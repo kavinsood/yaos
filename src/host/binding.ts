@@ -29,9 +29,9 @@
  */
 
 import * as Y from "yjs";
-import type { DocId, VaultPath } from "../core/types";
+import type { DocId, PathKey, VaultPath } from "../core/types";
 import { kindOfPath } from "../core/types";
-import { FORBIDDEN_PATH_CHARS, MAIN_UPDATE_COALESCE_MS } from "../core/limits";
+import { MAIN_UPDATE_COALESCE_MS } from "../core/limits";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
 import type { VaultEvent, VaultPort, VaultStat } from "../ports/vault";
@@ -41,6 +41,8 @@ import type { Hasher } from "./hashing";
 import { utf8 } from "./hashing";
 import { DEFAULT_MERGE_LIMITS, merge } from "../core/merge/merge";
 import { applyEditsTo, minimalDiff } from "../core/merge/minimalDiff";
+import { conflictCopyNotice, conflictName } from "../core/plan/conflictName";
+import { pathKey } from "../core/paths/pathKey";
 
 export const REMOTE_IN: unique symbol = Symbol("yaos.remote-in");
 export const BIND_LOCAL: unique symbol = Symbol("yaos.bind-local");
@@ -52,6 +54,8 @@ const BOUND_SAVED_DEBOUNCE_MS = 50;
 const CHECK_SAVED_RETRY_MS = 1_000;
 /** Backoff for conflict-copy writes that hit an I/O error (the last value repeats). */
 export const CONFLICT_COPY_RETRY_MS: readonly number[] = [250, 1_000, 2_000, 5_000, 10_000, 30_000];
+/** Conflict-copy names tried per attempt while each one turns out taken on disk. */
+const CONFLICT_COPY_NAME_TRIES = 12;
 
 export interface BindingLink {
 	/** Post to the engine (the host handles [T] ownership). */
@@ -116,37 +120,6 @@ export interface BindingStats {
 	boundSavedPosted: number;
 	externalMerges: number;
 	conflictCopies: number;
-}
-
-function sanitizeLabel(label: string): string {
-	let out = "";
-	for (const ch of label) {
-		const c = ch.codePointAt(0) ?? 0;
-		if (c < 0x20 || c === 0x7f || ch === "/" || FORBIDDEN_PATH_CHARS.includes(ch)) continue;
-		out += ch;
-	}
-	out = out.trim().replace(/\s+/g, " ").replace(/^\.+/, "");
-	return (out.length > 32 ? out.slice(0, 32).trim() : out) || "device";
-}
-
-function pad(n: number, w = 2): string {
-	return String(n).padStart(w, "0");
-}
-
-/** "<stem> (conflict <device> <YYYY-MM-DD HHmm>[ n])<ext>" in the same folder. */
-export function conflictCopyPath(path: string, deviceLabel: string, nowMs: number, n: number, timeZone: "local" | "utc" = "local"): string {
-	const slash = path.lastIndexOf("/");
-	const dir = slash < 0 ? "" : path.slice(0, slash + 1);
-	const leaf = path.slice(slash + 1);
-	const dot = leaf.lastIndexOf(".");
-	const stem = dot > 0 ? leaf.slice(0, dot) : leaf;
-	const ext = dot > 0 ? leaf.slice(dot) : "";
-	const d = new Date(nowMs);
-	const utc = timeZone === "utc";
-	const ymd = `${utc ? d.getUTCFullYear() : d.getFullYear()}-${pad((utc ? d.getUTCMonth() : d.getMonth()) + 1)}-${pad(utc ? d.getUTCDate() : d.getDate())}`;
-	const hm = `${pad(utc ? d.getUTCHours() : d.getHours())}${pad(utc ? d.getUTCMinutes() : d.getMinutes())}`;
-	const suffix = n > 1 ? ` ${n}` : "";
-	return `${dir}${stem} (conflict ${sanitizeLabel(deviceLabel)} ${ymd} ${hm}${suffix})${ext}`;
 }
 
 function applyTextDiff(ytext: Y.Text, from: string, to: string, origin: unknown): void {
@@ -429,7 +402,7 @@ export class BindingManager {
 			const reason = report.reason.kind === "conflict" ? report.reason.reason : null;
 			const path = view.path ?? "";
 			void (async () => {
-				if (copyText !== null) await this.writeConflictCopy(path, copyText);
+				if (copyText !== null) await this.writeConflictCopy(path, info.docId, copyText);
 				this.stats.externalMerges++;
 				this.deps.link.post({ t: "boundExternalMerged", docId: info.docId, result, conflictReason: reason });
 			})();
@@ -556,7 +529,7 @@ export class BindingManager {
 		const path = slot.view.path ?? "";
 		void (async () => {
 			await Promise.resolve(); // never call save() from inside Obsidian's setData
-			if (copy !== null) await this.writeConflictCopy(path, copy);
+			if (copy !== null) await this.writeConflictCopy(path, rep.docId, copy);
 			if (report) {
 				this.stats.externalMerges++;
 				this.deps.link.post({ t: "boundExternalMerged", docId: rep.docId, result: r.kind as "identical" | "disk-only" | "clean" | "conflict", conflictReason: r.kind === "conflict" ? r.reason : null });
@@ -588,12 +561,12 @@ export class BindingManager {
 	 * failure is retried (backoff, capped) for as long as the binding runs; callers that save over the
 	 * disk side await this first. Gives up on unload, a non-transient refusal, or when every candidate name is taken.
 	 */
-	private async writeConflictCopy(path: string, text: string): Promise<boolean> {
+	private async writeConflictCopy(path: string, docId: DocId, text: string): Promise<boolean> {
 		let attempt = 0;
 		const pending = { path, text };
 		try {
 			for (;;) {
-				const r = await this.tryConflictCopy(path, text);
+				const r = await this.tryConflictCopy(path, docId, text);
 				if (r === "ok") return true;
 				if (r === "give-up") break;
 				if (attempt === 0) {
@@ -621,19 +594,23 @@ export class BindingManager {
 		return [...this.pendingCopies];
 	}
 
-	private async tryConflictCopy(path: string, text: string): Promise<"ok" | "io" | "give-up"> {
-		const now = this.deps.clock.now();
-		const tz = this.deps.timeZone ?? "local";
-		for (let n = 1; n <= 12; n++) {
-			const target = n <= 10 ? conflictCopyPath(path, this.deps.deviceLabel(), now, n, tz) : conflictCopyPath(path, `${this.deps.deviceLabel()} ${now}`, now, n - 10, tz);
+	/** Names come from core conflictName (DESIGN §f.7); a name another writer took meanwhile is skipped. */
+	private async tryConflictCopy(path: string, docId: DocId, text: string): Promise<"ok" | "io" | "give-up"> {
+		const nowMs = this.deps.clock.now();
+		const tzOffsetMinutes = (this.deps.timeZone ?? "local") === "utc" ? 0 : -new Date(nowMs).getTimezoneOffset();
+		const taken = new Set<PathKey>();
+		for (let n = 1; n <= CONFLICT_COPY_NAME_TRIES; n++) {
+			const target = conflictName({ path, docId, deviceLabel: this.deps.deviceLabel(), nowMs, tzOffsetMinutes, pathKey, isTaken: (k) => taken.has(k) });
 			try {
 				const out = await this.deps.vault.write(target, text, { t: "absent" });
 				if (out.ok) {
 					this.stats.conflictCopies++;
+					this.deps.notice("warn", "conflict-copy", conflictCopyNotice({ from: path, to: target }, 1));
 					return "ok";
 				}
 				if (out.reason === "io") return "io";
 				if (out.reason !== "precondition") return "give-up"; // invalid path / parent is a file: not transient
+				taken.add(pathKey(target));
 			} catch {
 				return "io";
 			}

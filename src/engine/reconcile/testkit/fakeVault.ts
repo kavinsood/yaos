@@ -6,8 +6,8 @@
  *    parent folders are created; a file in the parent chain fails "parent-is-file";
  *  - rename() is a plain rename: it never rewrites links. `fileManagerRenameFile`
  *    is the link-rewriting variant the engine must never reach (counted);
- *  - trash() moves to ".trash/" (obsidian-trash) or a system-trash list;
- *    nothing is ever permanently deleted;
+ *  - trash() moves to ".trash/" (obsidian-trash) or a system-trash list (system-trash, and
+ *    follow-obsidian as Obsidian's default); nothing is ever permanently deleted;
  *  - case-insensitive profile: "a.md" and "A.md" are one file, the stored name
  *    keeps the casing of its creation (or of the last rename);
  *  - events: create / modify / delete / rename, emitted synchronously after the change.

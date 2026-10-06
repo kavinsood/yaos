@@ -54,7 +54,7 @@ test("snapshot: zip of md/canvas + small blobs with a manifest; big blobs left o
 	assert.deepEqual((await job.list()).map((s) => [s.id, s.files]), [[res.id, 4]]);
 });
 
-test("snapshot: over 256 MiB is skipped with a notice; disabled skips all but manual", async () => {
+test("snapshot: over 256 MiB is skipped with a notice; disabled skips all but manual and the pre-restore one", async () => {
 	const big = await setup({ files: () => [{ path: P("huge.md"), kind: "markdown", size: 300 * 1024 * 1024 }] });
 	assert.equal(await big.job.take("brake"), null);
 	assert.deepEqual(big.notices, ["snapshot-too-large"]);
@@ -62,7 +62,33 @@ test("snapshot: over 256 MiB is skipped with a notice; disabled skips all but ma
 	const off = await setup({ enabled: false });
 	off.w.vault.userWrite("a.md", "a");
 	assert.equal(await off.job.take("daily"), null);
-	assert.ok(await off.job.take("manual"));
+	assert.equal(await off.job.take("brake"), null);
+	const manual = (await off.job.take("manual"))!;
+	assert.ok(manual);
+	off.w.clock.advance(1000);
+	await off.job.restore(manual.id, null);
+	assert.deepEqual((await off.job.list()).map((s) => s.reason), ["manual", "restore"], "restore saves a safety snapshot even when snapshots are off");
+});
+
+test("remove and lookups: malformed or unknown ids are bad requests; remove deletes only that snapshot", async () => {
+	const { w, side, job } = await setup();
+	w.vault.userWrite("a.md", "a");
+	const one = (await job.take("manual"))!;
+	w.clock.advance(1000);
+	const two = (await job.take("manual"))!;
+	const badRequest = (re: RegExp) => (e: unknown) => (e as { error?: { code?: string } }).error?.code === "bad-request" && re.test(String(e));
+	for (const id of ["../outbox-a.bin", "x", `${one.id}/../../y`, ""]) {
+		await assert.rejects(job.remove(id), badRequest(/not a snapshot id/), id);
+		await assert.rejects(job.restore(id, null), badRequest(/not a snapshot id/), id);
+		await assert.rejects(job.manifest(id), badRequest(/not a snapshot id/), id);
+	}
+	const unknown = snapshotId(5, "daily");
+	await assert.rejects(job.remove(unknown), badRequest(/not found/));
+	await assert.rejects(job.restore(unknown, null), badRequest(/not found/));
+	assert.equal(await job.manifest(unknown), null);
+	await job.remove(one.id);
+	assert.deepEqual([...side.files.keys()], [`snapshots/${two.id}.zip`]);
+	await assert.rejects(job.remove(one.id), badRequest(/not found/), "already removed");
 });
 
 test("retention: keepDaily newest dailies, a bounded number of event snapshots; daily at most once per 24 h", async () => {

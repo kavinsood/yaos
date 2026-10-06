@@ -1,5 +1,5 @@
 /**
- * Line-based diff3 (ported from legacy-src/sync/lineMerge.ts; the policy
+ * Line-based diff3 (ported from the old client's sync/lineMerge.ts; the policy
  * wrappers and ThreeWayConflict regions are dropped).
  *
  * base = merge base, disk = the file, crdt = the replica text.

@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { diagnosticsFileName, exportDiagnostics, formatDiagnostics, isSecretKey } from "./diagnostics";
+import { diagnosticsFileName, diagnosticsSettings, exportDiagnostics, formatDiagnostics, isSecretKey } from "./diagnostics";
 import type { DiagnosticsBundle, StatusSnapshot } from "../../protocol/status";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
+import { DEFAULT_ENGINE_SETTINGS, type YaosPluginData } from "./api";
 
 const STATUS = {
 	phase: "live", deviceClass: "desktop", transport: "worker", vaultEpoch: "e1", vaultSeq: 5, headSeq: 5,
@@ -11,7 +12,7 @@ const STATUS = {
 		liveDocs: 1, staleStreams: 0, outboxFrames: 0, outboxBytes: 0, unreceiptedFrames: 0, residentDocs: 1,
 		residentBytesEstimate: 10, pendingDiskOps: 0, pendingBlobs: 0, quarantinedRows: 0, frozenDocs: 0, conflictCopiesToday: 0,
 	},
-	bootstrap: null, brake: null, lastFullReconcileAtMs: null, lastSyncedAtMs: 1, dailyFramesUsed: 3, notices: [],
+	bootstrap: null, brake: null, lastFullReconcileAtMs: null, lastSyncedAtMs: 1, dailyFramesUsed: 3, maxBlobBytes: null, notices: [],
 } satisfies StatusSnapshot;
 
 function bundle(over: Partial<DiagnosticsBundle> = {}): DiagnosticsBundle {
@@ -78,15 +79,28 @@ test("diagnosticsFileName", () => {
 	assert.equal(diagnosticsFileName(Date.UTC(2026, 9, 5, 12, 34, 56, 789)), "yaos-diagnostics-2026-10-05T12-34-56-789Z.json");
 	assert.equal(diagnosticsFileName(Number.NaN), "yaos-diagnostics-1970-01-01T00-00-00-000Z.json");
 	assert.doesNotMatch(diagnosticsFileName(Date.now()), /[:\\/]/);
+	assert.equal(diagnosticsFileName(0, true), "yaos-diagnostics-1970-01-01T00-00-00-000Z-with-file-names.json");
 });
 
-function fakeHost(result: EngineResultValue | Error, writeFails = false) {
+const TOKEN = "dtok_9f8e7d6c5b4a39281706f5e4d3c2b1a0ZZ";
+const DATA: YaosPluginData = {
+	version: 1,
+	identity: { host: "https://sync.example.com", vaultId: "v-123", deviceId: "d-456", deviceToken: TOKEN, deviceName: "Laptop", vaultGeneration: "g1" },
+	deviceLabel: "Laptop",
+	engine: { ...DEFAULT_ENGINE_SETTINGS, excludePatterns: ["Clients/Acme/", "**.tmp"] },
+	showStatusBar: true,
+};
+
+function fakeHost(result: EngineResultValue | Error, writeFails = false, data: YaosPluginData = DATA) {
 	const commands: UserCommand[] = [];
 	const writes: { name: string; text: string }[] = [];
 	return {
 		commands,
 		writes,
 		host: {
+			pluginVersion: "2.1.0",
+			data: () => data,
+			runState: () => ({ phase: "running" as const, transport: "worker" as const, lastError: null }),
 			async command(c: UserCommand): Promise<EngineResultValue> {
 				commands.push(c);
 				if (result instanceof Error) throw result;
@@ -107,11 +121,11 @@ test("exportDiagnostics: command -> write -> copy -> notify", async () => {
 	const notes: [string, string][] = [];
 	const copied: string[] = [];
 	const res = await exportDiagnostics(h.host, { notify: (m, l) => notes.push([m, l]), copyText: async (t) => { copied.push(t); } });
-	assert.deepEqual(h.commands, [{ t: "exportDiagnostics" }]);
+	assert.deepEqual(h.commands, [{ t: "exportDiagnostics", includePaths: false }]);
 	assert.equal(h.writes.length, 1);
 	assert.equal(h.writes[0]?.name, "yaos-diagnostics-2026-10-05T12-34-56-789Z.json");
-	assert.equal(h.writes[0]?.text, formatDiagnostics(b));
-	assert.deepEqual(copied, [formatDiagnostics(b)]);
+	assert.equal(h.writes[0]?.text, formatDiagnostics(b, diagnosticsSettings(h.host, false)));
+	assert.deepEqual(copied, [h.writes[0]?.text]);
 	assert.deepEqual(res, { path: ".obsidian/plugins/yaos/diagnostics/yaos-diagnostics-2026-10-05T12-34-56-789Z.json", copied: true });
 	assert.equal(notes.length, 1);
 	assert.equal(notes[0]?.[1], "info");
@@ -130,4 +144,37 @@ test("exportDiagnostics: failures notify and never throw", async () => {
 	assert.match(notes[0]?.[0] ?? "", /engine stopped/);
 	assert.match(notes[2]?.[0] ?? "", /disk full/);
 	assert.doesNotMatch(notes[3]?.[0] ?? "", /clipboard/);
+});
+
+test("exportDiagnostics: settings section names the device and engine settings, never the device token", async () => {
+	for (const includePaths of [false, true]) {
+		const h = fakeHost({ t: "diagnostics", bundle: bundle() });
+		const copied: string[] = [];
+		await exportDiagnostics(h.host, { notify: () => {}, copyText: async (t) => { copied.push(t); } }, { includePaths });
+		assert.deepEqual(h.commands, [{ t: "exportDiagnostics", includePaths }]);
+		const text = h.writes[0]?.text ?? "";
+		for (const out of [text, copied[0] ?? ""]) {
+			assert.ok(!out.includes(TOKEN), "device token leaked");
+			assert.ok(!out.includes(TOKEN.slice(5, 20)), "part of the device token leaked");
+		}
+		const s = (JSON.parse(text) as { settings: Record<string, unknown> }).settings;
+		assert.deepEqual(Object.keys(s).sort(), ["deviceId", "deviceLabel", "engine", "host", "pluginVersion", "transport", "vaultId"]);
+		assert.equal(s.host, "https://sync.example.com");
+		assert.equal(s.vaultId, "v-123");
+		assert.equal(s.deviceId, "d-456");
+		assert.equal(s.pluginVersion, "2.1.0");
+		assert.equal(s.transport, "worker");
+		const engine = s.engine as Record<string, unknown>;
+		assert.equal(engine.excludePatternCount, 2);
+		assert.equal(engine.syncAttachments, DEFAULT_ENGINE_SETTINGS.syncAttachments);
+		// Exclude patterns name folders: only with the file-names opt-in.
+		assert.equal(text.includes("Clients/Acme/"), includePaths);
+		assert.equal(h.writes[0]?.name.endsWith("-with-file-names.json"), includePaths);
+	}
+});
+
+test("diagnosticsSettings: unpaired device has null identity fields", () => {
+	const s = diagnosticsSettings({ pluginVersion: "2.1.0", data: () => ({ ...DATA, identity: null }), runState: () => ({ phase: "stopped", transport: null, lastError: null }) }, false);
+	assert.deepEqual([s.host, s.vaultId, s.deviceId, s.transport], [null, null, null, null]);
+	assert.equal("excludePatterns" in s.engine, false);
 });

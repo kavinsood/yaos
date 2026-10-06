@@ -12,6 +12,7 @@ import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
 import type { DiagnosticsEvent, EnginePhase, StatusSnapshot } from "../../protocol/status";
 import { CheckpointState, type CheckpointDeps } from "../body/checkpoints";
+import { DailyLimitNoticeGate } from "./dailyLimit";
 import type { FrameCtx } from "../body/frames";
 import type { HandleManager } from "../body/handles";
 import { resolveRefRow, type RefDeps } from "../body/refs";
@@ -66,10 +67,13 @@ export class EngineCtx {
 	/** Bumped on every session start / end; stale callbacks compare it. */
 	gen = 0;
 	stopped = false;
+	/** App backgrounded (DESIGN §i.4): lanes 3–4 (stale reads, compaction, checkpoints) wait. */
+	background = false;
 	readOnly = false;
 	lastCloseCode: number | null = null;
 	lastSyncedAtMs: number | null = null;
 	dailyLimitUntilMono = 0;
+	private readonly dailyLimitNotices = new DailyLimitNoticeGate();
 	daily = { day: "", frames: 0 };
 	/** Monotonic time the head hint was first seen above V with an idle live queue. */
 	headAheadSince: number | null = null;
@@ -144,6 +148,11 @@ export class EngineCtx {
 		this.notices.push({ code, level, atMs: this.now() });
 		if (this.notices.length > 20) this.notices.shift();
 		this.scheduleStatus();
+	}
+	/** Relay refused with cf_daily_limit (append or connect): one host popup per reset window. */
+	dailyLimitPopup(retryAfterMs: number | null): void {
+		const text = this.dailyLimitNotices.trip(this.now(), retryAfterMs);
+		if (text !== null) this.opts.onHostNotice?.("warn", "daily-limit", text);
 	}
 	noticeList(): readonly Notice[] {
 		return [...this.notices];

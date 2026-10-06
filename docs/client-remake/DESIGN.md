@@ -1435,6 +1435,9 @@ interface PlatformPort {
 // vault.ts — main thread only
 type WritePrecondition = { t: "absent" } | { t: "fingerprint"; fingerprint: DiskFingerprint }
   | { t: "hash"; hash: ContentHash } | { t: "any" };
+// "follow-obsidian" (default): the host reads trashOption from <configDir>/app.json at each delete. "system" or absent
+// → system trash; "local" and "none" (Permanently delete) → the vault's .trash folder, never a permanent delete.
+type TrashMode = "follow-obsidian" | "obsidian-trash" | "system-trash";
 interface VaultPort {
   readonly configDir: string;
   readonly caseInsensitive: boolean;
@@ -1593,10 +1596,10 @@ Further caps:
 
 | Event | Action |
 |---|---|
-| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors; pause lanes 3–4. Desktop keeps the socket. Mobile closes it (1000) after 30 s hidden. |
-| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then close the socket. Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
-| `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. Check the IDB connection: `onLost` → §i.5. |
-| `online` / `offline` | Connect at once / stop reconnect attempts. The outbox keeps accumulating. |
+| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and lanes 3–4, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk (the engine cannot tell an iPad from desktop Obsidian running the engine inline, so tablets count as desktop). Phone and constrained devices pause lanes 3–4 at once (hard-cap compaction is lane 1 and still runs) and close the socket (1000) after 30 s hidden. A background close shows no offline or error phase and arms no backoff. |
+| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause lanes 3–4 and close the socket on every device class. Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
+| `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. This tries once even after `offline`, so a missed `online` cannot strand the device; while offline a failure arms no backoff. The user's pause wins over this and over `online`. Check the IDB connection: `onLost` → §i.5. |
+| `online` / `offline` | Connect at once / stop reconnect attempts (an open socket stays until it fails). The outbox keeps accumulating. |
 | `memory-pressure` | Evict all clean docs, drop live-queue payloads for cold docs (stale-record), drop candidate caches except the newest. |
 
 ### i.5 IDB loss and recovery
@@ -1662,8 +1665,10 @@ ones get conflict copies.
     ns references.
   - **Download:** `get` → `openBlob` → verify sha256 → write with precondition. A missing blob is retried with backoff
     (`wait(blob-unavailable)`).
-  - Files larger than `BlobPort.maxBlobBytes` (10 MiB) or `settings.maxAttachmentBytes` are not synced (notice) and
-    never deleted.
+  - Files larger than `BlobPort.maxBlobBytes` (the server's `maxBlobUploadBytes`; 10 MiB when it sends none or the
+    capabilities probe fails) or `settings.maxAttachmentBytes` are not synced (notice) and never deleted.
+    `StatusSnapshot.maxBlobBytes` reports the carrier's limit (8 MiB without a blob store); the attachment size
+    setting then reads "This server accepts attachments up to N MB; the smaller limit applies."
 - **Without a blob store** (`blob = null`; the relay answers 503 `attachments_unavailable`):
   - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<sha256>` as `blobChunk` frames (768 KiB, ≤ 11 rows).
     The ns op is emitted after every chunk is receipted.
@@ -1695,13 +1700,17 @@ ones get conflict copies.
 ### j.3 Settings sync (`cfg`)
 
 - **Allowlist:**
-  - `app.json`, `appearance.json`, `hotkeys.json`, `core-plugins.json`: `jsonSet` / `jsonDel` per top-level key,
-    canonical JSON. A device-local key denylist per file is never emitted.
+  - Root JSON (the legacy set): `app.json`, `appearance.json`, `hotkeys.json`, `core-plugins.json`,
+    `core-plugins-migration.json`, `graph.json`, `daily-notes.json`, `templates.json`, `backlink.json`,
+    `page-preview.json`, `note-composer.json`, `switcher.json`, `bookmarks.json`, `workspaces.json`: `jsonSet` /
+    `jsonDel` per top-level key, canonical JSON. A device-local key denylist per file is never emitted
+    (`appearance.json` `nativeMenus` / `translucency`, `workspaces.json` `active`).
   - `community-plugins.json`: projected from `plugins` (`pluginSet` / `pluginDel`).
   - `plugins/<id>/data.json`: `filePut` with `pluginVersion`, applied only on an equal local version.
   - `snippets/*.css`, `themes/<name>/{theme.css, manifest.json}`: `filePut`. Content > 64 KiB or binary goes as a
     blob ref.
-- **Never synced:** `plugins/yaos/**`, `workspace*.json`, plugin code (`main.js`, `styles.css` of plugins), caches.
+- **Never synced:** `plugins/yaos/**`, `workspace.json`, `workspace-mobile.json` (open-pane layout),
+  `file-recovery.json`, `publish.json`, `types.json`, plugin code (`main.js`, `styles.css` of plugins), caches.
 - **Detection.** On full reconcile and focus, `ConfigDirPort.list` / `readBytes` are compared with `cfgBase`. Changed
   keys or files become cfg ops, sent through the send window.
 - **Projection.** For each register whose fold value ≠ local:
@@ -1711,21 +1720,61 @@ ones get conflict copies.
 - **Ops cover only settings changes**, never whole-file rewrites. Each key holds a single value, so a register cannot
   grow.
 - **Reload notice.** When applied settings need an Obsidian reload, show a notice. YAOS never reloads Obsidian itself.
-- Port the legacy `settingsSync/{allowlist, dataJsonGate, configDirKey, lwwReconcile(json canonicalization only)}`.
+- **Size caps** (`CFG_MAX_*`, legacy values). A file over 1 MB is not sent and not written. Going through files in
+  path order, the first one that would take the synced set past 256 files or 4 MB is held, and so is every file after
+  it. This applies on both sides, using the size after the pass. A held file gets no op and no write, and its
+  `cfgBase` is left alone, so it is never deleted elsewhere. Removals never count toward the caps.
+- **Skip notices.** These skips each show one warn notice per category: a `data.json` held for a plugin version
+  mismatch, a plugin enabled elsewhere but not installed here, local JSON that is not valid, and files past the caps.
+  The notice names the files and plugins (a count once there are many) and says what to do. A category is shown
+  again only when it gains an item, so a steady hold is shown once.
+- **Clash pause.** While Obsidian Sync (`core-plugins.json` `sync`) or a known community sync plugin (Remotely Save,
+  Self-hosted LiveSync, Relay) is enabled, cfg sync emits and applies nothing. It shows one warn naming the clashing
+  plugin and resumes on its own once that plugin is off. Note sync is not affected.
+- **Desktop-only plugins.** On mobile (`PlatformInfo.isMobile`), a plugin enabled elsewhere whose installed manifest
+  says `isDesktopOnly` is not enabled here. This hold is silent, and the device never disables the plugin elsewhere.
+- **First-enable seed.** Turning the settings toggle on asks "Use the vault's settings" or "Use this device's
+  settings" (`EngineSettings.syncSettingsSeed`, absent = vault). Closing the dialog leaves sync off.
+  - The answer only applies while `cfgBase` is empty, which means the first pass on this device or the first pass after a
+    cache rebuild. Later passes, including after turning sync off and on again, are normal 3-way merges.
+  - With no base, vault: the vault's register wins over the local value. Device: the local value wins.
+  - In both cases, what only one side has is taken and nothing is deleted.
+  - While `cfgBase` is empty, a pass waits until the cfg stream has been read to the relay head in this runtime
+    (`CfgSyncDeps.remoteReady`, the log reached `live`). An empty view would otherwise let local win whatever the seed.
+- Port the legacy `settingsSync/{allowlist, dataJsonGate, configDirKey, clash, lwwReconcile(json canonicalization
+  only)}`.
 
 ### j.4 Client snapshots and recovery
 
 - **Snapshot:** a zip (fflate) of markdown and canvas files, plus blobs ≤ 1 MiB, with a manifest of path, hash and
   size. Written as side file `snapshots/<id>.zip`. Capped at 256 MiB; skipped above with a notice.
 - **When taken:**
-  - daily, keeping `keepDaily`;
-  - before a brake approval, an epoch migration, an IDB recovery, and `restoreSnapshot`.
+  - daily, keeping `keepDaily` (with snapshots enabled);
+  - before a brake approval, an epoch migration and an IDB recovery (with snapshots enabled);
+  - on `createSnapshot` and before every `restoreSnapshot`, even with snapshots disabled (user actions);
+  - the newest 10 non-daily snapshots are kept.
 - **Optional R2 upload:** with `uploadToBlobStore` and a `BlobPort`, the sealed zip is `put` under its hash address.
-  The local index keeps the address. Cross-device restore is out of scope for v1.
-- **Restore** (`restoreSnapshot{id, paths|null}`):
-  - files are written as ordinary local edits (precondition `any`, after a `conflictCopy` of any differing current
-    file);
+  The address is not recorded, so the upload is an off-device copy only. Cross-device restore is out of scope for v1.
+- **Commands** (`src/protocol/messages.ts`): `listSnapshots` → `snapshots` (id, time, reason, file count, bytes);
+  `snapshotFiles{id}` → the manifest's files (path, kind, size) and `skipped` entries (too large, unreadable);
+  `restoreSnapshot{id, paths|null}` → `restored` (counts, conflict copies, failed paths); `deleteSnapshot{id}`.
+  - Ids come from the host and must parse as snapshot ids (no path tricks); unknown ids are `bad-request`.
+  - Without a running vault runtime these commands, `createSnapshot` and `exportDiagnostics` fail with `not-ready`.
+- **Restore:**
+  - files are written as ordinary local edits, after a `conflictCopy` of any differing current file. The write uses
+    precondition fingerprint(current) or absent instead of `any`, so a file edited between the read and the write is
+    reported failed, not clobbered;
   - they sync normally and are subject to the brake (overwrite counting).
+- **Host UI** (`src/host/ui/snapshotsModal.ts`; copy and logic in the pure `snapshotsModel.ts`):
+  - the snapshots dialog (settings "Browse snapshots" or the command palette) has "Create snapshot now" and one row
+    per snapshot, newest first (local time, reason, file count, size), with "Browse files…", "Restore all…" and
+    "Delete…". Restore and delete ask first; the restore confirm says differing files become conflict copies and a
+    safety snapshot is taken first;
+  - the files dialog has a path filter, checkboxes (at most 500 rendered; "Select all matching" includes the rest),
+    "Restore selected…" with a confirm, and a warning listing the manifest's skipped files;
+  - after a restore a notice summarises restored, unchanged, conflict-copy and failed counts.
+  - The settings toggle "Upload snapshots to attachment storage" sets `uploadToBlobStore`. Its copy says it is an
+    off-device copy, needs attachment storage on the server, and does not allow restore on another device.
 
 ### j.5 Onboarding and import
 
@@ -1767,16 +1816,29 @@ ones get conflict copies.
 
 - **`StatusSnapshot`** (`src/protocol/status.ts`): phase, transport, epoch, seqs, relay connection, counts (stale
   streams, outbox, unreceipted, resident, pending disk ops and blobs, quarantined rows, frozen docs, conflict copies
-  today), bootstrap progress, brake, last reconcile and sync times, daily frames, notices.
+  today), bootstrap progress, brake, last reconcile and sync times, daily frames, the carrier's attachment limit
+  (`maxBlobBytes`, null until a vault is open), notices.
   - Posted on phase change, and otherwise at most 4/s.
   - The status bar shows phase + unsynced count.
-- **`DiagnosticsBundle`:**
-  - recent events (a 2000-entry ring of `DiagnosticsEvent`: numbers, booleans, stream classes and **hashed** paths),
-    quarantine summary, frozen docs, per-store counts and bytes;
-  - real paths only on opt-in;
-  - never credentials, tickets or file contents.
-  - Exported by command. The host writes it under `<configDir>/plugins/yaos/diagnostics/` and offers copy to
-    clipboard.
+- **`DiagnosticsBundle`** (`exportDiagnostics{includePaths}`, built in `src/engine/compose/diagnosticsBundle.ts`):
+  - the whole 2000-entry ring of `DiagnosticsEvent`, oldest first (numbers, booleans, stream classes, error
+    messages). The whole ring, not a tail: the window before an incident is what support needs;
+  - quarantine summary (at most 200 rows), frozen doc streams, per-store counts, status;
+  - never credentials, tickets or file contents. `error` fields are error messages as thrown, not scrubbed.
+- **Pseudonyms.** Every stream and path is replaced by 12 hex chars of SHA-256 over a fresh random per-bundle salt and
+  the file's vault path (or its stream name when the path is unknown).
+  - The salt is not exported, so pseudonyms cannot be matched across bundles or tested against guessed paths.
+  - Within one bundle a file has one pseudonym everywhere: doc streams read `b:`/`c:`/`x:` + pseudonym, and brake
+    `samplePaths` hold the same pseudonym. `ns` and `cfg` keep their names.
+- **`paths`** is null unless the user opted in. With opt-in it maps each pseudonym whose path the engine knows to
+  that vault path, sorted by path. The command "Export diagnostics (include file names)" asks for confirmation
+  first; the file name ends in `-with-file-names`.
+- **Host additions** (`src/host/ui/diagnostics.ts`):
+  - a `settings` section: plugin version, transport, host URL, vaultId, deviceId, device label, engine settings.
+    Identity fields are picked one by one, never the device token. Exclude patterns appear only with opt-in (they
+    name folders); otherwise only their count.
+  - Secret-looking keys are redacted at any depth as a backstop.
+  - The host writes the file under `<configDir>/plugins/yaos/diagnostics/` and copies it to the clipboard.
 
 ---
 
@@ -1826,8 +1888,9 @@ These are enforced by `scripts/check-deps.mjs` (WP-D), a regex import scan run i
 - `engine/**` imports `core`, `ports`, `protocol`, `yjs`, `lib0` and `fflate`.
   - Never `obsidian` or `host/**`.
   - Browser globals (`indexedDB`, `WebSocket`, `fetch`, `crypto.subtle`) only in `engine/adapters/**`.
-- `host/**` imports `core`, `ports`, `protocol`, `obsidian`, `yjs`, `y-codemirror.next` and `@codemirror/*`. From
-  `engine/` it imports only `engine/runtime/engine.ts` (inline fallback) and the bundled worker source string.
+- `host/**` imports `core`, `ports`, `protocol`, `obsidian`, `yjs`, `y-codemirror.next`, `@codemirror/*` and `qrcode`
+  (the pairing QR). From `engine/` it imports only `engine/runtime/engine.ts` (inline fallback) and the bundled worker
+  source string.
 - `sim/**` may import anything. Nothing imports `sim/**` except tests.
 - Shared shapes change only through the architect files plus this document.
 
@@ -1866,8 +1929,10 @@ All actors run in one Node process with a virtual `ClockPort` and a seeded `Rand
   y-codemirror stand-in, 2 s save debounce, `setViewData` reloads) + `MemStoragePort` + `SideFilePort`.
 - **User actors**, per device: type into open notes (unique tokens), open/close/switch views, create/edit/rename/
   delete files and folders, case-only renames, paste large text, import a folder of files, attachments, settings
-  edits.
-- **External-writer actor:** another app modifying files on disk, including files open in editors.
+  edits. They act only on a running app in the foreground. While a device is down or backgrounded (`hidden`,
+  `pagehide`, `freeze`), its user actions are recorded as skips.
+- **External-writer actor:** another app modifying files on disk, including files open in editors. It also writes
+  while the app is backgrounded. The engine then takes those writes in on resume (§i.4), as one change per file.
 
 ### l.2 Seeded faults
 
@@ -1930,28 +1995,30 @@ After healing (all faults off, all online, run until every queue is idle and no 
 ### m.1 Port
 
 Port means copying the logic with tests, adapted to the new types. No runtime coupling to legacy code.
+The old client was deleted once the port was done; `adfa7a7:src/...` names its files at that commit
+(`git show adfa7a7:src/<path>`).
 
 | Legacy | New location | Notes |
 |---|---|---|
 | `server/src/shared/markdownCodec.ts` | `src/core/hash/markdownLf.ts` | markdown-lf-v1 canonicalization, logical hash, exact fingerprint |
-| `server/src/shared/vaultPath.ts`, `legacy-src/paths/canonicalPath.ts` | `src/core/paths/validate.ts` | Reworked to §c.2 rules (frozen Unicode, reserved stems) |
-| `legacy-src/paths/pathCollision.ts` | `src/core/paths/pathKey.ts` (tests) | Collision fixtures only. The key function is new (frozen case fold) |
-| `legacy-src/paths/pathCategory.ts`, `legacy-src/sync/exclude.ts` | `src/engine/reconcile/localTree.ts` | Exclude patterns, kind classification |
-| `server/src/shared/canvasCodec.ts`, `canvasOrdering.ts`, `canvasTypes.ts`, `canvasLimits.ts` | `src/core/hash/canvasCanonical.ts`, `src/engine/body/canvasDoc.ts` | Canonical bytes, Obsidian formatting, ranks, validation |
-| `legacy-src/sync/lineMerge.ts`, `threeWayMerge.ts` | `src/core/merge/{myers,diff3}.ts` | Line diff3 core and limits. Policy wrappers dropped |
-| `legacy-src/sync/boundedTextDiff.ts`, `diff.ts` (`tryApplyDiffToYText` only) | `src/core/merge/minimalDiff.ts`, `src/engine/reconcile/mergeJob.ts` | Minimal diff + CAS apply. `forceReplaceYText` is **dropped** |
-| `legacy-src/sync/dailyLimit.ts` | `src/engine/runtime/lifecycle.ts` (+ notice strings) | `resetAt` parsing, probe schedule, notice gate |
+| `server/src/shared/vaultPath.ts`, `adfa7a7:src/paths/canonicalPath.ts` | `src/core/paths/validate.ts` | Reworked to §c.2 rules (frozen Unicode, reserved stems) |
+| `adfa7a7:src/paths/pathCollision.ts` | `src/core/paths/pathKey.ts` (tests) | Collision fixtures only. The key function is new (frozen case fold) |
+| `adfa7a7:src/paths/pathCategory.ts`, `adfa7a7:src/sync/exclude.ts` | `src/engine/reconcile/localState.ts` | Exclude patterns, kind classification |
+| `server/src/shared/canvasCodec.ts`, `canvasOrdering.ts`, `canvasTypes.ts`, `canvasLimits.ts` | `src/core/hash/canvasCanonical.ts`, `src/engine/reconcile/canvasDoc.ts` | Canonical bytes, Obsidian formatting, ranks, validation |
+| `adfa7a7:src/sync/lineMerge.ts`, `threeWayMerge.ts` | `src/core/merge/{myers,diff3}.ts` | Line diff3 core and limits. Policy wrappers dropped |
+| `adfa7a7:src/sync/boundedTextDiff.ts`, `diff.ts` (`tryApplyDiffToYText` only) | `src/core/merge/minimalDiff.ts`, `src/engine/reconcile/mergeJob.ts` | Minimal diff + CAS apply. `forceReplaceYText` is **dropped** |
+| `adfa7a7:src/sync/dailyLimit.ts` | `src/engine/adapters/relayHttp.ts` (`dailyResetDelayMs`), `src/engine/runtime/relayPolicy.ts` (retry), `src/engine/runtime/dailyLimit.ts` (notice gate + text) | `resetAt` parsing, probe schedule, notice gate |
 | `server/src/shared/socketCloseCodes.ts` | `src/engine/adapters/wsRelay.ts` | Mapped onto `RELAY_CLOSE` / `RelayEvent.closed` |
-| `legacy-src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*`, `src/core/cfg/projection.ts` | Allowlist, plugin version gate, canonical JSON |
-| `legacy-src/utils/{randomId,sha256,semver,defaultDeviceName,format}.ts` | `src/core/codec/ids.ts`, `src/engine/adapters/webHash.ts`, `src/host/*` | Ids become 16-byte base64url |
-| `legacy-src/snapshots/{snapshotService,vaultExport}.ts` | `src/engine/snapshots/snapshotJob.ts` | Zip writing only |
-| `legacy-src/onboarding/{provisioningClient,localVaultImport}.ts` | `src/host/ui/pairing.ts`, §j.5 | Pairing HTTP calls. Import is now just "plan L-only files" |
-| `legacy-src/settings/{settingsTab,PairDeviceModal,DeviceCredentialsModal}.ts` | `src/host/ui/*` | UI shells only |
-| `legacy-src/status/statusBarController.ts` | `src/host/ui/statusBar.ts` | Render `StatusSnapshot` |
+| `adfa7a7:src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*`, `src/core/cfg/projection.ts` | Allowlist, plugin version gate, canonical JSON |
+| `adfa7a7:src/utils/{randomId,sha256,semver,defaultDeviceName,format}.ts` | `src/core/codec/ids.ts`, `src/engine/adapters/webHash.ts`, `src/host/*` | Ids become 16-byte base64url |
+| `adfa7a7:src/snapshots/{snapshotService,vaultExport}.ts` | `src/engine/snapshots/snapshotJob.ts` | Zip writing only |
+| `adfa7a7:src/onboarding/{provisioningClient,localVaultImport}.ts` | `src/host/ui/pairing.ts`, §j.5 | Pairing HTTP calls. Import is now just "plan L-only files" |
+| `adfa7a7:src/settings/{settingsTab,PairDeviceModal,DeviceCredentialsModal}.ts` | `src/host/ui/*` | UI shells only |
+| `adfa7a7:src/status/statusBarController.ts` | `src/host/ui/statusBar.ts` | Render `StatusSnapshot` |
 
 ### m.2 Deliberately dropped
 
-- **`legacy-src/main.ts`, `VaultSync`, the runtime coordinators** (`runtime/*`: admission, residency, overdue-work
+- **`adfa7a7:src/main.ts`, `VaultSync`, the runtime coordinators** (`runtime/*`: admission, residency, overdue-work
   kernels, connection controllers). Replaced by lanes, budgets, the pure planner and ports.
 - **Server-side CRDT and WASM engine** (`@yaos/crdt-engine`, ywasm). Pure JS Yjs only, client-side.
 - **Semantic epochs, fenced WebSocket, legacy receipts, bootstrap client** (`semanticEpochTransition`,

@@ -137,6 +137,9 @@ test("blob keep-both: concurrent edits keep the remote bytes at the path and the
 	assert.equal(w.intents(), 0);
 	await w.sync();
 	assert.equal(w.conflictCopies().length, 1);
+	assert.deepEqual(w.notices.filter((n) => n.code === "conflict-copy").map((n) => n.message), [
+		`YAOS could not merge two versions of “k.png”; the other version is saved as “${copies[0]!}”.`,
+	]);
 });
 
 test("excluded and config paths are never synced", async () => {

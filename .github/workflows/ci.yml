@@ -21,9 +21,7 @@ jobs:
       - run: npm ci --prefix server
       - run: npm run build
       - run: npm run typecheck:tests
-      - run: npm run typecheck:qa
       - run: npm run guard:no-any
-      - run: npm run guard:production-bundles
       - run: npm run guard:no-tracked-generated-artifacts
       - run: npm run test:ci
       - run: npm --prefix server run typecheck

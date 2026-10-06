@@ -89,6 +89,32 @@ test("same-line conflict: CRDT keeps remote, disk keeps a copy with the original
 	assert.equal(w.intents(), 0);
 	await w.sync();
 	assert.equal(w.conflictCopies().length, 1);
+	assert.deepEqual(w.notices.filter((n) => n.code === "conflict-copy"), [
+		{ level: "warn", code: "conflict-copy", message: `YAOS could not merge two versions of “c.md”; the other version is saved as “${copy}”.` },
+	]);
+});
+
+test("conflict copies of one pass make one notice with the count and the first path", async () => {
+	const w = await booted();
+	const ids = ["x.md", "y.md", "z.md"].map((p) => w.log.remoteCreate(P(p), "head\nshared\ntail\n"));
+	await w.sync();
+	for (const id of ids) w.log.remoteEdit(id, (t) => {
+		const at = t.toString().indexOf("shared");
+		t.delete(at, "shared".length);
+		t.insert(at, "remote");
+	});
+	for (const p of ["x.md", "y.md", "z.md"]) w.vault.userWrite(p, "head\nlocal\ntail\n");
+	await w.sync();
+	const copies = w.conflictCopies();
+	assert.equal(copies.length, 3);
+	const notes = w.notices.filter((n) => n.code === "conflict-copy");
+	assert.equal(notes.length, 1, JSON.stringify(notes));
+	assert.match(notes[0]!.message, /^YAOS could not merge 3 files; the other versions are saved as conflict copies \(first: “. \(conflict laptop .*\)\.md”\)\.$/);
+	assert.ok(copies.some((c) => notes[0]!.message.includes(c)));
+	assert.deepEqual(w.conflictCopyEvents.map(([, to]) => to).sort(), [...copies].sort(), "each copy reaches onConflictCopy (status conflictCopiesToday)");
+	await w.sync();
+	assert.equal(w.notices.filter((n) => n.code === "conflict-copy").length, 1, "quiet passes add nothing");
+	assert.equal(w.conflictCopyEvents.length, 3);
 });
 
 test("CRLF file: merge keeps the file's bytes when content is unchanged", async () => {

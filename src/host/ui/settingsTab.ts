@@ -3,22 +3,24 @@
  * through host.updateData. Live rows (connection, engine status, held changes) repaint in place on
  * host.onChange, throttled; visibility/disabled predicates are re-evaluated with refreshDomState(),
  * so typing in a text field is never interrupted by a full re-render.
- * Ported in spirit from legacy-src/settings/settingsTab.ts.
+ * Ported in spirit from the old client (adfa7a7:src/settings/settingsTab.ts).
  */
 
 import {
-	Notice, PluginSettingTab,
+	Modal, Notice, PluginSettingTab,
 	type App, type Plugin, type Setting, type SettingDefinitionItem, type SettingDefinitionRender, type SettingGroupItem,
+	type ToggleComponent,
 } from "obsidian";
 import { MAX_KEEP_DAILY, pendingBrake, type YaosUiHost } from "./api";
 import { brakeHeadline } from "./brake";
 import { confirmAction } from "./confirmModal";
+import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
 import { clearIdentity } from "./pairFlow";
 import {
-	applyControl, connectionRows, engineAcceptsCommands, engineRows, isControlKey, isPaused, MAX_ATTACHMENT_MB, readControl,
-	TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
-	type ControlKey,
+	applyControl, attachmentSizeDesc, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused,
+	MAX_ATTACHMENT_MB, readControl, serverConsoleUrl, TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
+	type ControlKey, type SettingsSeed,
 } from "./settingsModel";
 import type { UserCommand } from "../../protocol/messages";
 
@@ -26,6 +28,7 @@ export interface SettingsTabActions {
 	openPair(): void;
 	openPairAnother(): void;
 	openBrake(): void;
+	openSnapshots(): void;
 	exportDiagnostics(): void;
 	/** Called after a change the status bar cares about (showStatusBar). */
 	onDataChanged(): void;
@@ -33,6 +36,32 @@ export interface SettingsTabActions {
 
 const TEXT_DEBOUNCE_MS = 600;
 const LIVE_MIN_INTERVAL_MS = 250;
+const SYNC_SETTINGS_NAME = "Sync Obsidian settings";
+const SYNC_SETTINGS_DESC = "Sync app options, appearance, hotkeys, core plugin options (graph, bookmarks, daily notes, templates, saved workspaces), core and community plugin lists, plugin settings, snippets and themes. Plugin code and the open-pane layout are never synced.";
+
+/** Asked when settings sync is turned on: whose values win where this device and the vault differ (DESIGN §j.3). */
+class SettingsSeedModal extends Modal {
+	private answer: SettingsSeed | null = null;
+
+	constructor(app: App, private readonly done: (seed: SettingsSeed | null) => void) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.setTitle("Whose settings come first?");
+		this.contentEl.createEl("p", { text: "Where this device's settings differ from the ones already in the vault, choose which side wins this first time. Nothing that only one side has is removed, and after this first pass changes merge normally." });
+		const row = this.contentEl.createDiv({ cls: "modal-button-container" });
+		const choices = [["Use the vault's settings", "vault", ""], ["Use this device's settings", "device", "mod-cta"]] as const;
+		for (const [text, seed, cls] of choices) {
+			row.createEl("button", { text, cls }).addEventListener("click", () => { this.answer = seed; this.close(); });
+		}
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.done(this.answer);
+	}
+}
 
 function linesFragment(lines: readonly string[]): DocumentFragment {
 	const frag = document.createDocumentFragment();
@@ -83,6 +112,12 @@ export class YaosSettingTab extends PluginSettingTab {
 				action: () => this.actions.openPairAnother(),
 			},
 			{
+				name: "Open server console",
+				desc: "Open your server's console in a browser to see this vault's devices. The operator key stays in the console.",
+				visible: paired,
+				action: () => this.openServerConsole(),
+			},
+			{
 				name: "Unpair this device",
 				desc: "Stop syncing and forget this device's credentials. Notes on disk are kept.",
 				visible: paired,
@@ -127,7 +162,7 @@ export class YaosSettingTab extends PluginSettingTab {
 		const syncItems: SettingGroupItem[] = [
 			{
 				name: "Excluded paths",
-				desc: "One path prefix per line, for example templates/ or private/. Files whose path starts with a listed prefix are not synced. The config folder and .trash are always excluded.",
+				desc: "One pattern per line, matched against the whole path from the vault root (case-sensitive). A line ending in / excludes that folder, e.g. templates/. Otherwise * and ? match within one file or folder name and ** matches across folders, e.g. Archive/*.pdf or **.tmp. A pattern that matches a folder also excludes everything inside it. The config folder and .trash are always excluded.",
 				control: {
 					type: "textarea",
 					key: "excludePatterns",
@@ -143,7 +178,7 @@ export class YaosSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Maximum attachment size (MB)",
-				desc: "Larger attachments stay on this device.",
+				desc: attachmentSizeDesc(this.host.status()),
 				visible: () => this.host.data().engine.syncAttachments,
 				control: {
 					type: "number",
@@ -155,13 +190,16 @@ export class YaosSettingTab extends PluginSettingTab {
 				},
 			},
 			{
-				name: "Sync Obsidian settings",
-				desc: "Sync appearance, hotkeys, core and community plugin lists, plugin settings, snippets and themes. Plugin code and workspace layout are never synced.",
-				control: { type: "toggle", key: "syncSettings" },
+				name: SYNC_SETTINGS_NAME,
+				desc: SYNC_SETTINGS_DESC,
+				render: (setting: Setting) => {
+					setting.setName(SYNC_SETTINGS_NAME).setDesc(SYNC_SETTINGS_DESC);
+					setting.addToggle((t) => t.setValue(this.host.data().engine.syncSettings).onChange((on) => { void this.setSyncSettings(on, t); }));
+				},
 			},
 			{
 				name: "Deleted files go to",
-				desc: "Where files deleted by sync are moved. YAOS never deletes a file permanently.",
+				desc: "Where files deleted by sync are moved. YAOS never deletes a file permanently: if Obsidian is set to \"Permanently delete\", Follow Obsidian uses the .trash folder.",
 				control: { type: "dropdown", key: "trashMode", options: { ...TRASH_MODE_OPTIONS } },
 			},
 			{
@@ -185,6 +223,11 @@ export class YaosSettingTab extends PluginSettingTab {
 					step: 1,
 					validate: (v: number) => validateControl("snapshotsKeepDaily", v) ?? undefined,
 				},
+			},
+			{
+				name: "Upload snapshots to attachment storage",
+				desc: "Also upload each new snapshot to the server's attachment storage as an off-device copy (encrypted only if the vault uses end-to-end encryption). Needs attachment storage on the server; without it only the copy on this device is kept. Snapshots can still be browsed and restored only on the device that took them.",
+				control: { type: "toggle", key: "snapshotsUpload" },
 			},
 		];
 
@@ -213,6 +256,12 @@ export class YaosSettingTab extends PluginSettingTab {
 				desc: "Save a recovery snapshot of your notes now.",
 				disabled: commandsOff,
 				action: () => { void this.send({ t: "createSnapshot" }, "Snapshot created."); },
+			},
+			{
+				name: "Browse snapshots",
+				desc: "See the recovery snapshots on this device, restore all or some of their files, or delete one.",
+				disabled: commandsOff,
+				action: () => this.actions.openSnapshots(),
 			},
 			{
 				name: "Export diagnostics",
@@ -325,6 +374,22 @@ export class YaosSettingTab extends PluginSettingTab {
 		if (key === "showStatusBar") this.actions.onDataChanged();
 	}
 
+	/** Turning settings sync on asks whose settings win first; closing the question leaves it off. */
+	private async setSyncSettings(on: boolean, toggle: ToggleComponent): Promise<void> {
+		// Also absorbs the onChange that toggle.setValue below may fire.
+		if (on === this.host.data().engine.syncSettings) return;
+		if (!on) return this.persist("syncSettings", false);
+		const seed = await new Promise<SettingsSeed | null>((resolve) => new SettingsSeedModal(this.app, resolve).open());
+		if (seed !== null) {
+			try {
+				await this.host.updateData((d) => enableSettingsSync(d, seed));
+			} catch (err) {
+				new Notice(`YAOS: could not save the setting: ${errorMessage(err)}`, 8000);
+			}
+		}
+		toggle.setValue(this.host.data().engine.syncSettings);
+	}
+
 	// -------------------------------------------------------------------------
 	// Actions
 	// -------------------------------------------------------------------------
@@ -337,6 +402,12 @@ export class YaosSettingTab extends PluginSettingTab {
 			new Notice(`YAOS: ${errorMessage(err)}`, 8000);
 		}
 		this.refreshLiveNow();
+	}
+
+	private openServerConsole(): void {
+		const url = serverConsoleUrl(this.host.data().identity);
+		if (url) window.open(url, "_blank", "noopener");
+		else new Notice("YAOS: the stored server address is not a web address. Pair this device again.", 8000);
 	}
 
 	private async unpair(): Promise<void> {
@@ -358,22 +429,12 @@ export class YaosSettingTab extends PluginSettingTab {
 	}
 
 	private async rebuildCache(): Promise<void> {
-		const ok = await confirmAction(this.app, {
-			title: "Rebuild local cache?",
-			message: "YAOS discards this device's sync database and rebuilds it from the files in this vault and the server. Unsent edits are kept. Files that differ from the server get conflict copies; nothing is deleted.\n\nThis can take a while on large vaults.",
-			confirmText: "Rebuild",
-		});
-		if (!ok) return;
-		await this.send({ t: "rebuildLocalCache" }, "rebuilding the local cache.");
+		await confirmAndRebuildCache(this.app, this.host);
+		this.refreshLiveNow();
 	}
 
 	private async restartEngine(): Promise<void> {
-		try {
-			await this.host.restartEngine();
-			new Notice("YAOS: sync engine restarted.");
-		} catch (err) {
-			new Notice(`YAOS: could not restart the sync engine: ${errorMessage(err)}`, 8000);
-		}
+		await restartSyncEngine(this.host);
 		this.refreshLiveNow();
 	}
 

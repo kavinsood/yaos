@@ -47,7 +47,12 @@ export type RenameOutcome =
 	| { readonly ok: true; readonly stat: VaultStat }
 	| { readonly ok: false; readonly reason: "source-missing" | "target-exists" | "precondition" | "io"; readonly message: string };
 
-export type TrashMode = "obsidian-trash" | "system-trash";
+/**
+ * Where a sync delete goes. "follow-obsidian" (default) reads Obsidian's Files and links → Deleted files
+ * preference at delete time: system trash, or the vault's .trash folder for "Move to Obsidian trash" and
+ * "Permanently delete" (YAOS never deletes permanently, invariant 2).
+ */
+export type TrashMode = "follow-obsidian" | "obsidian-trash" | "system-trash";
 
 export interface VaultPort {
 	readonly configDir: string;

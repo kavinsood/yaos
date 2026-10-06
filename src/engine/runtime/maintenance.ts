@@ -5,6 +5,7 @@
  * scheduling.
  */
 
+import { TAIL_HARD_ROWS } from "../../core/limits";
 import { NS_STREAM, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import { bodyCheckpointDue, foldCheckpointDue, writeBodyCheckpoint, writeFoldCheckpoint } from "../body/checkpoints";
@@ -112,6 +113,7 @@ export class Maintenance {
 			if (r.stale || r.frozen || c.sess.isReading(r.stream)) continue;
 			if ((this.compactSkip.get(r.stream) ?? 0) > now) continue;
 			if (!needsCompaction(r, c.tuning.compactRows, c.tuning.compactBytes)) continue;
+			if (c.background && r.tailRows <= TAIL_HARD_ROWS) continue; // lane 4 waits; the hard cap is lane 1
 			budget--;
 			const res = r.cls === "ns" ? await compactFold(c.deps, c.ns) : r.cls === "cfg" ? await compactFold(c.deps, c.cfg) : await compactBody(c.deps, r.stream);
 			if (res.t === "ok") {
@@ -138,7 +140,7 @@ export class Maintenance {
 	private async checkpoints(): Promise<void> {
 		const c = this.c;
 		const s = c.session;
-		if (!s || !s.canWrite || c.readOnly || c.phase !== "live") return;
+		if (!s || !s.canWrite || c.readOnly || c.phase !== "live" || c.background) return;
 		const now = c.mono();
 		let budget = CHECKPOINTS_PER_TICK;
 		for (const r of [...c.repo.streams()]) {

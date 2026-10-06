@@ -1,7 +1,9 @@
 /**
  * Pairing modals: PairModal (join this device to a vault with a server URL + one-time code) and
- * the "pair another device" code display. Ported from legacy-src/settings/PairDeviceModal.ts and
- * the enrollment parts of legacy-src/settings/settingsTab.ts (no QR code: no new dependencies).
+ * the "pair another device" code display with a QR code of the mobile setup page and an "Open
+ * pairing page" button. Ported from the old client (adfa7a7:src/settings/PairDeviceModal.ts, QR at
+ * :40-65, and the enrollment parts of adfa7a7:src/settings/settingsTab.ts). When a pairing
+ * replaces another, the old enrollment is revoked on its server after the new one is stored.
  *
  * SECRETS: the pairing code input is a password field; codes and tokens are never logged. The
  * code shown by PairingCodeModal is displayed only because handing it to the other device is the
@@ -9,11 +11,15 @@
  */
 
 import { Modal, Notice, Setting, type App, type ButtonComponent } from "obsidian";
-import type { YaosUiHost } from "./api";
+import { toCanvas } from "qrcode";
+import { sameIdentity, type YaosUiHost } from "./api";
 import { errorMessage } from "./format";
 import { copyText, obsidianRequest } from "./obsidianEnv";
-import { applyPairedIdentity, formatCountdown, PairingSession } from "./pairFlow";
-import { requestPairingCode, type PairingCodeGrant, type RequestFn } from "./pairing";
+import { applyPairedIdentity, formatCountdown, PairingSession, setPendingEnrollment, withoutPendingEnrollment } from "./pairFlow";
+import { requestPairingCode, retireDeviceEnrollment, type PairingCodeGrant, type RequestFn } from "./pairing";
+
+/** One-click Cloudflare deploy of the server (README "Deploy to Cloudflare"). */
+const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
 
 export interface PairPrefill {
 	readonly host?: string;
@@ -33,10 +39,14 @@ export class PairModal extends Modal {
 		app: App,
 		private readonly host: YaosUiHost,
 		prefill: PairPrefill = {},
-		request: RequestFn = obsidianRequest,
+		private readonly request: RequestFn = obsidianRequest,
 	) {
 		super(app);
-		this.session = new PairingSession({ request, onProgress: (text) => this.setStatus(text, false) });
+		this.session = new PairingSession({
+			request,
+			onProgress: (text) => this.setStatus(text, false),
+			persist: (attempt) => host.updateData((d) => (attempt ? setPendingEnrollment(d, attempt) : withoutPendingEnrollment(d))),
+		});
 		const data = host.data();
 		this.hostValue = prefill.host ?? data.identity?.host ?? "";
 		this.codeValue = prefill.pairingCode ?? "";
@@ -54,7 +64,7 @@ export class PairModal extends Modal {
 		if (current) {
 			contentEl.createEl("p", {
 				cls: "mod-warning",
-				text: `This device is already paired with ${current.host}. Pairing again replaces this device's credentials and syncs this folder with the vault of the new code. Notes on disk are not deleted.`,
+				text: `This device is already paired with ${current.host}. Pairing again replaces this device's credentials and syncs this folder with the vault of the new code. Once the new pairing succeeds, YAOS asks the old server to remove this device's old membership. Notes on disk are not deleted.`,
 			});
 		}
 		contentEl.createEl("p", {
@@ -63,6 +73,11 @@ export class PairModal extends Modal {
 
 		new Setting(contentEl)
 			.setName("Server URL")
+			.setDesc(createFragment((f) => {
+				f.appendText("No server yet? ");
+				f.createEl("a", { text: "Deploy your server", href: CLOUDFLARE_DEPLOY_URL });
+				f.appendText(" on Cloudflare with one click; its console gives you a pairing code.");
+			}))
 			.addText((text) => {
 				text.setPlaceholder("https://sync.example.com").setValue(this.hostValue).onChange((v) => { this.hostValue = v; });
 				text.inputEl.autocomplete = "off";
@@ -79,7 +94,7 @@ export class PairModal extends Modal {
 			});
 		new Setting(contentEl)
 			.setName("Device name")
-			.setDesc("Shown to your other devices and used in conflict copy names.")
+			.setDesc("Sent to your server, which lists it among the vault's devices, and used in this device's conflict copy names.")
 			.addText((text) => {
 				text.setPlaceholder("My laptop").setValue(this.nameValue).onChange((v) => { this.nameValue = v; });
 			});
@@ -105,6 +120,7 @@ export class PairModal extends Modal {
 		if (this.session.busy) return;
 		this.pairButton?.setDisabled(true);
 		this.setStatus("Pairing…", false);
+		const previous = this.host.data().identity;
 		try {
 			const identity = await this.session.submit({ host: this.hostValue, pairingCode: this.codeValue, deviceName: this.nameValue });
 			// Persist even if the modal was closed meanwhile: the server has already enrolled this
@@ -113,6 +129,11 @@ export class PairModal extends Modal {
 			this.codeValue = "";
 			new Notice(`YAOS: this device is now paired with ${identity.host}.`);
 			if (this.open_) this.close();
+			// Best effort, only after the new identity is stored: revoke the replaced enrollment
+			// with its own token (adfa7a7:src/runtime/setupLinkController.ts:243-256).
+			if (previous && !sameIdentity(previous, identity)) {
+				retireDeviceEnrollment(previous, { request: this.request }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
+			}
 		} catch (err) {
 			this.setStatus(errorMessage(err), true);
 			if (!this.open_) new Notice(`YAOS pairing failed: ${errorMessage(err)}`, 8000);
@@ -170,11 +191,13 @@ export class PairingCodeModal extends Modal {
 
 	private renderGrant(grant: PairingCodeGrant): void {
 		const { contentEl } = this;
+		const page = grant.mobileSetupUrl;
 		contentEl.createEl("p", {
-			text: "On the other device, open the setup link, or open YAOS settings, choose \"Pair this device\" and enter the server URL and this code. Anyone with this code can join your vault until it is used or expires, so share it only with your own device.",
+			text: `${page ? "Scan the QR code with your phone's camera, or on" : "On"} the other device open the setup link, or open YAOS settings, choose "Pair this device" and enter the server URL and this code. Anyone with this code can join your vault until it is used or expires, so share it only with your own device.`,
 		});
+		if (page) this.renderQr(page);
 
-		const field = (label: string, value: string, rows: number): void => {
+		const field = (label: string, value: string, rows: number): Setting => {
 			const s = new Setting(contentEl).setName(label);
 			s.settingEl.addClass("yaos-pairing-code-field");
 			const area = contentEl.createEl("textarea", { cls: "yaos-pairing-code-value" });
@@ -185,11 +208,13 @@ export class PairingCodeModal extends Modal {
 			s.addButton((b) => b.setButtonText("Copy").onClick(() => {
 				copyText(value).then(() => new Notice(`${label} copied.`), () => new Notice(`Could not copy the ${label.toLowerCase()}.`, 6000));
 			}));
+			return s;
 		};
 		field("Server URL", this.host.data().identity?.host ?? "", 1);
 		field("Pairing code", grant.pairingCode, 2);
 		field("Setup link", grant.setupLink, 3);
-		if (grant.mobileSetupUrl) field("Mobile setup page", grant.mobileSetupUrl, 2);
+		// pairing.ts admits only a URL under the paired server's origin, so opening it is safe.
+		if (page) field("Mobile setup page", page, 2).addButton((b) => b.setButtonText("Open pairing page").onClick(() => { window.open(page, "_blank", "noopener"); }));
 
 		const expiry = contentEl.createEl("p", { cls: "yaos-pairing-code-expiry" });
 		const tick = (): void => {
@@ -206,6 +231,21 @@ export class PairingCodeModal extends Modal {
 		this.timer = window.setInterval(tick, 1000);
 
 		new Setting(contentEl).addButton((b) => b.setButtonText("Done").setCta().onClick(() => this.close()));
+	}
+
+	/** The mobile setup page as a QR code (legacy size and error correction); on failure a short note replaces it. */
+	private renderQr(page: string): void {
+		const wrap = this.contentEl.createDiv({ cls: "yaos-pairing-qr" });
+		const canvas = wrap.createEl("canvas", { cls: "yaos-pairing-qr-canvas", attr: { role: "img", "aria-label": "QR code for the mobile setup page" } });
+		canvas.hidden = true;
+		toCanvas(canvas, page, { width: 220, margin: 1, errorCorrectionLevel: "M" }).then(
+			() => { if (!this.closed) canvas.hidden = false; },
+			() => {
+				if (this.closed) return;
+				canvas.remove();
+				wrap.createEl("p", { cls: "mod-warning", text: "Could not draw the QR code. Use the mobile setup page below." });
+			},
+		);
 	}
 
 	private stopTimer(): void {

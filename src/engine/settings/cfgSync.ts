@@ -8,6 +8,12 @@
  *   -> per write: re-read, skip if the file moved since the snapshot, else
  *      download (blob refs) and writeBytes/remove, then cfgBase (T_cfg).
  *
+ * Clash (clash.ts): while Obsidian Sync or a known sync plugin is enabled here,
+ * a pass reads the snapshot and stops: no ops, no writes, one warn notice.
+ * Size caps: snapshotConfig leaves files over the caps out (held); planCfg also
+ * caps what it writes. Skips the user can act on become warn notices
+ * (cfgNotices.ts), each category shown again only when it gains an item.
+ *
  * Writes go through ConfigDirPort.writeBytes (atomic replace). A crash after a
  * write but before its cfgBase commit leaves local == view, which the next pass
  * records as in sync. A crash after submitCfg but before the base commit re-emits
@@ -21,9 +27,12 @@ import type { StorageDb } from "../../ports/storage";
 import type { ConfigDirPort } from "../../ports/vault";
 import type { BlobTransfer } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
+import { CFG_MAX_FILE_BYTES } from "../../core/limits";
 import { STORE, type CfgBaseRecord } from "../store/schema";
-import { CFG_JSON_FILES, CFG_PLUGINS_FILE, classifyConfigPath, isSyncablePluginId, manifestVersion } from "./allowlist";
-import { planCfg, type CfgFileAction, type CfgLocalFile, type CfgLocalSnapshot, type CfgPlan } from "./cfgPlan";
+import { CFG_JSON_FILES, CFG_PLUGINS_FILE, classifyConfigPath, isSyncablePluginId, readManifest } from "./allowlist";
+import { CfgBudget, planCfg, type CfgFileAction, type CfgHoldReason, type CfgLocalFile, type CfgLocalSnapshot, type CfgPlan } from "./cfgPlan";
+import { CFG_NOTICE_CODES, cfgSkipNotices } from "./cfgNotices";
+import { CFG_CORE_PLUGINS_FILE, clashMessage, detectCfgClash } from "./clash";
 
 /** The cfg side of the log runtime (WP-C). */
 export interface CfgLogPort {
@@ -40,6 +49,19 @@ export interface CfgSyncDeps {
 	readonly blobs: BlobTransfer | null;
 	readonly clock: ClockPort;
 	readonly notice?: (level: "info" | "warn", code: string, detail?: string) => void;
+	/** This device is mobile (PlatformInfo.isMobile): desktop-only plugins are not enabled here. */
+	readonly mobile?: boolean;
+	/**
+	 * The user's answer when turning settings sync on (EngineSettings.syncSettingsSeed). "device": while cfgBase
+	 * is empty (the first pass on this device), this device's values win over the vault's. Default "vault".
+	 */
+	readonly seed?: "device" | "vault";
+	/**
+	 * The cfg stream has been read up to the relay head in this runtime. While cfgBase is empty (first contact) a
+	 * pass waits for it: an empty view would let this device's values win over the vault's whatever the seed.
+	 * Absent: always ready (unit tests).
+	 */
+	readonly remoteReady?: () => boolean;
 }
 
 export interface CfgPassResult {
@@ -47,6 +69,8 @@ export interface CfgPassResult {
 	readonly emitted: number;
 	readonly written: readonly ConfigRelPath[];
 	readonly deferred: readonly ConfigRelPath[];
+	/** Clashing plugin id while settings sync is paused (nothing planned). */
+	readonly paused: string | null;
 }
 
 /** BlobQueue rows need a doc id; cfg blobs use this sentinel. */
@@ -59,18 +83,30 @@ function join(dir: string, path: string): string {
 	return dir ? `${dir}/${name}` : name;
 }
 
+/**
+ * Allowlisted local files. A file over CFG_MAX_FILE_BYTES is held (not read when its listed size already says
+ * so; plugin data.json and theme files are not listed, so they are read first). Then, in path order, files past
+ * CFG_MAX_FILES / CFG_MAX_TOTAL_BYTES are held.
+ */
 export async function snapshotConfig(config: ConfigDirPort): Promise<CfgLocalSnapshot> {
 	const files = new Map<ConfigRelPath, CfgLocalFile>();
 	const installed = new Map<string, string | null>();
-	const mtimes = new Map<string, number>();
+	const pluginNames = new Map<string, string>();
+	const desktopOnly = new Set<string>();
+	const held = new Map<ConfigRelPath, CfgHoldReason>();
+	const stats = new Map<string, { readonly size: number; readonly mtimeMs: number }>();
 	const read = async (path: string): Promise<void> => {
 		if (!classifyConfigPath(path)) return;
+		const st = stats.get(path);
+		if (st && st.size > CFG_MAX_FILE_BYTES) { held.set(path, "too-large"); return; }
 		const bytes = await config.readBytes(path);
-		if (bytes) files.set(path, { bytes, mtimeMs: mtimes.get(path) ?? 0 });
+		if (!bytes) return;
+		if (bytes.length > CFG_MAX_FILE_BYTES) held.set(path, "too-large");
+		else files.set(path, { bytes, mtimeMs: st?.mtimeMs ?? 0 });
 	};
 	const list = async (dir: string) => {
 		const out = await config.list(dir).catch(() => []);
-		for (const e of out) mtimes.set(join(dir, e.path), e.mtimeMs);
+		for (const e of out) stats.set(join(dir, e.path), e);
 		return out.map((e) => ({ path: join(dir, e.path), isFolder: e.isFolder }));
 	};
 	await list(""); // root mtimes
@@ -87,14 +123,25 @@ export async function snapshotConfig(config: ConfigDirPort): Promise<CfgLocalSna
 		if (!isSyncablePluginId(id)) continue;
 		const manifest = await config.readBytes(`${p.path}/manifest.json`);
 		if (manifest === null) continue;
-		installed.set(id, manifestVersion(manifest, decode));
+		const m = readManifest(manifest, decode);
+		installed.set(id, m.version);
+		if (m.name) pluginNames.set(id, m.name);
+		if (m.desktopOnly) desktopOnly.add(id);
 		await read(`${p.path}/data.json`);
 	}
-	return { files, installed };
+	const budget = new CfgBudget();
+	for (const path of [...files.keys()].sort()) {
+		if (budget.admit(files.get(path)!.bytes.length)) continue;
+		files.delete(path);
+		held.set(path, "over-cap");
+	}
+	return { files, installed, pluginNames, desktopOnly, held };
 }
 
 export class CfgSync {
 	private running: Promise<CfgPassResult> | null = null;
+	/** Items last shown per notice code: a code is shown again only when it gains an item. */
+	private readonly shown = new Map<string, ReadonlySet<string>>();
 
 	constructor(private readonly deps: CfgSyncDeps) {}
 
@@ -107,9 +154,19 @@ export class CfgSync {
 	private async run(): Promise<CfgPassResult> {
 		const { db, config, log, clock } = this.deps;
 		const local = await snapshotConfig(config);
+		const clash = detectCfgClash(local.files.get(CFG_CORE_PLUGINS_FILE)?.bytes ?? null, local.files.get(CFG_PLUGINS_FILE)?.bytes ?? null);
+		this.report("settings-clash", clash ? { items: [clash.id], message: clashMessage(clash) } : null);
+		if (clash) return { plan: { actions: [], skipped: [] }, emitted: 0, written: [], deferred: [], paused: clash.id };
 		const rows = await db.tx([STORE.cfgBase], "readonly", (tx) => tx.getAll(STORE.cfgBase));
+		if (rows.length === 0 && this.deps.remoteReady && !this.deps.remoteReady()) {
+			return { plan: { actions: [], skipped: [] }, emitted: 0, written: [], deferred: [], paused: null };
+		}
 		const base = new Map(rows.map((r) => [r.file, r]));
-		const plan = planCfg({ local, base, view: log.view(), nowMs: clock.now() });
+		const view = log.view();
+		const preferLocal = this.deps.seed === "device" && rows.length === 0;
+		const plan = planCfg({ local, base, view, nowMs: clock.now(), mobile: this.deps.mobile ?? false, preferLocal });
+		const notices = cfgSkipNotices(plan, local, view);
+		for (const code of CFG_NOTICE_CODES) this.report(code, notices.find((n) => n.code === code) ?? null);
 		const deferred: ConfigRelPath[] = [];
 		const ready: CfgFileAction[] = [];
 		for (const a of plan.actions) {
@@ -135,7 +192,14 @@ export class CfgSync {
 			reload ||= a.reload;
 		}
 		if (reload) this.deps.notice?.("info", "settings-reload", written.join(", "));
-		return { plan, emitted: ops.length, written, deferred };
+		return { plan, emitted: ops.length, written, deferred, paused: null };
+	}
+
+	private report(code: string, n: { readonly items: readonly string[]; readonly message: string } | null): void {
+		const items = n?.items ?? [];
+		const prev = this.shown.get(code);
+		this.shown.set(code, new Set(items));
+		if (n && items.some((i) => !prev?.has(i))) this.deps.notice?.("warn", code, n.message);
 	}
 
 	private async applyWrite(a: CfgFileAction): Promise<boolean> {

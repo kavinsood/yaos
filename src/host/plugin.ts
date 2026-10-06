@@ -23,7 +23,18 @@ import { BrowserPlatform, browserClock, platformInfoFrom } from "./platform";
 import { YaosController } from "./pluginController";
 import { ObsidianSideFiles } from "./sideFiles";
 import { defaultDeviceName, sanitizePluginData, type YaosUiHost } from "./ui/api";
+import { errorMessage } from "./ui/format";
+import { obsidianRequest } from "./ui/obsidianEnv";
+import { resumePendingEnrollment, type ResumedEnrollment } from "./ui/pairFlow";
+import { retireDeviceEnrollment } from "./ui/pairing";
 import { registerUi } from "./ui/registerUi";
+
+function resumedEnrollmentNotice(r: ResumedEnrollment | null): void {
+	if (r?.ok) new Notice(`YAOS: this device is now paired with ${r.identity.host}.`);
+	else if (r && r.final) new Notice(`YAOS: an interrupted pairing could not finish: ${errorMessage(r.error)}`, 8000);
+	// Best effort and not awaited, so the engine start does not wait on the old server.
+	if (r?.ok && r.replaced) retireDeviceEnrollment(r.replaced, { request: obsidianRequest }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
+}
 
 function workerCarrier(): EngineCarrier | null {
 	if (typeof Worker === "undefined" || typeof Blob === "undefined" || typeof URL.createObjectURL !== "function") return null;
@@ -94,7 +105,7 @@ export default class YaosPlugin extends Plugin {
 					log: (line) => console.debug(`[yaos] ${line}`),
 				}),
 			saveData: (d) => this.saveData(d),
-			notice: (_level, message) => new Notice(message),
+			notice: (_level, message, timeoutMs) => new Notice(message, timeoutMs),
 			log: (line) => console.debug(`[yaos] ${line}`),
 		});
 		this.controller = controller;
@@ -119,8 +130,13 @@ export default class YaosPlugin extends Plugin {
 			},
 		};
 		this.register(registerUi(this, host));
-		// Start after the vault index is complete (no flood of initial "create" events).
-		app.workspace.onLayoutReady(() => void controller.start());
+		// Start after the vault index is complete (no flood of initial "create" events), and after one
+		// retry of an enrollment the last session sent without seeing the answer (none: no request).
+		app.workspace.onLayoutReady(() => {
+			void resumePendingEnrollment(host, { request: obsidianRequest })
+				.then(resumedEnrollmentNotice, () => undefined)
+				.then(() => controller.start());
+		});
 	}
 
 	async onunload(): Promise<void> {

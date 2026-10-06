@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as Y from "yjs";
 import type { DocId } from "../core/types";
 import type { EngineResultValue, MainToEngine } from "../protocol/messages";
-import { BindingManager, conflictCopyPath, type BindingLink } from "./binding";
+import { BindingManager, type BindingLink } from "./binding";
 import { createHasher } from "./hashing";
 import { VirtualClock } from "../sim/clock";
 import { simHashPort } from "../sim/hash";
@@ -34,10 +34,9 @@ class FakeEngine {
 		},
 	};
 
-	add(path: string, text: string, base: string | null = text): { docId: DocId; doc: Y.Doc } {
+	add(path: string, text: string, base: string | null = text, docId = `d:${path}` as DocId): { docId: DocId; doc: Y.Doc } {
 		const doc = new Y.Doc();
 		doc.getText("text").insert(0, text);
-		const docId = `d:${path}` as DocId;
 		this.docs.set(path, { docId, doc, base, frozen: false });
 		return { docId, doc };
 	}
@@ -129,14 +128,27 @@ test("binding: bind-time merge disk-only goes through bindDelta; conflict writes
 	assert.equal(engine.count("localUpdate"), 0, "bind-time merge is not a localUpdate");
 	assert.equal(vb.getText(), "crdt side", "conflict: crdt keeps its side in the editor");
 	assert.equal(engine.text("b.md"), "crdt side");
-	const copy = conflictCopyPath("b.md", "Pixel 8", clock.now(), 1, "utc");
-	assert.match(copy, /^b \(conflict Pixel 8 2026-01-01 0000\)\.md$/);
-	assert.equal(vault.textOf(copy), "disk side", "the disk side is preserved in a conflict copy");
+	assert.equal(vault.textOf("b (conflict Pixel 8 2026-01-01 0000).md"), "disk side", "the disk side is preserved in a conflict copy");
 	const reports = engine.posts.filter((m) => m.t === "boundExternalMerged").map((m) => m.t === "boundExternalMerged" && [m.docId, m.result, m.conflictReason]);
 	assert.deepEqual(reports, [["d:a.md", "disk-only", null], ["d:b.md", "conflict", "both-edited"]]);
 	assert.equal(va.counters.bindMismatch + vb.counters.bindMismatch, 0);
-	// Second conflict copy in the same minute gets a suffix.
-	assert.equal(conflictCopyPath("x/y.md", "a/b:c", 0, 2, "utc"), "x/y (conflict abc 1970-01-01 0000 2).md");
+});
+
+test("binding: conflict copy names come from core conflictName: a name taken on disk gets a suffix, an overlong one the doc-id fallback", async () => {
+	const { clock, vault, ws, engine, bm, notices } = setup();
+	vault.userWrite("x/y.md", "disk side");
+	vault.userWrite("x/y (conflict Pixel 8 2026-01-01 0000).md", "an older copy");
+	engine.add("x/y.md", "crdt side", "base");
+	const long = "s".repeat(240);
+	vault.userWrite(`${long}.md`, "disk side");
+	engine.add(`${long}.md`, "crdt side", "base", "abcdef1234" as DocId);
+	bm.start();
+	assert.ok(ws.openFile("x/y.md") && ws.openFile(`${long}.md`));
+	await clock.advance(10);
+	assert.equal(vault.textOf("x/y (conflict Pixel 8 2026-01-01 0000).md"), "an older copy", "never overwritten");
+	assert.equal(vault.textOf("x/y (conflict Pixel 8 2026-01-01 0000 2).md"), "disk side");
+	assert.equal(vault.textOf(`${"s".repeat(200)} (conflict abcdef12).md`), "disk side");
+	assert.deepEqual(notices.filter((n) => n.startsWith("conflict-copy")), ["conflict-copy", "conflict-copy"]);
 });
 
 test("binding: external reload of a bound view is intercepted and merged (no clobber, merge update, boundSaved)", async () => {
@@ -189,6 +201,7 @@ test("binding: a conflict copy that hits disk errors is retried until written (t
 	assert.ok(copies.some(([, t]) => t.includes("[theirs]")), `external side kept in a conflict copy: ${JSON.stringify(copies)}`);
 	assert.ok(v.getText().includes("[mine]"));
 	assert.ok(!notices.includes("conflict-copy-failed"), JSON.stringify(notices));
+	assert.equal(notices.filter((n) => n === "conflict-copy").length, 1, "one notice once the copy lands");
 });
 
 test("binding: worker killed mid-typing loses nothing (suspend, keep typing, rebind with bindDelta)", async () => {

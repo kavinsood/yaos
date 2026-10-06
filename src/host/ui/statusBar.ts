@@ -1,7 +1,7 @@
 /**
  * Status bar: pure rendering of StatusSnapshot + EngineRunState (DESIGN §j.7: phase + unsynced
  * count), and a small controller that keeps one status bar element up to date.
- * Ported from legacy-src/status/statusBarController.ts.
+ * Ported from the old client (adfa7a7:src/status/statusBarController.ts).
  *
  * No obsidian runtime import: the controller touches only standard DOM APIs on the element it is
  * given, and its timers are injectable, so it is testable in Node with a fake element.

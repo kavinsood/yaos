@@ -9,7 +9,7 @@
 // So the harness gets tested the same way the suites it serves are, and it
 // lives beside the file it guards (like tests/suite-discovery.ts beside
 // tests/run-suites.mjs) rather than in a bucket: it tests test infrastructure,
-// not client, server or contract behaviour, and it is registered explicitly in
+// not server or contract behaviour, and it is registered explicitly in
 // the runner's ROOT_SUITES for exactly that reason.
 //
 // The interesting properties — exit code, output ORDER, and "did the summary

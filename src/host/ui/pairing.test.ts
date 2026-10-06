@@ -4,7 +4,7 @@ import {
 	base64Url, buildSetupLink, DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, enroll, fetchCapabilities,
 	FENCE_RETRY_DELAYS_MS, generateDeviceId, generateDeviceToken, generateEnrollmentRequestId, normalizeHost,
 	normalizePairingCode, PairingError, parseSetupLink, prepareEnrollment, requestPairingCode, runEnrollment,
-	attemptMatches, pairDevice, scrubSecrets,
+	attemptMatches, pairDevice, retireDeviceEnrollment, RETIRE_FAILED_MESSAGE, scrubSecrets,
 	type HttpRequest, type HttpResponse, type PairingDeps,
 } from "./pairing";
 import type { PairedIdentity } from "./api";
@@ -322,6 +322,42 @@ test("requestPairingCode: error mapping never echoes the token", async () => {
 	}
 	const f = fake([{ status: 200, json: { pairingCode: "x" } }]);
 	await assert.rejects(requestPairingCode(IDENTITY, f.deps), (e: unknown) => e instanceof PairingError && e.code === "code_response_invalid");
+});
+
+test("retireDeviceEnrollment: DELETE auth/device with the old Bearer token; 200 and 401 are done", async () => {
+	for (const status of [200, 401]) {
+		const f = fake([{ status, json: status === 200 ? { ok: true, pending: false } : { error: "unauthorized" } }]);
+		await retireDeviceEnrollment(IDENTITY, f.deps);
+		assert.equal(f.calls.length, 1);
+		const call = f.calls[0]!;
+		assert.equal(call.url, "https://sync.example.com/vault/vault%2F1/auth/device");
+		assert.equal(call.method, "DELETE");
+		assert.deepEqual(call.headers, { Authorization: `Bearer ${IDENTITY.deviceToken}` });
+		assert.equal(call.body, undefined);
+	}
+});
+
+test("retireDeviceEnrollment: other statuses and network errors give the console hint and never echo the token", async () => {
+	const cases: [HttpResponse | Error, string, number | null][] = [
+		[{ status: 500, json: { error: "internal" } }, "internal", 500],
+		[{ status: 202, json: { error: "authorization_fence_pending", pending: true } }, "authorization_fence_pending", 202],
+		[{ status: 404, json: null }, "http_error", 404],
+		[new Error(`connect ECONNREFUSED (Bearer ${IDENTITY.deviceToken})`), "network", null],
+	];
+	for (const [response, code, status] of cases) {
+		const f = fake([response]);
+		await assert.rejects(retireDeviceEnrollment(IDENTITY, f.deps), (e: unknown) => {
+			assert.ok(e instanceof PairingError);
+			assert.equal(e.message, RETIRE_FAILED_MESSAGE);
+			assert.equal(e.code, code);
+			assert.equal(e.status, status);
+			assert.equal(`${e.message} ${e.code} ${String(e.stack)}`.includes(IDENTITY.deviceToken), false);
+			return true;
+		});
+	}
+	const bad = fake([{ status: 200, json: null }]);
+	await assert.rejects(retireDeviceEnrollment({ ...IDENTITY, host: "http://example.com" }, bad.deps), (e: unknown) => e instanceof PairingError && e.code === "bad_host");
+	assert.equal(bad.calls.length, 0, "no request to a non-https host");
 });
 
 test("parseSetupLink accepts host + pairing code only", () => {

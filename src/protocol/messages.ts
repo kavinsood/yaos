@@ -36,6 +36,11 @@ export interface EngineSettings {
 	readonly syncAttachments: boolean;
 	readonly maxAttachmentBytes: number;
 	readonly syncSettings: boolean;
+	/**
+	 * The user's answer when turning syncSettings on (DESIGN §j.3): "device" = on this device's first settings pass
+	 * (empty cfgBase), its own values win over the vault's. Absent = "vault".
+	 */
+	readonly syncSettingsSeed?: "device" | "vault";
 	readonly trashMode: TrashMode;
 	/** Use the relay's early provisional broadcast for open notes. */
 	readonly provisionalBroadcast: boolean;
@@ -129,6 +134,35 @@ export interface BindInfo {
 	readonly frozen: boolean;
 }
 
+/** Why a local recovery snapshot was taken (DESIGN §j.4). */
+export type SnapshotReason = "daily" | "brake" | "epoch" | "idb" | "restore" | "manual";
+
+/** One local snapshot (listSnapshots). `bytes` = sum of the file sizes inside, not the zip size. */
+export interface SnapshotSummary {
+	readonly id: string;
+	readonly createdAtMs: number;
+	readonly reason: SnapshotReason;
+	readonly files: number;
+	readonly bytes: number;
+}
+
+/** A file inside a snapshot (snapshotFiles). */
+export interface SnapshotFileEntry {
+	readonly path: VaultPath;
+	readonly kind: DocKind;
+	readonly size: number;
+}
+
+/** A file the snapshot does not contain although it was in the vault when it was taken. */
+export interface SnapshotSkippedEntry {
+	readonly path: VaultPath;
+	readonly reason: "too-large" | "unreadable";
+}
+
+/**
+ * User commands. The snapshot commands, createSnapshot and exportDiagnostics fail with `not-ready`
+ * while the engine has no running vault runtime (instead of answering an empty or `ok` result).
+ */
 export type UserCommand =
 	| { readonly t: "pause" }
 	| { readonly t: "resume" }
@@ -137,8 +171,14 @@ export type UserCommand =
 	| { readonly t: "rejectBrake"; readonly brakeId: string }
 	| { readonly t: "createSnapshot" }
 	| { readonly t: "listSnapshots" }
+	/** -> `snapshotFiles`. Unknown id: `bad-request`. */
+	| { readonly t: "snapshotFiles"; readonly snapshotId: string }
+	/** -> `restored`. paths null = every file in the snapshot. A "restore" snapshot is taken first. */
 	| { readonly t: "restoreSnapshot"; readonly snapshotId: string; readonly paths: readonly VaultPath[] | null }
-	| { readonly t: "exportDiagnostics" }
+	/** -> `ok`. Unknown id: `bad-request`. */
+	| { readonly t: "deleteSnapshot"; readonly snapshotId: string }
+	/** -> `diagnostics`. includePaths: the user opted in to file names (DiagnosticsBundle.paths). */
+	| { readonly t: "exportDiagnostics"; readonly includePaths: boolean }
 	| { readonly t: "rebuildLocalCache" }
 	| { readonly t: "updateSettings"; readonly settings: EngineSettings }
 	| { readonly t: "releaseQuarantine"; readonly stream: string };
@@ -214,7 +254,15 @@ export type EngineResultValue =
 	| { readonly t: "bind"; readonly bind: BindInfo }
 	/** openDoc on an untracked path (excluded, not yet created, oversize). */
 	| { readonly t: "notBindable"; readonly reason: "excluded" | "untracked" | "oversize" | "not-markdown" }
-	| { readonly t: "snapshots"; readonly snapshots: readonly { readonly id: string; readonly createdAtMs: number; readonly files: number; readonly bytes: number }[] }
+	/** listSnapshots, oldest first (ids sort by time). */
+	| { readonly t: "snapshots"; readonly snapshots: readonly SnapshotSummary[] }
+	| { readonly t: "snapshotFiles"; readonly snapshotId: string; readonly files: readonly SnapshotFileEntry[]; readonly skipped: readonly SnapshotSkippedEntry[] }
+	/**
+	 * restoreSnapshot: counts of files written back and of files already identical, the conflict copies made of
+	 * differing current files, and the paths that could not be restored (changed during the restore, unreadable,
+	 * or damaged in the snapshot).
+	 */
+	| { readonly t: "restored"; readonly restored: number; readonly unchanged: number; readonly copies: readonly VaultPath[]; readonly failed: readonly VaultPath[] }
 	| { readonly t: "diagnostics"; readonly bundle: DiagnosticsBundle };
 
 /** Priority lanes (DESIGN §i.1); also tags disk batches so the host executes higher lanes first. */

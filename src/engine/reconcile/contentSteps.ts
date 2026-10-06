@@ -58,6 +58,6 @@ export async function writeConflictCopy(
 		return null;
 	}
 	ctx.echo.expectWrite(ctx.pk(copyPath), out.stat.size, out.stat.mtimeMs);
-	ctx.noteDestructive("conflict");
+	ctx.noteConflictCopy(op.path, copyPath);
 	return { intent, local: ctx.localEntry(copyPath, out.stat, kind, hb.hash, out.fingerprint) };
 }

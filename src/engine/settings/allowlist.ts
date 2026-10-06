@@ -1,20 +1,38 @@
 /**
  * Settings-sync allowlist (DESIGN §j.3). Ported from legacy
- * settingsSync/{allowlist, dataJsonGate, configDirKey} and narrowed to the
- * DESIGN set. Everything here is pure.
+ * settingsSync/{allowlist, dataJsonGate, configDirKey}; the root JSON set is
+ * the legacy one. Everything here is pure.
  *
  * Classes:
- *   json        app.json, appearance.json, hotkeys.json, core-plugins.json  (jsonSet/jsonDel per top-level key)
+ *   json        CFG_JSON_FILES (core settings files, legacy parity)        (jsonSet/jsonDel per top-level key)
  *   plugins     community-plugins.json                                     (pluginSet per plugin id)
  *   pluginData  plugins/<id>/data.json                                     (filePut + pluginVersion gate)
  *   file        snippets/<name>.css, themes/<name>/{theme.css,manifest.json} (filePut/fileDel)
  *
- * Never synced: plugins/yaos/** (and the QA harness), workspace*.json, plugin
- * code (main.js, styles.css), caches, anything not listed above.
+ * Never synced: plugins/yaos/** (and the QA harness), workspace.json and
+ * workspace-mobile.json (open-pane layout), plugin code (main.js, styles.css),
+ * caches, anything not listed above. Like legacy, file-recovery.json,
+ * publish.json and types.json stay unsynced.
  */
 import type { ConfigRelPath } from "../../core/types";
 
-export const CFG_JSON_FILES = ["app.json", "appearance.json", "hotkeys.json", "core-plugins.json"] as const;
+/** Root JSON settings files: the legacy SETTINGS_SYNC_ROOT_JSON set. */
+export const CFG_JSON_FILES = [
+	"app.json",
+	"appearance.json",
+	"hotkeys.json",
+	"core-plugins.json",
+	"core-plugins-migration.json",
+	"graph.json",
+	"daily-notes.json",
+	"templates.json",
+	"backlink.json",
+	"page-preview.json",
+	"note-composer.json",
+	"switcher.json",
+	"bookmarks.json",
+	"workspaces.json",
+] as const;
 export const CFG_PLUGINS_FILE = "community-plugins.json";
 /** Plugin ids whose folders and enablement are never touched by settings sync. */
 export const CFG_SKIP_PLUGIN_IDS: readonly string[] = ["yaos", "yaos-qa-harness"];
@@ -22,11 +40,14 @@ export const CFG_SKIP_PLUGIN_IDS: readonly string[] = ["yaos", "yaos-qa-harness"
 export const CFG_INLINE_MAX_BYTES = 64 * 1024;
 
 /**
- * Device-local top-level keys: never emitted, never overwritten. Platform
- * dependent appearance switches only (decision; DESIGN names no keys).
+ * Device-local top-level keys: never emitted, never overwritten (decision;
+ * DESIGN names no keys). Platform-dependent appearance switches, and the
+ * saved layout this device last loaded (workspaces.json `active`, rewritten
+ * by Obsidian on every switch; the saved layouts themselves sync).
  */
 export const CFG_DEVICE_LOCAL_KEYS: Readonly<Record<string, readonly string[]>> = {
 	"appearance.json": ["nativeMenus", "translucency"],
+	"workspaces.json": ["active"],
 };
 
 export type CfgFileClass =
@@ -90,15 +111,24 @@ export function sanitizeConfigDirKey(basename: string): string | null {
 	return basename;
 }
 
-/** `version` from a plugin manifest.json, or null when missing/invalid. */
-export function manifestVersion(bytes: Uint8Array | null, decode: (b: Uint8Array) => string | null): string | null {
-	if (!bytes) return null;
-	const text = decode(bytes);
-	if (text === null) return null;
+export interface PluginManifestInfo {
+	readonly version: string | null;
+	/** Display name. */
+	readonly name: string | null;
+	/** `isDesktopOnly: true`: Obsidian does not load the plugin on mobile. */
+	readonly desktopOnly: boolean;
+}
+
+/** The fields settings sync reads from a plugin manifest.json; null / false when missing or invalid. */
+export function readManifest(bytes: Uint8Array | null, decode: (b: Uint8Array) => string | null): PluginManifestInfo {
+	const none = { version: null, name: null, desktopOnly: false };
+	const text = bytes ? decode(bytes) : null;
+	if (text === null) return none;
 	try {
-		const v = (JSON.parse(text) as { version?: unknown }).version;
-		return typeof v === "string" && v.length > 0 ? v : null;
+		const m = JSON.parse(text) as { version?: unknown; name?: unknown; isDesktopOnly?: unknown } | null;
+		const str = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
+		return { version: str(m?.version), name: str(m?.name), desktopOnly: m?.isDesktopOnly === true };
 	} catch {
-		return null;
+		return none;
 	}
 }

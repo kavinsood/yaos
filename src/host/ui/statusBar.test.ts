@@ -29,6 +29,7 @@ function snap(phase: EnginePhase, over: Partial<Omit<StatusSnapshot, "counts">> 
 		lastFullReconcileAtMs: null,
 		lastSyncedAtMs: null,
 		dailyFramesUsed: 0,
+		maxBlobBytes: null,
 		notices: [],
 		...rest,
 	};

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { generatePlan, minimizePlan, runSim, type SimConfig, type SimReport, type Step } from "./run";
 import { DEFAULT_FAULTS } from "./faults";
 import { checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
-import { TokenLedger } from "./actors";
+import { runUserAction, TokenLedger } from "./actors";
 import { SimDevice } from "./device";
 import { SimNet } from "./net";
 import { VirtualClock } from "./clock";
@@ -97,6 +97,22 @@ test("invariants: divergent bytes, a missing file and a doc that never reached t
 	assert.ok(v.some((d) => d === "only-a.md on A, missing on B"), JSON.stringify(v));
 	assert.ok(v.some((d) => d === "x.md never reached the relay"), JSON.stringify(v));
 	assert.ok(v.some((d) => d === "relay doc ghost.md has no file"), JSON.stringify(v));
+});
+
+test("actors: a backgrounded app takes no user actions; other programs still write its files (sim seed 131)", async () => {
+	const { a, b } = twoDevices();
+	const ledger = new TokenLedger();
+	let background = true;
+	const w = { devs: [a, b], ledger, isDown: () => false, isBackground: (i: number) => i === 0 && background };
+	a.vault.userWrite("notes/n0.md", "seed\n");
+	assert.equal(await runUserAction(w, { t: "create", dev: 0, name: 1 }, 5), "skip A create: app in background");
+	assert.equal(await runUserAction(w, { t: "diskInsert", dev: 0, file: 0, pos: 0, by: "user" }, 6), "skip A diskInsert: app in background");
+	assert.equal(await runUserAction(w, { t: "diskInsert", dev: 0, file: 0, pos: 0, by: "external" }, 7), "A diskInsert(external) notes/n0.md@0 [A.7]");
+	assert.equal(a.vault.textOf("notes/n0.md"), "[A.7] seed\n");
+	assert.equal(await runUserAction(w, { t: "create", dev: 1, name: 1 }, 8), "B create notes/n1.md new [B.8]");
+	background = false;
+	assert.equal(await runUserAction(w, { t: "create", dev: 0, name: 2 }, 9), "A create notes/n2.md new [A.9]");
+	assert.deepEqual([...ledger.entries.keys()], ["[A.7]", "[B.8]", "[A.9]"]);
 });
 
 test("invariants: a lost live token and a destroyed version are reported; deleted tokens are exempt", () => {

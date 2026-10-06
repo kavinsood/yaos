@@ -21,7 +21,7 @@ import type { EnginePorts } from "../../ports";
 import { findKnownEpoch } from "./knownEpoch";
 import { isStorageError } from "../../ports/storage";
 import type { VaultEvent } from "../../ports/vault";
-import type { ProtocolError } from "../../protocol/errors";
+import { ProtocolFailure, type ProtocolError } from "../../protocol/errors";
 import { PROTOCOL_VERSION, type EngineInitConfig, type EngineResultValue, type EngineSettings, type LocalObservation, type MainToEngine, type UserCommand } from "../../protocol/messages";
 import type { StatusSnapshot } from "../../protocol/status";
 import type { EngineTransport } from "../../protocol/transport";
@@ -148,7 +148,7 @@ export class ComposedEngine {
 		void this.dispatch(m).catch((e) => {
 			const message = e instanceof Error ? e.message : String(e);
 			this.log(`dispatch ${m.t} failed: ${message}`);
-			if ("rid" in m) this.fail(m.rid, { code: "internal", message, retryable: true });
+			if ("rid" in m) this.fail(m.rid, e instanceof ProtocolFailure ? e.error : { code: "internal", message, retryable: true });
 		});
 	}
 
@@ -382,8 +382,15 @@ export class ComposedEngine {
 				await this.restart("rebuild", async () => undefined);
 				return { t: "ok" };
 			}
+			case "createSnapshot":
 			case "listSnapshots":
-				return rt ? rt.command(c) : { t: "snapshots", snapshots: [] };
+			case "snapshotFiles":
+			case "restoreSnapshot":
+			case "deleteSnapshot":
+			case "exportDiagnostics":
+				// An empty list or `ok` here would read as "no snapshots" / "done".
+				if (!rt) throw new ProtocolFailure({ code: "not-ready", message: "the sync engine is not running", retryable: true });
+				return rt.command(c);
 			default:
 				return rt ? rt.command(c) : { t: "ok" };
 		}

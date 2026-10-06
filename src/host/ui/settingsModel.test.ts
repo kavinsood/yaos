@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-	applyControl, CONTROL_KEYS, connectionRows, engineAcceptsCommands, engineRows, isControlKey, isPaused, parseExcludePatterns,
-	phaseLabel, readControl, runStateLabel, validateControl,
+	applyControl, ATTACHMENT_SIZE_DESC, attachmentSizeDesc, CONTROL_KEYS, connectionRows, enableSettingsSync, engineAcceptsCommands,
+	engineRows, isControlKey, isPaused, parseExcludePatterns, phaseLabel, readControl, runStateLabel, serverConsoleUrl, TRASH_MODE_OPTIONS, validateControl,
 } from "./settingsModel";
-import { defaultPluginData, MIB, sanitizePluginData, type PairedIdentity } from "./api";
+import { defaultPluginData, MIB, sanitizePluginData, TRASH_MODES, type PairedIdentity } from "./api";
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
 
 const TOKEN = "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
@@ -24,6 +24,7 @@ test("every control key reads back what it writes, through the sanitizer", () =>
 		provisionalBroadcast: false,
 		snapshotsEnabled: false,
 		snapshotsKeepDaily: 30,
+		snapshotsUpload: true,
 		showStatusBar: false,
 	};
 	let data = base;
@@ -51,7 +52,7 @@ test("validation rejects bad values with readable messages and applyControl thro
 		["excludePatterns", Array.from({ length: 501 }, (_, i) => `p${i}`).join("\n")], ["excludePatterns", "y".repeat(513)],
 		["maxAttachmentMb", 0], ["maxAttachmentMb", 1025], ["maxAttachmentMb", 2.5], ["maxAttachmentMb", Number.NaN], ["maxAttachmentMb", "5"],
 		["snapshotsKeepDaily", 0], ["snapshotsKeepDaily", 91],
-		["trashMode", "rm"], ["syncAttachments", "yes"],
+		["trashMode", "rm"], ["syncAttachments", "yes"], ["snapshotsUpload", 1],
 	];
 	const d = defaultPluginData("Mac");
 	for (const [key, value] of bad) {
@@ -61,6 +62,34 @@ test("validation rejects bad values with readable messages and applyControl thro
 	}
 	assert.equal(validateControl("maxAttachmentMb", 1024), null);
 	assert.equal(validateControl("snapshotsKeepDaily", 90), null);
+});
+
+test("trashMode: follow-obsidian is the default and listed first; every mode validates, applies and survives the sanitizer", () => {
+	assert.deepEqual(Object.keys(TRASH_MODE_OPTIONS), [...TRASH_MODES]);
+	assert.equal(TRASH_MODES[0], "follow-obsidian");
+	assert.match(TRASH_MODE_OPTIONS["follow-obsidian"], /Files and links → Deleted files/);
+	assert.equal(defaultPluginData("Mac").engine.trashMode, "follow-obsidian");
+	for (const mode of TRASH_MODES) {
+		assert.equal(validateControl("trashMode", mode), null, mode);
+		const d = applyControl(defaultPluginData("Mac"), "trashMode", mode);
+		assert.equal(readControl(d, "trashMode"), mode);
+		assert.equal(sanitizePluginData(JSON.parse(JSON.stringify(d)), "Mac").engine.trashMode, mode);
+	}
+});
+
+test("enableSettingsSync turns settings sync on with the seed answer, which survives the sanitizer; turning it off keeps the rest", () => {
+	const base = defaultPluginData("Mac");
+	assert.equal(base.engine.syncSettingsSeed, undefined);
+	for (const seed of ["device", "vault"] as const) {
+		const on = enableSettingsSync(base, seed);
+		assert.equal(on.engine.syncSettings, true);
+		assert.equal(on.engine.syncSettingsSeed, seed);
+		assert.deepEqual(sanitizePluginData(JSON.parse(JSON.stringify(on)), "Mac"), on);
+		assert.equal(applyControl(on, "syncSettings", false).engine.syncSettings, false);
+	}
+	const junk = sanitizePluginData({ ...base, engine: { ...base.engine, syncSettingsSeed: "mine" } }, "Mac");
+	assert.equal(junk.engine.syncSettingsSeed, undefined);
+	assert.deepEqual(base, defaultPluginData("Mac"));
 });
 
 test("isControlKey and parseExcludePatterns", () => {
@@ -79,6 +108,16 @@ test("connectionRows mask the device token and never show it", () => {
 	assert.equal(connectionRows(null).length, 1);
 });
 
+test("serverConsoleUrl: the stored host's origin over http(s), else null", () => {
+	assert.equal(serverConsoleUrl(IDENTITY), "https://sync.example.com/");
+	assert.equal(serverConsoleUrl({ ...IDENTITY, host: "https://sync.example.com/sub/path?q=1#frag" }), "https://sync.example.com/");
+	assert.equal(serverConsoleUrl({ ...IDENTITY, host: "http://127.0.0.1:8787" }), "http://127.0.0.1:8787/");
+	for (const host of ["javascript:alert(1)", "file:///etc/passwd", "obsidian://yaos", "not a url", "", "https://user:pw@sync.example.com"]) {
+		assert.equal(serverConsoleUrl({ ...IDENTITY, host }), null, host);
+	}
+	assert.equal(serverConsoleUrl(null), null);
+});
+
 function snap(phase: EnginePhase, over: Partial<StatusSnapshot> = {}): StatusSnapshot {
 	return {
 		phase, deviceClass: "desktop", transport: "worker", vaultEpoch: "e", vaultSeq: 1, headSeq: 1,
@@ -87,7 +126,7 @@ function snap(phase: EnginePhase, over: Partial<StatusSnapshot> = {}): StatusSna
 			liveDocs: 0, staleStreams: 0, outboxFrames: 2, outboxBytes: 0, unreceiptedFrames: 1, residentDocs: 0, residentBytesEstimate: 0,
 			pendingDiskOps: 0, pendingBlobs: 0, quarantinedRows: 1, frozenDocs: 0, conflictCopiesToday: 0,
 		},
-		bootstrap: null, brake: null, lastFullReconcileAtMs: null, lastSyncedAtMs: null, dailyFramesUsed: 0, notices: [],
+		bootstrap: null, brake: null, lastFullReconcileAtMs: null, lastSyncedAtMs: null, dailyFramesUsed: 0, maxBlobBytes: null, notices: [],
 		...over,
 	};
 }
@@ -112,4 +151,15 @@ test("engine rows and labels", () => {
 	assert.equal(engineAcceptsCommands({ phase: "stopped", transport: null, lastError: null }), false);
 	assert.equal(isPaused(snap("paused")), true);
 	assert.equal(isPaused(null), false);
+});
+
+test("attachment size description names the open carrier's limit when the status has it, rounded down", () => {
+	assert.equal(attachmentSizeDesc(null), ATTACHMENT_SIZE_DESC);
+	assert.equal(attachmentSizeDesc(snap("starting")), ATTACHMENT_SIZE_DESC, "no vault open yet");
+	const tail = "; the smaller limit applies.";
+	assert.equal(attachmentSizeDesc(snap("live", { maxBlobBytes: 10 * MIB })), `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to 10 MB${tail}`);
+	for (const [bytes, size] of [[8 * MIB, "8 MB"], [1.5 * MIB, "1.5 MB"], [10 * MIB + 1, "10 MB"], [1.99 * MIB, "1.9 MB"], [512 * 1024, "512 KB"], [10, "1 KB"]] as const) {
+		assert.equal(attachmentSizeDesc(snap("live", { maxBlobBytes: bytes })), `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to ${size}${tail}`);
+	}
+	for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) assert.equal(attachmentSizeDesc(snap("live", { maxBlobBytes: bad })), ATTACHMENT_SIZE_DESC);
 });

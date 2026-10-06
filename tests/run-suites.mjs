@@ -4,7 +4,7 @@
 // if any suite fails.
 //
 // DISCOVERY, NOT REGISTRATION. A regression suite is any `*.ts` file inside
-// tests/client/, tests/server/ or tests/contracts/ that is not named in
+// tests/server/ or tests/contracts/ that is not named in
 // tests/suites.json.
 // There is no list to append to: this runner replaced one that had silently
 // orphaned two real unit suites (458 + 364 LOC, 146 assertions).
@@ -67,10 +67,10 @@ const RUNNER = ["node", "tests/run-typescript.mjs", "--test-aliases"];
 // rather than a copy of it that could drift.
 // -----------------------------------------------------------------------
 
-// The three regression buckets. Everything else under tests/ is
+// The two regression buckets. Everything else under tests/ is
 // infrastructure — this runner, suites.json, harness.ts, mocks/, fixtures/ and
 // manual/ — and is not a discovery candidate, so it needs no registry excuse.
-const BUCKETS = ["client", "server", "contracts"];
+const BUCKETS = ["server", "contracts"];
 
 // The suites that cannot live in a bucket: they guard this runner's own
 // discovery functions and the shared assertion harness every bucket suite

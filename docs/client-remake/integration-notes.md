@@ -25,6 +25,21 @@ The last code change is 5735ad5; 5b1803e touches only the e2e harness
 (onboarding sends an `Origin` header, §7). The commit after it holds only
 these notes.
 
+Integration, client-remake after merging the server rewrite (PR #82), the
+latency, E2EE design and legacy branches, all on one tree:
+- typecheck (client, tests, `server` tsc): clean; check-deps 327 files, 0
+  errors, 0 warnings;
+- `npm run test:client`: 837 pass; `npm run test:regressions`: 18/18 suites;
+- local relay e2e: full 53/53, smoke 56/56, relay smoke 31/31, engines with
+  relay restart 27/27;
+- production build: OK, plugin smoke passes; `main.js` 616.2 KiB (qrcode and
+  the legacy-parity UI on top of 558.9 KiB).
+
+The legacy merge took every delete over every edit. It also removed what PR
+#82 had kept only for the old client and its tests: `legacy-src/shared` (18
+modules, no importer in `src/`), `tests/client`, and the old recovery decode
+helper. The suite-discovery floor is 10, since 18 suites remain.
+
 Latency pass, branch `client-remake-latency`, code as of 33d3631: the latency
 commits plus the merge of client-remake 7208184, the server rewrite (§7.1):
 
@@ -41,6 +56,24 @@ commits plus the merge of client-remake 7208184, the server rewrite (§7.1):
 
 Before the merge (a5ab167) the same gates passed: check-deps 303 files,
 deployed e2e 50/50 twice, `main.js` 987.0 KiB, zip 342,009 B.
+
+After the legacy port and the deletion of the old client (branch
+client-remake-legacy, code at 1a69e4a), the gates are:
+- typecheck: clean;
+- check-deps: 0 errors, 0 warnings;
+- `npm run test:client`: 815 tests pass;
+- the production build passes its plugin smoke test;
+- the local full-client e2e: 53/53.
+
+The sim sweep at 1a69e4a found no bad seeds: 3 devices with faults, seeds
+1-1000; 5 devices, 1-250; heavy, 1-500 (§6).
+
+`npm run lint` does not run, and it fails the same way at 9b618d5. ESLint
+aborts on `e2e/client/*.ts`, which no typed project covers. With `e2e/`
+ignored it reports 2078 problems: 1279 in `src/`, 767 in `packages/cli`
+(since deleted with the old
+server, PR #82) and 32 in `server/`. The new
+client has never been linted.
 
 ### 1.1 Real-device relay
 
@@ -264,7 +297,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   delete waits while the deleter's own body frames are unsequenced, so a body
   record stuck in the outbox (poisoned) holds that delete until it is resolved.
 - Divergence (V3 digest) is not implemented; `divergence` is always false.
-- `conflictCopiesToday` is always 0 and bootstrap progress is null in status.
+- Bootstrap progress is null in status. `conflictCopiesToday` (0db3bb7) is
+  kept in memory: it restarts at 0 with the engine and does not count copies
+  made from an open editor.
 - A job-level overwrite rejected through `rejectBrake` is not persisted; the
   brake comes back on the next pass. Planner-held ops are handled.
 - Collapse noise: a third device can materialize a suffixed loser
@@ -345,6 +380,30 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   the host uses inline. This is verified in V8 and JavaScriptCore, but not yet on
   an iOS device.
 
+**Legacy parity** (the full map is legacy-parity.md)
+- Device and member management (roster, revoke, rename, invite a person,
+  ownership transfer, leave) lives only in the server's operator console. The
+  plugin pairs this device and creates pairing codes for your other devices.
+- A snapshot uploaded to attachment storage cannot be restored on another
+  device: cross-device restore is out of scope for v1 (§j.4).
+- Settings sync: while `cfgBase` is empty, a pass waits until this runtime has
+  read the cfg stream to the relay head (the log reached `live`, 66c8a4c). A
+  device that never reaches `live` never runs its first settings pass.
+- Lifecycle (4a14c02): on desktop and tablet `hidden` only flushes and keeps
+  the socket (an occluded desktop window also reports hidden). The hidden
+  state is not carried across an engine restart.
+- Since 4a14c02 a backgrounded app runs no passes, so the sim's users no
+  longer act on a hidden or frozen app; the external writer still does
+  (1a69e4a, §6 seed 131). Several disk writes made while the app is in the
+  background reach the engine as one change on resume. The diff of that
+  change can then reuse characters of a deleted word. Example: delete
+  "[C.42]" and add "[C.105]" diffs as "42" -> "105". A concurrent delete of
+  "[C.42]" on another device then leaves "105". This is the same as an
+  in-place edit of the word, which minimalDiff keeps minimal by design
+  ("foo(bar)" -> "foo(baz)").
+- The daily-limit popup (once per reset window) forgets that it was shown
+  when the engine restarts.
+
 **Tests and sim**
 - Token survival (`vaultTokens`) is checked against device A's vault only
   (after convergence every vault is equal, so this only matters when
@@ -402,6 +461,20 @@ ordering bugs (heavy 119, 246) and the waiting-delete case behind D17
 
 Final run on 5735ad5: 3000 + 250 + 250 seeds, 0 bad, 0 token failures;
 `npm run test:client` (743 tests including the 200-seed sim) passes.
+
+**Seed 131.** On client-remake-legacy, 3 devices with default faults, seed
+131 lost a token after the lifecycle commit 4a14c02. A bisect from 9b618d5
+found 4a14c02 as the first bad commit. The cause:
+1. The user typed through device C while it was frozen.
+2. The engine had paused passes, as §i.4 requires, so a delete of "[C.42]"
+   and an insert of "[C.105]" reached it as one diff, "42" -> "105".
+3. A concurrent delete of "[C.42]" elsewhere took the reused brackets.
+
+The fix (1a69e4a) is in the sim, not the engine: actors skip user actions
+while a device is backgrounded, and external writes still run (DESIGN §l.1).
+At 1a69e4a the sweep found no bad seeds: 3 devices with faults, seeds
+1-1000; 5 devices, 1-250; heavy, 1-500. The same 1000-seed sweep at 9b618d5
+found none either.
 
 
 ## 7. End-to-end results

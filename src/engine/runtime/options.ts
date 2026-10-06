@@ -113,6 +113,8 @@ export interface EngineOptions {
 	onOwnBodySettled?(docIds: readonly DocId[]): void;
 	onStatus?(status: StatusSnapshot): void;
 	onDiag?(event: DiagnosticsEvent): void;
+	/** A popup for the user (status notices stay in onStatus): the daily-limit warning. */
+	onHostNotice?(level: "warn", code: string, message: string): void;
 }
 
 export function resolveTuning(t: Partial<EngineTuning> | undefined): EngineTuning {

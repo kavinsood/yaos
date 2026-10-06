@@ -3,10 +3,11 @@
  * read-only info rows (connection, engine). No obsidian runtime import.
  */
 
+import type { TrashMode } from "../../ports/vault";
 import type { StatusSnapshot } from "../../protocol/status";
 import {
 	MAX_ATTACHMENT_BYTES_LIMIT, MAX_DEVICE_LABEL_CHARS, MAX_EXCLUDE_PATTERN_CHARS, MAX_EXCLUDE_PATTERNS, MAX_KEEP_DAILY, MIB,
-	sanitizeDeviceLabel,
+	isTrashMode, sanitizeDeviceLabel,
 	type EngineRunState, type PairedIdentity, type YaosPluginData,
 } from "./api";
 import { formatAgo, formatDuration, maskSecret, plural } from "./format";
@@ -22,6 +23,7 @@ export const CONTROL_KEYS = [
 	"provisionalBroadcast",
 	"snapshotsEnabled",
 	"snapshotsKeepDaily",
+	"snapshotsUpload",
 	"showStatusBar",
 ] as const;
 
@@ -32,7 +34,22 @@ export const TEXT_CONTROL_KEYS: ReadonlySet<ControlKey> = new Set<ControlKey>(["
 
 export const MAX_ATTACHMENT_MB = MAX_ATTACHMENT_BYTES_LIMIT / MIB;
 
-export const TRASH_MODE_OPTIONS: Readonly<Record<string, string>> = Object.freeze({
+export const ATTACHMENT_SIZE_DESC = "Larger attachments stay on this device.";
+
+/**
+ * Description of the attachment size control. The engine skips attachments over
+ * min(this setting, the open carrier's limit) (engine/reconcile/localState.ts); once the status
+ * carries that limit (StatusSnapshot.maxBlobBytes), say so. Rounded down, never overstated.
+ */
+export function attachmentSizeDesc(status: StatusSnapshot | null): string {
+	const max = status?.maxBlobBytes;
+	if (typeof max !== "number" || !Number.isFinite(max) || max <= 0) return ATTACHMENT_SIZE_DESC;
+	const size = max >= MIB ? `${Math.floor((max / MIB) * 10) / 10} MB` : `${Math.max(1, Math.floor(max / 1024))} KB`;
+	return `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to ${size}; the smaller limit applies.`;
+}
+
+export const TRASH_MODE_OPTIONS: Readonly<Record<TrashMode, string>> = Object.freeze({
+	"follow-obsidian": "Follow Obsidian (Files and links → Deleted files)",
 	"obsidian-trash": "Obsidian trash (.trash folder)",
 	"system-trash": "System trash",
 });
@@ -66,6 +83,7 @@ export function readControl(data: YaosPluginData, key: ControlKey): string | num
 		case "provisionalBroadcast": return e.provisionalBroadcast;
 		case "snapshotsEnabled": return e.snapshots.enabled;
 		case "snapshotsKeepDaily": return e.snapshots.keepDaily;
+		case "snapshotsUpload": return e.snapshots.uploadToBlobStore;
 		case "showStatusBar": return data.showStatusBar;
 	}
 }
@@ -95,11 +113,12 @@ export function validateControl(key: ControlKey, value: unknown): string | null 
 		}
 		case "maxAttachmentMb": return intError(value, 1, MAX_ATTACHMENT_MB, "MB");
 		case "snapshotsKeepDaily": return intError(value, 1, MAX_KEEP_DAILY, "days");
-		case "trashMode": return value === "obsidian-trash" || value === "system-trash" ? null : "Choose a trash mode.";
+		case "trashMode": return isTrashMode(value) ? null : "Choose a trash mode.";
 		case "syncAttachments":
 		case "syncSettings":
 		case "provisionalBroadcast":
 		case "snapshotsEnabled":
+		case "snapshotsUpload":
 		case "showStatusBar":
 			return typeof value === "boolean" ? null : "Expected on or off.";
 	}
@@ -127,12 +146,23 @@ export function applyControl(data: YaosPluginData, key: ControlKey, value: unkno
 		case "syncAttachments": return { ...data, engine: { ...e, syncAttachments: value as boolean } };
 		case "maxAttachmentMb": return { ...data, engine: { ...e, maxAttachmentBytes: (value as number) * MIB } };
 		case "syncSettings": return { ...data, engine: { ...e, syncSettings: value as boolean } };
-		case "trashMode": return { ...data, engine: { ...e, trashMode: value as "obsidian-trash" | "system-trash" } };
+		case "trashMode": return { ...data, engine: { ...e, trashMode: value as TrashMode } };
 		case "provisionalBroadcast": return { ...data, engine: { ...e, provisionalBroadcast: value as boolean } };
 		case "snapshotsEnabled": return { ...data, engine: { ...e, snapshots: { ...e.snapshots, enabled: value as boolean } } };
 		case "snapshotsKeepDaily": return { ...data, engine: { ...e, snapshots: { ...e.snapshots, keepDaily: value as number } } };
+		case "snapshotsUpload": return { ...data, engine: { ...e, snapshots: { ...e.snapshots, uploadToBlobStore: value as boolean } } };
 		case "showStatusBar": return { ...data, showStatusBar: value as boolean };
 	}
+}
+
+export type SettingsSeed = "device" | "vault";
+
+/**
+ * Turns settings sync on with the user's answer to "whose settings first?" (DESIGN §j.3). The seed only
+ * matters on the engine's first settings pass on this device (empty base); later passes merge normally.
+ */
+export function enableSettingsSync(data: YaosPluginData, seed: SettingsSeed): YaosPluginData {
+	return { ...data, engine: { ...data.engine, syncSettings: true, syncSettingsSeed: seed } };
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +183,23 @@ export function connectionRows(identity: PairedIdentity | null): InfoRow[] {
 		{ name: "Device name", value: identity.deviceName || "(unnamed)" },
 		{ name: "Device token", value: maskSecret(identity.deviceToken) },
 	];
+}
+
+/**
+ * The server's operator console: its home page (relay2 server/src/index.ts:178 routes GET / to the
+ * console or its login), from the stored host. http(s) only; null when unpaired or the host is not
+ * such a URL. The old client opened the host as typed (adfa7a7:src/main.ts:3476-3483).
+ */
+export function serverConsoleUrl(identity: PairedIdentity | null): string | null {
+	if (!identity) return null;
+	let url: URL;
+	try {
+		url = new URL(identity.host);
+	} catch {
+		return null;
+	}
+	if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) return null;
+	return `${url.origin}/`;
 }
 
 export function runStateLabel(run: EngineRunState): string {

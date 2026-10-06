@@ -7,10 +7,11 @@ import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import { badRequest } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
-import { utf8Encode } from "../../core/codec/lib0";
 import { encodeStateAsUpdate } from "../body/yjsCounters";
+import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
 import { dbName, STORE } from "../store/schema";
 import { readBase } from "../reconcile/store";
 import type { VaultRuntime } from "./vaultRuntime";
@@ -104,20 +105,33 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 			return { t: "ok" };
 		}
 		case "createSnapshot":
-			await rt.takeSnapshot("manual");
+			// null: over the size cap (a notice says so) or the write failed (logged).
+			if ((await rt.takeSnapshot("manual")) === null) throw new Error("the snapshot could not be saved (vault over the 256 MiB snapshot limit, or a write error)");
 			return { t: "ok" };
 		case "listSnapshots": {
 			const list = await rt.snaps.list();
-			return { t: "snapshots", snapshots: list.map((s) => ({ id: s.id, createdAtMs: s.createdAtMs, files: s.files, bytes: s.bytes })) };
+			return { t: "snapshots", snapshots: list.map((s) => ({ id: s.id, createdAtMs: s.createdAtMs, reason: s.reason, files: s.files, bytes: s.bytes })) };
+		}
+		case "snapshotFiles": {
+			const m = await rt.snaps.manifest(c.snapshotId);
+			if (!m) throw badRequest(`snapshot ${c.snapshotId} not found`);
+			return {
+				t: "snapshotFiles", snapshotId: c.snapshotId,
+				files: m.files.map((f) => ({ path: f.path, kind: f.kind, size: f.size })),
+				skipped: m.skipped.map((f) => ({ path: f.path, reason: f.reason })),
+			};
 		}
 		case "restoreSnapshot": {
 			const r = await rt.snaps.restore(c.snapshotId, c.paths);
 			rt.diag(`restore ${c.snapshotId}: ${r.restored.length} restored, ${r.copies.length} copies, ${r.failed.length} failed`);
 			rt.sched.request({ t: "full" }, true);
-			return { t: "ok" };
+			return { t: "restored", restored: r.restored.length, unchanged: r.unchanged.length, copies: r.copies, failed: r.failed };
 		}
+		case "deleteSnapshot":
+			await rt.snaps.remove(c.snapshotId);
+			return { t: "ok" };
 		case "exportDiagnostics":
-			return { t: "diagnostics", bundle: await diagnostics(rt) };
+			return { t: "diagnostics", bundle: await diagnostics(rt, c.includePaths === true) };
 		case "releaseQuarantine": {
 			const docId = streamDocId(c.stream as StreamName);
 			if (docId) await rt.log.releaseQuarantine(docId);
@@ -129,29 +143,23 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 	}
 }
 
-async function diagnostics(rt: VaultRuntime): Promise<DiagnosticsBundle> {
+async function diagnostics(rt: VaultRuntime, includePaths: boolean): Promise<DiagnosticsBundle> {
 	const c = rt.log.c;
 	const quarantine: { stream: string; seq: number; reason: string; bytes: number }[] = [];
-	const frozenDocs: { pathHash: string; reason: string }[] = [];
+	const frozen: { stream: string; reason: string }[] = [];
 	for (const s of c.repo.streams()) {
-		if (s.frozen === 1) frozenDocs.push({ pathHash: await shortHash(rt, s.stream), reason: s.frozenReason ?? "frozen" });
-		if (quarantine.length < 200) for (const q of await c.repo.quarantineOf(s.stream)) quarantine.push({ stream: s.stream, seq: q.seq, reason: q.reason, bytes: q.bytes.length });
+		if (s.frozen === 1) frozen.push({ stream: s.stream, reason: s.frozenReason ?? "frozen" });
+		if (quarantine.length < DIAGNOSTICS_QUARANTINE_MAX) for (const q of await c.repo.quarantineOf(s.stream)) quarantine.push({ stream: s.stream, seq: q.seq, reason: q.reason, bytes: q.bytes.length });
 	}
 	const stores: Record<string, { records: number; bytes: number }> = {};
 	stores[STORE.synced] = { records: rt.rec.ctx.store.synced.size, bytes: 0 };
 	stores[STORE.outbox] = { records: [...c.outbox.values()].length, bytes: 0 };
 	stores[STORE.intents] = { records: rt.rec.ctx.store.intents.size, bytes: 0 };
-	return {
+	const synced = rt.rec.ctx.store.synced;
+	return buildDiagnosticsBundle({
 		generatedAtMs: rt.o.ports.clock.now(), clientVersion: rt.o.clientVersion, status: rt.status(),
-		recentEvents: rt.log.diagnostics().slice(-200), quarantine, frozenDocs, stores, paths: null,
-	};
-}
-
-async function shortHash(rt: VaultRuntime, s: string): Promise<string> {
-	const h = await rt.o.ports.hash.sha256(utf8Encode(s));
-	let out = "";
-	for (let i = 0; i < 6; i++) out += h[i]!.toString(16).padStart(2, "0");
-	return out;
+		events: rt.log.diagnostics(), quarantine, frozen, stores, pathOf: (docId) => synced.get(docId)?.path ?? null,
+	}, rt.o.ports, includePaths);
 }
 
 /**

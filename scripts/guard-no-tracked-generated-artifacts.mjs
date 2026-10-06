@@ -3,7 +3,7 @@
 /**
  * Guard: generated artifacts must never be tracked by Git.
  *
- * Builds and QA runs may create these files locally, but releases build and
+ * Builds may create these files locally, but releases build and
  * publish them from source. Keeping them out of the index prevents generated
  * output from becoming a second source of truth.
  */
@@ -13,10 +13,7 @@ import { execFileSync } from "node:child_process";
 const BLOCKED_PATHS = [
 	"main.js",
 	"dist",
-	"qa-runs",
 	"*.map",
-	"qa/**/*.js",
-	"qa/**/*.js.map",
 ];
 
 let tracked;
@@ -34,9 +31,9 @@ if (tracked.length > 0) {
 	console.error("FAIL: generated artifacts are tracked by Git:");
 	for (const path of tracked) console.error(`  ${path}`);
 	console.error("");
-	console.error("Generated bundles and QA run output must remain untracked.");
+	console.error("Generated bundles must remain untracked.");
 	console.error("Remove them from the index with: git rm -r --cached -- <path>");
 	process.exit(1);
 }
 
-console.log("PASS: no generated bundles, QA output, or QA run artifacts are tracked.");
+console.log("PASS: no generated bundles are tracked.");

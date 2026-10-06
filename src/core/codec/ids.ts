@@ -2,7 +2,7 @@
  * Identifiers (DESIGN §b.2, §g.3): docId and clientFrameId are 16 random
  * bytes, base64url without padding (22 chars). Content hashes are lowercase
  * hex SHA-256 in types and 32 raw bytes on the wire.
- * Ported from legacy-src/utils/randomId.ts, reworked to 16-byte base64url.
+ * Ported from the old client's utils/randomId.ts, reworked to 16-byte base64url.
  */
 
 import type { ClientFrameId, ContentHash, DocId } from "../types";

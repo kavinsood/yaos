@@ -3,10 +3,12 @@
  * <configDir>/plugins/yaos/diagnostics/ -> clipboard. Pure orchestration: the Notice and the
  * clipboard are injected, so no obsidian runtime import.
  *
- * The bundle type carries no secrets; formatDiagnostics adds nothing (no identity, no host) and
- * additionally redacts any secret-looking key should one ever appear.
+ * The bundle type carries no secrets. The export adds a `settings` section built from an allowlist
+ * (never the device token), and formatDiagnostics redacts any secret-looking key at any depth
+ * should one ever appear.
  */
 
+import type { EngineSettings } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import type { YaosUiHost } from "./api";
 import { errorMessage } from "./format";
@@ -40,16 +42,57 @@ function canonicalize(value: unknown, depth: number): unknown {
 	return null;
 }
 
-/** Pretty JSON with recursively sorted keys (stable across runs), plus a format tag. */
-export function formatDiagnostics(bundle: DiagnosticsBundle): string {
-	return `${JSON.stringify(canonicalize({ format: DIAGNOSTICS_FORMAT, bundle }, 0), null, 2)}\n`;
+/**
+ * Non-secret settings written next to the bundle. Identity fields are picked one by one, so the
+ * device token (or any field added to the identity later) never gets in; engine settings hold no
+ * secrets. Exclude patterns often name folders, so only their count is written unless the user chose
+ * to include file names.
+ */
+export interface DiagnosticsSettings {
+	readonly pluginVersion: string;
+	readonly transport: "worker" | "inline" | null;
+	readonly host: string | null;
+	readonly vaultId: string | null;
+	readonly deviceId: string | null;
+	readonly deviceLabel: string;
+	readonly engine: Omit<EngineSettings, "excludePatterns"> & { readonly excludePatternCount: number; readonly excludePatterns?: readonly string[] };
 }
 
-/** `yaos-diagnostics-2026-10-05T12-34-56-789Z.json` (no ':' so the name is valid on every OS). */
-export function diagnosticsFileName(atMs: number): string {
-	const iso = new Date(Number.isFinite(atMs) ? atMs : 0).toISOString().replace(/[:.]/g, "-");
-	return `yaos-diagnostics-${iso}.json`;
+export function diagnosticsSettings(host: Pick<YaosUiHost, "data" | "pluginVersion" | "runState">, includePaths: boolean): DiagnosticsSettings {
+	const data = host.data();
+	const id = data.identity;
+	const { excludePatterns, ...engine } = data.engine;
+	return {
+		pluginVersion: host.pluginVersion,
+		transport: host.runState().transport,
+		host: id?.host ?? null,
+		vaultId: id?.vaultId ?? null,
+		deviceId: id?.deviceId ?? null,
+		deviceLabel: data.deviceLabel,
+		engine: { ...engine, excludePatternCount: excludePatterns.length, ...(includePaths ? { excludePatterns: [...excludePatterns] } : {}) },
+	};
 }
+
+/** Pretty JSON with recursively sorted keys (stable across runs), plus a format tag. */
+export function formatDiagnostics(bundle: DiagnosticsBundle, settings?: DiagnosticsSettings): string {
+	return `${JSON.stringify(canonicalize({ format: DIAGNOSTICS_FORMAT, bundle, settings }, 0), null, 2)}\n`;
+}
+
+/**
+ * `yaos-diagnostics-2026-10-05T12-34-56-789Z.json` (no ':' so the name is valid on every OS);
+ * `...-with-file-names.json` when the file lists vault paths.
+ */
+export function diagnosticsFileName(atMs: number, includePaths = false): string {
+	const iso = new Date(Number.isFinite(atMs) ? atMs : 0).toISOString().replace(/[:.]/g, "-");
+	return `yaos-diagnostics-${iso}${includePaths ? "-with-file-names" : ""}.json`;
+}
+
+/** Asked before exportDiagnostics{includePaths: true}. */
+export const DIAGNOSTICS_WITH_PATHS_CONFIRM = Object.freeze({
+	title: "Export diagnostics with file names?",
+	message: "The diagnostics file will also list the folder and file names of the files it mentions (frozen notes, quarantined changes, held changes, recent sync events) and your excluded-path patterns. It still contains no note contents and no device token.\n\nShare it only with someone you are happy to show those names to.",
+	confirmText: "Export with file names",
+});
 
 export interface ExportDiagnosticsDeps {
 	notify(message: string, level: "info" | "error"): void;
@@ -62,18 +105,23 @@ export interface ExportDiagnosticsResult {
 	readonly copied: boolean;
 }
 
-/** Runs the export end to end. Never throws: failures are reported through notify and return null. */
+/**
+ * Runs the export end to end (the caller confirms includePaths first). Never throws: failures are
+ * reported through notify and return null.
+ */
 export async function exportDiagnostics(
-	host: Pick<YaosUiHost, "command" | "writeDiagnosticsFile">,
+	host: Pick<YaosUiHost, "command" | "writeDiagnosticsFile" | "data" | "pluginVersion" | "runState">,
 	deps: ExportDiagnosticsDeps,
+	options: { readonly includePaths: boolean } = { includePaths: false },
 ): Promise<ExportDiagnosticsResult | null> {
+	const { includePaths } = options;
 	let text: string;
 	let name: string;
 	try {
-		const result = await host.command({ t: "exportDiagnostics" });
+		const result = await host.command({ t: "exportDiagnostics", includePaths });
 		if (result.t !== "diagnostics") throw new Error("the sync engine returned no diagnostics");
-		text = formatDiagnostics(result.bundle);
-		name = diagnosticsFileName(result.bundle.generatedAtMs);
+		text = formatDiagnostics(result.bundle, diagnosticsSettings(host, includePaths));
+		name = diagnosticsFileName(result.bundle.generatedAtMs, includePaths);
 	} catch (err) {
 		deps.notify(`Could not collect diagnostics: ${errorMessage(err)}`, "error");
 		return null;
@@ -94,6 +142,7 @@ export async function exportDiagnostics(
 			copied = false;
 		}
 	}
-	deps.notify(copied ? `Diagnostics saved to ${path} and copied to the clipboard.` : `Diagnostics saved to ${path}.`, "info");
+	const what = includePaths ? "Diagnostics (with file names)" : "Diagnostics";
+	deps.notify(copied ? `${what} saved to ${path} and copied to the clipboard.` : `${what} saved to ${path}.`, "info");
 	return { path, copied };
 }

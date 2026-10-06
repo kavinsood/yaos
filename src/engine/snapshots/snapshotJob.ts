@@ -21,7 +21,8 @@ import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort } from "../../ports/crypto";
 import type { ClockPort } from "../../ports/clock";
 import type { SideFileName, SideFilePort, WritePrecondition } from "../../ports/vault";
-import { LANE, type DiskOp, type DiskOpPurpose, type DiskReadResult } from "../../protocol/messages";
+import { badRequest } from "../../protocol/errors";
+import { LANE, type DiskOp, type DiskOpPurpose, type DiskReadResult, type SnapshotReason } from "../../protocol/messages";
 import type { DiskGateway } from "../reconcile/deps";
 
 export const SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024;
@@ -31,7 +32,6 @@ export const SNAPSHOT_EVENT_KEEP = 10;
 const READ_BATCH = 32;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-export type SnapshotReason = "daily" | "brake" | "epoch" | "idb" | "restore" | "manual";
 export interface SnapshotFile { readonly path: VaultPath; readonly kind: DocKind; readonly hash: DiskFingerprint; readonly size: number }
 export interface SnapshotManifest {
 	readonly formatVersion: 1;
@@ -83,10 +83,13 @@ export class SnapshotJob {
 		this.pk = deps.pathKey ?? standInPathKey;
 	}
 
-	/** Takes a snapshot; null when disabled, too large or the vault is empty of eligible files. */
+	/**
+	 * Takes a snapshot; null when too large, or when snapshots are disabled. A user action (manual, and the
+	 * safety snapshot before a restore) takes one even when disabled.
+	 */
 	async take(reason: SnapshotReason): Promise<{ id: string; address: BlobAddress | null } | null> {
 		const { deps } = this;
-		if (!deps.settings().enabled && reason !== "manual") return null;
+		if (!deps.settings().enabled && reason !== "manual" && reason !== "restore") return null;
 		const eligible = deps.files().filter((f) => f.kind !== "blob" || f.size <= SNAPSHOT_BLOB_MAX_BYTES);
 		const planned = eligible.reduce((n, f) => n + f.size, 0);
 		if (planned > SNAPSHOT_MAX_BYTES) {
@@ -155,16 +158,23 @@ export class SnapshotJob {
 	}
 
 	async manifest(id: string): Promise<SnapshotManifest | null> {
-		const zip = await this.deps.side.read(sideName(id));
+		const zip = await this.deps.side.read(sideName(checkId(id)));
 		if (!zip) return null;
 		const m = unzipSync(zip, { filter: (f) => f.name === MANIFEST })[MANIFEST];
 		return m ? (JSON.parse(strFromU8(m)) as SnapshotManifest) : null;
 	}
 
+	/** Deletes snapshot `id`. Throws bad-request for a malformed or unknown id. */
+	async remove(id: string): Promise<void> {
+		const name = sideName(checkId(id));
+		if (!(await this.deps.side.list("snapshots/")).includes(name)) throw notFound(id);
+		await this.deps.side.remove(name);
+	}
+
 	/** restoreSnapshot{id, paths|null}: a "restore" snapshot first, then conflict-copy + write per file. */
 	async restore(id: string, paths: readonly VaultPath[] | null): Promise<RestoreResult> {
-		const zip = await this.deps.side.read(sideName(id));
-		if (!zip) throw new Error(`snapshot ${id} not found`);
+		const zip = await this.deps.side.read(sideName(checkId(id)));
+		if (!zip) throw notFound(id);
 		const want = paths ? new Set(paths) : null;
 		const content = unzipSync(zip, { filter: (f) => f.name === MANIFEST || want === null || (f.name.startsWith("files/") && want.has(f.name.slice(6))) });
 		const manifest = JSON.parse(strFromU8(content[MANIFEST]!)) as SnapshotManifest;
@@ -223,6 +233,16 @@ export class SnapshotJob {
 		const drop = [...daily.slice(0, Math.max(0, daily.length - keepDaily)), ...other.slice(0, Math.max(0, other.length - SNAPSHOT_EVENT_KEEP))];
 		for (const s of drop) await this.deps.side.remove(sideName(s.id));
 	}
+}
+
+/** Ids come from the host: only well-formed ones name a side file (no path tricks). */
+function checkId(id: string): string {
+	if (parseSnapshotId(id) === null) throw badRequest("not a snapshot id");
+	return id;
+}
+
+function notFound(id: string): Error {
+	return badRequest(`snapshot ${id} not found`);
 }
 
 function isMissing(r: DiskReadResult | undefined): boolean {

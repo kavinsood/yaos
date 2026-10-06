@@ -5,7 +5,7 @@ import { globalIgnores } from "eslint/config";
 
 export default tseslint.config(
 	{
-		files: ["src/**/*.ts", "yaos-plugin-api.d.ts"],
+		files: ["src/**/*.ts"],
 		languageOptions: {
 			globals: {
 				...globals.browser,
@@ -67,18 +67,6 @@ export default tseslint.config(
 		"build-server-release.mjs",
 		"scripts",
 		"server/scripts",
-		// QA harness, analyzers, and run artifacts.
-		// `qa/` contains both .ts sources and emitted .js artifacts (e.g.
-		// qa/analyzers/analyzer.js sits next to qa/analyzers/analyzer.ts).
-		// The emitted .js files have no parserOptions.project entry in
-		// tsconfig.eslint.json, which causes typed lint rules
-		// (@typescript-eslint/no-deprecated and friends) to throw on rule
-		// load and abort the entire eslint run. The QA harness is a
-		// separate workspace: the .ts sources are linted there if needed,
-		// and the emitted .js artifacts are not source we lint. Same for
-		// qa-runs/ which holds run output bundles and reports.
-		"qa",
-		"qa-runs",
 		"manifest.json",
 		"esbuild.config.mjs",
 		"eslint.config.mts",
@@ -88,7 +76,7 @@ export default tseslint.config(
 		// flat config does not read .gitignore, so each one has to be listed or
 		// it aborts the whole run: a bundle has no entry in
 		// tsconfig.eslint.json, and typed rules throw on rule load rather than
-		// skipping the file (see the `qa` note above). Keep this in sync with
+		// skipping the file. Keep this in sync with
 		// the outfiles in esbuild.config.mjs.
 		"main.js",
 	]),

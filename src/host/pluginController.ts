@@ -15,8 +15,25 @@ import { sameEngineSettings, sameIdentity, type EngineRunState, type PairedIdent
 export interface ControllerEnv {
 	makeRuntime(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink): HostRuntime;
 	saveData(data: YaosPluginData): Promise<void>;
-	notice(level: "info" | "warn" | "error", message: string): void;
+	notice(level: "info" | "warn" | "error", message: string, timeoutMs?: number): void;
 	log?(line: string): void;
+}
+
+export interface HostNotice {
+	readonly text: string;
+	readonly timeoutMs?: number;
+}
+
+/**
+ * The popup the host shows for an engine notice, or null to keep it in the
+ * status only. Info notices stay status-only except the settings-reload prompt
+ * (legacy also asked for a reload); the daily-limit popup stays up 20 s, as in legacy.
+ */
+export function hostNotice(level: "info" | "warn" | "error", code: string, message: string): HostNotice | null {
+	if (code === "settings-reload") return { text: `YAOS: synced settings changed (${message}). Reload Obsidian to apply them.`, timeoutMs: 15_000 };
+	if (level === "info") return null;
+	if (code === "daily-limit") return { text: message, timeoutMs: 20_000 };
+	return { text: message };
 }
 
 export function hostIdentityOf(id: PairedIdentity, deviceLabel: string): HostIdentity {
@@ -120,8 +137,9 @@ export class YaosController {
 				this.pendingBrake = b;
 				this.changed();
 			},
-			onNotice: (level, _code, message) => {
-				if (this.runtime === rt && level !== "info") this.env.notice(level, message);
+			onNotice: (level, code, message) => {
+				const n = this.runtime === rt ? hostNotice(level, code, message) : null;
+				if (n) this.env.notice(level, n.text, n.timeoutMs);
 			},
 			onCarrier: (c) => {
 				if (this.runtime !== rt || this.run.phase === "failed") return;

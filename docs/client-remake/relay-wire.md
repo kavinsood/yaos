@@ -583,7 +583,8 @@ The smoke stores the operator key in a 0600 file at
 ## 14. Legacy server behaviour still present but unused by the new client
 
 The new client must not call any of the following. It all stays in the Worker for now. Removing it is a separate
-change, and some of it is still exercised by `legacy-src/` and the relay2 experiments.
+change, and some of it is still exercised by the server tests, `tests/live` and the relay2 tools. The old client that
+used it is deleted (see `legacy-parity.md`).
 
 - **Semantic sockets.** `/vault/:id/ws/root`, `/ws/body/:bodyId` and `/ws/semantic/:docId` carry server-side Yjs
   sync with root/body epochs. They come with tickets of purpose `root`/`body`/`semantic`, close code 4409 (epoch

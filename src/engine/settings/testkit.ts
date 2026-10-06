@@ -36,7 +36,7 @@ export class FakeConfigDir implements ConfigDirPort {
 			const cut = rest.indexOf("/");
 			seen.set(cut < 0 ? rest : rest.slice(0, cut), cut >= 0 || seen.get(rest) === true);
 		}
-		return [...seen].map(([name, isFolder]) => ({ path: prefix + name, size: 0, mtimeMs: 1, isFolder }));
+		return [...seen].map(([name, isFolder]) => ({ path: prefix + name, size: isFolder ? 0 : this.files.get(prefix + name)!.length, mtimeMs: 1, isFolder }));
 	}
 	async readBytes(path: string) {
 		const n = (this.reads.get(path) ?? 0) + 1;
@@ -47,6 +47,7 @@ export class FakeConfigDir implements ConfigDirPort {
 	async writeBytes(path: string, bytes: Uint8Array) { this.writes++; this.files.set(path, bytes.slice()); }
 	async remove(path: string) { this.files.delete(path); }
 	resetReads(): void { this.reads.clear(); }
+	readsOf(path: string): number { return this.reads.get(path) ?? 0; }
 }
 
 export function emptyFold(): CfgFoldState {
@@ -87,7 +88,14 @@ export class Device {
 	readonly config = new FakeConfigDir();
 	readonly storage = new FakeStorage();
 	readonly clock = new FakeClock();
+	/** Notice codes, in order. */
 	readonly notices: string[] = [];
+	readonly warnings: { code: string; message: string }[] = [];
+	/** CfgSyncDeps.mobile / .seed, read when the first pass creates the CfgSync. */
+	mobile = false;
+	seed: "device" | "vault" | undefined = undefined;
+	/** CfgSyncDeps.remoteReady (null: not passed, always ready). */
+	remoteReady: boolean | null = null;
 	private sync: CfgSync | null = null;
 
 	constructor(readonly name: string, readonly log: SharedCfgLog, readonly blobs: FakeBlobs | null = null) {}
@@ -99,7 +107,10 @@ export class Device {
 	async pass(): Promise<CfgPassResult> {
 		if (!this.sync) {
 			const db = await this.storage.open<DiskSchema>(`cfg-${this.name}`, DB_SCHEMA_VERSION, STORE_SPECS);
-			this.sync = new CfgSync({ db, config: this.config, log: this.log.port(this.name), blobs: this.blobs, clock: this.clock, notice: (_l, c) => this.notices.push(c) });
+			this.sync = new CfgSync({ db, config: this.config, log: this.log.port(this.name), blobs: this.blobs, clock: this.clock, mobile: this.mobile, seed: this.seed, ...(this.remoteReady === null ? {} : { remoteReady: () => this.remoteReady === true }), notice: (l, c, m) => {
+				this.notices.push(c);
+				if (l === "warn") this.warnings.push({ code: c, message: m ?? "" });
+			} });
 		}
 		this.config.resetReads();
 		return this.sync.pass();

@@ -8,7 +8,11 @@ import type { App } from "obsidian";
 import type { EngineSettings, UserCommand, EngineResultValue } from "../../protocol/messages";
 import type { StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
-import { DEVICE_ID_RE, DEVICE_TOKEN_RE, normalizeDeviceName, normalizeHost } from "./pairing";
+import type { TrashMode } from "../../ports/vault";
+import {
+	DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, normalizeDeviceName, normalizeHost, normalizePairingCode,
+	type EnrollmentAttempt,
+} from "./pairing";
 
 export { defaultDeviceName } from "./deviceName";
 export type { DevicePlatformFlags } from "./deviceName";
@@ -29,6 +33,12 @@ export interface YaosPluginData {
 	readonly deviceLabel: string; // human label for conflict copy names
 	readonly engine: EngineSettings;
 	readonly showStatusBar: boolean;
+	/**
+	 * SECRET (pairing code + the new device token): an /enroll sent but not yet answered, kept until
+	 * success or a definitive refusal so the next load can retry it once (the relay replays an
+	 * identical request). Never logged or exported.
+	 */
+	readonly pendingEnrollment?: EnrollmentAttempt;
 }
 
 export const MIB = 1024 * 1024;
@@ -38,12 +48,18 @@ export const MAX_EXCLUDE_PATTERNS = 500;
 export const MAX_EXCLUDE_PATTERN_CHARS = 512;
 export const MAX_DEVICE_LABEL_CHARS = 64;
 
+export const TRASH_MODES: readonly TrashMode[] = Object.freeze(["follow-obsidian", "obsidian-trash", "system-trash"]);
+
+export function isTrashMode(value: unknown): value is TrashMode {
+	return (TRASH_MODES as readonly unknown[]).includes(value);
+}
+
 export const DEFAULT_ENGINE_SETTINGS: EngineSettings = Object.freeze({
 	excludePatterns: Object.freeze([]) as readonly string[],
 	syncAttachments: true,
 	maxAttachmentBytes: 50 * MIB,
 	syncSettings: false,
-	trashMode: "obsidian-trash",
+	trashMode: "follow-obsidian",
 	provisionalBroadcast: true,
 	snapshots: Object.freeze({ enabled: true, keepDaily: 7, uploadToBlobStore: false }),
 });
@@ -104,7 +120,8 @@ export function sanitizeEngineSettings(raw: unknown): EngineSettings {
 		syncAttachments: bool(r.syncAttachments, d.syncAttachments),
 		maxAttachmentBytes: intInRange(r.maxAttachmentBytes, 1, MAX_ATTACHMENT_BYTES_LIMIT, d.maxAttachmentBytes),
 		syncSettings: bool(r.syncSettings, d.syncSettings),
-		trashMode: r.trashMode === "obsidian-trash" || r.trashMode === "system-trash" ? r.trashMode : d.trashMode,
+		...(r.syncSettingsSeed === "device" || r.syncSettingsSeed === "vault" ? { syncSettingsSeed: r.syncSettingsSeed } : {}),
+		trashMode: isTrashMode(r.trashMode) ? r.trashMode : d.trashMode,
 		provisionalBroadcast: bool(r.provisionalBroadcast, d.provisionalBroadcast),
 		snapshots: {
 			enabled: bool(snap?.enabled, d.snapshots.enabled),
@@ -137,17 +154,40 @@ export function sanitizeIdentity(raw: unknown): PairedIdentity | null {
 	};
 }
 
+/** Returns a well-formed pending enrollment attempt or null. */
+export function sanitizePendingEnrollment(raw: unknown): EnrollmentAttempt | null {
+	const r = asRecord(raw);
+	if (!r) return null;
+	const str = (v: unknown): string => (typeof v === "string" ? v : "");
+	try {
+		const attempt: EnrollmentAttempt = {
+			host: normalizeHost(str(r.host)),
+			pairingCode: normalizePairingCode(str(r.pairingCode)),
+			deviceName: normalizeDeviceName(str(r.deviceName)),
+			enrollmentRequestId: str(r.enrollmentRequestId),
+			deviceId: str(r.deviceId),
+			deviceToken: str(r.deviceToken),
+		};
+		const ok = ENROLLMENT_REQUEST_ID_RE.test(attempt.enrollmentRequestId) && DEVICE_ID_RE.test(attempt.deviceId) && DEVICE_TOKEN_RE.test(attempt.deviceToken);
+		return ok ? attempt : null;
+	} catch {
+		return null;
+	}
+}
+
 /** Tolerant loader for whatever loadData() returned (null, garbage, partial). Never throws. */
 export function sanitizePluginData(raw: unknown, fallbackLabel: string): YaosPluginData {
 	try {
 		const r = asRecord(raw);
 		if (!r) return defaultPluginData(fallbackLabel);
+		const pending = sanitizePendingEnrollment(r.pendingEnrollment);
 		return {
 			version: 1,
 			identity: sanitizeIdentity(r.identity),
 			deviceLabel: sanitizeDeviceLabel(r.deviceLabel, fallbackLabel),
 			engine: sanitizeEngineSettings(r.engine),
 			showStatusBar: bool(r.showStatusBar, true),
+			...(pending ? { pendingEnrollment: pending } : {}),
 		};
 	} catch {
 		return defaultPluginData(fallbackLabel);
@@ -165,6 +205,7 @@ export function sameEngineSettings(a: EngineSettings, b: EngineSettings): boolea
 	return a.syncAttachments === b.syncAttachments
 		&& a.maxAttachmentBytes === b.maxAttachmentBytes
 		&& a.syncSettings === b.syncSettings
+		&& a.syncSettingsSeed === b.syncSettingsSeed
 		&& a.trashMode === b.trashMode
 		&& a.provisionalBroadcast === b.provisionalBroadcast
 		&& a.snapshots.enabled === b.snapshots.enabled

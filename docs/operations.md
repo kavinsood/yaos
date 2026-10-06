@@ -221,21 +221,7 @@ Membership, device, and ownership changes stop new admission before the vault in
 
 ## Headless Linux client
 
-The headless client requires Node 24 and a local Linux filesystem. Build it with `npm run build:cli`. Enroll each directory as a distinct device:
-
-```sh
-YAOS_HOST=https://sync.example.workers.dev \
-YAOS_PAIRING_CODE=... \
-node packages/cli/dist/yaos.mjs enroll /srv/vault
-
-node packages/cli/dist/yaos.mjs daemon /srv/vault
-```
-
-The setup code is read from the environment, never argv. Enrollment persists a replay-stable request ID, generated device ID and bearer, vault generation, principal and membership revisions, device credential revision, role, fixed capabilities, server-minted names, and origin/import authority before the daemon starts. Default state lives under `XDG_STATE_HOME` or `~/.local/state/yaos/headless/`; `YAOS_STATE_DIR` is an explicit state-directory leaf override, not a parent directory. State directories are mode `0700`, credential/database files `0600`, and nothing is written inside the vault except user Markdown.
-
-The daemon prints `YAOS_DAEMON_READY <vaultId>` only after bootstrap, origin import when applicable, provider sync, authoritative disk admission, and durable candidate/lifecycle settlement. Exit `2` is terminal identity/admission failure; exit `17` means another process owns that vault state. `SIGINT` and `SIGTERM` stop input, drain disk work and receipts, close SQLite, and release the lock.
-
-Supported: Markdown, one daemon per local vault, external editor/Git changes, conservative conflict preservation. Unsupported: `.obsidian`, attachments, recovery UI, NFS/SMB/FUSE, and inferred rename identity. A filesystem rename deliberately synchronizes as delete plus create.
+The headless Linux CLI in `packages/cli` was built on the old Obsidian client, which has been deleted. It no longer builds and is not supported.
 
 ## Settings sync setup and operation
 
@@ -367,5 +353,4 @@ The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`,
 - Settings counts per environment: 256 ordinary files, 256 plugin intents, 64 theme intents, 256 plugin-data rows, and 512 tombstones. IDs are at most 128 characters, repository strings 256, and version strings 64.
 - Long-duration Cloudflare eviction/outage soak, broader desktop
   settings/recovery, and all real mobile settings/recovery evidence remain
-  deferred. Current evidence and its limits are recorded in [QA](qa.md).
-- Network-filesystem support for headless clients remains future work.
+  deferred.

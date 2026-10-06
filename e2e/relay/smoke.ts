@@ -4,8 +4,8 @@
  *   node e2e/relay/smoke.ts --host http://127.0.0.1:8787 [--label local]
  *   node e2e/relay/smoke.ts --host https://<worker>.workers.dev --label deployed [--operator-context <file>]
  *
- * Standalone: global fetch + WebSocket and a private lib0-compatible codec; imports nothing from src/,
- * legacy-src/ or server/. Every run uses a FRESH vault: an unclaimed server is claimed (the operator recovery
+ * Standalone: global fetch + WebSocket and a private lib0-compatible codec; imports nothing from src/
+ * or server/. Every run uses a FRESH vault: an unclaimed server is claimed (the operator recovery
  * key is kept in a 0600 context file under the log dir); a claimed one is entered through operator login
  * (key from that context file or --operator-context <json with operatorRecoveryKey>) and gets a new vault.
  *

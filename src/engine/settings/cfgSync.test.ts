@@ -2,16 +2,57 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { utf8Encode } from "../../core/hash/utf8";
 import { FakeBlobs } from "../reconcile/testkit/fakes";
-import { CFG_INLINE_MAX_BYTES, classifyConfigPath } from "./allowlist";
+import { CFG_INLINE_MAX_BYTES, CFG_JSON_FILES, classifyConfigPath } from "./allowlist";
 import { Device, SharedCfgLog } from "./testkit";
 
-test("allowlist: closed set; yaos dir, workspace, plugin code and caches never synced", () => {
-	for (const p of ["app.json", "appearance.json", "hotkeys.json", "core-plugins.json", "community-plugins.json", "snippets/a.css", "themes/Min/theme.css", "themes/Min/manifest.json", "plugins/dv/data.json"]) {
-		assert.ok(classifyConfigPath(p), p);
-	}
-	for (const p of ["plugins/yaos/data.json", "plugins/yaos/state/outbox-a.bin", "plugins/yaos-qa-harness/data.json", "workspace.json", "workspace-mobile.json", "plugins/dv/main.js", "plugins/dv/styles.css", "plugins/dv/manifest.json", "graph.json", "cache/x", "snippets/.css", "snippets/a/b.css", "themes/Min/x.css", "../app.json", "plugins/../data.json", ""]) {
-		assert.equal(classifyConfigPath(p), null, p);
-	}
+test("allowlist: closed set; yaos dir, workspace layout, plugin code and caches never synced", () => {
+	const synced = [
+		"app.json", "appearance.json", "hotkeys.json", "core-plugins.json", "core-plugins-migration.json", "graph.json",
+		"daily-notes.json", "templates.json", "backlink.json", "page-preview.json", "note-composer.json", "switcher.json",
+		"bookmarks.json", "workspaces.json", "community-plugins.json", "snippets/a.css", "themes/Min/theme.css",
+		"themes/Min/manifest.json", "plugins/dv/data.json",
+	];
+	for (const p of synced) assert.ok(classifyConfigPath(p), p);
+	assert.deepEqual([...CFG_JSON_FILES].sort(), synced.filter((p) => !p.includes("/") && p !== "community-plugins.json").sort(),
+		"root JSON set = legacy SETTINGS_SYNC_ROOT_JSON");
+	const never = [
+		"workspace.json", "workspace-mobile.json", "file-recovery.json", "publish.json", "types.json",
+		"plugins/yaos/data.json", "plugins/yaos/manifest.json", "plugins/yaos/main.js", "plugins/yaos/state/outbox-a.bin",
+		"plugins/yaos-qa-harness/data.json", "plugins/dv/main.js", "plugins/dv/styles.css", "plugins/dv/manifest.json",
+		"cache/x", "unknown.json", "snippets/.css", "snippets/a/b.css", "themes/Min/x.css", "../app.json",
+		"plugins/../data.json", "",
+	];
+	for (const p of never) assert.equal(classifyConfigPath(p), null, p);
+});
+
+test("restored root JSON: graph, bookmarks, saved workspaces sync; workspaces.json `active` stays device-local", async () => {
+	const log = new SharedCfgLog();
+	const a = new Device("A", log);
+	const b = new Device("B", log);
+	a.config.set("graph.json", { showTags: true, scale: 1.5 });
+	a.config.set("bookmarks.json", { items: [{ type: "file", path: "Inbox.md" }] });
+	a.config.set("workspaces.json", { workspaces: { Writing: { main: {} } }, active: "Writing" });
+	a.config.set("workspace.json", { main: { id: "a-layout" } });
+	a.config.set("workspace-mobile.json", { main: { id: "a-mobile" } });
+	await a.pass();
+	assert.ok(log.opsBy("A").every((o) => "file" in o && !o.file.startsWith("workspace.") && !o.file.startsWith("workspace-")));
+	assert.ok(!log.opsBy("A").some((o) => o.t === "jsonSet" && o.file === "workspaces.json" && o.key === "active"));
+	b.config.set("workspaces.json", { workspaces: {}, active: "Mobile" });
+	b.config.set("workspace.json", { main: { id: "b-layout" } });
+	await b.pass();
+	assert.deepEqual(b.config.json("graph.json"), { scale: 1.5, showTags: true });
+	assert.deepEqual(b.config.json("bookmarks.json"), { items: [{ type: "file", path: "Inbox.md" }] });
+	assert.deepEqual(b.config.json("workspaces.json"), { workspaces: { Writing: { main: {} } }, active: "Mobile" });
+	assert.deepEqual(b.config.json("workspace.json"), { main: { id: "b-layout" } }, "workspace.json never written");
+	assert.equal(b.config.text("workspace-mobile.json"), null);
+	assert.ok(b.notices.includes("settings-reload"));
+	// A bookmark added on B reaches A.
+	b.config.set("bookmarks.json", { items: [{ type: "file", path: "Inbox.md" }, { type: "search", query: "tag:#todo" }] });
+	await b.pass();
+	await a.pass();
+	assert.deepEqual(a.config.json("bookmarks.json"), { items: [{ type: "file", path: "Inbox.md" }, { type: "search", query: "tag:#todo" }] });
+	assert.equal((a.config.json("workspaces.json") as { active: string }).active, "Writing");
+	assert.equal((await a.pass()).plan.actions.length + (await b.pass()).plan.actions.length, 0);
 });
 
 test("initial upload: per-key jsonSet, device-local keys never emitted, next pass is quiet", async () => {

@@ -1,7 +1,7 @@
 // Guard for the test-discovery contract.
 //
 // The regression runner discovers suites by convention — every `*.ts` file in
-// tests/client/, tests/server/ or tests/contracts/ — instead of reading a
+// tests/server/ or tests/contracts/ — instead of reading a
 // hand-maintained array.
 // That only stays trustworthy if two invariants hold, and both are checked here:
 //
@@ -41,8 +41,8 @@ s.section("Test 1: discovery finds a plausible number of suites");
 // not become the next thing developers have to remember to update. The point
 // is to catch a discovery function that has broken outright and returns [] or
 // a handful, which would turn the whole regression gate green-and-empty.
-s.check(candidates.length > 50, `tests/ has ${candidates.length} discovery candidates (> 50)`);
-s.check(suites.length > 50, `discovery selected ${suites.length} suites (> 50)`);
+s.check(candidates.length > 10, `tests/ has ${candidates.length} discovery candidates (> 10)`);
+s.check(suites.length > 10, `discovery selected ${suites.length} suites (> 10)`);
 s.check(
 	suiteSet.has("tests/suite-discovery.ts"),
 	"this suite is itself discovered (discovery is not filtering out .ts files)",

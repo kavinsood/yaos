@@ -33,6 +33,10 @@ export class SessionLoop {
 	reconnectAtMono: number | null = null;
 	private connecting = false;
 	private manual = false;
+	/** Deliberately closed for the background (DESIGN §i.4): no offline phase, no backoff, until wake(). */
+	private parked = false;
+	/** The platform reported offline: no automatic reconnect attempts until online (or a session opens). */
+	private netDown = false;
 	private backpressureFlag = false;
 	private unsub: (() => void) | null = null;
 	private feeding: Promise<void> | null = null;
@@ -73,13 +77,14 @@ export class SessionLoop {
 		} finally {
 			this.connecting = false;
 		}
-		if (c.stopped || this.manual) {
-			if (r.ok) r.session.close(RELAY_CLOSE.normal, "stopped");
+		if (c.stopped || this.manual || this.parked) {
+			if (r.ok) r.session.close(RELAY_CLOSE.normal, this.parked ? "background" : "stopped");
 			return;
 		}
 		if (!r.ok) {
 			this.stats.connectFailures++;
 			c.diag("connect-failed", { reason: r.reason });
+			if (r.reason === "daily-limit") c.dailyLimitPopup(r.retryAfterMs);
 			this.decide(connectFailure(r.reason, r.retryAfterMs, this.st, this.random, c.tuning.reconnectBaseMs));
 			return;
 		}
@@ -90,7 +95,7 @@ export class SessionLoop {
 		const c = this.c;
 		c.setPhase(d.phase);
 		if (d.notice) c.notice(d.notice);
-		if (d.retryMs !== null && c.opts.autoReconnect !== false && !this.manual && !c.stopped) this.scheduleReconnect(d.retryMs);
+		if (d.retryMs !== null && c.opts.autoReconnect !== false && !this.manual && !c.stopped && !this.parked && !this.netDown) this.scheduleReconnect(d.retryMs);
 	}
 
 	private scheduleReconnect(ms: number): void {
@@ -119,6 +124,7 @@ export class SessionLoop {
 		}
 		const gen = ++c.gen;
 		c.session = session;
+		this.netDown = false;
 		this.stats.sessions++;
 		this.backpressureFlag = false;
 		this.unsub = session.onEvent((ev) => this.onEvent(gen, ev));
@@ -236,6 +242,7 @@ export class SessionLoop {
 		c.live.disable();
 		c.lastCloseCode = ev.code;
 		c.diag("session-closed", { code: ev.code, errorCode: ev.errorCode, wasClean: ev.wasClean });
+		if (this.parked && !c.stopped && !this.manual) return;
 		if (c.stopped || this.manual) {
 			c.setPhase("offline");
 			return;
@@ -385,7 +392,7 @@ export class SessionLoop {
 	scheduleCatchUp(): void {
 		const c = this.c;
 		const s = c.session;
-		if (!s || !c.live.enabled || c.stopped) return;
+		if (!s || !c.live.enabled || c.stopped || c.background) return;
 		let slots = c.budgets.catchUpConcurrency - this.lanes;
 		if (slots <= 0) return;
 		const now = c.mono();
@@ -421,6 +428,48 @@ export class SessionLoop {
 
 	async reconnect(): Promise<void> {
 		this.manual = false;
+		this.parked = false;
+		this.clearReconnect();
+		this.st = newReconnectState();
+		await this.connectOnce();
+	}
+
+	/** Background close (1000): the phase stays, nothing backs off, nothing reconnects until wake(). */
+	park(): void {
+		const c = this.c;
+		this.parked = true;
+		this.clearReconnect();
+		const s = c.session;
+		if (!s) return;
+		const gen = c.gen;
+		try {
+			s.close(RELAY_CLOSE.normal, "background");
+		} catch {
+			/* already closed */
+		}
+		this.handleClosed(gen, { t: "closed", code: RELAY_CLOSE.normal, errorCode: null, wasClean: true });
+	}
+
+	/**
+	 * visible / resume: connect at once on a fresh backoff unless the user paused. It tries once even after
+	 * offline, so a missed online event cannot strand the device; while offline a failure arms no backoff.
+	 */
+	wake(): Promise<void> {
+		this.parked = false;
+		return this.connectNow(true);
+	}
+
+	/** offline: stop reconnect attempts (an open socket stays until it fails); online: connect at once. */
+	setNetwork(online: boolean): Promise<void> {
+		this.netDown = !online;
+		if (online) return this.connectNow();
+		this.clearReconnect();
+		return Promise.resolve();
+	}
+
+	private async connectNow(evenOffline = false): Promise<void> {
+		const c = this.c;
+		if (this.manual || this.parked || (this.netDown && !evenOffline) || c.stopped || c.opts.autoReconnect === false) return;
 		this.clearReconnect();
 		this.st = newReconnectState();
 		await this.connectOnce();

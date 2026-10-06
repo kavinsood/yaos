@@ -34,7 +34,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 
-const TREES = ["src", "server/src", "qa", "tests"];
+const TREES = ["src", "server/src", "tests"];
 
 const RULES = [
 	{ label: "as any", re: /\bas\s+any\b/ },

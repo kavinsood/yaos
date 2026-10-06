@@ -6,7 +6,9 @@
  *    Binary over an existing file is check-then-modifyBinary (not atomic;
  *    narrowed by a stat recheck). Gap recorded in wp-d-notes.
  *  - rename: vault.rename only (never fileManager.renameFile: no link rewrites).
- *  - trash: vault.trash only. No permanent file delete exists in this adapter.
+ *  - trash: vault.trash only. No permanent file delete exists in this adapter. "follow-obsidian"
+ *    reads trashOption from <configDir>/app.json through the adapter at each delete (see
+ *    followObsidianSystemTrash).
  *  - removeEmptyFolder: vault.delete(folder, false) only when it has zero
  *    children in the index (no file content can be lost).
  */
@@ -25,6 +27,26 @@ class CasAbort extends Error {}
 
 export function statOf(f: FileLike): VaultStat {
 	return { path: f.path, size: f.stat.size, mtimeMs: f.stat.mtime, ctimeMs: f.stat.ctime };
+}
+
+/**
+ * Obsidian's Deleted files preference (Settings → Files and links), stored as `trashOption` in
+ * `<configDir>/app.json`, mapped to vault.trash's `system` flag. Obsidian 1.12.7 (obsidian.asar):
+ * the default is trashOption "system", and FileManager.trashFile does "system" → vault.trash(f, true),
+ * "local" → vault.trash(f, false), "none" → vault.delete(f, true); the config is saved with
+ * writeConfigJson("app"). "none" maps to the .trash folder here because YAOS never deletes
+ * permanently (invariant 2). Absent, unreadable or malformed → Obsidian's default, system.
+ */
+export function followObsidianSystemTrash(appJson: string | null): boolean {
+	if (appJson === null) return true;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(appJson);
+	} catch {
+		return true;
+	}
+	const option = parsed !== null && typeof parsed === "object" ? (parsed as { trashOption?: unknown }).trashOption : undefined;
+	return option !== "local" && option !== "none";
 }
 
 export class ObsidianVault implements VaultPort {
@@ -185,17 +207,24 @@ export class ObsidianVault implements VaultPort {
 		const f = this.file(path);
 		if (!f) return { ok: false, reason: "source-missing", message: "source missing" };
 		const before = statOf(f);
+		const system = await this.systemTrash(mode); // before the check: no await between recheck and trash
 		const { pass } = await this.check(path, f, precondition);
 		if (!pass) return { ok: false, reason: "precondition", message: `precondition ${precondition.t} failed` };
 		const now = this.file(path);
 		if (!now || now.stat.mtime !== before.mtimeMs || now.stat.size !== before.size) return { ok: false, reason: "precondition", message: "changed during check" };
 		const stat = statOf(now);
 		try {
-			await this.vault.trash(now, mode === "system-trash");
+			await this.vault.trash(now, system);
 		} catch (e) {
 			return { ok: false, reason: "io", message: e instanceof Error ? e.message : String(e) };
 		}
 		return { ok: true, stat };
+	}
+
+	private async systemTrash(mode: TrashMode): Promise<boolean> {
+		if (mode !== "follow-obsidian") return mode === "system-trash";
+		const appJson = await this.vault.adapter.read(`${this.configDir}/app.json`).catch(() => null);
+		return followObsidianSystemTrash(appJson);
 	}
 
 	async removeEmptyFolder(path: VaultPath): Promise<void> {
