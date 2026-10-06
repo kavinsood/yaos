@@ -37,7 +37,7 @@ const R = new Report();
 const url = new URL(HOST);
 const LOCAL = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
 const relay = LOCAL ? {
-	stop: () => void execFileSync("zsh", [`${RELAY_SCRIPTS}/stop-local.sh`], { stdio: ["ignore", "ignore", "inherit"] }),
+	stop: () => void execFileSync("zsh", [`${RELAY_SCRIPTS}/stop-local.sh`, "--port", url.port || "80"], { stdio: ["ignore", "ignore", "inherit"] }),
 	start: () => void execFileSync("zsh", [`${RELAY_SCRIPTS}/start-local.sh`, "--port", url.port || "80"], { stdio: ["ignore", "ignore", "inherit"] }),
 } : null;
 

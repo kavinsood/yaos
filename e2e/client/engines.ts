@@ -24,6 +24,8 @@ const HOST = arg("host", process.env.YAOS_E2E_HOST ?? "http://127.0.0.1:8787").r
 const LABEL = arg("label", "local");
 const OPERATOR_CONTEXT = arg("operator-context", "");
 const RELAY_RESTART = process.argv.includes("--relay-restart");
+/** start-local.sh / stop-local.sh keep state, pid and port files per port. */
+const RELAY_PORT = new URL(HOST).port || "80";
 const WT = new URL("../..", import.meta.url).pathname;
 const R = new Report();
 const P = (s: string) => s as VaultPath;
@@ -211,10 +213,10 @@ async function phase2(a: Device, b: Device, c: Device, ids: DocId[]): Promise<vo
 
 	if (RELAY_RESTART) {
 		R.step("relay process restart (state kept)");
-		execFileSync("zsh", [`${WT}scripts/relay-dev/stop-local.sh`], { stdio: "inherit" });
+		execFileSync("zsh", [`${WT}scripts/relay-dev/stop-local.sh`, "--port", RELAY_PORT], { stdio: "inherit" });
 		await sleep(500);
 		await a.e.editDoc(ids[2]!, (x) => x.insert(0, "during-relay-down;"));
-		execFileSync("zsh", [`${WT}scripts/relay-dev/start-local.sh`], { stdio: ["ignore", "ignore", "inherit"] });
+		execFileSync("zsh", [`${WT}scripts/relay-dev/start-local.sh`, "--port", RELAY_PORT], { stdio: ["ignore", "ignore", "inherit"] });
 		t = R.now();
 		await until(() => [a, b, c].every((d) => d.e.status().phase === "live"), 60_000, "auto-reconnect");
 		R.record("relay_restart_reconnect_ms", R.now() - t);
