@@ -51,6 +51,7 @@ const EXPECTED: Record<EnginePhase, { text: string; level: string }> = {
 	"revoked": { text: "YAOS: re-pair device", level: "error" },
 	"epoch-migrating": { text: "YAOS: re-syncing vault", level: "busy" },
 	"upgrade-required": { text: "YAOS: update required", level: "error" },
+	"key-missing": { text: "YAOS: encryption key missing", level: "error" },
 	"error": { text: "YAOS: error", level: "error" },
 };
 
