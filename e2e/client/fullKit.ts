@@ -34,6 +34,7 @@ import { createWsRelayPort } from "../../src/engine/adapters/wsRelay";
 import { SimPlatform } from "../../src/sim/device";
 import { SimConfigDir, SimSideFiles, SimVault } from "../../src/sim/vault";
 import { SimWorkspace } from "../../src/sim/workspace";
+import type { BootTrace } from "./bootTrace";
 import type { Report } from "./engineKit";
 import type { OnboardDevice, OnboardedVault } from "./onboard";
 
@@ -146,6 +147,8 @@ export interface FullClientOptions {
 	/** Delay of watcher events for external writes (ms). */
 	readonly watcherDelayMs: number;
 	readonly settings?: Partial<EngineSettings>;
+	/** Times this client's relay HTTP calls, socket and storage transactions (bootBench.ts). */
+	readonly trace?: BootTrace;
 }
 
 const LOG_RING = 400;
@@ -214,11 +217,14 @@ export class FullClient {
 				const clock = createWebClock();
 				const hash = createWebHash();
 				const random = createWebRandom();
-				const relay = this.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random }));
+				const tr = this.o.trace;
+				const relay = this.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random,
+					...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}) }));
 				const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential };
 				const blob = await probeHttpBlob(blobOpts).catch(() => createHttpBlob(blobOpts));
 				this.blobKind = blob ? "http" : "log";
-				return { relay, storage: createIdbStoragePort(this.factory, IDBKeyRange), clock, random, crypto: createNoopCrypto(hash), hash, blob: this.net.wrapBlob(blob) };
+				const storage = createIdbStoragePort(this.factory, IDBKeyRange);
+				return { relay, storage: tr ? tr.wrapStorage(storage) : storage, clock, random, crypto: createNoopCrypto(hash), hash, blob: this.net.wrapBlob(blob) };
 			},
 		});
 		this.handle = handle;
