@@ -1,0 +1,75 @@
+scripts/check-deps.mjs
+  s_8bc9bf3abe4a95::t_061f9231a817e6 73-74
+src/engine/adapters/storageConformance.test.ts
+  s_8bc9bf3abe4a95::t_39a250b8c9d09d 4,21
+src/engine/body/checkpoints.ts
+  s_8bc9bf3abe4a95::t_88f8b913260ae4 19
+src/engine/body/compaction.ts
+  s_8bc9bf3abe4a95::t_52583f118f5311 10,20
+src/engine/body/frames.test.ts
+  s_8bc9bf3abe4a95::t_6fdef7c957f51d 21-22
+src/engine/body/frames.ts
+  s_3bea9f4c72a663::t_c269691644b161 17,23-27,45,71-72,107,121-125
+src/engine/body/refs.ts
+  s_8bc9bf3abe4a95::t_af43ab2f23dbdb 14-15,30-31,46-47,52
+src/engine/ingest/envelope.ts
+  s_8bc9bf3abe4a95::t_4bca7d54db29d3 3-4,7,11-20,33-35,39-40,53-54,58-60
+src/engine/ingest/gate.test.ts
+  s_8bc9bf3abe4a95::t_6c726d537806d7 10
+src/engine/ingest/gate.ts
+  s_8bc9bf3abe4a95::t_46df7e8a330ee4 12,16-22,42-43,47-50,85-86,89,93-94,106-107,110,117,122-123,127,129,131-137
+src/engine/runtime/catchup.test.ts
+  s_8bc9bf3abe4a95::t_06a16b7f1d2a5d 4,72,99
+src/engine/runtime/compactionCas.test.ts
+  s_8bc9bf3abe4a95::t_b2425ae4e4a35e 8
+src/engine/runtime/crash.test.ts
+  s_8bc9bf3abe4a95::t_de89cf484fc2e9 19-20
+src/engine/runtime/engine.test.ts
+  s_8bc9bf3abe4a95::t_bfceca4b9f9db9 3
+src/engine/runtime/engine.ts
+  s_8bc9bf3abe4a95::t_0fd23a197e77f1 24-25,176-177
+src/engine/runtime/keystrokeBench.test.ts
+  s_8bc9bf3abe4a95::t_f2aefc3a490874 20
+src/engine/runtime/largeUpdate.test.ts
+  s_8bc9bf3abe4a95::t_4d02972ad8259a 13
+src/engine/runtime/mirrorIo.ts
+  s_8bc9bf3abe4a95::t_31b9a3c3bc131d 18-19,136-138,140,149-150,152
+src/engine/runtime/provisional.test.ts
+  s_8bc9bf3abe4a95::t_b447af813eafe3 5
+src/engine/runtime/quarantine.test.ts
+  s_8bc9bf3abe4a95::t_93e7fd437120a0 16,169,171-172
+src/engine/runtime/recovery.test.ts
+  s_8bc9bf3abe4a95::t_053a78cc99e9e2 9
+src/engine/runtime/testHarness.ts
+  s_8bc9bf3abe4a95::t_47bea8db804f2e 17
+src/engine/sync/foldRuntime.ts
+  s_8bc9bf3abe4a95::t_dee007b8aaf186 2-3,5-14,17-21,23-24,26-31,33-35,37-44,47-51,54-96,98-103,105-117,119-129,131,134-137,140-142,145-149,152-160
+src/engine/sync/ingestRow.ts
+  s_8bc9bf3abe4a95::t_63343a28b6436d 17,61
+src/engine/sync/nsRuntime.ts
+  s_8bc9bf3abe4a95::t_663773eb1fea88 2,4-6,15-24,26,28-35,45-46,48-59,63-64,67-69,72-73,80,88,91-97,99-103,105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e1f21ab3515e973e88eee22435a5d77ee30c7f22",
+  "prompts": {},
+  "sessions": {
+    "s_3bea9f4c72a663": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb05cda11fb8d171",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_8bc9bf3abe4a95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac019149b1d227e41",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
