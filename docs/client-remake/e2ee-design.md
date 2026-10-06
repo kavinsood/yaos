@@ -441,3 +441,124 @@ pre-restore frames from the abandoned timeline into the new epoch. This is accep
 - the restore is visible to the user as an epoch migration;
 - disk is the truth (DESIGN §c.12);
 - the carried-over frameNo (§8.2) keeps new frames from colliding with spliced ones.
+
+## 9. What is sealed, and open failures
+
+### 9.1 Sealed vs visible
+
+- **Sealed under suite 1:**
+  - every relay payload (`ns`, `cfg`, `b:`, `c:`, `x:`);
+  - every checkpoint;
+  - every blob: attachments, oversize body updates behind `bodyUpdateRef`, and uploaded snapshot zips
+    (`snapshotJob.ts:129-130`);
+  - the key material inside `k` records (§11).
+- **Visible to the server:**
+  - stream names: `b:`/`c:` + a random docId, `x:` + a keyed address, plus `ns`, `cfg`, `k`;
+  - deviceId and clientFrameId (both random);
+  - the outer envelope header (format, suite, keyEpoch);
+  - `k` record headers;
+  - deviceName;
+  - HTTP metadata.
+- **Suite pin.** The CryptoPort instance *is* the device's pin (§6.1, §12): a suite-1 port knows the vault is
+  encrypted.
+
+### 9.2 Classification
+
+`OpenFailure` grows from three reasons to five (§18.1). Readers classify a failure like this:
+
+| Situation | Reason | Class |
+|---|---|---|
+| Suite 1 port reads a **suite 0** envelope | `suite-downgrade` (new) | **Deterministic.** Otherwise the server could inject plaintext frames |
+| Suite 0 port reads a suite 1 envelope | `unsupported-suite` | Reader-dependent. Phase `key-missing`: "this vault is encrypted", re-key (§12) |
+| Suite ≥ 2, or unknown `formatVersion` | `unsupported-suite` / `unsupported-version` | Reader-dependent (upgrade) |
+| keyEpoch not held | `unknown-key` | Reader-dependent (re-key, or the `k` record not read yet) |
+| Tag fails under a **verified** key (§5.2) | `auth-failed` | **Deterministic** |
+| Tag fails under an **unverified** key | `auth-failed` | Reader-dependent |
+| Nonce field shorter than 12 bytes, or sealed shorter than 28 | `malformed` | Deterministic |
+| Valid tag, bad padding | `bad-padding` (new) | Deterministic |
+| keyEpoch older than the newest revoke epoch, and the row committed after S_rot | `stale-epoch` (engine rule, §14.3) | Deterministic |
+
+`isReaderDependent(reason, keyVerified)` replaces `isReaderDependent(reason)` (`src/engine/ingest/envelope.ts`).
+
+### 9.3 Actions (extends the DESIGN §d.6 table)
+
+| Class | ns / cfg | body / canvas / x | checkpoint |
+|---|---|---|---|
+| Deterministic | Fold as an empty frame (§c.3), plus a diagnostics event | Quarantine, freeze doc | Treat as absent: bootstrap from the tail; event |
+| Reader-dependent | **Halt** the fold at the row: phase `key-missing` or `upgrade-required`. Rows wait in `tail` | Quarantine, freeze. Automatically released and re-gated on `keyringChanged` (§6.3) | Treat as absent until new keys arrive |
+| `stale-epoch` | Fold as empty (`ignored/stale-epoch`) | **Ignored, no quarantine, no freeze** (the author re-seals, §14.3). A causal hole is handled by the existing rule (§d.6 step 3) | Rejected as absent |
+| frameNo replay (§8.2) | Fold as empty (`ignored/replay-*`) | n/a | n/a |
+
+- **Quarantine records keep the sealed bytes** (they already do, `QuarantineRecord.bytes`), so
+  `releaseQuarantine` and the automatic re-gate can re-open them after a re-key (`src/engine/runtime/quarantineRelease.ts`).
+- **Catch-up order** is `k` → `ns` → `cfg` → bodies (DESIGN §d.7 gains `k` in front). Keys are verified before
+  anything else is opened, so `auth-failed` under an unverified key is rare in practice.
+- **New phase `key-missing`** (`EnginePhase`, §18.4). It has two causes:
+  - the ns/cfg fold halted on a key it does not have;
+  - `k` shows an epoch above every key this device holds (a revoke it was left out of).
+
+  The device is read-only: it seals nothing, and its outbox is held. The status names the remedy: "Scan a re-key
+  code from another device, or enter the recovery key".
+
+## 10. Blobs
+
+### 10.1 Addressing and dedupe
+
+- `address = hex(HMAC-SHA-256(kAddr, sha256(plaintext)))`: 64 lowercase hex characters. It matches the server's
+  only check, `^[0-9a-f]{64}$`, with no hash verification (DECISIONS D9). The R2 key is `v/<vaultId>/<address>`.
+- ns entries, refs and snapshot records keep the **plaintext sha256**. The address is recomputed with the
+  vault-lifetime kAddr (§5.1) in any epoch.
+- `x:` streams become **`x:<address>`** (66 bytes, under the 256-byte cap in `server/src/streams/protocol.ts:16`).
+  `blobChunkStream(hash)` becomes `blobChunkStream(address)` (`src/engine/body/frames.ts:84`). The `blobChunk`
+  content still carries the sha256, now sealed.
+- **Dedupe** is per vault. Identical plaintexts get identical addresses, so `exists` skips the upload
+  (`frames.ts:76-77`, `blobQueue.ts:195-205`). There is no cross-vault dedupe: kAddr differs per vault.
+- **Accepted leak.** Equality of two attachments inside one vault, and blob count and bucketed sizes (§2.2).
+- Alternative: convergent per-blob keys `K = H(plaintext)`. Rejected: they allow confirmation of guessed files by
+  anyone with the ciphertext, and add a key per blob for no single-user gain.
+
+### 10.2 Sealed blob format
+
+```
+u8      blobFormat   = 1
+u8      cryptoSuite  = 1
+varuint keyEpoch     sealing epoch at upload
+bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §7.2) ‖ tag(16)
+```
+
+- Suite 0 is unchanged: address = sha256, and the bytes are raw.
+- A blob stays under its upload epoch forever. Rolls and revokes never re-seal blobs. A revoked device can read old
+  blobs it can fetch, which follows from §14.4.
+- **PUT overwrites** (DECISIONS D9). Two devices uploading the same file put two different ciphertexts at one
+  address. Either opens and verifies, so last-writer-wins is harmless.
+- **Download.** `get` → `openBlob(address, sealed)` → the sha256 must equal the reference. Any failure is
+  "unavailable" and is retried with backoff, as today (DESIGN §j.1). After the key is verified and 3 retries
+  over ≥ 3 min have failed, the referencing row is quarantined as deterministic.
+
+### 10.3 No chunking
+
+- One AEAD call per blob. WebCrypto has no streaming AEAD [w3c-webcrypto-73], and blobs are ≤ 10 MiB.
+- [M] At ≥ 2 GB/s on desktop, sealing 10 MiB takes ~5 ms. Mobile is **[U]** (budget §16).
+- Peak memory is about 3 × 10 MiB transient (plaintext, padded copy, ciphertext).
+- **Caps.**
+  - Suite 1 plaintext ≤ `MAX_BLOB_PLAINTEXT_BYTES` = 10223615 (§7.3). Above that the file is not synced (notice),
+    as today above 10 MiB.
+  - Log path (no R2, `blob = null`): chunk frames are ordinary sealed frames. [D] A 768 KiB chunk pads to
+    784 KiB, under the frame cap. `MAX_LOG_BLOB_BYTES` (8 MiB) is unchanged.
+
+### 10.4 Garbage collection
+
+- **Today** (suite 0 as well): the server has no blob list or delete route (DECISIONS §2.2). Blobs live until the
+  vault is deleted (R2 prefix purge, DECISIONS D5). E2EE changes nothing here until server ask A3.
+- **With A3: client mark-and-sweep.** Cold path: a user command or at most monthly, on one device.
+  1. Live set: the addresses of every sha256 referenced by ns entries (live, plus tombstones inside retention),
+     unresolved `bodyUpdateRef`s, kept uploaded snapshots, and the local blob queue.
+  2. Page through `GET /vault/:id/blobs` (A3), which returns addresses and upload times.
+  3. For each address that is not live and was uploaded more than 7 days ago, call
+     `DELETE /vault/:id/blobs/:addr?ifUploadedBefore=<ms>` (A3).
+     - The condition is checked against the R2 object's upload time, so a concurrent re-upload (PUT refreshes it)
+       survives.
+     - The grace period covers the gap between a put and the ns frame that references it (DESIGN §j.1 "only after
+       the put succeeds").
+- Alternative: server refcounts. Rejected: the server cannot see references under E2EE, and keeping refs
+  consistent across DOs would be a distributed transaction.
