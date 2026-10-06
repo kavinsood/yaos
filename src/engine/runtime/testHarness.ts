@@ -41,6 +41,8 @@ export const FAST_TUNING: Partial<EngineTuning> = {
 	causalRetries: 2,
 	readBackoffMs: 50,
 	reconnectBaseMs: 20,
+	refRetryMs: 50,
+	refRetryMaxMs: 400,
 };
 
 export interface FaultyCrypto extends CryptoPort {
