@@ -203,7 +203,7 @@ bound to the vaultId only. *Why:* an epoch means only "the stream space was repl
   measures DROP+CREATE billing on workerd and uses it if it is cheaper.
 - *Test:* T-RESET.
 
-**D8b restore (proposed — awaiting user OK).** `POST /operator/vaults/:id/restore {"at": ISO8601}` → `200
+**D8b restore (approved 2026-10-06; operator-only, cold path).** `POST /operator/vaults/:id/restore {"at": ISO8601}` → `200
 {vaultEpoch}`. A restore rewinds content, never authority.
 - **Why not a temp table:** PITR "appl[ies] to the entire SQLite database contents, including … key-value data"
   and returns storage "to exactly match what the storage contained at the given bookmark". A backup table written
@@ -245,7 +245,8 @@ The config DO runs the steps (the Worker forwards the request after the session 
   reset-streams with `409 restore_in_progress` (operator routes already pass the config DO, so it costs nothing).
   Vault delete wins: it deletes the journal row first. An enroll that lands in the rewound vault is dropped by the
   re-rewind (fail-closed: re-pair).
-- **Invariants.** The vault DO never calls the config DO; no device route gains a hop. Rows: config 3 (insert,
+- **Invariants.** Cold path only: the operator route is the sole entry, and the journal, steps and alarm never touch
+  a device path. The vault DO never calls the config DO; no device route gains a hop. Rows: config 3 (insert,
   update, delete); vault 1 (the marker, which the rewind erases) + finish.
 - **Residual window.** No crash: one internal RPC between abort and finish; upgrades re-check the device table,
   and a write in the window sends finish back to 2. Crash: at most the alarm delay (≈ 30 s plus retries) of
@@ -375,7 +376,7 @@ Classes: **additive** (new; old clients unaffected), **relaxation** (the server 
 | 2.4 | 200 body: exactly `host, deviceToken, vaultId, deviceId, deviceName, vaultGeneration` (D3) | removal | none |
 | 2.5 | Pairing-code response `{pairingCode, expiresAt, purpose, obsidianUrl, mobileSetupUrl?}`; purpose `device` only (absent = device; else `400 invalid_purpose`) | tightening | none |
 | 2.6 | Ticket wire unchanged; issued by the vault DO | none | none |
-| 2.7 | Removed: `403 capability_denied`, `409 vault_<state>`, `503 vault_draining`; `404 unknown_vault` → `401 unauthorized` (§2.2). `409 vault_generation_mismatch` gains `vaultEpoch`. + D8b (proposed): `503 restore_in_progress` with `Retry-After`, `409 restore_in_progress`, `503 restore_incomplete`, `400 invalid_restore_point`, `501 restore_unsupported` | removal / additive | none |
+| 2.7 | Removed: `403 capability_denied`, `409 vault_<state>`, `503 vault_draining`; `404 unknown_vault` → `401 unauthorized` (§2.2). `409 vault_generation_mismatch` gains `vaultEpoch`. + D8b: `503 restore_in_progress` with `Retry-After`, `409 restore_in_progress`, `503 restore_incomplete`, `400 invalid_restore_point`, `501 restore_unsupported` | removal / additive | none |
 | 3.1 | `unclaimed` frame never sent (D4); DO-level `409 authority_superseded` and `403` at upgrade removed; `unauthorized` and `update_required` frames unchanged; 429 stays | removal | treat as `unauthorized` (already mapped) |
 | 3.2 | `canWrite` always true; D6 constants; the `write_forbidden` note is removed; `groupCommit.minIntervalMs` 0 → 1000 | removal / tightening | read `limits`; set receipt timeouts ≥ maxMs + RTT |
 | 4.3 | `STREAM_APPEND_REJECTED write_forbidden` removed. `VAULT_ERROR durability_failed` + `retryAfterMs` (ms, number) | removal / additive | when present, wait `retryAfterMs` before resending |
@@ -383,7 +384,7 @@ Classes: **additive** (new; old clients unaffected), **relaxation** (the server 
 | 5.4 | Dedupe scope (text below) | relaxation | none |
 | 6, 7, 8 | Optional `epoch=<vaultEpoch>`; mismatch or empty → `409 {"error":"vault_generation_mismatch","vaultEpoch"}` before any effect | additive | send it; on 409 switch to the returned epoch (new local DB) |
 | 8 | GC text (below) | tightening | write a final checkpoint at `lastSeq` to retire a stream |
-| 10 | 1001 also means "replaced by a newer socket of the same device" (reason `device_socket_limit`); 4403 only on revoke; + 1013 `restore_in_progress` (D8b, proposed) | additive | back off ≥ 30 s on `device_socket_limit` |
+| 10 | 1001 also means "replaced by a newer socket of the same device" (reason `device_socket_limit`); 4403 only on revoke; + 1013 `restore_in_progress` (D8b) | additive | back off ≥ 30 s on `device_socket_limit` |
 | 11.1 | Rate gate per socket → per device; + "Streams sockets per device: 4, a 5th evicts the oldest (1001 `device_socket_limit`)"; group commit row gains "1000 ms min interval" | tightening | one socket per vault per device |
 | 11.2 | Permissions table and the 5 s authority cache removed; revoke shuts the gate at once (D7) | removal | none |
 | 11.3 | `<sha256 hex>` → `<64 lowercase hex address>`; no hash check; `400 hash mismatch` removed; PUT overwrites; capability names gone | relaxation / removal | verify downloads client-side |
@@ -430,8 +431,8 @@ CREATE TABLE vault_meta (
   vault_id TEXT NOT NULL, vault_generation TEXT NOT NULL,
   ticket_key BLOB NOT NULL,            -- 32 random bytes, never leaves the DO
   created_at INTEGER NOT NULL,
-  pending_restore_id TEXT,             -- D8b (proposed): set by prepare, erased by a real rewind
-  last_restore_id TEXT,                -- D8b (proposed): step 2 skip, finish idempotency
+  pending_restore_id TEXT,             -- D8b: set by prepare, erased by a real rewind
+  last_restore_id TEXT,                -- D8b: step 2 skip, finish idempotency
   last_restore_at INTEGER
 ) WITHOUT ROWID;
 CREATE TABLE device (
@@ -477,7 +478,7 @@ CREATE TABLE session (token_hash BLOB PRIMARY KEY, expires_at INTEGER NOT NULL) 
 CREATE TABLE vault (vault_id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE restore_journal (vault_id TEXT PRIMARY KEY, restore_id TEXT NOT NULL, at INTEGER NOT NULL,
   bookmark TEXT, devices BLOB,                                          -- set after prepare; token hashes only
-  created_at INTEGER NOT NULL) WITHOUT ROWID;                           -- D8b (proposed); alarm while rows exist
+  created_at INTEGER NOT NULL) WITHOUT ROWID;                           -- D8b; alarm while rows exist
 ```
 
 `claimed` = the operator row exists. Rows written: claim 3 here (operator, vault, session) + 2 in the vault DO
@@ -570,7 +571,7 @@ Review flags:
 - F6 → accepted, now in D5.
 - F7 → accepted, now in D5.
 - F8 → accepted, now in D5.
-- F9 → replaced by the new D8b design (proposed — awaiting user OK).
+- F9 → replaced by the new D8b design (approved 2026-10-06).
 - F10 → accepted, now in D3.
 - F11 → accepted, now in §2.2.
 - F12 → accepted, now in H2.
@@ -598,6 +599,6 @@ Raised during the fold, now resolved:
 | P0 Conformance baseline | BB suite in `e2e/conformance/` for every BB row of section 7; run against scratch-3 and local `wrangler dev` | The suite runs end to end; scratch-3 results recorded, with every difference from the section 7 guesses explained |
 | P1 Host skeleton | New Worker router, vault DO and config DO classes; streams core behind ports; legacy `server/src` deleted; README "Cloudflare only". The Node host, Docker and `packages/cli` are already gone on this branch, with the harness adapter in `tests/server/helpers/` | Ported streams WB tests green; T-LEGACY-404 and T-HOTPATH harness in place; `tsc`/lint clean |
 | P2 Identity | Claim, login and sessions, vaults, owner code, D3 codes, enroll (replay, D3), D4 tickets, devices list and revoke (D7 gate) | D2–D7 BB + BASELINE green on local dev; T-PAIR-NOWRITE, T-HOTPATH, T-ROWS-WB (identity rows) green |
-| P3 Hardening | H1–H8, D8a/D8c, D9 (`v/<vaultId>/<address>` keys); D8b once approved | Every BB row except T-RESTORE-MANUAL green locally (blob rows with local R2); all WB green; H2 cold-scan CPU and D8a DROP+CREATE billing measured |
+| P3 Hardening | H1–H8, D8a/D8c, D9 (`v/<vaultId>/<address>` keys); D8b | Every BB row except T-RESTORE-MANUAL green locally (blob rows with local R2); all WB green; H2 cold-scan CPU and D8a DROP+CREATE billing measured |
 | P4 Console | `GET /` page and `GET /mobile-setup` (D5) | Manual run on local dev: claim → vault → QR → enroll → revoke → reset; no external assets |
 | P5 Deploy over scratch-3 | The coordinator deploys: one migration that deletes the old DO classes and adds the two new ones (the account is at the namespace cap) | The full suite is green on scratch-3 except the documented SKIPs; T-RESTORE-MANUAL done once by hand; §15 latencies re-measured |
