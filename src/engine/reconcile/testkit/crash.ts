@@ -6,7 +6,9 @@
  * before / after the n-th commit), reboots, syncs, and returns the world.
  */
 
+import { canvasContentHash } from "../../../core/hash/canvasCanonical";
 import { sha256Hex } from "../../../core/hash/sha256";
+import { canvasDocHash } from "../canvasDoc";
 import type { VaultPath } from "../../../core/types";
 import { CrashError } from "./fakeGateway";
 import type { World } from "./world";
@@ -69,8 +71,8 @@ export async function runCrashed(make: () => Promise<World>, p: CrashPoint): Pro
 }
 
 /**
- * Global convergence: every live doc is on disk with the CRDT's text / the blob's
- * bytes, every visible file is a live doc, S agrees with disk, no open intents,
+ * Global convergence: every live doc is on disk with the CRDT's text / the
+ * canvas projection's logical hash / the blob's bytes, every visible file is a live doc, S agrees with disk, no open intents,
  * and another sync does nothing.
  */
 export async function assertConverged(w: World, where: string): Promise<void> {
@@ -78,6 +80,11 @@ export async function assertConverged(w: World, where: string): Promise<void> {
 	for (const r of view.remote.values()) {
 		if (r.state !== "live") continue;
 		if (r.kind === "markdown") eq(w.vault.text(r.path), w.log.text(r.docId), `${where}: ${r.path} disk != crdt`);
+		if (r.kind === "canvas") {
+			const b = w.vault.bytesOf(r.path);
+			ok(b, `${where}: ${r.path} missing on disk`);
+			eq(canvasContentHash(b), canvasDocHash(w.log.canvasDoc(r.docId)), `${where}: ${r.path} disk != canvas crdt`);
+		}
 		if (r.kind === "blob") {
 			const b = w.vault.bytesOf(r.path);
 			ok(b, `${where}: ${r.path} missing on disk`);

@@ -5,10 +5,12 @@
  *    suffixing, stale-delete and rev-mismatch). Own ops fold immediately, or
  *    are held (`holdNs = true`) and shown through an optimistic overlay with
  *    `pendingLocal` until `flushNs()`.
- *  - bodies: one Y.Doc replica per doc ("text" root). Durable state = remote
+ *  - bodies: one Y.Doc replica per doc ("text" root for markdown; "nodes" /
+ *    "edges" / "doc" maps for canvas, canvasDoc.ts). Durable state = remote
  *    rows + own committed frames. MERGE-origin updates are framed only by
  *    commitEdits() (T_edit); crash() drops replicas and unframed updates.
- *  - remote devices: remoteCreate / remoteEdit / remoteRename / remoteDelete / remoteSetBlob.
+ *  - remote devices: remoteCreate / remoteEdit / remoteEditCanvas / remoteRename / remoteDelete / remoteSetBlob.
+ *  - textHash: markdownContentHash of the text, canvasDocHash for canvas docs.
  * The real implementation is WP-C's; nothing here is shipped.
  */
 
@@ -17,10 +19,12 @@ import type {
 	BodyVersion, ContentHash, DocId, DocKind, NsBlobRef, NsEntryState, NsOp, NsOpOutcome, PathKey, RemoteEntry, Seq, StreamName, VaultPath,
 } from "../../../core/types";
 import { kindOfPath } from "../../../core/types";
+import { canvasContentHash, parseCanvasText, rankCanvasInFileOrder } from "../../../core/hash/canvasCanonical";
 import { markdownContentHash } from "../../../core/hash/markdownLf";
 import { sha256Hex } from "../../../core/hash/sha256";
-import { utf8Length } from "../../../core/hash/utf8";
+import { utf8Encode, utf8Length } from "../../../core/hash/utf8";
 import { joinPath, leafOf, parentOf, splitExt, standInPathKey } from "../../../core/plan/pathRules";
+import { applyCanvas, canvasDocHash, projectCanvasBytes } from "../canvasDoc";
 import type { BodyHandle, LogPort, OwnFoldEvent, RemoteView } from "../deps";
 
 export const REMOTE = Symbol("REMOTE");
@@ -214,6 +218,18 @@ export class StubLog implements LogPort {
 		return this.durableText(docId);
 	}
 
+	/** Canvas Y.Doc: the resident replica if any, else a fresh load of the durable state. */
+	canvasDoc(docId: DocId): Y.Doc {
+		const b = this.ensureBody(docId);
+		return b.replica ?? this.durableDoc(b);
+	}
+
+	/** Disk projection text of a canvas doc (null = invalid CRDT). */
+	canvasText(docId: DocId): string | null {
+		const p = projectCanvasBytes(this.canvasDoc(docId));
+		return p.ok ? p.text : null;
+	}
+
 	private remoteEntry(e: Entry | undefined, pendingLocal: boolean): RemoteEntry | null {
 		if (!e) return null;
 		const b = this.bodies.get(e.docId);
@@ -253,7 +269,8 @@ export class StubLog implements LogPort {
 			const b = this.bodies.get(e.docId);
 			if (b && e.kind !== "blob") {
 				appliedSeq.set(e.docId, b.maxRowSeq);
-				if (b.caughtUp) textHash.set(e.docId, markdownContentHash(this.text(e.docId)));
+				const h = !b.caughtUp ? null : e.kind === "canvas" ? canvasDocHash(this.canvasDoc(e.docId)) : markdownContentHash(this.text(e.docId));
+				if (h !== null) textHash.set(e.docId, h);
 				if (b.unframed.length > 0) docsWithPendingBody.add(e.docId);
 			}
 		}
@@ -266,8 +283,9 @@ export class StubLog implements LogPort {
 	// ---- bodies -----------------------------------------------------------------
 
 	async acquireBody(docId: DocId, kind: "markdown" | "canvas"): Promise<BodyHandle | null> {
-		const known = this.entries.has(docId) || this.pending.some((op) => op.t === "create" && op.docId === docId);
-		if (!known || kind !== "markdown") return null;
+		const created = this.pending.find((op): op is Extract<NsOp, { t: "create" }> => op.t === "create" && op.docId === docId);
+		const known = this.entries.get(docId)?.kind ?? created?.kind;
+		if (known !== kind) return null;
 		const b = this.ensureBody(docId);
 		if (!b.replica) {
 			const d = this.durableDoc(b);
@@ -335,14 +353,14 @@ export class StubLog implements LogPort {
 		return `${prefix}${String(this.idCounter).padStart(21, "0")}`.slice(0, 22) as DocId;
 	}
 
-	private remoteRow(docId: DocId, fn: (t: Y.Text) => void): void {
+	private remoteRow(docId: DocId, fn: (doc: Y.Doc) => void): void {
 		const b = this.ensureBody(docId);
 		const base = this.durableDoc(b);
 		const other = new Y.Doc();
 		other.clientID = this.nextClient++;
 		Y.applyUpdate(other, Y.encodeStateAsUpdate(base));
 		const sv = Y.encodeStateVector(other);
-		fn(other.getText("text"));
+		fn(other);
 		const update = Y.encodeStateAsUpdate(other, sv);
 		b.durable.push(update);
 		const seq = ++this.seq;
@@ -360,13 +378,29 @@ export class StubLog implements LogPort {
 			return docId;
 		}
 		const text = content as string;
+		if (kind === "canvas") {
+			const parsed = parseCanvasText(text);
+			if (parsed.kind !== "valid") throw new Error(`remoteCreate: invalid canvas ${parsed.kind}`);
+			const hash = canvasContentHash(utf8Encode(text));
+			this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: hash, size: utf8Length(text) }, ++this.seq);
+			const ranked = rankCanvasInFileOrder(parsed.data);
+			if (parsed.data.nodes.size + parsed.data.edges.size + Object.keys(parsed.data.rootFields).length > 0) {
+				this.remoteRow(docId, (d) => applyCanvas(d, null, ranked));
+			} else this.ensureBody(docId);
+			return docId;
+		}
 		this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: markdownContentHash(text), size: utf8Length(text) }, ++this.seq);
-		if (text.length > 0) this.remoteRow(docId, (t) => t.insert(0, text));
+		if (text.length > 0) this.remoteRow(docId, (d) => d.getText("text").insert(0, text));
 		else this.ensureBody(docId);
 		return docId;
 	}
 
 	remoteEdit(docId: DocId, fn: (t: Y.Text) => void): void {
+		this.remoteRow(docId, (d) => fn(d.getText("text")));
+	}
+
+	/** A remote device edits a canvas doc (raw Y.Doc access; canvasDoc.applyCanvas for record-level edits). */
+	remoteEditCanvas(docId: DocId, fn: (doc: Y.Doc) => void): void {
 		this.remoteRow(docId, fn);
 	}
 
