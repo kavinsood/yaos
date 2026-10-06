@@ -1,8 +1,13 @@
 # YAOS client remake: crypto suite 1 (single-user E2EE)
 
 Status: proposed, normative once accepted. Owner: architect. Extends [DESIGN.md](DESIGN.md); where this document
-changes a shape named there, §18 gives the DESIGN diff. Scope is **single-user** end-to-end encryption: one person,
-several devices, one vault. Shared E2EE vaults are out of scope. §2.4 lists what this design keeps open for them.
+changes a shape named there, §18 gives the DESIGN diff. Server baseline: the rewritten relay merged into
+`client-remake` at 7208184 (PR #82; `docs/server-rewrite/DECISIONS.md`). It is an opaque byte sequencer: streams,
+checkpoint CAS, R2 blobs at `v/<vaultId>/<address>`, operator-only revoke/reset/restore, and no server-side
+recovery or snapshots (DECISIONS §1, §2.1, D7, D8a, D8b, D9). Server line references are at 7208184.
+
+Scope is **single-user** end-to-end encryption: one person, several devices, one vault. Shared E2EE vaults are out
+of scope (DECISIONS §1 removes them server-side too). §2.4 lists what this design keeps open for them.
 
 - Conventions as in DESIGN: MUST / NEVER are hard rules. "Alternative:" lines record a rejected option in one line.
 - Evidence tags on claims:
@@ -11,7 +16,7 @@ several devices, one vault. Shared E2EE vaults are out of scope. §2.4 lists wha
   - **[D]** derived here by calculation from cited inputs (the calculation is shown);
   - **[U]** unverified: needs a device or is not stated anywhere I could find.
 - Terms:
-  - **K_e**: the 32-byte vault key of key epoch `e` (`e ≥ 1`). "Vault key" in `server/src/auth/ticket.ts` is the relay's
+  - **K_e**: the 32-byte vault key of key epoch `e` (`e ≥ 1`). "Vault key" in `server/src/vault/ticket.ts` (DECISIONS D4) is the relay's
     ticket-signing key and is unrelated (server ask A8).
   - **keyEpoch** (this document) vs **vaultEpoch** (the relay generation, DESIGN §c.12). They are independent.
   - **RK**: the recovery key (§13). **k**: the keyring stream (§11).
@@ -62,7 +67,7 @@ recovery · [14](#14-rotation-and-revocation) rotation · [15](#15-enable-migrat
 - **Non-goals:**
   - availability (the server can always withhold);
   - fork consistency: the server can show two devices different histories. Rollback to any state the server
-    once held is also possible, because PITR restore is a legitimate server feature ([CF-PITR]);
+    once held is also possible, because PITR restore is a legitimate operator feature (DECISIONS D8b, [CF-PITR]);
   - local at-rest encryption: IndexedDB `tail`/`snapshots` and the vault files on disk hold plaintext;
   - hiding that YAOS is used, or when.
 - **The user is the trust anchor** for the vault's suite: §12.4 covers downgrade by a lying server.
@@ -77,7 +82,7 @@ recovery · [14](#14-rotation-and-revocation) rotation · [15](#15-enable-migrat
 | Exact frame, checkpoint and blob sizes | **Mitigated (bucketed)** | Padmé leaks O(log log M) bits per size, with ≤ 12 % overhead [Padmé] (§7.3). |
 | Plaintext sha256 and size in HTTP headers | **Mitigated** | The client never sends `X-YAOS-Content-*`. Server ask A2 removes them. |
 | Number of streams, i.e. roughly the number of notes plus canvases | Accepted | One stream per doc is the relay's cost model (relay-wire §11.4). |
-| Stream class (`b:` vs `c:` vs `x:` vs `ns`/`cfg`/`k`) | Accepted | The relay's provisional broadcast keys on `b:`/`c:` ([server] `streams/protocol.ts:52-54`). |
+| Stream class (`b:` vs `c:` vs `x:` vs `ns`/`cfg`/`k`) | Accepted | The relay's provisional broadcast keys on `b:`/`c:` (`server/src/streams/protocol.ts:53`). |
 | Which stream was touched when, and by which device | Accepted | Row timing, seq order and deviceId are relay-visible by design. This reveals editing activity per note. |
 | Bucketed sizes and growth of each stream | Accepted | Residual after padding. |
 | Device count, deviceName, IPs, user agents, connection times | Accepted | deviceName defaults to a neutral label under suite 1 (§12.3). |
