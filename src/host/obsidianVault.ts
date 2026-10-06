@@ -1,25 +1,40 @@
 /**
  * VaultPort over Obsidian's Vault (DESIGN §f, §h).
- *  - write: CAS. Text over an existing file goes through vault.process with an
- *    exact-content guard (the callback throws to abort, so a changed file is
- *    never written); "absent" goes through vault.create (throws if it exists).
- *    Binary over an existing file is check-then-modifyBinary (not atomic;
- *    narrowed by a stat recheck). Gap recorded in wp-d-notes.
+ *  - write: CAS without hashing on main (DESIGN §d.4). "absent" goes through vault.create (throws if
+ *    it exists: atomic). fingerprint/hash: read the raw bytes, the engine hashes them (HashOracle),
+ *    compare, then write behind O(1) guards; see "Precondition window" below.
  *  - rename: vault.rename only (never fileManager.renameFile: no link rewrites).
  *  - trash: vault.trash only. No permanent file delete exists in this adapter. "follow-obsidian"
  *    reads trashOption from <configDir>/app.json through the adapter at each delete (see
  *    followObsidianSystemTrash).
  *  - removeEmptyFolder: vault.delete(folder, false) only when it has zero
  *    children in the index (no file content can be lost).
+ *
+ * Precondition window (fingerprint/hash over an existing file). Obsidian has no compare-and-swap; the
+ * check reads at t0 (adapter.readBinary), the engine answers at t1, the write happens at t2.
+ *  - Caught: any change visible in TFile.stat (size or mtime differs from the snapshot taken before
+ *    the t0 read) up to the recheck right before the write; for text, any change of the UTF-16 length
+ *    at t2: vault.process reads the file inside Obsidian's adapter queue and our callback throws (no
+ *    write) unless `cur.length` equals the engine's textLength of the t0 bytes (desktop adapter.process
+ *    reads, calls the callback, writes only if it returned, obsidian.asar 1.14.4 app.js@552301;
+ *    Vault.process@1426847 delegates to it; Capacitor@1350128 is the same shape).
+ *  - Missed (accepted gap): a same-length text change, or any binary change, that is not yet in
+ *    TFile.stat when we recheck: Obsidian's watcher has not delivered it yet, it kept size and mtime
+ *    (same-millisecond, coarse-mtime filesystems), or it lands between the recheck and the process
+ *    read (text) / the modifyBinary (binary). The old main-thread guard compared the full text inside
+ *    process and closed the text part of this gap at O(N) main-thread cost; DESIGN §d.4 forbids that.
+ *    The engine fingerprints what it wrote and re-reads the disk on the next modify event, so a lost
+ *    external edit of this kind is still the narrow race of any non-atomic writer, not a silent loop.
+ *  - Spurious failures (safe direction): if Obsidian's decode ever disagreed with the engine's
+ *    WHATWG UTF-8 decode on invalid bytes, the length guard fails and the op is retried/replanned.
  */
 
-import type { DiskFingerprint, VaultPath } from "../core/types";
+import type { VaultPath } from "../core/types";
 import type { Unsubscribe } from "../ports/common";
 import type { RenameOutcome, TrashMode, VaultEvent, VaultPort, VaultStat, WriteOutcome, WritePrecondition } from "../ports/vault";
-import type { Hasher } from "./hashing";
-import { utf8 } from "./hashing";
+import type { HashOracle } from "./hashOracle";
 import {
-	decodeKeepBom, invalidVaultPath, isFile, isFolder, parentsOf, tightBuffer,
+	invalidVaultPath, isFile, isFolder, parentsOf, tightBuffer,
 	type AbstractFileLike, type FileLike, type VaultApi,
 } from "./obsidianApi";
 
@@ -56,7 +71,7 @@ export class ObsidianVault implements VaultPort {
 
 	constructor(
 		private readonly vault: VaultApi,
-		private readonly hasher: Hasher,
+		private readonly hashes: HashOracle,
 		caseInsensitive: boolean,
 	) {
 		this.configDir = vault.configDir;
@@ -90,26 +105,48 @@ export class ObsidianVault implements VaultPort {
 	async readBytes(path: string): Promise<Uint8Array> {
 		const f = this.file(path);
 		if (!f) throw new Error(`ENOENT: ${path}`);
-		return new Uint8Array(await this.vault.readBinary(f));
+		// adapter.readBinary, not vault.readBinary: the latter also decodes .md files into Obsidian's
+		// cache on main (obsidian.asar 1.14.4 app.js@1423772). Desktop returns a fresh ArrayBuffer
+		// (@550001, Xl @545899: buffer.slice), so the view owns it and transfers without a copy.
+		return new Uint8Array(await this.vault.adapter.readBinary(f.path));
 	}
 
-	/** null = passes. Reads exact bytes so fingerprint preconditions see what is on disk. */
-	private async check(path: string, f: FileLike | null, pre: WritePrecondition): Promise<{ pass: boolean; bytes: Uint8Array | null }> {
+	/**
+	 * Evaluates a precondition without hashing on main: the exact bytes go (transferred) to the engine,
+	 * which answers the hash and the UTF-16 length of their text (BOM kept) for the write guard.
+	 * Throws when the engine is not running (callers report io, never guess).
+	 */
+	private async check(path: string, f: FileLike | null, pre: WritePrecondition): Promise<{ pass: boolean; textLength: number | null }> {
 		switch (pre.t) {
 			case "any":
-				return { pass: true, bytes: null };
+				return { pass: true, textLength: null };
 			case "absent":
-				return { pass: f === null && !(await this.vault.adapter.exists(path)), bytes: null };
+				return { pass: f === null && !(await this.vault.adapter.exists(path)), textLength: null };
 			case "fingerprint":
 			case "hash": {
-				if (!f) return { pass: false, bytes: null };
-				const bytes = new Uint8Array(await this.vault.readBinary(f));
-				const pass = pre.t === "fingerprint"
-					? (await this.hasher.fingerprint(bytes)) === pre.fingerprint
-					: (await this.hasher.contentHash(path, bytes)) === pre.hash;
-				return { pass, bytes };
+				if (!f) return { pass: false, textLength: null };
+				const bytes = await this.readBytes(f.path);
+				const [v] = await this.hashes.hash([{ path: f.path, want: pre.t === "fingerprint" ? "fingerprint" : "contentHash", bytes }]);
+				if (!v) throw new Error("hash oracle returned no value");
+				return { pass: v.hash === (pre.t === "fingerprint" ? pre.fingerprint : pre.hash), textLength: v.textLength };
 			}
 		}
+	}
+
+	/** check() for rename/trash: an unavailable engine is an io failure, not a throw. */
+	private async checkOrIo(path: string, f: FileLike, pre: WritePrecondition): Promise<RenameOutcome | null> {
+		try {
+			const { pass } = await this.check(path, f, pre);
+			return pass ? null : { ok: false, reason: "precondition", message: `precondition ${pre.t} failed` };
+		} catch (e) {
+			return { ok: false, reason: "io", message: e instanceof Error ? e.message : String(e) };
+		}
+	}
+
+	/** True when `f` is still the file the check read: present, same size and mtime as `before`. */
+	private unchanged(path: string, before: VaultStat | null): FileLike | null {
+		const now = this.file(path);
+		return now && before && now.stat.mtime === before.mtimeMs && now.stat.size === before.size ? now : null;
 	}
 
 	private async ensureParents(path: string): Promise<string | null> {
@@ -137,12 +174,11 @@ export class ObsidianVault implements VaultPort {
 			const pf = this.file(parentFile);
 			return { ok: false, reason: "parent-is-file", current: pf ? statOf(pf) : null, message: `parent ${parentFile} is a file` };
 		}
-		const bytes = typeof data === "string" ? utf8(data) : data;
 		const f = this.file(path);
 		const failPre = (cur: FileLike | null): WriteOutcome => ({ ok: false, reason: "precondition", current: cur ? statOf(cur) : null, message: `precondition ${precondition.t} failed` });
 		const before = f ? statOf(f) : null; // snapshot: Obsidian mutates file.stat in place
 		try {
-			const { pass, bytes: seen } = await this.check(path, f, precondition);
+			const { pass, textLength } = await this.check(path, f, precondition);
 			if (!pass) return failPre(this.file(path));
 			if (!f) {
 				// absent (or "any" on a missing file): create throws if it appeared meanwhile.
@@ -153,16 +189,23 @@ export class ObsidianVault implements VaultPort {
 					if (this.file(path) || (await this.vault.adapter.exists(path))) return failPre(this.file(path));
 					throw e;
 				}
-			} else if (typeof data === "string") {
-				const expect = seen ? decodeKeepBom(seen) : null;
-				await this.vault.process(f, (cur) => {
-					if (expect !== null && cur !== expect) throw new CasAbort("changed since check");
-					return data;
-				});
 			} else {
-				const now = this.file(path);
-				if (!now || !before || now.stat.mtime !== before.mtimeMs || now.stat.size !== before.size) return failPre(now);
-				await this.vault.modifyBinary(now, tightBuffer(data));
+				// Checked preconditions: the file must still be the one the check read (stat-visible
+				// changes since the snapshot). "any" skips it, as before. No await between this recheck
+				// and the write call below.
+				const now = precondition.t === "any" ? f : this.unchanged(path, before);
+				if (!now) return failPre(this.file(path));
+				if (typeof data === "string") {
+					// O(1) guard at the read inside Obsidian's adapter queue: a changed length aborts
+					// before anything is written (the callback throws). Same-length changes not visible
+					// in stat are the accepted gap (header).
+					await this.vault.process(now, (cur) => {
+						if (textLength !== null && cur.length !== textLength) throw new CasAbort("changed since check");
+						return data;
+					});
+				} else {
+					await this.vault.modifyBinary(now, tightBuffer(data));
+				}
 			}
 		} catch (e) {
 			if (e instanceof CasAbort) return failPre(this.file(path));
@@ -170,7 +213,7 @@ export class ObsidianVault implements VaultPort {
 		}
 		const after = this.file(path);
 		if (!after) return { ok: false, reason: "io", current: null, message: "written file vanished" };
-		return { ok: true, stat: statOf(after), fingerprint: (await this.hasher.fingerprint(bytes)) as DiskFingerprint };
+		return { ok: true, stat: statOf(after) };
 	}
 
 	async rename(from: string, to: VaultPath, precondition: WritePrecondition): Promise<RenameOutcome> {
@@ -182,19 +225,22 @@ export class ObsidianVault implements VaultPort {
 		if (!caseOnly && (this.vault.getAbstractFileByPath(to) !== null || (await this.vault.adapter.exists(to)))) {
 			return { ok: false, reason: "target-exists", message: "target exists" };
 		}
-		const { pass } = await this.check(from, src, precondition);
-		if (!pass) return { ok: false, reason: "precondition", message: `precondition ${precondition.t} failed` };
+		const before = statOf(src);
+		const failed = await this.checkOrIo(from, src, precondition);
+		if (failed) return failed;
 		const parentFile = await this.ensureParents(to);
 		if (parentFile !== null) return { ok: false, reason: "io", message: `parent ${parentFile} is a file` };
+		const cur = precondition.t === "any" || precondition.t === "absent" ? this.file(from) : this.unchanged(from, before);
+		if (!cur) return { ok: false, reason: "precondition", message: "changed during check" };
 		try {
 			if (caseOnly) {
 				const tmp = `${from}.yaos-case-${++this.tmpSeq}`;
-				await this.vault.rename(src, tmp);
+				await this.vault.rename(cur, tmp);
 				const mid = this.file(tmp);
 				if (!mid) return { ok: false, reason: "io", message: "case rename lost the file" };
 				await this.vault.rename(mid, to);
 			} else {
-				await this.vault.rename(src, to);
+				await this.vault.rename(cur, to);
 			}
 		} catch (e) {
 			return { ok: false, reason: "io", message: e instanceof Error ? e.message : String(e) };
@@ -208,10 +254,10 @@ export class ObsidianVault implements VaultPort {
 		if (!f) return { ok: false, reason: "source-missing", message: "source missing" };
 		const before = statOf(f);
 		const system = await this.systemTrash(mode); // before the check: no await between recheck and trash
-		const { pass } = await this.check(path, f, precondition);
-		if (!pass) return { ok: false, reason: "precondition", message: `precondition ${precondition.t} failed` };
-		const now = this.file(path);
-		if (!now || now.stat.mtime !== before.mtimeMs || now.stat.size !== before.size) return { ok: false, reason: "precondition", message: "changed during check" };
+		const failed = await this.checkOrIo(path, f, precondition);
+		if (failed) return failed;
+		const now = this.unchanged(path, before);
+		if (!now) return { ok: false, reason: "precondition", message: "changed during check" };
 		const stat = statOf(now);
 		try {
 			await this.vault.trash(now, system);

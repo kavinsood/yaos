@@ -1,19 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { exactFingerprint, markdownContentHash } from "../core/hash/markdownLf";
+import { utf8Encode } from "../core/hash/utf8";
 import type { DiskFingerprint, VaultPath } from "../core/types";
 import type { VaultEvent } from "../ports/vault";
-import { simHashPort } from "../sim/hash";
+import { simHashOracle } from "../sim/hash";
 import { FakeObsidianVault } from "../sim/fakeObsidian";
-import { createHasher, utf8 } from "./hashing";
+import type { HashOracle } from "./hashOracle";
 import { followObsidianSystemTrash, ObsidianVault } from "./obsidianVault";
 
-const hasher = createHasher(simHashPort());
 const P = (p: string) => p as VaultPath;
-const fp = (t: string) => hasher.fingerprint(utf8(t));
+const utf8 = utf8Encode;
+/** Test-side reference hashing (core, in-process); the vault itself only asks its HashOracle. */
+const fp = (t: string) => exactFingerprint(utf8(t));
 
 function setup(insensitive = false) {
 	const fake = new FakeObsidianVault(insensitive);
-	const vault = new ObsidianVault(fake, hasher, insensitive);
+	const vault = new ObsidianVault(fake, simHashOracle(), insensitive);
 	return { fake, vault };
 }
 
@@ -28,10 +31,10 @@ test("write honours absent / fingerprint / hash / any and never writes on a fail
 	assert.equal(stale.ok === false && stale.reason, "precondition");
 	assert.equal(fake.text("n/a.md"), "one");
 	const good = await vault.write(P("n/a.md"), "two", { t: "fingerprint", fingerprint: await fp("one") });
-	assert.equal(good.ok && good.fingerprint, await fp("two"));
+	assert.equal(good.ok, true);
 	assert.equal(fake.text("n/a.md"), "two");
-	fake.put("n/a.md", "﻿two\r\n");
-	const h = await hasher.contentHash("n/a.md", utf8("two\n"));
+	fake.put("n/a.md", "\uFEFFtwo\r\n");
+	const h = markdownContentHash("two\n");
 	const viaHash = await vault.write(P("n/a.md"), "three", { t: "hash", hash: h });
 	assert.equal(viaHash.ok, true, "logical hash ignores BOM and CRLF");
 	assert.equal((await vault.write(P("n/a.md"), "four", { t: "any" })).ok, true);
@@ -60,10 +63,86 @@ test("binary CAS rechecks the stat before modifyBinary", async () => {
 		fake.afterReadBinary = null;
 		fake.put(p, new Uint8Array([9, 9, 9, 9]));
 	};
-	const pre = { t: "fingerprint" as const, fingerprint: await hasher.fingerprint(new Uint8Array([1, 2, 3])) };
+	const pre = { t: "fingerprint" as const, fingerprint: exactFingerprint(new Uint8Array([1, 2, 3])) };
 	const r = await vault.write(P("img.png"), new Uint8Array([7]), pre);
 	assert.equal(r.ok === false && r.reason, "precondition");
 	assert.deepEqual([...(fake.files.get("img.png")?.bytes ?? [])], [9, 9, 9, 9]);
+});
+
+/** simHashOracle that runs `after` once the engine has answered (between the oracle read and the write). */
+function oracleThen(after: () => void): HashOracle {
+	const inner = simHashOracle();
+	return { hash: async (items) => { const v = await inner.hash(items); after(); return v; } };
+}
+const bytesOf = (fake: FakeObsidianVault, p: string) => fake.files.get(p)!.bytes;
+/** An external write Obsidian has not reflected in TFile.stat yet (watcher lag, same size and mtime). */
+const silently = (fake: FakeObsidianVault, p: string, t: string) => { fake.files.get(p)!.bytes = utf8(t); };
+
+test("race (i): a stat-visible change after the engine answered fails the precondition, text and binary", async () => {
+	const fake = new FakeObsidianVault();
+	fake.put("a.md", "base");
+	fake.put("b.png", new Uint8Array([1, 2]));
+	let change = () => fake.put("a.md", "BASE"); // same length: only the stat recheck can see it
+	const vault = new ObsidianVault(fake, oracleThen(() => change()), false);
+	const r = await vault.write(P("a.md"), "sync", { t: "fingerprint", fingerprint: fp("base") });
+	assert.equal(r.ok === false && r.reason, "precondition");
+	assert.equal(fake.text("a.md"), "BASE");
+	assert.ok(!fake.calls.includes("process a.md"), "never reaches vault.process");
+	change = () => fake.put("b.png", new Uint8Array([3, 4]));
+	const b = await vault.write(P("b.png"), new Uint8Array([7]), { t: "fingerprint", fingerprint: exactFingerprint(new Uint8Array([1, 2])) });
+	assert.equal(b.ok === false && b.reason, "precondition");
+	assert.deepEqual([...bytesOf(fake, "b.png")], [3, 4]);
+	change = () => fake.put("a.md", "BASE!");
+	const t = await vault.trash("a.md", "system-trash", { t: "fingerprint", fingerprint: fp("BASE") });
+	assert.equal(t.ok === false && t.reason, "precondition");
+	change = () => fake.put("a.md", "base");
+	const m = await vault.rename("a.md", P("moved.md"), { t: "fingerprint", fingerprint: fp("BASE!") });
+	assert.equal(m.ok === false && m.reason, "precondition");
+	assert.equal(fake.text("a.md"), "base");
+});
+
+test("race (ii): a length-changing change after the stat recheck is caught by the process length guard", async () => {
+	const { fake, vault } = setup();
+	fake.put("a.md", "\uFEFFbase\r\n"); // BOM kept on both sides: textLength 7 = what process hands the callback
+	fake.beforeProcess = (p) => silently(fake, p, "\uFEFFbase\r\nuser line\r\n");
+	const r = await vault.write(P("a.md"), "sync", { t: "hash", hash: markdownContentHash("base\n") });
+	assert.equal(r.ok === false && r.reason, "precondition");
+	assert.equal(fake.text("a.md"), "\uFEFFbase\r\nuser line\r\n");
+	fake.beforeProcess = null;
+	fake.put("a.md", "\uFEFFbase\r\n");
+	assert.equal((await vault.write(P("a.md"), "sync", { t: "hash", hash: markdownContentHash("base\n") })).ok, true, "unchanged BOM file passes the guard");
+});
+
+test("race (iii), the accepted gap: a same-length change not visible in stat is overwritten", async () => {
+	// DESIGN §d.4 trade-off (obsidianVault.ts header): main never compares full contents, so an external
+	// edit that keeps the UTF-16 length and is not yet in TFile.stat when we recheck is lost. Text: it
+	// lands between the recheck and process's read; binary: anywhere after the read before modifyBinary.
+	const { fake, vault } = setup();
+	fake.put("a.md", "base");
+	fake.beforeProcess = (p) => silently(fake, p, "BASE");
+	assert.equal((await vault.write(P("a.md"), "sync", { t: "fingerprint", fingerprint: fp("base") })).ok, true);
+	assert.equal(fake.text("a.md"), "sync");
+	fake.put("b.png", new Uint8Array([1, 2]));
+	const bin = new ObsidianVault(fake, oracleThen(() => { bytesOf(fake, "b.png").set([3, 4]); }), false);
+	assert.equal((await bin.write(P("b.png"), new Uint8Array([7]), { t: "fingerprint", fingerprint: exactFingerprint(new Uint8Array([1, 2])) })).ok, true);
+	assert.deepEqual([...bytesOf(fake, "b.png")], [7]);
+});
+
+test("no engine: checked ops report io and write nothing; reads skip Obsidian's main-thread md decode", async () => {
+	const fake = new FakeObsidianVault();
+	fake.put("a.md", "base");
+	fake.readBinary = () => Promise.reject(new Error("vault.readBinary decodes .md on main: not used"));
+	const down: HashOracle = { hash: () => Promise.reject(new Error("engine not running")) };
+	const vault = new ObsidianVault(fake, down, false);
+	const pre = { t: "fingerprint" as const, fingerprint: fp("base") };
+	const w = await vault.write(P("a.md"), "sync", pre);
+	assert.equal(w.ok === false && w.reason, "io");
+	assert.equal((await vault.rename("a.md", P("b.md"), pre)).ok === false, true);
+	assert.equal((await vault.trash("a.md", "system-trash", pre)).ok === false, true);
+	assert.equal(fake.text("a.md"), "base");
+	assert.deepEqual([...(await vault.readBytes("a.md"))], [...utf8("base")]);
+	const live = new ObsidianVault(fake, simHashOracle(), false);
+	assert.equal((await live.write(P("a.md"), "sync", pre)).ok, true);
 });
 
 test("parent-is-file, invalid path, folder target", async () => {

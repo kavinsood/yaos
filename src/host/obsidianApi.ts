@@ -75,12 +75,6 @@ export interface VaultApi {
 	offref(ref: EventRefLike): void;
 }
 
-/** Exact-bytes UTF-8 decode that keeps a leading BOM (vault.read keeps it too). */
-const keepBomDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
-export function decodeKeepBom(bytes: Uint8Array): string {
-	return keepBomDecoder.decode(bytes);
-}
-
 export function tightBuffer(bytes: Uint8Array): ArrayBuffer {
 	if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength && bytes.buffer instanceof ArrayBuffer) return bytes.buffer;
 	return bytes.slice().buffer as ArrayBuffer;
