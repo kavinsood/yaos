@@ -1,74 +1,72 @@
 /**
- * Seal/open relay payloads through the CryptoPort (DESIGN §b.1, §d.6 stage 1).
- * Codec: core/codec/envelope.ts. The engine stores flags without the deflate
- * bit (content is kept inflated), so the open result clears it.
+ * Seal/open relay payloads through the CryptoPort (DESIGN §b.1, §d.6 stage 1,
+ * e2ee-design §7, §9.2). Codec: core/codec/envelope.ts. The engine stores
+ * flags without the deflate bit (content is kept inflated), so the open
+ * result clears it.
  */
 
-import { ALLOWED_KINDS, ENVELOPE_FORMAT_VERSION, EnvelopeFlag, type EnvelopeKind, type EnvelopeOpenResult } from "../../core/envelope";
-import type { ClientFrameId, Seq, StreamName, VaultId } from "../../core/types";
-import { streamClass } from "../../core/types";
+import { EnvelopeFlag, type EnvelopeBinding, type EnvelopeKind, type EnvelopeOpenFailure, type EnvelopeOpenResult } from "../../core/envelope";
+import type { ClientFrameId, DeviceId, Seq, StreamName, VaultId } from "../../core/types";
 import type { CryptoPort } from "../../ports/crypto";
-import { checkpointAad, decodeInner, decodeOuter, encodeInner, encodeOuter, frameAad } from "../../core/codec/envelope";
-import { Reader } from "../../core/codec/lib0";
+import { openEnvelope as openCore, sealEnvelope, type SealedEnvelope } from "../../core/codec/envelope";
 
-/** Flags of an encoded inner envelope (kind u8, varuint authorNsSeq, varuint flags). */
-function innerFlags(inner: Uint8Array): number {
-	const r = new Reader(inner);
-	r.u8();
-	r.varuint();
-	return r.varuint();
-}
-
-export interface SealedFrame {
-	/** Exact relay payload. */
-	readonly sealed: Uint8Array;
-	/** Flags as sealed (deflate bit included when compressed). */
+export interface FrameToSeal {
+	readonly stream: StreamName;
+	/** The sealing device (AAD-bound, e2ee-design §7.2). T_adopt seals under the adopter's own id. */
+	readonly deviceId: DeviceId;
+	readonly clientFrameId: ClientFrameId;
+	readonly kind: EnvelopeKind;
+	readonly authorNsSeq: Seq;
 	readonly flags: number;
+	/** ≥ 1 for nsOps/cfgOps (e2ee-design §8.2), 0 otherwise. */
+	readonly frameNo: number;
+	readonly content: Uint8Array;
 }
 
-export async function sealFrame(
-	crypto: CryptoPort, vaultId: VaultId, stream: StreamName, clientFrameId: ClientFrameId,
-	kind: EnvelopeKind, authorNsSeq: Seq, flags: number, content: Uint8Array,
-): Promise<SealedFrame> {
-	const inner = encodeInner({ kind, authorNsSeq, flags, content });
-	const keyEpoch = crypto.sealEpoch();
-	const sealedInner = await crypto.seal({ purpose: "frame", keyEpoch, aad: frameAad(vaultId, stream, clientFrameId), plaintext: inner });
-	return { sealed: encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch }, sealedInner), flags: innerFlags(inner) };
+export function sealFrame(crypto: CryptoPort, vaultId: VaultId, f: FrameToSeal): Promise<SealedEnvelope> {
+	return sealEnvelope(crypto, {
+		vaultId,
+		binding: { t: "frame", stream: f.stream, deviceId: f.deviceId, clientFrameId: f.clientFrameId },
+		inner: { kind: f.kind, authorNsSeq: f.authorNsSeq, flags: f.flags, frameNo: f.frameNo, content: f.content },
+	});
 }
 
 export async function sealCheckpoint(crypto: CryptoPort, vaultId: VaultId, stream: StreamName, coversSeq: Seq, content: Uint8Array, authorNsSeq: Seq): Promise<Uint8Array> {
-	const inner = encodeInner({ kind: "checkpoint", authorNsSeq, flags: 0, content });
-	const keyEpoch = crypto.sealEpoch();
-	const sealedInner = await crypto.seal({ purpose: "checkpoint", keyEpoch, aad: checkpointAad(vaultId, stream, coversSeq), plaintext: inner });
-	return encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch }, sealedInner);
+	const s = await sealEnvelope(crypto, {
+		vaultId,
+		binding: { t: "checkpoint", stream, coversSeq },
+		inner: { kind: "checkpoint", authorNsSeq, flags: 0, frameNo: 0, content },
+	});
+	return s.sealed;
 }
-
-export type Binding =
-	| { readonly t: "frame"; readonly stream: StreamName; readonly clientFrameId: ClientFrameId }
-	| { readonly t: "checkpoint"; readonly stream: StreamName; readonly coversSeq: Seq };
 
 /**
- * Stage 1: header, CryptoPort.open with the binding AAD, inner decode, kind
- * check. The returned inner content is inflated (deflate bit cleared).
+ * Stage 1: header, CryptoPort.open with the binding AAD, unpad, inner decode,
+ * kind check. The returned inner content is inflated (deflate bit cleared).
  */
-export async function openEnvelope(crypto: CryptoPort, vaultId: VaultId, binding: Binding, payload: Uint8Array): Promise<EnvelopeOpenResult> {
-	const outer = decodeOuter(payload);
-	if (!outer.ok) return outer;
-	const aad = binding.t === "frame" ? frameAad(vaultId, binding.stream, binding.clientFrameId) : checkpointAad(vaultId, binding.stream, binding.coversSeq);
-	const opened = await crypto.open({ purpose: binding.t, suite: outer.header.suite, keyEpoch: outer.header.keyEpoch, aad, sealed: outer.sealed });
-	if (!opened.ok) return { ok: false, reason: opened.reason === "suite-downgrade" ? "unsupported-suite" : opened.reason };
-	const dec = decodeInner(opened.plaintext);
-	if (!dec.ok) return dec;
-	const inner = dec.inner;
-	const cls = streamClass(binding.stream);
-	if (cls === "other") return { ok: false, reason: "kind-stream-mismatch" };
-	const allowed = ALLOWED_KINDS[cls];
-	if (!allowed.includes(inner.kind)) return { ok: false, reason: "kind-stream-mismatch" };
-	if ((binding.t === "checkpoint") !== (inner.kind === "checkpoint")) return { ok: false, reason: "kind-stream-mismatch" };
-	return { ok: true, header: outer.header, inner: { ...inner, flags: inner.flags & ~EnvelopeFlag.deflate } };
+export async function openEnvelope(crypto: CryptoPort, vaultId: VaultId, binding: EnvelopeBinding, payload: Uint8Array): Promise<EnvelopeOpenResult> {
+	const r = await openCore(crypto, { vaultId, binding, bytes: payload });
+	return r.ok ? { ...r, inner: { ...r.inner, flags: r.inner.flags & ~EnvelopeFlag.deflate } } : r;
 }
 
-/** Reader-dependent failures (DESIGN §d.6): halt ns/cfg folds instead of folding as empty. */
-export function isReaderDependent(reason: Exclude<EnvelopeOpenResult, { ok: true }>["reason"]): boolean {
-	return reason === "unsupported-version" || reason === "unsupported-suite" || reason === "unknown-key" || reason === "auth-failed";
+/**
+ * Reader-dependent failures (DESIGN §d.6, e2ee-design §9.2) halt ns/cfg folds
+ * and quarantine bodies until an upgrade or new keys; every other failure is
+ * deterministic (fold as empty). `keyVerified`: the kcv of the header's key
+ * epoch matched (CryptoPort.keyState), so a bad tag is the sender's fault.
+ */
+export function isReaderDependent(reason: EnvelopeOpenFailure, keyVerified: boolean): boolean {
+	switch (reason) {
+		case "unsupported-version":
+		case "unsupported-suite":
+		case "unknown-key":
+			return true;
+		case "auth-failed":
+			return !keyVerified;
+		case "malformed":
+		case "suite-downgrade":
+		case "bad-padding":
+		case "kind-stream-mismatch":
+			return false;
+	}
 }

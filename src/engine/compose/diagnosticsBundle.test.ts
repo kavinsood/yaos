@@ -4,6 +4,9 @@ import type { DocId, VaultPath } from "../../core/types";
 import type { StatusSnapshot } from "../../protocol/status";
 import { simHashPort } from "../../sim/hash";
 import { SeededRandom } from "../../sim/random";
+import { createNoopCrypto } from "../adapters/noopCrypto";
+import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
+import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX, PSEUDONYM_HEX_CHARS, type DiagnosticsInput } from "./diagnosticsBundle";
 
 const SECRET_PATH = "Clients/Acme merger/plan.md" as VaultPath;
@@ -34,7 +37,8 @@ function input(): DiagnosticsInput {
 	};
 }
 
-const ports = (seed: number) => ({ random: new SeededRandom(seed), hash: simHashPort() });
+const noop = () => createNoopCrypto(simHashPort());
+const ports = (seed: number) => ({ random: new SeededRandom(seed), crypto: noop() });
 
 test("diagnostics bundle: no stream id or path in the body; one file has one pseudonym across sections", async () => {
 	const b = await buildDiagnosticsBundle(input(), ports(1), false);
@@ -56,8 +60,8 @@ test("diagnostics bundle: no stream id or path in the body; one file has one pse
 
 test("diagnostics bundle: a fresh salt per bundle, so pseudonyms do not match across bundles", async () => {
 	const random = new SeededRandom(7);
-	const a = await buildDiagnosticsBundle(input(), { random, hash: simHashPort() }, false);
-	const b = await buildDiagnosticsBundle(input(), { random, hash: simHashPort() }, false);
+	const a = await buildDiagnosticsBundle(input(), { random, crypto: noop() }, false);
+	const b = await buildDiagnosticsBundle(input(), { random, crypto: noop() }, false);
 	assert.notEqual(a.frozenDocs[0]!.stream, b.frozenDocs[0]!.stream);
 	assert.notEqual(a.status.brake?.samplePaths[1], b.status.brake?.samplePaths[1]);
 });
@@ -72,4 +76,17 @@ test("diagnostics bundle: paths only with opt-in, mapping every known pseudonym;
 	assert.ok(!JSON.stringify({ ...b, paths: null }).includes("Acme"), "real paths appear only in `paths`");
 	const many = { ...input(), quarantine: Array.from({ length: DIAGNOSTICS_QUARANTINE_MAX + 5 }, (_, i) => ({ stream: "ns", seq: i, reason: "r", bytes: 1 })) };
 	assert.equal((await buildDiagnosticsBundle(many, ports(4), false)).quarantine.length, DIAGNOSTICS_QUARANTINE_MAX);
+});
+
+test("diagnostics bundle: pseudonyms come from CryptoPort.diagHash, keyed by K_1 under suite 1 (e2ee-design §6.4)", async () => {
+	const suite1 = (k0: number) => createWebCryptoSuite1({ vaultId: "AAAAAAAAAAAAAAAAAAAAAA", random: new ScriptedRandom(), keys: [{ e: 1, k: Uint8Array.from({ length: 32 }, (_, i) => k0 + i) }] });
+	const [ka, kb] = [await suite1(0), await suite1(0x20)];
+	const plain = await buildDiagnosticsBundle(input(), ports(9), false);
+	const a = await buildDiagnosticsBundle(input(), { random: new SeededRandom(9), crypto: ka }, false);
+	const a2 = await buildDiagnosticsBundle(input(), { random: new SeededRandom(9), crypto: ka }, false);
+	const b = await buildDiagnosticsBundle(input(), { random: new SeededRandom(9), crypto: kb }, false);
+	assert.match(a.frozenDocs[0]!.stream, new RegExp(`^b:[0-9a-f]{${PSEUDONYM_HEX_CHARS}}$`));
+	assert.equal(a.frozenDocs[0]!.stream, a2.frozenDocs[0]!.stream, "same key and salt: same pseudonym");
+	assert.notEqual(a.frozenDocs[0]!.stream, b.frozenDocs[0]!.stream, "another vault key: another pseudonym");
+	assert.notEqual(a.frozenDocs[0]!.stream, plain.frozenDocs[0]!.stream, "suite 1 is not the suite-0 sha256 prefix");
 });

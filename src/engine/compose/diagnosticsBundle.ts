@@ -2,12 +2,17 @@
  * exportDiagnostics bundle (DESIGN §j.7). Every stream and path in the engine's diagnostics is
  * replaced by a pseudonym under a fresh random salt; the pseudonym -> path table is added only when
  * the user opted in. DiagnosticsBundle (src/protocol/status.ts) documents each field.
+ *
+ * Pseudonym = the first PSEUDONYM_HEX_CHARS of CryptoPort.diagHash(salt ‖ 0x00 ‖ key)
+ * (e2ee-design §6.4): a sha256 prefix under suite 0, HMAC(kDiag, ·) under suite 1, so a short
+ * path cannot be found by hashing guesses without the vault key. The per-bundle salt stays:
+ * two bundles do not share pseudonyms.
  */
 
 import { newId } from "../../core/codec/ids";
-import { bytesToHex, utf8Encode } from "../../core/codec/lib0";
+import { utf8Encode } from "../../core/codec/lib0";
 import { streamClass, streamDocId, type DocId, type StreamName, type VaultPath } from "../../core/types";
-import type { HashPort } from "../../ports/crypto";
+import type { CryptoPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
 import type { DiagnosticsBundle, DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 
@@ -29,7 +34,7 @@ export interface DiagnosticsInput {
 
 export async function buildDiagnosticsBundle(
 	input: DiagnosticsInput,
-	ports: { readonly random: RandomPort; readonly hash: HashPort },
+	ports: { readonly random: RandomPort; readonly crypto: CryptoPort },
 	includePaths: boolean,
 ): Promise<DiagnosticsBundle> {
 	const salt = newId(ports.random);
@@ -38,7 +43,7 @@ export async function buildDiagnosticsBundle(
 	const pseudonym = async (key: string, path: VaultPath | null): Promise<string> => {
 		let p = memo.get(key);
 		if (p === undefined) {
-			p = bytesToHex(await ports.hash.sha256(utf8Encode(`${salt}\u0000${key}`))).slice(0, PSEUDONYM_HEX_CHARS);
+			p = (await ports.crypto.diagHash(utf8Encode(`${salt}\u0000${key}`))).slice(0, PSEUDONYM_HEX_CHARS);
 			memo.set(key, p);
 		}
 		if (path !== null) known.set(p, path);
@@ -49,7 +54,7 @@ export async function buildDiagnosticsBundle(
 	const ofStream = async (stream: string): Promise<string> => {
 		const s = stream as StreamName;
 		const cls = streamClass(s);
-		if (cls === "ns" || cls === "cfg") return stream;
+		if (cls === "ns" || cls === "cfg" || cls === "keyring") return stream;
 		const docId = streamDocId(s);
 		const path = docId ? input.pathOf(docId) : null;
 		const p = path !== null ? await ofPath(path) : await pseudonym(`s:${stream}`, null);

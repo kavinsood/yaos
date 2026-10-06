@@ -33,7 +33,7 @@ async function rawDevice(relay: SimRelay, deviceId = "dev-x") {
 	return {
 		async send(stream: StreamName, content: Uint8Array): Promise<void> {
 			const cf = `rawframe${String(n++).padStart(14, "0")}` as ClientFrameId;
-			const sealed = await sealFrame(noop, VAULT, stream, cf, "bodyUpdate", 0, 0, content);
+			const sealed = await sealFrame(noop, VAULT, { stream, deviceId: deviceId as DeviceId, clientFrameId: cf, kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content });
 			s.append({ stream, clientFrameId: cf, payload: sealed.sealed });
 		},
 		close: () => s.close(1000, "done"),

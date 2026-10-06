@@ -313,7 +313,7 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 | Synced mirror | Plaintext docId, path, contentHash, seqs | Accepted: the vault folder holds the same plaintext |
 | Local snapshots (zip) | Plaintext | Accepted (local). Uploads go through `sealBlob` (`src/engine/snapshots/snapshotJob.ts:129-130`) |
 | IndexedDB `tail`, `snapshots`, `baseText`, ... | Plaintext (T_receipt stores outbox content, DESIGN §e.2) | Accepted (non-goal: local at-rest encryption) |
-| Diagnostics bundle | Hashes MUST be `HMAC(kDiag, ·)`, not sha256 (`src/engine/compose/runtimeOps.ts:150-153`; DESIGN §j.7) | Change in WP-E2 |
+| Diagnostics bundle | Hashes MUST be `HMAC(kDiag, ·)`, not sha256 (DESIGN §j.7). Pseudonym = the first 12 hex of `CryptoPort.diagHash(salt ‖ 0x00 ‖ value)`; the per-bundle random salt stays, so two bundles do not correlate unless the user shares both (`src/engine/compose/diagnosticsBundle.ts`) | Done in WP-E2 |
 
 ## 7. Envelope v2, AAD and padding
 
@@ -360,7 +360,7 @@ k wraps:     §11.2
 | stream | A frame or checkpoint moved to another stream fails. |
 | deviceId | **New.** The relay asserts the row's deviceId (relay-wire §4.1). Without this binding, the server could re-attribute a frame, shifting dedupe and replay state (§8) and the planner's own-frame matching (DESIGN §c.13). deviceId is client-chosen at enroll (relay-wire §2.4), so it is known at seal time. T_adopt seals under the adopter's own deviceId (DESIGN §d.5, unchanged). |
 | clientFrameId | Frame identity. Unique per device across the vault (relay-wire §1). |
-| coversSeq (checkpoints) | As today. The inner `CheckpointContent.coversSeq` check stays (DESIGN §b.1). |
+| coversSeq (checkpoints) | As today. The inner `CheckpointContent.coversSeq` check stays (DESIGN §b.1); it runs in the ingest gate (`src/engine/ingest/gate.ts`), after the envelope codec opened the bytes. |
 | address (blobs) | The server cannot serve one blob's bytes at another address. The reader also checks sha256 after opening (`src/engine/body/refs.ts:50-59`). |
 
 - **seq is NOT bound.** The relay assigns it after the append (relay-wire §5). Order is protected per device by
@@ -431,26 +431,48 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
 - **Writer.**
   - frameNo is a counter per (deviceId, stream), for `ns` and `cfg` only. It is strictly increasing across that
     device's frames on the stream, and gaps are allowed.
-  - Normally `next = 1 + max(own right edge in the fold state, highest frameNo in the outbox for the stream)`.
-  - On **every engine start**, the first value is that max **+ NS_DEDUPE_RING** (64). This skips any number that
-    a frame may have used while it was in flight when IndexedDB was lost.
-  - No new persistent counter: the fold state (in IDB and in checkpoints) and the outbox already hold it.
-  - Epoch migration (DESIGN §c.12 step 3) also carries the device's highest own frameNo per stream into the new DB,
-    so new frames never reuse numbers from the abandoned timeline.
+  - `next = 1 + max(own right edge R in the fold state, own frameNos above the fold (own tail rows and receipts
+    not yet folded), the outbox for the stream (poisoned included), the epoch-migration floor, earlier
+    allocations of this runtime)` (`FoldRuntime.allocFrameNo`, `src/engine/sync/foldRuntime.ts`). The receipt
+    writes the own tail row with its frameNo, so the max survives a restart before the row is folded.
+  - The **first allocation of every runtime** (engine start) adds **NS_DEDUPE_RING** (64). This skips any number
+    that a frame may have used while it was in flight when IndexedDB was lost.
+  - Allocation and the outbox write share the engine's edit chain (`src/engine/runtime/logApi.ts`), so frameNo
+    order is outbox order.
+  - No new persistent counter: the fold state (in IDB and in checkpoints), own tail rows and the outbox already
+    hold it.
+  - Epoch migration (DESIGN §c.12 step 3) carries the device's highest own frameNo per stream into the new DB as
+    meta `frameNoFloor` (max-merged, never lowered), so new frames never reuse numbers from the abandoned timeline.
 - **Send window, restated over frameNo** (DESIGN §c.3). Own frame `f` may be sent only when every own frame with
-  frameNo ≤ `f − NS_SEND_WINDOW` (32) is receipted.
+  frameNo ≤ `f − NS_SEND_WINDOW` (32) is receipted. Equivalently (`Sender.window`, `src/engine/body/sender.ts`):
+  `f < u + NS_SEND_WINDOW`, where `u` is the lowest frameNo among the stream's unreceipted own frames. Poisoned
+  frames never send, so they do not hold `u` down; only body frames are ever `held`.
 - **Reader.** State per (deviceId, stream): a right edge R and a 64-bit bitmap, as in RFC 4303 §3.4.3 [RFC4303]
-  (window ≥ 32, 64 preferred). After a frame with frameNo `f` opens and decodes:
-  1. `f = 0`: malformed. Fold as empty.
-  2. `f ≤ R − 64`: event `ignored/replay-stale`. Fold as empty.
-  3. `R − 64 < f ≤ R` with the bit set: `ignored/replay-duplicate`.
-  4. Otherwise accept and set the bit. If `f > R`, shift the bitmap and set `R = f`.
-  
+  (window ≥ 32, 64 preferred; `src/core/replayWindow.ts`).
+  - `f = 0` on an ns/cfg frame never reaches the fold: the inner decoder rejects it as `malformed` (and the
+    encoder throws). A row that failed the gate is folded with frameNo 0 and skips the window.
+  - Order per frame, after open and decode: (ns only) the upgradeRules pre-scan, then the clientFrameId ring
+    (`ignored/duplicate-frame`), then the window:
+    1. `f ≤ R − 64`: `ignored/replay-stale`.
+    2. `R − 64 < f ≤ R` with the bit set: `ignored/replay-duplicate`.
+    3. Otherwise accept: record the clientFrameId in the ring, set the bit (if `f > R`, shift and set `R = f`),
+       then fold the ops.
+  - A rejected frame emits one frame-level event (index −1), folds as empty and advances coversSeq; neither the
+    ring nor the window changes. Malformed ops behind a valid frameNo still enter the ring and the window.
+
   The state changes only after open and decode succeed. RFC 4303 updates the window "only if the integrity
   verification succeeds".
-- **Why no legitimate frame is ever rejected** [D]. When frame `f` was sent, every own frame ≤ `f − 32` had
-  already committed. So any frame that commits after `f` has a frameNo > `f − 32` ≥ `R − 64`. The rule is exact
-  for honest writers. The same argument already makes the clientFrameId ring exact (DESIGN §c.3).
+- **Why no legitimate frame is ever rejected** [D]. Let `f` be an honest frame that has not committed yet. Then
+  `u ≤ f`, so every own frame ever sent is `< f + 32`, so `R < f + 32` and `f > R − 64`: never stale. frameNos are
+  distinct, so `f`'s bit is clear: never a duplicate. Every later commit of an already committed frame is rejected
+  (ring or bit). This holds whatever order the relay commits in, with no relay dedupe, across reconnects with
+  copies lingering on old sockets, and across restarts with IndexedDB intact. It is a property test
+  (`src/core/ns/replayExactness.test.ts`, 150 seeds × 1500 steps), which also shows that without the send window
+  some honest frame goes stale.
+- **Boundary (open).** If IndexedDB is lost while an old socket still holds frames that the relay commits *after*
+  the new runtime's first frames, those old frames can land at or below `R − 64` and are rejected as stale. The
+  +64 skip prevents collisions, not this. Their content came from a local state that no longer exists; disk stays
+  the truth (DESIGN §c.12).
 - The clientFrameId ring stays. frameNo covers replays older than the ring's 64 ids.
 - The `nsFoldV1` and `cfgFoldV1` checkpoint encodings gain `(deviceId → R, bitmap)` and become V2 (§18.2). Suite 0
   uses the same code: one path, so the sim covers it.
@@ -1112,6 +1134,9 @@ Crypto is never on the hot path. Bootstrap is bound by the network and the plann
   `MemStoragePort` trips `tx-inactive` only when a body awaits a macrotask (`src/sim/storage.ts:29-44`).
 - **Fix (WP-E7).** A `DelayedCrypto` double settles every call after `setTimeout(0)`. Any future crypto await
   inside a transaction then fails the sim and the unit tests, exactly as on a device.
+- **WP-E2 status.** E2 adds no IndexedDB path. frameNo allocation and sealing run on the edit chain before
+  `repo.tEdit` (`src/engine/runtime/logApi.ts`), the gate opens before T_receipt, and the receipt only writes the
+  already-known frameNo. The double is still WP-E7's.
 
 ## 17. Lost server features and client replacements
 
@@ -1206,7 +1231,7 @@ export interface KeyringCrypto {
   - `AAD_FRAME_PREFIX = "yaos/f2"`, `AAD_CHECKPOINT_PREFIX = "yaos/c2"` and the new `AAD_BLOB_PREFIX = "yaos/b2"`,
     `AAD_KEYRING_PREFIX = "yaos/k2"`;
   - the inner layout gains `varuint frameNo` after `flags`. It is 0 for kinds outside ns and cfg, and non-zero
-    for ns and cfg (§8.2);
+    for ns and cfg (§8.2). A violation is `malformed` on decode and a `CodecError` on encode;
   - `EnvelopeOpenResult.reason` gains `"suite-downgrade"` and `"bad-padding"` (§9.2). Replay is a fold
     decision, not an open failure: `NsIgnoreReason` (`src/core/types.ts:232`) and the cfg equivalent gain
     `"replay-stale"`, `"replay-duplicate"` and `"stale-epoch"` (§8.2, §14.3);
@@ -1214,7 +1239,11 @@ export interface KeyringCrypto {
     V2 in this document).
 - `src/core/codec/envelope.ts`:
   - `bindingAad` (lines 155-162) writes the §7.2 fields: header plus deviceId for frames, header for checkpoints;
-  - padding (§7.3) is applied when `suite ≠ 0`, between the inner encoding and `seal`, and stripped after `open`.
+  - padding (§7.3) is applied when `suite ≠ 0`, between the inner encoding and `seal`, and stripped after `open`;
+  - `sealEnvelope` / `openEnvelope` are the one seal/open implementation (`src/engine/ingest/envelope.ts` wraps
+    them). They check the kind against the stream class; checkpoint *content* checks (coversSeq, encoding, size)
+    stay in the ingest gate. Until WP-E3 the keyring stream `k` is treated like an unknown class: the codec
+    answers `kind-stream-mismatch` and the gate ignores `k` rows.
 - `src/core/types.ts`:
   - `NsFoldState` and `CfgFoldState` gain `readonly replay: Map<DeviceId, { r: number; bits: bigint }>` (64-bit
     window);
@@ -1223,15 +1252,17 @@ export interface KeyringCrypto {
 - `src/core/limits.ts`:
   - `MAX_FRAME_CONTENT_BYTES` (:49, today 1 MiB − 4 KiB) → 1015808 (§7.3);
   - new `MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 10223615`;
-  - new `REPLAY_WINDOW = 64`, `ROLL_SEQ_SPAN = 2 ** 23`, `ROLL_OWN_SEALS = 2 ** 22`,
-    `PADME_FLOOR_BYTES = 256`, `KEY_STORE_WAIT_MS = 5000`.
+  - new `REPLAY_WINDOW = 64` and `PADME_FLOOR_BYTES = 256` (WP-E2);
+  - `ROLL_SEQ_SPAN = 2 ** 23` and `ROLL_OWN_SEALS = 2 ** 22` land with the roll (WP-E3), `KEY_STORE_WAIT_MS = 5000`
+    with host key storage (WP-E4): constants arrive with their first user.
 - `QuarantineReason` (`src/engine/store/schema.ts:186`) gains `"crypto-downgrade"` and `"envelope-padding"`.
 
 ### 18.3 IndexedDB (`src/engine/store/schema.ts`)
 
 | Store / record | Change |
 |---|---|
-| `OutboxRecord` (:156) | + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2); + `frameNo: number \| null` (ns/cfg) |
+| `OutboxRecord` (:156) | + `frameNo: number \| null` (ns/cfg; WP-E2). + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2) lands with the re-seal in WP-E3 |
+| `TailRecord` | + `frameNo: number` (0 outside ns/cfg and for rows that failed the gate; WP-E2). Own rows carry the allocator's max across restarts (§8.2) |
 | `MetaRecord` | + `MetaKeyring {key: "keyring"; sealEpoch; epochs: {e, firstSeq, kind, verified}[]; revokeEpoch: number \| null; sRot: Seq \| null; ownSeals: number}`. **No key bytes** (§6.1) |
 | `MetaRecord` | + `MetaFrameNoFloor {key: "frameNoFloor"; ns: number; cfg: number}`, written by epoch migration (§8.2) |
 | ns and cfg fold state records | Carry `replay` (V2 encoding) |
@@ -1369,7 +1400,7 @@ per-vault crypto flags on the server (the suite is client-pinned, §12.4).
     - **WP-E1** (`src/engine/adapters/suite1Golden.test.ts`): kcv for K_1 and K_2 (= 20..3f), kAddr of
       sha256("abc"), kDiag, raw frame and checkpoint seals (fixed AAD), a frame under K_2, one sealed blob, and
       next/prev/recovery wraps (fake 35-byte RK = 40..62; fixed AAD, since wrap AAD §11.2 is WP-E3);
-    - **WP-E2**: one envelope per kind with the §7.2 AAD and padding;
+    - **WP-E2** (`src/engine/adapters/suite1Envelope.test.ts`): one envelope per kind with the §7.2 AAD and padding;
     - **WP-E3**: genesis/roll/revoke records and the RK encoding; **WP-E5**: the setup link.
   - **Cross-checked by a second implementation** in the test: Node `node:crypto` (`createCipheriv`, `hkdfSync`,
     `createHmac`), not WebCrypto, so one implementation's bug cannot certify itself.
@@ -1438,7 +1469,7 @@ There is one agent per package. Sizes: S ≈ 1 agent-day, M ≈ 2–3, L ≈ 4�
 |---|---|---|---|---|
 | **E0** Device runs | `src/host/spike/**`: add a SecretStorage probe (set/get/restart, 64 KiB value, `""`, locked device) and an Android `obsidian://` QR scan check (iOS is [User]-confirmed, §23.3) | none (needs a human with devices) | §23.3 open rows filled with [M] rows | S |
 | **E1** CryptoPort + suite-1 adapter | `src/ports/crypto.ts` (§18.1), `src/engine/adapters/webCryptoSuite1.ts`, `noopCrypto.ts`, `identityCrypto` | none | §20.1 KATs and golden vectors pass under Node WebCrypto and the `node:crypto` cross-check; 12-byte nonce check; non-extractable keys only | M |
-| **E2** Envelope v2 | `src/core/envelope.ts`, `src/core/codec/**` (AAD v2, Padmé, frameNo, fold V2 encodings), `src/core/{ns,cfg}/**` (replay window), `src/core/limits.ts`, the send window over frameNo, `diagHash` in `runtimeOps.ts:150-153` | E1 shape | Codec round-trips; replay window unit tests including the §8.2 exactness argument as a property test; suite 0 still passes the whole suite | M–L |
+| **E2** Envelope v2 | `src/core/envelope.ts`, `src/core/codec/**` (AAD v2, Padmé, frameNo, fold V2 encodings), `src/core/{ns,cfg}/**` (replay window), `src/core/limits.ts`, the send window over frameNo, `diagHash` in the diagnostics bundle (`src/engine/compose/diagnosticsBundle.ts`) | E1 shape | Codec round-trips; replay window unit tests including the §8.2 exactness argument as a property test; suite 0 still passes the whole suite | M–L |
 | **E3** Keyring engine | `src/engine/keyring/**` (record codec, validity, winners, roll, revoke, re-publish, stale-epoch), the catch-up order (`k` first), phase `key-missing` | E1, E2 | §11 and §14.3 rules as unit tests; the forged-roll and duplicate-record tests in §20.2 | L |
 | **E4** Host key storage + protocol | `src/host/keys/**` (SecretStorage adapter, 5 s wait, pin incl. unpinned and `keyringSeen`, Linux notice), `src/protocol/**` (§18.4: unpinned config, `pinSuite0`), persist-before-use; the engine's unpinned mode (reads `k` only) | E1 shape | Restart keeps keys; IDB wipe keeps keys; at-rest leak check (§20.3) is zero; an unpinned engine issues zero writes | M |
 | **E5** Pairing, RK, revoke UX | `src/host/ui/**`: QR (`qrcode`), the `key`/`suite` link parameters stripped before `/enroll`, the blocked key-less screen (§12.4), the "Create a new vault" creation path with its `Origin` check first (§15.1), RK show/confirm/enter, revoke re-key, re-key QR, hiding `mobileSetupUrl` under both suites, device-name hint | E3, E4 | UI tests for each flow; `/enroll` request bodies asserted key-free; the link is never in logs; no path from a link, code or console QR reaches the creation flow or a suite-0 pin | L |

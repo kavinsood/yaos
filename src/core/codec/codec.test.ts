@@ -29,7 +29,7 @@ import {
 import { decodeNsOps, encodeNsOps } from "./nsOps";
 import { decodeCfgOps, encodeCfgOps } from "./cfgOps";
 import { CheckpointEncoding, EnvelopeFlag } from "../envelope";
-import type { CfgOp, ClientFrameId, ContentHash, DocId, NsOp, StreamName } from "../types";
+import type { CfgOp, ClientFrameId, ContentHash, DeviceId, DocId, NsOp, StreamName } from "../types";
 
 const H1 = "11".repeat(32) as ContentHash;
 const H2 = "ab".repeat(32) as ContentHash;
@@ -122,7 +122,7 @@ test("envelope outer: round trip, version/suite/keyEpoch handling", () => {
 
 test("envelope inner: deflate rule, bounded inflate, malformed cases", () => {
 	const small = new Uint8Array(DEFLATE_MIN_BYTES - 1).fill(65);
-	const e1 = encodeInner({ kind: "bodyUpdate", authorNsSeq: 3, flags: EnvelopeFlag.deflate, content: small });
+	const e1 = encodeInner({ kind: "bodyUpdate", authorNsSeq: 3, flags: EnvelopeFlag.deflate, frameNo: 0, content: small });
 	const d1 = decodeInner(e1);
 	assert.ok(d1.ok);
 	if (d1.ok) {
@@ -130,7 +130,7 @@ test("envelope inner: deflate rule, bounded inflate, malformed cases", () => {
 		assert.deepEqual(d1.inner.content, small);
 	}
 	const big = new Uint8Array(DEFLATE_MIN_BYTES).fill(65);
-	const e2 = encodeInner({ kind: "nsOps", authorNsSeq: 300, flags: EnvelopeFlag.initial, content: big });
+	const e2 = encodeInner({ kind: "nsOps", authorNsSeq: 300, flags: EnvelopeFlag.initial, frameNo: 7, content: big });
 	assert.ok(e2.length < 200);
 	const d2 = decodeInner(e2);
 	assert.ok(d2.ok);
@@ -138,69 +138,88 @@ test("envelope inner: deflate rule, bounded inflate, malformed cases", () => {
 		assert.equal(d2.inner.kind, "nsOps");
 		assert.equal(d2.inner.authorNsSeq, 300);
 		assert.equal(d2.inner.flags, EnvelopeFlag.initial | EnvelopeFlag.deflate);
+		assert.equal(d2.inner.frameNo, 7);
 		assert.deepEqual(d2.inner.content, big);
 	}
 	// Incompressible content >= 4096 stays raw.
 	const rnd = lcg(1);
 	const noise = new Uint8Array(8192).map(() => Math.floor(rnd() * 256));
-	const d3 = decodeInner(encodeInner({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, content: noise }));
+	const d3 = decodeInner(encodeInner({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content: noise }));
 	assert.ok(d3.ok && d3.inner.flags === 0 && d3.inner.content.length === 8192);
 	// never
-	const d4 = decodeInner(encodeInner({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, content: big }, { deflate: "never" }));
+	const d4 = decodeInner(encodeInner({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content: big }, { deflate: "never" }));
 	assert.ok(d4.ok && d4.inner.flags === 0);
 
-	assert.deepEqual(decodeInner(new Uint8Array([99, 0, 0])), { ok: false, reason: "malformed" }, "unknown kind");
-	assert.deepEqual(decodeInner(new Uint8Array([0, 0, 0])), { ok: false, reason: "malformed" }, "kind 0");
-	assert.deepEqual(decodeInner(new Uint8Array([1, 0x80, 0, 0])), { ok: false, reason: "malformed" }, "non-minimal authorNsSeq");
-	assert.deepEqual(decodeInner(new Uint8Array([1, 0])), { ok: false, reason: "malformed" }, "truncated flags");
-	assert.deepEqual(decodeInner(new Uint8Array([1, 0, 4])), { ok: false, reason: "malformed" }, "empty deflate");
-	assert.deepEqual(decodeInner(new Uint8Array([1, 0, 4, 0xff, 0xff])), { ok: false, reason: "malformed" }, "bad deflate");
+	assert.deepEqual(decodeInner(new Uint8Array([99, 0, 0, 0])), { ok: false, reason: "malformed" }, "unknown kind");
+	assert.deepEqual(decodeInner(new Uint8Array([0, 0, 0, 0])), { ok: false, reason: "malformed" }, "kind 0");
+	assert.deepEqual(decodeInner(new Uint8Array([2, 0x80, 0, 0, 0])), { ok: false, reason: "malformed" }, "non-minimal authorNsSeq");
+	assert.deepEqual(decodeInner(new Uint8Array([2, 0])), { ok: false, reason: "malformed" }, "truncated flags");
+	assert.deepEqual(decodeInner(new Uint8Array([2, 0, 0])), { ok: false, reason: "malformed" }, "truncated frameNo");
+	assert.deepEqual(decodeInner(new Uint8Array([2, 0, 4, 0])), { ok: false, reason: "malformed" }, "empty deflate");
+	assert.deepEqual(decodeInner(new Uint8Array([2, 0, 4, 0, 0xff, 0xff])), { ok: false, reason: "malformed" }, "bad deflate");
 	const z = deflateSync(new Uint8Array(1_000_000));
-	assert.deepEqual(decodeInner(new Uint8Array([1, 0, 4, ...z]), 100_000), { ok: false, reason: "malformed" }, "bomb bounded");
+	assert.deepEqual(decodeInner(new Uint8Array([2, 0, 4, 0, ...z]), 100_000), { ok: false, reason: "malformed" }, "bomb bounded");
 	assert.equal(inflateBounded(z, 1_000_000).length, 1_000_000);
 	assert.throws(() => inflateBounded(z.subarray(0, z.length - 3), 2_000_000), CodecError, "truncated deflate");
 	// Unknown flag bits are ignored.
-	const d5 = decodeInner(new Uint8Array([2, 0, 0x80, 0x01, 1, 2]));
+	const d5 = decodeInner(new Uint8Array([2, 0, 0x80, 0x01, 0, 1, 2]));
 	assert.ok(d5.ok && d5.inner.flags === 128 && d5.inner.content.length === 2);
 });
 
-test("AAD layout", () => {
-	const a = frameAad("v", "ns", "x");
-	assert.deepEqual(a, new Uint8Array([...new TextEncoder().encode("yaos/f1"), 1, 0x76, 2, 0x6e, 0x73, 1, 0x78]));
-	const c = checkpointAad("v", "ns", 300);
-	assert.deepEqual(c, new Uint8Array([...new TextEncoder().encode("yaos/c1"), 1, 0x76, 2, 0x6e, 0x73, 0xac, 0x02]));
+test("envelope inner: frameNo is >= 1 for nsOps/cfgOps and 0 for every other kind (e2ee-design §8.1)", () => {
+	const ok = (b: number[]) => { const d = decodeInner(new Uint8Array(b)); return d.ok ? d.inner.frameNo : d.reason; };
+	assert.equal(ok([1, 0, 0, 1]), 1, "nsOps frameNo 1");
+	assert.equal(ok([4, 0, 0, 0xac, 0x02]), 300, "cfgOps frameNo 300");
+	assert.equal(ok([1, 0, 0, 0]), "malformed", "nsOps frameNo 0");
+	assert.equal(ok([4, 0, 0, 0]), "malformed", "cfgOps frameNo 0");
+	assert.equal(ok([1, 0, 0, 0x81, 0x00]), "malformed", "non-minimal frameNo");
+	for (const code of [2, 3, 5, 6, 7]) {
+		assert.equal(ok([code, 0, 0, 0]), 0, `kind ${code} frameNo 0`);
+		assert.equal(ok([code, 0, 0, 1]), "malformed", `kind ${code} frameNo 1`);
+	}
+	const content = new Uint8Array([1]);
+	assert.throws(() => encodeInner({ kind: "nsOps", authorNsSeq: 0, flags: 0, frameNo: 0, content }), CodecError);
+	assert.throws(() => encodeInner({ kind: "cfgOps", authorNsSeq: 0, flags: 0, frameNo: 1.5, content }), CodecError);
+	assert.throws(() => encodeInner({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 2, content }), CodecError);
+});
+
+test("AAD layout v2", () => {
+	const enc = (s: string) => [...new TextEncoder().encode(s)];
+	const s0 = { formatVersion: 1, suite: 0, keyEpoch: 0 } as const;
+	const s1 = { formatVersion: 1, suite: 1, keyEpoch: 300 } as const;
+	assert.deepEqual(frameAad(s0, "v", "ns", "d", "x"), new Uint8Array([...enc("yaos/f2"), 1, 0, 0, 1, 0x76, 2, 0x6e, 0x73, 1, 0x64, 1, 0x78]));
+	assert.deepEqual(frameAad(s1, "v", "ns", "d", "x"), new Uint8Array([...enc("yaos/f2"), 1, 1, 0xac, 0x02, 1, 0x76, 2, 0x6e, 0x73, 1, 0x64, 1, 0x78]));
+	assert.deepEqual(checkpointAad(s0, "v", "ns", 300), new Uint8Array([...enc("yaos/c2"), 1, 0, 0, 1, 0x76, 2, 0x6e, 0x73, 0xac, 0x02]));
+	// Length-prefixed fields: moving a byte between deviceId and clientFrameId changes the AAD.
+	assert.notDeepEqual(frameAad(s0, "v", "ns", "dx", ""), frameAad(s0, "v", "ns", "d", "x"));
 });
 
 test("seal/open with the identity suite: binding checks", async () => {
 	const crypto = identityCrypto();
 	const ns = "ns" as StreamName;
+	const dev = "devA" as DeviceId;
+	const fb = (stream: StreamName) => ({ t: "frame" as const, stream, deviceId: dev, clientFrameId: F1 });
 	const content = encodeNsOps([{ t: "upgradeRules", version: 1 }]);
-	const bytes = await sealEnvelope(crypto, {
-		vaultId: "v1", binding: { t: "frame", stream: ns, clientFrameId: F1 },
-		inner: { kind: "nsOps", authorNsSeq: 4, flags: 0, content },
-	});
-	const ok = await openEnvelope(crypto, { vaultId: "v1", binding: { t: "frame", stream: ns, clientFrameId: F1 }, bytes });
+	const { sealed: bytes, flags } = await sealEnvelope(crypto, { vaultId: "v1", binding: fb(ns), inner: { kind: "nsOps", authorNsSeq: 4, flags: 0, frameNo: 9, content } });
+	assert.equal(flags, 0);
+	assert.deepEqual([...bytes.subarray(0, 7)], [1, 0, 0, 1, 4, 0, 9], "suite 0: header then the plain inner envelope, no padding");
+	const ok = await openEnvelope(crypto, { vaultId: "v1", binding: fb(ns), bytes });
 	assert.ok(ok.ok);
-	if (ok.ok) assert.deepEqual(ok.inner.content, content);
-	const body = await openEnvelope(crypto, { vaultId: "v1", binding: { t: "frame", stream: `b:${D1}` as StreamName, clientFrameId: F1 }, bytes });
-	assert.deepEqual(body, { ok: false, reason: "kind-stream-mismatch" });
-	const other = await openEnvelope(crypto, { vaultId: "v1", binding: { t: "frame", stream: "zz" as StreamName, clientFrameId: F1 }, bytes });
-	assert.deepEqual(other, { ok: false, reason: "kind-stream-mismatch" });
+	if (ok.ok) assert.deepEqual([ok.inner.content, ok.inner.frameNo], [content, 9]);
+	assert.deepEqual(await openEnvelope(crypto, { vaultId: "v1", binding: fb(`b:${D1}` as StreamName), bytes }), { ok: false, reason: "kind-stream-mismatch", header: { formatVersion: 1, suite: 0, keyEpoch: 0 } });
+	assert.equal((await openEnvelope(crypto, { vaultId: "v1", binding: fb("zz" as StreamName), bytes }) as { reason: string }).reason, "kind-stream-mismatch");
+	assert.equal((await openEnvelope(crypto, { vaultId: "v1", binding: fb("k" as StreamName), bytes }) as { reason: string }).reason, "kind-stream-mismatch", "keyring stream carries no envelopes");
+	await assert.rejects(sealEnvelope(crypto, { vaultId: "v1", binding: fb(ns), inner: { kind: "nsOps", authorNsSeq: 4, flags: 0, frameNo: 0, content } }), CodecError);
 
 	const ckContent = encodeCheckpointContent({ encoding: CheckpointEncoding.nsFoldV1, coversSeq: 77, foldRulesVersion: 1, state: new Uint8Array([1]) });
-	const ck = await sealEnvelope(crypto, {
+	const { sealed: ck } = await sealEnvelope(crypto, {
 		vaultId: "v1", binding: { t: "checkpoint", stream: ns, coversSeq: 77 },
-		inner: { kind: "checkpoint", authorNsSeq: 77, flags: 0, content: ckContent },
+		inner: { kind: "checkpoint", authorNsSeq: 77, flags: 0, frameNo: 0, content: ckContent },
 	});
 	assert.ok((await openEnvelope(crypto, { vaultId: "v1", binding: { t: "checkpoint", stream: ns, coversSeq: 77 }, bytes: ck })).ok);
-	assert.deepEqual(await openEnvelope(crypto, { vaultId: "v1", binding: { t: "checkpoint", stream: ns, coversSeq: 78 }, bytes: ck }),
-		{ ok: false, reason: "kind-stream-mismatch" }, "coversSeq binding");
-	assert.deepEqual(await openEnvelope(crypto, { vaultId: "v1", binding: { t: "frame", stream: ns, clientFrameId: F1 }, bytes: ck }),
-		{ ok: false, reason: "kind-stream-mismatch" }, "checkpoint kind on a frame row");
-	assert.deepEqual(await openEnvelope(crypto, { vaultId: "v1", binding: { t: "checkpoint", stream: "cfg" as StreamName, coversSeq: 77 }, bytes: ck }),
-		{ ok: false, reason: "kind-stream-mismatch" }, "nsFoldV1 encoding on cfg");
-	assert.deepEqual(await openEnvelope(crypto, { vaultId: "v1", binding: { t: "frame", stream: ns, clientFrameId: F1 }, bytes: new Uint8Array([1, 1, 0]) }),
-		{ ok: false, reason: "unsupported-suite" });
+	assert.equal((await openEnvelope(crypto, { vaultId: "v1", binding: fb(ns), bytes: ck }) as { reason: string }).reason, "kind-stream-mismatch", "checkpoint kind on a frame row");
+	assert.deepEqual(await openEnvelope(crypto, { vaultId: "v1", binding: fb(ns), bytes: new Uint8Array([1, 1, 1]) }), { ok: false, reason: "unsupported-suite", header: { formatVersion: 1, suite: 1, keyEpoch: 1 } },
+		"a suite-0 reader cannot open suite 1");
 });
 
 test("contents: checkpoint / blobChunk / bodyUpdateRef round trip and malformed", () => {

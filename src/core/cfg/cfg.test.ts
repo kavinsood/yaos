@@ -44,8 +44,9 @@ const F = () => `c${(fid++).toString().padStart(21, "0")}` as ClientFrameId;
 const H = (n: number) => n.toString(16).padStart(2, "0").repeat(32) as ContentHash;
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
-function fold(s: CfgFoldState, seq: number, deviceId: DeviceId, ops: CfgOp[], clientFrameId = F()): CfgFoldEvent[] {
-	const ev = foldCfgFrame(s, { seq, deviceId, clientFrameId, ops });
+/** frameNo 0 skips the replay window (a gate-failed row); the window has its own tests below. */
+function fold(s: CfgFoldState, seq: number, deviceId: DeviceId, ops: CfgOp[], clientFrameId = F(), frameNo = 0): CfgFoldEvent[] {
+	const ev = foldCfgFrame(s, { seq, deviceId, clientFrameId, frameNo, ops });
 	assert.equal(checkCfgInvariants(s), null);
 	const bytes = encodeCfgFoldV1(s);
 	const v = verifyCfgFoldBytes(bytes, s.coversSeq);
@@ -115,7 +116,7 @@ test("fold: LWW by (seq, index), tombstones, events, coversSeq", () => {
 
 	// Already folded seq: nothing.
 	const before = encodeCfgFoldV1(s);
-	assert.deepEqual(foldCfgFrame(s, { seq: 2, deviceId: A, clientFrameId: F(), ops: [{ t: "pluginDel", pluginId: "x" }] }), []);
+	assert.deepEqual(foldCfgFrame(s, { seq: 2, deviceId: A, clientFrameId: F(), frameNo: 0, ops: [{ t: "pluginDel", pluginId: "x" }] }), []);
 	assert.ok(bytesEqual(before, encodeCfgFoldV1(s)));
 });
 
@@ -140,9 +141,9 @@ test("fold: duplicate frames, ring expiry, malformed = empty, invalid ops", () =
 	// Ring expiry with a small ring.
 	const t = newCfgFoldState();
 	const ids = [F(), F(), F()];
-	ids.forEach((id, i) => foldCfgFrameWith({ dedupeRing: 2 }, t, { seq: i + 1, deviceId: A, clientFrameId: id, ops: [] }));
+	ids.forEach((id, i) => foldCfgFrameWith({ dedupeRing: 2 }, t, { seq: i + 1, deviceId: A, clientFrameId: id, frameNo: 0, ops: [] }));
 	assert.deepEqual(t.recentFrames.get(A), ids.slice(1));
-	ev = foldCfgFrameWith({ dedupeRing: 2 }, t, { seq: 4, deviceId: A, clientFrameId: ids[0]!, ops: [{ t: "pluginSet", pluginId: "q", enabled: true }] });
+	ev = foldCfgFrameWith({ dedupeRing: 2 }, t, { seq: 4, deviceId: A, clientFrameId: ids[0]!, frameNo: 0, ops: [{ t: "pluginSet", pluginId: "q", enabled: true }] });
 	assert.equal((ev[0]!.outcome as { t: string }).t, "applied");
 	// Invalid ops are ignored individually.
 	const u = newCfgFoldState();
@@ -156,6 +157,32 @@ test("fold: duplicate frames, ring expiry, malformed = empty, invalid ops", () =
 	]);
 	assert.deepEqual(ev.map((e) => (e.outcome.t === "ignored" ? e.outcome.reason : e.outcome.t)), ["invalid-op", "invalid-op", "invalid-op", "invalid-op", "invalid-op", "applied"]);
 	assert.deepEqual(u.json.get(jsonRegisterKey("app.json", "k"))!.version.index, 5);
+});
+
+test("fold: frameNo replay window after the ring; a rejected frame changes neither (e2ee-design §8.2)", () => {
+	const s = newCfgFoldState();
+	const set = (enabled: boolean) => [{ t: "pluginSet" as const, pluginId: "p", enabled }];
+	assert.equal(fold(s, 1, A, set(true), F(), 100)[0]!.outcome.t, "applied");
+	const reasons = (e: CfgFoldEvent[]) => e.map((x) => (x.outcome.t === "ignored" ? `${x.index}:${x.outcome.reason}` : x.outcome.t));
+	// A replayed frameNo under a fresh clientFrameId (the ring cannot see it): duplicate.
+	let before = encodeCfgFoldV1(s);
+	const fresh = F();
+	assert.deepEqual(reasons(fold(s, 2, A, set(false), fresh, 100)), ["-1:replay-duplicate"]);
+	assert.equal(s.coversSeq, 2);
+	assert.ok(!s.recentFrames.get(A)!.includes(fresh), "rejected frame is not in the ring");
+	assert.deepEqual(decodeCfgFoldV1(encodeCfgFoldV1(s))!.replay, decodeCfgFoldV1(before)!.replay, "window unchanged");
+	// Out of order inside the window is fine; at or below r - 64 is stale.
+	assert.equal(fold(s, 3, A, set(false), F(), 37)[0]!.outcome.t, "applied");
+	before = encodeCfgFoldV1(s);
+	assert.deepEqual(reasons(fold(s, 4, A, set(true), F(), 36)), ["-1:replay-stale"]);
+	assert.equal(s.plugins.get("p")!.value, false);
+	assert.deepEqual(s.replay.get(A), decodeCfgFoldV1(before)!.replay.get(A));
+	// The ring answers first: a replayed clientFrameId is duplicate-frame, not replay-*.
+	assert.deepEqual(reasons(fold(s, 5, A, set(true), s.recentFrames.get(A)![0]!, 100)), ["-1:duplicate-frame"]);
+	// Windows are per device; frameNo 0 (a gate-failed row) skips the window.
+	assert.equal(fold(s, 6, B, set(true), F(), 1)[0]!.outcome.t, "applied");
+	assert.deepEqual(fold(s, 7, A, [], F(), 0), []);
+	assert.deepEqual([s.replay.get(A)!.r, s.replay.get(B)!.r], [100, 1]);
 });
 
 test("cfgFoldV1 round-trip, V1 non-canonical rejection, V2 violations, checkpoint header", () => {
@@ -214,8 +241,8 @@ test("overlay: pending frames on a copy", () => {
 	fold(s, 5, B, [{ t: "pluginSet", pluginId: "p", enabled: true }]);
 	const before = encodeCfgFoldV1(s);
 	const o = overlayPendingCfg(s, A, [
-		{ clientFrameId: F(), ops: [{ t: "pluginSet", pluginId: "p", enabled: false }] },
-		{ clientFrameId: F(), ops: [{ t: "jsonSet", file: "app.json", key: "k", valueJson: "1" }] },
+		{ clientFrameId: F(), frameNo: 1, ops: [{ t: "pluginSet", pluginId: "p", enabled: false }] },
+		{ clientFrameId: F(), frameNo: 2, ops: [{ t: "jsonSet", file: "app.json", key: "k", valueJson: "1" }] },
 	]);
 	assert.ok(bytesEqual(before, encodeCfgFoldV1(s)));
 	assert.equal(o.state.plugins.get("p")!.value, false);
@@ -345,7 +372,8 @@ test("cfg fold fuzz: V1/V2 per frame, cut-point replay, determinism", () => {
 			if (r < 0.9) return { t: "pluginSet", pluginId: pick(["p", "q", "r"]), enabled: rnd() < 0.5 };
 			return { t: "pluginDel", pluginId: pick(["p", "q", "r"]) };
 		};
-		type Fr = { seq: number; deviceId: DeviceId; clientFrameId: ClientFrameId; ops: CfgOp[] };
+		type Fr = { seq: number; deviceId: DeviceId; clientFrameId: ClientFrameId; frameNo: number; ops: CfgOp[] };
+		const frameNos = new Map<DeviceId, number>();
 		const frames: Fr[] = [];
 		const sent: Fr[] = [];
 		let seq = 0;
@@ -360,7 +388,10 @@ test("cfg fold fuzz: V1/V2 per frame, cut-point replay, determinism", () => {
 			const ops = Array.from({ length: n }, genOp);
 			const decoded = n === 0 ? [] : decodeCfgOps(encodeCfgOps(ops));
 			assert.ok(decoded !== null);
-			const fr: Fr = { seq, deviceId: pick(devices), clientFrameId: F(), ops: decoded };
+			const deviceId = pick(devices);
+			const frameNo = (frameNos.get(deviceId) ?? 0) + 1;
+			frameNos.set(deviceId, frameNo);
+			const fr: Fr = { seq, deviceId, clientFrameId: F(), frameNo, ops: decoded };
 			sent.push(fr);
 			frames.push(fr);
 		}

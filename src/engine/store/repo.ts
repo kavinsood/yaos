@@ -18,7 +18,7 @@ import type { KeyRange, StorageDb, StoragePort, StorageTx } from "../../ports/st
 import { CursorTracker } from "../sync/cursor";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
-	type MetaCursor, type MetaIdentity, type MetaOutboxOrder, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
+	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaOutboxOrder, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
 	type SnapshotRecord, type StreamRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
@@ -32,6 +32,12 @@ type Tx = StorageTx<YS>;
 type StoreKey = keyof YS & string;
 
 const MAXK = Number.MAX_SAFE_INTEGER;
+
+/** Highest own ns / cfg frameNo of an abandoned epoch timeline (MetaFrameNoFloor). */
+export interface FrameNoFloor {
+	readonly ns: number;
+	readonly cfg: number;
+}
 
 export interface RepoIdentity {
 	readonly vaultId: VaultId;
@@ -131,6 +137,8 @@ export class Repo {
 	private readonly cache = new Map<StreamName, StreamRecord>();
 	private queue: Promise<unknown> = Promise.resolve();
 	private ckptDuty = new Set<StreamName>();
+	/** meta frameNoFloor (epoch migration, e2ee-design §8.2); read at open. */
+	frameNoFloor: FrameNoFloor = { ns: 0, cfg: 0 };
 	priorityFn: PriorityFn = defaultPriority;
 	/** Monotonic clock for the cursor gap timer. */
 	monotonic: () => number = () => 0;
@@ -154,7 +162,7 @@ export class Repo {
 	 * Open (or create) the DB for this identity. `mismatch` closes nothing: the
 	 * caller deletes the DB and recovers (DESIGN §i.5).
 	 */
-	static async open(storage: StoragePort, id: RepoIdentity, nowMs: number, opts: { recoveredFromMirror?: boolean } = {}): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
+	static async open(storage: StoragePort, id: RepoIdentity, nowMs: number, opts: { recoveredFromMirror?: boolean; frameNoFloor?: FrameNoFloor | null } = {}): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
 		const db = await storage.open<YS>(dbName(id.vaultId, id.vaultEpoch, id.deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
 		const res = await db.tx([STORE.meta], "readwrite", async (tx) => {
 			const ident = await tx.get(STORE.meta, "identity") as MetaIdentity | undefined;
@@ -164,6 +172,7 @@ export class Repo {
 				}
 				const cursor = (await tx.get(STORE.meta, "cursor") as MetaCursor | undefined) ?? { key: "cursor", vaultSeq: 0, headSeqSeen: 0 };
 				const order = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
+				if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
 				return { outcome: { t: "existing", identity: ident } as OpenOutcome, ident, cursor, next: order.next };
 			}
 			const fresh: MetaIdentity = {
@@ -174,6 +183,7 @@ export class Repo {
 			tx.put(STORE.meta, fresh);
 			tx.put(STORE.meta, cursor);
 			tx.put(STORE.meta, { key: "outboxOrder", next: 1 });
+			if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
 			return { outcome: { t: "fresh" } as OpenOutcome, ident: fresh, cursor, next: 1 };
 		});
 		if (res.outcome.t === "mismatch" || res.cursor === null) return { repo: null, outcome: res.outcome, db };
@@ -183,13 +193,15 @@ export class Repo {
 	}
 
 	private async loadCache(): Promise<void> {
-		const { streams, duty } = await this.db.tx([STORE.streams, STORE.meta], "readonly", async (tx) => {
+		const { streams, duty, floor } = await this.db.tx([STORE.streams, STORE.meta], "readonly", async (tx) => {
 			const streams = await tx.getAll(STORE.streams);
 			const d = await tx.get(STORE.meta, "ckptDuty");
-			return { streams, duty: d && d.key === "ckptDuty" ? d.streams : [] };
+			const f = await tx.get(STORE.meta, "frameNoFloor");
+			return { streams, duty: d && d.key === "ckptDuty" ? d.streams : [], floor: f && f.key === "frameNoFloor" ? { ns: f.ns, cfg: f.cfg } : { ns: 0, cfg: 0 } };
 		});
 		for (const s of streams) this.cache.set(s.stream, s);
 		this.ckptDuty = new Set(duty);
+		this.frameNoFloor = floor;
 	}
 
 	/** Serial queue for read-write transactions. */
@@ -262,7 +274,7 @@ export class Repo {
 		return this.db.tx([STORE.streams], "readonly", (tx) =>
 			tx.getAllByIndex(STORE.streams, INDEX.streamsByStale, { lower: [1, -MAXK], upper: [1, MAXK] }, limit));
 	}
-	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty">(key: K) {
+	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "frameNoFloor">(key: K) {
 		return this.db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, key));
 	}
 
@@ -437,7 +449,8 @@ export class Repo {
 			const changed: Mut<StreamRecord>[] = [];
 			const v = await this.db.tx([STORE.streams, STORE.meta], "readwrite", async (tx) => {
 				for (const e of entries) {
-					if (streamClass(e.stream) === "other") continue;
+					const ec = streamClass(e.stream);
+					if (ec === "other" || ec === "keyring") continue; // keyring: WP-E3
 					const r: Mut<StreamRecord> = { ...((await tx.get(STORE.streams, e.stream)) ?? newStreamRecord(e.stream, nowMs)) };
 					if (e.lastSeq <= r.remoteHeadSeq && this.cache.has(e.stream)) continue;
 					r.remoteHeadSeq = Math.max(r.remoteHeadSeq, e.lastSeq);
@@ -720,10 +733,16 @@ function stateOrderRange(state: OutboxState): KeyRange {
 	return { lower: [state, 0], upper: [state, MAXK] };
 }
 
+/** Merge a carried frameNo floor into meta (max per stream; e2ee-design §8.2). */
+async function raiseFrameNoFloor(tx: Tx, f: FrameNoFloor): Promise<void> {
+	const cur = await tx.get(STORE.meta, "frameNoFloor") as MetaFrameNoFloor | undefined;
+	tx.put(STORE.meta, { key: "frameNoFloor", ns: Math.max(cur?.ns ?? 0, f.ns), cfg: Math.max(cur?.cfg ?? 0, f.cfg) });
+}
+
 /** Own frame -> tail row. A bodyUpdateRef record keeps the resolved update as content (local cache). */
 function receiptRow(ob: OutboxRecord, seq: Seq, self: DeviceId): TailRecord {
 	const kind = ob.kind === "bodyUpdateRef" ? (streamClass(ob.stream) === "canvas" ? "canvasUpdate" : "bodyUpdate") : ob.kind;
-	return { stream: ob.stream, seq, deviceId: self, clientFrameId: ob.clientFrameId, kind, authorNsSeq: ob.authorNsSeq, flags: ob.flags, content: ob.content };
+	return { stream: ob.stream, seq, deviceId: self, clientFrameId: ob.clientFrameId, kind, authorNsSeq: ob.authorNsSeq, flags: ob.flags, frameNo: ob.frameNo ?? 0, content: ob.content };
 }
 
 /** Idempotent tail put; rows already covered by the snapshot are skipped. Returns true if written. */

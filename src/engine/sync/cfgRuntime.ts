@@ -41,17 +41,21 @@ export class CfgRuntime extends FoldRuntime<CfgOp, CfgFoldEvent> {
 	}
 
 	protected foldFrame(row: TailRecord, ops: readonly CfgOp[]): { events: readonly CfgFoldEvent[]; halted: boolean } {
-		return { events: foldCfgFrame(this.state, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, ops }), halted: false };
+		return { events: foldCfgFrame(this.state, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, frameNo: row.frameNo ?? 0, ops }), halted: false };
 	}
 
 	encodeState(): Uint8Array {
 		return encodeCfgFoldV1(this.state);
 	}
 
+	protected ownReplayEdge(): number {
+		return this.state.replay.get(this.self)?.r ?? 0;
+	}
+
 	/** Committed cfg fold + own pending cfg frames (outbox, receipted-unfolded). */
 	view(outbox: OutboxCache): CfgFoldState {
 		const pending = this.pendingFrames(outbox);
 		if (pending.length === 0) return this.state;
-		return overlayPendingCfg(this.state, this.self, pending.map((f) => ({ clientFrameId: f.clientFrameId, ops: f.ops }))).state;
+		return overlayPendingCfg(this.state, this.self, pending.map((f) => ({ clientFrameId: f.clientFrameId, frameNo: f.frameNo, ops: f.ops }))).state;
 	}
 }

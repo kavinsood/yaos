@@ -8,7 +8,7 @@ import type { DocId, NsEntry, NsFoldIndex, NsFoldState, PathKey, VaultPath } fro
 import { FOLD_RULES_VERSION } from "../limits";
 
 export function newNsFoldState(): NsFoldState {
-	return { formatVersion: 1, foldRulesVersion: FOLD_RULES_VERSION, coversSeq: 0, entries: new Map(), recentFrames: new Map() };
+	return { formatVersion: 1, foldRulesVersion: FOLD_RULES_VERSION, coversSeq: 0, entries: new Map(), recentFrames: new Map(), replay: new Map() };
 }
 
 export function newNsFoldIndex(): NsFoldIndex {
@@ -72,6 +72,7 @@ export function cloneNsFold(state: NsFoldState, index: NsFoldIndex): { state: Ns
 			coversSeq: state.coversSeq,
 			entries: new Map(state.entries),
 			recentFrames: new Map(state.recentFrames),
+			replay: new Map(state.replay),
 		},
 		index: { byPathKey: new Map(index.byPathKey), folderRefs: new Map(index.folderRefs), tombstones: index.tombstones },
 	};

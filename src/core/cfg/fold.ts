@@ -7,6 +7,9 @@
  * - seq <= coversSeq: [] and no change (already folded).
  * - Duplicate clientFrameId (ring of NS_DEDUPE_RING per device): one
  *   frame-level event, coversSeq still advances.
+ * - Then the frameNo replay window (e2ee-design §8.2, frameNo ≥ 1 only):
+ *   replay-stale / replay-duplicate are frame-level events too; a frame
+ *   rejected by the ring or the window changes neither.
  * - A malformed cfgOps payload folds as a frame with ops: [] (it still enters
  *   the ring and advances coversSeq).
  * - The fold has no allowlist gate (§c.11); it only rejects structurally
@@ -31,6 +34,7 @@ import type {
 	Seq,
 } from "../types";
 import { NS_DEDUPE_RING } from "../limits";
+import { replayAccept, replayCheck } from "../replayWindow";
 import { isContentHash } from "../codec/ids";
 import { isCanonicalJson } from "./json";
 
@@ -41,6 +45,8 @@ export interface CfgFrame {
 	readonly seq: Seq;
 	readonly deviceId: DeviceId;
 	readonly clientFrameId: ClientFrameId;
+	/** Replay counter (e2ee-design §8.2); 0 = a gate-failed row, outside the window. */
+	readonly frameNo: number;
 	/** [] for a malformed payload. */
 	readonly ops: readonly CfgOp[];
 }
@@ -55,11 +61,12 @@ export type CfgOpOutcome =
 	| { readonly t: "applied" }
 	/** Value unchanged; version updated. */
 	| { readonly t: "same" }
-	| { readonly t: "ignored"; readonly reason: "duplicate-frame" | "invalid-op" | "stale" };
+	/** replay-*: frame-level, the frameNo window (e2ee-design §8.2); stale-epoch: frame-level, WP-E3 (§14.3). */
+	| { readonly t: "ignored"; readonly reason: "duplicate-frame" | "replay-stale" | "replay-duplicate" | "stale-epoch" | "invalid-op" | "stale" };
 
 export interface CfgFoldEvent {
 	readonly seq: Seq;
-	/** Op index; -1 for the frame-level duplicate event. */
+	/** Op index; -1 for a frame-level event (duplicate-frame, replay-*). */
 	readonly index: number;
 	readonly deviceId: DeviceId;
 	readonly clientFrameId: ClientFrameId;
@@ -77,7 +84,7 @@ export const DEFAULT_CFG_FOLD_RULES: CfgFoldRules = { dedupeRing: NS_DEDUPE_RING
 export type CfgFileValue = { readonly content: CfgFileContent; readonly pluginVersion: string | null };
 
 export function newCfgFoldState(): CfgFoldState {
-	return { formatVersion: 1, coversSeq: 0, recentFrames: new Map(), json: new Map(), files: new Map(), plugins: new Map() };
+	return { formatVersion: 1, coversSeq: 0, recentFrames: new Map(), replay: new Map(), json: new Map(), files: new Map(), plugins: new Map() };
 }
 
 /** Shallow copy: maps are new, registers (immutable) are shared. */
@@ -86,6 +93,7 @@ export function cloneCfgFold(s: CfgFoldState): CfgFoldState {
 		formatVersion: 1,
 		coversSeq: s.coversSeq,
 		recentFrames: new Map(s.recentFrames),
+		replay: new Map(s.replay),
 		json: new Map(s.json),
 		files: new Map(s.files),
 		plugins: new Map(s.plugins),
@@ -203,6 +211,16 @@ export function foldCfgFrameWith(rules: CfgFoldRules, state: CfgFoldState, frame
 		state.coversSeq = frame.seq;
 		return [ev(-1, null, { t: "ignored", reason: "duplicate-frame" })];
 	}
+	// frameNo window after the ring (e2ee-design §8.2): a rejected frame changes neither.
+	if (frame.frameNo >= 1) {
+		const w = state.replay.get(frame.deviceId);
+		const verdict = replayCheck(w, frame.frameNo);
+		if (verdict !== "accept") {
+			state.coversSeq = frame.seq;
+			return [ev(-1, null, { t: "ignored", reason: verdict })];
+		}
+		state.replay.set(frame.deviceId, replayAccept(w, frame.frameNo));
+	}
 	const nextRing = ring ? [...ring, frame.clientFrameId] : [frame.clientFrameId];
 	state.recentFrames.set(frame.deviceId, nextRing.length > rules.dedupeRing ? nextRing.slice(-rules.dedupeRing) : nextRing);
 
@@ -264,6 +282,8 @@ export function changedRegisters(events: readonly CfgFoldEvent[]): CfgRegisterRe
 
 export interface PendingCfgFrame {
 	readonly clientFrameId: ClientFrameId;
+	/** Sealed frameNo (≥ 1; 0 = unknown, skips the replay window). */
+	readonly frameNo: number;
 	readonly ops: readonly CfgOp[];
 }
 
@@ -275,7 +295,7 @@ export function overlayPendingCfg(state: CfgFoldState, deviceId: DeviceId, frame
 	const s = cloneCfgFold(state);
 	const events: CfgFoldEvent[] = [];
 	frames.forEach((f, i) => {
-		events.push(...foldCfgFrame(s, { seq: state.coversSeq + 1 + i, deviceId, clientFrameId: f.clientFrameId, ops: f.ops }));
+		events.push(...foldCfgFrame(s, { seq: state.coversSeq + 1 + i, deviceId, clientFrameId: f.clientFrameId, frameNo: f.frameNo, ops: f.ops }));
 	});
 	return { state: s, events };
 }

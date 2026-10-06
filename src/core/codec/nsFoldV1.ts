@@ -4,13 +4,19 @@
  *
  * The encoder is canonical (entries by ascending docId, devices by ascending
  * deviceId, UTF-16 code-unit order). The decoder is strict about bytes
- * (minimal varuints, UTF-8, no trailing bytes, ring n in 1..64) but not about
- * order/uniqueness: V1 (re-encode equality, src/core/ns/verify.ts) catches
- * those, V2 catches field inconsistencies.
+ * (minimal varuints, UTF-8, no trailing bytes, ring n in 1..64, replay
+ * windows canonical) but not about order/uniqueness: V1 (re-encode equality,
+ * src/core/ns/verify.ts) catches those, V2 catches field inconsistencies.
+ *
+ * After the rings comes the frameNo replay state (e2ee-design §8.2, "V2" in
+ * that document; redefined in place, §18): varuint deviceCount, then per
+ * device (ascending deviceId) varstring deviceId, varuint r, 8 bytes bitmap
+ * (big-endian; bit i = frameNo r − i).
  */
 
-import type { ClientFrameId, DeviceId, DocId, NsEntry, NsEntryState, NsFoldState } from "../types";
+import type { ClientFrameId, DeviceId, DocId, NsEntry, NsEntryState, NsFoldState, ReplayWindow } from "../types";
 import { NS_DEDUPE_RING } from "../limits";
+import { REPLAY_BITS_BYTES, replayBitsFromBytes, replayBitsToBytes, replayWindowValid } from "../replayWindow";
 import { pathKey } from "../paths/pathKey";
 import { CodecError, Reader, Writer, compareCodeUnits } from "./lib0";
 import { bytesToHash, hashToBytes } from "./ids";
@@ -49,6 +55,27 @@ export function readRings(r: Reader): Map<DeviceId, ClientFrameId[]> {
 	return rings;
 }
 
+export function writeReplay(w: Writer, replay: ReadonlyMap<DeviceId, ReplayWindow>): void {
+	const devices = sortedKeys(replay);
+	w.varuint(devices.length);
+	for (const d of devices) {
+		const win = replay.get(d)!;
+		w.varstring(d).varuint(win.r).fixed(replayBitsToBytes(win.bits), REPLAY_BITS_BYTES);
+	}
+}
+
+export function readReplay(r: Reader): Map<DeviceId, ReplayWindow> {
+	const out = new Map<DeviceId, ReplayWindow>();
+	const n = r.varuint();
+	for (let i = 0; i < n; i++) {
+		const d = r.varstring() as DeviceId;
+		const win: ReplayWindow = { r: r.varuint(), bits: replayBitsFromBytes(r.copy(REPLAY_BITS_BYTES)) };
+		if (!replayWindowValid(win)) throw new CodecError("replay window not canonical");
+		out.set(d, win);
+	}
+	return out;
+}
+
 export function encodeNsFoldV1(state: NsFoldState): Uint8Array {
 	const w = new Writer(64 + state.entries.size * 120);
 	w.varuint(state.formatVersion).varuint(state.foldRulesVersion).varuint(state.coversSeq);
@@ -65,6 +92,7 @@ export function encodeNsFoldV1(state: NsFoldState): Uint8Array {
 		else w.u8(0);
 	}
 	writeRings(w, state.recentFrames);
+	writeReplay(w, state.replay);
 	return w.finish();
 }
 
@@ -109,8 +137,9 @@ export function decodeNsFoldV1Strict(bytes: Uint8Array): NsFoldState {
 		});
 	}
 	const recentFrames = readRings(r);
+	const replay = readReplay(r);
 	r.end();
-	return { formatVersion: 1, foldRulesVersion, coversSeq, entries, recentFrames };
+	return { formatVersion: 1, foldRulesVersion, coversSeq, entries, recentFrames, replay };
 }
 
 /** null = malformed (bytes). Canonical form and invariants: src/core/ns/verify.ts. */

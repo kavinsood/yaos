@@ -397,7 +397,7 @@ export class SessionLoop {
 		if (slots <= 0) return;
 		const now = c.mono();
 		const order = staleOrder(c.repo.streams(), (r) => c.repo.priorityFn(r), (r) =>
-			this.reads.has(r.stream) || r.cls === "other" || (r.frozen === 1 && r.frozenReason === "checkpoint-disputed") || (this.readBackoff.get(r.stream) ?? 0) > now);
+			this.reads.has(r.stream) || r.cls === "other" || r.cls === "keyring" || (r.frozen === 1 && r.frozenReason === "checkpoint-disputed") || (this.readBackoff.get(r.stream) ?? 0) > now);
 		const per = this.batching(s);
 		for (let i = 0; slots > 0 && i < order.length; slots--) {
 			const group = order.slice(i, i + per).map((r) => r.stream);

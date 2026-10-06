@@ -7,7 +7,7 @@
  *  - a token bucket (APPEND_BYTES_PER_SEC, halved for 10 min after backpressure);
  *  - maxInflightAppendBytes of sent-unreceipted bytes (one frame always allowed);
  *  - session.bufferedBytes() <= BUFFERED_HIGH_WATER;
- *  - the ns/cfg send window (first NS_SEND_WINDOW unreceipted frames by order),
+ *  - the ns/cfg send window (frameNo < lowest unreceipted frameNo + NS_SEND_WINDOW),
  *    opened only after the reconnect late-receipt reads (DESIGN §d.7);
  *  - daily-limit hold, canWrite / forbidden, durability backoff;
  *  - probe mode after a 1008/1009 close: one frame in flight; a frame that
@@ -276,7 +276,12 @@ export class Sender {
 		return this.sorted;
 	}
 
-	/** First NS_SEND_WINDOW unreceipted frames of ns and of cfg, by order. */
+	/**
+	 * Sendable ns and cfg frames (DESIGN §c.3 restated over frameNo, e2ee-design
+	 * §8.2): frameNo < u + NS_SEND_WINDOW, u = the lowest unreceipted own
+	 * frameNo of the stream. So every own frame ≤ f − NS_SEND_WINDOW is
+	 * receipted when f is sent, which keeps the replay window exact.
+	 */
 	private window(): Set<ClientFrameId> {
 		const ns: Entry[] = [];
 		const cfg: Entry[] = [];
@@ -286,8 +291,9 @@ export class Sender {
 		}
 		const out = new Set<ClientFrameId>();
 		for (const list of [ns, cfg]) {
-			list.sort((a, b) => a.rec.order - b.rec.order);
-			for (const e of list.slice(0, NS_SEND_WINDOW)) out.add(e.rec.clientFrameId);
+			let u = Infinity;
+			for (const e of list) u = Math.min(u, e.rec.frameNo ?? 0);
+			for (const e of list) if ((e.rec.frameNo ?? 0) < u + NS_SEND_WINDOW) out.add(e.rec.clientFrameId);
 		}
 		return out;
 	}

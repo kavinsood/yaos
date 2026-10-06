@@ -186,6 +186,7 @@ function generate(seed: number, totalOps: number): Gen {
 	let seq = 0;
 	let ops = 0;
 	const lastOwn = new Map<DeviceId, number>();
+	const lastFrameNo = new Map<DeviceId, number>();
 	while (ops < totalOps) {
 		seq += r.chance(0.05) ? r.int(2, 30) : 1;
 		const roll = r.next();
@@ -193,21 +194,27 @@ function generate(seed: number, totalOps: number): Gen {
 		if (roll < 0.05 && frames.length > 0) {
 			// Resend of a past frame at a new seq: recent (likely inside the ring) or any (often outside).
 			const past = r.chance(0.6) ? frames[r.int(Math.max(0, frames.length - 20), frames.length - 1)]! : r.pick(frames);
-			frame = { ...past, seq };
+			// Every third resend reuses the frameNo under a fresh clientFrameId (a misbehaving key
+			// holder; the ring misses it, the frameNo window must not). No extra draws: seeds keep their frames.
+			const fresh = seq % 3 === 0 ? (`r${String(seq).padStart(21, "0")}` as ClientFrameId) : past.clientFrameId;
+			frame = { ...past, seq, clientFrameId: fresh };
 		} else {
 			const deviceId = r.pick(devices);
 			const lag = snapshots.length === 0 || r.chance(0.5) ? 0 : r.int(1, snapshots.length);
 			const view = lag === 0 ? state : snapshots[snapshots.length - lag]!;
 			const ids = liveIds(view);
 			const clientFrameId = randId(r) as ClientFrameId;
+			// An honest per-device frameNo counter; replays of `past` above reuse theirs (§8.2).
+			const frameNo = (lastFrameNo.get(deviceId) ?? 0) + 1;
+			lastFrameNo.set(deviceId, frameNo);
 			if (roll < 0.08) {
-				frame = { seq, deviceId, clientFrameId, authorNsSeq: view.coversSeq, ops: [] }; // malformed
+				frame = { seq, deviceId, clientFrameId, frameNo, authorNsSeq: view.coversSeq, ops: [] }; // malformed
 			} else {
 				const want = r.int(1, 20);
 				const list: NsOp[] = [];
 				while (list.length < want) list.push(...genOp(r, view, ids, used));
 				const authorNsSeq = r.chance(0.15) ? r.int(0, view.coversSeq) : view.coversSeq;
-				frame = { seq, deviceId, clientFrameId, authorNsSeq: Math.max(authorNsSeq, lastOwn.get(deviceId) ?? 0), ops: list.slice(0, 512) };
+				frame = { seq, deviceId, clientFrameId, frameNo, authorNsSeq: Math.max(authorNsSeq, lastOwn.get(deviceId) ?? 0), ops: list.slice(0, 512) };
 			}
 			lastOwn.set(deviceId, frame.authorNsSeq);
 		}
@@ -277,7 +284,8 @@ function checkRun(rules: NsFoldRules, frames: readonly NsFrame[], cutSeed: numbe
 			throw new Error(`coversSeq ${state.coversSeq} != seq ${f.seq} after frame ${i}`);
 		}
 		const perOp = ev.filter((e) => e.index >= 0).length;
-		const dup = ev.length === 1 && ev[0]!.outcome.kind === "ignored" && ev[0]!.outcome.reason === "duplicate-frame";
+		const FRAME_LEVEL = ["duplicate-frame", "replay-duplicate", "replay-stale"];
+		const dup = ev.length === 1 && ev[0]!.index === -1 && ev[0]!.outcome.kind === "ignored" && FRAME_LEVEL.includes(ev[0]!.outcome.reason);
 		if (!nsFoldHalted(ev) && !dup && perOp !== f.ops.length) throw new Error(`event count ${perOp} != ops ${f.ops.length} at frame ${i}`);
 		if (cuts.has(i)) snapshotsAt.set(i, encodeNsFoldV1(state));
 	}, true);
@@ -371,6 +379,7 @@ test("fuzz generator is deterministic per seed and exercises every outcome", () 
 		"ignored/duplicate-frame", "ignored/duplicate-docid", "ignored/unknown-docid", "ignored/invalid-path", "ignored/kind-mismatch",
 		"ignored/stale-delete", "ignored/already-deleted", "ignored/not-deleted", "ignored/restore-not-current", "ignored/stale-revive",
 		"ignored/rev-mismatch", "ignored/not-blob", "ignored/noop", "ignored/rules-version",
+		"ignored/replay-duplicate", "ignored/replay-stale",
 	];
 	assert.deepEqual(expected.filter((k) => !seen.has(k)), []);
 });

@@ -64,11 +64,17 @@ const BOUND = "d:bound" as StreamName;
 const BG = "d:bg" as StreamName;
 const X = "x:chunk" as StreamName;
 let ord = 0;
+/** Per-stream frameNo counters for ns/cfg records, allocated in outbox order like LogApi does. */
+const frameNos = new Map<StreamName, number>();
 function rec(stream: StreamName, bytes = 10, over: Partial<OutboxRecord> = {}): OutboxRecord {
 	const n = ord++;
+	const counted = stream === NS_STREAM || stream === CFG_STREAM;
+	const frameNo = counted ? (frameNos.get(stream) ?? 0) + 1 : null;
+	if (frameNo !== null) frameNos.set(stream, frameNo);
 	return {
-		clientFrameId: `f${String(n).padStart(21, "0")}` as ClientFrameId, order: n, stream, kind: stream === NS_STREAM ? "nsOps" : "bodyUpdate",
-		state: "pending", sealed: new Uint8Array(bytes), content: new Uint8Array(0), authorNsSeq: 0, flags: 0, dependsOn: null, adoptOf: null,
+		clientFrameId: `f${String(n).padStart(21, "0")}` as ClientFrameId, order: n, stream,
+		kind: stream === NS_STREAM ? "nsOps" : stream === CFG_STREAM ? "cfgOps" : "bodyUpdate",
+		state: "pending", sealed: new Uint8Array(bytes), content: new Uint8Array(0), authorNsSeq: 0, flags: 0, frameNo, dependsOn: null, adoptOf: null,
 		attempts: 0, createdAtMs: 0, lastSentAtMs: 0, ...over,
 	};
 }
@@ -107,7 +113,7 @@ test("sender: lane rank then outbox order; ns waits for openNs; resend replays i
 	assert.equal(s2.appends.length, 4);
 });
 
-test("sender: ns and cfg windows are the first NS_SEND_WINDOW unreceipted frames by order, independently", () => {
+test("sender: ns and cfg windows are frameNo < lowest unreceipted own frameNo + NS_SEND_WINDOW, independently (e2ee-design §8.2)", () => {
 	const { sender, add, clock } = mk();
 	const nss = add(...Array.from({ length: NS_SEND_WINDOW + 8 }, () => rec(NS_STREAM)));
 	const cfgs = add(...Array.from({ length: 3 }, () => rec(CFG_STREAM)));
@@ -120,8 +126,17 @@ test("sender: ns and cfg windows are the first NS_SEND_WINDOW unreceipted frames
 	assert.ok(cfgs.every((r) => sent.has(r.clientFrameId)));
 	sender.onReceipt(nss[5]!.clientFrameId);
 	clock.advance(0);
-	assert.equal(s.appends.at(-1)!.clientFrameId, nss[NS_SEND_WINDOW]!.clientFrameId, "one receipt opens exactly one slot");
+	assert.equal(s.appends.length, NS_SEND_WINDOW + 3, "a receipt above the lowest unreceipted frameNo opens no slot");
+	sender.onReceipt(nss[0]!.clientFrameId);
+	clock.advance(0);
+	assert.equal(s.appends.at(-1)!.clientFrameId, nss[NS_SEND_WINDOW]!.clientFrameId, "the lowest receipt opens exactly one slot");
 	assert.equal(s.appends.length, NS_SEND_WINDOW + 4);
+	for (const i of [1, 2, 3, 4]) sender.onReceipt(nss[i]!.clientFrameId);
+	clock.advance(0);
+	// u is now nss[6]'s frameNo (nss[5] was receipted early): frameNos up to u + 31 are out.
+	assert.deepEqual(s.ids().slice(-5), nss.slice(NS_SEND_WINDOW + 1, NS_SEND_WINDOW + 6).map((r) => r.clientFrameId));
+	assert.equal(s.appends.length, NS_SEND_WINDOW + 9);
+	assert.ok(s.ids().every((id) => id !== nss[NS_SEND_WINDOW + 6]!.clientFrameId), "frameNo u + 32 waits");
 });
 
 test("sender: inflight byte cap is head-of-line; one frame is always allowed; buffered high water defers 50 ms", () => {

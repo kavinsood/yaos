@@ -30,6 +30,7 @@ import type { ReconcileSettings } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
 import { LogEngine } from "../runtime/engine";
 import type { EngineTuning } from "../runtime/options";
+import type { FrameNoFloor } from "../store/repo";
 import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
 import { SnapshotJob } from "../snapshots/snapshotJob";
 import type { FoldedNsFrame } from "../sync/nsRuntime";
@@ -71,6 +72,8 @@ export interface VaultRuntimeStart {
 	readonly pathBases?: ReadonlyMap<PathKey, string> | null;
 	/** Old epoch whose DB is deleted once the new one reaches live (§c.12 step 6). */
 	readonly retireEpoch?: VaultEpoch | null;
+	/** Highest own ns / cfg frameNo of the old epoch (§c.12 step 3, e2ee-design §8.2). */
+	readonly frameNoFloor?: FrameNoFloor | null;
 }
 
 export function reconcileSettings(s: EngineSettings): ReconcileSettings {
@@ -143,7 +146,7 @@ export class VaultRuntime {
 		const { engine, config } = o;
 		const log = await LogEngine.start({
 			ports: o.ports, vaultId: config.vaultId, deviceId: config.deviceId, deviceClass: config.deviceClass,
-			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles,
+			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, frameNoFloor: o.frameNoFloor ?? null,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,
 			onDocUpdate: (docId, update, origin) => engine.bound.push(docId, update, origin === "local" ? "merge" : origin),
 			onDocFrozen: (docId, reason) => holder.rt?.onFrozen(docId, reason),

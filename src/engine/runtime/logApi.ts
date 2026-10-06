@@ -5,7 +5,8 @@
  * submitNs / submitCfg: ops are split into frames (<= MAX_NS_OPS_PER_FRAME
  * ops, <= MAX_FRAME_CONTENT_BYTES encoded), sealed and put in the outbox in
  * one T_edit on the edit chain; they resolve once the records are committed,
- * so the optimistic views already include them.
+ * so the optimistic views already include them. Each frame gets its frameNo
+ * on the chain (FoldRuntime.allocFrameNo), so frameNo order is outbox order.
  */
 
 import { cloneCfgFold } from "../../core/cfg/fold";
@@ -66,7 +67,7 @@ export async function submitNs(c: EngineCtx, ops: readonly NsOp[], extra?: Extra
 	const parts = chunkOps(ops, encodeNsOps);
 	return c.docs.chain(async () => {
 		const frames: NewOutboxFrame[] = [];
-		for (const part of parts) frames.push(await buildNsFrame(c.deps, NS_STREAM, part, c.ns.coversSeq, c.now()));
+		for (const part of parts) frames.push(await buildNsFrame(c.deps, NS_STREAM, part, c.ns.coversSeq, c.ns.allocFrameNo(c.outbox), c.now()));
 		const more = extra ? await extra(frames) : [];
 		c.addOutbox(await c.repo.tEdit([...frames, ...more], c.now()));
 		frames.forEach((f, i) => {
@@ -81,7 +82,7 @@ export async function submitCfg(c: EngineCtx, ops: readonly CfgOp[]): Promise<Cl
 	const parts = chunkOps(ops, encodeCfgOps);
 	return c.docs.chain(async () => {
 		const frames: NewOutboxFrame[] = [];
-		for (const part of parts) frames.push(await buildCfgFrame(c.deps, CFG_STREAM, part, c.ns.coversSeq, c.now()));
+		for (const part of parts) frames.push(await buildCfgFrame(c.deps, CFG_STREAM, part, c.ns.coversSeq, c.cfg.allocFrameNo(c.outbox), c.now()));
 		c.addOutbox(await c.repo.tEdit(frames, c.now()));
 		return frames.map((f) => f.clientFrameId);
 	});

@@ -29,6 +29,8 @@ import { ORIGIN } from "./yjsCounters";
 
 export interface FrameCtx {
 	readonly vaultId: VaultId;
+	/** This device: the AAD binds every own frame to it (e2ee-design §7.1). */
+	readonly self: DeviceId;
 	readonly crypto: CryptoPort;
 	readonly hash: HashPort;
 	readonly random: RandomPort;
@@ -41,12 +43,13 @@ export class FrameTooLargeError extends Error {
 	}
 }
 
-async function seal(ctx: FrameCtx, stream: StreamName, kind: EnvelopeKind, authorNsSeq: Seq, flags: number, sealedContent: Uint8Array, localContent: Uint8Array, state: "pending" | "held", dependsOn: ClientFrameId | null, nowMs: number): Promise<NewOutboxFrame> {
+/** frameNo is ≥ 1 for nsOps / cfgOps (allocated by the caller, e2ee-design §8.2) and 0 for every other kind. */
+async function seal(ctx: FrameCtx, stream: StreamName, kind: EnvelopeKind, authorNsSeq: Seq, flags: number, frameNo: number, sealedContent: Uint8Array, localContent: Uint8Array, state: "pending" | "held", dependsOn: ClientFrameId | null, nowMs: number): Promise<NewOutboxFrame> {
 	const clientFrameId = newClientFrameId(ctx.random);
-	const s = await sealFrame(ctx.crypto, ctx.vaultId, stream, clientFrameId, kind, authorNsSeq, flags, sealedContent);
+	const s = await sealFrame(ctx.crypto, ctx.vaultId, { stream, deviceId: ctx.self, clientFrameId, kind, authorNsSeq, flags, frameNo, content: sealedContent });
 	return {
 		clientFrameId, stream, kind, state, sealed: s.sealed, content: localContent, authorNsSeq, flags: s.flags & ~EnvelopeFlag.deflate,
-		dependsOn, adoptOf: null, createdAtMs: nowMs,
+		frameNo: frameNo === 0 ? null : frameNo, dependsOn, adoptOf: null, createdAtMs: nowMs,
 	};
 }
 
@@ -66,7 +69,7 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 	const kind: EnvelopeKind = cls === "canvas" ? "canvasUpdate" : "bodyUpdate";
 	const state = input.dependsOn ? "held" : "pending";
 	if (input.content.length <= MAX_INLINE_UPDATE_BYTES) {
-		return [await seal(ctx, input.stream, kind, input.authorNsSeq, input.flags, input.content, input.content, state, input.dependsOn, input.nowMs)];
+		return [await seal(ctx, input.stream, kind, input.authorNsSeq, input.flags, 0, input.content, input.content, state, input.dependsOn, input.nowMs)];
 	}
 	const hash = bytesToHex(await ctx.hash.sha256(input.content)) as ContentHash;
 	const refContent = encodeBodyUpdateRef({ hash, size: input.content.length });
@@ -75,7 +78,7 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 			const address = await ctx.crypto.blobAddress(hash);
 			const has = await ctx.blob.has([address]);
 			if (!has.has(address)) await ctx.blob.put(address, await ctx.crypto.sealBlob({ address, plaintext: input.content }));
-			return [await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, refContent, input.content, state, input.dependsOn, input.nowMs)];
+			return [await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, 0, refContent, input.content, state, input.dependsOn, input.nowMs)];
 		} catch {
 			// Blob store unavailable: fall through to the log path.
 		}
@@ -87,12 +90,12 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 	for (let i = 0; i < total; i++) {
 		const chunk = input.content.subarray(i * BLOB_CHUNK_BYTES, Math.min(input.content.length, (i + 1) * BLOB_CHUNK_BYTES));
 		const c = encodeBlobChunk({ hash, index: i, total, totalSize: input.content.length, chunk });
-		out.push(await seal(ctx, xs, "blobChunk", input.authorNsSeq, 0, c, c, "pending", null, input.nowMs));
+		out.push(await seal(ctx, xs, "blobChunk", input.authorNsSeq, 0, 0, c, c, "pending", null, input.nowMs));
 	}
 	// The ref waits for the last chunk (released when no own x: frame remains, DESIGN §e.1). An explicit
 	// ns-create / adoptable dependency takes precedence; it is re-pointed to the chunk when released.
 	const dep = input.dependsOn ?? out[out.length - 1]!.clientFrameId;
-	out.push(await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, refContent, input.content, "held", dep, input.nowMs));
+	out.push(await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, 0, refContent, input.content, "held", dep, input.nowMs));
 	return out;
 }
 
@@ -106,27 +109,27 @@ export async function buildAdoptFrame(
 ): Promise<NewOutboxFrame> {
 	const clientFrameId = newClientFrameId(ctx.random);
 	const f = flags | EnvelopeFlag.adopted;
-	const s = await sealFrame(ctx.crypto, ctx.vaultId, stream, clientFrameId, kind, authorNsSeq, f, content);
+	const s = await sealFrame(ctx.crypto, ctx.vaultId, { stream, deviceId: ctx.self, clientFrameId, kind, authorNsSeq, flags: f, frameNo: 0, content });
 	return {
 		clientFrameId, stream, kind, state: "adoptable", sealed: s.sealed, content, authorNsSeq, flags: s.flags & ~EnvelopeFlag.deflate,
-		dependsOn: null, adoptOf, createdAtMs: nowMs,
+		frameNo: null, dependsOn: null, adoptOf, createdAtMs: nowMs,
 	};
 }
 
-export async function buildNsFrame(ctx: FrameCtx, stream: StreamName, ops: readonly NsOp[], authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
+export async function buildNsFrame(ctx: FrameCtx, stream: StreamName, ops: readonly NsOp[], authorNsSeq: Seq, frameNo: number, nowMs: number): Promise<NewOutboxFrame> {
 	const content = encodeNsOps(ops);
-	return seal(ctx, stream, "nsOps", authorNsSeq, 0, content, content, "pending", null, nowMs);
+	return seal(ctx, stream, "nsOps", authorNsSeq, 0, frameNo, content, content, "pending", null, nowMs);
 }
 
-export async function buildCfgFrame(ctx: FrameCtx, stream: StreamName, ops: readonly CfgOp[], authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
+export async function buildCfgFrame(ctx: FrameCtx, stream: StreamName, ops: readonly CfgOp[], authorNsSeq: Seq, frameNo: number, nowMs: number): Promise<NewOutboxFrame> {
 	const content = encodeCfgOps(ops);
-	return seal(ctx, stream, "cfgOps", authorNsSeq, 0, content, content, "pending", null, nowMs);
+	return seal(ctx, stream, "cfgOps", authorNsSeq, 0, frameNo, content, content, "pending", null, nowMs);
 }
 
 /** One x:<hash> blobChunk frame (pending, no dependency). */
 export async function buildBlobChunkFrame(ctx: FrameCtx, chunk: BlobChunkContent, authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
 	const content = encodeBlobChunk(chunk);
-	return seal(ctx, blobChunkStream(chunk.hash), "blobChunk", authorNsSeq, 0, content, content, "pending", null, nowMs);
+	return seal(ctx, blobChunkStream(chunk.hash), "blobChunk", authorNsSeq, 0, 0, content, content, "pending", null, nowMs);
 }
 
 /** Split text into <= max UTF-16 unit chunks without cutting a surrogate pair. */

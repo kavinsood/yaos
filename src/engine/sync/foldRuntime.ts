@@ -12,9 +12,12 @@
  * Own frames are "pending" (overlaid on the committed fold) from T_edit until
  * the committed fold has them: while in the outbox, and after the receipt
  * removed the outbox record but before the row is folded (stale stream, halt).
+ *
+ * allocFrameNo() hands out the stream's own frameNos (e2ee-design §8.2).
  */
 
 import type { CheckpointEncoding } from "../../core/envelope";
+import { NS_DEDUPE_RING } from "../../core/limits";
 import { NS_CANDIDATE_INTERVAL, isCandidateSeq } from "../../core/ns/candidate";
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../../core/types";
 import type { Repo } from "../store/repo";
@@ -49,6 +52,7 @@ export interface FoldedFrame<Op, E> {
 export interface OwnPendingFrame<Op> {
 	readonly clientFrameId: ClientFrameId;
 	readonly authorNsSeq: Seq;
+	readonly frameNo: number;
 	readonly ops: readonly Op[];
 }
 
@@ -61,6 +65,12 @@ export abstract class FoldRuntime<Op, E> {
 	private busy: Promise<unknown> = Promise.resolve();
 	/** Own frames whose outbox record is gone (receipted) but whose row is not folded yet, in receipt order. */
 	private committedOwn: OwnPendingFrame<Op>[] = [];
+	/** Highest own frameNo seen outside the fold state and the outbox (tail above the fold, receipts, allocations). */
+	private ownFrameNoSeen = 0;
+	/** The first allocation of this runtime skips NS_DEDUPE_RING numbers (e2ee-design §8.2). */
+	private allocated = false;
+	/** Floor carried by epoch migration (meta frameNoFloor). */
+	frameNoFloor = 0;
 
 	constructor(
 		protected readonly repo: Repo,
@@ -81,6 +91,8 @@ export abstract class FoldRuntime<Op, E> {
 	protected abstract foldFrame(row: TailRecord, ops: readonly Op[]): { readonly events: readonly E[]; readonly halted: boolean };
 	/** Canonical encoding of the committed state (snapshot / checkpoint bytes). */
 	abstract encodeState(): Uint8Array;
+	/** This device's replay right edge R in the committed fold (0 = none). */
+	protected abstract ownReplayEdge(): number;
 
 	/** (Re)load from the snapshot and refold the tail. */
 	async load(): Promise<FoldedFrame<Op, E>[]> {
@@ -94,7 +106,8 @@ export abstract class FoldRuntime<Op, E> {
 			const rest = await this.repo.getTail(this.stream, this.coversSeq);
 			this.committedOwn = rest
 				.filter((r) => r.deviceId === this.self && !(r.flags & LOCAL_FLAG_UNOPENED))
-				.map((r) => ({ clientFrameId: r.clientFrameId, authorNsSeq: r.authorNsSeq, ops: this.decodeOps(r.content) ?? [] }));
+				.map((r) => ({ clientFrameId: r.clientFrameId, authorNsSeq: r.authorNsSeq, frameNo: r.frameNo ?? 0, ops: this.decodeOps(r.content) ?? [] }));
+			for (const f of this.committedOwn) this.seeFrameNo(f.frameNo);
 			return folded;
 		};
 		const p = this.busy.then(run, run);
@@ -151,8 +164,37 @@ export abstract class FoldRuntime<Op, E> {
 	/** The receipt removed an own outbox record of this stream: keep it pending until folded. */
 	noteCommitted(rec: OutboxRecord): void {
 		if (rec.stream !== this.stream || rec.state === "poisoned" || rec.content.length === 0) return;
+		this.seeFrameNo(rec.frameNo ?? 0);
 		if (this.committedOwn.some((f) => f.clientFrameId === rec.clientFrameId)) return;
-		this.committedOwn.push({ clientFrameId: rec.clientFrameId, authorNsSeq: rec.authorNsSeq, ops: this.decodeOps(rec.content) ?? [] });
+		this.committedOwn.push({ clientFrameId: rec.clientFrameId, authorNsSeq: rec.authorNsSeq, frameNo: rec.frameNo ?? 0, ops: this.decodeOps(rec.content) ?? [] });
+	}
+
+	private seeFrameNo(f: number): void {
+		if (f > this.ownFrameNoSeen) this.ownFrameNoSeen = f;
+	}
+
+	/**
+	 * Next own frameNo of this stream (e2ee-design §8.2): 1 + the highest own
+	 * frameNo known (fold R, own tail rows and receipts above the fold, the
+	 * outbox incl. poisoned, the epoch-migration floor, earlier allocations).
+	 * The first allocation of a runtime adds NS_DEDUPE_RING, skipping numbers
+	 * an in-flight frame may have used when IndexedDB was lost. Gaps are fine.
+	 */
+	allocFrameNo(outbox: OutboxCache): number {
+		let max = this.maxOwnFrameNo(outbox);
+		if (!this.allocated) {
+			max += NS_DEDUPE_RING;
+			this.allocated = true;
+		}
+		this.ownFrameNoSeen = max + 1;
+		return max + 1;
+	}
+
+	/** Highest own frameNo this runtime knows of (epoch migration carries it, §8.2). */
+	maxOwnFrameNo(outbox: OutboxCache): number {
+		let max = Math.max(this.ownReplayEdge(), this.ownFrameNoSeen, this.frameNoFloor);
+		for (const r of outbox.ofStream(this.stream)) max = Math.max(max, r.frameNo ?? 0);
+		return max;
 	}
 
 	/** Own frames not in the committed fold, in order: receipted-unfolded first, then the outbox (poisoned excluded). */
@@ -160,7 +202,7 @@ export abstract class FoldRuntime<Op, E> {
 		const out = [...this.committedOwn];
 		for (const r of outbox.ofStream(this.stream)) {
 			if (r.state === "poisoned" || r.content.length === 0) continue;
-			out.push({ clientFrameId: r.clientFrameId, authorNsSeq: r.authorNsSeq, ops: this.decodeOps(r.content) ?? [] });
+			out.push({ clientFrameId: r.clientFrameId, authorNsSeq: r.authorNsSeq, frameNo: r.frameNo ?? 0, ops: this.decodeOps(r.content) ?? [] });
 		}
 		return out;
 	}

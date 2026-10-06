@@ -5,9 +5,12 @@ import { CheckpointEncoding } from "../../core/envelope";
 import { FOLD_RULES_VERSION, MAX_FRAME_CONTENT_BYTES } from "../../core/limits";
 import { NS_STREAM, type ClientFrameId, type DeviceId, type StreamName, type VaultId } from "../../core/types";
 import { createNoopCrypto } from "../adapters/noopCrypto";
+import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
+import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
 import { createWebHash } from "../adapters/webHash";
 import { faultyCrypto } from "../runtime/testHarness";
 import { encodeBodyUpdateRef as encodeBodyRef, encodeCheckpointContent } from "../../core/codec/contents";
+import { encodeOuter, frameAad } from "../../core/codec/envelope";
 import { sealCheckpoint, sealFrame } from "./envelope";
 import { gate, type GateCtx, type GateResult } from "./gate";
 import { checkYjsUpdate } from "./yjsCheck";
@@ -20,7 +23,7 @@ const CF = "cf-1" as ClientFrameId;
 const DEV = "dev-x" as DeviceId;
 
 async function row(stream: StreamName, content: Uint8Array, kind: "bodyUpdate" | "canvasUpdate" | "bodyUpdateRef" | "nsOps" = stream.startsWith("c:") ? "canvasUpdate" : "bodyUpdate", cf = CF, c: GateCtx = ctx): Promise<GateResult> {
-	const s = await sealFrame(crypto, ctx.vaultId, stream, CF, kind, 0, 0, content);
+	const s = await sealFrame(crypto, ctx.vaultId, { stream, deviceId: DEV, clientFrameId: CF, kind, authorNsSeq: 0, flags: 0, frameNo: kind === "nsOps" ? 1 : 0, content });
 	return gate(c, { t: "row", stream, seq: 1, deviceId: DEV, clientFrameId: cf, payload: s.sealed });
 }
 function upd(fn: (d: Y.Doc) => void): Uint8Array {
@@ -109,11 +112,38 @@ test("gate: checkpoints (binding, encoding, size, structure)", async () => {
 	assert.ok(ok.ok && ok.t === "checkpoint");
 	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: BODY, coversSeq: 8, payload: await ck(7, CheckpointEncoding.yjsStateV1, state, 8) })), "checkpoint-mismatch");
 	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: BODY, coversSeq: 8, payload: await ck(7, CheckpointEncoding.yjsStateV1, state) })), "checkpoint-mismatch");
-	const asRow = await sealFrame(crypto, ctx.vaultId, BODY, CF, "bodyUpdate", 0, 0, state);
+	const asRow = await sealFrame(crypto, ctx.vaultId, { stream: BODY, deviceId: DEV, clientFrameId: CF, kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content: state });
 	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: BODY, coversSeq: 7, payload: asRow.sealed })), "kind-not-allowed", "a frame is not a checkpoint");
 	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: BODY, coversSeq: 7, payload: await ck(7, CheckpointEncoding.nsFoldV1, state) })), "kind-not-allowed");
 	const small = { ...ctx, maxCheckpointStateBytes: 4 };
 	assert.equal(failReason(await gate(small, { t: "checkpoint", stream: BODY, coversSeq: 7, payload: await ck(7, CheckpointEncoding.yjsStateV1, state) })), "oversize");
 	const bad = upd((d) => d.getMap("evil").set("k", 1));
 	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: BODY, coversSeq: 7, payload: await ck(7, CheckpointEncoding.yjsStateV1, bad) })), "disallowed-type");
+});
+
+test("gate: suite-1 failures map to quarantine reasons; only key-dependent ones are reader-dependent (e2ee-design §9.2)", async () => {
+	const vaultId = "AAAAAAAAAAAAAAAAAAAAAA" as VaultId;
+	const random = new ScriptedRandom();
+	const s1 = await createWebCryptoSuite1({ vaultId, random, keys: [{ e: 1, k: new Uint8Array(32).fill(1) }, { e: 2, k: new Uint8Array(32).fill(2) }] });
+	s1.markVerified(1);
+	s1.setSealEpoch(1);
+	const c1: GateCtx = { ...ctx, crypto: s1, vaultId };
+	const content = upd((d) => d.getText("text").insert(0, "x"));
+	random.push(new Uint8Array(12).fill(7), new Uint8Array(12).fill(8));
+	const s = await sealFrame(s1, vaultId, { stream: BODY, deviceId: DEV, clientFrameId: CF, kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content });
+	const at = (payload: Uint8Array, c = c1) => gate(c, { t: "row", stream: BODY, seq: 1, deviceId: DEV, clientFrameId: CF, payload });
+	const verdict = (r: GateResult) => (r.ok ? "ok" : `${r.reason}/${r.readerDependent}`);
+	const with_ = (i: number, v: number) => { const o = s.sealed.slice(); o[i] = v; return o; };
+	assert.equal(verdict(await at(s.sealed)), "ok");
+	const flipped = s.sealed.slice();
+	flipped[40]! ^= 1;
+	assert.equal(verdict(await at(flipped)), "crypto-auth/false", "bad tag under a verified key: the sender's fault");
+	assert.equal(verdict(await at(with_(2, 2))), "crypto-auth/true", "bad tag under an unverified key: maybe ours");
+	assert.equal(verdict(await at(with_(2, 9))), "crypto-unknown-key/true");
+	const plain = await sealFrame(crypto, vaultId, { stream: BODY, deviceId: DEV, clientFrameId: CF, kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content });
+	assert.equal(verdict(await at(plain.sealed)), "crypto-downgrade/false", "suite-0 bytes to a suite-1 reader");
+	assert.equal(verdict(await at(s.sealed, { ...ctx, vaultId })), "crypto-unknown-key/true", "suite-1 bytes to a suite-0 reader");
+	const header = { formatVersion: 1, suite: 1, keyEpoch: 1 } as const;
+	const unpadded = await s1.seal({ purpose: "frame", keyEpoch: 1, aad: frameAad(header, vaultId, BODY, DEV, CF), plaintext: new Uint8Array(256) });
+	assert.equal(verdict(await at(encodeOuter(header, unpadded))), "envelope-padding/false");
 });
