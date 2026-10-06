@@ -1,0 +1,27 @@
+src/host/ui/commands.test.ts
+  s_42fec8a9c03dda::t_e690e6caa48493 24-25,30,32-34,37-38
+src/host/ui/commands.ts
+  s_42fec8a9c03dda::t_9fb8f2b8623880 16-20,36-40
+src/host/ui/engineActions.ts
+  s_42fec8a9c03dda::t_ef654c0d07e279 1-35
+src/host/ui/registerUi.ts
+  s_42fec8a9c03dda::t_13abd04b998561 17,130-133
+src/host/ui/settingsTab.ts
+  s_42fec8a9c03dda::t_234ef568fa4c3f 16,374-375,379
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f236cbe8e6c96fd77996367f9770ac9d1a06a78f",
+  "prompts": {},
+  "sessions": {
+    "s_42fec8a9c03dda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab7f16ac97bca1a6d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
