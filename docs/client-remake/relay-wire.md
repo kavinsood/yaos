@@ -471,8 +471,8 @@ cannot check this.
 | Group commit | 300 ms idle / 1500 ms max / 64 KiB; 20 ms leading edge after 1500 ms without a commit |
 | Ticket TTL | 5 min |
 | Pairing code TTL | 15 min |
-| Blob body | 10 MiB (`maxBlobUploadBytes`); `exists` answers 50 addresses (§11.3) |
-| Blob GC | list page 1000 items; list and delete together 60 requests/min per vault (§11.3.1) |
+| Blob body | 10 MiB (`maxBlobUploadBytes`); `exists` takes at most 50 addresses (§11.3) |
+| Blob GC | list page 1000 items; batch delete 1–100 addresses; list and delete together 60 requests/min per vault (§11.3.1) |
 
 Env overrides (Worker vars, integer strings):
 
@@ -509,15 +509,16 @@ then `capabilities.attachments` is `true`. Every blob route takes the device bea
 |---|---|---|
 | `PUT /vault/:id/blobs/<address>` | body 1 B to `maxBlobUploadBytes` (10 MiB) | `204`; `413 body_too_large`; `400 missing_body`; `400 invalid_content_length` |
 | `GET /vault/:id/blobs/<address>` | | `200` the bytes as `application/octet-stream` with `X-Content-Type-Options: nosniff`; `404 {"error":"not found"}` |
-| `POST /vault/:id/blobs/exists` | `{"hashes":[<address>, ...]}`, body ≤ 64 KiB | `200 {"present":[...]}`: the stored addresses among the first 50 entries, in request order |
-| `GET /vault/:id/blobs?cursor=<next>` | blob GC, §11.3.1 | `200 {"items":[{"address","uploadedAt"}],"next"}` |
-| `DELETE /vault/:id/blobs/<address>?ifUploadedBefore=<ms>` | blob GC, §11.3.1 | `200 {"result":"deleted"\|"newer"\|"absent","uploadedAt"?}` |
+| `POST /vault/:id/blobs/exists` | `{"hashes":[<address>, ...]}`, at most 50, body ≤ 64 KiB | `200 {"present":[...]}`: the stored addresses, in request order |
+| `GET /vault/:id/blobs?cursor=<next>` | blob GC, §11.3.1 | `200 {"items":[{"address","uploadedAt"}],"next"}`; `503 list_incomplete` |
+| `POST /vault/:id/blobs/delete` | blob GC, §11.3.1: `{"ifUploadedBefore":<ms>,"addresses":[<address>, ...]}`, 1 to 100, body ≤ 16 KiB | `200 {"results":[{"address","result":"deleted"\|"newer"\|"absent","uploadedAt"?}]}` |
 
 Checks, in order, on every blob route:
 
 1. No bucket: `503 attachments_unavailable`. The client must then treat attachments as unavailable (the client-e2e
    deployment runs without R2, which matches the Free-plan profile).
-2. Format: `400 invalid_address` for a malformed `<address>`, the PUT size checks, and the GC query checks below.
+2. Format: `400 invalid_address` for a malformed `<address>`, the PUT size checks, and the GC cursor and delete-body
+   checks below. (The `exists` body is read after the bearer check.)
 3. Bearer: `401 unauthorized` (an unknown vault too, §2.7); `503 restore_in_progress` with `Retry-After` during a
    restore.
 4. GC routes only: the request limit, `429 too_many_attempts` (§11.3.1).
@@ -527,42 +528,60 @@ Checks, in order, on every blob route:
 - Every entry of `hashes` must be an address. One that is not (a non-string, upper case, the wrong length) makes the
   whole request `400 invalid_address`. It is never reported as absent, so a client addressing bug fails loudly
   instead of re-uploading forever.
-- Only the first 50 entries are answered; send batches of at most 50.
+- At most 50 entries. More is `400 too_many_addresses`, with no R2 call, never an answer for the first 50; send
+  batches of at most 50.
 - Other errors: `400 "invalid json"`, `400 "missing hashes array"`, `413 body_too_large`.
 
 #### 11.3.1 Blob garbage collection
 
 The server cannot tell which blobs a vault still references (under E2EE it sees only opaque addresses), so blob GC
-is the client's mark-and-sweep. These two routes are the server's part. They are a cold path: a sweep runs on one
-device, on a user command or at most monthly.
+is the client's mark-and-sweep. The list and the batch delete are the server's part. They are a cold path: a sweep
+runs on one device, on a user command or at most monthly.
 
 - **List.** `GET /vault/:id/blobs` lists the vault's blobs in address order (lexicographic), at most **1000** items
-  a page (R2's `list` maximum, one R2 list call a page, about 90 KiB of JSON).
+  a page (R2's `list` maximum, usually one R2 list call a page, about 90 KiB of JSON).
   - `uploadedAt` is R2's upload time of the object, in ms since the Unix epoch. A PUT overwrite refreshes it.
   - `next` is the cursor of the following page, or `null` after the last page. Treat it as opaque and send it back
     unchanged as `?cursor=`. An absent or empty `cursor` asks for the first page; a malformed one is
     `400 invalid_cursor`.
   - Only `next: null` ends the walk; do not infer the end from a short page.
+  - R2 may answer a list call truncated with fewer objects than asked, even none. On an empty truncated answer the
+    server keeps listing in the same request with R2's own cursor, up to **10** R2 list calls, until it has items
+    or the listing ends. So a page may be short, or empty with `next: null` at the end. If 10 calls bring nothing
+    while R2 still says truncated, the answer is `503 {"error":"list_incomplete"}` with `Retry-After: 5`: send the
+    same cursor again after that long. `next` is never `null` while R2 says the listing is truncated.
   - Deleting listed blobs between pages (the sweep does) skips nothing. A blob PUT during the walk may or may not
     be listed.
-- **Conditional delete.** `DELETE /vault/:id/blobs/<address>?ifUploadedBefore=<ms>`: the server reads the object's
-  upload time (R2 `head`) and deletes it only if that time is strictly before `ifUploadedBefore`.
-  - `{"result":"deleted","uploadedAt":<ms>}`: it was older; it is gone.
-  - `{"result":"newer","uploadedAt":<ms>}`: uploaded at or after the cutoff, for example re-uploaded during the
-    sweep; it is kept.
-  - `{"result":"absent"}`: there is no such blob.
-  - `ifUploadedBefore` is required: decimal digits only, a safe integer (0 to 2^53 − 1). Anything else is
-    `400 invalid_if_uploaded_before`.
-  - R2 has no conditional delete. A PUT that lands between the server's `head` and `delete` (one R2 round trip) is
-    deleted. The sweep's grace period (E2EE design §10.4: only blobs listed as uploaded more than 7 days ago) keeps
-    the window to re-uploads of long-orphaned bytes.
-- **Limit.** List and delete share **60 requests a minute per vault**, counted in the vault DO in memory (a restarted
-  vault DO starts a fresh window). Only requests with a valid bearer count, and a refused one does not. Over the
-  limit: `429 {"error":"too_many_attempts"}` with `Retry-After` in seconds; wait that long. PUT, GET and `exists`
-  are not limited.
-- **Cost.** Each GC request is one vault-DO request plus one R2 operation (list: Class A; head: Class B; delete:
-  free). A sweep of a vault with N blobs and D orphans costs about N/1000 + D requests and takes at least that many
-  seconds at the limit.
+- **Batch conditional delete.** `POST /vault/:id/blobs/delete` with
+  `{"ifUploadedBefore": <ms>, "addresses": [<address>, ...]}`. The server reads each object's upload time (R2 `head`,
+  at most 6 in flight, the Workers limit on simultaneous open connections), then deletes the objects uploaded strictly
+  before `ifUploadedBefore` in one R2 `delete` call.
+  - The answer is `200 {"results":[...]}`, one entry per address, in request order:
+    - `{"address":…,"result":"deleted","uploadedAt":<ms>}`: it was older; it is gone.
+    - `{"address":…,"result":"newer","uploadedAt":<ms>}`: uploaded at or after the cutoff, for example re-uploaded
+      during the sweep; it is kept.
+    - `{"address":…,"result":"absent"}`: there is no such blob.
+  - The body is checked before the bearer and before any R2 call. One bad field refuses the whole call and nothing is
+    deleted:
+    - a body over 16 KiB: `413 body_too_large`; not a JSON object: `400 invalid_json`;
+    - `addresses` missing, not an array or empty: `400 invalid_addresses`; more than 100: `400 too_many_addresses`;
+    - an entry that is not an address: `400 invalid_address`; the same address twice: `400 duplicate_address`;
+    - `ifUploadedBefore` missing or not a JSON integer from 0 to 2^53 − 1: `400 invalid_if_uploaded_before`.
+    - Unknown fields are ignored.
+  - A call is one request against the limit below, whatever its size. It is at most 100 heads, 1 delete and 1
+    vault-DO call: 102 subrequests to Cloudflare services, within the Workers Free budget of 1000 per invocation
+    (https://developers.cloudflare.com/workers/platform/limits/#subrequests), and none external.
+  - R2 has no conditional delete. All heads run before the one delete, so a PUT that lands after an address's head
+    and before the delete (at most 17 rounds of 6 heads, then the delete) is deleted, and its result still says
+    `deleted`. The sweep's grace period (E2EE design §10.4: only blobs listed as uploaded more than 7 days ago) keeps
+    the window to re-uploads of long-orphaned bytes; the client handles it.
+- **Limit.** List and batch delete share **60 requests a minute per vault**, counted in the vault DO in memory (a
+  restarted vault DO starts a fresh window). A batch delete of up to 100 addresses is one request. Only requests
+  with a valid bearer count, and a refused one does not. Over the limit: `429 {"error":"too_many_attempts"}` with
+  `Retry-After` in seconds; wait that long. PUT, GET and `exists` are not limited.
+- **Cost.** A list request is one vault-DO request plus usually one R2 list (Class A). A batch delete is one
+  vault-DO request plus one R2 head (Class B) per address and one R2 delete (free). A sweep of a vault with N blobs
+  and D orphans costs about N/1000 + D/100 requests and takes at least that many seconds at the limit.
 
 ### 11.4 Cloudflare Free-plan daily limit
 
