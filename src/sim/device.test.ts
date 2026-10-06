@@ -117,6 +117,36 @@ test("engine killed mid-typing loses nothing (re-attach with the durable base af
 	assert.equal(va.getText(), "start one two three");
 });
 
+test("engine restart with a dirty view, then a second view loads the older disk text: the edit survives (sim seed 62)", async () => {
+	const { clock, devs } = world();
+	const a = dev(devs, 0);
+	const b = dev(devs, 1);
+	a.vault.userWrite("a.md", "start [Z]\n");
+	await boot(clock, devs);
+	await clock.advance(2_000);
+	const va = a.workspace.openFile("a.md");
+	assert.ok(va);
+	await clock.advance(500);
+	va.edit(6, 0, "[A] "); // typed, not saved yet (2 s debounce)
+	await clock.advance(400);
+	va.edit(10, 3, ""); // and deleted the seed token
+	await clock.advance(400); // pushed, framed, committed, on the relay
+	assert.equal(a.vault.textOf("a.md"), "start [Z]\n", "the editor has not saved");
+	a.crashEngine();
+	// While the engine restarts, a second view of the file loads what is on disk. The re-bind of the dirty view
+	// must tell the engine which text is on disk (`saved`), or the second view's older text reads as an edit
+	// against the first view's unsaved one and reverts it.
+	const vb = a.workspace.openFile("a.md");
+	assert.ok(vb);
+	await clock.advance(10_000);
+	assert.equal(a.engineStarts, 2);
+	const want = "start [A] \n";
+	assert.equal(a.engineText("a.md"), want);
+	assert.equal(va.getText(), want);
+	assert.equal(vb.getText(), want);
+	assert.equal(b.vault.textOf("a.md"), want);
+});
+
 test("worker storage failure falls back to inline and still syncs (OR-1 fallback)", async () => {
 	const { clock, devs } = world({ workerMode: "storage-fails" });
 	const a = dev(devs, 0);

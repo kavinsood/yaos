@@ -667,7 +667,9 @@ cold ──load──▶ resident ──bind──▶ bound
   - This is the only whole-editor read on main, and it never runs per keystroke or per workspace event. It happens
     at the first bind and at a re-bind (after a resync or an engine restart).
     - At a re-bind, main also uploads the restart base: the mirror's last durable text.
-    - At the first bind of a dirty view, it also uploads the text Obsidian last saved (`saved`).
+    - At every bind of a dirty view, it also uploads the text Obsidian last saved (`saved`). The engine has no disk
+      text for the doc after a restart; taking the editor's unsaved text for it would turn a sibling view's older
+      disk text into an edit that reverts the unsaved one (sim seed 62, sim/device.test.ts).
   - `bodyAttach{docId, viewId, editor, base, saved}` names the uploads. The user keeps typing meanwhile. Edits made
     after the upload stay in the view client as `pre`.
 - **Bind-time merge, in the worker** (boundBody.attach). If the upload differs from the replica's text, the worker

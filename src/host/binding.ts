@@ -6,7 +6,7 @@
  * entries applied as CodeMirror transactions outside the undo history.
  *
  * Whole texts cross only at a bind (first open, re-open after a resync or an engine restart: the editor text,
- * plus the merge base when there is one) and when Obsidian pushes text into a bound view (an external reload,
+ * plus the merge base when there is one, plus the text Obsidian last saved when the editor is dirty) and when Obsidian pushes text into a bound view (an external reload,
  * a properties edit, an unbound view's quick preview): uploaded as transferred UTF-16 chunks of
  * TEXT_CHUNK_UNITS with a yield between chunks. The worker compares, merges and diffs; main never does.
  *
@@ -428,14 +428,16 @@ export class BindingManager {
 			this.idle(slot, "idle");
 			return;
 		}
-		const first = doc.slots.size === 0 && doc.mirror === null;
 		Object.assign(slot, { binding, client, doc, state: "attaching", attachPosted: false });
 		doc.slots.add(slot);
 		this.intercept(slot);
 		const editor = binding.doc();
 		slot.attachDoc = editor;
 		const base = this.bases.get(info.docId) ?? null;
-		const saved = first && base === null && view.isDirty() ? view.lastSavedText() : null;
+		// Every bind of a dirty view says what is on disk: after an engine restart the engine has no disk text for
+		// the doc, and taking this editor's unsaved text for it would turn a sibling view's (older) disk text into
+		// an edit that reverts this one (sim seed 62).
+		const saved = view.isDirty() ? view.lastSavedText() : null;
 		const alive = () => slot.seq === seq && slot.client === client;
 		const editorId = await this.upload(ofText(editor), alive);
 		const baseId = base && editorId !== null ? await this.upload(ofText(base), alive) : null;
