@@ -1,0 +1,29 @@
+src/engine/compose/passScheduler.test.ts
+  s_5ec5b8c6943789::t_a7dc06155aaf7c 10
+src/engine/reconcile/diskJobs.ts
+  s_5ec5b8c6943789::t_43ae3313b455c0 20-21
+src/engine/reconcile/intents.ts
+  s_5ec5b8c6943789::t_fa3dd887e6d165 85-86,89
+src/engine/reconcile/mergeJob.ts
+  s_5ec5b8c6943789::t_da5214ab07c03d 18-22,156-157,162,170
+src/engine/reconcile/reconciler.basic.test.ts
+  s_5ec5b8c6943789::t_6f0e21a0633f25 160-209
+src/engine/reconcile/runner.ts
+  s_5ec5b8c6943789::t_6a2cd39a836e94 15,33-34,84,91-94,160
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "260886ef24a4461f9383d2c38d17c9433a06095d",
+  "prompts": {},
+  "sessions": {
+    "s_5ec5b8c6943789": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad23e7dffd5cd7d1b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
