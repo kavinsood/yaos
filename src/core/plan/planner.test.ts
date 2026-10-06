@@ -329,6 +329,9 @@ test("row live/absent/absent: materialize once caught up and (hasContent or empt
 	assert.deepEqual(run({ remote: [R("d1", "a.md", { body: { ...body, hasContent: false } })] }).ops, [{ op: "wait", docId: "d1", reason: "body-empty" }]);
 	assert.deepEqual(opsOf(run({ remote: [R("d1", "a.md", { createHash: EMPTY_CONTENT_HASH, body: { ...body, hasContent: false } })] })), ["diskMaterialize"]);
 	assert.deepEqual(opsOf(run({ remote: [R("d9", "i.png")] })), ["diskMaterialize"]);
+	// live only through an own pending op (restore duty, no S): wait for the fold to place it
+	assert.deepEqual(run({ remote: [R("d1", "a (2).md", { pendingLocal: true })] }).ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }]);
+	assert.deepEqual(run({ remote: [R("d9", "i.png", { pendingLocal: true })] }).ops, [{ op: "wait", docId: "d9", reason: "pending-ns" }]);
 });
 
 // ---------------------------------------------------------------------------

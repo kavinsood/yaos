@@ -502,6 +502,9 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		if (l?.excluded) return;
 		if (r.body?.frozen) return push([waitOp(docId, "frozen")]);
 		if (!l) {
+			// Live only through an own op not yet folded (a restore with no synced record here): its path is the
+			// overlay's guess, and S1 puts S on the requested path at fold. Materialize the committed placement.
+			if (r.pendingLocal) return push([waitOp(docId, "pending-ns")]);
 			if (r.kind === "blob") return push([{ op: "diskMaterialize", docId, path: r.path, expect: { t: "absent" } }]);
 			if (!r.body || !r.body.caughtUp) return push([waitOp(docId, "body-not-caught-up")]);
 			if (r.body.hasContent || r.createHash === EMPTY_CONTENT_HASH) return push([{ op: "diskMaterialize", docId, path: r.path, expect: { t: "absent" } }]);
