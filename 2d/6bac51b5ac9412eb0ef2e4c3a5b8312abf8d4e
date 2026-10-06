@@ -1,0 +1,35 @@
+src/core/plan/conflictName.ts
+  s_441b74abbd0702::t_cfdc48e3736c35 105-111
+src/engine/reconcile/blobJobs.ts
+  s_441b74abbd0702::t_fd16fe863f990b 58
+src/engine/reconcile/contentSteps.ts
+  s_441b74abbd0702::t_6d84b35d6cd724 61
+src/engine/reconcile/context.ts
+  s_441b74abbd0702::t_05434dc4c89555 12,97,184-198
+src/engine/reconcile/reconciler.basic.test.ts
+  s_441b74abbd0702::t_1fc27dccf41dee 92-115
+src/engine/reconcile/reconciler.brakes.test.ts
+  s_441b74abbd0702::t_e672f5605a918e 140-142
+src/engine/reconcile/reconciler.ts
+  s_441b74abbd0702::t_88d00b2ed101c5 121-123,204
+src/host/binding.test.ts
+  s_441b74abbd0702::t_7caaa19a2d7e61 192
+src/host/binding.ts
+  s_441b74abbd0702::t_5eeb169c1ece2c 44,634
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2d6bac51b5ac9412eb0ef2e4c3a5b8312abf8d4e",
+  "prompts": {},
+  "sessions": {
+    "s_441b74abbd0702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5b78666751a5e84f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
