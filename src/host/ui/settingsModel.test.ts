@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	applyControl, CONTROL_KEYS, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused,
-	parseExcludePatterns, phaseLabel, readControl, runStateLabel, TRASH_MODE_OPTIONS, validateControl,
+	parseExcludePatterns, phaseLabel, readControl, runStateLabel, serverConsoleUrl, TRASH_MODE_OPTIONS, validateControl,
 } from "./settingsModel";
 import { defaultPluginData, MIB, sanitizePluginData, TRASH_MODES, type PairedIdentity } from "./api";
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
@@ -106,6 +106,16 @@ test("connectionRows mask the device token and never show it", () => {
 	assert.deepEqual(rows.map((r) => r.name), ["Server", "Vault ID", "Device name", "Device token"]);
 	assert.equal(rows[3]?.value, "••••••••••••");
 	assert.equal(connectionRows(null).length, 1);
+});
+
+test("serverConsoleUrl: the stored host's origin over http(s), else null", () => {
+	assert.equal(serverConsoleUrl(IDENTITY), "https://sync.example.com/");
+	assert.equal(serverConsoleUrl({ ...IDENTITY, host: "https://sync.example.com/sub/path?q=1#frag" }), "https://sync.example.com/");
+	assert.equal(serverConsoleUrl({ ...IDENTITY, host: "http://127.0.0.1:8787" }), "http://127.0.0.1:8787/");
+	for (const host of ["javascript:alert(1)", "file:///etc/passwd", "obsidian://yaos", "not a url", "", "https://user:pw@sync.example.com"]) {
+		assert.equal(serverConsoleUrl({ ...IDENTITY, host }), null, host);
+	}
+	assert.equal(serverConsoleUrl(null), null);
 });
 
 function snap(phase: EnginePhase, over: Partial<StatusSnapshot> = {}): StatusSnapshot {

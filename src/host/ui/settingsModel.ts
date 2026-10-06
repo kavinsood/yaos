@@ -171,6 +171,23 @@ export function connectionRows(identity: PairedIdentity | null): InfoRow[] {
 	];
 }
 
+/**
+ * The server's operator console: its home page (relay2 server/src/index.ts:178 routes GET / to the
+ * console or its login), from the stored host. http(s) only; null when unpaired or the host is not
+ * such a URL. The old client opened the host as typed (adfa7a7:src/main.ts:3476-3483).
+ */
+export function serverConsoleUrl(identity: PairedIdentity | null): string | null {
+	if (!identity) return null;
+	let url: URL;
+	try {
+		url = new URL(identity.host);
+	} catch {
+		return null;
+	}
+	if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) return null;
+	return `${url.origin}/`;
+}
+
 export function runStateLabel(run: EngineRunState): string {
 	switch (run.phase) {
 		case "unpaired": return "Not paired";

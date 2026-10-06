@@ -19,7 +19,7 @@ import { errorMessage } from "./format";
 import { clearIdentity } from "./pairFlow";
 import {
 	applyControl, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused, MAX_ATTACHMENT_MB,
-	readControl, TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
+	readControl, serverConsoleUrl, TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
 	type ControlKey, type SettingsSeed,
 } from "./settingsModel";
 import type { UserCommand } from "../../protocol/messages";
@@ -110,6 +110,12 @@ export class YaosSettingTab extends PluginSettingTab {
 				desc: "Create a one-time code and setup link for your other device.",
 				visible: paired,
 				action: () => this.actions.openPairAnother(),
+			},
+			{
+				name: "Open server console",
+				desc: "Open your server's console in a browser to see this vault's devices. The operator key stays in the console.",
+				visible: paired,
+				action: () => this.openServerConsole(),
 			},
 			{
 				name: "Unpair this device",
@@ -396,6 +402,12 @@ export class YaosSettingTab extends PluginSettingTab {
 			new Notice(`YAOS: ${errorMessage(err)}`, 8000);
 		}
 		this.refreshLiveNow();
+	}
+
+	private openServerConsole(): void {
+		const url = serverConsoleUrl(this.host.data().identity);
+		if (url) window.open(url, "_blank", "noopener");
+		else new Notice("YAOS: the stored server address is not a web address. Pair this device again.", 8000);
 	}
 
 	private async unpair(): Promise<void> {
