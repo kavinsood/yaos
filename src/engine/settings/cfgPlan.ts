@@ -14,7 +14,12 @@
  * register names them; data.json is written only when the installed manifest
  * version equals the register's pluginVersion and is emitted only with a known
  * local version; data.json is never deleted or fileDel'd; enabling a plugin is
- * projected only when it is installed; YAOS's own enablement is never touched.
+ * projected only when it is installed (on mobile, not when its manifest is
+ * isDesktopOnly); YAOS's own enablement is never touched.
+ *
+ * preferLocal ("use this device's settings" when settings sync is turned on):
+ * with no base yet, a value this device has wins over the view's; what only the
+ * view has (a key, an enabled plugin, a file this device lacks) is still taken.
  *
  * Size caps (core/limits CFG_MAX_*): a file whose local or incoming content is
  * over CFG_MAX_FILE_BYTES is held. In path order, the first file that would take
@@ -29,7 +34,7 @@ import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
 import { CFG_MAX_FILE_BYTES, CFG_MAX_FILES, CFG_MAX_TOTAL_BYTES } from "../../core/limits";
 import type { CfgFoldState, CfgOp, CfgRegister, ConfigRelPath, ContentHash, DiskFingerprint } from "../../core/types";
 import type { CfgBaseRecord } from "../store/schema";
-import { CFG_INLINE_MAX_BYTES, CFG_PLUGINS_FILE, canApplyPluginData, cfgJsonKey, classifyConfigPath, isDeviceLocalKey, isSyncablePluginId, type CfgFileClass } from "./allowlist";
+import { CFG_INLINE_MAX_BYTES, CFG_PLUGINS_FILE, canApplyPluginData, classifyConfigPath, isDeviceLocalKey, isSyncablePluginId, type CfgFileClass } from "./allowlist";
 
 export interface CfgLocalFile { readonly bytes: Uint8Array; readonly mtimeMs: number }
 export interface CfgLocalSnapshot {
@@ -39,6 +44,8 @@ export interface CfgLocalSnapshot {
 	readonly installed: ReadonlyMap<string, string | null>;
 	/** Installed community plugins: id -> manifest display name, when it has one. */
 	readonly pluginNames: ReadonlyMap<string, string>;
+	/** Installed community plugins whose manifest says isDesktopOnly. */
+	readonly desktopOnly: ReadonlySet<string>;
 	/** Allowlisted local files left out by the size caps (not in `files`): never emitted, written or deleted. */
 	readonly held: ReadonlyMap<ConfigRelPath, CfgHoldReason>;
 }
@@ -47,6 +54,10 @@ export interface CfgPlanInput {
 	readonly base: ReadonlyMap<ConfigRelPath, CfgBaseRecord>;
 	readonly view: CfgFoldState;
 	readonly nowMs: number;
+	/** This device is mobile: desktop-only plugins are not enabled here. */
+	readonly mobile: boolean;
+	/** No base yet: this device's values win (see the header). */
+	readonly preferLocal: boolean;
 }
 export type CfgWrite =
 	| { readonly t: "bytes"; readonly bytes: Uint8Array }
@@ -68,9 +79,10 @@ export interface CfgFileAction {
 export type CfgHoldReason = "too-large" | "over-cap";
 /**
  * plugin-version: data.json written by another version than the installed one; plugin-absent: data.json of a
- * plugin not installed here; no-manifest: local data.json of a plugin whose manifest has no version.
+ * plugin not installed here; no-manifest: local data.json of a plugin whose manifest has no version;
+ * desktop-only: a plugin enabled elsewhere that this mobile device does not run.
  */
-export type CfgSkipReason = "unparseable" | "plugin-version" | "plugin-absent" | "no-manifest" | "not-installed" | "data-json-delete" | CfgHoldReason;
+export type CfgSkipReason = "unparseable" | "plugin-version" | "plugin-absent" | "no-manifest" | "not-installed" | "desktop-only" | "data-json-delete" | CfgHoldReason;
 export interface CfgPlan {
 	readonly actions: readonly CfgFileAction[];
 	readonly skipped: readonly { readonly file: ConfigRelPath; readonly key: string | null; readonly reason: CfgSkipReason }[];
@@ -125,9 +137,10 @@ export function planCfg(input: CfgPlanInput): CfgPlan {
 			skipped.push({ file, key: null, reason: held });
 			continue;
 		}
-		const ctx: FileCtx = { file, local: input.local.files.get(file), base: input.base.get(file), nowMs: input.nowMs, skipped: [] };
+		const base = input.base.get(file);
+		const ctx: FileCtx = { file, local: input.local.files.get(file), base, firstContact: base === undefined && !input.preferLocal, nowMs: input.nowMs, skipped: [] };
 		const a = cls.t === "json" ? planJson(ctx, jsonByFile.get(file) ?? new Map())
-			: cls.t === "plugins" ? planPlugins(ctx, input.view, input.local.installed)
+			: cls.t === "plugins" ? planPlugins(ctx, input.view, input.local, input.mobile)
 			: planFile(ctx, cls, input.view, input.local.installed);
 		const w = a?.write;
 		const after = !w ? ctx.local?.bytes.length ?? null : w.t === "bytes" ? w.bytes.length : w.t === "blob" ? w.size : null;
@@ -145,6 +158,8 @@ interface FileCtx {
 	readonly file: ConfigRelPath;
 	readonly local: CfgLocalFile | undefined;
 	readonly base: CfgBaseRecord | undefined;
+	/** No base and not preferLocal: a register in the view wins over the local value. */
+	readonly firstContact: boolean;
 	readonly nowMs: number;
 	readonly skipped: Skips;
 }
@@ -209,7 +224,7 @@ function planJson(ctx: FileCtx, regs: ReadonlyMap<string, CfgRegister<string>>):
 			if (hL) hashes[key] = hL;
 			continue;
 		}
-		if (reg && (missing || hL === B || ctx.base === undefined)) {
+		if (reg && (missing || hL === B || ctx.firstContact)) {
 			if (reg.value === null) obj.delete(key);
 			else obj.set(key, JSON.parse(reg.value) as unknown);
 			if (hF) hashes[key] = hF;
@@ -223,7 +238,7 @@ function planJson(ctx: FileCtx, regs: ReadonlyMap<string, CfgRegister<string>>):
 	return finish(ctx, ops, next, hashes);
 }
 
-function planPlugins(ctx: FileCtx, view: CfgFoldState, installed: ReadonlyMap<string, string | null>): CfgFileAction | null {
+function planPlugins(ctx: FileCtx, view: CfgFoldState, local: CfgLocalSnapshot, mobile: boolean): CfgFileAction | null {
 	const missing = ctx.local === undefined;
 	const parsed = missing ? [] : parseJson(ctx.local!.bytes);
 	if (!Array.isArray(parsed) || !parsed.every((x) => typeof x === "string")) {
@@ -247,9 +262,10 @@ function planPlugins(ctx: FileCtx, view: CfgFoldState, installed: ReadonlyMap<st
 			if (lv) hashes[id] = H_TRUE;
 			continue;
 		}
-		if (reg && (missing || lv === bv || ctx.base === undefined)) {
-			if (fv && !installed.has(id)) {
-				ctx.skipped.push({ file: ctx.file, key: id, reason: "not-installed" });
+		if (reg && (missing || lv === bv || ctx.firstContact)) {
+			const hold = !fv ? null : !local.installed.has(id) ? "not-installed" : mobile && local.desktopOnly.has(id) ? "desktop-only" : null;
+			if (hold) {
+				ctx.skipped.push({ file: ctx.file, key: id, reason: hold });
 				if (bv) hashes[id] = H_TRUE;
 				continue;
 			}
@@ -281,7 +297,7 @@ function planFile(ctx: FileCtx, cls: CfgFileClass, view: CfgFoldState, installed
 		({ file: ctx.file, ops: [], upload: null, write: null, expect: L, reload: false, ...a });
 	if (L === hF) return act({ base: base(L, lb?.length ?? 0, ctx.local?.mtimeMs ?? ctx.nowMs) });
 	const B = ctx.base?.fingerprint ?? null;
-	if (reg && ((ctx.base !== undefined && L === B) || ctx.base === undefined)) {
+	if (reg && (L === B || ctx.firstContact)) {
 		if (!F) {
 			if (isData) { ctx.skipped.push({ file: ctx.file, key: null, reason: "data-json-delete" }); return null; }
 			return act({ write: { t: "remove" }, base: null, reload });

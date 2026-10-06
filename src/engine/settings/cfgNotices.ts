@@ -4,7 +4,7 @@
  * currently held in it, coalesced with a count. `items` identify the holds:
  * CfgSync shows a category again only when it gains an item, so a steady hold is
  * shown once. Skips the user cannot act on (data.json of a plugin not installed
- * here, a remote data.json delete) stay silent.
+ * here, a desktop-only plugin on mobile, a remote data.json delete) stay silent.
  */
 import { CFG_MAX_FILE_BYTES, CFG_MAX_FILES, CFG_MAX_TOTAL_BYTES } from "../../core/limits";
 import type { CfgFoldState, ConfigRelPath } from "../../core/types";
@@ -124,6 +124,7 @@ export function cfgSkipNotices(plan: CfgPlan, local: CfgLocalSnapshot, view: Cfg
 				overCap.push({ key: f, short: f, long: `${capPrefix}; ${f} is past that limit and is not synced. Remove settings files you do not need to sync the rest.` });
 				break;
 			case "plugin-absent":
+			case "desktop-only":
 			case "data-json-delete":
 				break;
 		}

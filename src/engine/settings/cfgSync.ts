@@ -49,6 +49,13 @@ export interface CfgSyncDeps {
 	readonly blobs: BlobTransfer | null;
 	readonly clock: ClockPort;
 	readonly notice?: (level: "info" | "warn", code: string, detail?: string) => void;
+	/** This device is mobile (PlatformInfo.isMobile): desktop-only plugins are not enabled here. */
+	readonly mobile?: boolean;
+	/**
+	 * The user's answer when turning settings sync on (EngineSettings.syncSettingsSeed). "device": while cfgBase
+	 * is empty (the first pass on this device), this device's values win over the vault's. Default "vault".
+	 */
+	readonly seed?: "device" | "vault";
 }
 
 export interface CfgPassResult {
@@ -79,6 +86,7 @@ export async function snapshotConfig(config: ConfigDirPort): Promise<CfgLocalSna
 	const files = new Map<ConfigRelPath, CfgLocalFile>();
 	const installed = new Map<string, string | null>();
 	const pluginNames = new Map<string, string>();
+	const desktopOnly = new Set<string>();
 	const held = new Map<ConfigRelPath, CfgHoldReason>();
 	const stats = new Map<string, { readonly size: number; readonly mtimeMs: number }>();
 	const read = async (path: string): Promise<void> => {
@@ -112,6 +120,7 @@ export async function snapshotConfig(config: ConfigDirPort): Promise<CfgLocalSna
 		const m = readManifest(manifest, decode);
 		installed.set(id, m.version);
 		if (m.name) pluginNames.set(id, m.name);
+		if (m.desktopOnly) desktopOnly.add(id);
 		await read(`${p.path}/data.json`);
 	}
 	const budget = new CfgBudget();
@@ -120,7 +129,7 @@ export async function snapshotConfig(config: ConfigDirPort): Promise<CfgLocalSna
 		files.delete(path);
 		held.set(path, "over-cap");
 	}
-	return { files, installed, pluginNames, held };
+	return { files, installed, pluginNames, desktopOnly, held };
 }
 
 export class CfgSync {
@@ -145,7 +154,8 @@ export class CfgSync {
 		const rows = await db.tx([STORE.cfgBase], "readonly", (tx) => tx.getAll(STORE.cfgBase));
 		const base = new Map(rows.map((r) => [r.file, r]));
 		const view = log.view();
-		const plan = planCfg({ local, base, view, nowMs: clock.now() });
+		const preferLocal = this.deps.seed === "device" && rows.length === 0;
+		const plan = planCfg({ local, base, view, nowMs: clock.now(), mobile: this.deps.mobile ?? false, preferLocal });
 		const notices = cfgSkipNotices(plan, local, view);
 		for (const code of CFG_NOTICE_CODES) this.report(code, notices.find((n) => n.code === code) ?? null);
 		const deferred: ConfigRelPath[] = [];

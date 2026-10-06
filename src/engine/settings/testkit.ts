@@ -91,6 +91,9 @@ export class Device {
 	/** Notice codes, in order. */
 	readonly notices: string[] = [];
 	readonly warnings: { code: string; message: string }[] = [];
+	/** CfgSyncDeps.mobile / .seed, read when the first pass creates the CfgSync. */
+	mobile = false;
+	seed: "device" | "vault" | undefined = undefined;
 	private sync: CfgSync | null = null;
 
 	constructor(readonly name: string, readonly log: SharedCfgLog, readonly blobs: FakeBlobs | null = null) {}
@@ -102,7 +105,7 @@ export class Device {
 	async pass(): Promise<CfgPassResult> {
 		if (!this.sync) {
 			const db = await this.storage.open<DiskSchema>(`cfg-${this.name}`, DB_SCHEMA_VERSION, STORE_SPECS);
-			this.sync = new CfgSync({ db, config: this.config, log: this.log.port(this.name), blobs: this.blobs, clock: this.clock, notice: (l, c, m) => {
+			this.sync = new CfgSync({ db, config: this.config, log: this.log.port(this.name), blobs: this.blobs, clock: this.clock, mobile: this.mobile, seed: this.seed, notice: (l, c, m) => {
 				this.notices.push(c);
 				if (l === "warn") this.warnings.push({ code: c, message: m ?? "" });
 			} });

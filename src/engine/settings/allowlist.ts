@@ -111,15 +111,24 @@ export function sanitizeConfigDirKey(basename: string): string | null {
 	return basename;
 }
 
-/** `version` and display `name` from a plugin manifest.json; each null when missing/invalid. */
-export function readManifest(bytes: Uint8Array | null, decode: (b: Uint8Array) => string | null): { readonly version: string | null; readonly name: string | null } {
+export interface PluginManifestInfo {
+	readonly version: string | null;
+	/** Display name. */
+	readonly name: string | null;
+	/** `isDesktopOnly: true`: Obsidian does not load the plugin on mobile. */
+	readonly desktopOnly: boolean;
+}
+
+/** The fields settings sync reads from a plugin manifest.json; null / false when missing or invalid. */
+export function readManifest(bytes: Uint8Array | null, decode: (b: Uint8Array) => string | null): PluginManifestInfo {
+	const none = { version: null, name: null, desktopOnly: false };
 	const text = bytes ? decode(bytes) : null;
-	if (text === null) return { version: null, name: null };
+	if (text === null) return none;
 	try {
-		const m = JSON.parse(text) as { version?: unknown; name?: unknown } | null;
+		const m = JSON.parse(text) as { version?: unknown; name?: unknown; isDesktopOnly?: unknown } | null;
 		const str = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
-		return { version: str(m?.version), name: str(m?.name) };
+		return { version: str(m?.version), name: str(m?.name), desktopOnly: m?.isDesktopOnly === true };
 	} catch {
-		return { version: null, name: null };
+		return none;
 	}
 }

@@ -182,3 +182,31 @@ test("size cap: past CFG_MAX_FILES files stop in path order", async () => {
 		"YAOS settings sync syncs at most 256 settings files and 4 MB in total; 44 files past that limit are not synced: snippets/s256.css, snippets/s257.css, snippets/s258.css, snippets/s259.css, snippets/s260.css and 39 more. Remove settings files you do not need to sync the rest.",
 	]);
 });
+
+test("desktop-only: a mobile device does not enable a plugin whose manifest is isDesktopOnly, silently, and never disables it elsewhere", async () => {
+	const log = new SharedCfgLog();
+	const a = new Device("A", log);
+	const desktopOnly = (d: Device): void => {
+		d.plugin("draw", "2.0.0");
+		d.config.set("plugins/draw/manifest.json", { id: "draw", version: "2.0.0", isDesktopOnly: true });
+		d.plugin("dv", "1.0.0");
+	};
+	desktopOnly(a);
+	a.config.set("community-plugins.json", ["draw", "dv"]);
+	await a.pass();
+	const phone = new Device("P", log);
+	phone.mobile = true;
+	desktopOnly(phone);
+	phone.config.set("community-plugins.json", []);
+	const r = await phone.pass();
+	assert.deepEqual(phone.config.json("community-plugins.json"), ["dv"]);
+	assert.deepEqual(r.plan.skipped, [{ file: "community-plugins.json", key: "draw", reason: "desktop-only" }]);
+	assert.deepEqual(phone.warnings, []);
+	assert.deepEqual(log.opsBy("P"), [], "no pluginSet false for the desktops");
+	assert.equal(log.fold.plugins.get("draw")?.value, true);
+	assert.equal((await phone.pass()).plan.actions.length, 0, "stable");
+	const laptop = new Device("L", log);
+	desktopOnly(laptop);
+	await laptop.pass();
+	assert.deepEqual(laptop.config.json("community-plugins.json"), ["draw", "dv"]);
+});
