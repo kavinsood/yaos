@@ -1,5 +1,5 @@
 /**
- * Daily-limit popup (legacy sync/dailyLimit.ts). The relay refuses writes or
+ * Daily-limit popup (old client, adfa7a7:src/sync/dailyLimit.ts). The relay refuses writes or
  * connects with `cf_daily_limit` once the Cloudflare free-tier rows limit is
  * hit; the engine holds sends until the reset and the host shows one popup
  * per reset window. The window ends at the relay's reset when it said when
