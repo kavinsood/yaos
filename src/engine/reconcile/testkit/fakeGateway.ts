@@ -9,6 +9,8 @@
  */
 
 import type { DiskOp, DiskOpResult, DiskReadRequest, DiskReadResult, Lane } from "../../../protocol/messages";
+import { fingerprintWrites, withFingerprints } from "../../compose/hashService";
+import type { ExecResult } from "../deps";
 import type { TrashMode } from "../../../ports/vault";
 import type { DiskGateway } from "../deps";
 import type { FakeVault } from "./fakeVault";
@@ -70,8 +72,8 @@ export class FakeGateway implements DiskGateway {
 		return out;
 	}
 
-	async exec(ops: readonly DiskOp[], _lane: Lane): Promise<readonly DiskOpResult[]> {
-		const out: DiskOpResult[] = [];
+	async exec(ops: readonly DiskOp[], _lane: Lane): Promise<readonly ExecResult[]> {
+		const out: ExecResult[] = [];
 		for (const op of ops) {
 			if (this.beforeOp) await this.beforeOp(op);
 			this.mutations++;
@@ -81,7 +83,9 @@ export class FakeGateway implements DiskGateway {
 				throw new CrashError(`before disk op ${n} (${op.t})`);
 			}
 			this.executed.push(op);
-			out.push(await this.one(op));
+			// Like the engine's host link: fingerprint the write before it is sent (detached).
+			const fps = fingerprintWrites([op]);
+			out.push(...withFingerprints([op], fps, [await this.one(op)]));
 			detachWriteBytes(op);
 			if (this.crash && this.crash.after && this.crash.at === n) {
 				this.crash = null;

@@ -15,9 +15,9 @@ import { standInPathKey } from "../../core/plan/pathRules";
 import type { ClockPort } from "../../ports/clock";
 import type { RandomPort } from "../../ports/random";
 import type { TrashMode, VaultStat } from "../../ports/vault";
-import { LANE, type DiskOp, type DiskOpResult, type DiskReadResult, type Lane } from "../../protocol/messages";
+import { LANE, type DiskOp, type DiskReadResult, type Lane } from "../../protocol/messages";
 import type { SyncedRecord } from "../store/schema";
-import type { DiskGateway, LogPort, OwnFoldEvent } from "./deps";
+import type { DiskGateway, ExecResult, LogPort, OwnFoldEvent } from "./deps";
 import { EchoTable } from "./echo";
 import { classify, compileExcludes, toRecord, type Classified, type ClassifySettings } from "./localState";
 import type { DiskChange, DiskSchema, ReconcileStore } from "./store";
@@ -140,7 +140,7 @@ export class Ctx {
 		return this.localAt(path)?.diskPath ?? path;
 	}
 
-	async exec(spec: DiskOpSpec, lane: Lane = LANE.background): Promise<DiskOpResult> {
+	async exec(spec: DiskOpSpec, lane: Lane = LANE.background): Promise<ExecResult> {
 		const op = { ...spec, opId: ++this.opId } as DiskOp;
 		const [res] = await this.deps.disk.exec([op], lane);
 		if (!res) throw new Error("disk gateway returned no result");
