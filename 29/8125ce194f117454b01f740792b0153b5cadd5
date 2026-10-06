@@ -1,0 +1,19 @@
+src/host/binding.test.ts
+  s_55df3a262a3f91::t_5bda9e43bc3e5c 292-311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "298125ce194f117454b01f740792b0153b5cadd5",
+  "prompts": {},
+  "sessions": {
+    "s_55df3a262a3f91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb505bd76147038f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
