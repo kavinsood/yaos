@@ -1,0 +1,27 @@
+e2e/client/fullCheck.ts
+  s_0a888a2d99d5d5::t_d90cc1a52cd8cd 1-168
+e2e/client/fullClients.ts
+  s_0a888a2d99d5d5::t_9ea9eae9d9a41c 1-118
+e2e/client/fullKit.ts
+  s_0a888a2d99d5d5::t_42a0c68401e8a3 1-298
+e2e/client/fullScenarios1.ts
+  s_0a888a2d99d5d5::t_30c48f35ae8f0f 1-166
+e2e/client/fullScenarios2.ts
+  s_0a888a2d99d5d5::t_13ea80a8123312 1-163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f0b7c63f6bc8d9c37a05ad64304d1d7f12373459",
+  "prompts": {},
+  "sessions": {
+    "s_0a888a2d99d5d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abaac5423d9326e26",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
