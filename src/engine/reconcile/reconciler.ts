@@ -13,7 +13,7 @@
  */
 
 import type { BrakeReport, DocId, PathKey, PlanScope, PlannerInput, PlannerOp } from "../../core/types";
-import { brakeId } from "../../core/plan/brake";
+import { brakeId, rejectHeld } from "../../core/plan/brake";
 import { planWith } from "../../core/plan/planner";
 import type { VaultEvent } from "../../ports/vault";
 import type { LocalObservation } from "../../protocol/messages";
@@ -51,6 +51,8 @@ export interface PassReport extends RunReport {
 
 export class Reconciler {
 	private lastJobBrake: { id: string; keys: string[] } | null = null;
+	/** Ops the planner held for the current brake report (rejectBrake turns them into their opposites). */
+	private lastHeld: { id: string; ops: readonly PlannerOp[] } | null = null;
 	lastPlan: readonly PlannerOp[] = [];
 
 	private constructor(readonly ctx: Ctx, readonly scan: Scanner, private readonly env: Env) {}
@@ -91,6 +93,27 @@ export class Reconciler {
 		this.ctx.brakeApproval = id;
 	}
 
+	/**
+	 * Reject a brake report (§f.5): held remote deletes keep the file (synced dropped, re-created as a new doc),
+	 * held local deletes re-materialize the remote doc. A job-level overwrite brake is simply not approved.
+	 */
+	async rejectBrake(id: string): Promise<RunReport | null> {
+		if (this.lastJobBrake && this.lastJobBrake.id === id) {
+			this.lastJobBrake = null;
+			return null;
+		}
+		const held = this.lastHeld;
+		if (!held || held.id !== id) return null;
+		this.lastHeld = null;
+		this.ctx.brakeApproval = null;
+		const view = this.ctx.log.view();
+		const ops = rejectHeld(held.ops, (docId) => {
+			const e = view.remote.get(docId as DocId);
+			return e && e.state === "live" ? e.path : null;
+		});
+		return runPlan(this.env, ops);
+	}
+
 	private freshIds(n: number): DocId[] {
 		const out: DocId[] = [];
 		for (let i = 0; i < n; i++) out.push(base64url(this.ctx.deps.random.bytes(16)) as DocId);
@@ -126,8 +149,13 @@ export class Reconciler {
 			tzOffsetMinutes: ctx.deps.tzOffsetMinutes?.() ?? 0, remoteTextHash: view.textHash, bodyAppliedSeq: view.appliedSeq, restoreDuty: view.restoreDuty,
 		});
 		this.lastPlan = plan.ops;
-		if (plan.brake) ctx.deps.onBrake?.(plan.brake);
-		else ctx.brakeApproval = null;
+		if (plan.brake) {
+			this.lastHeld = { id: plan.brake.id, ops: plan.held };
+			ctx.deps.onBrake?.(plan.brake);
+		} else {
+			if (scope.t === "full") this.lastHeld = null;
+			ctx.brakeApproval = null;
+		}
 		this.env.heldOverwrites.length = 0;
 		const run = await runPlan(this.env, plan.ops);
 		if (ctx.localComplete) ctx.renames = [];

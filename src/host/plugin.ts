@@ -2,16 +2,13 @@
  * YAOS plugin entry (main thread). Wires the Obsidian adapters, the engine
  * carriers (Blob-URL worker from `virtual:yaos-engine-worker`, inline
  * fallback), the HostRuntime (through YaosController) and the UI.
- *
- * STAND-IN: the inline carrier runs engine/__standins__ (protocol-complete,
- * local only) until WP-C's createEngine lands.
- * INTEGRATION: createInline -> createEngine(pair.engine, { carrier: "inline", makePorts })
- * from engine/runtime/engine.ts.
+ * The inline carrier runs the same composed engine as the worker
+ * (engine/adapters/webEngine.ts) on the main thread.
  */
 
 import { Notice, Platform, Plugin } from "obsidian";
 import workerSource from "virtual:yaos-engine-worker";
-import { createStandinEngine } from "../engine/__standins__/engine";
+import { createWebEngine } from "../engine/adapters/webEngine";
 import { createInlinePair } from "../protocol/inlineTransport";
 import { createWorkerHostTransport, type WorkerLike } from "../protocol/workerTransport";
 import { attachCollab, collabCompartmentExtension, editorViewOf } from "./collab";
@@ -52,7 +49,7 @@ function workerCarrier(): EngineCarrier | null {
 
 function inlineCarrier(): EngineCarrier {
 	const pair = createInlinePair();
-	const handle = createStandinEngine(pair.engine, { carrier: "inline", clock: browserClock(), hash: webCryptoHashPort(), hub: null, store: null });
+	const handle = createWebEngine(pair.engine, "inline");
 	return {
 		kind: "inline",
 		transport: pair.host,

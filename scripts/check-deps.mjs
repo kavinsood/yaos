@@ -113,7 +113,7 @@ export function checkSource(file, text) {
 		}
 	}
 
-	if (!test && area === "engine" && !file.startsWith("engine/adapters/") && !file.startsWith("engine/__standins__/")) {
+	if (!test && area === "engine" && !file.startsWith("engine/adapters/")) {
 		const body = stripComments(text).replace(/(["'`])(?:\\.|(?!\1).)*\1/g, '""');
 		for (const [name, re] of BROWSER_GLOBALS) {
 			const m = re.exec(body);
@@ -143,11 +143,9 @@ function checkInternal(file, area, target, tArea, typeOnly, spec, line, err, war
 		case "host":
 			if (["core", "ports", "protocol", "host"].includes(tArea)) return;
 			if (tArea === "engine") {
-				if (target === "engine/runtime/engine") return;
-				if (target.startsWith("engine/__standins__/")) {
-					return warn(line, `stand-in import (INTEGRATION: replace with engine/runtime/engine): ${spec}`);
-				}
-				return err(line, `host/** may import from engine/ only engine/runtime/engine.ts: ${spec}`);
+				// Deviation from DESIGN §k.2 (integration-notes): the inline-fallback entry is the composed web engine.
+				if (target === "engine/adapters/webEngine") return;
+				return err(line, `host/** may import from engine/ only engine/adapters/webEngine.ts: ${spec}`);
 			}
 			return err(line, `host/** must not import ${tArea}/**: ${spec}`);
 		default:

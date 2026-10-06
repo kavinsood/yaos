@@ -75,7 +75,8 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	const D = canonicalizeMarkdown(decoded);
 	const F = exactFingerprint(rd.bytes);
 	const s = ctx.synced(docId);
-	const storedBase = op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
+	// §c.12: after an epoch migration a doc with no synced record merges against the old epoch's base at its path.
+	const storedBase = op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : !s ? ctx.deps.pathBase?.(ctx.pk(op.path)) ?? null : null;
 	const ytext = h.doc.getText("text");
 
 	let result: MergeResult | null = null;

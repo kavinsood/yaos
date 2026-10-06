@@ -37,11 +37,10 @@ test("§k.2 rules", () => {
 	assert.equal(check("engine/body/a.ts", `const db = indexedDB.open("x");`).errors.length, 1, "browser global outside adapters");
 	assert.equal(check("engine/adapters/idb.ts", `const db = indexedDB.open("x");`).errors.length, 0);
 	assert.equal(check("engine/body/a.ts", `const s = "fetch(";`).errors.length, 0, "strings are ignored");
-	assert.equal(check("host/engineHost.ts", `import { createEngine } from "../engine/runtime/engine";`).errors.length, 0);
+	assert.equal(check("host/plugin.ts", `import { createWebEngine } from "../engine/adapters/webEngine";`).errors.length, 0);
+	assert.equal(check("host/engineHost.ts", `import { LogEngine } from "../engine/runtime/engine";`).errors.length, 1);
 	assert.equal(check("host/engineHost.ts", `import { x } from "../engine/body/handles";`).errors.length, 1);
-	const standin = check("host/plugin.ts", `import { createEngine } from "../engine/__standins__/engine";`);
-	assert.equal(standin.errors.length, 0);
-	assert.equal(standin.warnings.length, 1);
+	assert.equal(check("host/plugin.ts", `import { createEngine } from "../engine/__standins__/engine";`).errors.length, 1, "stand-ins are gone");
 	assert.equal(check("host/plugin.ts", `import src from "virtual:yaos-engine-worker";`).errors.length, 0);
 	assert.equal(check("host/plugin.ts", `import { EditorView } from "@codemirror/view";`).errors.length, 0);
 	assert.equal(check("host/plugin.ts", `import { readFile } from "node:fs";`).errors.length, 1);
@@ -54,7 +53,8 @@ test("§k.2 rules", () => {
 });
 
 test("the tree passes", () => {
-	const r = checkTree() as { files: number; errors: string[] };
+	const r = checkTree() as { files: number; errors: string[]; warnings: string[] };
 	assert.deepEqual(r.errors, []);
+	assert.deepEqual(r.warnings, []);
 	assert.ok(r.files > 10);
 });

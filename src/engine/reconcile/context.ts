@@ -56,6 +56,8 @@ export interface ReconcilerDeps {
 	readonly mergeLimits?: MergeLimits;
 	readonly notice?: (level: "info" | "warn" | "error", code: string, message: string) => void;
 	readonly onBrake?: (report: BrakeReport) => void;
+	/** Path-keyed base text carried over a vaultEpoch migration (§c.12 step 3); null = none. */
+	readonly pathBase?: (key: PathKey) => string | null;
 }
 
 export const BRAKE_WINDOW_MS = 10 * 60_000;

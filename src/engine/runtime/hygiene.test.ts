@@ -2,7 +2,7 @@
  * Static engine rules (task brief + DESIGN §d.4/§d.8): only yjsCounters.ts calls
  * Y.encodeStateAsUpdate / Y.mergeUpdates; src/engine imports only core, ports,
  * protocol, yjs, lib0, fflate; browser globals and real timers only in adapters.
- * Stand-ins (__standins__, replaced at integration), test files and test kits
+ * Test files and test kits
  * (any testkit/ directory, testHarness.ts, relayTestFakes.ts) are exempt.
  */
 
@@ -26,7 +26,7 @@ function walk(dir: string, out: string[] = []): string[] {
 
 const files = walk(ENGINE)
 	.map((p) => ({ path: p, rel: relative(ENGINE, p) }))
-	.filter((f) => !f.rel.endsWith(".test.ts") && !f.rel.includes("__standins__") && !f.rel.split("/").includes("testkit") && f.rel !== "runtime/testHarness.ts" && f.rel !== "adapters/relayTestFakes.ts");
+	.filter((f) => !f.rel.endsWith(".test.ts") && !f.rel.split("/").includes("testkit") && f.rel !== "runtime/testHarness.ts" && f.rel !== "adapters/relayTestFakes.ts");
 
 /** Source without comments or string bodies (keeps quotes so import specifiers survive separately). */
 function code(src: string): string {
@@ -57,7 +57,7 @@ test("hygiene: imports stay within core / ports / protocol / engine and yjs, lib
 				const target = resolve(dirname(f.path), spec);
 				if (!allowedDirs.some((d) => target === d || target.startsWith(d + "/"))) problems.push(`${f.rel}: ${spec}`);
 				if (/legacy-src|\/host\//.test(target)) problems.push(`${f.rel}: ${spec}`);
-				if (!f.rel.startsWith("adapters/") && target.startsWith(join(ENGINE, "adapters") + "/") && !/adapters\/(noopCrypto|webHash|webClock|webRandom)$/.test(target)) {
+				if (!f.rel.startsWith("adapters/") && target.startsWith(join(ENGINE, "adapters") + "/") && !/adapters\/(noopCrypto|webHash|webClock|webRandom|webEngine)$/.test(target)) {
 					problems.push(`${f.rel}: engine core imports adapter ${spec}`);
 				}
 			} else if (!/^(yjs|lib0|fflate)(\/|$)/.test(spec)) problems.push(`${f.rel}: package ${spec}`);
