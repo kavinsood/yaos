@@ -17,7 +17,7 @@ import { errorMessage } from "./format";
 
 export interface HttpRequest {
 	readonly url: string;
-	readonly method: "GET" | "POST";
+	readonly method: "GET" | "POST" | "DELETE";
 	readonly headers?: Readonly<Record<string, string>>;
 	readonly body?: string;
 }
@@ -446,6 +446,35 @@ export async function requestPairingCode(
 	let mobileSetupUrl: string | null = null;
 	if (typeof r.mobileSetupUrl === "string" && r.mobileSetupUrl.startsWith(`${host}/`)) mobileSetupUrl = r.mobileSetupUrl;
 	return { pairingCode: r.pairingCode, expiresAt, setupLink: buildSetupLink(host, r.pairingCode), mobileSetupUrl };
+}
+
+// ---------------------------------------------------------------------------
+// Retiring a replaced enrollment (DELETE /vault/:id/auth/device)
+// ---------------------------------------------------------------------------
+
+export const RETIRE_FAILED_MESSAGE = "Could not remove the old server membership. Remove it from the old server console.";
+
+/**
+ * Revokes an enrollment that a new pairing has replaced, authenticated by that enrollment's own
+ * token: the server revokes the device the token belongs to (relay2 server/src/routes/enroll.ts:391-399).
+ * Same request and outcome rule as the old client (adfa7a7:src/main.ts:3439-3473): 200 (revoked) and
+ * 401 (the token is already dead) count as done. Anything else, including 202
+ * authorization_fence_pending, and network errors throw PairingError(RETIRE_FAILED_MESSAGE); the
+ * token never appears in it.
+ */
+export async function retireDeviceEnrollment(identity: PairedIdentity, deps: Pick<PairingDeps, "request">): Promise<void> {
+	let res: HttpResponse;
+	try {
+		res = await deps.request({
+			url: `${normalizeHost(identity.host)}/vault/${encodeURIComponent(identity.vaultId)}/auth/device`,
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${identity.deviceToken}` },
+		});
+	} catch (err) {
+		throw new PairingError(RETIRE_FAILED_MESSAGE, err instanceof PairingError ? err.code : "network");
+	}
+	if (res.status === 200 || res.status === 401) return;
+	throw new PairingError(RETIRE_FAILED_MESSAGE, errorCodeOf(res.json) || "http_error", res.status);
 }
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,8 @@
  * Pairing modals: PairModal (join this device to a vault with a server URL + one-time code) and
  * the "pair another device" code display with a QR code of the mobile setup page and an "Open
  * pairing page" button. Ported from the old client (adfa7a7:src/settings/PairDeviceModal.ts, QR at
- * :40-65, and the enrollment parts of adfa7a7:src/settings/settingsTab.ts).
+ * :40-65, and the enrollment parts of adfa7a7:src/settings/settingsTab.ts). When a pairing
+ * replaces another, the old enrollment is revoked on its server after the new one is stored.
  *
  * SECRETS: the pairing code input is a password field; codes and tokens are never logged. The
  * code shown by PairingCodeModal is displayed only because handing it to the other device is the
@@ -11,11 +12,11 @@
 
 import { Modal, Notice, Setting, type App, type ButtonComponent } from "obsidian";
 import { toCanvas } from "qrcode";
-import type { YaosUiHost } from "./api";
+import { sameIdentity, type YaosUiHost } from "./api";
 import { errorMessage } from "./format";
 import { copyText, obsidianRequest } from "./obsidianEnv";
 import { applyPairedIdentity, formatCountdown, PairingSession, setPendingEnrollment, withoutPendingEnrollment } from "./pairFlow";
-import { requestPairingCode, type PairingCodeGrant, type RequestFn } from "./pairing";
+import { requestPairingCode, retireDeviceEnrollment, type PairingCodeGrant, type RequestFn } from "./pairing";
 
 /** One-click Cloudflare deploy of the server (README "Deploy to Cloudflare"). */
 const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
@@ -38,7 +39,7 @@ export class PairModal extends Modal {
 		app: App,
 		private readonly host: YaosUiHost,
 		prefill: PairPrefill = {},
-		request: RequestFn = obsidianRequest,
+		private readonly request: RequestFn = obsidianRequest,
 	) {
 		super(app);
 		this.session = new PairingSession({
@@ -63,7 +64,7 @@ export class PairModal extends Modal {
 		if (current) {
 			contentEl.createEl("p", {
 				cls: "mod-warning",
-				text: `This device is already paired with ${current.host}. Pairing again replaces this device's credentials and syncs this folder with the vault of the new code. Notes on disk are not deleted.`,
+				text: `This device is already paired with ${current.host}. Pairing again replaces this device's credentials and syncs this folder with the vault of the new code. Once the new pairing succeeds, YAOS asks the old server to remove this device's old membership. Notes on disk are not deleted.`,
 			});
 		}
 		contentEl.createEl("p", {
@@ -119,6 +120,7 @@ export class PairModal extends Modal {
 		if (this.session.busy) return;
 		this.pairButton?.setDisabled(true);
 		this.setStatus("Pairing…", false);
+		const previous = this.host.data().identity;
 		try {
 			const identity = await this.session.submit({ host: this.hostValue, pairingCode: this.codeValue, deviceName: this.nameValue });
 			// Persist even if the modal was closed meanwhile: the server has already enrolled this
@@ -127,6 +129,11 @@ export class PairModal extends Modal {
 			this.codeValue = "";
 			new Notice(`YAOS: this device is now paired with ${identity.host}.`);
 			if (this.open_) this.close();
+			// Best effort, only after the new identity is stored: revoke the replaced enrollment
+			// with its own token (adfa7a7:src/runtime/setupLinkController.ts:243-256).
+			if (previous && !sameIdentity(previous, identity)) {
+				retireDeviceEnrollment(previous, { request: this.request }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
+			}
 		} catch (err) {
 			this.setStatus(errorMessage(err), true);
 			if (!this.open_) new Notice(`YAOS pairing failed: ${errorMessage(err)}`, 8000);
