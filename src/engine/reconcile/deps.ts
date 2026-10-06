@@ -12,7 +12,10 @@ import type {
 } from "../../core/types";
 import type { DiskOp, DiskOpResult, DiskReadRequest, DiskReadResult, Lane } from "../../protocol/messages";
 
-/** Engine side of `readRequest` / `diskOps` (DESIGN §g.2). The host executes ops in order. */
+/**
+ * Engine side of `readRequest` / `diskOps` (DESIGN §g.2). The host executes ops in order.
+ * `exec` transfers write bytes ([T]): after the call they are detached, never reuse them.
+ */
 export interface DiskGateway {
 	read(reads: readonly DiskReadRequest[], lane: Lane): Promise<readonly DiskReadResult[]>;
 	exec(ops: readonly DiskOp[], lane: Lane): Promise<readonly DiskOpResult[]>;

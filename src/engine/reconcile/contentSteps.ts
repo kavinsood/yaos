@@ -48,7 +48,9 @@ export async function writeConflictCopy(
 		fromPath: op.path, toPath: copyPath, step: 1, createdAtMs: ctx.now(),
 	};
 	await ctx.commit({ intentPut: [intent] });
-	const res = await ctx.exec({ t: "write", area: "vault", path: copyPath, data: { t: "bytes", bytes }, precondition: { t: "absent" }, docId, purpose: "conflict-copy" });
+	// exec transfers (detaches) write bytes; the caller still needs its read buffer.
+	const hb = hashBytes(kind, bytes);
+	const res = await ctx.exec({ t: "write", area: "vault", path: copyPath, data: { t: "bytes", bytes: bytes.slice() }, precondition: { t: "absent" }, docId, purpose: "conflict-copy" });
 	const out = writeOk(res);
 	if (!out) {
 		await ctx.commit({ intentDrop: [intent.id] });
@@ -57,6 +59,5 @@ export async function writeConflictCopy(
 	}
 	ctx.echo.expectWrite(ctx.pk(copyPath), out.stat.size, out.stat.mtimeMs);
 	ctx.noteDestructive("conflict");
-	const hb = hashBytes(kind, bytes);
 	return { intent, local: ctx.localEntry(copyPath, out.stat, kind, hb.hash, out.fingerprint) };
 }

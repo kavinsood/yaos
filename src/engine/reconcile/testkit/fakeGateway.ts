@@ -77,6 +77,7 @@ export class FakeGateway implements DiskGateway {
 			}
 			this.executed.push(op);
 			out.push(await this.one(op));
+			detachWriteBytes(op);
 			if (this.crash && this.crash.after && this.crash.at === n) {
 				this.crash = null;
 				throw new CrashError(`after disk op ${n} (${op.t})`);
@@ -104,4 +105,11 @@ export class FakeGateway implements DiskGateway {
 				return { opId: op.opId, t: "removeEmptyFolder", ok: true };
 		}
 	}
+}
+
+/** Like the real carriers ([T] transfer): a write's bytes are detached once sent. */
+function detachWriteBytes(op: DiskOp): void {
+	if (op.t !== "write" || op.data.t !== "bytes") return;
+	const b = op.data.bytes;
+	if (b.byteOffset === 0 && b.byteLength === b.buffer.byteLength && b.buffer instanceof ArrayBuffer) structuredClone(b, { transfer: [b.buffer] });
 }

@@ -10,7 +10,7 @@ import type { ConfigDirPort, SideFileName, SideFilePort } from "../../ports/vaul
 import type { ProtocolError } from "../../protocol/errors";
 import type { DiskOp, DiskOpResult, DiskReadRequest, DiskReadResult, EngineToMain, HostIoOp, HostIoResult, Lane, MainResultValue } from "../../protocol/messages";
 import type { EngineTransport } from "../../protocol/transport";
-import { postOwned, TransferOwnershipError } from "../../protocol/workerTransport";
+import { owned, postOwned, TransferOwnershipError } from "../../protocol/workerTransport";
 import type { DiskGateway } from "../reconcile/deps";
 
 type WithRid = Extract<EngineToMain, { readonly rid: number }>;
@@ -95,7 +95,9 @@ export class HostLink {
 		},
 		exec: async (ops: readonly DiskOp[], lane: Lane): Promise<readonly DiskOpResult[]> => {
 			if (ops.length === 0) return [];
-			const r = await this.request({ t: "diskOps", lane, ops });
+			// Write bytes are transferred: copy any view that does not own its buffer.
+			const sent = ops.map((op) => (op.t === "write" && op.data.t === "bytes" ? { ...op, data: { t: "bytes" as const, bytes: owned(op.data.bytes) } } : op));
+			const r = await this.request({ t: "diskOps", lane, ops: sent });
 			if (r.t !== "diskOps") throw new Error(`unexpected diskOps answer ${r.t}`);
 			return r.results;
 		},
