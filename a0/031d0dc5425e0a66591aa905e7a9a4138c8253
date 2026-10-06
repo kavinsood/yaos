@@ -1,0 +1,23 @@
+src/host/plugin.ts
+  s_441b74abbd0702::t_aaad453e98eb42 95
+src/host/pluginController.test.ts
+  s_441b74abbd0702::t_e129fab77f7954 6-7,19,21-24,28,33,98-125
+src/host/pluginController.ts
+  s_441b74abbd0702::t_eb158d64c523d8 18,22-38,140-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a0031d0dc5425e0a66591aa905e7a9a4138c8253",
+  "prompts": {},
+  "sessions": {
+    "s_441b74abbd0702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5b78666751a5e84f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
