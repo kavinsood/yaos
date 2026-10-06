@@ -63,10 +63,11 @@ export function transferablesOf(message: MainToEngine | EngineToMain): ArrayBuff
 			s.syncedMirror.forEach((b, i) => b && add(out, seen, b, `init.sideState.syncedMirror[${i}]`));
 			break;
 		}
-		case "localUpdate":
-		case "bindDelta":
-		case "docUpdate":
-			add(out, seen, message.update, `${message.t}.update`);
+		case "textChunk":
+			add(out, seen, message.bytes, "textChunk.bytes");
+			break;
+		case "hashRequest":
+			message.items.forEach((it, i) => add(out, seen, it.bytes, `hashRequest.items[${i}].bytes`));
 			break;
 		case "sideFileWrite":
 			add(out, seen, message.bytes, "sideFileWrite.bytes");
@@ -84,10 +85,6 @@ export function transferablesOf(message: MainToEngine | EngineToMain): ArrayBuff
 					break;
 				case "sideFile":
 					if (v.bytes) add(out, seen, v.bytes, "result.sideFile.bytes");
-					break;
-				case "bind":
-					add(out, seen, v.bind.state, "result.bind.state");
-					add(out, seen, v.bind.stateVector, "result.bind.stateVector");
 					break;
 				default:
 					break;

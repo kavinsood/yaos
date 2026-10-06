@@ -13,11 +13,19 @@ import type { RelayEvent } from "../../ports/relay";
 import { buildAdoptFrame, buildBodyFrames, FrameTooLargeError } from "../body/frames";
 import { docTextLength, hasCausalHole, type Handle, type HandleHooks } from "../body/handles";
 import { resolveRefRow } from "../body/refs";
+import { deltaToChanges } from "../body/textChanges";
 import { ORIGIN } from "../body/yjsCounters";
 import { gate } from "../ingest/gate";
 import type { TailRecord } from "../store/schema";
 import { adoptKey, type EngineCtx } from "./context";
-import type { DocUpdateOrigin } from "./options";
+import type { BoundTextOrigin, DocUpdateOrigin } from "./options";
+
+function boundOrigin(origin: unknown): BoundTextOrigin {
+	if (origin === ORIGIN.MAIN) return "editor";
+	if (origin === ORIGIN.MERGE) return "merge";
+	if (origin === ORIGIN.PROVISIONAL) return "provisional";
+	return "remote";
+}
 
 type Provisional = Extract<RelayEvent, { t: "provisional" }>;
 type Dropped = Extract<RelayEvent, { t: "provisionalDropped" }>;
@@ -64,6 +72,15 @@ export class DocRuntime {
 	}
 
 	private attach(h: Handle): void {
+		if (h.cls === "body") {
+			const ytext = h.doc.getText("text");
+			ytext.observe((ev, tr) => {
+				const hook = this.c.opts.onBoundText;
+				if (h.bound === 0 || !hook) return;
+				// ev.delta walks the text's items (Yjs YText.js:655-721): worker-side cost, main gets O(change) JSON.
+				hook(h.docId, deltaToChanges(ev.delta, ytext.length), ytext.length, boundOrigin(tr.origin));
+			});
+		}
 		h.doc.on("update", (u: Uint8Array, origin: unknown) => {
 			if (origin === ORIGIN.MERGE) {
 				if (h.builder.push(u, this.c.mono())) void this.closeFrame(h);
@@ -102,6 +119,7 @@ export class DocRuntime {
 		if (!taken) return this.chain(async () => undefined);
 		h.pins++;
 		const c = this.c;
+		const durable = h.bound > 0 ? c.opts.onFrameTaken?.(h.docId) : undefined;
 		return this.chain(async () => {
 			try {
 				const docId = streamDocId(h.stream);
@@ -110,7 +128,9 @@ export class DocRuntime {
 				c.addOutbox(await c.repo.tEdit(frames, c.now()));
 				c.ckpt.lastActivity.set(h.stream, c.mono());
 				this.stats.framesClosed++;
+				durable?.(true);
 			} catch (e) {
+				durable?.(false);
 				if (e instanceof FrameTooLargeError) {
 					// The update (and keystrokes typed on top of it) can never be sent: discard them and drop the
 					// replica so it reloads from durable state; later frames never depend on unsent structs.

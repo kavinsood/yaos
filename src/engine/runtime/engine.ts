@@ -19,6 +19,7 @@ import type { RelaySession } from "../../ports/relay";
 import type { StoragePort } from "../../ports/storage";
 import { buildBodyFrames, initialTextUpdates } from "../body/frames";
 import { HandleManager, type Handle } from "../body/handles";
+import { applyChanges, changesBaseLength, type TextChanges } from "../body/textChanges";
 import { Sender } from "../body/sender";
 import { encodeStateAsUpdate, ORIGIN } from "../body/yjsCounters";
 import { defaultPriority, Repo, type YS } from "../store/repo";
@@ -46,6 +47,7 @@ export class EngineStartError extends Error {
 	}
 }
 
+/** Replica state for a raw-Yjs bind (tests, e2e kits); encoded on first read only. */
 export interface BindResult {
 	readonly state: Uint8Array;
 	readonly stateVector: Uint8Array;
@@ -361,6 +363,78 @@ export class LogEngine {
 		else c.docs.armBuilder(h);
 	}
 
+	/**
+	 * Bound-view editor changes (CodeMirror ChangeSet JSON over the replica text now, textChanges.ts): one MAIN
+	 * transaction, O(change); the open frame closes on its timers. false = the changes do not fit the text length.
+	 */
+	applyEditorChanges(docId: DocId, changes: TextChanges): boolean {
+		const c = this.c;
+		const stream = this.boundStreams.get(docId);
+		const h = stream ? c.handles.peek(stream) : undefined;
+		if (!h || h.bound === 0) throw new Error(`doc not bound: ${docId}`);
+		if (c.repo.stream(h.stream)?.frozen) throw new Error("doc frozen");
+		const ytext = h.doc.getText("text");
+		if (changesBaseLength(changes) !== ytext.length) return false;
+		let update = null as Uint8Array | null;
+		const grab = (u: Uint8Array, origin: unknown) => {
+			if (origin === ORIGIN.MAIN) update = u;
+		};
+		h.doc.on("update", grab);
+		try {
+			h.doc.transact(() => applyChanges(ytext, changes), ORIGIN.MAIN);
+		} finally {
+			h.doc.off("update", grab);
+		}
+		h.lastAccessMono = c.mono();
+		if (update === null) return true;
+		c.handles.grow(h, update.length);
+		if (h.builder.push(update, c.mono())) void c.docs.closeFrame(h);
+		else c.docs.armBuilder(h);
+		return true;
+	}
+
+	/** Everything applied to the doc's replica is in committed storage (no open frame, no T_edit pending). */
+	bodyDurable(docId: DocId): boolean {
+		const h = this.c.handles.peek(this.streamOf(docId));
+		return (!h || h.builder.empty) && this.c.docs.editIdle;
+	}
+
+	/**
+	 * Merge edit on a bound doc, synchronous (the attach / reload merge of the bound views): one MERGE
+	 * transaction on the resident replica, its frame closed at once. Returns the frame's commit.
+	 */
+	editBound(docId: DocId, fn: (text: Y.Text) => void): Promise<void> {
+		const c = this.c;
+		const stream = this.boundStreams.get(docId);
+		const h = stream ? c.handles.peek(stream) : undefined;
+		if (!h || h.bound === 0) throw new Error(`doc not bound: ${docId}`);
+		if (c.repo.stream(h.stream)?.frozen) throw new Error("doc frozen");
+		h.doc.transact(() => fn(h.doc.getText("text")), ORIGIN.MERGE);
+		h.lastAccessMono = c.mono();
+		return h.builder.empty ? Promise.resolve() : c.docs.closeFrame(h);
+	}
+
+	/** The bound replica's text (O(N), worker only: attach, reload, save marks). */
+	boundText(docId: DocId): string {
+		const stream = this.boundStreams.get(docId);
+		const h = stream ? this.c.handles.peek(stream) : undefined;
+		if (!h || h.bound === 0) throw new Error(`doc not bound: ${docId}`);
+		return h.doc.getText("text").toString();
+	}
+
+	/** The bound replica's length (O(1)). */
+	boundLength(docId: DocId): number {
+		const stream = this.boundStreams.get(docId);
+		const h = stream ? this.c.handles.peek(stream) : undefined;
+		return h && h.bound > 0 ? h.doc.getText("text").length : -1;
+	}
+
+	/** The doc is bound and frozen (no edits accepted). */
+	boundFrozen(docId: DocId): boolean {
+		const stream = this.boundStreams.get(docId);
+		return stream ? Boolean(this.c.repo.stream(stream)?.frozen) : false;
+	}
+
 	async bind(docId: DocId): Promise<BindResult> {
 		const c = this.c;
 		const stream = this.streamOf(docId);
@@ -368,7 +442,15 @@ export class LogEngine {
 		h.bound++;
 		this.boundStreams.set(docId, stream);
 		c.sess.scheduleCatchUp();
-		return { state: encodeStateAsUpdate(h.doc), stateVector: Y.encodeStateVector(h.doc) };
+		const doc = h.doc;
+		return {
+			get state() {
+				return encodeStateAsUpdate(doc);
+			},
+			get stateVector() {
+				return Y.encodeStateVector(doc);
+			},
+		};
 	}
 
 	unbind(docId: DocId): void {

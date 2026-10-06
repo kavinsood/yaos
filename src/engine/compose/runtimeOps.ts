@@ -10,7 +10,6 @@ import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamNam
 import { badRequest } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
-import { encodeStateAsUpdate } from "../body/yjsCounters";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
 import { dbName, STORE } from "../store/schema";
 import { readBase } from "../reconcile/store";
@@ -27,23 +26,14 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
 	}
 	const docId = e.docId;
 	const first = rt.engine.bound.add(docId, path, viewId);
-	let bind: { state: Uint8Array; stateVector: Uint8Array };
 	try {
-		bind = await rt.log.bind(docId);
-		if (!first) rt.log.unbind(docId);
+		// One replica pin per bound doc (released when its last view closes); the views attach next (bodyAttach).
+		if (first) await rt.log.bind(docId);
 	} catch (err) {
 		rt.engine.bound.remove(docId, viewId);
 		throw err;
 	}
-	const s = rt.rec.ctx.synced(docId);
-	const baseText = s?.hasBase ? await rt.rec.ctx.store.loadBase(docId) : null;
-	return {
-		t: "bind",
-		bind: {
-			docId, kind: "markdown", state: bind.state, stateVector: bind.stateVector, baseText,
-			baseHash: baseText !== null && s ? s.contentHash : null, frozen: e.body?.frozen ?? false,
-		},
-	};
+	return { t: "bind", bind: { docId, kind: "markdown", frozen: e.body?.frozen ?? false } };
 }
 
 /**
@@ -75,11 +65,6 @@ export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefi
 	if (!ctx.local.has(key)) return e;
 	for (const o of ctx.store.synced.values()) if (o.pathKey === key && o.docId !== e.docId) return undefined;
 	return e;
-}
-
-export function fullState(rt: VaultRuntime, docId: DocId): Uint8Array | null {
-	const h = rt.log.handleOf(docId);
-	return h ? encodeStateAsUpdate(h.doc) : null;
 }
 
 export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineResultValue> {

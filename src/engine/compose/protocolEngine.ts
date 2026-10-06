@@ -27,6 +27,8 @@ import type { StatusSnapshot } from "../../protocol/status";
 import type { EngineTransport } from "../../protocol/transport";
 import type { Budgets } from "../../core/limits";
 import type { EngineTuning } from "../runtime/options";
+import { BoundBody } from "./boundBody";
+import { BoundDisk } from "./boundDisk";
 import { BoundDocs } from "./boundDocs";
 import { HostLink } from "./hostLink";
 import { idleStatus } from "./statusMerge";
@@ -67,6 +69,8 @@ const MAX_REPLAY_EVENTS = 20_000;
 export class ComposedEngine {
 	readonly link: HostLink;
 	readonly bound: BoundDocs;
+	readonly boundBody: BoundBody;
+	readonly boundDisk: BoundDisk;
 	config: EngineInitConfig | null = null;
 	settings: EngineSettings | null = null;
 	ports: EnginePorts | null = null;
@@ -90,8 +94,13 @@ export class ComposedEngine {
 		this.bound = new BoundDocs({
 			post: (m) => this.link.post(m),
 			window: () => BUDGETS[this.config?.deviceClass ?? "desktop"].docUpdateWindowBytes,
-			fullState: (docId) => this.rt?.fullState(docId) ?? null,
+			durableNow: (docId) => this.rt?.log.bodyDurable(docId) ?? false,
 		});
+		this.boundDisk = new BoundDisk({
+			bound: this.bound, post: (m) => this.link.post(m), runtime: () => this.rt,
+			clock: () => this.ports?.clock ?? null, disposed: () => this.disposed,
+		});
+		this.boundBody = new BoundBody({ bound: this.bound, disk: this.boundDisk, runtime: () => this.rt, diag: (m) => this.log(m) });
 		this.offs.push(transport.onMessage((m) => this.onMessage(m)));
 	}
 
@@ -265,6 +274,7 @@ export class ComposedEngine {
 			this.link.post({ t: "docRetarget", docId: b.docId, change: { t: "renamed", path: b.path } });
 		}
 		this.bound.clear();
+		this.boundBody.clear();
 		if (old) await old.stop().catch((e) => this.log(`runtime stop failed: ${String(e)}`));
 		if (beforeStart) await beforeStart();
 		if (reason === "epoch") this.knownEpoch = undefined;
@@ -324,6 +334,7 @@ export class ComposedEngine {
 				this.recordEvents(m.events);
 				for (const e of m.events) if (e.t === "rename") this.bound.followRename(pathKey(e.from), e.to, pathKey);
 				rt?.vaultEvents(m.events);
+				this.boundDisk.onVaultEvents(m.events);
 				return;
 			case "openDoc": {
 				if (!rt) {
@@ -338,14 +349,21 @@ export class ComposedEngine {
 				if (rt) rt.closeDoc(m.docId, m.viewId);
 				else this.bound.remove(m.docId, m.viewId);
 				return;
-			case "localUpdate":
-			case "bindDelta":
-				rt?.localUpdate(m.docId, m.update);
+			// Body messages run synchronously up to their first await: their order is the host's (DESIGN §d.3).
+			case "textChunk":
+				this.boundBody.textChunk(m);
 				return;
-			case "boundSaved":
-				rt?.boundSaved(m.docId, m.path, m.stat);
+			case "bodyAttach":
+				await this.boundBody.attach(m);
 				return;
-			case "boundExternalMerged":
+			case "bodyPush":
+				this.boundBody.push(m);
+				return;
+			case "bodyReload":
+				await this.boundDisk.reload(m.docId, m.viewId, m.reload);
+				return;
+			case "bodySaveMark":
+				this.boundBody.saveMark(m);
 				return;
 			case "docCredit":
 				this.bound.credit(m.bytes);

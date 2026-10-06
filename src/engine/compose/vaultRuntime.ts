@@ -145,7 +145,8 @@ export class VaultRuntime {
 			ports: o.ports, vaultId: config.vaultId, deviceId: config.deviceId, deviceClass: config.deviceClass,
 			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,
-			onDocUpdate: (docId, update, origin) => engine.bound.push(docId, update, origin === "local" ? "merge" : origin),
+			onBoundText: (docId, changes, length, origin) => engine.bound.onText(docId, changes, length, origin),
+			onFrameTaken: (docId) => engine.bound.frameTaken(docId),
 			onDocFrozen: (docId, reason) => holder.rt?.onFrozen(docId, reason),
 			onNsFold: (frames, reloaded) => holder.rt?.onNsFold(frames, reloaded),
 			onCfgFold: () => holder.rt?.requestCfg(),
@@ -481,18 +482,6 @@ export class VaultRuntime {
 		if (!this.engine.bound.remove(docId, viewId)) return;
 		this.log.unbind(docId);
 		this.sched.request({ t: "docs", docIds: [docId], pathKeys: [] });
-	}
-
-	fullState(docId: DocId): Uint8Array | null {
-		return ops.fullState(this, docId);
-	}
-
-	localUpdate(docId: DocId, update: Uint8Array): void {
-		try {
-			this.log.applyLocalUpdate(docId, update);
-		} catch (e) {
-			this.diag(`localUpdate dropped: ${e instanceof Error ? e.message : String(e)}`);
-		}
 	}
 
 	boundSaved(docId: DocId, path: VaultPath, stat: VaultStat): void {

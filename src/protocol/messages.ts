@@ -15,7 +15,7 @@
  */
 
 import type {
-	ContentHash, DeviceId, DiskFingerprint, DocId, DocKind, VaultEpoch, VaultId, VaultPath, BrakeReport, ConflictReason,
+	DeviceId, DocId, DocKind, VaultEpoch, VaultId, VaultPath, BrakeReport,
 } from "../core/types";
 import type { DeviceClass } from "../core/limits";
 import type { PlatformInfo, LifecycleEvent } from "../ports/platform";
@@ -23,7 +23,7 @@ import type { VaultEvent, VaultStat, WritePrecondition, WriteOutcome, RenameOutc
 import type { ProtocolError } from "./errors";
 import type { StatusSnapshot, DiagnosticsBundle } from "./status";
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export type RequestId = number;
 
@@ -102,7 +102,38 @@ export type DiskOpResult =
 	/** Not attempted: an earlier op of the batch failed and this one depended on it. */
 	| { readonly opId: number; readonly t: "skipped" };
 
-export type DocUpdateOrigin = "remote" | "provisional" | "merge" | "restore" | "resync";
+/** Why a bound doc's worker replica changed (not by the view's own push). */
+export type DocUpdateOrigin = "remote" | "provisional" | "merge" | "editor";
+
+/**
+ * A change to a bound body, in CodeMirror ChangeSet JSON (ChangeSet.toJSON, @codemirror/state): a number keeps
+ * that many UTF-16 units; [n] deletes n; [n, ...lines] replaces n units with the lines joined by "\n" (DESIGN §d.3).
+ * Both sides split and join on "\n" only, so a "\r" is one ordinary unit and lengths match Y.Text exactly.
+ */
+export type BodyChanges = readonly (number | readonly [number, ...string[]])[];
+
+/**
+ * Per-doc body events, FIFO per doc, within the docCredit window (DESIGN §d.3). Versions count the worker
+ * replica's changes since the doc was bound; every view of the doc sees every event in order.
+ *  - entry: the replica went from version `from` to `to` = from + 1 by `changes`. `author` is the view whose
+ *    bodyPush it is (that view confirms instead of applying); null for remote / provisional / merge changes.
+ *    `length` = replica length after (UTF-16 units): an O(1) divergence check on main.
+ *  - bound: the bodyAttach of view `viewId` whose editor upload is `attach` was merged at `version`: `changes`
+ *    turn the uploaded editor text into the replica text (length `length`). Events before it are inside for that view.
+ *  - reject: the bodyPush `seq` of `viewId` was based on an older version; every entry it missed is before it.
+ *  - durable: every change up to `version` is in committed storage (the restart merge base, §d.3).
+ *  - reloaded: the bodyReload `reload` of `viewId` is merged (its entry, if any, is before it); `save` = the
+ *    replica differs from the file text the engine read, so the views should save.
+ */
+export type BodyEvent =
+	| { readonly t: "entry"; readonly from: number; readonly to: number; readonly changes: BodyChanges; readonly length: number; readonly origin: DocUpdateOrigin; readonly author: { readonly viewId: number; readonly seq: number } | null }
+	| { readonly t: "bound"; readonly viewId: number; readonly attach: number; readonly version: number; readonly changes: BodyChanges; readonly length: number }
+	| { readonly t: "reject"; readonly viewId: number; readonly seq: number; readonly version: number }
+	| { readonly t: "durable"; readonly version: number }
+	| { readonly t: "reloaded"; readonly viewId: number; readonly reload: number; readonly save: boolean };
+
+/** A hash the host asks the engine for (main never hashes, DESIGN §d.4). */
+export type HashWant = "fingerprint" | "contentHash";
 
 /**
  * Small host I/O calls the disk side needs besides reads and disk ops
@@ -120,16 +151,10 @@ export type HostIoResult =
 	| { readonly t: "sideFiles"; readonly names: readonly SideFileName[] }
 	| { readonly t: "done" };
 
+/** openDoc answer. The host then uploads the editor text and sends bodyAttach (DESIGN §d.3). */
 export interface BindInfo {
 	readonly docId: DocId;
 	readonly kind: DocKind;
-	/** Y.encodeStateAsUpdate of the worker replica. [T] */
-	readonly state: Uint8Array;
-	/** Y.encodeStateVector of the worker replica. [T] */
-	readonly stateVector: Uint8Array;
-	/** Synced base text for the bind-time merge; null = no base. */
-	readonly baseText: string | null;
-	readonly baseHash: ContentHash | null;
 	/** Doc is frozen by the ingest gate: bind read-only, show banner. */
 	readonly frozen: boolean;
 }
@@ -198,15 +223,35 @@ export type MainToEngine =
 	| { readonly t: "vaultEvents"; readonly events: readonly VaultEvent[] }
 	| { readonly t: "openDoc"; readonly rid: RequestId; readonly path: VaultPath; readonly viewId: number }
 	| { readonly t: "closeDoc"; readonly docId: DocId; readonly viewId: number }
-	/** Main replica update (editor or main-side merge), coalesced <= 16 ms. Never dropped. [T] */
-	| { readonly t: "localUpdate"; readonly docId: DocId; readonly update: Uint8Array; readonly origin: "editor" | "merge" }
-	/** Main replica delta after (re)bind: Y.encodeStateAsUpdate(mainDoc, BindInfo.stateVector). [T] */
-	| { readonly t: "bindDelta"; readonly docId: DocId; readonly update: Uint8Array }
-	/** Obsidian saved a bound view: new synced base (persisted lazily). */
-	| { readonly t: "boundSaved"; readonly docId: DocId; readonly path: VaultPath; readonly text: string; readonly fingerprint: DiskFingerprint; readonly stat: VaultStat }
-	/** Bound-view external change was merged on main; conflict copy (if any) already requested. */
-	| { readonly t: "boundExternalMerged"; readonly docId: DocId; readonly result: "identical" | "disk-only" | "clean" | "conflict"; readonly conflictReason: ConflictReason | null }
+	/**
+	 * A piece of a text upload (editor text, merge base, reload): the UTF-16 code units (platform byte order, exact
+	 * for any JS string, protocol/utf16.ts), split anywhere; `last` completes upload `uploadId`. Only a bind (first
+	 * open, restart, resync) uploads whole texts, never typing or reloads (DESIGN §d.3). [T]
+	 */
+	| { readonly t: "textChunk"; readonly uploadId: number; readonly bytes: Uint8Array; readonly last: boolean }
+	/**
+	 * Bind view `viewId` (after openDoc answered `bind`): merge the uploaded editor text into the replica, answered
+	 * by a `bound` body event. `base` = uploaded merge base (restart / resync: the last durable text the view saw),
+	 * null = the engine's synced base. `saved` = uploaded view.data when the editor had unsaved edits, null = the
+	 * editor text is what Obsidian loaded (the reload merge base).
+	 */
+	| { readonly t: "bodyAttach"; readonly docId: DocId; readonly viewId: number; readonly editor: number; readonly base: number | null; readonly saved: number | null }
+	/** Editor changes of view `viewId` against version `base`, coalesced <= 16 ms; answered by an entry or a reject. */
+	| { readonly t: "bodyPush"; readonly docId: DocId; readonly viewId: number; readonly seq: number; readonly base: number; readonly changes: BodyChanges }
+	/**
+	 * Obsidian reloaded bound view `viewId` from its file (an external write; the view holds its saves until
+	 * `reloaded`): the engine reads the file and merges it into the replica (§d.3). `reload` = the view's counter.
+	 */
+	| { readonly t: "bodyReload"; readonly docId: DocId; readonly viewId: number; readonly reload: number }
+	/**
+	 * Obsidian read view `viewId` for a save while its text was the replica at `version` (after its own push
+	 * `seq`, null = no push pending): the engine keeps that text as one the disk may hold (absorbed, §d.3).
+	 */
+	| { readonly t: "bodySaveMark"; readonly docId: DocId; readonly viewId: number; readonly version: number; readonly seq: number | null }
+	/** Body event weight applied on main (returns docCredit window). */
 	| { readonly t: "docCredit"; readonly bytes: number }
+	/** Hash raw bytes the host read (write preconditions, config writes); answered by `hashes`. [T] */
+	| { readonly t: "hashRequest"; readonly rid: RequestId; readonly items: readonly { readonly path: string; readonly want: HashWant; readonly bytes: Uint8Array /* [T] */ }[] }
 	| { readonly t: "result"; readonly re: RequestId; readonly value: MainResultValue }
 	| { readonly t: "error"; readonly re: RequestId; readonly error: ProtocolError }
 	| { readonly t: "command"; readonly rid: RequestId; readonly command: UserCommand };
@@ -227,10 +272,13 @@ export type MainResultValue =
 export type EngineToMain =
 	| { readonly t: "result"; readonly re: RequestId; readonly value: EngineResultValue }
 	| { readonly t: "error"; readonly re: RequestId; readonly error: ProtocolError }
-	/** Remote/merge/provisional update for a bound doc, FIFO per doc, within the docCredit window. [T] */
-	| { readonly t: "docUpdate"; readonly docId: DocId; readonly update: Uint8Array; readonly origin: DocUpdateOrigin }
-	/** Doc identity changed under a bound view (merged alias, remote rename, delete, freeze). */
-	| { readonly t: "docRetarget"; readonly docId: DocId; readonly change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "deleted" } | { readonly t: "frozen"; readonly reason: string } }
+	/** A bound doc's body event (FIFO per doc); main returns `weight` as docCredit once applied. */
+	| { readonly t: "body"; readonly docId: DocId; readonly event: BodyEvent; readonly weight: number }
+	/**
+	 * Doc identity changed under a bound view (merged alias, remote rename, delete, freeze), or (`resync`) the
+	 * engine dropped body events past 4x the credit window: the host re-binds those views.
+	 */
+	| { readonly t: "docRetarget"; readonly docId: DocId; readonly change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "deleted" } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" } }
 	/** A path became bindable (e.g. its create was planned): host retries openDoc for open views. */
 	| { readonly t: "bindable"; readonly path: VaultPath }
 	| { readonly t: "readRequest"; readonly rid: RequestId; readonly reads: readonly DiskReadRequest[] }
@@ -252,6 +300,8 @@ export type EngineResultValue =
 	| { readonly t: "ok" }
 	| { readonly t: "pong" }
 	| { readonly t: "bind"; readonly bind: BindInfo }
+	/** hashRequest: per item, the hash asked for and the UTF-16 length of the bytes decoded with any BOM kept. */
+	| { readonly t: "hashes"; readonly values: readonly { readonly hash: string; readonly textLength: number }[] }
 	/** openDoc on an untracked path (excluded, not yet created, oversize). */
 	| { readonly t: "notBindable"; readonly reason: "excluded" | "untracked" | "oversize" | "not-markdown" }
 	/** listSnapshots, oldest first (ids sort by time). */

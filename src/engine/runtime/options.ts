@@ -9,6 +9,7 @@ import type { EnginePorts } from "../../ports";
 import type { SideFilePort } from "../../ports/vault";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import { DEFAULT_CHECKPOINT_TUNING, type CheckpointTuning } from "../body/checkpoints";
+import type { TextChanges } from "../body/textChanges";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import { NS_CANDIDATE_MODULUS, type FoldedNsFrame } from "../sync/nsRuntime";
 
@@ -71,6 +72,8 @@ export const DEFAULT_TUNING: EngineTuning = {
 
 /** Where an update forwarded to the host came from. */
 export type DocUpdateOrigin = "remote" | "provisional" | "local";
+/** Why a bound body's text changed: "editor" = applyEditorChanges, "merge" = an engine merge (editDoc, mergeJob). */
+export type BoundTextOrigin = "remote" | "provisional" | "merge" | "editor";
 
 export interface EngineOptions {
 	readonly ports: EnginePorts;
@@ -90,6 +93,16 @@ export interface EngineOptions {
 	readonly autoReconnect?: boolean;
 	/** Updates applied to a bound doc that the host did not author. */
 	onDocUpdate?(docId: DocId, update: Uint8Array, origin: DocUpdateOrigin): void;
+	/**
+	 * A bound body's text changed (any origin), as CodeMirror ChangeSet JSON over the text before (textChanges.ts);
+	 * `length` = text length after. Synchronous, inside the Yjs transaction's observer phase (DESIGN §d.3).
+	 */
+	onBoundText?(docId: DocId, changes: TextChanges, length: number, origin: BoundTextOrigin): void;
+	/**
+	 * A bound doc's open frame was taken for T_edit (everything applied so far is in it or in earlier frames).
+	 * The returned callback runs once that T_edit committed (true) or failed (false).
+	 */
+	onFrameTaken?(docId: DocId): ((ok: boolean) => void) | undefined;
 	/** A doc stream was frozen (DESIGN §d.6; protocol docRetarget{frozen}): the host unbinds and re-opens read-only. */
 	onDocFrozen?(docId: DocId, reason: string): void;
 	/**
