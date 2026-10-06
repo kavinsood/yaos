@@ -218,7 +218,7 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 ```
 
 - HKDF is from [RFC5869]. The base key is imported with `extractable:false` ([WebCrypto] §33.4.2), and derived keys
-  take `extractable:false` explicitly (§14.3.7).
+  take `extractable:false` explicitly ([WebCrypto] §14.3.7).
 - Subkeys are derived **lazily** per epoch on first use. Startup derives the newest epoch's set plus kAddr and
   kDiag: 7 `deriveKey` calls.
 - **Why kAddr and kDiag live for the whole vault.**
