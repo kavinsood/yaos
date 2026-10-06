@@ -10,7 +10,7 @@
  *    written unless it passes; pass 2 re-reads the verified parts and writes each entry (restore.ts). Any failed
  *    check is `content_corrupt`: notice + diagnostic, the download cache is removed, the request fails.
  */
-import { SnapCorrupt, SNAP_DEFAULT_PART_BYTES, type SnapManifest } from "../../core/snap/bundle";
+import { SnapCorrupt, snapPartBytes, type SnapManifest } from "../../core/snap/bundle";
 import { snapLive } from "../../core/snap/fold";
 import { parseRemoteSnapshotId, parseSnapshotId, remoteSnapshotId, snapKey, snapshotId, type SnapReason, type SnapRecord } from "../../core/snap/record";
 import { verifyBundle } from "../../core/snap/verify";
@@ -54,7 +54,7 @@ export interface SnapshotDeps {
 	readonly tzOffsetMinutes?: () => number;
 	readonly notice?: (level: "info" | "warn", code: string, detail?: string) => void;
 	readonly diag?: (line: string) => void;
-	/** Zip part size; default min(8 MiB, 7/8 of the store's blob limit). */
+	/** Zip part size; default snapPartBytes (min(8 MiB, 7/8 of the store's blob limit)). */
 	readonly partBytes?: number;
 }
 
@@ -175,7 +175,7 @@ export class SnapshotJob {
 		while (await readLocal(d.side, snapshotId(createdAtMs, reason))) createdAtMs++;
 		const id = snapshotId(createdAtMs, reason);
 		const store = this.rd?.store;
-		const partBytes = d.partBytes ?? (store ? Math.min(SNAP_DEFAULT_PART_BYTES, Math.floor((store.maxBlobBytes * 7) / 8)) : SNAP_DEFAULT_PART_BYTES);
+		const partBytes = d.partBytes ?? snapPartBytes(store ? store.maxBlobBytes : null);
 		this.busy = id;
 		this.locals = null;
 		try {
