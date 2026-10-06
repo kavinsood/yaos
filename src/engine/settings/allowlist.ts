@@ -111,15 +111,15 @@ export function sanitizeConfigDirKey(basename: string): string | null {
 	return basename;
 }
 
-/** `version` from a plugin manifest.json, or null when missing/invalid. */
-export function manifestVersion(bytes: Uint8Array | null, decode: (b: Uint8Array) => string | null): string | null {
-	if (!bytes) return null;
-	const text = decode(bytes);
-	if (text === null) return null;
+/** `version` and display `name` from a plugin manifest.json; each null when missing/invalid. */
+export function readManifest(bytes: Uint8Array | null, decode: (b: Uint8Array) => string | null): { readonly version: string | null; readonly name: string | null } {
+	const text = bytes ? decode(bytes) : null;
+	if (text === null) return { version: null, name: null };
 	try {
-		const v = (JSON.parse(text) as { version?: unknown }).version;
-		return typeof v === "string" && v.length > 0 ? v : null;
+		const m = JSON.parse(text) as { version?: unknown; name?: unknown } | null;
+		const str = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
+		return { version: str(m?.version), name: str(m?.name) };
 	} catch {
-		return null;
+		return { version: null, name: null };
 	}
 }

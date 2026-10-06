@@ -113,6 +113,15 @@ export const OUTBOX_MIRROR_DEBOUNCE_MS = 1_000;
 export const OUTBOX_MIRROR_TRIM_DEBOUNCE_MS = 5_000;
 export const SYNCED_MIRROR_DEBOUNCE_MS = 30_000;
 
+// --- Settings sync (DESIGN §j.3; legacy settingsSync/types.ts) ---------------
+
+/** Largest config file settings sync sends or writes. */
+export const CFG_MAX_FILE_BYTES = 1_000_000;
+/** Synced config files, in path order, stop at the first one that would take the total past this. */
+export const CFG_MAX_TOTAL_BYTES = 4_000_000;
+/** ... or past this many files. */
+export const CFG_MAX_FILES = 256;
+
 // --- Relay ------------------------------------------------------------------
 
 export const RELAY_CLOSE = {

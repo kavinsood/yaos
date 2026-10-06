@@ -15,11 +15,18 @@
  * version equals the register's pluginVersion and is emitted only with a known
  * local version; data.json is never deleted or fileDel'd; enabling a plugin is
  * projected only when it is installed; YAOS's own enablement is never touched.
+ *
+ * Size caps (core/limits CFG_MAX_*): a file whose local or incoming content is
+ * over CFG_MAX_FILE_BYTES is held. In path order, the first file that would take
+ * the synced set past CFG_MAX_FILES or CFG_MAX_TOTAL_BYTES (size after this pass)
+ * is held, and so is every later one. A held file is left exactly as it is: no
+ * op, no write, cfgBase untouched. Removals and local deletes are never held.
  */
 import { canonicalJson, type JsonValue } from "../../core/hash/canvasCanonical";
 import { exactFingerprint } from "../../core/hash/markdownLf";
 import { sha256Hex } from "../../core/hash/sha256";
 import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
+import { CFG_MAX_FILE_BYTES, CFG_MAX_FILES, CFG_MAX_TOTAL_BYTES } from "../../core/limits";
 import type { CfgFoldState, CfgOp, CfgRegister, ConfigRelPath, ContentHash, DiskFingerprint } from "../../core/types";
 import type { CfgBaseRecord } from "../store/schema";
 import { CFG_INLINE_MAX_BYTES, CFG_PLUGINS_FILE, canApplyPluginData, cfgJsonKey, classifyConfigPath, isDeviceLocalKey, isSyncablePluginId, type CfgFileClass } from "./allowlist";
@@ -30,6 +37,10 @@ export interface CfgLocalSnapshot {
 	readonly files: ReadonlyMap<ConfigRelPath, CfgLocalFile>;
 	/** Installed community plugins: id -> manifest version (null = unreadable manifest). */
 	readonly installed: ReadonlyMap<string, string | null>;
+	/** Installed community plugins: id -> manifest display name, when it has one. */
+	readonly pluginNames: ReadonlyMap<string, string>;
+	/** Allowlisted local files left out by the size caps (not in `files`): never emitted, written or deleted. */
+	readonly held: ReadonlyMap<ConfigRelPath, CfgHoldReason>;
 }
 export interface CfgPlanInput {
 	readonly local: CfgLocalSnapshot;
@@ -54,7 +65,12 @@ export interface CfgFileAction {
 	/** Obsidian must reload to pick the write up. */
 	readonly reload: boolean;
 }
-export type CfgSkipReason = "unparseable" | "plugin-version" | "no-manifest" | "not-installed" | "data-json-delete";
+export type CfgHoldReason = "too-large" | "over-cap";
+/**
+ * plugin-version: data.json written by another version than the installed one; plugin-absent: data.json of a
+ * plugin not installed here; no-manifest: local data.json of a plugin whose manifest has no version.
+ */
+export type CfgSkipReason = "unparseable" | "plugin-version" | "plugin-absent" | "no-manifest" | "not-installed" | "data-json-delete" | CfgHoldReason;
 export interface CfgPlan {
 	readonly actions: readonly CfgFileAction[];
 	readonly skipped: readonly { readonly file: ConfigRelPath; readonly key: string | null; readonly reason: CfgSkipReason }[];
@@ -64,6 +80,26 @@ const hashText = (s: string): ContentHash => sha256Hex(utf8Encode(s)) as Content
 const H_TRUE = hashText("true");
 
 type Skips = { file: ConfigRelPath; key: string | null; reason: CfgSkipReason }[];
+
+/** Count/total cap over files fed in path order; once one does not fit, nothing more does. */
+export class CfgBudget {
+	private files = 0;
+	private bytes = 0;
+	private closed = false;
+
+	/** Admit a file of `size` bytes after this pass (null = absent: always fits, counts nothing). */
+	admit(size: number | null): boolean {
+		if (size === null) return true;
+		if (this.closed || this.files + 1 > CFG_MAX_FILES || this.bytes + size > CFG_MAX_TOTAL_BYTES) {
+			this.closed = true;
+			return false;
+		}
+		this.files++;
+		this.bytes += size;
+		return true;
+	}
+	close(): void { this.closed = true; }
+}
 
 export function planCfg(input: CfgPlanInput): CfgPlan {
 	const jsonByFile = new Map<ConfigRelPath, Map<string, CfgRegister<string>>>();
@@ -75,17 +111,31 @@ export function planCfg(input: CfgPlanInput): CfgPlan {
 		if (!m) jsonByFile.set(file, (m = new Map()));
 		m.set(k.slice(cut + 1), reg);
 	}
-	const files = new Set<ConfigRelPath>([...input.local.files.keys(), ...input.base.keys(), ...input.view.files.keys(), ...jsonByFile.keys()]);
+	const files = new Set<ConfigRelPath>([...input.local.files.keys(), ...input.local.held.keys(), ...input.base.keys(), ...input.view.files.keys(), ...jsonByFile.keys()]);
 	if (input.view.plugins.size > 0) files.add(CFG_PLUGINS_FILE);
 	const actions: CfgFileAction[] = [];
 	const skipped: Skips = [];
+	const budget = new CfgBudget();
 	for (const file of [...files].sort()) {
 		const cls = classifyConfigPath(file);
 		if (!cls) continue;
-		const ctx: FileCtx = { file, local: input.local.files.get(file), base: input.base.get(file), nowMs: input.nowMs, skipped };
+		const held = input.local.held.get(file);
+		if (held) {
+			if (held === "over-cap") budget.close();
+			skipped.push({ file, key: null, reason: held });
+			continue;
+		}
+		const ctx: FileCtx = { file, local: input.local.files.get(file), base: input.base.get(file), nowMs: input.nowMs, skipped: [] };
 		const a = cls.t === "json" ? planJson(ctx, jsonByFile.get(file) ?? new Map())
 			: cls.t === "plugins" ? planPlugins(ctx, input.view, input.local.installed)
 			: planFile(ctx, cls, input.view, input.local.installed);
+		const w = a?.write;
+		const after = !w ? ctx.local?.bytes.length ?? null : w.t === "bytes" ? w.bytes.length : w.t === "blob" ? w.size : null;
+		if (!budget.admit(after)) {
+			skipped.push({ file, key: null, reason: "over-cap" });
+			continue;
+		}
+		skipped.push(...ctx.skipped);
 		if (a && (a.ops.length > 0 || a.write || !sameBase(ctx.base ?? null, a.base))) actions.push(a);
 	}
 	return { actions, skipped };
@@ -115,7 +165,14 @@ function record(file: ConfigRelPath, bytes: Uint8Array | null, mtimeMs: number, 
 	return { file, fingerprint: exactFingerprint(bytes), size: bytes.length, mtimeMs, keyHashes };
 }
 
-function finish(ctx: FileCtx, ops: CfgOp[], next: Uint8Array | null, keyHashes: Record<string, ContentHash>): CfgFileAction {
+function tooLarge(ctx: FileCtx, size: number): boolean {
+	if (size <= CFG_MAX_FILE_BYTES) return false;
+	ctx.skipped.push({ file: ctx.file, key: null, reason: "too-large" });
+	return true;
+}
+
+function finish(ctx: FileCtx, ops: CfgOp[], next: Uint8Array | null, keyHashes: Record<string, ContentHash>): CfgFileAction | null {
+	if (next && tooLarge(ctx, next.length)) return null;
 	const cur = ctx.local?.bytes ?? null;
 	const bytes = next ?? cur;
 	return {
@@ -229,12 +286,13 @@ function planFile(ctx: FileCtx, cls: CfgFileClass, view: CfgFoldState, installed
 			if (isData) { ctx.skipped.push({ file: ctx.file, key: null, reason: "data-json-delete" }); return null; }
 			return act({ write: { t: "remove" }, base: null, reload });
 		}
-		if (isData && !canApplyPluginData(localVer, F.pluginVersion)) {
-			ctx.skipped.push({ file: ctx.file, key: null, reason: "plugin-version" });
+		if (cls.t === "pluginData" && !canApplyPluginData(localVer, F.pluginVersion)) {
+			ctx.skipped.push({ file: ctx.file, key: null, reason: installed.has(cls.pluginId) ? "plugin-version" : "plugin-absent" });
 			return null;
 		}
-		const write: CfgWrite = F.content.t === "inline" ? { t: "bytes", bytes: F.content.bytes } : { t: "blob", hash: F.content.hash, size: F.content.size };
 		const size = F.content.t === "inline" ? F.content.bytes.length : F.content.size;
+		if (tooLarge(ctx, size)) return null;
+		const write: CfgWrite = F.content.t === "inline" ? { t: "bytes", bytes: F.content.bytes } : { t: "blob", hash: F.content.hash, size: F.content.size };
 		return act({ write, base: base(hF, size, ctx.nowMs), reload });
 	}
 	if (!lb || !L) {
