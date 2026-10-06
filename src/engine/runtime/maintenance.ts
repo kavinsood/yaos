@@ -7,8 +7,8 @@
 
 import { NS_STREAM, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
-import { bodyCheckpointDue, nsCheckpointDue, writeBodyCheckpoint, writeNsCheckpoint } from "../body/checkpoints";
-import { compactBody, compactNs, needsCompaction } from "../body/compaction";
+import { bodyCheckpointDue, foldCheckpointDue, writeBodyCheckpoint, writeFoldCheckpoint } from "../body/checkpoints";
+import { compactBody, compactFold, needsCompaction } from "../body/compaction";
 import type { EngineCtx } from "./context";
 
 const COMPACTIONS_PER_TICK = 4;
@@ -108,12 +108,12 @@ export class Maintenance {
 		let budget = COMPACTIONS_PER_TICK;
 		for (const r of [...c.repo.streams()]) {
 			if (budget <= 0 || c.stopped) return;
-			if (r.cls !== "body" && r.cls !== "canvas" && r.cls !== "ns") continue;
+			if (r.cls !== "body" && r.cls !== "canvas" && r.cls !== "ns" && r.cls !== "cfg") continue;
 			if (r.stale || r.frozen || c.sess.isReading(r.stream)) continue;
 			if ((this.compactSkip.get(r.stream) ?? 0) > now) continue;
 			if (!needsCompaction(r, c.tuning.compactRows, c.tuning.compactBytes)) continue;
 			budget--;
-			const res = r.cls === "ns" ? await compactNs(c.deps, c.ns) : await compactBody(c.deps, r.stream);
+			const res = r.cls === "ns" ? await compactFold(c.deps, c.ns) : r.cls === "cfg" ? await compactFold(c.deps, c.cfg) : await compactBody(c.deps, r.stream);
 			if (res.t === "ok") {
 				this.stats.compactions++;
 				this.compactSkip.delete(r.stream);
@@ -158,17 +158,22 @@ export class Maintenance {
 				c.diag("checkpoint-failed", { cls: r.cls, error: String(e) });
 			}
 		}
-		if (c.session !== s || c.sess.isReading(NS_STREAM)) return;
-		if (!nsCheckpointDue(c.repo.stream(NS_STREAM), c.ns, c.ckpt, c.tuning.checkpoint, now, this.jitter(NS_STREAM))) return;
-		try {
-			const o = await writeNsCheckpoint(c.deps, c.ckpt, s, c.ns);
-			this.count(`ns-${o.t}`);
-			if (o.t === "ok") this.stats.checkpoints++;
-			else if (o.t === "skipped") c.ckpt.backoffUntil.set(NS_STREAM, now + CHECKPOINT_ERROR_BACKOFF_MS);
-		} catch (e) {
-			this.count("ns-error");
-			c.ckpt.backoffUntil.set(NS_STREAM, now + CHECKPOINT_ERROR_BACKOFF_MS);
-			c.diag("checkpoint-failed", { cls: "ns", error: String(e) });
+		for (const fold of [c.ns, c.cfg]) {
+			const stream = fold.stream;
+			const cls = stream === NS_STREAM ? "ns" : "cfg";
+			if (c.session !== s) return;
+			if (c.sess.isReading(stream)) continue;
+			if (!foldCheckpointDue(c.repo.stream(stream), fold, c.ckpt, c.tuning.checkpoint, now, this.jitter(stream))) continue;
+			try {
+				const o = await writeFoldCheckpoint(c.deps, c.ckpt, s, fold);
+				this.count(`${cls}-${o.t}`);
+				if (o.t === "ok") this.stats.checkpoints++;
+				else if (o.t === "skipped") c.ckpt.backoffUntil.set(stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
+			} catch (e) {
+				this.count(`${cls}-error`);
+				c.ckpt.backoffUntil.set(stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
+				c.diag("checkpoint-failed", { cls, error: String(e) });
+			}
 		}
 	}
 

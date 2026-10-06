@@ -3,19 +3,21 @@
  *
  * Body/canvas: compact first so snapshotCoversSeq = appliedSeq = C, seal the
  * snapshot as a yjsStateV1 checkpoint (checkpoint AAD), putCheckpoint(stream,
- * C, remoteCheckpointCoversSeq). ns: only candidate seqs (§b.5) with the fold
- * bytes NsRuntime kept for the newest candidate.
+ * C, remoteCheckpointCoversSeq). ns / cfg: only candidate seqs (§b.5, same
+ * rule for cfg) with the fold bytes the fold runtime kept for the newest
+ * candidate. cfg uses the ns row / byte thresholds (decision: the cfg stream
+ * is small; one tuning pair for both folds).
  */
 
 import { CheckpointEncoding } from "../../core/envelope";
 import { FOLD_RULES_VERSION, REMOTE_CHECKPOINT_BYTES, REMOTE_CHECKPOINT_IDLE_MS, REMOTE_CHECKPOINT_ROWS, NS_CHECKPOINT_BYTES, NS_CHECKPOINT_ROWS } from "../../core/limits";
-import { NS_STREAM, type Seq, type StreamName, type VaultId } from "../../core/types";
+import { streamClass, type Seq, type StreamName, type VaultId } from "../../core/types";
 import type { CryptoPort } from "../../ports/crypto";
 import type { PutCheckpointResult, RelaySession } from "../../ports/relay";
 import { sealCheckpoint } from "../ingest/envelope";
 import type { Mut, Repo } from "../store/repo";
 import type { StreamRecord } from "../store/schema";
-import type { NsRuntime } from "../sync/nsRuntime";
+import type { FoldRuntime } from "../sync/foldRuntime";
 import { encodeCheckpointContent } from "../../core/codec/contents";
 import { compactBody, type CompactDeps } from "./compaction";
 
@@ -117,7 +119,7 @@ async function applyOutcome(
 				r.remoteCheckpointCoversSeq = current;
 				if (current >= c) resetCounters(r);
 			} }], now);
-			deps.diag("checkpoint-conflict", { cls: stream === NS_STREAM ? "ns" : "body", current, coversSeq: c });
+			deps.diag("checkpoint-conflict", { cls: streamClass(stream), current, coversSeq: c });
 			return { t: "conflict", current, retry: current < c };
 		}
 		case "refused":
@@ -179,34 +181,36 @@ export async function writeBodyCheckpoint(deps: CheckpointDeps, st: CheckpointSt
 	return applyOutcome(deps, st, session, stream, c, snap.bytes.length, res);
 }
 
-/** ns duty: candidate exists above the remote checkpoint and enough rows/bytes accumulated. */
-export function nsCheckpointDue(rec: StreamRecord | undefined, ns: NsRuntime, st: CheckpointState, tuning: CheckpointTuning, nowMono: number, jitterMs: number): boolean {
-	const cand = ns.candidate;
-	if (!rec || !cand || rec.stale || ns.halted) return false;
+/** ns / cfg duty: candidate exists above the remote checkpoint and enough rows/bytes accumulated. */
+export function foldCheckpointDue(rec: StreamRecord | undefined, fold: FoldRuntime<unknown, unknown>, st: CheckpointState, tuning: CheckpointTuning, nowMono: number, jitterMs: number): boolean {
+	const cand = fold.candidate;
+	const stream = fold.stream;
+	if (!rec || !cand || rec.stale || fold.halted) return false;
 	if (cand.seq <= rec.remoteCheckpointCoversSeq) return false;
 	if (nowMono < st.holdUntilMono) return false;
-	if ((st.backoffUntil.get(NS_STREAM) ?? 0) > nowMono) return false;
+	if ((st.backoffUntil.get(stream) ?? 0) > nowMono) return false;
 	const cond = rec.rowsSinceRemoteCheckpoint >= tuning.nsRows || rec.bytesSinceRemoteCheckpoint >= tuning.nsBytes;
 	if (!cond) {
-		st.condSince.delete(NS_STREAM);
+		st.condSince.delete(stream);
 		return false;
 	}
-	if (!st.condSince.has(NS_STREAM)) st.condSince.set(NS_STREAM, nowMono);
+	if (!st.condSince.has(stream)) st.condSince.set(stream, nowMono);
 	if (cand.authoredBySelf) return true;
-	return nowMono - st.condSince.get(NS_STREAM)! >= tuning.fallbackMs + jitterMs;
+	return nowMono - st.condSince.get(stream)! >= tuning.fallbackMs + jitterMs;
 }
 
-export async function writeNsCheckpoint(deps: CheckpointDeps, st: CheckpointState, session: RelaySession, ns: NsRuntime): Promise<CheckpointOutcome> {
-	const rec = deps.repo.stream(NS_STREAM);
-	const cand = ns.candidate;
+export async function writeFoldCheckpoint(deps: CheckpointDeps, st: CheckpointState, session: RelaySession, fold: FoldRuntime<unknown, unknown>): Promise<CheckpointOutcome> {
+	const stream = fold.stream;
+	const rec = deps.repo.stream(stream);
+	const cand = fold.candidate;
 	if (!rec || !cand) return { t: "skipped", reason: "no-candidate" };
 	if (cand.seq <= rec.remoteCheckpointCoversSeq) return { t: "skipped", reason: "not-advancing-local" };
-	const content = encodeCheckpointContent({ encoding: CheckpointEncoding.nsFoldV1, coversSeq: cand.seq, foldRulesVersion: FOLD_RULES_VERSION, state: cand.bytes });
-	const sealed = await sealCheckpoint(deps.crypto, deps.vaultId, NS_STREAM, cand.seq, content, deps.authorNsSeq());
+	const content = encodeCheckpointContent({ encoding: fold.encoding, coversSeq: cand.seq, foldRulesVersion: fold.rulesVersion, state: cand.bytes });
+	const sealed = await sealCheckpoint(deps.crypto, deps.vaultId, stream, cand.seq, content, deps.authorNsSeq());
 	if (sealed.length > session.limits.maxCheckpointBytes) {
-		st.tooLarge.set(NS_STREAM, cand.bytes.length);
+		st.tooLarge.set(stream, cand.bytes.length);
 		return { t: "skipped", reason: "too-large-local" };
 	}
-	const res = await session.putCheckpoint(NS_STREAM, cand.seq, rec.remoteCheckpointCoversSeq, sealed);
-	return applyOutcome(deps, st, session, NS_STREAM, cand.seq, cand.bytes.length, res);
+	const res = await session.putCheckpoint(stream, cand.seq, rec.remoteCheckpointCoversSeq, sealed);
+	return applyOutcome(deps, st, session, stream, cand.seq, cand.bytes.length, res);
 }

@@ -12,6 +12,7 @@
  */
 
 import { CheckpointEncoding } from "../../core/envelope";
+import { FOLD_RULES_VERSION } from "../../core/limits";
 import { decodeNsFoldV1, encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
@@ -43,6 +44,8 @@ export interface DocInfo {
 }
 
 export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
+	readonly encoding = CheckpointEncoding.nsFoldV1;
+	readonly rulesVersion = FOLD_RULES_VERSION;
 	state: NsFoldState = newNsFoldState();
 	index: NsFoldIndex = buildIndex(this.state);
 
@@ -69,7 +72,7 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 		return { events, halted: nsFoldHalted(events) };
 	}
 
-	protected encodeState(): Uint8Array {
+	encodeState(): Uint8Array {
 		return encodeNsFoldV1(this.state);
 	}
 

@@ -126,6 +126,7 @@ export class SessionLoop {
 			if (gen !== c.gen) return;
 			c.sender.openNs();
 			await c.afterNsChange();
+			await c.afterCfgChange();
 			if (gen !== c.gen) return;
 			c.setPhase(c.dailyLimitUntilMono > c.mono() ? "daily-limit" : "live");
 			this.st = newReconnectState();
@@ -273,10 +274,9 @@ export class SessionLoop {
 				if (res.checkpointState || res.apply.length > 0) await c.docs.applyToHandle(h, res.apply, res.checkpointState);
 				c.docs.checkDoc(h);
 			}
-		} else if (cls === "ns") {
-			if (res.replacedFold) await c.ns.load();
-			await c.afterNsChange();
-		} else if (cls === "blobchunk" && res.tailPut.length > 0) await c.docs.retryRefs();
+		} else if (cls === "ns") await c.afterNsChange(res.replacedFold);
+		else if (cls === "cfg") await c.afterCfgChange(res.replacedFold);
+		else if (cls === "blobchunk" && res.tailPut.length > 0) await c.docs.retryRefs();
 		if (cls !== "ns" && res.removed.length > 0) await c.afterNsChange();
 		if (res.rows > 0 || res.t === "done") c.lastSyncedAtMs = c.now();
 		c.scheduleStatus();

@@ -12,12 +12,11 @@
 
 import * as Y from "yjs";
 import { CheckpointEncoding } from "../../core/envelope";
-import { NS_STREAM, streamClass, type Seq, type StreamName } from "../../core/types";
+import { streamClass, type Seq, type StreamName } from "../../core/types";
 import type { Repo } from "../store/repo";
 import type { SnapshotRecord, StreamRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
-import type { NsRuntime } from "../sync/nsRuntime";
-import { encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
+import type { FoldRuntime } from "../sync/foldRuntime";
 import { encodeStateAsUpdate, ORIGIN } from "./yjsCounters";
 
 export interface CompactDeps {
@@ -114,20 +113,22 @@ export async function unionBodyCheckpoint(deps: CompactDeps, stream: StreamName,
 }
 
 /** ns compaction: snapshot = nsFoldV1(state) at state.coversSeq; deletes tail rows <= it. */
-export async function compactNs(deps: Pick<CompactDeps, "repo" | "nowMs">, ns: NsRuntime): Promise<CompactResult> {
-	const rec = deps.repo.stream(NS_STREAM);
+/** ns / cfg compaction (§d.8): snapshot = the fold's canonical bytes at its coversSeq, tail <= coversSeq deleted. */
+export async function compactFold(deps: Pick<CompactDeps, "repo" | "nowMs">, fold: FoldRuntime<unknown, unknown>): Promise<CompactResult> {
+	const stream = fold.stream;
+	const rec = deps.repo.stream(stream);
 	if (!rec) return { t: "skip", reason: "unknown" };
 	if (rec.stale) return { t: "skip", reason: "stale" };
-	await ns.advance();
-	if (ns.halted) return { t: "skip", reason: "halted" };
-	const c = ns.coversSeq;
+	await fold.advance();
+	if (fold.halted) return { t: "skip", reason: "halted" };
+	const c = fold.coversSeq;
 	const expect = rec.snapshotCoversSeq;
 	if (c <= expect) return { t: "skip", reason: "nothing" };
-	const rows = await deps.repo.getTail(NS_STREAM, 0, c);
-	const bytes = encodeNsFoldV1(ns.state);
+	const rows = await deps.repo.getTail(stream, 0, c);
+	const bytes = fold.encodeState();
 	const out = await deps.repo.tSnapshot({
-		stream: NS_STREAM, expectSnapshotCoversSeq: expect,
-		snapshot: { stream: NS_STREAM, coversSeq: c, encoding: CheckpointEncoding.nsFoldV1, bytes, createdAtMs: deps.nowMs() },
+		stream, expectSnapshotCoversSeq: expect,
+		snapshot: { stream, coversSeq: c, encoding: fold.encoding, bytes, createdAtMs: deps.nowMs() },
 		deleteSeqs: rows.map((r) => r.seq), fromRemote: false,
 	});
 	if (!out) return { t: "skip", reason: "cas" };

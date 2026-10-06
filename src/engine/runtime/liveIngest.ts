@@ -16,7 +16,7 @@
  * The queue survives a session close (its events are committed facts).
  */
 
-import { NS_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
 import type { RelayEvent } from "../../ports/relay";
 import type { LiveItem } from "../store/repo";
 import { gateRow } from "../sync/ingestRow";
@@ -190,6 +190,7 @@ export class LiveIngest {
 		c.applyOutboxResult(res);
 		await c.docs.applyRows(res.tailPut.filter((r) => !skipApply.has(r.seq)));
 		if (res.removed.length > 0 || res.tailPut.some((r) => r.stream === NS_STREAM)) await c.afterNsChange();
+		if (res.tailPut.some((r) => r.stream === CFG_STREAM)) await c.afterCfgChange();
 		if (stale > 0) c.sess.scheduleCatchUp();
 		c.scheduleStatus();
 	}

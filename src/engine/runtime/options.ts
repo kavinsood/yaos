@@ -9,7 +9,8 @@ import type { EnginePorts } from "../../ports";
 import type { SideFilePort } from "../../ports/vault";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import { DEFAULT_CHECKPOINT_TUNING, type CheckpointTuning } from "../body/checkpoints";
-import { NS_CANDIDATE_MODULUS } from "../sync/nsRuntime";
+import type { CfgFoldEvent } from "../../core/cfg/fold";
+import { NS_CANDIDATE_MODULUS, type FoldedNsFrame } from "../sync/nsRuntime";
 
 export interface EngineTuning {
 	/** Local compaction trigger (DESIGN §d.8). */
@@ -85,6 +86,14 @@ export interface EngineOptions {
 	onDocUpdate?(docId: DocId, update: Uint8Array, origin: DocUpdateOrigin): void;
 	/** A doc stream was frozen (DESIGN §d.6; protocol docRetarget{frozen}): the host unbinds and re-opens read-only. */
 	onDocFrozen?(docId: DocId, reason: string): void;
+	/**
+	 * Committed ns frames just folded, in seq order (called after the fold advanced and held records were
+	 * reconciled). reloaded = the fold was rebuilt from a new snapshot (remote checkpoint adoption, boot):
+	 * frames covered by the snapshot are not reported, re-read nsView().
+	 */
+	onNsFold?(folded: readonly FoldedNsFrame[], reloaded: boolean): void;
+	/** Events of committed cfg frames just folded (reloaded: as onNsFold; re-read cfgView()). */
+	onCfgFold?(events: readonly CfgFoldEvent[], reloaded: boolean): void;
 	onStatus?(status: StatusSnapshot): void;
 	onDiag?(event: DiagnosticsEvent): void;
 }

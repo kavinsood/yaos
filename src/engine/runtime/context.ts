@@ -6,7 +6,7 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { streamDocId, type ClientFrameId, type DeviceId, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, streamDocId, type ClientFrameId, type DeviceId, type DocId, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
@@ -20,6 +20,7 @@ import type { GateCtx } from "../ingest/gate";
 import type { Mut, Repo } from "../store/repo";
 import type { OutboxRecord } from "../store/schema";
 import type { CatchUpDeps } from "../sync/catchUp";
+import type { CfgRuntime } from "../sync/cfgRuntime";
 import type { NsRuntime } from "../sync/nsRuntime";
 import type { DocRuntime } from "./docRuntime";
 import type { LiveIngest } from "./liveIngest";
@@ -52,6 +53,7 @@ export class EngineCtx {
 	readonly deps: EngineDeps;
 	repo!: Repo;
 	ns!: NsRuntime;
+	cfg!: CfgRuntime;
 	handles!: HandleManager;
 	sender!: Sender;
 	docs!: DocRuntime;
@@ -77,6 +79,8 @@ export class EngineCtx {
 	readonly adoptMap = new Map<string, ClientFrameId>();
 	readonly adoptRev = new Map<ClientFrameId, string>();
 	readonly adoptTimers = new Map<ClientFrameId, TimerHandle>();
+	/** docId -> cfid of the own ns frame creating it (first body frame dependsOn it while it is in the outbox, §e.1). */
+	readonly pendingCreates = new Map<DocId, ClientFrameId>();
 	private readonly notices: Notice[] = [];
 	private readonly ring: DiagnosticsEvent[] = [];
 	private statusTimer: TimerHandle | null = null;
@@ -165,6 +169,9 @@ export class EngineCtx {
 	/** Mirror committed outbox transitions into the cache, the sender and the adopt map. */
 	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly updated: readonly OutboxRecord[] }): void {
 		for (const r of res.removed) {
+			// ns/cfg records leave the outbox only on (late) receipt: keep them in the overlay until folded.
+			if (r.stream === NS_STREAM) this.ns.noteCommitted(r);
+			else if (r.stream === CFG_STREAM) this.cfg.noteCommitted(r);
 			this.outbox.delete(r.clientFrameId);
 			this.sender.remove(r.clientFrameId);
 			this.sentPending.delete(r.clientFrameId);
@@ -225,11 +232,41 @@ export class EngineCtx {
 		return this.outbox.get(own)?.state === "adoptable" ? own : null;
 	}
 
-	/** Fold newly available ns rows, then release / delete held records whose create folded (DESIGN §e.1). */
-	async afterNsChange(): Promise<void> {
-		await this.ns.advance();
+	/**
+	 * Fold newly available ns rows (reload: snapshot replaced, refold from it), then release / delete held
+	 * records whose create folded (DESIGN §e.1), then report the folded frames.
+	 */
+	async afterNsChange(reload = false): Promise<void> {
+		const folded = reload ? await this.ns.load() : await this.ns.advance();
 		const changes = this.ns.reconcileHeld(this.outbox);
 		if (changes.length > 0) this.applyOutboxResult(await this.repo.tOutbox(changes));
+		if (folded.length > 0 || reload) this.emit("onNsFold", () => this.opts.onNsFold?.(folded, reload));
+	}
+
+	/** Fold newly available cfg rows (reload: snapshot replaced) and report them. */
+	async afterCfgChange(reload = false): Promise<void> {
+		const folded = reload ? await this.cfg.load() : await this.cfg.advance();
+		if (folded.length === 0 && !reload) return;
+		const events = folded.flatMap((f) => f.events);
+		this.emit("onCfgFold", () => this.opts.onCfgFold?.(events, reload));
+	}
+
+	/** Host callback; a throwing callback is logged, never breaks the engine. */
+	emit(name: string, fn: () => void): void {
+		try {
+			fn();
+		} catch (e) {
+			this.diag("callback-failed", { name, error: String(e) });
+		}
+	}
+
+	/** Own ns create of `docId` still in the outbox (held dependency for its first body frames), else null. */
+	createDependency(docId: DocId): ClientFrameId | null {
+		const cfid = this.pendingCreates.get(docId);
+		if (cfid === undefined) return null;
+		if (this.outbox.has(cfid)) return cfid;
+		this.pendingCreates.delete(docId);
+		return null;
 	}
 
 	async freeze(stream: StreamName, reason: string): Promise<void> {

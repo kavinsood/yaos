@@ -14,6 +14,7 @@
  * removed the outbox record but before the row is folded (stale stream, halt).
  */
 
+import type { CheckpointEncoding } from "../../core/envelope";
 import { NS_CANDIDATE_INTERVAL, isCandidateSeq } from "../../core/ns/candidate";
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../../core/types";
 import type { Repo } from "../store/repo";
@@ -68,13 +69,18 @@ export abstract class FoldRuntime<Op, E> {
 		private readonly candidateInterval = NS_CANDIDATE_INTERVAL,
 	) {}
 
+	/** Snapshot / checkpoint encoding of the committed state (nsFoldV1 / cfgFoldV1). */
+	abstract readonly encoding: CheckpointEncoding;
+	/** foldRulesVersion written into checkpoints. */
+	abstract readonly rulesVersion: number;
 	abstract get coversSeq(): Seq;
 	/** Replace the committed state from the snapshot (undefined / unusable -> empty). */
 	protected abstract reset(snap: SnapshotRecord | undefined): void;
 	/** null = deterministic malformation (folds as an empty frame). */
 	protected abstract decodeOps(content: Uint8Array): Op[] | null;
 	protected abstract foldFrame(row: TailRecord, ops: readonly Op[]): { readonly events: readonly E[]; readonly halted: boolean };
-	protected abstract encodeState(): Uint8Array;
+	/** Canonical encoding of the committed state (snapshot / checkpoint bytes). */
+	abstract encodeState(): Uint8Array;
 
 	/** (Re)load from the snapshot and refold the tail. */
 	async load(): Promise<FoldedFrame<Op, E>[]> {

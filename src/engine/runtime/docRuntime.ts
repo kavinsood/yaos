@@ -7,7 +7,7 @@
 
 import * as Y from "yjs";
 import { MAX_DOC_TEXT_CHARS } from "../../core/limits";
-import { streamClass, type ClientFrameId, type StreamName } from "../../core/types";
+import { streamClass, streamDocId, type ClientFrameId, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelayEvent } from "../../ports/relay";
 import { buildAdoptFrame, buildBodyFrames, FrameTooLargeError } from "../body/frames";
@@ -104,7 +104,8 @@ export class DocRuntime {
 		const c = this.c;
 		return this.chain(async () => {
 			try {
-				const dependsOn = c.outbox.newestAdoptable(h.stream)?.clientFrameId ?? c.outbox.heldDependency(h.stream);
+				const docId = streamDocId(h.stream);
+				const dependsOn = c.outbox.newestAdoptable(h.stream)?.clientFrameId ?? c.outbox.heldDependency(h.stream) ?? (docId ? c.createDependency(docId) : null);
 				const frames = await buildBodyFrames(c.deps, { stream: h.stream, content: taken.content, flags: taken.flags, authorNsSeq: c.ns.coversSeq, dependsOn, nowMs: c.now() });
 				c.addOutbox(await c.repo.tEdit(frames, c.now()));
 				c.ckpt.lastActivity.set(h.stream, c.mono());

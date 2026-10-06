@@ -12,10 +12,11 @@
 
 import * as Y from "yjs";
 import { EnvelopeFlag } from "../../core/envelope";
-import { NS_STREAM, docStream, kindOfPath, streamClass, type ContentHash, type DocId, type DocKind, type NsOp, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import type { CfgFoldEvent } from "../../core/cfg/fold";
+import { NS_STREAM, docStream, kindOfPath, streamClass, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { RelaySession } from "../../ports/relay";
-import { buildBodyFrames, buildNsFrame, initialTextUpdates } from "../body/frames";
+import { buildBodyFrames, initialTextUpdates } from "../body/frames";
 import { HandleManager, type Handle } from "../body/handles";
 import { Sender } from "../body/sender";
 import { encodeStateAsUpdate, ORIGIN } from "../body/yjsCounters";
@@ -24,7 +25,11 @@ import type { QuarantineRecord, TailRecord } from "../store/schema";
 import { newDocId } from "../../core/codec/ids";
 import { bytesToHex, utf8Encode } from "../../core/codec/lib0";
 import { gateRow } from "../sync/ingestRow";
+import type { BodyHandle } from "../reconcile/deps";
+import { decodeNsOps } from "../../core/codec/nsOps";
+import { CfgRuntime } from "../sync/cfgRuntime";
 import { NsRuntime, type DocInfo } from "../sync/nsRuntime";
+import * as api from "./logApi";
 import { EngineCtx } from "./context";
 import { DocRuntime } from "./docRuntime";
 import { LiveIngest } from "./liveIngest";
@@ -95,6 +100,7 @@ export class LogEngine {
 		repo.priorityFn = (r) => ((c.handles?.peek(r.stream)?.bound ?? 0) > 0 ? -10 : defaultPriority(r));
 		c.repo = repo;
 		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus);
+		c.cfg = new CfgRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.docs = new DocRuntime(c);
 		c.handles = new HandleManager(repo, c.budgets, c.docs.hooks());
 		c.sender = new Sender({
@@ -134,9 +140,12 @@ export class LogEngine {
 			c.outbox.put(r);
 			if (r.state === "adoptable") c.registerAdopt(r);
 			else c.sender.upsert(r);
+			if (r.stream === NS_STREAM && r.state !== "poisoned") {
+				for (const op of decodeNsOps(r.content) ?? []) if (op.t === "create") c.pendingCreates.set(op.docId, r.clientFrameId);
+			}
 		}
-		await c.ns.load();
-		await c.afterNsChange();
+		await c.afterNsChange(true);
+		await c.afterCfgChange(true);
 		eng.maint.start();
 		if (first) void c.sess.onSession(first);
 		else c.sess.startLoop();
@@ -160,11 +169,7 @@ export class LogEngine {
 	}
 
 	private async authorNs(ops: readonly NsOp[]): Promise<void> {
-		const c = this.c;
-		await c.docs.chain(async () => {
-			const f = await buildNsFrame(c.deps, NS_STREAM, ops, c.ns.coversSeq, c.now());
-			c.addOutbox(await c.repo.tEdit([f], c.now()));
-		});
+		await api.submitNs(this.c, ops);
 	}
 
 	async createDoc(path: VaultPath, text: string, kind: DocKind = kindOfPath(path)): Promise<DocId> {
@@ -175,24 +180,23 @@ export class LogEngine {
 		const stream = docStream(kind, docId)!;
 		const bytes = utf8Encode(text);
 		const contentHash = bytesToHex(await c.ports.hash.sha256(bytes)) as ContentHash;
-		await c.docs.chain(async () => {
-			const nsFrame = await buildNsFrame(c.deps, NS_STREAM, [{ t: "create", docId, kind, path, contentHash, size: bytes.length }], c.ns.coversSeq, c.now());
-			const h = await c.handles.acquire(stream);
-			try {
-				const frames = [nsFrame];
+		const h = await c.handles.acquire(stream);
+		try {
+			await api.submitNs(c, [{ t: "create", docId, kind, path, contentHash, size: bytes.length }], async ([nsFrame]) => {
+				const frames = [];
 				if (kind === "markdown" && text.length > 0) {
 					for (const u of initialTextUpdates(h.doc, text)) {
-						frames.push(...await buildBodyFrames(c.deps, { stream, content: u, flags: EnvelopeFlag.initial, authorNsSeq: c.ns.coversSeq, dependsOn: nsFrame.clientFrameId, nowMs: c.now() }));
+						frames.push(...await buildBodyFrames(c.deps, { stream, content: u, flags: EnvelopeFlag.initial, authorNsSeq: c.ns.coversSeq, dependsOn: nsFrame!.clientFrameId, nowMs: c.now() }));
 					}
 				}
-				c.addOutbox(await c.repo.tEdit(frames, c.now()));
-			} catch (e) {
-				c.handles.unpin(h);
-				c.handles.drop(stream);
-				throw e;
-			}
+				return frames;
+			});
+		} catch (e) {
 			c.handles.unpin(h);
-		});
+			c.handles.drop(stream);
+			throw e;
+		}
+		c.handles.unpin(h);
 		return docId;
 	}
 
@@ -203,6 +207,70 @@ export class LogEngine {
 	deleteDoc(docId: DocId): Promise<void> {
 		const rec = this.c.repo.stream(this.streamOf(docId));
 		return this.authorNs([{ t: "delete", docId, baseBodySeq: Math.max(rec?.appliedSeq ?? 0, rec?.lastOwnSeq ?? 0) }]);
+	}
+
+	// ------------------------------------------------------------ ns / cfg
+
+	/** Own ns ops -> frames (<= MAX_NS_OPS_PER_FRAME) in the outbox; resolves once committed (in nsView()). */
+	submitNs(ops: readonly NsOp[]): Promise<ClientFrameId[]> {
+		return api.submitNs(this.c, ops);
+	}
+
+	/** Committed fold + own pending ns frames (§f.1). */
+	nsView(): api.NsView {
+		return api.nsView(this.c);
+	}
+
+	/** Own cfg ops -> frames in the outbox; resolves once committed (in cfgView()). */
+	submitCfg(ops: readonly CfgOp[]): Promise<ClientFrameId[]> {
+		return api.submitCfg(this.c, ops);
+	}
+
+	/** Committed cfg fold + own pending cfg frames (a copy). */
+	cfgView(): CfgFoldState {
+		return api.cfgView(this.c);
+	}
+
+	/** Body info of a markdown / canvas doc; null = unknown doc or blob. `kind` skips the lookup. */
+	bodyInfo(docId: DocId, kind?: DocKind): RemoteBodyInfo | null {
+		return api.bodyInfo(this.c, docId, kind ?? api.docKind(this.c, docId));
+	}
+
+	/** Docs with own body / canvas frames in the outbox. */
+	docsWithPendingBody(): Set<DocId> {
+		return api.docsWithPendingBody(this.c);
+	}
+
+	/**
+	 * Pin the worker replica of a doc's body stream (markdown -> b:, canvas -> c:) for a merge job (§d.1).
+	 * Works for docs only in the optimistic view (own pending create). null = the stream is frozen.
+	 */
+	async openBody(docId: DocId, kind: "markdown" | "canvas"): Promise<BodyHandle | null> {
+		const c = this.c;
+		const stream = docStream(kind, docId)!;
+		if (c.repo.stream(stream)?.frozen) return null;
+		const h = await c.handles.acquire(stream);
+		let released = false;
+		const version = (): BodyVersion => c.repo.stream(stream)?.bodyVersion ?? { remoteSeq: 0, localOrder: 0 };
+		return {
+			docId,
+			doc: h.doc,
+			mergeOrigin: ORIGIN.MERGE,
+			get bound() {
+				return h.bound > 0;
+			},
+			commitEdits: async () => {
+				await c.docs.closeFrame(h);
+				return version();
+			},
+			version,
+			release: () => {
+				if (released) return;
+				released = true;
+				if (!h.builder.empty) void c.docs.closeFrame(h);
+				c.handles.unpin(h);
+			},
+		};
 	}
 
 	/** Disk-merge style edit: one MERGE transaction, frame closed at once. */
