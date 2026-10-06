@@ -1,0 +1,25 @@
+e2e/conformance/lib/fixture.ts
+  s_4bbb4f0137215c::t_107843dd63b843 30-31,48-49,65-68
+e2e/conformance/lib/http.ts
+  s_4bbb4f0137215c::t_2526758abb0744 19-21
+e2e/conformance/tests/onboarding.ts
+  s_4bbb4f0137215c::t_3bb53bf6dbc5b6 108
+e2e/conformance/tests/revoke.ts
+  s_4bbb4f0137215c::t_2a0ab9dd458d44 45-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "760ec97b05cf73f31c1af60997b0a7e0b48bf406",
+  "prompts": {},
+  "sessions": {
+    "s_4bbb4f0137215c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a75978e2782c742bb",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
