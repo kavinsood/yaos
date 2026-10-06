@@ -1,0 +1,5 @@
+{
+	"extends": "../../tsconfig.client-tests.json",
+	"compilerOptions": { "noEmit": true, "lib": ["DOM", "ES2022"], "target": "ES2022", "module": "ESNext" },
+	"include": ["./*.ts", "../../src/**/*.ts"]
+}
