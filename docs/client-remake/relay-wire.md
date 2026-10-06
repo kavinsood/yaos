@@ -504,8 +504,9 @@ when the Worker binds `YAOS_BUCKET` (R2). Then `capabilities.attachments` is `tr
 Without the bucket these return `503 attachments_unavailable`. The client-e2e deployment and local dev run
 **without R2**, which matches the Free-plan profile; the client must treat attachments as unavailable.
 `start-local.sh --r2` keeps the bucket (miniflare R2) for tests that need it, such as e2e/client/snapshots.ts. A
-client can reference blobs from stream payloads by hash. Because the relay checks no hashes, the client verifies
-every blob it downloads (DESIGN §j.1, §j.4).
+client names a blob by `CryptoPort.blobAddress(sha256)`: the sha256 under suite 0, `HMAC(kAddr, sha256)` under
+suite 1 (e2ee-design §10.1), so no plaintext hash reaches the relay in a route or an `exists` body under suite 1.
+Because the relay checks no hashes, the client verifies every blob it downloads (DESIGN §j.1, §j.4).
 
 ### 11.4 Cloudflare Free-plan daily limit
 
