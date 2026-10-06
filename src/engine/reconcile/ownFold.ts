@@ -16,7 +16,7 @@
  *   restore revived    -> path = requested path, nsTouchSeq = seq
  *   S has moved on (the requested path is not written) when a later own
  *   rename/restore of the doc is in this batch or still pending (S follows that
- *   move), or when a suffixed rename's S already sits at the final path: a pass
+ *   move), or when a suffixed rename's / restore's S already sits at the final path: a pass
  *   that ran between the fold and this S1 batch projected the committed entry
  *   (materialized or moved the file there). Writing the requested path back
  *   would point S at a path the file left, possibly another doc's file.
@@ -73,7 +73,7 @@ export async function applyOwnFold(ctx: Ctx, events: readonly OwnFoldEvent[]): P
 				break;
 			case "restore":
 				if (!s || outcome.kind !== "revived") break;
-				next.set(op.docId, movedOn(i, op.docId, op.path, op.path, s) ? { ...s, nsTouchSeq: seq } : { ...s, path: op.path, pathKey: ctx.pk(op.path), nsTouchSeq: seq });
+				next.set(op.docId, movedOn(i, op.docId, op.path, outcome.finalPath, s) ? { ...s, nsTouchSeq: seq } : { ...s, path: op.path, pathKey: ctx.pk(op.path), nsTouchSeq: seq });
 				break;
 			case "setBlob": {
 				if (!s || outcome.kind !== "applied") break;

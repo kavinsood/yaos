@@ -160,3 +160,27 @@ test("own rename applied while S is still at the old path (synced mirror restore
 	assert.deepEqual(w.vault.snapshot(), { "a.md": "new\n", "b.md": "a\n" });
 	assert.ok(res.quiet);
 });
+
+test("own restore suffixed, S1 lands after a pass already moved the file to the final path: S is not pointed back", async () => {
+	const w = new World();
+	await w.boot();
+	const d = w.log.remoteCreate(P("a.md"), "a\n");
+	await w.sync();
+	w.log.holdNs = true;
+	w.vault.userWrite("a.md", "a\nmine\n");
+	w.log.remoteDelete(d);
+	await w.sync(); // edit beats delete: own restore at a.md, pending
+	const x = w.log.remoteCreate(P("a.md"), "x\n");
+	const s1 = w.log.onOwnFold;
+	w.log.onOwnFold = null;
+	const folded = await w.log.flushNs();
+	assert.deepEqual(folded.filter((e) => e.op.t === "restore").map((e) => e.outcome), [{ kind: "revived", finalPath: "a (2).md" }]);
+	await w.sync();
+	assert.equal(w.synced(d)?.path, "a (2).md");
+	await s1?.(folded);
+	const res = await w.sync();
+	assert.equal(w.synced(d)?.path, "a (2).md", "S stays where the file is");
+	assert.equal(w.synced(x)?.path, "a.md");
+	assert.deepEqual(w.vault.snapshot(), { "a (2).md": "a\nmine\n", "a.md": "x\n" });
+	assert.ok(res.quiet, "no retried disk rename");
+});
