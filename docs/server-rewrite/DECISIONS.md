@@ -145,9 +145,9 @@ pairing-code make zero config-DO calls, checked with a counting stub).
 
 **D5 Surviving routes.** Exactly the §2.2 table; everything else → 404.
 - Static Worker responses, no DO call: the console (`GET /`), `GET /mobile-setup` (the target of `mobileSetupUrl`
-  and the claim QR) and CORS preflight.
+  and the console's setup QR) and CORS preflight.
 - The console is one server-rendered page with inline JS and no external assets. It covers claim, login, the
-  vault list, create vault, owner code + QR (`setupQr.ts`), devices + revoke, reset streams behind a typed vaultId
+  vault list, create vault, owner code + QR (drawn in the page, O12), devices + revoke, reset streams behind a typed vaultId
   confirmation, and the D8b "Restore incomplete" banner.
 - Operator JSON routes require `Content-Type: application/json` and a same-origin `Origin`. The cookie is
   HttpOnly, Secure, SameSite=Strict, 7 days.
@@ -638,7 +638,7 @@ P2 and P4 gap calls (accepted; marked `DECISIONS-GAP` in code). G7 is closed: ro
 - G24 The D3 enroll limiter counts 404, 410 and `409 used_code`; malformed bodies don't count.
 - G25 Operator response shapes (the console reads only these): state `{vaults:[{vaultId,name,createdAt}],
   pendingRestores:[{vaultId,at}]}`; devices `{devices:[{deviceId,deviceName,enrolledAt}]}`; owner-code adds
-  `mobileSetupUrl` and `mobileSetupQrDataUrl`.
+  `mobileSetupUrl`. Neither claim nor owner-code carries a QR; the console draws it (O12).
 - G26 The console generates the recovery key in the page and sends `/claim` only after "I have saved it" is ticked.
 - G27 The entry module (`worker.ts`) exports only the fetch handler and the DO classes: workerd treats every named
   export as an entrypoint and refuses to start on a constant. The route table is `router.ts`; a WB test guards it.
@@ -659,7 +659,8 @@ P3a gap calls (accepted; marked `DECISIONS-GAP` in code):
   P5 shows `exceededCpu`. P5: none, but scratch-3's account is Workers Enterprise, so Free's 10 ms is not enforced
   there and cannot show up. Worker CPU p50 0.6 ms (the old server: 2.4 ms). Over 10 ms (GraphQL
   `workersInvocationsAdaptive`): claim 64 ms and owner-code 7–46 ms in the Worker, both rendering the setup QR
-  (O12), and VaultDO 4 MiB stream reads 21–24 ms. Still open until a Free account is measured.
+  (moved to the console page, O12), and VaultDO 4 MiB stream reads 21–24 ms. Still open until a Free account is
+  measured.
 - O9 → resolved: a daily-limit failure on any route, including one thrown by a DO RPC, is `503 cf_daily_limit`
   with Retry-After (router.ts:187-188; WB in tests/server/reset.ts). Revoke under the latch changes nothing and
   says so; the device keeps its read access until the reset (≤ 24 h). Kept: a gate shut in memory only would not
@@ -699,10 +700,16 @@ P3b gap calls (accepted; marked `DECISIONS-GAP` in code):
 
 P5 findings:
 
-- O12 (decision pending) The setup QR is rendered in the Worker (setupQr.ts, `qrcode-generator` `make()`: 8 ms cold,
-  2.6 ms warm on a laptop for the 195-character URL, version 10). It makes claim and owner-code the only Worker
-  routes over Free's 10 ms CPU (O10). Options: render it in the console page (G25 drops `mobileSetupQrDataUrl`; the
-  console is its only reader), or keep it and rely on the platform tolerating rare overruns.
+- O12 → resolved (the user's call, 2026-10-06: the console draws it). The setup QR was rendered in the Worker
+  (`qrcode-generator` `make()`: 8 ms cold, 2.6 ms warm on a laptop for the 195-character URL, version 10), which made
+  claim and owner-code the only Worker routes over Free's 10 ms CPU (O10). Now the console page inlines
+  qrcode-generator 2.0.4's browser build (`dist/qrcode.js`, 56 KB) verbatim as its first nonce script; a wrangler
+  Text rule bundles it as text, and the Node tests alias the import to the same file (tests/mocks/qrcodeScript.ts).
+  The page encodes setupQr.ts's mobile setup URL on `location.origin` as the SVG the Worker sent. Claim and
+  owner-code drop `mobileSetupQrDataUrl` (G25); the console was its only reader and the client never read it. WB:
+  tests/server/console.ts matches the drawn modules to the library's for that URL. Headless Chrome on local
+  `wrangler dev` (d51c3ae): the encoder runs under the CSP, and jsQR decodes both QRs (claim, owner-code) to the
+  exact URL; no page error or CSP violation.
 - O13 A refused upgrade (relay-wire §3.1: accept, error frame, close, 101; vault/cloudflare.ts) logs as a VaultDO
   `scriptThrewException` "Network connection lost" on scratch-3. Clients get the frame and the close code (the
   refusal rows pass); the cost is noise in error analytics.
@@ -756,4 +763,4 @@ refused T, 11 s after the vault's init, and the runner retried forever with the 
 writes they must keep and the vault's first snapshot awaited: 42 pass, 0 fail
 (`restore-manual-scratch3-20261006T125029Z.json`). Final suite at f9ce3a1 (version 249ab495):
 `conformance-scratch3-p5-final-20261006T125917Z.json`, 48 pass, 0 fail, the same 2 SKIP. P5 is done. CPU: O10,
-O12. Open: O12 (decision), O13, O14, O16.
+O12. Open: O13, O14, O16 (O12 resolved after P5).
