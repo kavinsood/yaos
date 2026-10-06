@@ -40,7 +40,7 @@ import type { BindInfo, EngineResultValue, MainToEngine } from "../protocol/mess
 import type { Hasher } from "./hashing";
 import { utf8 } from "./hashing";
 import { DEFAULT_MERGE_LIMITS, merge } from "../core/merge/merge";
-import { minimalDiff } from "../core/merge/minimalDiff";
+import { applyEditsTo, minimalDiff } from "../core/merge/minimalDiff";
 
 export const REMOTE_IN: unique symbol = Symbol("yaos.remote-in");
 export const BIND_LOCAL: unique symbol = Symbol("yaos.bind-local");
@@ -154,14 +154,7 @@ function applyTextDiff(ytext: Y.Text, from: string, to: string, origin: unknown)
 	const edits = minimalDiff(from, to);
 	const doc = ytext.doc;
 	if (!doc) throw new Error("Y.Text without doc");
-	doc.transact(() => {
-		for (let i = edits.length - 1; i >= 0; i--) {
-			const e = edits[i];
-			if (!e) continue;
-			if (e.end > e.start) ytext.delete(e.start, e.end - e.start);
-			if (e.text.length > 0) ytext.insert(e.start, e.text);
-		}
-	}, origin);
+	doc.transact(() => applyEditsTo(ytext, from, edits), origin);
 }
 
 export class BindingManager {

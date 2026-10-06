@@ -6,7 +6,7 @@
 import * as Y from "yjs";
 import type { DeviceClass } from "../../core/limits";
 import { MERGE_MAX_EDITS_PER_SIDE, MERGE_MAX_INPUT_CHARS } from "../../core/limits";
-import { minimalDiff } from "../../core/merge/minimalDiff";
+import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
 import type { DiskFingerprint, DocId, MergeFn, MergeLimits } from "../../core/types";
 import type { StatusSnapshot } from "../../protocol/status";
 
@@ -26,21 +26,14 @@ export const conservativeMerge: MergeFn = ({ base, disk, crdt, limits }) => {
 	return { kind: "conflict", text: crdt, conflictCopy: disk, reason: "both-edited" };
 };
 
-/** Apply core minimalDiff(current -> to) to ytext in one transaction (end to start, offsets stay valid). */
+/** Apply core minimalDiff(current -> to) to ytext in one transaction (core applyEditsTo). */
 export function applyTextDiff(ytext: Y.Text, to: string, origin: unknown): boolean {
 	const from = ytext.toString();
 	if (from === to) return false;
 	const edits = minimalDiff(from, to);
 	const doc = ytext.doc;
 	if (!doc) throw new Error("ytext without doc");
-	doc.transact(() => {
-		for (let i = edits.length - 1; i >= 0; i--) {
-			const e = edits[i];
-			if (!e) continue;
-			if (e.end > e.start) ytext.delete(e.start, e.end - e.start);
-			if (e.text.length > 0) ytext.insert(e.start, e.text);
-		}
-	}, origin);
+	doc.transact(() => applyEditsTo(ytext, from, edits), origin);
 	return true;
 }
 

@@ -23,7 +23,7 @@ import type { DiskFingerprint, DocId, LocalEntry, MergeResult, PlannerOp, Synced
 import { canonicalizeMarkdown, exactFingerprint, markdownContentHash } from "../../core/hash/markdownLf";
 import { utf8Decode, utf8Length } from "../../core/hash/utf8";
 import { merge } from "../../core/merge/merge";
-import { minimalDiff } from "../../core/merge/minimalDiff";
+import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
 import { brakeKey, isShrinkingOverwrite } from "../../core/plan/brake";
 import { conflictName } from "../../core/plan/conflictName";
 import type { IntentRecord } from "../store/schema";
@@ -37,17 +37,11 @@ export const MAX_CAS_ATTEMPTS = 3;
 
 type ReconcileOp = Extract<PlannerOp, { op: "reconcileContent" }>;
 
-/** Apply minimalDiff(from -> to) to the Y.Text in one transaction (end to start, offsets stay valid). */
+/** Apply minimalDiff(from -> to) to the Y.Text in one transaction (core applyEditsTo). */
 export function applyMinimalDiff(h: BodyHandle, ytext: Y.Text, from: string, to: string): number {
 	const edits = minimalDiff(from, to);
 	if (edits.length === 0) return 0;
-	h.doc.transact(() => {
-		for (let i = edits.length - 1; i >= 0; i--) {
-			const e = edits[i]!;
-			if (e.end > e.start) ytext.delete(e.start, e.end - e.start);
-			if (e.text.length > 0) ytext.insert(e.start, e.text);
-		}
-	}, h.mergeOrigin);
+	h.doc.transact(() => applyEditsTo(ytext, from, edits), h.mergeOrigin);
 	return edits.length;
 }
 
