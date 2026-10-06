@@ -1,7 +1,9 @@
 /**
  * Pairing modals: PairModal (join this device to a vault with a server URL + one-time code) and
- * the "pair another device" code display. Ported from legacy-src/settings/PairDeviceModal.ts and
- * the enrollment parts of legacy-src/settings/settingsTab.ts (no QR code: no new dependencies).
+ * the "pair another device" code display with an "Open pairing page" button. Ported from the old
+ * client (adfa7a7:src/settings/PairDeviceModal.ts and the enrollment parts of
+ * adfa7a7:src/settings/settingsTab.ts). No QR code: scripts/check-deps.mjs does not let the host
+ * import the qrcode package.
  *
  * SECRETS: the pairing code input is a password field; codes and tokens are never logged. The
  * code shown by PairingCodeModal is displayed only because handing it to the other device is the
@@ -79,7 +81,7 @@ export class PairModal extends Modal {
 			});
 		new Setting(contentEl)
 			.setName("Device name")
-			.setDesc("Shown to your other devices and used in conflict copy names.")
+			.setDesc("Sent to your server, which lists it among the vault's devices, and used in this device's conflict copy names.")
 			.addText((text) => {
 				text.setPlaceholder("My laptop").setValue(this.nameValue).onChange((v) => { this.nameValue = v; });
 			});
@@ -174,7 +176,7 @@ export class PairingCodeModal extends Modal {
 			text: "On the other device, open the setup link, or open YAOS settings, choose \"Pair this device\" and enter the server URL and this code. Anyone with this code can join your vault until it is used or expires, so share it only with your own device.",
 		});
 
-		const field = (label: string, value: string, rows: number): void => {
+		const field = (label: string, value: string, rows: number): Setting => {
 			const s = new Setting(contentEl).setName(label);
 			s.settingEl.addClass("yaos-pairing-code-field");
 			const area = contentEl.createEl("textarea", { cls: "yaos-pairing-code-value" });
@@ -185,11 +187,14 @@ export class PairingCodeModal extends Modal {
 			s.addButton((b) => b.setButtonText("Copy").onClick(() => {
 				copyText(value).then(() => new Notice(`${label} copied.`), () => new Notice(`Could not copy the ${label.toLowerCase()}.`, 6000));
 			}));
+			return s;
 		};
 		field("Server URL", this.host.data().identity?.host ?? "", 1);
 		field("Pairing code", grant.pairingCode, 2);
 		field("Setup link", grant.setupLink, 3);
-		if (grant.mobileSetupUrl) field("Mobile setup page", grant.mobileSetupUrl, 2);
+		const page = grant.mobileSetupUrl;
+		// pairing.ts admits only a URL under the paired server's origin, so opening it is safe.
+		if (page) field("Mobile setup page", page, 2).addButton((b) => b.setButtonText("Open pairing page").onClick(() => { window.open(page, "_blank", "noopener"); }));
 
 		const expiry = contentEl.createEl("p", { cls: "yaos-pairing-code-expiry" });
 		const tick = (): void => {
