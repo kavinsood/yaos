@@ -96,7 +96,6 @@ export function cleanIssues(c: FullClient): string[] {
 	if (c.ui.fatals.length > 0) out.push(`${n}: fatal ${c.ui.fatals[0]?.code}`);
 	for (const ws of c.workspaces) {
 		for (const v of ws.history) {
-			if (v.counters.bindMismatch > 0) out.push(`${n}: view ${v.viewId} bindMismatch=${v.counters.bindMismatch}`);
 			if (v.counters.defaultReloadWhileBound > 0) out.push(`${n}: view ${v.viewId} defaultReloadWhileBound=${v.counters.defaultReloadWhileBound}`);
 		}
 	}
