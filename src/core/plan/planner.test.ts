@@ -50,6 +50,26 @@ test("row live/present/present: remote move = plain diskRename (expect hash) + s
 	assert.equal(find(folder, "syncedPut").entry.path, "Notes/a.md");
 });
 
+test("row live/present/present: remote move onto an untracked copy of the doc's own bytes trashes the copy; the move follows", () => {
+	// Sim heavy seed 79: after an IDB loss S came back at the old path (re-materialized with B's edit) while the
+	// user's renamed file, still the create content, sat at R.path. That file is never created (mergesIntoOwner)
+	// and the move waited for it forever.
+	const base = { remote: [R("d1", "b.md", { createHash: h("c0") })], synced: [S("d1", "a.md", { contentHash: h("c1") })] };
+	const p = run({ ...base, local: [L("a.md", h("c1")), L("b.md", h("c0"))] });
+	assert.deepEqual(p.ops[0], { op: "diskTrash", docId: null, path: "b.md", expect: { t: "hash", hash: h("c0") } });
+	assert.ok(!opsOf(p).includes("diskRename") && !opsOf(p).includes("nsCreate"), JSON.stringify(opsOf(p)));
+	// next pass, the path free: the plain move
+	assert.deepEqual(opsOf(run({ ...base, local: [L("a.md", h("c1"))] })), ["diskRename", "syncedPut"]);
+	// a copy of the doc's current file: the same
+	assert.equal(opsOf(run({ ...base, local: [L("a.md", h("c1")), L("b.md", h("c1"))] }))[0], "diskTrash");
+	// unhashed occupant: hash it first
+	assert.deepEqual(run({ ...base, local: [L("a.md", h("c1")), L("b.md", null)] }).ops, [{ op: "needHash", path: "b.md" }]);
+	// other bytes: a new file (created; the move waits for the path)
+	const other = run({ ...base, local: [L("a.md", h("c1")), L("b.md", h("c9"))] });
+	assert.ok(!opsOf(other).includes("diskTrash") && !opsOf(other).includes("diskRename"), JSON.stringify(opsOf(other)));
+	assert.equal(find(other, "nsCreate").path, "b.md");
+});
+
 test("row live/present/present: markdown content Rc / Lc / both -> reconcileContent", () => {
 	const rc = run({ remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(12) } })], synced: [S("d1", "a.md")], local: [L("a.md", h("c0"))] });
 	assert.deepEqual(rc.ops, [{ op: "reconcileContent", docId: "d1", path: "a.md", kind: "markdown", hasBase: true }]);

@@ -256,6 +256,12 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		const w = id === undefined ? undefined : input.remote.get(id);
 		return w !== undefined && w.kind === l.kind && (l.hash === w.createHash || l.hash === (w.blob?.hash ?? null));
 	};
+	/** The occupant of r's (blocked) target is untracked and holds r's own bytes: the doc's file `l` or its create content. */
+	const ownCopyAt = (r: RemoteEntry, l: LocalEntry): boolean => {
+		const t = input.local.get(r.pathKey);
+		if (!t || t.excluded || syncedByKey.has(r.pathKey) || claimed.has(r.pathKey) || input.remoteByPathKey.get(r.pathKey) !== r.docId) return false;
+		return t.hash === null || (t.hash === l.hash && t.kind === l.kind) || mergesIntoOwner(t);
+	};
 
 	// ---- rename inference ------------------------------------------------------
 	const freshLocal = inScopeLocal.filter((l) => !l.excluded && !syncedByKey.has(l.pathKey) && !remoteOwns(l.pathKey));
@@ -479,8 +485,17 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 				pathChanged = true;
 			} else if (s.nsTouchSeq === 0 && collapse(s, r, l, prefix)) {
 				return;
-			} else if (moveBlocked(r, l)) {
+			} else if (moveBlocked(r, l) && !ownCopyAt(r, l)) {
 				// The target holds a new local file (see remoteOwns): keep the doc at its path until that file moves.
+			} else if (moveBlocked(r, l)) {
+				// The target holds an untracked copy of this doc's own bytes (its current file or its create
+				// content, e.g. the user's rename of a copy re-materialized after an IDB loss). It is never
+				// created (mergesIntoOwner) and the move would wait for it forever: trash it (plan order puts
+				// trashes after renames, so the move is the next pass's, once the path is free).
+				const t = input.local.get(r.pathKey)!;
+				claimed.add(t.pathKey);
+				if (t.hash === null) return push([...prefix, { op: "needHash", path: t.path }]);
+				push([{ op: "diskTrash", docId: null, path: t.path, expect: { t: "hash", hash: t.hash } }], "diskTrash", brakeKey("diskTrash", docId, t.path, t.hash), t.path);
 			} else {
 				ops.push({ op: "diskRename", docId, from: l.path, to: r.path, expect: { t: "hash", hash: l.hash! } });
 				diskPath = r.path;
