@@ -23,7 +23,15 @@ import { BrowserPlatform, browserClock, platformInfoFrom } from "./platform";
 import { YaosController } from "./pluginController";
 import { ObsidianSideFiles } from "./sideFiles";
 import { defaultDeviceName, sanitizePluginData, type YaosUiHost } from "./ui/api";
+import { errorMessage } from "./ui/format";
+import { obsidianRequest } from "./ui/obsidianEnv";
+import { resumePendingEnrollment, type ResumedEnrollment } from "./ui/pairFlow";
 import { registerUi } from "./ui/registerUi";
+
+function resumedEnrollmentNotice(r: ResumedEnrollment | null): void {
+	if (r?.ok) new Notice(`YAOS: this device is now paired with ${r.identity.host}.`);
+	else if (r && r.final) new Notice(`YAOS: an interrupted pairing could not finish: ${errorMessage(r.error)}`, 8000);
+}
 
 function workerCarrier(): EngineCarrier | null {
 	if (typeof Worker === "undefined" || typeof Blob === "undefined" || typeof URL.createObjectURL !== "function") return null;
@@ -117,8 +125,13 @@ export default class YaosPlugin extends Plugin {
 			},
 		};
 		this.register(registerUi(this, host));
-		// Start after the vault index is complete (no flood of initial "create" events).
-		app.workspace.onLayoutReady(() => void controller.start());
+		// Start after the vault index is complete (no flood of initial "create" events), and after one
+		// retry of an enrollment the last session sent without seeing the answer (none: no request).
+		app.workspace.onLayoutReady(() => {
+			void resumePendingEnrollment(host, { request: obsidianRequest })
+				.then(resumedEnrollmentNotice, () => undefined)
+				.then(() => controller.start());
+		});
 	}
 
 	async onunload(): Promise<void> {

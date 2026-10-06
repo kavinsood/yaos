@@ -1,8 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyPairedIdentity, clearIdentity, formatCountdown, PairingSession } from "./pairFlow";
-import { PairingError, type HttpRequest, type HttpResponse, type PairingDeps } from "./pairing";
-import { defaultPluginData, type PairedIdentity } from "./api";
+import {
+	applyPairedIdentity, clearIdentity, enrollmentFailureIsFinal, formatCountdown, PairingSession, resumePendingEnrollment,
+	setPendingEnrollment, withoutPendingEnrollment,
+} from "./pairFlow";
+import { PairingError, prepareEnrollment, type HttpRequest, type HttpResponse, type PairingDeps } from "./pairing";
+import { defaultPluginData, sanitizePluginData, type PairedIdentity, type YaosPluginData } from "./api";
 
 const CODE = "pc_ABCDEFGHIJKLMNOPQRSTUVWX";
 const CAPS: HttpResponse = { status: 200, json: { claimed: true, streams: 1 } };
@@ -95,4 +98,71 @@ test("formatCountdown", () => {
 	assert.equal(formatCountdown(999), "0:01");
 	assert.equal(formatCountdown(-5), "0:00");
 	assert.equal(formatCountdown(Number.NaN), "0:00");
+});
+
+function memHost(initial: YaosPluginData) {
+	let d = initial;
+	return { data: () => d, updateData: async (m: (x: YaosPluginData) => YaosPluginData) => { d = m(d); } };
+}
+const pendingData = () => setPendingEnrollment(defaultPluginData("Mac"), prepareEnrollment({ host: "https://sync.example.com", pairingCode: CODE, deviceName: "Mac" }));
+
+test("PairingSession stores the attempt before /enroll, keeps it when the server is unreachable, drops it on a definitive refusal", async () => {
+	const h = memHost(defaultPluginData("Mac"));
+	const off = new Error("offline");
+	const s = scripted([CAPS, off, off, off, CAPS, { status: 409, json: { error: "used_code" } }]);
+	const persist = (a: Parameters<typeof setPendingEnrollment>[1] | null) => h.updateData((d) => (a ? setPendingEnrollment(d, a) : withoutPendingEnrollment(d)));
+	const session = new PairingSession({ ...s.deps, persist });
+	const input = { host: "https://sync.example.com", pairingCode: CODE, deviceName: "Mac" };
+	await assert.rejects(session.submit(input), (e: unknown) => e instanceof PairingError && e.code === "network");
+	const kept = h.data().pendingEnrollment;
+	assert.ok(kept);
+	assert.equal(kept.enrollmentRequestId, enrollBodies(s.calls)[0]?.enrollmentRequestId);
+	assert.deepEqual(sanitizePluginData(JSON.parse(JSON.stringify(h.data())), "Mac").pendingEnrollment, kept, "survives save + load");
+	assert.equal(sanitizePluginData({ pendingEnrollment: { ...kept, deviceToken: "short" } }, "Mac").pendingEnrollment, undefined, "malformed: dropped on load");
+	await assert.rejects(session.submit(input), (e: unknown) => e instanceof PairingError && e.status === 409);
+	assert.equal(h.data().pendingEnrollment, undefined);
+});
+
+test("resumePendingEnrollment sends the stored attempt once with the identical ids; success stores the identity and drops it", async () => {
+	const h = memHost(pendingData());
+	const attempt = h.data().pendingEnrollment;
+	assert.ok(attempt);
+	const s = scripted([okEnroll]);
+	const r = await resumePendingEnrollment(h, s.deps);
+	assert.equal(r?.ok, true);
+	assert.deepEqual(s.calls.map((c) => c.url), ["https://sync.example.com/enroll"]);
+	const body = enrollBodies(s.calls)[0];
+	assert.deepEqual([body?.enrollmentRequestId, body?.deviceId, body?.deviceToken], [attempt.enrollmentRequestId, attempt.deviceId, attempt.deviceToken]);
+	assert.equal(h.data().identity?.deviceToken, attempt.deviceToken);
+	assert.equal(h.data().pendingEnrollment, undefined);
+});
+
+test("resumePendingEnrollment keeps the attempt on a server error, drops it on a refusal; nothing pending sends nothing", async () => {
+	const none = scripted([]);
+	assert.equal(await resumePendingEnrollment(memHost(defaultPluginData("Mac")), none.deps), null);
+	assert.equal(none.calls.length, 0);
+	const h = memHost(pendingData());
+	const busy = await resumePendingEnrollment(h, scripted([{ status: 500, json: { error: "internal" } }]).deps);
+	assert.equal(busy !== null && !busy.ok && busy.final, false);
+	assert.ok(h.data().pendingEnrollment, "kept for the next load");
+	const gone = await resumePendingEnrollment(h, scripted([{ status: 410, json: { error: "expired_code" } }]).deps);
+	assert.equal(gone !== null && !gone.ok && gone.final, true);
+	assert.equal(h.data().pendingEnrollment, undefined);
+});
+
+test("enrollmentFailureIsFinal; pairing and unpairing drop the pending attempt", () => {
+	const err = (code: string, status: number | null) => new PairingError("x", code, status);
+	assert.deepEqual(
+		[err("network", null), err("authorization_fence_pending", 202), err("rate_limited", 429), err("server_error", 503), new Error("x")].map(enrollmentFailureIsFinal),
+		[false, false, false, false, false],
+	);
+	assert.deepEqual([err("used_code", 409), err("expired_code", 410), err("forbidden", 403), err("host_mismatch", 200), err("bad_host", null)].map(enrollmentFailureIsFinal), [true, true, true, true, true]);
+	const d = pendingData();
+	const p = d.pendingEnrollment;
+	assert.ok(p);
+	const identity: PairedIdentity = { host: p.host, vaultId: "v", deviceId: p.deviceId, deviceToken: p.deviceToken, deviceName: "Mac", vaultGeneration: null };
+	assert.equal(applyPairedIdentity(d, identity).pendingEnrollment, undefined);
+	assert.equal(applyPairedIdentity(d, { ...identity, deviceId: "dev_BBBBBBBBBBBBBBBB" }).pendingEnrollment, p, "another device's attempt stays");
+	assert.equal(clearIdentity(d).pendingEnrollment, undefined);
+	assert.equal(withoutPendingEnrollment(d, "other-request-id"), d);
 });

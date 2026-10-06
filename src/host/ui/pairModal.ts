@@ -14,7 +14,7 @@ import { Modal, Notice, Setting, type App, type ButtonComponent } from "obsidian
 import type { YaosUiHost } from "./api";
 import { errorMessage } from "./format";
 import { copyText, obsidianRequest } from "./obsidianEnv";
-import { applyPairedIdentity, formatCountdown, PairingSession } from "./pairFlow";
+import { applyPairedIdentity, formatCountdown, PairingSession, setPendingEnrollment, withoutPendingEnrollment } from "./pairFlow";
 import { requestPairingCode, type PairingCodeGrant, type RequestFn } from "./pairing";
 
 /** One-click Cloudflare deploy of the server (README "Deploy to Cloudflare"). */
@@ -41,7 +41,11 @@ export class PairModal extends Modal {
 		request: RequestFn = obsidianRequest,
 	) {
 		super(app);
-		this.session = new PairingSession({ request, onProgress: (text) => this.setStatus(text, false) });
+		this.session = new PairingSession({
+			request,
+			onProgress: (text) => this.setStatus(text, false),
+			persist: (attempt) => host.updateData((d) => (attempt ? setPendingEnrollment(d, attempt) : withoutPendingEnrollment(d))),
+		});
 		const data = host.data();
 		this.hostValue = prefill.host ?? data.identity?.host ?? "";
 		this.codeValue = prefill.pairingCode ?? "";
