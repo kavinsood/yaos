@@ -1,76 +1,83 @@
 /**
- * SimWorkspace: Obsidian markdown views for the simulation (DESIGN §l.1).
- *
- * Models what matters for sync, matching what the Android spike measured on
- * Obsidian 1.13.8 (docs/client-remake/spike-reports/android-2026-10-06.md):
- *  - an editor buffer per view, `data` = view.data, and Obsidian's 2 s trailing
- *    save debounce (any editor change, local or remote, schedules a save);
- *  - save(): `data = getViewData()` FIRST, then the write (writer "save"). So a
- *    save always writes the editor, whatever `data` held (spike C);
- *  - setData(text, clear) (TextFileView.setData): `data = text` is assigned
- *    BEFORE setViewData(text, clear) is called. An interceptor that returns
- *    "handled" therefore sees view.data === incoming already (spike A), and if
- *    it leaves the editor alone the next save overwrites the incoming text
- *    (spike C: the data loss the binding must avoid);
- *  - file open / leaf switch: setData(text, clear=true);
- *  - external reloads: after every modify/create of an open file Obsidian
- *    calls setData(text, false) on every view of that file whose view.data
- *    differs: split views, and reading-mode views too (spike R). Timing comes
- *    from SimVault.onReload: right after the event for vault-API writes
- *    (spike A), ~25 ms after the watcher event for another app's write
- *    (spike B). The
- *    per-instance interceptor (WorkspacePort.interceptExternalReload) sees it
- *    first; otherwise the default replaces the buffer, which a bound editor
- *    turns into a local CRDT edit (the clobber the interceptor exists to
- *    prevent). Not modelled: Obsidian's own merge of unsaved edits into an
- *    unbound dirty editor (spike E); the default here is a plain replace;
- *  - a y-codemirror.next stand-in with the same origin rules: editor changes
- *    go to the Y.Text in one transaction tagged with the binding's origin;
- *    Y.Text changes from any other origin are applied to the buffer and are
- *    not echoed back. Counters let tests assert "no echo loop";
+ * SimWorkspace: Obsidian markdown views for the simulation (DESIGN §l.1). Models what matters for sync in
+ * Obsidian 1.14.4 (app.js, read-only: TextFileView.save / loadFileInternal / setData, MarkdownView
+ * onInternalDataChange / saveFrontmatter), and the adapter host/obsidianWorkspace.ts + host/collab.ts:
+ *  - the editor document is an immutable CodeMirror Text; every edit is a ChangeSet. A bound editor reports each
+ *    local change (onLocal) and takes the replica's changes (applyRemote) outside its undo history, as collab.ts;
+ *  - TextFileView fields: `data` (view.data), `lastSavedData`, `dirty`. Any editor change sets dirty and restarts
+ *    the 2 s save debounce (requestSave) and, in source mode, the 10 ms onInternalDataChange debounce;
+ *  - save(): dirty = false; o = getViewData(); skipped when lastSavedData === o (or null); else
+ *    data = lastSavedData = o, then the write (writer "save");
+ *  - loadFileInternal (after every modify/create of an open file, SimVault.onReload): n = disk text;
+ *    i = lastSavedData; lastSavedData = n; if i: return when i === n; while dirty, return when getViewData() === n
+ *    (Obsidian then merges e2(i, editor, n) into n for a dirty editor: not modelled, n goes as is); setData(n, false);
+ *  - setData(text, clear): when data !== text or clear: data = text, then setViewData(text, clear);
+ *  - setViewData(text, clear): clear (another file in this leaf) unbinds first, as the adapter's instance wrapper
+ *    does; otherwise the interceptor (WorkspacePort.interceptExternalReload) sees it first, with `from` = the view
+ *    whose quick preview this is. The default replaces the editor with a minimal change, which a bound editor
+ *    reports as local (the clobber the interceptor exists to prevent: counters.defaultReloadWhileBound);
+ *  - onInternalDataChange: e = editor text; if data !== e: data = e and every other view of the file gets
+ *    setData(e, false) (the "quick-preview" workspace event);
+ *  - getViewData is the adapter's wrapper: with dirty cleared (a save) it reports onSaveRead and, while saves are
+ *    held (holdSaves), answers lastSavedData so the save skips;
+ *  - undo(): CodeMirror history: undoes this editor's own changes, mapped over the remote ones;
  *  - rename of an open file updates view.path; delete closes its views.
+ * The O(N) string work here (toString, minimal replace) is Obsidian's own or the sim's, never the binding's.
  */
 
-import * as Y from "yjs";
+import { ChangeSet, Text } from "@codemirror/state";
 import type { Unsubscribe } from "../ports/common";
 import type { ClockPort, TimerHandle } from "../ports/clock";
-import type { EditorBindingSpec, EditorViewRef, ExternalReloadHandler, ViewEvent, WorkspacePort } from "../ports/workspace";
+import type { EditorBinding, EditorBindingSpec, EditorViewRef, ExternalReloadHandler, ViewEvent, WorkspacePort } from "../ports/workspace";
 import type { VaultEvent } from "../ports/vault";
 import type { SimVault } from "./vault";
 
 export const OBSIDIAN_SAVE_DEBOUNCE_MS = 2_000;
+/** MarkdownEditView.requestOnInternalDataChange debounce (Obsidian 1.14.4). */
+export const OBSIDIAN_INTERNAL_CHANGE_MS = 10;
+const UNDO_DEPTH = 200;
 
-interface Binding {
-	readonly ytext: Y.Text;
-	readonly origin: unknown;
-	readonly observer: (event: Y.YTextEvent, tr: Y.Transaction) => void;
+/** The sim keeps every character (\r included) as Obsidian's buffer would hold it: lines split on \n only. */
+export function simText(s: string): Text {
+	return Text.of(s.split("\n"));
 }
 
 export interface ViewCounters {
-	/** Editor-originated Y.Text transactions (one per user edit while bound). */
+	/** Local editor changes reported to the binding. */
 	localTx: number;
-	/** Y.Text changes applied to the buffer (remote/merge). */
+	/** Replica changes applied to the editor. */
 	remoteApplied: number;
 	saves: number;
 	setViewDataCalls: number;
 	intercepted: number;
-	/** setViewData applied by default while bound (CRDT clobber path). */
+	/** setViewData applied by default while bound (the editor-clobber path). */
 	defaultReloadWhileBound: number;
-	/** bind() called while buffer != Y.Text (binding contract violation). */
-	bindMismatch: number;
+	undos: number;
+}
+
+interface SimBinding {
+	readonly spec: EditorBindingSpec;
+	live: boolean;
 }
 
 export class SimEditorView implements EditorViewRef {
 	path: string | null;
-	buffer = "";
-	data = "";
+	doc: Text = Text.empty;
+	/** view.data */
+	data: string | null = null;
+	lastSavedData: string | null = null;
 	mode: "source" | "reading" = "source";
-	private binding: Binding | null = null;
-	private interceptor: ExternalReloadHandler | null = null;
-	private saveTimer: TimerHandle | null = null;
-	private dirty = false;
 	closed = false;
-	readonly counters: ViewCounters = { localTx: 0, remoteApplied: 0, saves: 0, setViewDataCalls: 0, intercepted: 0, defaultReloadWhileBound: 0, bindMismatch: 0 };
+	readonly counters: ViewCounters = { localTx: 0, remoteApplied: 0, saves: 0, setViewDataCalls: 0, intercepted: 0, defaultReloadWhileBound: 0, undos: 0 };
+	private binding: SimBinding | null = null;
+	private interceptor: ExternalReloadHandler | null = null;
+	private held = false;
+	private skipped = false;
+	private dirty = false;
+	private saveTimer: TimerHandle | null = null;
+	private changeTimer: TimerHandle | null = null;
+	/** Inverses of this editor's own changes (newest last), each relative to the document after the ones above it. */
+	private undoStack: ChangeSet[] = [];
 
 	constructor(
 		readonly viewId: number,
@@ -80,56 +87,46 @@ export class SimEditorView implements EditorViewRef {
 		this.path = path;
 	}
 
-	// --- EditorViewRef --------------------------------------------------------
-
-	hasEditor(): boolean {
-		return this.mode === "source" && !this.closed;
+	/** The editor text (sim/test convenience: O(N)). */
+	get buffer(): string {
+		return this.doc.toString();
 	}
 
 	getText(): string {
 		return this.buffer;
 	}
 
-	getLastSavedText(): string {
-		return this.data;
+	// --- EditorViewRef --------------------------------------------------------
+
+	hasEditor(): boolean {
+		return this.mode === "source" && !this.closed;
 	}
 
-	applyMinimalReplace(text: string): void {
-		if (this.binding) throw new Error("applyMinimalReplace while bound");
-		if (text === this.buffer) return;
-		this.buffer = text;
-		this.markDirty();
+	editorDoc(): Text | null {
+		return this.closed ? null : this.doc;
 	}
 
-	bind(spec: EditorBindingSpec): Unsubscribe {
-		if (this.binding) throw new Error("bind while bound");
-		if (spec.ytext.toString() !== this.buffer) this.counters.bindMismatch++;
-		const observer = (event: Y.YTextEvent, tr: Y.Transaction) => {
-			if (tr.origin === spec.localOrigin) return;
-			let pos = 0;
-			let out = this.buffer;
-			for (const d of event.delta) {
-				if (d.insert != null) {
-					const ins = typeof d.insert === "string" ? d.insert : "";
-					out = out.slice(0, pos) + ins + out.slice(pos);
-					pos += ins.length;
-				} else if (d.delete != null) {
-					out = out.slice(0, pos) + out.slice(pos + d.delete);
-				} else if (d.retain != null) {
-					pos += d.retain;
-				}
-			}
-			this.buffer = out;
-			this.counters.remoteApplied++;
-			this.markDirty();
-		};
-		spec.ytext.observe(observer);
-		const binding: Binding = { ytext: spec.ytext, origin: spec.localOrigin, observer };
-		this.binding = binding;
-		return () => {
-			if (this.binding !== binding) return;
-			spec.ytext.unobserve(observer);
-			this.binding = null;
+	isDirty(): boolean {
+		return this.dirty;
+	}
+
+	lastSavedText(): string | null {
+		return this.lastSavedData;
+	}
+
+	bind(spec: EditorBindingSpec): EditorBinding {
+		if (this.closed) throw new Error("bind on a closed view");
+		this.unbindNow();
+		const b: SimBinding = { spec, live: true };
+		this.binding = b;
+		return {
+			doc: () => this.doc,
+			applyRemote: (changes) => {
+				if (b.live) this.change(changes, "remote");
+			},
+			detach: () => {
+				if (this.binding === b) this.unbindNow();
+			},
 		};
 	}
 
@@ -140,132 +137,220 @@ export class SimEditorView implements EditorViewRef {
 		};
 	}
 
-	async save(): Promise<void> {
-		if (this.saveTimer !== null) {
-			this.ws.clock.clearTimer(this.saveTimer);
-			this.saveTimer = null;
-		}
-		if (this.closed || this.path === null) return;
-		const text = this.buffer;
-		this.dirty = false;
-		// Skipped only when it would rewrite identical bytes (no observable difference).
-		if (text === this.data && this.ws.vault.textOf(this.path) === text) return;
-		this.data = text; // view.data = getViewData(), then vault.modify
-
-		this.counters.saves++;
-		this.ws.vault.editorSave(this.path, text);
+	holdSaves(hold: boolean): boolean {
+		const skipped = this.skipped;
+		this.held = hold;
+		this.skipped = false;
+		return !hold && skipped;
 	}
 
-	// --- user actions ---------------------------------------------------------
-
-	/** User edit in the editor (positions in UTF-16 units of the buffer). */
-	edit(pos: number, deleteCount: number, insert: string): void {
-		if (!this.hasEditor()) return;
-		const p = Math.max(0, Math.min(pos, this.buffer.length));
-		const del = Math.max(0, Math.min(deleteCount, this.buffer.length - p));
-		this.buffer = this.buffer.slice(0, p) + insert + this.buffer.slice(p + del);
-		const b = this.binding;
-		if (b) {
-			this.counters.localTx++;
-			const doc = b.ytext.doc;
-			if (!doc) throw new Error("ytext without doc");
-			doc.transact(() => {
-				if (del > 0) b.ytext.delete(p, del);
-				if (insert.length > 0) b.ytext.insert(p, insert);
-			}, b.origin);
-		}
-		this.markDirty();
+	async save(): Promise<void> {
+		this.clearTimer("save");
+		this.dirty = false;
+		if (this.closed || this.path === null) return;
+		const o = this.getViewData();
+		if (this.lastSavedData === o || this.lastSavedData === null) return;
+		this.data = o;
+		this.lastSavedData = o;
+		this.counters.saves++;
+		this.ws.vault.editorSave(this.path, o);
 	}
 
 	isBound(): boolean {
 		return this.binding !== null;
 	}
 
-	isDirty(): boolean {
-		return this.dirty;
+	// --- user actions ---------------------------------------------------------
+
+	/** User edit in the editor (positions in UTF-16 units of the document). */
+	edit(pos: number, deleteCount: number, insert: string): void {
+		if (!this.hasEditor()) return;
+		const len = this.doc.length;
+		const from = Math.max(0, Math.min(pos, len));
+		const to = from + Math.max(0, Math.min(deleteCount, len - from));
+		if (from === to && insert.length === 0) return;
+		this.change(ChangeSet.of({ from, to, insert: simText(insert) }, len), "local");
+	}
+
+	/** Mod-z: undo this editor's newest own change (CodeMirror history; remote changes are never undone). */
+	undo(): boolean {
+		if (!this.hasEditor()) return false;
+		const inv = this.undoStack.pop();
+		if (!inv) return false;
+		this.counters.undos++;
+		this.change(inv, "undo");
+		return true;
+	}
+
+	/** Properties edit (MarkdownView.saveFrontmatter): getViewData, setViewData(t, false), onInternalDataChange, save. */
+	saveFrontmatter(mutate: (text: string) => string): Promise<void> {
+		const t = mutate(this.getViewData());
+		this.setViewData(t, false);
+		this.onInternalDataChange();
+		return this.save();
 	}
 
 	// --- Obsidian internals ---------------------------------------------------
 
-	/** TextFileView.setData(data, clear): view.data is assigned before setViewData runs. */
+	/** TextFileView.getViewData as the adapter's instance wrapper answers it. */
+	getViewData(): string {
+		if (!this.dirty) {
+			this.binding?.spec.onSaveRead();
+			if (this.held && this.lastSavedData !== null) {
+				this.skipped = true;
+				return this.lastSavedData;
+			}
+		}
+		return this.doc.toString();
+	}
+
+	/** TextFileView.setData(data, clear). */
 	setData(text: string, clear: boolean): void {
+		if (this.data === text && !clear) return;
 		this.data = text;
 		this.setViewData(text, clear);
 	}
 
-	/** Obsidian reloading this view after a modify/create of its file: setData(disk, false) if it differs from data. */
-	reloadFromDisk(): void {
+	/** TextFileView.loadFileInternal(file, clear=false): Obsidian reloading this view after a modify/create of its file. */
+	loadFileInternal(): void {
 		if (this.closed || this.path === null) return;
-		const text = this.ws.vault.textOf(this.path);
-		if (text !== null && text !== this.data) this.setData(text, false);
+		const n = this.ws.vault.textOf(this.path);
+		if (n === null) return;
+		const i = this.lastSavedData;
+		this.lastSavedData = n;
+		if (i) {
+			if (i === n) return;
+			if (this.dirty && this.getViewData() === n) return;
+		}
+		this.setData(n, false);
 	}
 
-	/** MarkdownView.setViewData(data, clear). Called by setData only (data is already assigned). */
+	/** File open / leaf switch: loadFileInternal(file, clear=true). */
+	loadFile(text: string): void {
+		this.lastSavedData = text;
+		this.setData(text, true);
+	}
+
+	/** MarkdownView.setViewData(data, clear). */
 	setViewData(incoming: string, clear: boolean): void {
 		this.counters.setViewDataCalls++;
 		if (clear) {
-			// Another file is loaded into this leaf. The Obsidian adapter's instance
-			// wrapper (host/obsidianWorkspace.ts) detaches the binding and drops the
-			// interceptor BEFORE Obsidian replaces the editor text; mirror that.
-			const b = this.binding;
-			if (b) b.ytext.unobserve(b.observer);
-			this.binding = null;
+			this.unbindNow();
 			this.interceptor = null;
-		} else if (this.interceptor) {
-			if (this.interceptor(incoming) === "handled") {
+			this.doc = simText(incoming);
+			this.undoStack = [];
+			this.dirty = false;
+			return;
+		}
+		if (this.interceptor) {
+			const p = this.ws.previewFrom;
+			if (this.interceptor(incoming, p !== null && p !== this.viewId ? p : null) === "handled") {
 				this.counters.intercepted++;
 				return;
 			}
 		}
-		if (this.binding) {
-			// Obsidian replaces the CM doc; y-codemirror forwards it as an editor change.
-			this.counters.defaultReloadWhileBound++;
-			const b = this.binding;
-			const old = this.buffer;
-			let start = 0;
-			while (start < old.length && start < incoming.length && old.charCodeAt(start) === incoming.charCodeAt(start)) start++;
-			let eo = old.length;
-			let ei = incoming.length;
-			while (eo > start && ei > start && old.charCodeAt(eo - 1) === incoming.charCodeAt(ei - 1)) {
-				eo--;
-				ei--;
-			}
-			this.buffer = incoming;
-			b.ytext.doc?.transact(() => {
-				if (eo > start) b.ytext.delete(start, eo - start);
-				if (ei > start) b.ytext.insert(start, incoming.slice(start, ei));
-			}, b.origin);
-		} else {
-			this.buffer = incoming;
+		if (this.binding) this.counters.defaultReloadWhileBound++;
+		const old = this.doc.toString();
+		let start = 0;
+		while (start < old.length && start < incoming.length && old.charCodeAt(start) === incoming.charCodeAt(start)) start++;
+		let eo = old.length;
+		let ei = incoming.length;
+		while (eo > start && ei > start && old.charCodeAt(eo - 1) === incoming.charCodeAt(ei - 1)) {
+			eo--;
+			ei--;
 		}
+		if (eo > start || ei > start) this.change(ChangeSet.of({ from: start, to: eo, insert: simText(incoming.slice(start, ei)) }, old.length), "set");
 		this.dirty = false;
+	}
+
+	/** MarkdownView.onInternalDataChange: view.data follows the editor; the other views of the file get a quick preview. */
+	onInternalDataChange(): void {
+		this.clearTimer("change");
+		if (this.closed) return;
+		const e = this.doc.toString();
+		if (this.data === e) return;
+		this.data = e;
+		const prev = this.ws.previewFrom;
+		this.ws.previewFrom = this.viewId;
+		try {
+			for (const v of this.ws.views_()) if (v !== this && v.path !== null && this.path !== null && this.ws.samePath(v.path, this.path)) v.setData(e, false);
+		} finally {
+			this.ws.previewFrom = prev;
+		}
+	}
+
+	/** One editor transaction. local/undo: reported to the binding; remote: mapped into the undo history instead. */
+	private change(c: ChangeSet, kind: "local" | "undo" | "remote" | "set"): void {
+		const before = this.doc;
+		this.doc = c.apply(before);
+		if (kind === "remote") {
+			this.counters.remoteApplied++;
+			let m = c;
+			for (let k = this.undoStack.length - 1; k >= 0; k--) {
+				const inv = this.undoStack[k] as ChangeSet;
+				this.undoStack[k] = inv.map(m);
+				m = m.map(inv, true);
+			}
+		} else {
+			// Obsidian's own replace (setViewData, clear=false) is an ordinary transaction: CodeMirror history records
+			// it (app.js sets addToHistory=false only in its collab sync), so it is undoable like typing.
+			if (kind === "local" || kind === "set") {
+				this.undoStack.push(c.invert(before));
+				if (this.undoStack.length > UNDO_DEPTH) this.undoStack.shift();
+			}
+			const b = this.binding;
+			if (b?.live) {
+				this.counters.localTx++;
+				b.spec.onLocal(c);
+			}
+		}
+		if (kind === "set") return;
+		this.markDirty();
+		if (this.mode === "source") {
+			this.clearTimer("change");
+			this.changeTimer = this.ws.clock.setTimer(OBSIDIAN_INTERNAL_CHANGE_MS, () => {
+				this.changeTimer = null;
+				this.onInternalDataChange();
+			});
+		}
 	}
 
 	private markDirty(): void {
 		this.dirty = true;
-		if (this.saveTimer !== null) this.ws.clock.clearTimer(this.saveTimer);
+		this.clearTimer("save");
 		this.saveTimer = this.ws.clock.setTimer(this.ws.saveDebounceMs, () => {
 			this.saveTimer = null;
 			void this.save();
 		});
 	}
 
+	private unbindNow(): void {
+		const b = this.binding;
+		this.binding = null;
+		this.held = false;
+		this.skipped = false;
+		if (b) b.live = false;
+	}
+
+	private clearTimer(which: "save" | "change"): void {
+		const t = which === "save" ? this.saveTimer : this.changeTimer;
+		if (t !== null) this.ws.clock.clearTimer(t);
+		if (which === "save") this.saveTimer = null;
+		else this.changeTimer = null;
+	}
+
 	/** Close: Obsidian saves a dirty view before closing it. */
 	async close(): Promise<void> {
 		if (this.dirty) await this.save();
-		this.stopTimers();
-		this.closed = true;
+		this.crash();
 	}
 
-	/** Device crash: unsaved buffer content is lost, no save. */
+	/** Device crash: unsaved editor content is lost, no save. */
 	crash(): void {
-		this.stopTimers();
+		this.clearTimer("save");
+		this.clearTimer("change");
+		this.unbindNow();
 		this.closed = true;
-	}
-
-	private stopTimers(): void {
-		if (this.saveTimer !== null) this.ws.clock.clearTimer(this.saveTimer);
-		this.saveTimer = null;
 	}
 }
 
@@ -279,6 +364,8 @@ export class SimWorkspace implements WorkspacePort {
 	readonly clock: ClockPort;
 	readonly vault: SimVault;
 	readonly saveDebounceMs: number;
+	/** The view whose onInternalDataChange is running (its quick preview reaches the others synchronously). */
+	previewFrom: number | null = null;
 	private readonly views = new Map<number, SimEditorView>();
 	private readonly listeners = new Set<(event: ViewEvent) => void>();
 	private nextViewId = 1;
@@ -292,7 +379,7 @@ export class SimWorkspace implements WorkspacePort {
 		this.saveDebounceMs = opts.saveDebounceMs ?? OBSIDIAN_SAVE_DEBOUNCE_MS;
 		const offEvents = this.vault.onEvent((e) => this.onVaultEvent(e));
 		const offReload = this.vault.onReload((path) => {
-			for (const v of [...this.views.values()]) if (this.same(v.path, path)) v.reloadFromDisk();
+			for (const v of [...this.views.values()]) if (v.path !== null && this.samePath(v.path, path)) v.loadFileInternal();
 		});
 		this.offVault = () => {
 			offEvents();
@@ -322,7 +409,7 @@ export class SimWorkspace implements WorkspacePort {
 		const text = this.vault.textOf(path);
 		if (text === null) return null;
 		const v = new SimEditorView(this.nextViewId++, this.displayPath(path), this);
-		v.setData(text, true);
+		v.loadFile(text);
 		this.views.set(v.viewId, v);
 		this.history.push(v);
 		this.emit({ t: "opened", view: v });
@@ -346,7 +433,7 @@ export class SimWorkspace implements WorkspacePort {
 		if (v.isDirty()) await v.save();
 		const previousPath = v.path;
 		v.path = this.displayPath(path);
-		v.setData(text, true);
+		v.loadFile(text);
 		this.emit({ t: "file-changed", view: v, previousPath });
 		return true;
 	}
@@ -382,8 +469,12 @@ export class SimWorkspace implements WorkspacePort {
 		for (const l of [...this.listeners]) l(event);
 	}
 
+	samePath(a: string, b: string): boolean {
+		return this.vault.key(a) === this.vault.key(b);
+	}
+
 	private same(a: string | null, b: string): boolean {
-		return a !== null && this.vault.key(a) === this.vault.key(b);
+		return a !== null && this.samePath(a, b);
 	}
 
 	private onVaultEvent(e: VaultEvent): void {

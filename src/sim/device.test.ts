@@ -67,9 +67,9 @@ test("bound editor typing reaches the other device's disk and editor without ech
 	assert.equal(va.counters.defaultReloadWhileBound + vb.counters.defaultReloadWhileBound, 0);
 	assert.equal(va.counters.localTx, 1, "remote changes are not re-sent as local edits");
 	assert.equal(vb.counters.localTx, 1);
-	const before = a.runtime.bindings.stats.localUpdatesPosted;
+	const before = a.runtime.bindings.stats.pushes;
 	await clock.advance(10_000);
-	assert.equal(a.runtime.bindings.stats.localUpdatesPosted, before, "quiet after convergence (no echo loop)");
+	assert.equal(a.runtime.bindings.stats.pushes, before, "quiet after convergence (no echo loop)");
 });
 
 test("pagehide flushes the coalesce buffer synchronously (acceptance 4)", async () => {
@@ -81,17 +81,17 @@ test("pagehide flushes the coalesce buffer synchronously (acceptance 4)", async 
 	assert.ok(va);
 	await clock.advance(500);
 	assert.equal(va.isBound(), true);
-	const posted = a.runtime.bindings.stats.localUpdatesPosted;
+	const posted = a.runtime.bindings.stats.pushes;
 	va.edit(1, 0, "y");
-	assert.equal(a.runtime.bindings.stats.localUpdatesPosted, posted, "still coalescing");
+	assert.equal(a.runtime.bindings.stats.pushes, posted, "still coalescing");
 	a.platform.emit("pagehide");
-	assert.equal(a.runtime.bindings.stats.localUpdatesPosted, posted + 1, "flushed before pagehide returns");
+	assert.equal(a.runtime.bindings.stats.pushes, posted + 1, "flushed before pagehide returns");
 	assert.equal(a.runtime.stats.lifecycleFlushes, 1);
 	await clock.advance(100);
 	assert.equal(a.engineText("a.md"), "xy");
 });
 
-test("engine killed mid-typing loses nothing (bindDelta after restart)", async () => {
+test("engine killed mid-typing loses nothing (re-attach with the durable base after restart)", async () => {
 	const { clock, devs } = world();
 	const a = dev(devs, 0);
 	const b = dev(devs, 1);

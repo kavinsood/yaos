@@ -50,7 +50,7 @@ export type RestartReason = "retry" | "epoch" | "storage-lost" | "rebuild" | "se
 export interface RuntimeOwner {
 	readonly link: HostLink;
 	readonly bound: BoundDocs;
-	readonly boundDisk: Pick<BoundDisk, "checkSaved">;
+	readonly boundDisk: Pick<BoundDisk, "checkSaved" | "pendingConflictCopies">;
 	onEpochChanged(epoch: VaultEpoch | null): void;
 	onStorageLost(): void;
 }
