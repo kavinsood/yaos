@@ -1,0 +1,19 @@
+docs/server-rewrite/DECISIONS.md
+  s_b3140f40764683::t_eb068f8d7c3584 205-207,314-317,411-413,645-658
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "15e9bf36103c787e831241126ccb3bff143ade68",
+  "prompts": {},
+  "sessions": {
+    "s_b3140f40764683": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab5b9c0ddb9ea6151",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
