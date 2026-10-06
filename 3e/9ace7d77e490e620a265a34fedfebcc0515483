@@ -1,0 +1,19 @@
+src/engine/reconcile/intents.ts
+  s_3bea9f4c72a663::t_d51026c7d34619 13-14,23-24,30,37-38,99-146,174-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3e9ace7d77e490e620a265a34fedfebcc0515483",
+  "prompts": {},
+  "sessions": {
+    "s_3bea9f4c72a663": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb05cda11fb8d171",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
