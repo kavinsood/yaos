@@ -133,15 +133,17 @@ pairing-code make zero config-DO calls, checked with a counting stub).
   T-PAIR-NOWRITE (WB).
 
 **D4 Tickets.**
-- Key: 32 random bytes per vault in `vault_meta`, made at init, never exported or rotated. The vault DO issues
-  tickets and verifies them at upgrade, with the key and device map in memory.
+- Ticket key: 32 random bytes per vault in `vault_meta` (`ticket_key`), made at init, never exported or rotated.
+  The vault DO issues tickets and verifies them at upgrade, with the key and device map in memory.
 - Payload as today (vaultId, deviceId, D6 constants, aud, purpose, documentId, iat, exp, nonce), signed with the
-  vault key. Wire unchanged: aud `yaos-vault-ws`, purpose `streams`, TTL 5 min (`YAOS_TICKET_TTL_MS`).
+  ticket key. Wire unchanged: aud `yaos-vault-ws`, purpose `streams`, TTL 5 min (`YAOS_TICKET_TTL_MS`).
 - Issuing costs 0 rows (the lastSeen "touch device" write is dropped). Upgrade rejections keep the §3.1 shape
   (accept, `error` frame, close 1008); the DO now produces them.
 - The §3.1 `unclaimed` frame is never sent: it would need a config read at upgrade. An unclaimed server has no
   vaults, so the DO answers `unauthorized`.
-- *Why:* a key per vault makes cross-vault replay impossible by construction. *Tests:* T-TICKET-CROSS-VAULT,
+- The ticket key only signs tickets. It is not the E2EE vault key K_e (e2ee-design.md §5.1), which never reaches
+  the server.
+- *Why:* a ticket key per vault makes cross-vault replay impossible by construction. *Tests:* T-TICKET-CROSS-VAULT,
   T-TICKET-BAD (BB).
 
 **D5 Surviving routes.** Exactly the §2.2 table; everything else → 404.
@@ -272,8 +274,9 @@ The config DO runs the steps (the Worker forwards the request after the session 
 - No `YAOS_BUCKET` → `503 attachments_unavailable` and `capabilities.attachments=false`.
 - **R2 key `v/<vaultId>/<address>` (mandatory)**, with no generation. Vault delete purges the prefix. *Why:* the
   content address is the identity, so identical bytes are the same blob across resets, restores and epoch bumps.
-- *Why opaque:* E2EE addresses are HMAC(vaultKey, hash), which the server cannot check; the client verifies on
-  download. *Tests:* T-BLOB-OPAQUE, T-BLOB-KEY-RESET (both SKIP when `attachments=false`), T-BLOB-UNAVAILABLE.
+- *Why opaque:* E2EE addresses are HMAC(kAddr, sha256) (e2ee-design.md §10.1), which the server cannot check; the
+  client verifies on download. *Tests:* T-BLOB-OPAQUE, T-BLOB-KEY-RESET (both SKIP when `attachments=false`),
+  T-BLOB-UNAVAILABLE.
 - **GC routes (E2EE design §19 A3).** The client's mark-and-sweep needs a list and a delete that cannot remove a
   blob re-uploaded during the sweep (relay-wire §11.3.1).
   - `GET /vault/:id/blobs?cursor=` → `{items:[{address,uploadedAt}],next}`: one R2 `list` of `v/<vaultId>/`, at most

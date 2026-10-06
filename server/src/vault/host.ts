@@ -244,7 +244,7 @@ export class VaultHost {
 	private readonly blobGcRequests: WindowLimiter;
 	/** undefined: not read yet in this runtime; null: never initialized ("no such table", cached per §6.1). */
 	private state: VaultState | null | undefined = undefined;
-	/** The imported HMAC key, once per runtime (D4: the key never rotates; vault delete drops it). */
+	/** The imported ticket key, once per runtime (D4: the key never rotates; vault delete drops it). */
 	private ticketKey: Promise<CryptoKey> | null = null;
 	private readonly pitr: PitrPort | null;
 	/** D8b `restoring` flag (memory only, 60 s TTL): set by prepare, cleared by finish, lost with the runtime. */
@@ -630,8 +630,8 @@ export class VaultHost {
 	}
 
 	/**
-	 * `GET /ws/streams?ticket=…` (D4): the ticket must verify with this vault's key and generation, and its device
-	 * must be in the device map after the verification (D7). Any failure: the `unauthorized` frame and 1008.
+	 * `GET /ws/streams?ticket=…` (D4): the ticket must verify with this vault's ticket key and generation, and its
+	 * device must be in the device map after the verification (D7). Any failure: the `unauthorized` frame and 1008.
 	 */
 	private async upgrade(request: Request, url: URL, state: VaultState): Promise<Response> {
 		const ticket = url.searchParams.get("ticket");
