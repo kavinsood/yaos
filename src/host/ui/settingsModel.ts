@@ -22,6 +22,7 @@ export const CONTROL_KEYS = [
 	"provisionalBroadcast",
 	"snapshotsEnabled",
 	"snapshotsKeepDaily",
+	"snapshotsUpload",
 	"showStatusBar",
 ] as const;
 
@@ -66,6 +67,7 @@ export function readControl(data: YaosPluginData, key: ControlKey): string | num
 		case "provisionalBroadcast": return e.provisionalBroadcast;
 		case "snapshotsEnabled": return e.snapshots.enabled;
 		case "snapshotsKeepDaily": return e.snapshots.keepDaily;
+		case "snapshotsUpload": return e.snapshots.uploadToBlobStore;
 		case "showStatusBar": return data.showStatusBar;
 	}
 }
@@ -100,6 +102,7 @@ export function validateControl(key: ControlKey, value: unknown): string | null 
 		case "syncSettings":
 		case "provisionalBroadcast":
 		case "snapshotsEnabled":
+		case "snapshotsUpload":
 		case "showStatusBar":
 			return typeof value === "boolean" ? null : "Expected on or off.";
 	}
@@ -131,6 +134,7 @@ export function applyControl(data: YaosPluginData, key: ControlKey, value: unkno
 		case "provisionalBroadcast": return { ...data, engine: { ...e, provisionalBroadcast: value as boolean } };
 		case "snapshotsEnabled": return { ...data, engine: { ...e, snapshots: { ...e.snapshots, enabled: value as boolean } } };
 		case "snapshotsKeepDaily": return { ...data, engine: { ...e, snapshots: { ...e.snapshots, keepDaily: value as number } } };
+		case "snapshotsUpload": return { ...data, engine: { ...e, snapshots: { ...e.snapshots, uploadToBlobStore: value as boolean } } };
 		case "showStatusBar": return { ...data, showStatusBar: value as boolean };
 	}
 }

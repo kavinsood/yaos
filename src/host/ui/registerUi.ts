@@ -18,6 +18,7 @@ import { errorMessage } from "./format";
 import { copyText, obsidianRequest, openPluginSettings } from "./obsidianEnv";
 import { PairingCodeModal, PairModal, type PairPrefill } from "./pairModal";
 import { parseSetupLink, type RequestFn } from "./pairing";
+import { SnapshotsModal } from "./snapshotsModal";
 import { YaosSettingTab } from "./settingsTab";
 import { StatusBarController } from "./statusBar";
 
@@ -83,6 +84,11 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		track(new PairingCodeModal(app, host, request));
 	};
 
+	const openSnapshots = (): void => {
+		if (disposed) return;
+		track(new SnapshotsModal(app, host, (child) => { if (!disposed) track(child); }));
+	};
+
 	const runExport = (): void => {
 		void exportDiagnostics(host, {
 			notify: (message, level) => { new Notice(`YAOS: ${message}`, level === "error" ? 8000 : 6000); },
@@ -105,6 +111,7 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		openPair: () => openPair(),
 		openPairAnother,
 		openBrake,
+		openSnapshots,
 		exportDiagnostics: runExport,
 		onDataChanged: () => statusBar.renderNow(),
 	});

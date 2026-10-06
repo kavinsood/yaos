@@ -1738,6 +1738,16 @@ ones get conflict copies.
     precondition fingerprint(current) or absent instead of `any`, so a file edited between the read and the write is
     reported failed, not clobbered;
   - they sync normally and are subject to the brake (overwrite counting).
+- **Host UI** (`src/host/ui/snapshotsModal.ts`; copy and logic in the pure `snapshotsModel.ts`):
+  - the snapshots dialog (settings "Browse snapshots" or the command palette) has "Create snapshot now" and one row
+    per snapshot, newest first (local time, reason, file count, size), with "Browse files…", "Restore all…" and
+    "Delete…". Restore and delete ask first; the restore confirm says differing files become conflict copies and a
+    safety snapshot is taken first;
+  - the files dialog has a path filter, checkboxes (at most 500 rendered; "Select all matching" includes the rest),
+    "Restore selected…" with a confirm, and a warning listing the manifest's skipped files;
+  - after a restore a notice summarises restored, unchanged, conflict-copy and failed counts.
+  - The settings toggle "Upload snapshots to attachment storage" sets `uploadToBlobStore`. Its copy says it is an
+    off-device copy, needs attachment storage on the server, and does not allow restore on another device.
 
 ### j.5 Onboarding and import
 

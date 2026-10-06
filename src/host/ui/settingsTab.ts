@@ -26,6 +26,7 @@ export interface SettingsTabActions {
 	openPair(): void;
 	openPairAnother(): void;
 	openBrake(): void;
+	openSnapshots(): void;
 	exportDiagnostics(): void;
 	/** Called after a change the status bar cares about (showStatusBar). */
 	onDataChanged(): void;
@@ -186,6 +187,11 @@ export class YaosSettingTab extends PluginSettingTab {
 					validate: (v: number) => validateControl("snapshotsKeepDaily", v) ?? undefined,
 				},
 			},
+			{
+				name: "Upload snapshots to attachment storage",
+				desc: "Also upload each new snapshot to the server's attachment storage as an off-device copy (encrypted only if the vault uses end-to-end encryption). Needs attachment storage on the server; without it only the copy on this device is kept. Snapshots can still be browsed and restored only on the device that took them.",
+				control: { type: "toggle", key: "snapshotsUpload" },
+			},
 		];
 
 		const actionItems: SettingGroupItem[] = [
@@ -213,6 +219,12 @@ export class YaosSettingTab extends PluginSettingTab {
 				desc: "Save a recovery snapshot of your notes now.",
 				disabled: commandsOff,
 				action: () => { void this.send({ t: "createSnapshot" }, "Snapshot created."); },
+			},
+			{
+				name: "Browse snapshots",
+				desc: "See the recovery snapshots on this device, restore all or some of their files, or delete one.",
+				disabled: commandsOff,
+				action: () => this.actions.openSnapshots(),
 			},
 			{
 				name: "Export diagnostics",

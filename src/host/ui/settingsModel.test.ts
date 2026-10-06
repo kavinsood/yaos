@@ -24,6 +24,7 @@ test("every control key reads back what it writes, through the sanitizer", () =>
 		provisionalBroadcast: false,
 		snapshotsEnabled: false,
 		snapshotsKeepDaily: 30,
+		snapshotsUpload: true,
 		showStatusBar: false,
 	};
 	let data = base;
@@ -51,7 +52,7 @@ test("validation rejects bad values with readable messages and applyControl thro
 		["excludePatterns", Array.from({ length: 501 }, (_, i) => `p${i}`).join("\n")], ["excludePatterns", "y".repeat(513)],
 		["maxAttachmentMb", 0], ["maxAttachmentMb", 1025], ["maxAttachmentMb", 2.5], ["maxAttachmentMb", Number.NaN], ["maxAttachmentMb", "5"],
 		["snapshotsKeepDaily", 0], ["snapshotsKeepDaily", 91],
-		["trashMode", "rm"], ["syncAttachments", "yes"],
+		["trashMode", "rm"], ["syncAttachments", "yes"], ["snapshotsUpload", 1],
 	];
 	const d = defaultPluginData("Mac");
 	for (const [key, value] of bad) {
