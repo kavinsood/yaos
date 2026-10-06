@@ -16,7 +16,7 @@
  * The queue survives a session close (its events are committed facts).
  */
 
-import { CFG_STREAM, NS_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
 import type { RelayEvent } from "../../ports/relay";
 import type { LiveItem } from "../store/repo";
 import { gateRow } from "../sync/ingestRow";
@@ -77,7 +77,7 @@ export class LiveIngest {
 		this.stats.overflows++;
 		const keep = (stream: StreamName) => {
 			const cls = streamClass(stream);
-			return cls === "ns" || cls === "cfg" || ((cls === "body" || cls === "canvas") && this.c.handles.isResident(stream));
+			return cls === "ns" || cls === "cfg" || cls === "snap" || ((cls === "body" || cls === "canvas") && this.c.handles.isResident(stream));
 		};
 		const next: QueuedEvent[] = [];
 		let bytes = 0;
@@ -192,6 +192,7 @@ export class LiveIngest {
 		c.noteBodyChange(res.tailPut.filter((r) => r.deviceId !== c.self || !skipApply.has(r.seq)).map((r) => r.stream));
 		if (res.removed.length > 0 || res.tailPut.some((r) => r.stream === NS_STREAM)) await c.afterNsChange();
 		if (res.tailPut.some((r) => r.stream === CFG_STREAM)) await c.afterCfgChange();
+		if (res.tailPut.some((r) => r.stream === SNAP_STREAM)) await c.afterSnapChange();
 		if (stale > 0) c.sess.scheduleCatchUp();
 		c.scheduleStatus();
 	}

@@ -19,6 +19,8 @@ import type { BlobChunkLog } from "../blobs/chunks";
 import type { BodyHandle, LogPort, RemoteView } from "../reconcile/deps";
 import type { LogEngine } from "../runtime/engine";
 import type { CfgLogPort } from "../settings/cfgSync";
+import type { SnapIndexPort } from "../snapshots/snapIndex";
+import type { SnapOp } from "../../core/snap/record";
 
 export class ComposedLog implements LogPort {
 	private memo: RemoteView | null = null;
@@ -144,8 +146,25 @@ export class ComposedLog implements LogPort {
 		},
 	};
 
+	readonly snap: SnapIndexPort = snapIndexPort(() => this.log, () => this.nsCaughtUp);
+
 	readonly chunks: BlobChunkLog = {
 		appendChunks: (hash: ContentHash, chunks: readonly BlobChunkContent[]) => this.log.appendBlobChunks(hash, chunks),
 		readChunks: (hash: ContentHash) => this.log.readBlobChunks(hash),
+	};
+}
+
+function snapIndexPort(log: () => LogEngine, liveOnce: () => boolean): SnapIndexPort {
+	return {
+		get self() {
+			return log().c.self;
+		},
+		view: () => {
+			const v = log().snapView();
+			return { state: v.state, ready: liveOnce() && v.caughtUp };
+		},
+		submit: async (ops: readonly SnapOp[]): Promise<void> => {
+			if (ops.length > 0) await log().submitSnap(ops);
+		},
 	};
 }

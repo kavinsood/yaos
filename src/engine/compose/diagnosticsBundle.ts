@@ -49,7 +49,7 @@ export async function buildDiagnosticsBundle(
 	const ofStream = async (stream: string): Promise<string> => {
 		const s = stream as StreamName;
 		const cls = streamClass(s);
-		if (cls === "ns" || cls === "cfg") return stream;
+		if (cls === "ns" || cls === "cfg" || cls === "snap") return stream;
 		const docId = streamDocId(s);
 		const path = docId ? input.pathOf(docId) : null;
 		const p = path !== null ? await ofPath(path) : await pseudonym(`s:${stream}`, null);

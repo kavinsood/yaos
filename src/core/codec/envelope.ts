@@ -174,6 +174,7 @@ export function bindingAad(vaultId: VaultId | string, binding: EnvelopeBinding):
 export const ALLOWED_CHECKPOINT_ENCODINGS: Readonly<Record<keyof typeof ALLOWED_KINDS, readonly number[]>> = {
 	ns: [CheckpointEncoding.nsFoldV1],
 	cfg: [CheckpointEncoding.cfgFoldV1],
+	snap: [CheckpointEncoding.snapFoldV1],
 	body: [CheckpointEncoding.yjsStateV1, CheckpointEncoding.retired],
 	canvas: [CheckpointEncoding.yjsStateV1, CheckpointEncoding.retired],
 	blobchunk: [CheckpointEncoding.retired],

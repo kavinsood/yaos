@@ -54,8 +54,10 @@ export type DocKind = "markdown" | "canvas" | "blob";
 
 export const NS_STREAM = "ns" as StreamName;
 export const CFG_STREAM = "cfg" as StreamName;
+/** Snapshot index (DESIGN §j.4). */
+export const SNAP_STREAM = "snap" as StreamName;
 
-export type StreamClass = "ns" | "cfg" | "body" | "canvas" | "blobchunk" | "other";
+export type StreamClass = "ns" | "cfg" | "snap" | "body" | "canvas" | "blobchunk" | "other";
 
 export function bodyStream(docId: DocId): StreamName {
 	return `b:${docId}` as StreamName;
@@ -74,6 +76,7 @@ export function docStream(kind: DocKind, docId: DocId): StreamName | null {
 export function streamClass(stream: StreamName): StreamClass {
 	if (stream === NS_STREAM) return "ns";
 	if (stream === CFG_STREAM) return "cfg";
+	if (stream === SNAP_STREAM) return "snap";
 	if (stream.startsWith("b:")) return "body";
 	if (stream.startsWith("c:")) return "canvas";
 	if (stream.startsWith("x:")) return "blobchunk";

@@ -195,7 +195,7 @@ export function mirrorFrameSize(f: OutboxMirrorFrame): number {
 
 function isNsOrCfg(stream: StreamName): boolean {
 	const cls = streamClass(stream);
-	return cls === "ns" || cls === "cfg";
+	return cls === "ns" || cls === "cfg" || cls === "snap";
 }
 
 /**

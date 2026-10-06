@@ -6,7 +6,7 @@
  */
 
 import { TAIL_HARD_ROWS } from "../../core/limits";
-import { NS_STREAM, type StreamName } from "../../core/types";
+import { NS_STREAM, SNAP_STREAM, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import { bodyCheckpointDue, foldCheckpointDue, writeBodyCheckpoint, writeFoldCheckpoint } from "../body/checkpoints";
 import { compactBody, compactFold, needsCompaction } from "../body/compaction";
@@ -109,13 +109,14 @@ export class Maintenance {
 		let budget = COMPACTIONS_PER_TICK;
 		for (const r of [...c.repo.streams()]) {
 			if (budget <= 0 || c.stopped) return;
-			if (r.cls !== "body" && r.cls !== "canvas" && r.cls !== "ns" && r.cls !== "cfg") continue;
+			if (r.cls !== "body" && r.cls !== "canvas" && r.cls !== "ns" && r.cls !== "cfg" && r.cls !== "snap") continue;
 			if (r.stale || r.frozen || c.sess.isReading(r.stream)) continue;
 			if ((this.compactSkip.get(r.stream) ?? 0) > now) continue;
 			if (!needsCompaction(r, c.tuning.compactRows, c.tuning.compactBytes)) continue;
 			if (c.background && r.tailRows <= TAIL_HARD_ROWS) continue; // lane 4 waits; the hard cap is lane 1
 			budget--;
-			const res = r.cls === "ns" ? await compactFold(c.deps, c.ns) : r.cls === "cfg" ? await compactFold(c.deps, c.cfg) : await compactBody(c.deps, r.stream);
+			const res = r.cls === "ns" ? await compactFold(c.deps, c.ns) : r.cls === "cfg" ? await compactFold(c.deps, c.cfg)
+				: r.cls === "snap" ? await compactFold(c.deps, c.snap) : await compactBody(c.deps, r.stream);
 			if (res.t === "ok") {
 				this.stats.compactions++;
 				this.compactSkip.delete(r.stream);
@@ -160,9 +161,9 @@ export class Maintenance {
 				c.diag("checkpoint-failed", { cls: r.cls, error: String(e) });
 			}
 		}
-		for (const fold of [c.ns, c.cfg]) {
+		for (const fold of [c.ns, c.cfg, c.snap]) {
 			const stream = fold.stream;
-			const cls = stream === NS_STREAM ? "ns" : "cfg";
+			const cls = stream === NS_STREAM ? "ns" : stream === SNAP_STREAM ? "snap" : "cfg";
 			if (c.session !== s) return;
 			if (c.sess.isReading(stream)) continue;
 			if (!foldCheckpointDue(c.repo.stream(stream), fold, c.ckpt, c.tuning.checkpoint, now, this.jitter(stream))) continue;

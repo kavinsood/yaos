@@ -8,7 +8,8 @@
  *            floor. Two different puts for one key only come from a buggy or hostile writer; the minimum keeps
  *            every reader on the same choice.
  *
- * A put's key is (the row's deviceId, record.snapshotId): a device can only add its own snapshots. Ids embed
+ * A put's key is (the row's deviceId, record.snapshotId): a device can only add its own snapshots. Ops of a row
+ * whose deviceId is not a relay device id are ignored. Ids embed
  * createdAtMs, so floor pruning of dels and records is exact and the state stays bounded by what retention keeps.
  * `coversSeq` only tracks the runtime's position (FoldRuntime); it is not part of the join.
  */
@@ -16,7 +17,7 @@
 import type { DeviceId, Seq } from "../types";
 import { bytesToHex, compareCodeUnits } from "../codec/lib0";
 import {
-	SNAP_VIEW_PER_DEVICE, encodeSnapRecord, isValidSnapOp, parseSnapshotId, snapKey,
+	SNAP_VIEW_PER_DEVICE, encodeSnapRecord, isDeviceId, isValidSnapOp, parseSnapshotId, snapKey,
 	type SnapOp, type SnapRecord,
 } from "./record";
 
@@ -76,6 +77,8 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
 
 /** Applies one op by `author`. Order- and duplicate-independent (see the module comment). */
 export function applySnapOp(state: SnapFoldState, author: DeviceId, op: SnapOp): { key: string | null; outcome: SnapOpOutcome } {
+	// Relay device ids are [A-Za-z0-9_-]{16,128} (relay-wire.md); anything else could not be checkpointed (snapFoldV1).
+	if (!isDeviceId(author)) return { key: null, outcome: { t: "ignored", reason: "invalid-op" } };
 	if (!isValidSnapOp(op)) return { key: null, outcome: { t: "ignored", reason: op.t === "putUnknown" ? "unknown-version" : "invalid-op" } };
 	switch (op.t) {
 		case "putUnknown":

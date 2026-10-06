@@ -131,6 +131,14 @@ test("snap fold: conflicting puts for one key converge on the smaller body", () 
 	assert.equal(snapLive(s1)[0]!.record.fileCount, 1);
 });
 
+test("snap fold: rows from a deviceId the relay could not have issued are ignored (checkpoint stays decodable)", () => {
+	const s = newSnapFold();
+	const ev = foldSnapFrame(s, { seq: 1, deviceId: "short" as DeviceId, ops: [put(rec(T0)), { t: "floor", createdAtMs: T0 }] });
+	assert.deepEqual(ev.map((e) => e.outcome), [{ t: "ignored", reason: "invalid-op" }, { t: "ignored", reason: "invalid-op" }]);
+	assert.equal(s.records.size + s.floors.size, 0);
+	assert.ok(decodeSnapFoldV1(encodeSnapFoldV1(s)));
+});
+
 // ---------------------------------------------------------------------------
 // Seeded fuzz: the folded state is a function of the multiset of (author, op), independent of order and duplicates.
 // ---------------------------------------------------------------------------

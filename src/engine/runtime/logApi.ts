@@ -9,15 +9,17 @@
  */
 
 import { cloneCfgFold } from "../../core/cfg/fold";
+import { cloneSnapFold, type SnapFoldState } from "../../core/snap/fold";
+import { SNAP_MAX_OPS, type SnapOp } from "../../core/snap/record";
 import { encodeCfgOps } from "../../core/codec/cfgOps";
 import { encodeNsOps } from "../../core/codec/nsOps";
 import { MAX_FRAME_CONTENT_BYTES, MAX_NS_OPS_PER_FRAME } from "../../core/limits";
 import type { PendingNsFrame } from "../../core/ns/overlay";
 import {
-	CFG_STREAM, NS_STREAM, docStream, streamClass, streamDocId,
+	CFG_STREAM, NS_STREAM, SNAP_STREAM, docStream, streamClass, streamDocId,
 	type CfgFoldState, type CfgOp, type ClientFrameId, type DocId, type DocKind, type NsFoldIndex, type NsFoldState, type NsOp, type RemoteBodyInfo, type Seq,
 } from "../../core/types";
-import { buildCfgFrame, buildNsFrame } from "../body/frames";
+import { buildCfgFrame, buildNsFrame, buildSnapFrame } from "../body/frames";
 import type { NewOutboxFrame } from "../store/repo";
 import type { FoldHalt } from "../sync/foldRuntime";
 import type { EngineCtx } from "./context";
@@ -85,6 +87,26 @@ export async function submitCfg(c: EngineCtx, ops: readonly CfgOp[]): Promise<Cl
 		c.addOutbox(await c.repo.tEdit(frames, c.now()));
 		return frames.map((f) => f.clientFrameId);
 	});
+}
+
+/** Own snap-index ops (DESIGN §j.4) -> frames of <= SNAP_MAX_OPS ops; resolves once committed (in snapView()). */
+export async function submitSnap(c: EngineCtx, ops: readonly SnapOp[]): Promise<ClientFrameId[]> {
+	if (ops.length === 0) return [];
+	const parts: SnapOp[][] = [];
+	for (let i = 0; i < ops.length; i += SNAP_MAX_OPS) parts.push(ops.slice(i, i + SNAP_MAX_OPS));
+	return c.docs.chain(async () => {
+		const frames: NewOutboxFrame[] = [];
+		for (const part of parts) frames.push(await buildSnapFrame(c.deps, SNAP_STREAM, part, c.ns.coversSeq, c.now()));
+		c.addOutbox(await c.repo.tEdit(frames, c.now()));
+		return frames.map((f) => f.clientFrameId);
+	});
+}
+
+/** Snapshot index: committed fold + own pending snap frames (a copy); `caughtUp` = stream read, not halted. */
+export function snapView(c: EngineCtx): { readonly state: SnapFoldState; readonly caughtUp: boolean } {
+	const v = c.snap.view(c.outbox);
+	const rec = c.repo.stream(SNAP_STREAM);
+	return { state: v === c.snap.state ? cloneSnapFold(v) : v, caughtUp: (!rec || !rec.stale) && c.snap.halted === null };
 }
 
 export function nsView(c: EngineCtx): NsView {

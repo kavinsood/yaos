@@ -3,8 +3,8 @@
  * table). Runs before any transaction.
  *
  *  - pass                                   -> tail row (content = opened inner content)
- *  - ns/cfg deterministic failure           -> tail row with empty content (folds as an empty frame)
- *  - ns/cfg reader-dependent failure        -> tail row flagged LOCAL_FLAG_UNOPENED, content = raw payload (halts the fold)
+ *  - ns/cfg/snap deterministic failure          -> tail row with empty content (folds as an empty frame)
+ *  - ns/cfg/snap reader-dependent failure   -> tail row flagged LOCAL_FLAG_UNOPENED, content = raw payload (halts the fold)
  *  - body/canvas/x failure                  -> quarantine record
  *  - unknown stream class                   -> accounted only
  */
@@ -41,6 +41,7 @@ export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, now
 				return { t: "account" };
 			case "ns":
 			case "cfg":
+			case "snap":
 			case "body":
 			case "bodyRef":
 			case "blobchunk":
@@ -49,8 +50,8 @@ export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, now
 				return { t: "account" };
 		}
 	}
-	if (cls === "ns" || cls === "cfg") {
-		const kind = cls === "ns" ? "nsOps" : "cfgOps";
+	if (cls === "ns" || cls === "cfg" || cls === "snap") {
+		const kind = cls === "ns" ? "nsOps" : cls === "cfg" ? "cfgOps" : "snapOps";
 		if (g.readerDependent) return { t: "row", row: { ...base, kind, authorNsSeq: 0, flags: LOCAL_FLAG_UNOPENED, content: input.payload } };
 		return { t: "row", row: { ...base, kind, authorNsSeq: 0, flags: 0, content: new Uint8Array(0) } };
 	}

@@ -148,7 +148,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 				if (!opts.stillValid()) return result("aborted");
 				if (!out || out.snapshotCoversSeq < ck.coversSeq) return result("retry", "union failed (CAS or unresolved ref)");
 				checkpointState = content.state;
-			} else if (cls === "ns" || cls === "cfg") {
+			} else if (cls === "ns" || cls === "cfg" || cls === "snap") {
 				const cur = repo.stream(stream)!;
 				const tail = await repo.getTail(stream, 0, ck.coversSeq);
 				const out = await repo.tSnapshot({
