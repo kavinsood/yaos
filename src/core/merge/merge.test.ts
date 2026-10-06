@@ -4,7 +4,7 @@ import * as Y from "yjs"; // tests only: the Y.Text interleaving check (shipped 
 import type { MergeResult } from "../types";
 import { DEFAULT_MERGE_LIMITS, merge, mergeValidated } from "./merge";
 import { splitLines } from "./myers";
-import { applyTextEdits, editSize, isTokenBoundary, lineDiffSize, minimalDiff } from "./minimalDiff";
+import { applyEditsTo, applyTextEdits, editSize, isTokenBoundary, lineDiffSize, minimalDiff } from "./minimalDiff";
 import { prng } from "./prng";
 
 const VOCAB = ["", "a", "b", "# heading", "- item", "same", "same", "😀 emoji", "\t tab", "x y z", "}", "{"];
@@ -223,20 +223,33 @@ test("minimalDiff: edits are whole tokens; punctuation between changed words is 
 	assert.deepEqual(minimalDiff("the cat sat", "the cart sat"), [{ start: 4, end: 7, text: "cart" }]);
 	assert.deepEqual(minimalDiff("x=1;", "x=12;"), [{ start: 2, end: 3, text: "12" }]);
 	assert.deepEqual(minimalDiff("caf\u00e9 ok", "cafe\u0301 ok"), [{ start: 0, end: 4, text: "cafe\u0301" }], "combining marks belong to the word");
-	assert.deepEqual(minimalDiff("[A.2]\n", "[B.27] \n"), [{ start: 1, end: 5, text: "B.27] " }], "sim seed 961: only the leading [ is shared");
+	assert.deepEqual(minimalDiff("[A.2]\n", "[B.27] \n"), [{ start: 0, end: 5, text: "[B.27] " }], "sim seed 961: the leading [ is not reused (glue)");
 	assert.deepEqual(minimalDiff("[A.6] x\n", "[A.53] x\n"), [{ start: 3, end: 4, text: "53" }]);
 	assert.deepEqual(minimalDiff("one\ntwo\n", "One\nTwo\n"), [{ start: 0, end: 3, text: "One" }, { start: 4, end: 7, text: "Two" }], "a kept \\n is never absorbed");
 	assert.deepEqual(minimalDiff("a.b", "x.y"), [{ start: 0, end: 3, text: "x.y" }]);
-	assert.deepEqual(minimalDiff("a, b", "x, y"), [{ start: 0, end: 1, text: "x" }, { start: 3, end: 4, text: "y" }], "a two-char equality between one-char edits stays");
+	assert.deepEqual(minimalDiff("a, b", "x, y"), [{ start: 0, end: 2, text: "x," }, { start: 3, end: 4, text: "y" }], "glue takes the \",\" of the chunk; the space between edits stays");
+	// A delete can slide along a repeated "[B." with equal boundary scores; the bracket tie-break keeps it whole.
+	assert.deepEqual(minimalDiff("seed[B.9][B.26]", "seed[B.26]"), [{ start: 4, end: 9, text: "" }], "sim seed 786: not \"9][B.\"");
+	assert.deepEqual(minimalDiff("se[A.1][A.17]", "se[A.17]"), [{ start: 2, end: 7, text: "" }], "sim seed 894: not \"1][A.\"");
 });
 
-test("minimalDiff: concurrent Y.Text edits never interleave inside a word", () => {
-	// Device 1 rewrites a token through a disk write (minimalDiff), device 2 concurrently
-	// deletes the old token or inserts a new one right after it.
-	const cases: { base: string; disk: string; remote: (t: Y.Text) => void; want: RegExp }[] = [
-		{ base: "[A.2]\n", disk: "[B.27] \n", remote: (t) => t.delete(0, 5), want: /B\.27\]/ },
-		{ base: "[A.6] \n", disk: "[A.53] \n", remote: (t) => t.insert(6, "[B.23] "), want: /\[A\.53\] [^\n]*\[B\.23\]|\[B\.23\] [^\n]*\[A\.53\]/ },
-		{ base: "the cat sat\n", disk: "the cart sat\n", remote: (t) => t.insert(7, "s"), want: /cart/ },
+test("minimalDiff + applyEditsTo: concurrent Y.Text edits never split a word, both clientID orders give the same text", () => {
+	// Device 1 applies a disk write (minimalDiff + applyEditsTo), device 2 concurrently
+	// deletes the old token or inserts next to it. `want` is exact: the remote edit keeps
+	// its side whatever the clientIDs.
+	const cases: { base: string; disk: string; remote: (t: Y.Text) => void; want: string }[] = [
+		{ base: "[A.2]\n", disk: "[B.27] \n", remote: (t) => t.delete(0, 5), want: "[B.27] \n" },
+		{ base: "seed 1 [Z.1]\n", disk: "seed 1 [A.15] \n", remote: (t) => t.delete(7, 5), want: "seed 1 [A.15] \n" },
+		{ base: "[A.6] \n", disk: "[A.53] \n", remote: (t) => t.insert(6, "[B.23] "), want: "[A.53] [B.23] \n" },
+		{ base: "[A.34]\n", disk: "\n[A.55] ", remote: (t) => t.insert(7, "[B.39] "), want: "\n[A.55] [B.39] " },
+		{ base: "the cat sat\n", disk: "the cart sat\n", remote: (t) => t.insert(7, "s"), want: "the carts sat\n" },
+		{ base: "the cat sat\n", disk: "the cart sat\n", remote: (t) => t.insert(4, "s"), want: "the scart sat\n" },
+		{ base: "the cat sat\n", disk: "a dog sat\n", remote: (t) => t.insert(4, "big "), want: "a big dog sat\n" },
+		{ base: "the cat sat\n", disk: "a dog sat\n", remote: (t) => t.insert(7, " big"), want: "a dog big sat\n" },
+		// A list insert slides to the line start, so deleting the next item keeps the new one whole.
+		{ base: "- a\n- b\n", disk: "- a\n- new\n- b\n", remote: (t) => t.delete(4, 4), want: "- a\n- new\n" },
+		{ base: "x [A.2]\n", disk: "x [B.1] [A.2]\n", remote: (t) => t.delete(2, 5), want: "x [B.1] \n" },
+		{ base: "x[C.2][B.14]\n", disk: "x[B.14]\n", remote: (t) => t.delete(1, 5), want: "x[B.14]\n" },
 	];
 	for (const c of cases) {
 		for (const order of [0, 1]) {
@@ -247,20 +260,14 @@ test("minimalDiff: concurrent Y.Text edits never interleave inside a word", () =
 			d1.getText("t").insert(0, c.base);
 			Y.applyUpdate(d2, Y.encodeStateAsUpdate(d1));
 			const t1 = d1.getText("t");
-			d1.transact(() => {
-				const edits = minimalDiff(c.base, c.disk);
-				for (let i = edits.length - 1; i >= 0; i--) {
-					const e = edits[i]!;
-					if (e.end > e.start) t1.delete(e.start, e.end - e.start);
-					if (e.text.length > 0) t1.insert(e.start, e.text);
-				}
-			});
+			d1.transact(() => applyEditsTo(t1, c.base, minimalDiff(c.base, c.disk)));
+			assert.equal(t1.toString(), c.disk);
 			c.remote(d2.getText("t"));
 			Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
 			Y.applyUpdate(d2, Y.encodeStateAsUpdate(d1));
 			const merged = t1.toString();
 			assert.equal(merged, d2.getText("t").toString());
-			assert.match(merged, c.want, `${JSON.stringify(c.base)} -> ${JSON.stringify(c.disk)} (order ${order}): ${JSON.stringify(merged)}`);
+			assert.equal(merged, c.want, `${JSON.stringify(c.base)} -> ${JSON.stringify(c.disk)} (order ${order})`);
 		}
 	}
 });
