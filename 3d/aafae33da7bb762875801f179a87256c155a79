@@ -1,0 +1,35 @@
+src/engine/compose/vaultRuntime.ts
+  s_9cbf31702d3e3d::t_a03d3ec3725e59 203,247,253-261
+src/engine/reconcile/context.ts
+  s_9cbf31702d3e3d::t_7e76b533c15661 59-64
+src/engine/reconcile/diskJobs.ts
+  s_4c8271111ae3a8::t_0fc3e5b0f8bf81 51,63
+src/engine/reconcile/reconciler.alias.test.ts
+  s_9cbf31702d3e3d::t_e9f8c3be72f124 3,72-89
+src/engine/reconcile/testkit/world.ts
+  s_4c8271111ae3a8::t_d5edf4da247cd0 44-45,70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3daafae33da7bb762875801f179a87256c155a79",
+  "prompts": {},
+  "sessions": {
+    "s_4c8271111ae3a8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a00d4c492b57e176d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_9cbf31702d3e3d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a80c8223f6cdc9a73",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
