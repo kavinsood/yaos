@@ -360,3 +360,64 @@ New only:
 | Case and Unicode collisions between paths | adfa7a7:src/paths/pathCollision.ts:55 | src/core/paths/pathKey.ts:48, :54 (one fold key per path) | ported |
 | Sync category of a path (markdown, attachment, canvas) | adfa7a7:src/paths/pathCategory.ts:33; adfa7a7:src/types.ts:68-70, :78-85 (`.md` matched case-sensitively) | src/core/types.ts:97-102 (ASCII case-insensitive) | ported (an `.MD` file is markdown now; the legacy `.MD` upgrade is dropped: zero users) |
 | Attachments off: non-markdown files skipped | adfa7a7:src/runtime/attachmentOrchestrator.ts:68, :152 | src/engine/reconcile/localState.ts:85 | ported |
+
+## 13. Public plugin API
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| `app.plugins.plugins.yaos.api`, a data-only API for other plugins | adfa7a7:src/main.ts:230-231; adfa7a7:src/publicApi.ts:267 | MISSING | dropped: DESIGN §m.2 (public API; can be re-added on top of StatusSnapshot) |
+| `yaos:api-ready` workspace event, and the handle cleared on unload | adfa7a7:src/main.ts:2413-2417, :3094-3096 | MISSING | dropped: DESIGN §m.2 (public API) |
+| `getSnapshot`, `subscribe`, `getFile`, `getFileByBodyId` | adfa7a7:src/publicApi.ts:133-137 | MISSING (the same facts are in `StatusSnapshot`, src/protocol/status.ts) | dropped: DESIGN §m.2 (public API) |
+| Collaboration and authority facts in the snapshot | adfa7a7:src/publicApi.ts:42 | MISSING | dropped: DESIGN §m.2 (public API) |
+| Stale-handle error after the plugin unloads | adfa7a7:src/publicApi.ts:147-149 | MISSING | dropped: DESIGN §m.2 (public API) |
+| Published type file `yaos-plugin-api.d.ts` | adfa7a7:yaos-plugin-api.d.ts:1-9 | MISSING (deleted in f451274) | dropped: DESIGN §m.2 (public API) |
+
+## 14. Update checker
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Fetch a release manifest (latest server and plugin versions) | adfa7a7:src/update/updateManifest.ts:3, :14, :27; adfa7a7:src/runtime/capabilityUpdateService.ts:584-590 | MISSING | dropped: DESIGN §m.2 (plugin install/update flows) |
+| "Server update available" notices | adfa7a7:src/runtime/capabilityUpdateService.ts:625-640 | MISSING | dropped: DESIGN §m.2 (plugin install/update flows) |
+| Updates group in settings (versions, refresh, open update action, initialize updater) | adfa7a7:src/settings/settingsTab.ts:310-335 | MISSING | dropped: DESIGN §m.2 (plugin install/update flows) |
+| Compatibility guard when the server's protocol or formats differ | adfa7a7:src/runtime/capabilityUpdateService.ts:308-315, :622 | src/engine/runtime/relayPolicy.ts:59 (`upgrade-required`, no retry); src/host/ui/statusBar.ts:153-157 | ported |
+
+## 15. Telemetry and observability
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Flight recorder files under `plugins/yaos/flight-logs` (10 MB files, 100 MB total, 7 days) | adfa7a7:src/telemetry/debug/flightRecorder.ts:22-24, :79, :526 | MISSING (an in-memory ring of 2000 events, src/engine/runtime/context.ts:38) | dropped: DESIGN §m.2 (telemetry and observability) |
+| Trace controller, and fetching the server's recent trace (`/debug/recent`) | adfa7a7:src/telemetry/debug/flightTraceController.ts:147, :757-766 | MISSING | dropped: DESIGN §m.2 (telemetry and observability) |
+| Trace ids appended to server requests | adfa7a7:src/observability/traceContext.ts:9, :37 | MISSING | dropped: DESIGN §m.2 (telemetry and observability) |
+| Product event taxonomy | adfa7a7:src/observability/productEventKinds.ts:26 | MISSING (diagnostic events in the ring, src/protocol/status.ts:73-92) | dropped: DESIGN §m.2 (telemetry and observability) |
+| QA debug port for the test harness | adfa7a7:src/telemetry/debug/ports/yaosDebugPort.ts:38; adfa7a7:src/main.ts:694 | MISSING | dropped: the QA harness was deleted (f451274) |
+
+Nothing leaves the device in the new client: the diagnostics file (§6) is the only export.
+
+## 16. Mobile-specific behaviour
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Hidden app: flush writes, mark the socket as background | adfa7a7:src/runtime/connectionController.ts:291-301 | src/host/platform.ts:89-91; src/engine/compose/vaultRuntime.ts:507-516 | implemented (4a14c02) |
+| Mobile in the background: optional work paused, documents released | adfa7a7:src/runtime/residencyAdmissionCoordinator.ts:241-243, :502, :533-535 | src/engine/compose/vaultRuntime.ts:83, :514-525 (phone and constrained close the socket after 30 s hidden) | implemented (4a14c02) (DESIGN §i.4) |
+| Visible again: reconnect and catch up | adfa7a7:src/runtime/connectionController.ts:303-312 | src/host/platform.ts:89, :92; src/engine/compose/vaultRuntime.ts:528-535 | implemented (4a14c02) |
+| Network online and offline events | adfa7a7:src/runtime/connectionController.ts:327-345 | src/host/platform.ts:93-94; src/engine/compose/vaultRuntime.ts:536-542 | implemented (4a14c02) |
+| Platform split (desktop or mobile) | adfa7a7:src/main.ts:1250-1254; adfa7a7:src/runtime/residencyAdmissionCoordinator.ts:4 | src/host/runtimeSupport.ts:20-24 (desktop, tablet, phone, constrained); src/core/limits.ts:170-193 (budgets per class) | ported (DESIGN §i.2) |
+| Default device name from the platform (iPhone, iPad, Android, ...) | adfa7a7:src/utils/defaultDeviceName.ts:12-19 | src/host/ui/deviceName.ts:17-19; src/host/plugin.ts:93 | ported |
+
+The desktop-only plugin hold on mobile is a settings sync row in §1. New only: memory pressure releases every
+clean document (src/engine/body/handles.ts:193).
+
+## 17. styles.css
+
+The legacy stylesheet (adfa7a7:styles.css, 163 lines) was deleted in f451274. The new UI uses Obsidian's own classes
+(`mod-cta`, `mod-warning`, `mod-clickable`, Setting rows). It still sets a few `yaos-*` class names
+(src/host/ui/statusBar.ts:217, :247; src/host/ui/pairModal.ts:60, :170, :238-239; src/host/ui/brakeModal.ts:26, :33),
+but no stylesheet styles them.
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Collapsible settings details | adfa7a7:styles.css:5-18 | MISSING (Setting groups) | dropped: styles.css (deleted in f451274) |
+| Pair dialog layout (copy text, QR frame, loading text, QR canvas) | adfa7a7:styles.css:19-44 | MISSING (unstyled; src/host/ui/pairModal.ts:238-239) | dropped: styles.css (deleted in f451274) |
+| Settings textarea and callout | adfa7a7:styles.css:45-59 | MISSING | dropped: styles.css (deleted in f451274) |
+| Snapshot list and restore-selection layout | adfa7a7:styles.css:60-106 | MISSING (Setting rows, src/host/ui/snapshotsModal.ts:38, :159) | dropped: styles.css (deleted in f451274) |
+| Remote cursor styles (hidden unless "Show remote cursors") | adfa7a7:styles.css:108-163 | MISSING | dropped: DESIGN §m.2 (awareness/cursor presence) |
