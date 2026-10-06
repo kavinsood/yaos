@@ -1,0 +1,25 @@
+src/engine/compose/syncedMirror.ts
+  s_a3bb6f72388aba::t_54c04cfe1543bc 79-85,148
+src/engine/compose/syncedMirrorOrder.test.ts
+  s_a3bb6f72388aba::t_0f0a94fe677a8e 1-64
+src/engine/compose/vaultRuntime.ts
+  s_a3bb6f72388aba::t_165ae63ebd7b65 219
+src/engine/runtime/mirrorIo.ts
+  s_a3bb6f72388aba::t_dcd03cce0bbaeb 100-105,135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a077a78b4b36a79069a8470b2e6709f21a793433",
+  "prompts": {},
+  "sessions": {
+    "s_a3bb6f72388aba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a97fe38a693c58afa",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
