@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import {
 	CapabilityUpdateService,
@@ -11,7 +12,6 @@ import {
 	STORAGE_FORMAT_VERSION,
 } from "../../legacy-src/sync/schema";
 import type { ServerCapabilities } from "../../legacy-src/sync/serverCapabilities";
-import { isUpdateManifest, type UpdateManifest } from "../../legacy-src/update/updateManifest";
 import { SERVER_VERSION } from "../../server/src/version";
 import { readSource, repoRoot, suite } from "../harness.ts";
 
@@ -80,39 +80,26 @@ for (const [field, value] of [
 }
 
 s.section("Fresh-deployment release artifact");
+// DECISIONS §1 removes update-metadata: the release emits the server archive only, and the archive carries no
+// legacy product pins or CRDT engine (the P1 server is the opaque streams relay).
+const updateManifestPath = resolve(root, "dist/release-assets/update-manifest.json");
+rmSync(updateManifestPath, { force: true });
 execFileSync(process.execPath, ["build-server-release.mjs"], { cwd: root, stdio: "pipe" });
-const emitted = JSON.parse(readSource("dist/release-assets/update-manifest.json")) as UpdateManifest;
-s.check(isUpdateManifest(emitted), "emitted update manifest has the exact current shape");
-s.check(emitted.deploymentBoundary === "fresh", "breaking storage release requires a fresh deployment");
-s.check(emitted.latestServerVersion === SERVER_VERSION, "manifest publishes the current server version");
-s.check(emitted.latestPluginVersion === manifest.version, "manifest publishes the current plugin version");
-s.check(emitted.schemaVersion === 8 && emitted.storageFormatVersion === 4
-	&& emitted.protocolVersion === 5 && emitted.snapshotFormatVersion === 4,
-"manifest publishes all independent product pins");
-s.check(!("upgradeOrder" in emitted) && !("autoUpdateEligible" in emitted)
-	&& !("minCompatibleServerVersionForPlugin" in emitted),
-"range and in-place update metadata is absent");
+s.check(!existsSync(updateManifestPath), "release no longer emits update-manifest.json");
 
 const archivePath = resolve(root, "dist/release-assets/yaos-server.zip");
 const embedded = JSON.parse(execFileSync("unzip", ["-p", archivePath, "yaos-server-manifest.json"], { encoding: "utf8" })) as Record<string, unknown>;
 s.check(embedded.serverVersion === SERVER_VERSION, "server archive publishes its version");
-s.check(embedded.schemaVersion === 8 && embedded.storageFormatVersion === 4
-	&& embedded.protocolVersion === 5 && embedded.snapshotFormatVersion === 4,
-"server archive publishes all product pins");
-s.check(!("pluginVersion" in embedded) && !("protectedFiles" in embedded), "obsolete compatibility metadata is absent");
-const crdtEngine = embedded.crdtEngine as Record<string, unknown> | undefined;
-s.check(crdtEngine?.name === "ywasm"
-	&& typeof crdtEngine.sourceCommit === "string" && crdtEngine.sourceCommit.length === 40
-	&& typeof crdtEngine.artifactSha256 === "string" && crdtEngine.artifactSha256.length === 64,
-"server archive identifies its pinned CRDT source and artifact");
-const archiveEntries = execFileSync("unzip", ["-Z1", archivePath], { encoding: "utf8" }).split("\n");
-for (const required of [
-	"scripts/build-ywasm.mjs",
-	"vendor/ywasm/SOURCE.json",
-	"vendor/ywasm/rust-toolchain.toml",
-	"vendor/ywasm/patches/0001-document-stats.patch",
-]) {
-	s.check(archiveEntries.includes(required), `server archive carries hermetic ywasm input ${required}`);
+s.check(embedded.deploymentBoundary === "fresh", "server archive requires a fresh deployment");
+for (const field of ["schemaVersion", "storageFormatVersion", "protocolVersion", "snapshotFormatVersion", "crdtEngine",
+	"pluginVersion", "protectedFiles"]) {
+	s.check(!(field in embedded), `server archive manifest has no ${field}`);
 }
+const archiveEntries = execFileSync("unzip", ["-Z1", archivePath], { encoding: "utf8" }).split("\n");
+for (const required of ["src/worker.ts", "wrangler.toml", "package.json", "package-lock.json"]) {
+	s.check(archiveEntries.includes(required), `server archive carries ${required}`);
+}
+s.check(!archiveEntries.some((entry) => entry.startsWith("vendor/") || entry.startsWith("src/crdt/")
+	|| entry === "scripts/build-ywasm.mjs"), "server archive carries no CRDT engine or ywasm build inputs");
 
 await s.done();

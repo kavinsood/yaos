@@ -69,7 +69,7 @@ try {
 	if (!read("wrangler.toml").includes("# local-test-preserved")) {
 		throw new Error("Rejected fresh deployment modified wrangler.toml");
 	}
-	console.log("Fresh schema-4 server artifact is rejected by the in-place updater.");
+	console.log("Fresh server artifact is rejected by the in-place updater.");
 } finally {
 	rmSync(tempDir, { recursive: true, force: true });
 }

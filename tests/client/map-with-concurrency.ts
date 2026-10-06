@@ -4,7 +4,7 @@
  * Covers: empty input, concurrency limit, order preservation, rejection behavior.
  */
 
-import { mapWithConcurrency } from "../../server/src/shared/concurrency";
+import { mapWithConcurrency } from "../../legacy-src/shared/concurrency";
 import { suite } from "../harness.ts";
 
 const s = suite("map-with-concurrency");

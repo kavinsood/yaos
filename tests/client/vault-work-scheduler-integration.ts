@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { SOCKET_LIVENESS_DESCRIPTOR } from "../../server/src/shared/socketLiveness";
-import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
+import { SOCKET_LIVENESS_DESCRIPTOR } from "../../legacy-src/shared/socketLiveness";
+import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../legacy-src/shared/socketCloseCodes";
 import type { OverdueWorkClock } from "../../legacy-src/runtime/overdueWorkKernel";
 import {
 	VaultSync,

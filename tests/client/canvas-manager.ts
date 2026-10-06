@@ -1,9 +1,9 @@
 import { strict as assert } from "node:assert";
 import { setTimeout as delay } from "node:timers/promises";
 import * as Y from "yjs";
-import { canonicalCanvasBytes, parseCanvasBytes } from "../../server/src/shared/canvasCodec";
-import { applyCanvasSnapshot, createCanvasDocument, materializeCanvasDocument } from "../../server/src/shared/canvasSemanticDocument";
-import type { SemanticPathRef } from "../../server/src/shared/canvasTypes";
+import { canonicalCanvasBytes, parseCanvasBytes } from "../../legacy-src/shared/canvasCodec";
+import { applyCanvasSnapshot, createCanvasDocument, materializeCanvasDocument } from "../../legacy-src/shared/canvasSemanticDocument";
+import type { SemanticPathRef } from "../../legacy-src/shared/canvasTypes";
 import { CanvasManager, type CanvasProjectionPort, type CanvasProviderPort } from "../../legacy-src/sync/canvas/canvasManager";
 import { CanvasHttpTransport, CanvasSemanticEpochMismatchError } from "../../legacy-src/sync/canvas/canvasTransport";
 import type { CanvasAuthorityReceipt, CanvasCandidateReceipt, CanvasDemotionRequest, CanvasLifecycleRequest,

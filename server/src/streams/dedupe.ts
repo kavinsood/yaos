@@ -1,0 +1,277 @@
+// H2 dedupe window (DECISIONS §4 H2): a resend is deduplicated exactly when its original is among the newest W
+// stored-row bytes of its stream. Memory only (0 rows written); built lazily per stream by one bounded scan.
+//
+// One index per stream: hash53(UTF-8 deviceId, 0x00, UTF-8 clientFrameId) → newest seq, plus a ring of
+// (hash, seq, rowBytes), oldest first, trimmed to the newest W bytes. A hit is only a candidate: the store loads the
+// row and compares keys (a collision on another key is not a hit) and bytes. The DO-wide entry cap evicts whole
+// streams, least recently used first; an evicted stream rescans (≤ 65 rows).
+//
+// CPU fallback (H2 "chunk the scan and gate that stream's commits on it"): measured worst case (4 MiB of 25 B rows
+// with distinct keys, ≈ 168k rows) is ≈ 16 ms of parse in Node (≈ 15 ms on local workerd), over the 10 ms Free
+// budget. So a cold scan runs in steps of at most STREAM_DEDUPE_STEP_ROWS row units (DedupeBuild): the one bounded
+// read is charged by its bytes, the parse by its rows. The relay holds the stream's frames until its build is
+// installed.
+
+/** W ≥ burst + maxPayload + gcMaxBytes = 2 MiB + 1 MiB + 64 KiB. */
+export const STREAM_DEDUPE_WINDOW_BYTES = 4 * 1024 * 1024;
+/** Newest sealed segments the cold scan may read (every sealed segment is ≥ 64 KiB, so 64 cover W). */
+export const STREAM_DEDUPE_SCAN_SEGMENTS = 64;
+/** DO-wide cap on index entries (about 16 MB at about 60 B/entry). */
+export const STREAM_DEDUPE_MAX_ENTRIES = 262_144;
+/**
+ * Row units one build step may spend (16,384 rows parse in a median 1.2 ms in Node, about 2 ms on local workerd).
+ * DECISIONS-GAP: H2 names no chunk size; 16,384 keeps a step well under the 10 ms budget, and a stream of up to
+ * 16,384 rows that are 256 B or larger (4 MiB in all) still builds in one step.
+ */
+export const STREAM_DEDUPE_STEP_ROWS = 16_384;
+/**
+ * The bounded read's charge: one row unit per this many bytes loaded. Measured on local workerd, reading the 4 MiB
+ * window (64 segments) costs about as much as parsing 16,384 rows, so a full-window read is a step of its own.
+ * DECISIONS-GAP: H2 does not split the read; charging it keeps a step bounded without paging the ≤ 65-row read.
+ */
+export const STREAM_DEDUPE_READ_BYTES_PER_ROW = 256;
+
+const utf8 = new TextEncoder();
+
+/**
+ * cyrb53 (public domain, bryc) over `a`, one 0x00 byte, then `b`: a 53-bit hash, exact in a double. The middle step
+ * is the 0x00 byte (`h ^ 0 === h`). Both the frame path (strings, UTF-8 encoded) and the scan path (raw stored key
+ * bytes, never decoded) hash the same bytes.
+ */
+export function keyHash(a: Uint8Array, aStart: number, aEnd: number, b: Uint8Array, bStart: number, bEnd: number): number {
+	let h1 = 0xdeadbeef;
+	let h2 = 0x41c6ce57;
+	for (let i = aStart; i < aEnd; i++) {
+		const ch = a[i]!;
+		h1 = Math.imul(h1 ^ ch, 2654435761);
+		h2 = Math.imul(h2 ^ ch, 1597334677);
+	}
+	h1 = Math.imul(h1, 2654435761);
+	h2 = Math.imul(h2, 1597334677);
+	for (let i = bStart; i < bEnd; i++) {
+		const ch = b[i]!;
+		h1 = Math.imul(h1 ^ ch, 2654435761);
+		h2 = Math.imul(h2 ^ ch, 1597334677);
+	}
+	h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+	h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+	h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+	h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+	return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+
+/** `keyHash` of a frame's (deviceId, clientFrameId). */
+export function frameKeyHash(deviceId: string, clientFrameId: string): number {
+	const device = utf8.encode(deviceId);
+	const id = utf8.encode(clientFrameId);
+	return keyHash(device, 0, device.byteLength, id, 0, id.byteLength);
+}
+
+/** One stream's window: map hash → newest seq, ring of (hash, seq, rowBytes) oldest first. */
+export class StreamDedupeIndex {
+	private readonly map = new Map<number, number>();
+	private hashes = new Float64Array(16);
+	private seqs = new Float64Array(16);
+	private sizes = new Uint32Array(16);
+	private start = 0;
+	private count = 0;
+	private bytes = 0;
+	private rows = 0;
+
+	constructor(private readonly windowBytes: number = STREAM_DEDUPE_WINDOW_BYTES) {}
+
+	/** Rows ever added (trimmed ones included): a build step's row measure. */
+	get added(): number {
+		return this.rows;
+	}
+
+	/** Ring entries (the memory measure of the DO-wide cap). */
+	get entries(): number {
+		return this.count;
+	}
+
+	get windowedBytes(): number {
+		return this.bytes;
+	}
+
+	get(hash: number): number | undefined {
+		return this.map.get(hash);
+	}
+
+	/** Appends the newest row and trims to W. Returns the change in entries. */
+	add(hash: number, seq: number, rowBytes: number): number {
+		if (this.count === this.hashes.length) this.grow();
+		const slot = (this.start + this.count) & (this.hashes.length - 1);
+		this.hashes[slot] = hash;
+		this.seqs[slot] = seq;
+		this.sizes[slot] = rowBytes;
+		this.count++;
+		this.bytes += rowBytes;
+		this.rows++;
+		this.map.set(hash, seq);
+		return 1 - this.trim();
+	}
+
+	/**
+	 * Parses one stored blob (concatenated rows: varuint seq, varstring deviceId, varstring clientFrameId,
+	 * varuint8array payload) for keys only, skipping payloads by length, and adds its rows oldest first: from byte
+	 * `start`, at most `maxRows` rows. Returns the offset after the last row parsed, `blob.byteLength` once the blob
+	 * is done. A malformed tail ends the blob (the rows before it stay indexed).
+	 */
+	scan(blob: Uint8Array, start = 0, maxRows = Number.POSITIVE_INFINITY): number {
+		const end = blob.byteLength;
+		let pos = start;
+		for (let parsed = 0; parsed < maxRows && pos < end; parsed++) {
+			const rowStart = pos;
+			// Inline lib0 varuint reads (little-endian base-128); written by encodeRow, so well formed.
+			let seq = 0;
+			let scale = 1;
+			let byte: number;
+			do { byte = blob[pos++]!; seq += (byte & 0x7f) * scale; scale *= 128; } while (byte >= 0x80 && pos < end);
+			let length = 0;
+			scale = 1;
+			do { byte = blob[pos++]!; length += (byte & 0x7f) * scale; scale *= 128; } while (byte >= 0x80 && pos < end);
+			const deviceStart = pos;
+			pos += length;
+			const deviceEnd = pos;
+			length = 0;
+			scale = 1;
+			do { byte = blob[pos++]!; length += (byte & 0x7f) * scale; scale *= 128; } while (byte >= 0x80 && pos < end);
+			const idStart = pos;
+			pos += length;
+			const idEnd = pos;
+			length = 0;
+			scale = 1;
+			do { byte = blob[pos++]!; length += (byte & 0x7f) * scale; scale *= 128; } while (byte >= 0x80 && pos < end);
+			pos += length;
+			if (pos > end || idEnd > end) return end;
+			this.add(keyHash(blob, deviceStart, deviceEnd, blob, idStart, idEnd), seq, pos - rowStart);
+		}
+		return pos;
+	}
+
+	/** Drops the oldest rows while the rest still hold ≥ W bytes. Returns the number dropped. */
+	private trim(): number {
+		let dropped = 0;
+		const mask = this.hashes.length - 1;
+		while (this.count > 1 && this.bytes - this.sizes[this.start]! >= this.windowBytes) {
+			const hash = this.hashes[this.start]!;
+			if (this.map.get(hash) === this.seqs[this.start]) this.map.delete(hash);
+			this.bytes -= this.sizes[this.start]!;
+			this.start = (this.start + 1) & mask;
+			this.count--;
+			dropped++;
+		}
+		return dropped;
+	}
+
+	private grow(): void {
+		const capacity = this.hashes.length * 2;
+		const hashes = new Float64Array(capacity);
+		const seqs = new Float64Array(capacity);
+		const sizes = new Uint32Array(capacity);
+		const mask = this.hashes.length - 1;
+		for (let i = 0; i < this.count; i++) {
+			const slot = (this.start + i) & mask;
+			hashes[i] = this.hashes[slot]!;
+			seqs[i] = this.seqs[slot]!;
+			sizes[i] = this.sizes[slot]!;
+		}
+		this.hashes = hashes;
+		this.seqs = seqs;
+		this.sizes = sizes;
+		this.start = 0;
+	}
+}
+
+const NO_BYTES = new Uint8Array(0);
+
+/**
+ * H2 CPU fallback: one stream's cold scan as resumable steps. The blobs (sealed segments oldest first, then the open
+ * segment) come from the one bounded read; only the parse is split, by rows (its CPU is per row: payloads are skipped
+ * by length). A parsed blob is released.
+ */
+export class DedupeBuild {
+	readonly index: StreamDedupeIndex;
+	/** Bytes the read loaded (its step charge). */
+	readonly bytes: number;
+	private next = 0;
+	private offset = 0;
+
+	constructor(private readonly blobs: Uint8Array[], windowBytes: number = STREAM_DEDUPE_WINDOW_BYTES) {
+		this.index = new StreamDedupeIndex(windowBytes);
+		this.bytes = blobs.reduce((total, blob) => total + blob.byteLength, 0);
+	}
+
+	get done(): boolean {
+		return this.next >= this.blobs.length;
+	}
+
+	/** Parses at most `maxRows` more rows. Returns the rows parsed. */
+	step(maxRows: number): number {
+		const before = this.index.added;
+		while (this.next < this.blobs.length && this.index.added - before < maxRows) {
+			const blob = this.blobs[this.next]!;
+			this.offset = this.index.scan(blob, this.offset, maxRows - (this.index.added - before));
+			if (this.offset >= blob.byteLength) { this.blobs[this.next++] = NO_BYTES; this.offset = 0; }
+		}
+		return this.index.added - before;
+	}
+}
+
+/** Every stream's index in one runtime, with the DO-wide entry cap (LRU over whole streams). */
+export class DedupeIndexes {
+	/** Insertion order = recency: `touch` re-inserts. */
+	private readonly streams = new Map<string, StreamDedupeIndex>();
+	private total = 0;
+
+	constructor(private readonly maxEntries: number = STREAM_DEDUPE_MAX_ENTRIES) {}
+
+	get entries(): number {
+		return this.total;
+	}
+
+	get size(): number {
+		return this.streams.size;
+	}
+
+	/** The stream's index, marked most recently used; undefined when not built (or evicted). */
+	touch(stream: string): StreamDedupeIndex | undefined {
+		const index = this.streams.get(stream);
+		if (index) { this.streams.delete(stream); this.streams.set(stream, index); }
+		return index;
+	}
+
+	has(stream: string): boolean {
+		return this.streams.has(stream);
+	}
+
+	/** Installs a freshly built index as most recently used, then enforces the cap (never evicting `stream`). */
+	install(stream: string, index: StreamDedupeIndex): void {
+		const previous = this.streams.get(stream);
+		if (previous) { this.total -= previous.entries; this.streams.delete(stream); }
+		this.streams.set(stream, index);
+		this.total += index.entries;
+		this.enforce(stream);
+	}
+
+	/** Records rows a commit added to `stream`'s index (`delta` from `add`), then enforces the cap. */
+	grew(stream: string, delta: number): void {
+		this.total += delta;
+		this.enforce(stream);
+	}
+
+	clear(): void {
+		this.streams.clear();
+		this.total = 0;
+	}
+
+	private enforce(keep: string): void {
+		for (const [stream, index] of this.streams) {
+			if (this.total <= this.maxEntries) return;
+			if (stream === keep) continue;
+			this.streams.delete(stream);
+			this.total -= index.entries;
+		}
+	}
+}

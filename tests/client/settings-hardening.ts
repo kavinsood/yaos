@@ -9,7 +9,7 @@ import {
 import {
 	MAX_CLIENT_MARKDOWN_BYTES,
 	MAX_CLIENT_MARKDOWN_KB,
-} from "../../server/src/shared/durableLimits";
+} from "../../legacy-src/shared/durableLimits";
 import { buildRuntimeConfig } from "../../legacy-src/runtime/runtimeConfig";
 import { suite } from "../harness.ts";
 

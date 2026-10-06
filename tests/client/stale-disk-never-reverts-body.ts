@@ -39,7 +39,7 @@ import type { DiskIngestPort } from "../../legacy-src/runtime/engineControlPort"
 import { suite } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto.ts";
-import { canonicalMarkdownHash } from "../../server/src/shared/markdownCodec";
+import { canonicalMarkdownHash } from "../../legacy-src/shared/markdownCodec";
 
 installDomCrypto();
 const s = suite("stale-disk-never-reverts-body");

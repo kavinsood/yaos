@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { setTimeout as delay } from "node:timers/promises";
-import type { CanvasMergeConflict } from "../../server/src/shared/canvasTypes";
+import type { CanvasMergeConflict } from "../../legacy-src/shared/canvasTypes";
 import type { CanvasProjectionPort } from "../../legacy-src/sync/canvas/canvasManager";
 import { CanvasProjectionRouter } from "../../legacy-src/sync/canvas/canvasProjectionRouter";
 import { suite } from "../harness.ts";

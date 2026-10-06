@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { MAX_DURABLE_UPDATE_BYTES, MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
+import { MAX_DURABLE_UPDATE_BYTES, MAX_CLIENT_MARKDOWN_BYTES } from "../../legacy-src/shared/durableLimits";
 import { FrontmatterSemanticMirror } from "../../legacy-src/sync/frontmatterSemanticMirror";
 import {
 	materializeFreshMarkdownUpdates,

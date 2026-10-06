@@ -5,8 +5,7 @@
 //
 // DISCOVERY, NOT REGISTRATION. A regression suite is any `*.ts` file inside
 // tests/client/, tests/server/ or tests/contracts/ that is not named in
-// tests/suites.json. Live-worker suites are owned separately by
-// tests/live/run-live.ts because they require a running Worker.
+// tests/suites.json.
 // There is no list to append to: this runner replaced one that had silently
 // orphaned two real unit suites (458 + 364 LOC, 146 assertions).
 //
@@ -36,7 +35,7 @@
 //
 // IMPORTANT: Always run regressions via `npm run test:regressions` (or this
 // script directly). The child bootstrap owns yjs/y-protocols deduplication and
-// the obsidian, partyserver and @shared aliases.
+// the obsidian, cloudflare:workers and @shared aliases.
 //
 // CLI flags:
 //   --only <substring>   Run only suites whose path contains <substring>.
@@ -68,8 +67,7 @@ const RUNNER = ["node", "tests/run-typescript.mjs", "--test-aliases"];
 // rather than a copy of it that could drift.
 // -----------------------------------------------------------------------
 
-// The three regression buckets. Live-worker suites have their own accountable
-// driver in tests/live/run-live.ts. Everything else under tests/ is
+// The three regression buckets. Everything else under tests/ is
 // infrastructure — this runner, suites.json, harness.ts, mocks/, fixtures/ and
 // manual/ — and is not a discovery candidate, so it needs no registry excuse.
 const BUCKETS = ["client", "server", "contracts"];
