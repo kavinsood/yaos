@@ -1,0 +1,19 @@
+README.md
+  s_ed451e485d98d2::t_4d1f20f170509a 7-9,13,19-20,39-81,87-97,101,113-124,126-127,129-131,133-134,138-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2bb319ba8e6ff908675868216d70bbfea68f6230",
+  "prompts": {},
+  "sessions": {
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
