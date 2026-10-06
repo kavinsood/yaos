@@ -51,7 +51,7 @@ export class FakeConfigDir implements ConfigDirPort {
 }
 
 export function emptyFold(): CfgFoldState {
-	return { formatVersion: 1, coversSeq: 0, recentFrames: new Map(), json: new Map(), files: new Map(), plugins: new Map() };
+	return { formatVersion: 1, coversSeq: 0, recentFrames: new Map(), replay: new Map(), json: new Map(), files: new Map(), plugins: new Map() };
 }
 
 /** Shared relay + fold: every submitted op gets the next seq; later seq wins (LWW). */

@@ -32,7 +32,7 @@ export type GatedRow =
 
 export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, nowMs: number): Promise<GatedRow> {
 	const cls = streamClass(input.stream);
-	if (cls === "other") return { t: "account" };
+	if (cls === "other" || cls === "keyring") return { t: "account" };
 	const g = await gate(ctx, { t: "row", ...input });
 	const base = { stream: input.stream, seq: input.seq, deviceId: input.deviceId, clientFrameId: input.clientFrameId };
 	if (g.ok) {
@@ -44,15 +44,16 @@ export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, now
 			case "body":
 			case "bodyRef":
 			case "blobchunk":
-				return { t: "row", row: { ...base, kind: g.inner.kind, authorNsSeq: g.inner.authorNsSeq, flags: g.inner.flags, content: g.inner.content } };
+				return { t: "row", row: { ...base, kind: g.inner.kind, authorNsSeq: g.inner.authorNsSeq, flags: g.inner.flags, frameNo: g.inner.frameNo, content: g.inner.content } };
 			case "checkpoint":
 				return { t: "account" };
 		}
 	}
 	if (cls === "ns" || cls === "cfg") {
 		const kind = cls === "ns" ? "nsOps" : "cfgOps";
-		if (g.readerDependent) return { t: "row", row: { ...base, kind, authorNsSeq: 0, flags: LOCAL_FLAG_UNOPENED, content: input.payload } };
-		return { t: "row", row: { ...base, kind, authorNsSeq: 0, flags: 0, content: new Uint8Array(0) } };
+		// frameNo 0: a row that did not open (or decode) never touches the replay window (e2ee-design §8.2).
+		if (g.readerDependent) return { t: "row", row: { ...base, kind, authorNsSeq: 0, flags: LOCAL_FLAG_UNOPENED, frameNo: 0, content: input.payload } };
+		return { t: "row", row: { ...base, kind, authorNsSeq: 0, flags: 0, frameNo: 0, content: new Uint8Array(0) } };
 	}
 	return { t: "quarantine", rec: await quarantineRecord(hash, input, g.reason, g.detail, nowMs) };
 }

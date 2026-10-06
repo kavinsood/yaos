@@ -30,7 +30,8 @@ import type { EngineTuning } from "../runtime/options";
 import { BoundDocs } from "./boundDocs";
 import { HostLink } from "./hostLink";
 import { idleStatus } from "./statusMerge";
-import { prepareEpochMigration } from "./runtimeOps";
+import { ownFrameNoFloor, prepareEpochMigration } from "./runtimeOps";
+import type { FrameNoFloor } from "../store/repo";
 import { VaultRuntime, type RestartReason } from "./vaultRuntime";
 
 export interface CreateEngineOptions {
@@ -82,7 +83,7 @@ export class ComposedEngine {
 	private lastStartError: string | null = null;
 	private knownEpoch: VaultEpoch | undefined;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
-	private migration: { bases: Map<PathKey, string>; oldEpoch: VaultEpoch } | null = null;
+	private migration: { bases: Map<PathKey, string>; oldEpoch: VaultEpoch; frameNoFloor: FrameNoFloor } | null = null;
 	private readonly offs: (() => void)[] = [];
 
 	constructor(readonly transport: EngineTransport, readonly options: CreateEngineOptions) {
@@ -197,7 +198,7 @@ export class ComposedEngine {
 					clientVersion: this.options.clientVersion ?? "dev", vaultEpoch: this.knownEpoch, reason,
 					tuning: this.options.tuning, budgets: this.options.budgets, paused: this.paused,
 					tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log,
-					pathBases: this.migration?.bases ?? null, retireEpoch: this.migration?.oldEpoch ?? null,
+					pathBases: this.migration?.bases ?? null, retireEpoch: this.migration?.oldEpoch ?? null, frameNoFloor: this.migration?.frameNoFloor ?? null,
 				});
 				if (this.disposed) {
 					await rt.stop();
@@ -252,11 +253,12 @@ export class ComposedEngine {
 		if (this.starting) await this.starting;
 		const old = this.rt;
 		if (reason === "epoch" && old) {
+			const frameNoFloor = ownFrameNoFloor(old);
 			const bases = await prepareEpochMigration(old).catch((e) => {
 				this.log(`epoch prepare failed: ${String(e)}`);
 				return new Map<PathKey, string>();
 			});
-			this.migration = { bases, oldEpoch: old.vaultEpoch };
+			this.migration = { bases, oldEpoch: old.vaultEpoch, frameNoFloor };
 		}
 		this.rt = null;
 		this.options.onRuntime?.(null);

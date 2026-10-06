@@ -54,8 +54,10 @@ export type DocKind = "markdown" | "canvas" | "blob";
 
 export const NS_STREAM = "ns" as StreamName;
 export const CFG_STREAM = "cfg" as StreamName;
+/** Keyring stream: k records, no envelope (e2ee-design §11). */
+export const KEYRING_STREAM = "k" as StreamName;
 
-export type StreamClass = "ns" | "cfg" | "body" | "canvas" | "blobchunk" | "other";
+export type StreamClass = "ns" | "cfg" | "body" | "canvas" | "blobchunk" | "keyring" | "other";
 
 export function bodyStream(docId: DocId): StreamName {
 	return `b:${docId}` as StreamName;
@@ -74,6 +76,7 @@ export function docStream(kind: DocKind, docId: DocId): StreamName | null {
 export function streamClass(stream: StreamName): StreamClass {
 	if (stream === NS_STREAM) return "ns";
 	if (stream === CFG_STREAM) return "cfg";
+	if (stream === KEYRING_STREAM) return "keyring";
 	if (stream.startsWith("b:")) return "body";
 	if (stream.startsWith("c:")) return "canvas";
 	if (stream.startsWith("x:")) return "blobchunk";
@@ -161,6 +164,12 @@ export interface NsFrame {
 	readonly clientFrameId: ClientFrameId;
 	/** Author's committed ns coversSeq when it built the frame. */
 	readonly authorNsSeq: Seq;
+	/**
+	 * Inner-envelope frameNo (e2ee-design §8.2), ≥ 1 for an authenticated
+	 * frame. 0: the row failed the gate deterministically and folds as empty
+	 * without touching the replay window.
+	 */
+	readonly frameNo: number;
 	readonly ops: readonly NsOp[];
 }
 
@@ -202,6 +211,16 @@ export interface NsEntry {
 }
 
 /**
+ * frameNo anti-replay window of one (device, stream) (e2ee-design §8.2):
+ * right edge r and a REPLAY_WINDOW-bit bitmap, bit i = frameNo r − i.
+ * Helpers: src/core/replayWindow.ts.
+ */
+export interface ReplayWindow {
+	readonly r: number;
+	readonly bits: bigint;
+}
+
+/**
  * Canonical, deterministic fold state. Mutable maps are owned by the fold;
  * everything else must treat them as read-only.
  */
@@ -213,6 +232,8 @@ export interface NsFoldState {
 	readonly entries: Map<DocId, NsEntry>;
 	/** Last NS_DEDUPE_RING clientFrameIds per device, oldest first. */
 	readonly recentFrames: Map<DeviceId, ClientFrameId[]>;
+	/** frameNo anti-replay window per device (e2ee-design §8.2). Values are immutable. */
+	readonly replay: Map<DeviceId, ReplayWindow>;
 }
 
 /** Derived indexes; rebuilt from entries, never encoded. */
@@ -231,6 +252,12 @@ export interface NsFoldIndex {
 
 export type NsIgnoreReason =
 	| "duplicate-frame"
+	/** frameNo at or below the window's left edge (e2ee-design §8.2). */
+	| "replay-stale"
+	/** frameNo inside the window, already accepted. */
+	| "replay-duplicate"
+	/** keyEpoch older than the newest revoke, committed after S_rot (e2ee-design §14.3; WP-E3 emits it). */
+	| "stale-epoch"
 	| "duplicate-docid"
 	| "unknown-docid"
 	| "invalid-path"
@@ -307,6 +334,8 @@ export interface CfgFoldState {
 	coversSeq: Seq;
 	/** Same duplicate-frame ring as NsFoldState (DESIGN §c.3, §c.11). */
 	readonly recentFrames: Map<DeviceId, ClientFrameId[]>;
+	/** Same frameNo anti-replay window as NsFoldState (e2ee-design §8.2). */
+	readonly replay: Map<DeviceId, ReplayWindow>;
 	/** Key = file + "\u0000" + topLevelKey. */
 	readonly json: Map<string, CfgRegister<string>>;
 	readonly files: Map<ConfigRelPath, CfgRegister<{ readonly content: CfgFileContent; readonly pluginVersion: string | null }>>;

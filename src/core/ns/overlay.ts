@@ -2,7 +2,9 @@
  * Optimistic overlay (DESIGN §f.1 RemoteEntry = OptimisticRemote(committed
  * fold + own pending ns ops)). Folds the device's pending frames, in outbox
  * order, on a copy-on-write clone at pseudo-seqs coversSeq + 1 + i. The
- * committed state/index are not modified.
+ * committed state/index are not modified. Pending frames pass the replay
+ * window like committed ones; the send window keeps that exact (e2ee-design
+ * §8.2), so an honest pending frame is never ignored as a replay.
  */
 
 import type { ClientFrameId, DeviceId, DocId, NsFoldEvent, NsFoldIndex, NsFoldState, NsOp, Seq } from "../types";
@@ -12,6 +14,8 @@ import { DEFAULT_NS_FOLD_RULES, foldNsFrameWith, nsFoldHalted, type NsFoldRules 
 export interface PendingNsFrame {
 	readonly clientFrameId: ClientFrameId;
 	readonly authorNsSeq: Seq;
+	/** Sealed frameNo (≥ 1; 0 = unknown, skips the replay window). */
+	readonly frameNo: number;
 	readonly ops: readonly NsOp[];
 }
 
@@ -37,7 +41,7 @@ export function overlayPending(
 	let halted = false;
 	for (let i = 0; i < frames.length; i++) {
 		const f = frames[i]!;
-		const ev = foldNsFrameWith(rules, c.state, c.index, { seq: state.coversSeq + 1 + i, deviceId, clientFrameId: f.clientFrameId, authorNsSeq: f.authorNsSeq, ops: f.ops });
+		const ev = foldNsFrameWith(rules, c.state, c.index, { seq: state.coversSeq + 1 + i, deviceId, clientFrameId: f.clientFrameId, authorNsSeq: f.authorNsSeq, frameNo: f.frameNo, ops: f.ops });
 		events.push(...ev);
 		if (nsFoldHalted(ev)) { halted = true; break; }
 	}

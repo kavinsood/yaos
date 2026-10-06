@@ -10,7 +10,7 @@ import * as Y from "yjs";
 import {
 	BLOB_CHUNK_BYTES, FRAME_MAX_BYTES, FRAME_MAX_UPDATES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES, OPEN_FRAME_IDLE_MS, OPEN_FRAME_MAX_MS,
 } from "../../core/limits";
-import { blobChunkStream, type ClientFrameId, type ContentHash, type Seq, type StreamName, type VaultId } from "../../core/types";
+import { blobChunkStream, type ClientFrameId, type ContentHash, type DeviceId, type Seq, type StreamName, type VaultId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress } from "../../ports/crypto";
 import { createNoopCrypto } from "../adapters/noopCrypto";
@@ -27,7 +27,7 @@ import { assembleChunks, resolveRefContent } from "./refs";
 const hash = createWebHash();
 const crypto = createNoopCrypto(hash);
 const VAULT = "v1" as VaultId;
-const ctx: FrameCtx = { vaultId: VAULT, crypto, hash, random: createWebRandom(), blob: null };
+const ctx: FrameCtx = { vaultId: VAULT, self: "dev1" as DeviceId, crypto, hash, random: createWebRandom(), blob: null };
 const gctx: GateCtx = { crypto, vaultId: VAULT, maxCheckpointStateBytes: 1 << 20 };
 const BODY = "b:doc1" as StreamName;
 

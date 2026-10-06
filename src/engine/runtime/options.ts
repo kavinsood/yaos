@@ -7,6 +7,7 @@ import { BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNC
 import type { DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { SideFilePort } from "../../ports/vault";
+import type { FrameNoFloor } from "../store/repo";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import { DEFAULT_CHECKPOINT_TUNING, type CheckpointTuning } from "../body/checkpoints";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
@@ -82,6 +83,8 @@ export interface EngineOptions {
 	readonly vaultEpoch?: VaultEpoch;
 	/** Outbox mirror (DESIGN §e.4); null/absent = no mirror. */
 	readonly sideFiles?: SideFilePort | null;
+	/** Highest own ns / cfg frameNo of the abandoned epoch (DESIGN §c.12 step 3, e2ee-design §8.2); written to meta. */
+	readonly frameNoFloor?: FrameNoFloor | null;
 	/** Apply + adopt other devices' provisional frames on bound docs (DESIGN §d.5). Default true. */
 	readonly provisionalBroadcast?: boolean;
 	readonly tuning?: Partial<EngineTuning>;

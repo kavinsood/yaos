@@ -22,12 +22,20 @@ export const TOMBSTONE_PRUNE_HYSTERESIS = 1_000;
 /** FOLD. clientFrameIds remembered per device for duplicate-frame suppression (ns and cfg). */
 export const NS_DEDUPE_RING = 64;
 /**
- * Send window for ns/cfg frames: own frame k of a stream may be sent only when
- * every own frame <= k - NS_SEND_WINDOW of that stream is receipted. With
- * NS_SEND_WINDOW <= NS_DEDUPE_RING / 2 a resend outside the relay's dedupe
- * window is always still in the fold's ring (DESIGN §c.3).
+ * Send window for ns/cfg frames, over frameNo (e2ee-design §8.2): own frame f
+ * of a stream may be sent only when every own frame with frameNo <=
+ * f - NS_SEND_WINDOW of that stream is receipted. With NS_SEND_WINDOW <=
+ * NS_DEDUPE_RING / 2 a resend outside the relay's dedupe window is always
+ * still in the fold's ring (DESIGN §c.3), and with REPLAY_WINDOW >=
+ * 2 * NS_SEND_WINDOW no honest frame is ever stale.
  */
 export const NS_SEND_WINDOW = 32;
+/**
+ * FOLD. Anti-replay window over frameNo per (device, stream), in frames
+ * (e2ee-design §8.2). 64-bit bitmap; must stay >= 2 * NS_SEND_WINDOW so an
+ * honest writer's frames are never stale (the exactness argument).
+ */
+export const REPLAY_WINDOW = 64;
 /** FOLD. Windows reserved stems (case-insensitive, with or without extension). */
 export const RESERVED_STEMS: readonly string[] = [
 	"con", "prn", "aux", "nul",
@@ -42,11 +50,14 @@ export const FORBIDDEN_PATH_CHARS = "\\*\"<>:|?";
 /** Max ns ops per frame. */
 export const MAX_NS_OPS_PER_FRAME = 512;
 /**
- * Max encoded inner content per frame (all kinds). The relay payload limit is
- * 1 MiB for the whole sealed envelope (1009 close above it); 4 KiB is left for
- * the envelope header and AEAD overhead.
+ * Max encoded inner content per frame (all kinds), under every suite. The
+ * relay payload limit is 1 MiB for the whole sealed envelope (1009 close above
+ * it). Suite 1 pads with Padmé, which for lengths in [2^19, 2^20) rounds up to
+ * 16 KiB: the largest padded inner that still fits is 63 × 16 KiB, so content
+ * stops 32 KiB short of 1 MiB, leaving >= 16 KiB for the inner header, the pad
+ * marker, the outer header and the 28 B AEAD overhead (e2ee-design §7.3).
  */
-export const MAX_FRAME_CONTENT_BYTES = 1024 * 1024 - 4096;
+export const MAX_FRAME_CONTENT_BYTES = 1024 * 1024 - 32 * 1024;
 /** Initial content of a large new note is inserted in chunks of this many UTF-16 units, one frame each (DESIGN §b.6). */
 export const INITIAL_INSERT_CHUNK_CHARS = 192 * 1024;
 export const MAX_NS_FRAME_BYTES = 256 * 1024;
@@ -64,6 +75,16 @@ export const MAIN_UPDATE_COALESCE_MS = 16;
 export const BLOB_CHUNK_BYTES = 768 * 1024;
 /** Largest attachment carried on the log without a blob store. */
 export const MAX_LOG_BLOB_BYTES = 8 * 1024 * 1024;
+
+// --- Crypto suite 1 (e2ee-design §7.3) ----------------------------------------
+
+/** Padmé floor: every padded payload is at least this long (decision D3). */
+export const PADME_FLOOR_BYTES = 256;
+/**
+ * Largest suite-1 blob plaintext, the 0x80 pad marker included: 39 × 256 KiB
+ * padded plus header and AEAD overhead fits the 10 MiB upload cap (DECISIONS D9).
+ */
+export const MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 39 * 256 * 1024 - 1;
 
 // --- Content ----------------------------------------------------------------
 

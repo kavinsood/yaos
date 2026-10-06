@@ -15,6 +15,7 @@ import type { DocId, NsEntry, NsFoldIndex, NsFoldState, PathKey, VaultPath } fro
 import { kindOfPath } from "../types";
 import { CheckpointEncoding, type CheckpointContent } from "../envelope";
 import { FOLD_RULES_VERSION, NS_DEDUPE_RING, TOMBSTONE_CAP } from "../limits";
+import { replayWindowValid } from "../replayWindow";
 import { bytesEqual } from "../codec/lib0";
 import { isClientFrameId, isContentHash, isDocId } from "../codec/ids";
 import { decodeNsFoldV1, encodeNsFoldV1 } from "../codec/nsFoldV1";
@@ -127,6 +128,10 @@ export function checkNsInvariants(state: NsFoldState, index?: NsFoldIndex, opts:
 		if (ring.length < 1 || ring.length > NS_DEDUPE_RING) return `ring ${device} size ${ring.length}`;
 		if (new Set(ring).size !== ring.length) return `ring ${device} has duplicates`;
 		for (const f of ring) if (!isClientFrameId(f)) return `ring ${device} has invalid id`;
+	}
+	for (const [device, w] of state.replay) {
+		if (typeof device !== "string" || device.length === 0) return "empty deviceId in replay";
+		if (!replayWindowValid(w)) return `replay ${device} window not canonical`;
 	}
 	if (index) {
 		const d = indexesEqual(index, { byPathKey, folderRefs: folders, tombstones });

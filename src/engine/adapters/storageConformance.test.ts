@@ -39,14 +39,14 @@ function outbox(id: string, order: number, state: OutboxState = "pending", strea
 	return {
 		clientFrameId: F(id), order, stream: S(stream), kind: "bodyUpdate", state,
 		sealed: new Uint8Array([order & 255, 1, 2, 3]), content: new Uint8Array([order & 255]),
-		authorNsSeq: 0, flags: 0, dependsOn: null, adoptOf: null, attempts: 0, createdAtMs: 1000 + order, lastSentAtMs: 0,
+		authorNsSeq: 0, flags: 0, frameNo: null, dependsOn: null, adoptOf: null, attempts: 0, createdAtMs: 1000 + order, lastSentAtMs: 0,
 	};
 }
 
 function tail(stream: string, seq: number): TailRecord {
 	return {
 		stream: S(stream), seq, deviceId: "dev1" as DeviceId, clientFrameId: F(`cf:${stream}:${seq}`), kind: "bodyUpdate",
-		authorNsSeq: 0, flags: 0, content: new Uint8Array([seq & 255, 0xaa, 0xbb]),
+		authorNsSeq: 0, flags: 0, frameNo: 0, content: new Uint8Array([seq & 255, 0xaa, 0xbb]),
 	};
 }
 

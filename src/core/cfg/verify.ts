@@ -16,6 +16,7 @@
 import type { CfgFoldState, CfgRegister, CfgVersion } from "../types";
 import { CheckpointEncoding, type CheckpointContent } from "../envelope";
 import { MAX_NS_OPS_PER_FRAME, NS_DEDUPE_RING } from "../limits";
+import { replayWindowValid } from "../replayWindow";
 import { bytesEqual } from "../codec/lib0";
 import { isClientFrameId } from "../codec/ids";
 import { decodeCfgFoldV1, encodeCfgFoldV1 } from "../codec/cfgFoldV1";
@@ -40,6 +41,10 @@ export function checkCfgInvariants(state: CfgFoldState): string | null {
 		if (ring.length < 1 || ring.length > NS_DEDUPE_RING) return `ring ${device} size ${ring.length}`;
 		if (new Set(ring).size !== ring.length) return `ring ${device} has duplicates`;
 		for (const f of ring) if (!isClientFrameId(f)) return `ring ${device} has invalid id`;
+	}
+	for (const [device, w] of state.replay) {
+		if (typeof device !== "string" || device.length === 0) return "empty deviceId in replay";
+		if (!replayWindowValid(w)) return `replay ${device} window not canonical`;
 	}
 	const versions = new Set<string>();
 	const seqDevice = new Map<number, string>();

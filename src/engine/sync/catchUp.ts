@@ -94,7 +94,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	const result = (t: ReadResult["t"], error?: string): ReadResult => ({
 		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, apply, tailPut, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
 	});
-	if (cls === "other") return result("done");
+	if (cls === "other" || cls === "keyring") return result("done");
 	const start = repo.stream(stream);
 	let after = opts.fromSeq ?? start?.appliedSeq ?? 0;
 	let preferCheckpoint = after === 0;

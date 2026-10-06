@@ -241,14 +241,17 @@ export class BlobQueue implements BlobTransfer {
 		const addr = await this.deps.crypto.blobAddress(hash);
 		const have = await store.has([addr]);
 		if (have.has(addr)) return true;
-		await store.put(addr, await this.deps.crypto.sealBlob(bytes));
+		await store.put(addr, await this.deps.crypto.sealBlob({ address: addr, plaintext: bytes }));
 		return true;
 	}
 
 	private async getStore(hash: ContentHash): Promise<Uint8Array | null> {
 		const store = this.deps.store!;
-		const sealed = await store.get(await this.deps.crypto.blobAddress(hash));
-		return sealed ? this.deps.crypto.openBlob(sealed) : null;
+		const address = await this.deps.crypto.blobAddress(hash);
+		const sealed = await store.get(address);
+		if (!sealed) return null;
+		const opened = await this.deps.crypto.openBlob({ address, sealed });
+		return opened.ok ? opened.plaintext : null;
 	}
 
 	private async putLog(hash: ContentHash, bytes: Uint8Array): Promise<boolean> {

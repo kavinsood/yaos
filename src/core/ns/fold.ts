@@ -11,6 +11,11 @@
  *   the state (including coversSeq) unchanged. nsFoldHalted(events) detects it.
  * - A duplicate frame emits one frame-level event and still sets coversSeq = seq
  *   (the row is folded; it just has no effect).
+ * - Replay window (e2ee-design §8.2) runs after the clientFrameId ring, for
+ *   frameNo ≥ 1 only (frameNo 0 = a row that failed the gate, folded as
+ *   empty). A stale or duplicate frameNo emits one frame-level
+ *   ignored/replay-* event, sets coversSeq = seq and changes neither the ring
+ *   nor the window. An accepted frame updates both.
  * - restore also checks invalid-path / kind-mismatch on op.path (after
  *   restore-not-current), like rename.
  * - Events for unknown-docid / duplicate-docid carry op.docId; other per-op
@@ -37,6 +42,7 @@ import { kindOfPath } from "../types";
 import { FOLD_RULES_VERSION, NS_DEDUPE_RING, TOMBSTONE_CAP, TOMBSTONE_PRUNE_HYSTERESIS } from "../limits";
 import { pathKey } from "../paths/pathKey";
 import { isValidPath } from "../paths/validate";
+import { replayAccept, replayCheck } from "../replayWindow";
 import { indexAddLive, indexRemoveLive } from "./index";
 import { applyRecases, place, type PlaceMode } from "./place";
 
@@ -267,6 +273,16 @@ export function foldNsFrameWith(rules: NsFoldRules, state: NsFoldState, index: N
 	if (ring && ring.includes(frame.clientFrameId)) {
 		state.coversSeq = frame.seq;
 		return [ev(-1, null, ign("duplicate-frame"))];
+	}
+	// e2ee-design §8.2 replay window.
+	if (frame.frameNo >= 1) {
+		const w = state.replay.get(frame.deviceId);
+		const verdict = replayCheck(w, frame.frameNo);
+		if (verdict !== "accept") {
+			state.coversSeq = frame.seq;
+			return [ev(-1, null, ign(verdict))];
+		}
+		state.replay.set(frame.deviceId, replayAccept(w, frame.frameNo));
 	}
 	const nextRing: ClientFrameId[] = ring ? [...ring, frame.clientFrameId] : [frame.clientFrameId];
 	state.recentFrames.set(frame.deviceId, nextRing.length > rules.dedupeRing ? nextRing.slice(-rules.dedupeRing) : nextRing);

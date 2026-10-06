@@ -57,12 +57,22 @@ export interface MetaDaily {
 	readonly framesSent: number;
 	readonly bytesSent: number;
 }
+/**
+ * Highest own ns / cfg frameNo of the abandoned timeline, carried by epoch
+ * migration (DESIGN §c.12 step 3, e2ee-design §8.2) so new frames never reuse
+ * its numbers. Absent = 0.
+ */
+export interface MetaFrameNoFloor {
+	readonly key: "frameNoFloor";
+	readonly ns: number;
+	readonly cfg: number;
+}
 export interface MetaRelayCheckpointDuty {
 	readonly key: "ckptDuty";
 	/** Streams this device authored the latest row of (candidate writer duty). */
 	readonly streams: readonly StreamName[];
 }
-export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty;
+export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------
@@ -128,6 +138,8 @@ export interface TailRecord {
 	readonly kind: EnvelopeKind;
 	readonly authorNsSeq: Seq;
 	readonly flags: number;
+	/** Inner frameNo (e2ee-design §8.2): ≥ 1 for ns / cfg frames, else 0 (also for gate-failed rows). */
+	readonly frameNo: number;
 	/** Opened inner content (post-crypto, pre-kind-decode). */
 	readonly content: Uint8Array;
 }
@@ -165,6 +177,8 @@ export interface OutboxRecord {
 	readonly content: Uint8Array;
 	readonly authorNsSeq: Seq;
 	readonly flags: number;
+	/** ns / cfg only: the frameNo sealed inside `sealed` (e2ee-design §8.2). null for other kinds. */
+	readonly frameNo: number | null;
 	/**
 	 * held only: the frame this waits for (DESIGN §e.1): the doc's ns create
 	 * (released when it folds), the newest adoptable of the same stream
@@ -188,6 +202,10 @@ export type QuarantineReason =
 	| "envelope-version"
 	| "crypto-unknown-key"
 	| "crypto-auth"
+	/** Suite-0 bytes on a suite-1 vault (e2ee-design §9.2). */
+	| "crypto-downgrade"
+	/** Valid tag over bad Padmé padding (e2ee-design §7.3). */
+	| "envelope-padding"
 	| "kind-not-allowed"
 	| "decode-failed"
 	| "yjs-structure"

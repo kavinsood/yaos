@@ -68,12 +68,16 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	}
 
 	protected foldFrame(row: TailRecord, ops: readonly NsOp[]): { events: readonly NsFoldEvent[]; halted: boolean } {
-		const events = foldNsFrame(this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, ops });
+		const events = foldNsFrame(this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, frameNo: row.frameNo ?? 0, ops });
 		return { events, halted: nsFoldHalted(events) };
 	}
 
 	encodeState(): Uint8Array {
 		return encodeNsFoldV1(this.state);
+	}
+
+	protected ownReplayEdge(): number {
+		return this.state.replay.get(this.self)?.r ?? 0;
 	}
 
 	entry(docId: DocId): NsEntry | undefined {

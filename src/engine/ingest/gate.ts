@@ -7,7 +7,7 @@
  * passes through gate().
  */
 
-import { CheckpointEncoding, type BodyUpdateRefContent, type CheckpointContent, type InnerEnvelope } from "../../core/envelope";
+import { CheckpointEncoding, type BodyUpdateRefContent, type CheckpointContent, type EnvelopeOpenFailure, type InnerEnvelope } from "../../core/envelope";
 import { FOLD_RULES_VERSION, MAX_DOC_TEXT_CHARS, MAX_FRAME_CONTENT_BYTES } from "../../core/limits";
 import type { CfgFoldState, CfgOp, ClientFrameId, DeviceId, NsFoldState, NsOp, Seq, StreamName, VaultId } from "../../core/types";
 import { streamClass } from "../../core/types";
@@ -61,21 +61,29 @@ export type GateResult = GatePass | GateFail;
 
 const fail = (reason: QuarantineReason, detail: string, readerDependent = false): GateFail => ({ ok: false, reason, detail, readerDependent });
 
+const QUARANTINE_REASON: Readonly<Record<EnvelopeOpenFailure, QuarantineReason>> = {
+	"malformed": "envelope-malformed",
+	"unsupported-version": "envelope-version",
+	"unsupported-suite": "crypto-unknown-key",
+	"unknown-key": "crypto-unknown-key",
+	"auth-failed": "crypto-auth",
+	"suite-downgrade": "crypto-downgrade",
+	"bad-padding": "envelope-padding",
+	"kind-stream-mismatch": "kind-not-allowed",
+};
+
 export async function gate(ctx: GateCtx, subject: GateSubject): Promise<GateResult> {
 	const cls = streamClass(subject.stream);
-	if (cls === "other") return { ok: true, t: "ignored" };
+	// keyring: k records carry no envelope (e2ee-design §11); WP-E3 reads them.
+	if (cls === "other" || cls === "keyring") return { ok: true, t: "ignored" };
 	const binding = subject.t === "checkpoint"
 		? { t: "checkpoint" as const, stream: subject.stream, coversSeq: subject.coversSeq }
-		: { t: "frame" as const, stream: subject.stream, clientFrameId: subject.clientFrameId };
+		: { t: "frame" as const, stream: subject.stream, deviceId: subject.deviceId, clientFrameId: subject.clientFrameId };
 	const opened = await openEnvelope(ctx.crypto, ctx.vaultId, binding, subject.payload);
 	if (!opened.ok) {
-		const rd = isReaderDependent(opened.reason);
-		const reason: QuarantineReason =
-			opened.reason === "malformed" ? "envelope-malformed"
-				: opened.reason === "unsupported-version" ? "envelope-version"
-					: opened.reason === "unknown-key" || opened.reason === "unsupported-suite" ? "crypto-unknown-key"
-						: opened.reason === "auth-failed" ? "crypto-auth" : "kind-not-allowed";
-		return fail(reason, opened.reason, rd);
+		// auth-failed is reader-dependent only while the epoch's key is unverified (e2ee-design §9.2).
+		const keyVerified = opened.header ? ctx.crypto.keyState(opened.header.keyEpoch).verified : false;
+		return fail(QUARANTINE_REASON[opened.reason], opened.reason, isReaderDependent(opened.reason, keyVerified));
 	}
 	const inner = opened.inner;
 	if (subject.t === "checkpoint") return gateCheckpoint(ctx, cls, subject.coversSeq, inner);

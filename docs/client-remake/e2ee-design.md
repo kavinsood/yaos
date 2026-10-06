@@ -1,6 +1,7 @@
 # YAOS client remake: crypto suite 1 (single-user E2EE)
 
-Status: proposed, normative once accepted. Owner: architect. Extends [DESIGN.md](DESIGN.md); where this document
+Status: **accepted and normative** (the user approved it and resolved every §22 decision on 2026-10-07). Owner:
+architect. Extends [DESIGN.md](DESIGN.md); where this document
 changes a shape named there, §18 gives the DESIGN diff. Server baseline: the rewritten relay merged into
 `client-remake` at 7208184 (PR #82; `docs/server-rewrite/DECISIONS.md`). It is an opaque byte sequencer: streams,
 checkpoint CAS, R2 blobs at `v/<vaultId>/<address>`, operator-only revoke/reset/restore, and no server-side
@@ -14,14 +15,16 @@ of scope (DECISIONS §1 removes them server-side too). §2.4 lists what this des
   - **[M]** measured by the spike in this worktree (`src/host/spike/cryptoProbe.ts`, §23);
   - **[S]** read in a cited source (spec, RFC, paper or source file at a pinned commit);
   - **[D]** derived here by calculation from cited inputs (the calculation is shown);
-  - **[U]** unverified: needs a device or is not stated anywhere I could find.
+  - **[U]** unverified: needs a device or is not stated anywhere I could find;
+  - **[User]** confirmed by the user on 2026-10-07 (their devices or Obsidian's documentation). Not measured by the
+    spike and not read in a source here, so it is kept apart from [M] and [S] (§23.3).
 - Terms:
   - **K_e**: the 32-byte vault key of key epoch `e` (`e ≥ 1`). "Vault key" in `server/src/vault/ticket.ts` (DECISIONS D4) is the relay's
     ticket-signing key and is unrelated (server ask A8).
   - **keyEpoch** (this document) vs **vaultEpoch** (the relay generation, DESIGN §c.12). They are independent.
   - **RK**: the recovery key (§13). **k**: the keyring stream (§11).
   - **S_rot**: the seq at which a revoke-kind keyring record committed (§14).
-  - **decision Dn** is a decision for the user (§22). **DECISIONS Dn** is a server decision in
+  - **decision Dn** is a user decision, resolved in §22. **DECISIONS Dn** is a server decision in
     `docs/server-rewrite/DECISIONS.md`. **An** is a server ask (§19).
 
 Contents: [1](#1-summary) summary · [2](#2-threat-model) threat model · [3](#3-platform-facts) platform facts ·
@@ -31,7 +34,7 @@ envelope · [8](#8-replay-and-reorder) replay · [9](#9-what-is-sealed-and-open-
 recovery · [14](#14-rotation-and-revocation) rotation · [15](#15-enable-migrate-disable) enable/migrate ·
 [16](#16-performance-budget) performance · [17](#17-lost-server-features-and-client-replacements) lost features ·
 [18](#18-shape-changes-and-design-diffs) shape changes · [19](#19-asks-for-the-server-rewrite) server asks ·
-[20](#20-test-plan) tests · [21](#21-work-packages) work packages · [22](#22-decisions-for-the-user) decisions ·
+[20](#20-test-plan) tests · [21](#21-work-packages) work packages · [22](#22-decisions-resolved) decisions ·
 [23](#23-spike-verified-vs-needs-a-device) spike · [24](#24-references) references.
 
 ---
@@ -50,7 +53,8 @@ recovery · [14](#14-rotation-and-revocation) rotation · [15](#15-enable-migrat
 8. A **keyring stream `k`** carries wrapped epoch keys: a backward chain for new devices and a forward chain for
    automatic rolls.
 9. **Pairing** is by QR or link. The key travels in a client-only URL parameter. The server-visible pairing code
-   carries no key. The **recovery key** (56 Crockford base32 characters) handles the all-devices-lost case.
+   carries no key. The **recovery key** (56 Crockford base32 characters) handles the all-devices-lost case. A device
+   with no suite pin writes nothing; the pin never comes from the server (§12.4).
 10. **Revocation** starts a new epoch that devices cannot follow from old keys. Kept devices re-key by QR or RK. A
     revoked device keeps everything it already decrypted.
 
@@ -72,7 +76,8 @@ recovery · [14](#14-rotation-and-revocation) rotation · [15](#15-enable-migrat
     once held is also possible, because PITR restore is a legitimate operator feature (DECISIONS D8b, [CF-PITR]);
   - local at-rest encryption: IndexedDB `tail`/`snapshots` and the vault files on disk hold plaintext;
   - hiding that YAOS is used, or when.
-- **The user is the trust anchor** for the vault's suite: §12.4 covers downgrade by a lying server.
+- **The user is the trust anchor** for the vault's suite. A device writes nothing until its suite pin comes from an
+  authenticated source, so a lying server cannot downgrade it (§12.4).
 
 ### 2.2 Metadata: mitigated vs accepted
 
@@ -140,12 +145,13 @@ What the design relies on, and how sure we are. Spike numbers are on an Apple M4
 | WKWebView accepts a **zero-length** GCM IV; Chrome throws | **[M]** macOS WKWebView (`capacitor://localhost`), Chrome 154 | Enforce 12 bytes ourselves (§4.1) |
 | Throughput, AES-256-GCM 1 MiB seal | **[M]** Chrome ~3000 MiB/s (0.334 ms, n=899); WKWebView (macOS) 2174 MiB/s seal / 5556 MiB/s open; Node 0.19 ms | Per call at 64 B: 5.5 µs (Chrome), 12 µs (WKWebView) sequential; ~2.4 µs batched |
 | Pure-JS XChaCha20-Poly1305 (@noble/ciphers) 1 MiB | **[M]** ~284–297 MiB/s Chrome, ~241 MiB/s WKWebView; README 340 MiB/s [noble] | 8–13× slower than WebCrypto GCM |
-| `app.secretStorage` exists (`setSecret`/`getSecret`/`listSecrets`, synchronous; ids lowercase alphanumeric plus dashes; no delete) | **[S]** `obsidian.d.ts:458`, `:5635` (npm `obsidian` 1.13.1); `@since 1.11.4`; plugin `minAppVersion` 1.13.0 | |
+| `app.secretStorage` exists (`setSecret`/`getSecret`/`listSecrets`, synchronous; ids lowercase alphanumeric plus dashes; no delete) | **[S]** `obsidian.d.ts:458`, `:5635` (npm `obsidian` 1.13.1); `@since 1.11.4`; plugin `minAppVersion` 1.13.0 (`manifest.json:5`). **[User]** confirmed: present since 1.11.4 | |
 | Desktop SecretStorage uses Electron `safeStorage`. Without OS encryption it stores **plaintext** and warns (`msgSecretsNotEncrypted`) | **[S]** `obsidian-1.14.4.asar`, bytes ~3571300–3572700 (read-only); same in 1.13.7 | Linux without a keyring: plaintext |
-| Mobile SecretStorage uses the Capacitor plugin `SecureStorage` under the bare key `"secrets-encrypted"`, so it is shared across vaults | **[S]** same asar (mobile adapter); that it is backed by Keychain/Keystore **[U]** (inferred from the name) | Namespace ids per vault (§6.1) |
-| `crypto.subtle` requires a secure context; custom schemes count as secure in WebKit; a worker inherits it | **[S]** [WebCrypto] §10; WebKit `SecurityOrigin.cpp` L101-102, `WorkerGlobalScope.cpp` L204-210 | Obsidian iOS origin `capacitor://localhost` **[U]** |
+| Mobile SecretStorage uses the Capacitor plugin `SecureStorage` under the bare key `"secrets-encrypted"`, so it is shared across vaults | **[S]** same asar (mobile adapter). Backed by the iOS Keychain: **[User]**. Android Keystore **[U]** | Namespace ids per vault (§6.1) |
+| `crypto.subtle` requires a secure context; custom schemes count as secure in WebKit; a worker inherits it | **[S]** [WebCrypto] §10; WebKit `SecurityOrigin.cpp` L101-102, `WorkerGlobalScope.cpp` L204-210 | Obsidian iOS: WKWebView treats `capacitor://localhost` as a secure context, so `crypto.subtle` works **[User]** |
 | No streaming AEAD in WebCrypto | **[S]** [w3c-webcrypto-73] | Blobs ≤ 10 MiB are sealed in one call (§10.3) |
-| Obsidian mobile WebViews and desktop Electron behave like the above | **[U]** | §23.3 lists the device runs |
+| The stock iOS Camera (iOS 11+) recognises a QR holding an `obsidian://` link and offers to open Obsidian | **[User]** | Android camera apps **[U]** |
+| Obsidian mobile WebViews and desktop Electron behave like the above (throughput, zero IV, Android) | **[U]**, except the [User] rows above | §23.3 lists the device runs |
 
 ## 4. Cipher
 
@@ -208,7 +214,7 @@ K_e        32 random bytes per key epoch, e ≥ 1           (stored: SecretStora
      kBlob    AES-GCM-256   blob bytes                     purpose "blob"
      kWrap    AES-GCM-256   prevWrap / nextWrap in k       purpose "wrap"
      kKcv     HMAC-SHA-256  key check value                purpose "kcv"
- from K_1 only (vault lifetime, never rotated):
+ from K_1 only (vault lifetime, never rotated), info I(purpose, 1):
      kAddr    HMAC-SHA-256  blob addresses, x: names       purpose "addr"
      kDiag    HMAC-SHA-256  diagnostics hashes             purpose "diag"
 RK         35-byte recovery key (§13)
@@ -219,8 +225,10 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 
 - HKDF is from [RFC5869]. The base key is imported with `extractable:false` ([WebCrypto] §33.4.2), and derived keys
   take `extractable:false` explicitly ([WebCrypto] §14.3.7).
-- Subkeys are derived **lazily** per epoch on first use. Startup derives the newest epoch's set plus kAddr and
-  kDiag: 7 `deriveKey` calls.
+- Every subkey is 32 bytes: AES-GCM with `length: 256`, HMAC with `hash: "SHA-256", length: 256` (WebCrypto's HMAC
+  default would be the 64-byte block size). The golden vectors (§20.1) pin this.
+- Subkeys are derived **lazily** per epoch on first use and memoised (`src/engine/adapters/webCryptoSuite1.ts`). A
+  normal session touches the newest epoch's set plus kAddr and kDiag: at most 7 `deriveKey` calls.
 - **Why kAddr and kDiag live for the whole vault.**
   - ns, refs and snapshots carry only the plaintext sha256, and the address must be recomputable from it in any
     epoch. Rotating kAddr would change every address, so blobs would need re-uploading (decision D4).
@@ -249,15 +257,18 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
     hashed because the mobile store is shared across vaults (§3).
   - Value: JSON `{ "v": 1, "vaultId", "suite": 1, "keys": [{ "e", "k": b64url(K_e) }], "records": [b64url(k record)] }`.
   - The records are kept so they can be re-published after a reset or restore (§11.5). They are not secret.
-  - Value size limits **[U]**.
+  - Value size limits **[U]** (WP-E0, §23.3).
 - **NEVER persist a key in IndexedDB.** Chromium writes stored CryptoKeys' raw bytes in plaintext **[M]**. WebKit
   adds keychain IPC, lock-state failures and an index bug (§3).
 - **NEVER persist a key in `data.json`** (`<configDir>/plugins/yaos/data.json`). Folder sync and backup tools copy
   the config dir.
 - **NEVER put keys or RK in** logs, `StatusSnapshot`, `DiagnosticsBundle`, `Error` messages, notices or the URL bar.
   Protocol fields that carry keys are marked SECRET, like `relay.credential` (`src/protocol/messages.ts:56`).
-- **The suite pin** (`e2ee: { suite: 1 }`, not secret) lives in `data.json` next to the device token. If the pin
-  says 1 and the secret is missing, the device enters phase `key-missing`: re-key by QR or RK.
+- **The suite pin** (`e2ee: { suite: 0 | 1 }`, not secret) lives in `data.json` next to the device token.
+  - If the pin says 1 and the secret is missing, the device enters phase `key-missing`: re-key by QR or RK.
+  - **No pin** (just enrolled by a key-less code, or `data.json` lost) means the device writes nothing until a pin
+    arrives from an authenticated source (§12.4). Nothing the server says sets or lowers a pin.
+  - A pin is never lowered: 1 → 0 does not exist (§15.2).
 - **Startup.** `getSecret` may return null before the store has loaded. Wait for SecretStorage's `changed` event
   for up to 5 s before deciding the key is missing. The store loads everything at app start, then fires `changed`
   ([S] asar).
@@ -275,7 +286,7 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 |---|---|---|
 | IndexedDB (cleared, evicted, corrupted) | Survive in SecretStorage | Normal re-bootstrap from the relay. frameNo restarts above the folded right edge (§8.2). The outbox mirror re-opens with the keys. |
 | SecretStorage (app reinstall, localStorage cleared) | Lost on this device | `key-missing`, read-only. Re-key by QR from another device or by RK. |
-| `data.json` | Survive, but are orphaned | Re-enroll: new device token and new deviceId. Re-key by QR or RK. |
+| `data.json` | Survive, but are orphaned | The pin is lost too. Re-enroll (new device token and deviceId): a key-less join, so the device is blocked until a QR or the RK (or, for a suite-0 vault, a suite-0 pairing link) settles it (§12.4). |
 | Every device | Gone | RK path (§13.3). Without the RK the data is unrecoverable, by design. |
 
 ### 6.3 Worker hand-off
@@ -284,6 +295,12 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
    transfer list. Main keeps no copy and re-reads SecretStorage when it needs one (QR display, §12).
 2. The worker imports each K_e as an HKDF base key with `extractable:false`, derives subkeys, and zero-fills the
    buffers. This is best-effort: JS cannot guarantee erasure.
+   - **Raw-key retention.** `k` records wrap raw keys (§11.1), and WebCrypto refuses `wrapKey` on a
+     non-extractable key (`InvalidAccessError`, [WebCrypto] §14.3.11; **[M]** in
+     `webCryptoSuite1.keys.test.ts`). So the worker keeps the raw bytes of K_e, in worker memory only, exactly
+     while a wrap or the host hand-off may still need them: a key not yet exported to main, a pending (generated,
+     not yet adopted) key, and every epoch ≥ the seal epoch (the next roll's or revoke's `prevWrap`). Older raw
+     bytes are zero-filled when the seal epoch moves past them. Keys from `init.crypto` count as exported.
 3. New keys (adopted by roll, entered by QR or RK) are produced in the worker and posted back once in
    `keyringChanged` (SECRET). Main persists them to SecretStorage.
 4. Inline mode runs the same code on main.
@@ -296,7 +313,7 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 | Synced mirror | Plaintext docId, path, contentHash, seqs | Accepted: the vault folder holds the same plaintext |
 | Local snapshots (zip) | Plaintext | Accepted (local). Uploads go through `sealBlob` (`src/engine/snapshots/snapshotJob.ts:129-130`) |
 | IndexedDB `tail`, `snapshots`, `baseText`, ... | Plaintext (T_receipt stores outbox content, DESIGN §e.2) | Accepted (non-goal: local at-rest encryption) |
-| Diagnostics bundle | Hashes MUST be `HMAC(kDiag, ·)`, not sha256 (`src/engine/compose/runtimeOps.ts:150-153`; DESIGN §j.7) | Change in WP-E2 |
+| Diagnostics bundle | Hashes MUST be `HMAC(kDiag, ·)`, not sha256 (DESIGN §j.7). Pseudonym = the first 12 hex of `CryptoPort.diagHash(salt ‖ 0x00 ‖ value)`; the per-bundle random salt stays, so two bundles do not correlate unless the user shares both (`src/engine/compose/diagnosticsBundle.ts`) | Done in WP-E2 |
 
 ## 7. Envelope v2, AAD and padding
 
@@ -315,7 +332,7 @@ inner
   varuint flags           initial | adopted | deflate | fromDisk
   varuint frameNo         NEW. ns/cfg frames: per-(deviceId, stream) counter ≥ 1 (§8.2); 0 for every other kind
   bytes   content         rest; deflate-raw iff flags & deflate (unchanged)
-pad (suite 1 only, inside the AEAD; added and stripped by the CryptoPort)
+pad (suite 1 only, inside the AEAD; added and stripped by the envelope codec, §18.2)
   0x80 ‖ 0x00*            to padmeLen(len(inner) + 1)                                   (ISO/IEC 7816-4 style)
 ```
 
@@ -343,7 +360,7 @@ k wraps:     §11.2
 | stream | A frame or checkpoint moved to another stream fails. |
 | deviceId | **New.** The relay asserts the row's deviceId (relay-wire §4.1). Without this binding, the server could re-attribute a frame, shifting dedupe and replay state (§8) and the planner's own-frame matching (DESIGN §c.13). deviceId is client-chosen at enroll (relay-wire §2.4), so it is known at seal time. T_adopt seals under the adopter's own deviceId (DESIGN §d.5, unchanged). |
 | clientFrameId | Frame identity. Unique per device across the vault (relay-wire §1). |
-| coversSeq (checkpoints) | As today. The inner `CheckpointContent.coversSeq` check stays (DESIGN §b.1). |
+| coversSeq (checkpoints) | As today. The inner `CheckpointContent.coversSeq` check stays (DESIGN §b.1); it runs in the ingest gate (`src/engine/ingest/gate.ts`), after the envelope codec opened the bytes. |
 | address (blobs) | The server cannot serve one blob's bytes at another address. The reader also checks sha256 after opening (`src/engine/body/refs.ts:50-59`). |
 
 - **seq is NOT bound.** The relay assigns it after the append (relay-wire §5). Order is protected per device by
@@ -364,7 +381,9 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
 
 - Padmé [Padmé] leaks O(log log M) bits of a length M, with at most 12 % overhead. Frames, checkpoints and blobs all
   use it. The 256-byte floor hides keystroke-sized frames (decision D3).
-- The padding lives **inside** the AEAD and is added and stripped by the suite-1 CryptoPort. Suite 0 does not pad.
+- The padding lives **inside** the AEAD. The envelope codec adds and strips it for frames and checkpoints (§18.2), so
+  `CryptoPort.seal/open` stay pure AEAD; the suite-1 `sealBlob/openBlob` add and strip it for blobs
+  (`src/core/codec/padme.ts`). Suite 0 does not pad.
 - A valid tag with bad padding means a key holder sealed garbage. That is **deterministic** malformation (§9.2).
 - **Limits change** (`src/core/limits.ts`).
   - The relay closes 1009 above `maxBinaryMessageBytes` = 1049600 (relay-wire §3.2). Treat it as 1 MiB of payload.
@@ -393,39 +412,67 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
 
 ### 8.1 What each stream class needs
 
-| Server action | ns / cfg | body / canvas | x: chunks | checkpoints | k |
-|---|---|---|---|---|---|
-| Re-commit an old frame's exact bytes as a new row | **Rejected**: clientFrameId ring (DESIGN §c.3) plus the frameNo window (§8.2) | Harmless: a Yjs update whose structs are known is a no-op | Duplicate index, ignored (DESIGN §j.1) | n/a | Later duplicates lose (first valid wins, §11.3) |
-| Re-attribute to another device or stream | Rejected by the AAD (§7.2) | same | same | same (stream) | same |
-| Reorder concurrent frames | Accepted. The relay owns the order; frameNo accepts any legitimate reorder (§8.2) | CRDT | by index | n/a | first in seq wins |
-| Serve an older checkpoint, withhold rows | Accepted (§2.3) | Accepted | Accepted | Accepted | Withholding k blocks new epochs (DoS only) |
-| Fork: different views per device | Accepted (§2.1 non-goal) | | | | |
+| Server action | ns / cfg | body / canvas | x: chunks | checkpoints | k | snap |
+|---|---|---|---|---|---|---|
+| Re-commit an old frame's exact bytes as a new row | **Rejected**: clientFrameId ring (DESIGN §c.3) plus the frameNo window (§8.2) | Harmless: a Yjs update whose structs are known is a no-op | Duplicate index, ignored (DESIGN §j.1) | n/a | Later duplicates lose (first valid wins, §11.3) | Harmless: a record is immutable per snapshot id and a tombstone is final, so a duplicate is a no-op and a replayed add cannot undo a delete |
+| Re-attribute to another device or stream | Rejected by the AAD (§7.2) | same | same | same (stream) | same | same |
+| Reorder concurrent frames | Accepted. The relay owns the order; frameNo accepts any legitimate reorder (§8.2) | CRDT | by index | n/a | first in seq wins | Commutative under the same two rules |
+| Serve an older checkpoint, withhold rows | Accepted (§2.3) | Accepted | Accepted | Accepted | Withholding k blocks new epochs (DoS only) | Accepted: a hidden snapshot is unavailable (DoS only) |
+| Fork: different views per device | Accepted (§2.1 non-goal) | | | | | |
+
+- **`snap`** is the snapshot index stream that the recovery work adds (branch `client-remake-recovery`; not built
+  here). It holds one small record per uploaded snapshot (id, part addresses, sizes, sha256s); a delete is a
+  tombstone. Its replay class is **index/LWW-like**: per snapshot id, the first valid add wins and a tombstone is
+  final. That is why it needs no frameNo: the two rules make a replay or a reorder converge to the same index.
+  Snapshot ids are random and never reused.
 
 ### 8.2 frameNo
 
 - **Writer.**
   - frameNo is a counter per (deviceId, stream), for `ns` and `cfg` only. It is strictly increasing across that
     device's frames on the stream, and gaps are allowed.
-  - Normally `next = 1 + max(own right edge in the fold state, highest frameNo in the outbox for the stream)`.
-  - On **every engine start**, the first value is that max **+ NS_DEDUPE_RING** (64). This skips any number that
-    a frame may have used while it was in flight when IndexedDB was lost.
-  - No new persistent counter: the fold state (in IDB and in checkpoints) and the outbox already hold it.
-  - Epoch migration (DESIGN §c.12 step 3) also carries the device's highest own frameNo per stream into the new DB,
-    so new frames never reuse numbers from the abandoned timeline.
+  - `next = 1 + max(own right edge R in the fold state, own frameNos above the fold (own tail rows and receipts
+    not yet folded), the outbox for the stream (poisoned included), the epoch-migration floor, earlier
+    allocations of this runtime)` (`FoldRuntime.allocFrameNo`, `src/engine/sync/foldRuntime.ts`). The receipt
+    writes the own tail row with its frameNo, so the max survives a restart before the row is folded.
+  - The **first allocation of every runtime** (engine start) adds **NS_DEDUPE_RING** (64). This skips any number
+    that a frame may have used while it was in flight when IndexedDB was lost.
+  - Allocation and the outbox write share the engine's edit chain (`src/engine/runtime/logApi.ts`), so frameNo
+    order is outbox order.
+  - No new persistent counter: the fold state (in IDB and in checkpoints), own tail rows and the outbox already
+    hold it.
+  - Epoch migration (DESIGN §c.12 step 3) carries the device's highest own frameNo per stream into the new DB as
+    meta `frameNoFloor` (max-merged, never lowered), so new frames never reuse numbers from the abandoned timeline.
 - **Send window, restated over frameNo** (DESIGN §c.3). Own frame `f` may be sent only when every own frame with
-  frameNo ≤ `f − NS_SEND_WINDOW` (32) is receipted.
+  frameNo ≤ `f − NS_SEND_WINDOW` (32) is receipted. Equivalently (`Sender.window`, `src/engine/body/sender.ts`):
+  `f < u + NS_SEND_WINDOW`, where `u` is the lowest frameNo among the stream's unreceipted own frames. Poisoned
+  frames never send, so they do not hold `u` down; only body frames are ever `held`.
 - **Reader.** State per (deviceId, stream): a right edge R and a 64-bit bitmap, as in RFC 4303 §3.4.3 [RFC4303]
-  (window ≥ 32, 64 preferred). After a frame with frameNo `f` opens and decodes:
-  1. `f = 0`: malformed. Fold as empty.
-  2. `f ≤ R − 64`: event `ignored/replay-stale`. Fold as empty.
-  3. `R − 64 < f ≤ R` with the bit set: `ignored/replay-duplicate`.
-  4. Otherwise accept and set the bit. If `f > R`, shift the bitmap and set `R = f`.
-  
+  (window ≥ 32, 64 preferred; `src/core/replayWindow.ts`).
+  - `f = 0` on an ns/cfg frame never reaches the fold: the inner decoder rejects it as `malformed` (and the
+    encoder throws). A row that failed the gate is folded with frameNo 0 and skips the window.
+  - Order per frame, after open and decode: (ns only) the upgradeRules pre-scan, then the clientFrameId ring
+    (`ignored/duplicate-frame`), then the window:
+    1. `f ≤ R − 64`: `ignored/replay-stale`.
+    2. `R − 64 < f ≤ R` with the bit set: `ignored/replay-duplicate`.
+    3. Otherwise accept: record the clientFrameId in the ring, set the bit (if `f > R`, shift and set `R = f`),
+       then fold the ops.
+  - A rejected frame emits one frame-level event (index −1), folds as empty and advances coversSeq; neither the
+    ring nor the window changes. Malformed ops behind a valid frameNo still enter the ring and the window.
+
   The state changes only after open and decode succeed. RFC 4303 updates the window "only if the integrity
   verification succeeds".
-- **Why no legitimate frame is ever rejected** [D]. When frame `f` was sent, every own frame ≤ `f − 32` had
-  already committed. So any frame that commits after `f` has a frameNo > `f − 32` ≥ `R − 64`. The rule is exact
-  for honest writers. The same argument already makes the clientFrameId ring exact (DESIGN §c.3).
+- **Why no legitimate frame is ever rejected** [D]. Let `f` be an honest frame that has not committed yet. Then
+  `u ≤ f`, so every own frame ever sent is `< f + 32`, so `R < f + 32` and `f > R − 64`: never stale. frameNos are
+  distinct, so `f`'s bit is clear: never a duplicate. Every later commit of an already committed frame is rejected
+  (ring or bit). This holds whatever order the relay commits in, with no relay dedupe, across reconnects with
+  copies lingering on old sockets, and across restarts with IndexedDB intact. It is a property test
+  (`src/core/ns/replayExactness.test.ts`, 150 seeds × 1500 steps), which also shows that without the send window
+  some honest frame goes stale.
+- **Boundary (open).** If IndexedDB is lost while an old socket still holds frames that the relay commits *after*
+  the new runtime's first frames, those old frames can land at or below `R − 64` and are rejected as stale. The
+  +64 skip prevents collisions, not this. Their content came from a local state that no longer exists; disk stays
+  the truth (DESIGN §c.12).
 - The clientFrameId ring stays. frameNo covers replays older than the ring's 64 ids.
 - The `nsFoldV1` and `cfgFoldV1` checkpoint encodings gain `(deviceId → R, bitmap)` and become V2 (§18.2). Suite 0
   uses the same code: one path, so the sim covers it.
@@ -449,20 +496,21 @@ pre-restore frames from the abandoned timeline into the new epoch. This is accep
 ### 9.1 Sealed vs visible
 
 - **Sealed under suite 1:**
-  - every relay payload (`ns`, `cfg`, `b:`, `c:`, `x:`);
+  - every relay payload (`ns`, `cfg`, `b:`, `c:`, `x:`, `snap`);
   - every checkpoint;
-  - every blob: attachments, oversize body updates behind `bodyUpdateRef`, and uploaded snapshot zips
-    (`src/engine/snapshots/snapshotJob.ts:129-130`);
+  - every blob: attachments, oversize body updates behind `bodyUpdateRef`, and uploaded snapshot bundles (today one
+    zip, `src/engine/snapshots/snapshotJob.ts:129-130`; multi-part bundles indexed by `snap` on the recovery branch);
   - the key material inside `k` records (§11).
 - **Visible to the server:**
-  - stream names: `b:`/`c:` + a random docId, `x:` + a keyed address, plus `ns`, `cfg`, `k`;
+  - stream names: `b:`/`c:` + a random docId, `x:` + a keyed address, plus `ns`, `cfg`, `k`, `snap`;
+  - the number and timing of `snap` rows, i.e. how often snapshots are uploaded (part sizes are padded blobs);
   - deviceId and clientFrameId (both random);
   - the outer envelope header (format, suite, keyEpoch);
   - `k` record headers;
   - deviceName;
   - HTTP metadata.
 - **Suite pin.** The CryptoPort instance *is* the device's pin (§6.1, §12): a suite-1 port knows the vault is
-  encrypted.
+  encrypted. A device with no pin has no CryptoPort: it reads `k` and nothing else, and seals nothing (§12.4).
 
 ### 9.2 Classification
 
@@ -481,6 +529,7 @@ pre-restore frames from the abandoned timeline into the new epoch. This is accep
 | keyEpoch older than the newest revoke epoch, and the row committed after S_rot | `stale-epoch` (engine rule, §14.3) | Deterministic |
 
 `isReaderDependent(reason, keyVerified)` replaces `isReaderDependent(reason)` (`src/engine/ingest/envelope.ts`).
+A device with no suite pin never reaches this table: it opens nothing (§12.4).
 
 ### 9.3 Actions (extends the DESIGN §d.6 table)
 
@@ -495,12 +544,15 @@ pre-restore frames from the abandoned timeline into the new epoch. This is accep
   `releaseQuarantine` and the automatic re-gate can re-open them after a re-key (`src/engine/runtime/quarantineRelease.ts`).
 - **Catch-up order** is `k` → `ns` → `cfg` → bodies (DESIGN §d.7 gains `k` in front). Keys are verified before
   anything else is opened, so `auth-failed` under an unverified key is rare in practice.
-- **New phase `key-missing`** (`EnginePhase`, §18.4). It has two causes:
+- **New phase `key-missing`** (`EnginePhase`, §18.4). It has three causes:
+  - the device has **no suite pin** (§12.4): `keyMissing` is `"no-pin"`, or `"encrypted-vault"` once it has read a
+    `k` genesis;
   - the ns/cfg fold halted on a key it does not have;
   - `k` shows an epoch above every key this device holds (a revoke it was left out of).
 
-  The device is read-only: it seals nothing, and its outbox is held. The status names the remedy: "Scan a re-key
-  code from another device, or enter the recovery key".
+  The device is read-only: it seals nothing, uploads no blob, and its outbox is held. An unpinned device does not
+  even run the reconcile, so it has no outbox. The status names the remedy: "Scan a re-key code from another
+  device, or enter the recovery key".
 
 ## 10. Blobs
 
@@ -529,6 +581,11 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
 ```
 
 - Suite 0 is unchanged: address = sha256, and the bytes are raw.
+- `openBlob` failures (`src/core/codec/sealedBlob.ts`): an unknown blobFormat or a suite byte other than 1 is
+  `unsupported-suite`; truncation, a non-minimal varuint, keyEpoch 0, a body shorter than 28 bytes, or a valid tag
+  over bad padding is `malformed`; then `unknown-key` and `auth-failed` as for frames. All of them are
+  "unavailable" to the download path below.
+- The suite-1 `sealBlob` seals under `sealEpoch()`, and throws above `MAX_BLOB_PLAINTEXT_BYTES_SUITE1` (§7.3).
 - A blob stays under its upload epoch forever. Rolls and revokes never re-seal blobs. A revoked device can read old
   blobs it can fetch, which follows from §14.4.
 - **PUT overwrites** (DECISIONS D9). Two devices uploading the same file put two different ciphertexts at one
@@ -554,7 +611,9 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
   vault is deleted (R2 prefix purge, DECISIONS D5). E2EE changes nothing here until server ask A3.
 - **With A3: client mark-and-sweep.** Cold path: a user command or at most monthly, on one device.
   1. Live set: the addresses of every sha256 referenced by ns entries (live, plus tombstones inside retention),
-     unresolved `bodyUpdateRef`s, kept uploaded snapshots, and the local blob queue.
+     unresolved `bodyUpdateRef`s, every part address named by a non-tombstoned `snap` record (§8.1), and the
+     local blob queue. The sweep reads `ns` and `snap` to head first. A server that withholds `snap` rows can make
+     the sweep delete snapshot parts, but it can delete them itself anyway (availability is a non-goal, §2.1).
   2. Page through `GET /vault/:id/blobs` (A3), which returns addresses and upload times.
   3. For each address that is not live and was uploaded more than 7 days ago, call
      `DELETE /vault/:id/blobs/:addr?ifUploadedBefore=<ms>` (A3).
@@ -562,6 +621,11 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
        survives.
      - The grace period covers the gap between a put and the ns frame that references it (DESIGN §j.1 "only after
        the put succeeds").
+- **Scale caveat (user, 2026-10-07).** The sweep is O(N) on the client: it lists every blob address (~50k on a heavy
+  vault) and does set arithmetic against the live set on whatever device runs it, possibly a phone. It will buckle
+  on heavy vaults. It is acceptable for v1 only because it is a cold, manual path. Future directions, not designed
+  here: a resumable sweep with a persisted cursor, and a live set kept incrementally from the ns fold instead of
+  rebuilt per run.
 - Alternative: server refcounts. Rejected: the server cannot see references under E2EE, and keeping refs
   consistent across DOs would be a distributed transaction.
 
@@ -671,7 +735,7 @@ Rows already sealed under e−1 stay valid. Outbox frames are not re-sealed: a r
 - Every device keeps all records (§6.1), so any device can re-publish. A device restoring from RK alone needs the
   genesis or a revoke record to be present. After a reset where no device survives, the vault holds nothing
   readable anyway.
-- **Genesis position.** Enable writes the genesis record when `VAULT_READY.head = 0` (§15). Readers do not rely on its
+- **Genesis position.** Enable writes the genesis record only on the creation path, at `VAULT_READY.head = 0` (§15.1). Readers do not rely on its
   position: validity alone decides.
 
 ## 12. Pairing
@@ -683,13 +747,14 @@ obsidian://yaos?action=setup&host=<host>&pairingCode=<vaultId.secret>&key=<b64ur
 ```
 
 1. The paired device calls `POST /vault/:id/auth/pairing-code` (DECISIONS §2.2), as today.
-2. It builds the link locally, extending `buildSetupLink` (`src/host/ui/pairing.ts:456`).
+2. It builds the link locally, extending `buildSetupLink` (`src/host/ui/pairing.ts:485`).
    - `key` holds the newest winning epoch and its key: 1 + 1 + 32 bytes, 46 base64url characters.
    - Older keys come from the `prevWrap` chain (§11.1).
    - The vaultId is already inside the pairing code (DECISIONS D3).
 3. The plugin draws the QR itself, with `qrcode` 1.5.4 (+9.6 KB gzip **[M]**, §23).
 4. The new device scans it. Obsidian hands the parameters to `registerObsidianProtocolHandler`
-   (`src/host/ui/registerUi.ts:136`). `parseSetupLink` accepts `key` (it joins `SETUP_LINK_KEYS`, `pairing.ts:465`).
+   (`src/host/ui/registerUi.ts:152`). `parseSetupLink` (`pairing.ts:501`) accepts `key` or `suite` (§12.4), never
+   both (they join `SETUP_LINK_KEYS`, `pairing.ts:494`, which rejects unknown keys today).
 5. **The key is stripped before `/enroll`.** DECISIONS D3 requires exactly this: "A future client-only key part
    must be stripped before `/enroll`". The key goes into the pending identity, in memory only. After enroll, the
    device reads `k`, checks kcv and walks the chains (§11.3). It then persists the keys and the suite pin.
@@ -699,14 +764,17 @@ Rules:
 - **NEVER put a key in any URL the server serves**, including the fragment of `GET /mobile-setup`.
   - That page is a static Worker response whose JS reads `location.hash` (`server/src/console/mobileSetup.ts:47`).
   - Its `connect-src 'none'` CSP is set by the same server, so it is no guarantee.
-  - Under suite 1 the pair modal hides `mobileSetupUrl` (`src/host/ui/pairModal.ts:192`).
+  - The pair modal stops showing `mobileSetupUrl` (`src/host/ui/pairModal.ts:194`) under **both** suites. That page
+    is server-drawn, so it can carry only a key-less join, and a key-less join is blocked (§12.4). The plugin draws
+    the `obsidian://` QR itself instead (iOS Camera opens it, §3).
 - **The link is a secret.** It is shown only after an explicit "Show pairing QR" click and hidden when the code
   expires (15 min, DECISIONS D3) or the modal closes. It is never logged.
   - "Copy setup link" stays, for phone → desktop and for desktops without a camera, with a warning: "This link
     contains your vault key. Send it only over a channel you trust (AirDrop, a cable), never a chat app."
-- **Opening an `obsidian://` QR from the stock camera is [U]** on iOS and Android (§23.3). Fallbacks, in order:
+- **Opening an `obsidian://` QR from the stock camera.** iOS Camera (iOS 11+) recognises it and offers to open
+  Obsidian **[User]**. Android is **[U]** (§23.3). Fallbacks, in order:
   1. the copied link;
-  2. pair with the code alone, then enter the recovery key (§12.4).
+  2. pair with the code alone; the device then stays blocked until the recovery key is entered (§12.4).
 - Alternative: SAS or ECDH pairing, where the new device and the old one agree a key through the relay and the
   user compares a short code (decision D5). Rejected for v1:
   - it needs an interactive two-device protocol over relay streams, with its own state machine and timeouts;
@@ -718,7 +786,10 @@ Rules:
 ### 12.2 Enroll from the operator console
 
 The console mints owner codes (DECISIONS D5, `POST /operator/vaults/:id/owner-code`). Its page and QR are served by
-the server, so they can never carry the key. A device paired this way follows §12.4: it needs the recovery key.
+the server (the console draws `obsidian://yaos?action=setup&host&pairingCode` and a `/mobile-setup#…` QR,
+`server/src/console/console.ts:158-169`), so they can never carry the key, and nothing they carry is trusted. A
+device paired this way is a **key-less join** (§12.4): it stays blocked until it gets the recovery key or a QR from
+one of the user's devices. It can never set suite 0 and never reaches the creation path (§15.1).
 
 ### 12.3 Device name
 
@@ -729,21 +800,80 @@ the server, so they can never carry the key. A device paired this way follows §
 - Under suite 1 the pair modal shows a hint next to the name field: "Visible to the server operator". No server
   change is needed (decision D6).
 
-### 12.4 Key-less links and downgrade
+### 12.4 Suite pin, key-less joins and downgrade
 
-A link or code without `key` may lead to an encrypted vault (owner code, or the user typed the code). The server
-cannot be trusted to say which (§2.1), so **the user decides**:
+**Fail closed.** If the pin says suite 1, the device is suite 1, and without the key it does not write. A device
+with **no pin** writes nothing at all:
+- no frame on any stream (`k` included), no checkpoint, no blob, no ns entry;
+- no reconcile, so no outbox;
+- it may enroll and read `k`, and that is all.
 
-> This setup link has no encryption key.
-> If this vault is end-to-end encrypted, enter its recovery key or scan a pairing QR from one of your devices.
-> [Enter recovery key] [Scan QR instead] [Continue unencrypted]
+No screen anywhere offers to continue without encryption.
 
-- "Continue unencrypted" pins suite 0. If `k` later shows a genesis record, the device stops with "This vault is
-  encrypted" (phase `key-missing`) and seals nothing.
-- A suite-1 device treats every suite-0 row as a deterministic malformation (`suite-downgrade`, §9.2). A server
-  that hides `k` and shows suite-0 rows cannot make a pinned device accept plaintext.
-- **Residual risk.** A user who picks "Continue unencrypted" for a vault the server hides as empty writes
-  plaintext. This is the cost of having no server-side truth. The default focus is "Enter recovery key".
+**A pin comes from exactly one of three sources.** All three are authenticated by the user or by this device;
+none is something the server says.
+
+| # | Source | Pin | Accepted only if |
+|---|---|---|---|
+| (i) | A key from a plugin-drawn pairing or re-key QR/link (§12.1, §14.2 step 3), or the RK (§13.3) | 1 | The key's kcv matches a valid `k` genesis or revoke record (§11.3). With no matching record (`k` empty, hidden or garbage) the device stays unpinned and blocked. It keeps the key in memory and retries as `k` arrives, and never persists an unverified key |
+| (ii) | A plugin-drawn pairing link from a device already pinned to suite 0, carrying `suite=0` | 0 | This device has never read a `k` genesis for the vault (`keyringSeen`, below), and `k` read to head now is empty |
+| (iii) | This device creating a brand-new vault (§15.1) | 1, or 0 by the D2 opt-out | The device made the vault-creating call itself, and then read `VAULT_READY.head = 0` and an empty `k` (§15.1) |
+
+- `parseSetupLink` accepts `key` or `suite=0`, never both, and no other `suite` value (a key implies suite 1).
+- `data.json` holds `e2ee` as one of: absent (unpinned), `{suite: null, keyringSeen: true}`, `{suite: 0}` or
+  `{suite: 1}`. `keyringSeen` is sticky. It is set the first time an unpinned device reads a `k` genesis for its
+  vault, and from then on (ii) is refused.
+
+**Key-less join.** This is any enrollment by a code that arrived without `key` or `suite`:
+- a code typed into the pair modal;
+- an `obsidian://yaos?action=setup` link without them, including the console's link and its `/mobile-setup` QR
+  (`server/src/console/console.ts:158-169`), and the `obsidianUrl` in a claim response shown by the console
+  (relay-wire §2.2);
+- `resumePendingEnrollment` (`src/host/ui/pairFlow.ts:114`) of any of those.
+
+After a key-less join the device enrolls, stays unpinned and reads `k`:
+- `k` has a genesis record → `keyringSeen`, phase `key-missing` with `keyMissing: "encrypted-vault"`;
+- `k` is empty → phase `key-missing` with `keyMissing: "no-pin"`. It **stays blocked**. An empty `k` is what an
+  unencrypted vault looks like, and also what a server hiding `k` looks like. This holds even at
+  `VAULT_READY.head = 0`: an empty vault reached by a key-less join is not a creation (§15.1).
+
+The blocked screen offers exactly two actions, and says why:
+
+> YAOS can't tell whether this vault is end-to-end encrypted. The server says it holds no encryption key record,
+> but a server can hide one, so this device will not sync until one of your own devices or your recovery key
+> settles it.
+> [Enter recovery key] [Scan QR from one of your devices]
+
+(For `"encrypted-vault"` the first sentence reads "This vault is end-to-end encrypted.")
+
+- **"Scan QR from one of your devices"** says: on a device that already syncs this vault, open YAOS → "Pair a
+  device" (or "Show re-key QR") and scan it with the camera.
+  - A suite-1 device's QR carries the key: source (i).
+  - A suite-0 device's pairing QR carries `suite=0`: source (ii).
+- **No re-enrollment.** The blocked device is already enrolled. When a setup link names the vault it is enrolled in
+  (the vaultId is inside the pairing code, DECISIONS D3), it takes only `key` or `suite` from the link and does not
+  enroll again. The code expires unused after 15 min.
+- **No third button.** Nothing on this screen sets suite 0, enables encryption or creates a vault.
+
+**Rules kept.**
+- A suite-0 device that sees a `k` genesis stops: phase `key-missing`, `keyMissing: "encrypted-vault"`. It seals
+  nothing and never switches suite by itself (§15.2).
+- A suite-1 device treats every suite-0 row as deterministic malformation (`suite-downgrade`, §9.2). A server that
+  hides `k` and shows suite-0 rows cannot make a pinned device accept plaintext.
+
+**Residual risk.** Sources (i) and (ii) trust the user to take the QR or link from their own device's YAOS screen
+(§2.1). A hostile server, or any web page, can draw an `obsidian://yaos` link:
+- one with `suite=0`, while it hides `k`; or
+- one with a key of its own, plus a forged genesis for that key.
+
+A user who scans such a link from anywhere but their own device gets a device that writes on the attacker's terms.
+The mitigations:
+- the honest console draws only key-less links;
+- the plugin never tells the user to scan anything the server serves;
+- the pair modal shows "End-to-end encryption: On" or "Off (from this link)" before pairing.
+
+What no longer exists is **downgrade by omission**. A user who does what the honest console says, and scans its
+QR, ends up blocked, not downgraded.
 
 ## 13. Recovery key
 
@@ -758,7 +888,7 @@ cannot be trusted to say which (§2.1), so **the user decides**:
 
 ### 13.2 Lifecycle
 
-- **Created** at enable (§15), on the enabling device.
+- **Created** at enable, on the creating device (§15.1).
   - Shown **once** with Copy, plus the advice "Store it outside this vault: a password manager or paper".
   - The user confirms by retyping 2 random groups. Enable cannot finish until they do.
 - **NEVER stored by YAOS**: not in SecretStorage, `data.json`, IndexedDB or logs. The device holds it only
@@ -778,8 +908,9 @@ cannot be trusted to say which (§2.1), so **the user decides**:
 
 1. Operator console → the vault → "Owner code" (`POST /operator/vaults/:id/owner-code`, DECISIONS §2.2). The
    console shows the code and its QR.
-2. On a new device: Pair → the owner code → the key-less prompt (§12.4) → "Enter recovery key".
-3. The device enrolls (the RK is never sent anywhere), reads `k` to head, and unwraps the newest genesis or revoke
+2. On a new device, pair with the owner code. That is a key-less join, so the device enrolls and stays blocked
+   (§12.4). Choose "Enter recovery key".
+3. The RK is never sent anywhere. The device reads `k` to head, and unwraps the newest genesis or revoke
    record's `recoveryWrap`. It checks kcv, walks `nextWrap` forward and `prevWrap` back to K_1 (§11.1), stores
    the keys, and bootstraps normally.
 4. Every revoke wraps K_r under the RK in force at that time (§14.2), so the current RK opens the newest record.
@@ -853,33 +984,90 @@ Devices that have not re-keyed still learn r from the record header, so they app
 - **What it loses:** every row sealed under an epoch ≥ r, and all write access (D7).
 - **Deep rotation (decision D4).** Rotating kAddr means re-uploading every blob under new addresses, then deleting
   the old ones (needs server ask A3). The cost is one PUT per blob and egress for the whole vault, and the only gain
-  is closing the "recognise a re-upload" leak. Recommended: no. It is an optional "Deep re-key" command later.
+  is closing the "recognise a re-upload" leak. Decided (D4, §22): not now; an optional "Deep re-key" command
+  later.
 - Alternative: re-seal all history under r on revoke. Rejected: the revoked device already holds the plaintext,
   so it gains nothing. It costs a full rewrite of the vault, i.e. rows and day budget.
 
 ## 15. Enable, migrate, disable
 
-### 15.1 Enable: new vaults only
+### 15.1 Enable: the creation path (new vaults only)
 
-- Encryption is chosen **when the first device pairs to a new vault**, i.e. when `VAULT_READY.head = 0`
-  (relay-wire §3.2). The pairing screen shows "End-to-end encryption: On" preselected (decision D2).
-- Enable steps:
-  1. generate K_1 and the RK;
-  2. show the RK and require the retype confirmation (§13.2);
-  3. append the genesis record to `k` as the vault's first frame, and hold every ns frame until it is receipted;
-  4. persist the keys and the record (§6.1), then set the pin `e2ee: {suite: 1}`.
-- `head > 0` with no genesis means the vault already has plaintext. Enable is refused with "Encryption can
-  only be turned on for a new vault" and a link to §15.2.
-- A crash before step 3's receipt leaves an empty vault. The retry regenerates everything; pending keys are dropped
-  because the record never won.
+Encryption is chosen only on the **creation path**: a YAOS "Create a new vault" flow in which this device makes
+the vault-creating server call itself. The plugin has no such flow today:
+- every pairing is a key-less enroll by code (`enroll` and `pairDevice`, `src/host/ui/pairing.ts:392`, `:397`);
+- an unclaimed server is refused with "Open it in a browser to claim it first" (`pairing.ts:232-233`).
+
+WP-E5 adds the flow.
+
+**Definition.** A device is on the creation path for vault V if and only if, in one flow that the user started from
+YAOS's own "Create a new vault" command or button, all three steps hold:
+1. **This device sent the call that created V,** and read V's vaultId from the response:
+   - **Unclaimed server** (`GET /api/capabilities` says `claimed: false`): `POST /claim` (relay-wire §2.2,
+     `server/src/router.ts:213`).
+     - The claim creates the first vault (`CLAIM_VAULT_NAME`, `router.ts:69`) and returns its `pairingCode`.
+     - The operator recovery key is generated on main, then shown and confirmed as the console does
+       (`server/src/console/console.ts:247-258`).
+   - **Claimed server**, in this order:
+     - `POST /operator/login` (`router.ts:215`) with the operator recovery key typed into this flow;
+     - `POST /operator/vaults {name}` (`:221`);
+     - `POST /operator/vaults/:id/owner-code` (`:435`) for that vaultId;
+     - `POST /operator/logout`.
+2. **It enrolled with the code from step 1.** The code must name that vaultId, and it never leaves memory: it is
+   not displayed, not put in a link and not logged.
+3. **After enrolling, it read `VAULT_READY.head = 0`** (relay-wire §3.2) **and read `k` to head, empty.**
+
+Only then does the screen show "End-to-end encryption: On", preselected, with the opt-out (decision D2). If any check
+fails, the flow aborts with "The server returned a vault that is not empty" and sets no pin. The device stays
+unpinned and blocked (§12.4).
+
+- **Never entered from:**
+  - the protocol handler (`src/host/ui/registerUi.ts:152`) or `parseSetupLink`;
+  - a typed or scanned code;
+  - the console's QR or link, or a claim response's `obsidianUrl`;
+  - `resumePendingEnrollment`.
+
+  All of those are key-less joins (§12.4).
+- **Crash recovery.**
+  - Right after step 1's response, main writes `creating: {vaultId}` to `data.json`. Nothing else writes it.
+  - On restart, an enrolled, unpinned device whose vaultId equals `creating.vaultId` resumes at step 3. Every other
+    unpinned device is blocked (§12.4).
+  - The marker is removed once a pin is set.
+- **Secrets.** The operator recovery key is held only for step 1. It is never stored, and the §6.1 NEVER rules
+  apply to it. The settings hint "The operator key stays in the console" (`src/host/ui/settingsTab.ts:116`) gains an
+  exception for this flow.
+- **`Origin` [U].** `/claim` and the operator routes require JSON and an `Origin` equal to the server's origin
+  (`server/src/router.ts:117-127`, DECISIONS D5).
+  - Whether Obsidian's `requestUrl` can send that `Origin` on desktop and mobile is **[U]**. E5 checks it first.
+  - If it cannot, server ask A11 applies (§19).
+- **What a lying server gains.** It could return an existing vault in step 1 and fake an empty one in step 3.
+  - Under suite 1 (the default), the device seals under a fresh K_1 that the server never sees. That is a fork
+    (§2.1), and the server learns nothing.
+  - Under the opt-out, the device uploads in plaintext only what the user chose to upload in plaintext.
+  - A join never offers this choice.
+- **Console-created vaults** cannot be set up by a device. That covers `POST /operator/vaults` from the console page
+  and the vault a console claim makes. Every device that reaches one is a key-less join and stays blocked. The
+  console stays useful for revoke, for owner codes on the RK path (§13.3), and for delete.
+
+Enable steps (suite 1):
+1. generate K_1 and the RK;
+2. show the RK and require the retype confirmation (§13.2);
+3. append the genesis record to `k` as the vault's first frame, and hold every ns frame until it is receipted;
+4. persist the keys and the record (§6.1), then set the pin `e2ee: {suite: 1}`.
+
+**Opt-out (suite 0):** set the pin `e2ee: {suite: 0}`. No `k` record is written. Other devices join by source (ii)
+links (§12.4).
+
+- A crash before step 3's receipt leaves an empty vault. The retry, resumed through `creating`, regenerates
+  everything. Pending keys are dropped because the record never won.
 
 ### 15.2 Migrate an existing vault, or turn encryption off
 
-Both mean **a new vault**:
-1. In the console, "Create vault" (DECISIONS D5).
-2. Pair this device to it with encryption On (or Off). The initial reconcile uploads every file from disk.
-3. Pair the other devices with the QR (§12).
-4. Delete the old vault in the console. Deletion runs `deleteAll()` and then purges the R2 prefix `v/<vaultId>/`
+Both mean **a new vault** (decision D7):
+1. In the plugin, run "Create a new vault" (§15.1) with encryption On, or Off by the opt-out. The device leaves the
+   old vault first. The initial reconcile uploads every file from disk.
+2. Pair the other devices with the plugin-drawn QR (§12.1), or the suite-0 link (§12.4).
+3. Delete the old vault in the console. Deletion runs `deleteAll()` and then purges the R2 prefix `v/<vaultId>/`
    (DECISIONS D5, D9).
    - Durable Object PITR keeps 30 days of history [CF-PITR]. Whether it can still restore after `deleteAll()` is
      **[U]**, so the old plaintext may linger at Cloudflare for up to 30 days.
@@ -946,6 +1134,9 @@ Crypto is never on the hot path. Bootstrap is bound by the network and the plann
   `MemStoragePort` trips `tx-inactive` only when a body awaits a macrotask (`src/sim/storage.ts:29-44`).
 - **Fix (WP-E7).** A `DelayedCrypto` double settles every call after `setTimeout(0)`. Any future crypto await
   inside a transaction then fails the sim and the unit tests, exactly as on a device.
+- **WP-E2 status.** E2 adds no IndexedDB path. frameNo allocation and sealing run on the edit chain before
+  `repo.tEdit` (`src/engine/runtime/logApi.ts`), the gate opens before T_receipt, and the receipt only writes the
+  already-known frameNo. The double is still WP-E7's.
 
 ## 17. Lost server features and client replacements
 
@@ -962,7 +1153,7 @@ rather than an accident.
 | Cross-vault dedupe | Impossible: kAddr is per vault | None, by design |
 | Server search, publish or web view | Impossible | None (out of scope) |
 | Server-held key recovery | Never existed | RK (§13) |
-| Operator snapshot or recovery routes | Removed by the rewrite (DECISIONS §1, D5) | Local snapshots; uploads are sealed blobs (§9.1) |
+| Operator snapshot or recovery routes, server backup alarm | Removed by the rewrite (DECISIONS §1, D5). The server never parses note content and has no backup alarm (user decision, 2026-10-07) | The client snapshot exporter: opaque multi-part bundles uploaded as sealed blobs and indexed by the sealed `snap` stream (§8.1, §9.1; recovery branch). `snap` part addresses are in the GC live set (§10.4). Otherwise operator PITR (D8b) |
 | Server-side size accounting per vault | Still works, but sizes are padded (§7.3) | n/a |
 
 ## 18. Shape changes and DESIGN diffs
@@ -1017,9 +1208,21 @@ export interface KeyringCrypto {
 - `openBlob` returns a result rather than `Uint8Array | null`, so the caller can classify the failure (§10.2).
   The callers that change are `src/engine/body/refs.ts:58-59` and `src/engine/blobs/blobQueue.ts:204`.
 - **The suite-0 adapter** (`src/engine/adapters/noopCrypto.ts`) and `identityCrypto`
-  (`src/core/codec/envelope.ts:242`) implement the new shape. `sealEpoch()` returns 0.
-- **The suite-1 adapter is new**, at `src/engine/adapters/webCryptoSuite1.ts` (WP-E1). It holds non-extractable
-  CryptoKeys only.
+  (`src/core/codec/envelope.ts`) implement the new shape. `sealEpoch()` returns 0.
+  - core has no digest, so `identityCrypto(hash?: HashPort)` takes an optional HashPort for `diagHash`; without one,
+    `diagHash` throws. `DIAG_HASH_HEX_CHARS = 16` lives in `src/core/codec/envelope.ts`.
+- **The suite-1 adapter is new**, at `src/engine/adapters/webCryptoSuite1.ts` (WP-E1), with the primitives in
+  `suite1Primitives.ts`. It holds non-extractable CryptoKeys only, plus the raw bytes §6.3 step 2 allows.
+  - `sealEpoch()` is 0 until `setSealEpoch`, so a fresh port seals nothing. `seal` throws under an unheld or
+    unverified epoch; `setSealEpoch` throws unless the key is verified, and never moves backwards.
+  - `open` checks in this order: suite 0 → `suite-downgrade`; suite ≠ 1 → `unsupported-suite`; epoch not held →
+    `unknown-key`; sealed < 28 bytes → `malformed`; then the tag. No trial decryption across epochs.
+  - `wrap` throws if the raw key it needs is no longer retained (§6.3). `unwrap` returns false and never throws on
+    bad bytes, a missing wrapping key or a short RK; a payload for an already-verified epoch is discarded (true).
+  - `install` and the constructor's `keys` zero-fill the caller's buffers. `install` refuses to replace a verified
+    epoch. `drop` refuses the seal epoch. `exportForHost` returns each not-yet-exported key once.
+  - `blobAddress` and `diagHash` need K_1 (§5.1). A device holding a later K_e reaches K_1 down the prevWrap chain
+    (§11.1) before it addresses any blob.
 
 ### 18.2 Envelope, codec, limits, fold
 
@@ -1028,7 +1231,7 @@ export interface KeyringCrypto {
   - `AAD_FRAME_PREFIX = "yaos/f2"`, `AAD_CHECKPOINT_PREFIX = "yaos/c2"` and the new `AAD_BLOB_PREFIX = "yaos/b2"`,
     `AAD_KEYRING_PREFIX = "yaos/k2"`;
   - the inner layout gains `varuint frameNo` after `flags`. It is 0 for kinds outside ns and cfg, and non-zero
-    for ns and cfg (§8.2);
+    for ns and cfg (§8.2). A violation is `malformed` on decode and a `CodecError` on encode;
   - `EnvelopeOpenResult.reason` gains `"suite-downgrade"` and `"bad-padding"` (§9.2). Replay is a fold
     decision, not an open failure: `NsIgnoreReason` (`src/core/types.ts:232`) and the cfg equivalent gain
     `"replay-stale"`, `"replay-duplicate"` and `"stale-epoch"` (§8.2, §14.3);
@@ -1036,7 +1239,11 @@ export interface KeyringCrypto {
     V2 in this document).
 - `src/core/codec/envelope.ts`:
   - `bindingAad` (lines 155-162) writes the §7.2 fields: header plus deviceId for frames, header for checkpoints;
-  - padding (§7.3) is applied when `suite ≠ 0`, between the inner encoding and `seal`, and stripped after `open`.
+  - padding (§7.3) is applied when `suite ≠ 0`, between the inner encoding and `seal`, and stripped after `open`;
+  - `sealEnvelope` / `openEnvelope` are the one seal/open implementation (`src/engine/ingest/envelope.ts` wraps
+    them). They check the kind against the stream class; checkpoint *content* checks (coversSeq, encoding, size)
+    stay in the ingest gate. Until WP-E3 the keyring stream `k` is treated like an unknown class: the codec
+    answers `kind-stream-mismatch` and the gate ignores `k` rows.
 - `src/core/types.ts`:
   - `NsFoldState` and `CfgFoldState` gain `readonly replay: Map<DeviceId, { r: number; bits: bigint }>` (64-bit
     window);
@@ -1045,15 +1252,17 @@ export interface KeyringCrypto {
 - `src/core/limits.ts`:
   - `MAX_FRAME_CONTENT_BYTES` (:49, today 1 MiB − 4 KiB) → 1015808 (§7.3);
   - new `MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 10223615`;
-  - new `REPLAY_WINDOW = 64`, `ROLL_SEQ_SPAN = 2 ** 23`, `ROLL_OWN_SEALS = 2 ** 22`,
-    `PADME_FLOOR_BYTES = 256`, `KEY_STORE_WAIT_MS = 5000`.
+  - new `REPLAY_WINDOW = 64` and `PADME_FLOOR_BYTES = 256` (WP-E2);
+  - `ROLL_SEQ_SPAN = 2 ** 23` and `ROLL_OWN_SEALS = 2 ** 22` land with the roll (WP-E3), `KEY_STORE_WAIT_MS = 5000`
+    with host key storage (WP-E4): constants arrive with their first user.
 - `QuarantineReason` (`src/engine/store/schema.ts:186`) gains `"crypto-downgrade"` and `"envelope-padding"`.
 
 ### 18.3 IndexedDB (`src/engine/store/schema.ts`)
 
 | Store / record | Change |
 |---|---|
-| `OutboxRecord` (:156) | + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2); + `frameNo: number \| null` (ns/cfg) |
+| `OutboxRecord` (:156) | + `frameNo: number \| null` (ns/cfg; WP-E2). + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2) lands with the re-seal in WP-E3 |
+| `TailRecord` | + `frameNo: number` (0 outside ns/cfg and for rows that failed the gate; WP-E2). Own rows carry the allocator's max across restarts (§8.2) |
 | `MetaRecord` | + `MetaKeyring {key: "keyring"; sealEpoch; epochs: {e, firstSeq, kind, verified}[]; revokeEpoch: number \| null; sRot: Seq \| null; ownSeals: number}`. **No key bytes** (§6.1) |
 | `MetaRecord` | + `MetaFrameNoFloor {key: "frameNoFloor"; ns: number; cfg: number}`, written by epoch migration (§8.2) |
 | ns and cfg fold state records | Carry `replay` (V2 encoding) |
@@ -1068,13 +1277,15 @@ No store or index is added or removed, so `upgrade()` (`src/engine/adapters/idbS
 // messages.ts — EngineInitConfig (:46) gains:
 /** SECRET (keys): never logged or echoed. Buffers are transferred, and main keeps no copy (§6.3). */
 readonly crypto:
+  | { readonly suite: null; readonly creating: boolean }   // unpinned (§12.4): reads `k` only, writes nothing
   | { readonly suite: 0 }
   | { readonly suite: 1; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; readonly records: readonly Uint8Array[] };
 
 // UserCommand (:132) gains (all SECRET payloads, transferred):
-| { readonly t: "enableE2ee"; readonly rk: Uint8Array }                       // genesis at head = 0 (§15.1)
+| { readonly t: "enableE2ee"; readonly rk: Uint8Array }                       // creation path only (§15.1): genesis at head = 0
 | { readonly t: "installKey"; readonly source: "qr"; readonly e: number; readonly k: Uint8Array }   // §12.1, §14.2 step 3
 | { readonly t: "installKey"; readonly source: "rk"; readonly rk: Uint8Array }                      // §12.4, §13.3
+| { readonly t: "pinSuite0"; readonly source: "link" | "create" }             // §12.4 (ii) / (iii): ok only if `k` is empty at head
 | { readonly t: "revokeRekey"; readonly rk: Uint8Array }                      // §14.2; a new RK is generated on main
 
 // EngineToMain (:187) gains:
@@ -1083,8 +1294,15 @@ readonly crypto:
 ```
 
 - `status.ts`: `EnginePhase` gains `"key-missing"`, already named in DESIGN §c.3. `StatusSnapshot` gains
-  `e2ee: { suite: 0 | 1; sealEpoch: number; keyMissing: "no-key" | "revoked-epoch" | "encrypted-vault" | null }`.
-  There are no secrets in status.
+  `e2ee: { suite: 0 | 1 | null; sealEpoch: number; keyMissing: "no-pin" | "no-key" | "revoked-epoch" |
+  "encrypted-vault" | null; keyringSeen: boolean; creatable: boolean }`. There are no secrets in status.
+  - `suite: null` is an unpinned device (§12.4).
+  - `creatable` is true only for an engine started with `creating: true` that has read `VAULT_READY.head = 0` and
+    an empty `k` (§15.1 step 3).
+  - **The engine never sets a pin.** Main sets it from (i) `keyringChanged` after a verified key, (ii) and (iii)
+    from a successful `pinSuite0` or `enableE2ee`. Main then restarts the engine with the pinned config.
+  - `enableE2ee` and `pinSuite0 {source: "create"}` are refused unless `creatable`. `pinSuite0 {source: "link"}`
+    is refused if `keyringSeen` or `k` is non-empty.
 - **Persist-before-use.** The engine does not seal under a new epoch until main acknowledges `keyringChanged`
   (the result of the same rid). A crash can therefore never leave committed rows under a key no device stored.
 - The RK and QR keys are generated and shown on main (UI). The worker never displays them, and main never logs them.
@@ -1161,6 +1379,7 @@ Baseline: 7208184. No ask is on the hot path, and none adds cross-DO coordinatio
 | A8 | Rename "vault key" in `server/src/vault/ticket.ts` (DECISIONS D4) to "ticket key" in code and docs | Avoids confusion with K_e in reviews and in incident response | Low |
 | A9 | Keep stream names opaque: no server-side meaning for `k` or any prefix (`server/src/streams/protocol.ts:16`, `:53`) | `k` needs no server change | Confirm only |
 | A10 | Keep `MAX_STREAM_CHECKPOINT_BYTES` (`server/src/streams/protocol.ts:25`, 4 MiB) and the 1 MiB frame cap stable, or announce changes in VAULT_READY limits | Suite-1 padding is computed against them (§7.3) | Confirm only |
+| A11 | *(conditional)* Let the plugin's creation path (§15.1) reach `/claim`, `/operator/login`, `/operator/vaults` and `/operator/vaults/:id/owner-code`. Today they demand a same-origin `Origin` (`server/src/router.ts:117-127`). For example, accept a JSON request with **no** `Origin` header, which browsers always send on such POSTs | Only if E5 finds that Obsidian's `requestUrl` cannot send `Origin: <host>`. Without it a device cannot create a vault, so no vault can be set up | Before WP-E5, if needed |
 
 Not asked: a device-list route for clients (the console covers revoke, D7); server-side key storage of any kind;
 per-vault crypto flags on the server (the suite is client-pinned, §12.4).
@@ -1177,6 +1396,12 @@ per-vault crypto flags on the server (the suite is client-pinned, §12.4).
   - inputs: fake key `K = 00 01 … 1f`, vaultId `AAAAAAAAAAAAAAAAAAAAAA`, and a seeded `RandomPort` for nonces;
   - outputs: each subkey's kcv, kAddr of a fixed hash, one frame per envelope kind, one checkpoint, one blob,
     genesis/roll/revoke records, an RK encode/decode, and a setup link.
+  - Split by package, since each lands with the code that produces it:
+    - **WP-E1** (`src/engine/adapters/suite1Golden.test.ts`): kcv for K_1 and K_2 (= 20..3f), kAddr of
+      sha256("abc"), kDiag, raw frame and checkpoint seals (fixed AAD), a frame under K_2, one sealed blob, and
+      next/prev/recovery wraps (fake 35-byte RK = 40..62; fixed AAD, since wrap AAD §11.2 is WP-E3);
+    - **WP-E2** (`src/engine/adapters/suite1Envelope.test.ts`): one envelope per kind with the §7.2 AAD and padding;
+    - **WP-E3**: genesis/roll/revoke records and the RK encoding; **WP-E5**: the setup link.
   - **Cross-checked by a second implementation** in the test: Node `node:crypto` (`createCipheriv`, `hkdfSync`,
     `createHmac`), not WebCrypto, so one implementation's bug cannot certify itself.
 - Codec property tests: Padmé round-trip and bucket monotonicity, varuint and base32 round-trips, and
@@ -1197,8 +1422,21 @@ Each test counts outcomes and asserts **all** of them; none samples a single cas
   63, 64, 65, 1000 and 10⁵ own frames. Assert the fold digest is identical to a run without the replays, over 1000
   seeds, and that events `ignored/replay-*` or `duplicate-frame` account for every injected row.
 - **Re-attribution.** Rewrite a row's deviceId: `auth-failed`, 100%.
-- **Downgrade.** Inject suite-0 rows into a suite-1 vault: every one is `suite-downgrade`, and the folds are
-  unchanged. Hide `k` from a fresh key-less device: it must stop at the §12.4 prompt with no seal issued.
+- **Downgrade.**
+  - Inject suite-0 rows into a suite-1 vault: every one is `suite-downgrade`, and the folds are unchanged.
+  - **Hidden `k`, key-less join.** Hide `k` from a fresh device that joins with a key-less code, including the
+    console's link and its `/mobile-setup` QR, at `head = 0` and at `head > 0`. Each must end in `key-missing` with
+    `"no-pin"` and zero writes: no frame on any stream, no blob PUT, no checkpoint, no outbox record, no ns entry.
+    The only actions offered are "Enter recovery key" and "Scan QR from one of your devices".
+  - **The pin never comes from the server.** Count every path that sets a pin. Over all key-less-join seeds, a
+    suite-0 pin and `creatable` occur 0 times.
+  - **Suite-0 link after a genesis.** After an unpinned device has read a `k` genesis, the server hides `k` and a
+    `suite=0` link arrives: refused (`keyringSeen`), and nothing is written.
+  - **Creation path.** Step 1 returns a vault with `head > 0` or a non-empty `k`: abort, no pin, no write. A
+    `creating` marker for another vaultId is ignored. The protocol handler cannot reach the flow.
+  - **Unverified key.** A QR key with no matching `k` record leaves the device unpinned, and nothing is
+    persisted.
+  - A suite-0 device that sees a `k` genesis stops with `"encrypted-vault"` and issues no seal.
 - **Stale epoch.** After a revoke, inject old-epoch frames sealed with K_{r−1}: all ignored, no quarantine, and
   the fold digest is unchanged.
 - **Keyring forgery.** Garbage records, a roll for r forged with K_{r−1} after a revoke (§11.3), and duplicate
@@ -1215,7 +1453,7 @@ Each test counts outcomes and asserts **all** of them; none samples a single cas
   - `keyRoll {dev}`: forced roll, including concurrent rolls on two devices;
   - `revoke {dev, by}`: console revoke, then re-key;
   - `epochRestore`: PITR-like rewind plus a new epoch, so `k` must be re-published;
-  - `hostileReplay`, `hostileDowngrade`.
+  - `hostileReplay`, `hostileDowngrade` (suite-0 rows, and `k` hidden from key-less joins, §20.2).
 - **Leak checks in sim:** the relay sees only bucketed payload sizes (§7.3), and no stream name contains a
   plaintext hash.
 - **At-rest leak check (desktop, WP-E4):** after an integration run, grep the IndexedDB LevelDB, `data.json`,
@@ -1229,12 +1467,12 @@ There is one agent per package. Sizes: S ≈ 1 agent-day, M ≈ 2–3, L ≈ 4�
 
 | WP | Scope (owned paths) | Depends on | Done when | Size |
 |---|---|---|---|---|
-| **E0** Device runs | `src/host/spike/**`: add a SecretStorage probe (set/get/restart, 64 KiB value, `""`, locked device) and an `obsidian://` QR scan check | none (needs a human with devices) | §23.3 table filled with [M] rows | S |
+| **E0** Device runs | `src/host/spike/**`: add a SecretStorage probe (set/get/restart, 64 KiB value, `""`, locked device) and an Android `obsidian://` QR scan check (iOS is [User]-confirmed, §23.3) | none (needs a human with devices) | §23.3 open rows filled with [M] rows | S |
 | **E1** CryptoPort + suite-1 adapter | `src/ports/crypto.ts` (§18.1), `src/engine/adapters/webCryptoSuite1.ts`, `noopCrypto.ts`, `identityCrypto` | none | §20.1 KATs and golden vectors pass under Node WebCrypto and the `node:crypto` cross-check; 12-byte nonce check; non-extractable keys only | M |
-| **E2** Envelope v2 | `src/core/envelope.ts`, `src/core/codec/**` (AAD v2, Padmé, frameNo, fold V2 encodings), `src/core/{ns,cfg}/**` (replay window), `src/core/limits.ts`, the send window over frameNo, `diagHash` in `runtimeOps.ts:150-153` | E1 shape | Codec round-trips; replay window unit tests including the §8.2 exactness argument as a property test; suite 0 still passes the whole suite | M–L |
+| **E2** Envelope v2 | `src/core/envelope.ts`, `src/core/codec/**` (AAD v2, Padmé, frameNo, fold V2 encodings), `src/core/{ns,cfg}/**` (replay window), `src/core/limits.ts`, the send window over frameNo, `diagHash` in the diagnostics bundle (`src/engine/compose/diagnosticsBundle.ts`) | E1 shape | Codec round-trips; replay window unit tests including the §8.2 exactness argument as a property test; suite 0 still passes the whole suite | M–L |
 | **E3** Keyring engine | `src/engine/keyring/**` (record codec, validity, winners, roll, revoke, re-publish, stale-epoch), the catch-up order (`k` first), phase `key-missing` | E1, E2 | §11 and §14.3 rules as unit tests; the forged-roll and duplicate-record tests in §20.2 | L |
-| **E4** Host key storage + protocol | `src/host/keys/**` (SecretStorage adapter, 5 s wait, pin, Linux notice), `src/protocol/**` (§18.4), persist-before-use | E1 shape | Restart keeps keys; IDB wipe keeps keys; at-rest leak check (§20.3) is zero | M |
-| **E5** Pairing, RK, revoke UX | `src/host/ui/**`: QR (`qrcode`), the `key` link parameter stripped before `/enroll`, key-less prompt, RK show/confirm/enter, revoke re-key, re-key QR, hiding `mobileSetupUrl`, device-name hint | E3, E4 | UI tests for each flow; `/enroll` request bodies asserted key-free; the link is never in logs | L |
+| **E4** Host key storage + protocol | `src/host/keys/**` (SecretStorage adapter, 5 s wait, pin incl. unpinned and `keyringSeen`, Linux notice), `src/protocol/**` (§18.4: unpinned config, `pinSuite0`), persist-before-use; the engine's unpinned mode (reads `k` only) | E1 shape | Restart keeps keys; IDB wipe keeps keys; at-rest leak check (§20.3) is zero; an unpinned engine issues zero writes | M |
+| **E5** Pairing, RK, revoke UX | `src/host/ui/**`: QR (`qrcode`), the `key`/`suite` link parameters stripped before `/enroll`, the blocked key-less screen (§12.4), the "Create a new vault" creation path with its `Origin` check first (§15.1), RK show/confirm/enter, revoke re-key, re-key QR, hiding `mobileSetupUrl` under both suites, device-name hint | E3, E4 | UI tests for each flow; `/enroll` request bodies asserted key-free; the link is never in logs; no path from a link, code or console QR reaches the creation flow or a suite-0 pin | L |
 | **E6a** Blob addressing and format | `src/engine/body/frames.ts` blob path, `src/engine/blobs/blobQueue.ts`, `src/engine/body/refs.ts`, `src/engine/runtime/blobChunks.ts`, `blobChunkStream(address)` | E1, E2 | Sealed-blob golden vector; dedupe via `has`; `x:` names carry no hash | S |
 | **E6b** Blob GC | `src/engine/blobs/gc.ts`, `BlobPort.list/deleteIf` | **A3** | Mark-and-sweep against a sim blob store with races (re-upload during the sweep survives) | M |
 | **E7** Verification | `DelayedCrypto`, sim `crypto: "suite1"`, new faults, the §20.2 measured tests, a perf bench against the §16 budgets | E1–E3 | The suite-1 fault matrix is green at suite-0 seed counts; every §20.2 assertion holds | M |
@@ -1242,18 +1480,26 @@ There is one agent per package. Sizes: S ≈ 1 agent-day, M ≈ 2–3, L ≈ 4�
 
 Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b waits for A3.
 
-## 22. Decisions for the user
+## 22. Decisions (resolved)
 
-| # | Question | Options | Recommendation |
+The user decided all eight on **2026-10-07**, each by the recommended option. Nothing in this document is pending
+on them.
+
+| # | Question | Decision | Why |
 |---|---|---|---|
-| D1 | How kept devices get the new key after a revoke | (a) Manually, by re-key QR or RK on each device. (b) Automatically via an ECDH-wrapped key per device, which needs per-device key pairs and their authentication | **(a).** Revocation is rare; (b) needs a device PKI and X25519 in mobile WebViews **[U]** |
-| D2 | Encryption for new vaults | (a) On by default, opt-out at first pairing. (b) Off by default, opt-in | **(a).** The cost is the RK ceremony at setup, but turning it on later means a new vault (§15.2) |
-| D3 | Padding | (a) Padmé with a 256 B floor. (b) No padding. (c) Padmé with a 1 KiB floor | **(a).** ≤ 12 % overhead and hides keystroke-sized frames. (c) costs about 4× bytes on typing frames for little gain |
-| D4 | Deep rotation of kAddr on revoke | (a) No. (b) Optional "Deep re-key" command (re-upload all blobs; needs A3). (c) Always | **(a) now, (b) later.** A revoked device already has the files; the gain is only recognising re-uploads |
-| D5 | Pairing transport | (a) QR or link with the key in a client-only parameter. (b) SAS/ECDH through the relay | **(a).** Same trust root, no protocol; SAS is the upgrade path if the camera-to-`obsidian://` hand-off fails on devices (§23.3) |
-| D6 | Device names under suite 1 | (a) Keep the platform default ("iPhone") plus a "visible to the operator" hint. (b) Force a random label. (c) No change | **(a).** Neutral by default; the console still needs a usable name for revoke |
-| D7 | Migrating an existing vault, or turning encryption off | (a) A new vault, then delete the old one. (b) In place with reset-streams | **(a).** Reset keeps plaintext blobs in R2 (D9); in place saves nothing real |
-| D8 | Recovery key at revoke | (a) Ask for the existing RK, with "generate a new one" as an option. (b) Always generate a new RK | **(a).** Fewer ceremonies; (b) is offered when the RK is lost or leaked |
+| D1 | How kept devices get the new key after a revoke | **(a) Manual re-key by QR or RK on each device.** No automatic ECDH key distribution | Revocation is rare. ECDH would need a device PKI and X25519 in mobile WebViews **[U]** |
+| D2 | Encryption for new vaults | **(a) On by default. Opt-out only on the creation path** (§15.1); never on a join (§12.4) | Turning it on later means a new vault (§15.2), so the RK ceremony belongs at setup |
+| D3 | Padding | **(a) Padmé with a 256 B floor** | ≤ 12 % overhead and hides keystroke-sized frames. A 1 KiB floor costs about 4× bytes on typing frames for little gain |
+| D4 | Deep rotation of kAddr on revoke | **(a) No, for now. (b), an optional "Deep re-key" command (re-upload all blobs; needs A3), later** | A revoked device already has the files. The gain is only recognising re-uploads |
+| D5 | Pairing transport | **(a) QR or link with the key in a client-only parameter** (§12.1) | Same trust root as SAS, with no protocol. The iOS camera hand-off is [User]-confirmed (§3); SAS/ECDH stays the upgrade path if Android fails |
+| D6 | Device names under suite 1 | **(a) Keep the platform default ("iPhone") plus a "visible to the operator" hint** | Neutral by default; the console still needs a usable name for revoke |
+| D7 | Migrating an existing vault, or turning encryption off | **(a) Create a new vault, then delete the old one** (§15.2) | Reset keeps plaintext blobs in R2 (D9); in place saves nothing real |
+| D8 | Recovery key at revoke | **(a) Ask for the existing RK, with "generate a new one" as an option** | Fewer ceremonies; a new RK is offered when the RK is lost or leaked |
+
+Also decided by the user on 2026-10-07, outside this table:
+- **Downgrade.** Fail closed (§12.4). There is no "Continue unencrypted", and a device with no pin writes nothing.
+- **Recovery.** The server never parses note content and has no backup alarm. Backups are the client snapshot
+  exporter (sealed blobs plus the `snap` index stream) or operator PITR (§17).
 
 ## 23. Spike: verified vs needs a device
 
@@ -1286,20 +1532,33 @@ Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b waits fo
 | `qrcode` 1.5.4 adds 9.6 KB gzip | esbuild bundle of a minimal QR-to-canvas call | [M] |
 | SecretStorage API shape; desktop safeStorage with a plaintext fallback; mobile `SecureStorage` key shared across vaults | `obsidian.d.ts`, `obsidian-1.14.4.asar` (read-only) | [S] |
 
-### 23.3 Needs a device (WP-E0)
+### 23.3 Confirmed by the user, and still needing a device (WP-E0)
+
+**[User] confirmed 2026-10-07.** The user stated these. The spike did not measure them and no source was read for
+them here, so they are tagged [User], not [M] or [S].
+
+| Fact | Used in |
+|---|---|
+| `app.secretStorage` exists since Obsidian 1.11.4, and the plugin's `minAppVersion` is 1.13.0 (`manifest.json:5`) | §3, §6.1 |
+| Mobile `SecureStorage` is backed by the iOS Keychain | §3, §6.1 |
+| `crypto.subtle` works on Obsidian iOS, because WKWebView treats `capacitor://localhost` as a secure context | §3, §4 |
+| The stock iOS Camera (iOS 11+) recognises a QR holding an `obsidian://` deep link and offers to open Obsidian | §3, §12.1, D5 |
+
+**Still open (WP-E0).** These need a human with devices, which is outside E1 and E2:
 
 | Platform | Run | Open question |
 |---|---|---|
-| Obsidian iOS (WKWebView) | `run-e2ee` in the worker and on main | Secure context and origin; throughput vs §16; zero-IV behaviour as on macOS |
-| | SecretStorage probe | Keychain-backed? Survives app restart and update? Value size limit (try 64 KiB)? `""` accepted? Readable while the device is locked (background sync)? |
-| | Camera app scanning an `obsidian://` QR | Opens Obsidian with the parameters intact? |
-| Obsidian Android (System WebView) | Same three runs | Keystore-backed? Google Lens / camera handling of custom schemes; low-end phone throughput |
+| Obsidian iOS (WKWebView) | `run-e2ee` in the worker and on main | Throughput vs §16; zero-IV behaviour as on macOS |
+| | SecretStorage probe | Is the Keychain item readable while the device is locked (background sync)? Value size limit (try 64 KiB)? Is `""` accepted? Does it survive app restart and update? |
+| | Camera app scanning an `obsidian://` QR | Do the parameters arrive intact? (The hand-off itself is [User].) |
+| Obsidian Android (System WebView) | Same three runs | Keystore-backed? Camera / Google Lens handling of custom schemes; low-end phone throughput |
 | Obsidian desktop (Electron) macOS, Windows | `run-e2ee`, SecretStorage probe | safeStorage availability; throughput (expected ≈ Chrome) |
 | Obsidian desktop Linux, with and without a keyring | SecretStorage probe | Plaintext fallback and `msgSecretsNotEncrypted` as read in the asar |
+| Obsidian `requestUrl`, desktop and mobile | Send `POST /claim` with `Origin: <host>` | Is the header sent as set? (§15.1; server ask A11 if not) |
 | Cloudflare (not a device) | Restore after `deleteAll()` | Can PITR bring back a deleted vault's rows (§15.2)? Not stated in [CF-PITR] |
 
-The Obsidian app binary was never launched for this design. Every Obsidian fact above is [S] from read-only files
-or [U].
+The Obsidian app binary was never launched for this design. Every Obsidian fact above is [S] from read-only files,
+[User], or [U].
 
 ## 24. References
 

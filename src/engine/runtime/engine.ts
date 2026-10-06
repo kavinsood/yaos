@@ -123,11 +123,12 @@ export class LogEngine {
 		const c = new EngineCtx(opts);
 		const { storage } = opts.ports;
 		const ident = { vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion };
-		let o = await Repo.open(storage, ident, c.now());
+		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null };
+		let o = await Repo.open(storage, ident, c.now(), openOpts);
 		if (!o.repo) {
 			o.db.close();
 			await storage.deleteDatabase(o.db.name);
-			o = await Repo.open(storage, ident, c.now());
+			o = await Repo.open(storage, ident, c.now(), openOpts);
 			if (!o.repo) throw new EngineStartError("db-identity");
 		}
 		const repo = o.repo;
@@ -136,6 +137,8 @@ export class LogEngine {
 		c.repo = repo;
 		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.cfg = new CfgRuntime(repo, c.self, c.tuning.nsCandidateModulus);
+		c.ns.frameNoFloor = repo.frameNoFloor.ns;
+		c.cfg.frameNoFloor = repo.frameNoFloor.cfg;
 		c.docs = new DocRuntime(c);
 		c.handles = new HandleManager(repo, c.budgets, c.docs.hooks());
 		c.sender = new Sender({
@@ -420,7 +423,7 @@ export class LogEngine {
 		for (const h of c.handles.all()) if (!h.builder.empty) return false;
 		if (c.outbox.unreceipted() > 0) return false;
 		for (const r of c.outbox.values()) if (r.state === "held") return false;
-		for (const r of c.repo.streams()) if (r.stale && r.cls !== "other" && !(r.frozen && r.frozenReason === "checkpoint-disputed")) return false;
+		for (const r of c.repo.streams()) if (r.stale && r.cls !== "other" && r.cls !== "keyring" && !(r.frozen && r.frozenReason === "checkpoint-disputed")) return false;
 		return c.repo.cursor.headSeqSeen <= c.repo.cursor.vaultSeq;
 	}
 

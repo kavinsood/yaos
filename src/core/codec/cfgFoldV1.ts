@@ -6,6 +6,8 @@
  *   varuint coversSeq
  *   varuint deviceCount, deviceCount x (ascending deviceId)
  *     varstring deviceId, varuint n (1..64), n x varstring clientFrameId (oldest first)
+ *   varuint replayCount, replayCount x (ascending deviceId; e2ee-design §8.2)
+ *     varstring deviceId, varuint r, 8 bytes bitmap (big-endian, bit i = frameNo r - i)
  *   varuint jsonCount,   jsonCount x (ascending key = file + "\0" + topLevelKey)
  *     varstring key, u8 present, [varstring valueJson], version
  *   varuint fileCount,   fileCount x (ascending path)
@@ -17,7 +19,7 @@
 
 import type { CfgFileContent, CfgFoldState, CfgRegister, CfgVersion, ConfigRelPath, DeviceId } from "../types";
 import { CodecError, Reader, Writer } from "./lib0";
-import { readRings, sortedKeys, writeRings } from "./nsFoldV1";
+import { readReplay, readRings, sortedKeys, writeReplay, writeRings } from "./nsFoldV1";
 import { readCfgFileContent, writeCfgFileContent } from "./cfgOps";
 
 export const CFG_FOLD_FORMAT_VERSION = 1;
@@ -62,6 +64,7 @@ export function encodeCfgFoldV1(state: CfgFoldState): Uint8Array {
 	const w = new Writer(256);
 	w.varuint(state.formatVersion).varuint(state.coversSeq);
 	writeRings(w, state.recentFrames);
+	writeReplay(w, state.replay);
 	writeSection(w, state.json, (w, v) => { w.varstring(v); });
 	writeSection<FileValue>(w, state.files, (w, v) => {
 		writeCfgFileContent(w, v.content);
@@ -77,6 +80,7 @@ export function decodeCfgFoldV1Strict(bytes: Uint8Array): CfgFoldState {
 	if (formatVersion !== CFG_FOLD_FORMAT_VERSION) throw new CodecError(`unsupported cfgFold formatVersion ${formatVersion}`);
 	const coversSeq = r.varuint();
 	const recentFrames = readRings(r);
+	const replay = readReplay(r);
 	const json = readSection(r, (r) => r.varstring());
 	const files = readSection<FileValue>(r, (r) => {
 		const content = readCfgFileContent(r);
@@ -89,7 +93,7 @@ export function decodeCfgFoldV1Strict(bytes: Uint8Array): CfgFoldState {
 		return b === 1;
 	});
 	r.end();
-	return { formatVersion: 1, coversSeq, recentFrames, json, files, plugins };
+	return { formatVersion: 1, coversSeq, recentFrames, replay, json, files, plugins };
 }
 
 export function decodeCfgFoldV1(bytes: Uint8Array): CfgFoldState | null {

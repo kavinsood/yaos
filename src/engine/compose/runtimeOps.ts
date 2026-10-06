@@ -12,6 +12,7 @@ import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { encodeStateAsUpdate } from "../body/yjsCounters";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
+import type { FrameNoFloor } from "../store/repo";
 import { dbName, STORE } from "../store/schema";
 import { readBase } from "../reconcile/store";
 import type { VaultRuntime } from "./vaultRuntime";
@@ -180,6 +181,12 @@ export async function prepareEpochMigration(rt: VaultRuntime): Promise<Map<PathK
 		if (text !== null) bases.set(pathKey(s.path), text);
 	}
 	return bases;
+}
+
+/** §c.12 step 3 (e2ee-design §8.2): the highest own ns / cfg frameNo, carried into the new epoch's DB. */
+export function ownFrameNoFloor(rt: VaultRuntime): FrameNoFloor {
+	const c = rt.log.c;
+	return { ns: c.ns.maxOwnFrameNo(c.outbox), cfg: c.cfg.maxOwnFrameNo(c.outbox) };
 }
 
 /** §c.12 step 6: the new epoch reached live; delete the old DB. */

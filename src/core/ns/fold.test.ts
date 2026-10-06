@@ -12,6 +12,7 @@ import { buildIndex } from "./index";
 import { checkNsInvariants, verifyNsCheckpoint, verifyNsFoldBytes, verifyNsFoldState } from "./verify";
 import { checkDigest, isCandidateSeq, nsFoldDigest, recordDigest } from "./candidate";
 import { overlayPending } from "./overlay";
+import { replayBitsToBytes } from "../replayWindow";
 
 const H = (n: number) => n.toString(16).padStart(2, "0").repeat(32) as ContentHash;
 const D = (s: string) => (s + "_".repeat(22)).slice(0, 22) as DocId;
@@ -33,8 +34,10 @@ const setBlob = (docId: DocId, hash: ContentHash, baseRev: number, size = 5): Ns
 function world(rules: NsFoldRules = DEFAULT_NS_FOLD_RULES) {
 	const state = newNsFoldState();
 	const index = newNsFoldIndex();
-	const fold = (seq: number, deviceId: DeviceId, authorNsSeq: number, ops: NsOp[], clientFrameId: ClientFrameId = F()): NsFoldEvent[] => {
-		const ev = rules === DEFAULT_NS_FOLD_RULES ? [...foldNsFrame(state, index, { seq, deviceId, clientFrameId, authorNsSeq, ops })] : foldNsFrameWith(rules, state, index, { seq, deviceId, clientFrameId, authorNsSeq, ops });
+	// frameNo 0 skips the replay window (a gate-failed row); the window has its own test.
+	const fold = (seq: number, deviceId: DeviceId, authorNsSeq: number, ops: NsOp[], clientFrameId: ClientFrameId = F(), frameNo = 0): NsFoldEvent[] => {
+		const frame = { seq, deviceId, clientFrameId, frameNo, authorNsSeq, ops };
+		const ev = rules === DEFAULT_NS_FOLD_RULES ? [...foldNsFrame(state, index, frame)] : foldNsFrameWith(rules, state, index, frame);
 		assert.equal(checkNsInvariants(state, index, { tombstoneCap: rules.tombstoneCap }), null);
 		return ev;
 	};
@@ -329,11 +332,11 @@ test("E12 upgradeRules halt: frame folds whole or not at all", () => {
 	const w = world();
 	w.fold(9099, A, 0, [create(d1, "a.md")]);
 	const before = encodeNsFoldV1(w.state);
-	const ev = foldNsFrame(w.state, w.index, { seq: 9100, deviceId: A, clientFrameId: F(), authorNsSeq: 9099, ops: [create(d2, "b.md"), { t: "upgradeRules", version: 2 }] });
+	const ev = foldNsFrame(w.state, w.index, { seq: 9100, deviceId: A, clientFrameId: F(), frameNo: 5, authorNsSeq: 9099, ops: [create(d2, "b.md"), { t: "upgradeRules", version: 2 }] });
 	assert.ok(nsFoldHalted(ev));
 	assert.deepEqual(ev.map((e) => [e.index, e.docId, e.outcome]), [[1, null, ignored("rules-version")]]);
 	assert.equal(w.state.coversSeq, 9099);
-	assert.ok(bytesEqual(encodeNsFoldV1(w.state), before), "state unchanged");
+	assert.ok(bytesEqual(encodeNsFoldV1(w.state), before), "state unchanged (the halted frame's frameNo is not in the window)");
 	assert.ok(!nsFoldHalted(w.fold(9101, A, 0, [create(d3, "c.md")])));
 	// A reader that knows v2 applies it once; repeats are noops.
 	const v = world({ ...DEFAULT_NS_FOLD_RULES, knownRulesVersion: 2 });
@@ -341,6 +344,36 @@ test("E12 upgradeRules halt: frame folds whole or not at all", () => {
 	assert.equal(v.state.foldRulesVersion, 2);
 	assert.deepEqual(out(v.fold(2, A, 0, [{ t: "upgradeRules", version: 1 }])), ignored("noop"));
 	assert.deepEqual(out(v.fold(3, A, 0, [{ t: "upgradeRules", version: 2 }])), ignored("noop"));
+});
+
+test("replay window (e2ee-design §8.2): pre-scan, ring, window, ops; a rejected frame changes nothing but coversSeq", () => {
+	const w = world();
+	assert.equal(out(w.fold(1, A, 0, [create(d1, "a.md")], F(), 80)).kind, "applied");
+	// Halted frames never reach the window: the same frameNo folds later.
+	const before = encodeNsFoldV1(w.state);
+	assert.ok(nsFoldHalted(foldNsFrame(w.state, w.index, { seq: 2, deviceId: A, clientFrameId: F(), frameNo: 81, authorNsSeq: 1, ops: [{ t: "upgradeRules", version: 9 }] })));
+	assert.ok(bytesEqual(encodeNsFoldV1(w.state), before));
+	assert.equal(out(w.fold(3, A, 1, [create(d2, "b.md")], F(), 81)).kind, "applied");
+	// Duplicate frameNo under a fresh clientFrameId, then stale (<= r - 64): frame-level, index -1, no ops.
+	const snap = encodeNsFoldV1(w.state);
+	for (const [seq, no, reason] of [[4, 80, "replay-duplicate"], [5, 17, "replay-stale"]] as const) {
+		const fresh = F();
+		const ev = w.fold(seq, A, 1, [create(d3, "c.md")], fresh, no);
+		assert.deepEqual(ev.map((e) => [e.index, e.docId, e.outcome]), [[-1, null, ignored(reason)]]);
+		assert.ok(!w.state.recentFrames.get(A)!.includes(fresh));
+	}
+	assert.equal(w.state.coversSeq, 5);
+	const after = decodeNsFoldV1(encodeNsFoldV1(w.state))!;
+	assert.deepEqual([after.replay, after.recentFrames, after.entries.size], [decodeNsFoldV1(snap)!.replay, decodeNsFoldV1(snap)!.recentFrames, 2]);
+	// Ring first: a replayed clientFrameId reports duplicate-frame whatever its frameNo.
+	assert.deepEqual(out(w.fold(6, A, 1, [], w.state.recentFrames.get(A)![0]!, 18)), ignored("duplicate-frame"));
+	// Inside the window, out of order, accepted once.
+	assert.equal(out(w.fold(7, A, 1, [create(d3, "c.md")], F(), 18)).kind, "applied");
+	assert.deepEqual(out(w.fold(8, A, 1, [create(d4, "d.md")], F(), 18)), ignored("replay-duplicate"));
+	// Overlay: own pending frameNos fold through the same window on the clone.
+	const o = overlayPending(w.state, w.index, A, [{ clientFrameId: F(), frameNo: 82, authorNsSeq: 8, ops: [create(d4, "d.md")] }]);
+	assert.equal(o.state.replay.get(A)!.r, 82);
+	assert.equal(w.state.replay.get(A)!.r, 81);
 });
 
 test("malformed frames fold as empty (ring + coversSeq only); seq <= coversSeq is ignored", () => {
@@ -351,7 +384,7 @@ test("malformed frames fold as empty (ring + coversSeq only); seq <= coversSeq i
 	assert.equal(w.state.coversSeq, 1);
 	assert.deepEqual(w.state.recentFrames.get(A), [f]);
 	assert.equal(out(w.fold(2, A, 0, [create(d1, "a.md")], f)).kind, "ignored");
-	assert.deepEqual(foldNsFrame(w.state, w.index, { seq: 2, deviceId: B, clientFrameId: F(), authorNsSeq: 0, ops: [create(d2, "b.md")] }), []);
+	assert.deepEqual(foldNsFrame(w.state, w.index, { seq: 2, deviceId: B, clientFrameId: F(), frameNo: 1, authorNsSeq: 0, ops: [create(d2, "b.md")] }), []);
 	assert.equal(w.state.entries.size, 0);
 });
 
@@ -429,6 +462,9 @@ test("verify V1: canonical bytes pass; unsorted, duplicate, trailing and non-min
 			wr.varstring(d).varuint(ring.length);
 			for (const f of ring) wr.varstring(f);
 		}
+		const replayDevices = [...s.replay.keys()].sort();
+		wr.varuint(replayDevices.length);
+		for (const d of replayDevices) wr.varstring(d).varuint(s.replay.get(d)!.r).raw(replayBitsToBytes(s.replay.get(d)!.bits));
 		return wr.finish();
 	};
 	assert.ok(bytesEqual(raw(w.state, [d1, d2, d3], [A, B]), bytes), "raw helper matches the encoder");
@@ -501,8 +537,8 @@ test("overlay folds pending frames on a clone; committed state untouched", () =>
 	w.fold(5, A, 0, [create(d1, "Notes/a.md"), create(d2, "Notes/b.md", H(2))]);
 	const before = encodeNsFoldV1(w.state);
 	const o = overlayPending(w.state, w.index, B, [
-		{ clientFrameId: F(), authorNsSeq: 5, ops: [create(d3, "Notes/a.md", H(3))] },
-		{ clientFrameId: F(), authorNsSeq: 5, ops: [rename(d1, "notes/a.md")] },
+		{ clientFrameId: F(), frameNo: 1, authorNsSeq: 5, ops: [create(d3, "Notes/a.md", H(3))] },
+		{ clientFrameId: F(), frameNo: 2, authorNsSeq: 5, ops: [rename(d1, "notes/a.md")] },
 	]);
 	assert.ok(bytesEqual(encodeNsFoldV1(w.state), before));
 	assert.equal(checkNsInvariants(w.state, w.index), null);

@@ -1,28 +1,29 @@
 /**
  * Client envelope carried in every relay payload (frames and checkpoints).
  * Types, wire constants and tiny pure helpers only; the codec lives in
- * src/core/codec/envelope.ts (WP-A). Byte layout: DESIGN §b.
+ * src/core/codec/envelope.ts (WP-A). Byte layout: DESIGN §b, e2ee-design §7.
  *
  *   outer (plaintext, AAD-bound):
  *     u8      formatVersion   = ENVELOPE_FORMAT_VERSION
- *     u8      cryptoSuite     (0 = none)
- *     varuint keyEpoch        (0 when suite = 0)
- *     bytes   sealed          (suite 0: inner verbatim)
- *   inner (after CryptoPort.open):
+ *     u8      cryptoSuite     (0 = none, 1 = aes256gcm)
+ *     varuint keyEpoch        (0 iff suite = 0)
+ *     bytes   sealed          (suite 0: inner verbatim; suite 1: AEAD of inner ‖ Padmé pad)
+ *   inner (after CryptoPort.open and, for suite ≠ 0, unpad):
  *     u8      kind            (EnvelopeKindCode)
  *     varuint authorNsSeq
  *     varuint flags           (EnvelopeFlag bits)
+ *     varuint frameNo         (nsOps/cfgOps: per-(device, stream) counter ≥ 1; every other kind 0)
  *     bytes   content         (kind-specific, see below)
  */
 
-import type { ClientFrameId, ContentHash, Seq, StreamName } from "./types";
+import type { ClientFrameId, ContentHash, DeviceId, Seq, StreamName } from "./types";
 
 export const ENVELOPE_FORMAT_VERSION = 1;
 
 export const CryptoSuite = {
 	none: 0,
-	/** Reserved: XChaCha20-Poly1305 with per-vault key epochs. */
-	xchacha20poly1305: 1,
+	/** AES-256-GCM over WebCrypto with per-vault key epochs (e2ee-design §4.1). Id 1 was a never-shipped reservation. */
+	aes256gcm: 1,
 } as const;
 export type CryptoSuite = (typeof CryptoSuite)[keyof typeof CryptoSuite];
 
@@ -61,7 +62,14 @@ export interface InnerEnvelope {
 	readonly kind: EnvelopeKind;
 	readonly authorNsSeq: Seq;
 	readonly flags: number;
+	/** Replay counter (e2ee-design §8.2): ≥ 1 for nsOps and cfgOps, 0 for every other kind. */
+	readonly frameNo: number;
 	readonly content: Uint8Array;
+}
+
+/** Kinds that carry a frameNo ≥ 1 and pass the fold's replay window (e2ee-design §8.2). */
+export function kindHasFrameNo(kind: EnvelopeKind): boolean {
+	return kind === "nsOps" || kind === "cfgOps";
 }
 
 /**
@@ -132,15 +140,27 @@ export interface BodyUpdateRefContent {
 	readonly size: number;
 }
 
-/** What the AAD binds. Frames bind clientFrameId; checkpoints bind coversSeq. */
+/**
+ * What the AAD binds besides the header (e2ee-design §7.2). Frames bind the
+ * author's deviceId and clientFrameId; checkpoints bind coversSeq.
+ */
 export type EnvelopeBinding =
-	| { readonly t: "frame"; readonly stream: StreamName; readonly clientFrameId: ClientFrameId }
+	| { readonly t: "frame"; readonly stream: StreamName; readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId }
 	| { readonly t: "checkpoint"; readonly stream: StreamName; readonly coversSeq: Seq };
 
-/** Result of the ingest gate's envelope stage (DESIGN §d.6). */
+/**
+ * Envelope-stage failures (DESIGN §d.6, e2ee-design §9.2). "suite-downgrade":
+ * a suite-1 reader got suite-0 bytes; "bad-padding": a valid tag over bad
+ * Padmé padding. Replay is a fold decision, not an open failure.
+ */
+export type EnvelopeOpenFailure =
+	| "malformed" | "unsupported-version" | "unsupported-suite" | "suite-downgrade"
+	| "unknown-key" | "auth-failed" | "bad-padding" | "kind-stream-mismatch";
+
+/** Result of the ingest gate's envelope stage. `header` is present on failures once the outer header decoded. */
 export type EnvelopeOpenResult =
 	| { readonly ok: true; readonly header: EnvelopeHeader; readonly inner: InnerEnvelope }
-	| { readonly ok: false; readonly reason: "malformed" | "unsupported-version" | "unsupported-suite" | "unknown-key" | "auth-failed" | "kind-stream-mismatch" };
+	| { readonly ok: false; readonly reason: EnvelopeOpenFailure; readonly header?: EnvelopeHeader };
 
 /** Which envelope kinds a stream class may carry. Anything else is quarantined. */
 export const ALLOWED_KINDS: Readonly<Record<"ns" | "cfg" | "body" | "canvas" | "blobchunk", readonly EnvelopeKind[]>> = {
@@ -151,6 +171,12 @@ export const ALLOWED_KINDS: Readonly<Record<"ns" | "cfg" | "body" | "canvas" | "
 	blobchunk: ["blobChunk", "checkpoint"],
 };
 
-/** AAD prefix for frames and checkpoints (UTF-8). */
-export const AAD_FRAME_PREFIX = "yaos/f1";
-export const AAD_CHECKPOINT_PREFIX = "yaos/c1";
+/** AAD prefixes for frames and checkpoints (UTF-8, e2ee-design §7.2). */
+export const AAD_FRAME_PREFIX = "yaos/f2";
+export const AAD_CHECKPOINT_PREFIX = "yaos/c2";
+/** AAD prefix of suite-1 sealed blobs (e2ee-design §7.2, §10.2). */
+export const AAD_BLOB_PREFIX = "yaos/b2";
+/** AAD prefix of k-record key wraps (e2ee-design §11.2). */
+export const AAD_KEYRING_PREFIX = "yaos/k2";
+/** Sealed-blob format byte (e2ee-design §10.2). */
+export const BLOB_FORMAT_VERSION = 1;
