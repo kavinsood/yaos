@@ -1,0 +1,33 @@
+src/core/limits.ts
+  s_27aea4557efbc1::t_dc66e034066459 116-124
+src/engine/settings/allowlist.ts
+  s_27aea4557efbc1::t_5934fee03cc7d8 114-117,119-121,123
+src/engine/settings/cfgHolds.test.ts
+  s_27aea4557efbc1::t_16214f5a64b8c6 1-184
+src/engine/settings/cfgNotices.ts
+  s_27aea4557efbc1::t_4c8f4d8b248764 1-143
+src/engine/settings/cfgPlan.ts
+  s_27aea4557efbc1::t_f0ed5914ff8407 18-23,29,40-43,68-73,84-103,114,118,122-128,132-138,168-175,289-290,294-295
+src/engine/settings/cfgSync.ts
+  s_27aea4557efbc1::t_0d89198274bbb2 11-16,30,32-35,59-60,73-77,81-83,86-87,89-91,95,112-114,117-123,128-129,142-144,147-150,176-183
+src/engine/settings/clash.ts
+  s_27aea4557efbc1::t_31c5ef2c5fec1a 1-52
+src/engine/settings/testkit.ts
+  s_27aea4557efbc1::t_4dd897886d5af5 39,50,91,93,105-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "59c7bea50084d2c8e99bcc7a98ed1cc45ab78ffd",
+  "prompts": {},
+  "sessions": {
+    "s_27aea4557efbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2f141519dac0ecc1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
