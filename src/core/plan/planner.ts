@@ -13,6 +13,8 @@
  *   - remoteTextHash: streams.textHash of caught-up md/canvas docs
  *   - bodyAppliedSeq: streams.appliedSeq (nsDelete.baseBodySeq)
  *   - restoreDuty: docs whose restore condition + own duty hold (§c.7)
+ *   - lostCreateBody: live docs this device created whose initial body never reached the relay
+ *     and is no longer pending here (store lost)
  *
  * Decisions (also in docs/client-remake/wp-b-notes.md):
  *   - createSize is not in RemoteEntry: "createSize = 0" is tested as
@@ -45,6 +47,10 @@
  *     md/canvas reconciles whose remote hash is known and differs. 3-way merges
  *     are not counted (they are usually clean).
  *   - Identical-loser collapse nsDeletes are not counted as destructive.
+ *   - A lost create body (own create, no rows, nothing pending, e.g. the store was wiped with its
+ *     mirrors) is not waited on as "body-empty": nobody else can supply it. A file at the path is
+ *     the content (reconcileContent; the empty CRDT is the base, so the disk text is pushed). With no
+ *     file there the empty doc is deleted (braked like a local delete).
  */
 
 import type {
@@ -70,6 +76,7 @@ export interface PlannerContext {
 	readonly remoteTextHash: ReadonlyMap<DocId, ContentHash>;
 	readonly bodyAppliedSeq: ReadonlyMap<DocId, Seq>;
 	readonly restoreDuty: ReadonlySet<DocId>;
+	readonly lostCreateBody: ReadonlySet<DocId>;
 	/** Paths with a path-keyed base carried over an epoch migration (§c.12). */
 	readonly pathBaseKeys: ReadonlySet<PathKey>;
 }
@@ -83,6 +90,7 @@ export const DEFAULT_PLANNER_CONTEXT: PlannerContext = {
 	remoteTextHash: new Map(),
 	bodyAppliedSeq: new Map(),
 	restoreDuty: new Set(),
+	lostCreateBody: new Set(),
 	pathBaseKeys: new Set(),
 };
 
@@ -508,7 +516,11 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 			if (r.kind === "blob") return push([{ op: "diskMaterialize", docId, path: r.path, expect: { t: "absent" } }]);
 			if (!r.body || !r.body.caughtUp) return push([waitOp(docId, "body-not-caught-up")]);
 			if (r.body.hasContent || r.createHash === EMPTY_CONTENT_HASH) return push([{ op: "diskMaterialize", docId, path: r.path, expect: { t: "absent" } }]);
-			return push([waitOp(docId, "body-empty")]);
+			if (!ctx.lostCreateBody.has(docId)) return push([waitOp(docId, "body-empty")]);
+			// Own create whose content is gone with the store and its file: drop the empty doc.
+			if (!ctx.nsReady || !input.localComplete || unhashedFresh) return;
+			if (r.pendingLocal) return push([waitOp(docId, "pending-ns")]);
+			return push([{ op: "nsDelete", docId, baseBodySeq: 0 }], "nsDelete", brakeKey("nsDelete", docId, r.path, r.createHash), r.path);
 		}
 		claimed.add(key);
 		if (l.hash === null) return push([{ op: "needHash", path: l.path }]);
@@ -533,8 +545,8 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 			], "conflict", brakeKey("conflict", docId, l.path, `${l.hash}|${rb.hash}`), l.path);
 		}
 		if (!r.body || !r.body.caughtUp) return push([waitOp(docId, "body-not-caught-up")]);
-		if (!r.body.hasContent && r.createHash !== EMPTY_CONTENT_HASH) return push([waitOp(docId, "body-empty")]);
-		const rh = remoteHash(r);
+		if (!r.body.hasContent && r.createHash !== EMPTY_CONTENT_HASH && !ctx.lostCreateBody.has(docId)) return push([waitOp(docId, "body-empty")]);
+		const rh = ctx.lostCreateBody.has(docId) ? EMPTY_CONTENT_HASH : remoteHash(r); // a lost create body merges as disk-only
 		const certainConflict = rh !== null && rh !== l.hash && rh !== EMPTY_CONTENT_HASH;
 		push([{ op: "reconcileContent", docId, path: l.path, kind: r.kind as ContentKind, hasBase: false }],
 			certainConflict ? "conflict" : null, certainConflict ? brakeKey("conflict", docId, l.path, `${l.hash}|${rh}`) : "", l.path);

@@ -156,6 +156,7 @@ export class Reconciler {
 		const plan = planWith(input, {
 			pathKey: ctx.pk, nsReady: view.nsReady, divergence: view.divergence, brakeWindow: ctx.window(),
 			tzOffsetMinutes: ctx.deps.tzOffsetMinutes?.() ?? 0, remoteTextHash: view.textHash, bodyAppliedSeq: view.appliedSeq, restoreDuty: view.restoreDuty,
+			lostCreateBody: view.lostCreateBody,
 			...(ctx.deps.pathBaseKeys ? { pathBaseKeys: ctx.deps.pathBaseKeys } : {}),
 		});
 		this.lastPlan = plan.ops;

@@ -354,6 +354,27 @@ test("row live/absent/present: md -> reconcileContent(no base); blob equal -> ad
 	assert.deepEqual(opsOf(run({ remote: [R("d1", "a.md", { body: { ...body, hasContent: false } })], local: [L("a.md", h("c3"))] })), ["wait"]);
 });
 
+test("lost create body (own create, no rows, nothing pending, no synced record): push the file, or drop the empty doc", () => {
+	// Sim heavy seeds 17, 90, 194: the creator's store (and mirrors) went before its initial frames were acked;
+	// every device then waited "body-empty" forever, with the text only on the creator's disk.
+	const empty = { ...R("d1", "a.md").body!, hasContent: false, version: V(0) };
+	const lost = { lostCreateBody: new Set([id("d1")]) };
+	const present = { remote: [R("d1", "a.md", { body: empty })], local: [L("a.md", h("c3"))] };
+	assert.deepEqual(run(present).ops, [{ op: "wait", docId: "d1", reason: "body-empty" }]);
+	const push = run(present, lost);
+	assert.deepEqual(push.ops, [{ op: "reconcileContent", docId: "d1", path: "a.md", kind: "markdown", hasBase: false }]);
+	assert.equal(push.brake, null);
+	// The file is gone too (moved or deleted while the store was down): the empty doc is deleted.
+	const absent = { remote: [R("d1", "a.md", { body: empty })] };
+	assert.deepEqual(run(absent).ops, [{ op: "wait", docId: "d1", reason: "body-empty" }]);
+	assert.deepEqual(run(absent, lost).ops, [{ op: "nsDelete", docId: "d1", baseBodySeq: 0 }]);
+	assert.deepEqual(run({ ...absent, over: { localComplete: false } }, lost).ops, []);
+	assert.deepEqual(run(absent, { ...lost, nsReady: false }).ops, []);
+	assert.deepEqual(run({ remote: [R("d1", "a.md", { body: empty, pendingLocal: true })] }, lost).ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }]);
+	// A moved file is a new doc next to the delete.
+	assert.deepEqual(opsOf(run({ ...absent, local: [L("b.md", h("c3"))] }, lost)), ["nsDelete", "nsCreate", "reconcileContent"]);
+});
+
 // ---------------------------------------------------------------------------
 // Row: absent | absent | present ; frozen ; needHash
 // ---------------------------------------------------------------------------

@@ -34,6 +34,8 @@ export interface RemoteView {
 	readonly docsWithPendingBody: ReadonlySet<DocId>;
 	/** Restore duty (§c.7) beyond docsWithPendingBody. */
 	readonly restoreDuty: ReadonlySet<DocId>;
+	/** Live docs this device created whose initial body reached no one and is no longer pending here (store lost). */
+	readonly lostCreateBody: ReadonlySet<DocId>;
 	/** streams.textHash of caught-up md/canvas docs. */
 	readonly textHash: ReadonlyMap<DocId, ContentHash>;
 	/** streams.appliedSeq per doc (nsDelete.baseBodySeq). */

@@ -76,6 +76,8 @@ export class StubLog implements LogPort {
 	/** An own create onto a live create with the same kind and hash folds as `merged` (§c.5 identical duplicate). */
 	mergeIdentical = false;
 	nsReady = true;
+	/** RemoteView.lostCreateBody as the test sets it. */
+	lostCreateBody = new Set<DocId>();
 	divergence = false;
 	/** S1 hook (Reconciler.applyOwnFold). */
 	onOwnFold: ((events: readonly OwnFoldEvent[]) => Promise<void>) | null = null;
@@ -287,7 +289,7 @@ export class StubLog implements LogPort {
 		}
 		return {
 			remote, remoteByPathKey: byKey, nsCoversSeq: this.seq, nsReady: this.nsReady, divergence: this.divergence,
-			docsWithPendingBody, restoreDuty: new Set(), textHash, appliedSeq,
+			docsWithPendingBody, restoreDuty: new Set(), lostCreateBody: this.lostCreateBody, textHash, appliedSeq,
 		};
 	}
 

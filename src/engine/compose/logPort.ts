@@ -10,6 +10,7 @@
 
 import type { BlobChunkContent } from "../../core/envelope";
 import { markdownContentHash } from "../../core/hash/markdownLf";
+import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import { canvasDocHash } from "../reconcile/canvasDoc";
 import type {
 	BodyVersion, CfgFoldState, CfgOp, ContentHash, DocId, NsOp, PathKey, RemoteEntry, Seq, StreamName,
@@ -48,6 +49,9 @@ export class ComposedLog implements LogPort {
 		const textHash = new Map<DocId, ContentHash>();
 		const appliedSeq = new Map<DocId, Seq>();
 		const restoreDuty = new Set<DocId>();
+		const lostCreateBody = new Set<DocId>();
+		const pending = log.docsWithPendingBody();
+		for (const h of c.handles.all()) if (!h.builder.empty) pending.add(h.docId);
 		for (const e of ns.state.entries.values()) {
 			const body = e.kind === "blob" ? null : log.bodyInfo(e.docId, e.kind);
 			remote.set(e.docId, {
@@ -62,19 +66,21 @@ export class ComposedLog implements LogPort {
 			// Fallback duty, here without the 30 s grace (integration-notes deviation): rows exist
 			// past the delete base, so some edit was not seen by the deleter whoever authored it.
 			if (e.state === "deleted" && rec && (rec.lastOwnSeq > e.deleteBaseBodySeq || rec.remoteHeadSeq > e.deleteBaseBodySeq)) restoreDuty.add(e.docId);
+			// Own create, ns and stream heads read in this session, no row anywhere and no own frame left: the
+			// initial body was lost with this device's store (wipe, mirror lag). Nobody else can supply it.
+			if (this.nsCaughtUp && e.state === "live" && e.createdBy === c.self && body.caughtUp && !body.hasContent
+				&& e.createHash !== EMPTY_CONTENT_HASH && !pending.has(e.docId)) lostCreateBody.add(e.docId);
 			if (body.caughtUp && e.state === "live") {
 				const h = this.residentHash(e.docId, e.kind as "markdown" | "canvas", body.stream, body.version);
 				if (h) textHash.set(e.docId, h);
 			}
 		}
 		for (const [key, id] of ns.index.byPathKey) remoteByPathKey.set(key, id);
-		const pending = log.docsWithPendingBody();
-		for (const h of c.handles.all()) if (!h.builder.empty) pending.add(h.docId);
 		this.memo = {
 			remote, remoteByPathKey, nsCoversSeq: ns.coversSeq,
 			nsReady: this.nsCaughtUp && ns.halted === null && !ns.overlayHalted,
 			divergence: false,
-			docsWithPendingBody: pending, restoreDuty, textHash, appliedSeq,
+			docsWithPendingBody: pending, restoreDuty, lostCreateBody, textHash, appliedSeq,
 		};
 		return this.memo;
 	}
