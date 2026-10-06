@@ -1,4 +1,4 @@
-/** Confirmation dialog. Ported from legacy-src/ui/ConfirmModal.ts. */
+/** Confirmation dialog. Ported from the old client (adfa7a7:src/ui/ConfirmModal.ts). */
 
 import { Modal, type App } from "obsidian";
 

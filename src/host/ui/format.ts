@@ -1,6 +1,6 @@
 /**
  * Small formatting helpers for UI copy. Pure: no obsidian runtime, no DOM.
- * Ported in part from legacy-src/utils/format.ts (formatUnknown).
+ * Ported in part from the old client (adfa7a7:src/utils/format.ts, formatUnknown).
  */
 
 const MAX_ERROR_CHARS = 300;

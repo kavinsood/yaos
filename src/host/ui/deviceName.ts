@@ -1,5 +1,5 @@
 /**
- * Default human label for this device. Ported from legacy-src/utils/defaultDeviceName.ts.
+ * Default human label for this device. Ported from the old client (adfa7a7:src/utils/defaultDeviceName.ts).
  * The parameter is structurally compatible with obsidian's `Platform` constant.
  */
 

@@ -56,7 +56,7 @@ test("hygiene: imports stay within core / ports / protocol / engine and yjs, lib
 			if (spec.startsWith(".")) {
 				const target = resolve(dirname(f.path), spec);
 				if (!allowedDirs.some((d) => target === d || target.startsWith(d + "/"))) problems.push(`${f.rel}: ${spec}`);
-				if (/legacy-src|\/host\//.test(target)) problems.push(`${f.rel}: ${spec}`);
+				if (/\/host\//.test(target)) problems.push(`${f.rel}: ${spec}`);
 				if (!f.rel.startsWith("adapters/") && target.startsWith(join(ENGINE, "adapters") + "/") && !/adapters\/(noopCrypto|webHash|webClock|webRandom|webEngine)$/.test(target)) {
 					problems.push(`${f.rel}: engine core imports adapter ${spec}`);
 				}
