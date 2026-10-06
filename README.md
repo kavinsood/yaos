@@ -73,9 +73,13 @@ Recovery points can be captured in the background, browsed by path, and selectiv
 
 Obsidian vaults remain ordinary local files. Changes made by editors, scripts, Git tools, or agents enter the same reconciliation path and can synchronize across enrolled devices.
 
-## Hosting
+## Hosting: Cloudflare only
 
-YAOS runs only on Cloudflare: one Worker with Durable Objects, plus an optional R2 bucket. There is no self-hosted Node or Docker server and no headless CLI client.
+YAOS runs only on Cloudflare: one Worker with two Durable Object classes (a `VaultDO` per vault and one `ConfigDO` per server), plus an optional R2 bucket for attachments. There is no self-hosted Node or Docker server and no headless CLI client. The server core sits behind small storage, socket and clock ports so its tests run on Node; that is a test seam, not a hosting option.
+
+The server is an opaque relay. It never interprets payloads, checkpoints, stream names or blob contents.
+
+Moving from a pre-rewrite server is a fresh deployment, not an upgrade. There is no data migration: the deploy's Durable Object migration deletes the old classes (`VaultSyncServer`, `ServerConfig`, `RecoveryJob`) together with their stored data, the new server starts unclaimed, and each device re-seeds it from its local files.
 
 ## Troubleshooting
 
