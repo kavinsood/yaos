@@ -8,7 +8,8 @@ import type { NodeSqliteStorage, SqliteRowValue } from "./nodeSqliteStorage";
 
 /** Local workerd's rejection of `getBookmarkForTime` (measured on wrangler dev; see vault/host.ts). */
 export const PITR_UNSUPPORTED_MESSAGE = "This Durable Object's storage back-end does not implement point-in-time recovery.";
-/** Cloudflare's rejection of a time before the object's PITR history (measured on scratch-3; see vault/host.ts). */
+/** Cloudflare's rejections before the object's first snapshot and of a time before it (scratch-3; see vault/host.ts). */
+export const PITR_NO_HISTORY_MESSAGE = "This database has no history.";
 export const PITR_BEFORE_HISTORY_MESSAGE = "Requested time is before this database existed.";
 
 interface TableCopy {
@@ -56,6 +57,7 @@ export class FakePitr implements PitrPort {
 	getBookmarkForTime(at: number): Promise<string> {
 		this.calls.push("getBookmarkForTime");
 		if (this.unsupported) return Promise.reject(new Error(PITR_UNSUPPORTED_MESSAGE));
+		if (this.captures.length === 0) return Promise.reject(new Error(PITR_NO_HISTORY_MESSAGE));
 		const capture = this.captures.filter((entry) => entry.at <= at).at(-1);
 		return capture ? Promise.resolve(capture.bookmark) : Promise.reject(new Error(PITR_BEFORE_HISTORY_MESSAGE));
 	}

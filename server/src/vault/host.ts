@@ -78,12 +78,14 @@ export function isPitrUnsupportedError(error: unknown): boolean {
 }
 
 /**
- * Cloudflare rejects a time its PITR history of the object does not reach with "Requested time is before this database
- * existed." (measured on scratch-3: an `at` 11 s after the vault's init was still refused 20 min later). Retrying
- * cannot help and nothing was done to the vault, so D8b's `400 invalid_restore_point` (G42).
+ * Cloudflare's PITR history of an object starts with its first snapshot, 45–55 s after the vault's init (measured on
+ * scratch-3, P5). Before that snapshot `getBookmarkForTime` rejects with "This database has no history."; a time before
+ * it, with "Requested time is before this database existed." Neither `at` becomes reachable on a retry and nothing was
+ * done to the vault, so D8b's `400 invalid_restore_point` (G42).
  */
 export function isPitrBeforeHistoryError(error: unknown): boolean {
-	return error instanceof Error && error.message.includes("before this database existed");
+	return error instanceof Error && (error.message.includes("before this database existed")
+		|| error.message.includes("database has no history"));
 }
 
 export interface VaultMeta {

@@ -435,7 +435,7 @@ s.test("D8b flag: 60 s of 503 restore_in_progress on device routes and enroll, u
 
 // ---- errors -------------------------------------------------------------------------------------------------------
 
-s.test("D8b errors: 400 invalid_restore_point (step 0, before the vault or its PITR history), 404 unknown_vault", async () => {
+s.test("D8b errors: 400 invalid_restore_point (step 0, before the vault, before or without PITR history), 404 unknown_vault", async () => {
 	await withWorld(async (world) => {
 		const sc = await scenario(world);
 		const now = world.config.clock.now;
@@ -474,6 +474,14 @@ s.test("D8b errors: 400 invalid_restore_point (step 0, before the vault or its P
 		const unknown = await press(world, sc.cookie, "AAAAAAAAAAAAAAAAAAAAAA", sc.atIso);
 		assert.deepEqual([unknown.status, await json(unknown)], [404, { error: "unknown_vault" }]);
 		assert.equal((await press(world, "x".repeat(43), sc.vaultId, sc.atIso)).status, 401);
+	}, PITR);
+	// Before the vault's first snapshot: Cloudflare has no history at all.
+	await withWorld(async (world) => {
+		const { cookie, vaultId } = await claim(world);
+		advance(world, 5000);
+		const response = await press(world, cookie, vaultId, new Date(world.config.clock.now - 1000).toISOString());
+		assert.deepEqual([response.status, await json(response)], [400, { error: "invalid_restore_point" }], "no history");
+		assert.equal(journalRows(world), 0, "the journal row is dropped");
 	}, PITR);
 });
 

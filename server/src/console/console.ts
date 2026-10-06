@@ -35,7 +35,7 @@ export const CONSOLE_MESSAGES: Readonly<Record<string, string>> = {
 	purge_incomplete: "The vault is closed, but some attachments are not removed yet. Press Delete vault again to finish.",
 	restore_in_progress: "A restore of this vault has not finished. Pairing, revoking and resetting wait for it; press Restore to resume it.",
 	restore_incomplete: "The restore started but has not finished. The server finishes it on its own within about a minute, or press Restore to resume it now.",
-	invalid_restore_point: "That restore point is not usable. Enter an ISO 8601 time within the last 30 days, after the vault was created and not in the future.",
+	invalid_restore_point: "That restore point is not usable. Enter an ISO 8601 time within the last 30 days, not in the future and at least a minute after the vault was created (Cloudflare keeps no earlier history).",
 	restore_unsupported: "This server cannot restore: Cloudflare point-in-time recovery is not available here (local development).",
 	cf_daily_limit: "The Cloudflare free-plan daily limit is used up. Try again after it resets.",
 	not_found: "That vault or device no longer exists. Reload the page.",
@@ -199,12 +199,12 @@ function vaultCard(v, pending) {
     const t = Date.parse(at.value.trim());
     if (!Number.isFinite(t)) return say("Restore: " + MESSAGES.invalid_restore_point, "err");
     const point = new Date(t).toISOString();
-    if (!confirm("Restore " + label + " to " + point + "? Synced content written after that point is discarded on the server.")) return;
+    if (!confirm("Restore " + label + " to Cloudflare's last snapshot at or before " + point + "? Synced content written after that snapshot (up to a minute before it) is discarded on the server.")) return;
     say("Restoring " + label + "; this takes a few seconds.");
     const r = await api("POST", base + "/restore", { at: point });
     done(r, "Restore", r.data.resumed
       ? "Finished the pending restore to " + when(r.data.at) + "; the time you entered was not used. Press Restore again to use it."
-      : label + " is restored to " + point + ". Devices start again from the new epoch.");
+      : label + " is restored to Cloudflare's last snapshot at or before " + point + ". Devices start again from the new epoch.");
     if (r.status !== 200) load();
   }
   return h("section", {},
@@ -225,7 +225,7 @@ function vaultCard(v, pending) {
         const r = await api("POST", base + "/reset-streams", { confirmVaultId });
         done(r, "Reset streams", label + " is reset. Devices upload again from their files.");
       }),
-      h("p", { textContent: "Restore rewinds synced content to a point within the last 30 days (Cloudflare point-in-time recovery; not in local development). Devices stay paired as they are now; unused pairing codes are cancelled." }),
+      h("p", { textContent: "Restore rewinds synced content to a point within the last 30 days (Cloudflare point-in-time recovery; not in local development). Cloudflare keeps a snapshot about once a minute, so the restore lands up to a minute before the time you enter. Devices stay paired as they are now; unused pairing codes are cancelled." }),
       h("div", { className: "row" }, at, act("Restore", restore)),
       h("p", { textContent: "Delete vault removes the vault, its devices and its attachments for good." }),
       typed("Delete vault", async (confirmVaultId) => {
