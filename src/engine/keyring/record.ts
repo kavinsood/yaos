@@ -4,7 +4,7 @@
  *   u8 recordFormat = 1 ‖ u8 cryptoSuite = 1 ‖ varuint e (≥ 1) ‖ u8 kind ‖ varuint prevEpoch
  *   ‖ bytes16 kcv ‖ varbytes nextWrap ‖ varbytes prevWrap ‖ varbytes recoveryWrap
  *
- * kind 1 genesis (prevEpoch 0, recoveryWrap), 2 roll (prevEpoch e − 1, nextWrap + prevWrap),
+ * kind 1 genesis (e 1, prevEpoch 0, recoveryWrap), 2 roll (prevEpoch e − 1, nextWrap + prevWrap),
  * 3 revoke (prevEpoch e − 1, prevWrap + recoveryWrap). Absent wraps are empty; present ones are
  * nonce(12) ‖ ct(32) ‖ tag(16). Decoding is canonical: anything else (trailing bytes, a wrap in the
  * wrong field, a bad length) is not a record, so one record has exactly one encoding.
@@ -51,7 +51,8 @@ function wrapOk(w: Uint8Array, present: boolean): boolean {
 function shapeOk(r: KeyRecord): boolean {
 	if (!Number.isSafeInteger(r.e) || r.e < 1) return false;
 	if (r.kind !== KeyRecordKind.genesis && r.kind !== KeyRecordKind.roll && r.kind !== KeyRecordKind.revoke) return false;
-	if (r.kind === KeyRecordKind.genesis ? r.prevEpoch !== 0 : r.prevEpoch !== r.e - 1 || r.e < 2) return false;
+	// Genesis introduces K_1 only (enable, §15.1); roll and revoke chain to e − 1.
+	if (r.kind === KeyRecordKind.genesis ? r.prevEpoch !== 0 || r.e !== 1 : r.prevEpoch !== r.e - 1 || r.e < 2) return false;
 	if (r.kcv.length !== KCV_LEN) return false;
 	const w = wrapsOf(r.kind);
 	return wrapOk(r.nextWrap, w.next) && wrapOk(r.prevWrap, w.prev) && wrapOk(r.recoveryWrap, w.recovery);

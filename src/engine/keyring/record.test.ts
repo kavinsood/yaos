@@ -25,6 +25,7 @@ describe("k record codec (§11.1)", () => {
 	it("rejects wrong shapes on encode and on decode", () => {
 		const bad: KeyRecord[] = [
 			{ ...genesis, e: 0 },
+			{ ...genesis, e: 2 }, // genesis introduces K_1 only
 			{ ...genesis, prevEpoch: 1 },
 			{ ...roll, prevEpoch: 0 },
 			{ ...newKeyRecord(1, KeyRecordKind.roll, kcv, { next: w(1), prev: w(2) }) }, // roll needs e ≥ 2
