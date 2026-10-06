@@ -500,7 +500,9 @@ then `capabilities.attachments` is `true`. Every blob route takes the device bea
 
 - **Address.** `<address>` is 64 lowercase hex characters, `^[0-9a-f]{64}$`. The server checks the format only and
   never hashes the body, so the address is opaque to it: a plaintext SHA-256 and an E2EE keyed address look alike.
-  The client verifies what it downloads.
+  A client names a blob by `CryptoPort.blobAddress(sha256)`: the sha256 under suite 0, `HMAC(kAddr, sha256)` under
+  suite 1 (e2ee-design §10.1), so no plaintext hash reaches the relay in a route or an `exists` body under suite 1.
+  The client verifies every blob it downloads (DESIGN §j.1, §j.4).
 - **Storage.** The R2 key is `v/<vaultId>/<address>`, with no epoch: a blob survives reset-streams and restore, and
   vault delete purges the prefix.
 - **PUT overwrites.** A PUT to an address that exists replaces the bytes and refreshes the object's upload time.

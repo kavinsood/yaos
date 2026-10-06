@@ -90,6 +90,8 @@ export interface DevOptions {
 	readonly upload?: boolean;
 	readonly partBytes?: number;
 	readonly files?: SnapshotDeps["files"];
+	/** Default: sealingCrypto (XOR seal). */
+	readonly crypto?: CryptoPort;
 }
 
 export function device(o: DevOptions = {}) {
@@ -100,7 +102,7 @@ export function device(o: DevOptions = {}) {
 	const settings = { enabled: o.enabled ?? true, keepDaily: o.keepDaily ?? 7, uploadToBlobStore: o.upload ?? true };
 	const remote = o.store && o.index ? { store: o.store, index: o.index.port(o.self ?? DEV_A) } : null;
 	const job = new SnapshotJob({
-		disk: w.gateway, side, clock: w.clock, crypto: sealingCrypto, settings: () => settings, remote, deviceLabel: o.label ?? "laptop",
+		disk: w.gateway, side, clock: w.clock, crypto: o.crypto ?? sealingCrypto, settings: () => settings, remote, deviceLabel: o.label ?? "laptop",
 		files: o.files ?? (() => w.vault.paths().filter((p) => !p.startsWith(".")).map((p) => ({ path: P(p), kind: kindOfPath(P(p)), size: w.vault.bytesOf(p)!.length }))),
 		notice: (level, code, message) => notices.push({ level, code, message: message ?? "" }),
 		diag: (l) => diags.push(l),

@@ -3,16 +3,26 @@
  * timer, frame close -> T_edit, remote row apply (refs resolved), causal-hole
  * / oversize checks with freeze, provisional apply + T_adopt and the
  * adoptable -> pending transition.
+ *
+ * Unresolved bodyUpdateRef rows (blob unavailable, e2ee-design §10.2) are
+ * retried when x: rows arrive and on a per-stream backoff timer (refRetryMs
+ * doubling to refRetryMaxMs, reset once every ref resolved). Each attempt's
+ * outcome feeds a per-row BlobFailureStreaks: once the initial attempt and 3
+ * retries all failed deterministically (refs.ts) over >= blobQuarantineMinMs,
+ * the doc is frozen "blob-corrupt" (§9.3: deterministic body failures freeze
+ * the doc). The tail rows stay; releaseQuarantine unfreezes and the count
+ * starts over.
  */
 
 import * as Y from "yjs";
-import { MAX_DOC_TEXT_CHARS } from "../../core/limits";
+import { BLOB_QUARANTINE_RETRIES, MAX_DOC_TEXT_CHARS } from "../../core/limits";
 import { streamClass, streamDocId, type ClientFrameId, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelayEvent } from "../../ports/relay";
 import { buildAdoptFrame, buildBodyFrames, FrameTooLargeError } from "../body/frames";
 import { docTextLength, hasCausalHole, type Handle, type HandleHooks } from "../body/handles";
-import { resolveRefRow } from "../body/refs";
+import { BlobFailureStreaks } from "../blobs/blobStore";
+import { resolveRef } from "../body/refs";
 import { deltaToChanges } from "../body/textChanges";
 import { ORIGIN } from "../body/yjsCounters";
 import { gate } from "../ingest/gate";
@@ -34,14 +44,18 @@ export class DocRuntime {
 	private chainP: Promise<void> = Promise.resolve();
 	private chained = 0;
 	private readonly causal = new Map<StreamName, { attempts: number; timer: TimerHandle | null }>();
+	private readonly refRetry = new Map<StreamName, { delayMs: number; timer: TimerHandle | null }>();
+	/** §10.2 deterministic-failure streaks of ref rows, by stream then seq; dropped when the doc freezes. */
+	private readonly refStreaks = new Map<StreamName, BlobFailureStreaks>();
 	stats = { framesClosed: 0, adopted: 0, adoptToPending: 0, causalReads: 0 };
 
 	constructor(private readonly c: EngineCtx) {}
 
 	hooks(): HandleHooks {
 		return {
-			resolveRef: (row) => resolveRefRow(this.c.deps, row),
+			resolveRef: (row) => this.resolveRow(row),
 			onCreate: (h) => this.attach(h),
+			onLoaded: (h) => this.checkRefs(h),
 			onEvict: (h) => this.detach(h),
 			monotonic: () => this.c.mono(),
 		};
@@ -65,6 +79,7 @@ export class DocRuntime {
 	/** Engine stop: drop every timer this module owns. */
 	dispose(): void {
 		for (const s of [...this.causal.keys()]) this.clearCausal(s);
+		for (const s of [...this.refRetry.keys()]) this.clearRefRetry(s);
 		for (const h of this.c.handles.all()) {
 			if (h.timer !== null) this.c.ports.clock.clearTimer(h.timer);
 			h.timer = null;
@@ -92,6 +107,7 @@ export class DocRuntime {
 		if (h.timer !== null) this.c.ports.clock.clearTimer(h.timer);
 		h.timer = null;
 		this.clearCausal(h.stream);
+		this.clearRefRetry(h.stream);
 	}
 
 	/** (Re)arm the open-frame close timer from the builder's due time. */
@@ -173,7 +189,7 @@ export class DocRuntime {
 			if (row.kind === "bodyUpdate" || row.kind === "canvasUpdate") {
 				if (row.content.length > 0) updates.push(row.content);
 			} else if (row.kind === "bodyUpdateRef") {
-				const u = await resolveRefRow(this.c.deps, row);
+				const u = await this.resolveRow(row);
 				if (u) updates.push(u);
 				else if (!h.unresolvedRows.some((r) => r.seq === row.seq)) {
 					h.unresolvedRefs++;
@@ -192,15 +208,71 @@ export class DocRuntime {
 		this.c.handles.grow(h, bytes);
 	}
 
-	/** New x: rows (or blob store answers): retry every unresolved ref row. */
+	/** New x: rows: retry every unresolved ref row. */
 	async retryRefs(): Promise<void> {
-		for (const h of [...this.c.handles.all()]) {
-			if (h.unresolvedRows.length === 0) continue;
-			const rows = h.unresolvedRows.splice(0);
-			h.unresolvedRefs = 0;
-			await this.applyToHandle(h, rows);
-			this.checkDoc(h);
+		for (const h of [...this.c.handles.all()]) await this.retryHandleRefs(h);
+	}
+
+	private async retryHandleRefs(h: Handle): Promise<void> {
+		if (h.unresolvedRows.length === 0) return;
+		const rows = h.unresolvedRows.splice(0);
+		h.unresolvedRefs = 0;
+		await this.applyToHandle(h, rows);
+		this.checkDoc(h);
+	}
+
+	/** One resolution attempt of a ref row; its outcome counts towards the §10.2 quarantine of the doc. */
+	private async resolveRow(row: TailRecord): Promise<Uint8Array | null> {
+		const r = await resolveRef(this.c.deps, row.stream, row.content);
+		let streaks = this.refStreaks.get(row.stream);
+		if (r.ok) {
+			streaks?.clear(String(row.seq));
+			return r.bytes;
 		}
+		if (!r.deterministic && !streaks) return null;
+		if (!streaks) this.refStreaks.set(row.stream, (streaks = new BlobFailureStreaks(BLOB_QUARANTINE_RETRIES, this.c.tuning.blobQuarantineMinMs)));
+		if (r.deterministic) this.c.diag("ref-blob-corrupt", { cls: streamClass(row.stream) });
+		if (streaks.note(String(row.seq), r.deterministic, this.c.mono())) void this.quarantineRefs(row.stream);
+		return null;
+	}
+
+	private async quarantineRefs(stream: StreamName): Promise<void> {
+		this.refStreaks.delete(stream);
+		this.clearRefRetry(stream);
+		await this.c.freeze(stream, "blob-corrupt");
+		this.clearRefRetry(stream); // re-armed by a checkDoc that ran before the freeze landed
+	}
+
+	/** Unresolved refs on an unfrozen doc: keep the retry timer armed; none left: reset the backoff. */
+	private checkRefs(h: Handle): void {
+		if (h.unresolvedRows.length === 0) {
+			this.clearRefRetry(h.stream);
+			return;
+		}
+		if (this.c.repo.stream(h.stream)?.frozen) return;
+		const st = this.refRetry.get(h.stream);
+		if (st && st.timer !== null) return;
+		const delayMs = st ? Math.min(st.delayMs * 2, this.c.tuning.refRetryMaxMs) : this.c.tuning.refRetryMs;
+		const next = { delayMs, timer: null as TimerHandle | null };
+		this.refRetry.set(h.stream, next);
+		next.timer = this.c.ports.clock.setTimer(delayMs, () => void this.refRetryFire(h.stream, next));
+	}
+	private clearRefRetry(stream: StreamName): void {
+		const st = this.refRetry.get(stream);
+		if (!st) return;
+		if (st.timer !== null) this.c.ports.clock.clearTimer(st.timer);
+		this.refRetry.delete(stream);
+	}
+	private async refRetryFire(stream: StreamName, st: { delayMs: number; timer: TimerHandle | null }): Promise<void> {
+		if (this.refRetry.get(stream) !== st) return;
+		st.timer = null;
+		const h = this.c.handles.peek(stream);
+		if (!h || this.c.repo.stream(stream)?.frozen) {
+			this.clearRefRetry(stream);
+			return;
+		}
+		await this.retryHandleRefs(h);
+		if (h.unresolvedRows.length === 0) this.clearRefRetry(stream);
 	}
 
 	/** Stage 3 (DESIGN §d.6): oversize -> freeze; causal hole on a caught-up stream -> re-read timer. */
@@ -211,6 +283,7 @@ export class DocRuntime {
 			void this.c.freeze(h.stream, "oversize-remote");
 			return;
 		}
+		this.checkRefs(h);
 		if (hasCausalHole(h.doc)) {
 			if (!rec.stale) this.armCausal(h.stream);
 		} else this.clearCausal(h.stream);

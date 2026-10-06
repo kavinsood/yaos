@@ -311,7 +311,7 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 |---|---|---|
 | Outbox mirror | `sealed` bytes, i.e. ciphertext. Re-opened with keys by `recoverFromMirror` (`src/engine/runtime/mirrorIo.ts:162`) | Fine |
 | Synced mirror | Plaintext docId, path, contentHash, seqs | Accepted: the vault folder holds the same plaintext |
-| Local snapshots (zip) | Plaintext | Accepted (local). Uploads go through `sealBlob` (`src/engine/snapshots/snapshotJob.ts:129-130`) |
+| Local snapshots (zip) | Plaintext | Accepted (local). Uploads go through `putSealed` → `sealBlob` (`src/engine/snapshots/remote.ts:52`, `src/engine/blobs/blobStore.ts:29-34`) |
 | IndexedDB `tail`, `snapshots`, `baseText`, ... | Plaintext (T_receipt stores outbox content, DESIGN §e.2) | Accepted (non-goal: local at-rest encryption) |
 | Diagnostics bundle | Hashes MUST be `HMAC(kDiag, ·)`, not sha256 (DESIGN §j.7). Pseudonym = the first 12 hex of `CryptoPort.diagHash(salt ‖ 0x00 ‖ value)`; the per-bundle random salt stays, so two bundles do not correlate unless the user shares both (`src/engine/compose/diagnosticsBundle.ts`) | Done in WP-E2 |
 
@@ -361,7 +361,7 @@ k wraps:     §11.2
 | deviceId | **New.** The relay asserts the row's deviceId (relay-wire §4.1). Without this binding, the server could re-attribute a frame, shifting dedupe and replay state (§8) and the planner's own-frame matching (DESIGN §c.13). deviceId is client-chosen at enroll (relay-wire §2.4), so it is known at seal time. T_adopt seals under the adopter's own deviceId (DESIGN §d.5, unchanged). |
 | clientFrameId | Frame identity. Unique per device across the vault (relay-wire §1). |
 | coversSeq (checkpoints) | As today. The inner `CheckpointContent.coversSeq` check stays (DESIGN §b.1); it runs in the ingest gate (`src/engine/ingest/gate.ts`), after the envelope codec opened the bytes. |
-| address (blobs) | The server cannot serve one blob's bytes at another address. The reader also checks sha256 after opening (`src/engine/body/refs.ts:50-59`). |
+| address (blobs) | The server cannot serve one blob's bytes at another address. The reader also checks sha256 after opening (`src/engine/blobs/blobStore.ts:73-77`; log path `src/engine/body/refs.ts:84`). |
 
 - **seq is NOT bound.** The relay assigns it after the append (relay-wire §5). Order is protected per device by
   frameNo (§8), not by the AEAD.
@@ -498,8 +498,8 @@ pre-restore frames from the abandoned timeline into the new epoch. This is accep
 - **Sealed under suite 1:**
   - every relay payload (`ns`, `cfg`, `b:`, `c:`, `x:`, `snap`);
   - every checkpoint;
-  - every blob: attachments, oversize body updates behind `bodyUpdateRef`, and uploaded snapshot bundles (today one
-    zip, `src/engine/snapshots/snapshotJob.ts:129-130`; multi-part bundles indexed by `snap` on the recovery branch);
+  - every blob: attachments, oversize body updates behind `bodyUpdateRef`, and uploaded snapshot bundles (multi-part
+    zips indexed by `snap`; each part stored through `src/engine/snapshots/remote.ts:52`);
   - the key material inside `k` records (§11).
 - **Visible to the server:**
   - stream names: `b:`/`c:` + a random docId, `x:` + a keyed address, plus `ns`, `cfg`, `k`, `snap`;
@@ -563,10 +563,13 @@ A device with no suite pin never reaches this table: it opens nothing (§12.4).
 - ns entries, refs and snapshot records keep the **plaintext sha256**. The address is recomputed with the
   vault-lifetime kAddr (§5.1) in any epoch.
 - `x:` streams become **`x:<address>`** (66 bytes, under the 256-byte cap in `server/src/streams/protocol.ts:16`).
-  `blobChunkStream(hash)` (`src/core/types.ts:66`) becomes `blobChunkStream(address)` at every caller (`src/engine/body/frames.ts:84,129`, `src/engine/runtime/blobChunks.ts:33,48,75`). The `blobChunk`
-  content still carries the sha256, now sealed.
+  `blobChunkStream(hash)` became `blobChunkStream(address)` (`src/core/types.ts:76`; WP-E6a) at every caller
+  (`src/engine/body/frames.ts:88,139`, `src/engine/runtime/blobChunks.ts:40,88`, `src/engine/body/refs.ts:81`). The
+  `blobChunk` content still carries the sha256, now sealed.
 - **Dedupe** is per vault. Identical plaintexts get identical addresses, so `exists` skips the upload
-  (`src/engine/body/frames.ts:75-77`, `src/engine/blobs/blobQueue.ts:195-198`). There is no cross-vault dedupe: kAddr differs per vault.
+  (`putSealed`, `src/engine/blobs/blobStore.ts:29-34`, for frames, attachments and snapshot parts). The log path
+  skips indexes already committed on `x:<address>` (`src/engine/runtime/blobChunks.ts:99-102`). There is no
+  cross-vault dedupe: kAddr differs per vault.
 - **Accepted leak.** Equality of two attachments inside one vault, and blob count and bucketed sizes (§2.2).
 - Alternative: convergent per-blob keys `K = H(plaintext)`. Rejected: they allow confirmation of guessed files by
   anyone with the ciphertext, and add a key per blob for no single-user gain.
@@ -593,6 +596,18 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
 - **Download.** `get` → `openBlob(address, sealed)` → the sha256 must equal the reference. Any failure is
   "unavailable" and is retried with backoff, as today (DESIGN §j.1). After the key is verified and 3 retries
   over ≥ 3 min have failed, the referencing row is quarantined as deterministic.
+  - Implemented in WP-E6a. `getOpened` (`src/engine/blobs/blobStore.ts:67-79`) classifies each attempt, and
+    `BlobFailureStreaks` (`:87-107`) applies the rule. Only these count: `auth-failed`, `malformed`,
+    `suite-downgrade` or a sha256 mismatch under a verified sealing key, or a header that does not parse.
+    Absent, transport errors, `unknown-key`, `unsupported-suite` and anything under an unverified key reset the
+    count.
+  - A body/canvas ref freezes the doc `blob-corrupt` (§9.3; `src/engine/runtime/docRuntime.ts:210-229`). No
+    QuarantineRecord is written, because the row holds no sealed blob; `releaseQuarantine` unfreezes it and the
+    count starts over.
+  - An attachment is quarantined in memory on the blob queue (notice `blob-quarantined`,
+    `src/engine/blobs/blobQueue.ts:230-233`), because an ns row cannot be quarantined. A restart retries.
+  - A snapshot restore fails `content_corrupt` only on a deterministic failure or an absent part. A
+    reader-dependent failure fails the request with no corruption notice (`src/engine/snapshots/remote.ts:77-85`).
 
 ### 10.3 No chunking
 
@@ -1105,7 +1120,7 @@ Both mean **a new vault** (decision D7):
 
 | Path | Desktop | Mobile (assumed) | Note |
 |---|---|---|---|
-| Typing: one frame per `OPEN_FRAME_IDLE_MS` (100 ms, `src/core/limits.ts:56`) | ≤ 0.05 ms per frame | ≤ 0.5 ms | Below 1% of the frame interval |
+| Typing: one frame per `OPEN_FRAME_IDLE_MS` (100 ms, `src/core/limits.ts:67`) | ≤ 0.05 ms per frame | ≤ 0.5 ms | Below 1% of the frame interval |
 | Bootstrap, 10k docs, 200 MiB of checkpoints and tail | ≤ 0.3 s total crypto | ≤ 3 s (10k × 0.1 ms + 200 MiB ÷ 100 MiB/s) | Downloading 200 MiB dominates |
 | One 10 MiB blob | ≤ 10 ms | ≤ 100 ms | Plus 3 × 10 MiB transient memory (§10.3) |
 | Engine start | ≤ 5 ms | ≤ 20 ms | |
@@ -1122,7 +1137,7 @@ Crypto is never on the hot path. Bootstrap is bound by the network and the plann
 - **NEVER await a CryptoPort or HashPort call inside a `runTx` body** (`src/engine/adapters/idbStorage.ts:187`).
   Seal before the transaction and open after it.
 - **Static audit (this worktree).** Every crypto call site seals or opens outside the transaction body:
-  - `src/engine/runtime/docRuntime.ts:109, :246, :256`;
+  - `src/engine/runtime/docRuntime.ts:125, :211, :319, :329`;
   - `src/engine/runtime/engine.ts:167, :225`;
   - `src/engine/sync/ingestRow.ts:36`;
   - `src/engine/sync/catchUp.ts:112`;
@@ -1145,7 +1160,7 @@ rather than an accident.
 
 | Feature (legacy or possible) | Under suite 1 | Client replacement |
 |---|---|---|
-| Server check that a blob's bytes match its sha256 | Impossible: opaque address | AEAD tag plus sha256 after open (`src/engine/body/refs.ts:50-59`) |
+| Server check that a blob's bytes match its sha256 | Impossible: opaque address | AEAD tag plus sha256 after open (`src/engine/blobs/blobStore.ts:73-77`; log path `src/engine/body/refs.ts:84`) |
 | `X-YAOS-Content-SHA256` / `-Size` headers | Would leak the plaintext hash and size. At 7208184 they are only still named in the CORS expose list (`server/src/http.ts:7`); nothing sets or reads them | The client never sends them. Server ask A2 removes the stale names |
 | Server-side debugging of content | Impossible | Diagnostics carry `HMAC(kDiag, ·)` hashes (§6.4). The user shares a bundle and correlates locally |
 | Point-in-time restore (D8b) | **Still works**: opaque rows rewind | Old keys stay in the keyring. `k` is re-published (§11.5) |
@@ -1206,7 +1221,8 @@ export interface KeyringCrypto {
 ```
 
 - `openBlob` returns a result rather than `Uint8Array | null`, so the caller can classify the failure (§10.2).
-  The callers that change are `src/engine/body/refs.ts:58-59` and `src/engine/blobs/blobQueue.ts:204`.
+  The callers classify through `getOpened` (`src/engine/blobs/blobStore.ts:67-79`): `src/engine/body/refs.ts:73`,
+  `src/engine/blobs/blobQueue.ts:272` and `src/engine/snapshots/remote.ts:79`.
 - **The suite-0 adapter** (`src/engine/adapters/noopCrypto.ts`) and `identityCrypto`
   (`src/core/codec/envelope.ts`) implement the new shape. `sealEpoch()` returns 0.
   - core has no digest, so `identityCrypto(hash?: HashPort)` takes an optional HashPort for `diagHash`; without one,
@@ -1317,6 +1333,8 @@ readonly crypto:
 | §11.1 Limits | Note that suite-1 payloads are padded, so the client caps content at 1015808 bytes (§7.3) |
 
 ### 18.6 DESIGN.md diffs
+
+Applied so far: the §j.1 `x:` stream naming (WP-E6a: DESIGN §b.2, §b.4, §b.6, §d.6, §j.1 now say `x:<address>`).
 
 ```diff
  §b.1 Envelope (:43)

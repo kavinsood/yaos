@@ -1,7 +1,8 @@
 /**
- * BlobPort: optional content-addressed store (R2 behind the relay). DESIGN §j.1.
- * The engine receives `BlobPort | null`; null = log-carried fallback for
- * attachments <= MAX_LOG_BLOB_BYTES via x:<hash> streams.
+ * BlobPort: optional store addressed by CryptoPort.blobAddress (R2 behind the
+ * relay). DESIGN §j.1, e2ee-design §10. The engine receives `BlobPort | null`;
+ * null = log-carried fallback for blobs <= MAX_LOG_BLOB_BYTES via x:<address>
+ * streams. Puts and gets go through blobs/blobStore.ts only (putSealed / getOpened).
  */
 
 import type { BlobAddress } from "./crypto";

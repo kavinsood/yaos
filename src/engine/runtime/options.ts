@@ -3,7 +3,7 @@
  * defaults are the DESIGN values.
  */
 
-import { BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, type Budgets, type DeviceClass } from "../../core/limits";
+import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, type Budgets, type DeviceClass } from "../../core/limits";
 import type { DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { SideFilePort } from "../../ports/vault";
@@ -13,6 +13,7 @@ import { DEFAULT_CHECKPOINT_TUNING, type CheckpointTuning } from "../body/checkp
 import type { TextChanges } from "../body/textChanges";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import { NS_CANDIDATE_MODULUS, type FoldedNsFrame } from "../sync/nsRuntime";
+import { BLOB_RETRY_BASE_MS, BLOB_RETRY_MAX_MS } from "../blobs/blobQueue";
 
 export interface EngineTuning {
 	/** Local compaction trigger (DESIGN §d.8). */
@@ -46,6 +47,11 @@ export interface EngineTuning {
 	readonly maxCheckpointStateBytes: number;
 	/** appendBlobChunks gives up (false) after this long without every receipt. */
 	readonly blobAppendTimeoutMs: number;
+	/** Unresolved bodyUpdateRef rows: retried after refRetryMs, doubling up to refRetryMaxMs (e2ee-design §10.2). */
+	readonly refRetryMs: number;
+	readonly refRetryMaxMs: number;
+	/** §10.2 quarantine: a ref row's deterministic failures must span at least this long (BLOB_QUARANTINE_MIN_MS). */
+	readonly blobQuarantineMinMs: number;
 }
 
 export const DEFAULT_TUNING: EngineTuning = {
@@ -69,6 +75,9 @@ export const DEFAULT_TUNING: EngineTuning = {
 	nsCandidateModulus: NS_CANDIDATE_MODULUS,
 	maxCheckpointStateBytes: 32 * 1024 * 1024,
 	blobAppendTimeoutMs: 120_000,
+	refRetryMs: BLOB_RETRY_BASE_MS,
+	refRetryMaxMs: BLOB_RETRY_MAX_MS,
+	blobQuarantineMinMs: BLOB_QUARANTINE_MIN_MS,
 };
 
 /** Why a bound body's text changed: "editor" = applyEditorChanges, "merge" = an engine merge (editDoc, mergeJob). */

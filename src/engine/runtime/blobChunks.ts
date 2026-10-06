@@ -1,5 +1,9 @@
 /**
- * x:<hash> chunk access for the blob layer (blobs/chunks.ts BlobChunkLog).
+ * x:<address> chunk access for the blob layer (blobs/chunks.ts BlobChunkLog).
+ * Callers pass the plaintext sha256; the stream is named by
+ * CryptoPort.blobAddress(sha256) (e2ee-design §10.1), so no stream name the
+ * relay sees carries a plaintext hash. The blobChunk content (sealed) keeps
+ * the sha256.
  *
  * appendBlobChunks authors blobChunk frames through the outbox (one T_edit on
  * the edit chain) and waits for their receipts. Idempotent by hash + index: an
@@ -11,13 +15,14 @@
  * readBlobChunks returns the rows already in the local tail (catch-up and live
  * ingest store x: rows) when they assemble into the blob (the hash is the
  * content address, so they are it); otherwise it reads the committed rows of
- * x:<hash> from the relay and opens them through the gate; nothing is
- * persisted. Offline: the local rows, or null if there are none.
+ * x:<address> from the relay and opens them through the gate; nothing is
+ * persisted. Offline: the local rows, or null if there are none. Reading the
+ * committed rows first is the log path's dedupe (the `has` of the store path).
  */
 
 import { decodeBlobChunk } from "../../core/codec/contents";
 import type { BlobChunkContent } from "../../core/envelope";
-import { blobChunkStream, type ClientFrameId, type ContentHash } from "../../core/types";
+import { blobChunkStream, type ClientFrameId, type ContentHash, type StreamName } from "../../core/types";
 import type { RelaySession } from "../../ports/relay";
 import { assembleChunks } from "../blobs/chunks";
 import { buildBlobChunkFrame } from "../body/frames";
@@ -31,26 +36,27 @@ function chunkOf(content: Uint8Array, hash: ContentHash): BlobChunkContent | nul
 	return ch && ch.hash === hash ? ch : null;
 }
 
-async function localChunks(c: EngineCtx, hash: ContentHash): Promise<BlobChunkContent[]> {
+async function chunkStream(c: EngineCtx, hash: ContentHash): Promise<StreamName> {
+	return blobChunkStream(await c.deps.crypto.blobAddress(hash));
+}
+
+async function localChunks(c: EngineCtx, stream: StreamName, hash: ContentHash): Promise<BlobChunkContent[]> {
 	const out: BlobChunkContent[] = [];
-	for (const row of await c.repo.getTail(blobChunkStream(hash), 0)) {
+	for (const row of await c.repo.getTail(stream, 0)) {
 		const ch = chunkOf(row.content, hash);
 		if (ch) out.push(ch);
 	}
 	return out;
 }
 
-/** Committed chunks of x:<hash> (any order, duplicates possible); null = not readable now. */
+/** Committed chunks of x:<address> for `hash` (any order, duplicates possible); null = not readable now. */
 export async function readBlobChunks(c: EngineCtx, hash: ContentHash): Promise<BlobChunkContent[] | null> {
+	if (c.stopped) return null;
+	const stream = await chunkStream(c, hash);
+	const local = await localChunks(c, stream, hash);
 	const s = c.session;
-	if (!s || c.stopped) {
-		if (c.stopped) return null;
-		const local = await localChunks(c, hash);
-		return local.length > 0 ? local : null;
-	}
-	const local = await localChunks(c, hash);
+	if (!s || c.stopped) return c.stopped || local.length === 0 ? null : local;
 	if (local.length > 0 && assembleChunks(hash, local).ok) return local;
-	const stream = blobChunkStream(hash);
 	const out: BlobChunkContent[] = [];
 	try {
 		let after = 0;
@@ -72,12 +78,14 @@ export async function readBlobChunks(c: EngineCtx, hash: ContentHash): Promise<B
 	return out;
 }
 
-/** Append chunks of one blob as x:<hash> frames; true once every chunk is committed. */
+/** Append chunks of one blob as x:<address> frames; true once every chunk is committed. */
 export async function appendBlobChunks(c: EngineCtx, hash: ContentHash, chunks: readonly BlobChunkContent[]): Promise<boolean> {
 	const session = c.session;
 	if (!session || c.stopped || !session.canWrite) return false;
 	if (chunks.some((ch) => ch.hash !== hash)) return false;
-	const stream = blobChunkStream(hash);
+	const address = await c.deps.crypto.blobAddress(hash);
+	if (c.session !== session) return false;
+	const stream = blobChunkStream(address);
 	const want = new Map<number, BlobChunkContent>();
 	for (const ch of chunks) if (!want.has(ch.index)) want.set(ch.index, ch);
 	const wait = new Set<ClientFrameId>();
@@ -97,7 +105,7 @@ export async function appendBlobChunks(c: EngineCtx, hash: ContentHash, chunks: 
 		const parts = [...want.values()];
 		const ids = await c.docs.chain(async () => {
 			const frames = [];
-			for (const ch of parts) frames.push(await buildBlobChunkFrame(c.deps, ch, c.ns.coversSeq, c.now()));
+			for (const ch of parts) frames.push(await buildBlobChunkFrame(c.deps, address, ch, c.ns.coversSeq, c.now()));
 			c.addOutbox(await c.repo.tEdit(frames, c.now()));
 			return frames.map((f) => f.clientFrameId);
 		});

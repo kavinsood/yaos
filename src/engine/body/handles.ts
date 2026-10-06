@@ -32,7 +32,7 @@ export interface Handle {
 	lastAccessMono: number;
 	/** Tail ref rows whose update is not available yet (doc shows wait/blob-unavailable). */
 	unresolvedRefs: number;
-	/** Those rows, retried when x: rows arrive or the blob store answers. */
+	/** Those rows, retried when x: rows arrive, and on a backoff timer (DocRuntime). */
 	unresolvedRows: TailRecord[];
 	/** Builder close timer. */
 	timer: number | null;
@@ -43,6 +43,8 @@ export interface HandleHooks {
 	resolveRef(row: TailRecord): Promise<Uint8Array | null>;
 	/** Called once per new handle before load (attach doc listeners). */
 	onCreate(h: Handle): void;
+	/** Called once a load completed (unresolvedRows set: arm their retry). */
+	onLoaded(h: Handle): void;
 	/** Called after eviction. */
 	onEvict(h: Handle): void;
 	monotonic(): number;
@@ -161,6 +163,7 @@ export class HandleManager {
 		h.bytesEstimate = 3 * bytes;
 		this.handles.set(stream, h);
 		this.loads++;
+		this.hooks.onLoaded(h);
 		return h;
 	}
 

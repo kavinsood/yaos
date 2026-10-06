@@ -1,15 +1,21 @@
 /**
  * SnapshotJob, remote side (DESIGN §j.4): parts through the attachments' blob path, resumable idempotent upload
  * with one index record, per-device retention floor, list merge, and cross-device restore that fails closed on
- * every fault a store (or someone tampering with it) can produce.
+ * every fault a store (or someone tampering with it) can produce. Suite 1 (e2ee-design §10): parts sealed at their
+ * keyed address within the store cap; only a deterministic open failure is corruption (§9.2).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { sealedBlobBytes } from "../../core/codec/sealedBlob";
 import { sha256Hex } from "../../core/hash/sha256";
+import { snapPartBytes } from "../../core/snap/bundle";
 import { snapLive } from "../../core/snap/fold";
 import { snapKey } from "../../core/snap/record";
 import type { BlobAddress } from "../../ports/crypto";
 import { ProtocolFailure } from "../../protocol/errors";
+import { SeededRandom } from "../../sim/random";
+import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
+import { SnapshotPartUnavailable } from "./remote";
 import { DAY, DEV_A, DEV_B, FaultyStore, MemIndex, addressOf, device, noise, sealingCrypto } from "./testkit/snapKit";
 
 function pair(o: { partBytes?: number; keepDaily?: number } = {}) {
@@ -137,4 +143,73 @@ test("store transport errors are not corruption: the request fails with the stor
 	assert.deepEqual(b.side.names(".part"), []);
 	store.onGet = null;
 	assert.equal((await b.job.restore(`${s.id}@${DEV_A}`, null)).restored.length, 3);
+});
+
+// ---- Suite 1 (e2ee-design §10, WP-E6a) ----
+
+const VAULT1 = "AAAAAAAAAAAAAAAAAAAAAA";
+const K1 = Uint8Array.from({ length: 32 }, (_, i) => i);
+const K2 = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
+
+async function suite1(seed: number, keys: readonly { e: number; k: Uint8Array }[], verified: readonly number[], sealEpoch = 1) {
+	const c = await createWebCryptoSuite1({ vaultId: VAULT1, random: new SeededRandom(seed), keys: keys.map(({ e, k }) => ({ e, k: k.slice() })) });
+	for (const e of verified) c.markVerified(e);
+	c.setSealEpoch(sealEpoch);
+	return c;
+}
+
+test("suite 1: parts sealed at blobAddress(sha256), every stored object within maxBlobBytes; restore opens them; tampered at rest -> content_corrupt; reader-dependent -> no corruption notice", async () => {
+	const both = [{ e: 1, k: K1 }, { e: 2, k: K2 }];
+	const writer = await suite1(51, both, [1, 2], 2);
+	const store = new FaultyStore(64 * 1024);
+	const index = new MemIndex();
+	const a = device({ label: "laptop", self: DEV_A, index, store, crypto: writer }); // part size: snapPartBytes(64 KiB) = 56 KiB
+	a.w.vault.userWrite("notes/a.md", "# A\n\nsealed\n");
+	a.w.vault.userWrite("img/p.png", noise(150_000, 9));
+	const s = (await a.job.take("manual"))!;
+	assert.equal(s.upload, "uploaded");
+	const id = `${s.id}@${DEV_A}`;
+	const record = index.state.records.get(snapKey(DEV_A, s.id))!.record;
+	assert.ok(record.parts.length >= 3, `${record.parts.length} parts`);
+	assert.equal(record.parts[0]!.size, snapPartBytes(store.maxBlobBytes), "a full part");
+	for (const p of record.parts) {
+		assert.equal(p.address, await writer.blobAddress(p.sha256));
+		assert.notEqual(p.address, p.sha256);
+		const sealed = store.objects.get(p.address as BlobAddress)!;
+		assert.deepEqual([...sealed.subarray(0, 3)], [1, 1, 2], "blobFormat 1, suite 1, keyEpoch 2");
+		assert.equal(sealed.length, sealedBlobBytes(p.size, 2));
+		assert.ok(sealed.length <= store.maxBlobBytes, `${sealed.length} <= ${store.maxBlobBytes}`);
+	}
+	assert.equal(store.calls.put, record.parts.length);
+
+	const reader = (seed: number, keys: readonly { e: number; k: Uint8Array }[], verified: readonly number[]) =>
+		suite1(seed, keys, verified).then((crypto) => device({ label: "phone", self: DEV_B, index, store, crypto }));
+	const b = await reader(52, both, [1, 2]);
+	const r = await b.job.restore(id, null);
+	assert.deepEqual([...r.restored].sort(), ["img/p.png", "notes/a.md"]);
+	for (const p of ["img/p.png", "notes/a.md"]) assert.deepEqual(b.w.vault.bytesOf(p), a.w.vault.bytesOf(p), p);
+
+	// Tampered at rest, key verified: deterministic -> content_corrupt, nothing written.
+	const addr = record.parts[1]!.address as BlobAddress;
+	const good = store.objects.get(addr)!;
+	const bad = good.slice();
+	bad[60]! ^= 1;
+	store.objects.set(addr, bad);
+	const c = await reader(53, both, [1, 2]);
+	await assert.rejects(c.job.restore(id, null), corrupt("part-missing"));
+	assert.deepEqual(c.notices.map((n) => n.code), ["content_corrupt"]);
+	assert.deepEqual(c.w.vault.paths(), []);
+	assert.deepEqual(c.side.names(".part"), [], "download cache removed");
+	// The same bytes under a K_2 not verified yet: maybe this device's key is wrong, so not corruption.
+	const d = await reader(54, both, [1]);
+	await assert.rejects(d.job.restore(id, null), (e: unknown) => e instanceof SnapshotPartUnavailable && /part 2\/\d+ .*\(auth-failed\)/.test(e.message));
+	assert.deepEqual(d.notices, []);
+	assert.deepEqual(d.side.names(".part"), []);
+	// Intact again, but this device does not hold K_2 (a re-key it has not read yet).
+	store.objects.set(addr, good);
+	const e2 = await reader(55, [{ e: 1, k: K1 }], [1]);
+	await assert.rejects(e2.job.restore(id, null), /\(unknown-key\)/);
+	assert.deepEqual(e2.notices, []);
+	assert.deepEqual(e2.w.vault.paths(), []);
+	assert.ok(!JSON.stringify([c.diags, d.diags, e2.diags]).includes(record.parts[1]!.sha256), "diagnostics never name a part hash");
 });

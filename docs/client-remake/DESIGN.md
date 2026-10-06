@@ -77,8 +77,11 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed))
 | `snap` | snap | `snapOps` | `snapFoldV1` | commit-only | devices that upload or delete snapshots (§j.4) |
 | `b:<docId>` | body | `bodyUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the note |
 | `c:<docId>` | canvas | `canvasUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the canvas |
-| `x:<sha256hex>` | blobchunk | `blobChunk` | `retired` | commit-only | uploader when there is no blob store |
+| `x:<address>` | blobchunk | `blobChunk` | `retired` | commit-only | uploader when there is no blob store |
 
+- `<address>` is `CryptoPort.blobAddress(sha256 of the blob)` (`blobChunkStream`, `src/core/types.ts:76`): the
+  sha256 itself under suite 0, `HMAC(kAddr, sha256)` under suite 1 (e2ee-design §10.1). No plaintext hash is ever
+  a stream name.
 - `docId` and `clientFrameId` are 16 random bytes encoded as base64url without padding (22 chars).
   - A `clientFrameId` is never reused, on any stream, ever. The relay does not detect reuse across streams.
 - Streams of any other class are ignored: the cursor still advances and nothing is stored.
@@ -134,7 +137,8 @@ opCount × { u8 tag, varuint bodyLen, body[bodyLen] }
 - **`blobChunk`.** `32B sha256(whole blob), varuint index, varuint total, varuint totalSize, bytes chunk`.
   - Chunks are `BLOB_CHUNK_BYTES` (768 KiB); only the last may be shorter.
 - **`bodyUpdateRef`.** `32B sha256(update bytes), varuint size`.
-  - The update bytes live in the `BlobPort` (sealed), or in stream `x:<sha256>` as chunks.
+  - The update bytes live in the `BlobPort` (sealed), or in stream `x:<address>` as chunks (address recomputed
+    from the sha256, §b.2).
   - The ref is appended only after every chunk is receipted, or after the blob put succeeds (`dependsOn`, §e.1).
 
 ### b.5 Checkpoints
@@ -246,7 +250,7 @@ the union adds nothing, and rows > coversSeq still apply.
 | snap frame | ≤ 16 ops, records ≤ 48 KiB | One upload is one frame: `put` plus an optional `floor` (§j.4). |
 | Body frame | soft 256 updates / 64 KiB | Holds whole updates. A single update may exceed 64 KiB. |
 | Initial content of a new note | `INITIAL_INSERT_CHUNK_CHARS` = 192 Ki UTF-16 units | Inserted as consecutive transactions of ≤ 192 Ki units: one update, one frame (flag `initial`) each, so ≤ 576 KiB UTF-8. |
-| Any single update > content limit after deflate | — | `bodyUpdateRef`: bytes go to `BlobPort`, else `x:<sha256>` chunks (≤ `MAX_LOG_BLOB_BYTES` = 8 MiB). Larger with no blob store: the doc is frozen `oversize-local`, the disk file is left untouched, and a notice is shown. |
+| Any single update > content limit after deflate | — | `bodyUpdateRef`: bytes go to `BlobPort`, else `x:<address>` chunks (≤ `MAX_LOG_BLOB_BYTES` = 8 MiB). Larger with no blob store: the doc is frozen `oversize-local`, the disk file is left untouched, and a notice is shown. |
 | Checkpoint | `maxCheckpointBytes` (4 MiB) | Larger: skip. The stream keeps its rows. An ns state > 4 MiB (roughly 40k entries) is open risk OR-3. |
 | Attachment | `BlobPort.maxBlobBytes` (10 MiB), else 8 MiB on the log | Larger: not synced, never deleted, notice (§j.1). |
 | Snapshot part | `min(8 MiB, ⌊maxBlobBytes × 7/8⌋)`; ≤ 512 parts, zip ≤ 320 MiB | Parts go to the `BlobPort` only, never to the log (§j.4). |
@@ -893,10 +897,11 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
        `ContentDeleted`, with no subdocs, embeds, formats or binary;
      - total inserted UTF-16 units ≤ `MAX_DOC_TEXT_CHARS`;
      - content ≤ `MAX_FRAME_CONTENT_BYTES`.
-   - **`bodyUpdateRef`:** fetch from `BlobPort` (or read the `x:` stream), check the sha256, open the bytes, then gate
-     stage 2 on them.
+   - **`bodyUpdateRef`:** fetch from `BlobPort` and open it (or read and open the `x:` stream), check the sha256, then
+     gate stage 2 on the bytes.
      - If they are unavailable yet, the ref row is stored and retried with backoff, and the doc shows
-       `wait/blob-unavailable`.
+       `wait/blob-unavailable`. Under the §j.1 quarantine rule (deterministic failures only) the doc is frozen
+       `blob-corrupt` (`src/engine/runtime/docRuntime.ts:210-229`); `releaseQuarantine` unfreezes it and retries.
      - Once resolved, the tail row is rewritten as `bodyUpdate` (a local cache only).
    - Cold docs stop here: the row is stored in `tail` (§e.2 `T_ingest`), and nothing is loaded.
 3. **Check** (resident docs, at apply time):
@@ -1811,16 +1816,23 @@ ones get conflict copies.
   - **Upload** (`blobQueue up`): hash → `crypto.blobAddress(hash)` → `has` → `put(sealBlob(bytes))`. Only **after**
     the put succeeds does the planner emit `nsCreate` / `nsSetBlob` for that hash, so readers can always fetch what
     ns references.
-  - **Download:** `get` → `openBlob` → verify sha256 → write with precondition. A missing blob is retried with backoff
-    (`wait(blob-unavailable)`).
-  - Files larger than `BlobPort.maxBlobBytes` (the server's `maxBlobUploadBytes`; 10 MiB when it sends none or the
-    capabilities probe fails) or `settings.maxAttachmentBytes` are not synced (notice) and never deleted.
+  - **Download:** `get` → `openBlob` → verify sha256 → write with precondition (`getOpened`,
+    `src/engine/blobs/blobStore.ts:67-79`). Every failure (absent, transport, open failure, hash mismatch) is
+    unavailable and retried with backoff (`wait(blob-unavailable)`). Only a failure under a verified key (or with an
+    unparseable header) is deterministic; once the initial attempt and 3 retries spanning ≥ 3 min all failed
+    deterministically, the referencing row is quarantined (e2ee-design §10.2). Absent blobs and failures under an
+    unverified key never are.
+  - Files larger than the store path's plaintext cap (`storePlaintextCap`: `BlobPort.maxBlobBytes`, the server's
+    `maxBlobUploadBytes`, 10 MiB when it sends none or the capabilities probe fails; under suite 1 what still fits
+    once sealed, at most `MAX_BLOB_PLAINTEXT_BYTES_SUITE1` = 10223615) or `settings.maxAttachmentBytes` are not
+    synced (notice) and never deleted.
     `StatusSnapshot.maxBlobBytes` reports the carrier's limit (8 MiB without a blob store); the attachment size
     setting then reads "This server accepts attachments up to N MB; the smaller limit applies."
 - **Without a blob store** (`blob = null`; the relay answers 503 `attachments_unavailable`):
-  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<sha256>` as `blobChunk` frames (768 KiB, ≤ 11 rows).
+  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<address>` as `blobChunk` frames (768 KiB, ≤ 11 rows).
     The ns op is emitted after every chunk is receipted.
-  - Readers `read(x:…)`, assemble by index (duplicates ignored), and verify the hash.
+  - Before appending, the uploader skips chunks already committed on `x:<address>` (the log path's `has`).
+  - Readers `read(x:…)`, open each frame, assemble by index (duplicates ignored), and verify the hash.
   - Larger files are not synced (notice).
   - `x:` streams get `retired` checkpoints once no ns entry or cfg file references the hash.
   - The same path carries `bodyUpdateRef` payloads.
@@ -1967,7 +1979,7 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
     file count, total bytes, bundle digest, and per part `{address, size, sha256}`.
   - **Untrusted input:**
     - decoding enforces every bound, the reason set, the id shape and 64-hex addresses and hashes (the relay's blob
-      routes take `<sha256 hex>`);
+      routes take 64-hex addresses);
     - a violation makes the frame malformed, so it folds as empty;
     - a put with an unknown record version is ignored and reported (`snap-unknown-version` diagnostic).
   - **Fold:** a join, independent of row order and duplicates, so it needs no dedupe ring. Per device, the floor is

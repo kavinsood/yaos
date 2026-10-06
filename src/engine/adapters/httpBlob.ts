@@ -1,8 +1,8 @@
 /**
- * BlobPort over the relay's content-addressed blob routes (relay-wire.md §11.3):
- *   PUT  /vault/:id/blobs/<addr>        204 (400 "hash mismatch", 413 over maxBlobUploadBytes)
+ * BlobPort over the relay's blob routes (relay-wire.md §11.3):
+ *   PUT  /vault/:id/blobs/<addr>        204 (400 invalid_address, 413 over maxBlobUploadBytes)
  *   GET  /vault/:id/blobs/<addr>        200 bytes | 404 {"error":"not found"}
- *   POST /vault/:id/blobs/exists        {"hashes":[...]} -> {"present":[...]}; the relay looks at 50 per call
+ *   POST /vault/:id/blobs/exists        {"hashes":[<addr>...]} -> {"present":[...]}; more than 50 is 400 too_many_addresses
  *
  * Without an R2 bucket every route answers 503 attachments_unavailable (local
  * dev, the client-e2e deploy, any Free-plan server). That surfaces here as a
@@ -10,9 +10,12 @@
  * use probeHttpBlob(), which returns null when capabilities.attachments is
  * false, and fall back to log-carried blobs (DESIGN §j.1).
  *
- * Suite 0 only: the relay checks sha256(body) == address, so the address must
- * be the plaintext SHA-256 (noopCrypto.blobAddress). An E2EE address/ciphertext
- * would be refused with 400 hash mismatch until the relay grows opaque blobs.
+ * The address is opaque to the relay (DECISIONS D9): it checks ^[0-9a-f]{64}$
+ * and nothing else (no hash check, PUT overwrites; server/src/router.ts:549-552),
+ * so it carries CryptoPort.blobAddress as is: the plaintext SHA-256 under
+ * suite 0, the keyed address over sealed bytes under suite 1 (e2ee-design
+ * §10.1). The exists body's field is named `hashes` on the wire; it carries
+ * addresses. Never a plaintext hash under suite 1 (blobs/blobStore.ts).
  */
 
 import type { BlobPort } from "../../ports/blob";

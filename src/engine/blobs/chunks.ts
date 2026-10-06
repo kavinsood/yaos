@@ -1,7 +1,9 @@
 /**
  * Log-carried blobs (DESIGN §j.1, no blob store): an attachment <= 8 MiB rides
- * stream x:<sha256> as blobChunk frames of BLOB_CHUNK_BYTES (<= 11 rows).
- * Readers assemble by index (duplicates ignored) and verify the hash.
+ * stream x:<address> (address = CryptoPort.blobAddress(sha256), e2ee-design
+ * §10.1) as blobChunk frames of BLOB_CHUNK_BYTES (<= 11 rows). The chunk
+ * content (sealed) carries the sha256. Readers assemble by index (duplicates
+ * ignored) and verify the hash.
  */
 
 import type { BlobChunkContent } from "../../core/envelope";
@@ -9,11 +11,11 @@ import { sha256Hex } from "../../core/hash/sha256";
 import { BLOB_CHUNK_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import type { ContentHash } from "../../core/types";
 
-/** The log runtime's x: stream access (WP-C). */
+/** The log runtime's x: stream access (WP-C). Keyed by the plaintext sha256; the runtime names the stream by its address. */
 export interface BlobChunkLog {
-	/** Append the chunks as blobChunk frames of x:<hash>; true once every chunk is receipted (committed). */
+	/** Append the chunks as blobChunk frames of x:<address>; true once every chunk is receipted (committed). */
 	appendChunks(hash: ContentHash, chunks: readonly BlobChunkContent[]): Promise<boolean>;
-	/** Committed chunk contents of x:<hash>, any order, duplicates possible; null = not readable now. */
+	/** Committed chunk contents of x:<address>, any order, duplicates possible; null = not readable now. */
 	readChunks(hash: ContentHash): Promise<readonly BlobChunkContent[] | null>;
 }
 
