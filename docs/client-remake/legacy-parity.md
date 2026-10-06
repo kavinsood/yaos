@@ -10,7 +10,7 @@ accident". Every decision is either a port, an implementation done for parity (w
 - `adfa7a7:src/<path>:<line>` is the old client at commit `adfa7a7`, the last commit before it was deleted in
   `ee31181`. Read it with `git show adfa7a7:src/<path>`. Root files of that tree are cited as `adfa7a7:styles.css`,
   `adfa7a7:package.json` and `adfa7a7:yaos-plugin-api.d.ts`.
-- A plain `src/<path>:<line>` is the new client at HEAD. The lines were checked at `3003810`.
+- A plain `src/<path>:<line>` is the new client at HEAD. The lines were checked at `f841bc4`.
 - `DESIGN §x.y` is a section of `docs/client-remake/DESIGN.md`. Sections are cited by name, not by line.
 - In a Legacy or New cell, a bare `:<line>` after a citation refers to the same file as the citation before it.
 
@@ -27,7 +27,55 @@ accident". Every decision is either a port, an implementation done for parity (w
 ## Summary
 
 <!-- summary:start -->
-(counts are filled in at the end)
+There are 235 rows in total.
+
+| Decision | Rows |
+|---|---|
+| `ported` | 83 |
+| `implemented (<commit>)` | 46 |
+| `dropped: ...` | 97 |
+| `missing: ...` | 4 |
+| `TBD-D` | 5 |
+| Total | 235 |
+
+Rows per section:
+
+| Section | ported | implemented | dropped | missing | TBD-D |
+|---|---|---|---|---|---|
+| 1. Settings sync | 12 | 11 | 10 | 0 | 0 |
+| 2. Commands | 5 | 4 | 8 | 0 | 0 |
+| 3. Status bar and UI | 23 | 7 | 28 | 1 | 2 |
+| 4. Onboarding and pairing | 11 | 3 | 1 | 0 | 2 |
+| 5. Snapshots and restore | 5 | 9 | 3 | 1 | 0 |
+| 6. Diagnostics | 3 | 4 | 2 | 0 | 0 |
+| 7. Frontmatter | 0 | 0 | 5 | 0 | 0 |
+| 8. Attachments | 5 | 0 | 1 | 1 | 0 |
+| 9. Canvas | 5 | 0 | 3 | 0 | 0 |
+| 10. Conflict copies | 1 | 3 | 2 | 0 | 0 |
+| 11. Trash and deletes | 0 | 0 | 1 | 0 | 1 |
+| 12. Excluded paths | 7 | 1 | 0 | 0 | 0 |
+| 13. Public plugin API | 0 | 0 | 6 | 0 | 0 |
+| 14. Update checker | 1 | 0 | 3 | 0 | 0 |
+| 15. Telemetry | 0 | 0 | 5 | 0 | 0 |
+| 16. Mobile | 2 | 4 | 0 | 0 | 0 |
+| 17. styles.css | 0 | 0 | 5 | 0 | 0 |
+| 18. Governance | 0 | 0 | 9 | 1 | 0 |
+| 19. Other | 3 | 0 | 5 | 0 | 0 |
+
+Still missing:
+
+- §3.4 "Attachment storage" status and "Refresh attachment capability". Undecided; small.
+- §5 Cross-device restore. Large; DESIGN §j.4 keeps it out of v1.
+- §8 "R2 backend detected" notice, and a daily snapshot when storage appears. Undecided; small.
+- §18 In-plugin governance as a whole. Large.
+
+Wave-2 rows (`TBD-D`):
+
+- §3.4 "Open server console".
+- §3.5 Attachment size limit: field text and effective cap.
+- §4 Retire the old enrollment when pairing replaces it.
+- §4 QR code of the mobile setup page in "Pair another device".
+- §11 Remote delete follows Obsidian's "Deleted files" preference.
 <!-- summary:end -->
 
 ## 1. Settings sync and its allowlist
