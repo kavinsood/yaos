@@ -26,6 +26,8 @@ import { tests as checkpoint } from "./tests/checkpoint.ts";
 import { tests as misc } from "./tests/misc.ts";
 import { tests as commit } from "./tests/commit.ts";
 import { tests as operator } from "./tests/operator.ts";
+import { tests as flags } from "./tests/flags.ts";
+import { tests as revoke } from "./tests/revoke.ts";
 
 function arg(name: string): string | undefined {
 	const index = process.argv.indexOf(`--${name}`);
@@ -45,13 +47,16 @@ const STARTED = new Date();
 const STAMP = STARTED.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
 
 // Order matters: shared fixtures first, destructive / revoking tests last.
-const ALL: TestDef[] = [...happy, ...onboarding, ...socket, ...checkpoint, ...misc, ...commit, ...operator];
+const ALL: TestDef[] = [...happy, ...onboarding, ...socket, ...checkpoint, ...misc, ...commit, ...operator, ...flags, ...revoke];
 const ORDER = ["T-HAPPY", "T-READY-SHAPE", "T-MININTERVAL-READY", "T-PAIR-FORMAT", "T-PAIR-MALFORMED", "T-PAIR-UNKNOWN-VAULT", "T-PAIR-USED",
 	"T-TICKET-CROSS-VAULT", "T-TICKET-BAD", "T-CODEC-UTF8", "T-CODEC-SURROGATE", "T-CODEC-OVERLONG", "T-CODEC-NONMINIMAL", "T-CODEC-TRAILING",
 	"T-CODEC-VALID", "T-OVERSIZE-1009", "T-TWO-SOCKETS", "T-DEDUPE-CONFLICT", "T-MININTERVAL-TIMING", "T-EPOCH-MISMATCH", "T-EPOCH-MATCH",
 	"T-EPOCH-ABSENT", "T-CKPT-MULTICHUNK", "T-RETIRED-GC", "T-PARTIAL-GC", "T-BLOB-OPAQUE", "T-BLOB-UNAVAILABLE", "T-DAILY", "T-DEDUPE-LARGE",
-	"T-DEDUPE-SMALL", "T-RATE-SOCKET", "T-RATE-DEVICE", "T-SOCKET-CAP-DEVICE", "T-DEVICES-LIST", "T-REVOKE-4403", "T-REVOKE-401", "T-RESET",
-	"T-ENROLL-200", "T-LEGACY-404"];
+	"T-DEDUPE-SMALL", "T-RATE-SOCKET", "T-RATE-DEVICE", "T-SOCKET-CAP-DEVICE", "T-DEVICES-LIST", "T-REVOKE-GATE", "T-REVOKE-SILENCE",
+	"T-REVOKE-BUFFER", "T-REVOKE-4403", "T-REVOKE-401", "T-RESET",
+	"T-ENROLL-200", "T-LEGACY-404",
+	"T-CONSOLE-ROUTES", "T-ENROLL-REPLAY", "T-ENROLL-CONFLICT", "T-ENROLL-BODY", "T-UNKNOWN-VAULT-401", "T-BLOB-KEY-RESET", "T-PROVISION-404",
+	"T-VAULT-DELETE-CONFIRM"];
 const byId = new Map(ALL.map((t) => [t.id, t]));
 if (byId.size !== ALL.length || ORDER.length !== ALL.length || ORDER.some((tid) => !byId.has(tid))) {
 	throw new Error("test registry and ORDER disagree");

@@ -76,9 +76,12 @@ export const tests: TestDef[] = [
 		async run(ctx, t) {
 			const code = `${id(16)}.${id(24)}`;
 			const response = await enrollAttempt(ctx, code, "unknown");
-			t.expect("4xx {error:invalid_code} (status unspecified)");
-			t.check("random well-formed code -> invalid_code", response.status >= 400 && response.status < 500
-				&& response.value?.error === "invalid_code", brief(response, { codeFormatOk: CODE_RE.test(code) }));
+			t.expect("404 {error:invalid_code} for an unknown vault and for an unknown secret on a known vault (D3, F2)");
+			t.check("unknown vault -> 404 invalid_code", response.status === 404 && response.value?.error === "invalid_code",
+				brief(response, { codeFormatOk: CODE_RE.test(code) }));
+			const v = await vault(ctx, "main");
+			const known = await enrollAttempt(ctx, `${v.vaultId}.${id(24)}`, "unknown-secret");
+			t.check("known vault, unknown secret -> 404 invalid_code", known.status === 404 && known.value?.error === "invalid_code", brief(known));
 		},
 	},
 	{

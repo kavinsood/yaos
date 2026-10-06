@@ -53,16 +53,31 @@ async function bearerProbe(ctx: Ctx, v: Vault, d: Device) {
 async function revokeWithSocket(ctx: Ctx, v: Vault, victim: Device, revoke: () => Promise<HttpResult>) {
 	const socket = await StreamSocket.connect(ctx, v.vaultId, victim, `victim-${victim.label}`);
 	const from = socket.mark();
+	// undici moves to CLOSING when the server's close frame arrives but fires `close` only when TCP ends: poll for the former.
+	let closeFrameAt: number | null = null;
+	const poll = setInterval(() => { if (closeFrameAt === null && socket.ws.readyState >= WebSocket.CLOSING) closeFrameAt = now(); }, 5);
 	const t0 = now();
 	const response = await revoke();
 	guard(ctx, response.value);
 	const ok = response.status >= 200 && response.status < 300;
-	// 15 s: on today's Worker a close issued from an HTTP-triggered DO handler reaches the client ~10 s after the error frame.
-	const close = await socket.waitClose(ok ? 15000 : 1500);
+	// On today's Worker the close (TCP end) reaches the client ~10 s after the error frame; wait until 16 s after the request.
+	const close = await socket.waitClose(ok ? Math.max(0, t0 + 16000 - now()) : 1500);
+	clearInterval(poll);
 	const errorFrame = socket.events.slice(from).find((e) => e.control?.type === "error");
 	return { response, ok, socket: { errorCode: errorFrame?.control.code ?? null, closeCode: close?.code ?? null,
 		errorBeforeClose: !!errorFrame && !!close && errorFrame.at <= close.at, errorLatencyMs: errorFrame ? round(errorFrame.at - t0) : null,
-		closeLatencyMs: close ? round(close.at - t0) : null, timeline: socket.timeline(from) } };
+		closeLatencyMs: close ? round(close.at - t0) : null, closeFrameLatencyMs: closeFrameAt === null ? null : round(closeFrameAt - t0),
+		timeline: socket.timeline(from) } };
+}
+
+/** T-REVOKE-4403 criteria: error frame and close frame each < 1 s after the revoke request was sent, close code 4403.
+ * The TCP end (undici's `close`) is platform teardown (~10 s on the legacy Worker): recorded, not judged. */
+function revokeTiming(s: { errorCode: unknown; closeCode: unknown; errorLatencyMs: number | null; closeLatencyMs: number | null;
+	closeFrameLatencyMs: number | null }) {
+	const errorOk = s.errorCode === "authority_superseded" && s.errorLatencyMs !== null && s.errorLatencyMs < 1000;
+	const closeOk = s.closeCode === 4403 && s.closeFrameLatencyMs !== null && s.closeFrameLatencyMs < 1000;
+	return { errorOk, closeOk, line: `error frame ${s.errorCode ?? "none"} at +${s.errorLatencyMs ?? "?"} ms (< 1 s: ${errorOk}); close frame at +${
+		s.closeFrameLatencyMs ?? "?"} ms (< 1 s, code ${s.closeCode ?? "none"}: ${closeOk}); TCP end at +${s.closeLatencyMs ?? "?"} ms` };
 }
 
 function revokeOutcome(ctx: Ctx) {
@@ -128,18 +143,22 @@ export const tests: TestDef[] = [
 		id: "T-REVOKE-4403", group: "decision", area: "D7 revoke", expectedBefore: "FAIL",
 		async run(ctx, t) {
 			const r = await revokeOutcome(ctx);
-			t.expect("2xx; victim socket gets error authority_superseded then close 4403, well under 5 s");
+			t.expect("2xx; victim socket gets error authority_superseded and close frame 4403, each < 1 s after the request");
 			if (r.routeMissing) {
 				t.routeMissing(ROUTE_REVOKE, r.primary);
 				t.info("legacy revoke (DELETE /operator/devices/:id, then owner DELETE /vault/:id/devices/:id) -> victim socket", r.legacy);
+				const owner = (r.legacy as { ownerDelete?: Parameters<typeof revokeTiming>[0] } | null)?.ownerDelete;
+				if (owner) t.info(`legacy owner revoke, timing criteria: ${revokeTiming(owner).line}`);
 				return;
 			}
 			t.observe("result", r.primary);
+			const timing = revokeTiming(r.primary);
 			t.check("revoke 2xx", r.primary.ok, r.primary.response);
-			t.check("error authority_superseded before close 4403", r.primary.errorCode === "authority_superseded"
-				&& r.primary.closeCode === 4403 && r.primary.errorBeforeClose, { errorCode: r.primary.errorCode, closeCode: r.primary.closeCode });
-			t.check("closed < 5 s after the request", r.primary.closeLatencyMs !== null && r.primary.closeLatencyMs < 5000,
-				{ closeLatencyMs: r.primary.closeLatencyMs });
+			t.check("error authority_superseded < 1 s after the request", timing.errorOk,
+				{ errorCode: r.primary.errorCode, errorLatencyMs: r.primary.errorLatencyMs });
+			t.check("close frame 4403 < 1 s after the request", timing.closeOk,
+				{ closeCode: r.primary.closeCode, closeFrameLatencyMs: r.primary.closeFrameLatencyMs });
+			t.info(timing.line);
 		},
 	},
 	{
