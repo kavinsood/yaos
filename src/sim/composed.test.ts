@@ -114,6 +114,49 @@ test("settings sync: app.json keys and a snippet reach the other device; the yao
 	assert.deepEqual(JSON.parse(dec(await a.configDir.readBytes("app.json")) ?? "null"), { vimMode: false, spellcheck: false });
 });
 
+/**
+ * A (desktop) syncs app.json and two enabled plugins; then mobile P joins with its own app.json. P's first cfg pass
+ * waits for the cfg catch-up, so the seed decides: "vault" takes A's values, "device" keeps P's. P never enables
+ * the desktop-only plugin, and A keeps it enabled.
+ */
+async function firstContact(seed: "device" | "vault"): Promise<{ a: string | null; p: string | null; pPlugins: string | null; aPlugins: string | null }> {
+	const clock = new VirtualClock();
+	clock.onError = (e) => {
+		throw e;
+	};
+	const net = new SimNet(clock);
+	const a = new SimDevice({ name: "A", clock, net, settings: () => SETTINGS_ON });
+	const p = new SimDevice({ name: "P", clock, net, mobile: true, settings: () => ({ ...SETTINGS_ON, syncSettingsSeed: seed }) });
+	const manifest = (d: SimDevice, id: string, desktopOnly: boolean): Promise<void> =>
+		d.configDir.writeBytes(`plugins/${id}/manifest.json`, enc(JSON.stringify({ id, version: "1.0.0", ...(desktopOnly ? { isDesktopOnly: true } : {}) })));
+	for (const d of [a, p]) {
+		await manifest(d, "draw", true);
+		await manifest(d, "dv", false);
+	}
+	await a.configDir.writeBytes("app.json", enc(JSON.stringify({ vimMode: true })));
+	await a.configDir.writeBytes("community-plugins.json", enc(JSON.stringify(["draw", "dv"])));
+	await boot(clock, [a]);
+	await clock.advance(20_000);
+	await p.configDir.writeBytes("app.json", enc(JSON.stringify({ vimMode: false })));
+	await p.configDir.writeBytes("community-plugins.json", enc(JSON.stringify([])));
+	await boot(clock, [p]);
+	await clock.advance(20_000);
+	await clock.advance(6 * 60_000); // A's next periodic full pass sees P's first-contact ops
+	const json = async (d: SimDevice, f: string): Promise<string | null> => {
+		const t = dec(await d.configDir.readBytes(f));
+		return t === null ? null : JSON.stringify(JSON.parse(t));
+	};
+	return { a: await json(a, "app.json"), p: await json(p, "app.json"), pPlugins: await json(p, "community-plugins.json"), aPlugins: await json(a, "community-plugins.json") };
+}
+
+test("settings sync first contact, seed \"vault\": the joining device waits for the cfg catch-up and takes the vault's values", async () => {
+	assert.deepEqual(await firstContact("vault"), { a: '{"vimMode":true}', p: '{"vimMode":true}', pPlugins: '["dv"]', aPlugins: '["draw","dv"]' });
+});
+
+test("settings sync first contact, seed \"device\": the joining device's values win; a mobile device leaves a desktop-only plugin off", async () => {
+	assert.deepEqual(await firstContact("device"), { a: '{"vimMode":false}', p: '{"vimMode":false}', pPlugins: '["dv"]', aPlugins: '["draw","dv"]' });
+});
+
 test("IndexedDB evicted while the app is down: restart recovers from the mirror, no duplicates, offline edits on both sides survive", async () => {
 	const { clock, devs } = world();
 	const [a, b] = pair(devs);

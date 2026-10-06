@@ -56,6 +56,12 @@ export interface CfgSyncDeps {
 	 * is empty (the first pass on this device), this device's values win over the vault's. Default "vault".
 	 */
 	readonly seed?: "device" | "vault";
+	/**
+	 * The cfg stream has been read up to the relay head in this runtime. While cfgBase is empty (first contact) a
+	 * pass waits for it: an empty view would let this device's values win over the vault's whatever the seed.
+	 * Absent: always ready (unit tests).
+	 */
+	readonly remoteReady?: () => boolean;
 }
 
 export interface CfgPassResult {
@@ -152,6 +158,9 @@ export class CfgSync {
 		this.report("settings-clash", clash ? { items: [clash.id], message: clashMessage(clash) } : null);
 		if (clash) return { plan: { actions: [], skipped: [] }, emitted: 0, written: [], deferred: [], paused: clash.id };
 		const rows = await db.tx([STORE.cfgBase], "readonly", (tx) => tx.getAll(STORE.cfgBase));
+		if (rows.length === 0 && this.deps.remoteReady && !this.deps.remoteReady()) {
+			return { plan: { actions: [], skipped: [] }, emitted: 0, written: [], deferred: [], paused: null };
+		}
 		const base = new Map(rows.map((r) => [r.file, r]));
 		const view = log.view();
 		const preferLocal = this.deps.seed === "device" && rows.length === 0;

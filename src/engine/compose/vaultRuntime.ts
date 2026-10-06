@@ -216,7 +216,7 @@ export class VaultRuntime {
 		});
 		await this.rec.start();
 		if (this.settings.syncSettings) {
-			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, notice: this.notice });
+			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp });
 		}
 		this.snaps = new SnapshotJob({
 			disk: link.disk, side: link.sideFiles, clock: ports.clock, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,

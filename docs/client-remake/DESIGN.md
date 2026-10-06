@@ -1734,6 +1734,8 @@ ones get conflict copies.
     cache rebuild. Later passes, including after turning sync off and on again, are normal 3-way merges.
   - With no base, vault: the vault's register wins over the local value. Device: the local value wins.
   - In both cases, what only one side has is taken and nothing is deleted.
+  - While `cfgBase` is empty, a pass waits until the cfg stream has been read to the relay head in this runtime
+    (`CfgSyncDeps.remoteReady`, the log reached `live`). An empty view would otherwise let local win whatever the seed.
 - Port the legacy `settingsSync/{allowlist, dataJsonGate, configDirKey, clash, lwwReconcile(json canonicalization
   only)}`.
 

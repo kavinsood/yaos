@@ -66,3 +66,21 @@ test("seed device applies only while cfgBase is empty: later first contacts take
 	await b.pass();
 	assert.deepEqual(b.config.json("hotkeys.json"), { "editor:save": [] });
 });
+
+test("first contact waits for the cfg catch-up: no ops and no writes until remoteReady, then the seed decides", async () => {
+	const { log, b } = await vaultAndNewcomer(undefined);
+	b.remoteReady = false;
+	const waiting = await b.pass();
+	assert.equal(waiting.emitted, 0);
+	assert.deepEqual(waiting.written, []);
+	assert.deepEqual(log.opsBy("B"), []);
+	assert.deepEqual(b.config.json("app.json"), { vimMode: false, spellcheck: true });
+	b.remoteReady = true;
+	await b.pass();
+	assert.deepEqual(b.config.json("app.json"), { vimMode: true, spellcheck: true, tabSize: 4 });
+	// Once a base exists the gate is off: an offline pass still runs.
+	b.remoteReady = false;
+	b.config.set("app.json", { vimMode: true, spellcheck: false, tabSize: 4 });
+	await b.pass();
+	assert.ok(log.opsBy("B").some((o) => o.t === "jsonSet" && o.key === "spellcheck" && o.valueJson === "false"));
+});
