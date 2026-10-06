@@ -1,0 +1,21 @@
+src/engine/runtime/blobChunks.test.ts
+  s_5ec5b8c6943789::t_a23363da9b301e 4,153-172
+src/engine/runtime/sessionLoop.ts
+  s_5ec5b8c6943789::t_19a97354fdddec 281-283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a9c16dee4e56802c70f401b89558f4a6bed8ff54",
+  "prompts": {},
+  "sessions": {
+    "s_5ec5b8c6943789": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad23e7dffd5cd7d1b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
