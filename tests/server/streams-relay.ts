@@ -156,7 +156,8 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 	const registry = new FakeRegistry();
 	const revoked = new Set<string>();
 	const store = new StreamStore(storage);
-	const resolved = { ...DEFAULT_STREAM_RELAY_CONFIG, ...config };
+	// The leading-edge commit is off unless a test asks for it: the timing tests below pin the idle/max/bytes rules.
+	const resolved = { ...DEFAULT_STREAM_RELAY_CONFIG, gcQuietMs: 0, ...config };
 	const make = (runtimeEpoch: string) => new StreamRelayService({
 		config: resolved,
 		store: () => store,
@@ -251,6 +252,9 @@ s.test("flag, capabilities, routes and config: inert unless YAOS_STREAMS is exac
 	assert.equal(config.gcIdleMs, 300);
 	assert.equal(config.gcMaxMs, 1500);
 	assert.equal(config.gcMaxBytes, 64 * 1024);
+	assert.equal(config.gcLeadMs, 20);
+	assert.equal(config.gcQuietMs, 1500);
+	assert.equal(readStreamRelayConfig({ YAOS_STREAMS: "true", YAOS_STREAMS_GC_QUIET_MS: "0" }).gcQuietMs, 0, "lead off");
 });
 
 s.test("tickets: purpose streams signs and inspects; other scopes do not open a streams socket", async () => {
@@ -340,6 +344,52 @@ s.test("group commit: idle re-arms, max age caps a busy stream, 64 KiB flushes a
 		timers.advance(700);
 		assert.equal(service.counters.flushIdle, 2);
 	}, { gcMinIntervalMs: 1000 });
+});
+
+s.test("group commit: leading edge commits an isolated frame after gcLeadMs; a burst pays one extra commit at most", async () => {
+	await withStreams(({ connect, append, timers, service }) => {
+		const a = connect(ownerA);
+		const b = connect(deviceB);
+		append(a, "b:doc-1", "l-1", "one");
+		timers.advance(5);
+		append(a, "ns", "l-2", "ns");
+		timers.advance(14);
+		assert.equal(a.receipts().length, 0, "lead window not over (a frame in it does not re-arm it)");
+		timers.advance(1);
+		assert.equal(service.counters.flushLead, 1);
+		assert.deepEqual(a.receipts().map((r) => r.clientFrameId), ["l-1", "l-2"], "both frames in the lead commit");
+		assert.deepEqual(b.frames().map((f) => f.kind), ["provisional", "notice", "committed"]);
+		// Not quiet (last commit 20 ms ago): the burst goes back to the idle window.
+		for (let index = 0; index < 4; index++) { append(a, "b:doc-1", `t-${index}`, "x"); timers.advance(100); }
+		assert.equal(a.receipts().length, 2);
+		timers.advance(200);
+		assert.equal(service.counters.flushIdle, 1);
+		assert.equal(a.receipts().length, 6);
+		// Quiet again only after gcQuietMs without a commit.
+		timers.advance(1_000);
+		append(a, "b:doc-1", "q-1", "x");
+		timers.advance(20);
+		assert.equal(service.counters.flushLead, 1, "1000 ms is not quiet");
+		timers.advance(280);
+		assert.equal(service.counters.flushIdle, 2);
+		timers.advance(1_500);
+		append(a, "b:doc-1", "q-2", "x");
+		timers.advance(20);
+		assert.equal(service.counters.flushLead, 2, "1500 ms after the last commit is quiet");
+		assert.equal(service.pendingFrames(), 0);
+	}, { gcQuietMs: DEFAULT_STREAM_RELAY_CONFIG.gcQuietMs });
+	await withStreams(({ connect, append, timers, service }) => {
+		const a = connect();
+		append(a, "ns", "f-1", "x");
+		timers.advance(20);
+		assert.equal(service.counters.flushLead, 1);
+		timers.advance(2_000);
+		append(a, "ns", "f-2", "x");
+		timers.advance(20);
+		assert.equal(service.counters.flushLead, 1, "min interval holds a lead commit too");
+		timers.advance(980);
+		assert.equal(service.counters.flushLead, 2);
+	}, { gcQuietMs: 1_500, gcMinIntervalMs: 3_000 });
 });
 
 s.test("dedupe: pending resend shares the receipt, reconnect resend is deduped from storage, conflicts are rejected", async () => {

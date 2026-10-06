@@ -160,7 +160,7 @@ error followed by close 1006:
     "maxBinaryMessageBytes": 1049600, "maxTextMessageBytes": 65536, "maxCheckpointBytes": 4194304,
     "feedDefaultLimit": 1000, "feedMaxLimit": 5000, "readDefaultBytes": 1048576, "readMaxBytes": 4194304,
     "readBatchMaxStreams": 128, "rateBytesPerSec": 262144, "burstBytes": 2097152,
-    "groupCommit": { "idleMs": 300, "maxMs": 1500, "maxBytes": 65536, "minIntervalMs": 0 }
+    "groupCommit": { "idleMs": 300, "maxMs": 1500, "maxBytes": 65536, "minIntervalMs": 0, "leadMs": 20, "quietMs": 1500 }
   },
   "canWrite": true,
   "principalId": "...", "deviceId": "...", "role": "owner",
@@ -235,7 +235,12 @@ transaction** at the first of these:
 
 - 300 ms after the last append (idle);
 - 1500 ms after the first buffered append (max age);
-- 64 KiB of buffered payload.
+- 64 KiB of buffered payload;
+- **leading edge:** 20 ms after an append that found the buffer empty with no commit in the last 1500 ms
+  (`leadMs`, `quietMs`; quietMs 0 = off). Appends inside those 20 ms join it; the idle window does not re-arm it.
+  An isolated edit is therefore not held for the idle window. A burst pays at most one extra commit at its start
+  (2 rows per stream that commit and the next both touch, §11.5), and there is at most one lead commit per
+  quietMs. `minIntervalMs` still holds a lead commit.
 
 It is also committed before authority fences and on graceful drain. The commit assigns contiguous seqs in arrival
 order.
@@ -247,7 +252,8 @@ Only after the transaction returns does the server send, in this order:
 
 The invariant is: **durable before receipt, and no seq is visible before its commit.**
 
-Measured append→receipt latency is about 300 ms plus the round trip (§15).
+Measured append→receipt latency is about 300 ms plus the round trip inside a burst (§15), and about 20 ms plus
+the round trip for an isolated append (leading edge).
 
 ### 5.2 Provisional broadcast (`b:*`, `c:*`)
 
@@ -462,13 +468,14 @@ cannot check this.
 | Batched read | 128 streams per request (`readBatchMaxStreams`), one page budget for the batch |
 | Streams sockets per vault | 1000 (`YAOS_STREAMS_MAX_SOCKETS`) |
 | Rate gate (per socket) | Token bucket of 256 KiB/s with a 2 MiB burst, charged on raw received bytes (text counted in UTF-16 units). Overdraft gives 1013. |
-| Group commit | 300 ms idle / 1500 ms max / 64 KiB |
+| Group commit | 300 ms idle / 1500 ms max / 64 KiB; 20 ms leading edge after 1500 ms without a commit |
 | Ticket TTL | 5 min |
 | Pairing code TTL | 15 min |
 
 Env overrides (Worker vars, integer strings):
 
-- `YAOS_STREAMS_GC_IDLE_MS`, `YAOS_STREAMS_GC_MAX_MS`, `YAOS_STREAMS_GC_MAX_BYTES`, `YAOS_STREAMS_GC_MIN_INTERVAL_MS`;
+- `YAOS_STREAMS_GC_IDLE_MS`, `YAOS_STREAMS_GC_MAX_MS`, `YAOS_STREAMS_GC_MAX_BYTES`, `YAOS_STREAMS_GC_MIN_INTERVAL_MS`,
+  `YAOS_STREAMS_GC_LEAD_MS`, `YAOS_STREAMS_GC_QUIET_MS`;
 - `YAOS_STREAMS_RATE_BYTES_PER_SEC`, `YAOS_STREAMS_BURST_BYTES` (floored at the max binary message size);
 - `YAOS_STREAMS_MAX_SOCKETS`.
 
@@ -643,7 +650,7 @@ export interface StreamLimits {
   maxBinaryMessageBytes: number; maxTextMessageBytes: number; maxCheckpointBytes: number;
   feedDefaultLimit: number; feedMaxLimit: number; readDefaultBytes: number; readMaxBytes: number;
   readBatchMaxStreams: number; rateBytesPerSec: number; burstBytes: number;
-  groupCommit: { idleMs: number; maxMs: number; maxBytes: number; minIntervalMs: number };
+  groupCommit: { idleMs: number; maxMs: number; maxBytes: number; minIntervalMs: number; leadMs: number; quietMs: number };
 }
 export interface VaultReady {
   type: "VAULT_READY"; documentId: "streams"; socketSessionId: string;

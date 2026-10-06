@@ -6,7 +6,8 @@
 // capability, daily limit), broadcast at once as PROVISIONAL when its stream is
 // b:/c:, and buffered. The vault-wide buffer commits in one transaction on
 // idle / max age / bytes (StreamStore.commit assigns contiguous seqs in arrival
-// order). After the commit: COMMITTED frames (or COMMIT_NOTICEs for sockets that
+// order); a frame that opens a buffer after a quiet spell commits after the short
+// lead window instead of the idle window. After the commit: COMMITTED frames (or COMMIT_NOTICEs for sockets that
 // already got the PROVISIONAL), then one STREAM_RECEIPTS per origin socket.
 // Invariant: durable before receipt, and every seq is delivered live only after
 // its commit.
@@ -53,6 +54,14 @@ export interface StreamRelayConfig {
 	gcMaxBytes: number;
 	/** Idle commits wait at least this long after the previous commit (0 = off). */
 	gcMinIntervalMs: number;
+	/**
+	 * Leading edge: a frame that finds the buffer empty and no commit in the last gcQuietMs commits (with whatever
+	 * joins it) after gcLeadMs instead of gcIdleMs, so an isolated edit is not held for the idle window. A burst pays
+	 * at most one extra commit (2 rows per stream it touches) at its start; at most one lead commit per gcQuietMs.
+	 * gcQuietMs 0 = off.
+	 */
+	gcLeadMs: number;
+	gcQuietMs: number;
 	/** Per-socket raw admission token bucket (every received message, before parsing). */
 	rateBytesPerSec: number;
 	burstBytes: number;
@@ -64,6 +73,8 @@ export const DEFAULT_STREAM_RELAY_CONFIG: Readonly<StreamRelayConfig> = Object.f
 	gcMaxMs: 1_500,
 	gcMaxBytes: 64 * 1024,
 	gcMinIntervalMs: 0,
+	gcLeadMs: 20,
+	gcQuietMs: 1_500,
 	rateBytesPerSec: 256 * 1024,
 	burstBytes: 2 * 1024 * 1024,
 	maxSockets: MAX_STREAM_SOCKETS,
@@ -74,6 +85,8 @@ export interface StreamsEnv extends StreamsFlagEnv {
 	YAOS_STREAMS_GC_MAX_MS?: string;
 	YAOS_STREAMS_GC_MAX_BYTES?: string;
 	YAOS_STREAMS_GC_MIN_INTERVAL_MS?: string;
+	YAOS_STREAMS_GC_LEAD_MS?: string;
+	YAOS_STREAMS_GC_QUIET_MS?: string;
 	YAOS_STREAMS_RATE_BYTES_PER_SEC?: string;
 	YAOS_STREAMS_BURST_BYTES?: string;
 	YAOS_STREAMS_MAX_SOCKETS?: string;
@@ -92,6 +105,8 @@ export function readStreamRelayConfig(env: StreamsEnv | null | undefined): Strea
 		gcMaxMs: readInteger(env?.YAOS_STREAMS_GC_MAX_MS, d.gcMaxMs, 0, 60_000),
 		gcMaxBytes: readInteger(env?.YAOS_STREAMS_GC_MAX_BYTES, d.gcMaxBytes, 1, 8 * 1024 * 1024),
 		gcMinIntervalMs: readInteger(env?.YAOS_STREAMS_GC_MIN_INTERVAL_MS, d.gcMinIntervalMs, 0, 60_000),
+		gcLeadMs: readInteger(env?.YAOS_STREAMS_GC_LEAD_MS, d.gcLeadMs, 0, 60_000),
+		gcQuietMs: readInteger(env?.YAOS_STREAMS_GC_QUIET_MS, d.gcQuietMs, 0, 3_600_000),
 		rateBytesPerSec: readInteger(env?.YAOS_STREAMS_RATE_BYTES_PER_SEC, d.rateBytesPerSec, 1024, 1 << 30),
 		// The bucket must hold one maximum-size message, or such a message is refused forever.
 		burstBytes: readInteger(env?.YAOS_STREAMS_BURST_BYTES, d.burstBytes, MAX_STREAM_BINARY_MESSAGE_BYTES, 1 << 30),
@@ -201,7 +216,7 @@ interface PendingFrame {
 	ordinal: number;
 }
 
-export type StreamFlushReason = "idle" | "max" | "bytes" | "forced";
+export type StreamFlushReason = "lead" | "idle" | "max" | "bytes" | "forced";
 
 export interface StreamRelayCounters {
 	appendFrames: number;
@@ -211,6 +226,7 @@ export interface StreamRelayCounters {
 	pendingDedupes: number;
 	conflicts: number;
 	commitFailures: number;
+	flushLead: number;
 	flushIdle: number;
 	flushMax: number;
 	flushBytes: number;
@@ -257,7 +273,7 @@ export class StreamRelayService {
 	readonly config: StreamRelayConfig;
 	readonly counters: StreamRelayCounters = {
 		appendFrames: 0, commits: 0, committedRows: 0, storeDedupes: 0, pendingDedupes: 0, conflicts: 0,
-		commitFailures: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0,
+		commitFailures: 0, flushLead: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0,
 		committedBroadcasts: 0, notices: 0, rateCloses: 0, oversizeCloses: 0, rawDrops: 0, authorityCloses: 0,
 		dailyLimitRejects: 0, wakeNotices: 0,
 	};
@@ -272,6 +288,8 @@ export class StreamRelayService {
 	private idleTimer: unknown = null;
 	private maxTimer: unknown = null;
 	private lastCommitAt = Number.NEGATIVE_INFINITY;
+	/** Commit deadline of a buffer opened after a quiet spell (leading edge), else null. */
+	private leadAt: number | null = null;
 	private wakeChecked = false;
 
 	constructor(private readonly options: StreamRelayOptions) {
@@ -325,7 +343,7 @@ export class StreamRelayService {
 			rateBytesPerSec: this.config.rateBytesPerSec,
 			burstBytes: this.config.burstBytes,
 			groupCommit: { idleMs: this.config.gcIdleMs, maxMs: this.config.gcMaxMs, maxBytes: this.config.gcMaxBytes,
-				minIntervalMs: this.config.gcMinIntervalMs },
+				minIntervalMs: this.config.gcMinIntervalMs, leadMs: this.config.gcLeadMs, quietMs: this.config.gcQuietMs },
 		};
 	}
 
@@ -533,9 +551,14 @@ export class StreamRelayService {
 	private schedule(): void {
 		if (this.pendingBytes >= this.config.gcMaxBytes) { this.flush("bytes"); return; }
 		if (this.maxTimer === null) this.maxTimer = this.timers.set(() => { this.maxTimer = null; this.flush("max"); }, this.config.gcMaxMs);
+		const now = this.now();
+		const quiet = this.config.gcQuietMs > 0 && now - this.lastCommitAt >= this.config.gcQuietMs;
+		if (this.pending.length === 1 && quiet) this.leadAt = now + this.config.gcLeadMs;
 		if (this.idleTimer !== null) this.timers.clear(this.idleTimer);
-		const wait = Math.max(this.config.gcIdleMs, this.lastCommitAt + this.config.gcMinIntervalMs - this.now());
-		this.idleTimer = this.timers.set(() => { this.idleTimer = null; this.flush("idle"); }, wait);
+		const floor = this.lastCommitAt + this.config.gcMinIntervalMs - now;
+		const lead = this.leadAt !== null;
+		const wait = lead ? Math.max(0, this.leadAt! - now, floor) : Math.max(this.config.gcIdleMs, floor);
+		this.idleTimer = this.timers.set(() => { this.idleTimer = null; this.flush(lead ? "lead" : "idle"); }, wait);
 	}
 
 	private clearTimers(): void {
@@ -543,6 +566,7 @@ export class StreamRelayService {
 		if (this.maxTimer !== null) this.timers.clear(this.maxTimer);
 		this.idleTimer = null;
 		this.maxTimer = null;
+		this.leadAt = null;
 	}
 
 	pendingFrames(): number {
@@ -562,7 +586,8 @@ export class StreamRelayService {
 		this.pending = [];
 		this.pendingBytes = 0;
 		this.pendingByKey.clear();
-		if (reason === "idle") this.counters.flushIdle++;
+		if (reason === "lead") this.counters.flushLead++;
+		else if (reason === "idle") this.counters.flushIdle++;
 		else if (reason === "max") this.counters.flushMax++;
 		else if (reason === "bytes") this.counters.flushBytes++;
 		else this.counters.flushForced++;
