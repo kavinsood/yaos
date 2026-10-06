@@ -1,0 +1,23 @@
+src/sim/clock.ts
+  s_ed451e485d98d2::t_4da2ffe83ab6fb 3
+src/sim/random.ts
+  s_ed451e485d98d2::t_d5109a0c8b1e0f 3-4
+src/sim/storage.ts
+  s_ed451e485d98d2::t_3a55b39d1bf26b 4-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "922d7d7b4a584f4965ab4e9d628e3c2a66466ee1",
+  "prompts": {},
+  "sessions": {
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
