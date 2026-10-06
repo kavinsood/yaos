@@ -1,0 +1,19 @@
+e2e/relay/smoke.ts
+  s_cb56d0be4b3619::t_44dca82c0426cb 152-153,196-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8e7bf8e260539f3feef0b5f8ae61113933f4cc17",
+  "prompts": {},
+  "sessions": {
+    "s_cb56d0be4b3619": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5855ff9a4be6c478",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
