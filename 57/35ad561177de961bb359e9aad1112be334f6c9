@@ -1,0 +1,25 @@
+src/engine/compose/boundDocs.ts
+  s_ed451e485d98d2::t_ec9a0aed5f8ec3 14,20-23,86-90
+src/engine/compose/protocolEngine.ts
+  s_ed451e485d98d2::t_044283ccb5f560 19,325
+src/engine/compose/vaultRuntime.ts
+  s_ed451e485d98d2::t_f572ddd912bc3d 352,358-378
+src/sim/composed.test.ts
+  s_ed451e485d98d2::t_c8d387e9a27269 263-295
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5735ad561177de961bb359e9aad1112be334f6c9",
+  "prompts": {},
+  "sessions": {
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
