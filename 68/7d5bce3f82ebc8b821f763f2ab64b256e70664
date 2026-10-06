@@ -1,0 +1,29 @@
+src/engine/compose/protocolEngine.ts
+  s_42fec8a9c03dda::t_817ee7aff6515d 24,151,385,387-393
+src/engine/compose/runtimeOps.ts
+  s_42fec8a9c03dda::t_c9d77238228d5a 10,108-109,113-122,128,130-132
+src/engine/snapshots/snapshotJob.test.ts
+  s_42fec8a9c03dda::t_c2a3d9a9fd48ae 57,65-91
+src/engine/snapshots/snapshotJob.ts
+  s_42fec8a9c03dda::t_8c5fcfa99f5579 24-25,86-89,92,161,167-173,176-177,238-247
+src/protocol/errors.ts
+  s_42fec8a9c03dda::t_127c673dd5dec8 29-43
+src/protocol/messages.ts
+  s_42fec8a9c03dda::t_3e8c09811f1935 132-160,169-171,173-174,251-259
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "687d5bce3f82ebc8b821f763f2ab64b256e70664",
+  "prompts": {},
+  "sessions": {
+    "s_42fec8a9c03dda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab7f16ac97bca1a6d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
