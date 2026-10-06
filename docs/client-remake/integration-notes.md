@@ -101,8 +101,8 @@ it to the clipboard). Pairing steps for desktop, Android and iOS: §9.0.
  HostRuntime          wires one paired vault            compose/ProtocolEngine   init/ping/route
    EngineHost         carrier: probe, ping, restart,      VaultRuntime (one per vault epoch)
                       worker -> inline fallback             LogEngine      (runtime/) log side
-   BindingManager     main Y.Doc per open note,             Reconciler     (reconcile/) disk side
-                      CM6 binding, docDelta/docUpdate        BlobQueue      (blobs/)
+   BindingManager     CM6 views as clients of the worker    Reconciler     (reconcile/) disk side
+                      replica: ChangeSets, no CRDT          BlobQueue      (blobs/)
    DiskExecutor       engine disk ops: lanes, slices,        CfgSync        (settings/)
                       write preconditions                    SnapshotJob    (snapshots/)
    vault feed         scan + create/modify/rename/delete     SyncedMirror   A/B side file
@@ -112,19 +112,24 @@ it to the clipboard). Pairing steps for desktop, Android and iOS: §9.0.
             \______________ src/protocol (messages, transports, ids) ______________/
 ```
 
-The host never touches the network, Yjs merging, hashing of synced state or
-compaction. The engine never touches a file: every disk read and write is a
+The host never touches the network, Yjs, hashing or compaction: it holds
+CodeMirror state and does raw disk I/O (DESIGN §d.2; check-deps enforces it,
+§2.2). The engine never touches a file: every disk read and write is a
 rid-correlated request to the host's DiskExecutor (HostLink, §g.2).
 
 ### 2.1 Flows
 
-- **Typing in an open note.** CM6 edits the main replica (BindingManager,
-  §d.2). Local updates go to the engine as `docDelta`; the engine applies them
-  to its worker replica and batches them into outbox frames (§d.4). Remote
-  body frames pass the ingest gate (§d.6), apply to the worker replica, and
-  go to the host as `docUpdate` (flow-controlled per doc, resync past 4x the
-  credit window; compose/boundDocs.ts). The host writes the file itself
-  (Obsidian's own save), so a bound doc is never written by the engine.
+- **Typing in an open note.** Each CM6 transaction's ChangeSet goes to the
+  view's client (host/bodyClient.ts, DESIGN §d.3) and leaves as `bodyPush`
+  (changed ranges and inserted text only, coalesced 16 ms). The engine applies
+  a push that fits as one MAIN transaction on the worker replica
+  (compose/boundBody.ts) and batches it into outbox frames (§d.4). Remote body
+  frames pass the ingest gate (§d.6), apply to the worker replica, and go to
+  every bound view as a `body` entry (ChangeSet JSON; flow-controlled per doc,
+  resync past 4x the credit window; compose/boundDocs.ts), which main rebases
+  over its unconfirmed changes and dispatches outside undo history. The host
+  writes the file itself (Obsidian's own save), so a bound doc is never
+  written by the engine.
 - **A file changed on disk** (external edit, unopened note, create, rename,
   delete). The vault feed sends observations; the Reconciler scans, the
   planner compares disk, synced and remote trees (§f), and the jobs author ns
@@ -177,7 +182,13 @@ files, ~15.4k lines.
 | `sim` | 22 / 6111 | SimRelay, MemStoragePort, VirtualClock, SimNet, devices, actors, faults, invariants, runner |
 
 Dependency rules (§k.2) are enforced by `scripts/check-deps.mjs` (and
-`host/checkDeps.test.ts`): only tests import `sim/**`; the host imports only
+`host/checkDeps.test.ts`). No `host/**` file imports `yjs`, `lib0`,
+`y-protocols` or `y-codemirror.next` (tests and type-only imports included),
+none is reachable from `host/**` through core/ports/protocol (`mainReach`),
+and every whole-document read on main (`getValue()`, `toString()`,
+`sliceDoc()`, `sliceString()`, `getViewData()`, `Text.of()`) must be listed in
+`FULL_READ_ALLOW` with why it is off the typing and event paths. Only tests
+import `sim/**`; the host imports only
 `engine/adapters/webEngine` from the engine (deviation D1); engine core imports
 only the pure adapters (`noopCrypto`, `webHash`, `webClock`, `webRandom`,
 `webEngine`).
@@ -203,6 +214,23 @@ only the pure adapters (`noopCrypto`, `webHash`, `webClock`, `webRandom`,
 - **Bound-view retargets.** Fold events retarget bound docs when an entry
   becomes an alias (`merged`); renames re-open waiting views at the new path
   (bug 11).
+- **Bound views hold no CRDT** (DESIGN §d.2, §d.3). The editor is a client of
+  the worker replica: `bodyPush` out, `body` events in (ChangeSet JSON),
+  rebased over unconfirmed local changes on main, applied with
+  `addToHistory=false` so CodeMirror's own undo stays local. Whole texts cross
+  only as chunked, transferred uploads at bind, re-bind and reload. The bind
+  and reload merges run in the worker (compose/boundBody.ts, boundDisk.ts),
+  which also writes their conflict copies.
+- **Saves of bound views.** Main posts `bodySaveMark{version, seq}` when
+  Obsidian reads the editor for a save; the worker keeps that replica text as
+  a candidate, and `checkSaved` (on the modify event: read, stat, unchanged)
+  promotes only absorbed text to the synced base. `boundSavedText` keeps the
+  reconcile merge from reading a bound editor's own save as an external edit.
+- **Quick preview between split views.** Obsidian copies one view's text into
+  its siblings with `setViewData(data, false)`. The interceptor drops that copy
+  when the sibling is attaching or bound (its edit arrives as an entry) and
+  routes it as a reload otherwise; idle or waiting views get Obsidian's default
+  (binding.ts onExternalReload).
 
 ## 3. Bugs found and fixed
 
@@ -373,8 +401,27 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 **Host**
 - With IndexedDB missing in both carriers, the host stays in `starting` and
   retries with backoff; the UI shows the reason but there is no degraded mode.
-- The host hashes canvas files only for write preconditions (the engine owns
-  every other hash).
+- The host never hashes: write preconditions and config writes send the raw
+  bytes to the engine (`hashRequest`, host/hashOracle.ts). Obsidian has no
+  compare-and-swap, and the guards left on main are O(1): a stat recheck right
+  before the write, and for text a UTF-16 length check inside `vault.process`.
+  A same-length text change, or a binary change, that is not yet in
+  `TFile.stat` can be overwritten. Base 6f7129b closed the text half of that
+  window by comparing the full text in `process`, at O(N) main-thread cost
+  (DESIGN §f.2).
+- Bind-time and reload conflict copies are written by the worker
+  (boundDisk). One not yet written (I/O error, retried every
+  `CONFLICT_COPY_RETRY_MS`) is lost if the worker dies (DESIGN §d.2).
+- With no Worker (inline fallback, §g.5) the engine, Yjs and hashing run on
+  main by design; the main-thread rules cover the host code only.
+- `y-codemirror.next` was removed from package.json, but package-lock.json
+  was left as it was: this worktree's node_modules is shared, so no
+  `npm install` ran. The next install drops the lock entry; nothing imports
+  the package.
+- An editor whose pushes keep crossing foreign entries keeps rebasing and
+  re-pushing (DESIGN §d.3 liveness): edits land only when foreign entries
+  arrive slower than one per round trip. The seeded fuzz converges with about
+  93 % of pushes rejected; nothing is lost, only delayed.
 - The worker carrier depends on `Function.prototype.toString` returning the
   bundle's source (D2). If a platform hid it, `workerScript()` returns null and
   the host uses inline. This is verified in V8 and JavaScriptCore, but not yet on
