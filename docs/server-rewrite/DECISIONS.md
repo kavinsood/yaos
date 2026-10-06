@@ -656,7 +656,10 @@ P3a gap calls (accepted; marked `DECISIONS-GAP` in code):
   requests and messages reset it (DO limits page). One message and then silence on a worst-case stream runs
   ≈ 10 steps (≈ 13 ms) in one window, over Free's 10 ms; the platform tolerates infrequent overruns ("built-in
   flexibility", Workers limits page). A vault-DO alarm per step would give each a fresh budget; add it only if
-  P5 shows `exceededCpu`.
+  P5 shows `exceededCpu`. P5: none, but scratch-3's account is Workers Enterprise, so Free's 10 ms is not enforced
+  there and cannot show up. Worker CPU p50 0.6 ms (the old server: 2.4 ms). Over 10 ms (GraphQL
+  `workersInvocationsAdaptive`): claim 64 ms and owner-code 7–46 ms in the Worker, both rendering the setup QR
+  (O12), and VaultDO 4 MiB stream reads 21–24 ms. Still open until a Free account is measured.
 - O9 → resolved: a daily-limit failure on any route, including one thrown by a DO RPC, is `503 cf_daily_limit`
   with Retry-After (router.ts:187-188; WB in tests/server/reset.ts). Revoke under the latch changes nothing and
   says so; the device keeps its read access until the reset (≤ 24 h). Kept: a gate shut in memory only would not
@@ -677,8 +680,9 @@ P3b gap calls (accepted; marked `DECISIONS-GAP` in code):
 - G41 A vault that answers `unknown_vault`, or whose journal row vanished mid-run, ends the run `404 unknown_vault`;
   `restore_unsupported` and `invalid_restore_point` from the vault drop the row.
 - G42 An `at` before the vault was created → `400 invalid_restore_point`, with no PITR call. So does an `at` that
-  Cloudflare's PITR history does not reach ("Requested time is before this database existed."; P5): nothing was
-  done to the vault, and the journal row is dropped.
+  Cloudflare's PITR history does not reach (P5: "Requested time is before this database existed.", or "This
+  database has no history." before the first snapshot): nothing was done to the vault, and the journal row is
+  dropped.
 - G43 Finish reads "`pending_restore_id` still set" as "equals this restoreId": a restore in flight at T leaves its
   own marker in the rewound state, and rewinding never clears that one.
 - G44 Enroll's restore 503 runs before the code is read, so a malformed body also gets it.
@@ -693,6 +697,29 @@ P3b gap calls (accepted; marked `DECISIONS-GAP` in code):
   (step 1 never ran), but its authority actions answer `409 restore_in_progress` until the operator presses restore
   again, which resumes the journaled `at`.
 
+P5 findings:
+
+- O12 (decision pending) The setup QR is rendered in the Worker (setupQr.ts, `qrcode-generator` `make()`: 8 ms cold,
+  2.6 ms warm on a laptop for the 195-character URL, version 10). It makes claim and owner-code the only Worker
+  routes over Free's 10 ms CPU (O10). Options: render it in the console page (G25 drops `mobileSetupQrDataUrl`; the
+  console is its only reader), or keep it and rely on the platform tolerating rare overruns.
+- O13 A refused upgrade (relay-wire §3.1: accept, error frame, close, 101; vault/cloudflare.ts) logs as a VaultDO
+  `scriptThrewException` "Network connection lost" on scratch-3. Clients get the frame and the close code (the
+  refusal rows pass); the cost is noise in error analytics.
+- O14 Two smoke receipts took 1525 and 1660 ms (the next ones 457 and 373 ms) with the same delay at both peers, so
+  the commit itself was late. Unexplained; untested guess: frames held during the dedupe index build and
+  rescheduled (relay.ts:684-689). p90 only; no check failed.
+- O15 (accepted; platform) A restore lands on Cloudflare's latest PITR snapshot at or before `at`, not at `at`.
+  Measured on scratch-3 (one frame every 2 s, restored every 2 s): snapshots about a minute apart, the first 45–55 s
+  after the vault's init, plus one just before each rewind. So a restore can drop up to a minute of content before
+  `at`, and a vault has no restore point in its first minute. The `200` cannot say which snapshot (a bookmark
+  carries no time); the console's restore text, confirm and result say "the last snapshot at or before".
+  A restore to a point before an earlier restore works (history survives a restore).
+- O16 (accepted risk) A step-1 error that is permanent but not classified (G42 lists the two PITR ones seen) keeps
+  the journal row: `503 restore_incomplete`, the alarm at ≤ 1 h, and the vault's revoke, owner-code and reset
+  frozen (`409 restore_in_progress`) until the vault is deleted; there is no cancel. Seen once on scratch-3, from
+  the unclassified "before this database existed", now classified.
+
 ## 9. Work plan
 
 | Phase | Work | Exit criterion |
@@ -702,7 +729,7 @@ P3b gap calls (accepted; marked `DECISIONS-GAP` in code):
 | P2 Identity | Claim, login and sessions, vaults, owner code, D3 codes, enroll (replay, D3), D4 tickets, devices list and revoke (D7 gate) | D2–D7 BB + BASELINE green on local dev; T-PAIR-NOWRITE, T-HOTPATH, T-ROWS-WB (identity rows) green |
 | P3 Hardening | H1–H8, D8a/D8c, D9 (`v/<vaultId>/<address>` keys); D8b | Every BB row except T-RESTORE-MANUAL green locally (blob rows with local R2); all WB green; H2 cold-scan CPU and D8a DROP+CREATE billing measured |
 | P4 Console | `GET /` page and `GET /mobile-setup` (D5) | Manual run on local dev: claim → vault → QR → enroll → revoke → reset; no external assets |
-| P5 Deploy over scratch-3 | The coordinator deploys: one migration that deletes the old DO classes and adds the two new ones (the account is at the namespace cap) | The full suite is green on scratch-3 except the documented SKIPs; T-RESTORE-MANUAL done once by hand; §15 latencies re-measured |
+| P5 Deploy over scratch-3 | The coordinator deploys: migration v3 deletes the old DO classes, then v4 adds the two new ones (one migration doing both failed with `10067` at the 500-namespace cap: the API counts the new classes before the deletions) | The full suite is green on scratch-3 except the documented SKIPs; T-RESTORE-MANUAL done once by hand; §15 latencies re-measured |
 
 Status 2026-10-06: P0–P3 done. Combined local run at 15e9bf3: `conformance-local-final-20261006T105356Z.json`,
 49 pass, 0 fail, 1 SKIP (T-BLOB-UNAVAILABLE needs an unbound bucket; it passes in
@@ -711,4 +738,22 @@ QR and `obsidian://` link → enroll (replay 200, reuse `409 used_code`) → rev
 `authority_superseded` +25 ms, list empty, token `401`) → reset (device kept, socket 1001, old epoch `409`) → restore
 (`501 restore_unsupported` message) → vault create and delete → sign out and in → `/mobile-setup` (fragment dropped,
 `connect-src 'none'` blocks fetch, foreign host and bad code refused). No external request. Fixed on the way: `.mono`
-inputs overflowed the card at 375 px; the `invalid_restore_point` text now names the vault's creation (G42). P5 next.
+inputs overflowed the card at 375 px; the `invalid_restore_point` text now names the vault's creation (G42).
+
+Status 2026-10-06 (P5): deployed over scratch-3 in two steps (v3, then v4; §9 row). Suite at c754d59:
+`conformance-scratch3-p5-20261006T113415Z.json`, 47 pass, 1 fail, 2 SKIP (T-BLOB-UNAVAILABLE: the bucket is bound;
+T-DAILY: no debug route). The fail, T-CODEC-VALID ("timeout waiting for VAULT_READY"), was the network: the Worker
+logged `responseStreamDisconnected` 40 ms in and the vault DO's fetch `canceled` after 1 ms, on a client behind
+WARP; three re-runs pass (`conformance-scratch3-codecvalid-rerun{1,2,3}-*.json`). e2e/relay/smoke.ts, with `Origin`
+on operator writes (G15), 31/31 three times (`client-e2e-smoke-deployed-new-{1,2,3}-*.json`). §15 p50 medians, old
+deployed → new: ticket 107 → 91; socket connect 317 → 170; peer PROVISIONAL 57 → 61; own receipt 370 → 989; peer
+COMMIT_NOTICE 357 → 994; peer COMMITTED 395 → 374; ping 67 → 64; 12 × 8 KiB burst 467 → 1150; feed 249 → 97; read
+page 238 → 93; checkpoint put 266 → 117. The three slower rows are H8: smoke sends each append right after the last
+receipt, inside the 1 s `minIntervalMs`; its first sample, from idle, is 372 ms (old 405). relay-wire §15 (the text
+after the table) and :163 (`minIntervalMs: 0`) are updated at the merge. T-RESTORE-MANUAL failed first: PITR
+refused T, 11 s after the vault's init, and the runner retried forever with the vault's authority frozen; fixed in
+55cfd32 and f9ce3a1 (G37, G42, O15). Re-run on 55cfd32 (version 243e812e) with T and T2 each 75 s after the
+writes they must keep and the vault's first snapshot awaited: 42 pass, 0 fail
+(`restore-manual-scratch3-20261006T125029Z.json`). Final suite at f9ce3a1 (version 249ab495):
+`conformance-scratch3-p5-final-20261006T125917Z.json`, 48 pass, 0 fail, the same 2 SKIP. P5 is done. CPU: O10,
+O12. Open: O12 (decision), O13, O14, O16.
