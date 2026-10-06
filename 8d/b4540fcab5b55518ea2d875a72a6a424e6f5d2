@@ -1,0 +1,21 @@
+src/host/ui/api.ts
+  s_441b74abbd0702::t_820c87171d70ad 11-14,35-40,150-170,176,183
+src/host/ui/pairFlow.ts
+  s_441b74abbd0702::t_348e82503a1efb 6-8,11,13,17-32,37,52-61,78-91,93-94,97,99-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8db4540fcab5b55518ea2d875a72a6a424e6f5d2",
+  "prompts": {},
+  "sessions": {
+    "s_441b74abbd0702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5b78666751a5e84f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
