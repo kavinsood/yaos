@@ -342,7 +342,7 @@ k wraps:     §11.2
 | deviceId | **New.** The relay asserts the row's deviceId (relay-wire §4.1). Without this binding, the server could re-attribute a frame, shifting dedupe and replay state (§8) and the planner's own-frame matching (DESIGN §c.13). deviceId is client-chosen at enroll (relay-wire §2.4), so it is known at seal time. T_adopt seals under the adopter's own deviceId (DESIGN §d.5, unchanged). |
 | clientFrameId | Frame identity. Unique per device across the vault (relay-wire §1). |
 | coversSeq (checkpoints) | As today. The inner `CheckpointContent.coversSeq` check stays (DESIGN §b.1). |
-| address (blobs) | The server cannot serve one blob's bytes at another address. The reader also checks sha256 after opening (`src/engine/body/refs.ts:58-59`). |
+| address (blobs) | The server cannot serve one blob's bytes at another address. The reader also checks sha256 after opening (`src/engine/body/refs.ts:50-59`). |
 
 - **seq is NOT bound.** The relay assigns it after the append (relay-wire §5). Order is protected per device by
   frameNo (§8), not by the AEAD.
@@ -934,8 +934,8 @@ Crypto is never on the hot path. Bootstrap is bound by the network and the plann
 - **Static audit (this worktree).** Every crypto call site seals or opens outside the transaction body:
   - `src/engine/runtime/docRuntime.ts:109, :246, :256`;
   - `src/engine/runtime/engine.ts:167, :225`;
-  - `src/engine/runtime/ingestRow.ts:36`;
-  - `src/engine/runtime/catchUp.ts:112`;
+  - `src/engine/sync/ingestRow.ts:36`;
+  - `src/engine/sync/catchUp.ts:112`;
   - `src/engine/runtime/quarantineRelease.ts:28`;
   - `src/engine/runtime/mirrorIo.ts:186`.
 
@@ -952,7 +952,7 @@ rather than an accident.
 
 | Feature (legacy or possible) | Under suite 1 | Client replacement |
 |---|---|---|
-| Server check that a blob's bytes match its sha256 | Impossible: opaque address | AEAD tag plus sha256 after open (`src/engine/body/refs.ts:58-59`) |
+| Server check that a blob's bytes match its sha256 | Impossible: opaque address | AEAD tag plus sha256 after open (`src/engine/body/refs.ts:50-59`) |
 | `X-YAOS-Content-SHA256` / `-Size` headers (`server/src/http.ts:7`) | Leak plaintext hash and size | The client never sends them (server ask A2 removes them) |
 | Server-side debugging of content | Impossible | Diagnostics carry `HMAC(kDiag, ·)` hashes (§6.4). The user shares a bundle and correlates locally |
 | Point-in-time restore (D8b) | **Still works**: opaque rows rewind | Old keys stay in the keyring. `k` is re-published (§11.5) |
