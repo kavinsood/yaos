@@ -16,26 +16,27 @@
  * Bound docs (open in an editor, §d.2): the replica is merged, the file is never
  * written; S records the disk side (hash(D), F, base D) and the editor's save
  * brings the file to the CRDT text.
+ *
+ * Canvas docs take the same steps in canvasJob.ts (record-per-line merge text,
+ * record-level CRDT apply, logical-hash write skip).
  */
 
 import type * as Y from "yjs";
-import type { DiskFingerprint, DocId, LocalEntry, MergeResult, PlannerOp, SyncedEntry, VaultPath } from "../../core/types";
+import type { DiskFingerprint, LocalEntry, MergeResult, SyncedEntry } from "../../core/types";
 import { canonicalizeMarkdown, exactFingerprint, markdownContentHash } from "../../core/hash/markdownLf";
 import { utf8Decode, utf8Length } from "../../core/hash/utf8";
 import { merge } from "../../core/merge/merge";
 import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
-import { brakeKey, isShrinkingOverwrite } from "../../core/plan/brake";
-import { conflictName } from "../../core/plan/conflictName";
+import { isShrinkingOverwrite } from "../../core/plan/brake";
 import type { IntentRecord } from "../store/schema";
+import { mergeCanvas } from "./canvasJob";
+import { MAX_CAS_ATTEMPTS, overwriteAllowed, writeConflictCopy, type ReconcileOp } from "./contentSteps";
 import type { BodyHandle } from "./deps";
 import { writeOk, type Env, type JobOutcome } from "./diskJobs";
-import { intentId } from "./blobJobs";
-import { hashBytes, MAX_TEXT_FILE_BYTES } from "./localState";
+import { MAX_TEXT_FILE_BYTES } from "./localState";
 import { makeBase } from "./store";
 
-export const MAX_CAS_ATTEMPTS = 3;
-
-type ReconcileOp = Extract<PlannerOp, { op: "reconcileContent" }>;
+export { MAX_CAS_ATTEMPTS } from "./contentSteps";
 
 /** Apply minimalDiff(from -> to) to the Y.Text in one transaction (core applyEditsTo). */
 export function applyMinimalDiff(h: BodyHandle, ytext: Y.Text, from: string, to: string): number {
@@ -45,28 +46,12 @@ export function applyMinimalDiff(h: BodyHandle, ytext: Y.Text, from: string, to:
 	return edits.length;
 }
 
-/** Job-level mass-overwrite brake for md writes (the planner cannot know M's size). */
-function overwriteAllowed(env: Env, docId: DocId, path: VaultPath, oldBytes: number, newBytes: number, transition: string): boolean {
-	const { ctx } = env;
-	if (!isShrinkingOverwrite(ctx.brake, oldBytes, newBytes)) return true;
-	const key = brakeKey("overwrite", docId, path, transition);
-	if (env.approvedOverwrites.has(key)) return true;
-	const threshold = Math.max(ctx.brake.minCount, ctx.brake.ratio * ctx.store.synced.size);
-	if (ctx.window().overwrite + 1 <= threshold) return true;
-	env.heldOverwrites.push({ key, path });
-	return false;
-}
-
 export async function reconcileContent(env: Env, op: ReconcileOp): Promise<JobOutcome> {
 	const { ctx } = env;
-	if (op.kind === "canvas") {
-		ctx.notice("warn", "canvas-unsupported", `canvas sync is not implemented yet: ${op.path}`, `canvas:${op.docId}`);
-		return "fail";
-	}
-	const h = await ctx.log.acquireBody(op.docId, "markdown");
+	const h = await ctx.log.acquireBody(op.docId, op.kind);
 	if (!h) return "fail";
 	try {
-		return await mergeMarkdown(env, op, h);
+		return op.kind === "canvas" ? await mergeCanvas(env, op, h) : await mergeMarkdown(env, op, h);
 	} finally {
 		h.release();
 	}
@@ -121,27 +106,10 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	let intent: IntentRecord | null = null;
 	const local: LocalEntry[] = [];
 	if (result.kind === "conflict") {
-		const view = ctx.log.view();
-		const copyPath = conflictName({
-			path: op.path, docId, deviceLabel: ctx.deps.deviceLabel, nowMs: ctx.now(), tzOffsetMinutes: ctx.deps.tzOffsetMinutes?.() ?? 0,
-			pathKey: ctx.pk, isTaken: (k) => ctx.local.has(k) || view.remoteByPathKey.has(k),
-		});
-		intent = {
-			id: intentId("conflict-copy", docId, op.path), docId, kind: "conflict-copy", subjectHash: markdownContentHash(D),
-			fromPath: op.path, toPath: copyPath, step: 1, createdAtMs: ctx.now(),
-		};
-		await ctx.commit({ intentPut: [intent] });
-		const res = await ctx.exec({ t: "write", area: "vault", path: copyPath, data: { t: "bytes", bytes: rd.bytes }, precondition: { t: "absent" }, docId, purpose: "conflict-copy" });
-		const out = writeOk(res);
-		if (!out) {
-			await ctx.commit({ intentDrop: [intent.id] });
-			env.scan.markDirty(copyPath, null);
-			return "fail";
-		}
-		ctx.echo.expectWrite(ctx.pk(copyPath), out.stat.size, out.stat.mtimeMs);
-		ctx.noteDestructive("conflict");
-		const hb = hashBytes("markdown", rd.bytes);
-		local.push(ctx.localEntry(copyPath, out.stat, "markdown", hb.hash, out.fingerprint));
+		const cc = await writeConflictCopy(env, op, rd.bytes, markdownContentHash(D), "markdown");
+		if (!cc) return "fail";
+		intent = cc.intent;
+		local.push(cc.local);
 	}
 
 	// Write M over the path, CAS on the fingerprint we read.

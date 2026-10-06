@@ -1,7 +1,7 @@
 /**
  * Disk-only plan ops (DESIGN §f.2): rebind, diskRename, diskMaterialize,
  * diskTrash, syncedPut/syncedDrop. Blob transfers live in blobJobs.ts, the
- * markdown merge in mergeJob.ts.
+ * markdown merge in mergeJob.ts, canvas merge / materialize in canvasJob.ts.
  *
  * Every job returns "ok" or "fail". A failed job leaves S untouched (the next
  * plan sees the same or newer facts and decides again) and the runner skips
@@ -107,10 +107,7 @@ export async function diskMaterialize(env: Env, op: Op<"diskMaterialize">): Prom
 	const r = ctx.log.view().remote.get(op.docId);
 	if (!r || r.state !== "live") return "fail";
 	if (r.kind === "blob") return materializeBlob(env, op, r.blob);
-	if (r.kind === "canvas") {
-		ctx.notice("warn", "canvas-unsupported", `canvas sync is not implemented yet: ${op.path}`, `canvas:${op.docId}`);
-		return "fail";
-	}
+	if (r.kind === "canvas") return "fail"; // the runner routes canvas docs to canvasJob.diskMaterializeCanvas
 	const h = await ctx.log.acquireBody(op.docId, "markdown");
 	if (!h) return "fail";
 	try {
