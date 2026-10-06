@@ -13,13 +13,17 @@ notes (wp-a..wp-d-notes.md). Section letters (§x.y) refer to DESIGN.md.
 
 | Gate | Command | Result |
 |---|---|---|
-| Typecheck | `npm run typecheck:client` | clean |
-| Dependency rules | `node scripts/check-deps.mjs` | 0 errors, 0 warnings |
-| Unit + sim (200 seeds) | `npm run test:client` | see §6 |
-| Sim, 1000 seeds | `YAOS_SIM_SEEDS=1000 npm run test:client` | see §6 |
-| Full-client e2e, local relay | see §7 | see §7 |
-| Full-client e2e, deployed relay | see §7 | see §7 |
-| Production build | `node esbuild.config.mjs production` | see §8 |
+| Typecheck | `npm run typecheck:client` | clean (5735ad5) |
+| Dependency rules | `node scripts/check-deps.mjs` | 0 errors, 0 warnings (5735ad5) |
+| Unit + sim (200 seeds) | `npm run test:client` | 743 tests pass (5735ad5) |
+| Sim, 1000 seeds | `YAOS_SIM_SEEDS=1000 npm run test:client`, run as the parallel sweep in §6 | 0 bad in every config (5735ad5, §6) |
+| Full-client e2e, local relay | §7 | full 53/53, smoke 56/56, engines 27/27 (5735ad5) |
+| Full-client e2e, deployed relay | §7 | 50/50, scenario 7 skipped as remote (5735ad5 + harness 5b1803e) |
+| Production build | `node esbuild.config.mjs production` | OK, plugin smoke passes (5b1803e, §8) |
+
+The last code change is 5735ad5; 5b1803e touches only the e2e harness
+(onboarding sends an `Origin` header, §7). The commit after it holds only
+these notes.
 
 ## 2. Architecture
 
@@ -186,6 +190,7 @@ devices).
 | 41 | The suffixed-restore moved-on check compared S with the requested path only; a pass that had already projected the revived entry at its suffixed path got the requested path (another doc's file) written back, and the same push-and-merge-back loop followed. | sim seed 193 F DEV3 | d480b1a: S1 also leaves S alone when it already sits at the final path. |
 | 42 | The user renamed n2 -> r5 and created a new n2.md before ns was ready while a peer moved the doc n2 -> r1. The re-occupied-source inference (bug 19) only looked at docs whose remote path was still the synced path, so the new n2.md was carried to r1.md as the doc's file and r5.md became a new doc. | sim seed 21 F DEV3 | b6e2686: the observed rename wins over a concurrent remote move as well (nsRename to r5); the file at the old path is planned as new once S has left it. |
 | 43 | A local delete that waited (`pending-body` or ns not ready, D12) left S in place, so a new file the user then created at the path merged into the old doc as a save. The diff kept fragments of the old text, the peer's concurrent delete of that text took them, and a token of the new note was lost. | heavy seed 92 (fix sweep: heavy 22, DEV5 F 140) | e3982bc: the waiting delete is decided (`SyncedEntry.fileGone`): the file at S's path is a new file from then on, and is created once the delete has gone out (a productive pass's follow-up covers the paths it vacated). A file at the doc's remote path is still its own (heavy 22: an own rename marked offline). See D17. |
+| 44 | A renamed the open note n6 -> r4 before ns was ready (a waiting delete, D17) and another note n4 -> r2, while a peer moved the doc n6 -> r2. The first ns-ready pass took the file at r2, the doc's remote path, as the doc's own: the other note merged into the doc as a conflict, r4 became a duplicate doc, and the views on r4 stayed bound to the old doc. That doc's merge never wrote r2 (a bound doc waits for the editor's save, and that save could only reach r4). | sim seed 452 F DEV3 | 5735ad5: a file that an observed rename brought from another path is not the doc's (`localFor`, `remoteOwns`), so the doc follows its own rename and the other note is a new doc. Engine side: `BoundDocs.path` follows vault renames (the views move with the file), and a pass that creates a doc at a bound view's path retargets those views to it. |
 
 Sim-only fixes found on the way (no client change): epoch names reused across
 resets, one global clock skew instead of per-device, ledger coverage of
@@ -212,7 +217,7 @@ waiting on the blob queue.
 | D14 | §i.5 | After IDB loss, own body rows the new store never receipted, and frames imported from the outbox mirror, move the body version like remote rows (bug 33). Mirror import sets `bodyVersion = null`, which the planner reads as "remote changed" rather than doing the spec's content comparison (bug 28). | Otherwise own text that reached the relay but not the disk looks synced. The null version is a conservative superset: one extra reconcile per recovered doc. |
 | D15 | §f.6 | An observed rename onto the path of a remote doc never materialized here moves the renamed doc; the remote doc waits for the path (bug 34). | The file came from the rename source, so it is the moved doc's; merging it into the remote doc made the bound editor refuse writes and every pass add a conflict copy. |
 | D16 | §f.2 | A remote move whose target holds an untracked copy of the doc's own bytes trashes that copy (no sync op, `diskTrash` with a hash precondition, braked like any trash), then moves (bug 38). Other bytes at the target are a new file (created; the move waits). | The copy can never be created (it folds as a duplicate of the doc moving in), so the move would wait forever. Trash keeps the bytes. |
-| D17 | §c.7, §f.2 | A local delete that has to wait marks `SyncedEntry.fileGone` (bug 43): the delete is decided at the first pass that sees the file missing, even offline or before ns is ready. A file then at S's path is a new doc (created after the delete goes out), not a save of the old one. The mark is a braked `nsDelete` unit (rejecting the brake re-materializes the doc); the later `nsDelete` is not braked again. Edit beats delete still applies while waiting: with a remote edit the doc re-materializes at its remote path, or, if the new file sits at that same path, the file merges into the doc (the mark is cleared). The mark is not in the synced mirror. | DESIGN treats delete-then-create at one path as a save. Merging an unrelated new note into the old doc lost text (the diff keeps fragments of the old text, which a peer's concurrent delete then removes). Rename inference is off before ns is ready, so a file at the doc's remote path stays its own. |
+| D17 | §c.7, §f.2 | A local delete that has to wait marks `SyncedEntry.fileGone` (bug 43): the delete is decided at the first pass that sees the file missing, even offline or before ns is ready. A file then at S's path is a new doc (created after the delete goes out), not a save of the old one. The mark is a braked `nsDelete` unit (rejecting the brake re-materializes the doc); the later `nsDelete` is not braked again. Edit beats delete still applies while waiting: with a remote edit the doc re-materializes at its remote path, or, if the new file sits at that same path, the file merges into the doc (the mark is cleared). The mark is not in the synced mirror. | DESIGN treats delete-then-create at one path as a save. Merging an unrelated new note into the old doc lost text (the diff keeps fragments of the old text, which a peer's concurrent delete then removes). Rename inference is off before ns is ready, so a file at the doc's remote path stays its own, unless an observed rename brought it there from another path (bug 44). |
 
 ## 5. Honest gaps
 
@@ -244,8 +249,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   `visible` / `resume`, not on config-dir file events.
 - The client trusts the relay's `retryAfter` (capped at one day).
 
-- One deployed full-client run took 15.5 s for a fresh device bootstrap of
-  the small e2e vault (0.9 s locally); not investigated (one sample).
+- A fresh device bootstrap of the small e2e vault took 15.5 s and 5.1 s in
+  the two deployed full-client runs (0.8-0.9 s locally); not investigated
+  (one sample per run, two relay builds).
 - `fileGone` (D17) lives in the store only: after an IDB loss the mirror
   brings S back without it, so a file re-created at the path while the delete
   waited merges into the old doc as a save (the pre-D17 behaviour).
@@ -285,12 +291,46 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   elsewhere.
 - The worker entry test can't reach a read without a relay; reads are
   covered by the e2e.
+- Bug 44's engine half (views retargeted to a doc created under them,
+  `retargetCreatedUnderViews`) is reached only by sim seed 452 (DEV=3 F). The
+  composed test for that scenario passes without it too, because its engine
+  restart re-binds the views on its own; it guards the scenario, not the
+  method. The planner half has a unit test that fails without the fix.
 - `idbStorage.test.ts` "even a zero-delay timer is enough to lose the tx" is
   timing-sensitive and failed once under heavy machine load (passes alone).
 
 ## 6. Simulation results
 
-_Filled in after the helper branches are merged; see the run log at the end._
+`src/sim/run.test.ts` runs the composed engine (one per device, real
+planner, reconciler, LogEngine, MemStoragePort) against SimRelay on one
+VirtualClock and checks the DESIGN §l invariants after every seed:
+convergence (byte-identical vaults and synced `.obsidian` files; an open view
+that never bound is reported here too), quiet (no pending work after the
+settle), clean (engine/host state), tokens (every acknowledged typed token is
+in some vault, trash or conflict copy) and destroyed (no acknowledged content
+lost). `npm run test:client` runs 200 seeds. The 1000-seed gate ran as a
+parallel sweep over the same `runSim` (11 shards of
+`runSim({ seed, devices, faults, faultRate })`) in four configurations:
+
+| Config | Seeds | Before the fix round (after 23dda34) | 42bf734 | 8446af3 | 5735ad5 (final) |
+|---|---|---|---|---|---|
+| 2 devices, no faults | 1-1000 | 2 bad (285, 723) | 0 | 0 | 0 |
+| 3 devices, default faults | 1-1000 | 38 bad, 15 token/destroyed | 3 bad (21, 405, 452), 1 token | 1 bad (452) | 0 |
+| 5 devices, default faults | 1-250 | 9 bad, 4 token/destroyed | 0 | 0 | 0 |
+| 2 devices, faults at rate 0.35 (heavy) | 1-250 | 13 bad, 9 token/destroyed | 2 bad (79, 92), 1 token | 0 | 0 |
+
+"Bad" is a seed with any violation; "token/destroyed" counts the seeds whose
+violations include a lost acknowledged token or destroyed content, the ones
+that would lose user text. Each failing seed was replayed with an observer
+(`obs.ts`: files, views, bindings, S/remote rows and the plan per pass) and
+fixed at the cause; bugs 23-44 in §3 cite their seeds. The heavy config is
+the one most likely to regress: it found the IDB-loss and outbox-mirror
+ordering bugs (heavy 119, 246) and the waiting-delete case behind D17
+(heavy 92).
+
+Final run on 5735ad5: 3000 + 250 + 250 seeds, 0 bad, 0 token failures;
+`npm run test:client` (743 tests including the 200-seed sim) passes.
+
 
 ## 7. End-to-end results
 
@@ -321,49 +361,80 @@ restart from IndexedDB and offline start.
 
 | Run | Tree | Result |
 |---|---|---|
-| full-client, local relay (`--fresh`) | d2b5156 | 53/53 |
-| smoke (adapters), local | d2b5156 | 56/56 |
-| engines (`--relay-restart`), local | d2b5156 | 27/27 |
-| full-client, deployed `yaos-relay2-scratch-3` (operator context) | 8939943 | 50/50 (scenario 7 skipped: remote) |
+| full-client, local relay (`--fresh`) | 5735ad5 | 53/53 |
+| smoke (adapters), local | 5735ad5 | 56/56 |
+| engines (`--relay-restart`), local | 5735ad5 | 27/27 |
+| full-client, deployed `yaos-relay2-scratch-3` (operator context) | 5735ad5 + 5b1803e harness | 50/50 (scenario 7 skipped: remote) |
 
-Latencies (ms) from the full-client runs, p50 / p95 (n). The host watcher
-delay is 100 ms, the editor coalesce 16 ms; the clients and the local relay
-share one laptop, which also ran the sim sweeps during the local run.
+Earlier runs: local d2b5156 (53/56/27, all pass) and deployed 8939943
+(50/50), recorded when the full-client e2e branch was merged. Run logs are in
+`experiments/logs/client-e2e-full-{local-20261006T113823Z,deployed-20261006T114251Z}.json`.
+
+The deployed relay changed between the two deployed runs: `scratch-3` was
+redeployed (around 17:04 IST, not by this pass) with the
+`experiments/yaos-server` build. That build enforces its D5 rule: operator
+JSON routes and `/claim` need a same-origin `Origin` header, which a browser
+sends and the Node harness did not, so the first attempt failed at operator
+login with 403 `forbidden_origin` (no client code involved). 5b1803e makes
+the harness onboarding send `Origin: <relay origin>` on those routes; the
+rerun passed. The new build also serves blobs over HTTP (`blobPath` = `http`
+on every client; the local relay and the earlier deployed build used `log`).
+
+Latencies (ms) from the 5735ad5 full-client runs, p50 / p95 (n). The host
+watcher delay is 100 ms, the editor coalesce 16 ms; the clients and the local
+relay share one laptop. Single-sample rows (n = 1) are noisy: the local relay
+restart rows include the reconnect backoff, which moved them from 252 / 2847
+ms in the d2b5156 run to 2960 / 5949 ms here. The deployed column is a
+different relay build from the earlier run (above); its text-to-peer p50s are
+0.4-1.1 s slower than that run's, and its attachments (HTTP blobs) are faster
+for 2 MB and slower for small files.
 
 | Metric | Local | Deployed |
 |---|---|---|
-| start_to_clean | 1146 (1) | 1985 (1) |
-| create_to_peer | 730 / 734 (18) | 889 / 1203 (18) |
-| burst20_create_converge | 1124 (1) | 1322 (1) |
-| disk_edit_to_peer | 525 / 526 (10) | 573 / 801 (10) |
-| edit_to_peer | 423 / 425 (10) | 512 / 817 (10) |
-| typing_to_peer_view | 122 / 124 (10) | 171 / 183 (10) |
-| typing_to_peer_disk | 458 / 466 (10) | 514 / 827 (10) |
-| rename_to_peer | 426 / 426 (4) | 502 / 502 (4) |
-| folder_rename_to_peer | 430 (1) | 518 (1) |
-| delete_to_peer | 426 / 463 (10) | 558 / 698 (10) |
-| attachment_to_peer | 886 / 7013 (14) | 1613 / 8037 (14) |
-| attachment_300k_to_peer | 676 / 676 (2) | 1914 / 1914 (2) |
-| attachment_2m_to_peer | 7054 / 7054 (2) | 8366 / 8366 (2) |
-| attachment_40k_to_peer | 886 / 900 (8) | 1608 / 1687 (8) |
-| attachment_modify_to_peer | 623 / 623 (2) | 1543 / 1543 (2) |
-| settings_to_peer | 318 / 327 (8) | 380 / 383 (8) |
-| reconnect_converge | 2222 (1) | 3687 (1) |
-| relay_outage | 2895 (1) | - |
-| relay_restart_reconnect | 252 (1) | - |
-| relay_restart_converge | 2847 (1) | - |
-| fresh_bootstrap | 917 (1) | 15450 (1) |
-| restart_from_idb_converge | 1419 (1) | 2582 (1) |
-| offline_start_reconnect_converge | 1404 (1) | 2079 (1) |
+| start_to_clean | 1144 (1) | 2704 (1) |
+| create_to_peer | 738 / 754 (18) | 1995 / 2191 (18) |
+| burst20_create_converge | 1141 (1) | 2420 (1) |
+| disk_edit_to_peer | 531 / 536 (10) | 994 / 1375 (10) |
+| edit_to_peer | 432 / 435 (10) | 1008 / 1275 (10) |
+| typing_to_peer_view | 124 / 129 (10) | 176 / 240 (10) |
+| typing_to_peer_disk | 464 / 466 (10) | 997 / 1316 (10) |
+| rename_to_peer | 430 / 430 (4) | 982 / 982 (4) |
+| folder_rename_to_peer | 432 (1) | 1002 (1) |
+| delete_to_peer | 430 / 507 (10) | 994 / 1005 (10) |
+| attachment_to_peer | 908 / 6987 (14) | 2414 / 2966 (14) |
+| attachment_300k_to_peer | 648 / 648 (2) | 2674 / 2674 (2) |
+| attachment_2m_to_peer | 7025 / 7025 (2) | 2966 / 2966 (2) |
+| attachment_40k_to_peer | 912 / 913 (8) | 2363 / 2556 (8) |
+| attachment_modify_to_peer | 639 / 639 (2) | 2414 / 2414 (2) |
+| settings_to_peer | 340 / 343 (8) | 1000 / 1154 (8) |
+| reconnect_converge | 2293 (1) | 3191 (1) |
+| relay_outage | 3990 (1) | - |
+| relay_restart_reconnect | 2960 (1) | - |
+| relay_restart_converge | 5949 (1) | - |
+| fresh_bootstrap | 789 (1) | 5068 (1) |
+| restart_from_idb_converge | 1410 (1) | 2534 (1) |
+| offline_start_reconnect_converge | 1397 (1) | 2477 (1) |
 
-`attachment_2m` is dominated by chunked upload through the log (no R2 in
-these relay configs, so blobs travel as `x:` chunks; `blobPath` = `log`).
-The deployed fresh bootstrap (15.5 s, one sample, against 0.9 s locally) was
-not investigated; it is listed under gaps.
+Locally `attachment_2m` is dominated by chunked upload through the log (no
+R2 in the local relay, so blobs travel as `x:` chunks; `blobPath` = `log`).
+The deployed fresh bootstrap took 5.1 s here and 15.5 s in the earlier
+deployed run (0.8-0.9 s locally); not investigated, listed under gaps.
 
 ## 8. Bundle
 
-_Filled in after the final build._
+`node esbuild.config.mjs production` on 5b1803e (code as of 5735ad5) writes
+`dist/yaos-client/yaos.zip`. The build's own smoke check passed: the zip
+layout, no WASM, onload -> running/inline -> unload (7 commands), and a worker
+ping/pong.
+
+| Artifact | Size |
+|---|---|
+| `main.js` | 978.5 KiB raw (1,001,990 B), 318 KiB gzip (325,276 B) |
+| of which the worker IIFE string | 434.2 KiB |
+| `yaos.zip` (`yaos/main.js`, `yaos/manifest.json`) | 331.2 KiB (339,181 B) |
+
+The engine is in `main.js` twice (D2): once as the worker string, once as the
+inline fallback.
 
 ## 9. Manual test plan
 
