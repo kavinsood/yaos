@@ -224,7 +224,17 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 	};
 
 	// ---- rename inference ------------------------------------------------------
-	const freshLocal = inScopeLocal.filter((l) => !l.excluded && !syncedByKey.has(l.pathKey) && !input.remoteByPathKey.has(l.pathKey));
+	// New = L entries with no R or S match (§f.6). A synced doc joins L at S.pathKey (§f.2): a file at the R.pathKey
+	// of a doc synced elsewhere, whose own file is still there, is not that doc's (its remote move has not landed
+	// here). It is new (or a local rename's target): published, it folds suffixed and the loser rename frees the
+	// path for the move. Treated as taken, nothing ever claimed it and the move's diskRename failed forever.
+	const remoteMatch = (l: LocalEntry): boolean => {
+		const x = input.remoteByPathKey.get(l.pathKey);
+		if (x === undefined) return false;
+		const sx = input.synced.get(x);
+		return !(sx && sx.pathKey !== l.pathKey && input.local.has(sx.pathKey));
+	};
+	const freshLocal = inScopeLocal.filter((l) => !l.excluded && !syncedByKey.has(l.pathKey) && !remoteMatch(l));
 	const unhashedFresh = freshLocal.some((l) => l.hash === null);
 	const missing: SyncedEntry[] = [];
 	for (const id of docIds) {

@@ -150,6 +150,21 @@ test("observed rename wins over a new file at the source path; the new file is c
 	assert.equal(find(next, "nsCreate").path, "a.md");
 });
 
+test("a file at the remote-move target of a doc synced elsewhere is new: published, not orphaned", () => {
+	// Sim seed 285 (2 devices, no faults): B moved seed0 -> r5 while A renamed r1 -> r5. The file at r5.md counted
+	// as d1's (R key) though d1's file was still at seed0.md: d2's rename became an nsDelete, nothing ever planned
+	// r5.md, and d1's diskRename into it failed on every pass.
+	const moved = { remote: [R("d1", "r5.md"), R("d2", "r1.md")], synced: [S("d1", "seed0.md"), S("d2", "r1.md", { contentHash: h("c2") })] };
+	const p = run({ ...moved, local: [L("seed0.md", h("c0")), L("r5.md", h("c2"))], over: { renames: [{ from: "r1.md", to: "r5.md", atMs: 1 }] } });
+	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d2", path: "r5.md" });
+	assert.ok(!opsOf(p).includes("nsDelete"), JSON.stringify(opsOf(p)));
+	assert.deepEqual(find(p, "diskRename"), { op: "diskRename", docId: "d1", from: "seed0.md", to: "r5.md", expect: { t: "hash", hash: h("c0") } });
+	// A plain new file there gets its own doc (the fold suffixes it; the loser rename frees the path).
+	const fresh = run({ remote: [R("d1", "r5.md")], synced: [S("d1", "seed0.md")], local: [L("seed0.md", h("c0")), L("r5.md", h("c7"))] });
+	assert.equal(find(fresh, "nsCreate").path, "r5.md");
+	// d1's file already moved (crash after the rename): the file at r5.md is d1's, adopted (test below).
+});
+
 test("row live/present/absent: remote edited -> diskMaterialize (edit beats delete); else nsDelete + syncedDrop", () => {
 	const edited = run({ remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] });
 	assert.deepEqual(edited.ops, [{ op: "diskMaterialize", docId: "d1", path: "a.md", expect: { t: "absent" } }]);
