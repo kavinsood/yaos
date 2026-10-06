@@ -92,7 +92,7 @@ export default class YaosPlugin extends Plugin {
 					log: (line) => console.debug(`[yaos] ${line}`),
 				}),
 			saveData: (d) => this.saveData(d),
-			notice: (_level, message) => new Notice(message),
+			notice: (_level, message, timeoutMs) => new Notice(message, timeoutMs),
 			log: (line) => console.debug(`[yaos] ${line}`),
 		});
 		this.controller = controller;
