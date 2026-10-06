@@ -211,6 +211,21 @@ test("observed rename onto the path of a remote doc never materialized here: the
 	assert.ok(!opsOf(run(sc, { nsReady: false })).includes("reconcileContent"));
 });
 
+test("observed rename off a re-occupied source path wins over a concurrent remote move: the new file stays put", () => {
+	// Sim DEV=3 F seed 21: the user renamed n2 -> r5 and created a new n2.md before ns was ready, while another
+	// device moved the doc n2 -> r1. The plan carried the new n2.md to r1.md as the doc's file and made r5.md a
+	// new doc; the editor that followed the rename kept the old doc, and r1.md never got the doc's text.
+	const sc = { remote: [R("d1", "c.md")], synced: [S("d1", "a.md")], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
+	const p = run({ ...sc, local: [L("a.md", h("c7")), L("b.md", h("c0"))] });
+	assert.deepEqual(opsOf(p), ["nsRename", "syncedPut"]);
+	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d1", path: "b.md" });
+	assert.equal(find(p, "syncedPut").entry.path, "b.md");
+	// without the observed rename the remote move takes the file at a.md along, as before
+	const byHash = run({ ...sc, over: {}, local: [L("a.md", h("c7")), L("b.md", h("c0"))] });
+	assert.ok(opsOf(byHash).includes("diskRename"));
+	assert.ok(!opsOf(byHash).includes("nsRename"));
+});
+
 test("row live/present/absent: remote edited -> diskMaterialize (edit beats delete); else nsDelete + syncedDrop", () => {
 	const edited = run({ remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] });
 	assert.deepEqual(edited.ops, [{ op: "diskMaterialize", docId: "d1", path: "a.md", expect: { t: "absent" } }]);

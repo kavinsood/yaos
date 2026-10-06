@@ -284,7 +284,9 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		for (const id of docIds) {
 			const s = input.synced.get(id);
 			const r = input.remote.get(id);
-			if (s && r && r.state === "live" && r.pathKey === s.pathKey && renamedFrom.has(s.pathKey) && input.local.has(s.pathKey)) reoccupied.push(s);
+			// A remote move of the doc does not change this: the user's rename still took the doc's file along
+			// (a missing source is inferred the same way), so the file at the old path is never carried to R.path.
+			if (s && r && r.state === "live" && renamedFrom.has(s.pathKey) && input.local.has(s.pathKey)) reoccupied.push(s);
 		}
 		const used = new Set([...inferred.values()].map((rn) => rn.to.pathKey));
 		for (const rn of inferRenames(reoccupied, freshLocal.filter((l) => !used.has(l.pathKey)), input.renames, false, pk)) {
