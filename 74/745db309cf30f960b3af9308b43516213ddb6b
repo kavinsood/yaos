@@ -1,0 +1,31 @@
+e2e/client/bootTrace.ts
+  s_6e0df1c7504874::t_60eff715a17827 1-101
+e2e/client/fullClients.ts
+  s_6e0df1c7504874::t_1808e9f1b0db86 40
+e2e/client/fullKit.ts
+  s_42fec8a9c03dda::t_68dc0995b0478f 37,150-151,220-222,226-227
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "74745db309cf30f960b3af9308b43516213ddb6b",
+  "prompts": {},
+  "sessions": {
+    "s_42fec8a9c03dda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab7f16ac97bca1a6d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_6e0df1c7504874": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a391b87c3ffcb4eb9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
