@@ -1,0 +1,37 @@
+src/engine/compose/passScheduler.test.ts
+  s_ed451e485d98d2::t_6468fb564b70be 1-67
+src/engine/compose/passScheduler.ts
+  s_79d9b93476b202::t_74bdae6ce88b30 150-151
+src/engine/reconcile/reconciler.safety.test.ts
+  s_79d9b93476b202::t_587449ce81d4ed 161-186
+src/engine/reconcile/reconciler.ts
+  s_ed451e485d98d2::t_bf4b8c1c5a7f06 48-49,177-179,190
+src/engine/reconcile/scan.ts
+  s_79d9b93476b202::t_de2592ce35a43f 97-99,102,127-130,144
+src/engine/reconcile/testkit/fakeGateway.ts
+  s_79d9b93476b202::t_39267cdc3307c3 32-33,52-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "95dc20c953ebbb4efac1491316f8a48d35b357dd",
+  "prompts": {},
+  "sessions": {
+    "s_79d9b93476b202": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4a02e307d4575a34",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
