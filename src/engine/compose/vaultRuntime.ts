@@ -400,11 +400,9 @@ export class VaultRuntime {
 	checkBindable(): void {
 		const waiting = this.engine.bound.waiting;
 		if (waiting.size === 0) return;
-		const view = this.port.view();
 		for (const path of [...waiting]) {
-			const id = view.remoteByPathKey.get(pathKey(path));
-			const e = id ? view.remote.get(id) : undefined;
-			if (!e || e.state !== "live" || e.kind === "blob") continue;
+			const e = ops.bindTarget(this, pathKey(path));
+			if (!e || e.kind === "blob") continue;
 			waiting.delete(path);
 			this.stats.bindable++;
 			this.engine.link.post({ t: "bindable", path });

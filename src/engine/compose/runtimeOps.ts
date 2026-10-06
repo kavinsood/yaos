@@ -5,7 +5,7 @@
 
 import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
-import { streamDocId, type DocId, type PathKey, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { utf8Encode } from "../../core/codec/lib0";
@@ -18,10 +18,8 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
 	const cls = rt.rec.ctx.classify(path, 0);
 	if (cls.excluded) return { t: "notBindable", reason: cls.reason === "too-large" ? "oversize" : "excluded" };
 	if (cls.kind !== "markdown") return { t: "notBindable", reason: "not-markdown" };
-	const view = rt.port.view();
-	const id = view.remoteByPathKey.get(cls.pathKey);
-	const e = id ? view.remote.get(id) : undefined;
-	if (!e || e.state !== "live" || e.kind !== "markdown") {
+	const e = bindTarget(rt, cls.pathKey);
+	if (!e || e.kind !== "markdown") {
 		rt.engine.bound.waiting.add(path);
 		return { t: "notBindable", reason: "untracked" };
 	}
@@ -44,6 +42,27 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
 			baseHash: baseText !== null && s ? s.contentHash : null, frozen: e.body?.frozen ?? false,
 		},
 	};
+}
+
+/**
+ * The live doc a view at `key` binds to (§d.2), or undefined. The remote entry at the path names it, unless the file
+ * there is another doc's (the planner's L lookup, §f.2): a doc synced at the path whose file is still there (the
+ * remote moved it away or put another doc at its path, and the planner has not moved it yet), or the remote doc
+ * synced elsewhere with its file still there (the remote moved it onto a file this device has and the mover never
+ * saw). Binding then merges one doc's file into another's CRDT. The view waits: `bindable` follows the pass that
+ * settles the path, or the host asks again at the path the file moves to.
+ */
+export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefined {
+	const view = rt.port.view();
+	const id = view.remoteByPathKey.get(key);
+	const e = id ? view.remote.get(id) : undefined;
+	if (!e || e.state !== "live") return undefined;
+	const ctx = rt.rec.ctx;
+	const s = ctx.synced(e.docId);
+	if (s && s.pathKey !== key && ctx.local.has(s.pathKey)) return undefined;
+	if (!ctx.local.has(key)) return e;
+	for (const o of ctx.store.synced.values()) if (o.pathKey === key && o.docId !== e.docId) return undefined;
+	return e;
 }
 
 export function fullState(rt: VaultRuntime, docId: DocId): Uint8Array | null {
