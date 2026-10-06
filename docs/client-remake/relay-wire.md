@@ -159,7 +159,7 @@ error followed by close 1006:
     "maxStreamNameBytes": 256, "maxClientFrameIdBytes": 128, "maxPayloadBytes": 1048576,
     "maxBinaryMessageBytes": 1049600, "maxTextMessageBytes": 65536, "maxCheckpointBytes": 4194304,
     "feedDefaultLimit": 1000, "feedMaxLimit": 5000, "readDefaultBytes": 1048576, "readMaxBytes": 4194304,
-    "rateBytesPerSec": 262144, "burstBytes": 2097152,
+    "readBatchMaxStreams": 128, "rateBytesPerSec": 262144, "burstBytes": 2097152,
     "groupCommit": { "idleMs": 300, "maxMs": 1500, "maxBytes": 65536, "minIntervalMs": 0 }
   },
   "canWrite": true,
@@ -362,6 +362,27 @@ For a socket admitted with `VAULT_READY.head = H`:
 - **Unknown stream.** Returns `200` with `lastSeq: 0` and no rows.
 - **Errors.** `400 invalid_stream`, `invalid_cursor` and `invalid_max_bytes`.
 
+### 7.1 Batched read (first pages of many streams)
+
+`GET /vault/:vaultId/streams/read?maxBytes=<B>&r=<after>.<0|1>.<name>&r=...` (same auth). Each `r` entry is a
+stream cursor, the `checkpoint` flag and the stream name (URL-encoded; everything after the second `.` is the
+name). At most `readBatchMaxStreams` entries (`VAULT_READY.limits`, 128); a relay without that limit has no batch
+form.
+
+```json
+{ "vaultEpoch": "...", "head": 57, "pages": [ { "stream": "b:x", "lastSeq": 57, "checkpointSeq": 0, "gcSeq": 0,
+  "checkpoint": null, "rows": [ ... ], "nextAfter": null }, ... ] }
+```
+
+- **Pages.** One per entry, in request order; each is exactly the single-read body without `vaultEpoch`/`head`.
+- **Budget.** `maxBytes` (default 1 MiB, max 4 MiB) is shared by the whole batch. The first entry always gets
+  its page, as a single read would. A later page that would overrun what is left ends the batch: `pages` is a
+  prefix of the entries, and the client re-requests the rest.
+- **Why.** On the deployed relay every HTTP request costs about 9 edge RTTs (≈ 220 ms: Worker auth, two config
+  Durable Object calls, then the vault Durable Object). A fresh device reads one stream per note, so one request
+  per stream made a 1000-note bootstrap take a minute; batching makes it a handful of requests.
+- **Errors.** As above, plus `400 invalid_read_entry` and `400 batch_too_large`.
+
 ## 8. Checkpoint (CAS put + GC)
 
 `PUT /vault/:vaultId/streams/checkpoint?stream=<name>&coversSeq=<N>&expectedCoversSeq=<M>` (Bearer,
@@ -438,6 +459,7 @@ cannot check this.
 | Checkpoint | 4 MiB, stored in 1 MB rows |
 | Feed page | default 1000, max 5000 streams |
 | Read page | default 1 MiB, max 4 MiB payload (JSON base64 adds about 33%) |
+| Batched read | 128 streams per request (`readBatchMaxStreams`), one page budget for the batch |
 | Streams sockets per vault | 1000 (`YAOS_STREAMS_MAX_SOCKETS`) |
 | Rate gate (per socket) | Token bucket of 256 KiB/s with a 2 MiB burst, charged on raw received bytes (text counted in UTF-16 units). Overdraft gives 1013. |
 | Group commit | 300 ms idle / 1500 ms max / 64 KiB |
@@ -620,7 +642,7 @@ export interface StreamLimits {
   maxStreamNameBytes: number; maxClientFrameIdBytes: number; maxPayloadBytes: number;
   maxBinaryMessageBytes: number; maxTextMessageBytes: number; maxCheckpointBytes: number;
   feedDefaultLimit: number; feedMaxLimit: number; readDefaultBytes: number; readMaxBytes: number;
-  rateBytesPerSec: number; burstBytes: number;
+  readBatchMaxStreams: number; rateBytesPerSec: number; burstBytes: number;
   groupCommit: { idleMs: number; maxMs: number; maxBytes: number; minIntervalMs: number };
 }
 export interface VaultReady {

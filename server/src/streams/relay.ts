@@ -26,6 +26,7 @@ import {
 	MAX_STREAM_TEXT_MESSAGE_BYTES,
 	STREAM_FEED_DEFAULT_LIMIT,
 	STREAM_FEED_MAX_LIMIT,
+	STREAM_READ_BATCH_MAX_STREAMS,
 	STREAM_READ_DEFAULT_BYTES,
 	STREAM_READ_MAX_BYTES,
 	STREAMS_CAPABILITY_VERSION,
@@ -39,7 +40,7 @@ import {
 	isProvisionalStream,
 	validStreamName,
 } from "./protocol";
-import { frameKey, type StreamStore } from "./store";
+import { frameKey, type StreamReadPage, type StreamStore } from "./store";
 
 // ---- configuration ----------------------------------------------------------
 
@@ -238,6 +239,20 @@ function nonNegativeInteger(raw: string | null, fallback: number): number | null
 	return Number.isSafeInteger(value) ? value : null;
 }
 
+/** One read page on the wire (single read body / one batched read entry). */
+function wirePage(page: StreamReadPage) {
+	return {
+		stream: page.stream,
+		lastSeq: page.lastSeq,
+		checkpointSeq: page.checkpointSeq,
+		gcSeq: page.gcSeq,
+		checkpoint: page.checkpoint ? { coversSeq: page.checkpoint.coversSeq, bytes: bytesToBase64(page.checkpoint.bytes) } : null,
+		rows: page.rows.map((row) => ({ seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId,
+			payload: bytesToBase64(row.payload) })),
+		nextAfter: page.nextAfter,
+	};
+}
+
 export class StreamRelayService {
 	readonly config: StreamRelayConfig;
 	readonly counters: StreamRelayCounters = {
@@ -306,6 +321,7 @@ export class StreamRelayService {
 			feedMaxLimit: STREAM_FEED_MAX_LIMIT,
 			readDefaultBytes: STREAM_READ_DEFAULT_BYTES,
 			readMaxBytes: STREAM_READ_MAX_BYTES,
+			readBatchMaxStreams: STREAM_READ_BATCH_MAX_STREAMS,
 			rateBytesPerSec: this.config.rateBytesPerSec,
 			burstBytes: this.config.burstBytes,
 			groupCommit: { idleMs: this.config.gcIdleMs, maxMs: this.config.gcMaxMs, maxBytes: this.config.gcMaxBytes,
@@ -705,28 +721,49 @@ export class StreamRelayService {
 		return json({ vaultEpoch: this.options.vaultGeneration(), ...page });
 	}
 
-	/** GET /streams/read?stream=X&after=S&maxBytes=B&checkpoint=1 */
+	/**
+	 * GET /streams/read?stream=X&after=S&maxBytes=B&checkpoint=1, or the batched form
+	 * GET /streams/read?maxBytes=B&r=<after>.<0|1>.<stream>&r=... (at most STREAM_READ_BATCH_MAX_STREAMS entries):
+	 * the first page of each entry in request order under one maxBytes budget. The first entry always gets its
+	 * page (as a single read); a later page that would overrun the remaining budget ends the batch, and the
+	 * client re-requests the entries without a page.
+	 */
 	read(url: URL): Response {
+		const maxBytes = nonNegativeInteger(url.searchParams.get("maxBytes"), STREAM_READ_DEFAULT_BYTES);
+		if (maxBytes === null || maxBytes < 1) return json({ error: "invalid_max_bytes" }, 400);
+		const budget = Math.min(maxBytes, STREAM_READ_MAX_BYTES);
+		const entries = url.searchParams.getAll("r");
+		if (entries.length > 0) return this.readBatch(entries, budget);
 		const stream = url.searchParams.get("stream");
 		if (!validStreamName(stream)) return json({ error: "invalid_stream" }, 400);
 		const after = nonNegativeInteger(url.searchParams.get("after"), 0);
-		const maxBytes = nonNegativeInteger(url.searchParams.get("maxBytes"), STREAM_READ_DEFAULT_BYTES);
 		if (after === null) return json({ error: "invalid_cursor" }, 400);
-		if (maxBytes === null || maxBytes < 1) return json({ error: "invalid_max_bytes" }, 400);
-		const page = this.options.store().read(stream, after, Math.min(maxBytes, STREAM_READ_MAX_BYTES),
-			url.searchParams.get("checkpoint") === "1");
-		return json({
-			vaultEpoch: this.options.vaultGeneration(),
-			head: this.head(),
-			stream: page.stream,
-			lastSeq: page.lastSeq,
-			checkpointSeq: page.checkpointSeq,
-			gcSeq: page.gcSeq,
-			checkpoint: page.checkpoint ? { coversSeq: page.checkpoint.coversSeq, bytes: bytesToBase64(page.checkpoint.bytes) } : null,
-			rows: page.rows.map((row) => ({ seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId,
-				payload: bytesToBase64(row.payload) })),
-			nextAfter: page.nextAfter,
-		});
+		const page = this.options.store().read(stream, after, budget, url.searchParams.get("checkpoint") === "1");
+		return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), ...wirePage(page) });
+	}
+
+	private readBatch(raw: string[], maxBytes: number): Response {
+		if (raw.length > STREAM_READ_BATCH_MAX_STREAMS) return json({ error: "batch_too_large", max: STREAM_READ_BATCH_MAX_STREAMS }, 400);
+		const entries: { stream: string; after: number; checkpoint: boolean }[] = [];
+		for (const entry of raw) {
+			const match = /^(\d+)\.([01])\.(.+)$/s.exec(entry);
+			const after = match ? nonNegativeInteger(match[1]!, 0) : null;
+			if (!match || after === null) return json({ error: "invalid_read_entry" }, 400);
+			if (!validStreamName(match[3])) return json({ error: "invalid_stream" }, 400);
+			entries.push({ stream: match[3], after, checkpoint: match[2] === "1" });
+		}
+		const store = this.options.store();
+		const pages: ReturnType<typeof wirePage>[] = [];
+		let left = maxBytes;
+		for (const entry of entries) {
+			if (pages.length > 0 && left <= 0) break;
+			const page = store.read(entry.stream, entry.after, pages.length > 0 ? left : maxBytes, entry.checkpoint);
+			const size = (page.checkpoint?.bytes.byteLength ?? 0) + page.rows.reduce((total, row) => total + row.payload.byteLength, 0);
+			if (pages.length > 0 && size > left) break;
+			pages.push(wirePage(page));
+			left -= size;
+		}
+		return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), pages });
 	}
 
 	/** PUT /streams/checkpoint?stream=X&coversSeq=N&expectedCoversSeq=M, body = opaque checkpoint bytes. */
