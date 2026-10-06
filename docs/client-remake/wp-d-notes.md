@@ -163,10 +163,7 @@ If B shows that `adapter.write` bypasses the wrapper, those writes reach YAOS on
 - **Seeded Yjs clientIDs.** `sim/__standins__/seededEntropy.ts` patches `globalThis.crypto.getRandomValues`, which is the object lib0 uses, before yjs loads. `node:crypto` is not used because the main tsconfig has no node types. Same seed gives the same trace and the same digest, in one process and across processes (checked: seed 511, three processes, same digest).
   - Import order matters: a script that imports `yjs` before `sim/run` gets random clientIDs, and the same plan then converges differently from run to run. That is how an apparent "nondeterministic sim" showed up in a debugging script. `SimReport.seededEntropy` says whether the seed took hold, and the reproducibility test asserts it.
 - **Harness: Obsidian clobber exemption.** An editor save (`vault.modify`, no precondition) can overwrite an external write before the watcher reports it. YAOS cannot see or prevent that. `SimVault` records a `ClobberRecord`, and the invariants exempt the tokens that save destroyed.
-- **Harness: diff-shift rules.** Disk writes reach the CRDT as a minimal prefix/suffix-trimmed diff (DESIGN §f). Two rules follow:
-  - Actors never insert a token right before its own first character, and never delete a token that is followed by its own first character.
-  - Token survival is matched by identity (`A.15`), not with brackets: a minimal diff may reuse a neighbour's `[` or `]`, and a concurrent delete of that neighbour takes the bracket. Greedy matching keeps `A.1`, `A.15` and `A.12.3` distinct.
-  - Whole tokens are peeled off and the rest is matched again (`tokenIdsIn`). The trim can reuse more than a bracket: when the engine sees a token delete and an external insert as one disk change (`[A.6]` → `[A.53] `, both during a background pause), it keeps `[A.`, and a concurrent remote insert at that spot lands inside the new identity: `[A.[B.23] 53]`. Every character of both tokens survives, so this is CRDT interleaving, not loss (3000-seed run, fault-heavy seed 511). A word-aligned diff in the engine would avoid the split; WP-C can choose that, and the invariant accepts both.
+- **Harness: diff-shift rules (removed at integration).** WP-D's actors avoided disk edits that a prefix/suffix-trimmed diff would shift, and token survival was matched by identity (`tokenIdsIn`, peeling whole tokens) because the trim could reuse a neighbour's `[` or a prefix like `[A.`. The token diff made both unnecessary. See "Integration fixes".
 - **Stand-in engine fixes the real engine must also have:**
   - retry I/O failures (`IO_RETRY_MS`) for reads, conflict copies and projections;
   - project a doc that is ahead of an unchanged disk (after an app crash);
@@ -188,7 +185,7 @@ If B shows that `adapter.write` bypasses the wrapper, those writes reach YAOS on
   - `engine.ts`, `engineMessages.ts`, `diskSync.ts`, `docs.ts`: a protocol-complete engine. Docs are keyed by path; it syncs through the hub, has a credit window and does projection. It uses a conservative merge with conflict copies and has no deletes or renames.
   - `hub.ts`: an in-memory relay with a member outbox, resync on join/online, and no echo.
   - `webPorts.ts`: the worker's clock and hash.
-- `src/host/__standins__/merge.ts`: MergeFn and `minimalDiff` (WP-B's `core/merge` replaces it).
+- ~~`src/host/__standins__/merge.ts`~~: deleted at integration; the binding and the stand-in engine use WP-B's `core/merge`.
 - `src/sim/__standins__/`:
   - `clock.ts` and `random.ts`: WP-A's merged `sim/clock.ts` and `sim/random.ts` produce the same sequences. Switch the imports.
   - `sha256.ts`: WP-B's `core/hash`.
@@ -235,9 +232,88 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
 |---|---|
 | `npm run test:client` (200 seeds) | green, sim part about 18 s |
 | `YAOS_SIM_SEEDS=1000` sim suite | green (final code) |
-| `YAOS_SIM_SEEDS=3000` sim suite | 150/150 seed chunks green, about 4.5 min. Before the `tokenIdsIn` peel, fault-heavy seed 511 failed (`lost [A.53]`): interleaving, not loss (see Decisions) |
+| `YAOS_SIM_SEEDS=3000` sim suite | 150/150 seed chunks green, about 4.5 min. Before the `tokenIdsIn` peel, fault-heavy seed 511 failed (`lost [A.53]`): interleaving, not loss (see Decisions). Superseded at integration: the peel is gone and 511 passes strict |
 | `typecheck:client`, `check-deps` (0 errors, 1 stand-in warning), `esbuild.config.mjs production` + smoke | green |
 | Merge check: `git merge-tree` of this branch with `client-remake` (6fa95f0, WP-A and WP-B merged) | clean; on the merged tree typecheck, check-deps, all client tests (50 seeds) and the production build + smoke pass |
 
-Bugs the larger seed runs found and fixed, in order: the zombie engine after an app crash (seeds 35/64, `halting`); a dropped external side when a conflict-copy write failed (seed 16, retry with backoff); the bracket shift (1000 seeds, seed 974, identity matching); the crash-lost pending copy (seed 551, recorded gap plus exemption); the interleaved identity (3000 seeds, seed 511, peel).
+Bugs the larger seed runs found and fixed, in order: the zombie engine after an app crash (seeds 35/64, `halting`); a dropped external side when a conflict-copy write failed (seed 16, retry with backoff); the bracket shift (1000 seeds, seed 974, identity matching); the crash-lost pending copy (seed 551, recorded gap plus exemption); the interleaved identity (3000 seeds, seed 511, peel). At integration the identity matching and the peel were replaced by the token diff (see "Integration fixes").
 
+
+## Integration fixes
+
+Commits 65c9676 to cfd0fd4 on `client-remake`, after WP-A, WP-B and WP-D were merged.
+
+### External reloads of a bound view were merged against the wrong base (data loss)
+
+- **Sim fidelity** (65c9676, b222b4d). `SimWorkspace` now follows spike OR-2:
+  - `setData` assigns `view.data` before it calls `setViewData`;
+  - `save()` writes `getViewData()` (the editor), not `view.data`;
+  - vault-API writes reload right after the modify event, adapter writes about 25 ms after it;
+  - reading mode reloads through `setViewData(clear=false)`.
+
+  The `sim fidelity A-D, R` tests pin this behaviour. The `binding contract` tests failed first. Contract C is the data loss: an explicit save right after the reload wrote the old editor text over the external edit.
+- **Base tracking** (1fcb1e2).
+  - Inside `setViewData`, `view.data` already holds the incoming text, so it cannot be the merge base.
+  - Each replica keeps `diskText`, the last disk text it absorbed. It is set from `view.data` when the replica is created, by every merged reload, and by a disk-verified `checkSaved`.
+  - A reload merges base = `diskText`, disk = incoming, crdt = Y.Text. The result goes into the Y.Text, and so into the editor. Dirty views are then saved, so `view.data`, the editor and the disk all equal the merge.
+  - A split sibling whose `view.data` equals the incoming text is our own save, not an external edit.
+  - `boundSaved` is posted only after a stable disk read (stat, read, stat), and only for text the replica already holds: `diskText`, the Y.Text, or a bound view's `view.data`. Any other disk text is an external write whose reload is still pending.
+  - The binding wraps `setViewData` per instance only: no prototype patch and no `view.data` accessor.
+- 7110469: the stand-in engine applies disk text through core `minimalDiff`. The host merge stand-in is deleted.
+
+### Concurrent edits interleaved inside words
+
+**Cause.**
+- A code-point diff reuses old characters inside new words. For example, `[A.6]` → `[A.53] ` keeps `[A.`.
+- A concurrent insert then lands inside the new token (seed 511: `[A.[B.23] 53]`), or a concurrent delete of the old token takes the reused characters with it (seeds 961, 974).
+- The Yjs applier added a second cause. Delete-then-insert anchors the new text after the deleted run, next to a concurrent insert at the run's right edge (seed 558: `[A.[B.39] 55]`).
+
+**`core/merge/minimalDiff.ts`** (2d2ab2b, bbf6125):
+- **Token Myers.** A token is a run of letters, digits, marks or `_`, or one other code point. A token never splits a surrogate pair.
+  - Word runs are interned by a hash table over the source text, without slicing.
+  - The prefix/suffix trim backs off to token boundaries.
+- **`tokenAlign`** then runs four steps:
+  1. **Snap** edit ends to token boundaries.
+  2. **Slide** each pure insert or delete to its best diff-match-patch boundary score (line break > whitespace > punctuation). Ties go to the bracket-balanced edit: delete `[B.9]`, not `9][B.`.
+  3. **Absorb** an equality between two edits if it is no longer than the larger side of both and holds no whitespace. Lines and words stay anchors.
+  4. **Glue** short punctuation runs to a replacement when that makes it cover whole whitespace-separated chunks: `[Z.1]` → `[A.15]` does not keep the old `[`.
+- **Result choice.** A single edit inside one line is returned as is. Otherwise the result is the smaller of the token script and the line diff (token-refined if possible, else plain), so it is never larger than the line diff.
+  - Property tests check exact apply, token-aligned ends, code-point safety and ≤ line diff.
+- **`applyEditsTo(TextSink, from, edits)`** (core stays Yjs-free).
+  - A replacement is inserted after the first code point of the old run. Then the run is deleted on both sides.
+  - Both Yjs origins of the new text are deleted characters, so a concurrent insert at either edge keeps its side for both clientID orders. The tests run both orders.
+  - It is used by the binding (`applyTextDiff`), the merge job (`applyMinimalDiff`) and the stand-in engine (4352b3f). `applyMinimalReplace` stays editor-only.
+- **Performance**: `minimalDiff` on 2M-char inputs, min of 3 runs, Apple M4 Pro.
+
+  | Inputs | Before Fix 2 (7110469) | 2d2ab2b | Now |
+  |---|---|---|---|
+  | Word and line edits (5 cases) | 4-23 ms | 8-23 ms | 4-37 ms |
+  | Repo's 2M merge-test scenarios | 27-108 ms | 27-114 ms | 31-174 ms |
+
+  - The worst case is both sides rewritten (crdt → disk): 174 ms and 42k edits now, against 108 ms and 16k edits before. Tokens are smaller units than code-point runs inside a line.
+  - Edit scripts are about a third larger on word edits (214 → 288 and 1840 → 2426 chars), because a replacement covers whole tokens. They are never larger than the line diff.
+- **Caveats:**
+  - Two devices editing inside the same word now duplicate the word instead of interleaving: `seed` becomes `see[A.49] dsee[C.52] d`. Every token stays whole.
+  - A one-code-point replacement has no inside, so it is inserted first. Its left-edge order then depends on clientIDs.
+  - Glue and absorb rewrite punctuation. If a concurrent edit deleted that character, the delete is undone. This is why absorption never crosses whitespace.
+
+### Sim invariant status
+
+**Strict again** (cfd0fd4): a token must be contiguous, `[A.15]` exactly.
+- `tokenIdsIn` is removed.
+- Both actor diff-shift rules are removed: no insert right before `[`, and no delete of a token that is followed by `[`.
+- Removing the delete rule exposed sliding along a repeated `[B.` (3-device seeds 786, 894). The bracket tie-break covers it.
+
+**Seed results** (final code):
+- `YAOS_SIM_SEEDS=1000 npm run test:client sim/run` is green. It runs 1000 seeds each for 2 and 3 devices, and 250 each for 5 devices and fault-heavy.
+- Extended sweeps cover 2 devices 1..2000, 3 devices 1..3000, 5 devices 1..1500 and fault-heavy 1..3000. One seed fails: fault-heavy 825.
+- Fixed along the way:
+  - failures once the strict invariant was back: 3-device 558, 961, 974 and fault-heavy 124;
+  - failures after dropping the actor rules: fault-heavy 65, 3-device 503/786/894 and 5-device 195/730.
+
+**Remaining: fault-heavy 825.**
+- B's own disk goes `[B.11]\n` → `\n` → `\n[B.40]\n` (steps 39 and 40). B is backgrounded, with a read fault armed (step 38), so its engine ingests only the net change.
+- The minimal token script keeps `[B.` and `]` of the deleted token: insert `\n`, replace `11` with `40`.
+- Device A had concurrently deleted `[B.11]`, so those characters go and only `40` is left.
+- The seed also fails under the old relaxed matcher, and at 2d2ab2b, so this is not an invariant artifact.
+- No diff can tell a retyped token from an edited one. Replacing whole short chunks would fix this seed, but concurrent edits in different parts of one chunk (code, URLs, unspaced tables) would then duplicate. It stays a known limitation of applying coalesced disk snapshots as diffs.
