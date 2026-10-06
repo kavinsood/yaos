@@ -1,0 +1,21 @@
+src/core/hash/canvasCanonical.ts
+  s_3bea9f4c72a663::t_eb05e9b9a277fe 11-16,132-136,412-425,449-454,458,465
+src/core/hash/hash.test.ts
+  s_3bea9f4c72a663::t_a4c63727ea5485 8,116-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ffe517d867ddac93c3fb7624783376206ecfe22f",
+  "prompts": {},
+  "sessions": {
+    "s_3bea9f4c72a663": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb05cda11fb8d171",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
