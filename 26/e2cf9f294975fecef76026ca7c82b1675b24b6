@@ -1,0 +1,65 @@
+e2e/client/fullKit.ts
+  s_6e0df1c7504874::t_933b034ba0895c 58
+src/engine/adapters/relayFrames.test.ts
+  s_6e0df1c7504874::t_07514b7a9a41a9 81,86
+src/engine/adapters/relayFrames.ts
+  s_441b74abbd0702::t_04afe90985ad27 121,196
+src/engine/adapters/relayHttp.ts
+  s_6e0df1c7504874::t_244531eee790eb 10,47-48,111-148,249-261,263-273,275
+src/engine/adapters/wsRelay.test.ts
+  s_6e0df1c7504874::t_7448ef7f052c1c 101,455-494
+src/engine/adapters/wsRelay.ts
+  s_6e0df1c7504874::t_29bda3040a9fd2 29-30,95,116,291-297
+src/engine/body/sender.test.ts
+  s_6e0df1c7504874::t_07bcec3f30e05b 50,56
+src/engine/runtime/catchUpBatch.test.ts
+  s_6e0df1c7504874::t_28c41dae9e031d 1-101
+src/engine/runtime/options.ts
+  s_42fec8a9c03dda::t_9bd0e0cb463b19 37-38,64
+src/engine/runtime/sessionLoop.ts
+  s_6e0df1c7504874::t_448038106efd5f 7-12,20,41-43,134,256-257,259,266-341,368,371-373,378-384
+src/engine/sync/catchUp.ts
+  s_6e0df1c7504874::t_e6c00d6d563223 22-24,33,57-58,102,107-108
+src/ports/relay.ts
+  s_441b74abbd0702::t_381452c3e123cb 56,58-59,110-116,175-180
+src/sim/a-relay-session.ts
+  s_441b74abbd0702::t_3d2e6dd9db82ab 11,21,106-112
+src/sim/a-relay-util.ts
+  s_441b74abbd0702::t_d223b5acac3425 19,30-31
+src/sim/relay-http.test.ts
+  s_6e0df1c7504874::t_ec1f9d385d67cd 68-94
+src/sim/relay.ts
+  s_6e0df1c7504874::t_daf5a06834c453 19,29,83-84,114-115,176,179,188-204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "26e2cf9f294975fecef76026ca7c82b1675b24b6",
+  "prompts": {},
+  "sessions": {
+    "s_42fec8a9c03dda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab7f16ac97bca1a6d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_441b74abbd0702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5b78666751a5e84f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_6e0df1c7504874": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a391b87c3ffcb4eb9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
