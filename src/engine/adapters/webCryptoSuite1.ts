@@ -94,6 +94,14 @@ export async function createWebCryptoSuite1(o: Suite1Options): Promise<Suite1Cry
 		if (!rk || rk.length < KEY_BYTES) throw new Error("suite 1: recovery key required");
 		return deriveSubkey(subtle, await importBase(subtle, rk.subarray(0, KEY_BYTES)), "recovery-kek", vaultId, 0);
 	};
+	/** Whether `raw` is the key held for e (full HMAC kcv of both); zero-fills `raw`. */
+	const sameAsHeld = async (e: number, raw: Uint8Array): Promise<boolean> => {
+		const tmp = await importBase(subtle, raw);
+		raw.fill(0);
+		const kcvOf = (base: CryptoKey) => deriveSubkey(subtle, base, "kcv", vaultId, e).then((k) => hmac(subtle, k, hkdfInfo("kcv", vaultId, e)));
+		const [a, b] = await Promise.all([kcvOf(tmp), kcvOf(entry(e).base)]);
+		return a.every((x, i) => x === b[i]);
+	};
 	/** For a record introducing e: which epoch's kWrap seals, and which epoch's K is sealed (§11.1). */
 	const wrapEpochs = (role: WrapRole, e: number): { by: number | null; of: number } =>
 		role === "next" ? { by: e - 1, of: e } : role === "prev" ? { by: e, of: e - 1 } : { by: null, of: e };
@@ -152,7 +160,11 @@ export async function createWebCryptoSuite1(o: Suite1Options): Promise<Suite1Cry
 			await put(e, o.random.bytes(KEY_BYTES), { pending: true, exported: false });
 		},
 		async install(e, raw) {
+			checkEpoch(e);
+			if (raw.length !== KEY_BYTES) throw new Error(`suite 1: key must be ${KEY_BYTES} bytes`);
+			if (keys.get(e)?.verified) return (await sameAsHeld(e, raw)) ? "same" : "conflict";
 			await put(e, raw, { pending: false, exported: false });
+			return "installed";
 		},
 		async kcv(e) {
 			return (await hmac(subtle, await subkey(e, "kcv"), hkdfInfo("kcv", vaultId, e))).slice(0, KCV_BYTES);
@@ -171,14 +183,8 @@ export async function createWebCryptoSuite1(o: Suite1Options): Promise<Suite1Cry
 			if (by === null ? !rk || rk.length < KEY_BYTES : !keys.has(by)) return false;
 			const r = await gcmOpen(subtle, by === null ? await kek(rk) : await subkey(by, "wrap"), aad, wrapped);
 			if (typeof r === "string" || r.length !== KEY_BYTES) return false;
-			if (keys.has(of)) {
-				// A held key is never replaced: the payload must be that same key (§11.3 prevWrap rule).
-				const tmp = await importBase(subtle, r);
-				r.fill(0);
-				const kcvOf = (base: CryptoKey) => deriveSubkey(subtle, base, "kcv", vaultId, of).then((k) => hmac(subtle, k, hkdfInfo("kcv", vaultId, of)));
-				const [a, b] = await Promise.all([kcvOf(tmp), kcvOf(entry(of).base)]);
-				return a.every((x, i) => x === b[i]);
-			}
+			// A held key is never replaced: the payload must be that same key (§11.3 prevWrap rule).
+			if (keys.has(of)) return sameAsHeld(of, r);
 			await put(of, r, { pending: false, exported: false });
 			return true;
 		},

@@ -81,8 +81,11 @@ export type WrapRole = "next" | "prev" | "recovery";
 export interface KeyringCrypto {
 	/** A new random K_e, held as pending (unverified) until setSealEpoch or drop. */
 	generate(e: number): Promise<void>;
-	/** QR / RK path. Zero-fills `raw`. Throws if e is already held and verified. */
-	install(e: number, raw: Uint8Array): Promise<void>;
+	/**
+	 * QR / RK path. Zero-fills `raw`. An unheld or unverified epoch is (re)placed: "installed". A verified epoch is
+	 * never replaced: "same" if `raw` is that key, else "conflict" (§11.3 out-of-band keys; the host re-keys by restart).
+	 */
+	install(e: number, raw: Uint8Array): Promise<"installed" | "same" | "conflict">;
 	/** kcv(e), 16 bytes (e2ee-design §5.2). */
 	kcv(e: number): Promise<Uint8Array>;
 	/** nonce(12) ‖ ct(32) ‖ tag(16). Throws if a needed key is not held or its raw bytes are no longer retained. */
