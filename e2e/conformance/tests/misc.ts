@@ -1,6 +1,6 @@
 /** D9 blobs, H3 daily limit. */
 import type { TestDef } from "../lib/results.ts";
-import { device, operatorCookie, vault } from "../lib/fixture.ts";
+import { device, vault } from "../lib/fixture.ts";
 import { brief, http, isRouteMissing } from "../lib/http.ts";
 import { checkpointPath } from "../lib/streams.ts";
 import { StreamSocket } from "../lib/socket.ts";
@@ -46,15 +46,15 @@ export const tests: TestDef[] = [
 	{
 		id: "T-DAILY", group: "decision", area: "H3 daily", expectedBefore: "SKIP", timeoutMs: 120000,
 		async run(ctx, t) {
+			// H3: a device route (bearer), forwarded only when the Worker sets YAOS_DEBUG_ROUTES=1.
 			const probeVault = await vault(ctx, "main");
-			const cookie = await operatorCookie(ctx);
-			const probe = await http(ctx, "POST", `${probeVault.path}/debug/simulate-daily-limit`, { cookie, json: { enabled: false } });
+			const probe = await http(ctx, "POST", `${probeVault.path}/debug/simulate-daily-limit`, { token: probeVault.owner.token, json: { enabled: false } });
 			if (isRouteMissing(probe) || probe.status === 404) {
-				t.skip("debug route POST /vault/:id/debug/simulate-daily-limit absent (404: YAOS_TEST_ONLY_DEBUG_ROUTES is not \"true\" on this Worker)", brief(probe));
+				t.skip("debug route POST /vault/:id/debug/simulate-daily-limit absent (404: YAOS_DEBUG_ROUTES is not \"1\" on this Worker)", brief(probe));
 				return;
 			}
 			const v = await vault(ctx, "daily", ["A", "B"]);
-			const on = await http(ctx, "POST", `${v.path}/debug/simulate-daily-limit`, { cookie, json: { enabled: true } });
+			const on = await http(ctx, "POST", `${v.path}/debug/simulate-daily-limit`, { token: v.owner.token, json: { enabled: true } });
 			t.check("simulate on 2xx", on.status >= 200 && on.status < 300, brief(on));
 			try {
 				const a = await StreamSocket.connect(ctx, v.vaultId, device(v, "A"), "A");
@@ -72,7 +72,7 @@ export const tests: TestDef[] = [
 				const ck = await http(ctx, "PUT", checkpointPath(v.path, "b:daily", 1, 0), { token: v.owner.token, body: payloadOf("ck", 16) });
 				t.info("checkpoint while latched", brief(ck, { retryAfter: ck.headers.get("retry-after") }));
 			} finally {
-				const off = await http(ctx, "POST", `${v.path}/debug/simulate-daily-limit`, { cookie, json: { enabled: false } });
+				const off = await http(ctx, "POST", `${v.path}/debug/simulate-daily-limit`, { token: v.owner.token, json: { enabled: false } });
 				t.check("simulate off 2xx", off.status >= 200 && off.status < 300, brief(off));
 			}
 		},

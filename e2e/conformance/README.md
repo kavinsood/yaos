@@ -75,7 +75,7 @@ node e2e/conformance/run.ts --host https://<worker>.workers.dev --label <label> 
 | T-CODEC-NONMINIMAL | H1 | fails (lib0 accepts non-minimal varuints) |
 | T-CODEC-VALID | H1 | passes |
 | T-DEDUPE-LARGE, T-DEDUPE-SMALL | H2 | fail (the dedupe window is the open segment plus one sealed segment while it has fewer than 64 rows) |
-| T-DAILY | H3 | skipped unless the Worker sets `YAOS_TEST_ONLY_DEBUG_ROUTES=true` |
+| T-DAILY | H3 | skipped unless the Worker sets `YAOS_DEBUG_ROUTES=1` |
 | T-RATE-DEVICE | H6 | fails (buckets are per socket, not per device) |
 | T-SOCKET-CAP-DEVICE | H6 | fails (no per-device socket cap) |
 | T-RETIRED-GC | H7 | fails (the open segment is never collected, so gcSeq stays 0) |
