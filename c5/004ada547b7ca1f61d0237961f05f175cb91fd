@@ -1,0 +1,21 @@
+src/engine/runtime/engine.test.ts
+  s_93127f9ec7696c::t_349aceaef54e7e 4-6,36-68
+src/engine/runtime/engine.ts
+  s_93127f9ec7696c::t_c2b1ace4fd1a5b 342-354,356-357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c5004ada547b7ca1f61d0237961f05f175cb91fd",
+  "prompts": {},
+  "sessions": {
+    "s_93127f9ec7696c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a77891ec80828224b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
