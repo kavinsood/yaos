@@ -1,0 +1,21 @@
+tests/server/identity.ts
+  s_4bbb4f0137215c::t_aeb04e84f46e95 1-613
+tests/server/operator.ts
+  s_4bbb4f0137215c::t_f1e1afd7e03458 1-504
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "351ef71271e49863cc51edf4463f283380ce3c62",
+  "prompts": {},
+  "sessions": {
+    "s_4bbb4f0137215c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a75978e2782c742bb",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
