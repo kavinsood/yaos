@@ -2,6 +2,14 @@
  * Test harness for LogEngine (tests and e2e scripts only; not imported by
  * engine code). Real web clock / hash / random adapters (Node globals), suite-0
  * crypto with a switchable "unknown key" fault, in-memory storage stand-in.
+ *
+ * Deterministic mode: pass a VirtualClock as `clock` to startTestEngine and to
+ * until / sleep / converged / drive, and build the SimRelay with the same
+ * clock (`new SimRelay({ clock })`). The engine then gets the virtual clock, a
+ * seeded random, the microtask sha256 and storage whose idle check runs before
+ * every timer; virtual time only moves inside until / sleep / drive, so any
+ * engine call that may wait on a timer (start, stop, flush) must go through
+ * drive().
  */
 
 import type { DeviceId, VaultId } from "../../core/types";
@@ -14,7 +22,10 @@ import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebClock } from "../adapters/webClock";
 import { createWebHash } from "../adapters/webHash";
 import { createWebRandom } from "../adapters/webRandom";
+import type { VirtualClock } from "../../sim/clock";
+import { hashLabel, SeededRandom } from "../../sim/random";
 import { MemStoragePort } from "../../sim/storage";
+import { simHashPort } from "../../sim/__standins__/sha256";
 import { LogEngine } from "./engine";
 import type { EngineOptions, EngineTuning } from "./options";
 
@@ -77,33 +88,80 @@ export interface TestEngineOpts {
 	readonly sideFiles?: SideFilePort | null;
 	readonly tuning?: Partial<EngineTuning>;
 	readonly extra?: Partial<EngineOptions>;
+	/** Deterministic mode (see the header). The relay must run on the same clock. */
+	readonly clock?: VirtualClock;
 }
 
-export function testPorts(relay: RelayPort, storage: StoragePort, crypto: CryptoPort | null = null): EnginePorts {
+export function testPorts(relay: RelayPort, storage: StoragePort, crypto: CryptoPort | null = null, clock?: VirtualClock, seed = 1): EnginePorts {
+	if (clock) {
+		const hash = simHashPort();
+		return { relay, storage, clock, random: new SeededRandom(seed), crypto: crypto ?? createNoopCrypto(hash), hash, blob: null };
+	}
 	const hash = createWebHash();
 	return { relay, storage, clock: createWebClock(), random: createWebRandom(), crypto: crypto ?? createNoopCrypto(hash), hash, blob: null };
 }
 
+/** Storage for a test engine: in clock mode the idle check also runs before every virtual timer. */
+export function testStorage(clock?: VirtualClock): MemStoragePort {
+	return new MemStoragePort(clock ? { beforeNextTimer: clock.beforeNextTimer } : {});
+}
+
+/** Engines started per virtual clock: a restarted device must not replay its random ids (frame ids would collide). */
+const starts = new WeakMap<VirtualClock, number>();
+
 export async function startTestEngine(o: TestEngineOpts): Promise<{ engine: LogEngine; storage: StoragePort }> {
-	const storage = o.storage ?? new MemStoragePort();
-	const engine = await LogEngine.start({
-		ports: testPorts(o.relay, storage, o.crypto ?? null),
+	const storage = o.storage ?? testStorage(o.clock);
+	let seed = 1;
+	if (o.clock) {
+		const n = (starts.get(o.clock) ?? 0) + 1;
+		starts.set(o.clock, n);
+		seed = hashLabel(`${o.deviceId}#${n}`);
+	}
+	const engine = await drive(LogEngine.start({
+		ports: testPorts(o.relay, storage, o.crypto ?? null, o.clock, seed),
 		vaultId: (o.vaultId ?? "vault-test") as VaultId,
 		deviceId: o.deviceId as DeviceId,
 		clientVersion: "test",
 		sideFiles: o.sideFiles ?? null,
 		tuning: { ...FAST_TUNING, ...(o.tuning ?? {}) },
 		...(o.extra ?? {}),
-	});
+	}), o.clock);
 	return { engine, storage };
 }
 
-export function sleep(ms: number): Promise<void> {
+/** Real clock: setTimeout. Virtual clock: advance virtual time by ms. */
+export function sleep(ms: number, clock?: VirtualClock): Promise<void> {
+	if (clock) return clock.advance(ms);
 	return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Poll until `pred` holds (or throw after timeoutMs). */
-export async function until(pred: () => boolean | Promise<boolean>, timeoutMs = 5_000, what = "condition"): Promise<void> {
+/** Await `p`; with a virtual clock, run the clock until p settles (throws after horizonMs of virtual time). */
+export async function drive<T>(p: Promise<T>, clock?: VirtualClock, horizonMs = 60_000, what = "promise"): Promise<T> {
+	if (!clock) return p;
+	let settled = false;
+	p.then(() => (settled = true), () => (settled = true));
+	if (!(await clock.runUntil(() => settled, horizonMs))) throw new Error(`timed out (virtual ${horizonMs} ms) waiting for ${what}`);
+	return p;
+}
+
+/**
+ * Poll until `pred` holds (or throw after timeoutMs). Real clock: every 10 ms.
+ * Virtual clock: after every timer (clock.runUntil; an async pred is awaited
+ * between steps), timeoutMs of virtual time.
+ */
+export async function until(pred: () => boolean | Promise<boolean>, timeoutMs = 5_000, what = "condition", clock?: VirtualClock): Promise<void> {
+	if (clock) {
+		const end = clock.monotonic() + timeoutMs;
+		for (;;) {
+			await clock.settleMicrotasks();
+			if (await pred()) return;
+			if (!(await clock.step(end))) {
+				await clock.settleMicrotasks();
+				if (await pred()) return;
+				throw new Error(`timed out (virtual ${timeoutMs} ms) waiting for ${what}`);
+			}
+		}
+	}
 	const start = Date.now();
 	for (;;) {
 		if (await pred()) return;
@@ -113,7 +171,7 @@ export async function until(pred: () => boolean | Promise<boolean>, timeoutMs = 
 }
 
 /** Every engine idle, and their doc lists / texts equal. */
-export async function converged(engines: readonly LogEngine[], timeoutMs = 8_000): Promise<void> {
+export async function converged(engines: readonly LogEngine[], timeoutMs = 8_000, clock?: VirtualClock): Promise<void> {
 	await until(async () => {
 		for (const e of engines) if (!e.isIdle()) return false;
 		const sig = async (e: LogEngine) => {
@@ -125,5 +183,5 @@ export async function converged(engines: readonly LogEngine[], timeoutMs = 8_000
 		const first = await sig(engines[0]!);
 		for (const e of engines.slice(1)) if ((await sig(e)) !== first) return false;
 		return true;
-	}, timeoutMs, "convergence");
+	}, timeoutMs, "convergence", clock);
 }

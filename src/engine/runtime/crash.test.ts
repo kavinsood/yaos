@@ -16,10 +16,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ClientFrameId, DeviceId, StreamName, VaultId } from "../../core/types";
 import { Repo } from "../store/repo";
+import { VirtualClock } from "../../sim/clock";
 import { MemStoragePort, type CommitDecision } from "../../sim/storage";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { converged, sleep, startTestEngine, until } from "./testHarness";
+import { converged, drive, sleep, startTestEngine, testStorage, until } from "./testHarness";
 
 const TUNING = { compactRows: 4, checkpoint: { rows: 3, bytes: 1e9, idleMs: 10, fallbackMs: 40, nsRows: 3, nsBytes: 1e9 } };
 const SAMPLE = Math.max(1, Number(process.env.YAOS_CRASH_SAMPLE ?? "1"));
@@ -39,10 +40,10 @@ interface RunResult {
 	readonly crashed: { index: number; label: string } | null;
 }
 
-async function kill(e: LogEngine | null): Promise<void> {
+async function kill(e: LogEngine | null, clock: VirtualClock): Promise<void> {
 	if (!e) return;
 	e.disconnect();
-	await Promise.race([e.stop().catch(() => undefined), sleep(1_000)]);
+	await drive(e.stop(), clock, 1_000).catch(() => undefined);
 }
 
 const IDENT = { vaultId: "vault-test" as VaultId, vaultEpoch: "sim-epoch-1", deviceId: "dev-a" as DeviceId, clientVersion: "test" };
@@ -71,10 +72,17 @@ async function probe(storage: MemStoragePort, relay: SimRelay): Promise<Set<Clie
 	return out;
 }
 
+/**
+ * Runs on a VirtualClock (deterministic: same k -> same interleaving). Virtual
+ * time only moves inside until / sleep / drive, so every engine call that may
+ * wait on a timer goes through drive().
+ */
 async function scenario(k: number | null, decision: CommitDecision): Promise<RunResult> {
-	const relay = new SimRelay();
-	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", tuning: TUNING });
-	const storage = new MemStoragePort();
+	const clock = new VirtualClock();
+	const relay = new SimRelay({ clock });
+	const run = <T>(p: Promise<T>, what?: string) => drive(p, clock, 60_000, what);
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", tuning: TUNING, clock });
+	const storage = testStorage(clock);
 	const labels: string[] = [];
 	let crashed: RunResult["crashed"] = null;
 	storage.setCommitHook((info) => {
@@ -90,9 +98,9 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 	let a: LogEngine | null = null;
 	let a2: LogEngine | null = null;
 	try {
-		await until(() => b.status().phase === "live", 3_000, "b live");
-		const pre = await b.createDoc("pre.md", "b-before;");
-		await until(() => b.isIdle(), 3_000, "b idle");
+		await until(() => b.status().phase === "live", 3_000, "b live", clock);
+		const pre = await run(b.createDoc("pre.md", "b-before;"));
+		await until(() => b.isIdle(), 3_000, "b idle", clock);
 		const step = async (fn: () => Promise<unknown>) => {
 			if (storage.dead) return;
 			try {
@@ -102,7 +110,7 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 			}
 		};
 		await step(async () => {
-			a = (await startTestEngine({ relay, deviceId: "dev-a", storage, tuning: TUNING })).engine;
+			a = (await startTestEngine({ relay, deviceId: "dev-a", storage, tuning: TUNING, clock })).engine;
 			const repo = a.c.repo;
 			const orig = repo.tEdit.bind(repo);
 			repo.tEdit = async (...args) => {
@@ -112,59 +120,62 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 			};
 		});
 		const A = () => a!;
-		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle"));
+		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle", clock));
 		let a1 = "" as never;
-		await step(async () => void (a1 = await A().createDoc("a1.md", "alpha;") as never));
+		await step(async () => void (a1 = await run(A().createDoc("a1.md", "alpha;")) as never));
 		for (let i = 0; i < 6; i++) {
-			await step(() => A().editDoc(a1, (t) => t.insert(t.length, `e${i};`)));
-			await step(() => sleep(15));
+			await step(() => run(A().editDoc(a1, (t) => t.insert(t.length, `e${i};`))));
+			await step(() => sleep(15, clock));
 		}
-		await b.editDoc(pre, (t) => t.insert(t.length, "b-live;"));
-		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle 2"));
-		await step(() => A().editDoc(pre, (t) => t.insert(0, "a-on-pre;")));
-		await step(() => A().renameDoc(a1, "a1-renamed.md"));
+		await run(b.editDoc(pre, (t) => t.insert(t.length, "b-live;")));
+		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle 2", clock));
+		await step(() => run(A().editDoc(pre, (t) => t.insert(0, "a-on-pre;"))));
+		await step(() => run(A().renameDoc(a1, "a1-renamed.md")));
 		await step(async () => {
-			const tmp = await A().createDoc("tmp.md", "gone soon");
-			await until(() => storage.dead || A().isIdle(), 3_000, "a idle 3");
-			await A().deleteDoc(tmp);
+			const tmp = await run(A().createDoc("tmp.md", "gone soon"));
+			await until(() => storage.dead || A().isIdle(), 3_000, "a idle 3", clock);
+			await run(A().deleteDoc(tmp));
 		});
 		await step(async () => {
 			relay.pauseCommits();
-			await A().editDoc(a1, (t) => t.insert(0, "paused;"));
-			await until(() => storage.dead || A().c.sender.inflightCount > 0, 2_000, "inflight");
+			await run(A().editDoc(a1, (t) => t.insert(0, "paused;")));
+			await until(() => storage.dead || A().c.sender.inflightCount > 0, 2_000, "inflight", clock);
+			// Lazy T_sent while the frame is unreceipted (commits paused, so no receipt can clear sentPending first).
+			const sent = labels.filter((l) => l === "tSent").length;
+			await until(() => storage.dead || labels.filter((l) => l === "tSent").length > sent, 2_000, "tSent", clock);
 			relay.restart();
 			relay.resumeCommits();
 		});
 		relay.resumeCommits();
-		await step(() => sleep(120)); // checkpoints / compaction / T_sent ticks
-		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle 4"));
+		await step(() => sleep(120, clock)); // checkpoints / compaction / T_sent ticks
+		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle 4", clock));
 		if (k === null) {
 			assert.equal(storage.dead, false);
-			await converged([A(), b]);
+			await converged([A(), b], 8_000, clock);
 			return { labels, crashed };
 		}
-		await kill(a);
+		await kill(a, clock);
 		a = null;
 		const copy = storage.crash();
 		const inOutbox = await probe(copy, relay);
 		const restartStore = copy.crash();
 		for (const id of inOutbox) durable.add(id);
-		a2 = (await startTestEngine({ relay, deviceId: "dev-a", storage: restartStore, tuning: TUNING })).engine;
-		await converged([a2, b], 10_000);
+		a2 = (await startTestEngine({ relay, deviceId: "dev-a", storage: restartStore, tuning: TUNING, clock })).engine;
+		await converged([a2, b], 10_000, clock);
 		const mine = new Map<string, number>();
 		for (const s of relay.streams()) for (const r of relay.rows(s as StreamName, { includeGc: true })) if (r.deviceId === "dev-a") mine.set(r.clientFrameId, (mine.get(r.clientFrameId) ?? 0) + 1);
 		totals.durableChecked += durable.size;
 		for (const id of durable) assert.equal(mine.get(id), 1, `durable frame ${id} committed exactly once (crash ${decision} #${k} ${(crashed as RunResult["crashed"])?.label})`);
 		assert.equal(a2.c.outbox.size, 0, "outbox drained");
 		assert.equal(a2.c.repo.cursor.vaultSeq, relay.head());
-		assert.ok((await b.docText(pre)).includes("b-before;b-live;"));
+		assert.ok((await run(b.docText(pre))).includes("b-before;b-live;"));
 		return { labels, crashed };
 	} catch (e) {
 		throw new Error(`crash ${decision} #${k} (${(crashed as RunResult["crashed"])?.label ?? "-"}): ${String(e instanceof Error ? e.stack : e)}`);
 	} finally {
-		await kill(a);
-		await kill(a2);
-		await b.stop();
+		await kill(a, clock);
+		await kill(a2, clock);
+		await run(b.stop());
 	}
 }
 
