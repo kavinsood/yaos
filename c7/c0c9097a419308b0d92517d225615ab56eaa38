@@ -1,0 +1,27 @@
+src/engine/compose/vaultRuntime.ts
+  s_71e670913dcd74::t_3769bb9aa10ccd 205,316-324
+src/engine/reconcile/context.ts
+  s_71e670913dcd74::t_b84c3b72253d35 19,63-67
+src/engine/reconcile/reconciler.ownFold.test.ts
+  s_71e670913dcd74::t_770680ebbcfac1 1-46
+src/engine/reconcile/reconciler.ts
+  s_71e670913dcd74::t_ee2a1b0318cc59 140-144
+src/engine/reconcile/testkit/world.ts
+  s_71e670913dcd74::t_adc2da4caa93ca 13,30-31,47,73,75,112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c7c0c9097a419308b0d92517d225615ab56eaa38",
+  "prompts": {},
+  "sessions": {
+    "s_71e670913dcd74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a293b6665872fe812",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
