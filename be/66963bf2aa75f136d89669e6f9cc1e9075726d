@@ -1,0 +1,23 @@
+src/core/plan/planner.test.ts
+  s_5ec5b8c6943789::t_4a3a572273ade1 123-152
+src/core/plan/planner.ts
+  s_5ec5b8c6943789::t_40e0e2d7f8aac4 31-34,39-41,223-238,352-354,418,422-423
+src/engine/reconcile/reconciler.safety.test.ts
+  s_5ec5b8c6943789::t_e38db0f30cc50a 113-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "be66963bf2aa75f136d89669e6f9cc1e9075726d",
+  "prompts": {},
+  "sessions": {
+    "s_5ec5b8c6943789": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad23e7dffd5cd7d1b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
