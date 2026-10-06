@@ -440,7 +440,8 @@ s.test("an unread request body is drained in finally; a thrown error is 500 inte
 		const response = await world.router.fetch(request, world.env);
 		assert.equal(response.status, 501);
 		assert.equal(request.bodyUsed, true, "the body was read to the end");
-		const failing = { ...world.env, YAOS_VAULT: { idFromName: () => { throw new Error("boom"); } } } as unknown as WorkerEnv;
+		const boom = () => { throw new Error("boom"); };
+		const failing: WorkerEnv = { ...world.env, YAOS_VAULT: new Proxy({}, { get: () => boom }) as WorkerEnv["YAOS_VAULT"] };
 		const original = console.error;
 		console.error = () => {};
 		try {

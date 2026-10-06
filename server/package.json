@@ -2,19 +2,15 @@
 	"name": "yaos-server",
 	"version": "1.0.0",
 	"private": true,
-	"description": "Cloudflare Worker server for multivault root/body CRDT sync and recovery",
+	"description": "Cloudflare Worker server for YAOS: opaque streams relay, devices and pairing",
 	"scripts": {
-		"build:ywasm": "node scripts/build-ywasm.mjs",
 		"dev": "wrangler dev",
 		"deploy": "wrangler deploy",
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"fflate": "^0.8.2",
 		"lib0": "0.2.117",
-		"qrcode-generator": "2.0.4",
-		"y-protocols": "1.0.7",
-		"yjs": "^13.6.20"
+		"qrcode-generator": "2.0.4"
 	},
 	"devDependencies": {
 		"@cloudflare/workers-types": "5.20261001.1",

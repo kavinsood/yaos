@@ -9,7 +9,7 @@ import {
 	type ClientTimerName,
 } from "../../legacy-src/runtime/testOnlyTimers";
 import { SocketLivenessCoordinator } from "../../legacy-src/runtime/socketLivenessCoordinator";
-import { SOCKET_LIVENESS_DESCRIPTOR, SOCKET_LIVENESS_IDLE_MS, SOCKET_LIVENESS_TIMEOUT_MS } from "../../server/src/shared/socketLiveness";
+import { SOCKET_LIVENESS_DESCRIPTOR, SOCKET_LIVENESS_IDLE_MS, SOCKET_LIVENESS_TIMEOUT_MS } from "../../legacy-src/shared/socketLiveness";
 import { AWARENESS_CHECK_MS, AWARENESS_REMOTE_TIMEOUT_MS, AWARENESS_RENEW_MS } from "../../legacy-src/sync/ownAwarenessProvider";
 import { TICKET_REFRESH_BUFFER_MS, ticketRefreshBufferMs } from "../../legacy-src/sync/socketTicket";
 import { suite } from "../harness.ts";

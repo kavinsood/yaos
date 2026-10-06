@@ -11,7 +11,7 @@ import {
 	type VaultServerPort,
 } from "../../legacy-src/sync/vaultSync";
 import type { StoredDocument } from "../../legacy-src/sync/vaultIndexedDb";
-import { SOCKET_CONTROL_CAPABILITIES, SOCKET_LIVENESS_DESCRIPTOR } from "../../server/src/shared/socketLiveness";
+import { SOCKET_CONTROL_CAPABILITIES, SOCKET_LIVENESS_DESCRIPTOR } from "../../legacy-src/shared/socketLiveness";
 import { ConnectionController } from "../../legacy-src/runtime/connectionController";
 import { VaultWorkScheduler } from "../../legacy-src/sync/vaultWorkScheduler";
 import { sleep, suite, until } from "../harness.ts";

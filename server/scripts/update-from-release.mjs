@@ -155,7 +155,7 @@ async function stageArtifactZip() {
 				[
 					baseMessage,
 					"Expected release assets were not found.",
-					"Make sure the selected release includes BOTH 'yaos-server.zip' and 'update-manifest.json'.",
+					"Make sure the selected release includes 'yaos-server.zip'.",
 					`release_repo=${releaseRepo}${releaseVersion ? ` version=${releaseVersion}` : " version=latest"}`,
 				].join(" "),
 			);

@@ -57,7 +57,6 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" \
               yaos.zip \
               dist/release-assets/yaos-server.zip \
-              dist/release-assets/update-manifest.json \
               main.js \
               manifest.json \
               styles.css \
@@ -68,7 +67,6 @@ jobs:
               --generate-notes \
               yaos.zip \
               dist/release-assets/yaos-server.zip \
-              dist/release-assets/update-manifest.json \
               main.js \
               manifest.json \
               styles.css

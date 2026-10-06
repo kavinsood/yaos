@@ -160,10 +160,11 @@ export class VaultCluster {
 			},
 			init: (vaultId: string) => Promise.resolve(this.object(name).host.init(vaultId)),
 		});
-		return {
+		const methods: Record<string, unknown> = {
 			idFromName: (name: string) => ({ name }),
 			get: (id: { name: string }) => stub(id.name),
-		} as unknown as WorkerEnv["YAOS_VAULT"];
+		};
+		return new Proxy({}, { get: (_target, property) => methods[String(property)] }) as WorkerEnv["YAOS_VAULT"];
 	}
 
 	close(): void {

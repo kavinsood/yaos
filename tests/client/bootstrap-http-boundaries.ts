@@ -1,5 +1,4 @@
 import { strict as assert } from "node:assert";
-import { MAX_CATCH_UP_BODIES } from "../../server/src/contracts";
 import {
 	BOOTSTRAP_BODY_BATCH_MAX,
 	BootstrapHttpPort,
@@ -14,9 +13,11 @@ import {
 	type HttpResponse,
 } from "../../legacy-src/utils/http";
 import { suite } from "../harness.ts";
-import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../legacy-src/shared/binaryEnvelope";
 
 const s = suite("bootstrap-http-boundaries");
+/** The legacy server's catch-up batch cap (`server/src/contracts.ts`, deleted with the legacy server in P1). */
+const MAX_CATCH_UP_BODIES = 100;
 
 function response(overrides: Partial<BootstrapHttpResponse> = {}): BootstrapHttpResponse {
 	return {

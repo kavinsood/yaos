@@ -2,7 +2,7 @@
 //
 // The regression runner discovers suites by convention — every `*.ts` file in
 // tests/client/, tests/server/ or tests/contracts/ — instead of reading a
-// hand-maintained array. Live-worker discovery belongs to tests/live/run-live.ts.
+// hand-maintained array.
 // That only stays trustworthy if two invariants hold, and both are checked here:
 //
 //   1. ACCOUNTABILITY — every discovery candidate is either a real suite (one

@@ -1,13 +1,10 @@
 #!/usr/bin/env node
+// The server is an opaque streams relay (docs/server-rewrite/DECISIONS.md §1): it holds no CRDT state, so no file
+// under server/src may import yjs or y-protocols.
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 const root = resolve("server/src");
-const allowed = new Set([
-	"crdt/yjsCrdtEngine.ts",
-	"shared/canvasSemanticDocument.ts",
-	"shared/frontmatterSemanticValidation.ts",
-]);
 const violations = [];
 
 function visit(directory) {
@@ -15,11 +12,9 @@ function visit(directory) {
 		const path = join(directory, entry.name);
 		if (entry.isDirectory()) visit(path);
 		else if (entry.name.endsWith(".ts")) {
-			const name = relative(root, path);
-			if (allowed.has(name)) continue;
 			const source = readFileSync(path, "utf8");
-			if (/from\s+["']yjs["']|from\s+["']y-protocols\/sync["']|require\(["']yjs["']\)/.test(source)) {
-				violations.push(name);
+			if (/from\s+["'](?:yjs|y-protocols(?:\/[^"']*)?)["']|require\(["'](?:yjs|y-protocols(?:\/[^"']*)?)["']\)/.test(source)) {
+				violations.push(relative(root, path));
 			}
 		}
 	}
@@ -27,7 +22,7 @@ function visit(directory) {
 
 visit(root);
 if (violations.length > 0) {
-	console.error(`Production server CRDT imports bypass the engine boundary:\n${violations.join("\n")}`);
+	console.error(`server/src must not import yjs or y-protocols:\n${violations.join("\n")}`);
 	process.exit(1);
 }
-console.log("Production server CRDT imports are confined to the oracle/shared client adapters.");
+console.log("server/src imports no yjs or y-protocols.");

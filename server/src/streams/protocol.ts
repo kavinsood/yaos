@@ -208,14 +208,3 @@ export function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
 	for (let index = 0; index < left.byteLength; index++) if (left[index] !== right[index]) return false;
 	return true;
 }
-
-// ---- flag --------------------------------------------------------------------
-
-export interface StreamsFlagEnv {
-	/** Opaque streams surface; inert unless exactly "true". */
-	YAOS_STREAMS?: string;
-}
-
-export function streamsEnabled(env: StreamsFlagEnv | null | undefined): boolean {
-	return env?.YAOS_STREAMS === "true";
-}

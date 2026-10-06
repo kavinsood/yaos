@@ -10,7 +10,7 @@ import {
 import { MemoryLocalVaultImportStateStore } from "../../legacy-src/onboarding/localVaultImportStore";
 import { fetchVaultProvisioningProof, readVaultProvisioningProof } from "../../legacy-src/onboarding/provisioningClient";
 import { suite } from "../harness.ts";
-import { MAX_CLIENT_MARKDOWN_BYTES } from "../../server/src/shared/durableLimits";
+import { MAX_CLIENT_MARKDOWN_BYTES } from "../../legacy-src/shared/durableLimits";
 
 const s = suite("onboarding-import");
 

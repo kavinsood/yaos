@@ -8,7 +8,7 @@
  * note only reached the server after the hourly probe.
  */
 import { strict as assert } from "node:assert";
-import { decodeBinaryEnvelope, encodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope } from "../../legacy-src/shared/binaryEnvelope";
 import { dailyLimitResponse } from "../../server/src/dailyLimit";
 import {
 	DAILY_LIMIT_FIRST_PROBE_MS,

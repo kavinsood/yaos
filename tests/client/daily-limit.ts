@@ -9,7 +9,7 @@ import {
 	type VaultDatabasePort,
 	type VaultServerPort,
 } from "../../legacy-src/sync/vaultSync";
-import { SOCKET_CONTROL_CAPABILITIES, SOCKET_LIVENESS_DESCRIPTOR } from "../../server/src/shared/socketLiveness";
+import { SOCKET_CONTROL_CAPABILITIES, SOCKET_LIVENESS_DESCRIPTOR } from "../../legacy-src/shared/socketLiveness";
 import {
 	DAILY_LIMIT_MAX_BACKOFF_MS,
 	DAILY_LIMIT_NOTICE,

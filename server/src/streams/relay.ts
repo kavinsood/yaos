@@ -29,7 +29,6 @@ import {
 	STREAM_READ_MAX_BYTES,
 	STREAMS_CAPABILITY_VERSION,
 	STREAMS_DOCUMENT_ID,
-	type StreamsFlagEnv,
 	bytesEqual,
 	decodeAppendFrame,
 	encodeCommitNotice,
@@ -67,7 +66,7 @@ export const DEFAULT_STREAM_RELAY_CONFIG: Readonly<StreamRelayConfig> = Object.f
 	maxSockets: MAX_STREAM_SOCKETS,
 });
 
-export interface StreamsEnv extends StreamsFlagEnv {
+export interface StreamsEnv {
 	YAOS_STREAMS_GC_IDLE_MS?: string;
 	YAOS_STREAMS_GC_MAX_MS?: string;
 	YAOS_STREAMS_GC_MAX_BYTES?: string;
