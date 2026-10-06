@@ -48,6 +48,7 @@ export async function rebind(env: Env, op: Op<"rebind">): Promise<JobOutcome> {
 	if (!s) return "ok";
 	if (ctx.synced(op.toDocId)) {
 		await ctx.commit({ syncedDrop: [op.fromDocId], baseDrop: [op.fromDocId] });
+		ctx.deps.onRebind?.(op.fromDocId, op.toDocId);
 		return "ok";
 	}
 	// A merged alias restarts at the winner's create, as the planner planned it; a collapse (live loser) keeps S.
@@ -59,6 +60,7 @@ export async function rebind(env: Env, op: Op<"rebind">): Promise<JobOutcome> {
 		syncedDrop: [op.fromDocId], syncedPut: [moved],
 		baseMove: from.hasBase ? [{ from: op.fromDocId, to: op.toDocId }] : [], baseDrop: s.hasBase && !from.hasBase ? [op.fromDocId] : [],
 	});
+	ctx.deps.onRebind?.(op.fromDocId, op.toDocId);
 	return "ok";
 }
 

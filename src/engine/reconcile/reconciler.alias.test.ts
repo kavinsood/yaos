@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { VaultPath } from "../../core/types";
+import type { PathKey, VaultPath } from "../../core/types";
 import { World } from "./testkit/world";
 
 const P = (s: string): VaultPath => s as VaultPath;
@@ -68,4 +68,22 @@ test("merged alias without local edits (E3): zero disk ops, zero conflict copies
 	assert.deepEqual(w.conflictCopies(), []);
 	assert.equal(w.gateway.executed.length, writes, "no disk ops");
 	assert.equal(w.synced(win)?.hasBase, true);
+});
+
+test("merged alias rebind reports the move, so an editor bound to the loser re-opens on the winner", async () => {
+	// Sim seeds 924 / 668: the planner's rebind moved S to the winner but nobody told the bound editor, whose
+	// typing kept going to the loser's stream while the merge job of the loser stayed "deferred".
+	const w = new World();
+	await w.boot();
+	w.log.holdNs = true;
+	w.log.mergeIdentical = true;
+	w.vault.userWrite("n.md", "c\n");
+	await w.sync();
+	const loser = w.log.view().remoteByPathKey.get("n.md" as PathKey);
+	assert.ok(loser);
+	const win = w.log.remoteCreateBodyless(P("n.md"), "c\n");
+	await w.log.flushNs();
+	await w.sync();
+	assert.equal(w.synced(win)?.path, "n.md");
+	assert.deepEqual(w.rebinds, [[loser, win]]);
 });

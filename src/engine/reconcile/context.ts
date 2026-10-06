@@ -56,6 +56,12 @@ export interface ReconcilerDeps {
 	readonly mergeLimits?: MergeLimits;
 	readonly notice?: (level: "info" | "warn" | "error", code: string, message: string) => void;
 	readonly onBrake?: (report: BrakeReport) => void;
+	/**
+	 * A rebind moved the synced record of `from` to `into` (§c.13 merged alias, identical-loser collapse,
+	 * §c.12 migrated loser): an editor bound to `from` must re-open as `into`, or its typing keeps going
+	 * to the loser while the file is the winner's.
+	 */
+	readonly onRebind?: (from: DocId, into: DocId) => void;
 	/** Path-keyed base text carried over a vaultEpoch migration (§c.12 step 3); null = none. */
 	readonly pathBase?: (key: PathKey) => string | null;
 	/** The keys `pathBase` answers for (the planner's migrated-loser merge). */

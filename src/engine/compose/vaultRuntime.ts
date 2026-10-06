@@ -200,7 +200,7 @@ export class VaultRuntime {
 		this.rec = await Reconciler.open({
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
-			notice: this.notice, onBrake: (r) => this.onBrake(r), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
+			notice: this.notice, onBrake: (r) => this.onBrake(r), onRebind: (from, into) => this.retarget(from, into), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
 			pathBaseKeys: o.pathBases ? new Set(o.pathBases.keys()) : undefined,
 			takeOwnFold: () => this.takeOwnFold(),
 		});
@@ -246,15 +246,19 @@ export class VaultRuntime {
 			this.ownQueue.push(...fx.own);
 			this.stats.ownFoldEvents += fx.own.length;
 		}
-		for (const r of fx.retarget) {
-			bound.drop(r.docId);
-			this.log.unbind(r.docId);
-			this.stats.retargets++;
-			this.engine.link.post({ t: "docRetarget", docId: r.docId, change: { t: "merged", into: r.into } });
-		}
+		for (const r of fx.retarget) this.retarget(r.docId, r.into);
 		this.checkBindable();
 		if (reloaded) this.sched.request({ t: "full" });
 		else if (fx.docIds.size > 0 || fx.own.length > 0) this.sched.request({ t: "docs", docIds: [...fx.docIds], pathKeys: [...fx.pathKeys] });
+	}
+
+	/** A bound doc's identity moved to `into` (merged alias fold, planner rebind): the host re-opens its views. */
+	private retarget(docId: DocId, into: DocId): void {
+		if (!this.engine.bound.isBound(docId)) return;
+		this.engine.bound.drop(docId);
+		this.log.unbind(docId);
+		this.stats.retargets++;
+		this.engine.link.post({ t: "docRetarget", docId, change: { t: "merged", into } });
 	}
 
 	/** Remote body rows / checkpoints / provisionals changed docs: project them (§f.2 docs scope). */

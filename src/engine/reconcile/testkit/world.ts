@@ -45,6 +45,8 @@ export class World {
 	readonly notices: { level: string; code: string; message: string }[] = [];
 	readonly brakes: BrakeReport[] = [];
 	readonly ownQueue: OwnFoldEvent[] = [];
+	/** ReconcilerDeps.onRebind calls: [from, into]. */
+	readonly rebinds: [DocId, DocId][] = [];
 	private rec: Reconciler | null = null;
 
 	constructor(readonly opts: WorldOptions = {}) {
@@ -69,6 +71,7 @@ export class World {
 			brake: { ...DEFAULT_BRAKE, ...this.opts.brake },
 			notice: (level, code, message) => this.notices.push({ level, code, message }),
 			onBrake: (report) => this.brakes.push(report),
+			onRebind: (from, into) => this.rebinds.push([from, into]),
 			pathBase: this.opts.pathBases ? (key) => this.opts.pathBases!.get(key) ?? null : undefined,
 			...(this.opts.deferOwnFold ? { takeOwnFold: () => this.ownQueue.splice(0) } : {}),
 		});
