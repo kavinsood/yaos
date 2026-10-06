@@ -1,0 +1,19 @@
+src/engine/runtime/dailyLimit.ts
+  s_441b74abbd0702::t_00162c7580cc7c 2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c3813c50e0c1f12e80a46206e12e5bdbd4bedcaf",
+  "prompts": {},
+  "sessions": {
+    "s_441b74abbd0702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5b78666751a5e84f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
