@@ -1,250 +1,289 @@
 /**
- * Local recovery snapshots (DESIGN §j.4).
+ * Recovery snapshots (DESIGN §j.4): local snapshots, their upload to the blob store, the snapshot index (`snap`
+ * stream) and restore from this device's or any other device's snapshots. Runs in the worker; every operation is
+ * serialized. Format, verification chain and retention are described in DESIGN §j.4 and core/snap/*.
  *
- * A snapshot is a zip (fflate) side file `snapshots/<id>.zip` holding
- * `manifest.json` plus `files/<vault path>` for every markdown/canvas file and
- * every blob <= 1 MiB. Capped at 256 MiB of file bytes: above that the snapshot
- * is skipped with a notice. Ids sort by time: `<createdAtMs base36, 9 chars>-<reason>`.
- *
- * Restore writes files as ordinary local edits (the reconciler picks them up
- * on its next scan; nothing is echo-suppressed). A differing current file is
- * first copied to a conflict name (precondition absent); the restore write then
- * uses precondition fingerprint(current) / absent instead of DESIGN's `any`, so a
- * file edited between the read and the write is not clobbered (reported failed).
+ *  - take: streaming export into side-file parts + descriptor (exporter.ts); a manual one is uploaded at once.
+ *  - maybeDaily (after a full pass): a daily snapshot when the newest is 24 h old, then maybeUpload: the newest
+ *    local daily/manual snapshot not yet in the index (so at most one upload a day besides manual ones).
+ *  - restore: pass 1 verifies the whole bundle (remote parts are downloaded to the cache meanwhile), nothing is
+ *    written unless it passes; pass 2 re-reads the verified parts and writes each entry (restore.ts). Any failed
+ *    check is `content_corrupt`: notice + diagnostic, the download cache is removed, the request fails.
  */
-import { strFromU8, strToU8, unzipSync, zipSync, type Zippable } from "fflate";
-import { exactFingerprint } from "../../core/hash/markdownLf";
-import { conflictName } from "../../core/plan/conflictName";
+import { SnapCorrupt, SNAP_DEFAULT_PART_BYTES, type SnapManifest } from "../../core/snap/bundle";
+import { snapLive } from "../../core/snap/fold";
+import { parseRemoteSnapshotId, parseSnapshotId, remoteSnapshotId, snapKey, snapshotId, type SnapReason, type SnapRecord } from "../../core/snap/record";
+import { verifyBundle } from "../../core/snap/verify";
 import { standInPathKey } from "../../core/plan/pathRules";
-import type { DiskFingerprint, DocKind, PathKey, PathKeyFn, VaultPath } from "../../core/types";
+import type { DeviceId, DocKind, PathKeyFn, VaultPath } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress, CryptoPort } from "../../ports/crypto";
 import type { ClockPort } from "../../ports/clock";
-import type { SideFileName, SideFilePort, WritePrecondition } from "../../ports/vault";
-import { badRequest } from "../../protocol/errors";
-import { LANE, type DiskOp, type DiskOpPurpose, type DiskReadResult, type SnapshotReason } from "../../protocol/messages";
+import type { CryptoPort } from "../../ports/crypto";
+import type { SideFilePort } from "../../ports/vault";
+import { ProtocolFailure, badRequest } from "../../protocol/errors";
 import type { DiskGateway } from "../reconcile/deps";
+import { exportSnapshot } from "./exporter";
+import { dlName, listLocal, partName, readLocal, removeDownload, removeLocal, sweep, type LocalSnapshot } from "./localStore";
+import { keepPart, remotePart, uploadSnapshot, type RemoteDeps, type UploadOutcome } from "./remote";
+import { Restorer, type RestoreResult } from "./restore";
+import type { SnapIndexPort } from "./snapIndex";
 
-export const SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024;
-export const SNAPSHOT_BLOB_MAX_BYTES = 1024 * 1024;
-/** Event snapshots (brake, epoch, idb, restore, manual) kept besides `keepDaily` dailies. */
+export type { RestoreResult } from "./restore";
+/** Event snapshots (brake, epoch, idb, restore, manual) kept locally besides `keepDaily` dailies. */
 export const SNAPSHOT_EVENT_KEEP = 10;
-const READ_BATCH = 32;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const UPLOAD_RETRY_MS = 60 * 60 * 1000;
 
-export interface SnapshotFile { readonly path: VaultPath; readonly kind: DocKind; readonly hash: DiskFingerprint; readonly size: number }
-export interface SnapshotManifest {
-	readonly formatVersion: 1;
-	readonly id: string;
-	readonly createdAtMs: number;
-	readonly reason: SnapshotReason;
-	readonly files: readonly SnapshotFile[];
-	readonly skipped: readonly { readonly path: VaultPath; readonly reason: "too-large" | "unreadable" }[];
-}
-export interface SnapshotInfo { readonly id: string; readonly createdAtMs: number; readonly reason: SnapshotReason; readonly files: number; readonly bytes: number }
-export interface RestoreResult {
-	readonly restored: readonly VaultPath[];
-	readonly unchanged: readonly VaultPath[];
-	readonly copies: readonly VaultPath[];
-	readonly failed: readonly VaultPath[];
+export interface SnapshotInfo {
+	readonly id: string; readonly createdAtMs: number; readonly reason: SnapReason; readonly files: number; readonly bytes: number;
+	readonly where: "local" | "remote" | "both"; readonly device: string | null;
 }
 
 export interface SnapshotDeps {
 	readonly disk: DiskGateway;
 	readonly side: SideFilePort;
 	readonly clock: ClockPort;
+	readonly crypto: CryptoPort;
 	/** Current local tree (files the reconciler tracks). */
 	readonly files: () => readonly { readonly path: VaultPath; readonly kind: DocKind; readonly size: number }[];
 	readonly settings: () => { readonly enabled: boolean; readonly keepDaily: number; readonly uploadToBlobStore: boolean };
-	readonly upload?: { readonly store: BlobPort; readonly crypto: CryptoPort } | null;
+	/** Blob store and snapshot index; null without a blob store (local snapshots only). */
+	readonly remote?: { readonly store: BlobPort; readonly index: SnapIndexPort } | null;
 	readonly pathKey?: PathKeyFn;
 	readonly deviceLabel: string;
 	readonly tzOffsetMinutes?: () => number;
 	readonly notice?: (level: "info" | "warn", code: string, detail?: string) => void;
+	readonly diag?: (line: string) => void;
+	/** Zip part size; default min(8 MiB, 7/8 of the store's blob limit). */
+	readonly partBytes?: number;
 }
 
-const sideName = (id: string): SideFileName => `snapshots/${id}.zip`;
-const MANIFEST = "manifest.json";
-const entryName = (path: VaultPath): string => `files/${path}`;
-
-export function snapshotId(createdAtMs: number, reason: SnapshotReason): string {
-	return `${Math.max(0, Math.floor(createdAtMs)).toString(36).padStart(9, "0")}-${reason}`;
-}
-export function parseSnapshotId(id: string): { createdAtMs: number; reason: SnapshotReason } | null {
-	const m = /^([0-9a-z]{9})-(daily|brake|epoch|idb|restore|manual)$/.exec(id);
-	return m ? { createdAtMs: parseInt(m[1]!, 36), reason: m[2] as SnapshotReason } : null;
-}
+type Source =
+	| { readonly t: "local"; readonly id: string; readonly record: SnapRecord }
+	| { readonly t: "remote"; readonly id: string; readonly key: string; readonly deviceId: DeviceId; readonly record: SnapRecord };
 
 export class SnapshotJob {
 	private readonly pk: PathKeyFn;
+	private readonly rd: RemoteDeps | null;
+	private chain: Promise<unknown> = Promise.resolve();
 	private opId = 1;
+	private busy: string | null = null;
+	private locals: LocalSnapshot[] | null = null;
+	private uploadAfterMs = 0;
+	/** The remote snapshot whose verified parts are in the download cache (one at most). */
+	private cache: { readonly key: string; readonly parts: number; readonly manifest: SnapManifest } | null = null;
 
 	constructor(private readonly deps: SnapshotDeps) {
 		this.pk = deps.pathKey ?? standInPathKey;
+		this.rd = deps.remote ? { store: deps.remote.store, index: deps.remote.index, crypto: deps.crypto } : null;
 	}
 
-	/**
-	 * Takes a snapshot; null when too large, or when snapshots are disabled. A user action (manual, and the
-	 * safety snapshot before a restore) takes one even when disabled.
-	 */
-	async take(reason: SnapshotReason): Promise<{ id: string; address: BlobAddress | null } | null> {
-		const { deps } = this;
-		if (!deps.settings().enabled && reason !== "manual" && reason !== "restore") return null;
-		const eligible = deps.files().filter((f) => f.kind !== "blob" || f.size <= SNAPSHOT_BLOB_MAX_BYTES);
-		const planned = eligible.reduce((n, f) => n + f.size, 0);
-		if (planned > SNAPSHOT_MAX_BYTES) {
-			deps.notice?.("warn", "snapshot-too-large", `${planned} bytes`);
-			return null;
-		}
-		const createdAtMs = deps.clock.now();
-		const id = snapshotId(createdAtMs, reason);
-		const zip: Zippable = {};
-		const files: SnapshotFile[] = [];
-		const skipped: { path: VaultPath; reason: "too-large" | "unreadable" }[] = [];
-		let total = 0;
-		for (let i = 0; i < eligible.length; i += READ_BATCH) {
-			const batch = eligible.slice(i, i + READ_BATCH);
-			const res = await deps.disk.read(batch.map((f) => ({ area: "vault" as const, path: f.path, maxBytes: f.kind === "blob" ? SNAPSHOT_BLOB_MAX_BYTES : SNAPSHOT_MAX_BYTES })), LANE.bulk);
-			batch.forEach((f, j) => {
-				const r = res[j];
-				if (!r || !r.ok) {
-					if (r?.ok === false && r.reason === "missing") return;
-					skipped.push({ path: f.path, reason: r?.ok === false && r.reason === "too-large" ? "too-large" : "unreadable" });
-					return;
-				}
-				total += r.bytes.length;
-				zip[entryName(f.path)] = [r.bytes, { level: f.kind === "blob" ? 0 : 6 }];
-				files.push({ path: f.path, kind: f.kind, hash: exactFingerprint(r.bytes), size: r.bytes.length });
-			});
-			if (total > SNAPSHOT_MAX_BYTES) {
-				deps.notice?.("warn", "snapshot-too-large", `${total} bytes`);
-				return null;
-			}
-		}
-		const manifest: SnapshotManifest = { formatVersion: 1, id, createdAtMs, reason, files, skipped };
-		zip[MANIFEST] = strToU8(JSON.stringify(manifest));
-		const bytes = zipSync(zip, { mtime: new Date(1980, 0, 1) });
-		await deps.side.write(sideName(id), bytes);
-		let address: BlobAddress | null = null;
-		if (deps.settings().uploadToBlobStore && deps.upload) {
-			const { store, crypto } = deps.upload;
-			try {
-				address = await crypto.blobAddress(exactFingerprint(bytes) as string as Parameters<CryptoPort["blobAddress"]>[0]);
-				await store.put(address, await crypto.sealBlob(bytes));
-			} catch {
-				address = null;
-				deps.notice?.("warn", "snapshot-upload-failed");
-			}
-		}
-		await this.prune();
-		return { id, address };
+	/** Local snapshots, oldest first (cached; only this job writes snapshot side files). */
+	private async local(): Promise<LocalSnapshot[]> {
+		this.locals ??= await listLocal(this.deps.side, (n) => this.deps.diag?.(`snapshot descriptor ${n} unreadable`));
+		return this.locals;
 	}
 
-	/** Daily snapshot when the newest daily one is older than 24 h. */
-	async maybeDaily(): Promise<string | null> {
-		const dailies = (await this.ids()).filter((s) => s.reason === "daily");
-		const latest = dailies[dailies.length - 1];
-		if (latest && this.deps.clock.now() - latest.createdAtMs < DAY_MS) return null;
-		return (await this.take("daily"))?.id ?? null;
+	private serial<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.chain.then(fn, fn);
+		this.chain = run.catch(() => undefined);
+		return run;
+	}
+
+	/** Takes a snapshot; null when too large or disabled (manual and the pre-restore one are taken regardless). */
+	take(reason: SnapReason): Promise<{ id: string; upload: UploadOutcome | null } | null> {
+		return this.serial(async () => {
+			const r = await this.takeNow(reason);
+			if (!r) return null;
+			const upload = reason === "manual" ? await this.upload(r, true) : null;
+			return { id: r.snapshotId, upload };
+		});
+	}
+
+	/** Daily snapshot when the newest daily is 24 h old; then the pending upload, if any. */
+	maybeDaily(): Promise<string | null> {
+		return this.serial(async () => {
+			const latest = (await this.local()).filter((s) => s.record.reason === "daily").pop();
+			const due = !latest || this.deps.clock.now() - latest.record.createdAtMs >= DAY_MS;
+			const taken = due ? await this.takeNow("daily") : null;
+			await this.maybeUpload();
+			return taken?.snapshotId ?? null;
+		});
 	}
 
 	async list(): Promise<SnapshotInfo[]> {
-		const out: SnapshotInfo[] = [];
-		for (const s of await this.ids()) {
-			const m = await this.manifest(s.id);
-			if (m) out.push({ id: s.id, createdAtMs: m.createdAtMs, reason: m.reason, files: m.files.length, bytes: m.files.reduce((n, f) => n + f.size, 0) });
+		const local = await this.local();
+		const live = this.rd ? snapLive(this.rd.index.view().state) : [];
+		const self = this.rd?.index.self;
+		const own = new Set(live.filter((e) => e.deviceId === self).map((e) => e.record.snapshotId));
+		const info = (id: string, r: SnapRecord, where: SnapshotInfo["where"], device: string | null): SnapshotInfo =>
+			({ id, createdAtMs: r.createdAtMs, reason: r.reason, files: r.fileCount, bytes: r.totalBytes, where, device });
+		const out = local.map((s) => info(s.id, s.record, own.has(s.id) ? "both" : "local", null));
+		const localIds = new Set(local.map((s) => s.id));
+		for (const e of live) {
+			if (e.deviceId === self && localIds.has(e.record.snapshotId)) continue;
+			out.push(info(remoteSnapshotId(e.deviceId, e.record.snapshotId), e.record, "remote", e.record.deviceLabel));
 		}
-		return out;
+		return out.sort((a, b) => a.createdAtMs - b.createdAtMs || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 	}
 
-	async manifest(id: string): Promise<SnapshotManifest | null> {
-		const zip = await this.deps.side.read(sideName(checkId(id)));
-		if (!zip) return null;
-		const m = unzipSync(zip, { filter: (f) => f.name === MANIFEST })[MANIFEST];
-		return m ? (JSON.parse(strFromU8(m)) as SnapshotManifest) : null;
+	/** The verified manifest (the whole bundle is verified; a remote one is downloaded to the cache for restore). */
+	manifest(id: string): Promise<SnapManifest> {
+		return this.serial(async () => this.verified(await this.resolve(id)));
 	}
 
-	/** Deletes snapshot `id`. Throws bad-request for a malformed or unknown id. */
-	async remove(id: string): Promise<void> {
-		const name = sideName(checkId(id));
-		if (!(await this.deps.side.list("snapshots/")).includes(name)) throw notFound(id);
-		await this.deps.side.remove(name);
-	}
-
-	/** restoreSnapshot{id, paths|null}: a "restore" snapshot first, then conflict-copy + write per file. */
-	async restore(id: string, paths: readonly VaultPath[] | null): Promise<RestoreResult> {
-		const zip = await this.deps.side.read(sideName(checkId(id)));
-		if (!zip) throw notFound(id);
-		const want = paths ? new Set(paths) : null;
-		const content = unzipSync(zip, { filter: (f) => f.name === MANIFEST || want === null || (f.name.startsWith("files/") && want.has(f.name.slice(6))) });
-		const manifest = JSON.parse(strFromU8(content[MANIFEST]!)) as SnapshotManifest;
-		await this.take("restore");
-		const taken = new Set<PathKey>(this.deps.files().map((f) => this.pk(f.path)));
-		const out = { restored: [] as VaultPath[], unchanged: [] as VaultPath[], copies: [] as VaultPath[], failed: [] as VaultPath[] };
-		for (const f of manifest.files) {
-			if (want && !want.has(f.path)) continue;
-			const bytes = content[entryName(f.path)];
-			if (!bytes || exactFingerprint(bytes) !== f.hash) { out.failed.push(f.path); continue; }
-			const [cur] = await this.deps.disk.read([{ area: "vault", path: f.path, maxBytes: SNAPSHOT_MAX_BYTES }], LANE.background);
-			let pre: WritePrecondition = { t: "absent" };
-			if (cur?.ok) {
-				const fp = exactFingerprint(cur.bytes);
-				if (fp === f.hash) { out.unchanged.push(f.path); continue; }
-				const copy = conflictName({
-					path: f.path, docId: null, deviceLabel: this.deps.deviceLabel, nowMs: this.deps.clock.now(),
-					tzOffsetMinutes: this.deps.tzOffsetMinutes?.() ?? 0, pathKey: this.pk, isTaken: (k) => taken.has(k),
-				});
-				if (!(await this.write(copy, cur.bytes, { t: "absent" }, "conflict-copy"))) { out.failed.push(f.path); continue; }
-				taken.add(this.pk(copy));
-				out.copies.push(copy);
-				pre = { t: "fingerprint", fingerprint: fp };
-			} else if (!isMissing(cur)) {
-				out.failed.push(f.path);
-				continue;
+	/** restoreSnapshot{id, paths|null}: verify, take a "restore" snapshot, then conflict-copy + write per file. */
+	restore(id: string, paths: readonly VaultPath[] | null): Promise<RestoreResult> {
+		return this.serial(async () => {
+			const src = await this.resolve(id);
+			try {
+				const manifest = await this.verified(src);
+				await this.takeNow("restore");
+				const d = this.deps;
+				const restorer = new Restorer({
+					disk: d.disk, clock: d.clock, pathKey: this.pk, deviceLabel: d.deviceLabel, tzOffsetMinutes: d.tzOffsetMinutes?.() ?? 0,
+					taken: d.files().map((f) => f.path), nextOpId: () => this.opId++,
+				}, paths ? new Set(paths) : null);
+				const part = src.t === "local" ? (i: number) => d.side.read(partName(src.id, i)) : (i: number) => d.side.read(dlName(i));
+				await this.corruptGuard(src, "pass2", () => verifyBundle({ record: src.record, part, expect: manifest, onEntry: restorer.entry }));
+				return restorer.out;
+			} finally {
+				if (src.t === "remote") await this.dropCache();
 			}
-			if (await this.write(f.path, bytes, pre, "snapshot-restore")) {
-				taken.add(this.pk(f.path));
-				out.restored.push(f.path);
-			} else out.failed.push(f.path);
+		});
+	}
+
+	/** Deletes snapshot `id` everywhere it is: the local copy, and its index record when it was uploaded. */
+	remove(id: string): Promise<void> {
+		return this.serial(async () => {
+			const src = await this.resolve(id);
+			if (src.t === "local") {
+				this.locals = null;
+				await removeLocal(this.deps.side, src.id, src.record.parts.length);
+				const index = this.rd?.index;
+				if (index && index.view().state.records.has(snapKey(index.self, src.id))) await index.submit([{ t: "del", deviceId: index.self, snapshotId: src.id }]);
+			} else await this.rd!.index.submit([{ t: "del", deviceId: src.deviceId, snapshotId: src.record.snapshotId }]);
+		});
+	}
+
+	// ---- internals (run inside serial) ---------------------------------------------------------------------
+
+	private async takeNow(reason: SnapReason): Promise<SnapRecord | null> {
+		const d = this.deps;
+		if (!d.settings().enabled && reason !== "manual" && reason !== "restore") return null;
+		let createdAtMs = d.clock.now();
+		while (await readLocal(d.side, snapshotId(createdAtMs, reason))) createdAtMs++;
+		const id = snapshotId(createdAtMs, reason);
+		const store = this.rd?.store;
+		const partBytes = d.partBytes ?? (store ? Math.min(SNAP_DEFAULT_PART_BYTES, Math.floor((store.maxBlobBytes * 7) / 8)) : SNAP_DEFAULT_PART_BYTES);
+		this.busy = id;
+		this.locals = null;
+		try {
+			const r = await exportSnapshot({
+				disk: d.disk, side: d.side, files: d.files(), id, createdAtMs, reason, partBytes, deviceLabel: d.deviceLabel,
+				address: async (h) => d.crypto.blobAddress(h),
+			});
+			if (r.t === "too-large") {
+				d.notice?.("warn", "snapshot-too-large", r.detail);
+				return null;
+			}
+			return r.record;
+		} finally {
+			this.busy = null;
+			await this.prune();
 		}
-		return out;
 	}
 
-	private async write(path: VaultPath, bytes: Uint8Array, precondition: WritePrecondition, purpose: DiskOpPurpose): Promise<boolean> {
-		const op: DiskOp = { t: "write", opId: this.opId++, area: "vault", path, data: { t: "bytes", bytes }, precondition, docId: null, purpose };
-		const [res] = await this.deps.disk.exec([op], LANE.background);
-		return res?.t === "write" && res.outcome.ok;
+	/** The newest local daily/manual snapshot, when uploads are on and it is not in the index yet. */
+	private async maybeUpload(): Promise<void> {
+		if (!this.rd || !this.deps.settings().uploadToBlobStore || this.deps.clock.now() < this.uploadAfterMs) return;
+		const newest = (await this.local()).filter((s) => s.record.reason === "daily" || s.record.reason === "manual").pop();
+		if (newest) await this.upload(newest.record, false);
 	}
 
-	private async ids(): Promise<{ id: string; createdAtMs: number; reason: SnapshotReason }[]> {
-		const names = await this.deps.side.list("snapshots/");
-		return names
-			.map((n) => n.slice("snapshots/".length, -".zip".length))
-			.flatMap((id) => { const p = parseSnapshotId(id); return p ? [{ id, ...p }] : []; })
-			.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+	private async upload(record: SnapRecord, user: boolean): Promise<UploadOutcome | null> {
+		if (!this.rd || !this.deps.settings().uploadToBlobStore) return null;
+		try {
+			const out = await uploadSnapshot(this.rd, this.deps.side, record, this.deps.settings().keepDaily);
+			if (out === "uploaded") this.deps.diag?.(`snapshot ${record.snapshotId} uploaded (${record.parts.length} parts)`);
+			return out;
+		} catch (e) {
+			this.uploadAfterMs = this.deps.clock.now() + UPLOAD_RETRY_MS;
+			this.deps.diag?.(`snapshot upload ${record.snapshotId} failed: ${String(e)}`);
+			if (user) this.deps.notice?.("warn", "snapshot-upload-failed", `The snapshot was saved on this device but could not be uploaded: ${e instanceof Error ? e.message : String(e)}`);
+			return null;
+		}
 	}
 
-	/** Keep the newest `keepDaily` daily snapshots and SNAPSHOT_EVENT_KEEP others. */
+	private async resolve(id: string): Promise<Source> {
+		const remote = parseRemoteSnapshotId(id);
+		const index = this.rd?.index;
+		if (remote) {
+			const e = index?.view().state.records.get(snapKey(remote.deviceId, remote.snapshotId));
+			if (!e) throw notFound(id);
+			return { t: "remote", id, key: snapKey(remote.deviceId, remote.snapshotId), deviceId: remote.deviceId, record: e.record };
+		}
+		if (!parseSnapshotId(id)) throw badRequest("not a snapshot id");
+		const record = await readLocal(this.deps.side, id);
+		if (record) return { t: "local", id, record };
+		const own = index?.view().state.records.get(snapKey(index.self, id));
+		if (own) return { t: "remote", id, key: snapKey(index!.self, id), deviceId: index!.self, record: own.record };
+		throw notFound(id);
+	}
+
+	/** Pass 1: verifies the whole bundle without writing to the vault; a remote one stays in the download cache. */
+	private async verified(src: Source): Promise<SnapManifest> {
+		if (src.t === "local") {
+			return this.corruptGuard(src, "pass1", () => verifyBundle({ record: src.record, part: (i) => this.deps.side.read(partName(src.id, i)) }));
+		}
+		if (this.cache?.key === src.key) return this.cache.manifest;
+		await this.dropCache();
+		const rd = this.rd!;
+		try {
+			const manifest = await this.corruptGuard(src, "pass1", () => verifyBundle({ record: src.record, part: remotePart(rd, src.record), onPart: keepPart(this.deps.side) }));
+			this.cache = { key: src.key, parts: src.record.parts.length, manifest };
+			return manifest;
+		} catch (e) {
+			await removeDownload(this.deps.side, src.record.parts.length);
+			throw e;
+		}
+	}
+
+	private async corruptGuard<T>(src: Source, pass: "pass1" | "pass2", fn: () => Promise<T>): Promise<T> {
+		try {
+			return await fn();
+		} catch (e) {
+			if (!(e instanceof SnapCorrupt)) throw e;
+			const what = pass === "pass1" ? "nothing was restored" : "the restore stopped";
+			const message = `Snapshot ${src.id} is damaged (${e.check}); ${what}.`;
+			// Part details name only indexes and sizes; entry checks would name vault paths, which diagnostics leave out.
+			this.deps.diag?.(`content_corrupt snapshot=${src.id} check=${e.check}${e.check.startsWith("part-") ? ` ${e.detail}` : ""}`);
+			this.deps.notice?.("warn", "content_corrupt", message);
+			throw new ProtocolFailure({ code: "content_corrupt", message, retryable: false });
+		}
+	}
+
+	private async dropCache(): Promise<void> {
+		if (!this.cache) return;
+		const n = this.cache.parts;
+		this.cache = null;
+		await removeDownload(this.deps.side, n);
+	}
+
+	/** Keep the newest `keepDaily` daily snapshots and SNAPSHOT_EVENT_KEEP others; remove export leftovers. */
 	private async prune(): Promise<void> {
-		const all = await this.ids();
+		this.locals = null;
+		const all = await this.local();
 		const keepDaily = Math.max(0, this.deps.settings().keepDaily);
-		const daily = all.filter((s) => s.reason === "daily");
-		const other = all.filter((s) => s.reason !== "daily");
-		const drop = [...daily.slice(0, Math.max(0, daily.length - keepDaily)), ...other.slice(0, Math.max(0, other.length - SNAPSHOT_EVENT_KEEP))];
-		for (const s of drop) await this.deps.side.remove(sideName(s.id));
+		const daily = all.filter((s) => s.record.reason === "daily");
+		const other = all.filter((s) => s.record.reason !== "daily");
+		const drop: LocalSnapshot[] = [...daily.slice(0, Math.max(0, daily.length - keepDaily)), ...other.slice(0, Math.max(0, other.length - SNAPSHOT_EVENT_KEEP))];
+		this.locals = null;
+		for (const s of drop) await removeLocal(this.deps.side, s.id, s.record.parts.length);
+		await sweep(this.deps.side, this.busy, this.cache !== null);
 	}
-}
-
-/** Ids come from the host: only well-formed ones name a side file (no path tricks). */
-function checkId(id: string): string {
-	if (parseSnapshotId(id) === null) throw badRequest("not a snapshot id");
-	return id;
 }
 
 function notFound(id: string): Error {
 	return badRequest(`snapshot ${id} not found`);
-}
-
-function isMissing(r: DiskReadResult | undefined): boolean {
-	return r !== undefined && !r.ok && r.reason === "missing";
 }

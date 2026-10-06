@@ -221,9 +221,9 @@ export class VaultRuntime {
 			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp });
 		}
 		this.snaps = new SnapshotJob({
-			disk: link.disk, side: link.sideFiles, clock: ports.clock, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,
-			upload: ports.blob && this.settings.snapshots.uploadToBlobStore ? { store: ports.blob, crypto: ports.crypto } : null,
-			pathKey, deviceLabel: config.deviceLabel, tzOffsetMinutes: tz, notice: this.notice,
+			disk: link.disk, side: link.sideFiles, clock: ports.clock, crypto: ports.crypto, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,
+			remote: ports.blob ? { store: ports.blob, index: this.port.snap } : null,
+			pathKey, deviceLabel: config.deviceLabel, tzOffsetMinutes: tz, notice: this.notice, diag: (l) => this.diag(l),
 		});
 		this.mirror = new SyncedMirrorWriter({
 			side: link.sideFiles, hash: ports.hash, clock: ports.clock, identity: () => identity,

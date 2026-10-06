@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { snapLive } from "../../core/snap/fold";
 import { snapKey, snapshotId, type SnapRecord } from "../../core/snap/record";
-import { SNAP_STREAM, type DeviceId } from "../../core/types";
+import { SNAP_STREAM, type ContentHash, type DeviceId } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { startTestEngine, until } from "./testHarness";
@@ -14,7 +14,7 @@ import { startTestEngine, until } from "./testHarness";
 const A = "dev-a-0123456789abcdef";
 const B = "dev-b-0123456789abcdef";
 const T0 = Date.UTC(2026, 9, 7);
-const H = (n: number) => n.toString(16).padStart(64, "0");
+const H = (n: number) => n.toString(16).padStart(64, "0") as ContentHash;
 const CKPT = { rows: 1e9, bytes: 1e12, idleMs: 10, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
 const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
 

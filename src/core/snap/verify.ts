@@ -31,6 +31,8 @@ export interface VerifyOptions {
 	readonly record: SnapRecord;
 	/** Bytes of part `index`, or null when it is missing. Called once per part, in order. */
 	readonly part: (index: number) => Promise<Uint8Array | null>;
+	/** Called with each part once it passed its size and hash checks (e.g. to keep a verified copy). */
+	readonly onPart?: (index: number, bytes: Uint8Array) => Promise<void>;
 	readonly onEntry?: (e: VerifiedEntry) => Promise<void>;
 	/** A manifest verified by an earlier pass: entries must match it before onEntry runs. */
 	readonly expect?: SnapManifest;
@@ -47,6 +49,7 @@ export async function verifyBundle(o: VerifyOptions): Promise<SnapManifest> {
 		if (!bytes) throw new SnapCorrupt("part-missing", `part ${i + 1}/${record.parts.length}`);
 		if (bytes.length !== want.size) throw new SnapCorrupt("part-size", `part ${i + 1}: ${bytes.length} bytes, record says ${want.size}`);
 		if (sha256Hex(bytes) !== want.sha256) throw new SnapCorrupt("part-hash", `part ${i + 1}`);
+		if (o.onPart) await o.onPart(i, bytes);
 		return bytes;
 	};
 	const seen: { path: VaultPath; kind: DocKind; size: number; hash: ContentHash }[] = [];

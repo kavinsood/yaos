@@ -29,10 +29,10 @@ test("side files live under <pluginDir>/state and list snapshots", async () => {
 	const side = new ObsidianSideFiles(fake.adapter, ".obsidian/plugins/yaos");
 	assert.equal(await side.read("outbox-a.bin"), null);
 	await side.write("outbox-a.bin", new Uint8Array([1, 2]));
-	await side.write("snapshots/2026-01-01.zip", new Uint8Array([3]));
+	await side.write("snapshots/2026-01-01.snap", new Uint8Array([3]));
 	assert.ok(fake.raw.has(".obsidian/plugins/yaos/state/outbox-a.bin"));
 	assert.deepEqual([...((await side.read("outbox-a.bin")) ?? [])], [1, 2]);
-	assert.deepEqual(await side.list("snapshots/"), ["snapshots/2026-01-01.zip"]);
+	assert.deepEqual(await side.list("snapshots/"), ["snapshots/2026-01-01.snap"]);
 	await side.remove("outbox-a.bin");
 	assert.equal(await side.read("outbox-a.bin"), null);
 });

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import * as Y from "yjs";
 import { CheckpointEncoding } from "../../core/envelope";
 import { FOLD_RULES_VERSION, MAX_FRAME_CONTENT_BYTES } from "../../core/limits";
-import { NS_STREAM, SNAP_STREAM, type ClientFrameId, type DeviceId, type StreamName, type VaultId } from "../../core/types";
+import { NS_STREAM, SNAP_STREAM, type ClientFrameId, type ContentHash, type DeviceId, type StreamName, type VaultId } from "../../core/types";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import { faultyCrypto } from "../runtime/testHarness";
@@ -123,7 +123,7 @@ test("gate: checkpoints (binding, encoding, size, structure)", async () => {
 
 test("gate: snap rows and checkpoints (DESIGN §j.4)", async () => {
 	const T = Date.UTC(2026, 9, 7);
-	const H = (n: number) => n.toString(16).padStart(64, "0");
+	const H = (n: number) => n.toString(16).padStart(64, "0") as ContentHash;
 	const record = {
 		version: 1 as const, snapshotId: snapshotId(T, "daily"), createdAtMs: T, deviceLabel: "l", reason: "daily" as const, format: 1,
 		fileCount: 1, totalBytes: 1, bundleDigest: H(1), parts: [{ address: H(2), size: 9, sha256: H(2) }],
@@ -139,7 +139,7 @@ test("gate: snap rows and checkpoints (DESIGN §j.4)", async () => {
 	const st = newSnapFold();
 	foldSnapFrame(st, { seq: 7, deviceId: "dev-x-0123456789abcdef" as DeviceId, ops: [{ t: "put", record }] });
 	st.coversSeq = 7;
-	const ck = (bytes: Uint8Array, encoding = CheckpointEncoding.snapFoldV1, coversSeq = 7) =>
+	const ck = (bytes: Uint8Array, encoding: CheckpointEncoding = CheckpointEncoding.snapFoldV1, coversSeq = 7) =>
 		sealCheckpoint(crypto, ctx.vaultId, SNAP_STREAM, coversSeq, encodeCheckpointContent({ encoding, coversSeq, foldRulesVersion: SNAP_FOLD_RULES_VERSION, state: bytes }), 0);
 	const good = await gate(ctx, { t: "checkpoint", stream: SNAP_STREAM, coversSeq: 7, payload: await ck(encodeSnapFoldV1(st)) });
 	assert.ok(good.ok && good.t === "checkpoint" && good.snapState?.records.size === 1);

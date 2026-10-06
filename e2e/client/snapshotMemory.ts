@@ -1,12 +1,14 @@
 /**
- * Snapshot export memory bench (DESIGN §j.4): a synthetic vault (~50 MiB: markdown + attachments <= 1 MiB) is
- * exported by SnapshotJob.take("manual"), with side files on the real disk (a temp dir).
+ * Snapshot memory bench (DESIGN §j.4): a synthetic vault (~50 MiB: markdown + attachments <= 1 MiB) is exported by
+ * SnapshotJob.take("manual"), with side files on the real disk (a temp dir); then the snapshot is verified end to
+ * end (SnapshotJob.manifest: every part, the bundle digest and every entry, as restore pass 1 does).
  *
  *   node --expose-gc --import jiti/register e2e/client/snapshotMemory.ts [--mib 50]
  *
  * Measures the live set (heapUsed + arrayBuffers after a forced gc) at every port call the job makes (disk read,
  * side-file read/write/remove), minus the same figure after the vault was built. The vault's own bytes are part of
- * the baseline; every read returns a copy, as the host does. Also reports the growth of the process's max RSS.
+ * the baseline; every read returns a copy, as the host does. Also reports the growth of the process's max RSS
+ * (over the whole run, so it covers the verify phase too).
  */
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -83,7 +85,7 @@ const settings = { enabled: true, keepDaily: 7, uploadToBlobStore: false };
 let now = Date.UTC(2026, 9, 7);
 const deps = {
 	disk: gateway, side, clock: { now: () => now, monotonic: () => now }, files: () => files, settings: () => settings,
-	upload: null, deviceLabel: "bench",
+	crypto: { blobAddress: async (h: string) => h }, remote: null, deviceLabel: "bench",
 } as unknown as ConstructorParameters<typeof SnapshotJob>[0];
 const job = new SnapshotJob(deps);
 
@@ -93,11 +95,19 @@ const t0 = performance.now();
 const res = await job.take("manual");
 const ms = performance.now() - t0;
 sample();
+const exportPeak = Math.max(...samples);
+samples.length = 0;
+base = live();
+const t1 = performance.now();
+const manifest = res ? await job.manifest(res.id) : null;
+const verifyMs = performance.now() - t1;
+sample();
+const verifyPeak = Math.max(...samples);
 const rss1 = process.resourceUsage().maxRSS * 1024;
 rmSync(dir, { recursive: true, force: true });
 now += 1;
-const peak = Math.max(...samples);
 console.log(JSON.stringify({
 	vaultBytes: total, vaultFiles: vault.size, snapshot: res ? "taken" : "skipped", sideFileBytes: sideBytes, ms: Math.round(ms),
-	peakLiveGrowthMiB: +(peak / MIB).toFixed(1), samples: samples.length, maxRssGrowthMiB: +((rss1 - rss0) / MIB).toFixed(1),
+	peakLiveGrowthMiB: +(exportPeak / MIB).toFixed(1), verifiedFiles: manifest?.files.length ?? null, verifyMs: Math.round(verifyMs),
+	verifyPeakLiveGrowthMiB: +(verifyPeak / MIB).toFixed(1), maxRssGrowthMiB: +((rss1 - rss0) / MIB).toFixed(1),
 }));
