@@ -1,0 +1,25 @@
+server/src/streams/dedupe.ts
+  s_8232c28df410e4::t_cb58f0d5ef8d7b 8-12,20-25,72,76-80,103,110-112,114,116-117,140-141,143,180-211
+server/src/streams/relay.ts
+  s_8232c28df410e4::t_c85db09967b78f 12-14,44,214-215,242-243,265,286,509,511-525,589-590,595,598,610,617,622,634-635,657-662,664,666,674-676,678-685,691,694-705,829
+server/src/streams/store.ts
+  s_8232c28df410e4::t_c666b320785be1 18,22,158-159,167-172,178,186,198,226-261,322-326,330-334,338-340,342-343,346,352,357-359
+tests/server/streams-hardening.ts
+  s_8232c28df410e4::t_a10a8671dcf4cc 22,151-152,173,306-307,310-317,320-321,462,466,483-572
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e38c9153b864692b56f553e608423f58aab799ea",
+  "prompts": {},
+  "sessions": {
+    "s_8232c28df410e4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a65d2a43c0bfc9176",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
