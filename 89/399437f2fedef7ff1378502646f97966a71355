@@ -1,0 +1,29 @@
+e2e/client/fullScenarios1.ts
+  s_79d9b93476b202::t_b16f0df9ae59e2 127-138,145-147,150-163
+e2e/client/fullScenarios2.ts
+  s_0a888a2d99d5d5::t_bc483388d09ef1 65-66,70,82-83,95-97,100-101,135-136,153,167,175-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "89399437f2fedef7ff1378502646f97966a71355",
+  "prompts": {},
+  "sessions": {
+    "s_0a888a2d99d5d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abaac5423d9326e26",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_79d9b93476b202": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4a02e307d4575a34",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
