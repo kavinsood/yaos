@@ -273,3 +273,90 @@ uploaded as an off-device copy, but nothing records where, so only the device th
 | Leak check and content-fingerprint redaction | adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:352, :385 | MISSING | dropped: diagnostics leak check (pseudonymization replaces it) |
 
 The bundle's store sizes are always 0 bytes (src/engine/compose/runtimeOps.ts:155-157); only record counts are real.
+
+## 7. Frontmatter
+
+The legacy client treated the properties block as a separate semantic document with its own guard, notice and
+quarantine. The new client has no frontmatter code. The block is plain text under the one merge engine
+(src/core/merge/merge.ts:24) and the ingest gate, as DESIGN §m.2 says.
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Semantic property CRDT (registers, sets, ordered lists per field) | adfa7a7:src/sync/frontmatterSemanticModel.ts:62, :104; adfa7a7:src/sync/frontmatterSemanticMirror.ts:25; adfa7a7:src/sync/frontmatterProjection.ts:29 | MISSING (text merge, src/core/merge/merge.ts:24) | dropped: DESIGN §m.2 (frontmatter family) |
+| Frontmatter guard (blocks unsafe property transitions) | adfa7a7:src/sync/frontmatterGuard.ts:44, :111; adfa7a7:src/sync/frontmatterGuardCoordinator.ts:57 | MISSING | dropped: DESIGN §m.2 (frontmatter family) |
+| "YAOS paused a properties update in ..." notice | adfa7a7:src/sync/frontmatterGuardCoordinator.ts:137-141 | MISSING | dropped: DESIGN §m.2 (frontmatter family) |
+| Frontmatter quarantine list (up to 128 entries, persisted) | adfa7a7:src/sync/frontmatterQuarantine.ts:31, :43 | MISSING | dropped: DESIGN §m.2 (frontmatter family) |
+| Body-only write that keeps the local properties block | adfa7a7:src/sync/frontmatterBoundary.ts:29, :79 | MISSING (the whole file is one text, src/core/merge/merge.ts:24) | dropped: DESIGN §m.2 (frontmatter family) |
+
+## 8. Attachments
+
+The settings fields ("Sync attachments", the size limit, "Parallel transfers") are in §3.5, and the
+attachment-storage info row is in §3.4.
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Attachments travel as content-addressed blobs | adfa7a7:src/sync/blobSync.ts:226, :380 | src/engine/adapters/httpBlob.ts:122-124 (blob store from the server capabilities); src/engine/reconcile/blobJobs.ts:112-116 | ported (DESIGN §j.1) |
+| No object storage: attachments are not synced, with a one-time notice | adfa7a7:src/runtime/attachmentOrchestrator.ts:188-194 ("This file won't sync yet. Attachment sync needs object storage. ...") | src/engine/reconcile/blobJobs.ts:26 (`no-blob-carrier` warning) | ported |
+| Oversized attachment skipped on scan and on upload | adfa7a7:src/sync/blobSync.ts:561, :860, :1077-1083 | src/engine/reconcile/localState.ts:81, :86; src/engine/blobs/blobQueue.ts:155-156; src/engine/reconcile/blobJobs.ts:114 | ported (the warning popup is implemented (c5ca263), §3.2) |
+| Effective cap is the smaller of the user limit and the server's upload limit | adfa7a7:src/settings/settingsStore.ts:14-23; adfa7a7:src/sync/blobSync.ts:482 | src/engine/reconcile/localState.ts:81; src/engine/adapters/httpBlob.ts:23, :122-124 | ported (the field text is the wave-2 row in §3.5) |
+| Downloaded attachment verified against its hash | adfa7a7:src/sync/blobSync.ts:1494-1505 | src/engine/blobs/blobQueue.ts:183-184 | ported |
+| Transfer concurrency from the "Parallel transfers" setting | adfa7a7:src/sync/blobSync.ts:481 | src/core/limits.ts:173, :179, :185, :191 (`blobConcurrency` per device class) | dropped: attachmentConcurrency setting (fixed limits in src/core/limits.ts) |
+| "R2 backend detected" notice, and a daily snapshot when storage appears | adfa7a7:src/runtime/capabilityUpdateService.ts:498-509 | MISSING (the store is chosen when the engine starts, src/engine/adapters/httpBlob.ts:121-124) | missing: undecided; small (a notice when the capabilities gain attachments) |
+
+New only: without a blob store, attachments up to 8 MiB travel on the log in 768 KiB chunks
+(src/core/limits.ts:64-66, src/engine/blobs/blobQueue.ts:80-81, DESIGN §j.1).
+
+## 9. Canvas
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Canvas files sync | adfa7a7:src/main.ts:449-456; adfa7a7:src/types.ts:83-85 (as an attachment unless promoted) | src/core/types.ts:97-102 (`.canvas` is its own kind); src/engine/reconcile/canvasJob.ts:49 | ported (always semantic, DESIGN §j.2) |
+| Semantic canvas CRDT and three-way merge | adfa7a7:src/sync/canvas/canvasManager.ts:149, :448 (`mergeCanvasThreeWay` from the server package) | src/engine/reconcile/canvasDoc.ts:102, :163, :272; src/engine/reconcile/canvasMerge.ts:138 (the one `MergeFn` over record-per-line text) | ported (DESIGN §j.2) |
+| Canonical canvas bytes and limits | adfa7a7:src/sync/canvas/canvasManager.ts:2 (`@shared/canvasCodec`) | src/core/hash/canvasCanonical.ts:26, :147, :316 | ported |
+| "Use semantic sync for active Canvas" / "Use attachment sync for active Canvas" | adfa7a7:src/commands.ts:56-69; adfa7a7:src/main.ts:458-480; adfa7a7:src/sync/canvas/canvasManager.ts:335, :371 | MISSING | dropped: canvas promote/demote (coordinator decision; every canvas is semantic, DESIGN §j.2) |
+| Live binding of open canvas views | adfa7a7:src/sync/canvas/canvasProjectionRouter.ts:18 | MISSING (edits reach the CRDT through a disk save) | dropped: DESIGN §j.2 ("Canvas views are not bound") |
+| Canvas conflicts kept under `.yaos-conflicts/canvas/` | adfa7a7:src/sync/canvas/canvasDiskMirror.ts:26-30 | src/engine/reconcile/canvasJob.ts:10 (a normal conflict copy next to the file) | ported (DESIGN §f.7 naming) |
+| Invalid canvas: not synced, with a warning | adfa7a7:src/sync/canvas/canvasManager.ts:3 (`validateCanvasDocument`) | src/engine/reconcile/canvasJob.ts:38-40 (`canvas-invalid`) | ported |
+| Canvas HTTP transport (separate authority endpoints) | adfa7a7:src/sync/canvas/canvasTransport.ts:102 | MISSING (canvas updates use the `c:` streams, DESIGN §j.2) | dropped: DESIGN §m.2 (semantic epochs and receipts) |
+
+## 10. Conflict copies
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Markdown conflict copy name `name (YAOS conflict from <device> <ISO time>).md` | adfa7a7:src/runtime/reconcile/markdownConflictArtifact.ts:13-31, :72 | src/core/plan/conflictName.ts:1-14, :81 (`name (conflict <label> <YYYY-MM-DD HHmm>).md`); src/host/binding.ts:598-603 | implemented (5d39472) (new pattern, DESIGN §f.7) |
+| Attachment conflict copy name `name (YAOS remote conflict <time>).ext` | adfa7a7:src/sync/blobSync.ts:274-291 | src/core/plan/planner.ts:393, :623 (the same `conflictName` pattern) | ported (DESIGN §f.7, "Blob keep-both uses the same pattern") |
+| Attachment conflict copy is local only (never uploaded) | adfa7a7:src/sync/blobSync.ts:1783-1790 | src/core/plan/planner.ts:395-396, :625-626 (the copy is created and pushed) | dropped: the copy is a normal synced file in the new client (DESIGN §f.7) |
+| Reuse an existing copy with identical content | adfa7a7:src/runtime/reconcile/markdownConflictArtifact.ts:52 | MISSING (identical content makes no copy, src/core/merge/merge.ts:26) | dropped: identical-content conflict copy reuse (coordinator decision) |
+| Conflict notice, throttled, with the suppressed count | adfa7a7:src/runtime/reconciliationController.ts:2701-2714; adfa7a7:src/sync/blobSync.ts:1827-1830 | src/engine/reconcile/context.ts:193-200; src/engine/reconcile/reconciler.ts:206 | implemented (2d6bac5) |
+| Count of conflict copies today | adfa7a7:src/runtime/reconciliationController.ts:2704 (only a per-notice suppressed count) | src/engine/compose/localDayCounter.ts:14; src/engine/compose/vaultRuntime.ts:586; src/protocol/status.ts:47 | implemented (0db3bb7) |
+
+New only: more than 200 conflict copies in one pass hold the changes for review (src/core/limits.ts:101,
+DESIGN §f.5), and a multi-step copy is resumed after a crash from its intent record (DESIGN §f.7).
+
+## 11. Trash and deletes
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Remote delete follows Obsidian's "Deleted files" preference (wave 2) | adfa7a7:src/sync/diskMirror.ts:1543-1546 and adfa7a7:src/sync/blobSync.ts:2047-2052: `app.fileManager.trashFile(file)`, which uses the user's Obsidian setting (system trash, the `.trash` folder, or permanent delete); there was no YAOS setting | TBD-D | TBD-D |
+| Remote move without rewriting links | adfa7a7:src/sync/diskMirror.ts:472 (`fileManager.renameFile`, which rewrote links) | src/host/obsidianVault.ts:8, :154, :168-176 (`vault.rename`; case-only renames go through a temporary name) | dropped: DESIGN §m.2 (`fileManager.renameFile` for remote moves) |
+
+New only:
+- "Deleted files go to" picks the Obsidian trash or the system trash (src/host/ui/settingsTab.ts:194,
+  src/ports/vault.ts:50, src/host/obsidianVault.ts:184, :194).
+- Sync never deletes a file permanently (DESIGN I2): the adapter has only `vault.trash`
+  (src/host/obsidianVault.ts:9), and the executor deletes only through it (src/host/diskExecutor.ts:15, :189).
+- A delete loses to edits typed before it arrived (src/host/diskExecutor.ts:181-185).
+- An emptied folder is removed only when it has no children (src/host/obsidianVault.ts:201-203).
+
+## 12. Excluded paths and ignore rules
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| The config folder and `.trash/` never sync | adfa7a7:src/sync/exclude.ts:3-9, :23-25 | src/core/paths/validate.ts:56 (any segment starting with a dot is invalid, which covers both) | ported |
+| User exclude patterns | adfa7a7:src/sync/exclude.ts:21, :26-27 (path prefixes) | src/engine/reconcile/localState.ts:36-59 (`folder/` prefixes plus `*`, `?`, `**` globs), :84 | ported (wider syntax) |
+| Pattern format: one comma-separated line | adfa7a7:src/sync/exclude.ts:36-40; adfa7a7:src/settings/settingsTab.ts:373-376 | src/host/ui/settingsModel.ts:46 (one pattern per line); src/host/ui/settingsTab.ts:157 | implemented (0b9e3e9) (the setting text describes the glob syntax) |
+| Names other systems cannot store (reserved names, forbidden characters, length) are not synced | adfa7a7:src/sync/pathPolicy.ts:12; adfa7a7:src/sync/blobSync.ts:558-564 (invalid attachment paths quarantined) | src/core/paths/validate.ts:54-62; src/core/limits.ts:12-14, :32-38; src/engine/reconcile/localState.ts:83 | ported (the warning popup is implemented (c5ca263), §3.2) |
+| Path canonicalization | adfa7a7:src/paths/canonicalPath.ts:39 | src/core/paths/validate.ts:1-5 (NFC, frozen fold rules); src/engine/reconcile/localState.ts:76 | ported |
+| Case and Unicode collisions between paths | adfa7a7:src/paths/pathCollision.ts:55 | src/core/paths/pathKey.ts:48, :54 (one fold key per path) | ported |
+| Sync category of a path (markdown, attachment, canvas) | adfa7a7:src/paths/pathCategory.ts:33; adfa7a7:src/types.ts:68-70, :78-85 (`.md` matched case-sensitively) | src/core/types.ts:97-102 (ASCII case-insensitive) | ported (an `.MD` file is markdown now; the legacy `.MD` upgrade is dropped: zero users) |
+| Attachments off: non-markdown files skipped | adfa7a7:src/runtime/attachmentOrchestrator.ts:68, :152 | src/engine/reconcile/localState.ts:85 | ported |
