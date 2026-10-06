@@ -1,0 +1,29 @@
+e2e/client/engines.ts
+  s_9a7a5e66b06859::t_094677a71412e3 27-28,216,219
+e2e/client/fullClients.ts
+  s_42fec8a9c03dda::t_bc21387243edef 40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b00e358e90f694b23b43974da017442aa10f0e88",
+  "prompts": {},
+  "sessions": {
+    "s_42fec8a9c03dda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab7f16ac97bca1a6d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_9a7a5e66b06859": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a9b4914bdca5ad129",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
