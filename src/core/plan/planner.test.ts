@@ -166,6 +166,31 @@ test("a file at the remote-move target of a doc synced elsewhere is new: publish
 	// d1's file already moved (crash after the rename): the file at r5.md is d1's, adopted (test below).
 });
 
+test("observed rename onto the path of a remote doc never materialized here: the doc moves, the remote doc waits for the path", () => {
+	// Sim heavy seed 222: B renamed seed1 -> r0 while A's doc at r0.md had not reached B's disk. The file was merged
+	// into A's doc (no base: conflict copy), its write refused by the moved doc's bound editor, so every pass added a copy.
+	const sc = {
+		remote: [R("d1", "a.md"), R("d2", "b.md", { createHash: h("c5") })],
+		synced: [S("d1", "a.md")],
+		local: [L("b.md", h("c3"))],
+		over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] },
+	};
+	const p = run(sc);
+	assert.deepEqual(opsOf(p), ["nsRename", "reconcileContent"]);
+	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d1", path: "b.md" });
+	assert.equal(find(p, "reconcileContent").docId, "d1");
+	assert.ok(!p.ops.some((o) => "docId" in o && o.docId === "d2"), "d2 waits for the path");
+	// unchanged bytes: the move only
+	assert.deepEqual(opsOf(run({ ...sc, local: [L("b.md", h("c0"))] })), ["nsRename", "syncedPut"]);
+	// never by hash alone, nor onto a remote doc synced here
+	const byHash = run({ ...sc, local: [L("b.md", h("c0"))], over: {} });
+	assert.ok(!opsOf(byHash).includes("nsRename"));
+	const held = run({ ...sc, synced: [S("d1", "a.md"), S("d2", "b.md")] });
+	assert.ok(!opsOf(held).includes("nsRename"));
+	// not while ns is not ready
+	assert.ok(!opsOf(run(sc, { nsReady: false })).includes("reconcileContent"));
+});
+
 test("row live/present/absent: remote edited -> diskMaterialize (edit beats delete); else nsDelete + syncedDrop", () => {
 	const edited = run({ remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] });
 	assert.deepEqual(edited.ops, [{ op: "diskMaterialize", docId: "d1", path: "a.md", expect: { t: "absent" } }]);

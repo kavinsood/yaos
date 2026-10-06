@@ -286,6 +286,28 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 			movedAway.add(rn.docId);
 		}
 	}
+	// Observed renames onto the path of a remote doc never materialized here (no synced record): the file there
+	// came from the rename source, so it is the moved doc's, not the remote doc's (merged into it, the bound
+	// editor of the moved doc refuses the write and every pass adds a conflict copy, sim heavy seed 222). The
+	// doc moves; its nsRename folds suffixed and the remote doc materializes once the file has left the path.
+	// Until ns is ready (no inference) the file is left alone, not merged into the remote doc.
+	const observedOnto = new Set<PathKey>();
+	if (renamedFrom.size > 0) {
+		const usedKeys = new Set([...inferred.values()].map((rn) => rn.to.pathKey));
+		const observedTo = new Set(input.renames.map((e) => pk(e.to)));
+		const onto = inScopeLocal.filter((l) => {
+			if (l.excluded || usedKeys.has(l.pathKey) || syncedByKey.has(l.pathKey) || !observedTo.has(l.pathKey)) return false;
+			const holder = input.remoteByPathKey.get(l.pathKey);
+			return holder !== undefined && !input.synced.has(holder);
+		});
+		if (onto.length > 0) {
+			const rest = missing.filter((s) => !inferred.has(s.docId));
+			for (const rn of inferRenames(rest, onto, input.renames, false, pk)) {
+				observedOnto.add(rn.to.pathKey);
+				if (ctx.nsReady) inferred.set(rn.docId, rn);
+			}
+		}
+	}
 
 	// ---- content step for a synced live doc with a local file ------------------
 	interface Step { ops: PlannerOp[]; destructive: DestructiveKind | null; key: string }
@@ -509,6 +531,8 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		const l = blocked ? undefined : input.local.get(key);
 		if (l?.excluded) return;
 		if (r.body?.frozen) return push([waitOp(docId, "frozen")]);
+		// The file at the path is a renamed doc's (observed rename above): materialize once it has moved away.
+		if (observedOnto.has(key)) return;
 		if (!l) {
 			// Live only through an own op not yet folded (a restore with no synced record here): its path is the
 			// overlay's guess, and S1 puts S on the requested path at fold. Materialize the committed placement.
