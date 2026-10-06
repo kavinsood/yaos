@@ -1,0 +1,23 @@
+src/engine/reconcile/mergeJob.ts
+  s_67b8c9b1582106::t_a4cb485192bf16 168-184
+src/engine/reconcile/reconciler.epoch.test.ts
+  s_67b8c9b1582106::t_f2c6ddc3b05036 1-42
+src/engine/reconcile/testkit/world.ts
+  s_67b8c9b1582106::t_7885defc106cdc 27-28,68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "54cb43a302481b640cd89dbe6ae7af6bf17df181",
+  "prompts": {},
+  "sessions": {
+    "s_67b8c9b1582106": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac2eb42fe0cde3f33",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
