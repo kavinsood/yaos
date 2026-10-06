@@ -28,6 +28,8 @@ function identityOf(c: EngineCtx): MirrorIdentity {
 
 export class MirrorWriter {
 	private gens: [number | null, number | null] = [null, null];
+	/** Frame ids of the newest on-disk mirror for this identity (readGenerations); null: none. */
+	private onDisk: ReadonlySet<string> | null = null;
 	private timer: number | null = null;
 	private dirty = false;
 	private writing: Promise<void> | null = null;
@@ -43,17 +45,41 @@ export class MirrorWriter {
 	async readGenerations(): Promise<void> {
 		if (!this.files) return;
 		const id = identityOf(this.c);
+		let newest = -1;
+		this.onDisk = null;
 		for (let i = 0; i < 2; i++) {
 			let g: number | null = null;
 			try {
 				const bytes = await this.files.read(FILES[i]!);
 				const m = bytes ? await decodeOutboxMirror(bytes, this.c.ports.hash) : null;
-				if (m && m.vaultId === id.vaultId && m.vaultEpoch === id.vaultEpoch && m.deviceId === id.deviceId) g = m.generation;
+				if (m && m.vaultId === id.vaultId && m.vaultEpoch === id.vaultEpoch && m.deviceId === id.deviceId) {
+					g = m.generation;
+					if (g > newest) {
+						newest = g;
+						this.onDisk = new Set(m.frames.map((f) => f.clientFrameId));
+					}
+				}
 			} catch {
 				g = null;
 			}
 			this.gens[i] = g;
 		}
+	}
+
+	/**
+	 * Start over a stored outbox: rewrite the mirror when it does not hold
+	 * exactly these frames. The app can die inside the write debounce, after
+	 * frames reached the store but not the mirror; nothing else rewrites it
+	 * until the outbox next changes, while the synced mirror moves on to sync
+	 * points those frames carry (an IDB loss then drops them and the merge
+	 * takes the disk as base: their text is overwritten, sim heavy seed 246).
+	 */
+	scheduleIfBehind(records: readonly OutboxRecord[]): void {
+		if (!this.files) return;
+		const want = selectMirrorFrames(records, OUTBOX_MIRROR_MAX_BYTES);
+		const have = this.onDisk;
+		if (have === null ? want.length === 0 : have.size === want.length && want.every((f) => have.has(f.clientFrameId))) return;
+		this.schedule();
 	}
 
 	schedule(): void {

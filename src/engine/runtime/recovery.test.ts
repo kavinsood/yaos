@@ -8,6 +8,8 @@ import { test } from "node:test";
 import type { ClientFrameId } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
+import type { SideFilePort } from "../../ports/vault";
+import { MemStoragePort } from "../../sim/storage";
 import { MemSideFiles, converged, sleep, startTestEngine, until } from "./testHarness";
 
 async function live(...es: LogEngine[]): Promise<void> {
@@ -71,6 +73,59 @@ for (const committed of [false, true]) {
 		}
 	});
 }
+
+/** Side files of an app process that can die: after kill() nothing it writes lands. */
+function mortal(side: MemSideFiles): { port: SideFilePort; kill: () => void } {
+	let alive = true;
+	const port: SideFilePort = {
+		read: (n) => side.read(n), remove: (n) => side.remove(n), list: (p) => side.list(p),
+		write: async (n, b) => {
+			if (alive) await side.write(n, b);
+		},
+	};
+	return { port, kill: () => (alive = false) };
+}
+
+/** Sim heavy seed 246: the app died inside the mirror debounce; the next run over that store must rewrite the mirror. */
+test("mirror recovery: a restart over stored frames the mirror lacks rewrites it, so a later IDB loss still resends them", async () => {
+	const relay = new SimRelay();
+	const side = new MemSideFiles();
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	const p1 = mortal(side);
+	const { engine: a, storage } = await startTestEngine({ relay, deviceId: "dev-a", sideFiles: p1.port, tuning: { mirrorDebounceMs: 60_000 } });
+	let a2: LogEngine | null = null;
+	let a3: LogEngine | null = null;
+	try {
+		await live(a, b);
+		const id = await a.createDoc("m.md", "base;");
+		await converged([a, b]);
+		relay.pauseCommits();
+		await a.editDoc(id, (t) => t.insert(t.length, "kept;"));
+		await until(() => a.c.outbox.size > 0, 2_000, "frame stored");
+		p1.kill(); // dies before the debounced mirror write
+		const copy = (storage as MemStoragePort).crash();
+		a.disconnect();
+		await a.stop().catch(() => undefined);
+		relay.restart(); // the uncommitted frame is gone from the relay too
+		relay.resumeCommits();
+		relay.setConnectFailure("unavailable"); // the second run stays offline: its outbox never changes
+		const p2 = mortal(side);
+		a2 = (await startTestEngine({ relay, deviceId: "dev-a", sideFiles: p2.port, storage: copy, extra: { vaultEpoch: relay.vaultEpoch() } })).engine;
+		assert.ok(a2.c.outbox.size > 0);
+		await sleep(80); // mirror debounce
+		p2.kill(); // IDB wiped with the app down
+		a2.disconnect();
+		await a2.stop().catch(() => undefined);
+		relay.setConnectFailure(null);
+		a3 = (await startTestEngine({ relay, deviceId: "dev-a", sideFiles: side })).engine; // fresh DB
+		assert.ok(a3.status().notices.some((n) => n.code === "recovered-from-mirror"), "recovered from the mirror");
+		await converged([a3, b], 10_000);
+		assert.equal(await b.docText(id), "base;kept;");
+	} finally {
+		await b.stop();
+		await a3?.stop();
+	}
+});
 
 /** Sim heavy seed 150: keystrokes receipted before the IDB loss, never saved to disk, read back as "own". */
 test("IDB lost without a mirror: this device's earlier rows read back are remote (remoteSeq moves)", async () => {

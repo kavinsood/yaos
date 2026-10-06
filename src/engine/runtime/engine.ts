@@ -179,6 +179,7 @@ export class LogEngine {
 				for (const op of decodeNsOps(r.content) ?? []) if (op.t === "create") c.pendingCreates.set(op.docId, r.clientFrameId);
 			}
 		}
+		c.mirror.scheduleIfBehind(c.outbox.all());
 		await c.afterNsChange(true);
 		await c.afterCfgChange(true);
 		eng.maint.start();
