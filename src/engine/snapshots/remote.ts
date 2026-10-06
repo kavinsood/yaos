@@ -62,16 +62,26 @@ export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: 
 	return "uploaded";
 }
 
+/** A part this device cannot open for a reader-dependent reason (e2ee-design §9.2): not corruption. */
+export class SnapshotPartUnavailable extends Error {}
+
 /**
  * Part source for verifyBundle over a remote record: part i is fetched by the hash the record names, through the
- * blob path (the address is recomputed from the sha256, never taken from the record); absent or unopenable is
- * part-missing, a store error throws. verifyBundle checks its size and hash before asking for the next part;
- * `keepPart` (its onPart) then writes it to the download cache.
+ * blob path (the address is recomputed from the sha256, never taken from the record). Absent, or failing to open
+ * deterministically (tampered at rest under a verified key, malformed), is part-missing: content_corrupt, fail
+ * closed. A store error throws, and so does a reader-dependent failure (unknown key, a key not verified yet, an
+ * unsupported suite; blobStore.ts getOpened): the request fails like a transport error, without a corruption
+ * notice. verifyBundle checks its size and hash before asking for the next part; `keepPart` (its onPart) then
+ * writes it to the download cache.
  */
 export function remotePart(r: RemoteDeps, record: SnapRecord): (i: number) => Promise<Uint8Array | null> {
 	return async (i) => {
 		const got = await getOpened(r.store, r.crypto, record.parts[i]!.sha256, null);
-		return got.ok ? got.bytes : null;
+		if (got.ok) return got.bytes;
+		if (!got.deterministic && got.reason !== "absent") {
+			throw new SnapshotPartUnavailable(`snapshot part ${i + 1}/${record.parts.length} cannot be opened on this device (${got.reason})`);
+		}
+		return null;
 	};
 }
 
