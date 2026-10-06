@@ -6,7 +6,8 @@
 // write capability, daily limit), broadcast at once as PROVISIONAL when its stream is
 // b:/c:, and buffered. The vault-wide buffer commits in one transaction on
 // idle / max age / bytes (StreamStore.commit assigns contiguous seqs in arrival
-// order). After the commit: COMMITTED frames (or COMMIT_NOTICEs for sockets that
+// order); a frame that opens a buffer after a quiet spell commits after the short
+// lead window instead of the idle window. After the commit: COMMITTED frames (or COMMIT_NOTICEs for sockets that
 // already got the PROVISIONAL), then one STREAM_RECEIPTS per origin socket.
 // Invariant: durable before receipt, and every seq is delivered live only after
 // its commit. H2 fallback: a stream's frames commit only once its dedupe index
@@ -29,6 +30,7 @@ import {
 	MAX_STREAM_TEXT_MESSAGE_BYTES,
 	STREAM_FEED_DEFAULT_LIMIT,
 	STREAM_FEED_MAX_LIMIT,
+	STREAM_READ_BATCH_MAX_STREAMS,
 	STREAM_READ_DEFAULT_BYTES,
 	STREAM_READ_MAX_BYTES,
 	STREAMS_CAPABILITY_VERSION,
@@ -41,7 +43,7 @@ import {
 	isProvisionalStream,
 	validStreamName,
 } from "./protocol";
-import { frameKey, type StreamAppendOutcome, type StreamStore } from "./store";
+import { frameKey, type StreamAppendOutcome, type StreamReadPage, type StreamStore } from "./store";
 
 // ---- configuration ----------------------------------------------------------
 
@@ -54,6 +56,14 @@ export interface StreamRelayConfig {
 	gcMaxBytes: number;
 	/** Idle commits wait at least this long after the previous commit (H8; 0 = off). */
 	gcMinIntervalMs: number;
+	/**
+	 * Leading edge: a frame that finds the buffer empty and no commit in the last gcQuietMs commits (with whatever
+	 * joins it) after gcLeadMs instead of gcIdleMs, so an isolated edit is not held for the idle window. A burst pays
+	 * at most one extra commit (2 rows per stream it touches) at its start; at most one lead commit per gcQuietMs.
+	 * gcQuietMs 0 = off.
+	 */
+	gcLeadMs: number;
+	gcQuietMs: number;
 	/** H6: per-device raw admission token bucket, shared by the device's sockets (every received message, before parsing). */
 	rateBytesPerSec: number;
 	burstBytes: number;
@@ -65,6 +75,8 @@ export const DEFAULT_STREAM_RELAY_CONFIG: Readonly<StreamRelayConfig> = Object.f
 	gcMaxMs: 1_500,
 	gcMaxBytes: 64 * 1024,
 	gcMinIntervalMs: 1_000,
+	gcLeadMs: 20,
+	gcQuietMs: 1_500,
 	rateBytesPerSec: 256 * 1024,
 	burstBytes: 2 * 1024 * 1024,
 	maxSockets: MAX_STREAM_SOCKETS,
@@ -75,6 +87,8 @@ export interface StreamsEnv {
 	YAOS_STREAMS_GC_MAX_MS?: string;
 	YAOS_STREAMS_GC_MAX_BYTES?: string;
 	YAOS_STREAMS_GC_MIN_INTERVAL_MS?: string;
+	YAOS_STREAMS_GC_LEAD_MS?: string;
+	YAOS_STREAMS_GC_QUIET_MS?: string;
 	YAOS_STREAMS_RATE_BYTES_PER_SEC?: string;
 	YAOS_STREAMS_BURST_BYTES?: string;
 	YAOS_STREAMS_MAX_SOCKETS?: string;
@@ -93,6 +107,8 @@ export function readStreamRelayConfig(env: StreamsEnv | null | undefined): Strea
 		gcMaxMs: readInteger(env?.YAOS_STREAMS_GC_MAX_MS, d.gcMaxMs, 0, 60_000),
 		gcMaxBytes: readInteger(env?.YAOS_STREAMS_GC_MAX_BYTES, d.gcMaxBytes, 1, 8 * 1024 * 1024),
 		gcMinIntervalMs: readInteger(env?.YAOS_STREAMS_GC_MIN_INTERVAL_MS, d.gcMinIntervalMs, 0, 60_000),
+		gcLeadMs: readInteger(env?.YAOS_STREAMS_GC_LEAD_MS, d.gcLeadMs, 0, 60_000),
+		gcQuietMs: readInteger(env?.YAOS_STREAMS_GC_QUIET_MS, d.gcQuietMs, 0, 3_600_000),
 		rateBytesPerSec: readInteger(env?.YAOS_STREAMS_RATE_BYTES_PER_SEC, d.rateBytesPerSec, 1024, 1 << 30),
 		// The bucket must hold one maximum-size message, or such a message is refused forever.
 		burstBytes: readInteger(env?.YAOS_STREAMS_BURST_BYTES, d.burstBytes, MAX_STREAM_BINARY_MESSAGE_BYTES, 1 << 30),
@@ -215,7 +231,7 @@ interface PendingFrame {
 	held: boolean;
 }
 
-export type StreamFlushReason = "idle" | "max" | "bytes" | "forced";
+export type StreamFlushReason = "lead" | "idle" | "max" | "bytes" | "forced";
 
 export interface StreamRelayCounters {
 	appendFrames: number;
@@ -225,6 +241,7 @@ export interface StreamRelayCounters {
 	pendingDedupes: number;
 	conflicts: number;
 	commitFailures: number;
+	flushLead: number;
 	flushIdle: number;
 	flushMax: number;
 	flushBytes: number;
@@ -256,11 +273,25 @@ function nonNegativeInteger(raw: string | null, fallback: number): number | null
 	return Number.isSafeInteger(value) ? value : null;
 }
 
+/** One read page on the wire (single read body / one batched read entry). */
+function wirePage(page: StreamReadPage) {
+	return {
+		stream: page.stream,
+		lastSeq: page.lastSeq,
+		checkpointSeq: page.checkpointSeq,
+		gcSeq: page.gcSeq,
+		checkpoint: page.checkpoint ? { coversSeq: page.checkpoint.coversSeq, bytes: bytesToBase64(page.checkpoint.bytes) } : null,
+		rows: page.rows.map((row) => ({ seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId,
+			payload: bytesToBase64(row.payload) })),
+		nextAfter: page.nextAfter,
+	};
+}
+
 export class StreamRelayService {
 	readonly config: StreamRelayConfig;
 	readonly counters: StreamRelayCounters = {
 		appendFrames: 0, commits: 0, committedRows: 0, storeDedupes: 0, pendingDedupes: 0, conflicts: 0,
-		commitFailures: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0,
+		commitFailures: 0, flushLead: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0,
 		committedBroadcasts: 0, notices: 0, rateCloses: 0, oversizeCloses: 0, deviceSocketEvictions: 0, rawDrops: 0,
 		authorityCloses: 0, dailyLimitRejects: 0, wakeNotices: 0, dedupeHeld: 0,
 	};
@@ -289,6 +320,8 @@ export class StreamRelayService {
 	private idleTimer: unknown = null;
 	private maxTimer: unknown = null;
 	private lastCommitAt = Number.NEGATIVE_INFINITY;
+	/** Commit deadline of a buffer opened after a quiet spell (leading edge), else null. */
+	private leadAt: number | null = null;
 	/** H3: consecutive failed commits in this runtime (reset by a successful commit). */
 	private failures = 0;
 	/** H3: kind of the last daily-limit error this relay classified (typing of up-front refusals). */
@@ -382,10 +415,11 @@ export class StreamRelayService {
 			feedMaxLimit: STREAM_FEED_MAX_LIMIT,
 			readDefaultBytes: STREAM_READ_DEFAULT_BYTES,
 			readMaxBytes: STREAM_READ_MAX_BYTES,
+			readBatchMaxStreams: STREAM_READ_BATCH_MAX_STREAMS,
 			rateBytesPerSec: this.config.rateBytesPerSec,
 			burstBytes: this.config.burstBytes,
 			groupCommit: { idleMs: this.config.gcIdleMs, maxMs: this.config.gcMaxMs, maxBytes: this.config.gcMaxBytes,
-				minIntervalMs: this.config.gcMinIntervalMs },
+				minIntervalMs: this.config.gcMinIntervalMs, leadMs: this.config.gcLeadMs, quietMs: this.config.gcQuietMs },
 		};
 	}
 
@@ -638,9 +672,14 @@ export class StreamRelayService {
 	private schedule(): void {
 		if (this.pendingBytes >= this.config.gcMaxBytes) { this.flush("bytes"); return; }
 		if (this.maxTimer === null) this.maxTimer = this.timers.set(() => { this.maxTimer = null; this.flush("max"); }, this.config.gcMaxMs);
+		const now = this.now();
+		const quiet = this.config.gcQuietMs > 0 && now - this.lastCommitAt >= this.config.gcQuietMs;
+		if (this.pending.length === 1 && quiet) this.leadAt = now + this.config.gcLeadMs;
 		if (this.idleTimer !== null) this.timers.clear(this.idleTimer);
-		const wait = Math.max(this.config.gcIdleMs, this.lastCommitAt + this.config.gcMinIntervalMs - this.now());
-		this.idleTimer = this.timers.set(() => { this.idleTimer = null; this.flush("idle"); }, wait);
+		const floor = this.lastCommitAt + this.config.gcMinIntervalMs - now;
+		const lead = this.leadAt !== null;
+		const wait = lead ? Math.max(0, this.leadAt! - now, floor) : Math.max(this.config.gcIdleMs, floor);
+		this.idleTimer = this.timers.set(() => { this.idleTimer = null; this.flush(lead ? "lead" : "idle"); }, wait);
 	}
 
 	private clearTimers(): void {
@@ -648,6 +687,7 @@ export class StreamRelayService {
 		if (this.maxTimer !== null) this.timers.clear(this.maxTimer);
 		this.idleTimer = null;
 		this.maxTimer = null;
+		this.leadAt = null;
 	}
 
 	pendingFrames(): number {
@@ -672,7 +712,8 @@ export class StreamRelayService {
 		this.pending = [];
 		this.pendingBytes = 0;
 		this.pendingByKey.clear();
-		if (reason === "idle") this.counters.flushIdle++;
+		if (reason === "lead") this.counters.flushLead++;
+		else if (reason === "idle") this.counters.flushIdle++;
 		else if (reason === "max") this.counters.flushMax++;
 		else if (reason === "bytes") this.counters.flushBytes++;
 		else this.counters.flushForced++;
@@ -908,30 +949,52 @@ export class StreamRelayService {
 		});
 	}
 
-	/** GET /streams/read?stream=X&after=S&maxBytes=B&checkpoint=1 */
+	/**
+	 * GET /streams/read?stream=X&after=S&maxBytes=B&checkpoint=1, or the batched form
+	 * GET /streams/read?maxBytes=B&r=<after>.<0|1>.<stream>&r=... (at most STREAM_READ_BATCH_MAX_STREAMS entries):
+	 * the first page of each entry in request order under one maxBytes budget. The first entry always gets its
+	 * page (as a single read); a later page that would overrun the remaining budget ends the batch, and the
+	 * client re-requests the entries without a page.
+	 */
 	read(url: URL): Response {
+		const maxBytes = nonNegativeInteger(url.searchParams.get("maxBytes"), STREAM_READ_DEFAULT_BYTES);
+		if (maxBytes === null || maxBytes < 1) return json({ error: "invalid_max_bytes" }, 400);
+		const budget = Math.min(maxBytes, STREAM_READ_MAX_BYTES);
+		const entries = url.searchParams.getAll("r");
+		if (entries.length > 0) return this.readBatch(entries, budget);
 		const stream = url.searchParams.get("stream");
 		if (!validStreamName(stream)) return json({ error: "invalid_stream" }, 400);
 		const after = nonNegativeInteger(url.searchParams.get("after"), 0);
-		const maxBytes = nonNegativeInteger(url.searchParams.get("maxBytes"), STREAM_READ_DEFAULT_BYTES);
 		if (after === null) return json({ error: "invalid_cursor" }, 400);
-		if (maxBytes === null || maxBytes < 1) return json({ error: "invalid_max_bytes" }, 400);
-		return this.dailyLimitAware(() => this.readPage(stream, after, maxBytes, url.searchParams.get("checkpoint") === "1"));
+		return this.dailyLimitAware(() => {
+			const page = this.options.store().read(stream, after, budget, url.searchParams.get("checkpoint") === "1");
+			return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), ...wirePage(page) });
+		});
 	}
 
-	private readPage(stream: string, after: number, maxBytes: number, preferCheckpoint: boolean): Response {
-		const page = this.options.store().read(stream, after, Math.min(maxBytes, STREAM_READ_MAX_BYTES), preferCheckpoint);
-		return json({
-			vaultEpoch: this.options.vaultGeneration(),
-			head: this.head(),
-			stream: page.stream,
-			lastSeq: page.lastSeq,
-			checkpointSeq: page.checkpointSeq,
-			gcSeq: page.gcSeq,
-			checkpoint: page.checkpoint ? { coversSeq: page.checkpoint.coversSeq, bytes: bytesToBase64(page.checkpoint.bytes) } : null,
-			rows: page.rows.map((row) => ({ seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId,
-				payload: bytesToBase64(row.payload) })),
-			nextAfter: page.nextAfter,
+	private readBatch(raw: string[], maxBytes: number): Response {
+		if (raw.length > STREAM_READ_BATCH_MAX_STREAMS) return json({ error: "batch_too_large", max: STREAM_READ_BATCH_MAX_STREAMS }, 400);
+		const entries: { stream: string; after: number; checkpoint: boolean }[] = [];
+		for (const entry of raw) {
+			const match = /^(\d+)\.([01])\.(.+)$/s.exec(entry);
+			const after = match ? nonNegativeInteger(match[1]!, 0) : null;
+			if (!match || after === null) return json({ error: "invalid_read_entry" }, 400);
+			if (!validStreamName(match[3])) return json({ error: "invalid_stream" }, 400);
+			entries.push({ stream: match[3], after, checkpoint: match[2] === "1" });
+		}
+		return this.dailyLimitAware(() => {
+			const store = this.options.store();
+			const pages: ReturnType<typeof wirePage>[] = [];
+			let left = maxBytes;
+			for (const entry of entries) {
+				if (pages.length > 0 && left <= 0) break;
+				const page = store.read(entry.stream, entry.after, pages.length > 0 ? left : maxBytes, entry.checkpoint);
+				const size = (page.checkpoint?.bytes.byteLength ?? 0) + page.rows.reduce((total, row) => total + row.payload.byteLength, 0);
+				if (pages.length > 0 && size > left) break;
+				pages.push(wirePage(page));
+				left -= size;
+			}
+			return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), pages });
 		});
 	}
 

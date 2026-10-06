@@ -815,7 +815,7 @@ s.test("H8 T-MININTERVAL-READY / -TIMING: minIntervalMs 1000 in VAULT_READY; idl
 	await withStreams(({ connect, append, timers, service }) => {
 		const a = connect();
 		assert.deepEqual((a.last("VAULT_READY")!.limits as Record<string, unknown>).groupCommit,
-			{ idleMs: 300, maxMs: 1500, maxBytes: 64 * 1024, minIntervalMs: 1000 });
+			{ idleMs: 300, maxMs: 1500, maxBytes: 64 * 1024, minIntervalMs: 1000, leadMs: 20, quietMs: 0 });
 		const committedAt: number[] = [];
 		const watch = () => { const count = a.receipts().length; return count; };
 		append(a, "ns", "t-1", "x");
@@ -844,7 +844,8 @@ s.test("H8 T-MININTERVAL-READY / -TIMING: minIntervalMs 1000 in VAULT_READY; idl
 		append(a, "ns", "big-1", new Uint8Array(64 * 1024));
 		append(a, "ns", "big-2", new Uint8Array(64 * 1024));
 		assert.equal(service.diagnostics().counters.flushBytes - bytesBefore, 2, "not deferred");
-	}, { config: { burstBytes: 8 * 1024 * 1024 } });
+		// The leading-edge commit is off here so the idle timing stays exact; streams-relay.ts tests it with H8.
+	}, { config: { burstBytes: 8 * 1024 * 1024, gcQuietMs: 0 } });
 });
 
 await s.done();

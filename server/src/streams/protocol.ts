@@ -29,6 +29,11 @@ export const STREAM_FEED_MAX_LIMIT = 5000;
 /** Catch-up page payload budget: default and cap (at least one row is always returned). */
 export const STREAM_READ_DEFAULT_BYTES = 1024 * 1024;
 export const STREAM_READ_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * Entries of one batched catch-up read (GET /streams/read with repeated `r=<after>.<0|1>.<stream>`): one
+ * request serves the first pages of many streams under one maxBytes budget (a fresh device has a stream per note).
+ */
+export const STREAM_READ_BATCH_MAX_STREAMS = 128;
 /** Concurrent streams sockets per vault. */
 export const MAX_STREAM_SOCKETS = 1000;
 /** H6: concurrent streams sockets per device; a 5th connect closes the device's oldest (1001 `device_socket_limit`). */

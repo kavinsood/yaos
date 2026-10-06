@@ -363,6 +363,22 @@ revoked devices, D7). *Why:* today `streamSockets()` walks every socket on every
   Accepted, and stated in §11.5.
 - *Tests:* T-MININTERVAL-READY, T-MININTERVAL-TIMING (≥ ~900 ms between back-to-back commits).
 
+**Latency additions after the rewrite** (built on client-remake as 18ea6fd and 2c3afd1, carried here on 2026-10-07 so
+that server code changes only on this branch and client branches merge it):
+- *Leading-edge commit.* An append that finds the buffer empty with no commit in the last `gcQuietMs` (1500) commits
+  after `gcLeadMs` (20) instead of the idle window; appends inside the 20 ms join it. The wait is
+  `max(leadAt − now, lastCommitAt + minIntervalMs − now)`, so H8 still holds: the lead fires only after ≥ 1.5 s
+  without a commit. Cost: at most one extra commit per burst start, at most one lead commit per quietMs. Echoed as
+  `groupCommit.leadMs`/`quietMs`; `YAOS_STREAMS_GC_LEAD_MS` / `_QUIET_MS` override (quiet 0 = off). Before it, an
+  isolated local edit reached the peer's disk after 417 ms, about 300 ms of it the idle window (2c3afd1).
+- *Batched read.* `GET /vault/:id/streams/read` also takes `r=<after>.<0|1>.<name>` entries (at most
+  `readBatchMaxStreams`, 128) with one `maxBytes` budget; the response has one page per entry, in order, ending early
+  when the budget runs out. One request per stream made a 1000-note bootstrap take about a minute on the deployed
+  relay (about 220 ms per request); a batch reads up to 128 streams per request. Errors `400 invalid_read_entry`,
+  `400 batch_too_large`.
+- *Tests:* tests/server/streams-relay.ts (lead commit with H8, batch budget, entry parsing); streams-hardening.ts
+  T-MININTERVAL-TIMING runs with the lead off (`gcQuietMs: 0`) so the idle timing stays exact.
+
 **BASELINE** (unchanged behaviour, must stay green): T-OVERSIZE-1009, T-CKPT-MULTICHUNK (2.5 MB), T-TWO-SOCKETS,
 T-HAPPY.
 
@@ -389,6 +405,8 @@ Classes: **additive** (new; old clients unaffected), **relaxation** (the server 
 | 3.2 | `canWrite` always true; D6 constants; the `write_forbidden` note is removed; `groupCommit.minIntervalMs` 0 → 1000 | removal / tightening | read `limits`; set receipt timeouts ≥ maxMs + RTT |
 | 4.3 | `STREAM_APPEND_REJECTED write_forbidden` removed. `VAULT_ERROR durability_failed` + `retryAfterMs` (ms, number) | removal / additive | when present, wait `retryAfterMs` before resending |
 | 5.1 | Idle flush deferred to `lastCommitAt + minIntervalMs` | tightening | none |
+| 3.2, 5.1 | Leading-edge commit: `groupCommit.leadMs` 20, `quietMs` 1500; an append after ≥ 1500 ms without a commit commits after 20 ms (H8 still holds) | additive | none |
+| 7.1 | Batched read: `/streams/read?r=…&r=…`, `limits.readBatchMaxStreams` 128, one byte budget per batch | additive | use it when the limit is present |
 | 5.4 | Dedupe scope (text below) | relaxation | none |
 | 6, 7, 8 | Optional `epoch=<vaultEpoch>`; mismatch or empty → `409 {"error":"vault_generation_mismatch","vaultEpoch"}` before any effect | additive | send it; on 409 switch to the returned epoch (new local DB) |
 | 8 | GC text (below) | tightening | write a final checkpoint at `lastSeq` to retire a stream |

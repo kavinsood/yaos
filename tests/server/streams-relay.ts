@@ -150,8 +150,9 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 	const registry = new FakeRegistry();
 	const revoked = new Set<string>();
 	const store = new StreamStore(storage);
-	// The H8 min interval (default 1000) is off here so idle-timing tests stay exact; its own tests set it.
-	const resolved = { ...DEFAULT_STREAM_RELAY_CONFIG, gcMinIntervalMs: 0, ...config };
+	// The leading-edge commit and the H8 min interval (default 1000) are off unless a test asks for them: the
+	// timing tests below pin the idle/max/bytes rules exactly.
+	const resolved = { ...DEFAULT_STREAM_RELAY_CONFIG, gcQuietMs: 0, gcMinIntervalMs: 0, ...config };
 	const make = (runtimeEpoch: string) => new StreamRelayService({
 		config: resolved,
 		store: () => store,
@@ -231,6 +232,9 @@ s.test("config: env overrides are clamped; the burst holds one maximum message",
 	assert.equal(config.gcMaxBytes, 64 * 1024);
 	assert.equal(config.gcMinIntervalMs, 1000, "H8 default");
 	assert.equal(readStreamRelayConfig({ YAOS_STREAMS_GC_MIN_INTERVAL_MS: "0" }).gcMinIntervalMs, 0, "H8 env override");
+	assert.equal(config.gcLeadMs, 20);
+	assert.equal(config.gcQuietMs, 1500);
+	assert.equal(readStreamRelayConfig({ YAOS_STREAMS_GC_QUIET_MS: "0" }).gcQuietMs, 0, "lead off");
 });
 
 // ---- live path ------------------------------------------------------------------
@@ -299,6 +303,52 @@ s.test("group commit: idle re-arms, max age caps a busy stream, 64 KiB flushes a
 		timers.advance(700);
 		assert.equal(service.counters.flushIdle, 2);
 	}, { gcMinIntervalMs: 1000 });
+});
+
+s.test("group commit: leading edge commits an isolated frame after gcLeadMs; a burst pays one extra commit at most", async () => {
+	await withStreams(({ connect, append, timers, service }) => {
+		const a = connect(ownerA);
+		const b = connect(deviceB);
+		append(a, "b:doc-1", "l-1", "one");
+		timers.advance(5);
+		append(a, "ns", "l-2", "ns");
+		timers.advance(14);
+		assert.equal(a.receipts().length, 0, "lead window not over (a frame in it does not re-arm it)");
+		timers.advance(1);
+		assert.equal(service.counters.flushLead, 1);
+		assert.deepEqual(a.receipts().map((r) => r.clientFrameId), ["l-1", "l-2"], "both frames in the lead commit");
+		assert.deepEqual(b.frames().map((f) => f.kind), ["provisional", "notice", "committed"]);
+		// Not quiet (last commit 20 ms ago): the burst goes back to the idle window.
+		for (let index = 0; index < 4; index++) { append(a, "b:doc-1", `t-${index}`, "x"); timers.advance(100); }
+		assert.equal(a.receipts().length, 2);
+		timers.advance(200);
+		assert.equal(service.counters.flushIdle, 1);
+		assert.equal(a.receipts().length, 6);
+		// Quiet again only after gcQuietMs without a commit.
+		timers.advance(1_000);
+		append(a, "b:doc-1", "q-1", "x");
+		timers.advance(20);
+		assert.equal(service.counters.flushLead, 1, "1000 ms is not quiet");
+		timers.advance(280);
+		assert.equal(service.counters.flushIdle, 2);
+		timers.advance(1_500);
+		append(a, "b:doc-1", "q-2", "x");
+		timers.advance(20);
+		assert.equal(service.counters.flushLead, 2, "1500 ms after the last commit is quiet");
+		assert.equal(service.pendingFrames(), 0);
+	}, { gcQuietMs: DEFAULT_STREAM_RELAY_CONFIG.gcQuietMs });
+	await withStreams(({ connect, append, timers, service }) => {
+		const a = connect();
+		append(a, "ns", "f-1", "x");
+		timers.advance(20);
+		assert.equal(service.counters.flushLead, 1);
+		timers.advance(2_000);
+		append(a, "ns", "f-2", "x");
+		timers.advance(20);
+		assert.equal(service.counters.flushLead, 1, "min interval holds a lead commit too");
+		timers.advance(980);
+		assert.equal(service.counters.flushLead, 2);
+	}, { gcQuietMs: 1_500, gcMinIntervalMs: 3_000 });
 });
 
 s.test("dedupe: pending resend shares the receipt, reconnect resend is deduped from storage, conflicts are rejected", async () => {
@@ -432,6 +482,47 @@ s.test("read: rows after S oldest first, byte-bounded pages, at least one row, a
 		assert.deepEqual(bigSeqs, [...bigSeqs].sort((x, y) => x - y));
 		const middle = await read(`stream=b:big&after=${bigSeqs[3]}&maxBytes=4000000`);
 		assert.deepEqual(middle.rows.map((row) => row.seq), bigSeqs.slice(4), "a cursor inside a sealed segment resumes there");
+	});
+});
+
+s.test("read batch: first pages of many streams in request order under one byte budget; the first entry always served", async () => {
+	await withStreams(async ({ connect, append, timers, service }) => {
+		const a = connect();
+		for (let index = 0; index < 6; index++) append(a, `b:n${index}`, `n-${index}`, new Uint8Array(100).fill(index));
+		append(a, "b:n0", "n-0b", new Uint8Array(100).fill(9));
+		append(a, "b:odd.name.with.dots", "dots", "dotted");
+		timers.advance(300);
+		type Page = { stream: string; rows: Array<{ seq: number; payload: string }>; nextAfter: number | null; lastSeq: number; checkpoint: unknown };
+		const batch = async (query: string) => {
+			const response = service.read(new URL(`https://do/streams/read?${query}`));
+			return { status: response.status, body: await response.json() as { head: number; vaultEpoch: string; pages: Page[]; error?: string } };
+		};
+		const entries = (list: Array<[number, string]>) => list.map(([after, stream]) => `r=${after}.0.${encodeURIComponent(stream)}`).join("&");
+		const all = await batch(entries([[0, "b:n0"], [0, "b:n1"], [0, "b:odd.name.with.dots"], [0, "missing"], [0, "b:n2"]]));
+		assert.equal(all.status, 200);
+		assert.equal(all.body.head, 8);
+		assert.equal(all.body.vaultEpoch, GENERATION);
+		assert.deepEqual(all.body.pages.map((page) => page.stream), ["b:n0", "b:n1", "b:odd.name.with.dots", "missing", "b:n2"]);
+		assert.deepEqual(all.body.pages[0]!.rows.map((row) => row.seq), [1, 7]);
+		assert.equal(text(base64ToBytes(all.body.pages[2]!.rows[0]!.payload)), "dotted", "names are opaque (dots after the second separator)");
+		assert.deepEqual([all.body.pages[3]!.rows, all.body.pages[3]!.lastSeq, all.body.pages[3]!.nextAfter], [[], 0, null]);
+		const after = await batch(entries([[1, "b:n0"], [2, "b:n1"]]));
+		assert.deepEqual(after.body.pages.map((page) => page.rows.map((row) => row.seq)), [[7], []], "per-entry cursors");
+		// 250 bytes: b:n0 (200) fits; b:n1 (100) would overrun the 50 left -> the batch ends there.
+		const bounded = await batch(`maxBytes=250&${entries([[0, "b:n0"], [0, "b:n1"], [0, "b:n2"]])}`);
+		assert.deepEqual(bounded.body.pages.map((page) => page.stream), ["b:n0"]);
+		const tiny = await batch(`maxBytes=1&${entries([[0, "b:n3"], [0, "b:n4"]])}`);
+		assert.deepEqual(tiny.body.pages.map((page) => [page.stream, page.rows.length]), [["b:n3", 1]], "the first entry is served even over budget");
+		const exact = await batch(`maxBytes=200&${entries([[0, "b:n3"], [0, "b:n4"], [0, "b:n5"]])}`);
+		assert.deepEqual(exact.body.pages.map((page) => page.stream), ["b:n3", "b:n4"]);
+		assert.equal((await batch("r=0.0.")).status, 400, "empty stream name");
+		assert.equal((await batch("r=x.0.b%3An0")).status, 400, "bad cursor");
+		assert.equal((await batch("r=0.2.b%3An0")).status, 400, "bad checkpoint flag");
+		assert.equal((await batch("r=0.0.b%3An0&maxBytes=0")).status, 400);
+		const tooMany = await batch(Array.from({ length: 129 }, (_, index) => `r=0.0.b%3A${index}`).join("&"));
+		assert.deepEqual([tooMany.status, tooMany.body.error], [400, "batch_too_large"]);
+		assert.equal((await batch(Array.from({ length: 128 }, (_, index) => `r=0.0.b%3A${index}`).join("&"))).body.pages.length, 128);
+		assert.equal((service.limits() as { readBatchMaxStreams: number }).readBatchMaxStreams, 128, "advertised in VAULT_READY limits");
 	});
 });
 
