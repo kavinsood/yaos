@@ -278,7 +278,9 @@ export class SessionLoop {
 				if (res.checkpointState || res.apply.length > 0) await c.docs.applyToHandle(h, res.apply, res.checkpointState);
 				c.docs.checkDoc(h);
 			}
-			if (res.checkpointState || res.tailPut.some((r) => r.deviceId !== c.self)) c.noteBodyChange([stream]);
+			// A completed read makes the stream caught up (§d.7), which the disk side waits on, even when
+			// every row is own (the author re-reading after its DB was lost); own plain rows change content too.
+			if (res.checkpointState || res.t === "done" || res.apply.length > 0 || res.tailPut.some((r) => r.deviceId !== c.self)) c.noteBodyChange([stream]);
 		} else if (cls === "ns") await c.afterNsChange(res.replacedFold);
 		else if (cls === "cfg") await c.afterCfgChange(res.replacedFold);
 		else if (cls === "blobchunk" && res.tailPut.length > 0) await c.docs.retryRefs();

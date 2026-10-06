@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { sha256Hex } from "../../core/hash/sha256";
-import { blobChunkStream, type ContentHash, type DeviceId, type DocId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
+import { blobChunkStream, bodyStream, type ContentHash, type DeviceId, type DocId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import { MemStoragePort } from "../../sim/storage";
 import { assembleChunks, splitChunks } from "../blobs/chunks";
@@ -148,5 +148,25 @@ test("onBodyChange: fires on the peer for remote body rows, not for own edits", 
 		assert.equal(await b.docText(d), "xfirst");
 	} finally {
 		await stopAll(a, b);
+	}
+});
+
+/** Sim seed 179: after an IDB wipe the author re-reads its doc; every row is its own, and the disk side waited on caughtUp. */
+test("onBodyChange: a completed catch-up read fires even when every row is own (author with a fresh DB)", async () => {
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	let a2: LogEngine | null = null;
+	try {
+		const d = await a.createDoc("n.md" as VaultPath, "first");
+		await until(() => a.isIdle() && a.c.outbox.size === 0, 2_000, "a's frames receipted");
+		await a.stop();
+		const seen: DocId[] = [];
+		a2 = (await startTestEngine({ relay, deviceId: "dev-a", extra: { onBodyChange: (ids) => seen.push(...ids) } })).engine; // fresh DB
+		const e = a2;
+		await until(() => e.isIdle() && e.c.repo.stream(bodyStream(d))?.stale === 0, 2_000, "body caught up");
+		assert.equal(await e.docText(d), "first");
+		assert.ok(seen.includes(d), "the body became caught up: the disk side must re-plan it");
+	} finally {
+		await a2?.stop();
 	}
 });
