@@ -44,7 +44,10 @@ export const MAX_ENROLL_BODY_BYTES = 64 * 1024;
 export const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{32}$/;
 /** §2.2 blob address (relay-wire §11.3 after §5: 64 lowercase hex, no hash check). */
 export const BLOB_ADDRESS_PATTERN = /^[0-9a-f]{64}$/;
-/** D9: `POST /vault/:id/blobs/exists` answers for at most 50 addresses (legacy routes/blobs.ts:11 slice). */
+/**
+ * D9: `POST /vault/:id/blobs/exists` takes at most 50 addresses (legacy routes/blobs.ts:11 sliced there; more is now
+ * `400 too_many_addresses`, never a silent answer for the first 50).
+ */
 export const MAX_BLOB_EXISTS_ADDRESSES = 50;
 /** R2 HEADs in flight for one `exists` (legacy routes/blobs.ts:12). */
 export const BLOB_HEAD_CONCURRENCY = 4;
@@ -665,10 +668,10 @@ function blobPrefix(vaultId: string): string {
 }
 
 /**
- * `POST /vault/:id/blobs/exists {"hashes": [...]}` → `{present: [...]}` (relay-wire §11.3): the first 50 entries,
- * HEADed 4 at a time. Every entry must be an address: one that is not (wrong type, wrong format) is `400
- * invalid_address`, not a silent "absent", so a client addressing bug cannot turn into re-uploads forever (E2EE design
- * §19 A4). The legacy errors stay: `400 "invalid json"` and `400 "missing hashes array"`.
+ * `POST /vault/:id/blobs/exists {"hashes": [...]}` → `{present: [...]}` (relay-wire §11.3): at most 50 entries, HEADed
+ * 4 at a time. Nothing is silently left out, so a client bug cannot read as "absent" and re-upload forever (E2EE design
+ * §19 A4): more than 50 entries is `400 too_many_addresses`, and an entry that is not an address (wrong type, wrong
+ * format) is `400 invalid_address`. The legacy errors stay: `400 "invalid json"` and `400 "missing hashes array"`.
  */
 async function blobExists(request: Request, bucket: R2Bucket, vaultId: string): Promise<Response> {
 	let bytes: Uint8Array;
@@ -687,20 +690,27 @@ async function blobExists(request: Request, bucket: R2Bucket, vaultId: string): 
 	}
 	const hashes = body && typeof body === "object" ? (body as { hashes?: unknown }).hashes : undefined;
 	if (!Array.isArray(hashes)) return json({ error: "missing hashes array" }, 400);
+	if (hashes.length > MAX_BLOB_EXISTS_ADDRESSES) return json({ error: "too_many_addresses" }, 400);
 	if (!hashes.every((hash): hash is string => typeof hash === "string" && BLOB_ADDRESS_PATTERN.test(hash))) {
 		return json({ error: "invalid_address" }, 400);
 	}
-	const addresses = hashes.slice(0, MAX_BLOB_EXISTS_ADDRESSES);
-	const present = addresses.map(() => false);
+	const present = await mapConcurrently(hashes, BLOB_HEAD_CONCURRENCY,
+		async (address) => await bucket.head(blobKey(vaultId, address)) !== null);
+	return json({ present: hashes.filter((_, index) => present[index]) });
+}
+
+/** `fn` over `items` with at most `limit` calls in flight; the results in input order. */
+async function mapConcurrently<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+	const results = new Array<R>(items.length);
 	let next = 0;
 	const worker = async () => {
-		while (next < addresses.length) {
+		while (next < items.length) {
 			const index = next++;
-			present[index] = await bucket.head(blobKey(vaultId, addresses[index]!)) !== null;
+			results[index] = await fn(items[index]!);
 		}
 	};
-	await Promise.all(Array.from({ length: Math.min(BLOB_HEAD_CONCURRENCY, addresses.length) }, worker));
-	return json({ present: addresses.filter((_, index) => present[index]) });
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+	return results;
 }
 
 /** One blob in a GC listing: its address and R2's upload time in ms (a PUT overwrite refreshes it). */

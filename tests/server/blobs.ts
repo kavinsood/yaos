@@ -1,12 +1,13 @@
 // D9 blobs through the real Router (server/src/router.ts) with the real vault host and an in-memory R2 bucket: the key
 // `v/<vaultId>/<address>`, opaque addresses (no hash check), overwrite, the GET headers, the 10 MiB cap (declared and
-// streamed), `exists` (≤ 50, A4: a malformed entry is 400, errors), the bearer check in the vault DO (zero config
-// calls), and the no-bucket answer (`503 attachments_unavailable`, `capabilities.attachments = false`). The blob GC
-// routes (E2EE design §19 A3, relay-wire §11.3): list paging, the conditional delete, their limit and refusals.
+// streamed), `exists` (≤ 50, more or a malformed entry is 400 (A4), errors), the bearer check in the vault DO (zero
+// config calls), and the no-bucket answer (`503 attachments_unavailable`, `capabilities.attachments = false`). The blob
+// GC routes (E2EE design §19 A3, relay-wire §11.3): list paging, the conditional delete, their limit and refusals.
 import assert from "node:assert/strict";
 
 import {
 	BLOB_LIST_PAGE_SIZE,
+	MAX_BLOB_EXISTS_ADDRESSES,
 	MAX_BLOB_EXISTS_BODY_BYTES,
 	MAX_BLOB_UPLOAD_BYTES,
 	blobKey,
@@ -137,25 +138,32 @@ s.test("D9 PUT cap: 10 MiB accepted; a larger declared or streamed body is 413; 
 	});
 });
 
-s.test("D9 exists: the first 50 entries, in order; legacy errors; a 64 KiB body cap", async () => {
+s.test("D9 exists: up to 50 entries, answered in order; more → 400 too_many_addresses; legacy errors; a 64 KiB body cap", async () => {
+	assert.equal(MAX_BLOB_EXISTS_ADDRESSES, 50);
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
-		const addresses = Array.from({ length: 60 }, (_, index) => index.toString(16).padStart(64, "0"));
+		const addresses = Array.from({ length: 60 }, (_, index) => addressOf(index));
 		for (const address of addresses) world.bucket.objects.set(blobKey(vaultId, address), new Uint8Array([1]));
 		world.bucket.objects.set(blobKey("another-vault-id-000", ADDRESS), new Uint8Array([1]));
 
-		const listed = [addresses[3], ADDRESS, addresses[0], ...addresses.slice(10, 54), ...addresses.slice(54)];
+		const listed = [addresses[3]!, ADDRESS, addresses[0]!, ...addresses.slice(10, 57)];
+		assert.equal(listed.length, 50);
+		world.bucket.calls.length = 0;
 		const response = await exists(world, vaultId, device, JSON.stringify({ hashes: listed }));
 		assert.equal(response.status, 200);
 		const { present } = await json(response) as { present: string[] };
 		assert.deepEqual(present, [addresses[3], addresses[0], ...addresses.slice(10, 57)],
-			"only the first 50 entries; a foreign-vault address is absent");
+			"every entry, in request order; a foreign-vault address is absent");
 		assert.ok(!present.includes(ADDRESS), "another vault's blob is not visible");
+		assert.equal(world.bucket.calls.filter((call) => call.startsWith("head ")).length, 50, "one R2 HEAD per entry");
 
 		world.bucket.calls.length = 0;
-		assert.deepEqual(await json(await exists(world, vaultId, device, JSON.stringify({ hashes: addresses }))),
-			{ present: addresses.slice(0, 50) });
-		assert.equal(world.bucket.calls.filter((call) => call.startsWith("head ")).length, 50, "≤ 50 R2 HEADs");
+		for (const hashes of [addresses.slice(0, 51), addresses, [...addresses.slice(0, 50), "not-an-address"]]) {
+			const refused = await exists(world, vaultId, device, JSON.stringify({ hashes }));
+			assert.deepEqual([refused.status, await json(refused)], [400, { error: "too_many_addresses" }],
+				`${hashes.length} entries`);
+		}
+		assert.deepEqual(world.bucket.calls, [], "never a silent answer for the first 50; no R2 call");
 
 		for (const [body, error] of [["{", "invalid json"], ["", "invalid json"], ["{}", "missing hashes array"],
 			['{"hashes":"x"}', "missing hashes array"], ["null", "missing hashes array"]] as const) {
@@ -167,11 +175,11 @@ s.test("D9 exists: the first 50 entries, in order; legacy errors; a 64 KiB body 
 	});
 });
 
-s.test("T-BLOB-EXISTS-STRICT (A4): any malformed entry, even past the first 50, is 400 invalid_address with no R2 HEAD", async () => {
+s.test("T-BLOB-EXISTS-STRICT (A4): any malformed entry, the 50th too, is 400 invalid_address with no R2 HEAD", async () => {
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
 		world.bucket.objects.set(blobKey(vaultId, ADDRESS), new Uint8Array([1]));
-		const valid = Array.from({ length: 50 }, (_, index) => index.toString(16).padStart(64, "0"));
+		const valid = Array.from({ length: MAX_BLOB_EXISTS_ADDRESSES - 1 }, (_, index) => addressOf(index));
 		for (const bad of ["not-an-address", "E".repeat(64), "e".repeat(63), "e".repeat(65), "", 7, null,
 			{ address: ADDRESS }, [ADDRESS]]) {
 			for (const hashes of [[ADDRESS, bad], [bad], [...valid, bad]]) {
