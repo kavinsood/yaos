@@ -642,6 +642,7 @@ P2 and P4 gap calls (accepted; marked `DECISIONS-GAP` in code). G7 is closed: ro
 - G26 The console generates the recovery key in the page and sends `/claim` only after "I have saved it" is ticked.
 - G27 The entry module (`worker.ts`) exports only the fetch handler and the DO classes: workerd treats every named
   export as an entrypoint and refuses to start on a constant. The route table is `router.ts`; a WB test guards it.
+
 P3a gap calls (accepted; marked `DECISIONS-GAP` in code):
 
 - G28 The daily-limit up-front refusal uses the last classified kind.
@@ -656,10 +657,37 @@ P3a gap calls (accepted; marked `DECISIONS-GAP` in code):
   ≈ 10 steps (≈ 13 ms) in one window, over Free's 10 ms; the platform tolerates infrequent overruns ("built-in
   flexibility", Workers limits page). A vault-DO alarm per step would give each a fresh budget; add it only if
   P5 shows `exceededCpu`.
-- O9 (open) Revoke under the D8 daily latch: the device DELETE fails, so nothing changes; the device keeps its
-  read access until the reset (≤ 24 h). Kept: shutting the gate in memory only would not survive eviction. Today
-  the operator sees `500 internal_error` (router.ts maps every failed vault RPC to 500); P3 maps a daily-limit
-  failure on any operator RPC to the D8 answer.
+- O9 → resolved: a daily-limit failure on any route, including one thrown by a DO RPC, is `503 cf_daily_limit`
+  with Retry-After (router.ts:187-188; WB in tests/server/reset.ts). Revoke under the latch changes nothing and
+  says so; the device keeps its read access until the reset (≤ 24 h). Kept: a gate shut in memory only would not
+  survive eviction.
+
+P3b gap calls (accepted; marked `DECISIONS-GAP` in code):
+
+- G34 `POST /vault/:id/blobs/exists` body cap 64 KiB → `413 body_too_large` (50 addresses are ≈ 3.5 KiB).
+- G35 A blob GET is always `application/octet-stream` with `nosniff` and `no-store`: blobs share the console's
+  origin, so an uploaded HTML or SVG body never renders.
+- G36 A restore body that is not a JSON object counts as `{}` (no `at` → `400 invalid_restore_point`).
+- G37 The restore alarm re-arms itself while journal rows remain: 30 s, doubling per failed alarm, capped at 1 h.
+- G38 One run rewinds at most 3 times, then `503 restore_incomplete`; the alarm carries on.
+- G39 `at` is a date-time with optional seconds, ≤ 3 fraction digits and an explicit zone (`Z` or ±hh:mm).
+- G40 `at` is validated even when a restore is pending; the pending one then resumes with its journaled `at`.
+- G41 A vault that answers `unknown_vault`, or whose journal row vanished mid-run, ends the run `404 unknown_vault`;
+  `restore_unsupported` and `invalid_restore_point` from the vault drop the row.
+- G42 An `at` before the vault was created → `400 invalid_restore_point`, with no PITR call.
+- G43 Finish reads "`pending_restore_id` still set" as "equals this restoreId": a restore in flight at T leaves its
+  own marker in the rewound state, and rewinding never clears that one.
+- G44 Enroll's restore 503 runs before the code is read, so a malformed body also gets it.
+- G45 The device routes' restore 503 runs after auth and D8c (no oracle); blob and debug routes count as device
+  routes.
+- G46 An upgrade during a restore is refused after the ticket check, with the error frame and 1013
+  `restore_in_progress`; a non-upgrade request with a valid ticket gets the 503.
+- G47 TEST-ONLY simulate-daily-limit: `enabled` must be a boolean (else `400 invalid_request`); `200 {ok, enabled}`.
+- O11 (accepted risk) Step 0 issues the journal INSERT and `setAlarm` in one synchronous turn (config/restore.ts
+  :126-130), so the platform should commit them together (write coalescing); not verified on the platform. A
+  daily-limit failure injected at `setAlarm` alone (WB) leaves a row without an alarm: the vault is untouched
+  (step 1 never ran), but its authority actions answer `409 restore_in_progress` until the operator presses restore
+  again, which resumes the journaled `at`.
 
 ## 9. Work plan
 
@@ -672,5 +700,7 @@ P3a gap calls (accepted; marked `DECISIONS-GAP` in code):
 | P4 Console | `GET /` page and `GET /mobile-setup` (D5) | Manual run on local dev: claim → vault → QR → enroll → revoke → reset; no external assets |
 | P5 Deploy over scratch-3 | The coordinator deploys: one migration that deletes the old DO classes and adds the two new ones (the account is at the namespace cap) | The full suite is green on scratch-3 except the documented SKIPs; T-RESTORE-MANUAL done once by hand; §15 latencies re-measured |
 
-Status 2026-10-06: P0, P1 and P2 done (P2: `conformance-local-p2-20261006T085006Z.json`, every D2–D7 and
-BASELINE row green, the 12 failures are P3 rows). P4 pages are done and wired; its manual run waits for P3.
+Status 2026-10-06: P0–P3 done. Combined local run at 15e9bf3: `conformance-local-final-20261006T105356Z.json`,
+49 pass, 0 fail, 1 SKIP (T-BLOB-UNAVAILABLE needs an unbound bucket; it passes in
+`conformance-local-p3b-nobucket-20261006T104800Z.json`). P4 pages are done and wired; the manual console run is next,
+then P5.
