@@ -170,12 +170,6 @@ export class FakeVault implements VaultPort {
 		return f ? this.statOf(f) : null;
 	}
 
-	async readText(path: string): Promise<string> {
-		const f = this.files.get(this.key(path));
-		if (!f) throw new Error(`ENOENT ${path}`);
-		return utf8Decode(f.bytes);
-	}
-
 	async readBytes(path: string): Promise<Uint8Array> {
 		const f = this.files.get(this.key(path));
 		if (!f) throw new Error(`ENOENT ${path}`);

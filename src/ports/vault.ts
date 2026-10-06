@@ -70,7 +70,6 @@ export interface VaultPort {
 	/** Full listing of files (not folders). Cheap on Obsidian (in-memory index). */
 	list(): Promise<readonly VaultStat[]>;
 	stat(path: string): Promise<VaultStat | null>;
-	readText(path: string): Promise<string>;
 	readBytes(path: string): Promise<Uint8Array>;
 	/** Create or replace, creating parent folders. */
 	write(path: VaultPath, data: string | Uint8Array, precondition: WritePrecondition): Promise<WriteOutcome>;

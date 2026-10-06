@@ -96,12 +96,6 @@ export class ObsidianVault implements VaultPort {
 		return f ? statOf(f) : null;
 	}
 
-	async readText(path: string): Promise<string> {
-		const f = this.file(path);
-		if (!f) throw new Error(`ENOENT: ${path}`);
-		return this.vault.read(f);
-	}
-
 	async readBytes(path: string): Promise<Uint8Array> {
 		const f = this.file(path);
 		if (!f) throw new Error(`ENOENT: ${path}`);

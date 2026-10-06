@@ -1553,8 +1553,7 @@ interface VaultPort {
   readonly caseInsensitive: boolean;
   list(): Promise<readonly VaultStat[]>;
   stat(path: string): Promise<VaultStat | null>;
-  readText(path: string): Promise<string>;
-  readBytes(path: string): Promise<Uint8Array>;
+  readBytes(path: string): Promise<Uint8Array>;   // raw bytes, transferred to the engine; main never decodes text
   write(path: VaultPath, data: string | Uint8Array, precondition: WritePrecondition): Promise<WriteOutcome>;
   rename(from: string, to: VaultPath, precondition: WritePrecondition): Promise<RenameOutcome>;   // vault.rename, never fileManager.renameFile
   trash(path: string, mode: TrashMode, precondition: WritePrecondition): Promise<RenameOutcome>;  // no permanent delete

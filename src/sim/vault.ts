@@ -185,10 +185,6 @@ export class SimVault implements VaultPort {
 		return f ? this.stamp(f) : null;
 	}
 
-	async readText(path: string): Promise<string> {
-		return fromUtf8(await this.readBytes(path));
-	}
-
 	async readBytes(path: string): Promise<Uint8Array> {
 		this.calls.readBytes++;
 		this.maybeFail("readBytes");
