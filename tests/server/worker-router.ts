@@ -1,9 +1,10 @@
-// Worker router (server/src/worker.ts) against DECISIONS §2.2 and D5: method and path match, format checks, size
+// Worker router (server/src/router.ts) against DECISIONS §2.2 and D5: method and path match, format checks, size
 // caps, CORS, the capabilities cache, and T-LEGACY-404 (every removed route → 404 with zero DO calls). The vault DO
 // is a real VaultHost on SQLite; the config DO is a namespace that records every access.
 import assert from "node:assert/strict";
 
-import { Router, type WorkerEnv } from "../../server/src/worker";
+import { Router, type WorkerEnv } from "../../server/src/router";
+import * as entry from "../../server/src/worker";
 import { suite } from "../harness.ts";
 import {
 	RecordingUpgrades,
@@ -480,6 +481,14 @@ s.test("an unread request body is drained in finally; a thrown error is 500 inte
 			console.error = original;
 		}
 	});
+});
+
+s.test("entry module: only the fetch handler and the two DO classes (workerd loads every named export)", () => {
+	// A non-function named export of the main module stops workerd at startup ("Incorrect type for map entry").
+	assert.deepEqual(Object.keys(entry).sort(), ["ConfigDO", "VaultDO", "default"]);
+	assert.equal(typeof entry.ConfigDO, "function");
+	assert.equal(typeof entry.VaultDO, "function");
+	assert.equal(typeof entry.default.fetch, "function");
 });
 
 await s.done();

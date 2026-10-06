@@ -1,4 +1,4 @@
-// Node harness for the Worker router (server/src/worker.ts) and the vault DO host (server/src/vault/host.ts):
+// Node harness for the Worker router (server/src/router.ts) and the vault DO host (server/src/vault/host.ts):
 // VaultHost objects on real SQLite behind a fake vault namespace, a config namespace that records every access,
 // fake hibernatable sockets, virtual timers and a recording upgrade-reject port. No Cloudflare global is used.
 import { mkdtempSync, rmSync } from "node:fs";
@@ -12,7 +12,7 @@ import type { SocketPort, SocketRegistryPort, TimerPort, UpgradeRejectPort } fro
 import { encodeAppendFrame } from "../../../server/src/streams/protocol";
 import { DEFAULT_STREAM_RELAY_CONFIG } from "../../../server/src/streams/relay";
 import { VaultHost } from "../../../server/src/vault/host";
-import type { WorkerEnv } from "../../../server/src/worker";
+import type { WorkerEnv } from "../../../server/src/router";
 import { CfRowModel } from "./cfRowModel";
 import { NodeSqliteStorage } from "./nodeSqliteStorage";
 

@@ -1,4 +1,4 @@
-// P2 operator routes (DECISIONS D5, D7, D8b seam) through the real Router (server/src/worker.ts) with the real config
+// P2 operator routes (DECISIONS D5, D7, D8b seam) through the real Router (server/src/router.ts) with the real config
 // host (server/src/config/host.ts) and vault hosts on Node SQLite: claim, login and its limiter, logout, sessions,
 // state, create vault, owner code, devices, revoke, delete vault with the R2 purge, the D5 CSRF checks, the restore
 // seam (409 restore_in_progress) and T-ROWS-WB (the §6.2 row counts of every operator operation).
@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 
 import { SESSION_TTL_MS } from "../../server/src/config/host";
 import { PAIRING_CODE_TTL_MS } from "../../server/src/vault/pairing";
-import { MAX_PURGE_BATCHES, Router, type WorkerEnv } from "../../server/src/worker";
+import { MAX_PURGE_BATCHES, Router, type WorkerEnv } from "../../server/src/router";
 import { suite } from "../harness.ts";
 import {
 	RecordingUpgrades,

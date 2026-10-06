@@ -6,7 +6,7 @@
 // real code, and a device mints a pairing code.
 import assert from "node:assert/strict";
 
-import { Router, type WorkerEnv } from "../../server/src/worker";
+import { Router, type WorkerEnv } from "../../server/src/router";
 import { suite } from "../harness.ts";
 import {
 	RecordingUpgrades,
