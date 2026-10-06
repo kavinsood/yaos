@@ -1,6 +1,6 @@
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
-import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../legacy-src/sync/schema.ts";
+import { PROTOCOL_VERSION, SCHEMA_VERSION } from "../../server/src/shared/productVersions.ts";
 import { describeFatalFrame, onFatalFrame } from "./fatalFrame.ts";
 import { fetchSocketTicket, LiveWebSocket as WebSocket, requireLiveIdentity } from "./liveIdentity.ts";
 import { socketPrefix } from "./schema4Live.ts";

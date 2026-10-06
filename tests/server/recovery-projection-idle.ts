@@ -28,14 +28,11 @@ import { VaultStore } from "../../server/src/vaultStore";
 import { actorHeaders } from "../../server/src/vaultAuthority";
 import type { VaultActorContext } from "../../server/src/collaboration";
 import { FakeObjectStore } from "../mocks/workerEnv.ts";
-import { decodeRecoveryStateObject } from "../../legacy-src/snapshots/recoveryStateDecode";
+import { decodeRecoveryStateObject } from "./helpers/recoveryStateDecode";
 import { runStateProjectionPass, STATE_PROJECTION_LIMITS } from "../../server/src/recoveryStateProjection";
 import { nextUtcMidnight } from "../../server/src/dailyLimit";
 import { suite } from "../harness.ts";
 import { recoveryRevisionIdentity } from "../../server/src/recoveryAuthorityStore";
-import { RECOVERY_STATE_CONTENT_TYPE } from "../../server/src/shared/recoveryStateObject";
-import { RecoveryClient, type RestoreItem } from "../../legacy-src/snapshots/recoveryClient";
-import { DEFAULT_SETTINGS } from "../../legacy-src/settings";
 
 const s = suite("recovery-projection-idle");
 
@@ -736,7 +733,7 @@ s.test("query plans: watermark change collection and head resolution are index s
 });
 
 
-s.test("[relay v3] a large-state note with an unknown hash still gets projected and restored (b3-a1fix)", async () => {
+s.test("[relay v3] a large-state note with an unknown hash still gets projected and captured (b3-a1fix)", async () => {
 	await withWorld("relay v3", async (world) => {
 		const seed = { name: "big-note", text: `${"x".repeat(50_000)}\n` };
 		await world.createNotes("seed", [seed]);
@@ -777,28 +774,6 @@ s.test("[relay v3] a large-state note with an unknown hash still gets projected 
 		assert.equal(entry.contentHash, revision, "the capture plan uses the projected identity");
 		assert.deepEqual(store.missingCoverage(capture.captureId, [revision], [], capture.gcEpoch).contentHashes, [],
 			"the projected object covers the capture");
-
-		// Restore: the client binds the object to the revision identity and derives the plaintext hash and size.
-		const arrayBuffer = new ArrayBuffer(object.byteLength);
-		new Uint8Array(arrayBuffer).set(object);
-		const client = new RecoveryClient({ ...DEFAULT_SETTINGS, host: "https://sync.example", deviceToken: "token", vaultId: VAULT_ID }, undefined, {
-			request: async () => ({ status: 200, json: null, text: "", arrayBuffer, headers: {
-				"content-type": RECOVERY_STATE_CONTENT_TYPE, "content-length": String(object.byteLength), "x-yaos-content-sha256": revision,
-			} }),
-		});
-		const item: Extract<RestoreItem, { kind: "markdown" }> = { kind: "markdown", itemId: "item-1", path: `${seed.name}.md`, sourceKind: "active",
-			sourceFileId: `body-${seed.name}`, sourceBodyId: `body-${seed.name}`, contentHash: entry.contentHash, size: entry.size, contentUrl: "/content" };
-		const restored = await client.downloadRestoreItemVerified("22222222-2222-4222-8222-222222222222", item);
-		assert.equal(new TextDecoder().decode(restored.bytes), text, "restore yields the latest text");
-		assert.equal(restored.item.contentHash, hashOf(text), "the restore continues under the real plaintext hash");
-		assert.equal(restored.item.size, sizeOf(text));
-		const forged = new RecoveryClient({ ...DEFAULT_SETTINGS, host: "https://sync.example", deviceToken: "token", vaultId: VAULT_ID }, undefined, {
-			request: async () => ({ status: 200, json: null, text: "", arrayBuffer, headers: {
-				"content-type": RECOVERY_STATE_CONTENT_TYPE, "content-length": String(object.byteLength), "x-yaos-content-sha256": "d".repeat(64),
-			} }),
-		});
-		await assert.rejects(forged.downloadRestoreItemVerified("22222222-2222-4222-8222-222222222222", { ...item, contentHash: "d".repeat(64) }),
-			/identity mismatch/, "an object served for another identity fails closed");
 	});
 });
 

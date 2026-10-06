@@ -1,4 +1,4 @@
-import { SCHEMA_VERSION } from "../../legacy-src/sync/schema.ts";
+import { SCHEMA_VERSION } from "../../server/src/shared/productVersions.ts";
 import { requireLiveIdentity } from "./liveIdentity.ts";
 import { bootstrapFromSql, createBody } from "./schema4Live.ts";
 

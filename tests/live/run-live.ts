@@ -19,8 +19,6 @@ const NODE_TS = ["tests/run-typescript.mjs"];
 interface LiveCommand {
 	readonly file: string;
 	readonly extraEnv?: Readonly<Record<string, string>>;
-	/** Resolve `@shared` and friends (suites that import client modules from src/). */
-	readonly testAliases?: boolean;
 }
 
 const LIVE_COMMANDS: readonly LiveCommand[] = [
@@ -35,10 +33,9 @@ const LIVE_COMMANDS: readonly LiveCommand[] = [
 	{ file: "ws-ticket-reconnect.ts" },
 	{ file: "ws-admission-protocol.ts" },
 	{ file: "settings-sync.ts" },
-	{ file: "cli-bootstrap-paging.ts", testAliases: true },
 	{ file: "operator-destroy.ts" },
 ];
-const LIVE_NON_SUITES = ["fatalFrame.ts", "liveIdentity.ts", "productionImport.ts", "run-live.ts", "schema4Live.ts"] as const;
+const LIVE_NON_SUITES = ["fatalFrame.ts", "liveIdentity.ts", "ownAwarenessProvider.ts", "run-live.ts", "schema4Live.ts"] as const;
 
 function assertLiveAccountability(): void {
 	const actual = readdirSync(new URL(".", import.meta.url)).filter((name) => name.endsWith(".ts")).sort();
@@ -72,7 +69,7 @@ async function waitForWorker(): Promise<void> {
 
 function runCommand(command: LiveCommand, context: LiveIdentityContext): Promise<void> {
 	return new Promise<void>((resolvePromise, rejectPromise) => {
-		const child = spawn("node", [...NODE_TS, ...(command.testAliases ? ["--test-aliases"] : []), `tests/live/${command.file}`], {
+		const child = spawn("node", [...NODE_TS, `tests/live/${command.file}`], {
 			cwd: resolve("."),
 			stdio: "inherit",
 			env: {

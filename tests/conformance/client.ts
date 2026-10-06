@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { randomBytes } from "node:crypto";
 import * as Y from "yjs";
-import { OwnAwarenessProvider as YSyncProvider } from "../../legacy-src/sync/ownAwarenessProvider.ts";
+import { OwnAwarenessProvider as YSyncProvider } from "../live/ownAwarenessProvider.ts";
 import WebSocket from "ws";
 import {
 	PROTOCOL_VERSION,
