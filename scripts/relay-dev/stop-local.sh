@@ -1,11 +1,13 @@
 #!/bin/zsh
 # Stops the local streams relay started by scripts/relay-dev/start-local.sh (state is kept;
 # start-local.sh --fresh wipes it).
+#
+#   scripts/relay-dev/stop-local.sh [--port 8787]
 set -uo pipefail
 LOGS=/Users/kavin/personal/obsidiansync/experiments/logs
-PIDFILE=$LOGS/client-e2e-local.pid
-PORTFILE=$LOGS/client-e2e-local.port
-PORT=$(<$PORTFILE 2>/dev/null || print 8787)
+PORT=8787
+[[ ${1:-} == --port ]] && PORT=$2
+PIDFILE=$LOGS/client-e2e-local-$PORT.pid
 if [[ -f $PIDFILE ]]; then
   PID=$(<$PIDFILE)
   if kill -0 $PID 2>/dev/null; then

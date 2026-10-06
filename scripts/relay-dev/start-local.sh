@@ -4,10 +4,11 @@
 #
 #   scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--var K=V]...
 #
-# Starts in the background (nohup; log at experiments/logs/client-e2e-local-<ts>.log), waits until
+# Starts in the background (nohup; log at experiments/logs/client-e2e-local-<port>-<ts>.log), waits until
 # /api/capabilities advertises streams=1, then prints the base URL as the last stdout line.
-# State persists in experiments/logs/client-e2e-local-state; --fresh wipes it (a new, unclaimed server).
-# Stop with scripts/relay-dev/stop-local.sh.
+# State persists in experiments/logs/client-e2e-local-<port>-state; --fresh wipes it (a new, unclaimed server).
+# State, pid and port files are per port, so worktrees can run relays side by side on different ports.
+# Stop with scripts/relay-dev/stop-local.sh [--port <port>].
 set -euo pipefail
 EXP_ROOT=/Users/kavin/personal/obsidiansync/experiments
 WT=${0:A:h:h:h}
@@ -23,14 +24,13 @@ while (( $# )); do
   esac
 done
 LOGS=$EXP_ROOT/logs
-STATE_DIR=$LOGS/client-e2e-local-state
-PIDFILE=$LOGS/client-e2e-local.pid
-PORTFILE=$LOGS/client-e2e-local.port
-LOG=$LOGS/client-e2e-local-$(date -u +%Y%m%dT%H%M%SZ).log
+STATE_DIR=$LOGS/client-e2e-local-$PORT-state
+PIDFILE=$LOGS/client-e2e-local-$PORT.pid
+LOG=$LOGS/client-e2e-local-$PORT-$(date -u +%Y%m%dT%H%M%SZ).log
 TOML=$WT/server/wrangler.relay2-client-e2e-local.toml
 mkdir -p $LOGS
 if [[ -f $PIDFILE ]] && kill -0 $(<$PIDFILE) 2>/dev/null; then
-  echo "already running (pid $(<$PIDFILE), port $(<$PORTFILE 2>/dev/null)); run stop-local.sh first" >&2
+  echo "already running on port $PORT (pid $(<$PIDFILE)); run stop-local.sh --port $PORT first" >&2
   exit 1
 fi
 (( FRESH )) && rm -rf $STATE_DIR
@@ -41,7 +41,6 @@ cd $WT/server
 nohup ./node_modules/.bin/wrangler dev -c ${TOML:t} --ip 127.0.0.1 --port $PORT --persist-to $STATE_DIR \
   > $LOG 2>&1 < /dev/null &
 print $! > $PIDFILE
-print $PORT > $PORTFILE
 URL=http://127.0.0.1:$PORT
 for i in {1..180}; do
   if curl -sf "$URL/api/capabilities" 2>/dev/null | grep -q '"streams":1'; then
