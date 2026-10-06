@@ -1,0 +1,31 @@
+src/engine/compose/bindTarget.test.ts
+  s_71e670913dcd74::t_ed7199a4f4df66 1-47
+src/engine/compose/runtimeOps.ts
+  s_4c8271111ae3a8::t_901e22a4031ea8 8,21-22,47-67
+src/engine/compose/vaultRuntime.ts
+  s_4c8271111ae3a8::t_237fadc8e16691 404-405
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2344da2afcf104b33563ff3ae51c53590caff060",
+  "prompts": {},
+  "sessions": {
+    "s_4c8271111ae3a8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a00d4c492b57e176d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_71e670913dcd74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a293b6665872fe812",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
