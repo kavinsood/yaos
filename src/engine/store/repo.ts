@@ -390,10 +390,12 @@ export class Repo {
 					} else {
 						await putQuarantine(tx, r, it.rec);
 					}
-					if (deviceId !== self) {
+					// An own row this store never receipted (an earlier store, lost with IDB) is remote here: its text
+					// is not known to be on disk.
+					if (deviceId !== self || seq > r.lastOwnSeq) {
 						r.bodyVersion = { remoteSeq: Math.max(r.bodyVersion.remoteSeq, seq), localOrder: r.bodyVersion.localOrder };
-						if (seq > r.lastOwnSeq && duty.delete(stream)) dutyChanged = true;
 					}
+					if (deviceId !== self && seq > r.lastOwnSeq && duty.delete(stream)) dutyChanged = true;
 					advance(r, seq, vAfter);
 					r.priority = this.priorityFn(r);
 					if (it.settleAdoptable) {
@@ -481,7 +483,8 @@ export class Repo {
 				}
 				for (const row of input.rows) {
 					if (await putTail(tx, r, row)) tailPut.push(row);
-					if (row.deviceId !== self) r.bodyVersion = { remoteSeq: Math.max(r.bodyVersion.remoteSeq, row.seq), localOrder: r.bodyVersion.localOrder };
+					// Own rows reach a page only without an outbox record; past lastOwnSeq they are an earlier store's (tLive).
+					if (row.deviceId !== self || row.seq > r.lastOwnSeq) r.bodyVersion = { remoteSeq: Math.max(r.bodyVersion.remoteSeq, row.seq), localOrder: r.bodyVersion.localOrder };
 					if (row.seq > r.remoteCheckpointCoversSeq && row.seq > r.appliedSeq) {
 						r.rowsSinceRemoteCheckpoint++;
 						r.bytesSinceRemoteCheckpoint += row.content.length;
@@ -651,14 +654,26 @@ export class Repo {
 	}
 
 	/** Recovery (DESIGN §i.5): import mirrored outbox frames (sent -> pending), outboxOrder.next = max + 1. */
-	tImportOutbox(records: readonly OutboxRecord[]): Promise<void> {
+	/**
+	 * Mirror recovery into a fresh DB. Imported body / canvas frames move their stream's bodyVersion.localOrder
+	 * like T_edit: the imported synced records carry no localOrder, and nothing says the frames' text (editor
+	 * keystrokes never saved, merges whose write died) is on disk, so Rc must hold until a merge settles it.
+	 */
+	tImportOutbox(records: readonly OutboxRecord[], nowMs: number): Promise<void> {
 		return this.serial("tImportOutbox", async () => {
-			const next = await this.db.tx([STORE.outbox, STORE.meta], "readwrite", async (tx) => {
+			const touched = new Map<StreamName, StreamRecord>();
+			const next = await this.db.tx([STORE.outbox, STORE.meta, STORE.streams], "readwrite", async (tx) => {
 				let max = 0;
 				for (const r of records) {
 					tx.put(STORE.outbox, r.state === "sent" ? { ...r, state: "pending" } : r);
 					max = Math.max(max, r.order);
+					const cls = streamClass(r.stream);
+					if (cls !== "body" && cls !== "canvas") continue;
+					const st = touched.get(r.stream) ?? (await tx.get(STORE.streams, r.stream)) ?? newStreamRecord(r.stream, nowMs);
+					if (r.order <= st.bodyVersion.localOrder) continue;
+					touched.set(r.stream, { ...st, bodyVersion: { remoteSeq: st.bodyVersion.remoteSeq, localOrder: r.order } });
 				}
+				for (const st of touched.values()) tx.put(STORE.streams, st);
 				const meta = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
 				const next = Math.max(meta.next, max + 1);
 				tx.put(STORE.meta, { key: "outboxOrder", next });
@@ -667,6 +682,7 @@ export class Repo {
 				return next;
 			});
 			this.outboxNext = next;
+			for (const st of touched.values()) this.cache.set(st.stream, st);
 		});
 	}
 

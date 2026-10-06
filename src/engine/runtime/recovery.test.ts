@@ -60,6 +60,8 @@ for (const committed of [false, true]) {
 			for (const f of frames) assert.equal(counts.get(f), 1, `frame ${f} committed exactly once`);
 			assert.equal(a2.c.outbox.size, 0);
 			assert.equal(a2.c.repo.cursor.vaultSeq, relay.head());
+			// The imported synced records carry no localOrder: the imported frames' text is not known to be on disk.
+			assert.ok((a2.bodyInfo(id)?.version.localOrder ?? 0) > 0, "imported body frames move localOrder");
 			await a2.editDoc(id, (t) => t.insert(0, "A2;"));
 			await converged([a2, b]);
 			assert.equal(await b.docText(id), "A2;base;lost1;");
@@ -69,6 +71,31 @@ for (const committed of [false, true]) {
 		}
 	});
 }
+
+/** Sim heavy seed 150: keystrokes receipted before the IDB loss, never saved to disk, read back as "own". */
+test("IDB lost without a mirror: this device's earlier rows read back are remote (remoteSeq moves)", async () => {
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	let a2: LogEngine | null = null;
+	try {
+		await live(a);
+		const id = await a.createDoc("o.md", "a1;");
+		await a.editDoc(id, (t) => t.insert(t.length, "a2;"));
+		await until(() => a.c.outbox.size === 0, 2_000, "receipted");
+		assert.equal(a.bodyInfo(id)?.version.remoteSeq, 0, "own receipted rows are local in their store");
+		await a.stop();
+		a2 = (await startTestEngine({ relay, deviceId: "dev-a" })).engine; // fresh DB, no side files
+		await live(a2);
+		assert.equal(await a2.docText(id), "a1;a2;");
+		await until(() => (a2!.bodyInfo(id)?.version.remoteSeq ?? 0) > 0, 2_000, "remoteSeq moved");
+		const before = a2.bodyInfo(id)!.version;
+		await a2.editDoc(id, (t) => t.insert(0, "b;"));
+		await until(() => a2!.c.outbox.size === 0, 2_000, "receipted again");
+		assert.equal(a2.bodyInfo(id)!.version.remoteSeq, before.remoteSeq, "rows this store receipted stay local");
+	} finally {
+		await a2?.stop();
+	}
+});
 
 test("live overflow: queue over liveQueueMaxRows drops cold payloads -> stale -> read later; converges", async () => {
 	const relay = new SimRelay();
