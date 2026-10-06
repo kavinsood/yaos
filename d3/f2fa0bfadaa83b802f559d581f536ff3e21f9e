@@ -1,0 +1,21 @@
+src/core/plan/planner.test.ts
+  s_a3bb6f72388aba::t_a296a1b1a49016 180-204
+src/core/plan/planner.ts
+  s_a3bb6f72388aba::t_1a2a9c376109dc 263-284,523-524
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d3f2fa0bfadaa83b802f559d581f536ff3e21f9e",
+  "prompts": {},
+  "sessions": {
+    "s_a3bb6f72388aba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a97fe38a693c58afa",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
