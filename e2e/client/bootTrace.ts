@@ -10,12 +10,14 @@ import type { WebSocketCtor, WebSocketLike } from "../../src/engine/adapters/wsR
 
 export interface HttpEvent { route: string; startMs: number; ms: number; status: number; bytes: number; streams: number }
 export interface TxEvent { stores: string; mode: string; startMs: number; ms: number }
+/** One streams-socket frame: direction, kind (JSON `type`, or "bin:<first byte>"), size. Never the payload. */
+export interface WsEvent { t: number; dir: "out" | "in"; kind: string; bytes: number }
 export interface Sample { t: number; phase: string | null; reads: number; feeding: boolean; writes: number; readsDone: number; feedPages: number }
 
 function routeOf(url: string): { route: string; streams: number } {
 	const u = new URL(url);
 	const p = u.pathname.replace(/^\/vault\/[^/]+/, "");
-	const streams = u.searchParams.getAll("stream").length;
+	const streams = u.searchParams.getAll("stream").length + u.searchParams.getAll("r").length;
 	return { route: p.startsWith("/blobs") ? "/blobs" : p, streams };
 }
 
@@ -25,6 +27,9 @@ export class BootTrace {
 	readonly tx: TxEvent[] = [];
 	readonly samples: Sample[] = [];
 	readonly ws: { ctorMs: number; openMs: number | null; readyMs: number | null }[] = [];
+	/** Socket frames, recorded only while `frames` is on (edit traces). */
+	readonly wsFrames: WsEvent[] = [];
+	frames = false;
 	private timer: ReturnType<typeof setInterval> | null = null;
 
 	now(): number {
@@ -37,6 +42,22 @@ export class BootTrace {
 		this.tx.length = 0;
 		this.samples.length = 0;
 		this.ws.length = 0;
+		this.wsFrames.length = 0;
+	}
+
+	frame(dir: "out" | "in", data: unknown): void {
+		if (!this.frames) return;
+		let kind = "?";
+		let bytes = 0;
+		if (typeof data === "string") {
+			bytes = data.length;
+			kind = /"type"\s*:\s*"([A-Za-z_]+)"/.exec(data.slice(0, 200))?.[1] ?? "text";
+		} else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+			const u = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+			bytes = u.byteLength;
+			kind = `bin:${u[0] ?? "-"}`;
+		}
+		this.wsFrames.push({ t: this.now(), dir, kind, bytes });
 	}
 
 	readonly fetch: typeof fetch = async (input, init) => {
@@ -60,7 +81,13 @@ export class BootTrace {
 				ws.addEventListener("open", () => { rec.openMs = trace.now(); });
 				ws.addEventListener("message", (e: MessageEvent) => {
 					if (rec.readyMs === null && typeof e.data === "string" && e.data.includes("VAULT_READY")) rec.readyMs = trace.now();
+					trace.frame("in", e.data);
 				});
+				const send = ws.send.bind(ws);
+				ws.send = (data: Parameters<WebSocketLike["send"]>[0]) => {
+					trace.frame("out", data);
+					send(data);
+				};
 				return ws;
 			}
 		} as unknown as WebSocketCtor;

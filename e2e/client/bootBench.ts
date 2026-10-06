@@ -32,7 +32,7 @@ const r1 = (v: number) => Math.round(v * 10) / 10;
 const median = (v: number[]) => (v.length ? [...v].sort((a, b) => a - b)[Math.floor((v.length - 1) / 2)]! : 0);
 
 /** Median ms of timed relay requests with a device credential (the credential stays in this function). */
-async function relayRtt(vault: OnboardedVault): Promise<Record<string, number>> {
+async function relayRtt(vault: OnboardedVault): Promise<{ workerMs: number; relayRequestMs: number }> {
 	const dev = vault.devices[0]!;
 	const base = `${HOST}/vault/${encodeURIComponent(vault.vaultId)}`;
 	const time = async (url: string, auth: boolean) => {
@@ -64,6 +64,11 @@ function analyze(tr: BootTrace, rtt: number, filesMs: number, cleanMs: number) {
 	const feed = by("/streams/feed");
 	const ws = tr.ws[0];
 	const maxReads = Math.max(0, ...tr.samples.map((s) => s.reads));
+	/** Most read requests on the wire at once (overlapping HTTP intervals); `maxReads` counts streams being read. */
+	const edges = reads.flatMap((e) => [[e.startMs, 1], [e.startMs + e.ms, -1]] as const).sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+	let open = 0;
+	let maxRequests = 0;
+	for (const [, d] of edges) maxRequests = Math.max(maxRequests, (open += d));
 	const writes = tr.samples.filter((s, i) => i > 0 && s.writes > tr.samples[i - 1]!.writes);
 	const live = tr.samples.find((s) => s.phase === "live");
 	const txByStores: Record<string, { n: number; ms: number }> = {};
@@ -82,7 +87,7 @@ function analyze(tr: BootTrace, rtt: number, filesMs: number, cleanMs: number) {
 		reads: {
 			n: reads.length, streamsPerRequest: reads.length ? r1(reads.reduce((s, e) => s + Math.max(1, e.streams), 0) / reads.length) : 0,
 			p50Ms: r1(median(reads.map((e) => e.ms))), maxMs: r1(Math.max(0, ...reads.map((e) => e.ms))),
-			bytes: reads.reduce((s, e) => s + e.bytes, 0), maxInFlight: maxReads, span: readSpan,
+			bytes: reads.reduce((s, e) => s + e.bytes, 0), maxRequestsInFlight: maxRequests, maxStreamsInFlight: maxReads, span: readSpan,
 			spanRtts: readSpan ? rt(readSpan.last - readSpan.first) : null,
 		},
 		checkpoints: by("/streams/checkpoint").length,
