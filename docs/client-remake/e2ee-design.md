@@ -139,3 +139,181 @@ What the design relies on, and how sure we are. Spike numbers are on an Apple M4
 | `crypto.subtle` requires a secure context; custom schemes count as secure in WebKit; a worker inherits it | **[S]** [WebCrypto] §10; WebKit `SecurityOrigin.cpp` L101-102, `WorkerGlobalScope.cpp` L204-210 | Obsidian iOS origin `capacitor://localhost` **[U]** |
 | No streaming AEAD in WebCrypto | **[S]** [w3c-webcrypto-73] | Blobs ≤ 10 MiB are sealed in one call (§10.3) |
 | Obsidian mobile WebViews and desktop Electron behave like the above | **[U]** | §23.3 lists the device runs |
+
+## 4. Cipher
+
+### 4.1 Suite 1 = AES-256-GCM (WebCrypto)
+
+- `CryptoSuite.aes256gcm = 1`. Id 1 was "reserved XChaCha20-Poly1305" and never shipped, so it is reassigned.
+- Sealed bytes: `nonce(12) ‖ ciphertext ‖ tag(16)`, i.e. 28 B of overhead.
+- `tagLength` MUST be passed explicitly as 128. Shorter tags are on the way out of SP 800-38D ([NIST-GCM-rev]).
+- The nonce MUST be 12 bytes from `crypto.getRandomValues`. Both `seal` and `open` MUST check `nonce.length === 12`
+  before calling WebCrypto: WKWebView accepted a 0-byte IV **[M]**, and [WebCrypto] §29.4 sets no minimum.
+- NEVER use counter or deterministic nonces. Several devices seal under the same key with no coordination.
+- NEVER trial-decrypt. The key comes from the header's `keyEpoch` (§5). A missing key is `unknown-key`.
+- Alternative: XChaCha20-Poly1305 in pure JS (@noble/ciphers 2.4.0). Rejected because:
+  - it is 8–13× slower at 1 MiB **[M]** and adds 4.9 KB gzip [noble];
+  - the key sits in the JS heap;
+  - the Cure53 audit covers 0.6.0, not 2.x [Cure53-NBL];
+  - its IRTF draft is dead [XChaCha-03].
+  
+  Its one advantage, a large nonce space, is covered by rolling epochs (§4.3).
+- Alternative: libsodium.js. It always ships WASM (~306 KB gzip), which the client forbids.
+
+### 4.2 Limits and the roll budget
+
+- **Random-nonce collisions.** NIST requires the IV-collision probability to stay ≤ 2^-32 and caps random-IV use at
+  2^32 invocations per key ([NIST-GCM] §8, §8.3). The CFRG limits assume nonces never repeat and do not cover random
+  explicit nonces ([CFRG-limits] §5.1, §7.1).
+  - [D] For q random 96-bit nonces under one key, P(collision) ≈ q²/2^97. q = 2^23 gives 2^-51.
+  - The same figure appears in [noble] README L366-388.
+- **Confidentiality.** [CFRG-limits] §6.2.1 gives `CA ≤ (s + q + 1)² / 2^129`, with s counted in 16-byte blocks.
+  - [D] Worst case: 2^23 frames, every one a full 1 MiB (2^16 blocks), so s ≤ 2^39. CA ≤ 2^78/2^129 = 2^-51.
+- **Integrity.** [CFRG-limits] §6.2.2 gives `IA ≤ 2·v·(L+1)/2^128`.
+  - [D] For L = 2^16, one forgery attempt succeeds with probability 2^-111. 2^40 attempts give 2^-71.
+- **Message length.** At most 2^39−256 **bits** ([NIST-GCM] §5.2.1.1). [WebCrypto] §29.4.1 says "bytes"; the
+  spec is inconsistent. Irrelevant here, since nothing exceeds 10 MiB.
+- **Rule: roll at 2^23.** A device starts a roll (§11.4) when either:
+  - `headSeq − firstSeq(e) ≥ 2^23`, where `firstSeq(e)` is the seq of epoch e's winning `k` record; or
+  - its own seal count under e reaches 2^22. This count is kept lazily in IDB meta and covers re-seals that
+    never commit.
+
+  Each subkey (kFrame, kCkpt, kBlob, kWrap) has its own budget. All of them see at most as many seals as frames
+  committed (one per frame; at most one checkpoint or blob per frame), so one trigger covers all of them.
+- [D] At the free plan's 100k rows/day, 2^23 frames take ≥ 84 days of writing at the limit. In practice a roll
+  happens once in years.
+
+### 4.3 Key commitment
+
+AES-GCM is not key-committing [LGR21] [DGRW18] [ADGKLS22]; see also [RFC9771] §4.3.3. In a single-user vault every
+key is honestly generated and none is known to the adversary, so invisible-salamander attacks do not apply. The
+KCV (§5.2) commits keyring records to their key. Shared vaults MUST add a commitment block per envelope (§2.4).
+
+## 5. Key hierarchy
+
+### 5.1 Keys
+
+```
+K_e        32 random bytes per key epoch, e ≥ 1           (stored: SecretStorage §6; travels: QR §12, k wraps §11)
+ └ HKDF-SHA-256(ikm = K_e, salt = "yaos-hkdf-v1", info = I(purpose, e)), every output non-extractable:
+     kFrame   AES-GCM-256   frames                         purpose "frame"
+     kCkpt    AES-GCM-256   checkpoints                    purpose "checkpoint"
+     kBlob    AES-GCM-256   blob bytes                     purpose "blob"
+     kWrap    AES-GCM-256   prevWrap / nextWrap in k       purpose "wrap"
+     kKcv     HMAC-SHA-256  key check value                purpose "kcv"
+ from K_1 only (vault lifetime, never rotated):
+     kAddr    HMAC-SHA-256  blob addresses, x: names       purpose "addr"
+     kDiag    HMAC-SHA-256  diagnostics hashes             purpose "diag"
+RK         35-byte recovery key (§13)
+ └ KEK_RK = HKDF-SHA-256(ikm = RK[0..32], salt = "yaos-hkdf-v1", info = I("recovery-kek", 0))   AES-GCM-256
+
+I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 ‖ varuint e
+```
+
+- HKDF is from [RFC5869]. The base key is imported with `extractable:false` ([WebCrypto] §33.4.2), and derived keys
+  take `extractable:false` explicitly (§14.3.7).
+- Subkeys are derived **lazily** per epoch on first use. Startup derives the newest epoch's set plus kAddr and
+  kDiag: 7 `deriveKey` calls.
+- **Why kAddr and kDiag live for the whole vault.**
+  - ns, refs and snapshots carry only the plaintext sha256, and the address must be recomputable from it in any
+    epoch. Rotating kAddr would change every address, so blobs would need re-uploading (decision D4).
+  - Diagnostics from different epochs stay comparable.
+- **No per-stream or per-doc subkeys.** The AAD already separates streams. Per-doc keys would cost one `deriveKey`
+  per stream at bootstrap (thousands) for no gain against this threat model.
+- Alternative: one key for everything. Rejected: separate subkeys give separate nonce budgets, and
+  KCV/addresses/diagnostics stay independent of the encryption key.
+
+### 5.2 Key check value (KCV)
+
+`kcv(e) = HMAC-SHA-256(kKcv_e, "yaos/v1/kcv" ‖ 0x00 ‖ vaultId ‖ 0x00 ‖ varuint e)[0..16]`
+
+- It is published in each `k` record (§11). A key whose KCV matches the winning record for its epoch is
+  **verified**.
+- Under a verified key, `auth-failed` is deterministic (§9.2). Under an unverified key it is reader-dependent.
+- It is safe to publish: it is a PRF output under a key derived from K_e, and it reveals nothing about K_e.
+
+## 6. Key storage
+
+### 6.1 Rules
+
+- **Store.** Epoch keys MUST be stored in Obsidian SecretStorage (`app.secretStorage`, §3), as **one secret per
+  vault**.
+  - Id: `"yaos-" + hex(sha256(utf8(vaultId)))[0..32]` (ids are lowercase alphanumeric plus dashes). The vaultId is
+    hashed because the mobile store is shared across vaults (§3).
+  - Value: JSON `{ "v": 1, "vaultId", "suite": 1, "keys": [{ "e", "k": b64url(K_e) }], "records": [b64url(k record)] }`.
+  - The records are kept so they can be re-published after a reset or restore (§11.5). They are not secret.
+  - Value size limits **[U]**.
+- **NEVER persist a key in IndexedDB.** Chromium writes stored CryptoKeys' raw bytes in plaintext **[M]**. WebKit
+  adds keychain IPC, lock-state failures and an index bug (§3).
+- **NEVER persist a key in `data.json`** (`<configDir>/plugins/yaos/data.json`). Folder sync and backup tools copy
+  the config dir.
+- **NEVER put keys or RK in** logs, `StatusSnapshot`, `DiagnosticsBundle`, `Error` messages, notices or the URL bar.
+  Protocol fields that carry keys are marked SECRET, like `relay.credential` (`src/protocol/messages.ts:56`).
+- **The suite pin** (`e2ee: { suite: 1 }`, not secret) lives in `data.json` next to the device token. If the pin
+  says 1 and the secret is missing, the device enters phase `key-missing`: re-key by QR or RK.
+- **Startup.** `getSecret` may return null before the store has loaded. Wait for SecretStorage's `changed` event
+  for up to 5 s before deciding the key is missing. The store loads everything at app start, then fires `changed`
+  ([S] asar).
+- **Linux desktop without an OS keyring.** SecretStorage stores plaintext and Obsidian shows
+  `msgSecretsNotEncrypted` ([S] asar). YAOS adds a persistent status notice, and the vault-folder trust level
+  applies.
+- **Forget keys** (leave the vault or disable the device) writes `""`. There is no delete API. Whether `""` is
+  accepted is **[U]**.
+- **Trust.** Any plugin in the vault can read any secret. Non-extractable CryptoKeys are hygiene, not a boundary:
+  they keep keys out of accidental exports and structured clones. Plugins already have full access (§2.1).
+
+### 6.2 What survives what
+
+| Loss | Keys | Effect |
+|---|---|---|
+| IndexedDB (cleared, evicted, corrupted) | Survive in SecretStorage | Normal re-bootstrap from the relay. frameNo restarts above the folded right edge (§8.2). The outbox mirror re-opens with the keys. |
+| SecretStorage (app reinstall, localStorage cleared) | Lost on this device | `key-missing`, read-only. Re-key by QR from another device or by RK. |
+| `data.json` | Survive, but are orphaned | Re-enroll: new device token and new deviceId. Re-key by QR or RK. |
+| Every device | Gone | RK path (§13.3). Without the RK the data is unrecoverable, by design. |
+
+### 6.3 Worker hand-off
+
+1. Main reads the secret and posts the raw keys **once**, in `init.crypto` (§18.4), with the buffers in the
+   transfer list. Main keeps no copy and re-reads SecretStorage when it needs one (QR display, §12).
+2. The worker imports each K_e as an HKDF base key with `extractable:false`, derives subkeys, and zero-fills the
+   buffers. This is best-effort: JS cannot guarantee erasure.
+3. New keys (adopted by roll, entered by QR or RK) are produced in the worker and posted back once in
+   `keyringChanged` (SECRET). Main persists them to SecretStorage.
+4. Inline mode runs the same code on main.
+
+### 6.4 Side files and local state (DESIGN §e.4)
+
+| File | Content under suite 1 | Verdict |
+|---|---|---|
+| Outbox mirror | `sealed` bytes, i.e. ciphertext. Re-opened with keys by `recoverFromMirror` (`src/engine/runtime/mirrorIo.ts:162`) | Fine |
+| Synced mirror | Plaintext docId, path, contentHash, seqs | Accepted: the vault folder holds the same plaintext |
+| Local snapshots (zip) | Plaintext | Accepted (local). Uploads go through `sealBlob` (`src/engine/snapshots/snapshotJob.ts:129-130`) |
+| IndexedDB `tail`, `snapshots`, `baseText`, ... | Plaintext (T_receipt stores outbox content, DESIGN §e.2) | Accepted (non-goal: local at-rest encryption) |
+| Diagnostics bundle | Hashes MUST be `HMAC(kDiag, ·)`, not sha256 (`src/engine/compose/runtimeOps.ts:150-153`; DESIGN §j.7) | Change in WP-E2 |
+
+## 7. Envelope v2, AAD and padding
+
+### 7.1 Layout
+
+```
+outer (plaintext)
+  u8      formatVersion   1 (see below)
+  u8      cryptoSuite     0 = none; 1 = aes256gcm
+  varuint keyEpoch        0 iff suite = 0; ≥ 1 for suite 1
+  bytes   sealed          suite 0: inner verbatim
+                          suite 1: nonce(12) ‖ AES-GCM(kFrame | kCkpt, inner ‖ pad, AAD §7.2) ‖ tag(16)
+inner
+  u8      kind            EnvelopeKindCode
+  varuint authorNsSeq
+  varuint flags           initial | adopted | deflate | fromDisk
+  varuint frameNo         NEW. ns/cfg frames: per-(deviceId, stream) counter ≥ 1 (§8.2); 0 for every other kind
+  bytes   content         rest; deflate-raw iff flags & deflate (unchanged)
+pad (suite 1 only, inside the AEAD; added and stripped by the CryptoPort)
+  0x80 ‖ 0x00*            to padmeLen(len(inner) + 1)                                   (ISO/IEC 7816-4 style)
+```
+
+- **formatVersion.**
+  - client-remake has not shipped, so the change lands **in place** as formatVersion 1.
+  - If any build that writes the old layout reaches users first, it MUST ship as formatVersion 2 instead. Old
+    rows then stay `unsupported-version` for new readers (and vice versa), which is reader-dependent (§9).
+- **Deflate** stays before padding (§2.2). The padded length hides most of the compression ratio.
