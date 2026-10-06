@@ -28,7 +28,7 @@ import { canvasLogicalHash, canvasToMergeText, type CanvasRanked } from "../../c
 import { isShrinkingOverwrite } from "../../core/plan/brake";
 import type { IntentRecord } from "../store/schema";
 import { applyCanvas, emptyCanvas, projectCanvasBytes, readCanvas, visibleCanvas } from "./canvasDoc";
-import { isEmptyCanvas, mergeCanvasSides, parseDiskCanvas, parseMergeText, type CanvasMergeOutput } from "./canvasMerge";
+import { isEmptyCanvas, mergeCanvasSides, parseDiskCanvas, parseMergeText, rankDisk, type CanvasMergeOutput } from "./canvasMerge";
 import { MAX_CAS_ATTEMPTS, overwriteAllowed, writeConflictCopy, type ReconcileOp } from "./contentSteps";
 import type { BodyHandle } from "./deps";
 import { writeOk, type Env, type JobOutcome } from "./diskJobs";
@@ -71,7 +71,8 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		const crdt = projectCanvasBytes(h.doc);
 		if (!crdt.ok) return invalid(env, docId, op.path, `crdt: ${crdt.reason}`, `crdt:${h.version().remoteSeq}`);
 		const token = canvasToMergeText(crdt.ranked);
-		const base = storedBase ?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : null);
+		// No stored base: a side still at the synced content is the base (see mergeJob).
+		const base = storedBase ?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : !s ? null : diskHash === s.contentHash ? rankDisk(disk.data, null, crdt.ranked) : crdt.hash === s.contentHash ? crdt.ranked : null);
 		await ctx.deps.clock.yieldNow();
 		const m = mergeCanvasSides({ base, disk: disk.data, crdt, limits: ctx.mergeLimits });
 		if (m.projection.hash !== diskHash

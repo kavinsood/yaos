@@ -76,8 +76,12 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	const F = exactFingerprint(rd.bytes);
 	const s = ctx.synced(docId);
 	// §c.12: after an epoch migration a doc with no synced record merges against the old epoch's base at its path.
-	const storedBase = op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : !s ? ctx.deps.pathBase?.(ctx.pk(op.path)) ?? null : null;
+	const pathBase = op.pathBase || !s ? ctx.deps.pathBase?.(ctx.pk(op.path)) ?? null : null;
+	const storedBase = op.pathBase ? pathBase : op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : pathBase;
+	// The synced-side fallback below needs a record describing this doc's last sync (not a rebound loser's).
+	const fallback = op.pathBase ? undefined : s;
 	const ytext = h.doc.getText("text");
+	const diskHash = markdownContentHash(D);
 
 	let result: MergeResult | null = null;
 	let crdt0 = "";
@@ -85,7 +89,9 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	for (let attempt = 0; ; attempt++) {
 		if (attempt >= MAX_CAS_ATTEMPTS) return "fail"; // remote kept moving: re-plan
 		crdt0 = ytext.toString();
-		const base = storedBase ?? (crdt0 === "" ? "" : null);
+		// No stored base (mirror recovery, too large to keep): a side still at the synced content is the base,
+		// so a one-sided change applies as one instead of a no-base conflict copy.
+		const base = storedBase ?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : markdownContentHash(crdt0) === fallback.contentHash ? crdt0 : null);
 		await ctx.deps.clock.yieldNow();
 		const res = merge({ base, disk: D, crdt: crdt0, limits: ctx.mergeLimits });
 		const M = res.kind === "identical" ? D : res.text;
