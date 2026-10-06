@@ -3,7 +3,7 @@
  * fold as committed. Until then the doc is `pendingLocal` and the planner pins
  * it. One T_synced commit per batch of fold events.
  *
- *   create applied     -> nsTouchSeq = seq (blob: blobRev = entry.blob.rev);
+ *   create applied     -> nsTouchSeq = seq (blob: blobRev = seq);
  *                         a blob doc without S yet gets one from L (pushBlob
  *                         writes it after submit otherwise)
  *   create suffixed    -> S keeps the requested path and nsTouchSeq, so the next
@@ -11,9 +11,14 @@
  *                         collapses an identical loser); blob: blobRev
  *   rename applied     -> nsTouchSeq = seq; suffixed -> S.path = requested path
  *   restore revived    -> path = requested path, nsTouchSeq = seq
- *   setBlob applied    -> contentHash = op.hash, blobRev = entry.blob.rev, stat +
+ *   setBlob applied    -> contentHash = op.hash, blobRev = seq, stat +
  *                         fingerprint from L when L holds that hash
  *   anything else      -> no change (the next plan re-derives)
+ *
+ * The fold stamps a blob's rev with the seq of the frame that set it, so the
+ * rev comes from the event's own seq. Never from `entry`: that is the committed
+ * state after the whole fold batch, which may already hold a later remote
+ * setBlob (own hash + remote rev would read as "in sync" and hide the change).
  */
 
 import type { SyncedEntry } from "../../core/types";
@@ -25,13 +30,13 @@ export async function applyOwnFold(ctx: Ctx, events: readonly OwnFoldEvent[]): P
 	const next = new Map<string, SyncedEntry>();
 	const get = (docId: string): SyncedEntry | undefined => next.get(docId) ?? ctx.synced(docId as SyncedEntry["docId"]);
 	for (const ev of events) {
-		const { op, seq, outcome, entry } = ev;
+		const { op, seq, outcome } = ev;
 		if (op.t === "upgradeRules") continue;
 		const s = get(op.docId);
 		switch (op.t) {
 			case "create": {
 				if (outcome.kind !== "applied" && outcome.kind !== "suffixed") break;
-				const blobRev = op.kind === "blob" ? entry?.blob?.rev ?? 0 : 0;
+				const blobRev = op.kind === "blob" ? seq : 0;
 				if (s) {
 					next.set(op.docId, outcome.kind === "applied" ? { ...s, nsTouchSeq: seq, blobRev: op.kind === "blob" ? blobRev : s.blobRev } : { ...s, blobRev: op.kind === "blob" ? blobRev : s.blobRev });
 					break;
@@ -58,7 +63,7 @@ export async function applyOwnFold(ctx: Ctx, events: readonly OwnFoldEvent[]): P
 				if (!s || outcome.kind !== "applied") break;
 				const l = ctx.localAt(s.path);
 				const stat = l && l.hash === op.hash && l.fingerprint !== null ? { size: l.size, mtimeMs: l.mtimeMs, fingerprint: l.fingerprint } : {};
-				next.set(op.docId, { ...s, ...stat, contentHash: op.hash, blobRev: entry?.blob?.rev ?? s.blobRev });
+				next.set(op.docId, { ...s, ...stat, contentHash: op.hash, blobRev: seq });
 				break;
 			}
 			case "delete":

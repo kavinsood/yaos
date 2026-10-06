@@ -150,3 +150,27 @@ test("excluded and config paths are never synced", async () => {
 	assert.ok(w.log.liveByPath(P("ok.md")));
 	assert.equal(w.log.liveByPath(P("private/s.md")), undefined);
 });
+
+test("blob S1: an own setBlob folding in one batch with a later remote setBlob keeps its own rev, so the remote bytes still land", async () => {
+	const w = new World();
+	w.vault.userWrite("m.png", bytes(1));
+	await w.boot();
+	await w.sync();
+	const id = w.log.liveByPath(P("m.png"))!;
+	const mine = bytes(2, 2);
+	const theirs = bytes(3, 3, 3);
+	w.vault.userWrite("m.png", mine);
+	const hook = w.log.onOwnFold!;
+	w.log.onOwnFold = async (events) => {
+		// Catch-up folds a remote setBlob on top in the same batch: the committed entry the bridge reports is theirs.
+		w.blobs!.put(theirs);
+		w.log.remoteSetBlob(id, theirs);
+		await hook(events.map((e) => ({ ...e, entry: w.log.entry(id) })));
+	};
+	await w.sync();
+	w.log.onOwnFold = hook;
+	await w.sync();
+	assert.deepEqual(w.vault.bytesOf("m.png"), theirs);
+	assert.equal(w.synced(id)!.contentHash, sha256Hex(theirs));
+	assert.equal(w.synced(id)!.blobRev, w.log.entry(id)!.blob!.rev);
+});
