@@ -1,0 +1,47 @@
+docs/server-rewrite/DECISIONS.md
+  s_ed451e485d98d2::t_197ec1db2a3c3d 4-5,21-24,35-36,48-49,51,53-54,56,60,70-72,74,90-95,113,116-126,131-132,141-142,146-148,150-151,154-160,163,173-175,177-193,198,202-255,266-269,301-302,305,307-308,312-313,324-325,328-330,335-338,341,353-355,371-373,375,378-379,386-388,391,433-435,445,459,464-465,478-480,485,491-495,499-503,505-508,510-544,546,549-556,561-592,599-602
+e2e/conformance/README.md
+  s_3bea9f4c72a663::t_bec501c0eb0427 19-20,53,55-60,65-67,72,89-97,102
+e2e/conformance/lib/rawsocket.ts
+  s_8bc9bf3abe4a95::t_63b09d75dd7ef7 1-272
+e2e/conformance/run.ts
+  s_3bea9f4c72a663::t_9f3d44d3315e96 29-30,50,55-59
+e2e/conformance/tests/flags.ts
+  s_ed451e485d98d2::t_70da84baf66014 1-223
+e2e/conformance/tests/onboarding.ts
+  s_ed451e485d98d2::t_fabdab348b4ecc 79-84
+e2e/conformance/tests/operator.ts
+  s_8bc9bf3abe4a95::t_a2129c527c03bb 56-58,63-65,69-80,146,150-151,155,157-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "49d80e50927fe0d15ecd6de5d01355f8cbf63d1f",
+  "prompts": {},
+  "sessions": {
+    "s_3bea9f4c72a663": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb05cda11fb8d171",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_8bc9bf3abe4a95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac019149b1d227e41",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
