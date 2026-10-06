@@ -1,0 +1,19 @@
+package-lock.json
+  s_ab5bcc5cfffe93::t_5d2d79274cf5d6 1155,3303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b1ebed137f390d9b4eaa1ceb10cfcdb75330b744",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
