@@ -1,0 +1,10 @@
+{
+  "name": "yaos-relay-dev-cf-deploy",
+  "private": true,
+  "type": "module",
+  "description": "Pinned deploy toolchain for scripts/relay-dev/deploy.sh: `cf deploy` builds through wrangler >= 4.136 (cf-wrangler build) and uploads as the cf CLI OAuth session. Separate from server/, which pins wrangler 4.69 for local dev and tests.",
+  "devDependencies": {
+    "cf": "1.0.0-beta.5",
+    "wrangler": "4.147.0"
+  }
+}

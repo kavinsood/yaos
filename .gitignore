@@ -65,3 +65,6 @@ tools/
 # Local workstation notes and incomplete working specifications.
 # Durable documentation belongs in docs/.
 notes/
+
+# relay-dev cf deploy projects (scripts/relay-dev/deploy.sh)
+server/.cf-deploy
