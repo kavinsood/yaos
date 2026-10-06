@@ -1,0 +1,19 @@
+scripts/plugin-smoke.mjs
+  s_ed451e485d98d2::t_707818724e0356 18,153,184-187,191,203,218-219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "773be68cb2c3fbfa0ac96d116ad65fbf2aa2ad50",
+  "prompts": {},
+  "sessions": {
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
