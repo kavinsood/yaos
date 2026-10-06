@@ -1,0 +1,27 @@
+esbuild.config.mjs
+  s_9a7a5e66b06859::t_13a3c2debbaa1b 1-3,5-11,16,24-25,28-31,36-37,48,57,75-76,78
+scripts/plugin-smoke-env.mjs
+  s_9a7a5e66b06859::t_950a6ed99c821a 1-198
+src/engine/workerMain.ts
+  s_9a7a5e66b06859::t_08e7f31c94ddba 2-4
+src/host/entry.ts
+  s_9a7a5e66b06859::t_697e6548cc0271 1-31
+src/host/plugin.ts
+  s_9a7a5e66b06859::t_6a9b9716b500b5 3-6,13,30-31,34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a4e95fb7a25173258469acc5770ccbd124bfa554",
+  "prompts": {},
+  "sessions": {
+    "s_9a7a5e66b06859": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a9b4914bdca5ad129",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
