@@ -171,6 +171,32 @@ test("verify: manifest mismatch (entry not listed, sizes or hashes differ)", asy
 	await expectCorrupt("bundle-digest", t3.record, t3.parts);
 });
 
+test("verify: manifest that fails the strict schema (bad JSON, version, id, file or skipped entry)", async () => {
+	const { built, record } = await build();
+	const m = built.manifest;
+	const json = (over: Record<string, unknown>) => enc(JSON.stringify({ ...m, ...over }));
+	const bad: Uint8Array[] = [
+		enc("{\"formatVersion\":1,"),
+		new Uint8Array([0x7b, 0xff, 0x7d]),
+		enc("[]"),
+		json({ formatVersion: 2 }),
+		json({ id: snapshotId(T0 + 1, "manual") }),
+		json({ reason: "daily" }),
+		json({ files: m.files.map((f, i) => (i === 0 ? { ...f, hash: "XY" } : f)) }),
+		json({ files: m.files.map((f, i) => (i === 0 ? { ...f, size: -1 } : f)) }),
+		json({ files: m.files.map((f, i) => (i === 0 ? { ...f, kind: "pdf" } : f)) }),
+		json({ skipped: [{ path: "x", reason: "because" }] }),
+		json({ files: m.files.map((_f, i) => m.files[i === 1 ? 0 : i]!) }), // duplicate path
+	];
+	for (const mb of bad) {
+		const entries = (mb === bad.at(-1) ? [FILES[0]!, FILES[0]!, ...FILES.slice(2)] : FILES)
+			.map(([p, d]): [string, Uint8Array, boolean] => [`files/${p}`, d, false]);
+		const zip = await rawZip([...entries, ["manifest.json", mb, true]]);
+		const t = consistentRecord(zip, 16 * 1024, record, mb, mb === bad.at(-1) ? { totalBytes: record.totalBytes - FILES[1]![1].length + FILES[0]![1].length } : {});
+		await expectCorrupt("manifest-invalid", t.record, t.parts);
+	}
+});
+
 test("verify: path traversal and invalid paths are refused", async () => {
 	for (const bad of ["../evil.md", "Notes/../../evil.md", ".obsidian/app.json", "a/./b.md", "/abs.md", "con.md"]) {
 		const files: [string, Uint8Array][] = [["ok.md", enc("ok")], [bad, enc("evil")]];
