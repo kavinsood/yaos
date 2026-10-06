@@ -17,6 +17,39 @@ const BROWSER_GLOBALS = [
 	["crypto.subtle", /\bcrypto\.subtle\b/],
 ];
 
+/**
+ * The main thread holds CodeMirror state and raw disk I/O only (DESIGN §d.2): no CRDT package anywhere under
+ * host/** (tests and type-only imports included), and none reachable from host/** through core/ports/protocol.
+ * The engine reaches main only through the two documented entries (integration-notes D2).
+ */
+export const MAIN_FORBIDDEN = ["yjs", "y-codemirror.next", "y-protocols", "lib0"];
+const ENGINE_ENTRIES = new Set(["engine/adapters/webEngine", "engine/workerMain"]);
+
+/** Throwaway day-1 spike plugin (scripts/build-spike.mjs): its own bundle, never imported by the product. */
+const isSpike = (f) => f.startsWith("host/spike/");
+
+/**
+ * Whole-document reads on main. Every host/** occurrence must be listed in FULL_READ_ALLOW with why it is not
+ * on a per-keystroke, per-remote-update or per-workspace-event path; a new one (or one more in a listed file) fails.
+ */
+export const FULL_READS = [
+	["getValue()", /\.getValue\s*\(/g],
+	["toString()", /\.toString\s*\(\s*\)/g],
+	["sliceDoc()", /\.sliceDoc\s*\(/g],
+	["sliceString()", /\.sliceString\s*\(/g],
+	["getViewData()", /\.getViewData\s*\(/g],
+	["Text.of()", /\bText\.of\s*\(/g],
+];
+/** file -> pattern -> [count, why]. */
+export const FULL_READ_ALLOW = {
+	"host/binding.ts": {
+		"sliceString()": [1, "bind upload (attach, resync, restart): TEXT_CHUNK_UNITS-unit slices of the editor Text, one chunk per macrotask, transferred"],
+	},
+	"host/ui/pairing.ts": { "toString()": [1, "URLSearchParams of the pairing link, not a document"] },
+	"host/ui/pairFlow.ts": { "toString()": [1, "a number (countdown seconds)"] },
+	"host/ui/diagnostics.ts": { "toString()": [1, "a bigint in the diagnostics dump"] },
+};
+
 function stripComments(text) {
 	// Good enough for import scanning: drop block and line comments, keep strings.
 	return text.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " ")).replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
@@ -83,8 +116,13 @@ export function checkSource(file, text) {
 	const warn = (line, msg) => warnings.push(`${file}:${line}: ${msg}`);
 
 	if (!test && /\bWebAssembly\b/.test(stripComments(text))) err(1, "WebAssembly is forbidden (pure JS Yjs only)");
+	if (area === "host" && !test && !isSpike(file)) checkFullReads(file, text, err);
 
 	for (const { spec, typeOnly, line } of scanImports(text)) {
+		if (area === "host" && !spec.startsWith(".") && MAIN_FORBIDDEN.includes(pkgName(spec))) {
+			err(line, `no CRDT on the main thread: host/** must not import ${spec} (the worker owns the only Y.Doc)`);
+			continue;
+		}
 		if (/\.wasm($|\?)/.test(spec) || pkgName(spec) === "ywasm" || spec.includes("crdt-engine")) {
 			err(line, `WASM import forbidden: ${spec}`);
 			continue;
@@ -99,6 +137,10 @@ export function checkSource(file, text) {
 			const tArea = areaOf(target);
 			if (tArea === "sim" && area !== "sim" && !test) {
 				err(line, `only tests may import sim/**: ${spec}`);
+				continue;
+			}
+			if (area === "host" && isSpike(target) && !isSpike(file) && !test) {
+				err(line, `the spike plugin is not part of the product: ${spec}`);
 				continue;
 			}
 			if (test || area === "sim") continue;
@@ -117,6 +159,16 @@ export function checkSource(file, text) {
 		}
 	}
 	return { errors, warnings };
+}
+
+function checkFullReads(file, text, err) {
+	const body = stripComments(text).replace(/(["'`])(?:\\.|(?!\1).)*\1/g, '""');
+	const allow = FULL_READ_ALLOW[file] ?? {};
+	for (const [name, re] of FULL_READS) {
+		const lines = [...body.matchAll(re)].map((m) => body.slice(0, m.index).split("\n").length);
+		const max = allow[name]?.[0] ?? 0;
+		if (lines.length > max) err(lines[max], `whole-document read ${name} on main (${lines.length} > ${max} allowed in FULL_READ_ALLOW)`);
+	}
 }
 
 function checkInternal(file, area, target, tArea, typeOnly, spec, line, err, warn) {
@@ -158,10 +210,10 @@ function checkPackage(area, spec, typeOnly, line, err, file) {
 		ports: [],
 		protocol: [],
 		engine: ["yjs", "lib0", "fflate"],
-		host: ["obsidian", "yjs", "y-codemirror.next", "@codemirror/state", "@codemirror/view", "@codemirror/commands", "@codemirror/language", "qrcode"],
+		host: ["obsidian", "@codemirror/state", "@codemirror/view", "@codemirror/commands", "@codemirror/language", "qrcode"],
 	}[area];
 	if (!allowed) return err(line, `unknown source area ${area}`);
-	if (area === "ports" && pkg === "yjs" && typeOnly && file === "ports/workspace.ts") return;
+	if (area === "ports" && pkg === "@codemirror/state" && typeOnly && file === "ports/workspace.ts") return;
 	if (area === "host" && pkg.startsWith("@codemirror/")) return;
 	if (spec.startsWith("node:")) return err(line, `node built-in in shipped code: ${spec}`);
 	if (!allowed.includes(pkg)) err(line, `${area}/** must not import package ${spec}`);
@@ -176,18 +228,59 @@ function walk(dir, out) {
 	return out;
 }
 
+/**
+ * Transitive MAIN_FORBIDDEN check: from every product host/** module, follow relative imports (not into the
+ * engine entries) and fail on a CRDT package import anywhere along the way. `sources`: src-relative path -> text.
+ */
+export function mainReach(sources) {
+	const errors = [];
+	const memo = new Map();
+	const resolve = (from, spec) => {
+		const r = resolveRel(from, spec);
+		if (r.outside || ENGINE_ENTRIES.has(r.path)) return null;
+		return [`${r.path}.ts`, `${r.path}/index.ts`].find((c) => sources.has(c)) ?? null;
+	};
+	const via = (mod, stack) => {
+		if (memo.has(mod)) return memo.get(mod);
+		if (stack.has(mod)) return null;
+		stack.add(mod);
+		let found = null;
+		for (const { spec } of scanImports(sources.get(mod))) {
+			if (!spec.startsWith(".")) {
+				if (MAIN_FORBIDDEN.includes(pkgName(spec))) found = [mod, spec];
+			} else {
+				const next = resolve(mod, spec);
+				const chain = next && via(next, stack);
+				if (chain) found = [mod, ...chain];
+			}
+			if (found) break;
+		}
+		stack.delete(mod);
+		memo.set(mod, found);
+		return found;
+	};
+	for (const mod of sources.keys()) {
+		if (areaOf(mod) !== "host" || isTest(mod) || isSpike(mod)) continue;
+		const chain = via(mod, new Set());
+		if (chain && chain.length > 2) errors.push(`${mod}:1: main thread reaches ${chain[chain.length - 1]} via ${chain.slice(0, -1).join(" -> ")}`);
+	}
+	return errors;
+}
+
 export function checkTree(srcDir = SRC) {
 	const errors = [];
 	const warnings = [];
-	let files = 0;
+	const sources = new Map();
 	for (const abs of walk(srcDir, [])) {
-		files++;
 		const rel = relative(srcDir, abs).split("\\").join("/");
-		const r = checkSource(rel, readFileSync(abs, "utf8"));
+		const text = readFileSync(abs, "utf8");
+		sources.set(rel, text);
+		const r = checkSource(rel, text);
 		errors.push(...r.errors);
 		warnings.push(...r.warnings);
 	}
-	return { files, errors, warnings };
+	errors.push(...mainReach(sources));
+	return { files: sources.size, errors, warnings };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
