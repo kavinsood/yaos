@@ -37,7 +37,7 @@ export interface EngineCarrier {
 	dispose(): void;
 }
 
-export type EngineRequestMessage = Extract<EngineToMain, { t: "readRequest" | "diskOps" | "saveViews" | "sideFileWrite" | "sideFileRead" }>;
+export type EngineRequestMessage = Extract<EngineToMain, { t: "readRequest" | "diskOps" | "saveViews" | "sideFileWrite" | "sideFileRead" | "hostIo" }>;
 export type EngineEventMessage = Extract<EngineToMain, { t: "docUpdate" | "docRetarget" | "bindable" | "status" | "brake" | "notice" }>;
 type HostRequest = Extract<MainToEngine, { rid: number }>;
 type HostRequestBody = HostRequest extends infer M ? (M extends { rid: number } ? Omit<M, "rid"> : never) : never;
@@ -384,7 +384,8 @@ export class EngineHost {
 			case "diskOps":
 			case "saveViews":
 			case "sideFileWrite":
-			case "sideFileRead": {
+			case "sideFileRead":
+			case "hostIo": {
 				const rid = m.rid;
 				this.deps.handlers.onRequest(m).then(
 					(value) => {

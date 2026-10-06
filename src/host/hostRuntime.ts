@@ -14,7 +14,7 @@ import type { LifecycleEvent, PlatformPort } from "../ports/platform";
 import type { ConfigDirPort, SideFilePort, VaultPort } from "../ports/vault";
 import type { WorkspacePort } from "../ports/workspace";
 import type { ProtocolError } from "../protocol/errors";
-import type { EngineResultValue, EngineSettings, MainResultValue, UserCommand } from "../protocol/messages";
+import type { EngineResultValue, EngineSettings, HostIoOp, HostIoResult, MainResultValue, UserCommand } from "../protocol/messages";
 import type { StatusSnapshot } from "../protocol/status";
 import { BindingManager } from "./binding";
 import { DiskExecutor } from "./diskExecutor";
@@ -260,6 +260,23 @@ export class HostRuntime {
 				return { t: "sideFileWritten" };
 			case "sideFileRead":
 				return { t: "sideFile", bytes: await this.deps.sideFiles.read(m.name) };
+			case "hostIo":
+				return { t: "hostIo", result: await this.hostIo(m.op) };
+		}
+	}
+
+	private async hostIo(op: HostIoOp): Promise<HostIoResult> {
+		switch (op.t) {
+			case "configList":
+				return { t: "configListing", entries: await this.deps.configDir.list(op.dir) };
+			case "configRemove":
+				await this.deps.configDir.remove(op.path);
+				return { t: "done" };
+			case "sideFileList":
+				return { t: "sideFiles", names: await this.deps.sideFiles.list(op.prefix) };
+			case "sideFileRemove":
+				await this.deps.sideFiles.remove(op.name);
+				return { t: "done" };
 		}
 	}
 }

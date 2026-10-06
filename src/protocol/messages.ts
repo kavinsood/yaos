@@ -99,6 +99,22 @@ export type DiskOpResult =
 
 export type DocUpdateOrigin = "remote" | "provisional" | "merge" | "restore" | "resync";
 
+/**
+ * Small host I/O calls the disk side needs besides reads and disk ops
+ * (integration addition, DESIGN §j.3 / §j.4): config-dir listing and removal
+ * (settings sync), side-file listing and removal (snapshot retention).
+ */
+export type HostIoOp =
+	| { readonly t: "configList"; readonly dir: string }
+	| { readonly t: "configRemove"; readonly path: string }
+	| { readonly t: "sideFileList"; readonly prefix: "snapshots/" }
+	| { readonly t: "sideFileRemove"; readonly name: SideFileName };
+
+export type HostIoResult =
+	| { readonly t: "configListing"; readonly entries: readonly { readonly path: string; readonly size: number; readonly mtimeMs: number; readonly isFolder: boolean }[] }
+	| { readonly t: "sideFiles"; readonly names: readonly SideFileName[] }
+	| { readonly t: "done" };
+
 export interface BindInfo {
 	readonly docId: DocId;
 	readonly kind: DocKind;
@@ -161,7 +177,8 @@ export type MainResultValue =
 	| { readonly t: "diskOps"; readonly results: readonly DiskOpResult[] }
 	| { readonly t: "sideFileWritten" }
 	| { readonly t: "sideFile"; readonly bytes: Uint8Array | null /* [T] */ }
-	| { readonly t: "viewSaved"; readonly saved: readonly DocId[] };
+	| { readonly t: "viewSaved"; readonly saved: readonly DocId[] }
+	| { readonly t: "hostIo"; readonly result: HostIoResult };
 
 // ---------------------------------------------------------------------------
 // Engine -> Main
@@ -183,6 +200,7 @@ export type EngineToMain =
 	| { readonly t: "saveViews"; readonly rid: RequestId; readonly docIds: readonly DocId[] }
 	| { readonly t: "sideFileWrite"; readonly rid: RequestId; readonly name: SideFileName; readonly bytes: Uint8Array /* [T] */ }
 	| { readonly t: "sideFileRead"; readonly rid: RequestId; readonly name: SideFileName }
+	| { readonly t: "hostIo"; readonly rid: RequestId; readonly op: HostIoOp }
 	| { readonly t: "status"; readonly status: StatusSnapshot }
 	| { readonly t: "brake"; readonly report: BrakeReport }
 	| { readonly t: "notice"; readonly level: "info" | "warn" | "error"; readonly code: string; readonly message: string }
