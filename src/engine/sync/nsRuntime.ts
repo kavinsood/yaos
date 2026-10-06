@@ -1,37 +1,38 @@
 /**
- * Namespace runtime (DESIGN §c, §d.7 step 5, §e.1 dependsOn).
+ * Namespace runtime (DESIGN §c, §d.7 step 5, §e.1 dependsOn, §f.1 overlay).
  *
- * State = nsFoldV1 snapshot + fold of ns tail rows in (snapshot, appliedSeq],
- * in seq order. Rows are folded only once the ns stream has them all
- * (appliedSeq), so live rows of a stale ns stream wait in tail. A tail row
- * flagged LOCAL_FLAG_UNOPENED (reader-dependent gate failure) halts the fold.
+ * Committed state = nsFoldV1 snapshot + fold of ns tail rows (FoldRuntime).
+ * The optimistic view (§f.1) folds own pending frames (outbox + receipted but
+ * not yet folded) over a clone of the committed state.
  *
  * reconcileHeld() is state-based so it is crash-safe: a held record whose
  * dependency record is gone is released when the fold has its doc (live /
  * deleted), deleted when the doc was merged away, and waits while the doc is
  * absent (create not folded yet).
- *
- * Fold / codecs are stand-ins (../sync/__standins__/nsFold) until WP-A lands.
  */
 
 import { CheckpointEncoding } from "../../core/envelope";
-import { NS_STREAM, streamClass, streamDocId, type DocId, type DocKind, type NsEntry, type NsFoldEvent, type NsFoldIndex, type NsFoldState, type NsOp, type PathKey, type Seq, type VaultPath, type DeviceId } from "../../core/types";
+import { decodeNsFoldV1, encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
+import { decodeNsOps } from "../../core/codec/nsOps";
+import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
+import { buildIndex, foldNsFrame, newNsFoldState, nsFoldHalted } from "../../core/ns/fold";
+import { overlayPending, type NsOverlay, type PendingNsFrame } from "../../core/ns/overlay";
+import { pathKey } from "../../core/paths/pathKey";
+import {
+	NS_STREAM, streamClass, streamDocId,
+	type DeviceId, type DocId, type DocKind, type NsEntry, type NsFoldEvent, type NsFoldIndex, type NsFoldState, type NsOp, type Seq, type VaultPath,
+} from "../../core/types";
 import type { OutboxChange, Repo } from "../store/repo";
-import type { OutboxRecord } from "../store/schema";
+import type { SnapshotRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
-import { buildIndex, decodeNsFoldV1, emptyNsState, encodeNsFoldV1, foldNsFrameStandin, pathKeyStandin } from "./__standins__/nsFold";
-import { decodeNsOps } from "./__standins__/nsOps";
+import { FoldRuntime, type FoldCandidate, type FoldedFrame } from "./foldRuntime";
 
-/** Local-only tail flag (never on the wire): the row failed a reader-dependent gate check; content = raw payload. */
-export const LOCAL_FLAG_UNOPENED = 1 << 20;
-/** FOLD (V3): an ns row s is a candidate iff floor(s / M) > floor(prev / M). */
-export const NS_CANDIDATE_MODULUS = 1000;
+export { LOCAL_FLAG_UNOPENED } from "./foldRuntime";
+/** FOLD (V3): an ns row s is a candidate iff floor(s / M) > floor(prev / M) (core/ns/candidate). */
+export const NS_CANDIDATE_MODULUS = NS_CANDIDATE_INTERVAL;
 
-export interface NsCandidate {
-	readonly seq: Seq;
-	readonly bytes: Uint8Array;
-	readonly authoredBySelf: boolean;
-}
+export type NsCandidate = FoldCandidate;
+export type FoldedNsFrame = FoldedFrame<NsOp, NsFoldEvent>;
 
 export interface DocInfo {
 	readonly docId: DocId;
@@ -41,80 +42,42 @@ export interface DocInfo {
 	readonly aliasOf: DocId | null;
 }
 
-export class NsRuntime {
-	state: NsFoldState = emptyNsState();
+export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
+	state: NsFoldState = newNsFoldState();
 	index: NsFoldIndex = buildIndex(this.state);
-	halted: { readonly seq: Seq; readonly reason: string } | null = null;
-	candidate: NsCandidate | null = null;
-	/** Highest ns tail seq looked at (rows in (through, appliedSeq] are next). */
-	private through: Seq = 0;
-	private prevSeq: Seq = 0;
-	private busy: Promise<NsFoldEvent[]> = Promise.resolve([]);
-	foldedRows = 0;
 
-	constructor(private readonly repo: Repo, private readonly self: DeviceId, private readonly candidateModulus = NS_CANDIDATE_MODULUS) {}
-
-	/** (Re)load from the snapshot and refold the tail. */
-	async load(): Promise<NsFoldEvent[]> {
-		const snap = await this.repo.getSnapshot(NS_STREAM);
-		this.state = snap && snap.encoding === CheckpointEncoding.nsFoldV1 && snap.bytes.length > 0 ? decodeNsFoldV1(snap.bytes) : emptyNsState();
-		this.index = buildIndex(this.state);
-		this.halted = null;
-		this.through = Math.max(this.state.coversSeq, snap?.coversSeq ?? 0);
-		this.prevSeq = this.state.coversSeq;
-		return this.advance();
-	}
-
-	/** Fold every newly available row (serialized). */
-	advance(): Promise<NsFoldEvent[]> {
-		const p = this.busy.then(() => this.doAdvance(), () => this.doAdvance());
-		this.busy = p.catch(() => []);
-		return p;
-	}
-
-	private async doAdvance(): Promise<NsFoldEvent[]> {
-		const rec = this.repo.stream(NS_STREAM);
-		if (!rec || this.halted) return [];
-		if (rec.appliedSeq <= this.through) return [];
-		const target = rec.appliedSeq;
-		const rows = await this.repo.getTail(NS_STREAM, this.through, target);
-		const events: NsFoldEvent[] = [];
-		for (const row of rows) {
-			if (row.seq <= this.state.coversSeq) continue;
-			if (row.flags & LOCAL_FLAG_UNOPENED) {
-				this.halted = { seq: row.seq, reason: "reader-dependent" };
-				this.through = row.seq - 1;
-				return events;
-			}
-			let ops: NsOp[] = [];
-			if (row.kind === "nsOps" && row.content.length > 0) {
-				try {
-					ops = decodeNsOps(row.content);
-				} catch {
-					ops = []; // deterministic malformation folds as an empty frame (§c.3)
-				}
-			}
-			events.push(...foldNsFrameStandin(this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, ops }));
-			this.foldedRows++;
-			const m = this.candidateModulus;
-			if (Math.floor(row.seq / m) > Math.floor(this.prevSeq / m)) {
-				this.candidate = { seq: row.seq, bytes: encodeNsFoldV1(this.state), authoredBySelf: row.deviceId === this.self };
-			}
-			this.prevSeq = row.seq;
-		}
-		this.through = target;
-		return events;
+	constructor(repo: Repo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS) {
+		super(repo, self, NS_STREAM, candidateModulus);
 	}
 
 	get coversSeq(): Seq {
 		return this.state.coversSeq;
 	}
 
+	protected reset(snap: SnapshotRecord | undefined): void {
+		const st = snap && snap.encoding === CheckpointEncoding.nsFoldV1 && snap.bytes.length > 0 ? decodeNsFoldV1(snap.bytes) : null;
+		this.state = st ?? newNsFoldState();
+		this.index = buildIndex(this.state);
+	}
+
+	protected decodeOps(content: Uint8Array): NsOp[] | null {
+		return decodeNsOps(content);
+	}
+
+	protected foldFrame(row: TailRecord, ops: readonly NsOp[]): { events: readonly NsFoldEvent[]; halted: boolean } {
+		const events = foldNsFrame(this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, ops });
+		return { events, halted: nsFoldHalted(events) };
+	}
+
+	protected encodeState(): Uint8Array {
+		return encodeNsFoldV1(this.state);
+	}
+
 	entry(docId: DocId): NsEntry | undefined {
 		return this.state.entries.get(docId);
 	}
 
-	/** Alias-resolved live entry. */
+	/** Alias-resolved entry. */
 	resolve(docId: DocId): NsEntry | undefined {
 		const e = this.state.entries.get(docId);
 		if (e && e.state === "merged" && e.aliasOf) return this.state.entries.get(e.aliasOf);
@@ -122,27 +85,24 @@ export class NsRuntime {
 	}
 
 	docAt(path: VaultPath): DocId | null {
-		return this.index.byPathKey.get(pathKeyStandin(path) as PathKey) ?? null;
+		return this.index.byPathKey.get(pathKey(path)) ?? null;
 	}
 
-	/**
-	 * Docs: fold entries plus own pending creates (outbox ns frames not folded
-	 * yet) as an overlay (§f.1).
-	 */
+	/** Committed fold + own pending frames (§f.1). */
+	overlay(outbox: OutboxCache): NsOverlay & { readonly pending: readonly PendingNsFrame[] } {
+		const pending = this.pendingFrames(outbox);
+		return { ...overlayPending(this.state, this.index, this.self, pending), pending };
+	}
+
+	/** Docs of the optimistic view; "pending" = not in the committed fold yet. */
 	listDocs(outbox: OutboxCache): DocInfo[] {
-		const out = new Map<DocId, DocInfo>();
-		for (const e of this.state.entries.values()) out.set(e.docId, { docId: e.docId, path: e.path, kind: e.kind, state: e.state, aliasOf: e.aliasOf });
-		for (const op of pendingNsOps(outbox)) {
-			if (op.t === "create" && !out.has(op.docId)) out.set(op.docId, { docId: op.docId, path: op.path, kind: op.kind, state: "pending", aliasOf: null });
-			else if (op.t === "rename") {
-				const d = out.get(op.docId);
-				if (d) out.set(op.docId, { ...d, path: op.path });
-			} else if (op.t === "delete") {
-				const d = out.get(op.docId);
-				if (d && d.state !== "merged") out.set(op.docId, { ...d, state: "deleted" });
-			}
+		const ov = this.overlay(outbox);
+		const out: DocInfo[] = [];
+		for (const e of ov.state.entries.values()) {
+			const committed = this.state.entries.has(e.docId);
+			out.push({ docId: e.docId, path: e.path, kind: e.kind, state: committed ? e.state : "pending", aliasOf: e.aliasOf });
 		}
-		return [...out.values()];
+		return out;
 	}
 
 	/** dependsOn rule for ns creates (DESIGN §e.1). */
@@ -173,22 +133,4 @@ export class NsRuntime {
 		}
 		return changes;
 	}
-}
-
-/** Ops of own ns frames still in the outbox, in order. */
-export function pendingNsOps(outbox: OutboxCache): NsOp[] {
-	const ops: NsOp[] = [];
-	for (const r of outbox.ofStream(NS_STREAM)) {
-		if (r.state === "poisoned" || r.content.length === 0) continue;
-		try {
-			ops.push(...decodeNsOps(r.content));
-		} catch {
-			// own frame; cannot happen
-		}
-	}
-	return ops;
-}
-
-export function isOwnNsRecord(r: OutboxRecord): boolean {
-	return r.stream === NS_STREAM;
 }

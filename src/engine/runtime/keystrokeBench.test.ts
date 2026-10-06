@@ -17,7 +17,7 @@ import * as Y from "yjs";
 import type { DocId } from "../../core/types";
 import { compactBody } from "../body/compaction";
 import { resetYjsCounters, yjsCounters } from "../body/yjsCounters";
-import { SimRelay } from "../sync/__standins__/simRelay";
+import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 

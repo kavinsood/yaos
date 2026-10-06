@@ -14,7 +14,7 @@ import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebClock } from "../adapters/webClock";
 import { createWebHash } from "../adapters/webHash";
 import { createWebRandom } from "../adapters/webRandom";
-import { MemStoragePort } from "../sync/__standins__/memStorage";
+import { MemStoragePort } from "../../sim/storage";
 import { LogEngine } from "./engine";
 import type { EngineOptions, EngineTuning } from "./options";
 

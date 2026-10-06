@@ -16,8 +16,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ClientFrameId, DeviceId, StreamName, VaultId } from "../../core/types";
 import { Repo } from "../store/repo";
-import { MemStoragePort, type CommitDecision } from "../sync/__standins__/memStorage";
-import { SimRelay } from "../sync/__standins__/simRelay";
+import { MemStoragePort, type CommitDecision } from "../../sim/storage";
+import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 

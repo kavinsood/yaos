@@ -7,7 +7,7 @@
  * exactly the tail keys that were folded in.
  *
  * ns: the snapshot is the nsFoldV1 encoding of the fold state at its coversSeq.
- * cfg: not compacted (cfg fold is a stand-in; gap recorded in the notes).
+ * cfg: snapshot = cfgFoldV1 of the cfg fold at its coversSeq (compactCfg).
  */
 
 import * as Y from "yjs";
@@ -17,7 +17,7 @@ import type { Repo } from "../store/repo";
 import type { SnapshotRecord, StreamRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
 import type { NsRuntime } from "../sync/nsRuntime";
-import { encodeNsFoldV1 } from "../sync/__standins__/nsFold";
+import { encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
 import { encodeStateAsUpdate, ORIGIN } from "./yjsCounters";
 
 export interface CompactDeps {

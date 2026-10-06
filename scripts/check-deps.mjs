@@ -70,7 +70,8 @@ function pkgName(spec) {
 	return spec.split("/")[0];
 }
 
-const isTest = (f) => f.endsWith(".test.ts");
+/** Tests and test-only support code (testkit/ dirs, engine/runtime/testHarness.ts) may import sim/** and anything else. */
+const isTest = (f) => f.endsWith(".test.ts") || f.split("/").includes("testkit") || f === "engine/runtime/testHarness.ts";
 
 /**
  * Check one file. Returns { errors: string[], warnings: string[] }.

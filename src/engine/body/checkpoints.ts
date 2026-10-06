@@ -16,7 +16,7 @@ import { sealCheckpoint } from "../ingest/envelope";
 import type { Mut, Repo } from "../store/repo";
 import type { StreamRecord } from "../store/schema";
 import type { NsRuntime } from "../sync/nsRuntime";
-import { encodeCheckpointContent } from "../sync/__standins__/envelopeCodec";
+import { encodeCheckpointContent } from "../../core/codec/contents";
 import { compactBody, type CompactDeps } from "./compaction";
 
 export const CHECKPOINT_FALLBACK_MS = 10 * 60_000;

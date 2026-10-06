@@ -15,8 +15,8 @@ import type { SideFileName, SideFilePort } from "../../ports/vault";
 import { assembleChunks, resolveRefContent } from "../body/refs";
 import { openEnvelope } from "../ingest/envelope";
 import type { OutboxMirrorFrame, OutboxRecord } from "../store/schema";
-import { toHex } from "../sync/__standins__/bytes";
-import { decodeBlobChunk, decodeBodyRef } from "../sync/__standins__/envelopeCodec";
+import { decodeBlobChunk, decodeBodyUpdateRef } from "../../core/codec/contents";
+import { bytesToHex } from "../../core/codec/lib0";
 import type { EngineCtx } from "./context";
 import { decodeOutboxMirror, encodeOutboxMirror, nextMirrorSlot, pickOutboxMirror, selectMirrorFrames, type MirrorIdentity } from "./mirrors";
 
@@ -133,13 +133,11 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 		}
 		opened.push({ f, kind: o.inner.kind, flags: o.inner.flags, content: o.inner.content });
 		if (streamClass(f.stream) === "blobchunk") {
-			try {
-				const h = decodeBlobChunk(o.inner.content).hash;
-				const l = chunks.get(h) ?? [];
+			const d = decodeBlobChunk(o.inner.content);
+			if (d) {
+				const l = chunks.get(d.hash) ?? [];
 				l.push(o.inner.content);
-				chunks.set(h, l);
-			} catch {
-				/* not a chunk */
+				chunks.set(d.hash, l);
 			}
 		}
 	}
@@ -148,13 +146,11 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 		let local = content;
 		if (kind === "bodyUpdateRef") {
 			local = new Uint8Array(0);
-			try {
-				const ref = decodeBodyRef(content);
+			const ref = decodeBodyUpdateRef(content);
+			if (ref) {
 				const fromChunks = assembleChunks(chunks.get(ref.hash) ?? [], ref.hash as ContentHash);
-				if (fromChunks && toHex(await c.ports.hash.sha256(fromChunks)) === ref.hash) local = fromChunks;
+				if (fromChunks && bytesToHex(await c.ports.hash.sha256(fromChunks)) === ref.hash) local = fromChunks;
 				else local = (await resolveRefContent(c.deps, f.stream, content)) ?? new Uint8Array(0);
-			} catch {
-				local = new Uint8Array(0);
 			}
 			if (local.length === 0) c.diag("mirror-ref-content-missing", {});
 		}

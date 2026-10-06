@@ -10,7 +10,7 @@ import { test } from "node:test";
 import * as Y from "yjs";
 import { BLOB_CHUNK_BYTES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { streamClass, type DocId } from "../../core/types";
-import { SimRelay } from "../sync/__standins__/simRelay";
+import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 

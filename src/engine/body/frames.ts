@@ -14,16 +14,17 @@
 import * as Y from "yjs";
 import { EnvelopeFlag, type EnvelopeKind } from "../../core/envelope";
 import { BLOB_CHUNK_BYTES, INITIAL_INSERT_CHUNK_CHARS, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
-import { blobChunkStream, streamClass, type ClientFrameId, type ContentHash, type DeviceId, type NsOp, type Seq, type StreamName, type VaultId } from "../../core/types";
+import { blobChunkStream, streamClass, type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type NsOp, type Seq, type StreamName, type VaultId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { CryptoPort, HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
 import { sealFrame } from "../ingest/envelope";
 import type { NewOutboxFrame } from "../store/repo";
-import { toHex } from "../sync/__standins__/bytes";
-import { encodeBlobChunk, encodeBodyRef } from "../sync/__standins__/envelopeCodec";
-import { newFrameId } from "../sync/__standins__/ids";
-import { encodeNsOps } from "../sync/__standins__/nsOps";
+import { encodeCfgOps } from "../../core/codec/cfgOps";
+import { encodeBlobChunk, encodeBodyUpdateRef } from "../../core/codec/contents";
+import { newClientFrameId } from "../../core/codec/ids";
+import { bytesToHex } from "../../core/codec/lib0";
+import { encodeNsOps } from "../../core/codec/nsOps";
 import { ORIGIN } from "./yjsCounters";
 
 export interface FrameCtx {
@@ -41,7 +42,7 @@ export class FrameTooLargeError extends Error {
 }
 
 async function seal(ctx: FrameCtx, stream: StreamName, kind: EnvelopeKind, authorNsSeq: Seq, flags: number, sealedContent: Uint8Array, localContent: Uint8Array, state: "pending" | "held", dependsOn: ClientFrameId | null, nowMs: number): Promise<NewOutboxFrame> {
-	const clientFrameId = newFrameId(ctx.random);
+	const clientFrameId = newClientFrameId(ctx.random);
 	const s = await sealFrame(ctx.crypto, ctx.vaultId, stream, clientFrameId, kind, authorNsSeq, flags, sealedContent);
 	return {
 		clientFrameId, stream, kind, state, sealed: s.sealed, content: localContent, authorNsSeq, flags: s.flags & ~EnvelopeFlag.deflate,
@@ -67,8 +68,8 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 	if (input.content.length <= MAX_INLINE_UPDATE_BYTES) {
 		return [await seal(ctx, input.stream, kind, input.authorNsSeq, input.flags, input.content, input.content, state, input.dependsOn, input.nowMs)];
 	}
-	const hash = toHex(await ctx.hash.sha256(input.content)) as ContentHash;
-	const refContent = encodeBodyRef({ hash, size: input.content.length });
+	const hash = bytesToHex(await ctx.hash.sha256(input.content)) as ContentHash;
+	const refContent = encodeBodyUpdateRef({ hash, size: input.content.length });
 	if (ctx.blob && input.content.length <= ctx.blob.maxBlobBytes) {
 		try {
 			const address = await ctx.crypto.blobAddress(hash);
@@ -103,7 +104,7 @@ export async function buildAdoptFrame(
 	ctx: FrameCtx, stream: StreamName, kind: EnvelopeKind, authorNsSeq: Seq, flags: number, content: Uint8Array,
 	adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly receivedAtMs: number }, nowMs: number,
 ): Promise<NewOutboxFrame> {
-	const clientFrameId = newFrameId(ctx.random);
+	const clientFrameId = newClientFrameId(ctx.random);
 	const f = flags | EnvelopeFlag.adopted;
 	const s = await sealFrame(ctx.crypto, ctx.vaultId, stream, clientFrameId, kind, authorNsSeq, f, content);
 	return {
@@ -115,6 +116,11 @@ export async function buildAdoptFrame(
 export async function buildNsFrame(ctx: FrameCtx, stream: StreamName, ops: readonly NsOp[], authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
 	const content = encodeNsOps(ops);
 	return seal(ctx, stream, "nsOps", authorNsSeq, 0, content, content, "pending", null, nowMs);
+}
+
+export async function buildCfgFrame(ctx: FrameCtx, stream: StreamName, ops: readonly CfgOp[], authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
+	const content = encodeCfgOps(ops);
+	return seal(ctx, stream, "cfgOps", authorNsSeq, 0, content, content, "pending", null, nowMs);
 }
 
 /** Split text into <= max UTF-16 unit chunks without cutting a surrogate pair. */

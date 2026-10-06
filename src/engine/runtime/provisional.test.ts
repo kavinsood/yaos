@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as Y from "yjs";
 import type { DocId } from "../../core/types";
-import { SimRelay } from "../sync/__standins__/simRelay";
+import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 

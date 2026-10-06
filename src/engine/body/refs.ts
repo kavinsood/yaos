@@ -11,8 +11,8 @@ import type { CryptoPort, HashPort } from "../../ports/crypto";
 import { checkYjsUpdate } from "../ingest/yjsCheck";
 import type { Repo } from "../store/repo";
 import type { TailRecord } from "../store/schema";
-import { concatBytes, toHex } from "../sync/__standins__/bytes";
-import { decodeBlobChunk, decodeBodyRef } from "../sync/__standins__/envelopeCodec";
+import { decodeBlobChunk, decodeBodyUpdateRef } from "../../core/codec/contents";
+import { bytesToHex, concatBytes } from "../../core/codec/lib0";
 
 export interface RefDeps {
 	readonly repo: Repo;
@@ -27,13 +27,8 @@ export function assembleChunks(contents: readonly Uint8Array[], hash: ContentHas
 	let total = -1;
 	let totalSize = -1;
 	for (const c of contents) {
-		let d;
-		try {
-			d = decodeBlobChunk(c);
-		} catch {
-			continue;
-		}
-		if (d.hash !== hash) continue;
+		const d = decodeBlobChunk(c);
+		if (!d || d.hash !== hash) continue;
 		if (total === -1) {
 			total = d.total;
 			totalSize = d.totalSize;
@@ -48,17 +43,13 @@ export function assembleChunks(contents: readonly Uint8Array[], hash: ContentHas
 }
 
 export async function resolveRefContent(deps: RefDeps, stream: StreamName, refContent: Uint8Array): Promise<Uint8Array | null> {
-	let ref;
-	try {
-		ref = decodeBodyRef(refContent);
-	} catch {
-		return null;
-	}
+	const ref = decodeBodyUpdateRef(refContent);
+	if (!ref) return null;
 	const cls = streamClass(stream);
 	if (cls !== "body" && cls !== "canvas") return null;
 	const verify = async (bytes: Uint8Array | null): Promise<Uint8Array | null> => {
 		if (!bytes || bytes.length !== ref.size) return null;
-		if (toHex(await deps.hash.sha256(bytes)) !== ref.hash) return null;
+		if (bytesToHex(await deps.hash.sha256(bytes)) !== ref.hash) return null;
 		const r = checkYjsUpdate(bytes, cls, { maxBytes: MAX_LOG_BLOB_BYTES * 8, maxChars: MAX_DOC_TEXT_CHARS });
 		return r.ok ? bytes : null;
 	};

@@ -7,7 +7,7 @@ import { NS_STREAM, type ClientFrameId, type DeviceId, type StreamName, type Vau
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import { faultyCrypto } from "../runtime/testHarness";
-import { encodeBodyRef, encodeCheckpointContent } from "../sync/__standins__/envelopeCodec";
+import { encodeBodyUpdateRef as encodeBodyRef, encodeCheckpointContent } from "../../core/codec/contents";
 import { sealCheckpoint, sealFrame } from "./envelope";
 import { gate, type GateCtx, type GateResult } from "./gate";
 import { checkYjsUpdate } from "./yjsCheck";

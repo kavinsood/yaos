@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { StreamName } from "../../core/types";
-import { SimRelay } from "../sync/__standins__/simRelay";
+import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 
@@ -69,7 +69,7 @@ test("socket drop: auto-reconnect, unreceipted frames resent, live again", async
 });
 
 test("checkpoint duty: maintenance writes a body checkpoint, relay GCs, fresh engine adopts it", async () => {
-	const relay = new SimRelay();
+	const relay = new SimRelay({ sealBytes: 64 }); // small segments so a checkpoint can GC sealed ones
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { checkpoint: CKPT } });
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", tuning: { checkpoint: CKPT } });
 	let c: LogEngine | null = null;
@@ -96,7 +96,7 @@ test("checkpoint duty: maintenance writes a body checkpoint, relay GCs, fresh en
 });
 
 test("union: engine with a local tail below a GC'd checkpoint catches up via checkpoint union", async () => {
-	const relay = new SimRelay();
+	const relay = new SimRelay({ sealBytes: 64 }); // small segments so a checkpoint can GC sealed ones
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { checkpoint: CKPT } });
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", tuning: { checkpoint: NO_CKPT } });
 	try {

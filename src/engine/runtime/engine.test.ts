@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { SimRelay } from "../sync/__standins__/simRelay";
+import { SimRelay } from "../../sim/relay";
 import { converged, startTestEngine, until } from "./testHarness";
 
 test("engine: two engines converge on ns + body through SimRelay", async () => {

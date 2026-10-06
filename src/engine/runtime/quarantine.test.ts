@@ -13,7 +13,7 @@ import type { RelaySession } from "../../ports/relay";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import { sealFrame } from "../ingest/envelope";
-import { SimRelay } from "../sync/__standins__/simRelay";
+import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, faultyCrypto, sleep, startTestEngine, until } from "./testHarness";
 
@@ -166,8 +166,10 @@ test("causal hole: missing structs -> re-read causalRetries times -> freeze caus
 		assert.equal(a.c.repo.stream(stream)!.quarantinedRows, 0, "a causal hole is not quarantine: the row stays in tail");
 		assert.equal(a.c.repo.cursor.vaultSeq, relay.head());
 
+		const h0 = relay.head();
 		await x.send(stream, u1[0]!);
-		await until(() => a.c.repo.cursor.vaultSeq === relay.head() && relay.head() > 0 && a.c.live.idle, 3_000, "u1 ingested");
+		// The relay group-commits: wait for the row to commit, then for a to ingest it.
+		await until(() => relay.head() > h0 && a.c.repo.cursor.vaultSeq === relay.head() && a.c.live.idle, 3_000, "u1 ingested");
 		await sleep(30);
 		assert.deepEqual(await a.releaseQuarantine(id), { passed: 0, dismissed: 0 });
 		assert.equal(a.c.repo.stream(stream)!.frozen, 0);

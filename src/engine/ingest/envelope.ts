@@ -1,13 +1,23 @@
 /**
  * Seal/open relay payloads through the CryptoPort (DESIGN §b.1, §d.6 stage 1).
- * Codec stand-in: ../sync/__standins__/envelopeCodec (WP-A at integration).
+ * Codec: core/codec/envelope.ts. The engine stores flags without the deflate
+ * bit (content is kept inflated), so the open result clears it.
  */
 
-import { ALLOWED_KINDS, CryptoSuite, ENVELOPE_FORMAT_VERSION, EnvelopeFlag, type EnvelopeKind, type EnvelopeOpenResult } from "../../core/envelope";
+import { ALLOWED_KINDS, ENVELOPE_FORMAT_VERSION, EnvelopeFlag, type EnvelopeKind, type EnvelopeOpenResult } from "../../core/envelope";
 import type { ClientFrameId, Seq, StreamName, VaultId } from "../../core/types";
 import { streamClass } from "../../core/types";
 import type { CryptoPort } from "../../ports/crypto";
-import { checkpointAad, decodeInner, decodeOuter, encodeInner, encodeOuter, frameAad } from "../sync/__standins__/envelopeCodec";
+import { checkpointAad, decodeInner, decodeOuter, encodeInner, encodeOuter, frameAad } from "../../core/codec/envelope";
+import { Reader } from "../../core/codec/lib0";
+
+/** Flags of an encoded inner envelope (kind u8, varuint authorNsSeq, varuint flags). */
+function innerFlags(inner: Uint8Array): number {
+	const r = new Reader(inner);
+	r.u8();
+	r.varuint();
+	return r.varuint();
+}
 
 export interface SealedFrame {
 	/** Exact relay payload. */
@@ -20,14 +30,14 @@ export async function sealFrame(
 	crypto: CryptoPort, vaultId: VaultId, stream: StreamName, clientFrameId: ClientFrameId,
 	kind: EnvelopeKind, authorNsSeq: Seq, flags: number, content: Uint8Array,
 ): Promise<SealedFrame> {
-	const inner = encodeInner(kind, authorNsSeq, flags, content);
-	const sealedInner = await crypto.seal({ aad: frameAad(vaultId, stream, clientFrameId), plaintext: inner.bytes });
-	return { sealed: encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch: crypto.keyEpoch }, sealedInner), flags: inner.flags };
+	const inner = encodeInner({ kind, authorNsSeq, flags, content });
+	const sealedInner = await crypto.seal({ aad: frameAad(vaultId, stream, clientFrameId), plaintext: inner });
+	return { sealed: encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch: crypto.keyEpoch }, sealedInner), flags: innerFlags(inner) };
 }
 
 export async function sealCheckpoint(crypto: CryptoPort, vaultId: VaultId, stream: StreamName, coversSeq: Seq, content: Uint8Array, authorNsSeq: Seq): Promise<Uint8Array> {
-	const inner = encodeInner("checkpoint", authorNsSeq, 0, content);
-	const sealedInner = await crypto.seal({ aad: checkpointAad(vaultId, stream, coversSeq), plaintext: inner.bytes });
+	const inner = encodeInner({ kind: "checkpoint", authorNsSeq, flags: 0, content });
+	const sealedInner = await crypto.seal({ aad: checkpointAad(vaultId, stream, coversSeq), plaintext: inner });
 	return encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch: crypto.keyEpoch }, sealedInner);
 }
 
@@ -40,23 +50,14 @@ export type Binding =
  * check. The returned inner content is inflated (deflate bit cleared).
  */
 export async function openEnvelope(crypto: CryptoPort, vaultId: VaultId, binding: Binding, payload: Uint8Array): Promise<EnvelopeOpenResult> {
-	let outer;
-	try {
-		outer = decodeOuter(payload);
-	} catch {
-		return { ok: false, reason: "malformed" };
-	}
-	if (outer.header.formatVersion !== ENVELOPE_FORMAT_VERSION) return { ok: false, reason: "unsupported-version" };
-	if (outer.header.suite !== CryptoSuite.none && outer.header.suite !== CryptoSuite.xchacha20poly1305) return { ok: false, reason: "unsupported-suite" };
+	const outer = decodeOuter(payload);
+	if (!outer.ok) return outer;
 	const aad = binding.t === "frame" ? frameAad(vaultId, binding.stream, binding.clientFrameId) : checkpointAad(vaultId, binding.stream, binding.coversSeq);
 	const opened = await crypto.open({ suite: outer.header.suite, keyEpoch: outer.header.keyEpoch, aad, sealed: outer.sealed });
 	if (!opened.ok) return { ok: false, reason: opened.reason === "unknown-key" ? "unknown-key" : opened.reason === "auth-failed" ? "auth-failed" : "unsupported-suite" };
-	let inner;
-	try {
-		inner = decodeInner(opened.plaintext);
-	} catch {
-		return { ok: false, reason: "malformed" };
-	}
+	const dec = decodeInner(opened.plaintext);
+	if (!dec.ok) return dec;
+	const inner = dec.inner;
 	const cls = streamClass(binding.stream);
 	if (cls === "other") return { ok: false, reason: "kind-stream-mismatch" };
 	const allowed = ALLOWED_KINDS[cls];

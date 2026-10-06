@@ -21,8 +21,8 @@ import { Sender } from "../body/sender";
 import { encodeStateAsUpdate, ORIGIN } from "../body/yjsCounters";
 import { defaultPriority, Repo } from "../store/repo";
 import type { QuarantineRecord, TailRecord } from "../store/schema";
-import { toHex, utf8 } from "../sync/__standins__/bytes";
-import { newDocId } from "../sync/__standins__/ids";
+import { newDocId } from "../../core/codec/ids";
+import { bytesToHex, utf8Encode } from "../../core/codec/lib0";
 import { gateRow } from "../sync/ingestRow";
 import { NsRuntime, type DocInfo } from "../sync/nsRuntime";
 import { EngineCtx } from "./context";
@@ -173,8 +173,8 @@ export class LogEngine {
 		if (this.listDocs().some((d) => d.path === path && (d.state === "live" || d.state === "pending"))) throw new Error(`path exists: ${path}`);
 		const docId = newDocId(c.ports.random);
 		const stream = docStream(kind, docId)!;
-		const bytes = utf8(text);
-		const contentHash = toHex(await c.ports.hash.sha256(bytes)) as ContentHash;
+		const bytes = utf8Encode(text);
+		const contentHash = bytesToHex(await c.ports.hash.sha256(bytes)) as ContentHash;
 		await c.docs.chain(async () => {
 			const nsFrame = await buildNsFrame(c.deps, NS_STREAM, [{ t: "create", docId, kind, path, contentHash, size: bytes.length }], c.ns.coversSeq, c.now());
 			const h = await c.handles.acquire(stream);

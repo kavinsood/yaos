@@ -5,7 +5,7 @@ import type { StreamName } from "../../core/types";
 import type { PutCheckpointResult, RelaySession } from "../../ports/relay";
 import { CheckpointState, writeBodyCheckpoint } from "../body/checkpoints";
 import { compactBody } from "../body/compaction";
-import { SimRelay } from "../sync/__standins__/simRelay";
+import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, startTestEngine, until } from "./testHarness";
 

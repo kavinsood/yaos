@@ -1,7 +1,7 @@
 /**
  * StoragePort conformance suite, run against both implementations:
  *  - createIdbStoragePort over a fresh fake-indexeddb IDBFactory per test;
- *  - MemStoragePort (src/engine/sync/__standins__/memStorage.ts).
+ *  - MemStoragePort (src/sim/storage.ts).
  * Implementation-specific behaviour lives in idbStorage.test.ts and
  * memStorage.test.ts.
  */
@@ -18,7 +18,7 @@ import {
 	type YaosSchema as YaosSchemaInterface,
 } from "../store/schema";
 import { createIdbStoragePort } from "./idbStorage";
-import { MemStoragePort } from "../sync/__standins__/memStorage";
+import { MemStoragePort } from "../../sim/storage";
 
 // ---------------------------------------------------------------------------
 // Fixtures

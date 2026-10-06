@@ -14,7 +14,7 @@ import { streamClass, type ClientFrameId, type ContentHash, type DeviceId, type 
 import type { HashPort } from "../../ports/crypto";
 import { gate, type GateCtx } from "../ingest/gate";
 import type { QuarantineRecord, TailRecord } from "../store/schema";
-import { toHex } from "./__standins__/bytes";
+import { bytesToHex } from "../../core/codec/lib0";
 import { LOCAL_FLAG_UNOPENED } from "./nsRuntime";
 
 export interface RowInput {
@@ -58,7 +58,7 @@ export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, now
 }
 
 export async function quarantineRecord(hash: HashPort, input: RowInput, reason: QuarantineRecord["reason"], detail: string, nowMs: number): Promise<QuarantineRecord> {
-	const bytesHash = toHex(await hash.sha256(input.payload)) as ContentHash;
+	const bytesHash = bytesToHex(await hash.sha256(input.payload)) as ContentHash;
 	return {
 		stream: input.stream, seq: input.seq, deviceId: input.deviceId, clientFrameId: input.clientFrameId, reason, detail,
 		bytes: input.payload.length > QUARANTINE_ROW_BYTES ? input.payload.slice(0, QUARANTINE_ROW_BYTES) : input.payload,
