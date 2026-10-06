@@ -17,6 +17,9 @@ import { copyText, obsidianRequest } from "./obsidianEnv";
 import { applyPairedIdentity, formatCountdown, PairingSession } from "./pairFlow";
 import { requestPairingCode, type PairingCodeGrant, type RequestFn } from "./pairing";
 
+/** One-click Cloudflare deploy of the server (README "Deploy to Cloudflare"). */
+const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
+
 export interface PairPrefill {
 	readonly host?: string;
 	readonly pairingCode?: string;
@@ -65,6 +68,11 @@ export class PairModal extends Modal {
 
 		new Setting(contentEl)
 			.setName("Server URL")
+			.setDesc(createFragment((f) => {
+				f.appendText("No server yet? ");
+				f.createEl("a", { text: "Deploy your server", href: CLOUDFLARE_DEPLOY_URL });
+				f.appendText(" on Cloudflare with one click; its console gives you a pairing code.");
+			}))
 			.addText((text) => {
 				text.setPlaceholder("https://sync.example.com").setValue(this.hostValue).onChange((v) => { this.hostValue = v; });
 				text.inputEl.autocomplete = "off";
