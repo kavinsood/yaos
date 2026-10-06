@@ -155,6 +155,11 @@ export function renderStatus(snapshot: StatusSnapshot | null, run: EngineRunStat
 			level = "error";
 			lines.push("The server needs a newer YAOS plugin. Update the plugin to continue syncing.");
 			break;
+		case "key-missing":
+			text = withUnsynced("encryption key missing", n);
+			level = "error";
+			lines.push("This device can't write. Scan a re-key code from another device, or enter the recovery key.");
+			break;
 		case "error": {
 			text = withUnsynced("error", n);
 			level = "error";

@@ -17,6 +17,7 @@ export type EnginePhase =
 	| "revoked"
 	| "epoch-migrating"
 	| "upgrade-required"
+	| "key-missing"
 	| "error";
 
 export interface StatusSnapshot {
@@ -58,6 +59,23 @@ export interface StatusSnapshot {
 	 */
 	readonly maxBlobBytes: number | null;
 	readonly notices: readonly { readonly code: string; readonly level: "info" | "warn" | "error"; readonly atMs: number }[];
+	/** End-to-end encryption state (e2ee-design §18.4). No secrets. The engine always sets it; optional only so older snapshot literals still type-check. */
+	readonly e2ee?: E2eeStatus;
+}
+
+/** Why a key-missing device cannot write (e2ee-design §9.3, §12.4). */
+export type KeyMissingReason = "no-pin" | "no-key" | "revoked-epoch" | "encrypted-vault";
+
+export interface E2eeStatus {
+	/** The pin: null for an unpinned device, which writes nothing (§12.4). */
+	readonly suite: 0 | 1 | null;
+	/** Epoch of new seals; 0 under suite 0 and while no key is usable. */
+	readonly sealEpoch: number;
+	readonly keyMissing: KeyMissingReason | null;
+	/** Sticky: this device has read a valid-looking `k` genesis for its vault, so a suite-0 link is refused. */
+	readonly keyringSeen: boolean;
+	/** Only for an engine started with `creating`, after VAULT_READY.head = 0 and an empty `k` (§15.1). */
+	readonly creatable: boolean;
 }
 
 export interface DiagnosticsEvent {
@@ -70,11 +88,13 @@ export interface DiagnosticsEvent {
 /**
  * exportDiagnostics answer. No secrets, no file contents, and no vault paths outside `paths`.
  *
- * Files are named by pseudonyms: 12 hex chars of SHA-256 over a random per-bundle salt and the
- * file's vault path (or its stream name when the engine does not know the path). The salt is not
- * included, so pseudonyms cannot be matched across bundles or tested against guessed paths. Within
- * one bundle the same file always has the same pseudonym. A doc stream is written as its class prefix
- * plus the pseudonym ("b:1a2b3c4d5e6f"); the vault-wide "ns" and "cfg" streams keep their names.
+ * Files are named by pseudonyms: the first 12 hex chars of CryptoPort.diagHash over a random
+ * per-bundle salt and the file's vault path (or its stream name when the engine does not know the
+ * path). diagHash is a SHA-256 prefix under suite 0 and HMAC(kDiag) under suite 1 (e2ee-design §6.4).
+ * The salt is not included, so pseudonyms cannot be matched across bundles or tested against guessed
+ * paths. Within one bundle the same file always has the same pseudonym. A doc stream is written as its
+ * class prefix plus the pseudonym ("b:1a2b3c4d5e6f"); the vault-wide "ns", "cfg" and "k" streams keep
+ * their names.
  */
 export interface DiagnosticsBundle {
 	readonly generatedAtMs: number;
