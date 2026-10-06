@@ -271,6 +271,18 @@ test("row pruned: absent -> syncedDrop; unchanged -> diskTrash + syncedDrop; cha
 		{ op: "syncedDrop", docId: "d1" },
 	]);
 	assert.equal(changed.consumedDocIds, 1);
+	// not before ns is ready: the entry may just not be read yet
+	assert.deepEqual(run({ synced: [S("d1", "a.md")] }, { nsReady: false }).ops, []);
+});
+
+test("row pruned before ns is ready keeps S: an observed rename still moves the doc once ns is read", () => {
+	// Sim seed 179: IDB wiped (mirrors kept), the user renamed a.md -> b.md, the ns was not read yet. S was
+	// dropped as "pruned", so b.md became a new doc and the old doc came back at a.md on every device.
+	const sc = { synced: [S("d1", "a.md")], local: [L("b.md", h("c0"))], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
+	assert.deepEqual(run(sc, { nsReady: false }).ops, []);
+	const p = run({ ...sc, remote: [R("d1", "a.md")] });
+	assert.deepEqual(opsOf(p), ["nsRename", "syncedPut"]);
+	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d1", path: "b.md" });
 });
 
 // ---------------------------------------------------------------------------

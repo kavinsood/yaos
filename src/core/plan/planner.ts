@@ -38,7 +38,7 @@
  *     synced takes R.path, the disk is left alone.
  *   - A missing synced file is only judged "not renamed" (edit-beats-delete
  *     diskMaterialize, or nsDelete) once inference can run: listing complete,
- *     every fresh local file hashed, ns ready.
+ *     every fresh local file hashed, ns ready. Likewise "pruned" (no remote entry) needs ns ready.
  *   - Blob materialization uses diskMaterialize (as in E4); fetchBlob is the
  *     overwrite of an existing file.
  *   - conflict-flood counts certain conflict copies: blob keep-both and no-base
@@ -320,8 +320,10 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 
 	// ---- rows --------------------------------------------------------------------
 	const pruned = (s: SyncedEntry, l: LocalEntry | undefined, prefix: PlannerOp[]): void => {
-		if (!l) return push([...prefix, drop(s.docId)]);
+		// Before ns is ready a missing entry may just not be read yet (fresh DB after a wipe): keep S, it carries
+		// the doc identity an observed rename of this file still needs.
 		if (!ctx.nsReady) return push(prefix);
+		if (!l) return push([...prefix, drop(s.docId)]);
 		if (l.hash === s.contentHash) {
 			return push([...prefix, { op: "diskTrash", docId: s.docId, path: l.path, expect: { t: "hash", hash: s.contentHash } }, drop(s.docId)],
 				"diskTrash", brakeKey("diskTrash", s.docId, l.path, s.contentHash), l.path);
