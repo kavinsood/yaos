@@ -80,7 +80,7 @@ recovery · [14](#14-rotation-and-revocation) rotation · [15](#15-enable-migrat
 | File contents and settings | **Mitigated** | Sealed. |
 | Attachment equality with a known file | **Mitigated** | The address is `HMAC(kAddr, sha256)`, not sha256. `x:` stream names use the same address (§10.1). |
 | Exact frame, checkpoint and blob sizes | **Mitigated (bucketed)** | Padmé leaks O(log log M) bits per size, with ≤ 12 % overhead [Padmé] (§7.3). |
-| Plaintext sha256 and size in HTTP headers | **Mitigated** | The client never sends `X-YAOS-Content-*`. Server ask A2 removes them. |
+| Plaintext sha256 and size in HTTP headers | **Mitigated** | The client never sends `X-YAOS-Content-*`, and at 7208184 the server neither sets nor reads them. Server ask A2 drops the stale CORS names. |
 | Number of streams, i.e. roughly the number of notes plus canvases | Accepted | One stream per doc is the relay's cost model (relay-wire §11.4). |
 | Stream class (`b:` vs `c:` vs `x:` vs `ns`/`cfg`/`k`) | Accepted | The relay's provisional broadcast keys on `b:`/`c:` (`server/src/streams/protocol.ts:53`). |
 | Which stream was touched when, and by which device | Accepted | Row timing, seq order and deviceId are relay-visible by design. This reveals editing activity per note. |
@@ -953,7 +953,7 @@ rather than an accident.
 | Feature (legacy or possible) | Under suite 1 | Client replacement |
 |---|---|---|
 | Server check that a blob's bytes match its sha256 | Impossible: opaque address | AEAD tag plus sha256 after open (`src/engine/body/refs.ts:50-59`) |
-| `X-YAOS-Content-SHA256` / `-Size` headers (`server/src/http.ts:7`) | Leak plaintext hash and size | The client never sends them (server ask A2 removes them) |
+| `X-YAOS-Content-SHA256` / `-Size` headers | Would leak the plaintext hash and size. At 7208184 they are only still named in the CORS expose list (`server/src/http.ts:7`); nothing sets or reads them | The client never sends them. Server ask A2 removes the stale names |
 | Server-side debugging of content | Impossible | Diagnostics carry `HMAC(kDiag, ·)` hashes (§6.4). The user shares a bundle and correlates locally |
 | Point-in-time restore (D8b) | **Still works**: opaque rows rewind | Old keys stay in the keyring. `k` is re-published (§11.5) |
 | Blob garbage collection | The server cannot see references | Client mark-and-sweep (§10.4), blocked on A3 |
@@ -1142,3 +1142,80 @@ readonly crypto:
 +  - recent events (… paths hashed with `CryptoPort.diagHash`: HMAC(kDiag) under suite 1),
 +  - never key material, recovery keys or setup links.
 ```
+
+## 19. Asks for the server rewrite
+
+Baseline: 7208184. No ask is on the hot path, and none adds cross-DO coordination.
+
+| # | Ask | Why | Priority |
+|---|---|---|---|
+| A1 | Rewrite relay-wire §11.3 (:464) to DECISIONS §5 row 11.3: opaque `^[0-9a-f]{64}$` addresses, no hash check, R2 key `v/<vaultId>/<address>`, PUT overwrites | The doc still describes sha256 addresses that the server verifies | Doc, before WP-E6a |
+| A2 | Drop `X-YAOS-Content-SHA256, X-YAOS-Content-Size` from `CORS_EXPOSE_HEADERS` (`server/src/http.ts:7`) | Stale names for plaintext-revealing headers. Nothing sets them, but they invite reintroduction | Trivial |
+| A3 | `GET /vault/:id/blobs?cursor=` → `{items: [{address, uploadedAt}], next}` (R2 `list` with prefix `v/<vaultId>/`), and `DELETE /vault/:id/blobs/:address?ifUploadedBefore=<ms>` (R2 `head` then `delete`). Device bearer. Cold path, low rate limit | Blob GC (§10.4). Without it, blobs live until the vault is deleted, under any suite | Before WP-E6b |
+| A4 | `POST …/blobs/exists`: answer `400` on a malformed entry instead of silently dropping it (`server/src/router.ts:624-650` filters with `BLOB_ADDRESS_PATTERN`) | A client bug in HMAC addressing would look like "absent" and cause re-uploads forever | Low |
+| A5 | Keep restore carrying the pre-restore device rows (already true, DECISIONS D8b "Crosses the rewind: the device rows only") | A revoked device must stay revoked after a restore (§14.3) | Confirm only |
+| A6 | Keep minting a fresh random epoch on reset and restore (already true, D8, D8a, D8b) | The client re-publishes `k` on a new epoch (§11.5) | Confirm only |
+| A7 | *(withdrawn)* Neutral device names. Already accepted: any string, de-duplicated by `uniqueDeviceName` (`server/src/vault/host.ts:544`) | | None |
+| A8 | Rename "vault key" in `server/src/vault/ticket.ts` (DECISIONS D4) to "ticket key" in code and docs | Avoids confusion with K_e in reviews and in incident response | Low |
+| A9 | Keep stream names opaque: no server-side meaning for `k` or any prefix (`server/src/streams/protocol.ts:16`, `:53`) | `k` needs no server change | Confirm only |
+| A10 | Keep `MAX_STREAM_CHECKPOINT_BYTES` (`server/src/streams/protocol.ts:25`, 4 MiB) and the 1 MiB frame cap stable, or announce changes in VAULT_READY limits | Suite-1 padding is computed against them (§7.3) | Confirm only |
+
+Not asked: a device-list route for clients (the console covers revoke, D7); server-side key storage of any kind;
+per-vault crypto flags on the server (the suite is client-pinned, §12.4).
+
+## 20. Test plan
+
+### 20.1 Known-answer tests (WP-E1)
+
+- **Published vectors**, run under Node WebCrypto and headless Chrome (the spike harness):
+  - AES-256-GCM: GCM spec test case 16 [GCM-spec] (already in `src/host/spike/cryptoProbe.ts`);
+  - HKDF-SHA-256: RFC 5869 A.1–A.3 [RFC5869];
+  - HMAC-SHA-256: RFC 4231 TC1–TC7 [RFC4231].
+- **YAOS golden vectors**, committed as hex:
+  - inputs: fake key `K = 00 01 … 1f`, vaultId `AAAAAAAAAAAAAAAAAAAAAA`, and a seeded `RandomPort` for nonces;
+  - outputs: each subkey's kcv, kAddr of a fixed hash, one frame per envelope kind, one checkpoint, one blob,
+    genesis/roll/revoke records, an RK encode/decode, and a setup link.
+  - **Cross-checked by a second implementation** in the test: Node `node:crypto` (`createCipheriv`, `hkdfSync`,
+    `createHmac`), not WebCrypto, so one implementation's bug cannot certify itself.
+- Codec property tests: Padmé round-trip and bucket monotonicity, varuint and base32 round-trips, and
+  canonical-encoding rejection (as in WP-A).
+
+### 20.2 Tamper, replay and downgrade (measured, WP-E7)
+
+Each test counts outcomes and asserts **all** of them; none samples a single case.
+- **Bit flips.**
+  - For every sealed type (frame, checkpoint, blob, k wrap), flip each byte of header, nonce, ciphertext and tag:
+    every byte for objects ≤ 4 KiB, and 4096 seeded positions otherwise.
+  - Assert `failures == flips`, with the expected reason per region: header → `auth-failed` or `malformed`; tag or
+    ciphertext → `auth-failed`.
+- **AAD substitution.** Change each bound field in turn (vaultId, stream, deviceId, clientFrameId, coversSeq,
+  address, keyEpoch, suite, role) and assert `auth-failed`, 100%.
+- **Cross-type confusion.** Open a frame as a checkpoint, a blob as a frame, a `next` wrap as `prev`: all fail.
+- **Replay (sim relay in hostile mode).** Re-append recorded genuine ns and cfg frames as new rows, at ages of 1,
+  63, 64, 65, 1000 and 10⁵ own frames. Assert the fold digest is identical to a run without the replays, over 1000
+  seeds, and that events `ignored/replay-*` or `duplicate-frame` account for every injected row.
+- **Re-attribution.** Rewrite a row's deviceId: `auth-failed`, 100%.
+- **Downgrade.** Inject suite-0 rows into a suite-1 vault: every one is `suite-downgrade`, and the folds are
+  unchanged. Hide `k` from a fresh key-less device: it must stop at the §12.4 prompt with no seal issued.
+- **Stale epoch.** After a revoke, inject old-epoch frames sealed with K_{r−1}: all ignored, no quarantine, and
+  the fold digest is unchanged.
+- **Keyring forgery.** Garbage records, a roll for r forged with K_{r−1} after a revoke (§11.3), and duplicate
+  records: no device adopts a wrong key.
+
+### 20.3 Simulation with suite 1 (WP-E7)
+
+- `SimConfig.crypto: "none" | "suite1"`. Suite 1 uses the real adapter on Node WebCrypto, wrapped in
+  `DelayedCrypto` (§16.3).
+- **The existing fault matrix runs unchanged under suite 1**, with the same seed counts as suite 0
+  (`src/sim/faults.ts:32-48`). The invariants (`src/sim/invariants.ts`) must hold.
+- **New faults:**
+  - `keyStoreLoss {dev}`: SecretStorage wiped, so the device goes `key-missing`, then re-keys by a sim QR;
+  - `keyRoll {dev}`: forced roll, including concurrent rolls on two devices;
+  - `revoke {dev, by}`: console revoke, then re-key;
+  - `epochRestore`: PITR-like rewind plus a new epoch, so `k` must be re-published;
+  - `hostileReplay`, `hostileDowngrade`.
+- **Leak checks in sim:** the relay sees only bucketed payload sizes (§7.3), and no stream name contains a
+  plaintext hash.
+- **At-rest leak check (desktop, WP-E4):** after an integration run, grep the IndexedDB LevelDB, `data.json`,
+  the diagnostics bundle and the logs for every key and the RK in hex and base64url. Expect zero hits (the same
+  method found Chrome's plaintext CryptoKey bytes, §3).
