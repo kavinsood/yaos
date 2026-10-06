@@ -671,3 +671,117 @@ Rows already sealed under e−1 stay valid. Outbox frames are not re-sealed: a r
   readable anyway.
 - **Genesis position.** Enable writes the genesis record when headSeq = 0 (§15). Readers do not rely on its
   position: validity alone decides.
+
+## 12. Pairing
+
+### 12.1 Pick: a plugin-drawn QR carrying the key in a client-only link
+
+```
+obsidian://yaos?action=setup&host=<host>&pairingCode=<vaultId.secret>&key=<b64url(u8 1 ‖ varuint e ‖ K_e)>
+```
+
+1. The paired device calls `POST /vault/:id/auth/pairing-code` (DECISIONS §2.2), as today.
+2. It builds the link locally, extending `buildSetupLink` (`src/host/ui/pairing.ts:456`).
+   - `key` holds the newest winning epoch and its key: 1 + 1 + 32 bytes, 46 base64url characters.
+   - Older keys come from the `prevWrap` chain (§11.1).
+   - The vaultId is already inside the pairing code (DECISIONS D3).
+3. The plugin draws the QR itself, with `qrcode` 1.5.4 (+9.6 KB gzip **[M]**, §23).
+4. The new device scans it. Obsidian hands the parameters to `registerObsidianProtocolHandler`
+   (`src/host/ui/registerUi.ts:136`). `parseSetupLink` accepts `key` (it joins `SETUP_LINK_KEYS`, `pairing.ts:465`).
+5. **The key is stripped before `/enroll`.** DECISIONS D3 requires exactly this: "A future client-only key part
+   must be stripped before `/enroll`". The key goes into the pending identity, in memory only. After enroll, the
+   device reads `k`, checks kcv and walks the chains (§11.3). It then persists the keys and the suite pin.
+
+Rules:
+
+- **NEVER put a key in any URL the server serves**, including the fragment of `GET /mobile-setup`.
+  - That page is a static Worker response whose JS reads `location.hash` (`server/src/console/mobileSetup.ts:47`).
+  - Its `connect-src 'none'` CSP is set by the same server, so it is no guarantee.
+  - Under suite 1 the pair modal hides `mobileSetupUrl` (`src/host/ui/pairModal.ts:192`).
+- **The link is a secret.** It is shown only after an explicit "Show pairing QR" click and hidden when the code
+  expires (15 min, DECISIONS D3) or the modal closes. It is never logged.
+  - "Copy setup link" stays, for phone → desktop and for desktops without a camera, with a warning: "This link
+    contains your vault key. Send it only over a channel you trust (AirDrop, a cable), never a chat app."
+- **Opening an `obsidian://` QR from the stock camera is [U]** on iOS and Android (§23.3). Fallbacks, in order:
+  1. the copied link;
+  2. pair with the code alone, then enter the recovery key (§12.4).
+- Alternative: SAS or ECDH pairing, where the new device and the old one agree a key through the relay and the
+  user compares a short code (decision D5). Rejected for v1:
+  - it needs an interactive two-device protocol over relay streams, with its own state machine and timeouts;
+  - X25519 support in mobile WebViews is **[U]**;
+  - a QR has the same trust root (the user's eyes on both screens) with no protocol.
+- Alternative: in-plugin QR scanning. Rejected: camera permission inside Obsidian mobile is **[U]**, and it needs
+  a QR decoder dependency.
+
+### 12.2 Enroll from the operator console
+
+The console mints owner codes (DECISIONS D5, `POST /operator/vaults/:id/owner-code`). Its page and QR are served by
+the server, so they can never carry the key. A device paired this way follows §12.4: it needs the recovery key.
+
+### 12.3 Device name
+
+- deviceName is plaintext on the server, shown in the console and stored in device rows
+  (`server/src/vault/host.ts:544`).
+- The default is already a platform label such as "iPhone" or "Mac" (`src/host/ui/deviceName.ts`). The server
+  de-duplicates repeats (`uniqueDeviceName`, `host.ts:544`).
+- Under suite 1 the pair modal shows a hint next to the name field: "Visible to the server operator". No server
+  change is needed (decision D6).
+
+### 12.4 Key-less links and downgrade
+
+A link or code without `key` may lead to an encrypted vault (owner code, or the user typed the code). The server
+cannot be trusted to say which (§2.1), so **the user decides**:
+
+> This setup link has no encryption key.
+> If this vault is end-to-end encrypted, enter its recovery key or scan a pairing QR from one of your devices.
+> [Enter recovery key] [Scan QR instead] [Continue unencrypted]
+
+- "Continue unencrypted" pins suite 0. If `k` later shows a genesis record, the device stops with "This vault is
+  encrypted" (phase `key-missing`) and seals nothing.
+- A suite-1 device treats every suite-0 row as a deterministic malformation (`suite-downgrade`, §9.2). A server
+  that hides `k` and shows suite-0 rows cannot make a pinned device accept plaintext.
+- **Residual risk.** A user who picks "Continue unencrypted" for a vault the server hides as empty writes
+  plaintext. This is the cost of having no server-side truth. The default focus is "Enter recovery key".
+
+## 13. Recovery key
+
+### 13.1 Format
+
+- `RK = 32 random bytes ‖ first 3 bytes of SHA-256(those 32)`: 35 bytes.
+- Crockford base32 gives 56 characters, shown as `YAOS-RK1-` plus 14 groups of 4, e.g.
+  `YAOS-RK1-0000-0000-…` (fake).
+- Decoding ignores case, dashes and spaces, and maps `I`/`L` to `1` and `O` to `0`.
+- The 24-bit checksum catches typos before any crypto: 1 in 16.7M misses.
+- KEK_RK = HKDF(RK[0..32]) (§5.1). The key has full entropy, so no password KDF is needed.
+
+### 13.2 Lifecycle
+
+- **Created** at enable (§15), on the enabling device.
+  - Shown **once** with Copy, plus the advice "Store it outside this vault: a password manager or paper".
+  - The user confirms by retyping 2 random groups. Enable cannot finish until they do.
+- **NEVER stored by YAOS**: not in SecretStorage, `data.json`, IndexedDB or logs. The device holds it only
+  transiently while unwrapping or wrapping.
+- **Used for:**
+  - adding a device without another device at hand (§12.4);
+  - the all-devices-lost case (§13.3);
+  - every revoke, which needs `recoveryWrap` (§14.2).
+- **Change it** ("I lost it" or "it leaked"). This runs a revoke-kind rotation that generates a new RK
+  (§14.2). The old RK still opens everything up to that rotation; that is inherent, since the old RK unwraps the
+  old genesis.
+- Alternative: derive a P-256 recovery key pair from RK, so that a revoke wraps to its public key without the RK
+  being entered. Rejected for v1: deterministic EC private-key import needs the public point, i.e. EC scalar math
+  that WebCrypto does not expose (JWK import requires `x` and `y`; whether PKCS#8 without them imports is **[U]**).
+
+### 13.3 All devices lost
+
+1. Operator console → the vault → "Owner code" (`POST /operator/vaults/:id/owner-code`, DECISIONS §2.2). The
+   console shows the code and its QR.
+2. On a new device: Pair → the owner code → the key-less prompt (§12.4) → "Enter recovery key".
+3. The device enrolls (the RK is never sent anywhere), reads `k` to head, and unwraps the newest genesis or revoke
+   record's `recoveryWrap`. It checks kcv, walks `nextWrap` forward and `prevWrap` back to K_1 (§11.1), stores
+   the keys, and bootstraps normally.
+4. If a revoke happened since the RK was last changed, that revoke record carries a `recoveryWrap` under the RK
+   entered at the time. The chain still resolves because every revoke wraps under the RK in force (§14.2).
+
+Without the RK, and with no device left: **the data is unrecoverable, by design.** The operator can delete the
+vault. Any local copy of the files on disk can seed a new vault.
