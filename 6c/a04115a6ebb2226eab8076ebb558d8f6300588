@@ -1,0 +1,35 @@
+src/host/ui/settingsModel.test.ts
+  s_42fec8a9c03dda::t_99bfbe2ca006b7 27,55
+src/host/ui/settingsModel.ts
+  s_42fec8a9c03dda::t_487ac3b3b012cc 25,70,105,137
+src/host/ui/snapshotsModal.ts
+  s_42fec8a9c03dda::t_2042ef5a301afe 1-292
+src/host/ui/snapshotsModel.test.ts
+  s_42fec8a9c03dda::t_ee19e8e53c7952 1-100
+src/host/ui/snapshotsModel.ts
+  s_27aea4557efbc1::t_24475a83c5f088 1-169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6ca04115a6ebb2226eab8076ebb558d8f6300588",
+  "prompts": {},
+  "sessions": {
+    "s_27aea4557efbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2f141519dac0ecc1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_42fec8a9c03dda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab7f16ac97bca1a6d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
