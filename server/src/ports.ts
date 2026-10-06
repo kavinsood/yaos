@@ -1,6 +1,6 @@
 // Injected ports (DECISIONS §1 D1): the streams core and the DO hosts depend only on these, so the core runs on
-// Node in tests (tests/server/helpers/nodeSqliteStorage.ts, fake sockets, virtual timers). Cloudflare adapters live
-// in vault/cloudflare.ts. Every interface is the structural subset of the Workers API the core calls.
+// Node in tests (tests/server/helpers/nodeSqliteStorage.ts, fake sockets, virtual timers). The Cloudflare adapters
+// live in vault/cloudflare.ts. Every interface is the structural subset of the Workers API the core calls.
 
 /** A SQLite cell as Durable Object SQL returns it (`SqlStorageValue`). */
 export type SqlValue = ArrayBuffer | string | number | null;
@@ -19,6 +19,14 @@ export interface StoragePort {
 	transactionSync<T>(closure: () => T): T;
 }
 
+/**
+ * A read of a table that was never created throws SQLite's "no such table: <name>" (workerd appends
+ * ": SQLITE_ERROR"). The DOs probe their first table this way, so an unknown object costs no write and no DDL.
+ */
+export function isMissingTableError(error: unknown, table: string): boolean {
+	return error instanceof Error && error.message.includes(`no such table: ${table}`);
+}
+
 /** One accepted (hibernatable) WebSocket. */
 export interface SocketPort {
 	close(code?: number, reason?: string): void;
@@ -33,6 +41,11 @@ export interface SocketRegistryPort {
 	createPair(): { client: unknown; server: SocketPort };
 	accept(socket: SocketPort): void;
 	upgradeResponse(client: unknown): Response;
+}
+
+/** A refused WebSocket upgrade (relay-wire §3.1): accept, send one `__YPS:` error frame, close, answer the 101. */
+export interface UpgradeRejectPort {
+	reject(frame: string, code: number, reason: string): Response;
 }
 
 export interface ClockPort {

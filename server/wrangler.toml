@@ -1,21 +1,16 @@
 name = "yaos"
-main = "src/index.ts"
-compatibility_date = "2026-03-02"
+main = "src/worker.ts"
+# DECISIONS-GAP: 2026-04-07 is the date `web_socket_auto_reply_to_close` defaults on (relay-wire close handshake).
+compatibility_date = "2026-04-07"
 
-[alias]
-"@yaos/crdt-engine" = "./src/crdt/ywasmWorkerCrdtEngine.ts"
-
+# One vault DO per vault (`idFromName(vaultId)`) and one config DO (`idFromName("config")`), DECISIONS §2.1.
 [[durable_objects.bindings]]
-name = "YAOS_SYNC"
-class_name = "VaultSyncServer"
+name = "YAOS_VAULT"
+class_name = "VaultDO"
 
 [[durable_objects.bindings]]
 name = "YAOS_CONFIG"
-class_name = "ServerConfig"
-
-[[durable_objects.bindings]]
-name = "YAOS_RECOVERY_JOBS"
-class_name = "RecoveryJob"
+class_name = "ConfigDO"
 
 [[migrations]]
 tag = "v1"
@@ -25,6 +20,12 @@ new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
 tag = "v2"
 new_sqlite_classes = ["RecoveryJob"]
 
+# DECISIONS §1 (fresh deploy, no data migration) and §9 P5: one migration deletes the legacy classes and their data.
+[[migrations]]
+tag = "v3"
+deleted_classes = ["VaultSyncServer", "ServerConfig", "RecoveryJob"]
+new_sqlite_classes = ["VaultDO", "ConfigDO"]
+
 [[r2_buckets]]
 binding = "YAOS_BUCKET"
 bucket_name = "yaos"
@@ -33,12 +34,11 @@ bucket_name = "yaos"
 enabled = true
 
 # ---------------------------------------------------------------------------
-# Admin / debug route gating
+# Debug route gating
 # ---------------------------------------------------------------------------
 #
-# Uncomment YAOS_ENABLE_ADMIN_ROUTES to expose the destructive compact route.
-# The route remains operator-session authenticated when enabled. When absent
-# or empty it returns 404 without waking the vault Durable Object.
+# YAOS_DEBUG_ROUTES = "1" enables POST /vault/:id/debug/simulate-daily-limit (test deployments only). When absent the
+# route is 404 and the vault DO is not called.
 #
 # [vars]
-# YAOS_ENABLE_ADMIN_ROUTES = "true"
+# YAOS_DEBUG_ROUTES = "1"

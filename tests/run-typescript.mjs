@@ -25,6 +25,7 @@ const aliases = useTestAliases
 		"y-protocols": fileURLToPath(new URL("../node_modules/y-protocols", import.meta.url)),
 		obsidian: fileURLToPath(new URL("./mocks/obsidian.ts", import.meta.url)),
 		partyserver: fileURLToPath(new URL("./mocks/partyserver.ts", import.meta.url)),
+		"cloudflare:workers": fileURLToPath(new URL("./mocks/cloudflareWorkers.ts", import.meta.url)),
 		"@shared": fileURLToPath(new URL("../server/src/shared", import.meta.url)),
 	}
 	: {};
