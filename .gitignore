@@ -30,7 +30,6 @@ server/node_modules
 server/dist
 server/.env
 .wrangler
-server/.partykit
 server/.wrangler
 
 # Agent/session artifacts

@@ -1,22 +1,24 @@
 // Opaque streams: socket relay, group commit, receipts and HTTP reads
-// (docs/client-remake/relay-wire.md). Only constructed when YAOS_STREAMS is
-// "true". Never imports the CRDT engine: payloads are opaque bytes.
+// (docs/client-remake/relay-wire.md). Streams are always on (DECISIONS §2.1).
+// Depends only on ../ports; never imports a CRDT engine: payloads are opaque bytes.
 //
-// Write path: a binary APPEND is admitted (raw rate gate, authority, write
-// capability, daily limit), broadcast at once as PROVISIONAL when its stream is
+// Write path: a binary APPEND is admitted (authority, per-device raw rate gate,
+// write capability, daily limit), broadcast at once as PROVISIONAL when its stream is
 // b:/c:, and buffered. The vault-wide buffer commits in one transaction on
 // idle / max age / bytes (StreamStore.commit assigns contiguous seqs in arrival
 // order); a frame that opens a buffer after a quiet spell commits after the short
 // lead window instead of the idle window. After the commit: COMMITTED frames (or COMMIT_NOTICEs for sockets that
 // already got the PROVISIONAL), then one STREAM_RECEIPTS per origin socket.
 // Invariant: durable before receipt, and every seq is delivered live only after
-// its commit.
+// its commit. H2 fallback: a stream's frames commit only once its dedupe index
+// is built; builds advance one bounded step per incoming message and per timer
+// flush (StreamStore.stepDedupe).
 import { bytesToBase64 } from "../base64url";
-import type { VaultActorContext, VaultRole } from "../collaboration";
+import { dailyLimitControl, dailyLimitKind, dailyLimitResponse, isCloudflareDailyLimitError, type DailyLimitKind } from "../dailyLimit";
+import { SYSTEM_CLOCK, SYSTEM_TIMERS, type ClockPort, type SocketPort, type SocketRegistryPort, type TimerPort } from "../ports";
 import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../shared/socketCloseCodes";
 import { SOCKET_LIVENESS_DESCRIPTOR, parseVaultPingFrame } from "../shared/socketLiveness";
-import type { VaultSocketPort, VaultSocketRegistryPort } from "../vaultSocketService";
 import {
 	MAX_CLIENT_FRAME_ID_BYTES,
 	MAX_STREAM_BINARY_MESSAGE_BYTES,
@@ -24,6 +26,7 @@ import {
 	MAX_STREAM_NAME_BYTES,
 	MAX_STREAM_PAYLOAD_BYTES,
 	MAX_STREAM_SOCKETS,
+	MAX_STREAM_SOCKETS_PER_DEVICE,
 	MAX_STREAM_TEXT_MESSAGE_BYTES,
 	STREAM_FEED_DEFAULT_LIMIT,
 	STREAM_FEED_MAX_LIMIT,
@@ -32,7 +35,6 @@ import {
 	STREAM_READ_MAX_BYTES,
 	STREAMS_CAPABILITY_VERSION,
 	STREAMS_DOCUMENT_ID,
-	type StreamsFlagEnv,
 	bytesEqual,
 	decodeAppendFrame,
 	encodeCommitNotice,
@@ -41,7 +43,7 @@ import {
 	isProvisionalStream,
 	validStreamName,
 } from "./protocol";
-import { frameKey, type StreamReadPage, type StreamStore } from "./store";
+import { frameKey, type StreamAppendOutcome, type StreamReadPage, type StreamStore } from "./store";
 
 // ---- configuration ----------------------------------------------------------
 
@@ -52,7 +54,7 @@ export interface StreamRelayConfig {
 	gcMaxMs: number;
 	/** ...or once the buffer holds this many payload bytes. */
 	gcMaxBytes: number;
-	/** Idle commits wait at least this long after the previous commit (0 = off). */
+	/** Idle commits wait at least this long after the previous commit (H8; 0 = off). */
 	gcMinIntervalMs: number;
 	/**
 	 * Leading edge: a frame that finds the buffer empty and no commit in the last gcQuietMs commits (with whatever
@@ -62,7 +64,7 @@ export interface StreamRelayConfig {
 	 */
 	gcLeadMs: number;
 	gcQuietMs: number;
-	/** Per-socket raw admission token bucket (every received message, before parsing). */
+	/** H6: per-device raw admission token bucket, shared by the device's sockets (every received message, before parsing). */
 	rateBytesPerSec: number;
 	burstBytes: number;
 	maxSockets: number;
@@ -72,7 +74,7 @@ export const DEFAULT_STREAM_RELAY_CONFIG: Readonly<StreamRelayConfig> = Object.f
 	gcIdleMs: 300,
 	gcMaxMs: 1_500,
 	gcMaxBytes: 64 * 1024,
-	gcMinIntervalMs: 0,
+	gcMinIntervalMs: 1_000,
 	gcLeadMs: 20,
 	gcQuietMs: 1_500,
 	rateBytesPerSec: 256 * 1024,
@@ -80,7 +82,7 @@ export const DEFAULT_STREAM_RELAY_CONFIG: Readonly<StreamRelayConfig> = Object.f
 	maxSockets: MAX_STREAM_SOCKETS,
 });
 
-export interface StreamsEnv extends StreamsFlagEnv {
+export interface StreamsEnv {
 	YAOS_STREAMS_GC_IDLE_MS?: string;
 	YAOS_STREAMS_GC_MAX_MS?: string;
 	YAOS_STREAMS_GC_MAX_BYTES?: string;
@@ -114,7 +116,24 @@ export function readStreamRelayConfig(env: StreamsEnv | null | undefined): Strea
 	};
 }
 
-// ---- socket attachment ------------------------------------------------------
+// ---- actor and socket attachment ----------------------------------------------
+
+/** VAULT_READY `role` (relay-wire §16): the type keeps "member"; only "owner" is sent (DECISIONS D6). */
+export type VaultRole = "owner" | "member";
+
+/** The identity a streams socket is admitted with (the D6 constants plus the device). */
+export interface StreamActor {
+	vaultId: string;
+	vaultGeneration: string;
+	principalId: string;
+	membershipRevision: number;
+	deviceId: string;
+	deviceName?: string;
+	deviceCredentialRevision: number;
+	role: VaultRole;
+	policyVersion: number;
+	capabilityDigest: string;
+}
 
 export interface StreamSocketAttachment {
 	kind: "streams";
@@ -149,7 +168,7 @@ export function parseStreamSocketAttachment(value: unknown): StreamSocketAttachm
 		? record as unknown as StreamSocketAttachment : null;
 }
 
-function actorOf(attachment: StreamSocketAttachment): VaultActorContext {
+function actorOf(attachment: StreamSocketAttachment): StreamActor {
 	return {
 		vaultId: attachment.vaultId,
 		vaultGeneration: attachment.vaultGeneration,
@@ -166,26 +185,15 @@ function actorOf(attachment: StreamSocketAttachment): VaultActorContext {
 
 // ---- service ------------------------------------------------------------------
 
-/** Timer seam (tests drive virtual time). */
-export interface StreamTimers {
-	set(callback: () => void, ms: number): unknown;
-	clear(handle: unknown): void;
-}
-
-const GLOBAL_TIMERS: StreamTimers = {
-	set: (callback, ms) => setTimeout(callback, ms),
-	clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-};
-
 export interface StreamRelayOptions {
 	config: StreamRelayConfig;
 	/** Getter: the runtime replaces storage-bound objects on vault delete. */
 	store: () => StreamStore;
-	sockets: VaultSocketRegistryPort;
-	/** `__YPS:` control send with the runtime's decorateControl (D8 daily-limit typing). */
-	sendControl: (socket: VaultSocketPort, value: unknown) => void;
-	/** Cached durable authority check (VaultStore.validateActorCached). */
-	validateActor: (actor: VaultActorContext) => boolean;
+	sockets: SocketRegistryPort;
+	/** `__YPS:` control send of `value` as is (the relay types its own frames, H3). */
+	sendControl: (socket: SocketPort, value: unknown) => void;
+	/** The host's authority check (the vault DO: the actor's device is in the device map). */
+	validateActor: (actor: StreamActor) => boolean;
 	/** D8: the free-plan daily row limit is latched. */
 	dailyLimitActive: () => boolean;
 	/** D8: records a failed commit's error (latches the daily limit when it is one). */
@@ -193,14 +201,19 @@ export interface StreamRelayOptions {
 	vaultId: () => string;
 	vaultGeneration: () => string;
 	runtimeEpoch: string;
-	now?: () => number;
-	timers?: StreamTimers;
+	clock?: ClockPort;
+	timers?: TimerPort;
+	/** H3 retry jitter source in [0, 1) (default Math.random). */
+	random?: () => number;
 }
 
-/** R12-style raw admission gate of one socket. */
-interface RawGate { tokens: number; at: number; refused: boolean }
+/** H6 raw admission bucket of one device. */
+interface DeviceBucket { tokens: number; at: number }
 
-interface Waiter { socket: VaultSocketPort; socketId: string }
+/** H5 cache entry: the attachment parsed once per runtime and the actor the device map is checked with. */
+interface CachedSocket { attachment: StreamSocketAttachment; actor: StreamActor }
+
+interface Waiter { socket: SocketPort; socketId: string }
 
 interface PendingFrame {
 	key: string;
@@ -214,6 +227,8 @@ interface PendingFrame {
 	provisional: boolean;
 	/** Socket ordinal at the PROVISIONAL broadcast: later sockets get COMMITTED instead of a notice. */
 	ordinal: number;
+	/** H2: a flush held it back while its stream's index builds; its bytes no longer count toward the bytes trigger. */
+	held: boolean;
 }
 
 export type StreamFlushReason = "lead" | "idle" | "max" | "bytes" | "forced";
@@ -236,10 +251,13 @@ export interface StreamRelayCounters {
 	notices: number;
 	rateCloses: number;
 	oversizeCloses: number;
+	deviceSocketEvictions: number;
 	rawDrops: number;
 	authorityCloses: number;
 	dailyLimitRejects: number;
 	wakeNotices: number;
+	/** H2: frames a flush held back because their stream's index was still building (once per flush). */
+	dedupeHeld: number;
 }
 
 export type StreamReceipt = { stream: string; clientFrameId: string; seq: number; deduped: boolean };
@@ -274,15 +292,29 @@ export class StreamRelayService {
 	readonly counters: StreamRelayCounters = {
 		appendFrames: 0, commits: 0, committedRows: 0, storeDedupes: 0, pendingDedupes: 0, conflicts: 0,
 		commitFailures: 0, flushLead: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0,
-		committedBroadcasts: 0, notices: 0, rateCloses: 0, oversizeCloses: 0, rawDrops: 0, authorityCloses: 0,
-		dailyLimitRejects: 0, wakeNotices: 0,
+		committedBroadcasts: 0, notices: 0, rateCloses: 0, oversizeCloses: 0, deviceSocketEvictions: 0, rawDrops: 0,
+		authorityCloses: 0, dailyLimitRejects: 0, wakeNotices: 0, dedupeHeld: 0,
 	};
-	private readonly timers: StreamTimers;
-	private readonly gates = new WeakMap<object, RawGate>();
+	private readonly clock: ClockPort;
+	private readonly timers: TimerPort;
+	private readonly random: () => number;
+	/** Every socket's parsed attachment (null: not a streams socket): `deserializeAttachment` once per socket per runtime. */
 	private readonly attachments = new WeakMap<object, StreamSocketAttachment | null>();
+	/**
+	 * H5 fanout set: the open streams sockets of admitted devices. Null until built once per runtime from
+	 * `getWebSockets()` (ensureWakeNotice); then maintained on accept, close, error and every close this relay makes.
+	 */
+	private cache: Map<SocketPort, CachedSocket> | null = null;
+	/** H5/H6: each device's cached sockets, oldest admitted first. */
+	private readonly byDevice = new Map<string, SocketPort[]>();
+	/** Sockets this relay closed or saw close: their later messages are dropped in O(1). */
+	private readonly closing = new WeakSet<object>();
+	/** H6: one bucket per device, full when first used in a runtime, kept for the runtime (a reconnect does not refill it), deleted on revoke. */
+	private readonly buckets = new Map<string, DeviceBucket>();
 	private readonly ordinals = new WeakMap<object, number>();
 	private socketOrdinal = 0;
 	private pending: PendingFrame[] = [];
+	/** Payload bytes of the buffered frames not held back (H2): the bytes trigger. */
 	private pendingBytes = 0;
 	private readonly pendingByKey = new Map<string, PendingFrame>();
 	private idleTimer: unknown = null;
@@ -290,18 +322,24 @@ export class StreamRelayService {
 	private lastCommitAt = Number.NEGATIVE_INFINITY;
 	/** Commit deadline of a buffer opened after a quiet spell (leading edge), else null. */
 	private leadAt: number | null = null;
-	private wakeChecked = false;
+	/** H3: consecutive failed commits in this runtime (reset by a successful commit). */
+	private failures = 0;
+	/** H3: kind of the last daily-limit error this relay classified (typing of up-front refusals). */
+	private dailyKind: DailyLimitKind = "rows-written";
+	private writes = 0;
 
 	constructor(private readonly options: StreamRelayOptions) {
 		this.config = options.config;
-		this.timers = options.timers ?? GLOBAL_TIMERS;
+		this.clock = options.clock ?? SYSTEM_CLOCK;
+		this.timers = options.timers ?? SYSTEM_TIMERS;
+		this.random = options.random ?? Math.random;
 	}
 
 	private now(): number {
-		return this.options.now?.() ?? Date.now();
+		return this.clock.now();
 	}
 
-	private attachmentOf(socket: VaultSocketPort): StreamSocketAttachment | null {
+	private attachmentOf(socket: SocketPort): StreamSocketAttachment | null {
 		if (this.attachments.has(socket)) return this.attachments.get(socket)!;
 		let attachment: StreamSocketAttachment | null = null;
 		try { attachment = parseStreamSocketAttachment(socket.deserializeAttachment()); } catch { /* closed */ }
@@ -310,21 +348,59 @@ export class StreamRelayService {
 	}
 
 	/** Whether `socket` is a streams socket (the runtime routes its messages here). */
-	owns(socket: VaultSocketPort): boolean {
+	owns(socket: SocketPort): boolean {
 		return this.attachmentOf(socket) !== null;
 	}
 
-	private streamSockets(): Array<{ socket: VaultSocketPort; attachment: StreamSocketAttachment }> {
-		const result: Array<{ socket: VaultSocketPort; attachment: StreamSocketAttachment }> = [];
-		for (const socket of this.options.sockets.sockets()) {
-			const attachment = this.attachmentOf(socket);
-			if (attachment) result.push({ socket, attachment });
+	/**
+	 * The fanout set (H5): the cached sockets, built once per runtime. `getWebSockets()` may still return a socket
+	 * after `close()` (developers.cloudflare.com/durable-objects/api/state/#getwebsockets), so membership is kept
+	 * here, not read from the platform. The device map is still consulted per socket (one Map lookup): a device the
+	 * host dropped from the map without `revokeDevice` is superseded here and leaves the set (D7).
+	 */
+	private streamSockets(): Array<{ socket: SocketPort; attachment: StreamSocketAttachment }> {
+		this.ensureWakeNotice();
+		const result: Array<{ socket: SocketPort; attachment: StreamSocketAttachment }> = [];
+		for (const [socket, entry] of this.cache!) {
+			if (this.options.validateActor(entry.actor)) result.push({ socket, attachment: entry.attachment });
+			else this.supersede(socket);
 		}
 		return result;
 	}
 
+	private cacheAdd(socket: SocketPort, attachment: StreamSocketAttachment): void {
+		if (this.cache!.has(socket)) return;
+		this.cache!.set(socket, { attachment, actor: actorOf(attachment) });
+		const own = this.byDevice.get(attachment.deviceId);
+		if (own) own.push(socket);
+		else this.byDevice.set(attachment.deviceId, [socket]);
+	}
+
+	private cacheRemove(socket: SocketPort): void {
+		const entry = this.cache?.get(socket);
+		if (!entry) return;
+		this.cache!.delete(socket);
+		const own = this.byDevice.get(entry.attachment.deviceId);
+		if (!own) return;
+		const at = own.indexOf(socket);
+		if (at >= 0) own.splice(at, 1);
+		if (own.length === 0) this.byDevice.delete(entry.attachment.deviceId);
+	}
+
+	/** Closes a socket this relay refuses: it leaves the fanout set in this turn and its later messages are dropped. */
+	private closeSocket(socket: SocketPort, code: number, reason: string): void {
+		this.closing.add(socket);
+		this.cacheRemove(socket);
+		try { socket.close(code, reason); } catch { /* closed */ }
+	}
+
 	head(): number {
 		return this.options.store().head();
+	}
+
+	/** D8b finish: committed appended rows plus successful checkpoint writes since this runtime booted. */
+	get writesThisRuntime(): number {
+		return this.writes;
 	}
 
 	limits() {
@@ -349,13 +425,22 @@ export class StreamRelayService {
 
 	// ---- accept -----------------------------------------------------------
 
-	/** Accepts an authorized streams socket upgrade (`vault.content.read` already checked). */
-	accept(actor: VaultActorContext, canWrite: boolean): Response {
+	/**
+	 * Accepts an authorized streams socket upgrade (the host has verified the ticket and the device). H6: a device
+	 * at MAX_STREAM_SOCKETS_PER_DEVICE first closes its oldest socket (1001 `device_socket_limit`); this runs before
+	 * the vault-wide cap, so a device at its cap can always reconnect.
+	 */
+	accept(actor: StreamActor, canWrite: boolean): Response {
 		if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
+		this.ensureWakeNotice();
+		const own = this.byDevice.get(actor.deviceId);
+		while (own && own.length >= MAX_STREAM_SOCKETS_PER_DEVICE) {
+			this.counters.deviceSocketEvictions++;
+			this.closeSocket(own[0]!, 1001, "device_socket_limit");
+		}
 		if (this.streamSockets().length >= this.config.maxSockets) {
 			return json({ error: "stream_socket_limit" }, 429, { "Retry-After": "1" });
 		}
-		this.ensureWakeNotice();
 		const pair = this.options.sockets.createPair();
 		const server = pair.server;
 		const now = this.now();
@@ -379,6 +464,7 @@ export class StreamRelayService {
 		server.serializeAttachment(attachment);
 		this.options.sockets.accept(server);
 		this.attachments.set(server, attachment);
+		this.cacheAdd(server, attachment);
 		this.ordinals.set(server, ++this.socketOrdinal);
 		this.options.sendControl(server, {
 			type: "VAULT_READY",
@@ -405,86 +491,121 @@ export class StreamRelayService {
 	}
 
 	/**
-	 * Once per runtime: streams sockets admitted by an earlier runtime (hibernation
-	 * wake, or an eviction that may have dropped buffered frames) are told to
-	 * resend every unacknowledged append. Resends are deduplicated.
+	 * Once per runtime, H5 rebuild: the socket cache is built from `getWebSockets()`, each attachment parsed once.
+	 * Streams sockets admitted by an earlier runtime (hibernation wake, or an eviction that may have dropped
+	 * buffered frames) are told to resend every unacknowledged append; resends are deduplicated. A surviving socket
+	 * whose device is no longer in the device map is skipped and gets authority_superseded + 4403 (D7, O3).
 	 */
 	ensureWakeNotice(): void {
-		if (this.wakeChecked) return;
-		this.wakeChecked = true;
+		if (this.cache !== null) return;
+		this.cache = new Map();
 		let head: number | null = null;
-		for (const { socket, attachment } of this.streamSockets()) {
-			if (attachment.runtimeEpoch === this.options.runtimeEpoch) continue;
-			const updated = { ...attachment, runtimeEpoch: this.options.runtimeEpoch };
-			try { socket.serializeAttachment(updated); } catch { continue; }
-			this.attachments.set(socket, updated);
-			head ??= this.head();
-			this.options.sendControl(socket, { type: "STREAM_RESEND", reason: "runtime_restarted",
-				runtimeEpoch: this.options.runtimeEpoch, head });
-			this.counters.wakeNotices++;
+		const kept: Array<{ socket: SocketPort; attachment: StreamSocketAttachment }> = [];
+		for (const socket of this.options.sockets.sockets()) {
+			if (this.closing.has(socket)) continue;
+			let attachment = this.attachmentOf(socket);
+			if (!attachment) continue;
+			if (!this.options.validateActor(actorOf(attachment))) { this.supersede(socket); continue; }
+			if (attachment.runtimeEpoch !== this.options.runtimeEpoch) {
+				const updated = { ...attachment, runtimeEpoch: this.options.runtimeEpoch };
+				try { socket.serializeAttachment(updated); } catch { continue; }
+				this.attachments.set(socket, updated);
+				attachment = updated;
+				head ??= this.head();
+				this.options.sendControl(socket, { type: "STREAM_RESEND", reason: "runtime_restarted",
+					runtimeEpoch: this.options.runtimeEpoch, head });
+				this.counters.wakeNotices++;
+			}
+			kept.push({ socket, attachment });
 		}
+		kept.sort((left, right) => left.attachment.admittedAt - right.attachment.admittedAt);
+		for (const entry of kept) this.cacheAdd(entry.socket, entry.attachment);
 	}
 
 	// ---- messages -----------------------------------------------------------
 
-	message(socket: VaultSocketPort, message: string | ArrayBuffer): void {
-		const attachment = this.attachmentOf(socket);
-		if (!attachment) { try { socket.close(1008, "not a streams socket"); } catch { /* closed */ } return; }
-		if (!this.charge(socket, message)) return;
+	message(socket: SocketPort, message: string | ArrayBuffer): void {
+		if (this.closing.has(socket)) { this.counters.rawDrops++; return; }
 		this.ensureWakeNotice();
-		if (typeof message === "string") this.control(socket, attachment, message);
-		else this.append(socket, attachment, new Uint8Array(message));
+		let entry = this.cache!.get(socket);
+		if (!entry) {
+			// The rebuild may have just superseded it.
+			if (this.closing.has(socket)) { this.counters.rawDrops++; return; }
+			const attachment = this.attachmentOf(socket);
+			if (!attachment) { this.closeSocket(socket, 1008, "not a streams socket"); return; }
+			// An open streams socket the cache lost track of: admitted → back into the set; otherwise superseded below.
+			if (this.options.validateActor(actorOf(attachment))) this.cacheAdd(socket, attachment);
+			entry = { attachment, actor: actorOf(attachment) };
+		}
+		// D7: the device map is checked first, before any echo, PROVISIONAL broadcast or buffering.
+		if (!this.authorityHolds(socket, entry.actor)) return;
+		if (!this.charge(socket, entry.attachment, message)) return;
+		let buffered = false;
+		if (typeof message === "string") this.control(socket, entry.attachment, message);
+		else buffered = this.append(socket, entry.attachment, new Uint8Array(message));
+		// H2 fallback: an incoming message is a fresh CPU budget (DO limits: each WebSocket message resets it), so it
+		// carries one bounded build step, before a bytes-triggered flush can try to commit the frame.
+		this.stepDedupe();
+		if (buffered) this.schedule();
+	}
+
+	/** H2 fallback: one bounded build step. A failed read leaves the build queued: the next flush retries it. */
+	private stepDedupe(): void {
+		try {
+			this.options.store().stepDedupe();
+		} catch (error) {
+			this.options.noteCommitError(error);
+			console.warn("[yaos-streams] dedupe build failed", error instanceof Error ? error.message : String(error));
+		}
 	}
 
 	/**
-	 * Raw admission: charges the received size (bytes for binary, UTF-16 units for
-	 * text) before any parsing. An oversize message closes 1009; an overdraft
-	 * sends VAULT_BACKPRESSURE and closes 1013. Either way every later message of
-	 * the socket is dropped in O(1). Frames buffered before still commit.
+	 * H6 raw admission: charges the received size (bytes for binary, UTF-16 units
+	 * for text) to the device's bucket before any parsing. An oversize message
+	 * closes 1009 (uncharged); an overdraft sends VAULT_BACKPRESSURE and closes the
+	 * overdrawing socket 1013. Either way every later message of the socket is
+	 * dropped in O(1). Frames the socket buffered before the close still commit: a
+	 * rate or size close is not a revoke (a D7 revoke drops them, see revokeDevice).
 	 */
-	private charge(socket: VaultSocketPort, message: string | ArrayBuffer): boolean {
-		let gate = this.gates.get(socket);
-		const now = this.now();
-		if (!gate) {
-			gate = { tokens: this.config.burstBytes, at: now, refused: false };
-			this.gates.set(socket, gate);
-		}
-		if (gate.refused) { this.counters.rawDrops++; return false; }
+	private charge(socket: SocketPort, attachment: StreamSocketAttachment, message: string | ArrayBuffer): boolean {
 		const size = typeof message === "string" ? message.length : message.byteLength;
 		const max = typeof message === "string" ? MAX_STREAM_TEXT_MESSAGE_BYTES : MAX_STREAM_BINARY_MESSAGE_BYTES;
-		gate.tokens = Math.min(this.config.burstBytes, gate.tokens + (Math.max(0, now - gate.at) * this.config.rateBytesPerSec) / 1000);
-		gate.at = now;
-		if (size <= max && gate.tokens >= size) {
-			gate.tokens -= size;
-			return true;
-		}
-		gate.refused = true;
 		if (size > max) {
 			this.counters.oversizeCloses++;
-			try { socket.close(1009, "message exceeds stream admission limit"); } catch { /* closed */ }
-		} else {
-			this.counters.rateCloses++;
-			this.options.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: "relay_rate_limit" });
-			try { socket.close(1013, "relay rate limit"); } catch { /* closed */ }
+			this.closeSocket(socket, 1009, "message exceeds stream admission limit");
+			return false;
 		}
+		const now = this.now();
+		let bucket = this.buckets.get(attachment.deviceId);
+		if (!bucket) {
+			bucket = { tokens: this.config.burstBytes, at: now };
+			this.buckets.set(attachment.deviceId, bucket);
+		}
+		bucket.tokens = Math.min(this.config.burstBytes,
+			bucket.tokens + (Math.max(0, now - bucket.at) * this.config.rateBytesPerSec) / 1000);
+		bucket.at = now;
+		if (bucket.tokens >= size) {
+			bucket.tokens -= size;
+			return true;
+		}
+		this.counters.rateCloses++;
+		this.options.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: "relay_rate_limit" });
+		this.closeSocket(socket, 1013, "relay rate limit");
 		return false;
 	}
 
-	private authorityHolds(socket: VaultSocketPort, attachment: StreamSocketAttachment): boolean {
-		if (this.options.validateActor(actorOf(attachment))) return true;
-		this.counters.authorityCloses++;
-		this.options.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
-		try { socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded"); } catch { /* closed */ }
+	private authorityHolds(socket: SocketPort, actor: StreamActor): boolean {
+		if (this.options.validateActor(actor)) return true;
+		this.supersede(socket);
 		return false;
 	}
 
-	private control(socket: VaultSocketPort, attachment: StreamSocketAttachment, message: string): void {
+	private control(socket: SocketPort, attachment: StreamSocketAttachment, message: string): void {
 		if (!message.startsWith("__YPS:")) return;
 		let value: unknown;
 		try { value = JSON.parse(message.slice(6)); } catch { return; }
 		const ping = parseVaultPingFrame(value);
 		if (!ping) return;
-		if (!this.authorityHolds(socket, attachment)) return;
 		this.options.sendControl(socket, {
 			type: "VAULT_PONG",
 			probeId: ping.probeId,
@@ -495,20 +616,20 @@ export class StreamRelayService {
 		});
 	}
 
-	private reject(socket: VaultSocketPort, stream: string, clientFrameId: string, code: string, extra: Record<string, unknown> = {}): void {
+	private reject(socket: SocketPort, stream: string, clientFrameId: string, code: string, extra: Record<string, unknown> = {}): void {
 		this.options.sendControl(socket, { type: "STREAM_APPEND_REJECTED", stream, clientFrameId, code, ...extra });
 	}
 
-	private append(socket: VaultSocketPort, attachment: StreamSocketAttachment, bytes: Uint8Array): void {
+	/** Admits one APPEND. Returns true when it was buffered (the caller schedules the flush). */
+	private append(socket: SocketPort, attachment: StreamSocketAttachment, bytes: Uint8Array): boolean {
 		const frame = decodeAppendFrame(bytes);
 		if ("error" in frame) {
-			const code = frame.error === "payload_too_large" ? 1009 : 1008;
-			try { socket.close(code, `stream frame rejected: ${frame.error}`); } catch { /* closed */ }
-			return;
+			// H1: the close reason is the bare error code (`malformed_frame` for every codec violation).
+			this.closeSocket(socket, frame.error === "payload_too_large" ? 1009 : 1008, frame.error);
+			return false;
 		}
 		this.counters.appendFrames++;
-		if (!attachment.canWrite) { this.reject(socket, frame.stream, frame.clientFrameId, "write_forbidden"); return; }
-		if (!this.authorityHolds(socket, attachment)) return;
+		if (!attachment.canWrite) { this.reject(socket, frame.stream, frame.clientFrameId, "write_forbidden"); return false; }
 		const waiter = { socket, socketId: attachment.socketId };
 		const key = frameKey(attachment.deviceId, frame.clientFrameId);
 		const pending = this.pendingByKey.get(key);
@@ -520,20 +641,19 @@ export class StreamRelayService {
 				this.counters.conflicts++;
 				this.reject(socket, frame.stream, frame.clientFrameId, "client_frame_id_conflict");
 			}
-			return;
+			return false;
 		}
 		if (this.options.dailyLimitActive()) {
-			// D8: decorateControl types this as cf_daily_limit with resetAt.
+			// H3: refused before any broadcast or buffering. DECISIONS-GAP: the host exposes only "latched", not the
+			// latched kind; the kind is the one this relay last classified, else "rows-written" (the latch default).
 			this.counters.dailyLimitRejects++;
-			this.options.sendControl(socket, { type: "VAULT_ERROR", code: "durability_failed",
-				message: "append was not committed; resend after the daily limit resets",
-				stream: frame.stream, clientFrameIds: [frame.clientFrameId] });
-			return;
+			this.options.sendControl(socket, dailyLimitControl(this.now(), this.dailyKind, frame.stream, [frame.clientFrameId]));
+			return false;
 		}
 		const provisional = isProvisionalStream(frame.stream);
 		const entry: PendingFrame = { key, stream: frame.stream, deviceId: attachment.deviceId,
 			clientFrameId: frame.clientFrameId, payload: frame.payload, origin: waiter, duplicates: [],
-			provisional, ordinal: this.socketOrdinal };
+			provisional, ordinal: this.socketOrdinal, held: false };
 		if (provisional) {
 			const message = encodeProvisional({ stream: frame.stream, deviceId: attachment.deviceId,
 				clientFrameId: frame.clientFrameId, payload: frame.payload });
@@ -545,7 +665,8 @@ export class StreamRelayService {
 		this.pending.push(entry);
 		this.pendingByKey.set(key, entry);
 		this.pendingBytes += frame.payload.byteLength;
-		this.schedule();
+		this.options.store().queueDedupe(frame.stream);
+		return true;
 	}
 
 	private schedule(): void {
@@ -573,16 +694,21 @@ export class StreamRelayService {
 		return this.pending.length;
 	}
 
-	/** Commits the buffer now, synchronously (authority fences, drain, restart). */
-	flushForAuthorityFence(): void {
-		this.flush("forced");
-	}
-
-	/** Commits every buffered frame in one transaction, then sends broadcasts and receipts. */
+	/**
+	 * Commits the buffered frames in one transaction, then sends broadcasts and receipts. H2 fallback: frames of a
+	 * stream whose index is still building are held back, in order, for a later flush (re-armed here); a timer flush
+	 * first advances the builds one step (a bytes flush runs in a message turn, which already stepped). A forced
+	 * flush holds nothing back (the commit builds inline). A failed flush fails every frame it took.
+	 *
+	 * DECISIONS-GAP: H2 does not say what drives the steps. They run once per incoming message and once per timer
+	 * flush. A message resets the DO's CPU budget and a timer does not, so with no messages arriving the timer steps
+	 * of one build share a single budget window (a fresh budget per step would need an alarm, which the vault host
+	 * owns).
+	 */
 	flush(reason: StreamFlushReason): void {
-		const frames = this.pending;
+		const taken = this.pending;
 		this.clearTimers();
-		if (frames.length === 0) return;
+		if (taken.length === 0) return;
 		this.pending = [];
 		this.pendingBytes = 0;
 		this.pendingByKey.clear();
@@ -591,20 +717,40 @@ export class StreamRelayService {
 		else if (reason === "max") this.counters.flushMax++;
 		else if (reason === "bytes") this.counters.flushBytes++;
 		else this.counters.flushForced++;
-		let outcomes;
+		let frames = taken;
+		const held: PendingFrame[] = [];
+		let outcomes: StreamAppendOutcome[] = [];
 		try {
-			outcomes = this.options.store().commit(frames).outcomes;
+			const store = this.options.store();
+			if (reason !== "forced") {
+				for (const frame of taken) store.queueDedupe(frame.stream);
+				if (reason !== "bytes") store.stepDedupe();
+				frames = [];
+				for (const frame of taken) (store.dedupeReady(frame.stream) ? frames : held).push(frame);
+			}
+			if (frames.length > 0) outcomes = store.commit(frames).outcomes;
 		} catch (error) {
 			this.counters.commitFailures++;
+			this.failures++;
 			this.options.noteCommitError(error);
 			console.warn("[yaos-streams] commit failed", error instanceof Error ? error.message : String(error));
-			this.failed(frames);
+			this.failed(taken, error);
 			return;
 		}
-		this.lastCommitAt = this.now();
-		this.counters.commits++;
+		if (frames.length > 0) {
+			this.failures = 0;
+			this.lastCommitAt = this.now();
+			this.counters.commits++;
+		}
+		if (held.length > 0) {
+			this.counters.dedupeHeld += held.length;
+			for (const frame of held) { frame.held = true; this.pendingByKey.set(frame.key, frame); }
+			this.pending = held;
+			this.schedule();
+		}
+		if (frames.length === 0) return;
 		const sockets = this.streamSockets();
-		const receipts = new Map<string, { socket: VaultSocketPort; receipts: StreamReceipt[] }>();
+		const receipts = new Map<string, { socket: SocketPort; receipts: StreamReceipt[] }>();
 		const addReceipt = (waiter: Waiter, receipt: StreamReceipt) => {
 			let entry = receipts.get(waiter.socketId);
 			if (!entry) { entry = { socket: waiter.socket, receipts: [] }; receipts.set(waiter.socketId, entry); }
@@ -624,7 +770,7 @@ export class StreamRelayService {
 				continue;
 			}
 			const seq = outcome.seq;
-			if (outcome.kind === "appended") this.counters.committedRows++;
+			if (outcome.kind === "appended") { this.counters.committedRows++; this.writes++; }
 			else this.counters.storeDedupes++;
 			// Live delivery: rows appended now go to every other socket (notice for those
 			// that hold the PROVISIONAL); a row deduped against an earlier commit was
@@ -656,7 +802,7 @@ export class StreamRelayService {
 		}
 	}
 
-	private dropProvisional(sockets: ReadonlyArray<{ socket: VaultSocketPort; attachment: StreamSocketAttachment }>,
+	private dropProvisional(sockets: ReadonlyArray<{ socket: SocketPort; attachment: StreamSocketAttachment }>,
 		frame: PendingFrame, reason: string): void {
 		for (const peer of sockets) {
 			if (peer.attachment.socketId === frame.origin.socketId) continue;
@@ -666,10 +812,17 @@ export class StreamRelayService {
 		}
 	}
 
-	/** A failed commit: nothing was written. Origins resend; holders of PROVISIONALs drop them. */
-	private failed(frames: readonly PendingFrame[]): void {
+	/**
+	 * A failed commit: nothing was written. Origins resend; holders of PROVISIONALs drop them. H3: the error is typed
+	 * here, at the source: the daily limit → `VAULT_ERROR cf_daily_limit`, anything else → `durability_failed` with
+	 * `retryAfterMs` (exponential in the consecutive failed commits n, jittered per message).
+	 */
+	private failed(frames: readonly PendingFrame[], error: unknown): void {
+		const daily = isCloudflareDailyLimitError(error);
+		if (daily) this.dailyKind = dailyLimitKind(error);
+		const now = this.now();
 		const sockets = this.streamSockets();
-		const byOrigin = new Map<string, { socket: VaultSocketPort; streams: Map<string, string[]> }>();
+		const byOrigin = new Map<string, { socket: SocketPort; streams: Map<string, string[]> }>();
 		for (const frame of frames) {
 			for (const waiter of [frame.origin, ...frame.duplicates]) {
 				let entry = byOrigin.get(waiter.socketId);
@@ -682,35 +835,64 @@ export class StreamRelayService {
 		}
 		for (const entry of byOrigin.values()) {
 			for (const [stream, clientFrameIds] of entry.streams) {
-				this.options.sendControl(entry.socket, { type: "VAULT_ERROR", code: "durability_failed",
-					message: "append was not committed; resend", stream, clientFrameIds });
+				this.options.sendControl(entry.socket, daily ? dailyLimitControl(now, this.dailyKind, stream, clientFrameIds)
+					: { type: "VAULT_ERROR", code: "durability_failed", message: "append was not committed; resend", stream, clientFrameIds,
+						retryAfterMs: this.retryAfterMs() });
 			}
 		}
 	}
 
+	/** H3: round(min(30000, 1000·2^(n−1)) · (0.5 + 0.5·rand)), n = consecutive failed commits in this runtime. */
+	private retryAfterMs(): number {
+		return Math.round(Math.min(30_000, 1000 * 2 ** (this.failures - 1)) * (0.5 + 0.5 * this.random()));
+	}
+
 	// ---- authority ------------------------------------------------------------
 
-	closeDevice(deviceId: string): number {
-		return this.closeWhere((attachment) => attachment.deviceId === deviceId, "device authority changed");
-	}
-
-	closePrincipal(principalId: string): number {
-		return this.closeWhere((attachment) => attachment.principalId === principalId, "membership revoked");
-	}
-
-	private closeWhere(match: (attachment: StreamSocketAttachment) => boolean, reason: string): number {
-		let closed = 0;
-		for (const { socket, attachment } of this.streamSockets()) {
-			if (!match(attachment)) continue;
-			this.options.sendControl(socket, { type: "error", code: "authority_superseded", reason });
-			try { socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, reason); } catch { /* fenced durably */ }
-			closed++;
+	/**
+	 * D7 revoke, synchronous (the host calls it in the same turn that deleted the
+	 * device row and its device-map entry). Every socket of the device gets
+	 * authority_superseded, closes 4403 and leaves the H5 fanout set; its H6 bucket
+	 * goes. Its buffered frames are dropped: they never commit and get no receipt;
+	 * peers that got their PROVISIONAL get STREAM_PROVISIONAL_DROPPED. Nothing is
+	 * flushed: other devices' frames stay buffered for their normal commit.
+	 */
+	revokeDevice(deviceId: string): { droppedFrames: number; closedSockets: number } {
+		// Cold path: walks getWebSockets() so a socket is found even before this runtime built its cache.
+		let closedSockets = 0;
+		for (const socket of this.options.sockets.sockets()) {
+			if (this.closing.has(socket) || this.attachmentOf(socket)?.deviceId !== deviceId) continue;
+			this.supersede(socket);
+			closedSockets++;
 		}
-		return closed;
+		this.buckets.delete(deviceId);
+		const kept: PendingFrame[] = [];
+		const dropped: PendingFrame[] = [];
+		for (const frame of this.pending) (frame.deviceId === deviceId ? dropped : kept).push(frame);
+		if (dropped.length > 0) {
+			this.pending = kept;
+			this.pendingBytes = 0;
+			for (const frame of kept) if (!frame.held) this.pendingBytes += frame.payload.byteLength;
+			for (const frame of dropped) this.pendingByKey.delete(frame.key);
+			if (kept.length === 0) this.clearTimers();
+			const peers = this.streamSockets();
+			// DECISIONS-GAP: the D7 reason value is unspecified; the wire's existing "commit_failed" is reused
+			// (the frame was not committed; the client ignores `reason`).
+			for (const frame of dropped) if (frame.provisional) this.dropProvisional(peers, frame, "commit_failed");
+		}
+		return { droppedFrames: dropped.length, closedSockets };
 	}
 
-	socketClosed(socket: VaultSocketPort): void {
-		this.gates.delete(socket);
+	private supersede(socket: SocketPort): void {
+		this.counters.authorityCloses++;
+		this.options.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
+		this.closeSocket(socket, AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded");
+	}
+
+	/** The runtime saw the socket close or error: it leaves the fanout set. */
+	socketClosed(socket: SocketPort): void {
+		this.closing.add(socket);
+		this.cacheRemove(socket);
 	}
 
 	/** Drops the buffer unacked (vault wipe; TEST-ONLY relay-crash simulation). Returns the dropped frame count. */
@@ -723,14 +905,33 @@ export class StreamRelayService {
 		return dropped;
 	}
 
-	/** Vault storage was wiped: drop the buffer unacked and every cached fact. */
+	/** Vault storage was wiped (the host closed every streams socket): drop the buffer unacked and every cached fact. */
 	reset(): void {
 		this.dropPending();
 		this.options.store().reset();
+		for (const socket of this.options.sockets.sockets()) if (this.attachmentOf(socket)) this.closing.add(socket);
+		this.cache = new Map();
+		this.byDevice.clear();
+	}
+
+	/**
+	 * D8a reset / D8b restore: drops the pending buffer (no commit, no receipts, no frames), the head cache and the
+	 * dedupe index, then closes every streams socket with `closeCode`/`reason` and forgets it. Synchronous.
+	 */
+	discardAll(closeCode: number, reason: string): void {
+		this.dropPending();
+		this.options.store().reset();
+		for (const socket of this.options.sockets.sockets()) {
+			if (this.closing.has(socket) || !this.attachmentOf(socket)) continue;
+			this.closeSocket(socket, closeCode, reason);
+		}
+		this.cache = new Map();
+		this.byDevice.clear();
 	}
 
 	diagnostics() {
 		return { pendingFrames: this.pending.length, pendingBytes: this.pendingBytes, head: this.head(),
+			sockets: this.cache?.size ?? null, dedupe: this.options.store().dedupeStats(),
 			counters: { ...this.counters }, tables: this.options.store().tableCounts() };
 	}
 
@@ -742,8 +943,10 @@ export class StreamRelayService {
 		const limit = nonNegativeInteger(url.searchParams.get("limit"), STREAM_FEED_DEFAULT_LIMIT);
 		if (after === null) return json({ error: "invalid_cursor" }, 400);
 		if (limit === null || limit < 1) return json({ error: "invalid_limit" }, 400);
-		const page = this.options.store().feed(after, Math.min(limit, STREAM_FEED_MAX_LIMIT));
-		return json({ vaultEpoch: this.options.vaultGeneration(), ...page });
+		return this.dailyLimitAware(() => {
+			const page = this.options.store().feed(after, Math.min(limit, STREAM_FEED_MAX_LIMIT));
+			return json({ vaultEpoch: this.options.vaultGeneration(), ...page });
+		});
 	}
 
 	/**
@@ -763,8 +966,10 @@ export class StreamRelayService {
 		if (!validStreamName(stream)) return json({ error: "invalid_stream" }, 400);
 		const after = nonNegativeInteger(url.searchParams.get("after"), 0);
 		if (after === null) return json({ error: "invalid_cursor" }, 400);
-		const page = this.options.store().read(stream, after, budget, url.searchParams.get("checkpoint") === "1");
-		return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), ...wirePage(page) });
+		return this.dailyLimitAware(() => {
+			const page = this.options.store().read(stream, after, budget, url.searchParams.get("checkpoint") === "1");
+			return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), ...wirePage(page) });
+		});
 	}
 
 	private readBatch(raw: string[], maxBytes: number): Response {
@@ -777,22 +982,27 @@ export class StreamRelayService {
 			if (!validStreamName(match[3])) return json({ error: "invalid_stream" }, 400);
 			entries.push({ stream: match[3], after, checkpoint: match[2] === "1" });
 		}
-		const store = this.options.store();
-		const pages: ReturnType<typeof wirePage>[] = [];
-		let left = maxBytes;
-		for (const entry of entries) {
-			if (pages.length > 0 && left <= 0) break;
-			const page = store.read(entry.stream, entry.after, pages.length > 0 ? left : maxBytes, entry.checkpoint);
-			const size = (page.checkpoint?.bytes.byteLength ?? 0) + page.rows.reduce((total, row) => total + row.payload.byteLength, 0);
-			if (pages.length > 0 && size > left) break;
-			pages.push(wirePage(page));
-			left -= size;
-		}
-		return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), pages });
+		return this.dailyLimitAware(() => {
+			const store = this.options.store();
+			const pages: ReturnType<typeof wirePage>[] = [];
+			let left = maxBytes;
+			for (const entry of entries) {
+				if (pages.length > 0 && left <= 0) break;
+				const page = store.read(entry.stream, entry.after, pages.length > 0 ? left : maxBytes, entry.checkpoint);
+				const size = (page.checkpoint?.bytes.byteLength ?? 0) + page.rows.reduce((total, row) => total + row.payload.byteLength, 0);
+				if (pages.length > 0 && size > left) break;
+				pages.push(wirePage(page));
+				left -= size;
+			}
+			return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), pages });
+		});
 	}
 
-	/** PUT /streams/checkpoint?stream=X&coversSeq=N&expectedCoversSeq=M, body = opaque checkpoint bytes. */
-	async putCheckpoint(request: Request, url: URL): Promise<Response> {
+	/**
+	 * PUT /streams/checkpoint?stream=X&coversSeq=N&expectedCoversSeq=M, body = opaque checkpoint bytes. `admitted`
+	 * runs after the body read, in the writing turn: a device revoked during the read gets 401, nothing written (D7).
+	 */
+	async putCheckpoint(request: Request, url: URL, admitted: () => boolean = () => true): Promise<Response> {
 		const stream = url.searchParams.get("stream");
 		if (!validStreamName(stream)) return json({ error: "invalid_stream" }, 400);
 		const coversSeq = nonNegativeInteger(url.searchParams.get("coversSeq"), -1);
@@ -805,11 +1015,25 @@ export class StreamRelayService {
 			const kind = error instanceof BoundedBodyError ? error.kind : "body_read_failed";
 			return json({ error: kind }, kind === "body_too_large" ? 413 : 400);
 		}
-		const result = this.options.store().putCheckpoint(stream, coversSeq, expected, bytes);
-		if (!result.ok) {
-			const { ok: _ok, status, ...body } = result;
-			return json(body, status);
+		if (!admitted()) return json({ error: "unauthorized" }, 401);
+		return this.dailyLimitAware(() => {
+			const result = this.options.store().putCheckpoint(stream, coversSeq, expected, bytes);
+			if (!result.ok) {
+				const { ok: _ok, status, ...body } = result;
+				return json(body, status);
+			}
+			this.writes++;
+			return json({ stream, coversSeq: result.coversSeq, gcSeq: result.gcSeq, deletedSegments: result.deletedSegments });
+		});
+	}
+
+	/** H3: a handler that fails on the daily limit answers `503 cf_daily_limit` itself; other errors propagate. */
+	private dailyLimitAware(run: () => Response): Response {
+		try {
+			return run();
+		} catch (error) {
+			if (!isCloudflareDailyLimitError(error)) throw error;
+			return dailyLimitResponse(this.now(), dailyLimitKind(error));
 		}
-		return json({ stream, coversSeq: result.coversSeq, gcSeq: result.gcSeq, deletedSegments: result.deletedSegments });
 	}
 }

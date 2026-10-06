@@ -5,8 +5,6 @@ import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const WORKER_YWASM_ENGINE = fileURLToPath(new URL("../server/src/crdt/ywasmWorkerCrdtEngine", import.meta.url));
-const NODE_YWASM_ENGINE = fileURLToPath(new URL("../packages/server-node/src/ywasmNodeCrdtEngine.ts", import.meta.url));
 const args = process.argv.slice(2);
 const useTestAliases = args[0] === "--test-aliases";
 if (useTestAliases) args.shift();
@@ -18,19 +16,12 @@ if (!entry) {
 
 const aliases = useTestAliases
 	? {
-		"@yaos/crdt-engine": NODE_YWASM_ENGINE,
 		yjs: fileURLToPath(new URL("../node_modules/yjs/dist/yjs.mjs", import.meta.url)),
 		"y-protocols": fileURLToPath(new URL("../node_modules/y-protocols", import.meta.url)),
 		obsidian: fileURLToPath(new URL("./mocks/obsidian.ts", import.meta.url)),
-		partyserver: fileURLToPath(new URL("./mocks/partyserver.ts", import.meta.url)),
-		"@shared": fileURLToPath(new URL("../server/src/shared", import.meta.url)),
-		[WORKER_YWASM_ENGINE]: NODE_YWASM_ENGINE,
-		[`${WORKER_YWASM_ENGINE}.js`]: NODE_YWASM_ENGINE,
-		[`${WORKER_YWASM_ENGINE}.ts`]: NODE_YWASM_ENGINE,
-		"./crdt/ywasmWorkerCrdtEngine": NODE_YWASM_ENGINE,
-		"./crdt/ywasmWorkerCrdtEngine.js": NODE_YWASM_ENGINE,
-		"./ywasmWorkerCrdtEngine": NODE_YWASM_ENGINE,
-		"./ywasmWorkerCrdtEngine.js": NODE_YWASM_ENGINE,
+		"cloudflare:workers": fileURLToPath(new URL("./mocks/cloudflareWorkers.ts", import.meta.url)),
+		"qrcode-generator/dist/qrcode.js": fileURLToPath(new URL("./mocks/qrcodeScript.ts", import.meta.url)),
+		"@shared": fileURLToPath(new URL("../legacy-src/shared", import.meta.url)),
 	}
 	: {};
 const target = resolve(ROOT, entry);

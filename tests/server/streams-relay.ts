@@ -1,4 +1,4 @@
-// Client remake: opaque streams relay (YAOS_STREAMS, server/src/streams/).
+// Client remake: opaque streams relay (server/src/streams/), white-box through the injected ports.
 // Real SQLite (NodeSqliteStorage) under StreamStore + StreamRelayService with
 // fake sockets and virtual timers. Row accounting uses the Cloudflare billing
 // model (helpers/cfRowModel.ts). Wire contract: docs/client-remake/relay-wire.md.
@@ -7,14 +7,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
+import { NodeSqliteStorage } from "./helpers/nodeSqliteStorage";
 import { base64ToBytes } from "../../server/src/base64url";
 import { DailyLimitLatch } from "../../server/src/dailyLimit";
-import { classifyWorkerRoute } from "../../server/src/index";
-import { getCapabilities } from "../../server/src/routes/auth";
-import { createTicket, handleTicketRoute, inspectTicket } from "../../server/src/routes/ticket";
-import type { AuthState, Env } from "../../server/src/routes/types";
-import { capabilityDigestForRole, COLLABORATION_POLICY_VERSION, type VaultActorContext } from "../../server/src/collaboration";
+import type { SocketPort, SocketRegistryPort, StoragePort, TimerPort } from "../../server/src/ports";
 import {
 	MAX_STREAM_BINARY_MESSAGE_BYTES,
 	MAX_STREAM_PAYLOAD_BYTES,
@@ -26,17 +22,15 @@ import {
 	encodeCommitted,
 	encodeProvisional,
 	encodeRow,
-	streamsEnabled,
 } from "../../server/src/streams/protocol";
 import {
 	DEFAULT_STREAM_RELAY_CONFIG,
 	StreamRelayService,
 	readStreamRelayConfig,
+	type StreamActor,
 	type StreamRelayConfig,
-	type StreamTimers,
 } from "../../server/src/streams/relay";
-import { STREAM_SEGMENT_SEAL_BYTES, StreamStore, type StreamStoragePort } from "../../server/src/streams/store";
-import type { VaultSocketPort, VaultSocketRegistryPort } from "../../server/src/vaultSocketService";
+import { STREAM_SEGMENT_SEAL_BYTES, StreamStore } from "../../server/src/streams/store";
 import { CfRowModel } from "./helpers/cfRowModel.ts";
 import { suite } from "../harness.ts";
 
@@ -45,15 +39,15 @@ const s = suite("streams-relay");
 const VAULT_ID = "streams-vault-0001";
 const GENERATION = "streams-generation-0001";
 
-const ownerA: VaultActorContext = { vaultId: VAULT_ID, vaultGeneration: GENERATION, principalId: "principal-a",
+const ownerA: StreamActor = { vaultId: VAULT_ID, vaultGeneration: GENERATION, principalId: "principal-a",
 	membershipRevision: 1, deviceId: "device-a", deviceCredentialRevision: 1, role: "owner",
-	policyVersion: COLLABORATION_POLICY_VERSION, capabilityDigest: "digest" };
-const deviceB: VaultActorContext = { ...ownerA, deviceId: "device-b" };
-const deviceC: VaultActorContext = { ...ownerA, deviceId: "device-c" };
+	policyVersion: 1, capabilityDigest: "digest" };
+const deviceB: StreamActor = { ...ownerA, deviceId: "device-b" };
+const deviceC: StreamActor = { ...ownerA, deviceId: "device-c" };
 
 type Control = Record<string, unknown> & { type: string };
 
-class FakeSocket implements VaultSocketPort {
+class FakeSocket implements SocketPort {
 	readonly binary: Uint8Array[] = [];
 	readonly controls: Control[] = [];
 	closed: { code?: number; reason?: string } | null = null;
@@ -80,16 +74,16 @@ class FakeSocket implements VaultSocketPort {
 	}
 }
 
-class FakeRegistry implements VaultSocketRegistryPort {
+class FakeRegistry implements SocketRegistryPort {
 	readonly list: FakeSocket[] = [];
 	lastClient: FakeSocket | null = null;
-	sockets(): readonly VaultSocketPort[] { return this.list.filter((socket) => !socket.closed); }
+	sockets(): readonly SocketPort[] { return this.list.filter((socket) => !socket.closed); }
 	createPair() { const server = new FakeSocket(); return { client: server, server }; }
-	accept(socket: VaultSocketPort): void { this.list.push(socket as FakeSocket); }
+	accept(socket: SocketPort): void { this.list.push(socket as FakeSocket); }
 	upgradeResponse(client: unknown): Response { this.lastClient = client as FakeSocket; return new Response(null, { status: 200 }); }
 }
 
-class VirtualTimers implements StreamTimers {
+class VirtualTimers implements TimerPort {
 	now = 1_000_000;
 	private nextId = 0;
 	private readonly timers = new Map<number, { at: number; callback: () => void }>();
@@ -125,7 +119,7 @@ interface Harness {
 	latch: DailyLimitLatch;
 	revoked: Set<string>;
 	failWrites: { on: boolean };
-	connect(actor?: VaultActorContext, canWrite?: boolean): FakeSocket;
+	connect(actor?: StreamActor, canWrite?: boolean): FakeSocket;
 	append(socket: FakeSocket, stream: string, clientFrameId: string, payload: Uint8Array | string): void;
 	/** A new runtime over the same storage and sockets (hibernation wake / eviction). */
 	fresh(runtimeEpoch: string): StreamRelayService;
@@ -142,7 +136,7 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 	const sqlite = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
 	const model = new CfRowModel(sqlite);
 	const failWrites = { on: false };
-	const storage: StreamStoragePort = {
+	const storage: StoragePort = {
 		sql: {
 			exec: (query: string, ...bindings: unknown[]) => {
 				if (failWrites.on && /^\s*(INSERT|UPDATE|DELETE)/i.test(query)) throw new Error(DAILY_LIMIT_MESSAGE);
@@ -156,20 +150,21 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 	const registry = new FakeRegistry();
 	const revoked = new Set<string>();
 	const store = new StreamStore(storage);
-	// The leading-edge commit is off unless a test asks for it: the timing tests below pin the idle/max/bytes rules.
-	const resolved = { ...DEFAULT_STREAM_RELAY_CONFIG, gcQuietMs: 0, ...config };
+	// The leading-edge commit and the H8 min interval (default 1000) are off unless a test asks for them: the
+	// timing tests below pin the idle/max/bytes rules exactly.
+	const resolved = { ...DEFAULT_STREAM_RELAY_CONFIG, gcQuietMs: 0, gcMinIntervalMs: 0, ...config };
 	const make = (runtimeEpoch: string) => new StreamRelayService({
 		config: resolved,
 		store: () => store,
 		sockets: registry,
-		sendControl: (socket, value) => { try { socket.send(`__YPS:${JSON.stringify(latch.decorateControl(value))}`); } catch { /* closed */ } },
+		sendControl: (socket, value) => { try { socket.send(`__YPS:${JSON.stringify(value)}`); } catch { /* closed */ } },
 		validateActor: (actor) => !revoked.has(actor.deviceId),
 		dailyLimitActive: () => latch.active(),
 		noteCommitError: (error) => { latch.note(error); },
 		vaultId: () => VAULT_ID,
 		vaultGeneration: () => GENERATION,
 		runtimeEpoch,
-		now: () => timers.now,
+		clock: { now: () => timers.now },
 		timers,
 	});
 	const harness: Harness = {
@@ -229,53 +224,17 @@ s.test("codec: APPEND round-trips; malformed, trailing, invalid names and oversi
 		rows.map((row) => ({ ...row, payload: [...row.payload] })));
 });
 
-s.test("flag, capabilities, routes and config: inert unless YAOS_STREAMS is exactly \"true\"", () => {
-	assert.equal(streamsEnabled({ YAOS_STREAMS: "true" }), true);
-	assert.equal(streamsEnabled({ YAOS_STREAMS: "1" }), false);
-	assert.equal(streamsEnabled({}), false);
-	const auth: AuthState = { mode: "unclaimed", claimed: false };
-	const off = getCapabilities(auth, {} as Env);
-	assert.equal("streams" in off, false, "flag-off capabilities unchanged");
-	assert.equal(getCapabilities(auth, { YAOS_STREAMS: "true" } as Env).streams, 1);
-	const base = "https://example.test/vault/vault-route-0001";
-	for (const [method, path] of [["GET", "/ws/streams"], ["GET", "/streams/feed"], ["GET", "/streams/read"], ["PUT", "/streams/checkpoint"]] as const) {
-		const request = new Request(`${base}${path}`, { method });
-		assert.equal(classifyWorkerRoute(request, new URL(request.url), false, false).kind, "not-found", `${method} ${path} off`);
-		assert.equal(classifyWorkerRoute(request, new URL(request.url), false, true).kind, "vault", `${method} ${path} on`);
-	}
-	for (const [method, path] of [["POST", "/streams/feed"], ["GET", "/streams/checkpoint"], ["GET", "/streams/other"], ["GET", "/ws/streams/x"]] as const) {
-		const request = new Request(`${base}${path}`, { method });
-		assert.equal(classifyWorkerRoute(request, new URL(request.url), false, true).kind, "not-found", `${method} ${path}`);
-	}
-	const config = readStreamRelayConfig({ YAOS_STREAMS: "true", YAOS_STREAMS_BURST_BYTES: "10" });
+s.test("config: env overrides are clamped; the burst holds one maximum message", () => {
+	const config = readStreamRelayConfig({ YAOS_STREAMS_BURST_BYTES: "10" });
 	assert.equal(config.burstBytes, MAX_STREAM_BINARY_MESSAGE_BYTES, "burst floored at one max message");
 	assert.equal(config.gcIdleMs, 300);
 	assert.equal(config.gcMaxMs, 1500);
 	assert.equal(config.gcMaxBytes, 64 * 1024);
+	assert.equal(config.gcMinIntervalMs, 1000, "H8 default");
+	assert.equal(readStreamRelayConfig({ YAOS_STREAMS_GC_MIN_INTERVAL_MS: "0" }).gcMinIntervalMs, 0, "H8 env override");
 	assert.equal(config.gcLeadMs, 20);
 	assert.equal(config.gcQuietMs, 1500);
-	assert.equal(readStreamRelayConfig({ YAOS_STREAMS: "true", YAOS_STREAMS_GC_QUIET_MS: "0" }).gcQuietMs, 0, "lead off");
-});
-
-s.test("tickets: purpose streams signs and inspects; other scopes do not open a streams socket", async () => {
-	const auth: AuthState = { mode: "claim", claimed: true, operatorRecoveryHash: "hash", ticketSigningKey: "streams-test-key" };
-	const actor = { ...ownerA, capabilityDigest: await capabilityDigestForRole("owner") };
-	const response = await handleTicketRoute(new Request("https://example.test/ticket", { method: "POST",
-		body: JSON.stringify({ purpose: "streams" }) }), auth, actor, (body, status = 200) => Response.json(body, { status }));
-	assert.equal(response.status, 200);
-	const { ticket } = await response.json() as { ticket: string };
-	const payload = await inspectTicket(ticket, auth, { vaultId: VAULT_ID, purpose: "streams", documentId: "streams" });
-	assert.equal(payload?.purpose, "streams");
-	assert.equal(payload?.deviceId, "device-a");
-	assert.equal(await inspectTicket(ticket, auth, { vaultId: VAULT_ID, purpose: "root", documentId: "root" }), null);
-	const root = await createTicket(auth, actor, { purpose: "root", documentId: "root", rootEpoch: 1 });
-	assert.equal(await inspectTicket(root.ticket, auth, { vaultId: VAULT_ID, purpose: "streams", documentId: "streams" }), null);
-	const bad = await handleTicketRoute(new Request("https://example.test/ticket", { method: "POST",
-		body: JSON.stringify({ purpose: "streams", documentId: "root" }) }), auth, actor, (body, status = 200) => Response.json(body, { status }));
-	assert.equal(bad.status, 400);
-	const body = await createTicket(auth, actor, { purpose: "body", documentId: "streams", bodyEpoch: 1 });
-	assert.equal((await inspectTicket(body.ticket, auth, { vaultId: VAULT_ID, purpose: "body", documentId: "streams", bodyEpoch: 1 }))?.purpose,
-		"body", "a body named \"streams\" keeps working");
+	assert.equal(readStreamRelayConfig({ YAOS_STREAMS_GC_QUIET_MS: "0" }).gcQuietMs, 0, "lead off");
 });
 
 // ---- live path ------------------------------------------------------------------
@@ -600,23 +559,25 @@ s.test("checkpoint: CAS ok, conflict, not advancing, ahead of stream; GC of seal
 		assert.deepEqual(cold.rows.map((row) => row.seq), [5], "rows resume after the checkpoint");
 		const warm = await read("stream=b:gc&after=4");
 		assert.equal(warm.checkpoint, null, "a reader past gcSeq gets rows only");
+		const preferred = await read("stream=b:gc&after=4&checkpoint=1");
+		assert.equal(preferred.checkpoint, null, "checkpoint=1 only when after < checkpointSeq");
+		assert.deepEqual(preferred.rows.map((row) => row.seq), [5]);
+		// H7: a checkpoint at lastSeq retires the stream: the open segment goes too and gcSeq = lastSeq.
 		const next = await put("stream=b:gc&coversSeq=5&expectedCoversSeq=4", new Uint8Array(0));
 		assert.equal(next.status, 200, "an empty checkpoint is allowed");
-		assert.equal(next.body.deletedSegments, 0, "the open segment (retain window) is never collected");
+		assert.deepEqual(next.body, { stream: "b:gc", coversSeq: 5, gcSeq: 5, deletedSegments: 0 });
 		assert.equal(store.tableCounts().checkpointChunks, 1, "the previous checkpoint is replaced");
-		const gcSeq = next.body.gcSeq as number;
-		assert.ok(gcSeq < 5);
-		assert.deepEqual((await read(`stream=b:gc&after=${gcSeq}`)).rows.map((row) => row.seq).at(-1), 5, "rows only past gcSeq");
-		const preferred = await read(`stream=b:gc&after=${gcSeq}&checkpoint=1`);
-		assert.equal(preferred.checkpoint?.coversSeq, 5, "checkpoint=1 asks for it when after < checkpointSeq");
-		assert.deepEqual(preferred.rows, []);
+		const retired = await read("stream=b:gc&after=0");
+		assert.equal(retired.checkpoint?.coversSeq, 5);
+		assert.deepEqual(retired.rows, [], "only the checkpoint is left");
+		assert.equal((await read("stream=b:gc&after=5")).checkpoint, null);
 	});
 });
 
 // ---- authority, admission, daily limit ------------------------------------------
 
-s.test("authority: revoked actors get authority_superseded + 4403; read-only sockets get write_forbidden", async () => {
-	await withStreams(({ connect, append, revoked, service, timers }) => {
+s.test("authority: a socket whose device left the map gets authority_superseded + 4403; read-only sockets get write_forbidden", async () => {
+	await withStreams(({ connect, append, revoked, service }) => {
 		const a = connect(ownerA);
 		const b = connect(deviceB);
 		const reader = connect(deviceC, false);
@@ -624,19 +585,46 @@ s.test("authority: revoked actors get authority_superseded + 4403; read-only soc
 		append(reader, "ns", "ro-1", "x");
 		assert.deepEqual(reader.last("STREAM_APPEND_REJECTED"), { type: "STREAM_APPEND_REJECTED", stream: "ns",
 			clientFrameId: "ro-1", code: "write_forbidden" });
-		append(a, "ns", "before", "x");
 		revoked.add("device-a");
 		append(a, "ns", "after", "y");
-		assert.equal(a.last("error")!.code, "authority_superseded");
+		assert.equal(a.last("error")!.code, "authority_superseded", "the device map is checked before the append");
 		assert.equal(a.closed?.code, 4403);
-		service.flushForAuthorityFence();
-		assert.equal(a.receipts().length, 0, "the closed socket missed its receipt (resend dedupes)");
-		assert.deepEqual(b.frames().map((frame) => frame.kind === "committed" ? frame.clientFrameId : frame.kind), ["before"],
-			"frames admitted before the revoke commit; later ones never go out");
+		assert.equal(service.pendingFrames(), 0, "the refused append is never buffered");
+		assert.equal(b.frames().length, 0);
 		assert.equal(service.accept(ownerA, true).status, 409, "a revoked device cannot reconnect");
-		assert.equal(service.closeDevice("device-b"), 1);
-		assert.equal(b.closed?.code, 4403);
-		timers.advance(1000);
+	});
+});
+
+s.test("D7 revokeDevice: one synchronous call drops the device's buffered frames, tells PROVISIONAL holders, closes 4403, never flushes", async () => {
+	await withStreams(({ connect, append, revoked, service, store, timers }) => {
+		const a = connect(ownerA);
+		const a2 = connect(ownerA);
+		const b = connect(deviceB);
+		append(a, "b:doc", "a-prov", "x");
+		append(a2, "ns", "a-ns", "y");
+		append(b, "ns", "b-ns", "z");
+		assert.equal(b.frames().filter((frame) => frame.kind === "provisional").length, 1, "b holds a's PROVISIONAL");
+		assert.equal(service.pendingFrames(), 3);
+
+		revoked.add("device-a"); // the host deletes the device-map entry in the same turn
+		const result = service.revokeDevice("device-a");
+		assert.deepEqual(result, { droppedFrames: 2, closedSockets: 2 });
+		for (const socket of [a, a2]) {
+			assert.deepEqual(socket.last("error"),
+				{ type: "error", code: "authority_superseded", reason: "socket authority superseded" });
+			assert.equal(socket.closed?.code, 4403);
+		}
+		assert.deepEqual(b.last("STREAM_PROVISIONAL_DROPPED"), { type: "STREAM_PROVISIONAL_DROPPED", stream: "b:doc",
+			deviceId: "device-a", clientFrameId: "a-prov", reason: "commit_failed" });
+		assert.equal(service.pendingFrames(), 1, "the peer's frame stays buffered: no flush");
+		assert.equal(store.head(), 0, "nothing committed in the revoke");
+
+		timers.advance(10_000);
+		assert.equal(store.head(), 1, "the normal group commit writes only the peer's frame");
+		assert.deepEqual(b.receipts().map((receipt) => receipt.clientFrameId), ["b-ns"]);
+		assert.equal(a.receipts().length + a2.receipts().length, 0, "the revoked device's frames get no receipt");
+		assert.deepEqual(b.frames().map((frame) => frame.kind), ["provisional"], "no COMMITTED of a dropped frame");
+		assert.deepEqual(service.revokeDevice("device-a"), { droppedFrames: 0, closedSockets: 0 }, "idempotent");
 	});
 });
 

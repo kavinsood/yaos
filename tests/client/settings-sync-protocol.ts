@@ -4,7 +4,7 @@ import {
 	SettingsSyncHttpError,
 	parseSettingsSyncState,
 } from "../../legacy-src/sync/settingsSync/protocol";
-import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../legacy-src/shared/binaryEnvelope";
 import { suite } from "../harness.ts";
 
 const s = suite("settings-sync-protocol");

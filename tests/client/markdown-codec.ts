@@ -6,7 +6,7 @@ import {
 	canonicalizeMarkdown,
 	prepareCanonicalMarkdown,
 	exactMarkdownDiskFingerprint,
-} from "../../server/src/shared/markdownCodec";
+} from "../../legacy-src/shared/markdownCodec";
 import {
 	contentBaselineHash,
 	currentContentHash,

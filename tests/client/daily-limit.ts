@@ -9,7 +9,7 @@ import {
 	type VaultDatabasePort,
 	type VaultServerPort,
 } from "../../legacy-src/sync/vaultSync";
-import { SOCKET_CONTROL_CAPABILITIES, SOCKET_LIVENESS_DESCRIPTOR } from "../../server/src/shared/socketLiveness";
+import { SOCKET_CONTROL_CAPABILITIES, SOCKET_LIVENESS_DESCRIPTOR } from "../../legacy-src/shared/socketLiveness";
 import {
 	DAILY_LIMIT_MAX_BACKOFF_MS,
 	DAILY_LIMIT_NOTICE,
@@ -21,7 +21,7 @@ import {
 	type DailyLimitInfo,
 } from "../../legacy-src/sync/dailyLimit";
 import { getLabelFromConnectionState } from "../../legacy-src/status/statusBarController";
-import { DailyLimitLatch, dailyLimitResponse } from "../../server/src/dailyLimit";
+import { dailyLimitControl, dailyLimitResponse } from "../../server/src/dailyLimit";
 import type { HttpRequest, HttpResponse } from "../../legacy-src/utils/http";
 import { sleep, suite, until } from "../harness.ts";
 import { partialOf } from "../mocks/productFixture.ts";
@@ -202,10 +202,8 @@ s.test("parses typed HTTP bodies and VAULT_ERROR frames; ignores everything else
 });
 
 s.test("the server's typed frame round-trips through the client parser", () => {
-	const latch = new DailyLimitLatch(() => NOW);
-	latch.note(new Error("Exceeded allowed rows written in Durable Objects free tier."));
-	const decorated = latch.decorateControl({ type: "VAULT_ERROR", code: "relay_persist_failed", message: "persist failed" });
-	const frame = parseVaultControlFrame(JSON.stringify(decorated));
+	const typed = dailyLimitControl(NOW, "rows-written", "b:doc", ["cf-1"]);
+	const frame = parseVaultControlFrame(JSON.stringify(typed));
 	assert.equal(frame?.type, "VAULT_ERROR");
 	assert.equal(frame?.type === "VAULT_ERROR" ? frame.code : null, "cf_daily_limit");
 	assert.equal(parseDailyLimitSignal(frame, NOW)?.resetAt, nextUtcMidnight(NOW));

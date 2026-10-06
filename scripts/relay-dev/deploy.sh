@@ -3,7 +3,7 @@
 #
 #   scripts/relay-dev/deploy.sh [<yaos-relay2-name>] [--var K=V]... [--dry-run]
 #
-# Config: scripts/relay-dev/config.sh (server/wrangler.toml, name replaced, no R2, YAOS_STREAMS=true) written
+# Config: scripts/relay-dev/config.sh (server/wrangler.toml, name replaced, no R2; streams are always on) written
 # to server/wrangler.relay2-<suffix>.toml (git-excluded; the same file start-local.sh feeds `wrangler dev`),
 # then rendered by cf-config.mjs as a cf project in server/.cf-deploy/<suffix>/ (gitignored).
 #
@@ -14,9 +14,9 @@
 # cf configs declare Durable Objects as an `exports` lifecycle instead of [[migrations]]; the upload API
 # reconciles it against a redeployed worker's classes (same classes = same namespaces, data kept).
 #
-# A new name creates 3 Durable Object namespaces. If the account is at the namespace cap (CF error 10067),
-# redeploy over an idle yaos-relay2-* worker with the same classes (VaultSyncServer, ServerConfig,
-# RecoveryJob) instead. Never deploy over yaos-relay2-scratch-3 (owned by another session).
+# A new name creates 2 Durable Object namespaces. If the account is at the namespace cap (CF error 10067),
+# redeploy over an idle yaos-relay2-* worker with the same classes (VaultDO, ConfigDO)
+# instead. Never deploy over yaos-relay2-scratch-3 (owned by another session).
 # Output goes to $EXP_ROOT/logs/client-e2e-deploy-<name>-<ts>.log; the URL is printed after
 # /api/capabilities reports "streams":1.
 set -euo pipefail

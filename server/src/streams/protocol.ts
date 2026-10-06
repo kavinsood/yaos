@@ -36,6 +36,8 @@ export const STREAM_READ_MAX_BYTES = 4 * 1024 * 1024;
 export const STREAM_READ_BATCH_MAX_STREAMS = 128;
 /** Concurrent streams sockets per vault. */
 export const MAX_STREAM_SOCKETS = 1000;
+/** H6: concurrent streams sockets per device; a 5th connect closes the device's oldest (1001 `device_socket_limit`). */
+export const MAX_STREAM_SOCKETS_PER_DEVICE = 4;
 
 /** Client -> server binary frame kinds (byte 0). */
 export const STREAM_FRAME_APPEND = 0x01;
@@ -82,24 +84,78 @@ export interface AppendFrame {
 export type AppendDecodeError = "malformed_frame" | "unknown_frame_kind" | "invalid_stream" | "invalid_client_frame_id"
 	| "payload_too_large";
 
-/** Decodes one client APPEND message. Never throws. */
+/**
+ * H1 strict APPEND reader. lib0's `readVarString` turns invalid UTF-8 into U+FFFD and its `readVarUint` accepts
+ * non-minimal encodings, so two byte strings could alias one stream name or frame id. Here strings are fatal UTF-8
+ * (`ignoreBOM` keeps a leading U+FEFF as part of the name), varuints are minimal and at most 2^53, every length
+ * must fit the remaining bytes, and the message must be fully consumed.
+ */
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+/** 8 groups of 7 bits hold 2^53 (the 8th group may carry at most 0b10000). */
+const MAX_VARUINT_GROUPS = 8;
+const VARUINT_TOP_SCALE = 2 ** 49;
+
+class StrictReader {
+	pos = 1;
+	constructor(private readonly bytes: Uint8Array) {}
+
+	/** A minimal little-endian base-128 varuint <= 2^53, or null. */
+	varuint(): number | null {
+		let low = 0;
+		let scale = 1;
+		for (let group = 0; group < MAX_VARUINT_GROUPS; group++) {
+			if (this.pos >= this.bytes.byteLength) return null;
+			const byte = this.bytes[this.pos++]!;
+			const bits = byte & 0x7f;
+			const last = byte < 0x80;
+			if (last && bits === 0 && group > 0) return null;
+			if (group === MAX_VARUINT_GROUPS - 1) {
+				// value = low + bits * 2^49 with low < 2^49: <= 2^53 iff bits < 16, or bits == 16 and low == 0.
+				if (!last || bits > 16 || (bits === 16 && low !== 0)) return null;
+				return low + bits * VARUINT_TOP_SCALE;
+			}
+			low += bits * scale;
+			if (last) return low;
+			scale *= 128;
+		}
+		return null;
+	}
+
+	/** A length-prefixed byte range that fits the remaining bytes, as a view, or null. */
+	bytesField(): Uint8Array | null {
+		const length = this.varuint();
+		if (length === null || length > this.bytes.byteLength - this.pos) return null;
+		const view = this.bytes.subarray(this.pos, this.pos + length);
+		this.pos += length;
+		return view;
+	}
+
+	string(): string | null {
+		const view = this.bytesField();
+		if (view === null) return null;
+		try { return strictUtf8.decode(view); } catch { return null; }
+	}
+
+	done(): boolean {
+		return this.pos === this.bytes.byteLength;
+	}
+}
+
+/** Decodes one client APPEND message (H1 strict codec). Never throws. */
 export function decodeAppendFrame(bytes: Uint8Array): AppendFrame | { error: AppendDecodeError } {
 	if (bytes.byteLength === 0) return { error: "malformed_frame" };
 	if (bytes[0] !== STREAM_FRAME_APPEND) return { error: "unknown_frame_kind" };
-	try {
-		const decoder = decoding.createDecoder(bytes);
-		decoding.readUint8(decoder);
-		const stream = decoding.readVarString(decoder);
-		const clientFrameId = decoding.readVarString(decoder);
-		const payload = decoding.readVarUint8Array(decoder);
-		if (decoder.pos !== bytes.byteLength) return { error: "malformed_frame" };
-		if (!validStreamName(stream)) return { error: "invalid_stream" };
-		if (!validClientFrameId(clientFrameId)) return { error: "invalid_client_frame_id" };
-		if (payload.byteLength > MAX_STREAM_PAYLOAD_BYTES) return { error: "payload_too_large" };
-		return { stream, clientFrameId, payload };
-	} catch {
-		return { error: "malformed_frame" };
-	}
+	const reader = new StrictReader(bytes);
+	const stream = reader.string();
+	if (stream === null) return { error: "malformed_frame" };
+	const clientFrameId = reader.string();
+	if (clientFrameId === null) return { error: "malformed_frame" };
+	const payload = reader.bytesField();
+	if (payload === null || !reader.done()) return { error: "malformed_frame" };
+	if (!validStreamName(stream)) return { error: "invalid_stream" };
+	if (!validClientFrameId(clientFrameId)) return { error: "invalid_client_frame_id" };
+	if (payload.byteLength > MAX_STREAM_PAYLOAD_BYTES) return { error: "payload_too_large" };
+	return { stream, clientFrameId, payload };
 }
 
 export function encodeAppendFrame(frame: AppendFrame): Uint8Array {
@@ -212,15 +268,4 @@ export function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
 	if (left.byteLength !== right.byteLength) return false;
 	for (let index = 0; index < left.byteLength; index++) if (left[index] !== right[index]) return false;
 	return true;
-}
-
-// ---- flag --------------------------------------------------------------------
-
-export interface StreamsFlagEnv {
-	/** Opaque streams surface; inert unless exactly "true". */
-	YAOS_STREAMS?: string;
-}
-
-export function streamsEnabled(env: StreamsFlagEnv | null | undefined): boolean {
-	return env?.YAOS_STREAMS === "true";
 }

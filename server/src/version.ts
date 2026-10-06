@@ -1,14 +1,4 @@
-import {
-	PROTOCOL_VERSION,
-	SCHEMA_VERSION,
-	SNAPSHOT_FORMAT_VERSION,
-	SETTINGS_FORMAT_VERSION,
-	STORAGE_FORMAT_VERSION,
-} from "./shared/productVersions";
-
+// DECISIONS-GAP: §2.3 keeps version.ts (14 lines) but deletes shared/productVersions, the source of its schema,
+// storage, protocol, snapshot and settings pins; §5 row 2.1 drops those pins from capabilities. Only the server
+// version is left.
 export const SERVER_VERSION = "1.0.0";
-export const SERVER_SCHEMA_VERSION = SCHEMA_VERSION;
-export const SERVER_STORAGE_FORMAT_VERSION = STORAGE_FORMAT_VERSION;
-export const SERVER_PROTOCOL_VERSION = PROTOCOL_VERSION;
-export const SERVER_SNAPSHOT_FORMAT_VERSION = SNAPSHOT_FORMAT_VERSION;
-export const SERVER_SETTINGS_FORMAT_VERSION = SETTINGS_FORMAT_VERSION;

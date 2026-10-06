@@ -3,4 +3,3 @@ bun.lock
 dist
 .env
 .wrangler
-.partykit

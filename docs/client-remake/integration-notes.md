@@ -53,7 +53,7 @@ it to the clipboard). Pairing steps for desktop, Android and iOS: §9.0.
 ```
  Obsidian main thread (src/host)                       Engine (src/engine), Web Worker or inline
  ------------------------------------                  -------------------------------------------
- plugin.ts            Obsidian Plugin shell             workerMain.ts      worker entry (IIFE string)
+ plugin.ts            Obsidian Plugin shell             workerMain.ts      worker entry (from entry.ts)
  PluginController     plugin data, lifecycle, UI host   adapters/webEngine createEngine over web ports
  HostRuntime          wires one paired vault            compose/ProtocolEngine   init/ping/route
    EngineHost         carrier: probe, ping, restart,      VaultRuntime (one per vault epoch)
@@ -146,8 +146,9 @@ only the pure adapters (`noopCrypto`, `webHash`, `webClock`, `webRandom`,
   the background. Only an unusable store fails init (`storage-lost`), which
   makes the host fall back from the worker to inline (OR-1).
 - **One engine, two carriers.** `workerMain.ts` and the inline carrier both run
-  `createWebEngine`. The worker build is an IIFE string imported as
-  `virtual:yaos-engine-worker` and started from a Blob URL.
+  `createWebEngine` from the same code in `main.js` (D2). The worker is a Blob
+  URL whose script is the bundle wrapper's own source text
+  (`host/bundleSource.ts`); `host/entry.ts` starts only the engine there.
 - **Pass scheduling.** PassScheduler runs scoped passes on fold/observation
   events and full passes on a 5-15 min cadence (full passes also re-read
   settings). Unproductive passes back off; a blob retry timer is armed at the
@@ -225,7 +226,7 @@ waiting on the blob queue.
 | # | Where | Deviation | Why |
 |---|---|---|---|
 | D1 | §k.2 | The host imports `engine/adapters/webEngine` (the inline carrier's entry), not `engine/runtime/engine.ts`. | The host may not import web adapters, and `engine/runtime/engine.ts` is now only the log side. `webEngine` is the one engine module the host may import; check-deps enforces it. |
-| D2 | §g.5, §k.1 | The engine is bundled twice in `main.js`: as the worker IIFE string and as the inline fallback. | The fallback must not depend on `eval` / `new Function` (CSP). It costs about 420 KiB raw (see §8). |
+| D2 | §k.1, §k.2 | There is no separate worker build or "bundled worker source string". `main.js` is one bundle wrapped in a named function (`__yaosBundle`); the worker's Blob script is that function's source (`Function.prototype.toString`, ECMA-262 §20.2.3.5) called with the worker scope, and `host/entry.ts` (the only host file allowed to import `engine/workerMain`) lazily starts either the engine (worker) or the plugin (main). | The engine is in `main.js` once, and both carriers keep working without `eval` / `new Function` on main and without reading files. The worker needs only what it needed before: a `blob:` worker, with inline as the fallback. This saves 424 KiB raw (see §8). |
 | D3 | §g.2 | `init` answers `ready` when the ports exist, before the vault runtime has started; the runtime retries in the background. Only an unusable store fails init (`storage-lost`). | A fresh device offline must still get a protocol-ready engine; only storage failure should push the host to the inline carrier (OR-1). |
 | D4 | §j.1 | When the relay's capabilities can't be read at startup (offline), the engine assumes the HTTP blob store exists and lets the blob queue retry. | Refs must not depend on whether a device happened to be online at startup (otherwise one attachment could be sent as a blob ref by one device and as `x:` chunks by another). |
 | D5 | §c.12 | `intent{epoch-migration}` is not written. A crash in the middle of a migration restarts on the newest DB (the new epoch): the path bases are gone (no-base handling) and the old DB is not deleted. | Epoch resets are rare operator actions; the snapshot taken before migration (step 1) keeps every file version. |
@@ -330,7 +331,10 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   retries with backoff; the UI shows the reason but there is no degraded mode.
 - The host hashes canvas files only for write preconditions (the engine owns
   every other hash).
-- The engine is duplicated in the main bundle (D2).
+- The worker carrier depends on `Function.prototype.toString` returning the
+  bundle's source (D2). If a platform hid it, `workerScript()` returns null and
+  the host uses inline. This is verified in V8 and JavaScriptCore, but not yet on
+  an iOS device.
 
 **Tests and sim**
 - Token survival (`vaultTokens`) is checked against device A's vault only
@@ -588,19 +592,66 @@ e2e writes edits back to back, so its `edit_to_peer` stays ~430 ms local /
 
 ## 8. Bundle
 
-`node esbuild.config.mjs production` on 5b1803e (code as of 5735ad5) writes
-`dist/yaos-client/yaos.zip`. The build's own smoke check passed: the zip
-layout, no WASM, onload -> running/inline -> unload (7 commands), and a worker
-ping/pong.
+`node esbuild.config.mjs production` on a4e95fb writes
+`dist/yaos-client/yaos.zip`. The build's smoke check passed: zip layout, no
+WASM, engine markers once each (yjs's import guard plus two engine-only
+strings), and `main.js` loaded twice through Obsidian's loader shape:
+- onload -> running/inline -> unload (7 commands, no `Worker`);
+- onload -> running/worker -> unload. The `Worker` is a
+  `node:worker_threads` thread running the Blob the host built
+  (`scripts/plugin-smoke-env.mjs`), and its script is exactly `main.js`'s
+  bundle wrapper.
 
-| Artifact | Size |
-|---|---|
-| `main.js` | 978.5 KiB raw (1,001,990 B), 318 KiB gzip (325,276 B) |
-| of which the worker IIFE string | 434.2 KiB |
-| `yaos.zip` (`yaos/main.js`, `yaos/manifest.json`) | 331.2 KiB (339,181 B) |
+| Artifact | Before (9b618d5, engine twice) | After (a4e95fb, engine once) |
+|---|---|---|
+| `main.js` raw | 978.5 KiB (1,001,990 B) | 554.6 KiB (567,937 B) |
+| `main.js` gzip (`gzip -c`) | 318 KiB (325,276 B) | 181 KiB (185,294 B) |
+| `yaos.zip` (`yaos/main.js`, `yaos/manifest.json`) | 331.2 KiB (339,181 B) | 188.7 KiB (193,260 B) |
 
-The engine is in `main.js` twice (D2): once as the worker string, once as the
-inline fallback.
+The worker string that used to be in `main.js` (434.2 KiB) is gone: the worker
+runs the bundle's own source (D2). Lazy module init (esbuild `__esm` wrappers,
+so the worker never evaluates host modules) costs about 10.5 KiB raw / 5 KiB
+gzip.
+
+Breakdown of `main.js` by esbuild metafile `bytesInOutput` (minified,
+es2018). `--analyze` prints it per file.
+
+| Area | KiB | % |
+|---|---|---|
+| `src/engine` | 231.0 | 41.7 |
+| `src/core` | 114.3 | 20.6 |
+| yjs | 65.8 | 11.9 |
+| `src/host` (without ui) | 48.7 | 8.8 |
+| `src/host/ui` | 47.3 | 8.5 |
+| lib0 | 21.0 | 3.8 |
+| fflate | 13.2 | 2.4 |
+| y-codemirror.next | 7.8 | 1.4 |
+| `src/protocol` | 4.5 | 0.8 |
+| esbuild runtime, banner | 0.9 | 0.2 |
+
+Largest single files: yjs 65.8, `core/paths/casefold15_1` 19.0 (generated
+Unicode table), `engine/store/repo` 16.0, `core/plan/planner` 14.4, fflate
+13.2. There are no `legacy-src/` inputs (194 inputs, none from it).
+`obsidian`, `electron`, `@codemirror/*` and `@lezer/*` are external. The
+production build is minified with no sourcemap; the dev build keeps an inline
+sourcemap.
+
+Not applied: `target: "es2020"` would save another 10 KiB raw / 3.5 KiB gzip
+(557,767 B). Obsidian 1.13.7's desktop `app.js` uses `?.` / `??`, but the
+oldest mobile WebView the plugin must run on is unverified.
+
+CSP facts behind D2 (read-only from the app packages):
+- Desktop `index.html:6` has the same CSP in 1.12.7, 1.13.7 and 1.14.4:
+  `style-src 'unsafe-inline' 'self' https://fonts.googleapis.com` only. There is
+  no `script-src`, `worker-src` or `default-src`, and the main process adds no
+  CSP header.
+- Plugins are loaded with `window.eval` (`app.js` `loadPlugin`).
+- Mobile: not verified from the app package. The Android spike
+  (`spike-reports/android-2026-10-06.md:6-8`) ran a Blob-URL worker plus
+  IndexedDB with "no CSP violations". iOS has not been run.
+
+D2 therefore depends on no main-thread script CSP. It needs only a `blob:`
+worker, as the old design did, and inline remains the fallback.
 
 ## 9. Manual test plan
 

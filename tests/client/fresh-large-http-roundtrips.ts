@@ -1,11 +1,11 @@
 import { strict as assert } from "node:assert";
 import * as Y from "yjs";
-import { decodeBinaryEnvelope, encodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope";
+import { decodeBinaryEnvelope, encodeBinaryEnvelope } from "../../legacy-src/shared/binaryEnvelope";
 import {
 	MAX_CANDIDATE_UPDATE_BYTES,
 	MAX_CLIENT_MARKDOWN_BYTES,
 	MAX_DURABLE_UPDATE_BYTES,
-} from "../../server/src/shared/durableLimits";
+} from "../../legacy-src/shared/durableLimits";
 import { VaultSync, type BulkCreateRequest } from "../../legacy-src/sync/vaultSync";
 import type { HttpRequest, HttpResponse } from "../../legacy-src/utils/http";
 import { suite } from "../harness.ts";
