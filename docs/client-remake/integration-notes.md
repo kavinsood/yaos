@@ -160,6 +160,11 @@ devices).
 | 15 | After an epoch migration a doc with no synced record merged 3-way against the old epoch's path base. That base can be ahead of the new epoch (offline imports, pending creates, acked edits the migrating peer never saw), so the peer's missing text read as deletions. | sim seeds 24, 34, 36, 41, 55 F DEV2; 34, 55 F DEV3 | 54cb43a: trust the path base only when it is a subsequence of the new epoch's text; otherwise merge with no base (the disk side survives as a conflict copy). |
 | 16 | An identical duplicate create folded as merged; the rebind moved the loser's synced record and base, which held an edit only present in the loser's dropped frames, and merged before the winner's body arrived (empty text). | sim seed 46 F DEV2; 2 F DEV3 | d727691: the moved record restarts at the winner's create hash with no version (`restartAtCreate`); the planner waits `body-empty` while a create body is in flight; a CRDT text matching the synced hash serves as the base. |
 | 17 | A remote delete of an open note trashed it while the editor still held edits in the 16 ms coalesce buffer. The unbind flush then authored them after the synced record was dropped, and nothing restored the doc (restore duty is acted on only through a synced record). | sim seed 30 DEV3 | 1e13b6f: trash of a bound path first posts the coalesce buffer; if there was anything, the trash fails as a precondition and the replan sees the pending body, so it restores instead (edit beats delete). |
+| 18 | A bound doc whose merge result M differed from the disk D recorded the synced state with the current CRDT version, trusting the editor to save. A view closed (or an app crash) before that save left L = S with an equal version, so the file stayed at D for good. | sim seeds 56 F DEV2; 28, 21 F DEV3 | 260886e: such a merge records no body version (Rc stays true, the next unbound pass writes M) and reports a `deferred` job outcome that the scheduler does not chain or retry. Same in the conflict-copy intent resume. |
+| 19 | A local rename made before ns was ready: edit-beats-delete re-created the old path (undoing the rename), the observed rename was forgotten after one pass, and a new file at the old path made the planner ignore it, so the open editor wrote into the wrong file. | sim seed 21 F DEV3 | 082e50c: the observed rename is kept until ns is ready and wins (§f.6). |
+| 20 | After an IDB wipe the author re-read its own doc; every row was its own, so `onBodyChange` never fired and the disk side waited on `caughtUp` forever (the file stayed missing). | sim seed 179 F DEV3 | dab7011: a completed catch-up read always notifies the disk side. |
+| 21 | Before ns was read, "no remote entry" was taken as "pruned on the relay" and the synced record dropped; a later rename then became a copy and both files ended up on every device. | sim seed 179 F DEV3 | 453496c: no prune verdict before ns is ready. |
+| 22 | A local delete raced its own unsequenced body frames: `nsDelete.baseBodySeq` was below them, so the deleter itself held the restore duty, but it had dropped its synced record and restore was only planned through one. The other device (the edit's author) had lost its duty with a store wipe. Edits were lost. | sim seed 9 F DEV2 (rate 0.35), 26 F DEV5 | fcfeeec: the planner waits (`pending-body`) before `nsDelete` while own body records are in the outbox, and the runtime runs a docs pass on `onOwnBodySettled`; logPort adds the fallback duty (D11); a deleted entry with duty and no synced record is restored. |
 
 Sim-only fixes found on the way (no client change): epoch names reused across
 resets, one global clock skew instead of per-device, ledger coverage of
@@ -180,6 +185,8 @@ waiting on the blob queue.
 | D8 | §f.2 / §j.1 | The blob queue drops transfers the plan no longer wants after every full unbraked pass (keeps settings blobs and docs with open intents). | Not in DESIGN; without it a superseded transfer stayed due forever (bug 14). |
 | D9 | §i | Blob retry backoff is monotonic in memory; the persisted wall time is only clamped to the backoff on reopen. | A wall clock jump must not park uploads (bug 12). |
 | D10 | §i.4 | A settings change that touches reconcile or cfg options restarts the vault runtime (with the listing replayed). | Simpler than hot-swapping options in the planner and CfgSync; settings changes are rare. |
+| D11 | §c.7 | Fallback restore duty: any device whose body stream holds a row past `deleteBaseBodySeq` restores at once (no 30 s grace, no hash timer, no upper bound at `deletedSeq`). | The primary duty is lost with the author's store (IDB wipe), and the deleter drops its synced record. The stream record keeps only the max row seq, not per-row `authorNsSeq`; the primary duty already counts rows after `deletedSeq`, so the fallback matches it. Double restores fold as `not-deleted`. Checkpoints carry no seq, so they can't trigger it. |
+| D12 | §c.7 | A local delete (`nsDelete`) waits while the doc has own body / canvas records in the outbox. | Otherwise the delete base misses the device's own edits and the deleter gets a restore duty for its own delete. |
 
 ## 5. Honest gaps
 
@@ -188,7 +195,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 **Engine**
 - `textHash` duty is checked only for resident docs. The merge job handles
   identical content without a copy anyway, so the cost is an extra merge.
-- Restore duty is primary-only; the fallback (30 s plus hash timer) is missing.
+- The fallback restore duty has no 30 s grace and no hash timer (D11); a
+  delete waits while the deleter's own body frames are unsequenced, so a body
+  record stuck in the outbox (poisoned) holds that delete until it is resolved.
 - Divergence (V3 digest) is not implemented; `divergence` is always false.
 - `conflictCopiesToday` is always 0 and bootstrap progress is null in status.
 - A job-level overwrite rejected through `rejectBrake` is not persisted; the
