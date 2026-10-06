@@ -1,0 +1,29 @@
+server/src/router.ts
+  s_4bbb4f0137215c::t_18d0eac201aa3b 1-550
+server/src/worker.ts
+  s_4bbb4f0137215c::t_4819df022029e1 1-6,8,11
+tests/server/helpers/workerHarness.ts
+  s_4bbb4f0137215c::t_3b253e8bc9b9b6 1,15
+tests/server/hotpath.ts
+  s_4bbb4f0137215c::t_4085706398cc47 9
+tests/server/operator.ts
+  s_4bbb4f0137215c::t_e5d88414fec895 1,9
+tests/server/worker-router.ts
+  s_4bbb4f0137215c::t_bbea7430f2c508 1,6-7,486-493
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e539db4592e76b69966d6cb615f14f7fa3b2beb0",
+  "prompts": {},
+  "sessions": {
+    "s_4bbb4f0137215c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a75978e2782c742bb",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
