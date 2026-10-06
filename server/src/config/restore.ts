@@ -7,7 +7,7 @@
 // finishRestore (devices, no codes, new epoch; or back to 2); 4 DELETE the journal row → 200 {vaultEpoch}.
 import { randomBase64Url } from "../base64url";
 import { isCloudflareDailyLimitError } from "../dailyLimit";
-import type { ClockPort, StoragePort } from "../ports";
+import { describeError, type ClockPort, type StoragePort } from "../ports";
 import type { DeviceRecord } from "../vault/devices";
 import type { FinishRestoreResult, PrepareRestoreResult, RewindResult } from "../vault/host";
 import type { ConfigFailure, ConfigResult } from "./host";
@@ -77,7 +77,9 @@ function encodeDevices(devices: readonly DeviceRecord[]): ArrayBuffer {
 		tokenHash: device.tokenHash, deviceId: device.deviceId, deviceName: device.deviceName,
 		enrollmentRequestId: device.enrollmentRequestId, enrolledAt: device.enrolledAt,
 	}))));
-	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+	const buffer = new ArrayBuffer(bytes.byteLength);
+	new Uint8Array(buffer).set(bytes);
+	return buffer;
 }
 
 function decodeDevices(blob: ArrayBuffer): DeviceRecord[] {
@@ -141,7 +143,7 @@ export class RestoreRunner {
 			try {
 				await (this.inFlight.get(row.vault_id) ?? this.track(row.vault_id, () => this.run(row)));
 			} catch (error) {
-				console.error("[yaos-config] restore alarm: run failed", error);
+				console.error("[yaos-config] restore alarm: run failed", describeError(error));
 			}
 		}
 		if (this.storage.sql.exec("SELECT vault_id FROM restore_journal LIMIT 1").toArray().length === 0) {
@@ -252,7 +254,7 @@ export class RestoreRunner {
 			return fail(503, "restore_incomplete");
 		} catch (error) {
 			if (isCloudflareDailyLimitError(error)) throw error;
-			console.error("[yaos-config] restore step failed", error);
+			console.error("[yaos-config] restore step failed", describeError(error));
 			return fail(503, "restore_incomplete");
 		}
 	}

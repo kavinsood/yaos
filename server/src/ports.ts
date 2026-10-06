@@ -32,6 +32,14 @@ export function isMissingTableError(error: unknown, table: string): boolean {
 	return error instanceof Error && error.message.includes(`no such table: ${table}`);
 }
 
+/**
+ * `name: message` for logs. An error that crossed a DO RPC logs as its local stack only (measured on scratch-3: the
+ * `restore step failed` lines carried no message), so log sites print this instead of the error object.
+ */
+export function describeError(error: unknown): string {
+	return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
 /** One accepted (hibernatable) WebSocket. */
 export interface SocketPort {
 	close(code?: number, reason?: string): void;

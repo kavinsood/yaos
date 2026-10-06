@@ -17,6 +17,7 @@ import { bearerToken, isWebSocketUpgrade, json, notFound, rejectSocket, releaseU
 import { FailureLimiter, tooManyAttempts } from "../limiter";
 import {
 	SYSTEM_CLOCK,
+	describeError,
 	isMissingTableError,
 	type ClockPort,
 	type SocketPort,
@@ -708,6 +709,7 @@ export class VaultHost {
 			bookmark = await this.pitr.getBookmarkForTime(at);
 		} catch (error) {
 			if (isPitrUnsupportedError(error)) return { kind: "unsupported" };
+			console.error("[yaos-vault] getBookmarkForTime failed", describeError(error));
 			throw error;
 		}
 		// Synchronous from here: re-read the state the await may have changed.

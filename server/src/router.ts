@@ -648,7 +648,7 @@ async function blobExists(request: Request, bucket: R2Bucket, vaultId: string): 
 	if (!Array.isArray(hashes)) return json({ error: "missing hashes array" }, 400);
 	const addresses = hashes.slice(0, MAX_BLOB_EXISTS_ADDRESSES)
 		.filter((hash): hash is string => typeof hash === "string" && BLOB_ADDRESS_PATTERN.test(hash));
-	const present: boolean[] = new Array(addresses.length).fill(false);
+	const present = addresses.map(() => false);
 	let next = 0;
 	const worker = async () => {
 		while (next < addresses.length) {
