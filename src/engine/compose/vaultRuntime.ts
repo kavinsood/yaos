@@ -217,6 +217,10 @@ export class VaultRuntime {
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
 			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
 			pathBaseKeys: o.pathBases ? new Set(o.pathBases.keys()) : undefined,
+			boundSavedText: (docId, text) => {
+				const b = o.engine.bound.get(docId);
+				return b !== undefined && (text === b.diskText || b.candidates.includes(text));
+			},
 			takeOwnFold: () => this.takeOwnFold(),
 		});
 		await this.rec.start();

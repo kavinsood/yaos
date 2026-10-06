@@ -74,6 +74,11 @@ export interface ReconcilerDeps {
 	/** The keys `pathBase` answers for (the planner's migrated-loser merge). */
 	readonly pathBaseKeys?: ReadonlySet<PathKey>;
 	/**
+	 * A bound doc's replica already holds `text` (canonical): a save of one of its editors read it, or it is the
+	 * last disk text the replica absorbed (boundDisk). Such a disk side is not an edit: the merge base is the text.
+	 */
+	readonly boundSavedText?: (docId: DocId, text: string) => boolean;
+	/**
 	 * Own ns ops folded since the last call (S1, §c.13), handed over and forgotten. A pass applies them right
 	 * before its plan reads the view, so no plan sees a folded own op without its synced update.
 	 */
