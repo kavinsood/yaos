@@ -105,6 +105,20 @@ export function parseRemoteSnapshotId(s: string): { readonly deviceId: DeviceId;
 	return parseSnapshotId(id) && isDeviceId(dev) ? { deviceId: dev, snapshotId: id } : null;
 }
 
+/** Device label cut to SNAP_MAX_LABEL_BYTES on a code point boundary, lone surrogates replaced. */
+export function clampSnapLabel(label: string): string {
+	let out = "";
+	let n = 0;
+	for (const ch of label) {
+		const c = hasLoneSurrogate(ch) ? "\ufffd" : ch;
+		const b = utf8Bytes(c);
+		if (n + b > SNAP_MAX_LABEL_BYTES) break;
+		out += c;
+		n += b;
+	}
+	return out;
+}
+
 // ---------------------------------------------------------------------------
 // Validation (also applied to own records before they are sent)
 // ---------------------------------------------------------------------------
