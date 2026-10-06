@@ -149,6 +149,8 @@ async function http(method: string, path: string, options: { token?: string; coo
 	const headers: Record<string, string> = {};
 	if (options.token) headers.Authorization = `Bearer ${options.token}`;
 	if (options.cookie) headers.Cookie = options.cookie;
+	// Operator routes and /claim require a same-origin Origin (relay D5, what a browser sends); harmless elsewhere.
+	if (path === "/claim" || path.startsWith("/operator/")) headers.Origin = new URL(HOST).origin;
 	let body: BodyInit | undefined;
 	if (options.json !== undefined) { headers["Content-Type"] = "application/json"; body = JSON.stringify(options.json); }
 	if (options.body) { headers["Content-Type"] = "application/octet-stream"; body = options.body; }
@@ -191,8 +193,8 @@ async function enroll(pairingCode: string, name: string): Promise<{ device: Devi
 }
 
 async function operatorLogin(key: string): Promise<string> {
-	const response = await fetch(`${HOST}/operator/login`, { method: "POST", headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ operatorRecoveryKey: key }) });
+	const response = await fetch(`${HOST}/operator/login`, { method: "POST",
+		headers: { "Content-Type": "application/json", Origin: new URL(HOST).origin }, body: JSON.stringify({ operatorRecoveryKey: key }) });
 	await response.arrayBuffer();
 	const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
 	if (!response.ok || !cookie) throw new Error(`operator login failed (${response.status})`);
