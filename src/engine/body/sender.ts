@@ -34,7 +34,8 @@ export interface SenderDeps {
 	onSent(rec: OutboxRecord, attempts: number): void;
 	onPoison(rec: OutboxRecord, why: string): void;
 	onForbidden(): void;
-	onDailyLimit(retryAfterMs: number): void;
+	/** waitMs: the hold; retryAfterMs: the relay's delay to its reset, null when it did not say. */
+	onDailyLimit(waitMs: number, retryAfterMs: number | null): void;
 	diag(code: string, fields: Record<string, string | number | boolean | null>): void;
 }
 
@@ -193,7 +194,7 @@ export class Sender {
 			case "daily-limit": {
 				const wait = Math.max(1_000, retryAfterMs ?? 60_000);
 				this.holdUntilMono = Math.max(this.holdUntilMono, now + wait);
-				this.deps.onDailyLimit(wait);
+				this.deps.onDailyLimit(wait, retryAfterMs);
 				this.schedule(wait);
 				return;
 			}

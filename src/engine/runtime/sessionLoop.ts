@@ -72,6 +72,7 @@ export class SessionLoop {
 		if (!r.ok) {
 			this.stats.connectFailures++;
 			c.diag("connect-failed", { reason: r.reason });
+			if (r.reason === "daily-limit") c.dailyLimitPopup(r.retryAfterMs);
 			this.decide(connectFailure(r.reason, r.retryAfterMs, this.st, this.random, c.tuning.reconnectBaseMs));
 			return;
 		}

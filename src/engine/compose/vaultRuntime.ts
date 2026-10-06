@@ -143,6 +143,7 @@ export class VaultRuntime {
 			onBodyChange: (docIds) => holder.rt?.onBodyChange(docIds),
 			onOwnBodySettled: (docIds) => holder.rt?.onOwnBodySettled(docIds),
 			onStatus: (s) => holder.rt?.onLogStatus(s),
+			onHostNotice: (level, code, message) => engine.link.post({ t: "notice", level, code, message }),
 		});
 		const rt = new VaultRuntime(o, log);
 		holder.rt = rt;

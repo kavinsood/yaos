@@ -1952,7 +1952,7 @@ Port means copying the logic with tests, adapted to the new types. No runtime co
 | `server/src/shared/canvasCodec.ts`, `canvasOrdering.ts`, `canvasTypes.ts`, `canvasLimits.ts` | `src/core/hash/canvasCanonical.ts`, `src/engine/body/canvasDoc.ts` | Canonical bytes, Obsidian formatting, ranks, validation |
 | `legacy-src/sync/lineMerge.ts`, `threeWayMerge.ts` | `src/core/merge/{myers,diff3}.ts` | Line diff3 core and limits. Policy wrappers dropped |
 | `legacy-src/sync/boundedTextDiff.ts`, `diff.ts` (`tryApplyDiffToYText` only) | `src/core/merge/minimalDiff.ts`, `src/engine/reconcile/mergeJob.ts` | Minimal diff + CAS apply. `forceReplaceYText` is **dropped** |
-| `legacy-src/sync/dailyLimit.ts` | `src/engine/runtime/lifecycle.ts` (+ notice strings) | `resetAt` parsing, probe schedule, notice gate |
+| `legacy-src/sync/dailyLimit.ts` | `src/engine/adapters/relayHttp.ts` (`dailyResetDelayMs`), `src/engine/runtime/relayPolicy.ts` (retry), `src/engine/runtime/dailyLimit.ts` (notice gate + text) | `resetAt` parsing, probe schedule, notice gate |
 | `server/src/shared/socketCloseCodes.ts` | `src/engine/adapters/wsRelay.ts` | Mapped onto `RELAY_CLOSE` / `RelayEvent.closed` |
 | `legacy-src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*`, `src/core/cfg/projection.ts` | Allowlist, plugin version gate, canonical JSON |
 | `legacy-src/utils/{randomId,sha256,semver,defaultDeviceName,format}.ts` | `src/core/codec/ids.ts`, `src/engine/adapters/webHash.ts`, `src/host/*` | Ids become 16-byte base64url |

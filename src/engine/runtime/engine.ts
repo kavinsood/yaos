@@ -152,10 +152,11 @@ export class LogEngine {
 				void c.repo.tOutbox([{ t: "state", clientFrameId: rec.clientFrameId, state: "poisoned" }]).then((r) => c.applyOutboxResult(r));
 			},
 			onForbidden: () => c.onForbidden(),
-			onDailyLimit: (ms) => {
+			onDailyLimit: (ms, retryAfterMs) => {
 				c.dailyLimitUntilMono = c.mono() + ms;
 				c.setPhase("daily-limit");
 				c.notice("daily-limit");
+				c.dailyLimitPopup(retryAfterMs);
 			},
 			diag: (code, f) => c.diag(code, f),
 		});
