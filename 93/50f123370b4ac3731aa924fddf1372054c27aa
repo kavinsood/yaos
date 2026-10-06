@@ -1,0 +1,19 @@
+README.md
+  s_79d9b93476b202::t_0d002082138e2a 76,78-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9350f123370b4ac3731aa924fddf1372054c27aa",
+  "prompts": {},
+  "sessions": {
+    "s_79d9b93476b202": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4a02e307d4575a34",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
