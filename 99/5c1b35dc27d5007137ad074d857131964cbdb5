@@ -1,0 +1,21 @@
+src/engine/reconcile/testkit/crash.ts
+  s_3bea9f4c72a663::t_340c695402506a 9,11,74-75,83-87
+src/engine/reconcile/testkit/stubLog.ts
+  s_3bea9f4c72a663::t_772824916f27ac 8-9,12-13,22,25,27,221-232,272-273,286-288,356,363,381-391,393,399-403
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "995c1b35dc27d5007137ad074d857131964cbdb5",
+  "prompts": {},
+  "sessions": {
+    "s_3bea9f4c72a663": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb05cda11fb8d171",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
