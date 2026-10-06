@@ -1059,3 +1059,86 @@ export interface KeyringCrypto {
 | `tail` for `k` | Holds `k` records like any stream. There is no snapshot, since `k` has no checkpoints |
 
 No store or index is added or removed, so `upgrade()` (`src/engine/adapters/idbStorage.ts:465`) is unchanged.
+
+### 18.4 Protocol (`src/protocol/*`)
+
+```ts
+// messages.ts — EngineInitConfig (:46) gains:
+/** SECRET (keys): never logged or echoed. Buffers are transferred, and main keeps no copy (§6.3). */
+readonly crypto:
+  | { readonly suite: 0 }
+  | { readonly suite: 1; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; readonly records: readonly Uint8Array[] };
+
+// UserCommand (:132) gains (all SECRET payloads, transferred):
+| { readonly t: "enableE2ee"; readonly rk: Uint8Array }                       // genesis at head = 0 (§15.1)
+| { readonly t: "installKey"; readonly source: "qr"; readonly e: number; readonly k: Uint8Array }   // §12.1, §14.2 step 3
+| { readonly t: "installKey"; readonly source: "rk"; readonly rk: Uint8Array }                      // §12.4, §13.3
+| { readonly t: "revokeRekey"; readonly rk: Uint8Array }                      // §14.2; a new RK is generated on main
+
+// EngineToMain (:187) gains:
+| { readonly t: "keyringChanged"; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
+    readonly records: readonly Uint8Array[]; readonly pending: number | null }   // main persists before replying
+```
+
+- `status.ts`: `EnginePhase` gains `"key-missing"`, already named in DESIGN §c.3. `StatusSnapshot` gains
+  `e2ee: { suite: 0 | 1; sealEpoch: number; keyMissing: "no-key" | "revoked-epoch" | "encrypted-vault" | null }`.
+  There are no secrets in status.
+- **Persist-before-use.** The engine does not seal under a new epoch until main acknowledges `keyringChanged`
+  (the result of the same rid). A crash can therefore never leave committed rows under a key no device stored.
+- The RK and QR keys are generated and shown on main (UI). The worker never displays them, and main never logs them.
+
+### 18.5 relay-wire.md
+
+| Section | Change |
+|---|---|
+| §1 Model | Note that stream `k` (keyring) is client-defined and opaque to the relay, like every stream |
+| §2.4 Enroll | "Any client-only key part of a setup link is stripped before `/enroll`" (DECISIONS D3) |
+| §11.3 Blobs (:464, stale) | Rewrite to DECISIONS §5 row 11.3: opaque `^[0-9a-f]{64}$` addresses, no hash verification, R2 key `v/<vaultId>/<address>`, PUT overwrites, ≤ 10 MiB. Drop `X-YAOS-Content-SHA256` / `-Size` (server ask A1, A2) |
+| §11.1 Limits | Note that suite-1 payloads are padded, so the client caps content at 1015808 bytes (§7.3) |
+
+### 18.6 DESIGN.md diffs
+
+```diff
+ §b.1 Envelope (:43)
+-  u8      cryptoSuite     0 = none (v1); 1 = reserved XChaCha20-Poly1305
++  u8      cryptoSuite     0 = none; 1 = AES-256-GCM (e2ee-design.md)
+   …
+   varuint flags           initial | adopted | deflate | fromDisk
++  varuint frameNo         ns/cfg: per-device counter ≥ 1 (§c.3); other kinds 0
+   bytes   content         rest; deflate-raw (fflate) iff flags & deflate
+-  - frames: `"yaos/f1" ‖ varstring vaultId ‖ varstring stream ‖ varstring clientFrameId`;
+-  - checkpoints: `"yaos/c1" ‖ varstring vaultId ‖ varstring stream ‖ varuint coversSeq`.
++  - frames: `"yaos/f2" ‖ header ‖ vaultId ‖ stream ‖ deviceId ‖ clientFrameId`;
++  - checkpoints: `"yaos/c2" ‖ header ‖ vaultId ‖ stream ‖ coversSeq` (e2ee-design §7.2).
++- **Padding.** Suite ≠ 0: Padmé inside the AEAD, 256 B floor (e2ee-design §7.3).
+-- **E2EE later.** Suite 1 swaps the `CryptoPort` only. No layout changes: blob addresses become `HMAC(vaultKey, hash)`.
++- **E2EE.** Suite 1 is specified in e2ee-design.md. Blob addresses are `HMAC(kAddr, sha256)`.
+
+ §b.2 Streams: table gains   | `k` | keyring | k records (no envelope) | none | yes | any device |
+
+ §c.3 Frame-level rules (:290)
++2a. **Replay window** (ns/cfg). frameNo `f` vs per-device (R, 64-bit bitmap): f = 0 malformed; f ≤ R−64 or a
++    set bit → `ignored/replay-*`, fold as empty. Update only after open and decode (e2ee-design §8.2).
+-own ns frame `k` may be sent only when every own ns frame ≤ `k − NS_SEND_WINDOW` (32) is receipted;
++own ns frame with frameNo `f` may be sent only when every own frame with frameNo ≤ `f − NS_SEND_WINDOW` is receipted;
+
+ §d.6 Ingest gate (:782) table gains rows:
++| `suite-downgrade`, `bad-padding`, `auth-failed` under a verified key | deterministic (as malformation) |
++| `auth-failed` under an unverified key | reader-dependent |
++| stale-epoch (e2ee-design §14.3) | ignored; ns/cfg fold as empty; bodies not quarantined |
+
+ §d.7 Catch-up (:840)
++0. **Keyring.** Read `k` to head and settle keys (e2ee-design §11.3) before any other stream.
+
+ §h Ports (:1399): replace the CryptoPort block with e2ee-design §18.1.
+
+ §j.1 Blobs (:1657)
+-  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<sha256>` as `blobChunk` frames
++  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<blobAddress>` as `blobChunk` frames
++- **GC.** Blobs are never deleted until the server has list and delete routes; then client mark-and-sweep (e2ee-design §10.4).
+
+ §j.7 Diagnostics (:1766)
+-  - recent events (… **hashed** paths),
++  - recent events (… paths hashed with `CryptoPort.diagHash`: HMAC(kDiag) under suite 1),
++  - never key material, recovery keys or setup links.
+```
