@@ -1,0 +1,21 @@
+src/engine/compose/runtimeOps.ts
+  s_9cbf31702d3e3d::t_dae7ad769d6640 8,55-59,66
+src/sim/composed.test.ts
+  s_9cbf31702d3e3d::t_410f3c7b2a203b 214-238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "31c6d4630a833e98f67abf42104ac34cbf195f36",
+  "prompts": {},
+  "sessions": {
+    "s_9cbf31702d3e3d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a80c8223f6cdc9a73",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
