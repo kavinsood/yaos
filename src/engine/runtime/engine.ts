@@ -22,10 +22,10 @@ import { HandleManager, type Handle } from "../body/handles";
 import { Sender } from "../body/sender";
 import { encodeStateAsUpdate, ORIGIN } from "../body/yjsCounters";
 import { defaultPriority, Repo, type YS } from "../store/repo";
-import { DB_NAME_PREFIX, DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity, type QuarantineRecord, type TailRecord } from "../store/schema";
+import { DB_NAME_PREFIX, DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity } from "../store/schema";
 import { newDocId } from "../../core/codec/ids";
 import { bytesToHex, utf8Encode } from "../../core/codec/lib0";
-import { gateRow } from "../sync/ingestRow";
+import { releaseQuarantine, retryReaderQuarantine } from "./quarantineRelease";
 import type { BodyHandle } from "../reconcile/deps";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { CfgRuntime } from "../sync/cfgRuntime";
@@ -378,35 +378,13 @@ export class LogEngine {
 	}
 
 	/** Re-gate quarantined rows (key now available, ...): pass -> tail; the rest dismissed; doc unfrozen. */
-	async releaseQuarantine(docId: DocId): Promise<{ passed: number; dismissed: number }> {
-		const c = this.c;
-		const stream = this.streamOf(docId);
-		const pass: TailRecord[] = [];
-		const dismiss: QuarantineRecord[] = [];
-		for (const q of await c.repo.quarantineOf(stream)) {
-			if (q.bytes.length < q.originalSize) {
-				dismiss.push(q);
-				continue;
-			}
-			const g = await gateRow(c.gateCtx, c.ports.hash, { stream, seq: q.seq, deviceId: q.deviceId, clientFrameId: q.clientFrameId, payload: q.bytes }, c.now());
-			if (g.t === "row") pass.push(g.row);
-			else dismiss.push(q);
-		}
-		await c.repo.tReleaseQuarantine(stream, pass, dismiss, c.now());
-		c.docs.clearCausal(stream);
-		for (const n of c.noticeList()) {
-			if (!n.code.startsWith("frozen:")) continue;
-			const reason = n.code.slice("frozen:".length);
-			if (![...c.repo.streams()].some((r) => r.frozen === 1 && r.frozenReason === reason)) c.clearNotice(n.code);
-		}
-		const h = c.handles.peek(stream);
-		if (h) {
-			if (pass.length > 0) await c.docs.applyToHandle(h, pass);
-			c.docs.checkDoc(h);
-		}
-		c.sess.scheduleCatchUp();
-		c.scheduleStatus();
-		return { passed: pass.length, dismissed: dismiss.length };
+	releaseQuarantine(docId: DocId): Promise<{ passed: number; dismissed: number }> {
+		return releaseQuarantine(this.c, this.streamOf(docId));
+	}
+
+	/** Automatic retry of reader-dependent quarantine (runs after every session start). */
+	retryQuarantine(): Promise<number> {
+		return retryReaderQuarantine(this.c);
 	}
 
 	// ------------------------------------------------------------ lifecycle

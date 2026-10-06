@@ -15,6 +15,7 @@ import type { RelayConnectResult, RelayEvent, RelaySession } from "../../ports/r
 import { readStream, staleOrder, type ReadResult } from "../sync/catchUp";
 import type { EngineCtx } from "./context";
 import { connectFailure, newReconnectState, sessionClosed, type ReconnectDecision } from "./relayPolicy";
+import { retryReaderQuarantine } from "./quarantineRelease";
 
 type Closed = Extract<RelayEvent, { t: "closed" }>;
 
@@ -130,6 +131,9 @@ export class SessionLoop {
 			if (gen !== c.gen) return;
 			c.setPhase(c.dailyLimitUntilMono > c.mono() ? "daily-limit" : "live");
 			this.st = newReconnectState();
+			// Reader-dependent quarantine is retried on every session start (new keys / version, §d.6).
+			await retryReaderQuarantine(c).catch((e) => c.diag("quarantine-retry-failed", { error: String(e) }));
+			if (gen !== c.gen) return;
 			this.scheduleCatchUp();
 		} catch (e) {
 			c.diag("session-start-failed", { error: String(e) });

@@ -241,3 +241,39 @@ test("oversize-remote: valid rows pushing the text past MAX_DOC_TEXT_CHARS freez
 		await a.stop();
 	}
 });
+
+test("quarantine: reader-dependent rows are retried automatically on the next session (keys arrived); still missing -> stay quarantined", async () => {
+	const relay = new SimRelay();
+	const fc = faultyCrypto();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", crypto: fc });
+	try {
+		await live(a, b);
+		const id = await a.createDoc("r.md", "base;");
+		await converged([a, b]);
+		const stream = a.streamOf(id);
+		fc.failOpen = true;
+		for (let i = 0; i < 2; i++) await a.editDoc(id, (t) => t.insert(t.length, `k${i};`));
+		await until(() => b.c.repo.stream(stream)?.quarantinedRows === 2, 3_000, "quarantined");
+		const sessions = b.c.sess.stats.sessions;
+		// Reconnect with the key still missing: nothing is released or dismissed.
+		relay.dropSession("dev-b" as DeviceId);
+		await until(() => b.c.sess.stats.sessions > sessions && b.status().phase === "live", 5_000, "b reconnected");
+		await until(() => b.isIdle(), 3_000, "b idle");
+		assert.equal(b.c.repo.stream(stream)!.frozen, 1);
+		assert.equal((await b.c.repo.quarantineOf(stream)).filter((q) => !q.detail.startsWith("dismissed:")).length, 2);
+		// The key arrives; the next session start re-gates and applies.
+		fc.failOpen = false;
+		const s2 = b.c.sess.stats.sessions;
+		relay.dropSession("dev-b" as DeviceId);
+		await until(() => b.c.sess.stats.sessions > s2 && b.c.repo.stream(stream)!.frozen === 0, 5_000, "released on reconnect");
+		assert.equal(await b.docText(id), "base;k0;k1;");
+		assert.equal(b.status().counts.frozenDocs, 0);
+		await b.editDoc(id, (t) => t.insert(0, "B;"));
+		await converged([a, b]);
+		assert.equal(await a.docText(id), "B;base;k0;k1;");
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});
