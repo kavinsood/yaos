@@ -1726,6 +1726,14 @@ ones get conflict copies.
 - **Clash pause.** While Obsidian Sync (`core-plugins.json` `sync`) or a known community sync plugin (Remotely Save,
   Self-hosted LiveSync, Relay) is enabled, cfg sync emits and applies nothing. It shows one warn naming the clashing
   plugin and resumes on its own once that plugin is off. Note sync is not affected.
+- **Desktop-only plugins.** On mobile (`PlatformInfo.isMobile`), a plugin enabled elsewhere whose installed manifest
+  says `isDesktopOnly` is not enabled here. This hold is silent, and the device never disables the plugin elsewhere.
+- **First-enable seed.** Turning the settings toggle on asks "Use the vault's settings" or "Use this device's
+  settings" (`EngineSettings.syncSettingsSeed`, absent = vault). Closing the dialog leaves sync off.
+  - The answer only applies while `cfgBase` is empty, which means the first pass on this device or the first pass after a
+    cache rebuild. Later passes, including after turning sync off and on again, are normal 3-way merges.
+  - With no base, vault: the vault's register wins over the local value. Device: the local value wins.
+  - In both cases, what only one side has is taken and nothing is deleted.
 - Port the legacy `settingsSync/{allowlist, dataJsonGate, configDirKey, clash, lwwReconcile(json canonicalization
   only)}`.
 
