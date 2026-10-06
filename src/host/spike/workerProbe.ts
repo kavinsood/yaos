@@ -1,6 +1,7 @@
 // YAOS spike: main-thread side of the OR-1 Blob-URL worker probe. All browser
 // constructors are injected (deps) so node:test can drive this against an
 // in-process worker over a MessageChannel.
+import type { CryptoProbeOptions } from "./cryptoProbe";
 import { defaultNow, errInfo, r1, settle, skipped, toStep, type WorkerProbeReport } from "./report";
 import { fillPattern, checkPattern, type MainToSpike, type SpikeToMain } from "./spikeWorkerHandler";
 
@@ -19,6 +20,14 @@ export interface WorkerProbeTimeouts {
 	echoMs: number;
 	transferBytes: number;
 	graceMs: number;
+	cryptoMs: number;
+}
+
+/** Which worker steps to run after the first pong. OR-1 runs idb + transfer; the E2EE part runs crypto only. */
+export interface WorkerProbeSteps {
+	idb: boolean;
+	transfer: boolean;
+	crypto: boolean;
 }
 
 export const DEFAULT_WORKER_TIMEOUTS: WorkerProbeTimeouts = {
@@ -30,6 +39,7 @@ export const DEFAULT_WORKER_TIMEOUTS: WorkerProbeTimeouts = {
 	echoMs: 5000,
 	transferBytes: 64 * 1024,
 	graceMs: 750,
+	cryptoMs: 60000,
 };
 
 export interface WorkerProbeDeps {
@@ -39,6 +49,8 @@ export interface WorkerProbeDeps {
 	revokeUrl(url: string): void;
 	now?: () => number;
 	timeouts?: Partial<WorkerProbeTimeouts>;
+	steps?: Partial<WorkerProbeSteps>;
+	cryptoOpts?: Omit<CryptoProbeOptions, "where">;
 	onProgress?: (msg: string) => void;
 }
 
@@ -49,6 +61,7 @@ function isReply(v: unknown): v is SpikeToMain {
 export async function runWorkerProbe(deps: WorkerProbeDeps): Promise<WorkerProbeReport> {
 	const now = deps.now ?? defaultNow;
 	const T: WorkerProbeTimeouts = { ...DEFAULT_WORKER_TIMEOUTS, ...deps.timeouts };
+	const steps: WorkerProbeSteps = { idb: true, transfer: true, crypto: false, ...deps.steps };
 	const progress = (m: string): void => {
 		try {
 			deps.onProgress?.(m);
@@ -175,7 +188,9 @@ export async function runWorkerProbe(deps: WorkerProbeDeps): Promise<WorkerProbe
 				const p = await request({ type: "ping", id: nextId++, t: r1(s) }, "pong", T.pingMs);
 				if (p.kind === "ok" && p.value.type === "pong") report.pingRttsMs.push(r1(now() - s));
 			}
+		}
 
+		if (report.firstPong.received && steps.idb) {
 			progress("worker IndexedDB probe");
 			const probe = await request({ type: "probe", id: nextId++, idbTimeoutMs: T.idbStepMs }, "probeResult", T.probeMs);
 			if (probe.kind === "ok") {
@@ -183,7 +198,9 @@ export async function runWorkerProbe(deps: WorkerProbeDeps): Promise<WorkerProbe
 				else if (probe.value.type === "error") report.probe = { received: false, ms: probe.ms, error: probe.value.error };
 			} else if (probe.kind === "hang") report.probe = { received: false, ms: probe.ms, hang: true };
 			else report.probe = { received: false, ms: probe.ms, error: probe.error };
+		}
 
+		if (report.firstPong.received && steps.transfer) {
 			progress("transfer echo");
 			const id = nextId++;
 			const buf = new ArrayBuffer(T.transferBytes);
@@ -210,6 +227,17 @@ export async function runWorkerProbe(deps: WorkerProbeDeps): Promise<WorkerProbe
 			else if (echo.value.type === "error") t.error = echo.value.error;
 			waiters.delete(`echoAfter:${id}`);
 		}
+
+		if (report.firstPong.received && steps.crypto) {
+			progress("worker E2EE crypto probe");
+			const msg: MainToSpike = deps.cryptoOpts ? { type: "crypto", id: nextId++, opts: deps.cryptoOpts } : { type: "crypto", id: nextId++ };
+			const c = await request(msg, "cryptoResult", T.cryptoMs);
+			if (c.kind === "ok") {
+				if (c.value.type === "cryptoResult") report.crypto = { received: true, ms: c.ms, report: c.value.report };
+				else if (c.value.type === "error") report.crypto = { received: false, ms: c.ms, error: c.value.error };
+			} else if (c.kind === "hang") report.crypto = { received: false, ms: c.ms, hang: true };
+			else report.crypto = { received: false, ms: c.ms, error: c.error };
+		} else if (steps.crypto) report.crypto = { received: false };
 	} catch (e) {
 		report.events.push({ type: "probeException", atMs: at(), message: errInfo(e).message });
 	} finally {

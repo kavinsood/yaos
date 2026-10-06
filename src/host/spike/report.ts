@@ -2,7 +2,9 @@
 // so node:test can load this file). Throwaway code: answers OR-1 (Blob-URL
 // worker + IndexedDB inside it, else inline fallback) and OR-2 (how an open
 // MarkdownView is reloaded when its file changes underneath, and whether a
-// per-instance setViewData wrapper can intercept it).
+// per-instance setViewData wrapper can intercept it). The E2EE part measures the
+// WebCrypto facts the suite-1 design depends on (see cryptoProbe.ts).
+import type { BenchRow, CryptoProbeReport } from "./cryptoProbe";
 
 export interface ErrInfo {
 	name: string;
@@ -236,6 +238,8 @@ export interface WorkerProbeReport {
 	pingRttsMs: number[];
 	probe: { received: boolean; ms?: number; hang?: boolean; report?: WorkerSelfReport; error?: ErrInfo };
 	transfer: TransferProbe;
+	/** Present only when the crypto step was requested (E2EE part). */
+	crypto?: { received: boolean; ms?: number; hang?: boolean; report?: CryptoProbeReport; error?: ErrInfo };
 	events: WorkerEventRecord[];
 	terminate: StepResult;
 	revoke: StepResult;
@@ -380,6 +384,15 @@ export interface ViewProbeReport {
 	totalMs: number;
 }
 
+export interface E2eeReport {
+	/** A separate Blob-URL worker that runs only the crypto step (OR-1's worker run is unchanged). */
+	worker: WorkerProbeReport | null;
+	workerCrash?: ErrInfo;
+	/** Same probe on the main thread (the engine's inline fallback realm). */
+	main: CryptoProbeReport | null;
+	mainCrash?: ErrInfo;
+}
+
 export interface SpikeReport {
 	spike: { id: string; version: string; build: string; startedAt: string; finishedAt?: string; durationMs?: number; ran: string[] };
 	env: Record<string, unknown>;
@@ -387,6 +400,8 @@ export interface SpikeReport {
 	or1Crash?: ErrInfo;
 	or2?: ViewProbeReport;
 	or2Crash?: ErrInfo;
+	e2ee?: E2eeReport;
+	e2eeCrash?: ErrInfo;
 	verdicts?: Verdicts;
 }
 
@@ -509,10 +524,70 @@ export function summarizeOr2(r: ViewProbeReport | undefined): Or2Summary {
 	};
 }
 
+export interface E2eeVerdict {
+	workerCryptoOk: boolean;
+	mainCryptoOk: boolean;
+	lines: string[];
+}
+
+const CRYPTO_STEPS = ["random", "importNonExtractable", "hkdf", "hmac", "aesGcm", "idbKey"] as const;
+
+function short(v: unknown, max = 240): string {
+	let s: string;
+	try {
+		s = JSON.stringify(v) ?? String(v);
+	} catch {
+		s = safeString(v);
+	}
+	return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
+function cryptoFailures(r: CryptoProbeReport): string[] {
+	const out: string[] = [];
+	for (const name of CRYPTO_STEPS) {
+		const st = r[name];
+		if (st.ok) continue;
+		const why = st.hang ? `HANG after ${st.ms} ms` : st.error ? `${st.error.name}: ${st.error.message}` : st.skipped ? `skipped${st.value ? ` (${safeString(st.value)})` : ""}` : `check failed ${short(st.value)}`;
+		out.push(`${name} ${why}`);
+	}
+	if (!r.bench.ok) out.push(`bench ${r.bench.hang ? "HANG" : r.bench.error ? `${r.bench.error.name}: ${r.bench.error.message}` : r.bench.skipped ? "skipped" : "incomplete"}`);
+	return out;
+}
+
+function benchLine(rows: BenchRow[]): string {
+	const size = (b: number): string => (b >= 1048576 ? `${b / 1048576} MiB` : `${b / 1024} KiB`);
+	return rows.map((r) => `${size(r.bytes)} seal ${r.sealMeanMs} ms (${r.sealMiBps} MiB/s, p50 ${r.sealP50Ms}, first ${r.firstSealMs}) open ${r.openMeanMs} ms (${r.openMiBps} MiB/s) n=${r.iters}`).join("; ");
+}
+
+export function computeE2eeVerdict(e: E2eeReport | undefined, crash?: ErrInfo): E2eeVerdict {
+	const lines: string[] = [];
+	const w = e?.worker ?? null;
+	const wc = w?.crypto?.report;
+	const workerCryptoOk = Boolean(wc?.ok);
+	const mainCryptoOk = Boolean(e?.main?.ok);
+	const where = (label: string, r: CryptoProbeReport | undefined, missing: string): void => {
+		if (!r) {
+			lines.push(`E2EE ${label}: NOT MEASURED (${missing})`);
+			return;
+		}
+		const fails = cryptoFailures(r);
+		lines.push(`E2EE ${label}: ${r.ok ? "OK" : "FAILED"} (getRandomValues, importKey extractable:false, HKDF, HMAC, AES-GCM KAT+tamper, CryptoKey in IDB, bench)${fails.length ? `; failed: ${fails.join("; ")}` : ""}`);
+		const k = r.idbKey.value as { storedType?: string; extractable?: boolean } | undefined;
+		if (k) lines.push(`E2EE ${label} IDB key: stored as ${k.storedType ?? "?"}, extractable ${safeString(k.extractable)}`);
+		if (r.bench.rows.length) lines.push(`E2EE ${label} AES-256-GCM: ${benchLine(r.bench.rows)}`);
+	};
+	const workerMissing = !w ? (e?.workerCrash ? `crashed ${e.workerCrash.name}: ${e.workerCrash.message}` : "no worker run") : !w.ok ? "worker did not start" : w.crypto?.hang ? `crypto step HANG after ${w.crypto.ms ?? "?"} ms` : w.crypto?.error ? `${w.crypto.error.name}: ${w.crypto.error.message}` : "no crypto reply";
+	where("worker", wc, workerMissing);
+	where("main thread", e?.main ?? undefined, e?.mainCrash ? `crashed ${e.mainCrash.name}: ${e.mainCrash.message}` : "not run");
+	if (crash) lines.push(`E2EE probe crashed: ${crash.name}: ${crash.message}`);
+	return { workerCryptoOk, mainCryptoOk, lines };
+}
+
 export interface Verdicts {
 	platform: string;
 	or1?: Or1Verdict;
 	or2?: Or2Summary;
+	e2ee?: E2eeVerdict;
 	lines: string[];
 }
 
@@ -569,6 +644,11 @@ export function computeVerdicts(report: SpikeReport): Verdicts {
 		lines.push(`OR-2 restore OK ${yn(s.restoreOk)}; cleanup OK ${yn(s.cleanupOk)}`);
 		for (const e of s.errors) lines.push(`OR-2 error: ${e}`);
 		if (report.or2Crash) lines.push(`OR-2 probe crashed: ${report.or2Crash.name}: ${report.or2Crash.message}`);
+	}
+	if (report.e2ee || report.e2eeCrash) {
+		const v = computeE2eeVerdict(report.e2ee, report.e2eeCrash);
+		out.e2ee = v;
+		lines.push(...v.lines);
 	}
 	return out;
 }

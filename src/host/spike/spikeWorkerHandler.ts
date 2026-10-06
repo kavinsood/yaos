@@ -2,18 +2,21 @@
 // driven in node:test over a MessageChannel; spikeWorker.ts binds it to the
 // real DedicatedWorkerGlobalScope. Nothing here may throw out of a handler:
 // every failure is posted back as data.
+import { runCryptoProbe, type CryptoProbeOptions, type CryptoProbeReport } from "./cryptoProbe";
 import { runIdbProbe } from "./idbProbe";
 import { defaultNow, errInfo, r1, settle, toStep, type ErrInfo, type WorkerSelfReport } from "./report";
 
 export type MainToSpike =
 	| { type: "ping"; id: number; t: number }
 	| { type: "probe"; id: number; idbTimeoutMs?: number }
-	| { type: "echo"; id: number; buf: ArrayBuffer };
+	| { type: "echo"; id: number; buf: ArrayBuffer }
+	| { type: "crypto"; id: number; opts?: Omit<CryptoProbeOptions, "where"> };
 
 export type SpikeToMain =
 	| { type: "boot"; workerNow: number }
 	| { type: "pong"; id: number; t: number; workerNow: number }
 	| { type: "probeResult"; id: number; report: WorkerSelfReport }
+	| { type: "cryptoResult"; id: number; report: CryptoProbeReport }
 	| { type: "echo"; id: number; buf: ArrayBuffer | null; receivedBytes: number; patternOk: boolean }
 	| { type: "echoAfter"; id: number; byteLengthAfterPost: number | null; postError?: ErrInfo }
 	| { type: "workerError"; source: string; error: ErrInfo; detail?: unknown }
@@ -28,6 +31,8 @@ export interface SpikeWorkerEnv {
 	/** May throw (e.g. SecurityError in opaque origins). */
 	getIndexedDB: () => IDBFactory | undefined;
 	subtle?: SubtleCrypto;
+	/** Bound to the worker's crypto; used by the E2EE crypto probe. */
+	getRandomValues?: (a: Uint8Array) => Uint8Array;
 	typeofWebSocket: string;
 	typeofStructuredClone: string;
 	typeofFetch: string;
@@ -125,6 +130,14 @@ export function installSpikeWorker(scope: SpikeScopeLike, env: SpikeWorkerEnv): 
 				case "probe": {
 					const report = await collectWorkerSelfReport(env, msg.idbTimeoutMs);
 					post({ type: "probeResult", id: msg.id, report });
+					return;
+				}
+				case "crypto": {
+					const report = await runCryptoProbe(
+						{ subtle: env.subtle, getRandomValues: env.getRandomValues, getIndexedDB: env.getIndexedDB, now },
+						{ ...msg.opts, where: "worker" },
+					);
+					post({ type: "cryptoResult", id: msg.id, report });
 					return;
 				}
 				case "echo": {

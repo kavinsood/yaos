@@ -3,11 +3,15 @@
 //         IndexedDB open inside it? (else: inline/main-thread fallback)
 //   OR-2  how does Obsidian reload an open MarkdownView when its file changes,
 //         and can a per-instance setViewData wrapper intercept it?
+//   E2EE  do getRandomValues, importKey(extractable:false), HKDF, HMAC, AES-GCM
+//         and a CryptoKey stored in IndexedDB work inside a Blob-URL worker (and
+//         on the main thread), and how fast is AES-256-GCM at 1 KiB/64 KiB/1 MiB?
 // Built by scripts/build-spike.mjs; the worker source is injected via esbuild
 // `define` as __YAOS_SPIKE_WORKER_SRC__ (no virtual module import).
 import { apiVersion, normalizePath, Notice, Platform, Plugin } from "obsidian";
+import { runCryptoProbe } from "./cryptoProbe";
 import { runIdbProbe } from "./idbProbe";
-import { computeVerdicts, errInfo, formatReport, settle, stamp, type Or1Report, type SpikeReport } from "./report";
+import { computeVerdicts, errInfo, formatReport, settle, stamp, type E2eeReport, type Or1Report, type SpikeReport } from "./report";
 import { ResultsModal } from "./resultsModal";
 import { runViewProbe } from "./viewProbe";
 import { runWorkerProbe } from "./workerProbe";
@@ -15,7 +19,8 @@ import { runWorkerProbe } from "./workerProbe";
 declare const __YAOS_SPIKE_WORKER_SRC__: string;
 declare const __YAOS_SPIKE_BUILD__: string;
 
-type Part = "or1" | "or2";
+type Part = "or1" | "or2" | "e2ee";
+const ALL_PARTS: Part[] = ["or1", "or2", "e2ee"];
 
 export default class YaosSpikePlugin extends Plugin {
 	private running = false;
@@ -23,11 +28,12 @@ export default class YaosSpikePlugin extends Plugin {
 
 	onload(): void {
 		this.addRibbonIcon("flask-conical", "YAOS spike: run probes", () => {
-			void this.run(["or1", "or2"]);
+			void this.run(ALL_PARTS);
 		});
-		this.addCommand({ id: "run-probes", name: "Run probes", callback: () => void this.run(["or1", "or2"]) });
+		this.addCommand({ id: "run-probes", name: "Run probes", callback: () => void this.run(ALL_PARTS) });
 		this.addCommand({ id: "run-or1", name: "Run OR-1 only (Blob-URL worker + IndexedDB)", callback: () => void this.run(["or1"]) });
 		this.addCommand({ id: "run-or2", name: "Run OR-2 only (setViewData interception)", callback: () => void this.run(["or2"]) });
+		this.addCommand({ id: "run-e2ee", name: "Run E2EE crypto probes only (WebCrypto in worker + main thread)", callback: () => void this.run(["e2ee"]) });
 		this.addCommand({ id: "show-last-report", name: "Show last report", callback: () => this.show() });
 	}
 
@@ -37,7 +43,7 @@ export default class YaosSpikePlugin extends Plugin {
 			return;
 		}
 		this.running = true;
-		const notice = new Notice("YAOS spike: starting (about 45 s; do not touch the probe tab)", 0);
+		const notice = new Notice("YAOS spike: starting (about 50 s; do not touch the probe tab)", 0);
 		const progress = (m: string): void => {
 			try {
 				notice.setMessage(`YAOS spike: ${m}`);
@@ -64,6 +70,13 @@ export default class YaosSpikePlugin extends Plugin {
 					report.or2 = await runViewProbe(this.app, { onProgress: progress });
 				} catch (e) {
 					report.or2Crash = errInfo(e, true);
+				}
+			}
+			if (parts.includes("e2ee")) {
+				try {
+					report.e2ee = await runE2ee(progress);
+				} catch (e) {
+					report.e2eeCrash = errInfo(e, true);
 				}
 			}
 		} catch (e) {
@@ -148,6 +161,38 @@ async function runOr1(progress: (m: string) => void): Promise<Or1Report> {
 		or1.inlineCrash = errInfo(e, true);
 	}
 	return or1;
+}
+
+async function runE2ee(progress: (m: string) => void): Promise<E2eeReport> {
+	const e2ee: E2eeReport = { worker: null, main: null };
+	try {
+		e2ee.worker = await runWorkerProbe({
+			source: workerSource(),
+			makeUrl: (src) => URL.createObjectURL(new Blob([src], { type: "text/javascript" })),
+			makeWorker: (url) => new Worker(url),
+			revokeUrl: (url) => URL.revokeObjectURL(url),
+			timeouts: { pings: 0 },
+			steps: { idb: false, transfer: false, crypto: true },
+			onProgress: (m) => progress(`E2EE ${m}`),
+		});
+	} catch (e) {
+		e2ee.workerCrash = errInfo(e, true);
+	}
+	progress("E2EE main-thread crypto probe (inline fallback path)");
+	try {
+		const c = typeof crypto !== "undefined" ? crypto : undefined;
+		e2ee.main = await runCryptoProbe(
+			{
+				subtle: c?.subtle,
+				getRandomValues: c && typeof c.getRandomValues === "function" ? (a) => c.getRandomValues(a) : undefined,
+				getIndexedDB: () => (typeof indexedDB === "undefined" ? undefined : indexedDB),
+			},
+			{ where: "main" },
+		);
+	} catch (e) {
+		e2ee.mainCrash = errInfo(e, true);
+	}
+	return e2ee;
 }
 
 async function collectEnv(plugin: Plugin): Promise<Record<string, unknown>> {
