@@ -53,7 +53,7 @@ fields are legacy (§14).
 
 ### 2.2 Claim (fresh server only)
 
-`POST /claim {"operatorRecoveryKey": "<≥32 chars>"}` → `200 {ok, host, vaultId, vaultName, pairingCode, pairingExpiresAt, obsidianUrl, mobileSetupQrDataUrl, capabilities}`
+`POST /claim {"operatorRecoveryKey": "<≥32 chars>"}` → `200 {ok, host, vaultId, vaultName, pairingCode, pairingExpiresAt, obsidianUrl, capabilities}`
 
 - This creates the server's first vault and returns a one-time owner pairing code (15 min TTL).
 - If `/api/capabilities` says `claimed: true`, the server already has an operator. Use §2.3 instead.
@@ -160,7 +160,7 @@ error followed by close 1006:
     "maxBinaryMessageBytes": 1049600, "maxTextMessageBytes": 65536, "maxCheckpointBytes": 4194304,
     "feedDefaultLimit": 1000, "feedMaxLimit": 5000, "readDefaultBytes": 1048576, "readMaxBytes": 4194304,
     "rateBytesPerSec": 262144, "burstBytes": 2097152,
-    "groupCommit": { "idleMs": 300, "maxMs": 1500, "maxBytes": 65536, "minIntervalMs": 0 }
+    "groupCommit": { "idleMs": 300, "maxMs": 1500, "maxBytes": 65536, "minIntervalMs": 1000 }
   },
   "canWrite": true,
   "principalId": "...", "deviceId": "...", "role": "owner",
@@ -595,8 +595,16 @@ change, and some of it is still exercised by `legacy-src/` and the relay2 experi
 | read page | 4.1 | 238 |
 | checkpoint put (+GC) | 4.8 | 266 |
 
-Receipt latency is dominated by the 300 ms idle group-commit window, and the rest is the round trip. HTTP routes
-pay Worker auth (a device check in the config DO) plus the vault DO hop.
+The table measures the server before its rewrite. There, receipt latency was dominated by the 300 ms idle
+group-commit window, and the rest was the round trip; HTTP routes paid Worker auth (a device check in the config DO)
+plus the vault DO hop.
+
+The rewritten server (docs/server-rewrite/DECISIONS.md) authenticates devices in the vault DO: no config DO hop
+(D2). A commit also waits at least `minIntervalMs` (1000 ms) after the last one (H8). Deployed on the same Worker
+(2026-10-06, p50 median of three 31/31 smoke runs), in ms: ticket 91, socket connect 170, peer PROVISIONAL 61, own
+receipt 989, peer COMMIT_NOTICE 994, peer COMMITTED 374, ping 64, burst 1150, feed 97, read page 93, checkpoint put
+117. Smoke sends each append right after the last receipt, inside `minIntervalMs`. Its first receipt, from idle, takes
+372 ms.
 
 ---
 

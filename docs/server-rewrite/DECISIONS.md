@@ -376,7 +376,7 @@ Classes: **additive** (new; old clients unaffected), **relaxation** (the server 
 | § | Old → new | Class | Client action |
 |---|---|---|---|
 | 2.1 | Capabilities: keep `claimed`, `streams:1`, `attachments`, `maxBlobUploadBytes`, `serverVersion`. Drop `schemaVersion`, `protocolVersion`, `snapshots`, `recoveryJobs`, `settingsSync`, `semanticCanvas`, `bulkCreate`, `relayBodies`, `storageFormatVersion`, `snapshotFormatVersion`, `settingsFormatVersion`, `update*` | removal | none (pairing.ts reads only the kept five) |
-| 2.2 | Claim body/response unchanged; already claimed → `409 already_claimed` | none | none |
+| 2.2 | Claim body unchanged; the response drops `mobileSetupQrDataUrl` (G25, O12); already claimed → `409 already_claimed` | removal | none (the client never read it) |
 | 2.3 | + `GET …/devices`, `DELETE …/devices/:deviceId`, `POST …/reset-streams`, `POST …/restore`; `/provision` → 404; `DELETE /operator/vaults/:id` takes `{"confirmVaultId"}` (D5) | additive / removal | none |
 | 2.4 | Pairing code: "8–512 printable" → `^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{32}$` after trim; malformed → `400 invalid_code`; unknown → `404 invalid_code` (was `unknown_code`) | tightening | none: `enrollHttpError` maps both codes; strip any client-only key part |
 | 2.4 | Same `enrollmentRequestId` + deviceId + token hash → replay 200; same id, other body → `409 enrollment_request_conflict` (D3) | additive | none (pairing.ts already re-sends the identical body) |
@@ -659,8 +659,8 @@ P3a gap calls (accepted; marked `DECISIONS-GAP` in code):
   P5 shows `exceededCpu`. P5: none, but scratch-3's account is Workers Enterprise, so Free's 10 ms is not enforced
   there and cannot show up. Worker CPU p50 0.6 ms (the old server: 2.4 ms). Over 10 ms (GraphQL
   `workersInvocationsAdaptive`): claim 64 ms and owner-code 7–46 ms in the Worker, both rendering the setup QR
-  (moved to the console page, O12), and VaultDO 4 MiB stream reads 21–24 ms. Still open until a Free account is
-  measured.
+  (moved to the console page, O12; Worker max since: 6.1 ms), and VaultDO 4 MiB stream reads 21–24 ms. Still open
+  until a Free account is measured.
 - O9 → resolved: a daily-limit failure on any route, including one thrown by a DO RPC, is `503 cf_daily_limit`
   with Retry-After (router.ts:187-188; WB in tests/server/reset.ts). Revoke under the latch changes nothing and
   says so; the device keeps its read access until the reset (≤ 24 h). Kept: a gate shut in memory only would not
@@ -709,7 +709,13 @@ P5 findings:
   owner-code drop `mobileSetupQrDataUrl` (G25); the console was its only reader and the client never read it. WB:
   tests/server/console.ts matches the drawn modules to the library's for that URL. Headless Chrome on local
   `wrangler dev` (d51c3ae): the encoder runs under the CSP, and jsQR decodes both QRs (claim, owner-code) to the
-  exact URL; no page error or CSP violation.
+  exact URL; no page error or CSP violation. On scratch-3 (version 4de93251), the same check signs in and decodes 9
+  owner-code QRs to the exact URL. The one failed request is the 401 from `GET /operator/state` before sign-in,
+  which shows the sign-in form (console.ts:150). Worker CPU in the minute of those 9 owner-code calls and 10 other
+  console requests: max 2.6 ms, p50 1.6 ms (was 7–46 ms). Claim cannot run again on claimed scratch-3. Its Worker work
+  is now what login and owner-code do: RPCs, a cookie and a URL (router.ts:261-304). Suite on 4de93251:
+  `conformance-scratch3-o12-20261006T132806Z.json`, 48 pass, 0 fail, the same 2 SKIP; Worker CPU over the run max
+  6.1 ms, p50 0.5–0.9 ms per minute.
 - O13 A refused upgrade (relay-wire §3.1: accept, error frame, close, 101; vault/cloudflare.ts) logs as a VaultDO
   `scriptThrewException` "Network connection lost" on scratch-3. Clients get the frame and the close code (the
   refusal rows pass); the cost is noise in error analytics.
@@ -757,10 +763,10 @@ deployed → new: ticket 107 → 91; socket connect 317 → 170; peer PROVISIONA
 COMMIT_NOTICE 357 → 994; peer COMMITTED 395 → 374; ping 67 → 64; 12 × 8 KiB burst 467 → 1150; feed 249 → 97; read
 page 238 → 93; checkpoint put 266 → 117. The three slower rows are H8: smoke sends each append right after the last
 receipt, inside the 1 s `minIntervalMs`; its first sample, from idle, is 372 ms (old 405). relay-wire §15 (the text
-after the table) and :163 (`minIntervalMs: 0`) are updated at the merge. T-RESTORE-MANUAL failed first: PITR
-refused T, 11 s after the vault's init, and the runner retried forever with the vault's authority frozen; fixed in
-55cfd32 and f9ce3a1 (G37, G42, O15). Re-run on 55cfd32 (version 243e812e) with T and T2 each 75 s after the
-writes they must keep and the vault's first snapshot awaited: 42 pass, 0 fail
+after the table) and :163 (`minIntervalMs: 0`) are updated in the PR into client-remake, with :56 (O12).
+T-RESTORE-MANUAL failed first: PITR refused T, 11 s after the vault's init, and the runner retried forever with the
+vault's authority frozen; fixed in 55cfd32 and f9ce3a1 (G37, G42, O15). Re-run on 55cfd32 (version 243e812e) with T
+and T2 each 75 s after the writes they must keep and the vault's first snapshot awaited: 42 pass, 0 fail
 (`restore-manual-scratch3-20261006T125029Z.json`). Final suite at f9ce3a1 (version 249ab495):
 `conformance-scratch3-p5-final-20261006T125917Z.json`, 48 pass, 0 fail, the same 2 SKIP. P5 is done. CPU: O10,
 O12. Open: O13, O14, O16 (O12 resolved after P5).
