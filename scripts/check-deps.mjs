@@ -95,8 +95,7 @@ export function checkSource(file, text) {
 		if (spec.startsWith(".")) {
 			const r = resolveRel(file, spec);
 			if (r.outside) {
-				if (r.path.includes("legacy-src")) err(line, `imports legacy-src (copy what you port): ${spec}`);
-				else if (!test) err(line, `imports outside src/: ${spec}`);
+				if (!test) err(line, `imports outside src/: ${spec}`);
 				continue;
 			}
 			const target = r.path;

@@ -47,7 +47,7 @@ test("§k.2 rules", () => {
 	assert.equal(check("host/binding.ts", `import { SimVault } from "../sim/vault";`).errors.length, 1, "only tests import sim");
 	assert.equal(check("host/binding.test.ts", `import { SimVault } from "../sim/vault";`).errors.length, 0);
 	assert.equal(check("sim/run.ts", `import { createEngine } from "../engine/runtime/engine";`).errors.length, 0);
-	assert.equal(check("host/a.ts", `import { x } from "../../legacy-src/main";`).errors.length, 1);
+	assert.equal(check("host/a.ts", `import { x } from "../../server/src/version";`).errors.length, 1, "product code stays inside src/");
 	assert.equal(check("engine/a.ts", `import init from "ywasm";`).errors.length, 1);
 	assert.equal(check("engine/a.ts", `WebAssembly.instantiate(b)`).errors.length, 1);
 });

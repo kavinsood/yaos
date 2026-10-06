@@ -1,6 +1,6 @@
 /**
  * Bounded Myers O(ND) diff over integer token sequences (interned lines or
- * code points), ported from legacy-src/sync/lineMerge.ts and generalised.
+ * code points), ported from the old client's sync/lineMerge.ts and generalised.
  *
  * Every function here is exact: when a budget is exceeded the changed middle
  * becomes one coarse hunk (still a correct edit script, only less precise).
