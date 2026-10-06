@@ -356,6 +356,12 @@ export class SimVault implements VaultPort {
 		return f ? fromUtf8(f.bytes) : null;
 	}
 
+	/** Exact bytes (inspection: no call counting, no injected faults). */
+	bytesOf(path: string): Uint8Array | null {
+		const f = this.files.get(this.key(path));
+		return f ? f.bytes.slice() : null;
+	}
+
 	folderPaths(): string[] {
 		return [...this.folders.values()];
 	}

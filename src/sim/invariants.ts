@@ -21,6 +21,7 @@
  *                      disk queues empty, no frozen docs, no fatals; no vault events
  *                      in flight, no dirty views, open bound views equal their file,
  *                      bindMismatch = defaultReloadWhileBound = 0
+ *   settings           every device's synced config files are equal (JSON parsed)
  *   quiet              no echo loop: after quiescence nothing appends, writes, posts
  *                      or saves
  *
@@ -32,7 +33,7 @@ import { encodeNsFoldV1 } from "../core/codec/nsFoldV1";
 import { checkNsInvariants } from "../core/ns/verify";
 import { pathKey } from "../core/paths/pathKey";
 import { NS_STREAM, type VaultPath } from "../core/types";
-import { tokensIn, type TokenLedger } from "./actors";
+import { SETTING_FILES, tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
 import type { SimDevice } from "./device";
 import type { OracleDoc, SimNet } from "./net";
@@ -72,6 +73,11 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 			if (!m) out.push({ inv: "convergence", detail: `${f.path} on ${first.name}, missing on ${d.name}` });
 			else if (m.path.split("/").pop() !== f.path.split("/").pop()) out.push({ inv: "convergence", detail: `leaf display differs: ${f.path} vs ${m.path}` });
 			else if (m.text !== f.text) out.push({ inv: "convergence", detail: `${f.path} differs: ${first.name}=${brief(f.text)} ${d.name}=${brief(m.text)}` });
+			else if (!f.path.endsWith(".md")) {
+				const x = first.vault.bytesOf(f.path);
+				const y = d.vault.bytesOf(m.path);
+				if (!x || !y || hex(x) !== hex(y)) out.push({ inv: "convergence", detail: `${f.path} bytes differ: ${first.name}=${x ? hex(x) : "-"} ${d.name}=${y ? hex(y) : "-"}` });
+			}
 		}
 		for (const [k, m] of mine) if (!ref.has(k)) out.push({ inv: "convergence", detail: `${m.path} on ${d.name}, missing on ${first.name}` });
 	}
@@ -87,7 +93,7 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 		else if (f.path !== doc.path) out.push({ inv: "convergence", detail: `relay path ${doc.path} vs disk ${f.path}` });
 		else if (doc.text !== null && f.text !== doc.text) out.push({ inv: "convergence", detail: `relay ${doc.path}=${brief(doc.text)} disk=${brief(f.text)}` });
 	}
-	for (const [k, f] of byKey) if (f.path.endsWith(".md") && !docKeys.has(k)) out.push({ inv: "convergence", detail: `${f.path} never reached the relay` });
+	for (const [k, f] of byKey) if ((f.path.endsWith(".md") || f.path.endsWith(".png")) && !docKeys.has(k)) out.push({ inv: "convergence", detail: `${f.path} never reached the relay` });
 	const folds = new Map<string, string[]>();
 	for (const d of devs) {
 		const st = d.vrt?.log.c.ns.state;
@@ -104,6 +110,41 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 	}
 	if (folds.size > 1) out.push({ inv: "convergence", detail: `NsFoldState bytes differ: ${[...folds].map(([h, n]) => `${n.join("")}=${h}`).join(" ")}` });
 	return out;
+}
+
+/** Settings converge (LWW per key): every device's synced config files are equal (JSON compared parsed). */
+export function checkSettings(devs: readonly SimDevice[]): Violation[] {
+	const out: Violation[] = [];
+	// JSON settings files sync as per-key registers (§j.3): a file with no keys is the same state as no file.
+	const norm = (path: string, b: Uint8Array | undefined): string => {
+		if (!b) return path.endsWith(".json") ? "[]" : "-";
+		const text = new TextDecoder().decode(b);
+		if (!path.endsWith(".json")) return text;
+		try {
+			const o = JSON.parse(text) as Record<string, unknown>;
+			return JSON.stringify(Object.keys(o).sort().map((k) => [k, o[k]]));
+		} catch {
+			return `invalid:${text}`;
+		}
+	};
+	const first = devs[0];
+	if (!first) return out;
+	for (const path of SETTING_FILES) {
+		const ref = norm(path, first.configDir.files.get(path));
+		for (const d of devs.slice(1)) {
+			const mine = norm(path, d.configDir.files.get(path));
+			if (mine !== ref) out.push({ inv: "convergence", detail: `config ${path}: ${first.name}=${brief(ref)} ${d.name}=${brief(mine)}` });
+		}
+	}
+	return out;
+}
+
+/** Fingerprint of the synced config files (quiescence detection). */
+export function settingsPrint(d: SimDevice): string {
+	return SETTING_FILES.map((p) => {
+		const b = d.configDir.files.get(p);
+		return b ? hex(b) : "-";
+	}).join(",");
 }
 
 /** Tokens Obsidian itself destroyed (editor save over an unseen external/user write; vault.ts ClobberRecord). */

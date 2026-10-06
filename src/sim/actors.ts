@@ -97,14 +97,31 @@ export type UserAction =
 	| { readonly t: "diskInsert"; readonly dev: number; readonly file: number; readonly pos: number; readonly by: Writer }
 	| { readonly t: "diskDeleteToken"; readonly dev: number; readonly file: number; readonly pick: number; readonly by: Writer }
 	| { readonly t: "rename"; readonly dev: number; readonly file: number; readonly name: number }
-	| { readonly t: "delete"; readonly dev: number; readonly file: number };
+	| { readonly t: "delete"; readonly dev: number; readonly file: number }
+	// Attachments (blob docs over x: chunk streams) and settings (config dir).
+	| { readonly t: "attach"; readonly dev: number; readonly name: number; readonly size: number }
+	| { readonly t: "attachRename"; readonly dev: number; readonly file: number; readonly name: number }
+	| { readonly t: "attachDelete"; readonly dev: number; readonly file: number }
+	| { readonly t: "setting"; readonly dev: number; readonly file: number; readonly key: number; readonly del: boolean };
 
 export type OpWeights = Readonly<Record<UserAction["t"], number>>;
 
+const NO_EXTRAS = { attach: 0, attachRename: 0, attachDelete: 0, setting: 0 } as const;
 /** Edits only (no deletes/renames). */
-export const EDIT_OPS: OpWeights = { type: 30, paste: 2, deleteToken: 6, open: 8, close: 4, switch: 3, mode: 2, create: 6, diskInsert: 8, diskDeleteToken: 3, rename: 0, delete: 0 };
+export const EDIT_OPS: OpWeights = { type: 30, paste: 2, deleteToken: 6, open: 8, close: 4, switch: 3, mode: 2, create: 6, diskInsert: 8, diskDeleteToken: 3, rename: 0, delete: 0, ...NO_EXTRAS };
 /** The full mix (the default). */
 export const FULL_OPS: OpWeights = { ...EDIT_OPS, rename: 3, delete: 2 };
+/**
+ * Attachment and settings actions. The runner draws them from their own RNG
+ * stream between main steps, so the main plan of a seed does not depend on them.
+ */
+export const EXTRA_OPS: OpWeights = {
+	type: 0, paste: 0, deleteToken: 0, open: 0, close: 0, switch: 0, mode: 0, create: 0, diskInsert: 0, diskDeleteToken: 0, rename: 0, delete: 0,
+	attach: 6, attachRename: 1, attachDelete: 1, setting: 4,
+};
+
+/** Synced config files the setting actor edits (DESIGN §j.3 allowlist). */
+export const SETTING_FILES = ["app.json", "appearance.json", "snippets/s0.css", "snippets/s1.css"] as const;
 
 const NAME_POOL = 8;
 const MAX_VIEWS = 3;
@@ -137,7 +154,24 @@ export function generateUserAction(rng: SeededRandom, devices: number, weights: 
 		case "diskDeleteToken": return { t: "diskDeleteToken", dev, file: f(), pick: f(), by };
 		case "rename": return { t: "rename", dev, file: f(), name: rng.int(NAME_POOL) };
 		case "delete": return { t: "delete", dev, file: f() };
+		case "attach": return { t: "attach", dev, name: rng.int(4), size: rng.chance(0.1) ? rng.range(800_000, 1_700_000) : rng.range(16, 4_000) };
+		case "attachRename": return { t: "attachRename", dev, file: f(), name: rng.int(4) };
+		case "attachDelete": return { t: "attachDelete", dev, file: f() };
+		case "setting": return { t: "setting", dev, file: rng.int(SETTING_FILES.length), key: rng.int(4), del: rng.chance(0.2) };
 	}
+}
+
+/** Attachment bytes: the token in ASCII, then filler that is not valid UTF-8. */
+export function attachmentBytes(token: string, size: number, seed: number): Uint8Array {
+	const head = new TextEncoder().encode(`PNG ${token}\n`);
+	const out = new Uint8Array(Math.max(size, head.length));
+	out.set(head);
+	let x = seed >>> 0 || 1;
+	for (let i = head.length; i < out.length; i++) {
+		x = Math.imul(x ^ (x >>> 15), 0x2c1b3c6d) >>> 0;
+		out[i] = 0x80 | (x & 0x7f);
+	}
+	return out;
 }
 
 export interface ActorWorld {
@@ -152,6 +186,10 @@ function pickOf<T>(items: readonly T[], pick: number): T | undefined {
 
 export function markdownFiles(d: SimDevice): string[] {
 	return [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".md")).sort();
+}
+
+export function attachmentFiles(d: SimDevice): string[] {
+	return [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".png")).sort();
 }
 
 function boundViews(d: SimDevice): SimEditorView[] {
@@ -268,6 +306,54 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 			for (const text of seen) for (const t of tokensIn(text)) w.ledger.deleted(t);
 			d.vault.userDelete(path);
 			return `${tag} ${path}`;
+		}
+		case "attach": {
+			const path = `att/a${a.name}.png`;
+			const cur = d.vault.textOf(path);
+			// The user replaces the attachment they see.
+			if (cur !== null) for (const t of tokensIn(cur)) w.ledger.deleted(t);
+			w.ledger.add(token, d.name, step, "attach");
+			d.vault.externalWrite(path, attachmentBytes(token, a.size, step * 31 + a.dev));
+			return `${tag} ${path} ${cur === null ? "new" : "replace"} ${a.size}B ${token}`;
+		}
+		case "attachRename": {
+			const path = pickOf(attachmentFiles(d), a.file);
+			const to = `att/b${a.name}.png`;
+			if (!path || !d.vault.userRename(path, to)) return `skip ${tag}`;
+			return `${tag} ${path} -> ${to}`;
+		}
+		case "attachDelete": {
+			const path = pickOf(attachmentFiles(d), a.file);
+			const cur = path ? d.vault.textOf(path) : null;
+			if (!path || cur === null) return `skip ${tag}: no file`;
+			for (const t of tokensIn(cur)) w.ledger.deleted(t);
+			d.vault.userDelete(path);
+			return `${tag} ${path}`;
+		}
+		case "setting": {
+			// Settings are last-writer-wins per key: no token ledger, convergence only (invariants checkSettings).
+			const file = SETTING_FILES[a.file] ?? "app.json";
+			const cur = await d.configDir.readBytes(file);
+			let next: string;
+			if (file.endsWith(".json")) {
+				let obj: Record<string, unknown> = {};
+				try {
+					obj = cur ? (JSON.parse(new TextDecoder().decode(cur)) as Record<string, unknown>) : {};
+				} catch {
+					obj = {};
+				}
+				if (a.del) delete obj[`k${a.key}`];
+				else obj[`k${a.key}`] = token;
+				next = JSON.stringify(obj, null, 2);
+			} else {
+				if (a.del) {
+					await d.configDir.remove(file);
+					return `${tag} ${file} removed`;
+				}
+				next = `.k${a.key} { --t: "${token}"; }\n`;
+			}
+			await d.configDir.writeBytes(file, new TextEncoder().encode(next));
+			return `${tag} ${file} ${a.del ? `-k${a.key}` : `k${a.key}=${token}`}`;
 		}
 	}
 }

@@ -18,12 +18,13 @@
 
 import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
-import { generateUserAction, runUserAction, FULL_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
+import { generateUserAction, runUserAction, EXTRA_OPS, FULL_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights } from "./faults";
-import { activity, checkClean, checkConvergence, checkNothingDestroyed, checkQuiet, checkTokens, type Violation } from "./invariants";
+import { activity, checkClean, checkConvergence, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, settingsPrint, type Violation } from "./invariants";
 import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
-import { SimDevice } from "./device";
+import { SIM_SETTINGS, SimDevice } from "./device";
+import type { EngineSettings } from "../protocol/messages";
 import { SimNet } from "./net";
 import type { CaseProfile } from "./vault";
 
@@ -37,6 +38,8 @@ export interface SimConfig {
 	/** Fraction of steps that are faults (when faults are on). */
 	readonly faultRate?: number;
 	readonly ops?: OpWeights;
+	/** Chance per main step of an extra attachment/settings action (own RNG stream). 0 disables. Default 0.15. */
+	readonly extras?: number;
 	/** Default: chosen by the seed. */
 	readonly profile?: CaseProfile;
 	readonly initialFiles?: number;
@@ -77,6 +80,9 @@ export interface SimReport {
 
 const NAMES = ["A", "B", "C", "D", "E"];
 
+/** Attachments (log-carried, <= 8 MiB) and settings sync on. */
+export const RUN_SETTINGS: EngineSettings = { ...SIM_SETTINGS, syncAttachments: true, maxAttachmentBytes: 8 * 1024 * 1024, syncSettings: true };
+
 function full(cfg: SimConfig) {
 	return {
 		devices: Math.max(2, Math.min(5, cfg.devices ?? 2)),
@@ -84,6 +90,7 @@ function full(cfg: SimConfig) {
 		faults: cfg.faults === undefined ? null : cfg.faults,
 		faultRate: cfg.faultRate ?? 0.15,
 		ops: cfg.ops ?? FULL_OPS,
+		extras: cfg.extras ?? 0.15,
 		initialFiles: cfg.initialFiles ?? 3,
 		maxGapMs: cfg.maxGapMs ?? 1_500,
 		healHorizonMs: cfg.healHorizonMs ?? 600_000,
@@ -93,11 +100,14 @@ function full(cfg: SimConfig) {
 export function generatePlan(cfg: SimConfig): Step[] {
 	const c = full(cfg);
 	const rng = new SeededRandom(cfg.seed).fork("plan");
+	const xr = new SeededRandom(cfg.seed).fork("extra");
 	const plan: Step[] = [];
+	let extra = c.steps;
 	for (let i = 0; i < c.steps; i++) {
 		const gapMs = rng.range(0, c.maxGapMs);
 		if (c.faults && rng.chance(c.faultRate)) plan.push({ i, gapMs, fault: generateFault(rng, c.devices, c.faults) });
 		else plan.push({ i, gapMs, user: generateUserAction(rng, c.devices, c.ops) });
+		if (c.extras > 0 && xr.chance(c.extras)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(xr, c.devices, EXTRA_OPS) });
 	}
 	return plan;
 }
@@ -133,6 +143,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			const watch = dr.fork("watch");
 			return new SimDevice({
 				name, clock, net, profile,
+				settings: () => RUN_SETTINGS,
 				mobile: dr.chance(0.3),
 				log: cfg.log ? (line) => cfg.log!(name, `${clock.monotonic()} ${line}`) : undefined,
 				watcherDelayMs: c.faults ? () => watch.range(0, 400) : undefined,
@@ -177,12 +188,20 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const t0 = clock.monotonic();
 		let stable = 0;
 		let last = "";
+		let kicked = false;
+		const print = () => `${activity(devs, net)}|${devs.map((d) => `${[...d.vault.snapshot()].join(";")}#${settingsPrint(d)}`).join("|")}`;
 		for (let t = 0; t < c.healHorizonMs && stable < 5; t += 1_000) {
 			await clock.advance(1_000);
 			const idle = net.quiet() && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty()));
-			const fp = `${activity(devs, net)}|${devs.map((d) => [...d.vault.snapshot()].join(";")).join("|")}`;
+			const fp = print();
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
+			if (stable >= 5 && !kicked) {
+				// Settings edits are detected by full passes (the 5-15 min periodic timer): run one everywhere now.
+				kicked = true;
+				stable = 0;
+				for (const d of devs) d.vrt?.sched.request({ t: "full" }, true);
+			}
 		}
 		const quiesceMs = clock.monotonic() - t0;
 
@@ -199,13 +218,12 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				if (d.vault.pendingEvents() > 0) why.push(`${d.name} vault events`);
 				if (d.workspace.views_().some((v) => v.isDirty())) why.push(`${d.name} dirty view`);
 			});
-			const fp = `${activity(devs, net)}|${devs.map((d) => [...d.vault.snapshot()].join(";")).join("|")}`;
-			if (fp !== last) why.push(`activity ${activity(devs, net)}`);
+			if (print() !== last) why.push(`activity ${activity(devs, net)}`);
 			violations.push({ inv: "clean", detail: `no quiescence within ${c.healHorizonMs}ms: ${why.join(", ") || "flapping"}` });
 		}
 		if (!(await faults.settle())) violations.push({ inv: "clean", detail: "crash inspections did not finish" });
 		const oracle = await net.oracle();
-		violations.push(...checkConvergence(devs, oracle), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)));
+		violations.push(...checkConvergence(devs, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)));
 		violations.push(...(await checkQuiet(clock, devs, net)));
 
 		const snap = [...(devs[0]?.vault.snapshot() ?? new Map<string, string>())].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
