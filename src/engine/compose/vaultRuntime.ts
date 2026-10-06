@@ -217,6 +217,7 @@ export class VaultRuntime {
 			side: link.sideFiles, hash: ports.hash, clock: ports.clock, identity: () => identity,
 			entries: () => this.rec.ctx.store.synced.values(), nsCoversSeq: () => c.ns.coversSeq,
 			onError: (e) => this.diag(`synced mirror write failed: ${String(e)}`),
+			before: () => c.mirror.flushed(),
 		});
 		this.offs.push(c.repo.db.onLost((failure) => {
 			if (this.stopped) return;

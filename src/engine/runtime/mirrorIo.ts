@@ -97,6 +97,12 @@ export class MirrorWriter {
 		this.timer = null;
 	}
 
+	/** Flush; true when the mirror now holds the outbox (or there is no mirror). */
+	async flushed(): Promise<boolean> {
+		await this.flush();
+		return !this.dirty;
+	}
+
 	/** Write now if dirty (single writer; loops while new changes arrive). */
 	flush(): Promise<void> {
 		if (!this.files) return Promise.resolve();
@@ -126,6 +132,7 @@ export class MirrorWriter {
 				this.stats.lastBytes = bytes.length;
 			} catch (e) {
 				this.stats.failures++;
+				this.dirty = true; // still behind: the next change or flush retries
 				this.c.diag("mirror-write-failed", { error: String(e) });
 				return;
 			}

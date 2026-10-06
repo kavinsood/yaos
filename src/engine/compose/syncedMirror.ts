@@ -83,6 +83,13 @@ export interface SyncedMirrorDeps {
 	readonly nsCoversSeq: () => Seq;
 	readonly debounceMs?: number;
 	readonly onError?: (e: unknown) => void;
+	/**
+	 * Bring the outbox mirror up to the outbox; false when that failed. Runs
+	 * after the entries are taken and before they are written: a sync point
+	 * may rest on own frames still unacked, and a synced mirror ahead of the
+	 * outbox mirror makes recovery take the disk as base without those frames.
+	 */
+	readonly before?: () => Promise<boolean>;
 }
 
 export class SyncedMirrorWriter {
@@ -145,6 +152,7 @@ export class SyncedMirrorWriter {
 		this.gens ??= await this.loadGens();
 		const { slot, generation } = nextMirrorSlot(this.gens);
 		const entries = [...this.deps.entries()].map(toMirrorEntry).sort((a, b) => (a.docId < b.docId ? -1 : a.docId > b.docId ? 1 : 0));
+		if (this.deps.before && !(await this.deps.before())) throw new Error("outbox mirror not written");
 		const bytes = await encodeSyncedMirror({
 			...this.deps.identity(), generation, writtenAtMs: this.deps.clock.now(), nsCoversSeq: this.deps.nsCoversSeq(), entries,
 		}, this.deps.hash);
