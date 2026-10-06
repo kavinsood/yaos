@@ -11,6 +11,12 @@
  *                         collapses an identical loser); blob: blobRev
  *   rename applied     -> nsTouchSeq = seq; suffixed -> S.path = requested path
  *   restore revived    -> path = requested path, nsTouchSeq = seq
+ *   S has moved on (the requested path is not written) when a later own
+ *   rename/restore of the doc is in this batch or still pending (S follows that
+ *   move), or when a suffixed rename's S already sits at the final path: a pass
+ *   that ran between the fold and this S1 batch projected the committed entry
+ *   (materialized or moved the file there). Writing the requested path back
+ *   would point S at a path the file left, possibly another doc's file.
  *   setBlob applied    -> contentHash = op.hash, blobRev = seq, stat +
  *                         fingerprint from L when L holds that hash
  *   anything else      -> no change (the next plan re-derives)
@@ -21,7 +27,7 @@
  * setBlob (own hash + remote rev would read as "in sync" and hide the change).
  */
 
-import type { SyncedEntry } from "../../core/types";
+import type { SyncedEntry, VaultPath } from "../../core/types";
 import type { SyncedRecord } from "../store/schema";
 import type { Ctx } from "./context";
 import type { OwnFoldEvent } from "./deps";
@@ -29,7 +35,14 @@ import type { OwnFoldEvent } from "./deps";
 export async function applyOwnFold(ctx: Ctx, events: readonly OwnFoldEvent[]): Promise<void> {
 	const next = new Map<string, SyncedEntry>();
 	const get = (docId: string): SyncedEntry | undefined => next.get(docId) ?? ctx.synced(docId as SyncedEntry["docId"]);
-	for (const ev of events) {
+	const view = ctx.log.view();
+	const movedOn = (i: number, docId: SyncedEntry["docId"], requested: VaultPath, final: VaultPath, s: SyncedEntry): boolean => {
+		if (s.pathKey === ctx.pk(final) && s.pathKey !== ctx.pk(requested)) return true;
+		if (events.slice(i + 1).some((e) => (e.op.t === "rename" || e.op.t === "restore") && e.op.docId === docId)) return true;
+		const r = view.remote.get(docId);
+		return r !== undefined && r.pendingLocal && r.pathKey === s.pathKey && s.pathKey !== ctx.pk(requested);
+	};
+	for (const [i, ev] of events.entries()) {
 		const { op, seq, outcome } = ev;
 		if (op.t === "upgradeRules") continue;
 		const s = get(op.docId);
@@ -53,11 +66,11 @@ export async function applyOwnFold(ctx: Ctx, events: readonly OwnFoldEvent[]): P
 			case "rename":
 				if (!s) break;
 				if (outcome.kind === "applied") next.set(op.docId, { ...s, nsTouchSeq: seq });
-				else if (outcome.kind === "suffixed") next.set(op.docId, { ...s, path: outcome.requestedPath, pathKey: ctx.pk(outcome.requestedPath) });
+				else if (outcome.kind === "suffixed" && !movedOn(i, op.docId, outcome.requestedPath, outcome.finalPath, s)) next.set(op.docId, { ...s, path: outcome.requestedPath, pathKey: ctx.pk(outcome.requestedPath) });
 				break;
 			case "restore":
 				if (!s || outcome.kind !== "revived") break;
-				next.set(op.docId, { ...s, path: op.path, pathKey: ctx.pk(op.path), nsTouchSeq: seq });
+				next.set(op.docId, movedOn(i, op.docId, op.path, op.path, s) ? { ...s, nsTouchSeq: seq } : { ...s, path: op.path, pathKey: ctx.pk(op.path), nsTouchSeq: seq });
 				break;
 			case "setBlob": {
 				if (!s || outcome.kind !== "applied") break;

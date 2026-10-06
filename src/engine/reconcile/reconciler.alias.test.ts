@@ -87,3 +87,52 @@ test("merged alias rebind reports the move, so an editor bound to the loser re-o
 	assert.equal(w.synced(win)?.path, "n.md");
 	assert.deepEqual(w.rebinds, [[loser, win]]);
 });
+
+test("own rename suffixed, then a later own rename of the same doc applied in one fold: S stays at the later path", async () => {
+	const w = new World();
+	await w.boot();
+	const d = w.log.remoteCreate(P("a.md"), "a\n");
+	const x = w.log.remoteCreate(P("x.md"), "x\n");
+	await w.sync();
+	w.log.holdNs = true;
+	w.vault.userRename("a.md", "r7.md");
+	await w.sync();
+	w.vault.userRename("r7.md", "r2.md");
+	await w.sync();
+	// Another device takes r7.md before our renames fold; our disk follows it (r7.md is free here).
+	w.log.remoteRename(x, P("r7.md"));
+	await w.sync();
+	assert.equal(w.vault.text("r7.md"), "x\n");
+	const folded = await w.log.flushNs();
+	assert.deepEqual(folded.map((e) => e.outcome.kind), ["suffixed", "applied"]);
+	const res = await w.sync();
+	assert.equal(w.synced(d)?.path, "r2.md", "the suffixed rename's requested path is not where the file is");
+	assert.equal(w.synced(x)?.path, "r7.md");
+	assert.deepEqual(w.vault.snapshot(), { "r2.md": "a\n", "r7.md": "x\n" });
+	assert.ok(res.quiet, "no retried disk rename");
+});
+
+test("own rename suffixed, S1 lands after a pass already moved the file to the final path: S is not pointed back", async () => {
+	const w = new World();
+	await w.boot();
+	const d = w.log.remoteCreate(P("a.md"), "a\n");
+	const x = w.log.remoteCreate(P("x.md"), "x\n");
+	await w.sync();
+	w.log.holdNs = true;
+	w.vault.userRename("a.md", "r0.md");
+	await w.sync();
+	w.log.remoteRename(x, P("r0.md"));
+	// The fold commits before its S1 batch runs (the runtime queues own events for the next pass).
+	const s1 = w.log.onOwnFold;
+	w.log.onOwnFold = null;
+	const folded = await w.log.flushNs();
+	assert.deepEqual(folded.map((e) => e.outcome.kind), ["suffixed"]);
+	await w.sync();
+	assert.equal(w.synced(d)?.path, "r0 (2).md");
+	await s1?.(folded);
+	const res = await w.sync();
+	assert.equal(w.synced(d)?.path, "r0 (2).md", "S stays where the file is");
+	assert.equal(w.synced(x)?.path, "r0.md");
+	assert.deepEqual(w.vault.snapshot(), { "r0 (2).md": "a\n", "r0.md": "x\n" });
+	assert.ok(res.quiet, "no retried disk rename");
+});
