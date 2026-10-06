@@ -111,21 +111,19 @@ s.test("D9 PUT cap: 10 MiB accepted; a larger declared or streamed body is 413; 
 	});
 });
 
-s.test("D9 exists: the first 50 entries, well-formed only, in order; legacy errors; a 64 KiB body cap", async () => {
+s.test("D9 exists: the first 50 entries, in order; legacy errors; a 64 KiB body cap", async () => {
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
 		const addresses = Array.from({ length: 60 }, (_, index) => index.toString(16).padStart(64, "0"));
 		for (const address of addresses) world.bucket.objects.set(blobKey(vaultId, address), new Uint8Array([1]));
 		world.bucket.objects.set(blobKey("another-vault-id-000", ADDRESS), new Uint8Array([1]));
-		world.bucket.objects.set(blobKey(vaultId, "e".repeat(64)), new Uint8Array([1]));
 
-		const mixed = [addresses[3], "not-an-address", ADDRESS, 7, "E".repeat(64), addresses[0],
-			...addresses.slice(10, 54), ...addresses.slice(54)];
-		const response = await exists(world, vaultId, device, JSON.stringify({ hashes: mixed }));
+		const listed = [addresses[3], ADDRESS, addresses[0], ...addresses.slice(10, 54), ...addresses.slice(54)];
+		const response = await exists(world, vaultId, device, JSON.stringify({ hashes: listed }));
 		assert.equal(response.status, 200);
 		const { present } = await json(response) as { present: string[] };
-		assert.deepEqual(present, [addresses[3], addresses[0], ...addresses.slice(10, 54)],
-			"only the first 50 entries; malformed and foreign-vault addresses are absent");
+		assert.deepEqual(present, [addresses[3], addresses[0], ...addresses.slice(10, 57)],
+			"only the first 50 entries; a foreign-vault address is absent");
 		assert.ok(!present.includes(ADDRESS), "another vault's blob is not visible");
 
 		world.bucket.calls.length = 0;
@@ -140,6 +138,27 @@ s.test("D9 exists: the first 50 entries, well-formed only, in order; legacy erro
 		}
 		const huge = await exists(world, vaultId, device, JSON.stringify({ hashes: ["x".repeat(MAX_BLOB_EXISTS_BODY_BYTES)] }));
 		assert.deepEqual([huge.status, await json(huge)], [413, { error: "body_too_large" }]);
+	});
+});
+
+s.test("A4 exists: any malformed entry, even past the first 50, is 400 invalid_address with no R2 HEAD", async () => {
+	await withWorld(async (world) => {
+		const { vaultId, device } = await enrolled(world);
+		world.bucket.objects.set(blobKey(vaultId, ADDRESS), new Uint8Array([1]));
+		const valid = Array.from({ length: 50 }, (_, index) => index.toString(16).padStart(64, "0"));
+		for (const bad of ["not-an-address", "E".repeat(64), "e".repeat(63), "e".repeat(65), "", 7, null,
+			{ address: ADDRESS }, [ADDRESS]]) {
+			for (const hashes of [[ADDRESS, bad], [bad], [...valid, bad]]) {
+				world.bucket.calls.length = 0;
+				const refused = await exists(world, vaultId, device, JSON.stringify({ hashes }));
+				assert.deepEqual([refused.status, await json(refused)], [400, { error: "invalid_address" }],
+					`${JSON.stringify(bad)} at ${hashes.length - 1}`);
+				assert.deepEqual(world.bucket.calls, [], "a refused probe makes no R2 call");
+			}
+		}
+		assert.deepEqual(await json(await exists(world, vaultId, device, JSON.stringify({ hashes: [] }))), { present: [] });
+		assert.deepEqual(await json(await exists(world, vaultId, device, JSON.stringify({ hashes: [ADDRESS, "e".repeat(64)] }))),
+			{ present: [ADDRESS] }, "a well-formed absent address is still just absent");
 	});
 });
 

@@ -621,9 +621,10 @@ function blobPrefix(vaultId: string): string {
 }
 
 /**
- * `POST /vault/:id/blobs/exists {"hashes": [...]}` → `{present: [...]}` (relay-wire §11.3): the first 50 entries, the
- * well-formed addresses among them, HEADed 4 at a time. The legacy errors stay: `400 "invalid json"` and `400 "missing
- * hashes array"`.
+ * `POST /vault/:id/blobs/exists {"hashes": [...]}` → `{present: [...]}` (relay-wire §11.3): the first 50 entries,
+ * HEADed 4 at a time. Every entry must be an address: one that is not (wrong type, wrong format) is `400
+ * invalid_address`, not a silent "absent", so a client addressing bug cannot turn into re-uploads forever (E2EE design
+ * §19 A4). The legacy errors stay: `400 "invalid json"` and `400 "missing hashes array"`.
  */
 async function blobExists(request: Request, bucket: R2Bucket, vaultId: string): Promise<Response> {
 	let bytes: Uint8Array;
@@ -642,8 +643,10 @@ async function blobExists(request: Request, bucket: R2Bucket, vaultId: string): 
 	}
 	const hashes = body && typeof body === "object" ? (body as { hashes?: unknown }).hashes : undefined;
 	if (!Array.isArray(hashes)) return json({ error: "missing hashes array" }, 400);
-	const addresses = hashes.slice(0, MAX_BLOB_EXISTS_ADDRESSES)
-		.filter((hash): hash is string => typeof hash === "string" && BLOB_ADDRESS_PATTERN.test(hash));
+	if (!hashes.every((hash): hash is string => typeof hash === "string" && BLOB_ADDRESS_PATTERN.test(hash))) {
+		return json({ error: "invalid_address" }, 400);
+	}
+	const addresses = hashes.slice(0, MAX_BLOB_EXISTS_ADDRESSES);
 	const present = addresses.map(() => false);
 	let next = 0;
 	const worker = async () => {
