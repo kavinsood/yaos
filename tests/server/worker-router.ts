@@ -391,7 +391,7 @@ s.test("blobs: no bucket → 503; address regex; 10 MiB PUT cap: all before any 
 		const address = "a".repeat(64);
 		world.resetCalls();
 		for (const [method, path] of [["GET", `blobs/${address}`], ["PUT", `blobs/${address}`], ["POST", "blobs/exists"],
-			["GET", "blobs"], ["DELETE", `blobs/${address}?ifUploadedBefore=1`]] as const) {
+			["GET", "blobs"], ["POST", "blobs/delete"]] as const) {
 			const response = await world.fetch(`${v}/${path}`,
 				{ method, headers: bearer(world.owner), ...(method === "GET" ? {} : { body: "x" }) });
 			assert.equal(response.status, 503, `${method} ${path}`);
@@ -412,18 +412,21 @@ s.test("blobs: no bucket → 503; address regex; 10 MiB PUT cap: all before any 
 		assert.equal(tooLarge.status, 413);
 		assert.deepEqual(await body(tooLarge), { error: "body_too_large" });
 		await assertNotFound(world, "GET", `${v}/blobs/${"c".repeat(64)}/x`);
-		await assertNotFound(world, "DELETE", `${v}/blobs/${"c".repeat(64)}/x?ifUploadedBefore=1`);
+		await assertNotFound(world, "DELETE", `${v}/blobs/${"c".repeat(64)}`);
+		await assertNotFound(world, "DELETE", `${v}/blobs/${"c".repeat(64)}?ifUploadedBefore=1`);
 		await assertNotFound(world, "DELETE", `${v}/blobs`);
+		await assertNotFound(world, "GET", `${v}/blobs/delete/x`);
+		await assertNotFound(world, "PUT", `${v}/blobs/delete/x`);
 		await assertNotFound(world, "POST", `${v}/blobs`);
 		await assertNotFound(world, "PATCH", `${v}/blobs/${"c".repeat(64)}`);
 		assert.equal(world.doCalls(), 0);
 		const address = "c".repeat(64);
 		for (const [method, path, check] of [["GET", `blobs/${address}`, "auth"], ["PUT", `blobs/${address}`, "auth"],
-			["POST", "blobs/exists", "auth"], ["GET", "blobs", "gc-auth"],
-			["DELETE", `blobs/${address}?ifUploadedBefore=1`, "gc-auth"]] as const) {
+			["POST", "blobs/exists", "auth"], ["GET", "blobs", "gc-auth"], ["POST", "blobs/delete", "gc-auth"]] as const) {
 			world.resetCalls();
-			const response = await world.fetch(`${v}/${path}`,
-				{ method, ...(method === "GET" || method === "DELETE" ? {} : { body: "x" }) });
+			// The batch delete checks its JSON body before the bearer, so it needs a valid one to reach the check.
+			const payload = path === "blobs/delete" ? JSON.stringify({ ifUploadedBefore: 1, addresses: [address] }) : "x";
+			const response = await world.fetch(`${v}/${path}`, { method, ...(method === "GET" ? {} : { body: payload }) });
 			assert.deepEqual([response.status, await body(response)], [401, { error: "unauthorized" }], `${method} ${path}`);
 			assert.deepEqual(world.cluster.fetches.map((call) => [call.method, call.url]),
 				[["POST", `https://vault.internal/blobs/${check}`]], `${method} ${path}: one bearer check`);

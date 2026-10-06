@@ -397,9 +397,10 @@ export function bearer(device: DeviceSeed): Record<string, string> {
 
 /**
  * An in-memory R2 bucket with the calls the Worker makes: blob put/get/head (D9), the D5 purge's list/delete and the
- * blob GC's list/head/delete (relay-wire §11.3). `calls` records each call in order (a put says whether its value was
+ * blob GC's list/head/delete (relay-wire §11.3.1). `calls` records each call in order (a put says whether its value was
  * a stream); `stuck` keeps every listing truncated. A put stamps the object with `now` (ms; R2's `uploaded`, which an
- * overwrite refreshes); an object set straight into `objects` reads as uploaded at 0.
+ * overwrite refreshes); an object set straight into `objects` reads as uploaded at 0. `head` resolves a microtask
+ * later and counts the HEADs in flight (`maxHeadsInFlight`); `afterHead` runs after each HEAD has read the object.
  */
 export class FakeBucket {
 	readonly objects = new Map<string, Uint8Array>();
@@ -408,6 +409,9 @@ export class FakeBucket {
 	stuck = false;
 	lists = 0;
 	now = 1_000_000;
+	maxHeadsInFlight = 0;
+	afterHead: ((key: string) => void) | null = null;
+	private headsInFlight = 0;
 	async put(key: string, value: ReadableStream | ArrayBuffer | ArrayBufferView | string): Promise<{ key: string }> {
 		this.calls.push(`put ${key} ${value instanceof ReadableStream ? "stream" : "bytes"}`);
 		const bytes = new Uint8Array(await new Response(value as BodyInit).arrayBuffer());
@@ -420,9 +424,15 @@ export class FakeBucket {
 		const bytes = this.objects.get(key);
 		return Promise.resolve(bytes ? { key, body: new Blob([bytes.slice()]).stream() } : null);
 	}
-	head(key: string): Promise<{ key: string; uploaded: Date } | null> {
+	async head(key: string): Promise<{ key: string; uploaded: Date } | null> {
 		this.calls.push(`head ${key}`);
-		return Promise.resolve(this.objects.has(key) ? this.described(key) : null);
+		this.headsInFlight++;
+		this.maxHeadsInFlight = Math.max(this.maxHeadsInFlight, this.headsInFlight);
+		const found = this.objects.has(key) ? this.described(key) : null;
+		await Promise.resolve();
+		this.headsInFlight--;
+		this.afterHead?.(key);
+		return found;
 	}
 	/** R2 `list`: keys in order, `prefix`, `limit` (≤ 1000) and `startAfter` (exclusive), as miniflare does. */
 	list(options: { prefix?: string; limit?: number; startAfter?: string }) {

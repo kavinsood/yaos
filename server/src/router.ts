@@ -57,10 +57,24 @@ export const BLOB_HEAD_CONCURRENCY = 4;
  */
 export const MAX_BLOB_EXISTS_BODY_BYTES = 64 * 1024;
 /**
- * Blob GC list (relay-wire §11.3): at most 1000 items a page, R2's own `list` maximum, so one page is one R2 list call
- * (Class A) and about 90 KiB of JSON.
+ * Blob GC list (relay-wire §11.3.1): at most 1000 items a page, R2's own `list` maximum, so one page is one R2 list
+ * call (Class A) and about 90 KiB of JSON.
  */
 export const BLOB_LIST_PAGE_SIZE = 1000;
+/**
+ * Blob GC delete (relay-wire §11.3.1): 1..100 addresses a call. Subrequest budget per invocation on Workers Free: 50
+ * external and 1000 to Cloudflare services (https://developers.cloudflare.com/workers/platform/limits/#subrequests;
+ * https://developers.cloudflare.com/changelog/post/2026-02-11-subrequests-limit/). R2 binding calls go to a Cloudflare
+ * service, so a full call is 100 HEADs + 1 delete + the vault-DO auth call = 102, within 1000, and nothing external.
+ */
+export const MAX_BLOB_DELETE_ADDRESSES = 100;
+/**
+ * R2 HEADs in flight for one GC delete: "up to six connections simultaneously waiting for response headers" per
+ * invocation, R2 `head` included (https://developers.cloudflare.com/workers/platform/limits/#simultaneous-open-connections).
+ */
+export const BLOB_GC_HEAD_CONCURRENCY = 6;
+/** The GC delete body: 100 addresses are about 6.6 KiB of JSON. A larger body is `413 body_too_large`. */
+export const MAX_BLOB_DELETE_BODY_BYTES = 16 * 1024;
 /**
  * DECISIONS-GAP: §2.2 does not give a format for the `:deviceId` path segment of the operator devices route. The
  * enroll body's deviceId format (legacy routes/enroll.ts:36) is used; anything else is 404.
@@ -136,13 +150,16 @@ function crossSiteRejection(request: Request, url: URL, needsJson: boolean): Res
 	return null;
 }
 
-type OperatorBody = { kind: "ok"; value: Record<string, unknown> } | { kind: "invalid" } | { kind: "too_large" };
+type JsonObjectBody = { kind: "ok"; value: Record<string, unknown> } | { kind: "invalid" } | { kind: "too_large" };
 
-/** An operator JSON body (≤ 64 KiB): an object, `invalid` (not JSON or not an object), or `too_large` (413). */
-async function readOperatorBody(request: Request): Promise<OperatorBody> {
+/**
+ * A JSON object body of at most `maxBytes` (operator routes: 64 KiB): the object, `invalid` (not JSON or not an
+ * object), or `too_large` (413).
+ */
+async function readJsonObject(request: Request, maxBytes = MAX_OPERATOR_BODY_BYTES): Promise<JsonObjectBody> {
 	let bytes: Uint8Array;
 	try {
-		bytes = await readBoundedBytes(request, MAX_OPERATOR_BODY_BYTES, { allowEmpty: true });
+		bytes = await readBoundedBytes(request, maxBytes, { allowEmpty: true });
 	} catch (error) {
 		if (!(error instanceof BoundedBodyError)) throw error;
 		return error.kind === "body_too_large" ? { kind: "too_large" } : { kind: "invalid" };
@@ -269,7 +286,7 @@ export class Router {
 	private async claim(request: Request, env: WorkerEnv, url: URL): Promise<Response> {
 		const rejected = crossSiteRejection(request, url, true);
 		if (rejected) return rejected;
-		const body = await readOperatorBody(request);
+		const body = await readJsonObject(request);
 		if (body.kind === "too_large") return bodyTooLarge();
 		if (body.kind === "invalid") return json({ error: "invalid json" }, 400);
 		const key = recoveryKey(body.value);
@@ -315,7 +332,7 @@ export class Router {
 	private async login(request: Request, env: WorkerEnv, url: URL): Promise<Response> {
 		const rejected = crossSiteRejection(request, url, true);
 		if (rejected) return rejected;
-		const body = await readOperatorBody(request);
+		const body = await readJsonObject(request);
 		if (body.kind === "too_large") return bodyTooLarge();
 		if (body.kind === "invalid") return json({ error: "invalid json" }, 400);
 		const key = recoveryKey(body.value);
@@ -354,7 +371,7 @@ export class Router {
 		const config = this.config(env);
 		const allowed = await config.authorize(token);
 		if (!allowed.ok) return json({ error: allowed.error }, allowed.status);
-		const body = await readOperatorBody(request);
+		const body = await readJsonObject(request);
 		if (body.kind === "too_large") return bodyTooLarge();
 		// Legacy: a body that is not JSON is `{}`, and a blank name is "Vault".
 		const raw = body.kind === "ok" && typeof body.value.name === "string" ? body.value.name.trim() : "";
@@ -417,7 +434,7 @@ export class Router {
 	 * and reaches `fetch`'s catch as `503 cf_daily_limit` (O9).
 	 */
 	private async resetStreams(request: Request, vault: DurableObjectStub<VaultDO>, vaultId: string): Promise<Response> {
-		const body = await readOperatorBody(request);
+		const body = await readJsonObject(request);
 		if (body.kind === "too_large") return bodyTooLarge();
 		if (body.kind !== "ok" || body.value.confirmVaultId !== vaultId) return json({ error: "confirmation_mismatch" }, 400);
 		const reset = await vault.resetStreams();
@@ -432,7 +449,7 @@ export class Router {
 	 * not a JSON object counts as `{}` (no `at`: `400 invalid_restore_point`), the create-vault rule.
 	 */
 	private async restore(request: Request, config: DurableObjectStub<ConfigDO>, vaultId: string): Promise<Response> {
-		const body = await readOperatorBody(request);
+		const body = await readJsonObject(request);
 		if (body.kind === "too_large") return bodyTooLarge();
 		const result = await config.restore(vaultId, body.kind === "ok" ? body.value.at : undefined);
 		if (!result.ok) return json({ error: result.error }, result.status);
@@ -444,7 +461,7 @@ export class Router {
 	 * → owner-bootstrap; any D3 purpose; anything else `400 invalid_purpose` (the bearer route's rule).
 	 */
 	private async ownerCode(request: Request, url: URL, vault: DurableObjectStub<VaultDO>): Promise<Response> {
-		const body = await readOperatorBody(request);
+		const body = await readJsonObject(request);
 		if (body.kind === "too_large") return bodyTooLarge();
 		const requested = body.kind === "ok" ? body.value.purpose : undefined;
 		if (requested !== undefined && !isPairingPurpose(requested)) return json({ error: "invalid_purpose" }, 400);
@@ -470,7 +487,7 @@ export class Router {
 	 */
 	private async deleteVault(request: Request, env: WorkerEnv, config: DurableObjectStub<ConfigDO>,
 		vault: DurableObjectStub<VaultDO>, vaultId: string): Promise<Response> {
-		const body = await readOperatorBody(request);
+		const body = await readJsonObject(request);
 		if (body.kind === "too_large") return bodyTooLarge();
 		if (body.kind !== "ok" || body.value.confirmVaultId !== vaultId) return json({ error: "confirmation_mismatch" }, 400);
 		await config.beginDeleteVault(vaultId);
@@ -548,13 +565,12 @@ export class Router {
 			case "POST blobs/exists":
 				return withCors(await this.blob(request, env, vaultId, null));
 			case "GET blobs":
-				return withCors(await this.blobGc(request, env, url, vaultId, null));
+				return withCors(await this.blobGcList(request, env, url, vaultId));
+			case "POST blobs/delete":
+				return withCors(await this.blobGcDelete(request, env, vaultId));
 		}
 		if (rest.length === 2 && rest[0] === "blobs" && (request.method === "GET" || request.method === "PUT")) {
 			return withCors(await this.blob(request, env, vaultId, rest[1]!));
-		}
-		if (rest.length === 2 && rest[0] === "blobs" && request.method === "DELETE") {
-			return withCors(await this.blobGc(request, env, url, vaultId, rest[1]!));
 		}
 		return withCors(notFound());
 	}
@@ -614,37 +630,60 @@ export class Router {
 	}
 
 	/**
-	 * Blob GC routes (relay-wire §11.3, E2EE design §19 A3), a cold path for the client's mark-and-sweep:
-	 * `GET /vault/:id/blobs?cursor=` lists a page and `DELETE /vault/:id/blobs/:address?ifUploadedBefore=<ms>` deletes
-	 * an object only if R2 says it was uploaded strictly before the cutoff. Checks in order: bucket (503), the query and
-	 * address formats (400), both before any DO call; then the vault DO's `POST /blobs/gc-auth` (bearer, then the GC
-	 * request limit: 401, 503 while restoring, 429); then R2. No config call, no DO storage write.
+	 * `GET /vault/:id/blobs?cursor=` (relay-wire §11.3.1, E2EE design §19 A3): one page of the vault's blobs for the
+	 * client's mark-and-sweep. Checks in order: bucket (503) and cursor format (400), both before any DO call; then the
+	 * GC auth (`blobGcAuth`); then R2.
 	 */
-	private async blobGc(
-		request: Request, env: WorkerEnv, url: URL, vaultId: string, address: string | null,
-	): Promise<Response> {
+	private async blobGcList(request: Request, env: WorkerEnv, url: URL, vaultId: string): Promise<Response> {
 		const bucket = env.YAOS_BUCKET;
 		if (!bucket) return json({ error: "attachments_unavailable" }, 503);
-		let cursor: string | null = null;
-		let cutoff = 0;
-		if (address === null) {
-			const raw = url.searchParams.get("cursor") ?? "";
-			if (raw !== "" && !BLOB_ADDRESS_PATTERN.test(raw)) return json({ error: "invalid_cursor" }, 400);
-			cursor = raw === "" ? null : raw;
-		} else {
-			if (!BLOB_ADDRESS_PATTERN.test(address)) return json({ error: "invalid_address" }, 400);
-			const parsed = uploadCutoff(url.searchParams.get("ifUploadedBefore"));
-			if (parsed === null) return json({ error: "invalid_if_uploaded_before" }, 400);
-			cutoff = parsed;
+		const raw = url.searchParams.get("cursor") ?? "";
+		if (raw !== "" && !BLOB_ADDRESS_PATTERN.test(raw)) return json({ error: "invalid_cursor" }, 400);
+		const refused = await this.blobGcAuth(request, env, vaultId);
+		if (refused) return refused;
+		return json(await listVaultBlobs(bucket, vaultId, raw === "" ? null : raw));
+	}
+
+	/**
+	 * `POST /vault/:id/blobs/delete {"ifUploadedBefore": <ms>, "addresses": [...]}` (relay-wire §11.3.1): deletes each
+	 * address whose object R2 says was uploaded strictly before the cutoff. Checks in order, all before any DO or R2
+	 * call: bucket (503); body (413 `body_too_large`, 400 `invalid_json`); `addresses` an array of 1..100 (400
+	 * `invalid_addresses`, `too_many_addresses`) of addresses (400 `invalid_address`) with no repeats (400
+	 * `duplicate_address`); `ifUploadedBefore` a non-negative safe integer (400 `invalid_if_uploaded_before`). Then the
+	 * GC auth, once for the whole call; then R2.
+	 */
+	private async blobGcDelete(request: Request, env: WorkerEnv, vaultId: string): Promise<Response> {
+		const bucket = env.YAOS_BUCKET;
+		if (!bucket) return json({ error: "attachments_unavailable" }, 503);
+		const body = await readJsonObject(request, MAX_BLOB_DELETE_BODY_BYTES);
+		if (body.kind === "too_large") return bodyTooLarge();
+		if (body.kind === "invalid") return json({ error: "invalid_json" }, 400);
+		const { addresses, ifUploadedBefore } = body.value;
+		if (!Array.isArray(addresses) || addresses.length === 0) return json({ error: "invalid_addresses" }, 400);
+		if (addresses.length > MAX_BLOB_DELETE_ADDRESSES) return json({ error: "too_many_addresses" }, 400);
+		if (!addresses.every((address): address is string => typeof address === "string"
+			&& BLOB_ADDRESS_PATTERN.test(address))) {
+			return json({ error: "invalid_address" }, 400);
 		}
+		if (new Set(addresses).size !== addresses.length) return json({ error: "duplicate_address" }, 400);
+		if (typeof ifUploadedBefore !== "number" || !Number.isSafeInteger(ifUploadedBefore) || ifUploadedBefore < 0) {
+			return json({ error: "invalid_if_uploaded_before" }, 400);
+		}
+		const refused = await this.blobGcAuth(request, env, vaultId);
+		if (refused) return refused;
+		return json({ results: await deleteVaultBlobsUploadedBefore(bucket, vaultId, addresses, ifUploadedBefore) });
+	}
+
+	/**
+	 * The vault DO's `POST /blobs/gc-auth`: the bearer, then the GC request limit (one request per call, whatever its
+	 * size). null when allowed; else its answer (401, 503 while restoring, 429). No config call, no DO storage write.
+	 */
+	private async blobGcAuth(request: Request, env: WorkerEnv, vaultId: string): Promise<Response | null> {
 		const auth = await this.vaultObject(env, vaultId).fetch(new Request(`${VAULT_INTERNAL_ORIGIN}/blobs/gc-auth`, {
 			method: "POST",
 			headers: { Authorization: request.headers.get("Authorization") ?? "" },
 		}));
-		if (auth.status !== 204) return auth;
-		return json(address === null
-			? await listVaultBlobs(bucket, vaultId, cursor)
-			: await deleteVaultBlobUploadedBefore(bucket, vaultId, address, cutoff));
+		return auth.status === 204 ? null : auth;
 	}
 
 	/**
@@ -746,34 +785,33 @@ export async function listVaultBlobs(bucket: R2Bucket, vaultId: string, cursor: 
 	return { items, next: listed.truncated && last ? last.address : null };
 }
 
-/** `DELETE /vault/:id/blobs/:address` → what happened to the object. */
+/** One address of `POST /vault/:id/blobs/delete` → what happened to its object. */
 export type BlobDeleteResult =
-	| { result: "deleted"; uploadedAt: number }
-	| { result: "newer"; uploadedAt: number }
-	| { result: "absent" };
+	| { address: string; result: "deleted"; uploadedAt: number }
+	| { address: string; result: "newer"; uploadedAt: number }
+	| { address: string; result: "absent" };
 
 /**
- * R2 `head`, then `delete` only if the object was uploaded strictly before `cutoff` (ms). A re-upload refreshes the
- * upload time, so a blob PUT again after the client's cutoff answers `newer` and stays. R2 has no conditional delete:
- * a PUT that lands between the head and the delete (one round trip) is still deleted.
+ * R2 `head` of every address (BLOB_GC_HEAD_CONCURRENCY in flight), then ONE R2 `delete` of the keys uploaded strictly
+ * before `cutoff` (ms; none → no delete call); the results in request order. A re-upload refreshes the upload time, so
+ * a blob PUT again after the client's cutoff answers `newer` and stays. R2 has no conditional delete: a PUT that lands
+ * after an address's HEAD and before the delete (the remaining HEADs, at most 17 rounds of 6, then the delete) is
+ * still deleted. The client handles that window (relay-wire §11.3.1).
  */
-export async function deleteVaultBlobUploadedBefore(
-	bucket: R2Bucket, vaultId: string, address: string, cutoff: number,
-): Promise<BlobDeleteResult> {
-	const key = blobKey(vaultId, address);
-	const head = await bucket.head(key);
-	if (!head) return { result: "absent" };
-	const uploadedAt = head.uploaded.getTime();
-	if (uploadedAt >= cutoff) return { result: "newer", uploadedAt };
-	await bucket.delete(key);
-	return { result: "deleted", uploadedAt };
-}
-
-/** `ifUploadedBefore`: ms since the epoch, decimal digits only, a safe integer. Anything else (absent too) → null. */
-function uploadCutoff(raw: string | null): number | null {
-	if (raw === null || !/^[0-9]{1,16}$/.test(raw)) return null;
-	const value = Number(raw);
-	return Number.isSafeInteger(value) ? value : null;
+export async function deleteVaultBlobsUploadedBefore(
+	bucket: R2Bucket, vaultId: string, addresses: readonly string[], cutoff: number,
+): Promise<BlobDeleteResult[]> {
+	const heads = await mapConcurrently(addresses, BLOB_GC_HEAD_CONCURRENCY,
+		(address) => bucket.head(blobKey(vaultId, address)));
+	const results = addresses.map((address, index): BlobDeleteResult => {
+		const head = heads[index];
+		if (!head) return { address, result: "absent" };
+		const uploadedAt = head.uploaded.getTime();
+		return uploadedAt < cutoff ? { address, result: "deleted", uploadedAt } : { address, result: "newer", uploadedAt };
+	});
+	const old = results.filter((entry) => entry.result === "deleted").map((entry) => blobKey(vaultId, entry.address));
+	if (old.length > 0) await bucket.delete(old);
+	return results;
 }
 
 /**

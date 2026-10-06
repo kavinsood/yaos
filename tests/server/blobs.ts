@@ -2,15 +2,20 @@
 // `v/<vaultId>/<address>`, opaque addresses (no hash check), overwrite, the GET headers, the 10 MiB cap (declared and
 // streamed), `exists` (≤ 50, more or a malformed entry is 400 (A4), errors), the bearer check in the vault DO (zero
 // config calls), and the no-bucket answer (`503 attachments_unavailable`, `capabilities.attachments = false`). The blob
-// GC routes (E2EE design §19 A3, relay-wire §11.3): list paging, the conditional delete, their limit and refusals.
+// GC routes (E2EE design §19 A3, relay-wire §11.3.1): list paging, the batch conditional delete, their limit and
+// refusals.
 import assert from "node:assert/strict";
 
 import {
+	BLOB_GC_HEAD_CONCURRENCY,
 	BLOB_LIST_PAGE_SIZE,
+	MAX_BLOB_DELETE_ADDRESSES,
+	MAX_BLOB_DELETE_BODY_BYTES,
 	MAX_BLOB_EXISTS_ADDRESSES,
 	MAX_BLOB_EXISTS_BODY_BYTES,
 	MAX_BLOB_UPLOAD_BYTES,
 	blobKey,
+	type BlobDeleteResult,
 	type BlobListPage,
 } from "../../server/src/router";
 import { BLOB_GC_REQUEST_LIMIT, BLOB_GC_WINDOW_MS } from "../../server/src/vault/host";
@@ -45,13 +50,23 @@ function listBlobs(world: World, vaultId: string, device: DeviceSeed, cursor?: s
 	return deviceFetch(world, vaultId, device, cursor === undefined ? "blobs" : `blobs?cursor=${cursor}`);
 }
 
-function deleteBlob(world: World, vaultId: string, device: DeviceSeed, address: string, before: number | string):
+function deleteBody(world: World, vaultId: string, device: DeviceSeed, body: string): Promise<Response> {
+	return deviceFetch(world, vaultId, device, "blobs/delete",
+		{ method: "POST", body, headers: { "Content-Type": "application/json" } });
+}
+
+function deleteBlobs(world: World, vaultId: string, device: DeviceSeed, addresses: readonly string[], ifUploadedBefore: number):
 	Promise<Response> {
-	return deviceFetch(world, vaultId, device, `blobs/${address}?ifUploadedBefore=${before}`, { method: "DELETE" });
+	return deleteBody(world, vaultId, device, JSON.stringify({ ifUploadedBefore, addresses }));
 }
 
 async function page(response: Response): Promise<BlobListPage> {
 	return await response.json() as BlobListPage;
+}
+
+async function results(response: Response): Promise<BlobDeleteResult[]> {
+	assert.equal(response.status, 200);
+	return (await response.json() as { results: BlobDeleteResult[] }).results;
 }
 
 /** The 64-hex address of `index`, so the key order is the index order. */
@@ -294,87 +309,155 @@ s.test("T-BLOB-GC-LIST: a PUT stamps uploadedAt; an overwrite refreshes it", asy
 	});
 });
 
-s.test("T-BLOB-GC-DELETE: older → deleted; at or after the cutoff → newer (kept); missing → absent", async () => {
+s.test("T-BLOB-GC-DELETE: one batch; older → deleted, at or after the cutoff → newer, missing → absent; request order", async () => {
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
 		const older = addressOf(1);
 		const same = addressOf(2);
 		const newer = addressOf(3);
-		for (const [address, at] of [[older, 999], [same, 1_000], [newer, 1_001]] as const) {
+		const oldest = addressOf(4);
+		const missing = addressOf(9);
+		for (const [address, at] of [[older, 999], [same, 1_000], [newer, 1_001], [oldest, 10]] as const) {
 			world.bucket.now = at;
 			assert.equal((await put(world, vaultId, device, address, new Uint8Array([7]))).status, 204);
 		}
-		world.bucket.calls.length = 0;
-		const deleted = await deleteBlob(world, vaultId, device, older, 1_000);
-		assert.equal(deleted.status, 200);
-		assert.equal(deleted.headers.get("Cache-Control"), "no-store");
-		assert.deepEqual(await json(deleted), { result: "deleted", uploadedAt: 999 });
-		assert.deepEqual(world.bucket.calls, [`head ${blobKey(vaultId, older)}`, "delete 1"], "one HEAD, then one delete");
-		assert.equal(world.bucket.objects.has(blobKey(vaultId, older)), false);
-
-		world.bucket.calls.length = 0;
-		assert.deepEqual(await json(await deleteBlob(world, vaultId, device, same, 1_000)),
-			{ result: "newer", uploadedAt: 1_000 }, "strictly before: an upload at the cutoff stays");
-		assert.deepEqual(await json(await deleteBlob(world, vaultId, device, newer, 1_000)),
-			{ result: "newer", uploadedAt: 1_001 });
-		assert.deepEqual(await json(await deleteBlob(world, vaultId, device, older, 1_000)), { result: "absent" });
-		assert.deepEqual(await json(await deleteBlob(world, vaultId, device, addressOf(9), 0)), { result: "absent" });
-		assert.ok(world.bucket.calls.every((call) => call.startsWith("head ")), "a kept or absent blob is never deleted");
-		assert.deepEqual([...world.bucket.objects.keys()].sort(), [blobKey(vaultId, same), blobKey(vaultId, newer)]);
-
-		const other = blobKey("another-vault-id-000", newer);
+		const other = blobKey("another-vault-id-000", older);
 		world.bucket.objects.set(other, new Uint8Array([1]));
-		assert.deepEqual(await json(await deleteBlob(world, vaultId, device, newer, 2_000)),
-			{ result: "deleted", uploadedAt: 1_001 });
-		assert.equal(world.bucket.objects.has(other), true, "another vault's object under the same address stays");
+		world.bucket.calls.length = 0;
+		const response = await deleteBlobs(world, vaultId, device, [newer, older, missing, same, oldest], 1_000);
+		assert.equal(response.headers.get("Cache-Control"), "no-store");
+		assert.deepEqual(await results(response), [
+			{ address: newer, result: "newer", uploadedAt: 1_001 },
+			{ address: older, result: "deleted", uploadedAt: 999 },
+			{ address: missing, result: "absent" },
+			{ address: same, result: "newer", uploadedAt: 1_000 },
+			{ address: oldest, result: "deleted", uploadedAt: 10 },
+		], "in request order; strictly before: an upload at the cutoff stays");
+		assert.deepEqual(world.bucket.calls, [...[newer, older, missing, same, oldest].map((a) => `head ${blobKey(vaultId, a)}`),
+			"delete 2"], "a HEAD per address, then ONE delete of the old keys");
+		assert.deepEqual([...world.bucket.objects.keys()].sort(), [blobKey(vaultId, same), blobKey(vaultId, newer), other].sort(),
+			"kept: the newer ones, and another vault's object under a deleted address");
+
+		world.bucket.calls.length = 0;
+		assert.deepEqual(await results(await deleteBlobs(world, vaultId, device, [older, same], 1_000)),
+			[{ address: older, result: "absent" }, { address: same, result: "newer", uploadedAt: 1_000 }]);
+		assert.deepEqual(world.bucket.calls, [`head ${blobKey(vaultId, older)}`, `head ${blobKey(vaultId, same)}`],
+			"nothing old → no delete call");
 	});
 });
 
-s.test("T-BLOB-GC-RACE: a blob re-uploaded after the sweep listed it survives the delete", async () => {
+s.test("T-BLOB-GC-DELETE: 100 addresses, 6 HEADs in flight, one delete; 101 → 400 too_many_addresses", async () => {
+	assert.deepEqual([MAX_BLOB_DELETE_ADDRESSES, BLOB_GC_HEAD_CONCURRENCY], [100, 6]);
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
-		world.bucket.now = 1_000;
-		await put(world, vaultId, device, ADDRESS, new Uint8Array([1]));
-		const listed = await page(await listBlobs(world, vaultId, device));
-		assert.deepEqual(listed.items, [{ address: ADDRESS, uploadedAt: 1_000 }]);
-		const cutoff = 2_000;
-		// Another device references the bytes again and re-uploads them after the cutoff the sweep chose.
-		world.bucket.now = 3_000;
-		await put(world, vaultId, device, ADDRESS, new Uint8Array([2]));
-		assert.deepEqual(await json(await deleteBlob(world, vaultId, device, ADDRESS, cutoff)),
-			{ result: "newer", uploadedAt: 3_000 });
-		const read = await deviceFetch(world, vaultId, device, `blobs/${ADDRESS}`);
-		assert.deepEqual([read.status, [...new Uint8Array(await read.arrayBuffer())]], [200, [2]]);
+		const addresses = Array.from({ length: MAX_BLOB_DELETE_ADDRESSES }, (_, index) => addressOf(index));
+		addresses.forEach((address, index) => {
+			if (index % 4 === 3) return;
+			world.bucket.objects.set(blobKey(vaultId, address), new Uint8Array([1]));
+			world.bucket.uploadedAt.set(blobKey(vaultId, address), index % 4 === 2 ? 5_000 : 1_000);
+		});
+		world.bucket.calls.length = 0;
+		world.bucket.maxHeadsInFlight = 0;
+		assert.deepEqual(await results(await deleteBlobs(world, vaultId, device, addresses, 2_000)),
+			addresses.map((address, index): BlobDeleteResult => index % 4 === 3
+				? { address, result: "absent" }
+				: index % 4 === 2
+					? { address, result: "newer", uploadedAt: 5_000 }
+					: { address, result: "deleted", uploadedAt: 1_000 }));
+		assert.equal(world.bucket.maxHeadsInFlight, BLOB_GC_HEAD_CONCURRENCY, "6 HEADs in flight, never 7");
+		assert.deepEqual(world.bucket.calls.slice(0, 100), addresses.map((address) => `head ${blobKey(vaultId, address)}`));
+		assert.deepEqual(world.bucket.calls.slice(100), ["delete 50"], "one R2 delete for the 50 old keys");
+		assert.equal(world.bucket.objects.size, 25);
+
+		const fetches = world.cluster.fetches.length;
+		world.bucket.calls.length = 0;
+		const tooMany = await deleteBlobs(world, vaultId, device, [...addresses, addressOf(100)], 2_000);
+		assert.deepEqual([tooMany.status, await json(tooMany)], [400, { error: "too_many_addresses" }]);
+		assert.equal(world.cluster.fetches.length, fetches, "refused before the vault DO");
+		assert.deepEqual(world.bucket.calls, [], "and before R2");
 	});
 });
 
-s.test("T-BLOB-GC-LIMIT (refusals): bad cursor, address or ifUploadedBefore → 400 before the vault DO and R2", async () => {
+s.test("T-BLOB-GC-RACE: a re-upload after the sweep's cutoff survives; a PUT between the HEAD and the delete does not", async () => {
+	await withWorld(async (world) => {
+		const { vaultId, device } = await enrolled(world);
+		const kept = addressOf(1);
+		const orphan = addressOf(2);
+		world.bucket.now = 1_000;
+		await put(world, vaultId, device, kept, new Uint8Array([1]));
+		await put(world, vaultId, device, orphan, new Uint8Array([1]));
+		const listed = await page(await listBlobs(world, vaultId, device));
+		assert.deepEqual(listed.items, [{ address: kept, uploadedAt: 1_000 }, { address: orphan, uploadedAt: 1_000 }]);
+		const cutoff = 2_000;
+		// Another device references `kept` again and re-uploads it after the cutoff the sweep chose.
+		world.bucket.now = 3_000;
+		await put(world, vaultId, device, kept, new Uint8Array([2]));
+		assert.deepEqual(await results(await deleteBlobs(world, vaultId, device, [kept, orphan], cutoff)),
+			[{ address: kept, result: "newer", uploadedAt: 3_000 }, { address: orphan, result: "deleted", uploadedAt: 1_000 }]);
+		const read = await deviceFetch(world, vaultId, device, `blobs/${kept}`);
+		assert.deepEqual([read.status, [...new Uint8Array(await read.arrayBuffer())]], [200, [2]]);
+
+		// The documented window (relay-wire §11.3.1): R2 has no conditional delete, so a PUT that lands after the
+		// address's HEAD and before the batch delete is deleted with it; the client re-checks and re-uploads.
+		world.bucket.now = 1_000;
+		await put(world, vaultId, device, orphan, new Uint8Array([3]));
+		world.bucket.afterHead = (key) => {
+			if (key !== blobKey(vaultId, orphan)) return;
+			world.bucket.objects.set(key, new Uint8Array([4]));
+			world.bucket.uploadedAt.set(key, 3_000);
+		};
+		assert.deepEqual(await results(await deleteBlobs(world, vaultId, device, [orphan], cutoff)),
+			[{ address: orphan, result: "deleted", uploadedAt: 1_000 }]);
+		world.bucket.afterHead = null;
+		assert.equal(world.bucket.objects.has(blobKey(vaultId, orphan)), false, "the late PUT is gone too");
+	});
+});
+
+s.test("T-BLOB-GC-LIMIT (refusals): a bad cursor or delete body → 400/413 before the vault DO and R2", async () => {
+	assert.equal(MAX_BLOB_DELETE_BODY_BYTES, 16 * 1024);
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
 		world.bucket.objects.set(blobKey(vaultId, ADDRESS), new Uint8Array([1]));
-		const cases: Array<[string, string, string]> = [
-			...["A".repeat(64), "a".repeat(63), "a".repeat(65), "x", "%20", `${ADDRESS}%2F`].map(
-				(cursor): [string, string, string] => ["GET", `blobs?cursor=${cursor}`, "invalid_cursor"]),
-			...["A".repeat(64), "a".repeat(63), "exists"].map(
-				(bad): [string, string, string] => ["DELETE", `blobs/${bad}?ifUploadedBefore=1`, "invalid_address"]),
-			...["", "?ifUploadedBefore", "?ifUploadedBefore=", "?ifUploadedBefore=-1", "?ifUploadedBefore=1.5",
-				"?ifUploadedBefore=1e3", "?ifUploadedBefore=%201", "?ifUploadedBefore=0x10", "?ifUploadedBefore=+1",
-				"?ifUploadedBefore=9007199254740992", "?ifUploadedBefore=99999999999999999", "?before=1"].map(
-				(query): [string, string, string] => ["DELETE", `blobs/${ADDRESS}${query}`, "invalid_if_uploaded_before"]),
+		const body = (fields: Record<string, unknown>) => JSON.stringify({ ifUploadedBefore: 1, addresses: [ADDRESS], ...fields });
+		const hundred = Array.from({ length: MAX_BLOB_DELETE_ADDRESSES }, (_, index) => addressOf(index));
+		const deletes: Array<[string, string]> = [
+			...["{", "", "null", "[]", "1", '"x"', `${body({})}x`].map((raw): [string, string] => [raw, "invalid_json"]),
+			['{"ifUploadedBefore":1}', "invalid_addresses"],
+			...[null, "x", ADDRESS, {}, []].map((addresses): [string, string] => [body({ addresses }), "invalid_addresses"]),
+			[body({ addresses: [...hundred, addressOf(100)] }), "too_many_addresses"],
+			[body({ addresses: [...hundred, "x"] }), "too_many_addresses"],
+			...["A".repeat(64), "a".repeat(63), "a".repeat(65), "", 7, null, [ADDRESS], { address: ADDRESS }].map(
+				(bad): [string, string] => [body({ addresses: [ADDRESS, bad] }), "invalid_address"]),
+			[body({ addresses: [ADDRESS, addressOf(1), ADDRESS] }), "duplicate_address"],
+			[JSON.stringify({ addresses: [ADDRESS] }), "invalid_if_uploaded_before"],
+			...[null, -1, 1.5, "1", "0", true, [1], 2 ** 53, 1e300].map(
+				(ifUploadedBefore): [string, string] => [body({ ifUploadedBefore }), "invalid_if_uploaded_before"]),
 		];
 		const fetches = world.cluster.fetches.length;
 		world.bucket.calls.length = 0;
-		for (const [method, path, error] of cases) {
-			const response = await deviceFetch(world, vaultId, device, path, { method });
-			assert.deepEqual([response.status, await json(response)], [400, { error }], `${method} ${path}`);
+		for (const cursor of ["A".repeat(64), "a".repeat(63), "a".repeat(65), "x", "%20", `${ADDRESS}%2F`]) {
+			const response = await listBlobs(world, vaultId, device, cursor);
+			assert.deepEqual([response.status, await json(response)], [400, { error: "invalid_cursor" }], cursor);
 		}
+		for (const [raw, error] of deletes) {
+			const response = await deleteBody(world, vaultId, device, raw);
+			assert.deepEqual([response.status, await json(response)], [400, { error }], raw.slice(0, 120));
+		}
+		const huge = await deleteBody(world, vaultId, device, body({ pad: "x".repeat(MAX_BLOB_DELETE_BODY_BYTES) }));
+		assert.deepEqual([huge.status, await json(huge)], [413, { error: "body_too_large" }]);
 		assert.equal(world.cluster.fetches.length, fetches, "no vault-DO call for a malformed request");
 		assert.deepEqual(world.bucket.calls, [], "no R2 call for a malformed request");
+
 		assert.deepEqual(await json(await listBlobs(world, vaultId, device, "")), { items: [{ address: ADDRESS, uploadedAt: 0 }],
 			next: null }, "an empty cursor is the first page");
-		for (const cutoff of ["0", "00", "9007199254740991"]) {
-			assert.equal((await deleteBlob(world, vaultId, device, addressOf(5), cutoff)).status, 200, cutoff);
+		for (const cutoff of [0, Number.MAX_SAFE_INTEGER]) {
+			assert.equal((await deleteBlobs(world, vaultId, device, [addressOf(5)], cutoff)).status, 200, String(cutoff));
 		}
+		assert.equal((await deleteBody(world, vaultId, device, body({ extra: true, addresses: [addressOf(5)] }))).status, 200,
+			"unknown fields are ignored");
+		assert.equal(world.bucket.objects.has(blobKey(vaultId, ADDRESS)), true);
+		const single = await deviceFetch(world, vaultId, device, `blobs/${ADDRESS}?ifUploadedBefore=1`, { method: "DELETE" });
+		assert.deepEqual([single.status, await json(single)], [404, { error: "not_found" }], "the single-address DELETE is gone");
 		assert.equal(world.bucket.objects.has(blobKey(vaultId, ADDRESS)), true);
 	});
 });
@@ -390,12 +473,13 @@ s.test("T-BLOB-GC-LIMIT (bearer): one /blobs/gc-auth call, zero config calls; a 
 		world.bucket.calls.length = 0;
 		for (const response of [
 			await listBlobs(world, vaultId, stranger),
-			await deleteBlob(world, vaultId, stranger, ADDRESS, Number.MAX_SAFE_INTEGER),
+			await deleteBlobs(world, vaultId, stranger, [ADDRESS], Number.MAX_SAFE_INTEGER),
 			await listBlobs(world, other.vaultId, device),
-			await deleteBlob(world, other.vaultId, device, ADDRESS, Number.MAX_SAFE_INTEGER),
+			await deleteBlobs(world, other.vaultId, device, [ADDRESS], Number.MAX_SAFE_INTEGER),
 			await world.router.fetch(new Request(`https://yaos.test/vault/${vaultId}/blobs`), world.env),
-			await world.router.fetch(new Request(`https://yaos.test/vault/${vaultId}/blobs/${ADDRESS}?ifUploadedBefore=1`,
-				{ method: "DELETE", headers: { Authorization: "Bearer not-a-token" } }), world.env),
+			await world.router.fetch(new Request(`https://yaos.test/vault/${vaultId}/blobs/delete`, { method: "POST",
+				headers: { Authorization: "Bearer not-a-token", "Content-Type": "application/json" },
+				body: JSON.stringify({ ifUploadedBefore: Number.MAX_SAFE_INTEGER, addresses: [ADDRESS] }) }), world.env),
 		]) {
 			assert.deepEqual([response.status, await json(response)], [401, { error: "unauthorized" }]);
 		}
@@ -403,22 +487,24 @@ s.test("T-BLOB-GC-LIMIT (bearer): one /blobs/gc-auth call, zero config calls; a 
 
 		const before = world.cluster.fetches.length;
 		assert.equal((await listBlobs(world, vaultId, device)).status, 200);
-		assert.equal((await deleteBlob(world, vaultId, device, addressOf(5), 1)).status, 200);
+		const hundred = Array.from({ length: MAX_BLOB_DELETE_ADDRESSES }, (_, index) => addressOf(index));
+		assert.equal((await deleteBlobs(world, vaultId, device, hundred, 1)).status, 200);
 		assert.deepEqual(world.cluster.fetches.slice(before).map(({ method, url }) => `${method} ${url}`),
-			["POST https://vault.internal/blobs/gc-auth", "POST https://vault.internal/blobs/gc-auth"]);
+			["POST https://vault.internal/blobs/gc-auth", "POST https://vault.internal/blobs/gc-auth"],
+			"one auth call per request; a 100-address batch too");
 		assert.equal(world.accesses.length, accesses, "zero config-DO accesses on the GC routes");
 
 		const revoked = await world.fetch(`/operator/vaults/${vaultId}/devices/${device.deviceId}`, { method: "DELETE", cookie });
 		assert.equal(revoked.status, 200);
 		world.bucket.calls.length = 0;
 		assert.equal((await listBlobs(world, vaultId, device)).status, 401, "D7: a revoked bearer is 401");
-		assert.equal((await deleteBlob(world, vaultId, device, ADDRESS, Number.MAX_SAFE_INTEGER)).status, 401);
+		assert.equal((await deleteBlobs(world, vaultId, device, [ADDRESS], Number.MAX_SAFE_INTEGER)).status, 401);
 		assert.deepEqual(world.bucket.calls, []);
 		assert.equal(world.bucket.objects.size, 1);
 	});
 });
 
-s.test("T-BLOB-GC-LIMIT: 60 authenticated GC requests a minute per vault → 429 + Retry-After; strangers do not count; blob I/O is not limited", async () => {
+s.test("T-BLOB-GC-LIMIT: 60 authenticated GC requests a minute per vault (a 100-address batch is one) → 429 + Retry-After; strangers do not count; blob I/O is not limited", async () => {
 	assert.deepEqual([BLOB_GC_REQUEST_LIMIT, BLOB_GC_WINDOW_MS], [60, 60_000]);
 	await withWorld(async (world) => {
 		const { vaultId, device, vault } = await enrolled(world);
@@ -426,15 +512,16 @@ s.test("T-BLOB-GC-LIMIT: 60 authenticated GC requests a minute per vault → 429
 		for (let index = 0; index < 100; index++) {
 			assert.equal((await listBlobs(world, vaultId, stranger)).status, 401);
 		}
+		const batch = Array.from({ length: MAX_BLOB_DELETE_ADDRESSES }, (_, index) => addressOf(index));
 		for (let index = 0; index < BLOB_GC_REQUEST_LIMIT; index++) {
 			const response = index % 2 === 0
 				? await listBlobs(world, vaultId, device)
-				: await deleteBlob(world, vaultId, device, addressOf(index), 1);
+				: await deleteBlobs(world, vaultId, device, batch, 1);
 			assert.equal(response.status, 200, `request ${index + 1}`);
 		}
 		vault.timers.now += 15_000;
 		world.bucket.calls.length = 0;
-		for (const response of [await listBlobs(world, vaultId, device), await deleteBlob(world, vaultId, device, ADDRESS, 1)]) {
+		for (const response of [await listBlobs(world, vaultId, device), await deleteBlobs(world, vaultId, device, [ADDRESS], 1)]) {
 			assert.equal(response.status, 429);
 			assert.deepEqual(await json(response), { error: "too_many_attempts" });
 			assert.equal(response.headers.get("Retry-After"), "45");
@@ -459,8 +546,8 @@ s.test("T-BLOB-UNAVAILABLE (WB): no bucket → 503 attachments_unavailable befor
 			await world.router.fetch(new Request(`https://yaos.test/vault/${vaultId}/blobs/${ADDRESS}`), world.env),
 			await listBlobs(world, vaultId, device),
 			await listBlobs(world, vaultId, device, "not-a-cursor"),
-			await deleteBlob(world, vaultId, device, ADDRESS, 1),
-			await deleteBlob(world, vaultId, device, "bad", "bad"),
+			await deleteBlobs(world, vaultId, device, [ADDRESS], 1),
+			await deleteBody(world, vaultId, device, "not json"),
 		]) {
 			assert.deepEqual([response.status, await json(response)], [503, { error: "attachments_unavailable" }]);
 		}

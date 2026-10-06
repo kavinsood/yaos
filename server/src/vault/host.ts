@@ -59,9 +59,10 @@ const MAX_SMALL_BODY_BYTES = 64 * 1024;
 export const RESTORE_FLAG_TTL_MS = 60_000;
 
 /**
- * Blob GC (relay-wire §11.3, E2EE design §19 A3): the list and conditional-delete routes share 60 authenticated
- * requests a minute per vault DO, in memory like D3 (a new runtime starts a fresh window). A sweep is a cold path (a
- * user command, at most monthly); 60/min caps a looping device at one DO request and one R2 operation a second.
+ * Blob GC (relay-wire §11.3.1, E2EE design §19 A3): the list and batch-delete routes share 60 authenticated
+ * requests a minute per vault DO, in memory like D3 (a new runtime starts a fresh window). A batch delete of up to 100
+ * addresses is one request. A sweep is a cold path (a user command, at most monthly); 60/min caps a looping device at
+ * one DO request a second, and at most 1000 listed or 100 deleted blobs a second.
  */
 export const BLOB_GC_REQUEST_LIMIT = 60;
 export const BLOB_GC_WINDOW_MS = 60_000;
@@ -240,7 +241,7 @@ export class VaultHost {
 	private readonly ticketTtlMs: number;
 	/** D3: 20 failed enrolls a minute (unknown, expired or used code) → 429. */
 	private readonly enrollFailures: WindowLimiter;
-	/** Blob GC: 60 authenticated list/delete requests a minute → 429. */
+	/** Blob GC: 60 authenticated list or batch-delete requests a minute → 429. */
 	private readonly blobGcRequests: WindowLimiter;
 	/** undefined: not read yet in this runtime; null: never initialized ("no such table", cached per §6.1). */
 	private state: VaultState | null | undefined = undefined;
