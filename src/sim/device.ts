@@ -20,7 +20,6 @@ import { createInlinePair, type InlinePair } from "../protocol/inlineTransport";
 import type { EngineSettings } from "../protocol/messages";
 import type { StatusSnapshot } from "../protocol/status";
 import type { EngineCarrier } from "../host/engineHost";
-import { createHasher } from "../host/hashing";
 import { HostRuntime, type HostUiSink } from "../host/hostRuntime";
 import type { HostIdentity } from "../host/runtimeSupport";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
@@ -30,7 +29,7 @@ import { residentText } from "../engine/compose/runtimeOps";
 import { FAST_TUNING } from "../engine/runtime/testHarness";
 import type { ClockPort } from "../ports/clock";
 import type { VirtualClock } from "./clock";
-import { simHashPort } from "./hash";
+import { simHashOracle, simHashPort } from "./hash";
 import { SIM_VAULT_ID, type SimNet } from "./net";
 import { hashLabel, SeededRandom } from "./random";
 import { MemStoragePort } from "./storage";
@@ -122,10 +121,9 @@ export class SimDevice {
 	};
 
 	constructor(readonly opts: SimDeviceOptions) {
-		const hasher = createHasher(simHashPort());
 		this.deviceId = `dev-${opts.name}` as DeviceId;
 		this.storage = new MemStoragePort({ beforeNextTimer: opts.clock.beforeNextTimer });
-		this.vault = new SimVault({ clock: opts.clock, hasher, profile: opts.profile ?? "case-sensitive", watcherDelayMs: opts.watcherDelayMs });
+		this.vault = new SimVault({ clock: opts.clock, hashes: simHashOracle(), profile: opts.profile ?? "case-sensitive", watcherDelayMs: opts.watcherDelayMs });
 		this.configDir = new SimConfigDir(opts.clock);
 		const mobile = opts.mobile ?? false;
 		this.platform = new SimPlatform({ os: mobile ? "ios" : "macos", isMobile: mobile, isTablet: false, hardwareConcurrency: mobile ? 6 : 8, deviceMemoryGiB: mobile ? 4 : null, workerSupported: true });
@@ -193,12 +191,11 @@ export class SimDevice {
 	runtimeFor(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink): HostRuntime {
 		return new HostRuntime({
 			clock: this.opts.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
-			workspace: this.workspace, platform: this.platform, hasher: createHasher(simHashPort()),
+			workspace: this.workspace, platform: this.platform,
 			identity, settings,
 			createWorker: () => (this.opts.workerMode === "unavailable" ? null : this.carrier("worker")),
 			createInline: () => this.carrier("inline"),
 			pingEnabled: true,
-			timeZone: "utc",
 			ui,
 		});
 	}
@@ -209,6 +206,8 @@ export class SimDevice {
 
 	/** The carrier dies: storage keeps exactly what was committed, the socket drops first, nothing flushes. */
 	private killEngine(reason: string): MemStoragePort {
+		// Bound-merge conflict copies not written yet live in the engine (boundDisk) and die with it.
+		for (const c of this.vrt?.engine.boundDisk.pendingConflictCopies() ?? []) this.crashLost.push(c.text);
 		const dying = this.storage;
 		this.storage = dying.crash();
 		this.opts.net.relay.dropSession(this.deviceId);
@@ -231,7 +230,6 @@ export class SimDevice {
 	 * committed storage the next start will see (empty after a wipe).
 	 */
 	crashApp(o: { readonly wipe?: boolean; readonly dropMirrors?: boolean } = {}): MemStoragePort {
-		for (const c of this.runtime.bindings.pendingConflictCopies()) this.crashLost.push(c.text);
 		let copy = this.killEngine("app crash");
 		this.workspace.crashAll();
 		void this.runtime.stop().catch(() => undefined);

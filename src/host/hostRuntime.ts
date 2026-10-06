@@ -19,7 +19,7 @@ import type { StatusSnapshot } from "../protocol/status";
 import { BindingManager } from "./binding";
 import { DiskExecutor } from "./diskExecutor";
 import { EngineHost, type CarrierKind, type EngineCarrier, type EngineEventMessage, type EngineRequestMessage } from "./engineHost";
-import type { Hasher } from "./hashing";
+import { engineHashOracle } from "./hashOracle";
 import { VaultEventBatcher, buildInitConfig, deviceClassFor, observationChunks, type HostIdentity } from "./runtimeSupport";
 
 export interface HostUiSink {
@@ -37,7 +37,6 @@ export interface HostRuntimeDeps {
 	readonly sideFiles: SideFilePort;
 	readonly workspace: WorkspacePort;
 	readonly platform: PlatformPort;
-	readonly hasher: Hasher;
 	readonly identity: HostIdentity;
 	readonly settings: () => EngineSettings;
 	readonly createWorker: () => EngineCarrier | null;
@@ -45,7 +44,6 @@ export interface HostRuntimeDeps {
 	readonly ui: HostUiSink;
 	readonly forceInline?: boolean;
 	readonly pingEnabled?: boolean;
-	readonly timeZone?: "local" | "utc";
 	readonly log?: (line: string) => void;
 }
 
@@ -70,10 +68,7 @@ export class HostRuntime {
 			workspace: deps.workspace,
 			vault: deps.vault,
 			clock: deps.clock,
-			hasher: deps.hasher,
-			deviceLabel: () => deps.identity.deviceLabel,
 			notice: (level, code, message) => deps.ui.onNotice(level, code, message),
-			timeZone: deps.timeZone,
 			link: {
 				post: (m) => void this.engine.post(m as Parameters<EngineHost["post"]>[0]), // binding posts events only
 				openDoc: (path, viewId) => this.engine.request({ t: "openDoc", path, viewId }),
@@ -83,7 +78,8 @@ export class HostRuntime {
 			vault: deps.vault,
 			configDir: deps.configDir,
 			clock: deps.clock,
-			hasher: deps.hasher,
+			// Config-area preconditions are hashed by this runtime's engine (main never hashes).
+			hashes: engineHashOracle((body) => this.engine.request(body)),
 			isBoundPath: (p) => this.bindings.isBoundPath(p),
 			flushBoundPath: (p) => this.bindings.flushPath(p),
 			budgets: () => BUDGETS[this.deviceClass],
@@ -227,8 +223,8 @@ export class HostRuntime {
 
 	private onEngineEvent(m: EngineEventMessage): void {
 		switch (m.t) {
-			case "docUpdate":
-				this.bindings.onDocUpdate(m.docId, m.update);
+			case "body":
+				this.bindings.onBody(m.docId, m.event, m.weight);
 				return;
 			case "docRetarget":
 				this.bindings.onDocRetarget(m.docId, m.change);
