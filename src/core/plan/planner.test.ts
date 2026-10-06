@@ -285,6 +285,17 @@ test("row live/present/absent: a delete that waits marks fileGone; a file re-cre
 	assert.deepEqual(moved.ops, [{ op: "syncedPut", entry: { ...S("d1", "b.md"), nsTouchSeq: 12 } }]);
 	const movedEdited = run({ remote: [{ ...edited, lastTouchSeq: 12 }], synced: [gone], local: [L("b.md", h("c0"))] });
 	assert.deepEqual(opsOf(movedEdited), ["reconcileContent"]);
+	// ... unless the user renamed another file there: the doc's file is where its own rename took it (sim DEV3 F
+	// seed 452). The doc follows the observed rename (merging there); the other file is a new doc, its create after
+	// the rename that frees the path.
+	const both = run({
+		remote: [{ ...edited, lastTouchSeq: 12 }], synced: [gone], local: [L("c.md", h("c5")), L("b.md", h("c7"))],
+		over: { renames: [{ from: "a.md", to: "c.md", atMs: 1 }, { from: "n.md", to: "b.md", atMs: 2 }] },
+	});
+	assert.deepEqual(opsOf(both), ["nsRename", "nsCreate", "reconcileContent", "reconcileContent"]);
+	assert.equal(find(both, "nsRename").path, "c.md");
+	assert.equal(find(both, "nsCreate").path, "b.md");
+	assert.deepEqual(both.ops.filter((o) => o.op === "reconcileContent").map((o) => [o.docId === "d1", o.path]), [[true, "c.md"], [false, "b.md"]]);
 });
 
 // ---------------------------------------------------------------------------

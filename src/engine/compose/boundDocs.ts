@@ -11,13 +11,16 @@
  * tracked (a create was planned or folded) the host gets `bindable`.
  */
 
-import type { DocId, VaultPath } from "../../core/types";
+import type { DocId, PathKey, VaultPath } from "../../core/types";
 import type { DocUpdateOrigin, EngineToMain } from "../../protocol/messages";
 import { owned } from "../../protocol/workerTransport";
 
 export interface BoundDoc {
 	readonly docId: DocId;
-	/** Path the doc was bound at (updated on remote renames). */
+	/**
+	 * Path of the file the views show: set at bind, moved by every vault rename of that file (Obsidian moves
+	 * view.file in place, for a user rename and for the projection's vault.rename alike; followRename).
+	 */
 	path: VaultPath;
 	readonly views: Set<number>;
 }
@@ -78,6 +81,11 @@ export class BoundDocs {
 		this.byId.delete(docId);
 		this.queues.delete(docId);
 		return true;
+	}
+
+	/** A vault rename `from` -> `to`: views on the file follow it (see BoundDoc.path). */
+	followRename(fromKey: PathKey, to: VaultPath, key: (p: VaultPath) => PathKey): void {
+		for (const b of this.byId.values()) if (key(b.path) === fromKey) b.path = to;
 	}
 
 	/** Forget a doc entirely (retargeted / engine restart). */

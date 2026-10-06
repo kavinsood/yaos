@@ -349,9 +349,31 @@ export class VaultRuntime {
 			this.requestCfg();
 			if (this.settings.snapshots.enabled) void this.snaps.maybeDaily().catch((e) => this.diag(`daily snapshot failed: ${String(e)}`));
 		}
+		this.retargetCreatedUnderViews();
 		this.checkBindable();
 		this.postStatus();
 		return r;
+	}
+
+	/**
+	 * The pass created a doc for the file a bound doc's views show (a local rename of the open note that lost to a
+	 * concurrent remote move: the doc went to the remote's path, the renamed file became a new doc). The views now
+	 * show that doc's file, so they re-open on it; the old doc, unbound, gets its own file written again (an
+	 * editor's save would only ever reach the view's file; sim DEV3 F seed 452).
+	 */
+	private retargetCreatedUnderViews(): void {
+		const bound = this.engine.bound;
+		if (bound.size === 0) return;
+		for (const op of this.rec.lastPlan) {
+			if (op.op !== "nsCreate") continue;
+			const key = pathKey(op.path);
+			if (this.rec.ctx.synced(op.docId)?.pathKey !== key) continue;
+			for (const b of [...bound.byId.values()]) {
+				if (b.docId === op.docId || pathKey(b.path) !== key) continue;
+				this.retarget(b.docId, op.docId);
+				this.sched.request({ t: "docs", docIds: [b.docId], pathKeys: [] });
+			}
+		}
 	}
 
 	/** Cheap change detector for the synced tree (size + summed touch seqs). */

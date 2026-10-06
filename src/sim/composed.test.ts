@@ -260,3 +260,36 @@ test("offline delete, then a new note at the same path: a new doc, not a save ov
 	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "new note\n"]], `${d.name}`);
 	assert.equal(b.vault.trashed.length, 1, "B trashed the old note (moved to y.md)");
 });
+
+test("a rename of the open note that loses to a concurrent remote move: the views re-open on the file's new doc", async () => {
+	// Sim DEV3 F seed 452. A renamed the open note offline while B moved it elsewhere, onto a path where A had a
+	// file of its own. The doc took B's path (the file there merged into it as a conflict), A's renamed file became a
+	// new doc, and the views stayed bound to the old doc: its merge never wrote the doc's file, waiting for an editor
+	// save that could only ever reach the views' file.
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "body\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "body\n");
+	const view = a.workspace.openFile("x.md");
+	await clock.advance(1_000);
+	assert.ok(view?.isBound(), "bound");
+	a.setOnline(false);
+	assert.ok(b.vault.userRename("x.md", "r2.md"));
+	await clock.advance(5_000);
+	b.vault.userWrite("r2.md", "body\nB edit\n");
+	await clock.advance(5_000);
+	assert.ok(a.vault.userRename("x.md", "r4.md"));
+	a.vault.userWrite("r2.md", "other\n");
+	a.crashEngine(); // the observed rename goes with it: no rename inference, x.md is just missing
+	await clock.advance(5_000);
+	a.setOnline(true);
+	await clock.advance(30_000);
+	const want = [...b.vault.snapshot().entries()].sort();
+	assert.deepEqual([...a.vault.snapshot().entries()].sort(), want);
+	assert.equal(a.vault.textOf("r2.md"), "body\nB edit\n");
+	assert.ok(want.some(([, t]) => t === "other\n"), "A's own file at r2 is kept");
+	assert.ok(view?.isBound(), "the view is bound again");
+	assert.equal(view?.getText(), a.vault.textOf("r4.md"));
+});

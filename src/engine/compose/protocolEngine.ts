@@ -16,6 +16,7 @@
 
 import type { DocId, PathKey, VaultEpoch, VaultPath } from "../../core/types";
 import { BUDGETS } from "../../core/limits";
+import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
 import { findKnownEpoch } from "./knownEpoch";
 import { isStorageError } from "../../ports/storage";
@@ -321,6 +322,7 @@ export class ComposedEngine {
 				return;
 			case "vaultEvents":
 				this.recordEvents(m.events);
+				for (const e of m.events) if (e.t === "rename") this.bound.followRename(pathKey(e.from), e.to, pathKey);
 				rt?.vaultEvents(m.events);
 				return;
 			case "openDoc": {

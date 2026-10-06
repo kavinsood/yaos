@@ -221,12 +221,28 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		l.kind === "blob"
 			? [{ op: "pushBlob", docId, path: l.path, hash: l.hash!, size: l.size }]
 			: [{ op: "reconcileContent", docId, path: l.path, kind: l.kind, hasBase: false }];
+	// Where each observed rename chain ended: target key -> the key the file started from.
+	const arrivedFrom = new Map<PathKey, PathKey>();
+	for (const e of [...input.renames].sort((x, y) => x.atMs - y.atMs)) {
+		const from = pk(e.from);
+		const origin = arrivedFrom.get(from) ?? from;
+		arrivedFrom.delete(from);
+		arrivedFrom.set(pk(e.to), origin);
+	}
+	/** The file at `key` was renamed there by the user from a path other than S's: another file, not S's doc's. */
+	const arrivedElsewhere = (key: PathKey, s: SyncedEntry): boolean => {
+		const o = arrivedFrom.get(key);
+		return o !== undefined && o !== s.pathKey;
+	};
 	const localFor = (s: SyncedEntry, r: RemoteEntry | undefined): { l: LocalEntry | undefined; atRemote: boolean } => {
 		// A decided delete (fileGone) covers the file at S's path only. A file at the doc's remote path is its
-		// own: the doc moved there (an own rename inference could not catch offline, sim heavy seed 22).
+		// own: the doc moved there (an own rename inference could not catch offline, sim heavy seed 22). Unless
+		// the user renamed it there from elsewhere: then it is that file, and the doc's own file is wherever its
+		// rename took it (sim DEV3 F seed 452: the doc's file renamed n6 -> r4 offline, another note n4 -> r2,
+		// the doc moved to r2 by a peer; r2's note merged into the doc as a conflict and r4 became a duplicate).
 		const l = s.fileGone ? undefined : input.local.get(s.pathKey);
 		if (l) return { l, atRemote: false };
-		if (r && r.state === "live" && r.pathKey !== s.pathKey && !syncedByKey.has(r.pathKey)) {
+		if (r && r.state === "live" && r.pathKey !== s.pathKey && !syncedByKey.has(r.pathKey) && !arrivedElsewhere(r.pathKey, s)) {
 			const atR = input.local.get(r.pathKey);
 			if (atR) return { l: atR, atRemote: true };
 		}
@@ -242,7 +258,7 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		const id = input.remoteByPathKey.get(key);
 		if (id === undefined) return false;
 		const s = input.synced.get(id);
-		return !(s && !s.fileGone && s.pathKey !== key && input.local.has(s.pathKey));
+		return !(s && s.pathKey !== key && ((!s.fileGone && input.local.has(s.pathKey)) || arrivedElsewhere(key, s)));
 	};
 	// Keys this plan moves a synced file away from (remote moved it, not pinned by an own pending op).
 	const vacating = new Set<PathKey>();
