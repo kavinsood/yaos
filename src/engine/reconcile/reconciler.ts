@@ -45,6 +45,8 @@ export interface PassReport extends RunReport {
 	readonly planned: number;
 	/** Ops other than wait / needHash in the plan. */
 	readonly actionable: number;
+	/** Files left unhashed (disk read failed, in scope or not); the scheduler retries them. */
+	readonly unread: number;
 	readonly brake: BrakeReport | null;
 	readonly openIntents: number;
 }
@@ -172,7 +174,9 @@ export class Reconciler {
 			brake ??= report;
 		}
 		const actionable = plan.ops.filter((o) => o.op !== "wait" && o.op !== "needHash").length;
-		return { ...run, planned: plan.ops.length, actionable, brake, openIntents };
+		// Out-of-scope read failures count too: nothing else would re-plan them before the periodic full pass.
+		const unread = Math.max(this.scan.lastUnread, plan.ops.filter((o) => o.op === "needHash").length);
+		return { ...run, planned: plan.ops.length, actionable, unread, brake, openIntents };
 	}
 
 	/** Passes until a plan has nothing actionable left or nothing succeeds (bounded). */
@@ -183,6 +187,6 @@ export class Reconciler {
 			last = await this.pass();
 			passes++;
 		}
-		return { passes, quiet: last.actionable === 0, last };
+		return { passes, quiet: last.actionable === 0 && last.unread === 0, last };
 	}
 }

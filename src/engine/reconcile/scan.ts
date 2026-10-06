@@ -94,8 +94,12 @@ export class Scanner {
 		else this.ctx.local.set(c.pathKey, { diskPath, path: c.path, pathKey: c.pathKey, kind: c.kind, size: 0, mtimeMs: 0, hash: null, fingerprint: null, hashedAtMs: 0, excluded: c.excluded, bound: false });
 	}
 
+	/** Entries the last hashPending could not read (I/O error): still hash = null. */
+	lastUnread = 0;
+
 	/** Read and hash every non-excluded entry with hash = null (batched by I/O budget), then persist. */
 	async hashPending(): Promise<number> {
+		let unread = 0;
 		const budget = this.ctx.deps.maxDiskIoBytesInFlight ?? DEFAULT_IO_BYTES;
 		const pending = [...this.ctx.local.values()].filter((e) => e.hash === null).sort((a, b) => (a.pathKey < b.pathKey ? -1 : 1));
 		let done = 0;
@@ -120,7 +124,10 @@ export class Scanner {
 				if (!r.ok) {
 					if (r.reason === "missing") drop.push(e.pathKey);
 					else if (r.reason === "too-large") put.push({ ...e, excluded: true, size: r.stat?.size ?? e.size });
-					else this.ctx.notice("warn", "read-failed", `could not read ${e.path}`);
+					else {
+						unread++;
+						this.ctx.notice("warn", "read-failed", `could not read ${e.path}`);
+					}
 					continue;
 				}
 				const c = this.ctx.classify(r.stat.path, r.stat.size);
@@ -134,6 +141,7 @@ export class Scanner {
 			}
 			await this.ctx.commit({}, put.filter((e) => !drop.includes(e.pathKey)), drop);
 		}
+		this.lastUnread = unread;
 		return done;
 	}
 }

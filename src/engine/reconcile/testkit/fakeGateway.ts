@@ -29,6 +29,8 @@ export class FakeGateway implements DiskGateway {
 	private crash: { at: number; after: boolean } | null = null;
 	/** Hook run before each read batch is answered (inject concurrent edits). */
 	beforeRead: ((reads: readonly DiskReadRequest[]) => void | Promise<void>) | null = null;
+	/** Paths whose next N reads fail with reason "io" (transient EIO). */
+	readonly failReads = new Map<string, number>();
 	/** Hook run before each op executes. */
 	beforeOp: ((op: DiskOp) => void | Promise<void>) | null = null;
 
@@ -47,7 +49,10 @@ export class FakeGateway implements DiskGateway {
 		const out: DiskReadResult[] = [];
 		for (const r of reads) {
 			this.reads.push(r);
-			if (r.area !== "vault") {
+			const fails = this.failReads.get(r.path) ?? 0;
+			if (r.area !== "vault" || fails > 0) {
+				if (fails > 1) this.failReads.set(r.path, fails - 1);
+				else this.failReads.delete(r.path);
 				out.push({ path: r.path, ok: false, reason: "io", stat: null });
 				continue;
 			}

@@ -147,7 +147,8 @@ export class PassScheduler {
 			this.last = report;
 			this.deps.onReport?.(report, scope);
 			const productive = report.actionable > 0 && report.ok > 0;
-			if (report.actionable > 0 && report.ok === 0 && report.held < report.actionable) this.scheduleRetry();
+			// Unread files (disk read failed) are only re-planned by a later pass: retry with backoff.
+			if ((report.actionable > 0 && report.ok === 0 && report.held < report.actionable) || report.unread > 0) this.scheduleRetry();
 			else if (report.actionable === 0 || productive) this.failures = 0;
 			this.armBlobRetry();
 			if (productive && ++chained < max) {

@@ -158,3 +158,29 @@ test("CAS miss persistently: job fails after MAX attempts, CRDT untouched; conve
 	assert.ok(w.log.text(id).endsWith("x\nlocal\n"));
 	assert.equal(w.vault.text("p.md"), w.log.text(id));
 });
+
+test("transient read error: the new file is reported unread (not quiet); the retry pass imports it", async () => {
+	const w = new World();
+	await w.boot();
+	w.gateway.failReads.set("notes/n.md", 1);
+	w.vault.userWrite("notes/n.md", "new\n");
+	const first = await w.sync();
+	assert.equal(first.quiet, false, "an unread file keeps the reconciler from being quiet");
+	assert.equal(w.log.liveByPath("notes/n.md" as VaultPath), undefined);
+	const retry = await w.r.pass({ t: "full" });
+	assert.equal(retry.unread, 0);
+	await w.sync();
+	const id = w.log.liveByPath("notes/n.md" as VaultPath);
+	assert.ok(id, "imported after the read succeeded");
+	assert.equal(w.log.text(id), "new\n");
+});
+
+test("transient read error outside the pass scope still reports unread", async () => {
+	const w = new World();
+	await w.boot();
+	w.gateway.failReads.set("notes/x.md", 1);
+	w.vault.userWrite("notes/x.md", "x\n");
+	w.flushEvents();
+	const r = await w.r.pass({ t: "docs", docIds: [], pathKeys: [] });
+	assert.equal(r.unread, 1);
+});
