@@ -157,3 +157,53 @@ test("bound doc: disk edit merges into the CRDT, the disk file is never written"
 	assert.equal(w.log.text(id), "x\ny\n");
 	assert.equal(w.gateway.executed.filter((o) => o.t === "write").length, writes);
 });
+
+/**
+ * Bound doc, remote and external edits merge to M ≠ D: the file stays at D until the editor saves.
+ * Sim seeds 56 (view closed before its save), 28 and 21 (app crash before the save) left the
+ * disk at D for good because S already claimed the CRDT version.
+ */
+async function boundMergedAwaitingSave(): Promise<{ w: World; id: DocId }> {
+	const w = await booted();
+	const id = w.log.remoteCreate(P("b.md"), "a\nb\nc\n") as DocId;
+	await w.sync();
+	w.log.setBound(id, true);
+	w.log.remoteEdit(id, (t) => t.insert(0, "A"));
+	w.vault.userWrite("b.md", "a\nb\nc\nd\n");
+	const res = await w.sync();
+	assert.equal(w.log.text(id), "Aa\nb\nc\nd\n");
+	assert.equal(w.vault.text("b.md"), "a\nb\nc\nd\n", "bound: never written");
+	assert.deepEqual(res, { passes: 1, quiet: true }, "deferred to the editor: no chained passes");
+	assert.equal(w.synced(id)?.bodyVersion, null, "no CRDT sync point before the save");
+	return { w, id };
+}
+
+test("bound doc merged, then closed before the editor saved: the next pass writes the merge", async () => {
+	const { w, id } = await boundMergedAwaitingSave();
+	w.log.setBound(id, false);
+	await w.sync();
+	assert.equal(w.vault.text("b.md"), "Aa\nb\nc\nd\n");
+	assert.deepEqual(w.conflictCopies(), []);
+});
+
+test("bound doc merged, then the app crashed before the editor saved: reboot writes the merge", async () => {
+	const { w, id } = await boundMergedAwaitingSave();
+	await w.crashAndReboot();
+	w.log.setBound(id, false); // the new app has no editor open
+	await w.sync();
+	assert.equal(w.vault.text("b.md"), "Aa\nb\nc\nd\n");
+	assert.deepEqual(w.conflictCopies(), []);
+});
+
+test("bound doc merged, then the editor saved: S gets its sync point, closing writes nothing", async () => {
+	const { w, id } = await boundMergedAwaitingSave();
+	w.vault.userWrite("b.md", "Aa\nb\nc\nd\n"); // the editor's save
+	await w.sync();
+	assert.notEqual(w.synced(id)?.bodyVersion, null);
+	w.log.setBound(id, false);
+	const writes = w.gateway.executed.filter((o) => o.t === "write").length;
+	const res = await w.sync();
+	assert.equal(res.quiet, true);
+	assert.equal(w.gateway.executed.filter((o) => o.t === "write").length, writes);
+	assert.equal(w.vault.text("b.md"), "Aa\nb\nc\nd\n");
+});

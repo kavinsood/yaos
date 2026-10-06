@@ -82,9 +82,11 @@ async function resumeConflictCopy(env: Env, i: IntentRecord, docId: DocId, from:
 		}
 		const hash = markdownContentHash(diskText);
 		const base = makeBase(docId, diskText, hash);
+		// Bound and the disk lacks the CRDT text: no sync point until the editor's save (mergeJob.ts header).
+		const awaitingSave = h.bound && markdownContentHash(crdt) !== hash;
 		const s = ctx.record({
 			docId, path: from, pathKey: ctx.pk(from), kind: "markdown", contentHash: hash, fingerprint, size: stat.size, mtimeMs: stat.mtimeMs,
-			bodyVersion: version, blobRev: 0, nsTouchSeq: ctx.touchSeq(docId), hasBase: base !== null,
+			bodyVersion: awaitingSave ? null : version, blobRev: 0, nsTouchSeq: ctx.touchSeq(docId), hasBase: base !== null,
 		});
 		await ctx.commit(
 			{ syncedPut: [s], basePut: base ? [base] : [], baseDrop: base ? [] : [docId], intentDrop: [i.id] },

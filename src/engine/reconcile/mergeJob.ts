@@ -15,7 +15,11 @@
  *
  * Bound docs (open in an editor, §d.2): the replica is merged, the file is never
  * written; S records the disk side (hash(D), F, base D) and the editor's save
- * brings the file to the CRDT text.
+ * brings the file to the CRDT text. Until that save is seen (M ≠ D), S has no
+ * CRDT sync point (bodyVersion null): a crash, or a close before the save,
+ * then still leaves Rc true and the next unbound pass writes M. Recording the
+ * current version instead left the disk at D for good. Such a job is
+ * "deferred": the doc waits for the editor, like a planner wait.
  *
  * Canvas docs take the same steps in canvasJob.ts (record-per-line merge text,
  * record-level CRDT apply, logical-hash write skip).
@@ -149,12 +153,13 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		diskText = M;
 	}
 
-	// T_synced + T_intent_end.
+	// T_synced + T_intent_end. Bound with M ≠ D: no sync point until the editor's save (header).
+	const awaitingSave = h.bound && M !== D;
 	const hash = markdownContentHash(diskText);
 	const base = makeBase(docId, diskText, hash);
 	const entry = ctx.record({
 		docId, path: op.path, pathKey: ctx.pk(op.path), kind: "markdown", contentHash: hash, fingerprint, size: stat.size, mtimeMs: stat.mtimeMs,
-		bodyVersion, blobRev: 0, nsTouchSeq: ctx.touchSeq(docId), hasBase: base !== null,
+		bodyVersion: awaitingSave ? null : bodyVersion, blobRev: 0, nsTouchSeq: ctx.touchSeq(docId), hasBase: base !== null,
 	});
 	const le = { ...ctx.localEntry(op.path, stat, "markdown", hash, fingerprint), bound: prevL?.bound ?? false };
 	local.push(le);
@@ -162,7 +167,7 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		{ syncedPut: [entry], basePut: base ? [base] : [], baseDrop: base ? [] : [docId], intentDrop: intent ? [intent.id] : [] },
 		local,
 	);
-	return "ok";
+	return awaitingSave ? "deferred" : "ok";
 }
 
 /**

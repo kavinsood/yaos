@@ -17,7 +17,8 @@ import type { Ctx } from "./context";
 import type { Scanner } from "./scan";
 import { makeBase } from "./store";
 
-export type JobOutcome = "ok" | "fail" | "held";
+/** "deferred": the job ran, the doc now waits outside the engine (a bound editor's save); counted like a wait. */
+export type JobOutcome = "ok" | "fail" | "held" | "deferred";
 
 export interface Env {
 	readonly ctx: Ctx;

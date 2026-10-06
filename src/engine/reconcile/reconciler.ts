@@ -174,7 +174,7 @@ export class Reconciler {
 			ctx.deps.onBrake?.(report);
 			brake ??= report;
 		}
-		const actionable = plan.ops.filter((o) => o.op !== "wait" && o.op !== "needHash").length;
+		const actionable = plan.ops.filter((o) => o.op !== "wait" && o.op !== "needHash").length - run.deferred;
 		// Out-of-scope read failures count too: nothing else would re-plan them before the periodic full pass.
 		const unread = Math.max(this.scan.lastUnread, plan.ops.filter((o) => o.op === "needHash").length);
 		return { ...run, planned: plan.ops.length, actionable, unread, brake, openIntents };

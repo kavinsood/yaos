@@ -12,6 +12,7 @@
  *     device's in-flight one);
  *   - disk / content / bookkeeping ops run one by one (per-op gateway exec);
  *   - when an op of a doc fails (or is held) the doc's later ops are skipped;
+ *   - a "deferred" job (bound doc awaiting the editor's save) counts as a wait;
  *   - after the run, folders emptied by renames / trashes are removed, deepest first.
  * Unknown exceptions propagate (a crash is a crash; intents + T_synced make it safe).
  */
@@ -29,6 +30,8 @@ export interface RunReport {
 	readonly ok: number;
 	readonly failed: number;
 	readonly held: number;
+	/** Jobs that ran but leave their doc waiting (not actionable until something outside changes). */
+	readonly deferred: number;
 	readonly skipped: number;
 	readonly waits: number;
 	readonly needHash: number;
@@ -78,11 +81,15 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 	const skip = new Set<DocId>(ctx.intentDocs());
 	const failedDocs = new Set<DocId>();
 	const vacated: VaultPath[] = [];
-	let ok = 0, failed = 0, held = 0, skipped = 0, waits = 0, needHash = 0, nsSubmitted = 0;
+	let ok = 0, failed = 0, held = 0, deferred = 0, skipped = 0, waits = 0, needHash = 0, nsSubmitted = 0;
 	const blocked = (op: PlannerOp): boolean => docsOf(op).some((d) => skip.has(d));
 	const note = (op: PlannerOp, res: JobOutcome): void => {
 		if (res === "ok") {
 			ok++;
+			return;
+		}
+		if (res === "deferred") {
+			deferred++;
 			return;
 		}
 		if (res === "held") held++;
@@ -150,7 +157,7 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 	}
 	env.deferred.clear();
 	await removeEmptied(env, vacated);
-	return { ok, failed, held, skipped, waits, needHash, nsSubmitted, failedDocs };
+	return { ok, failed, held, deferred, skipped, waits, needHash, nsSubmitted, failedDocs };
 }
 
 /** S for a markdown / canvas doc about to be created: the empty body, stat of the local file. */
