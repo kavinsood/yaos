@@ -141,6 +141,7 @@ export class VaultRuntime {
 			onNsFold: (frames, reloaded) => holder.rt?.onNsFold(frames, reloaded),
 			onCfgFold: () => holder.rt?.requestCfg(),
 			onBodyChange: (docIds) => holder.rt?.onBodyChange(docIds),
+			onOwnBodySettled: (docIds) => holder.rt?.onOwnBodySettled(docIds),
 			onStatus: (s) => holder.rt?.onLogStatus(s),
 		});
 		const rt = new VaultRuntime(o, log);
@@ -266,6 +267,24 @@ export class VaultRuntime {
 		}
 		this.stats.bodyChanges += docIds.length;
 		this.sched.request({ t: "docs", docIds: [...docIds], pathKeys });
+	}
+
+	/**
+	 * Own edits of unbound docs are all sequenced: a local delete waiting on them ("pending-body") can
+	 * go out now with a base that covers them. Bound docs are skipped (typing settles every frame).
+	 */
+	onOwnBodySettled(docIds: readonly DocId[]): void {
+		if (this.stopped) return;
+		const ids = docIds.filter((d) => !this.engine.bound.isBound(d));
+		if (ids.length === 0) return;
+		this.port.invalidate();
+		const ns = this.log.c.ns.state.entries;
+		const pathKeys: PathKey[] = [];
+		for (const d of ids) {
+			const e = ns.get(d);
+			if (e) pathKeys.push(e.pathKey);
+		}
+		this.sched.request({ t: "docs", docIds: ids, pathKeys });
 	}
 
 	onFrozen(docId: DocId, reason: string): void {

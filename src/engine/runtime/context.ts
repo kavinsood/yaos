@@ -168,7 +168,10 @@ export class EngineCtx {
 
 	/** Mirror committed outbox transitions into the cache, the sender and the adopt map. */
 	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly updated: readonly OutboxRecord[] }): void {
+		const drained = new Set<StreamName>();
 		for (const r of res.removed) {
+			const cls = streamClass(r.stream);
+			if (cls === "body" || cls === "canvas") drained.add(r.stream);
 			// ns/cfg records leave the outbox only on (late) receipt: keep them in the overlay until folded.
 			if (r.stream === NS_STREAM) this.ns.noteCommitted(r);
 			else if (r.stream === CFG_STREAM) this.cfg.noteCommitted(r);
@@ -187,6 +190,12 @@ export class EngineCtx {
 			this.mirror.schedule();
 			this.scheduleStatus();
 		}
+		const settled: DocId[] = [];
+		for (const s of drained) {
+			const d = streamDocId(s);
+			if (d && this.outbox.ofStream(s).length === 0) settled.push(d);
+		}
+		if (settled.length > 0) this.emit("onOwnBodySettled", () => this.opts.onOwnBodySettled?.(settled));
 	}
 
 	/** New own records (T_edit / T_adopt). */

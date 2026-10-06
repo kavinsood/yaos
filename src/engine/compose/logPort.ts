@@ -59,7 +59,9 @@ export class ComposedLog implements LogPort {
 			const rec = c.repo.stream(body.stream);
 			if (rec) appliedSeq.set(e.docId, Math.max(rec.appliedSeq, rec.lastOwnSeq));
 			// Primary restore duty (§c.7): this device authored body rows the deleter had not seen.
-			if (e.state === "deleted" && rec && rec.lastOwnSeq > e.deleteBaseBodySeq) restoreDuty.add(e.docId);
+			// Fallback duty, here without the 30 s grace (integration-notes deviation): rows exist
+			// past the delete base, so some edit was not seen by the deleter whoever authored it.
+			if (e.state === "deleted" && rec && (rec.lastOwnSeq > e.deleteBaseBodySeq || rec.remoteHeadSeq > e.deleteBaseBodySeq)) restoreDuty.add(e.docId);
 			if (body.caughtUp && e.state === "live") {
 				const h = this.residentHash(e.docId, e.kind as "markdown" | "canvas", body.stream, body.version);
 				if (h) textHash.set(e.docId, h);

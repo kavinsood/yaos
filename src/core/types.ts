@@ -473,7 +473,7 @@ export type PlannerOp =
 	| { readonly op: "syncedPut"; readonly entry: SyncedEntry }
 	| { readonly op: "syncedDrop"; readonly docId: DocId }
 	| { readonly op: "needHash"; readonly path: VaultPath }
-	| { readonly op: "wait"; readonly docId: DocId; readonly reason: "body-not-caught-up" | "body-empty" | "blob-unavailable" | "frozen" | "pending-ns" };
+	| { readonly op: "wait"; readonly docId: DocId; readonly reason: "body-not-caught-up" | "body-empty" | "blob-unavailable" | "frozen" | "pending-ns" | "pending-body" };
 
 /** Precondition the host checks before a destructive disk op. */
 export type DiskExpect =

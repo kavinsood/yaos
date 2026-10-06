@@ -378,6 +378,9 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		const Rc = s.kind === "blob" ? (r.blob?.rev ?? 0) !== s.blobRev : !versionEq(r.body!.version, s.bodyVersion);
 		if (Rc) return push([...prefix, { op: "diskMaterialize", docId, path: r.path, expect: { t: "absent" } }]); // edit beats delete
 		if (r.pendingLocal) return push([...prefix, waitOp(docId, "pending-ns")]);
+		// Own body frames still unsequenced: a delete now would carry a base below them and hand
+		// this device a restore duty for its own edits (§c.7). Delete once they are acked.
+		if (input.docsWithPendingBody.has(docId)) return push([...prefix, waitOp(docId, "pending-body")]);
 		push([...prefix, { op: "nsDelete", docId, baseBodySeq: baseBodySeq(r) }, drop(docId)], "nsDelete", brakeKey("nsDelete", docId, s.path, s.contentHash), s.path);
 	};
 
@@ -524,6 +527,13 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		if (input.synced.has(id) || handled.has(id)) continue;
 		const r = input.remote.get(id);
 		if (r && r.state === "live") planRemoteOnly(r);
+		// Deleted with no synced record here (e.g. this device is the deleter, or its store was
+		// rebuilt) but body rows the delete did not cover: restore (§c.7); the live entry then
+		// materializes on the next pass.
+		else if (r && r.state === "deleted" && ctx.nsReady && !r.pendingLocal && hasRestoreDuty(id)) {
+			claimed.add(r.pathKey); // a local file there is this doc's: merge it after the restore, never nsCreate it
+			push([{ op: "nsRestore", docId: id, path: r.path, againstDeleteSeq: r.deletedSeq }]);
+		}
 	}
 	for (const l of freshLocal) planNewLocal(l);
 

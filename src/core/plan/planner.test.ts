@@ -161,6 +161,9 @@ test("row live/present/absent: remote edited -> diskMaterialize (edit beats dele
 	// precondition op with a pending own ns op -> wait
 	const pend = run({ remote: [R("d1", "a.md", { pendingLocal: true })], synced: [S("d1", "a.md")] });
 	assert.deepEqual(pend.ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }]);
+	// own body frames still in the outbox -> wait, so the delete base covers them (§c.7)
+	const body = run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], over: { docsWithPendingBody: new Set([id("d1")]) } });
+	assert.deepEqual(body.ops, [{ op: "wait", docId: "d1", reason: "pending-body" }]);
 	// needs localComplete
 	assert.deepEqual(run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], over: { localComplete: false } }).ops, []);
 	// an unhashed new local file might be the renamed doc: no delete yet
@@ -189,6 +192,20 @@ test("row deleted/present/present unchanged -> diskTrash(expect S hash) + synced
 	assert.deepEqual(opsOf(duty2), ["nsRestore"]);
 	const pend = run({ ...sc, remote: [R("d1", "a.md", { state: "deleted", deletedSeq: 41, pendingLocal: true })], over: { docsWithPendingBody: new Set([id("d1")]) } });
 	assert.deepEqual(pend.ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }]);
+});
+
+test("row deleted/absent/*: restore duty without a synced record -> nsRestore (claims the path); else nothing", () => {
+	const del = R("d1", "a.md", { state: "deleted", deletedSeq: 41 });
+	assert.deepEqual(run({ remote: [del] }).ops, []);
+	const duty = planWith(input({ remote: [del] }), { restoreDuty: new Set([id("d1")]) });
+	assert.deepEqual(duty.ops, [{ op: "nsRestore", docId: "d1", path: "a.md", againstDeleteSeq: 41 }]);
+	assert.deepEqual(run({ remote: [del], over: { docsWithPendingBody: new Set([id("d1")]) } }).ops, [{ op: "nsRestore", docId: "d1", path: "a.md", againstDeleteSeq: 41 }]);
+	// a stray local file at the path is not nsCreated next to the restore: it merges once live
+	const stray = planWith(input({ remote: [del], local: [L("a.md", h("c9"))] }), { restoreDuty: new Set([id("d1")]) });
+	assert.deepEqual(opsOf(stray), ["nsRestore"]);
+	// pending own ns op or ns not ready -> nothing
+	assert.deepEqual(planWith(input({ remote: [{ ...del, pendingLocal: true }] }), { restoreDuty: new Set([id("d1")]) }).ops, []);
+	assert.deepEqual(planWith(input({ remote: [del] }), { restoreDuty: new Set([id("d1")]), nsReady: false }).ops, []);
 });
 
 test("row deleted/present/present changed -> nsRestore + content", () => {

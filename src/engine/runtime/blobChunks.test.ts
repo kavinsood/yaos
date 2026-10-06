@@ -151,6 +151,27 @@ test("onBodyChange: fires on the peer for remote body rows, not for own edits", 
 	}
 });
 
+test("onOwnBodySettled: fires once the doc's last own body record is receipted, not while frames remain", async () => {
+	const relay = new SimRelay();
+	const settled: DocId[][] = [];
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", extra: { onOwnBodySettled: (ids) => settled.push([...ids]) } });
+	try {
+		const d = await a.createDoc("n.md" as VaultPath, "first");
+		await until(() => a.isIdle() && a.c.outbox.size === 0, 2_000, "create receipted");
+		assert.ok(settled.some((ids) => ids.includes(d)), "the create's body frame settled");
+		settled.length = 0;
+		const h = (await a.openBody(d, "markdown"))!;
+		h.doc.transact(() => h.doc.getText("text").insert(0, "x"), h.mergeOrigin);
+		await h.commitEdits();
+		h.release();
+		await until(() => a.isIdle() && a.c.outbox.size === 0, 2_000, "edit receipted");
+		assert.deepEqual(settled.flat(), [d]);
+		assert.equal(a.docsWithPendingBody().has(d), false);
+	} finally {
+		await a.stop();
+	}
+});
+
 /** Sim seed 179: after an IDB wipe the author re-reads its doc; every row is its own, and the disk side waited on caughtUp. */
 test("onBodyChange: a completed catch-up read fires even when every row is own (author with a fresh DB)", async () => {
 	const relay = new SimRelay();

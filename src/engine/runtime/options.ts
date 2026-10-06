@@ -105,6 +105,8 @@ export interface EngineOptions {
 	 * still fires for bound docs.
 	 */
 	onBodyChange?(docIds: readonly DocId[]): void;
+	/** The last own body / canvas record of these docs left the outbox (receipt): own edits are all sequenced. */
+	onOwnBodySettled?(docIds: readonly DocId[]): void;
 	onStatus?(status: StatusSnapshot): void;
 	onDiag?(event: DiagnosticsEvent): void;
 }
