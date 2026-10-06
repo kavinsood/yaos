@@ -1,0 +1,31 @@
+src/engine/settings/allowlist.ts
+  s_27aea4557efbc1::t_afd23455ba82cc 114-124,126,128,130,132
+src/engine/settings/cfgHolds.test.ts
+  s_27aea4557efbc1::t_ce12a6d7652ed3 185-212
+src/engine/settings/cfgNotices.ts
+  s_27aea4557efbc1::t_3be3705c9fd818 7,127
+src/engine/settings/cfgPlan.ts
+  s_27aea4557efbc1::t_055c7d31aa8198 17-22,37,47-48,57-60,82-83,85,140-141,143,161-162,227,241,265-268,300
+src/engine/settings/cfgSeed.test.ts
+  s_27aea4557efbc1::t_872a489a098d48 1-68
+src/engine/settings/cfgSync.ts
+  s_27aea4557efbc1::t_7794a1d6e9d325 52-58,89,123,132,157-158
+src/engine/settings/testkit.ts
+  s_27aea4557efbc1::t_55e258d02443ff 94-96,108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "13068c6a39f11d59dc7e1eeae292bade10118885",
+  "prompts": {},
+  "sessions": {
+    "s_27aea4557efbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2f141519dac0ecc1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
