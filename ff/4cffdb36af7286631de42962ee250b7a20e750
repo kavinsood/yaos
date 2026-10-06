@@ -1,0 +1,45 @@
+src/engine/body/frames.ts
+  s_8bc9bf3abe4a95::t_a4f57b2763d2fc 15,126-131
+src/engine/runtime/blobChunks.test.ts
+  s_8bc9bf3abe4a95::t_d635fca3eb469a 1-152
+src/engine/runtime/blobChunks.ts
+  s_8bc9bf3abe4a95::t_ba8d72497e57ac 1-122
+src/engine/runtime/context.ts
+  s_8bc9bf3abe4a95::t_0ef4b3343a4231 9,254-264
+src/engine/runtime/docRuntime.ts
+  s_8bc9bf3abe4a95::t_d45d79beefa26e 249,260,265
+src/engine/runtime/engine.ts
+  s_8bc9bf3abe4a95::t_80a775acf651cd 14,16,19,24-25,34,72-104,274-283
+src/engine/runtime/liveIngest.ts
+  s_8bc9bf3abe4a95::t_94575037f63876 192
+src/engine/runtime/options.ts
+  s_8bc9bf3abe4a95::t_200aab7198c385 43-44,66,100-107
+src/engine/runtime/sessionLoop.ts
+  s_8bc9bf3abe4a95::t_3c6a15fa6f1783 277
+src/engine/runtime/testHarness.ts
+  s_ed451e485d98d2::t_665833dbf604d5 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ff4cffdb36af7286631de42962ee250b7a20e750",
+  "prompts": {},
+  "sessions": {
+    "s_8bc9bf3abe4a95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac019149b1d227e41",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
