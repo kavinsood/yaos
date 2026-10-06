@@ -1,5 +1,5 @@
 /**
- * Engine-side hashing for the host (DESIGN §d.4: the main thread never hashes).
+ * Engine-side hashing for the host (DESIGN §d.2: the main thread never hashes).
  *
  *  - hashRequest: the host reads raw bytes (write preconditions, config writes) and transfers them
  *    here; per item the engine answers the hash asked for and `textLength`, the UTF-16 length of the

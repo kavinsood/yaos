@@ -133,7 +133,7 @@ export type BodyEvent =
 	| { readonly t: "durable"; readonly version: number }
 	| { readonly t: "reloaded"; readonly viewId: number; readonly reload: number; readonly save: boolean };
 
-/** A hash the host asks the engine for (main never hashes, DESIGN §d.4). */
+/** A hash the host asks the engine for (main never hashes, DESIGN §d.2). */
 export type HashWant = "fingerprint" | "contentHash";
 
 /**

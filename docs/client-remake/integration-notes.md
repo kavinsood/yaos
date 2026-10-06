@@ -786,6 +786,15 @@ runs the bundle's own source (D2). Lazy module init (esbuild `__esm` wrappers,
 so the worker never evaluates host modules) costs about 10.5 KiB raw / 5 KiB
 gzip.
 
+Main-thread rework (branch `client-remake-mainthread`): `main.js` is 616.3 KiB
+raw / 203 KiB gzip (631,137 / 207,910 B). `y-codemirror.next` is no longer in
+the bundle. yjs and lib0 stay, because the worker runs the same bundle (D2) and
+the inline fallback runs the engine on main; check-deps keeps them out of every
+`host/**` module. By area (KiB, same method as the table below): `src/engine`
+262.7, `src/core` 114.5, `src/host/ui` 65.1, yjs 58.9, `src/host` 51.2, qrcode
+22.8, lib0 20.4, fflate 13.2, `src/protocol` 5.1. The table below is the
+a4e95fb snapshot.
+
 Breakdown of `main.js` by esbuild metafile `bytesInOutput` (minified,
 es2018). `--analyze` prints it per file.
 

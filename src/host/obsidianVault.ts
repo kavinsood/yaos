@@ -1,6 +1,6 @@
 /**
  * VaultPort over Obsidian's Vault (DESIGN §f, §h).
- *  - write: CAS without hashing on main (DESIGN §d.4). "absent" goes through vault.create (throws if
+ *  - write: CAS without hashing on main (DESIGN §d.2, §f.2). "absent" goes through vault.create (throws if
  *    it exists: atomic). fingerprint/hash: read the raw bytes, the engine hashes them (HashOracle),
  *    compare, then write behind O(1) guards; see "Precondition window" below.
  *  - rename: vault.rename only (never fileManager.renameFile: no link rewrites).
@@ -22,7 +22,7 @@
  *    TFile.stat when we recheck: Obsidian's watcher has not delivered it yet, it kept size and mtime
  *    (same-millisecond, coarse-mtime filesystems), or it lands between the recheck and the process
  *    read (text) / the modifyBinary (binary). The old main-thread guard compared the full text inside
- *    process and closed the text part of this gap at O(N) main-thread cost; DESIGN §d.4 forbids that.
+ *    process and closed the text part of this gap at O(N) main-thread cost; DESIGN §d.2 forbids that.
  *    The engine fingerprints what it wrote and re-reads the disk on the next modify event, so a lost
  *    external edit of this kind is still the narrow race of any non-atomic writer, not a silent loop.
  *  - Spurious failures (safe direction): if Obsidian's decode ever disagreed with the engine's

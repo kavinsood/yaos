@@ -28,7 +28,7 @@ export interface DiskExecutorDeps {
 	readonly vault: VaultPort;
 	readonly configDir: ConfigDirPort;
 	readonly clock: ClockPort;
-	/** Config-area fingerprint/hash preconditions: the engine hashes (main never does, DESIGN §d.4). */
+	/** Config-area fingerprint/hash preconditions: the engine hashes (main never does, DESIGN §d.2, §f.2). */
 	readonly hashes: HashOracle;
 	/** Live check: is this vault path currently bound to an editor view. */
 	readonly isBoundPath: (path: string) => boolean;

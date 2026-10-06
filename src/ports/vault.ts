@@ -8,7 +8,7 @@
  *    "absent" is atomic (Obsidian: vault.create throws if the file exists).
  *    fingerprint/hash preconditions are evaluated without hashing on the main
  *    thread: the implementation reads the raw bytes and asks the engine for
- *    their hash (host/hashOracle.ts, DESIGN §d.4), then writes behind O(1)
+ *    their hash (host/hashOracle.ts, DESIGN §f.2), then writes behind O(1)
  *    guards (stat unchanged; for text, decoded length unchanged). See
  *    host/obsidianVault.ts for the exact TOCTOU window.
  *  - Events are hints. The engine never deletes or overwrites based on an

@@ -15,7 +15,7 @@ import type { DiskOp, DiskOpResult, DiskReadRequest, DiskReadResult, Lane } from
 
 /**
  * A successful write as the engine sees it: `fingerprint` = sha256 of the exact bytes the engine asked
- * to write, computed engine-side before the op was posted (main never hashes, DESIGN §d.4).
+ * to write, computed engine-side before the op was posted (main never hashes, DESIGN §d.2).
  */
 export type WrittenOk = Extract<WriteOutcome, { readonly ok: true }> & { readonly fingerprint: DiskFingerprint };
 

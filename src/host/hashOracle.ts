@@ -1,5 +1,5 @@
 /**
- * HashOracle: how main gets a hash without hashing (DESIGN §d.4: the main thread is for CodeMirror and
+ * HashOracle: how main gets a hash without hashing (DESIGN §d.2: the main thread is for CodeMirror and
  * raw disk I/O; hashing lives in the engine worker).
  *
  * Main reads raw bytes (write preconditions, config writes) and transfers them to the engine in a

@@ -260,7 +260,7 @@ test("diskExecutor over ObsidianVault: precondition races (i) stat-visible, (ii)
 	fake.beforeProcess = (p) => { fake.files.get(p)!.bytes = utf8("BASE and more"); };
 	assert.equal(reason((await exec.run(3, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("BASE") })]))[0]), "precondition");
 	assert.equal(fake.text("a.md"), "BASE and more");
-	// (iii) accepted gap (ObsidianVault header, DESIGN §d.4): same length, not in stat -> overwritten.
+	// (iii) accepted gap (ObsidianVault header, DESIGN §f.2): same length, not in stat -> overwritten.
 	fake.put("a.md", "base");
 	fake.beforeProcess = (p) => { fake.files.get(p)!.bytes = utf8("BASE"); };
 	assert.equal(reason((await exec.run(3, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("base") })]))[0]), "ok");

@@ -114,7 +114,7 @@ test("race (ii): a length-changing change after the stat recheck is caught by th
 });
 
 test("race (iii), the accepted gap: a same-length change not visible in stat is overwritten", async () => {
-	// DESIGN §d.4 trade-off (obsidianVault.ts header): main never compares full contents, so an external
+	// DESIGN §f.2 trade-off (obsidianVault.ts header): main never compares full contents, so an external
 	// edit that keeps the UTF-16 length and is not yet in TFile.stat when we recheck is lost. Text: it
 	// lands between the recheck and process's read; binary: anywhere after the read before modifyBinary.
 	const { fake, vault } = setup();
