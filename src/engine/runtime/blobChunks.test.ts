@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { sha256Hex } from "../../core/hash/sha256";
 import { blobChunkStream, bodyStream, type ContentHash, type DeviceId, type DocId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
+import type { BlobAddress } from "../../ports/crypto";
+import { SeededRandom } from "../../sim/random";
 import { SimRelay } from "../../sim/relay";
 import { MemStoragePort } from "../../sim/storage";
+import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
 import { assembleChunks, splitChunks } from "../blobs/chunks";
 import { Repo } from "../store/repo";
 import { LogEngine } from "./engine";
@@ -119,6 +122,63 @@ test("blob chunks: session drop -> false; offline -> false / null; after reconne
 		assert.equal(relay.rows(xs).length, 2);
 	} finally {
 		await a.stop();
+	}
+});
+
+const VAULT1 = "AAAAAAAAAAAAAAAAAAAAAA";
+
+/** A suite-1 engine (shared K_1, verified); a distinct seed per device, so nonces never repeat across devices. */
+async function suite1Engine(relay: SimRelay, deviceId: string, seed: number): Promise<LogEngine> {
+	const crypto = await createWebCryptoSuite1({ vaultId: VAULT1, random: new SeededRandom(seed), keys: [{ e: 1, k: Uint8Array.from({ length: 32 }, (_, i) => i) }] });
+	crypto.markVerified(1);
+	crypto.setSealEpoch(1);
+	return (await startTestEngine({ relay, deviceId, vaultId: VAULT1, crypto })).engine;
+}
+
+test("blob chunks, suite 1: x:<HMAC address> (never the hash); two devices append the same blob concurrently: different ciphertexts at one address, a third device opens either", async () => {
+	const relay = new SimRelay();
+	const a = await suite1Engine(relay, "dev-a", 41);
+	const b = await suite1Engine(relay, "dev-b", 42);
+	let c: LogEngine | null = null;
+	try {
+		const { hash, bytes } = blob(2_500, 8);
+		const chunks = splitChunks(hash, bytes, 1_000);
+		const xs = await xsOf(a, hash);
+		assert.equal(xs, await xsOf(b, hash), "one address for every key holder");
+		assert.notEqual(xs, blobChunkStream(hash as unknown as BlobAddress), "not x:<sha256>");
+		assert.ok(!xs.includes(hash));
+		// Both read the committed rows (none yet), so both author: the relay holds each chunk twice.
+		relay.pauseCommits();
+		const pa = a.appendBlobChunks(hash, chunks);
+		const pb = b.appendBlobChunks(hash, chunks);
+		await until(() => a.c.outbox.ofStream(xs).length === 3 && b.c.outbox.ofStream(xs).length === 3, 3_000, "both authored");
+		relay.resumeCommits();
+		assert.deepEqual(await Promise.all([pa, pb]), [true, true]);
+		const rows = relay.rows(xs);
+		assert.equal(rows.length, 6);
+		assert.ok(relay.streams().every((st) => !st.includes(hash)), "no stream name carries the hash");
+		const hex = (u: Uint8Array) => Buffer.from(u).toString("hex");
+		assert.ok(rows.every((r) => !hex(r.payload).includes(hash)), "nor any payload (the sha256 inside is sealed)");
+		const byDev = new Map<string, string[]>();
+		for (const r of rows) byDev.set(r.deviceId, [...(byDev.get(r.deviceId) ?? []), hex(r.payload)]);
+		assert.equal(byDev.size, 2);
+		const [fromA, fromB] = [...byDev.values()];
+		assert.ok(fromA!.every((p) => !fromB!.includes(p)), "same chunks, different ciphertexts");
+
+		// A fresh device reads x:<address> from the relay: every row (both authors) opens and carries its chunk.
+		c = await suite1Engine(relay, "dev-c", 43);
+		await until(async () => (await c!.c.repo.getTail(xs, 0)).length === 6, 3_000, "c ingested the x: rows");
+		const got = (await c.readBlobChunks(hash))!;
+		assert.equal(got.length, 6);
+		for (const ch of got) assert.deepEqual(ch, chunks[ch.index]);
+		const asm = assembleChunks(hash, got);
+		assert.ok(asm.ok);
+		assert.deepEqual(asm.bytes, bytes);
+		// Dedupe on the log path: everything committed, no new rows from anyone.
+		assert.equal(await c.appendBlobChunks(hash, chunks), true);
+		assert.equal(relay.rows(xs).length, 6);
+	} finally {
+		await stopAll(a, b, ...(c ? [c] : []));
 	}
 });
 
