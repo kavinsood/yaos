@@ -27,6 +27,7 @@ installSpikeWorker(
 	{
 		getIndexedDB: readIndexedDB,
 		subtle: tryGet(() => (typeof crypto !== "undefined" && crypto.subtle ? crypto.subtle : undefined)),
+		getRandomValues: tryGet(() => (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function" ? (a: Uint8Array) => crypto.getRandomValues(a) : undefined)),
 		typeofWebSocket: typeof WebSocket,
 		typeofStructuredClone: typeof structuredClone,
 		typeofFetch: typeof fetch,

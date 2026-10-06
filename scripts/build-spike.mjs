@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Builds the throwaway YAOS day-1 spike plugin (OR-1 worker/IDB, OR-2 setViewData).
+// Builds the throwaway YAOS day-1 spike plugin (OR-1 worker/IDB, OR-2 setViewData,
+// E2EE WebCrypto-in-worker probes for docs/client-remake/e2ee-design.md).
 //   pass 1: src/host/spike/spikeWorker.ts -> IIFE string (browser, es2018, minified, not written)
 //   pass 2: src/host/spike/main.ts -> CJS main.js with the worker source injected via
 //           define __YAOS_SPIKE_WORKER_SRC__ (no virtual module)
@@ -7,12 +8,13 @@
 // dist/yaos-client/spike/yaos-spike/ folder, and yaos-spike.zip (top-level yaos-spike/).
 // Then smoke-checks the bundle in node: main.js loads as CJS against a stub
 // "obsidian" module and registers its commands; the worker IIFE boots and answers
-// ping/probe inside a node:vm context.
-// Usage: node scripts/build-spike.mjs
+// ping/probe/crypto inside a node:vm context.
+// Usage: node scripts/build-spike.mjs [--out <path/to/yaos-spike.zip>]
+//   --out copies the checked zip there after every smoke check passed.
 import esbuild from "esbuild";
 import { zipSync, unzipSync, strFromU8 } from "fflate";
-import { mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { webcrypto } from "node:crypto";
@@ -20,14 +22,20 @@ import { webcrypto } from "node:crypto";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const OUT = join(ROOT, "dist", "yaos-client", "spike");
 const PLUGIN_ID = "yaos-spike";
+const outIdx = process.argv.indexOf("--out");
+const COPY_TO = outIdx > 0 ? process.argv[outIdx + 1] : undefined;
+if (outIdx > 0 && (!COPY_TO || !COPY_TO.endsWith(".zip"))) {
+	console.error("build-spike: --out needs a path ending in .zip");
+	process.exit(1);
+}
 
 const manifest = {
 	id: PLUGIN_ID,
 	name: "YAOS Spike",
-	version: "0.0.1",
+	version: "0.0.2",
 	minAppVersion: "1.5.0",
 	description:
-		"Throwaway YAOS day-1 spike: probes Blob-URL worker + IndexedDB (OR-1) and MarkdownView reload / setViewData interception (OR-2). Use in a test vault only.",
+		"Throwaway YAOS day-1 spike: probes Blob-URL worker + IndexedDB (OR-1), MarkdownView reload / setViewData interception (OR-2) and WebCrypto in the worker for E2EE (AES-GCM, HKDF, HMAC, non-extractable keys in IndexedDB, throughput). Use in a test vault only.",
 	author: "YAOS",
 	isDesktopOnly: false,
 };
@@ -181,7 +189,7 @@ if (!mainJs.includes("yaos-spike-probe")) fail("main.js missing the view probe")
 	if (!(plugin instanceof Plugin)) fail("default export does not extend Plugin");
 	plugin.onload();
 	const ids = plugin.commands.map((c) => c.id).sort();
-	const wantIds = ["run-or1", "run-or2", "run-probes", "show-last-report"];
+	const wantIds = ["run-e2ee", "run-or1", "run-or2", "run-probes", "show-last-report"];
 	if (JSON.stringify(ids) !== JSON.stringify(wantIds)) fail(`commands ${JSON.stringify(ids)}`);
 	if (plugin.ribbons.length !== 1) fail("expected one ribbon icon");
 }
@@ -235,6 +243,16 @@ if (!mainJs.includes("yaos-spike-probe")) fail("main.js missing the view probe")
 		if (r.typeofIndexedDB !== "undefined" || r.idb.ok !== false) fail(`vm worker idb ${JSON.stringify(r.idb)}`);
 		const want = webcrypto.subtle ? Buffer.from(await webcrypto.subtle.digest("SHA-256", new TextEncoder().encode("yaos"))).toString("hex") : null;
 		if (r.cryptoSubtle.digest.value !== want) fail(`vm worker digest ${JSON.stringify(r.cryptoSubtle)}`);
+		// E2EE crypto probe: every WebCrypto check passes in the vm worker; IDB is absent there, so idbKey is skipped.
+		send({ type: "crypto", id: 3, opts: { sizes: [1024, 65536], benchMs: 5, benchMaxIters: 10 } });
+		const cr = (await waitFor((m) => m.type === "cryptoResult" && m.id === 3, 15000)).report;
+		for (const step of ["random", "importNonExtractable", "hkdf", "hmac", "aesGcm"]) {
+			if (cr[step].ok !== true) fail(`vm worker crypto ${step} ${JSON.stringify(cr[step])}`);
+		}
+		if (cr.hkdf.value.rfc5869A1 !== true || cr.hmac.value.rfc4231Tc2 !== true || cr.aesGcm.value.gcmTc16Encrypt !== true) fail("vm worker crypto KAT");
+		if (cr.aesGcm.value.tamperTag !== "OperationError" || cr.aesGcm.value.wrongAad !== "OperationError") fail(`vm worker crypto tamper ${JSON.stringify(cr.aesGcm.value)}`);
+		if (cr.idbKey.skipped !== true) fail(`vm worker crypto idbKey ${JSON.stringify(cr.idbKey)}`);
+		if (!cr.bench.ok || cr.bench.rows.length !== 2) fail(`vm worker crypto bench ${JSON.stringify(cr.bench)}`);
 	} catch (e) {
 		fail(e instanceof Error ? e.message : String(e));
 	}
@@ -244,3 +262,7 @@ const kib = (n) => `${(n / 1024).toFixed(1)} KiB`;
 console.log(`build-spike: OK  main.js ${kib(mainBytes.length)} (worker ${kib(workerSrc.length)})  zip ${kib(zip.length)}`);
 console.log(`build-spike: ${zipPath}`);
 console.log(`build-spike: ${join(OUT, PLUGIN_ID)}/ (copy this folder into <vault>/.obsidian/plugins/)`);
+if (COPY_TO) {
+	copyFileSync(zipPath, resolve(COPY_TO));
+	console.log(`build-spike: copied zip to ${resolve(COPY_TO)}`);
+}
