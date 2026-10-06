@@ -2,8 +2,8 @@
 // (docs/client-remake/relay-wire.md). Streams are always on (DECISIONS §2.1).
 // Depends only on ../ports; never imports a CRDT engine: payloads are opaque bytes.
 //
-// Write path: a binary APPEND is admitted (authority, raw rate gate, write
-// capability, daily limit), broadcast at once as PROVISIONAL when its stream is
+// Write path: a binary APPEND is admitted (authority, per-device raw rate gate,
+// write capability, daily limit), broadcast at once as PROVISIONAL when its stream is
 // b:/c:, and buffered. The vault-wide buffer commits in one transaction on
 // idle / max age / bytes (StreamStore.commit assigns contiguous seqs in arrival
 // order). After the commit: COMMITTED frames (or COMMIT_NOTICEs for sockets that
@@ -23,6 +23,7 @@ import {
 	MAX_STREAM_NAME_BYTES,
 	MAX_STREAM_PAYLOAD_BYTES,
 	MAX_STREAM_SOCKETS,
+	MAX_STREAM_SOCKETS_PER_DEVICE,
 	MAX_STREAM_TEXT_MESSAGE_BYTES,
 	STREAM_FEED_DEFAULT_LIMIT,
 	STREAM_FEED_MAX_LIMIT,
@@ -49,9 +50,9 @@ export interface StreamRelayConfig {
 	gcMaxMs: number;
 	/** ...or once the buffer holds this many payload bytes. */
 	gcMaxBytes: number;
-	/** Idle commits wait at least this long after the previous commit (0 = off). */
+	/** Idle commits wait at least this long after the previous commit (H8; 0 = off). */
 	gcMinIntervalMs: number;
-	/** Per-socket raw admission token bucket (every received message, before parsing). */
+	/** H6: per-device raw admission token bucket, shared by the device's sockets (every received message, before parsing). */
 	rateBytesPerSec: number;
 	burstBytes: number;
 	maxSockets: number;
@@ -61,7 +62,7 @@ export const DEFAULT_STREAM_RELAY_CONFIG: Readonly<StreamRelayConfig> = Object.f
 	gcIdleMs: 300,
 	gcMaxMs: 1_500,
 	gcMaxBytes: 64 * 1024,
-	gcMinIntervalMs: 0,
+	gcMinIntervalMs: 1_000,
 	rateBytesPerSec: 256 * 1024,
 	burstBytes: 2 * 1024 * 1024,
 	maxSockets: MAX_STREAM_SOCKETS,
@@ -184,10 +185,15 @@ export interface StreamRelayOptions {
 	runtimeEpoch: string;
 	clock?: ClockPort;
 	timers?: TimerPort;
+	/** H3 retry jitter source in [0, 1) (default Math.random). */
+	random?: () => number;
 }
 
-/** R12-style raw admission gate of one socket. */
-interface RawGate { tokens: number; at: number; refused: boolean }
+/** H6 raw admission bucket of one device. */
+interface DeviceBucket { tokens: number; at: number }
+
+/** H5 cache entry: the attachment parsed once per runtime and the actor the device map is checked with. */
+interface CachedSocket { attachment: StreamSocketAttachment; actor: StreamActor }
 
 interface Waiter { socket: SocketPort; socketId: string }
 
@@ -224,6 +230,7 @@ export interface StreamRelayCounters {
 	notices: number;
 	rateCloses: number;
 	oversizeCloses: number;
+	deviceSocketEvictions: number;
 	rawDrops: number;
 	authorityCloses: number;
 	dailyLimitRejects: number;
@@ -248,13 +255,25 @@ export class StreamRelayService {
 	readonly counters: StreamRelayCounters = {
 		appendFrames: 0, commits: 0, committedRows: 0, storeDedupes: 0, pendingDedupes: 0, conflicts: 0,
 		commitFailures: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0,
-		committedBroadcasts: 0, notices: 0, rateCloses: 0, oversizeCloses: 0, rawDrops: 0, authorityCloses: 0,
-		dailyLimitRejects: 0, wakeNotices: 0,
+		committedBroadcasts: 0, notices: 0, rateCloses: 0, oversizeCloses: 0, deviceSocketEvictions: 0, rawDrops: 0,
+		authorityCloses: 0, dailyLimitRejects: 0, wakeNotices: 0,
 	};
 	private readonly clock: ClockPort;
 	private readonly timers: TimerPort;
-	private readonly gates = new WeakMap<object, RawGate>();
+	private readonly random: () => number;
+	/** Every socket's parsed attachment (null: not a streams socket): `deserializeAttachment` once per socket per runtime. */
 	private readonly attachments = new WeakMap<object, StreamSocketAttachment | null>();
+	/**
+	 * H5 fanout set: the open streams sockets of admitted devices. Null until built once per runtime from
+	 * `getWebSockets()` (ensureWakeNotice); then maintained on accept, close, error and every close this relay makes.
+	 */
+	private cache: Map<SocketPort, CachedSocket> | null = null;
+	/** H5/H6: each device's cached sockets, oldest admitted first. */
+	private readonly byDevice = new Map<string, SocketPort[]>();
+	/** Sockets this relay closed or saw close: their later messages are dropped in O(1). */
+	private readonly closing = new WeakSet<object>();
+	/** H6: one bucket per device, full when first used in a runtime, kept for the runtime (a reconnect does not refill it), deleted on revoke. */
+	private readonly buckets = new Map<string, DeviceBucket>();
 	private readonly ordinals = new WeakMap<object, number>();
 	private socketOrdinal = 0;
 	private pending: PendingFrame[] = [];
@@ -263,7 +282,8 @@ export class StreamRelayService {
 	private idleTimer: unknown = null;
 	private maxTimer: unknown = null;
 	private lastCommitAt = Number.NEGATIVE_INFINITY;
-	private wakeChecked = false;
+	/** H3: consecutive failed commits in this runtime (reset by a successful commit). */
+	private failures = 0;
 	/** H3: kind of the last daily-limit error this relay classified (typing of up-front refusals). */
 	private dailyKind: DailyLimitKind = "rows-written";
 	private writes = 0;
@@ -272,6 +292,7 @@ export class StreamRelayService {
 		this.config = options.config;
 		this.clock = options.clock ?? SYSTEM_CLOCK;
 		this.timers = options.timers ?? SYSTEM_TIMERS;
+		this.random = options.random ?? Math.random;
 	}
 
 	private now(): number {
@@ -292,17 +313,45 @@ export class StreamRelayService {
 	}
 
 	/**
-	 * The fanout set: streams sockets whose device is still admitted. `getWebSockets()` may still return a socket
-	 * after `close()` (developers.cloudflare.com/durable-objects/api/state/#getwebsockets), so a revoked device's
-	 * sockets are excluded by the device map, not by their close (D7).
+	 * The fanout set (H5): the cached sockets, built once per runtime. `getWebSockets()` may still return a socket
+	 * after `close()` (developers.cloudflare.com/durable-objects/api/state/#getwebsockets), so membership is kept
+	 * here, not read from the platform. The device map is still consulted per socket (one Map lookup): a device the
+	 * host dropped from the map without `revokeDevice` is superseded here and leaves the set (D7).
 	 */
 	private streamSockets(): Array<{ socket: SocketPort; attachment: StreamSocketAttachment }> {
+		this.ensureWakeNotice();
 		const result: Array<{ socket: SocketPort; attachment: StreamSocketAttachment }> = [];
-		for (const socket of this.options.sockets.sockets()) {
-			const attachment = this.attachmentOf(socket);
-			if (attachment && this.options.validateActor(actorOf(attachment))) result.push({ socket, attachment });
+		for (const [socket, entry] of this.cache!) {
+			if (this.options.validateActor(entry.actor)) result.push({ socket, attachment: entry.attachment });
+			else this.supersede(socket);
 		}
 		return result;
+	}
+
+	private cacheAdd(socket: SocketPort, attachment: StreamSocketAttachment): void {
+		if (this.cache!.has(socket)) return;
+		this.cache!.set(socket, { attachment, actor: actorOf(attachment) });
+		const own = this.byDevice.get(attachment.deviceId);
+		if (own) own.push(socket);
+		else this.byDevice.set(attachment.deviceId, [socket]);
+	}
+
+	private cacheRemove(socket: SocketPort): void {
+		const entry = this.cache?.get(socket);
+		if (!entry) return;
+		this.cache!.delete(socket);
+		const own = this.byDevice.get(entry.attachment.deviceId);
+		if (!own) return;
+		const at = own.indexOf(socket);
+		if (at >= 0) own.splice(at, 1);
+		if (own.length === 0) this.byDevice.delete(entry.attachment.deviceId);
+	}
+
+	/** Closes a socket this relay refuses: it leaves the fanout set in this turn and its later messages are dropped. */
+	private closeSocket(socket: SocketPort, code: number, reason: string): void {
+		this.closing.add(socket);
+		this.cacheRemove(socket);
+		try { socket.close(code, reason); } catch { /* closed */ }
 	}
 
 	head(): number {
@@ -335,13 +384,22 @@ export class StreamRelayService {
 
 	// ---- accept -----------------------------------------------------------
 
-	/** Accepts an authorized streams socket upgrade (the host has verified the ticket and the device). */
+	/**
+	 * Accepts an authorized streams socket upgrade (the host has verified the ticket and the device). H6: a device
+	 * at MAX_STREAM_SOCKETS_PER_DEVICE first closes its oldest socket (1001 `device_socket_limit`); this runs before
+	 * the vault-wide cap, so a device at its cap can always reconnect.
+	 */
 	accept(actor: StreamActor, canWrite: boolean): Response {
 		if (!this.options.validateActor(actor)) return json({ error: "authority_superseded" }, 409);
+		this.ensureWakeNotice();
+		const own = this.byDevice.get(actor.deviceId);
+		while (own && own.length >= MAX_STREAM_SOCKETS_PER_DEVICE) {
+			this.counters.deviceSocketEvictions++;
+			this.closeSocket(own[0]!, 1001, "device_socket_limit");
+		}
 		if (this.streamSockets().length >= this.config.maxSockets) {
 			return json({ error: "stream_socket_limit" }, 429, { "Retry-After": "1" });
 		}
-		this.ensureWakeNotice();
 		const pair = this.options.sockets.createPair();
 		const server = pair.server;
 		const now = this.now();
@@ -365,6 +423,7 @@ export class StreamRelayService {
 		server.serializeAttachment(attachment);
 		this.options.sockets.accept(server);
 		this.attachments.set(server, attachment);
+		this.cacheAdd(server, attachment);
 		this.ordinals.set(server, ++this.socketOrdinal);
 		this.options.sendControl(server, {
 			type: "VAULT_READY",
@@ -391,82 +450,96 @@ export class StreamRelayService {
 	}
 
 	/**
-	 * Once per runtime: streams sockets admitted by an earlier runtime (hibernation
-	 * wake, or an eviction that may have dropped buffered frames) are told to
-	 * resend every unacknowledged append. Resends are deduplicated. A surviving
-	 * socket whose device is no longer in the device map gets authority_superseded
-	 * and closes 4403 instead (DECISIONS O3).
+	 * Once per runtime, H5 rebuild: the socket cache is built from `getWebSockets()`, each attachment parsed once.
+	 * Streams sockets admitted by an earlier runtime (hibernation wake, or an eviction that may have dropped
+	 * buffered frames) are told to resend every unacknowledged append; resends are deduplicated. A surviving socket
+	 * whose device is no longer in the device map is skipped and gets authority_superseded + 4403 (D7, O3).
 	 */
 	ensureWakeNotice(): void {
-		if (this.wakeChecked) return;
-		this.wakeChecked = true;
+		if (this.cache !== null) return;
+		this.cache = new Map();
 		let head: number | null = null;
+		const kept: Array<{ socket: SocketPort; attachment: StreamSocketAttachment }> = [];
 		for (const socket of this.options.sockets.sockets()) {
-			const attachment = this.attachmentOf(socket);
+			if (this.closing.has(socket)) continue;
+			let attachment = this.attachmentOf(socket);
 			if (!attachment) continue;
-			if (!this.authorityHolds(socket, attachment)) continue;
-			if (attachment.runtimeEpoch === this.options.runtimeEpoch) continue;
-			const updated = { ...attachment, runtimeEpoch: this.options.runtimeEpoch };
-			try { socket.serializeAttachment(updated); } catch { continue; }
-			this.attachments.set(socket, updated);
-			head ??= this.head();
-			this.options.sendControl(socket, { type: "STREAM_RESEND", reason: "runtime_restarted",
-				runtimeEpoch: this.options.runtimeEpoch, head });
-			this.counters.wakeNotices++;
+			if (!this.options.validateActor(actorOf(attachment))) { this.supersede(socket); continue; }
+			if (attachment.runtimeEpoch !== this.options.runtimeEpoch) {
+				const updated = { ...attachment, runtimeEpoch: this.options.runtimeEpoch };
+				try { socket.serializeAttachment(updated); } catch { continue; }
+				this.attachments.set(socket, updated);
+				attachment = updated;
+				head ??= this.head();
+				this.options.sendControl(socket, { type: "STREAM_RESEND", reason: "runtime_restarted",
+					runtimeEpoch: this.options.runtimeEpoch, head });
+				this.counters.wakeNotices++;
+			}
+			kept.push({ socket, attachment });
 		}
+		kept.sort((left, right) => left.attachment.admittedAt - right.attachment.admittedAt);
+		for (const entry of kept) this.cacheAdd(entry.socket, entry.attachment);
 	}
 
 	// ---- messages -----------------------------------------------------------
 
 	message(socket: SocketPort, message: string | ArrayBuffer): void {
-		const attachment = this.attachmentOf(socket);
-		if (!attachment) { try { socket.close(1008, "not a streams socket"); } catch { /* closed */ } return; }
-		// D7: the device map is checked first, before any echo, PROVISIONAL broadcast or buffering.
-		if (!this.authorityHolds(socket, attachment)) return;
-		if (!this.charge(socket, message)) return;
+		if (this.closing.has(socket)) { this.counters.rawDrops++; return; }
 		this.ensureWakeNotice();
-		if (typeof message === "string") this.control(socket, attachment, message);
-		else this.append(socket, attachment, new Uint8Array(message));
+		let entry = this.cache!.get(socket);
+		if (!entry) {
+			// The rebuild may have just superseded it.
+			if (this.closing.has(socket)) { this.counters.rawDrops++; return; }
+			const attachment = this.attachmentOf(socket);
+			if (!attachment) { this.closeSocket(socket, 1008, "not a streams socket"); return; }
+			// An open streams socket the cache lost track of: admitted → back into the set; otherwise superseded below.
+			if (this.options.validateActor(actorOf(attachment))) this.cacheAdd(socket, attachment);
+			entry = { attachment, actor: actorOf(attachment) };
+		}
+		// D7: the device map is checked first, before any echo, PROVISIONAL broadcast or buffering.
+		if (!this.authorityHolds(socket, entry.actor)) return;
+		if (!this.charge(socket, entry.attachment, message)) return;
+		if (typeof message === "string") this.control(socket, entry.attachment, message);
+		else this.append(socket, entry.attachment, new Uint8Array(message));
 	}
 
 	/**
-	 * Raw admission: charges the received size (bytes for binary, UTF-16 units for
-	 * text) before any parsing. An oversize message closes 1009; an overdraft
-	 * sends VAULT_BACKPRESSURE and closes 1013. Either way every later message of
-	 * the socket is dropped in O(1). Frames the socket buffered before the close
-	 * still commit: a rate or size close is not a revoke (a D7 revoke drops them,
-	 * see revokeDevice).
+	 * H6 raw admission: charges the received size (bytes for binary, UTF-16 units
+	 * for text) to the device's bucket before any parsing. An oversize message
+	 * closes 1009 (uncharged); an overdraft sends VAULT_BACKPRESSURE and closes the
+	 * overdrawing socket 1013. Either way every later message of the socket is
+	 * dropped in O(1). Frames the socket buffered before the close still commit: a
+	 * rate or size close is not a revoke (a D7 revoke drops them, see revokeDevice).
 	 */
-	private charge(socket: SocketPort, message: string | ArrayBuffer): boolean {
-		let gate = this.gates.get(socket);
-		const now = this.now();
-		if (!gate) {
-			gate = { tokens: this.config.burstBytes, at: now, refused: false };
-			this.gates.set(socket, gate);
-		}
-		if (gate.refused) { this.counters.rawDrops++; return false; }
+	private charge(socket: SocketPort, attachment: StreamSocketAttachment, message: string | ArrayBuffer): boolean {
 		const size = typeof message === "string" ? message.length : message.byteLength;
 		const max = typeof message === "string" ? MAX_STREAM_TEXT_MESSAGE_BYTES : MAX_STREAM_BINARY_MESSAGE_BYTES;
-		gate.tokens = Math.min(this.config.burstBytes, gate.tokens + (Math.max(0, now - gate.at) * this.config.rateBytesPerSec) / 1000);
-		gate.at = now;
-		if (size <= max && gate.tokens >= size) {
-			gate.tokens -= size;
-			return true;
-		}
-		gate.refused = true;
 		if (size > max) {
 			this.counters.oversizeCloses++;
-			try { socket.close(1009, "message exceeds stream admission limit"); } catch { /* closed */ }
-		} else {
-			this.counters.rateCloses++;
-			this.options.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: "relay_rate_limit" });
-			try { socket.close(1013, "relay rate limit"); } catch { /* closed */ }
+			this.closeSocket(socket, 1009, "message exceeds stream admission limit");
+			return false;
 		}
+		const now = this.now();
+		let bucket = this.buckets.get(attachment.deviceId);
+		if (!bucket) {
+			bucket = { tokens: this.config.burstBytes, at: now };
+			this.buckets.set(attachment.deviceId, bucket);
+		}
+		bucket.tokens = Math.min(this.config.burstBytes,
+			bucket.tokens + (Math.max(0, now - bucket.at) * this.config.rateBytesPerSec) / 1000);
+		bucket.at = now;
+		if (bucket.tokens >= size) {
+			bucket.tokens -= size;
+			return true;
+		}
+		this.counters.rateCloses++;
+		this.options.sendControl(socket, { type: "VAULT_BACKPRESSURE", reason: "relay_rate_limit" });
+		this.closeSocket(socket, 1013, "relay rate limit");
 		return false;
 	}
 
-	private authorityHolds(socket: SocketPort, attachment: StreamSocketAttachment): boolean {
-		if (this.options.validateActor(actorOf(attachment))) return true;
+	private authorityHolds(socket: SocketPort, actor: StreamActor): boolean {
+		if (this.options.validateActor(actor)) return true;
 		this.supersede(socket);
 		return false;
 	}
@@ -494,8 +567,8 @@ export class StreamRelayService {
 	private append(socket: SocketPort, attachment: StreamSocketAttachment, bytes: Uint8Array): void {
 		const frame = decodeAppendFrame(bytes);
 		if ("error" in frame) {
-			const code = frame.error === "payload_too_large" ? 1009 : 1008;
-			try { socket.close(code, `stream frame rejected: ${frame.error}`); } catch { /* closed */ }
+			// H1: the close reason is the bare error code (`malformed_frame` for every codec violation).
+			this.closeSocket(socket, frame.error === "payload_too_large" ? 1009 : 1008, frame.error);
 			return;
 		}
 		this.counters.appendFrames++;
@@ -574,11 +647,13 @@ export class StreamRelayService {
 			outcomes = this.options.store().commit(frames).outcomes;
 		} catch (error) {
 			this.counters.commitFailures++;
+			this.failures++;
 			this.options.noteCommitError(error);
 			console.warn("[yaos-streams] commit failed", error instanceof Error ? error.message : String(error));
 			this.failed(frames, error);
 			return;
 		}
+		this.failures = 0;
 		this.lastCommitAt = this.now();
 		this.counters.commits++;
 		const sockets = this.streamSockets();
@@ -646,7 +721,8 @@ export class StreamRelayService {
 
 	/**
 	 * A failed commit: nothing was written. Origins resend; holders of PROVISIONALs drop them. H3: the error is typed
-	 * here, at the source: the daily limit → `VAULT_ERROR cf_daily_limit`, anything else → `durability_failed`.
+	 * here, at the source: the daily limit → `VAULT_ERROR cf_daily_limit`, anything else → `durability_failed` with
+	 * `retryAfterMs` (exponential in the consecutive failed commits n, jittered per message).
 	 */
 	private failed(frames: readonly PendingFrame[], error: unknown): void {
 		const daily = isCloudflareDailyLimitError(error);
@@ -667,22 +743,36 @@ export class StreamRelayService {
 		for (const entry of byOrigin.values()) {
 			for (const [stream, clientFrameIds] of entry.streams) {
 				this.options.sendControl(entry.socket, daily ? dailyLimitControl(now, this.dailyKind, stream, clientFrameIds)
-					: { type: "VAULT_ERROR", code: "durability_failed", message: "append was not committed; resend", stream, clientFrameIds });
+					: { type: "VAULT_ERROR", code: "durability_failed", message: "append was not committed; resend", stream, clientFrameIds,
+						retryAfterMs: this.retryAfterMs() });
 			}
 		}
+	}
+
+	/** H3: round(min(30000, 1000·2^(n−1)) · (0.5 + 0.5·rand)), n = consecutive failed commits in this runtime. */
+	private retryAfterMs(): number {
+		return Math.round(Math.min(30_000, 1000 * 2 ** (this.failures - 1)) * (0.5 + 0.5 * this.random()));
 	}
 
 	// ---- authority ------------------------------------------------------------
 
 	/**
 	 * D7 revoke, synchronous (the host calls it in the same turn that deleted the
-	 * device row and its device-map entry, so `streamSockets()` already excludes
-	 * the device). The device's buffered frames are dropped: they never commit and
-	 * get no receipt; peers that got their PROVISIONAL get STREAM_PROVISIONAL_DROPPED.
-	 * Nothing is flushed: other devices' frames stay buffered for their normal
-	 * commit. Every socket of the device gets authority_superseded and closes 4403.
+	 * device row and its device-map entry). Every socket of the device gets
+	 * authority_superseded, closes 4403 and leaves the H5 fanout set; its H6 bucket
+	 * goes. Its buffered frames are dropped: they never commit and get no receipt;
+	 * peers that got their PROVISIONAL get STREAM_PROVISIONAL_DROPPED. Nothing is
+	 * flushed: other devices' frames stay buffered for their normal commit.
 	 */
 	revokeDevice(deviceId: string): { droppedFrames: number; closedSockets: number } {
+		// Cold path: walks getWebSockets() so a socket is found even before this runtime built its cache.
+		let closedSockets = 0;
+		for (const socket of this.options.sockets.sockets()) {
+			if (this.closing.has(socket) || this.attachmentOf(socket)?.deviceId !== deviceId) continue;
+			this.supersede(socket);
+			closedSockets++;
+		}
+		this.buckets.delete(deviceId);
 		const kept: PendingFrame[] = [];
 		const dropped: PendingFrame[] = [];
 		for (const frame of this.pending) (frame.deviceId === deviceId ? dropped : kept).push(frame);
@@ -697,24 +787,19 @@ export class StreamRelayService {
 			// (the frame was not committed; the client ignores `reason`).
 			for (const frame of dropped) if (frame.provisional) this.dropProvisional(peers, frame, "commit_failed");
 		}
-		let closedSockets = 0;
-		for (const socket of this.options.sockets.sockets()) {
-			const attachment = this.attachmentOf(socket);
-			if (attachment?.deviceId !== deviceId) continue;
-			this.supersede(socket);
-			closedSockets++;
-		}
 		return { droppedFrames: dropped.length, closedSockets };
 	}
 
 	private supersede(socket: SocketPort): void {
 		this.counters.authorityCloses++;
 		this.options.sendControl(socket, { type: "error", code: "authority_superseded", reason: "socket authority superseded" });
-		try { socket.close(AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded"); } catch { /* closed */ }
+		this.closeSocket(socket, AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE, "socket authority superseded");
 	}
 
+	/** The runtime saw the socket close or error: it leaves the fanout set. */
 	socketClosed(socket: SocketPort): void {
-		this.gates.delete(socket);
+		this.closing.add(socket);
+		this.cacheRemove(socket);
 	}
 
 	/** Drops the buffer unacked (vault wipe; TEST-ONLY relay-crash simulation). Returns the dropped frame count. */
@@ -727,10 +812,13 @@ export class StreamRelayService {
 		return dropped;
 	}
 
-	/** Vault storage was wiped: drop the buffer unacked and every cached fact. */
+	/** Vault storage was wiped (the host closed every streams socket): drop the buffer unacked and every cached fact. */
 	reset(): void {
 		this.dropPending();
 		this.options.store().reset();
+		for (const socket of this.options.sockets.sockets()) if (this.attachmentOf(socket)) this.closing.add(socket);
+		this.cache = new Map();
+		this.byDevice.clear();
 	}
 
 	/**
@@ -741,14 +829,16 @@ export class StreamRelayService {
 		this.dropPending();
 		this.options.store().reset();
 		for (const socket of this.options.sockets.sockets()) {
-			if (!this.attachmentOf(socket)) continue;
-			this.gates.delete(socket);
-			try { socket.close(closeCode, reason); } catch { /* closed */ }
+			if (this.closing.has(socket) || !this.attachmentOf(socket)) continue;
+			this.closeSocket(socket, closeCode, reason);
 		}
+		this.cache = new Map();
+		this.byDevice.clear();
 	}
 
 	diagnostics() {
 		return { pendingFrames: this.pending.length, pendingBytes: this.pendingBytes, head: this.head(),
+			sockets: this.cache?.size ?? null, dedupe: this.options.store().dedupeStats(),
 			counters: { ...this.counters }, tables: this.options.store().tableCounts() };
 	}
 

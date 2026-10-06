@@ -150,7 +150,8 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 	const registry = new FakeRegistry();
 	const revoked = new Set<string>();
 	const store = new StreamStore(storage);
-	const resolved = { ...DEFAULT_STREAM_RELAY_CONFIG, ...config };
+	// The H8 min interval (default 1000) is off here so idle-timing tests stay exact; its own tests set it.
+	const resolved = { ...DEFAULT_STREAM_RELAY_CONFIG, gcMinIntervalMs: 0, ...config };
 	const make = (runtimeEpoch: string) => new StreamRelayService({
 		config: resolved,
 		store: () => store,
@@ -228,6 +229,8 @@ s.test("config: env overrides are clamped; the burst holds one maximum message",
 	assert.equal(config.gcIdleMs, 300);
 	assert.equal(config.gcMaxMs, 1500);
 	assert.equal(config.gcMaxBytes, 64 * 1024);
+	assert.equal(config.gcMinIntervalMs, 1000, "H8 default");
+	assert.equal(readStreamRelayConfig({ YAOS_STREAMS_GC_MIN_INTERVAL_MS: "0" }).gcMinIntervalMs, 0, "H8 env override");
 });
 
 // ---- live path ------------------------------------------------------------------
@@ -465,16 +468,18 @@ s.test("checkpoint: CAS ok, conflict, not advancing, ahead of stream; GC of seal
 		assert.deepEqual(cold.rows.map((row) => row.seq), [5], "rows resume after the checkpoint");
 		const warm = await read("stream=b:gc&after=4");
 		assert.equal(warm.checkpoint, null, "a reader past gcSeq gets rows only");
+		const preferred = await read("stream=b:gc&after=4&checkpoint=1");
+		assert.equal(preferred.checkpoint, null, "checkpoint=1 only when after < checkpointSeq");
+		assert.deepEqual(preferred.rows.map((row) => row.seq), [5]);
+		// H7: a checkpoint at lastSeq retires the stream: the open segment goes too and gcSeq = lastSeq.
 		const next = await put("stream=b:gc&coversSeq=5&expectedCoversSeq=4", new Uint8Array(0));
 		assert.equal(next.status, 200, "an empty checkpoint is allowed");
-		assert.equal(next.body.deletedSegments, 0, "the open segment (retain window) is never collected");
+		assert.deepEqual(next.body, { stream: "b:gc", coversSeq: 5, gcSeq: 5, deletedSegments: 0 });
 		assert.equal(store.tableCounts().checkpointChunks, 1, "the previous checkpoint is replaced");
-		const gcSeq = next.body.gcSeq as number;
-		assert.ok(gcSeq < 5);
-		assert.deepEqual((await read(`stream=b:gc&after=${gcSeq}`)).rows.map((row) => row.seq).at(-1), 5, "rows only past gcSeq");
-		const preferred = await read(`stream=b:gc&after=${gcSeq}&checkpoint=1`);
-		assert.equal(preferred.checkpoint?.coversSeq, 5, "checkpoint=1 asks for it when after < checkpointSeq");
-		assert.deepEqual(preferred.rows, []);
+		const retired = await read("stream=b:gc&after=0");
+		assert.equal(retired.checkpoint?.coversSeq, 5);
+		assert.deepEqual(retired.rows, [], "only the checkpoint is left");
+		assert.equal((await read("stream=b:gc&after=5")).checkpoint, null);
 	});
 });
 
