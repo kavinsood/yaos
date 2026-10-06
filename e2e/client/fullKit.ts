@@ -18,7 +18,7 @@ import { createInlinePair } from "../../src/protocol/inlineTransport";
 import type { EngineSettings } from "../../src/protocol/messages";
 import type { StatusSnapshot } from "../../src/protocol/status";
 import type { EngineCarrier } from "../../src/host/engineHost";
-import { createHasher, webCryptoHashPort } from "../../src/host/hashing";
+import { engineHashOracle } from "../../src/host/hashOracle";
 import { HostRuntime } from "../../src/host/hostRuntime";
 import { DEFAULT_ENGINE_SETTINGS } from "../../src/host/ui/api";
 import { createEngine, type EngineHandle } from "../../src/engine/compose/protocolEngine";
@@ -159,7 +159,8 @@ export class FullClient {
 	/** The device's IndexedDB (kept across restarts). */
 	readonly factory = new IDBFactory();
 	readonly clock = createWebClock();
-	readonly hasher = createHasher(webCryptoHashPort());
+	/** Like the plugin: vault preconditions are hashed by the live runtime's engine (main never hashes). */
+	readonly hashes = engineHashOracle((body) => this.runtime.engine.request(body));
 	readonly vault: SimVault;
 	readonly configDir: SimConfigDir;
 	readonly sideFiles = new SimSideFiles();
@@ -180,7 +181,7 @@ export class FullClient {
 	private handle: EngineHandle | null = null;
 
 	constructor(readonly o: FullClientOptions) {
-		this.vault = new SimVault({ clock: this.clock, hasher: this.hasher, profile: "case-sensitive", watcherDelayMs: () => o.watcherDelayMs });
+		this.vault = new SimVault({ clock: this.clock, hashes: this.hashes, profile: "case-sensitive", watcherDelayMs: () => o.watcherDelayMs });
 		this.configDir = new SimConfigDir(this.clock);
 		this.workspace = this.newWorkspace();
 		this.runtime = this.makeRuntime();
@@ -244,7 +245,7 @@ export class FullClient {
 		const { o } = this;
 		return new HostRuntime({
 			clock: this.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
-			workspace: this.workspace, platform: this.platform, hasher: this.hasher,
+			workspace: this.workspace, platform: this.platform,
 			identity: { vaultId: o.vaultId as VaultId, deviceId: o.device.deviceId as DeviceId, deviceLabel: o.name, relay: { url: o.host, credential: o.device.deviceToken } },
 			settings: () => ({ ...DEFAULT_ENGINE_SETTINGS, syncSettings: true, ...o.settings }),
 			createWorker: () => null,

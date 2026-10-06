@@ -4,23 +4,34 @@ import type { ContentHash, DiskFingerprint, DocId } from "../core/types";
 import type { DiskOp, DiskOpResult, Lane } from "../protocol/messages";
 import type { WritePrecondition } from "../ports/vault";
 import { DiskExecutor } from "./diskExecutor";
-import { createHasher, utf8 } from "./hashing";
+import type { HashOracle } from "./hashOracle";
+import { ObsidianVault } from "./obsidianVault";
+import { FakeObsidianVault } from "../sim/fakeObsidian";
+import { exactFingerprint, markdownContentHash } from "../core/hash/markdownLf";
+import { utf8Encode as utf8 } from "../core/hash/utf8";
 import { VirtualClock } from "../sim/clock";
-import { simHashPort } from "../sim/hash";
+import { simHashOracle } from "../sim/hash";
 import { SimConfigDir, SimVault, type CaseProfile } from "../sim/vault";
 
 function setup(profile: CaseProfile = "case-insensitive", bound: Set<string> = new Set()) {
 	const clock = new VirtualClock();
-	const hasher = createHasher(simHashPort());
-	const vault = new SimVault({ clock, hasher, profile });
+	const hashes = simHashOracle();
+	const vault = new SimVault({ clock, hashes, profile });
 	const configDir = new SimConfigDir(clock);
-	const exec = new DiskExecutor({ vault, configDir, clock, hasher, isBoundPath: (p) => bound.has(p), budgets: () => ({ mainSliceMs: 8 }) });
-	return { clock, hasher, vault, configDir, exec, bound };
+	const exec = new DiskExecutor({ vault, configDir, clock, hashes, isBoundPath: (p) => bound.has(p), budgets: () => ({ mainSliceMs: 8 }) });
+	return { clock, vault, configDir, exec, bound };
 }
+
+/** Test-side reference hashing (core, in-process); the executor only asks its HashOracle. */
+const fpOf = (t: string) => exactFingerprint(utf8(t));
 
 let opId = 1;
 const w = (path: string, text: string, precondition: WritePrecondition, extra: Partial<{ docId: DocId | null; purpose: "materialize" | "merge" | "conflict-copy" | "restore" | "settings"; area: "vault" | "config" }> = {}): DiskOp => ({
 	t: "write", opId: opId++, area: extra.area ?? "vault", path, data: { t: "text", text }, precondition, docId: extra.docId ?? null, purpose: extra.purpose ?? "materialize",
+});
+/** Config-area write: the engine sends bytes (engine/compose/hostLink.ts configDir.writeBytes). */
+const cw = (path: string, text: string, precondition: WritePrecondition): DiskOp => ({
+	t: "write", opId: opId++, area: "config", path, data: { t: "bytes", bytes: utf8(text) }, precondition, docId: null, purpose: "settings",
 });
 const ANY: WritePrecondition = { t: "any" };
 const ABSENT: WritePrecondition = { t: "absent" };
@@ -33,10 +44,10 @@ function outcomeOk(r: DiskOpResult | undefined): boolean {
 }
 
 test("diskExecutor: every WritePrecondition passes or fails without writing", async () => {
-	const { vault, exec, hasher } = setup();
+	const { vault, exec } = setup();
 	vault.userWrite("a.md", "one\r\n");
-	const fp = await hasher.fingerprint(utf8("one\r\n"));
-	const lfHash = await hasher.contentHash("a.md", utf8("one\n"));
+	const fp = fpOf("one\r\n");
+	const lfHash = markdownContentHash("one\n");
 	const historyBefore = vault.history.length;
 
 	// One batch each: inside a batch, ops on the same path after a failure are skipped.
@@ -55,9 +66,9 @@ test("diskExecutor: every WritePrecondition passes or fails without writing", as
 	// hash = logical (markdown canonical): CRLF on disk matches the LF hash.
 	const ok1 = await exec.run(3, [w("a.md", "two\n", { t: "hash", hash: lfHash })]);
 	assert.ok(outcomeOk(ok1[0]));
-	const fp2 = await hasher.fingerprint(utf8("two\n"));
+	const fp2 = fpOf("two\n");
 	const r1 = ok1[0];
-	assert.ok(r1 && r1.t === "write" && r1.outcome.ok && r1.outcome.fingerprint === fp2);
+	assert.ok(r1 && r1.t === "write" && r1.outcome.ok && !("fingerprint" in r1.outcome), "main reports no fingerprint (the engine computes it)");
 	const ok2 = await exec.run(3, [w("a.md", "three", { t: "fingerprint", fingerprint: fp2 }), w("b.md", "bee", ABSENT), w("b.md", "bee2", ANY)]);
 	assert.deepEqual(ok2.map(outcomeOk), [true, true, true]);
 	assert.equal(vault.textOf("a.md"), "three");
@@ -79,10 +90,10 @@ test("diskExecutor: case-insensitive profile makes absent fail on a case variant
 });
 
 test("diskExecutor: renames use VaultPort.rename, deletes use VaultPort.trash only (with mode + precondition)", async () => {
-	const { vault, exec, hasher } = setup();
+	const { vault, exec } = setup();
 	vault.userWrite("x/a.md", "A");
 	vault.userWrite("b.md", "B");
-	const fpA = await hasher.fingerprint(utf8("A"));
+	const fpA = fpOf("A");
 	const res = await exec.run(2, [
 		{ t: "rename", opId: opId++, from: "x/a.md", to: "y/z/a.md", precondition: { t: "fingerprint", fingerprint: fpA }, docId: "d1" as DocId, purpose: "remote-move" },
 		{ t: "trash", opId: opId++, path: "b.md", mode: "obsidian-trash", precondition: { t: "fingerprint", fingerprint: "ff".repeat(32) as DiskFingerprint }, docId: "d2" as DocId, purpose: "remote-delete" },
@@ -99,7 +110,7 @@ test("diskExecutor: renames use VaultPort.rename, deletes use VaultPort.trash on
 	assert.equal(vault.calls.rename, 1);
 	assert.equal(vault.calls.trash, 2);
 
-	const fpB = await hasher.fingerprint(utf8("B"));
+	const fpB = fpOf("B");
 	const res2 = await exec.run(2, [{ t: "trash", opId: opId++, path: "b.md", mode: "system-trash", precondition: { t: "fingerprint", fingerprint: fpB }, docId: null, purpose: "remote-delete" }]);
 	assert.equal(outcomeOk(res2[0]), true);
 	assert.equal(vault.hasFile("b.md"), false);
@@ -147,12 +158,12 @@ test("diskExecutor: bound guard blocks content writes to an open note, not confl
 
 test("diskExecutor: trash of a bound note with unsent editor edits posts them and refuses once (§c.7)", async () => {
 	const clock = new VirtualClock();
-	const hasher = createHasher(simHashPort());
-	const vault = new SimVault({ clock, hasher, profile: "case-insensitive" });
+	const hashes = simHashOracle();
+	const vault = new SimVault({ clock, hashes, profile: "case-insensitive" });
 	const unsent = new Set(["open.md"]);
 	const flushed: string[] = [];
 	const exec = new DiskExecutor({
-		vault, configDir: new SimConfigDir(clock), clock, hasher, isBoundPath: () => true, budgets: () => ({ mainSliceMs: 8 }),
+		vault, configDir: new SimConfigDir(clock), clock, hashes, isBoundPath: () => true, budgets: () => ({ mainSliceMs: 8 }),
 		flushBoundPath: (p) => { flushed.push(p); return unsent.delete(p); },
 	});
 	vault.userWrite("open.md", "typed");
@@ -183,7 +194,7 @@ test("diskExecutor: lanes execute open-note first; order within a batch is prese
 });
 
 test("diskExecutor: I/O exceptions map to io outcomes; config area writes are read-compare-write", async () => {
-	const { vault, exec, configDir, hasher } = setup();
+	const { vault, exec, configDir } = setup();
 	vault.failNextOps = 1;
 	const res = await exec.run(3, [w("a.md", "x", ANY), w("b.md", "y", ANY)]);
 	const r0 = res[0];
@@ -191,16 +202,23 @@ test("diskExecutor: I/O exceptions map to io outcomes; config area writes are re
 	assert.equal(outcomeOk(res[1]), true);
 
 	await configDir.writeBytes("app.json", utf8("{}"));
-	const fp = await hasher.fingerprint(utf8("{}"));
+	const fp = fpOf("{}");
 	const cfg = await exec.run(2, [
-		w("app.json", '{"a":1}', { t: "fingerprint", fingerprint: "00".repeat(32) as DiskFingerprint }, { area: "config", purpose: "settings" }),
-		w("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }, { area: "config", purpose: "settings" }),
-		w("hotkeys.json", "[]", ABSENT, { area: "config", purpose: "settings" }),
+		cw("app.json", '{"a":1}', { t: "fingerprint", fingerprint: "00".repeat(32) as DiskFingerprint }),
+		cw("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }),
+		cw("hotkeys.json", "[]", ABSENT),
 	]);
 	assert.deepEqual(cfg.map(outcomeOk), [false, false, true], "second op shares the failed config path -> skipped");
 	assert.equal(cfg[1]?.t, "skipped");
 	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), "{}");
 	assert.equal(vault.hasFile("hotkeys.json"), false, "config writes never land in the vault");
+	// The engine hashes the current config bytes: a matching fingerprint/hash passes.
+	const ok = await exec.run(2, [cw("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }), cw("hotkeys.json", "[1]", { t: "hash", hash: exactFingerprint(utf8("[]")) as unknown as ContentHash })]);
+	assert.deepEqual(ok.map(outcomeOk), [true, true]);
+	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), '{"a":2}');
+	// Text config payloads are refused: encoding them would be O(N) string work on main.
+	const text = await exec.run(2, [w("app.json", "{}", ANY, { area: "config", purpose: "settings" })]);
+	assert.ok(text[0]?.t === "write" && !text[0].outcome.ok && text[0].outcome.reason === "io");
 });
 
 test("diskExecutor: reads honour maxBytes and report missing / too-large / io", async () => {
@@ -223,4 +241,42 @@ test("diskExecutor: reads honour maxBytes and report missing / too-large / io", 
 	vault.failNextOps = 1;
 	const io = await exec.read([{ area: "vault", path: "a.md", maxBytes: 100 }]);
 	assert.equal(io[0]?.ok === false && io[0].reason, "io");
+});
+
+test("diskExecutor over ObsidianVault: precondition races (i) stat-visible, (ii) length change, (iii) accepted gap", async () => {
+	const clock = new VirtualClock();
+	const fake = new FakeObsidianVault();
+	let afterHash: (() => void) | null = null;
+	const inner = simHashOracle();
+	const hashes: HashOracle = { hash: async (items) => { const v = await inner.hash(items); afterHash?.(); afterHash = null; return v; } };
+	const exec = new DiskExecutor({ vault: new ObsidianVault(fake, hashes, false), configDir: new SimConfigDir(clock), clock, hashes, isBoundPath: () => false, budgets: () => ({ mainSliceMs: 8 }) });
+	const reason = (r: DiskOpResult | undefined) => (r?.t === "write" && !r.outcome.ok ? r.outcome.reason : r?.t === "write" ? "ok" : r?.t);
+	// (i) a stat-visible same-length change after the engine answered: precondition, nothing written.
+	fake.put("a.md", "base");
+	afterHash = () => fake.put("a.md", "BASE");
+	assert.equal(reason((await exec.run(3, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("base") })]))[0]), "precondition");
+	assert.equal(fake.text("a.md"), "BASE");
+	// (ii) a change not yet in TFile.stat that changes the length, landing after the recheck: process guard.
+	fake.beforeProcess = (p) => { fake.files.get(p)!.bytes = utf8("BASE and more"); };
+	assert.equal(reason((await exec.run(3, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("BASE") })]))[0]), "precondition");
+	assert.equal(fake.text("a.md"), "BASE and more");
+	// (iii) accepted gap (ObsidianVault header, DESIGN §d.4): same length, not in stat -> overwritten.
+	fake.put("a.md", "base");
+	fake.beforeProcess = (p) => { fake.files.get(p)!.bytes = utf8("BASE"); };
+	assert.equal(reason((await exec.run(3, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("base") })]))[0]), "ok");
+	assert.equal(fake.text("a.md"), "sync");
+	fake.beforeProcess = null;
+});
+
+test("diskExecutor config CAS: a change between the read and writeBytes is not detected (documented window)", async () => {
+	// ConfigDirPort has no stat to recheck; check-then-write as before main stopped hashing (diskExecutor.ts writeConfig).
+	const clock = new VirtualClock();
+	const configDir = new SimConfigDir(clock);
+	await configDir.writeBytes("app.json", utf8("{}"));
+	const inner = simHashOracle();
+	const hashes: HashOracle = { hash: async (items) => { const v = await inner.hash(items); await configDir.writeBytes("app.json", utf8('{"user":1}')); return v; } };
+	const exec = new DiskExecutor({ vault: new SimVault({ clock, hashes, profile: "case-insensitive" }), configDir, clock, hashes, isBoundPath: () => false, budgets: () => ({ mainSliceMs: 8 }) });
+	const r = await exec.run(2, [cw("app.json", '{"a":1}', { t: "fingerprint", fingerprint: fpOf("{}") })]);
+	assert.equal(outcomeOk(r[0]), true);
+	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), '{"a":1}');
 });

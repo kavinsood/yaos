@@ -12,9 +12,8 @@ import * as Y from "yjs";
 import type { DocId } from "../core/types";
 import type { EngineResultValue, MainToEngine } from "../protocol/messages";
 import { BindingManager, type BindingLink } from "../host/binding";
-import { createHasher } from "../host/hashing";
 import { VirtualClock } from "./clock";
-import { simHashPort } from "./hash";
+import { simHashOracle } from "./hash";
 import { OBSIDIAN_RELOAD_DELAY_MS, SimVault } from "./vault";
 import { SimWorkspace, type SimEditorView } from "./workspace";
 
@@ -25,10 +24,9 @@ function world() {
 	clock.onError = (e) => {
 		throw e;
 	};
-	const hasher = createHasher(simHashPort());
-	const vault = new SimVault({ clock, hasher, profile: "case-sensitive", watcherDelayMs: () => WATCHER_MS });
+	const vault = new SimVault({ clock, hashes: simHashOracle(), profile: "case-sensitive", watcherDelayMs: () => WATCHER_MS });
 	const ws = new SimWorkspace({ clock, vault });
-	return { clock, hasher, vault, ws };
+	return { clock, vault, ws };
 }
 
 function open(ws: SimWorkspace, path: string): SimEditorView {
@@ -199,7 +197,7 @@ async function bound(files: Record<string, string>, opens: string[]) {
 		w.vault.userWrite(p, t);
 		engine.add(p, t);
 	}
-	const bm = new BindingManager({ workspace: w.ws, vault: w.vault, clock: w.clock, hasher: w.hasher, link: engine.link, deviceLabel: () => "Sim", notice: () => undefined, timeZone: "utc" });
+	const bm = new BindingManager({ workspace: w.ws, vault: w.vault, clock: w.clock, link: engine.link, deviceLabel: () => "Sim", notice: () => undefined, timeZone: "utc" });
 	w.vault.onEvent((e) => bm.onVaultEvent(e));
 	bm.start();
 	const views = opens.map((p) => open(w.ws, p));

@@ -42,8 +42,13 @@ import type {
 	ConfigDirPort, RenameOutcome, SideFileName, SideFilePort, TrashMode, VaultEvent, VaultPort, VaultStat, WriteOutcome, WritePrecondition,
 } from "../ports/vault";
 import type { VaultPath } from "../core/types";
-import type { Hasher } from "../host/hashing";
-import { fromUtf8, utf8 } from "../host/hashing";
+import type { HashOracle } from "../host/hashOracle";
+
+// The simulated filesystem's own text encoding (Obsidian's job in the real host, not hashing).
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const utf8 = (text: string): Uint8Array => encoder.encode(text);
+const fromUtf8 = (bytes: Uint8Array): string => decoder.decode(bytes);
 
 export type CaseProfile = "case-insensitive" | "case-sensitive";
 
@@ -92,7 +97,8 @@ export interface TrashRecord {
 
 export interface SimVaultOptions {
 	readonly clock: ClockPort;
-	readonly hasher: Hasher;
+	/** Precondition hashes: the engine's (main never hashes, host/hashOracle.ts); sim/hash.ts simHashOracle. */
+	readonly hashes: HashOracle;
 	readonly profile: CaseProfile;
 	readonly configDir?: string;
 	/** Delay of events for API (Obsidian-internal) operations. */
@@ -211,7 +217,7 @@ export class SimVault implements VaultPort {
 			if ((now ? now.version : -1) !== version) continue;
 			if (!pass) return { ok: false, reason: "precondition", current: cur ? this.stamp(cur) : null, message: `precondition ${precondition.t} failed` };
 			const f = this.commit(path, bytes, "sync");
-			return { ok: true, stat: this.stamp(f), fingerprint: await this.opts.hasher.fingerprint(bytes) };
+			return { ok: true, stat: this.stamp(f) };
 		}
 		return { ok: false, reason: "io", current: null, message: "file kept changing during CAS" };
 	}
@@ -387,9 +393,14 @@ export class SimVault implements VaultPort {
 			case "absent":
 				return cur === null;
 			case "fingerprint":
-				return cur !== null && (await this.opts.hasher.fingerprint(cur.bytes)) === pre.fingerprint;
-			case "hash":
-				return cur !== null && (await this.opts.hasher.contentHash(path, cur.bytes)) === pre.hash;
+			case "hash": {
+				if (cur === null) return false;
+				// A copy: the oracle takes (transfers) its bytes. The sim keeps an exact version CAS around
+				// this (write() retries when the file changed), so it does not model ObsidianVault's
+				// accepted same-length gap.
+				const [v] = await this.opts.hashes.hash([{ path, want: pre.t === "fingerprint" ? "fingerprint" : "contentHash", bytes: cur.bytes.slice() }]);
+				return v !== undefined && v.hash === (pre.t === "fingerprint" ? pre.fingerprint : pre.hash);
+			}
 		}
 	}
 

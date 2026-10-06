@@ -22,14 +22,14 @@ import type { Budgets } from "../core/limits";
 import type { ClockPort } from "../ports/clock";
 import type { ConfigDirPort, RenameOutcome, VaultPort, VaultStat, WriteOutcome, WritePrecondition } from "../ports/vault";
 import type { DiskOp, DiskOpResult, DiskReadRequest, DiskReadResult, Lane } from "../protocol/messages";
-import type { Hasher } from "./hashing";
-import { utf8 } from "./hashing";
+import type { HashOracle } from "./hashOracle";
 
 export interface DiskExecutorDeps {
 	readonly vault: VaultPort;
 	readonly configDir: ConfigDirPort;
 	readonly clock: ClockPort;
-	readonly hasher: Hasher;
+	/** Config-area fingerprint/hash preconditions: the engine hashes (main never does, DESIGN §d.4). */
+	readonly hashes: HashOracle;
 	/** Live check: is this vault path currently bound to an editor view. */
 	readonly isBoundPath: (path: string) => boolean;
 	/** Post a bound path's unsent editor edits; true when there were any (trash then refuses). */
@@ -157,7 +157,12 @@ export class DiskExecutor {
 		const { vault } = this.deps;
 		switch (op.t) {
 			case "write": {
-				if (op.area === "config") return { opId: op.opId, t: "write", outcome: await this.writeConfig(op.path, op.data.t === "text" ? utf8(op.data.text) : op.data.bytes, op.precondition) };
+				if (op.area === "config") {
+					// The engine sends config data as bytes (engine/compose/hostLink.ts configDir.writeBytes);
+					// encoding a text payload here would be O(N) string work on main.
+					if (op.data.t === "text") return { opId: op.opId, t: "write", outcome: { ok: false, reason: "io", current: null, message: "config writes take bytes" } };
+					return { opId: op.opId, t: "write", outcome: await this.writeConfig(op.path, op.data.bytes, op.precondition) };
+				}
 				if (BOUND_GUARDED.has(op.purpose) && this.deps.isBoundPath(op.path)) {
 					return { opId: op.opId, t: "write", outcome: { ok: false, reason: "precondition", current: await this.safeStat(op.path), message: "bound" } };
 				}
@@ -211,9 +216,15 @@ export class DiskExecutor {
 		}
 	}
 
-	/** Config area: read-compare-write (ConfigDirPort.writeBytes is tmp+rename atomic). */
+	/**
+	 * Config area: read-compare-write (ConfigDirPort.writeBytes is tmp+rename atomic). fingerprint/hash:
+	 * the read bytes go (transferred) to the engine, which answers the hash. Window: a change between
+	 * the read and writeBytes is not detected (ConfigDirPort exposes no stat to recheck); it was already
+	 * check-then-write when main hashed, the engine round trip only widens it. The engine's only config
+	 * write today uses "any" (engine/compose/hostLink.ts configDir.writeBytes).
+	 */
 	private async writeConfig(path: string, bytes: Uint8Array, pre: WritePrecondition): Promise<WriteOutcome> {
-		const { configDir, hasher, clock } = this.deps;
+		const { configDir, hashes, clock } = this.deps;
 		try {
 			const cur = await configDir.readBytes(path);
 			const curStat: VaultStat | null = cur ? { path, size: cur.byteLength, mtimeMs: clock.now(), ctimeMs: clock.now() } : null;
@@ -226,16 +237,20 @@ export class DiskExecutor {
 					pass = cur === null;
 					break;
 				case "fingerprint":
-					pass = cur !== null && (await hasher.fingerprint(cur)) === pre.fingerprint;
+				case "hash": {
+					if (cur === null) {
+						pass = false;
+						break;
+					}
+					const [v] = await hashes.hash([{ path, want: pre.t === "fingerprint" ? "fingerprint" : "contentHash", bytes: cur }]);
+					pass = v !== undefined && v.hash === (pre.t === "fingerprint" ? pre.fingerprint : pre.hash);
 					break;
-				case "hash":
-					pass = cur !== null && (await hasher.contentHash(path, cur)) === pre.hash;
-					break;
+				}
 			}
 			if (!pass) return { ok: false, reason: "precondition", current: curStat, message: `precondition ${pre.t} failed` };
 			await configDir.writeBytes(path, bytes);
 			const now = clock.now();
-			return { ok: true, stat: { path, size: bytes.byteLength, mtimeMs: now, ctimeMs: now }, fingerprint: await hasher.fingerprint(bytes) };
+			return { ok: true, stat: { path, size: bytes.byteLength, mtimeMs: now, ctimeMs: now } };
 		} catch (error) {
 			return { ok: false, reason: "io", current: null, message: errorMessage(error) };
 		}
