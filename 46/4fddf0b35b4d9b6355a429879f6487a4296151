@@ -1,0 +1,19 @@
+docs/client-remake/wp-d-notes.md
+  s_1a35cb80c7073a::t_59916c30bd1e1c 166,188,235,239-319
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "464fddf0b35b4d9b6355a429879f6487a4296151",
+  "prompts": {},
+  "sessions": {
+    "s_1a35cb80c7073a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a89afd77513d78071",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
