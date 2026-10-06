@@ -1,0 +1,51 @@
+src/core/plan/brake.ts
+  s_ed451e485d98d2::t_c0e070835cbd4e 144-148
+src/core/plan/planHelpers.test.ts
+  s_ed451e485d98d2::t_45d60d8077a59d 203-208
+src/core/types.ts
+  s_8232c28df410e4::t_23e239df52f342 401-405
+src/engine/compose/passScheduler.ts
+  s_b3140f40764683::t_fabc02d61827f0 9,159-160
+src/engine/compose/runtimeOps.ts
+  s_ed451e485d98d2::t_f894cf44859e70 60-62,72
+src/engine/reconcile/canvasJob.ts
+  s_ed451e485d98d2::t_e8d4c54582d659 143-144
+src/engine/reconcile/mergeJob.ts
+  s_ed451e485d98d2::t_f5359ff1da6c77 199-200
+src/engine/reconcile/reconciler.ts
+  s_b3140f40764683::t_7ee7000a49fea3 52-56,176-180,202
+src/sim/composed.test.ts
+  s_ed451e485d98d2::t_4fe800f2284663 239-262
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e3982bc71dc5bbe8155ff8e45b6a11ceea5837c6",
+  "prompts": {},
+  "sessions": {
+    "s_8232c28df410e4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a65d2a43c0bfc9176",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_b3140f40764683": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab5b9c0ddb9ea6151",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
