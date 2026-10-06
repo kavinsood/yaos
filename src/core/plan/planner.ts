@@ -223,18 +223,34 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		return { l: undefined, atRemote: false };
 	};
 
-	// ---- rename inference ------------------------------------------------------
-	// New = L entries with no R or S match (§f.6). A synced doc joins L at S.pathKey (§f.2): a file at the R.pathKey
-	// of a doc synced elsewhere, whose own file is still there, is not that doc's (its remote move has not landed
-	// here). It is new (or a local rename's target): published, it folds suffixed and the loser rename frees the
-	// path for the move. Treated as taken, nothing ever claimed it and the move's diskRename failed forever.
-	const remoteMatch = (l: LocalEntry): boolean => {
-		const x = input.remoteByPathKey.get(l.pathKey);
-		if (x === undefined) return false;
-		const sx = input.synced.get(x);
-		return !(sx && sx.pathKey !== l.pathKey && input.local.has(sx.pathKey));
+	// ---- remote moves into occupied paths ---------------------------------------
+	// A file at a live remote entry's path is that doc's, unless the doc is synced at another path and its file is
+	// still there: then the remote moved it onto a file this device has that the mover never saw (a local create or
+	// rename). That file is new here. It is created like any other (the fold suffixes it, its loser rename frees the
+	// path); the remote move waits for the path (`moveBlocked`).
+	const remoteOwns = (key: PathKey): boolean => {
+		const id = input.remoteByPathKey.get(key);
+		if (id === undefined) return false;
+		const s = input.synced.get(id);
+		return !(s && s.pathKey !== key && input.local.has(s.pathKey));
 	};
-	const freshLocal = inScopeLocal.filter((l) => !l.excluded && !syncedByKey.has(l.pathKey) && !remoteMatch(l));
+	// Keys this plan moves a synced file away from (remote moved it, not pinned by an own pending op).
+	const vacating = new Set<PathKey>();
+	for (const id of syncedIds) {
+		const s = input.synced.get(id)!;
+		const r = resolve(id);
+		if (r && r.state === "live" && !r.pendingLocal && r.pathKey !== s.pathKey && input.local.has(s.pathKey)) vacating.add(s.pathKey);
+	}
+	const moveBlocked = (r: RemoteEntry, l: LocalEntry): boolean => r.pathKey !== l.pathKey && input.local.has(r.pathKey) && !vacating.has(r.pathKey);
+	/** An own create of `l` would fold as an identical duplicate of the doc moving onto its path (merged, then dropped: a loop). */
+	const mergesIntoOwner = (l: LocalEntry): boolean => {
+		const id = input.remoteByPathKey.get(l.pathKey);
+		const w = id === undefined ? undefined : input.remote.get(id);
+		return w !== undefined && w.kind === l.kind && (l.hash === w.createHash || l.hash === (w.blob?.hash ?? null));
+	};
+
+	// ---- rename inference ------------------------------------------------------
+	const freshLocal = inScopeLocal.filter((l) => !l.excluded && !syncedByKey.has(l.pathKey) && !remoteOwns(l.pathKey));
 	const unhashedFresh = freshLocal.some((l) => l.hash === null);
 	const missing: SyncedEntry[] = [];
 	for (const id of docIds) {
@@ -433,6 +449,8 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 				pathChanged = true;
 			} else if (s.nsTouchSeq === 0 && collapse(s, r, l, prefix)) {
 				return;
+			} else if (moveBlocked(r, l)) {
+				// The target holds a new local file (see remoteOwns): keep the doc at its path until that file moves.
 			} else {
 				ops.push({ op: "diskRename", docId, from: l.path, to: r.path, expect: { t: "hash", hash: l.hash! } });
 				diskPath = r.path;
@@ -523,6 +541,7 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		if (l.excluded || claimed.has(l.pathKey)) return;
 		if (l.hash === null) return push([{ op: "needHash", path: l.path }]);
 		if (!isValidVaultPath(l.path) || !ctx.nsReady) return;
+		if (mergesIntoOwner(l)) return;
 		const id = takeFresh();
 		if (id === null) return;
 		push([{ op: "nsCreate", docId: id, kind: l.kind as DocKind, path: l.path, contentHash: l.hash, size: l.size }, ...initialContent(id, l)]);

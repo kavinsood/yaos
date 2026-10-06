@@ -158,7 +158,8 @@ test("a file at the remote-move target of a doc synced elsewhere is new: publish
 	const p = run({ ...moved, local: [L("seed0.md", h("c0")), L("r5.md", h("c2"))], over: { renames: [{ from: "r1.md", to: "r5.md", atMs: 1 }] } });
 	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d2", path: "r5.md" });
 	assert.ok(!opsOf(p).includes("nsDelete"), JSON.stringify(opsOf(p)));
-	assert.deepEqual(find(p, "diskRename"), { op: "diskRename", docId: "d1", from: "seed0.md", to: "r5.md", expect: { t: "hash", hash: h("c0") } });
+	// d1's move waits for r5.md to be freed by d2's loser rename (no diskRename into an occupied path).
+	assert.ok(!opsOf(p).includes("diskRename"), JSON.stringify(opsOf(p)));
 	// A plain new file there gets its own doc (the fold suffixes it; the loser rename frees the path).
 	const fresh = run({ remote: [R("d1", "r5.md")], synced: [S("d1", "seed0.md")], local: [L("seed0.md", h("c0")), L("r5.md", h("c7"))] });
 	assert.equal(find(fresh, "nsCreate").path, "r5.md");
@@ -448,6 +449,25 @@ test("remote-move target already on disk (crash after rename): adopt the path, n
 	const p = run({ remote: [R("d1", "b.md", { lastTouchSeq: 8 })], synced: [S("d1", "a.md")], local: [L("b.md", h("c0"))] });
 	assert.deepEqual(opsOf(p), ["syncedPut"]);
 	assert.equal(find(p, "syncedPut").entry.path, "b.md");
+});
+
+test("remote move onto a new local file: the file is created (fold suffixes it), the move waits for the path", () => {
+	// d1 synced at a.md (file still there); the remote moved it to b.md, where this device has a new file.
+	const sc = { remote: [R("d1", "b.md", { lastTouchSeq: 9 })], synced: [S("d1", "a.md")], local: [L("a.md", h("c0")), L("b.md", h("n1"))] };
+	const p = run(sc);
+	assert.deepEqual(opsOf(p), ["nsCreate", "reconcileContent"]);
+	assert.equal(find(p, "nsCreate").path, "b.md");
+	// The move becomes possible once the new file's loser rename frees b.md.
+	const later = run({ ...sc, remote: [...sc.remote, R("fresh1", "b (2).md")], synced: [...sc.synced, S("fresh1", "b.md", { contentHash: h("n1"), nsTouchSeq: 0 })] });
+	assert.deepEqual(later.ops.filter((o) => o.op === "diskRename").map((o) => o.op === "diskRename" && `${o.from}>${o.to}`), ["b.md>b (2).md", "a.md>b.md"]);
+	// A chain (the occupant moves away in the same plan) is not blocked.
+	const chain = run({
+		remote: [R("d1", "b.md"), R("d2", "c.md")],
+		synced: [S("d1", "a.md", { contentHash: h("1") }), S("d2", "b.md", { contentHash: h("2") })],
+		local: [L("a.md", h("1")), L("b.md", h("2"))],
+	});
+	assert.deepEqual(chain.ops.filter((o) => o.op === "diskRename").map((o) => o.op === "diskRename" && `${o.from}>${o.to}`), ["b.md>c.md", "a.md>b.md"]);
+	assert.ok(!opsOf(chain).includes("nsCreate"));
 });
 
 test("rename cycle a<->b goes through a temp name", () => {
