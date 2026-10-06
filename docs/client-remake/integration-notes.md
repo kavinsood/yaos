@@ -25,6 +25,23 @@ The last code change is 5735ad5; 5b1803e touches only the e2e harness
 (onboarding sends an `Origin` header, §7). The commit after it holds only
 these notes.
 
+After the legacy port and the deletion of the old client (branch
+client-remake-legacy, code at 1a69e4a), the gates are:
+- typecheck: clean;
+- check-deps: 0 errors, 0 warnings;
+- `npm run test:client`: 815 tests pass;
+- the production build passes its plugin smoke test;
+- the local full-client e2e: 53/53.
+
+The sim sweep at 1a69e4a found no bad seeds: 3 devices with faults, seeds
+1-1000; 5 devices, 1-250; heavy, 1-500 (§6).
+
+`npm run lint` does not run, and it fails the same way at 9b618d5. ESLint
+aborts on `e2e/client/*.ts`, which no typed project covers. With `e2e/`
+ignored it reports 2078 problems: 1279 in `src/`, 767 in `packages/cli`
+(which still imports the deleted `legacy-src/`) and 32 in `server/`. The new
+client has never been linted.
+
 ## 2. Architecture
 
 ```
@@ -287,6 +304,15 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - Lifecycle (4a14c02): on desktop and tablet `hidden` only flushes and keeps
   the socket (an occluded desktop window also reports hidden). The hidden
   state is not carried across an engine restart.
+- Since 4a14c02 a backgrounded app runs no passes, so the sim's users no
+  longer act on a hidden or frozen app; the external writer still does
+  (1a69e4a, §6 seed 131). Several disk writes made while the app is in the
+  background reach the engine as one change on resume. The diff of that
+  change can then reuse characters of a deleted word. Example: delete
+  "[C.42]" and add "[C.105]" diffs as "42" -> "105". A concurrent delete of
+  "[C.42]" on another device then leaves "105". This is the same as an
+  in-place edit of the word, which minimalDiff keeps minimal by design
+  ("foo(bar)" -> "foo(baz)").
 - The daily-limit popup (once per reset window) forgets that it was shown
   when the engine restarts.
 
@@ -347,6 +373,20 @@ ordering bugs (heavy 119, 246) and the waiting-delete case behind D17
 
 Final run on 5735ad5: 3000 + 250 + 250 seeds, 0 bad, 0 token failures;
 `npm run test:client` (743 tests including the 200-seed sim) passes.
+
+**Seed 131.** On client-remake-legacy, 3 devices with default faults, seed
+131 lost a token after the lifecycle commit 4a14c02. A bisect from 9b618d5
+found 4a14c02 as the first bad commit. The cause:
+1. The user typed through device C while it was frozen.
+2. The engine had paused passes, as §i.4 requires, so a delete of "[C.42]"
+   and an insert of "[C.105]" reached it as one diff, "42" -> "105".
+3. A concurrent delete of "[C.42]" elsewhere took the reused brackets.
+
+The fix (1a69e4a) is in the sim, not the engine: actors skip user actions
+while a device is backgrounded, and external writes still run (DESIGN §l.1).
+At 1a69e4a the sweep found no bad seeds: 3 devices with faults, seeds
+1-1000; 5 devices, 1-250; heavy, 1-500. The same 1000-seed sweep at 9b618d5
+found none either.
 
 
 ## 7. End-to-end results
