@@ -7,6 +7,7 @@ import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import { badRequest } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { utf8Encode } from "../../core/codec/lib0";
@@ -104,18 +105,31 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 			return { t: "ok" };
 		}
 		case "createSnapshot":
-			await rt.takeSnapshot("manual");
+			// null: over the size cap (a notice says so) or the write failed (logged).
+			if ((await rt.takeSnapshot("manual")) === null) throw new Error("the snapshot could not be saved (vault over the 256 MiB snapshot limit, or a write error)");
 			return { t: "ok" };
 		case "listSnapshots": {
 			const list = await rt.snaps.list();
-			return { t: "snapshots", snapshots: list.map((s) => ({ id: s.id, createdAtMs: s.createdAtMs, files: s.files, bytes: s.bytes })) };
+			return { t: "snapshots", snapshots: list.map((s) => ({ id: s.id, createdAtMs: s.createdAtMs, reason: s.reason, files: s.files, bytes: s.bytes })) };
+		}
+		case "snapshotFiles": {
+			const m = await rt.snaps.manifest(c.snapshotId);
+			if (!m) throw badRequest(`snapshot ${c.snapshotId} not found`);
+			return {
+				t: "snapshotFiles", snapshotId: c.snapshotId,
+				files: m.files.map((f) => ({ path: f.path, kind: f.kind, size: f.size })),
+				skipped: m.skipped.map((f) => ({ path: f.path, reason: f.reason })),
+			};
 		}
 		case "restoreSnapshot": {
 			const r = await rt.snaps.restore(c.snapshotId, c.paths);
 			rt.diag(`restore ${c.snapshotId}: ${r.restored.length} restored, ${r.copies.length} copies, ${r.failed.length} failed`);
 			rt.sched.request({ t: "full" }, true);
-			return { t: "ok" };
+			return { t: "restored", restored: r.restored.length, unchanged: r.unchanged.length, copies: r.copies, failed: r.failed };
 		}
+		case "deleteSnapshot":
+			await rt.snaps.remove(c.snapshotId);
+			return { t: "ok" };
 		case "exportDiagnostics":
 			return { t: "diagnostics", bundle: await diagnostics(rt) };
 		case "releaseQuarantine": {

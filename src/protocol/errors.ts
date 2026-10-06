@@ -26,3 +26,18 @@ export interface ProtocolError {
 
 /** Codes after which the host must not retry automatically. */
 export const TERMINAL_ERROR_CODES: readonly ProtocolErrorCode[] = ["version-mismatch", "revoked"];
+
+/**
+ * Thrown on the engine side to answer a request with this exact error (code and message) instead of the
+ * generic `internal` one.
+ */
+export class ProtocolFailure extends Error {
+	constructor(readonly error: ProtocolError) {
+		super(error.message);
+		this.name = "ProtocolFailure";
+	}
+}
+
+export function badRequest(message: string): ProtocolFailure {
+	return new ProtocolFailure({ code: "bad-request", message, retryable: false });
+}

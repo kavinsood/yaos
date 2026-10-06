@@ -1722,13 +1722,21 @@ ones get conflict copies.
 - **Snapshot:** a zip (fflate) of markdown and canvas files, plus blobs ≤ 1 MiB, with a manifest of path, hash and
   size. Written as side file `snapshots/<id>.zip`. Capped at 256 MiB; skipped above with a notice.
 - **When taken:**
-  - daily, keeping `keepDaily`;
-  - before a brake approval, an epoch migration, an IDB recovery, and `restoreSnapshot`.
+  - daily, keeping `keepDaily` (with snapshots enabled);
+  - before a brake approval, an epoch migration and an IDB recovery (with snapshots enabled);
+  - on `createSnapshot` and before every `restoreSnapshot`, even with snapshots disabled (user actions);
+  - the newest 10 non-daily snapshots are kept.
 - **Optional R2 upload:** with `uploadToBlobStore` and a `BlobPort`, the sealed zip is `put` under its hash address.
-  The local index keeps the address. Cross-device restore is out of scope for v1.
-- **Restore** (`restoreSnapshot{id, paths|null}`):
-  - files are written as ordinary local edits (precondition `any`, after a `conflictCopy` of any differing current
-    file);
+  The address is not recorded, so the upload is an off-device copy only. Cross-device restore is out of scope for v1.
+- **Commands** (`src/protocol/messages.ts`): `listSnapshots` → `snapshots` (id, time, reason, file count, bytes);
+  `snapshotFiles{id}` → the manifest's files (path, kind, size) and `skipped` entries (too large, unreadable);
+  `restoreSnapshot{id, paths|null}` → `restored` (counts, conflict copies, failed paths); `deleteSnapshot{id}`.
+  - Ids come from the host and must parse as snapshot ids (no path tricks); unknown ids are `bad-request`.
+  - Without a running vault runtime these commands, `createSnapshot` and `exportDiagnostics` fail with `not-ready`.
+- **Restore:**
+  - files are written as ordinary local edits, after a `conflictCopy` of any differing current file. The write uses
+    precondition fingerprint(current) or absent instead of `any`, so a file edited between the read and the write is
+    reported failed, not clobbered;
   - they sync normally and are subject to the brake (overwrite counting).
 
 ### j.5 Onboarding and import
