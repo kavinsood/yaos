@@ -1,0 +1,21 @@
+src/engine/reconcile/canvasJob.ts
+  s_ed451e485d98d2::t_2a7a0ccff456b4 31,74-75
+src/engine/reconcile/mergeJob.ts
+  s_ed451e485d98d2::t_5011dbe9c8fb03 79-82,84,92-94
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "86c2a8b650202cf88ae4597991ec5f9df77ccf97",
+  "prompts": {},
+  "sessions": {
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
