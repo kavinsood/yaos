@@ -1,0 +1,23 @@
+docs/client-remake/DESIGN.md
+  s_ab5bcc5cfffe93::t_04dcac3c24db0f 1989-1990,1995-2001,2003-2008,2012
+src/host/ui/pairing.ts
+  s_ab5bcc5cfffe93::t_524a31837fc67a 3
+src/host/ui/settingsTab.ts
+  s_ab5bcc5cfffe93::t_c4b89c1ed37914 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ee311813034105c4fdbb65c2131dc481831c651d",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
