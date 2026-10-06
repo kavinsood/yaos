@@ -3,15 +3,13 @@
  *
  * DiskFingerprint = sha256(exact bytes). ContentHash = logical hash:
  * markdown-lf-v1 canonical bytes for markdown (strip one BOM, CRLF/CR -> LF),
- * exact bytes for blobs.
- *
- * INTEGRATION: canvas logical hash must become WP-B's
- * core/hash/canvasCanonical.canvasContentHash; until then canvas hashes its
- * exact bytes (a "hash" precondition on a canvas file only passes when the
- * engine computed the hash the same way).
+ * json-canvas-canonical-v1 for canvas (core canvasContentHash, the engine's
+ * definition: invalid canvas JSON falls back to its exact bytes), exact bytes
+ * for blobs.
  */
 
-import type { ContentHash, DiskFingerprint } from "../core/types";
+import { canvasContentHash } from "../core/hash/canvasCanonical";
+import type { ContentHash, DiskFingerprint, VaultPath } from "../core/types";
 import { kindOfPath } from "../core/types";
 import type { HashPort } from "../ports/crypto";
 
@@ -49,9 +47,11 @@ export function createHasher(hash: HashPort): Hasher {
 			return toHex(await hash.sha256(bytes)) as DiskFingerprint;
 		},
 		async contentHash(path, bytes) {
-			if (kindOfPath(path) === "markdown") {
+			const kind = kindOfPath(path as VaultPath);
+			if (kind === "markdown") {
 				return toHex(await hash.sha256(utf8(canonicalizeMarkdown(fromUtf8(bytes))))) as ContentHash;
 			}
+			if (kind === "canvas") return canvasContentHash(bytes);
 			return toHex(await hash.sha256(bytes)) as ContentHash;
 		},
 	};
