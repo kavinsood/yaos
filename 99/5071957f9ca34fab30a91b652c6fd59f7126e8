@@ -1,0 +1,33 @@
+src/sim/actors.ts
+  s_ed451e485d98d2::t_c6f9b7f0deeb0b 104-107,264-268
+src/sim/device.ts
+  s_ed451e485d98d2::t_8c1927dfbb8eb8 31,113-122,159,211-213,218-219,227-233,235,238-243
+src/sim/faults.ts
+  s_ed451e485d98d2::t_59e7ba295d017c 2-3,5-18,21,25-26,28-30,35-37,41-47,51-54,71-73,77-83,87-88,91-92,100,103-113,118,135-165,167-169,177-197,199-205,211,215,222,224-231,233-267,290-299,307-310
+src/sim/inspect.ts
+  s_ed451e485d98d2::t_c879e4538a9da0 1-85
+src/sim/invariants.ts
+  s_ed451e485d98d2::t_c1bd9ed4db7e9e 2,5-9,19-25,27-28,31-34,36,38,45,57-63,78-103,105,156,159-160,165-175,181,201-203,206,212-214,216
+src/sim/net.ts
+  s_ed451e485d98d2::t_c7af3889c23f32 10,75-81,101,104,120
+src/sim/run.test.ts
+  s_ed451e485d98d2::t_d7aaf2950d07c3 1,10-12,84,86-87,90-91,95,98-99
+src/sim/run.ts
+  s_ed451e485d98d2::t_d5def8b40496c1 14-16,19,21,24-25,27,46-48,70-72,86,129-130,135,137,142-143,171,176,182-183,189,191-209,219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "995071957f9ca34fab30a91b652c6fd59f7126e8",
+  "prompts": {},
+  "sessions": {
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
