@@ -12,7 +12,7 @@ import { suite } from "../harness.ts";
 import { installDomCrypto } from "./helpers/installDomCrypto";
 import { FakeIndexedDb } from "../mocks/indexedDb";
 import type { SettingsDirAdapter } from "../../legacy-src/sync/settingsSync/watch";
-import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../server/src/shared/binaryEnvelope";
+import { encodeBinaryEnvelope, YAOS_BINARY_CONTENT_TYPE } from "../../legacy-src/shared/binaryEnvelope";
 
 installDomCrypto();
 const s = suite("settings-sync-engine");

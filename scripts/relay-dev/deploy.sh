@@ -3,11 +3,11 @@
 #
 #   scripts/relay-dev/deploy.sh [<yaos-relay2-name>] [--var K=V]... [--dry-run]
 #
-# Config: scripts/relay-dev/config.sh (server/wrangler.toml, name replaced, no R2, YAOS_STREAMS=true) written
+# Config: scripts/relay-dev/config.sh (server/wrangler.toml, name replaced, no R2) written
 # to server/wrangler.relay2-<suffix>.toml (git-excluded). Credentials: the `cf` CLI OAuth session, fed to
-# wrangler through scripts/relay2/cf-cred.sh (never printed).
+# wrangler through scripts/relay-dev/cf-cred.sh (never printed).
 # The account sits at the Durable Object namespace cap (500; each worker = 3; CF error 10067), so a new name fails
-# until namespaces are freed. Like scripts/relay2/runfast.sh --reuse-pool, redeploy onto an idle yaos-relay2-*
+# until namespaces are freed. Redeploy onto an idle yaos-relay2-*
 # worker instead (same script + classes = same namespaces); the client e2e target is yaos-relay2-scratch-3.
 # Output goes to $EXP_ROOT/logs/client-e2e-deploy-<name>-<ts>.log; the URL is printed after
 # /api/capabilities reports "streams":1.
@@ -36,7 +36,7 @@ relay_dev_config $NAME "${VARS[@]}" > $WT/server/$TOML
 grep -A20 '^\[vars\]' $WT/server/$TOML
 (( DRY )) && { echo "dry run; not deploying"; exit 0; }
 
-source $WT/scripts/relay2/cf-cred.sh
+source $WT/scripts/relay-dev/cf-cred.sh
 cd $WT/server
 # `cf deploy` (tried first per the experiment rules) refuses to run here: it delegates to wrangler >= 4.136 in
 # server/node_modules and server/ pins 4.69, and it has no flag for a non-default config file. Deploy with

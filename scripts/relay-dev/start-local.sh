@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Local streams relay for the client remake: `wrangler dev` (real workerd + local DO SQLite) with
-# YAOS_STREAMS=true and no R2, the same config as the deployed e2e worker (scripts/relay-dev/deploy.sh).
+# no R2, the same config as the deployed e2e worker (scripts/relay-dev/deploy.sh).
 #
 #   scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--var K=V]...
 #

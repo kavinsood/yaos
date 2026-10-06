@@ -8,9 +8,9 @@
 	//
 	//   npx tsc -noEmit -p tsconfig.tests.json
 	//
-	// `lib` tracks the Node runtime floor declared in package.json. The repository
-	// now ships Node-24 CLI and server runtimes, so ES2024 APIs are part of the
-	// supported surface. Raise this only with the declared runtime floor.
+	// `lib` tracks the Node runtime floor declared in package.json (Node 24), so
+	// ES2024 APIs are part of the supported surface for tests and tooling. Raise
+	// this only with the declared runtime floor.
 	//
 	// The target/module bump to ES2022 is unavoidable — suites legitimately use
 	// top-level await, which the plugin's ES6 target forbids — but that affects

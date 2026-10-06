@@ -7,10 +7,8 @@
  * overrides. Nothing installs it by default, so every accessor returns the
  * production value passed in by the caller.
  *
- * Installation paths (both require the master flag
+ * Installation path (requires the master flag
  * `YAOS_TEST_ONLY_FAST_TIMERS=true`):
- * - CLI: environment variables, parsed in `packages/cli/src/config.ts`, like
- *   the existing `YAOS_TEST_ONLY_RECONCILE_INTERVAL_MS` precedent.
  * - Plugin: only a bundle built with the esbuild define
  *   `__YAOS_TEST_ONLY_TIMERS__` (a JSON object of the same variables) honors
  *   anything. The shipped production build never defines it, so no setting,

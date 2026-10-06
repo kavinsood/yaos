@@ -18,7 +18,7 @@
 //
 // Docs: https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/
 // ("every row update of an index counts as an additional row"; deletes count).
-import type { NodeSqliteStorage } from "../../../packages/server-node/src/storage";
+import type { NodeSqliteStorage } from "./nodeSqliteStorage";
 
 interface IndexInfo { name: string; columns: string[] }
 

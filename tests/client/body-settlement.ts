@@ -4,7 +4,7 @@ import {
 	validateBodySettlement,
 	type StoredBodySettlement,
 } from "../../legacy-src/sync/bodySettlement";
-import { canonicalMarkdownHash } from "../../server/src/shared/markdownCodec";
+import { canonicalMarkdownHash } from "../../legacy-src/shared/markdownCodec";
 import { suite } from "../harness.ts";
 
 const s = suite("body-settlement");

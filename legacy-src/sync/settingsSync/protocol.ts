@@ -3,7 +3,7 @@ import {
 	decodeBinaryEnvelope,
 	encodeBinaryEnvelope,
 	YAOS_BINARY_CONTENT_TYPE,
-} from "../../../server/src/shared/binaryEnvelope";
+} from "../../shared/binaryEnvelope";
 import { obsidianRequest } from "../../utils/http";
 import {
 	SETTINGS_SYNC_FORMAT_VERSION,

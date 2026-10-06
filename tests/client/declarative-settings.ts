@@ -4,7 +4,7 @@ import { VaultSyncSettingTab, type VaultSyncSettingsHost } from "../../legacy-sr
 import { emptySettingsSyncStatus, type SettingsSyncStatus } from "../../legacy-src/sync/settingsSync/types";
 import { readSource, suite } from "../harness.ts";
 import type { OperationalResourceSnapshot } from "../../legacy-src/runtime/operationalResourceSnapshot";
-import { MAX_CLIENT_MARKDOWN_KB } from "../../server/src/shared/durableLimits";
+import { MAX_CLIENT_MARKDOWN_KB } from "../../legacy-src/shared/durableLimits";
 
 const s = suite("declarative-settings");
 

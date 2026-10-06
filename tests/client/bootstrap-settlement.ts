@@ -15,7 +15,7 @@ import type {
 import { suite } from "../harness.ts";
 import { BodyManager } from "../../legacy-src/sync/bodyManager";
 import { BodySettlementRepository, type StoredBodySettlement } from "../../legacy-src/sync/bodySettlement";
-import { canonicalMarkdownHash, exactMarkdownDiskFingerprint } from "../../server/src/shared/markdownCodec";
+import { canonicalMarkdownHash, exactMarkdownDiskFingerprint } from "../../legacy-src/shared/markdownCodec";
 import { SCHEMA_VERSION } from "../../legacy-src/sync/schema";
 
 const s = suite("bootstrap-settlement");

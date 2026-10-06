@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import {
 	SOCKET_LIVENESS_DESCRIPTOR,
 	SOCKET_LIVENESS_TIMEOUT_MS,
-} from "../../server/src/shared/socketLiveness";
+} from "../../legacy-src/shared/socketLiveness";
 import {
 	SocketLivenessCoordinator,
 	type SocketLivenessClock,

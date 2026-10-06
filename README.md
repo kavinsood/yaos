@@ -4,19 +4,20 @@
 
 **A zero-terminal, real-time sync engine for Obsidian, powered by your own Cloudflare Worker.**
 
-YAOS synchronizes Markdown live across devices and invited people with CRDT merge
-semantics. One server can host multiple vaults; each person has a vault-scoped
-identity with separately revocable devices.
+YAOS syncs your Obsidian vaults live across your devices, with CRDT merging. It is built for one person. Each
+server has one operator, and holds any number of vaults. Each device is paired with a one-time code and can be
+revoked on its own.
 
 <img src="https://github.com/user-attachments/assets/ee937050-8a05-4d56-9c5f-3ae5003496fc" alt="YAOS syncing a note across desktop and mobile in real time" width="720" />
 
-No terminal, `.env` file, database setup, or R2 bucket is required for Markdown sync.
+No terminal, `.env` file, database setup, or R2 bucket is required for note sync.
 
 [![License: 0-BSD](https://img.shields.io/badge/license-0--BSD-green)](LICENSE)
 
 ## How it compares
 
-YAOS runs on infrastructure in your Cloudflare account. Markdown content is split into independently loaded CRDT bodies rather than one vault-wide content document.
+YAOS runs on infrastructure in your Cloudflare account. The server only relays changes; merging happens on your
+devices.
 
 | | Conflicts | Real-time | Deployment | No terminal | Free |
 |---|:---:|:---:|:---:|:---:|:---:|
@@ -35,86 +36,109 @@ If you want the official, fully managed experience, use Obsidian Sync. If you wa
 </a>
 
 1. **Deploy the server.** Click **Deploy to Cloudflare** above.
-2. **Claim it.** Open the Worker URL, click **Claim**, and save the operator recovery key. Claiming provisions a Personal vault and returns a one-use owner-bootstrap code.
-3. **Install YAOS.** Install the plugin from the Obsidian Marketplace.
-4. **Enroll this folder.** Open the setup link or scan the QR code. Use **Add my device** for another installation you own and **Invite person** for a collaborator.
+2. **Claim it.** Open the Worker URL and click **Generate a recovery key**.
+   - Save the operator recovery key in your password manager. It is shown only once, and it is the only way to
+     sign in to the console. It cannot be reset.
+   - Tick **I have saved the recovery key**, then click **Claim server**.
+   - Claiming creates your first vault and shows a one-time pairing code with a QR code.
+3. **Install YAOS.** Install the plugin from Obsidian's Community plugins on each device.
+4. **Pair a device.**
+   - On a phone, scan the QR code and tap **Connect Obsidian**.
+   - On a computer, click **Open in Obsidian**, or open YAOS settings, choose **Pair this device**, and enter the
+     server URL and the code.
+   - A code works once and expires after 15 minutes.
+5. **Pair more devices.** Click **Pair a device** on the vault in the console. Or, on a device that is already paired,
+   open YAOS settings and choose **Pair another device**.
 
-The operator key opens the server console. It is not a device credential and must not be pasted into plugin settings.
+The operator recovery key opens the server console. It is not a device credential; never paste it into plugin
+settings.
 
-## Vault collaboration
+## One operator, vaults and devices
 
-Every vault has one owner and any number of full members. Everyone can read and
-change the complete vault, including creating, moving, and deleting notes and
-attachments. Only the owner manages people, recovery, security audit, vault
-policy, ownership transfer, and destruction. YAOS intentionally does not offer
-viewer roles, folder permissions, or per-person permission toggles.
+- **One operator.** The person who claims the server is its only operator, and the console at the Worker URL is
+  theirs. YAOS has no members, invitations or roles. Every paired device can read and change its whole vault.
+- **Vaults.** One server holds any number of vaults. Create them in the console with **Create vault**. Each vault
+  syncs on its own.
+- **Devices.** A device stays paired until you revoke it. **Devices** on a vault lists them.
+  - **Revoke** cuts a device off at once: its connections close, and changes it had not yet synced are dropped. To
+    use it again, pair it again.
+  - Revoking cannot erase files already on that device.
+- **Reset streams** deletes the vault's synced content on the server and starts it over. You must type the vault
+  ID first. Devices stay paired and upload again from their files, and attachments are kept.
+- **Delete vault** removes the vault, its devices and its attachments for good. You must type the vault ID first.
 
-Invitations grant complete plaintext read/write access. Removing a member stops
-future admission and closes their sessions, but cannot erase files already
-downloaded to their devices. See [vault collaboration](./docs/collaboration.md).
+## Attachments (optional R2)
 
-## Obsidian settings sync
+Notes sync through Durable Object storage and need no R2.
 
-Settings sync is enabled by default after enrollment and is independent of note sync. Before a pre-existing remote environment can change this folder, open **Settings → YAOS → Obsidian settings sync** and choose **Take the remote seed**, **Seed from this device**, or **Decide initial seed later**. The choice is stored for this exact enrollment, folder, device, and configuration-folder name. Use **Replace remote settings environment** only when this device should replace an existing seed.
+Images, PDFs and other non-note files sync through an R2 bucket bound as `YAOS_BUCKET`. The shipped
+`server/wrangler.toml` binds a bucket named `yaos`. Without the binding:
+- the server reports attachments as off;
+- the console's header line says so;
+- the server refuses attachment uploads;
+- notes keep syncing.
 
-YAOS synchronizes a closed allowlist of Obsidian JSON files, CSS snippets, community-plugin intents, theme intents, and version-matched plugin `data.json`. It does not store plugin or theme binaries; automatic package installation/removal requires separate explicit consent and is off by default. Each person's settings environment is private to their principal and synchronizes only across their own devices. Settings state is stored in the vault Durable Object's SQLite sidecar, not Yjs or R2. Unsupported servers, an off switch, or a detected settings-sync clash pause settings only; notes continue syncing. See [operations](./docs/operations.md#settings-sync-setup-and-operation) for setup, limits, and recovery behavior.
-
-## Attachments and recovery
-
-Markdown and explicitly promoted semantic Canvas files use Durable Object SQLite and work without R2. Add a `YAOS_BUCKET` R2 binding to synchronize images, PDFs, opaque Canvas fallback, and other non-Markdown content; enable Canvas promotion/demotion rollback; and enable asynchronous recovery points.
+Uploads are limited to 10 MiB per file. Reset and restore keep attachments; deleting a vault removes them.
 
 <a href="https://youtu.be/Z7xCMEYfdFM">
   <img src="https://img.youtube.com/vi/Z7xCMEYfdFM/maxresdefault.jpg" width="480" alt="Watch the R2 setup video" />
 </a>
 
-Recovery points can be captured in the background, browsed by path, and selectively restored. A deployment also needs the included `RecoveryJob` Durable Object binding and migration for this capability. See [operations](./docs/operations.md).
+## Restore to a point in time
+
+**Restore** in the console rewinds a vault's synced content to any moment in the last 30 days. It uses Cloudflare's
+Durable Object point-in-time recovery.
+- Device pairings stay as they are now: a restore rewinds content, never access.
+- Unused pairing codes are cancelled.
+- The vault gets a new epoch, which tells devices that the server content was replaced.
+- Restore needs a deployed Worker. Local development (`wrangler dev`) has no point-in-time recovery, and the console
+  says so.
+
+Separately, each device can keep daily zip snapshots of its notes (YAOS settings, **Daily recovery snapshots**).
 
 ## Works with local tools
 
-Obsidian vaults remain ordinary local files. Changes made by editors, scripts, Git tools, or agents enter the same reconciliation path and can synchronize across enrolled devices.
+Obsidian vaults remain ordinary local files. Changes made by editors, scripts, Git tools, or agents enter the same reconciliation path and can synchronize across paired devices.
 
-## Headless Linux client
+## Hosting: Cloudflare only
 
-The Node 24 CLI synchronizes Markdown in a local directory without Obsidian. It enrolls as its own vault-scoped device; credentials are generated and stored outside the vault rather than copied from another installation.
+YAOS runs only on Cloudflare: one Worker with two Durable Object classes (a `VaultDO` per vault and one `ConfigDO` per server), plus an optional R2 bucket for attachments. There is no self-hosted Node or Docker server and no headless CLI client. The server core sits behind small storage, socket and clock ports so its tests run on Node; that is a test seam, not a hosting option.
 
-```sh
-npm run build:cli
+The server is an opaque relay. It never interprets payloads, checkpoints, stream names or blob contents.
 
-YAOS_HOST=https://sync.example.workers.dev \
-YAOS_PAIRING_CODE=... \
-node packages/cli/dist/yaos.mjs enroll /srv/vault
-
-node packages/cli/dist/yaos.mjs daemon /srv/vault
-```
-
-The daemon is Linux/local-filesystem only, Markdown only, and single-process per vault. `.obsidian`, attachments, network filesystems, and rename-identity inference are intentionally outside its contract. See [operations](./docs/operations.md#headless-linux-client).
-
-## Self-hosted Docker server
-
-The production image packages `packages/server-node`, which runs the same
-schema-8 control-plane, vault, settings, attachment, recovery, and deletion
-owners as the Cloudflare Worker over Node 24, SQLite, WebSockets, and filesystem
-object storage.
-
-```sh
-YAOS_PUBLIC_ORIGIN=https://sync.example.com docker compose up --build -d
-```
-
-The `yaos-data` volume is the complete durable server state. Put TLS in front of the container, preserve that volume, and pin released deployments to an exact `ghcr.io/kavinsood/yaos-server:<version>` image. See [operations](./docs/operations.md#docker-deployment).
+Moving from a pre-rewrite server is a fresh deployment, not an upgrade. There is no data migration: the deploy's Durable Object migration deletes the old classes (`VaultSyncServer`, `ServerConfig`, `RecoveryJob`) together with their stored data, the new server starts unclaimed, and each device re-seeds it from its local files.
 
 ## Troubleshooting
 
-**Unauthorized or auth rejected:** The principal membership or this device credential is missing, revoked, or belongs to another vault. Re-enroll with a fresh purpose-correct code.
+**YAOS: re-pair device.** The device was revoked in the console, or its vault was deleted. Pair it again with a new
+code (**Pair this device**).
 
-**Recovery unavailable:** Recovery needs both `YAOS_BUCKET` and the `YAOS_RECOVERY_JOBS` binding. Markdown sync remains available without R2.
+**Lost the operator recovery key.** The server stores only a hash of the key, so nobody can recover or reset it.
+Paired devices keep syncing, but no one can sign in to the console.
 
-**Cloudflare deployment issues:** See [operations](./docs/operations.md#troubleshooting), including the required Durable Object migration and R2 binding.
+**Restore says the server cannot restore.** Point-in-time recovery exists only on a deployed Worker, and only for the
+last 30 days. A time outside that window is refused before anything changes.
 
-**Files not syncing:** Check exclusions and file-size limits, then use **Show sync debug info**. Safe exports redact the server URL, vault and device identity, credentials, and vault paths.
+**Restore incomplete.** The console shows this banner when a restore was interrupted. Pairing, revoking and
+resetting that vault wait until it finishes. The server finishes it on its own within about a minute, or you can
+press **Restore** to resume it now.
+
+**YAOS: daily limit.** On the Workers Free plan, Durable Objects allow 100,000 rows written per day. Past that the
+server refuses writes until the limit resets; the console shows the reset time.
+
+**Attachments do not sync.** If the console's header line says attachments are off, add the `YAOS_BUCKET` R2 binding
+and redeploy. Also check **Sync attachments** and **Maximum attachment size (MB)** in YAOS settings. The server
+accepts at most 10 MiB per file.
+
+**Files not syncing.** Check **Excluded paths** in YAOS settings. Then use **Export diagnostics**, which saves a
+file without note contents or credentials. If sync seems stuck, use **Rebuild local cache**.
 
 ## Engineering documentation
 
-The compact current source set is indexed in [docs/README.md](./docs/README.md).
+- [docs/server-rewrite/DECISIONS.md](./docs/server-rewrite/DECISIONS.md): the server design, including its route
+  table.
+- [docs/client-remake/relay-wire.md](./docs/client-remake/relay-wire.md): the wire contract that design amends (see
+  its section 5).
 
 ## License
 
