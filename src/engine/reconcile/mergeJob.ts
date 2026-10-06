@@ -75,9 +75,11 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	const D = canonicalizeMarkdown(decoded);
 	const F = exactFingerprint(rd.bytes);
 	const s = ctx.synced(docId);
-	// §c.12: after an epoch migration a doc with no synced record merges against the old epoch's base at its path.
-	const pathBase = op.pathBase || !s ? ctx.deps.pathBase?.(ctx.pk(op.path)) ?? null : null;
-	const storedBase = op.pathBase ? pathBase : op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : pathBase;
+	// §c.12: after an epoch migration a doc with no synced record (or a differing re-create loser merged into its
+	// winner, op.pathBase) merges against the old epoch's base at its path, but only while the new epoch's text
+	// still contains that base (trustedEpochBase): a base ahead of the new epoch would read as deletions.
+	const epochBase = op.pathBase || !s ? ctx.deps.pathBase?.(ctx.pk(op.path)) ?? null : null;
+	const storedBase = !op.pathBase && op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
 	// The synced-side fallback below needs a record describing this doc's last sync (not a rebound loser's).
 	const fallback = op.pathBase ? undefined : s;
 	const ytext = h.doc.getText("text");
@@ -91,7 +93,8 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		crdt0 = ytext.toString();
 		// No stored base (mirror recovery, too large to keep): a side still at the synced content is the base,
 		// so a one-sided change applies as one instead of a no-base conflict copy.
-		const base = storedBase ?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : markdownContentHash(crdt0) === fallback.contentHash ? crdt0 : null);
+		const base = storedBase ?? trustedEpochBase(epochBase, crdt0)
+			?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : markdownContentHash(crdt0) === fallback.contentHash ? crdt0 : null);
 		await ctx.deps.clock.yieldNow();
 		const res = merge({ base, disk: D, crdt: crdt0, limits: ctx.mergeLimits });
 		const M = res.kind === "identical" ? D : res.text;
@@ -160,6 +163,23 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		local,
 	);
 	return "ok";
+}
+
+/**
+ * §c.12 path base, trusted only when the new epoch's text still holds all of it
+ * (base is a subsequence of crdt). The old base can be ahead of the new epoch:
+ * it includes own edits the old relay never received (offline imports, pending
+ * creates) and acked edits the migrating peer never saw before the reset. A
+ * 3-way merge against such a base reads the peer's staleness as deletions and
+ * drops local text. With base ⊑ crdt the crdt side only inserted, so no disk
+ * text can be lost; otherwise null: the no-base merge keeps the disk side as a
+ * conflict copy.
+ */
+export function trustedEpochBase(base: string | null, crdt: string): string | null {
+	if (base === null || base.length > crdt.length) return null;
+	let i = 0;
+	for (let j = 0; i < base.length && j < crdt.length; j++) if (base.charCodeAt(i) === crdt.charCodeAt(j)) i++;
+	return i === base.length ? base : null;
 }
 
 function rebaseOnDisk(ctx: Env["ctx"], s: SyncedEntry, D: string, F: DiskFingerprint, stat: { size: number; mtimeMs: number }) {

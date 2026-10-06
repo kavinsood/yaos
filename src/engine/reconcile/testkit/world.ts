@@ -24,6 +24,8 @@ export interface WorldOptions {
 	readonly brake?: Partial<BrakeConfig>;
 	readonly settings?: Partial<ReconcileSettings>;
 	readonly deviceLabel?: string;
+	/** §c.12 path-keyed bases from the previous epoch (ReconcilerDeps.pathBase). */
+	readonly pathBases?: ReadonlyMap<string, string>;
 }
 
 export const DB = "yaos2-test";
@@ -63,6 +65,7 @@ export class World {
 			brake: { ...DEFAULT_BRAKE, ...this.opts.brake },
 			notice: (level, code, message) => this.notices.push({ level, code, message }),
 			onBrake: (report) => this.brakes.push(report),
+			pathBase: this.opts.pathBases ? (key) => this.opts.pathBases!.get(key) ?? null : undefined,
 		});
 		this.log.onOwnFold = (events) => rec.applyOwnFold(events);
 		this.rec = rec;
