@@ -1,0 +1,33 @@
+docs/client-remake/relay-wire.md
+  s_6e0df1c7504874::t_abd01ff406caba 162,365-385,462,645
+server/src/streams/protocol.ts
+  s_42fec8a9c03dda::t_3ee1a8ab6241fd 32-36
+server/src/streams/relay.ts
+  s_42fec8a9c03dda::t_d5f0edc2830b38 29,43,242-255,324,724-730,732-736,741-766
+tests/server/streams-relay.ts
+  s_6e0df1c7504874::t_1e2220b6022ef7 479-519
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "18ea6fdb6c0b57676e2ccc373c4a3a6698ce3eb8",
+  "prompts": {},
+  "sessions": {
+    "s_42fec8a9c03dda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab7f16ac97bca1a6d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_6e0df1c7504874": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a391b87c3ffcb4eb9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
