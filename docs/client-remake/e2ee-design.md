@@ -962,3 +962,98 @@ rather than an accident.
 | Server-held key recovery | Never existed | RK (§13) |
 | Operator snapshot or recovery routes | Removed by the rewrite (DECISIONS §1, D5) | Local snapshots; uploads are sealed blobs (§9.1) |
 | Server-side size accounting per vault | Still works, but sizes are padded (§7.3) | n/a |
+
+## 18. Shape changes and DESIGN diffs
+
+The client remake has not shipped, so formats change **in place**: envelope `formatVersion` stays 1, and the
+checkpoint encodings and IDB schema are edited rather than versioned. If a build ships before WP-E2 lands, bump
+`DB_SCHEMA_VERSION` to 2 (`src/engine/store/schema.ts:19`) instead and treat an old DB as lost (DESIGN §i.5).
+
+### 18.1 `src/ports/crypto.ts`
+
+```ts
+export type BlobAddress = Brand<string, "BlobAddress">;   // suite 0: sha256 hex; suite 1: HMAC(kAddr, sha256) hex
+export type SealPurpose = "frame" | "checkpoint";
+export type OpenFailure =
+  | "unknown-key" | "auth-failed" | "unsupported-suite"
+  | "suite-downgrade"          // NEW: suite-1 port given suite-0 bytes (§9.2)
+  | "malformed";               // NEW: nonce < 12 bytes or sealed < 28 bytes (§4.1)
+export type OpenResult = { readonly ok: true; readonly plaintext: Uint8Array } | { readonly ok: false; readonly reason: OpenFailure };
+
+export interface CryptoPort {
+  /** Suite for new seals; also this device's pin (§9.1). */
+  readonly suite: CryptoSuite;
+  /** Epoch for new seals (0 for suite 0). Changes when a roll or revoke is adopted; read it once per seal. */
+  sealEpoch(): number;
+  /** held: key present; verified: kcv matched the winning k record (§5.2). Suite 0: {held: e === 0, verified: true}. */
+  keyState(keyEpoch: number): { readonly held: boolean; readonly verified: boolean };
+  /** keyEpoch is the one already written into the header (the AAD binds it), so a concurrent roll cannot split them. */
+  seal(input: { readonly purpose: SealPurpose; readonly keyEpoch: number; readonly aad: Uint8Array; readonly plaintext: Uint8Array }): Promise<Uint8Array>;
+  open(input: { readonly purpose: SealPurpose; readonly suite: CryptoSuite; readonly keyEpoch: number; readonly aad: Uint8Array; readonly sealed: Uint8Array }): Promise<OpenResult>;
+  /** Whole sealed-blob format incl. header and padding (§10.2). Suite 0: identity. */
+  sealBlob(input: { readonly address: BlobAddress; readonly plaintext: Uint8Array }): Promise<Uint8Array>;
+  openBlob(input: { readonly address: BlobAddress; readonly sealed: Uint8Array }): Promise<OpenResult>;
+  blobAddress(hash: ContentHash): Promise<BlobAddress>;
+  /** Diagnostics digest, 16 hex chars. Suite 0: sha256 prefix; suite 1: HMAC(kDiag, bytes) prefix (§6.4). */
+  diagHash(bytes: Uint8Array): Promise<string>;
+}
+
+/** Suite-1 adapter only; used by the keyring engine (WP-E3). Raw keys never cross this interface outward. */
+export interface KeyringCrypto {
+  generate(e: number): Promise<void>;                                  // new K_e, held as pending
+  install(e: number, raw: Uint8Array): Promise<void>;                  // QR / RK path; zero-fills raw
+  kcv(e: number): Promise<Uint8Array>;
+  wrap(role: "next" | "prev" | "recovery", e: number, aad: Uint8Array, rk?: Uint8Array): Promise<Uint8Array>;
+  unwrap(role: "next" | "prev" | "recovery", e: number, aad: Uint8Array, wrapped: Uint8Array, rk?: Uint8Array): Promise<boolean>;
+  markVerified(e: number): void;
+  setSealEpoch(e: number): void;
+  drop(e: number): void;                                               // discard a pending key that lost
+  exportForHost(): readonly { readonly e: number; readonly k: Uint8Array }[]; // only for keyringChanged (§18.4)
+}
+```
+
+- `openBlob` returns a result rather than `Uint8Array | null`, so the caller can classify the failure (§10.2).
+  The callers that change are `src/engine/body/refs.ts:58-59` and `src/engine/blobs/blobQueue.ts:204`.
+- **The suite-0 adapter** (`src/engine/adapters/noopCrypto.ts`) and `identityCrypto`
+  (`src/core/codec/envelope.ts:242`) implement the new shape. `sealEpoch()` returns 0.
+- **The suite-1 adapter is new**, at `src/engine/adapters/webCryptoSuite1.ts` (WP-E1). It holds non-extractable
+  CryptoKeys only.
+
+### 18.2 Envelope, codec, limits, fold
+
+- `src/core/envelope.ts`:
+  - `CryptoSuite = { none: 0, aes256gcm: 1 }`, replacing the reserved `xchacha20poly1305: 1`;
+  - `AAD_FRAME_PREFIX = "yaos/f2"`, `AAD_CHECKPOINT_PREFIX = "yaos/c2"` and the new `AAD_BLOB_PREFIX = "yaos/b2"`,
+    `AAD_KEYRING_PREFIX = "yaos/k2"`;
+  - the inner layout gains `varuint frameNo` after `flags`. It is 0 for kinds outside ns and cfg, and non-zero
+    for ns and cfg (§8.2);
+  - `EnvelopeOpenResult.reason` gains `"suite-downgrade"`, `"bad-padding"` and `"replay"` (§9.2, §8.2);
+  - `CheckpointEncoding`: `nsFoldV1` and `cfgFoldV1` are redefined in place to carry the replay window (named
+    V2 in this document).
+- `src/core/codec/envelope.ts`:
+  - `bindingAad` (lines 155-162) writes the §7.2 fields: header plus deviceId for frames, header for checkpoints;
+  - padding (§7.3) is applied when `suite ≠ 0`, between the inner encoding and `seal`, and stripped after `open`.
+- `src/core/types.ts`:
+  - `NsFoldState` and `CfgFoldState` gain `readonly replay: Map<DeviceId, { r: number; bits: bigint }>` (64-bit
+    window);
+  - `StreamClass` gains `"keyring"`, and `streamClass("k") === "keyring"`;
+  - `blobChunkStream(address: BlobAddress)`.
+- `src/core/limits.ts`:
+  - `MAX_FRAME_CONTENT_BYTES` → 1015808 (§7.3);
+  - new `MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 10223615`;
+  - new `REPLAY_WINDOW = 64`, `ROLL_SEQ_SPAN = 2 ** 23`, `ROLL_OWN_SEALS = 2 ** 22`,
+    `PADME_FLOOR_BYTES = 256`, `KEY_STORE_WAIT_MS = 5000`.
+- `QuarantineReason` (`src/engine/store/schema.ts:189`) gains `"crypto-downgrade"` and `"envelope-padding"`.
+
+### 18.3 IndexedDB (`src/engine/store/schema.ts`)
+
+| Store / record | Change |
+|---|---|
+| `OutboxRecord` (:156) | + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2); + `frameNo: number \| null` (ns/cfg) |
+| `MetaRecord` | + `MetaKeyring {key: "keyring"; sealEpoch; epochs: {e, firstSeq, kind, verified}[]; revokeEpoch: number \| null; sRot: Seq \| null; ownSeals: number}`. **No key bytes** (§6.1) |
+| `MetaRecord` | + `MetaFrameNoFloor {key: "frameNoFloor"; ns: number; cfg: number}`, written by epoch migration (§8.2) |
+| ns and cfg fold state records | Carry `replay` (V2 encoding) |
+| `StreamRecord.cls` | Accepts `"keyring"` |
+| `tail` for `k` | Holds `k` records like any stream. There is no snapshot, since `k` has no checkpoints |
+
+No store or index is added or removed, so `upgrade()` (`src/engine/adapters/idbStorage.ts:465`) is unchanged.
