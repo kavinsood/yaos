@@ -780,8 +780,9 @@ cannot be trusted to say which (§2.1), so **the user decides**:
 3. The device enrolls (the RK is never sent anywhere), reads `k` to head, and unwraps the newest genesis or revoke
    record's `recoveryWrap`. It checks kcv, walks `nextWrap` forward and `prevWrap` back to K_1 (§11.1), stores
    the keys, and bootstraps normally.
-4. If a revoke happened since the RK was last changed, that revoke record carries a `recoveryWrap` under the RK
-   entered at the time. The chain still resolves because every revoke wraps under the RK in force (§14.2).
+4. Every revoke wraps K_r under the RK in force at that time (§14.2), so the current RK opens the newest record.
+   An older, replaced RK opens only the epochs before the rotation that replaced it: the device reads that much
+   and stays in `key-missing` for the rest.
 
 Without the RK, and with no device left: **the data is unrecoverable, by design.** The operator can delete the
 vault. Any local copy of the files on disk can seed a new vault.
