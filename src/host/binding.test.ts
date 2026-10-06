@@ -208,6 +208,42 @@ test("binding: a sibling view's quick preview of the same doc is dropped; its ed
 	assert.equal(engine.count("bodyReload"), 0);
 });
 
+test("binding: a view still opening drops a bound sibling's preview (no double merge); an unbindable view gets Obsidian's copy", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "abc\n");
+	bm.start();
+	const v1 = ws.openFile("a.md");
+	assert.ok(v1);
+	await clock.advance(5);
+	assert.equal(bm.slotState(v1.viewId), "bound");
+	engine.delay = () => 40; // v2's openDoc takes a while
+	const v2 = ws.openFile("a.md");
+	assert.ok(v2);
+	v1.edit(3, 0, "d");
+	await clock.advance(20); // v1's quick preview reaches v2 while it is opening
+	assert.equal(bm.slotState(v2.viewId), "opening");
+	assert.equal(bm.stats.siblingCopies, 1);
+	assert.equal(v2.getText(), "abc\n", "dropped: v1's push delivers the edit");
+	await clock.advance(500);
+	assert.equal(bm.slotState(v2.viewId), "bound");
+	assert.equal(engine.text("a.md"), "abcd\n", "merged once (v2's upload did not carry v1's edit)");
+	assert.equal(v2.getText(), "abcd\n");
+	assert.equal(engine.count("bodyReload"), 0);
+
+	engine.delay = () => 0;
+	file(s, "n.md", "new\n");
+	engine.notBindable.add("n.md");
+	const n1 = ws.openFile("n.md");
+	const n2 = ws.openFile("n.md");
+	assert.ok(n1 && n2);
+	await clock.advance(5);
+	assert.equal(bm.slotState(n1.viewId), "waiting");
+	n1.edit(0, 0, "x");
+	await clock.advance(20);
+	assert.equal(n2.getText(), "xnew\n", "not bound: Obsidian's own quick preview applies");
+});
+
 test("binding: onSaveRead posts a save mark naming the mirror version and the newest push", async () => {
 	const s = setup();
 	const { clock, ws, engine, bm } = s;

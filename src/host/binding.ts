@@ -373,11 +373,14 @@ export class BindingManager {
 			return;
 		}
 		slot.state = "opening";
+		// Intercepting from here drops a bound sibling's quick preview while this view waits for openDoc (see
+		// onExternalReload); everything else still reaches the editor as Obsidian applies it.
+		this.intercept(slot);
 		let res: EngineResultValue;
 		try {
 			res = await this.deps.link.openDoc(path, slot.viewId);
 		} catch {
-			if (seq === slot.seq) slot.state = "idle";
+			if (seq === slot.seq) this.idle(slot, "idle");
 			return;
 		}
 		const stale = seq !== slot.seq || this.slots.get(slot.viewId) !== slot || view.path === null || !this.samePath(view.path, path);
@@ -387,14 +390,14 @@ export class BindingManager {
 			return;
 		}
 		if (res.t !== "bind") {
-			slot.state = "waiting";
+			this.idle(slot, "waiting");
 			return;
 		}
 		const info = res.bind;
 		if (info.frozen) {
 			// WorkspacePort has no read-only bind; a frozen doc stays unbound with a notice.
 			this.deps.link.post({ t: "closeDoc", docId: info.docId, viewId: slot.viewId });
-			slot.state = "waiting";
+			this.idle(slot, "waiting");
 			this.deps.notice("warn", "doc-frozen", "This note is frozen by sync; edits are kept locally until it is released.");
 			return;
 		}
@@ -422,13 +425,13 @@ export class BindingManager {
 		} catch {
 			this.deps.link.post({ t: "closeDoc", docId: info.docId, viewId: slot.viewId });
 			if (doc.slots.size === 0) this.docs.delete(info.docId);
-			slot.state = "idle";
+			this.idle(slot, "idle");
 			return;
 		}
 		const first = doc.slots.size === 0 && doc.mirror === null;
 		Object.assign(slot, { binding, client, doc, state: "attaching", attachPosted: false });
 		doc.slots.add(slot);
-		slot.unintercept = view.interceptExternalReload((incoming, from) => this.onExternalReload(slot, incoming, from));
+		this.intercept(slot);
 		const editor = binding.doc();
 		slot.attachDoc = editor;
 		const base = this.bases.get(info.docId) ?? null;
@@ -508,15 +511,35 @@ export class BindingManager {
 	 * else is uploaded and merged in the worker; the view holds its saves until `reloaded`, so its stale text
 	 * cannot overwrite the incoming text meanwhile.
 	 */
+	private intercept(slot: ViewSlot): void {
+		slot.unintercept ??= slot.view.interceptExternalReload((incoming, from) => this.onExternalReload(slot, incoming, from));
+	}
+
+	/** Not bound and not about to be: Obsidian applies whatever it loads into the view. */
+	private idle(slot: ViewSlot, state: "idle" | "waiting"): void {
+		slot.unintercept?.();
+		slot.unintercept = null;
+		slot.state = state;
+	}
+
+	/**
+	 * Content Obsidian puts into the view without a transaction. A quick preview from a sibling view of the same
+	 * file that is attaching or bound is dropped: that view's bind upload and pushes deliver its edits to the
+	 * replica, which sends them here as entries. Applying the copy as well would add them twice (this editor's own
+	 * upload or reload would carry them too, merged as new text). While this view is still opening, the sibling's
+	 * doc is compared by path. Anything else, while attaching or bound, is merged in the worker (bodyReload).
+	 */
 	private onExternalReload(slot: ViewSlot, incoming: string, from: number | null): "handled" | "default" {
-		if (slot.state !== "attaching" && slot.state !== "bound") return "default";
 		if (from !== null) {
 			const src = this.slots.get(from);
-			if (src && src.doc === slot.doc && (src.state === "attaching" || src.state === "bound")) {
+			const live = src !== undefined && src !== slot && (src.state === "attaching" || src.state === "bound");
+			const same = live && (slot.state === "opening" ? src.view.path !== null && slot.view.path !== null && this.samePath(src.view.path, slot.view.path) : src.doc === slot.doc);
+			if (same && slot.state !== "idle" && slot.state !== "waiting") {
 				this.stats.siblingCopies++;
 				return "handled";
 			}
 		}
+		if (slot.state !== "attaching" && slot.state !== "bound") return "default";
 		this.stats.reloads++;
 		slot.view.holdSaves(true);
 		slot.reloadText = incoming;
