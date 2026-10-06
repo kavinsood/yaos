@@ -180,6 +180,12 @@ devices).
 | 35 | The app died inside the outbox-mirror debounce: the next run never rewrote the mirror while the synced mirror moved on to sync points resting on those frames. A later IDB loss recovered a hash matching disk but not the CRDT, and the merge overwrote the text. | heavy seed 246 | d471cc6: the start rewrites a lagging outbox mirror; 36a4cff: the synced mirror is written only after the outbox mirror holds the outbox (a failed write stays dirty). |
 | 36 | Planner rebinds (merged alias, identical-loser collapse, §c.12 migrated loser) moved the synced record to the winner but did not retarget a bound editor, which kept typing into the loser. | sim seeds 668, 924 F DEV3; with bug 37, the eight DEV5 seeds of bug 23 (epoch reset with notes open) | a06b66d: `ReconcilerDeps.onRebind`; the runtime posts `docRetarget`. |
 | 37 | A view bound a create whose initial content was not in the body yet (the re-create after an epoch migration re-opens views at once); the bind-time merge took "" with no base as a conflict, emptied the editor and wrote a conflict copy. | composed test (epoch reset, note open) | 76e0e83: the same gate as the planner's `body-empty` wait. |
+| 38 | After an IDB loss S came back at the old path (re-materialized with the peer's edit) while the user's renamed copy, still the create content, sat at the remote path. That file is never created (an own create would fold as a duplicate of the doc moving in) and the remote move waited for the path forever. | heavy seed 79 | 324152e: a remote move blocked by an untracked copy of the doc's own bytes (its current file or its create content) trashes the copy; the move follows on the next pass. |
+| 39 | S1 set `synced.path = requestedPath` for a suffixed own rename (§c.13) after a later own rename (same batch or pending), or a pass between the fold and the S1 batch, had already moved S and the file. Two synced records sat on one path and a diskRename of the other doc's file was retried forever. | sim seeds 351, 386, 481 F DEV3 | 2d17824: S1 leaves the path alone once S has moved on; restore gets the same guard. |
+| 40 | After IDB loss the synced mirror could predate an own rename job; the replayed own fold only bumped `nsTouchSeq`, so S stayed at the old path, the planner retried the remote move onto the doc's own file and pushed that file as a new doc that merged back, forever. | sim seed 405 F DEV3 | be0f957: S1 moves S to an applied own rename's path while S is still behind the op. |
+| 41 | The suffixed-restore moved-on check compared S with the requested path only; a pass that had already projected the revived entry at its suffixed path got the requested path (another doc's file) written back, and the same push-and-merge-back loop followed. | sim seed 193 F DEV3 | d480b1a: S1 also leaves S alone when it already sits at the final path. |
+| 42 | The user renamed n2 -> r5 and created a new n2.md before ns was ready while a peer moved the doc n2 -> r1. The re-occupied-source inference (bug 19) only looked at docs whose remote path was still the synced path, so the new n2.md was carried to r1.md as the doc's file and r5.md became a new doc. | sim seed 21 F DEV3 | b6e2686: the observed rename wins over a concurrent remote move as well (nsRename to r5); the file at the old path is planned as new once S has left it. |
+| 43 | A local delete that waited (`pending-body` or ns not ready, D12) left S in place, so a new file the user then created at the path merged into the old doc as a save. The diff kept fragments of the old text, the peer's concurrent delete of that text took them, and a token of the new note was lost. | heavy seed 92 (fix sweep: heavy 22, DEV5 F 140) | e3982bc: the waiting delete is decided (`SyncedEntry.fileGone`): the file at S's path is a new file from then on, and is created once the delete has gone out (a productive pass's follow-up covers the paths it vacated). A file at the doc's remote path is still its own (heavy 22: an own rename marked offline). See D17. |
 
 Sim-only fixes found on the way (no client change): epoch names reused across
 resets, one global clock skew instead of per-device, ledger coverage of
@@ -202,6 +208,11 @@ waiting on the blob queue.
 | D10 | §i.4 | A settings change that touches reconcile or cfg options restarts the vault runtime (with the listing replayed). | Simpler than hot-swapping options in the planner and CfgSync; settings changes are rare. |
 | D11 | §c.7 | Fallback restore duty: any device whose body stream holds a row past `deleteBaseBodySeq` restores at once (no 30 s grace, no hash timer, no upper bound at `deletedSeq`). | The primary duty is lost with the author's store (IDB wipe), and the deleter drops its synced record. The stream record keeps only the max row seq, not per-row `authorNsSeq`; the primary duty already counts rows after `deletedSeq`, so the fallback matches it. Double restores fold as `not-deleted`. Checkpoints carry no seq, so they can't trigger it. |
 | D12 | §c.7 | A local delete (`nsDelete`) waits while the doc has own body / canvas records in the outbox. | Otherwise the delete base misses the device's own edits and the deleter gets a restore duty for its own delete. |
+| D13 | §c.6, §i.5 | A doc this device created whose create body is gone everywhere (acked nsCreate, no rows on the relay, nothing pending, store lost) is pushed from the file as a disk-only merge, or nsDeleted if the file is gone too (bug 31). | DESIGN has no owner for this state; every device waited `body-empty` forever. |
+| D14 | §i.5 | After IDB loss, own body rows the new store never receipted, and frames imported from the outbox mirror, move the body version like remote rows (bug 33). Mirror import sets `bodyVersion = null`, which the planner reads as "remote changed" rather than doing the spec's content comparison (bug 28). | Otherwise own text that reached the relay but not the disk looks synced. The null version is a conservative superset: one extra reconcile per recovered doc. |
+| D15 | §f.6 | An observed rename onto the path of a remote doc never materialized here moves the renamed doc; the remote doc waits for the path (bug 34). | The file came from the rename source, so it is the moved doc's; merging it into the remote doc made the bound editor refuse writes and every pass add a conflict copy. |
+| D16 | §f.2 | A remote move whose target holds an untracked copy of the doc's own bytes trashes that copy (no sync op, `diskTrash` with a hash precondition, braked like any trash), then moves (bug 38). Other bytes at the target are a new file (created; the move waits). | The copy can never be created (it folds as a duplicate of the doc moving in), so the move would wait forever. Trash keeps the bytes. |
+| D17 | §c.7, §f.2 | A local delete that has to wait marks `SyncedEntry.fileGone` (bug 43): the delete is decided at the first pass that sees the file missing, even offline or before ns is ready. A file then at S's path is a new doc (created after the delete goes out), not a save of the old one. The mark is a braked `nsDelete` unit (rejecting the brake re-materializes the doc); the later `nsDelete` is not braked again. Edit beats delete still applies while waiting: with a remote edit the doc re-materializes at its remote path, or, if the new file sits at that same path, the file merges into the doc (the mark is cleared). The mark is not in the synced mirror. | DESIGN treats delete-then-create at one path as a save. Merging an unrelated new note into the old doc lost text (the diff keeps fragments of the old text, which a peer's concurrent delete then removes). Rename inference is off before ns is ready, so a file at the doc's remote path stays its own. |
 
 ## 5. Honest gaps
 
@@ -235,6 +246,19 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 
 - One deployed full-client run took 15.5 s for a fresh device bootstrap of
   the small e2e vault (0.9 s locally); not investigated (one sample).
+- `fileGone` (D17) lives in the store only: after an IDB loss the mirror
+  brings S back without it, so a file re-created at the path while the delete
+  waited merges into the old doc as a save (the pre-D17 behaviour).
+- D17 keeps one merge case: a waiting delete, a remote edit of the doc, and a
+  new file at the doc's remote path merge that file into the doc (edit beats
+  delete). It is rare enough to accept; no sweep hit it.
+- The bind-time merge (openDoc) does not use the §c.12 path-keyed epoch base
+  that the merge job uses (`trustedEpochBase`): a note edited offline while
+  open across an epoch reset gets two conflict copies where a 3-way merge was
+  possible. Nothing is lost.
+- A disk write right after an epoch reset, with the note open, is overwritten
+  when the reset saves the open views (the sim models it as Obsidian's own
+  overwrite and exempts it).
 
 **Host**
 - With IndexedDB missing in both carriers, the host stays in `starting` and
