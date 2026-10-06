@@ -1,0 +1,19 @@
+docs/client-remake/DESIGN.md
+  s_27aea4557efbc1::t_c347331ad695d9 1718-1730
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "404d2369e2680349ce6f9b59d4991c877408cd6c",
+  "prompts": {},
+  "sessions": {
+    "s_27aea4557efbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2f141519dac0ecc1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
