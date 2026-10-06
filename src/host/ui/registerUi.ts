@@ -13,7 +13,8 @@ import { pendingBrake, type YaosUiHost } from "./api";
 import { BrakeTracker } from "./brake";
 import { BrakeModal } from "./brakeModal";
 import { UI_COMMANDS, type UiCommandId } from "./commands";
-import { exportDiagnostics } from "./diagnostics";
+import { confirmAction } from "./confirmModal";
+import { DIAGNOSTICS_WITH_PATHS_CONFIRM, exportDiagnostics } from "./diagnostics";
 import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
 import { copyText, obsidianRequest, openPluginSettings } from "./obsidianEnv";
@@ -90,11 +91,11 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		track(new SnapshotsModal(app, host, (child) => { if (!disposed) track(child); }));
 	};
 
-	const runExport = (): void => {
+	const runExport = (includePaths: boolean): void => {
 		void exportDiagnostics(host, {
 			notify: (message, level) => { new Notice(`YAOS: ${message}`, level === "error" ? 8000 : 6000); },
 			copyText,
-		});
+		}, { includePaths });
 	};
 
 	const send = (command: UserCommand, done: string): void => {
@@ -113,7 +114,7 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		openPairAnother,
 		openBrake,
 		openSnapshots,
-		exportDiagnostics: runExport,
+		exportDiagnostics: () => runExport(false),
 		onDataChanged: () => statusBar.renderNow(),
 	});
 	plugin.addSettingTab(tab);
@@ -123,7 +124,10 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		"yaos-pause": () => send({ t: "pause" }, "sync paused."),
 		"yaos-resume": () => send({ t: "resume" }, "sync resumed."),
 		"yaos-reconcile-now": () => send({ t: "reconcileNow" }, "full sync started."),
-		"yaos-export-diagnostics": runExport,
+		"yaos-export-diagnostics": () => runExport(false),
+		"yaos-export-diagnostics-with-paths": () => {
+			void confirmAction(app, DIAGNOSTICS_WITH_PATHS_CONFIRM).then((ok) => { if (ok && !disposed) runExport(true); });
+		},
 		"yaos-show-brake": openBrake,
 		"yaos-pair-device": () => openPair(),
 		"yaos-pair-another-device": openPairAnother,

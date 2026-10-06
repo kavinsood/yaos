@@ -1,6 +1,6 @@
 /**
- * Snapshot user commands through the whole client on the sim (host runtime -> protocol -> composed
- * engine -> SnapshotJob): list, files, restore result, delete, and errors without a runtime.
+ * Snapshot and diagnostics user commands through the whole client on the sim (host runtime -> protocol
+ * -> composed engine): list, files, restore result, delete, diagnostics export, and errors without a runtime.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -93,11 +93,25 @@ test("without a running vault runtime, snapshot and diagnostics commands fail in
 	for (const c of [
 		{ t: "createSnapshot" }, { t: "listSnapshots" }, { t: "snapshotFiles", snapshotId: "000000001-manual" },
 		{ t: "restoreSnapshot", snapshotId: "000000001-manual", paths: null }, { t: "deleteSnapshot", snapshotId: "000000001-manual" },
-		{ t: "exportDiagnostics" },
+		{ t: "exportDiagnostics", includePaths: false },
 	] satisfies UserCommand[]) {
 		const r = await send(clock, a, c);
 		assert.equal(r.ok, false, c.t);
 		if (!r.ok) assert.match(r.error.message, /^not-ready: the sync engine is not running$/, c.t);
 	}
 	assert.deepEqual(await ok(clock, a, { t: "pause" }, "ok"), { t: "ok" });
+});
+
+test("exportDiagnostics on a running device: the whole event ring; paths only with opt-in", async () => {
+	const { clock, a } = world();
+	a.vault.userWrite("Private/a.md", "a\n");
+	void a.start();
+	await clock.advance(3_000);
+	const plain = (await ok(clock, a, { t: "exportDiagnostics", includePaths: false }, "diagnostics")).bundle;
+	assert.equal(plain.paths, null);
+	assert.ok(plain.recentEvents.length > 0);
+	assert.ok(!JSON.stringify(plain).includes("Private/a.md"));
+	const withPaths = (await ok(clock, a, { t: "exportDiagnostics", includePaths: true }, "diagnostics")).bundle;
+	assert.ok(Array.isArray(withPaths.paths));
+	assert.ok(withPaths.recentEvents.length >= plain.recentEvents.length, "not cut to a fixed tail");
 });

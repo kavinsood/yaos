@@ -57,18 +57,38 @@ export interface StatusSnapshot {
 export interface DiagnosticsEvent {
 	readonly atMs: number;
 	readonly code: string;
-	/** Numbers, booleans, stream classes, hashed paths only. */
+	/** Numbers, booleans, stream classes and error messages; streams and paths only as pseudonyms in a bundle. */
 	readonly fields: Readonly<Record<string, string | number | boolean | null>>;
 }
 
+/**
+ * exportDiagnostics answer. No secrets, no file contents, and no vault paths outside `paths`.
+ *
+ * Files are named by pseudonyms: 12 hex chars of SHA-256 over a random per-bundle salt and the
+ * file's vault path (or its stream name when the engine does not know the path). The salt is not
+ * included, so pseudonyms cannot be matched across bundles or tested against guessed paths. Within
+ * one bundle the same file always has the same pseudonym. A doc stream is written as its class prefix
+ * plus the pseudonym ("b:1a2b3c4d5e6f"); the vault-wide "ns" and "cfg" streams keep their names.
+ */
 export interface DiagnosticsBundle {
 	readonly generatedAtMs: number;
 	readonly clientVersion: string;
+	/** Status at export time; `brake.samplePaths` holds pseudonyms. */
 	readonly status: StatusSnapshot;
+	/**
+	 * The engine's whole diagnostics ring (at most 2000 events, oldest first): the window before an
+	 * incident is what support needs, and 200 events often missed it. `stream` and `path` fields are
+	 * pseudonymized; `error` fields are error messages as thrown by storage and network code.
+	 */
 	readonly recentEvents: readonly DiagnosticsEvent[];
+	/** At most 200 quarantined rows; `stream` is pseudonymized. */
 	readonly quarantine: readonly { readonly stream: string; readonly seq: Seq; readonly reason: string; readonly bytes: number }[];
-	readonly frozenDocs: readonly { readonly pathHash: string; readonly reason: string }[];
+	/** Frozen doc streams; `stream` is pseudonymized. */
+	readonly frozenDocs: readonly { readonly stream: string; readonly reason: string }[];
 	readonly stores: Readonly<Record<string, { readonly records: number; readonly bytes: number }>>;
-	/** Present only if the user opts in to include paths. */
-	readonly paths: readonly VaultPath[] | null;
+	/**
+	 * Only when the user opted in (exportDiagnostics{includePaths: true}), else null: the vault path
+	 * of every pseudonym in this bundle whose path the engine knows, sorted by path.
+	 */
+	readonly paths: readonly { readonly pseudonym: string; readonly path: VaultPath }[] | null;
 }

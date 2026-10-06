@@ -11,6 +11,7 @@ export type UiCommandId =
 	| "yaos-resume"
 	| "yaos-reconcile-now"
 	| "yaos-export-diagnostics"
+	| "yaos-export-diagnostics-with-paths"
 	| "yaos-show-brake"
 	| "yaos-pair-device"
 	| "yaos-pair-another-device"
@@ -30,6 +31,7 @@ export const UI_COMMANDS: readonly UiCommandSpec[] = Object.freeze([
 	{ id: "yaos-resume", name: "Resume sync", available: (h) => engineAcceptsCommands(h.runState()) && isPaused(h.status()) },
 	{ id: "yaos-reconcile-now", name: "Sync now (full rescan)", available: (h) => engineAcceptsCommands(h.runState()) },
 	{ id: "yaos-export-diagnostics", name: "Export diagnostics", available: (h) => engineAcceptsCommands(h.runState()) },
+	{ id: "yaos-export-diagnostics-with-paths", name: "Export diagnostics (include file names)", available: (h) => engineAcceptsCommands(h.runState()) },
 	{ id: "yaos-show-brake", name: "Review held changes", available: (h) => pendingBrake(h) !== null },
 	{ id: "yaos-pair-device", name: "Pair this device", available: () => true },
 	{ id: "yaos-pair-another-device", name: "Pair another device", available: (h) => h.data().identity !== null },

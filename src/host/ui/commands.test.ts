@@ -21,7 +21,7 @@ const available = (h: ReturnType<typeof host>) => UI_COMMANDS.filter((c) => c.av
 
 test("command ids match the contract", () => {
 	assert.deepEqual(UI_COMMANDS.map((c) => c.id).sort(), [
-		"yaos-browse-snapshots", "yaos-create-snapshot", "yaos-export-diagnostics", "yaos-pair-another-device", "yaos-pair-device", "yaos-pause",
+		"yaos-browse-snapshots", "yaos-create-snapshot", "yaos-export-diagnostics", "yaos-export-diagnostics-with-paths", "yaos-pair-another-device", "yaos-pair-device", "yaos-pause",
 		"yaos-rebuild-local-cache", "yaos-reconcile-now", "yaos-restart-engine", "yaos-resume", "yaos-show-brake",
 	]);
 	for (const c of UI_COMMANDS) assert.ok(c.name.length > 0 && c.name[0] === c.name[0]?.toUpperCase());
@@ -29,7 +29,7 @@ test("command ids match the contract", () => {
 
 test("command availability follows engine, pause, brake and pairing state; restart stays available when the engine is down", () => {
 	assert.deepEqual(available(host({ run: "unpaired" })), ["yaos-pair-device"]);
-	const running = ["yaos-browse-snapshots", "yaos-create-snapshot", "yaos-export-diagnostics", "yaos-pair-another-device", "yaos-pair-device", "yaos-rebuild-local-cache", "yaos-reconcile-now", "yaos-restart-engine"];
+	const running = ["yaos-browse-snapshots", "yaos-create-snapshot", "yaos-export-diagnostics", "yaos-export-diagnostics-with-paths", "yaos-pair-another-device", "yaos-pair-device", "yaos-rebuild-local-cache", "yaos-reconcile-now", "yaos-restart-engine"];
 	assert.deepEqual(available(host({ paired: true, phase: "live" })), [...running, "yaos-pause"].sort());
 	assert.deepEqual(available(host({ paired: true, phase: "paused" })), [...running, "yaos-resume"].sort());
 	const brake: BrakeReport = { id: "b", reason: "listing-shrank", heldCount: 1, syncedCount: 1, samplePaths: [] };

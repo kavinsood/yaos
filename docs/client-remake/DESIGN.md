@@ -1792,13 +1792,25 @@ ones get conflict copies.
   today), bootstrap progress, brake, last reconcile and sync times, daily frames, notices.
   - Posted on phase change, and otherwise at most 4/s.
   - The status bar shows phase + unsynced count.
-- **`DiagnosticsBundle`:**
-  - recent events (a 2000-entry ring of `DiagnosticsEvent`: numbers, booleans, stream classes and **hashed** paths),
-    quarantine summary, frozen docs, per-store counts and bytes;
-  - real paths only on opt-in;
-  - never credentials, tickets or file contents.
-  - Exported by command. The host writes it under `<configDir>/plugins/yaos/diagnostics/` and offers copy to
-    clipboard.
+- **`DiagnosticsBundle`** (`exportDiagnostics{includePaths}`, built in `src/engine/compose/diagnosticsBundle.ts`):
+  - the whole 2000-entry ring of `DiagnosticsEvent`, oldest first (numbers, booleans, stream classes, error
+    messages). The whole ring, not a tail: the window before an incident is what support needs;
+  - quarantine summary (at most 200 rows), frozen doc streams, per-store counts, status;
+  - never credentials, tickets or file contents. `error` fields are error messages as thrown, not scrubbed.
+- **Pseudonyms.** Every stream and path is replaced by 12 hex chars of SHA-256 over a fresh random per-bundle salt and
+  the file's vault path (or its stream name when the path is unknown).
+  - The salt is not exported, so pseudonyms cannot be matched across bundles or tested against guessed paths.
+  - Within one bundle a file has one pseudonym everywhere: doc streams read `b:`/`c:`/`x:` + pseudonym, and brake
+    `samplePaths` hold the same pseudonym. `ns` and `cfg` keep their names.
+- **`paths`** is null unless the user opted in. With opt-in it maps each pseudonym whose path the engine knows to
+  that vault path, sorted by path. The command "Export diagnostics (include file names)" asks for confirmation
+  first; the file name ends in `-with-file-names`.
+- **Host additions** (`src/host/ui/diagnostics.ts`):
+  - a `settings` section: plugin version, transport, host URL, vaultId, deviceId, device label, engine settings.
+    Identity fields are picked one by one, never the device token. Exclude patterns appear only with opt-in (they
+    name folders); otherwise only their count.
+  - Secret-looking keys are redacted at any depth as a backstop.
+  - The host writes the file under `<configDir>/plugins/yaos/diagnostics/` and copies it to the clipboard.
 
 ---
 

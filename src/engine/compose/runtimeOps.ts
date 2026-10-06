@@ -10,8 +10,8 @@ import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamNam
 import { badRequest } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
-import { utf8Encode } from "../../core/codec/lib0";
 import { encodeStateAsUpdate } from "../body/yjsCounters";
+import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
 import { dbName, STORE } from "../store/schema";
 import { readBase } from "../reconcile/store";
 import type { VaultRuntime } from "./vaultRuntime";
@@ -131,7 +131,7 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 			await rt.snaps.remove(c.snapshotId);
 			return { t: "ok" };
 		case "exportDiagnostics":
-			return { t: "diagnostics", bundle: await diagnostics(rt) };
+			return { t: "diagnostics", bundle: await diagnostics(rt, c.includePaths === true) };
 		case "releaseQuarantine": {
 			const docId = streamDocId(c.stream as StreamName);
 			if (docId) await rt.log.releaseQuarantine(docId);
@@ -143,29 +143,23 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 	}
 }
 
-async function diagnostics(rt: VaultRuntime): Promise<DiagnosticsBundle> {
+async function diagnostics(rt: VaultRuntime, includePaths: boolean): Promise<DiagnosticsBundle> {
 	const c = rt.log.c;
 	const quarantine: { stream: string; seq: number; reason: string; bytes: number }[] = [];
-	const frozenDocs: { pathHash: string; reason: string }[] = [];
+	const frozen: { stream: string; reason: string }[] = [];
 	for (const s of c.repo.streams()) {
-		if (s.frozen === 1) frozenDocs.push({ pathHash: await shortHash(rt, s.stream), reason: s.frozenReason ?? "frozen" });
-		if (quarantine.length < 200) for (const q of await c.repo.quarantineOf(s.stream)) quarantine.push({ stream: s.stream, seq: q.seq, reason: q.reason, bytes: q.bytes.length });
+		if (s.frozen === 1) frozen.push({ stream: s.stream, reason: s.frozenReason ?? "frozen" });
+		if (quarantine.length < DIAGNOSTICS_QUARANTINE_MAX) for (const q of await c.repo.quarantineOf(s.stream)) quarantine.push({ stream: s.stream, seq: q.seq, reason: q.reason, bytes: q.bytes.length });
 	}
 	const stores: Record<string, { records: number; bytes: number }> = {};
 	stores[STORE.synced] = { records: rt.rec.ctx.store.synced.size, bytes: 0 };
 	stores[STORE.outbox] = { records: [...c.outbox.values()].length, bytes: 0 };
 	stores[STORE.intents] = { records: rt.rec.ctx.store.intents.size, bytes: 0 };
-	return {
+	const synced = rt.rec.ctx.store.synced;
+	return buildDiagnosticsBundle({
 		generatedAtMs: rt.o.ports.clock.now(), clientVersion: rt.o.clientVersion, status: rt.status(),
-		recentEvents: rt.log.diagnostics().slice(-200), quarantine, frozenDocs, stores, paths: null,
-	};
-}
-
-async function shortHash(rt: VaultRuntime, s: string): Promise<string> {
-	const h = await rt.o.ports.hash.sha256(utf8Encode(s));
-	let out = "";
-	for (let i = 0; i < 6; i++) out += h[i]!.toString(16).padStart(2, "0");
-	return out;
+		events: rt.log.diagnostics(), quarantine, frozen, stores, pathOf: (docId) => synced.get(docId)?.path ?? null,
+	}, rt.o.ports, includePaths);
 }
 
 /**

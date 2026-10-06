@@ -172,7 +172,8 @@ export type UserCommand =
 	| { readonly t: "restoreSnapshot"; readonly snapshotId: string; readonly paths: readonly VaultPath[] | null }
 	/** -> `ok`. Unknown id: `bad-request`. */
 	| { readonly t: "deleteSnapshot"; readonly snapshotId: string }
-	| { readonly t: "exportDiagnostics" }
+	/** -> `diagnostics`. includePaths: the user opted in to file names (DiagnosticsBundle.paths). */
+	| { readonly t: "exportDiagnostics"; readonly includePaths: boolean }
 	| { readonly t: "rebuildLocalCache" }
 	| { readonly t: "updateSettings"; readonly settings: EngineSettings }
 	| { readonly t: "releaseQuarantine"; readonly stream: string };
