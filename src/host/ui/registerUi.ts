@@ -14,6 +14,7 @@ import { BrakeTracker } from "./brake";
 import { BrakeModal } from "./brakeModal";
 import { UI_COMMANDS, type UiCommandId } from "./commands";
 import { exportDiagnostics } from "./diagnostics";
+import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
 import { copyText, obsidianRequest, openPluginSettings } from "./obsidianEnv";
 import { PairingCodeModal, PairModal, type PairPrefill } from "./pairModal";
@@ -126,6 +127,10 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		"yaos-show-brake": openBrake,
 		"yaos-pair-device": () => openPair(),
 		"yaos-pair-another-device": openPairAnother,
+		"yaos-create-snapshot": () => send({ t: "createSnapshot" }, "snapshot created."),
+		"yaos-browse-snapshots": openSnapshots,
+		"yaos-rebuild-local-cache": () => { void confirmAndRebuildCache(app, host); },
+		"yaos-restart-engine": () => { void restartSyncEngine(host); },
 	};
 	for (const spec of UI_COMMANDS) {
 		plugin.addCommand({

@@ -13,6 +13,7 @@ import {
 import { MAX_KEEP_DAILY, pendingBrake, type YaosUiHost } from "./api";
 import { brakeHeadline } from "./brake";
 import { confirmAction } from "./confirmModal";
+import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
 import { clearIdentity } from "./pairFlow";
 import {
@@ -370,22 +371,12 @@ export class YaosSettingTab extends PluginSettingTab {
 	}
 
 	private async rebuildCache(): Promise<void> {
-		const ok = await confirmAction(this.app, {
-			title: "Rebuild local cache?",
-			message: "YAOS discards this device's sync database and rebuilds it from the files in this vault and the server. Unsent edits are kept. Files that differ from the server get conflict copies; nothing is deleted.\n\nThis can take a while on large vaults.",
-			confirmText: "Rebuild",
-		});
-		if (!ok) return;
-		await this.send({ t: "rebuildLocalCache" }, "rebuilding the local cache.");
+		await confirmAndRebuildCache(this.app, this.host);
+		this.refreshLiveNow();
 	}
 
 	private async restartEngine(): Promise<void> {
-		try {
-			await this.host.restartEngine();
-			new Notice("YAOS: sync engine restarted.");
-		} catch (err) {
-			new Notice(`YAOS: could not restart the sync engine: ${errorMessage(err)}`, 8000);
-		}
+		await restartSyncEngine(this.host);
 		this.refreshLiveNow();
 	}
 
