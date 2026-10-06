@@ -10,8 +10,13 @@
  * The reconcile runner emits nsCreate / nsSetBlob only after upload() returned
  * true, so readers can always fetch what ns references. A failure persists a
  * BlobQueueRecord with exponential backoff; until it is due, the transfer is
- * not retried (returns false / null at once), and nextDueAtMs() tells the
+ * not retried (returns false / null at once), and nextDueInMs() tells the
  * scheduler when to run the next reconcile pass. Success deletes the record.
+ *
+ * Backoff runs on the monotonic clock: a wall clock that jumps back (NTP, the
+ * user, a skewed device) must not park a transfer for hours. The persisted
+ * nextAttemptAtMs is wall time; on open the remaining wait is clamped to the
+ * record's own backoff.
  */
 
 import { sha256Hex } from "../../core/hash/sha256";
@@ -48,6 +53,8 @@ interface Req { readonly hash: string; readonly docId: DocId; readonly path: Vau
 
 export class BlobQueue implements BlobTransfer {
 	private readonly records = new Map<string, BlobQueueRecord>();
+	/** Monotonic due time per record key. */
+	private readonly due = new Map<string, number>();
 	private readonly inflight = new Map<string, Promise<unknown>>();
 
 	private constructor(private readonly deps: BlobQueueDeps) {}
@@ -56,7 +63,13 @@ export class BlobQueue implements BlobTransfer {
 		const q = new BlobQueue(deps);
 		const rows = await deps.db.tx([STORE.blobQueue], "readonly", (tx) => tx.getAll(STORE.blobQueue));
 		// A record left "in flight" by a crash is simply queued again.
-		for (const r of rows) q.records.set(`${r.direction}:${r.hash}`, { ...r, active: 0 });
+		const now = deps.clock.now();
+		const mono = deps.clock.monotonic();
+		for (const r of rows) {
+			const key = `${r.direction}:${r.hash}`;
+			q.records.set(key, { ...r, active: 0 });
+			q.due.set(key, mono + Math.min(Math.max(0, r.nextAttemptAtMs - now), backoffMs(r.attempts)));
+		}
 		return q;
 	}
 
@@ -73,16 +86,16 @@ export class BlobQueue implements BlobTransfer {
 		return [...this.records.values()];
 	}
 
-	/** Earliest retry time, or null when nothing is queued. */
-	nextDueAtMs(): number | null {
+	/** Milliseconds until the earliest retry (0 = due now), or null when nothing is queued. */
+	nextDueInMs(): number | null {
 		let next: number | null = null;
-		for (const r of this.records.values()) if (next === null || r.nextAttemptAtMs < next) next = r.nextAttemptAtMs;
-		return next;
+		for (const at of this.due.values()) if (next === null || at < next) next = at;
+		return next === null ? null : Math.max(0, next - this.deps.clock.monotonic());
 	}
 
 	private backingOff(direction: Direction, hash: string): boolean {
-		const r = this.records.get(`${direction}:${hash}`);
-		return r !== undefined && r.nextAttemptAtMs > this.deps.clock.now();
+		const at = this.due.get(`${direction}:${hash}`);
+		return at !== undefined && at > this.deps.clock.monotonic();
 	}
 
 	private async failed(direction: Direction, req: Req, size: number): Promise<void> {
@@ -95,12 +108,14 @@ export class BlobQueue implements BlobTransfer {
 		// keyPath is the hash: an up and a down for one hash share the row (latest wins); the map keeps both.
 		await this.deps.db.tx([STORE.blobQueue], "readwrite", async (tx) => tx.put(STORE.blobQueue, rec));
 		this.records.set(key, rec);
+		this.due.set(key, this.deps.clock.monotonic() + backoffMs(attempts));
 	}
 
 	private async succeeded(direction: Direction, hash: string): Promise<void> {
 		const key = `${direction}:${hash}`;
 		if (!this.records.has(key)) return;
 		this.records.delete(key);
+		this.due.delete(key);
 		const other = this.records.get(`${direction === "up" ? "down" : "up"}:${hash}`);
 		await this.deps.db.tx([STORE.blobQueue], "readwrite", async (tx) => (other ? tx.put(STORE.blobQueue, other) : tx.delete(STORE.blobQueue, hash as ContentHash)));
 	}

@@ -20,7 +20,7 @@ function harness(reports: PassReport[]) {
 	const clock = new FakeClock();
 	const scopes: PlanScope[] = [];
 	const s = new PassScheduler({
-		clock, ready: () => true, nextBlobDueAtMs: () => null, fullIntervalMs: 600_000, debounceMs: 10,
+		clock, ready: () => true, nextBlobDueInMs: () => null, fullIntervalMs: 600_000, debounceMs: 10,
 		run: async (scope) => {
 			scopes.push(scope);
 			return reports.shift() ?? report();

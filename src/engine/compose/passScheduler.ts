@@ -20,7 +20,8 @@ export interface PassSchedulerDeps {
 	readonly clock: ClockPort;
 	run(scope: PlanScope): Promise<PassReport>;
 	ready(): boolean;
-	nextBlobDueAtMs(): number | null;
+	/** Milliseconds until the blob queue's next retry is due (null = nothing queued). */
+	nextBlobDueInMs(): number | null;
 	readonly fullIntervalMs: number;
 	readonly debounceMs?: number;
 	readonly maxChained?: number;
@@ -173,9 +174,9 @@ export class PassScheduler {
 	}
 
 	private armBlobRetry(): void {
-		const due = this.deps.nextBlobDueAtMs();
+		const due = this.deps.nextBlobDueInMs();
 		if (due === null || this.retry !== null || this.stopped) return;
-		const delay = Math.max(0, due - this.deps.clock.now()) + 5;
+		const delay = due + 5;
 		this.retry = this.deps.clock.setTimer(delay, () => {
 			this.retry = null;
 			this.request({ t: "full" }, true);

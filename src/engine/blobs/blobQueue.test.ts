@@ -96,7 +96,7 @@ test("store: outage -> backoff record persisted; not retried until due; success 
 	store!.down = true;
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
 	assert.equal(q.queued().length, 1);
-	assert.equal(q.nextDueAtMs(), clock.now() + BLOB_RETRY_BASE_MS);
+	assert.equal(q.nextDueInMs(), BLOB_RETRY_BASE_MS);
 	assert.equal(storage.dump("b", "blobQueue").length, 1);
 	store!.down = false;
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false, "still backing off");
@@ -110,16 +110,31 @@ test("store: outage -> backoff record persisted; not retried until due; success 
 	assert.equal(storage.dump("b", "blobQueue").length, 0);
 });
 
+test("store: backoff is monotonic: a wall clock jumping back 12 h does not park the retry; reopen clamps to the backoff", async () => {
+	const { q, store, clock, reopen } = await make();
+	const bytes = rnd(32);
+	const hash = sha256Hex(bytes);
+	store!.down = true;
+	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
+	store!.down = false;
+	clock.wall -= 12 * 3600_000;
+	assert.equal(q.nextDueInMs(), BLOB_RETRY_BASE_MS);
+	const q2 = await reopen();
+	assert.equal(q2.nextDueInMs(), BLOB_RETRY_BASE_MS, "persisted wall-time due 12 h ahead is clamped to the record's backoff");
+	clock.advance(BLOB_RETRY_BASE_MS);
+	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), true);
+	assert.equal(await q2.upload({ hash, docId: D, path: P, bytes }), true);
+});
+
 test("store: missing blob on download backs off exponentially", async () => {
 	const { q, clock } = await make();
 	const hash = sha256Hex(rnd(10));
-	const t0 = clock.now();
 	assert.equal(await q.download({ hash, docId: D, path: P, size: 10 }), null);
-	assert.equal(q.nextDueAtMs(), t0 + backoffMs(1));
+	assert.equal(q.nextDueInMs(), backoffMs(1));
 	clock.advance(backoffMs(1));
 	assert.equal(await q.download({ hash, docId: D, path: P, size: 10 }), null);
 	assert.equal(q.queued()[0]!.attempts, 2);
-	assert.equal(q.nextDueAtMs(), clock.now() + backoffMs(2));
+	assert.equal(q.nextDueInMs(), backoffMs(2));
 	assert.equal(backoffMs(2), 2 * backoffMs(1));
 	assert.equal(backoffMs(100), 10 * 60_000);
 });

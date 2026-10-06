@@ -111,7 +111,7 @@ export class VaultRuntime {
 			clock: o.ports.clock,
 			run: (scope) => this.runPass(scope),
 			ready: () => !this.stopped && !this.paused && !this.migrating && this.listingComplete && this.rec !== undefined,
-			nextBlobDueAtMs: () => this.blobs?.nextDueAtMs() ?? null,
+			nextBlobDueInMs: () => this.blobs?.nextDueInMs() ?? null,
 			fullIntervalMs: b.fullReconcileIntervalMs,
 			onError: (e) => this.diag(`pass failed: ${e instanceof Error ? e.message : String(e)}`),
 		});
