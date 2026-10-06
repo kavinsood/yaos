@@ -7,14 +7,24 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import * as Y from "yjs";
 import { BLOB_CHUNK_BYTES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { streamClass, type DocId } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
+import { applyChanges, type TextChanges } from "../body/textChanges";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 
 const BUDGETS = { maxResidentBytes: 1024 * 1024 * 1024, maxResidentDocs: 64 };
+
+/** A bound view's text as main keeps it: the bind text, then every onBoundText change (none before the bind read). */
+function boundView() {
+	const v = { text: null as string | null };
+	const sink = {
+		insert: (i: number, t: string) => void (v.text = v.text!.slice(0, i) + t + v.text!.slice(i)),
+		delete: (i: number, n: number) => void (v.text = v.text!.slice(0, i) + v.text!.slice(i + n)),
+	};
+	return { v, onBoundText: (_id: DocId, changes: TextChanges) => void (v.text !== null && applyChanges(sink, changes)) };
+}
 
 async function live(...es: LogEngine[]): Promise<void> {
 	await until(() => es.every((e) => e.status().phase === "live"), 3_000, "live");
@@ -22,24 +32,25 @@ async function live(...es: LogEngine[]): Promise<void> {
 
 test("large update: x: chunks + bodyUpdateRef reach a live peer, its bound view, and a fresh engine via catch-up", async () => {
 	const relay = new SimRelay();
-	const host = new Y.Doc();
+	const host = boundView();
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", extra: { budgets: BUDGETS } });
 	const { engine: b } = await startTestEngine({
 		relay, deviceId: "dev-b",
-		extra: { budgets: BUDGETS, onDocUpdate: (_id: DocId, u: Uint8Array) => Y.applyUpdate(host, u, "engine") },
+		extra: { budgets: BUDGETS, onBoundText: host.onBoundText },
 	});
 	let c: LogEngine | null = null;
 	try {
 		await live(a, b);
 		const id = await a.createDoc("big.md", "seed;");
 		await converged([a, b]);
-		Y.applyUpdate(host, (await b.bind(id)).state, "engine");
+		await b.bind(id);
+		host.v.text = b.boundText(id);
 		const big = "z".repeat(MAX_INLINE_UPDATE_BYTES + 300_000);
 		await a.editDoc(id, (t) => t.insert(t.length, big));
 		await converged([a, b], 15_000);
 		const want = "seed;" + big;
 		assert.equal(await b.docText(id), want);
-		assert.equal(host.getText("text").toString(), want, "bound view got the resolved update");
+		assert.equal(host.v.text, want, "bound view got the resolved update");
 		const xs = relay.streams().filter((s) => streamClass(s) === "blobchunk");
 		assert.equal(xs.length, 1);
 		const chunkRows = relay.rows(xs[0]!);

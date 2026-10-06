@@ -70,8 +70,6 @@ export const DEFAULT_TUNING: EngineTuning = {
 	blobAppendTimeoutMs: 120_000,
 };
 
-/** Where an update forwarded to the host came from. */
-export type DocUpdateOrigin = "remote" | "provisional" | "local";
 /** Why a bound body's text changed: "editor" = applyEditorChanges, "merge" = an engine merge (editDoc, mergeJob). */
 export type BoundTextOrigin = "remote" | "provisional" | "merge" | "editor";
 
@@ -91,8 +89,6 @@ export interface EngineOptions {
 	readonly budgets?: Partial<Budgets>;
 	/** Default true. false = connect once; reconnect() only. */
 	readonly autoReconnect?: boolean;
-	/** Updates applied to a bound doc that the host did not author. */
-	onDocUpdate?(docId: DocId, update: Uint8Array, origin: DocUpdateOrigin): void;
 	/**
 	 * A bound body's text changed (any origin), as CodeMirror ChangeSet JSON over the text before (textChanges.ts);
 	 * `length` = text length after. Synchronous, inside the Yjs transaction's observer phase (DESIGN §d.3).
@@ -119,7 +115,7 @@ export interface EngineOptions {
 	 * not), a body checkpoint adopted by a read, a provisional update applied
 	 * (and adopted), and a catch-up read that completed (the body became caught
 	 * up, even from own rows only). Fires after the change is durable / applied;
-	 * onDocUpdate still fires for bound docs.
+	 * onBoundText still fires for bound docs.
 	 */
 	onBodyChange?(docIds: readonly DocId[]): void;
 	/** The last own body / canvas record of these docs left the outbox (receipt): own edits are all sequenced. */

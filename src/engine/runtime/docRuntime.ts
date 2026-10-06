@@ -18,7 +18,7 @@ import { ORIGIN } from "../body/yjsCounters";
 import { gate } from "../ingest/gate";
 import type { TailRecord } from "../store/schema";
 import { adoptKey, type EngineCtx } from "./context";
-import type { BoundTextOrigin, DocUpdateOrigin } from "./options";
+import type { BoundTextOrigin } from "./options";
 
 function boundOrigin(origin: unknown): BoundTextOrigin {
 	if (origin === ORIGIN.MAIN) return "editor";
@@ -85,18 +85,13 @@ export class DocRuntime {
 			if (origin === ORIGIN.MERGE) {
 				if (h.builder.push(u, this.c.mono())) void this.closeFrame(h);
 				else this.armBuilder(h);
-				this.forward(h, u, "local");
-			} else if (origin === ORIGIN.REMOTE) this.forward(h, u, "remote");
-			else if (origin === ORIGIN.PROVISIONAL) this.forward(h, u, "provisional");
+			}
 		});
 	}
 	private detach(h: Handle): void {
 		if (h.timer !== null) this.c.ports.clock.clearTimer(h.timer);
 		h.timer = null;
 		this.clearCausal(h.stream);
-	}
-	private forward(h: Handle, u: Uint8Array, origin: DocUpdateOrigin): void {
-		if (h.bound > 0) this.c.opts.onDocUpdate?.(h.docId, u, origin);
 	}
 
 	/** (Re)arm the open-frame close timer from the builder's due time. */

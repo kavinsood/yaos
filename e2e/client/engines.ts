@@ -103,8 +103,8 @@ async function main(): Promise<void> {
 	const frames = a.e.c.sender.stats.appends - appends0;
 	R.extra.typingFrames = { keys: KEYS, frames };
 	R.check("burst typing is batched into frames (max age 300 ms)", frames <= KEYS / 4, { frames, keys: KEYS });
-	R.check("bound views equal the replicas", a.hosts.get(doc)!.getText("text").toString() === (await a.e.docText(doc))
-		&& b.hosts.get(doc)!.getText("text").toString() === (await b.e.docText(doc)));
+	R.check("bound views equal the replicas", a.hosts.get(doc) === (await a.e.docText(doc))
+		&& b.hosts.get(doc) === (await b.e.docText(doc)));
 
 	R.step("concurrent edits on one doc");
 	const cdoc = ids[2]!;

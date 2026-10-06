@@ -4,10 +4,10 @@
  * maintenance and the outbox mirror behind a small host-facing API.
  *
  * Host contract (WP-D wires it): createDoc / renameDoc / deleteDoc author ns
- * ops; bind() returns the replica state for a view, applyLocalUpdate() feeds
- * keystrokes (O(update), never re-encodes the doc), editDoc() applies a
- * disk-merge edit; onDocUpdate forwards remote / provisional / merge updates
- * to bound views.
+ * ops; bind() pins the replica for bound views, applyEditorChanges() applies
+ * their CodeMirror changes (O(change), never re-encodes the doc), editDoc()
+ * applies a disk-merge edit; onBoundText reports every change of a bound body
+ * as CodeMirror changes (DESIGN §d.3).
  */
 
 import * as Y from "yjs";
@@ -21,7 +21,7 @@ import { buildBodyFrames, initialTextUpdates } from "../body/frames";
 import { HandleManager, type Handle } from "../body/handles";
 import { applyChanges, changesBaseLength, type TextChanges } from "../body/textChanges";
 import { Sender } from "../body/sender";
-import { encodeStateAsUpdate, ORIGIN } from "../body/yjsCounters";
+import { ORIGIN } from "../body/yjsCounters";
 import { defaultPriority, Repo, type YS } from "../store/repo";
 import { DB_NAME_PREFIX, DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity } from "../store/schema";
 import { newDocId } from "../../core/codec/ids";
@@ -45,12 +45,6 @@ export class EngineStartError extends Error {
 	constructor(readonly reason: string) {
 		super(`engine start failed: ${reason}`);
 	}
-}
-
-/** Replica state for a raw-Yjs bind (tests, e2e kits); encoded on first read only. */
-export interface BindResult {
-	readonly state: Uint8Array;
-	readonly stateVector: Uint8Array;
 }
 
 function rankOf(c: EngineCtx) {
@@ -336,33 +330,6 @@ export class LogEngine {
 		}
 	}
 
-	/** Host keystroke update on a bound doc: O(update); the open frame closes on its timers. */
-	applyLocalUpdate(docId: DocId, update: Uint8Array): void {
-		const c = this.c;
-		const stream = this.boundStreams.get(docId);
-		const h = stream ? c.handles.peek(stream) : undefined;
-		if (!h || h.bound === 0) throw new Error(`doc not bound: ${docId}`);
-		if (c.repo.stream(h.stream)?.frozen) throw new Error("doc frozen");
-		// Yjs emits "update" only when the transaction changed the doc. A no-op update (a bindDelta carrying only
-		// the known delete set) must not become a frame: it would bump the body version and count as an edit
-		// (a peer's delete would then be undone by edit-beats-delete).
-		let changed = false;
-		const probe = (_u: Uint8Array, origin: unknown) => {
-			if (origin === ORIGIN.MAIN) changed = true;
-		};
-		h.doc.on("update", probe);
-		try {
-			Y.applyUpdate(h.doc, update, ORIGIN.MAIN);
-		} finally {
-			h.doc.off("update", probe);
-		}
-		h.lastAccessMono = c.mono();
-		if (!changed && h.doc.store.pendingStructs === null && h.doc.store.pendingDs === null) return;
-		c.handles.grow(h, update.length);
-		if (h.builder.push(update, c.mono())) void c.docs.closeFrame(h);
-		else c.docs.armBuilder(h);
-	}
-
 	/**
 	 * Bound-view editor changes (CodeMirror ChangeSet JSON over the replica text now, textChanges.ts): one MAIN
 	 * transaction, O(change); the open frame closes on its timers. false = the changes do not fit the text length.
@@ -435,22 +402,14 @@ export class LogEngine {
 		return stream ? Boolean(this.c.repo.stream(stream)?.frozen) : false;
 	}
 
-	async bind(docId: DocId): Promise<BindResult> {
+	/** Pin the replica of a bound doc (one per bound doc; unbind releases it). */
+	async bind(docId: DocId): Promise<void> {
 		const c = this.c;
 		const stream = this.streamOf(docId);
 		const h = await c.handles.load(stream);
 		h.bound++;
 		this.boundStreams.set(docId, stream);
 		c.sess.scheduleCatchUp();
-		const doc = h.doc;
-		return {
-			get state() {
-				return encodeStateAsUpdate(doc);
-			},
-			get stateVector() {
-				return Y.encodeStateVector(doc);
-			},
-		};
 	}
 
 	unbind(docId: DocId): void {
