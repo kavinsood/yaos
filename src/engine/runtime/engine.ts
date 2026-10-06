@@ -339,9 +339,22 @@ export class LogEngine {
 		const h = stream ? c.handles.peek(stream) : undefined;
 		if (!h || h.bound === 0) throw new Error(`doc not bound: ${docId}`);
 		if (c.repo.stream(h.stream)?.frozen) throw new Error("doc frozen");
-		Y.applyUpdate(h.doc, update, ORIGIN.MAIN);
-		c.handles.grow(h, update.length);
+		// Yjs emits "update" only when the transaction changed the doc. A no-op update (a bindDelta carrying only
+		// the known delete set) must not become a frame: it would bump the body version and count as an edit
+		// (a peer's delete would then be undone by edit-beats-delete).
+		let changed = false;
+		const probe = (_u: Uint8Array, origin: unknown) => {
+			if (origin === ORIGIN.MAIN) changed = true;
+		};
+		h.doc.on("update", probe);
+		try {
+			Y.applyUpdate(h.doc, update, ORIGIN.MAIN);
+		} finally {
+			h.doc.off("update", probe);
+		}
 		h.lastAccessMono = c.mono();
+		if (!changed && h.doc.store.pendingStructs === null && h.doc.store.pendingDs === null) return;
+		c.handles.grow(h, update.length);
 		if (h.builder.push(update, c.mono())) void c.docs.closeFrame(h);
 		else c.docs.armBuilder(h);
 	}

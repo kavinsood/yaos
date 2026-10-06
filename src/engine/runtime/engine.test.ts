@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SimRelay } from "../../sim/relay";
-import { converged, startTestEngine, until } from "./testHarness";
+import * as Y from "yjs";
+import { OPEN_FRAME_MAX_MS } from "../../core/limits";
+import { converged, sleep, startTestEngine, until } from "./testHarness";
 
 test("engine: two engines converge on ns + body through SimRelay", async () => {
 	const relay = new SimRelay();
@@ -29,5 +31,38 @@ test("engine: two engines converge on ns + body through SimRelay", async () => {
 	} finally {
 		await a.stop();
 		await b.stop();
+	}
+});
+
+test("engine: a no-op local update (empty bindDelta) produces no frame and keeps the body version", async () => {
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	try {
+		await until(() => a.status().phase === "live", 3_000, "live");
+		const id = await a.createDoc("n.md", "hello world");
+		await a.editDoc(id, (t) => t.delete(0, 6)); // the delete set is non-empty, so the bindDelta is not [0, 0]
+		await converged([a]);
+		const stream = `b:${id}` as never;
+		const rows0 = relay.rows(stream).length;
+		const v0 = a.c.repo.stream(stream)?.bodyVersion;
+		// Host bind: the main replica takes the bind state; nothing was typed, so the delta carries only the known delete set.
+		const b = await a.bind(id);
+		const main = new Y.Doc();
+		Y.applyUpdate(main, b.state);
+		const delta = Y.encodeStateAsUpdate(main, b.stateVector);
+		assert.ok(delta.byteLength > 2, "delta carries the delete set");
+		a.applyLocalUpdate(id, delta);
+		await sleep(OPEN_FRAME_MAX_MS + 200);
+		await converged([a]);
+		assert.equal(relay.rows(stream).length, rows0, "no body row for a no-op update");
+		assert.deepEqual(a.c.repo.stream(stream)?.bodyVersion, v0, "body version unchanged");
+		// A real edit still goes out.
+		const before = Y.encodeStateVector(main);
+		main.getText("text").insert(0, "x");
+		a.applyLocalUpdate(id, Y.encodeStateAsUpdate(main, before));
+		await until(() => relay.rows(stream).length === rows0 + 1, 3_000, "edit row");
+		assert.equal(await a.docText(id), "xworld");
+	} finally {
+		await a.stop();
 	}
 });
