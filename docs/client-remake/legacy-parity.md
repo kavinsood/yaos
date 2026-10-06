@@ -38,8 +38,8 @@ controls have no counterpart.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| "Sync Obsidian settings" toggle | adfa7a7:src/settings/settingsTab.ts:575 | src/host/ui/settingsTab.ts:186-193 | ported |
-| Settings sync default | adfa7a7:src/settings/settingsStore.ts:130 (on) | src/host/ui/api.ts:54 (off) | ported (off is kept on purpose, so nothing syncs until the seed question is answered) |
+| "Sync Obsidian settings" toggle | adfa7a7:src/settings/settingsTab.ts:575 | src/host/ui/settingsTab.ts:192-199 | ported |
+| Settings sync default | adfa7a7:src/settings/settingsStore.ts:130 (on) | src/host/ui/api.ts:61 (off) | ported (off is kept on purpose, so nothing syncs until the seed question is answered) |
 | Root JSON allowlist (the 14 core settings files) | adfa7a7:src/sync/settingsSync/allowlist.ts:3-18 | src/engine/settings/allowlist.ts:20-35 | implemented (97a9651) |
 | Files never synced (workspace.json, workspace-mobile.json, file-recovery.json, publish.json, types.json) | adfa7a7:src/sync/settingsSync/allowlist.ts:20-27 | src/engine/settings/allowlist.ts:12-15 | ported |
 | CSS snippets | adfa7a7:src/sync/settingsSync/allowlist.ts:47-50 | src/engine/settings/allowlist.ts:10, :64 | ported |
@@ -62,7 +62,7 @@ controls have no counterpart.
 | Restart/reload notice after a settings write | adfa7a7:src/sync/settingsSync/apply.ts:643-649 (app.json and hotkeys.json only, :34) | src/engine/settings/cfgPlan.ts:200; src/engine/settings/cfgSync.ts:194; src/host/pluginController.ts:33 | implemented (a0031d0); asking on every JSON write is kept on purpose |
 | "Restart required" settings row | adfa7a7:src/settings/settingsTab.ts:682 | MISSING | dropped: the reload notice replaces it (a0031d0) |
 | Clash pause (Obsidian Sync, Remotely Save, Self-hosted LiveSync, Relay) | adfa7a7:src/sync/settingsSync/clash.ts:1-10; adfa7a7:src/sync/settingsSync/engine.ts:198-201; adfa7a7:src/settings/settingsTab.ts:672 | src/engine/settings/clash.ts:12-16, :41, :49; src/engine/settings/cfgSync.ts:157-159 | implemented (59c7bea) |
-| First-enable seed: "seed from this device" or "take the remote seed" | adfa7a7:src/sync/settingsSync/engine.ts:212-222, :343, :363; adfa7a7:src/settings/settingsTab.ts:601, :624 | src/host/ui/settingsTab.ts:43-64, :372-376; src/protocol/messages.ts:43; src/engine/settings/cfgSync.ts:166 | implemented (13068c6, 4b8ca1a) |
+| First-enable seed: "seed from this device" or "take the remote seed" | adfa7a7:src/sync/settingsSync/engine.ts:212-222, :343, :363; adfa7a7:src/settings/settingsTab.ts:601, :624 | src/host/ui/settingsTab.ts:43-64, :378-382; src/protocol/messages.ts:43; src/engine/settings/cfgSync.ts:166 | implemented (13068c6, 4b8ca1a) |
 | "Decide initial seed later" | adfa7a7:src/settings/settingsTab.ts:647 | src/host/ui/settingsTab.ts:43-64 (closing the question leaves settings sync off) | implemented (4b8ca1a) |
 | First pass on a new device does not let an empty view win | adfa7a7:src/sync/settingsSync/engine.ts:1085 (probeBlank) | src/engine/settings/cfgSync.ts:161-163; src/engine/compose/vaultRuntime.ts:219 | implemented (66c8a4c) |
 | "Apply remote environment" and "Replace remote settings environment" buttons | adfa7a7:src/settings/settingsTab.ts:592, :656 | MISSING | dropped: per-key projection is automatic, and there is no environment (DESIGN §j.3) |
@@ -118,7 +118,7 @@ held changes (:35), pair this device (:36), pair another device (:37), and resta
 | Tooltip | adfa7a7:src/status/statusBarController.ts:178 | src/host/ui/statusBar.ts:184, :284 | ported |
 
 New only: a click opens the held-changes review or the settings (src/host/ui/statusBar.ts:235-238), and the item can
-be hidden (src/host/ui/statusBar.ts:270-275; setting at src/host/ui/settingsTab.ts:280).
+be hidden (src/host/ui/statusBar.ts:270-275; setting at src/host/ui/settingsTab.ts:286).
 
 ### 3.2 Notices
 
@@ -143,7 +143,7 @@ Info-level engine notices stay in the status only, except the settings-reload pr
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
 | Confirm dialog | adfa7a7:src/ui/ConfirmModal.ts:6 | src/host/ui/confirmModal.ts:16, :48 | ported |
-| Pairing-code dialog ("Add my device") | adfa7a7:src/settings/PairDeviceModal.ts:14 | src/host/ui/pairModal.ts:151 | ported (details in §4) |
+| Pairing-code dialog ("Add my device") | adfa7a7:src/settings/PairDeviceModal.ts:14 | src/host/ui/pairModal.ts:158 | ported (details in §4) |
 | Device credentials dialog | adfa7a7:src/settings/DeviceCredentialsModal.ts:3 | MISSING (a masked "Device token" row, src/host/ui/settingsTab.ts:100) | dropped: DeviceCredentials modal (coordinator decision) |
 | Rename shared vault dialog | adfa7a7:src/settings/VaultNameModal.ts:3 | MISSING | dropped: governance moved to the server operator console (§18) |
 | Three-way conflict dialog | adfa7a7:src/ui/ThreeWayConflictModal.ts:10 | MISSING | dropped: DESIGN §m.2 (ThreeWayConflictModal, externalEditPolicy) |
@@ -157,45 +157,45 @@ settings-seed question (src/host/ui/settingsTab.ts:43-64).
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
 | Settings tab registered | adfa7a7:src/main.ts:819-820 | src/host/ui/registerUi.ts:112-120 | ported |
-| Inline setup form ("Join this folder", Server URL, Pairing code, Enroll) | adfa7a7:src/settings/settingsTab.ts:231-254 | src/host/ui/settingsTab.ts:103-107, opening src/host/ui/pairModal.ts:28 | ported (the inline form became a dialog) |
-| "Deploy your server" link | adfa7a7:src/settings/settingsTab.ts:256-260 (URL at :136) | src/host/ui/pairModal.ts:77 (in the pair dialog) | implemented (5a9b34c) |
-| Status rows (Status, Server, Folder, Vault ID, This device) | adfa7a7:src/settings/settingsTab.ts:264-269 | src/host/ui/settingsTab.ts:99-102, :123-125; src/host/ui/settingsModel.ts:162, :203 | ported (there is no Folder row) |
+| Inline setup form ("Join this folder", Server URL, Pairing code, Enroll) | adfa7a7:src/settings/settingsTab.ts:231-254 | src/host/ui/settingsTab.ts:103-107, opening src/host/ui/pairModal.ts:29 | ported (the inline form became a dialog) |
+| "Deploy your server" link | adfa7a7:src/settings/settingsTab.ts:256-260 (URL at :136) | src/host/ui/pairModal.ts:78 (in the pair dialog) | implemented (5a9b34c) |
+| Status rows (Status, Server, Folder, Vault ID, This device) | adfa7a7:src/settings/settingsTab.ts:264-269 | src/host/ui/settingsTab.ts:99-102, :129-131; src/host/ui/settingsModel.ts:164, :222 | ported (there is no Folder row) |
 | "Add my device" | adfa7a7:src/settings/settingsTab.ts:270-274 | src/host/ui/settingsTab.ts:108-113 ("Pair another device") | ported |
 | "Invite person" | adfa7a7:src/settings/settingsTab.ts:275-280 | MISSING | dropped: governance moved to the server operator console (§18) |
 | "Device credentials" | adfa7a7:src/settings/settingsTab.ts:281-285 | MISSING (masked token row, src/host/ui/settingsTab.ts:100) | dropped: DeviceCredentials modal (coordinator decision) |
 | "Open server console" (wave 2) | adfa7a7:src/settings/settingsTab.ts:286-290: a settings action "Open this Worker in a browser. The operator key stays in the console." It calls adfa7a7:src/main.ts:3476-3483, which trims the configured server URL, drops a trailing slash, shows "Configure a server URL first." when it is empty, and otherwise calls window.open(host, "_blank", "noopener"). | TBD-D | TBD-D |
-| "Leave this vault" (members only) | adfa7a7:src/settings/settingsTab.ts:291-296; adfa7a7:src/main.ts:3584 | src/host/ui/settingsTab.ts:114-119 ("Unpair this device"; local only, the confirm text at :406 points at the server console) | dropped: governance moved to the server operator console (§18) |
+| "Leave this vault" (members only) | adfa7a7:src/settings/settingsTab.ts:291-296; adfa7a7:src/main.ts:3584 | src/host/ui/settingsTab.ts:120-125 ("Unpair this device"; local only, the confirm text at :418 points at the server console) | dropped: governance moved to the server operator console (§18) |
 | Updates group (versions, refresh, update action, initialize updater) | adfa7a7:src/settings/settingsTab.ts:305-340 | MISSING | dropped: DESIGN §m.2 (plugin install/update flows; see §14) |
 | "Attachment storage" status and "Refresh attachment capability" | adfa7a7:src/settings/settingsTab.ts:398-409 | MISSING as a row; only the no-attachment-storage warning (src/engine/reconcile/blobJobs.ts:26) | missing: undecided; small (a read-only row that says whether the server has attachment storage) |
 | "Set up attachment storage" video | adfa7a7:src/settings/settingsTab.ts:410-415 (URL at :137) | MISSING | dropped: attachment storage video (coordinator decision) |
 | Collaboration group ("Show remote cursors") | adfa7a7:src/settings/settingsTab.ts:460-470 | MISSING | dropped: DESIGN §m.2 (awareness/cursor presence) |
-| Operational resource rows (residency, queued work, blockers, body sockets, pressure) | adfa7a7:src/settings/settingsTab.ts:509-543 | MISSING (engine rows at src/host/ui/settingsModel.ts:203) | dropped: DESIGN §m.2 (runtime coordinators) |
+| Operational resource rows (residency, queued work, blockers, body sockets, pressure) | adfa7a7:src/settings/settingsTab.ts:509-543 | MISSING (engine rows at src/host/ui/settingsModel.ts:222) | dropped: DESIGN §m.2 (runtime coordinators) |
 
 The settings sync group (adfa7a7:src/settings/settingsTab.ts:545-723) is covered in §1. The roster, security audit and
 governance groups (adfa7a7:src/settings/settingsTab.ts:890-1012) are covered in §18.
 
-New only: the held-changes row (src/host/ui/settingsTab.ts:126-140) and an Actions group: pause, resume, sync now,
-create and browse snapshots, export diagnostics, rebuild the local cache, restart the engine (src/host/ui/settingsTab.ts:229-278).
+New only: the held-changes row (src/host/ui/settingsTab.ts:132-146) and an Actions group: pause, resume, sync now,
+create and browse snapshots, export diagnostics, rebuild the local cache, restart the engine (src/host/ui/settingsTab.ts:235-284).
 
 ### 3.5 Settings fields
 
 Legacy fields are the keys of `DEFAULT_SETTINGS` (adfa7a7:src/settings/settingsStore.ts:111-146). New fields are
-`YaosPluginData` (src/host/ui/api.ts:29) and `EngineSettings` (src/protocol/messages.ts:34), with defaults at
-src/host/ui/api.ts:50-58. The settings sync fields are in §1 and the exclude field is in §12.
+`YaosPluginData` (src/host/ui/api.ts:30) and `EngineSettings` (src/protocol/messages.ts:34), with defaults at
+src/host/ui/api.ts:57-65. The settings sync fields are in §1 and the exclude field is in §12.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Server URL (`host`) | adfa7a7:src/settings/settingsStore.ts:112 | src/host/ui/api.ts:20 (`PairedIdentity`); entered in src/host/ui/pairModal.ts:28 | ported |
-| Device credentials (`deviceToken`, `vaultId`, `deviceId`, `vaultGeneration`) | adfa7a7:src/settings/settingsStore.ts:113-115, :125 | src/host/ui/api.ts:20, :128 (validated on load) | ported |
+| Server URL (`host`) | adfa7a7:src/settings/settingsStore.ts:112 | src/host/ui/api.ts:21 (`PairedIdentity`); entered in src/host/ui/pairModal.ts:29 | ported |
+| Device credentials (`deviceToken`, `vaultId`, `deviceId`, `vaultGeneration`) | adfa7a7:src/settings/settingsStore.ts:113-115, :125 | src/host/ui/api.ts:21, :135 (validated on load) | ported |
 | Person and authority fields (`principalId`, `principalDisplayName` "Your name", `principalColorSeed`, `vaultRole`, revisions, `capabilityDigest`, `authorityCapabilities`) | adfa7a7:src/settings/settingsStore.ts:116-124; adfa7a7:src/settings/settingsTab.ts:344-356 | MISSING | dropped: governance moved to the server operator console (§18) |
 | `originImportPending` (import local files after joining) | adfa7a7:src/settings/settingsStore.ts:126 | MISSING (bootstrap imports local files itself, DESIGN §j.5) | dropped: the first import is part of bootstrap |
-| Device name, renamed on the server when changed | adfa7a7:src/settings/settingsStore.ts:127; adfa7a7:src/settings/settingsTab.ts:357-367, :789-796 | src/host/ui/settingsTab.ts:144 ("Device label": local, used in conflict-copy names); src/host/ui/pairModal.ts:95 (the name is sent once, at pairing) | dropped: renaming a device after pairing moved to the server operator console (§18) |
-| `pendingEnrollment` (an unanswered enrollment kept across restarts) | adfa7a7:src/settings/settingsStore.ts:128; adfa7a7:src/runtime/setupLinkController.ts:60-62 | src/host/ui/api.ts:151; src/host/ui/pairFlow.ts:79, :112; src/host/plugin.ts:131 | implemented (8db4540) |
+| Device name, renamed on the server when changed | adfa7a7:src/settings/settingsStore.ts:127; adfa7a7:src/settings/settingsTab.ts:357-367, :789-796 | src/host/ui/settingsTab.ts:150 ("Device label": local, used in conflict-copy names); src/host/ui/pairModal.ts:96 (the name is sent once, at pairing) | dropped: renaming a device after pairing moved to the server operator console (§18) |
+| `pendingEnrollment` (an unanswered enrollment kept across restarts) | adfa7a7:src/settings/settingsStore.ts:128; adfa7a7:src/runtime/setupLinkController.ts:60-62 | src/host/ui/api.ts:158; src/host/ui/pairFlow.ts:79, :112; src/host/plugin.ts:131 | implemented (8db4540) |
 | `debug` ("Record detailed sync events ...") | adfa7a7:src/settings/settingsStore.ts:129; adfa7a7:src/settings/settingsTab.ts:498-502 | MISSING (the 2000-event ring is always on, src/engine/runtime/context.ts:38) | dropped: DESIGN §m.2 (telemetry and observability) |
 | `frontmatterGuardEnabled` | adfa7a7:src/settings/settingsStore.ts:133; adfa7a7:src/settings/settingsTab.ts:493-497 | MISSING | dropped: DESIGN §m.2 (frontmatter family) |
 | `maxFileSizeKB` ("Maximum text file size in kilobytes") | adfa7a7:src/settings/settingsStore.ts:135; adfa7a7:src/settings/settingsTab.ts:377-392 | MISSING (fixed `MAX_DOC_TEXT_CHARS`, src/core/limits.ts:70; too-large warning at src/engine/reconcile/mergeJob.ts:70) | dropped: markdown max-size setting (fixed limits in src/core/limits.ts) |
 | `externalEditPolicy` ("Edits from other apps": always, closed-only, never) | adfa7a7:src/settings/settingsStore.ts:136; adfa7a7:src/settings/settingsTab.ts:488-492 (options at :138-142) | MISSING | dropped: DESIGN §m.2 (externalEditPolicy) |
-| `enableAttachmentSync` ("Sync attachments", default on) | adfa7a7:src/settings/settingsStore.ts:137; adfa7a7:src/settings/settingsTab.ts:416-421 | src/host/ui/api.ts:52; src/host/ui/settingsTab.ts:168 | ported |
+| `enableAttachmentSync` ("Sync attachments", default on) | adfa7a7:src/settings/settingsStore.ts:137; adfa7a7:src/settings/settingsTab.ts:416-421 | src/host/ui/api.ts:59; src/host/ui/settingsTab.ts:174 | ported |
 | `attachmentSyncExplicitlyConfigured` and its migration | adfa7a7:src/settings/settingsStore.ts:138, :286-292 | MISSING | dropped: legacy settings migration (zero users) |
 | Attachment size limit: field text and effective cap (wave 2) | adfa7a7:src/settings/settingsTab.ts:422-441: number field "Maximum attachment size in kilobytes", text "Attachments larger than this are skipped. Maximum N KB.", min 1, max N, and validation that rejects values above N ("Enter N or less."). N is `attachmentSizeCapKB(serverMaxBlobUploadBytes)` (adfa7a7:src/settings/settingsStore.ts:14-23): min(10240, floor(server max upload bytes / 1024)), or 10240 KB (`MAX_ATTACHMENT_SIZE_KB`, :12) when the server reports no cap. Default 10240 KB (:139). Shown only when the server has attachment storage and sync attachments is on. | TBD-D | TBD-D |
 | `attachmentConcurrency` ("Parallel transfers", 1-5, default 1) | adfa7a7:src/settings/settingsStore.ts:141; adfa7a7:src/settings/settingsTab.ts:442-456 | MISSING (per-device-class `blobConcurrency` 4/2/2/1, src/core/limits.ts:173, :179, :185, :191) | dropped: attachmentConcurrency setting (fixed per-class budgets, DESIGN §i.2) |
@@ -204,32 +204,32 @@ src/host/ui/api.ts:50-58. The settings sync fields are in §1 and the exclude fi
 | `qaDebugMode` | adfa7a7:src/settings/settingsStore.ts:145; adfa7a7:src/main.ts:694 | MISSING | dropped: the QA harness was deleted (f451274) |
 
 New only: "Deleted files go to" (`trashMode`, §11), "Live edits from other devices" (`provisionalBroadcast`,
-src/host/ui/settingsTab.ts:199), daily snapshots and how many to keep (:204, :209), "Upload snapshots to attachment
+src/host/ui/settingsTab.ts:205), daily snapshots and how many to keep (:210, :215), "Upload snapshots to attachment
 storage" (:221), and "Show status in the status bar" (:280).
 
 ## 4. Onboarding and pairing
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Setup link `obsidian://yaos?action=setup&host=...&pairingCode=...` | adfa7a7:src/main.ts:684; adfa7a7:src/runtime/setupLinkController.ts:65-74 | src/host/ui/registerUi.ts:152-159; src/host/ui/pairing.ts:472 | ported (the link opens a pre-filled pair dialog and needs one click; legacy enrolled at once) |
+| Setup link `obsidian://yaos?action=setup&host=...&pairingCode=...` | adfa7a7:src/main.ts:684; adfa7a7:src/runtime/setupLinkController.ts:65-74 | src/host/ui/registerUi.ts:152-159; src/host/ui/pairing.ts:501 | ported (the link opens a pre-filled pair dialog and needs one click; legacy enrolled at once) |
 | Enroll with a server URL and a one-time code | adfa7a7:src/runtime/setupLinkController.ts:56; adfa7a7:src/onboarding/provisioningClient.ts:51 | src/host/ui/pairing.ts:309; src/host/ui/pairFlow.ts:33 | ported |
 | Enroll error text (expired, used, unknown code) | adfa7a7:src/runtime/setupLinkController.ts:336-341 | src/host/ui/pairing.ts:293-296 | ported |
-| "This device is enrolled. Starting sync..." | adfa7a7:src/runtime/setupLinkController.ts:284 | src/host/ui/pairModal.ts:128 | ported |
-| Confirm before pairing over an existing enrollment | adfa7a7:src/runtime/setupLinkController.ts:289 | src/host/ui/pairModal.ts:62-67 (warning), :106 ("Replace pairing") | ported |
+| "This device is enrolled. Starting sync..." | adfa7a7:src/runtime/setupLinkController.ts:284 | src/host/ui/pairModal.ts:130 | ported |
+| Confirm before pairing over an existing enrollment | adfa7a7:src/runtime/setupLinkController.ts:289 | src/host/ui/pairModal.ts:63-68 (warning), :107 ("Replace pairing") | ported |
 | Retire the old enrollment when pairing replaces it (wave 2) | adfa7a7:src/runtime/setupLinkController.ts:250-257: when the new enrollment differs from the current one in host, vault, device or generation (:246-249), it awaits `retireCurrentEnrollment`, and if that throws it shows the error and abandons the new enrollment. The retire step (adfa7a7:src/main.ts:3439-3473) clears the settings-sync local state; sends `DELETE {host}/vault/{vaultId}/auth/device` with the old device token, treating 200 and 401 as success and otherwise showing "Could not remove the old server membership. Remove it from the old server console." (9 s); then tears down sync and deletes the old local database. | TBD-D | TBD-D |
-| An unanswered enrollment is kept and retried on the next load | adfa7a7:src/runtime/setupLinkController.ts:60-62 | src/host/plugin.ts:131; src/host/ui/pairFlow.ts:79, :112; src/host/ui/api.ts:151 | implemented (8db4540) |
+| An unanswered enrollment is kept and retried on the next load | adfa7a7:src/runtime/setupLinkController.ts:60-62 | src/host/plugin.ts:131; src/host/ui/pairFlow.ts:79, :112; src/host/ui/api.ts:158 | implemented (8db4540) |
 | Unclaimed server: claim it in a browser first | adfa7a7:src/runtime/fatalSyncNotice.ts:19-21 | src/host/ui/pairing.ts:216, :233 | ported |
-| Create a pairing code for another device ("Add my device") | adfa7a7:src/main.ts:3238 | src/host/ui/pairing.ts:421; src/host/ui/pairModal.ts:256 | ported |
-| Pairing dialog: copy the pairing page URL and the desktop deep link | adfa7a7:src/settings/PairDeviceModal.ts:69-74, :82-111 | src/host/ui/pairModal.ts:196-210 (server URL, pairing code, setup link and mobile setup page, each with Copy) | ported |
-| "Open pairing page" button | adfa7a7:src/settings/PairDeviceModal.ts:75-77, :95-97 | src/host/ui/pairModal.ts:210 | implemented (a6d3385) |
+| Create a pairing code for another device ("Add my device") | adfa7a7:src/main.ts:3238 | src/host/ui/pairing.ts:421; src/host/ui/pairModal.ts:263 | ported |
+| Pairing dialog: copy the pairing page URL and the desktop deep link | adfa7a7:src/settings/PairDeviceModal.ts:69-74, :82-111 | src/host/ui/pairModal.ts:203-217 (server URL, pairing code, setup link and mobile setup page, each with Copy) | ported |
+| "Open pairing page" button | adfa7a7:src/settings/PairDeviceModal.ts:75-77, :95-97 | src/host/ui/pairModal.ts:217 | implemented (a6d3385) |
 | QR code of the mobile setup page in "Pair another device" (wave 2) | adfa7a7:src/settings/PairDeviceModal.ts:40-66: a "Generating pairing code..." placeholder, then `QRCode.toCanvas(canvas, mobileUrl, { width: 220, margin: 1, errorCorrectionLevel: "M" })` from the `qrcode` package. On success the canvas is shown with aria-label "Device linking code" ("Person invitation code" for an invite); on failure the placeholder reads "Could not generate a pairing code." and the canvas is removed. The intro text asks the user to scan the link on the other device (:33-38). | TBD-D | TBD-D |
-| Device-name hint in the pair dialog | adfa7a7:src/settings/settingsTab.ts:362-364 | src/host/ui/pairModal.ts:95 | implemented (a6d3385) |
+| Device-name hint in the pair dialog | adfa7a7:src/settings/settingsTab.ts:362-364 | src/host/ui/pairModal.ts:96 | implemented (a6d3385) |
 | Default device name | adfa7a7:src/utils/defaultDeviceName.ts:12 | src/host/ui/deviceName.ts:17 | ported |
 | "Invite person" pairing (`kind: "person"`) | adfa7a7:src/settings/PairDeviceModal.ts:21, :31-36; adfa7a7:src/main.ts:3252 | MISSING | dropped: governance moved to the server operator console (§18) |
 | First join with existing local files (durable, resumable importer with a summary) | adfa7a7:src/onboarding/localVaultImport.ts:215, :244; adfa7a7:src/main.ts:920 | src/core/plan/planner.ts:637-644 (local-only files become creates on the first full pass, DESIGN §j.5) | ported (no separate importer) |
 | Operator-provisioned vault check before the first sync | adfa7a7:src/onboarding/provisioningClient.ts:51; adfa7a7:src/main.ts:940 | src/host/ui/pairing.ts:216 (capabilities are checked before enrolling) | ported |
 
-New only: the pairing code shows a live expiry countdown (src/host/ui/pairModal.ts:212-224).
+New only: the pairing code shows a live expiry countdown (src/host/ui/pairModal.ts:219-231).
 
 ## 5. Snapshots and restore UI
 
@@ -242,7 +242,7 @@ uploaded as an off-device copy, but nothing records where, so only the device th
 | Daily snapshot | adfa7a7:src/snapshots/snapshotService.ts:99; adfa7a7:src/main.ts:1514 | src/engine/snapshots/snapshotJob.ts:144; src/engine/compose/vaultRuntime.ts:360 | ported |
 | Manual snapshot | adfa7a7:src/snapshots/snapshotService.ts:113 | src/engine/snapshots/snapshotJob.ts:90; src/engine/compose/runtimeOps.ts:107 | ported (the command is in §2) |
 | Snapshot reasons (initial, daily, manual, pre-bulk-operation) | adfa7a7:src/snapshots/recoveryClient.ts:44 | src/protocol/messages.ts:138 (daily, brake, epoch, idb, restore, manual) | implemented (687d5bc) (reasons shown in listings) |
-| Retention | adfa7a7:src/snapshots/recoveryClient.ts:887; adfa7a7:src/snapshots/snapshotService.ts:180 | src/engine/snapshots/snapshotJob.ts:228 (keep N dailies and 10 others); src/host/ui/settingsTab.ts:209 | ported |
+| Retention | adfa7a7:src/snapshots/recoveryClient.ts:887; adfa7a7:src/snapshots/snapshotService.ts:180 | src/engine/snapshots/snapshotJob.ts:228 (keep N dailies and 10 others); src/host/ui/settingsTab.ts:215 | ported |
 | Snapshot list | adfa7a7:src/snapshots/recoveryModals.ts:13; adfa7a7:src/snapshots/snapshotService.ts:152 | src/host/ui/snapshotsModal.ts:38; src/engine/compose/runtimeOps.ts:111 | implemented (6ca0411) |
 | Browse a snapshot's files | adfa7a7:src/snapshots/recoveryModals.ts:55; adfa7a7:src/snapshots/snapshotService.ts:206 | src/host/ui/snapshotsModal.ts:159; src/engine/compose/runtimeOps.ts:115 | implemented (687d5bc, 6ca0411) |
 | "Back up and restore all" | adfa7a7:src/snapshots/recoveryModals.ts:101 | src/host/ui/snapshotsModal.ts:92 ("Restore all...") | implemented (6ca0411) |
@@ -254,7 +254,7 @@ uploaded as an off-device copy, but nothing records where, so only the device th
 | "Restore as a fresh file identity" | adfa7a7:src/snapshots/recoveryModals.ts:174 | src/engine/snapshots/snapshotJob.ts:175 (a restore is a plain disk write; sync imports it like any local file) | ported |
 | Capture status dialog | adfa7a7:src/snapshots/recoveryModals.ts:196 | MISSING | dropped: recovery-job UI (coordinator decision) |
 | Resume persisted recovery operations on load | adfa7a7:src/snapshots/snapshotService.ts:67, :195 | MISSING | dropped: interrupted restore resume (coordinator decision) |
-| Upload snapshots off the device | adfa7a7:src/snapshots/recoveryClient.ts:688, :722 (server-side recovery points) | src/engine/snapshots/snapshotJob.ts:129-133; src/host/ui/settingsTab.ts:221 | implemented (6ca0411) (the toggle; upload only) |
+| Upload snapshots off the device | adfa7a7:src/snapshots/recoveryClient.ts:688, :722 (server-side recovery points) | src/engine/snapshots/snapshotJob.ts:129-133; src/host/ui/settingsTab.ts:227 | implemented (6ca0411) (the toggle; upload only) |
 | Cross-device restore (restore a recovery point taken on another device) | adfa7a7:src/snapshots/recoveryClient.ts:722; adfa7a7:src/snapshots/snapshotService.ts:152 | MISSING | missing: large; DESIGN §j.4 keeps it out of v1 (uploads record no address, and there is no list or fetch path) |
 | Portable vault export | adfa7a7:src/snapshots/vaultExport.ts:124, :127; adfa7a7:src/main.ts:1389-1390 | MISSING | dropped: portable export (the vault is plain files; a manual snapshot is a zip) |
 
@@ -338,15 +338,16 @@ DESIGN §f.5), and a multi-step copy is resumed after a crash from its intent re
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
 | Remote delete follows Obsidian's "Deleted files" preference (wave 2) | adfa7a7:src/sync/diskMirror.ts:1543-1546 and adfa7a7:src/sync/blobSync.ts:2047-2052: `app.fileManager.trashFile(file)`, which uses the user's Obsidian setting (system trash, the `.trash` folder, or permanent delete); there was no YAOS setting | TBD-D | TBD-D |
-| Remote move without rewriting links | adfa7a7:src/sync/diskMirror.ts:472 (`fileManager.renameFile`, which rewrote links) | src/host/obsidianVault.ts:8, :154, :168-176 (`vault.rename`; case-only renames go through a temporary name) | dropped: DESIGN §m.2 (`fileManager.renameFile` for remote moves) |
+| Remote move without rewriting links | adfa7a7:src/sync/diskMirror.ts:472 (`fileManager.renameFile`, which rewrote links) | src/host/obsidianVault.ts:8, :176, :190-198 (`vault.rename`; case-only renames go through a temporary name) | dropped: DESIGN §m.2 (`fileManager.renameFile` for remote moves) |
 
 New only:
-- "Deleted files go to" picks the Obsidian trash or the system trash (src/host/ui/settingsTab.ts:194,
-  src/ports/vault.ts:50, src/host/obsidianVault.ts:184, :194).
+- "Deleted files go to" is a YAOS setting, so sync deletes can go to the Obsidian trash or the system trash
+  whatever Obsidian's own preference says (src/host/ui/settingsTab.ts:200, src/ports/vault.ts:55,
+  src/host/obsidianVault.ts:206, :216). The "Follow Obsidian" choice is the wave-2 row above.
 - Sync never deletes a file permanently (DESIGN I2): the adapter has only `vault.trash`
   (src/host/obsidianVault.ts:9), and the executor deletes only through it (src/host/diskExecutor.ts:15, :189).
 - A delete loses to edits typed before it arrived (src/host/diskExecutor.ts:181-185).
-- An emptied folder is removed only when it has no children (src/host/obsidianVault.ts:201-203).
+- An emptied folder is removed only when it has no children (src/host/obsidianVault.ts:230-232).
 
 ## 12. Excluded paths and ignore rules
 
@@ -354,7 +355,7 @@ New only:
 |---|---|---|---|
 | The config folder and `.trash/` never sync | adfa7a7:src/sync/exclude.ts:3-9, :23-25 | src/core/paths/validate.ts:56 (any segment starting with a dot is invalid, which covers both) | ported |
 | User exclude patterns | adfa7a7:src/sync/exclude.ts:21, :26-27 (path prefixes) | src/engine/reconcile/localState.ts:36-59 (`folder/` prefixes plus `*`, `?`, `**` globs), :84 | ported (wider syntax) |
-| Pattern format: one comma-separated line | adfa7a7:src/sync/exclude.ts:36-40; adfa7a7:src/settings/settingsTab.ts:373-376 | src/host/ui/settingsModel.ts:46 (one pattern per line); src/host/ui/settingsTab.ts:157 | implemented (0b9e3e9) (the setting text describes the glob syntax) |
+| Pattern format: one comma-separated line | adfa7a7:src/sync/exclude.ts:36-40; adfa7a7:src/settings/settingsTab.ts:373-376 | src/host/ui/settingsModel.ts:48 (one pattern per line); src/host/ui/settingsTab.ts:163 | implemented (0b9e3e9) (the setting text describes the glob syntax) |
 | Names other systems cannot store (reserved names, forbidden characters, length) are not synced | adfa7a7:src/sync/pathPolicy.ts:12; adfa7a7:src/sync/blobSync.ts:558-564 (invalid attachment paths quarantined) | src/core/paths/validate.ts:54-62; src/core/limits.ts:12-14, :32-38; src/engine/reconcile/localState.ts:83 | ported (the warning popup is implemented (c5ca263), §3.2) |
 | Path canonicalization | adfa7a7:src/paths/canonicalPath.ts:39 | src/core/paths/validate.ts:1-5 (NFC, frozen fold rules); src/engine/reconcile/localState.ts:76 | ported |
 | Case and Unicode collisions between paths | adfa7a7:src/paths/pathCollision.ts:55 | src/core/paths/pathKey.ts:48, :54 (one fold key per path) | ported |
@@ -411,13 +412,13 @@ clean document (src/engine/body/handles.ts:193).
 
 The legacy stylesheet (adfa7a7:styles.css, 163 lines) was deleted in f451274. The new UI uses Obsidian's own classes
 (`mod-cta`, `mod-warning`, `mod-clickable`, Setting rows). It still sets a few `yaos-*` class names
-(src/host/ui/statusBar.ts:217, :247; src/host/ui/pairModal.ts:60, :170, :238-239; src/host/ui/brakeModal.ts:26, :33),
+(src/host/ui/statusBar.ts:217, :247; src/host/ui/pairModal.ts:61, :177, :245-246; src/host/ui/brakeModal.ts:26, :33),
 but no stylesheet styles them.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
 | Collapsible settings details | adfa7a7:styles.css:5-18 | MISSING (Setting groups) | dropped: styles.css (deleted in f451274) |
-| Pair dialog layout (copy text, QR frame, loading text, QR canvas) | adfa7a7:styles.css:19-44 | MISSING (unstyled; src/host/ui/pairModal.ts:238-239) | dropped: styles.css (deleted in f451274) |
+| Pair dialog layout (copy text, QR frame, loading text, QR canvas) | adfa7a7:styles.css:19-44 | MISSING (unstyled; src/host/ui/pairModal.ts:245-246) | dropped: styles.css (deleted in f451274) |
 | Settings textarea and callout | adfa7a7:styles.css:45-59 | MISSING | dropped: styles.css (deleted in f451274) |
 | Snapshot list and restore-selection layout | adfa7a7:styles.css:60-106 | MISSING (Setting rows, src/host/ui/snapshotsModal.ts:38, :159) | dropped: styles.css (deleted in f451274) |
 | Remote cursor styles (hidden unless "Show remote cursors") | adfa7a7:styles.css:108-163 | MISSING | dropped: DESIGN §m.2 (awareness/cursor presence) |
