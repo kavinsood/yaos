@@ -75,19 +75,7 @@ Obsidian vaults remain ordinary local files. Changes made by editors, scripts, G
 
 ## Headless Linux client
 
-The Node 24 CLI synchronizes Markdown in a local directory without Obsidian. It enrolls as its own vault-scoped device; credentials are generated and stored outside the vault rather than copied from another installation.
-
-```sh
-npm run build:cli
-
-YAOS_HOST=https://sync.example.workers.dev \
-YAOS_PAIRING_CODE=... \
-node packages/cli/dist/yaos.mjs enroll /srv/vault
-
-node packages/cli/dist/yaos.mjs daemon /srv/vault
-```
-
-The daemon is Linux/local-filesystem only, Markdown only, and single-process per vault. `.obsidian`, attachments, network filesystems, and rename-identity inference are intentionally outside its contract. See [operations](./docs/operations.md#headless-linux-client).
+The headless Linux CLI in `packages/cli` was built on the old Obsidian client, which has been deleted. It no longer builds and is not supported.
 
 ## Self-hosted Docker server
 
