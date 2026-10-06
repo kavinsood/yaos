@@ -19,7 +19,7 @@ const IDENTITY: PairedIdentity = {
 test("DEFAULT_ENGINE_SETTINGS matches the contract and is frozen", () => {
 	assert.deepEqual(DEFAULT_ENGINE_SETTINGS, {
 		excludePatterns: [], syncAttachments: true, maxAttachmentBytes: 50 * MIB, syncSettings: false,
-		trashMode: "obsidian-trash", provisionalBroadcast: true,
+		trashMode: "follow-obsidian", provisionalBroadcast: true,
 		snapshots: { enabled: true, keepDaily: 7, uploadToBlobStore: false },
 	});
 	assert.ok(Object.isFrozen(DEFAULT_ENGINE_SETTINGS));
@@ -73,7 +73,7 @@ test("sanitizePluginData: partial and invalid fields fall back per field", () =>
 	assert.deepEqual(out.engine.excludePatterns, ["a", "b"]);
 	assert.equal(out.engine.syncAttachments, true);
 	assert.equal(out.engine.maxAttachmentBytes, 50 * MIB);
-	assert.equal(out.engine.trashMode, "obsidian-trash");
+	assert.equal(out.engine.trashMode, "follow-obsidian");
 	assert.equal(out.engine.snapshots.keepDaily, 7);
 	assert.equal(out.engine.snapshots.enabled, false);
 	assert.equal(out.showStatusBar, true);

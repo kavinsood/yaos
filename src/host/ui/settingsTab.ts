@@ -193,7 +193,7 @@ export class YaosSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Deleted files go to",
-				desc: "Where files deleted by sync are moved. YAOS never deletes a file permanently.",
+				desc: "Where files deleted by sync are moved. YAOS never deletes a file permanently: if Obsidian is set to \"Permanently delete\", Follow Obsidian uses the .trash folder.",
 				control: { type: "dropdown", key: "trashMode", options: { ...TRASH_MODE_OPTIONS } },
 			},
 			{

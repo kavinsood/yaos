@@ -1435,6 +1435,9 @@ interface PlatformPort {
 // vault.ts — main thread only
 type WritePrecondition = { t: "absent" } | { t: "fingerprint"; fingerprint: DiskFingerprint }
   | { t: "hash"; hash: ContentHash } | { t: "any" };
+// "follow-obsidian" (default): the host reads trashOption from <configDir>/app.json at each delete. "system" or absent
+// → system trash; "local" and "none" (Permanently delete) → the vault's .trash folder, never a permanent delete.
+type TrashMode = "follow-obsidian" | "obsidian-trash" | "system-trash";
 interface VaultPort {
   readonly configDir: string;
   readonly caseInsensitive: boolean;

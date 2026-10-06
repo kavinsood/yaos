@@ -146,8 +146,8 @@ export async function sRenames(x: FullCtx): Promise<void> {
 	c.vault.userDelete("rn2/sub/file3.md"); // c got this path from a's folder rename: delete after a remote rename
 	for (const ms of await reachPeers([a, b], "rn2/sub/file3.md", null, t0)) x.R.record("delete_to_peer_ms", ms);
 	await settle(x, null);
-	const trashOk = (p: FullClient, path: string) => p.vault.trashed.some((r) => r.path === path && r.mode === "obsidian-trash");
-	x.R.check("deleted files went to the Obsidian trash on peers", trashOk(a, "del/x.md") && trashOk(c, "del/x.md") && trashOk(a, "del/inner/y.md") && trashOk(b, "del/inner/y.md")
+	const trashOk = (p: FullClient, path: string) => p.vault.trashed.some((r) => r.path === path && r.mode === "follow-obsidian");
+	x.R.check("deleted files went to the trash Obsidian is set to (default mode) on peers", trashOk(a, "del/x.md") && trashOk(c, "del/x.md") && trashOk(a, "del/inner/y.md") && trashOk(b, "del/inner/y.md")
 		&& trashOk(a, "rn2/sub/file3.md") && trashOk(b, "rn2/sub/file3.md"), x.clients.map((p) => p.vault.trashed.map((r) => `${r.path}:${r.mode}`)));
 	x.R.check("trash calls only for the deletes", delta(0, "trash") === 3 && delta(1, "trash") === 2 && delta(2, "trash") === 1, [0, 1, 2].map((i) => delta(i, "trash")));
 	x.R.check("deleted files gone everywhere", x.clients.every((p) => !p.vault.hasFile("del/x.md") && !p.vault.hasFile("del/inner/y.md") && !p.vault.hasFile("rn2/sub/file3.md")));
@@ -184,7 +184,7 @@ export async function sAttachments(x: FullCtx): Promise<void> {
 	c.vault.userDelete("attachments/manual.pdf");
 	for (const ms of await reachPeers([a, b], "attachments/manual.pdf", null, t0, 60_000)) x.R.record("delete_to_peer_ms", ms);
 	await settle(x, null, 120_000);
-	x.R.check("attachment delete went to trash on peers", [a, b].every((p) => p.vault.trashed.some((r) => r.path === "attachments/manual.pdf" && r.mode === "obsidian-trash")));
+	x.R.check("attachment delete went to trash on peers", [a, b].every((p) => p.vault.trashed.some((r) => r.path === "attachments/manual.pdf" && r.mode === "follow-obsidian")));
 	x.R.check("modified png identical everywhere", (await Promise.all(x.clients.map((p) => bytesOf(p, "attachments/photo.png")))).every((v, _i, all) => sameBytes(v, all[0]!)));
 	x.R.extra.blobPath = Object.fromEntries(x.clients.map((p) => [p.name, p.blobKind]));
 	noConflicts(x);

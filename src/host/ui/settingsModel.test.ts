@@ -2,9 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	applyControl, CONTROL_KEYS, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused,
-	parseExcludePatterns, phaseLabel, readControl, runStateLabel, validateControl,
+	parseExcludePatterns, phaseLabel, readControl, runStateLabel, TRASH_MODE_OPTIONS, validateControl,
 } from "./settingsModel";
-import { defaultPluginData, MIB, sanitizePluginData, type PairedIdentity } from "./api";
+import { defaultPluginData, MIB, sanitizePluginData, TRASH_MODES, type PairedIdentity } from "./api";
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
 
 const TOKEN = "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
@@ -62,6 +62,19 @@ test("validation rejects bad values with readable messages and applyControl thro
 	}
 	assert.equal(validateControl("maxAttachmentMb", 1024), null);
 	assert.equal(validateControl("snapshotsKeepDaily", 90), null);
+});
+
+test("trashMode: follow-obsidian is the default and listed first; every mode validates, applies and survives the sanitizer", () => {
+	assert.deepEqual(Object.keys(TRASH_MODE_OPTIONS), [...TRASH_MODES]);
+	assert.equal(TRASH_MODES[0], "follow-obsidian");
+	assert.match(TRASH_MODE_OPTIONS["follow-obsidian"], /Files and links → Deleted files/);
+	assert.equal(defaultPluginData("Mac").engine.trashMode, "follow-obsidian");
+	for (const mode of TRASH_MODES) {
+		assert.equal(validateControl("trashMode", mode), null, mode);
+		const d = applyControl(defaultPluginData("Mac"), "trashMode", mode);
+		assert.equal(readControl(d, "trashMode"), mode);
+		assert.equal(sanitizePluginData(JSON.parse(JSON.stringify(d)), "Mac").engine.trashMode, mode);
+	}
 });
 
 test("enableSettingsSync turns settings sync on with the seed answer, which survives the sanitizer; turning it off keeps the rest", () => {

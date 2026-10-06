@@ -8,6 +8,7 @@ import type { App } from "obsidian";
 import type { EngineSettings, UserCommand, EngineResultValue } from "../../protocol/messages";
 import type { StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
+import type { TrashMode } from "../../ports/vault";
 import {
 	DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, normalizeDeviceName, normalizeHost, normalizePairingCode,
 	type EnrollmentAttempt,
@@ -47,12 +48,18 @@ export const MAX_EXCLUDE_PATTERNS = 500;
 export const MAX_EXCLUDE_PATTERN_CHARS = 512;
 export const MAX_DEVICE_LABEL_CHARS = 64;
 
+export const TRASH_MODES: readonly TrashMode[] = Object.freeze(["follow-obsidian", "obsidian-trash", "system-trash"]);
+
+export function isTrashMode(value: unknown): value is TrashMode {
+	return (TRASH_MODES as readonly unknown[]).includes(value);
+}
+
 export const DEFAULT_ENGINE_SETTINGS: EngineSettings = Object.freeze({
 	excludePatterns: Object.freeze([]) as readonly string[],
 	syncAttachments: true,
 	maxAttachmentBytes: 50 * MIB,
 	syncSettings: false,
-	trashMode: "obsidian-trash",
+	trashMode: "follow-obsidian",
 	provisionalBroadcast: true,
 	snapshots: Object.freeze({ enabled: true, keepDaily: 7, uploadToBlobStore: false }),
 });
@@ -114,7 +121,7 @@ export function sanitizeEngineSettings(raw: unknown): EngineSettings {
 		maxAttachmentBytes: intInRange(r.maxAttachmentBytes, 1, MAX_ATTACHMENT_BYTES_LIMIT, d.maxAttachmentBytes),
 		syncSettings: bool(r.syncSettings, d.syncSettings),
 		...(r.syncSettingsSeed === "device" || r.syncSettingsSeed === "vault" ? { syncSettingsSeed: r.syncSettingsSeed } : {}),
-		trashMode: r.trashMode === "obsidian-trash" || r.trashMode === "system-trash" ? r.trashMode : d.trashMode,
+		trashMode: isTrashMode(r.trashMode) ? r.trashMode : d.trashMode,
 		provisionalBroadcast: bool(r.provisionalBroadcast, d.provisionalBroadcast),
 		snapshots: {
 			enabled: bool(snap?.enabled, d.snapshots.enabled),

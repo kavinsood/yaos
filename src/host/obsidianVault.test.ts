@@ -5,7 +5,7 @@ import type { VaultEvent } from "../ports/vault";
 import { simHashPort } from "../sim/hash";
 import { FakeObsidianVault } from "../sim/fakeObsidian";
 import { createHasher, utf8 } from "./hashing";
-import { ObsidianVault } from "./obsidianVault";
+import { followObsidianSystemTrash, ObsidianVault } from "./obsidianVault";
 
 const hasher = createHasher(simHashPort());
 const P = (p: string) => p as VaultPath;
@@ -111,6 +111,33 @@ test("trash only, with precondition; removeEmptyFolder only removes empty folder
 	await vault.removeEmptyFolder(P("t"));
 	assert.equal(fake.folders.has("t"), false);
 	assert.deepEqual(fake.calls.filter((c) => c.startsWith("delete")), ["delete t force=false"]);
+});
+
+test("follow-obsidian reads trashOption from <configDir>/app.json at each delete; none is never a permanent delete", async () => {
+	assert.equal(followObsidianSystemTrash(null), true, "absent: Obsidian's default (system)");
+	assert.equal(followObsidianSystemTrash(`{"trashOption":"system"}`), true);
+	assert.equal(followObsidianSystemTrash(`{"trashOption":"local"}`), false);
+	assert.equal(followObsidianSystemTrash(`{"trashOption":"none"}`), false, "permanently delete: .trash folder");
+	for (const bad of ["{not json", "null", "[]", `"local"`, `{"trashOption":42}`, `{"trashOption":"later"}`]) assert.equal(followObsidianSystemTrash(bad), true, bad);
+
+	const { fake, vault } = setup();
+	const del = async (name: string, appJson: string | null, mode: "follow-obsidian" | "obsidian-trash" = "follow-obsidian") => {
+		if (appJson === null) fake.raw.delete(".obsidian/app.json");
+		else fake.raw.set(".obsidian/app.json", utf8(appJson));
+		fake.put(name, name);
+		assert.equal((await vault.trash(name, mode, { t: "any" })).ok, true, name);
+	};
+	await del("absent.md", null);
+	await del("system.md", `{"trashOption":"system"}`);
+	await del("local.md", `{"promptDelete":false,"trashOption":"local"}`);
+	await del("none.md", `{"trashOption":"none"}`);
+	await del("bad.md", "{not json");
+	await del("explicit.md", `{"trashOption":"system"}`, "obsidian-trash");
+	assert.deepEqual(fake.trashed, [
+		{ path: "absent.md", system: true }, { path: "system.md", system: true }, { path: "local.md", system: false },
+		{ path: "none.md", system: false }, { path: "bad.md", system: true }, { path: "explicit.md", system: false },
+	]);
+	assert.equal(fake.calls.some((c) => c.startsWith("delete")), false, "never vault.delete");
 });
 
 test("events map files only and unsubscribe cleanly", async () => {

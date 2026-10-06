@@ -3,10 +3,11 @@
  * read-only info rows (connection, engine). No obsidian runtime import.
  */
 
+import type { TrashMode } from "../../ports/vault";
 import type { StatusSnapshot } from "../../protocol/status";
 import {
 	MAX_ATTACHMENT_BYTES_LIMIT, MAX_DEVICE_LABEL_CHARS, MAX_EXCLUDE_PATTERN_CHARS, MAX_EXCLUDE_PATTERNS, MAX_KEEP_DAILY, MIB,
-	sanitizeDeviceLabel,
+	isTrashMode, sanitizeDeviceLabel,
 	type EngineRunState, type PairedIdentity, type YaosPluginData,
 } from "./api";
 import { formatAgo, formatDuration, maskSecret, plural } from "./format";
@@ -33,7 +34,8 @@ export const TEXT_CONTROL_KEYS: ReadonlySet<ControlKey> = new Set<ControlKey>(["
 
 export const MAX_ATTACHMENT_MB = MAX_ATTACHMENT_BYTES_LIMIT / MIB;
 
-export const TRASH_MODE_OPTIONS: Readonly<Record<string, string>> = Object.freeze({
+export const TRASH_MODE_OPTIONS: Readonly<Record<TrashMode, string>> = Object.freeze({
+	"follow-obsidian": "Follow Obsidian (Files and links → Deleted files)",
 	"obsidian-trash": "Obsidian trash (.trash folder)",
 	"system-trash": "System trash",
 });
@@ -97,7 +99,7 @@ export function validateControl(key: ControlKey, value: unknown): string | null 
 		}
 		case "maxAttachmentMb": return intError(value, 1, MAX_ATTACHMENT_MB, "MB");
 		case "snapshotsKeepDaily": return intError(value, 1, MAX_KEEP_DAILY, "days");
-		case "trashMode": return value === "obsidian-trash" || value === "system-trash" ? null : "Choose a trash mode.";
+		case "trashMode": return isTrashMode(value) ? null : "Choose a trash mode.";
 		case "syncAttachments":
 		case "syncSettings":
 		case "provisionalBroadcast":
@@ -130,7 +132,7 @@ export function applyControl(data: YaosPluginData, key: ControlKey, value: unkno
 		case "syncAttachments": return { ...data, engine: { ...e, syncAttachments: value as boolean } };
 		case "maxAttachmentMb": return { ...data, engine: { ...e, maxAttachmentBytes: (value as number) * MIB } };
 		case "syncSettings": return { ...data, engine: { ...e, syncSettings: value as boolean } };
-		case "trashMode": return { ...data, engine: { ...e, trashMode: value as "obsidian-trash" | "system-trash" } };
+		case "trashMode": return { ...data, engine: { ...e, trashMode: value as TrashMode } };
 		case "provisionalBroadcast": return { ...data, engine: { ...e, provisionalBroadcast: value as boolean } };
 		case "snapshotsEnabled": return { ...data, engine: { ...e, snapshots: { ...e.snapshots, enabled: value as boolean } } };
 		case "snapshotsKeepDaily": return { ...data, engine: { ...e, snapshots: { ...e.snapshots, keepDaily: value as number } } };
