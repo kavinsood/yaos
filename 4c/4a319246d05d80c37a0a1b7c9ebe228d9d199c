@@ -1,0 +1,31 @@
+src/engine/runtime/blobChunks.test.ts
+  s_71e670913dcd74::t_1fa05ccf889aa3 194-227
+src/engine/runtime/liveIngest.ts
+  s_a3bb6f72388aba::t_8ccabb8237206b 192-193
+src/engine/store/repo.ts
+  s_a3bb6f72388aba::t_e58cc636b439de 384,386-387,395-396,483-485,715-726,734
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4c4a319246d05d80c37a0a1b7c9ebe228d9d199c",
+  "prompts": {},
+  "sessions": {
+    "s_71e670913dcd74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a293b6665872fe812",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_a3bb6f72388aba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a97fe38a693c58afa",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
