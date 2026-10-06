@@ -2,13 +2,15 @@
 // `v/<vaultId>/<address>`, opaque addresses (no hash check), overwrite, the GET headers, the 10 MiB cap (declared and
 // streamed), `exists` (≤ 50, more or a malformed entry is 400 (A4), errors), the bearer check in the vault DO (zero
 // config calls), and the no-bucket answer (`503 attachments_unavailable`, `capabilities.attachments = false`). The blob
-// GC routes (E2EE design §19 A3, relay-wire §11.3.1): list paging, the batch conditional delete, their limit and
-// refusals.
+// GC routes (E2EE design §19 A3, relay-wire §11.3.1): list paging (empty truncated R2 pages too), the batch
+// conditional delete, their limit and refusals.
 import assert from "node:assert/strict";
 
 import {
 	BLOB_GC_HEAD_CONCURRENCY,
+	BLOB_LIST_MAX_CALLS,
 	BLOB_LIST_PAGE_SIZE,
+	BLOB_LIST_RETRY_AFTER_S,
 	MAX_BLOB_DELETE_ADDRESSES,
 	MAX_BLOB_DELETE_BODY_BYTES,
 	MAX_BLOB_EXISTS_ADDRESSES,
@@ -306,6 +308,51 @@ s.test("T-BLOB-GC-LIST: a PUT stamps uploadedAt; an overwrite refreshes it", asy
 		assert.equal((await put(world, vaultId, device, ADDRESS, new Uint8Array([2]))).status, 204);
 		assert.deepEqual(await json(await listBlobs(world, vaultId, device)),
 			{ items: [{ address: ADDRESS, uploadedAt: 9_000 }], next: null });
+	});
+});
+
+s.test("T-BLOB-GC-LIST: an empty truncated R2 page is followed with R2's cursor (≤ 10 calls), else 503 list_incomplete", async () => {
+	assert.deepEqual([BLOB_LIST_MAX_CALLS, BLOB_LIST_RETRY_AFTER_S], [10, 5]);
+	await withWorld(async (world) => {
+		const { vaultId, device } = await enrolled(world);
+		const prefix = `v/${vaultId}/`;
+		for (let index = 0; index < 1005; index++) world.bucket.objects.set(blobKey(vaultId, addressOf(index)), new Uint8Array([1]));
+
+		// First page: 3 empty truncated answers, then objects; one request.
+		world.bucket.emptyTruncatedLists = 3;
+		world.bucket.calls.length = 0;
+		const first = await page(await listBlobs(world, vaultId, device));
+		assert.deepEqual([first.items.length, first.items[0]!.address, first.next], [1000, addressOf(0), addressOf(999)]);
+		assert.deepEqual(world.bucket.calls, [`list ${prefix}`, `list ${prefix} cursor `, `list ${prefix} cursor `,
+			`list ${prefix} cursor `], "after an empty truncated answer: prefix + R2's own cursor, no startAfter");
+
+		// A later page: the client's cursor is startAfter, then R2's cursor carries the position.
+		world.bucket.emptyTruncatedLists = 2;
+		world.bucket.calls.length = 0;
+		const second = await page(await listBlobs(world, vaultId, device, first.next!));
+		assert.deepEqual(second, { items: Array.from({ length: 5 }, (_, index) => ({ address: addressOf(1000 + index),
+			uploadedAt: 0 })), next: null });
+		const after = blobKey(vaultId, addressOf(999));
+		assert.deepEqual(world.bucket.calls, [`list ${prefix} after ${after}`, `list ${prefix} cursor ${after}`,
+			`list ${prefix} cursor ${after}`]);
+
+		// Truncated and empty, then the listing completes with nothing more: an empty last page, next null.
+		world.bucket.emptyTruncatedLists = 1;
+		assert.deepEqual(await json(await listBlobs(world, vaultId, device, addressOf(1004))), { items: [], next: null });
+
+		// Ten empty truncated answers: 503, never `next: null` while R2 says truncated.
+		world.bucket.emptyTruncatedLists = BLOB_LIST_MAX_CALLS;
+		world.bucket.calls.length = 0;
+		const incomplete = await listBlobs(world, vaultId, device, first.next!);
+		assert.deepEqual([incomplete.status, await json(incomplete)], [503, { error: "list_incomplete" }]);
+		assert.equal(incomplete.headers.get("Retry-After"), "5");
+		assert.equal(incomplete.headers.get("Access-Control-Allow-Origin"), "*", "CORS like every vault route");
+		assert.equal(world.bucket.calls.length, BLOB_LIST_MAX_CALLS, "bounded: 10 list calls");
+		assert.deepEqual(await page(await listBlobs(world, vaultId, device, first.next!)), second, "the retry lists");
+
+		// Nine empty answers still end in a page.
+		world.bucket.emptyTruncatedLists = BLOB_LIST_MAX_CALLS - 1;
+		assert.equal((await page(await listBlobs(world, vaultId, device))).items.length, 1000);
 	});
 });
 

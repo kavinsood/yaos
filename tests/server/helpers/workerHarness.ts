@@ -398,7 +398,8 @@ export function bearer(device: DeviceSeed): Record<string, string> {
 /**
  * An in-memory R2 bucket with the calls the Worker makes: blob put/get/head (D9), the D5 purge's list/delete and the
  * blob GC's list/head/delete (relay-wire §11.3.1). `calls` records each call in order (a put says whether its value was
- * a stream); `stuck` keeps every listing truncated. A put stamps the object with `now` (ms; R2's `uploaded`, which an
+ * a stream); `stuck` keeps every listing truncated; `emptyTruncatedLists` makes the next N lists answer truncated with
+ * no objects (real R2 may; miniflare never does). A put stamps the object with `now` (ms; R2's `uploaded`, which an
  * overwrite refreshes); an object set straight into `objects` reads as uploaded at 0. `head` resolves a microtask
  * later and counts the HEADs in flight (`maxHeadsInFlight`); `afterHead` runs after each HEAD has read the object.
  */
@@ -407,6 +408,7 @@ export class FakeBucket {
 	readonly uploadedAt = new Map<string, number>();
 	readonly calls: string[] = [];
 	stuck = false;
+	emptyTruncatedLists = 0;
 	lists = 0;
 	now = 1_000_000;
 	maxHeadsInFlight = 0;
@@ -434,15 +436,30 @@ export class FakeBucket {
 		this.afterHead?.(key);
 		return found;
 	}
-	/** R2 `list`: keys in order, `prefix`, `limit` (≤ 1000) and `startAfter` (exclusive), as miniflare does. */
-	list(options: { prefix?: string; limit?: number; startAfter?: string }) {
+	/**
+	 * R2 `list` as miniflare does it: keys in order, `prefix`, `limit` (≤ 1000), `startAfter` (exclusive) and `cursor`
+	 * (base64 of the last key listed; with both, the later position wins).
+	 */
+	list(options: { prefix?: string; limit?: number; startAfter?: string; cursor?: string }) {
 		this.lists++;
-		this.calls.push(`list ${options.prefix ?? ""}${options.startAfter === undefined ? "" : ` after ${options.startAfter}`}`);
-		const after = options.startAfter;
+		this.calls.push(`list ${options.prefix ?? ""}${options.startAfter === undefined ? "" : ` after ${options.startAfter}`}`
+			+ `${options.cursor === undefined ? "" : ` cursor ${atob(options.cursor)}`}`);
+		let after = options.startAfter;
+		if (options.cursor !== undefined) {
+			const fromCursor = atob(options.cursor);
+			if (after === undefined || fromCursor > after) after = fromCursor;
+		}
+		if (this.emptyTruncatedLists > 0) {
+			this.emptyTruncatedLists--;
+			return Promise.resolve({ objects: [], truncated: true, cursor: btoa(after ?? "") });
+		}
 		const matching = [...this.objects.keys()]
 			.filter((key) => key.startsWith(options.prefix ?? "") && (after === undefined || key > after)).sort();
 		const objects = matching.slice(0, Math.min(options.limit ?? 1000, 1000)).map((key) => this.described(key));
-		return Promise.resolve({ objects, truncated: this.stuck || matching.length > objects.length });
+		const truncated = this.stuck || matching.length > objects.length;
+		return Promise.resolve(truncated
+			? { objects, truncated, cursor: btoa(objects.at(-1)?.key ?? after ?? "") }
+			: { objects, truncated });
 	}
 	delete(keys: string | string[]): Promise<void> {
 		const list = typeof keys === "string" ? [keys] : keys;

@@ -57,10 +57,17 @@ export const BLOB_HEAD_CONCURRENCY = 4;
  */
 export const MAX_BLOB_EXISTS_BODY_BYTES = 64 * 1024;
 /**
- * Blob GC list (relay-wire §11.3.1): at most 1000 items a page, R2's own `list` maximum, so one page is one R2 list
- * call (Class A) and about 90 KiB of JSON.
+ * Blob GC list (relay-wire §11.3.1): at most 1000 items a page, R2's own `list` maximum, so a page is usually one R2
+ * list call (Class A) and about 90 KiB of JSON.
  */
 export const BLOB_LIST_PAGE_SIZE = 1000;
+/**
+ * R2 may answer a list `truncated` with fewer objects than the limit, even none ("may return less in order to minimize
+ * memory pressure", R2 Workers API reference). A GC page follows R2's own cursor for at most this many list calls,
+ * then answers `503 list_incomplete` with Retry-After BLOB_LIST_RETRY_AFTER_S.
+ */
+export const BLOB_LIST_MAX_CALLS = 10;
+export const BLOB_LIST_RETRY_AFTER_S = 5;
 /**
  * Blob GC delete (relay-wire §11.3.1): 1..100 addresses a call. Subrequest budget per invocation on Workers Free: 50
  * external and 1000 to Cloudflare services (https://developers.cloudflare.com/workers/platform/limits/#subrequests;
@@ -632,7 +639,7 @@ export class Router {
 	/**
 	 * `GET /vault/:id/blobs?cursor=` (relay-wire §11.3.1, E2EE design §19 A3): one page of the vault's blobs for the
 	 * client's mark-and-sweep. Checks in order: bucket (503) and cursor format (400), both before any DO call; then the
-	 * GC auth (`blobGcAuth`); then R2.
+	 * GC auth (`blobGcAuth`); then R2. `503 list_incomplete` + Retry-After when R2 keeps answering empty truncated pages.
 	 */
 	private async blobGcList(request: Request, env: WorkerEnv, url: URL, vaultId: string): Promise<Response> {
 		const bucket = env.YAOS_BUCKET;
@@ -641,7 +648,11 @@ export class Router {
 		if (raw !== "" && !BLOB_ADDRESS_PATTERN.test(raw)) return json({ error: "invalid_cursor" }, 400);
 		const refused = await this.blobGcAuth(request, env, vaultId);
 		if (refused) return refused;
-		return json(await listVaultBlobs(bucket, vaultId, raw === "" ? null : raw));
+		const page = await listVaultBlobs(bucket, vaultId, raw === "" ? null : raw);
+		if (page) return json(page);
+		const incomplete = json({ error: "list_incomplete" }, 503);
+		incomplete.headers.set("Retry-After", String(BLOB_LIST_RETRY_AFTER_S));
+		return incomplete;
 	}
 
 	/**
@@ -768,21 +779,30 @@ export interface BlobListPage {
  * One page of `v/<vaultId>/`, in key order (lexicographic by address), at most BLOB_LIST_PAGE_SIZE items, starting
  * after `cursor`. The cursor is the last address of the previous page, passed to R2 as `startAfter`: it is checked
  * like an address, stays inside the vault's prefix, and survives deletes made between pages (R2's own cursor is not
- * promised to). `next` is null once R2 reports the listing complete.
+ * promised to). `next` is the last address returned while R2 says `truncated`, null once the listing is complete.
+ * A truncated answer with no objects is followed with R2's own cursor, up to BLOB_LIST_MAX_CALLS list calls; null
+ * when they all came back empty and truncated (the route's `503 list_incomplete`), never `next: null` mid-listing.
  */
-export async function listVaultBlobs(bucket: R2Bucket, vaultId: string, cursor: string | null): Promise<BlobListPage> {
+export async function listVaultBlobs(bucket: R2Bucket, vaultId: string, cursor: string | null):
+	Promise<BlobListPage | null> {
 	const prefix = blobPrefix(vaultId);
-	const listed = await bucket.list({
+	let options: R2ListOptions = {
 		prefix,
 		limit: BLOB_LIST_PAGE_SIZE,
 		...(cursor === null ? {} : { startAfter: blobKey(vaultId, cursor) }),
-	});
-	const items = listed.objects.map((object) => ({
-		address: object.key.slice(prefix.length),
-		uploadedAt: object.uploaded.getTime(),
-	}));
-	const last = items[items.length - 1];
-	return { items, next: listed.truncated && last ? last.address : null };
+	};
+	for (let call = 0; call < BLOB_LIST_MAX_CALLS; call++) {
+		const listed = await bucket.list(options);
+		const items = listed.objects.map((object) => ({
+			address: object.key.slice(prefix.length),
+			uploadedAt: object.uploaded.getTime(),
+		}));
+		const last = items[items.length - 1];
+		if (!listed.truncated) return { items, next: null };
+		if (last) return { items, next: last.address };
+		options = { prefix, limit: BLOB_LIST_PAGE_SIZE, cursor: listed.cursor };
+	}
+	return null;
 }
 
 /** One address of `POST /vault/:id/blobs/delete` → what happened to its object. */
