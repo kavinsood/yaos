@@ -1,0 +1,77 @@
+README.md
+  s_ed451e485d98d2::t_7e4ce3808a96e0 76,78
+legacy-src/runtime/testOnlyTimers.ts
+  s_3bea9f4c72a663::t_17698ea152f6f5 10
+package.json
+  s_8bc9bf3abe4a95::t_7da1f793a65bc2 16,19
+scripts/b3measure/projreads.ts
+  s_ed451e485d98d2::t_a6603fd5c7294e 13
+scripts/pathology-lab/fixture.ts
+  s_ed451e485d98d2::t_1bb5f3f405a4b2 5
+scripts/relay2-core-alarmprobe.ts
+  s_ed451e485d98d2::t_7d4e44e1b109c8 11
+scripts/relay2-core-reset-loop.ts
+  s_ed451e485d98d2::t_a2d2aa8d43f97e 17
+scripts/relay2/bench.ts
+  s_ed451e485d98d2::t_1383d389154d2d 35-36,41-42
+scripts/relay2/catalog-rows-read.ts
+  s_ed451e485d98d2::t_5f197bfca167c0 17
+scripts/relay2/wb/mimport.ts
+  s_ed451e485d98d2::t_aee02c2ba89335 8,10-11
+scripts/relay2/wb/plan-compare.ts
+  s_ed451e485d98d2::t_37de57cc77b5ef 17
+scripts/relay2/wb/r1dl/scenarios.ts
+  s_ed451e485d98d2::t_f7c23bb2dd6692 2-3,5,8,102,148
+scripts/relay2/wb/r1dl/selftest.ts
+  s_3bea9f4c72a663::t_96ce2f8d114087 6
+scripts/relay2/wb/scenarios.ts
+  s_3bea9f4c72a663::t_f7dd3154a798f7 13,307
+tests/conformance/run-conformance.ts
+  s_8bc9bf3abe4a95::t_7c30c1057d023d 6,282,299,308-309
+tests/conformance/target.ts
+  s_8bc9bf3abe4a95::t_ba8e98992e29cf 7,57
+tests/run-typescript.mjs
+  s_ed451e485d98d2::t_a103e4a0d8f8ac 8-10,22-23
+tests/server/helpers/cfRowModel.ts
+  s_ed451e485d98d2::t_5a19798fad633a 21
+tests/server/helpers/nodeSqliteStorage.ts
+  s_8bc9bf3abe4a95::t_f95e60080e2502 1-5,11,22,222,227
+tests/server/helpers/planCompare.ts
+  s_ed451e485d98d2::t_2439c3133b2ae2 6
+tests/server/helpers/ywasmWasmModule.ts
+  s_8bc9bf3abe4a95::t_6fcefdccc2b3e1 1-8
+tests/server/streams-relay.ts
+  s_ed451e485d98d2::t_d3255331a75120 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "35ec3f4164754320ae400974f62b2a1d6e464b0a",
+  "prompts": {},
+  "sessions": {
+    "s_3bea9f4c72a663": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb05cda11fb8d171",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_8bc9bf3abe4a95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac019149b1d227e41",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
