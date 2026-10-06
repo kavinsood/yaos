@@ -23,19 +23,21 @@ export type ViewEvent =
 	| { readonly t: "closed"; readonly viewId: number };
 
 /**
- * External content arriving for a bound view, intercepted at the view instance
- * (wrapping view.setViewData(data, clear=false) on that instance only, removed
- * on unbind). The handler must route it through the merge engine and return
- * "handled"; "default" lets Obsidian apply it (used when not bound).
+ * Content Obsidian puts into a bound view without an editor transaction, intercepted at the view instance
+ * (wrapping view.setViewData(data, clear=false) on that instance only, removed on unbind): an external reload
+ * of the file (TextFileView.loadFileInternal), a properties edit (MarkdownView.saveFrontmatter), or the
+ * quick-preview copy of another view of the same file. `from` is that other view's id for a quick preview
+ * (MarkdownView.onInternalDataChange -> workspace "quick-preview" -> onExternalDataChange -> setData), else
+ * null. The handler routes it through the engine and returns "handled"; "default" lets Obsidian apply it.
  */
-export type ExternalReloadHandler = (incoming: string) => "handled" | "default";
+export type ExternalReloadHandler = (incoming: string, from: number | null) => "handled" | "default";
 
 export interface EditorBindingSpec {
 	/** A change made in this editor (typing, undo, paste, commands), once per transaction, in order. */
 	onLocal(changes: ChangeSet): void;
 	/** The editor state was replaced without a transaction (EditorView.setState): the binding is void. */
 	onReset(): void;
-	/** Obsidian is reading the editor for a save (view.getViewData), synchronously before it writes. */
+	/** Obsidian is reading the editor for a save (view.getViewData with dirty cleared), synchronously before it writes. */
 	onSaveRead(): void;
 }
 
@@ -54,13 +56,19 @@ export interface EditorViewRef {
 	hasEditor(): boolean;
 	/** The editor document now (O(1)). Null without an editor. */
 	editorDoc(): Text | null;
-	/** Unsaved editor edits (TextFileView.dirty): the editor may differ from getLastSavedText(). */
+	/** Unsaved editor edits (TextFileView.dirty): the editor may differ from lastSavedText(). */
 	isDirty(): boolean;
-	/** The text Obsidian last loaded or saved for this view (view.data). Read, never compared, on main. */
-	getLastSavedText(): string;
+	/** The text Obsidian last loaded or saved for this view (TextFileView.lastSavedData). Read, never compared, on main. */
+	lastSavedText(): string | null;
 	/** Attach the editor binding. Throws when the view has no CodeMirror 6 editor. */
 	bind(spec: EditorBindingSpec): EditorBinding;
 	interceptExternalReload(handler: ExternalReloadHandler): Unsubscribe;
+	/**
+	 * While held, Obsidian's saves of this view write nothing (getViewData answers the text Obsidian last loaded or
+	 * saved, TextFileView.lastSavedData, which its save compares and skips). Releasing returns whether a save was
+	 * skipped meanwhile. Used while the engine merges an external reload the editor does not show yet.
+	 */
+	holdSaves(hold: boolean): boolean;
 	/** Force Obsidian's save now (instead of its 2 s debounce). */
 	save(): Promise<void>;
 }

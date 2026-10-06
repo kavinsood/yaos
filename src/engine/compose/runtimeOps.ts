@@ -153,7 +153,14 @@ async function diagnostics(rt: VaultRuntime, includePaths: boolean): Promise<Dia
  */
 export async function prepareEpochMigration(rt: VaultRuntime): Promise<Map<PathKey, string>> {
 	const bound = [...rt.engine.bound.byId.keys()];
-	if (bound.length > 0) await rt.engine.link.request({ t: "saveViews", docIds: bound }).catch(() => undefined);
+	if (bound.length > 0) {
+		await rt.engine.link.request({ t: "saveViews", docIds: bound }).catch(() => undefined);
+		// The saves' disk check now (boundSaved: the synced base the new epoch merges against), not after its debounce.
+		await Promise.all(bound.map((d) => {
+			const b = rt.engine.bound.get(d);
+			return b ? rt.engine.boundDisk.checkSaved(b) : undefined;
+		}));
+	}
 	await rt.takeSnapshot("epoch");
 	const bases = new Map<PathKey, string>();
 	const rows = await rt.db.tx([STORE.baseText], "readonly", (tx) => tx.getAll(STORE.baseText)).catch(() => []);

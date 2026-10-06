@@ -1,13 +1,14 @@
 /**
  * Bound views, worker side (DESIGN §d.3): text uploads, the bind-time merge (bodyAttach -> `bound`), editor pushes
  * (bodyPush -> entry or reject) and save marks. The replica is the authority; views are CodeMirror clients of it
- * (the @codemirror/collab model): a push applies only on the version it was made against, otherwise main rebases
- * it over the entries it missed and pushes again. Everything after the uploads are taken runs synchronously, so
+ * (the @codemirror/collab model): a push applies only on the version it was made against (or right after the
+ * view's previous push), otherwise main rebases it over the entries it missed and pushes again. Everything after the uploads are taken runs synchronously, so
  * no other change of the replica can slip between reading its text and queueing the answer.
  */
 
 import { DEFAULT_MERGE_LIMITS, merge } from "../../core/merge/merge";
 import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
+import type { DocId } from "../../core/types";
 import type { BodyChanges, MainToEngine } from "../../protocol/messages";
 import { decodeUtf16 } from "../../protocol/utf16";
 import { editsToChanges, type TextChanges } from "../body/textChanges";
@@ -64,10 +65,28 @@ export class BoundBody {
 	 * result into the replica (its entry reaches the doc's other views) and `bound` with the changes that turn the
 	 * editor text into it. A conflict keeps the editor side as a conflict copy.
 	 */
-	async attach(m: Msg<"bodyAttach">): Promise<void> {
+	attach(m: Msg<"bodyAttach">): Promise<void> {
 		const editor = this.take(m.editor);
 		const uploaded = this.take(m.base);
 		const saved = this.take(m.saved);
+		return this.serial(m.docId, () => this.attachNow(m, editor, uploaded, saved));
+	}
+
+	/** bodyReload: the uploaded text is merged after any attach of the doc still running. */
+	reload(m: Msg<"bodyReload">): Promise<void> {
+		const text = this.take(m.text);
+		return this.serial(m.docId, () => this.deps.disk.reload(m.docId, m.viewId, m.reload, text));
+	}
+
+	private serial(docId: DocId, op: () => Promise<void>): Promise<void> {
+		const b = this.deps.bound.get(docId);
+		if (!b) return Promise.resolve();
+		const run = b.ops.then(op, op);
+		b.ops = run.catch((e: unknown) => this.deps.diag(`body op ${docId}: ${String(e)}`));
+		return b.ops;
+	}
+
+	private async attachNow(m: Msg<"bodyAttach">, editor: string | null, uploaded: string | null, saved: string | null): Promise<void> {
 		const rt = this.deps.runtime();
 		const b = this.deps.bound.get(m.docId);
 		if (!rt || !b || !b.views.has(m.viewId) || editor === null) return; // the view went away or re-opens
@@ -108,16 +127,18 @@ export class BoundBody {
 		if (copy !== null) void this.deps.disk.writeConflictCopy(b.path, m.docId, copy);
 	}
 
-	/** Editor changes against version `base`: applied as one MAIN transaction (an entry tagged with the push), or rejected. */
+	/** Editor changes (against version `base`, or chained after the view's push `after`): one MAIN transaction (an entry tagged with the push), or rejected. */
 	push(m: Msg<"bodyPush">): void {
 		const rt = this.deps.runtime();
 		const b = this.deps.bound.get(m.docId);
 		if (!rt || !b || !b.attached.has(m.viewId)) return; // pushed before a resync / re-open: the view re-binds
-		if (m.base !== b.version) {
+		const fits = m.after === null ? m.base === b.version : b.lastAuthor?.viewId === m.viewId && b.lastAuthor.seq === m.after;
+		if (!fits) {
 			this.deps.bound.queue(b, { t: "reject", viewId: m.viewId, seq: m.seq, version: b.version });
 			return;
 		}
 		this.stats.pushes++;
+		const before = b.version;
 		b.author = { viewId: m.viewId, seq: m.seq };
 		try {
 			if (!rt.log.applyEditorChanges(m.docId, m.changes as TextChanges)) {
@@ -126,7 +147,7 @@ export class BoundBody {
 				return;
 			}
 			// A push the replica already matched (no Yjs change): still confirmed, with an empty entry.
-			if (b.version === m.base) {
+			if (b.version === before) {
 				const n = rt.log.boundLength(m.docId);
 				this.deps.bound.onText(m.docId, (n > 0 ? [n] : []) as BodyChanges, n, "editor");
 			}

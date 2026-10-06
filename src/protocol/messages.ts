@@ -120,10 +120,11 @@ export type BodyChanges = readonly (number | readonly [number, ...string[]])[];
  *    `length` = replica length after (UTF-16 units): an O(1) divergence check on main.
  *  - bound: the bodyAttach of view `viewId` whose editor upload is `attach` was merged at `version`: `changes`
  *    turn the uploaded editor text into the replica text (length `length`). Events before it are inside for that view.
- *  - reject: the bodyPush `seq` of `viewId` was based on an older version; every entry it missed is before it.
+ *  - reject: the bodyPush `seq` of `viewId` did not fit (an older base, or chained after a push that is not the
+ *    newest change); every entry it missed is before it.
  *  - durable: every change up to `version` is in committed storage (the restart merge base, §d.3).
  *  - reloaded: the bodyReload `reload` of `viewId` is merged (its entry, if any, is before it); `save` = the
- *    replica differs from the file text the engine read, so the views should save.
+ *    replica differs from the reloaded text, so the view should save.
  */
 export type BodyEvent =
 	| { readonly t: "entry"; readonly from: number; readonly to: number; readonly changes: BodyChanges; readonly length: number; readonly origin: DocUpdateOrigin; readonly author: { readonly viewId: number; readonly seq: number } | null }
@@ -226,23 +227,28 @@ export type MainToEngine =
 	/**
 	 * A piece of a text upload (editor text, merge base, reload): the UTF-16 code units (platform byte order, exact
 	 * for any JS string, protocol/utf16.ts), split anywhere; `last` completes upload `uploadId`. Only a bind (first
-	 * open, restart, resync) uploads whole texts, never typing or reloads (DESIGN §d.3). [T]
+	 * open, restart, resync) and a reload Obsidian pushes into a bound view upload whole texts, never typing (DESIGN §d.3). [T]
 	 */
 	| { readonly t: "textChunk"; readonly uploadId: number; readonly bytes: Uint8Array; readonly last: boolean }
 	/**
 	 * Bind view `viewId` (after openDoc answered `bind`): merge the uploaded editor text into the replica, answered
 	 * by a `bound` body event. `base` = uploaded merge base (restart / resync: the last durable text the view saw),
-	 * null = the engine's synced base. `saved` = uploaded view.data when the editor had unsaved edits, null = the
-	 * editor text is what Obsidian loaded (the reload merge base).
+	 * null = the engine's synced base. `saved` = uploaded TextFileView.lastSavedData when the editor had unsaved
+	 * edits, null = the editor text is what Obsidian loaded (the reload merge base).
 	 */
 	| { readonly t: "bodyAttach"; readonly docId: DocId; readonly viewId: number; readonly editor: number; readonly base: number | null; readonly saved: number | null }
-	/** Editor changes of view `viewId` against version `base`, coalesced <= 16 ms; answered by an entry or a reject. */
-	| { readonly t: "bodyPush"; readonly docId: DocId; readonly viewId: number; readonly seq: number; readonly base: number; readonly changes: BodyChanges }
 	/**
-	 * Obsidian reloaded bound view `viewId` from its file (an external write; the view holds its saves until
-	 * `reloaded`): the engine reads the file and merges it into the replica (§d.3). `reload` = the view's counter.
+	 * Editor changes of view `viewId`, coalesced <= 16 ms; answered by an entry or a reject. `after` = null: against
+	 * replica version `base`; else chained: against the replica right after this view's push `after`, applied only
+	 * while that push is the replica's newest change (so a view need not wait for each confirmation).
 	 */
-	| { readonly t: "bodyReload"; readonly docId: DocId; readonly viewId: number; readonly reload: number }
+	| { readonly t: "bodyPush"; readonly docId: DocId; readonly viewId: number; readonly seq: number; readonly base: number; readonly after: number | null; readonly changes: BodyChanges }
+	/**
+	 * Obsidian pushed text into bound view `viewId` without an editor transaction (an external reload of its
+	 * file, a properties edit, an unbound view's quick preview; the view holds its saves until `reloaded`):
+	 * upload `text` is merged into the replica (§d.3). `reload` = the view's counter.
+	 */
+	| { readonly t: "bodyReload"; readonly docId: DocId; readonly viewId: number; readonly reload: number; readonly text: number }
 	/**
 	 * Obsidian read view `viewId` for a save while its text was the replica at `version` (after its own push
 	 * `seq`, null = no push pending): the engine keeps that text as one the disk may hold (absorbed, §d.3).

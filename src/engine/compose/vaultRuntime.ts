@@ -33,6 +33,7 @@ import type { EngineTuning } from "../runtime/options";
 import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
 import { SnapshotJob } from "../snapshots/snapshotJob";
 import type { FoldedNsFrame } from "../sync/nsRuntime";
+import type { BoundDisk } from "./boundDisk";
 import type { BoundDocs } from "./boundDocs";
 import { foldEffects } from "./foldBridge";
 import type { HostLink } from "./hostLink";
@@ -49,6 +50,7 @@ export type RestartReason = "retry" | "epoch" | "storage-lost" | "rebuild" | "se
 export interface RuntimeOwner {
 	readonly link: HostLink;
 	readonly bound: BoundDocs;
+	readonly boundDisk: Pick<BoundDisk, "checkSaved">;
 	onEpochChanged(epoch: VaultEpoch | null): void;
 	onStorageLost(): void;
 }

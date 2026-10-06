@@ -44,8 +44,10 @@ export interface BoundDoc {
 	lastReported: string | null;
 	/** Texts a save read from a view while it equalled the replica (newest last). */
 	readonly candidates: string[];
-	/** checkSaved state (boundBody.ts). */
+	/** checkSaved state (boundDisk.ts). */
 	check: { timer: number | null; queued: boolean; chain: Promise<void> };
+	/** bodyAttach / bodyReload run one after another per doc (an attach may await the synced base). */
+	ops: Promise<void>;
 }
 
 interface Queued {
@@ -104,7 +106,7 @@ export class BoundDocs {
 			b = {
 				docId, path, views: new Set(), attached: new Set(), version: this.lastVersion.get(docId) ?? 0,
 				author: null, lastAuthor: null, durable: null, frameFailed: false, diskText: null, lastReported: null,
-				candidates: [], check: { timer: null, queued: false, chain: Promise.resolve() },
+				candidates: [], check: { timer: null, queued: false, chain: Promise.resolve() }, ops: Promise.resolve(),
 			};
 			this.byId.set(docId, b);
 		}

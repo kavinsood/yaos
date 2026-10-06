@@ -30,6 +30,7 @@ import type { EngineTuning } from "../runtime/options";
 import { BoundBody } from "./boundBody";
 import { BoundDisk } from "./boundDisk";
 import { BoundDocs } from "./boundDocs";
+import { answerHashRequest } from "./hashService";
 import { HostLink } from "./hostLink";
 import { idleStatus } from "./statusMerge";
 import { prepareEpochMigration } from "./runtimeOps";
@@ -360,7 +361,7 @@ export class ComposedEngine {
 				this.boundBody.push(m);
 				return;
 			case "bodyReload":
-				await this.boundDisk.reload(m.docId, m.viewId, m.reload);
+				await this.boundBody.reload(m);
 				return;
 			case "bodySaveMark":
 				this.boundBody.saveMark(m);
@@ -370,6 +371,9 @@ export class ComposedEngine {
 				return;
 			case "command":
 				this.answer(m.rid, await this.command(m.command));
+				return;
+			case "hashRequest":
+				this.answer(m.rid, await answerHashRequest(m.items, this.ports));
 				return;
 		}
 	}

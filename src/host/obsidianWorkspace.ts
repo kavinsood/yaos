@@ -4,34 +4,43 @@
  * Views: every leaf of type "markdown". The adapter diffs the leaf set on
  * layout-change / active-leaf-change / file-open (and on demand) and emits
  * opened / file-changed / closed. A source<->reading mode switch is reported
- * as file-changed with the same path so the binding (un)binds.
+ * as file-changed with the same path so the binding (un)binds. Nothing here
+ * reads, copies or compares a document: a refresh is O(leaves).
  *
- * Interception (OR-2): an instance-level wrapper of view.setViewData, never a
- * prototype patch. clear=false (external reload of the same file) goes to the
- * handler; "handled" swallows it. clear=true (Obsidian loading another file
- * into this view) detaches the y-codemirror binding BEFORE Obsidian replaces
- * the editor content, so the next file's text can never be written into the
- * previous file's doc.
+ * Interception (OR-2): instance-level wrappers, never prototype patches.
+ * - setViewData: clear=false (external reload of the same file) goes to the
+ *   handler; "handled" swallows it. clear=true (Obsidian loading another file
+ *   into this view) detaches the binding BEFORE Obsidian replaces the editor
+ *   content, so the next file's text can never reach the previous file's doc.
+ * - getViewData (what TextFileView.save writes): with dirty cleared (save()
+ *   clears it before reading; loadFileInternal reads only while dirty) it
+ *   reports onSaveRead, and while saves are held answers view.lastSavedData,
+ *   which save() compares and skips (Obsidian 1.14.4 TextFileView.save:
+ *   `if (this.lastSavedData === o || null === this.lastSavedData) return`). The
+ *   2 s debounced save calls the prototype save bound at construction, which
+ *   still reads this.getViewData, so the instance wrapper sees every save.
+ * - onInternalDataChange: MarkdownView fires workspace "quick-preview" from it,
+ *   synchronously, and every other view of the file takes the text through
+ *   onExternalDataChange -> setData(text, false). The wrapper names the source
+ *   view, so a bound sibling's copy is told apart without reading the text.
  */
 
+import type { Text } from "@codemirror/state";
 import type { VaultPath } from "../core/types";
 import type { Unsubscribe } from "../ports/common";
-import type { EditorBindingSpec, EditorViewRef, ExternalReloadHandler, ViewEvent, WorkspacePort } from "../ports/workspace";
+import type { EditorBinding, EditorBindingSpec, EditorViewRef, ExternalReloadHandler, ViewEvent, WorkspacePort } from "../ports/workspace";
 import type { EventRefLike } from "./obsidianApi";
-
-export interface EditorLike {
-	getValue(): string;
-	offsetToPos(offset: number): { line: number; ch: number };
-	replaceRange(text: string, from: { line: number; ch: number }, to?: { line: number; ch: number }): void;
-}
 
 export interface MarkdownViewLike {
 	file: { path: string } | null;
-	editor: EditorLike;
-	data?: string;
+	editor: unknown;
+	dirty?: boolean;
+	lastSavedData?: string | null;
 	getViewType(): string;
 	getMode(): string;
+	getViewData(): string;
 	setViewData(data: string, clear: boolean): void;
+	onInternalDataChange?(): void;
 	save(): Promise<void>;
 }
 
@@ -43,20 +52,29 @@ export interface WorkspaceLike {
 	offref(ref: EventRefLike): void;
 }
 
-/** Attaches the editor binding (collab.ts in production); returns detach. */
-export type AttachFn = (editor: EditorLike, spec: EditorBindingSpec) => (() => void) | null;
+/** The CodeMirror side (collab.ts in production): the editor's document, and attaching the binding. */
+export interface EditorAdapter {
+	doc(editor: unknown): Text | null;
+	attach(editor: unknown, spec: EditorBindingSpec): EditorBinding | null;
+}
+
+type Wrapped = "setViewData" | "getViewData" | "onInternalDataChange";
+
+/** The view whose MarkdownView.onInternalDataChange is running (it fires quick-preview into its siblings synchronously). */
+let previewFrom: number | null = null;
 
 class ObsidianViewRef implements EditorViewRef {
-	private detachBinding: (() => void) | null = null;
+	private binding: EditorBinding | null = null;
+	private spec: EditorBindingSpec | null = null;
 	private handler: ExternalReloadHandler | null = null;
-	private wrapped = false;
-	private ownBefore = false;
-	private orig: MarkdownViewLike["setViewData"] | null = null;
+	private held = false;
+	private skipped = false;
+	private readonly orig = new Map<Wrapped, { fn: (...a: never[]) => unknown; own: boolean }>();
 
 	constructor(
 		readonly viewId: number,
 		readonly view: MarkdownViewLike,
-		private readonly attach: AttachFn,
+		private readonly editors: EditorAdapter,
 	) {}
 
 	get path(): VaultPath | null {
@@ -67,48 +85,48 @@ class ObsidianViewRef implements EditorViewRef {
 		return this.view.getMode() === "source";
 	}
 
-	getText(): string {
-		return this.view.editor.getValue();
+	editorDoc(): Text | null {
+		return this.editors.doc(this.view.editor);
 	}
 
-	getLastSavedText(): string {
-		return typeof this.view.data === "string" ? this.view.data : this.getText();
+	isDirty(): boolean {
+		return this.view.dirty === true;
 	}
 
-	applyMinimalReplace(text: string): void {
-		const cur = this.getText();
-		if (cur === text) return;
-		let start = 0;
-		while (start < cur.length && start < text.length && cur.charCodeAt(start) === text.charCodeAt(start)) start++;
-		let ec = cur.length;
-		let et = text.length;
-		while (ec > start && et > start && cur.charCodeAt(ec - 1) === text.charCodeAt(et - 1)) {
-			ec--;
-			et--;
-		}
-		const ed = this.view.editor;
-		ed.replaceRange(text.slice(start, et), ed.offsetToPos(start), ed.offsetToPos(ec));
+	lastSavedText(): string | null {
+		return typeof this.view.lastSavedData === "string" ? this.view.lastSavedData : null;
 	}
 
-	bind(spec: EditorBindingSpec): Unsubscribe {
+	bind(spec: EditorBindingSpec): EditorBinding {
 		this.unbindNow();
-		const detach = this.attach(this.view.editor, spec);
-		if (!detach) throw new Error("editor has no CodeMirror 6 view");
-		this.detachBinding = detach;
-		this.ensureWrapper();
-		return () => {
-			if (this.detachBinding === detach) this.unbindNow();
+		const b = this.editors.attach(this.view.editor, spec);
+		if (!b) throw new Error("editor has no CodeMirror 6 view");
+		this.binding = b;
+		this.spec = spec;
+		this.wrap();
+		const unbind = () => {
+			if (this.binding === b) this.unbindNow();
 		};
+		return { doc: () => b.doc(), applyRemote: (c) => b.applyRemote(c), detach: unbind };
 	}
 
 	interceptExternalReload(handler: ExternalReloadHandler): Unsubscribe {
 		this.handler = handler;
-		this.ensureWrapper();
+		this.wrap();
 		return () => {
 			if (this.handler !== handler) return;
 			this.handler = null;
-			if (!this.detachBinding) this.removeWrapper();
+			if (!this.binding) this.unwrap();
 		};
+	}
+
+	holdSaves(hold: boolean): boolean {
+		const skipped = this.skipped;
+		this.held = hold;
+		this.skipped = false;
+		if (hold) this.wrap();
+		else if (!this.binding && !this.handler) this.unwrap();
+		return !hold && skipped;
 	}
 
 	save(): Promise<void> {
@@ -116,47 +134,81 @@ class ObsidianViewRef implements EditorViewRef {
 	}
 
 	get isBound(): boolean {
-		return this.detachBinding !== null;
+		return this.binding !== null;
 	}
 
 	private unbindNow(): void {
-		const d = this.detachBinding;
-		this.detachBinding = null;
-		d?.();
+		const b = this.binding;
+		this.binding = null;
+		this.spec = null;
+		this.held = false;
+		this.skipped = false;
+		b?.detach();
 	}
 
-	private ensureWrapper(): void {
-		if (this.wrapped) return;
+	private wrap(): void {
+		if (this.orig.size > 0) return;
 		const v = this.view;
-		this.ownBefore = Object.prototype.hasOwnProperty.call(v, "setViewData");
-		const orig = v.setViewData;
-		this.orig = orig;
+		const keep = (k: Wrapped) => {
+			const fn = v[k];
+			if (typeof fn === "function") this.orig.set(k, { fn, own: Object.prototype.hasOwnProperty.call(v, k) });
+			return fn;
+		};
+		const setViewData = keep("setViewData") as MarkdownViewLike["setViewData"];
+		const getViewData = keep("getViewData") as MarkdownViewLike["getViewData"];
+		const onInternalDataChange = keep("onInternalDataChange") as MarkdownViewLike["onInternalDataChange"];
 		const self = this;
 		v.setViewData = function (this: MarkdownViewLike, data: string, clear: boolean): void {
 			if (clear) {
 				// Another file is being loaded into this view: unbind first.
 				self.unbindNow();
 				self.handler = null;
-			} else if (self.handler && self.handler(data) === "handled") {
+			} else if (self.handler && self.handler(data, previewFrom !== self.viewId ? previewFrom : null) === "handled") {
 				return;
 			}
-			orig.call(this, data, clear);
+			setViewData.call(this, data, clear);
 		};
-		this.wrapped = true;
+		v.getViewData = function (this: MarkdownViewLike): string {
+			// save() clears dirty before it reads; loadFileInternal reads only while dirty (to merge) and must see the editor.
+			if (this.dirty !== true) {
+				self.spec?.onSaveRead();
+				if (self.held && typeof this.lastSavedData === "string") {
+					self.skipped = true;
+					return this.lastSavedData;
+				}
+			}
+			return getViewData.call(this);
+		};
+		if (onInternalDataChange) {
+			v.onInternalDataChange = function (this: MarkdownViewLike): void {
+				const prev = previewFrom;
+				previewFrom = self.viewId;
+				try {
+					onInternalDataChange.call(this);
+				} finally {
+					previewFrom = prev;
+				}
+			};
+		}
+	}
+
+	private unwrap(): void {
+		const v = this.view as unknown as Record<Wrapped, unknown>;
+		for (const [k, o] of this.orig) {
+			if (o.own) v[k] = o.fn;
+			else delete v[k];
+		}
+		this.orig.clear();
 	}
 
 	removeWrapper(): void {
-		if (!this.wrapped || !this.orig) return;
-		if (this.ownBefore) this.view.setViewData = this.orig;
-		else delete (this.view as Partial<MarkdownViewLike>).setViewData;
-		this.wrapped = false;
-		this.orig = null;
+		this.unwrap();
 	}
 
 	dispose(): void {
 		this.unbindNow();
 		this.handler = null;
-		this.removeWrapper();
+		this.unwrap();
 	}
 }
 
@@ -168,7 +220,7 @@ interface Known {
 
 function isMarkdownView(v: unknown): v is MarkdownViewLike {
 	const x = v as Partial<MarkdownViewLike> | null;
-	return !!x && typeof x.getViewType === "function" && x.getViewType() === "markdown" && typeof x.setViewData === "function" && !!x.editor;
+	return !!x && typeof x.getViewType === "function" && x.getViewType() === "markdown" && typeof x.setViewData === "function" && typeof x.getViewData === "function" && !!x.editor;
 }
 
 export class ObsidianWorkspace implements WorkspacePort {
@@ -180,7 +232,7 @@ export class ObsidianWorkspace implements WorkspacePort {
 
 	constructor(
 		private readonly ws: WorkspaceLike,
-		private readonly attach: AttachFn,
+		private readonly editors: EditorAdapter,
 	) {}
 
 	listMarkdownViews(): readonly EditorViewRef[] {
@@ -222,7 +274,7 @@ export class ObsidianWorkspace implements WorkspacePort {
 			const mode = v.getMode();
 			const k = this.known.get(id);
 			if (!k) {
-				const ref = new ObsidianViewRef(id, v, this.attach);
+				const ref = new ObsidianViewRef(id, v, this.editors);
 				this.known.set(id, { ref, path, mode });
 				events.push({ t: "opened", view: ref });
 			} else if (k.path !== path || k.mode !== mode) {

@@ -2,10 +2,9 @@
  * Bound docs and the disk (DESIGN §d.3), worker side: the merge of an external reload, the check that a save of a
  * bound file wrote text the replica already holds (boundSaved), and bound-merge conflict copies.
  *
- * Main never compares or hashes texts: an intercepted reload only names the view (bodyReload), and the engine
- * reads the file through the disk gateway (raw bytes from main, transferred) and merges here. The view holds its
- * saves until `reloaded` (it reports the text Obsidian last loaded), so its old text cannot overwrite the external
- * edit meanwhile.
+ * Main never compares or hashes texts: an intercepted reload is uploaded as it came (transferred UTF-16 chunks,
+ * between yields) and merged here. The view holds its saves until `reloaded` (it answers the text Obsidian last
+ * loaded), so its old text cannot overwrite the external edit meanwhile.
  */
 
 import { pathKey as defaultPathKey } from "../../core/paths/pathKey";
@@ -57,28 +56,35 @@ export class BoundDisk {
 		for (const b of this.deps.bound.byId.values()) if (keys.has(defaultPathKey(b.path))) this.scheduleCheck(b, BOUND_SAVED_DEBOUNCE_MS);
 	}
 
-	/** bodyReload: merge the file's text into the replica, then answer `reloaded` (in order after its entry). */
-	async reload(docId: DocId, viewId: number, reload: number): Promise<void> {
+	/**
+	 * bodyReload: merge `text` (what Obsidian pushed into the view; null = its upload was dropped, read the file
+	 * instead) into the replica, then answer `reloaded` (in order after its entry). Base as in the old main
+	 * binding: a text the replica already holds (its last disk text, or a save of one of its views) is not an
+	 * edit, so base = text; otherwise the last disk text it absorbed.
+	 */
+	async reload(docId: DocId, viewId: number, reload: number, text: string | null): Promise<void> {
 		const rt = this.deps.runtime();
 		const b = this.deps.bound.get(docId);
 		if (!rt || !b || !b.attached.has(viewId)) return;
 		this.stats.reloads++;
-		const rd = await rt.rec.ctx.read(b.path, MAX_TEXT_FILE_BYTES, LANE.openNote).catch(() => null);
-		if (this.deps.runtime() !== rt || this.deps.bound.get(docId) !== b || !b.attached.has(viewId)) return;
+		let incoming = text;
+		if (incoming === null) {
+			const rd = await rt.rec.ctx.read(b.path, MAX_TEXT_FILE_BYTES, LANE.openNote).catch(() => null);
+			if (this.deps.runtime() !== rt || this.deps.bound.get(docId) !== b || !b.attached.has(viewId)) return;
+			incoming = rd?.ok ? utf8Decode(rd.bytes) : null;
+		}
 		let save = false;
-		if (rd?.ok && !rt.log.boundFrozen(docId)) {
-			const disk = utf8Decode(rd.bytes);
+		if (incoming !== null && !rt.log.boundFrozen(docId)) {
 			const crdt = rt.log.boundText(docId);
-			// Disk text the replica already holds (its last disk text, or a save of one of its views): not external.
-			const base = disk === b.diskText || b.candidates.includes(disk) ? disk : b.diskText;
-			const r = merge({ base, disk, crdt, limits: DEFAULT_MERGE_LIMITS });
+			const base = incoming === b.diskText || b.candidates.includes(incoming) ? incoming : b.diskText;
+			const r = merge({ base, disk: incoming, crdt, limits: DEFAULT_MERGE_LIMITS });
 			const target = r.kind === "identical" ? crdt : r.text;
 			if (target !== crdt) {
 				this.stats.reloadMerges++;
 				void rt.log.editBound(docId, (y) => applyEditsTo(y, crdt, minimalDiff(crdt, target))).catch(() => undefined);
 			}
-			b.diskText = disk; // absorbed: merged into the replica, or kept by the conflict copy below
-			save = target !== disk;
+			b.diskText = incoming; // absorbed: merged into the replica, or kept by the conflict copy below
+			save = target !== incoming;
 			if (r.kind === "conflict") void this.writeConflictCopy(b.path, docId, r.conflictCopy);
 		}
 		this.deps.bound.queue(b, { t: "reloaded", viewId, reload, save });
