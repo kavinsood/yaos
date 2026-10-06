@@ -396,22 +396,23 @@ export function bearer(device: DeviceSeed): Record<string, string> {
 }
 
 /**
- * R2 as the Worker uses it (D9 blobs and the D5 purge): `put` (bytes or a stream), `get`, `head`, `list({prefix,
- * limit})` and `delete(keys)`, in memory. `stuck` keeps every listing truncated. `calls` records each operation.
- */
-/**
- * An in-memory R2 bucket with the calls the Worker makes: blob put/get/head (D9) and the D5 purge's list/delete.
- * `calls` records each call in order (a put says whether its value was a stream); `stuck` keeps every listing truncated.
+ * An in-memory R2 bucket with the calls the Worker makes: blob put/get/head (D9), the D5 purge's list/delete and the
+ * blob GC's list/head/delete (relay-wire §11.3). `calls` records each call in order (a put says whether its value was
+ * a stream); `stuck` keeps every listing truncated. A put stamps the object with `now` (ms; R2's `uploaded`, which an
+ * overwrite refreshes); an object set straight into `objects` reads as uploaded at 0.
  */
 export class FakeBucket {
 	readonly objects = new Map<string, Uint8Array>();
+	readonly uploadedAt = new Map<string, number>();
 	readonly calls: string[] = [];
 	stuck = false;
 	lists = 0;
+	now = 1_000_000;
 	async put(key: string, value: ReadableStream | ArrayBuffer | ArrayBufferView | string): Promise<{ key: string }> {
 		this.calls.push(`put ${key} ${value instanceof ReadableStream ? "stream" : "bytes"}`);
 		const bytes = new Uint8Array(await new Response(value as BodyInit).arrayBuffer());
 		this.objects.set(key, bytes);
+		this.uploadedAt.set(key, this.now);
 		return { key };
 	}
 	get(key: string): Promise<{ key: string; body: ReadableStream } | null> {
@@ -419,22 +420,31 @@ export class FakeBucket {
 		const bytes = this.objects.get(key);
 		return Promise.resolve(bytes ? { key, body: new Blob([bytes.slice()]).stream() } : null);
 	}
-	head(key: string): Promise<{ key: string } | null> {
+	head(key: string): Promise<{ key: string; uploaded: Date } | null> {
 		this.calls.push(`head ${key}`);
-		return Promise.resolve(this.objects.has(key) ? { key } : null);
+		return Promise.resolve(this.objects.has(key) ? this.described(key) : null);
 	}
-	list(options: { prefix?: string; limit?: number }) {
+	/** R2 `list`: keys in order, `prefix`, `limit` (≤ 1000) and `startAfter` (exclusive), as miniflare does. */
+	list(options: { prefix?: string; limit?: number; startAfter?: string }) {
 		this.lists++;
-		this.calls.push(`list ${options.prefix ?? ""}`);
-		const matching = [...this.objects.keys()].filter((key) => key.startsWith(options.prefix ?? "")).sort();
-		const objects = matching.slice(0, options.limit ?? 1000).map((key) => ({ key }));
+		this.calls.push(`list ${options.prefix ?? ""}${options.startAfter === undefined ? "" : ` after ${options.startAfter}`}`);
+		const after = options.startAfter;
+		const matching = [...this.objects.keys()]
+			.filter((key) => key.startsWith(options.prefix ?? "") && (after === undefined || key > after)).sort();
+		const objects = matching.slice(0, Math.min(options.limit ?? 1000, 1000)).map((key) => this.described(key));
 		return Promise.resolve({ objects, truncated: this.stuck || matching.length > objects.length });
 	}
 	delete(keys: string | string[]): Promise<void> {
 		const list = typeof keys === "string" ? [keys] : keys;
 		this.calls.push(`delete ${list.length}`);
-		for (const key of list) this.objects.delete(key);
+		for (const key of list) {
+			this.objects.delete(key);
+			this.uploadedAt.delete(key);
+		}
 		return Promise.resolve();
+	}
+	private described(key: string): { key: string; uploaded: Date } {
+		return { key, uploaded: new Date(this.uploadedAt.get(key) ?? 0) };
 	}
 	asR2(): R2Bucket {
 		// @ts-expect-error FakeBucket intentionally implements only the R2 calls the Worker makes.

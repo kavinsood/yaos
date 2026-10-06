@@ -54,6 +54,11 @@ export const BLOB_HEAD_CONCURRENCY = 4;
  */
 export const MAX_BLOB_EXISTS_BODY_BYTES = 64 * 1024;
 /**
+ * Blob GC list (relay-wire §11.3): at most 1000 items a page, R2's own `list` maximum, so one page is one R2 list call
+ * (Class A) and about 90 KiB of JSON.
+ */
+export const BLOB_LIST_PAGE_SIZE = 1000;
+/**
  * DECISIONS-GAP: §2.2 does not give a format for the `:deviceId` path segment of the operator devices route. The
  * enroll body's deviceId format (legacy routes/enroll.ts:36) is used; anything else is 404.
  */
@@ -539,9 +544,14 @@ export class Router {
 					: notFound());
 			case "POST blobs/exists":
 				return withCors(await this.blob(request, env, vaultId, null));
+			case "GET blobs":
+				return withCors(await this.blobGc(request, env, url, vaultId, null));
 		}
 		if (rest.length === 2 && rest[0] === "blobs" && (request.method === "GET" || request.method === "PUT")) {
 			return withCors(await this.blob(request, env, vaultId, rest[1]!));
+		}
+		if (rest.length === 2 && rest[0] === "blobs" && request.method === "DELETE") {
+			return withCors(await this.blobGc(request, env, url, vaultId, rest[1]!));
 		}
 		return withCors(notFound());
 	}
@@ -601,6 +611,40 @@ export class Router {
 	}
 
 	/**
+	 * Blob GC routes (relay-wire §11.3, E2EE design §19 A3), a cold path for the client's mark-and-sweep:
+	 * `GET /vault/:id/blobs?cursor=` lists a page and `DELETE /vault/:id/blobs/:address?ifUploadedBefore=<ms>` deletes
+	 * an object only if R2 says it was uploaded strictly before the cutoff. Checks in order: bucket (503), the query and
+	 * address formats (400), both before any DO call; then the vault DO's `POST /blobs/gc-auth` (bearer, then the GC
+	 * request limit: 401, 503 while restoring, 429); then R2. No config call, no DO storage write.
+	 */
+	private async blobGc(
+		request: Request, env: WorkerEnv, url: URL, vaultId: string, address: string | null,
+	): Promise<Response> {
+		const bucket = env.YAOS_BUCKET;
+		if (!bucket) return json({ error: "attachments_unavailable" }, 503);
+		let cursor: string | null = null;
+		let cutoff = 0;
+		if (address === null) {
+			const raw = url.searchParams.get("cursor") ?? "";
+			if (raw !== "" && !BLOB_ADDRESS_PATTERN.test(raw)) return json({ error: "invalid_cursor" }, 400);
+			cursor = raw === "" ? null : raw;
+		} else {
+			if (!BLOB_ADDRESS_PATTERN.test(address)) return json({ error: "invalid_address" }, 400);
+			const parsed = uploadCutoff(url.searchParams.get("ifUploadedBefore"));
+			if (parsed === null) return json({ error: "invalid_if_uploaded_before" }, 400);
+			cutoff = parsed;
+		}
+		const auth = await this.vaultObject(env, vaultId).fetch(new Request(`${VAULT_INTERNAL_ORIGIN}/blobs/gc-auth`, {
+			method: "POST",
+			headers: { Authorization: request.headers.get("Authorization") ?? "" },
+		}));
+		if (auth.status !== 204) return auth;
+		return json(address === null
+			? await listVaultBlobs(bucket, vaultId, cursor)
+			: await deleteVaultBlobUploadedBefore(bucket, vaultId, address, cutoff));
+	}
+
+	/**
 	 * Streams the request (method, headers, query, body) to the vault DO at `<internal origin>/<rest>`. The public
 	 * origin rides in `X-YAOS-Origin`, set (not appended) so a client-sent value never reaches the DO.
 	 */
@@ -657,6 +701,69 @@ async function blobExists(request: Request, bucket: R2Bucket, vaultId: string): 
 	};
 	await Promise.all(Array.from({ length: Math.min(BLOB_HEAD_CONCURRENCY, addresses.length) }, worker));
 	return json({ present: addresses.filter((_, index) => present[index]) });
+}
+
+/** One blob in a GC listing: its address and R2's upload time in ms (a PUT overwrite refreshes it). */
+export interface BlobListItem {
+	address: string;
+	uploadedAt: number;
+}
+
+/** `GET /vault/:id/blobs` → one page; `next` is the cursor of the following page, null after the last one. */
+export interface BlobListPage {
+	items: BlobListItem[];
+	next: string | null;
+}
+
+/**
+ * One page of `v/<vaultId>/`, in key order (lexicographic by address), at most BLOB_LIST_PAGE_SIZE items, starting
+ * after `cursor`. The cursor is the last address of the previous page, passed to R2 as `startAfter`: it is checked
+ * like an address, stays inside the vault's prefix, and survives deletes made between pages (R2's own cursor is not
+ * promised to). `next` is null once R2 reports the listing complete.
+ */
+export async function listVaultBlobs(bucket: R2Bucket, vaultId: string, cursor: string | null): Promise<BlobListPage> {
+	const prefix = blobPrefix(vaultId);
+	const listed = await bucket.list({
+		prefix,
+		limit: BLOB_LIST_PAGE_SIZE,
+		...(cursor === null ? {} : { startAfter: blobKey(vaultId, cursor) }),
+	});
+	const items = listed.objects.map((object) => ({
+		address: object.key.slice(prefix.length),
+		uploadedAt: object.uploaded.getTime(),
+	}));
+	const last = items[items.length - 1];
+	return { items, next: listed.truncated && last ? last.address : null };
+}
+
+/** `DELETE /vault/:id/blobs/:address` → what happened to the object. */
+export type BlobDeleteResult =
+	| { result: "deleted"; uploadedAt: number }
+	| { result: "newer"; uploadedAt: number }
+	| { result: "absent" };
+
+/**
+ * R2 `head`, then `delete` only if the object was uploaded strictly before `cutoff` (ms). A re-upload refreshes the
+ * upload time, so a blob PUT again after the client's cutoff answers `newer` and stays. R2 has no conditional delete:
+ * a PUT that lands between the head and the delete (one round trip) is still deleted.
+ */
+export async function deleteVaultBlobUploadedBefore(
+	bucket: R2Bucket, vaultId: string, address: string, cutoff: number,
+): Promise<BlobDeleteResult> {
+	const key = blobKey(vaultId, address);
+	const head = await bucket.head(key);
+	if (!head) return { result: "absent" };
+	const uploadedAt = head.uploaded.getTime();
+	if (uploadedAt >= cutoff) return { result: "newer", uploadedAt };
+	await bucket.delete(key);
+	return { result: "deleted", uploadedAt };
+}
+
+/** `ifUploadedBefore`: ms since the epoch, decimal digits only, a safe integer. Anything else (absent too) → null. */
+function uploadCutoff(raw: string | null): number | null {
+	if (raw === null || !/^[0-9]{1,16}$/.test(raw)) return null;
+	const value = Number(raw);
+	return Number.isSafeInteger(value) ? value : null;
 }
 
 /**
