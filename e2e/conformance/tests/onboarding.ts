@@ -105,7 +105,7 @@ export const tests: TestDef[] = [
 			const observed = { enrolls: log.length, first200: log.filter((e) => e.firstStatus === 200).length, first202,
 				other: log.filter((e) => e.firstStatus !== 200 && e.firstStatus !== 202).map((e) => e.firstStatus),
 				bodyOk: log.filter((e) => e.bodyOk).length };
-			t.expect("every enroll answers 200 on the first attempt (no 202 authorization_fence_pending), body has deviceId/vaultId/vaultGeneration/principalId");
+			t.expect("every enroll answers 200 on the first attempt (no 202 authorization_fence_pending), body has exactly host, deviceToken, vaultId, deviceId, deviceName, vaultGeneration");
 			t.observe("enrolls", observed);
 			t.check("all first attempts 200", log.length > 0 && observed.first200 === log.length, observed);
 			t.check("all 200 bodies well-formed", observed.bodyOk === log.length, observed);

@@ -42,6 +42,8 @@ async function timed(ctx: Ctx, method: string, path: string, options: { token?: 
 	const headers: Record<string, string> = {};
 	if (options.token) headers.Authorization = `Bearer ${options.token}`;
 	if (options.cookie) headers.Cookie = options.cookie;
+	// D5: the operator revoke needs a same-origin Origin, as the browser console sends; Node's fetch sends none.
+	if (options.cookie && method !== "GET") headers.Origin = new URL(ctx.host).origin;
 	let body: string | undefined;
 	if (options.json !== undefined) { headers["Content-Type"] = "application/json"; body = JSON.stringify(options.json); }
 	const t0 = now();

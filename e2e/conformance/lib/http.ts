@@ -16,6 +16,9 @@ export async function http(ctx: Ctx, method: string, path: string, options: Http
 	const headers: Record<string, string> = {};
 	if (options.token) headers.Authorization = `Bearer ${options.token}`;
 	if (options.cookie) headers.Cookie = options.cookie;
+	// D5: operator writes and /claim need a same-origin Origin. A browser sends it on every non-GET fetch; Node's
+	// fetch never does, so the console's request is reproduced here.
+	if ((options.cookie || path === "/claim") && method !== "GET") headers.Origin = new URL(ctx.host).origin;
 	let body: BodyInit | undefined;
 	if (options.json !== undefined) { headers["Content-Type"] = "application/json"; body = JSON.stringify(options.json); }
 	if (options.body) { headers["Content-Type"] = "application/octet-stream"; body = options.body; }

@@ -27,7 +27,8 @@ export function operatorCookie(ctx: Ctx): Promise<string> {
 		const key = JSON.parse(readFileSync(ctx.operatorContextPath, "utf8")).operatorRecoveryKey;
 		if (typeof key !== "string" || key.length < 32) throw new Error("operator context has no usable operatorRecoveryKey");
 		secret(ctx, key);
-		const response = await fetch(`${ctx.host}/operator/login`, { method: "POST", headers: { "Content-Type": "application/json" },
+		const response = await fetch(`${ctx.host}/operator/login`, { method: "POST",
+			headers: { "Content-Type": "application/json", Origin: new URL(ctx.host).origin },
 			body: JSON.stringify({ operatorRecoveryKey: key }), signal: AbortSignal.timeout(30000) });
 		await response.arrayBuffer();
 		const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
@@ -44,6 +45,8 @@ export function newDeviceIdentity(ctx: Ctx, label: string, vaultKey: string): De
 	return device;
 }
 
+const ENROLL_FIELDS = ["deviceId", "deviceName", "deviceToken", "host", "vaultGeneration", "vaultId"];
+
 export function enrollBody(device: Device, pairingCode: string, enrollmentRequestId = id(16)) {
 	return { pairingCode, enrollmentRequestId, deviceId: device.deviceId, deviceToken: device.token, deviceName: device.deviceName };
 }
@@ -59,8 +62,10 @@ export async function enroll(ctx: Ctx, vaultKey: string, pairingCode: string, la
 		statuses.push(response.status);
 		if (response.status === 202) { await sleep(1000); continue; }
 		const v = response.value ?? {};
-		const bodyOk = response.status === 200 && v.deviceId === device.deviceId && typeof v.vaultId === "string"
-			&& typeof v.vaultGeneration === "string" && typeof v.principalId === "string";
+		// D3 / §5 row 2.4: exactly the six fields the client's readEnrollment reads (no principalId: D6 is VAULT_READY only).
+		const bodyOk = response.status === 200 && Object.keys(v).sort().join() === ENROLL_FIELDS.join()
+			&& typeof v.host === "string" && v.deviceToken === device.token && v.deviceId === device.deviceId
+			&& typeof v.vaultId === "string" && typeof v.deviceName === "string" && typeof v.vaultGeneration === "string";
 		ctx.enrollLog.push({ vaultKey, device: label, firstStatus: statuses[0]!, statuses, ok: response.status === 200, bodyOk });
 		if (response.status !== 200 || v.deviceId !== device.deviceId) {
 			throw new Error(`enroll ${vaultKey}/${label} failed ${response.status} ${String(v.error ?? "")}`);
