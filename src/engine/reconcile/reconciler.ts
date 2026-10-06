@@ -24,6 +24,7 @@ import { applyOwnFold } from "./ownFold";
 import type { OwnFoldEvent } from "./deps";
 import { runPlan, type RunReport } from "./runner";
 import { Scanner } from "./scan";
+import { SkipNoticeGate, unexpectedSkips } from "./skipNotice";
 import { recoverTempNames } from "./tempRecovery";
 import { ReconcileStore } from "./store";
 
@@ -61,6 +62,7 @@ export class Reconciler {
 	/** Ops the planner held for the current brake report (rejectBrake turns them into their opposites). */
 	private lastHeld: { id: string; ops: readonly PlannerOp[] } | null = null;
 	lastPlan: readonly PlannerOp[] = [];
+	private readonly skips = new SkipNoticeGate();
 
 	private constructor(readonly ctx: Ctx, readonly scan: Scanner, private readonly env: Env) {}
 
@@ -202,6 +204,10 @@ export class Reconciler {
 		// Out-of-scope read failures count too: nothing else would re-plan them before the periodic full pass.
 		const unread = Math.max(this.scan.lastUnread, plan.ops.filter((o) => o.op === "needHash").length);
 		ctx.flushConflictCopies();
+		if (ctx.localComplete) {
+			const text = this.skips.next(unexpectedSkips(ctx.local.values(), (p, size) => ctx.classify(p, size)));
+			if (text !== null) ctx.notice("warn", "scan-skipped", text);
+		}
 		return { ...run, planned: plan.ops.length, actionable, unread, brake, openIntents, vacated };
 	}
 
