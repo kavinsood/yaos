@@ -98,7 +98,7 @@ describe("wsRelay connect", () => {
 		assert.equal(session.canWrite, true);
 		assert.deepEqual(session.limits, {
 			maxFrameBytes: 1048576, maxCheckpointBytes: 4194304, appendBytesPerSec: 262144, burstBytes: 2097152,
-			feedPageRows: 1000, readPageBytes: 1048576,
+			feedPageRows: 1000, readPageBytes: 1048576, readBatchStreams: 1,
 		});
 	});
 
@@ -449,6 +449,46 @@ describe("wsRelay session sending", () => {
 		assert.equal(seen[1]!.url.search, "?stream=ns&after=0&maxBytes=1048576&checkpoint=1");
 		assert.equal(seen[2]!.url.pathname, "/vault/vault1/streams/checkpoint");
 		for (const req of seen) assert.equal(req.headers.get("authorization"), `Bearer ${TOKEN}`);
+	});
+});
+
+describe("wsRelay batched read", () => {
+	const page = (stream: string, seq: number) => ({ stream, lastSeq: seq, checkpointSeq: 0, gcSeq: 0, checkpoint: null,
+		rows: [{ seq, deviceId: "d", clientFrameId: `c${seq}`, payload: bytesToBase64(bytes(seq)) }], nextAfter: null });
+	const reqs = (...names: string[]) => names.map((n, i) => ({ stream: S(n), afterSeq: i, preferCheckpoint: i === 0 }));
+
+	it("sends r= entries under the batch cap and maps the page prefix", async () => {
+		const seen: FakeRequest[] = [];
+		const { session } = await open({}, { ...READY, limits: { ...READY.limits, readBatchMaxStreams: 2 } }, (req) => {
+			seen.push(req);
+			return jsonResponse({ vaultEpoch: "E1", head: 42, pages: [page("b:a", 3)] });
+		});
+		assert.equal(session.limits.readBatchStreams, 2);
+		const pages = await session.readBatch(reqs("b:a", "b:x.y", "b:c"));
+		assert.equal(pages.length, 1, "a prefix: the rest are re-requested");
+		assert.deepEqual(pages[0]!.rows, [{ seq: 3, deviceId: "d", clientFrameId: "c3", payload: bytes(3) }]);
+		assert.equal(seen[0]!.url.pathname, "/vault/vault1/streams/read");
+		assert.deepEqual(seen[0]!.url.searchParams.getAll("r"), ["0.1.b:a", "1.0.b:x.y"], "capped at readBatchStreams");
+		assert.equal(seen[0]!.url.searchParams.get("maxBytes"), "1048576");
+		assert.equal(seen[0]!.headers.get("authorization"), `Bearer ${TOKEN}`);
+	});
+
+	it("rejects a page for another stream or more pages than entries; a relay without the limit gets single reads", async () => {
+		let reply: unknown = { pages: [page("b:other", 1)] };
+		const { session } = await open({}, { ...READY, limits: { ...READY.limits, readBatchMaxStreams: 8 } }, () => jsonResponse(reply));
+		await assert.rejects(session.readBatch(reqs("b:a", "b:b")), /malformed_response/);
+		reply = { pages: [page("b:a", 1), page("b:b", 2), page("b:c", 3)] };
+		await assert.rejects(session.readBatch(reqs("b:a", "b:b")), /malformed_response/);
+		reply = { pages: [] };
+		await assert.rejects(session.readBatch(reqs("b:a", "b:b")), /malformed_response/);
+		const seen: FakeRequest[] = [];
+		const old = await open({}, READY, (req) => {
+			seen.push(req);
+			return jsonResponse({ vaultEpoch: "E1", head: 42, ...page("b:a", 4) });
+		});
+		const single = await old.session.readBatch(reqs("b:a", "b:b"));
+		assert.deepEqual(single.map((p) => p.lastSeq), [4]);
+		assert.equal(seen[0]!.url.search, "?stream=b%3Aa&after=0&maxBytes=1048576&checkpoint=1");
 	});
 });
 

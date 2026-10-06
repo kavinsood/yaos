@@ -8,7 +8,7 @@
 import type { DeviceId, Seq, StreamName, VaultEpoch } from "../core/types";
 import type { ClockPort } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
-import type { AppendFrame, FeedPage, PutCheckpointResult, ReadPage, RelayEvent, RelayLimits, RelaySession } from "../ports/relay";
+import type { AppendFrame, FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayEvent, RelayLimits, RelaySession } from "../ports/relay";
 import { TimedQueue } from "./a-relay-link";
 import { appendMessageBytes, heldKey, type DownMsg, type LinkSpec, type UpMsg } from "./a-relay-util";
 
@@ -18,6 +18,7 @@ export interface SessionHost {
 	arrive(session: SimRelaySession, msg: UpMsg): void;
 	feed(session: SimRelaySession, afterSeq: Seq): Promise<FeedPage>;
 	read(session: SimRelaySession, stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean): Promise<ReadPage>;
+	readBatch(session: SimRelaySession, reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]>;
 	putCheckpoint(session: SimRelaySession, stream: StreamName, coversSeq: Seq, expectedPrevCoversSeq: Seq, bytes: Uint8Array): Promise<PutCheckpointResult>;
 	/** Uniform [0, jitterMs) for this socket's link. */
 	jitter(session: SimRelaySession): number;
@@ -100,6 +101,13 @@ export class SimRelaySession implements RelaySession {
 
 	read(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean): Promise<ReadPage> {
 		return this.host.read(this, stream, afterSeq, preferCheckpoint);
+	}
+
+	async readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]> {
+		const first = reqs[0];
+		if (first === undefined) throw new RangeError("readBatch: no requests");
+		if (this.limits.readBatchStreams <= 1 || reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
+		return this.host.readBatch(this, reqs.slice(0, this.limits.readBatchStreams));
 	}
 
 	putCheckpoint(stream: StreamName, coversSeq: Seq, expectedPrevCoversSeq: Seq, bytes: Uint8Array): Promise<PutCheckpointResult> {

@@ -7,7 +7,7 @@
  */
 
 import type { ClockPort } from "../../ports/clock";
-import type { FeedPage, PutCheckpointResult, ReadPage, RelayConnectResult, RelayRow } from "../../ports/relay";
+import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectResult, RelayRow } from "../../ports/relay";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
 
 export type ConnectFailureReason = Extract<RelayConnectResult, { ok: false }>["reason"];
@@ -44,6 +44,8 @@ export interface RelayHttp {
 	ticket(vaultId: string): Promise<TicketResult>;
 	feed(vaultId: string, afterSeq: number, limit: number | null): Promise<FeedPage>;
 	read(vaultId: string, stream: string, afterSeq: number, preferCheckpoint: boolean, maxBytes: number | null): Promise<ReadPage>;
+	/** Batched read (relay-wire §7.1): pages for a non-empty prefix of `reqs` (the URL is capped at READ_BATCH_MAX_QUERY_CHARS). */
+	readBatch(vaultId: string, reqs: readonly ReadRequest[], maxBytes: number | null): Promise<ReadPage[]>;
 	putCheckpoint(vaultId: string, stream: string, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array): Promise<PutCheckpointResult>;
 }
 
@@ -104,6 +106,44 @@ interface HttpReply {
 	readonly body: Json | null;
 	readonly code: string | null;
 	readonly retryAfterMs: number | null;
+}
+
+/** Query budget of one batched read URL (CDN URL limits are 8-16 KB); entries past it go in a later batch. */
+export const READ_BATCH_MAX_QUERY_CHARS = 6000;
+
+/** One read page (single read body / batched read entry); null when malformed. */
+function parsePage(body: Json, afterSeq: number): ReadPage | null {
+	const lastSeq = seqField(body, "lastSeq");
+	const checkpointSeq = seqField(body, "checkpointSeq") ?? 0;
+	const rawRows = body["rows"];
+	const nextAfterRaw = body["nextAfter"];
+	const nextAfter = nextAfterRaw === null || nextAfterRaw === undefined ? null : seqField(body, "nextAfter");
+	if (lastSeq === null || !Array.isArray(rawRows) || (nextAfterRaw !== null && nextAfterRaw !== undefined && nextAfter === null)) return null;
+	try {
+		let checkpoint: { coversSeq: number; bytes: Uint8Array } | null = null;
+		const rawCheckpoint = body["checkpoint"];
+		if (isRecord(rawCheckpoint)) {
+			const coversSeq = seqField(rawCheckpoint, "coversSeq");
+			const bytes = rawCheckpoint["bytes"];
+			if (coversSeq === null || typeof bytes !== "string") return null;
+			checkpoint = { coversSeq, bytes: base64ToBytes(bytes) };
+		}
+		const rows: RelayRow[] = [];
+		for (const raw of rawRows) {
+			if (!isRecord(raw)) return null;
+			const seq = seqField(raw, "seq");
+			const deviceId = raw["deviceId"];
+			const clientFrameId = raw["clientFrameId"];
+			const payload = raw["payload"];
+			if (seq === null || typeof deviceId !== "string" || typeof clientFrameId !== "string" || typeof payload !== "string") return null;
+			rows.push({ seq, deviceId: deviceId as DeviceId, clientFrameId: clientFrameId as ClientFrameId, payload: base64ToBytes(payload) });
+		}
+		const lastRow = rows.length > 0 ? rows[rows.length - 1] : undefined;
+		const nextAfterSeq = nextAfter ?? lastRow?.seq ?? checkpoint?.coversSeq ?? afterSeq;
+		return { checkpoint, rows, lastSeq, checkpointSeq, nextAfterSeq, more: nextAfter !== null };
+	} catch {
+		return null; // invalid base64
+	}
 }
 
 export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
@@ -206,49 +246,33 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 				+ (preferCheckpoint ? "&checkpoint=1" : "");
 			const reply = await call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET" });
 			if (reply === null || reply.status !== 200) throw fail("read", reply);
-			const body = reply.body;
-			if (body === null) throw malformed("read", reply.status);
-			const lastSeq = seqField(body, "lastSeq");
-			const checkpointSeq = seqField(body, "checkpointSeq") ?? 0;
-			const rawRows = body["rows"];
-			const nextAfterRaw = body["nextAfter"];
-			const nextAfter = nextAfterRaw === null || nextAfterRaw === undefined ? null : seqField(body, "nextAfter");
-			if (lastSeq === null || !Array.isArray(rawRows) || (nextAfterRaw !== null && nextAfterRaw !== undefined && nextAfter === null)) {
-				throw malformed("read", reply.status);
+			const page = reply.body === null ? null : parsePage(reply.body, afterSeq);
+			if (page === null) throw malformed("read", reply.status);
+			return page;
+		},
+
+		async readBatch(vaultId, reqs, maxBytes) {
+			let q = maxBytes !== null ? `maxBytes=${maxBytes}` : "";
+			let sent = 0;
+			for (const r of reqs) {
+				const entry = `r=${r.afterSeq}.${r.preferCheckpoint ? 1 : 0}.${encodeURIComponent(r.stream)}`;
+				if (sent > 0 && q.length + entry.length + 1 > READ_BATCH_MAX_QUERY_CHARS) break;
+				q += `${q === "" ? "" : "&"}${entry}`;
+				sent++;
 			}
-			let checkpoint: { coversSeq: number; bytes: Uint8Array } | null = null;
-			const rawCheckpoint = body["checkpoint"];
-			try {
-				if (isRecord(rawCheckpoint)) {
-					const coversSeq = seqField(rawCheckpoint, "coversSeq");
-					const bytes = rawCheckpoint["bytes"];
-					if (coversSeq === null || typeof bytes !== "string") throw malformed("read", reply.status);
-					checkpoint = { coversSeq, bytes: base64ToBytes(bytes) };
-				}
-				const rows: RelayRow[] = [];
-				for (const raw of rawRows) {
-					if (!isRecord(raw)) throw malformed("read", reply.status);
-					const seq = seqField(raw, "seq");
-					const deviceId = raw["deviceId"];
-					const clientFrameId = raw["clientFrameId"];
-					const payload = raw["payload"];
-					if (seq === null || typeof deviceId !== "string" || typeof clientFrameId !== "string" || typeof payload !== "string") {
-						throw malformed("read", reply.status);
-					}
-					rows.push({
-						seq,
-						deviceId: deviceId as DeviceId,
-						clientFrameId: clientFrameId as ClientFrameId,
-						payload: base64ToBytes(payload),
-					});
-				}
-				const lastRow = rows.length > 0 ? rows[rows.length - 1] : undefined;
-				const nextAfterSeq = nextAfter ?? lastRow?.seq ?? checkpoint?.coversSeq ?? afterSeq;
-				return { checkpoint, rows, lastSeq, checkpointSeq, nextAfterSeq, more: nextAfter !== null };
-			} catch (error) {
-				if (error instanceof RelayHttpError) throw error;
-				throw malformed("read", reply.status);
+			if (sent === 0) throw new RangeError("readBatch: no requests");
+			const reply = await call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET" });
+			if (reply === null || reply.status !== 200) throw fail("read", reply);
+			const raw = reply.body?.["pages"];
+			if (!Array.isArray(raw) || raw.length === 0 || raw.length > sent) throw malformed("read", reply.status);
+			const pages: ReadPage[] = [];
+			for (let i = 0; i < raw.length; i++) {
+				const item: unknown = raw[i];
+				const page = isRecord(item) && item["stream"] === reqs[i]!.stream ? parsePage(item, reqs[i]!.afterSeq) : null;
+				if (page === null) throw malformed("read", reply.status);
+				pages.push(page);
 			}
+			return pages;
 		},
 
 		async putCheckpoint(vaultId, stream, coversSeq, expectedPrevCoversSeq, bytes) {

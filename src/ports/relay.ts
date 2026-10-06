@@ -53,8 +53,10 @@ export interface RelayLimits {
 	readonly burstBytes: number;
 	/** Streams per feed() page. */
 	readonly feedPageRows: number;
-	/** Payload bytes per read() page. */
+	/** Payload bytes per read() page, and per readBatch() request. */
 	readonly readPageBytes: number;
+	/** Streams per readBatch() request (VAULT_READY readBatchMaxStreams); 1 = the relay has no batch form. */
+	readonly readBatchStreams: number;
 }
 
 export interface AppendFrame {
@@ -103,6 +105,13 @@ export interface ReadPage {
 	/** Pass as afterSeq for the next page. */
 	readonly nextAfterSeq: Seq;
 	readonly more: boolean;
+}
+
+/** One entry of readBatch(): the same arguments as read(). */
+export interface ReadRequest {
+	readonly stream: StreamName;
+	readonly afterSeq: Seq;
+	readonly preferCheckpoint: boolean;
 }
 
 export type PutCheckpointResult =
@@ -163,6 +172,12 @@ export interface RelaySession {
 	feed(afterSeq: Seq): Promise<FeedPage>;
 	/** preferCheckpoint: also take a newer checkpoint when rows still exist (fresh docs). */
 	read(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean): Promise<ReadPage>;
+	/**
+	 * The first page of each request, for a non-empty prefix of `reqs` in order: one relay request under one
+	 * readPageBytes budget (relay-wire §7.1). Requests without a page are re-requested later. With
+	 * readBatchStreams 1 this is read(reqs[0]).
+	 */
+	readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]>;
 	putCheckpoint(stream: StreamName, coversSeq: Seq, expectedPrevCoversSeq: Seq, bytes: Uint8Array): Promise<PutCheckpointResult>;
 	/** Events received before the first listener is attached are buffered, so nothing after headSeq is lost. */
 	onEvent(listener: (event: RelayEvent) => void): Unsubscribe;

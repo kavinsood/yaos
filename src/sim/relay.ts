@@ -16,7 +16,7 @@ import type { DeviceId, Seq, StreamName, VaultEpoch } from "../core/types";
 import type { ClockPort } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
 import type { RandomPort } from "../ports/random";
-import type { FeedPage, PutCheckpointResult, ReadPage, RelayConnectParams, RelayConnectResult, RelayEvent, RelayLimits, RelayPort } from "../ports/relay";
+import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectParams, RelayConnectResult, RelayEvent, RelayLimits, RelayPort } from "../ports/relay";
 import { RelayEngine, type CommitFault, type CommitHook, type SimCommitInfo, type SimRelayCounters } from "./a-relay-engine";
 import { SimRelaySession, type SessionHost } from "./a-relay-session";
 import { RelayStore, type SegmentInfo } from "./a-relay-store";
@@ -26,6 +26,7 @@ import {
 	DEFAULT_SIM_RELAY_LIMITS,
 	SIM_FEED_MAX_LIMIT,
 	SIM_MAX_SOCKETS,
+	SIM_READ_BATCH_MAX_STREAMS,
 	SIM_READ_MAX_BYTES,
 	SIM_SEGMENT_MAX_BYTES,
 	SIM_SEGMENT_SEAL_BYTES,
@@ -79,6 +80,8 @@ export class SimRelay implements RelayPort {
 	private nextSessionId = 1;
 	private readonly readPageRows: number;
 	private readonly maxSockets: number;
+	/** Catch-up read requests served (single and batched). */
+	readRequests = 0;
 	/** Listener exceptions: rethrown asynchronously by default (like wsRelay). */
 	onListenerError: (error: unknown) => void = (error) => queueMicrotask(() => {
 		throw error;
@@ -108,7 +111,8 @@ export class SimRelay implements RelayPort {
 			clock: this.clock,
 			arrive: (session, msg) => this.engine.arrive(session, msg),
 			feed: (session, afterSeq) => this.http(session, () => this.feedPage(afterSeq)),
-			read: (session, stream, afterSeq, prefer) => this.http(session, () => this.readPage(stream, afterSeq, prefer)),
+			read: (session, stream, afterSeq, prefer) => (this.readRequests++, this.http(session, () => this.readPage(stream, afterSeq, prefer))),
+			readBatch: (session, reqs) => (this.readRequests++, this.http(session, () => this.readBatchPages(reqs))),
 			putCheckpoint: (session, stream, coversSeq, expected, bytes) => this.http(session, () => this.checkpointPut(session, stream, coversSeq, expected, bytes)),
 			jitter: (session) => this.jitter(session.link),
 			listenerError: (error) => this.onListenerError(error),
@@ -169,16 +173,33 @@ export class SimRelay implements RelayPort {
 		return { entries: page.changes, throughSeq: page.nextAfter ?? page.head, headSeq: page.head, more: page.nextAfter !== null };
 	}
 
-	private readPage(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean): ReadPage {
+	private readPage(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean, budget?: number): ReadPage {
 		if (!validStreamName(stream)) throw new SimRelayError("invalid_stream");
 		if (!validSeq(afterSeq)) throw new SimRelayError("invalid_cursor");
-		const maxBytes = Math.max(1, Math.min(SIM_READ_MAX_BYTES, this.limits.readPageBytes));
+		const maxBytes = budget ?? Math.max(1, Math.min(SIM_READ_MAX_BYTES, this.limits.readPageBytes));
 		const page = this.store.read(stream, afterSeq, maxBytes, preferCheckpoint, this.readPageRows);
 		const last = page.rows.length > 0 ? page.rows[page.rows.length - 1]!.seq : page.checkpoint?.coversSeq ?? afterSeq;
 		return {
 			checkpoint: page.checkpoint, rows: page.rows, lastSeq: page.lastSeq, checkpointSeq: page.checkpointSeq,
 			nextAfterSeq: page.nextAfter ?? last, more: page.nextAfter !== null,
 		};
+	}
+
+	/** Server readBatch: request order, one budget; the first entry always served, a later overrun ends the batch. */
+	private readBatchPages(reqs: readonly ReadRequest[]): ReadPage[] {
+		if (reqs.length === 0 || reqs.length > SIM_READ_BATCH_MAX_STREAMS) throw new SimRelayError("batch_too_large");
+		const maxBytes = Math.max(1, Math.min(SIM_READ_MAX_BYTES, this.limits.readPageBytes));
+		const pages: ReadPage[] = [];
+		let left = maxBytes;
+		for (const r of reqs) {
+			if (pages.length > 0 && left <= 0) break;
+			const page = this.readPage(r.stream, r.afterSeq, r.preferCheckpoint, pages.length > 0 ? left : maxBytes);
+			const size = (page.checkpoint?.bytes.byteLength ?? 0) + page.rows.reduce((n, row) => n + row.payload.byteLength, 0);
+			if (pages.length > 0 && size > left) break;
+			pages.push(page);
+			left -= size;
+		}
+		return pages;
 	}
 
 	/** Route permission, argument validation, body size, daily limit, then the store CAS (server order). */

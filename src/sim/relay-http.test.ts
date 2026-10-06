@@ -65,6 +65,33 @@ test("relay read: paged by payload bytes (at least one row) and readPageRows; ne
 	assert.deepEqual([page.rows.map((r) => r.seq), page.nextAfterSeq, page.more], [[2, 3], 3, true]);
 });
 
+test("relay readBatch: first pages in request order under one readPageBytes budget; first always served; cap; single fallback", async () => {
+	const { clock, relay, a } = await setup({ limits: { readPageBytes: 25, readBatchStreams: 3 } });
+	for (const [stream, id, size] of [["b:1", "x1", 10], ["b:2", "x2", 10], ["b:3", "x3", 10], ["b:1", "x4", 10], ["b:4", "x5", 40]] as const) {
+		a.session.append(frame(stream, id, size));
+	}
+	await clock.runUntilIdle();
+	const req = (stream: string, afterSeq = 0, preferCheckpoint = false) => ({ stream: stream as StreamName, afterSeq, preferCheckpoint });
+	const batch = (...reqs: ReturnType<typeof req>[]) => pump(clock, a.session.readBatch(reqs));
+	// b:1 (20 bytes) + b:2 (10) would overrun 25 -> only b:1.
+	assert.deepEqual((await batch(req("b:1"), req("b:2"), req("b:3"))).map((p) => p.rows.map((r) => r.seq)), [[1, 4]]);
+	assert.deepEqual((await batch(req("b:2"), req("b:3"), req("nope"), req("b:1"))).map((p) => [p.rows.map((r) => r.seq), p.lastSeq]),
+		[[[2], 2], [[3], 3], [[], 0]], "capped at readBatchStreams (3)");
+	assert.deepEqual((await batch(req("b:4"), req("b:2"))).map((p) => p.rows.length), [1], "first entry over budget is still served");
+	assert.deepEqual((await batch(req("b:1", 1), req("b:2", 2))).map((p) => [p.rows.map((r) => r.seq), p.nextAfterSeq, p.more]),
+		[[[4], 4, false], [[], 2, false]], "per-entry cursors");
+	await assert.rejects(batch(req(""), req("b:1")), rejectsWith("invalid_stream"));
+	await assert.rejects(pump(clock, a.session.readBatch([])), /no requests/);
+	assert.equal(relay.limits.readBatchStreams, 3);
+
+	const single = await setup({ limits: { readBatchStreams: 1 } });
+	single.a.session.append(frame("b:1", "y1", 10));
+	single.a.session.append(frame("b:2", "y2", 10));
+	await single.clock.runUntilIdle();
+	const one = await pump(single.clock, single.a.session.readBatch([req("b:1"), req("b:2")]));
+	assert.deepEqual(one.map((p) => p.rows.map((r) => r.seq)), [[1]], "no batch form: read(reqs[0])");
+});
+
 test("relay checkpoint: CAS order (not found, conflict, not advancing, ahead), GC of covered sealed segments, reads take the checkpoint after GC", async () => {
 	// rows are 1 + 2 + 3 + 11 = 17 bytes: one-row commits seal every 2 rows
 	const { clock, relay, a } = await setup({ sealBytes: 34, limits: { maxCheckpointBytes: 16 } });

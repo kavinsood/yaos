@@ -16,6 +16,7 @@ export const DEFAULT_SIM_RELAY_LIMITS: RelayLimits = Object.freeze({
 	burstBytes: 2 * 1024 * 1024,
 	feedPageRows: 1000,
 	readPageBytes: 1024 * 1024,
+	readBatchStreams: 128,
 });
 
 /** STREAM_DEDUPE_TAIL_ROWS: the newest sealed segment is searched while the open segment has fewer rows. */
@@ -26,6 +27,8 @@ export const SIM_SEGMENT_MAX_BYTES = 1_500_000;
 export const SIM_MESSAGE_SLACK_BYTES = 1024;
 export const SIM_FEED_MAX_LIMIT = 5000;
 export const SIM_READ_MAX_BYTES = 4 * 1024 * 1024;
+/** STREAM_READ_BATCH_MAX_STREAMS: entries of one batched read. */
+export const SIM_READ_BATCH_MAX_STREAMS = 128;
 export const SIM_MAX_SOCKETS = 1000;
 
 export interface GroupCommitSpec {

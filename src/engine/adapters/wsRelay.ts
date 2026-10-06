@@ -26,6 +26,8 @@ import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { RandomPort } from "../../ports/random";
 import type {
 	AppendFrame,
+	ReadPage,
+	ReadRequest,
 	RelayConnectParams,
 	RelayConnectResult,
 	RelayEvent,
@@ -90,6 +92,7 @@ export const DEFAULT_RELAY_LIMITS: RelayLimits = {
 	burstBytes: 2 * 1024 * 1024,
 	feedPageRows: 1000,
 	readPageBytes: 1024 * 1024,
+	readBatchStreams: 1,
 };
 
 export const DEFAULT_LIVENESS = { idleMs: 60_000, timeoutMs: 15_000 } as const;
@@ -110,6 +113,7 @@ export function mapLimits(wire: WireLimits): RelayLimits {
 		burstBytes: wire.burstBytes ?? DEFAULT_RELAY_LIMITS.burstBytes,
 		feedPageRows: wire.feedDefaultLimit ?? DEFAULT_RELAY_LIMITS.feedPageRows,
 		readPageBytes: wire.readDefaultBytes ?? DEFAULT_RELAY_LIMITS.readPageBytes,
+		readBatchStreams: Math.max(1, Math.floor(wire.readBatchMaxStreams ?? DEFAULT_RELAY_LIMITS.readBatchStreams)),
 	};
 }
 
@@ -282,6 +286,13 @@ class WsRelaySession implements RelaySession {
 
 	read(stream: StreamName, afterSeq: number, preferCheckpoint: boolean) {
 		return this.http.read(this.vaultId, stream, afterSeq, preferCheckpoint, this.limits.readPageBytes);
+	}
+
+	async readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]> {
+		const first = reqs[0];
+		if (first === undefined) throw new RangeError("readBatch: no requests");
+		if (this.limits.readBatchStreams <= 1 || reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
+		return this.http.readBatch(this.vaultId, reqs.slice(0, this.limits.readBatchStreams), this.limits.readPageBytes);
 	}
 
 	putCheckpoint(stream: StreamName, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array) {

@@ -19,6 +19,9 @@
  * rows below it are gone, the stream is frozen `checkpoint-disputed` and the
  * read stops without completing (the stream stays stale).
  *
+ * A batched read (sessionLoop) hands its page in as `first`; it stands in for the first read() only when it
+ * was read from the same cursor and checkpoint preference this read starts with.
+ *
  * Completion: the last page (more = false) carries completeThrough =
  * max(session H, lastSeq). It is only valid in the session the read started
  * in: stillValid() is checked after every await before committing.
@@ -27,7 +30,7 @@
 import { CheckpointEncoding } from "../../core/envelope";
 import { NS_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
 import type { HashPort } from "../../ports/crypto";
-import type { RelaySession } from "../../ports/relay";
+import type { ReadPage, RelaySession } from "../../ports/relay";
 import { unionBodyCheckpoint, type CompactDeps } from "../body/compaction";
 import { gate, type GateCtx } from "../ingest/gate";
 import type { OutboxRecord, QuarantineRecord, SnapshotRecord, StreamRecord, TailRecord } from "../store/schema";
@@ -51,6 +54,8 @@ export interface ReadOptions {
 	stillValid(): boolean;
 	/** Stop after this many pages (tests); the stream stays stale. */
 	readonly maxPages?: number;
+	/** The first page, already read by a batched read with these arguments. */
+	readonly first?: { readonly afterSeq: Seq; readonly preferCheckpoint: boolean; readonly page: ReadPage };
 }
 
 export interface ReadResult {
@@ -94,11 +99,13 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	let after = opts.fromSeq ?? start?.appliedSeq ?? 0;
 	let preferCheckpoint = after === 0;
 	let disputedRetry = false;
+	let first = opts.first && opts.first.afterSeq === after && opts.first.preferCheckpoint === preferCheckpoint ? opts.first.page : null;
 	for (;;) {
 		if (opts.maxPages !== undefined && pages >= opts.maxPages) return result("partial");
 		let page;
 		try {
-			page = await session.read(stream, after, preferCheckpoint);
+			page = first ?? await session.read(stream, after, preferCheckpoint);
+			first = null;
 		} catch (e) {
 			return result("aborted", e instanceof Error ? e.message : String(e));
 		}

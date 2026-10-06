@@ -4,6 +4,12 @@
  * queue on -> ns/cfg reads (late receipts) -> ns window open -> held release ->
  * live; then stale streams are read with bounded concurrency.
  *
+ * Catch-up reads are batched when the relay has the batch form (limits.readBatchStreams > 1): one request reads
+ * the first page of up to readBatchStreams stale streams under one readPageBytes budget, and each served stream
+ * then runs readStream (which pages on alone if it has more). On the deployed relay a request costs ~9 edge RTTs
+ * whatever it carries, so a fresh device reads its N notes in about N / readBatchStreams requests instead of N.
+ * catchUpConcurrency bounds lanes: a single read or a batch (until all of its streams are done).
+ *
  * Every session gets a generation; callbacks of an older session are ignored.
  * Reconnect timing is relayPolicy's; this module only owns the timer.
  */
@@ -11,7 +17,7 @@
 import { RELAY_CLOSE } from "../../core/limits";
 import { CFG_STREAM, NS_STREAM, streamClass, type Seq, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
-import type { RelayConnectResult, RelayEvent, RelaySession } from "../../ports/relay";
+import type { ReadPage, ReadRequest, RelayConnectResult, RelayEvent, RelaySession } from "../../ports/relay";
 import { readStream, staleOrder, type ReadResult } from "../sync/catchUp";
 import type { EngineCtx } from "./context";
 import { connectFailure, newReconnectState, sessionClosed, type ReconnectDecision } from "./relayPolicy";
@@ -32,7 +38,9 @@ export class SessionLoop {
 	private feeding: Promise<void> | null = null;
 	private readonly reads = new Map<StreamName, Promise<void>>();
 	private readonly readBackoff = new Map<StreamName, number>();
-	stats = { sessions: 0, connectFailures: 0, feedPages: 0, reads: 0, readFailures: 0 };
+	/** Catch-up lanes in use: single reads and batches (bounded by catchUpConcurrency). */
+	private lanes = 0;
+	stats = { sessions: 0, connectFailures: 0, feedPages: 0, reads: 0, readFailures: 0, readBatches: 0 };
 
 	constructor(private readonly c: EngineCtx) {}
 
@@ -123,7 +131,7 @@ export class SessionLoop {
 			await this.feedTo(gen, session.headSeq);
 			if (gen !== c.gen) return;
 			c.live.enable();
-			for (const s of [NS_STREAM, CFG_STREAM]) if (c.repo.stream(s)?.stale) await this.runRead(s);
+			await this.readInOrder([NS_STREAM, CFG_STREAM].filter((s) => c.repo.stream(s)?.stale));
 			if (gen !== c.gen) return;
 			c.sender.openNs();
 			await c.afterNsChange();
@@ -245,22 +253,90 @@ export class SessionLoop {
 		const s = c.session;
 		if (!s) return Promise.resolve();
 		const gen = c.gen;
-		this.stats.reads++;
-		const p = (async () => {
-			try {
-				const res = await readStream(c.deps, s, stream, { headSeq: s.headSeq, fromSeq, stillValid: () => gen === c.gen && c.session === s });
-				await this.postRead(stream, res);
-			} catch (e) {
-				this.stats.readFailures++;
-				this.readBackoff.set(stream, c.mono() + c.tuning.readBackoffMs);
-				c.diag("read-failed", { cls: streamClass(stream), error: String(e) });
-			}
-		})().finally(() => {
+		this.lanes++;
+		const p = this.readOne(s, gen, stream, fromSeq, undefined).finally(() => {
 			this.reads.delete(stream);
+			this.lanes--;
 			this.scheduleCatchUp();
 		});
 		this.reads.set(stream, p);
 		return p;
+	}
+
+	private async readOne(s: RelaySession, gen: number, stream: StreamName, fromSeq: Seq | undefined, first: (ReadRequest & { page: ReadPage }) | undefined): Promise<void> {
+		const c = this.c;
+		this.stats.reads++;
+		try {
+			const res = await readStream(c.deps, s, stream, { headSeq: s.headSeq, fromSeq, first, stillValid: () => gen === c.gen && c.session === s });
+			await this.postRead(stream, res);
+		} catch (e) {
+			this.stats.readFailures++;
+			this.readBackoff.set(stream, c.mono() + c.tuning.readBackoffMs);
+			c.diag("read-failed", { cls: streamClass(stream), error: String(e) });
+		}
+	}
+
+	private batching(s: RelaySession): number {
+		return Math.max(1, Math.min(s.limits.readBatchStreams, this.c.tuning.readBatchStreams));
+	}
+
+	/**
+	 * One batched request for `streams` (none being read), one lane until every served stream is read. inOrder:
+	 * stream i is applied after stream i - 1 (ns before cfg). Resolves with the streams the batch did not serve
+	 * (still stale; a later batch or read takes them). A failed request backs every stream off, like a failed read.
+	 */
+	private runBatch(s: RelaySession, streams: readonly StreamName[], inOrder: boolean): Promise<StreamName[]> {
+		const c = this.c;
+		const gen = c.gen;
+		this.lanes++;
+		this.stats.readBatches++;
+		const reqs: ReadRequest[] = streams.map((stream) => {
+			const afterSeq = c.repo.stream(stream)?.appliedSeq ?? 0;
+			return { stream, afterSeq, preferCheckpoint: afterSeq === 0 };
+		});
+		const batch = s.readBatch(reqs).catch((e: unknown): null => {
+			this.stats.readFailures++;
+			c.diag("read-batch-failed", { streams: reqs.length, error: String(e) });
+			const until = c.mono() + c.tuning.readBackoffMs;
+			for (const q of reqs) this.readBackoff.set(q.stream, until);
+			return null;
+		});
+		const unserved: StreamName[] = [];
+		let prev: Promise<void> = Promise.resolve();
+		const members = reqs.map((q, i) => {
+			const after = prev;
+			const p = (async () => {
+				const pages = await batch;
+				if (inOrder) await after;
+				const page = pages?.[i];
+				if (page) await this.readOne(s, gen, q.stream, undefined, { ...q, page });
+				else if (pages) unserved.push(q.stream);
+			})().finally(() => {
+				this.reads.delete(q.stream);
+				this.scheduleCatchUp();
+			});
+			this.reads.set(q.stream, p);
+			prev = p;
+			return p;
+		});
+		return Promise.allSettled(members).then(() => {
+			this.lanes--;
+			this.scheduleCatchUp();
+			return unserved;
+		});
+	}
+
+	/** Reads `streams` one after another (session start: ns, cfg); batched into one request when possible. */
+	private async readInOrder(streams: readonly StreamName[]): Promise<void> {
+		const s = this.c.session;
+		if (!s) return;
+		let rest: readonly StreamName[] = streams;
+		const fresh = streams.filter((st) => !this.reads.has(st));
+		if (fresh.length > 1 && this.batching(s) > 1) {
+			const unserved = await this.runBatch(s, fresh, true);
+			rest = streams.filter((st) => this.reads.has(st) || unserved.includes(st));
+		}
+		for (const st of rest) await this.runRead(st);
 	}
 
 	private async postRead(stream: StreamName, res: ReadResult): Promise<void> {
@@ -289,16 +365,23 @@ export class SessionLoop {
 		c.scheduleStatus();
 	}
 
-	/** Start reads for stale streams, bound docs first, up to catchUpConcurrency. */
+	/** Start reads for stale streams, bound docs first: up to catchUpConcurrency lanes, batched when the relay can. */
 	scheduleCatchUp(): void {
 		const c = this.c;
-		if (!c.session || !c.live.enabled || c.stopped) return;
-		const slots = c.budgets.catchUpConcurrency - this.reads.size;
+		const s = c.session;
+		if (!s || !c.live.enabled || c.stopped) return;
+		let slots = c.budgets.catchUpConcurrency - this.lanes;
 		if (slots <= 0) return;
 		const now = c.mono();
 		const order = staleOrder(c.repo.streams(), (r) => c.repo.priorityFn(r), (r) =>
 			this.reads.has(r.stream) || r.cls === "other" || (r.frozen === 1 && r.frozenReason === "checkpoint-disputed") || (this.readBackoff.get(r.stream) ?? 0) > now);
-		for (const r of order.slice(0, slots)) void this.runRead(r.stream);
+		const per = this.batching(s);
+		for (let i = 0; slots > 0 && i < order.length; slots--) {
+			const group = order.slice(i, i + per).map((r) => r.stream);
+			i += group.length;
+			if (group.length === 1) void this.runRead(group[0]!);
+			else void this.runBatch(s, group, false);
+		}
 	}
 
 	/** Manual disconnect: no automatic reconnect until reconnect(). */

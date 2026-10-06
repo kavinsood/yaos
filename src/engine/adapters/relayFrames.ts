@@ -118,6 +118,7 @@ export interface WireLimits {
 	readonly burstBytes: number | null;
 	readonly feedDefaultLimit: number | null;
 	readonly readDefaultBytes: number | null;
+	readonly readBatchMaxStreams: number | null;
 }
 
 export interface WireReceipt {
@@ -192,6 +193,7 @@ function parseLimits(value: unknown): WireLimits {
 		burstBytes: positive(o, "burstBytes"),
 		feedDefaultLimit: positive(o, "feedDefaultLimit"),
 		readDefaultBytes: positive(o, "readDefaultBytes"),
+		readBatchMaxStreams: positive(o, "readBatchMaxStreams"),
 	};
 }
 

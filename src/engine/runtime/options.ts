@@ -34,6 +34,8 @@ export interface EngineTuning {
 	readonly maintenanceMs: number;
 	/** Backoff after a failed / aborted stream read. */
 	readonly readBackoffMs: number;
+	/** Streams per batched catch-up read (also capped by the relay's readBatchStreams); 1 = single reads only. */
+	readonly readBatchStreams: number;
 	readonly reconnectBaseMs: number;
 	/** Multiplier on the open-frame idle / max timers (tests shrink it). */
 	readonly frameStretch: number;
@@ -59,6 +61,7 @@ export const DEFAULT_TUNING: EngineTuning = {
 	mirrorDebounceMs: OUTBOX_MIRROR_DEBOUNCE_MS,
 	maintenanceMs: 1_000,
 	readBackoffMs: 5_000,
+	readBatchStreams: 128,
 	reconnectBaseMs: RECONNECT_BASE_MS,
 	frameStretch: 1,
 	nsCandidateModulus: NS_CANDIDATE_MODULUS,
