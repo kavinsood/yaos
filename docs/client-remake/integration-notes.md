@@ -218,6 +218,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   `visible` / `resume`, not on config-dir file events.
 - The client trusts the relay's `retryAfter` (capped at one day).
 
+- One deployed full-client run took 15.5 s for a fresh device bootstrap of
+  the small e2e vault (0.9 s locally); not investigated (one sample).
+
 **Host**
 - With IndexedDB missing in both carriers, the host stays in `starting` and
   retries with backoff; the UI shows the reason but there is no degraded mode.
@@ -252,7 +255,72 @@ _Filled in after the helper branches are merged; see the run log at the end._
 
 ## 7. End-to-end results
 
-_Filled in after the full-client e2e harness is merged._
+Harness: `e2e/client/fullClients.ts` (from the full-client e2e branch,
+f0b7c63 / 8939943). Each client is a complete `HostRuntime` over the
+simulated Obsidian vault/workspace/config dir/side files, with the real
+composed engine on the production ports (wsRelay, relayHttp, idbStorage on
+fake-indexeddb, suite-0 crypto), the inline carrier and real timers; 3 clients
+plus a 4th device for bootstrap. Every scenario ends with a byte-identical
+check of every file and every synced `.obsidian` file on every client, and
+clean engine/host state. `smoke.ts` (RelayPort adapters) and `engines.ts`
+(three headless LogEngines) are the WP-C e2e suites, still run.
+
+```sh
+URL=$(zsh scripts/relay-dev/start-local.sh --fresh | tail -1)
+node --import jiti/register e2e/client/fullClients.ts --host "$URL" --label local
+node --import jiti/register e2e/client/smoke.ts --host "$URL" --label local
+node --import jiti/register e2e/client/engines.ts --host "$URL" --label local --relay-restart
+zsh scripts/relay-dev/stop-local.sh
+```
+
+Scenarios: 1 fresh-vault creates; 2 disk / API / editor edits and concurrent
+merges; 3 file and folder renames and deletes, including open views across a
+remote rename and delete; 4 binary attachments (40 KB, 300 KB, 2 MB, modify);
+5 `.obsidian` settings; 6 offline edits, offline typing in a bound editor and
+reconnect; 7 relay process restart (local only); 8 fresh device bootstrap,
+restart from IndexedDB and offline start.
+
+| Run | Tree | Result |
+|---|---|---|
+| full-client, local relay (`--fresh`) | d2b5156 | 53/53 |
+| smoke (adapters), local | d2b5156 | 56/56 |
+| engines (`--relay-restart`), local | d2b5156 | 27/27 |
+| full-client, deployed `yaos-relay2-scratch-3` (operator context) | 8939943 | 50/50 (scenario 7 skipped: remote) |
+
+Latencies (ms) from the full-client runs, p50 / p95 (n). The host watcher
+delay is 100 ms, the editor coalesce 16 ms; the clients and the local relay
+share one laptop, which also ran the sim sweeps during the local run.
+
+| Metric | Local | Deployed |
+|---|---|---|
+| start_to_clean | 1146 (1) | 1985 (1) |
+| create_to_peer | 730 / 734 (18) | 889 / 1203 (18) |
+| burst20_create_converge | 1124 (1) | 1322 (1) |
+| disk_edit_to_peer | 525 / 526 (10) | 573 / 801 (10) |
+| edit_to_peer | 423 / 425 (10) | 512 / 817 (10) |
+| typing_to_peer_view | 122 / 124 (10) | 171 / 183 (10) |
+| typing_to_peer_disk | 458 / 466 (10) | 514 / 827 (10) |
+| rename_to_peer | 426 / 426 (4) | 502 / 502 (4) |
+| folder_rename_to_peer | 430 (1) | 518 (1) |
+| delete_to_peer | 426 / 463 (10) | 558 / 698 (10) |
+| attachment_to_peer | 886 / 7013 (14) | 1613 / 8037 (14) |
+| attachment_300k_to_peer | 676 / 676 (2) | 1914 / 1914 (2) |
+| attachment_2m_to_peer | 7054 / 7054 (2) | 8366 / 8366 (2) |
+| attachment_40k_to_peer | 886 / 900 (8) | 1608 / 1687 (8) |
+| attachment_modify_to_peer | 623 / 623 (2) | 1543 / 1543 (2) |
+| settings_to_peer | 318 / 327 (8) | 380 / 383 (8) |
+| reconnect_converge | 2222 (1) | 3687 (1) |
+| relay_outage | 2895 (1) | - |
+| relay_restart_reconnect | 252 (1) | - |
+| relay_restart_converge | 2847 (1) | - |
+| fresh_bootstrap | 917 (1) | 15450 (1) |
+| restart_from_idb_converge | 1419 (1) | 2582 (1) |
+| offline_start_reconnect_converge | 1404 (1) | 2079 (1) |
+
+`attachment_2m` is dominated by chunked upload through the log (no R2 in
+these relay configs, so blobs travel as `x:` chunks; `blobPath` = `log`).
+The deployed fresh bootstrap (15.5 s, one sample, against 0.9 s locally) was
+not investigated; it is listed under gaps.
 
 ## 8. Bundle
 
