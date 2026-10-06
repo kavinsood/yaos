@@ -41,7 +41,9 @@ test("§k.2 rules", () => {
 	assert.equal(check("host/engineHost.ts", `import { LogEngine } from "../engine/runtime/engine";`).errors.length, 1);
 	assert.equal(check("host/engineHost.ts", `import { x } from "../engine/body/handles";`).errors.length, 1);
 	assert.equal(check("host/plugin.ts", `import { createEngine } from "../engine/__standins__/engine";`).errors.length, 1, "stand-ins are gone");
-	assert.equal(check("host/plugin.ts", `import src from "virtual:yaos-engine-worker";`).errors.length, 0);
+	assert.equal(check("host/plugin.ts", `import src from "virtual:yaos-engine-worker";`).errors.length, 1, "the worker string module is gone (D2)");
+	assert.equal(check("host/entry.ts", `const w = require("../engine/workerMain");`).errors.length, 0, "the bundle entry starts the worker engine");
+	assert.equal(check("host/plugin.ts", `const w = require("../engine/workerMain");`).errors.length, 1, "only the bundle entry");
 	assert.equal(check("host/plugin.ts", `import { EditorView } from "@codemirror/view";`).errors.length, 0);
 	assert.equal(check("host/plugin.ts", `import { readFile } from "node:fs";`).errors.length, 1);
 	assert.equal(check("host/binding.ts", `import { SimVault } from "../sim/vault";`).errors.length, 1, "only tests import sim");

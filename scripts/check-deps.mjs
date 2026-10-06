@@ -10,9 +10,6 @@ import { fileURLToPath } from "node:url";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SRC = join(ROOT, "src");
 
-/** Virtual module the esbuild config resolves to the bundled engine worker source. */
-export const WORKER_SOURCE_MODULE = "virtual:yaos-engine-worker";
-
 const BROWSER_GLOBALS = [
 	["indexedDB", /\bindexedDB\b/],
 	["WebSocket", /\bWebSocket\b/],
@@ -143,9 +140,11 @@ function checkInternal(file, area, target, tArea, typeOnly, spec, line, err, war
 		case "host":
 			if (["core", "ports", "protocol", "host"].includes(tArea)) return;
 			if (tArea === "engine") {
-				// Deviation from DESIGN §k.2 (integration-notes): the inline-fallback entry is the composed web engine.
+				// Deviations from DESIGN §k.2 (integration-notes D2): the inline-fallback entry is the composed web
+				// engine, and the bundle entry starts the worker's engine (main.js is also the worker script).
 				if (target === "engine/adapters/webEngine") return;
-				return err(line, `host/** may import from engine/ only engine/adapters/webEngine.ts: ${spec}`);
+				if (target === "engine/workerMain" && file === "host/entry.ts") return;
+				return err(line, `host/** may import from engine/ only engine/adapters/webEngine.ts (and host/entry.ts engine/workerMain.ts): ${spec}`);
 			}
 			return err(line, `host/** must not import ${tArea}/**: ${spec}`);
 		default:
@@ -164,7 +163,7 @@ function checkPackage(area, spec, typeOnly, line, err, file) {
 	}[area];
 	if (!allowed) return err(line, `unknown source area ${area}`);
 	if (area === "ports" && pkg === "yjs" && typeOnly && file === "ports/workspace.ts") return;
-	if (area === "host" && (spec === WORKER_SOURCE_MODULE || pkg.startsWith("@codemirror/"))) return;
+	if (area === "host" && pkg.startsWith("@codemirror/")) return;
 	if (spec.startsWith("node:")) return err(line, `node built-in in shipped code: ${spec}`);
 	if (!allowed.includes(pkg)) err(line, `${area}/** must not import package ${spec}`);
 }

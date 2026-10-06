@@ -1,16 +1,16 @@
 /**
  * YAOS plugin entry (main thread). Wires the Obsidian adapters, the engine
- * carriers (Blob-URL worker from `virtual:yaos-engine-worker`, inline
- * fallback), the HostRuntime (through YaosController) and the UI.
- * The inline carrier runs the same composed engine as the worker
- * (engine/adapters/webEngine.ts) on the main thread.
+ * carriers (Blob-URL worker started from this bundle's own source, see
+ * bundleSource.ts; inline fallback), the HostRuntime (through YaosController)
+ * and the UI. The inline carrier runs the same composed engine as the worker
+ * (engine/adapters/webEngine.ts) on the main thread. Loaded through entry.ts.
  */
 
 import { Notice, Platform, Plugin } from "obsidian";
-import workerSource from "virtual:yaos-engine-worker";
 import { createWebEngine } from "../engine/adapters/webEngine";
 import { createInlinePair } from "../protocol/inlineTransport";
 import { createWorkerHostTransport, type WorkerLike } from "../protocol/workerTransport";
+import { workerScript } from "./bundleSource";
 import { attachCollab, collabCompartmentExtension, editorViewOf } from "./collab";
 import { ObsidianConfigDir } from "./configDir";
 import type { EngineCarrier } from "./engineHost";
@@ -27,9 +27,11 @@ import { registerUi } from "./ui/registerUi";
 
 function workerCarrier(): EngineCarrier | null {
 	if (typeof Worker === "undefined" || typeof Blob === "undefined" || typeof URL.createObjectURL !== "function") return null;
+	const script = workerScript();
+	if (script === null) return null;
 	let url: string | null = null;
 	try {
-		url = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));
+		url = URL.createObjectURL(new Blob([script], { type: "text/javascript" }));
 		const worker = new Worker(url, { name: "yaos-engine" });
 		const transport = createWorkerHostTransport(worker as unknown as WorkerLike);
 		const u = url;
