@@ -5,7 +5,7 @@ import { sha256Hex } from "./sha256";
 import { utf8Decode, utf8Encode, utf8Length } from "./utf8";
 import { canonicalizeMarkdown, exactFingerprint, markdownContentHash, markdownTextFromBytes } from "./markdownLf";
 import {
-	canonicalCanvasBytes, canvasContentHash, canvasFromMergeText, canvasToMergeText, formatCanvasText,
+	canonicalCanvasBytes, canvasContentHash, canvasFromMergeText, canvasJsonValue, canvasLogicalHash, canvasToMergeText, formatCanvasText,
 	parseCanvasBytes, parseCanvasText, rankCanvasInFileOrder,
 } from "./canvasCanonical";
 import { initialCanvasRanks, rankBetween, reconcileCanvasRanks } from "./canvasOrdering";
@@ -113,7 +113,29 @@ test("canvas merge text round-trips and is one record per line", () => {
 	assert.deepEqual(canonicalCanvasBytes(back!.data), canonicalCanvasBytes(parsed.data));
 	assert.equal(canvasFromMergeText(text.replace('"node"', '"nod"')), null);
 	assert.equal(canvasFromMergeText(text + text.split("\n")[1] + "\n"), null, "duplicate node id");
-	assert.equal(canvasFromMergeText(text.split("\n").slice(1).join("\n")), null, "doc line missing");
+	const lines = text.split("\n");
+	assert.ok(lines[lines.length - 2]!.startsWith('{"doc":'), "doc line is last");
+	assert.equal(canvasFromMergeText(lines.filter((l) => !l.startsWith('{"doc":')).join("\n")), null, "doc line missing");
+	// Order-agnostic: a doc line first parses the same.
+	const docFirst = [lines[lines.length - 2], ...lines.slice(0, -2)].join("\n") + "\n";
+	assert.equal(canvasToMergeText(canvasFromMergeText(docFirst)!), text);
+});
+
+test("canvas logical hash: empty canvas = empty content; formatting and dangling edges ignored", () => {
+	const empty = sha256Hex(new Uint8Array(0));
+	assert.equal(canvasContentHash(utf8Encode("")), empty);
+	assert.equal(canvasContentHash(utf8Encode('{"nodes":[],"edges":[]}')), empty);
+	assert.equal(canvasContentHash(utf8Encode("{\n  \"nodes\": []\n}\n")), empty);
+	assert.notEqual(canvasContentHash(utf8Encode('{"x":1}')), empty, "root fields are content");
+	const parsed = parseCanvasText(JSON.stringify(SAMPLE));
+	assert.equal(parsed.kind, "valid");
+	if (parsed.kind !== "valid") return;
+	assert.equal(canvasLogicalHash(parsed.data), canvasContentHash(utf8Encode(formatCanvasText(parsed.data))));
+	const dangling = { ...parsed.data, edges: new Map(parsed.data.edges), edgeOrder: [...parsed.data.edgeOrder, "zz"] };
+	dangling.edges.set("zz", { id: "zz", endpoints: { fromNode: "a", toNode: "gone" }, decorations: {}, extensions: {} });
+	assert.equal(canvasLogicalHash(dangling), canvasLogicalHash(parsed.data));
+	assert.equal(canvasJsonValue({ a: [1, Infinity] }), undefined);
+	assert.equal(JSON.stringify(canvasJsonValue({ a: [1, "x"] })), '{"a":[1,"x"]}');
 });
 
 test("canvas ranks", () => {

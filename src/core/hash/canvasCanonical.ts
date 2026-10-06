@@ -8,8 +8,12 @@
  *  - formatCanvasBytes: Obsidian's disk formatting, JSON.stringify(_, null, "\t")
  *    (DESIGN §j.2; legacy used 2 spaces + "\n", see wp-b-notes deviations).
  *  - canvasToMergeText / canvasFromMergeText: the record-per-line text the ONE
- *    MergeFn runs over (first line = root fields, then one line per node and per
- *    edge in (rank, id) order).
+ *    MergeFn runs over (one line per node, then per edge, in (rank, id) order;
+ *    the root-fields line last).
+ *  - canvasLogicalHash: the canvas ContentHash. The empty canvas (no root
+ *    fields, no nodes, no visible edges) hashes like empty content (sha256 of
+ *    zero bytes), so the planner's "createSize = 0" test and the born-empty
+ *    synced record work for canvases as for markdown "".
  */
 
 import type { ContentHash } from "../types";
@@ -123,6 +127,11 @@ function checkedJsonValue(value: unknown, depth = 0): JsonValue | undefined {
 		result[key] = checked;
 	}
 	return result;
+}
+
+/** JSON-checked copy of an arbitrary value (finite numbers, depth limit), or undefined. */
+export function canvasJsonValue(value: unknown): JsonValue | undefined {
+	return checkedJsonValue(value);
 }
 
 function oversized(limit: CanvasLimitName, measured: number): CanvasParseResult {
@@ -400,7 +409,20 @@ function parseCanvasValue(raw: unknown): CanvasParseResult {
  */
 export function canvasContentHash(bytes: Uint8Array): ContentHash {
 	const parsed = parseCanvasBytes(bytes);
-	return sha256Hex(parsed.kind === "valid" ? parsed.canonicalBytes : bytes) as ContentHash;
+	return parsed.kind === "valid" ? hashCanonical(parsed.canonicalBytes) : sha256Hex(bytes) as ContentHash;
+}
+
+const EMPTY_CANONICAL = '{"edges":[],"nodes":[]}';
+const EMPTY_HASH = sha256Hex(new Uint8Array(0)) as ContentHash;
+
+function hashCanonical(canonical: Uint8Array): ContentHash {
+	if (canonical.byteLength === EMPTY_CANONICAL.length && utf8Decode(canonical) === EMPTY_CANONICAL) return EMPTY_HASH;
+	return sha256Hex(canonical) as ContentHash;
+}
+
+/** Logical ContentHash of parsed canvas data (dangling edges dropped); the empty canvas = hash of empty content. */
+export function canvasLogicalHash(data: CanvasSemanticData): ContentHash {
+	return hashCanonical(canonicalCanvasBytes(data));
 }
 
 // ---------------------------------------------------------------------------
@@ -424,19 +446,23 @@ function rankedIds(ids: Iterable<string>, ranks: ReadonlyMap<string, string>): s
 }
 
 /**
- * Line 1: {"doc":{...root fields}}. Then {"node":{...},"rank":r} per node and
- * {"edge":{...},"rank":r} per edge, each sorted by (rank, id). Every line ends
- * with "\n". JSON escapes newlines, so a record is always exactly one line.
+ * {"node":{...},"rank":r} per node, then {"edge":{...},"rank":r} per edge, each
+ * sorted by (rank, id), then {"doc":{...root fields}} as the LAST line. Every
+ * line ends with "\n"; JSON escapes newlines, so a record is exactly one line.
+ * The doc line goes last because the diff3 treats two hunks that both reach
+ * end-of-file as overlapping: with a record line last, two devices appending
+ * different nodes/edges would always conflict.
  */
 export function canvasToMergeText(ranked: CanvasRanked): string {
 	const { data } = ranked;
-	const lines: string[] = [canonicalJson({ doc: Object.assign(Object.create(null), data.rootFields) as JsonObject })];
+	const lines: string[] = [];
 	for (const id of rankedIds(data.nodes.keys(), ranked.nodeRanks)) {
 		lines.push(canonicalJson({ node: canvasNodeJson(data.nodes.get(id)!), rank: ranked.nodeRanks.get(id) ?? null }));
 	}
 	for (const id of rankedIds(data.edges.keys(), ranked.edgeRanks)) {
 		lines.push(canonicalJson({ edge: canvasEdgeJson(data.edges.get(id)!), rank: ranked.edgeRanks.get(id) ?? null }));
 	}
+	lines.push(canonicalJson({ doc: Object.assign(Object.create(null), data.rootFields) as JsonObject }));
 	return lines.map((line) => `${line}\n`).join("");
 }
 
