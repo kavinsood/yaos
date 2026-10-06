@@ -8,7 +8,7 @@ import {
 	MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_MAGIC, SYNCED_MIRROR_MAGIC,
 	type OutboxMirror, type OutboxMirrorFrame, type OutboxRecord, type OutboxState, type SyncedMirror, type SyncedMirrorEntry,
 } from "../store/schema";
-import { CodecError, Writer, concatBytes, fromHex } from "../sync/__standins__/bytes";
+import { CodecError, Writer, concatBytes, hexToBytes } from "../../core/codec/lib0";
 import {
 	decodeOutboxMirror, decodeSyncedMirror, encodeOutboxMirror, encodeSyncedMirror, mirrorFrameSize, nextMirrorSlot,
 	pickOutboxMirror, pickSyncedMirror, selectMirrorFrames, toMirrorFrame,
@@ -109,7 +109,7 @@ interface Forge {
 
 function outboxBody(m: OutboxMirror, forge: Forge = {}): Uint8Array {
 	const w = new Writer();
-	w.bytes(forge.magic ?? OUTBOX_MIRROR_MAGIC).u8(forge.version ?? MIRROR_FORMAT_VERSION);
+	w.raw(forge.magic ?? OUTBOX_MIRROR_MAGIC).u8(forge.version ?? MIRROR_FORMAT_VERSION);
 	w.varstring(m.vaultId).varstring(m.vaultEpoch).varstring(m.deviceId).varuint(m.generation).varuint(m.writtenAtMs);
 	w.varuint(m.frames.length + (forge.countDelta ?? 0));
 	m.frames.forEach((f, i) => {
@@ -122,21 +122,21 @@ function outboxBody(m: OutboxMirror, forge: Forge = {}): Uint8Array {
 		else w.u8(1).varstring(f.adoptOf.deviceId).varstring(f.adoptOf.clientFrameId);
 		w.varbytes(f.sealed);
 	});
-	if (forge.trailing) w.bytes(forge.trailing);
+	if (forge.trailing) w.raw(forge.trailing);
 	return w.finish();
 }
 
 function syncedBody(m: SyncedMirror, forge: Forge = {}): Uint8Array {
 	const w = new Writer();
-	w.bytes(forge.magic ?? SYNCED_MIRROR_MAGIC).u8(forge.version ?? MIRROR_FORMAT_VERSION);
+	w.raw(forge.magic ?? SYNCED_MIRROR_MAGIC).u8(forge.version ?? MIRROR_FORMAT_VERSION);
 	w.varstring(m.vaultId).varstring(m.vaultEpoch).varstring(m.deviceId).varuint(m.generation).varuint(m.writtenAtMs);
 	w.varuint(m.nsCoversSeq).varuint(m.entries.length + (forge.countDelta ?? 0));
 	m.entries.forEach((e, i) => {
 		const code = KIND_CODES[e.kind];
-		w.varstring(e.docId).varstring(e.path).u8(forge.kindCode ? forge.kindCode(i, code) : code).bytes(fromHex(e.contentHash));
+		w.varstring(e.docId).varstring(e.path).u8(forge.kindCode ? forge.kindCode(i, code) : code).raw(hexToBytes(e.contentHash));
 		w.varuint(e.nsTouchSeq).varuint(e.bodyRemoteSeq).varuint(e.blobRev);
 	});
-	if (forge.trailing) w.bytes(forge.trailing);
+	if (forge.trailing) w.raw(forge.trailing);
 	return w.finish();
 }
 
@@ -360,8 +360,8 @@ describe("synced mirror codec", () => {
 
 	it("rejects invalid UTF-8 in a path", async () => {
 		const w = new Writer();
-		w.bytes(SYNCED_MIRROR_MAGIC).u8(1).varstring("v").varstring("e").varstring("d").varuint(1).varuint(1).varuint(0).varuint(1);
-		w.varstring("doc").varbytes(new Uint8Array([0xc3, 0x28])).u8(1).bytes(fromHex(HASH_A)).varuint(0).varuint(0).varuint(0);
+		w.raw(SYNCED_MIRROR_MAGIC).u8(1).varstring("v").varstring("e").varstring("d").varuint(1).varuint(1).varuint(0).varuint(1);
+		w.varstring("doc").varbytes(new Uint8Array([0xc3, 0x28])).u8(1).raw(hexToBytes(HASH_A)).varuint(0).varuint(0).varuint(0);
 		assert.equal(await decodeSyncedMirror(withChecksum(w.finish()), sha), null);
 	});
 });

@@ -376,11 +376,8 @@ export function tailRange(stream: StreamName, afterSeq: Seq = 0, throughSeq: Seq
 // Side-file mirrors (DESIGN §e.4). Written by the host on the engine's request.
 // ---------------------------------------------------------------------------
 
-/** "YAOSOBX1" */
-export const OUTBOX_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x4f, 0x42, 0x58, 0x31]);
-/** "YAOSSYN1" */
-export const SYNCED_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x53, 0x59, 0x4e, 0x31]);
-export const MIRROR_FORMAT_VERSION = 1;
+/** Byte format: core/codec/mirrors.ts (the shapes below are assignable to its OutboxMirrorData / SyncedMirrorData). */
+export { MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_MAGIC, SYNCED_MIRROR_MAGIC } from "../../core/codec/mirrors";
 
 export interface OutboxMirrorFrame {
 	readonly clientFrameId: ClientFrameId;
