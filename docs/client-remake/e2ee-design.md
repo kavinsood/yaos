@@ -450,7 +450,7 @@ pre-restore frames from the abandoned timeline into the new epoch. This is accep
   - every relay payload (`ns`, `cfg`, `b:`, `c:`, `x:`);
   - every checkpoint;
   - every blob: attachments, oversize body updates behind `bodyUpdateRef`, and uploaded snapshot zips
-    (`snapshotJob.ts:129-130`);
+    (`src/engine/snapshots/snapshotJob.ts:129-130`);
   - the key material inside `k` records (§11).
 - **Visible to the server:**
   - stream names: `b:`/`c:` + a random docId, `x:` + a keyed address, plus `ns`, `cfg`, `k`;
@@ -509,10 +509,10 @@ pre-restore frames from the abandoned timeline into the new epoch. This is accep
 - ns entries, refs and snapshot records keep the **plaintext sha256**. The address is recomputed with the
   vault-lifetime kAddr (§5.1) in any epoch.
 - `x:` streams become **`x:<address>`** (66 bytes, under the 256-byte cap in `server/src/streams/protocol.ts:16`).
-  `blobChunkStream(hash)` becomes `blobChunkStream(address)` (`src/engine/body/frames.ts:84`). The `blobChunk`
+  `blobChunkStream(hash)` (`src/core/types.ts:66`) becomes `blobChunkStream(address)` at every caller (`src/engine/body/frames.ts:84,129`, `src/engine/runtime/blobChunks.ts:33,48,75`). The `blobChunk`
   content still carries the sha256, now sealed.
 - **Dedupe** is per vault. Identical plaintexts get identical addresses, so `exists` skips the upload
-  (`frames.ts:76-77`, `blobQueue.ts:195-205`). There is no cross-vault dedupe: kAddr differs per vault.
+  (`src/engine/body/frames.ts:75-77`, `src/engine/blobs/blobQueue.ts:195-198`). There is no cross-vault dedupe: kAddr differs per vault.
 - **Accepted leak.** Equality of two attachments inside one vault, and blob count and bucketed sizes (§2.2).
 - Alternative: convergent per-blob keys `K = H(plaintext)`. Rejected: they allow confirmation of guessed files by
   anyone with the ciphertext, and add a key per blob for no single-user gain.
@@ -562,3 +562,112 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
        the put succeeds").
 - Alternative: server refcounts. Rejected: the server cannot see references under E2EE, and keeping refs
   consistent across DOs would be a distributed transaction.
+
+## 11. Keyring stream `k`
+
+The keyring is an ordinary relay stream named `k`. The relay treats stream names as opaque, so it needs no server
+change (`server/src/streams/protocol.ts:16`; server ask A9). `streamClass` gains `"keyring"` (`src/core/types.ts:74`).
+`k` frames carry a **k record** as payload, not an envelope. `k` has no checkpoints: a vault sees a handful of
+records in its lifetime, and each is under 256 bytes.
+
+### 11.1 Record layout
+
+```
+u8       recordFormat = 1
+u8       cryptoSuite  = 1
+varuint  e            epoch this record introduces (≥ 1)
+u8       kind         1 genesis | 2 roll | 3 revoke
+varuint  prevEpoch    0 for genesis, else e − 1
+bytes16  kcv          kcv(e) (§5.2)
+varbytes nextWrap     roll only:            AES-GCM(kWrap_prevEpoch, K_e)
+varbytes prevWrap     roll and revoke:      AES-GCM(kWrap_e, K_prevEpoch)
+varbytes recoveryWrap genesis and revoke:   AES-GCM(KEK_RK, K_e)
+```
+
+Absent wraps are empty `varbytes`. Every wrap is `nonce(12) ‖ ct(32) ‖ tag(16)`.
+
+| Kind | Who can obtain K_e from it | Purpose |
+|---|---|---|
+| genesis | RK holders (`recoveryWrap`), QR holders (direct) | Enable (§15). Anchors the RK chain |
+| roll | Holders of K_{e−1} (`nextWrap`), RK holders via the chain | Nonce-budget roll (§4.2). Automatic on every device |
+| revoke | RK holders, QR holders. **Not** holders of K_{e−1}, by design | Revocation (§14). A device left out cannot follow |
+
+- **Backward chain.** `prevWrap` lets anyone holding K_e recover every older key: old checkpoints, old blobs and
+  K_1 (for kAddr and kDiag).
+- **RK path.** Unwrap the newest genesis or revoke record's `recoveryWrap`, then follow `nextWrap` forward through
+  later rolls and `prevWrap` backward to K_1.
+
+### 11.2 Wrap AAD
+
+```
+"yaos/k2" ‖ u8 recordFormat ‖ u8 cryptoSuite ‖ varstring vaultId ‖ varuint e ‖ u8 kind ‖ varuint prevEpoch
+  ‖ bytes16 kcv ‖ u8 role            role: 1 next | 2 prev | 3 recovery
+```
+
+- The AAD binds the role, so a wrap cannot be moved to another field, record or vault.
+- vaultEpoch is not bound, for the same reason as §7.2: records must survive a restore and be re-published
+  verbatim (§11.5).
+
+### 11.3 Validity and winner selection
+
+Records are processed in seq order. A device holds a **key set** H (SecretStorage, §6). Each epoch has a winning
+record: the first valid one, with these rules.
+
+- **Validity is judged against the keys this device holds.** The recovered key must:
+  - match `kcv`;
+  - open `prevWrap` (if present) to a key whose kcv matches the winner for prevEpoch.
+
+  How the device gets K_e:
+  - roll: it holds K_{e−1} (the winner's key);
+  - genesis and revoke: it holds K_e directly (QR), or RK is in hand.
+
+  A record the device cannot evaluate is **pending**, not invalid.
+- **Revoke outranks roll for the same epoch, whatever the seq order.** A roll for epoch e is not adopted while any
+  record of kind revoke for an epoch ≥ e exists, pending or valid.
+  - This stops a revoked device colluding with the server. It holds K_{r−1}, and could otherwise forge a roll for
+    epoch r that every device holding K_{r−1} would accept. It cannot forge a revoke record, because that needs a
+    `recoveryWrap` under KEK_RK.
+- **Winners are sticky.** A winner, once decided, is stored with its record in SecretStorage (`records`, §6.1)
+  and never re-decided. Later records for the same epoch are ignored (event `keyring/duplicate`), even if valid.
+  Byte-identical re-publishes are a no-op.
+- **Keys entered out of band are authoritative.** If a QR key or an RK unwrap for epoch e conflicts with `k`'s
+  record for e (kcv mismatch), the record is rejected (event `keyring/conflict`).
+- **Phase `key-missing`** (§9.3) is entered when a pending genesis or revoke record has an epoch above every key
+  held, or when an ns/cfg row names an unknown epoch. While in it, the device seals nothing. Leaving it needs a QR
+  or RK re-key (§12, §13).
+- **What a hostile server can do with `k`** (§2.3):
+  - append garbage records: a device ignores ones it can evaluate, and ones it cannot may push it into
+    `key-missing` (denial of service only);
+  - withhold or reorder records: delays only, since every honest record is self-validating;
+  - fork views between devices: a non-goal (§2.1). The fork case for revocation is in §14.3.
+- **Catch-up order** is `k` to head, then ns, cfg, bodies (§9.3). Live `k` rows are processed before anything
+  queued behind them.
+
+### 11.4 Roll
+
+1. Trigger (§4.2). Let e = (highest winning epoch) + 1.
+2. Generate K_e with `getRandomValues`. Build the roll record. Post `keyringChanged {pending: e}` so main persists
+   K_e **before** the append, and a crash after the commit cannot lose the key.
+3. Append the record to `k` and wait for its receipt at seq s.
+4. Read `k` through s.
+   - If this device's record is the winner for e, it adopts e: new seals use e.
+   - If another device won (a concurrent roll), it discards K_e and adopts the winner's key from `nextWrap`.
+5. Other devices adopt e when they read the record.
+
+Rows already sealed under e−1 stay valid. Outbox frames are not re-sealed: a roll is hygiene, not a compromise.
+
+- Alternative: a deterministic ratchet `K_e = HKDF(K_{e−1})`. Rejected: no record would be needed, but everyone
+  holding any old key could derive every future key, which makes revocation impossible.
+
+### 11.5 Re-publish after reset or restore
+
+- A reset empties every stream, and a restore to T drops records committed after T (DECISIONS D8b, `server/src/vault/host.ts:686`, `:767`).
+- On the first VAULT_READY in a new vaultEpoch, a device reads `k` to head. It then appends, in epoch order,
+  every stored record whose epoch has no record in `k`.
+- The bytes are verbatim, so the records validate exactly as before. Concurrent re-publishes from two devices
+  produce byte-identical duplicates, which are harmless.
+- Every device keeps all records (§6.1), so any device can re-publish. A device restoring from RK alone needs the
+  genesis or a revoke record to be present. After a reset where no device survives, the vault holds nothing
+  readable anyway.
+- **Genesis position.** Enable writes the genesis record when headSeq = 0 (§15). Readers do not rely on its
+  position: validity alone decides.
