@@ -124,18 +124,43 @@ export async function sRenames(x: FullCtx): Promise<void> {
 	x.R.check("old folder gone on peers", [b, c].every((p) => !p.vault.folderPaths().some((f) => f === "rn" || f.startsWith("rn/"))),
 		[b, c].map((p) => p.vault.folderPaths().filter((f) => f === "rn" || f.startsWith("rn/"))));
 
+	// A renames a file B has open in a bound editor: B's view follows and B's typing lands at the new path.
+	const vb = b.workspace.openFile("notes/deep/a/b/three.md")!;
+	await waitFor(() => vb.isBound(), "b view bound", 15_000);
+	t0 = performance.now();
+	a.vault.userRename("notes/deep/a/b/three.md", "notes/three-moved.md");
+	for (const ms of await reachPeers([b, c], "notes/three-moved.md", enc(a.vault.textOf("notes/three-moved.md") ?? "?"), t0)) x.R.record("rename_to_peer_ms", ms);
+	await waitFor(() => vb.path === "notes/three-moved.md", "b's open view follows the remote rename", 10_000);
+	vb.edit(vb.buffer.length, 0, "typed after remote rename\n");
+	await textReachesPeers([a, c], "notes/three-moved.md", "typed after remote rename", performance.now());
+	x.R.check("open view followed the remote rename and stayed bound", vb.isBound() && vb.path === "notes/three-moved.md");
+	await b.workspace.closeView(vb.viewId);
+
 	t0 = performance.now();
 	b.vault.userDelete("del/x.md");
 	for (const ms of await reachPeers([a, c], "del/x.md", null, t0)) x.R.record("delete_to_peer_ms", ms);
 	t0 = performance.now();
 	c.vault.userDelete("del/inner/y.md"); // the last file of the folder: Obsidian deletes the folder's files
 	for (const ms of await reachPeers([a, b], "del/inner/y.md", null, t0)) x.R.record("delete_to_peer_ms", ms);
+	t0 = performance.now();
+	c.vault.userDelete("rn2/sub/file3.md"); // c got this path from a's folder rename: delete after a remote rename
+	for (const ms of await reachPeers([a, b], "rn2/sub/file3.md", null, t0)) x.R.record("delete_to_peer_ms", ms);
 	await settle(x, null);
 	const trashOk = (p: FullClient, path: string) => p.vault.trashed.some((r) => r.path === path && r.mode === "obsidian-trash");
-	x.R.check("deleted files went to the Obsidian trash on peers", trashOk(a, "del/x.md") && trashOk(c, "del/x.md") && trashOk(a, "del/inner/y.md") && trashOk(b, "del/inner/y.md"),
-		x.clients.map((p) => p.vault.trashed.map((r) => `${r.path}:${r.mode}`)));
-	x.R.check("trash calls only for the deletes", delta(0, "trash") === 2 && delta(1, "trash") === 1 && delta(2, "trash") === 1, [0, 1, 2].map((i) => delta(i, "trash")));
-	x.R.check("deleted files gone everywhere", x.clients.every((p) => !p.vault.hasFile("del/x.md") && !p.vault.hasFile("del/inner/y.md")));
+	x.R.check("deleted files went to the Obsidian trash on peers", trashOk(a, "del/x.md") && trashOk(c, "del/x.md") && trashOk(a, "del/inner/y.md") && trashOk(b, "del/inner/y.md")
+		&& trashOk(a, "rn2/sub/file3.md") && trashOk(b, "rn2/sub/file3.md"), x.clients.map((p) => p.vault.trashed.map((r) => `${r.path}:${r.mode}`)));
+	x.R.check("trash calls only for the deletes", delta(0, "trash") === 3 && delta(1, "trash") === 2 && delta(2, "trash") === 1, [0, 1, 2].map((i) => delta(i, "trash")));
+	x.R.check("deleted files gone everywhere", x.clients.every((p) => !p.vault.hasFile("del/x.md") && !p.vault.hasFile("del/inner/y.md") && !p.vault.hasFile("rn2/sub/file3.md")));
+
+	// A deletes a file B has open in a bound editor: it goes to B's trash and is not resurrected.
+	const vd = b.workspace.openFile("moved/solo-renamed.md")!;
+	await waitFor(() => vd.isBound(), "b view bound", 15_000);
+	t0 = performance.now();
+	a.vault.userDelete("moved/solo-renamed.md");
+	for (const ms of await reachPeers([b, c], "moved/solo-renamed.md", null, t0)) x.R.record("delete_to_peer_ms", ms);
+	await settle(x, null);
+	x.R.check("file open on a peer deleted (trash, view closed, not resurrected)", x.clients.every((p) => !p.vault.hasFile("moved/solo-renamed.md"))
+		&& trashOk(b, "moved/solo-renamed.md") && !b.workspace.views_().includes(vd));
 	noConflicts(x);
 }
 

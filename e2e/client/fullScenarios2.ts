@@ -62,9 +62,12 @@ export async function sOffline(x: FullCtx): Promise<void> {
 	const [a, b, c] = x.clients as [FullClient, FullClient, FullClient];
 	const one = "notes/one.md";
 	await settle(x, null);
+	const vb = b.workspace.openFile("notes/two.md")!;
+	await waitFor(() => vb.isBound(), "b view bound", 15_000);
 	a.setOnline(false);
 	b.setOnline(false);
 	await waitFor(() => [a, b].every((d) => d.vrt?.status().relay.connected === false), "a, b disconnected", 10_000);
+	vb.edit(0, 0, "offline typing on b\n"); // bound editor, offline
 	const base = (a.vault.textOf(one) ?? "").split("\n");
 	const ea = [...base];
 	ea[2] = `${ea[2]} (offline a)`;
@@ -76,6 +79,8 @@ export async function sOffline(x: FullCtx): Promise<void> {
 	b.vault.externalWrite(one, eb.join("\n"));
 	b.vault.userWrite("offline/b-new.md", "made offline on b\n");
 	b.vault.userDelete("burst/n01.md");
+	a.vault.userRename("journal/2026-10-06.md", "journal/renamed-offline.md"); // a renames, b edits the same file
+	b.vault.externalWrite("journal/2026-10-06.md", `${b.vault.textOf("journal/2026-10-06.md")}edited on b while a renamed it\n`);
 	c.vault.userWrite("offline/c-online.md", "made on c while a and b were offline\n");
 	c.vault.userWrite("notes/two.md", `${c.vault.textOf("notes/two.md")}c online edit\n`);
 	await sleep(3_000);
@@ -87,8 +92,13 @@ export async function sOffline(x: FullCtx): Promise<void> {
 	x.R.record("reconnect_converge_ms", performance.now() - t0);
 	const m = a.vault.textOf(one) ?? "";
 	x.R.check("offline edits to the same file merged", m.includes("(offline a)") && m.includes("(offline b)"), { text: m });
+	const two = a.vault.textOf("notes/two.md") ?? "";
+	x.R.check("offline editor typing merged with an online edit", two.startsWith("offline typing on b\n") && two.includes("c online edit") && vb.buffer === two, { text: two.slice(0, 200) });
+	await b.workspace.closeView(vb.viewId);
 	x.R.check("offline creates, rename and delete applied everywhere", x.clients.every((d) => d.vault.hasFile("offline/a-new.md") && d.vault.hasFile("offline/b-new.md")
 		&& d.vault.hasFile("offline/c-online.md") && d.vault.hasFile("offline/n00-renamed.md") && !d.vault.hasFile("burst/n00.md") && !d.vault.hasFile("burst/n01.md")));
+	x.R.check("offline rename on a + edit on b of the same file: one file, renamed, with the edit", x.clients.every((d) => !d.vault.hasFile("journal/2026-10-06.md")
+		&& (d.vault.textOf("journal/renamed-offline.md") ?? "").includes("edited on b while a renamed it")), x.clients.map((d) => [...d.vault.snapshot().keys()].filter((p) => p.startsWith("journal/"))));
 	noConflicts(x);
 }
 
@@ -122,7 +132,8 @@ export async function sRelayRestart(x: FullCtx): Promise<void> {
 /** 8. A new device with an empty vault receives everything; a client restarts from its IndexedDB. */
 export async function sBootstrapRestart(x: FullCtx): Promise<void> {
 	const [a, b] = x.clients as [FullClient, FullClient, FullClient];
-	await settle(x, null);
+	for (let i = 0; i < 150; i++) a.vault.userWrite(`bulk/f${Math.floor(i / 30)}/n${i}.md`, `bulk note ${i}\n${"text ".repeat(20 + (i % 40))}\n`);
+	await settle(x, null, 120_000);
 	const dev = await pairDevice(x.vault, "D3");
 	const d = x.newClient("d", dev);
 	const t0 = performance.now();
@@ -139,6 +150,7 @@ export async function sBootstrapRestart(x: FullCtx): Promise<void> {
 	const cursor = b.vrt?.log.c.repo.cursor.vaultSeq ?? 0;
 	const writes = b.vault.calls.write;
 	const starts = b.cursorAtStart.length;
+	b.vault.userWrite("restart/quit-right-after.md", "written on b right before quitting\n"); // before its event is even delivered
 	await b.stop();
 	x.clients.splice(x.clients.indexOf(b), 1);
 	a.vault.userWrite("restart/while-b-down.md", "written while b was down\n");
@@ -152,6 +164,7 @@ export async function sBootstrapRestart(x: FullCtx): Promise<void> {
 	const resumed = b.cursorAtStart[starts] ?? 0;
 	x.R.check("restart resumed from IndexedDB (cursor kept)", resumed >= cursor && cursor > 0, { before: cursor, atRestart: resumed });
 	x.R.check("restart rewrote only what changed while down", b.vault.calls.write - writes <= 2, { writes: b.vault.calls.write - writes });
+	x.R.check("a write right before quitting reached peers after the restart", x.clients.every((c) => c.vault.textOf("restart/quit-right-after.md") === "written on b right before quitting\n"));
 	const vb = b.workspace.openFile("notes/one.md")!;
 	await waitFor(() => vb.isBound(), "b view bound after restart", 15_000);
 	const t1 = performance.now();
@@ -159,5 +172,25 @@ export async function sBootstrapRestart(x: FullCtx): Promise<void> {
 	await Promise.all(x.clients.filter((c) => c !== b).map((c) => waitFor(() => (c.vault.textOf("notes/one.md") ?? "").includes("typed after restart"), `typing on ${c.name}`, 30_000, t1)));
 	await b.workspace.closeView(vb.viewId);
 	await settle(x, null);
+
+	// c quits, then starts again while offline (local DB only), edits, and comes back online.
+	const c = x.clients[2]!;
+	await c.stop();
+	x.clients.splice(x.clients.indexOf(c), 1);
+	c.setOnline(false);
+	const restarting = c.restart();
+	await waitFor(() => c.vrt !== null, "c runtime up while offline", 30_000);
+	c.vault.userWrite("restart/offline-start-c.md", "written on c after an offline start\n");
+	c.vault.userWrite("notes/two.md", `${c.vault.textOf("notes/two.md")}edited on c after an offline start\n`);
+	await sleep(2_000);
+	x.R.check("offline-started client uploaded nothing yet", !a.vault.hasFile("restart/offline-start-c.md"));
+	const to = performance.now();
+	c.setOnline(true);
+	await restarting;
+	x.clients.splice(2, 0, c);
+	await settle(x, null, 90_000);
+	x.R.record("offline_start_reconnect_converge_ms", performance.now() - to);
+	x.R.check("edits after an offline start reached every client", x.clients.every((d) => d.vault.hasFile("restart/offline-start-c.md")
+		&& (d.vault.textOf("notes/two.md") ?? "").includes("edited on c after an offline start")));
 	noConflicts(x);
 }
