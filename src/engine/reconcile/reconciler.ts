@@ -161,7 +161,8 @@ export class Reconciler {
 		}
 		this.env.heldOverwrites.length = 0;
 		const run = await runPlan(this.env, plan.ops);
-		if (ctx.localComplete) ctx.renames = [];
+		// Observed renames stay until inference could use them (it is off while ns is not ready).
+		if (ctx.localComplete && view.nsReady) ctx.renames = [];
 		let brake = plan.brake;
 		if (this.env.heldOverwrites.length > 0) {
 			const units = this.env.heldOverwrites.map((h) => ({ ops: [], destructive: "overwrite" as const, brakeKey: h.key, path: h.path }));

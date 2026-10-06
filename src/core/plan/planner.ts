@@ -28,11 +28,17 @@
  *     doc re-materializes as "live, absent, absent" instead of being deleted again.
  *   - An inferred/observed local rename emits nsRename + a syncedPut of the new
  *     path, so the next pass (overlay R at the new path) is consistent.
+ *   - An observed rename wins even when a new file already re-occupies the
+ *     source path (§f.6 asks "missing" only of hash inference): the doc moves,
+ *     and the file at the old path is planned as new once S has left it. Until
+ *     ns is ready (no inference) that file is not merged into the doc.
  *   - Remote-move target already on disk (crash between rename and synced
  *     update): adopt the path, no disk op.
  *   - Folder-casing-only remote moves (same pathKey, same leaf) are tolerated:
  *     synced takes R.path, the disk is left alone.
- *   - nsDelete waits while any fresh local file is unhashed (inference incomplete).
+ *   - A missing synced file is only judged "not renamed" (edit-beats-delete
+ *     diskMaterialize, or nsDelete) once inference can run: listing complete,
+ *     every fresh local file hashed, ns ready.
  *   - Blob materialization uses diskMaterialize (as in E4); fetchBlob is the
  *     overwrite of an existing file.
  *   - conflict-flood counts certain conflict copies: blob keep-both and no-base
@@ -230,6 +236,22 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 	}
 	const inferred = new Map<DocId, InferredRename>();
 	if (ctx.nsReady) for (const rn of inferRenames(missing, freshLocal, input.renames, input.localComplete, pk)) inferred.set(rn.docId, rn);
+	// Observed renames off a re-occupied source path (header): observed-only inference over the rest.
+	const renamedFrom = new Set(input.renames.map((e) => pk(e.from)));
+	const movedAway = new Set<DocId>();
+	if (ctx.nsReady && renamedFrom.size > 0) {
+		const reoccupied: SyncedEntry[] = [];
+		for (const id of docIds) {
+			const s = input.synced.get(id);
+			const r = input.remote.get(id);
+			if (s && r && r.state === "live" && r.pathKey === s.pathKey && renamedFrom.has(s.pathKey) && input.local.has(s.pathKey)) reoccupied.push(s);
+		}
+		const used = new Set([...inferred.values()].map((rn) => rn.to.pathKey));
+		for (const rn of inferRenames(reoccupied, freshLocal.filter((l) => !used.has(l.pathKey)), input.renames, false, pk)) {
+			inferred.set(rn.docId, rn);
+			movedAway.add(rn.docId);
+		}
+	}
 
 	// ---- content step for a synced live doc with a local file ------------------
 	interface Step { ops: PlannerOp[]; destructive: DestructiveKind | null; key: string }
@@ -348,9 +370,11 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 			return push([...prefix, ...renameOps, ...step.ops.filter((o) => o.op !== "syncedPut"), put], step.destructive, step.key, l2.path);
 		}
 		if (s.kind !== "blob" && (!r.body || !r.body.caughtUp)) return push([...prefix, waitOp(docId, "body-not-caught-up")]);
+		// "Not a rename" needs the inference inputs, for edit-beats-delete as for nsDelete: while ns
+		// is not ready inference is off, and re-materializing would undo the user's rename into a copy.
+		if (!input.localComplete || unhashedFresh || !ctx.nsReady) return push(prefix);
 		const Rc = s.kind === "blob" ? (r.blob?.rev ?? 0) !== s.blobRev : !versionEq(r.body!.version, s.bodyVersion);
 		if (Rc) return push([...prefix, { op: "diskMaterialize", docId, path: r.path, expect: { t: "absent" } }]); // edit beats delete
-		if (!input.localComplete || unhashedFresh || !ctx.nsReady) return push(prefix);
 		if (r.pendingLocal) return push([...prefix, waitOp(docId, "pending-ns")]);
 		push([...prefix, { op: "nsDelete", docId, baseBodySeq: baseBodySeq(r) }, drop(docId)], "nsDelete", brakeKey("nsDelete", docId, s.path, s.contentHash), s.path);
 	};
@@ -422,10 +446,12 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 			s = { ...(r ? restartAtCreate(s0, r.createHash) : s0), docId: r0.aliasOf };
 			handled.add(r0.aliasOf);
 		}
-		const found = localFor(s, r);
+		const found = movedAway.has(s.docId) ? { l: undefined, atRemote: false } : localFor(s, r);
 		const l = found.l;
 		if (l) claimed.add(l.pathKey);
 		if (l?.excluded) return push(prefix);
+		// The file at a path an observed rename left may be new: no merge into the doc before inference (ns ready).
+		if (l && !found.atRemote && !ctx.nsReady && renamedFrom.has(s.pathKey)) return push(prefix);
 		if (r?.body?.frozen) return push([...prefix, waitOp(s.docId, "frozen")]);
 		if (l && l.hash === null) return push([...prefix, { op: "needHash", path: l.path }]);
 		if (!r) return pruned(s, l, prefix);

@@ -110,6 +110,26 @@ test("local delete -> nsDelete; local rename -> nsRename (no disk ops)", async (
 	assert.equal(w.vault.trashed.length, 0);
 });
 
+/** Sim seed 21 (3 devices): renames while ns was not ready were undone or forgotten. */
+test("local rename while ns is not ready: no re-materialize, the observed rename is kept until ns is ready", async () => {
+	const { w, id } = await withDoc("a.md", "a\n");
+	w.log.nsReady = false;
+	w.log.remoteEdit(id, (t) => t.insert(0, "R")); // edit-beats-delete would bring a.md back
+	w.vault.userRename("a.md", "b.md");
+	await w.sync();
+	assert.deepEqual(w.vault.paths(), ["b.md"]);
+	w.vault.userWrite("a.md", "new\n"); // a new note at the old path
+	await w.sync();
+	w.log.nsReady = true;
+	await w.sync();
+	assert.equal(w.log.entry(id)?.path, "b.md", "the doc follows the observed rename");
+	assert.equal(w.vault.text("b.md"), "Ra\n");
+	const fresh = w.log.liveByPath(P("a.md"));
+	assert.ok(fresh && fresh !== id);
+	assert.equal(w.log.text(fresh), "new\n");
+	assert.deepEqual(w.conflictCopies(), []);
+});
+
 test("fingerprint precondition: user types during the merge write -> nothing lost, converges", async () => {
 	const { w, id } = await withDoc("m.md", "a\nb\nc\n");
 	w.log.remoteEdit(id, (t) => t.insert(0, "R\n"));

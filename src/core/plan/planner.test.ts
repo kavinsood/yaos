@@ -120,6 +120,36 @@ test("row live/present/absent: inferred rename -> nsRename + synced path; observ
 	assert.ok(!opsOf(partial).includes("nsDelete"));
 });
 
+test("row live/present/absent: edit-beats-delete waits for rename inference (ns not ready, listing partial, fresh unhashed)", () => {
+	// Sim seed 21 (3 devices): a local rename of a remotely edited doc while ns was not ready was
+	// re-materialized at the old path; the editor kept the renamed file bound to the old doc.
+	const edited = { remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] };
+	const renamed = { ...edited, local: [L("b.md", h("c0"))], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
+	assert.deepEqual(run(renamed, { nsReady: false }).ops, []);
+	assert.deepEqual(run({ ...edited, over: { localComplete: false } }).ops, []);
+	assert.deepEqual(run({ ...edited, local: [L("z.md", null)] }).ops, [{ op: "needHash", path: "z.md" }]);
+	// once ns is ready the observed rename wins: nsRename + reconcile at the new path
+	assert.deepEqual(opsOf(run(renamed)), ["nsRename", "reconcileContent"]);
+});
+
+test("observed rename wins over a new file at the source path; the new file is created once S has moved", () => {
+	// Sim seed 21: rename n2 -> r5, then a new n2.md before ns was ready. The doc stayed at n2.md, r5.md became a
+	// new doc, and the editor that followed the rename kept writing the old doc's text into r5.md.
+	const sc = { remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
+	const p = run({ ...sc, local: [L("a.md", h("c7")), L("b.md", h("c0"))] });
+	assert.deepEqual(opsOf(p), ["nsRename", "syncedPut"]);
+	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d1", path: "b.md" });
+	assert.equal(find(p, "syncedPut").entry.path, "b.md");
+	// not while ns is not ready, and never by hash alone
+	assert.deepEqual(run({ ...sc, local: [L("a.md", h("c7")), L("b.md", h("c0"))] }, { nsReady: false }).ops, []);
+	const byHash = run({ ...sc, over: {}, local: [L("a.md", h("c7")), L("b.md", h("c0"))] });
+	assert.ok(!opsOf(byHash).includes("nsRename"));
+	// next pass: S and R at b.md, the file at a.md is new
+	const next = run({ remote: [R("d1", "b.md")], synced: [S("d1", "b.md")], local: [L("a.md", h("c7")), L("b.md", h("c0"))] });
+	assert.deepEqual(opsOf(next), ["nsCreate", "reconcileContent"]);
+	assert.equal(find(next, "nsCreate").path, "a.md");
+});
+
 test("row live/present/absent: remote edited -> diskMaterialize (edit beats delete); else nsDelete + syncedDrop", () => {
 	const edited = run({ remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] });
 	assert.deepEqual(edited.ops, [{ op: "diskMaterialize", docId: "d1", path: "a.md", expect: { t: "absent" } }]);
