@@ -1,0 +1,23 @@
+src/engine/__standins__/docs.ts
+  s_1a35cb80c7073a::t_5b3c792fcb67c0 9,29,36
+src/engine/reconcile/mergeJob.ts
+  s_1a35cb80c7073a::t_58c9049f761a62 26,40,44
+src/host/binding.ts
+  s_1a35cb80c7073a::t_1c8eecac6777bd 43,157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4352b3f01d56e92fda35c3fe1c7f798f9c7f7538",
+  "prompts": {},
+  "sessions": {
+    "s_1a35cb80c7073a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a89afd77513d78071",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
