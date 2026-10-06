@@ -52,14 +52,14 @@ const D = "doc0000000000000000000" as DocId;
 const P = "a/pic.png" as VaultPath;
 const rnd = (n: number, seed = 1): Uint8Array => { const b = new Uint8Array(n); let x = seed; for (let i = 0; i < n; i++) { x = (x * 1103515245 + 12345) >>> 0; b[i] = x >>> 24; } return b; };
 
-async function make(opts: { store?: FakeStore | null; log?: FakeChunkLog | null } = {}) {
+async function make(opts: { store?: FakeStore | null; log?: FakeChunkLog | null; ahead?: { count: number; bytes: number } } = {}) {
 	const storage = new FakeStorage();
 	const clock = new FakeClock();
 	const crypto = new XorCrypto();
 	const store = opts.store === undefined ? new FakeStore() : opts.store;
 	const log = opts.log === undefined ? new FakeChunkLog() : opts.log;
 	const notices: string[] = [];
-	const open = async () => BlobQueue.open({ db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto, store, chunkLog: log, notice: (_l, c) => notices.push(c) });
+	const open = async () => BlobQueue.open({ db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto, store, chunkLog: log, notice: (_l, c) => notices.push(c), ahead: opts.ahead });
 	return { storage, clock, crypto, store, log, notices, q: await open(), reopen: open };
 }
 
@@ -216,4 +216,43 @@ test("concurrent uploads of one hash share one transfer", async () => {
 	const [a, b] = await Promise.all([q.upload({ hash, docId: D, path: P, bytes }), q.upload({ hash, docId: D, path: P, bytes })]);
 	assert.equal(a && b, true);
 	assert.equal(store!.puts, 1);
+});
+
+test("prefetch: the job's download takes the prefetched fetch; bounded by count and bytes; failures book like a download", async () => {
+	const store = new FakeStore();
+	let gets = 0;
+	const get = store.get.bind(store);
+	store.get = async (a) => { gets++; return get(a); };
+	const { q } = await make({ store, ahead: { count: 2, bytes: 10_000 } });
+	const blobs = [rnd(4000, 1), rnd(4000, 2), rnd(4000, 3), rnd(20_000, 4)].map((bytes) => ({ bytes, hash: sha256Hex(bytes) }));
+	for (const b of blobs) assert.equal(await q.upload({ hash: b.hash, docId: D, path: P, bytes: b.bytes }), true);
+	const req = (i: number) => ({ hash: blobs[i]!.hash, docId: D, path: P, size: blobs[i]!.bytes.length });
+	assert.equal(q.prefetch(req(0)), true);
+	assert.equal(q.prefetch(req(0)), true, "already ahead");
+	assert.equal(q.prefetch(req(3)), true, "larger than the whole budget: skipped, its job downloads it");
+	assert.equal(q.prefetch(req(1)), true);
+	assert.equal(q.prefetch(req(2)), false, "count bound");
+	await new Promise((r) => setTimeout(r, 0));
+	assert.equal(gets, 2);
+	assert.deepEqual(await q.download(req(0)), blobs[0]!.bytes);
+	assert.equal(gets, 2, "taken, not fetched again");
+	assert.equal(q.prefetch(req(2)), true, "a take frees the window");
+	q.dropPrefetched();
+	assert.deepEqual(await q.download(req(1)), blobs[1]!.bytes);
+	assert.equal(gets, 4, "a dropped prefetch is fetched again by its job");
+	// A prefetch that fails is the download's attempt: it books the backoff record.
+	store.down = true;
+	const { q: q2 } = await make({ store, ahead: { count: 1, bytes: 10_000 } });
+	assert.equal(q2.prefetch(req(2)), true);
+	assert.equal(await q2.download(req(2)), null);
+	store.down = false;
+	assert.equal(q2.queued().length, 1);
+	assert.equal(q2.prefetch(req(2)), true, "backing off: nothing started");
+	assert.equal(await q2.download(req(2)), null, "still backing off");
+});
+
+test("prefetch: no ahead bound = never prefetches", async () => {
+	const { q } = await make();
+	const bytes = rnd(100, 5);
+	assert.equal(q.prefetch({ hash: sha256Hex(bytes), docId: D, path: P, size: bytes.length }), false);
 });

@@ -196,7 +196,9 @@ export class VaultRuntime {
 		this.idbSnapshotDue = this.recovered || o.reason === "storage-lost";
 		if (imported > 0) this.diag(`synced mirror imported: ${imported} records`);
 		const tz = o.tzOffsetMinutes ?? (() => 0);
-		this.blobs = await BlobQueue.open({ db, clock: ports.clock, crypto: ports.crypto, store: ports.blob, chunkLog: this.port.chunks, notice: this.notice });
+		// Prefetch: with the running job's own download, at most blobConcurrency transfers; held bytes bounded.
+		const ahead = { count: Math.max(0, c.budgets.blobConcurrency - 1), bytes: c.budgets.maxDiskIoBytesInFlight };
+		this.blobs = await BlobQueue.open({ db, clock: ports.clock, crypto: ports.crypto, store: ports.blob, chunkLog: this.port.chunks, notice: this.notice, ahead });
 		this.rec = await Reconciler.open({
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,

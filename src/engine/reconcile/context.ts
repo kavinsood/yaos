@@ -30,6 +30,10 @@ export interface BlobTransfer {
 	upload(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly bytes: Uint8Array }): Promise<boolean>;
 	/** Verified bytes, or null = unavailable now (queued with backoff). */
 	download(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly size: number }): Promise<Uint8Array | null>;
+	/** Start a download for a job that runs soon; its download() takes the result. false = the carrier's bound is full. */
+	prefetch?(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly size: number }): boolean;
+	/** Forget prefetched results no job took. */
+	dropPrefetched?(): void;
 }
 
 export interface ReconcileSettings {

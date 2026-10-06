@@ -10,7 +10,9 @@
  *     S ≠ L, so the next pass re-runs the merge instead of waiting forever on
  *     "body-empty" (the planner cannot tell an own unwritten body from another
  *     device's in-flight one);
- *   - disk / content / bookkeeping ops run one by one (per-op gateway exec);
+ *   - disk / content / bookkeeping ops run one by one (per-op gateway exec); the
+ *     downloads of upcoming blob jobs start ahead (BlobTransfer.prefetch, bounded
+ *     by the carrier), so N attachments cost about N / window round trips, not N;
  *   - when an op of a doc fails (or is held) the doc's later ops are skipped;
  *   - a "deferred" job (bound doc awaiting the editor's save) counts as a wait;
  *   - after the run, folders emptied by renames / trashes are removed, deepest first.
@@ -135,7 +137,9 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		ok += ns.length;
 	}
 
+	const ahead = prefetcher(env, ops, blocked);
 	for (; i < ops.length; i++) {
+		ahead.pump(i);
 		const op = ops[i]!;
 		if (op.op === "wait") {
 			waits++;
@@ -155,9 +159,37 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		if (res === "ok" && op.op === "diskRename") vacated.push(op.from);
 		if (res === "ok" && op.op === "diskTrash") vacated.push(op.path);
 	}
+	ahead.done();
 	env.deferred.clear();
 	await removeEmptied(env, vacated);
 	return { ok, failed, held, deferred, skipped, waits, needHash, nsSubmitted, failedDocs };
+}
+
+/** The download a blob job will make: diskMaterialize of a live blob doc, fetchBlob. */
+function blobReqOf(env: Env, op: PlannerOp): { hash: string; docId: DocId; path: VaultPath; size: number } | null {
+	if (op.op === "fetchBlob") return { hash: op.hash, docId: op.docId, path: op.path, size: op.size };
+	if (op.op !== "diskMaterialize") return null;
+	const r = env.ctx.log.view().remote.get(op.docId);
+	return r?.state === "live" && r.kind === "blob" && r.blob ? { hash: r.blob.hash, docId: op.docId, path: op.path, size: r.blob.size } : null;
+}
+
+/** Keeps the carrier's prefetch window full with the next blob jobs at or after the running op. */
+function prefetcher(env: Env, ops: readonly PlannerOp[], blocked: (op: PlannerOp) => boolean) {
+	const blobs = env.ctx.deps.blobs;
+	let next = 0;
+	return {
+		pump(at: number): void {
+			if (!blobs?.prefetch) return;
+			for (next = Math.max(next, at); next < ops.length; next++) {
+				const op = ops[next]!;
+				const req = blocked(op) ? null : blobReqOf(env, op);
+				if (req && !blobs.prefetch(req)) return;
+			}
+		},
+		done(): void {
+			blobs?.dropPrefetched?.();
+		},
+	};
 }
 
 /** S for a markdown / canvas doc about to be created: the empty body, stat of the local file. */

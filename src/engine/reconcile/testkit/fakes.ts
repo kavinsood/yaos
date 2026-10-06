@@ -62,7 +62,28 @@ export class FakeBlobs implements BlobTransfer {
 	uploadOk = true;
 	uploads: { hash: string; docId: DocId; path: VaultPath }[] = [];
 	downloads: { hash: string; docId: DocId; path: VaultPath }[] = [];
+	/** prefetch(): results held at once (0 = refuse every prefetch); log of prefetched hashes, takes, drops. */
+	window = 0;
+	readonly ahead = new Set<string>();
+	prefetches: string[] = [];
+	taken: string[] = [];
+	maxAhead = 0;
+	drops = 0;
 	constructor(readonly maxBlobBytes = 8 * 1024 * 1024) {}
+
+	prefetch(req: { hash: string; docId: DocId; path: VaultPath; size: number }): boolean {
+		if (this.ahead.has(req.hash)) return true;
+		if (this.ahead.size >= this.window) return false;
+		this.ahead.add(req.hash);
+		this.prefetches.push(req.hash);
+		this.maxAhead = Math.max(this.maxAhead, this.ahead.size);
+		return true;
+	}
+
+	dropPrefetched(): void {
+		this.drops++;
+		this.ahead.clear();
+	}
 
 	put(bytes: Uint8Array): ContentHash {
 		const hash = sha256Hex(bytes) as ContentHash;
@@ -79,6 +100,7 @@ export class FakeBlobs implements BlobTransfer {
 
 	async download(req: { hash: string; docId: DocId; path: VaultPath; size: number }): Promise<Uint8Array | null> {
 		this.downloads.push({ hash: req.hash, docId: req.docId, path: req.path });
+		if (this.ahead.delete(req.hash)) this.taken.push(req.hash);
 		if (!this.available) return null;
 		const b = this.server.get(req.hash);
 		return b ? b.slice() : null;
