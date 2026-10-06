@@ -1,0 +1,25 @@
+docs/client-remake/DESIGN.md
+  s_ab5bcc5cfffe93::t_371130ec83f40a 1698-1702,1707-1708
+src/engine/settings/allowlist.ts
+  s_ab5bcc5cfffe93::t_704aa40c3aca72 3-4,7,12-15,19-35,43-46,50
+src/engine/settings/cfgSync.test.ts
+  s_ab5bcc5cfffe93::t_bdf391e5bb2f1b 5,8-55
+src/host/ui/settingsTab.ts
+  s_ab5bcc5cfffe93::t_bdbe4ab2ba9157 159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "97a96515b7009d8894304bf51f92ef7f1c7b28ad",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
