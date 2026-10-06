@@ -1,0 +1,21 @@
+src/host/hashing.test.ts
+  s_5ec5b8c6943789::t_f24ec715e15a74 1-21
+src/host/hashing.ts
+  s_5ec5b8c6943789::t_eb24981c8c9795 6-8,11-12,50-51,54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "eb218a603c486492d20939848caf41c9a1c20089",
+  "prompts": {},
+  "sessions": {
+    "s_5ec5b8c6943789": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad23e7dffd5cd7d1b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
