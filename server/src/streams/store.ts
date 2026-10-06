@@ -15,9 +15,11 @@
 // per-frame row. The H2 dedupe index (./dedupe.ts) is memory only.
 import type { SqlValue, StoragePort } from "../ports";
 import {
+	DedupeBuild,
 	DedupeIndexes,
 	STREAM_DEDUPE_MAX_ENTRIES,
 	STREAM_DEDUPE_SCAN_SEGMENTS,
+	STREAM_DEDUPE_STEP_ROWS,
 	STREAM_DEDUPE_WINDOW_BYTES,
 	StreamDedupeIndex,
 	frameKeyHash,
@@ -153,6 +155,8 @@ export interface StreamStoreOptions {
 	schemaReady?: boolean;
 	/** H2 DO-wide dedupe index cap in entries (default STREAM_DEDUPE_MAX_ENTRIES). */
 	dedupeMaxEntries?: number;
+	/** H2 rows per build step (default STREAM_DEDUPE_STEP_ROWS). */
+	dedupeStepRows?: number;
 }
 
 export class StreamStore {
@@ -160,11 +164,18 @@ export class StreamStore {
 	private schemaReady: boolean;
 	private headCache: number | null = null;
 	private readonly dedupe: DedupeIndexes;
+	/**
+	 * H2 builds not yet installed, oldest queued first: null until the build starts (no blobs held); the first entry
+	 * is the one in progress, so at most one build holds its blobs.
+	 */
+	private readonly builds = new Map<string, DedupeBuild | null>();
+	private readonly stepRows: number;
 
 	constructor(private readonly storage: StoragePort, options: StreamStoreOptions = {}) {
 		this.schemaManaged = options.schemaReady === true;
 		this.schemaReady = this.schemaManaged;
 		this.dedupe = new DedupeIndexes(options.dedupeMaxEntries ?? STREAM_DEDUPE_MAX_ENTRIES);
+		this.stepRows = options.dedupeStepRows ?? STREAM_DEDUPE_STEP_ROWS;
 	}
 
 	/** Storage was wiped or rewound (vault delete, D8b restore): forget every cached fact, the dedupe index included. */
@@ -172,6 +183,7 @@ export class StreamStore {
 		this.schemaReady = this.schemaManaged;
 		this.headCache = null;
 		this.dedupe.clear();
+		this.builds.clear();
 	}
 
 	/**
@@ -183,6 +195,7 @@ export class StreamStore {
 		this.ensureSchema();
 		this.headCache = null;
 		this.dedupe.clear();
+		this.builds.clear();
 		for (const table of ["stream_head", "stream_segment", "stream_checkpoint"]) {
 			this.storage.sql.exec(`DELETE FROM ${table}`).toArray();
 		}
@@ -210,9 +223,42 @@ export class StreamStore {
 		).toArray()[0] ?? null;
 	}
 
-	/** H2 diagnostics: built stream indexes and their entries (tests and debug). */
-	dedupeStats(): { streams: number; entries: number } {
-		return { streams: this.dedupe.size, entries: this.dedupe.entries };
+	/** H2 diagnostics: built stream indexes, their entries and the queued builds (tests and debug). */
+	dedupeStats(): { streams: number; entries: number; building: number } {
+		return { streams: this.dedupe.size, entries: this.dedupe.entries, building: this.builds.size };
+	}
+
+	/** H2 gate: the stream's index is installed in this runtime, so a commit of its frames scans nothing. */
+	dedupeReady(stream: string): boolean {
+		return this.dedupe.has(stream);
+	}
+
+	/** H2: queues the stream's index build unless it is installed or queued. Memory only, no I/O. */
+	queueDedupe(stream: string): void {
+		if (!this.dedupe.has(stream) && !this.builds.has(stream)) this.builds.set(stream, null);
+	}
+
+	/**
+	 * H2 CPU fallback: advances the queued builds, oldest first, by at most `maxRows` parsed rows in total, installing
+	 * each one that finishes. A build starts with the one bounded read (head + ≤ 64 segments = ≤ 65 rows) and then
+	 * holds those blobs until parsed, so only the build in progress holds any. Returns the rows parsed.
+	 *
+	 * DECISIONS-GAP: builds run one at a time in queue order, so a cold stream queued behind a large build waits for
+	 * it (bounded memory: one window of blobs, ≤ W + 1.5 MB + the open segment, instead of one per queued stream).
+	 */
+	stepDedupe(maxRows: number = this.stepRows): number {
+		if (this.builds.size === 0) return 0;
+		this.ensureSchema();
+		let rows = 0;
+		for (const [stream, queued] of this.builds) {
+			if (rows >= maxRows) break;
+			const build = queued ?? this.loadBuild(stream, this.headRow(stream));
+			rows += build.step(maxRows - rows);
+			if (!build.done) { this.builds.set(stream, build); break; }
+			this.builds.delete(stream);
+			this.dedupe.install(stream, build.index);
+		}
+		return rows;
 	}
 
 	/**
@@ -273,39 +319,44 @@ export class StreamStore {
 		return result;
 	}
 
-	/** The stream's H2 index: built by one bounded cold scan on first use in this runtime (or after an eviction). */
+	/**
+	 * The stream's H2 index. Not installed (a commit the relay did not gate: a forced flush, or a direct store user):
+	 * the whole build runs inline, inside the commit transaction, reusing the commit's head row, and replaces any
+	 * queued build of the stream (whose snapshot this commit would make stale).
+	 */
 	private indexFor(state: StreamCommitState): StreamDedupeIndex {
 		const built = this.dedupe.touch(state.stream);
 		if (built) return built;
-		const index = this.coldScan(state.stream, state.head);
-		this.dedupe.install(state.stream, index);
-		return index;
+		this.builds.delete(state.stream);
+		const build = this.loadBuild(state.stream, state.head);
+		build.step(Number.POSITIVE_INFINITY);
+		this.dedupe.install(state.stream, build.index);
+		return build.index;
 	}
 
 	/**
-	 * H2 cold scan, inside the commit transaction and before its writes: the head row (already read by the commit),
-	 * then the newest sealed segments, newest first, stopping once ≥ W bytes are held: at most
-	 * STREAM_DEDUPE_SCAN_SEGMENTS rows (every sealed segment is ≥ 64 KiB). Keys are parsed, payloads skipped.
+	 * H2 cold scan read: the head row, then the newest sealed segments, newest first, stopping once ≥ W bytes are
+	 * held: at most STREAM_DEDUPE_SCAN_SEGMENTS rows (every sealed segment is ≥ 64 KiB). The blobs go to the build
+	 * oldest first, the open segment last.
 	 */
-	private coldScan(stream: string, head: HeadRow | null): StreamDedupeIndex {
-		const index = new StreamDedupeIndex();
-		if (!head) return index;
+	private loadBuild(stream: string, head: HeadRow | null): DedupeBuild {
+		if (!head) return new DedupeBuild([]);
 		const open = head.open && head.open.byteLength > 0 ? new Uint8Array(head.open) : null;
 		let bytes = open?.byteLength ?? 0;
-		const sealed: Uint8Array[] = [];
+		const blobs: Uint8Array[] = [];
 		if (head.tail_first !== null && bytes < STREAM_DEDUPE_WINDOW_BYTES) {
 			const segments = this.storage.sql.exec<{ bytes: ArrayBuffer }>(
 				"SELECT bytes FROM stream_segment WHERE stream = ? ORDER BY first_seq DESC LIMIT ?", stream, STREAM_DEDUPE_SCAN_SEGMENTS);
 			for (const segment of segments) {
 				const blob = new Uint8Array(segment.bytes);
-				sealed.push(blob);
+				blobs.push(blob);
 				bytes += blob.byteLength;
 				if (bytes >= STREAM_DEDUPE_WINDOW_BYTES) break;
 			}
 		}
-		for (let i = sealed.length - 1; i >= 0; i--) index.scan(sealed[i]!);
-		if (open) index.scan(open);
-		return index;
+		blobs.reverse();
+		if (open) blobs.push(open);
+		return new DedupeBuild(blobs);
 	}
 
 	/**

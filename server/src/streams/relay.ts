@@ -9,7 +9,9 @@
 // order). After the commit: COMMITTED frames (or COMMIT_NOTICEs for sockets that
 // already got the PROVISIONAL), then one STREAM_RECEIPTS per origin socket.
 // Invariant: durable before receipt, and every seq is delivered live only after
-// its commit.
+// its commit. H2 fallback: a stream's frames commit only once its dedupe index
+// is built; builds advance one bounded step per incoming message and per timer
+// flush (StreamStore.stepDedupe).
 import { bytesToBase64 } from "../base64url";
 import { dailyLimitControl, dailyLimitKind, dailyLimitResponse, isCloudflareDailyLimitError, type DailyLimitKind } from "../dailyLimit";
 import { SYSTEM_CLOCK, SYSTEM_TIMERS, type ClockPort, type SocketPort, type SocketRegistryPort, type TimerPort } from "../ports";
@@ -39,7 +41,7 @@ import {
 	isProvisionalStream,
 	validStreamName,
 } from "./protocol";
-import { frameKey, type StreamStore } from "./store";
+import { frameKey, type StreamAppendOutcome, type StreamStore } from "./store";
 
 // ---- configuration ----------------------------------------------------------
 
@@ -209,6 +211,8 @@ interface PendingFrame {
 	provisional: boolean;
 	/** Socket ordinal at the PROVISIONAL broadcast: later sockets get COMMITTED instead of a notice. */
 	ordinal: number;
+	/** H2: a flush held it back while its stream's index builds; its bytes no longer count toward the bytes trigger. */
+	held: boolean;
 }
 
 export type StreamFlushReason = "idle" | "max" | "bytes" | "forced";
@@ -235,6 +239,8 @@ export interface StreamRelayCounters {
 	authorityCloses: number;
 	dailyLimitRejects: number;
 	wakeNotices: number;
+	/** H2: frames a flush held back because their stream's index was still building (once per flush). */
+	dedupeHeld: number;
 }
 
 export type StreamReceipt = { stream: string; clientFrameId: string; seq: number; deduped: boolean };
@@ -256,7 +262,7 @@ export class StreamRelayService {
 		appendFrames: 0, commits: 0, committedRows: 0, storeDedupes: 0, pendingDedupes: 0, conflicts: 0,
 		commitFailures: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0,
 		committedBroadcasts: 0, notices: 0, rateCloses: 0, oversizeCloses: 0, deviceSocketEvictions: 0, rawDrops: 0,
-		authorityCloses: 0, dailyLimitRejects: 0, wakeNotices: 0,
+		authorityCloses: 0, dailyLimitRejects: 0, wakeNotices: 0, dedupeHeld: 0,
 	};
 	private readonly clock: ClockPort;
 	private readonly timers: TimerPort;
@@ -277,6 +283,7 @@ export class StreamRelayService {
 	private readonly ordinals = new WeakMap<object, number>();
 	private socketOrdinal = 0;
 	private pending: PendingFrame[] = [];
+	/** Payload bytes of the buffered frames not held back (H2): the bytes trigger. */
 	private pendingBytes = 0;
 	private readonly pendingByKey = new Map<string, PendingFrame>();
 	private idleTimer: unknown = null;
@@ -499,8 +506,23 @@ export class StreamRelayService {
 		// D7: the device map is checked first, before any echo, PROVISIONAL broadcast or buffering.
 		if (!this.authorityHolds(socket, entry.actor)) return;
 		if (!this.charge(socket, entry.attachment, message)) return;
+		let buffered = false;
 		if (typeof message === "string") this.control(socket, entry.attachment, message);
-		else this.append(socket, entry.attachment, new Uint8Array(message));
+		else buffered = this.append(socket, entry.attachment, new Uint8Array(message));
+		// H2 fallback: an incoming message is a fresh CPU budget (DO limits: each WebSocket message resets it), so it
+		// carries one bounded build step, before a bytes-triggered flush can try to commit the frame.
+		this.stepDedupe();
+		if (buffered) this.schedule();
+	}
+
+	/** H2 fallback: one bounded build step. A failed read leaves the build queued: the next flush retries it. */
+	private stepDedupe(): void {
+		try {
+			this.options.store().stepDedupe();
+		} catch (error) {
+			this.options.noteCommitError(error);
+			console.warn("[yaos-streams] dedupe build failed", error instanceof Error ? error.message : String(error));
+		}
 	}
 
 	/**
@@ -564,15 +586,16 @@ export class StreamRelayService {
 		this.options.sendControl(socket, { type: "STREAM_APPEND_REJECTED", stream, clientFrameId, code, ...extra });
 	}
 
-	private append(socket: SocketPort, attachment: StreamSocketAttachment, bytes: Uint8Array): void {
+	/** Admits one APPEND. Returns true when it was buffered (the caller schedules the flush). */
+	private append(socket: SocketPort, attachment: StreamSocketAttachment, bytes: Uint8Array): boolean {
 		const frame = decodeAppendFrame(bytes);
 		if ("error" in frame) {
 			// H1: the close reason is the bare error code (`malformed_frame` for every codec violation).
 			this.closeSocket(socket, frame.error === "payload_too_large" ? 1009 : 1008, frame.error);
-			return;
+			return false;
 		}
 		this.counters.appendFrames++;
-		if (!attachment.canWrite) { this.reject(socket, frame.stream, frame.clientFrameId, "write_forbidden"); return; }
+		if (!attachment.canWrite) { this.reject(socket, frame.stream, frame.clientFrameId, "write_forbidden"); return false; }
 		const waiter = { socket, socketId: attachment.socketId };
 		const key = frameKey(attachment.deviceId, frame.clientFrameId);
 		const pending = this.pendingByKey.get(key);
@@ -584,19 +607,19 @@ export class StreamRelayService {
 				this.counters.conflicts++;
 				this.reject(socket, frame.stream, frame.clientFrameId, "client_frame_id_conflict");
 			}
-			return;
+			return false;
 		}
 		if (this.options.dailyLimitActive()) {
 			// H3: refused before any broadcast or buffering. DECISIONS-GAP: the host exposes only "latched", not the
 			// latched kind; the kind is the one this relay last classified, else "rows-written" (the latch default).
 			this.counters.dailyLimitRejects++;
 			this.options.sendControl(socket, dailyLimitControl(this.now(), this.dailyKind, frame.stream, [frame.clientFrameId]));
-			return;
+			return false;
 		}
 		const provisional = isProvisionalStream(frame.stream);
 		const entry: PendingFrame = { key, stream: frame.stream, deviceId: attachment.deviceId,
 			clientFrameId: frame.clientFrameId, payload: frame.payload, origin: waiter, duplicates: [],
-			provisional, ordinal: this.socketOrdinal };
+			provisional, ordinal: this.socketOrdinal, held: false };
 		if (provisional) {
 			const message = encodeProvisional({ stream: frame.stream, deviceId: attachment.deviceId,
 				clientFrameId: frame.clientFrameId, payload: frame.payload });
@@ -608,7 +631,8 @@ export class StreamRelayService {
 		this.pending.push(entry);
 		this.pendingByKey.set(key, entry);
 		this.pendingBytes += frame.payload.byteLength;
-		this.schedule();
+		this.options.store().queueDedupe(frame.stream);
+		return true;
 	}
 
 	private schedule(): void {
@@ -630,11 +654,16 @@ export class StreamRelayService {
 		return this.pending.length;
 	}
 
-	/** Commits every buffered frame in one transaction, then sends broadcasts and receipts. */
+	/**
+	 * Commits the buffered frames in one transaction, then sends broadcasts and receipts. H2 fallback: frames of a
+	 * stream whose index is still building are held back, in order, for a later flush (re-armed here); a timer flush
+	 * first advances the builds one step (a bytes flush runs in a message turn, which already stepped). A forced
+	 * flush holds nothing back (the commit builds inline). A failed flush fails every frame it took.
+	 */
 	flush(reason: StreamFlushReason): void {
-		const frames = this.pending;
+		const taken = this.pending;
 		this.clearTimers();
-		if (frames.length === 0) return;
+		if (taken.length === 0) return;
 		this.pending = [];
 		this.pendingBytes = 0;
 		this.pendingByKey.clear();
@@ -642,20 +671,38 @@ export class StreamRelayService {
 		else if (reason === "max") this.counters.flushMax++;
 		else if (reason === "bytes") this.counters.flushBytes++;
 		else this.counters.flushForced++;
-		let outcomes;
+		let frames = taken;
+		const held: PendingFrame[] = [];
+		let outcomes: StreamAppendOutcome[] = [];
 		try {
-			outcomes = this.options.store().commit(frames).outcomes;
+			const store = this.options.store();
+			if (reason !== "forced") {
+				for (const frame of taken) store.queueDedupe(frame.stream);
+				if (reason !== "bytes") store.stepDedupe();
+				frames = [];
+				for (const frame of taken) (store.dedupeReady(frame.stream) ? frames : held).push(frame);
+			}
+			if (frames.length > 0) outcomes = store.commit(frames).outcomes;
 		} catch (error) {
 			this.counters.commitFailures++;
 			this.failures++;
 			this.options.noteCommitError(error);
 			console.warn("[yaos-streams] commit failed", error instanceof Error ? error.message : String(error));
-			this.failed(frames, error);
+			this.failed(taken, error);
 			return;
 		}
-		this.failures = 0;
-		this.lastCommitAt = this.now();
-		this.counters.commits++;
+		if (frames.length > 0) {
+			this.failures = 0;
+			this.lastCommitAt = this.now();
+			this.counters.commits++;
+		}
+		if (held.length > 0) {
+			this.counters.dedupeHeld += held.length;
+			for (const frame of held) { frame.held = true; this.pendingByKey.set(frame.key, frame); }
+			this.pending = held;
+			this.schedule();
+		}
+		if (frames.length === 0) return;
 		const sockets = this.streamSockets();
 		const receipts = new Map<string, { socket: SocketPort; receipts: StreamReceipt[] }>();
 		const addReceipt = (waiter: Waiter, receipt: StreamReceipt) => {
@@ -779,7 +826,7 @@ export class StreamRelayService {
 		if (dropped.length > 0) {
 			this.pending = kept;
 			this.pendingBytes = 0;
-			for (const frame of kept) this.pendingBytes += frame.payload.byteLength;
+			for (const frame of kept) if (!frame.held) this.pendingBytes += frame.payload.byteLength;
 			for (const frame of dropped) this.pendingByKey.delete(frame.key);
 			if (kept.length === 0) this.clearTimers();
 			const peers = this.streamSockets();

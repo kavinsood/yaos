@@ -19,7 +19,7 @@ import {
 	type StreamActor,
 	type StreamRelayConfig,
 } from "../../server/src/streams/relay";
-import { STREAM_DEDUPE_WINDOW_BYTES, StreamDedupeIndex, frameKeyHash } from "../../server/src/streams/dedupe";
+import { DedupeBuild, STREAM_DEDUPE_STEP_ROWS, STREAM_DEDUPE_WINDOW_BYTES, StreamDedupeIndex, frameKeyHash } from "../../server/src/streams/dedupe";
 import { StreamStore, type StreamAppendInput } from "../../server/src/streams/store";
 import { suite } from "../harness.ts";
 
@@ -148,7 +148,8 @@ function buffer(value: Uint8Array): ArrayBuffer {
 }
 
 async function withStreams(check: (harness: Harness) => void | Promise<void>,
-	options: { config?: Partial<StreamRelayConfig>; dedupeMaxEntries?: number; random?: () => number } = {}): Promise<void> {
+	options: { config?: Partial<StreamRelayConfig>; dedupeMaxEntries?: number; dedupeStepRows?: number; random?: () => number } = {},
+): Promise<void> {
 	const directory = await mkdtemp(join(tmpdir(), "yaos-hardening-"));
 	const sqlite = NodeSqliteStorage.open(join(directory, "vault.sqlite"));
 	const model = new CfRowModel(sqlite);
@@ -169,7 +170,7 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>,
 	const registry = new FakeRegistry();
 	const revoked = new Set<string>();
 	const config = { ...DEFAULT_STREAM_RELAY_CONFIG, ...options.config };
-	const makeStore = () => new StreamStore(storage, { dedupeMaxEntries: options.dedupeMaxEntries });
+	const makeStore = () => new StreamStore(storage, { dedupeMaxEntries: options.dedupeMaxEntries, dedupeStepRows: options.dedupeStepRows });
 	const make = (runtimeEpoch: string, store: StreamStore, random?: () => number) => new StreamRelayService({
 		config,
 		store: () => store,
@@ -302,13 +303,22 @@ s.test("H2 index: frame keys and raw stored keys hash alike; trim keeps the newe
 	const blob = new Uint8Array(rows.flatMap((row) => [...encodeRow(row)]));
 	const size = encodeRow(rows[0]!).byteLength;
 	const scanned = new StreamDedupeIndex(1000);
-	assert.equal(scanned.scan(blob), 4);
+	assert.equal(scanned.scan(blob), blob.byteLength, "returns the offset after the last row");
+	assert.equal(scanned.entries, 4);
 	assert.equal(scanned.windowedBytes, blob.byteLength, "rowBytes = the encoded row length");
 	for (const row of rows) assert.equal(scanned.get(frameKeyHash(row.deviceId, row.clientFrameId)), row.seq);
-	assert.equal(scanned.scan(blob.subarray(0, blob.byteLength - 3)), 3, "a malformed tail stops the parse");
+	const truncated = blob.subarray(0, blob.byteLength - 3);
+	assert.equal(scanned.scan(truncated), truncated.byteLength, "a malformed tail ends the blob");
+	assert.equal(scanned.added, 4 + 3, "the rows before it are indexed");
+	// Resumable: at most maxRows rows from `start`, the offset of the next row returned.
+	const stepped = new StreamDedupeIndex(1000);
+	assert.equal(stepped.scan(blob, 0, 3), 3 * size);
+	assert.equal(stepped.scan(blob, 3 * size, 3), blob.byteLength);
+	assert.equal(stepped.entries, 4);
 	// Rows of `size` bytes, W = 100: a row stays while the rows newer than it hold < W bytes.
 	const index = new StreamDedupeIndex(100);
-	assert.equal(index.scan(blob), Math.floor((100 - 1) / size) + 1, "the scan trims too");
+	index.scan(blob);
+	assert.equal(index.entries, Math.floor((100 - 1) / size) + 1, "the scan trims too");
 	const keep = Math.floor((100 - 1) / size) + 1;
 	for (let seq = 5; seq <= 12; seq++) index.add(frameKeyHash("device-a", `cf-${seq}`), seq, size);
 	assert.equal(index.entries, keep);
@@ -449,11 +459,11 @@ s.test("H2 memory cap: whole streams are evicted LRU at the DO-wide entry cap; a
 			// The first commit to a stream builds its (empty) index; rows join after the commit.
 		}
 		// Every stream has 4 entries: 12 > 10, so the least recently used (s1) went.
-		assert.deepEqual(store.dedupeStats(), { streams: 2, entries: 8 });
+		assert.deepEqual(store.dedupeStats(), { streams: 2, entries: 8, building: 0 });
 		reads.reset();
 		assert.deepEqual(store.commit([frame("s1", 0)]).outcomes, [{ kind: "deduped", seq: 1 }]);
 		assert.equal(reads.matching(/FROM stream_head WHERE stream = \?/), 1, "rescan of s1 (open segment only)");
-		assert.deepEqual(store.dedupeStats(), { streams: 2, entries: 8 }, "s1 back, s2 (now LRU) evicted");
+		assert.deepEqual(store.dedupeStats(), { streams: 2, entries: 8, building: 0 }, "s1 back, s2 (now LRU) evicted");
 		assert.deepEqual(store.commit([frame("s2", 3)]).outcomes, [{ kind: "deduped", seq: 8 }]);
 	}, { dedupeMaxEntries: 10 });
 });
@@ -467,6 +477,96 @@ s.test("H2: rows join the index only after their commit is durable (a failed com
 		fail.mode = null;
 		assert.deepEqual(store.commit([frame]).outcomes, [{ kind: "appended", seq: 2 }]);
 		assert.deepEqual(store.commit([frame]).outcomes, [{ kind: "deduped", seq: 2 }]);
+	});
+});
+
+s.test("H2 CPU fallback: a build parses at most maxRows rows per step, resumes mid-blob, and indexes like one scan", () => {
+	assert.equal(STREAM_DEDUPE_STEP_ROWS, 16_384);
+	const blob = (from: number, count: number) => new Uint8Array(Array.from({ length: count }, (_, offset) => from + offset)
+		.flatMap((seq) => [...encodeRow({ seq, deviceId: "device-a", clientFrameId: `cf-${seq}`, payload: new Uint8Array(3) })]));
+	const blobs = [blob(1, 7), blob(8, 7), blob(15, 3)];
+	const whole = new StreamDedupeIndex();
+	for (const part of blobs) whole.scan(part);
+	const build = new DedupeBuild(blobs.map((part) => part.slice()));
+	const steps: number[] = [];
+	while (!build.done) steps.push(build.step(5));
+	assert.deepEqual(steps, [5, 5, 5, 2], "17 rows across 3 blobs in steps of 5, crossing blob boundaries");
+	assert.equal(build.index.entries, whole.entries);
+	for (let seq = 1; seq <= 17; seq++) assert.equal(build.index.get(frameKeyHash("device-a", `cf-${seq}`)), seq);
+	assert.equal(build.step(5), 0, "a finished build parses nothing");
+	assert.ok(new DedupeBuild([]).done, "nothing stored: done at once");
+});
+
+s.test("H2 CPU fallback T-DEDUPE-CHUNK-WB: a large cold build is stepped per message and per timer flush; only its stream waits", async () => {
+	await withStreams(({ store, fresh, registry, timers, reads, append }) => {
+		// 4 sealed segments of 10 rows (each 10 × 7 KiB commit seals) = 40 rows; a build step parses 10.
+		const payload = (index: number) => new Uint8Array(7 * 1024).fill(index % 251);
+		for (let batch = 0; batch < 4; batch++) {
+			store.commit(Array.from({ length: 10 }, (_, offset) => ({ stream: "b:big", deviceId: "device-a",
+				clientFrameId: `big-${batch * 10 + offset}`, payload: payload(batch * 10 + offset) })));
+		}
+		assert.equal(store.tableCounts().segments, 4);
+		const service = fresh("runtime-b");
+		assert.equal(service.accept(ownerA, true).status, 200);
+		const a = registry.lastClient!;
+		const cold = () => (service as unknown as { options: { store: () => StreamStore } }).options.store();
+		// ns:warm first: its (empty) build finishes inside its own message turn.
+		append(a, "ns:warm", "warm-1", "w");
+		assert.ok(cold().dedupeReady("ns:warm"));
+		reads.reset();
+		// Message 1: a resend of big-5 queues b:big; the message turn reads head + 4 segments once and parses 10 rows.
+		append(a, "b:big", "big-5", payload(5));
+		assert.equal(reads.matching(/ORDER BY first_seq DESC LIMIT \?/), 4, "the one bounded read, at build start");
+		assert.equal(reads.matching(/FROM stream_head WHERE stream = \?/), 1);
+		assert.deepEqual(cold().dedupeStats(), { streams: 1, entries: 0, building: 1 });
+		// Message 2 (a new stream, queued behind b:big): the turn's step is b:big's rows 11–20.
+		append(a, "ns:late", "late-1", "l");
+		reads.reset();
+		// Idle flush 1: step (rows 21–30); ns:warm commits, b:big and ns:late stay held, nothing is re-read.
+		timers.advance(300);
+		assert.deepEqual(a.receipts().map((receipt) => receipt.clientFrameId), ["warm-1"]);
+		assert.equal(service.counters.dedupeHeld, 2);
+		assert.equal(reads.matching(/ORDER BY first_seq DESC LIMIT \?/), 0, "steps after the first read nothing");
+		assert.ok(!cold().dedupeReady("b:big"));
+		// Next flush (minInterval after the last commit): step (rows 31–40) installs b:big; big-5 dedupes against seq 6.
+		timers.advance(1_000);
+		assert.deepEqual(a.receipts().slice(1), [{ stream: "b:big", clientFrameId: "big-5", seq: 6, deduped: true }]);
+		assert.ok(cold().dedupeReady("b:big"));
+		assert.ok(!cold().dedupeReady("ns:late"), "the step budget was spent on b:big");
+		// Next flush: ns:late's build (nothing stored) finishes and its frame commits.
+		timers.advance(1_000);
+		assert.deepEqual(a.receipts().slice(2), [{ stream: "ns:late", clientFrameId: "late-1", seq: 42, deduped: false }]);
+		assert.deepEqual(cold().dedupeStats(), { streams: 3, entries: 40 + 2, building: 0 });
+		assert.equal(service.pendingFrames(), 0);
+	}, { dedupeStepRows: 10, config: { burstBytes: 8 * 1024 * 1024 } });
+});
+
+s.test("H2 CPU fallback: store steps share one row budget in queue order; a gated commit is never needed", async () => {
+	await withStreams(({ store, storage }) => {
+		for (let batch = 0; batch < 3; batch++) {
+			store.commit(Array.from({ length: 10 }, (_, offset) => ({ stream: "b:x", deviceId: "device-a",
+				clientFrameId: `x-${batch * 10 + offset}`, payload: new Uint8Array(7 * 1024) })));
+		}
+		store.commit([{ stream: "b:y", deviceId: "device-a", clientFrameId: "y-0", payload: bytes("y") }]);
+		const cold = new StreamStore(storage, { dedupeStepRows: 12 });
+		cold.queueDedupe("b:x");
+		cold.queueDedupe("b:y");
+		cold.queueDedupe("b:x");
+		assert.deepEqual(cold.dedupeStats(), { streams: 0, entries: 0, building: 2 }, "queued once");
+		assert.deepEqual([cold.stepDedupe(), cold.stepDedupe(), cold.stepDedupe()], [12, 12, 7], "b:x 12+12+6, then b:y's 1 row");
+		assert.ok(cold.dedupeReady("b:x") && cold.dedupeReady("b:y"));
+		assert.equal(cold.stepDedupe(), 0);
+		// An ungated commit (forced flush) of a queued stream builds inline and drops the queued build.
+		const other = new StreamStore(storage, { dedupeStepRows: 12 });
+		other.queueDedupe("b:x");
+		other.stepDedupe();
+		assert.deepEqual(other.commit([{ stream: "b:x", deviceId: "device-a", clientFrameId: "x-29", payload: new Uint8Array(7 * 1024) }]).outcomes,
+			[{ kind: "deduped", seq: 30 }]);
+		assert.deepEqual(other.dedupeStats(), { streams: 1, entries: 30, building: 0 });
+		// reset() forgets queued builds too.
+		other.queueDedupe("b:y");
+		other.reset();
+		assert.equal(other.dedupeStats().building, 0);
 	});
 });
 

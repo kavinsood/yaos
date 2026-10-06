@@ -5,6 +5,11 @@
 // (hash, seq, rowBytes), oldest first, trimmed to the newest W bytes. A hit is only a candidate: the store loads the
 // row and compares keys (a collision on another key is not a hit) and bytes. The DO-wide entry cap evicts whole
 // streams, least recently used first; an evicted stream rescans (≤ 65 rows).
+//
+// CPU fallback (H2 "chunk the scan and gate that stream's commits on it"): measured worst case (4 MiB of 25 B rows
+// with distinct keys, ≈ 168k rows) is ≈ 16 ms of parse in Node, over the 10 ms Free budget. So the parse of a
+// cold scan runs in steps of at most STREAM_DEDUPE_STEP_ROWS rows (DedupeBuild); the relay holds the stream's frames
+// until its build is installed.
 
 /** W ≥ burst + maxPayload + gcMaxBytes = 2 MiB + 1 MiB + 64 KiB. */
 export const STREAM_DEDUPE_WINDOW_BYTES = 4 * 1024 * 1024;
@@ -12,6 +17,12 @@ export const STREAM_DEDUPE_WINDOW_BYTES = 4 * 1024 * 1024;
 export const STREAM_DEDUPE_SCAN_SEGMENTS = 64;
 /** DO-wide cap on index entries (about 16 MB at about 60 B/entry). */
 export const STREAM_DEDUPE_MAX_ENTRIES = 262_144;
+/**
+ * Rows one build step may parse (about 1.5 ms in Node at the measured ≈ 93 ns/row worst case). DECISIONS-GAP: H2
+ * names no chunk size; 16,384 rows keeps a step well under the 10 ms budget, and a stream of up to 16,384 rows
+ * (4 MiB of 256 B rows) still builds in one step.
+ */
+export const STREAM_DEDUPE_STEP_ROWS = 16_384;
 
 const utf8 = new TextEncoder();
 
@@ -58,8 +69,14 @@ export class StreamDedupeIndex {
 	private start = 0;
 	private count = 0;
 	private bytes = 0;
+	private rows = 0;
 
 	constructor(private readonly windowBytes: number = STREAM_DEDUPE_WINDOW_BYTES) {}
+
+	/** Rows ever added (trimmed ones included): a build step's row measure. */
+	get added(): number {
+		return this.rows;
+	}
 
 	/** Ring entries (the memory measure of the DO-wide cap). */
 	get entries(): number {
@@ -83,20 +100,21 @@ export class StreamDedupeIndex {
 		this.sizes[slot] = rowBytes;
 		this.count++;
 		this.bytes += rowBytes;
+		this.rows++;
 		this.map.set(hash, seq);
 		return 1 - this.trim();
 	}
 
 	/**
 	 * Parses one stored blob (concatenated rows: varuint seq, varstring deviceId, varstring clientFrameId,
-	 * varuint8array payload) for keys only, skipping payloads by length, and adds every row oldest first. Returns
-	 * the change in entries. A malformed tail stops the parse (the rows before it stay indexed).
+	 * varuint8array payload) for keys only, skipping payloads by length, and adds its rows oldest first: from byte
+	 * `start`, at most `maxRows` rows. Returns the offset after the last row parsed, `blob.byteLength` once the blob
+	 * is done. A malformed tail ends the blob (the rows before it stay indexed).
 	 */
-	scan(blob: Uint8Array): number {
-		let delta = 0;
+	scan(blob: Uint8Array, start = 0, maxRows = Number.POSITIVE_INFINITY): number {
 		const end = blob.byteLength;
-		let pos = 0;
-		while (pos < end) {
+		let pos = start;
+		for (let parsed = 0; parsed < maxRows && pos < end; parsed++) {
 			const rowStart = pos;
 			// Inline lib0 varuint reads (little-endian base-128); written by encodeRow, so well formed.
 			let seq = 0;
@@ -119,10 +137,10 @@ export class StreamDedupeIndex {
 			scale = 1;
 			do { byte = blob[pos++]!; length += (byte & 0x7f) * scale; scale *= 128; } while (byte >= 0x80 && pos < end);
 			pos += length;
-			if (pos > end || idEnd > end) break;
-			delta += this.add(keyHash(blob, deviceStart, deviceEnd, blob, idStart, idEnd), seq, pos - rowStart);
+			if (pos > end || idEnd > end) return end;
+			this.add(keyHash(blob, deviceStart, deviceEnd, blob, idStart, idEnd), seq, pos - rowStart);
 		}
-		return delta;
+		return pos;
 	}
 
 	/** Drops the oldest rows while the rest still hold ≥ W bytes. Returns the number dropped. */
@@ -156,6 +174,38 @@ export class StreamDedupeIndex {
 		this.seqs = seqs;
 		this.sizes = sizes;
 		this.start = 0;
+	}
+}
+
+const NO_BYTES = new Uint8Array(0);
+
+/**
+ * H2 CPU fallback: one stream's cold scan as resumable steps. The blobs (sealed segments oldest first, then the open
+ * segment) come from the one bounded read; only the parse is split, by rows (its CPU is per row: payloads are skipped
+ * by length). A parsed blob is released.
+ */
+export class DedupeBuild {
+	readonly index: StreamDedupeIndex;
+	private next = 0;
+	private offset = 0;
+
+	constructor(private readonly blobs: Uint8Array[], windowBytes: number = STREAM_DEDUPE_WINDOW_BYTES) {
+		this.index = new StreamDedupeIndex(windowBytes);
+	}
+
+	get done(): boolean {
+		return this.next >= this.blobs.length;
+	}
+
+	/** Parses at most `maxRows` more rows. Returns the rows parsed. */
+	step(maxRows: number): number {
+		const before = this.index.added;
+		while (this.next < this.blobs.length && this.index.added - before < maxRows) {
+			const blob = this.blobs[this.next]!;
+			this.offset = this.index.scan(blob, this.offset, maxRows - (this.index.added - before));
+			if (this.offset >= blob.byteLength) { this.blobs[this.next++] = NO_BYTES; this.offset = 0; }
+		}
+		return this.index.added - before;
 	}
 }
 
