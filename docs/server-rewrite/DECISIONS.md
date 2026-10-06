@@ -702,5 +702,9 @@ P3b gap calls (accepted; marked `DECISIONS-GAP` in code):
 
 Status 2026-10-06: P0–P3 done. Combined local run at 15e9bf3: `conformance-local-final-20261006T105356Z.json`,
 49 pass, 0 fail, 1 SKIP (T-BLOB-UNAVAILABLE needs an unbound bucket; it passes in
-`conformance-local-p3b-nobucket-20261006T104800Z.json`). P4 pages are done and wired; the manual console run is next,
-then P5.
+`conformance-local-p3b-nobucket-20261006T104800Z.json`). P4 manual run done on local dev (Chrome, desktop and 375 px): claim → owner code with
+QR and `obsidian://` link → enroll (replay 200, reuse `409 used_code`) → revoke from the Devices list (error frame
+`authority_superseded` +25 ms, list empty, token `401`) → reset (device kept, socket 1001, old epoch `409`) → restore
+(`501 restore_unsupported` message) → vault create and delete → sign out and in → `/mobile-setup` (fragment dropped,
+`connect-src 'none'` blocks fetch, foreign host and bad code refused). No external request. Fixed on the way: `.mono`
+inputs overflowed the card at 375 px; the `invalid_restore_point` text now names the vault's creation (G42). P5 next.

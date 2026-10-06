@@ -35,7 +35,7 @@ export const CONSOLE_MESSAGES: Readonly<Record<string, string>> = {
 	purge_incomplete: "The vault is closed, but some attachments are not removed yet. Press Delete vault again to finish.",
 	restore_in_progress: "A restore of this vault has not finished. Pairing, revoking and resetting wait for it; press Restore to resume it.",
 	restore_incomplete: "The restore started but has not finished. The server finishes it on its own within about a minute, or press Restore to resume it now.",
-	invalid_restore_point: "That restore point is not usable. Enter an ISO 8601 time within the last 30 days and not in the future.",
+	invalid_restore_point: "That restore point is not usable. Enter an ISO 8601 time within the last 30 days, after the vault was created and not in the future.",
 	restore_unsupported: "This server cannot restore: Cloudflare point-in-time recovery is not available here (local development).",
 	cf_daily_limit: "The Cloudflare free-plan daily limit is used up. Try again after it resets.",
 	not_found: "That vault or device no longer exists. Reload the page.",
@@ -65,7 +65,7 @@ body { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
 section { border: 1px solid #8886; border-radius: 8px; padding: 4px 16px 12px; margin: 16px 0; }
 input, button { font: inherit; padding: 6px 10px; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
-.mono { font-family: ui-monospace, monospace; min-width: 22em; }
+.mono { font-family: ui-monospace, monospace; min-width: min(22em, 100%); box-sizing: border-box; }
 .warn { border-left: 4px solid #d80; padding-left: 10px; }
 .err { color: #d33; } .ok { color: #2a7; } .muted { opacity: .7; font-size: 13px; }
 img.qr { width: 240px; height: 240px; background: #fff; }
