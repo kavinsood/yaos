@@ -262,10 +262,7 @@ export class BindingManager {
 	}
 
 	onBindable(path: VaultPath): void {
-		if (!this.running) return;
-		for (const slot of this.slots.values()) {
-			if ((slot.state === "waiting" || slot.state === "idle") && slot.view.path !== null && this.samePath(slot.view.path, path)) void this.open(slot);
-		}
+		this.retryUnbound(path);
 	}
 
 	async saveViews(docIds: readonly DocId[]): Promise<DocId[]> {
@@ -284,6 +281,11 @@ export class BindingManager {
 	onVaultEvent(event: VaultEvent): void {
 		if (event.t !== "modify" && event.t !== "create" && event.t !== "rename") return;
 		const path = event.t === "rename" ? event.to : event.path;
+		// A rename keeps the file's views (Obsidian moves view.file in place, no file-changed). A slot
+		// waiting on the old path would wait forever: the engine's `bindable` is keyed by the path openDoc
+		// asked for, and the new path may have been live all along (the projection applying a remote
+		// rename it had already folded). Ask again at the new path.
+		if (event.t === "rename") this.retryUnbound(event.to);
 		for (const rep of this.replicas.values()) {
 			const first = [...rep.slots][0];
 			if (!first || first.view.path === null || !this.samePath(first.view.path, path)) continue;
@@ -295,6 +297,14 @@ export class BindingManager {
 
 	private newSlot(view: EditorViewRef): ViewSlot {
 		return { viewId: view.viewId, view, seq: 0, state: "idle", rep: null, detach: null, unintercept: null };
+	}
+
+	/** Re-open every unbound (waiting/idle) slot whose view is at `path`. */
+	private retryUnbound(path: string): void {
+		if (!this.running) return;
+		for (const slot of this.slots.values()) {
+			if ((slot.state === "waiting" || slot.state === "idle") && slot.view.path !== null && this.samePath(slot.view.path, path)) void this.open(slot);
+		}
 	}
 
 	private samePath(a: string, b: string): boolean {

@@ -289,3 +289,23 @@ test("binding: retarget deleted waits for bindable; saveViews; flushAll is synch
 	assert.equal(bm.isBoundPath("R.MD"), true);
 	assert.equal(bm.isBoundPath("f.md"), false);
 });
+
+test("binding: a waiting view whose file is renamed re-opens at the new path (no bindable comes for it)", async () => {
+	const { clock, vault, ws, engine, bm } = setup();
+	// The engine already folded a remote rename old.md -> new.md; the disk still has old.md.
+	vault.userWrite("old.md", "body");
+	engine.add("new.md", "body");
+	bm.start();
+	const v = ws.openFile("old.md");
+	assert.ok(v);
+	await clock.advance(10);
+	assert.equal(bm.slotState(v.viewId), "waiting", "untracked at the old path");
+	// The projection applies the rename. new.md was live in the engine already, so no bindable{new.md} follows.
+	const r = await vault.rename("old.md", "new.md", { t: "any" });
+	assert.equal(r.ok, true);
+	await clock.advance(500);
+	assert.equal(v.path, "new.md");
+	assert.equal(bm.slotState(v.viewId), "bound");
+	assert.equal(v.isBound(), true);
+	assert.equal(bm.docOfView(v.viewId), "d:new.md");
+});
