@@ -1,0 +1,21 @@
+src/engine/runtime/liveIngest.ts
+  s_a3bb6f72388aba::t_d61f3db2fd643a 192
+src/engine/runtime/mirrorIo.ts
+  s_a3bb6f72388aba::t_fec687482e76b6 164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9424d0234ce5aae7505be1f1cad4edc2e85be550",
+  "prompts": {},
+  "sessions": {
+    "s_a3bb6f72388aba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a97fe38a693c58afa",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
