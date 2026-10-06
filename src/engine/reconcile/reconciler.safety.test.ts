@@ -130,6 +130,31 @@ test("local rename while ns is not ready: no re-materialize, the observed rename
 	assert.deepEqual(w.conflictCopies(), []);
 });
 
+/** Sim seed 723 (2 devices, no faults): a rename observed mid-pass was cleared with the pass's own (none). */
+test("a rename observed while a pass runs is kept for the next pass: nsRename, not a copy", async () => {
+	const { w, id } = await withDoc("a.md", "a\n");
+	const id2 = w.log.remoteCreate(P("b.md"), "b\n");
+	await w.sync();
+	w.log.remoteEdit(id2, (t) => t.insert(0, "R"));
+	let fired = false;
+	w.gateway.beforeOp = (op) => {
+		if (!fired && op.t === "write" && op.path === "b.md") {
+			fired = true;
+			w.vault.userRename("a.md", "c.md"); // with an edit: only the observed event pairs them
+			w.vault.userWrite("c.md", "a\nmore\n");
+			w.flushEvents(); // the host posts the events while the write is in flight
+		}
+	};
+	await w.sync();
+	assert.ok(fired);
+	await w.sync();
+	assert.equal(w.log.entry(id)?.path, "c.md", "the doc follows the rename");
+	assert.equal(w.log.liveByPath(P("a.md")), undefined, "no doc left at the old path");
+	assert.deepEqual(w.vault.paths(), ["b.md", "c.md"], "the old path is not re-materialized");
+	assert.equal(w.log.liveByPath(P("c.md")), id, "no fresh doc for the target");
+	assert.equal(w.log.text(id), "a\nmore\n");
+});
+
 test("fingerprint precondition: user types during the merge write -> nothing lost, converges", async () => {
 	const { w, id } = await withDoc("m.md", "a\nb\nc\n");
 	w.log.remoteEdit(id, (t) => t.insert(0, "R\n"));

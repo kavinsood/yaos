@@ -141,9 +141,11 @@ export class Reconciler {
 		ctx.echo.sweep();
 		const view = ctx.log.view();
 		const freshDocIds = this.freshIds(this.freshNeed());
+		// A snapshot: renames observed while this plan runs (its awaits) are for the next plan, not dropped with these.
+		const renames = [...ctx.renames];
 		const input: PlannerInput = {
 			scope, remote: view.remote, remoteByPathKey: view.remoteByPathKey, local: ctx.local, localComplete: ctx.localComplete,
-			synced: ctx.store.synced, renames: ctx.renames, docsWithPendingBody: view.docsWithPendingBody, nsCoversSeq: view.nsCoversSeq,
+			synced: ctx.store.synced, renames, docsWithPendingBody: view.docsWithPendingBody, nsCoversSeq: view.nsCoversSeq,
 			brake: ctx.brake, brakeApproval: ctx.brakeApproval, freshDocIds, deviceLabel: ctx.deps.deviceLabel, nowMs: ctx.now(),
 		};
 		const plan = planWith(input, {
@@ -162,7 +164,10 @@ export class Reconciler {
 		this.env.heldOverwrites.length = 0;
 		const run = await runPlan(this.env, plan.ops);
 		// Observed renames stay until inference could use them (it is off while ns is not ready).
-		if (ctx.localComplete && view.nsReady) ctx.renames = [];
+		if (ctx.localComplete && view.nsReady) {
+			const used = new Set(renames);
+			ctx.renames = ctx.renames.filter((r) => !used.has(r));
+		}
 		let brake = plan.brake;
 		if (this.env.heldOverwrites.length > 0) {
 			const units = this.env.heldOverwrites.map((h) => ({ ops: [], destructive: "overwrite" as const, brakeKey: h.key, path: h.path }));
