@@ -1,0 +1,29 @@
+docs/client-remake/DESIGN.md
+  s_ab5bcc5cfffe93::t_3e48c35c1205ae 1737-1738
+src/engine/compose/vaultRuntime.ts
+  s_ab5bcc5cfffe93::t_7a3235bcf644e1 219
+src/engine/settings/cfgSeed.test.ts
+  s_ab5bcc5cfffe93::t_389d9476e781ba 69-86
+src/engine/settings/cfgSync.ts
+  s_ab5bcc5cfffe93::t_5b8aaef124d744 59-64,161-163
+src/engine/settings/testkit.ts
+  s_ab5bcc5cfffe93::t_5ecdfb12fa777d 97-98,110
+src/sim/composed.test.ts
+  s_ab5bcc5cfffe93::t_a56a809dd3cf3b 117-159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "66c8a4cd705ea53ebceace7dd55f2196f048f89a",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
