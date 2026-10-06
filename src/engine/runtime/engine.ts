@@ -441,6 +441,24 @@ export class LogEngine {
 		return this.c.sess.reconnect();
 	}
 
+	/** DESIGN §i.4: lanes 3–4 (stale reads, compaction, checkpoints) wait while backgrounded. */
+	setBackground(on: boolean): void {
+		const c = this.c;
+		if (c.background === on) return;
+		c.background = on;
+		if (!on) c.sess.scheduleCatchUp();
+	}
+	/** Deliberate background close: no offline phase, no backoff; wake() reconnects. */
+	park(): void {
+		this.c.sess.park();
+	}
+	wake(): Promise<void> {
+		return this.c.sess.wake();
+	}
+	setNetwork(online: boolean): Promise<void> {
+		return this.c.sess.setNetwork(online);
+	}
+
 	async stop(): Promise<void> {
 		const c = this.c;
 		if (c.stopped) return;

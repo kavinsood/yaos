@@ -17,6 +17,7 @@ import type { BrakeReport, DocId, DocKind, PathKey, PlanScope, VaultEpoch, Vault
 import type { Budgets } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
+import type { TimerHandle } from "../../ports/clock";
 import type { StorageDb } from "../../ports/storage";
 import type { VaultEvent, VaultStat } from "../../ports/vault";
 import type { EngineInitConfig, EngineResultValue, EngineSettings, LocalObservation, UserCommand } from "../../protocol/messages";
@@ -77,6 +78,9 @@ export function reconcileSettings(s: EngineSettings): ReconcileSettings {
 
 type Notice = DiskSideStatus["notices"][number];
 
+/** Phone / constrained close the socket after this long hidden (DESIGN §i.4). */
+export const HIDDEN_CLOSE_MS = 30_000;
+
 export class VaultRuntime {
 	rec!: Reconciler;
 	blobs!: BlobQueue;
@@ -92,6 +96,9 @@ export class VaultRuntime {
 	brake: BrakeReport | null = null;
 	settings: EngineSettings;
 	migrating = false;
+	/** Backgrounded (DESIGN §i.4): passes (lanes 3–4) wait until visible / resume. */
+	background = false;
+	private hiddenTimer: TimerHandle | null = null;
 	private idbSnapshotDue = false;
 	private ownQueue: OwnFoldEvent[] = [];
 	private readonly notices: Notice[] = [];
@@ -110,7 +117,7 @@ export class VaultRuntime {
 		this.sched = new PassScheduler({
 			clock: o.ports.clock,
 			run: (scope) => this.runPass(scope),
-			ready: () => !this.stopped && !this.paused && !this.migrating && this.listingComplete && this.rec !== undefined,
+			ready: () => !this.stopped && !this.paused && !this.migrating && !this.background && this.listingComplete && this.rec !== undefined,
 			nextBlobDueInMs: () => this.blobs?.nextDueInMs() ?? null,
 			fullIntervalMs: b.fullReconcileIntervalMs,
 			onError: (e) => this.diag(`pass failed: ${e instanceof Error ? e.message : String(e)}`),
@@ -489,14 +496,59 @@ export class VaultRuntime {
 		this.sched.request({ t: "docs", docIds: [docId], pathKeys: [pathKey(path)] });
 	}
 
+	/**
+	 * DESIGN §i.4. hidden: flush; phone / constrained also pause lanes 3–4 and close the socket after
+	 * HIDDEN_CLOSE_MS (desktop and tablet keep syncing: an occluded desktop window reports hidden too).
+	 * pagehide / freeze: flush, pause, close now. visible / resume: reconnect at once, full pass.
+	 * Background closes keep the phase and never back off; the user's pause wins over visible / online.
+	 */
 	lifecycle(event: LifecycleEvent): void {
-		if (event === "online" || event === "resume" || event === "visible") {
-			void this.log.reconnect().catch(() => undefined);
-			this.sched.request({ t: "full" });
-		} else if (event === "pagehide" || event === "freeze" || event === "hidden") {
-			void this.log.flush().catch(() => undefined);
-			void this.mirror.flush();
+		switch (event) {
+			case "hidden":
+			case "pagehide":
+			case "freeze": {
+				void this.log.flush().catch(() => undefined);
+				void this.mirror.flush();
+				const mobile = this.o.config.deviceClass === "phone" || this.o.config.deviceClass === "constrained";
+				if (event === "hidden" && !mobile) return;
+				this.setBackground(true);
+				if (event !== "hidden") {
+					this.clearHiddenTimer();
+					this.log.park();
+				} else if (this.hiddenTimer === null) {
+					this.hiddenTimer = this.o.ports.clock.setTimer(HIDDEN_CLOSE_MS, () => {
+						this.hiddenTimer = null;
+						this.log.park();
+					});
+				}
+				return;
+			}
+			case "visible":
+			case "resume":
+				this.clearHiddenTimer();
+				this.setBackground(false);
+				void this.log.wake().catch(() => undefined);
+				this.sched.poke();
+				this.sched.request({ t: "full" });
+				return;
+			case "offline":
+				void this.log.setNetwork(false);
+				return;
+			case "online":
+				void this.log.setNetwork(true).catch(() => undefined);
+				this.sched.request({ t: "full" });
+				return;
 		}
+	}
+
+	private setBackground(on: boolean): void {
+		this.background = on;
+		this.log.setBackground(on);
+	}
+
+	private clearHiddenTimer(): void {
+		if (this.hiddenTimer !== null) this.o.ports.clock.clearTimer(this.hiddenTimer);
+		this.hiddenTimer = null;
 	}
 
 	command(c: UserCommand): Promise<EngineResultValue> {
@@ -543,6 +595,7 @@ export class VaultRuntime {
 	async stop(crash = false): Promise<void> {
 		if (this.stopped) return;
 		this.stopped = true;
+		this.clearHiddenTimer();
 		if (crash) this.log.disconnect();
 		this.sched.stop();
 		await this.sched.drain().catch(() => undefined);

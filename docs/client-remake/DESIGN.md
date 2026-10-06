@@ -1593,10 +1593,10 @@ Further caps:
 
 | Event | Action |
 |---|---|
-| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors; pause lanes 3–4. Desktop keeps the socket. Mobile closes it (1000) after 30 s hidden. |
-| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then close the socket. Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
-| `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. Check the IDB connection: `onLost` → §i.5. |
-| `online` / `offline` | Connect at once / stop reconnect attempts. The outbox keeps accumulating. |
+| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and lanes 3–4, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk (the engine cannot tell an iPad from desktop Obsidian running the engine inline, so tablets count as desktop). Phone and constrained devices pause lanes 3–4 at once (hard-cap compaction is lane 1 and still runs) and close the socket (1000) after 30 s hidden. A background close shows no offline or error phase and arms no backoff. |
+| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause lanes 3–4 and close the socket on every device class. Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
+| `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. This tries once even after `offline`, so a missed `online` cannot strand the device; while offline a failure arms no backoff. The user's pause wins over this and over `online`. Check the IDB connection: `onLost` → §i.5. |
+| `online` / `offline` | Connect at once / stop reconnect attempts (an open socket stays until it fails). The outbox keeps accumulating. |
 | `memory-pressure` | Evict all clean docs, drop live-queue payloads for cold docs (stale-record), drop candidate caches except the newest. |
 
 ### i.5 IDB loss and recovery
