@@ -786,3 +786,108 @@ cannot be trusted to say which (§2.1), so **the user decides**:
 
 Without the RK, and with no device left: **the data is unrecoverable, by design.** The operator can delete the
 vault. Any local copy of the files on disk can seed a new vault.
+
+## 14. Rotation and revocation
+
+### 14.1 Kinds of rotation
+
+| Trigger | Record kind | Who acts | Other devices |
+|---|---|---|---|
+| Nonce budget (§4.2) | roll | Any device, automatically | Adopt automatically (`nextWrap`) |
+| Revoke a device | revoke | The user, on a kept device, with the RK | Re-key by QR or RK (`key-missing` until then) |
+| Change the RK (lost or leaked) | revoke, with a new RK | The user | Same as revoke |
+| Suspected key leak | revoke | The user | Same as revoke |
+
+### 14.2 Revoke flow
+
+1. **Revoke the device in the operator console** (DECISIONS D7: `DELETE /operator/vaults/:id/devices/:deviceId`,
+   operator-only). The gate shuts in the revoke turn: no frame of that device commits afterwards, and its bearer
+   gets 401 on every device route. The client cannot revoke; there is no device route for it (D7).
+2. **On a kept device, run "Re-key after revoking a device"** (command and settings button).
+   - The user enters the RK, or chooses "Generate a new recovery key" (shown and confirmed as in §13.2).
+   - The device builds a revoke record for `r = highest epoch + 1`: kcv, `prevWrap` and `recoveryWrap`, and no
+     `nextWrap`.
+   - It persists K_r as pending (§11.4 step 2), appends the record, gets the receipt at seq **S_rot**, reads `k`
+     through S_rot, and adopts r if its record won (§11.3).
+   - Steps 1 and 2 may run in either order: the revoked device cannot follow r either way. Revoke-first is the
+     documented order, so the device stops writing sooner.
+3. **Re-key every other kept device.** The re-keying device shows a re-key QR,
+   `obsidian://yaos?action=rekey&key=<b64url(u8 1 ‖ varuint r ‖ K_r)>`, with no pairing code because these
+   devices are already enrolled. Each other device scans it, or enters the RK. It checks kcv against `k`
+   (§11.3), stores K_r and leaves `key-missing`.
+4. **Own frames sealed under an epoch < r that commit after S_rot** are stale (§14.3), so readers ignore them.
+   Their author handles them as in `refused frame-id-conflict` (DESIGN §j.1 table):
+   - body: re-seal the same update under a fresh clientFrameId, since Yjs updates are idempotent;
+   - ns and cfg: re-plan the ops under a fresh frame id.
+
+   Unsent outbox frames under an epoch < r are re-sealed under r before sending.
+5. **Checkpoints.** Nothing is forced. New checkpoints are sealed under r at the normal cadence (DESIGN §d.6
+   checkpoint policy). Old checkpoints with coversSeq ≤ S_rot stay valid.
+
+### 14.3 Stale-epoch rule
+
+For the winning revoke epoch r, committed at S_rot in the current vaultEpoch:
+- a frame with `keyEpoch < r` and `seq > S_rot` is **stale**: ignored, not quarantined (§9.3);
+- a checkpoint with `keyEpoch < r` and `coversSeq > S_rot` is rejected (treated as absent).
+
+Devices that have not re-keyed still learn r from the record header, so they apply the rule too.
+
+- **After a reset or restore**, S_rot is the seq of the re-published revoke record (§11.5). Between the new
+  vaultEpoch's first row and that re-publish, the server could inject old-epoch frames that the revoked device
+  sealed. This is an integrity risk only: the revoked device learns nothing new. It is bounded by the first kept
+  device to reconnect, and accepted.
+- **Fork** (non-goal, §2.1). A server that hides the revoke record from device X, and shows X a roll for r forged
+  with K_{r−1}, makes X adopt a key the revoked device knows. X's later writes are then readable by the revoked
+  device. A QR or RK re-key of X overrides it (out-of-band keys are authoritative, §11.3). The UX tells the user
+  to re-key **every** kept device, which closes this.
+
+### 14.4 What a revoked device keeps (said plainly)
+
+- **Everything it ever decrypted**: the notes, attachments and settings on its disk, and its IndexedDB.
+  Revocation cannot unsend them.
+- **Every key up to epoch r−1**, plus kAddr and kDiag (vault lifetime, §5.1). With the server's help it can:
+  - read every row and blob sealed before the revoke (old-epoch rows are never re-sealed);
+  - recognise a file it knows if it is uploaded again later, since the address is the same (§2.3).
+- **What it loses:** every row sealed under an epoch ≥ r, and all write access (D7).
+- **Deep rotation (decision D4).** Rotating kAddr means re-uploading every blob under new addresses, then deleting
+  the old ones (needs server ask A3). The cost is one PUT per blob and egress for the whole vault, and the only gain
+  is closing the "recognise a re-upload" leak. Recommended: no. It is an optional "Deep re-key" command later.
+- Alternative: re-seal all history under r on revoke. Rejected: the revoked device already holds the plaintext,
+  so it gains nothing. It costs a full rewrite of the vault, i.e. rows and day budget.
+
+## 15. Enable, migrate, disable
+
+### 15.1 Enable: new vaults only
+
+- Encryption is chosen **when the first device pairs to a new vault**, i.e. when `VAULT_READY.headSeq = 0`
+  (relay-wire §3.2). The pairing screen shows "End-to-end encryption: On" preselected (decision D2).
+- Enable steps:
+  1. generate K_1 and the RK;
+  2. show the RK and require the retype confirmation (§13.2);
+  3. append the genesis record to `k` as the vault's first frame, and hold every ns frame until it is receipted;
+  4. persist the keys and the record (§6.1), then set the pin `e2ee: {suite: 1}`.
+- `headSeq > 0` with no genesis means the vault already has plaintext. Enable is refused with "Encryption can
+  only be turned on for a new vault" and a link to §15.2.
+- A crash before step 3's receipt leaves an empty vault. The retry regenerates everything; pending keys are dropped
+  because the record never won.
+
+### 15.2 Migrate an existing vault, or turn encryption off
+
+Both mean **a new vault**:
+1. In the console, "Create vault" (DECISIONS D5).
+2. Pair this device to it with encryption On (or Off). The initial reconcile uploads every file from disk.
+3. Pair the other devices with the QR (§12).
+4. Delete the old vault in the console. Deletion runs `deleteAll()` and then purges the R2 prefix `v/<vaultId>/`
+   (DECISIONS D5, D9).
+   - Durable Object PITR keeps 30 days of history [CF-PITR]. Whether it can still restore after `deleteAll()` is
+     **[U]**, so the old plaintext may linger at Cloudflare for up to 30 days.
+
+- **Suites never coexist in a vault.** One pin per device. A suite-1 device treats suite-0 rows as malformed
+  (§9.2). A suite-0 device reading suite-1 rows halts (`unsupported-suite`, reader-dependent).
+- Alternative: migrate in place with reset-streams (D8a), then re-upload under suite 1. Rejected (decision D7):
+  - reset keeps R2 blobs (D9 has no generation in the R2 key), so plaintext attachments stay readable until the
+    blob GC (A3) exists;
+  - PITR keeps the plaintext timeline anyway;
+  - the result is a new vault in all but name, with confusing pairing.
+- Alternative: mixed suites during a migration window. Rejected: a downgrade path, and two code paths in every
+  reader.
