@@ -1,0 +1,51 @@
+server/src/config/config.ts
+  s_79d9b93476b202::t_3ad27a116049c0 1-21
+server/src/ports.ts
+  s_79d9b93476b202::t_40b7dfc7fe24b0 2-3,22-29,46-50
+server/src/vault/cloudflare.ts
+  s_79d9b93476b202::t_fc2eb05cdd28e1 1-41
+server/src/vault/devices.ts
+  s_67b8c9b1582106::t_b5af1edf77103c 1-79
+server/src/vault/schema.ts
+  s_79d9b93476b202::t_b285179620f8cd 1-29
+server/src/vault/vault.ts
+  s_79d9b93476b202::t_5652a7d672e716 1-47
+server/src/vaultId.ts
+  s_79d9b93476b202::t_ad29ce85e3cdc8 29-35
+tests/mocks/cloudflareWorkers.ts
+  s_5ec5b8c6943789::t_b8ff9fed3629a7 1-11
+tests/run-typescript.mjs
+  s_5ec5b8c6943789::t_4a5b1ec743a657 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e105da2caf78952bb204c5572bb6cf2fdcf9c675",
+  "prompts": {},
+  "sessions": {
+    "s_5ec5b8c6943789": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad23e7dffd5cd7d1b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_67b8c9b1582106": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac2eb42fe0cde3f33",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_79d9b93476b202": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4a02e307d4575a34",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
