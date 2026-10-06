@@ -1,0 +1,31 @@
+e2e/client/bootBench.ts
+  s_441b74abbd0702::t_3b5c1c5d4f9345 35,67-71,90
+e2e/client/bootTrace.ts
+  s_6e0df1c7504874::t_5d906a073fb56f 13-14,20,30-32,45-60,84,86-90
+e2e/client/editTrace.ts
+  s_6e0df1c7504874::t_1dcbcf2f4ecdda 1-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "93d72ee5a5e291ecdcca39f7b948a2a53210beea",
+  "prompts": {},
+  "sessions": {
+    "s_441b74abbd0702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5b78666751a5e84f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_6e0df1c7504874": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a391b87c3ffcb4eb9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
