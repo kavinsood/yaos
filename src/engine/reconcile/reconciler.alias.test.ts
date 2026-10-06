@@ -136,3 +136,27 @@ test("own rename suffixed, S1 lands after a pass already moved the file to the f
 	assert.deepEqual(w.vault.snapshot(), { "r0 (2).md": "a\n", "r0.md": "x\n" });
 	assert.ok(res.quiet, "no retried disk rename");
 });
+
+test("own rename applied while S is still at the old path (synced mirror restored after IDB loss): S follows the op", async () => {
+	const w = new World();
+	await w.boot();
+	const d = w.log.remoteCreate(P("a.md"), "a\n");
+	await w.sync();
+	const before = w.synced(d)!;
+	w.log.holdNs = true;
+	w.vault.userRename("a.md", "b.md");
+	await w.sync();
+	const s1 = w.log.onOwnFold;
+	w.log.onOwnFold = null;
+	const folded = await w.log.flushNs();
+	assert.deepEqual(folded.map((e) => e.outcome.kind), ["applied"]);
+	// The restored mirror predates the rename job: S is back at a.md with the older touch seq. A new file sits there.
+	await w.r.ctx.commit({ syncedPut: [w.r.ctx.record(before)] });
+	w.vault.userWrite("a.md", "new\n");
+	await s1?.(folded);
+	const res = await w.sync();
+	assert.equal(w.synced(d)?.path, "b.md", "S follows its own committed rename");
+	assert.notEqual(w.syncedByPath("a.md")?.docId, d, "the file at the old path is a new doc");
+	assert.deepEqual(w.vault.snapshot(), { "a.md": "new\n", "b.md": "a\n" });
+	assert.ok(res.quiet);
+});

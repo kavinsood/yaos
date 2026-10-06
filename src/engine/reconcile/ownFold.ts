@@ -9,7 +9,10 @@
  *   create suffixed    -> S keeps the requested path and nsTouchSeq, so the next
  *                         plan sees the remote move and renames the file (or
  *                         collapses an identical loser); blob: blobRev
- *   rename applied     -> nsTouchSeq = seq; suffixed -> S.path = requested path
+ *   rename applied     -> nsTouchSeq = seq (the rename job already moved S); S still behind
+ *                         the op (older nsTouchSeq, another path: a synced mirror restored after
+ *                         IDB loss re-folds own frames) -> also S.path = op.path
+ *                         suffixed -> S.path = requested path
  *   restore revived    -> path = requested path, nsTouchSeq = seq
  *   S has moved on (the requested path is not written) when a later own
  *   rename/restore of the doc is in this batch or still pending (S follows that
@@ -65,7 +68,7 @@ export async function applyOwnFold(ctx: Ctx, events: readonly OwnFoldEvent[]): P
 			}
 			case "rename":
 				if (!s) break;
-				if (outcome.kind === "applied") next.set(op.docId, { ...s, nsTouchSeq: seq });
+				if (outcome.kind === "applied") next.set(op.docId, s.nsTouchSeq < seq && s.pathKey !== ctx.pk(op.path) && !movedOn(i, op.docId, op.path, op.path, s) ? { ...s, path: op.path, pathKey: ctx.pk(op.path), nsTouchSeq: seq } : { ...s, nsTouchSeq: seq });
 				else if (outcome.kind === "suffixed" && !movedOn(i, op.docId, outcome.requestedPath, outcome.finalPath, s)) next.set(op.docId, { ...s, path: outcome.requestedPath, pathKey: ctx.pk(outcome.requestedPath) });
 				break;
 			case "restore":
