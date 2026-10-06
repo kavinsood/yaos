@@ -38,7 +38,7 @@ node e2e/conformance/run.ts --host https://<worker>.workers.dev --label <label> 
 | T-HAPPY | READY, PROVISIONAL/COMMITTED/NOTICE, no self-broadcast, bulk seq contiguity, ping, feed and read paging, the checkpoint status matrix (200 / 409 conflict / 400 not_advancing / 409 ahead / 404) |
 | T-OVERSIZE-1009 | A frame over 1 MiB + 1 KiB → close 1009 |
 | T-TWO-SOCKETS | Two sockets for the same device both receive peer broadcasts |
-| T-DEDUPE-CONFLICT | The same clientFrameId with different bytes → `VAULT_ERROR dedupe_conflict` |
+| T-DEDUPE-CONFLICT | The same clientFrameId with different bytes → `STREAM_APPEND_REJECTED client_frame_id_conflict` (seq = the original when present) |
 | T-CKPT-MULTICHUNK | A 2.5 MB checkpoint round-trips byte-identical |
 | T-PARTIAL-GC | Checkpoint below lastSeq: the rows above stay readable |
 | T-RATE-SOCKET | Bursting past the socket bucket → `VAULT_BACKPRESSURE relay_rate_limit` then 1013; the committed rows form a prefix; resends dedupe to the same seqs |

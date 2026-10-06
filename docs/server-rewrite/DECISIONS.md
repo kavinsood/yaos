@@ -491,9 +491,13 @@ vault DO's `deleteAll()` (not measured); restore 3 (insert, update, delete).
 
 "scratch-3" is today's `yaos-relay2-scratch-3` (legacy server, `YAOS_STREAMS=true`, no R2). BB results are
 measured: `experiments/logs/conformance-scratch3-baseline-20261005T215906Z.json` and
-`conformance-scratch3-flags-20261006T050159Z.json`; the revoke rows from `conformance-scratch3-revoke-20261006T051325Z.json`. `*` marks a
-WB test: it never runs against scratch-3, so the entry is a guess at today's code. BB files live in
-`e2e/conformance/tests/`, WB files in `tests/server/` (WB file names are suggestions).
+`conformance-scratch3-flags-20261006T050159Z.json`; the revoke rows from `conformance-scratch3-revoke-20261006T051325Z.json`.
+These three ran uncommitted suite versions, so their check names can differ from the committed suite (for example
+T-ENROLL-BODY); the runner now records `<sha>+dirty` in that case. Second measurement: the same legacy commit under
+local `wrangler dev` (`conformance-local-legacy-20261006T060730Z.json`) gives the same status on all 50 BB tests, so
+local dev stands in for deployed in P2–P4; only timings differ (round trip ≈ 0.4 ms vs 80 ms). `*` marks a WB test:
+it never runs against scratch-3, so the entry is a guess at today's code. BB files live in `e2e/conformance/tests/`,
+WB files in `tests/server/` (WB file names are suggestions).
 
 | ID | What | Kind | scratch-3 | Where |
 |---|---|---|---|---|
@@ -523,9 +527,9 @@ WB test: it never runs against scratch-3, so the entry is a guess at today's cod
 | T-REVOKE-GATE | no frame the revoked socket sends after the revoke response commits (incl. after idle) | BB | PASS | revoke.ts |
 | T-REVOKE-SILENCE | the revoked socket gets no data-bearing message after the revoke response | BB | PASS | revoke.ts |
 | T-REVOKE-BUFFER | frames buffered for group commit at revoke never commit, no receipt | BB | FAIL (23/23 committed) | revoke.ts |
-| T-REVOKE-4403 | error frame and close frame 4403 each < 1 s; TCP end recorded | BB | FAIL (route; legacy owner route: 207 / 211 ms) | operator.ts |
+| T-REVOKE-4403 | error frame and close frame 4403 each < 1 s; TCP end recorded | BB | FAIL (route; legacy owner route: 207 / 211 ms deployed, 6 / 10.5 ms local; TCP end ≈ 10 s in both) | operator.ts |
 | T-REVOKE-401 | revoked bearer → 401 on ticket, feed, read, pairing-code | BB | FAIL (route; legacy: all 401) | operator.ts |
-| T-RESET | new epoch, empty streams, 1001 closes, devices kept | BB | FAIL | operator.ts |
+| T-RESET | new epoch, empty streams, 1001 closes, devices kept | BB | FAIL (its restore probe: 404 on legacy, deployed and local; 501 without PITR applies to the rewrite only) | operator.ts |
 | T-RESTORE-RESUME-WB | fake PITR port, crash after each step; resume ends with snapshot devices, no codes, new epoch, no journal row | WB | FAIL* | restore.ts |
 | T-RESTORE-MANUAL | restore to T: content rewound, devices as of the request, codes gone, epoch rotates (deployed only) | manual | n/a | manual |
 | T-EPOCH-MISMATCH | wrong or empty epoch → 409 + vaultEpoch, no effect | BB | FAIL | checkpoint.ts |
@@ -544,7 +548,7 @@ WB test: it never runs against scratch-3, so the entry is a guess at today's cod
 | T-DEDUPE-SMALL | 400×4 KiB resend → deduped | BB | FAIL | commit.ts |
 | T-DEDUPE-CONFLICT | same id, other bytes → client_frame_id_conflict + seq | BB | PASS | socket.ts |
 | T-DEDUPE-COLD-WB | the same after a runtime restart; ≤ 65 rows read | WB | FAIL* | dedupe.ts |
-| T-DAILY | simulated limit → VAULT_ERROR cf_daily_limit; checkpoint 503 | BB | SKIP (no `YAOS_DEBUG_ROUTES`) | misc.ts |
+| T-DAILY | simulated limit → VAULT_ERROR cf_daily_limit; checkpoint 503 | BB | SKIP (legacy's switch is `YAOS_TEST_ONLY_DEBUG_ROUTES`, unset; the rewrite uses `YAOS_DEBUG_ROUTES=1`) | misc.ts |
 | T-COMMIT-DAILY-WB | the relay types the daily limit itself | WB | PASS* (same wire) | relay-commit.ts |
 | T-COMMIT-RETRY-WB | durability_failed + retryAfterMs, backoff, reset | WB | FAIL* | relay-commit.ts |
 | T-SOCKET-CACHE-WB | attachment parsed once per socket per runtime; wake rebuild skips revoked devices | WB | FAIL* | socket-cache.ts |

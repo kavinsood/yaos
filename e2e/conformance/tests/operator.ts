@@ -11,12 +11,14 @@ import { findDeviceEntries, id, now, payloadOf, round, tokenLikeKeys } from "../
 
 const enc = encodeURIComponent;
 
-/** Registers credential-looking strings found in a response so they can never reach output. */
+/** Registers credential-looking strings found in a response so they can never reach output. `…Id` keys are record ids,
+ * not credentials: legacy `/operator/state` lists unused pairing codes by a random 16-char `codeId`, and registering it
+ * made `leaksSecret` flag the very response that carried it. */
 function guard(ctx: Ctx, value: unknown) {
 	if (Array.isArray(value)) value.forEach((v) => guard(ctx, v));
 	else if (value && typeof value === "object") {
 		for (const [key, child] of Object.entries(value)) {
-			if (typeof child === "string" && /code|token|ticket|secret|key/i.test(key)) secret(ctx, child);
+			if (typeof child === "string" && /code|token|ticket|secret|key/i.test(key) && !/Id$/.test(key)) secret(ctx, child);
 			else guard(ctx, child);
 		}
 	}

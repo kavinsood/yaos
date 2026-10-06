@@ -120,7 +120,12 @@ for (const tid of ORDER) {
 }
 
 let sha: string | null = null;
-try { sha = execFileSync("git", ["-C", new URL("../..", import.meta.url).pathname, "rev-parse", "--short", "HEAD"]).toString().trim(); }
+try {
+	const root = new URL("../..", import.meta.url).pathname;
+	sha = execFileSync("git", ["-C", root, "rev-parse", "--short", "HEAD"]).toString().trim();
+	// With uncommitted suite edits the sha alone does not identify the code that ran.
+	if (execFileSync("git", ["-C", root, "status", "--porcelain", "--", "e2e/conformance"]).toString().trim()) sha += "+dirty";
+}
 catch { /* not a checkout */ }
 const count = (status: string, group?: string) => results.filter((r) => r.status === status && (!group || r.group === group)).length;
 const summary = {
