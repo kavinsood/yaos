@@ -222,6 +222,21 @@ export class BindingManager {
 		return false;
 	}
 
+	/**
+	 * Post the coalesce buffer of every replica bound at `path` now. True when edits were posted:
+	 * the engine had not seen them, so a delete planned without them must be replanned (§c.7).
+	 */
+	flushPath(path: string): boolean {
+		let posted = false;
+		for (const slot of this.slots.values()) {
+			const rep = slot.rep;
+			if (!rep || slot.view.path === null || !this.samePath(slot.view.path, path)) continue;
+			if (rep.pending.length > 0 && !rep.suspended) posted = true;
+			this.flush(rep);
+		}
+		return posted;
+	}
+
 	boundDocs(): DocId[] {
 		return [...this.replicas.keys()] as DocId[];
 	}

@@ -145,6 +145,26 @@ test("diskExecutor: bound guard blocks content writes to an open note, not confl
 	assert.equal(outcomeOk(res2[0]), true, "guard is live: unbound path is writable");
 });
 
+test("diskExecutor: trash of a bound note with unsent editor edits posts them and refuses once (§c.7)", async () => {
+	const clock = new VirtualClock();
+	const hasher = createHasher(simHashPort());
+	const vault = new SimVault({ clock, hasher, profile: "case-insensitive" });
+	const unsent = new Set(["open.md"]);
+	const flushed: string[] = [];
+	const exec = new DiskExecutor({
+		vault, configDir: new SimConfigDir(clock), clock, hasher, isBoundPath: () => true, budgets: () => ({ mainSliceMs: 8 }),
+		flushBoundPath: (p) => { flushed.push(p); return unsent.delete(p); },
+	});
+	vault.userWrite("open.md", "typed");
+	const trash = (): DiskOp => ({ t: "trash", opId: opId++, path: "open.md", mode: "obsidian-trash", precondition: ANY, docId: "d1" as DocId, purpose: "remote-delete" });
+	const r1 = (await exec.run(0, [trash()]))[0];
+	assert.ok(r1 && r1.t === "trash" && !r1.outcome.ok && r1.outcome.reason === "precondition" && r1.outcome.message === "bound-unsent-edits");
+	assert.equal(vault.hasFile("open.md"), true, "edits were unsent: the engine must replan before trashing");
+	assert.equal(outcomeOk((await exec.run(0, [trash()]))[0]), true, "nothing left to post: bound notes are still trashable");
+	assert.deepEqual(flushed, ["open.md", "open.md"]);
+	assert.equal(vault.hasFile("open.md"), false);
+});
+
 test("diskExecutor: lanes execute open-note first; order within a batch is preserved", async () => {
 	const { vault, exec } = setup();
 	const order: string[] = [];

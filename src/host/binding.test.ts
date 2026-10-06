@@ -272,11 +272,16 @@ test("binding: retarget deleted waits for bindable; saveViews; flushAll is synch
 	assert.equal(bm.slotState(vf.viewId), "waiting");
 	assert.deepEqual(notices, ["doc-frozen"]);
 
+	assert.equal(bm.flushPath("r.md"), false, "nothing unsent");
 	v.edit(1, 0, "x");
+	assert.equal(bm.flushPath("f.md"), false, "other path untouched");
+	assert.equal(bm.flushPath("R.md"), true, "flushPath posts a bound path's unsent edits now");
+	assert.equal(engine.count("localUpdate"), 1);
+	v.edit(2, 0, "y");
 	bm.flushAll();
-	assert.equal(engine.count("localUpdate"), 1, "flushAll posts without waiting for the timer");
+	assert.equal(engine.count("localUpdate"), 2, "flushAll posts without waiting for the timer");
 	assert.deepEqual(await bm.saveViews(["d:r.md" as DocId, "d:nope.md" as DocId]), ["d:r.md"]);
-	assert.equal(vault.textOf("r.md"), "rx");
+	assert.equal(vault.textOf("r.md"), "rxy");
 
 	bm.onDocRetarget("d:r.md" as DocId, { t: "deleted" });
 	assert.equal(bm.slotState(v.viewId), "waiting");

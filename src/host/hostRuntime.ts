@@ -85,6 +85,7 @@ export class HostRuntime {
 			clock: deps.clock,
 			hasher: deps.hasher,
 			isBoundPath: (p) => this.bindings.isBoundPath(p),
+			flushBoundPath: (p) => this.bindings.flushPath(p),
 			budgets: () => BUDGETS[this.deviceClass],
 		});
 		this.batcher = new VaultEventBatcher(deps.clock, (events) => {

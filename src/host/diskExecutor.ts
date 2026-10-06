@@ -32,6 +32,8 @@ export interface DiskExecutorDeps {
 	readonly hasher: Hasher;
 	/** Live check: is this vault path currently bound to an editor view. */
 	readonly isBoundPath: (path: string) => boolean;
+	/** Post a bound path's unsent editor edits; true when there were any (trash then refuses). */
+	readonly flushBoundPath?: (path: string) => boolean;
 	readonly budgets: () => Pick<Budgets, "mainSliceMs">;
 }
 
@@ -177,6 +179,11 @@ export class DiskExecutor {
 				return { opId: op.opId, t: "rename", outcome };
 			}
 			case "trash": {
+				// Edits typed before the delete reached this device beat it (§c.7): post them and refuse,
+				// so the engine replans with the doc's pending body (restore instead of trash).
+				if (this.deps.flushBoundPath?.(op.path)) {
+					return { opId: op.opId, t: "trash", outcome: { ok: false, reason: "precondition", message: "bound-unsent-edits" } };
+				}
 				let outcome: RenameOutcome;
 				try {
 					outcome = await vault.trash(op.path, op.mode, op.precondition);
