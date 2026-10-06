@@ -1,0 +1,21 @@
+src/host/binding.test.ts
+  s_27aea4557efbc1::t_fc485d61241784 6,37,131,135-151
+src/host/binding.ts
+  s_27aea4557efbc1::t_b397a0f1b164ec 32,34,44-45,57-58,405,532,564,569,597-603,613
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5d39472391b33f50e130ce3aa59190e6689360d4",
+  "prompts": {},
+  "sessions": {
+    "s_27aea4557efbc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2f141519dac0ecc1",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
