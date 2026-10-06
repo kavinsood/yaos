@@ -1,9 +1,8 @@
 /**
  * Pairing modals: PairModal (join this device to a vault with a server URL + one-time code) and
- * the "pair another device" code display with an "Open pairing page" button. Ported from the old
- * client (adfa7a7:src/settings/PairDeviceModal.ts and the enrollment parts of
- * adfa7a7:src/settings/settingsTab.ts). No QR code: scripts/check-deps.mjs does not let the host
- * import the qrcode package.
+ * the "pair another device" code display with a QR code of the mobile setup page and an "Open
+ * pairing page" button. Ported from the old client (adfa7a7:src/settings/PairDeviceModal.ts, QR at
+ * :40-65, and the enrollment parts of adfa7a7:src/settings/settingsTab.ts).
  *
  * SECRETS: the pairing code input is a password field; codes and tokens are never logged. The
  * code shown by PairingCodeModal is displayed only because handing it to the other device is the
@@ -11,6 +10,7 @@
  */
 
 import { Modal, Notice, Setting, type App, type ButtonComponent } from "obsidian";
+import { toCanvas } from "qrcode";
 import type { YaosUiHost } from "./api";
 import { errorMessage } from "./format";
 import { copyText, obsidianRequest } from "./obsidianEnv";
@@ -184,9 +184,11 @@ export class PairingCodeModal extends Modal {
 
 	private renderGrant(grant: PairingCodeGrant): void {
 		const { contentEl } = this;
+		const page = grant.mobileSetupUrl;
 		contentEl.createEl("p", {
-			text: "On the other device, open the setup link, or open YAOS settings, choose \"Pair this device\" and enter the server URL and this code. Anyone with this code can join your vault until it is used or expires, so share it only with your own device.",
+			text: `${page ? "Scan the QR code with your phone's camera, or on" : "On"} the other device open the setup link, or open YAOS settings, choose "Pair this device" and enter the server URL and this code. Anyone with this code can join your vault until it is used or expires, so share it only with your own device.`,
 		});
+		if (page) this.renderQr(page);
 
 		const field = (label: string, value: string, rows: number): Setting => {
 			const s = new Setting(contentEl).setName(label);
@@ -204,7 +206,6 @@ export class PairingCodeModal extends Modal {
 		field("Server URL", this.host.data().identity?.host ?? "", 1);
 		field("Pairing code", grant.pairingCode, 2);
 		field("Setup link", grant.setupLink, 3);
-		const page = grant.mobileSetupUrl;
 		// pairing.ts admits only a URL under the paired server's origin, so opening it is safe.
 		if (page) field("Mobile setup page", page, 2).addButton((b) => b.setButtonText("Open pairing page").onClick(() => { window.open(page, "_blank", "noopener"); }));
 
@@ -223,6 +224,21 @@ export class PairingCodeModal extends Modal {
 		this.timer = window.setInterval(tick, 1000);
 
 		new Setting(contentEl).addButton((b) => b.setButtonText("Done").setCta().onClick(() => this.close()));
+	}
+
+	/** The mobile setup page as a QR code (legacy size and error correction); on failure a short note replaces it. */
+	private renderQr(page: string): void {
+		const wrap = this.contentEl.createDiv({ cls: "yaos-pairing-qr" });
+		const canvas = wrap.createEl("canvas", { cls: "yaos-pairing-qr-canvas", attr: { role: "img", "aria-label": "QR code for the mobile setup page" } });
+		canvas.hidden = true;
+		toCanvas(canvas, page, { width: 220, margin: 1, errorCorrectionLevel: "M" }).then(
+			() => { if (!this.closed) canvas.hidden = false; },
+			() => {
+				if (this.closed) return;
+				canvas.remove();
+				wrap.createEl("p", { cls: "mod-warning", text: "Could not draw the QR code. Use the mobile setup page below." });
+			},
+		);
 	}
 
 	private stopTimer(): void {

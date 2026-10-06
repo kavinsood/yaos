@@ -1882,8 +1882,9 @@ These are enforced by `scripts/check-deps.mjs` (WP-D), a regex import scan run i
 - `engine/**` imports `core`, `ports`, `protocol`, `yjs`, `lib0` and `fflate`.
   - Never `obsidian` or `host/**`.
   - Browser globals (`indexedDB`, `WebSocket`, `fetch`, `crypto.subtle`) only in `engine/adapters/**`.
-- `host/**` imports `core`, `ports`, `protocol`, `obsidian`, `yjs`, `y-codemirror.next` and `@codemirror/*`. From
-  `engine/` it imports only `engine/runtime/engine.ts` (inline fallback) and the bundled worker source string.
+- `host/**` imports `core`, `ports`, `protocol`, `obsidian`, `yjs`, `y-codemirror.next`, `@codemirror/*` and `qrcode`
+  (the pairing QR). From `engine/` it imports only `engine/runtime/engine.ts` (inline fallback) and the bundled worker
+  source string.
 - `sim/**` may import anything. Nothing imports `sim/**` except tests.
 - Shared shapes change only through the architect files plus this document.
 

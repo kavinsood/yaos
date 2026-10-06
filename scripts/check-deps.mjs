@@ -159,7 +159,7 @@ function checkPackage(area, spec, typeOnly, line, err, file) {
 		ports: [],
 		protocol: [],
 		engine: ["yjs", "lib0", "fflate"],
-		host: ["obsidian", "yjs", "y-codemirror.next", "@codemirror/state", "@codemirror/view", "@codemirror/commands", "@codemirror/language"],
+		host: ["obsidian", "yjs", "y-codemirror.next", "@codemirror/state", "@codemirror/view", "@codemirror/commands", "@codemirror/language", "qrcode"],
 	}[area];
 	if (!allowed) return err(line, `unknown source area ${area}`);
 	if (area === "ports" && pkg === "yjs" && typeOnly && file === "ports/workspace.ts") return;
