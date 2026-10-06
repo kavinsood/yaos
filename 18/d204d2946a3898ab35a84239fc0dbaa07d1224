@@ -1,0 +1,29 @@
+src/core/plan/planner.test.ts
+  s_67b8c9b1582106::t_cd4819267474b4 184,201-229
+src/core/plan/planner.ts
+  s_67b8c9b1582106::t_8a27f4cfc82a37 90-102,249-253,409
+src/engine/reconcile/diskJobs.ts
+  s_67b8c9b1582106::t_6475b0187c6cce 13,52-60
+src/engine/reconcile/mergeJob.ts
+  s_67b8c9b1582106::t_af91db8bbb4d5a 89,160-168
+src/engine/reconcile/reconciler.alias.test.ts
+  s_67b8c9b1582106::t_d19704b570d2d7 1-71
+src/engine/reconcile/testkit/stubLog.ts
+  s_67b8c9b1582106::t_95255590c90663 76-77,110-117,186,413-419
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "18d204d2946a3898ab35a84239fc0dbaa07d1224",
+  "prompts": {},
+  "sessions": {
+    "s_67b8c9b1582106": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac2eb42fe0cde3f33",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
