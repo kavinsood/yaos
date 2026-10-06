@@ -46,9 +46,6 @@ export const STREAM_FRAME_PROVISIONAL = 0x10;
 export const STREAM_FRAME_COMMITTED = 0x11;
 export const STREAM_FRAME_COMMIT_NOTICE = 0x12;
 
-/** The vault's namespace stream; always delivered committed (with seq). */
-export const NS_STREAM = "ns";
-
 /**
  * Streams whose frames are broadcast before the commit (PROVISIONAL, then a
  * COMMIT_NOTICE with the seq). Every other stream (ns included) is broadcast

@@ -4,7 +4,6 @@ import type { UpgradeRejectPort } from "./ports";
 
 const CORS_ALLOW_HEADERS = "Authorization, Content-Type";
 const CORS_ALLOW_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
-const CORS_EXPOSE_HEADERS = "X-YAOS-Content-SHA256, X-YAOS-Content-Size";
 
 export function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -30,7 +29,6 @@ export function withCors(response: Response): Response {
 	headers.set("Access-Control-Allow-Origin", "*");
 	headers.set("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS);
 	headers.set("Access-Control-Allow-Methods", CORS_ALLOW_METHODS);
-	headers.set("Access-Control-Expose-Headers", CORS_EXPOSE_HEADERS);
 	const webSocket = (response as { webSocket?: WebSocket | null }).webSocket ?? null;
 	return new Response(response.body, {
 		status: response.status,

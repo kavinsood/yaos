@@ -1,7 +1,9 @@
-// D4 streams tickets: HMAC-SHA-256 with the vault's 32-byte key from vault_meta. The wire is the legacy one (removed
+// D4 streams tickets: HMAC-SHA-256 with the 32-byte ticket key from vault_meta. The wire is the legacy one (removed
 // server/src/routes/ticket.ts): base64url(JSON payload) "." base64url(HMAC(key, encoded payload)), payload v 4,
 // aud "yaos-vault-ws", purpose and documentId "streams", the actor's D6 fields, iat, exp, nonce. The legacy
-// deploymentId is gone: the key is per vault, so a ticket cannot verify in another vault (T-TICKET-CROSS-VAULT).
+// deploymentId is gone: each vault has its own ticket key, so a ticket cannot verify in another vault
+// (T-TICKET-CROSS-VAULT). The ticket key only signs tickets; it is not the E2EE vault key (K_e), which the server
+// never sees.
 import { base64UrlToBytes, bytesToBase64Url, randomBase64Url } from "../base64url";
 import type { StreamActor } from "../streams/relay";
 
@@ -33,7 +35,7 @@ export function readTicketTtlMs(raw: string | undefined): number {
 		: TICKET_TTL_MS;
 }
 
-/** The vault key as a non-extractable HMAC key (workers-types SubtleCrypto.importKey). */
+/** The ticket key as a non-extractable HMAC key (workers-types SubtleCrypto.importKey). */
 export function importTicketKey(raw: Uint8Array): Promise<CryptoKey> {
 	return crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 }
