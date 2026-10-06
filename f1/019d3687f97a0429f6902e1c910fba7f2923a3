@@ -1,0 +1,25 @@
+src/engine/compose/hostLink.ts
+  s_ed451e485d98d2::t_13b23280a2346f 1-153
+src/host/engineHost.ts
+  s_ed451e485d98d2::t_f0599472a273a0 40,387-388
+src/host/hostRuntime.ts
+  s_ed451e485d98d2::t_4f79c08aeb3290 17,263-279
+src/protocol/messages.ts
+  s_ed451e485d98d2::t_a62cebf826347f 102-117,180-181,203
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f1019d3687f97a0429f6902e1c910fba7f2923a3",
+  "prompts": {},
+  "sessions": {
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
