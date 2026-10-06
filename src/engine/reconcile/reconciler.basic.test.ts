@@ -195,6 +195,33 @@ test("bound doc merged, then the app crashed before the editor saved: reboot wri
 	assert.deepEqual(w.conflictCopies(), []);
 });
 
+/**
+ * Sim heavy seed 119: the editor typed while a merge of its doc was closing its frame. The keystrokes rode
+ * that frame, so S claimed their version with the disk text; the app then died before the editor's save
+ * and the disk never got them (Rc and Lc both false).
+ */
+test("bound doc: keystrokes landing in the merge's frame are not claimed by S; the next unbound pass writes them", async () => {
+	const w = await booted();
+	const id = w.log.remoteCreate(P("b.md"), "x\n") as DocId;
+	await w.sync();
+	w.log.setBound(id, true);
+	w.vault.userWrite("b.md", "x\ny\n");
+	let typed = false;
+	w.log.onCommitEdits = (d) => {
+		if (d !== id || typed) return;
+		typed = true;
+		w.log.editorType(id, (t) => t.insert(t.length, "z\n"));
+	};
+	await w.sync();
+	assert.ok(typed);
+	assert.equal(w.log.text(id), "x\ny\nz\n");
+	assert.equal(w.vault.text("b.md"), "x\ny\n");
+	w.log.setBound(id, false); // closed before its save
+	await w.sync();
+	assert.equal(w.vault.text("b.md"), "x\ny\nz\n");
+	assert.deepEqual(w.conflictCopies(), []);
+});
+
 test("bound doc merged, then the editor saved: S gets its sync point, closing writes nothing", async () => {
 	const { w, id } = await boundMergedAwaitingSave();
 	w.vault.userWrite("b.md", "Aa\nb\nc\nd\n"); // the editor's save

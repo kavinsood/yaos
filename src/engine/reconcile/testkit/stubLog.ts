@@ -30,6 +30,8 @@ import type { BodyHandle, LogPort, OwnFoldEvent, RemoteView } from "../deps";
 export const REMOTE = Symbol("REMOTE");
 export const MERGE = Symbol("MERGE");
 export const LOAD = Symbol("LOAD");
+/** A bound editor's keystrokes (editorType): framed with the next commitEdits, like the engine's open frame. */
+export const EDITOR = Symbol("EDITOR");
 
 interface Entry {
 	docId: DocId;
@@ -83,6 +85,8 @@ export class StubLog implements LogPort {
 	onOwnFold: ((events: readonly OwnFoldEvent[]) => Promise<void>) | null = null;
 	/** Called right before acquireBody returns (inject concurrent remote edits). */
 	onAcquire: ((docId: DocId) => void) | null = null;
+	/** Called as commitEdits starts, before the frame closes (inject editor keystrokes racing a merge). */
+	onCommitEdits: ((docId: DocId) => void) | null = null;
 	private nextClient = 1000;
 	private idCounter = 0;
 
@@ -304,7 +308,7 @@ export class StubLog implements LogPort {
 			const d = this.durableDoc(b);
 			d.clientID = 1; // this device
 			d.on("update", (u: Uint8Array, origin: unknown) => {
-				if (origin === MERGE) b.unframed.push(u);
+				if (origin === MERGE || origin === EDITOR) b.unframed.push(u);
 			});
 			b.replica = d;
 		}
@@ -318,6 +322,7 @@ export class StubLog implements LogPort {
 			mergeOrigin: MERGE,
 			bound: b.bound,
 			commitEdits: async () => {
+				this.onCommitEdits?.(docId);
 				if (b.unframed.length > 0) {
 					b.localOrder = ++this.order;
 					for (const u of b.unframed) {
@@ -338,6 +343,14 @@ export class StubLog implements LogPort {
 				}
 			},
 		};
+	}
+
+	/** Keystrokes in a bound editor on the pinned replica; they ride the next commitEdits frame. */
+	editorType(docId: DocId, fn: (t: Y.Text) => void): void {
+		const b = this.ensureBody(docId);
+		if (!b.bound || !b.replica) throw new Error("editorType: not bound or no replica");
+		const r = b.replica;
+		r.transact(() => fn(r.getText("text")), EDITOR);
 	}
 
 	setBound(docId: DocId, bound: boolean): void {

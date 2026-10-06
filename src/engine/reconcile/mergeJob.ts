@@ -91,6 +91,7 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 
 	let result: MergeResult | null = null;
 	let crdt0 = "";
+	let crdt1 = ""; // the CRDT text right after the merge transaction
 	let v0 = h.version();
 	for (let attempt = 0; ; attempt++) {
 		if (attempt >= MAX_CAS_ATTEMPTS) return "fail"; // remote kept moving: re-plan
@@ -107,13 +108,18 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		}
 		// Synchronous section: CAS, apply, capture the version.
 		if (ytext.toString() !== crdt0) continue;
-		if (res.kind === "disk-only" || res.kind === "clean" || res.kind === "conflict") applyMinimalDiff(h, ytext, crdt0, res.text);
+		const apply = res.kind === "disk-only" || res.kind === "clean" || res.kind === "conflict";
+		if (apply) applyMinimalDiff(h, ytext, crdt0, res.text);
+		crdt1 = apply ? res.text : crdt0;
 		v0 = h.version();
 		result = res;
 		break;
 	}
 	const v1 = await h.commitEdits();
-	const bodyVersion = { remoteSeq: v0.remoteSeq, localOrder: v1.localOrder };
+	// Editor keystrokes applied between the CAS and the frame close are covered by v1.localOrder but are not in M:
+	// recording v1 would claim the disk holds them, and a crash before the editor's save lost them on this disk
+	// for good (sim heavy seed 119). No sync point then (header): the next pass merges again.
+	const bodyVersion = ytext.toString() === crdt1 ? { remoteSeq: v0.remoteSeq, localOrder: v1.localOrder } : null;
 	const M = result.kind === "identical" ? D : result.text;
 
 	// Conflict copy of the disk side (exact original bytes).
