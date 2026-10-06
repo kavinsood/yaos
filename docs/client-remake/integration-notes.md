@@ -9,6 +9,21 @@ stand-in is gone (922d7d7).
 Read with DESIGN.md (the spec), relay-wire.md (the wire), and the per-package
 notes (wp-a..wp-d-notes.md). Section letters (§x.y) refer to DESIGN.md.
 
+## 0. User decisions (2026-10-07)
+
+- **Server code lives on `server-remake` only.** The latency work had changed `server/` on this branch (batched
+  read 18ea6fd, leading-edge commit 2c3afd1). They were carried to `server-remake` as fee6b31 and merged back
+  (f7ef9a8); `git diff server-remake client-remake -- server/ tests/server/` is empty. Client branches do not edit
+  `server/` or `tests/server/`: a server change lands on `server-remake` first and is merged in.
+- **No server backup alarm.** The server never parses note content (Option A from relay-v2-spike is not coming
+  back). Backups are client snapshots uploaded as opaque bundles (DESIGN §j.4) or the operator's point-in-time
+  restore (DECISIONS D8b).
+- **H8 stays.** At most one commit per second per vault: back-to-back edits reach a peer in about 1 s and new
+  files in about 2 s (§7.1). The free-plan row budget wins over sub-second propagation.
+- **No server-metadata UI.** The "Attachment storage" status row and the "R2 backend detected" notice are dropped
+  (legacy-parity.md §3.4, §8); no polling loops to display server state.
+- **E2EE:** e2ee-design.md §22 D1–D8 as recommended, and a key-less join fails closed (no "Continue unencrypted").
+
 ## 1. Gates
 
 | Gate | Command | Result |

@@ -33,8 +33,8 @@ There are 236 rows in total.
 |---|---|
 | `ported` | 83 |
 | `implemented (<commit>)` | 52 |
-| `dropped: ...` | 97 |
-| `missing: ...` | 4 |
+| `dropped: ...` | 99 |
+| `missing: ...` | 2 |
 | Total | 236 |
 
 Rows per section:
@@ -43,12 +43,12 @@ Rows per section:
 |---|---|---|---|---|
 | 1. Settings sync | 12 | 11 | 10 | 0 |
 | 2. Commands | 5 | 4 | 8 | 0 |
-| 3. Status bar and UI | 23 | 9 | 28 | 1 |
+| 3. Status bar and UI | 23 | 9 | 29 | 0 |
 | 4. Onboarding and pairing | 11 | 6 | 1 | 0 |
 | 5. Snapshots and restore | 5 | 9 | 3 | 1 |
 | 6. Diagnostics | 3 | 4 | 2 | 0 |
 | 7. Frontmatter | 0 | 0 | 5 | 0 |
-| 8. Attachments | 5 | 0 | 1 | 1 |
+| 8. Attachments | 5 | 0 | 2 | 0 |
 | 9. Canvas | 5 | 0 | 3 | 0 |
 | 10. Conflict copies | 1 | 3 | 2 | 0 |
 | 11. Trash and deletes | 0 | 1 | 1 | 0 |
@@ -63,9 +63,7 @@ Rows per section:
 
 Still missing:
 
-- §3.4 "Attachment storage" status and "Refresh attachment capability". Undecided; small.
 - §5 Cross-device restore. Large; DESIGN §j.4 keeps it out of v1.
-- §8 "R2 backend detected" notice, and a daily snapshot when storage appears. Undecided; small.
 - §18 In-plugin governance as a whole. Large.
 
 Wave-2 rows, all implemented:
@@ -214,7 +212,7 @@ settings-seed question (src/host/ui/settingsTab.ts:43-64).
 | "Open server console" (wave 2) | adfa7a7:src/settings/settingsTab.ts:286-290: a settings action "Open this Worker in a browser. The operator key stays in the console." It calls adfa7a7:src/main.ts:3476-3483, which trims the configured server URL, drops a trailing slash, shows "Configure a server URL first." when it is empty, and otherwise calls window.open(host, "_blank", "noopener"). | src/host/ui/settingsTab.ts:114-119 (row shown only while paired), :407-411 (`window.open(url, "_blank", "noopener")`, else the notice "the stored server address is not a web address. Pair this device again."); src/host/ui/settingsModel.ts:193-203 (`serverConsoleUrl`: the origin of the stored host, http(s) only, no credentials in the URL) | implemented (f841bc4) |
 | "Leave this vault" (members only) | adfa7a7:src/settings/settingsTab.ts:291-296; adfa7a7:src/main.ts:3584 | src/host/ui/settingsTab.ts:120-125 ("Unpair this device"; local only, the confirm text at :418 points at the server console) | dropped: governance moved to the server operator console (§18) |
 | Updates group (versions, refresh, update action, initialize updater) | adfa7a7:src/settings/settingsTab.ts:305-340 | MISSING | dropped: DESIGN §m.2 (plugin install/update flows; see §14) |
-| "Attachment storage" status and "Refresh attachment capability" | adfa7a7:src/settings/settingsTab.ts:398-409 | MISSING as a row; only the no-attachment-storage warning (src/engine/reconcile/blobJobs.ts:26) | missing: undecided; small (a read-only row that says whether the server has attachment storage) |
+| "Attachment storage" status and "Refresh attachment capability" | adfa7a7:src/settings/settingsTab.ts:398-409 | MISSING as a row; only the no-attachment-storage warning (src/engine/reconcile/blobJobs.ts:26) | dropped: user decision 2026-10-07: no UI that only displays server metadata; the no-attachment-storage warning stays |
 | "Set up attachment storage" video | adfa7a7:src/settings/settingsTab.ts:410-415 (URL at :137) | MISSING | dropped: attachment storage video (coordinator decision) |
 | Collaboration group ("Show remote cursors") | adfa7a7:src/settings/settingsTab.ts:460-470 | MISSING | dropped: DESIGN §m.2 (awareness/cursor presence) |
 | Operational resource rows (residency, queued work, blockers, body sockets, pressure) | adfa7a7:src/settings/settingsTab.ts:509-543 | MISSING (engine rows at src/host/ui/settingsModel.ts:236) | dropped: DESIGN §m.2 (runtime coordinators) |
@@ -350,7 +348,7 @@ attachment-storage info row is in §3.4.
 | Effective cap is the smaller of the user limit and the server's upload limit | adfa7a7:src/settings/settingsStore.ts:14-23; adfa7a7:src/sync/blobSync.ts:482 | src/engine/reconcile/localState.ts:81; src/engine/adapters/httpBlob.ts:23, :122-124 | ported (the field text is the wave-2 row in §3.5) |
 | Downloaded attachment verified against its hash | adfa7a7:src/sync/blobSync.ts:1494-1505 | src/engine/blobs/blobQueue.ts:183-184 | ported |
 | Transfer concurrency from the "Parallel transfers" setting | adfa7a7:src/sync/blobSync.ts:481 | src/core/limits.ts:173, :179, :185, :191 (`blobConcurrency` per device class) | dropped: attachmentConcurrency setting (fixed limits in src/core/limits.ts) |
-| "R2 backend detected" notice, and a daily snapshot when storage appears | adfa7a7:src/runtime/capabilityUpdateService.ts:498-509 | MISSING (the store is chosen when the engine starts, src/engine/adapters/httpBlob.ts:121-124) | missing: undecided; small (a notice when the capabilities gain attachments) |
+| "R2 backend detected" notice, and a daily snapshot when storage appears | adfa7a7:src/runtime/capabilityUpdateService.ts:498-509 | MISSING (the store is chosen when the engine starts, src/engine/adapters/httpBlob.ts:121-124) | dropped: user decision 2026-10-07: no capability polling or notices for server metadata; the store is chosen at engine start |
 
 New only: without a blob store, attachments up to 8 MiB travel on the log in 768 KiB chunks
 (src/core/limits.ts:64-66, src/engine/blobs/blobQueue.ts:80-81, DESIGN §j.1).
