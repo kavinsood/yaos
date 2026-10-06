@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-	applyControl, CONTROL_KEYS, connectionRows, engineAcceptsCommands, engineRows, isControlKey, isPaused, parseExcludePatterns,
-	phaseLabel, readControl, runStateLabel, validateControl,
+	applyControl, CONTROL_KEYS, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused,
+	parseExcludePatterns, phaseLabel, readControl, runStateLabel, validateControl,
 } from "./settingsModel";
 import { defaultPluginData, MIB, sanitizePluginData, type PairedIdentity } from "./api";
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
@@ -62,6 +62,21 @@ test("validation rejects bad values with readable messages and applyControl thro
 	}
 	assert.equal(validateControl("maxAttachmentMb", 1024), null);
 	assert.equal(validateControl("snapshotsKeepDaily", 90), null);
+});
+
+test("enableSettingsSync turns settings sync on with the seed answer, which survives the sanitizer; turning it off keeps the rest", () => {
+	const base = defaultPluginData("Mac");
+	assert.equal(base.engine.syncSettingsSeed, undefined);
+	for (const seed of ["device", "vault"] as const) {
+		const on = enableSettingsSync(base, seed);
+		assert.equal(on.engine.syncSettings, true);
+		assert.equal(on.engine.syncSettingsSeed, seed);
+		assert.deepEqual(sanitizePluginData(JSON.parse(JSON.stringify(on)), "Mac"), on);
+		assert.equal(applyControl(on, "syncSettings", false).engine.syncSettings, false);
+	}
+	const junk = sanitizePluginData({ ...base, engine: { ...base.engine, syncSettingsSeed: "mine" } }, "Mac");
+	assert.equal(junk.engine.syncSettingsSeed, undefined);
+	assert.deepEqual(base, defaultPluginData("Mac"));
 });
 
 test("isControlKey and parseExcludePatterns", () => {

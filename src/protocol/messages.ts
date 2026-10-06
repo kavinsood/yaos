@@ -36,6 +36,11 @@ export interface EngineSettings {
 	readonly syncAttachments: boolean;
 	readonly maxAttachmentBytes: number;
 	readonly syncSettings: boolean;
+	/**
+	 * The user's answer when turning syncSettings on (DESIGN §j.3): "device" = on this device's first settings pass
+	 * (empty cfgBase), its own values win over the vault's. Absent = "vault".
+	 */
+	readonly syncSettingsSeed?: "device" | "vault";
 	readonly trashMode: TrashMode;
 	/** Use the relay's early provisional broadcast for open notes. */
 	readonly provisionalBroadcast: boolean;

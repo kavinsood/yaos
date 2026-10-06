@@ -139,6 +139,16 @@ export function applyControl(data: YaosPluginData, key: ControlKey, value: unkno
 	}
 }
 
+export type SettingsSeed = "device" | "vault";
+
+/**
+ * Turns settings sync on with the user's answer to "whose settings first?" (DESIGN §j.3). The seed only
+ * matters on the engine's first settings pass on this device (empty base); later passes merge normally.
+ */
+export function enableSettingsSync(data: YaosPluginData, seed: SettingsSeed): YaosPluginData {
+	return { ...data, engine: { ...data.engine, syncSettings: true, syncSettingsSeed: seed } };
+}
+
 // ---------------------------------------------------------------------------
 // Info rows
 // ---------------------------------------------------------------------------

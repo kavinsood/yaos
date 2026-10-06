@@ -104,6 +104,7 @@ export function sanitizeEngineSettings(raw: unknown): EngineSettings {
 		syncAttachments: bool(r.syncAttachments, d.syncAttachments),
 		maxAttachmentBytes: intInRange(r.maxAttachmentBytes, 1, MAX_ATTACHMENT_BYTES_LIMIT, d.maxAttachmentBytes),
 		syncSettings: bool(r.syncSettings, d.syncSettings),
+		...(r.syncSettingsSeed === "device" || r.syncSettingsSeed === "vault" ? { syncSettingsSeed: r.syncSettingsSeed } : {}),
 		trashMode: r.trashMode === "obsidian-trash" || r.trashMode === "system-trash" ? r.trashMode : d.trashMode,
 		provisionalBroadcast: bool(r.provisionalBroadcast, d.provisionalBroadcast),
 		snapshots: {
@@ -165,6 +166,7 @@ export function sameEngineSettings(a: EngineSettings, b: EngineSettings): boolea
 	return a.syncAttachments === b.syncAttachments
 		&& a.maxAttachmentBytes === b.maxAttachmentBytes
 		&& a.syncSettings === b.syncSettings
+		&& a.syncSettingsSeed === b.syncSettingsSeed
 		&& a.trashMode === b.trashMode
 		&& a.provisionalBroadcast === b.provisionalBroadcast
 		&& a.snapshots.enabled === b.snapshots.enabled

@@ -7,8 +7,9 @@
  */
 
 import {
-	Notice, PluginSettingTab,
+	Modal, Notice, PluginSettingTab,
 	type App, type Plugin, type Setting, type SettingDefinitionItem, type SettingDefinitionRender, type SettingGroupItem,
+	type ToggleComponent,
 } from "obsidian";
 import { MAX_KEEP_DAILY, pendingBrake, type YaosUiHost } from "./api";
 import { brakeHeadline } from "./brake";
@@ -17,9 +18,9 @@ import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
 import { clearIdentity } from "./pairFlow";
 import {
-	applyControl, connectionRows, engineAcceptsCommands, engineRows, isControlKey, isPaused, MAX_ATTACHMENT_MB, readControl,
-	TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
-	type ControlKey,
+	applyControl, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused, MAX_ATTACHMENT_MB,
+	readControl, TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
+	type ControlKey, type SettingsSeed,
 } from "./settingsModel";
 import type { UserCommand } from "../../protocol/messages";
 
@@ -35,6 +36,32 @@ export interface SettingsTabActions {
 
 const TEXT_DEBOUNCE_MS = 600;
 const LIVE_MIN_INTERVAL_MS = 250;
+const SYNC_SETTINGS_NAME = "Sync Obsidian settings";
+const SYNC_SETTINGS_DESC = "Sync app options, appearance, hotkeys, core plugin options (graph, bookmarks, daily notes, templates, saved workspaces), core and community plugin lists, plugin settings, snippets and themes. Plugin code and the open-pane layout are never synced.";
+
+/** Asked when settings sync is turned on: whose values win where this device and the vault differ (DESIGN §j.3). */
+class SettingsSeedModal extends Modal {
+	private answer: SettingsSeed | null = null;
+
+	constructor(app: App, private readonly done: (seed: SettingsSeed | null) => void) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.setTitle("Whose settings come first?");
+		this.contentEl.createEl("p", { text: "Where this device's settings differ from the ones already in the vault, choose which side wins this first time. Nothing that only one side has is removed, and after this first pass changes merge normally." });
+		const row = this.contentEl.createDiv({ cls: "modal-button-container" });
+		const choices = [["Use the vault's settings", "vault", ""], ["Use this device's settings", "device", "mod-cta"]] as const;
+		for (const [text, seed, cls] of choices) {
+			row.createEl("button", { text, cls }).addEventListener("click", () => { this.answer = seed; this.close(); });
+		}
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.done(this.answer);
+	}
+}
 
 function linesFragment(lines: readonly string[]): DocumentFragment {
 	const frag = document.createDocumentFragment();
@@ -157,9 +184,12 @@ export class YaosSettingTab extends PluginSettingTab {
 				},
 			},
 			{
-				name: "Sync Obsidian settings",
-				desc: "Sync app options, appearance, hotkeys, core plugin options (graph, bookmarks, daily notes, templates, saved workspaces), core and community plugin lists, plugin settings, snippets and themes. Plugin code and the open-pane layout are never synced.",
-				control: { type: "toggle", key: "syncSettings" },
+				name: SYNC_SETTINGS_NAME,
+				desc: SYNC_SETTINGS_DESC,
+				render: (setting: Setting) => {
+					setting.setName(SYNC_SETTINGS_NAME).setDesc(SYNC_SETTINGS_DESC);
+					setting.addToggle((t) => t.setValue(this.host.data().engine.syncSettings).onChange((on) => { void this.setSyncSettings(on, t); }));
+				},
 			},
 			{
 				name: "Deleted files go to",
@@ -336,6 +366,22 @@ export class YaosSettingTab extends PluginSettingTab {
 		}
 		if (key === "syncAttachments" || key === "snapshotsEnabled") this.refreshDomState();
 		if (key === "showStatusBar") this.actions.onDataChanged();
+	}
+
+	/** Turning settings sync on asks whose settings win first; closing the question leaves it off. */
+	private async setSyncSettings(on: boolean, toggle: ToggleComponent): Promise<void> {
+		// Also absorbs the onChange that toggle.setValue below may fire.
+		if (on === this.host.data().engine.syncSettings) return;
+		if (!on) return this.persist("syncSettings", false);
+		const seed = await new Promise<SettingsSeed | null>((resolve) => new SettingsSeedModal(this.app, resolve).open());
+		if (seed !== null) {
+			try {
+				await this.host.updateData((d) => enableSettingsSync(d, seed));
+			} catch (err) {
+				new Notice(`YAOS: could not save the setting: ${errorMessage(err)}`, 8000);
+			}
+		}
+		toggle.setValue(this.host.data().engine.syncSettings);
 	}
 
 	// -------------------------------------------------------------------------
