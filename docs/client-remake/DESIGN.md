@@ -1986,28 +1986,30 @@ After healing (all faults off, all online, run until every queue is idle and no 
 ### m.1 Port
 
 Port means copying the logic with tests, adapted to the new types. No runtime coupling to legacy code.
+The old client was deleted once the port was done; `adfa7a7:src/...` names its files at that commit
+(`git show adfa7a7:src/<path>`).
 
 | Legacy | New location | Notes |
 |---|---|---|
 | `server/src/shared/markdownCodec.ts` | `src/core/hash/markdownLf.ts` | markdown-lf-v1 canonicalization, logical hash, exact fingerprint |
-| `server/src/shared/vaultPath.ts`, `legacy-src/paths/canonicalPath.ts` | `src/core/paths/validate.ts` | Reworked to §c.2 rules (frozen Unicode, reserved stems) |
-| `legacy-src/paths/pathCollision.ts` | `src/core/paths/pathKey.ts` (tests) | Collision fixtures only. The key function is new (frozen case fold) |
-| `legacy-src/paths/pathCategory.ts`, `legacy-src/sync/exclude.ts` | `src/engine/reconcile/localTree.ts` | Exclude patterns, kind classification |
-| `server/src/shared/canvasCodec.ts`, `canvasOrdering.ts`, `canvasTypes.ts`, `canvasLimits.ts` | `src/core/hash/canvasCanonical.ts`, `src/engine/body/canvasDoc.ts` | Canonical bytes, Obsidian formatting, ranks, validation |
-| `legacy-src/sync/lineMerge.ts`, `threeWayMerge.ts` | `src/core/merge/{myers,diff3}.ts` | Line diff3 core and limits. Policy wrappers dropped |
-| `legacy-src/sync/boundedTextDiff.ts`, `diff.ts` (`tryApplyDiffToYText` only) | `src/core/merge/minimalDiff.ts`, `src/engine/reconcile/mergeJob.ts` | Minimal diff + CAS apply. `forceReplaceYText` is **dropped** |
-| `legacy-src/sync/dailyLimit.ts` | `src/engine/adapters/relayHttp.ts` (`dailyResetDelayMs`), `src/engine/runtime/relayPolicy.ts` (retry), `src/engine/runtime/dailyLimit.ts` (notice gate + text) | `resetAt` parsing, probe schedule, notice gate |
+| `server/src/shared/vaultPath.ts`, `adfa7a7:src/paths/canonicalPath.ts` | `src/core/paths/validate.ts` | Reworked to §c.2 rules (frozen Unicode, reserved stems) |
+| `adfa7a7:src/paths/pathCollision.ts` | `src/core/paths/pathKey.ts` (tests) | Collision fixtures only. The key function is new (frozen case fold) |
+| `adfa7a7:src/paths/pathCategory.ts`, `adfa7a7:src/sync/exclude.ts` | `src/engine/reconcile/localState.ts` | Exclude patterns, kind classification |
+| `server/src/shared/canvasCodec.ts`, `canvasOrdering.ts`, `canvasTypes.ts`, `canvasLimits.ts` | `src/core/hash/canvasCanonical.ts`, `src/engine/reconcile/canvasDoc.ts` | Canonical bytes, Obsidian formatting, ranks, validation |
+| `adfa7a7:src/sync/lineMerge.ts`, `threeWayMerge.ts` | `src/core/merge/{myers,diff3}.ts` | Line diff3 core and limits. Policy wrappers dropped |
+| `adfa7a7:src/sync/boundedTextDiff.ts`, `diff.ts` (`tryApplyDiffToYText` only) | `src/core/merge/minimalDiff.ts`, `src/engine/reconcile/mergeJob.ts` | Minimal diff + CAS apply. `forceReplaceYText` is **dropped** |
+| `adfa7a7:src/sync/dailyLimit.ts` | `src/engine/adapters/relayHttp.ts` (`dailyResetDelayMs`), `src/engine/runtime/relayPolicy.ts` (retry), `src/engine/runtime/dailyLimit.ts` (notice gate + text) | `resetAt` parsing, probe schedule, notice gate |
 | `server/src/shared/socketCloseCodes.ts` | `src/engine/adapters/wsRelay.ts` | Mapped onto `RELAY_CLOSE` / `RelayEvent.closed` |
-| `legacy-src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*`, `src/core/cfg/projection.ts` | Allowlist, plugin version gate, canonical JSON |
-| `legacy-src/utils/{randomId,sha256,semver,defaultDeviceName,format}.ts` | `src/core/codec/ids.ts`, `src/engine/adapters/webHash.ts`, `src/host/*` | Ids become 16-byte base64url |
-| `legacy-src/snapshots/{snapshotService,vaultExport}.ts` | `src/engine/snapshots/snapshotJob.ts` | Zip writing only |
-| `legacy-src/onboarding/{provisioningClient,localVaultImport}.ts` | `src/host/ui/pairing.ts`, §j.5 | Pairing HTTP calls. Import is now just "plan L-only files" |
-| `legacy-src/settings/{settingsTab,PairDeviceModal,DeviceCredentialsModal}.ts` | `src/host/ui/*` | UI shells only |
-| `legacy-src/status/statusBarController.ts` | `src/host/ui/statusBar.ts` | Render `StatusSnapshot` |
+| `adfa7a7:src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*`, `src/core/cfg/projection.ts` | Allowlist, plugin version gate, canonical JSON |
+| `adfa7a7:src/utils/{randomId,sha256,semver,defaultDeviceName,format}.ts` | `src/core/codec/ids.ts`, `src/engine/adapters/webHash.ts`, `src/host/*` | Ids become 16-byte base64url |
+| `adfa7a7:src/snapshots/{snapshotService,vaultExport}.ts` | `src/engine/snapshots/snapshotJob.ts` | Zip writing only |
+| `adfa7a7:src/onboarding/{provisioningClient,localVaultImport}.ts` | `src/host/ui/pairing.ts`, §j.5 | Pairing HTTP calls. Import is now just "plan L-only files" |
+| `adfa7a7:src/settings/{settingsTab,PairDeviceModal,DeviceCredentialsModal}.ts` | `src/host/ui/*` | UI shells only |
+| `adfa7a7:src/status/statusBarController.ts` | `src/host/ui/statusBar.ts` | Render `StatusSnapshot` |
 
 ### m.2 Deliberately dropped
 
-- **`legacy-src/main.ts`, `VaultSync`, the runtime coordinators** (`runtime/*`: admission, residency, overdue-work
+- **`adfa7a7:src/main.ts`, `VaultSync`, the runtime coordinators** (`runtime/*`: admission, residency, overdue-work
   kernels, connection controllers). Replaced by lanes, budgets, the pure planner and ports.
 - **Server-side CRDT and WASM engine** (`@yaos/crdt-engine`, ywasm). Pure JS Yjs only, client-side.
 - **Semantic epochs, fenced WebSocket, legacy receipts, bootstrap client** (`semanticEpochTransition`,

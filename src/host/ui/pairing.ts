@@ -1,6 +1,6 @@
 /**
  * Pairing HTTP calls against the streams relay (docs/client-remake/relay-wire.md §2).
- * Ported from legacy-src/onboarding/provisioningClient.ts and legacy-src/runtime/setupLinkController.ts.
+ * Ported from the old client (adfa7a7:src/onboarding/provisioningClient.ts and adfa7a7:src/runtime/setupLinkController.ts).
  *
  * Pure: every network call goes through an injected `request` function, randomness through an
  * injected `randomBytes`, waiting through an injected `sleep`. No obsidian runtime import.

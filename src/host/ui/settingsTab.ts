@@ -3,7 +3,7 @@
  * through host.updateData. Live rows (connection, engine status, held changes) repaint in place on
  * host.onChange, throttled; visibility/disabled predicates are re-evaluated with refreshDomState(),
  * so typing in a text field is never interrupted by a full re-render.
- * Ported in spirit from legacy-src/settings/settingsTab.ts.
+ * Ported in spirit from the old client (adfa7a7:src/settings/settingsTab.ts).
  */
 
 import {
