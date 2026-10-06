@@ -25,24 +25,34 @@ The last code change is 5735ad5; 5b1803e touches only the e2e harness
 (onboarding sends an `Origin` header, §7). The commit after it holds only
 these notes.
 
-Latency pass, branch `client-remake-latency`, code as of a5ab167 (§7.1):
+Latency pass, branch `client-remake-latency`, code as of 33d3631: the latency
+commits plus the merge of client-remake 7208184, the server rewrite (§7.1):
 
 | Gate | Result |
 |---|---|
 | `npm run typecheck:client` | clean |
-| `node scripts/check-deps.mjs` | 303 files, 0 errors, 0 warnings |
+| `node scripts/check-deps.mjs` | 306 files, 0 errors, 0 warnings |
 | `npm run test:client` | 758 pass, exit 0 |
-| Full-client e2e, local relay (port 8791) | 53/53 |
-| Full-client e2e, deployed `yaos-relay2-client-e2e` | 50/50, twice (scenario 7 skipped as remote) |
-| `npm run build` | OK, plugin smoke passes; `main.js` 987.0 KiB (worker 438.4 KiB), zip 342,009 B |
+| `server`: `tsc --noEmit` | clean |
+| `tests/server/streams-relay.ts`, `streams-hardening.ts` | 17/17, 22/22 |
+| Full-client e2e, local relay (port 8791, `--fresh`) | 53/53 |
+| Full-client e2e, deployed `yaos-relay2-client-e2e` | 50/50 (scenario 7 skipped as remote) |
+| `npm run build` | OK, plugin smoke passes; `main.js` 558.9 KiB, zip 194,764 B |
+
+Before the merge (a5ab167) the same gates passed: check-deps 303 files,
+deployed e2e 50/50 twice, `main.js` 987.0 KiB, zip 342,009 B.
 
 ### 1.1 Real-device relay
 
 `https://yaos-relay2-client-e2e.kavinsood.workers.dev`: the streams relay
-(`server/wrangler.toml` minus the R2 bucket, plus `YAOS_STREAMS=true`;
-nothing beyond the free plan), deployed with
+(`server/wrangler.toml` minus the R2 bucket; streams are always on in the
+rewritten server; nothing beyond the free plan), deployed with
 `zsh scripts/relay-dev/deploy.sh` (cf CLI session, no API token) from
-93d72ee; later commits are client-only. It is claimed. The operator recovery
+b260c7c, the merge of client-remake 7208184 (the server rewrite, PR #82).
+The rewrite replaced the Durable Object classes, so the worker was deleted
+and recreated under the same name (CF error 10086 otherwise; deploy.sh
+header); the earlier deployment (93d72ee) and its vaults are gone. It is
+claimed again by the harness. The operator recovery
 key, the host and the harness's vaults are only in
 `experiments/logs/client-e2e-context-yaos-relay2-client-e2e.kavinsood.workers.dev.json`
 (keys `host`, `operatorRecoveryKey`, `vaults`); never print it (§9.0 copies
@@ -293,30 +303,29 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   and the last ~1 s of the deployed run. Batching the commit would break the
   write-file-then-record order that crash recovery relies on, so it was left.
 - Blob jobs that run before catch-up has read their `x:` stream still read
-  it from the relay (9 of 22 in the deployed run), the same bytes catch-up
+  it from the relay (9 of 22 in the a5ab167 deployed run), the same bytes catch-up
   reads again. These reads (`readBlobChunks`) do not go through the catch-up
   lanes, hence the 5th request on the wire. The rare `checkpoint-disputed`
   retry read also runs outside the lane chain.
 - Session start reads ns (+ cfg) in its own request before catch-up starts:
   one round trip by design (ns is folded before live).
 - Each leading-edge commit costs 2 extra rows per stream it touches (free
-  plan row budget); at most one per `gcQuietMs` (1.5 s) per vault. Edits
-  closer together than that keep the 300 ms idle grouping (full e2e
-  `edit_to_peer` ~480 ms deployed).
+  plan row budget); at most one per `gcQuietMs` (1.5 s) per vault. Writes
+  closer together than that wait for the merged server's H8 floor (commits
+  at least 1000 ms apart): full e2e `edit_to_peer` ~1000 ms and
+  `create_to_peer` ~2000 ms (two commits per create), local and deployed.
+  This is a server cost bound; the client has no cheap way around it (§7.1).
 - The bench and e2e run the inline carrier with the tablet budget (4 lanes,
   2 blob jobs); desktop numbers with the worker budget are not measured.
-- The deployed per-request cost (~220 ms against a ~24 ms edge round trip)
-  is three sequential DO hops per request (`server/src/index.ts:275`),
-  outside `server/src/streams/*`; not touched.
+- Deployed requests cost 87-90 ms on the merged server, against a ~24 ms
+  edge round trip; before the rewrite they cost ~220 ms (three sequential DO
+  hops, `server/src/index.ts:275` at a5ab167). The router is outside
+  `server/src/streams/*`, so it was not touched.
 
 **Pairing and packaging (found while writing §9)**
-- The pair modal says codes come from a paired device "or in your server's
-  console" (`pairModal.ts:61`). The console only issues owner setup and
-  recovery codes; a generic device code is refused with 409
-  `collaboration_authority_required` (`server/src/routes/operator.ts:146-153`).
-- The mobile setup page and the claim page tell the user to install YAOS
-  from Community plugins (`server/src/setupPage.ts:46,569,611`); this client
-  is not published, so it has to be side-loaded (§9.0).
+- The mobile setup page tells the user to install YAOS from Community
+  plugins (`server/src/console/mobileSetup.ts:38-39`); this client is not
+  published, so it has to be side-loaded (§9.0).
 - `package.json` says 2.1.0, `manifest.json` 3.0.0. `styles.css` is legacy:
   none of its classes are used by `src/host/ui`, and the zip does not ship it
   (the modals render unstyled, which works).
@@ -570,7 +579,7 @@ cost that bounds the local run. Deployed is now within ~0.3 s of local.
 and a peer projects an edit of a note it does not have open to disk only on
 COMMIT_NOTICE, so every isolated edit waited the idle window. Fix: a frame
 that opens an empty buffer after 1500 ms without a commit commits after
-20 ms (`gcLeadMs` / `gcQuietMs`, `server/src/streams/relay.ts:58-77`,
+20 ms (`gcLeadMs` / `gcQuietMs`, `server/src/streams/relay.ts:60-79` at 33d3631,
 2c3afd1). A burst pays at most one extra commit at its start (2 rows per
 stream it touches) and then groups as before. Medians of 8 isolated edits
 (1.5 s apart), C's disk, ms:
@@ -589,6 +598,50 @@ that follow another commit within 1500 ms keep the old grouping: the full
 e2e writes edits back to back, so its `edit_to_peer` stays ~430 ms local /
 ~480 ms deployed (a5ab167, two deployed runs: edit 477 / 481, disk edit
 572, create 942 / 837, typing to view 174).
+
+**Merged server (client-remake 7208184, PR #82).** Merged as 441643e;
+measured at 33d3631 against the redeployed relay (§1.1) and a fresh local
+relay. The merge keeps the batched read and the leading edge next to the
+rewrite's H6/H8; the H8 floor applies to lead commits too
+(`server/src/streams/relay.ts:676-680`). Deployed requests got faster:
+87-90 ms per relay request (`rttMs`) against 216-224 ms before.
+
+| 1k notes + 22 attachments, files on disk / clean (ms) | pre-merge a5ab167 | merged 33d3631 |
+|---|---|---|
+| local, boot 1 / boot 2 | 4066 / 3649 (4245 / 3828) | 3684 / 3552 (3860 / 3728) |
+| deployed, boot 1 / boot 2 | 4036 / 4306 (4217 / 4488) | 3060 / 2883 (3243 / 3063) |
+| deployed read requests | 19 / 20 | 25 / 23 |
+
+150 notes: local 132 -> 123 ms, deployed 1359 -> 821 ms (3 reads both).
+Isolated edits (editTrace, C's disk, medians of 8) are unchanged: local
+137 / 236 / 171 ms and deployed 194 / 291 / 225 ms (API / disk / typing),
+against 138 / 238 / 172 and 197 / 306 / 232 before; the lead fires only
+after 1500 ms of quiet, so H8's 1000 ms floor is already past.
+
+Full e2e p50 (ms), pre-merge -> merged:
+
+| Metric | local | deployed |
+|---|---|---|
+| fresh_bootstrap | 820 -> 1025 | 3012 / 2865 -> 2393 |
+| edit_to_peer | 430 -> 1001 | 477 / 481 -> 1001 |
+| disk_edit_to_peer | 530 -> 1000 | 572 / 582 -> 999 |
+| typing_to_peer_view | 122 -> 122 | 174 / 172 -> 177 |
+| create_to_peer | 736 -> 2001 | 942 / 837 -> 2001 |
+| attachment_40k_to_peer | 899 -> 2002 | 1406 / 1360 -> 2003 |
+| delete_to_peer | 426 -> 1002 | 511 / 481 -> 999 |
+
+Back-to-back writes now pay H8 (DECISIONS.md:358-364): commits at least
+1000 ms apart, the price of about 1 row/s/vault on the free plan's daily
+row budget. A write that needs one commit lands at ~1000 ms. A create needs
+two commits, so ~2000 ms: the ns create, then its initial body frames,
+which are held until that create folds (DESIGN §d.4 and the §e.1
+`dependsOn` rule; §d.4 rejects sending them first). An isolated create is ~1.4 s (local
+1423 ms, the first create of scenario 1). A peer with the note open
+still sees typing in ~120-180 ms, from provisional frames. There is no
+cheap safe win here. The client cannot drop the second commit without
+reversing the `dependsOn` decision, and the floor itself is H8, a server
+cost bound that this pass does not weaken. Raw logs:
+`experiments/logs/client-e2e-{boot,edit,full}-*-merged-*.json`.
 
 ## 8. Bundle
 
@@ -694,13 +747,16 @@ the device credential (`src/host/ui/api.ts:16-21`), and a copy makes two
 installs one device.
 
 **First device (vault owner).**
-1. Open the relay URL -> "Operator sign-in" -> paste the key -> Open console.
-2. Enter a vault name -> Create vault. The console issues an owner setup
-   code at once and shows it with "Open in Obsidian" and "Open mobile setup"
-   links. It is shown once, works once, and expires after 15 minutes (if it
-   lapses, the vault card has "Issue owner setup code" while the vault has
-   no owner).
-3. On the device, click "Open in Obsidian" (opens the pair modal prefilled),
+1. Open the relay URL (the console, `server/src/router.ts:205-206`) -> "Sign
+   in" -> paste the key -> Sign in.
+2. Enter a vault name -> Create vault, then "Pair a device" on its card
+   (`server/src/console/console.ts:226-229`). The console shows a one-time
+   pairing code (Copy), an "Open in Obsidian on this device" link and a QR code
+   of the mobile setup page. It is shown once, works once and expires after 15
+   minutes (`server/src/vault/pairing.ts:6`); "Pair a device" again issues a
+   new one.
+3. On the device, click "Open in Obsidian" (opens the pair modal prefilled;
+   on a phone, scan the QR code and tap Connect Obsidian),
    or run the command "YAOS: Pair this device" and enter the server URL and
    the code. The device name defaults to the platform. Pair -> notice
    "YAOS: this device is now paired with <host>." -> status `starting…` ->
@@ -716,8 +772,9 @@ installs one device.
    setup page in the phone's browser and tap "Connect Obsidian" (ignore its
    "install from Community plugins" text, §5), or run "YAOS: Pair this
    device" and paste the URL and code.
-6. Expect `YAOS: synced` and the vault's files. The console's own codes are
-   owner codes only; device codes come from step 4 (§5).
+6. Expect `YAOS: synced` and the vault's files. The console's "Pair a device"
+   (step 2) also pairs further devices; its codes have the owner-bootstrap
+   purpose (`server/src/router.ts:435-443`), step 4's the device purpose.
 
 ### 9.1 Desktop (macOS / Windows / Linux), two desktops A and B
 
