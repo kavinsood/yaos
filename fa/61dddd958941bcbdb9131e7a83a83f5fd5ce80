@@ -1,0 +1,21 @@
+e2e/conformance/README.md
+  s_8232c28df410e4::t_3bd133dae535ed 78
+e2e/conformance/tests/misc.ts
+  s_8232c28df410e4::t_0b6a600c710fe6 3,49,51,53,57,75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fa61dddd958941bcbdb9131e7a83a83f5fd5ce80",
+  "prompts": {},
+  "sessions": {
+    "s_8232c28df410e4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a65d2a43c0bfc9176",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
