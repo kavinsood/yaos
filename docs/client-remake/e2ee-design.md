@@ -1219,3 +1219,36 @@ Each test counts outcomes and asserts **all** of them; none samples a single cas
 - **At-rest leak check (desktop, WP-E4):** after an integration run, grep the IndexedDB LevelDB, `data.json`,
   the diagnostics bundle and the logs for every key and the RK in hex and base64url. Expect zero hits (the same
   method found Chrome's plaintext CryptoKey bytes, §3).
+
+## 21. Work packages
+
+There is one agent per package. Sizes: S ≈ 1 agent-day, M ≈ 2–3, L ≈ 4–6. Every package passes
+`npm run -s typecheck:client`, `node scripts/check-deps.mjs` (0/0) and `npm run test:client`.
+
+| WP | Scope (owned paths) | Depends on | Done when | Size |
+|---|---|---|---|---|
+| **E0** Device runs | `src/host/spike/**`: add a SecretStorage probe (set/get/restart, 64 KiB value, `""`, locked device) and an `obsidian://` QR scan check | none (needs a human with devices) | §23.3 table filled with [M] rows | S |
+| **E1** CryptoPort + suite-1 adapter | `src/ports/crypto.ts` (§18.1), `src/engine/adapters/webCryptoSuite1.ts`, `noopCrypto.ts`, `identityCrypto` | none | §20.1 KATs and golden vectors pass under Node WebCrypto and the `node:crypto` cross-check; 12-byte nonce check; non-extractable keys only | M |
+| **E2** Envelope v2 | `src/core/envelope.ts`, `src/core/codec/**` (AAD v2, Padmé, frameNo, fold V2 encodings), `src/core/{ns,cfg}/**` (replay window), `src/core/limits.ts`, the send window over frameNo, `diagHash` in `runtimeOps.ts:150-153` | E1 shape | Codec round-trips; replay window unit tests including the §8.2 exactness argument as a property test; suite 0 still passes the whole suite | M–L |
+| **E3** Keyring engine | `src/engine/keyring/**` (record codec, validity, winners, roll, revoke, re-publish, stale-epoch), the catch-up order (`k` first), phase `key-missing` | E1, E2 | §11 and §14.3 rules as unit tests; the forged-roll and duplicate-record tests in §20.2 | L |
+| **E4** Host key storage + protocol | `src/host/keys/**` (SecretStorage adapter, 5 s wait, pin, Linux notice), `src/protocol/**` (§18.4), persist-before-use | E1 shape | Restart keeps keys; IDB wipe keeps keys; at-rest leak check (§20.3) is zero | M |
+| **E5** Pairing, RK, revoke UX | `src/host/ui/**`: QR (`qrcode`), the `key` link parameter stripped before `/enroll`, key-less prompt, RK show/confirm/enter, revoke re-key, re-key QR, hiding `mobileSetupUrl`, device-name hint | E3, E4 | UI tests for each flow; `/enroll` request bodies asserted key-free; the link is never in logs | L |
+| **E6a** Blob addressing and format | `src/engine/body/frames.ts` blob path, `src/engine/blobs/blobQueue.ts`, `src/engine/body/refs.ts`, `src/engine/runtime/blobChunks.ts`, `blobChunkStream(address)` | E1, E2 | Sealed-blob golden vector; dedupe via `has`; `x:` names carry no hash | S |
+| **E6b** Blob GC | `src/engine/blobs/gc.ts`, `BlobPort.list/deleteIf` | **A3** | Mark-and-sweep against a sim blob store with races (re-upload during the sweep survives) | M |
+| **E7** Verification | `DelayedCrypto`, sim `crypto: "suite1"`, new faults, the §20.2 measured tests, a perf bench against the §16 budgets | E1–E3 | The suite-1 fault matrix is green at suite-0 seed counts; every §20.2 assertion holds | M |
+| **E8** Docs | Apply §18.5 and §18.6 to relay-wire.md and DESIGN.md | E2 merged | Docs match the code | S |
+
+Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b waits for A3.
+
+## 22. Decisions for the user
+
+| # | Question | Options | Recommendation |
+|---|---|---|---|
+| D1 | How kept devices get the new key after a revoke | (a) Manually, by re-key QR or RK on each device. (b) Automatically via an ECDH-wrapped key per device, which needs per-device key pairs and their authentication | **(a).** Revocation is rare; (b) needs a device PKI and X25519 in mobile WebViews **[U]** |
+| D2 | Encryption for new vaults | (a) On by default, opt-out at first pairing. (b) Off by default, opt-in | **(a).** The cost is the RK ceremony at setup, but turning it on later means a new vault (§15.2) |
+| D3 | Padding | (a) Padmé with a 256 B floor. (b) No padding. (c) Padmé with a 1 KiB floor | **(a).** ≤ 12 % overhead and hides keystroke-sized frames. (c) costs about 4× bytes on typing frames for little gain |
+| D4 | Deep rotation of kAddr on revoke | (a) No. (b) Optional "Deep re-key" command (re-upload all blobs; needs A3). (c) Always | **(a) now, (b) later.** A revoked device already has the files; the gain is only recognising re-uploads |
+| D5 | Pairing transport | (a) QR or link with the key in a client-only parameter. (b) SAS/ECDH through the relay | **(a).** Same trust root, no protocol; SAS is the upgrade path if the camera-to-`obsidian://` hand-off fails on devices (§23.3) |
+| D6 | Device names under suite 1 | (a) Keep the platform default ("iPhone") plus a "visible to the operator" hint. (b) Force a random label. (c) No change | **(a).** Neutral by default; the console still needs a usable name for revoke |
+| D7 | Migrating an existing vault, or turning encryption off | (a) A new vault, then delete the old one. (b) In place with reset-streams | **(a).** Reset keeps plaintext blobs in R2 (D9); in place saves nothing real |
+| D8 | Recovery key at revoke | (a) Ask for the existing RK, with "generate a new one" as an option. (b) Always generate a new RK | **(a).** Fewer ceremonies; (b) is offered when the RK is lost or leaked |
