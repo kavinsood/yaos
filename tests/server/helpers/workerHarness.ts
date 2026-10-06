@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { randomBase64Url } from "../../../server/src/base64url";
+import { ConfigHost } from "../../../server/src/config/host";
 import { sha256Hex } from "../../../server/src/hex";
 import type { SocketPort, SocketRegistryPort, TimerPort, UpgradeRejectPort } from "../../../server/src/ports";
 import { encodeAppendFrame } from "../../../server/src/streams/protocol";
@@ -72,6 +73,19 @@ export class ManualTimers implements TimerPort {
 		return id;
 	}
 	clear(handle: unknown): void { this.timers.delete(handle as number); }
+	/** Moves the clock forward by `ms`, firing every timer that falls due, in time order. */
+	advance(ms: number): void {
+		const until = this.now + ms;
+		for (;;) {
+			let next: [number, { at: number; callback: () => void }] | undefined;
+			for (const entry of this.timers) if (entry[1].at <= until && (!next || entry[1].at < next[1].at)) next = entry;
+			if (!next) break;
+			this.timers.delete(next[0]);
+			this.now = Math.max(this.now, next[1].at);
+			next[1].callback();
+		}
+		this.now = until;
+	}
 }
 
 export interface DeviceSeed {
@@ -104,12 +118,44 @@ export interface VaultObject {
 	readonly statements: string[];
 }
 
+/** The config DO singleton on its own SQLite file, with the row model and the statements it ran. */
+export interface ConfigObject {
+	readonly storage: NodeSqliteStorage;
+	readonly model: CfRowModel;
+	readonly statements: string[];
+	readonly clock: { now: number };
+	readonly host: ConfigHost;
+}
+
 /** Every vault DO a test touched, keyed by `idFromName` name, plus a fake `YAOS_VAULT` namespace over them. */
 export class VaultCluster {
 	readonly objects = new Map<string, VaultObject>();
 	/** Each `stub.fetch` the Worker made: object name, method, internal URL. */
 	readonly fetches: Array<{ name: string; method: string; url: string }> = [];
+	/** Each RPC the Worker made on a vault stub: object name and method. */
+	readonly rpcs: Array<{ name: string; method: string }> = [];
 	private readonly directory = mkdtempSync(join(tmpdir(), "yaos-worker-"));
+	private configObject: ConfigObject | null = null;
+
+	/** The config DO (one per cluster), on the clock `now` of the returned object. */
+	config(): ConfigObject {
+		if (this.configObject) return this.configObject;
+		const storage = NodeSqliteStorage.open(join(this.directory, "config.sqlite"));
+		const model = new CfRowModel(storage);
+		const statements: string[] = [];
+		const port = {
+			sql: {
+				exec: (query: string, ...bindings: unknown[]) => {
+					statements.push(query);
+					return model.exec(query, ...bindings) as never;
+				},
+			},
+			transactionSync: <T>(closure: () => T): T => storage.transactionSync(closure),
+		};
+		const clock = { now: 1_700_000_000_000 };
+		this.configObject = { storage, model, statements, clock, host: new ConfigHost(port, { now: () => clock.now }) };
+		return this.configObject;
+	}
 
 	object(name: string): VaultObject {
 		const existing = this.objects.get(name);
@@ -125,6 +171,15 @@ export class VaultCluster {
 				},
 			},
 			transactionSync: <T>(closure: () => T): T => storage.transactionSync(closure),
+			// Durable Object deleteAll(): every table goes (DDL is not billed by the row model).
+			deleteAll: (): Promise<void> => {
+				storage.transactionSync(() => {
+					const tables = storage.sql.exec<{ name: string }>(
+						"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").toArray();
+					for (const { name: table } of tables) storage.sql.exec(`DROP TABLE "${table}"`);
+				});
+				return Promise.resolve();
+			},
 		};
 		const registry = new FakeRegistry();
 		const upgrades = new RecordingUpgrades();
@@ -158,7 +213,12 @@ export class VaultCluster {
 				this.fetches.push({ name, method: request.method, url: request.url });
 				return this.object(name).host.fetch(request);
 			},
-			init: (vaultId: string) => Promise.resolve(this.object(name).host.init(vaultId)),
+			init: (vaultId: string) => this.rpc(name, "init", () => this.object(name).host.init(vaultId)),
+			mintOwnerCode: (purpose: Parameters<VaultHost["mintOwnerCode"]>[0]) =>
+				this.rpc(name, "mintOwnerCode", () => this.object(name).host.mintOwnerCode(purpose)),
+			listDevices: () => this.rpc(name, "listDevices", () => this.object(name).host.listDevices()),
+			revokeDevice: (deviceId: string) => this.rpc(name, "revokeDevice", () => this.object(name).host.revokeDevice(deviceId)),
+			deleteVault: () => this.rpc(name, "deleteVault", () => this.object(name).host.deleteVault()),
 		});
 		const methods: Record<string, unknown> = {
 			idFromName: (name: string) => ({ name }),
@@ -167,8 +227,15 @@ export class VaultCluster {
 		return new Proxy({}, { get: (_target, property) => methods[String(property)] }) as WorkerEnv["YAOS_VAULT"];
 	}
 
+	/** A DO RPC: the result arrives as a promise, and the call is recorded. */
+	private async rpc<T>(name: string, method: string, call: () => T | Promise<T>): Promise<T> {
+		this.rpcs.push({ name, method });
+		return await call();
+	}
+
 	close(): void {
 		for (const object of this.objects.values()) object.storage.close();
+		this.configObject?.storage.close();
 		rmSync(this.directory, { recursive: true, force: true });
 	}
 }
@@ -177,7 +244,7 @@ export class VaultCluster {
  * A `YAOS_CONFIG` namespace that records every property access on the namespace and every RPC on its stub. T-HOTPATH
  * asserts both stay empty on device paths.
  */
-export function recordingConfigNamespace(state: { claimed: boolean }): {
+export function recordingConfigNamespace(source: { claimed: boolean } | ConfigHost): {
 	namespace: WorkerEnv["YAOS_CONFIG"];
 	accesses: string[];
 } {
@@ -185,7 +252,13 @@ export function recordingConfigNamespace(state: { claimed: boolean }): {
 	const stub = new Proxy({}, {
 		get(_target, property) {
 			accesses.push(`stub.${String(property)}`);
-			if (property === "isClaimed") return () => Promise.resolve(state.claimed);
+			if (source instanceof ConfigHost) {
+				const method = (source as unknown as Record<string, unknown>)[String(property)];
+				return typeof method === "function"
+					? async (...args: unknown[]) => await (method as (...a: unknown[]) => unknown).apply(source, args)
+					: undefined;
+			}
+			if (property === "isClaimed") return () => Promise.resolve(source.claimed);
 			return undefined;
 		},
 	});

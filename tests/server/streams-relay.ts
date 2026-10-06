@@ -480,8 +480,8 @@ s.test("checkpoint: CAS ok, conflict, not advancing, ahead of stream; GC of seal
 
 // ---- authority, admission, daily limit ------------------------------------------
 
-s.test("authority: revoked actors get authority_superseded + 4403; read-only sockets get write_forbidden", async () => {
-	await withStreams(({ connect, append, revoked, service, timers }) => {
+s.test("authority: a socket whose device left the map gets authority_superseded + 4403; read-only sockets get write_forbidden", async () => {
+	await withStreams(({ connect, append, revoked, service }) => {
 		const a = connect(ownerA);
 		const b = connect(deviceB);
 		const reader = connect(deviceC, false);
@@ -489,19 +489,46 @@ s.test("authority: revoked actors get authority_superseded + 4403; read-only soc
 		append(reader, "ns", "ro-1", "x");
 		assert.deepEqual(reader.last("STREAM_APPEND_REJECTED"), { type: "STREAM_APPEND_REJECTED", stream: "ns",
 			clientFrameId: "ro-1", code: "write_forbidden" });
-		append(a, "ns", "before", "x");
 		revoked.add("device-a");
 		append(a, "ns", "after", "y");
-		assert.equal(a.last("error")!.code, "authority_superseded");
+		assert.equal(a.last("error")!.code, "authority_superseded", "the device map is checked before the append");
 		assert.equal(a.closed?.code, 4403);
-		service.flushForAuthorityFence();
-		assert.equal(a.receipts().length, 0, "the closed socket missed its receipt (resend dedupes)");
-		assert.deepEqual(b.frames().map((frame) => frame.kind === "committed" ? frame.clientFrameId : frame.kind), ["before"],
-			"frames admitted before the revoke commit; later ones never go out");
+		assert.equal(service.pendingFrames(), 0, "the refused append is never buffered");
+		assert.equal(b.frames().length, 0);
 		assert.equal(service.accept(ownerA, true).status, 409, "a revoked device cannot reconnect");
-		assert.equal(service.closeDevice("device-b"), 1);
-		assert.equal(b.closed?.code, 4403);
-		timers.advance(1000);
+	});
+});
+
+s.test("D7 revokeDevice: one synchronous call drops the device's buffered frames, tells PROVISIONAL holders, closes 4403, never flushes", async () => {
+	await withStreams(({ connect, append, revoked, service, store, timers }) => {
+		const a = connect(ownerA);
+		const a2 = connect(ownerA);
+		const b = connect(deviceB);
+		append(a, "b:doc", "a-prov", "x");
+		append(a2, "ns", "a-ns", "y");
+		append(b, "ns", "b-ns", "z");
+		assert.equal(b.frames().filter((frame) => frame.kind === "provisional").length, 1, "b holds a's PROVISIONAL");
+		assert.equal(service.pendingFrames(), 3);
+
+		revoked.add("device-a"); // the host deletes the device-map entry in the same turn
+		const result = service.revokeDevice("device-a");
+		assert.deepEqual(result, { droppedFrames: 2, closedSockets: 2 });
+		for (const socket of [a, a2]) {
+			assert.deepEqual(socket.last("error"),
+				{ type: "error", code: "authority_superseded", reason: "socket authority superseded" });
+			assert.equal(socket.closed?.code, 4403);
+		}
+		assert.deepEqual(b.last("STREAM_PROVISIONAL_DROPPED"), { type: "STREAM_PROVISIONAL_DROPPED", stream: "b:doc",
+			deviceId: "device-a", clientFrameId: "a-prov", reason: "commit_failed" });
+		assert.equal(service.pendingFrames(), 1, "the peer's frame stays buffered: no flush");
+		assert.equal(store.head(), 0, "nothing committed in the revoke");
+
+		timers.advance(10_000);
+		assert.equal(store.head(), 1, "the normal group commit writes only the peer's frame");
+		assert.deepEqual(b.receipts().map((receipt) => receipt.clientFrameId), ["b-ns"]);
+		assert.equal(a.receipts().length + a2.receipts().length, 0, "the revoked device's frames get no receipt");
+		assert.deepEqual(b.frames().map((frame) => frame.kind), ["provisional"], "no COMMITTED of a dropped frame");
+		assert.deepEqual(service.revokeDevice("device-a"), { droppedFrames: 0, closedSockets: 0 }, "idempotent");
 	});
 });
 

@@ -19,6 +19,11 @@ export interface StoragePort {
 	transactionSync<T>(closure: () => T): T;
 }
 
+/** The vault DO's storage: the SQL port plus `deleteAll()` for vault delete (D5). */
+export interface VaultStoragePort extends StoragePort {
+	deleteAll(): Promise<void>;
+}
+
 /**
  * A read of a table that was never created throws SQLite's "no such table: <name>" (workerd appends
  * ": SQLITE_ERROR"). The DOs probe their first table this way, so an unknown object costs no write and no DDL.

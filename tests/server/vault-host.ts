@@ -202,11 +202,13 @@ s.test("§6.1: bearer auth reads meta 1 + devices N once per runtime, then 0 row
 			assert.equal(response.status, 401);
 			assert.deepEqual(await response.json(), { error: "unauthorized" });
 		}
-		for (const path of ["auth/ticket", "auth/pairing-code", "debug/simulate-daily-limit"]) {
-			const response = await object.host.fetch(
-				new Request(`${INTERNAL}/${path}`, { method: "POST", headers: bearer(owner), body: "{}" }));
-			assert.equal(response.status, 501, `${path}: P2/P3`);
-		}
+		const ticket = await object.host.fetch(
+			new Request(`${INTERNAL}/auth/ticket`, { method: "POST", headers: bearer(owner), body: "{}" }));
+		assert.equal(ticket.status, 400);
+		assert.deepEqual(await ticket.json(), { error: "invalid_ticket_scope" }, "D4: the purpose is required");
+		const debug = await object.host.fetch(
+			new Request(`${INTERNAL}/debug/simulate-daily-limit`, { method: "POST", headers: bearer(owner), body: "{}" }));
+		assert.equal(debug.status, 501, "simulate-daily-limit: P3");
 		assert.equal(object.model.totals.cf, 1, "bearer requests write nothing (1 = init)");
 	});
 });

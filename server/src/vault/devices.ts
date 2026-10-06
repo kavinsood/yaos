@@ -45,6 +45,11 @@ export class DeviceMap {
 		return this.byToken.size;
 	}
 
+	/** Every enrolled device (the operator's device list, name uniqueness at enroll). */
+	list(): IterableIterator<DeviceRecord> {
+		return this.byDeviceId.values();
+	}
+
 	byTokenHash(tokenHash: string): DeviceRecord | undefined {
 		return this.byToken.get(tokenHash);
 	}

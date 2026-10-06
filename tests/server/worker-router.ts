@@ -155,27 +155,45 @@ s.test("§2.2: static pages and CORS preflight answer without a DO", async () =>
 	});
 });
 
-s.test("§2.2: claim and operator routes are matched (501 until P2), with no DO call; bad ids → 404", async () => {
+s.test("§2.2 / D5: operator routes refuse a cross-site write or a missing session before any DO call; P3 routes 501; bad ids → 404", async () => {
 	await withWorld(async (world) => {
 		const id = world.vaultId;
-		const matched: Array<[string, string]> = [
-			["POST", "/claim"], ["POST", "/operator/login"], ["POST", "/operator/logout"], ["GET", "/operator/state"],
-			["POST", "/operator/vaults"], ["POST", `/operator/vaults/${id}/owner-code`], ["DELETE", `/operator/vaults/${id}`],
-			["GET", `/operator/vaults/${id}/devices`], ["DELETE", `/operator/vaults/${id}/devices/owner-device-0001`],
-			["POST", `/operator/vaults/${id}/reset-streams`], ["POST", `/operator/vaults/${id}/restore`],
+		const writes: Array<[string, string]> = [
+			["POST", "/claim"], ["POST", "/operator/login"], ["POST", "/operator/logout"], ["POST", "/operator/vaults"],
+			["POST", `/operator/vaults/${id}/owner-code`], ["DELETE", `/operator/vaults/${id}`],
+			["DELETE", `/operator/vaults/${id}/devices/owner-device-0001`],
 		];
-		for (const [method, path] of matched) {
+		for (const [method, path] of writes) {
+			for (const origin of [undefined, "https://evil.test", "null"]) {
+				world.resetCalls();
+				const response = await world.fetch(path, { method, body: "{}",
+					headers: { "Content-Type": "application/json", ...(origin ? { Origin: origin } : {}) } });
+				assert.equal(response.status, 403, `${method} ${path} Origin ${origin}`);
+				assert.deepEqual(await body(response), { error: "forbidden_origin" });
+				assert.equal(world.doCalls(), 0, `${method} ${path}: no DO call`);
+			}
+		}
+		for (const path of ["/operator/state", `/operator/vaults/${id}/devices`]) {
 			world.resetCalls();
-			const response = await world.fetch(path, { method, ...(method === "GET" ? {} : { body: "{}" }) });
-			assert.equal(response.status, 501, `${method} ${path}`);
-			assert.deepEqual(await body(response), { error: "not_implemented" }, `${method} ${path}`);
-			assert.equal(world.doCalls(), 0, `${method} ${path}: no DO call`);
+			const response = await world.fetch(path);
+			assert.equal(response.status, 401, path);
+			assert.deepEqual(await body(response), { error: "unauthorized" });
+			assert.equal(world.doCalls(), 0, `${path}: no cookie, no DO call`);
+		}
+		for (const path of [`/operator/vaults/${id}/reset-streams`, `/operator/vaults/${id}/restore`]) {
+			world.resetCalls();
+			const response = await world.fetch(path, { method: "POST", body: "{}" });
+			assert.equal(response.status, 501, path);
+			assert.deepEqual(await body(response), { error: "not_implemented" }, path);
+			assert.equal(world.doCalls(), 0, `${path}: no DO call (P3)`);
 		}
 		await assertNotFound(world, "GET", `/operator/vaults/${id}/owner-code`);
 		await assertNotFound(world, "POST", "/operator/vaults/short/owner-code");
 		await assertNotFound(world, "DELETE", `/operator/vaults/${id}/devices/short`);
 		await assertNotFound(world, "DELETE", `/operator/vaults/${id}/devices/${"d".repeat(129)}`);
 		await assertNotFound(world, "DELETE", `/operator/vaults/${id}/devices/owner%2Ddevice%2D0001`);
+		await assertNotFound(world, "GET", `/operator/vaults/${id}/devices/owner-device-0001`);
+		await assertNotFound(world, "PATCH", `/operator/vaults/${id}`);
 	});
 });
 
@@ -218,10 +236,18 @@ s.test("§2.2: bearer device routes reach the vault DO; a wrong token is 401", a
 			const response = await world.fetch(`${v}/streams/feed`, { headers });
 			assert.equal(response.status, 401);
 		}
-		for (const path of ["auth/ticket", "auth/pairing-code"]) {
-			const response = await world.fetch(`${v}/${path}`, { method: "POST", headers: bearer(world.owner), body: "{}" });
-			assert.equal(response.status, 501, `${path}: P2`);
-		}
+		const ticket = await world.fetch(`${v}/auth/ticket`, { method: "POST", headers: bearer(world.owner), body: "{}" });
+		assert.equal(ticket.status, 400);
+		assert.deepEqual(await body(ticket), { error: "invalid_ticket_scope" });
+		const code = await world.fetch(`${v}/auth/pairing-code`, { method: "POST", headers: bearer(world.owner), body: "{}" });
+		assert.equal(code.status, 200);
+		const minted = await body(code) as { obsidianUrl: string; mobileSetupUrl: string };
+		assert.ok(minted.mobileSetupUrl.startsWith(`${ORIGIN}/mobile-setup#`), "the public origin reaches the vault DO");
+		assert.ok(minted.obsidianUrl.includes(`host=${encodeURIComponent(ORIGIN)}`));
+		const spoofed = await world.fetch(`${v}/auth/pairing-code`, { method: "POST",
+			headers: { ...bearer(world.owner), "X-YAOS-Origin": "https://evil.test" }, body: "{}" });
+		const spoofedBody = await body(spoofed) as { mobileSetupUrl: string };
+		assert.ok(spoofedBody.mobileSetupUrl.startsWith(`${ORIGIN}/`), "a client-sent X-YAOS-Origin is replaced");
 	});
 });
 
@@ -230,7 +256,7 @@ s.test("streams routes: exact method and path (moved from streams-relay)", async
 		const v = `/vault/${world.vaultId}`;
 		appendCommitted(world.vault, world.owner.deviceId, "ns", "frame-1", new Uint8Array([7]));
 		const routed: Array<[string, string, RequestInit, number]> = [
-			["GET", `${v}/ws/streams?streamsVersion=1`, { headers: { Upgrade: "websocket" } }, 501],
+			["GET", `${v}/ws/streams?streamsVersion=1`, { headers: { Upgrade: "websocket" } }, 200],
 			["GET", `${v}/streams/feed`, { headers: bearer(world.owner) }, 200],
 			["GET", `${v}/streams/read?stream=ns`, { headers: bearer(world.owner) }, 200],
 			["PUT", `${v}/streams/checkpoint?stream=ns&coversSeq=1&expectedCoversSeq=0`,
@@ -302,7 +328,8 @@ s.test("D3: the pairing code is checked after trim; malformed → 400 invalid_co
 		assert.equal(world.cluster.object(unknown).model.totals.cf, 0, "unknown vault: zero writes");
 
 		const known = await world.fetch("/enroll", { method: "POST", body: JSON.stringify({ pairingCode: `${id}.${SECRET}` }) });
-		assert.equal(known.status, 501, "known vault: P2");
+		assert.equal(known.status, 400, "known vault: the vault DO checks the other fields");
+		assert.deepEqual(await body(known), { error: "invalid enrollment request" });
 	});
 });
 
@@ -329,7 +356,8 @@ s.test("streamsVersion: anything but 1 → update_required (frame + 1008, or 426
 		}
 		world.resetCalls();
 		const ok = await world.fetch(`/vault/${world.vaultId}/ws/streams?streamsVersion=1`, { headers: { Upgrade: "websocket" } });
-		assert.equal(ok.status, 501, "a known vault: ticket verification is P2");
+		assert.equal(ok.headers.get("X-Test-Upgrade"), "rejected", "version 1 reaches the vault DO, which wants a ticket");
+		assert.deepEqual(world.vault.upgrades.rejected.map((entry) => entry.frame), [{ type: "error", code: "unauthorized" }]);
 		assert.equal(world.cluster.fetches.length, 1);
 	});
 });
@@ -438,7 +466,7 @@ s.test("an unread request body is drained in finally; a thrown error is 500 inte
 	await withWorld(async (world) => {
 		const request = new Request(`${ORIGIN}/claim`, { method: "POST", body: "{\"recoveryKey\":\"x\"}" });
 		const response = await world.router.fetch(request, world.env);
-		assert.equal(response.status, 501);
+		assert.equal(response.status, 403, "no Origin: refused before the body is read");
 		assert.equal(request.bodyUsed, true, "the body was read to the end");
 		const boom = () => { throw new Error("boom"); };
 		const failing: WorkerEnv = { ...world.env, YAOS_VAULT: new Proxy({}, { get: () => boom }) as WorkerEnv["YAOS_VAULT"] };

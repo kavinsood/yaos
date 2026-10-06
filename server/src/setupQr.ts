@@ -9,6 +9,11 @@ export function buildMobileSetupUrl(host: string, pairingCode: string): string {
 	return `${host}/mobile-setup#${hash}`;
 }
 
+/** The `obsidian://yaos` setup link of a pairing code (legacy, removed server/src/routes/auth.ts:269-271). */
+export function buildObsidianPairingUrl(host: string, pairingCode: string): string {
+	return `obsidian://yaos?${new URLSearchParams({ action: "setup", host, pairingCode }).toString()}`;
+}
+
 /**
  * Encodes a mobile setup URL as a self-contained SVG data URL. The QR encoder
  * is bundled with the Worker; no third-party browser script or asset is loaded.
