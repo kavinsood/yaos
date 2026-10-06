@@ -1,13 +1,11 @@
 /**
- * R1 (closed-file merge) and DL (D8 daily limit) harness scenarios, ported from the write-budget spike
- * (yaos-wb-int scripts/relay2/wb/scenarios.ts @ 91b1fac / 4f36c9e) and trimmed to R1 + DL. Registered in bench.ts:
+ * R1 (closed-file merge) harness scenario, ported from the write-budget spike
+ * (yaos-wb-int scripts/relay2/wb/scenarios.ts @ 91b1fac / 4f36c9e) and trimmed to R1. Registered in bench.ts:
  *
- *   node tests/run-typescript.mjs --test-aliases scripts/relay2/bench.ts <R1|R1LIVE|DL> --host <url> --adapter relay --out <json>
+ *   node tests/run-typescript.mjs --test-aliases scripts/relay2/bench.ts R1 --host <url> --adapter relay --out <json>
  *
  *   R1      merge fixture table (MERGE_CASES) through `--merge-module` (default src/sync/lineMerge.ts; `reference` = the
- *           harness diff3) + the EMULATED live part (`--no-live` = table only; `--live daemon` = same as R1LIVE).
- *   R1LIVE  merge fixture table + the real reconcile through the headless CLI daemon (realScenarios.R1live).
- *   DL      D8 simulated Cloudflare daily limit through a real VaultSync (realScenarios.DL).
+ *           harness diff3) + the EMULATED live part (`--no-live` = table only).
  *
  * Rows come from adapters.RowsCounter (exact `debug/sql-rows` when present; on relay v3 it falls back to the relay
  * in-memory counter, labelled `relay-diagnostics`).
@@ -101,10 +99,9 @@ export async function runMergeCases(modulePath?: string) {
  * Part 2 (default; `--no-live` skips): EMULATED client reconcile — per base-present case the server note goes
  * base → theirs (device B), then device A "reconciles" with disk = ours via the merge module: clean → applied as a
  * CRDT edit on the existing note (GET must equal merged); conflict → original untouched + conflict copy created with
- * ours. No-base identical must write 0 rows. `--live daemon` runs the real CLI daemon instead (= R1LIVE).
+ * ours. No-base identical must write 0 rows.
  */
 export async function R1(ctx: RunCtx): Promise<Result> {
-	if (!ctx.args.flags["no-live"] && ctx.str("live", "emulated") === "daemon") return R1LIVE(ctx);
 	const modulePath = mergeModulePath(ctx.str("merge-module"));
 	const table = await runMergeCases(modulePath);
 	const live: Result[] = [];
@@ -148,18 +145,6 @@ export async function R1(ctx: RunCtx): Promise<Result> {
 			live.push(ev);
 		}
 	}
-	return { mergeTable: table, live, liveEmulated: ctx.args.flags["no-live"] ? "skipped (--no-live)" : "client reconcile emulated in harness (R1LIVE = real CLI daemon)",
+	return { mergeTable: table, live, liveEmulated: ctx.args.flags["no-live"] ? "skipped (--no-live)" : "client reconcile emulated in harness",
 		convergence: { pass: table.pass && live.every((e) => e.pass) } };
 }
-
-/** R1 with the real reconcile: fixture table + realScenarios.R1live (headless CLI daemon; cases `--live-cases`). */
-export async function R1LIVE(ctx: RunCtx): Promise<Result> {
-	const table = await runMergeCases(mergeModulePath(ctx.str("merge-module")));
-	const daemon = await (await import("./realScenarios")).R1live(ctx);
-	const live = daemon.live as Array<{ pass: boolean }>;
-	return { mergeTable: table, ...daemon, liveEmulated: false, convergence: { pass: table.pass && live.length > 0 && live.every((e) => e.pass) } };
-}
-
-// ================================================================================================= DL (D8)
-/** D8 simulated Cloudflare daily limit; see realScenarios.DL. */
-export async function DL(ctx: RunCtx): Promise<Result> { return (await import("./realScenarios")).DL(ctx); }

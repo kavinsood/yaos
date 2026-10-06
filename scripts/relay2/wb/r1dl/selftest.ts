@@ -3,8 +3,7 @@
  *   node tests/run-typescript.mjs --test-aliases scripts/relay2/wb/selftest.ts [--merge-module <path>|reference]
  * Checks: reference diff3 properties, the R1 fixture table through the reference AND the product module
  * (default src/sync/lineMerge.ts; must be 15/15), rows-payload parsing + deltas, the rows-read timeout retry,
- * the closed-file candidate request shape (DL probe), bulk batch splitting, and the DL verdict (bulk skipped →
- * not applicable; destroy timeout / unhandled rejection → failure).
+ * the closed-file candidate request shape (DL probe), and bulk batch splitting.
  */
 import { createHash } from "node:crypto";
 import { createServer, type ServerResponse } from "node:http";
@@ -13,7 +12,6 @@ import { candidateDigestMaterial } from "../../../../server/src/shared/candidate
 import { flagStr, parseArgs } from "../../lib/common";
 import { candidateRequest, fetchRows, parseRowsPayload, rowsDelta, splitBatches } from "./adapters";
 import { merge3, mergeNoBase } from "./diff3";
-import { dlChecks, DL_BULK_SKIPPED } from "./realScenarios";
 import { applyMinimalDiff, MERGE_CASES, mergeModulePath, runMergeCases } from "./scenarios";
 
 let failures = 0, checks = 0;
@@ -129,36 +127,6 @@ function rng(seed: number) {
 		"DL probe: route + headers match VaultServerPort.submitCandidate");
 	const batches = splitBatches(Array.from({ length: 25 }, (_v, i) => i), 10, 1_000_000, () => 1);
 	ok(batches.length === 3 && batches.flat().length === 25 && batches.every((b) => b.length <= 10), "splitBatches ≤ maxFiles, keeps every item");
-}
-
-// ---------------------------------------------------------------- DL verdict
-{
-	const typed503 = { status: 503, retryAfter: "3600", body: { error: "cf_daily_limit", resetAt: Date.now() + 3_600_000 } };
-	const good = () => ({
-		typing: { raw: { vaultErrors: 1, firstVaultError: { type: "VAULT_ERROR", code: "cf_daily_limit" } },
-			realClient: { http503Sample: [], vaultErrorSample: [], vaultErrors: 0, onDailyLimit: [{ atMsAfterEnable: 10 }] } },
-		candidateProbeWhileLimited: { status: 503, retryAfter: "3600", value: typed503.body },
-		typingNoLoss: { convergence: { pass: true } },
-		bulk: { skipped: DL_BULK_SKIPPED, realClientDailyLimitState: null, realClient503: [] } as Record<string, unknown>,
-		trippedClientClose: { destroyMs: 12, destroyTimedOut: false }, finalClientClose: { destroyMs: 8, destroyTimedOut: false },
-		unhandledRejections: { count: 0, distinct: [] },
-	});
-	const skipped = dlChecks(good());
-	ok(skipped.assertionsPass && skipped.noLoss, `DL verdict: bulk skipped + all typed signals → pass ${JSON.stringify(skipped.checks)}`);
-	ok(skipped.notApplicable.includes("createBulkTyped503") && skipped.notApplicable.includes("bulkNoLossAfterDisable"), "DL verdict: bulk checks n/a when skipped");
-	const hung = good(); hung.trippedClientClose.destroyTimedOut = true;
-	ok(!dlChecks(hung).assertionsPass, "DL verdict: destroy timeout while tripped → fail");
-	const hungFinal = good(); hungFinal.finalClientClose.destroyTimedOut = true;
-	ok(!dlChecks(hungFinal).assertionsPass, "DL verdict: final close timeout → fail");
-	const rej = good(); rej.unhandledRejections.count = 1;
-	ok(!dlChecks(rej).assertionsPass, "DL verdict: unhandled rejection → fail");
-	const untyped = good(); untyped.candidateProbeWhileLimited = { status: 503, retryAfter: "", value: { error: "body_persistence_unavailable" } } as never;
-	ok(!dlChecks(untyped).assertionsPass, "DL verdict: untyped 503 → fail");
-	const withBulk = good(); withBulk.bulk = { http503Probes: [typed503], missingAfterRetry: 0, realClientDailyLimitState: null, realClient503: [] };
-	const wb = dlChecks(withBulk);
-	ok(wb.assertionsPass && wb.notApplicable.length === 0, "DL verdict: bulk present, typed 503, nothing missing → pass");
-	const lost = good(); lost.bulk = { http503Probes: [typed503], missingAfterRetry: 2, realClientDailyLimitState: null, realClient503: [] };
-	ok(!dlChecks(lost).noLoss && !dlChecks(lost).assertionsPass, "DL verdict: bulk notes missing after retry → fail");
 }
 
 console.log(`${checks - failures}/${checks} checks passed`);

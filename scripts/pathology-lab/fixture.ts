@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import * as Y from "yjs";
-import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
+import { NodeSqliteStorage } from "../../tests/server/helpers/nodeSqliteStorage";
 import { canonicalMarkdownBytes, canonicalizeMarkdown } from "../../server/src/shared/markdownCodec";
 import { VaultStore, type VaultStoragePort } from "../../server/src/vaultStore";
 import { readFrozenFrames, readTraceManifest, sha256 } from "./trace";

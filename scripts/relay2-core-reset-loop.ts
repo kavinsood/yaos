@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Y from "yjs";
 
-import { NodeSqliteStorage } from "../packages/server-node/src/storage";
+import { NodeSqliteStorage } from "../tests/server/helpers/nodeSqliteStorage";
 import { bytesToBase64 } from "../server/src/base64url";
 import { diffUpdate, mergeUpdates, stateVectorFromUpdate, ywasmLinearMemoryBytes } from "../server/src/crdt/ywasmByteOps";
 import { RelayBodyService } from "../server/src/relayBodies";

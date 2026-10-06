@@ -8,7 +8,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Y from "yjs";
-import { NodeSqliteStorage } from "../packages/server-node/src/storage";
+import { NodeSqliteStorage } from "../tests/server/helpers/nodeSqliteStorage";
 import { RelayBodyService, type RelaySocketHost } from "../server/src/relayBodies";
 import { RelayBodyStore } from "../server/src/relayBodyStore";
 import { readRelayConfig } from "../server/src/relayFlag";

@@ -14,7 +14,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Y from "yjs";
-import { NodeSqliteStorage } from "../../../packages/server-node/src/storage";
+import { NodeSqliteStorage } from "../../../tests/server/helpers/nodeSqliteStorage";
 import { VaultStore } from "../../../server/src/vaultStore";
 import { comparePlans, legacyTableDdl, sqlitePort } from "../../../tests/server/helpers/planCompare";
 

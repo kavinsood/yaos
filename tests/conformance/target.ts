@@ -4,7 +4,7 @@ export const PROTOCOL_VERSION = 5 as const;
 export const SNAPSHOT_FORMAT_VERSION = 4 as const;
 export const SETTINGS_FORMAT_VERSION = 2 as const;
 
-export type RuntimeName = "wrangler" | "node";
+export type RuntimeName = "wrangler";
 
 export const ALL_CAPABILITIES = [
 	"capabilities", "routing", "identity", "admission", "root-body", "bootstrap",
@@ -54,7 +54,7 @@ export function targetFromEnv(): ConformanceTarget {
 	const value: unknown = JSON.parse(raw);
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${TARGET_ENV} is invalid`);
 	const target = value as Partial<Omit<ConformanceTarget, "capabilities">> & { capabilities?: unknown };
-	if ((target.runtime !== "wrangler" && target.runtime !== "node")
+	if (target.runtime !== "wrangler"
 		|| typeof target.baseUrl !== "string" || typeof target.controlUrl !== "string"
 		|| !Array.isArray(target.capabilities)) throw new Error(`${TARGET_ENV} is invalid`);
 	const capabilities = new Set<Capability>();

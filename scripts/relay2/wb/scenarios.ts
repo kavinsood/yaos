@@ -10,7 +10,7 @@
  * `implemented`/`source` fields say which parts ran against real W1/W2/W3 code and which against fallbacks.
  *
  * Batch 3 (b3-bulk) port onto relay3: bulk-create scenarios I1–I4 only. C4W/XCRASH (W1 typing), R1 (W3 merge),
- * A1 and L5R stay on write-budget-spike. I4 defaults to the real VaultSync client (realScenarios.ts).
+ * A1 and L5R stay on write-budget-spike.
  */
 import * as Y from "yjs";
 import { connectDocument } from "../../../tests/live/schema4Live";
@@ -304,11 +304,9 @@ export async function I3(ctx: RunCtx): Promise<Result> {
  *   hold  — paste lands after the create was sent but before its receipt → held, sent after the receipt
  *   after — paste lands `--late-ms` (3000) after the create → plain body edit
  * `--paste-at-ms` (100) is the fold paste time. Asserts no body frame precedes the create receipt; reports rows per case
- * and time until peer B sees the final text. Default is the REAL client (realScenarios.I4real: VaultSync's create
- * collector in Node); `--client emulated` keeps this protocol-level emulation.
+ * and time until peer B sees the final text.
  */
 export async function I4(ctx: RunCtx): Promise<Result> {
-	if (ctx.str("client", "real") !== "emulated") return (await import("./realScenarios")).I4real(ctx);
 	const rows = rowsCounter(ctx);
 	const adapter = creator(ctx);
 	const collector = ctx.num("collector-ms", 300), pasteAt = ctx.num("paste-at-ms", 100), late = ctx.num("late-ms", 3000);

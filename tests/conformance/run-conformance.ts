@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import { basename, join } from "node:path";
-import { launchNode, launchWrangler, type LaunchedRuntime } from "./launch/index.ts";
+import { launchWrangler, type LaunchedRuntime } from "./launch/index.ts";
 import { REPO_ROOT, terminateTree } from "./launch/runtime.ts";
 import {
 	ALL_CAPABILITIES,
@@ -22,7 +22,6 @@ const HARD_TIMEOUT_MS = 600_000;
 /** Exact and shrink-only. Adding an entry accepts a regression and requires explicit review. */
 const KNOWN_GAPS: Record<RuntimeName, readonly Capability[]> = {
 	wrangler: ["recovery-crash-resume"],
-	node: [],
 };
 
 interface Fixture { readonly name: string; readonly path: string }
@@ -280,7 +279,7 @@ async function runOne(runtimeName: RuntimeName, fixture: Fixture): Promise<RunRe
 	let runtime: LaunchedRuntime | null = null;
 	let control: { url: string; close(): Promise<void> } | null = null;
 	try {
-		runtime = runtimeName === "wrangler" ? await launchWrangler() : await launchNode();
+		runtime = await launchWrangler();
 		runtimes.add(runtime);
 		assertExactBaseline(runtime);
 		control = await controlServer(runtime);
@@ -297,7 +296,7 @@ async function runOne(runtimeName: RuntimeName, fixture: Fixture): Promise<RunRe
 }
 
 function parseArgs(argv: readonly string[]): { targets: RuntimeName[]; only: string | null; list: boolean } {
-	let target = "both";
+	let target = "wrangler";
 	let only: string | null = null;
 	let list = false;
 	for (const argument of argv) {
@@ -306,10 +305,8 @@ function parseArgs(argv: readonly string[]): { targets: RuntimeName[]; only: str
 		else if (argument.startsWith("--only=")) only = argument.slice("--only=".length);
 		else throw new Error(`unknown argument ${argument}`);
 	}
-	if (target !== "both" && target !== "wrangler" && target !== "node") {
-		throw new Error("--target must be wrangler, node, or both");
-	}
-	return { targets: target === "both" ? ["wrangler", "node"] : [target as RuntimeName], only, list };
+	if (target !== "wrangler") throw new Error("--target must be wrangler");
+	return { targets: [target], only, list };
 }
 
 async function main(): Promise<void> {

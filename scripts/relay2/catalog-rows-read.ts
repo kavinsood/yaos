@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import * as Y from "yjs";
-import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
+import { NodeSqliteStorage } from "../../tests/server/helpers/nodeSqliteStorage";
 import { VaultStore, type VaultStoragePort } from "../../server/src/vaultStore";
 import type { CatalogMutation } from "../../server/src/vaultCatalogStore";
 

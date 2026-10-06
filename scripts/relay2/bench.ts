@@ -32,14 +32,14 @@ const SCENARIOS: Record<string, Scenario> = {
 	X1: limits.X1, X2: limits.X2, X3: limits.X3, X4: limits.X4,
 	C2: extra.C2, C5: extra.C5, C6: extra.C6, K1: extra.K1, MB: extra.MB, CW: extra.CW,
 	CRASH: v3.CRASH, FENCE: v3.FENCE, HTTPSAVE: v3.HTTPSAVE,
-	// Closed-file merge (R1 emulated, R1LIVE = real CLI daemon) and D8 daily limit (DL); see wb/r1dl/scenarios.ts.
-	R1: r1dl.R1, R1LIVE: r1dl.R1LIVE, DL: r1dl.DL,
+	// Closed-file merge (R1, emulated client reconcile); see wb/r1dl/scenarios.ts.
+	R1: r1dl.R1,
 	diag: cost.diag,
 	// Write-budget spike (PHASE3-WRITE-BUDGET-SPIKE §3 W4); see wb/scenarios.ts.
 	// b3-bulk: bulk-create scenarios only (C4W/XCRASH = W1 typing, R1 = W3 merge, A1/L5R not in scope).
 	I1: wb.I1, I2: wb.I2, I3: wb.I3, I4: wb.I4,
-	// b3-m-import: I1 + projection wait, 2k import across a D8 daily-limit trip; see wb/mimport.ts.
-	I1P: mimport.I1P, DLI: mimport.DLI,
+	// b3-m-import: I1 + projection wait; see wb/mimport.ts.
+	I1P: mimport.I1P,
 	// b3-m-typing (scripts/relay2/b3/scenarios.ts): autosave rewrite with hash-state probes; request-free idle.
 	A1R: b3.A1R, IDLE0: b3.IDLE0,
 };

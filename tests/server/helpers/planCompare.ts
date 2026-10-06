@@ -3,7 +3,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { NodeSqliteStorage } from "../../../packages/server-node/src/storage";
+import { NodeSqliteStorage } from "./nodeSqliteStorage";
 import { VaultStore, type VaultStoragePort } from "../../../server/src/vaultStore";
 
 export const CONVERTED_TABLES = ["vault_document_heads", "vault_checkpoints", "vault_checkpoint_manifests",

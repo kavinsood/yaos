@@ -8,7 +8,6 @@ import { fileURLToPath } from "node:url";
 const serverDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const vendorDir = join(serverDir, "vendor/ywasm");
 const outputDir = join(serverDir, "src/crdt/vendor/ywasm");
-const nodeOutputDir = resolve(serverDir, "../packages/server-node/vendor/ywasm");
 const metadata = JSON.parse(readFileSync(join(vendorDir, "SOURCE.json"), "utf8"));
 const refreshArtifact = process.argv.includes("--refresh-artifact");
 const sourceOverrideIndex = process.argv.indexOf("--source");
@@ -116,11 +115,6 @@ try {
 	mkdirSync(outputDir, { recursive: true });
 	cpSync(wasmPath, join(outputDir, "ywasm_bg.wasm"));
 	cpSync(generatedWrapper, join(outputDir, "ywasm.mjs"));
-	mkdirSync(nodeOutputDir, { recursive: true });
-	cpSync(nodeEntry, join(nodeOutputDir, "ywasm.js"));
-	cpSync(nodeWasm, join(nodeOutputDir, "ywasm_bg.wasm"));
-	cpSync(nodeTypes, join(nodeOutputDir, "ywasm.d.ts"));
-	cpSync(join(vendorDir, "LICENSE"), join(nodeOutputDir, "LICENSE"));
 	if (refreshArtifact) {
 		metadata.artifact = {
 			wasmSha256: sha256(wasmPath),

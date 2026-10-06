@@ -94,75 +94,16 @@ export default tseslint.config(
 			"no-console": "off",
 		},
 	},
-	{
-		files: ["packages/cli/**/*.ts"],
-		languageOptions: {
-			globals: {
-				...globals.node,
-				...globals.browser,
-			},
-			parserOptions: {
-				project: "./packages/cli/tsconfig.json",
-				tsconfigRootDir: import.meta.dirname,
-			},
-		},
-		rules: {
-			"import/no-nodejs-modules": "off",
-			"no-console": "off",
-			"obsidianmd/prefer-window-timers": "off",
-			"obsidianmd/no-global-this": "off",
-			"obsidianmd/no-nodejs-modules": "off",
-			"obsidianmd/hardcoded-config-path": "off",
-			"obsidianmd/platform": "off",
-			"obsidianmd/rule-custom-message": "off",
-			"no-restricted-globals": "off",
-		},
-	},
-	{
-		files: ["packages/server-node/**/*.ts"],
-		languageOptions: {
-			globals: {
-				...globals.node,
-				...globals.serviceworker,
-			},
-			parserOptions: {
-				project: "./packages/server-node/tsconfig.json",
-				tsconfigRootDir: import.meta.dirname,
-			},
-		},
-		rules: {
-			"import/no-nodejs-modules": "off",
-			"no-console": "off",
-			"obsidianmd/prefer-window-timers": "off",
-			"obsidianmd/no-global-this": "off",
-			"obsidianmd/no-nodejs-modules": "off",
-			"obsidianmd/hardcoded-config-path": "off",
-			"obsidianmd/platform": "off",
-			"obsidianmd/rule-custom-message": "off",
-			"no-restricted-globals": "off",
-		},
-	},
-	{
-		files: ["packages/**/*.mjs"],
-		rules: {
-			"import/no-nodejs-modules": "off",
-			"no-console": "off",
-			"obsidianmd/no-nodejs-modules": "off",
-			"obsidianmd/rule-custom-message": "off",
-		},
-	},
 	globalIgnores([
 		"node_modules",
 		"dist",
 		"server/dist",
-		"packages/*/dist",
 		"server/.wrangler",
 		"server/.partykit",
 		// Hermetically generated wasm-bindgen output is checksum-verified by the
 		// ywasm build and QA gates. Its declarations are not members of either
 		// typed ESLint project and must not be parsed as handwritten source.
 		"server/src/crdt/vendor/ywasm",
-		"packages/server-node/vendor/ywasm",
 		"tests",
 		// The Obsidian preset targets plugin runtime code. Build tooling,
 		// Worker maintenance scripts, benches, and server-only tests execute in

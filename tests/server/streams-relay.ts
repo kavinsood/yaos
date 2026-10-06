@@ -7,7 +7,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
+import { NodeSqliteStorage } from "./helpers/nodeSqliteStorage";
 import { base64ToBytes } from "../../server/src/base64url";
 import { DailyLimitLatch } from "../../server/src/dailyLimit";
 import { classifyWorkerRoute } from "../../server/src/index";

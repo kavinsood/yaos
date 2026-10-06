@@ -10,7 +10,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as Y from "yjs";
-import { NodeSqliteStorage } from "../../packages/server-node/src/storage";
+import { NodeSqliteStorage } from "../../tests/server/helpers/nodeSqliteStorage";
 import { encodeBinaryEnvelope } from "../../server/src/shared/binaryEnvelope";
 import { VaultRuntime } from "../../server/src/server";
 import { readRelayConfig } from "../../server/src/relayFlag";

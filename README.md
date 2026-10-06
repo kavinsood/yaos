@@ -73,34 +73,9 @@ Recovery points can be captured in the background, browsed by path, and selectiv
 
 Obsidian vaults remain ordinary local files. Changes made by editors, scripts, Git tools, or agents enter the same reconciliation path and can synchronize across enrolled devices.
 
-## Headless Linux client
+## Hosting
 
-The Node 24 CLI synchronizes Markdown in a local directory without Obsidian. It enrolls as its own vault-scoped device; credentials are generated and stored outside the vault rather than copied from another installation.
-
-```sh
-npm run build:cli
-
-YAOS_HOST=https://sync.example.workers.dev \
-YAOS_PAIRING_CODE=... \
-node packages/cli/dist/yaos.mjs enroll /srv/vault
-
-node packages/cli/dist/yaos.mjs daemon /srv/vault
-```
-
-The daemon is Linux/local-filesystem only, Markdown only, and single-process per vault. `.obsidian`, attachments, network filesystems, and rename-identity inference are intentionally outside its contract. See [operations](./docs/operations.md#headless-linux-client).
-
-## Self-hosted Docker server
-
-The production image packages `packages/server-node`, which runs the same
-schema-8 control-plane, vault, settings, attachment, recovery, and deletion
-owners as the Cloudflare Worker over Node 24, SQLite, WebSockets, and filesystem
-object storage.
-
-```sh
-YAOS_PUBLIC_ORIGIN=https://sync.example.com docker compose up --build -d
-```
-
-The `yaos-data` volume is the complete durable server state. Put TLS in front of the container, preserve that volume, and pin released deployments to an exact `ghcr.io/kavinsood/yaos-server:<version>` image. See [operations](./docs/operations.md#docker-deployment).
+YAOS runs only on Cloudflare: one Worker with Durable Objects, plus an optional R2 bucket. There is no self-hosted Node or Docker server and no headless CLI client.
 
 ## Troubleshooting
 
