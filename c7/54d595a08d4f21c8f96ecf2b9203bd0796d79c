@@ -1,0 +1,19 @@
+server/wrangler.toml
+  s_c3a92395a9a1be::t_a6a5db9d560dc2 23-25,29-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c754d595a08d4f21c8f96ecf2b9203bd0796d79c",
+  "prompts": {},
+  "sessions": {
+    "s_c3a92395a9a1be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aea51b1dd46aa4279",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
