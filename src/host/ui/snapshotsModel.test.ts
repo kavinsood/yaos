@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { VaultPath } from "../../core/types";
 import type { SnapshotFileEntry, SnapshotReason, SnapshotSummary } from "../../protocol/messages";
 import {
-	deleteCopy, fileView, filterFiles, formatSnapshotTime, MAX_FILE_ROWS, MAX_LISTED_PATHS, restoreAllCopy, restoreSelectedCopy,
+	deleteCopy, fileView, filterFiles, formatSnapshotTime, loadingText, MAX_FILE_ROWS, MAX_LISTED_PATHS, restoreAllCopy, restoreSelectedCopy,
 	restoreSummary, selectedPaths, selectionText, skippedText, snapshotReasonLabel, snapshotRow, snapshotRows, withAll, withPath,
 } from "./snapshotsModel";
 
@@ -22,8 +22,11 @@ test("every snapshot reason has its own label", () => {
 
 test("snapshot rows: local time, reason, file count and size; newest first", () => {
 	assert.equal(formatSnapshotTime(at(2026, 1, 2, 3, 4)), "2026-01-02 03:04");
-	assert.deepEqual(snapshotRow(summary()), { id: "000000001-daily", title: "2026-10-05 14:03 · Daily", detail: "12 files, 3.4 MiB" });
+	assert.deepEqual(snapshotRow(summary()), { id: "000000001-daily", title: "2026-10-05 14:03 · Daily", detail: "12 files, 3.4 MiB", where: "local" });
 	assert.equal(snapshotRow(summary({ files: 1, bytes: 900 })).detail, "1 file, 900 B");
+	assert.equal(snapshotRow(summary({ where: "both" })).detail, "12 files, 3.4 MiB · uploaded");
+	assert.equal(snapshotRow(summary({ where: "remote", device: "phone" })).detail, "12 files, 3.4 MiB · from phone");
+	assert.equal(loadingText(snapshotRow(summary({ where: "remote", device: "phone" }))), "Downloading and checking the snapshot…");
 	const rows = snapshotRows([
 		summary({ id: "a-daily", createdAtMs: at(2026, 10, 1, 9, 0) }),
 		summary({ id: "c-manual", createdAtMs: at(2026, 10, 3, 9, 0), reason: "manual" }),
@@ -74,14 +77,16 @@ test("confirm copy explains conflict copies and the safety snapshot", () => {
 	}
 	assert.equal(restoreSelectedCopy(row, 1).title, "Restore 1 file?");
 	assert.equal(restoreAllCopy(row).confirmText, "Restore all");
-	assert.match(deleteCopy(row).message, /notes are not changed/);
+	assert.match(deleteCopy(row).message, /removed from this device\. Your notes are not changed/);
+	assert.match(deleteCopy(snapshotRow(summary({ where: "both" }))).message, /this device and from the list on all your devices/);
+	assert.match(deleteCopy(snapshotRow(summary({ where: "remote", device: "phone" }))).message, /^Snapshot: .*\n\nThe snapshot is removed from the list on all your devices\./);
 });
 
 test("skipped warning lists entries with a readable reason and caps the list", () => {
 	assert.equal(skippedText([]), null);
-	const one = skippedText([{ path: p("big.png"), reason: "too-large" }, { path: p("x.md"), reason: "unreadable" }]);
-	assert.equal(one?.heading, "2 files were not saved in this snapshot and cannot be restored from it:");
-	assert.deepEqual(one?.lines, ["big.png (attachment over 1 MiB)", "x.md (could not be read)"]);
+	const one = skippedText([{ path: p("big.png"), reason: "too-large" }, { path: p("x.md"), reason: "unreadable" }, { path: p("b.canvas"), reason: "invalid" }]);
+	assert.equal(one?.heading, "3 files were not saved in this snapshot and cannot be restored from it:");
+	assert.deepEqual(one?.lines, ["big.png (attachment over 1 MiB)", "x.md (could not be read)", "b.canvas (invalid name or content)"]);
 	assert.equal(one?.moreText, null);
 	const many = skippedText(Array.from({ length: MAX_LISTED_PATHS + 4 }, (_, i) => ({ path: p(`f${i}.png`), reason: "too-large" as const })));
 	assert.equal(many?.lines.length, MAX_LISTED_PATHS);
