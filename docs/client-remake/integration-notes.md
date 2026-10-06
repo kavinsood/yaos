@@ -39,7 +39,7 @@ The sim sweep at 1a69e4a found no bad seeds: 3 devices with faults, seeds
 `npm run lint` does not run, and it fails the same way at 9b618d5. ESLint
 aborts on `e2e/client/*.ts`, which no typed project covers. With `e2e/`
 ignored it reports 2078 problems: 1279 in `src/`, 767 in `packages/cli`
-(which still imports the deleted `legacy-src/`) and 32 in `server/`. The new
+(which still imports the deleted old client) and 32 in `server/`. The new
 client has never been linted.
 
 ## 2. Architecture
