@@ -1,0 +1,23 @@
+docs/client-remake/relay-wire.md
+  s_ab5bcc5cfffe93::t_b6b51e1d284cad 557-558
+docs/client-remake/wp-d-notes.md
+  s_ab5bcc5cfffe93::t_7ad82047a6ddea 68
+e2e/relay/smoke.ts
+  s_ab5bcc5cfffe93::t_a79080c8d8b6e1 7-8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3241c2e38e01a6b6198a361730cd065dbde13830",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
