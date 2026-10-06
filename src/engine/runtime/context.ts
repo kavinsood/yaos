@@ -6,7 +6,7 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, streamDocId, type ClientFrameId, type DeviceId, type DocId, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, streamClass, streamDocId, type ClientFrameId, type DeviceId, type DocId, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
@@ -249,6 +249,17 @@ export class EngineCtx {
 		if (folded.length === 0 && !reload) return;
 		const events = folded.flatMap((f) => f.events);
 		this.emit("onCfgFold", () => this.opts.onCfgFold?.(events, reload));
+	}
+
+	/** onBodyChange for the body / canvas streams among `streams` (deduped; nothing if none). */
+	noteBodyChange(streams: Iterable<StreamName>): void {
+		const ids = new Set<DocId>();
+		for (const s of streams) {
+			const cls = streamClass(s);
+			const d = cls === "body" || cls === "canvas" ? streamDocId(s) : null;
+			if (d) ids.add(d);
+		}
+		if (ids.size > 0) this.emit("onBodyChange", () => this.opts.onBodyChange?.([...ids]));
 	}
 
 	/** Host callback; a throwing callback is logged, never breaks the engine. */

@@ -11,17 +11,18 @@
  */
 
 import * as Y from "yjs";
-import { EnvelopeFlag } from "../../core/envelope";
+import { EnvelopeFlag, type BlobChunkContent } from "../../core/envelope";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
-import { NS_STREAM, docStream, kindOfPath, streamClass, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import { NS_STREAM, docStream, kindOfPath, streamClass, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type DeviceId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { RelaySession } from "../../ports/relay";
+import type { StoragePort } from "../../ports/storage";
 import { buildBodyFrames, initialTextUpdates } from "../body/frames";
 import { HandleManager, type Handle } from "../body/handles";
 import { Sender } from "../body/sender";
 import { encodeStateAsUpdate, ORIGIN } from "../body/yjsCounters";
-import { defaultPriority, Repo } from "../store/repo";
-import type { QuarantineRecord, TailRecord } from "../store/schema";
+import { defaultPriority, Repo, type YS } from "../store/repo";
+import { DB_NAME_PREFIX, DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity, type QuarantineRecord, type TailRecord } from "../store/schema";
 import { newDocId } from "../../core/codec/ids";
 import { bytesToHex, utf8Encode } from "../../core/codec/lib0";
 import { gateRow } from "../sync/ingestRow";
@@ -30,6 +31,7 @@ import { decodeNsOps } from "../../core/codec/nsOps";
 import { CfgRuntime } from "../sync/cfgRuntime";
 import { NsRuntime, type DocInfo } from "../sync/nsRuntime";
 import * as api from "./logApi";
+import * as blobs from "./blobChunks";
 import { EngineCtx } from "./context";
 import { DocRuntime } from "./docRuntime";
 import { LiveIngest } from "./liveIngest";
@@ -65,6 +67,39 @@ export class LogEngine {
 
 	private constructor(readonly c: EngineCtx) {
 		this.maint = new Maintenance(c);
+	}
+
+	/**
+	 * Epoch of an existing local DB of (vaultId, deviceId), from the DB names
+	 * (store/schema dbName); several: the most recently created. undefined =
+	 * none. Pass it as opts.vaultEpoch to boot offline (start() never looks it up
+	 * itself: without vaultEpoch the first connect decides, which is what an
+	 * epoch change needs). A relay on another epoch moves the phase to epoch-migrating.
+	 */
+	static async findKnownEpoch(storage: StoragePort, vaultId: VaultId, deviceId: DeviceId): Promise<VaultEpoch | undefined> {
+		const found: VaultEpoch[] = [];
+		for (const name of await storage.listDatabases()) {
+			const parts = name.split(":");
+			if (parts.length !== 4 || parts[0] !== DB_NAME_PREFIX) continue;
+			try {
+				if (decodeURIComponent(parts[1]!) !== vaultId || decodeURIComponent(parts[3]!) !== deviceId) continue;
+				found.push(decodeURIComponent(parts[2]!) as VaultEpoch);
+			} catch {
+				continue; // not URI-encoded by dbName: not ours
+			}
+		}
+		if (found.length <= 1) return found[0];
+		let best: { epoch: VaultEpoch; at: number } | undefined;
+		for (const epoch of found) {
+			const db = await storage.open<YS>(dbName(vaultId, epoch, deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
+			try {
+				const ident = await db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, "identity")) as MetaIdentity | undefined;
+				if (ident && ident.vaultEpoch === epoch && (!best || ident.createdAtMs > best.at)) best = { epoch, at: ident.createdAtMs };
+			} finally {
+				db.close();
+			}
+		}
+		return best?.epoch;
 	}
 
 	static async start(opts: EngineOptions): Promise<LogEngine> {
@@ -234,6 +269,16 @@ export class LogEngine {
 	/** Body info of a markdown / canvas doc; null = unknown doc or blob. `kind` skips the lookup. */
 	bodyInfo(docId: DocId, kind?: DocKind): RemoteBodyInfo | null {
 		return api.bodyInfo(this.c, docId, kind ?? api.docKind(this.c, docId));
+	}
+
+	/** BlobChunkLog.appendChunks: x:<hash> frames via the outbox; true once all are committed (blobChunks.ts). */
+	appendBlobChunks(hash: ContentHash, chunks: readonly BlobChunkContent[]): Promise<boolean> {
+		return blobs.appendBlobChunks(this.c, hash, chunks);
+	}
+
+	/** BlobChunkLog.readChunks: committed chunks of x:<hash> from the relay; null = not readable now. */
+	readBlobChunks(hash: ContentHash): Promise<BlobChunkContent[] | null> {
+		return blobs.readBlobChunks(this.c, hash);
 	}
 
 	/** Docs with own body / canvas frames in the outbox. */

@@ -189,6 +189,7 @@ export class LiveIngest {
 		c.lastSyncedAtMs = c.now();
 		c.applyOutboxResult(res);
 		await c.docs.applyRows(res.tailPut.filter((r) => !skipApply.has(r.seq)));
+		c.noteBodyChange(res.tailPut.filter((r) => r.deviceId !== c.self).map((r) => r.stream));
 		if (res.removed.length > 0 || res.tailPut.some((r) => r.stream === NS_STREAM)) await c.afterNsChange();
 		if (res.tailPut.some((r) => r.stream === CFG_STREAM)) await c.afterCfgChange();
 		if (stale > 0) c.sess.scheduleCatchUp();

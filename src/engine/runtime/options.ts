@@ -40,6 +40,8 @@ export interface EngineTuning {
 	readonly nsCandidateModulus: number;
 	/** Gate bound on checkpoint state bytes (the relay cap is on the sealed checkpoint). */
 	readonly maxCheckpointStateBytes: number;
+	/** appendBlobChunks gives up (false) after this long without every receipt. */
+	readonly blobAppendTimeoutMs: number;
 }
 
 export const DEFAULT_TUNING: EngineTuning = {
@@ -61,6 +63,7 @@ export const DEFAULT_TUNING: EngineTuning = {
 	frameStretch: 1,
 	nsCandidateModulus: NS_CANDIDATE_MODULUS,
 	maxCheckpointStateBytes: 32 * 1024 * 1024,
+	blobAppendTimeoutMs: 120_000,
 };
 
 /** Where an update forwarded to the host came from. */
@@ -94,6 +97,14 @@ export interface EngineOptions {
 	onNsFold?(folded: readonly FoldedNsFrame[], reloaded: boolean): void;
 	/** Events of committed cfg frames just folded (reloaded: as onNsFold; re-read cfgView()). */
 	onCfgFold?(events: readonly CfgFoldEvent[], reloaded: boolean): void;
+	/**
+	 * Docs whose body changed from outside this engine's own edits: committed
+	 * rows of other devices stored (bodyVersion.remoteSeq moved, resident or
+	 * not), a body checkpoint adopted by a read, a provisional update applied
+	 * (and adopted). Fires after the change is durable / applied; onDocUpdate
+	 * still fires for bound docs.
+	 */
+	onBodyChange?(docIds: readonly DocId[]): void;
 	onStatus?(status: StatusSnapshot): void;
 	onDiag?(event: DiagnosticsEvent): void;
 }

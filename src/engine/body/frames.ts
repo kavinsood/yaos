@@ -12,7 +12,7 @@
  */
 
 import * as Y from "yjs";
-import { EnvelopeFlag, type EnvelopeKind } from "../../core/envelope";
+import { EnvelopeFlag, type BlobChunkContent, type EnvelopeKind } from "../../core/envelope";
 import { BLOB_CHUNK_BYTES, INITIAL_INSERT_CHUNK_CHARS, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { blobChunkStream, streamClass, type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type NsOp, type Seq, type StreamName, type VaultId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
@@ -121,6 +121,12 @@ export async function buildNsFrame(ctx: FrameCtx, stream: StreamName, ops: reado
 export async function buildCfgFrame(ctx: FrameCtx, stream: StreamName, ops: readonly CfgOp[], authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
 	const content = encodeCfgOps(ops);
 	return seal(ctx, stream, "cfgOps", authorNsSeq, 0, content, content, "pending", null, nowMs);
+}
+
+/** One x:<hash> blobChunk frame (pending, no dependency). */
+export async function buildBlobChunkFrame(ctx: FrameCtx, chunk: BlobChunkContent, authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
+	const content = encodeBlobChunk(chunk);
+	return seal(ctx, blobChunkStream(chunk.hash), "blobChunk", authorNsSeq, 0, content, content, "pending", null, nowMs);
 }
 
 /** Split text into <= max UTF-16 unit chunks without cutting a surrogate pair. */

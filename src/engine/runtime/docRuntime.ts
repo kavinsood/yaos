@@ -246,6 +246,7 @@ export class DocRuntime {
 		const g = await gate(c.gateCtx, { t: "provisional", stream: ev.stream, deviceId: ev.deviceId, clientFrameId: ev.clientFrameId, payload: ev.payload });
 		if (!g.ok || g.t !== "body") return; // refs / failures: wait for the committed row
 		h.pins++;
+		let adopted = false;
 		try {
 			await this.chain(async () => {
 				if (c.adoptMap.has(key)) return;
@@ -256,10 +257,12 @@ export class DocRuntime {
 					{ deviceId: ev.deviceId, clientFrameId: ev.clientFrameId, receivedAtMs: now }, now);
 				c.addOutbox(await c.repo.tEdit([f], now, false));
 				this.stats.adopted++;
+				adopted = true;
 			});
 		} finally {
 			c.handles.unpin(h);
 		}
+		if (adopted) c.noteBodyChange([ev.stream]);
 		this.checkDoc(h);
 	}
 

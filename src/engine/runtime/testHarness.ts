@@ -25,7 +25,7 @@ import { createWebRandom } from "../adapters/webRandom";
 import type { VirtualClock } from "../../sim/clock";
 import { hashLabel, SeededRandom } from "../../sim/random";
 import { MemStoragePort } from "../../sim/storage";
-import { simHashPort } from "../../sim/__standins__/sha256";
+import { simHashPort } from "../../sim/hash";
 import { LogEngine } from "./engine";
 import type { EngineOptions, EngineTuning } from "./options";
 
