@@ -156,7 +156,7 @@ export class YaosSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Sync Obsidian settings",
-				desc: "Sync appearance, hotkeys, core and community plugin lists, plugin settings, snippets and themes. Plugin code and workspace layout are never synced.",
+				desc: "Sync app options, appearance, hotkeys, core plugin options (graph, bookmarks, daily notes, templates, saved workspaces), core and community plugin lists, plugin settings, snippets and themes. Plugin code and the open-pane layout are never synced.",
 				control: { type: "toggle", key: "syncSettings" },
 			},
 			{

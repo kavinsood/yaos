@@ -1695,13 +1695,17 @@ ones get conflict copies.
 ### j.3 Settings sync (`cfg`)
 
 - **Allowlist:**
-  - `app.json`, `appearance.json`, `hotkeys.json`, `core-plugins.json`: `jsonSet` / `jsonDel` per top-level key,
-    canonical JSON. A device-local key denylist per file is never emitted.
+  - Root JSON (the legacy set): `app.json`, `appearance.json`, `hotkeys.json`, `core-plugins.json`,
+    `core-plugins-migration.json`, `graph.json`, `daily-notes.json`, `templates.json`, `backlink.json`,
+    `page-preview.json`, `note-composer.json`, `switcher.json`, `bookmarks.json`, `workspaces.json`: `jsonSet` /
+    `jsonDel` per top-level key, canonical JSON. A device-local key denylist per file is never emitted
+    (`appearance.json` `nativeMenus` / `translucency`, `workspaces.json` `active`).
   - `community-plugins.json`: projected from `plugins` (`pluginSet` / `pluginDel`).
   - `plugins/<id>/data.json`: `filePut` with `pluginVersion`, applied only on an equal local version.
   - `snippets/*.css`, `themes/<name>/{theme.css, manifest.json}`: `filePut`. Content > 64 KiB or binary goes as a
     blob ref.
-- **Never synced:** `plugins/yaos/**`, `workspace*.json`, plugin code (`main.js`, `styles.css` of plugins), caches.
+- **Never synced:** `plugins/yaos/**`, `workspace.json`, `workspace-mobile.json` (open-pane layout),
+  `file-recovery.json`, `publish.json`, `types.json`, plugin code (`main.js`, `styles.css` of plugins), caches.
 - **Detection.** On full reconcile and focus, `ConfigDirPort.list` / `readBytes` are compared with `cfgBase`. Changed
   keys or files become cfg ops, sent through the send window.
 - **Projection.** For each register whose fold value ≠ local:
