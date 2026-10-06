@@ -3,8 +3,9 @@
  *
  *  - body/canvas content > MAX_INLINE_UPDATE_BYTES (raw, the size the gate
  *    checks) becomes a bodyUpdateRef: the update goes to the BlobPort, or
- *    without one to `x:<sha256>` blobChunk frames; the ref frame is then
- *    `held` on the last chunk.
+ *    without one to `x:<address>` blobChunk frames (the address is
+ *    CryptoPort.blobAddress(sha256), e2ee-design §10.1); the ref frame is
+ *    then `held` on the last chunk. The ref keeps the plaintext sha256.
  *  - The outbox record of a ref keeps the full update as `content` (the local
  *    doc re-applies it at load); the sealed payload carries the ref.
  *  - Initial content is inserted in INITIAL_INSERT_CHUNK_CHARS transactions,
@@ -16,7 +17,7 @@ import { EnvelopeFlag, type BlobChunkContent, type EnvelopeKind } from "../../co
 import { BLOB_CHUNK_BYTES, INITIAL_INSERT_CHUNK_CHARS, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { blobChunkStream, streamClass, type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type NsOp, type Seq, type StreamName, type VaultId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { CryptoPort, HashPort } from "../../ports/crypto";
+import type { BlobAddress, CryptoPort, HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
 import { sealFrame } from "../ingest/envelope";
 import type { NewOutboxFrame } from "../store/repo";
@@ -85,7 +86,7 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 		}
 	}
 	if (input.content.length > MAX_LOG_BLOB_BYTES) throw new FrameTooLargeError(input.content.length);
-	const xs = blobChunkStream(hash);
+	const xs = blobChunkStream(await ctx.crypto.blobAddress(hash));
 	const total = Math.ceil(input.content.length / BLOB_CHUNK_BYTES);
 	const out: NewOutboxFrame[] = [];
 	for (let i = 0; i < total; i++) {
@@ -133,10 +134,10 @@ export async function buildSnapFrame(ctx: FrameCtx, stream: StreamName, ops: rea
 	return seal(ctx, stream, "snapOps", authorNsSeq, 0, 0, content, content, "pending", null, nowMs);
 }
 
-/** One x:<hash> blobChunk frame (pending, no dependency). */
-export async function buildBlobChunkFrame(ctx: FrameCtx, chunk: BlobChunkContent, authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
+/** One blobChunk frame of x:<address>, address = blobAddress(chunk.hash) (pending, no dependency). */
+export async function buildBlobChunkFrame(ctx: FrameCtx, address: BlobAddress, chunk: BlobChunkContent, authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
 	const content = encodeBlobChunk(chunk);
-	return seal(ctx, blobChunkStream(chunk.hash), "blobChunk", authorNsSeq, 0, 0, content, content, "pending", null, nowMs);
+	return seal(ctx, blobChunkStream(address), "blobChunk", authorNsSeq, 0, 0, content, content, "pending", null, nowMs);
 }
 
 /** Split text into <= max UTF-16 unit chunks without cutting a surrogate pair. */

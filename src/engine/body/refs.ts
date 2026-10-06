@@ -1,6 +1,7 @@
 /**
  * bodyUpdateRef resolution (DESIGN §d.6 stage 2, §b.6, §j.1): BlobPort first,
- * then the x:<hash> log stream; sha256 checked, then gate stage 2 on the
+ * then the x:<address> log stream (address = CryptoPort.blobAddress of the
+ * ref's sha256, e2ee-design §10.1); sha256 checked, then gate stage 2 on the
  * bytes. null = not available yet (the doc shows wait/blob-unavailable).
  */
 
@@ -53,9 +54,9 @@ export async function resolveRefContent(deps: RefDeps, stream: StreamName, refCo
 		const r = checkYjsUpdate(bytes, cls, { maxBytes: MAX_LOG_BLOB_BYTES * 8, maxChars: MAX_DOC_TEXT_CHARS });
 		return r.ok ? bytes : null;
 	};
+	const address = await deps.crypto.blobAddress(ref.hash);
 	if (deps.blob) {
 		try {
-			const address = await deps.crypto.blobAddress(ref.hash);
 			const sealed = await deps.blob.get(address);
 			const opened = sealed ? await deps.crypto.openBlob({ address, sealed }) : null;
 			const ok = await verify(opened?.ok ? opened.plaintext : null);
@@ -64,7 +65,7 @@ export async function resolveRefContent(deps: RefDeps, stream: StreamName, refCo
 			// fall through to the log
 		}
 	}
-	const rows = await deps.repo.getTail(blobChunkStream(ref.hash));
+	const rows = await deps.repo.getTail(blobChunkStream(address));
 	return verify(assembleChunks(rows.map((r) => r.content), ref.hash));
 }
 

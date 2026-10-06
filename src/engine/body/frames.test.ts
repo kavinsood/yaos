@@ -137,7 +137,7 @@ test("buildBodyFrames: > MAX_INLINE_UPDATE_BYTES without a blob store -> x: chun
 	const ref = frames[frames.length - 1]!;
 	assert.equal(chunks.length, Math.ceil(u.length / BLOB_CHUNK_BYTES));
 	for (const c of chunks) {
-		assert.equal(c.stream, blobChunkStream(h));
+		assert.equal(c.stream, blobChunkStream(await crypto.blobAddress(h)));
 		assert.equal(c.kind, "blobChunk");
 		assert.equal(c.state, "pending");
 		assert.ok(c.sealed.length <= 1024 * 1024, "every chunk fits a relay frame");

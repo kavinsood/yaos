@@ -15,6 +15,11 @@ function blob(n: number, salt = 0): { hash: ContentHash; bytes: Uint8Array } {
 	return { hash: sha256Hex(bytes) as ContentHash, bytes };
 }
 
+/** x:<address> of `hash` under the engine's crypto (suite 0: the hash itself). */
+async function xsOf(e: LogEngine, hash: ContentHash) {
+	return blobChunkStream(await e.c.deps.crypto.blobAddress(hash));
+}
+
 async function stopAll(...es: LogEngine[]): Promise<void> {
 	for (const e of es) await e.stop();
 }
@@ -27,9 +32,10 @@ test("blob chunks: append on A, read + assemble on B; append is idempotent", asy
 		const { hash, bytes } = blob(3_500);
 		const chunks = splitChunks(hash, bytes, 1_000);
 		assert.equal(chunks.length, 4);
+		const xs = await xsOf(a, hash);
 		assert.equal(await a.appendBlobChunks(hash, chunks), true);
-		assert.equal(relay.rows(blobChunkStream(hash)).length, 4);
-		assert.equal(a.c.outbox.ofStream(blobChunkStream(hash)).length, 0, "receipted");
+		assert.equal(relay.rows(xs).length, 4);
+		assert.equal(a.c.outbox.ofStream(xs).length, 0, "receipted");
 
 		const got = await b.readBlobChunks(hash);
 		assert.ok(got);
@@ -40,7 +46,7 @@ test("blob chunks: append on A, read + assemble on B; append is idempotent", asy
 		// Idempotent: everything committed -> true, no new rows; a partial retry adds nothing either.
 		assert.equal(await a.appendBlobChunks(hash, chunks), true);
 		assert.equal(await b.appendBlobChunks(hash, chunks.slice(1, 3)), true);
-		assert.equal(relay.rows(blobChunkStream(hash)).length, 4);
+		assert.equal(relay.rows(xs).length, 4);
 
 		// Unknown hash: readable, empty. Mismatched hash in a chunk: refused.
 		assert.deepEqual(await b.readBlobChunks(blob(10, 7).hash), []);
@@ -58,7 +64,8 @@ test("blob chunks: once the peer's tail holds every chunk, readBlobChunks assemb
 	try {
 		const { hash, bytes } = blob(3_500, 4);
 		assert.equal(await a.appendBlobChunks(hash, splitChunks(hash, bytes, 1_000)), true);
-		await until(async () => (await b.c.repo.getTail(blobChunkStream(hash), 0)).length === 4, 3_000, "b's tail has the x: rows");
+		const xs = await xsOf(b, hash);
+		await until(async () => (await b.c.repo.getTail(xs, 0)).length === 4, 3_000, "b's tail has the x: rows");
 		const reads = relay.readRequests;
 		const got = await b.readBlobChunks(hash);
 		assert.equal(relay.readRequests, reads, "no relay read");
@@ -78,13 +85,14 @@ test("blob chunks: timeout -> false; the records still commit and a retry adds n
 	try {
 		const one = blob(2_500, 1);
 		const c1 = splitChunks(one.hash, one.bytes, 1_000);
+		const xs = await xsOf(a, one.hash);
 		relay.pauseCommits();
 		assert.equal(await a.appendBlobChunks(one.hash, c1), false, "timeout while commits are paused");
-		assert.equal(a.c.outbox.ofStream(blobChunkStream(one.hash)).length, 3, "records stay in the outbox");
+		assert.equal(a.c.outbox.ofStream(xs).length, 3, "records stay in the outbox");
 		relay.resumeCommits();
-		await until(() => a.c.outbox.ofStream(blobChunkStream(one.hash)).length === 0, 3_000, "records committed");
+		await until(() => a.c.outbox.ofStream(xs).length === 0, 3_000, "records committed");
 		assert.equal(await a.appendBlobChunks(one.hash, c1), true);
-		assert.equal(relay.rows(blobChunkStream(one.hash)).length, 3);
+		assert.equal(relay.rows(xs).length, 3);
 	} finally {
 		await a.stop();
 	}
@@ -96,9 +104,10 @@ test("blob chunks: session drop -> false; offline -> false / null; after reconne
 	try {
 		const two = blob(1_500, 2);
 		const c2 = splitChunks(two.hash, two.bytes, 1_000);
+		const xs = await xsOf(a, two.hash);
 		relay.pauseCommits();
 		const p = a.appendBlobChunks(two.hash, c2);
-		await until(() => a.c.outbox.ofStream(blobChunkStream(two.hash)).length === 2, 2_000, "authored");
+		await until(() => a.c.outbox.ofStream(xs).length === 2, 2_000, "authored");
 		a.disconnect();
 		assert.equal(await p, false, "session dropped");
 		assert.equal(await a.appendBlobChunks(two.hash, c2), false, "offline");
@@ -107,7 +116,7 @@ test("blob chunks: session drop -> false; offline -> false / null; after reconne
 		relay.resumeCommits();
 		await a.reconnect();
 		assert.equal(await a.appendBlobChunks(two.hash, c2), true, "retry waits on the outbox records");
-		assert.equal(relay.rows(blobChunkStream(two.hash)).length, 2);
+		assert.equal(relay.rows(xs).length, 2);
 	} finally {
 		await a.stop();
 	}
