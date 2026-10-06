@@ -4,10 +4,11 @@
 // DO (T-HOTPATH).
 import { randomBase64Url } from "./base64url";
 import { CONFIG_OBJECT_NAME, type ConfigDO } from "./config/config";
+import { consolePage } from "./console/console";
+import { mobileSetupPage } from "./console/mobileSetup";
 import { SESSION_TOKEN_PATTERN, SESSION_TTL_MS, type FrozenAction } from "./config/host";
 import {
 	corsPreflight,
-	html,
 	json,
 	notFound,
 	notImplemented,
@@ -69,15 +70,6 @@ export const MAX_VAULT_NAME_LENGTH = 80;
  */
 export const PURGE_BATCH_SIZE = 1000;
 export const MAX_PURGE_BATCHES = 20;
-
-/**
- * DECISIONS-GAP: the console (`GET /`) and `GET /mobile-setup` are P4 (§9). Until then both are static placeholders
- * with no DO call, as §2.2 requires.
- */
-const CONSOLE_PLACEHOLDER = "<!doctype html><meta charset=\"utf-8\"><title>YAOS server</title><h1>YAOS server</h1>"
-	+ "<p>The operator console is not available in this build.</p>";
-const MOBILE_SETUP_PLACEHOLDER = "<!doctype html><meta charset=\"utf-8\"><title>YAOS mobile setup</title>"
-	+ "<h1>YAOS mobile setup</h1><p>Mobile setup is not available in this build.</p>";
 
 export interface RouterPorts {
 	upgrades: UpgradeRejectPort;
@@ -195,9 +187,9 @@ export class Router {
 		}
 		switch (`${method} ${path}`) {
 			case "GET /":
-				return html(CONSOLE_PLACEHOLDER);
+				return consolePage();
 			case "GET /mobile-setup":
-				return html(MOBILE_SETUP_PLACEHOLDER);
+				return mobileSetupPage();
 			case "GET /api/capabilities":
 				return withCors(json(await this.capabilities(env)));
 			case "POST /enroll":

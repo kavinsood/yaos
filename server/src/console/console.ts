@@ -46,7 +46,7 @@ export const CONSOLE_MESSAGES: Readonly<Record<string, string>> = {
 	not_implemented: "This server build does not support that action yet.",
 };
 
-/** The console page. The coordinator wires it as `case "GET /": return consolePage();` in worker.ts. */
+/** The console page, served by router.ts for `GET /`. */
 export function consolePage(): Response {
 	return staticPage(renderConsole, "'self'");
 }

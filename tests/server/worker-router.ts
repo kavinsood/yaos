@@ -145,6 +145,7 @@ s.test("§2.2: static pages and CORS preflight answer without a DO", async () =>
 			assert.equal(response.status, 200, path);
 			assert.match(response.headers.get("Content-Type") ?? "", /^text\/html/, path);
 			assert.equal(response.headers.get("Access-Control-Allow-Origin"), null, `${path}: no CORS`);
+			assert.match(response.headers.get("Content-Security-Policy") ?? "", /script-src 'nonce-/, `${path}: the P4 page`);
 		}
 		for (const path of ["/api/capabilities", "/api/anything", "/enroll", `/vault/${world.vaultId}/streams/feed`, "/vault/x"]) {
 			const response = await world.fetch(path, { method: "OPTIONS" });

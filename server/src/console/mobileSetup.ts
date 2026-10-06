@@ -7,7 +7,7 @@
 // origin (setupQr.ts always builds both from the same host), so a crafted link cannot point Obsidian at another server.
 import { staticPage } from "./page";
 
-/** The mobile setup page. The coordinator wires it as `case "GET /mobile-setup": return mobileSetupPage();`. */
+/** The mobile setup page, served by router.ts for `GET /mobile-setup`. */
 export function mobileSetupPage(): Response {
 	return staticPage(renderMobileSetup, "'none'");
 }
