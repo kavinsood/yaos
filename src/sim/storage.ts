@@ -1,9 +1,8 @@
 /**
  * In-memory StoragePort with IndexedDB semantics and crash injection
  * (DESIGN §e, §m). Implements the frozen src/ports/storage.ts; API-compatible
- * superset of the WP-C stand-in (src/engine/sync/__standins__/memStorage.ts
- * there) and meant to pass the same conformance suite
- * (src/engine/adapters/storageConformance.test.ts there).
+ * superset of the former WP-C memStorage stand-in; passes the storage
+ * conformance suite.
  *
  * Data semantics:
  *  - tx() is atomic: a readwrite body writes into a copy-on-write working copy

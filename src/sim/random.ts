@@ -1,8 +1,7 @@
 /**
  * Seeded RandomPort for simulation (DESIGN §m). sfc32 seeded via splitmix32
- * (12 warm-up draws). Bit-for-bit the same sequence as the WP-D stand-in
- * (src/sim/__standins__/random.ts there), so seeds recorded against it
- * still reproduce after the swap.
+ * (12 warm-up draws). Bit-for-bit the same sequence as the former WP-D
+ * stand-in, so seeds recorded against it still reproduce.
  *
  * `fork(label)` derives an independent deterministic stream
  * (seed ^ FNV-1a(label)) so adding draws in one actor never shifts another.

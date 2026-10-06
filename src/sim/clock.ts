@@ -1,7 +1,6 @@
 /**
  * Virtual clock for deterministic simulation (DESIGN §m). Implements the
- * frozen ClockPort; API-compatible superset of the WP-D stand-in
- * (src/sim/__standins__/clock.ts there), so integration is an import swap.
+ * frozen ClockPort; API-compatible superset of the former WP-D stand-in.
  *
  * Determinism:
  * - Timers fire in (dueAt, insertion order); a binary heap keyed on that pair.
