@@ -1,0 +1,145 @@
+build-server-release.mjs
+  s_79d9b93476b202::t_616dfc3263939f 2,39-41
+eslint.config.mts
+  s_79d9b93476b202::t_d6702c07e9a4d8 64-66
+legacy-src/shared/concurrency.ts
+  s_79d9b93476b202::t_c6090bcd3d80f8 2-4
+legacy-src/shared/socketCloseCodes.ts
+  s_5ec5b8c6943789::t_dd8edd701e2ed5 1-2
+legacy-src/shared/socketLiveness.ts
+  s_5ec5b8c6943789::t_17ac7d0bf4c2ee 1-30,32-35,37-44,46-54,56,62-70,72-89,92-98,101-110,112-113,116-120,124-260
+legacy-src/sync/settingsSync/protocol.ts
+  s_79d9b93476b202::t_c6014fca5b1de9 6
+package-lock.json
+  s_79d9b93476b202::t_3c968fb0a02ea6 38
+package.json
+  s_79d9b93476b202::t_c4339d7ac9420f 15-16,63
+scripts/guard-server-crdt-imports.mjs
+  s_79d9b93476b202::t_1ba7fdf0bc4118 2-3,16-17,25,28
+scripts/relay-dev/config.sh
+  s_79d9b93476b202::t_b1783eb9488538 5-7
+scripts/relay-dev/deploy.sh
+  s_79d9b93476b202::t_4d6e46656e5418 6,8,10,39
+scripts/relay-dev/start-local.sh
+  s_79d9b93476b202::t_c1c9a0c3b737e2 3
+server/.env.example
+  s_79d9b93476b202::t_146a05aa2bb703 6
+server/package-lock.json
+  s_79d9b93476b202::t_478e6887fc978a 12
+server/package.json
+  s_79d9b93476b202::t_f858d0507b0ea0 5,13
+server/scripts/update-from-release.mjs
+  s_79d9b93476b202::t_38a9886bd4ea7b 158
+server/src/shared/socketLiveness.ts
+  s_79d9b93476b202::t_af66a3393c7eeb 1-3
+server/src/streams/relay.ts
+  s_79d9b93476b202::t_a5e04de7358481 69
+server/src/version.ts
+  s_79d9b93476b202::t_009d558445d895 1-3
+tests/client/binary-envelope.ts
+  s_79d9b93476b202::t_65914b51c10a30 6
+tests/client/body-settlement.ts
+  s_79d9b93476b202::t_3473fcc268e693 7
+tests/client/bootstrap-http-boundaries.ts
+  s_67b8c9b1582106::t_beec72460b6232 16,19-20
+tests/client/bootstrap-settlement.ts
+  s_79d9b93476b202::t_42b54ca4837f32 18
+tests/client/canvas-manager.ts
+  s_79d9b93476b202::t_496ec91b70a21d 4-6
+tests/client/canvas-projection-router.ts
+  s_79d9b93476b202::t_1168ecdf9cedce 3
+tests/client/canvas-semantic-core.ts
+  s_79d9b93476b202::t_513505f10dd2e2 3-5,8-9
+tests/client/daily-limit-create-replay.ts
+  s_79d9b93476b202::t_78448132fc5a34 11
+tests/client/daily-limit.ts
+  s_79d9b93476b202::t_8911275844d515 12
+tests/client/declarative-settings.ts
+  s_79d9b93476b202::t_6732fbd3e41ad9 7
+tests/client/fresh-large-http-roundtrips.ts
+  s_79d9b93476b202::t_fdd42492635aed 3,8
+tests/client/fresh-markdown-updates.ts
+  s_79d9b93476b202::t_f57fb1138b468d 3
+tests/client/map-with-concurrency.ts
+  s_79d9b93476b202::t_a87e06205b19a6 7
+tests/client/markdown-codec.ts
+  s_79d9b93476b202::t_c2fee804a6c37c 9
+tests/client/onboarding-import.ts
+  s_79d9b93476b202::t_4abdc7cf0a287d 13
+tests/client/root-reconnect-admission.ts
+  s_79d9b93476b202::t_20697a1502fc29 14
+tests/client/semantic-epoch-protocol.ts
+  s_79d9b93476b202::t_e5cc2f7b360287 14
+tests/client/settings-hardening.ts
+  s_79d9b93476b202::t_007d195db88ee6 12
+tests/client/settings-sync-engine.ts
+  s_79d9b93476b202::t_942e0bb9d616e8 15
+tests/client/settings-sync-protocol.ts
+  s_79d9b93476b202::t_8ba48f9b6f5454 7
+tests/client/socket-liveness-coordinator.ts
+  s_79d9b93476b202::t_e45a64f328a0c6 5
+tests/client/stale-disk-never-reverts-body.ts
+  s_79d9b93476b202::t_ad7933aa68f431 42
+tests/client/test-only-timers.ts
+  s_79d9b93476b202::t_1eb4037dead414 12
+tests/client/vault-work-scheduler-integration.ts
+  s_79d9b93476b202::t_6ce00e68d281fe 3-4
+tests/contracts/release-compatibility-matrix.ts
+  s_79d9b93476b202::t_526b85e23c10d5 2,83-86,88,93-97,99-100,102-103
+tests/contracts/server-update-local.ts
+  s_79d9b93476b202::t_686fc6568b16fb 72
+tests/fixtures/runner-yjs-probe.ts
+  s_79d9b93476b202::t_d422bc3f5f3aba 2,4-7
+tests/run-suites.mjs
+  s_79d9b93476b202::t_5a4674c670a9bf 8,38,70
+tests/run-typescript.mjs
+  s_79d9b93476b202::t_0d758ad4437dc9 23
+tests/server/helpers/workerHarness.ts
+  s_0a888a2d99d5d5::t_f445c259de4e37 163,166-167
+tests/server/setup-qr.ts
+  s_79d9b93476b202::t_24bcdffed67169 4
+tests/server/worker-router.ts
+  s_0a888a2d99d5d5::t_ec559fbc1d1b39 443-444
+tests/suite-discovery.ts
+  s_79d9b93476b202::t_57ce84dc627bdb 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "67e6af8c868b0ca339e30d6e200033ff3641bff6",
+  "prompts": {},
+  "sessions": {
+    "s_0a888a2d99d5d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abaac5423d9326e26",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_5ec5b8c6943789": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad23e7dffd5cd7d1b",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_67b8c9b1582106": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac2eb42fe0cde3f33",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_79d9b93476b202": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4a02e307d4575a34",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
