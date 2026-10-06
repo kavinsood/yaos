@@ -1,0 +1,27 @@
+src/engine/blobs/blobQueue.test.ts
+  s_ed451e485d98d2::t_fdca23b8d57eb5 99,113-128,133,137
+src/engine/blobs/blobQueue.ts
+  s_ed451e485d98d2::t_0507b30843cfa0 13,15-19,56-57,66-72,89-90,92-93,97-98,111,118
+src/engine/compose/passScheduler.test.ts
+  s_ed451e485d98d2::t_2bce20f276f726 23
+src/engine/compose/passScheduler.ts
+  s_ed451e485d98d2::t_9ed63b3b42a9b6 23-24,177,179
+src/engine/compose/vaultRuntime.ts
+  s_ed451e485d98d2::t_0a7cdf4a12095d 114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a2f9889607ee70e781a734321a5990c17ee39dfe",
+  "prompts": {},
+  "sessions": {
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
