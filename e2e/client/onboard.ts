@@ -91,6 +91,8 @@ async function http(baseUrl: string, method: string, path: string, options: { to
 	const headers: Record<string, string> = {};
 	if (options.token) headers.Authorization = `Bearer ${options.token}`;
 	if (options.cookie) headers.Cookie = options.cookie;
+	// Operator routes and /claim require a same-origin Origin (relay D5, what a browser sends); harmless elsewhere.
+	if (path === "/claim" || path.startsWith("/operator/")) headers.Origin = new URL(baseUrl).origin;
 	let body: string | undefined;
 	if (options.json !== undefined) {
 		headers["Content-Type"] = "application/json";
@@ -139,7 +141,7 @@ export async function devicePairingCode(baseUrl: string, vaultId: string, device
 }
 
 async function operatorLogin(baseUrl: string, key: string): Promise<string> {
-	const response = await fetch(`${baseUrl}/operator/login`, { method: "POST", headers: { "Content-Type": "application/json" },
+	const response = await fetch(`${baseUrl}/operator/login`, { method: "POST", headers: { "Content-Type": "application/json", Origin: new URL(baseUrl).origin },
 		body: JSON.stringify({ operatorRecoveryKey: key }) });
 	await response.arrayBuffer();
 	const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
