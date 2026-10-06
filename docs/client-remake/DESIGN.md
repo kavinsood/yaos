@@ -1715,7 +1715,19 @@ ones get conflict copies.
 - **Ops cover only settings changes**, never whole-file rewrites. Each key holds a single value, so a register cannot
   grow.
 - **Reload notice.** When applied settings need an Obsidian reload, show a notice. YAOS never reloads Obsidian itself.
-- Port the legacy `settingsSync/{allowlist, dataJsonGate, configDirKey, lwwReconcile(json canonicalization only)}`.
+- **Size caps** (`CFG_MAX_*`, legacy values). A file over 1 MB is not sent and not written. Going through files in
+  path order, the first one that would take the synced set past 256 files or 4 MB is held, and so is every file after
+  it. This applies on both sides, using the size after the pass. A held file gets no op and no write, and its
+  `cfgBase` is left alone, so it is never deleted elsewhere. Removals never count toward the caps.
+- **Skip notices.** These skips each show one warn notice per category: a `data.json` held for a plugin version
+  mismatch, a plugin enabled elsewhere but not installed here, local JSON that is not valid, and files past the caps.
+  The notice names the files and plugins (a count once there are many) and says what to do. A category is shown
+  again only when it gains an item, so a steady hold is shown once.
+- **Clash pause.** While Obsidian Sync (`core-plugins.json` `sync`) or a known community sync plugin (Remotely Save,
+  Self-hosted LiveSync, Relay) is enabled, cfg sync emits and applies nothing. It shows one warn naming the clashing
+  plugin and resumes on its own once that plugin is off. Note sync is not affected.
+- Port the legacy `settingsSync/{allowlist, dataJsonGate, configDirKey, clash, lwwReconcile(json canonicalization
+  only)}`.
 
 ### j.4 Client snapshots and recovery
 
