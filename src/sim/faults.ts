@@ -123,6 +123,10 @@ export class FaultState {
 		return this.down.has(i);
 	}
 
+	isBackground(i: number): boolean {
+		return this.backgrounded.has(i);
+	}
+
 	private later(ms: number, fn: () => void): void {
 		const h = this.clock.setTimer(ms, () => {
 			this.timers.delete(h);

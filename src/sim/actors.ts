@@ -178,6 +178,8 @@ export interface ActorWorld {
 	readonly devs: readonly SimDevice[];
 	readonly ledger: TokenLedger;
 	isDown(dev: number): boolean;
+	/** Hidden, pagehide or freeze (faults.ts "background"): the user cannot reach the app. */
+	isBackground(dev: number): boolean;
 }
 
 function pickOf<T>(items: readonly T[], pick: number): T | undefined {
@@ -202,6 +204,10 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 	if (!d) return `skip ${a.t}: no device ${a.dev}`;
 	const tag = `${d.name} ${a.t}`;
 	if (w.isDown(a.dev)) return `skip ${tag}: app down`;
+	// Nobody types into, or acts through, a hidden or frozen app; other programs still write its files.
+	// The engine pauses passes then (DESIGN §i.4), so those writes reach it as one change on resume.
+	const external = (a.t === "diskInsert" || a.t === "diskDeleteToken") && a.by === "external";
+	if (!external && w.isBackground(a.dev)) return `skip ${tag}: app in background`;
 	const token = `[${d.name}.${step}]`;
 	const ws = d.workspace;
 	switch (a.t) {

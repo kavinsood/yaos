@@ -172,7 +172,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		for (const d of devs) void d.start();
 		await clock.advance(500);
 
-		const actorWorld = { devs, ledger, isDown: (i: number) => faults.isDown(i) };
+		const actorWorld = { devs, ledger, isDown: (i: number) => faults.isDown(i), isBackground: (i: number) => faults.isBackground(i) };
 		let skipped = 0;
 		for (const step of plan) {
 			await clock.advance(step.gapMs);

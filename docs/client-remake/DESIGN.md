@@ -1929,8 +1929,10 @@ All actors run in one Node process with a virtual `ClockPort` and a seeded `Rand
   y-codemirror stand-in, 2 s save debounce, `setViewData` reloads) + `MemStoragePort` + `SideFilePort`.
 - **User actors**, per device: type into open notes (unique tokens), open/close/switch views, create/edit/rename/
   delete files and folders, case-only renames, paste large text, import a folder of files, attachments, settings
-  edits.
-- **External-writer actor:** another app modifying files on disk, including files open in editors.
+  edits. They act only on a running app in the foreground. While a device is down or backgrounded (`hidden`,
+  `pagehide`, `freeze`), its user actions are recorded as skips.
+- **External-writer actor:** another app modifying files on disk, including files open in editors. It also writes
+  while the app is backgrounded. The engine then takes those writes in on resume (§i.4), as one change per file.
 
 ### l.2 Seeded faults
 
