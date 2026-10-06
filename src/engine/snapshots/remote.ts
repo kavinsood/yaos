@@ -10,7 +10,7 @@ import { snapKey, type SnapOp, type SnapRecord } from "../../core/snap/record";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort } from "../../ports/crypto";
 import type { SideFilePort } from "../../ports/vault";
-import { getOpened, putSealed } from "../blobs/blobStore";
+import { getOpened, putSealed, storePlaintextCap } from "../blobs/blobStore";
 import { dlName, partName } from "./localStore";
 import type { SnapIndexPort } from "./snapIndex";
 
@@ -35,8 +35,9 @@ export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: 
 	const key = snapKey(index.self, record.snapshotId);
 	if (before.state.records.has(key)) return "present";
 	if (before.state.dels.has(key) || record.createdAtMs < (before.state.floors.get(index.self) ?? 0)) return "deleted";
+	const cap = storePlaintextCap(crypto, store);
 	for (const p of record.parts) {
-		if (p.size > store.maxBlobBytes) throw new SnapshotUploadError(`part of ${p.size} bytes exceeds the store limit ${store.maxBlobBytes}`);
+		if (p.size > cap) throw new SnapshotUploadError(`part of ${p.size} bytes exceeds the store limit ${cap}`);
 	}
 	const addresses: BlobAddress[] = [];
 	for (const p of record.parts) addresses.push(await crypto.blobAddress(p.sha256));
@@ -63,11 +64,15 @@ export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: 
 
 /**
  * Part source for verifyBundle over a remote record: part i is fetched by the hash the record names, through the
- * blob path; absent or unopenable is part-missing. verifyBundle checks its size and hash before asking for the
- * next part; `keepPart` (its onPart) then writes it to the download cache.
+ * blob path (the address is recomputed from the sha256, never taken from the record); absent or unopenable is
+ * part-missing, a store error throws. verifyBundle checks its size and hash before asking for the next part;
+ * `keepPart` (its onPart) then writes it to the download cache.
  */
 export function remotePart(r: RemoteDeps, record: SnapRecord): (i: number) => Promise<Uint8Array | null> {
-	return (i) => getOpened(r.store, r.crypto, record.parts[i]!.sha256);
+	return async (i) => {
+		const got = await getOpened(r.store, r.crypto, record.parts[i]!.sha256, null);
+		return got.ok ? got.bytes : null;
+	};
 }
 
 export function keepPart(side: SideFilePort): (i: number, bytes: Uint8Array) => Promise<void> {

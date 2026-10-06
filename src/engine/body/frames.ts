@@ -19,6 +19,7 @@ import { blobChunkStream, streamClass, type CfgOp, type ClientFrameId, type Cont
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort, HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
+import { putSealed, storePlaintextCap } from "../blobs/blobStore";
 import { sealFrame } from "../ingest/envelope";
 import type { NewOutboxFrame } from "../store/repo";
 import { encodeCfgOps } from "../../core/codec/cfgOps";
@@ -75,11 +76,9 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 	}
 	const hash = bytesToHex(await ctx.hash.sha256(input.content)) as ContentHash;
 	const refContent = encodeBodyUpdateRef({ hash, size: input.content.length });
-	if (ctx.blob && input.content.length <= ctx.blob.maxBlobBytes) {
+	if (ctx.blob && input.content.length <= storePlaintextCap(ctx.crypto, ctx.blob)) {
 		try {
-			const address = await ctx.crypto.blobAddress(hash);
-			const has = await ctx.blob.has([address]);
-			if (!has.has(address)) await ctx.blob.put(address, await ctx.crypto.sealBlob({ address, plaintext: input.content }));
+			await putSealed(ctx.blob, ctx.crypto, hash, input.content);
 			return [await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, 0, refContent, input.content, state, input.dependsOn, input.nowMs)];
 		} catch {
 			// Blob store unavailable: fall through to the log path.
