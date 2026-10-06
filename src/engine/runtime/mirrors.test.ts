@@ -254,8 +254,9 @@ describe("outbox mirror codec", () => {
 		}
 	});
 
-	it("refuses to encode non-integer numbers or unknown states", async () => {
-		await assert.rejects(encodeOutboxMirror({ ...FULL_OUTBOX, writtenAtMs: 1.5 }, sha), CodecError);
+	it("floors a fractional writtenAtMs (ClockPort.now may be fractional); refuses bad counters and unknown states", async () => {
+		const floored = await decodeOutboxMirror(await encodeOutboxMirror({ ...FULL_OUTBOX, writtenAtMs: 1.5 }, sha), sha);
+		assert.deepEqual(floored, { ...FULL_OUTBOX, writtenAtMs: 1 });
 		await assert.rejects(encodeOutboxMirror({ ...FULL_OUTBOX, generation: -1 }, sha), CodecError);
 		const badState = { ...frame("a", 1), state: "bogus" as OutboxState };
 		await assert.rejects(encodeOutboxMirror({ ...ID, generation: 1, writtenAtMs: 1, frames: [badState] }, sha), CodecError);
