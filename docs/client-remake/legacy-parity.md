@@ -206,3 +206,70 @@ src/host/ui/api.ts:50-58. The settings sync fields are in §1 and the exclude fi
 New only: "Deleted files go to" (`trashMode`, §11), "Live edits from other devices" (`provisionalBroadcast`,
 src/host/ui/settingsTab.ts:199), daily snapshots and how many to keep (:204, :209), "Upload snapshots to attachment
 storage" (:221), and "Show status in the status bar" (:280).
+
+## 4. Onboarding and pairing
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Setup link `obsidian://yaos?action=setup&host=...&pairingCode=...` | adfa7a7:src/main.ts:684; adfa7a7:src/runtime/setupLinkController.ts:65-74 | src/host/ui/registerUi.ts:152-159; src/host/ui/pairing.ts:472 | ported (the link opens a pre-filled pair dialog and needs one click; legacy enrolled at once) |
+| Enroll with a server URL and a one-time code | adfa7a7:src/runtime/setupLinkController.ts:56; adfa7a7:src/onboarding/provisioningClient.ts:51 | src/host/ui/pairing.ts:309; src/host/ui/pairFlow.ts:33 | ported |
+| Enroll error text (expired, used, unknown code) | adfa7a7:src/runtime/setupLinkController.ts:336-341 | src/host/ui/pairing.ts:293-296 | ported |
+| "This device is enrolled. Starting sync..." | adfa7a7:src/runtime/setupLinkController.ts:284 | src/host/ui/pairModal.ts:128 | ported |
+| Confirm before pairing over an existing enrollment | adfa7a7:src/runtime/setupLinkController.ts:289 | src/host/ui/pairModal.ts:62-67 (warning), :106 ("Replace pairing") | ported |
+| Retire the old enrollment when pairing replaces it (wave 2) | adfa7a7:src/runtime/setupLinkController.ts:250-257: when the new enrollment differs from the current one in host, vault, device or generation (:246-249), it awaits `retireCurrentEnrollment`, and if that throws it shows the error and abandons the new enrollment. The retire step (adfa7a7:src/main.ts:3439-3473) clears the settings-sync local state; sends `DELETE {host}/vault/{vaultId}/auth/device` with the old device token, treating 200 and 401 as success and otherwise showing "Could not remove the old server membership. Remove it from the old server console." (9 s); then tears down sync and deletes the old local database. | TBD-D | TBD-D |
+| An unanswered enrollment is kept and retried on the next load | adfa7a7:src/runtime/setupLinkController.ts:60-62 | src/host/plugin.ts:131; src/host/ui/pairFlow.ts:79, :112; src/host/ui/api.ts:151 | implemented (8db4540) |
+| Unclaimed server: claim it in a browser first | adfa7a7:src/runtime/fatalSyncNotice.ts:19-21 | src/host/ui/pairing.ts:216, :233 | ported |
+| Create a pairing code for another device ("Add my device") | adfa7a7:src/main.ts:3238 | src/host/ui/pairing.ts:421; src/host/ui/pairModal.ts:256 | ported |
+| Pairing dialog: copy the pairing page URL and the desktop deep link | adfa7a7:src/settings/PairDeviceModal.ts:69-74, :82-111 | src/host/ui/pairModal.ts:196-210 (server URL, pairing code, setup link and mobile setup page, each with Copy) | ported |
+| "Open pairing page" button | adfa7a7:src/settings/PairDeviceModal.ts:75-77, :95-97 | src/host/ui/pairModal.ts:210 | implemented (a6d3385) |
+| QR code of the mobile setup page in "Pair another device" (wave 2) | adfa7a7:src/settings/PairDeviceModal.ts:40-66: a "Generating pairing code..." placeholder, then `QRCode.toCanvas(canvas, mobileUrl, { width: 220, margin: 1, errorCorrectionLevel: "M" })` from the `qrcode` package. On success the canvas is shown with aria-label "Device linking code" ("Person invitation code" for an invite); on failure the placeholder reads "Could not generate a pairing code." and the canvas is removed. The intro text asks the user to scan the link on the other device (:33-38). | TBD-D | TBD-D |
+| Device-name hint in the pair dialog | adfa7a7:src/settings/settingsTab.ts:362-364 | src/host/ui/pairModal.ts:95 | implemented (a6d3385) |
+| Default device name | adfa7a7:src/utils/defaultDeviceName.ts:12 | src/host/ui/deviceName.ts:17 | ported |
+| "Invite person" pairing (`kind: "person"`) | adfa7a7:src/settings/PairDeviceModal.ts:21, :31-36; adfa7a7:src/main.ts:3252 | MISSING | dropped: governance moved to the server operator console (§18) |
+| First join with existing local files (durable, resumable importer with a summary) | adfa7a7:src/onboarding/localVaultImport.ts:215, :244; adfa7a7:src/main.ts:920 | src/core/plan/planner.ts:637-644 (local-only files become creates on the first full pass, DESIGN §j.5) | ported (no separate importer) |
+| Operator-provisioned vault check before the first sync | adfa7a7:src/onboarding/provisioningClient.ts:51; adfa7a7:src/main.ts:940 | src/host/ui/pairing.ts:216 (capabilities are checked before enrolling) | ported |
+
+New only: the pairing code shows a live expiry countdown (src/host/ui/pairModal.ts:212-224).
+
+## 5. Snapshots and restore UI
+
+Legacy recovery points lived on the server (`{host}/vault/{id}/recovery`, adfa7a7:src/snapshots/recoveryClient.ts:388),
+so any device could restore them. New snapshots are local zips in the plugin folder (DESIGN §j.4). They can also be
+uploaded as an off-device copy, but nothing records where, so only the device that took a snapshot can restore it.
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Daily snapshot | adfa7a7:src/snapshots/snapshotService.ts:99; adfa7a7:src/main.ts:1514 | src/engine/snapshots/snapshotJob.ts:144; src/engine/compose/vaultRuntime.ts:360 | ported |
+| Manual snapshot | adfa7a7:src/snapshots/snapshotService.ts:113 | src/engine/snapshots/snapshotJob.ts:90; src/engine/compose/runtimeOps.ts:107 | ported (the command is in §2) |
+| Snapshot reasons (initial, daily, manual, pre-bulk-operation) | adfa7a7:src/snapshots/recoveryClient.ts:44 | src/protocol/messages.ts:138 (daily, brake, epoch, idb, restore, manual) | implemented (687d5bc) (reasons shown in listings) |
+| Retention | adfa7a7:src/snapshots/recoveryClient.ts:887; adfa7a7:src/snapshots/snapshotService.ts:180 | src/engine/snapshots/snapshotJob.ts:228 (keep N dailies and 10 others); src/host/ui/settingsTab.ts:209 | ported |
+| Snapshot list | adfa7a7:src/snapshots/recoveryModals.ts:13; adfa7a7:src/snapshots/snapshotService.ts:152 | src/host/ui/snapshotsModal.ts:38; src/engine/compose/runtimeOps.ts:111 | implemented (6ca0411) |
+| Browse a snapshot's files | adfa7a7:src/snapshots/recoveryModals.ts:55; adfa7a7:src/snapshots/snapshotService.ts:206 | src/host/ui/snapshotsModal.ts:159; src/engine/compose/runtimeOps.ts:115 | implemented (687d5bc, 6ca0411) |
+| "Back up and restore all" | adfa7a7:src/snapshots/recoveryModals.ts:101 | src/host/ui/snapshotsModal.ts:92 ("Restore all...") | implemented (6ca0411) |
+| "Back up and restore this item" | adfa7a7:src/snapshots/recoveryModals.ts:148 | src/host/ui/snapshotsModal.ts:230 ("Restore selected...") | implemented (6ca0411) |
+| Restore result | adfa7a7:src/snapshots/snapshotService.ts:223 | src/engine/compose/runtimeOps.ts:124-128 (restored, unchanged, copies, failed) | implemented (687d5bc) |
+| Delete a recovery point | adfa7a7:src/snapshots/recoveryModals.ts:44; adfa7a7:src/snapshots/snapshotService.ts:490 | src/host/ui/snapshotsModal.ts:93; src/engine/compose/runtimeOps.ts:130 | implemented (687d5bc, 6ca0411) |
+| Back up current files before a restore replaces them | adfa7a7:src/snapshots/recoveryBackup.ts:33, :39 (`plugins/yaos/restore-backups`), :41 | src/engine/snapshots/snapshotJob.ts:181 (a "restore" snapshot first), :193-199 (a conflict copy of each changed file) | ported |
+| Snapshot "complete with gaps" warning | adfa7a7:src/snapshots/recoveryModals.ts:80 | src/host/ui/snapshotsModal.ts:199-207 (files a snapshot skipped) | implemented (6ca0411) |
+| "Restore as a fresh file identity" | adfa7a7:src/snapshots/recoveryModals.ts:174 | src/engine/snapshots/snapshotJob.ts:175 (a restore is a plain disk write; sync imports it like any local file) | ported |
+| Capture status dialog | adfa7a7:src/snapshots/recoveryModals.ts:196 | MISSING | dropped: recovery-job UI (coordinator decision) |
+| Resume persisted recovery operations on load | adfa7a7:src/snapshots/snapshotService.ts:67, :195 | MISSING | dropped: interrupted restore resume (coordinator decision) |
+| Upload snapshots off the device | adfa7a7:src/snapshots/recoveryClient.ts:688, :722 (server-side recovery points) | src/engine/snapshots/snapshotJob.ts:129-133; src/host/ui/settingsTab.ts:221 | implemented (6ca0411) (the toggle; upload only) |
+| Cross-device restore (restore a recovery point taken on another device) | adfa7a7:src/snapshots/recoveryClient.ts:722; adfa7a7:src/snapshots/snapshotService.ts:152 | MISSING | missing: large; DESIGN §j.4 keeps it out of v1 (uploads record no address, and there is no list or fetch path) |
+| Portable vault export | adfa7a7:src/snapshots/vaultExport.ts:124, :127; adfa7a7:src/main.ts:1389-1390 | MISSING | dropped: portable export (the vault is plain files; a manual snapshot is a zip) |
+
+## 6. Diagnostics and export
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Export a diagnostics file to the plugin folder | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:207; adfa7a7:src/telemetry/installTelemetryRuntime.ts:253 (needed debug mode on, :184) | src/host/ui/diagnostics.ts:112; src/host/plugin.ts:120 (`diagnostics/`); src/engine/compose/runtimeOps.ts:133-134 | ported (always available) |
+| Paths pseudonymized under a per-bundle salt | adfa7a7:src/telemetry/diagnostics/pathRedactor.ts:124, :277; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:203 | src/engine/compose/diagnosticsBundle.ts:30-35 | implemented (5d42e55) |
+| Export with file names (opt-in) | adfa7a7:src/telemetry/installTelemetryRuntime.ts:258 | src/engine/compose/diagnosticsBundle.ts:92-94; src/host/ui/commands.ts:34 | implemented (5d42e55) |
+| Recent events in the bundle | adfa7a7:src/telemetry/debug/flightRecorder.ts:79 | src/engine/runtime/context.ts:38 (the whole 2000-event ring) | implemented (5d42e55) |
+| Settings section without secrets | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:143; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:293 | src/host/ui/diagnostics.ts:19-21, :61 | implemented (5d42e55) |
+| Platform information | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:39 | src/protocol/status.ts:24 (device class in the status) | ported (device class, not the OS name) |
+| Copy to the clipboard and say where the file is | adfa7a7:src/telemetry/installTelemetryRuntime.ts:194 | src/host/ui/diagnostics.ts:146 | ported |
+| Vault-versus-CRDT comparison | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:77; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:314 | MISSING | dropped: disk-vs-state hash in diagnostics (coordinator decision) |
+| Leak check and content-fingerprint redaction | adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:352, :385 | MISSING | dropped: diagnostics leak check (pseudonymization replaces it) |
+
+The bundle's store sizes are always 0 bytes (src/engine/compose/runtimeOps.ts:155-157); only record counts are real.
