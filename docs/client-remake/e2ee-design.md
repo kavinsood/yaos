@@ -1027,7 +1027,9 @@ export interface KeyringCrypto {
     `AAD_KEYRING_PREFIX = "yaos/k2"`;
   - the inner layout gains `varuint frameNo` after `flags`. It is 0 for kinds outside ns and cfg, and non-zero
     for ns and cfg (§8.2);
-  - `EnvelopeOpenResult.reason` gains `"suite-downgrade"`, `"bad-padding"` and `"replay"` (§9.2, §8.2);
+  - `EnvelopeOpenResult.reason` gains `"suite-downgrade"` and `"bad-padding"` (§9.2). Replay is a fold
+    decision, not an open failure: `NsIgnoreReason` (`src/core/types.ts:232`) and the cfg equivalent gain
+    `"replay-stale"`, `"replay-duplicate"` and `"stale-epoch"` (§8.2, §14.3);
   - `CheckpointEncoding`: `nsFoldV1` and `cfgFoldV1` are redefined in place to carry the replay window (named
     V2 in this document).
 - `src/core/codec/envelope.ts`:
@@ -1039,11 +1041,11 @@ export interface KeyringCrypto {
   - `StreamClass` gains `"keyring"`, and `streamClass("k") === "keyring"`;
   - `blobChunkStream(address: BlobAddress)`.
 - `src/core/limits.ts`:
-  - `MAX_FRAME_CONTENT_BYTES` → 1015808 (§7.3);
+  - `MAX_FRAME_CONTENT_BYTES` (:49, today 1 MiB − 4 KiB) → 1015808 (§7.3);
   - new `MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 10223615`;
   - new `REPLAY_WINDOW = 64`, `ROLL_SEQ_SPAN = 2 ** 23`, `ROLL_OWN_SEALS = 2 ** 22`,
     `PADME_FLOOR_BYTES = 256`, `KEY_STORE_WAIT_MS = 5000`.
-- `QuarantineReason` (`src/engine/store/schema.ts:189`) gains `"crypto-downgrade"` and `"envelope-padding"`.
+- `QuarantineReason` (`src/engine/store/schema.ts:186`) gains `"crypto-downgrade"` and `"envelope-padding"`.
 
 ### 18.3 IndexedDB (`src/engine/store/schema.ts`)
 
