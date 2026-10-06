@@ -5,61 +5,12 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { KEYRING_STREAM, type ClientFrameId, type DeviceId, type StreamName, type VaultId, type VaultPath } from "../../core/types";
-import type { StoragePort } from "../../ports/storage";
+import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
-import { createWebRandom } from "../adapters/webRandom";
-import type { LogEngine } from "../runtime/engine";
-import { converged, startTestEngine, until } from "../runtime/testHarness";
-import type { KeyringChange } from "./keyring";
-import type { EngineE2ee } from "./keyringRuntime";
-import { K, VAULT, genesis } from "./testkit/world";
+import { converged, until } from "../runtime/testHarness";
+import { checkpoints, keyMissing, ownRows, parked, rawAppend, start, type Dev } from "./testkit/engines";
+import { K, genesis } from "./testkit/world";
 import { KeyMissingError, KeyringRefusedError } from "./writeGate";
-
-let raw = 0;
-/** A row appended by some other party (a hostile relay, or a device this test does not run). */
-async function rawAppend(relay: SimRelay, stream: StreamName, payload: Uint8Array): Promise<number> {
-	const r = await relay.connect({ vaultId: VAULT as VaultId, deviceId: "dev-raw" as DeviceId });
-	if (!r.ok) throw new Error(`connect: ${r.reason}`);
-	const s = r.session;
-	const seq = await new Promise<number>((resolve, reject) => {
-		s.onEvent((ev) => {
-			if (ev.t === "receipt") resolve(ev.seq);
-			else if (ev.t === "refused") reject(new Error(ev.reason));
-		});
-		s.append({ stream, clientFrameId: `raw-${++raw}` as ClientFrameId, payload });
-	});
-	s.close(1000, "done");
-	return seq;
-}
-
-interface Dev {
-	readonly engine: LogEngine;
-	readonly storage: StoragePort;
-	readonly changes: KeyringChange[];
-}
-
-async function start(relay: SimRelay, deviceId: string, pin: "unpinned" | "creating" | "seen" | 0 | { keys: { e: number; k: Uint8Array }[]; records: Uint8Array[] }, storage?: StoragePort): Promise<Dev> {
-	const changes: KeyringChange[] = [];
-	const persist = async (ch: KeyringChange) => void changes.push({ keys: ch.keys.map((x) => ({ e: x.e, k: x.k.slice() })), records: ch.records, pending: ch.pending });
-	const e2ee: EngineE2ee = pin === 0 ? { suite: 0 }
-		: typeof pin === "object" ? { suite: 1, records: pin.records, persist }
-		: { suite: null, creating: pin === "creating", keyringSeen: pin === "seen", persist };
-	const keys = typeof pin === "object" ? pin.keys.map((x) => ({ e: x.e, k: x.k.slice() })) : [];
-	const crypto = pin === 0 ? undefined : await createWebCryptoSuite1({ vaultId: VAULT, random: createWebRandom(), keys });
-	const r = await startTestEngine({ relay, deviceId, vaultId: VAULT, e2ee, ...(crypto ? { crypto } : {}), ...(storage ? { storage } : {}) });
-	return { engine: r.engine, storage: r.storage, changes };
-}
-
-const keyMissing = (d: Dev) => d.engine.status().e2ee?.keyMissing ?? null;
-const ownRows = (relay: SimRelay, deviceId: string) => relay.streams().flatMap((s) => relay.rows(s)).filter((r) => r.deviceId === deviceId).length;
-const checkpoints = (relay: SimRelay) => relay.streams().filter((s) => relay.checkpoint(s) !== null).length;
-
-/** Waits until the device read `k` on its session and parked in key-missing for `reason`. */
-async function parked(d: Dev, reason: string): Promise<void> {
-	await until(() => d.engine.status().phase === "key-missing" && keyMissing(d) === reason && d.engine.isIdle(), 5_000, `key-missing ${reason}`);
-}
 
 async function assertWritesNothing(relay: SimRelay, d: Dev, deviceId: string): Promise<void> {
 	const head = relay.head();
@@ -144,7 +95,7 @@ describe("fail closed (§12.4)", () => {
 		} finally {
 			await a.engine.stop();
 		}
-		a = await start(relay, "dev-a", 0, a.storage);
+		a = await start(relay, "dev-a", 0, { storage: a.storage });
 		try {
 			assert.equal(keyMissing(a), "encrypted-vault", "the stored k tail blocks before any session");
 			await parked(a, "encrypted-vault");
