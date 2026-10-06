@@ -1,0 +1,47 @@
+src/core/plan/planner.test.ts
+  s_ed451e485d98d2::t_e2883bea45f5c5 324-343
+src/core/plan/planner.ts
+  s_ed451e485d98d2::t_317675993724e3 67-68,80,346-350,352-358
+src/core/types.ts
+  s_67b8c9b1582106::t_3c5117b8cc69d9 464-468
+src/engine/compose/vaultRuntime.ts
+  s_ed451e485d98d2::t_36f27ed8ab1297 190
+src/engine/reconcile/context.ts
+  s_ed451e485d98d2::t_de580976e76655 61-62
+src/engine/reconcile/reconciler.ts
+  s_ed451e485d98d2::t_978b9bd5a16074 152
+src/sim/composed.test.ts
+  s_0a888a2d99d5d5::t_bbc51fd394bb46 1-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6cdac8ee8ef506e431ff19bf702cf3ea8e5d79e6",
+  "prompts": {},
+  "sessions": {
+    "s_0a888a2d99d5d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abaac5423d9326e26",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_67b8c9b1582106": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac2eb42fe0cde3f33",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
