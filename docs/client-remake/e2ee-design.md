@@ -322,3 +322,122 @@ pad (suite 1 only, inside the AEAD; added and stripped by the CryptoPort)
   - If any build that writes the old layout reaches users first, it MUST ship as formatVersion 2 instead. Old
     rows then stay `unsupported-version` for new readers (and vice versa), which is reader-dependent (§9).
 - **Deflate** stays before padding (§2.2). The padded length hides most of the compression ratio.
+
+### 7.2 AAD v2
+
+```
+frames:      "yaos/f2" ‖ u8 formatVersion ‖ u8 cryptoSuite ‖ varuint keyEpoch
+               ‖ varstring vaultId ‖ varstring stream ‖ varstring deviceId ‖ varstring clientFrameId
+checkpoints: "yaos/c2" ‖ u8 formatVersion ‖ u8 cryptoSuite ‖ varuint keyEpoch
+               ‖ varstring vaultId ‖ varstring stream ‖ varuint coversSeq
+blobs:       "yaos/b2" ‖ u8 blobFormat ‖ u8 cryptoSuite ‖ varuint keyEpoch ‖ varstring vaultId ‖ varstring address
+k wraps:     §11.2
+```
+
+| Field | Bound because |
+|---|---|
+| Header (format, suite, keyEpoch) | A relabelled header fails the AEAD. It does not rely only on key separation. |
+| vaultId | No transplant between vaults. HKDF info binds it as well (§5.1). |
+| stream | A frame or checkpoint moved to another stream fails. |
+| deviceId | **New.** The relay asserts the row's deviceId (relay-wire §4.1). Without this binding, the server could re-attribute a frame, shifting dedupe and replay state (§8) and the planner's own-frame matching (DESIGN §c.13). deviceId is client-chosen at enroll (relay-wire §2.4), so it is known at seal time. T_adopt seals under the adopter's own deviceId (DESIGN §d.5, unchanged). |
+| clientFrameId | Frame identity. Unique per device across the vault (relay-wire §1). |
+| coversSeq (checkpoints) | As today. The inner `CheckpointContent.coversSeq` check stays (DESIGN §b.1). |
+| address (blobs) | The server cannot serve one blob's bytes at another address. The reader also checks sha256 after opening (`src/engine/body/refs.ts:58-59`). |
+
+- **seq is NOT bound.** The relay assigns it after the append (relay-wire §5). Order is protected per device by
+  frameNo (§8), not by the AEAD.
+- **vaultEpoch is NOT bound.** A PITR restore keeps every row written before the restore point and mints a new
+  epoch (DECISIONS D8b: "content == T", "mint a new epoch"). With the epoch bound, every restored row would fail to
+  open. The cost is §8.4.
+- Alternative: bind seq by sealing after the receipt. Rejected: the relay needs the bytes in order to assign seq.
+
+### 7.3 Padding
+
+```
+padmeLen(n):  m = max(n, 256); E = floor(log2 m); S = floor(log2 E) + 1; z = E − S
+              return ceil(m / 2^z) · 2^z
+seal:  p = inner ‖ 0x80 ‖ 0x00 × (padmeLen(len(inner) + 1) − len(inner) − 1)
+open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
+```
+
+- Padmé [Padmé] leaks O(log log M) bits of a length M, with at most 12 % overhead. Frames, checkpoints and blobs all
+  use it. The 256-byte floor hides keystroke-sized frames (decision D3).
+- The padding lives **inside** the AEAD and is added and stripped by the suite-1 CryptoPort. Suite 0 does not pad.
+- A valid tag with bad padding means a key holder sealed garbage. That is **deterministic** malformation (§9.2).
+- **Limits change** (`src/core/limits.ts`).
+  - The relay closes 1009 above `maxBinaryMessageBytes` = 1049600 (relay-wire §3.2). Treat it as 1 MiB of payload.
+    - [D] For lengths in [2^19, 2^20), Padmé pads to multiples of 2^14 = 16 KiB. 64 × 16 KiB is exactly 1 MiB,
+      which leaves no room for the header and the 28 B of AEAD overhead. So the largest padded inner is
+      63 × 16 KiB = 1032192 B.
+    - `MAX_FRAME_CONTENT_BYTES` therefore drops from `1 MiB − 4 KiB` to **`1 MiB − 32 KiB`** (1015808). That
+      leaves ≥ 16 KiB for the inner header, marker and outer header, under every suite, so suites behave alike.
+    - `MAX_INLINE_UPDATE_BYTES` follows it. Slightly more updates take the ref path (DESIGN §b.6).
+  - Checkpoints. `maxCheckpointBytes` = 4194304 (relay-wire §3.2; Worker cap 4 MiB, DECISIONS §2.2).
+    - [D] For lengths in [2^21, 2^22), Padmé pads to multiples of 64 KiB.
+    - The writer's existing `sealed.length > maxCheckpointBytes` branch handles the ≤ 12 % growth
+      (`src/engine/body/checkpoints.ts:174-176`).
+  - Blobs. `maxBlobUploadBytes` = 10 MiB (DECISIONS D9).
+    - [D] For lengths in [2^23, 2^24), Padmé pads to multiples of 256 KiB. The largest padded plaintext that fits
+      with header and overhead is 39 × 256 KiB = 10223616 B.
+    - So `MAX_BLOB_PLAINTEXT_BYTES` (suite 1) = **10223615**, the 0x80 marker included.
+    - `BlobPort.maxBlobBytes` stays the transport cap. The engine compares plaintext against the suite's cap.
+- **Row cost.** relay-wire §11.4: a commit costs 2 rows per touched stream, plus 1 per sealed ~64 KiB segment.
+  Padding changes only the bytes.
+  - [D] Small frames grow to 256 B. 100 such frames in one commit are 25 KiB, still one segment.
+  - Large frames grow by ≤ 12 %, so segment rows grow by ≤ 12 % on bulk writes.
+  - Storage grows by the same bound.
+
+## 8. Replay and reorder
+
+### 8.1 What each stream class needs
+
+| Server action | ns / cfg | body / canvas | x: chunks | checkpoints | k |
+|---|---|---|---|---|---|
+| Re-commit an old frame's exact bytes as a new row | **Rejected**: clientFrameId ring (DESIGN §c.3) plus the frameNo window (§8.2) | Harmless: a Yjs update whose structs are known is a no-op | Duplicate index, ignored (DESIGN §j.1) | n/a | Later duplicates lose (first valid wins, §11.3) |
+| Re-attribute to another device or stream | Rejected by the AAD (§7.2) | same | same | same (stream) | same |
+| Reorder concurrent frames | Accepted. The relay owns the order; frameNo accepts any legitimate reorder (§8.2) | CRDT | by index | n/a | first in seq wins |
+| Serve an older checkpoint, withhold rows | Accepted (§2.3) | Accepted | Accepted | Accepted | Withholding k blocks new epochs (DoS only) |
+| Fork: different views per device | Accepted (§2.1 non-goal) | | | | |
+
+### 8.2 frameNo
+
+- **Writer.**
+  - frameNo is a counter per (deviceId, stream), for `ns` and `cfg` only. It is strictly increasing across that
+    device's frames on the stream, and gaps are allowed.
+  - Normally `next = 1 + max(own right edge in the fold state, highest frameNo in the outbox for the stream)`.
+  - On **every engine start**, the first value is that max **+ NS_DEDUPE_RING** (64). This skips any number that
+    a frame may have used while it was in flight when IndexedDB was lost.
+  - No new persistent counter: the fold state (in IDB and in checkpoints) and the outbox already hold it.
+  - Epoch migration (DESIGN §c.12 step 3) also carries the device's highest own frameNo per stream into the new DB,
+    so new frames never reuse numbers from the abandoned timeline.
+- **Send window, restated over frameNo** (DESIGN §c.3). Own frame `f` may be sent only when every own frame with
+  frameNo ≤ `f − NS_SEND_WINDOW` (32) is receipted.
+- **Reader.** State per (deviceId, stream): a right edge R and a 64-bit bitmap, as in RFC 4303 §3.4.3 [RFC4303]
+  (window ≥ 32, 64 preferred). After a frame with frameNo `f` opens and decodes:
+  1. `f = 0`: malformed. Fold as empty.
+  2. `f ≤ R − 64`: event `ignored/replay-stale`. Fold as empty.
+  3. `R − 64 < f ≤ R` with the bit set: `ignored/replay-duplicate`.
+  4. Otherwise accept and set the bit. If `f > R`, shift the bitmap and set `R = f`.
+  
+  The state changes only after open and decode succeed. RFC 4303 updates the window "only if the integrity
+  verification succeeds".
+- **Why no legitimate frame is ever rejected** [D]. When frame `f` was sent, every own frame ≤ `f − 32` had
+  already committed. So any frame that commits after `f` has a frameNo > `f − 32` ≥ `R − 64`. The rule is exact
+  for honest writers. The same argument already makes the clientFrameId ring exact (DESIGN §c.3).
+- The clientFrameId ring stays. frameNo covers replays older than the ring's 64 ids.
+- The `nsFoldV1` and `cfgFoldV1` checkpoint encodings gain `(deviceId → R, bitmap)` and become V2 (§18.2). Suite 0
+  uses the same code: one path, so the sim covers it.
+- Alternative: bind seq or a hash chain of predecessors in the AAD. Rejected: seq is unknown at seal time, and a
+  per-device hash chain breaks on IndexedDB loss and on poisoned frames.
+
+### 8.3 Within one vaultEpoch
+
+R only grows, so every replay of an old ns/cfg frame is rejected, whatever its age. Body replays are no-ops.
+
+### 8.4 Across vaultEpochs
+
+A restore or reset starts a fresh fold, so the reader state restarts too. A server can then splice genuine
+pre-restore frames from the abandoned timeline into the new epoch. This is accepted (§2.3), for three reasons:
+- the restore is visible to the user as an epoch migration;
+- disk is the truth (DESIGN §c.12);
+- the carried-over frameNo (§8.2) keeps new frames from colliding with spliced ones.
