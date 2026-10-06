@@ -17,6 +17,10 @@
 # A new name creates 2 Durable Object namespaces. If the account is at the namespace cap (CF error 10067),
 # redeploy over an idle yaos-relay2-* worker with the same classes (VaultDO, ConfigDO)
 # instead. Never deploy over yaos-relay2-scratch-3 (owned by another session).
+# A Durable Object class change (the server rewrite: VaultSyncServer/ServerConfig/RecoveryJob -> VaultDO/ConfigDO)
+# fails with CF error 10086 when a binding name moves to a new class: the old namespace is still referenced by the
+# live version. Delete the worker (`cf workers delete <name> --force`; the old classes' data is retired anyway) and
+# deploy again; the context file in $EXP_ROOT/logs then holds stale credentials and must be recreated.
 # Output goes to $EXP_ROOT/logs/client-e2e-deploy-<name>-<ts>.log; the URL is printed after
 # /api/capabilities reports "streams":1.
 set -euo pipefail
