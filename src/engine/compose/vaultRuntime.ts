@@ -36,6 +36,7 @@ import type { FoldedNsFrame } from "../sync/nsRuntime";
 import type { BoundDocs } from "./boundDocs";
 import { foldEffects } from "./foldBridge";
 import type { HostLink } from "./hostLink";
+import { localDay, LocalDayCounter } from "./localDayCounter";
 import { ComposedLog } from "./logPort";
 import { PassScheduler } from "./passScheduler";
 import { mergeStatus, type DiskSideStatus } from "./statusMerge";
@@ -102,6 +103,7 @@ export class VaultRuntime {
 	private idbSnapshotDue = false;
 	private ownQueue: OwnFoldEvent[] = [];
 	private readonly notices: Notice[] = [];
+	private readonly conflictCopies = new LocalDayCounter(() => localDay(this.o.ports.clock.now(), (this.o.tzOffsetMinutes ?? (() => 0))()));
 	private lastLog: StatusSnapshot | null = null;
 	private lastFullAtMs: number | null = null;
 	private cfgRunning: Promise<void> | null = null;
@@ -208,7 +210,7 @@ export class VaultRuntime {
 		this.rec = await Reconciler.open({
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
-			notice: this.notice, onBrake: (r) => this.onBrake(r), onRebind: (from, into) => this.retarget(from, into), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
+			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
 			pathBaseKeys: o.pathBases ? new Set(o.pathBases.keys()) : undefined,
 			takeOwnFold: () => this.takeOwnFold(),
 		});
@@ -581,7 +583,7 @@ export class VaultRuntime {
 		const log = this.lastLog ?? this.log.status();
 		return mergeStatus(log, {
 			transport: this.o.carrier, paused: this.paused, migrating: this.migrating, brake: this.brake,
-			pendingDiskOps: this.rec?.ctx.store.intents.size ?? 0, pendingBlobs: this.blobs?.queued().length ?? 0, conflictCopiesToday: 0,
+			pendingDiskOps: this.rec?.ctx.store.intents.size ?? 0, pendingBlobs: this.blobs?.queued().length ?? 0, conflictCopiesToday: this.conflictCopies.value,
 			lastFullReconcileAtMs: this.lastFullAtMs, bootstrap: null, notices: this.notices,
 		});
 	}

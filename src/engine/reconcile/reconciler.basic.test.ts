@@ -111,8 +111,10 @@ test("conflict copies of one pass make one notice with the count and the first p
 	assert.equal(notes.length, 1, JSON.stringify(notes));
 	assert.match(notes[0]!.message, /^YAOS could not merge 3 files; the other versions are saved as conflict copies \(first: “. \(conflict laptop .*\)\.md”\)\.$/);
 	assert.ok(copies.some((c) => notes[0]!.message.includes(c)));
+	assert.deepEqual(w.conflictCopyEvents.map(([, to]) => to).sort(), [...copies].sort(), "each copy reaches onConflictCopy (status conflictCopiesToday)");
 	await w.sync();
 	assert.equal(w.notices.filter((n) => n.code === "conflict-copy").length, 1, "quiet passes add nothing");
+	assert.equal(w.conflictCopyEvents.length, 3);
 });
 
 test("CRLF file: merge keeps the file's bytes when content is unchanged", async () => {

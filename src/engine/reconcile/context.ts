@@ -57,6 +57,8 @@ export interface ReconcilerDeps {
 	readonly mergeLimits?: MergeLimits;
 	readonly notice?: (level: "info" | "warn" | "error", code: string, message: string) => void;
 	readonly onBrake?: (report: BrakeReport) => void;
+	/** Sync completed a conflict copy `to` of `from` (status `conflictCopiesToday`). */
+	readonly onConflictCopy?: (from: VaultPath, to: VaultPath) => void;
 	/**
 	 * A rebind moved the synced record of `from` to `into` (§c.13 merged alias, identical-loser collapse,
 	 * §c.12 migrated loser): an editor bound to `from` must re-open as `into`, or its typing keeps going
@@ -185,6 +187,7 @@ export class Ctx {
 	noteConflictCopy(from: VaultPath, to: VaultPath): void {
 		this.noteDestructive("conflict");
 		this.copies.push({ from, to });
+		this.deps.onConflictCopy?.(from, to);
 	}
 
 	/** One warn for the conflict copies written since the last call (end of a pass): the count and the first path. */

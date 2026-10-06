@@ -5,7 +5,7 @@
  * which posts events after the diskOps result).
  */
 
-import type { BrakeConfig, BrakeReport, DocId, SyncedEntry } from "../../../core/types";
+import type { BrakeConfig, BrakeReport, DocId, SyncedEntry, VaultPath } from "../../../core/types";
 import { DEFAULT_BRAKE } from "../../../core/plan/brake";
 import type { VaultEvent } from "../../../ports/vault";
 import { DB_SCHEMA_VERSION, STORE_SPECS } from "../../store/schema";
@@ -44,6 +44,8 @@ export class World {
 	readonly pending: VaultEvent[] = [];
 	readonly notices: { level: string; code: string; message: string }[] = [];
 	readonly brakes: BrakeReport[] = [];
+	/** ReconcilerDeps.onConflictCopy calls: [from, to]. */
+	readonly conflictCopyEvents: [VaultPath, VaultPath][] = [];
 	readonly ownQueue: OwnFoldEvent[] = [];
 	/** ReconcilerDeps.onRebind calls: [from, into]. */
 	readonly rebinds: [DocId, DocId][] = [];
@@ -71,6 +73,7 @@ export class World {
 			brake: { ...DEFAULT_BRAKE, ...this.opts.brake },
 			notice: (level, code, message) => this.notices.push({ level, code, message }),
 			onBrake: (report) => this.brakes.push(report),
+			onConflictCopy: (from, to) => this.conflictCopyEvents.push([from, to]),
 			onRebind: (from, into) => this.rebinds.push([from, into]),
 			pathBase: this.opts.pathBases ? (key) => this.opts.pathBases!.get(key) ?? null : undefined,
 			...(this.opts.deferOwnFold ? { takeOwnFold: () => this.ownQueue.splice(0) } : {}),
