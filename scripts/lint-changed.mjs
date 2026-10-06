@@ -16,7 +16,7 @@
  *   - New files (not present at the comparison ref) must have zero lint errors.
  *   - Modified files (present at the ref) are linted and errors reported, but
  *     they do not fail the gate. This is an interim policy while baseline debt
- *     exists in files like src/main.ts.
+ *     exists.
  *
  * In CI (CI=true), missing base refs and diff failures are hard errors.
  * Locally, they are skipped with a warning.

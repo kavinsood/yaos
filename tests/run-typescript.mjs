@@ -21,7 +21,6 @@ const aliases = useTestAliases
 		"@yaos/crdt-engine": NODE_YWASM_ENGINE,
 		yjs: fileURLToPath(new URL("../node_modules/yjs/dist/yjs.mjs", import.meta.url)),
 		"y-protocols": fileURLToPath(new URL("../node_modules/y-protocols", import.meta.url)),
-		obsidian: fileURLToPath(new URL("./mocks/obsidian.ts", import.meta.url)),
 		partyserver: fileURLToPath(new URL("./mocks/partyserver.ts", import.meta.url)),
 		"@shared": fileURLToPath(new URL("../server/src/shared", import.meta.url)),
 		[WORKER_YWASM_ENGINE]: NODE_YWASM_ENGINE,

@@ -37,13 +37,6 @@ server/.wrangler
 session-*.md
 *.session.md
 
-# QA run artifacts (flight traces, manifests, reports)
-qa-runs/
-
-# QA harness build output (compiled from .ts by qa/obsidian-harness/esbuild.mjs)
-qa/**/*.js
-qa/**/*.js.map
-
 # TypeScript compilation artifacts (compiled .js next to .ts source)
 # Build outputs are not committed; only .ts source is tracked.
 src/**/*.js
@@ -53,8 +46,6 @@ tests/**/*.js.map
 
 # Local working files (not for public repo)
 rca/
-# qa/ harness SOURCE is tracked; only its build output (qa/**/*.js above) and
-# qa-runs/ evidence are ignored.
 tools/
 .agents/
 .codex/

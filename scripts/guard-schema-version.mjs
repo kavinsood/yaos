@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 /**
- * Enforce the schema-8 ownership contract.
+ * Enforce the server's schema-8 ownership contract.
  *
- * The plugin owns its pin in src/sync/schema.ts. The server owns its pin in
- * server/src/shared/productVersions.ts and exposes that same symbol through
- * server/src/version.ts. Both canonical sources must exist, the plugin source
- * must remain on schema 8, and the server source must match it exactly.
+ * The server owns its pin in server/src/shared/productVersions.ts and exposes
+ * that same symbol through server/src/version.ts. The canonical source must
+ * exist, must stay on schema 8, and the durable SQLite CHECK must derive from it.
  */
 
 import { readFileSync, existsSync } from "node:fs";
 
-const EXPECTED_PLUGIN_SCHEMA_VERSION = 8;
+const EXPECTED_SCHEMA_VERSION = 8;
 let failures = 0;
 
 function fail(msg) {
@@ -22,14 +21,13 @@ function pass(msg) {
 	console.log("PASS:", msg);
 }
 
-const PLUGIN_SCHEMA_SOURCE = "src/sync/schema.ts";
 const SERVER_SCHEMA_SOURCE = "server/src/shared/productVersions.ts";
 const SERVER_VERSION_MODULE = "server/src/version.ts";
 const SERVER_DOCUMENT_STORE = "server/src/vaultDocumentStore.ts";
 
-function readSchemaVersion(path, owner) {
+function readSchemaVersion(path) {
 	if (!existsSync(path)) {
-		fail(`${path} is missing — ${owner} schema pin cannot be validated.`);
+		fail(`${path} is missing — the server schema pin cannot be validated.`);
 		return null;
 	}
 
@@ -97,25 +95,11 @@ function validateServerSqlConstraint() {
 	pass(`${SERVER_DOCUMENT_STORE}: schema_version CHECK derives from SCHEMA_VERSION`);
 }
 
-const pluginSchemaVersion = readSchemaVersion(PLUGIN_SCHEMA_SOURCE, "plugin");
-const serverSchemaVersion = readSchemaVersion(SERVER_SCHEMA_SOURCE, "server");
+const serverSchemaVersion = readSchemaVersion(SERVER_SCHEMA_SOURCE);
 
-if (
-	pluginSchemaVersion !== null &&
-	pluginSchemaVersion !== EXPECTED_PLUGIN_SCHEMA_VERSION
-) {
+if (serverSchemaVersion !== null && serverSchemaVersion !== EXPECTED_SCHEMA_VERSION) {
 	fail(
-		`${PLUGIN_SCHEMA_SOURCE} has SCHEMA_VERSION = ${pluginSchemaVersion}, expected ${EXPECTED_PLUGIN_SCHEMA_VERSION}.`,
-	);
-}
-
-if (
-	pluginSchemaVersion !== null &&
-	serverSchemaVersion !== null &&
-	serverSchemaVersion !== pluginSchemaVersion
-) {
-	fail(
-		`${SERVER_SCHEMA_SOURCE} must pin the plugin's schema version exactly: plugin=${pluginSchemaVersion}, server=${serverSchemaVersion}.`,
+		`${SERVER_SCHEMA_SOURCE} has SCHEMA_VERSION = ${serverSchemaVersion}, expected ${EXPECTED_SCHEMA_VERSION}.`,
 	);
 }
 
@@ -124,8 +108,8 @@ if (serverSchemaVersion !== null) validateServerSqlConstraint();
 
 if (failures > 0) {
 	console.error(`\nFAIL: ${failures} schema-version guard violation(s).`);
-	console.error(`  ${PLUGIN_SCHEMA_SOURCE} must pin schema ${EXPECTED_PLUGIN_SCHEMA_VERSION}, and`);
-	console.error(`  ${SERVER_SCHEMA_SOURCE} and ${SERVER_VERSION_MODULE} must expose that same exact pin.`);
+	console.error(`  ${SERVER_SCHEMA_SOURCE} must pin schema ${EXPECTED_SCHEMA_VERSION}, and`);
+	console.error(`  ${SERVER_VERSION_MODULE} must expose that same exact pin.`);
 	process.exit(1);
 } else {
 	console.log("\nPASS: schema version guard — all checks passed.");

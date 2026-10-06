@@ -1298,9 +1298,9 @@ Local tests (round 4 unless noted):
 |---|---|
 | `tests/server/relay2-server-core.ts` | 31/31 in default and lean modes (round 3: 27/27) |
 | `tests/server/relay2-byteops.ts` | 9/9 |
-| `tests/client/relay2-reset-builder.ts` | 45/45 |
-| `tests/client/relay2-reset-policy.ts` | 31/31 |
-| `tests/client/relay2-reset-race.ts` | 127/127 |
+| `tests/server/relay2-reset-builder.ts` (was `tests/client/`) | 45/45 |
+| `tests/server/relay2-reset-policy.ts` (was `tests/client/`) | 31/31 |
+| `tests/client/relay2-reset-race.ts` (deleted with the old client) | 127/127 |
 | flag-off regressions | 3,635 pass, 0 new failures (round 2: 3,622/0; round 1: 199/199 steps) (`results/relay2/flag-tests.md`) |
 | flag on (default and lean) | only the expected capabilities key-set failures. Lean matches after the lazy-ALTER fix. Headless 92/92 in both modes (round 3). Conformance 13/13 flag off (round 3). |
 | base suites (base SHA) | 179/179 suites, 3,135 assertions; node-runtime 32/32; conformance 26/26 (1 declared GAP); headless 92/92 (1 of 4 flaky) (`results/relay2/base-tests.md`) |

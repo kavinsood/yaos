@@ -7,9 +7,9 @@
 		]
 	},
 	"include": [
-		"legacy-src/**/*.ts",
-		"yaos-plugin-api.d.ts",
+		"src/**/*.ts",
 		"tests/**/*.ts",
 		"eslint.config.mts"
-	]
+	],
+	"exclude": []
 }

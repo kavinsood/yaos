@@ -22,7 +22,7 @@
  *
  * Steps 3–4 are a line-for-line mirror of `prepareSemanticReset`; that function
  * is hard-wired to the ywasm engine (`@yaos/crdt-engine`), so it cannot run on
- * a client Y.Doc. `tests/client/relay2-reset-builder.ts` proves equivalence by
+ * a client Y.Doc. `tests/server/relay2-reset-builder.ts` proves equivalence by
  * running both on the same state (same text, same content hash, same root
  * snapshot, same struct census, same encoded size).
  *

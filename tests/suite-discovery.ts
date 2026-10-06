@@ -1,7 +1,7 @@
 // Guard for the test-discovery contract.
 //
 // The regression runner discovers suites by convention — every `*.ts` file in
-// tests/client/, tests/server/ or tests/contracts/ — instead of reading a
+// tests/server/ or tests/contracts/ — instead of reading a
 // hand-maintained array. Live-worker discovery belongs to tests/live/run-live.ts.
 // That only stays trustworthy if two invariants hold, and both are checked here:
 //

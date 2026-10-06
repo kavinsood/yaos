@@ -367,5 +367,5 @@ The vault status surface additionally exposes `vaultGeneration`, `runtimeEpoch`,
 - Settings counts per environment: 256 ordinary files, 256 plugin intents, 64 theme intents, 256 plugin-data rows, and 512 tombstones. IDs are at most 128 characters, repository strings 256, and version strings 64.
 - Long-duration Cloudflare eviction/outage soak, broader desktop
   settings/recovery, and all real mobile settings/recovery evidence remain
-  deferred. Current evidence and its limits are recorded in [QA](qa.md).
+  deferred.
 - Network-filesystem support for headless clients remains future work.

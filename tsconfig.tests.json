@@ -30,10 +30,18 @@
 		// skipLibCheck scopes the check to code we actually own, and matches the
 		// root build (`tsc -noEmit -skipLibCheck`) and server/tsconfig.json.
 		"skipLibCheck": true,
-		"noEmit": true
+		"noEmit": true,
+		// The client tsconfig this extends is src-only; tests/ and server/src
+		// still resolve the server's engine and shared aliases, and the suite
+		// runner's .mjs modules.
+		"allowJs": true,
+		"baseUrl": ".",
+		"paths": {
+			"@yaos/crdt-engine": ["server/src/crdt/ywasmWorkerCrdtEngine.ts"],
+			"@shared/*": ["server/src/shared/*"]
+		}
 	},
 	"include": [
-		"legacy-src/**/*.ts",
 		"server/src/**/*.ts",
 		"tests/**/*.ts"
 	]

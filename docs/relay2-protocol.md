@@ -524,7 +524,7 @@ a doc. Clients are trusted, as with envelope hashes.
 Local tests: `YAOS_TEST_FORCE_RELAY_BODIES=true` (or `YAOS_TEST_RELAY_BODIES=true`) makes runtimes
 built without an env (unit suites) default to relay mode (`relayBodiesTestDefault()` in
 `server/src/relayFlag.ts`). An explicit `YAOS_RELAY_BODIES` in the env always wins. The local
-wrangler launchers (`tests/conformance/launch/wrangler.ts`, `tests/headless/wrangler.ts`) forward
+wrangler launcher (`tests/conformance/launch/wrangler.ts`) forwards
 `YAOS_RELAY_BODIES` from the process env as `--var`, and the Node host reads it from
 `process.env`.
 

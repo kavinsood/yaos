@@ -2,9 +2,9 @@
 /**
  * Regression coverage for scripts/guard-schema-version.mjs.
  *
- * Schema 8 is pinned in the plugin's sync schema and the server's shared
- * product-version source. The public server version module must derive its
- * schema export from that canonical server pin rather than duplicate a number.
+ * Schema 8 is pinned in the server's shared product-version source. The
+ * public server version module must derive its schema export from that
+ * canonical server pin rather than duplicate a number.
  *
  * These fixtures prove that the real guard fails closed when the canonical
  * server source is missing or mismatched, while accepting the exact schema-4
@@ -19,11 +19,6 @@ import { repoRoot, suite, withTempDir } from "../harness.ts";
 const s = suite("schema-version-guard");
 
 const guardPath = resolve(repoRoot(), "scripts/guard-schema-version.mjs");
-
-function makePluginFixture(dir: string) {
-	mkdirSync(join(dir, "src/sync"), { recursive: true });
-	writeFileSync(join(dir, "src/sync/schema.ts"), "export const SCHEMA_VERSION = 8;\n");
-}
 
 function writeServerVersionModule(dir: string) {
 	mkdirSync(join(dir, "server/src"), { recursive: true });
@@ -54,7 +49,6 @@ function runGuard(cwd: string) {
 
 s.section("Test 1: missing canonical server schema source fails closed");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
-	makePluginFixture(fixtureDir);
 	writeServerVersionModule(fixtureDir);
 	const result = runGuard(fixtureDir);
 
@@ -78,14 +72,13 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 
 s.section("Test 2: a mismatched canonical server pin fails closed");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
-	makePluginFixture(fixtureDir);
 	makeServerFixture(fixtureDir, 5);
 
 	const result = runGuard(fixtureDir);
 
 	s.check(result.status === 1, "guard exits non-zero when the server pins a different schema version");
 	s.check(
-		result.stderr.includes("must pin the plugin's schema version exactly"),
+		result.stderr.includes("has SCHEMA_VERSION = 5, expected 8"),
 		"guard reports the mismatched canonical pin as a violation",
 	);
 	s.check(
@@ -96,7 +89,6 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 
 s.section("Test 3: exact schema-8 pins pass");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
-	makePluginFixture(fixtureDir);
 	makeServerFixture(fixtureDir, 8);
 
 	const result = runGuard(fixtureDir);
@@ -110,7 +102,6 @@ await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
 
 s.section("Test 4: a stale durable SQL schema constraint fails closed");
 await withTempDir("yaos-schema-version-guard-", (fixtureDir) => {
-	makePluginFixture(fixtureDir);
 	makeServerFixture(fixtureDir, 8);
 	writeFileSync(
 		join(fixtureDir, "server/src/vaultDocumentStore.ts"),

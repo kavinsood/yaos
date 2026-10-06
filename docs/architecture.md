@@ -2,26 +2,9 @@
 
 ## Runtime boundaries
 
-The shipped Obsidian plugin is built from `src/` into `main.js`. It contains the sync engine and diagnostics runtime. Diagnostics collection is inert until enabled.
+The shipped Obsidian plugin is built from `src/` into `main.js` (an engine worker is embedded in it). Its design is [client-remake/DESIGN.md](client-remake/DESIGN.md). A release contains `main.js` and `manifest.json`, packaged as `dist/yaos-client/yaos.zip` by `node esbuild.config.mjs production`. There is no stylesheet, no QA product bundle and no public plugin API (DESIGN §m.2). Where the sections below describe client behaviour (filesystem reconciliation, settings apply, restore), they describe the old client; the new client's behaviour is specified in DESIGN.
 
-The QA harness under `qa/` is not shipped. QA scenarios use a separately built product bundle with `__YAOS_QA_HARNESS_ENABLED__=true`; production code does not import QA implementations. A release contains `main.js`, `manifest.json`, and `styles.css`.
-
-`FlightTraceController` owns the client diagnostics lifecycle. Product code emits through the published flight envelope and taxonomy; there is no second persistent logger.
-
-`ObsidianHostAdapter` is the sole boundary for capability-checked undocumented
-Obsidian behavior, including leaf identities and the community-plugin manager.
-Its scoped patch registry observes only demonstrated product needs and always
-stands down safely when the host behavior is unavailable or replaced. The
-supported behavior matrix is in [Obsidian host compatibility](obsidian-host-compatibility.md).
-
-`plugin.api` is a separate, versioned data-only projection for other plugins.
-It exposes immutable collaboration authority, member/presence summaries,
-coordinator, settlement, and preservation facts without Yjs documents,
-credentials, invitation secrets, providers, diagnostics, or mutation controls.
-Consumers reacquire after `yaos:api-ready`; unload fences retained handles.
-The contract is in [Public plugin API](public-api.md).
-
-The headless client under `packages/cli` hosts the same `VaultSync`, `BodyManager`, Canvas manager, disk mirrors, and reconciliation policy on a local Linux filesystem. It synchronizes Markdown and closed semantic Canvas files, stores its complete principal/device authority tuple and schema-8 retry/cache state in machine-local SQLite, and never copies another enrollment's bearer.
+The old client (`VaultSync`, `FlightTraceController`, `ObsidianHostAdapter`, `plugin.api`) is deleted; [client-remake/legacy-parity.md](client-remake/legacy-parity.md) records where each of its features went. The headless client under `packages/cli` imported that old client and no longer builds.
 
 The Cloudflare Worker classes are thin platform wrappers around portable `ControlPlaneRuntime`, `VaultRuntime`, and `RecoveryJobRuntime` compositions. `packages/server-node` supplies Node-specific SQLite/KV, actor, WebSocket, alarm, and filesystem-object mechanisms to those same domain owners; it does not implement a second sync policy.
 
@@ -171,7 +154,6 @@ Persistence corruption, invalid identity, wrong generation, stale candidate, and
 
 Long-duration deployed-Cloudflare eviction/outage evidence, broader real desktop
 settings/recovery flows, and all real mobile settings/recovery evidence remain
-deferred; the completed pathological large-document run and disposable deployed
-two-device run are described in [QA](qa.md). The Docker image packages the
+deferred. The Docker image packages the
 conformant Node host without changing the shared domain runtimes. Evidenced open
 risks are tracked in [BACKLOG.md](BACKLOG.md).
