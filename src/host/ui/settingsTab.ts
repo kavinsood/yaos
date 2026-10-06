@@ -18,8 +18,8 @@ import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
 import { clearIdentity } from "./pairFlow";
 import {
-	applyControl, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused, MAX_ATTACHMENT_MB,
-	readControl, serverConsoleUrl, TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
+	applyControl, attachmentSizeDesc, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused,
+	MAX_ATTACHMENT_MB, readControl, serverConsoleUrl, TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
 	type ControlKey, type SettingsSeed,
 } from "./settingsModel";
 import type { UserCommand } from "../../protocol/messages";
@@ -178,7 +178,7 @@ export class YaosSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Maximum attachment size (MB)",
-				desc: "Larger attachments stay on this device.",
+				desc: attachmentSizeDesc(this.host.status()),
 				visible: () => this.host.data().engine.syncAttachments,
 				control: {
 					type: "number",

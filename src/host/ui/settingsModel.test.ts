@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-	applyControl, CONTROL_KEYS, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused,
-	parseExcludePatterns, phaseLabel, readControl, runStateLabel, serverConsoleUrl, TRASH_MODE_OPTIONS, validateControl,
+	applyControl, ATTACHMENT_SIZE_DESC, attachmentSizeDesc, CONTROL_KEYS, connectionRows, enableSettingsSync, engineAcceptsCommands,
+	engineRows, isControlKey, isPaused, parseExcludePatterns, phaseLabel, readControl, runStateLabel, serverConsoleUrl, TRASH_MODE_OPTIONS, validateControl,
 } from "./settingsModel";
 import { defaultPluginData, MIB, sanitizePluginData, TRASH_MODES, type PairedIdentity } from "./api";
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
@@ -126,7 +126,7 @@ function snap(phase: EnginePhase, over: Partial<StatusSnapshot> = {}): StatusSna
 			liveDocs: 0, staleStreams: 0, outboxFrames: 2, outboxBytes: 0, unreceiptedFrames: 1, residentDocs: 0, residentBytesEstimate: 0,
 			pendingDiskOps: 0, pendingBlobs: 0, quarantinedRows: 1, frozenDocs: 0, conflictCopiesToday: 0,
 		},
-		bootstrap: null, brake: null, lastFullReconcileAtMs: null, lastSyncedAtMs: null, dailyFramesUsed: 0, notices: [],
+		bootstrap: null, brake: null, lastFullReconcileAtMs: null, lastSyncedAtMs: null, dailyFramesUsed: 0, maxBlobBytes: null, notices: [],
 		...over,
 	};
 }
@@ -151,4 +151,15 @@ test("engine rows and labels", () => {
 	assert.equal(engineAcceptsCommands({ phase: "stopped", transport: null, lastError: null }), false);
 	assert.equal(isPaused(snap("paused")), true);
 	assert.equal(isPaused(null), false);
+});
+
+test("attachment size description names the open carrier's limit when the status has it, rounded down", () => {
+	assert.equal(attachmentSizeDesc(null), ATTACHMENT_SIZE_DESC);
+	assert.equal(attachmentSizeDesc(snap("starting")), ATTACHMENT_SIZE_DESC, "no vault open yet");
+	const tail = "; the smaller limit applies.";
+	assert.equal(attachmentSizeDesc(snap("live", { maxBlobBytes: 10 * MIB })), `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to 10 MB${tail}`);
+	for (const [bytes, size] of [[8 * MIB, "8 MB"], [1.5 * MIB, "1.5 MB"], [10 * MIB + 1, "10 MB"], [1.99 * MIB, "1.9 MB"], [512 * 1024, "512 KB"], [10, "1 KB"]] as const) {
+		assert.equal(attachmentSizeDesc(snap("live", { maxBlobBytes: bytes })), `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to ${size}${tail}`);
+	}
+	for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) assert.equal(attachmentSizeDesc(snap("live", { maxBlobBytes: bad })), ATTACHMENT_SIZE_DESC);
 });

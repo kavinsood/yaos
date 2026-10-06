@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { VirtualClock } from "../../sim/clock";
 import { SimDevice } from "../../sim/device";
 import { SimNet } from "../../sim/net";
@@ -103,4 +104,11 @@ test("the user's pause wins over visible and online", async () => {
 	vrt(a).setPaused(false);
 	await clock.advance(1_000);
 	assert.equal(connected(net, a), true);
+});
+
+test("status reports the open carrier's attachment limit (the log's 8 MiB without a blob store) and the host receives it", async () => {
+	const { a } = await world(false);
+	assert.equal(vrt(a).status().maxBlobBytes, MAX_LOG_BLOB_BYTES);
+	assert.equal(vrt(a).status().maxBlobBytes, vrt(a).blobs.maxBlobBytes);
+	assert.equal(a.ui.statuses.at(-1)?.maxBlobBytes, MAX_LOG_BLOB_BYTES, "posted to the host");
 });

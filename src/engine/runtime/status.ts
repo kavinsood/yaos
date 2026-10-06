@@ -47,6 +47,7 @@ export function buildStatus(c: EngineCtx): StatusSnapshot {
 		lastFullReconcileAtMs: null,
 		lastSyncedAtMs: c.lastSyncedAtMs,
 		dailyFramesUsed: c.daily.day === c.day() ? c.daily.frames : 0,
+		maxBlobBytes: null,
 		notices: c.noticeList(),
 	};
 }

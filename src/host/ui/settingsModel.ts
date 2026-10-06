@@ -34,6 +34,20 @@ export const TEXT_CONTROL_KEYS: ReadonlySet<ControlKey> = new Set<ControlKey>(["
 
 export const MAX_ATTACHMENT_MB = MAX_ATTACHMENT_BYTES_LIMIT / MIB;
 
+export const ATTACHMENT_SIZE_DESC = "Larger attachments stay on this device.";
+
+/**
+ * Description of the attachment size control. The engine skips attachments over
+ * min(this setting, the open carrier's limit) (engine/reconcile/localState.ts); once the status
+ * carries that limit (StatusSnapshot.maxBlobBytes), say so. Rounded down, never overstated.
+ */
+export function attachmentSizeDesc(status: StatusSnapshot | null): string {
+	const max = status?.maxBlobBytes;
+	if (typeof max !== "number" || !Number.isFinite(max) || max <= 0) return ATTACHMENT_SIZE_DESC;
+	const size = max >= MIB ? `${Math.floor((max / MIB) * 10) / 10} MB` : `${Math.max(1, Math.floor(max / 1024))} KB`;
+	return `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to ${size}; the smaller limit applies.`;
+}
+
 export const TRASH_MODE_OPTIONS: Readonly<Record<TrashMode, string>> = Object.freeze({
 	"follow-obsidian": "Follow Obsidian (Files and links → Deleted files)",
 	"obsidian-trash": "Obsidian trash (.trash folder)",

@@ -12,7 +12,7 @@ const STATUS = {
 		liveDocs: 1, staleStreams: 0, outboxFrames: 0, outboxBytes: 0, unreceiptedFrames: 0, residentDocs: 1,
 		residentBytesEstimate: 10, pendingDiskOps: 0, pendingBlobs: 0, quarantinedRows: 0, frozenDocs: 0, conflictCopiesToday: 0,
 	},
-	bootstrap: null, brake: null, lastFullReconcileAtMs: null, lastSyncedAtMs: 1, dailyFramesUsed: 3, notices: [],
+	bootstrap: null, brake: null, lastFullReconcileAtMs: null, lastSyncedAtMs: 1, dailyFramesUsed: 3, maxBlobBytes: null, notices: [],
 } satisfies StatusSnapshot;
 
 function bundle(over: Partial<DiagnosticsBundle> = {}): DiagnosticsBundle {

@@ -51,6 +51,12 @@ export interface StatusSnapshot {
 	readonly lastFullReconcileAtMs: number | null;
 	readonly lastSyncedAtMs: number | null;
 	readonly dailyFramesUsed: number;
+	/**
+	 * Largest attachment the open carrier moves: the blob store's limit (the server's
+	 * maxBlobUploadBytes, or the client default when the probe failed) or the log's 8 MiB without
+	 * one. Files over min(this, settings.maxAttachmentBytes) are skipped. null until a vault is open.
+	 */
+	readonly maxBlobBytes: number | null;
 	readonly notices: readonly { readonly code: string; readonly level: "info" | "warn" | "error"; readonly atMs: number }[];
 }
 

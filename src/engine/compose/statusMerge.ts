@@ -22,6 +22,7 @@ export function idleStatus(o: { deviceClass: DeviceClass; transport: "worker" | 
 		lastFullReconcileAtMs: null,
 		lastSyncedAtMs: null,
 		dailyFramesUsed: 0,
+		maxBlobBytes: null,
 		notices: [],
 	};
 }
@@ -36,6 +37,7 @@ export interface DiskSideStatus {
 	readonly conflictCopiesToday: number;
 	readonly lastFullReconcileAtMs: number | null;
 	readonly bootstrap: StatusSnapshot["bootstrap"];
+	readonly maxBlobBytes: number | null;
 	readonly notices: readonly { readonly code: string; readonly level: "info" | "warn" | "error"; readonly atMs: number }[];
 }
 
@@ -60,6 +62,7 @@ export function mergeStatus(log: StatusSnapshot, d: DiskSideStatus): StatusSnaps
 		bootstrap: d.bootstrap,
 		brake: d.brake,
 		lastFullReconcileAtMs: d.lastFullReconcileAtMs,
+		maxBlobBytes: d.maxBlobBytes,
 		notices: notices.slice(-32),
 	};
 }

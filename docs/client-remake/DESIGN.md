@@ -1665,8 +1665,10 @@ ones get conflict copies.
     ns references.
   - **Download:** `get` → `openBlob` → verify sha256 → write with precondition. A missing blob is retried with backoff
     (`wait(blob-unavailable)`).
-  - Files larger than `BlobPort.maxBlobBytes` (10 MiB) or `settings.maxAttachmentBytes` are not synced (notice) and
-    never deleted.
+  - Files larger than `BlobPort.maxBlobBytes` (the server's `maxBlobUploadBytes`; 10 MiB when it sends none or the
+    capabilities probe fails) or `settings.maxAttachmentBytes` are not synced (notice) and never deleted.
+    `StatusSnapshot.maxBlobBytes` reports the carrier's limit (8 MiB without a blob store); the attachment size
+    setting then reads "This server accepts attachments up to N MB; the smaller limit applies."
 - **Without a blob store** (`blob = null`; the relay answers 503 `attachments_unavailable`):
   - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<sha256>` as `blobChunk` frames (768 KiB, ≤ 11 rows).
     The ns op is emitted after every chunk is receipted.
@@ -1814,7 +1816,8 @@ ones get conflict copies.
 
 - **`StatusSnapshot`** (`src/protocol/status.ts`): phase, transport, epoch, seqs, relay connection, counts (stale
   streams, outbox, unreceipted, resident, pending disk ops and blobs, quarantined rows, frozen docs, conflict copies
-  today), bootstrap progress, brake, last reconcile and sync times, daily frames, notices.
+  today), bootstrap progress, brake, last reconcile and sync times, daily frames, the carrier's attachment limit
+  (`maxBlobBytes`, null until a vault is open), notices.
   - Posted on phase change, and otherwise at most 4/s.
   - The status bar shows phase + unsynced count.
 - **`DiagnosticsBundle`** (`exportDiagnostics{includePaths}`, built in `src/engine/compose/diagnosticsBundle.ts`):

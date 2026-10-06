@@ -584,7 +584,7 @@ export class VaultRuntime {
 		return mergeStatus(log, {
 			transport: this.o.carrier, paused: this.paused, migrating: this.migrating, brake: this.brake,
 			pendingDiskOps: this.rec?.ctx.store.intents.size ?? 0, pendingBlobs: this.blobs?.queued().length ?? 0, conflictCopiesToday: this.conflictCopies.value,
-			lastFullReconcileAtMs: this.lastFullAtMs, bootstrap: null, notices: this.notices,
+			lastFullReconcileAtMs: this.lastFullAtMs, bootstrap: null, maxBlobBytes: this.blobs?.maxBlobBytes ?? null, notices: this.notices,
 		});
 	}
 
