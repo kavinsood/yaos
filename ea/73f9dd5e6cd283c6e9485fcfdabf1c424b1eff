@@ -1,0 +1,19 @@
+scripts/relay2/reset/tsconfig.json
+  s_ab5bcc5cfffe93::t_23ef6f00ba7ba1 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ea73f9dd5e6cd283c6e9485fcfdabf1c424b1eff",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
