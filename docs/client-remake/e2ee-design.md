@@ -891,3 +891,74 @@ Both mean **a new vault**:
   - the result is a new vault in all but name, with confusing pairing.
 - Alternative: mixed suites during a migration window. Rejected: a downgrade path, and two code paths in every
   reader.
+
+## 16. Performance budget
+
+### 16.1 Inputs
+
+- **[M]** desktop (§3):
+  - 1 MiB AES-256-GCM seal: Chrome ~3000 MiB/s; WKWebView (macOS) 2174 MiB/s seal, 5556 MiB/s open;
+  - per-call floor 5.5 µs (Chrome) and 12 µs (WKWebView), sequential at 64 B.
+- **[U]** mobile, assumed **10× worse**: 100 MiB/s and 0.1 ms per call, until §23.3 measures it.
+- Calls per operation:
+
+| Operation | Crypto calls |
+|---|---|
+| Frame seal or open | 1 AES-GCM, plus 1 padding copy |
+| Blob up | sha256 (already done today), 1 HMAC (address), 1 AES-GCM |
+| Blob down | 1 AES-GCM, sha256 (already done today) |
+| Engine start | 1 HKDF import per held epoch, plus 7 `deriveKey` (§5.1) |
+| Older epoch, first use | 5 `deriveKey`, lazily |
+| Re-key | ≤ 3 unwraps per record walked, plus 1 kcv per epoch |
+
+### 16.2 Budgets (MUST hold; WP-E7 measures them)
+
+| Path | Desktop | Mobile (assumed) | Note |
+|---|---|---|---|
+| Typing: one frame per `OPEN_FRAME_IDLE_MS` (100 ms, `src/core/limits.ts:56`) | ≤ 0.05 ms per frame | ≤ 0.5 ms | Below 1% of the frame interval |
+| Bootstrap, 10k docs, 200 MiB of checkpoints and tail | ≤ 0.3 s total crypto | ≤ 3 s (10k × 0.1 ms + 200 MiB ÷ 100 MiB/s) | Downloading 200 MiB dominates |
+| One 10 MiB blob | ≤ 10 ms | ≤ 100 ms | Plus 3 × 10 MiB transient memory (§10.3) |
+| Engine start | ≤ 5 ms | ≤ 20 ms | |
+| Bundle | +0 KB (WebCrypto) | | `qrcode` +9.6 KB gzip **[M]**, plus ~2 KB of base32 and record code [D] |
+
+Crypto is never on the hot path. Bootstrap is bound by the network and the planner, not by AES. If a mobile run
+(§23.3) misses a budget by more than 2×, the fallback is to batch opens with `Promise.all` (the spike measured
+~2.4 µs per call batched, §3). No format change is needed.
+
+### 16.3 Transaction rule (correctness, not speed)
+
+- WebCrypto promises settle on a task, not a microtask. Awaiting one inside an IndexedDB transaction body lets the
+  transaction auto-commit early, and later writes then fail.
+- **NEVER await a CryptoPort or HashPort call inside a `runTx` body** (`src/engine/adapters/idbStorage.ts:187`).
+  Seal before the transaction and open after it.
+- **Static audit (this worktree).** Every crypto call site seals or opens outside the transaction body:
+  - `src/engine/runtime/docRuntime.ts:109, :246, :256`;
+  - `src/engine/runtime/engine.ts:167, :225`;
+  - `src/engine/runtime/ingestRow.ts:36`;
+  - `src/engine/runtime/catchUp.ts:112`;
+  - `src/engine/runtime/quarantineRelease.ts:28`;
+  - `src/engine/runtime/mirrorIo.ts:186`.
+
+  The engine is changing in parallel, so this is re-checked by test, not by reading.
+- **Why the sim cannot see it today.** `identityCrypto` resolves on microtasks (`src/core/codec/envelope.ts:242`).
+  `MemStoragePort` trips `tx-inactive` only when a body awaits a macrotask (`src/sim/storage.ts:29-44`).
+- **Fix (WP-E7).** A `DelayedCrypto` double settles every call after `setTimeout(0)`. Any future crypto await
+  inside a transaction then fails the sim and the unit tests, exactly as on a device.
+
+## 17. Lost server features and client replacements
+
+The rewritten server already verifies nothing about content (DECISIONS §2.1, D9). Suite 1 makes that a property
+rather than an accident.
+
+| Feature (legacy or possible) | Under suite 1 | Client replacement |
+|---|---|---|
+| Server check that a blob's bytes match its sha256 | Impossible: opaque address | AEAD tag plus sha256 after open (`src/engine/body/refs.ts:58-59`) |
+| `X-YAOS-Content-SHA256` / `-Size` headers (`server/src/http.ts:7`) | Leak plaintext hash and size | The client never sends them (server ask A2 removes them) |
+| Server-side debugging of content | Impossible | Diagnostics carry `HMAC(kDiag, ·)` hashes (§6.4). The user shares a bundle and correlates locally |
+| Point-in-time restore (D8b) | **Still works**: opaque rows rewind | Old keys stay in the keyring. `k` is re-published (§11.5) |
+| Blob garbage collection | The server cannot see references | Client mark-and-sweep (§10.4), blocked on A3 |
+| Cross-vault dedupe | Impossible: kAddr is per vault | None, by design |
+| Server search, publish or web view | Impossible | None (out of scope) |
+| Server-held key recovery | Never existed | RK (§13) |
+| Operator snapshot or recovery routes | Removed by the rewrite (DECISIONS §1, D5) | Local snapshots; uploads are sealed blobs (§9.1) |
+| Server-side size accounting per vault | Still works, but sizes are padded (§7.3) | n/a |
