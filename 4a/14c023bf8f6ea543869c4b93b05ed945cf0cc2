@@ -1,0 +1,29 @@
+src/engine/compose/lifecycle.test.ts
+  s_441b74abbd0702::t_495a8958b17e49 1-106
+src/engine/compose/vaultRuntime.ts
+  s_441b74abbd0702::t_076623b69479ab 20,81-83,99-101,120,499-504,506-540,544-553,598
+src/engine/runtime/context.ts
+  s_441b74abbd0702::t_90ace0b6b0ba7a 70-71
+src/engine/runtime/engine.ts
+  s_441b74abbd0702::t_aa7409205c33b5 444-461
+src/engine/runtime/maintenance.ts
+  s_441b74abbd0702::t_51b6b1989eced2 8,116,143
+src/engine/runtime/sessionLoop.ts
+  s_441b74abbd0702::t_920bbdfcbd7401 30-33,72-73,90,119,237,302,332-373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4a14c023bf8f6ea543869c4b93b05ed945cf0cc2",
+  "prompts": {},
+  "sessions": {
+    "s_441b74abbd0702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5b78666751a5e84f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
