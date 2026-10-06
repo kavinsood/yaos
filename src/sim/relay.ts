@@ -80,8 +80,10 @@ export class SimRelay implements RelayPort {
 	private nextSessionId = 1;
 	private readonly readPageRows: number;
 	private readonly maxSockets: number;
-	/** Catch-up read requests served (single and batched). */
+	/** Catch-up read requests (single and batched): total, on the wire now, most on the wire at once. */
 	readRequests = 0;
+	readsOnWire = 0;
+	maxReadsOnWire = 0;
 	/** Listener exceptions: rethrown asynchronously by default (like wsRelay). */
 	onListenerError: (error: unknown) => void = (error) => queueMicrotask(() => {
 		throw error;
@@ -111,8 +113,8 @@ export class SimRelay implements RelayPort {
 			clock: this.clock,
 			arrive: (session, msg) => this.engine.arrive(session, msg),
 			feed: (session, afterSeq) => this.http(session, () => this.feedPage(afterSeq)),
-			read: (session, stream, afterSeq, prefer) => (this.readRequests++, this.http(session, () => this.readPage(stream, afterSeq, prefer))),
-			readBatch: (session, reqs) => (this.readRequests++, this.http(session, () => this.readBatchPages(reqs))),
+			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.readPage(stream, afterSeq, prefer)),
+			readBatch: (session, reqs) => this.readRequest(session, () => this.readBatchPages(reqs)),
 			putCheckpoint: (session, stream, coversSeq, expected, bytes) => this.http(session, () => this.checkpointPut(session, stream, coversSeq, expected, bytes)),
 			jitter: (session) => this.jitter(session.link),
 			listenerError: (error) => this.onListenerError(error),
@@ -146,6 +148,12 @@ export class SimRelay implements RelayPort {
 	// ---- HTTP ---------------------------------------------------------------------
 
 	/** Request travels httpMs (+jitter), is answered from the state at arrival, the response travels back. */
+	private readRequest<T>(session: SimRelaySession, compute: () => T): Promise<T> {
+		this.readRequests++;
+		this.maxReadsOnWire = Math.max(this.maxReadsOnWire, ++this.readsOnWire);
+		return this.http(session, compute).finally(() => this.readsOnWire--);
+	}
+
 	private http<T>(session: SimRelaySession, compute: () => T): Promise<T> {
 		this.httpInFlight++;
 		return new Promise<T>((resolve, reject) => {

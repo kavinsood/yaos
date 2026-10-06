@@ -303,14 +303,30 @@ export class SessionLoop {
 		});
 		const unserved: StreamName[] = [];
 		let prev: Promise<void> = Promise.resolve();
+		// Members that must read on (more pages, or the stream moved since the request) go one at a time: the
+		// batch is one lane, so it has at most one request on the wire.
+		let net: Promise<void> = Promise.resolve();
 		const members = reqs.map((q, i) => {
 			const after = prev;
 			const p = (async () => {
 				const pages = await batch;
 				if (inOrder) await after;
 				const page = pages?.[i];
-				if (page) await this.readOne(s, gen, q.stream, undefined, { ...q, page });
-				else if (pages) unserved.push(q.stream);
+				if (!page) {
+					if (pages) unserved.push(q.stream);
+					return;
+				}
+				const first = { ...q, page };
+				if (!page.more && (c.repo.stream(q.stream)?.appliedSeq ?? 0) === q.afterSeq) return this.readOne(s, gen, q.stream, undefined, first);
+				const before = net;
+				let release = () => {};
+				net = new Promise<void>((r) => (release = r));
+				try {
+					await before;
+					await this.readOne(s, gen, q.stream, undefined, first);
+				} finally {
+					release();
+				}
 			})().finally(() => {
 				this.reads.delete(q.stream);
 				this.scheduleCatchUp();
