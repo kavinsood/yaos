@@ -25,6 +25,29 @@ The last code change is 5735ad5; 5b1803e touches only the e2e harness
 (onboarding sends an `Origin` header, §7). The commit after it holds only
 these notes.
 
+Latency pass, branch `client-remake-latency`, code as of a5ab167 (§7.1):
+
+| Gate | Result |
+|---|---|
+| `npm run typecheck:client` | clean |
+| `node scripts/check-deps.mjs` | 303 files, 0 errors, 0 warnings |
+| `npm run test:client` | 758 pass, exit 0 |
+| Full-client e2e, local relay (port 8791) | 53/53 |
+| Full-client e2e, deployed `yaos-relay2-client-e2e` | 50/50, twice (scenario 7 skipped as remote) |
+| `npm run build` | OK, plugin smoke passes; `main.js` 987.0 KiB (worker 438.4 KiB), zip 342,009 B |
+
+### 1.1 Real-device relay
+
+`https://yaos-relay2-client-e2e.kavinsood.workers.dev`: the streams relay
+(`server/wrangler.toml` minus the R2 bucket, plus `YAOS_STREAMS=true`;
+nothing beyond the free plan), deployed with
+`zsh scripts/relay-dev/deploy.sh` (cf CLI session, no API token) from
+93d72ee; later commits are client-only. It is claimed. The operator recovery
+key, the host and the harness's vaults are only in
+`experiments/logs/client-e2e-context-yaos-relay2-client-e2e.kavinsood.workers.dev.json`
+(keys `host`, `operatorRecoveryKey`, `vaults`); never print it (§9.0 copies
+it to the clipboard). Pairing steps for desktop, Android and iOS: §9.0.
+
 ## 2. Architecture
 
 ```
@@ -248,10 +271,6 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - Settings changes are seen on full passes (5-15 min by device class) and on
   `visible` / `resume`, not on config-dir file events.
 - The client trusts the relay's `retryAfter` (capped at one day).
-
-- A fresh device bootstrap of the small e2e vault took 15.5 s and 5.1 s in
-  the two deployed full-client runs (0.8-0.9 s locally); not investigated
-  (one sample per run, two relay builds).
 - `fileGone` (D17) lives in the store only: after an IDB loss the mirror
   brings S back without it, so a file re-created at the path while the delete
   waited merges into the old doc as a save (the pre-D17 behaviour).
@@ -265,6 +284,46 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - A disk write right after an epoch reset, with the note open, is overwritten
   when the reset saves the open views (the sim models it as Obsidian's own
   overwrite and exempts it).
+
+**Latency (§7.1)**
+- Bootstrap storage work is not batched: ~3 IDB tx per note (the per-stream
+  catch-up apply, `store/repo.ts:471`; the materialize read; the per-note
+  synced/localTree commit, `reconcile/store.ts:90`). It bounds the local run
+  and the last ~1 s of the deployed run. Batching the commit would break the
+  write-file-then-record order that crash recovery relies on, so it was left.
+- Blob jobs that run before catch-up has read their `x:` stream still read
+  it from the relay (9 of 22 in the deployed run), the same bytes catch-up
+  reads again. These reads (`readBlobChunks`) do not go through the catch-up
+  lanes, hence the 5th request on the wire. The rare `checkpoint-disputed`
+  retry read also runs outside the lane chain.
+- Session start reads ns (+ cfg) in its own request before catch-up starts:
+  one round trip by design (ns is folded before live).
+- Each leading-edge commit costs 2 extra rows per stream it touches (free
+  plan row budget); at most one per `gcQuietMs` (1.5 s) per vault. Edits
+  closer together than that keep the 300 ms idle grouping (full e2e
+  `edit_to_peer` ~480 ms deployed).
+- The bench and e2e run the inline carrier with the tablet budget (4 lanes,
+  2 blob jobs); desktop numbers with the worker budget are not measured.
+- The deployed per-request cost (~220 ms against a ~24 ms edge round trip)
+  is three sequential DO hops per request (`server/src/index.ts:275`),
+  outside `server/src/streams/*`; not touched.
+
+**Pairing and packaging (found while writing §9)**
+- The pair modal says codes come from a paired device "or in your server's
+  console" (`pairModal.ts:61`). The console only issues owner setup and
+  recovery codes; a generic device code is refused with 409
+  `collaboration_authority_required` (`server/src/routes/operator.ts:146-153`).
+- The mobile setup page and the claim page tell the user to install YAOS
+  from Community plugins (`server/src/setupPage.ts:46,569,611`); this client
+  is not published, so it has to be side-loaded (§9.0).
+- `package.json` says 2.1.0, `manifest.json` 3.0.0. `styles.css` is legacy:
+  none of its classes are used by `src/host/ui`, and the zip does not ship it
+  (the modals render unstyled, which works).
+- Unpairing leaves the device listed on the server (the confirm dialog
+  says so, `settingsTab.ts:347`); there is no in-app way to create a vault
+  on a claimed server (operator console only).
+- The relay has no R2 binding, so attachments travel inline as `x:` chunks
+  (cap 8 MiB per blob on this config).
 
 **Host**
 - With IndexedDB missing in both carriers, the host stays in `starting` and
@@ -417,8 +476,115 @@ for 2 MB and slower for small files.
 
 Locally `attachment_2m` is dominated by chunked upload through the log (no
 R2 in the local relay, so blobs travel as `x:` chunks; `blobPath` = `log`).
-The deployed fresh bootstrap took 5.1 s here and 15.5 s in the earlier
-deployed run (0.8-0.9 s locally); not investigated, listed under gaps.
+The deployed fresh bootstrap (5.1 s here, 15.5 s in the earlier deployed run)
+is explained and fixed in §7.1.
+
+### 7.1 Latency pass (branch `client-remake-latency`)
+
+Probes, both on the production ports of FullClients, logs without secrets in
+`experiments/logs/client-e2e-{boot,edit}-<label>-<stamp>.json`:
+- `e2e/client/bootBench.ts`: a writer seeds N notes + attachments, then fresh
+  devices boot one after another with a BootTrace (`bootTrace.ts`): every
+  relay HTTP call by route, the socket, every storage tx, engine and disk
+  samples every 5 ms, and a read timeline. Spans are also given in relay
+  round trips (median of a timed authenticated feed request).
+- `e2e/client/editTrace.ts`: per edit, the socket frames of writer A and
+  reader C (APPEND out, COMMIT_NOTICE in, receipt) and C's disk.
+
+```sh
+node --import jiti/register e2e/client/bootBench.ts --host URL --label L --notes 1000 --attachments 20 --big 2 --repeat 2
+node --import jiti/register e2e/client/editTrace.ts --host URL --label L
+```
+
+Deployed means `yaos-relay2-client-e2e` (§1.1; Worker built from 93d72ee;
+every later commit is client-only). One authenticated deployed request takes ~220 ms from this laptop against a ~24 ms edge round
+trip: the Worker resolves auth state, then the vault DO, then authorizes,
+three sequential DO hops per request (`server/src/index.ts:275`). The
+harness runs the inline carrier (`fullKit.ts:166`), so `deviceClassFor`
+(`runtimeSupport.ts:20-29`) gives the tablet budget: 4 catch-up lanes, 2 blob
+jobs, 4 MiB disk I/O in flight (a desktop with the worker gets 8 / 4 / 8 MiB).
+
+**Bootstrap root causes and fixes**
+
+1. *One HTTP read per stream.* Catch-up sent one `GET /streams/read` per
+   stale stream, `catchUpConcurrency` at a time: 1045 requests for 1022
+   files, ~261 rounds of 4 lanes at ~230 ms each (61 s deployed). Fix: the relay
+   serves many streams per request (`GET /streams/read?maxBytes=B&r=<after>.<0|1>.<stream>`,
+   up to 128 entries under one 1 MiB budget, advertised as
+   `readBatchMaxStreams`; `server/src/streams/*`, 18ea6fd) and each catch-up
+   lane sends one batch (`RelaySession.readBatch`, `sessionLoop.ts`
+   scheduleCatchUp/runBatch; ns + cfg in one request before live; 26e2cf9).
+   Members a response did not serve are read on one at a time on the same
+   lane, so a lane never has two requests on the wire (ba01198).
+2. *Attachments, one round trip each, read twice.* The plan runner runs ops
+   in order (§f.2; `reconcile/runner.ts:138-157` at ba01198). Each blob
+   materialize awaited `blobs.download` (`diskJobs.ts:158`) -> `BlobQueue` ->
+   `readBlobChunks` -> one relay read per blob (`runtime/blobChunks.ts:53` at
+   ba01198).
+   22 attachments were ~22 serial requests (~5 s deployed), and the 1000
+   notes waited behind them in the same pass (`att/` sorts first). The read
+   timeline showed it: single ~55 KB reads back to back from 1.7 s to 6.5 s,
+   after catch-up had already put every `x:` stream in the local tail
+   (rank 4, `engine.ts:59`) at 3.4 s. Fixes: blob jobs prefetch the next
+   downloads while the current op runs (`BlobQueue.prefetch`, window
+   `blobConcurrency - 1`, held bytes <= `maxDiskIoBytesInFlight`, leftovers
+   dropped after the pass; 9a76b06), and `readBlobChunks` assembles from the
+   local tail when the tail holds the whole blob, else reads the relay
+   (61db34d).
+
+Fresh device, 1000 notes + 20 x 40 KB + 2 x 300 KB attachments (1022 files,
+vaultSeq 1047), two fresh devices per run. ms until every file is on disk /
+until clean convergence; reads = `/streams/read` requests.
+
+| Run | Tree | Files on disk | Clean | Reads |
+|---|---|---|---|---|
+| local, before | 41e2950 | 5712 / 5378 | 5889 / 5553 | 1045 |
+| local, batched reads | 93d72ee | 4398 / 4208 | 4579 / 4388 | 32 |
+| local, + blob prefetch / tail | a5ab167 | 4066 / 3649 | 4245 / 3828 | 32 |
+| deployed, before | 41e2950 | 61485 / 60346 | 63060 / 62180 | 1045 |
+| deployed, batched reads | 93d72ee | 7901 / 7516 | 8083 / 7695 | 35 |
+| deployed, one request per lane | ba01198 | 7762 / 7479 | 7942 / 7662 | 35 |
+| deployed, + blob prefetch / tail | a5ab167 | 4036 / 4306 | 4217 / 4488 | 19 / 20 |
+
+150 notes, no attachments, one fresh device: local 295 -> 132 ms, deployed
+9307 -> 1359 ms (151 -> 3 read requests). The full e2e's own
+`fresh_bootstrap` (scenario 8, ~40 files including a 2 MB attachment), on
+this deployed relay: 13369 ms (41e2950) -> 3012 / 2865 ms (a5ab167, two
+runs); local 783 -> 820 ms (n = 1, noise).
+
+Where the deployed 4.0 s goes now (a5ab167, boot 1, 224 ms per request):
+socket ready at 0.39 s (ticket + upgrade), two feed pages to 0.93 s, the ns
+read (folded before live) to 1.21 s, then 9 catch-up batches on 4 lanes and
+9 blob reads (jobs that ran before catch-up reached their `x:` stream) until
+3.05 s, at most 5 requests on the wire (reads span 9.5 round trips). Disk
+writes run 1.50-4.02 s, and all but 6 of the 1022 land after 2.9 s. The
+tail end is local work: ~3 storage tx per note (catch-up apply, reconcile read, synced/
+localTree commit; 3083 tx, 1.8 s of tx time on fake-indexeddb), the same
+cost that bounds the local run. Deployed is now within ~0.3 s of local.
+
+**Edit to peer.** The relay commits a group after 300 ms idle (1500 ms max),
+and a peer projects an edit of a note it does not have open to disk only on
+COMMIT_NOTICE, so every isolated edit waited the idle window. Fix: a frame
+that opens an empty buffer after 1500 ms without a commit commits after
+20 ms (`gcLeadMs` / `gcQuietMs`, `server/src/streams/relay.ts:58-77`,
+2c3afd1). A burst pays at most one extra commit at its start (2 rows per
+stream it touches) and then groups as before. Medians of 8 isolated edits
+(1.5 s apart), C's disk, ms:
+
+| Edit | Local before | Local after | Deployed before | Deployed after |
+|---|---|---|---|---|
+| API write | 417 | 138 | 468 | 197 |
+| External disk write | 517 | 238 | 568 | 306 |
+| Typing in a bound view (C not open) | 450 | 172 | 503 | 232 |
+
+Deployed after, API write: APPEND out at 85 ms, COMMIT_NOTICE on C at 160 ms,
+disk at 197 ms. The 85 ms before the frame leaves are client side: the host's
+50 ms vault-event batch (`VAULT_EVENT_BATCH_MS`, `runtimeSupport.ts:16`) plus
+engine work; the disk write adds the harness's 100 ms watcher delay. Edits
+that follow another commit within 1500 ms keep the old grouping: the full
+e2e writes edits back to back, so its `edit_to_peer` stays ~430 ms local /
+~480 ms deployed (a5ab167, two deployed runs: edit 477 / 481, disk edit
+572, create 942 / 837, typing to view 174).
 
 ## 8. Bundle
 
@@ -438,11 +604,69 @@ inline fallback.
 
 ## 9. Manual test plan
 
-Install `dist/yaos-client/yaos.zip` (unzip into `<vault>/.obsidian/plugins/yaos/`)
-on every device, enable the plugin, pair each device to the same vault on a
-scratch relay. Use throwaway vaults; keep the relay's operator view open to
+Install the plugin on every device and pair each one to the same vault on a
+scratch relay (§9.0). Use throwaway vaults; keep the relay's operator view open to
 watch heads. "Converged" means: open the same files on every device and
 compare (or run `sha256sum` over the vault folder on desktop).
+
+### 9.0 Setup: relay, plugin, pairing
+
+**Relay.** `https://yaos-relay2-client-e2e.kavinsood.workers.dev` (§1.1),
+already claimed. Its operator recovery key is only in the harness context
+file; put it on the clipboard without printing it:
+
+```sh
+jq -r .operatorRecoveryKey /Users/kavin/personal/obsidiansync/experiments/logs/client-e2e-context-yaos-relay2-client-e2e.kavinsood.workers.dev.json | pbcopy
+```
+
+**Plugin.** `npm run build` (tsc, then `node esbuild.config.mjs production`)
+writes `dist/yaos-client/yaos.zip` with `yaos/main.js` and
+`yaos/manifest.json` (id `yaos`, minAppVersion 1.13.0) and runs the plugin
+smoke check; `dist/yaos-client/yaos/` is the same folder unpacked. The
+folder must be named `yaos`:
+- Desktop: `unzip dist/yaos-client/yaos.zip -d "<vault>/.obsidian/plugins/"`.
+- Android: `adb push dist/yaos-client/yaos "/sdcard/<vault folder>/.obsidian/plugins/"`
+  (the vault folder is where Obsidian created it, often
+  `/sdcard/Documents/<vault>`), or copy the folder over USB file transfer.
+- iOS / iPadOS: the Files app does not show dot-folders, so `.obsidian` can't
+  be reached there. Use a vault stored in iCloud Drive and copy from a Mac
+  into `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/<vault>/.obsidian/plugins/yaos/`,
+  then wait for the files to appear on the device. iCloud then also syncs that
+  vault (that is what 9.3-3 tests).
+
+In Obsidian: Settings -> Community plugins -> turn community plugins on
+(Restricted mode off) -> reload the installed list -> enable YAOS. The status
+bar shows `YAOS: not paired`. Obsidian mobile has no status bar; use the YAOS
+settings tab (Phase, Unsynced changes) there. Never copy
+`.obsidian/plugins/yaos/data.json` between devices or vault copies: it holds
+the device credential (`src/host/ui/api.ts:16-21`), and a copy makes two
+installs one device.
+
+**First device (vault owner).**
+1. Open the relay URL -> "Operator sign-in" -> paste the key -> Open console.
+2. Enter a vault name -> Create vault. The console issues an owner setup
+   code at once and shows it with "Open in Obsidian" and "Open mobile setup"
+   links. It is shown once, works once, and expires after 15 minutes (if it
+   lapses, the vault card has "Issue owner setup code" while the vault has
+   no owner).
+3. On the device, click "Open in Obsidian" (opens the pair modal prefilled),
+   or run the command "YAOS: Pair this device" and enter the server URL and
+   the code. The device name defaults to the platform. Pair -> notice
+   "YAOS: this device is now paired with <host>." -> status `starting…` ->
+   `catching up` -> `synced`.
+
+**Every other device.**
+4. On a paired device run "YAOS: Pair another device" (also a button in the
+   YAOS settings tab). It shows the server URL, a pairing code, a setup link
+   (`obsidian://yaos?action=setup&...`) and a mobile setup page
+   (`<relay>/mobile-setup#...`), each with Copy, and the expiry countdown. One
+   code pairs one device, within 15 minutes.
+5. On the new device: open the setup link (desktop), or open the mobile
+   setup page in the phone's browser and tap "Connect Obsidian" (ignore its
+   "install from Community plugins" text, §5), or run "YAOS: Pair this
+   device" and paste the URL and code.
+6. Expect `YAOS: synced` and the vault's files. The console's own codes are
+   owner codes only; device codes come from step 4 (§5).
 
 ### 9.1 Desktop (macOS / Windows / Linux), two desktops A and B
 
@@ -481,8 +705,9 @@ compare (or run `sha256sum` over the vault folder on desktop).
 11. **Restart.** Quit Obsidian on A during a burst of typing; restart. Expect
     no lost characters that were visible for more than ~1 s, and catch-up of
     anything B did meanwhile.
-12. **IDB loss.** In devtools on A, delete the `yaos-*` IndexedDB databases
-    and reload the plugin. Expect recovery from the `.yaos` mirrors with no
+12. **IDB loss.** In devtools on A, delete the `yaos2:<vaultId>:...`
+    IndexedDB databases (`store/schema.ts:22`) and reload the plugin. Expect
+    recovery from the `.yaos` mirrors with no
     mass conflict copies and no re-upload of the whole vault.
 13. **Relay restart / outage.** Restart the relay (or block it for a few
     minutes) while both type. Expect status `offline` -> reconnect with
