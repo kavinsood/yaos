@@ -11,6 +11,7 @@
 // Invariant: durable before receipt, and every seq is delivered live only after
 // its commit.
 import { bytesToBase64 } from "../base64url";
+import { dailyLimitControl, dailyLimitKind, dailyLimitResponse, isCloudflareDailyLimitError, type DailyLimitKind } from "../dailyLimit";
 import { SYSTEM_CLOCK, SYSTEM_TIMERS, type ClockPort, type SocketPort, type SocketRegistryPort, type TimerPort } from "../ports";
 import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../shared/socketCloseCodes";
@@ -170,7 +171,7 @@ export interface StreamRelayOptions {
 	/** Getter: the runtime replaces storage-bound objects on vault delete. */
 	store: () => StreamStore;
 	sockets: SocketRegistryPort;
-	/** `__YPS:` control send with the host's decorateControl (D8 daily-limit typing). */
+	/** `__YPS:` control send of `value` as is (the relay types its own frames, H3). */
 	sendControl: (socket: SocketPort, value: unknown) => void;
 	/** The host's authority check (the vault DO: the actor's device is in the device map). */
 	validateActor: (actor: StreamActor) => boolean;
@@ -263,6 +264,9 @@ export class StreamRelayService {
 	private maxTimer: unknown = null;
 	private lastCommitAt = Number.NEGATIVE_INFINITY;
 	private wakeChecked = false;
+	/** H3: kind of the last daily-limit error this relay classified (typing of up-front refusals). */
+	private dailyKind: DailyLimitKind = "rows-written";
+	private writes = 0;
 
 	constructor(private readonly options: StreamRelayOptions) {
 		this.config = options.config;
@@ -303,6 +307,11 @@ export class StreamRelayService {
 
 	head(): number {
 		return this.options.store().head();
+	}
+
+	/** D8b finish: committed appended rows plus successful checkpoint writes since this runtime booted. */
+	get writesThisRuntime(): number {
+		return this.writes;
 	}
 
 	limits() {
@@ -505,11 +514,10 @@ export class StreamRelayService {
 			return;
 		}
 		if (this.options.dailyLimitActive()) {
-			// D8: decorateControl types this as cf_daily_limit with resetAt.
+			// H3: refused before any broadcast or buffering. DECISIONS-GAP: the host exposes only "latched", not the
+			// latched kind; the kind is the one this relay last classified, else "rows-written" (the latch default).
 			this.counters.dailyLimitRejects++;
-			this.options.sendControl(socket, { type: "VAULT_ERROR", code: "durability_failed",
-				message: "append was not committed; resend after the daily limit resets",
-				stream: frame.stream, clientFrameIds: [frame.clientFrameId] });
+			this.options.sendControl(socket, dailyLimitControl(this.now(), this.dailyKind, frame.stream, [frame.clientFrameId]));
 			return;
 		}
 		const provisional = isProvisionalStream(frame.stream);
@@ -568,7 +576,7 @@ export class StreamRelayService {
 			this.counters.commitFailures++;
 			this.options.noteCommitError(error);
 			console.warn("[yaos-streams] commit failed", error instanceof Error ? error.message : String(error));
-			this.failed(frames);
+			this.failed(frames, error);
 			return;
 		}
 		this.lastCommitAt = this.now();
@@ -594,7 +602,7 @@ export class StreamRelayService {
 				continue;
 			}
 			const seq = outcome.seq;
-			if (outcome.kind === "appended") this.counters.committedRows++;
+			if (outcome.kind === "appended") { this.counters.committedRows++; this.writes++; }
 			else this.counters.storeDedupes++;
 			// Live delivery: rows appended now go to every other socket (notice for those
 			// that hold the PROVISIONAL); a row deduped against an earlier commit was
@@ -636,8 +644,14 @@ export class StreamRelayService {
 		}
 	}
 
-	/** A failed commit: nothing was written. Origins resend; holders of PROVISIONALs drop them. */
-	private failed(frames: readonly PendingFrame[]): void {
+	/**
+	 * A failed commit: nothing was written. Origins resend; holders of PROVISIONALs drop them. H3: the error is typed
+	 * here, at the source: the daily limit → `VAULT_ERROR cf_daily_limit`, anything else → `durability_failed`.
+	 */
+	private failed(frames: readonly PendingFrame[], error: unknown): void {
+		const daily = isCloudflareDailyLimitError(error);
+		if (daily) this.dailyKind = dailyLimitKind(error);
+		const now = this.now();
 		const sockets = this.streamSockets();
 		const byOrigin = new Map<string, { socket: SocketPort; streams: Map<string, string[]> }>();
 		for (const frame of frames) {
@@ -652,8 +666,8 @@ export class StreamRelayService {
 		}
 		for (const entry of byOrigin.values()) {
 			for (const [stream, clientFrameIds] of entry.streams) {
-				this.options.sendControl(entry.socket, { type: "VAULT_ERROR", code: "durability_failed",
-					message: "append was not committed; resend", stream, clientFrameIds });
+				this.options.sendControl(entry.socket, daily ? dailyLimitControl(now, this.dailyKind, stream, clientFrameIds)
+					: { type: "VAULT_ERROR", code: "durability_failed", message: "append was not committed; resend", stream, clientFrameIds });
 			}
 		}
 	}
@@ -719,6 +733,20 @@ export class StreamRelayService {
 		this.options.store().reset();
 	}
 
+	/**
+	 * D8a reset / D8b restore: drops the pending buffer (no commit, no receipts, no frames), the head cache and the
+	 * dedupe index, then closes every streams socket with `closeCode`/`reason` and forgets it. Synchronous.
+	 */
+	discardAll(closeCode: number, reason: string): void {
+		this.dropPending();
+		this.options.store().reset();
+		for (const socket of this.options.sockets.sockets()) {
+			if (!this.attachmentOf(socket)) continue;
+			this.gates.delete(socket);
+			try { socket.close(closeCode, reason); } catch { /* closed */ }
+		}
+	}
+
 	diagnostics() {
 		return { pendingFrames: this.pending.length, pendingBytes: this.pendingBytes, head: this.head(),
 			counters: { ...this.counters }, tables: this.options.store().tableCounts() };
@@ -732,8 +760,10 @@ export class StreamRelayService {
 		const limit = nonNegativeInteger(url.searchParams.get("limit"), STREAM_FEED_DEFAULT_LIMIT);
 		if (after === null) return json({ error: "invalid_cursor" }, 400);
 		if (limit === null || limit < 1) return json({ error: "invalid_limit" }, 400);
-		const page = this.options.store().feed(after, Math.min(limit, STREAM_FEED_MAX_LIMIT));
-		return json({ vaultEpoch: this.options.vaultGeneration(), ...page });
+		return this.dailyLimitAware(() => {
+			const page = this.options.store().feed(after, Math.min(limit, STREAM_FEED_MAX_LIMIT));
+			return json({ vaultEpoch: this.options.vaultGeneration(), ...page });
+		});
 	}
 
 	/** GET /streams/read?stream=X&after=S&maxBytes=B&checkpoint=1 */
@@ -744,8 +774,11 @@ export class StreamRelayService {
 		const maxBytes = nonNegativeInteger(url.searchParams.get("maxBytes"), STREAM_READ_DEFAULT_BYTES);
 		if (after === null) return json({ error: "invalid_cursor" }, 400);
 		if (maxBytes === null || maxBytes < 1) return json({ error: "invalid_max_bytes" }, 400);
-		const page = this.options.store().read(stream, after, Math.min(maxBytes, STREAM_READ_MAX_BYTES),
-			url.searchParams.get("checkpoint") === "1");
+		return this.dailyLimitAware(() => this.readPage(stream, after, maxBytes, url.searchParams.get("checkpoint") === "1"));
+	}
+
+	private readPage(stream: string, after: number, maxBytes: number, preferCheckpoint: boolean): Response {
+		const page = this.options.store().read(stream, after, Math.min(maxBytes, STREAM_READ_MAX_BYTES), preferCheckpoint);
 		return json({
 			vaultEpoch: this.options.vaultGeneration(),
 			head: this.head(),
@@ -778,11 +811,24 @@ export class StreamRelayService {
 			return json({ error: kind }, kind === "body_too_large" ? 413 : 400);
 		}
 		if (!admitted()) return json({ error: "unauthorized" }, 401);
-		const result = this.options.store().putCheckpoint(stream, coversSeq, expected, bytes);
-		if (!result.ok) {
-			const { ok: _ok, status, ...body } = result;
-			return json(body, status);
+		return this.dailyLimitAware(() => {
+			const result = this.options.store().putCheckpoint(stream, coversSeq, expected, bytes);
+			if (!result.ok) {
+				const { ok: _ok, status, ...body } = result;
+				return json(body, status);
+			}
+			this.writes++;
+			return json({ stream, coversSeq: result.coversSeq, gcSeq: result.gcSeq, deletedSegments: result.deletedSegments });
+		});
+	}
+
+	/** H3: a handler that fails on the daily limit answers `503 cf_daily_limit` itself; other errors propagate. */
+	private dailyLimitAware(run: () => Response): Response {
+		try {
+			return run();
+		} catch (error) {
+			if (!isCloudflareDailyLimitError(error)) throw error;
+			return dailyLimitResponse(this.now(), dailyLimitKind(error));
 		}
-		return json({ stream, coversSeq: result.coversSeq, gcSeq: result.gcSeq, deletedSegments: result.deletedSegments });
 	}
 }

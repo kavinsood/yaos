@@ -181,7 +181,7 @@ export class VaultHost {
 			store: () => this.store,
 			sockets: options.sockets,
 			sendControl: (socket, value) => {
-				const frame = `__YPS:${JSON.stringify(this.latch.decorateControl(value))}`;
+				const frame = `__YPS:${JSON.stringify(value)}`;
 				try { socket.send(frame); } catch { /* closed */ }
 			},
 			validateActor: (actor) => this.admits(actor.deviceId),

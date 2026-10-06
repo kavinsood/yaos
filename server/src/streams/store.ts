@@ -173,6 +173,19 @@ export class StreamStore {
 		this.headCache = null;
 	}
 
+	/**
+	 * D8a: deletes every row of the three stream tables. Synchronous and transaction-agnostic: the caller may run it
+	 * inside its own `transactionSync` (then a rollback restores the rows). Forgets the cached head. Bills one row
+	 * per deleted row (§6.2).
+	 */
+	deleteAllStreamRows(): void {
+		this.ensureSchema();
+		this.headCache = null;
+		for (const table of ["stream_head", "stream_segment", "stream_checkpoint"]) {
+			this.storage.sql.exec(`DELETE FROM ${table}`).toArray();
+		}
+	}
+
 	private ensureSchema(): void {
 		if (this.schemaReady) return;
 		this.storage.sql.exec(STREAM_SCHEMA);

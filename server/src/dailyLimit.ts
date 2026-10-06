@@ -17,9 +17,10 @@
  *
  * Classification is a pure function of the error; detection hooks the storage
  * port once (instrumentStorageForDailyLimit) so every code path that writes is
- * covered without touching each catch block. While the limit is latched, every
- * VAULT_ERROR frame and every failed HTTP request is answered with the typed
- * code `cf_daily_limit` plus `resetAt` (next 00:00 UTC).
+ * covered without touching each catch block. Errors are typed at the source
+ * (H3): the streams relay builds `dailyLimitControl` frames for appends it
+ * refuses or fails on the limit, and HTTP handlers answer `dailyLimitResponse`
+ * (typed code `cf_daily_limit` plus `resetAt`, the next 00:00 UTC).
  */
 
 export const DAILY_LIMIT_ERROR_CODE = "cf_daily_limit";
@@ -93,6 +94,13 @@ export function dailyLimitResponse(now: number, kind: DailyLimitKind = "rows-wri
 	});
 }
 
+/** The `VAULT_ERROR cf_daily_limit` control frame (relay-wire §16) for appends refused or failed on the daily limit (H3). */
+export function dailyLimitControl(now: number, kind: DailyLimitKind, stream: string, clientFrameIds: readonly string[]) {
+	const body = dailyLimitBody(now, kind);
+	return { type: "VAULT_ERROR" as const, code: DAILY_LIMIT_ERROR_CODE, cause: "durability_failed" as const, kind: body.kind,
+		resetAt: body.resetAt, message: body.message, stream, clientFrameIds: [...clientFrameIds] };
+}
+
 /**
  * Per-runtime record that the limit was hit. It stays set until the next
  * 00:00 UTC, or until a row write succeeds again (`noteWriteSucceeded`: the
@@ -102,6 +110,7 @@ export function dailyLimitResponse(now: number, kind: DailyLimitKind = "rows-wri
 export class DailyLimitLatch {
 	private until = 0;
 	private kind: DailyLimitKind = "rows-written";
+	private simulated = false;
 	constructor(private readonly now: () => number = Date.now) {}
 
 	/** Records `error` if it is the daily limit; returns whether it was. */
@@ -131,17 +140,19 @@ export class DailyLimitLatch {
 	}
 
 	/**
-	 * Typed form of a VAULT_ERROR control frame while the limit is latched (or
-	 * when the frame's own message is the limit error); other frames unchanged.
+	 * TEST-ONLY (`POST /vault/:id/debug/simulate-daily-limit {"enabled"}`, only with YAOS_DEBUG_ROUTES=1). `true`
+	 * latches rows-written now, and every write through `instrumentStorageForDailyLimit` throws Cloudflare's exact
+	 * error (so the real classification paths run); `false` stops that and clears the latch. Memory only.
 	 */
-	decorateControl(value: unknown): unknown {
-		if (!value || typeof value !== "object" || (value as { type?: unknown }).type !== "VAULT_ERROR") return value;
-		const frame = value as { type: "VAULT_ERROR"; code?: string; message?: string };
-		if (!this.active() && !this.note(frame.message)) return value;
-		const body = this.body();
-		if (!body) return value;
-		return { ...frame, code: DAILY_LIMIT_ERROR_CODE, kind: body.kind, resetAt: body.resetAt,
-			message: body.message, ...(frame.code ? { cause: frame.code } : {}) };
+	simulate(enabled: boolean): void {
+		this.simulated = enabled;
+		if (enabled) this.note(new Error(CF_DO_ROWS_WRITTEN_LIMIT_MESSAGE));
+		else this.clear();
+	}
+
+	/** Whether `simulate(true)` is in effect. */
+	simulating(): boolean {
+		return this.simulated;
 	}
 }
 
@@ -168,13 +179,13 @@ interface SqlLike {
  * - while `simulate()` is true, every write statement and every KV/alarm write
  *   (`put`, `delete`, `deleteAll`, `setAlarm`, `deleteAlarm`; each is a billed
  *   row write) throws Cloudflare's exact rows-written error (TEST-ONLY; the
- *   caller gates it behind YAOS_TEST_ONLY_DEBUG_ROUTES).
+ *   default reads `latch.simulating()`, which only the debug route sets).
  * Reads are never blocked by the simulation.
  */
 export function instrumentStorageForDailyLimit<T extends object>(
 	storage: T,
 	latch: DailyLimitLatch,
-	simulate: () => boolean = () => false,
+	simulate: () => boolean = () => latch.simulating(),
 ): T {
 	const observe = <R>(run: () => R): R => {
 		try {

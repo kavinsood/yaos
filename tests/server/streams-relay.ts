@@ -155,7 +155,7 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 		config: resolved,
 		store: () => store,
 		sockets: registry,
-		sendControl: (socket, value) => { try { socket.send(`__YPS:${JSON.stringify(latch.decorateControl(value))}`); } catch { /* closed */ } },
+		sendControl: (socket, value) => { try { socket.send(`__YPS:${JSON.stringify(value)}`); } catch { /* closed */ } },
 		validateActor: (actor) => !revoked.has(actor.deviceId),
 		dailyLimitActive: () => latch.active(),
 		noteCommitError: (error) => { latch.note(error); },
