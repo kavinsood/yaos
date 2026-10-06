@@ -7,6 +7,13 @@
  * The mirror carries no stat or fingerprint: imported records get size -1 and
  * an empty fingerprint, so the first pass refreshes them with a syncedPut
  * after hashing the file (the content hash is what decides).
+ *
+ * Nor a CRDT sync point: imported records get bodyVersion null (§i.5 step 3),
+ * so the planner sees the remote side as changed and the merge compares
+ * content against the synced side. `bodyRemoteSeq` cannot stand in for it: the
+ * fresh DB re-reads this device's own rows, which never advance remoteSeq, so
+ * own edits the disk never got (an editor buffer lost with the app) would look
+ * synced.
  */
 
 import type { DiskFingerprint, PathKeyFn, Seq } from "../../core/types";
@@ -31,7 +38,7 @@ export function toMirrorEntry(s: SyncedRecord): SyncedMirrorEntry {
 export function fromMirrorEntry(e: SyncedMirrorEntry, pk: PathKeyFn, nowMs: number): SyncedRecord {
 	return {
 		docId: e.docId, path: e.path, pathKey: pk(e.path), kind: e.kind, contentHash: e.contentHash, fingerprint: "" as DiskFingerprint,
-		size: -1, mtimeMs: 0, bodyVersion: e.kind === "blob" ? null : { remoteSeq: e.bodyRemoteSeq, localOrder: 0 }, blobRev: e.blobRev,
+		size: -1, mtimeMs: 0, bodyVersion: null, blobRev: e.blobRev,
 		nsTouchSeq: e.nsTouchSeq, hasBase: false, syncedAtMs: nowMs,
 	};
 }
