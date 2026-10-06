@@ -8,15 +8,18 @@
  * changed (offline / reconnect: the records stay in the outbox and go out on
  * the next session; a retry waits on them), or the timeout passed.
  *
- * readBlobChunks reads the committed rows of x:<hash> from the relay and opens
- * them through the gate; nothing is persisted. Offline: the rows already in the
- * local tail (live ingest stores x: rows), or null if there are none.
+ * readBlobChunks returns the rows already in the local tail (catch-up and live
+ * ingest store x: rows) when they assemble into the blob (the hash is the
+ * content address, so they are it); otherwise it reads the committed rows of
+ * x:<hash> from the relay and opens them through the gate; nothing is
+ * persisted. Offline: the local rows, or null if there are none.
  */
 
 import { decodeBlobChunk } from "../../core/codec/contents";
 import type { BlobChunkContent } from "../../core/envelope";
 import { blobChunkStream, type ClientFrameId, type ContentHash } from "../../core/types";
 import type { RelaySession } from "../../ports/relay";
+import { assembleChunks } from "../blobs/chunks";
 import { buildBlobChunkFrame } from "../body/frames";
 import { gateRow } from "../sync/ingestRow";
 import type { EngineCtx } from "./context";
@@ -45,6 +48,8 @@ export async function readBlobChunks(c: EngineCtx, hash: ContentHash): Promise<B
 		const local = await localChunks(c, hash);
 		return local.length > 0 ? local : null;
 	}
+	const local = await localChunks(c, hash);
+	if (local.length > 0 && assembleChunks(hash, local).ok) return local;
 	const stream = blobChunkStream(hash);
 	const out: BlobChunkContent[] = [];
 	try {

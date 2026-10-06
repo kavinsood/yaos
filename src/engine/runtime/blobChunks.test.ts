@@ -51,6 +51,27 @@ test("blob chunks: append on A, read + assemble on B; append is idempotent", asy
 	}
 });
 
+test("blob chunks: once the peer's tail holds every chunk, readBlobChunks assembles from it without a relay read", async () => {
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	try {
+		const { hash, bytes } = blob(3_500, 4);
+		assert.equal(await a.appendBlobChunks(hash, splitChunks(hash, bytes, 1_000)), true);
+		await until(async () => (await b.c.repo.getTail(blobChunkStream(hash), 0)).length === 4, 3_000, "b's tail has the x: rows");
+		const reads = relay.readRequests;
+		const got = await b.readBlobChunks(hash);
+		assert.equal(relay.readRequests, reads, "no relay read");
+		const asm = assembleChunks(hash, got ?? []);
+		assert.ok(asm.ok);
+		assert.deepEqual(asm.bytes, bytes);
+		assert.deepEqual(await b.readBlobChunks(blob(10, 6).hash), []);
+		assert.equal(relay.readRequests, reads + 1, "nothing local: the relay is read");
+	} finally {
+		await stopAll(a, b);
+	}
+});
+
 test("blob chunks: timeout -> false; the records still commit and a retry adds no rows", async () => {
 	const relay = new SimRelay();
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { blobAppendTimeoutMs: 200 } });
