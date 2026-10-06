@@ -28,6 +28,7 @@ import { createEngine, type ComposedEngine, type EngineHandle } from "../engine/
 import type { VaultRuntime } from "../engine/compose/vaultRuntime";
 import { residentText } from "../engine/compose/runtimeOps";
 import { FAST_TUNING } from "../engine/runtime/testHarness";
+import type { ClockPort } from "../ports/clock";
 import type { VirtualClock } from "./clock";
 import { simHashPort } from "./hash";
 import { SIM_VAULT_ID, type SimNet } from "./net";
@@ -109,6 +110,16 @@ export class SimDevice {
 	/** Texts that existed only in host memory when the app crashed (pending conflict copies; known gap). */
 	readonly crashLost: string[] = [];
 	readonly deviceId: DeviceId;
+	/** This device's wall-clock error (fault); the relay and other devices keep true time. */
+	wallSkewMs = 0;
+	/** The run's clock as this device sees it: shared timers and monotonic time, skewed wall time. */
+	readonly deviceClock: ClockPort = {
+		now: () => this.opts.clock.now() + this.wallSkewMs,
+		monotonic: () => this.opts.clock.monotonic(),
+		setTimer: (ms, fn) => this.opts.clock.setTimer(ms, fn),
+		clearTimer: (h) => this.opts.clock.clearTimer(h),
+		yieldNow: () => this.opts.clock.yieldNow(),
+	};
 
 	constructor(readonly opts: SimDeviceOptions) {
 		const hasher = createHasher(simHashPort());
@@ -145,7 +156,7 @@ export class SimDevice {
 				if (storageFails) throw new Error("IndexedDB unavailable in worker");
 				const hash = simHashPort();
 				return {
-					relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.opts.clock,
+					relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.deviceClock,
 					random: new SeededRandom(hashLabel(`${this.deviceId}#${n}`)), crypto: createNoopCrypto(hash), hash, blob: null,
 				};
 			},
@@ -197,12 +208,15 @@ export class SimDevice {
 	}
 
 	/** The carrier dies: storage keeps exactly what was committed, the socket drops first, nothing flushes. */
-	private killEngine(reason: string): void {
-		this.storage = this.storage.crash();
+	private killEngine(reason: string): MemStoragePort {
+		const dying = this.storage;
+		this.storage = dying.crash();
 		this.opts.net.relay.dropSession(this.deviceId);
 		this.handle?.engine.dispose(true);
 		this.pair?.kill(reason);
 		this.vrt = null;
+		// A second, independent copy of the committed state (for inspection).
+		return dying.crash();
 	}
 
 	/** Worker dies (OOM, OS kill): engine state newer than its last storage commit is lost. */
@@ -210,12 +224,23 @@ export class SimDevice {
 		this.killEngine(reason);
 	}
 
-	/** Whole app dies: unsaved editor buffers are lost, nothing flushes. Restart with `restartApp`. */
-	crashApp(): void {
+	/**
+	 * Whole app dies: unsaved editor buffers are lost, nothing flushes. Restart
+	 * with `restartApp`. `wipe`: the OS also evicted IndexedDB (and with
+	 * `dropMirrors` the side-file mirrors too). Returns a private copy of the
+	 * committed storage the next start will see (empty after a wipe).
+	 */
+	crashApp(o: { readonly wipe?: boolean; readonly dropMirrors?: boolean } = {}): MemStoragePort {
 		for (const c of this.runtime.bindings.pendingConflictCopies()) this.crashLost.push(c.text);
-		this.killEngine("app crash");
+		let copy = this.killEngine("app crash");
 		this.workspace.crashAll();
 		void this.runtime.stop().catch(() => undefined);
+		if (o.wipe) {
+			this.storage = new MemStoragePort({ beforeNextTimer: this.opts.clock.beforeNextTimer });
+			copy = new MemStoragePort({ beforeNextTimer: this.opts.clock.beforeNextTimer });
+		}
+		if (o.dropMirrors) this.sideFiles.files.clear();
+		return copy;
 	}
 
 	/** IndexedDB evicted / wiped while running (§e.4 recovery): every database of this device is deleted. */

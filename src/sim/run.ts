@@ -11,19 +11,20 @@
  * seededEntropy (imported first, before anything loads yjs), so the same seed
  * gives the same trace, the same converged bytes and the same digest.
  *
- * INTEGRATION: SimDevice switches to WP-C's engine over WP-A's SimRelay /
- * MemStoragePort; the hub-based convergence check becomes the relay fold check.
+ * Devices run the composed engine over one SimRelay (SimNet) on the run's
+ * VirtualClock, each with its own MemStoragePort. Convergence is checked
+ * against the relay fold: a fresh observer bootstrapped from the relay.
  */
 
-import { entropyIsSeeded, seedEntropy } from "./__standins__/seededEntropy";
+import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
-import { StandinHub } from "../engine/__standins__/hub";
-import { generateUserAction, runUserAction, STANDIN_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
+import { generateUserAction, runUserAction, FULL_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights } from "./faults";
 import { activity, checkClean, checkConvergence, checkNothingDestroyed, checkQuiet, checkTokens, type Violation } from "./invariants";
-import { VirtualClock } from "./__standins__/clock";
-import { SeededRandom } from "./__standins__/random";
+import { VirtualClock } from "./clock";
+import { SeededRandom } from "./random";
 import { SimDevice } from "./device";
+import { SimNet } from "./net";
 import type { CaseProfile } from "./vault";
 
 export interface SimConfig {
@@ -42,7 +43,9 @@ export interface SimConfig {
 	readonly maxGapMs?: number;
 	readonly healHorizonMs?: number;
 	/** Debug hook: called after every step ("<i>"), after heal ("heal") and before the checks ("end"). */
-	readonly observe?: (label: string, devs: readonly SimDevice[], hub: StandinHub) => void;
+	readonly observe?: (label: string, devs: readonly SimDevice[], net: SimNet) => void;
+	/** Debug hook: engine diagnostics lines per device. */
+	readonly log?: (device: string, line: string) => void;
 }
 
 export type Step =
@@ -64,7 +67,9 @@ export interface SimReport {
 		readonly files: number;
 		readonly faults: Readonly<Record<string, number>>;
 		readonly quiesceMs: number;
-		readonly hubPublished: number;
+		readonly relayHead: number;
+		/** Tokens app crashes legitimately lost (in no disk, trash or committed storage). */
+		readonly crashUnacked: number;
 		/** Editor saves that overwrote an unseen external write (Obsidian race, exempt). */
 		readonly clobbers: number;
 	};
@@ -78,7 +83,7 @@ function full(cfg: SimConfig) {
 		steps: cfg.steps ?? 120,
 		faults: cfg.faults === undefined ? null : cfg.faults,
 		faultRate: cfg.faultRate ?? 0.15,
-		ops: cfg.ops ?? STANDIN_OPS,
+		ops: cfg.ops ?? FULL_OPS,
 		initialFiles: cfg.initialFiles ?? 3,
 		maxGapMs: cfg.maxGapMs ?? 1_500,
 		healHorizonMs: cfg.healHorizonMs ?? 600_000,
@@ -121,21 +126,21 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		clock.onError = (e, label) => {
 			if (errors.length < 5) errors.push({ inv: "clean", detail: `timer ${label} threw: ${e instanceof Error ? e.message : String(e)}` });
 		};
-		const net = world.fork("net");
-		const hub = new StandinHub(clock, () => net.range(5, 150));
+		const nr = world.fork("net");
+		const net = new SimNet(clock, { seed: nr.int(0x7fffffff), linkMs: nr.range(5, 60), jitterMs: nr.range(0, 90) });
 		const devs = NAMES.slice(0, c.devices).map((name) => {
 			const dr = world.fork(`dev-${name}`);
 			const watch = dr.fork("watch");
 			return new SimDevice({
-				name, clock, hub, profile,
+				name, clock, net, profile,
 				mobile: dr.chance(0.3),
-				persistDelayMs: c.faults ? dr.pick([0, 0, 300, 2_000]) : 0,
+				log: cfg.log ? (line) => cfg.log!(name, `${clock.monotonic()} ${line}`) : undefined,
 				watcherDelayMs: c.faults ? () => watch.range(0, 400) : undefined,
 			});
 		});
 		const ledger = new TokenLedger();
-		const faults = new FaultState(clock, devs, hub, ledger);
-		const trace: string[] = [`world ${profile} ${devs.map((d) => `${d.name}:${d.platform.info.os}/persist=${d.opts.persistDelayMs}`).join(" ")}`];
+		const faults = new FaultState(clock, devs, net, ledger);
+		const trace: string[] = [`world ${profile} ${devs.map((d) => `${d.name}:${d.platform.info.os}`).join(" ")}`];
 
 		// Onboarding: files on A; some also on B (identical, or a different version).
 		const init = world.fork("init");
@@ -163,29 +168,45 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			const line = "user" in step ? await runUserAction(actorWorld, step.user, step.i) : faults.run(step.fault);
 			if (line.startsWith("skip")) skipped++;
 			trace.push(`${step.i} ${line}`);
-			cfg.observe?.(String(step.i), devs, hub);
+			cfg.observe?.(String(step.i), devs, net);
 		}
 
 		faults.heal();
 		trace.push("heal");
-		cfg.observe?.("heal", devs, hub);
+		cfg.observe?.("heal", devs, net);
 		const t0 = clock.monotonic();
 		let stable = 0;
 		let last = "";
 		for (let t = 0; t < c.healHorizonMs && stable < 5; t += 1_000) {
 			await clock.advance(1_000);
-			const idle = hub.quiet() && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty()));
-			const fp = `${activity(devs, hub)}|${devs.map((d) => [...d.vault.snapshot()].join(";")).join("|")}`;
+			const idle = net.quiet() && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty()));
+			const fp = `${activity(devs, net)}|${devs.map((d) => [...d.vault.snapshot()].join(";")).join("|")}`;
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
 		}
 		const quiesceMs = clock.monotonic() - t0;
 
-		cfg.observe?.("end", devs, hub);
+		cfg.observe?.("end", devs, net);
 		const violations: Violation[] = [...errors];
-		if (stable < 5) violations.push({ inv: "clean", detail: `no quiescence within ${c.healHorizonMs}ms` });
-		violations.push(...checkConvergence(devs, hub), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, hub, (i) => faults.isDown(i)));
-		violations.push(...(await checkQuiet(clock, devs, hub)));
+		if (stable < 5) {
+			const why: string[] = [];
+			if (!net.relay.quiescent()) why.push("relay busy");
+			if (net.relay.pendingCount() > 0) why.push(`relay pending ${net.relay.pendingCount()}`);
+			devs.forEach((d, i) => {
+				if (faults.isDown(i)) why.push(`${d.name} down`);
+				else if (!d.runtime.engine.isReady) why.push(`${d.name} not ready`);
+				else if (!(d.vrt?.log.isIdle() ?? false)) why.push(`${d.name} log busy`);
+				if (d.vault.pendingEvents() > 0) why.push(`${d.name} vault events`);
+				if (d.workspace.views_().some((v) => v.isDirty())) why.push(`${d.name} dirty view`);
+			});
+			const fp = `${activity(devs, net)}|${devs.map((d) => [...d.vault.snapshot()].join(";")).join("|")}`;
+			if (fp !== last) why.push(`activity ${activity(devs, net)}`);
+			violations.push({ inv: "clean", detail: `no quiescence within ${c.healHorizonMs}ms: ${why.join(", ") || "flapping"}` });
+		}
+		if (!(await faults.settle())) violations.push({ inv: "clean", detail: "crash inspections did not finish" });
+		const oracle = await net.oracle();
+		violations.push(...checkConvergence(devs, oracle), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)));
+		violations.push(...(await checkQuiet(clock, devs, net)));
 
 		const snap = [...(devs[0]?.vault.snapshot() ?? new Map<string, string>())].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 		const tokens = { live: 0, deleted: 0, unacked: 0 };
@@ -195,7 +216,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, files: snap.length, faults: { ...faults.counts }, quiesceMs, hubPublished: hub.stats.published, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0) },
+			stats: { steps: plan.length, skipped, tokens, files: snap.length, faults: { ...faults.counts }, quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0) },
 		};
 	} finally {
 		seedEntropy(null);

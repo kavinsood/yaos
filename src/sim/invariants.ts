@@ -1,8 +1,12 @@
 /**
- * Quiescence invariants (DESIGN §l.3), host-observable subset.
+ * Quiescence invariants (DESIGN §l.3).
  *
  *   1 convergence      same file set and byte-equal contents on every device;
- *                      every hub doc equals the disk; every markdown file has a hub doc
+ *                      the relay fold (a fresh observer bootstrapped from the
+ *                      relay, net.oracle()) equals the disk: every live markdown
+ *                      doc has its file with the same text, every markdown file
+ *                      has a live doc; every device's NsFoldState encodes to the
+ *                      same bytes; every resident body replica equals its file
  *   2 tokens           every live (not user-deleted, not crash-unacknowledged) token
  *                      survives somewhere in the converged vault (conflict copies count),
  *                      contiguous: "[A.15]" exactly, so a token split by a concurrent
@@ -12,27 +16,33 @@
  *   3 destroyed        every token that ever reached any disk is in the vault, in a
  *                      trash record, or was deleted by a user action. Exempt: text held
  *                      only in a pending (disk-error) conflict copy when the app crashed
- *   5 clean            engines ready, no vault events in flight, no dirty views,
- *                      no fatals, status counters drained, open bound views equal
- *                      their file, bindMismatch = defaultReloadWhileBound = 0
- *   quiet              no echo loop: after quiescence nothing publishes or writes
+ *   5 clean            relay quiet, engines ready and caught up to the relay head,
+ *                      ns not halted, no pending ns ops, no open intents, outbox and
+ *                      disk queues empty, no frozen docs, no fatals; no vault events
+ *                      in flight, no dirty views, open bound views equal their file,
+ *                      bindMismatch = defaultReloadWhileBound = 0
+ *   quiet              no echo loop: after quiescence nothing appends, writes, posts
+ *                      or saves
  *
- * INTEGRATION: 4 (fold determinism), the rest of 5 (outbox/held/adoptable/
- * cursors/intents) and 6 (resource bounds) need WP-A/WP-C introspection; add
- * them as extra checks fed by the real engine handles.
+ * Not checked here: 4 (fold determinism; WP-A's fold fuzz covers it) and 6
+ * (resource bounds; WP-C budget tests).
  */
 
-import type { StandinHub } from "../engine/__standins__/hub";
+import { encodeNsFoldV1 } from "../core/codec/nsFoldV1";
+import { checkNsInvariants } from "../core/ns/verify";
+import { pathKey } from "../core/paths/pathKey";
+import { NS_STREAM, type VaultPath } from "../core/types";
 import { tokensIn, type TokenLedger } from "./actors";
-import type { VirtualClock } from "./__standins__/clock";
+import type { VirtualClock } from "./clock";
 import type { SimDevice } from "./device";
+import type { OracleDoc, SimNet } from "./net";
 
 export interface Violation {
 	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet";
 	readonly detail: string;
 }
 
-const hubKey = (p: string) => p.normalize("NFC").toLowerCase();
+const relayKey = (p: string) => pathKey(p as VaultPath) as string;
 
 function files(d: SimDevice): Map<string, { path: string; text: string }> {
 	const out = new Map<string, { path: string; text: string }>();
@@ -44,7 +54,13 @@ function brief(s: string): string {
 	return JSON.stringify(s.length > 80 ? `${s.slice(0, 77)}...` : s);
 }
 
-export function checkConvergence(devs: readonly SimDevice[], hub: StandinHub): Violation[] {
+function hex(b: Uint8Array): string {
+	let h = 0x811c9dc5;
+	for (const x of b) h = Math.imul(h ^ x, 0x01000193) >>> 0;
+	return `${b.length}:${h.toString(16)}`;
+}
+
+export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly docs: readonly OracleDoc[]; readonly error: string | null }): Violation[] {
 	const out: Violation[] = [];
 	const first = devs[0];
 	if (!first) return out;
@@ -59,17 +75,34 @@ export function checkConvergence(devs: readonly SimDevice[], hub: StandinHub): V
 		}
 		for (const [k, m] of mine) if (!ref.has(k)) out.push({ inv: "convergence", detail: `${m.path} on ${d.name}, missing on ${first.name}` });
 	}
-	const byHubKey = new Map<string, { path: string; text: string }>();
-	for (const f of ref.values()) byHubKey.set(hubKey(f.path), f);
-	const hubKeys = new Set<string>();
-	for (const { key, path } of hub.list()) {
-		hubKeys.add(key);
-		const f = byHubKey.get(key);
-		const text = hub.text(key) ?? "";
-		if (!f) out.push({ inv: "convergence", detail: `hub doc ${path} has no file` });
-		else if (f.text !== text) out.push({ inv: "convergence", detail: `hub ${path}=${brief(text)} disk=${brief(f.text)}` });
+	if (oracle.error) out.push({ inv: "convergence", detail: `relay oracle: ${oracle.error}` });
+	const byKey = new Map<string, { path: string; text: string }>();
+	for (const f of ref.values()) byKey.set(relayKey(f.path), f);
+	const docKeys = new Set<string>();
+	for (const doc of oracle.docs) {
+		const k = relayKey(doc.path);
+		docKeys.add(k);
+		const f = byKey.get(k);
+		if (!f) out.push({ inv: "convergence", detail: `relay doc ${doc.path} has no file` });
+		else if (f.path !== doc.path) out.push({ inv: "convergence", detail: `relay path ${doc.path} vs disk ${f.path}` });
+		else if (doc.text !== null && f.text !== doc.text) out.push({ inv: "convergence", detail: `relay ${doc.path}=${brief(doc.text)} disk=${brief(f.text)}` });
 	}
-	for (const [k, f] of byHubKey) if (f.path.endsWith(".md") && !hubKeys.has(k)) out.push({ inv: "convergence", detail: `${f.path} never reached the hub` });
+	for (const [k, f] of byKey) if (f.path.endsWith(".md") && !docKeys.has(k)) out.push({ inv: "convergence", detail: `${f.path} never reached the relay` });
+	const folds = new Map<string, string[]>();
+	for (const d of devs) {
+		const st = d.vrt?.log.c.ns.state;
+		if (!st) continue;
+		const bad = checkNsInvariants(st);
+		if (bad) out.push({ inv: "convergence", detail: `${d.name}: ns invariant ${bad}` });
+		const h = hex(encodeNsFoldV1(st));
+		folds.set(h, [...(folds.get(h) ?? []), d.name]);
+		for (const [path, text] of d.vault.snapshot()) {
+			if (!path.endsWith(".md")) continue;
+			const crdt = d.engineText(path);
+			if (crdt !== null && crdt !== text) out.push({ inv: "convergence", detail: `${d.name}: body replica of ${path}=${brief(crdt)} disk=${brief(text)}` });
+		}
+	}
+	if (folds.size > 1) out.push({ inv: "convergence", detail: `NsFoldState bytes differ: ${[...folds].map(([h, n]) => `${n.join("")}=${h}`).join(" ")}` });
 	return out;
 }
 
@@ -120,20 +153,32 @@ export function checkNothingDestroyed(devs: readonly SimDevice[], ledger: TokenL
 	return out;
 }
 
-export function checkClean(devs: readonly SimDevice[], hub: StandinHub, isDown: (i: number) => boolean): Violation[] {
+export function checkClean(devs: readonly SimDevice[], net: SimNet, isDown: (i: number) => boolean): Violation[] {
 	const out: Violation[] = [];
 	const bad = (detail: string) => out.push({ inv: "clean", detail });
-	if (!hub.quiet()) bad("hub has queued or in-flight updates");
+	if (!net.quiet()) bad(`relay not quiet (pending ${net.relay.pendingCount()})`);
+	const head = net.streamHead(NS_STREAM);
 	devs.forEach((d, i) => {
 		const n = d.name;
 		if (isDown(i)) bad(`${n}: app still down`);
 		if (!d.runtime.engine.isReady) bad(`${n}: engine not ready`);
+		const rt = d.vrt;
+		if (!rt) bad(`${n}: no vault runtime`);
+		else {
+			const v = rt.log.nsView();
+			if (v.halted || v.overlayHalted) bad(`${n}: ns halted`);
+			if (!v.caughtUp || v.coversSeq < head) bad(`${n}: ns covers ${v.coversSeq} of head ${head}`);
+			if (v.pending.length > 0) bad(`${n}: ${v.pending.length} pending ns frames`);
+			if (!rt.log.isIdle()) bad(`${n}: log engine not idle`);
+			const intents = rt.rec.ctx.store.intents.size;
+			if (intents > 0) bad(`${n}: ${intents} open intents`);
+		}
 		if (d.vault.pendingEvents() > 0) bad(`${n}: ${d.vault.pendingEvents()} vault events in flight`);
 		if (d.ui.fatals.length > 0) bad(`${n}: fatal ${d.ui.fatals[0]?.code}`);
 		const st = d.ui.statuses[d.ui.statuses.length - 1];
 		if (st) {
 			const c = st.counts;
-			if (c.pendingDiskOps > 0 || c.outboxFrames > 0 || c.frozenDocs > 0) bad(`${n}: status pendingDiskOps=${c.pendingDiskOps} outbox=${c.outboxFrames} frozen=${c.frozenDocs}`);
+			if (c.pendingDiskOps > 0 || c.outboxFrames > 0 || c.frozenDocs > 0 || c.unreceiptedFrames > 0) bad(`${n}: status pendingDiskOps=${c.pendingDiskOps} outbox=${c.outboxFrames} unreceipted=${c.unreceiptedFrames} frozen=${c.frozenDocs}`);
 		}
 		for (const ws of d.workspaces) {
 			for (const v of ws.history) {
@@ -153,20 +198,21 @@ export function checkClean(devs: readonly SimDevice[], hub: StandinHub, isDown: 
 	return out;
 }
 
-export function activity(devs: readonly SimDevice[], hub: StandinHub): string {
-	const parts: (number | string)[] = [hub.stats.published, hub.stats.delivered];
+export function activity(devs: readonly SimDevice[], net: SimNet): string {
+	const rc = net.relay.counters();
+	const parts: (number | string)[] = [net.relay.head(), rc.appendFrames, rc.provisionalBroadcasts];
 	for (const d of devs) {
 		const b = d.runtime.bindings.stats;
-		parts.push(d.vault.calls.write, d.vault.calls.rename, d.vault.calls.trash, b.localUpdatesPosted, b.mergeUpdatesPosted, b.bindDeltasPosted, d.engine?.stats.docUpdatesSent ?? "-");
+		parts.push(d.vault.calls.write, d.vault.calls.rename, d.vault.calls.trash, b.localUpdatesPosted, b.mergeUpdatesPosted, b.bindDeltasPosted, d.sideFiles.writes);
 		for (const v of d.workspace.views_()) parts.push(v.counters.saves, v.counters.localTx, v.counters.remoteApplied);
 	}
 	return parts.join(",");
 }
 
-/** No echo loop: advancing `ms` after quiescence produces no publishes, writes, posts or saves. */
-export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[], hub: StandinHub, ms = 30_000): Promise<Violation[]> {
-	const before = activity(devs, hub);
+/** No echo loop: advancing `ms` after quiescence produces no appends, writes, posts or saves. */
+export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[], net: SimNet, ms = 30_000): Promise<Violation[]> {
+	const before = activity(devs, net);
 	await clock.advance(ms);
-	const after = activity(devs, hub);
+	const after = activity(devs, net);
 	return before === after ? [] : [{ inv: "quiet", detail: `activity after quiescence: ${before} -> ${after}` }];
 }

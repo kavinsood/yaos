@@ -1,4 +1,4 @@
-// Simulation suite (DESIGN §l) over the stand-in engine. Seeds: YAOS_SIM_SEEDS (default 200, the CI count).
+// Simulation suite (DESIGN §l) over the composed engine and SimRelay. Seeds: YAOS_SIM_SEEDS (default 200, the CI count).
 // A failure prints the seed, its violations and a ddmin-minimized plan to replay with runSim(cfg, plan).
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -7,8 +7,9 @@ import { DEFAULT_FAULTS } from "./faults";
 import { checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
 import { TokenLedger } from "./actors";
 import { SimDevice } from "./device";
-import { StandinHub } from "../engine/__standins__/hub";
-import { VirtualClock } from "./__standins__/clock";
+import { SimNet } from "./net";
+import { VirtualClock } from "./clock";
+import type { DocId, VaultPath } from "../core/types";
 
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
@@ -80,21 +81,22 @@ test("sim: ddmin reduces a plan to the steps a failure needs", async () => {
 
 // --- invariant self-tests: the checks must catch what they claim to catch ---------------------
 
-function twoDevices(): { clock: VirtualClock; hub: StandinHub; a: SimDevice; b: SimDevice } {
+function twoDevices(): { clock: VirtualClock; net: SimNet; a: SimDevice; b: SimDevice } {
 	const clock = new VirtualClock();
-	const hub = new StandinHub(clock, () => 10);
-	return { clock, hub, a: new SimDevice({ name: "A", clock, hub }), b: new SimDevice({ name: "B", clock, hub }) };
+	const net = new SimNet(clock, { linkMs: 10 });
+	return { clock, net, a: new SimDevice({ name: "A", clock, net }), b: new SimDevice({ name: "B", clock, net }) };
 }
 
-test("invariants: divergent bytes, a missing file and a doc that never reached the hub are reported", () => {
-	const { hub, a, b } = twoDevices();
+test("invariants: divergent bytes, a missing file and a doc that never reached the relay are reported", () => {
+	const { a, b } = twoDevices();
 	a.vault.userWrite("x.md", "one [A.1]\n");
 	b.vault.userWrite("x.md", "one [A.1]\nextra\n");
 	a.vault.userWrite("only-a.md", "a\n");
-	const v = checkConvergence([a, b], hub).map((x) => x.detail);
+	const v = checkConvergence([a, b], { docs: [{ docId: "d1" as DocId, path: "ghost.md" as VaultPath, kind: "markdown", text: "boo" }], error: null }).map((x) => x.detail);
 	assert.ok(v.some((d) => d.startsWith("x.md differs")), JSON.stringify(v));
 	assert.ok(v.some((d) => d === "only-a.md on A, missing on B"), JSON.stringify(v));
-	assert.ok(v.some((d) => d === "x.md never reached the hub"), JSON.stringify(v));
+	assert.ok(v.some((d) => d === "x.md never reached the relay"), JSON.stringify(v));
+	assert.ok(v.some((d) => d === "relay doc ghost.md has no file"), JSON.stringify(v));
 });
 
 test("invariants: a lost live token and a destroyed version are reported; deleted tokens are exempt", () => {

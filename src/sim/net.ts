@@ -7,7 +7,7 @@
  * the folded vault (live docs and their texts).
  */
 
-import type { DeviceId, DocId, VaultId, VaultPath } from "../core/types";
+import { NS_STREAM, type DeviceId, type DocId, type StreamName, type VaultId, type VaultPath } from "../core/types";
 import type { RelayConnectResult, RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { LogEngine } from "../engine/runtime/engine";
@@ -72,6 +72,13 @@ export class SimNet {
 		return `${this.relay.head()}`;
 	}
 
+	/** Seq of the last row of `stream` (GC'd rows included; the checkpoint's coversSeq if none). */
+	streamHead(stream: StreamName): number {
+		const rows = this.relay.rows(stream, { includeGc: true });
+		const last = rows[rows.length - 1];
+		return last ? last.seq : (this.relay.checkpoint(stream)?.coversSeq ?? 0);
+	}
+
 	/**
 	 * Bootstrap a fresh observer from the relay and read the folded vault.
 	 * Runs the clock (the caller must not be inside a clock step).
@@ -91,10 +98,10 @@ export class SimNet {
 		await started;
 		const eng = engine as LogEngine | null;
 		if (!eng) return { docs: [], error: error ?? "oracle start timed out" };
-		const head = this.relay.head();
+		const head = this.streamHead(NS_STREAM);
 		const ok = await this.clock.runUntil(() => eng.isIdle() && eng.nsView().caughtUp && eng.nsView().coversSeq >= head, horizonMs);
 		const docs: OracleDoc[] = [];
-		if (!ok) error = `oracle did not catch up (covers ${eng.nsView().coversSeq} of head ${head})`;
+		if (!ok) error = `oracle did not catch up (ns covers ${eng.nsView().coversSeq} of ${head})`;
 		for (const d of eng.listDocs()) {
 			if (d.state !== "live") continue;
 			let text: string | null = null;
@@ -110,7 +117,7 @@ export class SimNet {
 		const stopped = eng.stop();
 		let done = false;
 		void stopped.finally(() => (done = true));
-		await this.clock.runUntil(() => done, 30_000);
+		await this.clock.runUntil(() => done && this.quiet(), 30_000);
 		return { docs, error };
 	}
 }

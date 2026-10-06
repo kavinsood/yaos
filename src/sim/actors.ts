@@ -101,10 +101,10 @@ export type UserAction =
 
 export type OpWeights = Readonly<Record<UserAction["t"], number>>;
 
-/** What the stand-in engine supports (no deletes/renames: see wp-d-notes). */
-export const STANDIN_OPS: OpWeights = { type: 30, paste: 2, deleteToken: 6, open: 8, close: 4, switch: 3, mode: 2, create: 6, diskInsert: 8, diskDeleteToken: 3, rename: 0, delete: 0 };
-/** INTEGRATION: the full mix once WP-B/WP-C handle renames and deletes. */
-export const FULL_OPS: OpWeights = { ...STANDIN_OPS, rename: 3, delete: 2 };
+/** Edits only (no deletes/renames). */
+export const EDIT_OPS: OpWeights = { type: 30, paste: 2, deleteToken: 6, open: 8, close: 4, switch: 3, mode: 2, create: 6, diskInsert: 8, diskDeleteToken: 3, rename: 0, delete: 0 };
+/** The full mix (the default). */
+export const FULL_OPS: OpWeights = { ...EDIT_OPS, rename: 3, delete: 2 };
 
 const NAME_POOL = 8;
 const MAX_VIEWS = 3;
@@ -261,7 +261,11 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 			const path = pickOf(markdownFiles(d), a.file);
 			const cur = path ? d.vault.textOf(path) : null;
 			if (!path || cur === null) return `skip ${tag}: no file`;
-			for (const t of tokensIn(cur)) w.ledger.deleted(t);
+			// The user deletes what they see: the file, open editors on it, and
+			// everything the device's engine had integrated (the nsDelete's
+			// baseBodySeq covers those rows, DESIGN §c.7).
+			const seen = [cur, d.engineText(path) ?? "", ...d.workspace.views_().filter((v) => v.path === path).map((v) => v.buffer ?? "")];
+			for (const text of seen) for (const t of tokensIn(text)) w.ledger.deleted(t);
 			d.vault.userDelete(path);
 			return `${tag} ${path}`;
 		}

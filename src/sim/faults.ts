@@ -1,36 +1,57 @@
 /**
- * Seeded faults (DESIGN §l.2), the subset the host + stand-in engine can
- * express today: engine (worker) crash, whole-app crash with restart, offline
- * periods, vault I/O failures, backgrounding (hidden/pagehide/freeze), wall
- * clock jumps, slow watchers and engine persistence lag (per-device options
- * chosen in run.ts).
+ * Seeded faults (DESIGN §l.2) on the real stack (composed engine, SimRelay,
+ * MemStoragePort):
  *
- * INTEGRATION: relay faults (socket close points, relay restart/STREAM_RESEND,
- * dedupe expiry), crash at every StorageTx step and IDB wipe come with WP-A's
- * SimRelay/MemStoragePort and WP-C's engine; add them as FaultAction variants
- * here so plans and the minimizer cover them unchanged.
+ *   device     engine (worker) crash; whole-app crash + restart; crash at the
+ *              k-th next storage commit (before/after it lands); IndexedDB
+ *              wipe while the app is down (with or without the side-file
+ *              mirrors); IndexedDB connection lost while running; offline
+ *              periods; vault I/O failures; backgrounding; slow watchers (run.ts)
+ *   relay      socket drops (1006/1001/1011) at random points of the frame
+ *              flow; relay restart (STREAM_RESEND, unreceipted frames lost);
+ *              graceful drain; HTTP failures; daily limit; vault epoch reset
+ *   world      wall-clock jumps (monotonic intact)
+ *
+ * Token durability across an app crash: a token typed on the crashed device
+ * may be lost only if it was on no disk, in no trash and not in the device's
+ * committed storage (inspectStore over a crash copy, resolved asynchronously
+ * as the clock runs; settle() waits for every inspection before the checks).
  */
 
-import * as Y from "yjs";
-import type { StandinHub } from "../engine/__standins__/hub";
+import type { DeviceId, VaultEpoch } from "../core/types";
 import type { LifecycleEvent } from "../ports/platform";
 import type { TimerHandle } from "../ports/clock";
 import { tokensIn, type TokenLedger } from "./actors";
-import type { VirtualClock } from "./__standins__/clock";
-import type { SeededRandom } from "./__standins__/random";
+import type { VirtualClock } from "./clock";
+import type { SeededRandom } from "./random";
 import type { SimDevice } from "./device";
+import { inspectStore } from "./inspect";
+import type { SimNet } from "./net";
+import type { MemStoragePort } from "./storage";
 
 export type FaultAction =
 	| { readonly t: "engineCrash"; readonly dev: number }
 	| { readonly t: "appCrash"; readonly dev: number; readonly downMs: number }
+	| { readonly t: "commitCrash"; readonly dev: number; readonly commits: number; readonly when: "before" | "after"; readonly downMs: number }
+	| { readonly t: "idbWipe"; readonly dev: number; readonly mirrors: boolean; readonly downMs: number }
+	| { readonly t: "idbLost"; readonly dev: number }
 	| { readonly t: "offline"; readonly dev: number; readonly durationMs: number }
 	| { readonly t: "ioFail"; readonly dev: number; readonly ops: number }
 	| { readonly t: "background"; readonly dev: number; readonly event: "hidden" | "pagehide" | "freeze"; readonly durationMs: number }
-	| { readonly t: "clockSkew"; readonly deltaMs: number };
+	| { readonly t: "socketDrop"; readonly dev: number; readonly code: number }
+	| { readonly t: "relayRestart" }
+	| { readonly t: "relayDrain" }
+	| { readonly t: "httpFail"; readonly durationMs: number }
+	| { readonly t: "dailyLimit"; readonly durationMs: number }
+	| { readonly t: "epochReset" }
+	| { readonly t: "clockSkew"; readonly dev: number; readonly deltaMs: number };
 
 export type FaultWeights = Readonly<Record<FaultAction["t"], number>>;
 
-export const DEFAULT_FAULTS: FaultWeights = { engineCrash: 3, appCrash: 2, offline: 4, ioFail: 2, background: 3, clockSkew: 1 };
+export const DEFAULT_FAULTS: FaultWeights = {
+	engineCrash: 3, appCrash: 2, commitCrash: 2, idbWipe: 1, idbLost: 1, offline: 4, ioFail: 2, background: 3,
+	socketDrop: 4, relayRestart: 1, relayDrain: 1, httpFail: 1, dailyLimit: 0.5, epochReset: 0.3, clockSkew: 1,
+};
 
 export function generateFault(rng: SeededRandom, devices: number, weights: FaultWeights): FaultAction {
 	const dev = rng.int(devices);
@@ -47,29 +68,28 @@ export function generateFault(rng: SeededRandom, devices: number, weights: Fault
 	switch (kind) {
 		case "engineCrash": return { t: "engineCrash", dev };
 		case "appCrash": return { t: "appCrash", dev, downMs: rng.range(200, 20_000) };
+		case "commitCrash": return { t: "commitCrash", dev, commits: rng.range(1, 12), when: rng.chance(0.5) ? "before" : "after", downMs: rng.range(200, 10_000) };
+		case "idbWipe": return { t: "idbWipe", dev, mirrors: rng.chance(0.6), downMs: rng.range(200, 10_000) };
+		case "idbLost": return { t: "idbLost", dev };
 		case "offline": return { t: "offline", dev, durationMs: rng.range(1_000, 120_000) };
 		case "ioFail": return { t: "ioFail", dev, ops: rng.range(1, 3) };
 		case "background": return { t: "background", dev, event: rng.pick(["hidden", "pagehide", "freeze"] as const), durationMs: rng.range(100, 30_000) };
-		case "clockSkew": return { t: "clockSkew", deltaMs: (rng.chance(0.5) ? 1 : -1) * rng.range(60_000, 3 * 86_400_000) };
+		case "socketDrop": return { t: "socketDrop", dev, code: rng.pick([1006, 1006, 1001, 1011]) };
+		case "relayRestart": return { t: "relayRestart" };
+		case "relayDrain": return { t: "relayDrain" };
+		case "httpFail": return { t: "httpFail", durationMs: rng.range(1_000, 30_000) };
+		case "dailyLimit": return { t: "dailyLimit", durationMs: rng.range(5_000, 60_000) };
+		case "epochReset": return { t: "epochReset" };
+		case "clockSkew": return { t: "clockSkew", dev, deltaMs: (rng.chance(0.5) ? 1 : -1) * rng.range(60_000, 3 * 86_400_000) };
 	}
 }
 
-/** Tokens that survive an app crash of `d`: on any disk or in any trash, accepted by the hub, or in d's engine store. */
-export function durableTokens(devs: readonly SimDevice[], hub: StandinHub, d: SimDevice): Set<string> {
+/** Tokens on any disk or in any trash right now. */
+export function diskTokens(devs: readonly SimDevice[]): Set<string> {
 	const out = new Set<string>();
-	const add = (text: string | null) => {
-		if (text) for (const t of tokensIn(text)) out.add(t);
-	};
 	for (const x of devs) {
-		for (const text of x.vault.snapshot().values()) add(text);
-		for (const r of x.vault.trashed) add(r.text);
-	}
-	for (const { key } of hub.list()) add(hub.text(key));
-	for (const p of d.store.values()) {
-		const doc = new Y.Doc();
-		Y.applyUpdate(doc, p.state);
-		add(doc.getText("text").toString());
-		doc.destroy();
+		for (const text of x.vault.snapshot().values()) for (const t of tokensIn(text)) out.add(t);
+		for (const r of x.vault.trashed) for (const t of tokensIn(r.text)) out.add(t);
 	}
 	return out;
 }
@@ -77,14 +97,25 @@ export function durableTokens(devs: readonly SimDevice[], hub: StandinHub, d: Si
 export class FaultState {
 	private readonly down = new Set<number>();
 	private readonly offline = new Set<number>();
+	private readonly armed = new Set<number>();
 	private readonly backgrounded = new Map<number, LifecycleEvent>();
 	private readonly timers = new Set<TimerHandle>();
-	readonly counts: Record<FaultAction["t"], number> = { engineCrash: 0, appCrash: 0, offline: 0, ioFail: 0, background: 0, clockSkew: 0 };
+	private readonly inspections: Promise<void>[] = [];
+	private inspecting = 0;
+	private epochs = 0;
+	private httpFailing = false;
+	private limited = false;
+	/** Tokens an app crash legitimately lost (not durable anywhere). */
+	unacked = 0;
+	readonly counts: Record<FaultAction["t"], number> = {
+		engineCrash: 0, appCrash: 0, commitCrash: 0, idbWipe: 0, idbLost: 0, offline: 0, ioFail: 0, background: 0,
+		socketDrop: 0, relayRestart: 0, relayDrain: 0, httpFail: 0, dailyLimit: 0, epochReset: 0, clockSkew: 0,
+	};
 
 	constructor(
 		private readonly clock: VirtualClock,
 		private readonly devs: readonly SimDevice[],
-		private readonly hub: StandinHub,
+		private readonly net: SimNet,
 		private readonly ledger: TokenLedger,
 	) {}
 
@@ -101,51 +132,139 @@ export class FaultState {
 	}
 
 	run(f: FaultAction): string {
-		if (f.t === "clockSkew") {
-			this.clock.skewWall(f.deltaMs);
-			this.counts.clockSkew++;
-			return `fault clockSkew ${f.deltaMs}`;
+		switch (f.t) {
+			case "relayRestart":
+				this.net.relay.restart();
+				this.counts.relayRestart++;
+				return "fault relayRestart";
+			case "relayDrain":
+				this.net.relay.drain();
+				this.counts.relayDrain++;
+				return "fault relayDrain";
+			case "httpFail":
+				if (this.httpFailing) return "skip fault httpFail: already failing";
+				this.httpFailing = true;
+				this.net.relay.setHttpFailure(true);
+				this.counts.httpFail++;
+				this.later(f.durationMs, () => this.healHttp());
+				return `fault httpFail ${f.durationMs}ms`;
+			case "dailyLimit":
+				if (this.limited) return "skip fault dailyLimit: already limited";
+				this.limited = true;
+				this.net.relay.setDailyLimit(true, f.durationMs);
+				this.counts.dailyLimit++;
+				this.later(f.durationMs, () => this.healLimit());
+				return `fault dailyLimit ${f.durationMs}ms`;
+			case "epochReset": {
+				const epoch = `sim-epoch-reset-${++this.epochs}` as VaultEpoch;
+				this.net.relay.resetEpoch(epoch);
+				this.counts.epochReset++;
+				return `fault epochReset ${epoch}`;
+			}
+			default:
+				return this.runDevice(f);
 		}
+	}
+
+	private runDevice(f: Extract<FaultAction, { dev: number }>): string {
 		const d = this.devs[f.dev];
 		if (!d) return `skip fault ${f.t}: no device`;
 		const tag = `fault ${d.name} ${f.t}`;
 		if (this.down.has(f.dev)) return `skip ${tag}: app down`;
-		this.counts[f.t]++;
 		switch (f.t) {
 			case "engineCrash":
 				d.crashEngine();
-				return tag;
-			case "appCrash": {
-				const durable = durableTokens(this.devs, this.hub, d);
-				let lost = 0;
-				for (const e of this.ledger.live()) {
-					if (e.dev === d.name && !durable.has(e.token)) {
-						this.ledger.unacked(e.token);
-						lost++;
-					}
-				}
-				d.crashApp();
-				this.down.add(f.dev);
-				this.backgrounded.delete(f.dev);
-				this.later(f.downMs, () => this.restart(f.dev));
-				return `${tag} down ${f.downMs}ms (${lost} unacknowledged tokens)`;
+				break;
+			case "appCrash":
+				this.crash(f.dev, f.downMs, {});
+				this.counts.appCrash++;
+				return `${tag} down ${f.downMs}ms`;
+			case "commitCrash": {
+				if (this.armed.has(f.dev)) return `skip ${tag}: already armed`;
+				this.armed.add(f.dev);
+				const storage = d.storage;
+				let left = f.commits;
+				storage.setCommitHook(() => {
+					if (--left > 0) return "commit";
+					storage.setCommitHook(null);
+					queueMicrotask(() => {
+						if (!this.armed.delete(f.dev) || this.down.has(f.dev) || d.storage !== storage) return;
+						this.crash(f.dev, f.downMs, {});
+					});
+					return f.when === "before" ? "crash-before" : "crash-after";
+				});
+				this.counts.commitCrash++;
+				return `${tag} at +${f.commits} ${f.when}, down ${f.downMs}ms`;
 			}
+			case "idbWipe":
+				this.crash(f.dev, f.downMs, { wipe: true, dropMirrors: !f.mirrors });
+				this.counts.idbWipe++;
+				return `${tag} mirrors=${f.mirrors} down ${f.downMs}ms`;
+			case "idbLost":
+				void d.storage.listDatabases().then((names) => names.forEach((n) => d.storage.loseConnection(n)), () => undefined);
+				break;
 			case "offline":
 				if (this.offline.has(f.dev)) return `skip ${tag}: already offline`;
 				this.offline.add(f.dev);
 				d.setOnline(false);
 				this.later(f.durationMs, () => this.reconnect(f.dev));
+				this.counts.offline++;
 				return `${tag} ${f.durationMs}ms`;
 			case "ioFail":
 				d.vault.failNextOps += f.ops;
+				this.counts.ioFail++;
 				return `${tag} x${f.ops}`;
 			case "background":
 				if (this.backgrounded.has(f.dev)) return `skip ${tag}: already backgrounded`;
 				this.backgrounded.set(f.dev, f.event);
 				d.platform.emit(f.event);
 				this.later(f.durationMs, () => this.foreground(f.dev));
+				this.counts.background++;
 				return `${tag} ${f.event} ${f.durationMs}ms`;
+			case "socketDrop":
+				this.net.relay.dropSession(d.deviceId as DeviceId, f.code);
+				this.counts.socketDrop++;
+				return `${tag} ${f.code}`;
+			case "clockSkew":
+				d.wallSkewMs += f.deltaMs;
+				this.counts.clockSkew++;
+				return `${tag} ${f.deltaMs}`;
 		}
+		this.counts[f.t]++;
+		return tag;
+	}
+
+	/** App crash of device i (optionally with an IDB wipe); restart after downMs. */
+	private crash(i: number, downMs: number, o: { readonly wipe?: boolean; readonly dropMirrors?: boolean }): void {
+		const d = this.devs[i]!;
+		const onDisk = diskTokens(this.devs);
+		const candidates = this.ledger.live().filter((e) => e.dev === d.name && !onDisk.has(e.token)).map((e) => e.token);
+		const copy = d.crashApp(o);
+		this.armed.delete(i);
+		this.down.add(i);
+		this.backgrounded.delete(i);
+		this.later(downMs, () => this.restart(i));
+		if (candidates.length > 0) this.inspect(copy, d.deviceId as DeviceId, candidates);
+	}
+
+	private inspect(copy: MemStoragePort, deviceId: DeviceId, candidates: readonly string[]): void {
+		this.inspecting++;
+		this.inspections.push(inspectStore(this.clock, copy, deviceId).then((texts) => {
+			const kept = new Set<string>();
+			for (const t of texts) for (const tok of tokensIn(t)) kept.add(tok);
+			for (const tok of candidates) {
+				if (kept.has(tok) || this.ledger.entries.get(tok)?.state !== "live") continue;
+				this.ledger.unacked(tok);
+				this.unacked++;
+			}
+		}).finally(() => this.inspecting--));
+	}
+
+	/** Wait (running the clock) for every crash inspection. */
+	async settle(horizonMs = 120_000): Promise<boolean> {
+		if (this.inspecting > 0) await this.clock.runUntil(() => this.inspecting === 0, horizonMs);
+		await Promise.all(this.inspections);
+		return this.inspecting === 0;
 	}
 
 	private restart(i: number): void {
@@ -168,6 +287,16 @@ export class FaultState {
 		if (!this.down.has(i)) d.platform.emit(ev === "freeze" ? "resume" : "visible");
 	}
 
+	private healHttp(): void {
+		this.httpFailing = false;
+		this.net.relay.setHttpFailure(false);
+	}
+
+	private healLimit(): void {
+		this.limited = false;
+		this.net.relay.setDailyLimit(false);
+	}
+
 	/** All faults off: cancel pending fault timers, reconnect, restart, foreground, no I/O failures. */
 	heal(): void {
 		for (const h of this.timers) this.clock.clearTimer(h);
@@ -175,6 +304,10 @@ export class FaultState {
 		for (const i of [...this.offline]) this.reconnect(i);
 		for (const i of [...this.backgrounded.keys()]) this.foreground(i);
 		for (const i of [...this.down]) this.restart(i);
+		for (const i of [...this.armed]) this.devs[i]?.storage.setCommitHook(null);
+		this.armed.clear();
+		this.healHttp();
+		this.healLimit();
 		for (const d of this.devs) d.vault.failNextOps = 0;
 	}
 }
