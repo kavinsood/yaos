@@ -10,6 +10,7 @@ import { DEFAULT_BRAKE } from "../../../core/plan/brake";
 import type { VaultEvent } from "../../../ports/vault";
 import { DB_SCHEMA_VERSION, STORE_SPECS } from "../../store/schema";
 import type { ReconcileSettings } from "../context";
+import type { OwnFoldEvent } from "../deps";
 import { Reconciler } from "../reconciler";
 import type { DiskSchema } from "../store";
 import { FakeBlobs, FakeClock, FakeRandom } from "./fakes";
@@ -26,6 +27,8 @@ export interface WorldOptions {
 	readonly deviceLabel?: string;
 	/** §c.12 path-keyed bases from the previous epoch (ReconcilerDeps.pathBase). */
 	readonly pathBases?: ReadonlyMap<string, string>;
+	/** Queue own fold events for the reconciler to take (ReconcilerDeps.takeOwnFold), as the vault runtime does. */
+	readonly deferOwnFold?: boolean;
 }
 
 export const DB = "yaos2-test";
@@ -41,6 +44,7 @@ export class World {
 	readonly pending: VaultEvent[] = [];
 	readonly notices: { level: string; code: string; message: string }[] = [];
 	readonly brakes: BrakeReport[] = [];
+	readonly ownQueue: OwnFoldEvent[] = [];
 	private rec: Reconciler | null = null;
 
 	constructor(readonly opts: WorldOptions = {}) {
@@ -66,8 +70,9 @@ export class World {
 			notice: (level, code, message) => this.notices.push({ level, code, message }),
 			onBrake: (report) => this.brakes.push(report),
 			pathBase: this.opts.pathBases ? (key) => this.opts.pathBases!.get(key) ?? null : undefined,
+			...(this.opts.deferOwnFold ? { takeOwnFold: () => this.ownQueue.splice(0) } : {}),
 		});
-		this.log.onOwnFold = (events) => rec.applyOwnFold(events);
+		this.log.onOwnFold = this.opts.deferOwnFold ? async (events) => void this.ownQueue.push(...events) : (events) => rec.applyOwnFold(events);
 		this.rec = rec;
 		this.pending.length = 0; // the listing below covers everything that happened before boot
 		await rec.start();
@@ -104,6 +109,7 @@ export class World {
 		this.clock.onYield = null;
 		this.rec = null;
 		this.pending.length = 0;
+		this.ownQueue.length = 0;
 		this.clock.advance(5_000);
 		return this.boot();
 	}

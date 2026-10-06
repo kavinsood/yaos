@@ -202,6 +202,7 @@ export class VaultRuntime {
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
 			notice: this.notice, onBrake: (r) => this.onBrake(r), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
 			pathBaseKeys: o.pathBases ? new Set(o.pathBases.keys()) : undefined,
+			takeOwnFold: () => this.takeOwnFold(),
 		});
 		await this.rec.start();
 		if (this.settings.syncSettings) {
@@ -312,13 +313,16 @@ export class VaultRuntime {
 
 	// ---- passes ---------------------------------------------------------------------
 
+	/** S1 events for the reconciler, which applies them right before a plan reads the view. */
+	private takeOwnFold(): readonly OwnFoldEvent[] {
+		const q = this.ownQueue;
+		if (q.length === 0) return q;
+		this.ownQueue = [];
+		this.mirror.markDirty();
+		return q;
+	}
+
 	private async runPass(scope: PlanScope): Promise<PassReport> {
-		if (this.ownQueue.length > 0) {
-			const q = this.ownQueue;
-			this.ownQueue = [];
-			await this.rec.applyOwnFold(q);
-			this.mirror.markDirty();
-		}
 		if (this.idbSnapshotDue) {
 			// §i.5: snapshot the disk state the recovered DB is about to reconcile against.
 			this.idbSnapshotDue = false;

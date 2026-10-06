@@ -16,7 +16,7 @@ import type { RandomPort } from "../../ports/random";
 import type { TrashMode, VaultStat } from "../../ports/vault";
 import { LANE, type DiskOp, type DiskOpResult, type DiskReadResult, type Lane } from "../../protocol/messages";
 import type { SyncedRecord } from "../store/schema";
-import type { DiskGateway, LogPort } from "./deps";
+import type { DiskGateway, LogPort, OwnFoldEvent } from "./deps";
 import { EchoTable } from "./echo";
 import { classify, compileExcludes, toRecord, type Classified, type ClassifySettings } from "./localState";
 import type { DiskChange, DiskSchema, ReconcileStore } from "./store";
@@ -60,6 +60,11 @@ export interface ReconcilerDeps {
 	readonly pathBase?: (key: PathKey) => string | null;
 	/** The keys `pathBase` answers for (the planner's migrated-loser merge). */
 	readonly pathBaseKeys?: ReadonlySet<PathKey>;
+	/**
+	 * Own ns ops folded since the last call (S1, §c.13), handed over and forgotten. A pass applies them right
+	 * before its plan reads the view, so no plan sees a folded own op without its synced update.
+	 */
+	readonly takeOwnFold?: () => readonly OwnFoldEvent[];
 }
 
 export const BRAKE_WINDOW_MS = 10 * 60_000;

@@ -137,6 +137,11 @@ export class Reconciler {
 		const openIntents = await resumeIntents(this.env);
 		await this.scan.hashPending();
 		await recoverTempNames(this.env);
+		// S1 for own ops that folded up to now, the awaits above included. Nothing may await between the last
+		// drain and the view read: a plan that sees a folded own op before its S1 update writes S from the new
+		// entry (a materialize at a suffixed restore path, a loser rename), and the late S1 then moves S back
+		// onto the requested path, where another doc's file may be.
+		for (let q = ctx.deps.takeOwnFold?.() ?? []; q.length > 0; q = ctx.deps.takeOwnFold?.() ?? []) await applyOwnFold(ctx, q);
 		this.scan.dirty.clear();
 		ctx.echo.sweep();
 		const view = ctx.log.view();
