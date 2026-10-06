@@ -7,8 +7,8 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
-import * as Y from "yjs";
 import type { DeviceId, DocId, VaultId } from "../../src/core/types";
+import { applyChanges, type ChangeSink } from "../../src/engine/body/textChanges";
 import { createIdbStoragePort } from "../../src/engine/adapters/idbStorage";
 import { createNoopCrypto } from "../../src/engine/adapters/noopCrypto";
 import { createWebClock } from "../../src/engine/adapters/webClock";
@@ -117,8 +117,8 @@ export class Device {
 	factory = new IDBFactory();
 	readonly side = new MemSideFiles();
 	engine: LogEngine | null = null;
-	/** Host-side Y.Docs for bound docs, fed by onDocUpdate (what an editor would see). */
-	readonly hosts = new Map<DocId, Y.Doc>();
+	/** Bound editors' texts: the bind text, then every onBoundText change (what main's editor would show). */
+	readonly hosts = new Map<DocId, string>();
 	private readonly waiters = new Set<() => void>();
 	constructor(readonly name: string, readonly dev: OnboardDevice) {}
 
@@ -142,10 +142,16 @@ export class Device {
 			clientVersion: "wpc-e2e",
 			sideFiles: this.side,
 			tuning,
-			onDocUpdate: (id, u) => {
-				const d = this.hosts.get(id);
-				if (!d) return;
-				Y.applyUpdate(d, u, "engine");
+			onBoundText: (id, changes, _length, origin) => {
+				const text = this.hosts.get(id);
+				if (text === undefined || origin === "editor") return; // "editor" = this device's own typing, already shown
+				const v = { text };
+				const sink: ChangeSink = {
+					insert: (i, t) => void (v.text = v.text.slice(0, i) + t + v.text.slice(i)),
+					delete: (i, n) => void (v.text = v.text.slice(0, i) + v.text.slice(i + n)),
+				};
+				applyChanges(sink, changes);
+				this.hosts.set(id, v.text);
 				for (const w of [...this.waiters]) w();
 			},
 		});
@@ -163,31 +169,28 @@ export class Device {
 		this.factory = new IDBFactory();
 	}
 
-	async bind(id: DocId): Promise<Y.Doc> {
-		const d = new Y.Doc();
-		Y.applyUpdate(d, (await this.e.bind(id)).state, "engine");
-		// Host edits (typing) go to the engine as keystroke updates; engine updates are tagged "engine".
-		d.on("update", (u: Uint8Array, origin: unknown) => {
-			if (origin !== "engine") this.e.applyLocalUpdate(id, u);
-		});
-		this.hosts.set(id, d);
-		return d;
+	async bind(id: DocId): Promise<string> {
+		await this.e.bind(id);
+		const text = this.e.boundText(id);
+		this.hosts.set(id, text);
+		return text;
 	}
 
-	/** Type into a bound doc like an editor: one Yjs transaction, forwarded via applyLocalUpdate. */
+	/** Type at the end of a bound doc like an editor: one change set (CodeMirror JSON), applied via applyEditorChanges. */
 	type(id: DocId, s: string): void {
-		const t = this.hosts.get(id)?.getText("text");
-		if (!t) throw new Error(`${this.name}: ${id} not bound`);
-		t.insert(t.length, s);
+		const text = this.hosts.get(id);
+		if (text === undefined) throw new Error(`${this.name}: ${id} not bound`);
+		const changes = text.length > 0 ? [text.length, [0, ...s.split("\n")] as [number, ...string[]]] : [[0, ...s.split("\n")] as [number, ...string[]]];
+		if (!this.e.applyEditorChanges(id, changes)) throw new Error(`${this.name}: ${id} editor out of sync`);
+		this.hosts.set(id, text + s);
 	}
 
 	/** Resolves when the bound host doc's text satisfies pred (event-driven, no polling). */
 	hostText(id: DocId, pred: (s: string) => boolean, timeoutMs: number): Promise<void> {
-		const d = this.hosts.get(id);
-		if (!d) return Promise.reject(new Error(`${this.name}: ${id} not bound`));
+		if (!this.hosts.has(id)) return Promise.reject(new Error(`${this.name}: ${id} not bound`));
 		return new Promise((resolve, reject) => {
 			const check = () => {
-				if (!pred(d.getText("text").toString())) return;
+				if (!pred(this.hosts.get(id) ?? "")) return;
 				this.waiters.delete(check);
 				clearTimeout(t);
 				resolve();

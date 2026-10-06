@@ -11,9 +11,9 @@
 import type { ContentHash, DocId, NsBlobRef, NsOp, PlannerOp, VaultPath } from "../../core/types";
 import { markdownContentHash } from "../../core/hash/markdownLf";
 import { restartAtCreate } from "../../core/plan/planner";
-import type { DiskOpResult } from "../../protocol/messages";
-import type { VaultStat, WriteOutcome } from "../../ports/vault";
+import type { VaultStat } from "../../ports/vault";
 import type { Ctx } from "./context";
+import type { ExecResult, WrittenOk } from "./deps";
 import type { Scanner } from "./scan";
 import { makeBase } from "./store";
 
@@ -33,11 +33,11 @@ export interface Env {
 
 type Op<K extends PlannerOp["op"]> = Extract<PlannerOp, { op: K }>;
 
-export function writeOk(res: DiskOpResult): Extract<WriteOutcome, { ok: true }> | null {
+export function writeOk(res: ExecResult): WrittenOk | null {
 	return res.t === "write" && res.outcome.ok ? res.outcome : null;
 }
 
-export function moveOk(res: DiskOpResult): VaultStat | null {
+export function moveOk(res: ExecResult): VaultStat | null {
 	return (res.t === "rename" || res.t === "trash") && res.outcome.ok ? res.outcome.stat : null;
 }
 

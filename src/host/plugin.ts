@@ -11,10 +11,10 @@ import { createWebEngine } from "../engine/adapters/webEngine";
 import { createInlinePair } from "../protocol/inlineTransport";
 import { createWorkerHostTransport, type WorkerLike } from "../protocol/workerTransport";
 import { workerScript } from "./bundleSource";
-import { attachCollab, collabCompartmentExtension, editorViewOf } from "./collab";
+import { codeMirrorEditors, collabExtension } from "./collab";
 import { ObsidianConfigDir } from "./configDir";
 import type { EngineCarrier } from "./engineHost";
-import { createHasher, webCryptoHashPort } from "./hashing";
+import { engineHashOracle } from "./hashOracle";
 import { HostRuntime } from "./hostRuntime";
 import type { VaultApi } from "./obsidianApi";
 import { ObsidianVault } from "./obsidianVault";
@@ -81,29 +81,29 @@ export default class YaosPlugin extends Plugin {
 		const vaultApi = app.vault as unknown as VaultApi;
 		const pluginDir = this.manifest.dir ?? `${app.vault.configDir}/plugins/${this.manifest.id}`;
 		const clock = browserClock();
-		const hasher = createHasher(webCryptoHashPort());
+		// Main never hashes (DESIGN §d.2, §f.2): vault preconditions are hashed by the running engine. The vault
+		// outlives runtimes (the controller makes a new one per start), so it asks whichever is live.
+		let live: HostRuntime | null = null;
+		const hashes = engineHashOracle((body) => (live ? live.engine.request(body) : Promise.reject(new Error("sync engine not running"))));
 		const insensitive = (app.vault.adapter as unknown as { insensitive?: unknown }).insensitive;
 		const caseInsensitive = typeof insensitive === "boolean" ? insensitive : Platform.isMacOS || Platform.isWin || Platform.isIosApp;
-		const vault = new ObsidianVault(vaultApi, hasher, caseInsensitive);
+		const vault = new ObsidianVault(vaultApi, hashes, caseInsensitive);
 		const configDir = new ObsidianConfigDir(vaultApi.adapter, app.vault.configDir);
 		const sideFiles = new ObsidianSideFiles(vaultApi.adapter, pluginDir);
 		const platform = new BrowserPlatform(platformInfoFrom(Platform, navigator as never, typeof Worker !== "undefined"), document, window, navigator);
-		const workspace = new ObsidianWorkspace(app.workspace as unknown as WorkspaceLike, (editor, spec) => {
-			const cm = editorViewOf(editor);
-			return cm ? attachCollab(cm, spec) : null;
-		});
-		this.registerEditorExtension(collabCompartmentExtension());
+		const workspace = new ObsidianWorkspace(app.workspace as unknown as WorkspaceLike, codeMirrorEditors);
+		this.registerEditorExtension(collabExtension());
 		this.register(() => workspace.dispose());
 
 		const data = sanitizePluginData(await this.loadData(), defaultDeviceName(Platform));
 		const controller = new YaosController(data, {
 			makeRuntime: (identity, settings, ui) =>
-				new HostRuntime({
-					clock, vault, configDir, sideFiles, workspace, platform, hasher, identity, settings, ui,
+				(live = new HostRuntime({
+					clock, vault, configDir, sideFiles, workspace, platform, identity, settings, ui,
 					createWorker: workerCarrier,
 					createInline: inlineCarrier,
 					log: (line) => console.debug(`[yaos] ${line}`),
-				}),
+				})),
 			saveData: (d) => this.saveData(d),
 			notice: (_level, message, timeoutMs) => new Notice(message, timeoutMs),
 			log: (line) => console.debug(`[yaos] ${line}`),

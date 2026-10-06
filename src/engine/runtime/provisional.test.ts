@@ -1,41 +1,42 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import * as Y from "yjs";
 import type { DocId } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
+import { applyChanges, type TextChanges } from "../body/textChanges";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 
-/** A host view: its own Y.Doc fed by bind() + onDocUpdate, typing through applyLocalUpdate. */
+/** A bound editor as main keeps it: bind() + boundText, onBoundText changes from others, typing via applyEditorChanges. */
 class View {
-	readonly doc = new Y.Doc();
+	text = "";
 	constructor(readonly engine: LogEngine, readonly docId: DocId) {}
 	async open(): Promise<void> {
-		const b = await this.engine.bind(this.docId);
-		Y.applyUpdate(this.doc, b.state, "engine");
-		this.doc.on("update", (u: Uint8Array, origin: unknown) => {
-			if (origin !== "engine") this.engine.applyLocalUpdate(this.docId, u);
-		});
+		await this.engine.bind(this.docId);
+		this.text = this.engine.boundText(this.docId);
 	}
-	type(s: string, at = this.doc.getText("text").length): void {
-		this.doc.getText("text").insert(at, s);
+	receive(changes: TextChanges): void {
+		applyChanges({
+			insert: (i, t) => void (this.text = this.text.slice(0, i) + t + this.text.slice(i)),
+			delete: (i, n) => void (this.text = this.text.slice(0, i) + this.text.slice(i + n)),
+		}, changes);
 	}
-	get text(): string {
-		return this.doc.getText("text").toString();
+	type(s: string, at = this.text.length): void {
+		const changes: TextChanges = at > 0 ? [at, [0, s]] : [[0, s]];
+		if (this.text.length > at) changes.push(this.text.length - at);
+		assert.ok(this.engine.applyEditorChanges(this.docId, changes));
+		this.text = this.text.slice(0, at) + s + this.text.slice(at);
 	}
 }
 
 async function pair(relay: SimRelay) {
 	const views = new Map<string, View>();
-	const forward = (dev: string) => (docId: DocId, u: Uint8Array) => {
-		const v = views.get(`${dev}:${docId}`);
-		if (v) Y.applyUpdate(v.doc, u, "engine");
-	};
 	const origins: Record<string, string[]> = { a: [], b: [] };
-	const mk = (dev: "a" | "b") => startTestEngine({ relay, deviceId: `dev-${dev}`, extra: { onDocUpdate: (d, u, o) => {
-		origins[dev]!.push(o);
-		forward(dev)(d, u);
-	} } });
+	const mk = (dev: "a" | "b") => startTestEngine({ relay, deviceId: `dev-${dev}`, extra: {
+		onBoundText: (d: DocId, changes: TextChanges, _length: number, o: string) => {
+			origins[dev]!.push(o);
+			if (o !== "editor") views.get(`${dev}:${d}`)?.receive(changes);
+		},
+	} });
 	const { engine: a } = await mk("a");
 	const { engine: b } = await mk("b");
 	await until(() => a.status().phase === "live" && b.status().phase === "live", 3_000, "live");

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Worker } from "node:worker_threads";
-import type { DocId, DeviceId, VaultId, DiskFingerprint } from "../core/types";
+import type { DocId, DeviceId, VaultId } from "../core/types";
 import type { EngineToMain, MainToEngine } from "./messages";
 import type { EngineTransport, HostTransport } from "./transport";
 import { createInlinePair } from "./inlineTransport";
@@ -108,13 +108,18 @@ function mainTrace(): MainToEngine[] {
 		},
 		{ t: "ping", rid: 2 },
 		{ t: "openDoc", rid: 3, path: "a.md", viewId: 7 },
-		{ t: "localUpdate", docId: D1, update: bytes(1, 0, 1), origin: "editor" },
-		{ t: "bindDelta", docId: D1, update: bytes(0, 0) },
+		{ t: "textChunk", uploadId: 1, bytes: bytes(104, 0, 105, 0), last: true },
+		{ t: "bodyAttach", docId: D1, viewId: 7, editor: 1, base: null, saved: 1 },
+		{ t: "bodyPush", docId: D1, viewId: 7, seq: 1, base: 0, after: null, changes: [2, [0, " world"], [1]] },
+		{ t: "bodyPush", docId: D1, viewId: 7, seq: 2, base: 0, after: 1, changes: [8, [0, "", "x"]] },
+		{ t: "bodyReload", docId: D1, viewId: 7, reload: 1, text: 2 },
+		{ t: "bodySaveMark", docId: D1, viewId: 7, version: 3, seq: null },
+		{ t: "hashRequest", rid: 4, items: [{ path: "a.md", want: "fingerprint", bytes: bytes(1) }, { path: "b.md", want: "contentHash", bytes: bytes(2, 3) }] },
+		{ t: "closeDoc", docId: D1, viewId: 7 },
 		{ t: "vaultEvents", events: [{ t: "modify", path: "b.md", stat: { path: "b.md", size: 3, mtimeMs: 5, ctimeMs: 1 } }, { t: "rename", from: "x/a.md", to: "y/a.md", stat: null }] },
 		{ t: "result", re: 1, value: { t: "reads", results: [{ path: "b.md", ok: true, stat: { path: "b.md", size: 3, mtimeMs: 5, ctimeMs: 1 }, bytes: bytes(97, 98, 99) }, { path: "c.md", ok: false, reason: "missing", stat: null }] } },
 		{ t: "result", re: 2, value: { t: "sideFile", bytes: bytes(4, 4) } },
 		{ t: "result", re: 3, value: { t: "sideFile", bytes: null } },
-		{ t: "boundSaved", docId: D1, path: "a.md", text: "hello\n", fingerprint: "ff" as DiskFingerprint, stat: { path: "a.md", size: 6, mtimeMs: 9, ctimeMs: 1 } },
 		{ t: "docCredit", bytes: 3 },
 		{ t: "lifecycle", event: "pagehide" },
 		{ t: "error", re: 4, error: { code: "timeout", message: "t", retryable: true } },
@@ -125,8 +130,14 @@ function engineTrace(): EngineToMain[] {
 	return [
 		{ t: "result", re: 1, value: { t: "ready", protocolVersion: 1, vaultEpoch: "e1", recovered: false } },
 		{ t: "result", re: 2, value: { t: "pong" } },
-		{ t: "result", re: 3, value: { t: "bind", bind: { docId: D1, kind: "markdown", state: bytes(1, 2), stateVector: bytes(0), baseText: "hi", baseHash: null, frozen: false } } },
-		{ t: "docUpdate", docId: D1, update: bytes(5, 5, 5), origin: "remote" },
+		{ t: "result", re: 3, value: { t: "bind", bind: { docId: D1, kind: "markdown", frozen: false } } },
+		{ t: "body", docId: D1, weight: 40, event: { t: "bound", viewId: 7, attach: 1, version: 0, changes: [2], length: 2 } },
+		{ t: "body", docId: D1, weight: 60, event: { t: "entry", from: 0, to: 1, changes: [2, [0, "!"]], length: 3, origin: "remote", author: null } },
+		{ t: "body", docId: D1, weight: 60, event: { t: "entry", from: 1, to: 2, changes: [3, [0, " world"]], length: 9, origin: "editor", author: { viewId: 7, seq: 1 } } },
+		{ t: "body", docId: D1, weight: 30, event: { t: "reject", viewId: 7, seq: 2, version: 2 } },
+		{ t: "body", docId: D1, weight: 20, event: { t: "durable", version: 2 } },
+		{ t: "body", docId: D1, weight: 30, event: { t: "reloaded", viewId: 7, reload: 1, save: true } },
+		{ t: "result", re: 4, value: { t: "hashes", values: [{ hash: "ff", textLength: 1 }, { hash: "ee", textLength: 2 }] } },
 		{ t: "readRequest", rid: 1, reads: [{ area: "vault", path: "b.md", maxBytes: 100 }] },
 		{
 			t: "diskOps",
@@ -196,14 +207,14 @@ test("transferablesOf: lists every [T] buffer and rejects non-owned views", () =
 	for (const m of all) assert.equal(transferablesOf(m).length, tBuffers(m).length, m.t);
 	const big = new Uint8Array(16);
 	const view = big.subarray(4, 8);
-	assert.throws(() => transferablesOf({ t: "localUpdate", docId: D1, update: view, origin: "editor" }), TransferOwnershipError);
+	assert.throws(() => transferablesOf({ t: "textChunk", uploadId: 1, bytes: view, last: true }), TransferOwnershipError);
 	const fixed = owned(view);
 	assert.notEqual(fixed.buffer, big.buffer);
 	assert.equal(fixed.byteLength, 4);
 	assert.equal(owned(big), big, "owned() keeps exclusively owned buffers");
 	const shared = new Uint8Array(4);
 	assert.throws(
-		() => transferablesOf({ t: "result", re: 1, value: { t: "bind", bind: { docId: D1, kind: "markdown", state: shared, stateVector: shared, baseText: null, baseHash: null, frozen: false } } }),
+		() => transferablesOf({ t: "hashRequest", rid: 1, items: [{ path: "a.md", want: "fingerprint", bytes: shared }, { path: "b.md", want: "fingerprint", bytes: shared }] }),
 		TransferOwnershipError,
 	);
 });
@@ -217,7 +228,7 @@ test("worker and inline carriers deliver identical results on the recorded trace
 	assert.deepEqual(inline.atHost, engineTrace(), "inline: host got the trace");
 	assert.deepEqual(worker.atEngine, inline.atEngine, "parity main->engine");
 	assert.deepEqual(worker.atHost, inline.atHost, "parity engine->main");
-	assert.ok(inline.detached.length > 10);
+	assert.ok(inline.detached.length >= 8, `${inline.detached.length} buffers`);
 	assert.ok(inline.detached.every(Boolean), "inline detaches transferred buffers");
 	assert.ok(worker.detached.every(Boolean), "worker detaches transferred buffers");
 	assert.deepEqual(inline.detached, worker.detached);
@@ -280,7 +291,7 @@ test("worker_threads: a real thread round-trips through the worker carrier with 
 		const { createWorkerEngineTransport, postOwned } = load(${JSON.stringify(new URL("./workerTransport.ts", import.meta.url).pathname)});
 		const t = createWorkerEngineTransport(scope);
 		t.onMessage((m) => {
-			if (m.t === "localUpdate") postOwned(t, { t: "docUpdate", docId: m.docId, update: m.update, origin: "remote" });
+			if (m.t === "textChunk") postOwned(t, { t: "result", re: m.uploadId, value: { t: "reads", results: [{ path: "a.md", ok: true, stat: null, bytes: m.bytes }] } });
 			if (m.t === "ping") t.post({ t: "result", re: m.rid, value: { t: "pong" } });
 		});
 	`;
@@ -297,13 +308,13 @@ test("worker_threads: a real thread round-trips through the worker carrier with 
 	const got: EngineToMain[] = [];
 	host.onMessage((m) => got.push(m));
 	const update = bytes(1, 2, 3, 4);
-	postOwned(host, { t: "localUpdate", docId: D1, update, origin: "editor" });
+	postOwned(host, { t: "textChunk", uploadId: 8, bytes: update, last: true });
 	assert.equal(update.byteLength, 0, "transferred to the thread");
 	host.post({ t: "ping", rid: 9 });
 	for (let i = 0; i < 400 && got.length < 2; i++) await tick();
 	host.close();
 	assert.deepEqual(got, [
-		{ t: "docUpdate", docId: D1, update: bytes(1, 2, 3, 4), origin: "remote" },
+		{ t: "result", re: 8, value: { t: "reads", results: [{ path: "a.md", ok: true, stat: null, bytes: bytes(1, 2, 3, 4) }] } },
 		{ t: "result", re: 9, value: { t: "pong" } },
 	]);
 });

@@ -495,7 +495,7 @@ vault" and the person fields are rows in §3.4, §3.5 and §4.
 |---|---|---|---|
 | Safety brake on mass destructive changes | adfa7a7:src/runtime/reconcile/safetyBrakePolicy.ts:22, :25, :68 (never called outside tests; adfa7a7:src/runtime/reconciliationController.ts:514 hard-codes `safetyBrakeTriggered: false`) | src/core/plan/brake.ts:33; src/core/limits.ts:99-103; src/host/ui/brake.ts:68; src/host/ui/brakeModal.ts:9; src/host/ui/registerUi.ts:162-168 | ported (live now, DESIGN §f.5) |
 | Recovery-loop quarantines (amplification, fingerprint) | adfa7a7:src/runtime/reconcile/amplificationQuarantinePolicy.ts:29, :95; adfa7a7:src/runtime/reconcile/fingerprintQuarantinePolicy.ts:28, :104 | MISSING (bounded planner and the brake) | dropped: DESIGN §m.2 (`runtime/reconcile/*` policies) |
-| Live editor binding (y-codemirror) | adfa7a7:src/sync/editorBinding.ts:181 | src/host/binding.ts:133 | ported (DESIGN §d.2) |
+| Live editor binding (legacy: y-codemirror over a main-thread Y.Doc) | adfa7a7:src/sync/editorBinding.ts:181 | src/host/binding.ts:95; src/host/collab.ts:60; src/host/bodyClient.ts:64 (CodeMirror ChangeSets against the worker replica, no CRDT on main) | ported (reworked onto the worker replica: DESIGN §d.2, §d.3) |
 | Bind-divergence decisions (adopt body or adopt editor) | adfa7a7:src/sync/editorBinding.ts:146 | MISSING (one `MergeFn` plus a conflict copy) | dropped: DESIGN §m.2 (merge and divergence policies) |
 | No sync write into the file open in an editor | adfa7a7:src/sync/diskMirror.ts:1836 | src/host/diskExecutor.ts:16-18, :162 | ported |
 | Full-document IndexedDB persistence | adfa7a7:src/sync/vaultIndexedDb.ts:279 | MISSING (snapshot, tail and outbox stores) | dropped: DESIGN §m.2 (full-doc IDB persistence) |

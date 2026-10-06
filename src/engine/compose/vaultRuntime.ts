@@ -34,6 +34,7 @@ import type { FrameNoFloor } from "../store/repo";
 import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
 import { SnapshotJob } from "../snapshots/snapshotJob";
 import type { FoldedNsFrame } from "../sync/nsRuntime";
+import type { BoundDisk } from "./boundDisk";
 import type { BoundDocs } from "./boundDocs";
 import { foldEffects } from "./foldBridge";
 import type { HostLink } from "./hostLink";
@@ -50,6 +51,7 @@ export type RestartReason = "retry" | "epoch" | "storage-lost" | "rebuild" | "se
 export interface RuntimeOwner {
 	readonly link: HostLink;
 	readonly bound: BoundDocs;
+	readonly boundDisk: Pick<BoundDisk, "checkSaved" | "pendingConflictCopies">;
 	onEpochChanged(epoch: VaultEpoch | null): void;
 	onStorageLost(): void;
 }
@@ -148,7 +150,8 @@ export class VaultRuntime {
 			ports: o.ports, vaultId: config.vaultId, deviceId: config.deviceId, deviceClass: config.deviceClass,
 			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, frameNoFloor: o.frameNoFloor ?? null,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,
-			onDocUpdate: (docId, update, origin) => engine.bound.push(docId, update, origin === "local" ? "merge" : origin),
+			onBoundText: (docId, changes, length, origin) => engine.bound.onText(docId, changes, length, origin),
+			onFrameTaken: (docId) => engine.bound.frameTaken(docId),
 			onDocFrozen: (docId, reason) => holder.rt?.onFrozen(docId, reason),
 			onNsFold: (frames, reloaded) => holder.rt?.onNsFold(frames, reloaded),
 			onCfgFold: () => holder.rt?.requestCfg(),
@@ -217,6 +220,10 @@ export class VaultRuntime {
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
 			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
 			pathBaseKeys: o.pathBases ? new Set(o.pathBases.keys()) : undefined,
+			boundSavedText: (docId, text) => {
+				const b = o.engine.bound.get(docId);
+				return b !== undefined && (text === b.diskText || b.candidates.includes(text));
+			},
 			takeOwnFold: () => this.takeOwnFold(),
 		});
 		await this.rec.start();
@@ -484,18 +491,6 @@ export class VaultRuntime {
 		if (!this.engine.bound.remove(docId, viewId)) return;
 		this.log.unbind(docId);
 		this.sched.request({ t: "docs", docIds: [docId], pathKeys: [] });
-	}
-
-	fullState(docId: DocId): Uint8Array | null {
-		return ops.fullState(this, docId);
-	}
-
-	localUpdate(docId: DocId, update: Uint8Array): void {
-		try {
-			this.log.applyLocalUpdate(docId, update);
-		} catch (e) {
-			this.diag(`localUpdate dropped: ${e instanceof Error ? e.message : String(e)}`);
-		}
 	}
 
 	boundSaved(docId: DocId, path: VaultPath, stat: VaultStat): void {

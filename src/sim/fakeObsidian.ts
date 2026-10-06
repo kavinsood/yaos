@@ -33,6 +33,8 @@ export class FakeObsidianVault implements VaultApi {
 	private clock = 1_000;
 	/** Runs inside readBinary after the bytes were taken (simulates a concurrent edit during a CAS check). */
 	afterReadBinary: ((path: string) => void) | null = null;
+	/** Runs inside process before it reads the file (a write landing after the host's last stat recheck). */
+	beforeProcess: ((path: string) => void) | null = null;
 	readonly adapter: AdapterApi;
 
 	constructor(readonly insensitive = false) {
@@ -55,8 +57,12 @@ export class FakeObsidianVault implements VaultApi {
 			},
 			async readBinary(p) {
 				const b = self.raw.get(rawKey(p));
-				if (!b) throw new Error(`ENOENT ${p}`);
-				return b.slice().buffer;
+				if (b) return b.slice().buffer;
+				const f = self.files.get(rawKey(p));
+				if (!f) throw new Error(`ENOENT ${p}`);
+				const out = f.bytes.slice().buffer;
+				self.afterReadBinary?.(f.path);
+				return out;
 			},
 			async write(p, data) {
 				self.calls.push(`adapter.write ${p}`);
@@ -173,6 +179,7 @@ export class FakeObsidianVault implements VaultApi {
 
 	async process(file: FileLike, fn: (data: string) => string): Promise<string> {
 		this.calls.push(`process ${file.path}`);
+		this.beforeProcess?.(file.path);
 		const next = fn(dec.decode((file as FakeFile).bytes));
 		this.put(file.path, next);
 		return next;

@@ -1,26 +1,53 @@
 /**
- * y-codemirror attachment for bound views (DESIGN §d.2).
+ * CodeMirror attachment for bound views (DESIGN §d.2, §d.3). No CRDT on main: the editor is a client of the worker
+ * replica in the @codemirror/collab model. A local transaction's ChangeSet goes to the binding (onLocal, O(change));
+ * a change of the replica comes back as a ChangeSet dispatched with addToHistory=false and transaction filters
+ * off, so CodeMirror's own history (Mod-z, Obsidian's "editor:undo") maps local events over it and undo never
+ * reverts a remote edit.
  *
- * One Compartment registered on every editor through
- * plugin.registerEditorExtension(collabCompartmentExtension()); binding a view
- * reconfigures that compartment on that view's EditorView only. yCollab gets
- * its own Y.UndoManager (tracks only this editor's origin, so undo never
- * reverts a remote edit) and the y-undo keymap at highest precedence so
- * Mod-z / Mod-y / Mod-Shift-z use it while bound.
- * Gap (recorded): Obsidian's "editor:undo" command (menu, mobile toolbar)
- * calls CM history undo, which can include remote edits.
+ * One static ViewPlugin registered on every editor through plugin.registerEditorExtension(collabExtension());
+ * binding a view registers its listener for that EditorView only (no reconfigure, no Compartment). EditorView.setState
+ * (Obsidian replacing the document wholesale) destroys and recreates view plugins (@codemirror/view 6.38.6
+ * dist/index.js:7754-7757): the binding is then void (onReset).
  */
 
-import { Compartment, Prec, type Extension } from "@codemirror/state";
-import { EditorView, keymap } from "@codemirror/view";
-import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
-import * as Y from "yjs";
-import type { EditorBindingSpec } from "../ports/workspace";
+import { Annotation, Transaction, type ChangeSet, type Extension } from "@codemirror/state";
+import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
+import type { EditorBinding, EditorBindingSpec } from "../ports/workspace";
 
-const compartment = new Compartment();
+/** Marks the binding's own remote dispatches (never reported back as local). */
+const remoteChange = Annotation.define<true>();
 
-export function collabCompartmentExtension(): Extension {
-	return compartment.of([]);
+interface Listener {
+	readonly spec: EditorBindingSpec;
+	live: boolean;
+}
+
+const listeners = new WeakMap<EditorView, Listener>();
+
+const collabPlugin = ViewPlugin.fromClass(class {
+	constructor(readonly view: EditorView) {}
+
+	update(u: ViewUpdate): void {
+		if (!u.docChanged) return;
+		const l = listeners.get(u.view);
+		if (!l?.live) return;
+		for (const tr of u.transactions) {
+			if (tr.docChanged && tr.annotation(remoteChange) !== true) l.spec.onLocal(tr.changes);
+		}
+	}
+
+	destroy(): void {
+		const l = listeners.get(this.view);
+		if (!l?.live) return;
+		l.live = false;
+		listeners.delete(this.view);
+		l.spec.onReset();
+	}
+});
+
+export function collabExtension(): Extension {
+	return collabPlugin;
 }
 
 /** EditorView behind an Obsidian Editor (private but stable `editor.cm`). */
@@ -29,19 +56,31 @@ export function editorViewOf(editor: unknown): EditorView | null {
 	return cm instanceof EditorView ? cm : null;
 }
 
-/** Attach yCollab to `cm`; returns an idempotent detach. Editor text must already equal ytext. */
-export function attachCollab(cm: EditorView, spec: EditorBindingSpec): () => void {
-	const undoManager = new Y.UndoManager(spec.ytext);
-	cm.dispatch({ effects: compartment.reconfigure([yCollab(spec.ytext, spec.awareness, { undoManager }), Prec.highest(keymap.of(yUndoManagerKeymap))]) });
-	let attached = true;
-	return () => {
-		if (!attached) return;
-		attached = false;
-		try {
-			cm.dispatch({ effects: compartment.reconfigure([]) });
-		} catch {
-			// editor already destroyed
-		}
-		undoManager.destroy();
+/** Attach the binding to `cm` (replacing any earlier one; that one is void). */
+export function attachCollab(cm: EditorView, spec: EditorBindingSpec): EditorBinding {
+	const prev = listeners.get(cm);
+	if (prev) prev.live = false;
+	const l: Listener = { spec, live: true };
+	listeners.set(cm, l);
+	return {
+		doc: () => cm.state.doc,
+		applyRemote(changes: ChangeSet): void {
+			if (!l.live) return;
+			cm.dispatch({ changes, annotations: [remoteChange.of(true), Transaction.addToHistory.of(false), Transaction.remote.of(true)], filter: false });
+		},
+		detach(): void {
+			if (!l.live) return;
+			l.live = false;
+			if (listeners.get(cm) === l) listeners.delete(cm);
+		},
 	};
 }
+
+/** EditorAdapter for ObsidianWorkspace: Obsidian's Editor -> its EditorView. */
+export const codeMirrorEditors = {
+	doc: (editor: unknown) => editorViewOf(editor)?.state.doc ?? null,
+	attach(editor: unknown, spec: EditorBindingSpec): EditorBinding | null {
+		const cm = editorViewOf(editor);
+		return cm ? attachCollab(cm, spec) : null;
+	},
+};

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 // @ts-expect-error untyped .mjs script
-import { checkSource, scanImports, checkTree } from "../../scripts/check-deps.mjs";
+import { checkSource, scanImports, checkTree, mainReach } from "../../scripts/check-deps.mjs";
 
 type Result = { errors: string[]; warnings: string[] };
 const check = (file: string, text: string): Result => checkSource(file, text) as Result;
@@ -28,8 +28,9 @@ test("§k.2 rules", () => {
 	assert.equal(check("core/a.ts", `import { X } from "../ports/vault";`).errors.length, 1, "core: runtime ports import");
 	assert.equal(check("core/a.ts", `import * as Y from "yjs";`).errors.length, 1, "core: yjs");
 	assert.equal(check("core/a.ts", `import { x } from "lib0/encoding";`).errors.length, 0);
-	assert.equal(check("ports/workspace.ts", `import type * as Y from "yjs";`).errors.length, 0);
-	assert.equal(check("ports/vault.ts", `import type * as Y from "yjs";`).errors.length, 1);
+	assert.equal(check("ports/workspace.ts", `import type * as Y from "yjs";`).errors.length, 1, "ports: no CRDT types");
+	assert.equal(check("ports/workspace.ts", `import type { ChangeSet, Text } from "@codemirror/state";`).errors.length, 0);
+	assert.equal(check("ports/vault.ts", `import type { Text } from "@codemirror/state";`).errors.length, 1);
 	assert.equal(check("protocol/workerTransport.ts", `import { Inbox } from "./inlineTransport";`).errors.length, 0);
 	assert.equal(check("protocol/x.ts", `import { BUDGETS } from "../core/limits";`).errors.length, 1, "protocol: runtime core");
 	assert.equal(check("engine/body/a.ts", `import { App } from "obsidian";`).errors.length, 1);
@@ -62,4 +63,46 @@ test("the tree passes", () => {
 	assert.deepEqual(r.errors, []);
 	assert.deepEqual(r.warnings, []);
 	assert.ok(r.files > 10);
+});
+
+test("no CRDT on the main thread: host/** never imports yjs, y-codemirror.next, y-protocols or lib0", () => {
+	for (const spec of ["yjs", "y-codemirror.next", "y-protocols/awareness", "lib0/encoding"]) {
+		assert.equal(check("host/binding.ts", `import * as M from "${spec}";`).errors.length, 1, spec);
+		assert.equal(check("host/collab.ts", `import type { X } from "${spec}";`).errors.length, 1, `${spec} type-only`);
+		assert.equal(check("host/binding.test.ts", `import * as M from "${spec}";`).errors.length, 1, `${spec} in a host test`);
+		assert.equal(check("engine/body/a.ts", `import * as M from "${spec}";`).errors.length, spec.startsWith("y-") ? 1 : 0, `engine ${spec}`);
+	}
+	const reach = (files: Record<string, string>) => mainReach(new Map(Object.entries(files))) as string[];
+	const viaCore = reach({
+		"host/a.ts": `import { f } from "../core/b";`,
+		"core/b.ts": `import { g } from "./c";`,
+		"core/c.ts": `import { writeVarUint } from "lib0/encoding";`,
+	});
+	assert.equal(viaCore.length, 1);
+	assert.match(viaCore[0] ?? "", /host\/a\.ts.*lib0\/encoding via host\/a\.ts -> core\/b\.ts -> core\/c\.ts/);
+	const viaEntry = reach({
+		"host/plugin.ts": `import { createWebEngine } from "../engine/adapters/webEngine";`,
+		"engine/adapters/webEngine.ts": `import * as Y from "yjs";`,
+	});
+	assert.deepEqual(viaEntry, [], "the inline-fallback engine entry is the documented exception (D2)");
+	assert.equal(check("host/plugin.ts", `import { probe } from "./spike/viewProbe";`).errors.length, 1, "the spike plugin stays out of the product");
+});
+
+test("whole-document reads on main: only the allowlisted ones", () => {
+	const reads = [
+		"const s = editor.getValue();",
+		"const s = view.state.doc.toString();",
+		"const s = view.state.sliceDoc(0);",
+		"const s = binding.doc().sliceString(0, 10);",
+		"const s = view.getViewData();",
+		"const t = Text.of(s.split(\"\\n\"));",
+	];
+	for (const r of reads) {
+		assert.equal(check("host/obsidianWorkspace.ts", r).errors.length, 1, r);
+		assert.equal(check("host/obsidianWorkspace.test.ts", r).errors.length, 0, `tests may read: ${r}`);
+		assert.equal(check("host/spike/viewProbe.ts", r).errors.length, 0, `spike plugin: ${r}`);
+	}
+	assert.equal(check("host/binding.ts", "t.sliceString(a, b)").errors.length, 0, "the chunked bind upload");
+	assert.equal(check("host/binding.ts", "t.sliceString(a, b); u.sliceString(0)").errors.length, 1, "one more than allowed");
+	assert.equal(check("host/binding.ts", "// editor.getValue() in a comment\nconst s = \"x.getValue()\";").errors.length, 0);
 });

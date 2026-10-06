@@ -67,9 +67,9 @@ test("bound editor typing reaches the other device's disk and editor without ech
 	assert.equal(va.counters.defaultReloadWhileBound + vb.counters.defaultReloadWhileBound, 0);
 	assert.equal(va.counters.localTx, 1, "remote changes are not re-sent as local edits");
 	assert.equal(vb.counters.localTx, 1);
-	const before = a.runtime.bindings.stats.localUpdatesPosted;
+	const before = a.runtime.bindings.stats.pushes;
 	await clock.advance(10_000);
-	assert.equal(a.runtime.bindings.stats.localUpdatesPosted, before, "quiet after convergence (no echo loop)");
+	assert.equal(a.runtime.bindings.stats.pushes, before, "quiet after convergence (no echo loop)");
 });
 
 test("pagehide flushes the coalesce buffer synchronously (acceptance 4)", async () => {
@@ -81,17 +81,17 @@ test("pagehide flushes the coalesce buffer synchronously (acceptance 4)", async 
 	assert.ok(va);
 	await clock.advance(500);
 	assert.equal(va.isBound(), true);
-	const posted = a.runtime.bindings.stats.localUpdatesPosted;
+	const posted = a.runtime.bindings.stats.pushes;
 	va.edit(1, 0, "y");
-	assert.equal(a.runtime.bindings.stats.localUpdatesPosted, posted, "still coalescing");
+	assert.equal(a.runtime.bindings.stats.pushes, posted, "still coalescing");
 	a.platform.emit("pagehide");
-	assert.equal(a.runtime.bindings.stats.localUpdatesPosted, posted + 1, "flushed before pagehide returns");
+	assert.equal(a.runtime.bindings.stats.pushes, posted + 1, "flushed before pagehide returns");
 	assert.equal(a.runtime.stats.lifecycleFlushes, 1);
 	await clock.advance(100);
 	assert.equal(a.engineText("a.md"), "xy");
 });
 
-test("engine killed mid-typing loses nothing (bindDelta after restart)", async () => {
+test("engine killed mid-typing loses nothing (re-attach with the durable base after restart)", async () => {
 	const { clock, devs } = world();
 	const a = dev(devs, 0);
 	const b = dev(devs, 1);
@@ -115,6 +115,36 @@ test("engine killed mid-typing loses nothing (bindDelta after restart)", async (
 	await clock.advance(5_000);
 	assert.equal(b.vault.textOf("a.md"), "start one two three");
 	assert.equal(va.getText(), "start one two three");
+});
+
+test("engine restart with a dirty view, then a second view loads the older disk text: the edit survives (sim seed 62)", async () => {
+	const { clock, devs } = world();
+	const a = dev(devs, 0);
+	const b = dev(devs, 1);
+	a.vault.userWrite("a.md", "start [Z]\n");
+	await boot(clock, devs);
+	await clock.advance(2_000);
+	const va = a.workspace.openFile("a.md");
+	assert.ok(va);
+	await clock.advance(500);
+	va.edit(6, 0, "[A] "); // typed, not saved yet (2 s debounce)
+	await clock.advance(400);
+	va.edit(10, 3, ""); // and deleted the seed token
+	await clock.advance(400); // pushed, framed, committed, on the relay
+	assert.equal(a.vault.textOf("a.md"), "start [Z]\n", "the editor has not saved");
+	a.crashEngine();
+	// While the engine restarts, a second view of the file loads what is on disk. The re-bind of the dirty view
+	// must tell the engine which text is on disk (`saved`), or the second view's older text reads as an edit
+	// against the first view's unsaved one and reverts it.
+	const vb = a.workspace.openFile("a.md");
+	assert.ok(vb);
+	await clock.advance(10_000);
+	assert.equal(a.engineStarts, 2);
+	const want = "start [A] \n";
+	assert.equal(a.engineText("a.md"), want);
+	assert.equal(va.getText(), want);
+	assert.equal(vb.getText(), want);
+	assert.equal(b.vault.textOf("a.md"), want);
 });
 
 test("worker storage failure falls back to inline and still syncs (OR-1 fallback)", async () => {

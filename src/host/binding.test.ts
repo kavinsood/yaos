@@ -1,329 +1,385 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import * as Y from "yjs";
 import type { DocId } from "../core/types";
-import type { EngineResultValue, MainToEngine } from "../protocol/messages";
-import { BindingManager, type BindingLink } from "./binding";
-import { createHasher } from "./hashing";
+import { TEXT_CHUNK_UNITS } from "../protocol/utf16";
+import { BindingManager } from "./binding";
 import { VirtualClock } from "../sim/clock";
-import { simHashPort } from "../sim/hash";
+import { SimBodyEngine } from "../sim/bodyEngine";
+import { simHashOracle } from "../sim/hash";
 import { SimVault } from "../sim/vault";
 import { SimWorkspace } from "../sim/workspace";
 
-/** Minimal engine side: one worker replica per path, records every post. */
-class FakeEngine {
-	readonly docs = new Map<string, { docId: DocId; doc: Y.Doc; base: string | null; frozen: boolean }>();
-	readonly posts: MainToEngine[] = [];
-	notBindable = new Set<string>();
-	opens = 0;
-	readonly link: BindingLink = {
-		post: (m) => {
-			this.posts.push(m);
-			if (m.t === "localUpdate" || m.t === "bindDelta") {
-				const e = [...this.docs.values()].find((d) => d.docId === m.docId);
-				if (e) Y.applyUpdate(e.doc, m.update, "main");
-			}
-		},
-		openDoc: async (path) => {
-			this.opens++;
-			await Promise.resolve();
-			if (this.notBindable.has(path)) return { t: "notBindable", reason: "untracked" } satisfies EngineResultValue;
-			const e = this.docs.get(path);
-			if (!e) return { t: "notBindable", reason: "untracked" };
-			return { t: "bind", bind: { docId: e.docId, kind: "markdown", state: Y.encodeStateAsUpdate(e.doc), stateVector: Y.encodeStateVector(e.doc), baseText: e.base, baseHash: null, frozen: e.frozen } };
-		},
-	};
-
-	add(path: string, text: string, base: string | null = text, docId = `d:${path}` as DocId): { docId: DocId; doc: Y.Doc } {
-		const doc = new Y.Doc();
-		doc.getText("text").insert(0, text);
-		this.docs.set(path, { docId, doc, base, frozen: false });
-		return { docId, doc };
-	}
-
-	text(path: string): string {
-		return this.docs.get(path)?.doc.getText("text").toString() ?? "";
-	}
-
-	count(t: MainToEngine["t"], pred: (m: MainToEngine) => boolean = () => true): number {
-		return this.posts.filter((m) => m.t === t && pred(m)).length;
-	}
-
-	/** Remote edit on the worker replica, delivered to main as docUpdate. */
-	remoteEdit(path: string, mutate: (t: Y.Text) => void, bm: BindingManager): void {
-		const e = this.docs.get(path);
-		if (!e) throw new Error("no doc");
-		const sv = Y.encodeStateVector(e.doc);
-		e.doc.transact(() => mutate(e.doc.getText("text")), "remote");
-		bm.onDocUpdate(e.docId, Y.encodeStateAsUpdate(e.doc, sv));
-	}
-}
-
 function setup() {
 	const clock = new VirtualClock();
-	const hasher = createHasher(simHashPort());
-	const vault = new SimVault({ clock, hasher, profile: "case-insensitive", watcherDelayMs: () => 200 });
+	clock.onError = (e) => {
+		throw e;
+	};
+	const vault = new SimVault({ clock, hashes: simHashOracle(), profile: "case-insensitive", watcherDelayMs: () => 200 });
 	const ws = new SimWorkspace({ clock, vault });
-	const engine = new FakeEngine();
+	const engine = new SimBodyEngine(clock);
 	const notices: string[] = [];
-	const bm = new BindingManager({ workspace: ws, vault, clock, hasher, link: engine.link, deviceLabel: () => "Pixel 8", notice: (_l, code) => notices.push(code), timeZone: "utc" });
+	const bm = new BindingManager({ workspace: ws, vault, clock, link: engine.link, notice: (_l, code) => notices.push(code) });
+	engine.bm = bm;
 	vault.onEvent((e) => bm.onVaultEvent(e));
 	return { clock, vault, ws, engine, bm, notices };
 }
 
-test("binding: bind with equal texts; editor edits coalesce into one localUpdate; no echo of remote updates", async () => {
-	const { clock, vault, ws, engine, bm } = setup();
-	vault.userWrite("a.md", "hello");
-	engine.add("a.md", "hello");
+function file(s: ReturnType<typeof setup>, path: string, text: string): void {
+	s.vault.userWrite(path, text);
+	s.engine.add(path, text);
+}
+
+test("binding: bind uploads the editor once; typing coalesces into one push of the change only; remote entries are not echoed", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "hello");
 	bm.start();
 	const v = ws.openFile("a.md");
 	assert.ok(v);
 	await clock.advance(1);
 	assert.equal(bm.slotState(v.viewId), "bound");
-	assert.equal(v.counters.bindMismatch, 0);
-	assert.equal(engine.count("bindDelta"), 1);
-
-	v.edit(5, 0, " w");
-	v.edit(7, 0, "o");
-	v.edit(8, 0, "rld");
-	assert.equal(engine.count("localUpdate"), 0, "coalesced, not posted per keystroke");
-	await clock.advance(16);
-	assert.equal(engine.count("localUpdate"), 1);
+	assert.equal(engine.count("textChunk"), 1);
+	assert.equal(engine.count("bodyAttach"), 1);
+	v.edit(5, 0, " ");
+	v.edit(6, 0, "w");
+	v.edit(7, 0, "orld");
+	assert.equal(engine.count("bodyPush"), 0, "coalescing");
+	await clock.advance(20);
+	const pushes = engine.posts.filter((m) => m.t === "bodyPush");
+	assert.equal(pushes.length, 1);
+	assert.deepEqual(pushes[0]?.t === "bodyPush" ? pushes[0].changes : null, [5, [0, " world"]], "pre-change coordinates, inserted text only");
 	assert.equal(engine.text("a.md"), "hello world");
-	assert.equal(v.counters.localTx, 3);
-
-	engine.remoteEdit("a.md", (t) => t.insert(0, ">> "), bm);
+	engine.remote("a.md", 0, 0, ">> ");
+	await clock.advance(5);
 	assert.equal(v.getText(), ">> hello world");
+	assert.equal(v.counters.localTx, 3);
 	assert.equal(v.counters.remoteApplied, 1);
-	await clock.advance(100);
-	assert.equal(engine.count("localUpdate"), 1, "remote update is not echoed back");
-	assert.deepEqual(engine.posts.filter((m) => m.t === "docCredit").map((m) => m.t === "docCredit" && m.bytes > 0), [true], "one credit per docUpdate");
-
-	// Obsidian's 2 s save writes the bound file and the host reports boundSaved.
-	await clock.advance(2_100);
-	assert.equal(vault.textOf("a.md"), ">> hello world");
-	const saved = engine.posts.filter((m) => m.t === "boundSaved");
-	assert.equal(saved.length, 1);
-	assert.equal(saved[0]?.t === "boundSaved" && saved[0].text, ">> hello world");
+	assert.equal(bm.mirrorText("d:a.md" as DocId)?.toString(), ">> hello world");
 	await clock.advance(5_000);
-	assert.equal(engine.count("localUpdate"), 1, "quiescent: no update loop");
-	assert.equal(engine.count("boundSaved"), 1);
+	assert.equal(engine.count("bodyPush"), 1, "no echo of the remote entry");
+	assert.equal(engine.count("textChunk"), 1, "typing never uploads text");
+	assert.equal(s.vault.textOf("a.md"), ">> hello world");
 });
 
-test("binding: bind-time merge disk-only goes through bindDelta; conflict writes a copy and reports", async () => {
-	const { clock, vault, ws, engine, bm } = setup();
-	// disk-only: crdt === base, editor (disk) changed while unbound.
-	vault.userWrite("a.md", "base text\nedited on disk");
-	engine.add("a.md", "base text", "base text");
-	// conflict: both changed.
-	vault.userWrite("b.md", "disk side");
-	engine.add("b.md", "crdt side", "base");
+test("binding: bind merges in the worker: a replica edit reaches the editor as the bound change; an editor-only edit goes in", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "base\n");
+	file(s, "b.md", "base\n");
+	engine.remote("a.md", 5, 5, "replica\n"); // nobody attached: the replica moved on
+	s.vault.userWrite("b.md", "base\ndisk\n");
 	bm.start();
 	const va = ws.openFile("a.md");
 	const vb = ws.openFile("b.md");
 	assert.ok(va && vb);
-	await clock.advance(10);
-	assert.equal(engine.text("a.md"), "base text\nedited on disk", "bindDelta carries the merge");
-	assert.equal(va.getText(), "base text\nedited on disk");
-	assert.equal(engine.count("localUpdate"), 0, "bind-time merge is not a localUpdate");
-	assert.equal(vb.getText(), "crdt side", "conflict: crdt keeps its side in the editor");
-	assert.equal(engine.text("b.md"), "crdt side");
-	assert.equal(vault.textOf("b (conflict Pixel 8 2026-01-01 0000).md"), "disk side", "the disk side is preserved in a conflict copy");
-	const reports = engine.posts.filter((m) => m.t === "boundExternalMerged").map((m) => m.t === "boundExternalMerged" && [m.docId, m.result, m.conflictReason]);
-	assert.deepEqual(reports, [["d:a.md", "disk-only", null], ["d:b.md", "conflict", "both-edited"]]);
-	assert.equal(va.counters.bindMismatch + vb.counters.bindMismatch, 0);
+	await clock.advance(5);
+	assert.equal(va.getText(), "base\nreplica\n");
+	assert.equal(vb.getText(), "base\ndisk\n");
+	assert.equal(engine.text("b.md"), "base\ndisk\n");
+	assert.equal(va.counters.localTx + vb.counters.localTx, 0, "the bound change is not a local edit");
 });
 
-test("binding: conflict copy names come from core conflictName: a name taken on disk gets a suffix, an overlong one the doc-id fallback", async () => {
-	const { clock, vault, ws, engine, bm, notices } = setup();
-	vault.userWrite("x/y.md", "disk side");
-	vault.userWrite("x/y (conflict Pixel 8 2026-01-01 0000).md", "an older copy");
-	engine.add("x/y.md", "crdt side", "base");
-	const long = "s".repeat(240);
-	vault.userWrite(`${long}.md`, "disk side");
-	engine.add(`${long}.md`, "crdt side", "base", "abcdef1234" as DocId);
+test("binding: a large editor text is uploaded in UTF-16 chunks with a yield between them", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	const big = "x".repeat(TEXT_CHUNK_UNITS * 2 + 10) + "é\r\n😀";
+	file(s, "big.md", big);
 	bm.start();
-	assert.ok(ws.openFile("x/y.md") && ws.openFile(`${long}.md`));
-	await clock.advance(10);
-	assert.equal(vault.textOf("x/y (conflict Pixel 8 2026-01-01 0000).md"), "an older copy", "never overwritten");
-	assert.equal(vault.textOf("x/y (conflict Pixel 8 2026-01-01 0000 2).md"), "disk side");
-	assert.equal(vault.textOf(`${"s".repeat(200)} (conflict abcdef12).md`), "disk side");
-	assert.deepEqual(notices.filter((n) => n.startsWith("conflict-copy")), ["conflict-copy", "conflict-copy"]);
-});
-
-test("binding: external reload of a bound view is intercepted and merged (no clobber, merge update, boundSaved)", async () => {
-	const { clock, vault, ws, engine, bm } = setup();
-	vault.userWrite("n.md", "line1\n");
-	engine.add("n.md", "line1\n");
-	bm.start();
-	const v = ws.openFile("n.md");
+	const v = ws.openFile("big.md");
 	assert.ok(v);
-	await clock.advance(10);
-	vault.externalWrite("n.md", "line1\nfrom another app\n");
-	await clock.advance(300);
+	await clock.runUntil(() => engine.count("textChunk") >= 1, 10);
+	await clock.settleMicrotasks();
+	assert.equal(engine.count("textChunk"), 1, "one chunk, then a yield to the event loop (a timer, not a microtask)");
+	await clock.advance(5);
+	assert.equal(engine.count("textChunk"), 3);
+	assert.equal(bm.slotState(v.viewId), "bound");
+	assert.equal(bm.stats.uploadUnits, big.length);
+	v.edit(big.length, 0, "!");
+	await clock.advance(20);
+	assert.equal(engine.text("big.md"), `${big}!`);
+});
+
+test("binding: concurrent pushes and remote edits are rebased (reject, re-push) and converge", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "0123456789");
+	bm.start();
+	const v = ws.openFile("a.md");
+	assert.ok(v);
+	await clock.advance(5);
+	engine.delay = () => 3;
+	v.edit(10, 0, "L");
+	await clock.advance(17); // pushed: on its way to the engine
+	engine.remote("a.md", 0, 0, "R"); // reaches the replica first
+	v.edit(0, 1, ""); // and another local edit meanwhile
+	await clock.advance(200);
+	assert.ok(bm.stats.rejects >= 1, "the stale push was rejected");
+	assert.equal(engine.text("a.md"), "R123456789L");
+	assert.equal(v.getText(), "R123456789L");
+});
+
+test("binding: pushes chain behind unconfirmed ones (no wait per confirmation)", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "");
+	bm.start();
+	const v = ws.openFile("a.md");
+	assert.ok(v);
+	await clock.advance(5);
+	engine.delay = () => 50;
+	for (let i = 0; i < 5; i++) {
+		v.edit(v.doc.length, 0, `${i}`);
+		bm.flushAll();
+	}
+	const pushes = engine.posts.flatMap((m) => (m.t === "bodyPush" ? [m] : []));
+	assert.equal(pushes.length, 5);
+	assert.equal(pushes[0]?.after, null);
+	for (let i = 1; i < 5; i++) assert.equal(pushes[i]?.after, pushes[i - 1]?.seq);
+	await clock.advance(1_000);
+	assert.equal(engine.text("a.md"), "01234");
+	assert.equal(bm.stats.rejects, 0);
+});
+
+test("binding: an external reload into a dirty bound view is intercepted, merged in the worker, and saved; saves are held meanwhile", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm, vault } = s;
+	file(s, "a.md", "one\ntwo\n");
+	bm.start();
+	const v = ws.openFile("a.md");
+	assert.ok(v);
+	await clock.advance(5);
+	v.edit(8, 0, "three\n");
+	await clock.advance(20);
+	engine.delay = () => 30; // the reload round trip is slow: a save in between must not write the stale editor
+	vault.userWrite("a.md", "ONE\ntwo\n");
+	await clock.advance(250); // watcher -> loadFileInternal -> setViewData -> interceptor
 	assert.equal(v.counters.intercepted, 1);
-	assert.equal(v.counters.defaultReloadWhileBound, 0, "setViewData never reached the editor");
-	assert.equal(v.getText(), "line1\nfrom another app\n");
-	assert.equal(engine.text("n.md"), "line1\nfrom another app\n");
-	assert.equal(engine.count("localUpdate", (m) => m.t === "localUpdate" && m.origin === "merge"), 1);
-	assert.equal(engine.count("localUpdate", (m) => m.t === "localUpdate" && m.origin === "editor"), 0, "merge is not echoed as an editor edit");
-	assert.deepEqual(engine.posts.filter((m) => m.t === "boundExternalMerged").map((m) => m.t === "boundExternalMerged" && m.result), ["disk-only"]);
-	await clock.advance(100);
-	const saved = engine.posts.filter((m) => m.t === "boundSaved");
-	assert.equal(saved.length, 1);
-	assert.equal(saved[0]?.t === "boundSaved" && saved[0].text, "line1\nfrom another app\n");
-
-	// Concurrent: user typed (unsaved) while another app edited: both edits kept or a copy is written.
-	v.edit(0, 0, "# ");
-	vault.externalWrite("n.md", "line1\nfrom another app\nmore\n");
-	await clock.advance(300);
 	assert.equal(v.counters.defaultReloadWhileBound, 0);
-	assert.ok(v.getText().startsWith("# line1"), "unsaved typing survives the reload");
-	const copies = [...vault.snapshot().entries()].filter(([p]) => p.includes("(conflict"));
-	assert.ok(v.getText().includes("more") || copies.some(([, t]) => t.includes("more")), "external edit is kept in the doc or in a conflict copy");
+	assert.equal(bm.stats.reloads, 1);
+	await clock.advance(5_000);
+	assert.equal(engine.count("bodyReload"), 1);
+	assert.equal(v.getText(), "ONE\ntwo\nthree\n");
+	assert.equal(vault.textOf("a.md"), "ONE\ntwo\nthree\n");
+	assert.equal(engine.text("a.md"), "ONE\ntwo\nthree\n");
 });
 
-test("binding: a conflict copy that hits disk errors is retried until written (the external side is never dropped)", async () => {
-	const { clock, vault, ws, engine, bm, notices } = setup();
-	vault.userWrite("n.md", "seed line\n");
-	engine.add("n.md", "seed line\n");
+test("binding: a save while an external reload is merging writes nothing; the reloaded result is saved after", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm, vault } = s;
+	file(s, "a.md", "one\n");
 	bm.start();
-	const v = ws.openFile("n.md");
+	const v = ws.openFile("a.md");
 	assert.ok(v);
-	await clock.advance(10);
-	v.edit(1, 0, "[mine]"); // unsaved typing on the same line the other app edits
-	vault.externalWrite("n.md", "s[theirs]eed line\n");
-	vault.failNextOps = 2;
-	await clock.advance(300);
-	assert.ok(notices.includes("conflict-copy-retrying"));
-	await clock.advance(10_000);
-	const copies = [...vault.snapshot().entries()].filter(([p]) => p.includes("(conflict"));
-	assert.ok(copies.some(([, t]) => t.includes("[theirs]")), `external side kept in a conflict copy: ${JSON.stringify(copies)}`);
-	assert.ok(v.getText().includes("[mine]"));
-	assert.ok(!notices.includes("conflict-copy-failed"), JSON.stringify(notices));
-	assert.equal(notices.filter((n) => n === "conflict-copy").length, 1, "one notice once the copy lands");
+	await clock.advance(5);
+	engine.delay = () => 400;
+	vault.userWrite("a.md", "one\ndisk\n");
+	await clock.advance(250);
+	assert.equal(v.counters.intercepted, 1);
+	const saves = v.counters.saves;
+	await v.save(); // not dirty: getViewData answers lastSavedData while held -> skipped
+	assert.equal(v.counters.saves, saves);
+	assert.equal(vault.textOf("a.md"), "one\ndisk\n");
+	await clock.advance(5_000);
+	assert.equal(v.getText(), "one\ndisk\n");
+	assert.equal(vault.textOf("a.md"), "one\ndisk\n");
 });
 
-test("binding: worker killed mid-typing loses nothing (suspend, keep typing, rebind with bindDelta)", async () => {
-	const { clock, vault, ws, engine, bm } = setup();
-	vault.userWrite("k.md", "start");
-	const { doc: oldWorker } = engine.add("k.md", "start");
-	const persisted = Y.encodeStateAsUpdate(oldWorker); // what the new worker will restore from IDB
+test("binding: a sibling view's quick preview of the same doc is dropped; its edits arrive as entries", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "abc");
 	bm.start();
-	const v = ws.openFile("k.md");
-	assert.ok(v);
-	await clock.advance(10);
-	v.edit(5, 0, " one");
-	await clock.advance(16); // posted to the old worker, never persisted
-	assert.equal(engine.text("k.md"), "start one");
-	v.edit(9, 0, " two"); // still in the coalesce buffer when the worker dies
-	bm.suspend();
-	v.edit(13, 0, " three"); // typed while the engine restarts
-	await clock.advance(100);
-	assert.equal(engine.count("localUpdate"), 1, "nothing posted while suspended");
-	const entry = engine.docs.get("k.md");
-	assert.ok(entry);
-	entry.doc = new Y.Doc();
-	Y.applyUpdate(entry.doc, persisted);
-	assert.equal(engine.text("k.md"), "start");
-	bm.start();
-	await clock.advance(10);
-	assert.equal(v.isBound(), true, "editor never detached");
-	assert.equal(v.counters.bindMismatch, 0);
-	assert.equal(engine.text("k.md"), "start one two three", "bindDelta carried lost + pending + typed-while-down edits");
-	assert.equal(v.getText(), "start one two three");
-	v.edit(0, 0, "> ");
-	await clock.advance(16);
-	assert.equal(engine.text("k.md"), "> start one two three", "posting resumes after rebind");
-});
-
-test("binding: split views share one replica; sibling reload is identical; stale/closed opens are released", async () => {
-	const { clock, vault, ws, engine, bm } = setup();
-	vault.userWrite("s.md", "shared");
-	engine.add("s.md", "shared");
-	bm.start();
-	const v1 = ws.openFile("s.md");
-	const v2 = ws.openFile("s.md");
+	const v1 = ws.openFile("a.md");
+	const v2 = ws.openFile("a.md");
 	assert.ok(v1 && v2);
-	await clock.advance(10);
-	assert.deepEqual(bm.boundDocs(), ["d:s.md"]);
-	v1.edit(6, 0, "!");
-	assert.equal(v2.getText(), "shared!", "second view follows through the shared replica");
-	await clock.advance(2_500);
-	assert.equal(vault.textOf("s.md"), "shared!");
+	await clock.advance(5);
+	assert.equal(bm.slotState(v1.viewId), "bound");
+	assert.equal(bm.slotState(v2.viewId), "bound");
+	v1.edit(3, 0, "d");
+	await clock.advance(50); // onInternalDataChange (10 ms) previews into v2
+	assert.ok(bm.stats.siblingCopies >= 1);
 	assert.equal(v2.counters.defaultReloadWhileBound, 0);
-	assert.equal(engine.count("boundExternalMerged"), 0, "sibling sync is not an external merge");
-	await ws.closeView(v1.viewId);
-	assert.deepEqual(bm.boundDocs(), ["d:s.md"], "replica kept while a view remains");
-	await ws.closeView(v2.viewId);
-	assert.deepEqual(bm.boundDocs(), []);
-	assert.equal(engine.count("closeDoc"), 2);
-
-	// Close while openDoc is in flight: the late bind is released with closeDoc.
-	const v3 = ws.openFile("s.md");
-	assert.ok(v3);
-	await ws.closeView(v3.viewId);
-	await clock.advance(10);
-	assert.equal(engine.count("closeDoc"), 3);
-	assert.deepEqual(bm.boundDocs(), []);
+	assert.equal(v2.getText(), "abcd");
+	assert.equal(v2.counters.localTx, 0, "the copy never became a local edit of v2");
+	assert.equal(engine.text("a.md"), "abcd");
+	v2.edit(0, 0, ">");
+	await clock.advance(50);
+	assert.equal(v1.getText(), ">abcd");
+	assert.equal(engine.count("bodyReload"), 0);
 });
 
-test("binding: retarget deleted waits for bindable; saveViews; flushAll is synchronous; frozen stays unbound", async () => {
-	const { clock, vault, ws, engine, bm, notices } = setup();
-	vault.userWrite("r.md", "r");
-	engine.add("r.md", "r");
-	vault.userWrite("f.md", "f");
-	engine.add("f.md", "f");
-	const fe = engine.docs.get("f.md");
-	assert.ok(fe);
-	fe.frozen = true;
+test("binding: a view still opening drops a bound sibling's preview (no double merge); an unbindable view gets Obsidian's copy", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "abc\n");
 	bm.start();
-	const v = ws.openFile("r.md");
+	const v1 = ws.openFile("a.md");
+	assert.ok(v1);
+	await clock.advance(5);
+	assert.equal(bm.slotState(v1.viewId), "bound");
+	engine.delay = () => 40; // v2's openDoc takes a while
+	const v2 = ws.openFile("a.md");
+	assert.ok(v2);
+	v1.edit(3, 0, "d");
+	await clock.advance(20); // v1's quick preview reaches v2 while it is opening
+	assert.equal(bm.slotState(v2.viewId), "opening");
+	assert.equal(bm.stats.siblingCopies, 1);
+	assert.equal(v2.getText(), "abc\n", "dropped: v1's push delivers the edit");
+	await clock.advance(500);
+	assert.equal(bm.slotState(v2.viewId), "bound");
+	assert.equal(engine.text("a.md"), "abcd\n", "merged once (v2's upload did not carry v1's edit)");
+	assert.equal(v2.getText(), "abcd\n");
+	assert.equal(engine.count("bodyReload"), 0);
+
+	engine.delay = () => 0;
+	file(s, "n.md", "new\n");
+	engine.notBindable.add("n.md");
+	const n1 = ws.openFile("n.md");
+	const n2 = ws.openFile("n.md");
+	assert.ok(n1 && n2);
+	await clock.advance(5);
+	assert.equal(bm.slotState(n1.viewId), "waiting");
+	n1.edit(0, 0, "x");
+	await clock.advance(20);
+	assert.equal(n2.getText(), "xnew\n", "not bound: Obsidian's own quick preview applies");
+});
+
+test("binding: onSaveRead posts a save mark naming the mirror version and the newest push", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "x");
+	bm.start();
+	const v = ws.openFile("a.md");
+	assert.ok(v);
+	await clock.advance(5);
+	engine.delay = () => 100;
+	v.edit(1, 0, "y");
+	await v.save(); // flushes the buffer, then marks
+	const marks = engine.posts.flatMap((m) => (m.t === "bodySaveMark" ? [m] : []));
+	const pushes = engine.posts.flatMap((m) => (m.t === "bodyPush" ? [m] : []));
+	assert.equal(marks.length, 1);
+	assert.equal(pushes.length, 1);
+	assert.equal(marks[0]?.seq, pushes[0]?.seq);
+	assert.equal(marks[0]?.version, pushes[0]?.base);
+	assert.equal(bm.stats.saveMarks, 1);
+});
+
+test("binding: an engine restart mid-typing loses nothing: re-attach merges the editor against the durable base", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "base\n");
+	bm.start();
+	const v = ws.openFile("a.md");
+	assert.ok(v);
+	await clock.advance(5);
+	v.edit(5, 0, "durable\n");
+	await clock.advance(20);
+	engine.markDurable("a.md");
+	await clock.advance(5);
+	v.edit(13, 0, "lost-by-engine\n");
+	await clock.advance(20); // pushed and applied, never durable
+	engine.remote("a.md", 0, 0, "R"); // also not durable
+	await clock.advance(5);
+	engine.delay = () => 7;
+	v.edit(0, 0, "typed-during-restart ");
+	engine.restart();
+	v.edit(v.doc.length, 0, "end\n");
+	await clock.advance(1_000);
+	const want = "typed-during-restart Rbase\ndurable\nlost-by-engine\nend\n";
+	assert.equal(v.getText(), want);
+	assert.equal(engine.text("a.md"), want);
+	const attaches = engine.posts.flatMap((m) => (m.t === "bodyAttach" ? [m] : []));
+	assert.equal(attaches.length, 2);
+	assert.notEqual(attaches[1]?.base, null, "the re-attach carries the durable base");
+});
+
+test("binding: docRetarget resync re-attaches with the mirror as base; renamed/merged re-open; deleted waits for bindable", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm } = s;
+	file(s, "a.md", "abc\n");
+	bm.start();
+	const v = ws.openFile("a.md");
+	assert.ok(v);
+	await clock.advance(5);
+	const docId = bm.docOfView(v.viewId);
+	assert.ok(docId);
+	bm.onDocRetarget(docId, { t: "resync" });
+	v.edit(4, 0, "d\n");
+	await clock.advance(50);
+	assert.equal(bm.slotState(v.viewId), "bound");
+	assert.equal(bm.stats.resyncs, 1);
+	assert.equal(engine.text("a.md"), "abc\nd\n");
+	bm.onDocRetarget(docId, { t: "deleted" });
+	assert.equal(bm.slotState(v.viewId), "waiting");
+	assert.equal(bm.isBoundPath("a.md"), false);
+	v.edit(0, 0, "x\n"); // unbound: goes in by the line merge at re-attach
+	bm.onBindable("A.md" as never); // case-insensitive vault
+	await clock.advance(50);
+	assert.equal(bm.slotState(v.viewId), "bound");
+	assert.equal(engine.text("a.md"), "x\nabc\nd\n");
+	assert.equal(v.getText(), "x\nabc\nd\n");
+	bm.onDocRetarget(docId, { t: "renamed", path: "a.md" as never });
+	await clock.advance(50);
+	assert.equal(bm.slotState(v.viewId), "bound");
+	assert.equal(engine.count("bodyAttach"), 4);
+});
+
+test("binding: a frozen doc stays unbound with a notice; notBindable waits until bindable", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm, notices } = s;
+	file(s, "f.md", "frozen");
+	file(s, "n.md", "later");
+	engine.frozen.add("f.md");
+	engine.notBindable.add("n.md");
+	bm.start();
 	const vf = ws.openFile("f.md");
-	assert.ok(v && vf);
-	await clock.advance(10);
+	const vn = ws.openFile("n.md");
+	assert.ok(vf && vn);
+	await clock.advance(5);
 	assert.equal(bm.slotState(vf.viewId), "waiting");
 	assert.deepEqual(notices, ["doc-frozen"]);
-
-	assert.equal(bm.flushPath("r.md"), false, "nothing unsent");
-	v.edit(1, 0, "x");
-	assert.equal(bm.flushPath("f.md"), false, "other path untouched");
-	assert.equal(bm.flushPath("R.md"), true, "flushPath posts a bound path's unsent edits now");
-	assert.equal(engine.count("localUpdate"), 1);
-	v.edit(2, 0, "y");
-	bm.flushAll();
-	assert.equal(engine.count("localUpdate"), 2, "flushAll posts without waiting for the timer");
-	assert.deepEqual(await bm.saveViews(["d:r.md" as DocId, "d:nope.md" as DocId]), ["d:r.md"]);
-	assert.equal(vault.textOf("r.md"), "rxy");
-
-	bm.onDocRetarget("d:r.md" as DocId, { t: "deleted" });
-	assert.equal(bm.slotState(v.viewId), "waiting");
-	assert.equal(v.isBound(), false);
-	const opens = engine.opens;
-	bm.onBindable("R.md");
-	await clock.advance(10);
-	assert.equal(engine.opens, opens + 1, "bindable re-opens (case-insensitive path match)");
-	assert.equal(bm.slotState(v.viewId), "bound");
-	assert.equal(bm.isBoundPath("R.MD"), true);
-	assert.equal(bm.isBoundPath("f.md"), false);
+	assert.ok(engine.posts.some((m) => m.t === "closeDoc"));
+	assert.equal(bm.slotState(vn.viewId), "waiting");
+	engine.notBindable.delete("n.md");
+	bm.onBindable("n.md" as never);
+	await clock.advance(5);
+	assert.equal(bm.slotState(vn.viewId), "bound");
 });
 
-test("binding: a waiting view whose file is renamed re-opens at the new path (no bindable comes for it)", async () => {
-	const { clock, vault, ws, engine, bm } = setup();
-	// The engine already folded a remote rename old.md -> new.md; the disk still has old.md.
-	vault.userWrite("old.md", "body");
-	engine.add("new.md", "body");
+test("binding: flushPath (case-insensitive), flushAll and saveViews push and save the bound views", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm, vault } = s;
+	file(s, "R.md", "r");
+	bm.start();
+	const v = ws.openFile("R.md");
+	assert.ok(v);
+	await clock.advance(5);
+	v.edit(1, 0, "1");
+	assert.equal(bm.flushPath("r.md"), true, "pending push for the same file under another case");
+	assert.equal(engine.count("bodyPush"), 1);
+	assert.equal(bm.flushPath("other.md"), false);
+	v.edit(2, 0, "2");
+	bm.flushAll();
+	assert.equal(engine.count("bodyPush"), 2);
+	const docId = bm.docOfView(v.viewId);
+	assert.ok(docId);
+	const saved = await bm.saveViews([docId, "d:none" as DocId]);
+	assert.deepEqual(saved, [docId]);
+	assert.equal(vault.textOf("R.md"), "r12");
+});
+
+test("binding: a view waiting on a path re-opens at the new path when the file is renamed", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm, vault } = s;
+	vault.userWrite("old.md", "text");
 	bm.start();
 	const v = ws.openFile("old.md");
 	assert.ok(v);
-	await clock.advance(10);
-	assert.equal(bm.slotState(v.viewId), "waiting", "untracked at the old path");
-	// The projection applies the rename. new.md was live in the engine already, so no bindable{new.md} follows.
-	const r = await vault.rename("old.md", "new.md", { t: "any" });
-	assert.equal(r.ok, true);
-	await clock.advance(500);
+	await clock.advance(5);
+	assert.equal(bm.slotState(v.viewId), "waiting", "untracked yet");
+	engine.add("new.md", "text");
+	vault.userRename("old.md", "new.md");
+	await clock.advance(300);
 	assert.equal(v.path, "new.md");
 	assert.equal(bm.slotState(v.viewId), "bound");
-	assert.equal(v.isBound(), true);
-	assert.equal(bm.docOfView(v.viewId), "d:new.md");
 });

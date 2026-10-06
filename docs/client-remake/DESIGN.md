@@ -616,15 +616,15 @@ changes.
 
 ## d. Body engine
 
-The body engine lives in the engine (the worker, or inline). It owns one **worker replica** `Y.Doc` per resident doc.
-The main thread owns a **main replica** only for docs bound to an open editor. Yjs is pure JS, and every doc uses
-`gc: true`.
+The body engine lives in the engine (the worker, or inline). It owns one **worker replica** `Y.Doc` per resident doc,
+and that is the only replica: the main thread holds no CRDT, including for docs bound to an open editor (§d.2). Yjs is
+pure JS, and every doc uses `gc: true`.
 
 - **Root types.**
   - Markdown: exactly one `Y.Text` named `"text"`.
   - Canvas: see §j.2.
 - **Origins.** Origin tags are module-level symbols:
-  - `MAIN`: updates received from the main replica;
+  - `MAIN`: editor changes pushed by a bound view (`bodyPush`, §d.3);
   - `REMOTE`: committed or provisional rows;
   - `MERGE`: worker-side merge engine output;
   - `LOAD`: building a replica from storage.
@@ -647,7 +647,7 @@ cold ──load──▶ resident ──bind──▶ bound
   - Cost is O(doc) and happens once per residency, never per edit.
 - **resident.** The replica is in memory, and the frame builder and merge jobs may use it.
   - Estimated heap: `3 × (snapshot bytes + tail bytes + applied update bytes)`.
-- **bound.** Resident, with a main replica attached (§d.2). A bound doc is pinned and never evicted.
+- **bound.** Resident, with one or more editor views attached as clients (§d.2). A bound doc is pinned and never evicted.
 - **evict.** LRU (`streams.lastAccessMs`) over **clean** handles only. A handle is clean when:
   - its frame builder is empty (flushed through `T_edit`);
   - no merge, projection, catch-up or compaction job holds it;
@@ -658,81 +658,160 @@ cold ──load──▶ resident ──bind──▶ bound
     budget by one doc.
   - `memory-pressure` evicts every clean handle.
 
-### d.2 Main replicas (open notes) vs worker replicas
+### d.2 Bound views: the worker replica is the only replica
 
+- **No CRDT on main.** A bound note has exactly one `Y.Doc`, and it lives in the worker. Each open editor is a client
+  of that replica in the @codemirror/collab model (split views of one file are two clients). Main holds only
+  CodeMirror values:
+  - the editor's own `Text`;
+  - a `DocMirror` per bound doc: the replica's text at the last version main applied (immutable `Text`, O(change ·
+    log N) per entry) and the text of the last durable version;
+  - per view, its unconfirmed `ChangeSet`s (host/bodyClient.ts).
+  - check-deps forbids `yjs`, `y-protocols`, `lib0` and `y-codemirror.next` anywhere under `src/host`. That covers
+    direct, type-only, test and transitive imports (through core/ports/protocol), and it guards whole-document
+    reads on main (§k.2).
+  - The one exception is the inline fallback (§g.5): with no Worker, the engine and its Yjs run on main by design.
+- **No hashing or whole-file decoding on main.** The host reads and writes raw bytes. Every fingerprint and content
+  hash it needs (write preconditions, config writes) comes from the engine through `HashOracle` (§h, `hashRequest`
+  in §g.2). What that costs in the precondition window is in §f.2.
 - **Opening a note.**
-  - The host sends `openDoc{path, viewId}`.
-  - The engine resolves the docId via `remoteByPathKey` (optimistic remote, so own pending creates are bindable), loads
-    the doc, and answers `bind{docId, state, stateVector, baseText, baseHash, frozen}`.
-  - It answers `notBindable` for excluded or untracked paths and for non-markdown files.
-  - When a create is planned later, `bindable{path}` makes the host retry.
-- **Bind-time merge**, on main, before attaching y-codemirror:
-  1. `editorText = view.getText()`, `crdtText = ytext.toString()` on a fresh main `Y.Doc` loaded from `state`.
-  2. If they are equal, bind.
-  3. Otherwise run `MergeFn{base: baseText, disk: editorText, crdt: crdtText}`. This is the ONE merge engine (§f.3),
-     pure, in `src/core/merge`.
-     - Apply the result to the main `Y.Text` as a minimal diff (origin `MAIN`), then `view.applyMinimalReplace(result
-       text)`.
-     - On a conflict the host writes the conflict copy (`write`, precondition `absent`, non-destructive) and reports
-       `boundExternalMerged`. The next reconcile creates the copy as a new doc.
-  4. `view.bind({ytext, localOrigin: MAIN_EDITOR, awareness: null})`.
-  5. Send `bindDelta{Y.encodeStateAsUpdate(mainDoc, stateVector)}`, which is empty unless step 3 changed text.
+  - The host sends `openDoc{path, viewId}` and the engine answers `bind{docId, kind, frozen}`. Resolution is as
+    before (`remoteByPathKey`, optimistic remote). The engine answers `notBindable` for excluded, untracked and
+    non-markdown paths, and a later `bindable{path}` makes the host retry. No answer carries text or CRDT state.
+  - Main uploads the editor text as `textChunk{uploadId, bytes, last}`:
+    - UTF-16 slices of `TEXT_CHUNK_UNITS` (65 536) units, each buffer transferred;
+    - one macrotask per chunk, with a `setTimer(0)` yield between chunks.
+  - This is the only whole-editor read on main, and it never runs per keystroke or per workspace event. It happens
+    at the first bind and at a re-bind (after a resync or an engine restart).
+    - At a re-bind, main also uploads the restart base: the mirror's last durable text.
+    - At every bind of a dirty view, it also uploads the text Obsidian last saved (`saved`). The engine has no disk
+      text for the doc after a restart; taking the editor's unsaved text for it would turn a sibling view's older
+      disk text into an edit that reverts the unsaved one (sim seed 62, sim/device.test.ts).
+  - `bodyAttach{docId, viewId, editor, base, saved}` names the uploads. The user keeps typing meanwhile. Edits made
+    after the upload stay in the view client as `pre`.
+- **Bind-time merge, in the worker** (boundBody.attach). If the upload differs from the replica's text, the worker
+  runs `merge(base, disk = upload, crdt = replica)` with the one merge engine (§f.3).
+  - `base` is the upload itself when the replica has already absorbed it (its last disk text or a save candidate).
+    Otherwise it is the uploaded restart base, the doc's last disk text, or the persisted synced base, in that order.
+  - The result enters the replica as one MERGE transaction, which reaches the doc's other views as an entry.
+  - The view gets `bound{viewId, attach, version, changes, length}`: the ChangeSet that turns its upload into the
+    replica's text at `version`. Main applies it behind `pre` (§d.3).
+  - On a conflict, the worker writes the conflict copy itself (boundDisk: precondition `absent`, retried on I/O
+    errors, notice `conflict-copy`).
+  - **A conflict copy not yet written exists only in worker memory and is lost if the worker dies.** The sim device
+    counts these as `crashLost`.
 - **While bound:**
-  - The editor buffer **is** the Local-tree content of the file, and Obsidian's own save writes it (2 s debounce, or
-    on request via `saveViews`).
-  - The projection never writes a bound file.
-  - `boundSaved{text, fingerprint, stat}` sets the synced base: `baseText` is persisted lazily (`BOUND_BASE_PERSIST_MS`),
-    and `synced` immediately.
-- **External change to a bound file.** Another app or plugin writes it, and Obsidian calls `setViewData(data,
-  false)`.
-  - The per-view interceptor runs `MergeFn{base: view.getLastSavedText(), disk: incoming, crdt: mainYText}` on main.
-  - It applies the result as a minimal diff (origin `MAIN`, sent as `localUpdate{origin: "merge"}`), requests a save,
-    and returns `"handled"`.
-  - If interception is unavailable (risk OR-2), the periodic reconcile catches it: L ≠ S for a bound doc → the engine
-    sends `saveViews` and then plans `reconcileContent`, which merges against the main text.
-- **Unbind** (`closeDoc` or `file-changed`): detach y-codemirror, destroy the main replica, and keep the worker
-  replica resident (clean, LRU).
-- **`docRetarget`** (renamed, merged, deleted, frozen, rebuilding): the host unbinds. For `renamed`, `merged` and
-  `frozen` it re-runs `openDoc` (`frozen` binds read-only with a banner). A deleted doc stays unbound until the next
-  `bindable`.
+  - The editor buffer **is** the Local-tree content of the file. Obsidian's own save writes it (2 s debounce, or
+    `saveViews`), and the projection never writes a bound file.
+  - When Obsidian reads the editor for a save (`getViewData` with dirty cleared, `onSaveRead`), main pushes what it
+    has buffered and posts `bodySaveMark{version, seq}`. The worker keeps that replica text as a save candidate.
+  - A vault event on a bound file schedules `checkSaved` in the worker. It reads the file, stats it, and checks the
+    file did not change in between.
+    - Only text the replica has absorbed (its last disk text, a save candidate, or the replica's current text)
+      becomes `boundSaved`, the synced base.
+    - The reconcile merge does not count a bound editor's own save as an external edit (`boundSavedText`).
+    - Main never hashes or compares texts on this path.
+- **Content Obsidian pushes into a bound view** with `setViewData(data, false)`: an external reload, a properties
+  edit, or the quick-preview copy from a sibling view. The per-view interceptor, installed from `opening` onward,
+  routes it:
+  - **Quick preview from a sibling of the same file that is attaching or bound: dropped** (`"handled"`). The sibling's
+    edit reaches this view as an entry. "Same file" means the same doc, or the same path while the receiving view is
+    still opening.
+    - A preview from a sibling that is only opening goes through the reload route below.
+    - Views that cannot bind (idle, waiting) get Obsidian's default.
+  - **Otherwise, while attaching or bound: a reload.**
+    1. Main holds the view's saves: `getViewData` answers `lastSavedData`, so Obsidian's save compares equal and
+       skips.
+    2. Main uploads the incoming text as it came (chunks) and sends `bodyReload{reload, text}`.
+    3. The worker merges it (boundDisk.reload: `base` is the incoming text if the replica absorbed it, else the last
+       disk text) and applies the result as MERGE. The entry carries the result to the editor. On a conflict the
+       worker writes a conflict copy.
+    4. The worker answers `reloaded{viewId, reload, save}`. Main releases the hold, and saves if told to or if a save
+       was skipped meanwhile.
+  - If interception is unavailable (risk OR-2), the periodic reconcile catches the change: `saveViews`, then
+    `reconcileContent` against the replica.
+- **Unbind** (`closeDoc{docId, viewId}`, on `file-changed`, view close, or `EditorView.setState` via `onReset`): the
+  binding detaches. The worker replica stays resident (clean, LRU).
+- **`docRetarget`** (renamed, merged, deleted, frozen, resync) works as before.
+  - For `renamed`, `merged` and `frozen`, the host re-opens the doc. `frozen` binds read-only.
+  - For `resync`, every view of the doc re-binds: upload, then `bodyAttach` with the mirror's durable text as the
+    base.
+- **Engine restart:** `suspend` keeps each doc's durable mirror text as its restart base, and `start` re-binds every
+  view.
 
 ### d.3 Two-way flow without double apply
 
 ```
-editor ─CM tx─▶ main Y.Doc ──update(origin≠REMOTE_IN)──▶ coalesce ≤16 ms ──localUpdate──▶ worker Y.Doc (origin MAIN)
-                     ▲                                                                       │
-                     └────── docUpdate (FIFO per doc, docCredit window) ◀── origin ∈ {REMOTE, MERGE} ┘
-                                                                                             │
-                                                                                 frame builder (origin ∈ {MAIN, MERGE})
+editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms─▶ bodyPush{seq, base|after, changes} ─▶ worker Y.Doc (MAIN)
+   ▲                                                                                                        │
+   └─ applyRemote(F′) ◀─ rebase over unconfirmed ◀─ DocMirror.apply ◀─ body{entry|bound|reject|durable|reloaded} ◀┘
+                                                     (FIFO per doc, docCredit window)          frame builder (MAIN, MERGE)
 ```
 
-- **Main.**
-  - Listens to `doc.on("update")` and forwards only updates whose origin is not `REMOTE_IN`, the origin it uses to
-    apply `docUpdate`.
-  - Coalesces within `MAIN_UPDATE_COALESCE_MS` with `Y.mergeUpdates` over the small batch.
-  - Posts `localUpdate` with the buffer transferred. It never drops one.
+- **Versions and entries.** Every change of a bound replica bumps the doc's version and becomes one `entry{from, to,
+  changes, length, origin, author}`.
+  - `changes` is CodeMirror ChangeSet JSON over the text at version `from`: a number retains, `[n]` deletes,
+    `[n, ...lines]` replaces. The worker computes it from the Y transaction's delta.
+  - `author` is `{viewId, seq}` of the push the entry applies, or null for remote, provisional and merge changes.
+- **Typing (main → worker).**
+  - The collab ViewPlugin reports each local transaction's ChangeSet (O(change)), and the view client composes it
+    into its buffer.
+  - `MAIN_UPDATE_COALESCE_MS` later, main sends `bodyPush{seq, base, after, changes}`. A push is either against the
+    mirror's version (`after = null`) or chained after the view's newest push still in flight (`after = seq`).
+  - Only changed ranges and inserted text cross. No message on the typing path carries the document.
 - **Worker.**
-  - Applies `localUpdate` with origin `MAIN`.
-  - The **same bytes** go to the frame builder. Nothing is re-encoded and there is no state-vector diff per keystroke.
-  - Updates with origin `REMOTE` or `MERGE` are forwarded to main as `docUpdate` when the doc is bound, and are never
-    sent back.
-  - `MERGE` updates also go to the frame builder. `REMOTE` updates never do.
-- **Idempotence.** `Y.applyUpdate` is idempotent, so a duplicate (resent row, adopted provisional, rebind) is
-  harmless. Origin filtering only prevents loops and wasted work.
-- **Backpressure.** `docUpdate` is sent within a per-doc credit window (`docUpdateWindowBytes`). Main returns
-  `docCredit{bytes}` after applying.
-  - When the window is exhausted the worker keeps applying to its own replica and queues the forwards.
-  - If the queue exceeds 4× the window, it replaces the queue with one `Y.encodeStateAsUpdate(workerDoc,
-    mainStateVector)` (origin `resync`), using the main state vector learned at bind and updated with every
-    `localUpdate`.
+  - A push fits when `after === null ? base === version : lastAuthor = {viewId, after}`, meaning nothing else came in
+    between.
+  - A push that fits applies as one MAIN Y transaction (`applyEditorChanges`, O(change)). Its update bytes go to the
+    frame builder unchanged. Its entry, with `author` set, goes to every attached view.
+  - Otherwise the worker answers `reject{viewId, seq, version}`.
+- **Main applies each body event in order:**
+  - **entry:** `DocMirror.apply` refuses a version gap or a length mismatch (→ resync).
+    - The author view confirms its oldest push in flight. Any other order → resync.
+    - Every other bound view rebases the foreign change F over its unconfirmed changes:
+      - for each push I in flight: `I′ = I.map(F)`, then `F = F.map(I, true)`;
+      - then for the buffer B: `B′ = B.map(F)`, then `F = F.map(B, true)`.
+    - The editor applies the final F with `addToHistory = false`, `remote = true` and filters off.
+    - On both sides the replica's change goes first at equal positions (the worker applies I′ after F), so every
+      editor converges with the replica.
+  - **reject:** `version` must equal the mirror's. Main composes everything unconfirmed into the buffer and pushes
+    it again at the newer version; the entries before the reject have already rebased it. Rejects of the pushes
+    chained behind it are stale and are ignored.
+  - **bound:** the editor applies `c.map(pre, true)`, and the buffer becomes `pre.map(c)`.
+  - **durable{version}:** the mirror keeps that version's text as the restart and resync base. The worker sends this
+    when everything up to `version` is committed.
+  - **reloaded:** see §d.2.
+- **Liveness.** A push lands only if no foreign entry arrives within its round trip. When foreign entries arrive
+  faster than 1/RTT, the client keeps rebasing and re-pushing: nothing is lost, only delayed. The seeded fuzz
+  (host/bindingFuzz.test.ts: split views, remote edits, delays up to 300 ms) converges with about 93 % of pushes
+  rejected.
+- **No double apply.**
+  - Editors apply only foreign entries; their own entries are confirmations.
+  - The worker applies each push at most once (seq plus the fit rule).
+  - Remote changes never go back to the worker, and bind and reload merges run only in the worker.
+- **Undo** is CodeMirror's own history (Obsidian's `editor:undo`).
+  - Local transactions are recorded. Remote dispatches carry `addToHistory = false`, which the history maps instead
+    of recording (obsidian.asar 1.14.4 app.js@1889598; Obsidian's bundled @codemirror/collab `receiveUpdates`,
+    app.js@2759543, does the same).
+  - An undo is a local transaction and is pushed like typing.
+  - Remote cursors stay null (§m.2).
+- **Backpressure.** Body events go out within a per-doc credit window (`docUpdateWindowBytes`; weight = event size).
+  Main returns `docCredit{bytes}` after applying an event. If a doc's queue exceeds 4× the window, the worker drops
+  it and sends `docRetarget{resync}`, and the views re-bind.
+- **Main-thread cost on a 1 MB note** (e2e/client/mainThreadBench.ts):
+  - **Per keystroke:** one compose, one `toJSON` of the changed ranges, one post. About 11 µs, flat in note size and
+    history. Before: 22–90 µs, growing with the Yjs item count.
+  - **Per remote update:** `fromJSON`, a `Text` replace, a map over unconfirmed changes, one dispatch. About 7 µs.
+    Before: 73–400 µs, because y-codemirror's observer reads `event.delta`, which walks every item (yjs
+    src/types/YText.js:655-721).
 - **Unbound docs → disk.** A remote change marks the doc `bodyVersion`-dirty. The planner (§f.2) emits
-  `reconcileContent`, which writes the CRDT text with a CAS precondition (`fingerprint = synced.fingerprint`). Disk
-  changes flow back the same way. Echo suppression is in §f.4.
+  `reconcileContent`, which writes the CRDT text with a CAS precondition (§f, preconditions hashed by the engine).
+  Disk changes flow back the same way. Echo suppression is in §f.4.
 
 ### d.4 Batching into outbox frames
 
-- **One frame builder per stream.** It holds raw update buffers: `MAIN` updates from `localUpdate`, and `MERGE`
-  updates from `doc.on("update")` during a merge job.
+- **One frame builder per stream.** It holds raw update buffers: `MAIN` updates from the editor pushes the worker
+  applies (`bodyPush` → `applyEditorChanges`, §d.3), and `MERGE` updates from `doc.on("update")` during a merge job.
 - **Closing.**
   - **Bound docs:** after `OPEN_FRAME_IDLE_MS` (100 ms) idle or `OPEN_FRAME_MAX_MS` (300 ms) age, or at
     `FRAME_MAX_UPDATES` / `FRAME_MAX_BYTES`.
@@ -751,7 +830,7 @@ editor ─CM tx─▶ main Y.Doc ──update(origin≠REMOTE_IN)──▶ coale
 - **Durability window.** From keystroke to `T_edit` commit is ≤ 16 + 300 ms plus IDB commit time.
   - During that window the edit is durable only through Obsidian's save of the bound file.
   - After a crash, startup bind or reconcile finds disk ≠ CRDT and merges the disk text in with base = synced (§f.3).
-  - Alternative: one `T_edit` per localUpdate. Rejected: about 60 IDB transactions per second while typing.
+  - Alternative: one `T_edit` per `bodyPush`. Rejected: about 60 IDB transactions per second while typing.
 - **Initial content of a new markdown/canvas doc** (planner `nsCreate` + `reconcileContent`, or the first bind):
   - inserted in `INITIAL_INSERT_CHUNK_CHARS` transactions, one frame each, flag `initial`;
   - every initial frame is `held` with `dependsOn` = the ns create frame, and released when that create folds as
@@ -1182,8 +1261,31 @@ All are in `src/core/types.ts`.
   "fingerprint"}` with the fingerprint read by the job). They are sent in `diskOps` batches of ≤ `diskOpsPerBatch`,
   tagged with the lane.
 - **Failed precondition:** that doc is re-planned in the next scoped pass. Nothing is retried blindly.
-- **Bound docs.** `reconcileContent` merges into the worker replica (origin `MERGE` → `docUpdate` → editor), and
+- **Bound docs.** `reconcileContent` merges into the worker replica (origin `MERGE` → body `entry` → editor), and
   Obsidian's save writes the disk. The projection never writes a bound file (§d.2).
+- **Precondition checks run without hashing on main** (host/obsidianVault.ts header, host/hashOracle.ts).
+  - Obsidian has no compare-and-swap. For a `fingerprint` / `hash` precondition over an existing file, the host
+    reads the raw bytes at t0 (`adapter.readBinary`) and transfers them in `hashRequest`. The engine answers the
+    hash and the UTF-16 length of the decoded text (BOM kept) at t1. The host writes at t2.
+    `absent` goes through `vault.create`, which throws if the file exists, so it is atomic.
+  - **Caught:**
+    - Any change visible in `TFile.stat` (size or mtime differs from the snapshot taken before the t0 read): the
+      host rechecks it right before the write, with no `await` in between.
+    - For text, any change of the UTF-16 length up to the write. `vault.process` reads the file inside Obsidian's
+      adapter queue, and the host's callback throws (nothing is written) unless `cur.length` equals the engine's
+      `textLength` (obsidian.asar 1.14.4: desktop `adapter.process` app.js@552301; `Vault.process`
+      app.js@1426847; Capacitor app.js@1350128).
+  - **Missed (accepted gap):** a same-length text change, or any binary change, that is not yet in `TFile.stat` at
+    the recheck. That covers a change the watcher has not delivered yet, one that kept size and mtime, and one that
+    lands between the recheck and the `process` read or `modifyBinary`.
+    - Base 6f7129b closed the text part of this gap by decoding and comparing the full text inside `process`, at
+      O(N) main-thread cost (obsidianVault.ts:108-109, 157, 173 at base). §d.2 forbids that.
+    - The engine fingerprints what it asked to write (`WriteOutcome` carries no fingerprint) and re-reads the
+      disk on the next modify event. A change lost this way is the narrow race of any non-atomic writer, never a
+      silent loop.
+  - **Spurious failures** are in the safe direction: if Obsidian's decode ever disagreed with the engine's WHATWG
+    UTF-8 decode on invalid bytes, the length guard fails and the op is re-planned.
+  - Config writes (`diskExecutor.writeConfig`) read the bytes and hash them through the same oracle.
 
 ### f.3 The merge engine (one)
 
@@ -1230,7 +1332,8 @@ All are in `src/core/types.ts`.
 
 ### f.4 Echo suppression
 
-- For every completed host write, rename or trash (`DiskOpResult` with stat + fingerprint), record `echo[pathKey] =
+- For every completed host write, rename or trash (`DiskOpResult` with the stat; the engine fingerprints the bytes
+  it asked to write), record `echo[pathKey] =
   {kind, size, mtimeMs, fingerprint, expiresAt: now + ECHO_TTL_MS}`. Writes also update `localTree` directly with the
   known hash.
 - A matching `VaultEvent` is dropped: modify/create with equal size + mtime, or the exact expected rename or delete.
@@ -1238,7 +1341,8 @@ All are in `src/core/types.ts`.
 - A non-matching event marks the path dirty (`hash = null`), and the scoped plan re-hashes.
 - Echo suppression only drops hints. The full reconcile re-checks stats, with racy-clean re-hashing, so a wrongly
   dropped event costs latency, never correctness.
-- Saves of bound files arrive as `boundSaved`. The matching modify event only refreshes the stat cache.
+- Saves of bound files are found by the worker's `checkSaved` on the modify event (§d.2) and become `boundSaved`;
+  that event otherwise only refreshes the stat cache.
 
 ### f.5 Safety brake
 
@@ -1301,7 +1405,8 @@ All are in `src/core/types.ts`.
 
 ## g. Main ↔ worker protocol
 
-Types are in `src/protocol/*.ts`. `PROTOCOL_VERSION = 1`.
+Types are in `src/protocol/*.ts`. `PROTOCOL_VERSION = 2` (2: the body protocol of §d.3 replaced Yjs updates on the
+binding path, and hashing moved to the engine).
 
 ### g.1 Carriers
 
@@ -1329,13 +1434,15 @@ transferred buffers.
 | `ping` | yes | Liveness every 10 s | `pong` (no pong within `PING_TIMEOUT_MS` → restart) |
 | `observations{scanId, chunk, complete}` | yes | Listing chunks (≤ 2000 stats) | `ok` (the host sends the next chunk after it) |
 | `vaultEvents{events}` | — | Hints, batched ≤ 50 ms / 256 | — |
-| `openDoc{path, viewId}` | yes | Bind request | `bind{BindInfo [T]}` / `notBindable{reason}` |
+| `openDoc{path, viewId}` | yes | Bind request | `bind{docId, kind, frozen}` / `notBindable{reason}` |
 | `closeDoc{docId, viewId}` | — | Unbind | — |
-| `localUpdate{docId, update [T], origin}` | — | Main replica update (editor / merge), coalesced ≤ 16 ms, never dropped | — |
-| `bindDelta{docId, update [T]}` | — | Main delta against `BindInfo.stateVector` after (re)bind | — |
-| `boundSaved{docId, path, text, fingerprint, stat}` | — | Obsidian saved a bound view: new synced base | — |
-| `boundExternalMerged{docId, result, conflictReason}` | — | Interceptor merged an external change | — |
-| `docCredit{bytes}` | — | `docUpdate` flow control | — |
+| `textChunk{uploadId, bytes [T], last}` | — | UTF-16 units of a whole-text upload (editor text, restart base, saved text, reload), ≤ 64 Ki units per chunk, one macrotask each. Bind, re-bind and reload only (§d.2) | — |
+| `bodyAttach{docId, viewId, editor, base, saved}` | — | Merge the uploaded editor text into the replica; `base` / `saved` name optional uploads | body `bound` |
+| `bodyPush{docId, viewId, seq, base, after, changes}` | — | Editor ChangeSet JSON, coalesced ≤ 16 ms: against version `base`, or chained after this view's push `after`. Never dropped | body `entry` (author set) / `reject` |
+| `bodyReload{docId, viewId, reload, text}` | — | Obsidian pushed text into a bound view (`setViewData`): merge upload `text` | body `reloaded` |
+| `bodySaveMark{docId, viewId, version, seq}` | — | Obsidian read the view for a save at replica `version` (after push `seq`): a save candidate | — |
+| `docCredit{bytes}` | — | Body event flow control (returns the event `weight`) | — |
+| `hashRequest{items[{path, want, bytes [T]}]}` | yes | Hash bytes the host read (write preconditions, config writes); ≤ 64 items / 8 MiB per batch | `hashes{values[{hash, textLength}]}` |
 | `command{UserCommand}` | yes | pause, resume, reconcileNow, approve/rejectBrake, snapshots, diagnostics, rebuildLocalCache, updateSettings, releaseQuarantine | `ok` / `snapshots` / `diagnostics` |
 | `result` / `error` `{re}` | — | Answers to engine requests | — |
 
@@ -1343,8 +1450,8 @@ transferred buffers.
 
 | Message | rid | Purpose | Answer |
 |---|---|---|---|
-| `docUpdate{docId, update [T], origin}` | — | Remote / merge / provisional / resync update for a bound doc, FIFO per doc, within credit | `docCredit` |
-| `docRetarget{docId, change}` | — | renamed / merged / deleted / frozen: the host unbinds and re-opens (§d.2) | — |
+| `body{docId, event, weight}` | — | Body event of a bound doc (`entry` / `bound` / `reject` / `durable` / `reloaded`, §d.3), FIFO per doc, within credit | `docCredit{weight}` |
+| `docRetarget{docId, change}` | — | renamed / merged / deleted / frozen: the host unbinds and re-opens; `resync`: the host re-binds every view of the doc (§d.2) | — |
 | `bindable{path}` | — | A path became bindable | Host `openDoc` |
 | `readRequest{reads}` | yes | Disk reads (area vault/config, maxBytes) | `reads{DiskReadResult[] [T]}` |
 | `diskOps{lane, ops}` | yes | Ordered ops with preconditions. A failed op does not stop independent later ones; dependents report `skipped` | `diskOps{DiskOpResult[]}` |
@@ -1370,12 +1477,14 @@ transferred buffers.
   The sender copies with `slice()` otherwise (Yjs encoders usually return owned buffers), and never touches it after
   `post`.
 - **Backpressure:**
-  - `docUpdate` uses a credit window per doc (§d.3);
+  - body events use a credit window per doc (§d.3);
+  - `hashRequest` batches are ≤ `MAX_BATCH_ITEMS` (64) items and `MAX_BATCH_BYTES` (8 MiB), with the bytes
+    transferred (host/hashOracle.ts);
   - `observations` are chunked and acknowledged;
   - `readRequest` is bounded by `maxDiskIoBytesInFlight`;
   - `diskOps` batches are ≤ `diskOpsPerBatch`, and the host runs lane 0 batches before others, within `mainSliceMs`
     slices;
-  - `vaultEvents` and `localUpdate` are small and unbounded by design. Main never drops them.
+  - `vaultEvents` and `bodyPush` are small and unbounded by design. Main never drops them.
 - **Timeouts.** Engine requests time out after `DISK_REQUEST_TIMEOUT_MS` / `SIDE_FILE_TIMEOUT_MS` → `error(timeout)`.
   The engine re-plans the scope, and nothing is assumed done.
 - **Errors.** `ProtocolError{code, message, retryable}`. `message` never contains credentials or file contents.
@@ -1383,8 +1492,9 @@ transferred buffers.
   failed verification, §j.4) is never retryable.
 - **Worker failure** (`onFailure`, or missed pongs):
   - The host terminates the worker and starts a new one.
-  - Bound views re-run `openDoc`. Their `bindDelta` carries any main edits the dead worker never persisted, because
-    the main replica still holds them, so a worker crash loses nothing.
+  - Bound views re-run `openDoc` and re-bind (§d.2): main uploads the editor text, with the mirror's last durable
+    text as the merge base. Edits the dead worker never persisted are still in the editor, so the bind merge brings
+    them back. A crash loses only conflict copies the worker had not written yet (§d.2).
   - After `MAX_WORKER_RESTARTS` within 10 min, the host switches to inline.
 
 ### g.5 Inline fallback
@@ -1464,8 +1574,7 @@ interface VaultPort {
   readonly caseInsensitive: boolean;
   list(): Promise<readonly VaultStat[]>;
   stat(path: string): Promise<VaultStat | null>;
-  readText(path: string): Promise<string>;
-  readBytes(path: string): Promise<Uint8Array>;
+  readBytes(path: string): Promise<Uint8Array>;   // raw bytes, transferred to the engine; main never decodes text
   write(path: VaultPath, data: string | Uint8Array, precondition: WritePrecondition): Promise<WriteOutcome>;
   rename(from: string, to: VaultPath, precondition: WritePrecondition): Promise<RenameOutcome>;   // vault.rename, never fileManager.renameFile
   trash(path: string, mode: TrashMode, precondition: WritePrecondition): Promise<RenameOutcome>;  // no permanent delete
@@ -1485,13 +1594,27 @@ interface SideFilePort {
   list(prefix: "snapshots/"): Promise<readonly SideFileName[]>;
 }
 
-// workspace.ts — main thread only
+// workspace.ts — main thread only. Only @codemirror/state types cross (type-only); every call is O(1) or O(change)
+interface EditorBindingSpec {
+  onLocal(changes: ChangeSet): void;   // one local transaction's changes, in order (typing, undo, paste)
+  onReset(): void;                     // EditorView.setState replaced the state: the binding is void
+  onSaveRead(): void;                  // Obsidian reads the editor for a save (getViewData, dirty cleared)
+}
+interface EditorBinding {
+  doc(): Text;                                 // immutable CodeMirror Text, O(1)
+  applyRemote(changes: ChangeSet): void;       // addToHistory=false, remote, filters off; never reported to onLocal
+  detach(): void;
+}
+type ExternalReloadHandler = (incoming: string, from: number | null) => "handled" | "default"; // from = sibling viewId
 interface EditorViewRef {
   readonly viewId: number; readonly path: VaultPath | null;
-  hasEditor(): boolean; getText(): string; getLastSavedText(): string;
-  applyMinimalReplace(text: string): void;
-  bind(spec: EditorBindingSpec): Unsubscribe;                       // y-codemirror
+  hasEditor(): boolean;
+  editorDoc(): Text | null;                    // O(1)
+  isDirty(): boolean;                          // TextFileView.dirty
+  lastSavedText(): string | null;              // TextFileView.lastSavedData: read, never compared, on main
+  bind(spec: EditorBindingSpec): EditorBinding;                     // collab ViewPlugin listener (host/collab.ts)
   interceptExternalReload(handler: ExternalReloadHandler): Unsubscribe; // per-instance setViewData wrap
+  holdSaves(hold: boolean): boolean;           // getViewData answers lastSavedData; returns "a save was skipped"
   save(): Promise<void>;
 }
 interface WorkspacePort {
@@ -1537,9 +1660,13 @@ interface RelayPort { connect(params: { vaultId: VaultId; deviceId: DeviceId }):
 
 // index.ts — bundles
 interface EnginePorts { relay; storage; clock; random; crypto; hash; blob: BlobPort | null }
-interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; random; hash }
+interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; random }   // no hash: main never hashes (§d.2)
 ```
 
+- **Not a port: `HashOracle`** (host/hashOracle.ts). The host's only hashing entry point:
+  `hash(items: {path, want: "fingerprint" | "contentHash", bytes}[]) → {hash, textLength}[]`, served by the engine
+  through `hashRequest` (bytes transferred, §g.2). It rejects while the engine is not running, and callers fail the op
+  instead of guessing. The simulation uses an in-process oracle (sim/hash.ts).
 - **Production adapters:**
   - `ObsidianVaultPort`, `ObsidianWorkspacePort`, `SideFilePort`, `ConfigDirPort` and `PlatformPort` in `src/host/`
     (WP-D);
@@ -1558,7 +1685,7 @@ interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; r
 
 | Lane | `LANE` | Work |
 |---|---|---|
-| 0 | `openNote` | `localUpdate` apply, frame close and **send** for bound docs, receipts, `docUpdate` forwarding, provisionals for bound docs, bind requests |
+| 0 | `openNote` | `bodyPush` apply, frame close and **send** for bound docs, receipts, body event forwarding, provisionals for bound docs, bind requests and bind merges |
 | 1 | `openCatchUp` | Reads, union and merges for bound or just-opened docs; hard-limit compaction |
 | 2 | `namespace` | ns/cfg/snap ingest, fold, ns/cfg/snap reads, planner runs, ns frames, settings projection |
 | 3 | `background` | Body reads for stale streams, merges, projection writes, materialization, scan hashing |
@@ -1594,7 +1721,7 @@ Budgets (`BUDGETS` in `limits.ts`):
 | Disk I/O in flight / ops per batch | 8 MiB / 32 | 4 MiB / 16 | 2 MiB / 16 | 1 MiB / 8 |
 | Full reconcile interval | 5 min | 10 min | 10 min | 15 min |
 | Daily frame soft budget | 20 000 | 10 000 | 6 000 | 4 000 |
-| `docUpdate` credit window | 512 KiB | 256 KiB | 256 KiB | 128 KiB |
+| Body event credit window (`docUpdateWindowBytes`) | 512 KiB | 256 KiB | 256 KiB | 128 KiB |
 
 Further caps:
 - live queue: 4 MiB / 1000 rows;
@@ -2021,8 +2148,8 @@ src/
     settings/ cfgScan, cfgProject                                                             [WP-B]
     snapshots/ snapshotJob, exporter, localStore, remote (upload, parts), restore, snapIndex  [WP-B]
     workerMain.ts            worker entry glue                                                [WP-D]
-  host/                      Obsidian main thread; obsidian, yjs, y-codemirror allowed
-    plugin.ts engineHost.ts (spawn, restart, inline fallback) diskExecutor.ts binding.ts
+  host/                      Obsidian main thread; obsidian, @codemirror/*; no yjs / lib0 / y-protocols (§k.2)
+    plugin.ts engineHost.ts (spawn, restart, inline fallback) diskExecutor.ts binding.ts bodyClient.ts collab.ts hashOracle.ts
     obsidianVault.ts obsidianWorkspace.ts configDir.ts sideFiles.ts platform.ts ui/          [WP-D]
   sim/                       tests only, never bundled
     relay.ts storage.ts clock.ts random.ts                                                    [WP-A]
@@ -2034,13 +2161,24 @@ src/
 These are enforced by `scripts/check-deps.mjs` (WP-D), a regex import scan run in CI.
 
 - `core/**` imports only `core/**`, `lib0`, `fflate`, and type-only `ports/**`.
-- `ports/**` and `protocol/**` (types) import only `core/**` types (plus the `yjs` type in workspace.ts).
+- `ports/**` and `protocol/**` (types) import only `core/**` types (plus type-only `@codemirror/state` in
+  ports/workspace.ts).
 - `engine/**` imports `core`, `ports`, `protocol`, `yjs`, `lib0` and `fflate`.
   - Never `obsidian` or `host/**`.
   - Browser globals (`indexedDB`, `WebSocket`, `fetch`, `crypto.subtle`) only in `engine/adapters/**`.
-- `host/**` imports `core`, `ports`, `protocol`, `obsidian`, `yjs`, `y-codemirror.next`, `@codemirror/*` and `qrcode`
-  (the pairing QR). From `engine/` it imports only `engine/runtime/engine.ts` (inline fallback) and the bundled worker
-  source string.
+- `host/**` imports `core`, `ports`, `protocol`, `obsidian`, `@codemirror/*` and `qrcode` (the pairing QR). From
+  `engine/` it imports only `engine/adapters/webEngine.ts` (worker spawn and inline fallback), and `host/entry.ts`
+  imports `engine/workerMain.ts`.
+- **Main-thread rules (§d.2).** The main thread holds CodeMirror state and raw disk I/O only.
+  - `MAIN_FORBIDDEN` = `yjs`, `y-codemirror.next`, `y-protocols`, `lib0`. No `host/**` file may import them: not
+    tests, not type-only imports.
+  - `mainReach` follows every product `host/**` module's relative imports through `core`, `ports` and `protocol`
+    (stopping at the two engine entries) and fails if a forbidden package is reachable.
+  - **Whole-document reads.** `FULL_READS` counts `.getValue(`, `.toString()`, `.sliceDoc(`, `.sliceString(`,
+    `.getViewData(` and `Text.of(` per `host/**` file. Each occurrence must be listed in `FULL_READ_ALLOW` with the
+    reason it is off the per-keystroke, per-remote-update and per-workspace-event paths, so a new one fails CI.
+    Today the list is the bind upload's `sliceString` (binding.ts) plus three `toString()` calls on non-documents
+    in host/ui.
 - `sim/**` may import anything. Nothing imports `sim/**` except tests.
 - Shared shapes change only through the architect files plus this document.
 
@@ -2054,7 +2192,7 @@ The only shared files are the frozen architect files. Each WP owns its directori
 | **WP-A: fold, codecs, paths, sim log** | `src/core/{codec,paths,ns,cfg}/**`, `src/sim/{relay,storage,clock,random}.ts` | (1) Every codec round-trips. Canonical re-encode rejects non-minimal input. Malformed ns/cfg frames fold as empty. (2) E1–E12 (§c.14) as unit tests. (3) 10k-op fold fuzz (§l.4) passes 1000 seeds. (4) pathKey: ß/ss, Σ/σ/ς, İ, NFC/NFD, unassigned code points rejected. Table generator reproducible from UCD 15.1. (5) `SimRelay` conformance with relay-wire: contiguous seqs, receipts after broadcasts, dedupe window expiry, older-seq notice, STREAM_RESEND loss, provisional/notice/dropped, feed/read paging, checkpoint CAS + GC, 1 MiB close, rate close, daily limit. (6) `MemStoragePort` crash semantics and tx-inactive detection. |
 | **WP-B: planner, merge, disk side** | `src/core/{hash,merge,plan}/**`, `src/engine/{reconcile,blobs,settings,snapshots}/**` | (1) MergeFn properties: no line of disk or crdt is lost (each appears in `text` or `conflictCopy`); identical/one-sided cases exact; bounded on 2M-char inputs. (2) `minimalDiff` applied to crdt0 equals the target, and its edit size is ≤ the line-diff size. (3) One test per planner table row. Brake thresholds and approval id stability. (4) Rename inference determinism (shuffle-invariant). (5) Conflict names always valid. (6) Reconcile job against `SimVault` + `MemStorage` + a stub log: CAS failures re-plan, echo suppression, intents resume at every crash point. (7) Settings projection gates (yaos dir, data.json version). |
 | **WP-C: log-side engine** | `src/engine/{store/repo.ts,adapters,ingest,body,sync,runtime}/**` | (1) Crash at every transaction boundary (§e.2): the state reconstructs, no outbox frame is lost, and the cursor never passes an unaccounted seq. (2) Gate: malformed, disallowed types, oversize, causal hole → re-read → freeze; `releaseQuarantine`. (3) Frame builder: per-keystroke cost independent of doc size (benchmark: 5 MB doc, 1000 keystrokes, no `encodeStateAsUpdate` calls), size caps, initial chunking, `bodyUpdateRef`. (4) Provisional adopt/settle/drop, R7 settle, STREAM_RESEND resend, send window. (5) Catch-up with GC'd rows → checkpoint union. Compaction exactness: snapshot = fold of rows ≤ C. Checkpoint CAS outcomes. (6) Smoke against the local relay (`scripts/relay-dev`, e2e/relay/smoke.ts scenarios through `WsRelayPort`). |
-| **WP-D: host, protocol carriers, worker, sim runner** | `src/protocol/{workerTransport,inlineTransport}.ts`, `src/engine/workerMain.ts`, `src/host/**`, `src/sim/{vault,workspace,actors,faults,invariants,run}.ts`, `scripts/check-deps.mjs`, esbuild config (worker string bundle) | (1) Worker and inline transport parity on recorded message traces; transfer ownership asserted. (2) Disk executor honours every `WritePrecondition`; rename uses `vault.rename`; trash only. (3) Binding: bind-time merge, no echo loop (update counts), external-reload interception, `docCredit` resync, worker kill mid-typing loses nothing (`bindDelta`). (4) Lifecycle flush on `pagehide`. (5) Full simulation suite (§l) green on 200 CI seeds. (6) Obsidian smoke on desktop + iOS: the worker starts and IDB opens in the worker (or inline fallback is reported). |
+| **WP-D: host, protocol carriers, worker, sim runner** | `src/protocol/{workerTransport,inlineTransport}.ts`, `src/engine/workerMain.ts`, `src/host/**`, `src/sim/{vault,workspace,actors,faults,invariants,run}.ts`, `scripts/check-deps.mjs`, esbuild config (worker string bundle) | (1) Worker and inline transport parity on recorded message traces; transfer ownership asserted. (2) Disk executor honours every `WritePrecondition`; rename uses `vault.rename`; trash only. (3) Binding: bind-time merge, no echo loop (update counts), external-reload interception, `docCredit` resync, worker kill mid-typing loses nothing (re-bind merge of the editor text). (4) Lifecycle flush on `pagehide`. (5) Full simulation suite (§l) green on 200 CI seeds. (6) Obsidian smoke on desktop + iOS: the worker starts and IDB opens in the worker (or inline fallback is reported). |
 
 - **Sequencing.** All four start at once against the frozen types.
   - WP-B and WP-C use stubs of each other's functions until the integration week.
@@ -2076,7 +2214,8 @@ All actors run in one Node process with a virtual `ClockPort` and a seeded `Rand
   latch, restarts.
 - **Device × N (2–5).** Each is engine (inline transport) + host + `SimVault` (case-insensitive or case-sensitive
   profile, Obsidian-like event semantics including per-child folder rename events) + `SimWorkspace` (views,
-  y-codemirror stand-in, 2 s save debounce, `setViewData` reloads) + `MemStoragePort` + `SideFilePort`.
+  a CodeMirror `Text` per view with a ChangeSet undo stack that maps remote changes like CodeMirror's history,
+  bound as in §d.3; 2 s save debounce; `setViewData` reloads) + `MemStoragePort` + `SideFilePort`.
 - **User actors**, per device: type into open notes (unique tokens), open/close/switch views, create/edit/rename/
   delete files and folders, case-only renames, paste large text, import a folder of files, attachments, settings
   edits. They act only on a running app in the foreground. While a device is down or backgrounded (`hidden`,

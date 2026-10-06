@@ -225,7 +225,6 @@ export function checkClean(devs: readonly SimDevice[], net: SimNet, isDown: (i: 
 		}
 		for (const ws of d.workspaces) {
 			for (const v of ws.history) {
-				if (v.counters.bindMismatch > 0) bad(`${n}: view ${v.viewId} bindMismatch=${v.counters.bindMismatch}`);
 				if (v.counters.defaultReloadWhileBound > 0) bad(`${n}: view ${v.viewId} defaultReloadWhileBound=${v.counters.defaultReloadWhileBound}`);
 			}
 		}
@@ -246,7 +245,7 @@ export function activity(devs: readonly SimDevice[], net: SimNet): string {
 	const parts: (number | string)[] = [net.relay.head(), rc.appendFrames, rc.provisionalBroadcasts];
 	for (const d of devs) {
 		const b = d.runtime.bindings.stats;
-		parts.push(d.vault.calls.write, d.vault.calls.rename, d.vault.calls.trash, b.localUpdatesPosted, b.mergeUpdatesPosted, b.bindDeltasPosted, d.sideFiles.writes);
+		parts.push(d.vault.calls.write, d.vault.calls.rename, d.vault.calls.trash, b.pushes, b.uploads, b.reloads, d.sideFiles.writes);
 		for (const v of d.workspace.views_()) parts.push(v.counters.saves, v.counters.localTx, v.counters.remoteApplied);
 	}
 	return parts.join(",");

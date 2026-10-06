@@ -1,61 +1,29 @@
 /**
- * Main-thread editor binding (DESIGN §d.2, §d.3).
+ * Main-thread editor binding (DESIGN §d.2, §d.3). Main holds no CRDT: the worker replica is the only Y.Doc,
+ * and each bound editor is a CodeMirror client of it (bodyClient.ts). Per keystroke main does O(change) work:
+ * the transaction's ChangeSet is composed into the view's buffer and pushed (coalesced, MAIN_UPDATE_COALESCE_MS)
+ * as ChangeSet JSON in pre-change coordinates with only the inserted text; the replica's changes come back as
+ * entries applied as CodeMirror transactions outside the undo history.
  *
- * One main replica (Y.Doc with one Y.Text "text") per bound doc, shared by
- * every view of that doc (split panes) and ref-counted by view slots.
+ * Whole texts cross only at a bind (first open, re-open after a resync or an engine restart: the editor text,
+ * plus the merge base when there is one, plus the text Obsidian last saved when the editor is dirty) and when Obsidian pushes text into a bound view (an external reload,
+ * a properties edit, an unbound view's quick preview): uploaded as transferred UTF-16 chunks of
+ * TEXT_CHUNK_UNITS with a yield between chunks. The worker compares, merges and diffs; main never does.
  *
- * Origins on the main replica:
- *  - REMOTE_IN   docUpdate from the engine and bind/rebind state: never forwarded;
- *  - BIND_LOCAL  bind-time merge edits: carried by bindDelta, never forwarded;
- *  - MAIN_MERGE  external-reload merge edits: forwarded at once as localUpdate "merge";
- *  - anything else (the y-codemirror sync config, its undo manager, the per-view origin):
- *    editor edits, coalesced MAIN_UPDATE_COALESCE_MS and forwarded as "editor".
- * The y-codemirror binding skips transactions tagged with its own origin and
- * annotates remote-applied CM transactions, so nothing is echoed.
- *
- * Engine restart: replicas are suspended (edits keep landing in the replica
- * but are not posted) and every view re-opens its doc; for the same docId the
- * new state is applied in place and bindDelta = encodeStateAsUpdate(replica,
- * new stateVector) carries every edit the new engine lacks, so a worker
- * killed mid-typing loses nothing and the editor is never detached.
- *
- * External reloads (OR-2): Obsidian's setData assigns view.data = incoming
- * BEFORE it calls setViewData, and save() writes the editor whatever
- * view.data holds (Android spike A/C). So inside the interceptor view.data is
- * not a merge base, and "handled" must always leave the merge in the editor.
- * The base is tracked per replica instead (Replica.diskText: the last disk
- * text the replica has absorbed), updated only from disk-verified reads and
- * from reloads it merged; see reloadBase() and checkSaved().
+ * Engine restart: views unbind (their edits stay in the editors) and re-bind on start with the last durable
+ * text as merge base, so a worker killed mid-typing loses nothing: the editor text is merged back.
  */
 
-import * as Y from "yjs";
-import type { DocId, PathKey, VaultPath } from "../core/types";
+import { ChangeSet, type Text } from "@codemirror/state";
+import type { DocId, VaultPath } from "../core/types";
 import { kindOfPath } from "../core/types";
 import { MAIN_UPDATE_COALESCE_MS } from "../core/limits";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
-import type { VaultEvent, VaultPort, VaultStat } from "../ports/vault";
-import type { EditorViewRef, ViewEvent, WorkspacePort } from "../ports/workspace";
-import type { BindInfo, EngineResultValue, MainToEngine } from "../protocol/messages";
-import type { Hasher } from "./hashing";
-import { utf8 } from "./hashing";
-import { DEFAULT_MERGE_LIMITS, merge } from "../core/merge/merge";
-import { applyEditsTo, minimalDiff } from "../core/merge/minimalDiff";
-import { conflictCopyNotice, conflictName } from "../core/plan/conflictName";
-import { pathKey } from "../core/paths/pathKey";
-
-export const REMOTE_IN: unique symbol = Symbol("yaos.remote-in");
-export const BIND_LOCAL: unique symbol = Symbol("yaos.bind-local");
-export const MAIN_MERGE: unique symbol = Symbol("yaos.main-merge");
-export const MAIN_EDITOR: unique symbol = Symbol("yaos.main-editor");
-
-const BOUND_SAVED_DEBOUNCE_MS = 50;
-/** checkSaved retry after a disk read error. */
-const CHECK_SAVED_RETRY_MS = 1_000;
-/** Backoff for conflict-copy writes that hit an I/O error (the last value repeats). */
-export const CONFLICT_COPY_RETRY_MS: readonly number[] = [250, 1_000, 2_000, 5_000, 10_000, 30_000];
-/** Conflict-copy names tried per attempt while each one turns out taken on disk. */
-const CONFLICT_COPY_NAME_TRIES = 12;
+import type { EditorBinding, EditorViewRef, ViewEvent, WorkspacePort } from "../ports/workspace";
+import type { BindInfo, BodyChanges, BodyEvent, EngineResultValue, MainToEngine } from "../protocol/messages";
+import { encodeUtf16, TEXT_CHUNK_UNITS } from "../protocol/utf16";
+import { DocMirror, ViewClient } from "./bodyClient";
 
 export interface BindingLink {
 	/** Post to the engine (the host handles [T] ownership). */
@@ -66,77 +34,76 @@ export interface BindingLink {
 
 export interface BindingDeps {
 	readonly workspace: WorkspacePort;
-	readonly vault: VaultPort;
+	readonly vault: { readonly caseInsensitive: boolean };
 	readonly clock: ClockPort;
-	readonly hasher: Hasher;
 	readonly link: BindingLink;
-	readonly deviceLabel: () => string;
 	readonly notice: (level: "info" | "warn" | "error", code: string, message: string) => void;
-	/** Conflict-copy timestamps: local time in production, UTC in the simulation (reproducible). */
-	readonly timeZone?: "local" | "utc";
 }
 
-class Replica {
-	readonly doc = new Y.Doc();
-	readonly ytext: Y.Text = this.doc.getText("text");
-	readonly slots = new Set<ViewSlot>();
-	pending: Uint8Array[] = [];
-	timer: TimerHandle | null = null;
-	savedTimer: TimerHandle | null = null;
-	suspended = false;
-	/** Last text reported through boundSaved (starts at the engine's synced base). */
-	lastReported: string | null = null;
-	/**
-	 * Merge base for external reloads: the last disk text this replica has absorbed (its content is
-	 * in the replica, or was preserved in a conflict copy). Set at replica creation from view.data
-	 * (outside setViewData, where it is what Obsidian loaded/saved), by every reload merged, and by
-	 * checkSaved from a disk read that matches something the replica already holds.
-	 */
-	diskText = "";
-	/** checkSaved runs serialized per replica (posts never reorder); at most one queued. */
-	checkChain: Promise<void> = Promise.resolve();
-	checkQueued = false;
-	constructor(readonly docId: DocId) {}
-}
+type SlotState = "idle" | "opening" | "attaching" | "bound" | "waiting";
 
-type SlotState = "idle" | "opening" | "bound" | "waiting";
+interface BoundDoc {
+	readonly docId: DocId;
+	mirror: DocMirror | null;
+	readonly slots: Set<ViewSlot>;
+}
 
 interface ViewSlot {
 	readonly viewId: number;
 	readonly view: EditorViewRef;
+	/** Open generation: bumped by every (re)open and unbind; async steps of an older one stop. */
 	seq: number;
 	state: SlotState;
-	rep: Replica | null;
-	detach: Unsubscribe | null;
+	doc: BoundDoc | null;
+	binding: EditorBinding | null;
+	client: ViewClient | null;
 	unintercept: Unsubscribe | null;
+	/** The editor text uploaded for the pending bodyAttach (the `bound` changes apply to it), and its upload id. */
+	attachDoc: Text | null;
+	attachId: number;
+	attachPosted: boolean;
+	timer: TimerHandle | null;
+	/** Reload counter; the latest intercepted text not yet `reloaded` (sent again after a re-bind); post order. */
+	reload: number;
+	reloadText: string | null;
+	reloadChain: Promise<void>;
 }
 
 export interface BindingStats {
-	localUpdatesPosted: number;
-	mergeUpdatesPosted: number;
-	bindDeltasPosted: number;
-	docUpdatesApplied: number;
+	pushes: number;
+	rejects: number;
+	entries: number;
+	bounds: number;
+	resyncs: number;
+	reloads: number;
+	siblingCopies: number;
+	saveMarks: number;
+	uploads: number;
+	uploadUnits: number;
 	creditsSent: number;
-	boundSavedPosted: number;
-	externalMerges: number;
-	conflictCopies: number;
 }
 
-function applyTextDiff(ytext: Y.Text, from: string, to: string, origin: unknown): void {
-	if (from === to) return;
-	const edits = minimalDiff(from, to);
-	const doc = ytext.doc;
-	if (!doc) throw new Error("Y.Text without doc");
-	doc.transact(() => applyEditsTo(ytext, from, edits), origin);
+/** A text to upload: a CodeMirror Text (sliceString) or a string, read one chunk at a time. */
+interface TextSource {
+	readonly length: number;
+	slice(from: number, to: number): string;
 }
+
+const ofText = (t: Text): TextSource => ({ length: t.length, slice: (a, b) => t.sliceString(a, b) });
+const ofString = (s: string): TextSource => ({ length: s.length, slice: (a, b) => s.slice(a, b) });
 
 export class BindingManager {
 	private readonly slots = new Map<number, ViewSlot>();
-	private readonly replicas = new Map<string, Replica>();
+	private readonly docs = new Map<DocId, BoundDoc>();
+	/** Merge base for the next binds of a doc after a resync / restart (until every view of it is bound). */
+	private readonly bases = new Map<DocId, Text>();
 	private running = false;
 	private offWorkspace: Unsubscribe | null = null;
-	private readonly pendingCopies = new Set<{ readonly path: string; readonly text: string }>();
-	readonly stats: BindingStats = { localUpdatesPosted: 0, mergeUpdatesPosted: 0, bindDeltasPosted: 0, docUpdatesApplied: 0, creditsSent: 0, boundSavedPosted: 0, externalMerges: 0, conflictCopies: 0 };
+	private nextUpload = 1;
+	private nextPush = 1;
+	private credit = 0;
+	private creditQueued = false;
+	readonly stats: BindingStats = { pushes: 0, rejects: 0, entries: 0, bounds: 0, resyncs: 0, reloads: 0, siblingCopies: 0, saveMarks: 0, uploads: 0, uploadUnits: 0, creditsSent: 0 };
 
 	constructor(private readonly deps: BindingDeps) {}
 
@@ -150,25 +117,17 @@ export class BindingManager {
 		for (const view of this.deps.workspace.listMarkdownViews()) {
 			if (!this.slots.has(view.viewId)) this.slots.set(view.viewId, this.newSlot(view));
 		}
-		for (const slot of this.slots.values()) {
-			if (slot.state === "bound" && slot.rep) void this.rebind(slot);
-			else void this.open(slot);
-		}
+		for (const slot of this.slots.values()) void this.open(slot);
 	}
 
-	/** Engine is gone (restart): keep editors bound, stop posting until rebind. */
+	/** Engine is gone (restart): unbind every view, keeping the restart merge base; start() re-binds them. */
 	suspend(): void {
 		this.running = false;
-		for (const rep of this.replicas.values()) {
-			rep.suspended = true;
-			if (rep.timer !== null) this.deps.clock.clearTimer(rep.timer);
-			rep.timer = null;
-			rep.pending = [];
+		for (const doc of this.docs.values()) {
+			const base = doc.mirror?.durable ?? null;
+			if (base) this.bases.set(doc.docId, base);
 		}
-		for (const slot of this.slots.values()) {
-			slot.seq++;
-			if (slot.state === "opening") slot.state = "idle";
-		}
+		for (const slot of this.slots.values()) this.unbindSlot(slot, false);
 	}
 
 	/** Plugin unload: flush and unbind everything. */
@@ -176,46 +135,47 @@ export class BindingManager {
 		this.flushAll();
 		for (const slot of [...this.slots.values()]) this.unbindSlot(slot, true);
 		this.slots.clear();
+		this.bases.clear();
 		this.offWorkspace?.();
 		this.offWorkspace = null;
 		this.running = false;
 	}
 
-	/** Synchronous flush of every coalesce buffer (hidden/pagehide/freeze, unload). */
+	/** Push every buffer now (hidden/pagehide/freeze, unload). */
 	flushAll(): void {
-		for (const rep of this.replicas.values()) this.flush(rep);
+		for (const slot of this.slots.values()) this.flushSlot(slot);
 	}
 
 	// --- queries --------------------------------------------------------------
 
 	isBoundPath(path: string): boolean {
 		for (const slot of this.slots.values()) {
-			if ((slot.state === "bound" || slot.state === "opening") && slot.view.path !== null && this.samePath(slot.view.path, path)) return true;
+			if (slot.state !== "idle" && slot.state !== "waiting" && slot.view.path !== null && this.samePath(slot.view.path, path)) return true;
 		}
 		return false;
 	}
 
 	/**
-	 * Post the coalesce buffer of every replica bound at `path` now. True when edits were posted:
-	 * the engine had not seen them, so a delete planned without them must be replanned (§c.7).
+	 * Push the buffers of every view bound at `path` now. True when that view had changes the engine had not
+	 * confirmed: a delete planned without them must be replanned (§c.7).
 	 */
 	flushPath(path: string): boolean {
-		let posted = false;
+		let pending = false;
 		for (const slot of this.slots.values()) {
-			const rep = slot.rep;
-			if (!rep || slot.view.path === null || !this.samePath(slot.view.path, path)) continue;
-			if (rep.pending.length > 0 && !rep.suspended) posted = true;
-			this.flush(rep);
+			if (!slot.client || slot.view.path === null || !this.samePath(slot.view.path, path)) continue;
+			if (slot.client.pending) pending = true;
+			this.flushSlot(slot);
 		}
-		return posted;
+		return pending;
 	}
 
 	boundDocs(): DocId[] {
-		return [...this.replicas.keys()] as DocId[];
+		return [...this.docs.keys()];
 	}
 
-	replicaText(docId: DocId): string | null {
-		return this.replicas.get(docId)?.ytext.toString() ?? null;
+	/** The replica text main last applied for `docId` (an immutable Text; tests and the simulation). */
+	mirrorText(docId: DocId): Text | null {
+		return this.docs.get(docId)?.mirror?.text ?? null;
 	}
 
 	slotState(viewId: number): SlotState | null {
@@ -223,26 +183,90 @@ export class BindingManager {
 	}
 
 	docOfView(viewId: number): DocId | null {
-		return this.slots.get(viewId)?.rep?.docId ?? null;
+		return this.slots.get(viewId)?.doc?.docId ?? null;
 	}
 
 	// --- engine -> main -------------------------------------------------------
 
-	onDocUpdate(docId: DocId, update: Uint8Array): void {
-		const bytes = update.byteLength;
-		const rep = this.replicas.get(docId);
-		if (rep) {
-			Y.applyUpdate(rep.doc, update, REMOTE_IN);
-			this.stats.docUpdatesApplied++;
+	/** A body event of `docId` (FIFO per doc). Its weight returns as docCredit once applied. */
+	onBody(docId: DocId, event: BodyEvent, weight: number): void {
+		this.addCredit(weight);
+		const doc = this.docs.get(docId);
+		if (!doc) return;
+		try {
+			this.applyBody(doc, event);
+		} catch {
+			// A change set that does not fit (RangeError from ChangeSet.fromJSON / map / apply): out of sync.
+			this.resync(doc, doc.mirror?.durable ?? null);
 		}
-		this.stats.creditsSent++;
-		this.deps.link.post({ t: "docCredit", bytes });
 	}
 
-	onDocRetarget(docId: DocId, change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "deleted" } | { readonly t: "frozen"; readonly reason: string }): void {
-		const rep = this.replicas.get(docId);
-		if (!rep) return;
-		for (const slot of [...rep.slots]) {
+	private applyBody(doc: BoundDoc, event: BodyEvent): void {
+		switch (event.t) {
+			case "entry": {
+				const m = doc.mirror;
+				if (!m) return;
+				const f = ChangeSet.fromJSON(event.changes);
+				if (!m.apply(event.from, event.to, f, event.length)) return this.resync(doc, m.durable);
+				this.stats.entries++;
+				for (const s of [...doc.slots]) {
+					if (s.state !== "bound" || !s.client) continue;
+					if (event.author?.viewId !== s.viewId) s.client.foreign(f);
+					else if (!s.client.confirm(event.author.seq)) return this.resync(doc, m.durable);
+				}
+				return;
+			}
+			case "bound":
+				return this.onBound(doc, event);
+			case "reject": {
+				const s = this.slots.get(event.viewId);
+				if (!s || s.doc !== doc || s.state !== "bound" || !s.client) return;
+				if (event.version !== doc.mirror?.version || !s.client.reject(event.seq)) return this.resync(doc, doc.mirror?.durable ?? null);
+				this.stats.rejects++;
+				this.flushSlot(s);
+				return;
+			}
+			case "durable":
+				doc.mirror?.markDurable(event.version);
+				return;
+			case "reloaded": {
+				const s = this.slots.get(event.viewId);
+				if (!s || s.doc !== doc || event.reload !== s.reload) return; // a newer reload is on its way
+				s.reloadText = null;
+				const skipped = s.view.holdSaves(false);
+				if (event.save || skipped) void s.view.save().catch(() => undefined);
+				return;
+			}
+		}
+	}
+
+	/** `bound`: the view's uploaded text plus `changes` is the replica at `version`; its local edits since go behind. */
+	private onBound(doc: BoundDoc, event: Extract<BodyEvent, { t: "bound" }>): void {
+		const s = this.slots.get(event.viewId);
+		if (!s || s.doc !== doc || s.state !== "attaching" || s.attachId !== event.attach || !s.client || !s.attachDoc) return;
+		const c = ChangeSet.fromJSON(event.changes);
+		const target = c.apply(s.attachDoc);
+		if (target.length !== event.length) return this.resync(doc, null);
+		const m = doc.mirror;
+		if (!m || m.version !== event.version || m.text.length !== event.length) {
+			// The mirror missed entries (no view was attached): this view's result is the replica now.
+			doc.mirror = new DocMirror(event.version, target);
+			for (const o of [...doc.slots]) if (o !== s && o.state === "bound") this.rebind(o, null);
+		}
+		s.attachDoc = null;
+		s.state = "bound";
+		this.stats.bounds++;
+		s.client.bound(c);
+		if ([...doc.slots].every((o) => o.state === "bound")) this.bases.delete(doc.docId);
+		this.flushSlot(s);
+	}
+
+	onDocRetarget(docId: DocId, change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "deleted" } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" }): void {
+		const doc = this.docs.get(docId);
+		if (!doc) return;
+		// resync: the worker dropped events (main fell behind its window); the mirror is behind but consistent.
+		if (change.t === "resync") return this.resync(doc, doc.mirror?.text ?? null);
+		for (const slot of [...doc.slots]) {
 			this.unbindSlot(slot, true);
 			if (change.t === "deleted") slot.state = "waiting";
 			else void this.open(slot);
@@ -253,38 +277,47 @@ export class BindingManager {
 		this.retryUnbound(path);
 	}
 
+	/** Engine request (viewSaved): save the views of `docIds` now; the engine checks the disk after its vault events. */
 	async saveViews(docIds: readonly DocId[]): Promise<DocId[]> {
 		const saved: DocId[] = [];
 		for (const docId of docIds) {
-			const rep = this.replicas.get(docId);
-			if (!rep) continue;
-			for (const slot of [...rep.slots]) await slot.view.save();
+			const doc = this.docs.get(docId);
+			if (!doc) continue;
+			for (const slot of [...doc.slots]) await slot.view.save().catch(() => undefined);
 			saved.push(docId);
-			await this.checkSaved(rep);
 		}
 		return saved;
 	}
 
 	/** Raw vault events (the host forwards every event here before batching). */
-	onVaultEvent(event: VaultEvent): void {
-		if (event.t !== "modify" && event.t !== "create" && event.t !== "rename") return;
-		const path = event.t === "rename" ? event.to : event.path;
+	onVaultEvent(event: { readonly t: string; readonly to?: string }): void {
 		// A rename keeps the file's views (Obsidian moves view.file in place, no file-changed). A slot
 		// waiting on the old path would wait forever: the engine's `bindable` is keyed by the path openDoc
-		// asked for, and the new path may have been live all along (the projection applying a remote
-		// rename it had already folded). Ask again at the new path.
-		if (event.t === "rename") this.retryUnbound(event.to);
-		for (const rep of this.replicas.values()) {
-			const first = [...rep.slots][0];
-			if (!first || first.view.path === null || !this.samePath(first.view.path, path)) continue;
-			this.scheduleCheckSaved(rep, BOUND_SAVED_DEBOUNCE_MS);
-		}
+		// asked for, and the new path may have been live all along. Ask again at the new path.
+		if (event.t === "rename" && typeof event.to === "string") this.retryUnbound(event.to);
+	}
+
+	private addCredit(weight: number): void {
+		this.credit += weight;
+		if (this.creditQueued) return;
+		this.creditQueued = true;
+		queueMicrotask(() => {
+			this.creditQueued = false;
+			const bytes = this.credit;
+			this.credit = 0;
+			if (bytes <= 0) return;
+			this.stats.creditsSent++;
+			this.deps.link.post({ t: "docCredit", bytes });
+		});
 	}
 
 	// --- internals: views -----------------------------------------------------
 
 	private newSlot(view: EditorViewRef): ViewSlot {
-		return { viewId: view.viewId, view, seq: 0, state: "idle", rep: null, detach: null, unintercept: null };
+		return {
+			viewId: view.viewId, view, seq: 0, state: "idle", doc: null, binding: null, client: null, unintercept: null,
+			attachDoc: null, attachId: 0, attachPosted: false, timer: null, reload: 0, reloadText: null, reloadChain: Promise.resolve(),
+		};
 	}
 
 	/** Re-open every unbound (waiting/idle) slot whose view is at `path`. */
@@ -317,6 +350,7 @@ export class BindingManager {
 					slot = this.newSlot(e.view);
 					this.slots.set(slot.viewId, slot);
 				} else this.unbindSlot(slot, true);
+				slot.reloadText = null; // another file now: its pending reload is moot
 				void this.open(slot);
 				return;
 			}
@@ -324,7 +358,6 @@ export class BindingManager {
 				const slot = this.slots.get(e.viewId);
 				if (!slot) return;
 				this.unbindSlot(slot, true);
-				slot.seq++;
 				this.slots.delete(e.viewId);
 				return;
 			}
@@ -340,11 +373,14 @@ export class BindingManager {
 			return;
 		}
 		slot.state = "opening";
+		// Intercepting from here drops a bound sibling's quick preview while this view waits for openDoc (see
+		// onExternalReload); everything else still reaches the editor as Obsidian applies it.
+		this.intercept(slot);
 		let res: EngineResultValue;
 		try {
 			res = await this.deps.link.openDoc(path, slot.viewId);
 		} catch {
-			if (seq === slot.seq) slot.state = "idle";
+			if (seq === slot.seq) this.idle(slot, "idle");
 			return;
 		}
 		const stale = seq !== slot.seq || this.slots.get(slot.viewId) !== slot || view.path === null || !this.samePath(view.path, path);
@@ -354,323 +390,207 @@ export class BindingManager {
 			return;
 		}
 		if (res.t !== "bind") {
-			slot.state = "waiting";
+			this.idle(slot, "waiting");
 			return;
 		}
 		const info = res.bind;
 		if (info.frozen) {
-			// Deviation: WorkspacePort has no read-only bind; a frozen doc stays unbound with a notice.
+			// WorkspacePort has no read-only bind; a frozen doc stays unbound with a notice.
 			this.deps.link.post({ t: "closeDoc", docId: info.docId, viewId: slot.viewId });
-			slot.state = "waiting";
+			this.idle(slot, "waiting");
 			this.deps.notice("warn", "doc-frozen", "This note is frozen by sync; edits are kept locally until it is released.");
 			return;
 		}
-		this.attach(slot, info);
+		await this.attach(slot, info, seq);
 	}
 
-	/** Bind-time merge + bind. Synchronous so no editor edit can slip in between. */
-	private attach(slot: ViewSlot, info: BindInfo): void {
+	/**
+	 * Install the binding (local edits buffer from here on), upload the editor text (plus the merge base after a
+	 * resync / restart, plus the text Obsidian last saved when the editor has unsaved edits), then bodyAttach.
+	 */
+	private async attach(slot: ViewSlot, info: BindInfo, seq: number): Promise<void> {
 		const view = slot.view;
-		let rep = this.replicas.get(info.docId);
-		if (!rep) {
-			rep = this.createReplica(info.docId);
-			rep.lastReported = info.baseText;
-			rep.diskText = view.getLastSavedText();
-		}
-		Y.applyUpdate(rep.doc, info.state, REMOTE_IN);
-		const editorText = view.getText();
-		const crdtText = rep.ytext.toString();
-		let report: { result: "identical" | "disk-only" | "clean" | "conflict"; reason: ReturnType<typeof merge> } | null = null;
-		let copyText: string | null = null;
-		if (editorText !== crdtText) {
-			const r = merge({ base: info.baseText, disk: editorText, crdt: crdtText, limits: DEFAULT_MERGE_LIMITS });
-			const target = r.kind === "identical" ? crdtText : r.text;
-			applyTextDiff(rep.ytext, crdtText, target, BIND_LOCAL);
-			view.applyMinimalReplace(target);
-			if (r.kind === "conflict") copyText = r.conflictCopy;
-			if (r.kind !== "crdt-only") report = { result: r.kind, reason: r };
-		}
-		// Distinct origin per view (y-codemirror uses its own config object per editor), so split views see each other.
-		slot.detach = view.bind({ ytext: rep.ytext, localOrigin: { editor: MAIN_EDITOR, viewId: slot.viewId }, awareness: null });
-		slot.unintercept = view.interceptExternalReload((incoming) => this.onExternalReload(slot, incoming));
-		slot.rep = rep;
-		slot.state = "bound";
-		rep.slots.add(slot);
-		this.postBindDelta(rep, info.stateVector);
-		if (report) {
-			const result = report.result;
-			const reason = report.reason.kind === "conflict" ? report.reason.reason : null;
-			const path = view.path ?? "";
-			void (async () => {
-				if (copyText !== null) await this.writeConflictCopy(path, info.docId, copyText);
-				this.stats.externalMerges++;
-				this.deps.link.post({ t: "boundExternalMerged", docId: info.docId, result, conflictReason: reason });
-			})();
-		}
-	}
-
-	/** Restart path: same doc -> apply state in place and send bindDelta; otherwise a fresh bind. */
-	private async rebind(slot: ViewSlot): Promise<void> {
-		const view = slot.view;
-		const path = view.path;
-		const rep = slot.rep;
-		const seq = ++slot.seq;
-		if (!rep || path === null) return this.open(slot);
-		let res: EngineResultValue;
+		let doc = this.docs.get(info.docId);
+		if (!doc) this.docs.set(info.docId, (doc = { docId: info.docId, mirror: null, slots: new Set() }));
+		const client = new ViewClient({
+			push: (pushSeq, base, after, changes) => {
+				this.stats.pushes++;
+				this.deps.link.post({ t: "bodyPush", docId: info.docId, viewId: slot.viewId, seq: pushSeq, base, after, changes: changes.toJSON() as BodyChanges });
+			},
+			apply: (changes) => slot.binding?.applyRemote(changes),
+		}, () => this.nextPush++);
+		let binding: EditorBinding;
 		try {
-			res = await this.deps.link.openDoc(path, slot.viewId);
+			binding = view.bind({ onLocal: (c) => this.onLocal(slot, c), onReset: () => this.onReset(slot), onSaveRead: () => this.onSaveRead(slot) });
 		} catch {
+			this.deps.link.post({ t: "closeDoc", docId: info.docId, viewId: slot.viewId });
+			if (doc.slots.size === 0) this.docs.delete(info.docId);
+			this.idle(slot, "idle");
 			return;
 		}
-		if (seq !== slot.seq || this.slots.get(slot.viewId) !== slot) {
-			if (res.t === "bind") this.deps.link.post({ t: "closeDoc", docId: res.bind.docId, viewId: slot.viewId });
-			return;
-		}
-		if (res.t === "bind" && res.bind.docId === rep.docId && !res.bind.frozen && slot.rep === rep) {
-			Y.applyUpdate(rep.doc, res.bind.state, REMOTE_IN);
-			rep.suspended = false;
-			this.postBindDelta(rep, res.bind.stateVector);
-			return;
-		}
-		if (res.t === "bind") this.deps.link.post({ t: "closeDoc", docId: res.bind.docId, viewId: slot.viewId });
-		this.unbindSlot(slot, false);
-		void this.open(slot);
+		Object.assign(slot, { binding, client, doc, state: "attaching", attachPosted: false });
+		doc.slots.add(slot);
+		this.intercept(slot);
+		const editor = binding.doc();
+		slot.attachDoc = editor;
+		const base = this.bases.get(info.docId) ?? null;
+		// Every bind of a dirty view says what is on disk: after an engine restart the engine has no disk text for
+		// the doc, and taking this editor's unsaved text for it would turn a sibling view's (older) disk text into
+		// an edit that reverts this one (sim seed 62).
+		const saved = view.isDirty() ? view.lastSavedText() : null;
+		const alive = () => slot.seq === seq && slot.client === client;
+		const editorId = await this.upload(ofText(editor), alive);
+		const baseId = base && editorId !== null ? await this.upload(ofText(base), alive) : null;
+		const savedId = saved !== null && editorId !== null ? await this.upload(ofString(saved), alive) : null;
+		if (!alive() || editorId === null || (base !== null && baseId === null) || (saved !== null && savedId === null)) return;
+		slot.attachId = editorId;
+		slot.attachPosted = true;
+		this.deps.link.post({ t: "bodyAttach", docId: info.docId, viewId: slot.viewId, editor: editorId, base: baseId, saved: savedId });
+		if (slot.reloadText !== null) this.sendReload(slot, slot.reloadText);
 	}
 
-	private unbindSlot(slot: ViewSlot, sendClose: boolean): void {
-		const rep = slot.rep;
-		slot.detach?.();
-		slot.unintercept?.();
-		slot.detach = null;
-		slot.unintercept = null;
-		slot.rep = null;
-		slot.state = "idle";
-		if (!rep) return;
-		this.flush(rep);
-		rep.slots.delete(slot);
-		if (sendClose && !rep.suspended) this.deps.link.post({ t: "closeDoc", docId: rep.docId, viewId: slot.viewId });
-		if (rep.slots.size === 0) {
-			if (rep.timer !== null) this.deps.clock.clearTimer(rep.timer);
-			if (rep.savedTimer !== null) this.deps.clock.clearTimer(rep.savedTimer);
-			this.replicas.delete(rep.docId);
-			rep.doc.destroy();
+	/** Upload a text as transferred UTF-16 chunks, yielding between chunks. Null when `alive` turned false. */
+	private async upload(src: TextSource, alive: () => boolean): Promise<number | null> {
+		const id = this.nextUpload++;
+		this.stats.uploads++;
+		for (let at = 0; ; ) {
+			const end = Math.min(src.length, at + TEXT_CHUNK_UNITS);
+			const last = end >= src.length;
+			this.stats.uploadUnits += end - at;
+			this.deps.link.post({ t: "textChunk", uploadId: id, bytes: encodeUtf16(src.slice(at, end)), last });
+			if (last) return id;
+			at = end;
+			await new Promise<void>((resolve) => this.deps.clock.setTimer(0, resolve));
+			if (!alive()) return null;
 		}
 	}
 
-	// --- internals: replica updates -------------------------------------------
+	// --- internals: editor events ---------------------------------------------
 
-	private createReplica(docId: DocId): Replica {
-		const rep = new Replica(docId);
-		rep.doc.on("update", (update: Uint8Array, origin: unknown) => this.onReplicaUpdate(rep, update, origin));
-		this.replicas.set(docId, rep);
-		return rep;
-	}
-
-	private onReplicaUpdate(rep: Replica, update: Uint8Array, origin: unknown): void {
-		if (origin === REMOTE_IN || origin === BIND_LOCAL) return;
-		if (rep.suspended) return; // bindDelta after rebind carries it
-		if (origin === MAIN_MERGE) {
-			this.flush(rep);
-			this.stats.mergeUpdatesPosted++;
-			this.deps.link.post({ t: "localUpdate", docId: rep.docId, update: update.slice(), origin: "merge" });
-			return;
-		}
-		rep.pending.push(update.slice());
-		if (rep.timer === null) {
-			rep.timer = this.deps.clock.setTimer(MAIN_UPDATE_COALESCE_MS, () => {
-				rep.timer = null;
-				this.flush(rep);
+	/** A local transaction: O(change). Pushed after MAIN_UPDATE_COALESCE_MS (one timer per view). */
+	private onLocal(slot: ViewSlot, changes: ChangeSet): void {
+		const client = slot.client;
+		if (!client) return;
+		client.local(changes);
+		if (slot.state === "bound" && slot.timer === null) {
+			slot.timer = this.deps.clock.setTimer(MAIN_UPDATE_COALESCE_MS, () => {
+				slot.timer = null;
+				this.flushSlot(slot);
 			});
 		}
 	}
 
-	private flush(rep: Replica): void {
-		if (rep.timer !== null) {
-			this.deps.clock.clearTimer(rep.timer);
-			rep.timer = null;
+	private flushSlot(slot: ViewSlot): void {
+		if (slot.timer !== null) {
+			this.deps.clock.clearTimer(slot.timer);
+			slot.timer = null;
 		}
-		if (rep.pending.length === 0) return;
-		const parts = rep.pending;
-		rep.pending = [];
-		if (rep.suspended) return;
-		const update = parts.length === 1 ? (parts[0] as Uint8Array) : Y.mergeUpdates(parts);
-		this.stats.localUpdatesPosted++;
-		this.deps.link.post({ t: "localUpdate", docId: rep.docId, update, origin: "editor" });
+		const m = slot.doc?.mirror;
+		if (slot.state === "bound" && slot.client && m) slot.client.flush(m.version);
 	}
-
-	private postBindDelta(rep: Replica, stateVector: Uint8Array): void {
-		// Pending editor updates are inside the delta; drop them so they are not sent twice.
-		if (rep.timer !== null) this.deps.clock.clearTimer(rep.timer);
-		rep.timer = null;
-		rep.pending = [];
-		this.stats.bindDeltasPosted++;
-		this.deps.link.post({ t: "bindDelta", docId: rep.docId, update: Y.encodeStateAsUpdate(rep.doc, stateVector) });
-	}
-
-	// --- internals: external reload + saves -----------------------------------
 
 	/**
-	 * Obsidian is reloading a bound view with `incoming` (the file's current text). view.data of THIS
-	 * view already equals `incoming` here, so the base comes from reloadBase(). The merge goes into the
-	 * replica (MAIN_MERGE), and so into every bound editor, synchronously: returning "handled" with the
-	 * editor unchanged would let the next save write the old editor text over the external edit.
-	 * Saves run after setData has returned, so view.data, the editor and the disk end equal.
+	 * Obsidian is about to write this editor (save): push what is buffered, then tell the engine which replica
+	 * text that is (its version, or its newest push), so a later read of that file text counts as absorbed.
 	 */
-	private onExternalReload(slot: ViewSlot, incoming: string): "handled" | "default" {
-		const rep = slot.rep;
-		if (!rep || slot.state !== "bound") return "default";
-		const base = this.reloadBase(rep, slot, incoming);
-		const crdt = rep.ytext.toString();
-		const r = merge({ base, disk: incoming, crdt, limits: DEFAULT_MERGE_LIMITS });
-		if (r.kind === "disk-only" || r.kind === "clean" || r.kind === "conflict") applyTextDiff(rep.ytext, crdt, r.text, MAIN_MERGE);
-		rep.diskText = incoming; // absorbed: merged into the replica, or kept by the conflict copy below
-		const copy = r.kind === "conflict" ? r.conflictCopy : null;
-		const report = r.kind === "disk-only" || r.kind === "clean" || r.kind === "conflict" || (r.kind === "identical" && incoming !== base);
-		const path = slot.view.path ?? "";
-		void (async () => {
-			await Promise.resolve(); // never call save() from inside Obsidian's setData
-			if (copy !== null) await this.writeConflictCopy(path, rep.docId, copy);
-			if (report) {
-				this.stats.externalMerges++;
-				this.deps.link.post({ t: "boundExternalMerged", docId: rep.docId, result: r.kind as "identical" | "disk-only" | "clean" | "conflict", conflictReason: r.kind === "conflict" ? r.reason : null });
+	private onSaveRead(slot: ViewSlot): void {
+		const m = slot.doc?.mirror;
+		if (slot.state !== "bound" || !slot.client || !slot.doc || !m) return;
+		this.flushSlot(slot);
+		this.stats.saveMarks++;
+		this.deps.link.post({ t: "bodySaveMark", docId: slot.doc.docId, viewId: slot.viewId, version: m.version, seq: slot.client.lastSeq });
+	}
+
+	/** EditorView.setState replaced the editor state: the binding is void; bind again (merge base: the mirror). */
+	private onReset(slot: ViewSlot): void {
+		if (!slot.doc) return;
+		this.rebind(slot, slot.doc.mirror?.text ?? null);
+	}
+
+	/**
+	 * Obsidian pushes text into a bound view without a transaction. A quick-preview copy from a sibling bound to
+	 * the same doc is dropped: the replica already carries that view's edits to this one as entries. Anything
+	 * else is uploaded and merged in the worker; the view holds its saves until `reloaded`, so its stale text
+	 * cannot overwrite the incoming text meanwhile.
+	 */
+	private intercept(slot: ViewSlot): void {
+		slot.unintercept ??= slot.view.interceptExternalReload((incoming, from) => this.onExternalReload(slot, incoming, from));
+	}
+
+	/** Not bound and not about to be: Obsidian applies whatever it loads into the view. */
+	private idle(slot: ViewSlot, state: "idle" | "waiting"): void {
+		slot.unintercept?.();
+		slot.unintercept = null;
+		slot.state = state;
+	}
+
+	/**
+	 * Content Obsidian puts into the view without a transaction. A quick preview from a sibling view of the same
+	 * file that is attaching or bound is dropped: that view's bind upload and pushes deliver its edits to the
+	 * replica, which sends them here as entries. Applying the copy as well would add them twice (this editor's own
+	 * upload or reload would carry them too, merged as new text). While this view is still opening, the sibling's
+	 * doc is compared by path. Anything else, while attaching or bound, is merged in the worker (bodyReload).
+	 */
+	private onExternalReload(slot: ViewSlot, incoming: string, from: number | null): "handled" | "default" {
+		if (from !== null) {
+			const src = this.slots.get(from);
+			const live = src !== undefined && src !== slot && (src.state === "attaching" || src.state === "bound");
+			const same = live && (slot.state === "opening" ? src.view.path !== null && slot.view.path !== null && this.samePath(src.view.path, slot.view.path) : src.doc === slot.doc);
+			if (same && slot.state !== "idle" && slot.state !== "waiting") {
+				this.stats.siblingCopies++;
+				return "handled";
 			}
-			if (this.replicas.get(rep.docId) !== rep) return;
-			for (const s of [...rep.slots]) {
-				if (s.view.getText() !== s.view.getLastSavedText()) await s.view.save();
-			}
-			await this.checkSaved(rep);
-		})();
+		}
+		if (slot.state !== "attaching" && slot.state !== "bound") return "default";
+		this.stats.reloads++;
+		slot.view.holdSaves(true);
+		slot.reloadText = incoming;
+		if (slot.attachPosted) this.sendReload(slot, incoming);
 		return "handled";
 	}
 
-	/**
-	 * Base for merging a reload of `slot`. If a sibling bound view of the same doc already holds
-	 * `incoming` as its view.data, the replica has absorbed it (that sibling saved it from the shared
-	 * replica, or already took this same reload), so the reload is not external: base = incoming.
-	 * Otherwise the replica's last absorbed disk text. Never this view's own view.data (pre-assigned).
-	 * A base that is stale (an ancestor of the true one, e.g. a reload racing checkSaved right after
-	 * our own save) can only turn a clean merge into a spurious conflict copy; it never drops text.
-	 */
-	private reloadBase(rep: Replica, slot: ViewSlot, incoming: string): string {
-		for (const s of rep.slots) if (s !== slot && s.view.getLastSavedText() === incoming) return incoming;
-		return rep.diskText;
-	}
-
-	/**
-	 * The copy text exists only in memory once the merge has replaced it in the editor/CRDT, so an I/O
-	 * failure is retried (backoff, capped) for as long as the binding runs; callers that save over the
-	 * disk side await this first. Gives up on unload, a non-transient refusal, or when every candidate name is taken.
-	 */
-	private async writeConflictCopy(path: string, docId: DocId, text: string): Promise<boolean> {
-		let attempt = 0;
-		const pending = { path, text };
-		try {
-			for (;;) {
-				const r = await this.tryConflictCopy(path, docId, text);
-				if (r === "ok") return true;
-				if (r === "give-up") break;
-				if (attempt === 0) {
-					this.pendingCopies.add(pending);
-					this.deps.notice("warn", "conflict-copy-retrying", `Could not write a conflict copy for ${path} (disk error); retrying.`);
-				}
-				const delay = CONFLICT_COPY_RETRY_MS[Math.min(attempt, CONFLICT_COPY_RETRY_MS.length - 1)] ?? 30_000;
-				attempt++;
-				await new Promise<void>((resolve) => this.deps.clock.setTimer(delay, resolve));
-				if (!this.running) break;
-			}
-		} finally {
-			this.pendingCopies.delete(pending);
-		}
-		this.deps.notice("error", "conflict-copy-failed", `Could not write a conflict copy for ${path}; the other version is kept in the editor history only.`);
-		return false;
-	}
-
-	/**
-	 * Conflict copies that hit a disk error and live only in memory until a retry lands. Known gap
-	 * (wp-d-notes): if the process dies in that window after Obsidian's own autosave replaced the disk
-	 * side, the copy is gone. The sim records these at an app crash (SimDevice.crashLost).
-	 */
-	pendingConflictCopies(): { readonly path: string; readonly text: string }[] {
-		return [...this.pendingCopies];
-	}
-
-	/** Names come from core conflictName (DESIGN §f.7); a name another writer took meanwhile is skipped. */
-	private async tryConflictCopy(path: string, docId: DocId, text: string): Promise<"ok" | "io" | "give-up"> {
-		const nowMs = this.deps.clock.now();
-		const tzOffsetMinutes = (this.deps.timeZone ?? "local") === "utc" ? 0 : -new Date(nowMs).getTimezoneOffset();
-		const taken = new Set<PathKey>();
-		for (let n = 1; n <= CONFLICT_COPY_NAME_TRIES; n++) {
-			const target = conflictName({ path, docId, deviceLabel: this.deps.deviceLabel(), nowMs, tzOffsetMinutes, pathKey, isTaken: (k) => taken.has(k) });
-			try {
-				const out = await this.deps.vault.write(target, text, { t: "absent" });
-				if (out.ok) {
-					this.stats.conflictCopies++;
-					this.deps.notice("warn", "conflict-copy", conflictCopyNotice({ from: path, to: target }, 1));
-					return "ok";
-				}
-				if (out.reason === "io") return "io";
-				if (out.reason !== "precondition") return "give-up"; // invalid path / parent is a file: not transient
-				taken.add(pathKey(target));
-			} catch {
-				return "io";
-			}
-		}
-		return "give-up"; // every candidate name is taken
-	}
-
-	/** Serialized per replica; a request while one is queued joins it (the queued run reads the disk later). */
-	private checkSaved(rep: Replica): Promise<void> {
-		if (rep.checkQueued) return rep.checkChain;
-		rep.checkQueued = true;
-		rep.checkChain = rep.checkChain.then(async () => {
-			rep.checkQueued = false;
-			await this.checkSavedNow(rep);
-		}).catch(() => undefined);
-		return rep.checkChain;
-	}
-
-	/**
-	 * Report a save of a bound file as boundSaved (the engine's new synced base). Disk-verified: stat,
-	 * read, stat (unchanged in between), and only a disk text the replica has absorbed (its last disk
-	 * text, its current text, or some bound view's view.data, read here outside setViewData) is
-	 * reported, with its own stat and fingerprint, and becomes the reload base. Anything else on disk is
-	 * an external write whose reload is still pending: the interceptor merges it, and reporting it here
-	 * would make unmerged text the engine's base.
-	 */
-	private async checkSavedNow(rep: Replica): Promise<void> {
-		const first = [...rep.slots][0];
-		if (!first || first.view.path === null) return;
-		const path = first.view.path;
-		let text: string;
-		let stat: VaultStat | null;
-		try {
-			const before = await this.deps.vault.stat(path);
-			if (!before) return;
-			text = await this.deps.vault.readText(path);
-			stat = await this.deps.vault.stat(path);
-			// Changed while reading: the write's own vault event schedules another check.
-			if (!stat || stat.size !== before.size || stat.mtimeMs !== before.mtimeMs) return;
-		} catch {
-			this.scheduleCheckSaved(rep, CHECK_SAVED_RETRY_MS);
-			return;
-		}
-		if (this.replicas.get(rep.docId) !== rep) return;
-		const absorbed = text === rep.diskText || text === rep.ytext.toString() || [...rep.slots].some((s) => s.view.getLastSavedText() === text);
-		if (!absorbed) return;
-		rep.diskText = text;
-		if (text === rep.lastReported) return;
-		const fingerprint = await this.deps.hasher.fingerprint(utf8(text));
-		if (this.replicas.get(rep.docId) !== rep) return;
-		rep.lastReported = text;
-		this.stats.boundSavedPosted++;
-		this.deps.link.post({ t: "boundSaved", docId: rep.docId, path, text, fingerprint, stat });
-	}
-
-	private scheduleCheckSaved(rep: Replica, delayMs: number): void {
-		if (rep.savedTimer !== null) this.deps.clock.clearTimer(rep.savedTimer);
-		rep.savedTimer = this.deps.clock.setTimer(delayMs, () => {
-			rep.savedTimer = null;
-			if (this.replicas.get(rep.docId) === rep) void this.checkSaved(rep);
+	private sendReload(slot: ViewSlot, text: string): void {
+		const doc = slot.doc;
+		const client = slot.client;
+		if (!doc || !client) return;
+		const reload = ++slot.reload;
+		const alive = () => slot.client === client;
+		slot.reloadChain = slot.reloadChain.then(async () => {
+			const id = await this.upload(ofString(text), alive);
+			if (id !== null && alive()) this.deps.link.post({ t: "bodyReload", docId: doc.docId, viewId: slot.viewId, reload, text: id });
 		});
+	}
+
+	// --- internals: unbind / resync -------------------------------------------
+
+	private unbindSlot(slot: ViewSlot, sendClose: boolean): void {
+		const doc = slot.doc;
+		if (doc && sendClose) this.flushSlot(slot); // pushed before closeDoc: the engine applies it first
+		if (slot.timer !== null) this.deps.clock.clearTimer(slot.timer);
+		slot.timer = null;
+		slot.seq++;
+		slot.binding?.detach();
+		slot.unintercept?.();
+		Object.assign(slot, { binding: null, client: null, unintercept: null, doc: null, attachDoc: null, attachPosted: false, state: "idle" });
+		if (!doc) return;
+		doc.slots.delete(slot);
+		if (sendClose && this.running) this.deps.link.post({ t: "closeDoc", docId: doc.docId, viewId: slot.viewId });
+		if (doc.slots.size === 0) this.docs.delete(doc.docId);
+	}
+
+	/** Re-open one view (its binding is void or out of sync); `base` = merge base for its bind. */
+	private rebind(slot: ViewSlot, base: Text | null): void {
+		const doc = slot.doc;
+		if (!doc) return;
+		this.stats.resyncs++;
+		if (base && !this.bases.has(doc.docId)) this.bases.set(doc.docId, base);
+		this.unbindSlot(slot, true);
+		void this.open(slot);
+	}
+
+	/** Main is out of sync with the replica for `doc`: every view re-binds, merging against `base`. */
+	private resync(doc: BoundDoc, base: Text | null): void {
+		if (base) this.bases.set(doc.docId, base);
+		for (const slot of [...doc.slots]) this.rebind(slot, null);
 	}
 }

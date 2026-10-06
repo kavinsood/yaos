@@ -4,8 +4,13 @@
  * Rules every implementation must follow:
  *  - rename() is a plain vault rename (Obsidian vault.rename), NEVER
  *    fileManager.renameFile: remote moves must not rewrite links.
- *  - write() with a precondition is a CAS (Obsidian: vault.process for
- *    existing files, create for "absent"); a failed precondition never writes.
+ *  - write() with a precondition never writes when the precondition fails.
+ *    "absent" is atomic (Obsidian: vault.create throws if the file exists).
+ *    fingerprint/hash preconditions are evaluated without hashing on the main
+ *    thread: the implementation reads the raw bytes and asks the engine for
+ *    their hash (host/hashOracle.ts, DESIGN §f.2), then writes behind O(1)
+ *    guards (stat unchanged; for text, decoded length unchanged). See
+ *    host/obsidianVault.ts for the exact TOCTOU window.
  *  - Events are hints. The engine never deletes or overwrites based on an
  *    event alone; it re-stats/re-hashes and plans from the three trees.
  *  - Dot-folders and the config dir are invisible to list() (Obsidian does not
@@ -39,8 +44,12 @@ export type WritePrecondition =
 	| { readonly t: "hash"; readonly hash: ContentHash }
 	| { readonly t: "any" };
 
+/**
+ * Result of VaultPort.write. No fingerprint: main never hashes. The engine knows the bytes it asked to
+ * write and fingerprints them itself (engine/compose/hashService.ts writeFingerprint).
+ */
 export type WriteOutcome =
-	| { readonly ok: true; readonly stat: VaultStat; readonly fingerprint: DiskFingerprint }
+	| { readonly ok: true; readonly stat: VaultStat }
 	| { readonly ok: false; readonly reason: "precondition" | "parent-is-file" | "invalid-path" | "io"; readonly current: VaultStat | null; readonly message: string };
 
 export type RenameOutcome =
@@ -61,7 +70,6 @@ export interface VaultPort {
 	/** Full listing of files (not folders). Cheap on Obsidian (in-memory index). */
 	list(): Promise<readonly VaultStat[]>;
 	stat(path: string): Promise<VaultStat | null>;
-	readText(path: string): Promise<string>;
 	readBytes(path: string): Promise<Uint8Array>;
 	/** Create or replace, creating parent folders. */
 	write(path: VaultPath, data: string | Uint8Array, precondition: WritePrecondition): Promise<WriteOutcome>;

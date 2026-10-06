@@ -1,7 +1,7 @@
 /**
  * Frame-builder cost benchmark (DESIGN §d.3/§d.4, §k.3 WP-C #3).
  *
- * Always on: 5 MB doc bound through a host view, 1000 keystrokes (burst and
+ * Always on: 5 MB doc bound, 1000 editor keystrokes (applyEditorChanges, burst and
  * paced = one frame per keystroke) -> zero encodeStateAsUpdate calls on the
  * keystroke path (instrumented counter), every frame committed, a fresh peer
  * converges afterwards. Local compaction / checkpoints are maintenance jobs
@@ -13,9 +13,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import * as Y from "yjs";
 import type { DocId } from "../../core/types";
 import { compactBody } from "../body/compaction";
+import type { TextChanges } from "../body/textChanges";
 import { resetYjsCounters, yjsCounters } from "../body/yjsCounters";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
@@ -29,14 +29,12 @@ function bigText(chars: number): string {
 	return line.repeat(Math.ceil(chars / line.length)).slice(0, chars);
 }
 
-async function bound(e: LogEngine, id: DocId): Promise<Y.Doc> {
-	const doc = new Y.Doc();
-	const b = await e.bind(id);
-	Y.applyUpdate(doc, b.state, "engine");
-	doc.on("update", (u: Uint8Array, origin: unknown) => {
-		if (origin !== "engine") e.applyLocalUpdate(id, u);
-	});
-	return doc;
+/** One keystroke as the main thread posts it: a CodeMirror ChangeSet (JSON) inserting `ch` at `at`. */
+function insertAt(e: LogEngine, id: DocId, at: number, ch: string): void {
+	const len = e.boundLength(id);
+	const changes: TextChanges = at > 0 ? [at, [0, ch]] : [[0, ch]];
+	if (len > at) changes.push(len - at);
+	assert.ok(e.applyEditorChanges(id, changes));
 }
 
 interface Run {
@@ -47,8 +45,7 @@ interface Run {
 	readonly merges: number;
 }
 
-async function typeInto(e: LogEngine, doc: Y.Doc, keys: number, paced: boolean): Promise<Run> {
-	const t = doc.getText("text");
+async function typeInto(e: LogEngine, id: DocId, keys: number, paced: boolean): Promise<Run> {
 	let seed = 7;
 	const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
 	const frames0 = e.c.docs.stats.framesClosed;
@@ -56,9 +53,9 @@ async function typeInto(e: LogEngine, doc: Y.Doc, keys: number, paced: boolean):
 	let syncMs = 0;
 	const start = performance.now();
 	for (let i = 0; i < keys; i++) {
-		const at = Math.floor(rnd() * t.length);
+		const at = Math.floor(rnd() * e.boundLength(id));
 		const k0 = performance.now();
-		t.insert(at, String.fromCharCode(97 + (i % 26)));
+		insertAt(e, id, at, String.fromCharCode(97 + (i % 26)));
 		syncMs += performance.now() - k0;
 		if (paced) await sleep(3);
 	}
@@ -74,24 +71,24 @@ async function setupDoc(relay: SimRelay, chars: number) {
 	const id = await a.createDoc("big.md", bigText(chars));
 	await until(() => a.isIdle(), 30_000, "created");
 	const createMs = performance.now() - t0;
-	const doc = await bound(a, id);
-	return { a, id, doc, createMs };
+	await a.bind(id);
+	return { a, id, createMs };
 }
 
 test("benchmark: 5 MB doc, 1000 keystrokes (burst + paced) -> zero encodeStateAsUpdate on the keystroke path", async () => {
 	const relay = new SimRelay();
-	const { a, id, doc, createMs } = await setupDoc(relay, 5 * 1024 * 1024);
+	const { a, id, createMs } = await setupDoc(relay, 5 * 1024 * 1024);
 	let b: LogEngine | null = null;
 	try {
-		assert.equal(await a.docText(id), doc.getText("text").toString());
-		const burst = await typeInto(a, doc, 1000, false);
+		assert.equal(await a.docText(id), a.boundText(id));
+		const burst = await typeInto(a, id, 1000, false);
 		assert.equal(burst.encodes, 0, "burst: no full-state encode");
 		assert.ok(burst.frames >= 4 && burst.frames <= 40, `burst frames ${burst.frames} (FRAME_MAX_UPDATES caps)`);
-		const paced = await typeInto(a, doc, 1000, true);
+		const paced = await typeInto(a, id, 1000, true);
 		assert.equal(paced.encodes, 0, "paced: no full-state encode");
 		assert.ok(paced.frames >= 200, `paced frames ${paced.frames}`);
 		assert.equal(a.c.outbox.size, 0);
-		const want = doc.getText("text").toString();
+		const want = a.boundText(id);
 		assert.equal(await a.docText(id), want);
 		const stream = a.streamOf(id);
 		const c0 = performance.now();
@@ -116,11 +113,11 @@ test("benchmark timing: 50 KB vs 5 MB per-keystroke cost (YAOS_BENCH=1)", { skip
 	const results: Record<string, Run> = {};
 	for (const [name, chars] of [["50KB", 50 * 1024], ["5MB", 5 * 1024 * 1024]] as const) {
 		const relay = new SimRelay();
-		const { a, doc } = await setupDoc(relay, chars);
+		const { a, id } = await setupDoc(relay, chars);
 		try {
-			await typeInto(a, doc, 200, false); // warm-up
-			const burst = await typeInto(a, doc, 1000, false);
-			const paced = await typeInto(a, doc, 1000, true);
+			await typeInto(a, id, 200, false); // warm-up
+			const burst = await typeInto(a, id, 1000, false);
+			const paced = await typeInto(a, id, 1000, true);
 			results[name] = paced;
 			assert.equal(burst.encodes + paced.encodes, 0);
 			rows.push(`${name}: burst ${(burst.syncMsPerKey * 1000).toFixed(1)}us/key sync (${burst.frames} frames, ${burst.totalMs.toFixed(0)}ms to idle); ` +

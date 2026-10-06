@@ -17,7 +17,7 @@ import type { Unsubscribe } from "../../../ports/common";
 import type {
 	RenameOutcome, TrashMode, VaultEvent, VaultPort, VaultStat, WriteOutcome, WritePrecondition,
 } from "../../../ports/vault";
-import type { ContentHash, DiskFingerprint, VaultPath } from "../../../core/types";
+import type { ContentHash, VaultPath } from "../../../core/types";
 import { kindOfPath } from "../../../core/types";
 import { sha256Hex } from "../../../core/hash/sha256";
 import { utf8Decode, utf8Encode } from "../../../core/hash/utf8";
@@ -170,12 +170,6 @@ export class FakeVault implements VaultPort {
 		return f ? this.statOf(f) : null;
 	}
 
-	async readText(path: string): Promise<string> {
-		const f = this.files.get(this.key(path));
-		if (!f) throw new Error(`ENOENT ${path}`);
-		return utf8Decode(f.bytes);
-	}
-
 	async readBytes(path: string): Promise<Uint8Array> {
 		const f = this.files.get(this.key(path));
 		if (!f) throw new Error(`ENOENT ${path}`);
@@ -200,12 +194,12 @@ export class FakeVault implements VaultPort {
 			f.bytes = bytes;
 			f.mtimeMs = mtimeMs;
 			this.emit({ t: "modify", path: f.path, stat: this.statOf(f) });
-			return { ok: true, stat: this.statOf(f), fingerprint: exactFingerprint(bytes) as DiskFingerprint };
+			return { ok: true, stat: this.statOf(f) };
 		}
 		const nf: FakeFile = { path, bytes, mtimeMs, ctimeMs: mtimeMs };
 		this.files.set(k, nf);
 		this.emit({ t: "create", path, stat: this.statOf(nf) });
-		return { ok: true, stat: this.statOf(nf), fingerprint: exactFingerprint(bytes) as DiskFingerprint };
+		return { ok: true, stat: this.statOf(nf) };
 	}
 
 	async rename(from: string, to: VaultPath, precondition: WritePrecondition): Promise<RenameOutcome> {

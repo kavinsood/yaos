@@ -88,6 +88,9 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	const fallback = op.pathBase ? undefined : s;
 	const ytext = h.doc.getText("text");
 	const diskHash = markdownContentHash(D);
+	// Bound: the disk holds a save of its editors (or the last disk text) that the replica already has: not an edit.
+	// Without this a save followed by more typing on the same line merges as a conflict against the old base.
+	const savedByEditor = h.bound && ctx.deps.boundSavedText?.(docId, D) === true;
 
 	let result: MergeResult | null = null;
 	let crdt0 = "";
@@ -98,7 +101,7 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		crdt0 = ytext.toString();
 		// No stored base (mirror recovery, too large to keep, a merged alias restarted at the winner's create): a side
 		// still at the synced content is the base, so a one-sided change applies as one instead of a no-base conflict copy.
-		const base = storedBase ?? trustedEpochBase(epochBase, crdt0)
+		const base = savedByEditor ? D : storedBase ?? trustedEpochBase(epochBase, crdt0)
 			?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : markdownContentHash(crdt0) === fallback.contentHash ? crdt0 : null);
 		await ctx.deps.clock.yieldNow();
 		const res = merge({ base, disk: D, crdt: crdt0, limits: ctx.mergeLimits });

@@ -8,9 +8,21 @@
 
 import type * as Y from "yjs";
 import type {
-	BodyVersion, ContentHash, DocId, NsOp, NsOpOutcome, PathKey, RemoteEntry, Seq,
+	BodyVersion, ContentHash, DiskFingerprint, DocId, NsOp, NsOpOutcome, PathKey, RemoteEntry, Seq,
 } from "../../core/types";
+import type { WriteOutcome } from "../../ports/vault";
 import type { DiskOp, DiskOpResult, DiskReadRequest, DiskReadResult, Lane } from "../../protocol/messages";
+
+/**
+ * A successful write as the engine sees it: `fingerprint` = sha256 of the exact bytes the engine asked
+ * to write, computed engine-side before the op was posted (main never hashes, DESIGN §d.2).
+ */
+export type WrittenOk = Extract<WriteOutcome, { readonly ok: true }> & { readonly fingerprint: DiskFingerprint };
+
+/** DiskOpResult as a DiskGateway answers it: successful writes carry the engine-side fingerprint. */
+export type ExecResult =
+	| Exclude<DiskOpResult, { readonly t: "write" }>
+	| { readonly opId: number; readonly t: "write"; readonly outcome: WrittenOk | Extract<WriteOutcome, { readonly ok: false }> };
 
 /**
  * Engine side of `readRequest` / `diskOps` (DESIGN §g.2). The host executes ops in order.
@@ -18,7 +30,7 @@ import type { DiskOp, DiskOpResult, DiskReadRequest, DiskReadResult, Lane } from
  */
 export interface DiskGateway {
 	read(reads: readonly DiskReadRequest[], lane: Lane): Promise<readonly DiskReadResult[]>;
-	exec(ops: readonly DiskOp[], lane: Lane): Promise<readonly DiskOpResult[]>;
+	exec(ops: readonly DiskOp[], lane: Lane): Promise<readonly ExecResult[]>;
 }
 
 /** Snapshot of the log side's view used to build a PlannerInput (+ PlannerContext). */

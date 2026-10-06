@@ -15,9 +15,9 @@ import { standInPathKey } from "../../core/plan/pathRules";
 import type { ClockPort } from "../../ports/clock";
 import type { RandomPort } from "../../ports/random";
 import type { TrashMode, VaultStat } from "../../ports/vault";
-import { LANE, type DiskOp, type DiskOpResult, type DiskReadResult, type Lane } from "../../protocol/messages";
+import { LANE, type DiskOp, type DiskReadResult, type Lane } from "../../protocol/messages";
 import type { SyncedRecord } from "../store/schema";
-import type { DiskGateway, LogPort, OwnFoldEvent } from "./deps";
+import type { DiskGateway, ExecResult, LogPort, OwnFoldEvent } from "./deps";
 import { EchoTable } from "./echo";
 import { classify, compileExcludes, toRecord, type Classified, type ClassifySettings } from "./localState";
 import type { DiskChange, DiskSchema, ReconcileStore } from "./store";
@@ -73,6 +73,11 @@ export interface ReconcilerDeps {
 	readonly pathBase?: (key: PathKey) => string | null;
 	/** The keys `pathBase` answers for (the planner's migrated-loser merge). */
 	readonly pathBaseKeys?: ReadonlySet<PathKey>;
+	/**
+	 * A bound doc's replica already holds `text` (canonical): a save of one of its editors read it, or it is the
+	 * last disk text the replica absorbed (boundDisk). Such a disk side is not an edit: the merge base is the text.
+	 */
+	readonly boundSavedText?: (docId: DocId, text: string) => boolean;
 	/**
 	 * Own ns ops folded since the last call (S1, §c.13), handed over and forgotten. A pass applies them right
 	 * before its plan reads the view, so no plan sees a folded own op without its synced update.
@@ -140,7 +145,7 @@ export class Ctx {
 		return this.localAt(path)?.diskPath ?? path;
 	}
 
-	async exec(spec: DiskOpSpec, lane: Lane = LANE.background): Promise<DiskOpResult> {
+	async exec(spec: DiskOpSpec, lane: Lane = LANE.background): Promise<ExecResult> {
 		const op = { ...spec, opId: ++this.opId } as DiskOp;
 		const [res] = await this.deps.disk.exec([op], lane);
 		if (!res) throw new Error("disk gateway returned no result");

@@ -34,17 +34,16 @@ Branch `client-remake-wp-d`. Scope: DESIGN §k.3 WP-D. Status of the acceptance 
   - a config area;
   - bounded reads;
   - I/O failures come back as `reason: "io"` and never throw.
-- **Binding manager** (`src/host/binding.ts`), one replica per open doc:
-  - bind-time merge;
-  - coalesced `localUpdate`;
-  - remote updates are never echoed;
-  - external-reload interception that merges and, on conflict, writes a conflict copy;
-  - `boundSaved` and `docCredit`;
-  - restart rebind via `bindDelta`;
-  - split views share one replica.
-  - Conflict-copy writes retry I/O errors with backoff (250 ms, 1 s, 2 s, 5 s, 10 s, then 30 s) before the merged buffer is saved over the disk side.
+- **Binding manager** (`src/host/binding.ts`). As delivered by WP-D it kept one main-thread Y.Doc per open doc,
+  bound with y-codemirror (`localUpdate`, `bindDelta`, `boundSaved`, main-side merges and conflict copies). The
+  main-thread rework (branch `client-remake-mainthread`) replaced all of that: the editor is a CodeMirror client
+  of the worker replica (`bodyPush` / `body` events, host/bodyClient.ts, host/collab.ts), and the bind and reload
+  merges, conflict copies and save detection run in the worker (DESIGN §d.2, §d.3).
+  - Still true: remote changes are never echoed, `docCredit` flow control, split views are clients of one replica,
+    and a restart re-binds every view.
 - **Obsidian adapters:**
-  - VaultPort (`obsidianVault.ts`): text CAS via `vault.process` with an exact-content guard; `vault.create` when the file is absent; `vault.rename` only; `vault.trash` only; empty-folder removal only when the folder has zero children.
+  - VaultPort (`obsidianVault.ts`): text CAS via `vault.process` with an exact-content guard (since the main-thread
+    rework: an engine-hashed precondition plus a stat recheck and a UTF-16 length guard, DESIGN §f.2); `vault.create` when the file is absent; `vault.rename` only; `vault.trash` only; empty-folder removal only when the folder has zero children.
   - WorkspacePort (`obsidianWorkspace.ts`): diffs the leaf set, so a mode switch shows up as `file-changed`; wraps `setViewData` per instance (OR-2); unbinds before Obsidian clears the view.
   - ConfigDirPort (`configDir.ts`): writes a temp file, then renames it.
   - Side files and platform: lifecycle events and device facts.
@@ -70,7 +69,8 @@ Branch `client-remake-wp-d`. Scope: DESIGN §k.3 WP-D. Status of the acceptance 
   - Stand-in imports are warnings. Today there is one: `host/plugin.ts` imports `engine/__standins__/engine`.
 - **Sim** (`src/sim/**`):
   - `SimVault`: case profiles, CAS, Obsidian-like events, per-child folder renames, clobber records.
-  - `SimWorkspace`: a y-codemirror stand-in, a 2 s save debounce, `setViewData` reloads.
+  - `SimWorkspace`: a y-codemirror stand-in (now a CodeMirror `Text` per view with a ChangeSet undo stack, bound
+    as in DESIGN §d.3), a 2 s save debounce, `setViewData` reloads.
   - `SimDevice`: engine, host, vault, workspace and store over the stand-in hub.
   - Actors, faults, invariants, and a seeded runner with ddmin (`run.ts`).
 
@@ -159,7 +159,7 @@ If B shows that `adapter.write` bypasses the wrapper, those writes reach YAOS on
 
 - **No `qa-product` build mode.** `esbuild.config.mjs` has `production` and dev only, so `package.json`'s `build:qa-product` and `qa:smoke-ready` are stale (legacy QA harness).
 - **manifest.json version 3.0.0.** It is a clean break and there are no users.
-- **The sim's `setViewData` clear=true unbinds first,** matching the Obsidian adapter. Loading another file into a view detaches y-codemirror before its content is replaced, so one file's text can never reach another file's doc.
+- **The sim's `setViewData` clear=true unbinds first,** matching the Obsidian adapter. Loading another file into a view detaches the editor binding before its content is replaced, so one file's text can never reach another file's doc.
 - **Seeded Yjs clientIDs.** `sim/__standins__/seededEntropy.ts` patches `globalThis.crypto.getRandomValues`, which is the object lib0 uses, before yjs loads. `node:crypto` is not used because the main tsconfig has no node types. Same seed gives the same trace and the same digest, in one process and across processes (checked: seed 511, three processes, same digest).
   - Import order matters: a script that imports `yjs` before `sim/run` gets random clientIDs, and the same plan then converges differently from run to run. That is how an apparent "nondeterministic sim" showed up in a debugging script. `SimReport.seededEntropy` says whether the seed took hold, and the reproducibility test asserts it.
 - **Harness: Obsidian clobber exemption.** An editor save (`vault.modify`, no precondition) can overwrite an external write before the watcher reports it. YAOS cannot see or prevent that. `SimVault` records a `ClobberRecord`, and the invariants exempt the tokens that save destroyed.
@@ -211,7 +211,7 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
 - `editor:undo` from Obsidian's menu or command can undo remote edits. It is not routed through the Yjs undo manager.
 - **Config dir:** there is no listing message and no config rename or trash.
 - ESLint does not cover `src/host/**`.
-- `obsidianWorkspace`, the y-codemirror attach and `plugin.ts` are tested against fakes, not against real CodeMirror 6 or Obsidian. The phone and desktop spike runs are the real check.
+- `obsidianWorkspace`, the CodeMirror attach (`collab.ts`) and `plugin.ts` are tested against fakes, not against real CodeMirror 6 or Obsidian. The phone and desktop spike runs are the real check.
 - **Sim coverage (§l), integration pending:**
   - relay faults (socket close points, relay restart/STREAM_RESEND, dedupe expiry);
   - storage crash points;
@@ -282,7 +282,7 @@ Commits 65c9676 to cfd0fd4 on `client-remake`, after WP-A, WP-B and WP-D were me
 - **`applyEditsTo(TextSink, from, edits)`** (core stays Yjs-free).
   - A replacement is inserted after the first code point of the old run. Then the run is deleted on both sides.
   - Both Yjs origins of the new text are deleted characters, so a concurrent insert at either edge keeps its side for both clientID orders. The tests run both orders.
-  - It is used by the binding (`applyTextDiff`), the merge job (`applyMinimalDiff`) and the stand-in engine (4352b3f). `applyMinimalReplace` stays editor-only.
+  - It is used by the binding (`applyTextDiff`), the merge job (`applyMinimalDiff`) and the stand-in engine (4352b3f). `applyMinimalReplace` stays editor-only. (Since the main-thread rework `applyTextDiff` and `applyMinimalReplace` are gone: the bind and reload merges apply their result in the worker, compose/boundBody.ts and boundDisk.ts.)
 - **Performance**: `minimalDiff` on 2M-char inputs, min of 3 runs, Apple M4 Pro.
 
   | Inputs | Before Fix 2 (7110469) | 2d2ab2b | Now |

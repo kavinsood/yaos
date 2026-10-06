@@ -9,7 +9,6 @@ import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
-import { encodeStateAsUpdate } from "../body/yjsCounters";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
 import type { FrameNoFloor } from "../store/repo";
 import { dbName, STORE } from "../store/schema";
@@ -27,23 +26,14 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
 	}
 	const docId = e.docId;
 	const first = rt.engine.bound.add(docId, path, viewId);
-	let bind: { state: Uint8Array; stateVector: Uint8Array };
 	try {
-		bind = await rt.log.bind(docId);
-		if (!first) rt.log.unbind(docId);
+		// One replica pin per bound doc (released when its last view closes); the views attach next (bodyAttach).
+		if (first) await rt.log.bind(docId);
 	} catch (err) {
 		rt.engine.bound.remove(docId, viewId);
 		throw err;
 	}
-	const s = rt.rec.ctx.synced(docId);
-	const baseText = s?.hasBase ? await rt.rec.ctx.store.loadBase(docId) : null;
-	return {
-		t: "bind",
-		bind: {
-			docId, kind: "markdown", state: bind.state, stateVector: bind.stateVector, baseText,
-			baseHash: baseText !== null && s ? s.contentHash : null, frozen: e.body?.frozen ?? false,
-		},
-	};
+	return { t: "bind", bind: { docId, kind: "markdown", frozen: e.body?.frozen ?? false } };
 }
 
 /**
@@ -75,11 +65,6 @@ export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefi
 	if (!ctx.local.has(key)) return e;
 	for (const o of ctx.store.synced.values()) if (o.pathKey === key && o.docId !== e.docId) return undefined;
 	return e;
-}
-
-export function fullState(rt: VaultRuntime, docId: DocId): Uint8Array | null {
-	const h = rt.log.handleOf(docId);
-	return h ? encodeStateAsUpdate(h.doc) : null;
 }
 
 export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineResultValue> {
@@ -171,7 +156,14 @@ async function diagnostics(rt: VaultRuntime, includePaths: boolean): Promise<Dia
  */
 export async function prepareEpochMigration(rt: VaultRuntime): Promise<Map<PathKey, string>> {
 	const bound = [...rt.engine.bound.byId.keys()];
-	if (bound.length > 0) await rt.engine.link.request({ t: "saveViews", docIds: bound }).catch(() => undefined);
+	if (bound.length > 0) {
+		await rt.engine.link.request({ t: "saveViews", docIds: bound }).catch(() => undefined);
+		// The saves' disk check now (boundSaved: the synced base the new epoch merges against), not after its debounce.
+		await Promise.all(bound.map((d) => {
+			const b = rt.engine.bound.get(d);
+			return b ? rt.engine.boundDisk.checkSaved(b) : undefined;
+		}));
+	}
 	await rt.takeSnapshot("epoch");
 	const bases = new Map<PathKey, string>();
 	const rows = await rt.db.tx([STORE.baseText], "readonly", (tx) => tx.getAll(STORE.baseText)).catch(() => []);
