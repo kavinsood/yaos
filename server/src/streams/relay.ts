@@ -659,6 +659,11 @@ export class StreamRelayService {
 	 * stream whose index is still building are held back, in order, for a later flush (re-armed here); a timer flush
 	 * first advances the builds one step (a bytes flush runs in a message turn, which already stepped). A forced
 	 * flush holds nothing back (the commit builds inline). A failed flush fails every frame it took.
+	 *
+	 * DECISIONS-GAP: H2 does not say what drives the steps. They run once per incoming message and once per timer
+	 * flush. A message resets the DO's CPU budget and a timer does not, so with no messages arriving the timer steps
+	 * of one build share a single budget window (a fresh budget per step would need an alarm, which the vault host
+	 * owns).
 	 */
 	flush(reason: StreamFlushReason): void {
 		const taken = this.pending;
