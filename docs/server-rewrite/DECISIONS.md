@@ -1,8 +1,8 @@
 # YAOS server rewrite: decisions
 
-Status: draft for review. Branch `server-remake`. Wire baseline: `docs/client-remake/relay-wire.md` ("the
-contract"). IDs are stable. The review flags F1–F18 are folded into the decisions; section 8 logs where each one
-landed and lists what is still open. D8b is a proposal awaiting the user's OK.
+Status: approved 2026-10-06; implementation under way (section 9). Branch `server-remake`. Wire baseline:
+`docs/client-remake/relay-wire.md` ("the contract"). IDs are stable. The review flags F1–F18 are folded into the
+decisions; section 8 logs where each one landed.
 
 Budget profile: Cloudflare Workers Free. 100k rows written/day, 5M rows read/day, 100k DO requests/day, 10 ms
 CPU, 5 GB DO storage, 2 MB max row. PITR keeps 30 days and does not exist in local dev.
