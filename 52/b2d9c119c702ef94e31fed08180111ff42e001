@@ -1,0 +1,19 @@
+src/engine/reconcile/reconciler.canvas.test.ts
+  s_3bea9f4c72a663::t_2ecbbc76caf000 1-324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "52b2d9c119c702ef94e31fed08180111ff42e001",
+  "prompts": {},
+  "sessions": {
+    "s_3bea9f4c72a663": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb05cda11fb8d171",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
