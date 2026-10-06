@@ -1,0 +1,37 @@
+.gitignore
+  s_68e2b2c5204835::t_7a16798cec538e 68-70
+scripts/relay-dev/cf-config.mjs
+  s_6e0df1c7504874::t_2f541022ab8ebe 1-99
+scripts/relay-dev/cf-deploy/.npmrc
+  s_6e0df1c7504874::t_53a9cb9d2a3236 1-2
+scripts/relay-dev/cf-deploy/package-lock.json
+  s_6e0df1c7504874::t_285d0bb4734738 1-1806
+scripts/relay-dev/cf-deploy/package.json
+  s_6e0df1c7504874::t_d9d9345afca860 1-10
+scripts/relay-dev/deploy.sh
+  s_68e2b2c5204835::t_c87463ee34912e 7-19,26,30,40-42,50-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "41e2950aec71d3519d987acddc19f9dc8d9bb3a3",
+  "prompts": {},
+  "sessions": {
+    "s_68e2b2c5204835": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa620417b3e86ab2f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_6e0df1c7504874": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a391b87c3ffcb4eb9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
