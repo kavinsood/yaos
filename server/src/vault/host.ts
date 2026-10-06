@@ -77,6 +77,15 @@ export function isPitrUnsupportedError(error: unknown): boolean {
 	return error instanceof Error && error.message.includes("does not implement point-in-time recovery");
 }
 
+/**
+ * Cloudflare rejects a time its PITR history of the object does not reach with "Requested time is before this database
+ * existed." (measured on scratch-3: an `at` 11 s after the vault's init was still refused 20 min later). Retrying
+ * cannot help and nothing was done to the vault, so D8b's `400 invalid_restore_point` (G42).
+ */
+export function isPitrBeforeHistoryError(error: unknown): boolean {
+	return error instanceof Error && error.message.includes("before this database existed");
+}
+
 export interface VaultMeta {
 	vaultId: string;
 	/** D8: the vault epoch, base64url(16 random bytes), minted at init. */
@@ -693,7 +702,7 @@ export class VaultHost {
 	 * `pending_restore_id = restoreId` (1 row; skipped when already set), and `{bookmark: getBookmarkForTime(at),
 	 * devices}`. `refreshOnly` (a resume whose journal already holds a snapshot): when the marker is gone the vault was
 	 * rewound, its device table is T's, and the journal's snapshot stands (`skip`). No effect before the bookmark: no
-	 * PITR → `unsupported`.
+	 * PITR → `unsupported`; a time before the vault or its PITR history → `invalid_point`.
 	 */
 	async prepareRestore(restoreId: string, at: number, refreshOnly: boolean): Promise<PrepareRestoreResult> {
 		const state = this.load();
@@ -709,6 +718,7 @@ export class VaultHost {
 			bookmark = await this.pitr.getBookmarkForTime(at);
 		} catch (error) {
 			if (isPitrUnsupportedError(error)) return { kind: "unsupported" };
+			if (isPitrBeforeHistoryError(error)) return { kind: "invalid_point" };
 			console.error("[yaos-vault] getBookmarkForTime failed", describeError(error));
 			throw error;
 		}

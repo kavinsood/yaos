@@ -668,13 +668,17 @@ P3b gap calls (accepted; marked `DECISIONS-GAP` in code):
 - G35 A blob GET is always `application/octet-stream` with `nosniff` and `no-store`: blobs share the console's
   origin, so an uploaded HTML or SVG body never renders.
 - G36 A restore body that is not a JSON object counts as `{}` (no `at` → `400 invalid_restore_point`).
-- G37 The restore alarm re-arms itself while journal rows remain: 30 s, doubling per failed alarm, capped at 1 h.
+- G37 The restore alarm re-arms itself while journal rows remain, after the newest row's age clamped to 30 s..1 h
+  (about doubling per alarm). The age is read from `created_at`, so an eviction does not reset the backoff (P5: an
+  in-memory counter re-armed every 30 s on scratch-3).
 - G38 One run rewinds at most 3 times, then `503 restore_incomplete`; the alarm carries on.
 - G39 `at` is a date-time with optional seconds, ≤ 3 fraction digits and an explicit zone (`Z` or ±hh:mm).
 - G40 `at` is validated even when a restore is pending; the pending one then resumes with its journaled `at`.
 - G41 A vault that answers `unknown_vault`, or whose journal row vanished mid-run, ends the run `404 unknown_vault`;
   `restore_unsupported` and `invalid_restore_point` from the vault drop the row.
-- G42 An `at` before the vault was created → `400 invalid_restore_point`, with no PITR call.
+- G42 An `at` before the vault was created → `400 invalid_restore_point`, with no PITR call. So does an `at` that
+  Cloudflare's PITR history does not reach ("Requested time is before this database existed."; P5): nothing was
+  done to the vault, and the journal row is dropped.
 - G43 Finish reads "`pending_restore_id` still set" as "equals this restoreId": a restore in flight at T leaves its
   own marker in the rewound state, and rewinding never clears that one.
 - G44 Enroll's restore 503 runs before the code is read, so a malformed body also gets it.

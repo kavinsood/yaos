@@ -18,8 +18,9 @@ export const RESTORE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 export const RESTORE_ALARM_DELAY_MS = 30_000;
 /**
  * DECISIONS-GAP: D8b says "the alarm with platform retries" but not how long it keeps trying. Platform retries cover
- * only a handler that throws (at most 6); the handler instead re-arms itself while journal rows remain, 30 s doubling
- * per failed alarm in this runtime, capped at 1 h, so a journal row is never left without an alarm.
+ * only a handler that throws (at most 6); the handler instead re-arms itself while journal rows remain, after the age
+ * of the newest row clamped to 30 s..1 h (about doubling per alarm, and an eviction does not reset it), so a journal
+ * row is never left without an alarm.
  */
 export const RESTORE_ALARM_MAX_DELAY_MS = 60 * 60 * 1000;
 /**
@@ -98,8 +99,6 @@ function decodeDevices(blob: ArrayBuffer): DeviceRecord[] {
 export class RestoreRunner {
 	/** One run per vault at a time: a second press and the alarm join it. */
 	private readonly inFlight = new Map<string, Promise<RestoreResult>>();
-	/** Alarms in a row that left journal rows behind (the re-arm backoff); memory only. */
-	private alarmMisses = 0;
 
 	constructor(
 		private readonly storage: StoragePort,
@@ -146,13 +145,13 @@ export class RestoreRunner {
 				console.error("[yaos-config] restore alarm: run failed", describeError(error));
 			}
 		}
-		if (this.storage.sql.exec("SELECT vault_id FROM restore_journal LIMIT 1").toArray().length === 0) {
-			this.alarmMisses = 0;
-			return;
-		}
-		const delay = Math.min(RESTORE_ALARM_DELAY_MS * 2 ** this.alarmMisses, RESTORE_ALARM_MAX_DELAY_MS);
-		this.alarmMisses++;
-		await this.ports.alarms.setAlarm(this.clock.now() + delay);
+		const newest = this.storage.sql.exec<{ created_at: number | null }>(
+			"SELECT MAX(created_at) AS created_at FROM restore_journal",
+		).one().created_at;
+		if (newest === null) return;
+		const now = this.clock.now();
+		const delay = Math.min(Math.max(now - newest, RESTORE_ALARM_DELAY_MS), RESTORE_ALARM_MAX_DELAY_MS);
+		await this.ports.alarms.setAlarm(now + delay);
 	}
 
 	private track(vaultId: string, start: () => Promise<RestoreResult>): Promise<RestoreResult> {

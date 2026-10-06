@@ -342,6 +342,32 @@ s.test("D8b: writes after every rewind → 503 restore_incomplete after MAX_REWI
 	}, PITR);
 });
 
+s.test("D8b alarm backoff (G37): the newest journal row's age, clamped to 30 s..1 h; an eviction does not reset it", async () => {
+	await withWorld(async (world) => {
+		const sc = await scenario(world);
+		world.cluster.restoreHook = (step, phase) => {
+			if (step === "prepareRestore" && phase === "before") throw new Error("transient");
+		};
+		const pressedAt = world.config.clock.now;
+		const response = await press(world, sc.cookie, sc.vaultId, sc.atIso);
+		assert.deepEqual([response.status, await json(response)], [503, { error: "restore_incomplete" }]);
+		assert.equal(world.config.alarms.scheduled, pressedAt + 30_000, "step 0");
+		const delays: number[] = [];
+		for (let fired = 0; fired < 9; fired++) {
+			advance(world, world.config.alarms.scheduled! - world.config.clock.now);
+			if (fired % 2 === 1) world.config.restart();
+			await world.config.fireAlarm();
+			delays.push(world.config.alarms.scheduled! - world.config.clock.now);
+		}
+		assert.deepEqual(delays.map((delay) => delay / 1000), [30, 60, 120, 240, 480, 960, 1920, 3600, 3600]);
+		world.cluster.restoreHook = null;
+		advance(world, world.config.alarms.scheduled! - world.config.clock.now);
+		await world.config.fireAlarm();
+		await assertRestored(world, sc);
+		assert.equal(world.config.alarms.scheduled, null, "done: not re-armed");
+	}, PITR);
+});
+
 // ---- the authority freeze and the flag ------------------------------------------------------------------------------
 
 s.test("D8b authority freeze: revoke, owner-code and reset-streams → 409 restore_in_progress while journaled", async () => {
@@ -409,7 +435,7 @@ s.test("D8b flag: 60 s of 503 restore_in_progress on device routes and enroll, u
 
 // ---- errors -------------------------------------------------------------------------------------------------------
 
-s.test("D8b errors: 400 invalid_restore_point (step 0 and before the vault existed), 404 unknown_vault", async () => {
+s.test("D8b errors: 400 invalid_restore_point (step 0, before the vault or its PITR history), 404 unknown_vault", async () => {
 	await withWorld(async (world) => {
 		const sc = await scenario(world);
 		const now = world.config.clock.now;
@@ -433,6 +459,17 @@ s.test("D8b errors: 400 invalid_restore_point (step 0 and before the vault exist
 		assert.equal(journalRows(world), 0, "the journal row is dropped");
 		assert.equal(sc.socket.closed, null, "no effect on the vault");
 		assert.deepEqual(markers(sc.vault), { pending: null, last: null });
+		// After the vault's init but before its PITR history: the fake rejects as Cloudflare does.
+		const calls = sc.vault.pitr!.calls.length;
+		const beforeHistory = await press(world, sc.cookie, sc.vaultId, new Date(sc.at - 500).toISOString());
+		assert.deepEqual([beforeHistory.status, await json(beforeHistory)], [400, { error: "invalid_restore_point" }],
+			"before the PITR history");
+		assert.deepEqual(sc.vault.pitr!.calls.slice(calls), ["getBookmarkForTime"]);
+		assert.equal(journalRows(world), 0, "the journal row is dropped");
+		assert.equal(sc.socket.closed, null, "no effect on the vault");
+		assert.deepEqual(markers(sc.vault), { pending: null, last: null });
+		assert.equal((await world.fetch(`/operator/vaults/${sc.vaultId}/devices/${sc.phone.deviceId}`,
+			{ method: "DELETE", cookie: sc.cookie })).status, 200, "no authority freeze is left");
 
 		const unknown = await press(world, sc.cookie, "AAAAAAAAAAAAAAAAAAAAAA", sc.atIso);
 		assert.deepEqual([unknown.status, await json(unknown)], [404, { error: "unknown_vault" }]);
