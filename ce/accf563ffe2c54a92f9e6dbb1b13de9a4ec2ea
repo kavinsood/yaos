@@ -1,0 +1,31 @@
+server/src/console/mobileSetup.ts
+  s_fb57791edfdd96::t_81cca659c7da10 1-69
+server/src/console/page.ts
+  s_fb57791edfdd96::t_04e7d915217fcb 1-29
+tests/server/console.ts
+  s_4bbb4f0137215c::t_e6234899fe7d9a 1-382
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ceaccf563ffe2c54a92f9e6dbb1b13de9a4ec2ea",
+  "prompts": {},
+  "sessions": {
+    "s_4bbb4f0137215c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a75978e2782c742bb",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_fb57791edfdd96": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afce4c746832c2a53",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
