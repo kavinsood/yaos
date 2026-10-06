@@ -9,8 +9,8 @@
  * (import it first; jiti keeps import order) and lets the runner seed it per
  * run. Outside a seeded run it delegates to the real CSPRNG.
  *
- * STAND-IN: test-only. The real engine draws clientIDs the same way, so this
- * keeps working after integration as long as it is imported first.
+ * Test-only. The engine draws clientIDs the same way, so this works for the
+ * real engine as long as it is imported first.
  */
 
 import { SeededRandom } from "./random";

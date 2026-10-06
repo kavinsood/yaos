@@ -13,8 +13,8 @@ import type { DocId } from "../core/types";
 import type { EngineResultValue, MainToEngine } from "../protocol/messages";
 import { BindingManager, type BindingLink } from "../host/binding";
 import { createHasher } from "../host/hashing";
-import { VirtualClock } from "./__standins__/clock";
-import { simHashPort } from "./__standins__/sha256";
+import { VirtualClock } from "./clock";
+import { simHashPort } from "./hash";
 import { OBSIDIAN_RELOAD_DELAY_MS, SimVault } from "./vault";
 import { SimWorkspace, type SimEditorView } from "./workspace";
 

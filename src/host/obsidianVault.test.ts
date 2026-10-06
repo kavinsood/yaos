@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { DiskFingerprint, VaultPath } from "../core/types";
 import type { VaultEvent } from "../ports/vault";
-import { simHashPort } from "../sim/__standins__/sha256";
+import { simHashPort } from "../sim/hash";
 import { FakeObsidianVault } from "../sim/fakeObsidian";
 import { createHasher, utf8 } from "./hashing";
 import { ObsidianVault } from "./obsidianVault";

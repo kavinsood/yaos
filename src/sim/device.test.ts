@@ -1,17 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { VirtualClock } from "./__standins__/clock";
-import { StandinHub } from "../engine/__standins__/hub";
+import { VirtualClock } from "./clock";
 import { SimDevice, type SimDeviceOptions } from "./device";
+import { SimNet } from "./net";
 
-function world(opts: Partial<SimDeviceOptions> = {}, names = ["A", "B"]): { clock: VirtualClock; hub: StandinHub; devs: SimDevice[] } {
+function world(opts: Partial<SimDeviceOptions> = {}, names = ["A", "B"]): { clock: VirtualClock; net: SimNet; devs: SimDevice[] } {
 	const clock = new VirtualClock();
 	clock.onError = (e) => {
 		throw e;
 	};
-	const hub = new StandinHub(clock, () => 20);
-	const devs = names.map((name) => new SimDevice({ name, clock, hub, ...opts }));
-	return { clock, hub, devs };
+	const net = new SimNet(clock);
+	const devs = names.map((name) => new SimDevice({ name, clock, net, ...opts }));
+	return { clock, net, devs };
 }
 
 async function boot(clock: VirtualClock, devs: SimDevice[]): Promise<void> {
@@ -88,11 +88,11 @@ test("pagehide flushes the coalesce buffer synchronously (acceptance 4)", async 
 	assert.equal(a.runtime.bindings.stats.localUpdatesPosted, posted + 1, "flushed before pagehide returns");
 	assert.equal(a.runtime.stats.lifecycleFlushes, 1);
 	await clock.advance(100);
-	assert.equal(a.engine?.doc(a.engine.keyOf("a.md"))?.ytext.toString(), "xy");
+	assert.equal(a.engineText("a.md"), "xy");
 });
 
 test("engine killed mid-typing loses nothing (bindDelta after restart)", async () => {
-	const { clock, devs } = world({ persistDelayMs: 1_000 });
+	const { clock, devs } = world();
 	const a = dev(devs, 0);
 	const b = dev(devs, 1);
 	a.vault.userWrite("a.md", "start");
@@ -110,7 +110,7 @@ test("engine killed mid-typing loses nothing (bindDelta after restart)", async (
 	await clock.advance(3_000);
 	assert.equal(a.engineStarts, 2);
 	assert.equal(a.runtime.engine.isReady, true);
-	assert.equal(a.engine?.doc(a.engine.keyOf("a.md"))?.ytext.toString(), "start one two three");
+	assert.equal(a.engineText("a.md"), "start one two three");
 	b.setOnline(true);
 	await clock.advance(5_000);
 	assert.equal(b.vault.textOf("a.md"), "start one two three");

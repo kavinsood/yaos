@@ -5,8 +5,8 @@ import type { DiskOp, DiskOpResult, Lane } from "../protocol/messages";
 import type { WritePrecondition } from "../ports/vault";
 import { DiskExecutor } from "./diskExecutor";
 import { createHasher, utf8 } from "./hashing";
-import { VirtualClock } from "../sim/__standins__/clock";
-import { simHashPort } from "../sim/__standins__/sha256";
+import { VirtualClock } from "../sim/clock";
+import { simHashPort } from "../sim/hash";
 import { SimConfigDir, SimVault, type CaseProfile } from "../sim/vault";
 
 function setup(profile: CaseProfile = "case-insensitive", bound: Set<string> = new Set()) {

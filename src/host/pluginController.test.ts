@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { VirtualClock } from "../sim/__standins__/clock";
-import { StandinHub } from "../engine/__standins__/hub";
+import { VirtualClock } from "../sim/clock";
+import { SimNet } from "../sim/net";
 import { SimDevice } from "../sim/device";
 import { YaosController } from "./pluginController";
 import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "./ui/api";
@@ -10,8 +10,8 @@ const ID: PairedIdentity = { host: "https://relay.example", vaultId: "v1", devic
 
 function setup(initial: YaosPluginData = defaultPluginData("A")) {
 	const clock = new VirtualClock();
-	const hub = new StandinHub(clock, () => 10);
-	const dev = new SimDevice({ name: "A", clock, hub });
+	const net = new SimNet(clock, { linkMs: 10 });
+	const dev = new SimDevice({ name: "A", clock, net });
 	const saved: YaosPluginData[] = [];
 	const notices: string[] = [];
 	const logs: string[] = [];
@@ -51,13 +51,13 @@ test("pairing starts the engine; status, commands, settings and unpairing flow t
 	const ok = ctl.command({ t: "pause" });
 	await clock.advance(10);
 	assert.deepEqual(await ok, { t: "ok" });
-	const before = dev.engine?.stats.localUpdates;
+	const engineBefore = dev.engine;
 	const upd = ctl.updateData((d) => ({ ...d, engine: { ...d.engine, excludePatterns: ["private/**"] } }));
 	await clock.advance(10);
 	await upd;
 	assert.equal(ctl.runState().phase, "running", "settings change does not restart");
 	assert.equal(dev.engineStarts, 1);
-	assert.equal(dev.engine?.stats.localUpdates, before);
+	assert.equal(dev.engine, engineBefore, "same engine instance");
 	const relabel = ctl.updateData((d) => ({ ...d, deviceLabel: "Laptop" }));
 	await clock.advance(5_000);
 	await relabel;

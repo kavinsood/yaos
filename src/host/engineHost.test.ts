@@ -6,7 +6,7 @@ import type { EngineInitConfig, MainToEngine } from "../protocol/messages";
 import { PROTOCOL_VERSION } from "../protocol/messages";
 import type { ProtocolErrorCode } from "../protocol/errors";
 import { PING_INTERVAL_MS, PING_TIMEOUT_MS } from "../protocol/transport";
-import { VirtualClock } from "../sim/__standins__/clock";
+import { VirtualClock } from "../sim/clock";
 import { EngineHost, HostRequestError, STARTUP_PING_TIMEOUT_MS, type CarrierKind, type EngineCarrier, type EngineEventMessage } from "./engineHost";
 
 type Mode = "ok" | "silent" | { initError: ProtocolErrorCode } | { fatalOnInit: ProtocolErrorCode } | "no-pong-after-init";

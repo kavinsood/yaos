@@ -1,15 +1,18 @@
 /**
  * SimDevice: one simulated Obsidian device = SimVault + SimWorkspace +
- * SimPlatform + HostRuntime + engine carrier (stand-in engine over an inline
- * pair on the virtual clock, presented to the host as a "worker" so crash,
- * restart and fallback paths run).
+ * SimPlatform + HostRuntime + the real composed engine (createEngine over an
+ * inline pair on the virtual clock, presented to the host as a "worker" so
+ * crash, restart and fallback paths run) on WP-A's MemStoragePort and the
+ * run's SimRelay (SimNet).
  *
- * INTEGRATION: the carrier factory switches to WP-C's createEngine with sim
- * ports (WP-A sim relay/storage) instead of createStandinEngine + StandinHub.
+ * Crashes keep exactly the committed storage state (MemStoragePort.crash());
+ * the dying engine's socket drops before anything else can flush.
  */
 
-import type { DeviceId, VaultId } from "../core/types";
+import type { DeviceId, VaultPath } from "../core/types";
+import { pathKey } from "../core/paths/pathKey";
 import type { Unsubscribe } from "../ports/common";
+import type { EnginePorts } from "../ports";
 import type { LifecycleEvent, PlatformInfo, PlatformPort } from "../ports/platform";
 import type { BrakeReport } from "../core/types";
 import type { ProtocolError } from "../protocol/errors";
@@ -20,11 +23,16 @@ import type { EngineCarrier } from "../host/engineHost";
 import { createHasher } from "../host/hashing";
 import { HostRuntime, type HostUiSink } from "../host/hostRuntime";
 import type { HostIdentity } from "../host/runtimeSupport";
-import { createStandinEngine, type StandinEngine } from "../engine/__standins__/engine";
-import type { StandinStore } from "../engine/__standins__/docs";
-import type { StandinHub } from "../engine/__standins__/hub";
-import type { VirtualClock } from "./__standins__/clock";
-import { simHashPort } from "./__standins__/sha256";
+import { createNoopCrypto } from "../engine/adapters/noopCrypto";
+import { createEngine, type ComposedEngine, type EngineHandle } from "../engine/compose/protocolEngine";
+import type { VaultRuntime } from "../engine/compose/vaultRuntime";
+import { residentText } from "../engine/compose/runtimeOps";
+import { FAST_TUNING } from "../engine/runtime/testHarness";
+import type { VirtualClock } from "./clock";
+import { simHashPort } from "./hash";
+import { SIM_VAULT_ID, type SimNet } from "./net";
+import { hashLabel, SeededRandom } from "./random";
+import { MemStoragePort } from "./storage";
 import { SimConfigDir, SimSideFiles, SimVault, type CaseProfile } from "./vault";
 import { SimWorkspace } from "./workspace";
 
@@ -60,11 +68,13 @@ export const SIM_SETTINGS: EngineSettings = {
 export interface SimDeviceOptions {
 	readonly name: string;
 	readonly clock: VirtualClock;
-	readonly hub: StandinHub;
+	readonly net: SimNet;
 	readonly profile?: CaseProfile;
 	readonly mobile?: boolean;
-	/** Engine persistence delay: changes newer than this die with a crashed engine. */
-	readonly persistDelayMs?: number;
+	/** Settings for this device (default SIM_SETTINGS). */
+	readonly settings?: () => EngineSettings;
+	/** Engine diagnostics lines (debug). */
+	readonly log?: (line: string) => void;
 	readonly watcherDelayMs?: () => number;
 	/** Worker carrier unavailable / fails storage in init (OR-1 paths). */
 	readonly workerMode?: "ok" | "unavailable" | "storage-fails";
@@ -83,13 +93,17 @@ export class SimDevice {
 	readonly configDir: SimConfigDir;
 	readonly sideFiles = new SimSideFiles();
 	readonly platform: SimPlatform;
-	readonly store: StandinStore = new Map();
+	/** The device's IndexedDB (survives engine and app crashes with exactly its committed state). */
+	storage: MemStoragePort;
 	readonly ui: SimUiLog = { statuses: [], brakes: [], notices: [], fatals: [], carriers: [] };
 	workspace: SimWorkspace;
 	/** Every workspace this device had (one per app incarnation), for invariant counters. */
 	readonly workspaces: SimWorkspace[] = [];
 	runtime: HostRuntime;
-	engine: StandinEngine | null = null;
+	engine: ComposedEngine | null = null;
+	/** The engine's current vault runtime (null while starting or restarting). */
+	vrt: VaultRuntime | null = null;
+	private handle: EngineHandle | null = null;
 	private pair: InlinePair | null = null;
 	engineStarts = 0;
 	/** Texts that existed only in host memory when the app crashed (pending conflict copies; known gap). */
@@ -99,6 +113,7 @@ export class SimDevice {
 	constructor(readonly opts: SimDeviceOptions) {
 		const hasher = createHasher(simHashPort());
 		this.deviceId = `dev-${opts.name}` as DeviceId;
+		this.storage = new MemStoragePort({ beforeNextTimer: opts.clock.beforeNextTimer });
 		this.vault = new SimVault({ clock: opts.clock, hasher, profile: opts.profile ?? "case-sensitive", watcherDelayMs: opts.watcherDelayMs });
 		this.configDir = new SimConfigDir(opts.clock);
 		const mobile = opts.mobile ?? false;
@@ -114,14 +129,31 @@ export class SimDevice {
 
 	private carrier(kind: "worker" | "inline"): EngineCarrier {
 		const pair = createInlinePair({ schedule: this.opts.clock.schedule });
-		const initError: ProtocolError | null = kind === "worker" && this.opts.workerMode === "storage-fails" ? { code: "storage-lost", message: "IndexedDB unavailable in worker", retryable: false } : null;
-		const handle = createStandinEngine(pair.engine, {
-			carrier: kind, clock: this.opts.clock, hash: simHashPort(), hub: this.opts.hub,
-			memberId: this.deviceId, store: this.store, persistDelayMs: this.opts.persistDelayMs ?? 0, initError,
+		const storageFails = kind === "worker" && this.opts.workerMode === "storage-fails";
+		const n = ++this.engineStarts;
+		const handle = createEngine(pair.engine, {
+			carrier: kind,
+			clientVersion: "sim",
+			tuning: FAST_TUNING,
+			startRetryMs: 1_000,
+			tzOffsetMinutes: () => 0,
+			log: this.opts.log,
+			onRuntime: (rt) => {
+				if (this.handle === handle) this.vrt = rt;
+			},
+			makePorts: (): EnginePorts => {
+				if (storageFails) throw new Error("IndexedDB unavailable in worker");
+				const hash = simHashPort();
+				return {
+					relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.opts.clock,
+					random: new SeededRandom(hashLabel(`${this.deviceId}#${n}`)), crypto: createNoopCrypto(hash), hash, blob: null,
+				};
+			},
 		});
 		this.pair = pair;
+		this.handle = handle;
 		this.engine = handle.engine;
-		this.engineStarts++;
+		this.vrt = null;
 		return {
 			kind,
 			transport: pair.host,
@@ -134,8 +166,8 @@ export class SimDevice {
 
 	private makeRuntime(): HostRuntime {
 		return this.runtimeFor(
-			{ vaultId: "sim-vault" as VaultId, deviceId: this.deviceId, deviceLabel: this.opts.name, relay: { url: "sim://hub", credential: "sim" } },
-			() => SIM_SETTINGS,
+			{ vaultId: SIM_VAULT_ID, deviceId: this.deviceId, deviceLabel: this.opts.name, relay: { url: "sim://relay", credential: "sim" } },
+			this.opts.settings ?? (() => SIM_SETTINGS),
 			{
 				onStatus: (s) => this.ui.statuses.push(s),
 				onBrake: (b) => this.ui.brakes.push(b),
@@ -164,19 +196,31 @@ export class SimDevice {
 		return this.runtime.start();
 	}
 
-	/** Worker dies (OOM, OS kill): engine state newer than its persistence is lost. */
-	crashEngine(reason = "sim crash"): void {
-		this.engine?.dispose();
+	/** The carrier dies: storage keeps exactly what was committed, the socket drops first, nothing flushes. */
+	private killEngine(reason: string): void {
+		this.storage = this.storage.crash();
+		this.opts.net.relay.dropSession(this.deviceId);
+		this.handle?.engine.dispose(true);
 		this.pair?.kill(reason);
+		this.vrt = null;
+	}
+
+	/** Worker dies (OOM, OS kill): engine state newer than its last storage commit is lost. */
+	crashEngine(reason = "sim crash"): void {
+		this.killEngine(reason);
 	}
 
 	/** Whole app dies: unsaved editor buffers are lost, nothing flushes. Restart with `restartApp`. */
 	crashApp(): void {
 		for (const c of this.runtime.bindings.pendingConflictCopies()) this.crashLost.push(c.text);
-		this.engine?.dispose();
-		this.pair?.kill("app crash");
+		this.killEngine("app crash");
 		this.workspace.crashAll();
 		void this.runtime.stop().catch(() => undefined);
+	}
+
+	/** IndexedDB evicted / wiped while running (§e.4 recovery): every database of this device is deleted. */
+	async wipeStorage(): Promise<void> {
+		for (const name of await this.storage.listDatabases()) await this.storage.deleteDatabase(name);
 	}
 
 	/** Fresh app process over the same disk, side files and engine store. */
@@ -187,8 +231,17 @@ export class SimDevice {
 		await this.runtime.start();
 	}
 
+	/** Text of the engine's resident replica of the live doc at `path` (null: unknown or not resident). */
+	engineText(path: string): string | null {
+		const rt = this.vrt;
+		if (!rt) return null;
+		const view = rt.port.view();
+		const id = view.remoteByPathKey.get(pathKey(path as VaultPath));
+		return id ? residentText(rt, id) : null;
+	}
+
 	setOnline(online: boolean): void {
-		this.opts.hub.setOnline(this.deviceId, online);
+		this.opts.net.setOnline(this.deviceId, online);
 		this.platform.emit(online ? "online" : "offline");
 	}
 }

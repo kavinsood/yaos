@@ -12,7 +12,7 @@
  * survive in the converged vault (conflict copies included).
  */
 
-import type { SeededRandom } from "./__standins__/random";
+import type { SeededRandom } from "./random";
 import type { SimDevice } from "./device";
 import type { SimEditorView } from "./workspace";
 

@@ -5,8 +5,8 @@ import type { DocId } from "../core/types";
 import type { EngineResultValue, MainToEngine } from "../protocol/messages";
 import { BindingManager, conflictCopyPath, type BindingLink } from "./binding";
 import { createHasher } from "./hashing";
-import { VirtualClock } from "../sim/__standins__/clock";
-import { simHashPort } from "../sim/__standins__/sha256";
+import { VirtualClock } from "../sim/clock";
+import { simHashPort } from "../sim/hash";
 import { SimVault } from "../sim/vault";
 import { SimWorkspace } from "../sim/workspace";
 
