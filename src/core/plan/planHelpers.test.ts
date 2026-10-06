@@ -200,4 +200,10 @@ test("brake unit: approval id, rejectHeld", () => {
 		rejectHeld([{ op: "nsDelete", docId: id("a"), baseBodySeq: 1 }, { op: "diskTrash", docId: id("b"), path: "b.md", expect: { t: "any" } }, { op: "syncedDrop", docId: id("b") }], (d) => (d === "a" ? "a.md" : null)),
 		[{ op: "diskMaterialize", docId: "a", path: "a.md", expect: { t: "absent" } }, { op: "syncedDrop", docId: "b" }],
 	);
+	// a held fileGone mark (a local delete waiting on ns / own frames) is re-created like a held nsDelete
+	const S0 = { docId: id("c"), path: "c.md", pathKey: "c.md", kind: "markdown", contentHash: "h", fingerprint: "f", size: 1, mtimeMs: 1, bodyVersion: null, blobRev: 0, nsTouchSeq: 1, hasBase: false } as const;
+	assert.deepEqual(
+		rejectHeld([{ op: "syncedPut", entry: { ...S0, fileGone: true } as never }, { op: "syncedPut", entry: S0 as never }], () => "c2.md"),
+		[{ op: "diskMaterialize", docId: "c", path: "c2.md", expect: { t: "absent" } }],
+	);
 });

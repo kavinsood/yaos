@@ -6,7 +6,7 @@
  *    stopped (requests are kept and run when the gate opens);
  *  - coalesced: a short debounce merges bursts (fold batches, vault events);
  *  - follow-up: while a pass was productive (actionable > 0 and ok > 0) the
- *    next one runs at once, up to `maxChained`;
+ *    next one runs at once, up to `maxChained`, widened by the paths it vacated;
  *  - backoff: actionable ops with nothing succeeding retry after a growing
  *    delay; queued blob transfers retry at the blob queue's next due time;
  *  - periodic: a full pass every `fullIntervalMs`.
@@ -156,6 +156,8 @@ export class PassScheduler {
 				// Follow-up pass over everything the last one touched (cheap enough: plans are linear).
 				const next = this.take();
 				scope = next && next.t === "docs" && scope.t === "full" ? scope : next ?? scope;
+				const vacated = report.vacated ?? [];
+				if (scope.t === "docs" && vacated.length > 0) scope = { ...scope, pathKeys: [...new Set([...scope.pathKeys, ...vacated])] };
 				continue;
 			}
 			scope = this.take();

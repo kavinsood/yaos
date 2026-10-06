@@ -145,9 +145,10 @@ test("row live/present/absent: edit-beats-delete waits for rename inference (ns 
 	// re-materialized at the old path; the editor kept the renamed file bound to the old doc.
 	const edited = { remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] };
 	const renamed = { ...edited, local: [L("b.md", h("c0"))], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
-	assert.deepEqual(run(renamed, { nsReady: false }).ops, []);
+	const gone: PlannerOp = { op: "syncedPut", entry: { ...S("d1", "a.md"), fileGone: true } };
+	assert.deepEqual(run(renamed, { nsReady: false }).ops, [gone]); // the file left a.md either way
 	assert.deepEqual(run({ ...edited, over: { localComplete: false } }).ops, []);
-	assert.deepEqual(run({ ...edited, local: [L("z.md", null)] }).ops, [{ op: "needHash", path: "z.md" }]);
+	assert.deepEqual(run({ ...edited, local: [L("z.md", null)] }).ops, [gone, { op: "needHash", path: "z.md" }]);
 	// once ns is ready the observed rename wins: nsRename + reconcile at the new path
 	assert.deepEqual(opsOf(run(renamed)), ["nsRename", "reconcileContent"]);
 });
@@ -234,17 +235,56 @@ test("row live/present/absent: remote edited -> diskMaterialize (edit beats dele
 	// default baseBodySeq = body.version.remoteSeq; blobs use 0
 	assert.deepEqual(find(run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")] }), "nsDelete").baseBodySeq, 10);
 	assert.deepEqual(find(run({ remote: [R("d9", "i.png")], synced: [S("d9", "i.png")] }), "nsDelete").baseBodySeq, 0);
+	// the waits below record the decided delete (fileGone, next test)
+	const gone: PlannerOp = { op: "syncedPut", entry: { ...S("d1", "a.md"), fileGone: true } };
 	// precondition op with a pending own ns op -> wait
 	const pend = run({ remote: [R("d1", "a.md", { pendingLocal: true })], synced: [S("d1", "a.md")] });
-	assert.deepEqual(pend.ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }]);
+	assert.deepEqual(pend.ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }, gone]);
 	// own body frames still in the outbox -> wait, so the delete base covers them (§c.7)
 	const body = run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], over: { docsWithPendingBody: new Set([id("d1")]) } });
-	assert.deepEqual(body.ops, [{ op: "wait", docId: "d1", reason: "pending-body" }]);
-	// needs localComplete
+	assert.deepEqual(body.ops, [{ op: "wait", docId: "d1", reason: "pending-body" }, gone]);
+	// needs localComplete (and no fileGone without it)
 	assert.deepEqual(run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], over: { localComplete: false } }).ops, []);
 	// an unhashed new local file might be the renamed doc: no delete yet
 	const unhashed = run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], local: [L("z.md", null)] });
-	assert.deepEqual(unhashed.ops, [{ op: "needHash", path: "z.md" }]);
+	assert.deepEqual(unhashed.ops, [gone, { op: "needHash", path: "z.md" }]);
+});
+
+test("row live/present/absent: a delete that waits marks fileGone; a file re-created at the path is new, not a save", () => {
+	// Sim heavy seed 92: A deleted n0.md offline (ns not ready, own body frames unacked), then created a new n0.md.
+	// The planner merged it into the doc as a save; the peer had deleted the old text, which took the brackets the
+	// minimal diff kept of it, and the new note's token was lost. Online the delete would have gone out first.
+	const base = { remote: [R("d1", "a.md")], synced: [S("d1", "a.md")] };
+	const gone = { ...S("d1", "a.md"), fileGone: true as const };
+	const waiting = run(base, { nsReady: false });
+	assert.deepEqual(waiting.ops, [{ op: "syncedPut", entry: gone }]);
+	// the mark passes the brake as the delete does: held with a mass delete
+	assert.equal(waiting.held.length, 0);
+	// next pass: the re-created file is not the doc's; it waits for the delete (no merge, no create yet)
+	const sc = { ...base, synced: [gone], local: [L("a.md", h("c9"))] };
+	assert.deepEqual(run(sc, { nsReady: false }).ops, []);
+	assert.deepEqual(run({ ...sc, over: { docsWithPendingBody: new Set([id("d1")]) } }).ops, [{ op: "wait", docId: "d1", reason: "pending-body" }]);
+	// ns ready, frames acked: the delete (decided, not braked again); then the file is created as a new doc
+	const del = run(sc);
+	assert.deepEqual(opsOf(del), ["nsDelete", "syncedDrop"]);
+	const after = run({ remote: [R("d1", "a.md", { state: "deleted", deletedSeq: 41, pendingLocal: true })], local: [L("a.md", h("c9"))] });
+	assert.deepEqual(opsOf(after), ["nsCreate", "reconcileContent"]);
+	// edit beats delete while waiting: the doc comes back at its (free) remote path
+	const edited = R("d1", "b.md", { body: { ...R("d1", "a.md").body!, version: V(11) } });
+	assert.deepEqual(run({ ...sc, remote: [edited] }).ops, [{ op: "diskMaterialize", docId: "d1", path: "b.md", expect: { t: "absent" } }]);
+	// ... and at the path the new file holds, the file merges into the doc after all (fileGone cleared)
+	const editedHere = R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } });
+	assert.deepEqual(run({ ...sc, remote: [editedHere] }).ops, [{ op: "syncedPut", entry: S("d1", "a.md") }]);
+	// an inferred rename of the doc clears it too
+	const renamed = run({ ...base, synced: [gone], local: [L("c.md", h("c0"))], over: { renames: [{ from: "a.md", to: "c.md", atMs: 1 }] } });
+	assert.deepEqual(opsOf(renamed), ["nsRename", "syncedPut"]);
+	assert.equal(find(renamed, "syncedPut").entry.fileGone, undefined);
+	// the doc's file at its remote path is its own (an own rename marked gone offline, sim heavy seed 22): recorded
+	// there, mark cleared; with a remote edit it merges (the job records it)
+	const moved = run({ remote: [R("d1", "b.md", { lastTouchSeq: 12 })], synced: [gone], local: [L("b.md", h("c0"))] });
+	assert.deepEqual(moved.ops, [{ op: "syncedPut", entry: { ...S("d1", "b.md"), nsTouchSeq: 12 } }]);
+	const movedEdited = run({ remote: [{ ...edited, lastTouchSeq: 12 }], synced: [gone], local: [L("b.md", h("c0"))] });
+	assert.deepEqual(opsOf(movedEdited), ["reconcileContent"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -577,7 +617,8 @@ test("rename cycle a<->b goes through a temp name", () => {
 test("gate: ns not ready -> no ns ops and no ns-derived moves/deletes", () => {
 	const ctx = { nsReady: false };
 	assert.deepEqual(run({ local: [L("n.md", h("c1"))] }, ctx).ops, []);
-	assert.deepEqual(run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")] }, ctx).ops, []);
+	// (a missing file only records the decided delete: fileGone)
+	assert.deepEqual(opsOf(run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")] }, ctx)), ["syncedPut"]);
 	assert.deepEqual(run({ remote: [R("d1", "b.md")], synced: [S("d1", "a.md")], local: [L("a.md", h("c0"))] }, ctx).ops, []);
 	assert.deepEqual(run({ remote: [R("d1", "a.md", { state: "deleted", deletedSeq: 3 })], synced: [S("d1", "a.md")], local: [L("a.md", h("c0"))] }, ctx).ops, []);
 	// body-driven materialization still runs
@@ -631,6 +672,16 @@ test("brake: mass-delete-local holds above max(minCount, ratio*|S|)", () => {
 	// rolling window adds to the per-plan count
 	assert.equal(run(deletes(10, 200), { brakeWindow: { nsDelete: 41, diskTrash: 0, overwrite: 0, conflict: 0 } }).brake?.reason, "mass-delete-local");
 	assert.equal(run(deletes(10, 200), { brakeWindow: { nsDelete: 40, diskTrash: 0, overwrite: 0, conflict: 0 } }).brake, null);
+	// deletes that wait (ns not ready) hold their fileGone marks the same way; the decided deletes are not braked again
+	const marks = run(deletes(51, 200), { nsReady: false });
+	assert.equal(marks.brake?.reason, "mass-delete-local");
+	assert.equal(marks.ops.filter((o) => o.op === "syncedPut").length, 0);
+	assert.equal(marks.held.filter((o) => o.op === "syncedPut" && o.entry.fileGone).length, 51);
+	assert.equal(run(deletes(50, 200), { nsReady: false }).ops.filter((o) => o.op === "syncedPut").length, 50);
+	const decided = deletes(51, 200);
+	const goneAll = run({ ...decided, synced: decided.synced!.map((s, i) => (i < 51 ? { ...s, fileGone: true as const } : s)) });
+	assert.equal(goneAll.brake, null);
+	assert.equal(goneAll.ops.filter((o) => o.op === "nsDelete").length, 51);
 });
 
 test("brake: mass-delete-remote, listing-shrank, conflict-flood, ns-divergence", () => {

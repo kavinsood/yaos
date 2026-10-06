@@ -49,6 +49,11 @@ export interface PassReport extends RunReport {
 	readonly unread: number;
 	readonly brake: BrakeReport | null;
 	readonly openIntents: number;
+	/**
+	 * Paths this plan moved a synced record off (dropped or re-pathed). A file left there is not in a docs-scoped
+	 * follow-up otherwise: a fileGone doc's delete frees its path for the new file there (nsCreate next pass).
+	 */
+	readonly vacated?: readonly PathKey[];
 }
 
 export class Reconciler {
@@ -168,6 +173,11 @@ export class Reconciler {
 			ctx.brakeApproval = null;
 		}
 		this.env.heldOverwrites.length = 0;
+		const vacated: PathKey[] = [];
+		for (const o of plan.ops) {
+			const s = o.op === "syncedDrop" ? ctx.store.synced.get(o.docId) : o.op === "syncedPut" ? ctx.store.synced.get(o.entry.docId) : undefined;
+			if (s && (o.op === "syncedDrop" || (o.op === "syncedPut" && o.entry.pathKey !== s.pathKey))) vacated.push(s.pathKey);
+		}
 		const run = await runPlan(this.env, plan.ops);
 		// Observed renames stay until inference could use them (it is off while ns is not ready).
 		if (ctx.localComplete && view.nsReady) {
@@ -189,7 +199,7 @@ export class Reconciler {
 		const actionable = plan.ops.filter((o) => o.op !== "wait" && o.op !== "needHash").length - run.deferred;
 		// Out-of-scope read failures count too: nothing else would re-plan them before the periodic full pass.
 		const unread = Math.max(this.scan.lastUnread, plan.ops.filter((o) => o.op === "needHash").length);
-		return { ...run, planned: plan.ops.length, actionable, unread, brake, openIntents };
+		return { ...run, planned: plan.ops.length, actionable, unread, brake, openIntents, vacated };
 	}
 
 	/** Passes until a plan has nothing actionable left or nothing succeeds (bounded). */

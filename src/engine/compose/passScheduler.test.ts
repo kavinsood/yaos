@@ -65,3 +65,14 @@ test("passScheduler: an unproductive actionable pass retries; a quiet pass does 
 	assert.equal(h.scopes.length, 2);
 	h.s.stop();
 });
+
+test("passScheduler: a productive docs pass's follow-up covers the paths it vacated", async () => {
+	// A fileGone doc's delete drops its record: the new file at its path is planned (nsCreate) by the follow-up.
+	const h = harness([report({ actionable: 2, ok: 2, vacated: ["x.md" as never] }), report()]);
+	h.s.request({ t: "docs", docIds: ["d1" as never], pathKeys: ["y.md" as never] });
+	await h.step(10);
+	await h.step(0);
+	assert.equal(h.scopes.length, 2);
+	assert.deepEqual(h.scopes[1], { t: "docs", docIds: ["d1"], pathKeys: ["y.md", "x.md"] });
+	h.s.stop();
+});

@@ -140,7 +140,8 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 
 function rebaseOnDisk(env: Env, s: SyncedEntry, disk: CanvasRanked, F: DiskFingerprint, stat: { size: number; mtimeMs: number }) {
 	const base = makeBase(s.docId, canvasToMergeText(disk));
-	const entry = env.ctx.record({ ...s, contentHash: canvasLogicalHash(disk.data), fingerprint: F, size: stat.size, mtimeMs: stat.mtimeMs, hasBase: base !== null });
+	const { fileGone: _gone, ...live } = s; // the disk holds the doc's file
+	const entry = env.ctx.record({ ...live, contentHash: canvasLogicalHash(disk.data), fingerprint: F, size: stat.size, mtimeMs: stat.mtimeMs, hasBase: base !== null });
 	return { entry, base };
 }
 

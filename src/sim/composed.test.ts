@@ -236,3 +236,27 @@ test("epoch reset with the note open: the view re-binds once the re-create holds
 	const o = await net.oracle();
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]), [["x.md", "one typed\n"]]);
 });
+
+test("offline delete, then a new note at the same path: a new doc, not a save over the old one", async () => {
+	// Sim heavy seed 92. A's delete waited (own frames unacked, offline), and the new file at the path merged into
+	// the old doc as a save: it followed the peer's rename of the old note, and the peer's edits to the old text
+	// took parts of the new one. Online the delete goes out first and the new file is a doc of its own.
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "old note\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "old note\n");
+	a.setOnline(false);
+	a.vault.userWrite("x.md", "old note\nedited offline\n");
+	await clock.advance(5_000); // merged: own frames in the outbox
+	assert.ok(a.vault.userDelete("x.md"));
+	await clock.advance(5_000); // the delete waits on the frames: decided (fileGone)
+	a.vault.userWrite("x.md", "new note\n");
+	assert.ok(b.vault.userRename("x.md", "y.md"));
+	await clock.advance(5_000);
+	a.setOnline(true);
+	await clock.advance(30_000);
+	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "new note\n"]], `${d.name}`);
+	assert.equal(b.vault.trashed.length, 1, "B trashed the old note (moved to y.md)");
+});

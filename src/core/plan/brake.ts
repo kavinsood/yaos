@@ -141,9 +141,11 @@ export function rejectHeld(held: readonly PlannerOp[], remotePath: (docId: strin
 	const out: PlannerOp[] = [];
 	for (const op of held) {
 		if (op.op === "diskTrash" && op.docId !== null) out.push({ op: "syncedDrop", docId: op.docId });
-		if (op.op === "nsDelete") {
-			const path = remotePath(op.docId);
-			if (path !== null) out.push({ op: "diskMaterialize", docId: op.docId, path, expect: { t: "absent" } });
+		// A held fileGone mark is the decision of a local delete (planner liveMissing): re-create too.
+		const del = op.op === "nsDelete" ? op.docId : op.op === "syncedPut" && op.entry.fileGone ? op.entry.docId : null;
+		if (del !== null) {
+			const path = remotePath(del);
+			if (path !== null) out.push({ op: "diskMaterialize", docId: del, path, expect: { t: "absent" } });
 		}
 	}
 	return out;

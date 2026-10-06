@@ -398,6 +398,11 @@ export interface SyncedEntry {
 	readonly nsTouchSeq: Seq;
 	/** A base text is stored in baseText (markdown/canvas below MAX_BASE_TEXT_CHARS). */
 	readonly hasBase: boolean;
+	/**
+	 * A pass found the file missing and decided `nsDelete`, which waits on own unsequenced body records
+	 * ("pending-body"). The delete is decided: a file at `path` from now on is a new file, not this doc's.
+	 */
+	readonly fileGone?: true;
 }
 
 /** Vault event hint: a rename observed live; verified by the next reconcile. */
