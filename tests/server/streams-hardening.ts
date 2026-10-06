@@ -500,7 +500,8 @@ s.test("H2 CPU fallback: a build parses at most maxRows rows per step, resumes m
 });
 
 s.test("H2 CPU fallback T-DEDUPE-CHUNK-WB: a large cold build is stepped per message and per timer flush; only its stream waits", async () => {
-	await withStreams(({ store, fresh, registry, timers, reads, append }) => {
+	await withStreams((harness) => {
+		const { store, fresh, registry, timers, reads, append } = harness;
 		// 4 sealed segments of 10 rows (each 10 × 7 KiB commit seals) = 40 rows; a step spends 10 units, so the read
 		// (≈ 288 KiB, over a thousand units) is a step of its own and the parse takes 4 more.
 		const payload = (index: number) => new Uint8Array(7 * 1024).fill(index % 251);
@@ -512,7 +513,8 @@ s.test("H2 CPU fallback T-DEDUPE-CHUNK-WB: a large cold build is stepped per mes
 		const service = fresh("runtime-b");
 		assert.equal(service.accept(ownerA, true).status, 200);
 		const a = registry.lastClient!;
-		const cold = () => (service as unknown as { options: { store: () => StreamStore } }).options.store();
+		// fresh() gave runtime-b a new store: the one that builds the dedupe index cold.
+		const cold = () => harness.store;
 		// ns:warm first: its (empty) build finishes inside its own message turn.
 		append(a, "ns:warm", "warm-1", "w");
 		assert.ok(cold().dedupeReady("ns:warm"));

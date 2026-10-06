@@ -119,8 +119,9 @@ function writes(object: VaultObject): string[] {
  */
 async function duringCrypto<T>(method: "digest" | "sign" | "verify", nth: number, action: () => void,
 	run: () => Promise<T>): Promise<T> {
-	const subtle = crypto.subtle as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
-	const original = subtle[method]!;
+	const subtle = crypto.subtle;
+	const original: unknown = Reflect.get(subtle, method);
+	if (typeof original !== "function") throw new Error(`crypto.subtle.${method} is not a function`);
 	let calls = 0;
 	let fired = false;
 	Object.defineProperty(subtle, method, {
@@ -128,7 +129,7 @@ async function duringCrypto<T>(method: "digest" | "sign" | "verify", nth: number
 		writable: true,
 		value: (...args: unknown[]) => {
 			if (++calls === nth) { fired = true; action(); }
-			return original.apply(crypto.subtle, args);
+			return Reflect.apply(original, subtle, args);
 		},
 	});
 	try {
@@ -136,7 +137,7 @@ async function duringCrypto<T>(method: "digest" | "sign" | "verify", nth: number
 		assert.ok(fired, `the hook ran at ${method} #${nth}`);
 		return result;
 	} finally {
-		delete subtle[method];
+		Reflect.deleteProperty(subtle, method);
 	}
 }
 

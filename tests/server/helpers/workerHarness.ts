@@ -358,9 +358,9 @@ export function recordingConfigNamespace(source: { claimed: boolean } | ConfigHo
 			// A ConfigObject is read per call, so a restarted config runtime takes over.
 			const host = source instanceof ConfigHost ? source : "host" in source ? source.host : null;
 			if (host) {
-				const method = (host as unknown as Record<string, unknown>)[String(property)];
+				const method: unknown = Reflect.get(host, String(property));
 				return typeof method === "function"
-					? async (...args: unknown[]) => structuredClone(await (method as (...a: unknown[]) => unknown).apply(host, args))
+					? async (...args: unknown[]) => structuredClone(await Reflect.apply(method, host, args))
 					: undefined;
 			}
 			if (property === "isClaimed") return () => Promise.resolve((source as { claimed: boolean }).claimed);
@@ -437,6 +437,7 @@ export class FakeBucket {
 		return Promise.resolve();
 	}
 	asR2(): R2Bucket {
-		return this as unknown as R2Bucket;
+		// @ts-expect-error FakeBucket intentionally implements only the R2 calls the Worker makes.
+		return this;
 	}
 }
