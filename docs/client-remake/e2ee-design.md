@@ -669,7 +669,7 @@ Rows already sealed under e−1 stay valid. Outbox frames are not re-sealed: a r
 - Every device keeps all records (§6.1), so any device can re-publish. A device restoring from RK alone needs the
   genesis or a revoke record to be present. After a reset where no device survives, the vault holds nothing
   readable anyway.
-- **Genesis position.** Enable writes the genesis record when headSeq = 0 (§15). Readers do not rely on its
+- **Genesis position.** Enable writes the genesis record when `VAULT_READY.head = 0` (§15). Readers do not rely on its
   position: validity alone decides.
 
 ## 12. Pairing
@@ -816,12 +816,12 @@ vault. Any local copy of the files on disk can seed a new vault.
    devices are already enrolled. Each other device scans it, or enters the RK. It checks kcv against `k`
    (§11.3), stores K_r and leaves `key-missing`.
 4. **Own frames sealed under an epoch < r that commit after S_rot** are stale (§14.3), so readers ignore them.
-   Their author handles them as in `refused frame-id-conflict` (DESIGN §j.1 table):
+   Their author handles them as in `refused frame-id-conflict` (DESIGN §i.6 table):
    - body: re-seal the same update under a fresh clientFrameId, since Yjs updates are idempotent;
    - ns and cfg: re-plan the ops under a fresh frame id.
 
    Unsent outbox frames under an epoch < r are re-sealed under r before sending.
-5. **Checkpoints.** Nothing is forced. New checkpoints are sealed under r at the normal cadence (DESIGN §d.6
+5. **Checkpoints.** Nothing is forced. New checkpoints are sealed under r at the normal cadence (DESIGN §d.9
    checkpoint policy). Old checkpoints with coversSeq ≤ S_rot stay valid.
 
 ### 14.3 Stale-epoch rule
@@ -859,14 +859,14 @@ Devices that have not re-keyed still learn r from the record header, so they app
 
 ### 15.1 Enable: new vaults only
 
-- Encryption is chosen **when the first device pairs to a new vault**, i.e. when `VAULT_READY.headSeq = 0`
+- Encryption is chosen **when the first device pairs to a new vault**, i.e. when `VAULT_READY.head = 0`
   (relay-wire §3.2). The pairing screen shows "End-to-end encryption: On" preselected (decision D2).
 - Enable steps:
   1. generate K_1 and the RK;
   2. show the RK and require the retype confirmation (§13.2);
   3. append the genesis record to `k` as the vault's first frame, and hold every ns frame until it is receipted;
   4. persist the keys and the record (§6.1), then set the pin `e2ee: {suite: 1}`.
-- `headSeq > 0` with no genesis means the vault already has plaintext. Enable is refused with "Encryption can
+- `head > 0` with no genesis means the vault already has plaintext. Enable is refused with "Encryption can
   only be turned on for a new vault" and a link to §15.2.
 - A crash before step 3's receipt leaves an empty vault. The retry regenerates everything; pending keys are dropped
   because the record never won.
