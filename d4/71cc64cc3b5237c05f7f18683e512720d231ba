@@ -1,0 +1,23 @@
+src/engine/runtime/engine.ts
+  s_a3bb6f72388aba::t_738548794a920f 182
+src/engine/runtime/mirrorIo.ts
+  s_a3bb6f72388aba::t_cff298726a27f9 31-32,48-49,55-61,69-84
+src/engine/runtime/recovery.test.ts
+  s_a3bb6f72388aba::t_2f7e5af184f644 11-12,77-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d471cc64cc3b5237c05f7f18683e512720d231ba",
+  "prompts": {},
+  "sessions": {
+    "s_a3bb6f72388aba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a97fe38a693c58afa",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
