@@ -19,7 +19,7 @@ import {
 import { tooManyAttempts } from "./limiter";
 import type { UpgradeRejectPort } from "./ports";
 import { BoundedBodyError, declaredBodyLength, readBoundedBytes } from "./readBoundedBytes";
-import { buildMobileSetupUrl, buildObsidianPairingUrl, renderSetupQrDataUrl } from "./setupQr";
+import { buildMobileSetupUrl, buildObsidianPairingUrl } from "./setupQr";
 import { MAX_STREAM_CHECKPOINT_BYTES, STREAMS_CAPABILITY_VERSION } from "./streams/protocol";
 import { ORIGIN_HEADER } from "./vault/host";
 import { isPairingPurpose, type PairingPurpose } from "./vault/pairing";
@@ -285,7 +285,6 @@ export class Router {
 		try {
 			const minted = await vault.mintOwnerCode("owner-bootstrap");
 			if (!minted) throw new Error("the new vault refused the owner code");
-			const mobileSetupQrDataUrl = await renderSetupQrDataUrl(buildMobileSetupUrl(host, minted.pairingCode));
 			return withCookie(json({
 				ok: true,
 				host,
@@ -294,7 +293,6 @@ export class Router {
 				pairingCode: minted.pairingCode,
 				pairingExpiresAt: minted.expiresAt,
 				obsidianUrl: buildObsidianPairingUrl(host, minted.pairingCode),
-				mobileSetupQrDataUrl,
 				capabilities: await this.capabilities(env),
 			}), cookie);
 		} catch (error) {
@@ -434,7 +432,7 @@ export class Router {
 	}
 
 	/**
-	 * `POST /operator/vaults/:id/owner-code`: §5 row 2.5 fields plus the claim's `mobileSetupQrDataUrl`. Purpose: absent
+	 * `POST /operator/vaults/:id/owner-code`: §5 row 2.5 fields. The console draws the setup QR (O12). Purpose: absent
 	 * → owner-bootstrap; any D3 purpose; anything else `400 invalid_purpose` (the bearer route's rule).
 	 */
 	private async ownerCode(request: Request, url: URL, vault: DurableObjectStub<VaultDO>): Promise<Response> {
@@ -447,15 +445,13 @@ export class Router {
 		// A registered vault is always initialized (D5); null means its storage is gone (an unfinished delete).
 		if (!minted) return json({ error: "unknown_vault" }, 404);
 		const host = url.origin;
-		const mobileSetupUrl = buildMobileSetupUrl(host, minted.pairingCode);
 		return json({
 			ok: true,
 			pairingCode: minted.pairingCode,
 			expiresAt: minted.expiresAt,
 			purpose: minted.purpose,
 			obsidianUrl: buildObsidianPairingUrl(host, minted.pairingCode),
-			mobileSetupUrl,
-			mobileSetupQrDataUrl: await renderSetupQrDataUrl(mobileSetupUrl),
+			mobileSetupUrl: buildMobileSetupUrl(host, minted.pairingCode),
 		});
 	}
 

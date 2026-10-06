@@ -44,8 +44,8 @@ s.test("D5 claim: §5 body, the session cookie, a code that enrolls on this host
 		assert.equal(response.status, 200);
 		assert.match(response.headers.get("Set-Cookie") ?? "", COOKIE_PATTERN);
 		const body = await json(response);
-		assert.deepEqual(Object.keys(body).sort(), ["capabilities", "host", "mobileSetupQrDataUrl", "obsidianUrl", "ok",
-			"pairingCode", "pairingExpiresAt", "vaultId", "vaultName"]);
+		assert.deepEqual(Object.keys(body).sort(), ["capabilities", "host", "obsidianUrl", "ok", "pairingCode",
+			"pairingExpiresAt", "vaultId", "vaultName"], "no QR: the console draws it (O12)");
 		const vaultId = body.vaultId as string;
 		assert.match(vaultId, /^[A-Za-z0-9_-]{22}$/);
 		assert.equal(body.ok, true);
@@ -56,7 +56,6 @@ s.test("D5 claim: §5 body, the session cookie, a code that enrolls on this host
 		assert.equal(body.pairingExpiresAt, vault.timers.now + PAIRING_CODE_TTL_MS);
 		assert.equal(body.obsidianUrl,
 			`obsidian://yaos?${new URLSearchParams({ action: "setup", host: ORIGIN, pairingCode: body.pairingCode as string })}`);
-		assert.match(body.mobileSetupQrDataUrl as string, /^data:image\/svg\+xml;base64,[A-Za-z0-9+/]+=*$/);
 		assert.equal((body.capabilities as { claimed: unknown }).claimed, true);
 		assert.deepEqual(world.cluster.rpcs.map((rpc) => rpc.method), ["init", "mintOwnerCode"]);
 
@@ -186,13 +185,12 @@ s.test("D5 state, create vault, owner-code and devices: the console's shapes", a
 		const code = await ownerCode(world, cookie, work);
 		assert.equal(code.status, 200);
 		const body = await json(code);
-		assert.deepEqual(Object.keys(body).sort(), ["expiresAt", "mobileSetupQrDataUrl", "mobileSetupUrl", "obsidianUrl", "ok",
-			"pairingCode", "purpose"]);
+		assert.deepEqual(Object.keys(body).sort(), ["expiresAt", "mobileSetupUrl", "obsidianUrl", "ok", "pairingCode",
+			"purpose"], "no QR: the console draws it (O12)");
 		assert.equal(body.purpose, "owner-bootstrap", "the default purpose");
 		assert.match(body.pairingCode as string, new RegExp(`^${work}\\.`));
 		assert.equal(body.mobileSetupUrl, `${ORIGIN}/mobile-setup#${new URLSearchParams({ host: ORIGIN,
 			pairingCode: body.pairingCode as string })}`);
-		assert.match(body.mobileSetupQrDataUrl as string, /^data:image\/svg\+xml;base64,/);
 		for (const purpose of ["owner-bootstrap", "owner-recovery", "device"]) {
 			assert.equal((await json(await ownerCode(world, cookie, work, purpose))).purpose, purpose);
 		}

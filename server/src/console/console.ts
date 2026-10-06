@@ -7,16 +7,19 @@
 // - `GET /operator/state` → `{vaults: [{vaultId, name, createdAt?}], pendingRestores: [{vaultId, at}]}`; the banner
 //   comes from `pendingRestores` (§2.2 table: "also lists pending restore journal rows").
 // - `GET …/devices` → `{devices: [{deviceId, deviceName, enrolledAt?}]}`.
-// - owner-code → the §5 row 2.5 body plus `mobileSetupQrDataUrl` (the claim already has it); without it the panel
-//   shows code + link and no QR, because setupQr.ts renders server-side.
-// - The setup link is built from `location.origin`, not from a response `host`/`obsidianUrl`, so it always names the
-//   server that served the console.
+// - The setup link and the setup QR's URL are built from `location.origin`, not from a response
+//   `host`/`obsidianUrl`/`mobileSetupUrl`, so they always name the server that served the console.
 // - Every non-GET sends `Content-Type: application/json` and a JSON body (`{}` for logout and revoke); GETs send none.
 // - Claim: the key is generated in the page and must be confirmed saved before `/claim` is sent, so a lost 200 cannot
 //   lose it; 0/500/≥502 read as "may have gone through" (D5: a failure after the claim is 503; re-probe and log in).
 // - Create needs a non-empty name (maxlength 80, no server limit is specified). Not a gap: login sends nothing under
 //   32 characters, the §2.2 claim minimum (the generated key is 64 hex).
 import { inlineJson, staticPage } from "./page";
+// The page draws the setup QR: in the Worker it cost claim 64 ms and owner-code up to 46 ms of CPU (DECISIONS O12).
+// The encoder is qrcode-generator's browser build, inlined verbatim as its own nonce script; it only defines the
+// global `qrcode`. wrangler.toml's Text rule makes this import the file's source text; the Node tests alias it to
+// tests/mocks/qrcodeScript.ts.
+import QRCODE_SCRIPT from "qrcode-generator/dist/qrcode.js";
 
 /**
  * Plain messages by error code: every code the operator routes document (§2.2, D3, D5, D7, D8a, D8b, §5 row 2.7), the
@@ -101,6 +104,8 @@ paste it into Obsidian.</p>
 <div id="vaults"></div>
 </div>
 <script nonce="${nonce}">
+${QRCODE_SCRIPT}</script>
+<script nonce="${nonce}">
 "use strict";
 const MESSAGES = ${inlineJson(CONSOLE_MESSAGES)};
 const $ = (id) => document.getElementById(id);
@@ -149,19 +154,25 @@ async function load() {
   const vaults = Array.isArray(r.data.vaults) ? r.data.vaults : [];
   $("vaults").replaceChildren(...(vaults.length ? vaults.map((v) => vaultCard(v, pending.get(v.vaultId))) : [h("p", { textContent: "No vaults yet." })]));
 }
+/** The setup QR: the URL setupQr.ts's buildMobileSetupUrl builds, as the SVG the Worker used to send (O12). */
+function setupQr(code) {
+  const qr = qrcode(0, "M");
+  qr.addData(location.origin + "/mobile-setup#" + new URLSearchParams({ host: location.origin, pairingCode: code }), "Byte");
+  qr.make();
+  const svg = qr.createSvgTag({ cellSize: 4, margin: 4, scalable: true })
+    .replace("<svg ", '<svg shape-rendering="crispEdges" ').replace('fill="black"', 'fill="#08111d"');
+  return h("img", { className: "qr", src: "data:image/svg+xml;base64," + btoa(svg), alt: "Mobile setup QR code" });
+}
 function showCode(data, label) {
   const code = typeof data.pairingCode === "string" ? data.pairingCode : "";
   if (!code) return say("The server returned no pairing code. Reload and try again.", "err");
   const link = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host: location.origin, pairingCode: code });
-  const qr = typeof data.mobileSetupQrDataUrl === "string" && data.mobileSetupQrDataUrl.startsWith("data:image/svg+xml;base64,")
-    ? h("img", { className: "qr", src: data.mobileSetupQrDataUrl, alt: "Mobile setup QR code" })
-    : h("p", { className: "muted", textContent: "No QR code came with this code; use the link or copy the code." });
   $("pair").replaceChildren(h("section", { className: "warn" },
     h("h2", { textContent: "Pair a device with " + label }),
     h("p", { textContent: "One-time pairing code, valid until " + when(data.expiresAt || data.pairingExpiresAt) + ". It is shown only here; reloading removes it." }),
     h("div", { className: "row" }, h("input", { className: "mono", readOnly: true, value: code }), h("button", { textContent: "Copy", onclick: () => copy(code) })),
     h("p", {}, h("a", { href: link, textContent: "Open in Obsidian on this device" })),
-    qr,
+    setupQr(code),
     h("p", { className: "muted", textContent: "On a phone: scan the QR code with the camera, then tap Connect Obsidian." }),
     h("button", { textContent: "Done", onclick: () => $("pair").replaceChildren() })));
 }

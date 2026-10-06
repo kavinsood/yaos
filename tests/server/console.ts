@@ -5,8 +5,11 @@
 import assert from "node:assert/strict";
 import vm from "node:vm";
 
+import QRCODE_SCRIPT from "qrcode-generator/dist/qrcode.js";
+
 import { CONSOLE_MESSAGES, consolePage } from "../../server/src/console/console";
 import { mobileSetupPage } from "../../server/src/console/mobileSetup";
+import { buildMobileSetupUrl } from "../../server/src/setupQr";
 import { suite } from "../harness.ts";
 
 const s = suite("console");
@@ -15,7 +18,6 @@ const ORIGIN = "https://yaos.test";
 const VAULT_ID = "AbCdEfGhIjKlMnOpQrStUv";
 const DEVICE_ID = "device-0001-abcdef";
 const CODE = `${VAULT_ID}.${"s".repeat(32)}`;
-const QR = "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=";
 
 /** §2.2 rows the console may call: discovery plus the D5 operator list (`:id` is any path parameter). */
 const ROUTES = [
@@ -80,12 +82,12 @@ class Page {
 			this.elements.set(m[3]!, el);
 		}
 		const storage = { setItem: (...a: unknown[]) => this.storage.push(a), getItem: () => null, removeItem: () => undefined };
-		vm.runInContext(inlineScript(html), vm.createContext({
+		const context = vm.createContext({
 			document: { getElementById: (id: string) => this.elements.get(id) ?? null, createElement: (tag: string) => new FakeElement(tag) },
 			location: { origin: ORIGIN, hash, pathname },
 			history: { replaceState: (...a: unknown[]) => this.replaced.push(a) },
 			navigator: { clipboard: { writeText: () => Promise.resolve() } },
-			crypto: globalThis.crypto, URLSearchParams, setTimeout,
+			crypto: globalThis.crypto, URLSearchParams, setTimeout, btoa,
 			confirm: (text: string) => { this.confirms.push(text); return true; },
 			console: new Proxy({}, { get: () => (...a: unknown[]) => this.logs.push(a) }),
 			localStorage: storage, sessionStorage: storage,
@@ -100,7 +102,8 @@ class Page {
 					else resolve({ status: reply[0], json: () => Promise.resolve(reply[1]) });
 				}));
 			},
-		}));
+		});
+		for (const script of inlineScripts(html)) vm.runInContext(script, context);
 	}
 
 	$(id: string): FakeElement { const el = this.elements.get(id); assert.ok(el, `#${id}`); return el; }
@@ -123,10 +126,39 @@ async function settle(): Promise<void> {
 	for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
+function inlineScripts(html: string): string[] {
+	return [...html.matchAll(/<script nonce="[^"]+">([\s\S]*?)<\/script>/g)].map((m) => m[1]!);
+}
+
+/** The page's own script: the console's comes after the QR encoder (O12), the mobile setup page has only its own. */
 function inlineScript(html: string): string {
-	const scripts = [...html.matchAll(/<script nonce="[^"]+">([\s\S]*?)<\/script>/g)];
-	assert.equal(scripts.length, 1, "one inline script");
-	return scripts[0]![1]!;
+	const scripts = inlineScripts(html);
+	assert.equal(scripts.length, html.includes(QRCODE_SCRIPT) ? 2 : 1, "the encoder and the page's own script");
+	return scripts.at(-1)!;
+}
+
+/**
+ * `img` is the setup QR of `code`: an inert SVG data URL whose dark modules (one `M x,y` square each, 4 px cells,
+ * margin 4) are those of setupQr.ts's mobile setup URL on ORIGIN at level M, byte mode.
+ */
+function assertSetupQr(img: FakeElement, code: string): void {
+	const prefix = "data:image/svg+xml;base64,";
+	assert.ok(img.src.startsWith(prefix), img.src.slice(0, 40));
+	assert.equal(img.alt, "Mobile setup QR code");
+	const svg = Buffer.from(img.src.slice(prefix.length), "base64").toString("utf8");
+	assert.ok(!/<script|<foreignObject|\son[a-z]+=|href/i.test(svg), "inert SVG");
+	const context = vm.createContext({});
+	vm.runInContext(QRCODE_SCRIPT, context);
+	const qr = (context.qrcode as (type: number, level: string) => {
+		addData(text: string, mode: string): void; make(): void; getModuleCount(): number; isDark(row: number, col: number): boolean;
+	})(0, "M");
+	qr.addData(buildMobileSetupUrl(ORIGIN, code), "Byte");
+	qr.make();
+	const count = qr.getModuleCount();
+	const expected: string[] = [];
+	for (let row = 0; row < count; row++) for (let col = 0; col < count; col++) if (qr.isDark(row, col)) expected.push(`${4 + 4 * col},${4 + 4 * row}`);
+	assert.ok(svg.includes(` viewBox="0 0 ${8 + 4 * count} ${8 + 4 * count}"`), "module count");
+	assert.deepEqual([...svg.matchAll(/M(\d+),(\d+)l/g)].map((m) => `${m[1]},${m[2]}`), expected);
 }
 
 async function consoleWith(claimed: boolean, state?: unknown): Promise<Page> {
@@ -158,19 +190,32 @@ s.test("D5: both pages are 200 HTML with a strict nonce CSP, a fresh nonce each 
 		assert.notEqual(b.headers.get("Content-Security-Policy"), csp, "fresh nonce");
 		const html = await a.text();
 		const tags = [...html.matchAll(/<(script|style)\b([^>]*)>/g)];
-		assert.deepEqual(tags.map((t) => t[1]).sort(), ["script", "style"]);
+		assert.deepEqual(tags.map((t) => t[1]).sort(), render === consolePage ? ["script", "script", "style"] : ["script", "style"]);
 		for (const tag of tags) assert.equal(tag[2], ` nonce="${nonce}"`);
-		new vm.Script(inlineScript(html));
+		for (const script of inlineScripts(html)) new vm.Script(script);
 	}
 });
 
 s.test("D5: no external asset, URL, inline handler or style attribute in either page", async () => {
-	for (const html of [await consolePage().text(), await mobileSetupPage().text()]) {
+	// The encoder's own URLs (license comments, the SVG namespace) are checked in the O12 test.
+	for (const html of [(await consolePage().text()).replace(QRCODE_SCRIPT, ""), await mobileSetupPage().text()]) {
 		const markup = html.replace(/<script[\s\S]*?<\/script>/g, "");
 		assert.ok(!/https?:|\/\/[\w-]+\.[\w.-]+/i.test(html), "no absolute or protocol-relative URL");
 		assert.ok(!/\s(src|href|srcset|action|style|on[a-z]+)\s*=/i.test(markup), "no src/href/action/style/on* attribute");
 		assert.ok(!/<(link|iframe|object|embed|base|img|meta http-equiv)\b|url\(|@import|javascript:/i.test(html), "no external element");
 	}
+});
+
+s.test("O12: the console's first script is qrcode-generator's browser build, verbatim; it defines only `qrcode`", async () => {
+	const scripts = inlineScripts(await consolePage().text());
+	assert.equal(scripts[0], `\n${QRCODE_SCRIPT}`);
+	assert.ok(!/fetch|XMLHttpRequest|WebSocket|EventSource|sendBeacon|import\(|\beval\(|\bFunction\(|document|window|location|navigator|Storage|indexedDB|cookie|console\./
+		.test(QRCODE_SCRIPT), "no network, storage, DOM or eval");
+	const code = QRCODE_SCRIPT.replace(/^\s*\/\/.*$/gm, "");
+	assert.deepEqual(code.match(/\w+:\/\/[^\s"']*/g), ["http://www.w3.org/2000/svg"], "outside comments, only the SVG namespace");
+	const context = vm.createContext({});
+	vm.runInContext(QRCODE_SCRIPT, context);
+	assert.deepEqual(Object.keys(context), ["qrcode"]);
 });
 
 s.test("§2.2: every fetch in the console is a D5 route, and every D5 operator route is used", async () => {
@@ -212,7 +257,7 @@ s.test("claim: the key is shown and confirmed before POST /claim {operatorRecove
 	page.$("claim-saved").checked = true;
 	page.$("claim-saved").onchange?.();
 	page.reply("POST /claim", 200, { ok: true, host: ORIGIN, vaultId: VAULT_ID, vaultName: "Personal", pairingCode: CODE,
-		pairingExpiresAt: Date.now() + 900_000, obsidianUrl: "obsidian://ignored", mobileSetupQrDataUrl: QR, capabilities: {} });
+		pairingExpiresAt: Date.now() + 900_000, obsidianUrl: "obsidian://ignored", capabilities: {} });
 	page.reply("GET /operator/state", 200, STATE);
 	await page.press(page.$("claim-go"));
 	const claim = page.calls.find((c) => c.path === "/claim")!;
@@ -221,7 +266,7 @@ s.test("claim: the key is shown and confirmed before POST /claim {operatorRecove
 	assert.equal(page.visible(), "main");
 	assert.equal(page.$("claim-key").value, "", "the key leaves the page");
 	const pair = page.$("pair");
-	assert.equal(pair.find("img").src, QR);
+	assertSetupQr(pair.find("img"), CODE);
 	assert.equal(pair.find("input").value, CODE);
 	assert.equal(pair.find("a").href, `obsidian://yaos?action=setup&host=${encodeURIComponent(ORIGIN)}&pairingCode=${encodeURIComponent(CODE)}`);
 	assert.match(pair.textContent, /Pair a device with Personal/);
@@ -285,9 +330,10 @@ s.test("vault: create, owner code + QR, devices + revoke (D7), and the pending-r
 	await page.press(page.card().button("Pair a device"));
 	assert.deepEqual([page.last().body, page.msg], [{ purpose: "owner-bootstrap" }, `Pairing code: ${CONSOLE_MESSAGES.restore_in_progress}`]);
 	page.reply(`POST ${base}/owner-code`, 200, { pairingCode: CODE, expiresAt: Date.now() + 900_000, purpose: "owner-bootstrap",
-		obsidianUrl: "obsidian://ignored", mobileSetupUrl: `${ORIGIN}/mobile-setup#x`, mobileSetupQrDataUrl: QR });
+		obsidianUrl: "obsidian://ignored", mobileSetupUrl: "https://elsewhere.test/mobile-setup#x" });
 	await page.press(page.card().button("Pair a device"));
-	assert.deepEqual([page.$("pair").find("img").src, page.$("pair").find("input").value], [QR, CODE]);
+	assert.equal(page.$("pair").find("input").value, CODE);
+	assertSetupQr(page.$("pair").find("img"), CODE);
 	page.reply(`GET ${base}/devices`, 200, { devices: [{ deviceId: DEVICE_ID, deviceName: "Phone", enrolledAt: 1_790_000_000_000 }] });
 	await page.press(page.card().button("Devices"));
 	assert.match(page.card().textContent, /Phone \(device-0001-abcdef\), paired/);

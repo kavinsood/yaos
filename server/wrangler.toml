@@ -31,6 +31,13 @@ deleted_classes = ["VaultSyncServer", "ServerConfig", "RecoveryJob"]
 tag = "v4"
 new_sqlite_classes = ["VaultDO", "ConfigDO"]
 
+# console.ts inlines qrcode-generator's browser build in the console page (DECISIONS O12): this rule bundles the file
+# as its source text. `fallthrough` keeps wrangler's default Text globs.
+[[rules]]
+type = "Text"
+globs = ["qrcode-generator/dist/qrcode.js"]
+fallthrough = true
+
 [[r2_buckets]]
 binding = "YAOS_BUCKET"
 bucket_name = "yaos"
