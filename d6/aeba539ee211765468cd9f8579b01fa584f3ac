@@ -1,0 +1,25 @@
+src/engine/compose/hostLink.ts
+  s_ed451e485d98d2::t_6a7145a3427532 13,98-100
+src/engine/reconcile/contentSteps.ts
+  s_ed451e485d98d2::t_67004c143ea12f 51-53
+src/engine/reconcile/deps.ts
+  s_ed451e485d98d2::t_c5c30a95ca0d2f 15-18
+src/engine/reconcile/testkit/fakeGateway.ts
+  s_ed451e485d98d2::t_2b2ceccd283271 80,109-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d6aeba539ee211765468cd9f8579b01fa584f3ac",
+  "prompts": {},
+  "sessions": {
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
