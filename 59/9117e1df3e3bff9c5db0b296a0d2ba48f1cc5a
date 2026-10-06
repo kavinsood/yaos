@@ -1,0 +1,35 @@
+src/engine/compose/boundDocs.ts
+  s_3bea9f4c72a663::t_ebc19278224cae 1-161
+src/engine/compose/foldBridge.ts
+  s_ed451e485d98d2::t_b49d0d14d1aa0c 1-75
+src/engine/compose/passScheduler.ts
+  s_ed451e485d98d2::t_6263338147a807 1-192
+src/engine/compose/statusMerge.ts
+  s_ed451e485d98d2::t_639fecc272dd76 1-65
+src/engine/compose/syncedMirror.ts
+  s_ed451e485d98d2::t_4cc2ab773def8c 1-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "599117e1df3e3bff9c5db0b296a0d2ba48f1cc5a",
+  "prompts": {},
+  "sessions": {
+    "s_3bea9f4c72a663": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb05cda11fb8d171",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
