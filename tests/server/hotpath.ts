@@ -1,14 +1,16 @@
-// T-HOTPATH (DECISIONS D2, §7): the seven device paths (feed, read, checkpoint, ticket, socket, enroll, pairing-code)
-// make zero config-DO calls. Each request goes through the real Router with a config namespace that records every
+// T-HOTPATH (DECISIONS D2, §7): the ten device paths (feed, read, checkpoint, ticket, socket, enroll, pairing-code and
+// the D9 blob PUT, GET and exists) make zero config-DO calls. Each request goes through the real Router with a config namespace that records every
 // property access, and reaches a real VaultHost on SQLite through a fake vault namespace.
 //
-// Every row is the real P2 flow: a ticket is issued, a socket opens with a real ticket, a device enrolls with a
-// real code, and a device mints a pairing code.
+// Every row is the real flow: a ticket is issued, a socket opens with a real ticket, a device enrolls with a real
+// code, a device mints a pairing code, and a blob is stored in, read from and probed in an in-memory R2 bucket (the
+// bearer check is the vault DO's `/blobs/auth`, its one call).
 import assert from "node:assert/strict";
 
 import { Router, type WorkerEnv } from "../../server/src/router";
 import { suite } from "../harness.ts";
 import {
+	FakeBucket,
 	RecordingUpgrades,
 	VaultCluster,
 	appendCommitted,
@@ -38,6 +40,7 @@ interface HotPath {
 }
 
 const ORIGIN = "https://yaos.test";
+const BLOB_ADDRESS = "a".repeat(64);
 
 const HOT_PATHS: HotPath[] = [
 	{ name: "feed", status: 200,
@@ -83,9 +86,24 @@ const HOT_PATHS: HotPath[] = [
 			const body = await response.json() as { purpose?: unknown };
 			assert.equal(body.purpose, "device");
 		} },
+	{ name: "blob PUT", status: 204,
+		request: ({ vaultId, device }) => new Request(`${ORIGIN}/vault/${vaultId}/blobs/${BLOB_ADDRESS}`, {
+			method: "PUT", headers: { ...bearer(device), "Content-Type": "application/octet-stream" },
+			body: new Uint8Array([4, 5, 6]),
+		}) },
+	{ name: "blob GET", status: 200,
+		request: ({ vaultId, device }) => new Request(`${ORIGIN}/vault/${vaultId}/blobs/${BLOB_ADDRESS}`,
+			{ headers: bearer(device) }),
+		async check(response) { assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [4, 5, 6]); } },
+	{ name: "blob exists", status: 200,
+		request: ({ vaultId, device }) => new Request(`${ORIGIN}/vault/${vaultId}/blobs/exists`, {
+			method: "POST", headers: { ...bearer(device), "Content-Type": "application/json" },
+			body: JSON.stringify({ hashes: [BLOB_ADDRESS, "b".repeat(64)] }),
+		}),
+		async check(response) { assert.deepEqual(await response.json(), { present: [BLOB_ADDRESS] }); } },
 ];
 
-s.test("T-HOTPATH: the seven device paths reach only their vault DO; zero config-DO accesses", async () => {
+s.test("T-HOTPATH: the ten device paths reach only their vault DO; zero config-DO accesses", async () => {
 	const cluster = new VaultCluster();
 	try {
 		const vaultId = newVaultId();
@@ -99,9 +117,10 @@ s.test("T-HOTPATH: the seven device paths reach only their vault DO; zero config
 		assert.ok(minted);
 		const context: HotContext = { vaultId, device: owner, ticket, pairingCode: minted.pairingCode };
 		const config = recordingConfigNamespace({ claimed: true });
-		const env = { YAOS_VAULT: cluster.namespace(), YAOS_CONFIG: config.namespace } as WorkerEnv;
+		const bucket = new FakeBucket();
+		const env = { YAOS_VAULT: cluster.namespace(), YAOS_CONFIG: config.namespace, YAOS_BUCKET: bucket.asR2() } as WorkerEnv;
 		const router = new Router({ upgrades: new RecordingUpgrades() });
-		assert.equal(HOT_PATHS.length, 7);
+		assert.equal(HOT_PATHS.length, 10);
 		for (const path of HOT_PATHS) {
 			const before = cluster.fetches.length;
 			const response = await router.fetch(path.request(context), env);

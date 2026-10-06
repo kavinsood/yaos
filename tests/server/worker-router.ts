@@ -7,6 +7,7 @@ import { Router, type WorkerEnv } from "../../server/src/router";
 import * as entry from "../../server/src/worker";
 import { suite } from "../harness.ts";
 import {
+	FakeBucket,
 	RecordingUpgrades,
 	VaultCluster,
 	appendCommitted,
@@ -54,7 +55,7 @@ async function withWorld(
 		const env = {
 			YAOS_VAULT: cluster.namespace(),
 			YAOS_CONFIG: config.namespace,
-			...(options.bucket ? { YAOS_BUCKET: {} as R2Bucket } : {}),
+			...(options.bucket ? { YAOS_BUCKET: new FakeBucket().asR2() } : {}),
 			...(options.debug ? { YAOS_DEBUG_ROUTES: "1" } : {}),
 		} as WorkerEnv;
 		const router = new Router({ upgrades });
@@ -157,13 +158,14 @@ s.test("§2.2: static pages and CORS preflight answer without a DO", async () =>
 	});
 });
 
-s.test("§2.2 / D5: operator routes refuse a cross-site write or a missing session before any DO call; P3 routes 501; bad ids → 404", async () => {
+s.test("§2.2 / D5: operator routes refuse a cross-site write or a missing session before any DO call; bad ids → 404", async () => {
 	await withWorld(async (world) => {
 		const id = world.vaultId;
 		const writes: Array<[string, string]> = [
 			["POST", "/claim"], ["POST", "/operator/login"], ["POST", "/operator/logout"], ["POST", "/operator/vaults"],
 			["POST", `/operator/vaults/${id}/owner-code`], ["DELETE", `/operator/vaults/${id}`],
 			["DELETE", `/operator/vaults/${id}/devices/owner-device-0001`],
+			["POST", `/operator/vaults/${id}/reset-streams`], ["POST", `/operator/vaults/${id}/restore`],
 		];
 		for (const [method, path] of writes) {
 			for (const origin of [undefined, "https://evil.test", "null"]) {
@@ -184,11 +186,14 @@ s.test("§2.2 / D5: operator routes refuse a cross-site write or a missing sessi
 		}
 		for (const path of [`/operator/vaults/${id}/reset-streams`, `/operator/vaults/${id}/restore`]) {
 			world.resetCalls();
-			const response = await world.fetch(path, { method: "POST", body: "{}" });
-			assert.equal(response.status, 501, path);
-			assert.deepEqual(await body(response), { error: "not_implemented" }, path);
-			assert.equal(world.doCalls(), 0, `${path}: no DO call (P3)`);
+			const response = await world.fetch(path, { method: "POST", body: "{}",
+				headers: { "Content-Type": "application/json", Origin: ORIGIN } });
+			assert.equal(response.status, 401, path);
+			assert.deepEqual(await body(response), { error: "unauthorized" }, path);
+			assert.equal(world.doCalls(), 0, `${path}: no cookie, no DO call`);
 		}
+		await assertNotFound(world, "GET", `/operator/vaults/${id}/reset-streams`);
+		await assertNotFound(world, "PUT", `/operator/vaults/${id}/restore`);
 		await assertNotFound(world, "GET", `/operator/vaults/${id}/owner-code`);
 		await assertNotFound(world, "POST", "/operator/vaults/short/owner-code");
 		await assertNotFound(world, "DELETE", `/operator/vaults/${id}/devices/short`);
@@ -380,7 +385,7 @@ s.test("checkpoint: Content-Length above 4 MiB → 413 before any DO call; a bad
 	});
 });
 
-s.test("blobs: no bucket → 503; address regex; 10 MiB PUT cap; no DO call (P3 adds the bearer check and R2)", async () => {
+s.test("blobs: no bucket → 503; address regex; 10 MiB PUT cap: all before any DO call; then one vault-DO bearer check", async () => {
 	await withWorld(async (world) => {
 		const v = `/vault/${world.vaultId}`;
 		const address = "a".repeat(64);
@@ -404,15 +409,19 @@ s.test("blobs: no bucket → 503; address regex; 10 MiB PUT cap; no DO call (P3 
 		const tooLarge = await world.router.fetch(new Request(`${ORIGIN}${v}/blobs/${"b".repeat(64)}`, { method: "PUT",
 			headers: { ...bearer(world.owner), "Content-Length": String(10 * 1024 * 1024 + 1) }, body: "x" }), world.env);
 		assert.equal(tooLarge.status, 413);
-		const address = "c".repeat(64);
-		for (const [method, path] of [["GET", `blobs/${address}`], ["PUT", `blobs/${address}`], ["POST", "blobs/exists"]] as const) {
-			const response = await world.fetch(`${v}/${path}`,
-				{ method, headers: bearer(world.owner), ...(method === "GET" ? {} : { body: "x" }) });
-			assert.equal(response.status, 501, `${method} ${path}`);
-		}
+		assert.deepEqual(await body(tooLarge), { error: "body_too_large" });
 		await assertNotFound(world, "DELETE", `${v}/blobs/${"c".repeat(64)}`);
 		await assertNotFound(world, "GET", `${v}/blobs/${"c".repeat(64)}/x`);
 		assert.equal(world.doCalls(), 0);
+		const address = "c".repeat(64);
+		for (const [method, path] of [["GET", `blobs/${address}`], ["PUT", `blobs/${address}`], ["POST", "blobs/exists"]] as const) {
+			world.resetCalls();
+			const response = await world.fetch(`${v}/${path}`, { method, ...(method === "GET" ? {} : { body: "x" }) });
+			assert.deepEqual([response.status, await body(response)], [401, { error: "unauthorized" }], `${method} ${path}`);
+			assert.deepEqual(world.cluster.fetches.map((call) => [call.method, call.url]),
+				[["POST", "https://vault.internal/blobs/auth"]], `${method} ${path}: one bearer check`);
+			assert.deepEqual(world.config.accesses, []);
+		}
 	}, { bucket: true });
 });
 
@@ -423,8 +432,8 @@ s.test("debug/simulate-daily-limit: 404 with no DO call unless YAOS_DEBUG_ROUTES
 	await withWorld(async (world) => {
 		world.resetCalls();
 		const response = await world.fetch(`/vault/${world.vaultId}/debug/simulate-daily-limit`,
-			{ method: "POST", headers: bearer(world.owner) });
-		assert.equal(response.status, 501, "P3 (H3)");
+			{ method: "POST", headers: bearer(world.owner), body: JSON.stringify({ enabled: false }) });
+		assert.deepEqual([response.status, await body(response)], [200, { ok: true, enabled: false }], "H3");
 		assert.equal(world.cluster.fetches.length, 1);
 		const unauthorized = await world.fetch(`/vault/${world.vaultId}/debug/simulate-daily-limit`, { method: "POST" });
 		assert.equal(unauthorized.status, 401);

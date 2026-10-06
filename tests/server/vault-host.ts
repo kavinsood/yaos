@@ -165,7 +165,8 @@ s.test("§6.1: an unknown vault is cached after one probe; it answers 401 / 404 
 		assert.deepEqual(object.upgrades.rejected.map((entry) => [entry.frame, entry.code]),
 			[[{ type: "error", code: "unauthorized" }, 1008]]);
 		assert.deepEqual(object.statements,
-			["SELECT vault_id, vault_generation, ticket_key, created_at FROM vault_meta WHERE id = 1"]);
+			["SELECT vault_id, vault_generation, ticket_key, created_at, pending_restore_id, last_restore_id,"
+				+ " last_restore_at FROM vault_meta WHERE id = 1"]);
 		assert.deepEqual(schemaOf(object.storage), {}, "T-PAIR-NOWRITE: no DDL on a request path");
 		assert.equal(object.model.totals.cf, 0);
 		assert.equal((await object.host.fetch(new Request(`${INTERNAL}/streams/other`))).status, 404);
@@ -193,7 +194,8 @@ s.test("§6.1: bearer auth reads meta 1 + devices N once per runtime, then 0 row
 		}
 		const reads = object.statements.filter((sql) => /FROM (vault_meta|device)\b/.test(sql));
 		assert.deepEqual(reads, [
-			"SELECT vault_id, vault_generation, ticket_key, created_at FROM vault_meta WHERE id = 1",
+			"SELECT vault_id, vault_generation, ticket_key, created_at, pending_restore_id, last_restore_id,"
+				+ " last_restore_at FROM vault_meta WHERE id = 1",
 			"SELECT token_hash, device_id, device_name, enrollment_request_id, enrolled_at FROM device",
 		]);
 		for (const headers of [bearer(newDevice("stranger-device-01")), { Authorization: `Bearer ${owner.token}x` },
@@ -208,7 +210,10 @@ s.test("§6.1: bearer auth reads meta 1 + devices N once per runtime, then 0 row
 		assert.deepEqual(await ticket.json(), { error: "invalid_ticket_scope" }, "D4: the purpose is required");
 		const debug = await object.host.fetch(
 			new Request(`${INTERNAL}/debug/simulate-daily-limit`, { method: "POST", headers: bearer(owner), body: "{}" }));
-		assert.equal(debug.status, 501, "simulate-daily-limit: P3");
+		assert.deepEqual([debug.status, await debug.json()], [400, { error: "invalid_request" }],
+			"simulate-daily-limit: `enabled` must be a boolean");
+		const blobAuth = await object.host.fetch(new Request(`${INTERNAL}/blobs/auth`, { method: "POST", headers: bearer(owner) }));
+		assert.equal(blobAuth.status, 204, "D9: the blob bearer check");
 		assert.equal(object.model.totals.cf, 1, "bearer requests write nothing (1 = init)");
 	});
 });

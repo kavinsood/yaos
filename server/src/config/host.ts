@@ -7,6 +7,7 @@
 import { randomBase64Url } from "../base64url";
 import { FailureLimiter } from "../limiter";
 import { SYSTEM_CLOCK, isMissingTableError, type ClockPort, type StoragePort } from "../ports";
+import { RestoreRunner, type RestorePorts, type RestoreResult } from "./restore";
 
 /** DECISIONS §6.3, verbatim. */
 export const CONFIG_SCHEMA = `
@@ -41,7 +42,7 @@ export interface VaultEntry {
 
 export interface OperatorState {
 	vaults: VaultEntry[];
-	/** D8b: one entry per restore journal row ("Restore incomplete" banner). Always empty until P3. */
+	/** D8b: one entry per restore journal row (the console's "Restore in progress" banner); `at` in Unix ms. */
 	pendingRestores: Array<{ vaultId: string; at: number }>;
 }
 
@@ -69,11 +70,14 @@ export class ConfigHost {
 	private claimed: boolean;
 	private readonly clock: ClockPort;
 	private readonly loginFailures: FailureLimiter;
+	/** D8b steps and alarm (config/restore.ts); null when the caller gave no vault and alarm ports. */
+	private readonly restorer: RestoreRunner | null;
 
-	constructor(private readonly storage: StoragePort, clock: ClockPort = SYSTEM_CLOCK) {
+	constructor(private readonly storage: StoragePort, clock: ClockPort = SYSTEM_CLOCK, restorePorts: RestorePorts | null = null) {
 		this.clock = clock;
 		this.loginFailures = new FailureLimiter(LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW_MS, clock);
 		this.claimed = this.probe();
+		this.restorer = restorePorts ? new RestoreRunner(storage, clock, restorePorts) : null;
 	}
 
 	isClaimed(): boolean {
@@ -157,6 +161,18 @@ export class ConfigHost {
 			"SELECT vault_id, at FROM restore_journal ORDER BY created_at, vault_id",
 		).toArray().map((row) => ({ vaultId: row.vault_id, at: row.at }));
 		return { ok: true, vaults, pendingRestores };
+	}
+
+	/** D8b `POST /operator/vaults/:id/restore`, after `authorize(token, vaultId)` (restore itself is not frozen). */
+	restore(vaultId: string, at: unknown): Promise<RestoreResult> {
+		if (!this.restorer) throw new Error("ConfigHost: no restore ports");
+		return this.restorer.restore(vaultId, at);
+	}
+
+	/** The config DO alarm: D8b resumes every journal row. */
+	async alarm(): Promise<void> {
+		if (!this.restorer) throw new Error("ConfigHost: no restore ports");
+		await this.restorer.alarm();
 	}
 
 	/** D5 create vault, last step: the registry row (1 row), after the vault DO's init. */

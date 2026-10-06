@@ -24,11 +24,6 @@ export function notFound(): Response {
 	return json({ error: "not_found" }, 404);
 }
 
-/** A route of the §2.2 table whose behaviour lands in a later phase (DECISIONS §9). */
-export function notImplemented(): Response {
-	return json({ error: "not_implemented" }, 501);
-}
-
 /** Adds the static CORS headers; keeps a WebSocket handoff attached. */
 export function withCors(response: Response): Response {
 	const headers = new Headers(response.headers);

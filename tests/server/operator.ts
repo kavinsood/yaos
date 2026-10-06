@@ -8,128 +8,25 @@ import { SESSION_TTL_MS } from "../../server/src/config/host";
 import { PAIRING_CODE_TTL_MS } from "../../server/src/vault/pairing";
 import { MAX_PURGE_BATCHES, Router, type WorkerEnv } from "../../server/src/router";
 import { suite } from "../harness.ts";
+import { RecordingUpgrades, bearer, newDevice } from "./helpers/workerHarness.ts";
 import {
-	RecordingUpgrades,
-	VaultCluster,
-	bearer,
-	newDevice,
-	recordingConfigNamespace,
-	type DeviceSeed,
-	type VaultObject,
-} from "./helpers/workerHarness.ts";
+	COOKIE_PATTERN,
+	ORIGIN,
+	RECOVERY_KEY,
+	claim,
+	deviceFeed,
+	enrollVia,
+	json,
+	ownerCode,
+	resetRows,
+	rows,
+	sessionOf,
+	withWorld,
+} from "./helpers/operatorWorld.ts";
 
 const s = suite("operator");
 
-const ORIGIN = "https://yaos.test";
-const RECOVERY_KEY = `recovery-${"k".repeat(40)}`;
-const COOKIE_PATTERN = /^yaos_op=([A-Za-z0-9_-]{43}); HttpOnly; Secure; SameSite=Strict; Path=\/; Max-Age=604800$/;
 const CLEAR_COOKIE = "yaos_op=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
-
-/** R2 as the purge uses it: `list({prefix, limit})` and `delete(keys)`. `stuck` keeps every listing truncated. */
-class FakeBucket {
-	readonly keys = new Set<string>();
-	stuck = false;
-	lists = 0;
-	list(options: { prefix?: string; limit?: number }) {
-		this.lists++;
-		const matching = [...this.keys].filter((key) => key.startsWith(options.prefix ?? "")).sort();
-		const objects = matching.slice(0, options.limit ?? 1000).map((key) => ({ key }));
-		return Promise.resolve({ objects, truncated: this.stuck || matching.length > objects.length });
-	}
-	delete(keys: string | string[]) {
-		for (const key of typeof keys === "string" ? [keys] : keys) this.keys.delete(key);
-		return Promise.resolve();
-	}
-}
-
-interface World {
-	cluster: VaultCluster;
-	config: ReturnType<VaultCluster["config"]>;
-	accesses: string[];
-	env: WorkerEnv;
-	bucket: FakeBucket;
-	router: Router;
-	fetch(path: string, init?: RequestInit & { cookie?: string; origin?: string | null; json?: unknown }): Promise<Response>;
-}
-
-async function withWorld(check: (world: World) => Promise<void>): Promise<void> {
-	const cluster = new VaultCluster();
-	try {
-		const config = cluster.config();
-		const recording = recordingConfigNamespace(config.host);
-		const bucket = new FakeBucket();
-		const env = { YAOS_VAULT: cluster.namespace(), YAOS_CONFIG: recording.namespace,
-			YAOS_BUCKET: bucket as unknown as R2Bucket } as WorkerEnv;
-		const world: World = {
-			cluster, config, accesses: recording.accesses, env, bucket,
-			router: new Router({ upgrades: new RecordingUpgrades() }),
-			fetch(path, init = {}) {
-				const { cookie, origin = ORIGIN, json: body, ...rest } = init;
-				const headers = new Headers(rest.headers);
-				if (origin !== null && (rest.method ?? "GET") !== "GET") headers.set("Origin", origin);
-				if (cookie) headers.set("Cookie", `yaos_op=${cookie}`);
-				if (body !== undefined) headers.set("Content-Type", "application/json");
-				return world.router.fetch(new Request(`${ORIGIN}${path}`,
-					{ ...rest, headers, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) }), env);
-			},
-		};
-		await check(world);
-	} finally {
-		cluster.close();
-	}
-}
-
-async function json(response: Response): Promise<Record<string, unknown>> {
-	return await response.json() as Record<string, unknown>;
-}
-
-function sessionOf(response: Response): string {
-	const match = COOKIE_PATTERN.exec(response.headers.get("Set-Cookie") ?? "");
-	assert.ok(match, "a D5 session cookie");
-	return match[1]!;
-}
-
-interface Claimed {
-	cookie: string;
-	vaultId: string;
-	pairingCode: string;
-	vault: VaultObject;
-}
-
-async function claim(world: World): Promise<Claimed> {
-	const response = await world.fetch("/claim", { method: "POST", json: { operatorRecoveryKey: RECOVERY_KEY } });
-	assert.equal(response.status, 200, "claim");
-	const body = await json(response);
-	const vaultId = body.vaultId as string;
-	return { cookie: sessionOf(response), vaultId, pairingCode: body.pairingCode as string,
-		vault: world.cluster.objects.get(vaultId)! };
-}
-
-async function enrollVia(world: World, pairingCode: string, device: DeviceSeed): Promise<Record<string, unknown>> {
-	const response = await world.fetch("/enroll", { method: "POST", origin: null, json: {
-		pairingCode, enrollmentRequestId: `enroll-${device.deviceId}`, deviceId: device.deviceId,
-		deviceToken: device.token, deviceName: device.deviceName } });
-	assert.equal(response.status, 200, "enroll");
-	return await json(response);
-}
-
-async function ownerCode(world: World, cookie: string, vaultId: string, purpose?: string): Promise<Response> {
-	return await world.fetch(`/operator/vaults/${vaultId}/owner-code`,
-		{ method: "POST", cookie, json: purpose === undefined ? {} : { purpose } });
-}
-
-function deviceFeed(world: World, vaultId: string, device: DeviceSeed): Promise<Response> {
-	return world.router.fetch(new Request(`${ORIGIN}/vault/${vaultId}/streams/feed`, { headers: bearer(device) }), world.env);
-}
-
-function rows(world: World, vault?: VaultObject): { config: number; vault?: number } {
-	return { config: world.config.model.totals.cf, ...(vault ? { vault: vault.model.totals.cf } : {}) };
-}
-
-function resetRows(world: World): void {
-	world.config.model.reset();
-	for (const object of world.cluster.objects.values()) object.model.reset();
-}
 
 // ---- D5 claim -----------------------------------------------------------------------------------------------------
 
@@ -363,9 +260,9 @@ s.test("D5 delete vault: confirmation, wipe, the R2 prefix purge, then the regis
 		await enrollVia(world, pairingCode, laptop);
 		assert.equal(vault.host.acceptStreams(laptop.deviceId).status, 200);
 		const socket = vault.registry.lastClient!;
-		const ownKeys = Array.from({ length: 2500 }, (_, index) => `v/${vaultId}/blobs/${String(index).padStart(64, "0")}`);
-		const kept = [`v/${other.vaultId}/blobs/${"a".repeat(64)}`, `v/${vaultId}x/blob`, `x/${vaultId}/blob`];
-		for (const key of [...ownKeys, ...kept]) world.bucket.keys.add(key);
+		const ownKeys = Array.from({ length: 2500 }, (_, index) => `v/${vaultId}/${String(index).padStart(64, "0")}`);
+		const kept = [`v/${other.vaultId}/${"a".repeat(64)}`, `v/${vaultId}x/blob`, `x/${vaultId}/blob`];
+		for (const key of [...ownKeys, ...kept]) world.bucket.objects.set(key, new Uint8Array());
 
 		for (const confirm of [undefined, other.vaultId, vaultId.toUpperCase()]) {
 			const mismatch = await world.fetch(`/operator/vaults/${vaultId}`, { method: "DELETE", cookie,
@@ -389,7 +286,7 @@ s.test("D5 delete vault: confirmation, wipe, the R2 prefix purge, then the regis
 		world.bucket.lists = 0;
 		const deleted = await world.fetch(`/operator/vaults/${vaultId}`, { method: "DELETE", cookie, json: { confirmVaultId: vaultId } });
 		assert.deepEqual([deleted.status, await json(deleted)], [200, { ok: true, vaultId }]);
-		assert.deepEqual([...world.bucket.keys].sort(), [...kept].sort(), "only v/<vaultId>/ was purged");
+		assert.deepEqual([...world.bucket.objects.keys()].sort(), [...kept].sort(), "only v/<vaultId>/ was purged");
 		assert.equal(world.bucket.lists, 1, "the retry found nothing left to list past one batch");
 		assert.deepEqual(rows(world), { config: 1 }, "§6.2 delete vault = 1 config row (+ deleteAll)");
 		const after = await json(await world.fetch("/operator/state", { cookie }));
@@ -420,15 +317,14 @@ s.test("D8b seam: a restore journal row freezes revoke, owner-code and reset (40
 		world.config.storage.sql.exec("INSERT INTO restore_journal (vault_id, restore_id, at, bookmark, devices, created_at)"
 			+ " VALUES (?, 'restore-1', ?, NULL, NULL, ?)", vaultId, at, world.config.clock.now);
 		const rpcs = world.cluster.rpcs.length;
-		const frozen: Array<[string, string]> = [["DELETE", `/operator/vaults/${vaultId}/devices/${laptop.deviceId}`],
-			["POST", `/operator/vaults/${vaultId}/owner-code`]];
-		for (const [method, path] of frozen) {
-			const response = await world.fetch(path, { method, cookie, ...(method === "POST" ? { json: {} } : {}) });
+		const frozen: Array<[string, string, unknown]> = [["DELETE", `/operator/vaults/${vaultId}/devices/${laptop.deviceId}`, undefined],
+			["POST", `/operator/vaults/${vaultId}/owner-code`, {}],
+			["POST", `/operator/vaults/${vaultId}/reset-streams`, { confirmVaultId: vaultId }]];
+		for (const [method, path, body] of frozen) {
+			const response = await world.fetch(path, { method, cookie, ...(body !== undefined ? { json: body } : {}) });
 			assert.deepEqual([response.status, await json(response)], [409, { error: "restore_in_progress" }], path);
 		}
 		assert.equal(world.cluster.rpcs.length, rpcs, "a frozen action never reaches the vault DO");
-		assert.deepEqual(await world.config.host.authorize(cookie, vaultId, "reset"),
-			{ ok: false, status: 409, error: "restore_in_progress" }, "the reset action is frozen too (P3 route)");
 		assert.equal((await deviceFeed(world, vaultId, laptop)).status, 200, "the device was not revoked");
 		assert.equal((await world.fetch(`/operator/vaults/${vaultId}/devices`, { cookie })).status, 200, "reads are not frozen");
 		const created = await json(await world.fetch("/operator/vaults", { method: "POST", cookie, json: { name: "B" } }));

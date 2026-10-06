@@ -7,11 +7,11 @@ import { CONFIG_OBJECT_NAME, type ConfigDO } from "./config/config";
 import { consolePage } from "./console/console";
 import { mobileSetupPage } from "./console/mobileSetup";
 import { SESSION_TOKEN_PATTERN, SESSION_TTL_MS, type FrozenAction } from "./config/host";
+import { dailyLimitKind, dailyLimitResponse, isCloudflareDailyLimitError } from "./dailyLimit";
 import {
 	corsPreflight,
 	json,
 	notFound,
-	notImplemented,
 	rejectSocket,
 	releaseUnreadBody,
 	withCors,
@@ -44,6 +44,15 @@ export const MAX_ENROLL_BODY_BYTES = 64 * 1024;
 export const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{32}$/;
 /** §2.2 blob address (relay-wire §11.3 after §5: 64 lowercase hex, no hash check). */
 export const BLOB_ADDRESS_PATTERN = /^[0-9a-f]{64}$/;
+/** D9: `POST /vault/:id/blobs/exists` answers for at most 50 addresses (legacy routes/blobs.ts:11 slice). */
+export const MAX_BLOB_EXISTS_ADDRESSES = 50;
+/** R2 HEADs in flight for one `exists` (legacy routes/blobs.ts:12). */
+export const BLOB_HEAD_CONCURRENCY = 4;
+/**
+ * DECISIONS-GAP: D9 caps `exists` at 50 addresses but names no body cap; legacy read the body unbounded. 64 KiB (the
+ * operator JSON cap; 50 addresses are ~3.5 KiB) is used; a larger body is `413 body_too_large`.
+ */
+export const MAX_BLOB_EXISTS_BODY_BYTES = 64 * 1024;
 /**
  * DECISIONS-GAP: §2.2 does not give a format for the `:deviceId` path segment of the operator devices route. The
  * enroll body's deviceId format (legacy routes/enroll.ts:36) is used; anything else is 404.
@@ -149,14 +158,19 @@ function recoveryKey(body: Record<string, unknown>): string | null {
 	return key.length >= 32 ? key : null;
 }
 
+/** A BoundedBodyError as `413 body_too_large` or `400 <kind>`; anything else is rethrown. */
+function boundedBodyRejection(error: unknown): Response {
+	if (!(error instanceof BoundedBodyError)) throw error;
+	return json({ error: error.kind }, error.kind === "body_too_large" ? 413 : 400);
+}
+
 /** 413 or 400 for a Content-Length the cap refuses; null when the body may pass. */
 function contentLengthRejection(request: Request, maxBytes: number): Response | null {
 	try {
 		declaredBodyLength(request, maxBytes);
 		return null;
 	} catch (error) {
-		if (!(error instanceof BoundedBodyError)) throw error;
-		return json({ error: error.kind }, error.kind === "body_too_large" ? 413 : 400);
+		return boundedBodyRejection(error);
 	}
 }
 
@@ -170,6 +184,8 @@ export class Router {
 		try {
 			return await this.route(request, env);
 		} catch (error) {
+			// O9: a Cloudflare daily-limit failure (here or thrown by a DO RPC) on any route is the typed `cf_daily_limit`.
+			if (isCloudflareDailyLimitError(error)) return withCors(dailyLimitResponse(Date.now(), dailyLimitKind(error)));
 			console.error("[yaos-worker] request failed", error);
 			// DECISIONS-GAP: §2.2 names no status for an unexpected Worker failure; 500 `internal_error`.
 			return withCors(json({ error: "internal_error" }, 500));
@@ -348,16 +364,17 @@ export class Router {
 	// ---- /operator/vaults/:id/... ---------------------------------------------------------------------------
 
 	/**
-	 * `/operator/vaults/:id/...` (§2.2): owner code, devices, D7 revoke, D5 delete. reset-streams and restore are P3
-	 * (501, no DO call). Every route asks the config DO for the session and the registry first.
+	 * `/operator/vaults/:id/...` (§2.2): owner code, devices, D7 revoke, D8a reset-streams, D8b restore, D5 delete. Every
+	 * route asks the config DO for the session and the registry first; revoke, owner-code and reset-streams also pass
+	 * D8b's authority freeze there.
 	 */
 	private async operatorVault(request: Request, env: WorkerEnv, url: URL, vaultId: string, rest: string[]):
 		Promise<Response> {
 		const route = `${request.method} ${rest.join("/")}`;
 		const revokeTarget = request.method === "DELETE" && rest.length === 2 && rest[0] === "devices"
 			&& DEVICE_ID_PATTERN.test(rest[1]!) ? rest[1]! : null;
-		if (route === "POST reset-streams" || route === "POST restore") return notImplemented();
-		const known = route === "DELETE " || route === "POST owner-code" || route === "GET devices" || revokeTarget !== null;
+		const known = route === "DELETE " || route === "POST owner-code" || route === "GET devices"
+			|| route === "POST reset-streams" || route === "POST restore" || revokeTarget !== null;
 		if (!known) return withCors(notFound());
 		if (request.method !== "GET") {
 			const rejected = crossSiteRejection(request, url, revokeTarget === null);
@@ -366,10 +383,12 @@ export class Router {
 		const token = sessionToken(request);
 		if (!token) return unauthorized();
 		const action: FrozenAction | undefined = revokeTarget !== null ? "revoke"
-			: route === "POST owner-code" ? "owner-code" : undefined;
+			: route === "POST owner-code" ? "owner-code"
+			: route === "POST reset-streams" ? "reset" : undefined;
 		const config = this.config(env);
 		const allowed = await config.authorize(token, vaultId, action);
 		if (!allowed.ok) return json({ error: allowed.error }, allowed.status);
+		if (route === "POST restore") return await this.restore(request, config, vaultId);
 		const vault = this.vaultObject(env, vaultId);
 		if (revokeTarget !== null) {
 			// D7: the vault DO revokes in one synchronous turn; this response leaves only after it.
@@ -381,7 +400,37 @@ export class Router {
 			return json({ devices });
 		}
 		if (route === "POST owner-code") return await this.ownerCode(request, url, vault);
+		if (route === "POST reset-streams") return await this.resetStreams(request, vault, vaultId);
 		return await this.deleteVault(request, env, config, vault, vaultId);
+	}
+
+	/**
+	 * `POST /operator/vaults/:id/reset-streams` (D8a): `{"confirmVaultId"}` must match (else `400
+	 * confirmation_mismatch`); the vault DO deletes every stream row and mints a new epoch in one transaction, then closes
+	 * its streams sockets 1001. Devices stay enrolled; R2 blobs stay. A daily-limit failure rolls the transaction back
+	 * and reaches `fetch`'s catch as `503 cf_daily_limit` (O9).
+	 */
+	private async resetStreams(request: Request, vault: DurableObjectStub<VaultDO>, vaultId: string): Promise<Response> {
+		const body = await readOperatorBody(request);
+		if (body.kind === "too_large") return bodyTooLarge();
+		if (body.kind !== "ok" || body.value.confirmVaultId !== vaultId) return json({ error: "confirmation_mismatch" }, 400);
+		const reset = await vault.resetStreams();
+		// A registered vault is always initialized (D5); null means its storage is gone (an unfinished delete).
+		if (!reset) return json({ error: "unknown_vault" }, 404);
+		return json({ vaultEpoch: reset.vaultEpoch });
+	}
+
+	/**
+	 * `POST /operator/vaults/:id/restore {"at"}` (D8b): the config DO runs steps 0–4 and answers `200 {vaultEpoch}`, with
+	 * `resumed: true` and the journaled `at` when it finished a pending restore instead. DECISIONS-GAP: a body that is
+	 * not a JSON object counts as `{}` (no `at`: `400 invalid_restore_point`), the create-vault rule.
+	 */
+	private async restore(request: Request, config: DurableObjectStub<ConfigDO>, vaultId: string): Promise<Response> {
+		const body = await readOperatorBody(request);
+		if (body.kind === "too_large") return bodyTooLarge();
+		const result = await config.restore(vaultId, body.kind === "ok" ? body.value.at : undefined);
+		if (!result.ok) return json({ error: result.error }, result.status);
+		return json(result.resumed ? { vaultEpoch: result.vaultEpoch, resumed: true, at: result.at } : { vaultEpoch: result.vaultEpoch });
 	}
 
 	/**
@@ -493,27 +542,66 @@ export class Router {
 					? await this.forward(request, env, url, vaultId, rest)
 					: notFound());
 			case "POST blobs/exists":
-				return withCors(this.blob(request, env, null));
+				return withCors(await this.blob(request, env, vaultId, null));
 		}
 		if (rest.length === 2 && rest[0] === "blobs" && (request.method === "GET" || request.method === "PUT")) {
-			return withCors(this.blob(request, env, rest[1]!));
+			return withCors(await this.blob(request, env, vaultId, rest[1]!));
 		}
 		return withCors(notFound());
 	}
 
 	/**
-	 * Blob routes: the Worker checks, in the legacy order of the removed routes/blobs.ts:111-127 (bucket, address,
-	 * size). P3 adds the vault DO bearer check and the R2 I/O under `v/<vaultId>/<address>` (D9).
+	 * Blob routes (D9): the Worker checks, in the legacy order of the removed routes/blobs.ts:111-127 (bucket, address,
+	 * size), then the vault DO checks the bearer (`POST /blobs/auth`: no config call, no storage write), then the Worker
+	 * does the R2 I/O under `v/<vaultId>/<address>`. The address is opaque: no hash check, and PUT overwrites.
 	 */
-	private blob(request: Request, env: WorkerEnv, address: string | null): Response {
-		if (!env.YAOS_BUCKET) return json({ error: "attachments_unavailable" }, 503);
+	private async blob(request: Request, env: WorkerEnv, vaultId: string, address: string | null): Promise<Response> {
+		const bucket = env.YAOS_BUCKET;
+		if (!bucket) return json({ error: "attachments_unavailable" }, 503);
 		// DECISIONS-GAP: §2.2 requires the address regex but names no error; `400 invalid_address`.
 		if (address !== null && !BLOB_ADDRESS_PATTERN.test(address)) return json({ error: "invalid_address" }, 400);
+		let declared: number | null = null;
 		if (request.method === "PUT") {
-			const rejection = contentLengthRejection(request, MAX_BLOB_UPLOAD_BYTES);
-			if (rejection) return rejection;
+			try {
+				declared = declaredBodyLength(request, MAX_BLOB_UPLOAD_BYTES);
+			} catch (error) {
+				return boundedBodyRejection(error);
+			}
 		}
-		return notImplemented();
+		const auth = await this.vaultObject(env, vaultId).fetch(new Request(`${VAULT_INTERNAL_ORIGIN}/blobs/auth`, {
+			method: "POST",
+			headers: { Authorization: request.headers.get("Authorization") ?? "" },
+		}));
+		if (auth.status !== 204) return auth;
+		if (address === null) return await blobExists(request, bucket, vaultId);
+		const key = blobKey(vaultId, address);
+		if (request.method === "GET") {
+			const object = await bucket.get(key);
+			if (!object) return json({ error: "not found" }, 404);
+			// DECISIONS-GAP: legacy echoed the uploader's Content-Type. Blobs are opaque (E2EE ciphertext included) and
+			// share the console's origin, so a GET is always `application/octet-stream` with `nosniff`: an uploaded
+			// HTML or SVG body can never render as a page here.
+			return new Response(object.body, {
+				headers: {
+					"Content-Type": "application/octet-stream",
+					"X-Content-Type-Options": "nosniff",
+					"Cache-Control": "no-store",
+				},
+			});
+		}
+		if (declared !== null && declared > 0 && request.body) {
+			// A declared length within the cap bounds the body (HTTP framing): stream it to R2 without buffering.
+			await bucket.put(key, request.body);
+			return new Response(null, { status: 204 });
+		}
+		let bytes: Uint8Array;
+		try {
+			bytes = await readBoundedBytes(request, MAX_BLOB_UPLOAD_BYTES);
+		} catch (error) {
+			return boundedBodyRejection(error);
+		}
+		await bucket.put(key, bytes);
+		return new Response(null, { status: 204 });
 	}
 
 	/**
@@ -527,12 +615,57 @@ export class Router {
 	}
 }
 
+/** D9: the R2 key of a blob, `v/<vaultId>/<address>` (no epoch: a blob survives reset-streams and restore). */
+export function blobKey(vaultId: string, address: string): string {
+	return `${blobPrefix(vaultId)}${address}`;
+}
+
+function blobPrefix(vaultId: string): string {
+	return `v/${vaultId}/`;
+}
+
+/**
+ * `POST /vault/:id/blobs/exists {"hashes": [...]}` → `{present: [...]}` (relay-wire §11.3): the first 50 entries, the
+ * well-formed addresses among them, HEADed 4 at a time. The legacy errors stay: `400 "invalid json"` and `400 "missing
+ * hashes array"`.
+ */
+async function blobExists(request: Request, bucket: R2Bucket, vaultId: string): Promise<Response> {
+	let bytes: Uint8Array;
+	try {
+		bytes = await readBoundedBytes(request, MAX_BLOB_EXISTS_BODY_BYTES, { allowEmpty: true });
+	} catch (error) {
+		if (!(error instanceof BoundedBodyError)) throw error;
+		if (error.kind === "body_too_large") return bodyTooLarge();
+		return json({ error: "invalid json" }, 400);
+	}
+	let body: unknown;
+	try {
+		body = JSON.parse(new TextDecoder().decode(bytes));
+	} catch {
+		return json({ error: "invalid json" }, 400);
+	}
+	const hashes = body && typeof body === "object" ? (body as { hashes?: unknown }).hashes : undefined;
+	if (!Array.isArray(hashes)) return json({ error: "missing hashes array" }, 400);
+	const addresses = hashes.slice(0, MAX_BLOB_EXISTS_ADDRESSES)
+		.filter((hash): hash is string => typeof hash === "string" && BLOB_ADDRESS_PATTERN.test(hash));
+	const present: boolean[] = new Array(addresses.length).fill(false);
+	let next = 0;
+	const worker = async () => {
+		while (next < addresses.length) {
+			const index = next++;
+			present[index] = await bucket.head(blobKey(vaultId, addresses[index]!)) !== null;
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(BLOB_HEAD_CONCURRENCY, addresses.length) }, worker));
+	return json({ present: addresses.filter((_, index) => present[index]) });
+}
+
 /**
  * D5 R2 purge of `v/<vaultId>/`: list up to 1000 keys, delete them, again until the listing is not truncated. Each
  * listing starts from the beginning: the keys before it are gone. false: keys may remain after MAX_PURGE_BATCHES.
  */
 export async function purgeVaultBlobs(bucket: R2Bucket, vaultId: string): Promise<boolean> {
-	const prefix = `v/${vaultId}/`;
+	const prefix = blobPrefix(vaultId);
 	for (let batch = 0; batch < MAX_PURGE_BATCHES; batch++) {
 		const listed = await bucket.list({ prefix, limit: PURGE_BATCH_SIZE });
 		if (listed.objects.length > 0) await bucket.delete(listed.objects.map((object) => object.key));

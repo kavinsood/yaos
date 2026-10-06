@@ -1,18 +1,19 @@
 // Vault DO host logic behind the ports (DECISIONS §2.1): vault meta, the device map, bearer auth, pairing codes and
-// enroll (D3), tickets (D4), revoke (D7), vault delete (D5) and the streams relay. vault.ts wraps it in the
-// Cloudflare Durable Object class; tests run it on Node with SQLite and fake sockets.
+// enroll (D3), tickets (D4), revoke (D7), vault delete (D5), reset-streams (D8a), the D8b restore steps, the D8c
+// epoch check, the blob bearer check (D9) and the streams relay. vault.ts wraps it in the Cloudflare Durable Object
+// class; tests run it on Node with SQLite and fake sockets.
 //
 // The Worker forwards a device route as `https://vault.internal/<rest>?<query>` (the path after /vault/:id, or
 // /enroll), after its own method, path and format checks, with the public origin in `X-YAOS-Origin`. This object
-// never calls the config DO.
+// never calls the config DO (D8b too: the config DO calls prepareRestore, rewind and finishRestore).
 //
 // Awaits: SHA-256, HMAC and body reads yield the turn, and a revoke or delete may run meanwhile (DO input gates hold
 // events only during storage operations). So every handler awaits its crypto first, then re-reads the in-memory
 // state and decides and writes in one synchronous stretch: a revoke that won the race is always seen.
 import { randomBase64Url } from "../base64url";
 import { DailyLimitLatch, dailyLimitResponse, instrumentStorageForDailyLimit } from "../dailyLimit";
-import { bytesToHex } from "../hex";
-import { bearerToken, isWebSocketUpgrade, json, notFound, notImplemented, rejectSocket, releaseUnreadBody } from "../http";
+import { bytesToHex, hexToBytes } from "../hex";
+import { bearerToken, isWebSocketUpgrade, json, notFound, rejectSocket, releaseUnreadBody } from "../http";
 import { FailureLimiter, tooManyAttempts } from "../limiter";
 import {
 	SYSTEM_CLOCK,
@@ -53,6 +54,28 @@ export const ORIGIN_HEADER = "X-YAOS-Origin";
 /** Small JSON bodies (enroll, ticket, pairing-code): the Worker's /enroll cap (G5) applies to all three. */
 const MAX_SMALL_BODY_BYTES = 64 * 1024;
 
+/** D8b: the in-memory `restoring` flag lives 60 s (device routes and enroll → 503, upgrades refused). */
+export const RESTORE_FLAG_TTL_MS = 60_000;
+
+/**
+ * D8b: Durable Object point-in-time recovery, `ctx.storage.getBookmarkForTime`, `ctx.storage
+ * .onNextSessionRestoreBookmark` and `ctx.abort` (vault.ts). Absent → `restore_unsupported`.
+ */
+export interface PitrPort {
+	getBookmarkForTime(at: number): Promise<string>;
+	onNextSessionRestoreBookmark(bookmark: string): Promise<unknown>;
+	/** Resets the object; the next request runs a new runtime on the restored storage. Always throws. */
+	abort(reason: string): never;
+}
+
+/**
+ * Local workerd has no PITR: `getBookmarkForTime` rejects with "This Durable Object's storage back-end does not
+ * implement point-in-time recovery." (measured on wrangler dev 4.147.0). D8b maps it to `501 restore_unsupported`.
+ */
+export function isPitrUnsupportedError(error: unknown): boolean {
+	return error instanceof Error && error.message.includes("does not implement point-in-time recovery");
+}
+
 export interface VaultMeta {
 	vaultId: string;
 	/** D8: the vault epoch, base64url(16 random bytes), minted at init. */
@@ -60,6 +83,11 @@ export interface VaultMeta {
 	/** D4: 32 random bytes, made at init, never exported. */
 	ticketKey: Uint8Array;
 	createdAt: number;
+	/** D8b: set by prepare, erased by a real rewind (the rewound state predates it), cleared by finish. */
+	pendingRestoreId: string | null;
+	/** D8b: the last finished restore (rewind skip, finish idempotency). */
+	lastRestoreId: string | null;
+	lastRestoreAt: number | null;
 }
 
 export interface VaultState {
@@ -83,6 +111,21 @@ export interface MintedCode {
 export interface DeviceListing {
 	devices: Array<{ deviceId: string; deviceName: string; enrolledAt: number }>;
 }
+
+/** D8b step 1. `skip`: a resume after the rewind (the marker is gone); the journal's snapshot stands. */
+export type PrepareRestoreResult =
+	| { kind: "prepared"; bookmark: string; devices: DeviceRecord[] }
+	| { kind: "skip" }
+	| { kind: "finished"; vaultEpoch: string }
+	| { kind: "unsupported" }
+	| { kind: "invalid_point" }
+	| { kind: "unknown_vault" };
+
+/** D8b step 2. A real rewind never returns: `ctx.abort()` makes the RPC throw. */
+export type RewindResult = { kind: "finished"; vaultEpoch: string } | { kind: "unsupported" } | { kind: "unknown_vault" };
+
+/** D8b step 3. `rewind_needed`: back to step 2. */
+export type FinishRestoreResult = { kind: "finished"; vaultEpoch: string } | { kind: "rewind_needed" } | { kind: "unknown_vault" };
 
 /** The VAULT_READY identity of a device (D6 constants). */
 export function ownerActor(meta: VaultMeta, device: DeviceRecord): StreamActor {
@@ -110,10 +153,27 @@ export interface VaultHostOptions {
 	clock?: ClockPort;
 	timers?: TimerPort;
 	runtimeEpoch?: string;
+	/** D8b PITR; absent (or local workerd) → `restore_unsupported`. */
+	pitr?: PitrPort;
 }
 
-type MetaRow = { vault_id: string; vault_generation: string; ticket_key: ArrayBuffer; created_at: number };
+type MetaRow = {
+	vault_id: string; vault_generation: string; ticket_key: ArrayBuffer; created_at: number;
+	pending_restore_id: string | null; last_restore_id: string | null; last_restore_at: number | null;
+};
 type CodeRow = { expires_at: number; used_at: number | null; used_request_id: string | null; used_device_id: string | null };
+
+function sameDevice(a: DeviceRecord, b: DeviceRecord): boolean {
+	return a.tokenHash === b.tokenHash && a.deviceId === b.deviceId && a.deviceName === b.deviceName
+		&& a.enrollmentRequestId === b.enrollmentRequestId && a.enrolledAt === b.enrolledAt;
+}
+
+/** D8b `503 restore_in_progress` with `Retry-After` (the flag's remaining seconds, at least 1). */
+function restoreInProgress(retryAfterMs: number): Response {
+	const response = json({ error: "restore_in_progress" }, 503);
+	response.headers.set("Retry-After", String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+	return response;
+}
 
 async function sha256(value: string): Promise<Uint8Array> {
 	return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
@@ -164,11 +224,22 @@ export class VaultHost {
 	private state: VaultState | null | undefined = undefined;
 	/** The imported HMAC key, once per runtime (D4: the key never rotates; vault delete drops it). */
 	private ticketKey: Promise<CryptoKey> | null = null;
+	private readonly pitr: PitrPort | null;
+	/** D8b `restoring` flag (memory only, 60 s TTL): set by prepare, cleared by finish, lost with the runtime. */
+	private restoring: { restoreId: string; until: number } | null = null;
+	/**
+	 * D8b: identity rows this runtime wrote (codes, enroll, revoke, reset, the restore marker). With the relay's
+	 * `writesThisRuntime` (commits and checkpoints) it tells finish whether anything was written since the rewind.
+	 */
+	private identityWrites = 0;
+	/** D8b step 2 armed a bookmark and is about to abort this runtime. */
+	private rewinding = false;
 
 	constructor(options: VaultHostOptions) {
 		this.clock = options.clock ?? SYSTEM_CLOCK;
 		this.sockets = options.sockets;
 		this.upgrades = options.upgrades;
+		this.pitr = options.pitr ?? null;
 		this.ticketTtlMs = options.ticketTtlMs ?? TICKET_TTL_MS;
 		this.enrollFailures = new FailureLimiter(ENROLL_FAILURE_LIMIT, ENROLL_FAILURE_WINDOW_MS, this.clock);
 		this.latch = new DailyLimitLatch(() => this.clock.now());
@@ -201,7 +272,8 @@ export class VaultHost {
 		let row: MetaRow | undefined;
 		try {
 			row = this.storage.sql.exec<MetaRow>(
-				"SELECT vault_id, vault_generation, ticket_key, created_at FROM vault_meta WHERE id = 1",
+				"SELECT vault_id, vault_generation, ticket_key, created_at, pending_restore_id, last_restore_id,"
+					+ " last_restore_at FROM vault_meta WHERE id = 1",
 			).toArray()[0];
 		} catch (error) {
 			if (!isMissingTableError(error, "vault_meta")) throw error;
@@ -209,7 +281,9 @@ export class VaultHost {
 		this.state = row
 			? {
 				meta: { vaultId: row.vault_id, vaultGeneration: row.vault_generation,
-					ticketKey: new Uint8Array(row.ticket_key), createdAt: row.created_at },
+					ticketKey: new Uint8Array(row.ticket_key), createdAt: row.created_at,
+					pendingRestoreId: row.pending_restore_id, lastRestoreId: row.last_restore_id,
+					lastRestoreAt: row.last_restore_at },
 				devices: DeviceMap.load(this.storage),
 			}
 			: null;
@@ -234,7 +308,8 @@ export class VaultHost {
 		}
 		const ticketKey = crypto.getRandomValues(new Uint8Array(32));
 		const vaultGeneration = randomBase64Url(16);
-		const meta: VaultMeta = { vaultId, vaultGeneration, ticketKey, createdAt: this.clock.now() };
+		const meta: VaultMeta = { vaultId, vaultGeneration, ticketKey, createdAt: this.clock.now(),
+			pendingRestoreId: null, lastRestoreId: null, lastRestoreAt: null };
 		this.storage.transactionSync(() => {
 			for (const ddl of VAULT_SCHEMA) this.storage.sql.exec(ddl);
 			this.storage.sql.exec(
@@ -269,7 +344,10 @@ export class VaultHost {
 		switch (route) {
 			case "POST /enroll":
 				// D3: an unknown vault answers like an unknown secret, with zero writes and no DDL.
-				return state ? await this.enroll(request, state) : json({ error: "invalid_code" }, 404);
+				if (!state) return json({ error: "invalid_code" }, 404);
+				// DECISIONS-GAP: D8b blocks enroll while restoring without placing the check; it runs first, before
+				// the code is read (no write can start), so a malformed body also gets the 503.
+				return this.restoreBlocked() ?? await this.enroll(request, state);
 			case "GET /ws/streams":
 				// §2.2: an unknown vault gets the `unauthorized` frame and 1008.
 				return state ? await this.upgrade(request, url, state) : rejectSocket(request, this.upgrades, "unauthorized");
@@ -278,6 +356,7 @@ export class VaultHost {
 			case "PUT /streams/checkpoint":
 			case "POST /auth/ticket":
 			case "POST /auth/pairing-code":
+			case "POST /blobs/auth":
 			case "POST /debug/simulate-daily-limit":
 				break;
 			default:
@@ -286,6 +365,15 @@ export class VaultHost {
 		// §2.2: an unknown vault answers exactly like a bad credential (no existence oracle).
 		const device = state ? await this.authenticate(request) : null;
 		if (!device) return json({ error: "unauthorized" }, 401);
+		// D8c: right after bearer auth, before any other validation or effect.
+		if (route === "GET /streams/feed" || route === "GET /streams/read" || route === "PUT /streams/checkpoint") {
+			const mismatch = this.epochMismatch(url);
+			if (mismatch) return mismatch;
+		}
+		// DECISIONS-GAP: D8b's 503 for device routes is placed after auth (and after D8c), so an unauthenticated
+		// caller learns nothing about a restore; the blob bearer check and the debug route count as device routes.
+		const blocked = this.restoreBlocked();
+		if (blocked) return blocked;
 		this.wake();
 		switch (route) {
 			case "GET /streams/feed":
@@ -299,10 +387,48 @@ export class VaultHost {
 				return await this.issueTicket(request, device);
 			case "POST /auth/pairing-code":
 				return await this.devicePairingCode(request, device);
+			case "POST /blobs/auth":
+				// D9: the Worker asks this before any R2 call; 204 = an enrolled device's bearer.
+				return new Response(null, { status: 204 });
 			default:
-				// P3: simulate-daily-limit (H3).
-				return notImplemented();
+				return await this.simulateDailyLimit(request);
 		}
+	}
+
+	/** D8c: `epoch=` present and not the current vaultEpoch (empty included) → 409 with the current one. */
+	private epochMismatch(url: URL): Response | null {
+		const state = this.load();
+		if (!state || !url.searchParams.has("epoch")) return null;
+		const current = state.meta.vaultGeneration;
+		return url.searchParams.get("epoch") === current
+			? null
+			: json({ error: "vault_generation_mismatch", vaultEpoch: current }, 409);
+	}
+
+	/** D8b: ms left on the `restoring` flag; 0 when unset or expired (an expired flag is dropped). */
+	private restoringRemainingMs(): number {
+		if (!this.restoring) return 0;
+		const left = this.restoring.until - this.clock.now();
+		if (left > 0) return left;
+		this.restoring = null;
+		return 0;
+	}
+
+	private restoreBlocked(): Response | null {
+		const left = this.restoringRemainingMs();
+		return left > 0 ? restoreInProgress(left) : null;
+	}
+
+	/**
+	 * TEST-ONLY H3 `POST /vault/:id/debug/simulate-daily-limit {"enabled": boolean}` (the Worker forwards it only with
+	 * `YAOS_DEBUG_ROUTES=1`) → `latch.simulate(enabled)`. DECISIONS-GAP: H3 gives no body rules or answer; `enabled`
+	 * must be a boolean (else `400 invalid_request`), and the answer is `200 {ok, enabled}`.
+	 */
+	private async simulateDailyLimit(request: Request): Promise<Response> {
+		const body = await readSmallJson(request);
+		if (typeof body.enabled !== "boolean") return json({ error: "invalid_request" }, 400);
+		this.latch.simulate(body.enabled);
+		return json({ ok: true, enabled: body.enabled });
 	}
 
 	/**
@@ -336,6 +462,7 @@ export class VaultHost {
 			this.storage.sql.exec("INSERT INTO pairing_code (code_hash, purpose, expires_at) VALUES (?, ?, ?)",
 				codeHash.buffer, purpose, expiresAt);
 		});
+		this.identityWrites++;
 		return { pairingCode: code, expiresAt, purpose };
 	}
 
@@ -376,6 +503,9 @@ export class VaultHost {
 		// Synchronous from here to the response: the code row, the device map and the write are one turn.
 		const current = this.load();
 		if (!current) return json({ error: "invalid_code" }, 404);
+		// D8b: a prepare that ran during the hashes wins (its device snapshot would drop this device).
+		const restoring = this.restoreBlocked();
+		if (restoring) return restoring;
 		const tokenHash = bytesToHex(tokenDigest);
 		const code = this.storage.sql.exec<CodeRow>(
 			"SELECT expires_at, used_at, used_request_id, used_device_id FROM pairing_code WHERE code_hash = ?",
@@ -414,6 +544,7 @@ export class VaultHost {
 				tokenDigest.buffer, record.deviceId, record.deviceName, record.enrollmentRequestId, record.enrolledAt,
 			);
 		});
+		this.identityWrites++;
 		current.devices.add(record);
 		return this.enrolled(current, record, parsed.deviceToken, host);
 	}
@@ -479,6 +610,15 @@ export class VaultHost {
 			|| !current.devices.admits(payload.deviceId)) {
 			return rejectSocket(request, this.upgrades, "unauthorized");
 		}
+		// D8b: upgrades are refused while restoring: the error frame and 1013 `restore_in_progress` (relay-wire §5
+		// row 10). DECISIONS-GAP: D8b says "refused" without the shape; it is checked after the ticket (no oracle), and
+		// a request that is not an upgrade gets the device routes' 503.
+		const left = this.restoringRemainingMs();
+		if (left > 0) {
+			if (!isWebSocketUpgrade(request)) return restoreInProgress(left);
+			const frame = `__YPS:${JSON.stringify({ type: "error", code: "restore_in_progress" })}`;
+			return this.upgrades.reject(frame, 1013, "restore_in_progress");
+		}
 		// DECISIONS-GAP: a valid ticket on a request that is not a WebSocket upgrade has no §2.2 answer (legacy fell
 		// through to its DO's 404). `426 upgrade_required`: the runtime cannot answer such a request with a socket.
 		if (!isWebSocketUpgrade(request)) return json({ error: "upgrade_required" }, 426);
@@ -518,6 +658,7 @@ export class VaultHost {
 			this.storage.transactionSync(() => {
 				this.storage.sql.exec("DELETE FROM device WHERE device_id = ?", deviceId);
 			});
+			this.identityWrites++;
 			state.devices.remove(deviceId);
 		}
 		const { droppedFrames, closedSockets } = this.relay.revokeDevice(deviceId);
@@ -525,10 +666,146 @@ export class VaultHost {
 	}
 
 	/**
+	 * D8a reset-streams, the vault DO's part. ONE `transactionSync` deletes every row of the 3 stream tables (H+S+C
+	 * rows) and writes a new generation (1 row), so a daily-limit hit rolls both back and the error reaches the Worker
+	 * (`503 cf_daily_limit`). After the commit the pending buffer, head cache and dedupe index are discarded and every
+	 * streams socket closes 1001. Devices, codes, the ticket key and blobs stay. null: the vault does not exist.
+	 */
+	resetStreams(): { vaultEpoch: string } | null {
+		const state = this.load();
+		if (!state) return null;
+		const vaultGeneration = randomBase64Url(16);
+		this.storage.transactionSync(() => {
+			this.store.deleteAllStreamRows();
+			this.storage.sql.exec("UPDATE vault_meta SET vault_generation = ? WHERE id = 1", vaultGeneration);
+		});
+		this.identityWrites++;
+		state.meta.vaultGeneration = vaultGeneration;
+		this.relay.discardAll(1001, "streams reset");
+		return { vaultEpoch: vaultGeneration };
+	}
+
+	// ---- D8b restore steps (called by the config DO's runner, config/restore.ts) --------------------------------
+
+	/**
+	 * D8b step 1: `restoring` flag (60 s), streams sockets close 1013 (the buffer is dropped), the marker
+	 * `pending_restore_id = restoreId` (1 row; skipped when already set), and `{bookmark: getBookmarkForTime(at),
+	 * devices}`. `refreshOnly` (a resume whose journal already holds a snapshot): when the marker is gone the vault was
+	 * rewound, its device table is T's, and the journal's snapshot stands (`skip`). No effect before the bookmark: no
+	 * PITR → `unsupported`.
+	 */
+	async prepareRestore(restoreId: string, at: number, refreshOnly: boolean): Promise<PrepareRestoreResult> {
+		const state = this.load();
+		if (!state) return { kind: "unknown_vault" };
+		if (state.meta.lastRestoreId === restoreId) return { kind: "finished", vaultEpoch: state.meta.vaultGeneration };
+		if (refreshOnly && state.meta.pendingRestoreId !== restoreId) return { kind: "skip" };
+		if (!this.pitr) return { kind: "unsupported" };
+		// DECISIONS-GAP: a point before the vault's init would rewind to storage with no vault; it is refused as
+		// `400 invalid_restore_point` with no effect and no PITR call (D8b's list is unparseable, future, over 30 days).
+		if (at < state.meta.createdAt) return { kind: "invalid_point" };
+		let bookmark: string;
+		try {
+			bookmark = await this.pitr.getBookmarkForTime(at);
+		} catch (error) {
+			if (isPitrUnsupportedError(error)) return { kind: "unsupported" };
+			throw error;
+		}
+		// Synchronous from here: re-read the state the await may have changed.
+		const current = this.load();
+		if (!current) return { kind: "unknown_vault" };
+		if (current.meta.lastRestoreId === restoreId) return { kind: "finished", vaultEpoch: current.meta.vaultGeneration };
+		if (current.meta.pendingRestoreId !== restoreId) {
+			this.storage.sql.exec("UPDATE vault_meta SET pending_restore_id = ? WHERE id = 1", restoreId);
+			this.identityWrites++;
+			current.meta.pendingRestoreId = restoreId;
+		}
+		this.restoring = { restoreId, until: this.clock.now() + RESTORE_FLAG_TTL_MS };
+		this.relay.discardAll(1013, "restore_in_progress");
+		return { kind: "prepared", bookmark, devices: [...current.devices.list()].map((device) => ({ ...device })) };
+	}
+
+	/**
+	 * D8b step 2: `last_restore_id == restoreId` → already finished. Otherwise arm `bookmark` for the next session and
+	 * `ctx.abort()`: the RPC throws by design, and the next call runs a new runtime on storage as of T.
+	 */
+	async rewind(restoreId: string, bookmark: string): Promise<RewindResult> {
+		const state = this.load();
+		if (!state) return { kind: "unknown_vault" };
+		if (state.meta.lastRestoreId === restoreId) return { kind: "finished", vaultEpoch: state.meta.vaultGeneration };
+		if (!this.pitr) return { kind: "unsupported" };
+		this.rewinding = true;
+		try {
+			await this.pitr.onNextSessionRestoreBookmark(bookmark);
+		} catch (error) {
+			this.rewinding = false;
+			throw error;
+		}
+		return this.pitr.abort("restore rewind");
+	}
+
+	/**
+	 * D8b step 3. Idempotent on `last_restore_id`. `rewind_needed` when the marker is still this restore's (no rewind
+	 * happened) or when this runtime wrote anything (a commit, checkpoint, enroll or code since the rewind), so content
+	 * is exactly T. Else ONE `transactionSync` (≈ D+P+1 rows): the device table becomes `devices` (rows that differ are
+	 * deleted and inserted), every pairing code is deleted, and meta gets a new epoch, `last_restore_id`,
+	 * `last_restore_at` and no marker. Then the flag clears and every streams socket closes 1001.
+	 */
+	finishRestore(restoreId: string, devices: readonly DeviceRecord[]): FinishRestoreResult {
+		const state = this.load();
+		if (!state) return { kind: "unknown_vault" };
+		if (state.meta.lastRestoreId === restoreId) return { kind: "finished", vaultEpoch: state.meta.vaultGeneration };
+		// DECISIONS-GAP: D8b's "pending_restore_id still set" is read as "== restoreId": the rewound state may hold
+		// another restore's marker from before T (a restore in flight at T), and that one never clears by rewinding.
+		if (state.meta.pendingRestoreId === restoreId) return { kind: "rewind_needed" };
+		if (this.relay.writesThisRuntime + this.identityWrites > 0) return { kind: "rewind_needed" };
+		const wanted = new Map(devices.map((device) => [device.tokenHash, device]));
+		const present = new Map([...state.devices.list()].map((device) => [device.tokenHash, device]));
+		const vaultGeneration = randomBase64Url(16);
+		const now = this.clock.now();
+		this.storage.transactionSync(() => {
+			for (const [tokenHash, device] of present) {
+				const keep = wanted.get(tokenHash);
+				if (keep && sameDevice(keep, device)) continue;
+				this.storage.sql.exec("DELETE FROM device WHERE token_hash = ?", hexToBytes(tokenHash).buffer);
+			}
+			for (const [tokenHash, device] of wanted) {
+				const have = present.get(tokenHash);
+				if (have && sameDevice(have, device)) continue;
+				this.storage.sql.exec(
+					"INSERT INTO device (token_hash, device_id, device_name, enrollment_request_id, enrolled_at)"
+						+ " VALUES (?, ?, ?, ?, ?)",
+					hexToBytes(tokenHash).buffer, device.deviceId, device.deviceName, device.enrollmentRequestId,
+					device.enrolledAt,
+				);
+			}
+			this.storage.sql.exec("DELETE FROM pairing_code");
+			this.storage.sql.exec(
+				"UPDATE vault_meta SET vault_generation = ?, pending_restore_id = NULL, last_restore_id = ?,"
+					+ " last_restore_at = ? WHERE id = 1",
+				vaultGeneration, restoreId, now,
+			);
+		});
+		this.identityWrites++;
+		const map = new DeviceMap();
+		for (const device of wanted.values()) map.add({ ...device });
+		state.devices = map;
+		state.meta.vaultGeneration = vaultGeneration;
+		state.meta.pendingRestoreId = null;
+		state.meta.lastRestoreId = restoreId;
+		state.meta.lastRestoreAt = now;
+		this.restoring = null;
+		this.relay.discardAll(1001, "vault restored");
+		return { kind: "finished", vaultEpoch: vaultGeneration };
+	}
+
+	/**
 	 * D5 vault delete, the vault DO's part: streams sockets close 1001, the buffer and caches are dropped, the
 	 * in-memory state becomes "no vault" at once (every device route → 401), then `deleteAll()` wipes the storage.
 	 */
 	async deleteVault(): Promise<{ deleted: true }> {
+		// A wipe now would be undone: the armed bookmark restores the storage when this runtime aborts. The delete
+		// fails before any effect; the operator's retry reaches the next runtime (the journal row is already gone).
+		if (this.rewinding) throw new Error("vault delete: a restore rewind is in flight; retry");
 		for (const socket of this.sockets.sockets()) {
 			if (!this.relay.owns(socket)) continue;
 			try { socket.close(1001, "vault deleted"); } catch { /* closed */ }
@@ -536,6 +813,7 @@ export class VaultHost {
 		this.relay.reset();
 		this.state = null;
 		this.ticketKey = null;
+		this.restoring = null;
 		try {
 			await this.storage.deleteAll();
 		} catch (error) {

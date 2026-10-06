@@ -3,7 +3,16 @@
 import { DurableObject } from "cloudflare:workers";
 import { readStreamRelayConfig, type StreamsEnv } from "../streams/relay";
 import { CLOUDFLARE_UPGRADE_REJECT, CloudflareSocketRegistry } from "./cloudflare";
-import { VaultHost, type DeviceListing, type MintedCode, type VaultInitResult } from "./host";
+import type { DeviceRecord } from "./devices";
+import {
+	VaultHost,
+	type DeviceListing,
+	type FinishRestoreResult,
+	type MintedCode,
+	type PrepareRestoreResult,
+	type RewindResult,
+	type VaultInitResult,
+} from "./host";
 import type { PairingPurpose } from "./pairing";
 import { readTicketTtlMs } from "./ticket";
 
@@ -25,6 +34,15 @@ export class VaultDO extends DurableObject<VaultEnv> {
 			upgrades: CLOUDFLARE_UPGRADE_REJECT,
 			relayConfig: readStreamRelayConfig(env),
 			ticketTtlMs: readTicketTtlMs(env.YAOS_TICKET_TTL_MS),
+			// D8b: Durable Object point-in-time recovery. Local workerd rejects getBookmarkForTime (→ 501).
+			pitr: {
+				getBookmarkForTime: (at) => ctx.storage.getBookmarkForTime(at),
+				onNextSessionRestoreBookmark: (bookmark) => ctx.storage.onNextSessionRestoreBookmark(bookmark),
+				abort: (reason) => {
+					ctx.abort(reason);
+					throw new Error(reason);
+				},
+			},
 		});
 	}
 
@@ -59,6 +77,26 @@ export class VaultDO extends DurableObject<VaultEnv> {
 	/** RPC: D5 vault delete, this object's part (sockets 1001, then `deleteAll()`). */
 	deleteVault(): Promise<{ deleted: true }> {
 		return this.host.deleteVault();
+	}
+
+	/** RPC: D8a reset-streams (one transaction; a daily-limit error propagates). null: no such vault. */
+	resetStreams(): { vaultEpoch: string } | null {
+		return this.host.resetStreams();
+	}
+
+	/** RPC: D8b step 1 (config DO only). */
+	prepareRestore(restoreId: string, at: number, refreshOnly: boolean): Promise<PrepareRestoreResult> {
+		return this.host.prepareRestore(restoreId, at, refreshOnly);
+	}
+
+	/** RPC: D8b step 2 (config DO only). A real rewind aborts this object, so the call throws. */
+	rewind(restoreId: string, bookmark: string): Promise<RewindResult> {
+		return this.host.rewind(restoreId, bookmark);
+	}
+
+	/** RPC: D8b step 3 (config DO only). */
+	finishRestore(restoreId: string, devices: DeviceRecord[]): FinishRestoreResult {
+		return this.host.finishRestore(restoreId, devices);
 	}
 
 	webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
