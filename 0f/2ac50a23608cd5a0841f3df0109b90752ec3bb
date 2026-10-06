@@ -1,0 +1,21 @@
+src/engine/reconcile/reconciler.safety.test.ts
+  s_4c8271111ae3a8::t_6fa0e39b316abe 113-135
+src/engine/reconcile/reconciler.ts
+  s_4c8271111ae3a8::t_766757424156c0 144,165-167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0f2ac50a23608cd5a0841f3df0109b90752ec3bb",
+  "prompts": {},
+  "sessions": {
+    "s_4c8271111ae3a8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a00d4c492b57e176d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
