@@ -1,0 +1,21 @@
+server/src/streams/dedupe.ts
+  s_8232c28df410e4::t_9ecb7d937caf1f 10-13,22-24,27-32,196-197,203
+tests/server/streams-hardening.ts
+  s_8232c28df410e4::t_f93bf44a94b60e 22,485,492,504-505,520,525,527,531,537,542-543,548,560-565
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f89cceca7a259962b5bc2d59560d1b7758e11770",
+  "prompts": {},
+  "sessions": {
+    "s_8232c28df410e4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a65d2a43c0bfc9176",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
