@@ -29,7 +29,7 @@ import type { ReconcileSettings } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
 import { LogEngine } from "../runtime/engine";
 import type { EngineTuning } from "../runtime/options";
-import { CfgSync } from "../settings/cfgSync";
+import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
 import { SnapshotJob } from "../snapshots/snapshotJob";
 import type { FoldedNsFrame } from "../sync/nsRuntime";
 import type { BoundDocs } from "./boundDocs";
@@ -165,6 +165,19 @@ export class VaultRuntime {
 		if (this.notices.length > 32) this.notices.shift();
 		this.engine.link.post({ t: "notice", level, code, message: message ?? code });
 	};
+
+	/** After a full unbraked pass: queued blob transfers the plan no longer wants are stale. */
+	private async pruneBlobQueue(): Promise<void> {
+		const want = new Set<string>();
+		for (const op of this.rec.lastPlan) {
+			if (op.op === "pushBlob") want.add(`up:${op.hash}`);
+			else if (op.op === "fetchBlob") want.add(`down:${op.hash}`);
+		}
+		const intentDocs = new Set<string>();
+		for (const i of this.rec.ctx.store.intents.values()) if (i.docId) intentDocs.add(i.docId);
+		const n = await this.blobs.retain((q) => q.docId === CFG_BLOB_DOC || intentDocs.has(q.docId) || want.has(`${q.direction}:${q.hash}`));
+		if (n > 0) this.diag(`blob queue: dropped ${n} stale transfer(s)`);
+	}
 
 	diag(line: string): void {
 		this.o.log?.(line);
@@ -304,6 +317,7 @@ export class VaultRuntime {
 		if (this.syncedSignature() !== syncedBefore || r.ok > 0) this.mirror.markDirty();
 		if (scope.t === "full") {
 			this.lastFullAtMs = this.o.ports.clock.now();
+			if (r.brake === null && this.listingComplete) await this.pruneBlobQueue();
 			this.requestCfg();
 			if (this.settings.snapshots.enabled) void this.snaps.maybeDaily().catch((e) => this.diag(`daily snapshot failed: ${String(e)}`));
 		}

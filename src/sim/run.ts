@@ -192,7 +192,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const print = () => `${activity(devs, net)}|${devs.map((d) => `${[...d.vault.snapshot()].join(";")}#${settingsPrint(d)}`).join("|")}`;
 		for (let t = 0; t < c.healHorizonMs && stable < 5; t += 1_000) {
 			await clock.advance(1_000);
-			const idle = net.quiet() && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty()));
+			const idle = net.quiet() && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && (d.vrt?.blobs.queued().length ?? 0) === 0 && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty()));
 			const fp = print();
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
@@ -215,6 +215,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				if (faults.isDown(i)) why.push(`${d.name} down`);
 				else if (!d.runtime.engine.isReady) why.push(`${d.name} not ready`);
 				else if (!(d.vrt?.log.isIdle() ?? false)) why.push(`${d.name} log busy`);
+				else if ((d.vrt?.blobs.queued().length ?? 0) > 0) why.push(`${d.name} blob queue ${d.vrt?.blobs.queued().map((q) => `${q.direction}:${q.path}#${q.attempts}`).join(" ")}`);
 				if (d.vault.pendingEvents() > 0) why.push(`${d.name} vault events`);
 				if (d.workspace.views_().some((v) => v.isDirty())) why.push(`${d.name} dirty view`);
 			});

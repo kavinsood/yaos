@@ -120,6 +120,28 @@ export class BlobQueue implements BlobTransfer {
 		await this.deps.db.tx([STORE.blobQueue], "readwrite", async (tx) => (other ? tx.put(STORE.blobQueue, other) : tx.delete(STORE.blobQueue, hash as ContentHash)));
 	}
 
+	/**
+	 * Drop queued records `keep` rejects (a full pass no longer plans that transfer: the file changed, the doc
+	 * went away). Without this a stale record stays due forever and keeps re-arming the blob retry. Records with
+	 * a transfer in flight are kept. Returns the number dropped.
+	 */
+	async retain(keep: (r: BlobQueueRecord) => boolean): Promise<number> {
+		const drop: string[] = [];
+		for (const [key, r] of this.records) if (!this.inflight.has(key) && !keep(r)) drop.push(key);
+		if (drop.length === 0) return 0;
+		const rows = new Map<string, BlobQueueRecord | null>();
+		for (const key of drop) {
+			const r = this.records.get(key)!;
+			this.records.delete(key);
+			this.due.delete(key);
+			rows.set(r.hash, this.records.get(`${r.direction === "up" ? "down" : "up"}:${r.hash}`) ?? null);
+		}
+		await this.deps.db.tx([STORE.blobQueue], "readwrite", async (tx) => {
+			for (const [hash, other] of rows) await (other ? tx.put(STORE.blobQueue, other) : tx.delete(STORE.blobQueue, hash as ContentHash));
+		});
+		return drop.length;
+	}
+
 	private once<T>(key: string, run: () => Promise<T>): Promise<T> {
 		const cur = this.inflight.get(key);
 		if (cur) return cur as Promise<T>;

@@ -213,6 +213,8 @@ export function checkClean(devs: readonly SimDevice[], net: SimNet, isDown: (i: 
 			if (!rt.log.isIdle()) bad(`${n}: log engine not idle`);
 			const intents = rt.rec.ctx.store.intents.size;
 			if (intents > 0) bad(`${n}: ${intents} open intents`);
+			const queued = rt.blobs.queued();
+			if (queued.length > 0) bad(`${n}: blob transfers queued: ${queued.map((q) => `${q.direction}:${q.path}`).join(", ")}`);
 		}
 		if (d.vault.pendingEvents() > 0) bad(`${n}: ${d.vault.pendingEvents()} vault events in flight`);
 		if (d.ui.fatals.length > 0) bad(`${n}: fatal ${d.ui.fatals[0]?.code}`);

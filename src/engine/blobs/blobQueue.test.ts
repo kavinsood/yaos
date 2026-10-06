@@ -126,6 +126,24 @@ test("store: backoff is monotonic: a wall clock jumping back 12 h does not park 
 	assert.equal(await q2.upload({ hash, docId: D, path: P, bytes }), true);
 });
 
+test("retain drops stale records (memory + store), keeps the rest and a shared row's other direction", async () => {
+	const { q, store, storage } = await make();
+	const a = rnd(16), b = rnd(17);
+	const ha = sha256Hex(a), hb = sha256Hex(b);
+	store!.down = true;
+	await q.upload({ hash: ha, docId: D, path: P, bytes: a });
+	await q.upload({ hash: hb, docId: D, path: P, bytes: b });
+	await q.download({ hash: hb, docId: D, path: P, size: b.length });
+	assert.equal(q.queued().length, 3);
+	assert.equal(await q.retain((r) => r.direction === "down"), 2);
+	assert.deepEqual(q.queued().map((r) => [r.direction, r.hash]), [["down", hb]]);
+	assert.deepEqual(storage.dump("b", "blobQueue").map((r) => [(r as { direction: string }).direction, (r as { hash: string }).hash]), [["down", hb]]);
+	assert.ok(q.nextDueInMs() !== null);
+	assert.equal(await q.retain(() => false), 1);
+	assert.equal(q.nextDueInMs(), null);
+	assert.equal(storage.dump("b", "blobQueue").length, 0);
+});
+
 test("store: missing blob on download backs off exponentially", async () => {
 	const { q, clock } = await make();
 	const hash = sha256Hex(rnd(10));
