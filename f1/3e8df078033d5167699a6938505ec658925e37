@@ -1,0 +1,31 @@
+src/engine/adapters/relayHttp.test.ts
+  s_8bc9bf3abe4a95::t_141820f411bf34 3,38-44
+src/engine/adapters/relayHttp.ts
+  s_ed451e485d98d2::t_da98f1bbde1cb1 55-64,140
+src/engine/adapters/wsRelay.ts
+  s_ed451e485d98d2::t_505eca0e96ebbb 38,468
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f13e8df078033d5167699a6938505ec658925e37",
+  "prompts": {},
+  "sessions": {
+    "s_8bc9bf3abe4a95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac019149b1d227e41",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_ed451e485d98d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7c0a7436b413138",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
