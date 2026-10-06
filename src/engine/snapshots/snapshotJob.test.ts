@@ -160,7 +160,7 @@ test("restore: subset of paths; a file edited between read and write is not clob
 test("optional upload: sealed zip put under its hash address", async () => {
 	const puts = new Map<string, Uint8Array>();
 	const store: BlobPort = { maxBlobBytes: 1 << 30, has: async () => new Set(), put: async (a, b) => { puts.set(a, b); }, get: async () => null };
-	const crypto = { suite: 0, keyEpoch: 0, seal: async () => new Uint8Array(), open: async () => ({ ok: false }), sealBlob: async (b: Uint8Array) => b.map((x) => x ^ 1), openBlob: async (b: Uint8Array) => b, blobAddress: async (h: ContentHash) => `addr:${h}` as BlobAddress } as unknown as CryptoPort;
+	const crypto = { suite: 0, sealEpoch: () => 0, seal: async () => new Uint8Array(), open: async () => ({ ok: false }), sealBlob: async (i: { plaintext: Uint8Array }) => i.plaintext.map((x) => x ^ 1), openBlob: async (i: { sealed: Uint8Array }) => ({ ok: true, plaintext: i.sealed }), blobAddress: async (h: ContentHash) => `addr:${h}` as BlobAddress } as unknown as CryptoPort;
 	const { w, side, job } = await setup({ upload: { store, crypto } });
 	w.vault.userWrite("a.md", "a");
 	const res = (await job.take("manual"))!;

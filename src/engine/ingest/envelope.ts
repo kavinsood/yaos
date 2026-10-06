@@ -31,14 +31,16 @@ export async function sealFrame(
 	kind: EnvelopeKind, authorNsSeq: Seq, flags: number, content: Uint8Array,
 ): Promise<SealedFrame> {
 	const inner = encodeInner({ kind, authorNsSeq, flags, content });
-	const sealedInner = await crypto.seal({ aad: frameAad(vaultId, stream, clientFrameId), plaintext: inner });
-	return { sealed: encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch: crypto.keyEpoch }, sealedInner), flags: innerFlags(inner) };
+	const keyEpoch = crypto.sealEpoch();
+	const sealedInner = await crypto.seal({ purpose: "frame", keyEpoch, aad: frameAad(vaultId, stream, clientFrameId), plaintext: inner });
+	return { sealed: encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch }, sealedInner), flags: innerFlags(inner) };
 }
 
 export async function sealCheckpoint(crypto: CryptoPort, vaultId: VaultId, stream: StreamName, coversSeq: Seq, content: Uint8Array, authorNsSeq: Seq): Promise<Uint8Array> {
 	const inner = encodeInner({ kind: "checkpoint", authorNsSeq, flags: 0, content });
-	const sealedInner = await crypto.seal({ aad: checkpointAad(vaultId, stream, coversSeq), plaintext: inner });
-	return encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch: crypto.keyEpoch }, sealedInner);
+	const keyEpoch = crypto.sealEpoch();
+	const sealedInner = await crypto.seal({ purpose: "checkpoint", keyEpoch, aad: checkpointAad(vaultId, stream, coversSeq), plaintext: inner });
+	return encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch }, sealedInner);
 }
 
 export type Binding =
@@ -53,8 +55,8 @@ export async function openEnvelope(crypto: CryptoPort, vaultId: VaultId, binding
 	const outer = decodeOuter(payload);
 	if (!outer.ok) return outer;
 	const aad = binding.t === "frame" ? frameAad(vaultId, binding.stream, binding.clientFrameId) : checkpointAad(vaultId, binding.stream, binding.coversSeq);
-	const opened = await crypto.open({ suite: outer.header.suite, keyEpoch: outer.header.keyEpoch, aad, sealed: outer.sealed });
-	if (!opened.ok) return { ok: false, reason: opened.reason === "unknown-key" ? "unknown-key" : opened.reason === "auth-failed" ? "auth-failed" : "unsupported-suite" };
+	const opened = await crypto.open({ purpose: binding.t, suite: outer.header.suite, keyEpoch: outer.header.keyEpoch, aad, sealed: outer.sealed });
+	if (!opened.ok) return { ok: false, reason: opened.reason === "suite-downgrade" ? "unsupported-suite" : opened.reason };
 	const dec = decodeInner(opened.plaintext);
 	if (!dec.ok) return dec;
 	const inner = dec.inner;

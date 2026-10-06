@@ -55,8 +55,10 @@ export async function resolveRefContent(deps: RefDeps, stream: StreamName, refCo
 	};
 	if (deps.blob) {
 		try {
-			const sealed = await deps.blob.get(await deps.crypto.blobAddress(ref.hash));
-			const ok = await verify(sealed ? await deps.crypto.openBlob(sealed) : null);
+			const address = await deps.crypto.blobAddress(ref.hash);
+			const sealed = await deps.blob.get(address);
+			const opened = sealed ? await deps.crypto.openBlob({ address, sealed }) : null;
+			const ok = await verify(opened?.ok ? opened.plaintext : null);
 			if (ok) return ok;
 		} catch {
 			// fall through to the log

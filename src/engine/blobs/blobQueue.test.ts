@@ -5,7 +5,7 @@ import { sha256Hex } from "../../core/hash/sha256";
 import { BLOB_CHUNK_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import type { ContentHash, DocId, VaultPath } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress, CryptoPort } from "../../ports/crypto";
+import type { BlobAddress, CryptoPort, OpenResult } from "../../ports/crypto";
 import { DB_SCHEMA_VERSION, STORE_SPECS } from "../store/schema";
 import type { DiskSchema } from "../reconcile/store";
 import { FakeClock } from "../reconcile/testkit/fakes";
@@ -16,13 +16,15 @@ import { assembleChunks, splitChunks, type BlobChunkLog } from "./chunks";
 /** Suite-0-like crypto, but sealing XORs so a missing openBlob would be caught. */
 class XorCrypto implements CryptoPort {
 	readonly suite = 0 as const;
-	readonly keyEpoch = 0;
 	sealCalls = 0;
-	async seal(input: { aad: Uint8Array; plaintext: Uint8Array }): Promise<Uint8Array> { return input.plaintext; }
+	sealEpoch(): number { return 0; }
+	keyState(e: number) { return { held: e === 0, verified: true }; }
+	async seal(input: { plaintext: Uint8Array }): Promise<Uint8Array> { return input.plaintext; }
 	async open(input: { sealed: Uint8Array }) { return { ok: true as const, plaintext: input.sealed }; }
-	async sealBlob(p: Uint8Array): Promise<Uint8Array> { this.sealCalls++; return p.map((b) => b ^ 0x5a); }
-	async openBlob(s: Uint8Array): Promise<Uint8Array | null> { return s.map((b) => b ^ 0x5a); }
+	async sealBlob(input: { plaintext: Uint8Array }): Promise<Uint8Array> { this.sealCalls++; return input.plaintext.map((b) => b ^ 0x5a); }
+	async openBlob(input: { sealed: Uint8Array }): Promise<OpenResult> { return { ok: true, plaintext: input.sealed.map((b) => b ^ 0x5a) }; }
 	async blobAddress(hash: ContentHash): Promise<BlobAddress> { return `addr-${hash.slice(0, 16)}` as BlobAddress; }
+	async diagHash(): Promise<string> { return "0".repeat(16); }
 }
 
 class FakeStore implements BlobPort {

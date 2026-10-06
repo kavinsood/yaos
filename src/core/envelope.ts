@@ -21,8 +21,8 @@ export const ENVELOPE_FORMAT_VERSION = 1;
 
 export const CryptoSuite = {
 	none: 0,
-	/** Reserved: XChaCha20-Poly1305 with per-vault key epochs. */
-	xchacha20poly1305: 1,
+	/** AES-256-GCM over WebCrypto with per-vault key epochs (e2ee-design §4.1). Id 1 was a never-shipped reservation. */
+	aes256gcm: 1,
 } as const;
 export type CryptoSuite = (typeof CryptoSuite)[keyof typeof CryptoSuite];
 
@@ -154,3 +154,9 @@ export const ALLOWED_KINDS: Readonly<Record<"ns" | "cfg" | "body" | "canvas" | "
 /** AAD prefix for frames and checkpoints (UTF-8). */
 export const AAD_FRAME_PREFIX = "yaos/f1";
 export const AAD_CHECKPOINT_PREFIX = "yaos/c1";
+/** AAD prefix of suite-1 sealed blobs (e2ee-design §7.2, §10.2). */
+export const AAD_BLOB_PREFIX = "yaos/b2";
+/** AAD prefix of k-record key wraps (e2ee-design §11.2). */
+export const AAD_KEYRING_PREFIX = "yaos/k2";
+/** Sealed-blob format byte (e2ee-design §10.2). */
+export const BLOB_FORMAT_VERSION = 1;

@@ -130,7 +130,7 @@ export class SnapshotJob {
 			const { store, crypto } = deps.upload;
 			try {
 				address = await crypto.blobAddress(exactFingerprint(bytes) as string as Parameters<CryptoPort["blobAddress"]>[0]);
-				await store.put(address, await crypto.sealBlob(bytes));
+				await store.put(address, await crypto.sealBlob({ address, plaintext: bytes }));
 			} catch {
 				address = null;
 				deps.notice?.("warn", "snapshot-upload-failed");

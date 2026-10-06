@@ -214,7 +214,7 @@ K_e        32 random bytes per key epoch, e ≥ 1           (stored: SecretStora
      kBlob    AES-GCM-256   blob bytes                     purpose "blob"
      kWrap    AES-GCM-256   prevWrap / nextWrap in k       purpose "wrap"
      kKcv     HMAC-SHA-256  key check value                purpose "kcv"
- from K_1 only (vault lifetime, never rotated):
+ from K_1 only (vault lifetime, never rotated), info I(purpose, 1):
      kAddr    HMAC-SHA-256  blob addresses, x: names       purpose "addr"
      kDiag    HMAC-SHA-256  diagnostics hashes             purpose "diag"
 RK         35-byte recovery key (§13)
@@ -225,8 +225,10 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 
 - HKDF is from [RFC5869]. The base key is imported with `extractable:false` ([WebCrypto] §33.4.2), and derived keys
   take `extractable:false` explicitly ([WebCrypto] §14.3.7).
-- Subkeys are derived **lazily** per epoch on first use. Startup derives the newest epoch's set plus kAddr and
-  kDiag: 7 `deriveKey` calls.
+- Every subkey is 32 bytes: AES-GCM with `length: 256`, HMAC with `hash: "SHA-256", length: 256` (WebCrypto's HMAC
+  default would be the 64-byte block size). The golden vectors (§20.1) pin this.
+- Subkeys are derived **lazily** per epoch on first use and memoised (`src/engine/adapters/webCryptoSuite1.ts`). A
+  normal session touches the newest epoch's set plus kAddr and kDiag: at most 7 `deriveKey` calls.
 - **Why kAddr and kDiag live for the whole vault.**
   - ns, refs and snapshots carry only the plaintext sha256, and the address must be recomputable from it in any
     epoch. Rotating kAddr would change every address, so blobs would need re-uploading (decision D4).
@@ -293,6 +295,12 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
    transfer list. Main keeps no copy and re-reads SecretStorage when it needs one (QR display, §12).
 2. The worker imports each K_e as an HKDF base key with `extractable:false`, derives subkeys, and zero-fills the
    buffers. This is best-effort: JS cannot guarantee erasure.
+   - **Raw-key retention.** `k` records wrap raw keys (§11.1), and WebCrypto refuses `wrapKey` on a
+     non-extractable key (`InvalidAccessError`, [WebCrypto] §14.3.11; **[M]** in
+     `webCryptoSuite1.keys.test.ts`). So the worker keeps the raw bytes of K_e, in worker memory only, exactly
+     while a wrap or the host hand-off may still need them: a key not yet exported to main, a pending (generated,
+     not yet adopted) key, and every epoch ≥ the seal epoch (the next roll's or revoke's `prevWrap`). Older raw
+     bytes are zero-filled when the seal epoch moves past them. Keys from `init.crypto` count as exported.
 3. New keys (adopted by roll, entered by QR or RK) are produced in the worker and posted back once in
    `keyringChanged` (SECRET). Main persists them to SecretStorage.
 4. Inline mode runs the same code on main.
@@ -324,7 +332,7 @@ inner
   varuint flags           initial | adopted | deflate | fromDisk
   varuint frameNo         NEW. ns/cfg frames: per-(deviceId, stream) counter ≥ 1 (§8.2); 0 for every other kind
   bytes   content         rest; deflate-raw iff flags & deflate (unchanged)
-pad (suite 1 only, inside the AEAD; added and stripped by the CryptoPort)
+pad (suite 1 only, inside the AEAD; added and stripped by the envelope codec, §18.2)
   0x80 ‖ 0x00*            to padmeLen(len(inner) + 1)                                   (ISO/IEC 7816-4 style)
 ```
 
@@ -373,7 +381,9 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
 
 - Padmé [Padmé] leaks O(log log M) bits of a length M, with at most 12 % overhead. Frames, checkpoints and blobs all
   use it. The 256-byte floor hides keystroke-sized frames (decision D3).
-- The padding lives **inside** the AEAD and is added and stripped by the suite-1 CryptoPort. Suite 0 does not pad.
+- The padding lives **inside** the AEAD. The envelope codec adds and strips it for frames and checkpoints (§18.2), so
+  `CryptoPort.seal/open` stay pure AEAD; the suite-1 `sealBlob/openBlob` add and strip it for blobs
+  (`src/core/codec/padme.ts`). Suite 0 does not pad.
 - A valid tag with bad padding means a key holder sealed garbage. That is **deterministic** malformation (§9.2).
 - **Limits change** (`src/core/limits.ts`).
   - The relay closes 1009 above `maxBinaryMessageBytes` = 1049600 (relay-wire §3.2). Treat it as 1 MiB of payload.
@@ -549,6 +559,11 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
 ```
 
 - Suite 0 is unchanged: address = sha256, and the bytes are raw.
+- `openBlob` failures (`src/core/codec/sealedBlob.ts`): an unknown blobFormat or a suite byte other than 1 is
+  `unsupported-suite`; truncation, a non-minimal varuint, keyEpoch 0, a body shorter than 28 bytes, or a valid tag
+  over bad padding is `malformed`; then `unknown-key` and `auth-failed` as for frames. All of them are
+  "unavailable" to the download path below.
+- The suite-1 `sealBlob` seals under `sealEpoch()`, and throws above `MAX_BLOB_PLAINTEXT_BYTES_SUITE1` (§7.3).
 - A blob stays under its upload epoch forever. Rolls and revokes never re-seal blobs. A revoked device can read old
   blobs it can fetch, which follows from §14.4.
 - **PUT overwrites** (DECISIONS D9). Two devices uploading the same file put two different ciphertexts at one
@@ -1168,9 +1183,21 @@ export interface KeyringCrypto {
 - `openBlob` returns a result rather than `Uint8Array | null`, so the caller can classify the failure (§10.2).
   The callers that change are `src/engine/body/refs.ts:58-59` and `src/engine/blobs/blobQueue.ts:204`.
 - **The suite-0 adapter** (`src/engine/adapters/noopCrypto.ts`) and `identityCrypto`
-  (`src/core/codec/envelope.ts:242`) implement the new shape. `sealEpoch()` returns 0.
-- **The suite-1 adapter is new**, at `src/engine/adapters/webCryptoSuite1.ts` (WP-E1). It holds non-extractable
-  CryptoKeys only.
+  (`src/core/codec/envelope.ts`) implement the new shape. `sealEpoch()` returns 0.
+  - core has no digest, so `identityCrypto(hash?: HashPort)` takes an optional HashPort for `diagHash`; without one,
+    `diagHash` throws. `DIAG_HASH_HEX_CHARS = 16` lives in `src/core/codec/envelope.ts`.
+- **The suite-1 adapter is new**, at `src/engine/adapters/webCryptoSuite1.ts` (WP-E1), with the primitives in
+  `suite1Primitives.ts`. It holds non-extractable CryptoKeys only, plus the raw bytes §6.3 step 2 allows.
+  - `sealEpoch()` is 0 until `setSealEpoch`, so a fresh port seals nothing. `seal` throws under an unheld or
+    unverified epoch; `setSealEpoch` throws unless the key is verified, and never moves backwards.
+  - `open` checks in this order: suite 0 → `suite-downgrade`; suite ≠ 1 → `unsupported-suite`; epoch not held →
+    `unknown-key`; sealed < 28 bytes → `malformed`; then the tag. No trial decryption across epochs.
+  - `wrap` throws if the raw key it needs is no longer retained (§6.3). `unwrap` returns false and never throws on
+    bad bytes, a missing wrapping key or a short RK; a payload for an already-verified epoch is discarded (true).
+  - `install` and the constructor's `keys` zero-fill the caller's buffers. `install` refuses to replace a verified
+    epoch. `drop` refuses the seal epoch. `exportForHost` returns each not-yet-exported key once.
+  - `blobAddress` and `diagHash` need K_1 (§5.1). A device holding a later K_e reaches K_1 down the prevWrap chain
+    (§11.1) before it addresses any blob.
 
 ### 18.2 Envelope, codec, limits, fold
 
@@ -1338,6 +1365,12 @@ per-vault crypto flags on the server (the suite is client-pinned, §12.4).
   - inputs: fake key `K = 00 01 … 1f`, vaultId `AAAAAAAAAAAAAAAAAAAAAA`, and a seeded `RandomPort` for nonces;
   - outputs: each subkey's kcv, kAddr of a fixed hash, one frame per envelope kind, one checkpoint, one blob,
     genesis/roll/revoke records, an RK encode/decode, and a setup link.
+  - Split by package, since each lands with the code that produces it:
+    - **WP-E1** (`src/engine/adapters/suite1Golden.test.ts`): kcv for K_1 and K_2 (= 20..3f), kAddr of
+      sha256("abc"), kDiag, raw frame and checkpoint seals (fixed AAD), a frame under K_2, one sealed blob, and
+      next/prev/recovery wraps (fake 35-byte RK = 40..62; fixed AAD, since wrap AAD §11.2 is WP-E3);
+    - **WP-E2**: one envelope per kind with the §7.2 AAD and padding;
+    - **WP-E3**: genesis/roll/revoke records and the RK encoding; **WP-E5**: the setup link.
   - **Cross-checked by a second implementation** in the test: Node `node:crypto` (`createCipheriv`, `hkdfSync`,
     `createHmac`), not WebCrypto, so one implementation's bug cannot certify itself.
 - Codec property tests: Padmé round-trip and bucket monotonicity, varuint and base32 round-trips, and

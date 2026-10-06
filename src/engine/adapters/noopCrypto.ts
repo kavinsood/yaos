@@ -1,17 +1,20 @@
 /**
  * Suite 0 (no-op) CryptoPort. DESIGN §b.1: seal/open are identity, the key
- * epoch is 0 and the blob address is the content hash itself. E2EE replaces
- * this adapter, not the envelope format.
+ * epoch is 0 and the blob address is the content hash itself. Suite 1 is
+ * webCryptoSuite1.ts; the envelope format is the same.
  */
 
 import type { BlobAddress, CryptoPort, HashPort } from "../../ports/crypto";
 import { CryptoSuite } from "../../core/envelope";
+import { DIAG_HASH_HEX_CHARS } from "../../core/codec/envelope";
+import { bytesToHex } from "../../core/codec/lib0";
 
-/** `hash` is unused by suite 0; it is taken so the factory shape matches the E2EE adapter. */
-export function createNoopCrypto(_hash: HashPort): CryptoPort {
+/** `hash` backs diagHash (a sha256 prefix under suite 0, e2ee-design §6.4). */
+export function createNoopCrypto(hash: HashPort): CryptoPort {
 	return {
 		suite: CryptoSuite.none,
-		keyEpoch: 0,
+		sealEpoch: () => 0,
+		keyState: (keyEpoch) => ({ held: keyEpoch === 0, verified: true }),
 		async seal({ plaintext }) {
 			return plaintext;
 		},
@@ -20,14 +23,17 @@ export function createNoopCrypto(_hash: HashPort): CryptoPort {
 			if (keyEpoch !== 0) return { ok: false, reason: "unknown-key" };
 			return { ok: true, plaintext: sealed };
 		},
-		async sealBlob(plaintext) {
+		async sealBlob({ plaintext }) {
 			return plaintext;
 		},
-		async openBlob(sealed) {
-			return sealed;
+		async openBlob({ sealed }) {
+			return { ok: true, plaintext: sealed };
 		},
-		async blobAddress(hash) {
-			return hash as string as BlobAddress;
+		async blobAddress(h) {
+			return h as string as BlobAddress;
+		},
+		async diagHash(bytes) {
+			return bytesToHex(await hash.sha256(bytes)).slice(0, DIAG_HASH_HEX_CHARS);
 		},
 	};
 }

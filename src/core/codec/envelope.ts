@@ -28,12 +28,15 @@ import {
 	type EnvelopeOpenResult,
 	type InnerEnvelope,
 } from "../envelope";
-import type { BlobAddress, CryptoPort } from "../../ports/crypto";
+import type { BlobAddress, CryptoPort, HashPort } from "../../ports/crypto";
 import type { Seq, StreamName, VaultId } from "../types";
 import { streamClass } from "../types";
 import { MAX_DOC_TEXT_CHARS } from "../limits";
-import { CodecError, Reader, Writer, utf8Encode } from "./lib0";
+import { CodecError, Reader, Writer, bytesToHex, utf8Encode } from "./lib0";
 import { decodeCheckpointContent } from "./contents";
+
+/** CryptoPort.diagHash length in hex characters (e2ee-design §18.1). */
+export const DIAG_HASH_HEX_CHARS = 16;
 
 /** Compress content of at least this many bytes ... */
 export const DEFLATE_MIN_BYTES = 4096;
@@ -209,8 +212,9 @@ export interface SealInput {
 export async function sealEnvelope(crypto: CryptoPort, input: SealInput): Promise<Uint8Array> {
 	const plaintext = encodeInner(input.inner, { deflate: input.deflate ?? "auto" });
 	const aad = bindingAad(input.vaultId, input.binding);
-	const sealed = await crypto.seal({ aad, plaintext });
-	return encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch: crypto.keyEpoch }, sealed);
+	const keyEpoch = crypto.sealEpoch();
+	const sealed = await crypto.seal({ purpose: input.binding.t, keyEpoch, aad, plaintext });
+	return encodeOuter({ formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch }, sealed);
 }
 
 export interface OpenInput {
@@ -225,12 +229,13 @@ export async function openEnvelope(crypto: CryptoPort, input: OpenInput): Promis
 	const outer = decodeOuter(input.bytes);
 	if (!outer.ok) return outer;
 	const opened = await crypto.open({
+		purpose: input.binding.t,
 		suite: outer.header.suite,
 		keyEpoch: outer.header.keyEpoch,
 		aad: bindingAad(input.vaultId, input.binding),
 		sealed: outer.sealed,
 	});
-	if (!opened.ok) return { ok: false, reason: opened.reason };
+	if (!opened.ok) return { ok: false, reason: opened.reason === "suite-downgrade" ? "unsupported-suite" : opened.reason };
 	const dec = decodeInner(opened.plaintext, input.maxContentBytes);
 	if (!dec.ok) return dec;
 	const b = checkBinding(input.binding, dec.inner);
@@ -238,18 +243,26 @@ export async function openEnvelope(crypto: CryptoPort, input: OpenInput): Promis
 	return { ok: true, header: outer.header, inner: dec.inner };
 }
 
-/** Suite-0 CryptoPort (identity). Handy for tests and the sim; production uses engine/adapters/noopCrypto. */
-export function identityCrypto(): CryptoPort {
+/**
+ * Suite-0 CryptoPort (identity). Handy for tests; production and the sim use
+ * engine/adapters/noopCrypto. diagHash needs a HashPort (core has no digest).
+ */
+export function identityCrypto(hash?: HashPort): CryptoPort {
 	return {
 		suite: CryptoSuite.none,
-		keyEpoch: 0,
+		sealEpoch: () => 0,
+		keyState: (keyEpoch) => ({ held: keyEpoch === 0, verified: true }),
 		seal: async ({ plaintext }) => plaintext.slice(),
 		open: async ({ suite, keyEpoch, sealed }) =>
 			suite !== CryptoSuite.none ? { ok: false, reason: "unsupported-suite" }
 			: keyEpoch !== 0 ? { ok: false, reason: "unknown-key" }
 			: { ok: true, plaintext: sealed.slice() },
-		sealBlob: async (b) => b.slice(),
-		openBlob: async (b) => b.slice(),
+		sealBlob: async ({ plaintext }) => plaintext.slice(),
+		openBlob: async ({ sealed }) => ({ ok: true, plaintext: sealed.slice() }),
 		blobAddress: async (h) => h as string as BlobAddress,
+		diagHash: async (bytes) => {
+			if (!hash) throw new Error("identityCrypto: diagHash needs a HashPort");
+			return bytesToHex(await hash.sha256(bytes)).slice(0, DIAG_HASH_HEX_CHARS);
+		},
 	};
 }

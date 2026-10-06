@@ -65,6 +65,16 @@ export const BLOB_CHUNK_BYTES = 768 * 1024;
 /** Largest attachment carried on the log without a blob store. */
 export const MAX_LOG_BLOB_BYTES = 8 * 1024 * 1024;
 
+// --- Crypto suite 1 (e2ee-design §7.3) ----------------------------------------
+
+/** Padmé floor: every padded payload is at least this long (decision D3). */
+export const PADME_FLOOR_BYTES = 256;
+/**
+ * Largest suite-1 blob plaintext, the 0x80 pad marker included: 39 × 256 KiB
+ * padded plus header and AEAD overhead fits the 10 MiB upload cap (DECISIONS D9).
+ */
+export const MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 39 * 256 * 1024 - 1;
+
 // --- Content ----------------------------------------------------------------
 
 export const MAX_DOC_TEXT_CHARS = 8 * 1024 * 1024;

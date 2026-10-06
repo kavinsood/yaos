@@ -74,7 +74,7 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 		try {
 			const address = await ctx.crypto.blobAddress(hash);
 			const has = await ctx.blob.has([address]);
-			if (!has.has(address)) await ctx.blob.put(address, await ctx.crypto.sealBlob(input.content));
+			if (!has.has(address)) await ctx.blob.put(address, await ctx.crypto.sealBlob({ address, plaintext: input.content }));
 			return [await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, refContent, input.content, state, input.dependsOn, input.nowMs)];
 		} catch {
 			// Blob store unavailable: fall through to the log path.
