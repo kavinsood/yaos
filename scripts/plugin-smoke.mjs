@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { webcrypto } from "node:crypto";
 import vm from "node:vm";
+import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const nodeRequire = createRequire(new URL("../package.json", import.meta.url));
@@ -149,7 +150,7 @@ async function loadFakeVault() {
 async function waitUntil(pred, ms, what) {
 	const end = Date.now() + ms;
 	while (!pred()) {
-		if (Date.now() > end) fail(`timeout waiting for ${what}`);
+		if (Date.now() > end) fail(`timeout waiting for ${typeof what === "function" ? what() : what}`);
 		await new Promise((r) => setTimeout(r, 10));
 	}
 }
@@ -180,11 +181,14 @@ async function smokePlugin(mainJs, manifest) {
 	const workspace = { getLeavesOfType: () => [], on: () => ({}), offref() {}, onLayoutReady: (cb) => cb() };
 	const app = { vault, workspace };
 	const g = globalThis;
-	const prev = { document: g.document, window: g.window };
+	const prev = { document: g.document, window: g.window, indexedDB: g.indexedDB, IDBKeyRange: g.IDBKeyRange };
+	// Obsidian always has IndexedDB; node does not (the engine's store is real IndexedDB code).
+	g.indexedDB = new IDBFactory();
+	g.IDBKeyRange = IDBKeyRange;
 	const logged = [];
 	const origDebug = console.debug;
 	g.document = eventTarget({ visibilityState: "visible", hidden: false });
-	g.window = eventTarget({});
+	g.window = eventTarget({ setTimeout, clearTimeout, setInterval, clearInterval });
 	console.debug = (...a) => logged.push(a.join(" "));
 	try {
 		const plugin = new Ctor(app, { ...manifest, dir: `.obsidian/plugins/${PLUGIN_ID}` });
@@ -196,7 +200,7 @@ async function smokePlugin(mainJs, manifest) {
 		if (plugin.commands.length === 0) fail("no commands registered");
 		const ctl = plugin.controller;
 		if (!ctl) fail("controller missing after onload");
-		await waitUntil(() => ctl.runState().phase === "running" || ctl.runState().phase === "failed", 5000, "engine running");
+		await waitUntil(() => ctl.runState().phase === "running" || ctl.runState().phase === "failed", 5000, () => `engine running (${JSON.stringify(ctl.runState())}; log: ${logged.slice(-8).join(" | ").replaceAll(TOKEN, "<token>")})`);
 		const rs = ctl.runState();
 		if (rs.phase !== "running" || rs.transport !== "inline") fail(`run state ${JSON.stringify(rs)}`);
 		await waitUntil(() => ctl.status() !== null, 3000, "status snapshot");
@@ -211,6 +215,8 @@ async function smokePlugin(mainJs, manifest) {
 		console.debug = origDebug;
 		g.document = prev.document;
 		g.window = prev.window;
+		g.indexedDB = prev.indexedDB;
+		g.IDBKeyRange = prev.IDBKeyRange;
 	}
 }
 
