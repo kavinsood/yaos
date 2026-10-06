@@ -59,7 +59,7 @@ function clientStats(c: FullClient) {
 		cursorAtStart: c.cursorAtStart, blob: c.blobKind, carrier: c.ui.carriers.at(-1) ?? null, deviceClass: c.runtime.currentDeviceClass,
 		notices: c.ui.notices.map((n) => `${n.level}:${n.code}`), fatals: c.ui.fatals.map((f) => f.code), brakes: c.ui.brakes.length,
 		phase: s?.phase ?? null, vaultSeq: s?.vaultSeq ?? null, counts: s?.counts ?? null, cfgPasses: c.vrt?.stats.cfgPasses ?? null,
-		trashed: c.vault.trashed.length, conflictCopiesWritten: c.runtime.bindings.stats.conflictCopies,
+		trashed: c.vault.trashed.length, conflictCopiesWritten: c.conflictCopiesWritten,
 	};
 }
 

@@ -196,6 +196,11 @@ export class FullClient {
 		if (this.logLines.length > LOG_RING) this.logLines.splice(0, this.logLines.length - LOG_RING);
 	}
 
+	/** Bound-merge conflict copies this engine wrote (the worker's boundDisk); null while no engine runs. */
+	get conflictCopiesWritten(): number | null {
+		return this.handle?.engine.boundDisk.stats.conflictCopies ?? null;
+	}
+
 	private newWorkspace(): SimWorkspace {
 		const ws = new SimWorkspace({ clock: this.clock, vault: this.vault });
 		this.workspaces.push(ws);
@@ -251,7 +256,6 @@ export class FullClient {
 			createWorker: () => null,
 			createInline: () => this.carrier(),
 			pingEnabled: true,
-			timeZone: "utc",
 			log: (line) => this.log(`host: ${line}`),
 			ui: {
 				onStatus: (s) => { this.ui.statuses.push(s); if (this.ui.statuses.length > 50) this.ui.statuses.shift(); },
