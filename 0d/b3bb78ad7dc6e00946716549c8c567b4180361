@@ -1,0 +1,29 @@
+src/engine/compose/localDayCounter.test.ts
+  s_441b74abbd0702::t_0d6379fe3ee25c 1-26
+src/engine/compose/localDayCounter.ts
+  s_441b74abbd0702::t_c2f403c47bd8ed 1-36
+src/engine/compose/vaultRuntime.ts
+  s_441b74abbd0702::t_0df9f3a7f38e2b 39,106,213,586
+src/engine/reconcile/context.ts
+  s_441b74abbd0702::t_577882b6990075 60-61,190
+src/engine/reconcile/reconciler.basic.test.ts
+  s_441b74abbd0702::t_87462353e48800 114,117
+src/engine/reconcile/testkit/world.ts
+  s_441b74abbd0702::t_aec01e28c485e3 8,47-48,76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0db3bb78ad7dc6e00946716549c8c567b4180361",
+  "prompts": {},
+  "sessions": {
+    "s_441b74abbd0702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5b78666751a5e84f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
