@@ -321,6 +321,26 @@ test("S1 identical-loser collapse: rebind to the winner + nsDelete(loser), no di
 	assert.deepEqual(opsOf(moved), ["diskRename", "diskMaterialize", "syncedPut"]);
 });
 
+test("§c.12 migrated-loser merge: a differing loser at a path with an old-epoch base merges into the winner", () => {
+	const sc = {
+		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
+		synced: [S("d4", "Inbox/x.md", { contentHash: h("L"), nsTouchSeq: 0 })],
+		local: [L("Inbox/x.md", h("L"))],
+	};
+	const ctx = { remoteTextHash: new Map([[id("d3"), h("W")]]) };
+	// No path base: a plain loser rename.
+	assert.deepEqual(opsOf(planWith(input(sc), ctx)), ["diskRename", "diskMaterialize", "syncedPut"]);
+	const p = planWith(input(sc), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) });
+	assert.deepEqual(p.ops, [
+		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "Inbox/x.md" },
+		{ op: "nsDelete", docId: "d4", baseBodySeq: 10 },
+		{ op: "reconcileContent", docId: "d3", path: "Inbox/x.md", kind: "markdown", hasBase: false, pathBase: true },
+	]);
+	// The winner's body must be readable first.
+	const empty = { ...sc, remote: [R("d3", "Inbox/x.md", { body: { ...R("d3", "Inbox/x.md").body!, hasContent: false } }), R("d4", "Inbox/x (2).md")] };
+	assert.deepEqual(planWith(input(empty), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) }).ops, [{ op: "wait", docId: "d4", reason: "body-empty" }]);
+});
+
 test("remote-move target already on disk (crash after rename): adopt the path, no disk op", () => {
 	const p = run({ remote: [R("d1", "b.md", { lastTouchSeq: 8 })], synced: [S("d1", "a.md")], local: [L("b.md", h("c0"))] });
 	assert.deepEqual(opsOf(p), ["syncedPut"]);

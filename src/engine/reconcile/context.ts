@@ -58,6 +58,8 @@ export interface ReconcilerDeps {
 	readonly onBrake?: (report: BrakeReport) => void;
 	/** Path-keyed base text carried over a vaultEpoch migration (§c.12 step 3); null = none. */
 	readonly pathBase?: (key: PathKey) => string | null;
+	/** The keys `pathBase` answers for (the planner's migrated-loser merge). */
+	readonly pathBaseKeys?: ReadonlySet<PathKey>;
 }
 
 export const BRAKE_WINDOW_MS = 10 * 60_000;

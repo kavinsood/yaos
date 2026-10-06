@@ -187,6 +187,7 @@ export class VaultRuntime {
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
 			notice: this.notice, onBrake: (r) => this.onBrake(r), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
+			pathBaseKeys: o.pathBases ? new Set(o.pathBases.keys()) : undefined,
 		});
 		await this.rec.start();
 		if (this.settings.syncSettings) {

@@ -64,6 +64,8 @@ export interface PlannerContext {
 	readonly remoteTextHash: ReadonlyMap<DocId, ContentHash>;
 	readonly bodyAppliedSeq: ReadonlyMap<DocId, Seq>;
 	readonly restoreDuty: ReadonlySet<DocId>;
+	/** Paths with a path-keyed base carried over an epoch migration (§c.12). */
+	readonly pathBaseKeys: ReadonlySet<PathKey>;
 }
 
 export const DEFAULT_PLANNER_CONTEXT: PlannerContext = {
@@ -75,6 +77,7 @@ export const DEFAULT_PLANNER_CONTEXT: PlannerContext = {
 	remoteTextHash: new Map(),
 	bodyAppliedSeq: new Map(),
 	restoreDuty: new Set(),
+	pathBaseKeys: new Set(),
 };
 
 function cmp(a: string, b: string): number {
@@ -340,9 +343,19 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		const w = input.remote.get(winner);
 		if (!w || w.state !== "live" || w.kind !== s.kind) return false;
 		const wh = remoteHash(w);
-		if (wh === null || wh !== l.hash) return false;
+		const identical = wh !== null && wh === l.hash;
+		// §c.12: devices re-creating the vault after an epoch reset race on every path. A differing loser at a
+		// path with an old-epoch base merges into the winner (3-way against that base) instead of a loser rename.
+		const migrated = !identical && s.kind === "markdown" && ctx.pathBaseKeys.has(s.pathKey);
+		if (!identical && !migrated) return false;
 		handled.add(winner);
-		push([...prefix, { op: "rebind", fromDocId: s.docId, toDocId: winner, path: w.path }, { op: "nsDelete", docId: s.docId, baseBodySeq: baseBodySeq(r) }]);
+		if (migrated && (!w.body?.caughtUp || (!w.body.hasContent && w.createHash !== EMPTY_CONTENT_HASH))) {
+			push([...prefix, waitOp(s.docId, w.body?.caughtUp ? "body-empty" : "body-not-caught-up")]);
+			return true;
+		}
+		const ops: PlannerOp[] = [...prefix, { op: "rebind", fromDocId: s.docId, toDocId: winner, path: w.path }, { op: "nsDelete", docId: s.docId, baseBodySeq: baseBodySeq(r) }];
+		if (migrated) ops.push({ op: "reconcileContent", docId: winner, path: l.path, kind: "markdown", hasBase: false, pathBase: true });
+		push(ops);
 		return true;
 	};
 

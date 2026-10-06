@@ -461,7 +461,11 @@ export type PlannerOp =
 	| { readonly op: "diskTrash"; readonly docId: DocId | null; readonly path: VaultPath; readonly expect: DiskExpect }
 	| { readonly op: "conflictCopy"; readonly docId: DocId | null; readonly from: VaultPath; readonly to: VaultPath; readonly reason: ConflictReason; readonly expect: DiskExpect }
 	// --- content (engine runs the ONE merge engine, may emit body frames + disk writes) ---
-	| { readonly op: "reconcileContent"; readonly docId: DocId; readonly path: VaultPath; readonly kind: "markdown" | "canvas"; readonly hasBase: boolean }
+	| {
+		readonly op: "reconcileContent"; readonly docId: DocId; readonly path: VaultPath; readonly kind: "markdown" | "canvas"; readonly hasBase: boolean;
+		/** Merge against the old epoch's path-keyed base (§c.12), not the synced record's. */
+		readonly pathBase?: true;
+	}
 	| { readonly op: "pushBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	| { readonly op: "fetchBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	// --- bookkeeping ---
