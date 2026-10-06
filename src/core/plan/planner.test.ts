@@ -181,7 +181,7 @@ test("row deleted/present/present changed -> nsRestore + content", () => {
 
 test("row merged: rebind then plan as the winner (E3: zero disk ops)", () => {
 	const p = run({
-		remote: [R("d4", "Inbox/x.md", { state: "merged", aliasOf: id("d3") }), R("d3", "Inbox/x.md", { body: { ...R("d3", "a.md").body!, version: V(11) } })],
+		remote: [R("d4", "Inbox/x.md", { state: "merged", aliasOf: id("d3") }), R("d3", "Inbox/x.md", { createHash: h("X"), body: { ...R("d3", "a.md").body!, version: V(11) } })],
 		synced: [S("d4", "Inbox/x.md", { contentHash: h("X") })],
 		local: [L("Inbox/x.md", h("X"))],
 	});
@@ -196,6 +196,35 @@ test("row merged: rebind then plan as the winner (E3: zero disk ops)", () => {
 		local: [L("Inbox/x.md", h("X"))],
 	});
 	assert.deepEqual(opsOf(behind), ["rebind", "wait"]);
+});
+
+test("row merged, loser edited after its create: the dropped edit is local, no base (§c.13)", () => {
+	// S of the loser records an edit that only lived in its dropped held frames: W holds the create text.
+	const sc = (body: Partial<NonNullable<RemoteEntry["body"]>>): Scenario => ({
+		remote: [R("d4", "x.md", { state: "merged", aliasOf: id("d3") }), R("d3", "x.md", { createHash: h("X"), body: { ...R("d3", "a.md").body!, version: V(11), ...body } })],
+		synced: [S("d4", "x.md", { contentHash: h("X+mine") })],
+		local: [L("x.md", h("X+mine"))],
+	});
+	assert.deepEqual(run(sc({})).ops, [
+		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "x.md" },
+		{ op: "reconcileContent", docId: "d3", path: "x.md", kind: "markdown", hasBase: false },
+	]);
+	// W's initial frames still in flight: never merge against the empty text.
+	assert.deepEqual(run(sc({ hasContent: false, version: V(0) })).ops, [
+		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "x.md" },
+		{ op: "wait", docId: "d3", reason: "body-empty" },
+	]);
+});
+
+test("row live/present/present: body without content, create not empty = wait body-empty unless S is born empty", () => {
+	const empty = { ...R("d1", "a.md").body!, hasContent: false, version: V(0) };
+	const p = run({ remote: [R("d1", "a.md", { body: empty })], synced: [S("d1", "a.md", { bodyVersion: V(3) })], local: [L("a.md", h("c0"))] });
+	assert.deepEqual(p.ops, [{ op: "wait", docId: "d1", reason: "body-empty" }]);
+	// Own create whose initial frames were never written (crash): born-empty S re-merges the disk text.
+	const born = run({
+		remote: [R("d1", "a.md", { body: empty })], synced: [S("d1", "a.md", { contentHash: EMPTY_CONTENT_HASH, bodyVersion: V(0), hasBase: false })], local: [L("a.md", h("c0"))],
+	});
+	assert.deepEqual(born.ops, [{ op: "reconcileContent", docId: "d1", path: "a.md", kind: "markdown", hasBase: false }]);
 });
 
 // ---------------------------------------------------------------------------

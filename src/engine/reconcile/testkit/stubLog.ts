@@ -73,6 +73,8 @@ export class StubLog implements LogPort {
 	/** Own committed body frames (docId, update), in order. */
 	readonly frames: { docId: DocId; update: Uint8Array }[] = [];
 	holdNs = false;
+	/** An own create onto a live create with the same kind and hash folds as `merged` (§c.5 identical duplicate). */
+	mergeIdentical = false;
 	nsReady = true;
 	divergence = false;
 	/** S1 hook (Reconciler.applyOwnFold). */
@@ -105,6 +107,14 @@ export class StubLog implements LogPort {
 		switch (op.t) {
 			case "create": {
 				if (entries.has(op.docId)) return { kind: "ignored", reason: "duplicate-docid" };
+				const twin = this.mergeIdentical ? entries.get(this.byKey(entries, this.pathKey(op.path), op.docId) ?? ("" as DocId)) : undefined;
+				if (twin && twin.kind === op.kind && twin.createHash === op.contentHash) {
+					entries.set(op.docId, {
+						docId: op.docId, kind: op.kind, path: twin.path, state: "merged", lastTouchSeq: seq, deletedSeq: 0, deleteBaseBodySeq: 0,
+						createHash: op.contentHash, createSize: op.size, blob: null, aliasOf: twin.docId,
+					});
+					return { kind: "merged", into: twin.docId };
+				}
 				const finalPath = this.place(entries, op.path, op.docId);
 				entries.set(op.docId, {
 					docId: op.docId, kind: op.kind, path: finalPath, state: "live", lastTouchSeq: seq, deletedSeq: 0, deleteBaseBodySeq: 0,
@@ -173,6 +183,7 @@ export class StubLog implements LogPort {
 			const seq = ++this.seq;
 			const outcome = this.foldOp(this.entries, op, seq);
 			const docId = "docId" in op ? op.docId : null;
+			if (outcome.kind === "merged" && docId) this.bodies.delete(docId); // held initial frames are dropped (§e.2)
 			events.push({ op, seq, outcome, entry: docId ? this.remoteEntry(this.entries.get(docId), false) : null });
 		}
 		if (events.length > 0 && this.onOwnFold) await this.onOwnFold(events);
@@ -397,6 +408,13 @@ export class StubLog implements LogPort {
 
 	remoteEdit(docId: DocId, fn: (t: Y.Text) => void): void {
 		this.remoteRow(docId, (d) => fn(d.getText("text")));
+	}
+
+	/** A remote markdown create whose initial body frames have not arrived (caught up, no content); remoteEdit delivers them. */
+	remoteCreateBodyless(path: VaultPath, text: string, docId: DocId = this.freshId()): DocId {
+		this.foldOp(this.entries, { t: "create", docId, kind: "markdown", path, contentHash: markdownContentHash(text), size: utf8Length(text) }, ++this.seq);
+		this.ensureBody(docId);
+		return docId;
 	}
 
 	/** A remote device edits a canvas doc (raw Y.Doc access; canvasDoc.applyCanvas for record-level edits). */

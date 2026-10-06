@@ -10,6 +10,7 @@
 
 import type { ContentHash, DocId, NsBlobRef, NsOp, PlannerOp, VaultPath } from "../../core/types";
 import { markdownContentHash } from "../../core/hash/markdownLf";
+import { restartAtCreate } from "../../core/plan/planner";
 import type { DiskOpResult } from "../../protocol/messages";
 import type { VaultStat, WriteOutcome } from "../../ports/vault";
 import type { Ctx } from "./context";
@@ -48,8 +49,15 @@ export async function rebind(env: Env, op: Op<"rebind">): Promise<JobOutcome> {
 		await ctx.commit({ syncedDrop: [op.fromDocId], baseDrop: [op.fromDocId] });
 		return "ok";
 	}
-	const moved = ctx.record({ ...s, docId: op.toDocId, path: op.path, pathKey: ctx.pk(op.path) });
-	await ctx.commit({ syncedDrop: [op.fromDocId], syncedPut: [moved], baseMove: s.hasBase ? [{ from: op.fromDocId, to: op.toDocId }] : [] });
+	// A merged alias restarts at the winner's create, as the planner planned it; a collapse (live loser) keeps S.
+	const view = ctx.log.view().remote;
+	const winner = view.get(op.toDocId);
+	const from = winner && view.get(op.fromDocId)?.state !== "live" ? restartAtCreate(s, winner.createHash) : s;
+	const moved = ctx.record({ ...from, docId: op.toDocId, path: op.path, pathKey: ctx.pk(op.path) });
+	await ctx.commit({
+		syncedDrop: [op.fromDocId], syncedPut: [moved],
+		baseMove: from.hasBase ? [{ from: op.fromDocId, to: op.toDocId }] : [], baseDrop: s.hasBase && !from.hasBase ? [op.fromDocId] : [],
+	});
 	return "ok";
 }
 

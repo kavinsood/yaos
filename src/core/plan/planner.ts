@@ -90,6 +90,19 @@ function versionEq(a: BodyVersion, b: BodyVersion | null): boolean {
 
 type ContentKind = "markdown" | "canvas";
 
+/**
+ * §c.13 merged rebind of a markdown/canvas doc. The loser's held body frames
+ * were dropped, so the winner never saw the loser's edits after its create: its
+ * sync point is the winner's create, not the loser's last merge. Keeping the
+ * loser's base would read those edits as already synced and the winner's text
+ * as their deletion. The base survives only when it is the create text; with no
+ * base the next merge keeps the disk side as a conflict copy.
+ */
+export function restartAtCreate(s: SyncedEntry, createHash: ContentHash): SyncedEntry {
+	if (s.kind === "blob") return s;
+	return { ...s, contentHash: createHash, bodyVersion: null, hasBase: s.hasBase && s.contentHash === createHash };
+}
+
 export const plan: PlanFn = (input) => planWith(input);
 
 export function planWith(input: PlannerInput, options: Partial<PlannerContext> = {}): Plan {
@@ -236,6 +249,11 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 			const Rc = body === null || !versionEq(body.version, s.bodyVersion);
 			if (!Lc && !Rc) return { ...none, ops: statMoved || pathChanged ? [putFull()] : [] };
 			if (body === null || !body.caughtUp) return { ...none, ops: [waitOp(docId, "body-not-caught-up"), ...putPath()] };
+			// The create's initial frames are still in flight: merging against the empty text would read it as a
+			// deletion. A born-empty S (own create, frames maybe never written) merges, so the runner can re-push.
+			if (!body.hasContent && r.createHash !== EMPTY_CONTENT_HASH && s.contentHash !== EMPTY_CONTENT_HASH) {
+				return { ...none, ops: [waitOp(docId, "body-empty"), ...putPath()] };
+			}
 			return { ...none, ops: [{ op: "reconcileContent", docId, path: diskPath, kind: s.kind as ContentKind, hasBase: s.hasBase }] };
 		}
 
@@ -400,8 +418,8 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		if (r0 && r0.state === "merged" && r0.aliasOf !== null) {
 			if (input.synced.has(r0.aliasOf)) return push([drop(s0.docId)]);
 			prefix.push({ op: "rebind", fromDocId: s0.docId, toDocId: r0.aliasOf, path: s0.path });
-			s = { ...s0, docId: r0.aliasOf };
 			r = input.remote.get(r0.aliasOf);
+			s = { ...(r ? restartAtCreate(s0, r.createHash) : s0), docId: r0.aliasOf };
 			handled.add(r0.aliasOf);
 		}
 		const found = localFor(s, r);

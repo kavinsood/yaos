@@ -91,8 +91,8 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	for (let attempt = 0; ; attempt++) {
 		if (attempt >= MAX_CAS_ATTEMPTS) return "fail"; // remote kept moving: re-plan
 		crdt0 = ytext.toString();
-		// No stored base (mirror recovery, too large to keep): a side still at the synced content is the base,
-		// so a one-sided change applies as one instead of a no-base conflict copy.
+		// No stored base (mirror recovery, too large to keep, a merged alias restarted at the winner's create): a side
+		// still at the synced content is the base, so a one-sided change applies as one instead of a no-base conflict copy.
 		const base = storedBase ?? trustedEpochBase(epochBase, crdt0)
 			?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : markdownContentHash(crdt0) === fallback.contentHash ? crdt0 : null);
 		await ctx.deps.clock.yieldNow();
