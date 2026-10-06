@@ -1,0 +1,51 @@
+tests/conformance/client.ts
+  s_ab5bcc5cfffe93::t_21fddf92142139 4
+tests/live/hardening-worker.ts
+  s_ab5bcc5cfffe93::t_9c298184ca5da7 1
+tests/live/live-seed-check.ts
+  s_ab5bcc5cfffe93::t_aa6b1b7685dbb0 1
+tests/live/membership.ts
+  s_ab5bcc5cfffe93::t_ad76d94e3d2ad1 1
+tests/live/ownAwarenessProvider.ts
+  s_ab5bcc5cfffe93::t_7af4194a2f0790 1-101
+tests/live/provider-manual-connect.ts
+  s_ab5bcc5cfffe93::t_d3894ea9ff2a34 3
+tests/live/run-live.ts
+  s_ab5bcc5cfffe93::t_52552bc5f2ac68 38,72
+tests/live/schema-guard.ts
+  s_ab5bcc5cfffe93::t_a62a2085c29b4c 1
+tests/live/schema4Live.ts
+  s_ab5bcc5cfffe93::t_dad424511d675a 2-3
+tests/live/settings-sync.ts
+  s_ab5bcc5cfffe93::t_7c14fd0f039c24 2
+tests/live/ws-admission-protocol.ts
+  s_ab5bcc5cfffe93::t_f522d234b8347f 1
+tests/live/ws-ticket-reconnect.ts
+  s_ab5bcc5cfffe93::t_f3bea011ae272d 3
+tests/server/bulk-create-inline-projection.ts
+  s_ab5bcc5cfffe93::t_2353e3f9c327ca 26
+tests/server/helpers/recoveryStateDecode.ts
+  s_ab5bcc5cfffe93::t_2d3d662bb6f88a 2-6,9-13,15-24
+tests/server/recovery-projection-idle.ts
+  s_ab5bcc5cfffe93::t_3be6ef7a5cf3d1 31,736
+tests/server/snapshot-lookup.ts
+  s_ab5bcc5cfffe93::t_89157e91da8b38 17
+tests/server/ws-ticket-auth.ts
+  s_ab5bcc5cfffe93::t_7d8909cb9b8fa0 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d01525f4a0e607604d1755c3267c7a61915fb64a",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
