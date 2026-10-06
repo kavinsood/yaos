@@ -97,7 +97,7 @@ async function open<T>(bytes: Uint8Array, magic: Uint8Array, hash: Sha, body: (r
 }
 
 function writeIdentity(w: Writer, m: MirrorIdentity & { generation: number; writtenAtMs: number }): void {
-	w.varstring(m.vaultId).varstring(m.vaultEpoch).varstring(m.deviceId).varuint(m.generation).varuint(m.writtenAtMs);
+	w.varstring(m.vaultId).varstring(m.vaultEpoch).varstring(m.deviceId).varuint(m.generation).varuint(Math.max(0, Math.floor(m.writtenAtMs))); // ClockPort.now may be fractional
 }
 function readIdentity(r: Reader): MirrorIdentity & { generation: number; writtenAtMs: number } {
 	const vaultId = r.varstring() as VaultId;

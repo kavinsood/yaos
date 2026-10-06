@@ -79,6 +79,7 @@ test("retention: keepDaily newest dailies, a bounded number of event snapshots; 
 	assert.deepEqual(left.filter((id) => id.endsWith("-daily")).sort(), ids.slice(2));
 	assert.equal(left.filter((id) => id.endsWith("-brake")).length, SNAPSHOT_EVENT_KEEP);
 	assert.equal(snapshotId(1, "epoch") < snapshotId(36 ** 8, "epoch"), true, "ids sort by time");
+	assert.deepEqual(parseSnapshotId(snapshotId(1767225602224.57, "daily")), { createdAtMs: 1767225602224, reason: "daily" }, "fractional clock reading");
 });
 
 test("restore: differing file conflict-copied then restored, deleted file recreated, unchanged skipped; changes sync", async () => {

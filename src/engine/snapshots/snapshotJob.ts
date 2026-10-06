@@ -68,7 +68,7 @@ const MANIFEST = "manifest.json";
 const entryName = (path: VaultPath): string => `files/${path}`;
 
 export function snapshotId(createdAtMs: number, reason: SnapshotReason): string {
-	return `${createdAtMs.toString(36).padStart(9, "0")}-${reason}`;
+	return `${Math.max(0, Math.floor(createdAtMs)).toString(36).padStart(9, "0")}-${reason}`;
 }
 export function parseSnapshotId(id: string): { createdAtMs: number; reason: SnapshotReason } | null {
 	const m = /^([0-9a-z]{9})-(daily|brake|epoch|idb|restore|manual)$/.exec(id);

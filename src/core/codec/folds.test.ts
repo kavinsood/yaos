@@ -148,3 +148,12 @@ test("synced mirror: round trip", async () => {
 	if (d.ok) assert.deepEqual(d.mirror, m);
 	assert.deepEqual(await decodeSyncedMirror(await encodeOutboxMirror({ ...ident, generation: 1, writtenAtMs: 0, frames: [] }, sha), sha), { ok: false, reason: "bad-magic" });
 });
+
+test("mirrors: a fractional clock reading encodes (floored), never throws", async () => {
+	const m: SyncedMirrorData = { ...ident, generation: 3, writtenAtMs: 1767225602224.5696, nsCoversSeq: 1, entries: [] };
+	const d = await decodeSyncedMirror(await encodeSyncedMirror(m, sha), sha);
+	assert.ok(d.ok);
+	if (d.ok) assert.equal(d.mirror.writtenAtMs, 1767225602224);
+	const o = await decodeOutboxMirror(await encodeOutboxMirror({ ...ident, generation: 1, writtenAtMs: 0.5, frames: [] }, sha), sha);
+	assert.ok(o.ok);
+});
