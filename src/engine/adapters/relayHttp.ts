@@ -52,6 +52,16 @@ export function normalizeBaseUrl(baseUrl: string): string {
 	return baseUrl.replace(/\/+$/, "");
 }
 
+/**
+ * Wait until a daily-limit `resetAt` (the relay's next 00:00 UTC). That is never
+ * more than a day away, whatever this device's clock says: a slow clock would
+ * otherwise wait days, a fast one gets null (the caller's default backoff).
+ */
+export function dailyResetDelayMs(resetAtMs: number, nowMs: number): number | null {
+	const d = resetAtMs - nowMs;
+	return d > 0 ? Math.min(d, 86_400_000) : null;
+}
+
 /** Retry-After (delta-seconds or HTTP-date) in ms; null when absent or unparseable. */
 export function parseRetryAfter(value: string | null, nowMs: number): number | null {
 	if (value === null) return null;
@@ -127,7 +137,7 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 		const code = body !== null && typeof body["error"] === "string" ? body["error"] : null;
 		let retryAfterMs = parseRetryAfter(res.headers.get("retry-after"), now());
 		if (retryAfterMs === null && code === "cf_daily_limit" && body !== null && typeof body["resetAt"] === "number") {
-			retryAfterMs = Math.max(0, body["resetAt"] - now());
+			retryAfterMs = dailyResetDelayMs(body["resetAt"], now());
 		}
 		return { status: res.status, body, code, retryAfterMs };
 	}

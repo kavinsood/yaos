@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { base64ToBytes, bytesToBase64, createRelayHttp, parseRetryAfter, RelayHttpError } from "./relayHttp";
+import { base64ToBytes, bytesToBase64, createRelayHttp, dailyResetDelayMs, parseRetryAfter, RelayHttpError } from "./relayHttp";
 import { fakeFetch, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
 
 const TOKEN = "device-token-SECRET-abc123";
@@ -33,6 +33,13 @@ describe("relayHttp helpers", () => {
 		assert.equal(parseRetryAfter("Mon, 05 Oct 2026 00:00:30 GMT", now), 30_000);
 		assert.equal(parseRetryAfter("Mon, 04 Oct 2026 00:00:30 GMT", now), 0);
 		assert.equal(parseRetryAfter("soon", now), null);
+	});
+
+	it("dailyResetDelayMs: at most a day whatever the device clock says; null when already past", () => {
+		const reset = Date.parse("2026-10-06T00:00:00Z");
+		assert.equal(dailyResetDelayMs(reset, reset - 60_000), 60_000);
+		assert.equal(dailyResetDelayMs(reset, reset - 3 * 86_400_000), 86_400_000, "slow clock");
+		assert.equal(dailyResetDelayMs(reset, reset + 5_000), null, "fast clock");
 	});
 
 	it("base64 round-trips binary and large inputs", () => {

@@ -35,7 +35,7 @@ import type {
 } from "../../ports/relay";
 import type { Unsubscribe } from "../../ports/common";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
-import { createRelayHttp, normalizeBaseUrl, type ConnectFailureReason, type RelayHttp } from "./relayHttp";
+import { createRelayHttp, dailyResetDelayMs, normalizeBaseUrl, type ConnectFailureReason, type RelayHttp } from "./relayHttp";
 import {
 	decodeServerFrame,
 	encodeAppend,
@@ -465,7 +465,7 @@ class WsRelaySession implements RelaySession {
 					: control.code === "cf_daily_limit" ? "daily-limit" : null;
 				if (reason === null || control.stream === null) return;
 				const retryAfterMs = reason === "daily-limit" && control.resetAt !== null
-					? Math.max(0, control.resetAt - this.clock.now()) : null;
+					? dailyResetDelayMs(control.resetAt, this.clock.now()) : null;
 				for (const id of control.clientFrameIds) {
 					this.emit({
 						t: "refused",
