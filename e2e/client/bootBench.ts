@@ -97,6 +97,11 @@ function analyze(tr: BootTrace, rtt: number, filesMs: number, cleanMs: number) {
 		disk: { writes: writes.at(-1)?.writes ?? 0, first: writes[0] ? r1(writes[0].t) : null, last: writes.at(-1) ? r1(writes.at(-1)!.t) : null },
 		liveAt: live ? r1(live.t) : null,
 		filesMs: r1(filesMs), cleanMs: r1(cleanMs), filesRtts: rt(filesMs),
+		/** Each read request: [startMs, ms, streams, bytes]; progress every ~250 ms: [t, readsDone, diskWrites, streamsInFlight]. */
+		timeline: {
+			reads: reads.map((e) => [r1(e.startMs), r1(e.ms), e.streams, e.bytes]),
+			progress: tr.samples.filter((s, i) => i % 50 === 0).map((s) => [r1(s.t), s.readsDone, s.writes, s.reads]),
+		},
 	};
 }
 
@@ -144,7 +149,8 @@ try {
 		const res = analyze(tr, rtt.relayRequestMs, filesMs, cleanMs);
 		R.extra[`boot ${k + 1}`] = res;
 		R.check("fresh device has every file", f.vault.snapshot().size === files, { files: f.vault.snapshot().size, expected: files });
-		console.log(JSON.stringify(res));
+		const { timeline: _t, ...brief } = res;
+		console.log(JSON.stringify(brief));
 		await f.stop();
 		await sleep(500);
 	}
