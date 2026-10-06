@@ -202,6 +202,9 @@ bound to the vaultId only. *Why:* an epoch means only "the stream space was repl
   buffer, head cache and dedupe index are discarded and streams sockets close 1001. Devices stay enrolled.
 - Cost: one row per stream row (§6.2). A daily-limit hit rolls the transaction back → `503 cf_daily_limit`. P3
   measures DROP+CREATE billing on workerd and uses it if it is cheaper.
+  - *Measured (P3a, local workerd, `cursor.rowsWritten`):* DROP+CREATE bills a constant 7 rows (0 per DROP, 2 per
+    CREATE TABLE, 1 per CREATE INDEX). Not adopted: DROP fails with SQLITE_LOCKED while any read cursor on the
+    table is open, and an early-exited `for…of` keeps one open until GC. Reset stays DELETE at H+S+C+1.
 - *Test:* T-RESET.
 
 **D8b restore (approved 2026-10-06; operator-only, cold path).** `POST /operator/vaults/:id/restore {"at": ISO8601}` → `200
@@ -308,6 +311,10 @@ Index:
   The 5M budget allows ≈ 76.9k cold scans/day; a realistic load (200 wakes × 10 hot streams) is ≈ 130k rows/day (2.6%).
 - **CPU.** 200k tiny rows can exceed 10 ms. Parse keys only; P3 measures the cold scan. If it is still over,
   chunk the scan and gate that stream's commits on it.
+  - *Measured (P3a, Node):* the worst case (4 MiB of 25 B rows, 168,467 rows) parses in 15.7 ms median, so the
+    fallback is built. Steps are 16,384 rows (median 1.2–1.35 ms, p95 ≤ 4.4 ms), and the window read is charged
+    one step unit per 256 B. Local workerd agrees (≈ 15 ms full parse, ≈ 2 ms per step); production CPU is
+    measured in P5.
 - **Memory bound.** The minimum row is 21 B (seq 1, deviceId 1+16, cfid 1+1, len 1), so one stream holds
   ≤ 199,728 entries, about 12 MB at about 60 B/entry (typical 250 B rows: ≤ 17k entries, about 1 MB). DO-wide cap:
   262,144 entries (about 16 MB), by LRU eviction of whole streams; an evicted stream rescans (≤ 65 rows).
@@ -401,7 +408,9 @@ New §5.4 "Dedupe scope":
 > Duplicates are detected in the pending buffer (vault-wide by `(deviceId, clientFrameId)`, comparing stream and
 > bytes) and against every committed row among the newest 4 MiB (stored row bytes) of the stream. Outside that
 > window a resend is appended again with a new seq. The window covers more than one burst plus one max payload
-> plus one commit batch, so every resend this section requires is deduped.
+> plus one commit batch, so every resend this section requires is deduped. The window is kept in memory only. A
+> stream's first append in a runtime builds it in chunks, and that stream's frames wait in the pending buffer
+> until it is installed: their receipts come later, and none is lost.
 
 New §8 "What survives":
 
@@ -633,6 +642,20 @@ P2 and P4 gap calls (accepted; marked `DECISIONS-GAP` in code). G7 is closed: ro
 - G26 The console generates the recovery key in the page and sends `/claim` only after "I have saved it" is ticked.
 - G27 The entry module (`worker.ts`) exports only the fetch handler and the DO classes: workerd treats every named
   export as an entrypoint and refuses to start on a constant. The route table is `router.ts`; a WB test guards it.
+P3a gap calls (accepted; marked `DECISIONS-GAP` in code):
+
+- G28 The daily-limit up-front refusal uses the last classified kind.
+- G29 H2 build steps are 16,384 rows; the window read is charged one unit per 256 B.
+- G30 Cold builds run one at a time, in queue order (a cold stream can wait behind a large build).
+- G31 Build steps run once per incoming message and once per timer flush. A forced flush builds inline; a failed
+  flush fails the frames it held.
+- G32 The per-device rate bucket survives reconnects and is deleted only on revoke.
+- G33 While a stream is gated, seq order across streams can differ from arrival order; per stream it is kept.
+- O10 (accepted risk) Timer-driven build steps share the CPU budget of the last incoming message, since only
+  requests and messages reset it (DO limits page). One message and then silence on a worst-case stream runs
+  ≈ 10 steps (≈ 13 ms) in one window, over Free's 10 ms; the platform tolerates infrequent overruns ("built-in
+  flexibility", Workers limits page). A vault-DO alarm per step would give each a fresh budget; add it only if
+  P5 shows `exceededCpu`.
 - O9 (open) Revoke under the D8 daily latch: the device DELETE fails, so nothing changes; the device keeps its
   read access until the reset (≤ 24 h). Kept: shutting the gate in memory only would not survive eviction. Today
   the operator sees `500 internal_error` (router.ts maps every failed vault RPC to 500); P3 maps a daily-limit
