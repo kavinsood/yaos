@@ -1,0 +1,39 @@
+src/engine/compose/diagnosticsBundle.test.ts
+  s_42fec8a9c03dda::t_cc97cf72b4c452 1-75
+src/engine/compose/diagnosticsBundle.ts
+  s_42fec8a9c03dda::t_59cbc3f44262f7 1-96
+src/engine/compose/runtimeOps.ts
+  s_42fec8a9c03dda::t_5c7010d624cff3 14,134,146,149,151-152,158-159,161-162
+src/engine/compose/snapshotCommands.test.ts
+  s_42fec8a9c03dda::t_0552a4cd057f34 2-3,96,104-117
+src/host/ui/commands.test.ts
+  s_42fec8a9c03dda::t_cd9ef19318441d 24,32
+src/host/ui/commands.ts
+  s_42fec8a9c03dda::t_06e371b1ea6951 14,34
+src/host/ui/diagnostics.test.ts
+  s_42fec8a9c03dda::t_ace7bae8616044 3,6,82,85-94,101-103,124,127-128,148-180
+src/host/ui/diagnostics.ts
+  s_42fec8a9c03dda::t_7e62b8a19a6823 6-8,11,45-75,77-78,81-85,87,90-96,108-111,113,115,117,121,123-124,145-146
+src/host/ui/registerUi.ts
+  s_42fec8a9c03dda::t_24812004a34cdb 16-17,94,98,117,127-130
+src/protocol/messages.ts
+  s_42fec8a9c03dda::t_cc9e0a0b417301 175-176
+src/protocol/status.ts
+  s_42fec8a9c03dda::t_767d2af715cacf 60,64-72,76,78-82,84,86-87,89-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5d42e55d636ebb87e0fda45868f682b809206bf6",
+  "prompts": {},
+  "sessions": {
+    "s_42fec8a9c03dda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab7f16ac97bca1a6d",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
