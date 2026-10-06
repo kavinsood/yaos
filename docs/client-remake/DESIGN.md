@@ -1639,7 +1639,7 @@ interface RelayPort { connect(params: { vaultId: VaultId; deviceId: DeviceId }):
 
 // index.ts — bundles
 interface EnginePorts { relay; storage; clock; random; crypto; hash; blob: BlobPort | null }
-interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; random; hash }
+interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; random }   // no hash: main never hashes (§d.2)
 ```
 
 - **Not a port: `HashOracle`** (host/hashOracle.ts). The host's only hashing entry point:

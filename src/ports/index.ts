@@ -52,5 +52,5 @@ export interface HostPorts {
 	readonly platform: PlatformPort;
 	readonly clock: ClockPort;
 	readonly random: RandomPort;
-	readonly hash: HashPort;
+	// No HashPort: main never hashes (DESIGN §d.2, §f.2); the vault's fingerprints come from the engine's HashOracle.
 }
