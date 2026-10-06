@@ -128,7 +128,7 @@ export class YaosSettingTab extends PluginSettingTab {
 		const syncItems: SettingGroupItem[] = [
 			{
 				name: "Excluded paths",
-				desc: "One path prefix per line, for example templates/ or private/. Files whose path starts with a listed prefix are not synced. The config folder and .trash are always excluded.",
+				desc: "One pattern per line, matched against the whole path from the vault root (case-sensitive). A line ending in / excludes that folder, e.g. templates/. Otherwise * and ? match within one file or folder name and ** matches across folders, e.g. Archive/*.pdf or **.tmp. A pattern that matches a folder also excludes everything inside it. The config folder and .trash are always excluded.",
 				control: {
 					type: "textarea",
 					key: "excludePatterns",
