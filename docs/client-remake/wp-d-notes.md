@@ -65,7 +65,7 @@ Branch `client-remake-wp-d`. Scope: DESIGN §k.3 WP-D. Status of the acceptance 
   - areas;
   - type-only imports;
   - browser globals only in adapters and stand-ins;
-  - no WASM and no `legacy-src`;
+  - no WASM and nothing outside `src/` (the old-client rule went with the old client);
   - `sim/**` only from tests.
   - Stand-in imports are warnings. Today there is one: `host/plugin.ts` imports `engine/__standins__/engine`.
 - **Sim** (`src/sim/**`):
