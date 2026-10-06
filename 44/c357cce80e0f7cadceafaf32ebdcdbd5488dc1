@@ -1,0 +1,55 @@
+server/src/config/config.ts
+  s_8232c28df410e4::t_c3c9858a9def48 4-5,7,12-17,20,22-31,63-67
+server/src/config/host.ts
+  s_8232c28df410e4::t_d475c47e3eb2f2 10,45,73-74,76,80,166-177
+server/src/config/restore.ts
+  s_b3140f40764683::t_97dd427fb11173 1-269
+server/src/hex.ts
+  s_b3140f40764683::t_60e2f290638add 25-32
+server/src/router.ts
+  s_b3140f40764683::t_b1936d241c1273 10,47-55,161-166,173,187-188,367-369,376-377,386-387,391,403,407-435,545,548,554-556,558-560,563,565-590,592-604,618-662,668
+server/src/vault/vault.ts
+  s_b3140f40764683::t_061beced4da32a 6-15,37-45,82-101
+tests/server/blobs.ts
+  s_b3140f40764683::t_8b74aa4e257118 1-202
+tests/server/helpers/fakePitr.ts
+  s_b3140f40764683::t_2875f2d4c7c556 1-97
+tests/server/helpers/operatorWorld.ts
+  s_b3140f40764683::t_9fcfeeb40e0fb8 1-126
+tests/server/helpers/workerHarness.ts
+  s_b3140f40764683::t_93fb55a8a351ad 3-5,12,17,21,124-139,148-161,171-172,175-179,197-232,241-242,250-258,272-277,279,281,302-312,315,317,319-329,333,336,350,358-361,363,366,397-442
+tests/server/hotpath.ts
+  s_b3140f40764683::t_5d11ea6dd16d3b 1-2,5-7,13,43,89-103,106,120-121,123
+tests/server/operator.ts
+  s_b3140f40764683::t_74a340aeac0a3c 11,13-25,263-265,289,320-324
+tests/server/reset.ts
+  s_b3140f40764683::t_ac2c5efb2c9818 1-266
+tests/server/vault-host.ts
+  s_b3140f40764683::t_3ad706528b3e72 168-169,197-198,213-216
+tests/server/worker-router.ts
+  s_b3140f40764683::t_a54cccd69d2324 10,58,161,168,189-193,195-196,388,412,416-424,435-436
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "44c357cce80e0f7cadceafaf32ebdcdbd5488dc1",
+  "prompts": {},
+  "sessions": {
+    "s_8232c28df410e4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a65d2a43c0bfc9176",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_b3140f40764683": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab5b9c0ddb9ea6151",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
