@@ -1,0 +1,19 @@
+docs/client-remake/integration-notes.md
+  s_b3140f40764683::t_7940d71084dcfe 183-188,211-215,249-261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cb3118427055c4847a1397f85eb8537d484cb2f2",
+  "prompts": {},
+  "sessions": {
+    "s_b3140f40764683": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab5b9c0ddb9ea6151",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
