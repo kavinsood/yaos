@@ -10,6 +10,8 @@
  *                                          write the current CRDT text over D
  *                                          (precondition hash D), T_synced, drop
  *   - otherwise (step 5 done / user edit) -> drop (the next merge converges)
+ * conflict-copy of a canvas (subjectHash = logical canvas hash of D): same
+ *   rules, step 5 writes the CRDT projection (canvasDoc.projectCanvasBytes).
  * keep-both-blob (subjectHash = local blob hash that was copied):
  *   - copy == subject and original == subject -> fetch + overwrite, T_synced, drop
  *     (download unavailable: keep the intent and retry next pass)
@@ -18,19 +20,22 @@
  */
 
 import type { ContentHash, DiskFingerprint, DocId, VaultPath } from "../../core/types";
+import { kindOfPath } from "../../core/types";
+import { canvasToMergeText } from "../../core/hash/canvasCanonical";
 import { canonicalizeMarkdown, markdownContentHash } from "../../core/hash/markdownLf";
 import { utf8Decode } from "../../core/hash/utf8";
 import type { VaultStat } from "../../ports/vault";
 import type { IntentRecord } from "../store/schema";
 import { fetchAndWrite } from "./blobJobs";
+import { projectCanvasBytes } from "./canvasDoc";
 import { writeOk, type Env } from "./diskJobs";
 import { hashBytes, MAX_TEXT_FILE_BYTES } from "./localState";
 import { makeBase } from "./store";
 
 interface Seen { readonly hash: ContentHash; readonly fingerprint: DiskFingerprint; readonly bytes: Uint8Array; readonly stat: VaultStat }
 
-async function hashAt(env: Env, path: VaultPath, kind: "markdown" | "blob"): Promise<Seen | null> {
-	const max = kind === "markdown" ? MAX_TEXT_FILE_BYTES : env.ctx.classifySettings.maxBlobBytes;
+async function hashAt(env: Env, path: VaultPath, kind: "markdown" | "canvas" | "blob"): Promise<Seen | null> {
+	const max = kind === "blob" ? env.ctx.classifySettings.maxBlobBytes : MAX_TEXT_FILE_BYTES;
 	const r = await env.ctx.read(env.ctx.diskPathOf(path), max);
 	if (!r.ok) return null;
 	const h = hashBytes(kind, r.bytes);
@@ -91,6 +96,54 @@ async function resumeConflictCopy(env: Env, i: IntentRecord, docId: DocId, from:
 	}
 }
 
+async function resumeCanvasCopy(env: Env, i: IntentRecord, docId: DocId, from: VaultPath, to: VaultPath, subject: ContentHash): Promise<boolean> {
+	const { ctx } = env;
+	const copy = await hashAt(env, to, "canvas");
+	const orig = await hashAt(env, from, "canvas");
+	const h = copy?.hash === subject && orig?.hash === subject ? await ctx.log.acquireBody(docId, "canvas") : null;
+	if (!h || !copy || !orig) {
+		await drop(env, i);
+		return true;
+	}
+	try {
+		const p = projectCanvasBytes(h.doc);
+		if (!p.ok) {
+			await drop(env, i); // the next merge reports canvas-invalid
+			return true;
+		}
+		const version = h.version();
+		let stat = orig.stat;
+		let fingerprint = orig.fingerprint;
+		let hash = orig.hash;
+		if (p.hash !== subject) {
+			const path = ctx.diskPathOf(from);
+			const res = await ctx.exec({ t: "write", area: "vault", path, data: { t: "text", text: p.text }, precondition: { t: "hash", hash: subject }, docId, purpose: "merge" });
+			const out = writeOk(res);
+			if (!out) {
+				env.scan.markDirty(path, null);
+				await drop(env, i);
+				return true;
+			}
+			ctx.echo.expectWrite(ctx.pk(from), out.stat.size, out.stat.mtimeMs);
+			stat = out.stat;
+			fingerprint = out.fingerprint;
+			hash = p.hash;
+		}
+		const base = makeBase(docId, canvasToMergeText(p.ranked));
+		const s = ctx.record({
+			docId, path: from, pathKey: ctx.pk(from), kind: "canvas", contentHash: hash, fingerprint, size: stat.size, mtimeMs: stat.mtimeMs,
+			bodyVersion: version, blobRev: 0, nsTouchSeq: ctx.touchSeq(docId), hasBase: base !== null,
+		});
+		await ctx.commit(
+			{ syncedPut: [s], basePut: base ? [base] : [], baseDrop: base ? [] : [docId], intentDrop: [i.id] },
+			[ctx.localEntry(from, stat, "canvas", hash, fingerprint), ctx.localEntry(to, copy.stat, "canvas", copy.hash, copy.fingerprint)],
+		);
+		return true;
+	} finally {
+		h.release();
+	}
+}
+
 async function resumeKeepBoth(env: Env, i: IntentRecord, docId: DocId, from: VaultPath, to: VaultPath, subject: ContentHash): Promise<boolean> {
 	const r = env.ctx.log.view().remote.get(docId);
 	const copy = await hashAt(env, to, "blob");
@@ -118,7 +171,8 @@ export async function resumeIntents(env: Env): Promise<number> {
 			continue;
 		}
 		let done = true;
-		if (i.kind === "conflict-copy") done = await resumeConflictCopy(env, i, docId, fromPath, toPath, subjectHash);
+		if (i.kind === "conflict-copy" && kindOfPath(fromPath) === "canvas") done = await resumeCanvasCopy(env, i, docId, fromPath, toPath, subjectHash);
+		else if (i.kind === "conflict-copy") done = await resumeConflictCopy(env, i, docId, fromPath, toPath, subjectHash);
 		else if (i.kind === "keep-both-blob") done = await resumeKeepBoth(env, i, docId, fromPath, toPath, subjectHash);
 		else await drop(env, i);
 		if (!done) open++;
