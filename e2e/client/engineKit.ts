@@ -142,6 +142,7 @@ export class Device {
 			clientVersion: "wpc-e2e",
 			sideFiles: this.side,
 			tuning,
+			e2ee: { suite: 0 },
 			onDocUpdate: (id, u) => {
 				const d = this.hosts.get(id);
 				if (!d) return;

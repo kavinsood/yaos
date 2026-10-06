@@ -3,7 +3,7 @@
  * defaults are the DESIGN values.
  */
 
-import { BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, type Budgets, type DeviceClass } from "../../core/limits";
+import { BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
 import type { DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { SideFilePort } from "../../ports/vault";
@@ -12,6 +12,7 @@ import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import { DEFAULT_CHECKPOINT_TUNING, type CheckpointTuning } from "../body/checkpoints";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import { NS_CANDIDATE_MODULUS, type FoldedNsFrame } from "../sync/nsRuntime";
+import type { EngineE2ee } from "../keyring/keyringRuntime";
 
 export interface EngineTuning {
 	/** Local compaction trigger (DESIGN §d.8). */
@@ -45,6 +46,9 @@ export interface EngineTuning {
 	readonly maxCheckpointStateBytes: number;
 	/** appendBlobChunks gives up (false) after this long without every receipt. */
 	readonly blobAppendTimeoutMs: number;
+	/** Roll trigger (e2ee-design §4.2); tests shrink them. */
+	readonly rollSeqSpan: number;
+	readonly rollOwnSeals: number;
 }
 
 export const DEFAULT_TUNING: EngineTuning = {
@@ -68,6 +72,8 @@ export const DEFAULT_TUNING: EngineTuning = {
 	nsCandidateModulus: NS_CANDIDATE_MODULUS,
 	maxCheckpointStateBytes: 32 * 1024 * 1024,
 	blobAppendTimeoutMs: 120_000,
+	rollSeqSpan: ROLL_SEQ_SPAN,
+	rollOwnSeals: ROLL_OWN_SEALS,
 };
 
 /** Where an update forwarded to the host came from. */
@@ -79,6 +85,11 @@ export interface EngineOptions {
 	readonly deviceId: DeviceId;
 	readonly deviceClass?: DeviceClass;
 	readonly clientVersion: string;
+	/**
+	 * The suite pin and keyring inputs (e2ee-design §12.4, §18.4). Required, with no default: an absent pin is
+	 * `{suite: null}` (unpinned: reads `k` only, writes nothing), never suite 0.
+	 */
+	readonly e2ee: EngineE2ee;
 	/** Known epoch: open the DB before connecting (offline start). Without it the first connect decides. */
 	readonly vaultEpoch?: VaultEpoch;
 	/** Outbox mirror (DESIGN §e.4); null/absent = no mirror. */

@@ -8,7 +8,7 @@ export function buildStatus(c: EngineCtx): StatusSnapshot {
 	let quarantinedRows = 0;
 	let frozenDocs = 0;
 	for (const r of c.repo.streams()) {
-		if (r.stale && r.cls !== "other" && r.cls !== "keyring") staleStreams++;
+		if (r.stale && r.cls !== "other") staleStreams++;
 		quarantinedRows += r.quarantinedRows;
 		if (r.frozen) frozenDocs++;
 	}
@@ -49,5 +49,6 @@ export function buildStatus(c: EngineCtx): StatusSnapshot {
 		dailyFramesUsed: c.daily.day === c.day() ? c.daily.frames : 0,
 		maxBlobBytes: null,
 		notices: c.noticeList(),
+		e2ee: c.keyring.status(),
 	};
 }

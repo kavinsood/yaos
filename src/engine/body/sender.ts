@@ -36,6 +36,8 @@ export interface SenderDeps {
 	onForbidden(): void;
 	/** waitMs: the hold; retryAfterMs: the relay's delay to its reset, null when it did not say. */
 	onDailyLimit(waitMs: number, retryAfterMs: number | null): void;
+	/** The engine's write gate is shut (key-missing, e2ee-design §9.3): the outbox is held, nothing is sent. */
+	writeBlocked(): boolean;
 	diag(code: string, fields: Record<string, string | number | boolean | null>): void;
 }
 
@@ -94,7 +96,6 @@ export class Sender {
 	private timerAt = Infinity;
 	private dirty = true;
 	private sorted: Entry[] = [];
-	paused = false;
 	readonly bucket: TokenBucket;
 	stats = { appends: 0, bytes: 0, poisoned: 0 };
 
@@ -300,7 +301,7 @@ export class Sender {
 
 	pump(): void {
 		const s = this.session;
-		if (!s || this.readOnly || this.paused) return;
+		if (!s || this.readOnly || this.deps.writeBlocked()) return;
 		const now = this.deps.clock.monotonic();
 		if (now < this.holdUntilMono) {
 			this.schedule(this.holdUntilMono - now);

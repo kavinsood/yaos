@@ -10,7 +10,7 @@ import { CFG_STREAM, NS_STREAM, streamClass, streamDocId, type ClientFrameId, ty
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
-import type { DiagnosticsEvent, EnginePhase, StatusSnapshot } from "../../protocol/status";
+import type { DiagnosticsEvent, EnginePhase, KeyMissingReason, StatusSnapshot } from "../../protocol/status";
 import { CheckpointState, type CheckpointDeps } from "../body/checkpoints";
 import { DailyLimitNoticeGate } from "./dailyLimit";
 import type { FrameCtx } from "../body/frames";
@@ -22,6 +22,8 @@ import type { Mut, Repo } from "../store/repo";
 import type { OutboxRecord } from "../store/schema";
 import type { CatchUpDeps } from "../sync/catchUp";
 import type { CfgRuntime } from "../sync/cfgRuntime";
+import type { KeyringRuntime } from "../keyring/keyringRuntime";
+import { assertWritable, gatedBlob, gatedCrypto } from "../keyring/writeGate";
 import type { NsRuntime } from "../sync/nsRuntime";
 import type { DocRuntime } from "./docRuntime";
 import type { LiveIngest } from "./liveIngest";
@@ -61,6 +63,8 @@ export class EngineCtx {
 	live!: LiveIngest;
 	sess!: SessionLoop;
 	mirror!: MirrorWriter;
+	/** Opened right after the repo, before anything can seal (e2ee-design §12.4). */
+	keyring!: KeyringRuntime;
 
 	phase: EnginePhase = "starting";
 	session: RelaySession | null = null;
@@ -88,6 +92,7 @@ export class EngineCtx {
 	private readonly notices: Notice[] = [];
 	private readonly ring: DiagnosticsEvent[] = [];
 	private statusTimer: TimerHandle | null = null;
+	readonly gate: () => KeyMissingReason | null;
 
 	constructor(readonly opts: EngineOptions) {
 		this.ports = opts.ports;
@@ -96,6 +101,9 @@ export class EngineCtx {
 		this.budgets = resolveBudgets(this.deviceClass, opts.budgets);
 		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes };
 		const c = this;
+		// The one write gate (writeGate.ts): shut until the keyring is open, then whenever it reports key-missing.
+		const gate = (): KeyMissingReason | null => (c.keyring ? c.keyring.keyMissing() : "no-pin");
+		this.gate = gate;
 		this.deps = {
 			get repo() {
 				return c.repo;
@@ -105,9 +113,9 @@ export class EngineCtx {
 			nowMs: () => c.now(),
 			gateCtx: this.gateCtx,
 			hash: opts.ports.hash,
-			crypto: opts.ports.crypto,
+			crypto: gatedCrypto(opts.ports.crypto, gate, () => c.keyring?.noteSeal()),
 			random: opts.ports.random,
-			blob: opts.ports.blob,
+			blob: gatedBlob(opts.ports.blob, gate),
 			self: opts.deviceId,
 			vaultId: opts.vaultId,
 			adoptFor: (d, f) => c.adoptFor(d, f),
@@ -167,6 +175,17 @@ export class EngineCtx {
 		this.diag("phase", { from: this.phase, to: p });
 		this.phase = p;
 		this.scheduleStatus();
+	}
+
+	/** The phase of a caught-up session: key-missing while the write gate is shut (e2ee-design §9.3). */
+	livePhase(): EnginePhase {
+		if (this.gate() !== null) return "key-missing";
+		return this.dailyLimitUntilMono > this.mono() ? "daily-limit" : "live";
+	}
+
+	/** Host write entry points: refuse up front while the gate is shut (the seal would refuse anyway). */
+	assertWritable(): void {
+		assertWritable(this.gate);
 	}
 
 	onForbidden(): void {
@@ -327,7 +346,7 @@ export class EngineCtx {
 		if (!this.opts.onStatus || this.statusTimer !== null || this.stopped) return;
 		this.statusTimer = this.ports.clock.setTimer(this.tuning.statusIntervalMs, () => {
 			this.statusTimer = null;
-			if (this.repo) this.opts.onStatus?.(this.status());
+			if (this.repo && this.keyring) this.opts.onStatus?.(this.status());
 		});
 	}
 	clearStatusTimer(): void {

@@ -15,6 +15,11 @@ export type ProtocolErrorCode =
 	| "revoked"
 	| "aborted"
 	| "timeout"
+	/**
+	 * A key or pin command the device's state does not allow (e2ee-design §12.4, §18.4): not on the creation path,
+	 * `k` not empty, already pinned, or an E3-owned command this engine does not implement yet. Not retryable.
+	 */
+	| "refused"
 	| "internal";
 
 export interface ProtocolError {

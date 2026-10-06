@@ -92,7 +92,7 @@ export class SimNet {
 		let error: string | null = null;
 		const started = LogEngine.start({
 			ports: { relay: this.port(deviceId), storage, clock: this.clock, random: new SeededRandom(hashLabel(deviceId)), crypto: createNoopCrypto(hash), hash, blob: null },
-			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-oracle", sideFiles: null, autoReconnect: true,
+			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-oracle", sideFiles: null, autoReconnect: true, e2ee: { suite: 0 },
 		}).then((e) => (engine = e), (e) => (error = `oracle start: ${e instanceof Error ? e.message : String(e)}`));
 		await this.clock.runUntil(() => engine !== null || error !== null, horizonMs);
 		await started;

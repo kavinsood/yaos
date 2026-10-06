@@ -94,6 +94,7 @@ function mainTrace(): MainToEngine[] {
 				configDir: ".obsidian",
 				caseInsensitiveFs: true,
 				relay: { url: "https://relay.invalid", credential: "secret" },
+				crypto: { suite: 1, keys: [{ e: 1, k: bytes(7, 7) }, { e: 2, k: bytes(8, 8) }], records: [bytes(1, 1), bytes(2, 2)] },
 				settings: {
 					excludePatterns: ["tmp/**"],
 					syncAttachments: true,
@@ -116,6 +117,10 @@ function mainTrace(): MainToEngine[] {
 		{ t: "result", re: 3, value: { t: "sideFile", bytes: null } },
 		{ t: "boundSaved", docId: D1, path: "a.md", text: "hello\n", fingerprint: "ff" as DiskFingerprint, stat: { path: "a.md", size: 6, mtimeMs: 9, ctimeMs: 1 } },
 		{ t: "docCredit", bytes: 3 },
+		{ t: "command", rid: 5, command: { t: "installKey", source: "qr", e: 3, k: bytes(3, 3) } },
+		{ t: "command", rid: 6, command: { t: "installKey", source: "rk", rk: bytes(4, 4) } },
+		{ t: "command", rid: 7, command: { t: "enableE2ee", rk: bytes(5, 5) } },
+		{ t: "command", rid: 8, command: { t: "revokeRekey", rk: bytes(6, 6) } },
 		{ t: "lifecycle", event: "pagehide" },
 		{ t: "error", re: 4, error: { code: "timeout", message: "t", retryable: true } },
 	];
@@ -139,6 +144,7 @@ function engineTrace(): EngineToMain[] {
 			],
 		},
 		{ t: "sideFileWrite", rid: 3, name: "outbox-a.bin", bytes: bytes(8, 8, 8, 8) },
+		{ t: "keyringChanged", rid: 4, keys: [{ e: 2, k: bytes(2, 2) }], records: [bytes(1), bytes(2)], pending: 2 },
 		{ t: "docRetarget", docId: D1, change: { t: "renamed", path: "z.md" } },
 		{ t: "notice", level: "warn", code: "c", message: "m" },
 	];

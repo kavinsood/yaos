@@ -70,7 +70,7 @@ test("worker entry answers ping before init, inits on IndexedDB and accepts obse
 	const pong = await waitFor((m) => m.t === "result" && m.re === 1);
 	assert.deepEqual(pong.t === "result" && pong.value, { t: "pong" });
 	const config = await buildInitConfig({
-		identity: { vaultId: "v" as VaultId, deviceId: "d" as DeviceId, deviceLabel: "test", relay: { url: "wss://x", credential: "c" } },
+		identity: { vaultId: "v" as VaultId, deviceId: "d" as DeviceId, deviceLabel: "test", relay: { url: "wss://x", credential: "c" }, crypto: { suite: 0 } },
 		platform: { os: "linux", isMobile: false, isTablet: false, hardwareConcurrency: 4, deviceMemoryGiB: null, workerSupported: true },
 		carrier: "worker", workerSupported: true, configDir: ".obsidian", caseInsensitiveFs: false, settings: SIM_SETTINGS, side: new SimSideFiles(),
 	});

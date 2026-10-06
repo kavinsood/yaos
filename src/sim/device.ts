@@ -177,7 +177,7 @@ export class SimDevice {
 
 	private makeRuntime(): HostRuntime {
 		return this.runtimeFor(
-			{ vaultId: SIM_VAULT_ID, deviceId: this.deviceId, deviceLabel: this.opts.name, relay: { url: "sim://relay", credential: "sim" } },
+			{ vaultId: SIM_VAULT_ID, deviceId: this.deviceId, deviceLabel: this.opts.name, relay: { url: "sim://relay", credential: "sim" }, crypto: { suite: 0 } },
 			this.opts.settings ?? (() => SIM_SETTINGS),
 			{
 				onStatus: (s) => this.ui.statuses.push(s),

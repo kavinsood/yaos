@@ -83,13 +83,14 @@ const RANK: Record<string, number> = { [BOUND]: 0, [NS_STREAM]: 1, [CFG_STREAM]:
 function mk(maxInflight = 10 * 1024 * 1024) {
 	const clock = new FakeClock();
 	const ev = { sent: [] as [string, number][], poison: [] as [string, string][], forbidden: 0, daily: [] as number[], diag: [] as string[] };
+	const gate = { blocked: false };
 	const sender = new Sender({
 		clock, rankOf: (r) => RANK[r.stream] ?? 3, maxInflightBytes: () => maxInflight,
 		onSent: (r, a) => ev.sent.push([r.clientFrameId, a]), onPoison: (r, why) => ev.poison.push([r.clientFrameId, why]),
-		onForbidden: () => ev.forbidden++, onDailyLimit: (ms) => ev.daily.push(ms), diag: (c) => ev.diag.push(c),
+		onForbidden: () => ev.forbidden++, onDailyLimit: (ms) => ev.daily.push(ms), writeBlocked: () => gate.blocked, diag: (c) => ev.diag.push(c),
 	});
 	const add = (...rs: OutboxRecord[]) => { for (const r of rs) sender.upsert(r); clock.advance(0); return rs; };
-	return { clock, ev, sender, add };
+	return { clock, ev, sender, add, gate };
 }
 
 test("sender: lane rank then outbox order; ns waits for openNs; resend replays in the same order", () => {
@@ -283,7 +284,7 @@ test("sender: probe mode after 1008/1009 -- one frame in flight, a repeat close 
 });
 
 test("sender: backpressure holds 5 s and halves the rate; pause; upsert replace / non-sendable state removes", () => {
-	const { sender, add, clock } = mk();
+	const { sender, add, clock, gate } = mk();
 	const s = new FakeSession();
 	sender.attach(s);
 	sender.onBackpressure();
@@ -294,12 +295,12 @@ test("sender: backpressure holds 5 s and halves the rate; pause; upsert replace 
 	clock.advance(1);
 	assert.equal(s.appends.length, 1);
 
-	sender.paused = true;
+	gate.blocked = true;
 	const [p] = add(rec(BOUND, 10));
 	clock.advance(1_000);
 	assert.equal(s.appends.length, 1);
 	sender.upsert({ ...p!, sealed: new Uint8Array(20) });
-	sender.paused = false;
+	gate.blocked = false;
 	sender.pump();
 	assert.equal(s.appends.length, 2);
 	assert.equal(s.appends[1]!.payload.length, 20, "the replaced record is what goes out");

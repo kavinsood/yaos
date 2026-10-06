@@ -8,8 +8,12 @@
  *  - own committed rows with an outbox record are receipts (another socket of
  *    this device, or an R7 re-notice);
  *  - overflow (> liveQueueMaxBytes / liveQueueMaxRows): payloads of streams
- *    that are not resident body docs (and not ns/cfg) are dropped, the rows
+ *    that are not resident body docs (and not k/ns/cfg) are dropped, the rows
  *    become T_stale items and the stream is read later;
+ *  - `k` rows go to the keyring after the batch is stored; a receipt for an
+ *    own `k` append is stored as the row it stands for (keyringRuntime.ts);
+ *  - while the keyring allows reading only `k` (e2ee-design §12.4), every
+ *    other row becomes a T_stale item and provisionals are dropped;
  *  - a failed tLive drops the batch: its seqs stay unaccounted and the gap
  *    feed / reads recover them.
  *
@@ -77,7 +81,7 @@ export class LiveIngest {
 		this.stats.overflows++;
 		const keep = (stream: StreamName) => {
 			const cls = streamClass(stream);
-			return cls === "ns" || cls === "cfg" || ((cls === "body" || cls === "canvas") && this.c.handles.isResident(stream));
+			return cls === "keyring" || cls === "ns" || cls === "cfg" || ((cls === "body" || cls === "canvas") && this.c.handles.isResident(stream));
 		};
 		const next: QueuedEvent[] = [];
 		let bytes = 0;
@@ -121,7 +125,7 @@ export class LiveIngest {
 			const first = this.q[0]!;
 			if (first.t === "provisional") {
 				this.shift();
-				if (!this.hasQueuedCommit(first.deviceId, first.clientFrameId)) await this.c.docs.onProvisional(first);
+				if (!this.c.keyring.readsOnlyK() && !this.hasQueuedCommit(first.deviceId, first.clientFrameId)) await this.c.docs.onProvisional(first);
 				continue;
 			}
 			if (first.t === "provisionalDropped") {
@@ -146,7 +150,13 @@ export class LiveIngest {
 		let stale = 0;
 		let receipts = 0;
 		const now = c.now();
+		const onlyK = c.keyring.readsOnlyK();
 		for (const ev of batch) {
+			const kr = ev.t === "receipt" ? c.keyring.receiptRow(ev) : null;
+			if (kr) {
+				items.push({ t: "row", row: kr, settleAdoptable: null });
+				continue;
+			}
 			if (ev.t === "receipt") {
 				items.push({ t: "receipt", stream: ev.stream, clientFrameId: ev.clientFrameId, seq: ev.seq });
 				skipApply.add(ev.seq);
@@ -161,7 +171,7 @@ export class LiveIngest {
 				receipts++;
 				continue;
 			}
-			if (f.payload === null) {
+			if (f.payload === null || (onlyK && streamClass(f.stream) !== "keyring")) {
 				items.push({ t: "stale", stream: f.stream, seq: f.seq });
 				stale++;
 				continue;
@@ -188,6 +198,7 @@ export class LiveIngest {
 		if (receipts > 0) c.countReceipts(receipts);
 		c.lastSyncedAtMs = c.now();
 		c.applyOutboxResult(res);
+		await c.keyring.ingestRows(res.tailPut);
 		await c.docs.applyRows(res.tailPut.filter((r) => !skipApply.has(r.seq)));
 		c.noteBodyChange(res.tailPut.filter((r) => r.deviceId !== c.self || !skipApply.has(r.seq)).map((r) => r.stream));
 		if (res.removed.length > 0 || res.tailPut.some((r) => r.stream === NS_STREAM)) await c.afterNsChange();

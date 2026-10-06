@@ -38,7 +38,8 @@ export function hostNotice(level: "info" | "warn" | "error", code: string, messa
 
 export function hostIdentityOf(id: PairedIdentity, deviceLabel: string): HostIdentity {
 	// SECRET: relay.credential is the device token. Never log the result.
-	return { vaultId: id.vaultId as VaultId, deviceId: id.deviceId as DeviceId, deviceLabel, relay: { url: id.host, credential: id.deviceToken } };
+	// No pin is stored yet (WP-E4 adds the data.json e2ee field): unpinned, which reads `k` and writes nothing (e2ee-design §12.4).
+	return { vaultId: id.vaultId as VaultId, deviceId: id.deviceId as DeviceId, deviceLabel, relay: { url: id.host, credential: id.deviceToken }, crypto: { suite: null, creating: false } };
 }
 
 function safeMessage(e: unknown): string {

@@ -18,7 +18,7 @@ import type { KeyRange, StorageDb, StoragePort, StorageTx } from "../../ports/st
 import { CursorTracker } from "../sync/cursor";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
-	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaOutboxOrder, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
+	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaKeyring, type MetaOutboxOrder, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
 	type SnapshotRecord, type StreamRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
@@ -55,6 +55,7 @@ export type PriorityFn = (rec: StreamRecord) => number;
 
 export function defaultPriority(rec: Pick<StreamRecord, "cls">): number {
 	switch (rec.cls) {
+		case "keyring": return -100; // read first: keys are verified before anything is opened (e2ee-design §9.3)
 		case "ns": return 0;
 		case "cfg": return 1;
 		case "body": case "canvas": return 100;
@@ -274,8 +275,14 @@ export class Repo {
 		return this.db.tx([STORE.streams], "readonly", (tx) =>
 			tx.getAllByIndex(STORE.streams, INDEX.streamsByStale, { lower: [1, -MAXK], upper: [1, MAXK] }, limit));
 	}
-	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "frameNoFloor">(key: K) {
+	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "frameNoFloor" | "keyring">(key: K) {
 		return this.db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, key));
+	}
+	/** MetaKeyring (e2ee-design §18.3): keyring diagnostics and the lazy own-seal count. No key bytes. */
+	putKeyringMeta(m: MetaKeyring): Promise<void> {
+		return this.serial("putKeyringMeta", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
+			tx.put(STORE.meta, m);
+		}));
 	}
 
 	// -------------------------------------------------------------------------
@@ -450,7 +457,7 @@ export class Repo {
 			const v = await this.db.tx([STORE.streams, STORE.meta], "readwrite", async (tx) => {
 				for (const e of entries) {
 					const ec = streamClass(e.stream);
-					if (ec === "other" || ec === "keyring") continue; // keyring: WP-E3
+					if (ec === "other") continue;
 					const r: Mut<StreamRecord> = { ...((await tx.get(STORE.streams, e.stream)) ?? newStreamRecord(e.stream, nowMs)) };
 					if (e.lastSeq <= r.remoteHeadSeq && this.cache.has(e.stream)) continue;
 					r.remoteHeadSeq = Math.max(r.remoteHeadSeq, e.lastSeq);

@@ -72,7 +72,20 @@ export interface MetaRelayCheckpointDuty {
 	/** Streams this device authored the latest row of (candidate writer duty). */
 	readonly streams: readonly StreamName[];
 }
-export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor;
+/**
+ * Keyring diagnostics and the roll counter (e2ee-design §18.3). No key bytes: keys and records live in the
+ * host's SecretStorage (§6.1); this is derived from them and from `k`.
+ */
+export interface MetaKeyring {
+	readonly key: "keyring";
+	readonly sealEpoch: number;
+	readonly epochs: readonly { readonly e: number; readonly firstSeq: Seq | null; readonly kind: number; readonly verified: boolean }[];
+	readonly revokeEpoch: number | null;
+	readonly sRot: Seq | null;
+	/** Own seals under sealEpoch (the §4.2 roll trigger). */
+	readonly ownSeals: number;
+}
+export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------
@@ -135,7 +148,8 @@ export interface TailRecord {
 	readonly seq: Seq;
 	readonly deviceId: DeviceId;
 	readonly clientFrameId: ClientFrameId;
-	readonly kind: EnvelopeKind;
+	/** "keyRecord": a `k` row; content is the raw record (no envelope, e2ee-design §11), empty if over 256 B. */
+	readonly kind: EnvelopeKind | "keyRecord";
 	readonly authorNsSeq: Seq;
 	readonly flags: number;
 	/** Inner frameNo (e2ee-design §8.2): ≥ 1 for ns / cfg frames, else 0 (also for gate-failed rows). */

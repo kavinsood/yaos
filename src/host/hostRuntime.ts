@@ -18,7 +18,7 @@ import type { EngineResultValue, EngineSettings, HostIoOp, HostIoResult, MainRes
 import type { StatusSnapshot } from "../protocol/status";
 import { BindingManager } from "./binding";
 import { DiskExecutor } from "./diskExecutor";
-import { EngineHost, type CarrierKind, type EngineCarrier, type EngineEventMessage, type EngineRequestMessage } from "./engineHost";
+import { EngineHost, HostRequestError, type CarrierKind, type EngineCarrier, type EngineEventMessage, type EngineRequestMessage } from "./engineHost";
 import type { Hasher } from "./hashing";
 import { VaultEventBatcher, buildInitConfig, deviceClassFor, observationChunks, type HostIdentity } from "./runtimeSupport";
 
@@ -263,6 +263,10 @@ export class HostRuntime {
 				return { t: "sideFile", bytes: await this.deps.sideFiles.read(m.name) };
 			case "hostIo":
 				return { t: "hostIo", result: await this.hostIo(m.op) };
+			case "keyringChanged":
+				// Nothing stores keys yet (WP-E4: src/host/keys): failing keeps the engine from using them (§18.4 persist-before-use).
+				for (const x of m.keys) x.k.fill(0);
+				throw new HostRequestError({ code: "refused", message: "this build cannot store encryption keys", retryable: false });
 		}
 	}
 

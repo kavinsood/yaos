@@ -35,6 +35,8 @@ export interface HostIdentity {
 	readonly deviceLabel: string;
 	/** SECRET credential inside: never log this object. */
 	readonly relay: { readonly url: string; readonly credential: string };
+	/** The data.json suite pin and stored keys (e2ee-design §12.4, §18.4). SECRET keys inside. */
+	readonly crypto: EngineInitConfig["crypto"];
 }
 
 const SIDE_A_B: { outbox: [SideFileName, SideFileName]; synced: [SideFileName, SideFileName] } = {
@@ -78,6 +80,7 @@ export async function buildInitConfig(input: {
 		configDir: input.configDir,
 		caseInsensitiveFs: input.caseInsensitiveFs,
 		relay: { url: input.identity.relay.url, credential: input.identity.relay.credential },
+		crypto: input.identity.crypto,
 		settings: input.settings,
 		sideState: { outboxMirror: [oa, ob], syncedMirror: [sa, sb] },
 	};

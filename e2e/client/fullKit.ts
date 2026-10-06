@@ -245,7 +245,7 @@ export class FullClient {
 		return new HostRuntime({
 			clock: this.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
 			workspace: this.workspace, platform: this.platform, hasher: this.hasher,
-			identity: { vaultId: o.vaultId as VaultId, deviceId: o.device.deviceId as DeviceId, deviceLabel: o.name, relay: { url: o.host, credential: o.device.deviceToken } },
+			identity: { vaultId: o.vaultId as VaultId, deviceId: o.device.deviceId as DeviceId, deviceLabel: o.name, relay: { url: o.host, credential: o.device.deviceToken }, crypto: { suite: 0 } },
 			settings: () => ({ ...DEFAULT_ENGINE_SETTINGS, syncSettings: true, ...o.settings }),
 			createWorker: () => null,
 			createInline: () => this.carrier(),

@@ -6,6 +6,8 @@
  *  - ns/cfg deterministic failure           -> tail row with empty content (folds as an empty frame)
  *  - ns/cfg reader-dependent failure        -> tail row flagged LOCAL_FLAG_UNOPENED, content = raw payload (halts the fold)
  *  - body/canvas/x failure                  -> quarantine record
+ *  - k row                                  -> tail row "keyRecord", content = the raw record (no envelope;
+ *                                              judged by the keyring, e2ee-design §11.3)
  *  - unknown stream class                   -> accounted only
  */
 
@@ -15,6 +17,7 @@ import type { HashPort } from "../../ports/crypto";
 import { gate, type GateCtx } from "../ingest/gate";
 import type { QuarantineRecord, TailRecord } from "../store/schema";
 import { bytesToHex } from "../../core/codec/lib0";
+import { KEY_RECORD_MAX_BYTES } from "../keyring/record";
 import { LOCAL_FLAG_UNOPENED } from "./nsRuntime";
 
 export interface RowInput {
@@ -32,7 +35,8 @@ export type GatedRow =
 
 export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, nowMs: number): Promise<GatedRow> {
 	const cls = streamClass(input.stream);
-	if (cls === "other" || cls === "keyring") return { t: "account" };
+	if (cls === "other") return { t: "account" };
+	if (cls === "keyring") return { t: "row", row: keyRecordRow(input) };
 	const g = await gate(ctx, { t: "row", ...input });
 	const base = { stream: input.stream, seq: input.seq, deviceId: input.deviceId, clientFrameId: input.clientFrameId };
 	if (g.ok) {
@@ -56,6 +60,12 @@ export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, now
 		return { t: "row", row: { ...base, kind, authorNsSeq: 0, flags: 0, frameNo: 0, content: new Uint8Array(0) } };
 	}
 	return { t: "quarantine", rec: await quarantineRecord(hash, input, g.reason, g.detail, nowMs) };
+}
+
+/** A `k` row as stored: over-long payloads are kept empty (garbage either way, §11.1). */
+export function keyRecordRow(input: Omit<RowInput, "stream"> & { readonly stream: StreamName }): TailRecord {
+	const content = input.payload.length <= KEY_RECORD_MAX_BYTES ? input.payload : new Uint8Array(0);
+	return { stream: input.stream, seq: input.seq, deviceId: input.deviceId, clientFrameId: input.clientFrameId, kind: "keyRecord", authorNsSeq: 0, flags: 0, frameNo: 0, content };
 }
 
 export async function quarantineRecord(hash: HashPort, input: RowInput, reason: QuarantineRecord["reason"], detail: string, nowMs: number): Promise<QuarantineRecord> {

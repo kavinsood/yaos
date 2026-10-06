@@ -94,10 +94,14 @@ export class DocRuntime {
 		});
 	}
 
-	/** Close the open frame: take it now (order), seal + T_edit on the chain. */
+	/**
+	 * Close the open frame: take it now (order), seal + T_edit on the chain. While the write gate is shut
+	 * (e2ee-design §9.3) the edits stay in the builder; keyringRuntime closes the frame when the gate opens.
+	 */
 	closeFrame(h: Handle): Promise<void> {
 		if (h.timer !== null) this.c.ports.clock.clearTimer(h.timer);
 		h.timer = null;
+		if (this.c.gate() !== null) return this.chain(async () => undefined);
 		const taken = h.builder.take();
 		if (!taken) return this.chain(async () => undefined);
 		h.pins++;

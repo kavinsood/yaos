@@ -61,6 +61,22 @@ export function transferablesOf(message: MainToEngine | EngineToMain): ArrayBuff
 			const s = message.config.sideState;
 			s.outboxMirror.forEach((b, i) => b && add(out, seen, b, `init.sideState.outboxMirror[${i}]`));
 			s.syncedMirror.forEach((b, i) => b && add(out, seen, b, `init.sideState.syncedMirror[${i}]`));
+			// SECRET keys: main keeps no copy (e2ee-design §6.3).
+			const c = message.config.crypto;
+			if (c.suite === 1) {
+				c.keys.forEach((x, i) => add(out, seen, x.k, `init.crypto.keys[${i}].k`));
+				c.records.forEach((b, i) => add(out, seen, b, `init.crypto.records[${i}]`));
+			}
+			break;
+		}
+		case "keyringChanged":
+			message.keys.forEach((x, i) => add(out, seen, x.k, `keyringChanged.keys[${i}].k`));
+			message.records.forEach((b, i) => add(out, seen, b, `keyringChanged.records[${i}]`));
+			break;
+		case "command": {
+			const c = message.command;
+			if (c.t === "enableE2ee" || c.t === "revokeRekey" || (c.t === "installKey" && c.source === "rk")) add(out, seen, c.rk, `command.${c.t}.rk`);
+			else if (c.t === "installKey") add(out, seen, c.k, "command.installKey.k");
 			break;
 		}
 		case "localUpdate":

@@ -1,8 +1,10 @@
 /**
  * Session lifecycle (DESIGN §d.7 "Reconnect", §i.6): connect -> epoch check ->
  * sender.attach (bodies resend at once) -> feed to the session head -> live
- * queue on -> ns/cfg reads (late receipts) -> ns window open -> held release ->
- * live; then stale streams are read with bounded concurrency.
+ * queue on -> `k` read (e2ee-design §9.3: keys first) -> ns/cfg reads (late
+ * receipts) -> ns window open -> held release -> live; then stale streams are
+ * read with bounded concurrency. A device that may read only `k` (§12.4: no
+ * pin, or a vault its pin cannot read) stops after the `k` read in key-missing.
  *
  * Catch-up reads are batched when the relay has the batch form (limits.readBatchStreams > 1): one request reads
  * the first page of up to readBatchStreams stale streams under one readPageBytes budget, and each served stream
@@ -15,7 +17,7 @@
  */
 
 import { RELAY_CLOSE } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, streamClass, type Seq, type StreamName } from "../../core/types";
+import { CFG_STREAM, KEYRING_STREAM, NS_STREAM, streamClass, type Seq, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import type { ReadPage, ReadRequest, RelayConnectResult, RelayEvent, RelaySession } from "../../ports/relay";
 import { readStream, staleOrder, type ReadResult } from "../sync/catchUp";
@@ -137,13 +139,23 @@ export class SessionLoop {
 			await this.feedTo(gen, session.headSeq);
 			if (gen !== c.gen) return;
 			c.live.enable();
+			if (c.repo.stream(KEYRING_STREAM)?.stale) await this.runRead(KEYRING_STREAM);
+			if (gen !== c.gen) return;
+			if (c.repo.stream(KEYRING_STREAM)?.stale) throw new Error("k not read to head");
+			await c.keyring.afterKRead(gen, session.headSeq);
+			if (gen !== c.gen) return;
+			if (c.keyring.readsOnlyK()) {
+				c.setPhase("key-missing");
+				this.st = newReconnectState();
+				return;
+			}
 			await this.readInOrder([NS_STREAM, CFG_STREAM].filter((s) => c.repo.stream(s)?.stale));
 			if (gen !== c.gen) return;
 			c.sender.openNs();
 			await c.afterNsChange();
 			await c.afterCfgChange();
 			if (gen !== c.gen) return;
-			c.setPhase(c.dailyLimitUntilMono > c.mono() ? "daily-limit" : "live");
+			c.setPhase(c.livePhase());
 			this.st = newReconnectState();
 			// Reader-dependent quarantine is retried on every session start (new keys / version, §d.6).
 			await retryReaderQuarantine(c).catch((e) => c.diag("quarantine-retry-failed", { error: String(e) }));
@@ -211,6 +223,7 @@ export class SessionLoop {
 				return;
 			case "refused":
 				c.diag("frame-refused", { reason: ev.reason });
+				if (c.keyring.onRefused(ev)) return;
 				c.sender.onRefused(ev.clientFrameId, ev.reason, ev.retryAfterMs);
 				return;
 			case "resendUnreceipted":
@@ -239,6 +252,7 @@ export class SessionLoop {
 		this.unsub = null;
 		c.session = null;
 		c.sender.onClosed(ev.code);
+		c.keyring.onClosed();
 		c.live.disable();
 		c.lastCloseCode = ev.code;
 		c.diag("session-closed", { code: ev.code, errorCode: ev.errorCode, wasClean: ev.wasClean });
@@ -299,7 +313,7 @@ export class SessionLoop {
 		this.stats.readBatches++;
 		const reqs: ReadRequest[] = streams.map((stream) => {
 			const afterSeq = c.repo.stream(stream)?.appliedSeq ?? 0;
-			return { stream, afterSeq, preferCheckpoint: afterSeq === 0 };
+			return { stream, afterSeq, preferCheckpoint: afterSeq === 0 && streamClass(stream) !== "keyring" };
 		});
 		const batch = s.readBatch(reqs).catch((e: unknown): null => {
 			this.stats.readFailures++;
@@ -383,12 +397,16 @@ export class SessionLoop {
 		} else if (cls === "ns") await c.afterNsChange(res.replacedFold);
 		else if (cls === "cfg") await c.afterCfgChange(res.replacedFold);
 		else if (cls === "blobchunk" && res.tailPut.length > 0) await c.docs.retryRefs();
+		else if (cls === "keyring") await c.keyring.ingestRows(res.tailPut, true);
 		if (cls !== "ns" && res.removed.length > 0) await c.afterNsChange();
 		if (res.rows > 0 || res.t === "done") c.lastSyncedAtMs = c.now();
 		c.scheduleStatus();
 	}
 
-	/** Start reads for stale streams, bound docs first: up to catchUpConcurrency lanes, batched when the relay can. */
+	/**
+	 * Start reads for stale streams, bound docs first: up to catchUpConcurrency lanes, batched when the relay can.
+	 * Only `k` while the keyring says this device may read nothing else (§12.4).
+	 */
 	scheduleCatchUp(): void {
 		const c = this.c;
 		const s = c.session;
@@ -396,8 +414,9 @@ export class SessionLoop {
 		let slots = c.budgets.catchUpConcurrency - this.lanes;
 		if (slots <= 0) return;
 		const now = c.mono();
+		const onlyK = c.keyring.readsOnlyK();
 		const order = staleOrder(c.repo.streams(), (r) => c.repo.priorityFn(r), (r) =>
-			this.reads.has(r.stream) || r.cls === "other" || r.cls === "keyring" || (r.frozen === 1 && r.frozenReason === "checkpoint-disputed") || (this.readBackoff.get(r.stream) ?? 0) > now);
+			this.reads.has(r.stream) || r.cls === "other" || (onlyK && r.cls !== "keyring") || (r.frozen === 1 && r.frozenReason === "checkpoint-disputed") || (this.readBackoff.get(r.stream) ?? 0) > now);
 		const per = this.batching(s);
 		for (let i = 0; slots > 0 && i < order.length; slots--) {
 			const group = order.slice(i, i + per).map((r) => r.stream);

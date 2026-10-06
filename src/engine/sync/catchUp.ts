@@ -94,10 +94,11 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	const result = (t: ReadResult["t"], error?: string): ReadResult => ({
 		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, apply, tailPut, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
 	});
-	if (cls === "other" || cls === "keyring") return result("done");
+	if (cls === "other") return result("done");
 	const start = repo.stream(stream);
 	let after = opts.fromSeq ?? start?.appliedSeq ?? 0;
-	let preferCheckpoint = after === 0;
+	// `k` has no checkpoints (e2ee-design §18.3): every record is read.
+	let preferCheckpoint = after === 0 && cls !== "keyring";
 	let disputedRetry = false;
 	let first = opts.first && opts.first.afterSeq === after && opts.first.preferCheckpoint === preferCheckpoint ? opts.first.page : null;
 	for (;;) {
@@ -112,7 +113,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 		if (!opts.stillValid()) return result("aborted");
 		pages++;
 		let freshSnapshot: SnapshotRecord | null = null;
-		const ck = page.checkpoint;
+		const ck = cls === "keyring" ? null : page.checkpoint;
 		const rec = repo.stream(stream);
 		if (ck && ck.coversSeq > (rec?.snapshotCoversSeq ?? 0)) {
 			const disputedBefore = rec !== undefined && rec.disputedCheckpointCoversSeq === ck.coversSeq;
