@@ -230,7 +230,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   delete waits while the deleter's own body frames are unsequenced, so a body
   record stuck in the outbox (poisoned) holds that delete until it is resolved.
 - Divergence (V3 digest) is not implemented; `divergence` is always false.
-- `conflictCopiesToday` is always 0 and bootstrap progress is null in status.
+- Bootstrap progress is null in status. `conflictCopiesToday` (0db3bb7) is
+  kept in memory: it restarts at 0 with the engine and does not count copies
+  made from an open editor.
 - A job-level overwrite rejected through `rejectBrake` is not persisted; the
   brake comes back on the next pass. Planner-held ops are handled.
 - Collapse noise: a third device can materialize a suffixed loser
@@ -272,6 +274,21 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - The host hashes canvas files only for write preconditions (the engine owns
   every other hash).
 - The engine is duplicated in the main bundle (D2).
+
+**Legacy parity** (the full map is legacy-parity.md)
+- Device and member management (roster, revoke, rename, invite a person,
+  ownership transfer, leave) lives only in the server's operator console. The
+  plugin pairs this device and creates pairing codes for your other devices.
+- A snapshot uploaded to attachment storage cannot be restored on another
+  device: cross-device restore is out of scope for v1 (§j.4).
+- Settings sync: while `cfgBase` is empty, a pass waits until this runtime has
+  read the cfg stream to the relay head (the log reached `live`, 66c8a4c). A
+  device that never reaches `live` never runs its first settings pass.
+- Lifecycle (4a14c02): on desktop and tablet `hidden` only flushes and keeps
+  the socket (an occluded desktop window also reports hidden). The hidden
+  state is not carried across an engine restart.
+- The daily-limit popup (once per reset window) forgets that it was shown
+  when the engine restarts.
 
 **Tests and sim**
 - Token survival (`vaultTokens`) is checked against device A's vault only
