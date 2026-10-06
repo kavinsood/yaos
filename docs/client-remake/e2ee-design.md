@@ -21,13 +21,15 @@ of scope (DECISIONS §1 removes them server-side too). §2.4 lists what this des
   - **keyEpoch** (this document) vs **vaultEpoch** (the relay generation, DESIGN §c.12). They are independent.
   - **RK**: the recovery key (§13). **k**: the keyring stream (§11).
   - **S_rot**: the seq at which a revoke-kind keyring record committed (§14).
+  - **decision Dn** is a decision for the user (§22). **DECISIONS Dn** is a server decision in
+    `docs/server-rewrite/DECISIONS.md`. **An** is a server ask (§19).
 
 Contents: [1](#1-summary) summary · [2](#2-threat-model) threat model · [3](#3-platform-facts) platform facts ·
 [4](#4-cipher) cipher · [5](#5-key-hierarchy) keys · [6](#6-key-storage) storage · [7](#7-envelope-v2-aad-and-padding)
 envelope · [8](#8-replay-and-reorder) replay · [9](#9-what-is-sealed-and-open-failures) failures ·
 [10](#10-blobs) blobs · [11](#11-keyring-stream-k) keyring · [12](#12-pairing) pairing · [13](#13-recovery-key)
 recovery · [14](#14-rotation-and-revocation) rotation · [15](#15-enable-migrate-disable) enable/migrate ·
-[16](#16-performance-budget) performance · [17](#17-lost-server-features) lost features ·
+[16](#16-performance-budget) performance · [17](#17-lost-server-features-and-client-replacements) lost features ·
 [18](#18-shape-changes-and-design-diffs) shape changes · [19](#19-asks-for-the-server-rewrite) server asks ·
 [20](#20-test-plan) tests · [21](#21-work-packages) work packages · [22](#22-decisions-for-the-user) decisions ·
 [23](#23-spike-verified-vs-needs-a-device) spike · [24](#24-references) references.
@@ -1252,3 +1254,84 @@ Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b waits fo
 | D6 | Device names under suite 1 | (a) Keep the platform default ("iPhone") plus a "visible to the operator" hint. (b) Force a random label. (c) No change | **(a).** Neutral by default; the console still needs a usable name for revoke |
 | D7 | Migrating an existing vault, or turning encryption off | (a) A new vault, then delete the old one. (b) In place with reset-streams | **(a).** Reset keeps plaintext blobs in R2 (D9); in place saves nothing real |
 | D8 | Recovery key at revoke | (a) Ask for the existing RK, with "generate a new one" as an option. (b) Always generate a new RK | **(a).** Fewer ceremonies; (b) is offered when the RK is lost or leaked |
+
+## 23. Spike: verified vs needs a device
+
+### 23.1 How to run
+
+- Build: `node scripts/build-spike.mjs --out <path>/yaos-spike.zip`. The script smoke-checks the bundle in Node:
+  the CJS plugin loads against a stub `obsidian`, and the worker IIFE answers ping, probe and crypto inside
+  `node:vm`. It copies the zip only if every check passed.
+- The artifact for this design is `experiments/yaos-spike.zip`, sha256
+  `711d1b1b5f6e4facb474f57dcea2b115cfd99d0d0def6032573a673530046d78`. It contains `yaos-spike/main.js` (64621 B)
+  and `manifest.json`.
+- Install the `yaos-spike` folder into a **throwaway** vault's plugins directory, then run the command "Run E2EE
+  crypto probes only" (`run-e2ee`, `src/host/spike/main.ts:36`). The report modal can be copied, and the report is
+  also saved.
+- Unit tests: `npm run test:client -- spike` (`src/host/spike/cryptoProbe.test.ts` and others).
+- The spike code is commit e8503d8. It is throwaway and never ships.
+
+### 23.2 Verified
+
+| Claim | Where | Evidence |
+|---|---|---|
+| WebCrypto AES-GCM / HKDF / HMAC / `getRandomValues` inside a Blob-URL worker | Chrome 154 headless (macOS), Node 26.5, Node `vm` worker smoke | [M] |
+| KATs: GCM TC16, RFC 5869 A.1, RFC 4231 TC2 | Node, Chrome 154 | [M] |
+| Tamper, wrong AAD and wrong nonce all reject | Node, Chrome 154 | [M] `cryptoProbe.test.ts:50-59` |
+| Non-extractable import and derive; the export is refused | Node, Chrome 154 | [M] |
+| A CryptoKey in IDB survives a restart, **and its raw bytes are plaintext on disk** | Chrome 154 profile directory | [M] grep, plus [S] Chromium source (§3) |
+| WKWebView accepts a 0-byte GCM IV | macOS WKWebView harness (`capacitor://localhost`) | [M] |
+| Throughput and per-call cost | Chrome, macOS WKWebView, Node | [M] (§3, §16) |
+| @noble/ciphers XChaCha is 8–13× slower | Chrome, WKWebView | [M] |
+| `qrcode` 1.5.4 adds 9.6 KB gzip | esbuild bundle of a minimal QR-to-canvas call | [M] |
+| SecretStorage API shape; desktop safeStorage with a plaintext fallback; mobile `SecureStorage` key shared across vaults | `obsidian.d.ts`, `obsidian-1.14.4.asar` (read-only) | [S] |
+
+### 23.3 Needs a device (WP-E0)
+
+| Platform | Run | Open question |
+|---|---|---|
+| Obsidian iOS (WKWebView) | `run-e2ee` in the worker and on main | Secure context and origin; throughput vs §16; zero-IV behaviour as on macOS |
+| | SecretStorage probe | Keychain-backed? Survives app restart and update? Value size limit (try 64 KiB)? `""` accepted? Readable while the device is locked (background sync)? |
+| | Camera app scanning an `obsidian://` QR | Opens Obsidian with the parameters intact? |
+| Obsidian Android (System WebView) | Same three runs | Keystore-backed? Google Lens / camera handling of custom schemes; low-end phone throughput |
+| Obsidian desktop (Electron) macOS, Windows | `run-e2ee`, SecretStorage probe | safeStorage availability; throughput (expected ≈ Chrome) |
+| Obsidian desktop Linux, with and without a keyring | SecretStorage probe | Plaintext fallback and `msgSecretsNotEncrypted` as read in the asar |
+| Cloudflare (not a device) | Restore after `deleteAll()` | Can PITR bring back a deleted vault's rows (§15.2)? Not stated in [CF-PITR] |
+
+The Obsidian app binary was never launched for this design. Every Obsidian fact above is [S] from read-only files
+or [U].
+
+## 24. References
+
+- [GCM-spec] D. McGrew, J. Viega, "The Galois/Counter Mode of Operation (GCM)", NIST modes submission (rev. 2005),
+  Test Case 16. The canonical NIST URL has moved **[U]**. The vector is reproduced in
+  `src/host/spike/cryptoProbe.ts:64` and passes under two independent implementations.
+- [RFC5869] HKDF. https://www.rfc-editor.org/rfc/rfc5869
+- [RFC4231] HMAC-SHA-2 test vectors. https://www.rfc-editor.org/rfc/rfc4231
+- [RFC4303] IPsec ESP, anti-replay window §3.4.3. https://www.rfc-editor.org/rfc/rfc4303
+- [RFC9771] Properties of AEAD algorithms, §4.3.3. https://www.rfc-editor.org/rfc/rfc9771#section-4.3.3
+- [WebCrypto] W3C Web Cryptography API (editor's draft; section numbers as read for this design).
+  https://w3c.github.io/webcrypto/
+- [w3c-webcrypto-73] Streaming encryption, an open issue. https://github.com/w3c/webcrypto/issues/73
+- [NIST-GCM] NIST SP 800-38D (2007). https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf
+- [NIST-GCM-rev] NIST SP 800-38D Rev. 1 drafts. https://csrc.nist.gov/pubs/sp/800/38/d/r1/iprd
+- [CFRG-limits] draft-irtf-cfrg-aead-limits-13. https://www.ietf.org/archive/id/draft-irtf-cfrg-aead-limits-13.txt
+- [XChaCha-03] draft-irtf-cfrg-xchacha-03 (expired). https://www.ietf.org/archive/id/draft-irtf-cfrg-xchacha-03.txt
+- [noble] @noble/ciphers README, L366-388 and L454-515 @fe43367.
+  https://github.com/paulmillr/noble-ciphers/blob/fe4336756e8b352ea520d8bd6e8547552e352189/README.md
+- [Cure53-NBL] Cure53 audit of the noble crypto libraries. https://cure53.de/audit-report_noble-crypto-libs.pdf
+- [LGR21] Len, Grubbs, Ristenpart, "Partitioning Oracle Attacks", USENIX Security 2021.
+  https://www.usenix.org/conference/usenixsecurity21/presentation/len
+- [DGRW18] Dodis, Grubbs, Ristenpart, Woodage, "Fast Message Franking: From Invisible Salamanders to Encryptment",
+  CRYPTO 2018. https://eprint.iacr.org/2019/016
+- [ADGKLS22] Albertini, Duong, Gueron, Kölbl, Luykx, Schmieg, "How to Abuse and Fix Authenticated Encryption
+  Without Key Commitment", USENIX Security 2022. https://eprint.iacr.org/2020/1456
+- [Padmé] Nikitin, Barman, Lueks, Underwood, Hubaux, Ford, "Reducing Metadata Leakage from Encrypted Files and
+  Communication with PURBs" (Padmé, ≤ 12 % overhead, O(log log M) leakage). https://arxiv.org/abs/1806.03160
+- [CF-PITR] Cloudflare Durable Objects SQLite storage API, "PITR (Point In Time Recovery) API" (30 days; silent on
+  `deleteAll()`). https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/
+- [WebKit-177350] IndexedDB index queries with CryptoKey values. https://bugs.webkit.org/show_bug.cgi?id=177350
+- Chromium `components/webcrypto/algorithm_implementation.cc` L125-131 @39d5b374.
+  https://chromium.googlesource.com/chromium/src/+/39d5b374831be4c1e548ad822b71f3a60216a885/components/webcrypto/algorithm_implementation.cc#125
+- WebKit `SerializedCryptoKeyWrapCocoa.mm`, `WorkerGlobalScope.cpp`, `SecurityOrigin.cpp` @55d19429 (lines in §3).
+- Server: `docs/server-rewrite/DECISIONS.md` and `server/src/**` at 7208184 (lines inline).
