@@ -421,3 +421,35 @@ but no stylesheet styles them.
 | Settings textarea and callout | adfa7a7:styles.css:45-59 | MISSING | dropped: styles.css (deleted in f451274) |
 | Snapshot list and restore-selection layout | adfa7a7:styles.css:60-106 | MISSING (Setting rows, src/host/ui/snapshotsModal.ts:38, :159) | dropped: styles.css (deleted in f451274) |
 | Remote cursor styles (hidden unless "Show remote cursors") | adfa7a7:styles.css:108-163 | MISSING | dropped: DESIGN §m.2 (awareness/cursor presence) |
+
+## 18. Governance and membership
+
+The legacy plugin let owners and members govern the shared vault from Obsidian. The new plugin has none of this.
+Device removal, rename and vault destruction are in the server's operator console. "Invite person", "Leave this
+vault" and the person fields are rows in §3.4, §3.5 and §4.
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| "People and devices" roster (role, device count, online, last seen, "Refresh roster") | adfa7a7:src/settings/settingsTab.ts:890-972; adfa7a7:src/main.ts:3509 | MISSING (server operator console) | dropped: governance moved to the server operator console |
+| Revoke another device | adfa7a7:src/settings/settingsTab.ts:913-921, :1032; adfa7a7:src/main.ts:3330 | MISSING (server operator console) | dropped: governance moved to the server operator console |
+| Remove a member and all their devices | adfa7a7:src/settings/settingsTab.ts:933-937, :1042; adfa7a7:src/main.ts:3339 | MISSING | dropped: governance moved to the server operator console |
+| Ownership transfer (offer, accept, cancel) | adfa7a7:src/settings/settingsTab.ts:928-932, :950-965, :1052-1080; adfa7a7:src/main.ts:3270, :3296, :3314 | MISSING | dropped: governance moved to the server operator console |
+| "Preserved unpublished work" from an older authority | adfa7a7:src/settings/settingsTab.ts:943-949 | MISSING (no authority revisions; unsent edits stay in the outbox, DESIGN I1) | dropped: DESIGN §m.2 (semantic epochs and legacy receipts) |
+| "Rename shared vault" | adfa7a7:src/settings/settingsTab.ts:1001-1004, :1014; adfa7a7:src/main.ts:3282 | MISSING (server operator console) | dropped: governance moved to the server operator console |
+| "Request vault destruction" | adfa7a7:src/settings/settingsTab.ts:1006-1009, :1022; adfa7a7:src/main.ts:3289 | MISSING (server operator console) | dropped: governance moved to the server operator console |
+| "Security audit" history | adfa7a7:src/settings/settingsTab.ts:975-991; adfa7a7:src/main.ts:3575 | MISSING | dropped: governance moved to the server operator console |
+| Rename this person ("Your name") | adfa7a7:src/settings/settingsTab.ts:351-353; adfa7a7:src/main.ts:3349 | MISSING | dropped: governance moved to the server operator console |
+| In-plugin governance as a whole (roster, revoke, rename, invite person, transfer, leave) | the rows above and in §3.4 | MISSING | missing: large; the coordinator lists it as the remaining gap if governance is wanted inside Obsidian |
+
+## 19. Other
+
+| Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
+|---|---|---|---|
+| Safety brake on mass destructive changes | adfa7a7:src/runtime/reconcile/safetyBrakePolicy.ts:22, :25, :68 (never called outside tests; adfa7a7:src/runtime/reconciliationController.ts:514 hard-codes `safetyBrakeTriggered: false`) | src/core/plan/brake.ts:33; src/core/limits.ts:99-103; src/host/ui/brake.ts:68; src/host/ui/brakeModal.ts:9; src/host/ui/registerUi.ts:162-168 | ported (live now, DESIGN §f.5) |
+| Recovery-loop quarantines (amplification, fingerprint) | adfa7a7:src/runtime/reconcile/amplificationQuarantinePolicy.ts:29, :95; adfa7a7:src/runtime/reconcile/fingerprintQuarantinePolicy.ts:28, :104 | MISSING (bounded planner and the brake) | dropped: DESIGN §m.2 (`runtime/reconcile/*` policies) |
+| Live editor binding (y-codemirror) | adfa7a7:src/sync/editorBinding.ts:181 | src/host/binding.ts:133 | ported (DESIGN §d.2) |
+| Bind-divergence decisions (adopt body or adopt editor) | adfa7a7:src/sync/editorBinding.ts:146 | MISSING (one `MergeFn` plus a conflict copy) | dropped: DESIGN §m.2 (merge and divergence policies) |
+| No sync write into the file open in an editor | adfa7a7:src/sync/diskMirror.ts:1836 | src/host/diskExecutor.ts:16-18, :162 | ported |
+| Full-document IndexedDB persistence | adfa7a7:src/sync/vaultIndexedDb.ts:279 | MISSING (snapshot, tail and outbox stores) | dropped: DESIGN §m.2 (full-doc IDB persistence) |
+| Remote cursor presence | adfa7a7:src/sync/ownAwarenessProvider.ts:19-21, :35 | src/host/binding.ts:394 (`awareness: null`) | dropped: DESIGN §m.2 (awareness/cursor presence) |
+| Headless CLI and its builds (`build:cli`, `test:headless`, `test:cli`) | adfa7a7:package.json:12, :25, :29 | MISSING | dropped: headless CLI (packages/cli ran on the old client; e31a401, f451274) |
