@@ -1,0 +1,27 @@
+src/engine/reconcile/canvasJob.ts
+  s_3bea9f4c72a663::t_815a7e1565a84f 1-183
+src/engine/reconcile/contentSteps.ts
+  s_3bea9f4c72a663::t_2ead3758d1ca48 1-62
+src/engine/reconcile/diskJobs.ts
+  s_3bea9f4c72a663::t_83596733994a00 4,110
+src/engine/reconcile/mergeJob.ts
+  s_3bea9f4c72a663::t_bfd9b799d61832 19-21,25,30,32-33,36,39,51,54,109-112
+src/engine/reconcile/runner.ts
+  s_3bea9f4c72a663::t_aa1bc151135271 6-7,24,63-64,118-119,156-157,163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1247d1eb14913112dea2dc93e4963d09b70c5ca3",
+  "prompts": {},
+  "sessions": {
+    "s_3bea9f4c72a663": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abb05cda11fb8d171",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
