@@ -1,0 +1,27 @@
+scripts/check-deps.mjs
+  s_ab5bcc5cfffe93::t_a40bd53eb97584 98
+src/core/codec/ids.ts
+  s_ab5bcc5cfffe93::t_a8584829f441d7 5
+src/core/merge/diff3.ts
+  s_ab5bcc5cfffe93::t_118159271ac30f 2
+src/core/merge/myers.ts
+  s_ab5bcc5cfffe93::t_661ee4dc9f0beb 3
+src/host/checkDeps.test.ts
+  s_ab5bcc5cfffe93::t_16014e10c6a72f 50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a4c4679b1578b94bc15d395a998ce39d9784f687",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
