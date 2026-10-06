@@ -1,0 +1,21 @@
+README.md
+  s_ab5bcc5cfffe93::t_d369804f323582 78
+docs/operations.md
+  s_ab5bcc5cfffe93::t_2820466016e13c 224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e31a401ba6b1a0eac7c6a3ec8a3d424b62f01151",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
