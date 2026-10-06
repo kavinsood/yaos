@@ -8,7 +8,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as Y from "yjs";
 import {
-	BLOB_CHUNK_BYTES, FRAME_MAX_BYTES, FRAME_MAX_UPDATES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES, OPEN_FRAME_IDLE_MS, OPEN_FRAME_MAX_MS,
+	BLOB_CHUNK_BYTES, FRAME_MAX_BYTES, FRAME_MAX_UPDATES, MAX_FRAME_CONTENT_BYTES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES, OPEN_FRAME_IDLE_MS,
+	OPEN_FRAME_MAX_MS,
 } from "../../core/limits";
 import { blobChunkStream, type ClientFrameId, type ContentHash, type DeviceId, type Seq, type StreamName, type VaultId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
@@ -21,8 +22,12 @@ import type { Repo } from "../store/repo";
 import { bytesToHex as toHex } from "../../core/codec/lib0";
 import { encodeBodyUpdateRef as encodeBodyRef } from "../../core/codec/contents";
 import { FrameBuilder } from "./frameBuilder";
-import { FrameTooLargeError, buildBodyFrames, initialTextUpdates, splitInitialText, type FrameCtx } from "./frames";
-import { assembleChunks, resolveRefContent } from "./refs";
+import { FrameTooLargeError, buildBlobChunkFrame, buildBodyFrames, initialTextUpdates, splitInitialText, type FrameCtx } from "./frames";
+import { assembleChunks, resolveRef, resolveRefContent } from "./refs";
+import { decodeBlobChunk, encodeBlobChunk } from "../../core/codec/contents";
+import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
+import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
+import { DEFAULT_RELAY_LIMITS } from "../adapters/wsRelay";
 
 const hash = createWebHash();
 const crypto = createNoopCrypto(hash);
@@ -35,6 +40,14 @@ function textUpdate(chars: number, ch = "a"): Uint8Array {
 	const d = new Y.Doc();
 	d.getText("text").insert(0, ch.repeat(chars));
 	return Y.encodeStateAsUpdate(d);
+}
+
+/** Incompressible bytes: the frame builder treats an update as opaque, and deflate cannot shrink these. */
+function noiseBytes(n: number): Uint8Array {
+	const b = new Uint8Array(n);
+	let x = 7;
+	for (let i = 0; i < n; i++) { x = (Math.imul(x, 1103515245) + 12345) >>> 0; b[i] = x >>> 24; }
+	return b;
 }
 
 test("FrameBuilder: closes at FRAME_MAX_UPDATES and FRAME_MAX_BYTES; take merges the batch and ORs flags", () => {
@@ -207,3 +220,105 @@ test("buildBodyFrames: > MAX_LOG_BLOB_BYTES with no blob store -> FrameTooLargeE
 	const u = textUpdate(MAX_LOG_BLOB_BYTES + 1);
 	await assert.rejects(buildBodyFrames(ctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 }), FrameTooLargeError);
 });
+
+// ---- suite 1 (e2ee-design §10, WP-E6a) -------------------------------------------------------
+
+const VAULT1 = "AAAAAAAAAAAAAAAAAAAAAA" as VaultId;
+const K1 = Uint8Array.from({ length: 32 }, (_, i) => i);
+const K2 = Uint8Array.from({ length: 32 }, (_, i) => 0x20 + i);
+
+async function suite1(tag: number, o: { e2?: Uint8Array | null; verified?: readonly number[] } = {}) {
+	const random = new ScriptedRandom();
+	for (let i = 0; i < 64; i++) random.push(Uint8Array.from([tag, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+	const keys = [{ e: 1, k: K1.slice() }, ...(o.e2 === null ? [] : [{ e: 2, k: (o.e2 ?? K2).slice() }])];
+	const c = await createWebCryptoSuite1({ vaultId: VAULT1, random, keys });
+	for (const e of o.verified ?? [1, 2]) c.markVerified(e);
+	c.setSealEpoch(o.verified && !o.verified.includes(2) ? 1 : 2);
+	return c;
+}
+
+test("suite 1, log path: x: named by the blob address; full 768 KiB chunk frames seal under the 1 MiB relay frame and pass the gate", async () => {
+	const s1 = await suite1(0xe1);
+	const c1: FrameCtx = { ...ctx, vaultId: VAULT1, crypto: s1 };
+	const g1: GateCtx = { crypto: await suite1(0xe2), vaultId: VAULT1, maxCheckpointStateBytes: 1 << 20 };
+	const u = noiseBytes(3 * BLOB_CHUNK_BYTES - 1000);
+	const h = toHex(await hash.sha256(u)) as ContentHash;
+	const frames = await buildBodyFrames(c1, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });
+	const xs = blobChunkStream(await s1.blobAddress(h));
+	assert.notEqual(xs, blobChunkStream(h as unknown as BlobAddress), "never x:<sha256>");
+	assert.ok(!xs.includes(h));
+	const chunks = frames.slice(0, -1);
+	assert.equal(chunks.length, 3);
+	for (const c of chunks) {
+		assert.equal(c.stream, xs);
+		assert.ok(c.content.length <= MAX_FRAME_CONTENT_BYTES);
+		assert.ok(c.sealed.length <= DEFAULT_RELAY_LIMITS.maxFrameBytes, `${c.sealed.length}`);
+		const g = await gate(g1, { t: "row", stream: c.stream, seq: 1, deviceId: c1.self, clientFrameId: c.clientFrameId, payload: c.sealed });
+		assert.ok(g.ok && g.t === "blobchunk", JSON.stringify(g.ok ? g.t : g.reason));
+	}
+	assert.equal(decodeBlobChunk(chunks[0]!.content)!.chunk.length, BLOB_CHUNK_BYTES);
+	assert.ok(chunks[0]!.sealed.length > BLOB_CHUNK_BYTES, "a full chunk, incompressible: not shrunk by deflate");
+	// The largest chunk frame the log path makes: the 11th 768 KiB chunk of an 8 MiB blob.
+	const last = await buildBlobChunkFrame(c1, await s1.blobAddress(h), { hash: h, index: 10, total: 11, totalSize: MAX_LOG_BLOB_BYTES, chunk: noiseBytes(BLOB_CHUNK_BYTES) }, 0 as Seq, 0);
+	assert.ok(last.content.length <= MAX_FRAME_CONTENT_BYTES);
+	// Padmé bucket 49 x 16 KiB (784 KiB), plus the outer header, nonce and tag: ~240 KiB under the 1 MiB frame.
+	assert.ok(last.sealed.length > 49 * 16 * 1024 && last.sealed.length <= 49 * 16 * 1024 + 28 + 64, `${last.sealed.length}`);
+	assert.ok(last.sealed.length <= DEFAULT_RELAY_LIMITS.maxFrameBytes);
+	const ref = frames.at(-1)!;
+	const g = await gate(g1, { t: "row", stream: BODY, seq: 2, deviceId: c1.self, clientFrameId: ref.clientFrameId, payload: ref.sealed });
+	assert.ok(g.ok && g.t === "bodyRef" && g.ref.hash === h, "the ref carries the plaintext sha256 (sealed)");
+
+	// Resolution (a real Yjs update: refs check it) from the committed x: rows, on another device; a chunk with
+	// other bytes (same shape) is deterministic, a missing one is not.
+	const y = textUpdate(2 * BLOB_CHUNK_BYTES + 5000);
+	const yh = toHex(await hash.sha256(y)) as ContentHash;
+	const yChunks = (await buildBodyFrames(c1, { stream: BODY, content: y, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 })).slice(0, -1);
+	assert.equal(yChunks.length, 3);
+	const tail = yChunks.map((c, i) => ({ stream: c.stream, seq: i + 1, content: c.content }));
+	const deps = { repo: { getTail: async (st: StreamName) => tail.filter((r) => r.stream === st) } as unknown as Repo, crypto: g1.crypto, hash, blob: null };
+	const refBody = encodeBodyRef({ hash: yh, size: y.length });
+	const ok = await resolveRef(deps, BODY, refBody);
+	assert.ok(ok.ok && Buffer.compare(ok.bytes, y) === 0, JSON.stringify(ok.ok ? ok.bytes.length : ok));
+	const second = decodeBlobChunk(tail[1]!.content)!;
+	tail[1] = { ...tail[1]!, content: encodeBlobChunk({ ...second, chunk: second.chunk.map((b) => b ^ 1) }) };
+	assert.deepEqual(await resolveRef(deps, BODY, refBody), { ok: false, deterministic: true });
+	tail.splice(1, 1);
+	assert.deepEqual(await resolveRef(deps, BODY, refBody), { ok: false, deterministic: false });
+});
+
+test("suite 1, store path: ref blobs sealed at their address; tampered -> deterministic only under a verified key", async () => {
+	const objects = new Map<BlobAddress, Uint8Array>();
+	let down = false;
+	const blob: BlobPort = {
+		maxBlobBytes: 10 * 1024 * 1024,
+		has: async (as) => { if (down) throw new Error("offline"); return new Set(as.filter((a) => objects.has(a))); },
+		put: async (a, b) => void objects.set(a, b.slice()),
+		get: async (a) => { if (down) throw new Error("offline"); return objects.get(a)?.slice() ?? null; },
+	};
+	const s1 = await suite1(0xe3);
+	const u = textUpdate(MAX_INLINE_UPDATE_BYTES + 10);
+	const h = toHex(await hash.sha256(u)) as ContentHash;
+	const frames = await buildBodyFrames({ ...ctx, vaultId: VAULT1, crypto: s1, blob }, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });
+	assert.equal(frames.length, 1);
+	const addr = await s1.blobAddress(h);
+	assert.deepEqual([...objects.keys()], [addr]);
+	assert.notDeepEqual(objects.get(addr)!.subarray(0, 64), u.subarray(0, 64), "sealed");
+	const repo = { getTail: async () => [] } as unknown as Repo;
+	const at = async (c: Awaited<ReturnType<typeof suite1>>, refBody = encodeBodyRef({ hash: h, size: u.length })) => resolveRef({ repo, crypto: c, hash, blob }, BODY, refBody);
+	const reader = await suite1(0xe4);
+	const unverified = await suite1(0xe5, { verified: [1] });
+	const noK2 = await suite1(0xe6, { e2: null, verified: [1] });
+	assert.deepEqual(await at(reader), { ok: true, bytes: u });
+	assert.deepEqual(await at(reader, encodeBodyRef({ hash: h, size: u.length - 1 })), { ok: false, deterministic: true }, "bytes of the ref's hash, wrong size: the ref is bad");
+	const good = objects.get(addr)!;
+	objects.set(addr, good.map((b, i) => (i === 40 ? b ^ 1 : b)));
+	assert.deepEqual(await at(reader), { ok: false, deterministic: true }, "tampered at rest, verified key");
+	assert.deepEqual(await at(unverified), { ok: false, deterministic: false }, "unverified key: never deterministic");
+	assert.deepEqual(await at(noK2), { ok: false, deterministic: false }, "unknown key");
+	down = true;
+	assert.deepEqual(await at(reader), { ok: false, deterministic: false }, "store error");
+	down = false;
+	objects.clear();
+	assert.deepEqual(await at(reader), { ok: false, deterministic: false }, "absent everywhere");
+});
+
