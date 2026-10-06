@@ -1,0 +1,31 @@
+src/engine/runtime/catchUpBatch.test.ts
+  s_441b74abbd0702::t_c9812cb2220ae8 11-12,15-22,76-77,81,87-112
+src/engine/runtime/sessionLoop.ts
+  s_6e0df1c7504874::t_366aaf849da398 306-308,315-329
+src/sim/relay.ts
+  s_6e0df1c7504874::t_0186527b0be198 83,85-86,116-117,151-156
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ba01198a77b5ff427d75c17afafecae9a152f349",
+  "prompts": {},
+  "sessions": {
+    "s_441b74abbd0702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5b78666751a5e84f",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    },
+    "s_6e0df1c7504874": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a391b87c3ffcb4eb9",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
