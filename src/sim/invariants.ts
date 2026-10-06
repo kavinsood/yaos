@@ -5,8 +5,8 @@
  *                      every hub doc equals the disk; every markdown file has a hub doc
  *   2 tokens           every live (not user-deleted, not crash-unacknowledged) token
  *                      survives somewhere in the converged vault (conflict copies count),
- *                      matched by identity ("A.15"): a minimal diff may move a bracket,
- *                      and a concurrent token may land inside a reused prefix (tokenIdsIn).
+ *                      contiguous: "[A.15]" exactly, so a token split by a concurrent
+ *                      edit ("[A.[B.23] 53]") or missing a bracket counts as lost.
  *                      Exempt: tokens Obsidian itself overwrote (an editor save landing
  *                      before the watcher reported an external write; ClobberRecord)
  *   3 destroyed        every token that ever reached any disk is in the vault, in a
@@ -23,7 +23,7 @@
  */
 
 import type { StandinHub } from "../engine/__standins__/hub";
-import { tokenIdsIn, tokensIn, type TokenLedger } from "./actors";
+import { tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./__standins__/clock";
 import type { SimDevice } from "./device";
 
@@ -85,10 +85,10 @@ export function clobberedTokens(devs: readonly SimDevice[]): Set<string> {
 	return out;
 }
 
-/** Token identities in the converged vault (device 0; convergence is checked separately). Brackets are not required: see tokenIdsIn. */
+/** Contiguous tokens in the converged vault (device 0; convergence is checked separately). */
 function vaultTokens(devs: readonly SimDevice[]): Set<string> {
 	const out = new Set<string>();
-	for (const text of devs[0]?.vault.snapshot().values() ?? []) for (const t of tokenIdsIn(text)) out.add(t);
+	for (const text of devs[0]?.vault.snapshot().values() ?? []) for (const t of tokensIn(text)) out.add(t);
 	return out;
 }
 
@@ -101,10 +101,10 @@ export function checkTokens(devs: readonly SimDevice[], ledger: TokenLedger): Vi
 
 export function checkNothingDestroyed(devs: readonly SimDevice[], ledger: TokenLedger): Violation[] {
 	const kept = vaultTokens(devs);
-	for (const d of devs) for (const r of d.vault.trashed) for (const t of tokenIdsIn(r.text)) kept.add(t);
+	for (const d of devs) for (const r of d.vault.trashed) for (const t of tokensIn(r.text)) kept.add(t);
 	for (const t of clobberedTokens(devs)) kept.add(t);
 	// Known gap (wp-d-notes): a conflict copy still retrying a disk error dies with an app crash.
-	for (const d of devs) for (const text of d.crashLost) for (const t of tokenIdsIn(text)) kept.add(t);
+	for (const d of devs) for (const text of d.crashLost) for (const t of tokensIn(text)) kept.add(t);
 	const out: Violation[] = [];
 	const seen = new Set<string>();
 	for (const d of devs) {

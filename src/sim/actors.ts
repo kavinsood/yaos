@@ -34,42 +34,13 @@ export function tokensIn(text: string): string[] {
 	return tokenSpans(text).map((s) => s.token);
 }
 
-const TOKEN_ID_RE = /[A-Z]\.\d+(?:\.\d+)?/g;
-const WHOLE_TOKEN_RE = /\[[A-Z]\.\d+(?:\.\d+)?\]\s?/g;
-
 /**
- * Tokens by identity ("A.15" -> "[A.15]"), ignoring their brackets. Survival checks use this:
- * a disk write reaches the CRDT as a minimal diff (DESIGN §f: prefix/suffix trim), which may
- * reuse a neighbour's "[" or "]" for a new token ("[Z.1]" -> "[A.15] " diffs as "Z.1]" ->
- * "A.15] " after the shared "["); a concurrent delete of that neighbour then takes the
- * bracket with it although every character the user wrote for the new token survives.
- * The same trim may reuse more ("[A.6]" -> "[A.53] " when the engine sees a token delete
- * and an external insert as one change keeps "[A."), and a concurrent remote insert at that
- * spot lands inside the identity: "[A.[B.23] 53]". So whole tokens are peeled off and the
- * remainder is matched again, until nothing changes; every character of both tokens is there.
- * Greedy matching keeps "A.1" distinct from "A.15" and "A.12.3".
+ * A position not strictly inside any token, chosen by `pick` in [0,1). Disk
+ * writes may also land right before a token's "[" or delete a token followed
+ * by its own first character: core minimalDiff slides such edits to whole
+ * tokens (an earlier trim-based diff needed the harness to avoid them).
  */
-export function tokenIdsIn(text: string): string[] {
-	const ids = new Set<string>();
-	let cur = text;
-	for (;;) {
-		for (const m of cur.matchAll(TOKEN_ID_RE)) ids.add(`[${m[0]}]`);
-		const next = cur.replace(WHOLE_TOKEN_RE, "");
-		if (next === cur) return [...ids];
-		cur = next;
-	}
-}
-
-/**
- * A position not strictly inside any token, chosen by `pick` in [0,1).
- * With `first` (disk writes): also not right before that character. A disk
- * write reaches the CRDT as a prefix/suffix-trimmed diff; when the inserted
- * text starts with the character that follows it, the diff shifts the hunk
- * right ("[B.1] [A.2]" diffs as "B.1] [" after the first "["), and a
- * concurrent delete of the neighbour then splits the token although no typed
- * character is lost. Editor typing goes to the CRDT directly and needs no rule.
- */
-export function safePosition(text: string, pick: number, first?: string): number {
+export function safePosition(text: string, pick: number): number {
 	const spans = tokenSpans(text);
 	const ok: number[] = [];
 	let si = 0;
@@ -77,7 +48,6 @@ export function safePosition(text: string, pick: number, first?: string): number
 		while (si < spans.length && (spans[si]?.end ?? 0) <= p) si++;
 		const s = spans[si];
 		if (s && s.start < p && p < s.end) continue;
-		if (first !== undefined && text[p] === first) continue;
 		ok.push(p);
 	}
 	return ok[Math.min(ok.length - 1, Math.floor(pick * ok.length))] ?? 0;
@@ -263,7 +233,7 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 			const path = pickOf(markdownFiles(d), a.file);
 			const cur = path ? d.vault.textOf(path) : null;
 			if (!path || cur === null) return `skip ${tag}: no file`;
-			const pos = safePosition(cur, a.pos, "[");
+			const pos = safePosition(cur, a.pos);
 			w.ledger.add(token, d.name, step, `disk-${a.by}`);
 			const next = `${cur.slice(0, pos)}${token} ${cur.slice(pos)}`;
 			if (a.by === "user") d.vault.userWrite(path, next);
@@ -273,8 +243,7 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 		case "diskDeleteToken": {
 			const path = pickOf(markdownFiles(d), a.file);
 			const cur = path ? d.vault.textOf(path) : null;
-			// Same diff-shift rule as safePosition: a token followed by its own first character would be deleted shifted.
-			const s = cur !== null ? pickOf(tokenSpans(cur).filter((t) => cur[t.end] !== cur[t.start]), a.pick) : undefined;
+			const s = cur !== null ? pickOf(tokenSpans(cur), a.pick) : undefined;
 			if (!path || cur === null || !s) return `skip ${tag}: nothing to delete`;
 			const next = cur.slice(0, s.start) + cur.slice(s.end);
 			w.ledger.deleted(s.token);

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { generatePlan, minimizePlan, runSim, type SimConfig, type SimReport, type Step } from "./run";
 import { DEFAULT_FAULTS } from "./faults";
 import { checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
-import { TokenLedger, tokenIdsIn } from "./actors";
+import { TokenLedger } from "./actors";
 import { SimDevice } from "./device";
 import { StandinHub } from "../engine/__standins__/hub";
 import { VirtualClock } from "./__standins__/clock";
@@ -125,17 +125,19 @@ test("invariants: tokens Obsidian clobbered (editor save over an unseen external
 	assert.deepEqual(checkNothingDestroyed([a, b], ledger), []);
 });
 
-test("invariants: token identity survives a lost bracket; a crash-lost pending conflict copy is exempt from 'destroyed'", () => {
+test("invariants: tokens must be contiguous; a crash-lost pending conflict copy is exempt from 'destroyed'", () => {
 	const { a, b } = twoDevices();
 	const ledger = new TokenLedger();
 	ledger.add("[A.15]", "A", 15, "disk-external");
 	ledger.add("[A.1]", "A", 1, "type");
-	a.vault.userWrite("x.md", "seed A.15] \n"); // "[" went with a concurrently deleted neighbour
-	b.vault.userWrite("x.md", "seed A.15] \n");
-	assert.deepEqual(checkTokens([a, b], ledger).map((v) => v.detail), ["lost [A.1] (type on A at step 1)"], "A.15 present; A.1 is not a prefix match of A.15");
-	assert.deepEqual(tokenIdsIn("[A.[B.23] 53] \n").sort(), ["[A.53]", "[B.23]"], "a concurrent token inside a reused '[A.' prefix");
-	assert.deepEqual(tokenIdsIn("[C.[A.[B.2] 4] 1]").sort(), ["[A.4]", "[B.2]", "[C.1]"], "nested interleaving peels repeatedly");
-	assert.deepEqual(tokenIdsIn("A.1 [A.15] [A.12.3]").sort(), ["[A.12.3]", "[A.15]", "[A.1]"]);
+	ledger.add("[A.53]", "A", 53, "disk-external");
+	ledger.add("[B.23]", "B", 23, "type");
+	a.vault.userWrite("x.md", "seed A.15] [A.1]\n[A.[B.23] 53]\n"); // a lost bracket; a concurrent token inside another
+	b.vault.userWrite("x.md", "seed A.15] [A.1]\n[A.[B.23] 53]\n");
+	assert.deepEqual(checkTokens([a, b], ledger).map((v) => v.detail), [
+		"lost [A.15] (disk-external on A at step 15)",
+		"lost [A.53] (disk-external on A at step 53)",
+	], "[A.1] is not a prefix match of [A.15]; [B.23] is whole");
 	a.vault.externalWrite("y.md", "other [A.36]\n");
 	a.vault.userWrite("y.md", "other\n");
 	b.vault.userWrite("y.md", "other\n");
