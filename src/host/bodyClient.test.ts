@@ -43,16 +43,17 @@ test("DocMirror: entries apply in version order; a gap or a length mismatch is o
 test("DocMirror: markDurable keeps the text of the durable version as the restart base; history is bounded", () => {
 	const m = new DocMirror(0, T(""));
 	for (let v = 0; v < 5; v++) assert.ok(m.apply(v, v + 1, ins(v, v, String(v)), v + 1));
-	assert.ok(m.durable === null);
+	const durable = () => m.durable?.toString() ?? null; // a call: no narrowing across markDurable
+	assert.equal(durable(), null);
 	m.markDurable(2);
-	assert.equal(m.durable?.toString(), "01");
+	assert.equal(durable(), "01");
 	m.markDurable(4);
-	assert.equal(m.durable?.toString(), "0123");
+	assert.equal(durable(), "0123");
 	m.markDurable(3); // older than the base already kept: no change
-	assert.equal(m.durable?.toString(), "0123");
+	assert.equal(durable(), "0123");
 	for (let v = 5; v < 5 + MIRROR_HISTORY + 10; v++) assert.ok(m.apply(v, v + 1, ins(m.text.length, 0, "z"), m.text.length + 1));
 	m.markDurable(6); // dropped from the bounded history: the older durable base stays (safe, coarser)
-	assert.equal(m.durable?.toString(), "0123");
+	assert.equal(durable(), "0123");
 });
 
 test("ViewClient: edits before `bound` are rebased behind the bind changes, then pushed", () => {
