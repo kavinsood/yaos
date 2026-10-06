@@ -167,7 +167,7 @@ s.test("D9 exists: the first 50 entries, in order; legacy errors; a 64 KiB body 
 	});
 });
 
-s.test("A4 exists: any malformed entry, even past the first 50, is 400 invalid_address with no R2 HEAD", async () => {
+s.test("T-BLOB-EXISTS-STRICT (A4): any malformed entry, even past the first 50, is 400 invalid_address with no R2 HEAD", async () => {
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
 		world.bucket.objects.set(blobKey(vaultId, ADDRESS), new Uint8Array([1]));
@@ -222,7 +222,7 @@ s.test("D9 bearer: the vault DO checks it (one /blobs/auth call, zero config cal
 	});
 });
 
-s.test("A3 list: pages of 1000 in address order, cursor = last address, uploadedAt from R2; only this vault", async () => {
+s.test("T-BLOB-GC-LIST: pages of 1000 in address order, cursor = last address, uploadedAt from R2; only this vault", async () => {
 	assert.equal(BLOB_LIST_PAGE_SIZE, 1000, "R2's list maximum");
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
@@ -272,7 +272,7 @@ s.test("A3 list: pages of 1000 in address order, cursor = last address, uploaded
 	});
 });
 
-s.test("A3 list: a PUT stamps uploadedAt; an overwrite refreshes it", async () => {
+s.test("T-BLOB-GC-LIST: a PUT stamps uploadedAt; an overwrite refreshes it", async () => {
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
 		world.bucket.now = 5_000;
@@ -286,7 +286,7 @@ s.test("A3 list: a PUT stamps uploadedAt; an overwrite refreshes it", async () =
 	});
 });
 
-s.test("A3 delete: older → deleted; at or after the cutoff → newer (kept); missing → absent", async () => {
+s.test("T-BLOB-GC-DELETE: older → deleted; at or after the cutoff → newer (kept); missing → absent", async () => {
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
 		const older = addressOf(1);
@@ -322,7 +322,7 @@ s.test("A3 delete: older → deleted; at or after the cutoff → newer (kept); m
 	});
 });
 
-s.test("A3 sweep race: a blob re-uploaded after the sweep listed it survives the delete", async () => {
+s.test("T-BLOB-GC-RACE: a blob re-uploaded after the sweep listed it survives the delete", async () => {
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
 		world.bucket.now = 1_000;
@@ -340,7 +340,7 @@ s.test("A3 sweep race: a blob re-uploaded after the sweep listed it survives the
 	});
 });
 
-s.test("A3 refusals: bad cursor, address or ifUploadedBefore → 400 before the vault DO and R2", async () => {
+s.test("T-BLOB-GC-LIMIT (refusals): bad cursor, address or ifUploadedBefore → 400 before the vault DO and R2", async () => {
 	await withWorld(async (world) => {
 		const { vaultId, device } = await enrolled(world);
 		world.bucket.objects.set(blobKey(vaultId, ADDRESS), new Uint8Array([1]));
@@ -371,7 +371,7 @@ s.test("A3 refusals: bad cursor, address or ifUploadedBefore → 400 before the 
 	});
 });
 
-s.test("A3 bearer: one /blobs/gc-auth call, zero config calls; a stranger, another vault, no bearer or a revoked device → 401, no R2", async () => {
+s.test("T-BLOB-GC-LIMIT (bearer): one /blobs/gc-auth call, zero config calls; a stranger, another vault, no bearer or a revoked device → 401, no R2", async () => {
 	await withWorld(async (world) => {
 		const { vaultId, device, cookie } = await enrolled(world);
 		world.bucket.objects.set(blobKey(vaultId, ADDRESS), new Uint8Array([1]));
@@ -410,7 +410,7 @@ s.test("A3 bearer: one /blobs/gc-auth call, zero config calls; a stranger, anoth
 	});
 });
 
-s.test("A3 limit: 60 authenticated GC requests a minute per vault → 429 + Retry-After; strangers do not count; blob I/O is not limited", async () => {
+s.test("T-BLOB-GC-LIMIT: 60 authenticated GC requests a minute per vault → 429 + Retry-After; strangers do not count; blob I/O is not limited", async () => {
 	assert.deepEqual([BLOB_GC_REQUEST_LIMIT, BLOB_GC_WINDOW_MS], [60, 60_000]);
 	await withWorld(async (world) => {
 		const { vaultId, device, vault } = await enrolled(world);
