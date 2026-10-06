@@ -1,0 +1,43 @@
+src/engine/body/checkpoints.ts
+  s_8bc9bf3abe4a95::t_5c5ecedd4c0eba 6-9,14,20,122,184-188,191,194,197,199,202-205,208-209,211,214-215
+src/engine/body/compaction.ts
+  s_8bc9bf3abe4a95::t_33047cd3e18d4a 15,19,116-119,122-124,127-128,130-131
+src/engine/runtime/context.ts
+  s_8bc9bf3abe4a95::t_e58c5f89b3db54 9,23,56,82-83,172-174,235-240,243-269
+src/engine/runtime/docRuntime.ts
+  s_8bc9bf3abe4a95::t_3a23d99fdad658 10,107-108
+src/engine/runtime/engine.ts
+  s_8bc9bf3abe4a95::t_c33641ef73ccad 15-16,19,28-30,32,103,143-145,147-148,172,183-186,189,192-194,196-199,212-275
+src/engine/runtime/liveIngest.ts
+  s_8bc9bf3abe4a95::t_0da1245e8f9ca4 19,193
+src/engine/runtime/logApi.ts
+  s_8bc9bf3abe4a95::t_591de04a272308 1-143
+src/engine/runtime/maintenance.ts
+  s_8bc9bf3abe4a95::t_feeb75522ebc04 10-11,111,116,161-176
+src/engine/runtime/options.ts
+  s_8bc9bf3abe4a95::t_ed21b6da4bbfb4 12-13,89-96
+src/engine/runtime/sessionLoop.ts
+  s_8bc9bf3abe4a95::t_fb1f1ebe94d2b3 129,277-279
+src/engine/sync/cfgRuntime.ts
+  s_8bc9bf3abe4a95::t_8881c97b906560 1-57
+src/engine/sync/foldRuntime.ts
+  s_8bc9bf3abe4a95::t_8d0562cfd20c5f 17,72-75,82-83
+src/engine/sync/nsRuntime.ts
+  s_8bc9bf3abe4a95::t_8eae1e32e388d2 15,47-48,75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ac638d6fe9a5eae845a34a908e15202cbf3622ed",
+  "prompts": {},
+  "sessions": {
+    "s_8bc9bf3abe4a95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac019149b1d227e41",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
