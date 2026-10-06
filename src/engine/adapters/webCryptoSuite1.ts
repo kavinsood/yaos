@@ -171,9 +171,13 @@ export async function createWebCryptoSuite1(o: Suite1Options): Promise<Suite1Cry
 			if (by === null ? !rk || rk.length < KEY_BYTES : !keys.has(by)) return false;
 			const r = await gcmOpen(subtle, by === null ? await kek(rk) : await subkey(by, "wrap"), aad, wrapped);
 			if (typeof r === "string" || r.length !== KEY_BYTES) return false;
-			if (keys.get(of)?.verified) {
+			if (keys.has(of)) {
+				// A held key is never replaced: the payload must be that same key (§11.3 prevWrap rule).
+				const tmp = await importBase(subtle, r);
 				r.fill(0);
-				return true;
+				const kcvOf = (base: CryptoKey) => deriveSubkey(subtle, base, "kcv", vaultId, of).then((k) => hmac(subtle, k, hkdfInfo("kcv", vaultId, of)));
+				const [a, b] = await Promise.all([kcvOf(tmp), kcvOf(entry(of).base)]);
+				return a.every((x, i) => x === b[i]);
 			}
 			await put(of, r, { pending: false, exported: false });
 			return true;
@@ -198,7 +202,8 @@ export async function createWebCryptoSuite1(o: Suite1Options): Promise<Suite1Cry
 			const out: { e: number; k: Uint8Array }[] = [];
 			for (const e of [...keys.keys()].sort((a, b) => a - b)) {
 				const k = keys.get(e)!;
-				if (k.exported || !k.raw) continue;
+				// Never an unverified key from install/unwrap (§12.4 (i)): only verified keys and this device's pending ones.
+				if (k.exported || !k.raw || !(k.verified || k.pending)) continue;
 				out.push({ e, k: k.raw.slice() });
 				k.exported = true;
 			}
