@@ -14,7 +14,7 @@ import { randomBase64Url } from "../base64url";
 import { DailyLimitLatch, dailyLimitResponse, instrumentStorageForDailyLimit } from "../dailyLimit";
 import { bytesToHex, hexToBytes } from "../hex";
 import { bearerToken, isWebSocketUpgrade, json, notFound, rejectSocket, releaseUnreadBody } from "../http";
-import { FailureLimiter, tooManyAttempts } from "../limiter";
+import { WindowLimiter, tooManyAttempts } from "../limiter";
 import {
 	SYSTEM_CLOCK,
 	describeError,
@@ -231,7 +231,7 @@ export class VaultHost {
 	private readonly upgrades: UpgradeRejectPort;
 	private readonly ticketTtlMs: number;
 	/** D3: 20 failed enrolls a minute (unknown, expired or used code) → 429. */
-	private readonly enrollFailures: FailureLimiter;
+	private readonly enrollFailures: WindowLimiter;
 	/** undefined: not read yet in this runtime; null: never initialized ("no such table", cached per §6.1). */
 	private state: VaultState | null | undefined = undefined;
 	/** The imported HMAC key, once per runtime (D4: the key never rotates; vault delete drops it). */
@@ -253,7 +253,7 @@ export class VaultHost {
 		this.upgrades = options.upgrades;
 		this.pitr = options.pitr ?? null;
 		this.ticketTtlMs = options.ticketTtlMs ?? TICKET_TTL_MS;
-		this.enrollFailures = new FailureLimiter(ENROLL_FAILURE_LIMIT, ENROLL_FAILURE_WINDOW_MS, this.clock);
+		this.enrollFailures = new WindowLimiter(ENROLL_FAILURE_LIMIT, ENROLL_FAILURE_WINDOW_MS, this.clock);
 		this.latch = new DailyLimitLatch(() => this.clock.now());
 		this.storage = instrumentStorageForDailyLimit(options.storage, this.latch);
 		// The schema exists exactly when the vault does: init creates it, and no request path runs DDL.
@@ -582,7 +582,7 @@ export class VaultHost {
 	}
 
 	private codeFailure(status: number, error: string): Response {
-		this.enrollFailures.fail();
+		this.enrollFailures.record();
 		return json({ error }, status);
 	}
 

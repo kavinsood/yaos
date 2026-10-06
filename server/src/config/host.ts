@@ -5,7 +5,7 @@
 // Every method awaits its hashes first and then runs its reads and writes in one synchronous stretch, so two
 // interleaved requests never both pass a check made before an await.
 import { randomBase64Url } from "../base64url";
-import { FailureLimiter } from "../limiter";
+import { WindowLimiter } from "../limiter";
 import { SYSTEM_CLOCK, isMissingTableError, type ClockPort, type StoragePort } from "../ports";
 import { RestoreRunner, type RestorePorts, type RestoreResult } from "./restore";
 
@@ -69,13 +69,13 @@ export class ConfigHost {
 	/** `claimed` = the operator row exists (§6.3); once true it stays true for this object's lifetime. */
 	private claimed: boolean;
 	private readonly clock: ClockPort;
-	private readonly loginFailures: FailureLimiter;
+	private readonly loginFailures: WindowLimiter;
 	/** D8b steps and alarm (config/restore.ts); null when the caller gave no vault and alarm ports. */
 	private readonly restorer: RestoreRunner | null;
 
 	constructor(private readonly storage: StoragePort, clock: ClockPort = SYSTEM_CLOCK, restorePorts: RestorePorts | null = null) {
 		this.clock = clock;
-		this.loginFailures = new FailureLimiter(LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW_MS, clock);
+		this.loginFailures = new WindowLimiter(LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW_MS, clock);
 		this.claimed = this.probe();
 		this.restorer = restorePorts ? new RestoreRunner(storage, clock, restorePorts) : null;
 	}
@@ -115,7 +115,7 @@ export class ConfigHost {
 			? this.storage.sql.exec<{ key_hash: ArrayBuffer }>("SELECT key_hash FROM operator WHERE id = 1").toArray()[0]
 			: undefined;
 		if (!row || !equalBytes(row.key_hash, keyHash)) {
-			this.loginFailures.fail();
+			this.loginFailures.record();
 			return fail(401, "unauthorized");
 		}
 		const now = this.clock.now();

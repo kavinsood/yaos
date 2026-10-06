@@ -1,34 +1,36 @@
-// In-memory failure limiter: D3 (20 failed enrolls a minute per vault DO) and the config DO's login-failure limiter
-// (DECISIONS §2.1). Memory only: a new runtime starts with a fresh window, as both decisions accept.
+// In-memory fixed-window limiter: D3 (20 failed enrolls a minute per vault DO), the config DO's login-failure limiter
+// (DECISIONS §2.1) and the blob GC request limit (relay-wire §11.3). The caller records what counts (a failure, a
+// request). Memory only: a new runtime starts with a fresh window, as all three accept.
 import type { ClockPort } from "./ports";
 
-export class FailureLimiter {
+export class WindowLimiter {
 	private windowStart = Number.NEGATIVE_INFINITY;
-	private failures = 0;
+	private count = 0;
 
 	constructor(private readonly limit: number, private readonly windowMs: number, private readonly clock: ClockPort) {}
 
 	/** Milliseconds until the next attempt may run; 0 when it may run now. */
 	retryAfterMs(): number {
 		this.roll();
-		return this.failures >= this.limit ? Math.max(1, this.windowStart + this.windowMs - this.clock.now()) : 0;
+		return this.count >= this.limit ? Math.max(1, this.windowStart + this.windowMs - this.clock.now()) : 0;
 	}
 
-	fail(): void {
+	/** Counts one event against the current window. */
+	record(): void {
 		this.roll();
-		this.failures++;
+		this.count++;
 	}
 
 	private roll(): void {
 		const now = this.clock.now();
 		if (now >= this.windowStart + this.windowMs) {
 			this.windowStart = now;
-			this.failures = 0;
+			this.count = 0;
 		}
 	}
 }
 
-/** The 429 body both limiters answer, with `Retry-After` in whole seconds. */
+/** The 429 body every limiter answers, with `Retry-After` in whole seconds. */
 export function tooManyAttempts(retryAfterMs: number): Response {
 	return new Response(JSON.stringify({ error: "too_many_attempts" }), {
 		status: 429,
