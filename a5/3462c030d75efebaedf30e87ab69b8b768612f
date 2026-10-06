@@ -1,0 +1,21 @@
+src/engine/runtime/crash.test.ts
+  s_8bc9bf3abe4a95::t_bfe6c85b1b6d5d 19,23,43,46,75-79,81-85,101-103,113,123,125,127-128,130-133,135-137,141-145,150-151,154,157,163-164,171,176-178
+src/engine/runtime/testHarness.ts
+  s_8bc9bf3abe4a95::t_3452e9bf7a6ac2 5-12,25-26,28,91-92,95-99,104-111,113-121,128,132-134,138-164,174,186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a53462c030d75efebaedf30e87ab69b8b768612f",
+  "prompts": {},
+  "sessions": {
+    "s_8bc9bf3abe4a95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac019149b1d227e41",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
