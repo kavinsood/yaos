@@ -20,10 +20,15 @@ new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
 tag = "v2"
 new_sqlite_classes = ["RecoveryJob"]
 
-# DECISIONS §1 (fresh deploy, no data migration) and §9 P5: one migration deletes the legacy classes and their data.
+# DECISIONS §1 (fresh deploy, no data migration) and §9 P5: v3 deletes the legacy classes and their data, v4 adds the
+# new ones. Two tags because the API counts a migration's new classes before its deletions against the 500-namespace
+# cap (error 10067); an account at the cap applies v3 alone first (P5). Elsewhere one deploy applies both.
 [[migrations]]
 tag = "v3"
 deleted_classes = ["VaultSyncServer", "ServerConfig", "RecoveryJob"]
+
+[[migrations]]
+tag = "v4"
 new_sqlite_classes = ["VaultDO", "ConfigDO"]
 
 [[r2_buckets]]
