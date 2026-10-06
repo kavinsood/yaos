@@ -1,0 +1,27 @@
+src/engine/runtime/hygiene.test.ts
+  s_ab5bcc5cfffe93::t_c65b472631d2af 59
+src/host/ui/confirmModal.ts
+  s_ab5bcc5cfffe93::t_dd7bd5e14027d1 1
+src/host/ui/deviceName.ts
+  s_ab5bcc5cfffe93::t_1fde3823bc6a09 2
+src/host/ui/format.ts
+  s_ab5bcc5cfffe93::t_6a6d59edbd0e1b 3
+src/host/ui/statusBar.ts
+  s_ab5bcc5cfffe93::t_6e2ed6e1e5ed4f 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c0a6bed5d2489ccfe722168b0f1f413703765920",
+  "prompts": {},
+  "sessions": {
+    "s_ab5bcc5cfffe93": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5273ece69d26a317",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
