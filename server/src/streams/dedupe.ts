@@ -7,9 +7,10 @@
 // streams, least recently used first; an evicted stream rescans (≤ 65 rows).
 //
 // CPU fallback (H2 "chunk the scan and gate that stream's commits on it"): measured worst case (4 MiB of 25 B rows
-// with distinct keys, ≈ 168k rows) is ≈ 16 ms of parse in Node, over the 10 ms Free budget. So the parse of a
-// cold scan runs in steps of at most STREAM_DEDUPE_STEP_ROWS rows (DedupeBuild); the relay holds the stream's frames
-// until its build is installed.
+// with distinct keys, ≈ 168k rows) is ≈ 16 ms of parse in Node (≈ 15 ms on local workerd), over the 10 ms Free
+// budget. So a cold scan runs in steps of at most STREAM_DEDUPE_STEP_ROWS row units (DedupeBuild): the one bounded
+// read is charged by its bytes, the parse by its rows. The relay holds the stream's frames until its build is
+// installed.
 
 /** W ≥ burst + maxPayload + gcMaxBytes = 2 MiB + 1 MiB + 64 KiB. */
 export const STREAM_DEDUPE_WINDOW_BYTES = 4 * 1024 * 1024;
@@ -18,11 +19,17 @@ export const STREAM_DEDUPE_SCAN_SEGMENTS = 64;
 /** DO-wide cap on index entries (about 16 MB at about 60 B/entry). */
 export const STREAM_DEDUPE_MAX_ENTRIES = 262_144;
 /**
- * Rows one build step may parse (about 1.5 ms in Node at the measured ≈ 93 ns/row worst case). DECISIONS-GAP: H2
- * names no chunk size; 16,384 rows keeps a step well under the 10 ms budget, and a stream of up to 16,384 rows
- * (4 MiB of 256 B rows) still builds in one step.
+ * Row units one build step may spend (16,384 rows parse in a median 1.2 ms in Node, about 2 ms on local workerd).
+ * DECISIONS-GAP: H2 names no chunk size; 16,384 keeps a step well under the 10 ms budget, and a stream of up to
+ * 16,384 rows that are 256 B or larger (4 MiB in all) still builds in one step.
  */
 export const STREAM_DEDUPE_STEP_ROWS = 16_384;
+/**
+ * The bounded read's charge: one row unit per this many bytes loaded. Measured on local workerd, reading the 4 MiB
+ * window (64 segments) costs about as much as parsing 16,384 rows, so a full-window read is a step of its own.
+ * DECISIONS-GAP: H2 does not split the read; charging it keeps a step bounded without paging the ≤ 65-row read.
+ */
+export const STREAM_DEDUPE_READ_BYTES_PER_ROW = 256;
 
 const utf8 = new TextEncoder();
 
@@ -186,11 +193,14 @@ const NO_BYTES = new Uint8Array(0);
  */
 export class DedupeBuild {
 	readonly index: StreamDedupeIndex;
+	/** Bytes the read loaded (its step charge). */
+	readonly bytes: number;
 	private next = 0;
 	private offset = 0;
 
 	constructor(private readonly blobs: Uint8Array[], windowBytes: number = STREAM_DEDUPE_WINDOW_BYTES) {
 		this.index = new StreamDedupeIndex(windowBytes);
+		this.bytes = blobs.reduce((total, blob) => total + blob.byteLength, 0);
 	}
 
 	get done(): boolean {

@@ -19,7 +19,7 @@ import {
 	type StreamActor,
 	type StreamRelayConfig,
 } from "../../server/src/streams/relay";
-import { DedupeBuild, STREAM_DEDUPE_STEP_ROWS, STREAM_DEDUPE_WINDOW_BYTES, StreamDedupeIndex, frameKeyHash } from "../../server/src/streams/dedupe";
+import { DedupeBuild, STREAM_DEDUPE_READ_BYTES_PER_ROW, STREAM_DEDUPE_STEP_ROWS, STREAM_DEDUPE_WINDOW_BYTES, StreamDedupeIndex, frameKeyHash } from "../../server/src/streams/dedupe";
 import { StreamStore, type StreamAppendInput } from "../../server/src/streams/store";
 import { suite } from "../harness.ts";
 
@@ -482,12 +482,14 @@ s.test("H2: rows join the index only after their commit is durable (a failed com
 
 s.test("H2 CPU fallback: a build parses at most maxRows rows per step, resumes mid-blob, and indexes like one scan", () => {
 	assert.equal(STREAM_DEDUPE_STEP_ROWS, 16_384);
+	assert.equal(STREAM_DEDUPE_READ_BYTES_PER_ROW, 256, "a full 4 MiB window read is one step's charge");
 	const blob = (from: number, count: number) => new Uint8Array(Array.from({ length: count }, (_, offset) => from + offset)
 		.flatMap((seq) => [...encodeRow({ seq, deviceId: "device-a", clientFrameId: `cf-${seq}`, payload: new Uint8Array(3) })]));
 	const blobs = [blob(1, 7), blob(8, 7), blob(15, 3)];
 	const whole = new StreamDedupeIndex();
 	for (const part of blobs) whole.scan(part);
 	const build = new DedupeBuild(blobs.map((part) => part.slice()));
+	assert.equal(build.bytes, blobs.reduce((total, part) => total + part.byteLength, 0));
 	const steps: number[] = [];
 	while (!build.done) steps.push(build.step(5));
 	assert.deepEqual(steps, [5, 5, 5, 2], "17 rows across 3 blobs in steps of 5, crossing blob boundaries");
@@ -499,7 +501,8 @@ s.test("H2 CPU fallback: a build parses at most maxRows rows per step, resumes m
 
 s.test("H2 CPU fallback T-DEDUPE-CHUNK-WB: a large cold build is stepped per message and per timer flush; only its stream waits", async () => {
 	await withStreams(({ store, fresh, registry, timers, reads, append }) => {
-		// 4 sealed segments of 10 rows (each 10 × 7 KiB commit seals) = 40 rows; a build step parses 10.
+		// 4 sealed segments of 10 rows (each 10 × 7 KiB commit seals) = 40 rows; a step spends 10 units, so the read
+		// (≈ 288 KiB, over a thousand units) is a step of its own and the parse takes 4 more.
 		const payload = (index: number) => new Uint8Array(7 * 1024).fill(index % 251);
 		for (let batch = 0; batch < 4; batch++) {
 			store.commit(Array.from({ length: 10 }, (_, offset) => ({ stream: "b:big", deviceId: "device-a",
@@ -514,34 +517,35 @@ s.test("H2 CPU fallback T-DEDUPE-CHUNK-WB: a large cold build is stepped per mes
 		append(a, "ns:warm", "warm-1", "w");
 		assert.ok(cold().dedupeReady("ns:warm"));
 		reads.reset();
-		// Message 1: a resend of big-5 queues b:big; the message turn reads head + 4 segments once and parses 10 rows.
+		// Message 1: a resend of big-5 queues b:big; the message turn's step is the read (head + 4 segments, once).
 		append(a, "b:big", "big-5", payload(5));
 		assert.equal(reads.matching(/ORDER BY first_seq DESC LIMIT \?/), 4, "the one bounded read, at build start");
 		assert.equal(reads.matching(/FROM stream_head WHERE stream = \?/), 1);
 		assert.deepEqual(cold().dedupeStats(), { streams: 1, entries: 0, building: 1 });
-		// Message 2 (a new stream, queued behind b:big): the turn's step is b:big's rows 11–20.
+		// Message 2 (a new stream, queued behind b:big): the turn's step is b:big's rows 1–10. Message 3: rows 11–20.
 		append(a, "ns:late", "late-1", "l");
+		append(a, "ns:warm", "warm-2", "w");
 		reads.reset();
 		// Idle flush 1: step (rows 21–30); ns:warm commits, b:big and ns:late stay held, nothing is re-read.
 		timers.advance(300);
-		assert.deepEqual(a.receipts().map((receipt) => receipt.clientFrameId), ["warm-1"]);
+		assert.deepEqual(a.receipts().map((receipt) => receipt.clientFrameId), ["warm-1", "warm-2"]);
 		assert.equal(service.counters.dedupeHeld, 2);
 		assert.equal(reads.matching(/ORDER BY first_seq DESC LIMIT \?/), 0, "steps after the first read nothing");
 		assert.ok(!cold().dedupeReady("b:big"));
 		// Next flush (minInterval after the last commit): step (rows 31–40) installs b:big; big-5 dedupes against seq 6.
 		timers.advance(1_000);
-		assert.deepEqual(a.receipts().slice(1), [{ stream: "b:big", clientFrameId: "big-5", seq: 6, deduped: true }]);
+		assert.deepEqual(a.receipts().slice(2), [{ stream: "b:big", clientFrameId: "big-5", seq: 6, deduped: true }]);
 		assert.ok(cold().dedupeReady("b:big"));
 		assert.ok(!cold().dedupeReady("ns:late"), "the step budget was spent on b:big");
 		// Next flush: ns:late's build (nothing stored) finishes and its frame commits.
 		timers.advance(1_000);
-		assert.deepEqual(a.receipts().slice(2), [{ stream: "ns:late", clientFrameId: "late-1", seq: 42, deduped: false }]);
-		assert.deepEqual(cold().dedupeStats(), { streams: 3, entries: 40 + 2, building: 0 });
+		assert.deepEqual(a.receipts().slice(3), [{ stream: "ns:late", clientFrameId: "late-1", seq: 43, deduped: false }]);
+		assert.deepEqual(cold().dedupeStats(), { streams: 3, entries: 40 + 3, building: 0 });
 		assert.equal(service.pendingFrames(), 0);
 	}, { dedupeStepRows: 10, config: { burstBytes: 8 * 1024 * 1024 } });
 });
 
-s.test("H2 CPU fallback: store steps share one row budget in queue order; a gated commit is never needed", async () => {
+s.test("H2 CPU fallback: store steps share one unit budget in queue order (read charged by bytes); ungated commits build inline", async () => {
 	await withStreams(({ store, storage }) => {
 		for (let batch = 0; batch < 3; batch++) {
 			store.commit(Array.from({ length: 10 }, (_, offset) => ({ stream: "b:x", deviceId: "device-a",
@@ -553,7 +557,12 @@ s.test("H2 CPU fallback: store steps share one row budget in queue order; a gate
 		cold.queueDedupe("b:y");
 		cold.queueDedupe("b:x");
 		assert.deepEqual(cold.dedupeStats(), { streams: 0, entries: 0, building: 2 }, "queued once");
-		assert.deepEqual([cold.stepDedupe(), cold.stepDedupe(), cold.stepDedupe()], [12, 12, 7], "b:x 12+12+6, then b:y's 1 row");
+		const unitsOf = (query: string) => Math.ceil(storage.sql.exec<{ n: number }>(query).one().n / STREAM_DEDUPE_READ_BYTES_PER_ROW);
+		const xRead = unitsOf("SELECT SUM(length(bytes)) AS n FROM stream_segment WHERE stream = 'b:x'");
+		const yRead = unitsOf("SELECT length(open) AS n FROM stream_head WHERE stream = 'b:y'");
+		assert.ok(xRead > 12 && yRead === 1);
+		assert.deepEqual([cold.stepDedupe(), cold.stepDedupe(), cold.stepDedupe(), cold.stepDedupe()], [xRead, 12, 12, 6 + yRead + 1],
+			"b:x's read alone (it overruns, never split), its rows 12+12+6, then b:y's read and 1 row");
 		assert.ok(cold.dedupeReady("b:x") && cold.dedupeReady("b:y"));
 		assert.equal(cold.stepDedupe(), 0);
 		// An ungated commit (forced flush) of a queued stream builds inline and drops the queued build.

@@ -18,6 +18,7 @@ import {
 	DedupeBuild,
 	DedupeIndexes,
 	STREAM_DEDUPE_MAX_ENTRIES,
+	STREAM_DEDUPE_READ_BYTES_PER_ROW,
 	STREAM_DEDUPE_SCAN_SEGMENTS,
 	STREAM_DEDUPE_STEP_ROWS,
 	STREAM_DEDUPE_WINDOW_BYTES,
@@ -155,7 +156,7 @@ export interface StreamStoreOptions {
 	schemaReady?: boolean;
 	/** H2 DO-wide dedupe index cap in entries (default STREAM_DEDUPE_MAX_ENTRIES). */
 	dedupeMaxEntries?: number;
-	/** H2 rows per build step (default STREAM_DEDUPE_STEP_ROWS). */
+	/** H2 row units per build step (default STREAM_DEDUPE_STEP_ROWS). */
 	dedupeStepRows?: number;
 }
 
@@ -190,6 +191,13 @@ export class StreamStore {
 	 * D8a: deletes every row of the three stream tables. Synchronous and transaction-agnostic: the caller may run it
 	 * inside its own `transactionSync` (then a rollback restores the rows). Forgets the cached head and the dedupe
 	 * index (rebuilt lazily, so a rollback leaves nothing stale). Bills one row per deleted row (§6.2).
+	 *
+	 * DECISIONS-GAP (D8a "uses DROP+CREATE if it is cheaper"): on local workerd DROP+CREATE bills a constant 7
+	 * rowsWritten (each DROP TABLE 0, each CREATE TABLE 2, the CREATE INDEX 1) against H+S+C here, and a rollback
+	 * restores the tables, rows and index. But DROP TABLE fails with SQLITE_LOCKED while any cursor on the table is
+	 * still live, and a cursor left unfinished (a `for…of` that breaks: `read` and `loadBuild` stop early to bound
+	 * memory) stays live across requests until garbage collected; DELETE is not blocked. So DELETE stays: it always
+	 * works, and its cost is the deterministic §6.2 figure.
 	 */
 	deleteAllStreamRows(): void {
 		this.ensureSchema();
@@ -239,9 +247,11 @@ export class StreamStore {
 	}
 
 	/**
-	 * H2 CPU fallback: advances the queued builds, oldest first, by at most `maxRows` parsed rows in total, installing
-	 * each one that finishes. A build starts with the one bounded read (head + ≤ 64 segments = ≤ 65 rows) and then
-	 * holds those blobs until parsed, so only the build in progress holds any. Returns the rows parsed.
+	 * H2 CPU fallback: advances the queued builds, oldest first, by at most `maxRows` row units in total, installing
+	 * each one that finishes. A build starts with the one bounded read (head + ≤ 64 segments = ≤ 65 rows), charged
+	 * one unit per STREAM_DEDUPE_READ_BYTES_PER_ROW bytes loaded; each parsed row is one unit. The build then holds
+	 * its blobs until parsed, so only the build in progress holds any. Returns the units spent (the read's charge can
+	 * overrun `maxRows`: the read is never split).
 	 *
 	 * DECISIONS-GAP: builds run one at a time in queue order, so a cold stream queued behind a large build waits for
 	 * it (bounded memory: one window of blobs, ≤ W + 1.5 MB + the open segment, instead of one per queued stream).
@@ -249,16 +259,20 @@ export class StreamStore {
 	stepDedupe(maxRows: number = this.stepRows): number {
 		if (this.builds.size === 0) return 0;
 		this.ensureSchema();
-		let rows = 0;
+		let units = 0;
 		for (const [stream, queued] of this.builds) {
-			if (rows >= maxRows) break;
-			const build = queued ?? this.loadBuild(stream, this.headRow(stream));
-			rows += build.step(maxRows - rows);
+			if (units >= maxRows) break;
+			let build = queued;
+			if (!build) {
+				build = this.loadBuild(stream, this.headRow(stream));
+				units += Math.ceil(build.bytes / STREAM_DEDUPE_READ_BYTES_PER_ROW);
+			}
+			units += build.step(Math.max(0, maxRows - units));
 			if (!build.done) { this.builds.set(stream, build); break; }
 			this.builds.delete(stream);
 			this.dedupe.install(stream, build.index);
 		}
-		return rows;
+		return units;
 	}
 
 	/**
