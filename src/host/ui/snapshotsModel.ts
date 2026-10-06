@@ -36,16 +36,26 @@ export interface SnapshotRow {
 	readonly id: string;
 	/** "2026-10-05 14:03 · Daily" */
 	readonly title: string;
-	/** "12 files, 3.4 MiB" */
+	/** "12 files, 3.4 MiB", plus where it is when uploaded: "· uploaded" / "· from phone" */
 	readonly detail: string;
+	/** On this device, uploaded by another device (or by this one, local copy gone), or both. */
+	readonly where: "local" | "remote" | "both";
 }
 
 export function snapshotRow(s: SnapshotSummary): SnapshotRow {
+	const where = s.where ?? "local";
+	const size = `${plural(s.files, "file")}, ${formatBytes(s.bytes)}`;
 	return {
 		id: s.id,
 		title: `${formatSnapshotTime(s.createdAtMs)} · ${snapshotReasonLabel(s.reason)}`,
-		detail: `${plural(s.files, "file")}, ${formatBytes(s.bytes)}`,
+		detail: where === "local" ? size : where === "both" ? `${size} · uploaded` : `${size} · from ${s.device || "another device"}`,
+		where,
 	};
+}
+
+/** Shown while the files dialog loads: a remote snapshot is downloaded and checked first. */
+export function loadingText(row: SnapshotRow): string {
+	return row.where === "remote" ? "Downloading and checking the snapshot…" : "Checking the snapshot…";
 }
 
 /** Rows newest first (the engine lists oldest first). */
@@ -137,7 +147,7 @@ export function restoreSelectedCopy(row: SnapshotRow, count: number): ConfirmCop
 export function deleteCopy(row: SnapshotRow): ConfirmCopy {
 	return {
 		title: "Delete this snapshot?",
-		message: `Snapshot: ${row.title} (${row.detail}).\n\nThe snapshot file is removed from this device. Your notes are not changed.`,
+		message: `Snapshot: ${row.title} (${row.detail}).\n\n${row.where === "local" ? "The snapshot is removed from this device." : row.where === "both" ? "The snapshot is removed from this device and from the list on all your devices." : "The snapshot is removed from the list on all your devices."} Your notes are not changed.`,
 		confirmText: "Delete",
 	};
 }
@@ -153,7 +163,7 @@ export function skippedText(skipped: readonly SnapshotSkippedEntry[]): { readonl
 	const shown = skipped.slice(0, MAX_LISTED_PATHS);
 	return {
 		heading: `${plural(skipped.length, "file was", "files were")} not saved in this snapshot and cannot be restored from it:`,
-		lines: shown.map((s) => `${s.path} (${s.reason === "too-large" ? "attachment over 1 MiB" : "could not be read"})`),
+		lines: shown.map((s) => `${s.path} (${s.reason === "too-large" ? "attachment over 1 MiB" : s.reason === "invalid" ? "invalid name or content" : "could not be read"})`),
 		moreText: skipped.length > shown.length ? `…and ${skipped.length - shown.length} more.` : null,
 	};
 }

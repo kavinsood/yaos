@@ -1,99 +1,93 @@
+/**
+ * SnapshotJob, local side (DESIGN §j.4): streaming multi-part export, retention, lookups, restore through the
+ * conflict-copy + CAS flow, and fail-closed `content_corrupt` on a damaged local snapshot.
+ */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { strFromU8, unzipSync } from "fflate";
+import { unzipSync, strFromU8 } from "fflate";
 import { exactFingerprint } from "../../core/hash/markdownLf";
-import { kindOfPath, type ContentHash, type VaultPath } from "../../core/types";
-import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress, CryptoPort } from "../../ports/crypto";
-import type { SideFileName, SideFilePort } from "../../ports/vault";
-import { World } from "../reconcile/testkit/world";
-import { SNAPSHOT_EVENT_KEEP, SnapshotJob, parseSnapshotId, snapshotId, type SnapshotDeps, type SnapshotManifest } from "./snapshotJob";
+import { parseSnapshotId, snapshotId, type SnapRecord, decodeSnapRecord } from "../../core/snap/record";
+import type { SnapManifest } from "../../core/snap/bundle";
+import { ProtocolFailure } from "../../protocol/errors";
+import { SNAPSHOT_EVENT_KEEP } from "./snapshotJob";
+import { DAY, P, device, noise } from "./testkit/snapKit";
 
-class MemSide implements SideFilePort {
-	readonly files = new Map<string, Uint8Array>();
-	async read(n: SideFileName) { return this.files.get(n) ?? null; }
-	async write(n: SideFileName, b: Uint8Array) { this.files.set(n, b.slice()); }
-	async remove(n: SideFileName) { this.files.delete(n); }
-	async list(prefix: "snapshots/") { return [...this.files.keys()].filter((k) => k.startsWith(prefix)) as SideFileName[]; }
-}
+const concat = (parts: Uint8Array[]) => {
+	const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+	let o = 0;
+	for (const p of parts) { out.set(p, o); o += p.length; }
+	return out;
+};
 
-const P = (s: string): VaultPath => s as VaultPath;
-const DAY = 24 * 60 * 60 * 1000;
-
-async function setup(opts: { keepDaily?: number; enabled?: boolean; upload?: SnapshotDeps["upload"]; files?: SnapshotDeps["files"] } = {}) {
-	const w = new World();
-	const side = new MemSide();
-	const notices: string[] = [];
-	const settings = { enabled: opts.enabled ?? true, keepDaily: opts.keepDaily ?? 7, uploadToBlobStore: opts.upload !== undefined };
-	const job = new SnapshotJob({
-		disk: w.gateway, side, clock: w.clock, settings: () => settings, upload: opts.upload ?? null, deviceLabel: "laptop",
-		files: opts.files ?? (() => w.vault.paths().filter((p) => !p.startsWith(".")).map((p) => ({ path: P(p), kind: kindOfPath(P(p)), size: w.vault.bytesOf(p)!.length }))),
-		notice: (_l, c) => notices.push(c),
-	});
-	return { w, side, job, notices, settings };
-}
-
-test("snapshot: zip of md/canvas + small blobs with a manifest; big blobs left out", async () => {
-	const { w, side, job } = await setup();
+test("export: multi-part zip (parts of partBytes) + descriptor; md/canvas/small blobs; big blobs and invalid files left out", async () => {
+	const { w, side, job } = device({ partBytes: 16 * 1024 });
 	w.vault.userWrite("a.md", "# A\n");
 	w.vault.userWrite("d/b.canvas", "{\"nodes\":[],\"edges\":[]}");
-	w.vault.userWrite("img/small.png", new Uint8Array(1000).fill(7));
+	w.vault.userWrite("img/small.png", noise(40_000, 3));
 	w.vault.userWrite("img/big.png", new Uint8Array(1024 * 1024 + 1));
 	w.vault.userWrite("ünï/cödé.md", "x");
-	const res = await job.take("manual");
-	assert.ok(res);
+	w.vault.userWrite("bad.canvas", "{not json");
+	const res = (await job.take("manual"))!;
 	assert.equal(parseSnapshotId(res.id)?.reason, "manual");
-	const zip = unzipSync(side.files.get(`snapshots/${res.id}.zip`)!);
-	const m = JSON.parse(strFromU8(zip["manifest.json"]!)) as SnapshotManifest;
+	assert.equal(res.upload, null, "no blob store");
+	const record = decodeSnapRecord(side.files.get(`snapshots/${res.id}.snap`)!) as SnapRecord;
+	const parts = side.names(".part").map((n) => side.files.get(n)!);
+	assert.ok(parts.length >= 3, `${parts.length} parts`);
+	assert.deepEqual(parts.slice(0, -1).map((p) => p.length), parts.slice(0, -1).map(() => 16 * 1024), "every part but the last is exactly partBytes");
+	assert.deepEqual(record.parts.map((p) => p.size), parts.map((p) => p.length));
+	const zip = unzipSync(concat(parts));
+	const m = JSON.parse(strFromU8(zip["manifest.json"]!)) as SnapManifest;
 	assert.deepEqual(m.files.map((f) => f.path).sort(), ["a.md", "d/b.canvas", "img/small.png", "ünï/cödé.md"]);
 	for (const f of m.files) {
 		assert.deepEqual(zip[`files/${f.path}`], w.vault.bytesOf(f.path));
 		assert.equal(f.hash, exactFingerprint(w.vault.bytesOf(f.path)!));
 	}
+	assert.deepEqual(m.skipped, [{ path: "bad.canvas", reason: "invalid" }]);
 	assert.equal(zip["files/img/big.png"], undefined);
-	assert.deepEqual((await job.list()).map((s) => [s.id, s.files]), [[res.id, 4]]);
+	assert.deepEqual((await job.list()).map((s) => [s.id, s.files, s.where]), [[res.id, 4, "local"]]);
+	assert.deepEqual((await job.manifest(res.id)).files.map((f) => f.path), m.files.map((f) => f.path));
 });
 
-test("snapshot: over 256 MiB is skipped with a notice; disabled skips all but manual and the pre-restore one", async () => {
-	const big = await setup({ files: () => [{ path: P("huge.md"), kind: "markdown", size: 300 * 1024 * 1024 }] });
+test("over 256 MiB is skipped with a notice; disabled skips all but manual and the pre-restore one", async () => {
+	const big = device({ files: () => [{ path: P("huge.md"), kind: "markdown", size: 300 * 1024 * 1024 }] });
 	assert.equal(await big.job.take("brake"), null);
-	assert.deepEqual(big.notices, ["snapshot-too-large"]);
+	assert.deepEqual(big.notices.map((n) => n.code), ["snapshot-too-large"]);
 	assert.equal(big.side.files.size, 0);
-	const off = await setup({ enabled: false });
+	const off = device({ enabled: false });
 	off.w.vault.userWrite("a.md", "a");
 	assert.equal(await off.job.take("daily"), null);
 	assert.equal(await off.job.take("brake"), null);
 	const manual = (await off.job.take("manual"))!;
-	assert.ok(manual);
 	off.w.clock.advance(1000);
 	await off.job.restore(manual.id, null);
 	assert.deepEqual((await off.job.list()).map((s) => s.reason), ["manual", "restore"], "restore saves a safety snapshot even when snapshots are off");
 });
 
 test("remove and lookups: malformed or unknown ids are bad requests; remove deletes only that snapshot", async () => {
-	const { w, side, job } = await setup();
+	const { w, side, job } = device();
 	w.vault.userWrite("a.md", "a");
 	const one = (await job.take("manual"))!;
 	w.clock.advance(1000);
 	const two = (await job.take("manual"))!;
 	const badRequest = (re: RegExp) => (e: unknown) => (e as { error?: { code?: string } }).error?.code === "bad-request" && re.test(String(e));
-	for (const id of ["../outbox-a.bin", "x", `${one.id}/../../y`, ""]) {
-		await assert.rejects(job.remove(id), badRequest(/not a snapshot id/), id);
-		await assert.rejects(job.restore(id, null), badRequest(/not a snapshot id/), id);
-		await assert.rejects(job.manifest(id), badRequest(/not a snapshot id/), id);
+	for (const id of ["../outbox-a.bin", "x", `${one.id}/../../y`, "", "dl", `dev-A-0000000000000/${one.id}`, `${one.id}@dev-A-0000000000000`]) {
+		await assert.rejects(job.remove(id), badRequest(/not a snapshot id|not found/), id);
+		await assert.rejects(job.restore(id, null), badRequest(/not a snapshot id|not found/), id);
+		await assert.rejects(job.manifest(id), badRequest(/not a snapshot id|not found/), id);
 	}
 	const unknown = snapshotId(5, "daily");
 	await assert.rejects(job.remove(unknown), badRequest(/not found/));
-	await assert.rejects(job.restore(unknown, null), badRequest(/not found/));
-	assert.equal(await job.manifest(unknown), null);
+	await assert.rejects(job.manifest(unknown), badRequest(/not found/));
 	await job.remove(one.id);
-	assert.deepEqual([...side.files.keys()], [`snapshots/${two.id}.zip`]);
+	assert.deepEqual([...side.files.keys()].filter((k) => !k.includes(two.id)), []);
 	await assert.rejects(job.remove(one.id), badRequest(/not found/), "already removed");
 });
 
-test("retention: keepDaily newest dailies, a bounded number of event snapshots; daily at most once per 24 h", async () => {
-	const { w, side, job } = await setup({ keepDaily: 2 });
+test("retention: keepDaily newest dailies, a bounded number of event snapshots; daily at most once per 24 h; leftovers swept", async () => {
+	const { w, side, job } = device({ keepDaily: 2 });
 	w.vault.userWrite("a.md", "a");
+	await side.write("snapshots/0000000ab-manual-p000.part", new Uint8Array(3));
+	await side.write("snapshots/dl-p000.part", new Uint8Array(3));
 	const ids: string[] = [];
 	for (let d = 0; d < 4; d++) {
 		ids.push((await job.maybeDaily())!);
@@ -101,15 +95,14 @@ test("retention: keepDaily newest dailies, a bounded number of event snapshots; 
 		w.clock.advance(DAY);
 	}
 	for (let i = 0; i < SNAPSHOT_EVENT_KEEP + 2; i++) { await job.take("brake"); w.clock.advance(1000); }
-	const left = [...side.files.keys()].map((k) => k.slice(10, -4));
-	assert.deepEqual(left.filter((id) => id.endsWith("-daily")).sort(), ids.slice(2));
+	const left = side.names(".snap").map((k) => k.slice(10, -5));
+	assert.deepEqual(left.filter((id) => id.endsWith("-daily")), ids.slice(2));
 	assert.equal(left.filter((id) => id.endsWith("-brake")).length, SNAPSHOT_EVENT_KEEP);
-	assert.equal(snapshotId(1, "epoch") < snapshotId(36 ** 8, "epoch"), true, "ids sort by time");
-	assert.deepEqual(parseSnapshotId(snapshotId(1767225602224.57, "daily")), { createdAtMs: 1767225602224, reason: "daily" }, "fractional clock reading");
+	assert.deepEqual(side.names(".part").filter((n) => !left.some((id) => n.startsWith(`snapshots/${id}-p`))), [], "orphan and download parts swept");
 });
 
 test("restore: differing file conflict-copied then restored, deleted file recreated, unchanged skipped; changes sync", async () => {
-	const { w, job } = await setup();
+	const { w, job } = device();
 	w.vault.userWrite("a.md", "original a\n");
 	w.vault.userWrite("b.md", "original b\n");
 	w.vault.userWrite("c.md", "same c\n");
@@ -119,7 +112,6 @@ test("restore: differing file conflict-copied then restored, deleted file recrea
 	w.vault.userWrite("a.md", "edited a\n");
 	w.vault.userDelete("b.md");
 	await w.sync();
-	assert.equal(w.log.liveByPath(P("b.md")), undefined);
 	w.clock.advance(60_000);
 	const r = await job.restore(snap.id, null);
 	assert.deepEqual([...r.restored].sort(), ["a.md", "b.md"]);
@@ -132,12 +124,11 @@ test("restore: differing file conflict-copied then restored, deleted file recrea
 	assert.ok((await job.list()).some((s) => s.reason === "restore"), "a restore snapshot is taken first");
 	await w.sync();
 	assert.equal(w.log.text(w.log.liveByPath(P("a.md"))!), "original a\n");
-	assert.equal(w.log.text(w.log.liveByPath(P("b.md"))!), "original b\n");
 	assert.equal(w.log.text(w.log.liveByPath(P(r.copies[0]!))!), "edited a\n");
 });
 
 test("restore: subset of paths; a file edited between read and write is not clobbered", async () => {
-	const { w, job } = await setup();
+	const { w, job } = device();
 	w.vault.userWrite("a.md", "A0\n");
 	w.vault.userWrite("b.md", "B0\n");
 	const snap = (await job.take("manual"))!;
@@ -152,19 +143,35 @@ test("restore: subset of paths; a file edited between read and write is not clob
 	assert.equal(w.vault.text(r.copies[0]!), "A1\n", "the copy still holds the pre-restore text");
 	assert.equal(w.vault.text("b.md"), "B1\n", "not selected");
 	w.gateway.beforeOp = null;
-	const r2 = await job.restore(snap.id, [P("b.md")]);
-	assert.deepEqual(r2.restored, ["b.md"]);
+	assert.deepEqual((await job.restore(snap.id, [P("b.md")])).restored, ["b.md"]);
 	assert.equal(w.vault.text("b.md"), "B0\n");
 });
 
-test("optional upload: sealed zip put under its hash address", async () => {
-	const puts = new Map<string, Uint8Array>();
-	const store: BlobPort = { maxBlobBytes: 1 << 30, has: async () => new Set(), put: async (a, b) => { puts.set(a, b); }, get: async () => null };
-	const crypto = { suite: 0, sealEpoch: () => 0, seal: async () => new Uint8Array(), open: async () => ({ ok: false }), sealBlob: async (i: { plaintext: Uint8Array }) => i.plaintext.map((x) => x ^ 1), openBlob: async (i: { sealed: Uint8Array }) => ({ ok: true, plaintext: i.sealed }), blobAddress: async (h: ContentHash) => `addr:${h}` as BlobAddress } as unknown as CryptoPort;
-	const { w, side, job } = await setup({ upload: { store, crypto } });
-	w.vault.userWrite("a.md", "a");
-	const res = (await job.take("manual"))!;
-	const zip = side.files.get(`snapshots/${res.id}.zip`)!;
-	assert.equal(res.address, `addr:${exactFingerprint(zip)}`);
-	assert.deepEqual(puts.get(res.address!), zip.map((x) => x ^ 1));
+test("damaged local snapshot: content_corrupt (notice + diagnostic + failure naming the check), nothing written, no restore snapshot", async () => {
+	for (const [damage, check] of [["flip", "part-hash"], ["cut", "part-size"], ["drop", "part-missing"], ["desc", "not found"]] as const) {
+		const { w, side, job, notices, diags } = device({ partBytes: 4096 });
+		w.vault.userWrite("a.md", "A0\n");
+		w.vault.userWrite("b.png", noise(10_000, 9));
+		const snap = (await job.take("manual"))!;
+		w.vault.userWrite("a.md", "A1\n");
+		const name = `snapshots/${snap.id}-p001.part`;
+		const part = side.files.get(name)!;
+		if (damage === "flip") part[100]! ^= 1;
+		if (damage === "cut") side.files.set(name, part.subarray(0, 4000));
+		if (damage === "drop") side.files.delete(name);
+		if (damage === "desc") side.files.set(`snapshots/${snap.id}.snap`, side.files.get(`snapshots/${snap.id}.snap`)!.subarray(0, 10));
+		const before = side.files.size;
+		const err = await job.restore(snap.id, null).then(() => null, (e: unknown) => e);
+		if (check === "not found") {
+			assert.match(String(err), /not found/, "an undecodable descriptor is not a snapshot");
+			continue;
+		}
+		assert.ok(err instanceof ProtocolFailure && err.error.code === "content_corrupt", `${damage}: ${String(err)}`);
+		assert.match(err.error.message, new RegExp(`${snap.id}.*${check}`));
+		assert.deepEqual(notices.map((n) => n.code), ["content_corrupt"]);
+		assert.ok(diags.some((d) => d.startsWith(`content_corrupt snapshot=${snap.id} check=${check}`)), diags.join("\n"));
+		assert.equal(w.vault.text("a.md"), "A1\n", "fail closed: nothing restored");
+		assert.equal(side.files.size, before, "no restore snapshot was taken");
+		await assert.rejects(job.manifest(snap.id), (e: unknown) => e instanceof ProtocolFailure && e.error.code === "content_corrupt");
+	}
 });

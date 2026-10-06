@@ -25,6 +25,7 @@ import { encodeBlobChunk, encodeBodyUpdateRef } from "../../core/codec/contents"
 import { newClientFrameId } from "../../core/codec/ids";
 import { bytesToHex } from "../../core/codec/lib0";
 import { encodeNsOps } from "../../core/codec/nsOps";
+import { encodeSnapOps, type SnapOp } from "../../core/snap/record";
 import { ORIGIN } from "./yjsCounters";
 
 export interface FrameCtx {
@@ -124,6 +125,12 @@ export async function buildNsFrame(ctx: FrameCtx, stream: StreamName, ops: reado
 export async function buildCfgFrame(ctx: FrameCtx, stream: StreamName, ops: readonly CfgOp[], authorNsSeq: Seq, frameNo: number, nowMs: number): Promise<NewOutboxFrame> {
 	const content = encodeCfgOps(ops);
 	return seal(ctx, stream, "cfgOps", authorNsSeq, 0, frameNo, content, content, "pending", null, nowMs);
+}
+
+/** One snap-index frame (DESIGN §j.4): small records only, never a ref; frameNo 0 (no replay window, e2ee-design §8.2). */
+export async function buildSnapFrame(ctx: FrameCtx, stream: StreamName, ops: readonly SnapOp[], authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
+	const content = encodeSnapOps(ops);
+	return seal(ctx, stream, "snapOps", authorNsSeq, 0, 0, content, content, "pending", null, nowMs);
 }
 
 /** One x:<hash> blobChunk frame (pending, no dependency). */

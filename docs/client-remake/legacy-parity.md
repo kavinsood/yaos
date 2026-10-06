@@ -32,9 +32,9 @@ There are 236 rows in total.
 | Decision | Rows |
 |---|---|
 | `ported` | 83 |
-| `implemented (<commit>)` | 52 |
+| `implemented (<commit>)` | 53 |
 | `dropped: ...` | 99 |
-| `missing: ...` | 2 |
+| `missing: ...` | 1 |
 | Total | 236 |
 
 Rows per section:
@@ -45,7 +45,7 @@ Rows per section:
 | 2. Commands | 5 | 4 | 8 | 0 |
 | 3. Status bar and UI | 23 | 9 | 29 | 0 |
 | 4. Onboarding and pairing | 11 | 6 | 1 | 0 |
-| 5. Snapshots and restore | 5 | 9 | 3 | 1 |
+| 5. Snapshots and restore | 5 | 10 | 3 | 0 |
 | 6. Diagnostics | 3 | 4 | 2 | 0 |
 | 7. Frontmatter | 0 | 0 | 5 | 0 |
 | 8. Attachments | 5 | 0 | 2 | 0 |
@@ -63,7 +63,6 @@ Rows per section:
 
 Still missing:
 
-- §5 Cross-device restore. Large; DESIGN §j.4 keeps it out of v1.
 - §18 In-plugin governance as a whole. Large.
 
 Wave-2 rows, all implemented:
@@ -131,7 +130,7 @@ controls have no counterpart.
 | "Take snapshot now" | adfa7a7:src/commands.ts:108 | src/host/ui/commands.ts:38 | implemented (f236cbe) |
 | "Show recovery readiness and job status" | adfa7a7:src/commands.ts:118 | MISSING | dropped: the snapshot browser replaces it |
 | "Browse and restore snapshots" | adfa7a7:src/commands.ts:128 | src/host/ui/commands.ts:39 | implemented (f236cbe) |
-| "Cleanup old snapshots (apply retention policy)" | adfa7a7:src/commands.ts:138 | src/engine/snapshots/snapshotJob.ts:139, :228 (retention runs after every snapshot) | ported |
+| "Cleanup old snapshots (apply retention policy)" | adfa7a7:src/commands.ts:138 | src/engine/snapshots/snapshotJob.ts:194, :273-283 (retention runs after every snapshot) | ported |
 | "Resume interrupted restore" | adfa7a7:src/commands.ts:147 | MISSING | dropped: interrupted restore resume; a restore takes a safety snapshot first, so running it again is safe |
 | "Export portable vault backup" | adfa7a7:src/commands.ts:157 | MISSING | dropped: the vault is plain files, and "Create snapshot now" writes a zip |
 | "Settings sync: apply remote environment" / "replace remote environment with this device" | adfa7a7:src/commands.ts:166, :174 | MISSING | dropped: no environment model (DESIGN §j.3) |
@@ -282,34 +281,35 @@ New only: the pairing code shows a live expiry countdown (src/host/ui/pairModal.
 
 Legacy recovery points lived on the server (`{host}/vault/{id}/recovery`, adfa7a7:src/snapshots/recoveryClient.ts:388),
 so any device could restore them. New snapshots are local zips in the plugin folder (DESIGN §j.4). They can also be
-uploaded as an off-device copy, but nothing records where, so only the device that took a snapshot can restore it.
+uploaded to attachment storage as opaque parts, recorded in the `snap` index stream, so any paired device can list,
+verify and restore them. The server never parses them.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Daily snapshot | adfa7a7:src/snapshots/snapshotService.ts:99; adfa7a7:src/main.ts:1514 | src/engine/snapshots/snapshotJob.ts:144; src/engine/compose/vaultRuntime.ts:360 | ported |
-| Manual snapshot | adfa7a7:src/snapshots/snapshotService.ts:113 | src/engine/snapshots/snapshotJob.ts:90; src/engine/compose/runtimeOps.ts:107 | ported (the command is in §2) |
+| Daily snapshot | adfa7a7:src/snapshots/snapshotService.ts:99; adfa7a7:src/main.ts:1514 | src/engine/snapshots/snapshotJob.ts:103; src/engine/compose/vaultRuntime.ts:362 | ported |
+| Manual snapshot | adfa7a7:src/snapshots/snapshotService.ts:113 | src/engine/snapshots/snapshotJob.ts:93; src/engine/compose/runtimeOps.ts:106 | ported (the command is in §2) |
 | Snapshot reasons (initial, daily, manual, pre-bulk-operation) | adfa7a7:src/snapshots/recoveryClient.ts:44 | src/protocol/messages.ts:138 (daily, brake, epoch, idb, restore, manual) | implemented (687d5bc) (reasons shown in listings) |
-| Retention | adfa7a7:src/snapshots/recoveryClient.ts:887; adfa7a7:src/snapshots/snapshotService.ts:180 | src/engine/snapshots/snapshotJob.ts:228 (keep N dailies and 10 others); src/host/ui/settingsTab.ts:215 | ported |
-| Snapshot list | adfa7a7:src/snapshots/recoveryModals.ts:13; adfa7a7:src/snapshots/snapshotService.ts:152 | src/host/ui/snapshotsModal.ts:38; src/engine/compose/runtimeOps.ts:111 | implemented (6ca0411) |
-| Browse a snapshot's files | adfa7a7:src/snapshots/recoveryModals.ts:55; adfa7a7:src/snapshots/snapshotService.ts:206 | src/host/ui/snapshotsModal.ts:159; src/engine/compose/runtimeOps.ts:115 | implemented (687d5bc, 6ca0411) |
+| Retention | adfa7a7:src/snapshots/recoveryClient.ts:887; adfa7a7:src/snapshots/snapshotService.ts:180 | src/engine/snapshots/snapshotJob.ts:273-283 (keep N dailies and 10 others; uploads: a per-device floor, src/engine/snapshots/remote.ts:56-58); src/host/ui/settingsTab.ts:215 | ported |
+| Snapshot list | adfa7a7:src/snapshots/recoveryModals.ts:13; adfa7a7:src/snapshots/snapshotService.ts:152 | src/host/ui/snapshotsModal.ts:38; src/engine/compose/runtimeOps.ts:110 | implemented (6ca0411) |
+| Browse a snapshot's files | adfa7a7:src/snapshots/recoveryModals.ts:55; adfa7a7:src/snapshots/snapshotService.ts:206 | src/host/ui/snapshotsModal.ts:159; src/engine/compose/runtimeOps.ts:117 | implemented (687d5bc, 6ca0411) |
 | "Back up and restore all" | adfa7a7:src/snapshots/recoveryModals.ts:101 | src/host/ui/snapshotsModal.ts:92 ("Restore all...") | implemented (6ca0411) |
 | "Back up and restore this item" | adfa7a7:src/snapshots/recoveryModals.ts:148 | src/host/ui/snapshotsModal.ts:230 ("Restore selected...") | implemented (6ca0411) |
-| Restore result | adfa7a7:src/snapshots/snapshotService.ts:223 | src/engine/compose/runtimeOps.ts:124-128 (restored, unchanged, copies, failed) | implemented (687d5bc) |
-| Delete a recovery point | adfa7a7:src/snapshots/recoveryModals.ts:44; adfa7a7:src/snapshots/snapshotService.ts:490 | src/host/ui/snapshotsModal.ts:93; src/engine/compose/runtimeOps.ts:130 | implemented (687d5bc, 6ca0411) |
-| Back up current files before a restore replaces them | adfa7a7:src/snapshots/recoveryBackup.ts:33, :39 (`plugins/yaos/restore-backups`), :41 | src/engine/snapshots/snapshotJob.ts:181 (a "restore" snapshot first), :193-199 (a conflict copy of each changed file) | ported |
+| Restore result | adfa7a7:src/snapshots/snapshotService.ts:223 | src/engine/compose/runtimeOps.ts:126-130 (restored, unchanged, copies, failed) | implemented (687d5bc) |
+| Delete a recovery point | adfa7a7:src/snapshots/recoveryModals.ts:44; adfa7a7:src/snapshots/snapshotService.ts:490 | src/host/ui/snapshotsModal.ts:93; src/engine/compose/runtimeOps.ts:132 | implemented (687d5bc, 6ca0411) |
+| Back up current files before a restore replaces them | adfa7a7:src/snapshots/recoveryBackup.ts:33, :39 (`plugins/yaos/restore-backups`), :41 | src/engine/snapshots/snapshotJob.ts:141 (a "restore" snapshot first); src/engine/snapshots/restore.ts:49-59 (a conflict copy of each changed file) | ported |
 | Snapshot "complete with gaps" warning | adfa7a7:src/snapshots/recoveryModals.ts:80 | src/host/ui/snapshotsModal.ts:199-207 (files a snapshot skipped) | implemented (6ca0411) |
-| "Restore as a fresh file identity" | adfa7a7:src/snapshots/recoveryModals.ts:174 | src/engine/snapshots/snapshotJob.ts:175 (a restore is a plain disk write; sync imports it like any local file) | ported |
+| "Restore as a fresh file identity" | adfa7a7:src/snapshots/recoveryModals.ts:174 | src/engine/snapshots/restore.ts:64 (a restore is a plain disk write; sync imports it like any local file) | ported |
 | Capture status dialog | adfa7a7:src/snapshots/recoveryModals.ts:196 | MISSING | dropped: recovery-job UI (coordinator decision) |
 | Resume persisted recovery operations on load | adfa7a7:src/snapshots/snapshotService.ts:67, :195 | MISSING | dropped: interrupted restore resume (coordinator decision) |
-| Upload snapshots off the device | adfa7a7:src/snapshots/recoveryClient.ts:688, :722 (server-side recovery points) | src/engine/snapshots/snapshotJob.ts:129-133; src/host/ui/settingsTab.ts:227 | implemented (6ca0411) (the toggle; upload only) |
-| Cross-device restore (restore a recovery point taken on another device) | adfa7a7:src/snapshots/recoveryClient.ts:722; adfa7a7:src/snapshots/snapshotService.ts:152 | MISSING | missing: large; DESIGN §j.4 keeps it out of v1 (uploads record no address, and there is no list or fetch path) |
+| Upload snapshots off the device | adfa7a7:src/snapshots/recoveryClient.ts:688, :722 (server-side recovery points) | src/engine/snapshots/remote.ts:31-60 (parts through the attachments' blob path, then one `snap` index record); src/engine/snapshots/snapshotJob.ts:93-100, :198-216; src/host/ui/settingsTab.ts:228-229 | implemented (63a48e7) (daily and manual snapshots; resumable, no duplicate records) |
+| Cross-device restore (restore a recovery point taken on another device) | adfa7a7:src/snapshots/recoveryClient.ts:722; adfa7a7:src/snapshots/snapshotService.ts:152 | src/engine/snapshots/snapshotJob.ts:114-155, :218-271 (list from the `snap` index, download, verify, restore); src/core/snap/verify.ts; src/host/ui/snapshotsModel.ts ("· from <device>"); e2e/client/snapshots.ts | implemented (63a48e7, 82dd030, 228baaa) (fails closed as `content_corrupt` on any failed check) |
 | Portable vault export | adfa7a7:src/snapshots/vaultExport.ts:124, :127; adfa7a7:src/main.ts:1389-1390 | MISSING | dropped: portable export (the vault is plain files; a manual snapshot is a zip) |
 
 ## 6. Diagnostics and export
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Export a diagnostics file to the plugin folder | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:207; adfa7a7:src/telemetry/installTelemetryRuntime.ts:253 (needed debug mode on, :184) | src/host/ui/diagnostics.ts:112; src/host/plugin.ts:123 (`diagnostics/`); src/engine/compose/runtimeOps.ts:133-134 | ported (always available) |
+| Export a diagnostics file to the plugin folder | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:207; adfa7a7:src/telemetry/installTelemetryRuntime.ts:253 (needed debug mode on, :184) | src/host/ui/diagnostics.ts:112; src/host/plugin.ts:123 (`diagnostics/`); src/engine/compose/runtimeOps.ts:135-136 | ported (always available) |
 | Paths pseudonymized under a per-bundle salt | adfa7a7:src/telemetry/diagnostics/pathRedactor.ts:124, :277; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:203 | src/engine/compose/diagnosticsBundle.ts:30-35 | implemented (5d42e55) |
 | Export with file names (opt-in) | adfa7a7:src/telemetry/installTelemetryRuntime.ts:258 | src/engine/compose/diagnosticsBundle.ts:92-94; src/host/ui/commands.ts:34 | implemented (5d42e55) |
 | Recent events in the bundle | adfa7a7:src/telemetry/debug/flightRecorder.ts:79 | src/engine/runtime/context.ts:38 (the whole 2000-event ring) | implemented (5d42e55) |
@@ -319,7 +319,7 @@ uploaded as an off-device copy, but nothing records where, so only the device th
 | Vault-versus-CRDT comparison | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:77; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:314 | MISSING | dropped: disk-vs-state hash in diagnostics (coordinator decision) |
 | Leak check and content-fingerprint redaction | adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:352, :385 | MISSING | dropped: diagnostics leak check (pseudonymization replaces it) |
 
-The bundle's store sizes are always 0 bytes (src/engine/compose/runtimeOps.ts:155-157); only record counts are real.
+The bundle's store sizes are always 0 bytes (src/engine/compose/runtimeOps.ts:157-159); only record counts are real.
 
 ## 7. Frontmatter
 

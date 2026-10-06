@@ -3,7 +3,7 @@ import { test } from "node:test";
 import * as Y from "yjs";
 import { CheckpointEncoding } from "../../core/envelope";
 import { FOLD_RULES_VERSION, MAX_FRAME_CONTENT_BYTES } from "../../core/limits";
-import { NS_STREAM, type ClientFrameId, type DeviceId, type StreamName, type VaultId } from "../../core/types";
+import { NS_STREAM, SNAP_STREAM, type ClientFrameId, type ContentHash, type DeviceId, type StreamName, type VaultId } from "../../core/types";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
@@ -14,6 +14,9 @@ import { encodeOuter, frameAad } from "../../core/codec/envelope";
 import { sealCheckpoint, sealFrame } from "./envelope";
 import { gate, type GateCtx, type GateResult } from "./gate";
 import { checkYjsUpdate } from "./yjsCheck";
+import { encodeSnapFoldV1 } from "../../core/codec/snapFoldV1";
+import { SNAP_FOLD_RULES_VERSION, foldSnapFrame, newSnapFold } from "../../core/snap/fold";
+import { encodeSnapOps, snapshotId } from "../../core/snap/record";
 
 const crypto = createNoopCrypto(createWebHash());
 const ctx: GateCtx = { crypto, vaultId: "v1" as VaultId, maxCheckpointStateBytes: 1 << 20 };
@@ -146,4 +149,31 @@ test("gate: suite-1 failures map to quarantine reasons; only key-dependent ones 
 	const header = { formatVersion: 1, suite: 1, keyEpoch: 1 } as const;
 	const unpadded = await s1.seal({ purpose: "frame", keyEpoch: 1, aad: frameAad(header, vaultId, BODY, DEV, CF), plaintext: new Uint8Array(256) });
 	assert.equal(verdict(await at(encodeOuter(header, unpadded))), "envelope-padding/false");
+});
+
+test("gate: snap rows and checkpoints (DESIGN §j.4)", async () => {
+	const T = Date.UTC(2026, 9, 7);
+	const H = (n: number) => n.toString(16).padStart(64, "0") as ContentHash;
+	const record = {
+		version: 1 as const, snapshotId: snapshotId(T, "daily"), createdAtMs: T, deviceLabel: "l", reason: "daily" as const, format: 1,
+		fileCount: 1, totalBytes: 1, bundleDigest: H(1), parts: [{ address: H(2), size: 9, sha256: H(2) }],
+	};
+	const seal = async (content: Uint8Array, kind: "snapOps" | "nsOps") =>
+		gate(ctx, { t: "row", stream: SNAP_STREAM, seq: 1, deviceId: DEV, clientFrameId: CF, payload: (await sealFrame(crypto, ctx.vaultId, { stream: SNAP_STREAM, deviceId: DEV, clientFrameId: CF, kind, authorNsSeq: 0, flags: 0, frameNo: kind === "nsOps" ? 1 : 0, content })).sealed });
+	const ok = await seal(encodeSnapOps([{ t: "put", record }]), "snapOps");
+	assert.ok(ok.ok && ok.t === "snap" && ok.ops?.length === 1);
+	const junk = await seal(new Uint8Array([9, 9, 9]), "snapOps");
+	assert.ok(junk.ok && junk.t === "snap" && junk.ops === null, "malformed: deterministic, folds empty");
+	assert.equal(failReason(await seal(encodeSnapOps([{ t: "put", record }]), "nsOps")), "kind-not-allowed");
+
+	const st = newSnapFold();
+	foldSnapFrame(st, { seq: 7, deviceId: "dev-x-0123456789abcdef" as DeviceId, ops: [{ t: "put", record }] });
+	st.coversSeq = 7;
+	const ck = (bytes: Uint8Array, encoding: CheckpointEncoding = CheckpointEncoding.snapFoldV1, coversSeq = 7) =>
+		sealCheckpoint(crypto, ctx.vaultId, SNAP_STREAM, coversSeq, encodeCheckpointContent({ encoding, coversSeq, foldRulesVersion: SNAP_FOLD_RULES_VERSION, state: bytes }), 0);
+	const good = await gate(ctx, { t: "checkpoint", stream: SNAP_STREAM, coversSeq: 7, payload: await ck(encodeSnapFoldV1(st)) });
+	assert.ok(good.ok && good.t === "checkpoint" && good.snapState?.records.size === 1);
+	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: SNAP_STREAM, coversSeq: 7, payload: await ck(encodeSnapFoldV1(st), CheckpointEncoding.cfgFoldV1) })), "kind-not-allowed");
+	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: SNAP_STREAM, coversSeq: 7, payload: await ck(new Uint8Array([1, 2, 3])) })), "decode-failed");
+	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: SNAP_STREAM, coversSeq: 8, payload: await ck(encodeSnapFoldV1(st), CheckpointEncoding.snapFoldV1, 8) })), "checkpoint-mismatch");
 });

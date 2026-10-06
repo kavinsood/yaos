@@ -20,6 +20,9 @@ import { bytesEqual } from "../../core/codec/lib0";
 import { decodeNsFoldV1, encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { CFG_FOLD_RULES_VERSION } from "../../core/cfg/fold";
+import { decodeSnapFoldV1, encodeSnapFoldV1 } from "../../core/codec/snapFoldV1";
+import { SNAP_FOLD_RULES_VERSION, type SnapFoldState } from "../../core/snap/fold";
+import { decodeSnapOps, type SnapOp } from "../../core/snap/record";
 import { isReaderDependent, openEnvelope } from "./envelope";
 import { checkYjsUpdate } from "./yjsCheck";
 
@@ -41,12 +44,14 @@ export type GatePass =
 	| { readonly ok: true; readonly t: "ns"; readonly inner: InnerEnvelope; readonly ops: readonly NsOp[] | null; readonly detail: string | null }
 	/** ops = null: deterministic malformation, folds as an empty frame (§c.11). */
 	| { readonly ok: true; readonly t: "cfg"; readonly inner: InnerEnvelope; readonly ops: readonly CfgOp[] | null }
+	/** ops = null: malformed (bounds, schema), folds as an empty frame (DESIGN §j.4). */
+	| { readonly ok: true; readonly t: "snap"; readonly inner: InnerEnvelope; readonly ops: readonly SnapOp[] | null }
 	| { readonly ok: true; readonly t: "body"; readonly inner: InnerEnvelope; readonly update: Uint8Array; readonly insertedChars: number }
 	| { readonly ok: true; readonly t: "bodyRef"; readonly inner: InnerEnvelope; readonly ref: BodyUpdateRefContent }
 	| { readonly ok: true; readonly t: "blobchunk"; readonly inner: InnerEnvelope }
 	| {
 		readonly ok: true; readonly t: "checkpoint"; readonly inner: InnerEnvelope; readonly checkpoint: CheckpointContent;
-		readonly nsState: NsFoldState | null; readonly cfgState: CfgFoldState | null;
+		readonly nsState: NsFoldState | null; readonly cfgState: CfgFoldState | null; readonly snapState?: SnapFoldState | null;
 	};
 
 export interface GateFail {
@@ -95,6 +100,8 @@ export async function gate(ctx: GateCtx, subject: GateSubject): Promise<GateResu
 		}
 		case "cfg":
 			return { ok: true, t: "cfg", inner, ops: decodeCfgOps(inner.content) };
+		case "snap":
+			return { ok: true, t: "snap", inner, ops: decodeSnapOps(inner.content) };
 		case "body":
 		case "canvas": {
 			if (inner.kind === "bodyUpdateRef") {
@@ -110,7 +117,7 @@ export async function gate(ctx: GateCtx, subject: GateSubject): Promise<GateResu
 	}
 }
 
-async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "body" | "canvas" | "blobchunk", coversSeq: Seq, inner: InnerEnvelope): Promise<GateResult> {
+async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "snap" | "body" | "canvas" | "blobchunk", coversSeq: Seq, inner: InnerEnvelope): Promise<GateResult> {
 	const ck = decodeCheckpointContent(inner.content);
 	if (!ck) return fail("decode-failed", "checkpoint content");
 	if (ck.coversSeq !== coversSeq) return fail("checkpoint-mismatch", `inner ${ck.coversSeq} != relay ${coversSeq}`);
@@ -142,6 +149,15 @@ async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "body" | "canvas
 			if (!bytesEqual(encodeCfgFoldV1(st), ck.state)) return fail("decode-failed", "cfgFoldV1 not canonical");
 			if (st.coversSeq !== coversSeq) return fail("checkpoint-mismatch", "cfgFoldV1 coversSeq");
 			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: st };
+		}
+		case "snap": {
+			if (ck.encoding !== CheckpointEncoding.snapFoldV1) return fail("kind-not-allowed", `encoding ${ck.encoding}`);
+			if (ck.foldRulesVersion > SNAP_FOLD_RULES_VERSION) return fail("envelope-version", `snap foldRulesVersion ${ck.foldRulesVersion}`, true);
+			const st = decodeSnapFoldV1(ck.state);
+			if (!st) return fail("decode-failed", "snapFoldV1");
+			if (!bytesEqual(encodeSnapFoldV1(st), ck.state)) return fail("decode-failed", "snapFoldV1 not canonical");
+			if (st.coversSeq !== coversSeq) return fail("checkpoint-mismatch", "snapFoldV1 coversSeq");
+			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: null, snapState: st };
 		}
 		case "blobchunk":
 			return fail("kind-not-allowed", "blobchunk checkpoint must be retired");

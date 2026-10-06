@@ -35,6 +35,8 @@ export const EnvelopeKindCode = {
 	checkpoint: 5,
 	blobChunk: 6,
 	bodyUpdateRef: 7,
+	/** Snapshot index ops (`snap` stream, DESIGN §j.4). */
+	snapOps: 8,
 } as const;
 export type EnvelopeKindCode = (typeof EnvelopeKindCode)[keyof typeof EnvelopeKindCode];
 export type EnvelopeKind = keyof typeof EnvelopeKindCode;
@@ -82,6 +84,7 @@ export function kindHasFrameNo(kind: EnvelopeKind): boolean {
  * bodyUpdate:     Yjs update v1 bytes.
  * canvasUpdate:   Yjs update v1 bytes.
  * cfgOps:         varuint opCount, then per op: u8 tag, varuint bodyLen, body (CfgOpTag).
+ * snapOps:        varuint opCount, then per op: u8 tag, varuint bodyLen, body (SnapOpTag, core/snap/record.ts).
  * checkpoint:     u8 CheckpointEncoding, varuint coversSeq, varuint foldRulesVersion, bytes state.
  * blobChunk:      32B sha256, varuint index, varuint total, varuint totalSize, bytes chunk.
  * bodyUpdateRef:  32B sha256 of the update bytes, varuint size (update stored in the blob store).
@@ -117,6 +120,8 @@ export const CheckpointEncoding = {
 	cfgFoldV1: 3,
 	/** Empty state: GC marker for retired streams (pruned tombstones, abandoned merged bodies). */
 	retired: 4,
+	/** Canonical SnapFoldState bytes (`snap` stream). */
+	snapFoldV1: 5,
 } as const;
 export type CheckpointEncoding = (typeof CheckpointEncoding)[keyof typeof CheckpointEncoding];
 
@@ -163,9 +168,10 @@ export type EnvelopeOpenResult =
 	| { readonly ok: false; readonly reason: EnvelopeOpenFailure; readonly header?: EnvelopeHeader };
 
 /** Which envelope kinds a stream class may carry. Anything else is quarantined. */
-export const ALLOWED_KINDS: Readonly<Record<"ns" | "cfg" | "body" | "canvas" | "blobchunk", readonly EnvelopeKind[]>> = {
+export const ALLOWED_KINDS: Readonly<Record<"ns" | "cfg" | "snap" | "body" | "canvas" | "blobchunk", readonly EnvelopeKind[]>> = {
 	ns: ["nsOps", "checkpoint"],
 	cfg: ["cfgOps", "checkpoint"],
+	snap: ["snapOps", "checkpoint"],
 	body: ["bodyUpdate", "bodyUpdateRef", "checkpoint"],
 	canvas: ["canvasUpdate", "bodyUpdateRef", "checkpoint"],
 	blobchunk: ["blobChunk", "checkpoint"],

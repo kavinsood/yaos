@@ -15,6 +15,8 @@ export type ProtocolErrorCode =
 	| "revoked"
 	| "aborted"
 	| "timeout"
+	/** A snapshot failed restore verification (DESIGN §j.4); the message names the snapshot and the failed check. */
+	| "content_corrupt"
 	| "internal";
 
 export interface ProtocolError {

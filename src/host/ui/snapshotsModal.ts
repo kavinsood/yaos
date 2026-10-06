@@ -12,7 +12,7 @@ import { confirmAction } from "./confirmModal";
 import { errorMessage, formatBytes } from "./format";
 import {
 	deleteCopy, fileView, restoreAllCopy, restoreSelectedCopy, restoreSummary, selectedPaths, selectionText, skippedText,
-	snapshotRows, withAll, withPath,
+	loadingText, snapshotRows, withAll, withPath,
 	type SnapshotRow,
 } from "./snapshotsModel";
 
@@ -179,7 +179,7 @@ export class SnapshotFilesModal extends Modal {
 		this.setTitle("Snapshot files");
 		contentEl.createEl("p", { text: `${this.row.title} (${this.row.detail})` });
 		const body = contentEl.createDiv();
-		body.createEl("p", { text: "Loading files…" });
+		body.createEl("p", { text: loadingText(this.row) });
 		void this.load(body);
 	}
 

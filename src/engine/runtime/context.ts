@@ -6,7 +6,7 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, streamClass, streamDocId, type ClientFrameId, type DeviceId, type DocId, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type ClientFrameId, type DeviceId, type DocId, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
@@ -22,6 +22,7 @@ import type { Mut, Repo } from "../store/repo";
 import type { OutboxRecord } from "../store/schema";
 import type { CatchUpDeps } from "../sync/catchUp";
 import type { CfgRuntime } from "../sync/cfgRuntime";
+import type { SnapRuntime } from "../sync/snapRuntime";
 import type { NsRuntime } from "../sync/nsRuntime";
 import type { DocRuntime } from "./docRuntime";
 import type { LiveIngest } from "./liveIngest";
@@ -55,6 +56,7 @@ export class EngineCtx {
 	repo!: Repo;
 	ns!: NsRuntime;
 	cfg!: CfgRuntime;
+	snap!: SnapRuntime;
 	handles!: HandleManager;
 	sender!: Sender;
 	docs!: DocRuntime;
@@ -181,9 +183,10 @@ export class EngineCtx {
 		for (const r of res.removed) {
 			const cls = streamClass(r.stream);
 			if (cls === "body" || cls === "canvas") drained.add(r.stream);
-			// ns/cfg records leave the outbox only on (late) receipt: keep them in the overlay until folded.
+			// ns/cfg/snap records leave the outbox only on (late) receipt: keep them in the overlay until folded.
 			if (r.stream === NS_STREAM) this.ns.noteCommitted(r);
 			else if (r.stream === CFG_STREAM) this.cfg.noteCommitted(r);
+			else if (r.stream === SNAP_STREAM) this.snap.noteCommitted(r);
 			this.outbox.delete(r.clientFrameId);
 			this.sender.remove(r.clientFrameId);
 			this.sentPending.delete(r.clientFrameId);
@@ -267,6 +270,14 @@ export class EngineCtx {
 		if (folded.length === 0 && !reload) return;
 		const events = folded.flatMap((f) => f.events);
 		this.emit("onCfgFold", () => this.opts.onCfgFold?.(events, reload));
+	}
+
+	/** Fold newly available snap rows (reload: snapshot replaced). The index is read on demand (snapView). */
+	async afterSnapChange(reload = false): Promise<void> {
+		const before = this.snap.unknownVersions;
+		const folded = reload ? await this.snap.load() : await this.snap.advance();
+		if (this.snap.unknownVersions > before) this.diag("snap-unknown-version", { ops: this.snap.unknownVersions - before });
+		if (folded.length > 0 || reload) this.diag("snap-fold", { frames: folded.length, coversSeq: this.snap.coversSeq, reload });
 	}
 
 	/** onBodyChange for the body / canvas streams among `streams` (deduped; nothing if none). */

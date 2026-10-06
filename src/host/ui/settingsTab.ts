@@ -226,7 +226,7 @@ export class YaosSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Upload snapshots to attachment storage",
-				desc: "Also upload each new snapshot to the server's attachment storage as an off-device copy (encrypted only if the vault uses end-to-end encryption). Needs attachment storage on the server; without it only the copy on this device is kept. Snapshots can still be browsed and restored only on the device that took them.",
+				desc: "Also upload daily and manual snapshots to the server's attachment storage, so you can restore them from any of your devices (encrypted only if the vault uses end-to-end encryption). Needs attachment storage on the server; without it only the copy on this device is kept.",
 				control: { type: "toggle", key: "snapshotsUpload" },
 			},
 		];
@@ -259,7 +259,7 @@ export class YaosSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Browse snapshots",
-				desc: "See the recovery snapshots on this device, restore all or some of their files, or delete one.",
+				desc: "See the recovery snapshots on this device and those uploaded from your devices, restore all or some of their files, or delete one.",
 				disabled: commandsOff,
 				action: () => this.actions.openSnapshots(),
 			},

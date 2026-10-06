@@ -11,7 +11,7 @@
  * The in-memory `streams` cache is updated only after a commit.
  */
 
-import { CFG_STREAM, NS_STREAM, streamClass, streamDocId } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId } from "../../core/types";
 import type { ClientFrameId, DeviceId, Seq, StreamName, VaultEpoch, VaultId } from "../../core/types";
 import { QUARANTINE_MAX_RECORDS } from "../../core/limits";
 import type { KeyRange, StorageDb, StoragePort, StorageTx } from "../../ports/storage";
@@ -57,6 +57,7 @@ export function defaultPriority(rec: Pick<StreamRecord, "cls">): number {
 	switch (rec.cls) {
 		case "ns": return 0;
 		case "cfg": return 1;
+		case "snap": return 2;
 		case "body": case "canvas": return 100;
 		case "blobchunk": return 1000;
 		default: return 5000;
@@ -805,7 +806,7 @@ async function releaseDependents(tx: Tx, gone: OutboxRecord): Promise<OutboxReco
 	const isChunk = streamClass(gone.stream) === "blobchunk";
 	// Adoption dependencies: an adoptable, or an adopted record re-appended as pending (dependents wait for its receipt).
 	if (gone.adoptOf === null && !isChunk) return [];
-	if (gone.stream === NS_STREAM || gone.stream === CFG_STREAM) return [];
+	if (gone.stream === NS_STREAM || gone.stream === CFG_STREAM || gone.stream === SNAP_STREAM) return [];
 	const held = await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, stateOrderRange("held"));
 	const out: OutboxRecord[] = [];
 	for (const h of held) {

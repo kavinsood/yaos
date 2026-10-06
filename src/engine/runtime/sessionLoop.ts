@@ -15,7 +15,7 @@
  */
 
 import { RELAY_CLOSE } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, streamClass, type Seq, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, type Seq, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import type { ReadPage, ReadRequest, RelayConnectResult, RelayEvent, RelaySession } from "../../ports/relay";
 import { readStream, staleOrder, type ReadResult } from "../sync/catchUp";
@@ -137,11 +137,12 @@ export class SessionLoop {
 			await this.feedTo(gen, session.headSeq);
 			if (gen !== c.gen) return;
 			c.live.enable();
-			await this.readInOrder([NS_STREAM, CFG_STREAM].filter((s) => c.repo.stream(s)?.stale));
+			await this.readInOrder([NS_STREAM, CFG_STREAM, SNAP_STREAM].filter((s) => c.repo.stream(s)?.stale));
 			if (gen !== c.gen) return;
 			c.sender.openNs();
 			await c.afterNsChange();
 			await c.afterCfgChange();
+			await c.afterSnapChange();
 			if (gen !== c.gen) return;
 			c.setPhase(c.dailyLimitUntilMono > c.mono() ? "daily-limit" : "live");
 			this.st = newReconnectState();
@@ -382,6 +383,7 @@ export class SessionLoop {
 			if (res.checkpointState || res.t === "done" || res.apply.length > 0 || res.tailPut.some((r) => r.deviceId !== c.self)) c.noteBodyChange([stream]);
 		} else if (cls === "ns") await c.afterNsChange(res.replacedFold);
 		else if (cls === "cfg") await c.afterCfgChange(res.replacedFold);
+		else if (cls === "snap") await c.afterSnapChange(res.replacedFold);
 		else if (cls === "blobchunk" && res.tailPut.length > 0) await c.docs.retryRefs();
 		if (cls !== "ns" && res.removed.length > 0) await c.afterNsChange();
 		if (res.rows > 0 || res.t === "done") c.lastSyncedAtMs = c.now();

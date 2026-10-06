@@ -7,7 +7,6 @@ import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
-import { badRequest } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { encodeStateAsUpdate } from "../body/yjsCounters";
@@ -111,11 +110,14 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 			return { t: "ok" };
 		case "listSnapshots": {
 			const list = await rt.snaps.list();
-			return { t: "snapshots", snapshots: list.map((s) => ({ id: s.id, createdAtMs: s.createdAtMs, reason: s.reason, files: s.files, bytes: s.bytes })) };
+			return {
+				t: "snapshots",
+				snapshots: list.map((s) => ({ id: s.id, createdAtMs: s.createdAtMs, reason: s.reason, files: s.files, bytes: s.bytes, where: s.where, ...(s.device !== null ? { device: s.device } : {}) })),
+			};
 		}
 		case "snapshotFiles": {
+			// Verifies the whole snapshot first (a remote one is downloaded): unknown id bad-request, damaged content_corrupt.
 			const m = await rt.snaps.manifest(c.snapshotId);
-			if (!m) throw badRequest(`snapshot ${c.snapshotId} not found`);
 			return {
 				t: "snapshotFiles", snapshotId: c.snapshotId,
 				files: m.files.map((f) => ({ path: f.path, kind: f.kind, size: f.size })),

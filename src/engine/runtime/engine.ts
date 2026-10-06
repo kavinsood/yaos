@@ -13,6 +13,8 @@
 import * as Y from "yjs";
 import { EnvelopeFlag, type BlobChunkContent } from "../../core/envelope";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
+import type { SnapFoldState } from "../../core/snap/fold";
+import type { SnapOp } from "../../core/snap/record";
 import { NS_STREAM, docStream, kindOfPath, streamClass, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type DeviceId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { RelaySession } from "../../ports/relay";
@@ -29,6 +31,7 @@ import { releaseQuarantine, retryReaderQuarantine } from "./quarantineRelease";
 import type { BodyHandle } from "../reconcile/deps";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { CfgRuntime } from "../sync/cfgRuntime";
+import { SnapRuntime } from "../sync/snapRuntime";
 import { NsRuntime, type DocInfo } from "../sync/nsRuntime";
 import * as api from "./logApi";
 import * as blobs from "./blobChunks";
@@ -56,6 +59,7 @@ function rankOf(c: EngineCtx) {
 		const cls = streamClass(rec.stream);
 		if (cls === "ns") return 1;
 		if (cls === "cfg") return 2;
+		if (cls === "snap") return 3;
 		if (cls === "blobchunk" || (rec.flags & EnvelopeFlag.adopted) !== 0) return 4;
 		return (c.handles.peek(rec.stream)?.bound ?? 0) > 0 ? 0 : 3;
 	};
@@ -139,6 +143,7 @@ export class LogEngine {
 		c.cfg = new CfgRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.ns.frameNoFloor = repo.frameNoFloor.ns;
 		c.cfg.frameNoFloor = repo.frameNoFloor.cfg;
+		c.snap = new SnapRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.docs = new DocRuntime(c);
 		c.handles = new HandleManager(repo, c.budgets, c.docs.hooks());
 		c.sender = new Sender({
@@ -186,6 +191,7 @@ export class LogEngine {
 		c.mirror.scheduleIfBehind(c.outbox.all());
 		await c.afterNsChange(true);
 		await c.afterCfgChange(true);
+		await c.afterSnapChange(true);
 		eng.maint.start();
 		if (first) void c.sess.onSession(first);
 		else c.sess.startLoop();
@@ -269,6 +275,16 @@ export class LogEngine {
 	/** Committed cfg fold + own pending cfg frames (a copy). */
 	cfgView(): CfgFoldState {
 		return api.cfgView(this.c);
+	}
+
+	/** Own snapshot-index ops (DESIGN §j.4) -> frames in the outbox; resolves once committed (in snapView()). */
+	submitSnap(ops: readonly SnapOp[]): Promise<ClientFrameId[]> {
+		return api.submitSnap(this.c, ops);
+	}
+
+	/** Snapshot index fold + own pending snap frames (a copy). */
+	snapView(): { readonly state: SnapFoldState; readonly caughtUp: boolean } {
+		return api.snapView(this.c);
 	}
 
 	/** Body info of a markdown / canvas doc; null = unknown doc or blob. `kind` skips the lookup. */

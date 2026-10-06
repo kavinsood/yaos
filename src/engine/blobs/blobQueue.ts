@@ -34,6 +34,7 @@ import type { StorageDb } from "../../ports/storage";
 import type { BlobTransfer } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
 import { STORE, type BlobQueueRecord } from "../store/schema";
+import { getOpened, putSealed } from "./blobStore";
 import { assembleChunks, splitChunks, type BlobChunkLog } from "./chunks";
 
 export const BLOB_RETRY_BASE_MS = 2_000;
@@ -171,7 +172,10 @@ export class BlobQueue implements BlobTransfer {
 			if (this.backingOff("up", req.hash)) return false;
 			let ok = false;
 			try {
-				ok = this.deps.store ? await this.putStore(req.hash as ContentHash, req.bytes) : await this.putLog(req.hash as ContentHash, req.bytes);
+				if (this.deps.store) {
+					await putSealed(this.deps.store, this.deps.crypto, req.hash as ContentHash, req.bytes);
+					ok = true;
+				} else ok = await this.putLog(req.hash as ContentHash, req.bytes);
 			} catch {
 				ok = false;
 			}
@@ -228,30 +232,12 @@ export class BlobQueue implements BlobTransfer {
 	private async getVerified(hash: ContentHash): Promise<Fetched> {
 		let bytes: Uint8Array | null = null;
 		try {
-			bytes = this.deps.store ? await this.getStore(hash) : await this.getLog(hash);
+			bytes = this.deps.store ? await getOpened(this.deps.store, this.deps.crypto, hash) : await this.getLog(hash);
 		} catch {
 			bytes = null;
 		}
 		if (bytes && sha256Hex(bytes) !== hash) return { bytes: null, corrupt: true };
 		return { bytes, corrupt: false };
-	}
-
-	private async putStore(hash: ContentHash, bytes: Uint8Array): Promise<boolean> {
-		const store = this.deps.store!;
-		const addr = await this.deps.crypto.blobAddress(hash);
-		const have = await store.has([addr]);
-		if (have.has(addr)) return true;
-		await store.put(addr, await this.deps.crypto.sealBlob({ address: addr, plaintext: bytes }));
-		return true;
-	}
-
-	private async getStore(hash: ContentHash): Promise<Uint8Array | null> {
-		const store = this.deps.store!;
-		const address = await this.deps.crypto.blobAddress(hash);
-		const sealed = await store.get(address);
-		if (!sealed) return null;
-		const opened = await this.deps.crypto.openBlob({ address, sealed });
-		return opened.ok ? opened.plaintext : null;
 	}
 
 	private async putLog(hash: ContentHash, bytes: Uint8Array): Promise<boolean> {

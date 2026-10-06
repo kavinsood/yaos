@@ -497,13 +497,15 @@ when the Worker binds `YAOS_BUCKET` (R2). Then `capabilities.attachments` is `tr
 
 | Route | Capability | Response |
 |---|---|---|
-| `PUT /vault/:id/blobs/<sha256 hex>` (body ≤ `maxBlobUploadBytes` = 10 MiB) | `vault.attachments.write` | `204`; `400 hash mismatch` |
+| `PUT /vault/:id/blobs/<sha256 hex>` (body ≤ `maxBlobUploadBytes` = 10 MiB) | `vault.attachments.write` | `204`. The address is opaque: no hash check, and a PUT overwrites (server/src/router.ts:551) |
 | `GET /vault/:id/blobs/<sha256 hex>` | `vault.attachments.read` | |
 | `POST /vault/:id/blobs/exists {"hashes":[...]}` | `vault.attachments.read` | `{present:[...]}` |
 
 Without the bucket these return `503 attachments_unavailable`. The client-e2e deployment and local dev run
-**without R2**, which matches the Free-plan profile; the client must treat attachments as unavailable. A client can
-reference blobs from stream payloads by hash.
+**without R2**, which matches the Free-plan profile; the client must treat attachments as unavailable.
+`start-local.sh --r2` keeps the bucket (miniflare R2) for tests that need it, such as e2e/client/snapshots.ts. A
+client can reference blobs from stream payloads by hash. Because the relay checks no hashes, the client verifies
+every blob it downloads (DESIGN §j.1, §j.4).
 
 ### 11.4 Cloudflare Free-plan daily limit
 
@@ -563,8 +565,9 @@ Billed writes:
 ## 13. Running
 
 ```sh
-# local (wrangler dev, DO SQLite persisted under experiments/logs/client-e2e-local-state, YAOS_STREAMS=true, no R2)
-scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--var K=V]
+# local (wrangler dev, DO SQLite persisted under experiments/logs/client-e2e-local-state, YAOS_STREAMS=true, no R2
+# unless --r2)
+scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--r2] [--var K=V]
 scripts/relay-dev/stop-local.sh
 
 # deploy (cf CLI credentials fed to wrangler; generated server/wrangler.relay2-<suffix>.toml is git-excluded)

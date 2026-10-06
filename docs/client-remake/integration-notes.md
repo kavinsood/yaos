@@ -399,8 +399,10 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - Device and member management (roster, revoke, rename, invite a person,
   ownership transfer, leave) lives only in the server's operator console. The
   plugin pairs this device and creates pairing codes for your other devices.
-- A snapshot uploaded to attachment storage cannot be restored on another
-  device: cross-device restore is out of scope for v1 (§j.4).
+- A snapshot uploaded to attachment storage can be listed, verified and
+  restored on any paired device (§j.4). A damaged one is refused as
+  `content_corrupt`. Parts of superseded snapshots stay in R2 until the vault
+  is deleted, because there is no blob GC before server ask A3.
 - Settings sync: while `cfgBase` is empty, a pass waits until this runtime has
   read the cfg stream to the relay head (the log reached `live`, 66c8a4c). A
   device that never reaches `live` never runs its first settings pass.

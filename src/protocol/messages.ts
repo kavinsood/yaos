@@ -137,13 +137,17 @@ export interface BindInfo {
 /** Why a local recovery snapshot was taken (DESIGN §j.4). */
 export type SnapshotReason = "daily" | "brake" | "epoch" | "idb" | "restore" | "manual";
 
-/** One local snapshot (listSnapshots). `bytes` = sum of the file sizes inside, not the zip size. */
+/** One snapshot (listSnapshots). `bytes` = sum of the file sizes inside, not the zip size. */
 export interface SnapshotSummary {
 	readonly id: string;
 	readonly createdAtMs: number;
 	readonly reason: SnapshotReason;
 	readonly files: number;
 	readonly bytes: number;
+	/** On this device, in the blob store (uploaded by any device), or both. Absent = local. */
+	readonly where?: "local" | "remote" | "both";
+	/** Label of the device that took a remote snapshot. */
+	readonly device?: string;
 }
 
 /** A file inside a snapshot (snapshotFiles). */
@@ -156,7 +160,8 @@ export interface SnapshotFileEntry {
 /** A file the snapshot does not contain although it was in the vault when it was taken. */
 export interface SnapshotSkippedEntry {
 	readonly path: VaultPath;
-	readonly reason: "too-large" | "unreadable";
+	/** invalid: would not pass restore verification (bad path, markdown not UTF-8, canvas that does not parse). */
+	readonly reason: "too-large" | "unreadable" | "invalid";
 }
 
 /**

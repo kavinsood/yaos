@@ -31,7 +31,7 @@ Each invariant from report.md is enforced by named structures, not by care.
 |---|---|---|
 | I1 | Never lose a local edit: it stays in the durable outbox until the receipt. | `outbox` store (§e.1). `T_edit` commits **before** `append` (§e.2). The record is deleted only by `T_receipt` or a late receipt found by `T_read_page`. The outbox mirror side files survive IDB loss (§e.4). Before `T_edit`, the durable copy is the disk file: Obsidian's save for bound notes, and the merge order "Y apply + `T_edit` → disk write" (§e.2) for merges. Poisoned frames are re-derived from disk, never dropped silently (§d.5). Y.Text is never wholesale-replaced (§f.3). |
 | I2 | Never destroy a file on disk without a recoverable copy. | `VaultPort` exposes only `trash`, never a permanent delete. Every destructive `DiskOp` carries a CAS precondition (`WritePrecondition`). `conflictCopy` runs before any conflicting overwrite. `intents` store (§e.1). The safety brake counts deletes, trashes and overwrites that shrink a file by ≥ 50 % (§f.5). Fold losers are renamed, never deleted (§c.13). Recovery snapshots are taken before brake approval, epoch migration and IDB recovery (§j.4). |
-| I3 | The same log prefix gives the same state everywhere. | Pure fold `FoldNsFrame` over `(seq, index)` (§c). `FOLD` constants in `limits.ts`. Frozen Unicode case folding (§c.2). Duplicate-frame ring plus send window (§c.3). `upgradeRules` halts instead of guessing (§c.10). Canonical `nsFoldV1` checkpoints are verified by re-encode and digests (§b.5). `cfg` is LWW on `(seq, index)` (§c.11). Bodies are Yjs CRDTs. |
+| I3 | The same log prefix gives the same state everywhere. | Pure fold `FoldNsFrame` over `(seq, index)` (§c). `FOLD` constants in `limits.ts`. Frozen Unicode case folding (§c.2). Duplicate-frame ring plus send window (§c.3). `upgradeRules` halts instead of guessing (§c.10). Canonical `nsFoldV1` checkpoints are verified by re-encode and digests (§b.5). `cfg` is LWW on `(seq, index)` (§c.11). `snap` is an order-independent join (§j.4). Bodies are Yjs CRDTs. |
 | I4 | One device's bad update can't corrupt others. | One ingest gate: verify → decode in scratch → check → apply, or quarantine (§d.6). `quarantine` store; per-doc `frozen`. Checkpoints are UNIONed into local state, never replace it (§d.7). A malformed ns frame folds as empty, deterministically. Merges run only against a caught-up CRDT (§f.3). The brake holds mass destruction (§f.5). The ns-divergence alarm holds destructive ops (§b.5). |
 | I5 | Bounded resources per device class (memory, CPU, battery, rows written). | `BUDGETS[deviceClass]` (§i.2). Clean-only LRU residency (§d.1). Frame builder caps (§d.4). Store bounds (§e.3). Priority lanes and slices (§i.1). Token bucket and daily soft budget (§i.6). Compaction thresholds (§d.8). No O(document) work per keystroke: frames are `Y.mergeUpdates` of small batches, never `encodeStateAsUpdate`, and nothing rewrites a full doc per edit. |
 | I6 | Disk events are hints; a periodic full reconcile is the truth check. | `VaultEvent`s only mark paths dirty. The `LocalEntry` stat cache is confirmed by hash (§f.6). A full reconcile runs every `fullReconcileIntervalMs` and on resume. The planner is a pure function of the three trees (§f.2). Echo suppression only drops events; it never decides anything (§f.4). |
@@ -74,6 +74,7 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed))
 |---|---|---|---|---|---|
 | `ns` | ns | `nsOps` | `nsFoldV1` | commit-only | every device (planner) |
 | `cfg` | cfg | `cfgOps` | `cfgFoldV1` | commit-only | devices with settings sync on |
+| `snap` | snap | `snapOps` | `snapFoldV1` | commit-only | devices that upload or delete snapshots (§j.4) |
 | `b:<docId>` | body | `bodyUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the note |
 | `c:<docId>` | canvas | `canvasUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the canvas |
 | `x:<sha256hex>` | blobchunk | `blobChunk` | `retired` | commit-only | uploader when there is no blob store |
@@ -122,6 +123,14 @@ opCount × { u8 tag, varuint bodyLen, body[bodyLen] }
   - `pluginSet(5)`: `varstring pluginId, u8 enabled`
   - `pluginDel(6)`: `varstring pluginId`
   - Malformation rules are the same as `nsOps`.
+- **`snapOps`** (`src/core/snap/record.ts`). `varuint opCount (1..16)`, then `{u8 tag, varuint bodyLen, body}` per op:
+  - `put(1)`: `u8 recordVersion`; version 1 is `varstring snapshotId, varuint createdAtMs, varstring deviceLabel,
+    varstring reason, u8 format, varuint fileCount, varuint totalBytes, 32B bundleDigest, varuint partCount
+    (1..512)`, then per part `32B address, varuint size, 32B sha256`. At most 48 KiB per record;
+  - `del(2)`: `varstring deviceId, varstring snapshotId`;
+  - `floor(3)`: `varuint createdAtMs` (the author's snapshots created before it are deleted).
+  - Malformation rules are the same as `nsOps`, plus every bound in §j.4. A put with an unknown `recordVersion` is
+    not malformed: the fold ignores it and reports it.
 - **`blobChunk`.** `32B sha256(whole blob), varuint index, varuint total, varuint totalSize, bytes chunk`.
   - Chunks are `BLOB_CHUNK_BYTES` (768 KiB); only the last may be shorter.
 - **`bodyUpdateRef`.** `32B sha256(update bytes), varuint size`.
@@ -215,6 +224,11 @@ A peer **verifies** an ns checkpoint before using it:
 Each register is `value? (u8 present + bytes), varuint seq, varuint index, varstring deviceId`. Verification is
 V1 + V2.
 
+**Snapshot index (`snapFoldV1`, encoding 5).** Header `varuint formatVersion, varuint coversSeq`, then floors
+sorted by deviceId, dels sorted by key and records sorted by key (key = `deviceId/snapshotId`; a record is
+`varstring deviceId, varbytes put body`). Verification: strict decode (every id, record and bound), then the
+canonical re-encode must be byte-identical; `foldRulesVersion` ≤ 1, and the inner coversSeq equals the relay's.
+
 **`retired`.** An empty state that tells the relay it may GC every row ≤ coversSeq. It is written only for:
 - `b:`/`c:` streams of docIds the fold has pruned, or that are merged aliases with rows;
 - `x:` streams no ns entry or cfg file references (§j.1).
@@ -229,11 +243,13 @@ the union adds nothing, and rows > coversSeq still apply.
 | Sealed envelope | `maxFrameBytes` (1 MiB; larger closes the socket with 1009) | Content ≤ `MAX_FRAME_CONTENT_BYTES` (1 MiB − 4 KiB, leaving room for the header and AEAD). |
 | ns frame | ≤ 512 ops, ≤ 256 KiB content | The planner splits; ops for one doc stay in plan order across frames. |
 | cfg frame | ≤ 512 ops, ≤ 256 KiB | `filePut` content > 64 KiB goes as a blob ref (§j.3). |
+| snap frame | ≤ 16 ops, records ≤ 48 KiB | One upload is one frame: `put` plus an optional `floor` (§j.4). |
 | Body frame | soft 256 updates / 64 KiB | Holds whole updates. A single update may exceed 64 KiB. |
 | Initial content of a new note | `INITIAL_INSERT_CHUNK_CHARS` = 192 Ki UTF-16 units | Inserted as consecutive transactions of ≤ 192 Ki units: one update, one frame (flag `initial`) each, so ≤ 576 KiB UTF-8. |
 | Any single update > content limit after deflate | — | `bodyUpdateRef`: bytes go to `BlobPort`, else `x:<sha256>` chunks (≤ `MAX_LOG_BLOB_BYTES` = 8 MiB). Larger with no blob store: the doc is frozen `oversize-local`, the disk file is left untouched, and a notice is shown. |
 | Checkpoint | `maxCheckpointBytes` (4 MiB) | Larger: skip. The stream keeps its rows. An ns state > 4 MiB (roughly 40k entries) is open risk OR-3. |
 | Attachment | `BlobPort.maxBlobBytes` (10 MiB), else 8 MiB on the log | Larger: not synced, never deleted, notice (§j.1). |
+| Snapshot part | `min(8 MiB, ⌊maxBlobBytes × 7/8⌋)`; ≤ 512 parts, zip ≤ 320 MiB | Parts go to the `BlobPort` only, never to the log (§j.4). |
 
 ---
 
@@ -309,8 +325,9 @@ writer-side **send window** closes the gap:
   newest 64 ids;
 - after a receipt a frame is never resent.
 
-The same ring and window apply to `cfg`. On reconnect the engine first catches up `ns` and `cfg`; own frames found
-there are late receipts. Only then does it resend what remains (§d.7), so duplicates are rare even before the ring.
+The same ring and window apply to `cfg`. `snap` needs no ring: its fold is a join, so a duplicate row changes
+nothing (§j.4). On reconnect the engine first catches up `ns`, `cfg` and `snap`; own frames found there are late
+receipts. Only then does it resend what remains (§d.7), so duplicates are rare even before the ring.
 
 ### c.4 Placement (create, rename, restore, revive)
 
@@ -790,7 +807,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - Decode the inner envelope.
    - Check the kind against `ALLOWED_KINDS[class]`, and the checkpoint coversSeq binding.
 2. **Decode and bound** (no doc needed).
-   - **ns / cfg:** the full op decode (§b.3).
+   - **ns / cfg / snap:** the full op decode (§b.3, §b.4). For snap that includes every record bound (§j.4).
    - **body / canvas:** `Y.decodeUpdate` (structural). Then all of:
      - root parent names ⊆ the allowed roots of the class;
      - content types limited to strings, deletes, `ContentType` (`Y.Text`/`Y.Map` per §j.2), `ContentAny` and
@@ -811,12 +828,12 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
      quarantine: the row is valid and stays in tail. The doc just stops projecting.
    - **Canvas:** the projection validates the JSON canvas (§j.2). Invalid → freeze `canvas-invalid`.
 4. **Apply or quarantine.**
-   - Apply: `Y.applyUpdate(doc, update, REMOTE)`, or fold the ns/cfg frame.
+   - Apply: `Y.applyUpdate(doc, update, REMOTE)`, or fold the ns/cfg/snap frame.
    - Quarantine: put a `quarantine` record and set `streams.frozen = 1` for the doc.
 
 **Failures by stream class:**
 
-| Failure | ns / cfg | body / canvas / x |
+| Failure | ns / cfg / snap | body / canvas / x |
 |---|---|---|
 | Deterministic malformation (bytes, decode) | Fold as empty frame (§c.3); diagnostics event | Quarantine, freeze doc |
 | Reader-dependent (unknown version, suite or key; auth failure) | **Halt** the fold at the row (`upgrade-required` / `key-missing`); rows wait in `tail` | Quarantine, freeze doc (retried on upgrade or new keys) |
@@ -861,7 +878,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - set V to `throughSeq`.
    - V reaches H after about `streams / 1000` pages, with no row reads.
 4. **Reads.** Catch-up jobs take stale streams by `byStalePriority`, up to `catchUpConcurrency` at once. Open notes
-   run in lane 1 and ns/cfg in lane 2, first.
+   run in lane 1 and ns/cfg/snap in lane 2, first (in that order).
    - Each job calls `read(stream, appliedSeq, preferCheckpoint = appliedSeq === 0)` and gates each page.
    - **`T_read_page`:** put tail rows. An own row (`deviceId` = self) whose `clientFrameId` is in the outbox is a
      **late receipt**, handled exactly like `T_receipt`. An own row without an outbox record is a plain row.
@@ -877,7 +894,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 5. **Live rows for a stale stream:**
    - **body/canvas:** stored, and applied at once if resident. Yjs is order-independent, so latency stays low while
      catching up.
-   - **ns/cfg:** stored and **not folded** until the stream is caught up. After that, rows arrive live in order (R2)
+   - **ns/cfg/snap:** stored and **not folded** until the stream is caught up. After that, rows arrive live in order (R2)
      and fold immediately.
 
 **Cursor advance.**
@@ -890,8 +907,8 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 
 **Reconnect order:**
 1. feed;
-2. ns and cfg reads (their late receipts remove outbox records);
-3. resend the remaining ns/cfg frames under the send window;
+2. ns, cfg and snap reads (their late receipts remove outbox records);
+3. resend the remaining ns/cfg frames under the send window, then snap frames;
 4. body frames are resent right after `VAULT_READY`, because CRDT idempotence makes duplicates harmless.
 
 The planner does no destructive work until ns is caught up (§f.2).
@@ -912,8 +929,8 @@ The planner does no destructive work until ns is caught up (§f.2).
   3. `bytes = Y.encodeStateAsUpdate(scratch)`.
   4. `T_compact`: CAS on `snapshotCoversSeq` unchanged; put the snapshot `{coversSeq: C}`; delete exactly the loaded
      tail keys; update the counters.
-  - ns and cfg compact the same way. Their "replay" is the fold, and their snapshot is the `nsFoldV1` / `cfgFoldV1`
-    bytes at `coversSeq`.
+  - ns, cfg and snap compact the same way. Their "replay" is the fold, and their snapshot is the `nsFoldV1` /
+    `cfgFoldV1` / `snapFoldV1` bytes at `coversSeq`.
 - **The resident replica is not touched.** Compaction never runs `Y.mergeUpdates` over stored arrays.
 - **Cost:** O(doc) per ≥ 200 rows or 256 KiB of tail.
 - Alternative: compaction by `Y.mergeUpdates(snapshot, ...tail)`. Rejected: memory spikes and no GC (a fixed
@@ -945,7 +962,7 @@ The planner does no destructive work until ns is caught up (§f.2).
   - Only candidate seqs (§b.5). The device keeps the `nsFoldV1` bytes of its newest candidate in memory.
   - Duty: the author of the candidate row, when ≥ `NS_CHECKPOINT_ROWS` ns rows or ≥ `NS_CHECKPOINT_BYTES` have
     accumulated since the last checkpoint. Others take over after 10 min.
-  - cfg uses the same candidate rule.
+  - cfg and snap use the same candidate rule.
 - **`retired`.**
   - For streams of docIds in a fold `pruned` event, or merged aliases that have rows.
   - Duty: the device whose frame caused the prune or merge. Fallback: 10 min.
@@ -969,7 +986,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | Store | Key path | Indexes | Value | Bound |
 |---|---|---|---|---|
 | `meta` | `key` | — | `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty` | 5 records |
-| `streams` | `stream` | `byStalePriority [stale, priority]`, `byAccess lastAccessMs` | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, active `x:`; deleted after `retired` |
+| `streams` | `stream` | `byStalePriority [stale, priority]`, `byAccess lastAccessMs` | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, active `x:`; deleted after `retired` |
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | Soft `OUTBOX_SOFT_BYTES` (16 MiB): builders stretch, notice. **Never dropped** |
@@ -1062,7 +1079,7 @@ frameCount × {
     receipts;
   - immediately on `hidden` / `pagehide`;
   - the target is the slot with the lower or invalid generation.
-- **Size limit.** Over `OUTBOX_MIRROR_MAX_BYTES`, the mirror keeps all ns/cfg frames first, then body frames by
+- **Size limit.** Over `OUTBOX_MIRROR_MAX_BYTES`, the mirror keeps all ns/cfg/snap frames first, then body frames by
   `order` until full. Unmirrored body edits are still on disk and are re-derived by reconcile.
 - **Why it exists.** It preserves **frame identity** (`clientFrameId`) across IDB loss:
   - a resent ns frame is deduped by the relay window or the fold ring instead of creating duplicate docs;
@@ -1081,6 +1098,9 @@ count × { varstring docId, varstring path, u8 kindCode, 32B contentHash, varuin
 - Lets recovery tell "unchanged since sync" (hash equal) from "edited offline", so an IDB loss does not produce
   conflict copies.
 - Base texts are not mirrored. Recovered docs merge without a base only when both sides changed.
+
+**Snapshots** (`snapshots/`): each snapshot's parts and its descriptor, plus the download cache for one remote
+snapshot (§j.4). A snapshot exists iff its descriptor decodes; parts without one are swept.
 
 ---
 
@@ -1359,7 +1379,8 @@ transferred buffers.
 - **Timeouts.** Engine requests time out after `DISK_REQUEST_TIMEOUT_MS` / `SIDE_FILE_TIMEOUT_MS` → `error(timeout)`.
   The engine re-plans the scope, and nothing is assumed done.
 - **Errors.** `ProtocolError{code, message, retryable}`. `message` never contains credentials or file contents.
-  `TERMINAL_ERROR_CODES` (`version-mismatch`, `revoked`) stop automatic retries.
+  `TERMINAL_ERROR_CODES` (`version-mismatch`, `revoked`) stop automatic retries. `content_corrupt` (a snapshot
+  failed verification, §j.4) is never retryable.
 - **Worker failure** (`onFailure`, or missed pongs):
   - The host terminates the worker and starts a new one.
   - Bound views re-run `openDoc`. Their `bindDelta` carries any main edits the dead worker never persisted, because
@@ -1539,7 +1560,7 @@ interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; r
 |---|---|---|
 | 0 | `openNote` | `localUpdate` apply, frame close and **send** for bound docs, receipts, `docUpdate` forwarding, provisionals for bound docs, bind requests |
 | 1 | `openCatchUp` | Reads, union and merges for bound or just-opened docs; hard-limit compaction |
-| 2 | `namespace` | ns/cfg ingest, fold, ns/cfg reads, planner runs, ns frames, settings projection |
+| 2 | `namespace` | ns/cfg/snap ingest, fold, ns/cfg/snap reads, planner runs, ns frames, settings projection |
 | 3 | `background` | Body reads for stale streams, merges, projection writes, materialization, scan hashing |
 | 4 | `bulk` | Blobs, compaction, remote checkpoints, retired checkpoints, snapshots, mirrors |
 
@@ -1547,7 +1568,7 @@ interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; r
   - Each slice runs jobs from the highest non-empty lane until `sliceMs` has elapsed, then calls `yieldNow()`.
   - **Aging:** every 8th slice serves the oldest job of lanes ≥ 3, so bulk work never starves.
   - Relay events are queued immediately (O(1)). Their processing is scheduled by lane.
-- **Sender** order: lane 0 frames, ns, cfg, background, then bulk (`x:` chunks, adopted frames).
+- **Sender** order: lane 0 frames, ns, cfg, then snap and background, then bulk (`x:` chunks, adopted frames).
 - **Host** executes `diskOps` batches lane-first within `mainSliceMs` slices, and puts editor work ahead of all of
   it.
 
@@ -1746,35 +1767,163 @@ ones get conflict copies.
 
 ### j.4 Client snapshots and recovery
 
-- **Snapshot:** a zip (fflate) of markdown and canvas files, plus blobs ≤ 1 MiB, with a manifest of path, hash and
-  size. Written as side file `snapshots/<id>.zip`. Capped at 256 MiB; skipped above with a notice.
+Snapshots are the recovery path. Each one is a file-level copy of the vault. It is kept on the device, and it can be
+uploaded as an opaque, verifiable backup that any paired device can list and restore. The relay never parses a
+snapshot: its parts are ordinary blobs (relay-wire §11.3) and its index is an ordinary commit-only stream. Zipping,
+hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snapshots/*`).
+
+- **Content.** Markdown and canvas files plus blobs ≤ 1 MiB (`SNAP_MAX_BLOB_BYTES`), from the reconciler's local tree.
+  Excluded paths are left out.
+  - Bounds: at most 256 MiB of file bytes (`SNAP_MAX_TOTAL_BYTES`) and 65,000 files. Above that the snapshot is
+    skipped with notice `snapshot-too-large`.
+  - A file that would fail restore verification is left out and listed as skipped `invalid`. That covers a bad path,
+    markdown that is not UTF-8, and a canvas `parseCanvasBytes` rejects. One bad file must not make the whole
+    snapshot unrestorable.
+- **Files, not CRDT state.** Bundles hold files, and Yjs state is not added:
+  - a restore is a plain local edit through conflict copies and CAS writes, and that flow consumes bytes;
+  - Yjs state only means something under the doc's stream identity, and a restore deliberately does not reuse it;
+  - it is up to 3 × the text (§e.1) and would put Yjs decoding of untrusted bytes on the restore path;
+  - all it would add is edit history, and a snapshot is a point in time.
+- **Format zip-v1** (`src/core/snap/zip.ts`, `bundle.ts`, `export.ts`):
+  - **Entries:** `files/<path>` in manifest order, then `manifest.json`: `{formatVersion: 1, id, createdAtMs,
+    reason, files: [{path, kind, hash, size}], skipped: [{path, reason}]}`. `hash` is `exactFingerprint`, the sha256
+    of the exact bytes.
+  - **Zip:** every local header carries crc32 and both sizes (no data descriptor, no extra field, UTF-8 flag, fixed
+    1980-01-01 date). Entries are deflated when that is smaller, else stored. There is no zip64. Standard unzip tools
+    read it.
+  - **Parts:** the zip byte stream is cut into parts of exactly `partSize` bytes; only the last may be shorter.
+    `partSize = min(8 MiB, ⌊maxBlobBytes × 7/8⌋)` (headroom for sealing), or 8 MiB without a blob store. The limits
+    are ≤ 512 parts of ≤ 16 MiB and a zip ≤ 320 MiB.
+  - **Hashing:** each part is hashed (SHA-256) when it is cut, while the next one fills. The bundle digest binds the
+    parts and the manifest:
+    `bundleDigest = SHA-256("yaos/snap-bundle/1" ‖ varstring id ‖ varuint n ‖ n × (varuint size ‖ 32B sha256(part)) ‖ 32B sha256(manifest.json))`.
+  - **Export** (`exporter.ts`) reads files in small batches and adds them one at a time. Each finished part goes
+    straight to its side file. Peak memory is one part buffer, one read batch with its deflated copy, the central
+    directory and the manifest list.
+  - **Memory**, measured with `e2e/client/snapshotMemory.ts` (peak live-heap growth):
+
+    | Vault | Before (whole zip in memory) | Streaming |
+    |---|---|---|
+    | 50 MiB, 1,556 files | 82 MiB | 21–23 MiB |
+    | 157 MiB, 4,667 files | — | 27 MiB |
+
+    The peak follows the part size, not the vault size.
+- **Side files** (`localStore.ts`, under `state/snapshots/`):
+  - `<id>-p<NNN>.part`: the parts;
+  - `<id>.snap`: the descriptor, which is the encoded index record, written last. A snapshot exists iff its
+    descriptor decodes, and the sweep removes parts without one;
+  - `dl-p<NNN>.part`: the download cache, holding one remote snapshot.
+  - Ids are `<createdAtMs, 9 base-36 chars>-<reason>`. A remote one appears to the host as `<id>@<deviceId>`. Host
+    ids are parsed strictly; anything else is `bad-request`.
 - **When taken:**
   - daily, keeping `keepDaily` (with snapshots enabled);
   - before a brake approval, an epoch migration and an IDB recovery (with snapshots enabled);
   - on `createSnapshot` and before every `restoreSnapshot`, even with snapshots disabled (user actions);
   - the newest 10 non-daily snapshots are kept.
-- **Optional R2 upload:** with `uploadToBlobStore` and a `BlobPort`, the sealed zip is `put` under its hash address.
-  The address is not recorded, so the upload is an off-device copy only. Cross-device restore is out of scope for v1.
-- **Commands** (`src/protocol/messages.ts`): `listSnapshots` → `snapshots` (id, time, reason, file count, bytes);
-  `snapshotFiles{id}` → the manifest's files (path, kind, size) and `skipped` entries (too large, unreadable);
-  `restoreSnapshot{id, paths|null}` → `restored` (counts, conflict copies, failed paths); `deleteSnapshot{id}`.
-  - Ids come from the host and must parse as snapshot ids (no path tricks); unknown ids are `bad-request`.
+- **Upload** (`remote.ts`; needs `uploadToBlobStore` and a `BlobPort`):
+  - **Cadence:** a manual snapshot is uploaded at once. After a full pass, `maybeDaily` takes the daily snapshot
+    when the last one is 24 h old, then uploads the newest local daily or manual snapshot that is not in the index
+    yet. That is at most one background upload a day, plus the manual ones. Event snapshots stay local.
+  - **Blob path:** parts go through the attachments' one blob path (`putSealed`). The address is
+    `CryptoPort.blobAddress(sha256(part))` and the body is `sealBlob(part)`, so E2EE applies unchanged.
+  - **Idempotent and resumable:**
+    - `has` runs first, and present parts are neither read nor sent;
+    - a missing part is re-checked against the descriptor before it is sent;
+    - the index record is appended only after every part is stored, and only if the index lacks it, so there are no
+      duplicate records.
+  - **Failures and readiness:**
+    - nothing uploads until the `snap` stream is caught up;
+    - a failed background upload backs off 1 h and only logs a diagnostic;
+    - a failed manual one raises notice `snapshot-upload-failed`.
+- **Index: stream `snap`** (`src/core/snap/record.ts`, `fold.ts`; §b.2, §b.4):
+  - **Records:** one small record per uploaded snapshot (≤ 48 KiB): id, createdAtMs, device label, reason, format,
+    file count, total bytes, bundle digest, and per part `{address, size, sha256}`.
+  - **Untrusted input:**
+    - decoding enforces every bound, the reason set, the id shape and 64-hex addresses and hashes (the relay's blob
+      routes take `<sha256 hex>`);
+    - a violation makes the frame malformed, so it folds as empty;
+    - a put with an unknown record version is ignored and reported (`snap-unknown-version` diagnostic).
+  - **Fold:** a join, independent of row order and duplicates, so it needs no dedupe ring. Per device, the floor is
+    the max of its floor ops. A del is kept at or above the target's floor. Per key (row deviceId/snapshotId) the put
+    with the smallest canonical body wins. A device can add only its own snapshots, and any device can delete any.
+    Rows whose deviceId the relay could not have issued are ignored. A seeded fuzz test (`snap.test.ts`) checks that
+    permutations and duplicates give the same state.
+  - **Live set:** records not deleted and not below their device's floor, at most the newest 100 per device.
+  - **Retention:** each upload appends `floor = createdAtMs` of this device's `keepDaily`-th newest upload, so every
+    reader drops older ones. Dels below a floor are pruned, so the state stays bounded by retention.
+  - **Wiring, like `cfg`:** read after `ns` and `cfg` in catch-up, folded by a FoldRuntime, lane 2, compacted, and
+    checkpointed as `snapFoldV1` (strict decode plus canonical re-encode, §b.5). The record adds no crypto of its own;
+    the envelope seals it like any frame.
+- **Restore and verification** (`verify.ts`, `snapshotJob.ts`). The relay is trusted for neither content nor paths,
+  so every check runs on the client.
+  1. **Resolve** the id: a local descriptor, else this device's uploaded record, else `<id>@<deviceId>` in the live
+     set.
+  2. **Pass 1, verify; nothing is written.** Parts are read in order: local parts from side files, a remote snapshot
+     downloaded one part at a time through `getOpened`. Each part enters the download cache only after it passes its
+     own check. Fail closed: the first failed check refuses the whole snapshot. The checks, in order:
+     - part present (`part-missing`), size (`part-size`), sha256 (`part-hash`);
+     - zip structure, bounded inflate, sizes and crc32 (`zip-decode` / `truncated`);
+     - each entry's path under the ns path rules, §c.2 (`path-invalid`);
+     - content: canvas through `parseCanvasBytes`, markdown through fatal UTF-8 decoding (`content-invalid`);
+     - `manifest.json` strict schema (`manifest-invalid`), and its id, counts and file list (path, kind, size,
+       sha256) equal to the record and to the entries (`manifest-mismatch`);
+     - the bundle digest (`bundle-digest`).
+  3. **Safety snapshot:** take a `restore` snapshot.
+  4. **Pass 2, write.** Re-read the verified parts from side files (no new download) and run the same checks, with
+     each entry also compared to the verified manifest (`file-hash`). Each entry goes through the restore flow:
+     - a differing current file is conflict-copied first;
+     - the write has precondition fingerprint(current) or absent, so a file edited meanwhile is reported failed, not
+       clobbered;
+     - written files sync normally, and the brake applies.
+
+     Pass 2 can only fail if a side file changed between the passes. Files written before the failure then stay;
+     each write was CAS-guarded, and the safety snapshot holds the prior state.
+  - **`content_corrupt`:** every failed check is reported three ways:
+    - notice `content_corrupt`: "Snapshot X is damaged (check); nothing was restored." (pass 2 says "the restore
+      stopped.");
+    - a diagnostic line `content_corrupt snapshot=<id> check=<check>`. Part checks add the index and sizes; vault
+      paths are never added;
+    - the request fails with `ProtocolError` code `content_corrupt`, not retryable.
+
+    A store or transport error is not corruption: the request fails without that notice.
+  - **Download cache:** removed after the restore, on any failure, when another remote snapshot is verified, and by
+    the sweep. It never holds more than one bundle (≤ 320 MiB).
+- **Blob lifetime (server ask A3, e2ee-design §10.4).** The relay has no blob GC. Until A3 exists, parts of
+  superseded snapshots (below a floor, or deleted) stay in R2 until the vault is deleted. For the A3 mark-and-sweep:
+  - the live set must include the part addresses of every record in the `snap` fold's live set. Records keep
+    `address` for this, because under E2EE the sweep sees addresses, not hashes;
+  - the 7-day grace period covers the gap between the part puts and the index record. A resumed upload skips parts
+    that `has` reports present, and such a part may be older than the grace period, so it could be swept before
+    its record lands. Before A3 ships, either the upload re-sends parts older than a day or `has` reports upload
+    times. A part swept anyway fails a restore as `part-missing`, never silently.
+- **Commands** (`src/protocol/messages.ts`):
+  - `listSnapshots` → `snapshots` (id, time, reason, file count, bytes). Also `where` (`local` / `remote` / `both`)
+    and the uploading device's label (`device`);
+  - `snapshotFiles{id}` → the manifest's files (path, kind, size) and `skipped` entries (too large, unreadable,
+    invalid). The whole snapshot is verified first (a remote one is downloaded): damaged is `content_corrupt`;
+  - `restoreSnapshot{id, paths|null}` → `restored` (counts, conflict copies, failed paths);
+  - `deleteSnapshot{id}` removes the local copy, plus the index record if it was uploaded; for a remote snapshot it
+    appends a `del`.
+  - Unknown ids are `bad-request`.
   - Without a running vault runtime these commands, `createSnapshot` and `exportDiagnostics` fail with `not-ready`.
-- **Restore:**
-  - files are written as ordinary local edits, after a `conflictCopy` of any differing current file. The write uses
-    precondition fingerprint(current) or absent instead of `any`, so a file edited between the read and the write is
-    reported failed, not clobbered;
-  - they sync normally and are subject to the brake (overwrite counting).
 - **Host UI** (`src/host/ui/snapshotsModal.ts`; copy and logic in the pure `snapshotsModel.ts`):
-  - the snapshots dialog (settings "Browse snapshots" or the command palette) has "Create snapshot now" and one row
-    per snapshot, newest first (local time, reason, file count, size), with "Browse files…", "Restore all…" and
-    "Delete…". Restore and delete ask first; the restore confirm says differing files become conflict copies and a
-    safety snapshot is taken first;
-  - the files dialog has a path filter, checkboxes (at most 500 rendered; "Select all matching" includes the rest),
-    "Restore selected…" with a confirm, and a warning listing the manifest's skipped files;
-  - after a restore a notice summarises restored, unchanged, conflict-copy and failed counts.
-  - The settings toggle "Upload snapshots to attachment storage" sets `uploadToBlobStore`. Its copy says it is an
-    off-device copy, needs attachment storage on the server, and does not allow restore on another device.
+  - **Snapshots dialog** (settings "Browse snapshots" or the command palette): "Create snapshot now", then one row
+    per local or uploaded snapshot, newest first (local time, reason, file count, size, plus "· uploaded" or
+    "· from <device>"). Each row has "Browse files…", "Restore all…" and "Delete…":
+    - restore and delete ask first;
+    - the restore confirm says differing files become conflict copies and a safety snapshot is taken first;
+    - opening a remote snapshot says it is being downloaded and checked.
+  - **Files dialog:** a path filter, checkboxes (at most 500 rendered; "Select all matching" includes the rest),
+    "Restore selected…" with a confirm, and a warning listing the manifest's skipped files.
+  - **After a restore,** a notice summarises the restored, unchanged, conflict-copy and failed counts.
+  - **Upload toggle:** "Upload snapshots to attachment storage" sets `uploadToBlobStore`. Its copy says you can
+    restore the snapshots from any of your devices, and that the upload needs attachment storage on the server.
+  - **Nothing else:** no status rows and no polling. The list reads the folded index when the dialog opens.
+- **Tests:**
+  - unit: codec bounds, fold fuzz, and one test per verification failure (`src/core/snap/*.test.ts`);
+  - job tests: a faulting `BlobPort` (`src/engine/snapshots/*.test.ts`);
+  - `e2e/client/snapshots.ts`, on a local relay with R2: device a uploads, a fresh device b lists, restores and
+    matches, and a part flipped at rest in R2 is refused as `content_corrupt`.
 
 ### j.5 Onboarding and import
 
@@ -1850,10 +1999,11 @@ ones get conflict copies.
 src/
   core/                      PURE: no I/O, timers, Date, Math.random, yjs, DOM
     types.ts envelope.ts limits.ts            [architect, frozen]
-    codec/   lib0 helpers, envelope, nsOps, cfgOps, nsFoldV1, cfgFoldV1, blobChunk, mirrors   [WP-A]
+    codec/   lib0 helpers, envelope, nsOps, cfgOps, nsFoldV1, cfgFoldV1, snapFoldV1, blobChunk, mirrors [WP-A]
     paths/   pathKey (+ generated casefold15_1, assigned15_1), validate, segments              [WP-A]
     ns/      fold, index, place, overlay, verify (V1/V2), candidate (V3 digest rule)          [WP-A]
     cfg/     fold, projection (pure JSON register → file bytes)                               [WP-A]
+    snap/    record (snapOps), fold, zip, bundle (parts, digest, manifest), export, verify (§j.4)
     hash/    markdownLf (ported markdownCodec), canvasCanonical (ported canvasCodec/Ordering) [WP-B]
     merge/   merge (MergeFn), myers, diff3, minimalDiff                                        [WP-B]
     plan/    planner (PlanFn), brake, renames, conflictName, order                            [WP-B]
@@ -1864,12 +2014,12 @@ src/
     adapters/ idbStorage, wsRelay (+http feed/read/checkpoint), httpBlob, noopCrypto, webHash [WP-C]
     ingest/  gate, yjsCheck                                                                   [WP-C]
     body/    handles, frameBuilder, sender, provisional, compaction, checkpoints, canvasDoc    [WP-C]
-    sync/    cursor, catchUp, nsRuntime (fold host, overlay, duties), cfgRuntime              [WP-C]
+    sync/    cursor, catchUp, nsRuntime (fold host, overlay, duties), cfgRuntime, snapRuntime [WP-C]
     runtime/ engine.ts (createEngine), lanes, budgets, lifecycle, status, diagnostics, recovery [WP-C]
     reconcile/ localTree, scan, planRunner, mergeJob, echo, intents                           [WP-B]
     blobs/   blobQueue (store + x: log carrier)                                               [WP-B]
     settings/ cfgScan, cfgProject                                                             [WP-B]
-    snapshots/ snapshotJob                                                                    [WP-B]
+    snapshots/ snapshotJob, exporter, localStore, remote (upload, parts), restore, snapIndex  [WP-B]
     workerMain.ts            worker entry glue                                                [WP-D]
   host/                      Obsidian main thread; obsidian, yjs, y-codemirror allowed
     plugin.ts engineHost.ts (spawn, restart, inline fallback) diskExecutor.ts binding.ts

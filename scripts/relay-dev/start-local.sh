@@ -1,8 +1,9 @@
 #!/bin/zsh
 # Local streams relay for the client remake: `wrangler dev` (real workerd + local DO SQLite) with
-# no R2, the same config as the deployed e2e worker (scripts/relay-dev/deploy.sh).
+# no R2, the same config as the deployed e2e worker (scripts/relay-dev/deploy.sh). --r2 keeps the YAOS_BUCKET
+# binding (a local emulated bucket under the state dir), so attachments and snapshot uploads work.
 #
-#   scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--var K=V]...
+#   scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--r2] [--var K=V]...
 #
 # Starts in the background (nohup; log at experiments/logs/client-e2e-local-<port>-<ts>.log), waits until
 # /api/capabilities advertises streams=1, then prints the base URL as the last stdout line.
@@ -19,6 +20,7 @@ while (( $# )); do
   case $1 in
     --port) PORT=$2; shift 2;;
     --fresh) FRESH=1; shift;;
+    --r2) export RELAY_DEV_R2=1; shift;;
     --var) VARS+=("$2"); shift 2;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac

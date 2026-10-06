@@ -92,7 +92,9 @@ export type SideFileName =
 	| "outbox-b.bin"
 	| "synced-a.bin"
 	| "synced-b.bin"
-	| `snapshots/${string}.zip`;
+	/** Snapshot parts and descriptors (engine/snapshots/localStore.ts). */
+	| `snapshots/${string}.part`
+	| `snapshots/${string}.snap`;
 
 export interface SideFilePort {
 	read(name: SideFileName): Promise<Uint8Array | null>;
