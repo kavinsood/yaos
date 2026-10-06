@@ -189,6 +189,7 @@ test("binding: a conflict copy that hits disk errors is retried until written (t
 	assert.ok(copies.some(([, t]) => t.includes("[theirs]")), `external side kept in a conflict copy: ${JSON.stringify(copies)}`);
 	assert.ok(v.getText().includes("[mine]"));
 	assert.ok(!notices.includes("conflict-copy-failed"), JSON.stringify(notices));
+	assert.equal(notices.filter((n) => n === "conflict-copy").length, 1, "one notice once the copy lands");
 });
 
 test("binding: worker killed mid-typing loses nothing (suspend, keep typing, rebind with bindDelta)", async () => {

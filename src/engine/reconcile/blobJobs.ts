@@ -55,7 +55,7 @@ export async function conflictCopy(env: Env, op: Op<"conflictCopy">): Promise<Jo
 		return "fail";
 	}
 	ctx.echo.expectWrite(ctx.pk(op.to), out.stat.size, out.stat.mtimeMs);
-	ctx.noteDestructive("conflict");
+	ctx.noteConflictCopy(op.from, op.to);
 	await ctx.commit({}, [ctx.localEntry(op.to, out.stat, "blob", h.hash, out.fingerprint)]);
 	return "ok";
 }

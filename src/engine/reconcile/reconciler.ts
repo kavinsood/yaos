@@ -118,7 +118,9 @@ export class Reconciler {
 			const e = view.remote.get(docId as DocId);
 			return e && e.state === "live" ? e.path : null;
 		});
-		return runPlan(this.env, ops);
+		const run = await runPlan(this.env, ops);
+		this.ctx.flushConflictCopies();
+		return run;
 	}
 
 	private freshIds(n: number): DocId[] {
@@ -199,6 +201,7 @@ export class Reconciler {
 		const actionable = plan.ops.filter((o) => o.op !== "wait" && o.op !== "needHash").length - run.deferred;
 		// Out-of-scope read failures count too: nothing else would re-plan them before the periodic full pass.
 		const unread = Math.max(this.scan.lastUnread, plan.ops.filter((o) => o.op === "needHash").length);
+		ctx.flushConflictCopies();
 		return { ...run, planned: plan.ops.length, actionable, unread, brake, openIntents, vacated };
 	}
 

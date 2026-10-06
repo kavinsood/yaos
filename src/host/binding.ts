@@ -41,6 +41,7 @@ import type { Hasher } from "./hashing";
 import { utf8 } from "./hashing";
 import { DEFAULT_MERGE_LIMITS, merge } from "../core/merge/merge";
 import { applyEditsTo, minimalDiff } from "../core/merge/minimalDiff";
+import { conflictCopyNotice } from "../core/plan/conflictName";
 
 export const REMOTE_IN: unique symbol = Symbol("yaos.remote-in");
 export const BIND_LOCAL: unique symbol = Symbol("yaos.bind-local");
@@ -630,6 +631,7 @@ export class BindingManager {
 				const out = await this.deps.vault.write(target, text, { t: "absent" });
 				if (out.ok) {
 					this.stats.conflictCopies++;
+					this.deps.notice("warn", "conflict-copy", conflictCopyNotice({ from: path, to: target }, 1));
 					return "ok";
 				}
 				if (out.reason === "io") return "io";

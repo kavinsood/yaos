@@ -9,6 +9,7 @@ import type {
 } from "../../core/types";
 import { MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { DEFAULT_BRAKE, type BrakeWindow, type DestructiveKind } from "../../core/plan/brake";
+import { conflictCopyNotice } from "../../core/plan/conflictName";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
 import { standInPathKey } from "../../core/plan/pathRules";
 import type { ClockPort } from "../../ports/clock";
@@ -93,6 +94,7 @@ export class Ctx {
 	private readonly destructive: { kind: DestructiveKind; at: number }[] = [];
 	private opId = 0;
 	private readonly noticed = new Set<string>();
+	private copies: { readonly from: VaultPath; readonly to: VaultPath }[] = [];
 
 	constructor(readonly deps: ReconcilerDeps, readonly store: ReconcileStore) {
 		this.pk = deps.pathKey ?? standInPathKey;
@@ -177,6 +179,21 @@ export class Ctx {
 
 	noteDestructive(kind: DestructiveKind): void {
 		this.destructive.push({ kind, at: this.deps.clock.monotonic() });
+	}
+
+	/** Sync wrote a conflict copy `to` of `from` (restore copies do not come here). */
+	noteConflictCopy(from: VaultPath, to: VaultPath): void {
+		this.noteDestructive("conflict");
+		this.copies.push({ from, to });
+	}
+
+	/** One warn for the conflict copies written since the last call (end of a pass): the count and the first path. */
+	flushConflictCopies(): void {
+		const first = this.copies[0];
+		if (!first) return;
+		const n = this.copies.length;
+		this.copies = [];
+		this.notice("warn", "conflict-copy", conflictCopyNotice(first, n), `conflict-copy:${first.to}`);
 	}
 
 	window(): BrakeWindow {

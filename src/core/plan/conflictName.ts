@@ -102,3 +102,10 @@ export function conflictName(input: ConflictNameInput): VaultPath {
 	if (root) return root;
 	return `conflict ${id8} ${input.nowMs}`;
 }
+
+/** The popup for conflict copies written in one burst: the first copy, and how many there were. */
+export function conflictCopyNotice(first: { readonly from: string; readonly to: string }, count: number): string {
+	return count <= 1
+		? `YAOS could not merge two versions of “${first.from}”; the other version is saved as “${first.to}”.`
+		: `YAOS could not merge ${count} files; the other versions are saved as conflict copies (first: “${first.to}”).`;
+}
