@@ -164,7 +164,8 @@ pairing-code make zero config-DO calls, checked with a counting stub).
 
 **D6 VAULT_READY constants.**
 - `role:"owner"`, `canWrite:true`, `membershipRevision:1`, `deviceCredentialRevision:1`, `policyVersion:1`.
-- `principalId` = `owner:<vaultId>`, the same in the enroll response.
+- `principalId` = `owner:<vaultId>`, in VAULT_READY only: the enroll body is D3's six fields (`readEnrollment`,
+  `src/host/ui/pairing.ts:363-388`, never reads it).
 - `capabilityDigest` = today's `capabilityDigestForRole("owner")` value, frozen as a literal.
 - Every §3.2 field stays; the `write_forbidden` path is removed. *Why:* the shape stays for the shipped client;
   the authority model is gone. *Test:* T-READY-SHAPE.
@@ -611,6 +612,32 @@ P1 gap calls (accepted by the coordinator; each is marked `DECISIONS-GAP` in cod
 - G11 Malformed blob address → `400 invalid_address`.
 - G12 `compatibility_date = "2026-04-07"` (`web_socket_auto_reply_to_close` on); wrangler 4.147.0.
 
+P2 and P4 gap calls (accepted; marked `DECISIONS-GAP` in code). G7 is closed: router.ts serves the P4 pages.
+
+- G13 Operator login limiter: in memory, 20 failures/min → `429 too_many_attempts` (D3's numbers).
+- G14 A vault not in the registry → `404 unknown_vault` on operator routes.
+- G15 CSRF: every operator write needs a same-origin `Origin`; JSON writes also need the Content-Type; GETs need
+  neither (SameSite=Strict carries them).
+- G16 A frame dropped by revoke tells holders `STREAM_PROVISIONAL_DROPPED` with reason `commit_failed`.
+- G17 Enroll replay ignores code expiry (it needs the original deviceToken, so it grants nothing new).
+- G18 Enroll of a deviceId that is enrolled under another code → `409 device_exists`.
+- G19 A valid ticket on a non-upgrade request → `426`.
+- G20 Vault names: 1–80 chars, else `400 invalid_name`.
+- G21 The session cookie is always `Secure` (browsers treat `http://localhost` as secure).
+- G22 Claim failing after the config write → `503 claim_incomplete`, with the session cookie set.
+- G23 Vault-delete R2 purge: at most 20 batches of 1000 per request, then `503 purge_incomplete` (retry).
+- G24 The D3 enroll limiter counts 404, 410 and `409 used_code`; malformed bodies don't count.
+- G25 Operator response shapes (the console reads only these): state `{vaults:[{vaultId,name,createdAt}],
+  pendingRestores:[{vaultId,at}]}`; devices `{devices:[{deviceId,deviceName,enrolledAt}]}`; owner-code adds
+  `mobileSetupUrl` and `mobileSetupQrDataUrl`.
+- G26 The console generates the recovery key in the page and sends `/claim` only after "I have saved it" is ticked.
+- G27 The entry module (`worker.ts`) exports only the fetch handler and the DO classes: workerd treats every named
+  export as an entrypoint and refuses to start on a constant. The route table is `router.ts`; a WB test guards it.
+- O9 (open) Revoke under the D8 daily latch: the device DELETE fails, so nothing changes; the device keeps its
+  read access until the reset (≤ 24 h). Kept: shutting the gate in memory only would not survive eviction. Today
+  the operator sees `500 internal_error` (router.ts maps every failed vault RPC to 500); P3 maps a daily-limit
+  failure on any operator RPC to the D8 answer.
+
 ## 9. Work plan
 
 | Phase | Work | Exit criterion |
@@ -621,3 +648,6 @@ P1 gap calls (accepted by the coordinator; each is marked `DECISIONS-GAP` in cod
 | P3 Hardening | H1–H8, D8a/D8c, D9 (`v/<vaultId>/<address>` keys); D8b | Every BB row except T-RESTORE-MANUAL green locally (blob rows with local R2); all WB green; H2 cold-scan CPU and D8a DROP+CREATE billing measured |
 | P4 Console | `GET /` page and `GET /mobile-setup` (D5) | Manual run on local dev: claim → vault → QR → enroll → revoke → reset; no external assets |
 | P5 Deploy over scratch-3 | The coordinator deploys: one migration that deletes the old DO classes and adds the two new ones (the account is at the namespace cap) | The full suite is green on scratch-3 except the documented SKIPs; T-RESTORE-MANUAL done once by hand; §15 latencies re-measured |
+
+Status 2026-10-06: P0, P1 and P2 done (P2: `conformance-local-p2-20261006T085006Z.json`, every D2–D7 and
+BASELINE row green, the 12 failures are P3 rows). P4 pages are done and wired; its manual run waits for P3.
