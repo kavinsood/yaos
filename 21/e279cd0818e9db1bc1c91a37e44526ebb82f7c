@@ -1,0 +1,21 @@
+e2e/conformance/README.md
+  s_ffd75806c38869::t_34cc224880a490 41
+e2e/conformance/tests/operator.ts
+  s_ffd75806c38869::t_f46272f26c2d9a 14-16,21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "21e279cd0818e9db1bc1c91a37e44526ebb82f7c",
+  "prompts": {},
+  "sessions": {
+    "s_ffd75806c38869": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad5531719fec0f464",
+        "model": "unknown"
+      },
+      "human_author": "Kavin Sood <68739182+kavinsood@users.noreply.github.com>"
+    }
+  }
+}
