@@ -250,7 +250,7 @@ the union adds nothing, and rows > coversSeq still apply.
 | Initial content of a new note | `INITIAL_INSERT_CHUNK_CHARS` = 192 Ki UTF-16 units | Inserted as consecutive transactions of ≤ 192 Ki units: one update, one frame (flag `initial`) each, so ≤ 576 KiB UTF-8. |
 | Any single update > content limit after deflate | `MAX_INLINE_UPDATE_BYTES` = `MAX_FRAME_CONTENT_BYTES` | `bodyUpdateRef`: the bytes go to the `BlobPort` only, the log carries the 32 B sha256 + size. No blob store, or larger than its cap (`storePlaintextCap`): the doc is frozen `oversize-local` (`src/engine/body/frames.ts:82`, `src/engine/runtime/docRuntime.ts:149-154`), the disk file is left untouched, and a notice is shown. |
 | Checkpoint | `maxCheckpointBytes` (4 MiB) | Larger: skip. The stream keeps its rows. An ns state > 4 MiB (roughly 40k entries) is open risk OR-3. |
-| Attachment | `storePlaintextCap` (`BlobPort.maxBlobBytes`, 10 MiB); 0 without a blob store | Larger: not synced, never deleted, notice. No store: no attachment is synced, silently (§j.1). |
+| Attachment | min(`settings.maxAttachmentBytes`, `storePlaintextCap`): `BlobPort.maxBlobBytes` is the relay's `maxBlobUploadBytes` (100 MB); under suite 1 what fits once sealed (98566143); 0 without a blob store | Larger: not synced, never deleted, notice. A PUT answered 413 refuses that blob (notice, no retry). No store: no attachment is synced, silently (§j.1). |
 | Snapshot part | `min(8 MiB, ⌊maxBlobBytes × 7/8⌋)`; ≤ 512 parts, zip ≤ 320 MiB | Parts go to the `BlobPort` only, never to the log (§j.4). |
 
 ---
@@ -1588,8 +1588,11 @@ transferred buffers.
   - `diskOps` batches are ≤ `diskOpsPerBatch`, and the host runs lane 0 batches before others, within `mainSliceMs`
     slices;
   - `vaultEvents` and `bodyPush` are small and unbounded by design. Main never drops them.
-- **Timeouts.** Engine requests time out after `DISK_REQUEST_TIMEOUT_MS` / `SIDE_FILE_TIMEOUT_MS` → `error(timeout)`.
-  The engine re-plans the scope, and nothing is assumed done.
+- **Timeouts.** Engine→main requests (disk I/O, side files) have no fixed timeout: a slow mobile disk is still
+  progressing. They end with the engine (`aborted`, engine/compose/hostLink.ts `close`), and the engine re-plans
+  the scope; nothing is assumed done. Main→engine requests time out after `DEFAULT_REQUEST_TIMEOUT_MS` (60 s,
+  host/engineHost.ts) → `error(timeout)`; liveness is the ping (`PING_TIMEOUT_MS`). Blob transfers run in the
+  engine over fetch, with no fixed timeout (engine/adapters/httpBlob.ts).
 - **Errors.** `ProtocolError{code, message, retryable}`. `message` never contains credentials or file contents.
   `TERMINAL_ERROR_CODES` (`version-mismatch`, `revoked`) stop automatic retries. `content_corrupt` (a snapshot
   failed verification, §j.4) is never retryable.
@@ -1931,11 +1934,18 @@ ones get conflict copies.
     deterministically, the referencing row is quarantined (e2ee-design §10.2). Absent blobs and failures under an
     unverified key never are.
   - Files larger than the store path's plaintext cap (`storePlaintextCap`: `BlobPort.maxBlobBytes`, the server's
-    `maxBlobUploadBytes`, 10 MiB when it sends none or the capabilities probe fails; under suite 1 what still fits
-    once sealed, at most `MAX_BLOB_PLAINTEXT_BYTES_SUITE1` = 10223615) or `settings.maxAttachmentBytes` are not
-    synced (notice) and never deleted.
+    `maxBlobUploadBytes`, `MAX_BLOB_UPLOAD_BYTES` = 100 MB when it sends none or the capabilities probe fails; under
+    suite 1 what still fits once sealed, `maxSealedBlobPlaintext`, 98566143 at 100 MB) or
+    `settings.maxAttachmentBytes` are not synced (notice) and never deleted.
+  - A PUT answered 413 (the relay's JSON, or the HTML page Cloudflare's edge answers above its plan's body limit)
+    throws `BlobTooLargeError`. The queue refuses that hash until the engine restarts: one notice, the outage record
+    dropped, no backoff; `pushBlob` holds the doc (`held`, no pass retry). Changed bytes are a new hash and are tried
+    (`src/engine/blobs/blobQueue.ts` `upload`, `src/engine/reconcile/blobJobs.ts`).
     `StatusSnapshot.maxBlobBytes` reports that cap (`src/engine/compose/vaultRuntime.ts:636`); the attachment size
-    setting then reads "This server accepts attachments up to N MB; the smaller limit applies."
+    setting then reads "This server accepts attachments up to N MB." and offers at most N (`attachmentLimitMb`,
+    `src/host/ui/settingsModel.ts`; 93 MB, what fits 100 MB once sealed, until a vault reports its own). The
+    setting can only lower the server's limit: its default (1 GiB, the most there is) follows it, and choosing
+    the maximum stores the default again.
   - **GC** (e2ee-design §10.4). The command "Clean up unused server attachments" runs one client mark-and-sweep in
     the worker and shows one notice. There is no schedule or status row.
     - Preconditions fail closed: any doubt about the live set deletes nothing.
@@ -1971,9 +1981,9 @@ ones get conflict copies.
   with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:531-536`). The restarted runtime's full
   pass uploads what is pending through the normal path. No polling, no new timers.
 - **Production ports** (`src/engine/adapters/webEngine.ts:43-54`): `blob = startupBlob(…)`
-  (`src/engine/adapters/httpBlob.ts:270-277`): `probeHttpBlob`'s answer, the HTTP store when the relay advertises
+  (`src/engine/adapters/httpBlob.ts:329-336`): `probeHttpBlob`'s answer, the HTTP store when the relay advertises
   attachments, else null. Capabilities unreachable at startup (offline), or not answered within
-  `CAPABILITIES_TIMEOUT_MS` (10 s, `httpBlob.ts:42`; init awaits this probe, so it is bounded): assume the store
+  `CAPABILITIES_TIMEOUT_MS` (10 s, `httpBlob.ts:46`; init awaits this probe, so it is bounded): assume the store
   (`createHttpBlob`) and let the blob queue retry (integration-notes D4). `probeBlob = probeHttpBlob`.
 - `syncAttachments = false` excludes blobs entirely: no ns ops, and remote blobs are not fetched.
 

@@ -163,7 +163,7 @@ function assertSetupQr(img: FakeElement, code: string): void {
 
 async function consoleWith(claimed: boolean, state?: unknown): Promise<Page> {
 	const page = new Page(await consolePage().text());
-	page.reply("GET /api/capabilities", 200, { claimed, attachments: false, maxBlobUploadBytes: 10485760, serverVersion: "1.0.0", streams: 1 });
+	page.reply("GET /api/capabilities", 200, { claimed, attachments: false, maxBlobUploadBytes: 100000000, serverVersion: "1.0.0", streams: 1 });
 	page.reply("GET /operator/state", state === undefined ? 401 : 200, state ?? { error: "unauthorized" });
 	await settle();
 	return page;

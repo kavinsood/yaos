@@ -60,6 +60,9 @@ export class FakeBlobs implements BlobTransfer {
 	readonly server = new Map<string, Uint8Array>();
 	available = true;
 	uploadOk = true;
+	/** upload() refuses every hash it sees from now on, for good (the store's 413: BlobTransfer.refused). */
+	refuseUploads = false;
+	readonly refusedHashes = new Set<string>();
 	uploads: { hash: string; docId: DocId; path: VaultPath }[] = [];
 	downloads: { hash: string; docId: DocId; path: VaultPath }[] = [];
 	/** prefetch(): results held at once (0 = refuse every prefetch); log of prefetched hashes, takes, drops. */
@@ -91,8 +94,17 @@ export class FakeBlobs implements BlobTransfer {
 		return hash;
 	}
 
+	refused(hash: string): boolean {
+		return this.refusedHashes.has(hash);
+	}
+
 	async upload(req: { hash: string; docId: DocId; path: VaultPath; bytes: Uint8Array }): Promise<boolean> {
+		if (this.refusedHashes.has(req.hash)) return false;
 		this.uploads.push({ hash: req.hash, docId: req.docId, path: req.path });
+		if (this.refuseUploads) {
+			this.refusedHashes.add(req.hash);
+			return false;
+		}
 		if (!this.uploadOk) return false;
 		this.server.set(req.hash, req.bytes.slice());
 		return true;

@@ -27,6 +27,3 @@ export const PING_INTERVAL_MS = 10_000;
 export const PING_TIMEOUT_MS = 15_000;
 /** Max consecutive engine restarts before falling back to inline. */
 export const MAX_WORKER_RESTARTS = 3;
-/** Engine->main request timeouts (disk I/O can be slow on mobile). */
-export const DISK_REQUEST_TIMEOUT_MS = 60_000;
-export const SIDE_FILE_TIMEOUT_MS = 30_000;

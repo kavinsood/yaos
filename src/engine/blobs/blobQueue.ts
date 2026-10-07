@@ -6,10 +6,21 @@
  *   up   = sha256 check -> blobAddress -> has -> put(sealBlob(bytes))
  *   down = get -> openBlob -> verify sha256
  *
+ * Both sha256 checks are one HashPort digest (WebCrypto): a 95 MB attachment
+ * hashes in ~35 ms instead of ~280 ms of pure JS on the engine thread.
+ *
  * maxBlobBytes is a plaintext cap: the store's transport cap under suite 0,
- * what still fits it once sealed under suite 1 (e2ee-design §7.3, ≤
- * MAX_BLOB_PLAINTEXT_BYTES_SUITE1). Larger files are not synced (reconcile
- * excludes them; upload() refuses with a notice).
+ * what still fits it once sealed under suite 1 (e2ee-design §7.3,
+ * maxSealedBlobPlaintext). Larger files are not synced (reconcile excludes
+ * them; upload() refuses with a notice).
+ *
+ * A store that refuses a put by size (BlobTooLargeError: HTTP 413, e.g. the
+ * edge's request limit on a plan below the advertised cap) refuses those
+ * bytes for good: notice "blob-too-large", no record, no backoff, and later
+ * upload()s of that hash answer false at once without a request (refused();
+ * the reconcile job holds instead of failing, so no retry is armed). In
+ * memory: a restart tries once more. Changed bytes are a new hash and are
+ * tried.
  *
  * No store (the relay has no R2 binding): maxBlobBytes is 0, reconcile
  * excludes every blob, and upload / download / prefetch answer at once
@@ -44,11 +55,11 @@
  * the transfer.
  */
 
-import { sha256Hex } from "../../core/hash/sha256";
+import { bytesToHex } from "../../core/codec/lib0";
 import type { ContentHash, DocId, VaultPath } from "../../core/types";
-import type { BlobPort } from "../../ports/blob";
+import { BlobTooLargeError, type BlobPort } from "../../ports/blob";
 import type { ClockPort } from "../../ports/clock";
-import type { CryptoPort } from "../../ports/crypto";
+import type { CryptoPort, HashPort } from "../../ports/crypto";
 import type { StorageDb } from "../../ports/storage";
 import type { BlobTransfer } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
@@ -66,6 +77,8 @@ export interface BlobQueueDeps {
 	readonly db: StorageDb<DiskSchema>;
 	readonly clock: ClockPort;
 	readonly crypto: CryptoPort;
+	/** The upload and download sha256 checks. */
+	readonly hash: HashPort;
 	/** null = no blob store: no transfer runs (see the header). */
 	readonly store: BlobPort | null;
 	/** When a present blob may be re-used (e2ee-design §10.4 R2). */
@@ -89,6 +102,8 @@ export class BlobQueue implements BlobTransfer {
 	private readonly streaks = new BlobFailureStreaks();
 	/** Downloads quarantined by the §10.2 rule, by hash (in memory). */
 	private readonly quarantinedDown = new Set<string>();
+	/** Uploads the store refused by size, by hash (in memory; see the header). */
+	private readonly refusedUp = new Set<string>();
 
 	private constructor(private readonly deps: BlobQueueDeps) {}
 
@@ -109,6 +124,11 @@ export class BlobQueue implements BlobTransfer {
 	/** Largest plaintext the store moves under the vault's suite (see the header); 0 without a store. */
 	get maxBlobBytes(): number {
 		return this.deps.store ? storePlaintextCap(this.deps.crypto, this.deps.store) : 0;
+	}
+
+	/** true = the store refused `hash` by size; upload() of it answers false without a request. */
+	refused(hash: string): boolean {
+		return this.refusedUp.has(hash);
 	}
 
 	/** Hashes whose download is quarantined (diagnostics / tests). */
@@ -154,7 +174,8 @@ export class BlobQueue implements BlobTransfer {
 		this.due.set(key, this.deps.clock.monotonic() + backoffMs(attempts));
 	}
 
-	private async succeeded(direction: Direction, hash: string): Promise<void> {
+	/** Forget the transfer's record, if any (it succeeded, or it can never succeed). */
+	private async settled(direction: Direction, hash: string): Promise<void> {
 		const key = `${direction}:${hash}`;
 		if (!this.records.has(key)) return;
 		this.records.delete(key);
@@ -201,20 +222,26 @@ export class BlobQueue implements BlobTransfer {
 		const store = this.deps.store;
 		if (!store) return Promise.resolve(false);
 		return this.once(`up:${req.hash}`, async () => {
+			if (this.refusedUp.has(req.hash)) return false;
 			if (req.bytes.length > this.maxBlobBytes) {
 				this.deps.notice?.("warn", "blob-too-large", `attachment too large to sync: ${req.path}`);
 				return false;
 			}
-			if (sha256Hex(req.bytes) !== req.hash) return false; // the file changed under us: re-plan
+			if (bytesToHex(await this.deps.hash.sha256(req.bytes)) !== req.hash) return false; // the file changed under us: re-plan
 			if (this.backingOff("up", req.hash)) return false;
 			let ok = false;
 			try {
 				await putSealed(store, this.deps.crypto, req.hash as ContentHash, req.bytes, this.deps.touch);
 				ok = true;
-			} catch {
-				ok = false;
+			} catch (e) {
+				if (e instanceof BlobTooLargeError) {
+					this.refusedUp.add(req.hash);
+					await this.settled("up", req.hash);
+					this.deps.notice?.("warn", "blob-too-large", `attachment too large to sync: ${req.path} (refused by the server)`);
+					return false;
+				}
 			}
-			if (ok) await this.succeeded("up", req.hash);
+			if (ok) await this.settled("up", req.hash);
 			else await this.failed("up", req, req.bytes.length);
 			return ok;
 		});
@@ -229,7 +256,7 @@ export class BlobQueue implements BlobTransfer {
 			const got = await (ahead ?? this.getVerified(req.hash as ContentHash));
 			if (got.ok) {
 				this.streaks.clear(req.hash);
-				await this.succeeded("down", req.hash);
+				await this.settled("down", req.hash);
 				return got.bytes;
 			}
 			if (got.deterministic) this.deps.notice?.("warn", "blob-corrupt", `downloaded attachment failed verification: ${req.path}`);
@@ -279,7 +306,7 @@ export class BlobQueue implements BlobTransfer {
 		const store = this.deps.store;
 		if (!store) return { ok: false, reason: "transport", deterministic: false };
 		try {
-			return await getOpened(store, this.deps.crypto, hash, sha256Hex);
+			return await getOpened(store, this.deps.crypto, hash, async (b) => bytesToHex(await this.deps.hash.sha256(b)));
 		} catch {
 			return { ok: false, reason: "transport", deterministic: false };
 		}

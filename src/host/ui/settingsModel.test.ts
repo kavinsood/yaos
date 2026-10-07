@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-	applyControl, ATTACHMENT_SIZE_DESC, attachmentSizeDesc, CONTROL_KEYS, connectionRows, enableSettingsSync, engineAcceptsCommands,
+	applyControl, ATTACHMENT_SIZE_DESC, attachmentLimitMb, attachmentSizeDesc, CONTROL_KEYS, connectionRows, enableSettingsSync, engineAcceptsCommands,
 	engineRows, isControlKey, isPaused, parseExcludePatterns, phaseLabel, readControl, runStateLabel, serverConsoleUrl, TRASH_MODE_OPTIONS, validateControl,
 } from "./settingsModel";
-import { defaultPluginData, MIB, sanitizePluginData, TRASH_MODES, type PairedIdentity } from "./api";
+import { defaultPluginData, MAX_ATTACHMENT_BYTES_LIMIT, MIB, sanitizePluginData, TRASH_MODES, type PairedIdentity } from "./api";
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
 import { testVaultId } from "../keys/testkit/vaultIds";
 
@@ -44,7 +44,28 @@ test("applyControl returns the same object when nothing changes", () => {
 	assert.equal(applyControl(d, "syncAttachments", true), d);
 	assert.equal(applyControl(d, "deviceLabel", "  Mac "), d);
 	assert.equal(applyControl(d, "excludePatterns", "\n\n"), d);
-	assert.equal(applyControl(d, "maxAttachmentMb", 50), d);
+	assert.equal(applyControl(d, "maxAttachmentMb", 1024), d);
+	assert.equal(applyControl(d, "maxAttachmentMb", 95, 95), d, "the default shows as the server's limit");
+});
+
+test("attachment size: the default follows the server's limit; the control only lowers it and never shows more", () => {
+	const d = defaultPluginData("Mac");
+	assert.equal(d.engine.maxAttachmentBytes, MAX_ATTACHMENT_BYTES_LIMIT, "default: min(setting, server) = the server's");
+	// Until a vault reports its limit: the least any relay takes (100 MB PUT cap, sealed under suite 1: 98,566,143 bytes).
+	assert.equal(attachmentLimitMb(null), 93);
+	assert.equal(attachmentLimitMb(snap("starting")), 93);
+	assert.equal(attachmentLimitMb(snap("live", { maxBlobBytes: 0 })), 93, "no blob store: no limit to name");
+	assert.equal(attachmentLimitMb(snap("live", { maxBlobBytes: 100_000_000 })), 95, "suite 0: the relay's cap, rounded down");
+	assert.equal(attachmentLimitMb(snap("live", { maxBlobBytes: 98_566_143 })), 93);
+	assert.equal(attachmentLimitMb(snap("live", { maxBlobBytes: 5 * 1024 * MIB })), 1024, "the setting's own ceiling");
+	assert.equal(attachmentLimitMb(snap("live", { maxBlobBytes: 1000 })), 1, "whole MB, at least 1");
+	assert.equal(readControl(d, "maxAttachmentMb", 95), 95);
+	assert.match(validateControl("maxAttachmentMb", 96, 95) ?? "", /from 1 to 95/);
+	assert.throws(() => applyControl(d, "maxAttachmentMb", 96, 95), RangeError);
+	const lowered = applyControl(d, "maxAttachmentMb", 40, 95);
+	assert.equal(lowered.engine.maxAttachmentBytes, 40 * MIB);
+	assert.equal(readControl(lowered, "maxAttachmentMb", 30), 30, "a lower server limit is what shows");
+	assert.equal(applyControl(lowered, "maxAttachmentMb", 95, 95).engine.maxAttachmentBytes, MAX_ATTACHMENT_BYTES_LIMIT, "the maximum follows the server again");
 });
 
 test("validation rejects bad values with readable messages and applyControl throws", () => {
@@ -157,7 +178,7 @@ test("engine rows and labels", () => {
 test("attachment size description names the open carrier's limit when the status has it, rounded down", () => {
 	assert.equal(attachmentSizeDesc(null), ATTACHMENT_SIZE_DESC);
 	assert.equal(attachmentSizeDesc(snap("starting")), ATTACHMENT_SIZE_DESC, "no vault open yet");
-	const tail = "; the smaller limit applies.";
+	const tail = ".";
 	assert.equal(attachmentSizeDesc(snap("live", { maxBlobBytes: 10 * MIB })), `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to 10 MB${tail}`);
 	for (const [bytes, size] of [[8 * MIB, "8 MB"], [1.5 * MIB, "1.5 MB"], [10 * MIB + 1, "10 MB"], [1.99 * MIB, "1.9 MB"], [512 * 1024, "512 KB"], [10, "1 KB"]] as const) {
 		assert.equal(attachmentSizeDesc(snap("live", { maxBlobBytes: bytes })), `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to ${size}${tail}`);

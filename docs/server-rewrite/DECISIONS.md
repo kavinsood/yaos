@@ -64,7 +64,7 @@ Auth: `-` none, `C` operator session cookie, `B` device bearer, `T` streams tick
 | `GET /vault/:id/ws/streams` | T | `streamsVersion` check (1008 `update_required`) | vault |
 | `GET /vault/:id/streams/feed`, `/streams/read` | B | | vault |
 | `PUT /vault/:id/streams/checkpoint` | B | Content-Length ≤ 4 MiB else 413; streams body | vault |
-| `PUT`/`GET /vault/:id/blobs/:addr`, `POST /vault/:id/blobs/exists` | B | address regex; ≤ 10 MiB; `exists` ≤ 50 entries; R2 I/O | vault (bearer check only) |
+| `PUT`/`GET /vault/:id/blobs/:addr`, `POST /vault/:id/blobs/exists` | B | address regex; ≤ 100 MB with a Content-Length; `exists` ≤ 50 entries; R2 I/O | vault (bearer check only) |
 | `GET /vault/:id/blobs?cursor=`, `POST /vault/:id/blobs/delete` | B | cursor format; delete body ≤ 16 KiB with 1–100 distinct addresses and a cutoff; R2 list (≤ 10 calls), or ≤ 100 heads then one delete (D9 GC) | vault (bearer check + GC limit) |
 | `POST /vault/:id/debug/simulate-daily-limit` | B | only when `YAOS_DEBUG_ROUTES=1`, else 404 | vault |
 
@@ -268,8 +268,13 @@ The config DO runs the steps (the Worker forwards the request after the session 
 - *Tests:* T-EPOCH-MISMATCH, T-EPOCH-MATCH, T-EPOCH-ABSENT.
 
 **D9 Blobs (R2 only).**
-- Address `^[0-9a-f]{64}$`: format check only, no SHA-256 check. PUT overwrites. Body ≤ 10 MiB
-  (`maxBlobUploadBytes`), else 413. `exists` takes at most 50 entries, more is `400 too_many_addresses`; any entry
+- Address `^[0-9a-f]{64}$`: format check only, no SHA-256 check. PUT overwrites. Body ≤ 100 MB
+  (`maxBlobUploadBytes` = 100000000), else 413. *Why 100 MB:* it is Cloudflare's request body limit on the Free and
+  Pro plans; the edge answers a larger body with its own 413 before the Worker runs
+  (https://developers.cloudflare.com/workers/platform/limits/). A Business (200 MB) or Enterprise (up to 5 GB) zone
+  still gets 100 MB. The PUT needs a `Content-Length`, else `411 length_required`, and the body streams to R2
+  (`bucket.put(key, request.body)`, which needs a known length): it is never buffered, since a body near the cap
+  would fill most of the 128 MB isolate. `exists` takes at most 50 entries, more is `400 too_many_addresses`; any entry
   that is not an address makes it `400 invalid_address` (E2EE design §19 A4: never a silent "absent").
 - No `YAOS_BUCKET` → `503 attachments_unavailable` and `capabilities.attachments=false`.
 - **R2 key `v/<vaultId>/<address>` (mandatory)**, with no generation. Vault delete purges the prefix. *Why:* the

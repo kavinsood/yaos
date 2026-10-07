@@ -100,6 +100,28 @@ test("blob: upload failure defers the nsCreate (no doc without bytes on the serv
 	assert.equal(w.syncedByPath("g.bin")?.docId, id);
 });
 
+test("blob: an upload the store refuses by size (413) holds the doc: no nsCreate, not a failure, never re-sent", async () => {
+	const w = new World();
+	w.vault.userWrite("big.bin", bytes(1, 2, 3));
+	await w.boot();
+	w.blobs!.refuseUploads = true;
+	const first = await w.r.pass();
+	assert.equal(first.held, 1);
+	assert.equal(first.failed, 0, "held, not failed: the scheduler arms no retry (passScheduler.ts)");
+	assert.equal(w.blobs!.uploads.length, 1);
+	const again = await w.r.pass();
+	assert.equal(again.held, 1);
+	assert.equal(w.blobs!.uploads.length, 1, "refused bytes are not read or sent again");
+	assert.equal(w.log.submitted.length, 0);
+	assert.equal(w.syncedByPath("big.bin"), undefined);
+	// Changed bytes are a new hash: tried, and synced once the store takes them.
+	w.blobs!.refuseUploads = false;
+	w.vault.userWrite("big.bin", bytes(4, 5, 6));
+	await w.sync();
+	assert.ok(w.log.liveByPath(P("big.bin")));
+	assert.equal(w.blobs!.uploads.length, 2);
+});
+
 test("blob: download unavailable -> retried on a later sync", async () => {
 	const w = new World();
 	await w.boot();

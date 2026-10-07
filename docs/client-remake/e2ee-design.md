@@ -149,7 +149,7 @@ What the design relies on, and how sure we are. Spike numbers are on an Apple M4
 | Desktop SecretStorage uses Electron `safeStorage`. Without OS encryption it stores **plaintext** and warns (`msgSecretsNotEncrypted`) | **[S]** `obsidian-1.14.4.asar`, bytes ~3571300–3572700 (read-only); same in 1.13.7 | Linux without a keyring: plaintext |
 | Mobile SecretStorage uses the Capacitor plugin `SecureStorage` under the bare key `"secrets-encrypted"`, so it is shared across vaults | **[S]** same asar (mobile adapter). Backed by the iOS Keychain: **[User]**. Android Keystore **[U]** | Namespace ids per vault (§6.1) |
 | `crypto.subtle` requires a secure context; custom schemes count as secure in WebKit; a worker inherits it | **[S]** [WebCrypto] §10; WebKit `SecurityOrigin.cpp` L101-102, `WorkerGlobalScope.cpp` L204-210 | Obsidian iOS: WKWebView treats `capacitor://localhost` as a secure context, so `crypto.subtle` works **[User]** |
-| No streaming AEAD in WebCrypto | **[S]** [w3c-webcrypto-73] | Blobs ≤ 10 MiB are sealed in one call (§10.3) |
+| No streaming AEAD in WebCrypto | **[S]** [w3c-webcrypto-73] | Each blob is sealed in one call, up to the relay's 100 MB cap (§10.3) |
 | The stock iOS Camera (iOS 11+) recognises a QR holding an `obsidian://` link and offers to open Obsidian | **[User]** | Android camera apps **[U]** |
 | Obsidian mobile WebViews and desktop Electron behave like the above (throughput, zero IV, Android) | **[U]**, except the [User] rows above | §23.3 lists the device runs |
 
@@ -185,7 +185,7 @@ What the design relies on, and how sure we are. Spike numbers are on an Apple M4
 - **Integrity.** [CFRG-limits] §6.2.2 gives `IA ≤ 2·v·(L+1)/2^128`.
   - [D] For L = 2^16, one forgery attempt succeeds with probability 2^-111. 2^40 attempts give 2^-71.
 - **Message length.** At most 2^39−256 **bits** ([NIST-GCM] §5.2.1.1). [WebCrypto] §29.4.1 says "bytes"; the
-  spec is inconsistent. Irrelevant here, since nothing exceeds 10 MiB.
+  spec is inconsistent. Irrelevant here: the largest message is a blob under the relay's 100 MB cap (§7.3).
 - **Rule: roll at 2^23.** A device starts a roll (§11.4) when either:
   - `headSeq − firstSeq(e) ≥ 2^23`, where `firstSeq(e)` is the seq of epoch e's winning `k` record; or
   - its own seal count under e reaches 2^22. This count is kept lazily in IDB meta and covers re-seals that
@@ -409,11 +409,16 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
     - [D] For lengths in [2^21, 2^22), Padmé pads to multiples of 64 KiB.
     - The writer's existing `sealed.length > maxCheckpointBytes` branch handles the ≤ 12 % growth
       (`src/engine/body/checkpoints.ts:174-176`).
-  - Blobs. `maxBlobUploadBytes` = 10 MiB (DECISIONS D9).
-    - [D] For lengths in [2^23, 2^24), Padmé pads to multiples of 256 KiB. The largest padded plaintext that fits
-      with header and overhead is 39 × 256 KiB = 10223616 B.
-    - So `MAX_BLOB_PLAINTEXT_BYTES` (suite 1) = **10223615**, the 0x80 marker included.
-    - `BlobPort.maxBlobBytes` stays the transport cap. The engine compares plaintext against the suite's cap.
+  - Blobs. `maxBlobUploadBytes` = 100 MB = 100000000 B, Cloudflare's request body limit on the Free and Pro plans
+    (DECISIONS D9; a larger request gets the edge's own 413).
+    - [D] For lengths in [2^26, 2^27), Padmé pads to multiples of 2 MiB. The largest padded plaintext that fits
+      with header and overhead is 47 × 2 MiB = 98566144 B (sealed: 98566179 B at the largest keyEpoch; 48 × 2 MiB
+      seals to 100663327 B).
+    - So the largest suite-1 plaintext is `maxSealedBlobPlaintext(100000000)` = **98566143**, the 0x80 marker
+      included. Suite 1 has no cap of its own: `maxSealedBlobPlaintext(cap)` derives it from whatever transport cap
+      the relay reports (`src/core/codec/sealedBlob.ts`).
+    - `BlobPort.maxBlobBytes` stays the transport cap. The engine compares plaintext against what still fits it once
+      sealed (`storePlaintextCap`, `src/engine/blobs/blobStore.ts`).
 - **Row cost.** relay-wire §11.4: a commit costs 2 rows per touched stream, plus 1 per sealed ~64 KiB segment.
   Padding changes only the bytes.
   - [D] Small frames grow to 256 B. 100 such frames in one commit are 25 KiB, still one segment.
@@ -598,7 +603,8 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
   `unsupported-suite`; truncation, a non-minimal varuint, keyEpoch 0, a body shorter than 28 bytes, or a valid tag
   over bad padding is `malformed`; then `unknown-key` and `auth-failed` as for frames. All of them are
   "unavailable" to the download path below.
-- The suite-1 `sealBlob` seals under `sealEpoch()`, and throws above `MAX_BLOB_PLAINTEXT_BYTES_SUITE1` (§7.3).
+- The suite-1 `sealBlob` seals under `sealEpoch()`. It has no size cap of its own; callers never pass more than
+  fits the transport cap once sealed (§7.3).
 - A blob stays under its upload epoch forever. Rolls and revokes never re-seal blobs. A revoked device can read old
   blobs it can fetch, which follows from §14.4.
 - **PUT overwrites** (DECISIONS D9). Two devices uploading the same file put two different ciphertexts at one
@@ -621,16 +627,30 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
 
 ### 10.3 No chunking
 
-- One AEAD call per blob. WebCrypto has no streaming AEAD [w3c-webcrypto-73], and blobs are ≤ 10 MiB.
-- [M] At ≥ 2 GB/s on desktop, sealing 10 MiB takes ~5 ms. Mobile is **[U]** (budget §16).
+- One AEAD call per blob. WebCrypto has no streaming AEAD [w3c-webcrypto-73]; a blob is at most the relay's
+  100 MB cap (§7.3).
+- [M] At ≥ 2 GB/s on desktop, sealing 10 MiB takes ~5 ms; 95 MB seals in 70 ms and opens in 63 ms (node, below).
+  Mobile is **[U]** (budget §16).
 - [M] Blob-sized transient buffers besides the plaintext itself (`scripts/bench-e2ee.mjs`, `benchBlobMemory`):
   - Up: 3. The padded copy (AES-GCM takes one contiguous input), the ciphertext, and one `Blob` request body.
-    `sealBlob` returns the parts `[header ‖ nonce, ciphertext]`; the transport joins them once.
-  - Down: 3. The response body, the plaintext (unpad is a view), and the exact-size copy handed to main.
+    `sealBlob` returns the parts `[header ‖ nonce, ciphertext]`; the transport joins them once. `put` is not
+    async, so only the `Blob` is reachable while the PUT runs (`src/engine/adapters/httpBlob.ts`).
+  - Down: 3. The response body, the plaintext (unpad is a view), and the exact-size copy handed to main. A GET
+    with a `Content-Length` is read into one buffer of that size as chunks arrive (`readBody`), where
+    `arrayBuffer()` held every chunk until it joined them; only the plaintext is reachable once it is open.
   - The WebCrypto outputs are inherent. So is the input copy the spec makes encrypt/decrypt take, which Node does not count.
+- [M] Peak RSS at 95 MB (node 26, one process per path, above a gc()'d baseline that already holds the input;
+  N = 95 MB; 2026-10-07): bare `subtle.encrypt` / `decrypt` 2.00 N (the floor: WebCrypto's input copy and its
+  output); `sealBlob` 3.05 N (the floor plus the padded copy); `openBlob` 2.03 N; `httpBlob.get` 1.08 N (2.07 N
+  with `arrayBuffer()`); `putSealed` through `httpBlob` 5.12 N and `getOpened` plus the copy for main 4.11 N, both
+  including garbage not yet collected (reachability after gc(): during the PUT only the `Blob`; after the open only
+  the plaintext).
 - **Caps.**
-  - Suite 1 plaintext ≤ `MAX_BLOB_PLAINTEXT_BYTES` = 10223615 (§7.3). Above that the file is not synced (notice),
-    as today above 10 MiB.
+  - Suite 1 plaintext ≤ `maxSealedBlobPlaintext(maxBlobBytes)`: 98566143 at the relay's 100 MB (§7.3). Above
+    that, or above the attachment size setting, the file is not synced (skip notice) and nothing is uploaded.
+  - A PUT answered 413, by the relay or by Cloudflare's edge (whatever the body), refuses that blob for the life
+    of the engine: one notice, no outage record, no retry; changed bytes are a new hash and are tried
+    (`src/engine/blobs/blobQueue.ts` `upload`).
   - No blob store (`blob = null`): attachments are not synced (fail closed, DESIGN §j.1). The log carries no
     blob bytes.
 
@@ -1521,7 +1541,8 @@ export interface KeyringCrypto {
   - `blobChunkStream(address: BlobAddress)` (later deleted with the `x:` carrier).
 - `src/core/limits.ts`:
   - `MAX_FRAME_CONTENT_BYTES` (:49, today 1 MiB − 4 KiB) → 1015808 (§7.3);
-  - new `MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 10223615`;
+  - new `MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 10223615`, since deleted: suite 1's cap is derived from the transport cap
+    (§7.3);
   - new `REPLAY_WINDOW = 64` and `PADME_FLOOR_BYTES = 256` (WP-E2);
   - `ROLL_SEQ_SPAN = 2 ** 23` (:89) and `ROLL_OWN_SEALS = 2 ** 22` (:91) landed with the roll (WP-E3);
     `KEY_STORE_WAIT_MS = 5000` lands with host key storage (WP-E4): constants arrive with their first user.
@@ -1614,7 +1635,7 @@ readonly crypto:
 |---|---|
 | §1 Model | Note that stream `k` (keyring) is client-defined and opaque to the relay, like every stream |
 | §2.4 Enroll | "Any client-only key part of a setup link is stripped before `/enroll`" (DECISIONS D3) |
-| §11.3 Blobs (:464, stale) | Rewrite to DECISIONS §5 row 11.3: opaque `^[0-9a-f]{64}$` addresses, no hash verification, R2 key `v/<vaultId>/<address>`, PUT overwrites, ≤ 10 MiB. Drop `X-YAOS-Content-SHA256` / `-Size` (server ask A1, A2) |
+| §11.3 Blobs (:464, stale) | Rewrite to DECISIONS §5 row 11.3: opaque `^[0-9a-f]{64}$` addresses, no hash verification, R2 key `v/<vaultId>/<address>`, PUT overwrites, ≤ `maxBlobUploadBytes` (100 MB). Drop `X-YAOS-Content-SHA256` / `-Size` (server ask A1, A2) |
 | §11.1 Limits | Note that suite-1 payloads are padded, so the client caps content at 1015808 bytes (§7.3) |
 
 ### 18.6 DESIGN.md diffs
@@ -1991,6 +2012,11 @@ runs in the engine):
 
   Blob temporaries (23c2783): uploads drop from 7 to 3 blob-sized buffers through `httpBlob` and from 4 to 2 in memory.
   Downloads stay at 3.
+- **Blob cap = the platform's** (client-remake-cap): the relay takes 100 MB (Cloudflare Free/Pro), suite 1 derives
+  98566143 from it (§7.3), and `MAX_BLOB_PLAINTEXT_BYTES_SUITE1` is gone. The attachment setting defaults to the
+  most it allows (1 GiB) and offers at most what the vault's relay takes. A 413 refuses the blob, no retry (§10.3).
+  `httpBlob` has no fixed timeout on put / get. Peak RSS at 95 MB is in §10.3; `httpBlob.get` dropped from 2.07 N
+  to 1.08 N, and the sealed parts are no longer reachable during a PUT.
 - **Checkpoint policy** (6aea9b1, DESIGN §d.9): the hot cap is 256 rows or 1 MiB, then 30 s idle. A settle
   checkpoint follows 2 min idle, capped at 1000 puts per device per day (≈ 4k rows, 4 % of the Free plan's 100k). A
   heavy day writes ≈ 2.5k checkpoint rows of ≈ 42.5k.

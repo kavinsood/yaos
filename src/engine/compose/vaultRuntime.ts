@@ -228,7 +228,7 @@ export class VaultRuntime {
 		const ahead = { count: Math.max(0, c.budgets.blobConcurrency - 1), bytes: c.budgets.maxDiskIoBytesInFlight };
 		// The write-gated ports (context.ts): no attachment or snapshot-part upload while the keyring reports key-missing.
 		const { crypto, blob } = c.deps;
-		this.blobs = await BlobQueue.open({ db, clock: ports.clock, crypto, store: blob, touch: c.touch, notice: this.notice, ahead });
+		this.blobs = await BlobQueue.open({ db, clock: ports.clock, crypto, hash: ports.hash, store: blob, touch: c.touch, notice: this.notice, ahead });
 		this.rec = await Reconciler.open({
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,

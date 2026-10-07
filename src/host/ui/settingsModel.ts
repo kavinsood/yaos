@@ -3,6 +3,8 @@
  * read-only info rows (connection, engine). No obsidian runtime import.
  */
 
+import { maxSealedBlobPlaintext } from "../../core/codec/sealedBlob";
+import { MAX_BLOB_UPLOAD_BYTES } from "../../core/limits";
 import type { TrashMode } from "../../ports/vault";
 import type { StatusSnapshot } from "../../protocol/status";
 import {
@@ -36,16 +38,29 @@ export const MAX_ATTACHMENT_MB = MAX_ATTACHMENT_BYTES_LIMIT / MIB;
 
 export const ATTACHMENT_SIZE_DESC = "Larger attachments stay on this device.";
 
-/**
- * Description of the attachment size control. The engine skips attachments over
- * min(this setting, the open carrier's limit) (engine/reconcile/localState.ts); once the status
- * carries that limit (StatusSnapshot.maxBlobBytes), say so. Rounded down, never overstated.
- */
-export function attachmentSizeDesc(status: StatusSnapshot | null): string {
+/** The open vault's blob limit (StatusSnapshot.maxBlobBytes), or null when the status does not carry one. */
+function knownBlobLimit(status: StatusSnapshot | null): number | null {
 	const max = status?.maxBlobBytes;
-	if (typeof max !== "number" || !Number.isFinite(max) || max <= 0) return ATTACHMENT_SIZE_DESC;
+	return typeof max === "number" && Number.isFinite(max) && max > 0 ? max : null;
+}
+
+/**
+ * Largest value the attachment size control offers, in whole MB, rounded down: the open vault's blob limit, or
+ * until one is known, what fits the relay's PUT cap once sealed (the smaller of the two suites'). The engine skips attachments
+ * over min(setting, that limit) (engine/reconcile/localState.ts), so the setting can only lower the server's
+ * limit (legacy parity: adfa7a7:src/settings/settingsStore.ts:14-23); the default is the server's own.
+ */
+export function attachmentLimitMb(status: StatusSnapshot | null): number {
+	const max = knownBlobLimit(status) ?? maxSealedBlobPlaintext(MAX_BLOB_UPLOAD_BYTES);
+	return Math.min(MAX_ATTACHMENT_MB, Math.max(1, Math.floor(max / MIB)));
+}
+
+/** Description of the attachment size control; names the open vault's limit once known. Rounded down, never overstated. */
+export function attachmentSizeDesc(status: StatusSnapshot | null): string {
+	const max = knownBlobLimit(status);
+	if (max === null) return ATTACHMENT_SIZE_DESC;
 	const size = max >= MIB ? `${Math.floor((max / MIB) * 10) / 10} MB` : `${Math.max(1, Math.floor(max / 1024))} KB`;
-	return `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to ${size}; the smaller limit applies.`;
+	return `${ATTACHMENT_SIZE_DESC} This server accepts attachments up to ${size}.`;
 }
 
 export const TRASH_MODE_OPTIONS: Readonly<Record<TrashMode, string>> = Object.freeze({
@@ -71,13 +86,14 @@ export function parseExcludePatterns(text: string): string[] {
 	return out;
 }
 
-export function readControl(data: YaosPluginData, key: ControlKey): string | number | boolean {
+/** `limitMb` = attachmentLimitMb(status): the attachment size shown is never above it. */
+export function readControl(data: YaosPluginData, key: ControlKey, limitMb = MAX_ATTACHMENT_MB): string | number | boolean {
 	const e = data.engine;
 	switch (key) {
 		case "deviceLabel": return data.deviceLabel;
 		case "excludePatterns": return e.excludePatterns.join("\n");
 		case "syncAttachments": return e.syncAttachments;
-		case "maxAttachmentMb": return Math.min(MAX_ATTACHMENT_MB, Math.max(1, Math.round(e.maxAttachmentBytes / MIB)));
+		case "maxAttachmentMb": return Math.min(limitMb, Math.max(1, Math.floor(e.maxAttachmentBytes / MIB)));
 		case "syncSettings": return e.syncSettings;
 		case "trashMode": return e.trashMode;
 		case "provisionalBroadcast": return e.provisionalBroadcast;
@@ -95,8 +111,8 @@ function intError(value: unknown, min: number, max: number, unit: string): strin
 	return null;
 }
 
-/** Returns a message safe to show inline, or null when `value` is acceptable for `key`. */
-export function validateControl(key: ControlKey, value: unknown): string | null {
+/** Returns a message safe to show inline, or null when `value` is acceptable for `key`. `limitMb` as in readControl. */
+export function validateControl(key: ControlKey, value: unknown, limitMb = MAX_ATTACHMENT_MB): string | null {
 	switch (key) {
 		case "deviceLabel": {
 			if (typeof value !== "string" || !value.trim()) return "Enter a device name.";
@@ -111,7 +127,7 @@ export function validateControl(key: ControlKey, value: unknown): string | null 
 			if (long !== undefined) return `Each pattern can be at most ${MAX_EXCLUDE_PATTERN_CHARS} characters.`;
 			return null;
 		}
-		case "maxAttachmentMb": return intError(value, 1, MAX_ATTACHMENT_MB, "MB");
+		case "maxAttachmentMb": return intError(value, 1, limitMb, "MB");
 		case "snapshotsKeepDaily": return intError(value, 1, MAX_KEEP_DAILY, "days");
 		case "trashMode": return isTrashMode(value) ? null : "Choose a trash mode.";
 		case "syncAttachments":
@@ -126,12 +142,13 @@ export function validateControl(key: ControlKey, value: unknown): string | null 
 
 /**
  * Returns `data` with `key` set to `value`. Throws RangeError (message safe to show) when invalid.
- * Returns the same object when nothing changes, so callers can skip the write.
+ * Returns the same object when nothing changes, so callers can skip the write. `limitMb` as in readControl:
+ * an attachment size of `limitMb` stores the most there is (follow the server's limit, the default).
  */
-export function applyControl(data: YaosPluginData, key: ControlKey, value: unknown): YaosPluginData {
-	const problem = validateControl(key, value);
+export function applyControl(data: YaosPluginData, key: ControlKey, value: unknown, limitMb = MAX_ATTACHMENT_MB): YaosPluginData {
+	const problem = validateControl(key, value, limitMb);
 	if (problem) throw new RangeError(problem);
-	if (readControl(data, key) === value) return data;
+	if (readControl(data, key, limitMb) === value) return data;
 	const e = data.engine;
 	switch (key) {
 		case "deviceLabel": {
@@ -144,7 +161,10 @@ export function applyControl(data: YaosPluginData, key: ControlKey, value: unkno
 			return { ...data, engine: { ...e, excludePatterns: patterns } };
 		}
 		case "syncAttachments": return { ...data, engine: { ...e, syncAttachments: value as boolean } };
-		case "maxAttachmentMb": return { ...data, engine: { ...e, maxAttachmentBytes: (value as number) * MIB } };
+		case "maxAttachmentMb": {
+			const bytes = (value as number) >= limitMb ? MAX_ATTACHMENT_BYTES_LIMIT : (value as number) * MIB;
+			return bytes === e.maxAttachmentBytes ? data : { ...data, engine: { ...e, maxAttachmentBytes: bytes } };
+		}
 		case "syncSettings": return { ...data, engine: { ...e, syncSettings: value as boolean } };
 		case "trashMode": return { ...data, engine: { ...e, trashMode: value as TrashMode } };
 		case "provisionalBroadcast": return { ...data, engine: { ...e, provisionalBroadcast: value as boolean } };

@@ -22,6 +22,10 @@ test("skipNotice: one file names it and the reason; several give tallies and the
 	assert.equal(sizeText(1536 * 1024), "1.5 MiB");
 	assert.equal(sizeText(300), "300 B");
 	assert.equal(sizeText(2048), "2 KiB");
+	// Rounded down: the relay's cap, sealed under suite 1 (maxSealedBlobPlaintext(100e6)) and plain.
+	assert.equal(sizeText(98_566_143), "93.9 MiB");
+	assert.equal(sizeText(100_000_000), "95.3 MiB");
+	assert.equal(sizeText(2047), "1 KiB");
 });
 
 test("SkipNoticeGate: a path joining the set notifies; unchanged or shrinking sets do not; a returning path does", () => {
@@ -76,4 +80,20 @@ test("reconciler: one warn per new skip set at the end of a pass; quiet passes a
 	await w.sync();
 	assert.equal(skipNotices(w).length, 2, "a shrinking set is not news");
 	assert.ok(w.log.liveByPath("ok.md" as VaultPath), "the rest syncs");
+});
+
+test("reconciler: an attachment over the store's advertised cap gets the too-large notice and no upload, whatever the setting", async () => {
+	// The setting at its default (1 GiB) never raises the store's cap: classify takes min(setting, store cap).
+	const w = new World({ maxBlobBytes: 16, settings: { maxAttachmentBytes: 1024 * 1024 * 1024 } });
+	w.vault.userWrite("ok.md", "ok\n");
+	w.vault.userWrite("fits.png", new Uint8Array(16));
+	w.vault.userWrite("big.png", new Uint8Array(17));
+	await w.boot();
+	await w.sync();
+	assert.deepEqual(skipNotices(w), ["warn:YAOS is not syncing “big.png”: larger than the 16 B limit."]);
+	assert.deepEqual(w.blobs?.uploads.map((u) => u.path), ["fits.png"], "the oversize file is never uploaded");
+	assert.equal(w.log.liveByPath("big.png" as VaultPath), undefined, "and has no ns entry");
+	assert.ok(w.log.liveByPath("fits.png" as VaultPath), "a file at the cap syncs");
+	await w.r.pass();
+	assert.equal(w.blobs?.uploads.length, 1, "a later pass does not try it either");
 });

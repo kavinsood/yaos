@@ -27,9 +27,10 @@ export interface Skipped {
 
 const MIB = 1024 * 1024;
 
+/** A limit as text, rounded down: never more than the limit (98,566,143 bytes is "93.9 MiB", not "94 MiB"). */
 export function sizeText(bytes: number): string {
-	if (bytes >= MIB) return `${Math.round((bytes / MIB) * 10) / 10} MiB`;
-	return bytes >= 1024 ? `${Math.round(bytes / 1024)} KiB` : `${bytes} B`;
+	if (bytes >= MIB) return `${Math.floor((bytes / MIB) * 10) / 10} MiB`;
+	return bytes >= 1024 ? `${Math.floor(bytes / 1024)} KiB` : `${bytes} B`;
 }
 
 function nameProblem(reason: PathInvalidReason | null): string {
