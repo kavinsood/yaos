@@ -6,6 +6,8 @@
  * Preconditions (any failure: zero deletes, a refusal with its reason):
  *  - the vault has a blob store (ports.blob: VAULT_READY attachments capability, adapters/httpBlob.ts);
  *  - suite 1: a sealing epoch is pinned and verified, and so is K_1 (addresses are HMAC(kAddr of K_1));
+ *  - the write gate open (writeGate.ts): a revoked device, or one behind a newer winner it has no key for, reads
+ *    rows it cannot open and is refused "keys-unverified" before it lists (its deletes would be refused anyway);
  *  - a relay session, writable;
  *  - ns / cfg / snap read to the relay's head now, in this session (SessionLoop.readFresh), and not stale;
  *  - no quarantined ns / cfg / snap row, and every fold complete: not halted, its snapshot decodes, every tail row opened, decodes, is
@@ -62,11 +64,12 @@ export class BlobGc {
 		const c = this.c;
 		const pre = this.preconditions();
 		if (pre) return gcRefused(pre.refused, pre.detail);
-		const store = c.ports.blob!;
+		// The write-gated ports (context.ts): the probe PUT, the deletes and an R4 re-upload all pass the gate.
+		const store = c.deps.blob!;
 		let first: Marked | null = null;
 		let own = new Map<ContentHash, Uint8Array>();
 		const out = await sweepBlobs({
-			store, crypto: c.ports.crypto, hash: c.ports.hash, clock: c.ports.clock, random: c.ports.random,
+			store, crypto: c.deps.crypto, hash: c.ports.hash, clock: c.ports.clock, random: c.ports.random,
 			graceMs: c.tuning.blobGcGraceMs, signal, policy: c.touch,
 			mark: async () => {
 				const m = await this.mark(queued, signal, undefined);
@@ -101,6 +104,8 @@ export class BlobGc {
 				return refuse("keys-unverified", "the vault's encryption key is not confirmed on this device");
 			}
 		}
+		const shut = c.gate();
+		if (shut !== null) return refuse("keys-unverified", `this device may not write to the vault (${shut})`);
 		if (!c.session || c.stopped) return refuse("offline", "not connected to the server");
 		if (c.readOnly || !c.session.canWrite) return refuse("read-only", "this device has read-only access");
 		return null;
