@@ -64,7 +64,7 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed))
   - the kind must be in `ALLOWED_KINDS[streamClass]`;
   - for a checkpoint, the inner `CheckpointContent.coversSeq` MUST equal the relay's `coversSeq`, else quarantine.
 - **Compression.** Deflate the content when it is ≥ 4096 B and deflating saves ≥ 10 %.
-- **E2EE later.** Suite 1 swaps the `CryptoPort` only. No layout changes: blob addresses become `HMAC(vaultKey, hash)`.
+- **E2EE later.** Suite 1 swaps the `CryptoPort` only. No layout changes: blob addresses become `hex(HMAC-SHA-256(kAddr, sha256))` (`src/ports/crypto.ts:13`, e2ee-design §10.1).
 - **Unknown values.** An unknown `formatVersion`, `cryptoSuite` or `keyEpoch` is *non-deterministic* (it depends on
   the reader's version and keys): see §d.6 for what each stream does with it.
 
