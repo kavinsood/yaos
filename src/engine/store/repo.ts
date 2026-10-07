@@ -60,7 +60,6 @@ export function defaultPriority(rec: Pick<StreamRecord, "cls">): number {
 		case "cfg": return 1;
 		case "snap": return 2;
 		case "body": case "canvas": return 100;
-		case "blobchunk": return 1000;
 		default: return 5000;
 	}
 }
@@ -149,8 +148,6 @@ export type OutboxChange =
 	| { readonly t: "release"; readonly clientFrameId: ClientFrameId }
 	| { readonly t: "delete"; readonly clientFrameId: ClientFrameId }
 	| { readonly t: "state"; readonly clientFrameId: ClientFrameId; readonly state: OutboxState }
-	/** held only: wait for another frame instead (a ref whose own x: chunks remain). */
-	| { readonly t: "repoint"; readonly clientFrameId: ClientFrameId; readonly dependsOn: ClientFrameId }
 	/**
 	 * pending/sent only, still sealed under `fromEpoch` with `fromLength` bytes: sealed again under the current epoch
 	 * (e2ee-design §14.2 step 4), under `next.clientFrameId` (its own for ns/cfg, a fresh one otherwise).
@@ -675,11 +672,6 @@ export class Repo {
 						const n: OutboxRecord = { ...r, ...c.next, state: "pending", attempts: 0, lastSentAtMs: 0 };
 						await rename(tx, r, n, updated);
 						renamed.push({ old: r, next: n });
-					} else if (c.t === "repoint") {
-						if (r.state !== "held" || r.dependsOn === c.dependsOn) continue;
-						const n: OutboxRecord = { ...r, dependsOn: c.dependsOn };
-						tx.put(STORE.outbox, n);
-						updated.push(n);
 					} else {
 						if (r.state === c.state) continue;
 						const n: OutboxRecord = { ...r, state: c.state, dependsOn: c.state === "pending" ? null : r.dependsOn };
@@ -871,8 +863,8 @@ async function settleOwn(tx: Tx, ob: OutboxRecord, copy: OwnCommitCopy | undefin
 
 /**
  * `next` replaces `old` at the same order (the order indexes are unique: the old key goes first); held records
- * waiting for `old` wait for `next` (dependsOn: ns creates, adopted records, x: chunks), and so do the pending /
- * sent body frames of a live ns create (DESIGN §e.1: they never go before it).
+ * waiting for `old` wait for `next` (dependsOn: ns creates, adopted records), and so do the pending / sent body
+ * frames of a live ns create (DESIGN §e.1: they never go before it).
  */
 async function rename(tx: Tx, old: OutboxRecord, next: OutboxRecord, updated: OutboxRecord[]): Promise<void> {
 	if (next.clientFrameId !== old.clientFrameId) tx.delete(STORE.outbox, old.clientFrameId);
@@ -941,26 +933,22 @@ function advance(r: Mut<StreamRecord>, seq: Seq, vAfter: Seq): void {
 }
 
 /**
- * DESIGN §e.1 dependsOn rule. Only adoptables and x: chunks are dependencies
- * released by record removal; ns creates are released by the fold
- * (nsRuntime; a live create's pending dependents need no release). A held
- * record whose dependency is gone is re-pointed to the
- * next remaining dependency of the same kind, else released to pending.
+ * DESIGN §e.1 dependsOn rule. Only adoptables are dependencies released by
+ * record removal; ns creates are released by the fold (nsRuntime; a live
+ * create's pending dependents need no release). A held record whose
+ * dependency is gone is re-pointed to the next remaining adoptable of its
+ * stream, else released to pending.
  */
 async function releaseDependents(tx: Tx, gone: OutboxRecord): Promise<OutboxRecord[]> {
-	const isChunk = streamClass(gone.stream) === "blobchunk";
 	// Adoption dependencies: an adoptable, or an adopted record re-appended as pending (dependents wait for its receipt).
-	if (gone.adoptOf === null && !isChunk) return [];
+	if (gone.adoptOf === null) return [];
 	if (gone.stream === NS_STREAM || gone.stream === CFG_STREAM || gone.stream === SNAP_STREAM) return [];
 	const held = await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, stateOrderRange("held"));
 	const out: OutboxRecord[] = [];
 	for (const h of held) {
 		if (h.dependsOn !== gone.clientFrameId) continue;
 		let best: OutboxRecord | null = null;
-		// x: streams sort by (stream, order): the newest remaining own chunk is the max order, not the last iterated.
-		const candidates = h.kind === "bodyUpdateRef"
-			? await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, { lower: ["x:", 0], upper: ["x;", 0], upperOpen: true })
-			: (await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(h.stream))).filter((c) => c.adoptOf !== null && c.state !== "poisoned");
+		const candidates = (await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(h.stream))).filter((c) => c.adoptOf !== null && c.state !== "poisoned");
 		for (const c of candidates) {
 			if (c.clientFrameId !== gone.clientFrameId && c.order < h.order && (!best || c.order > best.order)) best = c;
 		}

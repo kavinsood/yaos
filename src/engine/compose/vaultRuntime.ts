@@ -18,6 +18,7 @@ import { bytesToHex } from "../../core/codec/lib0";
 import type { Budgets } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
+import type { BlobPort } from "../../ports/blob";
 import type { TimerHandle } from "../../ports/clock";
 import type { StorageDb } from "../../ports/storage";
 import type { VaultEvent, VaultStat } from "../../ports/vault";
@@ -49,7 +50,7 @@ import { mergeStatus, type DiskSideStatus } from "./statusMerge";
 import { importSyncedMirror, SyncedMirrorWriter } from "./syncedMirror";
 import * as ops from "./runtimeOps";
 
-export type RestartReason = "retry" | "epoch" | "storage-lost" | "rebuild" | "settings";
+export type RestartReason = "retry" | "epoch" | "storage-lost" | "rebuild" | "settings" | "blob-store";
 
 /** What a runtime needs from the protocol engine that owns it. */
 export interface RuntimeOwner {
@@ -60,6 +61,8 @@ export interface RuntimeOwner {
 	readonly boundDisk: Pick<BoundDisk, "checkSaved" | "pendingConflictCopies">;
 	onEpochChanged(epoch: VaultEpoch | null): void;
 	onStorageLost(): void;
+	/** Started without a blob store, and a later connect found one (EngineOptions.onBlobStore): restart on it. */
+	onBlobStore(store: BlobPort): void;
 }
 
 export interface VaultRuntimeStart {
@@ -167,6 +170,7 @@ export class VaultRuntime {
 			onHostNotice: (level, code, message) => engine.link.post({ t: "notice", level, code, message }),
 			e2ee: e2eeOf(config.crypto, engine.keyring),
 			blobBytes: (hash) => holder.rt?.localBlobBytes(hash) ?? Promise.resolve(null),
+			onBlobStore: (store) => engine.onBlobStore(store),
 		});
 		const rt = new VaultRuntime(o, log);
 		holder.rt = rt;
@@ -224,7 +228,7 @@ export class VaultRuntime {
 		const ahead = { count: Math.max(0, c.budgets.blobConcurrency - 1), bytes: c.budgets.maxDiskIoBytesInFlight };
 		// The write-gated ports (context.ts): no attachment or snapshot-part upload while the keyring reports key-missing.
 		const { crypto, blob } = c.deps;
-		this.blobs = await BlobQueue.open({ db, clock: ports.clock, crypto, store: blob, touch: c.touch, chunkLog: this.port.chunks, notice: this.notice, ahead });
+		this.blobs = await BlobQueue.open({ db, clock: ports.clock, crypto, store: blob, touch: c.touch, notice: this.notice, ahead });
 		this.rec = await Reconciler.open({
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,

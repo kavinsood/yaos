@@ -3,8 +3,9 @@
  * file over its size limit, or a name some systems cannot store (§c.2). The old client only
  * logged these (adfa7a7:src/runtime/reconciliationController.ts, "syncFileFromDisk: skipping").
  *
- * Deliberate skips stay silent: exclude patterns, attachments turned off, and every path with a
- * dot segment (the config dir, .trash, hidden files; Obsidian does not index them, §c.2).
+ * Deliberate skips stay silent: exclude patterns, attachments turned off, attachments without a
+ * blob store (no server-metadata UI), and every path with a dot segment (the config dir, .trash,
+ * hidden files; Obsidian does not index them, §c.2).
  *
  * The gate notifies when a path joins the skip set: an unchanged or shrinking set says nothing,
  * a file that leaves and comes back is news again. It lives with the Reconciler, so an unchanged
@@ -52,7 +53,7 @@ export function unexpectedSkips(entries: Iterable<LocalEntry>, classify: (diskPa
 	for (const e of entries) {
 		if (!e.excluded) continue;
 		const c = classify(e.diskPath, e.size);
-		if (hidden(c.path) || c.reason === "pattern" || c.reason === "attachments-off") continue;
+		if (hidden(c.path) || c.reason === "pattern" || c.reason === "attachments-off" || c.reason === "no-blob-store") continue;
 		// reason null: the read found more bytes than the stat said (scan.ts hashPending, "too-large").
 		if (c.reason === "invalid-path") {
 			out.push({ path: c.path, pathKey: c.pathKey, why: "name", detail: `the name ${nameProblem(pathInvalidReason(c.path))}` });

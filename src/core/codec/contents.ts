@@ -1,14 +1,13 @@
 /**
- * Small kind-specific contents (DESIGN §b.4, §b.5): checkpoint, blobChunk,
- * bodyUpdateRef. Decoders return null on malformed input.
+ * Small kind-specific contents (DESIGN §b.4, §b.5): checkpoint, bodyUpdateRef.
+ * Decoders return null on malformed input.
  *
- * Decisions: unknown CheckpointEncoding -> malformed; blobChunk requires
- * total >= 1 and index < total; bodyUpdateRef rejects trailing bytes.
+ * Decisions: unknown CheckpointEncoding -> malformed; bodyUpdateRef rejects
+ * trailing bytes.
  */
 
 import {
 	CheckpointEncoding,
-	type BlobChunkContent,
 	type BodyUpdateRefContent,
 	type CheckpointContent,
 } from "../envelope";
@@ -39,29 +38,6 @@ export function decodeCheckpointContent(bytes: Uint8Array): CheckpointContent | 
 		const coversSeq = r.varuint();
 		const foldRulesVersion = r.varuint();
 		return { encoding: encoding as CheckpointEncoding, coversSeq, foldRulesVersion, state: r.rest() };
-	});
-}
-
-export function encodeBlobChunk(c: BlobChunkContent): Uint8Array {
-	if (c.total < 1 || c.index >= c.total) throw new CodecError("blob chunk index out of range");
-	return new Writer(c.chunk.length + 64)
-		.fixed(hashToBytes(c.hash), 32)
-		.varuint(c.index)
-		.varuint(c.total)
-		.varuint(c.totalSize)
-		.raw(c.chunk)
-		.finish();
-}
-
-export function decodeBlobChunk(bytes: Uint8Array): BlobChunkContent | null {
-	return guard(() => {
-		const r = new Reader(bytes);
-		const hash = bytesToHash(r.copy(32));
-		const index = r.varuint();
-		const total = r.varuint();
-		const totalSize = r.varuint();
-		if (total < 1 || index >= total) throw new CodecError("blob chunk index out of range");
-		return { hash, index, total, totalSize, chunk: r.rest() };
 	});
 }
 

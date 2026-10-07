@@ -208,7 +208,7 @@ function isNsOrCfg(stream: StreamName): boolean {
  * exists for), then the other frames in `order` while they fit, stopping at
  * the first that does not. Keeping an order prefix means a kept frame's
  * dependency (lower order: an earlier body update, the adoptable it waits
- * for, the x: chunks of a bodyUpdateRef) is kept too. Dropped body edits are
+ * for) is kept too. Dropped body edits are
  * still on disk and are re-derived by reconcile.
  *
  * Input order is arbitrary; output is sorted by order. Poisoned records are

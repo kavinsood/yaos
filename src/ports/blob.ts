@@ -1,8 +1,10 @@
 /**
- * BlobPort: optional store addressed by CryptoPort.blobAddress (R2 behind the
- * relay). DESIGN §j.1, e2ee-design §10. The engine receives `BlobPort | null`;
- * null = log-carried fallback for blobs <= MAX_LOG_BLOB_BYTES via x:<address>
- * streams. Puts and gets go through blobs/blobStore.ts only (putSealed / getOpened).
+ * BlobPort: the store addressed by CryptoPort.blobAddress (R2 behind the
+ * relay, HTTP PUT / GET). DESIGN §j.1, e2ee-design §10. The only carrier of
+ * blob bytes: the relay's sequence log carries just the small records that
+ * reference them. The engine receives `BlobPort | null`; null = no store:
+ * attachments and oversize body updates do not sync (fail closed). Puts and
+ * gets go through blobs/blobStore.ts only (putSealed / getOpened).
  *
  * list / deleteIfUploadedBefore are the mark-and-sweep routes (relay-wire §11.3.1,
  * e2ee-design §10.4): only blobs/gc.ts calls them. Upload times are the store's

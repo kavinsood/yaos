@@ -4,7 +4,7 @@
  * equals the DB between transactions. Bounded by OUTBOX_SOFT_BYTES in practice.
  */
 
-import { streamClass, type ClientFrameId, type StreamName } from "../../core/types";
+import type { ClientFrameId, StreamName } from "../../core/types";
 import type { OutboxRecord } from "../store/schema";
 
 export class OutboxCache {
@@ -91,16 +91,5 @@ export class OutboxCache {
 		let n = 0;
 		for (const r of this.byId.values()) if (r.state === "pending" || r.state === "sent") n++;
 		return n;
-	}
-
-	/** Own x: chunk records with order below `order` (a bodyUpdateRef waits for the last one). */
-	lastChunkBefore(order: number, stream?: StreamName): OutboxRecord | null {
-		let best: OutboxRecord | null = null;
-		for (const r of this.byId.values()) {
-			if (streamClass(r.stream) !== "blobchunk" || r.order >= order) continue;
-			if (stream && r.stream !== stream) continue;
-			if (!best || r.order > best.order) best = r;
-		}
-		return best;
 	}
 }

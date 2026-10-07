@@ -104,6 +104,8 @@ async function main(): Promise<void> {
 	R.record("start_to_clean_ms", performance.now() - t0);
 	R.check("clients started inline, ready and clean", clients.every((c) => c.runtime.engine.isReady && c.ui.carriers.at(-1)?.carrier === "inline"),
 		clients.map((c) => ({ carrier: c.ui.carriers.at(-1), deviceClass: c.runtime.currentDeviceClass })));
+	R.check("every client has the relay's blob store (R2): attachments upload over HTTP PUT, never through the relay log",
+		clients.every((c) => c.blobKind === "http" && (c.vrt?.status().maxBlobBytes ?? 0) > 0), clients.map((c) => ({ blob: c.blobKind, maxBlobBytes: c.vrt?.status().maxBlobBytes ?? null })));
 	R.extra.config = { watcherDelayMs: WATCHER_MS, local: LOCAL, carrier: "inline", settings: "DEFAULT_ENGINE_SETTINGS + syncSettings" };
 	// Back-to-back edits cannot commit closer than the relay's minimum interval: the sustained_* floor per commit.
 	R.extra.groupCommit = tap.groupCommit;

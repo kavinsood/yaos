@@ -1,6 +1,6 @@
 /**
  * Snapshot backup e2e (DESIGN §j.4): two full clients (fullKit.ts) on a REAL local relay WITH attachment storage
- * (`start-local.sh --r2`: wrangler dev emulates the R2 bucket under the state dir).
+ * (`start-local.sh`, R2 by default: wrangler dev emulates the bucket under the state dir).
  *   1 device a (upload on) writes markdown, a canvas and ~9 MiB of images (2 parts), takes a manual snapshot
  *     (uploaded), then edits, replaces and deletes files
  *   2 a FRESH device b lists the uploaded snapshot, verifies it (snapshotFiles), restores it: every file equals a's
@@ -228,7 +228,7 @@ function sha256(b: Uint8Array): BlobAddress {
 }
 function blobOf(c: FullClient): BlobPort {
 	const s = c.vrt?.log.c.ports.blob;
-	if (!s) throw new Error(`${c.name} has no blob store (relay started without --r2?)`);
+	if (!s) throw new Error(`${c.name} has no blob store (relay started with --no-r2?)`);
 	return s;
 }
 /** Every stored address (the store's listing, paged). */

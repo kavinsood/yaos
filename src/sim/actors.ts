@@ -98,7 +98,7 @@ export type UserAction =
 	| { readonly t: "diskDeleteToken"; readonly dev: number; readonly file: number; readonly pick: number; readonly by: Writer }
 	| { readonly t: "rename"; readonly dev: number; readonly file: number; readonly name: number }
 	| { readonly t: "delete"; readonly dev: number; readonly file: number }
-	// Attachments (blob docs over x: chunk streams) and settings (config dir).
+	// Attachments (blob docs; bytes through the blob store) and settings (config dir).
 	| { readonly t: "attach"; readonly dev: number; readonly name: number; readonly size: number }
 	| { readonly t: "attachRename"; readonly dev: number; readonly file: number; readonly name: number }
 	| { readonly t: "attachDelete"; readonly dev: number; readonly file: number }

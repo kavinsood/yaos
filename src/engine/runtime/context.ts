@@ -6,7 +6,7 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, blobChunkStream, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
@@ -132,10 +132,6 @@ export class EngineCtx {
 			times: () => c.repo,
 			committed: () => c.committedBlobs(),
 			blobBytes: (h) => opts.blobBytes?.(h) ?? Promise.resolve(null),
-			logCarried: (address) => {
-				const xs = blobChunkStream(address);
-				return c.outbox.ofStream(xs).length > 0 || c.repo.stream(xs) !== undefined;
-			},
 			onReady: () => c.sender?.poke(),
 			diag: (code, fields) => c.diag(code, fields),
 		});

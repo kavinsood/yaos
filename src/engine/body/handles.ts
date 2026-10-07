@@ -32,7 +32,7 @@ export interface Handle {
 	lastAccessMono: number;
 	/** Tail ref rows whose update is not available yet (doc shows wait/blob-unavailable). */
 	unresolvedRefs: number;
-	/** Those rows, retried when x: rows arrive, and on a backoff timer (DocRuntime). */
+	/** Those rows, retried on a per-stream backoff timer (DocRuntime; none without a blob store). */
 	unresolvedRows: TailRecord[];
 	/** Builder close timer. */
 	timer: number | null;

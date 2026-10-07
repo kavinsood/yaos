@@ -62,7 +62,6 @@ export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, now
 			case "snap":
 			case "body":
 			case "bodyRef":
-			case "blobchunk":
 				return { t: "row", row: { ...base, kind: g.inner.kind, authorNsSeq: g.inner.authorNsSeq, flags: g.inner.flags, frameNo: g.inner.frameNo, content: g.inner.content } };
 			case "checkpoint":
 				return { t: "account" };

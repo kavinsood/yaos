@@ -41,7 +41,7 @@ class Times implements PutTimes {
 	async noteBlobPut(a: string, ms: number) { this.at.set(a, ms); }
 }
 
-function setup(o: { committed?: Set<ContentHash> | null; local?: Map<ContentHash, Uint8Array>; carried?: Set<string>; store?: Store | null } = {}) {
+function setup(o: { committed?: Set<ContentHash> | null; local?: Map<ContentHash, Uint8Array>; store?: Store | null } = {}) {
 	const clock = new FakeClock();
 	const store = o.store === undefined ? new Store() : o.store;
 	const times = new Times();
@@ -51,7 +51,6 @@ function setup(o: { committed?: Set<ContentHash> | null; local?: Map<ContentHash
 		store, crypto, hash: hashPort, clock, graceMs: GRACE, times: () => times,
 		committed: () => committed,
 		blobBytes: async (h) => o.local?.get(h) ?? null,
-		logCarried: (a) => o.carried?.has(a) ?? false,
 		onReady: () => void ev.ready++,
 		diag: (c) => void ev.diag.push(c),
 	});
@@ -168,7 +167,7 @@ test("R3 gate: without local bytes the stored object is re-PUT verbatim; neither
 	assert.equal(touch.ready(r2), true);
 });
 
-test("R3 gate: a bodyUpdateRef re-PUTs its own content unless it went to x: chunks", async () => {
+test("R3 gate: a bodyUpdateRef re-PUTs its own content; without a store it is held (its bytes may be in no store)", async () => {
 	const update = bytes(2000, 5);
 	const h = H(update);
 	const a = await crypto.blobAddress(h);
@@ -178,16 +177,16 @@ test("R3 gate: a bodyUpdateRef re-PUTs its own content unless it went to x: chun
 	await settle(ev);
 	assert.deepEqual(store.puts, [a], "from the frame's own bytes");
 	assert.equal(touch.ready(r), true);
-	const u2 = bytes(2000, 6);
-	const carried = setup({ carried: new Set([await crypto.blobAddress(H(u2))]) });
-	const r2 = rec("b:doc" as StreamName, "bodyUpdateRef", u2);
-	assert.equal(carried.touch.ready(r2), false);
-	await settle(carried.ev);
-	assert.equal(carried.store.puts.length, 0, "x: carries it: nothing to refresh");
-	assert.equal(carried.touch.ready(r2), true);
+	const none = setup({ store: null });
+	const r2 = rec("b:doc" as StreamName, "bodyUpdateRef", bytes(2000, 6));
+	assert.equal(none.touch.ready(r2), false, "no store: held");
+	await settle(null);
+	assert.equal(none.touch.ready(r2), false, "still held: no retry, no timer");
+	assert.equal(none.ev.ready, 0);
+	assert.deepEqual(none.ev.diag, []);
 });
 
-test("R3 gate: a store error holds the frame with backoff; the timer pokes; forget drops it; reset re-checks; inert without a store", async () => {
+test("R3 gate: a store error holds the frame with backoff; the timer pokes; forget drops it; reset re-checks; other frames pass without a store", async () => {
 	const pic = bytes(64, 7);
 	const h = H(pic);
 	const { touch, store, ev, clock } = setup({ local: new Map([[h, pic]]) });
@@ -222,5 +221,5 @@ test("R3 gate: a store error holds the frame with backoff; the timer pokes; forg
 	await settle(null);
 	clock.advance(60_000);
 	assert.equal(ev.ready, 4, "a forgotten frame schedules no retry");
-	assert.equal(setup({ store: null }).touch.ready(nsCreate(h)), true, "no store: nothing to keep alive");
+	assert.equal(setup({ store: null }).touch.ready(nsCreate(h)), true, "no store: an ns ref passes (reconcile emits it only after its upload succeeded)");
 });

@@ -143,13 +143,6 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 				continue;
 			}
 			if (!held) continue; // a live create's body frame (DESIGN §e.1): already pending
-			if (r.kind === "bodyUpdateRef") {
-				const chunk = outbox.lastChunkBefore(r.order);
-				if (chunk) {
-					changes.push({ t: "repoint", clientFrameId: r.clientFrameId, dependsOn: chunk.clientFrameId });
-					continue;
-				}
-			}
 			changes.push({ t: "release", clientFrameId: r.clientFrameId });
 		}
 		return changes;

@@ -1,20 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
-import type { BlobChunkContent } from "../../core/envelope";
 import { sha256Hex } from "../../core/hash/sha256";
-import { BLOB_CHUNK_BYTES, MAX_BLOB_PLAINTEXT_BYTES_SUITE1, MAX_LOG_BLOB_BYTES } from "../../core/limits";
+import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../../core/limits";
 import type { ContentHash, DocId, VaultPath } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort, OpenResult, SealedBlobParts } from "../../ports/crypto";
-import { DB_SCHEMA_VERSION, STORE_SPECS } from "../store/schema";
+import { DB_SCHEMA_VERSION, STORE, STORE_SPECS } from "../store/schema";
 import type { DiskSchema } from "../reconcile/store";
 import { FakeClock } from "../reconcile/testkit/fakes";
 import { FakeStorage } from "../reconcile/testkit/fakeStorage";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
 import { BLOB_RETRY_BASE_MS, BlobQueue, backoffMs } from "./blobQueue";
-import { assembleChunks, splitChunks, type BlobChunkLog } from "./chunks";
 
 /** Suite-0-like crypto, but sealing XORs so a missing openBlob would be caught. */
 class XorCrypto implements CryptoPort {
@@ -42,35 +40,21 @@ class FakeStore implements BlobPort {
 	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
 }
 
-class FakeChunkLog implements BlobChunkLog {
-	readonly streams = new Map<string, BlobChunkContent[]>();
-	receipts = true;
-	async appendChunks(hash: ContentHash, chunks: readonly BlobChunkContent[]) {
-		if (!this.receipts) return false;
-		const s = this.streams.get(hash) ?? [];
-		s.push(...chunks.map((c) => ({ ...c, chunk: c.chunk.slice() })));
-		this.streams.set(hash, s);
-		return true;
-	}
-	async readChunks(hash: ContentHash) { return this.streams.get(hash) ?? null; }
-}
-
 const D = "doc0000000000000000000" as DocId;
 const P = "a/pic.png" as VaultPath;
 const rnd = (n: number, seed = 1): Uint8Array => { const b = new Uint8Array(n); let x = seed; for (let i = 0; i < n; i++) { x = (Math.imul(x, 1103515245) + 12345) >>> 0; b[i] = x >>> 24; } return b; };
 
-async function make(opts: { store?: FakeStore | null; log?: FakeChunkLog | null; ahead?: { count: number; bytes: number }; crypto?: CryptoPort; clock?: FakeClock } = {}) {
+async function make(opts: { store?: FakeStore | null; ahead?: { count: number; bytes: number }; crypto?: CryptoPort; clock?: FakeClock } = {}) {
 	const storage = new FakeStorage();
 	const clock = opts.clock ?? new FakeClock();
 	const crypto = new XorCrypto();
 	const store = opts.store === undefined ? new FakeStore() : opts.store;
-	const log = opts.log === undefined ? new FakeChunkLog() : opts.log;
 	const notices: string[] = [];
 	const open = async () => BlobQueue.open({
-		db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto: opts.crypto ?? crypto, store, chunkLog: log,
+		db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto: opts.crypto ?? crypto, store,
 		notice: (_l, c) => notices.push(c), ahead: opts.ahead, touch: { reuse: async () => true, noted: async () => {} },
 	});
-	return { storage, clock, crypto, store, log, notices, q: await open(), reopen: open };
+	return { storage, clock, crypto, store, notices, q: await open(), reopen: open };
 }
 
 test("store: upload seals and puts once; has() short-circuits; download opens and verifies", async () => {
@@ -174,49 +158,19 @@ test("store: oversize upload is refused with a notice", async () => {
 	assert.ok(notices.includes("blob-too-large"));
 });
 
-test("log carrier: chunks of 768 KiB, assembled by index with duplicates ignored", async () => {
-	const { q, log } = await make({ store: null });
-	assert.equal(q.maxBlobBytes, MAX_LOG_BLOB_BYTES);
-	const bytes = rnd(BLOB_CHUNK_BYTES * 2 + 1234, 3);
+test("no blob store: maxBlobBytes 0; upload refuses at once and queues nothing (no retry timer); download / prefetch return at once", async () => {
+	const { q, storage, notices } = await make({ store: null });
+	assert.equal(q.maxBlobBytes, 0);
+	const bytes = rnd(5000, 3);
 	const hash = sha256Hex(bytes);
-	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), true);
-	const chunks = log!.streams.get(hash)!;
-	assert.equal(chunks.length, 3);
-	assert.ok(chunks.every((c) => c.total === 3 && c.totalSize === bytes.length && c.chunk.length <= BLOB_CHUNK_BYTES));
-	// Re-sent duplicates (resend after restart) and shuffled order.
-	log!.streams.set(hash, [chunks[2]!, chunks[0]!, chunks[1]!, chunks[0]!]);
-	assert.deepEqual(await q.download({ hash, docId: D, path: P, size: bytes.length }), bytes);
-});
-
-test("log carrier: not receipted -> false and queued; incomplete stream -> null", async () => {
-	const { q, log, clock } = await make({ store: null });
-	const bytes = rnd(BLOB_CHUNK_BYTES + 1, 4);
-	const hash = sha256Hex(bytes);
-	log!.receipts = false;
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
-	assert.equal(q.queued()[0]!.via, "log");
-	log!.receipts = true;
-	clock.advance(BLOB_RETRY_BASE_MS);
-	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), true);
-	log!.streams.set(hash, log!.streams.get(hash)!.slice(0, 1));
 	assert.equal(await q.download({ hash, docId: D, path: P, size: bytes.length }), null);
-});
-
-test("assembleChunks: inconsistent totals, wrong hash, empty blob", () => {
-	const bytes = rnd(3000, 5);
-	const hash = sha256Hex(bytes) as ContentHash;
-	const chunks = splitChunks(hash, bytes, 1000);
-	assert.equal(chunks.length, 3);
-	assert.deepEqual(assembleChunks(hash, chunks), { ok: true, bytes });
-	assert.deepEqual(assembleChunks(hash, [...chunks, { ...chunks[0]!, total: 4 }]), { ok: false, reason: "inconsistent" });
-	const other = sha256Hex(rnd(3000, 6)) as ContentHash;
-	assert.deepEqual(assembleChunks(other, chunks.map((c) => ({ ...c, hash: other }))), { ok: false, reason: "hash-mismatch" });
-	const empty = new Uint8Array(0);
-	const eh = sha256Hex(empty) as ContentHash;
-	const ec = splitChunks(eh, empty);
-	assert.equal(ec.length, 1);
-	assert.deepEqual(assembleChunks(eh, ec), { ok: true, bytes: empty });
-	assert.throws(() => splitChunks(hash, new Uint8Array(MAX_LOG_BLOB_BYTES + 1)));
+	assert.equal(q.prefetch({ hash, docId: D, path: P, size: bytes.length }), true);
+	assert.deepEqual(q.queued(), []);
+	assert.equal(q.nextDueInMs(), null, "nothing to retry: a store that appears later restarts the runtime");
+	assert.deepEqual(notices, [], "no notice about the server's blob storage");
+	const db = await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS);
+	assert.deepEqual(await db.tx([STORE.blobQueue], "readonly", (tx) => tx.getAll(STORE.blobQueue)), []);
 });
 
 test("concurrent uploads of one hash share one transfer", async () => {
@@ -395,26 +349,4 @@ test("suite 1: an open failure under an unverified key, or an unknown key, is ne
 	}
 });
 
-test("suite 1, log path: assembled chunks that do not verify are deterministic (quarantined); missing ones never are", async () => {
-	const log = new FakeChunkLog();
-	const { q, notices, clock } = await make({ store: null, log, crypto: await suite1(0xa5) });
-	const bytes = rnd(BLOB_CHUNK_BYTES + 10, 14);
-	const hash = sha256Hex(bytes);
-	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), true);
-	assert.deepEqual(await q.download({ hash, docId: D, path: P, size: bytes.length }), bytes);
-	log.streams.get(hash)![1] = { ...log.streams.get(hash)![1]!, chunk: new Uint8Array(10) };
-	for (let n = 0; n < 4; n++) {
-		assert.equal(await q.download({ hash, docId: D, path: P, size: bytes.length }), null);
-		clock.advance(MIN + 1);
-	}
-	assert.ok(notices.includes("blob-corrupt"));
-	assert.ok(notices.includes("blob-quarantined"), "4 deterministic failures over > 3 min");
-	log.streams.get(hash)!.splice(1, 1);
-	const fresh = await make({ store: null, log, crypto: await suite1(0xb5) });
-	for (let n = 0; n < 6; n++) {
-		assert.equal(await fresh.q.download({ hash, docId: D, path: P, size: bytes.length }), null);
-		fresh.clock.advance(10 * MIN);
-	}
-	assert.deepEqual(fresh.notices, [], "incomplete: absent, never deterministic");
-});
 

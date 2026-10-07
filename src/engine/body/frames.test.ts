@@ -1,34 +1,27 @@
 /**
  * Frame builder + frame sealing units (DESIGN §d.4, §b.6, §j.1; §k.3 WP-C #3):
- * caps, close timing, initial chunking, bodyUpdateRef (x: chunks / BlobPort),
+ * caps, close timing, initial chunking, bodyUpdateRef (BlobPort only),
  * FrameTooLargeError, ref resolution.
  */
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as Y from "yjs";
-import {
-	BLOB_CHUNK_BYTES, FRAME_MAX_BYTES, FRAME_MAX_UPDATES, MAX_FRAME_CONTENT_BYTES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES, OPEN_FRAME_IDLE_MS,
-	OPEN_FRAME_MAX_MS,
-} from "../../core/limits";
-import { blobChunkStream, type ClientFrameId, type ContentHash, type DeviceId, type Seq, type StreamName, type VaultId } from "../../core/types";
+import { FRAME_MAX_BYTES, FRAME_MAX_UPDATES, MAX_INLINE_UPDATE_BYTES, OPEN_FRAME_IDLE_MS, OPEN_FRAME_MAX_MS } from "../../core/limits";
+import { type ClientFrameId, type ContentHash, type DeviceId, type Seq, type StreamName, type VaultId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress } from "../../ports/crypto";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import { createWebRandom } from "../adapters/webRandom";
 import { gate, type GateCtx } from "../ingest/gate";
-import type { Repo } from "../store/repo";
 import { bytesToHex as toHex, concatBytes } from "../../core/codec/lib0";
 import { encodeBodyUpdateRef as encodeBodyRef } from "../../core/codec/contents";
 import { FrameBuilder } from "./frameBuilder";
-import { FrameTooLargeError, buildBlobChunkFrame, buildBodyFrames, initialTextUpdates, splitInitialText, type FrameCtx } from "./frames";
-import { assembleChunks } from "../blobs/chunks";
-import { decodeChunks, resolveRef, resolveRefContent } from "./refs";
-import { decodeBlobChunk, encodeBlobChunk } from "../../core/codec/contents";
+import { FrameTooLargeError, buildBodyFrames, initialTextUpdates, splitInitialText, type FrameCtx } from "./frames";
+import { resolveRef, resolveRefContent } from "./refs";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
-import { DEFAULT_RELAY_LIMITS } from "../adapters/wsRelay";
 
 const hash = createWebHash();
 const crypto = createNoopCrypto(hash);
@@ -41,14 +34,6 @@ function textUpdate(chars: number, ch = "a"): Uint8Array {
 	const d = new Y.Doc();
 	d.getText("text").insert(0, ch.repeat(chars));
 	return Y.encodeStateAsUpdate(d);
-}
-
-/** Incompressible bytes: the frame builder treats an update as opaque, and deflate cannot shrink these. */
-function noiseBytes(n: number): Uint8Array {
-	const b = new Uint8Array(n);
-	let x = 7;
-	for (let i = 0; i < n; i++) { x = (Math.imul(x, 1103515245) + 12345) >>> 0; b[i] = x >>> 24; }
-	return b;
 }
 
 test("FrameBuilder: closes at FRAME_MAX_UPDATES and FRAME_MAX_BYTES; take merges the batch and ORs flags", () => {
@@ -142,86 +127,71 @@ test("buildBodyFrames: inline frame pending (or held on a dependency); content i
 	assert.equal(c!.kind, "canvasUpdate");
 });
 
-test("buildBodyFrames: > MAX_INLINE_UPDATE_BYTES without a blob store -> x: chunks + bodyUpdateRef held on the last chunk", async () => {
-	const u = textUpdate(MAX_INLINE_UPDATE_BYTES + 200_000);
-	assert.ok(u.length > MAX_INLINE_UPDATE_BYTES);
-	const frames = await buildBodyFrames(ctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });
-	const h = toHex(await hash.sha256(u)) as ContentHash;
-	const chunks = frames.slice(0, -1);
-	const ref = frames[frames.length - 1]!;
-	assert.equal(chunks.length, Math.ceil(u.length / BLOB_CHUNK_BYTES));
-	for (const c of chunks) {
-		assert.equal(c.stream, blobChunkStream(await crypto.blobAddress(h)));
-		assert.equal(c.kind, "blobChunk");
-		assert.equal(c.state, "pending");
-		assert.ok(c.sealed.length <= 1024 * 1024, "every chunk fits a relay frame");
-		const g = await gate(gctx, { t: "row", stream: c.stream, seq: 1, deviceId: "d" as never, clientFrameId: c.clientFrameId, payload: c.sealed });
-		assert.ok(g.ok && g.t === "blobchunk", JSON.stringify(g.ok ? g.t : g.reason));
-	}
-	assert.equal(ref.kind, "bodyUpdateRef");
-	assert.equal(ref.state, "held");
-	assert.equal(ref.dependsOn, chunks[chunks.length - 1]!.clientFrameId);
-	assert.deepEqual(ref.content, u, "outbox keeps the full update for local reload");
-	const g = await gate(gctx, { t: "row", stream: BODY, seq: 1, deviceId: "d" as never, clientFrameId: ref.clientFrameId, payload: ref.sealed });
-	assert.ok(g.ok && g.t === "bodyRef" && g.ref.hash === h && g.ref.size === u.length);
-	assert.deepEqual(assembleChunks(h, decodeChunks(chunks.map((c) => c.content).reverse())), { ok: true, bytes: u }, "chunks reassemble in any order");
-	assert.deepEqual(assembleChunks(h, decodeChunks(chunks.slice(1).map((c) => c.content))), { ok: false, reason: "incomplete" });
-
-	const dep = "dep-frame-id-000000000" as ClientFrameId;
-	const withDep = await buildBodyFrames(ctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: dep, nowMs: 0 });
-	assert.equal(withDep[withDep.length - 1]!.dependsOn, dep, "an explicit dependency takes precedence");
-
-	// Resolution from the x: tail: hash checked, then gate stage 2 on the bytes.
-	const tail = chunks.map((c, i) => ({ stream: c.stream, seq: i + 1, content: c.content }));
-	const repo = { getTail: async (s: StreamName) => tail.filter((r) => r.stream === s) } as unknown as Repo;
-	const deps = { repo, crypto, hash, blob: null };
-	const refBody = encodeBodyRef({ hash: h, size: u.length });
-	assert.deepEqual(await resolveRefContent(deps, BODY, refBody), u);
-	const wrongSize = encodeBodyRef({ hash: h, size: u.length - 1 });
-	assert.equal(await resolveRefContent(deps, BODY, wrongSize), null);
-	tail.pop();
-	assert.equal(await resolveRefContent(deps, BODY, refBody), null, "missing chunk -> unavailable yet");
-});
-
-test("buildBodyFrames: BlobPort path puts once (deduped by has), falls back to x: chunks when the store fails", async () => {
-	const store = new Map<BlobAddress, Uint8Array>();
-	let puts = 0;
-	let fail = false;
-	const blob: BlobPort = {
-		maxBlobBytes: 64 * 1024 * 1024,
-		async has(as) {
-			if (fail) throw new Error("offline");
-			return new Set(as.filter((a) => store.has(a)));
-		},
-		async put(a, parts) {
-			puts++;
-			store.set(a, concatBytes(parts));
-		},
-		async get(a) {
-			return store.get(a) ?? null;
-		},
+/** In-memory BlobPort; `fail` makes every call throw (store outage). */
+function memStore(maxBlobBytes = 64 * 1024 * 1024) {
+	const objects = new Map<BlobAddress, Uint8Array>();
+	const st = { objects, puts: 0, fail: false, blob: null as unknown as BlobPort };
+	st.blob = {
+		maxBlobBytes,
+		async has(as) { if (st.fail) throw new Error("offline"); return new Set(as.filter((a) => objects.has(a))); },
+		async put(a, parts) { if (st.fail) throw new Error("offline"); st.puts++; objects.set(a, concatBytes(parts)); },
+		async get(a) { if (st.fail) throw new Error("offline"); return objects.get(a)?.slice() ?? null; },
 		list: async () => { throw new Error("unused"); },
 		deleteIfUploadedBefore: async () => { throw new Error("unused"); },
 	};
-	const bctx = { ...ctx, blob };
+	return st;
+}
+
+test("buildBodyFrames: > MAX_INLINE_UPDATE_BYTES without a blob store -> FrameTooLargeError (the doc freezes oversize-local), nothing for the log", async () => {
 	const u = textUpdate(MAX_INLINE_UPDATE_BYTES + 10);
+	assert.ok(u.length > MAX_INLINE_UPDATE_BYTES);
+	await assert.rejects(buildBodyFrames(ctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 }), FrameTooLargeError);
+	const at = textUpdate(MAX_INLINE_UPDATE_BYTES - 200);
+	assert.ok(at.length <= MAX_INLINE_UPDATE_BYTES);
+	const [f] = await buildBodyFrames(ctx, { stream: BODY, content: at, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });
+	assert.equal(f!.kind, "bodyUpdate", "up to the inline cap still rides the log as a plain update");
+});
+
+test("buildBodyFrames: BlobPort path: one ref frame (pending or held on a dependency), put once (deduped by has); resolved from the store only", async () => {
+	const st = memStore();
+	const bctx = { ...ctx, blob: st.blob };
+	const u = textUpdate(MAX_INLINE_UPDATE_BYTES + 200_000);
+	const h = toHex(await hash.sha256(u)) as ContentHash;
 	const one = await buildBodyFrames(bctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });
 	assert.equal(one.length, 1);
 	assert.equal(one[0]!.kind, "bodyUpdateRef");
 	assert.equal(one[0]!.state, "pending");
-	await buildBodyFrames(bctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });
-	assert.equal(puts, 1, "second put skipped: has() answered");
-	const repo = { getTail: async () => [] } as unknown as Repo;
-	const refBody = encodeBodyRef({ hash: toHex(await hash.sha256(u)) as ContentHash, size: u.length });
-	assert.deepEqual(await resolveRefContent({ repo, crypto, hash, blob }, BODY, refBody), u, "resolved from the blob store");
-	fail = true;
-	const fb = await buildBodyFrames(bctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });
-	assert.equal(fb.length, 3, "2 chunks + held ref");
+	assert.deepEqual(one[0]!.content, u, "outbox keeps the full update for local reload");
+	assert.ok(one[0]!.sealed.length < 256, `the relay sees a small ref, not the update: ${one[0]!.sealed.length} B`);
+	assert.deepEqual([...st.objects.keys()], [await crypto.blobAddress(h)]);
+	const g = await gate(gctx, { t: "row", stream: BODY, seq: 1, deviceId: "d" as never, clientFrameId: one[0]!.clientFrameId, payload: one[0]!.sealed });
+	assert.ok(g.ok && g.t === "bodyRef" && g.ref.hash === h && g.ref.size === u.length);
+	const dep = "dep-frame-id-000000000" as ClientFrameId;
+	const held = await buildBodyFrames(bctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: dep, nowMs: 0 });
+	assert.equal(held.length, 1);
+	assert.equal(held[0]!.state, "held");
+	assert.equal(held[0]!.dependsOn, dep);
+	assert.equal(st.puts, 1, "second put skipped: has() answered");
+
+	const deps = { crypto, hash, blob: st.blob };
+	const refBody = encodeBodyRef({ hash: h, size: u.length });
+	assert.deepEqual(await resolveRefContent(deps, BODY, refBody), u, "resolved from the blob store");
+	assert.equal(await resolveRefContent(deps, BODY, encodeBodyRef({ hash: h, size: u.length - 1 })), null);
+	assert.deepEqual(await resolveRef({ ...deps, blob: null }, BODY, refBody), { ok: false, deterministic: false }, "no store: unavailable, never from the log");
+	st.objects.clear();
+	assert.deepEqual(await resolveRef(deps, BODY, refBody), { ok: false, deterministic: false }, "absent: unavailable");
 });
 
-test("buildBodyFrames: > MAX_LOG_BLOB_BYTES with no blob store -> FrameTooLargeError", async () => {
-	const u = textUpdate(MAX_LOG_BLOB_BYTES + 1);
-	await assert.rejects(buildBodyFrames(ctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 }), FrameTooLargeError);
+test("buildBodyFrames: a store error still emits only the ref (BlobTouch R3 re-puts it before send); above the store's cap -> FrameTooLargeError", async () => {
+	const st = memStore();
+	st.fail = true;
+	const u = textUpdate(MAX_INLINE_UPDATE_BYTES + 10);
+	const out = await buildBodyFrames({ ...ctx, blob: st.blob }, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });
+	assert.deepEqual(out.map((f) => [f.stream, f.kind]), [[BODY, "bodyUpdateRef"]]);
+	assert.equal(st.objects.size, 0);
+	const small = memStore(MAX_INLINE_UPDATE_BYTES + 1);
+	await assert.rejects(buildBodyFrames({ ...ctx, blob: small.blob }, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 }), FrameTooLargeError);
+	assert.equal(small.puts, 0);
 });
 
 // ---- suite 1 (e2ee-design §10, WP-E6a) -------------------------------------------------------
@@ -239,55 +209,6 @@ async function suite1(tag: number, o: { e2?: Uint8Array | null; verified?: reado
 	c.setSealEpoch(o.verified && !o.verified.includes(2) ? 1 : 2);
 	return c;
 }
-
-test("suite 1, log path: x: named by the blob address; full 768 KiB chunk frames seal under the 1 MiB relay frame and pass the gate", async () => {
-	const s1 = await suite1(0xe1);
-	const c1: FrameCtx = { ...ctx, vaultId: VAULT1, crypto: s1 };
-	const g1: GateCtx = { crypto: await suite1(0xe2), vaultId: VAULT1, maxCheckpointStateBytes: 1 << 20, staleCheck: () => null };
-	const u = noiseBytes(3 * BLOB_CHUNK_BYTES - 1000);
-	const h = toHex(await hash.sha256(u)) as ContentHash;
-	const frames = await buildBodyFrames(c1, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });
-	const xs = blobChunkStream(await s1.blobAddress(h));
-	assert.notEqual(xs, blobChunkStream(h as unknown as BlobAddress), "never x:<sha256>");
-	assert.ok(!xs.includes(h));
-	const chunks = frames.slice(0, -1);
-	assert.equal(chunks.length, 3);
-	for (const c of chunks) {
-		assert.equal(c.stream, xs);
-		assert.ok(c.content.length <= MAX_FRAME_CONTENT_BYTES);
-		assert.ok(c.sealed.length <= DEFAULT_RELAY_LIMITS.maxFrameBytes, `${c.sealed.length}`);
-		const g = await gate(g1, { t: "row", stream: c.stream, seq: 1, deviceId: c1.self, clientFrameId: c.clientFrameId, payload: c.sealed });
-		assert.ok(g.ok && g.t === "blobchunk", JSON.stringify(g.ok ? g.t : g.reason));
-	}
-	assert.equal(decodeBlobChunk(chunks[0]!.content)!.chunk.length, BLOB_CHUNK_BYTES);
-	assert.ok(chunks[0]!.sealed.length > BLOB_CHUNK_BYTES, "a full chunk, incompressible: not shrunk by deflate");
-	// The largest chunk frame the log path makes: the 11th 768 KiB chunk of an 8 MiB blob.
-	const last = await buildBlobChunkFrame(c1, await s1.blobAddress(h), { hash: h, index: 10, total: 11, totalSize: MAX_LOG_BLOB_BYTES, chunk: noiseBytes(BLOB_CHUNK_BYTES) }, 0 as Seq, 0);
-	assert.ok(last.content.length <= MAX_FRAME_CONTENT_BYTES);
-	// Padmé bucket 49 x 16 KiB (784 KiB), plus the outer header, nonce and tag: ~240 KiB under the 1 MiB frame.
-	assert.ok(last.sealed.length > 49 * 16 * 1024 && last.sealed.length <= 49 * 16 * 1024 + 28 + 64, `${last.sealed.length}`);
-	assert.ok(last.sealed.length <= DEFAULT_RELAY_LIMITS.maxFrameBytes);
-	const ref = frames.at(-1)!;
-	const g = await gate(g1, { t: "row", stream: BODY, seq: 2, deviceId: c1.self, clientFrameId: ref.clientFrameId, payload: ref.sealed });
-	assert.ok(g.ok && g.t === "bodyRef" && g.ref.hash === h, "the ref carries the plaintext sha256 (sealed)");
-
-	// Resolution (a real Yjs update: refs check it) from the committed x: rows, on another device; a chunk with
-	// other bytes (same shape) is deterministic, a missing one is not.
-	const y = textUpdate(2 * BLOB_CHUNK_BYTES + 5000);
-	const yh = toHex(await hash.sha256(y)) as ContentHash;
-	const yChunks = (await buildBodyFrames(c1, { stream: BODY, content: y, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 })).slice(0, -1);
-	assert.equal(yChunks.length, 3);
-	const tail = yChunks.map((c, i) => ({ stream: c.stream, seq: i + 1, content: c.content }));
-	const deps = { repo: { getTail: async (st: StreamName) => tail.filter((r) => r.stream === st) } as unknown as Repo, crypto: g1.crypto, hash, blob: null };
-	const refBody = encodeBodyRef({ hash: yh, size: y.length });
-	const ok = await resolveRef(deps, BODY, refBody);
-	assert.ok(ok.ok && Buffer.compare(ok.bytes, y) === 0, JSON.stringify(ok.ok ? ok.bytes.length : ok));
-	const second = decodeBlobChunk(tail[1]!.content)!;
-	tail[1] = { ...tail[1]!, content: encodeBlobChunk({ ...second, chunk: second.chunk.map((b) => b ^ 1) }) };
-	assert.deepEqual(await resolveRef(deps, BODY, refBody), { ok: false, deterministic: true });
-	tail.splice(1, 1);
-	assert.deepEqual(await resolveRef(deps, BODY, refBody), { ok: false, deterministic: false });
-});
 
 test("suite 1, store path: ref blobs sealed at their address; tampered -> deterministic only under a verified key", async () => {
 	const objects = new Map<BlobAddress, Uint8Array>();
@@ -308,8 +229,7 @@ test("suite 1, store path: ref blobs sealed at their address; tampered -> determ
 	const addr = await s1.blobAddress(h);
 	assert.deepEqual([...objects.keys()], [addr]);
 	assert.notDeepEqual(objects.get(addr)!.subarray(0, 64), u.subarray(0, 64), "sealed");
-	const repo = { getTail: async () => [] } as unknown as Repo;
-	const at = async (c: Awaited<ReturnType<typeof suite1>>, refBody = encodeBodyRef({ hash: h, size: u.length })) => resolveRef({ repo, crypto: c, hash, blob }, BODY, refBody);
+	const at = async (c: Awaited<ReturnType<typeof suite1>>, refBody = encodeBodyRef({ hash: h, size: u.length })) => resolveRef({ crypto: c, hash, blob }, BODY, refBody);
 	const reader = await suite1(0xe4);
 	const unverified = await suite1(0xe5, { verified: [1] });
 	const noK2 = await suite1(0xe6, { e2: null, verified: [1] });

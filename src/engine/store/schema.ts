@@ -210,9 +210,8 @@ export interface OutboxRecord {
 	/**
 	 * pending / sent: the live ns create this body frame goes after (DESIGN §e.1, Sender blockedBy).
 	 * held: the frame this waits for (DESIGN §e.1): the doc's ns create
-	 * (released when it folds), the newest adoptable of the same stream
-	 * (released when that record is gone), or the last x: chunk of a
-	 * bodyUpdateRef (released when no own frame of that x: stream remains).
+	 * (released when it folds) or the newest adoptable of the same stream
+	 * (released when that record is gone).
 	 */
 	readonly dependsOn: ClientFrameId | null;
 	/** adoptable only: identity of the provisional frame being shadowed. */
@@ -340,7 +339,6 @@ export interface BlobQueueRecord {
 	readonly docId: DocId;
 	readonly path: VaultPath;
 	readonly size: number;
-	readonly via: "store" | "log";
 	readonly attempts: number;
 	readonly nextAttemptAtMs: number;
 	/** 0 = queued, 1 = in flight. Indexed with nextAttemptAtMs. */

@@ -205,7 +205,8 @@ export class FullClient {
 	workspace: SimWorkspace;
 	runtime: HostRuntime;
 	vrt: VaultRuntime | null = null;
-	blobKind: "http" | "log" | null = null;
+	/** "http" = the relay's blob store (R2); "none" = the relay has none (attachments not synced); null = not started. */
+	blobKind: "http" | "none" | null = null;
 	engineStarts = 0;
 	/** Vault cursor of each new vault runtime when it came up (a restart from IndexedDB resumes, not 0). */
 	readonly cursorAtStart: number[] = [];
@@ -276,14 +277,20 @@ export class FullClient {
 				const tap = this.o.tap;
 				const relay = this.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random,
 					...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}), ...(tap ? { WebSocketImpl: tap.webSocket(tr?.WebSocket) } : {}) }));
-				const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential };
+				const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock };
+				// As webEngine.ts: probed at start, and again on a later connect while there is none.
 				const blob = await probeHttpBlob(blobOpts).catch(() => createHttpBlob(blobOpts));
-				this.blobKind = blob ? "http" : "log";
+				this.blobKind = blob ? "http" : "none";
+				const probeBlob = async () => {
+					const found = await probeHttpBlob(blobOpts);
+					if (found) this.blobKind = "http";
+					return this.net.wrapBlob(found);
+				};
 				const storage = createIdbStoragePort(this.factory, IDBKeyRange);
 				const c = config.crypto;
 				// As webEngine.ts: suite-1 keys are zero-filled once imported; unpinned gets the adapter with no key.
 				const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
-				return { relay, storage: tr ? tr.wrapStorage(storage) : storage, clock, random, crypto, hash, blob: this.net.wrapBlob(blob) };
+				return { relay, storage: tr ? tr.wrapStorage(storage) : storage, clock, random, crypto, hash, blob: this.net.wrapBlob(blob), probeBlob };
 			},
 		});
 		this.handle = handle;

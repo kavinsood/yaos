@@ -145,7 +145,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 			}
 			const content = g.checkpoint;
 			if (content.encoding === CheckpointEncoding.retired) {
-				// Retired streams (x: / pruned bodies) are not adopted locally (gap: retirement handling).
+				// Retired streams (e.g. pruned bodies) are not adopted locally (gap: retirement handling).
 				deps.diag("checkpoint-retired", { cls, coversSeq: ck.coversSeq });
 			} else if (isFresh(rec)) {
 				freshSnapshot = { stream, coversSeq: ck.coversSeq, encoding: content.encoding, bytes: content.state, createdAtMs: deps.nowMs() };
@@ -213,7 +213,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	}
 }
 
-/** Streams to read, lowest priority value first (bound docs, ns, cfg, bodies, x:). */
+/** Streams to read, lowest priority value first (keyring, bound docs, ns, cfg, snap, bodies, other). */
 export function staleOrder(streams: Iterable<StreamRecord>, priority: (r: StreamRecord) => number, skip: (r: StreamRecord) => boolean): StreamRecord[] {
 	const out: StreamRecord[] = [];
 	for (const r of streams) if (r.stale && !skip(r)) out.push(r);

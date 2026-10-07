@@ -32,7 +32,6 @@ const V: Record<string, Vector> = {
 	canvasUpdate: { stream: `c:${DOC}`, kind: "canvasUpdate", authorNsSeq: 7, flags: 8, frameNo: 0, nonce: 0xb3 },
 	cfgOps: { stream: "cfg", kind: "cfgOps", authorNsSeq: 12, flags: 0, frameNo: 70000, nonce: 0xb4 },
 	checkpoint: { stream: "ns", kind: "checkpoint", authorNsSeq: 4242, flags: 0, frameNo: 0, nonce: 0xb5, coversSeq: 4242 },
-	blobChunk: { stream: `x:${HASH}`, kind: "blobChunk", authorNsSeq: 0, flags: 0, frameNo: 0, nonce: 0xb6 },
 	bodyUpdateRef: { stream: `b:${DOC}`, kind: "bodyUpdateRef", authorNsSeq: 9, flags: 2, frameNo: 0, nonce: 0xb7 },
 };
 const content = (name: string) => new TextEncoder().encode(`golden ${name}`);
@@ -78,9 +77,11 @@ const GOLDEN: Record<string, string> = {
 	canvasUpdate: "010101b3b3b3b3b3b3b3b3b3b3b3b3ceb04ad1f2c4260538aa152ea26e19d43bbb6756e3bb34b6f01aa3d4d0d42ae898ba6ee1820ff04e12dc33cd393f1fa683342c0946e8d539d59c889248411e632b04082550dc45f8e3c8d58f2b445ab18ddd810049a873178f72aadc0cbfcdc91a1453f8d33ac1a5628f93e545dfd571003dbfe70508507db445c366d275fa9269d665af5d8045e5b414d1e5998b1322068e97a74d8e6d1073d63ae4d34323558efbc3196fa3086e3136be14e6f5bdd3a2a49f5a97c5343f15013e37b9017e732b49df6c1ce555918768b1384e0d1115d6e032821d84f880dc0c707205ab2d5497ecb5453fbcf6f7de6057d53ecc2d10b97abc0b6dddc20d20485753fe7f3a1183dda525f9229c3808be36098b7d46ee",
 	cfgOps: "010101b4b4b4b4b4b4b4b4b4b4b4b450bf701bc4cddb52edd0a724747265f270637a4290c58ef189c7b99f6a2154ec21d1af30dfd3fc3a282f99f2edf86e959195c99b225d5d0c321e0490592a84372eaf9889f12c7044290428694a1f5840fac447a2d181d2613ff83e9617282410a5fc3c807d2d69406e70bd4c9773b92a34f3388bccbdab43d3b62bce71108039bbc71e5df33d916c03af0d63ee997bcc7cbb935c6840f276e4ca8b953d2812d3850acee09614126ee250694fe9cf585f0d5a8a2906ac333256f9569b4b772f8ff521134e2c7c962e6608fad4cde3ea5220abe956fb87b86c65e6bcfc2a2a74f7f272ab6b0fa842cc36235306d88809de6189bdc6bd2ac1d8249799488971a2ae3cb9f30372e3e8913c176df1218f9605",
 	checkpoint: "010101b5b5b5b5b5b5b5b5b5b5b5b5c744ee41bd30ff6fc7c39b1f6a0ef25f220b3c02bd930bdd4ecd4638272b31068d5de4d029c2de71c78e8aae18ec529702b3e889e08f822520404b44ef45f7f7c936b54d82a46baeac6d0f37b1d69f640136aa0a036f104571290f6c187955aaea48a058372b8381e350429be24a919fd38122f2202db1d6411e3e23ae26c1d64e4f671eb6cbeb6a607467aca88d6c7e18bf20767570d52ac6c5ef64d8e7e896e9b7906e131f20ffb3ec975617706f750d4939f1e1c56558d083b897d970c66c9733e094e4a7eed715c25c8f835f7c8ffdfcb1e07e8264ac7e58fdcb6117f406d640198d0efc151642c61dbd926f27fe78062b74c946d572ecc07c334891648b2f745eed9a9bad400038a5fe5daebdb5",
-	blobChunk: "010101b6b6b6b6b6b6b6b6b6b6b6b6883f79065fec66d308ea20c88521264336fc7c38665a224da5425b6c0b9bdd711545ee2cd1d34b806ed084e0b9289bd8eb481a47744cc8b08b545094346cd8eb23de51dbc86b4b6535b7237d59679764d79e6e18e5fb87971b2f115e2d0fc26a5cbacae905f8b03cb3fb3b6491d850deaad53182819495010e817d898a56b177c84deb21766e551411f4be5d8be4e0056d942f2c3425db81644b2cd428cef4ce393854133c792e4cc5fe6eef73c47b607514477b4ab764963b19b91782eac5518b548cb14d1364bb0f56950e18322f93173dcbc5d9ade23fce64d8c2f3df315df908dcfe1aedb577d6b23208a445cfa8b99674c2b9ede28f0ce10cf23ac62a41e58a6b27b049407f9d652fd0c4c046c4",
 	bodyUpdateRef: "010101b7b7b7b7b7b7b7b7b7b7b7b7864d6923e8a460a19ec26d9b78ecbf6b82ddc7150b8889590d10efb16d36d244672db6233b13bd101b3f2516c2c7a7f721edee00cafc934f2a3254b2481c954eec1dc5397e3cd500608700b516be4c4dc9b049fafda9da24507e882115affb469d4d7f1e2a86b8ffeb6ff291cec0374f6865fe87572939e7ba176e759dd2bf7efc8b9ecdcaa3803d35a0bfb0db12d2d81217d1e8e5ddf0a1315c11076ce7b9ecd01097c7a09c65df773acdb709e4f442d3362b025b6923c959efbc49f053b1a49d6b18ea582d67892e32dd95c7de9330a296c2eea823c7d30a3e8a1de8ce4ae950ce96ac7b84a376cdda5f10edebef437b4741c5d04f73d186f847e0009bbe6aba00dd64df898f331090f9d087714f86",
 };
+
+/** Kind 6 (the retired log blob carrier, stream x:<HASH>), sealed before it was retired: it must not open. */
+const RETIRED_KIND6 = "010101b6b6b6b6b6b6b6b6b6b6b6b6883f79065fec66d308ea20c88521264336fc7c38665a224da5425b6c0b9bdd711545ee2cd1d34b806ed084e0b9289bd8eb481a47744cc8b08b545094346cd8eb23de51dbc86b4b6535b7237d59679764d79e6e18e5fb87971b2f115e2d0fc26a5cbacae905f8b03cb3fb3b6491d850deaad53182819495010e817d898a56b177c84deb21766e551411f4be5d8be4e0056d942f2c3425db81644b2cd428cef4ce393854133c792e4cc5fe6eef73c47b607514477b4ab764963b19b91782eac5518b548cb14d1364bb0f56950e18322f93173dcbc5d9ade23fce64d8c2f3df315df908dcfe1aedb577d6b23208a445cfa8b99674c2b9ede28f0ce10cf23ac62a41e58a6b27b049407f9d652fd0c4c046c4";
 
 async function adapter(seal = true) {
 	const random = new ScriptedRandom();
@@ -107,6 +108,12 @@ describe("suite 1 envelope golden vectors (one per kind)", () => {
 			assert.equal(s.sealed.length, 3 + 28 + padmeLen(refInner(name, v).length + 1), `${name}: Padmé-bucketed length`);
 			assert.deepEqual(await open(c, binding(v), hexToBytes(GOLDEN[name]!)), { ok: true, header: { formatVersion: 1, suite: 1, keyEpoch: 1 }, inner }, name);
 		}
+	});
+
+	it("the retired kind 6 authenticates but is malformed", async () => {
+		const { c } = await adapter();
+		const b: EnvelopeBinding = { t: "frame", stream: `x:${HASH}` as StreamName, deviceId: DEV, clientFrameId: CF };
+		assert.deepEqual(await open(c, b, hexToBytes(RETIRED_KIND6)), { ok: false, reason: "malformed", header: { formatVersion: 1, suite: 1, keyEpoch: 1 } });
 	});
 
 	it("sealing needs a seal epoch (no setSealEpoch, no seal)", async () => {

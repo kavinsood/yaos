@@ -1,6 +1,6 @@
 /**
  * Suite-1 (end-to-end encrypted) e2e (e2ee-design §12.4, §14.2, §15.1, §20.3) on a REAL local relay WITH attachment
- * storage (`start-local.sh --r2`). Every device runs the real plugin controller (src/host/pluginController.ts) over
+ * storage (R2; `start-local.sh` binds it by default). Every device runs the real plugin controller (src/host/pluginController.ts) over
  * a full client (fullKit.ts `runtimeFor`): main stores keys in SecretStorage, decides the pin and restarts the
  * engine, which gets the suite-1 adapter (webCryptoSuite1.ts) as in production.
  *   1 a creates the vault through the plugin's own creation flow (src/host/ui/createVault.ts, §15.1) on the fresh,
@@ -187,7 +187,7 @@ function newRk(): Uint8Array {
 
 function blobOf(d: Device): BlobPort {
 	const s = d.client.vrt?.log.c.ports.blob;
-	if (!s) throw new Error(`${d.client.name} has no blob store (relay started without --r2?)`);
+	if (!s) throw new Error(`${d.client.name} has no blob store (relay started with --no-r2?)`);
 	return s;
 }
 async function storedAddresses(d: Device): Promise<Set<string>> {

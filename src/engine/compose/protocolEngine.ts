@@ -25,6 +25,7 @@ import type { DocId, PathKey, VaultEpoch, VaultPath } from "../../core/types";
 import { BUDGETS } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
+import type { BlobPort } from "../../ports/blob";
 import { findKnownEpoch } from "./knownEpoch";
 import { isStorageError } from "../../ports/storage";
 import type { VaultEvent } from "../../ports/vault";
@@ -524,6 +525,14 @@ export class ComposedEngine {
 	/** The store connection died (§i.5): restart; the new runtime recovers from the mirrors. */
 	onStorageLost(): void {
 		void this.restart("storage-lost").then(() => undefined, (e) => this.log(`storage restart failed: ${String(e)}`));
+	}
+
+	/** Started without a blob store and a later connect found one (sessionLoop probeBlobStore): restart on it. */
+	onBlobStore(store: BlobPort): void {
+		if (!this.ports || this.ports.blob || this.disposed) return;
+		this.ports = { ...this.ports, blob: store };
+		this.log("blob store available -> restarting");
+		void this.restart("blob-store").then(() => undefined, (e) => this.log(`blob-store restart failed: ${String(e)}`));
 	}
 
 	/** Tests / diagnostics. */

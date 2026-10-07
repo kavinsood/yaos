@@ -20,7 +20,7 @@ import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
 import { generateUserAction, runUserAction, EXTRA_OPS, FULL_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights } from "./faults";
-import { activity, checkClean, checkConvergence, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, settingsPrint, type Violation } from "./invariants";
+import { activity, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, settingsPrint, type Violation } from "./invariants";
 import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
 import { SIM_SETTINGS, SimDevice } from "./device";
@@ -93,7 +93,7 @@ export interface SimReport {
 
 const NAMES = ["A", "B", "C", "D", "E"];
 
-/** Attachments (log-carried, <= 8 MiB) and settings sync on. */
+/** Attachments (through the net's blob store, <= 8 MiB) and settings sync on. */
 export const RUN_SETTINGS: EngineSettings = { ...SIM_SETTINGS, syncAttachments: true, maxAttachmentBytes: 8 * 1024 * 1024, syncSettings: true };
 
 function full(cfg: SimConfig) {
@@ -245,7 +245,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		if (!(await faults.settle())) violations.push({ inv: "clean", detail: "crash inspections did not finish" });
 		const oracle = await net.oracle(120_000, c.suite1 ? oracleKeys(devs) : null);
 		if (c.suite1) violations.push(...checkE2eeLeaks(devs, net, ledger).violations, ...(faults.e2ee?.check() ?? []));
-		violations.push(...checkConvergence(devs, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)));
+		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)));
 		violations.push(...(await checkQuiet(clock, devs, net)));
 
 		const snap = [...(devs[0]?.vault.snapshot() ?? new Map<string, string>())].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));

@@ -64,7 +64,7 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed))
   - the kind must be in `ALLOWED_KINDS[streamClass]`;
   - for a checkpoint, the inner `CheckpointContent.coversSeq` MUST equal the relay's `coversSeq`, else quarantine.
 - **Compression.** Deflate the content when it is ≥ 4096 B and deflating saves ≥ 10 %.
-- **E2EE later.** Suite 1 swaps the `CryptoPort` only. No layout changes: blob addresses become `HMAC(vaultKey, hash)`.
+- **E2EE later.** Suite 1 swaps the `CryptoPort` only. No layout changes: blob addresses become `hex(HMAC-SHA-256(kAddr, sha256))` (`src/ports/crypto.ts:13`, e2ee-design §10.1).
 - **Unknown values.** An unknown `formatVersion`, `cryptoSuite` or `keyEpoch` is *non-deterministic* (it depends on
   the reader's version and keys): see §d.6 for what each stream does with it.
 
@@ -77,14 +77,13 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed))
 | `snap` | snap | `snapOps` | `snapFoldV1` | commit-only | devices that upload or delete snapshots (§j.4) |
 | `b:<docId>` | body | `bodyUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the note |
 | `c:<docId>` | canvas | `canvasUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the canvas |
-| `x:<address>` | blobchunk | `blobChunk` | `retired` | commit-only | uploader when there is no blob store |
 
-- `<address>` is `CryptoPort.blobAddress(sha256 of the blob)` (`blobChunkStream`, `src/core/types.ts:76`): the
-  sha256 itself under suite 0, `HMAC(kAddr, sha256)` under suite 1 (e2ee-design §10.1). No plaintext hash is ever
-  a stream name.
+- No stream carries blob bytes. Attachments, oversized updates and snapshot parts go to the `BlobPort` only; the
+  log carries only their small records (ns / cfg / snap ops, `bodyUpdateRef`) (§j.1).
 - `docId` and `clientFrameId` are 16 random bytes encoded as base64url without padding (22 chars).
   - A `clientFrameId` is never reused, on any stream, ever. The relay does not detect reuse across streams.
-- Streams of any other class are ignored: the cursor still advances and nothing is stored.
+- Streams of any other class (`streamClass` "other", `src/core/types.ts:76-84`, the retired `x:` names included)
+  are ignored: the cursor still advances and nothing is stored (`src/engine/ingest/gate.ts:94`).
 - Every socket receives every stream (relay-wire §5.3). The cost of a row for a non-resident doc is bounded at
   gate stage 1–2 plus one tail put (§d.6).
 
@@ -134,12 +133,12 @@ opCount × { u8 tag, varuint bodyLen, body[bodyLen] }
   - `floor(3)`: `varuint createdAtMs` (the author's snapshots created before it are deleted).
   - Malformation rules are the same as `nsOps`, plus every bound in §j.4. A put with an unknown `recordVersion` is
     not malformed: the fold ignores it and reports it.
-- **`blobChunk`.** `32B sha256(whole blob), varuint index, varuint total, varuint totalSize, bytes chunk`.
-  - Chunks are `BLOB_CHUNK_BYTES` (768 KiB); only the last may be shorter.
 - **`bodyUpdateRef`.** `32B sha256(update bytes), varuint size`.
-  - The update bytes live in the `BlobPort` (sealed), or in stream `x:<address>` as chunks (address recomputed
-    from the sha256, §b.2).
-  - The ref is appended only after every chunk is receipted, or after the blob put succeeds (`dependsOn`, §e.1).
+  - The update bytes live only in the `BlobPort` (sealed, at `CryptoPort.blobAddress(sha256)`), never on the log.
+  - The ref frame is built after the blob put (`buildBodyFrames`, `src/engine/body/frames.ts:82-90`). A failed put
+    still emits the ref: the sender's R3 gate re-PUTs from the outbox record's content before it sends the ref (§j.1).
+- **Kind code 6** is retired (it was the log blob carrier) and never reused; a row of kind 6 is malformed
+  (`src/core/envelope.ts:36`).
 
 ### b.5 Checkpoints
 
@@ -234,8 +233,7 @@ sorted by deviceId, dels sorted by key and records sorted by key (key = `deviceI
 canonical re-encode must be byte-identical; `foldRulesVersion` ≤ 1, and the inner coversSeq equals the relay's.
 
 **`retired`.** An empty state that tells the relay it may GC every row ≤ coversSeq. It is written only for:
-- `b:`/`c:` streams of docIds the fold has pruned, or that are merged aliases with rows;
-- `x:` streams no ns entry or cfg file references (§j.1).
+- `b:`/`c:` streams of docIds the fold has pruned, or that are merged aliases with rows.
 
 A reader that receives `retired` for a stream the fold still references treats it as a checkpoint with no state:
 the union adds nothing, and rows > coversSeq still apply.
@@ -244,15 +242,15 @@ the union adds nothing, and rows > coversSeq still apply.
 
 | Item | Limit | Rule |
 |---|---|---|
-| Sealed envelope | `maxFrameBytes` (1 MiB; larger closes the socket with 1009) | Content ≤ `MAX_FRAME_CONTENT_BYTES` (1 MiB − 4 KiB, leaving room for the header and AEAD). |
+| Sealed envelope | `maxFrameBytes` (1 MiB; larger closes the socket with 1009) | Content ≤ `MAX_FRAME_CONTENT_BYTES` (1 MiB − 32 KiB, `src/core/limits.ts:60`, leaving room for padding, the headers and AEAD). |
 | ns frame | ≤ 512 ops, ≤ 256 KiB content | The planner splits; ops for one doc stay in plan order across frames. |
 | cfg frame | ≤ 512 ops, ≤ 256 KiB | `filePut` content > 64 KiB goes as a blob ref (§j.3). |
 | snap frame | ≤ 16 ops, records ≤ 48 KiB | One upload is one frame: `put` plus an optional `floor` (§j.4). |
 | Body frame | soft 256 updates / 64 KiB | Holds whole updates. A single update may exceed 64 KiB. |
 | Initial content of a new note | `INITIAL_INSERT_CHUNK_CHARS` = 192 Ki UTF-16 units | Inserted as consecutive transactions of ≤ 192 Ki units: one update, one frame (flag `initial`) each, so ≤ 576 KiB UTF-8. |
-| Any single update > content limit after deflate | — | `bodyUpdateRef`: bytes go to `BlobPort`, else `x:<address>` chunks (≤ `MAX_LOG_BLOB_BYTES` = 8 MiB). Larger with no blob store: the doc is frozen `oversize-local`, the disk file is left untouched, and a notice is shown. |
+| Any single update > content limit after deflate | `MAX_INLINE_UPDATE_BYTES` = `MAX_FRAME_CONTENT_BYTES` | `bodyUpdateRef`: the bytes go to the `BlobPort` only, the log carries the 32 B sha256 + size. No blob store, or larger than its cap (`storePlaintextCap`): the doc is frozen `oversize-local` (`src/engine/body/frames.ts:82`, `src/engine/runtime/docRuntime.ts:149-154`), the disk file is left untouched, and a notice is shown. |
 | Checkpoint | `maxCheckpointBytes` (4 MiB) | Larger: skip. The stream keeps its rows. An ns state > 4 MiB (roughly 40k entries) is open risk OR-3. |
-| Attachment | `BlobPort.maxBlobBytes` (10 MiB), else 8 MiB on the log | Larger: not synced, never deleted, notice (§j.1). |
+| Attachment | `storePlaintextCap` (`BlobPort.maxBlobBytes`, 10 MiB); 0 without a blob store | Larger: not synced, never deleted, notice. No store: no attachment is synced, silently (§j.1). |
 | Snapshot part | `min(8 MiB, ⌊maxBlobBytes × 7/8⌋)`; ≤ 512 parts, zip ≤ 320 MiB | Parts go to the `BlobPort` only, never to the log (§j.4). |
 
 ---
@@ -385,8 +383,9 @@ Results:
 
 **Identical duplicate creates** are the onboarding case: two devices import the same vault concurrently. Each
 identical file merges, so there are no conflict copies, no extra body rows (held initial body frames of merged docs
-are dropped, §d.4: onboarding creates hold their frames, live ones do not) and no disk ops. Only files that really differ are suffixed. When W was edited after its create,
-the loser may still match W's *current* body; the planner's identical-loser collapse handles that (§c.13).
+are dropped, §d.4: onboarding creates hold their frames, live ones do not) and no disk ops. Only files that really
+differ are suffixed. When W was edited after its create, the loser may still match W's *current* body; the planner's
+identical-loser collapse handles that (§c.13).
 
 ### c.6 rename
 
@@ -931,11 +930,13 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
        `ContentDeleted`, with no subdocs, embeds, formats or binary;
      - total inserted UTF-16 units ≤ `MAX_DOC_TEXT_CHARS`;
      - content ≤ `MAX_FRAME_CONTENT_BYTES`.
-   - **`bodyUpdateRef`:** fetch from `BlobPort` and open it (or read and open the `x:` stream), check the sha256, then
-     gate stage 2 on the bytes.
+   - **`bodyUpdateRef`:** fetch from the `BlobPort` only and open it, check the size and the sha256, then gate stage 2
+     on the bytes (`resolveRef`, `src/engine/body/refs.ts:37-55`).
      - If they are unavailable yet, the ref row is stored and retried with backoff, and the doc shows
        `wait/blob-unavailable`. Under the §j.1 quarantine rule (deterministic failures only) the doc is frozen
-       `blob-corrupt` (`src/engine/runtime/docRuntime.ts:210-229`); `releaseQuarantine` unfreezes it and retries.
+       `blob-corrupt` (`src/engine/runtime/docRuntime.ts:221-240`); `releaseQuarantine` unfreezes it and retries.
+     - Without a blob store the row stays unresolved and arms no retry timer (`docRuntime.ts:243-248`); a store found
+       on a later connect restarts the runtime (§j.1).
      - Once resolved, the tail row is rewritten as `bodyUpdate` (a local cache only).
    - Cold docs stop here: the row is stored in `tail` (§e.2 `T_ingest`), and nothing is loaded.
 3. **Check** (resident docs, at apply time):
@@ -1163,7 +1164,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | Store | Key path | Indexes | Value | Bound |
 |---|---|---|---|---|
 | `meta` | `key` | — | `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty` | 5 records |
-| `streams` | `stream` | `byStalePriority [stale, priority]`, `byAccess lastAccessMs` | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, active `x:`; deleted after `retired` |
+| `streams` | `stream` | `byStalePriority [stale, priority]`, `byAccess lastAccessMs` | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap; deleted after `retired` |
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | Soft `OUTBOX_SOFT_BYTES` (16 MiB): builders stretch, notice. **Never dropped** |
@@ -1175,10 +1176,9 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | `cfgBase` | `file` | — | `CfgBaseRecord` | Allowlisted config files |
 | `blobQueue` | `hash` | `byActiveDue [active, nextAttemptAtMs]` | `BlobQueueRecord` | 1 per pending transfer |
 
-- **`dependsOn` rule.** A `held` record waits for one of three things:
+- **`dependsOn` rule.** A `held` record waits for one of two things:
   - the doc's ns create, during onboarding (released when it folds, §d.4);
-  - the newest adoptable of the stream (released when that record is gone);
-  - the last `x:` chunk of a `bodyUpdateRef` (released when no own `x:` frame of that stream remains).
+  - the newest adoptable of the stream (released when that record is gone).
   - Releasing a record means `held → pending` in the same transaction that removes the dependency.
 - **`pending` with `dependsOn`** is a live create's body frame (§d.4). It is sent only after that create: while the
   create is in the outbox, the frame goes only once the create is inflight on the same session. It is deleted when
@@ -1766,7 +1766,7 @@ interface RelaySession {
 interface RelayPort { connect(params: { vaultId: VaultId; deviceId: DeviceId }): Promise<RelayConnectResult> }
 
 // index.ts — bundles
-interface EnginePorts { relay; storage; clock; random; crypto; hash; blob: BlobPort | null }
+interface EnginePorts { relay; storage; clock; random; crypto; hash; blob: BlobPort | null; probeBlob?: () => Promise<BlobPort | null> }
 interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; random }   // no hash: main never hashes (§d.2)
 ```
 
@@ -1802,7 +1802,7 @@ interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; r
   - Each slice runs jobs from the highest non-empty lane until `sliceMs` has elapsed, then calls `yieldNow()`.
   - **Aging:** every 8th slice serves the oldest job of lanes ≥ 3, so bulk work never starves.
   - Relay events are queued immediately (O(1)). Their processing is scheduled by lane.
-- **Sender** order: lane 0 frames, ns, cfg, then snap and background, then bulk (`x:` chunks, adopted frames).
+- **Sender** order: lane 0 frames, ns, cfg, then snap and background, then bulk (adopted frames).
 - **Host** executes `diskOps` batches lane-first within `mainSliceMs` slices, and puts editor work ahead of all of
   it.
 
@@ -1914,14 +1914,18 @@ ones get conflict copies.
 
 ### j.1 Blobs
 
+- **Blobs never ride the relay log.** Attachment bytes, the bytes behind a `bodyUpdateRef` and snapshot parts go
+  only to the blob store (`BlobPort`: R2 over HTTP `PUT /vault/:id/blobs/<address>`), out of band. The log carries
+  only the small record: `nsCreate` / `nsSetBlob` (hash + size) once the upload finished, or the `bodyUpdateRef`
+  (32 B sha256 + varuint size). There is no log carrier (envelope kind 6 is retired, §b.4).
 - **With a blob store** (`BlobPort`):
   - **Upload** (`blobQueue up`): hash → `crypto.blobAddress(hash)` → `has` → `put(sealBlob(bytes))`. Only **after**
-    the put succeeds does the planner emit `nsCreate` / `nsSetBlob` for that hash, so readers can always fetch what
-    ns references. A `has` hit skips the put only if the committed folds reference the hash or this device put it
-    less than grace/2 ago. Otherwise it puts again, which refreshes the upload time another device's GC sweep
-    checks (e2ee-design §10.4 R2).
+    the put succeeds does the planner emit `nsCreate` / `nsSetBlob` for that hash (`pushBlob`,
+    `src/engine/reconcile/blobJobs.ts:117-121`), so readers can always fetch what ns references. A `has` hit skips
+    the put only if the committed folds reference the hash or this device put it less than grace/2 ago. Otherwise it
+    puts again, which refreshes the upload time another device's GC sweep checks (e2ee-design §10.4 R2).
   - **Download:** `get` → `openBlob` → verify sha256 → write with precondition (`getOpened`,
-    `src/engine/blobs/blobStore.ts:67-79`). Every failure (absent, transport, open failure, hash mismatch) is
+    `src/engine/blobs/blobStore.ts:85-97`). Every failure (absent, transport, open failure, hash mismatch) is
     unavailable and retried with backoff (`wait(blob-unavailable)`). Only a failure under a verified key (or with an
     unparseable header) is deterministic; once the initial attempt and 3 retries spanning ≥ 3 min all failed
     deterministically, the referencing row is quarantined (e2ee-design §10.2). Absent blobs and failures under an
@@ -1930,7 +1934,7 @@ ones get conflict copies.
     `maxBlobUploadBytes`, 10 MiB when it sends none or the capabilities probe fails; under suite 1 what still fits
     once sealed, at most `MAX_BLOB_PLAINTEXT_BYTES_SUITE1` = 10223615) or `settings.maxAttachmentBytes` are not
     synced (notice) and never deleted.
-    `StatusSnapshot.maxBlobBytes` reports the carrier's limit (8 MiB without a blob store); the attachment size
+    `StatusSnapshot.maxBlobBytes` reports that cap (`src/engine/compose/vaultRuntime.ts:636`); the attachment size
     setting then reads "This server accepts attachments up to N MB; the smaller limit applies."
   - **GC** (e2ee-design §10.4). The command "Clean up unused server attachments" runs one client mark-and-sweep in
     the worker and shows one notice. There is no schedule or status row.
@@ -1943,14 +1947,32 @@ ones get conflict copies.
       device; else it is put again first (R3).
     - Scale caveat: the sweep holds O(N) addresses on whatever device runs it. It is acceptable only as a cold,
       manual path.
-- **Without a blob store** (`blob = null`; the relay answers 503 `attachments_unavailable`):
-  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<address>` as `blobChunk` frames (768 KiB, ≤ 11 rows).
-    The ns op is emitted after every chunk is receipted.
-  - Before appending, the uploader skips chunks already committed on `x:<address>` (the log path's `has`).
-  - Readers `read(x:…)`, open each frame, assemble by index (duplicates ignored), and verify the hash.
-  - Larger files are not synced (notice).
-  - `x:` streams get `retired` checkpoints once no ns entry or cfg file references the hash.
-  - The same path carries `bodyUpdateRef` payloads.
+- **Without a blob store** (`blob = null`: the relay has no R2 binding, capabilities `attachments: false`, the blob
+  routes answer 503 `attachments_unavailable`): **fail closed**.
+  - `BlobQueue.maxBlobBytes` is 0 (`src/engine/blobs/blobQueue.ts:110-111`), and so is `StatusSnapshot.maxBlobBytes`
+    (the setting then names no server limit).
+  - Reconcile excludes every blob file, reason `no-blob-store` (`src/engine/reconcile/localState.ts:70`, `:86`). The
+    reason is silent: no skip notice (`src/engine/reconcile/skipNotice.ts:56`). Attachments are not synced; the
+    local file stays and is never deleted.
+  - Blob jobs return `held`, which arms no retry timer (`blobJobs.ts:64-65`, `:103-104`;
+    `src/engine/reconcile/diskJobs.ts:34-41`, `:168`). `upload` / `download` / `prefetch` answer at once
+    (false / null) without persisting a queue record (`blobQueue.ts:202`, `:224`, `:252`), so nothing is queued.
+  - No ns op for a blob is ever emitted unless the blob is durably stored.
+  - An update > `MAX_INLINE_UPDATE_BYTES` (1 MiB − 32 KiB) freezes its doc `oversize-local` (§b.6).
+  - The sender's R3 gate holds a `bodyUpdateRef` frame and passes every other frame
+    (`src/engine/blobs/touch.ts:170-171`).
+  - A reader leaves a `bodyUpdateRef` row unresolved and arms no retry timer (§d.6).
+  - There is no UI row, notice, banner or setting about server blob storage (no server-metadata UI); only a log line.
+- **A store found on a later connect.** `EnginePorts.probeBlob` (`src/ports/index.ts:51`) asks the relay again. The
+  session loop calls it once per session that reaches live, only while `ports.blob` is null
+  (`src/engine/runtime/sessionLoop.ts:162`, `:443-456`). A store found → `EngineOptions.onBlobStore`
+  (`src/engine/runtime/options.ts:160-164`) → `VaultRuntime` (`src/engine/compose/vaultRuntime.ts:64-65`, `:173`) →
+  `ComposedEngine.onBlobStore` sets `ports.blob`, logs "blob store available -> restarting" and restarts the runtime
+  with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:531-536`). The restarted runtime's full
+  pass uploads what is pending through the normal path. No polling, no new timers.
+- **Production ports** (`src/engine/adapters/webEngine.ts:48-53`): `blob = probeHttpBlob(…)`, the HTTP store when the
+  relay advertises attachments, else null. Capabilities unreachable at startup (offline): assume the store
+  (`createHttpBlob`) and let the blob queue retry (integration-notes D4). `probeBlob = probeHttpBlob`.
 - `syncAttachments = false` excludes blobs entirely: no ns ops, and remote blobs are not fetched.
 
 ### j.2 Canvas
@@ -2197,8 +2219,8 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
   - identical files → `merged`: no copies, no body rows;
   - differing files → suffixed;
   - identical-loser collapse removes the rest (§c.5, §c.13).
-- **Row budget.** About 1 ns row per 512 creates, plus ≥ 1 body row per note (`ceil(chars / 192 Ki)`), plus ≤ 11 per
-  log-carried attachment.
+- **Row budget.** About 1 ns row per 512 creates, plus ≥ 1 body row per note (`ceil(chars / 192 Ki)`). An attachment
+  costs only its ns op: its bytes go to the blob store (§j.1).
   - A 10k-note vault is about 10k rows/day of the 100k free-plan rows.
   - Larger imports are paced by the daily soft budget, in order: most recently modified first, then small before
     large. Status shows progress. The daily-limit hold (§i.6) is the backstop.
@@ -2222,8 +2244,8 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 
 - **`StatusSnapshot`** (`src/protocol/status.ts`): phase, transport, epoch, seqs, relay connection, counts (stale
   streams, outbox, unreceipted, resident, pending disk ops and blobs, quarantined rows, frozen docs, conflict copies
-  today), bootstrap progress, brake, last reconcile and sync times, daily frames, the carrier's attachment limit
-  (`maxBlobBytes`, null until a vault is open), notices.
+  today), bootstrap progress, brake, last reconcile and sync times, daily frames, the blob store's attachment limit
+  (`maxBlobBytes`, null until a vault is open, 0 without a blob store), notices.
   - Posted on phase change, and otherwise at most 4/s.
   - The status bar shows phase + unsynced count.
 - **`DiagnosticsBundle`** (`exportDiagnostics{includePaths}`, built in `src/engine/compose/diagnosticsBundle.ts`):
@@ -2234,7 +2256,7 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 - **Pseudonyms.** Every stream and path is replaced by 12 hex chars of SHA-256 over a fresh random per-bundle salt and
   the file's vault path (or its stream name when the path is unknown).
   - The salt is not exported, so pseudonyms cannot be matched across bundles or tested against guessed paths.
-  - Within one bundle a file has one pseudonym everywhere: doc streams read `b:`/`c:`/`x:` + pseudonym, and brake
+  - Within one bundle a file has one pseudonym everywhere: doc streams read `b:`/`c:` + pseudonym, and brake
     `samplePaths` hold the same pseudonym. `ns` and `cfg` keep their names.
 - **`paths`** is null unless the user opted in. With opt-in it maps each pseudonym whose path the engine knows to
   that vault path, sorted by path. The command "Export diagnostics (include file names)" asks for confirmation
@@ -2256,7 +2278,7 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 src/
   core/                      PURE: no I/O, timers, Date, Math.random, yjs, DOM
     types.ts envelope.ts limits.ts            [architect, frozen]
-    codec/   lib0 helpers, envelope, nsOps, cfgOps, nsFoldV1, cfgFoldV1, snapFoldV1, blobChunk, mirrors [WP-A]
+    codec/   lib0 helpers, envelope, nsOps, cfgOps, nsFoldV1, cfgFoldV1, snapFoldV1, bodyUpdateRef, mirrors [WP-A]
     paths/   pathKey (+ generated casefold15_1, assigned15_1), validate, segments              [WP-A]
     ns/      fold, index, place, overlay, verify (V1/V2), candidate (V3 digest rule)          [WP-A]
     cfg/     fold, projection (pure JSON register → file bytes)                               [WP-A]
@@ -2274,7 +2296,7 @@ src/
     sync/    cursor, catchUp, nsRuntime (fold host, overlay, duties), cfgRuntime, snapRuntime [WP-C]
     runtime/ engine.ts (createEngine), lanes, budgets, lifecycle, status, diagnostics, recovery [WP-C]
     reconcile/ localTree, scan, planRunner, mergeJob, echo, intents                           [WP-B]
-    blobs/   blobQueue (store + x: log carrier)                                               [WP-B]
+    blobs/   blobQueue (the BlobPort is the only carrier)                                     [WP-B]
     settings/ cfgScan, cfgProject                                                             [WP-B]
     snapshots/ snapshotJob, exporter, localStore, remote (upload, parts), restore, snapIndex  [WP-B]
     workerMain.ts            worker entry glue                                                [WP-D]
@@ -2398,6 +2420,10 @@ After healing (all faults off, all online, run until every queue is idle and no 
    frame was injected, no open intents.
 6. **Resource bounds held throughout:** resident docs/bytes ≤ budget (+1 doc), tail ≤ hard rows, live queue ≤ bound,
    no `encodeStateAsUpdate` on the keystroke path (instrumented counter).
+7. **No blobs on the log** (`checkLogCarriesNoBlobs`, `src/sim/invariants.ts:120-128`, run by `src/sim/run.ts:248`):
+   no foreign stream on the relay log, no ns / cfg / snap / k row over `MAX_NS_FRAME_BYTES`, no `b:`/`c:` stream for
+   an attachment doc. Sim devices get the net's `SimBlobStore` (`SimNet.blobs`, `blobsAvailable`, `blobPort()`,
+   `src/sim/net.ts:58-85`) and its probe by default (`src/sim/device.ts:186-187`).
 
 ### l.4 10k-op fold fuzz (WP-A)
 

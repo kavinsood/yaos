@@ -15,7 +15,7 @@ branch, so everything runs against the frozen types plus local fakes
 | Merge (pure) | `core/merge`: bounded Myers, line diff3 (ported), `MergeFn` with an anchored (patience) fallback when over budget, code-point-safe `minimalDiff` | `merge.test.ts` 8, `myers.test.ts` 3 |
 | Planner (pure) | `core/plan`: `planWith` (every §f.2 row, the §c.13 duties), brake units, approval id, rename inference, conflict names, path rules, op order (temp names for cycles) | `planner.test.ts` 29, `planHelpers.test.ts` 8 |
 | Reconcile job | `engine/reconcile`: scan / hash / dirty marks, echo table, plan runner, disk jobs, blob jobs, markdown merge job, intents resume, S1 own-fold, temp-name recovery, `Reconciler` facade | basic 9, safety 10, brakes 8, crash 8 scenarios = 134 crash points |
-| Blob queue (§j.1) | `engine/blobs`: `BlobQueue implements BlobTransfer`. Store carrier: `has`, then `put(sealBlob)`; download uses `openBlob` and verifies the hash. Log carrier: `x:` chunks of 768 KiB, at most 8 MiB. Persisted backoff (2 s doubling, cap 10 min) and in-flight dedupe | `blobQueue.test.ts` 9 |
+| Blob queue (§j.1) | `engine/blobs`: `BlobQueue implements BlobTransfer`. Store carrier: `has`, then `put(sealBlob)`; download uses `openBlob` and verifies the hash. Log carrier: `x:` chunks of 768 KiB, at most 8 MiB (later deleted: blobs travel only via the blob store). Persisted backoff (2 s doubling, cap 10 min) and in-flight dedupe | `blobQueue.test.ts` 9 |
 | Settings (§j.3) | `engine/settings`: allowlist (ported), pure `planCfg`, `CfgSync` driver (detection plus projection) | `cfgSync.test.ts` 9 |
 | Snapshots (§j.4) | `engine/snapshots/snapshotJob.ts`: fflate zip plus manifest, 256 MiB cap, retention, restore through a conflict copy, optional sealed upload | `snapshotJob.test.ts` 6 |
 
@@ -91,7 +91,7 @@ Measured on an Apple M4 Pro with Node 26.5 (`merge.test.ts` diagnostics). Inputs
 - **Temp-name recovery** (`tempRecovery.ts`): an untracked file at a temp path whose id8 names exactly one doc is renamed back to `S.path`, if that doc's file is missing and the hashes are equal (crash after the temp rename).
 
 ### Blobs
-- `BlobChunkLog` (`appendChunks` / `readChunks` over `x:<hash>`) is defined locally in `engine/blobs/chunks.ts`. WP-C implements it.
+- `BlobChunkLog` (`appendChunks` / `readChunks` over `x:<hash>`) is defined locally in `engine/blobs/chunks.ts`. WP-C implements it. (Later deleted with the `x:` carrier.)
 
 ### Settings
 - **Allowlist**: exactly the DESIGN set. Legacy also synced `graph.json`, `daily-notes.json`, `templates.json`, `bookmarks.json` and others; these are not included.
@@ -146,14 +146,14 @@ None.
 - **WP-C**:
   - `LogPort` (`view`, `submitNs` with optimistic overlay, `acquireBody` / `BodyHandle`);
   - `OwnFoldEvent`s into `Reconciler.applyOwnFold` (S1);
-  - `BlobChunkLog` over `x:` streams;
+  - `BlobChunkLog` over `x:` streams (later deleted);
   - `CfgLogPort` (`view()` = committed cfg fold plus own unfolded ops; `submitCfg` = frame, outbox, overlay).
 - **WP-D**:
   - a `DiskGateway` over `readRequest` / `diskOps`; vault events must be delivered after the op result for echo matching;
   - `ConfigDirPort` and `SideFilePort` (snapshots);
   - a `tzOffsetMinutes` provider.
 - **Wiring**:
-  - `BlobQueue.open({db, clock, crypto, store | null, chunkLog})` as the reconciler's `BlobTransfer`, with a retry timer on `nextDueAtMs()`;
+  - `BlobQueue.open({db, clock, crypto, store | null, chunkLog})` as the reconciler's `BlobTransfer`, with a retry timer on `nextDueAtMs()` (`chunkLog` later deleted);
   - `CfgSync.pass()` on full reconcile and focus;
   - `SnapshotJob.maybeDaily()` on a timer, and `take("brake")` before `approveBrake`.
 - **Tests**: swap the testkit fakes for SimVault, MemStorage and the real log. The `assertConverged` and crash-point harness (`testkit/crash.ts`) is reusable against them.

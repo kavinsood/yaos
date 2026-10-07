@@ -31,6 +31,15 @@ export interface Env {
 	readonly approvedOverwrites: Set<string>;
 }
 
+/**
+ * The blob store, or null without one (maxBlobBytes 0): attachments are not synced (fail closed). Jobs then
+ * return "held", which arms no retry; a store found on a later connect restarts the runtime (EnginePorts.probeBlob).
+ */
+export function blobStore(env: Env): NonNullable<Env["ctx"]["deps"]["blobs"]> | null {
+	const blobs = env.ctx.deps.blobs;
+	return blobs && blobs.maxBlobBytes > 0 ? blobs : null;
+}
+
 type Op<K extends PlannerOp["op"]> = Extract<PlannerOp, { op: K }>;
 
 export function writeOk(res: ExecResult): WrittenOk | null {
@@ -154,12 +163,9 @@ export async function diskMaterialize(env: Env, op: Op<"diskMaterialize">): Prom
 
 async function materializeBlob(env: Env, op: Op<"diskMaterialize">, blob: NsBlobRef | null): Promise<JobOutcome> {
 	const { ctx } = env;
-	const blobs = ctx.deps.blobs;
 	if (!blob) return "fail";
-	if (!blobs) {
-		ctx.notice("warn", "no-blob-carrier", "attachments cannot be transferred: no blob carrier", "no-blob-carrier");
-		return "fail";
-	}
+	const blobs = blobStore(env);
+	if (!blobs) return "held";
 	const bytes = await blobs.download({ hash: blob.hash, docId: op.docId, path: op.path, size: blob.size });
 	if (!bytes) return "fail";
 	const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "bytes", bytes }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });

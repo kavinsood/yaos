@@ -3,9 +3,9 @@
  * asserts the whole tally (rules: §12.4, §15.1). Every bullet maps to one test; where a single-case test
  * already covers it, that test is cited and the counting form is added here.
  *
- * (a) Suite-0 rows injected into a suite-1 vault -> "a. ...". 26 forged rows (ns, cfg, snap, body, canvas, blob
- *     chunk; hostile and genuine deviceIds) plus checkpoints: the gate's stage 1 says crypto-downgrade for every
- *     subject; each of two devices opens all 26 as suite-downgrade; folds, docs, disk, ns/cfg/snap state and a
+ * (a) Suite-0 rows injected into a suite-1 vault -> "a. ...". 25 forged rows (ns, cfg, snap, body, canvas;
+ *     hostile and genuine deviceIds) plus checkpoints: the gate's stage 1 says crypto-downgrade for every
+ *     subject; each of two devices opens all 25 as suite-downgrade; folds, docs, disk, ns/cfg/snap state and a
  *     replay are unchanged. Existing: webCryptoSuite1.test.ts:62, suite1Envelope.test.ts:139,
  *     suite1Tamper.test.ts:423.
  * (b) Hidden k, key-less join -> "b. ...". 6 join forms (typed code, console link, the same with the protocol
@@ -76,10 +76,10 @@ import { encodeNsOps } from "../../core/codec/nsOps";
 import { encodeCfgOps } from "../../core/codec/cfgOps";
 import { encodeSnapOps } from "../../core/snap/record";
 import {
-	CFG_STREAM, KEYRING_STREAM, NS_STREAM, SNAP_STREAM, bodyStream, canvasStream, blobChunkStream,
+	CFG_STREAM, KEYRING_STREAM, NS_STREAM, SNAP_STREAM, bodyStream, canvasStream,
 	type ClientFrameId, type DeviceId, type Seq, type StreamName, type VaultPath,
 } from "../../core/types";
-import type { BlobAddress, CryptoPort } from "../../ports/crypto";
+import type { CryptoPort } from "../../ports/crypto";
 import type { EnvelopeKind } from "../../core/envelope";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
@@ -252,7 +252,6 @@ test("a. suite-0 rows forged into a suite-1 vault: every open is suite-downgrade
 	const ghost = newDocId(rnd);
 	await add("body-unknown", bodyStream(ghost), "bodyUpdate", yUpdate(`${MARK} ghost\n`), authors[0]!, false);
 	await add("canvas-unknown", canvasStream(newDocId(rnd)), "bodyUpdate", yUpdate(`${MARK} canvas\n`), authors[1]!, false);
-	await add("blobchunk", blobChunkStream("ab".repeat(32) as BlobAddress), "blobChunk", enc.encode(`${MARK} chunk`), authors[0]!, false);
 
 	// Stage 1 directly, for every forged row and the same bytes as a provisional, plus forged checkpoints.
 	const port = await createWebCryptoSuite1({ vaultId: SIM_VAULT_ID, random: new SeededRandom(5), keys: storedKeys(X)!.keys });
@@ -303,8 +302,8 @@ test("a. suite-0 rows forged into a suite-1 vault: every open is suite-downgrade
 			if (r.frozen === 1) count(frozen, `${sideStreams.has(r.stream) ? "forged" : "other"}:${r.frozenReason}`);
 			for (const x of await devs[i]!.vrt!.log.c.repo.quarantineOf(r.stream)) count(q, `${r.stream.slice(0, 2)}${x.reason}`);
 		}
-		// §9.3: a body/canvas/x row that fails is quarantined and its doc frozen (DoS only, nothing applied).
-		assert.deepEqual(tallyObj(q), { "b:crypto-downgrade": 4, "c:crypto-downgrade": 1, "x:crypto-downgrade": 1 }, "one quarantine record per forged side-stream row, none for ns/cfg/snap");
+		// §9.3: a body/canvas row that fails is quarantined and its doc frozen (DoS only, nothing applied).
+		assert.deepEqual(tallyObj(q), { "b:crypto-downgrade": 4, "c:crypto-downgrade": 1 }, "one quarantine record per forged side-stream row, none for ns/cfg/snap");
 		assert.deepEqual(tallyObj(frozen), { "forged:crypto-downgrade": sideStreams.size }, "only the forged-into streams are frozen, for that reason");
 	}
 	const oracleAfter = await net.oracle(120_000, keys);
@@ -322,7 +321,7 @@ test("a. suite-0 rows forged into a suite-1 vault: every open is suite-downgrade
 	}
 	for (const doc of oracleAfter.docs) if (doc.path.includes(MARK) || (doc.text ?? "").includes(MARK)) marks++;
 	assert.equal(marks, 0, "no forged path, text or plugin id anywhere");
-	console.log(`[a] forged rows=${forged.length} (+${subjects.length - 2 * forged.length} checkpoints, ${forged.length} provisionals) stage-1=crypto-downgrade x${subjects.length}; per device opened=${openedBy.join(",")} suite-downgrade=${reasons.get("suite-downgrade")}; quarantined=6 frozen=${sideStreams.size}; folds unchanged; marks=0`);
+	console.log(`[a] forged rows=${forged.length} (+${subjects.length - 2 * forged.length} checkpoints, ${forged.length} provisionals) stage-1=crypto-downgrade x${subjects.length}; per device opened=${openedBy.join(",")} suite-downgrade=${reasons.get("suite-downgrade")}; quarantined=5 frozen=${sideStreams.size}; folds unchanged; marks=0`);
 });
 
 // --- b, c. key-less joins through the plugin controller ----------------------------------------------------------

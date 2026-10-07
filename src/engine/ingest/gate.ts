@@ -60,7 +60,6 @@ export type GatePass =
 	| { readonly ok: true; readonly t: "snap"; readonly inner: InnerEnvelope; readonly ops: readonly SnapOp[] | null }
 	| { readonly ok: true; readonly t: "body"; readonly inner: InnerEnvelope; readonly update: Uint8Array; readonly insertedChars: number }
 	| { readonly ok: true; readonly t: "bodyRef"; readonly inner: InnerEnvelope; readonly ref: BodyUpdateRefContent }
-	| { readonly ok: true; readonly t: "blobchunk"; readonly inner: InnerEnvelope }
 	| {
 		readonly ok: true; readonly t: "checkpoint"; readonly inner: InnerEnvelope; readonly checkpoint: CheckpointContent;
 		readonly nsState: NsFoldState | null; readonly cfgState: CfgFoldState | null; readonly snapState?: SnapFoldState | null;
@@ -126,8 +125,6 @@ export async function gate(ctx: GateCtx, subject: GateSubject): Promise<GateResu
 			if (!r.ok) return fail(r.reason, r.detail);
 			return { ok: true, t: "body", inner, update: inner.content, insertedChars: r.insertedChars };
 		}
-		case "blobchunk":
-			return { ok: true, t: "blobchunk", inner };
 	}
 }
 
@@ -148,7 +145,7 @@ function staleVerdict(ctx: GateCtx, subject: GateSubject): GateResult | null {
 	return subject.t === "row" ? { ok: true, t: "stale", keyEpoch: e } : fail("stale-epoch", `keyEpoch ${e}`);
 }
 
-async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "snap" | "body" | "canvas" | "blobchunk", coversSeq: Seq, inner: InnerEnvelope): Promise<GateResult> {
+async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "snap" | "body" | "canvas", coversSeq: Seq, inner: InnerEnvelope): Promise<GateResult> {
 	const ck = decodeCheckpointContent(inner.content);
 	if (!ck) return fail("decode-failed", "checkpoint content");
 	if (ck.coversSeq !== coversSeq) return fail("checkpoint-mismatch", `inner ${ck.coversSeq} != relay ${coversSeq}`);
@@ -190,7 +187,5 @@ async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "snap" | "body" 
 			if (st.coversSeq !== coversSeq) return fail("checkpoint-mismatch", "snapFoldV1 coversSeq");
 			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: null, snapState: st };
 		}
-		case "blobchunk":
-			return fail("kind-not-allowed", "blobchunk checkpoint must be retired");
 	}
 }

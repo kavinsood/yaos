@@ -20,7 +20,7 @@ export interface ClassifySettings {
 	readonly excludePatterns: readonly string[];
 	readonly syncAttachments: boolean;
 	readonly maxAttachmentBytes: number;
-	/** Largest blob the active carrier accepts (BlobPort.maxBlobBytes or MAX_LOG_BLOB_BYTES). */
+	/** Largest blob the blob store accepts (BlobPort.maxBlobBytes); 0 = no store, attachments are not synced. */
 	readonly maxBlobBytes: number;
 }
 
@@ -67,7 +67,7 @@ export interface Classified {
 	readonly pathKey: PathKey;
 	readonly kind: DocKind;
 	readonly excluded: boolean;
-	readonly reason: "invalid-path" | "pattern" | "attachments-off" | "too-large" | null;
+	readonly reason: "invalid-path" | "pattern" | "attachments-off" | "no-blob-store" | "too-large" | null;
 	/** maxBytes for the content read. */
 	readonly maxBytes: number;
 }
@@ -83,6 +83,7 @@ export function classify(diskPath: string, size: number, settings: ClassifySetti
 	if (!valid) reason = "invalid-path";
 	else if (excludes(path)) reason = "pattern";
 	else if (kind === "blob" && !settings.syncAttachments) reason = "attachments-off";
+	else if (kind === "blob" && settings.maxBlobBytes === 0) reason = "no-blob-store";
 	else if (size > maxBytes) reason = "too-large";
 	return { path, pathKey: key, kind, excluded: reason !== null, reason, maxBytes };
 }

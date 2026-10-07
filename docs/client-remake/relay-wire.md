@@ -517,9 +517,9 @@ then `capabilities.attachments` is `true`. Every blob route takes the device bea
 
 Checks, in order, on every blob route:
 
-1. No bucket: `503 attachments_unavailable`. The client must then treat attachments as unavailable (the client-e2e
-   deployment runs without R2, which matches the Free-plan profile). `start-local.sh --r2` keeps the bucket
-   (miniflare R2) for tests that need it, such as e2e/client/snapshots.ts.
+1. No bucket: `503 attachments_unavailable`. The client then fails closed: attachments are not synced, with no
+   notice (DESIGN §j.1). `start-local.sh` keeps the bucket (miniflare R2) by default; `--no-r2` drops it, only for
+   the store-less test (conformance T-BLOB-UNAVAILABLE).
 2. Format: `400 invalid_address` for a malformed `<address>`, the PUT size checks, and the GC cursor and delete-body
    checks below. (The `exists` body is read after the bearer check.)
 3. Bearer: `401 unauthorized` (an unknown vault too, §2.7); `503 restore_in_progress` with `Retry-After` during a
@@ -646,12 +646,13 @@ Billed writes:
 ## 13. Running
 
 ```sh
-# local (wrangler dev, DO SQLite persisted under experiments/logs/client-e2e-local-state, YAOS_STREAMS=true, no R2
-# unless --r2)
-scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--r2] [--var K=V]
+# local (wrangler dev, DO SQLite persisted under experiments/logs/client-e2e-local-<port>-state, R2 by default;
+# --no-r2 drops the bucket, --r2 is a no-op)
+scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--r2 | --no-r2] [--var K=V]
 scripts/relay-dev/stop-local.sh
 
-# deploy (cf CLI credentials fed to wrangler; generated server/wrangler.relay2-<suffix>.toml is git-excluded)
+# deploy (cf CLI credentials fed to wrangler; generated server/wrangler.relay2-<suffix>.toml is git-excluded).
+# Client e2e needs a YAOS_BUCKET binding, which cf-config.mjs does not render yet; RELAY_DEV_R2=0 deploys without it.
 scripts/relay-dev/deploy.sh yaos-relay2-scratch-3 [--var K=V]
 
 # smoke (fresh vault per run; claim on a fresh server, operator login on a claimed one)

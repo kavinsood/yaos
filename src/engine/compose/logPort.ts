@@ -1,6 +1,6 @@
 /**
  * The log side as the disk side sees it (DESIGN §f.1): LogPort (reconcile),
- * CfgLogPort (settings) and BlobChunkLog (x: chunks) over one LogEngine.
+ * CfgLogPort (settings) and SnapIndexPort (snapshots) over one LogEngine.
  *
  * view() joins the optimistic ns overlay (committed fold + own pending ns
  * frames, core/ns/overlay) with per-doc body info from the stream records. It
@@ -8,14 +8,12 @@
  * the owner invalidates it on fold / submit / body change and before a pass.
  */
 
-import type { BlobChunkContent } from "../../core/envelope";
 import { markdownContentHash } from "../../core/hash/markdownLf";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import { canvasDocHash } from "../reconcile/canvasDoc";
 import type {
 	BodyVersion, CfgFoldState, CfgOp, ContentHash, DocId, NsOp, PathKey, RemoteEntry, Seq, StreamName,
 } from "../../core/types";
-import type { BlobChunkLog } from "../blobs/chunks";
 import type { BodyHandle, LogPort, RemoteView, SubmitNsOptions } from "../reconcile/deps";
 import type { LogEngine } from "../runtime/engine";
 import type { CfgLogPort } from "../settings/cfgSync";
@@ -141,7 +139,7 @@ export class ComposedLog implements LogPort {
 		};
 	}
 
-	// ---- settings + blobs ----------------------------------------------------------
+	// ---- settings + snapshots ------------------------------------------------------
 
 	readonly cfg: CfgLogPort = {
 		view: (): CfgFoldState => this.log.cfgView(),
@@ -151,11 +149,6 @@ export class ComposedLog implements LogPort {
 	};
 
 	readonly snap: SnapIndexPort = snapIndexPort(() => this.log, () => this.nsCaughtUp);
-
-	readonly chunks: BlobChunkLog = {
-		appendChunks: (hash: ContentHash, chunks: readonly BlobChunkContent[]) => this.log.appendBlobChunks(hash, chunks),
-		readChunks: (hash: ContentHash) => this.log.readBlobChunks(hash),
-	};
 }
 
 function snapIndexPort(log: () => LogEngine, liveOnce: () => boolean): SnapIndexPort {
