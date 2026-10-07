@@ -231,7 +231,9 @@ export async function lone(R: Report, o: LoneOptions): Promise<void> {
 			});
 		}
 
-		const sizes = [["40k", 40 * 1024, 4, "jpg"], ["300k", 300 * 1024, 3, "png"], ["2m", 2 * 1024 * 1024, 2, "pdf"]] as const;
+		// 25m: well above the old 10 MiB cap (the relay takes up to 100 MB, DECISIONS D9). Last, so only the final
+		// converge fingerprints it.
+		const sizes = [["40k", 40 * 1024, 4, "jpg"], ["300k", 300 * 1024, 3, "png"], ["2m", 2 * 1024 * 1024, 2, "pdf"], ["25m", 25 * 1024 * 1024, 1, "mp4"]] as const;
 		for (const [tag, size, n, ext] of sizes) {
 			for (let i = 0; i < n; i++) {
 				const path = `lone/att-${tag}-${i}.${ext}`;

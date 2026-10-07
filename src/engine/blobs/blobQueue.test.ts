@@ -2,9 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
 import { sha256Hex } from "../../core/hash/sha256";
-import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../../core/limits";
+import { maxSealedBlobPlaintext } from "../../core/codec/sealedBlob";
 import type { ContentHash, DocId, VaultPath } from "../../core/types";
-import type { BlobPort } from "../../ports/blob";
+import { BlobTooLargeError, type BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort, OpenResult, SealedBlobParts } from "../../ports/crypto";
 import { DB_SCHEMA_VERSION, STORE, STORE_SPECS } from "../store/schema";
 import type { DiskSchema } from "../reconcile/store";
@@ -12,7 +12,8 @@ import { FakeClock } from "../reconcile/testkit/fakes";
 import { FakeStorage } from "../reconcile/testkit/fakeStorage";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
-import { BLOB_RETRY_BASE_MS, BlobQueue, backoffMs } from "./blobQueue";
+import { createWebHash } from "../adapters/webHash";
+import { BLOB_RETRY_BASE_MS, BLOB_RETRY_MAX_MS, BlobQueue, backoffMs } from "./blobQueue";
 
 /** Suite-0-like crypto, but sealing XORs so a missing openBlob would be caught. */
 class XorCrypto implements CryptoPort {
@@ -33,8 +34,15 @@ class FakeStore implements BlobPort {
 	readonly objects = new Map<string, Uint8Array>();
 	puts = 0;
 	down = false;
+	/** Answer every put 413 (an edge limit below maxBlobBytes); `refusals` counts those requests. */
+	refuse = false;
+	refusals = 0;
 	async has(a: readonly BlobAddress[]) { if (this.down) throw new Error("503"); return new Set(a.filter((x) => this.objects.has(x))); }
-	async put(a: BlobAddress, parts: SealedBlobParts) { if (this.down) throw new Error("503"); this.puts++; this.objects.set(a, concatBytes(parts)); }
+	async put(a: BlobAddress, parts: SealedBlobParts) {
+		if (this.down) throw new Error("503");
+		if (this.refuse) { this.refusals++; throw new BlobTooLargeError(concatBytes(parts).length); }
+		this.puts++; this.objects.set(a, concatBytes(parts));
+	}
 	async get(a: BlobAddress) { if (this.down) throw new Error("503"); return this.objects.get(a)?.slice() ?? null; }
 	async list(): Promise<never> { throw new Error("unused"); }
 	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
@@ -51,7 +59,7 @@ async function make(opts: { store?: FakeStore | null; ahead?: { count: number; b
 	const store = opts.store === undefined ? new FakeStore() : opts.store;
 	const notices: string[] = [];
 	const open = async () => BlobQueue.open({
-		db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto: opts.crypto ?? crypto, store,
+		db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto: opts.crypto ?? crypto, hash: createWebHash(), store,
 		notice: (_l, c) => notices.push(c), ahead: opts.ahead, touch: { reuse: async () => true, noted: async () => {} },
 	});
 	return { storage, clock, crypto, store, notices, q: await open(), reopen: open };
@@ -102,6 +110,34 @@ test("store: outage -> backoff record persisted; not retried until due; success 
 	assert.equal(await q2.upload({ hash, docId: D, path: P, bytes }), true);
 	assert.equal(q2.queued().length, 0);
 	assert.equal(storage.dump("b", "blobQueue").length, 0);
+});
+
+test("store: a put refused by size (413) is refused for good: notice, its backoff record dropped, no retry, no second request", async () => {
+	const { q, store, clock, storage, notices } = await make();
+	const bytes = rnd(64);
+	const hash = sha256Hex(bytes);
+	store!.down = true;
+	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
+	assert.equal(q.queued().length, 1, "an outage first: a backoff record");
+	clock.advance(BLOB_RETRY_BASE_MS);
+	store!.down = false;
+	store!.refuse = true;
+	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
+	assert.equal(store!.refusals, 1);
+	assert.deepEqual(notices, ["blob-too-large"]);
+	assert.equal(q.refused(hash), true);
+	assert.equal(q.queued().length, 0, "no record: nothing to retry");
+	assert.equal(q.nextDueInMs(), null, "no blob retry armed");
+	assert.equal(storage.dump("b", "blobQueue").length, 0);
+	clock.advance(BLOB_RETRY_MAX_MS);
+	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
+	assert.equal(store!.refusals, 1, "no second request for the same bytes");
+	assert.equal(notices.length, 1, "one notice");
+	// Other bytes are still tried.
+	store!.refuse = false;
+	const other = rnd(64, 9);
+	assert.equal(await q.upload({ hash: sha256Hex(other), docId: D, path: P, bytes: other }), true);
+	assert.equal(q.refused(sha256Hex(other)), false);
 });
 
 test("store: backoff is monotonic: a wall clock jumping back 12 h does not park the retry; reopen clamps to the backoff", async () => {
@@ -283,12 +319,12 @@ test("suite 1: two devices upload the same file: different ciphertexts at one ad
 	const c = await make({ store: a.store, crypto: await suite1(0xc1) });
 	assert.equal(await c.q.upload({ hash, docId: D, path: P, bytes }), true);
 	assert.equal(a.store!.puts, 1);
-	assert.equal(c.q.maxBlobBytes, MAX_BLOB_PLAINTEXT_BYTES_SUITE1, "plaintext cap under suite 1");
+	assert.equal(c.q.maxBlobBytes, maxSealedBlobPlaintext(a.store!.maxBlobBytes), "plaintext cap under suite 1");
 });
 
 test("suite 1: a file above the sealed cap is not synced: upload refuses with a notice, nothing stored", async () => {
 	const { q, store, notices } = await make({ crypto: await suite1(0xa2) });
-	const bytes = new Uint8Array(MAX_BLOB_PLAINTEXT_BYTES_SUITE1 + 1);
+	const bytes = new Uint8Array(q.maxBlobBytes + 1);
 	assert.ok(bytes.length < store!.maxBlobBytes, "fits the transport cap as plaintext, not once sealed");
 	assert.equal(await q.upload({ hash: sha256Hex(bytes), docId: D, path: P, bytes }), false);
 	assert.equal(store!.puts, 0);

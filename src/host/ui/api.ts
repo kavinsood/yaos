@@ -66,7 +66,8 @@ export function isTrashMode(value: unknown): value is TrashMode {
 export const DEFAULT_ENGINE_SETTINGS: EngineSettings = Object.freeze({
 	excludePatterns: Object.freeze([]) as readonly string[],
 	syncAttachments: true,
-	maxAttachmentBytes: 50 * MIB,
+	// The most there is: the effective cap is min(this, the server's), so by default the server's (localState.ts).
+	maxAttachmentBytes: MAX_ATTACHMENT_BYTES_LIMIT,
 	syncSettings: false,
 	trashMode: "follow-obsidian",
 	provisionalBroadcast: true,

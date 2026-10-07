@@ -53,9 +53,10 @@ export interface StatusSnapshot {
 	readonly lastSyncedAtMs: number | null;
 	readonly dailyFramesUsed: number;
 	/**
-	 * Largest attachment the open carrier moves: the blob store's limit (the server's
-	 * maxBlobUploadBytes, or the client default when the probe failed) or the log's 8 MiB without
-	 * one. Files over min(this, settings.maxAttachmentBytes) are skipped. null until a vault is open.
+	 * Largest attachment plaintext the blob store moves (engine/blobs/blobQueue.ts maxBlobBytes): the
+	 * server's maxBlobUploadBytes (core/limits.ts MAX_BLOB_UPLOAD_BYTES when the probe failed), less
+	 * the sealing overhead under suite 1; 0 without a blob store (attachments are not synced). Files
+	 * over min(this, settings.maxAttachmentBytes) are skipped. null until a vault is open.
 	 */
 	readonly maxBlobBytes: number | null;
 	readonly notices: readonly { readonly code: string; readonly level: "info" | "warn" | "error"; readonly atMs: number }[];

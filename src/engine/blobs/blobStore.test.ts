@@ -8,8 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
 import { sha256Hex } from "../../core/hash/sha256";
-import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../../core/limits";
-import { sealedBlobBytes } from "../../core/codec/sealedBlob";
+import { maxSealedBlobPlaintext, sealedBlobBytes } from "../../core/codec/sealedBlob";
 import { snapPartBytes } from "../../core/snap/bundle";
 import type { ContentHash } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
@@ -72,7 +71,8 @@ test("putSealed: one object at blobAddress(sha256) (never the hash), deduped by 
 	const [key] = [...store.objects.keys()];
 	assert.equal(key, await w.blobAddress(hash));
 	assert.ok(!key!.includes(hash), "the plaintext hash never appears in the key");
-	assert.equal(storePlaintextCap(w, store), MAX_BLOB_PLAINTEXT_BYTES_SUITE1);
+	assert.equal(storePlaintextCap(w, store), maxSealedBlobPlaintext(10 * MIB));
+	assert.equal(storePlaintextCap(w, store), 10_223_615, "39 x 256 KiB - 1");
 	assert.equal(storePlaintextCap(createNoopCrypto(createWebHash()), store), 10 * MIB, "suite 0: the transport cap");
 	const small = storePlaintextCap(w, new MemStore(4 * MIB));
 	assert.ok(sealedBlobBytes(small, Number.MAX_SAFE_INTEGER) <= 4 * MIB && sealedBlobBytes(small + 1, 1) > 4 * MIB, "a smaller store: what still fits once sealed");
@@ -93,7 +93,7 @@ test("a full snapshot part (8 MiB at a 10 MiB store) sealed under suite 1 is 8 6
 	const got = await getOpened(store, at, hash, sha256Hex);
 	assert.ok(got.ok && got.bytes.length === part.length);
 	// The largest plaintext the suite takes also fits; MemStore refuses anything above maxBlobBytes (413).
-	const max = bytes(MAX_BLOB_PLAINTEXT_BYTES_SUITE1, 4);
+	const max = bytes(storePlaintextCap(w, store), 4);
 	await putSealed(store, w, sha256Hex(max) as ContentHash, max, REUSE_ALL);
 	assert.equal(store.puts, 2);
 });

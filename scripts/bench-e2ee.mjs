@@ -24,9 +24,9 @@
  * - bootstrap: openEnvelope (header decode, AAD, AES-GCM open, unpad, inner decode, kind check) of every row a
  *   fresh device reads. Content is incompressible, so no inflate (not crypto, and suite 0 pays it too). Only the
  *   opens are timed; the seal-side setup is not. The engine pattern (see benchBootstrap) is the budgeted number.
- * - blob up: blobAddress (1 HMAC) + sealBlob (Padmé copy, AES-GCM seal; the parts [header ‖ nonce, ciphertext]) of the largest suite-1
- *   blob, MAX_BLOB_PLAINTEXT_BYTES_SUITE1 (§7.3: a full 10 MiB plaintext exceeds the suite-1 cap). sha256 of the
- *   plaintext is excluded ("already done today", §16.1).
+ * - blob up: blobAddress (1 HMAC) + sealBlob (Padmé copy, AES-GCM seal; the parts [header ‖ nonce, ciphertext]) of the largest
+ *   plaintext whose sealed blob fits 10 MiB, BLOB_N = maxSealedBlobPlaintext(10 MiB) = 10223615 (§16.2's 10 MiB blob; §7.3:
+ *   suite 1 has no cap of its own). sha256 of the plaintext is excluded ("already done today", §16.1).
  * - blob down: openBlob (header decode, AES-GCM open, unpad). The sha256 check after it is excluded likewise.
  * - engine start: createWebCryptoSuite1 with N held epochs (N HKDF imports), Keyring.open twice as the engine
  *   does (pinGate.ts keyed(), then KeyringRuntime.open: the kcv of every epoch, N deriveKey + HMACs), then the
@@ -64,7 +64,9 @@ const { newId } = await load("src/core/codec/ids.ts");
 const { bytesToHex } = await load("src/core/codec/lib0.ts");
 const { bodyStream } = await load("src/core/types.ts");
 const { padmeLen } = await load("src/core/codec/padme.ts");
-const { OPEN_FRAME_IDLE_MS, MAX_BLOB_PLAINTEXT_BYTES_SUITE1, BUDGETS } = await load("src/core/limits.ts");
+const { OPEN_FRAME_IDLE_MS, BUDGETS } = await load("src/core/limits.ts");
+const { maxSealedBlobPlaintext } = await load("src/core/codec/sealedBlob.ts");
+const BLOB_N = maxSealedBlobPlaintext(10 * 1048576);
 const { DEFAULT_RELAY_LIMITS } = await load("src/engine/adapters/wsRelay.ts");
 const { DEFAULT_TUNING } = await load("src/engine/runtime/options.ts");
 
@@ -275,7 +277,7 @@ async function benchBootstrap(label, ckptBytes, tailOf, tailBytes, must) {
 
 async function benchBlob() {
 	const crypto = await readyCrypto(1);
-	const n = MAX_BLOB_PLAINTEXT_BYTES_SUITE1;
+	const n = BLOB_N;
 	const plaintext = randomBytes(n);
 	const hash = bytesToHex(await createWebHash().sha256(plaintext)); // excluded: "already done today" (§16.1)
 	let address = null;
@@ -294,7 +296,7 @@ async function benchBlob() {
 	});
 	if (bytesToHex(await createWebHash().sha256(last)) !== hash) throw new Error("blob round trip mismatch");
 	const mib = (n / 1048576).toFixed(2);
-	row(`blob up: ${mib} MiB, HMAC addr + seal`, stats(up), 10, "<= 100 ms", true, "max suite-1 plaintext");
+	row(`blob up: ${mib} MiB, HMAC addr + seal`, stats(up), 10, "<= 100 ms", true, "seals to 10 MiB");
 	row(`blob down: ${mib} MiB, open + unpad`, stats(down), 10, "<= 100 ms", true);
 }
 
@@ -325,7 +327,7 @@ async function benchBlobMemory() {
 	const { owned } = await load("src/protocol/workerTransport.ts");
 	const { concatBytes } = await load("src/core/codec/lib0.ts");
 	const crypto = await readyCrypto(1);
-	const n = MAX_BLOB_PLAINTEXT_BYTES_SUITE1;
+	const n = BLOB_N;
 	const MiB = 1048576;
 	const plaintext = randomBytes(n);
 	const hash = bytesToHex(await createWebHash().sha256(plaintext));

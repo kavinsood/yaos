@@ -1,6 +1,6 @@
 // D9 blobs through the real Router (server/src/router.ts) with the real vault host and an in-memory R2 bucket: the key
-// `v/<vaultId>/<address>`, opaque addresses (no hash check), overwrite, the GET headers, the 10 MiB cap (declared and
-// streamed), `exists` (≤ 50, more or a malformed entry is 400 (A4), errors), the bearer check in the vault DO (zero
+// `v/<vaultId>/<address>`, opaque addresses (no hash check), overwrite, the GET headers, the 100 MB cap (a required
+// Content-Length; the body streams to R2), `exists` (≤ 50, more or a malformed entry is 400 (A4), errors), the bearer check in the vault DO (zero
 // config calls), and the no-bucket answer (`503 attachments_unavailable`, `capabilities.attachments = false`). The blob
 // GC routes (E2EE design §19 A3, relay-wire §11.3.1): list paging (empty truncated R2 pages too), the batch
 // conditional delete, their limit and refusals.
@@ -36,10 +36,12 @@ async function enrolled(world: World): Promise<{ vaultId: string; device: Device
 	return { vaultId: claimed.vaultId, device, cookie: claimed.cookie, vault: claimed.vault };
 }
 
-function put(world: World, vaultId: string, device: DeviceSeed, address: string, body: BodyInit | null,
+/** A blob PUT; a byte body declares its length the way a network request does, a stream body only via `headers`. */
+function put(world: World, vaultId: string, device: DeviceSeed, address: string, body: Uint8Array | ReadableStream | null,
 	headers: Record<string, string> = {}): Promise<Response> {
+	const length: Record<string, string> = body instanceof Uint8Array ? { "Content-Length": String(body.byteLength) } : {};
 	return deviceFetch(world, vaultId, device, `blobs/${address}`, { method: "PUT", body,
-		headers: { "Content-Type": "application/octet-stream", ...headers },
+		headers: { "Content-Type": "application/octet-stream", ...length, ...headers },
 		...(body instanceof ReadableStream ? { duplex: "half" } : {}) } as RequestInit);
 }
 
@@ -120,40 +122,42 @@ s.test("T-BLOB-OPAQUE: R2 key v/<vaultId>/<address>, no hash check, PUT overwrit
 	});
 });
 
-s.test("D9 PUT cap: 10 MiB accepted; a larger declared or streamed body is 413; an empty body is 400", async () => {
-	await withWorld(async (world) => {
-		const { vaultId, device } = await enrolled(world);
-		const exact = new Uint8Array(MAX_BLOB_UPLOAD_BYTES).fill(1);
+s.test("D9 PUT cap: Cloudflare's 100 MB is accepted and streams to R2; larger is 413; no Content-Length is 411; empty is 400",
+	async () => {
+		assert.equal(MAX_BLOB_UPLOAD_BYTES, 100_000_000, "the Free/Pro edge request body limit, not a YAOS policy");
+		await withWorld(async (world) => {
+			const { vaultId, device } = await enrolled(world);
 
-		world.bucket.calls.length = 0;
-		const declared = await put(world, vaultId, device, ADDRESS, exact, { "Content-Length": String(exact.byteLength) });
-		assert.equal(declared.status, 204);
-		assert.deepEqual(world.bucket.calls, [`put v/${vaultId}/${ADDRESS} stream`], "a declared length streams to R2");
-		assert.equal(world.bucket.objects.get(blobKey(vaultId, ADDRESS))!.byteLength, MAX_BLOB_UPLOAD_BYTES);
+			world.bucket.calls.length = 0;
+			const exact = await put(world, vaultId, device, ADDRESS, chunked(MAX_BLOB_UPLOAD_BYTES, 1024 * 1024),
+				{ "Content-Length": String(MAX_BLOB_UPLOAD_BYTES) });
+			assert.equal(exact.status, 204);
+			assert.deepEqual(world.bucket.calls, [`put v/${vaultId}/${ADDRESS} stream`], "a declared length streams to R2");
+			assert.equal(world.bucket.objects.get(blobKey(vaultId, ADDRESS))!.byteLength, MAX_BLOB_UPLOAD_BYTES);
+			world.bucket.objects.clear();
 
-		world.bucket.calls.length = 0;
-		const undeclared = await put(world, vaultId, device, ADDRESS, chunked(MAX_BLOB_UPLOAD_BYTES));
-		assert.equal(undeclared.status, 204);
-		assert.deepEqual(world.bucket.calls, [`put v/${vaultId}/${ADDRESS} bytes`], "no length: read bounded, then put");
-
-		const fetches = world.cluster.fetches.length;
-		const tooLarge = await put(world, vaultId, device, ADDRESS, new Uint8Array(1),
-			{ "Content-Length": String(MAX_BLOB_UPLOAD_BYTES + 1) });
-		assert.deepEqual([tooLarge.status, await json(tooLarge)], [413, { error: "body_too_large" }]);
-		const invalid = await put(world, vaultId, device, ADDRESS, new Uint8Array(1), { "Content-Length": "1e3" });
-		assert.deepEqual([invalid.status, await json(invalid)], [400, { error: "invalid_content_length" }]);
-		assert.equal(world.cluster.fetches.length, fetches, "a declared size refusal comes before the vault DO");
-
-		world.bucket.calls.length = 0;
-		const streamed = await put(world, vaultId, device, ADDRESS, chunked(MAX_BLOB_UPLOAD_BYTES + 1));
-		assert.deepEqual([streamed.status, await json(streamed)], [413, { error: "body_too_large" }]);
-		const empty = await put(world, vaultId, device, ADDRESS, null);
-		assert.deepEqual([empty.status, await json(empty)], [400, { error: "missing_body" }]);
-		const zero = await put(world, vaultId, device, ADDRESS, new Uint8Array(0), { "Content-Length": "0" });
-		assert.deepEqual([zero.status, await json(zero)], [400, { error: "missing_body" }]);
-		assert.deepEqual(world.bucket.calls, [], "no refused PUT reaches R2");
+			world.bucket.calls.length = 0;
+			const fetches = world.cluster.fetches.length;
+			const tooLarge = await put(world, vaultId, device, ADDRESS, new Uint8Array(1),
+				{ "Content-Length": String(MAX_BLOB_UPLOAD_BYTES + 1) });
+			assert.deepEqual([tooLarge.status, await json(tooLarge)], [413, { error: "body_too_large" }]);
+			const invalid = await put(world, vaultId, device, ADDRESS, new Uint8Array(1), { "Content-Length": "1e3" });
+			assert.deepEqual([invalid.status, await json(invalid)], [400, { error: "invalid_content_length" }]);
+			for (const total of [1, MAX_BLOB_UPLOAD_BYTES + 1]) {
+				const undeclared = await put(world, vaultId, device, ADDRESS, chunked(total));
+				assert.deepEqual([undeclared.status, await json(undeclared)], [411, { error: "length_required" }],
+					`a ${total} B stream without a length is never buffered`);
+			}
+			const empty = await put(world, vaultId, device, ADDRESS, null, { "Content-Length": "0" });
+			assert.deepEqual([empty.status, await json(empty)], [400, { error: "missing_body" }]);
+			const zero = await put(world, vaultId, device, ADDRESS, new Uint8Array(0));
+			assert.deepEqual([zero.status, await json(zero)], [400, { error: "missing_body" }]);
+			const absent = await put(world, vaultId, device, ADDRESS, null);
+			assert.deepEqual([absent.status, await json(absent)], [411, { error: "length_required" }]);
+			assert.equal(world.cluster.fetches.length, fetches, "every size refusal comes before the vault DO");
+			assert.deepEqual(world.bucket.calls, [], "no refused PUT reaches R2");
+		});
 	});
-});
 
 s.test("D9 exists: up to 50 entries, answered in order; more → 400 too_many_addresses; legacy errors; a 64 KiB body cap", async () => {
 	assert.equal(MAX_BLOB_EXISTS_ADDRESSES, 50);

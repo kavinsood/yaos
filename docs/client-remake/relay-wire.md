@@ -45,7 +45,7 @@ Never log tokens, pairing codes or recovery keys.
 
 ```json
 { "claimed": true, "streams": 1, "attachments": false, "snapshots": false, "recoveryJobs": false,
-  "maxBlobUploadBytes": 10485760, "serverVersion": "1.0.0", "schemaVersion": <n>, "protocolVersion": <n>, ... }
+  "maxBlobUploadBytes": 100000000, "serverVersion": "1.0.0", "schemaVersion": <n>, "protocolVersion": <n>, ... }
 ```
 
 The client requires `streams === 1`. `attachments` is `true` only when the R2 bucket is bound (§11.3). Other
@@ -471,7 +471,7 @@ cannot check this.
 | Group commit | 300 ms idle / 1500 ms max / 64 KiB; 20 ms leading edge after 1500 ms without a commit |
 | Ticket TTL | 5 min |
 | Pairing code TTL | 15 min |
-| Blob body | 10 MiB (`maxBlobUploadBytes`); `exists` takes at most 50 addresses (§11.3) |
+| Blob body | 100 MB (`maxBlobUploadBytes` = 100000000): Cloudflare's Free/Pro request body limit, not a YAOS policy; `exists` takes at most 50 addresses (§11.3) |
 | Blob GC | list page 1000 items; batch delete 1–100 addresses; list and delete together 60 requests/min per vault (§11.3.1) |
 
 Env overrides (Worker vars, integer strings):
@@ -509,7 +509,7 @@ then `capabilities.attachments` is `true`. Every blob route takes the device bea
 
 | Route | Request | Response |
 |---|---|---|
-| `PUT /vault/:id/blobs/<address>` | body 1 B to `maxBlobUploadBytes` (10 MiB) | `204`; `413 body_too_large`; `400 missing_body`; `400 invalid_content_length` |
+| `PUT /vault/:id/blobs/<address>` | body 1 B to `maxBlobUploadBytes` (100 MB), with a `Content-Length` | `204`; `413 body_too_large`; `411 length_required`; `400 missing_body`; `400 invalid_content_length` |
 | `GET /vault/:id/blobs/<address>` | | `200` the bytes as `application/octet-stream` with `X-Content-Type-Options: nosniff`; `404 {"error":"not found"}` |
 | `POST /vault/:id/blobs/exists` | `{"hashes":[<address>, ...]}`, at most 50, body ≤ 64 KiB | `200 {"present":[...]}`: the stored addresses, in request order |
 | `GET /vault/:id/blobs?cursor=<next>` | blob GC, §11.3.1 | `200 {"items":[{"address","uploadedAt"}],"next"}`; `503 list_incomplete` |

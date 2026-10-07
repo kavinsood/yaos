@@ -96,12 +96,14 @@ export async function fetchBlob(env: Env, op: Op<"fetchBlob">): Promise<JobOutco
  * Upload the local file's bytes. Only after the store confirms are the
  * doc's deferred ns ops submitted, so no ns entry ever points at a blob that
  * readers cannot fetch. A brand-new doc gets a synced record (blobRev 0,
- * nsTouchSeq 0) unless the S1 fold already wrote one.
+ * nsTouchSeq 0) unless the S1 fold already wrote one. "held" = no blob store,
+ * or the store refused these bytes by size (BlobTransfer.refused): retrying
+ * cannot help, so no retry is armed and the doc stays local.
  */
 export async function pushBlob(env: Env, op: Op<"pushBlob">): Promise<JobOutcome> {
 	const { ctx } = env;
 	const blobs = blobStore(env);
-	if (!blobs) return "held";
+	if (!blobs || blobs.refused?.(op.hash)) return "held";
 	const path = ctx.diskPathOf(op.path);
 	const r = await ctx.read(path, blobs.maxBlobBytes);
 	if (!r.ok) {
@@ -114,7 +116,7 @@ export async function pushBlob(env: Env, op: Op<"pushBlob">): Promise<JobOutcome
 		env.scan.markDirty(path, r.stat);
 		return "fail";
 	}
-	if (!(await blobs.upload({ hash: h.hash, docId: op.docId, path: op.path, bytes: r.bytes }))) return "fail";
+	if (!(await blobs.upload({ hash: h.hash, docId: op.docId, path: op.path, bytes: r.bytes }))) return blobs.refused?.(h.hash) ? "held" : "fail";
 	const deferred = env.deferred.get(op.docId);
 	if (deferred) {
 		env.deferred.delete(op.docId);

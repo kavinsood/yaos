@@ -77,11 +77,6 @@ export const MAIN_UPDATE_COALESCE_MS = 16;
 /** Padmé floor: every padded payload is at least this long (decision D3). */
 export const PADME_FLOOR_BYTES = 256;
 /**
- * Largest suite-1 blob plaintext, the 0x80 pad marker included: 39 × 256 KiB
- * padded plus header and AEAD overhead fits the 10 MiB upload cap (DECISIONS D9).
- */
-export const MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 39 * 256 * 1024 - 1;
-/**
  * Blob download quarantine (e2ee-design §10.2): after the initial attempt and this many retries all failed
  * deterministically (key verified), spanning at least BLOB_QUARANTINE_MIN_MS, the referencing row is quarantined.
  */
@@ -177,6 +172,13 @@ export const CFG_MAX_FILES = 256;
 export const KEY_STORE_WAIT_MS = 5_000;
 
 // --- Relay ------------------------------------------------------------------
+
+/**
+ * The relay's blob PUT cap (server/src/router.ts MAX_BLOB_UPLOAD_BYTES): Cloudflare's request body limit on the
+ * Free and Pro plans (developers.cloudflare.com/workers/platform/limits). The client's cap when GET
+ * /api/capabilities could not be read, and the most the settings offer until the open vault reports its own.
+ */
+export const MAX_BLOB_UPLOAD_BYTES = 100_000_000;
 
 export const RELAY_CLOSE = {
 	normal: 1000,

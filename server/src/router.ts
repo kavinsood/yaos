@@ -33,8 +33,14 @@ export interface WorkerEnv extends VaultEnv {
 	YAOS_BUCKET?: R2Bucket;
 }
 
-/** Capabilities `maxBlobUploadBytes` and the blob PUT cap (relay-wire §11.3, unchanged). */
-export const MAX_BLOB_UPLOAD_BYTES = 10 * 1024 * 1024;
+/**
+ * Capabilities `maxBlobUploadBytes` and the blob PUT cap (relay-wire §11.3). Not a YAOS policy: Cloudflare's edge refuses
+ * a request body above 100 MB on the Free and Pro plans with its own 413 before the Worker runs
+ * (https://developers.cloudflare.com/workers/platform/limits/, "Request and response limits"), so this is the largest
+ * body every deployment can receive. Business (200 MB) and Enterprise (up to 5 GB) zones accept more at the edge; this
+ * server does not.
+ */
+export const MAX_BLOB_UPLOAD_BYTES = 100_000_000;
 /**
  * DECISIONS-GAP: §2.2 caps the claim JSON at 64 KiB but names no cap for /enroll, whose body the Worker must parse to
  * route by code. The same 64 KiB is used; a larger body is `413 body_too_large`.
@@ -592,13 +598,17 @@ export class Router {
 		if (!bucket) return json({ error: "attachments_unavailable" }, 503);
 		// DECISIONS-GAP: §2.2 requires the address regex but names no error; `400 invalid_address`.
 		if (address !== null && !BLOB_ADDRESS_PATTERN.test(address)) return json({ error: "invalid_address" }, 400);
-		let declared: number | null = null;
 		if (request.method === "PUT") {
+			let declared: number | null;
 			try {
 				declared = declaredBodyLength(request, MAX_BLOB_UPLOAD_BYTES);
 			} catch (error) {
 				return boundedBodyRejection(error);
 			}
+			// A PUT body streams to R2, which needs a known length, and never buffers here: a body of up to the cap
+			// held in a 128 MB isolate could exhaust it. No Content-Length is refused, fail closed.
+			if (declared === null) return json({ error: "length_required" }, 411);
+			if (declared === 0) return json({ error: "missing_body" }, 400);
 		}
 		const auth = await this.vaultObject(env, vaultId).fetch(new Request(`${VAULT_INTERNAL_ORIGIN}/blobs/auth`, {
 			method: "POST",
@@ -621,18 +631,9 @@ export class Router {
 				},
 			});
 		}
-		if (declared !== null && declared > 0 && request.body) {
-			// A declared length within the cap bounds the body (HTTP framing): stream it to R2 without buffering.
-			await bucket.put(key, request.body);
-			return new Response(null, { status: 204 });
-		}
-		let bytes: Uint8Array;
-		try {
-			bytes = await readBoundedBytes(request, MAX_BLOB_UPLOAD_BYTES);
-		} catch (error) {
-			return boundedBodyRejection(error);
-		}
-		await bucket.put(key, bytes);
+		if (!request.body) return json({ error: "missing_body" }, 400);
+		// The declared length, within the cap, bounds the body (HTTP framing): stream it to R2 without buffering.
+		await bucket.put(key, request.body);
 		return new Response(null, { status: 204 });
 	}
 

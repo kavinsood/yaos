@@ -34,11 +34,23 @@ export type BlobDeleteResult =
 	| { readonly address: BlobAddress; readonly result: "newer"; readonly uploadedAt: number }
 	| { readonly address: BlobAddress; readonly result: "absent" };
 
+/**
+ * BlobPort.put's rejection when the store will not take a body of that size (HTTP 413: the relay's own, or the
+ * edge's HTML page when a plan's request limit is below the advertised cap). The same bytes can never succeed,
+ * so the caller does not retry them (blobs/blobQueue.ts).
+ */
+export class BlobTooLargeError extends Error {
+	constructor(readonly bytes: number) {
+		super(`blob store refused ${bytes} bytes as too large`);
+		this.name = "BlobTooLargeError";
+	}
+}
+
 export interface BlobPort {
 	readonly maxBlobBytes: number;
 	/** Subset of addresses already stored. */
 	has(addresses: readonly BlobAddress[]): Promise<ReadonlySet<BlobAddress>>;
-	/** Idempotent. Stores the concatenation of `parts`, as CryptoPort.sealBlob returned them. */
+	/** Idempotent. Stores the concatenation of `parts`, as CryptoPort.sealBlob returned them. BlobTooLargeError = refused by size. */
 	put(address: BlobAddress, parts: SealedBlobParts): Promise<void>;
 	/** null = not found (yet). */
 	get(address: BlobAddress): Promise<Uint8Array | null>;
