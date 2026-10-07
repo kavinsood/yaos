@@ -2,7 +2,7 @@
  * SimBodyEngine: the worker side of the bound-body protocol (DESIGN §d.3) with a CodeMirror Text as the replica,
  * for unit tests of the main-thread binding (host/binding.ts) without the composed engine. It follows
  * engine/compose/boundBody.ts + boundDocs.ts: versions, author-tagged entries, chained pushes and rejects,
- * bind-time and reload merges (core merge, as the worker), durable marks on request. Both directions are FIFO
+ * bind-time and reload merges (core merge, as the worker). Both directions are FIFO
  * (postMessage), each message after a seeded delay, so a test controls how pushes and remote edits interleave.
  */
 
@@ -25,8 +25,6 @@ interface Doc {
 	readonly attached: Set<number>;
 	lastAuthor: { readonly viewId: number; readonly seq: number } | null;
 	diskText: string | null;
-	/** Text per version since the last durable mark (restart: the replica falls back to the durable one). */
-	durable: { version: number; text: Text };
 }
 
 export class SimBodyEngine {
@@ -42,8 +40,6 @@ export class SimBodyEngine {
 	private readonly done = new Map<number, string>();
 	private toEngineAt = 0;
 	private toMainAt = 0;
-	/** Engine generation: messages to or from a dead engine are dropped. */
-	private gen = 0;
 
 	constructor(private readonly clock: ClockPort) {}
 
@@ -65,7 +61,7 @@ export class SimBodyEngine {
 
 	add(path: string, text: string, docId = `d:${path}` as DocId): DocId {
 		const t = simText(text);
-		this.docs.set(path, { docId, text: t, version: 0, views: new Set(), attached: new Set(), lastAuthor: null, diskText: text, durable: { version: 0, text: t } });
+		this.docs.set(path, { docId, text: t, version: 0, views: new Set(), attached: new Set(), lastAuthor: null, diskText: text });
 		return docId;
 	}
 
@@ -86,28 +82,6 @@ export class SimBodyEngine {
 		this.apply(d, ChangeSet.of({ from: a, to: b, insert: simText(insert) }, len), "remote", null);
 	}
 
-	/** Every change so far is committed. */
-	markDurable(path: string): void {
-		const d = this.need(path);
-		d.durable = { version: d.version, text: d.text };
-		this.emit(d, { t: "durable", version: d.version });
-	}
-
-	/** The engine dies: replicas fall back to their durable text, views re-bind (HostRuntime onDown + start). */
-	restart(): void {
-		for (const d of this.docs.values()) {
-			d.text = d.durable.text;
-			d.views.clear();
-			d.attached.clear();
-			d.lastAuthor = null;
-		}
-		this.uploads.clear();
-		this.done.clear();
-		this.gen++;
-		this.bm?.suspend();
-		this.later("main", () => this.bm?.start());
-	}
-
 	private need(path: string): Doc {
 		const d = this.docs.get(path);
 		if (!d) throw new Error(`no doc at ${path}`);
@@ -120,14 +94,11 @@ export class SimBodyEngine {
 	}
 
 	private later(to: "engine" | "main", fn: () => void): void {
-		const gen = this.gen;
 		const now = this.clock.now();
 		const at = Math.max(to === "engine" ? this.toEngineAt : this.toMainAt, now + Math.max(0, this.delay()));
 		if (to === "engine") this.toEngineAt = at;
 		else this.toMainAt = at;
-		this.clock.setTimer(at - now, () => {
-			if (gen === this.gen) fn();
-		});
+		this.clock.setTimer(at - now, fn);
 	}
 
 	private emit(d: Doc, event: BodyEvent): void {

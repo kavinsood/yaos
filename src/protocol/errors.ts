@@ -32,9 +32,6 @@ export interface ProtocolError {
 	readonly retryable: boolean;
 }
 
-/** Codes after which the host must not retry automatically. */
-export const TERMINAL_ERROR_CODES: readonly ProtocolErrorCode[] = ["version-mismatch", "revoked"];
-
 /**
  * Thrown on the engine side to answer a request with this exact error (code and message) instead of the
  * generic `internal` one.

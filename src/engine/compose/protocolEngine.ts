@@ -1,12 +1,12 @@
 /**
- * The engine behind the protocol (DESIGN §g): one instance per carrier
- * (worker or inline). Answers ping in every phase, init -> ready, and routes
+ * The engine behind the protocol (DESIGN §g): one instance per carrier (the
+ * worker; an in-process pair in tests, the sim and harnesses). Answers ping in every phase, init -> ready, and routes
  * every other message to the per-epoch VaultRuntime.
  *
  * Protocol-ready is not vault-ready: init answers `ready` as soon as the ports
  * exist, even offline on a fresh device (the runtime keeps retrying in the
- * background). Only an unusable store fails init (`storage-lost`), so the
- * host falls back from the worker to inline (OR-1).
+ * background). Only an unusable store fails init (`storage-lost`), which
+ * stops the host (OR-1, DESIGN §g.4).
  *
  * The runtime is restarted in-process on an epoch change (§c.12), storage
  * loss (§i.5), rebuildLocalCache and settings changes that need it. Bound

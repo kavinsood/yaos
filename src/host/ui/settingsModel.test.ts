@@ -157,7 +157,7 @@ test("engine rows and labels", () => {
 	const running = { phase: "running", transport: "worker", lastError: null } as const;
 	assert.deepEqual(engineRows({ phase: "unpaired", transport: null, lastError: null }, null, 0), [{ name: "Engine", value: "Not paired" }]);
 	assert.match(runStateLabel({ phase: "failed", transport: null, lastError: "boom" }), /boom/);
-	assert.match(runStateLabel({ ...running, transport: "inline" }), /main thread/);
+	assert.equal(runStateLabel(running), "Running in a background worker");
 	const rows = engineRows(running, snap("live", { lastSyncedAtMs: 0 }), 120_000);
 	const byName = Object.fromEntries(rows.map((r) => [r.name, r.value]));
 	assert.equal(byName["Phase"], "Live");

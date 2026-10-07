@@ -1,7 +1,7 @@
 /**
  * The engine thread of a FullClient on the worker carrier (fullKit.ts EngineThread): what the plugin's Blob-URL
  * worker runs (engine/workerMain.ts startWorkerEngine), on worker_threads. Each carrier is createEngine (carrier
- * "worker") over createWorkerEngineTransport on its MessagePort, with the ports fullKit gives the inline engine
+ * "worker") over createWorkerEngineTransport on its MessagePort, with the ports fullKit gives the in-process engine
  * (fullEnginePorts) over this thread's IndexedDB and net switch, which outlive the carriers (engine restarts).
  *
  * Diagnostics, never secrets: log lines; monitorEventLoopDelay({ resolution: 1 }) and a 1 ms heartbeat (probe);

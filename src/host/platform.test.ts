@@ -7,16 +7,14 @@ import { deviceClassFor } from "./runtimeSupport";
 test("platform info maps Obsidian flags and navigator facts onto device classes", () => {
 	const phone = platformInfoFrom({ isMobile: true, isIosApp: true }, { hardwareConcurrency: 6, deviceMemory: 4 }, true);
 	assert.equal(phone.os, "ios");
-	assert.equal(deviceClassFor(phone, "worker"), "phone");
-	assert.equal(deviceClassFor(phone, "inline"), "constrained");
+	assert.equal(deviceClassFor(phone), "phone");
 	const old = platformInfoFrom({ isMobile: true, isAndroidApp: true }, { hardwareConcurrency: 2 }, true);
-	assert.equal(deviceClassFor(old, "worker"), "constrained");
+	assert.equal(deviceClassFor(old), "constrained");
 	const tablet = platformInfoFrom({ isMobile: true, isTablet: true, isIosApp: true }, {}, false);
-	assert.equal(deviceClassFor(tablet, "worker"), "tablet");
+	assert.equal(deviceClassFor(tablet), "tablet");
 	assert.equal(tablet.workerSupported, false);
 	const mac = platformInfoFrom({ isMobile: false, isMacOS: true }, { hardwareConcurrency: 10 }, true);
-	assert.equal(deviceClassFor(mac, "worker"), "desktop");
-	assert.equal(deviceClassFor(mac, "inline"), "tablet");
+	assert.equal(deviceClassFor(mac), "desktop");
 });
 
 test("lifecycle events come from visibilitychange, pagehide, freeze/resume, online/offline and detach when unused", () => {

@@ -16,17 +16,11 @@ export const OBSERVATION_CHUNK = 2_000;
 export const VAULT_EVENT_BATCH_MS = 50;
 export const VAULT_EVENT_BATCH_MAX = 256;
 
-/** §i.2. Inline runs one class lower (phone/tablet inline => constrained). */
-export function deviceClassFor(info: PlatformInfo, carrier: "worker" | "inline"): DeviceClass {
-	let cls: DeviceClass;
-	if (!info.isMobile) cls = "desktop";
-	else if ((info.deviceMemoryGiB !== null && info.deviceMemoryGiB < 3) || info.hardwareConcurrency <= 2) cls = "constrained";
-	else cls = info.isTablet ? "tablet" : "phone";
-	if (carrier === "inline") {
-		if (cls === "desktop") return "tablet";
-		return "constrained";
-	}
-	return cls;
+/** §i.2. */
+export function deviceClassFor(info: PlatformInfo): DeviceClass {
+	if (!info.isMobile) return "desktop";
+	if ((info.deviceMemoryGiB !== null && info.deviceMemoryGiB < 3) || info.hardwareConcurrency <= 2) return "constrained";
+	return info.isTablet ? "tablet" : "phone";
 }
 
 export interface HostIdentity {
@@ -54,8 +48,6 @@ async function readSide(side: SideFilePort, name: SideFileName): Promise<Uint8Ar
 export async function buildInitConfig(input: {
 	readonly identity: HostIdentity;
 	readonly platform: PlatformInfo;
-	readonly carrier: "worker" | "inline";
-	readonly workerSupported: boolean;
 	readonly configDir: string;
 	readonly caseInsensitiveFs: boolean;
 	readonly settings: EngineSettings;
@@ -69,14 +61,13 @@ export async function buildInitConfig(input: {
 		readSide(input.side, SIDE_A_B.synced[0]),
 		readSide(input.side, SIDE_A_B.synced[1]),
 	]);
-	const platform: PlatformInfo = { ...input.platform, workerSupported: input.workerSupported };
 	return {
 		protocolVersion: PROTOCOL_VERSION,
 		vaultId: input.identity.vaultId,
 		deviceId: input.identity.deviceId,
 		deviceLabel: input.identity.deviceLabel,
-		deviceClass: deviceClassFor(platform, input.carrier),
-		platform,
+		deviceClass: deviceClassFor(input.platform),
+		platform: input.platform,
 		configDir: input.configDir,
 		caseInsensitiveFs: input.caseInsensitiveFs,
 		relay: { url: input.identity.relay.url, credential: input.identity.relay.credential },

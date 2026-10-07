@@ -91,7 +91,7 @@ test("pagehide flushes the coalesce buffer synchronously (acceptance 4)", async 
 	assert.equal(a.engineText("a.md"), "xy");
 });
 
-test("engine killed mid-typing loses nothing (re-attach with the durable base after restart)", async () => {
+test("engine killed mid-typing: the runtime stops, the editor keeps every keystroke, the user's restart loses nothing", async () => {
 	const { clock, devs } = world();
 	const a = dev(devs, 0);
 	const b = dev(devs, 1);
@@ -105,19 +105,30 @@ test("engine killed mid-typing loses nothing (re-attach with the durable base af
 	va.edit(5, 0, " one");
 	await clock.advance(20); // posted + applied in the engine, not persisted
 	va.edit(9, 0, " two"); // still in the coalesce buffer
+	const dead = a.runtime;
 	a.crashEngine();
 	va.edit(13, 0, " three"); // typed while the engine is down
 	await clock.advance(3_000);
+	// The dead worker stopped its runtime for good: one fatal, and the next engine is the user's restart (a new
+	// runtime), never a background one.
+	assert.equal(dead.engine.isStopped, true);
+	assert.deepEqual(a.ui.crashFatals.map((e) => e.message), ["the sync engine failed: sim crash"]);
+	assert.deepEqual(a.ui.fatals, []);
+	assert.notEqual(a.runtime, dead);
 	assert.equal(a.engineStarts, 2);
 	assert.equal(a.runtime.engine.isReady, true);
-	assert.equal(a.engineText("a.md"), "start one two three");
 	b.setOnline(true);
 	await clock.advance(5_000);
-	assert.equal(b.vault.textOf("a.md"), "start one two three");
-	assert.equal(va.getText(), "start one two three");
+	// The new runtime binds the view as at a first open: the engine's replica holds " one" (it reached the relay),
+	// the editor " one two three", the disk neither. Nothing is lost: the editor side is kept as a conflict copy.
+	const want = "start one two three";
+	assert.equal(va.getText(), a.engineText("a.md"));
+	assert.equal(b.vault.textOf("a.md"), a.engineText("a.md"));
+	assert.ok([...b.vault.snapshot().values()].includes(want), "every keystroke reached B");
+	assert.ok([...a.vault.snapshot().values()].includes(want), "every keystroke is on A's disk");
 });
 
-test("engine restart with a dirty view, then a second view loads the older disk text: the edit survives (sim seed 62)", async () => {
+test("engine dies with a dirty view, then a second view loads the older disk text during the restart: the edit survives (sim seed 62)", async () => {
 	const { clock, devs } = world();
 	const a = dev(devs, 0);
 	const b = dev(devs, 1);
@@ -133,7 +144,7 @@ test("engine restart with a dirty view, then a second view loads the older disk 
 	await clock.advance(400); // pushed, framed, committed, on the relay
 	assert.equal(a.vault.textOf("a.md"), "start [Z]\n", "the editor has not saved");
 	a.crashEngine();
-	// While the engine restarts, a second view of the file loads what is on disk. The re-bind of the dirty view
+	// While the next runtime starts, a second view of the file loads what is on disk. The re-bind of the dirty view
 	// must tell the engine which text is on disk (`saved`), or the second view's older text reads as an edit
 	// against the first view's unsaved one and reverts it.
 	const vb = a.workspace.openFile("a.md");
@@ -147,16 +158,31 @@ test("engine restart with a dirty view, then a second view loads the older disk 
 	assert.equal(b.vault.textOf("a.md"), want);
 });
 
-test("worker storage failure falls back to inline and still syncs (OR-1 fallback)", async () => {
+test("worker storage failure stops the runtime: storage-lost fatal, one engine, no fallback (OR-1)", async () => {
 	const { clock, devs } = world({ workerMode: "storage-fails" });
 	const a = dev(devs, 0);
 	const b = dev(devs, 1);
 	a.vault.userWrite("x.md", "1");
 	await boot(clock, devs);
-	await clock.advance(2_000);
-	assert.equal(a.runtime.engine.carrierKind, "inline");
-	assert.equal(a.runtime.currentDeviceClass, "tablet");
-	assert.equal(b.vault.textOf("x.md"), "1");
+	await clock.advance(60_000);
+	assert.equal(a.runtime.engine.isStopped, true);
+	assert.equal(a.runtime.engine.carrierKind, null);
+	assert.deepEqual(a.ui.fatals.map((e) => e.code), ["storage-lost"]);
+	assert.match(a.ui.fatals[0]?.message ?? "", /^the sync engine could not start: engine ports: IndexedDB unavailable in worker$/);
+	assert.equal(a.engineStarts, 1, "no second engine");
+	assert.deepEqual(a.ui.carriers, [{ carrier: null, ready: false }], "never ready; the UI shows no carrier");
+	assert.equal(b.vault.textOf("x.md"), null, "nothing synced from A");
+});
+
+test("no Worker: the runtime stops before any engine runs", async () => {
+	const { clock, devs } = world({ workerMode: "unavailable" });
+	const a = dev(devs, 0);
+	await boot(clock, devs);
+	await clock.advance(60_000);
+	assert.equal(a.runtime.engine.isStopped, true);
+	assert.deepEqual(a.ui.fatals.map((e) => e.message), ["the sync engine could not start: Worker is not available (sim)"]);
+	assert.equal(a.engineStarts, 0);
+	assert.deepEqual(a.ui.carriers, [{ carrier: null, ready: false }]);
 });
 
 test("same path created on both devices while offline: one keeps the doc, the other's text goes to a conflict copy", async () => {

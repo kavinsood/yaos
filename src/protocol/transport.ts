@@ -1,9 +1,9 @@
 /**
  * Transport between host and engine. DESIGN §g.1, §g.5.
  *
- * Implementations (WP-D): WorkerTransport (postMessage + transfer lists),
- * InlineTransport (same-thread pair: structuredClone, delivery on a macrotask,
- * FIFO), used as the fallback when the worker cannot start and in Node.
+ * Implementations (WP-D): WorkerTransport (postMessage + transfer lists), the
+ * plugin's only carrier; InlineTransport (same-thread pair: structuredClone,
+ * delivery on a macrotask, FIFO), for tests, the simulation and harnesses.
  */
 
 import type { Unsubscribe } from "../ports/common";
@@ -22,8 +22,6 @@ export interface Transport<Out, In> {
 export type HostTransport = Transport<MainToEngine, EngineToMain>;
 export type EngineTransport = Transport<EngineToMain, MainToEngine>;
 
-/** Liveness: host pings every PING_INTERVAL_MS; no pong within PING_TIMEOUT_MS => restart engine. */
+/** Liveness: host pings every PING_INTERVAL_MS; no pong within PING_TIMEOUT_MS => the engine is dead, the host stops. */
 export const PING_INTERVAL_MS = 10_000;
 export const PING_TIMEOUT_MS = 15_000;
-/** Max consecutive engine restarts before falling back to inline. */
-export const MAX_WORKER_RESTARTS = 3;

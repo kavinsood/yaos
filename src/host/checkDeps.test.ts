@@ -31,14 +31,13 @@ test("§k.2 rules", () => {
 	assert.equal(check("ports/workspace.ts", `import type * as Y from "yjs";`).errors.length, 1, "ports: no CRDT types");
 	assert.equal(check("ports/workspace.ts", `import type { ChangeSet, Text } from "@codemirror/state";`).errors.length, 0);
 	assert.equal(check("ports/vault.ts", `import type { Text } from "@codemirror/state";`).errors.length, 1);
-	assert.equal(check("protocol/workerTransport.ts", `import { Inbox } from "./inlineTransport";`).errors.length, 0);
+	assert.equal(check("protocol/inlineTransport.ts", `import { Inbox } from "./workerTransport";`).errors.length, 0);
 	assert.equal(check("protocol/x.ts", `import { BUDGETS } from "../core/limits";`).errors.length, 1, "protocol: runtime core");
 	assert.equal(check("engine/body/a.ts", `import { App } from "obsidian";`).errors.length, 1);
 	assert.equal(check("engine/body/a.ts", `import { h } from "../../host/plugin";`).errors.length, 1);
 	assert.equal(check("engine/body/a.ts", `const db = indexedDB.open("x");`).errors.length, 1, "browser global outside adapters");
 	assert.equal(check("engine/adapters/idb.ts", `const db = indexedDB.open("x");`).errors.length, 0);
 	assert.equal(check("engine/body/a.ts", `const s = "fetch(";`).errors.length, 0, "strings are ignored");
-	assert.equal(check("host/plugin.ts", `import { createWebEngine } from "../engine/adapters/webEngine";`).errors.length, 0);
 	assert.equal(check("host/engineHost.ts", `import { LogEngine } from "../engine/runtime/engine";`).errors.length, 1);
 	assert.equal(check("host/engineHost.ts", `import { x } from "../engine/body/handles";`).errors.length, 1);
 	assert.equal(check("host/plugin.ts", `import { createEngine } from "../engine/__standins__/engine";`).errors.length, 1, "stand-ins are gone");
@@ -84,7 +83,7 @@ test("no CRDT on the main thread: host/** never imports yjs, y-codemirror.next, 
 		"host/plugin.ts": `import { createWebEngine } from "../engine/adapters/webEngine";`,
 		"engine/adapters/webEngine.ts": `import * as Y from "yjs";`,
 	});
-	assert.deepEqual(viaEntry, [], "the inline-fallback engine entry is the documented exception (D2)");
+	assert.deepEqual(viaEntry, [], "a direct import is checkSource's (it fails there: no engine on main)");
 	assert.equal(check("host/plugin.ts", `import { probe } from "./spike/viewProbe";`).errors.length, 1, "the spike plugin stays out of the product");
 });
 
@@ -106,6 +105,52 @@ test("no hashing on the main thread: product host/** never imports or reaches co
 	assert.equal(viaCore.length, 1);
 	assert.match(viaCore[0] ?? "", /host\/a\.ts.*core\/hash\/sha256 via host\/a\.ts -> core\/b\.ts/);
 	assert.deepEqual(reach({ "host/a.test.ts": `import { f } from "../core/b";`, "core/b.ts": `import { g } from "./hash/sha256";`, "core/hash/sha256.ts": "" }), [], "tests are not the main thread");
+});
+
+test("no engine on the main thread: the plugin's one carrier is the worker", () => {
+	// Direct: only the bundle entry reaches the engine, and only its worker entry; nothing on main builds the
+	// in-process carrier.
+	assert.equal(check("host/plugin.ts", `import { createWebEngine } from "../engine/adapters/webEngine";`).errors.length, 1, "no web engine on main");
+	assert.equal(check("host/entry.ts", `import { createWebEngine } from "../engine/adapters/webEngine";`).errors.length, 1, "not even from the bundle entry");
+	assert.equal(check("host/hostRuntime.ts", `import type { WebEngineOptions } from "../engine/adapters/webEngine";`).errors.length, 1, "type-only too");
+	assert.equal(check("host/entry.ts", `import "../engine/workerMain";`).errors.length, 0, "the worker entry");
+	for (const file of ["host/plugin.ts", "host/engineHost.ts", "host/hostRuntime.ts", "host/ui/settingsTab.ts"]) {
+		assert.equal(check(file, `import { createInlinePair } from "${file.startsWith("host/ui/") ? "../../" : "../"}protocol/inlineTransport";`).errors.length, 1, file);
+	}
+	assert.equal(check("host/engineHost.ts", `import type { InlinePair } from "../protocol/inlineTransport";`).errors.length, 1, "type-only too");
+	assert.equal(check("host/engineHost.test.ts", `import { createInlinePair } from "../protocol/inlineTransport";`).errors.length, 0, "host tests drive the in-process pair");
+	assert.equal(check("sim/device.ts", `import { createInlinePair } from "../protocol/inlineTransport";`).errors.length, 0, "the sim");
+	assert.equal(check("protocol/transports.test.ts", `import { createInlinePair } from "./inlineTransport";`).errors.length, 0);
+	// Transitive: through core/ports/protocol (or another host module) is as bad as direct.
+	const reach = (files: Record<string, string>) => mainReach(new Map(Object.entries(files))) as string[];
+	const viaProtocol = reach({
+		"host/engineHost.ts": `import { createWorkerHostTransport } from "../protocol/workerTransport";`,
+		"protocol/workerTransport.ts": `import { Inbox } from "./inlineTransport";`,
+		"protocol/inlineTransport.ts": `export class Inbox {}`,
+	});
+	assert.equal(viaProtocol.length, 1);
+	assert.match(viaProtocol[0] ?? "", /^host\/engineHost\.ts:1: main thread reaches protocol\/inlineTransport via host\/engineHost\.ts -> protocol\/workerTransport\.ts$/);
+	const viaHost = reach({
+		"host/plugin.ts": `import { makeRuntime } from "./runtimeSupport";`,
+		"host/runtimeSupport.ts": `import { createInlinePair } from "../protocol/inlineTransport";`,
+		"protocol/inlineTransport.ts": "",
+	});
+	assert.deepEqual(viaHost, ["host/plugin.ts:1: main thread reaches protocol/inlineTransport via host/plugin.ts -> host/runtimeSupport.ts"]);
+	const webViaProtocol = reach({
+		"host/plugin.ts": `import { f } from "../protocol/x";`,
+		"protocol/x.ts": `import { createWebEngine } from "../engine/adapters/webEngine";`,
+		"engine/adapters/webEngine.ts": `export function createWebEngine() {}`,
+	});
+	assert.deepEqual(webViaProtocol, ["host/plugin.ts:1: main thread reaches engine/adapters/webEngine via host/plugin.ts -> protocol/x.ts"]);
+	const workerPath = reach({
+		"host/entry.ts": `import { startWorker } from "../engine/workerMain";\nimport { YaosPlugin } from "./plugin";`,
+		"host/plugin.ts": `import { createWorkerHostTransport } from "../protocol/workerTransport";`,
+		"protocol/workerTransport.ts": "",
+		"engine/workerMain.ts": `import { createWebEngine } from "./adapters/webEngine";`,
+		"engine/adapters/webEngine.ts": `import { createInlinePair } from "../../protocol/inlineTransport";\nimport * as Y from "yjs";`,
+		"protocol/inlineTransport.ts": "",
+	});
+	assert.deepEqual(workerPath, [], "the web engine is reachable only via engine/workerMain from the bundle entry (the worker path)");
 });
 
 test("whole-document reads on main: only the allowlisted ones", () => {

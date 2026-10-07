@@ -28,7 +28,7 @@ export interface HostUiSink {
 	onStatus(status: StatusSnapshot): void;
 	onBrake(report: BrakeReport): void;
 	onNotice(level: "info" | "warn" | "error", code: string, message: string): void;
-	onCarrier(info: { readonly carrier: CarrierKind | null; readonly ready: boolean; readonly fallbackReason: string | null }): void;
+	onCarrier(info: { readonly carrier: CarrierKind | null; readonly ready: boolean }): void;
 	onFatal(error: ProtocolError): void;
 }
 
@@ -43,10 +43,9 @@ export interface HostRuntimeDeps {
 	readonly settings: () => EngineSettings;
 	/** The engine's keys and the keyringChanged store (e2ee-design §6.3, §18.4). */
 	readonly keys: HostKeys;
-	readonly createWorker: () => EngineCarrier | null;
-	readonly createInline: () => EngineCarrier;
+	/** The engine's one carrier (plugin: the worker; tests and harnesses: an in-process pair). */
+	readonly createCarrier: () => EngineCarrier;
 	readonly ui: HostUiSink;
-	readonly forceInline?: boolean;
 	readonly pingEnabled?: boolean;
 	readonly log?: (line: string) => void;
 }
@@ -57,7 +56,7 @@ export class HostRuntime {
 	readonly disk: DiskExecutor;
 	private readonly batcher: VaultEventBatcher;
 	private readonly offs: (() => void)[] = [];
-	private deviceClass: DeviceClass;
+	private readonly deviceClass: DeviceClass;
 	private scanId = 0;
 	private scanning: Promise<void> | null = null;
 	private rescanWanted = false;
@@ -67,7 +66,7 @@ export class HostRuntime {
 	readonly stats = { scans: 0, observationsSent: 0, vaultEventBatches: 0, lifecycleFlushes: 0 };
 
 	constructor(private readonly deps: HostRuntimeDeps) {
-		this.deviceClass = deviceClassFor(deps.platform.info, deps.forceInline ? "inline" : "worker");
+		this.deviceClass = deviceClassFor(deps.platform.info);
 		this.bindings = new BindingManager({
 			workspace: deps.workspace,
 			vault: deps.vault,
@@ -94,16 +93,13 @@ export class HostRuntime {
 		});
 		this.engine = new EngineHost({
 			clock: deps.clock,
-			createWorker: deps.createWorker,
-			createInline: deps.createInline,
-			forceInline: deps.forceInline,
+			createCarrier: deps.createCarrier,
 			pingEnabled: deps.pingEnabled ?? true,
 			log: deps.log,
-			initConfig: async (carrier, workerSupported) => {
-				this.deviceClass = deviceClassFor(deps.platform.info, carrier);
+			initConfig: async () => {
 				// Keys are loaded per start, as fresh buffers that move into the engine (§6.3).
 				return buildInitConfig({
-					identity: deps.identity, platform: deps.platform.info, carrier, workerSupported,
+					identity: deps.identity, platform: deps.platform.info,
 					configDir: deps.vault.configDir, caseInsensitiveFs: deps.vault.caseInsensitive,
 					settings: deps.settings(), side: deps.sideFiles, crypto: await deps.keys.crypto(),
 				});
@@ -112,10 +108,6 @@ export class HostRuntime {
 				onEvent: (m) => this.onEngineEvent(m),
 				onRequest: (m) => this.onEngineRequest(m),
 				onReady: () => this.onReady(),
-				onDown: () => {
-					this.bindings.suspend();
-					this.reportCarrier();
-				},
 				onFatal: (e) => {
 					this.bindings.stop();
 					this.reportCarrier();
@@ -185,7 +177,7 @@ export class HostRuntime {
 			try {
 				await this.engine.request({ t: "observations", scanId, chunk, complete: i === chunks.length - 1 });
 			} catch {
-				return; // engine went away; the next onReady rescans
+				return; // engine stopped (unload or fatal)
 			}
 			this.stats.observationsSent += chunk.length;
 		}
@@ -209,7 +201,7 @@ export class HostRuntime {
 	}
 
 	private reportCarrier(): void {
-		this.deps.ui.onCarrier({ carrier: this.engine.carrierKind, ready: this.engine.isReady, fallbackReason: this.engine.lastFallbackReason });
+		this.deps.ui.onCarrier({ carrier: this.engine.carrierKind, ready: this.engine.isReady });
 	}
 
 	/** §i.4: hidden/pagehide/freeze flush synchronously before the OS may kill us. */

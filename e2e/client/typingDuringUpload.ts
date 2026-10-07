@@ -781,8 +781,8 @@ async function runVault(R: Report, kind: VaultKind, meter: MainMeter, vaults: On
 		const bFinal = await peer.call<PeerFinal>({ op: "final" });
 		const aProbe = (await thread.probe(false)).value;
 		const carriers = [...a.ui.carriers, ...bFinal.carriers];
-		R.check(`${kind}: both engines ran on the worker carrier (no inline fallback)`,
-			carriers.length > 0 && carriers.every((c) => c.carrier === "worker" && c.fallbackReason === null) && lastStatus(a)?.transport === "worker",
+		R.check(`${kind}: both engines ran on the worker carrier`,
+			carriers.length > 0 && carriers.every((c) => c.carrier === "worker") && lastStatus(a)?.transport === "worker",
 			{ a: a.ui.carriers, b: bFinal.carriers });
 		R.check(`${kind}: no fatal on either device`, a.ui.fatals.length === 0 && bFinal.fatals.length === 0, { a: a.ui.fatals.map((f) => f.code), b: bFinal.fatals });
 		R.check(`${kind}: a's runtime was not replaced while typing`, a.runtime === runtime && a.engineStarts === a.ui.carriers.length, { engineStarts: a.engineStarts });
