@@ -1,7 +1,8 @@
 /**
  * Sender unit tests (DESIGN §d.4-§d.6, §i.1, §i.6) with a fake clock and session:
  * lane/outbox order, ns/cfg send window, inflight byte cap, buffered high water,
- * token bucket, refusals, probe mode, STREAM_RESEND, backpressure, pause.
+ * token bucket, refusals, probe mode, STREAM_RESEND, backpressure, pause, a live
+ * create's body frames behind their ns create, the ns cork.
  */
 
 import assert from "node:assert/strict";
@@ -11,7 +12,7 @@ import { CFG_STREAM, NS_STREAM, type ClientFrameId, type StreamName } from "../.
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { AppendFrame, RelaySession } from "../../ports/relay";
 import type { OutboxRecord } from "../store/schema";
-import { BUFFERED_HIGH_WATER, DURABILITY_RETRY_MS, Sender, TokenBucket, type SendGate } from "./sender";
+import { BUFFERED_HIGH_WATER, DURABILITY_RETRY_MS, NS_CORK_MAX_MS, Sender, TokenBucket, type SendGate } from "./sender";
 
 class FakeClock implements ClockPort {
 	t = 1_000;
@@ -84,14 +85,17 @@ function mk(maxInflight = 10 * 1024 * 1024, sendGate?: SendGate) {
 	const clock = new FakeClock();
 	const ev = { sent: [] as [string, number][], poison: [] as [string, string][], forbidden: 0, daily: [] as number[], diag: [] as string[], reseal: [] as string[] };
 	const gate = { blocked: false, minEpoch: 0 };
+	/** The outbox as blockedBy sees it (EngineCtx.outbox): add() puts records in, tests take them out. */
+	const outbox = new Set<ClientFrameId>();
 	const sender = new Sender({
 		clock, rankOf: (r) => RANK[r.stream] ?? 3, maxInflightBytes: () => maxInflight,
 		onSent: (r, a) => ev.sent.push([r.clientFrameId, a]), onPoison: (r, why) => ev.poison.push([r.clientFrameId, why]),
 		onForbidden: () => ev.forbidden++, onDailyLimit: (ms) => ev.daily.push(ms), writeBlocked: () => gate.blocked, diag: (c) => ev.diag.push(c),
 		minSendEpoch: () => gate.minEpoch, reseal: (r) => ev.reseal.push(r.clientFrameId), gate: sendGate,
+		blockedBy: (r) => (r.dependsOn !== null && outbox.has(r.dependsOn) ? r.dependsOn : null),
 	});
-	const add = (...rs: OutboxRecord[]) => { for (const r of rs) sender.upsert(r); clock.advance(0); return rs; };
-	return { clock, ev, sender, add, gate };
+	const add = (...rs: OutboxRecord[]) => { for (const r of rs) { outbox.add(r.clientFrameId); sender.upsert(r); } clock.advance(0); return rs; };
+	return { clock, ev, sender, add, gate, outbox };
 }
 
 test("sender: lane rank then outbox order; ns waits for openNs; resend replays in the same order", () => {
@@ -389,4 +393,91 @@ test("sender: the blob gate holds a frame and the later frames of its stream; po
 	assert.deepEqual(s.ids().slice(1), [a1!.clientFrameId, a2!.clientFrameId]);
 	sender.remove(a1!.clientFrameId);
 	assert.deepEqual(calls.forgot, [a1!.clientFrameId]);
+});
+
+/** A live create's body frame (DESIGN §e.1): pending, dependsOn = its ns create. */
+const after = (create: OutboxRecord, stream: StreamName = BOUND, bytes = 10) => rec(stream, bytes, { dependsOn: create.clientFrameId });
+
+test("sender: a live create's body frames go right after their ns create, in the same pump, even from the bound lane", () => {
+	const { sender, add, clock } = mk();
+	const [other, created] = add(rec(BOUND), rec(NS_STREAM));
+	const [d1, d2] = add(after(created!), after(created!));
+	const s = new FakeSession();
+	sender.attach(s);
+	assert.deepEqual(s.ids(), [other!.clientFrameId], "before openNs the create cannot go, so neither can its body frames");
+	sender.openNs();
+	assert.deepEqual(s.ids().slice(1), [created, d1, d2].map((r) => r!.clientFrameId), "create first (lower seq), its body frames in the same pump");
+	sender.onResend();
+	clock.advance(0);
+	assert.deepEqual(s.ids().slice(4), [other, created, d1, d2].map((r) => r!.clientFrameId), "a resend keeps the create ahead of its body frames");
+	sender.detach();
+	const s2 = new FakeSession();
+	sender.attach(s2);
+	assert.deepEqual(s2.ids(), [other!.clientFrameId], "a new session: they wait for the create's resend again");
+	sender.openNs();
+	assert.deepEqual(s2.ids().slice(1), [created, d1, d2].map((r) => r!.clientFrameId));
+});
+
+test("sender: a body frame never overtakes its create: create outside the ns window, create not in the sender (held, poisoned), create receipted", () => {
+	const { sender, add, clock, outbox } = mk();
+	const full = add(...Array.from({ length: NS_SEND_WINDOW }, () => rec(NS_STREAM)));
+	const [create] = add(rec(NS_STREAM));
+	const [d1] = add(after(create!, BG));
+	const [later, free] = add(rec(BG), rec("d:other" as StreamName));
+	const s = new FakeSession();
+	sender.attach(s);
+	sender.openNs();
+	assert.equal(s.appends.length, NS_SEND_WINDOW + 1);
+	assert.ok(!s.ids().includes(create!.clientFrameId) && !s.ids().includes(d1!.clientFrameId), "create outside the window: its body frame waits");
+	assert.ok(!s.ids().includes(later!.clientFrameId), "so do the later frames of its stream (per-stream order)");
+	assert.ok(s.ids().includes(free!.clientFrameId), "a frame of another stream behind it does not wait");
+	sender.onReceipt(full[0]!.clientFrameId);
+	outbox.delete(full[0]!.clientFrameId);
+	clock.advance(0);
+	assert.deepEqual(s.ids().slice(-3), [create, d1, later].map((r) => r!.clientFrameId), "the window opens: create, then its body frame");
+
+	// A create in the outbox but not sendable (poisoned, held): the frame waits however long.
+	const ghost = rec(NS_STREAM);
+	outbox.add(ghost.clientFrameId);
+	const [d2] = add(after(ghost, BG));
+	clock.advance(60_000);
+	assert.ok(!s.ids().includes(d2!.clientFrameId));
+	// The create left the outbox (receipted, or deleted with its dependents' fate decided by the fold): the frame goes.
+	outbox.delete(ghost.clientFrameId);
+	sender.poke();
+	clock.advance(0);
+	assert.equal(s.ids().at(-1), d2!.clientFrameId);
+});
+
+test("sender: corkNs holds ns frames (not cfg, not bodies) until released or NS_CORK_MAX_MS; the release sends a create and its body frames together", () => {
+	const { sender, add, clock } = mk();
+	const s = new FakeSession();
+	sender.attach(s);
+	sender.openNs();
+	const uncork = sender.corkNs();
+	const [create, cfg, other] = add(rec(NS_STREAM), rec(CFG_STREAM), rec(BG));
+	clock.advance(0);
+	assert.deepEqual(s.ids(), [cfg, other].map((r) => r!.clientFrameId), "corked: only the ns frame waits");
+	const [d1, d2] = add(after(create!), after(create!));
+	clock.advance(0);
+	assert.equal(s.appends.length, 2, "its body frames wait with it");
+	uncork();
+	clock.advance(0);
+	assert.deepEqual(s.ids().slice(2), [create, d1, d2].map((r) => r!.clientFrameId), "one pump: create, then its body frames");
+	uncork(); // idempotent
+	const u1 = sender.corkNs();
+	const u2 = sender.corkNs();
+	const [n2] = add(rec(NS_STREAM));
+	u1();
+	clock.advance(0);
+	assert.ok(!s.ids().includes(n2!.clientFrameId), "every cork must be released");
+	clock.advance(NS_CORK_MAX_MS);
+	assert.equal(s.ids().at(-1), n2!.clientFrameId, "a cork lasts NS_CORK_MAX_MS at most");
+	u2();
+	const before = s.appends.length;
+	sender.detach();
+	const u3 = sender.corkNs();
+	u3();
+	clock.advance(NS_CORK_MAX_MS * 2);
+	assert.equal(s.appends.length, before, "a release while detached sends nothing");
 });

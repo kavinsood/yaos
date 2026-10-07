@@ -3,6 +3,9 @@
  *   - docs with an open intent are skipped entirely (intents.ts resolves them first);
  *   - rebinds run first, then every ns op goes to the log in ONE submitNs,
  *     except blob nsCreate / nsSetBlob, which wait for their pushBlob upload;
+ *   - live creates (Ctx.liveCreates, DESIGN §d.4): the ns frames are corked from the
+ *     submit until the last initial-content merge of those docs is framed, so each
+ *     create and its body frames reach the relay in one burst (one group commit);
  *   - a markdown / canvas nsCreate with content first gets a "born empty" synced
  *     record (contentHash = hash of empty content, bodyVersion of the empty body, no base), committed
  *     BEFORE the submit: the initial content is then an ordinary disk-only merge
@@ -131,14 +134,27 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		ns.push(nsOp);
 	}
 	if (born.length > 0) await ctx.commit({ syncedPut: born });
+	const live = new Set<DocId>();
+	if (ctx.liveCreates) for (const o of ns) if (o.t === "create" && o.kind !== "blob" && o.contentHash !== EMPTY_CONTENT_HASH) live.add(o.docId);
+	let lastLive = -1;
+	for (let j = i; j < ops.length; j++) {
+		const o = ops[j]!;
+		if (o.op === "reconcileContent" && live.has(o.docId)) lastLive = j;
+	}
+	// Released after the last of those merges (or by NS_CORK_MAX_MS if the run throws).
+	let uncork = lastLive >= 0 ? ctx.log.corkNs() : null;
 	if (ns.length > 0) {
-		await ctx.log.submitNs(ns);
+		await ctx.log.submitNs(ns, { liveCreates: ctx.liveCreates });
 		nsSubmitted += ns.length;
 		ok += ns.length;
 	}
 
 	const ahead = prefetcher(env, ops, blocked);
 	for (; i < ops.length; i++) {
+		if (uncork && i > lastLive) {
+			uncork();
+			uncork = null;
+		}
 		ahead.pump(i);
 		const op = ops[i]!;
 		if (op.op === "wait") {
@@ -159,6 +175,7 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		if (res === "ok" && op.op === "diskRename") vacated.push(op.from);
 		if (res === "ok" && op.op === "diskTrash") vacated.push(op.path);
 	}
+	uncork?.();
 	ahead.done();
 	env.deferred.clear();
 	await removeEmptied(env, vacated);

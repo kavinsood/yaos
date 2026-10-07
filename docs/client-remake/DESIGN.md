@@ -385,7 +385,7 @@ Results:
 
 **Identical duplicate creates** are the onboarding case: two devices import the same vault concurrently. Each
 identical file merges, so there are no conflict copies, no extra body rows (held initial body frames of merged docs
-are dropped, §e.2) and no disk ops. Only files that really differ are suffixed. When W was edited after its create,
+are dropped, §d.4: onboarding creates hold their frames, live ones do not) and no disk ops. Only files that really differ are suffixed. When W was edited after its create,
 the loser may still match W's *current* body; the planner's identical-loser collapse handles that (§c.13).
 
 ### c.6 rename
@@ -541,7 +541,8 @@ changes.
 
 - **E1, simple create.** A@4 seq 5 `create d1 md "Notes/a.md" h1`.
   - Result: `applied`; `d1 {live, "Notes/a.md", createdSeq 5, lastTouch 5}`; `folderRefs[notes] = {"Notes", 1}`.
-  - A then releases its held initial body frames for d1, and S1 sets `synced[d1].nsTouchSeq = 5`.
+  - During onboarding A then releases its held initial body frames for d1. A live create sent them with the create
+    (§d.4). S1 sets `synced[d1].nsTouchSeq = 5`.
 - **E2, collision suffix and casing.** B@4 seq 7 `create d2 md "notes/A.md" h2`.
   - The ancestor `notes` exists as `"Notes"`, so it is recased to `"Notes"`.
   - The leaf key `notes/a.md` is held by d1 and `h2 ∉ {h1}`, so the leaf is suffixed.
@@ -837,15 +838,48 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   - Alternative: one `T_edit` per `bodyPush`. Rejected: about 60 IDB transactions per second while typing.
 - **Initial content of a new markdown/canvas doc** (planner `nsCreate` + `reconcileContent`, or the first bind):
   - inserted in `INITIAL_INSERT_CHUNK_CHARS` transactions, one frame each, flag `initial`;
-  - every initial frame is `held` with `dependsOn` = the ns create frame, and released when that create folds as
-    `applied` / `suffixed`;
-  - if it folds as `merged`, the held frames are deleted, and the doc is rebound to the winner (§c.13);
-  - if it folds as `duplicate-docid`, which cannot happen with fresh random ids, the frames are deleted and the file
-    is re-planned.
-  - Alternative: send body frames before the create commits. Rejected: wasted rows, and junk streams for merged
-    duplicates during onboarding.
+  - every frame of the doc built before its create folds carries `dependsOn` = the ns create frame
+    (`Ctx.pendingCreates`, docRuntime closeFrame).
+- **Live creates** (every pass after the reconciler's first full pass with ns ready and the local scan complete,
+  `Ctx.liveCreates`, reconciler.ts:191):
+  - the frames are `pending`, not `held` (frames.ts `sendAfter`);
+  - the pass corks the ns stream (`Sender.corkNs`, at most `NS_CORK_MAX_MS` = 2 s) from `submitNs` until the last
+    `reconcileContent` of the docs it created (runner.ts), so the creates and their body frames reach the relay
+    back to back and normally land in one group commit. Without the cork the create goes out alone on the next
+    tick, takes the leading-edge commit, and the body waits `minIntervalMs` for the next one;
+  - the sender never puts a frame on the wire before its create (`blockedBy`, sender.ts pump). While the create is in
+    the outbox, its body frame waits until the create is inflight on the same session, and holds the stream's later
+    frames behind it. This applies to resends after a reconnect too. In the lane order, a frame ranks no earlier
+    than its create.
+- **Onboarding** (the passes before that, against a remote that may already hold the same files; and the first full
+  pass after every engine start): the frames are `held` and are released when the create folds `applied` /
+  `suffixed`. Identical concurrent imports merge (§c.5), and holding keeps them at zero body rows. A restart also
+  turns un-folded live creates back into held ones: `pendingCreates` is rebuilt from the outbox with `live: false`
+  (engine.ts:203), so frames built after the restart are held.
+- **Create folds `merged`** (nsRuntime.reconcileHeld):
+  - its held, pending and sent-but-unreceipted frames are deleted, and the doc is rebound to the winner (§c.13);
+  - the winner already has the create's content (a merge needs the same create hash, place.ts). Edits made after
+    the create reach the winner from disk, through the rebind's merge from the winner's create (`restartAtCreate`);
+  - frames the relay already committed (sent with the create, or in flight when the merge was seen) stay as junk
+    rows on the loser's stream;
+  - no device materializes those rows: the planner projects only live entries and follows `aliasOf`, and open
+    docs, `diskMaterialize` and `acquireBody` are keyed by `docStream(kind, docId)` of the entry they act on. Rows of
+    a docId the fold does not know are stored in the tail and never applied.
+- **Create ignored as `duplicate-docid`**: this needs a docId collision, and every `nsCreate` takes 16 fresh random
+  bytes (`Reconciler.freshIds`). If it did happen, the frames go to that doc like any edit of it: held frames are
+  released, pending ones stay pending. The file stays bound to that doc, so devices converge on one doc with both
+  texts. Earlier text here said "deleted and re-planned"; nothing implemented that.
+- **Create ignored as `invalid-path` / `kind-mismatch`** (the planner checks paths first): a live create's frames are
+  sent anyway, as rows on a stream with no entry.
+- **Trade-off.** A live create costs one commit cycle to peers instead of two: a lone create rides the leading-edge
+  commit with its body, and sustained creates pace at one `minIntervalMs` instead of two. The price is junk rows
+  on the loser's stream when a create folds merged outside onboarding, i.e. two devices creating the same path with
+  the same content within one round trip. The cork also delays the pass's other ns ops by up to the time it takes
+  to frame the new bodies, capped at 2 s.
+- **Alternative:** hold every create's frames until it folds, the earlier rule. Rejected for live creates: every
+  create→peer takes two group commits. Kept for onboarding, where merged duplicates are the common case.
 - **Sender.**
-  - Picks `pending` records by lane (§i.1), then by `order`.
+  - Picks `pending` records by lane (§i.1), then by `order`. A live create's body frame waits for its create (above).
   - Respects all of: the token bucket (`APPEND_BYTES_PER_SEC`, burst ≤ `limits.burstBytes`), `maxInflightAppendBytes`
     of sent-unreceipted bytes, `session.bufferedBytes()`, and the ns/cfg send window (§c.3).
   - Record state `sent` is persisted lazily and only for diagnostics. After any restart, `pending` and `sent` are both
@@ -1142,10 +1176,14 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | `blobQueue` | `hash` | `byActiveDue [active, nextAttemptAtMs]` | `BlobQueueRecord` | 1 per pending transfer |
 
 - **`dependsOn` rule.** A `held` record waits for one of three things:
-  - the doc's ns create (released when it folds);
+  - the doc's ns create, during onboarding (released when it folds, §d.4);
   - the newest adoptable of the stream (released when that record is gone);
   - the last `x:` chunk of a `bodyUpdateRef` (released when no own `x:` frame of that stream remains).
   - Releasing a record means `held → pending` in the same transaction that removes the dependency.
+- **`pending` with `dependsOn`** is a live create's body frame (§d.4). It is sent only after that create: while the
+  create is in the outbox, the frame goes only once the create is inflight on the same session. It is deleted when
+  the create folds `merged`. When the create's record is replaced under a new `clientFrameId` (own stale-epoch copy,
+  repo.ts `rename`), the frame is re-pointed like a held one.
 - **IDB booleans.** `stale`, `frozen` and `active` are `0 | 1` because IDB cannot index booleans.
 
 ### e.2 Transactions

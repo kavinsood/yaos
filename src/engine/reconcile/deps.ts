@@ -77,13 +77,26 @@ export interface BodyHandle {
 	release(): void;
 }
 
+export interface SubmitNsOptions {
+	/**
+	 * The creates are live (DESIGN §d.4): their body frames are sent right after them, not held until they fold.
+	 * false for onboarding / the first full pass after start, where same-path creates of other devices are likely.
+	 */
+	readonly liveCreates?: boolean;
+}
+
 export interface LogPort {
 	view(): RemoteView;
 	/**
 	 * Hand ns ops to the ns runtime: framed (<= MAX_NS_OPS_PER_FRAME), put in the
 	 * outbox (T_edit) and reflected in the optimistic overlay before resolving.
 	 */
-	submitNs(ops: readonly NsOp[]): Promise<void>;
+	submitNs(ops: readonly NsOp[], opts?: SubmitNsOptions): Promise<void>;
+	/**
+	 * Hold own ns frames back from the wire until the returned release (idempotent), at most NS_CORK_MAX_MS:
+	 * a pass's live creates then leave with their initial body frames (DESIGN §d.4).
+	 */
+	corkNs(): () => void;
 	/** Load (or pin) the worker replica. null = the doc has no body stream (unknown / blob). */
 	acquireBody(docId: DocId, kind: "markdown" | "canvas"): Promise<BodyHandle | null>;
 }

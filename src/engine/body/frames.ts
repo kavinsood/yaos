@@ -65,6 +65,11 @@ export interface BodyFrameInput {
 	readonly authorNsSeq: Seq;
 	/** Held dependency (ns create or newest adoptable); null = pending. */
 	readonly dependsOn: ClientFrameId | null;
+	/**
+	 * dependsOn is a live ns create (DESIGN §e.1): the frame is pending, not held, and the sender sends it only
+	 * after the create (Sender blockedBy).
+	 */
+	readonly sendAfter?: boolean;
 	readonly nowMs: number;
 }
 
@@ -72,7 +77,7 @@ export interface BodyFrameInput {
 export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Promise<NewOutboxFrame[]> {
 	const cls = streamClass(input.stream);
 	const kind: EnvelopeKind = cls === "canvas" ? "canvasUpdate" : "bodyUpdate";
-	const state = input.dependsOn ? "held" : "pending";
+	const state = input.dependsOn && !input.sendAfter ? "held" : "pending";
 	if (input.content.length <= MAX_INLINE_UPDATE_BYTES) {
 		return [await seal(ctx, input.stream, kind, input.authorNsSeq, input.flags, 0, input.content, input.content, state, input.dependsOn, input.nowMs)];
 	}

@@ -187,6 +187,8 @@ export class Reconciler {
 		if (ctx.localComplete && view.nsReady) {
 			const used = new Set(renames);
 			ctx.renames = ctx.renames.filter((r) => !used.has(r));
+			// Onboarding / the first pass after start has planned its creates with the hold: later creates are live.
+			if (scope.t === "full") ctx.liveCreates = true;
 		}
 		let brake = plan.brake;
 		if (this.env.heldOverwrites.length > 0) {

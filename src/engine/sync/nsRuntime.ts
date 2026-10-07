@@ -8,7 +8,11 @@
  * reconcileHeld() is state-based so it is crash-safe: a held record whose
  * dependency record is gone is released when the fold has its doc (live /
  * deleted), deleted when the doc was merged away, and waits while the doc is
- * absent (create not folded yet).
+ * absent (create not folded yet). A live create's body frames (pending / sent,
+ * dependsOn = the create, DESIGN §e.1) are deleted once their create folded
+ * merged away; the ones the relay already committed are junk rows on the
+ * loser's stream, which nobody materializes (§d.4). Otherwise they stay
+ * pending, like released held frames.
  */
 
 import { CheckpointEncoding } from "../../core/envelope";
@@ -123,11 +127,13 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	reconcileHeld(outbox: OutboxCache): OutboxChange[] {
 		const changes: OutboxChange[] = [];
 		for (const r of outbox.values()) {
-			if (r.state !== "held" || !r.dependsOn || outbox.has(r.dependsOn)) continue;
+			if (!r.dependsOn || outbox.has(r.dependsOn)) continue;
+			const held = r.state === "held";
+			if (!held && r.state !== "pending" && r.state !== "sent") continue;
 			const cls = streamClass(r.stream);
 			const docId = cls === "body" || cls === "canvas" ? streamDocId(r.stream) : null;
 			if (!docId) {
-				changes.push({ t: "release", clientFrameId: r.clientFrameId });
+				if (held) changes.push({ t: "release", clientFrameId: r.clientFrameId });
 				continue;
 			}
 			const e = this.state.entries.get(docId);
@@ -136,6 +142,7 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 				changes.push({ t: "delete", clientFrameId: r.clientFrameId });
 				continue;
 			}
+			if (!held) continue; // a live create's body frame (DESIGN §e.1): already pending
 			if (r.kind === "bodyUpdateRef") {
 				const chunk = outbox.lastChunkBefore(r.order);
 				if (chunk) {

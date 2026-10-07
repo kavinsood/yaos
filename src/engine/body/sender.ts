@@ -22,6 +22,13 @@
  *    it. Bodies are CRDT updates and do not wait.
  *  - the blob gate (blobs/touch.ts, e2ee-design §10.4 R3): a frame it holds also
  *    holds the later frames of its stream for that pass.
+ *  - a live create's body frames (pending, dependsOn = the ns create, DESIGN §e.1)
+ *    sort at the create's rank or later and go only once the create is in flight
+ *    on this session, so they never overtake it on the wire (lower seq) and
+ *    normally ride the same append burst, hence the same group commit.
+ *  - corkNs(): ns frames wait while a reconcile pass frames the initial bodies of
+ *    the docs it just created (at most NS_CORK_MAX_MS), so the creates and their
+ *    bodies leave together.
  */
 
 import { APPEND_BYTES_PER_SEC, NS_SEND_WINDOW, RELAY_CLOSE } from "../../core/limits";
@@ -33,6 +40,8 @@ import type { OutboxRecord } from "../store/schema";
 export const BUFFERED_HIGH_WATER = 256 * 1024;
 export const BACKPRESSURE_SLOWDOWN_MS = 10 * 60_000;
 export const DURABILITY_RETRY_MS = 1_000;
+/** Longest an ns cork holds (a pass stuck on a disk read must not hold renames and deletes). */
+export const NS_CORK_MAX_MS = 2_000;
 const MAX_BURST = 1024 * 1024;
 
 export interface SenderDeps {
@@ -55,6 +64,11 @@ export interface SenderDeps {
 	diag(code: string, fields: Record<string, string | number | boolean | null>): void;
 	/** Per-frame send gate (blobs/touch.ts BlobTouch); poke() when a held frame may go. */
 	readonly gate?: SendGate;
+	/**
+	 * The record `rec` must follow on the wire, or null: a live create's body frame names its ns create while that
+	 * create is in the outbox (DESIGN §e.1). The frame waits until that record is in flight on this session.
+	 */
+	blockedBy(rec: OutboxRecord): ClientFrameId | null;
 }
 
 export interface SendGate {
@@ -121,6 +135,7 @@ export class Sender {
 	private timerAt = Infinity;
 	private dirty = true;
 	private sorted: Entry[] = [];
+	private readonly corks = new Set<object>();
 	readonly bucket: TokenBucket;
 	stats = { appends: 0, bytes: 0, poisoned: 0 };
 
@@ -282,6 +297,22 @@ export class Sender {
 		this.schedule(0);
 	}
 
+	/**
+	 * Hold ns frames until the returned release (idempotent) or NS_CORK_MAX_MS. A reconcile pass corks around its
+	 * creates and their initial body frames, so both go in one append burst (DESIGN §d.4).
+	 */
+	corkNs(maxMs = NS_CORK_MAX_MS): () => void {
+		const token = {};
+		this.corks.add(token);
+		const release = (): void => {
+			if (!this.corks.delete(token)) return;
+			this.deps.clock.clearTimer(timer);
+			this.schedule(0);
+		};
+		const timer = this.deps.clock.setTimer(maxMs, release);
+		return release;
+	}
+
 	private clearTimer(): void {
 		if (this.timer !== null) this.deps.clock.clearTimer(this.timer);
 		this.timer = null;
@@ -301,9 +332,18 @@ export class Sender {
 		});
 	}
 
+	/** Lane rank, then outbox order. A frame waiting for another record sorts at that record's rank or later. */
 	private order(): Entry[] {
 		if (this.dirty) {
-			this.sorted = [...this.entries.values()].sort((a, b) => this.deps.rankOf(a.rec) - this.deps.rankOf(b.rec) || a.rec.order - b.rec.order);
+			const own = new Map<ClientFrameId, number>();
+			for (const e of this.entries.values()) own.set(e.rec.clientFrameId, this.deps.rankOf(e.rec));
+			const rank = new Map<Entry, number>();
+			for (const e of this.entries.values()) {
+				const r = own.get(e.rec.clientFrameId)!;
+				const dep = e.rec.dependsOn === null ? undefined : own.get(e.rec.dependsOn);
+				rank.set(e, dep === undefined ? r : Math.max(r, dep));
+			}
+			this.sorted = [...this.entries.values()].sort((a, b) => rank.get(a)! - rank.get(b)! || a.rec.order - b.rec.order);
 			this.dirty = false;
 		}
 		return this.sorted;
@@ -354,12 +394,17 @@ export class Sender {
 				continue;
 			}
 			if (this.probe && this.inflight.size > 0) break;
-			if (isNs && (!this.nsOpen || !nsWindow.has(cfid))) continue;
+			if (isNs && (!this.nsOpen || !nsWindow.has(cfid) || (this.corks.size > 0 && e.rec.stream === NS_STREAM))) continue;
 			if (e.retryAtMono > now) {
 				nextWake = Math.min(nextWake, e.retryAtMono - now);
 				continue;
 			}
 			if (held.has(e.rec.stream)) continue;
+			const dep = e.rec.dependsOn === null ? null : this.deps.blockedBy(e.rec);
+			if (dep !== null && !this.inflight.has(dep)) {
+				held.add(e.rec.stream);
+				continue;
+			}
 			// After the ns window check: an ns/cfg record is re-sealed under its own id only once the late-receipt reads ran.
 			if (belowFloor) {
 				this.deps.reseal(e.rec);

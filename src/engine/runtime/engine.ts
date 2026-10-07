@@ -180,6 +180,7 @@ export class LogEngine {
 			},
 			diag: (code, f) => c.diag(code, f),
 			gate: c.touch,
+			blockedBy: (rec) => (rec.dependsOn !== null && c.outbox.has(rec.dependsOn) ? rec.dependsOn : null),
 		});
 		c.live = new LiveIngest(c);
 		c.sess = new SessionLoop(c);
@@ -198,7 +199,8 @@ export class LogEngine {
 			if (r.state === "adoptable") c.registerAdopt(r);
 			else c.sender.upsert(r);
 			if (r.stream === NS_STREAM && r.state !== "poisoned") {
-				for (const op of decodeNsOps(r.content) ?? []) if (op.t === "create") c.pendingCreates.set(op.docId, r.clientFrameId);
+				// After a restart a create's later body frames are held until its fold (§e.1).
+				for (const op of decodeNsOps(r.content) ?? []) if (op.t === "create") c.pendingCreates.set(op.docId, { cfid: r.clientFrameId, live: false });
 			}
 		}
 		c.mirror.scheduleIfBehind(c.outbox.all());
@@ -272,10 +274,18 @@ export class LogEngine {
 
 	// ------------------------------------------------------------ ns / cfg
 
-	/** Own ns ops -> frames (<= MAX_NS_OPS_PER_FRAME) in the outbox; resolves once committed (in nsView()). */
-	async submitNs(ops: readonly NsOp[]): Promise<ClientFrameId[]> {
+	/**
+	 * Own ns ops -> frames (<= MAX_NS_OPS_PER_FRAME) in the outbox; resolves once committed (in nsView()).
+	 * `liveCreates`: the creates' body frames go right after them instead of waiting for their fold (DESIGN §d.4).
+	 */
+	async submitNs(ops: readonly NsOp[], opts?: { readonly liveCreates?: boolean }): Promise<ClientFrameId[]> {
 		this.c.assertWritable();
-		return api.submitNs(this.c, ops);
+		return api.submitNs(this.c, ops, undefined, opts?.liveCreates === true);
+	}
+
+	/** Hold ns frames until the returned release or NS_CORK_MAX_MS (Sender.corkNs, DESIGN §d.4). */
+	corkNs(): () => void {
+		return this.c.sender.corkNs();
 	}
 
 	/** Committed fold + own pending ns frames (§f.1). */
