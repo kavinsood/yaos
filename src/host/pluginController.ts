@@ -11,6 +11,7 @@
  */
 
 import { isVaultId } from "../core/codec/ids";
+import { hexToBytes } from "../core/codec/lib0";
 import type { BrakeReport, DeviceId, VaultId } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { EngineResultValue, EngineSettings, UserCommand } from "../protocol/messages";
@@ -20,10 +21,10 @@ import type { HostRuntime, HostUiSink } from "./hostRuntime";
 import { createHostKeys, type HostKeys } from "./keys/hostKeys";
 import {
 	isCreating, markedCreating, pinAcross, pinnedSuite0, pinnedSuite1, pinsFromKeyring, refuseEnableE2ee, refuseKeyCommand,
-	refusePinSuite0, sawKeyring, PIN_REFUSAL_TEXT, type PinRefusal,
+	refusePinSuite0, sawKeyring, withoutCreating, PIN_REFUSAL_TEXT, type PinRefusal,
 } from "./keys/pin";
 import { plaintextNoticeOnce, type PlaintextNoticeEnv } from "./keys/plaintextNotice";
-import { VaultKeyStore, type SecretStorageLike } from "./keys/secretStore";
+import { VaultKeyStore, type EpochKey, type SecretStorageLike } from "./keys/secretStore";
 import type { HostIdentity } from "./runtimeSupport";
 import { sameEngineSettings, sameIdentity, type EngineRunState, type PairedIdentity, type YaosPluginData } from "./ui/api";
 
@@ -345,6 +346,57 @@ export class YaosController {
 	async markCreating(vaultId: string): Promise<void> {
 		if (!isVaultId(vaultId)) throw new TypeError("not a vault id");
 		await this.savePin(markedCreating(this.current, vaultId, this.current.identity?.vaultId ?? null));
+	}
+
+	/**
+	 * §15.1: the creation of `vaultId` failed its step-3 check (the vault was not empty). The marker goes and no pin is
+	 * set, so the device stays unpinned and blocked (§12.4). The engine restarts without `creating`.
+	 */
+	async abandonCreating(vaultId: string): Promise<void> {
+		const next = withoutCreating(this.current, vaultId);
+		if (next === this.current) return;
+		await this.savePin(next);
+		if (this.current.identity?.vaultId === vaultId) this.requestRestart();
+	}
+
+	/**
+	 * The 3-byte recovery-key checksum of a 32-byte secret, first 3 bytes of SHA-256 (§13.1), hashed by the engine
+	 * (main never hashes). `secret` is not changed: a copy is transferred and wiped. Needs an initialized engine.
+	 */
+	async rkChecksum(secret: Uint8Array): Promise<Uint8Array> {
+		const rt = this.runtime;
+		if (!rt || secret.length !== 32) throw new Error("YAOS is not running.");
+		const bytes = secret.slice();
+		let r: Awaited<ReturnType<HostRuntime["engine"]["request"]>>;
+		try {
+			r = await rt.engine.request({ t: "hashRequest", items: [{ path: "recovery-key", want: "fingerprint", bytes }] });
+		} catch (e) {
+			throw new Error(safeMessage(e));
+		} finally {
+			if (bytes.byteLength > 0) bytes.fill(0); // empty once transferred (detached)
+		}
+		const hash = r.t === "hashes" && r.values.length === 1 ? r.values[0]!.hash : "";
+		if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error("YAOS: the engine returned no checksum.");
+		return hexToBytes(hash.slice(0, 6));
+	}
+
+	/**
+	 * SECRET: the key a pairing or re-key QR carries (§12.1, §14.2 step 3): the stored key of the epoch this device
+	 * seals under, as a fresh copy the caller zero-fills. Null unless the device is pinned to suite 1, the engine
+	 * reports the key usable (keyMissing null) and the store holds that epoch.
+	 */
+	vaultKeyForQr(): EpochKey | null {
+		const identity = this.current.identity;
+		const e2ee = this.snapshot?.e2ee;
+		if (!identity || this.current.e2ee?.suite !== 1 || !e2ee || e2ee.suite !== 1 || e2ee.keyMissing !== null || e2ee.sealEpoch < 1) return null;
+		const stored = this.keyStoreFor(identity.vaultId)?.load() ?? null;
+		if (!stored) return null;
+		let out: EpochKey | null = null;
+		for (const key of stored.keys) {
+			if (key.e === e2ee.sealEpoch && key.k.length === 32 && !out) out = { e: key.e, k: key.k.slice() };
+			key.k.fill(0);
+		}
+		return out;
 	}
 
 	/** Persist, then apply: identity/label change restarts (or stops); engine settings go live. */

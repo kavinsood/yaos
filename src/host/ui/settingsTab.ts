@@ -13,6 +13,7 @@ import {
 } from "obsidian";
 import { MAX_KEEP_DAILY, pendingBrake, type YaosUiHost } from "./api";
 import { brakeHeadline } from "./brake";
+import { canFinishCreating, canRekey, isKeyMissing } from "./commands";
 import { confirmAction } from "./confirmModal";
 import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
@@ -27,6 +28,11 @@ import type { UserCommand } from "../../protocol/messages";
 export interface SettingsTabActions {
 	openPair(): void;
 	openPairAnother(): void;
+	openCreateVault(): void;
+	openResumeCreation(): void;
+	openKeyMissing(): void;
+	openRekeyQr(): void;
+	openRevokeRekey(): void;
 	openBrake(): void;
 	openSnapshots(): void;
 	exportDiagnostics(): void;
@@ -106,14 +112,19 @@ export class YaosSettingTab extends PluginSettingTab {
 				action: () => this.actions.openPair(),
 			},
 			{
+				name: "Create a new vault",
+				desc: "Create an empty vault on your server (setting up a new server first) and pair this device with it. Only a new vault can choose end-to-end encryption.",
+				action: () => this.actions.openCreateVault(),
+			},
+			{
 				name: "Pair another device",
-				desc: "Create a one-time code and setup link for your other device.",
+				desc: "Create a one-time code, and on request a QR code with the vault key, for your other device.",
 				visible: paired,
 				action: () => this.actions.openPairAnother(),
 			},
 			{
 				name: "Open server console",
-				desc: "Open your server's console in a browser to see this vault's devices. The operator key stays in the console.",
+				desc: "Open your server's console in a browser to see this vault's devices. The operator key stays in the console; only \"Create a new vault\" asks for it here, and uses it once.",
 				visible: paired,
 				action: () => this.openServerConsole(),
 			},
@@ -124,6 +135,35 @@ export class YaosSettingTab extends PluginSettingTab {
 				action: () => { void this.unpair(); },
 			},
 		];
+
+		// Actions only: the encryption state itself is not shown as a row (the status bar says when a key is missing).
+		const encryptionItems: SettingGroupItem[] = [
+			{
+				name: "Finish creating this vault",
+				desc: "Check that the new vault is empty, then choose its encryption.",
+				visible: () => canFinishCreating(this.host),
+				action: () => this.actions.openResumeCreation(),
+			},
+			{
+				name: "Enter recovery key or scan a QR code",
+				desc: "This device does not have the vault key yet, so it does not sync.",
+				visible: () => isKeyMissing(this.host),
+				action: () => this.actions.openKeyMissing(),
+			},
+			{
+				name: "Show re-key QR",
+				desc: "A QR code with the vault's current key, for one of your devices that lost it or missed a re-key.",
+				visible: () => canRekey(this.host),
+				action: () => this.actions.openRekeyQr(),
+			},
+			{
+				name: "Re-key after revoking a device",
+				desc: "After you removed a device in the server console: make a new vault key that it never gets.",
+				visible: () => canRekey(this.host),
+				action: () => this.actions.openRevokeRekey(),
+			},
+		];
+		const encryptionVisible = (): boolean => canFinishCreating(this.host) || isKeyMissing(this.host) || canRekey(this.host);
 
 		const statusItems: SettingGroupItem[] = [
 			this.liveRow("Sync engine", () => linesFragment(
@@ -291,6 +331,7 @@ export class YaosSettingTab extends PluginSettingTab {
 
 		return [
 			{ type: "group", heading: "Connection", items: connectionItems },
+			{ type: "group", heading: "Encryption", items: encryptionItems, visible: encryptionVisible },
 			{ type: "group", heading: "Status", items: statusItems },
 			{ type: "group", heading: "This device", items: deviceItems },
 			{ type: "group", heading: "Sync", items: syncItems },
@@ -451,6 +492,9 @@ export class YaosSettingTab extends PluginSettingTab {
 			engineAcceptsCommands(run),
 			this.host.data().engine.syncAttachments,
 			this.host.data().engine.snapshots.enabled,
+			canFinishCreating(this.host),
+			isKeyMissing(this.host),
+			canRekey(this.host),
 		].join("|");
 	}
 

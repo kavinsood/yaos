@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	isCreating, keyringSeenOf, markedCreating, pinAcross, pinnedSuite, pinnedSuite0, pinnedSuite1, pinsFromKeyring, refuseEnableE2ee,
-	refuseKeyCommand, refusePinSuite0, sanitizeCreating, sanitizePin, sawKeyring, withoutPin, PIN_REFUSAL_TEXT, type PinFields,
+	refuseKeyCommand, refusePinSuite0, sanitizeCreating, sanitizePin, sawKeyring, withoutCreating, withoutPin, PIN_REFUSAL_TEXT,
+	type PinFields,
 } from "./pin";
 import { sanitizePluginData } from "../ui/api";
 import { BAD_VAULT_IDS, testVaultId } from "./testkit/vaultIds";
@@ -91,6 +92,15 @@ test("keyringSeen is sticky and only set while absent", () => {
 	assert.equal(sawKeyring(S0), S0);
 	assert.equal(sawKeyring(S1), S1);
 	assert.equal(refusePinSuite0(sawKeyring(ABSENT), V, "link"), "keyring-seen");
+});
+
+test("withoutCreating: an aborted creation drops only its own marker and never touches the pin", () => {
+	const creating = markedCreating(ABSENT, V, null);
+	assert.deepEqual(withoutCreating(creating, V), {});
+	assert.equal(isCreating(withoutCreating(creating, V), V), false, "no resume as a creation after the abort");
+	assert.equal(withoutCreating(creating, W), creating, "another vault's marker stays");
+	assert.deepEqual(withoutCreating({ ...SEEN, creating: { vaultId: V } }, V), SEEN);
+	assert.equal(withoutCreating(S1, V), S1);
 });
 
 test("leaving the vault drops pin and marker", () => {

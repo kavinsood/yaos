@@ -5,13 +5,17 @@ import {
 	FENCE_RETRY_DELAYS_MS, generateDeviceId, generateDeviceToken, generateEnrollmentRequestId, normalizeHost,
 	normalizePairingCode, PairingError, parseSetupLink, prepareEnrollment, requestPairingCode, runEnrollment,
 	attemptMatches, pairDevice, retireDeviceEnrollment, RETIRE_FAILED_MESSAGE, scrubSecrets,
-	type HttpRequest, type HttpResponse, type PairingDeps,
+	buildRekeyLink, claimServer, decodeKeyParam, encodeKeyParam, generateOperatorKey, normalizeOperatorKey, operatorCreateVault,
+	operatorLogin, operatorLogout, pairingCodeVaultId,
+	type HttpRequest, type HttpResponse, type LinkKey, type PairingDeps,
 } from "./pairing";
 import type { PairedIdentity } from "./api";
 import { BAD_VAULT_IDS, testVaultId } from "../keys/testkit/vaultIds";
 
 const CODE = "pc_ABCDEFGHIJKLMNOPQRSTUVWX";
 const VAULT = testVaultId("vaultOne");
+/** A code as the server mints it, `<vaultId>.<secret>` (DECISIONS D3). */
+const VCODE = `${VAULT}.pcSecretPcSecretPcSecret01`;
 
 function counterBytes(): (n: number) => Uint8Array {
 	let k = 0;
@@ -277,6 +281,9 @@ test("fetchCapabilities requires streams === 1 and a claimed server", async () =
 	await assert.rejects(fetchCapabilities("https://sync.example.com", v2.deps), (e: unknown) => e instanceof PairingError && e.code === "no_streams");
 	const unclaimed = fake([{ status: 200, json: { claimed: false, streams: 1 } }]);
 	await assert.rejects(fetchCapabilities("https://sync.example.com", unclaimed.deps), (e: unknown) => e instanceof PairingError && e.code === "unclaimed");
+	// Only "Create a new vault" accepts an unclaimed server (§15.1 step 1 claims it).
+	const unclaimedOk = fake([{ status: 200, json: { claimed: false, streams: 1 } }]);
+	assert.equal((await fetchCapabilities("https://sync.example.com", unclaimedOk.deps, { allowUnclaimed: true })).claimed, false);
 	const nf = fake([{ status: 404, json: null }]);
 	await assert.rejects(fetchCapabilities("https://sync.example.com", nf.deps), (e: unknown) => e instanceof PairingError && e.code === "not_found");
 });
@@ -300,27 +307,33 @@ const IDENTITY: PairedIdentity = {
 	vaultGeneration: "gen-7",
 };
 
-test("requestPairingCode sends Bearer + purpose device and builds the setup link", async () => {
-	const f = fake([{ status: 200, json: { codeId: "c1", pairingCode: CODE, expiresAt: 1_700_000_900_000, purpose: "device-link", mobileSetupUrl: `https://sync.example.com/mobile-setup#x` } }]);
+test("requestPairingCode sends Bearer + purpose device; the grant is the code and its expiry only (no server-drawn page)", async () => {
+	const f = fake([{ status: 200, json: { codeId: "c1", pairingCode: VCODE, expiresAt: 1_700_000_900_000, purpose: "device-link", mobileSetupUrl: `https://sync.example.com/mobile-setup#x` } }]);
 	const grant = await requestPairingCode(IDENTITY, f.deps);
 	const call = f.calls[0]!;
 	assert.equal(call.url, `https://sync.example.com/vault/${VAULT}/auth/pairing-code`);
 	assert.equal(call.method, "POST");
 	assert.equal(call.headers?.Authorization, `Bearer ${IDENTITY.deviceToken}`);
 	assert.deepEqual(JSON.parse(call.body ?? ""), { purpose: "device" });
-	assert.equal(grant.pairingCode, CODE);
-	assert.equal(grant.expiresAt, 1_700_000_900_000);
-	assert.equal(grant.mobileSetupUrl, "https://sync.example.com/mobile-setup#x");
-	assert.equal(grant.setupLink, `obsidian://yaos?action=setup&host=https%3A%2F%2Fsync.example.com&pairingCode=${CODE}`);
-	const parsed = parseSetupLink(Object.fromEntries(new URL(grant.setupLink).searchParams));
-	assert.deepEqual(parsed, { ok: true, host: "https://sync.example.com", pairingCode: CODE });
+	// §12.1: the server's mobileSetupUrl is dropped; the plugin draws its own QR with the key.
+	assert.deepEqual(grant, { pairingCode: VCODE, expiresAt: 1_700_000_900_000 });
 });
 
-test("requestPairingCode: missing expiry defaults to 15 min, foreign mobile URL dropped", async () => {
-	const f = fake([{ status: 200, json: { pairingCode: CODE, mobileSetupUrl: "https://evil.example.com/x" } }]);
+test("requestPairingCode: missing expiry defaults to 15 min", async () => {
+	const f = fake([{ status: 200, json: { pairingCode: VCODE, mobileSetupUrl: "https://evil.example.com/x" } }]);
 	const grant = await requestPairingCode(IDENTITY, { ...f.deps, nowMs: () => 1000 });
-	assert.equal(grant.expiresAt, 1000 + 15 * 60 * 1000);
-	assert.equal(grant.mobileSetupUrl, null);
+	assert.deepEqual(grant, { pairingCode: VCODE, expiresAt: 1000 + 15 * 60 * 1000 });
+});
+
+test("requestPairingCode: a code that names another vault, or none, is refused (D3)", async () => {
+	for (const code of [`${testVaultId("other")}.pcSecretPcSecretPcSecret01`, CODE]) {
+		const f = fake([{ status: 200, json: { pairingCode: code } }]);
+		await assert.rejects(requestPairingCode(IDENTITY, f.deps), (e: unknown) => {
+			assert.ok(e instanceof PairingError && e.code === "code_response_invalid");
+			assert.ok(!e.message.includes(code));
+			return true;
+		});
+	}
 });
 
 test("requestPairingCode: error mapping never echoes the token", async () => {
@@ -373,9 +386,14 @@ test("retireDeviceEnrollment: other statuses and network errors give the console
 	assert.equal(bad.calls.length, 0, "no request to a non-https host");
 });
 
-test("parseSetupLink accepts host + pairing code only", () => {
-	assert.deepEqual(parseSetupLink({ action: "yaos", host: "https://sync.example.com/", pairingCode: CODE }), { ok: true, host: "https://sync.example.com", pairingCode: CODE });
-	assert.deepEqual(parseSetupLink({ action: "setup", host: "sync.example.com", pairingCode: CODE, vault: "Notes" }), { ok: true, host: "https://sync.example.com", pairingCode: CODE });
+test("parseSetupLink accepts host + pairing code, with at most one of key and suite=0", () => {
+	assert.deepEqual(parseSetupLink({ action: "yaos", host: "https://sync.example.com/", pairingCode: CODE }), { ok: true, kind: "setup", host: "https://sync.example.com", pairingCode: CODE, e2ee: null });
+	assert.deepEqual(parseSetupLink({ action: "setup", host: "sync.example.com", pairingCode: CODE, vault: "Notes" }), { ok: true, kind: "setup", host: "https://sync.example.com", pairingCode: CODE, e2ee: null });
+	assert.deepEqual(parseSetupLink({ action: "setup", host: "https://sync.example.com", pairingCode: CODE, suite: "0" }), { ok: true, kind: "setup", host: "https://sync.example.com", pairingCode: CODE, e2ee: { suite: 0 } });
+	const withKey = parseSetupLink({ action: "setup", host: "https://sync.example.com", pairingCode: CODE, key: GOLDEN_KEY_PARAM });
+	assert.ok(withKey.ok && withKey.kind === "setup" && withKey.e2ee?.suite === 1);
+	assert.equal(withKey.e2ee.key.e, 1);
+	assert.deepEqual([...withKey.e2ee.key.k], [...GOLDEN_K]);
 	const rejects: Record<string, string>[] = [
 		{ action: "yaos", host: "https://sync.example.com" },
 		{ action: "yaos", pairingCode: CODE },
@@ -384,16 +402,209 @@ test("parseSetupLink accepts host + pairing code only", () => {
 		{ action: "other", host: "https://sync.example.com", pairingCode: CODE },
 		{ action: "yaos", host: "http://sync.example.com", pairingCode: CODE },
 		{ action: "yaos", host: "https://sync.example.com", pairingCode: "short" },
+		// §12.4: key or suite=0, never both, and no other suite value.
+		{ action: "setup", host: "https://sync.example.com", pairingCode: CODE, key: GOLDEN_KEY_PARAM, suite: "0" },
+		{ action: "setup", host: "https://sync.example.com", pairingCode: CODE, suite: "1" },
+		{ action: "setup", host: "https://sync.example.com", pairingCode: CODE, suite: "2" },
+		{ action: "setup", host: "https://sync.example.com", pairingCode: CODE, suite: "" },
+		{ action: "setup", host: "https://sync.example.com", pairingCode: CODE, suite: " 0" },
+		{ action: "setup", host: "https://sync.example.com", pairingCode: CODE, key: GOLDEN_KEY_PARAM.slice(0, -1) },
+		{ action: "setup", host: "https://sync.example.com", pairingCode: CODE, key: "" },
+		// A re-key link carries only the key.
+		{ action: "rekey", host: "https://sync.example.com", key: GOLDEN_KEY_PARAM },
+		{ action: "rekey", pairingCode: CODE, key: GOLDEN_KEY_PARAM },
+		{ action: "rekey", key: GOLDEN_KEY_PARAM, suite: "0" },
+		{ action: "rekey" },
 	];
 	for (const p of rejects) {
 		const r = parseSetupLink(p);
-		assert.equal(r.ok, false, JSON.stringify(Object.keys(p)));
-		if (!r.ok) assert.equal(r.reason.includes(CODE), false);
+		assert.equal(r.ok, false, JSON.stringify(p).replace(GOLDEN_KEY_PARAM, "<key>"));
+		if (!r.ok) {
+			assert.equal(r.reason.includes(CODE), false);
+			assert.equal(r.reason.includes(GOLDEN_KEY_PARAM.slice(0, 12)), false);
+		}
+	}
+});
+
+test("parseSetupLink: a re-key link carries only the key", () => {
+	for (const params of [{ action: "rekey", key: GOLDEN_KEY_PARAM }, { action: "yaos", key: GOLDEN_KEY_PARAM }]) {
+		const r = parseSetupLink(params);
+		assert.ok(r.ok && r.kind === "rekey");
+		assert.equal(r.key.e, 1);
+		assert.deepEqual([...r.key.k], [...GOLDEN_K]);
 	}
 });
 
 test("buildSetupLink matches the server's link shape", () => {
 	assert.equal(buildSetupLink("https://sync.example.com/", "a+b/c=d_12"), "obsidian://yaos?action=setup&host=https%3A%2F%2Fsync.example.com&pairingCode=a%2Bb%2Fc%3Dd_12");
+});
+
+// §20.1 golden vector: K = 00..1f, e = 1. A fixture key, not a secret.
+const GOLDEN_K = Uint8Array.from({ length: 32 }, (_, i) => i);
+const GOLDEN_KEY_PARAM = "AQEAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHw";
+const GOLDEN_CODE = `${testVaultId("golden")}.goldenSecret0123456789`;
+
+test("setup link golden vector (§20.1): key = b64url(u8 1 ‖ varuint e ‖ K_e)", () => {
+	const key = (e: number): LinkKey => ({ e, k: GOLDEN_K.slice() });
+	assert.equal(encodeKeyParam(key(1)), GOLDEN_KEY_PARAM);
+	assert.equal(encodeKeyParam(key(300)), "AawCAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
+	assert.equal(
+		buildSetupLink("https://sync.example.com", GOLDEN_CODE, { suite: 1, key: key(1) }),
+		"obsidian://yaos?action=setup&host=https%3A%2F%2Fsync.example.com&pairingCode=goldenAAAAAAAAAAAAAAAA.goldenSecret0123456789&key=AQEAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHw",
+	);
+	assert.equal(
+		buildSetupLink("https://sync.example.com", GOLDEN_CODE, { suite: 0 }),
+		"obsidian://yaos?action=setup&host=https%3A%2F%2Fsync.example.com&pairingCode=goldenAAAAAAAAAAAAAAAA.goldenSecret0123456789&suite=0",
+	);
+	assert.equal(buildRekeyLink(key(1)), "obsidian://yaos?action=rekey&key=AQEAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHw");
+	// Round trip through Obsidian's param shape.
+	const link = buildSetupLink("https://sync.example.com", GOLDEN_CODE, { suite: 1, key: key(1) });
+	const parsed = parseSetupLink(Object.fromEntries(new URL(link).searchParams));
+	assert.ok(parsed.ok && parsed.kind === "setup" && parsed.e2ee?.suite === 1);
+	assert.equal(parsed.pairingCode, GOLDEN_CODE);
+	assert.equal(pairingCodeVaultId(parsed.pairingCode), testVaultId("golden"));
+	assert.deepEqual([...parsed.e2ee.key.k], [...GOLDEN_K]);
+});
+
+test("decodeKeyParam is strict: version 1, epoch >= 1 (minimal), exactly 32 key bytes, canonical base64url", () => {
+	const big = encodeKeyParam({ e: Number.MAX_SAFE_INTEGER, k: GOLDEN_K.slice() });
+	assert.equal(decodeKeyParam(big)?.e, Number.MAX_SAFE_INTEGER);
+	const b64 = (bytes: number[]) => base64Url(Uint8Array.from(bytes));
+	const k = [...GOLDEN_K];
+	assert.equal(decodeKeyParam(b64([1, 1, ...k]))?.e, 1);
+	for (const bad of [
+		b64([2, 1, ...k]), // version 2
+		b64([1, 0, ...k]), // epoch 0
+		b64([1, 0x81, 0x00, ...k]), // non-minimal varuint
+		b64([1, 1, ...k.slice(1)]), // 31 key bytes
+		b64([1, 1, ...k, 0]), // trailing byte
+		`${GOLDEN_KEY_PARAM}=`, // padded
+		GOLDEN_KEY_PARAM.replace(/^A/, "+"), // standard alphabet
+		GOLDEN_KEY_PARAM.slice(0, -1) + "x", // non-canonical last char
+		"A".repeat(57),
+	]) assert.equal(decodeKeyParam(bad), null, bad.slice(0, 8));
+	assert.throws(() => encodeKeyParam({ e: 0, k: GOLDEN_K.slice() }), PairingError);
+	assert.throws(() => encodeKeyParam({ e: 1, k: new Uint8Array(31) }), PairingError);
+});
+
+test("pairingCodeVaultId reads the vaultId half of <vaultId>.<secret> and nothing else", () => {
+	assert.equal(pairingCodeVaultId(VCODE), VAULT);
+	assert.equal(pairingCodeVaultId(` ${VCODE} `), VAULT);
+	assert.equal(pairingCodeVaultId(CODE), null);
+	assert.equal(pairingCodeVaultId(`.${VAULT}`), null);
+	// The code is trimmed as a whole, so only ids without surrounding whitespace test the vaultId rule itself.
+	for (const bad of BAD_VAULT_IDS.filter((b) => b !== "" && b.trim() === b)) assert.equal(pairingCodeVaultId(`${bad}.secret`), null, bad);
+});
+
+test("enroll from a link with a key: the /enroll body carries only the code, never the key (§12.1)", async () => {
+	const link = buildSetupLink("https://sync.example.com", VCODE, { suite: 1, key: { e: 1, k: GOLDEN_K.slice() } });
+	const parsed = parseSetupLink(Object.fromEntries(new URL(link).searchParams));
+	assert.ok(parsed.ok && parsed.kind === "setup");
+	const f = fake([okEnroll]);
+	await enroll({ host: parsed.host, pairingCode: parsed.pairingCode, deviceName: "Mac" }, f.deps);
+	assert.equal(f.calls.length, 1);
+	const call = f.calls[0]!;
+	assert.equal(call.url, "https://sync.example.com/enroll");
+	const body = JSON.parse(call.body ?? "{}") as Record<string, unknown>;
+	assert.deepEqual(Object.keys(body).sort(), ["deviceId", "deviceName", "deviceToken", "enrollmentRequestId", "pairingCode"]);
+	assert.equal(body.pairingCode, VCODE);
+	const wire = `${call.url} ${call.body} ${JSON.stringify(call.headers ?? {})}`;
+	for (const leak of [GOLDEN_KEY_PARAM, "key=", "suite", Buffer.from(GOLDEN_K).toString("hex"), Buffer.from(GOLDEN_K).toString("base64")]) assert.ok(!wire.includes(leak), leak);
+});
+
+// ---------------------------------------------------------------------------
+// Operator routes (§15.1 step 1)
+// ---------------------------------------------------------------------------
+
+const OP_KEY = "opkey-" + "q".repeat(40);
+const SESSION_TOKEN = "S".repeat(43);
+const OP_HOST = "https://sync.example.com";
+
+function claimOk(vaultId: string, cookie: string | readonly string[] = `yaos_op=${SESSION_TOKEN}; Path=/; HttpOnly; Secure; SameSite=Strict`): HttpResponse {
+	return {
+		status: 200,
+		json: { ok: true, host: OP_HOST, vaultId, vaultName: "Personal", pairingCode: `${vaultId}.ownerSecretOwnerSecret01`, obsidianUrl: "obsidian://yaos?action=setup", capabilities: {} },
+		headers: { "set-cookie": cookie },
+	};
+}
+
+test("operator keys: generated as 32 random bytes hex; normalized by trimming; short ones refused", () => {
+	const k = generateOperatorKey(counterBytes());
+	assert.match(k, /^[0-9a-f]{64}$/);
+	assert.notEqual(generateOperatorKey(), generateOperatorKey());
+	assert.equal(normalizeOperatorKey(`  ${OP_KEY}\n`), OP_KEY);
+	assert.throws(() => normalizeOperatorKey("x".repeat(31)), (e: unknown) => e instanceof PairingError && e.code === "bad_operator_key" && !e.message.includes("x".repeat(31)));
+});
+
+test("claimServer: JSON + explicit Origin, the key only in the body; the session cookie from an array or a joined string", async () => {
+	const vaultId = testVaultId("claimed");
+	for (const cookie of [[`other=1; Path=/`, `yaos_op=${SESSION_TOKEN}; Path=/; HttpOnly`], `other=1; Path=/, yaos_op=${SESSION_TOKEN}; Path=/; HttpOnly`]) {
+		const f = fake([claimOk(vaultId, cookie)]);
+		const { vault, session } = await claimServer("sync.example.com/", OP_KEY, f.deps);
+		assert.deepEqual(vault, { host: OP_HOST, vaultId, pairingCode: `${vaultId}.ownerSecretOwnerSecret01` });
+		assert.deepEqual(session, { host: OP_HOST, token: SESSION_TOKEN });
+		const call = f.calls[0]!;
+		assert.equal(call.url, `${OP_HOST}/claim`);
+		assert.equal(call.method, "POST");
+		assert.deepEqual(call.headers, { "Content-Type": "application/json", Origin: OP_HOST });
+		assert.deepEqual(JSON.parse(call.body ?? ""), { operatorRecoveryKey: OP_KEY });
+	}
+	// No (or a malformed) cookie is fine for a claim: the session is not needed.
+	const f = fake([claimOk(vaultId, "yaos_op=short")]);
+	assert.equal((await claimServer(OP_HOST, OP_KEY, f.deps)).session, null);
+});
+
+test("operator routes: error mapping never echoes the operator key or the session", async () => {
+	const cases: [HttpResponse, string][] = [
+		[{ status: 403, json: { error: "forbidden_origin" } }, "forbidden_origin"],
+		[{ status: 415, json: { error: "unsupported_media_type" } }, "unsupported_media_type"],
+		[{ status: 401, json: { error: "unauthorized" } }, "unauthorized"],
+		[{ status: 409, json: { error: "already_claimed" } }, "already_claimed"],
+		[{ status: 503, json: { error: "claim_incomplete" }, headers: { "set-cookie": `yaos_op=${SESSION_TOKEN}` } }, "claim_incomplete"],
+		[{ status: 400, json: { error: "invalid operatorRecoveryKey" } }, "bad_operator_key"],
+		[{ status: 429, json: { error: "too_many_attempts" }, headers: { "retry-after": "42" } }, "too_many_attempts"],
+		[{ status: 500, json: { error: "internal" } }, "internal"],
+	];
+	for (const [res, code] of cases) {
+		const f = fake([res, { status: 200, json: { ok: true } }]);
+		await assert.rejects(claimServer(OP_HOST, OP_KEY, f.deps), (e: unknown) => {
+			assert.ok(e instanceof PairingError, code);
+			assert.equal(e.code, code);
+			assert.ok(!`${e.message} ${String(e.stack)}`.includes(OP_KEY) && !e.message.includes(SESSION_TOKEN));
+			if (code === "too_many_attempts") assert.match(e.message, /42 s/);
+			return true;
+		});
+		// A failed claim that still set a session ends it.
+		if (code === "claim_incomplete") assert.equal(f.calls[1]?.url, `${OP_HOST}/operator/logout`);
+	}
+	const net = fake([new Error(`ECONNRESET while sending ${OP_KEY}`)]);
+	await assert.rejects(operatorLogin(OP_HOST, OP_KEY, net.deps), (e: unknown) => e instanceof PairingError && e.code === "network" && !e.message.includes(OP_KEY));
+});
+
+test("operatorLogin needs the session cookie; operatorCreateVault sends it with Origin, then mints the owner code; logout never throws", async () => {
+	const noCookie = fake([{ status: 200, json: { ok: true } }]);
+	await assert.rejects(operatorLogin(OP_HOST, OP_KEY, noCookie.deps), (e: unknown) => e instanceof PairingError && e.code === "no_session");
+
+	const vaultId = testVaultId("created");
+	const f = fake([
+		{ status: 200, json: { ok: true }, headers: { "set-cookie": [`yaos_op=${SESSION_TOKEN}; Path=/; HttpOnly`] } },
+		{ status: 200, json: { ok: true, vault: { vaultId, name: "Notes" } } },
+		{ status: 200, json: { ok: true, pairingCode: `${vaultId}.ownerSecretOwnerSecret01` } },
+	]);
+	const session = await operatorLogin(OP_HOST, OP_KEY, f.deps);
+	const vault = await operatorCreateVault(session, "  My   notes ", f.deps);
+	assert.deepEqual(vault, { host: OP_HOST, vaultId, pairingCode: `${vaultId}.ownerSecretOwnerSecret01` });
+	assert.deepEqual(f.calls.map((c) => c.url), [`${OP_HOST}/operator/login`, `${OP_HOST}/operator/vaults`, `${OP_HOST}/operator/vaults/${vaultId}/owner-code`]);
+	for (const c of f.calls.slice(1)) assert.deepEqual(c.headers, { "Content-Type": "application/json", Origin: OP_HOST, Cookie: `yaos_op=${SESSION_TOKEN}` });
+	assert.deepEqual(JSON.parse(f.calls[1]!.body ?? ""), { name: "My notes" });
+	assert.deepEqual(JSON.parse(f.calls[2]!.body ?? ""), { purpose: "owner-bootstrap" });
+	assert.ok(f.calls.slice(1).every((c) => !(c.body ?? "").includes(OP_KEY)), "the key goes only to login");
+
+	const down = fake([new Error("offline")]);
+	await operatorLogout(session, down.deps);
+	assert.equal(down.calls[0]!.url, `${OP_HOST}/operator/logout`);
+	assert.equal(down.calls[0]!.headers?.Cookie, `yaos_op=${SESSION_TOKEN}`);
+	assert.equal(down.calls[0]!.headers?.Origin, OP_HOST);
 });
 
 test("scrubSecrets", () => {

@@ -719,7 +719,8 @@ export class Repo {
 	}
 
 	/**
-	 * releaseQuarantine (DESIGN §d.6): rows that pass go to tail; the rest are marked dismissed; the doc unfreezes.
+	 * releaseQuarantine (DESIGN §d.6): rows that pass go to tail and move bodyVersion; the rest are marked dismissed;
+	 * the doc unfreezes.
 	 * The caller re-gated a snapshot: a record stored since (neither passed nor dismissed here) still counts and
 	 * keeps the doc frozen.
 	 */
@@ -730,6 +731,11 @@ export class Repo {
 				for (const row of pass) {
 					tx.delete(STORE.quarantine, [stream, row.seq]);
 					await putTail(tx, r, row);
+					// Applied now: a remote change, as T_read_page counts its rows (it does not count a row it quarantines;
+					// T_live does). Without this the planner saw no change and the disk kept the old text (E7 sim seed 88).
+					if (row.deviceId !== this.deviceId || row.seq > r.lastOwnSeq) {
+						r.bodyVersion = { remoteSeq: Math.max(r.bodyVersion.remoteSeq, row.seq), localOrder: r.bodyVersion.localOrder };
+					}
 				}
 				for (const q of dismiss) {
 					if (!q.detail.startsWith("dismissed:")) tx.put(STORE.quarantine, { ...q, detail: `dismissed: ${q.detail}` });

@@ -5,10 +5,12 @@
  * Pure: every network call goes through an injected `request` function, randomness through an
  * injected `randomBytes`, waiting through an injected `sleep`. No obsidian runtime import.
  *
- * SECRETS: deviceToken and pairing codes never appear in thrown messages or progress text.
+ * SECRETS: deviceToken, pairing codes, the operator recovery key, the operator session cookie and the vault key of a
+ * setup or re-key link never appear in thrown messages or progress text.
  */
 
-import { isVaultId } from "../../core/codec/ids";
+import { base64urlDecode, isVaultId } from "../../core/codec/ids";
+import { bytesToHex, Reader, Writer } from "../../core/codec/lib0";
 import type { PairedIdentity } from "./api";
 import { errorMessage } from "./format";
 
@@ -27,6 +29,11 @@ export interface HttpResponse {
 	readonly status: number;
 	/** Parsed JSON body, or null/undefined when the body was not JSON. */
 	readonly json: unknown;
+	/**
+	 * Response headers by lower-cased name, when the RequestFn supplies them (obsidianEnv.ts does). Only the
+	 * operator login reads one: its `set-cookie` (an array on Electron, IncomingMessage.headers).
+	 */
+	readonly headers?: Readonly<Record<string, string | readonly string[]>>;
 }
 
 export type RequestFn = (req: HttpRequest) => Promise<HttpResponse>;
@@ -213,8 +220,11 @@ export interface ServerCapabilities {
 	readonly serverVersion: string | null;
 }
 
-/** GET /api/capabilities. Throws PairingError unless the server is a claimed streams relay (streams === 1). */
-export async function fetchCapabilities(host: string, deps: PairingDeps): Promise<ServerCapabilities> {
+/**
+ * GET /api/capabilities. Throws PairingError unless the server is a streams relay (streams === 1) and, unless
+ * `allowUnclaimed` (only "Create a new vault" passes it: it claims an unclaimed server itself), claimed.
+ */
+export async function fetchCapabilities(host: string, deps: PairingDeps, options: { readonly allowUnclaimed?: boolean } = {}): Promise<ServerCapabilities> {
 	const origin = normalizeHost(host);
 	const res = await send(deps, { url: `${origin}/api/capabilities`, method: "GET" }, []);
 	if (res.status === 404) throw new PairingError("No YAOS server answered at this address.", "not_found", 404);
@@ -230,8 +240,8 @@ export async function fetchCapabilities(host: string, deps: PairingDeps): Promis
 	if (caps.streams !== 1) {
 		throw new PairingError("This server does not support this version of YAOS (streams sync is not enabled). Update the server.", "no_streams");
 	}
-	if (!caps.claimed) {
-		throw new PairingError("This server has not been set up yet. Open it in a browser to claim it first.", "unclaimed");
+	if (!caps.claimed && options.allowUnclaimed !== true) {
+		throw new PairingError("This server has not been set up yet. Run \"Create a new vault\" in YAOS to set it up.", "unclaimed");
 	}
 	return caps;
 }
@@ -406,15 +416,15 @@ export async function pairDevice(attempt: EnrollmentAttempt, deps: PairingDeps):
 // §2.5 Pair another device
 // ---------------------------------------------------------------------------
 
+/**
+ * The server's `mobileSetupUrl` is not kept: it is a server-drawn page, so it can carry only a key-less join, which
+ * is blocked (e2ee-design §12.1). The pair modal builds its own link with buildSetupLink.
+ */
 export interface PairingCodeGrant {
 	/** SECRET-ish: one-shot code shown to the user, never logged. */
 	readonly pairingCode: string;
 	/** Unix ms. */
 	readonly expiresAt: number;
-	/** obsidian://yaos?action=setup&host=...&pairingCode=... */
-	readonly setupLink: string;
-	/** Browser page for phones (from the server), if it returned one. */
-	readonly mobileSetupUrl: string | null;
 }
 
 /** Fallback when the server omits expiresAt (relay-wire §11.1: pairing code TTL 15 min). */
@@ -445,9 +455,11 @@ export async function requestPairingCode(
 	}
 	const now = deps.nowMs ? deps.nowMs() : Date.now();
 	const expiresAt = Number.isSafeInteger(r.expiresAt) && (r.expiresAt as number) > 0 ? r.expiresAt as number : now + PAIRING_CODE_TTL_MS;
-	let mobileSetupUrl: string | null = null;
-	if (typeof r.mobileSetupUrl === "string" && r.mobileSetupUrl.startsWith(`${host}/`)) mobileSetupUrl = r.mobileSetupUrl;
-	return { pairingCode: r.pairingCode, expiresAt, setupLink: buildSetupLink(host, r.pairingCode), mobileSetupUrl };
+	// D3: the code names its vault. One for another vault would pair the other device elsewhere.
+	if (pairingCodeVaultId(r.pairingCode) !== identity.vaultId) {
+		throw new PairingError("The server returned a pairing code for a different vault.", "code_response_invalid", 200);
+	}
+	return { pairingCode: r.pairingCode, expiresAt };
 }
 
 // ---------------------------------------------------------------------------
@@ -480,41 +492,350 @@ export async function retireDeviceEnrollment(identity: PairedIdentity, deps: Pic
 }
 
 // ---------------------------------------------------------------------------
-// Setup links (obsidian://yaos?...)
+// Claim and operator routes: "Create a new vault" only (relay-wire §2.2, e2ee-design §15.1)
 // ---------------------------------------------------------------------------
 
-/** Same shape as the server's buildObsidianPairingUrl (server/src/routes/auth.ts). */
-export function buildSetupLink(host: string, pairingCode: string): string {
-	return `obsidian://yaos?${new URLSearchParams({ action: "setup", host: normalizeHost(host), pairingCode }).toString()}`;
+/** D5 operator session cookie name (server/src/router.ts:97). */
+const OPERATOR_COOKIE = "yaos_op";
+/** server/src/config/host.ts:26. */
+const SESSION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+/** server/src/router.ts:188-191: the trimmed operator recovery key is at least 32 characters. */
+const MIN_OPERATOR_KEY_CHARS = 32;
+/** server/src/router.ts:103. */
+export const MAX_VAULT_NAME_CHARS = 80;
+
+/**
+ * SECRET: an operator session (the `yaos_op` cookie value), held in memory for one creation flow and ended with
+ * operatorLogout. Never stored, never logged.
+ */
+export interface OperatorSession {
+	readonly host: string;
+	readonly token: string;
+}
+
+/** What step 1 of the creation path returns: the new vault and its owner code. The code is a SECRET. */
+export interface CreatedVault {
+	readonly host: string;
+	readonly vaultId: string;
+	readonly pairingCode: string;
+}
+
+/**
+ * `/claim` and the operator routes need JSON and `Origin` equal to the server's origin (server/src/router.ts:153-158,
+ * DECISIONS D5). Obsidian's requestUrl is not a browser fetch, so the header is sent explicitly. The session token
+ * goes in `Cookie`: requestUrl keeps no cookie jar.
+ */
+function operatorHeaders(origin: string, session?: OperatorSession): Record<string, string> {
+	const headers: Record<string, string> = { "Content-Type": "application/json", Origin: origin };
+	if (session) headers.Cookie = `${OPERATOR_COOKIE}=${session.token}`;
+	return headers;
+}
+
+function headerValues(res: HttpResponse, name: string): string[] {
+	const out: string[] = [];
+	for (const [key, value] of Object.entries(res.headers ?? {})) {
+		if (key.toLowerCase() !== name) continue;
+		if (typeof value === "string") out.push(value);
+		else for (const v of value) if (typeof v === "string") out.push(v);
+	}
+	return out;
+}
+
+/** The `yaos_op` token from a response's Set-Cookie (an array, or one joined string), or null. */
+function sessionTokenOf(res: HttpResponse): string | null {
+	const re = new RegExp(`(?:^|[\\s,;])${OPERATOR_COOKIE}=([A-Za-z0-9_-]*)`, "g");
+	for (const value of headerValues(res, "set-cookie")) {
+		for (const m of value.matchAll(re)) {
+			const token = m[1] ?? "";
+			if (SESSION_TOKEN_RE.test(token)) return token;
+		}
+	}
+	return null;
+}
+
+function retryAfterSeconds(res: HttpResponse): number | null {
+	const raw = headerValues(res, "retry-after")[0];
+	const n = raw === undefined ? NaN : Number(raw.trim());
+	return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/** Normalizes the operator recovery key as the server does (trimmed), or throws PairingError("bad_operator_key"). */
+export function normalizeOperatorKey(input: string): string {
+	const key = input.trim();
+	if (key.length < MIN_OPERATOR_KEY_CHARS) throw new PairingError(`The operator key is at least ${MIN_OPERATOR_KEY_CHARS} characters. Paste all of it.`, "bad_operator_key");
+	return key;
+}
+
+/** A new operator recovery key, as the console makes one (server/src/console/console.ts:248-250): 32 random bytes, hex. */
+export function generateOperatorKey(random: RandomBytesFn = defaultRandomBytes): string {
+	const bytes = random(32);
+	try {
+		return bytesToHex(bytes);
+	} finally {
+		bytes.fill(0);
+	}
+}
+
+/** Mapping for the claim and operator routes; `action` completes "The server refused to ...". */
+function operatorHttpError(res: HttpResponse, action: string): PairingError {
+	const code = errorCodeOf(res.json);
+	const status = res.status;
+	switch (code) {
+		case "forbidden_origin":
+			return new PairingError("The server refused this request because it did not carry the server's own Origin header, so YAOS cannot create a vault on this server from this device.", code, status);
+		case "unsupported_media_type":
+			return new PairingError("The server refused the request format. Update YAOS or the server.", code, status);
+		case "unauthorized":
+			return new PairingError("The server did not accept the operator key.", code, status);
+		case "already_claimed":
+			return new PairingError("Someone set up this server meanwhile. Run \"Create a new vault\" again and enter its operator key.", code, status);
+		case "claim_incomplete":
+			return new PairingError("The server was set up, but it could not finish its first vault. Run \"Create a new vault\" again with the operator key you saved.", code, status);
+		case "invalid operatorRecoveryKey":
+			return new PairingError(`The server refused the operator key: it is at least ${MIN_OPERATOR_KEY_CHARS} characters.`, "bad_operator_key", status);
+		case "invalid_name":
+			return new PairingError(`The vault name is too long (at most ${MAX_VAULT_NAME_CHARS} characters).`, code, status);
+		case "unknown_vault":
+			return new PairingError("The server lost the new vault before it gave out a pairing code. Try again.", code, status);
+		case "restore_in_progress":
+			return new PairingError("The server is restoring this vault. Try again when the restore has finished.", code, status);
+		case "too_many_attempts": {
+			const wait = retryAfterSeconds(res);
+			return new PairingError(`Too many operator key attempts. Wait ${wait !== null ? `${wait} s` : "a minute"} and try again.`, code, status);
+		}
+		default: break;
+	}
+	if (status === 401) return new PairingError("The server did not accept the operator key.", code || "unauthorized", status);
+	return genericHttpError(status, res.json, action);
+}
+
+function createdVaultOf(origin: string, json: unknown, vaultId: unknown, codeField: "pairingCode"): CreatedVault {
+	const r = asRecord(json);
+	const code = r[codeField];
+	if (typeof vaultId !== "string" || !isVaultId(vaultId) || typeof code !== "string" || !PAIRING_CODE_RE.test(code)) {
+		throw new PairingError("The server returned incomplete vault details.", "create_response_invalid", 200);
+	}
+	return { host: origin, vaultId, pairingCode: code };
+}
+
+/**
+ * `POST /claim` on an unclaimed server (server/src/router.ts:293-336): makes the first vault and returns its owner
+ * code. The response's `obsidianUrl` is ignored: the code is used in memory only (§15.1 step 2). The session cookie
+ * it sets is not needed and is ended with operatorLogout.
+ */
+export async function claimServer(host: string, operatorKey: string, deps: PairingDeps): Promise<{ readonly vault: CreatedVault; readonly session: OperatorSession | null }> {
+	const origin = normalizeHost(host);
+	const key = normalizeOperatorKey(operatorKey);
+	const res = await send(deps, { url: `${origin}/claim`, method: "POST", headers: operatorHeaders(origin), body: JSON.stringify({ operatorRecoveryKey: key }) }, [key]);
+	const token = sessionTokenOf(res);
+	const session = token ? { host: origin, token } : null;
+	if (res.status !== 200) {
+		if (session) await operatorLogout(session, deps);
+		throw operatorHttpError(res, "set up this server");
+	}
+	const r = asRecord(res.json);
+	if (r.ok !== true) throw new PairingError("The server returned incomplete vault details.", "create_response_invalid", 200);
+	return { vault: createdVaultOf(origin, res.json, r.vaultId, "pairingCode"), session };
+}
+
+/** `POST /operator/login` (server/src/router.ts:339-352). */
+export async function operatorLogin(host: string, operatorKey: string, deps: PairingDeps): Promise<OperatorSession> {
+	const origin = normalizeHost(host);
+	const key = normalizeOperatorKey(operatorKey);
+	const res = await send(deps, { url: `${origin}/operator/login`, method: "POST", headers: operatorHeaders(origin), body: JSON.stringify({ operatorRecoveryKey: key }) }, [key]);
+	if (res.status !== 200) throw operatorHttpError(res, "log in");
+	const token = sessionTokenOf(res);
+	if (!token) {
+		throw new PairingError("The server accepted the operator key, but Obsidian did not pass on its session cookie, so YAOS cannot create a vault on this server from this device.", "no_session", 200);
+	}
+	return { host: origin, token };
+}
+
+/** `POST /operator/vaults {name}` then `POST /operator/vaults/:id/owner-code` (server/src/router.ts:373-392, :470-488). */
+export async function operatorCreateVault(session: OperatorSession, name: string, deps: PairingDeps): Promise<CreatedVault> {
+	const origin = session.host;
+	const created = await send(deps, {
+		url: `${origin}/operator/vaults`,
+		method: "POST",
+		headers: operatorHeaders(origin, session),
+		body: JSON.stringify({ name: name.replace(/\s+/g, " ").trim() }),
+	}, [session.token]);
+	if (created.status !== 200) throw operatorHttpError(created, "create a vault");
+	const vault = asRecord(asRecord(created.json).vault);
+	const vaultId = vault.vaultId;
+	if (typeof vaultId !== "string" || !isVaultId(vaultId)) throw new PairingError("The server returned incomplete vault details.", "create_response_invalid", 200);
+	const minted = await send(deps, {
+		url: `${origin}/operator/vaults/${encodeURIComponent(vaultId)}/owner-code`,
+		method: "POST",
+		headers: operatorHeaders(origin, session),
+		body: JSON.stringify({ purpose: "owner-bootstrap" }),
+	}, [session.token]);
+	if (minted.status !== 200) throw operatorHttpError(minted, "create a pairing code for the new vault");
+	return createdVaultOf(origin, minted.json, vaultId, "pairingCode");
+}
+
+/** `POST /operator/logout` (server/src/router.ts:355-361). Best effort: it never throws. */
+export async function operatorLogout(session: OperatorSession, deps: Pick<PairingDeps, "request">): Promise<void> {
+	try {
+		await deps.request({ url: `${session.host}/operator/logout`, method: "POST", headers: operatorHeaders(session.host, session), body: "{}" });
+	} catch {
+		// The session expires on its own (7 days, server/src/config/host.ts:24, router.ts:125-127).
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Setup links (obsidian://yaos?...), e2ee-design §12.1, §12.4, §14.2 step 3
+// ---------------------------------------------------------------------------
+
+/**
+ * SECRET: a vault key as a setup or re-key link carries it, `key=<b64url(u8 1 ‖ varuint e ‖ K_e)>` (§12.1). Callers
+ * zero-fill `k` once it is handed on. Never logged, never in a notice, status or diagnostics.
+ */
+export interface LinkKey {
+	/** Key epoch, >= 1. */
+	readonly e: number;
+	/** K_e, 32 bytes. */
+	readonly k: Uint8Array;
+}
+
+/** The encryption part of a setup link: a key (suite 1, source (i)) or `suite=0` (source (ii)). */
+export type LinkE2ee = { readonly suite: 0 } | { readonly suite: 1; readonly key: LinkKey };
+
+const LINK_KEY_VERSION = 1;
+const LINK_KEY_BYTES = 32;
+/** 1 + varuint(2^53 - 1) (8 bytes) + 32 bytes, as base64url. */
+const MAX_KEY_PARAM_CHARS = 56;
+
+/** The `key` parameter for `key`. Throws (with no key material in the message) on a bad epoch or key length. */
+export function encodeKeyParam(key: LinkKey): string {
+	if (!Number.isSafeInteger(key.e) || key.e < 1) throw new PairingError("The vault key has an invalid epoch.", "bad_key");
+	if (key.k.length !== LINK_KEY_BYTES) throw new PairingError("The vault key has the wrong length.", "bad_key");
+	const epoch = new Writer(16).varuint(key.e).finish();
+	const bytes = new Uint8Array(1 + epoch.length + LINK_KEY_BYTES);
+	bytes[0] = LINK_KEY_VERSION;
+	bytes.set(epoch, 1);
+	bytes.set(key.k, 1 + epoch.length);
+	try {
+		return base64Url(bytes);
+	} finally {
+		bytes.fill(0);
+	}
+}
+
+/**
+ * Strict decode of a `key` parameter: version 1, epoch >= 1 (minimal varuint), exactly 32 key bytes, nothing after
+ * them, and canonical base64url (it re-encodes to the same text). Null when anything is off; the caller's message
+ * never echoes the parameter.
+ */
+export function decodeKeyParam(raw: string): LinkKey | null {
+	if (raw.length === 0 || raw.length > MAX_KEY_PARAM_CHARS) return null;
+	let bytes: Uint8Array;
+	try {
+		bytes = base64urlDecode(raw);
+	} catch {
+		return null;
+	}
+	try {
+		if (base64Url(bytes) !== raw) return null;
+		const r = new Reader(bytes);
+		if (r.u8() !== LINK_KEY_VERSION) return null;
+		const e = r.varuint();
+		if (e < 1 || r.remaining !== LINK_KEY_BYTES) return null;
+		return { e, k: r.copy(LINK_KEY_BYTES) };
+	} catch {
+		return null;
+	} finally {
+		bytes.fill(0);
+	}
+}
+
+/** The vaultId half of a server pairing code `<vaultId>.<secret>` (DECISIONS D3), or null when it has none. */
+export function pairingCodeVaultId(pairingCode: string): string | null {
+	const code = pairingCode.trim();
+	const dot = code.indexOf(".");
+	if (dot <= 0) return null;
+	const id = code.slice(0, dot);
+	return isVaultId(id) ? id : null;
+}
+
+/**
+ * Same shape as the server's buildObsidianPairingUrl (server/src/setupQr.ts:12), plus the client-only `key` or
+ * `suite=0` (§12.1). With e2ee the result is a SECRET: show it only on an explicit click, never log it.
+ */
+export function buildSetupLink(host: string, pairingCode: string, e2ee: LinkE2ee | null = null): string {
+	const fields: Record<string, string> = { action: "setup", host: normalizeHost(host), pairingCode };
+	if (e2ee?.suite === 1) fields.key = encodeKeyParam(e2ee.key);
+	else if (e2ee?.suite === 0) fields.suite = "0";
+	return `obsidian://yaos?${new URLSearchParams(fields).toString()}`;
+}
+
+/** SECRET: the re-key link of §14.2 step 3. No pairing code: the devices it is for are already enrolled. */
+export function buildRekeyLink(key: LinkKey): string {
+	return `obsidian://yaos?action=rekey&key=${encodeKeyParam(key)}`;
 }
 
 export type SetupLinkParse =
-	| { readonly ok: true; readonly host: string; readonly pairingCode: string }
+	| {
+		readonly ok: true;
+		readonly kind: "setup";
+		readonly host: string;
+		readonly pairingCode: string;
+		/** Null: a key-less link (the console's, a claim response's obsidianUrl, a code-only link), §12.4. */
+		readonly e2ee: LinkE2ee | null;
+	}
+	| { readonly ok: true; readonly kind: "rekey"; readonly key: LinkKey }
 	| { readonly ok: false; readonly reason: string };
 
 /** Keys a setup link may carry. `vault` is Obsidian's own vault selector. */
-const SETUP_LINK_KEYS = new Set(["action", "host", "pairingCode", "vault"]);
+const SETUP_LINK_KEYS = new Set(["action", "host", "pairingCode", "vault", "key", "suite"]);
 
 /**
- * Parse the params Obsidian hands to registerObsidianProtocolHandler("yaos", ...). Accepts only a
- * server address and a pairing code; anything else (credentials, vault ids, unknown fields) is
- * rejected so a link can never inject an identity.
+ * Parse the params Obsidian hands to registerObsidianProtocolHandler("yaos", ...). A setup link carries a server
+ * address and a pairing code, and at most one of `key` and `suite=0` (§12.4: never both, no other suite value). A
+ * re-key link carries only `key`. Anything else (credentials, vault ids, unknown fields) is rejected so a link can
+ * never inject an identity. No reason ever contains the code or the key.
  */
 export function parseSetupLink(params: Readonly<Record<string, string>>): SetupLinkParse {
 	for (const key of Object.keys(params)) {
 		if (!SETUP_LINK_KEYS.has(key)) return { ok: false, reason: "This YAOS link contains unexpected fields and was ignored." };
 	}
-	const action = typeof params.action === "string" ? params.action.trim() : "";
-	// Obsidian may report either the protocol action ("yaos") or the query's action ("setup").
-	if (action !== "" && action !== "yaos" && action !== "setup") {
+	const field = (name: string): string | null => (typeof params[name] === "string" ? params[name] : null);
+	const action = (field("action") ?? "").trim();
+	// Obsidian may report either the protocol action ("yaos") or the query's action ("setup", "rekey").
+	if (action !== "" && action !== "yaos" && action !== "setup" && action !== "rekey") {
 		return { ok: false, reason: "This YAOS link is not a setup link." };
 	}
-	const rawHost = typeof params.host === "string" ? params.host : "";
-	const rawCode = typeof params.pairingCode === "string" ? params.pairingCode : "";
-	if (!rawHost.trim() || !rawCode.trim()) return { ok: false, reason: "This YAOS setup link is missing the server address or the pairing code." };
+	const rawKey = field("key");
+	const rawSuite = field("suite");
+	if (rawKey !== null && rawSuite !== null) {
+		return { ok: false, reason: "This YAOS link carries both a vault key and suite=0, which never happens, so it was ignored." };
+	}
+	if (rawSuite !== null && rawSuite !== "0") return { ok: false, reason: "This YAOS link names an encryption suite YAOS does not accept, so it was ignored." };
+	const rawHost = field("host") ?? "";
+	const rawCode = field("pairingCode") ?? "";
+	let key: LinkKey | null = null;
+	if (rawKey !== null) {
+		key = decodeKeyParam(rawKey);
+		if (!key) return { ok: false, reason: "The vault key in this YAOS link is damaged. Copy or scan the link again." };
+	}
+	if (action === "rekey" || (action !== "setup" && key && !rawHost.trim() && !rawCode.trim())) {
+		if (!key || rawHost !== "" || rawCode !== "" || rawSuite !== null) {
+			key?.k.fill(0);
+			return { ok: false, reason: "This YAOS re-key link is invalid. Show the re-key QR on your other device again." };
+		}
+		return { ok: true, kind: "rekey", key };
+	}
+	if (!rawHost.trim() || !rawCode.trim()) {
+		key?.k.fill(0);
+		return { ok: false, reason: "This YAOS setup link is missing the server address or the pairing code." };
+	}
 	try {
-		return { ok: true, host: normalizeHost(rawHost), pairingCode: normalizePairingCode(rawCode) };
+		const host = normalizeHost(rawHost);
+		const pairingCode = normalizePairingCode(rawCode);
+		const e2ee: LinkE2ee | null = key ? { suite: 1, key } : rawSuite === "0" ? { suite: 0 } : null;
+		return { ok: true, kind: "setup", host, pairingCode, e2ee };
 	} catch (err) {
+		key?.k.fill(0);
 		return { ok: false, reason: `This YAOS setup link is invalid: ${errorMessage(err)}` };
 	}
 }
