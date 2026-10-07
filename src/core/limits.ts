@@ -143,6 +143,14 @@ export const CFG_MAX_TOTAL_BYTES = 4_000_000;
 /** ... or past this many files. */
 export const CFG_MAX_FILES = 256;
 
+// --- Host keys (e2ee-design §6.1) -------------------------------------------
+
+/**
+ * SecretStorage may answer null before it has loaded: wait this long for its `changed` event before deciding a
+ * pinned device's key is missing (§6.1 Startup).
+ */
+export const KEY_STORE_WAIT_MS = 5_000;
+
 // --- Relay ------------------------------------------------------------------
 
 export const RELAY_CLOSE = {

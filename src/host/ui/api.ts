@@ -9,6 +9,7 @@ import type { EngineSettings, UserCommand, EngineResultValue } from "../../proto
 import type { StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
 import type { TrashMode } from "../../ports/vault";
+import { sanitizeCreating, sanitizePin, type CreatingMarker, type E2eePin } from "../keys/pin";
 import {
 	DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, normalizeDeviceName, normalizeHost, normalizePairingCode,
 	type EnrollmentAttempt,
@@ -39,6 +40,13 @@ export interface YaosPluginData {
 	 * identical request). Never logged or exported.
 	 */
 	readonly pendingEnrollment?: EnrollmentAttempt;
+	/**
+	 * The suite pin (e2ee-design §6.1, §12.4; not secret). Absent = unpinned: the device writes nothing until main
+	 * pins it from an authenticated source (src/host/keys/pin.ts). Only the controller writes it.
+	 */
+	readonly e2ee?: E2eePin;
+	/** §15.1 crash-recovery marker: this device created that vault and may still choose its encryption. */
+	readonly creating?: CreatingMarker;
 }
 
 export const MIB = 1024 * 1024;
@@ -181,13 +189,19 @@ export function sanitizePluginData(raw: unknown, fallbackLabel: string): YaosPlu
 		const r = asRecord(raw);
 		if (!r) return defaultPluginData(fallbackLabel);
 		const pending = sanitizePendingEnrollment(r.pendingEnrollment);
+		const identity = sanitizeIdentity(r.identity);
+		// A pin belongs to the vault the device is enrolled in: without one it is dropped (never inferred, §12.4).
+		const pin = identity ? sanitizePin(r.e2ee) : undefined;
+		const creating = sanitizeCreating(r.creating);
 		return {
 			version: 1,
-			identity: sanitizeIdentity(r.identity),
+			identity,
 			deviceLabel: sanitizeDeviceLabel(r.deviceLabel, fallbackLabel),
 			engine: sanitizeEngineSettings(r.engine),
 			showStatusBar: bool(r.showStatusBar, true),
 			...(pending ? { pendingEnrollment: pending } : {}),
+			...(pin ? { e2ee: pin } : {}),
+			...(creating ? { creating } : {}),
 		};
 	} catch {
 		return defaultPluginData(fallbackLabel);

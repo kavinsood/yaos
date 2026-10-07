@@ -100,8 +100,8 @@ function pkgName(spec) {
 	return spec.split("/")[0];
 }
 
-/** Tests and test-only support code (testkit/ dirs, engine/runtime/testHarness.ts) may import sim/** and anything else. */
-const isTest = (f) => f.endsWith(".test.ts") || f.split("/").includes("testkit") || f === "engine/runtime/testHarness.ts";
+/** Tests and test-only support code (testkit/ dirs, testkit.ts files, engine/runtime/testHarness.ts) may import sim/** and anything else. */
+const isTest = (f) => f.endsWith(".test.ts") || f.split("/").includes("testkit") || f.endsWith("/testkit.ts") || f === "engine/runtime/testHarness.ts";
 
 /**
  * Check one file. Returns { errors: string[], warnings: string[] }.
@@ -137,6 +137,10 @@ export function checkSource(file, text) {
 			const tArea = areaOf(target);
 			if (tArea === "sim" && area !== "sim" && !test) {
 				err(line, `only tests may import sim/**: ${spec}`);
+				continue;
+			}
+			if (target.split("/").includes("testkit") && area !== "sim" && !test) {
+				err(line, `only tests and the sim may import testkit/**: ${spec}`);
 				continue;
 			}
 			if (area === "host" && isSpike(target) && !isSpike(file) && !test) {
