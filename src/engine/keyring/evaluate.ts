@@ -9,6 +9,11 @@
  * - genesis / revoke: R.recoveryWrap with the RK in hand.
  * A blocked roll can still win through an authoritative key (oob or prev): that is how a device re-keyed above a
  * revoke walks the backward chain through the rolls before it. An own key never unblocks a roll.
+ *
+ * A pending row does not hold back later rows of its epoch (a device with the RK or an authoritative key passes over
+ * a record it cannot open, §11.3 garbage), except a genesis: one creator writes it (§15.1), and a genesis this device
+ * cannot judge may be the first valid one, so no later genesis wins past it. Otherwise a second creator would adopt
+ * its own K_1 and fork the vault.
  */
 
 import { bytesEqual } from "../../core/codec/lib0";
@@ -42,7 +47,10 @@ async function step(b: KeyBook, x: EvalCtx): Promise<boolean> {
 	for (const e of [...new Set(open.map((r) => r.rec!.e))].sort((p, q) => p - q)) {
 		for (const row of open.filter((r) => r.rec!.e === e)) {
 			const v = await tryRow(b, x, row.rec!);
-			if (v === "pending") continue;
+			if (v === "pending") {
+				if (row.rec!.kind === KeyRecordKind.genesis) break;
+				continue;
+			}
 			if (v === "valid") {
 				b.decide(e, row);
 				x.kc.markVerified(e);

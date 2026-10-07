@@ -14,7 +14,7 @@ import type { KeyMissingReason } from "../../protocol/status";
 import { KeyBook, type KRow, type StaleVerdict } from "./book";
 import { buildKeyRecord } from "./build";
 import { evaluate } from "./evaluate";
-import { KeyRecordKind } from "./record";
+import { KeyRecordKind, decodeKeyRecord } from "./record";
 
 type Fields = Record<string, string | number | boolean | null>;
 
@@ -24,7 +24,7 @@ export type KeyringMode = "suite1" | "suite0" | "unpinned";
 export interface KeyringChange {
 	/** Keys main has not stored yet, each once. */
 	readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[];
-	/** Every winning record, by epoch: the full set. */
+	/** Every winning record, by epoch, then (suite 1) the revokes held open (§11.5, KeyBook.openRecords): the full set. */
 	readonly records: readonly Uint8Array[];
 	/** Epoch of an own key whose record is not decided yet (§11.4 step 2); a stored key at an epoch with neither a record nor this may be dropped. */
 	readonly pending: number | null;
@@ -35,7 +35,7 @@ export interface KeyringOptions {
 	readonly vaultId: string;
 	/** suite1: required. unpinned: needed only to take a QR key or the RK (§12.4 (i)). */
 	readonly kc?: (KeyringCrypto & Pick<CryptoPort, "keyState" | "sealEpoch">) | null;
-	/** Winners decided before (SecretStorage `records`, §6.1). */
+	/** Winners decided before and revokes held open (SecretStorage `records`, §6.1, §11.5). */
 	readonly records?: readonly Uint8Array[];
 	readonly keyringSeen?: boolean;
 	/** Must resolve only once main has stored the change. */
@@ -52,13 +52,17 @@ export class Keyring {
 	private readonly book = new KeyBook();
 	private readonly kc: NonNullable<KeyringOptions["kc"]> | null;
 	private rk: Uint8Array | null = null;
-	private own: { readonly e: number; readonly bytes: Uint8Array } | null = null;
+	private own: { readonly e: number; readonly kind: KeyRecordKind; readonly bytes: Uint8Array } | null = null;
+	/** `rk` came with the own genesis or revoke (propose), not from installRk: it goes once that record settles. */
+	private rkOwn = false;
 	private persistedVersion = 0;
+	private persistedOpen: readonly Uint8Array[] = [];
 	private persistedPending: number | null = null;
 	private unsent: { readonly e: number; readonly k: Uint8Array }[] = [];
 	private readonly reported = new WeakSet<KRow>();
 	private queue: Promise<unknown> = Promise.resolve();
 	private seen: boolean;
+	private disposed = false;
 
 	private constructor(private readonly o: KeyringOptions) {
 		this.kc = o.kc ?? null;
@@ -69,8 +73,14 @@ export class Keyring {
 	static async open(o: KeyringOptions): Promise<Keyring> {
 		const k = new Keyring(o);
 		await k.run(async () => {
-			for (const b of o.mode === "suite1" ? (o.records ?? []) : []) if (!k.book.addStored(b)) k.diag("keyring/garbage", { stored: true });
+			// A stored revoke whose key is not held was stored open (a winner's key is stored with it, §18.4).
+			for (const b of o.mode === "suite1" ? (o.records ?? []) : []) {
+				const rec = decodeKeyRecord(b);
+				const open = rec?.kind === KeyRecordKind.revoke && !k.kc!.keyState(rec.e).held;
+				if (!(open ? k.book.addStoredOpen(b) : k.book.addStored(b))) k.diag("keyring/garbage", { stored: true });
+			}
 			k.persistedVersion = k.book.version;
+			k.persistedOpen = k.book.openRecords();
 			await k.settleAll();
 		});
 		return k;
@@ -84,7 +94,7 @@ export class Keyring {
 	}
 	/** Rows of `k` seen this vaultEpoch, garbage included (§12.4 (ii): "k read to head is empty"). */
 	get rowCount(): number {
-		return this.book.rows.length;
+		return this.book.kRows().length;
 	}
 
 	/** `k` rows (catch-up, live or the stored tail), any order; already-seen seqs are skipped. */
@@ -134,14 +144,15 @@ export class Keyring {
 	/**
 	 * Steps 1-2 of a roll (§11.4), a revoke (§14.2) or the genesis (§15.1): generate K_e, build the record and
 	 * persist the pending key. The caller appends `bytes` to `k`, reads `k` through the receipt and calls settleOwn.
-	 * `rk` (genesis, revoke) is used for the recoveryWrap only; the caller keeps and zero-fills it.
+	 * `rk` (genesis, revoke) is copied and held until the record settles, so that an earlier record for e under the
+	 * same RK is judged with it rather than outvoted by the own key (§11.3); the caller zero-fills its own copy.
 	 */
 	propose(kind: KeyRecordKind, rk?: Uint8Array): Promise<{ readonly e: number; readonly bytes: Uint8Array }> {
 		return this.run(async () => {
 			const kc = this.kc;
 			if (!kc || this.own) throw new Error(kc ? "keyring: a record is already in flight" : "keyring: no KeyringCrypto");
 			const genesis = kind === KeyRecordKind.genesis;
-			if (genesis && (this.book.rows.length > 0 || this.book.winners.size > 0)) throw new Error("keyring: genesis needs an empty k");
+			if (genesis && (this.book.rows.length > 0 || this.book.winners.size > 0)) throw new Error("keyring: genesis needs an empty k and no stored record");
 			const e = genesis ? 1 : this.book.highestWinner() + 1;
 			if (!genesis && this.book.source.get(e - 1) !== "verified") throw new Error(`keyring: epoch ${e - 1} is not keyed`);
 			if (kind !== KeyRecordKind.roll && !rk) throw new Error("keyring: the recovery key is required");
@@ -149,25 +160,37 @@ export class Keyring {
 			this.book.source.set(e, "own");
 			try {
 				const bytes = await buildKeyRecord(kc, this.o.vaultId, e, kind, rk);
-				this.own = { e, bytes };
+				this.own = { e, kind, bytes };
+				if (rk) {
+					this.zeroRk();
+					this.rk = rk.slice();
+					this.rkOwn = true;
+				}
 				if (!(await this.flush())) throw new Error("keyring: persist failed");
-				return this.own;
+				return { e, bytes };
 			} catch (err) {
 				this.own = null;
 				this.dropOwn(e);
+				this.releaseRk();
 				throw err;
 			}
 		});
 	}
 
-	/** After `k` was read through the own record's receipt (§11.4 step 4). "won": new seals use e. */
+	/**
+	 * After `k` was read through the own record's receipt (§11.4 step 4). "won": new seals use e. An own genesis read
+	 * in `k` but undecided sits behind a genesis this device cannot judge (evaluate.ts): it lost, and its K_1 goes.
+	 */
 	settleOwn(): Promise<OwnOutcome | null> {
 		return this.run(async () => {
-			if (!this.own) return null;
-			const w = this.book.winners.get(this.own.e);
-			if (!w) return "pending";
-			const won = bytesEqual(w.row.bytes, this.own.bytes);
+			const own = this.own;
+			if (!own) return null;
+			const w = this.book.winners.get(own.e);
+			if (!w && (own.kind !== KeyRecordKind.genesis || !this.book.rows.some((r) => bytesEqual(r.bytes, own.bytes)))) return "pending";
+			const won = w !== undefined && bytesEqual(w.row.bytes, own.bytes);
 			this.own = null;
+			if (!w) this.dropOwn(own.e);
+			this.releaseRk();
 			await this.flush();
 			return won ? "won" : "lost";
 		});
@@ -180,6 +203,7 @@ export class Keyring {
 			const e = this.own.e;
 			this.own = null;
 			if (!this.book.winners.has(e)) this.dropOwn(e);
+			this.releaseRk();
 			await this.flush();
 		});
 	}
@@ -230,10 +254,16 @@ export class Keyring {
 		return { epochs, revokeEpoch: r || null, sRot: r ? (this.book.winners.get(r)!.seq ?? null) : null };
 	}
 
-	/** Zero-fill the RK. The engine calls it on stop. */
+	/**
+	 * The engine is done with this keyring (stop, a new vaultEpoch, the gate's check): zero-fill the RK and drop
+	 * from the adapter every key main has not stored. The adapter exports a key once, so the next keyring on the same
+	 * port would take it for stored and seal under it (§18.4); dropped, it is derived (or entered) and handed over again.
+	 */
 	dispose(): void {
-		this.rk?.fill(0);
-		this.rk = null;
+		this.disposed = true;
+		this.zeroRk();
+		this.dropUnstored(this.unsent);
+		this.unsent = [];
 	}
 
 	private async settleAll(): Promise<void> {
@@ -245,8 +275,8 @@ export class Keyring {
 			this.reported.add(r);
 			this.diag(r.state === "garbage" ? "keyring/garbage" : "keyring/duplicate", { e: r.rec?.e ?? null, seq: r.seq });
 		}
-		const rkWanted = this.book.highestKeyed() === 0 || this.book.rows.some((r) => r.state === "pending" && r.rec!.kind !== KeyRecordKind.roll);
-		if (this.rk && !rkWanted) this.dispose();
+		const rkWanted = this.rkOwn || this.book.highestKeyed() === 0 || this.book.rows.some((r) => r.state === "pending" && r.rec!.kind !== KeyRecordKind.roll);
+		if (this.rk && !rkWanted) this.zeroRk();
 		await this.flush();
 	}
 
@@ -257,17 +287,22 @@ export class Keyring {
 		const keys = [...this.unsent, ...kc.exportForHost()];
 		const pending = this.own && !this.book.winners.has(this.own.e) ? this.own.e : null;
 		const version = this.book.version;
-		if (keys.length > 0 || version !== this.persistedVersion || pending !== this.persistedPending) {
+		// Open revokes go with the winners (§11.5): a reset or restore that drops one from `k` must not reopen the gate.
+		const open = this.o.mode === "suite1" ? this.book.openRecords() : [];
+		const openChanged = open.length !== this.persistedOpen.length || open.some((b, i) => !bytesEqual(b, this.persistedOpen[i]!));
+		if (keys.length > 0 || version !== this.persistedVersion || openChanged || pending !== this.persistedPending) {
 			if (!this.o.persist) throw new Error("keyring: no persist hook");
 			try {
-				await this.o.persist({ keys, records: this.book.records(), pending });
+				await this.o.persist({ keys, records: [...this.book.records(), ...open], pending });
 			} catch (err) {
-				this.unsent = keys;
 				this.diag("keyring/persist-failed", { error: String(err) });
+				if (this.disposed) this.dropUnstored(keys);
+				else this.unsent = keys;
 				return false;
 			}
 			this.unsent = [];
 			this.persistedVersion = version;
+			this.persistedOpen = open;
 			this.persistedPending = pending;
 		}
 		const hk = this.book.highestKeyed();
@@ -276,9 +311,28 @@ export class Keyring {
 	}
 
 	private takeRk(rk: Uint8Array): void {
-		this.dispose();
+		this.zeroRk();
 		this.rk = rk.slice();
 		rk.fill(0);
+	}
+
+	private zeroRk(): void {
+		this.rk?.fill(0);
+		this.rk = null;
+		this.rkOwn = false;
+	}
+
+	/** The own record settled or was abandoned: the RK it came with is no longer needed. */
+	private releaseRk(): void {
+		if (this.rkOwn) this.zeroRk();
+	}
+
+	/** Keys main did not store: zero-filled, and out of the adapter unless one is already sealed under. */
+	private dropUnstored(keys: readonly { readonly e: number; readonly k: Uint8Array }[]): void {
+		for (const x of keys) {
+			x.k.fill(0);
+			if (this.kc && x.e !== this.kc.sealEpoch()) this.kc.drop(x.e);
+		}
 	}
 
 	private dropOwn(e: number): void {

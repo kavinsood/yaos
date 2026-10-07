@@ -32,7 +32,7 @@ export type RowState =
 	| "garbage";
 
 export interface KRow {
-	/** null: a stored winner (SecretStorage, §6.1). */
+	/** null: stored (SecretStorage, §6.1): a winner, or a revoke stored while open until `k` shows it (§11.5). */
 	readonly seq: Seq | null;
 	readonly bytes: Uint8Array;
 	readonly rec: KeyRecord | null;
@@ -46,6 +46,9 @@ export interface Winner {
 }
 
 export type StaleVerdict = "stale" | "hold" | null;
+
+/** Open revokes stored with the winners (§11.5), lowest epoch first: one keeps the gate shut, a few bound the store. */
+export const STORED_OPEN_REVOKES = 4;
 
 export class KeyBook {
 	readonly rows: KRow[] = [];
@@ -64,10 +67,24 @@ export class KeyBook {
 		return true;
 	}
 
+	/**
+	 * A revoke this device stored while it held it open (§11.5, §14.3): pending again, so the gate stays shut and
+	 * rolls into its epoch stay blocked after a reset or restore drops it from `k`. False for anything else.
+	 */
+	addStoredOpen(bytes: Uint8Array): boolean {
+		const rec = decodeKeyRecord(bytes);
+		if (rec?.kind !== KeyRecordKind.revoke || this.winners.has(rec.e)) return false;
+		if (!this.rows.some((r) => bytesEqual(r.bytes, bytes))) this.rows.unshift({ seq: null, bytes, rec, state: "pending" });
+		return true;
+	}
+
 	/** A `k` row. null: this seq was already ingested. */
 	add(seq: Seq, bytes: Uint8Array): KRow | null {
 		if (this.seqs.has(seq)) return null;
 		this.seqs.add(seq);
+		// A stored open revoke that `k` shows (a restart in the same vaultEpoch) is that `k` row from now on.
+		const stored = this.rows.findIndex((r) => r.seq === null && r.state === "pending" && bytesEqual(r.bytes, bytes));
+		if (stored >= 0) this.rows.splice(stored, 1);
 		const rec = decodeKeyRecord(bytes);
 		const row: KRow = { seq, bytes, rec, state: rec ? "pending" : "garbage" };
 		let i = this.rows.length;
@@ -142,15 +159,22 @@ export class KeyBook {
 		for (const [r, w] of this.winners) {
 			if (w.row.rec!.kind === KeyRecordKind.revoke && keyEpoch < r && w.seq !== null && seq > w.seq) return "stale";
 		}
-		for (const row of this.openRevokes()) if (keyEpoch < row.rec!.e && seq > row.seq!) return "hold";
+		// A stored open revoke has no seq in this vaultEpoch's `k`: every row sealed below it is held.
+		for (const row of this.openRevokes()) if (keyEpoch < row.rec!.e && (row.seq === null || seq > row.seq)) return "hold";
 		return null;
 	}
 
-	/** Stored winners whose epoch has no record in `k` (§11.5), in epoch order. */
+	/**
+	 * Stored winners `k` does not show this vaultEpoch (§11.5), in epoch order: those whose epoch has no record in
+	 * `k`, and a revoke over another record for its epoch (revoke outranks roll whatever the seq order, §11.3): a
+	 * device that took a roll there after a reset then stops (revoked-epoch) instead of forking silently.
+	 */
 	republishable(): readonly Uint8Array[] {
 		const seen = new Set<number>();
-		for (const r of this.rows) if (r.rec) seen.add(r.rec.e);
-		return [...this.winners.entries()].filter(([e]) => !seen.has(e)).sort((a, b) => a[0] - b[0]).map(([, w]) => w.row.bytes);
+		for (const r of this.kRows()) if (r.rec) seen.add(r.rec.e);
+		return [...this.winners.entries()]
+			.filter(([e, w]) => w.seq === null && (!seen.has(e) || w.row.rec!.kind === KeyRecordKind.revoke))
+			.sort((a, b) => a[0] - b[0]).map(([, w]) => w.row.bytes);
 	}
 
 	/** Every winning record by epoch: what main stores (§6.1). */
@@ -158,7 +182,22 @@ export class KeyBook {
 		return [...this.winners.entries()].sort((a, b) => a[0] - b[0]).map(([, w]) => w.row.bytes);
 	}
 
+	/** Open revokes (pending, no winner for their epoch) to store after the winners (§11.5), by epoch, at most STORED_OPEN_REVOKES. */
+	openRecords(): readonly Uint8Array[] {
+		const out: KRow[] = [];
+		for (const r of this.rows) {
+			if (r.rec?.kind !== KeyRecordKind.revoke || r.state !== "pending" || this.winners.has(r.rec.e)) continue;
+			if (!out.some((o) => bytesEqual(o.bytes, r.bytes))) out.push(r);
+		}
+		return out.sort((a, b) => a.rec!.e - b.rec!.e).slice(0, STORED_OPEN_REVOKES).map((r) => r.bytes);
+	}
+
+	/** The rows `k` holds this vaultEpoch (not the stored ones). */
+	kRows(): readonly KRow[] {
+		return this.rows.filter((r) => r.seq !== null);
+	}
+
 	anyRecord(): boolean {
-		return this.rows.some((r) => r.rec !== null);
+		return this.kRows().some((r) => r.rec !== null);
 	}
 }

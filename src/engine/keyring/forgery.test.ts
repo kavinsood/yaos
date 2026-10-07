@@ -4,7 +4,7 @@
  * (mask 0x01 and a seeded nonzero mask), valid records of other vaults, and well-formed records with random kcv and
  * wraps. Each case runs on a fresh device of the real Keyring over the real adapter, and the device's whole state is
  * compared with what §11.3 predicts: diagnostics, keyMissing, seal epoch, winners, held keys, K_1 intact, nothing
- * persisted. Extends keyring.test.ts (two garbage rows, one forged roll after a revoke, one duplicate).
+ * persisted but a revoke held open (stored with the winners so that a reset does not lift it, §11.5; never a key). Extends keyring.test.ts (two garbage rows, one forged roll after a revoke, one duplicate).
  * YAOS_TAMPER_REPORT=1 prints the outcome counts (counts only: never key bytes).
  */
 import { describe, it } from "node:test";
@@ -74,6 +74,8 @@ const BASE: Readonly<Record<DevKind, Omit<Obs, "diag" | "km" | "seen">>> = {
 	unpinned: { seal: "0/0", epochs: "", held: "", k1: false, persist: 0 },
 	nokey: { seal: "0/0", epochs: "", held: "", k1: false, persist: 0 },
 };
+/** A revoke held open is stored with the winners (one keyringChanged, no key): a reset does not lift it (§11.5). */
+const OPEN = { persist: 1 } as const;
 const want = (kind: DevKind, diag: string, km: string | null, seen: boolean, more: Partial<Obs> = {}): string =>
 	fmt({ ...BASE[kind], diag, km: String(km), seen, ...more });
 
@@ -210,11 +212,12 @@ describe("§20.2 keyring forgery: garbage rows are never adopted (measured)", ()
 			return `${before} => ${await observe(d, `rk:${await d.kr.installRk(RK_A.slice())}`)}`;
 		}, (c) => {
 			if (notRecord(c.group)) return `${want("pinned", "garbage×1", null, false)} => ${want("pinned", "garbage×1", null, false, { extra: "rk:verified" })}`;
-			const before = want("pinned", "none", "revoked-epoch", true);
+			const before = want("pinned", "none", "revoked-epoch", true, OPEN);
 			// kcv (in every wrap's AAD) or recoveryWrap: the RK cannot open it, and a forged recoveryWrap cannot be told
 			// from a wrong RK: pending (§11.3). prevWrap: K_2 opens and matches kcv, prevWrap does not open: invalid.
-			if (c.group === "prev") return `${before} => ${want("pinned", "invalid×1", null, true, { extra: "rk:verified" })}`;
-			return `${before} => ${want("pinned", "none", "revoked-epoch", true, { extra: "rk:verified" })}`;
+			// Judged invalid, it is no longer open: a second keyringChanged drops it from the stored records.
+			if (c.group === "prev") return `${before} => ${want("pinned", "invalid×1", null, true, { persist: 2, extra: "rk:verified" })}`;
+			return `${before} => ${want("pinned", "none", "revoked-epoch", true, { ...OPEN, extra: "rk:verified" })}`;
 		});
 	});
 
@@ -265,7 +268,7 @@ describe("§20.2 keyring forgery: garbage rows are never adopted (measured)", ()
 				case "genesis → unpinned + QR K_1": return want("unpinned", "conflict×1+invalid×1", "encrypted-vault", true, { held: "1", extra: "qr:pending" });
 				case "genesis → nokey + RK": return want("nokey", "none", "no-key", true, { extra: "rk:pending" });
 				case "roll 2 → pinned": return want("pinned", "invalid×1", null, true);
-				default: return want("pinned", "none", "revoked-epoch", true, { extra: "rk:verified" });
+				default: return want("pinned", "none", "revoked-epoch", true, { ...OPEN, extra: "rk:verified" });
 			}
 		});
 	});
@@ -294,7 +297,7 @@ describe("§20.2 keyring forgery: garbage rows are never adopted (measured)", ()
 				case "roll 2 → pinned": return want("pinned", "invalid×1", null, true);
 				// No winner for e − 1: not judgeable, and no revoke or genesis above the held keys: the device keeps sealing.
 				case "roll 3..10 → pinned": return want("pinned", "none", null, true);
-				case "revoke 2..10 → pinned + RK": return `${want("pinned", "none", "revoked-epoch", true)} => ${want("pinned", "none", "revoked-epoch", true, { extra: "rk:verified" })}`;
+				case "revoke 2..10 → pinned + RK": return `${want("pinned", "none", "revoked-epoch", true, OPEN)} => ${want("pinned", "none", "revoked-epoch", true, { ...OPEN, extra: "rk:verified" })}`;
 				case "genesis → pinned": return want("pinned", "duplicate×1", null, true);
 				case "genesis → unpinned + RK": return `${want("unpinned", "none", "encrypted-vault", true)} => ${want("unpinned", "none", "encrypted-vault", true, { extra: "rk:pending" })}`;
 				default: return `${want("nokey", "none", "no-key", true)} => ${want("nokey", "none", "no-key", true, { extra: "rk:pending" })}`;
