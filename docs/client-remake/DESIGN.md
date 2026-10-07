@@ -840,7 +840,7 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   - every frame of the doc built before its create folds carries `dependsOn` = the ns create frame
     (`Ctx.pendingCreates`, docRuntime closeFrame).
 - **Live creates** (every pass after the reconciler's first full pass with ns ready and the local scan complete,
-  `Ctx.liveCreates`, reconciler.ts:191):
+  `Ctx.liveCreates`, reconciler.ts:207):
   - the frames are `pending`, not `held` (frames.ts `sendAfter`);
   - the pass corks the ns stream (`Sender.corkNs`, at most `NS_CORK_MAX_MS` = 2 s) from `submitNs` until the last
     `reconcileContent` of the docs it created (runner.ts), so the creates and their body frames reach the relay
@@ -1138,7 +1138,7 @@ The planner does no destructive work until ns is caught up (§f.2).
       for a doc (2 for its first checkpoint). A put at `lastSeq` also drops the open segment at no extra row (H7).
     - A CAS conflict writes nothing, and the fallback refresh is a read.
   - A heavy desktop day:
-    - Frames: ≤ 20k (soft budget, limits.ts:233; frames are 4× slower beyond it, src/engine/runtime/context.ts:399) ×
+    - Frames: ≤ 20k (soft budget, limits.ts:254; frames are 4× slower beyond it, src/engine/runtime/context.ts:413-415) ×
       ≤ 2 rows = ≤ 40k.
     - Settle: 500 edit sessions × ≤ 4 = 2k. One put per session: a pause of 2 min or more ends one.
     - Hot: 20k / 256 × 4 ≈ 310.
@@ -1924,11 +1924,11 @@ ones get conflict copies.
 - **With a blob store** (`BlobPort`):
   - **Upload** (`blobQueue up`): hash → `crypto.blobAddress(hash)` → `has` → `put(sealBlob(bytes))`. Only **after**
     the put succeeds does the planner emit `nsCreate` / `nsSetBlob` for that hash (`pushBlob`,
-    `src/engine/reconcile/blobJobs.ts:117-121`), so readers can always fetch what ns references. A `has` hit skips
+    `src/engine/reconcile/blobJobs.ts:120-130`), so readers can always fetch what ns references. A `has` hit skips
     the put only if the committed folds reference the hash or this device put it less than grace/2 ago. Otherwise it
     puts again, which refreshes the upload time another device's GC sweep checks (e2ee-design §10.4 R2).
   - **Download:** `get` → `openBlob` → verify sha256 → write with precondition (`getOpened`,
-    `src/engine/blobs/blobStore.ts:85-97`). Every failure (absent, transport, open failure, hash mismatch) is
+    `src/engine/blobs/blobStore.ts:90-102`). Every failure (absent, transport, open failure, hash mismatch) is
     unavailable and retried with backoff (`wait(blob-unavailable)`). Only a failure under a verified key (or with an
     unparseable header) is deterministic; once the initial attempt and 3 retries spanning ≥ 3 min all failed
     deterministically, the referencing row is quarantined (e2ee-design §10.2). Absent blobs and failures under an
@@ -1964,7 +1964,7 @@ ones get conflict copies.
     throws `BlobTooLargeError`. The queue refuses that hash until the engine restarts: one notice, the outage record
     dropped, no backoff; `pushBlob` holds the doc (`held`, no pass retry). Changed bytes are a new hash and are tried
     (`src/engine/blobs/blobQueue.ts` `upload`, `src/engine/reconcile/blobJobs.ts`).
-    `StatusSnapshot.maxBlobBytes` reports that cap (`src/engine/compose/vaultRuntime.ts:636`); the attachment size
+    `StatusSnapshot.maxBlobBytes` reports that cap (`src/engine/compose/vaultRuntime.ts:650`); the attachment size
     setting then reads "This server accepts attachments up to N MB." and offers at most N (`attachmentLimitMb`,
     `src/host/ui/settingsModel.ts`; 93 MB, what fits 100 MB once sealed, until a vault reports its own). The
     setting can only lower the server's limit: its default (1 GiB, the most there is) follows it, and choosing
@@ -1982,14 +1982,15 @@ ones get conflict copies.
       manual path.
 - **Without a blob store** (`blob = null`: the relay has no R2 binding, capabilities `attachments: false`, the blob
   routes answer 503 `attachments_unavailable`): **fail closed**.
-  - `BlobQueue.maxBlobBytes` is 0 (`src/engine/blobs/blobQueue.ts:110-111`), and so is `StatusSnapshot.maxBlobBytes`
+  - `BlobQueue.maxBlobBytes` is 0 (`src/engine/blobs/blobQueue.ts:220-221`), and so is `StatusSnapshot.maxBlobBytes`
     (the setting then names no server limit).
   - Reconcile excludes every blob file, reason `no-blob-store` (`src/engine/reconcile/localState.ts:70`, `:86`). The
     reason is silent: no skip notice (`src/engine/reconcile/skipNotice.ts:56`). Attachments are not synced; the
     local file stays and is never deleted.
-  - Blob jobs return `held`, which arms no retry timer (`blobJobs.ts:64-65`, `:103-104`;
-    `src/engine/reconcile/diskJobs.ts:34-41`, `:168`). `upload` / `download` / the claims answer at once
-    (false / null / unavailable) without persisting a queue record (`blobQueue.ts:202`, `:224`, `:252`), so nothing is queued.
+  - Blob jobs return `held`, which arms no retry timer (`blobJobs.ts:71-72`, `:118-119`;
+    `src/engine/reconcile/diskJobs.ts:38-45`, `:172`). `upload` / `download` / the claims answer at once
+    (false / null / unavailable) without persisting a queue record (`blobQueue.ts:392`, `:407`, `:343`, `:359`), so
+    nothing is queued.
   - No ns op for a blob is ever emitted unless the blob is durably stored.
   - An update > `MAX_INLINE_UPDATE_BYTES` (1 MiB − 32 KiB) freezes its doc `oversize-local` (§b.6).
   - The sender's R3 gate holds a `bodyUpdateRef` frame and passes every other frame
@@ -1998,15 +1999,15 @@ ones get conflict copies.
   - There is no UI row, notice, banner or setting about server blob storage (no server-metadata UI); only a log line.
 - **A store found on a later connect.** `EnginePorts.probeBlob` (`src/ports/index.ts:51`) asks the relay again. The
   session loop calls it once per session that reaches live, only while `ports.blob` is null
-  (`src/engine/runtime/sessionLoop.ts:162`, `:443-456`). A store found → `EngineOptions.onBlobStore`
+  (`src/engine/runtime/sessionLoop.ts:162`, `:452-465`). A store found → `EngineOptions.onBlobStore`
   (`src/engine/runtime/options.ts:160-164`) → `VaultRuntime` (`src/engine/compose/vaultRuntime.ts:64-65`, `:173`) →
   `ComposedEngine.onBlobStore` sets `ports.blob`, logs "blob store available -> restarting" and restarts the runtime
   with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:531-536`). The restarted runtime's full
   pass uploads what is pending through the normal path. No polling, no new timers.
 - **Production ports** (`src/engine/adapters/webEngine.ts:43-54`): `blob = startupBlob(…)`
-  (`src/engine/adapters/httpBlob.ts:329-336`): `probeHttpBlob`'s answer, the HTTP store when the relay advertises
+  (`src/engine/adapters/httpBlob.ts:518-525`): `probeHttpBlob`'s answer, the HTTP store when the relay advertises
   attachments, else null. Capabilities unreachable at startup (offline), or not answered within
-  `CAPABILITIES_TIMEOUT_MS` (10 s, `httpBlob.ts:46`; init awaits this probe, so it is bounded): assume the store
+  `CAPABILITIES_TIMEOUT_MS` (10 s, `httpBlob.ts:76`; init awaits this probe, so it is bounded): assume the store
   (`createHttpBlob`) and let the blob queue retry (integration-notes D4). `probeBlob = probeHttpBlob`.
 - `syncAttachments = false` excludes blobs entirely: no ns ops, and remote blobs are not fetched.
 
@@ -2455,7 +2456,7 @@ After healing (all faults off, all online, run until every queue is idle and no 
    frame was injected, no open intents.
 6. **Resource bounds held throughout:** resident docs/bytes ≤ budget (+1 doc), tail ≤ hard rows, live queue ≤ bound,
    no `encodeStateAsUpdate` on the keystroke path (instrumented counter).
-7. **No blobs on the log** (`checkLogCarriesNoBlobs`, `src/sim/invariants.ts:120-128`, run by `src/sim/run.ts:248`):
+7. **No blobs on the log** (`checkLogCarriesNoBlobs`, `src/sim/invariants.ts:124-132`, run by `src/sim/run.ts:251`):
    no foreign stream on the relay log, no ns / cfg / snap / k row over `MAX_NS_FRAME_BYTES`, no `b:`/`c:` stream for
    an attachment doc. Sim devices get the net's `SimBlobStore` (`SimNet.blobs`, `blobsAvailable`, `blobPort()`,
    `src/sim/net.ts:58-85`) and its probe by default (`src/sim/device.ts:186-187`).
