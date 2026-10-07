@@ -17,7 +17,7 @@ import { hashLabel, SeededRandom } from "./random";
 import { SimRelay } from "./relay";
 import { MemStoragePort } from "./storage";
 
-export const SIM_VAULT_ID = "sim-vault" as VaultId;
+export const SIM_VAULT_ID = "simVaultAAAAAAAAAAAAAA" as VaultId;
 
 export interface OracleDoc {
 	readonly docId: DocId;

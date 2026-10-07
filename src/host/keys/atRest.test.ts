@@ -19,8 +19,9 @@ import { YaosController } from "../pluginController";
 import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "../ui/api";
 import { secretIdFor } from "./secretStore";
 import { fakeEpochKey, fakeGenesisRecord } from "./testkit/kRecords";
+import { testVaultId } from "./testkit/vaultIds";
 
-const ID: PairedIdentity = { host: "https://relay.example", vaultId: "v1", deviceId: "dev-A", deviceToken: "device-credential", deviceName: "A", vaultGeneration: null };
+const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), deviceId: "dev-A", deviceToken: "device-credential", deviceName: "A", vaultGeneration: null };
 
 function base64(bytes: Uint8Array): string {
 	let s = "";

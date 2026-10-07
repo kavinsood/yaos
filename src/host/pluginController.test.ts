@@ -9,10 +9,11 @@ import type { HostUiSink } from "./hostRuntime";
 import { secretIdFor, VaultKeyStore } from "./keys/secretStore";
 import { fakeEpochKey, fakeGenesisRecord } from "./keys/testkit/kRecords";
 import { withSuite0PinForTest } from "./keys/testkit/pinFixture";
+import { testVaultId } from "./keys/testkit/vaultIds";
 import { hostNotice, PinRefusedError, YaosController } from "./pluginController";
 import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "./ui/api";
 
-const ID: PairedIdentity = { host: "https://relay.example", vaultId: "v1", deviceId: "dev-A", deviceToken: "secret-token", deviceName: "A", vaultGeneration: null };
+const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), deviceId: "dev-A", deviceToken: "secret-token", deviceName: "A", vaultGeneration: null };
 
 function setup(initial: YaosPluginData = defaultPluginData("A"), o: { readonly secretsAvailable?: boolean } = {}) {
 	const clock = new VirtualClock();
@@ -304,6 +305,6 @@ test("creation marker (§15.1): written before enroll, kept across it; creatable
 	assert.equal(w.ctl.data().e2ee, undefined);
 	assert.equal(w.net.relay.counters().appendFrames, 0);
 	// Enrolling in another vault drops the marker.
-	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: { ...ID, vaultId: "v2" } })), 5_000);
+	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: { ...ID, vaultId: testVaultId("v2") } })), 5_000);
 	assert.equal(w.saved.at(-1)?.creating, undefined);
 });

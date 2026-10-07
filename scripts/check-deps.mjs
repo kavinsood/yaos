@@ -23,6 +23,13 @@ const BROWSER_GLOBALS = [
  * The engine reaches main only through the two documented entries (integration-notes D2).
  */
 export const MAIN_FORBIDDEN = ["yjs", "y-codemirror.next", "y-protocols", "lib0"];
+/**
+ * The main thread never hashes (§d.2; HostPorts has no HashPort, §h): no product host/** module may import
+ * core/hash/** (type-only imports included), directly or through core/ports/protocol. Tests may, to compute
+ * expected values.
+ */
+export const MAIN_FORBIDDEN_DIRS = ["core/hash"];
+const isMainForbiddenPath = (p) => MAIN_FORBIDDEN_DIRS.some((d) => p === d || p.startsWith(`${d}/`));
 const ENGINE_ENTRIES = new Set(["engine/adapters/webEngine", "engine/workerMain"]);
 
 /** Throwaway day-1 spike plugin (scripts/build-spike.mjs): its own bundle, never imported by the product. */
@@ -143,6 +150,10 @@ export function checkSource(file, text) {
 				err(line, `only tests and the sim may import testkit/**: ${spec}`);
 				continue;
 			}
+			if (area === "host" && !test && !isSpike(file) && isMainForbiddenPath(target)) {
+				err(line, `no hashing on the main thread: host/** must not import ${spec} (hashing runs in the worker)`);
+				continue;
+			}
 			if (area === "host" && isSpike(target) && !isSpike(file) && !test) {
 				err(line, `the spike plugin is not part of the product: ${spec}`);
 				continue;
@@ -234,7 +245,8 @@ function walk(dir, out) {
 
 /**
  * Transitive MAIN_FORBIDDEN check: from every product host/** module, follow relative imports (not into the
- * engine entries) and fail on a CRDT package import anywhere along the way. `sources`: src-relative path -> text.
+ * engine entries) and fail on a CRDT package import, or an import of a MAIN_FORBIDDEN_DIRS module, anywhere along
+ * the way. `sources`: src-relative path -> text.
  */
 export function mainReach(sources) {
 	const errors = [];
@@ -253,9 +265,14 @@ export function mainReach(sources) {
 			if (!spec.startsWith(".")) {
 				if (MAIN_FORBIDDEN.includes(pkgName(spec))) found = [mod, spec];
 			} else {
-				const next = resolve(mod, spec);
-				const chain = next && via(next, stack);
-				if (chain) found = [mod, ...chain];
+				const r = resolveRel(mod, spec);
+				if (!r.outside && isMainForbiddenPath(r.path)) {
+					found = [mod, r.path];
+				} else {
+					const next = resolve(mod, spec);
+					const chain = next && via(next, stack);
+					if (chain) found = [mod, ...chain];
+				}
 			}
 			if (found) break;
 		}

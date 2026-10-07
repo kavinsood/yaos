@@ -7,6 +7,7 @@ import type { E2eePin } from "./pin";
 import { plaintextNoticeOnce, PLAINTEXT_NOTICE_KEY } from "./plaintextNotice";
 import { KeyStoreError, VaultKeyStore, sameKeys, type EpochKey } from "./secretStore";
 import { FakeSecretStorage } from "./testkit/fakeSecretStorage";
+import { testVaultId } from "./testkit/vaultIds";
 
 function key(e: number, seed: number): EpochKey {
 	const k = new Uint8Array(32);
@@ -18,7 +19,7 @@ const record = (n: number): Uint8Array => new Uint8Array([0xb0, n, 9]);
 test("crypto(): unpinned and suite 0 carry no keys and do not wait for the store", async () => {
 	const clock = new VirtualClock();
 	const fake = new FakeSecretStorage(new Map(), { loaded: false });
-	const store = new VaultKeyStore(fake, "v", clock);
+	const store = new VaultKeyStore(fake, testVaultId("v"), clock);
 	let pin: E2eePin | undefined;
 	let creating = false;
 	const hk = createHostKeys({ store, pin: () => pin, creating: () => creating });
@@ -35,9 +36,9 @@ test("crypto(): unpinned and suite 0 carry no keys and do not wait for the store
 test("crypto(): suite 1 waits for the store, then loads fresh key buffers", async () => {
 	const clock = new VirtualClock();
 	const backing = new Map<string, string>();
-	new VaultKeyStore(new FakeSecretStorage(backing), "v", clock).merge({ keys: [key(1, 1)], records: [record(1)] });
+	new VaultKeyStore(new FakeSecretStorage(backing), testVaultId("v"), clock).merge({ keys: [key(1, 1)], records: [record(1)] });
 	const fake = new FakeSecretStorage(backing, { loaded: false });
-	const hk = createHostKeys({ store: new VaultKeyStore(fake, "v", clock), pin: () => ({ suite: 1 }), creating: () => false });
+	const hk = createHostKeys({ store: new VaultKeyStore(fake, testVaultId("v"), clock), pin: () => ({ suite: 1 }), creating: () => false });
 	let got: Awaited<ReturnType<typeof hk.crypto>> | null = null;
 	void hk.crypto().then((c) => (got = c));
 	await clock.advance(100);
@@ -55,7 +56,7 @@ test("crypto(): suite 1 with nothing stored (or no SecretStorage) starts key-mis
 	const none = createHostKeys({ store: null, pin: () => ({ suite: 1 }), creating: () => false });
 	assert.deepEqual(await none.crypto(), { suite: 1, keys: [], records: [] });
 	// An empty store cannot prove it loaded: the start waits KEY_STORE_WAIT_MS, then goes on key-missing.
-	const empty = createHostKeys({ store: new VaultKeyStore(new FakeSecretStorage(), "v", clock), pin: () => ({ suite: 1 }), creating: () => false });
+	const empty = createHostKeys({ store: new VaultKeyStore(new FakeSecretStorage(), testVaultId("v"), clock), pin: () => ({ suite: 1 }), creating: () => false });
 	const p = empty.crypto();
 	await clock.advance(KEY_STORE_WAIT_MS);
 	assert.deepEqual(await p, { suite: 1, keys: [], records: [] });
@@ -64,7 +65,7 @@ test("crypto(): suite 1 with nothing stored (or no SecretStorage) starts key-mis
 test("persist(): stores before the pin decision, which completes before persist resolves (persist-before-use)", async () => {
 	const clock = new VirtualClock();
 	const backing = new Map<string, string>();
-	const store = new VaultKeyStore(new FakeSecretStorage(backing), "v", clock);
+	const store = new VaultKeyStore(new FakeSecretStorage(backing), testVaultId("v"), clock);
 	const order: string[] = [];
 	let pin: E2eePin | undefined;
 	const hk = createHostKeys({
@@ -87,7 +88,7 @@ test("persist(): refused under a suite-0 pin, nothing stored, buffers zero-fille
 	const clock = new VirtualClock();
 	const fake = new FakeSecretStorage();
 	let decided = 0;
-	const hk = createHostKeys({ store: new VaultKeyStore(fake, "v", clock), pin: () => ({ suite: 0 }), creating: () => false, stored: async () => void decided++ });
+	const hk = createHostKeys({ store: new VaultKeyStore(fake, testVaultId("v"), clock), pin: () => ({ suite: 0 }), creating: () => false, stored: async () => void decided++ });
 	const change = { keys: [key(1, 3)], records: [record(1)], pending: null };
 	await assert.rejects(hk.persist(change), KeyRefused);
 	assert.equal(fake.writes, 0);
@@ -111,17 +112,17 @@ test("plaintext notice: shown once per vault when keys are stored or loaded on a
 	const env = { load: (k: string) => local.get(k) ?? null, save: (k: string, v: string) => void local.set(k, v), show: (t: string) => void shown.push(t) };
 	const backing = new Map<string, string>();
 	const plain = new FakeSecretStorage(backing, { encryption: false });
-	const hk = createHostKeys({ store: new VaultKeyStore(plain, "v", clock), pin: () => undefined, creating: () => false, plaintext: plaintextNoticeOnce(env) });
+	const hk = createHostKeys({ store: new VaultKeyStore(plain, testVaultId("v"), clock), pin: () => undefined, creating: () => false, plaintext: plaintextNoticeOnce(env) });
 	await hk.persist({ keys: [key(1, 5)], records: [record(1)], pending: null });
 	await hk.persist({ keys: [key(2, 6)], records: [record(1)], pending: null });
 	assert.equal(shown.length, 1);
 	assert.equal(local.get(PLAINTEXT_NOTICE_KEY), "1");
 	// A restart (new notice function) remembers it was shown.
-	const again = createHostKeys({ store: new VaultKeyStore(plain, "v", clock), pin: () => ({ suite: 1 }), creating: () => false, plaintext: plaintextNoticeOnce(env) });
+	const again = createHostKeys({ store: new VaultKeyStore(plain, testVaultId("v"), clock), pin: () => ({ suite: 1 }), creating: () => false, plaintext: plaintextNoticeOnce(env) });
 	await again.crypto();
 	assert.equal(shown.length, 1);
 	// An encrypted store never shows it.
-	const enc = createHostKeys({ store: new VaultKeyStore(new FakeSecretStorage(), "w", clock), pin: () => undefined, creating: () => false, plaintext: plaintextNoticeOnce({ ...env, load: () => null }) });
+	const enc = createHostKeys({ store: new VaultKeyStore(new FakeSecretStorage(), testVaultId("w"), clock), pin: () => undefined, creating: () => false, plaintext: plaintextNoticeOnce({ ...env, load: () => null }) });
 	await enc.persist({ keys: [key(1, 7)], records: [record(1)], pending: null });
 	assert.equal(shown.length, 1);
 	assert.ok(!shown[0]!.match(/[0-9a-f]{16}/));

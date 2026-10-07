@@ -1,6 +1,6 @@
 /**
- * Vault keys in Obsidian SecretStorage (e2ee-design §6.1): one secret per vault, namespaced by a hash of the vault
- * id, read and written only on main. Nothing here logs, caches or echoes key bytes: `load()` decodes fresh buffers
+ * Vault keys in Obsidian SecretStorage (e2ee-design §6.1): one secret per vault, named by the vaultId's bytes in
+ * hex, read and written only on main. Nothing here logs, caches or echoes key bytes: `load()` decodes fresh buffers
  * for each engine start and the caller hands them to the engine as transferred buffers (§6.3).
  *
  * API (node_modules/obsidian/obsidian.d.ts, obsidian 1.13.1; manifest minAppVersion 1.13.0):
@@ -13,15 +13,14 @@
  * `changed`; `setSecret` also fires `changed`; `isEncryptionAvailable()` is false only on desktop without an OS
  * keyring (the value is then stored in plaintext). There is no delete in the d.ts, so forget writes "" (§6.1).
  *
- * The secret id is `"yaos-" + hex(sha256(utf8(vaultId)))[0..32]`. That is the one hash main computes: a fixed,
- * tiny identifier (no content, no fingerprint), needed before any engine exists (DESIGN §d.2 keeps every content
- * hash in the worker).
+ * The secret id is `"yaos-" + hex(base64urlDecode(vaultId))`: the vaultId's 16 bytes in lowercase hex, 37 chars,
+ * valid for setSecret's `/^[a-z0-9-]+$/` and its 64-char limit. No hash: main never hashes (DESIGN §d.2; §h
+ * HostPorts has no HashPort; scripts/check-deps.mjs keeps core/hash/** off the main thread).
  */
 
 import { KEY_STORE_WAIT_MS } from "../../core/limits";
-import { base64urlDecode, base64urlEncode } from "../../core/codec/ids";
-import { sha256Hex } from "../../core/hash/sha256";
-import { utf8Encode } from "../../core/hash/utf8";
+import { base64urlDecode, base64urlEncode, isVaultId } from "../../core/codec/ids";
+import { bytesToHex } from "../../core/codec/lib0";
 import type { ClockPort } from "../../ports/clock";
 
 /** The parts of Obsidian's SecretStorage YAOS uses (structural, so tests and the sim can supply a fake). */
@@ -69,9 +68,13 @@ const KEY_BYTES = 32;
 const MAX_RECORD_BYTES = 1024;
 const MAX_ENTRIES = 1024;
 
-/** §6.1: the SecretStorage id for `vaultId` (lowercase hex, 37 chars, valid for setSecret's /^[a-z0-9-]+$/). */
+/**
+ * §6.1: the SecretStorage id for `vaultId`: "yaos-" + the 32 lowercase hex chars of its 16 bytes (37 chars). Throws
+ * on anything but a canonical 22-char vaultId (isVaultId): a malformed id never names a secret.
+ */
 export function secretIdFor(vaultId: string): string {
-	return SECRET_ID_PREFIX + sha256Hex(utf8Encode(vaultId)).slice(0, 32);
+	if (!isVaultId(vaultId)) throw new TypeError("not a vault id");
+	return SECRET_ID_PREFIX + bytesToHex(base64urlDecode(vaultId));
 }
 
 interface StoredValueV1 {
