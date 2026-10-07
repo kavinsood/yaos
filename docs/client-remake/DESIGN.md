@@ -920,7 +920,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 | Failure | ns / cfg / snap | body / canvas / x |
 |---|---|---|
 | Deterministic malformation (bytes, decode) | Fold as empty frame (§c.3); diagnostics event | Quarantine, freeze doc |
-| Reader-dependent (unknown version, suite or key; auth failure) | **Halt** the fold at the row (`upgrade-required` / `key-missing`); rows wait in `tail` | Quarantine, freeze doc (retried on upgrade or new keys) |
+| Reader-dependent (unknown version, suite or key; auth failure) | **Halt** the fold at the row (`upgrade-required` / `key-missing`); rows wait in `tail` | Quarantine with the whole row, freeze doc (retried on upgrade or new keys) |
 | Kind not allowed | Fold as empty | Quarantine, freeze |
 
 - **The cursor always advances.** Quarantined, stored-cold, stale-recorded and halted rows are all *accounted*.
@@ -1074,7 +1074,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | Soft `OUTBOX_SOFT_BYTES` (16 MiB): builders stretch, notice. **Never dropped** |
-| `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes ≤ 256 KiB + hash) | `QUARANTINE_MAX_RECORDS` / `_BYTES`; oldest evicted (the doc stays frozen) |
+| `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes + hash: ≤ 256 KiB for a deterministic failure, whole for a reader-dependent one so it can be re-gated) | `QUARANTINE_MAX_RECORDS` / `_BYTES`; oldest evicted (the doc stays frozen) |
 | `synced` | `docId` | `byPathKey pathKey` (non-unique: transient during rebind) | `SyncedRecord` | 1 per synced doc |
 | `baseText` | `docId` | — | `BaseTextRecord` (deflated, ≤ `MAX_BASE_TEXT_CHARS`) | markdown/canvas synced docs |
 | `localTree` | `pathKey` | — | `LocalTreeRecord` | 1 per vault file |
