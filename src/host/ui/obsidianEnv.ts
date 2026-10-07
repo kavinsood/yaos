@@ -6,7 +6,16 @@
 import { requestUrl, type App } from "obsidian";
 import type { HttpResponse, RequestFn } from "./pairing";
 
-/** RequestFn backed by Obsidian's requestUrl. Never throws on HTTP status; network failures reject. */
+/**
+ * RequestFn backed by Obsidian's requestUrl. Never throws on HTTP status; network failures reject.
+ *
+ * Headers, including `Origin` and `Cookie` (the creation path, pairing.ts operatorHeaders), are passed as given. On
+ * desktop requestUrl runs Electron's `net.request` in the main process and sets each header with `setHeader`, and
+ * Electron maps `origin` to the URL loader's origin (the `request-url` IPC handler of Obsidian's app.asar main.js,
+ * installer 1.12.7; Electron 39.8.3 `ClientRequest._startRequest`);
+ * whether every header arrives as set on mobile is [U] (e2ee-design §23.3). A refused `Origin` is answered 403
+ * forbidden_origin, which the caller reports. Response headers come back lower-cased; `set-cookie` may be an array.
+ */
 export const obsidianRequest: RequestFn = async (req) => {
 	const res = await requestUrl({
 		url: req.url,
@@ -21,7 +30,13 @@ export const obsidianRequest: RequestFn = async (req) => {
 	} catch {
 		json = null;
 	}
-	const out: HttpResponse = { status: res.status, json };
+	const headers: Record<string, string | readonly string[]> = {};
+	const raw = res.headers as Readonly<Record<string, unknown>> | undefined;
+	for (const [name, value] of Object.entries(raw ?? {})) {
+		if (typeof value === "string") headers[name.toLowerCase()] = value;
+		else if (Array.isArray(value)) headers[name.toLowerCase()] = value.filter((v): v is string => typeof v === "string");
+	}
+	const out: HttpResponse = { status: res.status, json, headers };
 	return out;
 };
 
