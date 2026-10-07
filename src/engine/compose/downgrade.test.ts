@@ -16,26 +16,39 @@
  *     engine. Existing: pluginController.test.ts:165, pinGate.test.ts:191, pinGate.test.ts:267.
  *     - The sim relay reports the true head, so a hidden genesis means head > 0. A server that also reports head 0
  *       gives the device exactly the "empty" state's view.
- *     - UI-only: the two-button blocked screen (§12.4) is not built yet (WP-E5, src/host/ui/** not edited).
- *       What is checked here is the host/engine layer (only installKey is accepted; pinSuite0, enableE2ee and
- *       revokeRekey are refused on main), the palette (commands.ts:30-45: no pin/suite/encryption command) and the
- *       status tooltip (statusBar.ts:158-162: names the RK and the QR, offers nothing else).
+ *     - The UI layer (src/host/ui/**) over the same controller: the palette is exact, and its only key command is
+ *       "yaos-unlock", the two-button blocked screen (keyModals.ts:51-94: [Scan QR from one of your devices]
+ *       [Enter recovery key]). "Create a new vault" is not offered (canCreateVault, commands.ts:18-22) and
+ *       createAndEnroll refuses "blocked" before any request, against a server that would create;
+ *       enableEncryption / optOutOfEncryption stop with no command (no marker); revokeRekey rejects before one;
+ *       nothing is saved. The status tooltip (statusBar.ts) names the RK and the QR and offers nothing else.
  * (c) The pin never comes from the server -> "c. ...". Over b's 72 joins: 0 saved e2ee/creating fields, 0
- *     creatable, keyringSeen or suite statuses, 0 pinSuite0 at an engine. pinCensus() counts every pin setter,
- *     pin-shaped write, saveData, markCreating and key-command construction in the shipped sources: all are main's
- *     (pluginController.ts, keys/pin.ts, ui/api.ts's sanitizing loader), and nothing builds a pinSuite0 command or
- *     calls markCreating. Existing: pin.test.ts:16, pin.test.ts:101, pluginController.test.ts:182.
+ *     creatable, keyringSeen or suite statuses, 0 pinSuite0 at an engine, 0 commands from the UI flows.
+ *     pinCensus() counts every pin setter, pin-shaped write, saveData, markCreating and key-command construction
+ *     in the shipped sources. The pin setters are main's (pluginController.ts, keys/pin.ts, ui/api.ts's
+ *     sanitizing loader). The key commands are E5's sanctioned sites only, each behind its guard: createVault.ts
+ *     enableE2ee and pinSuite0 {create} behind creationCheck (§15.1) and main's marker check; keyActions.ts
+ *     pinSuite0 {link}, installKey and revokeRekey behind main's refusals. They are reached only from the
+ *     user-initiated modals and the protocol handler (import graph). Behaviourally: createVault's two choices
+ *     send nothing short of "creatable", and a suite=0 link routed through routeSetupLink and applyLinkE2ee into
+ *     a suite-1, suite-0 or keyringSeen device is refused on main, with 0 engine pins and 0 writes.
+ *     Existing: pin.test.ts:16, pin.test.ts:101, pluginController.test.ts:182.
  * (d) Suite-0 link after a genesis -> "d. ...". Live and history genesis x 3 seeds; the server then hides k and
- *     drops the session. 6 suite=0 link shapes are rejected by parseSetupLink. pinSuite0 {link} is refused
- *     (keyring-seen) by main, also after UI writes, a re-pair and a restart. keyringSeen stays saved; there are 0
- *     writes. Existing: pluginController.test.ts:200, keyReader.test.ts:91, pinGate.test.ts:227, pin.test.ts:88.
+ *     drops the session. parseSetupLink accepts the 4 `suite=0` shapes (§12.4 source (ii)) and rejects the 2
+ *     with unknown keys. Every accepted one routes "apply" (routeSetupLink) and applyLinkE2ee's pinSuite0 {link}
+ *     is refused (keyring-seen) by main, also after UI writes, a re-pair and a restart. keyringSeen stays saved;
+ *     there are 0 writes. Existing: pluginController.test.ts:200, keyReader.test.ts:91, pinGate.test.ts:227,
+ *     pin.test.ts:88.
  *     - A restarted engine is not told keyringSeen (e2ee-design.md §18.4 "keyringSeen is not in init.crypto", hostKeys.ts:48), so its own answer
  *       is "ok". The engine never pins: only main does (pluginController.ts:267, :294-299), and main refuses.
  * (e) Creation path -> "e. ...". 5 non-empty vaults (head > 0, or k non-empty) x 3 seeds: never creatable;
  *     enableE2ee and pinSuite0 {create} are refused; no pin, 0 writes. A marker for another vaultId, set before
- *     pairing, while paired, or via a UI write, is ignored. 13 hostile setup-link shapes are rejected, and the
- *     protocol handler (registerUi.ts:156-163) only prefills host and pairing code. Existing: pinGate.test.ts:243,
- *     pin.test.ts:63, pin.test.ts:29, pluginController.test.ts:295.
+ *     pairing, while paired, or via a UI write, is ignored. No link reaches the flow: every link class (13
+ *     hostile shapes, key-less, suite=0, key, re-key) x 9 device states goes through the protocol handler's
+ *     routeSetupLink(parseSetupLink(params)) (registerUi.ts:220-225) to ignore, apply or pair, as §12.4 says;
+ *     a pair route enrolls with a key-free /enroll body and attempt, and an apply route sends only pinSuite0
+ *     {link} or installKey {qr}, never markCreating. Existing: pinGate.test.ts:243, pin.test.ts:63,
+ *     pin.test.ts:29, pluginController.test.ts:295.
  * (f) Unverified key -> "f. ...". 9 QR/RK keys without a matching k record x 3 seeds x {same engine, restart}:
  *     unpinned, 0 SecretStorage writes, 0 writes, no key bytes left on main. Existing: keyReader.test.ts:114,
  *     pluginController.test.ts:216.
@@ -44,8 +57,9 @@
  *     write gate, counts 0 seals after encrypted-vault and 0 through a shut gate. 0 rows and 0 k rows by the
  *     device after it saw the genesis. Existing: keyring.ops.test.ts:81.
  *
- * Residual risk (§12.4): a suite=0 link taken from a hostile source. Here parseSetupLink rejects `suite`
- * (pairing.ts:503-507), and c's census shows no production code builds pinSuite0.
+ * Residual risk (§12.4): a suite=0 link, or a key with a forged genesis, taken from a hostile source and opened
+ * by an unpinned device that has never read a genesis. parseSetupLink accepts `suite=0` by design (source (ii));
+ * c and d show it is refused once keyringSeen or any pin is set.
  * Output: counts only, never key bytes, recovery keys, codes or links.
  */
 import { test } from "node:test";
@@ -84,11 +98,17 @@ import type { UserCommand } from "../../protocol/messages";
 import type { StatusSnapshot } from "../../protocol/status";
 import type { HostUiSink } from "../../host/hostRuntime";
 import { PinRefusedError, YaosController } from "../../host/pluginController";
-import { defaultPluginData, type YaosPluginData } from "../../host/ui/api";
-import { base64Url, buildSetupLink, parseSetupLink, prepareEnrollment, type EnrollInput, type RequestFn } from "../../host/ui/pairing";
+import { defaultPluginData, type YaosPluginData, type YaosUiHost } from "../../host/ui/api";
+import {
+	base64Url, buildRekeyLink, buildSetupLink, encodeKeyParam, parseSetupLink, prepareEnrollment,
+	type EnrollInput, type EnrollmentAttempt, type HttpRequest, type RequestFn,
+} from "../../host/ui/pairing";
 import { applyPairedIdentity, PairingSession, resumePendingEnrollment, setPendingEnrollment, withoutPendingEnrollment } from "../../host/ui/pairFlow";
 import { renderStatus } from "../../host/ui/statusBar";
-import { UI_COMMANDS } from "../../host/ui/commands";
+import { canCreateVault, UI_COMMANDS } from "../../host/ui/commands";
+import { createAndEnroll, CreateVaultError, enableEncryption, optOutOfEncryption } from "../../host/ui/createVault";
+import { applyLinkE2ee, revokeRekey, routeSetupLink } from "../../host/ui/keyActions";
+import { FakeUiHost, snapshot } from "../../host/ui/testkit/fakeUiHost";
 
 // --- shared helpers ------------------------------------------------------------------------------------------
 
@@ -480,6 +500,64 @@ function controllerWorld(clock: VirtualClock, net: SimNet, initial: YaosPluginDa
 
 const noBytes = (b: Uint8Array): boolean => b.byteLength === 0 || b.every((x) => x === 0);
 
+type FlowHost = Pick<YaosUiHost, "data" | "status" | "runState" | "brake" | "onChange" | "updateData" | "command" | "markCreating" | "abandonCreating">;
+
+/**
+ * The controller as the UI flows (src/host/ui/**) see it, as plugin.ts hands it to registerUi. Every command main
+ * answers is counted as `main answered <command>=<answer>`, and every marker call as `main <method>`.
+ */
+function uiHostOf(ctl: YaosController, answers: Map<string, number>): FlowHost {
+	return {
+		data: () => ctl.data(), status: () => ctl.status(), runState: () => ctl.runState(), brake: () => ctl.brake(),
+		onChange: (l) => ctl.onChange(l), updateData: (m) => ctl.updateData(m),
+		markCreating: (v) => (count(answers, "main markCreating"), ctl.markCreating(v)),
+		abandonCreating: (v) => (count(answers, "main abandonCreating"), ctl.abandonCreating(v)),
+		command: async (c) => {
+			const label = c.t === "pinSuite0" ? `pinSuite0:${c.source}` : c.t === "installKey" ? `installKey:${c.source}` : c.t;
+			try {
+				const v = await ctl.command(c);
+				count(answers, `main answered ${label}=${v.t}`);
+				return v;
+			} catch (e) {
+				count(answers, `main answered ${label}=${e instanceof PinRefusedError ? `refused:${e.refusal}` : "error"}`);
+				throw e;
+			}
+		},
+	};
+}
+
+/** Settles a UI flow on the clock: "resolved", "CreateVaultError:<code>" or "rejected" (messages are not kept). */
+async function flowOutcome(clock: VirtualClock, p: Promise<unknown>): Promise<string> {
+	let r: string | null = null;
+	p.then(() => (r = "resolved"), (e: unknown) => (r = e instanceof CreateVaultError ? `CreateVaultError:${e.code}` : "rejected"));
+	await clock.runUntil(() => r !== null, 60_000);
+	return r ?? "unsettled";
+}
+
+/** A fixed test operator key (never printed). */
+const TEST_OPERATOR_KEY = "0f1e2d3c4b5a6978".repeat(4);
+
+/**
+ * A server that would create a vault for anyone: unclaimed, and its claim hands back the device's own vault id and
+ * an owner code for it (markedCreating would accept that on an unpinned device). Every request is counted.
+ */
+function willingCreationServer(requests: Map<string, number>, code: string): RequestFn {
+	return async (req) => {
+		const path = req.url.startsWith(HOST) ? req.url.slice(HOST.length) : "other-host";
+		count(requests, `${req.method} ${path}`);
+		if (req.method === "GET" && path === "/api/capabilities") return { status: 200, json: { claimed: false, streams: 1, serverVersion: "sim" } };
+		if (req.method === "POST" && path === "/claim") {
+			return { status: 200, json: { ok: true, vaultId: SIM_VAULT_ID, pairingCode: code }, headers: { "set-cookie": [`yaos_op=${"s".repeat(43)}; Path=/; HttpOnly; Secure; SameSite=Strict`] } };
+		}
+		if (req.method === "POST" && path === "/operator/logout") return { status: 200, json: { ok: true } };
+		if (req.method === "POST" && path === "/enroll") {
+			const b = JSON.parse(req.body ?? "{}") as { deviceId?: string; deviceToken?: string };
+			return { status: 200, json: { vaultId: SIM_VAULT_ID, deviceId: b.deviceId, deviceToken: b.deviceToken, host: HOST, deviceName: "Joiner", vaultGeneration: null } };
+		}
+		return { status: 404, json: null };
+	};
+}
+
 interface JoinTallies {
 	cases: number;
 	readonly finals: Map<string, number>;
@@ -491,6 +569,8 @@ interface JoinTallies {
 	readonly writes: Map<string, number>;
 	readonly requests: Map<string, number>;
 	readonly ui: Map<string, number>;
+	/** The UI flows of src/host/ui/** on the blocked device, and every command or marker call they made on main. */
+	readonly flows: Map<string, number>;
 	headZero: number;
 	headPositive: number;
 }
@@ -568,6 +648,27 @@ async function keylessJoin(form: JoinForm, state: VaultState, seed: number, t: J
 	dev.vault.userWrite("typed-after-keys.md", "still blocked\n");
 	await clock.advance(10_000);
 
+	// The UI flows a user can reach on this device (§12.4: only a key; §15.1: never creation), against main itself.
+	const flowHost = uiHostOf(ctl, t.flows);
+	const savesBefore = w.saved.length;
+	const dataBefore = fp(ctl.data());
+	const creation = new Map<string, number>();
+	count(t.flows, `canCreateVault=${canCreateVault(flowHost)}`);
+	for (const claimed of [false, true]) {
+		const create = createAndEnroll({ server: { host: HOST, claimed }, operatorKey: TEST_OPERATOR_KEY, vaultName: "New vault", deviceName: "Joiner" }, flowHost, { request: willingCreationServer(creation, code), randomBytes });
+		count(t.flows, `createAndEnroll ${claimed ? "claimed" : "unclaimed"}=${await flowOutcome(clock, create)}`);
+	}
+	const rk4 = seededRk(rng.fork("rk4"));
+	const rk5 = seededRk(rng.fork("rk5"));
+	count(t.flows, `enableEncryption=${await flowOutcome(clock, enableEncryption(flowHost, SIM_VAULT_ID, rk4))}`);
+	count(t.flows, `optOutOfEncryption=${await flowOutcome(clock, optOutOfEncryption(flowHost, SIM_VAULT_ID))}`);
+	count(t.flows, `revokeRekey=${await flowOutcome(clock, revokeRekey(flowHost, rk5))}`);
+	count(t.flows, `flow buffers wiped=${[rk4, rk5].every(noBytes)}`);
+	count(t.flows, `creation requests=${[...creation.values()].reduce((a, b) => a + b, 0)}`);
+	await clock.advance(3_000);
+	count(t.flows, `saves=${w.saved.length - savesBefore}`);
+	count(t.flows, `data unchanged=${fp(ctl.data()) === dataBefore}`);
+
 	// The case's outcome.
 	const s = ctl.status();
 	count(t.finals, `${ctl.runState().phase}/${s?.phase}/${s?.e2ee?.keyMissing}/suite=${s?.e2ee?.suite}`);
@@ -599,7 +700,7 @@ async function keylessJoin(form: JoinForm, state: VaultState, seed: number, t: J
 		diskNotUsers: [...dev.vault.snapshot().keys()].filter((p) => !["mine.md", "typed-while-blocked.md", "typed-after-keys.md"].includes(p)).length,
 	};
 	for (const [k2, n] of Object.entries(writes)) t.writes.set(k2, (t.writes.get(k2) ?? 0) + n);
-	// The UI layer (read-only here, src/host/ui/**): the status text and the command list of this state.
+	// The UI layer (src/host/ui/**): the status text and the command list of this state.
 	const r = renderStatus(s, ctl.runState());
 	count(t.ui, `tooltip names RK+QR=${/recovery key/i.test(r.tooltip) && /scan/i.test(r.tooltip)}`);
 	count(t.ui, `tooltip offers plaintext/create=${/unencrypt|without encryption|plain|suite|continue|create|turn off/i.test(r.tooltip)}`);
@@ -622,13 +723,20 @@ function keylessJoinMatrix(): Promise<JoinTallies> {
 	joinMatrix ??= (async () => {
 		const t: JoinTallies = {
 			cases: 0, finals: new Map(), uiCommands: new Map(), probes: new Map(), engineCommands: new Map(), savedPins: new Map(),
-			statusFlags: new Map(), writes: new Map(), requests: new Map(), ui: new Map(), headZero: 0, headPositive: 0,
+			statusFlags: new Map(), writes: new Map(), requests: new Map(), ui: new Map(), flows: new Map(), headZero: 0, headPositive: 0,
 		};
 		for (const seed of JOIN_SEEDS) for (const state of VAULT_STATES) for (const form of JOIN_FORMS) await keylessJoin(form, state, seed, t);
 		return t;
 	})();
 	return joinMatrix;
 }
+
+/** commands.ts UI_COMMANDS available on a paired device blocked for want of a key (running, not paused, no brake). */
+const PALETTE_WHEN_BLOCKED = [
+	"yaos-browse-snapshots", "yaos-clean-up-attachments", "yaos-create-snapshot", "yaos-export-diagnostics",
+	"yaos-export-diagnostics-with-paths", "yaos-pair-another-device", "yaos-pair-device", "yaos-pause",
+	"yaos-rebuild-local-cache", "yaos-reconcile-now", "yaos-restart-engine", "yaos-unlock",
+] as const;
 
 test("b. hidden k, key-less join: every form x head state x seed ends key-missing/no-pin with zero writes; only installKey (QR, RK) is accepted", async () => {
 	const t = await keylessJoinMatrix();
@@ -657,13 +765,43 @@ test("b. hidden k, key-less join: every form x head state x seed ends key-missin
 		rebuildLocalCache: n, cleanUpAttachments: n, "installKey:qr": n, "installKey:rk": n,
 	}, "no pinSuite0, enableE2ee or revokeRekey reached an engine");
 	assert.deepEqual(tallyObj(t.requests), { "GET /api/capabilities": n - resumes, "POST /enroll": n }, "every form enrolled against the hostile server");
-	// UI layer (read-only, src/host/ui/**): the status tooltip names exactly the two ways out; no palette command
-	// sets a pin, a suite or encryption. The two-button screen itself is WP-E5 (UI-only).
+	// UI layer (src/host/ui/**): the palette of every blocked device, exactly. Its one key command is "yaos-unlock",
+	// the blocked screen (keyModals.ts:51-94) with exactly [Scan QR from one of your devices] [Enter recovery key].
+	// "Create a new vault" is not offered (canCreateVault, commands.ts:18-22), nor anything that pins or re-keys.
 	const commands = Object.keys(tallyObj(t.ui)).filter((k) => k.startsWith("command:"));
-	assert.deepEqual(commands.filter((c) => /pin\b|suite|e2ee|encrypt|key|plain|unlock|create-vault/.test(c)), []);
+	assert.deepEqual(commands, PALETTE_WHEN_BLOCKED.map((id) => `command:${id}`), "the blocked device's palette, exactly");
+	assert.deepEqual(commands.filter((c) => /pin\b|suite|e2ee|encrypt|key|plain|unlock|vault|rekey/.test(c)), ["command:yaos-unlock"], "no command that pins, creates a vault or re-keys");
 	assert.ok(commands.every((c) => t.ui.get(c) === n));
 	assert.equal(t.ui.get("tooltip names RK+QR=true"), n);
 	assert.equal(t.ui.get("tooltip offers plaintext/create=false"), n);
+	// The flows behind every other button (createVault.ts, keyActions.ts) on the same controller: creation refuses
+	// before any request (canCreateVault) against a server that would create, the two choices stop without a marker,
+	// re-key needs the key; no command reached main, no marker call, nothing saved.
+	assert.deepEqual(tallyObj(t.flows), {
+		"canCreateVault=false": n,
+		"createAndEnroll claimed=CreateVaultError:blocked": n,
+		"createAndEnroll unclaimed=CreateVaultError:blocked": n,
+		"enableEncryption=CreateVaultError:stopped": n,
+		"optOutOfEncryption=CreateVaultError:stopped": n,
+		"revokeRekey=rejected": n,
+		"flow buffers wiped=true": n,
+		"creation requests=0": n,
+		"saves=0": n,
+		"data unchanged=true": n,
+	}, "the UI flows of a blocked device send nothing and write nothing");
+});
+
+test("b. control: the same willing server creates for an unpaired device (the refusal above is not vacuous)", async () => {
+	const host = new FakeUiHost();
+	const requests = new Map<string, number>();
+	const rng = new SeededRandom(5);
+	const code = `${SIM_VAULT_ID}.${base64Url(rng.bytes(24))}`;
+	assert.equal(canCreateVault(host), true);
+	const out = await createAndEnroll({ server: { host: HOST, claimed: false }, operatorKey: TEST_OPERATOR_KEY, vaultName: "New vault", deviceName: "Joiner" }, host, { request: willingCreationServer(requests, code), randomBytes: (k) => rng.bytes(k) });
+	assert.equal(out.vaultId, SIM_VAULT_ID);
+	assert.deepEqual(tallyObj(requests), { "POST /claim": 1, "POST /enroll": 1, "POST /operator/logout": 1 });
+	assert.deepEqual(host.calls, [`markCreating:${SIM_VAULT_ID}`, "updateData"]);
+	assert.deepEqual(host.data().creating, { vaultId: SIM_VAULT_ID });
 });
 
 test("c. the pin never comes from the server: over every key-less join, 0 suite-0 pins, 0 creatable; every pin setter is main's", async () => {
@@ -676,21 +814,153 @@ test("c. the pin never comes from the server: over every key-less join, 0 suite-
 	assert.equal(t.engineCommands.get("pinSuite0:link") ?? 0, 0);
 	assert.equal(t.engineCommands.get("pinSuite0:create") ?? 0, 0);
 
+	// The UI flows on every blocked device (b) sent main no command and made no marker call.
+	assert.deepEqual(Object.keys(tallyObj(t.flows)).filter((k) => k.startsWith("main ")), [], "no UI flow reached main");
+
 	// Static: every path that can set a pin, counted in the shipped sources (comments stripped; tests, testkits, spike out).
 	const census = pinCensus();
 	assert.deepEqual(census, {
-		// pluginController.ts: onStatus keyringSeen (:188), pinAfter (:295 pinSuite0 / enableE2ee ok), keyringStored (:308),
-		// markCreating (:347, no production caller).
+		// pluginController.ts: onStatus keyringSeen (:189), pinAfter (:296, only after an engine "ok" to pinSuite0 /
+		// enableE2ee that main let through), keyringStored (:309), markCreating (:348).
 		"call:sawKeyring": { "host/pluginController.ts": 1 },
 		"call:pinnedSuite0": { "host/pluginController.ts": 1 },
 		"call:pinnedSuite1": { "host/pluginController.ts": 2 },
 		"call:markedCreating": { "host/pluginController.ts": 1 },
 		"call:withPin": { "host/keys/pin.ts": 2 },
-		// Pin-shaped writes: pin.ts withPin / sawKeyring / pinAcross; api.ts the data.json loader (sanitizePin).
-		"e2ee-write": { "host/keys/pin.ts": 3, "host/ui/api.ts": 1 },
+		// Pin-shaped writes: pin.ts withPin / sawKeyring / pinAcross; api.ts the data.json loader (sanitizePin);
+		// keyActions.ts:50 is a route value ({kind: "apply", e2ee: {suite: 1, key}}), not data.json.
+		"e2ee-write": { "host/keys/pin.ts": 3, "host/ui/api.ts": 1, "host/ui/keyActions.ts": 1 },
 		"creating-write": { "host/keys/pin.ts": 1 },
 		saveData: { "host/pluginController.ts": 2, "host/plugin.ts": 1 },
-	}, "no other pin setter, and no production code builds a pinSuite0/enableE2ee/installKey/revokeRekey command or calls markCreating");
+		// plugin.ts:128 wires YaosUiHost.markCreating to main. createVault.ts:117: step 1, after canCreateVault (:114)
+		// and the server's creating response; main's markedCreating still refuses it under a pin for that vault.
+		markCreating: { "host/plugin.ts": 1, "host/ui/createVault.ts": 1 },
+		// createVault.ts:211 enableE2ee and :223 pinSuite0 {create}: only when creationCheck (:206, :221) says
+		// "creatable" (§15.1), and main refuses both without the marker (refuseEnableE2ee, refusePinSuite0).
+		"command:enableE2ee": { "host/ui/createVault.ts": 1 },
+		// keyActions.ts:115 pinSuite0 {link}: main refuses it under any pin or keyringSeen (refusePinSuite0).
+		"command:pinSuite0": { "host/ui/createVault.ts": 1, "host/ui/keyActions.ts": 1 },
+		// keyActions.ts:119 (QR or link key), :145 (RK): main refuses both on a suite-0 pin (refuseKeyCommand).
+		"command:installKey": { "host/ui/keyActions.ts": 2 },
+		// keyActions.ts:219: after rekeyBlocked (:215, suite 1 with the current key), and main's refuseKeyCommand.
+		"command:revokeRekey": { "host/ui/keyActions.ts": 1 },
+		"source-link": { "host/ui/keyActions.ts": 1 },
+	}, "no other pin setter, and key commands only at E5's guarded sites");
+
+	// Who can reach those sites: only the user-initiated modals and the protocol handler (registerUi.ts), which
+	// plugin.ts registers. createVault.ts sits behind CreateVaultModal alone.
+	assert.deepEqual(importersOf(["host/ui/createVault.ts", "host/ui/createVaultModal.ts", "host/ui/keyActions.ts", "host/ui/keyModals.ts", "host/ui/pairModal.ts", "host/ui/registerUi.ts"]), {
+		"host/ui/createVault.ts": ["host/ui/createVaultModal.ts"],
+		"host/ui/createVaultModal.ts": ["host/ui/registerUi.ts"],
+		"host/ui/keyActions.ts": ["host/ui/keyModals.ts", "host/ui/pairModal.ts", "host/ui/registerUi.ts"],
+		"host/ui/keyModals.ts": ["host/ui/createVaultModal.ts", "host/ui/registerUi.ts"],
+		"host/ui/pairModal.ts": ["host/ui/registerUi.ts"],
+		"host/ui/registerUi.ts": ["host/plugin.ts"],
+	});
+	// registerUi.ts opens CreateVaultModal (:120) only from the two commands and the two settings actions.
+	const register = shippedSource("host/ui/registerUi.ts");
+	assert.equal(register.match(/new CreateVaultModal\(/g)?.length, 1);
+	assert.equal(register.match(/\bopenCreateVault\(/g)?.length, 4);
+	assert.deepEqual([...register.matchAll(/^\s*(.*?)\s*=>\s*openCreateVault\((true|false)\)/gm)].map((m) => `${m[1]}(${m[2]})`).sort(), [
+		"\"yaos-create-vault\": ()(false)", "\"yaos-finish-creating-vault\": ()(true)", "openCreateVault: ()(false)", "openResumeCreation: ()(true)",
+	]);
+});
+
+test("c. createVault's two choices send nothing short of \"creatable\" (§15.1), whatever the status claims", async () => {
+	const out = new Map<string, number>();
+	const marker = { creating: { vaultId: SIM_VAULT_ID } };
+	const states: [string, Partial<YaosPluginData>, StatusSnapshot | null][] = [
+		["creatable (control)", { ...pairedData(), ...marker }, snapshot("key-missing", { creatable: true })],
+		["no marker, status says creatable", pairedData(), snapshot("key-missing", { creatable: true })],
+		["unpaired, marker", { ...defaultPluginData("J"), ...marker }, snapshot("key-missing", { creatable: true })],
+		["marker for another vault", { ...pairedData(), creating: { vaultId: OTHER_VAULT } }, snapshot("key-missing", { creatable: true })],
+		["marker, keyringSeen pin", { ...pairedData(), ...marker, e2ee: { suite: null, keyringSeen: true } }, snapshot("key-missing", { creatable: true })],
+		["marker, suite-1 pin", { ...pairedData(), ...marker, e2ee: { suite: 1 } }, snapshot("key-missing", { creatable: true })],
+		["marker, suite-0 pin", { ...pairedData(), ...marker, e2ee: { suite: 0 } }, snapshot("key-missing", { creatable: true })],
+		["marker, engine read a genesis", { ...pairedData(), ...marker }, snapshot("key-missing", { keyringSeen: true, keyMissing: "encrypted-vault" })],
+		["marker, head > 0", { ...pairedData(), ...marker }, snapshot("key-missing", {}, { headSeq: 3 })],
+		["marker, engine not reporting", { ...pairedData(), ...marker }, null],
+	];
+	for (const [name, data, snap] of states) {
+		for (const choice of ["enable", "opt-out"] as const) {
+			const host = new FakeUiHost(data);
+			host.snap = snap;
+			const rk = seededRk(new SeededRandom(name.length));
+			const r = await (choice === "enable" ? enableEncryption(host, SIM_VAULT_ID, rk) : optOutOfEncryption(host, SIM_VAULT_ID)).then(() => "resolved", (e: unknown) => (e instanceof CreateVaultError ? e.code : "rejected"));
+			count(out, `${name}: ${choice}=${r} sent=${host.commands.map((c) => (c.t === "pinSuite0" ? `pinSuite0:${c.source}` : c.t)).join(",") || "none"} rk wiped=${noBytes(rk)}`);
+		}
+	}
+	assert.deepEqual(tallyObj(out), {
+		"creatable (control): enable=resolved sent=enableE2ee rk wiped=true": 1,
+		"creatable (control): opt-out=resolved sent=pinSuite0:create rk wiped=false": 1,
+		"no marker, status says creatable: enable=stopped sent=none rk wiped=true": 1,
+		"no marker, status says creatable: opt-out=stopped sent=none rk wiped=false": 1,
+		"unpaired, marker: enable=stopped sent=none rk wiped=true": 1,
+		"unpaired, marker: opt-out=stopped sent=none rk wiped=false": 1,
+		"marker for another vault: enable=stopped sent=none rk wiped=true": 1,
+		"marker for another vault: opt-out=stopped sent=none rk wiped=false": 1,
+		"marker, keyringSeen pin: enable=not-empty sent=none rk wiped=true": 1,
+		"marker, keyringSeen pin: opt-out=not-empty sent=none rk wiped=false": 1,
+		"marker, suite-1 pin: enable=stopped sent=none rk wiped=true": 1,
+		"marker, suite-1 pin: opt-out=stopped sent=none rk wiped=false": 1,
+		"marker, suite-0 pin: enable=stopped sent=none rk wiped=true": 1,
+		"marker, suite-0 pin: opt-out=stopped sent=none rk wiped=false": 1,
+		"marker, engine read a genesis: enable=not-empty sent=none rk wiped=true": 1,
+		"marker, engine read a genesis: opt-out=not-empty sent=none rk wiped=false": 1,
+		"marker, head > 0: enable=not-empty sent=none rk wiped=true": 1,
+		"marker, head > 0: opt-out=not-empty sent=none rk wiped=false": 1,
+		"marker, engine not reporting: enable=unconfirmed sent=none rk wiped=true": 1,
+		"marker, engine not reporting: opt-out=unconfirmed sent=none rk wiped=false": 1,
+	}, "a command only on the creation path, read creatable");
+});
+
+test("c. a suite=0 link never pins a device that holds a pin or has seen a genesis: refused on main, 0 engine pins, 0 writes", async () => {
+	const t = { outcomes: new Map<string, number>(), pins: new Map<string, number>(), writes: new Map<string, number>(), engine: new Map<string, number>() };
+	const PINS = [["suite 1", { suite: 1 }], ["suite 0", { suite: 0 }], ["keyringSeen", { suite: null, keyringSeen: true }]] as const;
+	for (const seed of SEEDS) for (const [name, pin] of PINS) {
+		const clock = newClock();
+		const net = new SimNet(clock, { seed: seed * 53 + name.length, linkMs: 10 });
+		const w = controllerWorld(clock, net, pairedData(J_ID, { e2ee: pin }));
+		const { ctl } = w;
+		void ctl.start();
+		assert.ok(await clock.runUntil(() => ctl.runState().phase === "running" && ctl.status()?.relay.connected === true && ctl.status()?.e2ee !== undefined, 60_000), `${name}: running`);
+		await clock.advance(3_000);
+		const since = { ...relayState(net), appends: net.relay.counters().appendFrames };
+		const answers = new Map<string, number>();
+		const host = uiHostOf(ctl, answers);
+		const opts = simOpts(clock);
+		const rng = new SeededRandom(seed * 7 + name.length);
+		const code = `${SIM_VAULT_ID}.${base64Url(rng.bytes(24))}`;
+		const links: [string, Record<string, string>][] = [["suite=0", { action: "setup", host: HOST, pairingCode: code, suite: "0" }]];
+		if (pin.suite === 0) links.push(["key", { action: "setup", host: HOST, pairingCode: code, key: encodeKeyParam({ e: 1, k: K(1).slice() }) }]);
+		for (const [link, params] of links) {
+			// What the protocol handler does (registerUi.ts:220-225): route, then applyLink -> applyLinkE2ee.
+			const route = routeSetupLink(parseSetupLink(params), ctl.data(), ctl.status());
+			const applied = route.kind === "apply" ? await flowOutcome(clock, applyLinkE2ee(host, SIM_VAULT_ID, route.e2ee, opts)) : "-";
+			count(t.outcomes, `${name}, ${link} link: route=${route.kind} applyLinkE2ee=${applied}`);
+		}
+		for (const [k2, v] of answers) count(t.outcomes, `${name}: ${k2}${v > 1 ? ` x${v}` : ""}`);
+		await clock.advance(3_000);
+		count(t.pins, `${name}: pin unchanged=${fp(ctl.data().e2ee) === fp(pin)}`);
+		for (const [c, v] of w.engineCommands) if (/pinSuite0|enableE2ee|installKey|revokeRekey/.test(c)) t.engine.set(c, (t.engine.get(c) ?? 0) + v);
+		if (pin.suite !== 0) sumInto(t.writes, await writesOf(net, w, [J_ID], since));
+		else count(t.writes, `suite 0: k rows by the device=${net.relay.rows(KEYRING_STREAM).filter((r) => r.deviceId === J_ID).length}`);
+		await settleOn(clock, ctl.stop());
+	}
+	const n = SEEDS.length;
+	assert.deepEqual(tallyObj(t.outcomes), {
+		"suite 1, suite=0 link: route=apply applyLinkE2ee=rejected": n,
+		"suite 1: main answered pinSuite0:link=refused:already-pinned": n,
+		"suite 0, suite=0 link: route=apply applyLinkE2ee=rejected": n,
+		"suite 0, key link: route=apply applyLinkE2ee=rejected": n,
+		"suite 0: main answered pinSuite0:link=refused:already-pinned": n,
+		"suite 0: main answered installKey:qr=refused:suite-0-pinned": n,
+		"keyringSeen, suite=0 link: route=apply applyLinkE2ee=rejected": n,
+		"keyringSeen: main answered pinSuite0:link=refused:keyring-seen": n,
+	}, "each link is routed to its vault and refused on main, once (a refusal is not retried)");
+	assert.deepEqual(tallyObj(t.pins), { "suite 1: pin unchanged=true": n, "suite 0: pin unchanged=true": n, "keyringSeen: pin unchanged=true": n });
+	assert.deepEqual(tallyObj(t.engine), {}, "no pin or key command reached an engine");
+	assert.deepEqual(tallyObj(t.writes), { ...ZERO_WRITES, "suite 0: k rows by the device=0": n });
 });
 
 // --- shared: a paired, unpinned controller device ------------------------------------------------------------
@@ -737,7 +1007,10 @@ function sumInto(t: Map<string, number>, r: Record<string, number>): void {
 
 const ZERO_WRITES = { rows: 0, appends: 0, headDelta: 0, checkpointsChanged: 0, blobCalls: 0, indexedDbStores: 0, secretWrites: 0, secretsHeld: 0 };
 
-/** suite=0 link shapes as Obsidian hands them to the protocol handler (registerUi.ts:156): all must be refused. */
+/**
+ * suite=0 link shapes as Obsidian hands them to the protocol handler (registerUi.ts:220-225). The first four are
+ * what §12.4 source (ii) sanctions and parseSetupLink accepts; the two with an unknown key are rejected.
+ */
 function suite0LinkParams(code: string): Record<string, string>[] {
 	const base = { action: "setup", host: HOST, pairingCode: code };
 	return [
@@ -754,6 +1027,22 @@ function suite0LinkParams(code: string): Record<string, string>[] {
 
 test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refused at every layer, nothing is written", async () => {
 	const t = { cases: 0, outcomes: new Map<string, number>(), links: new Map<string, number>(), writes: new Map<string, number>(), pins: new Map<string, number>() };
+	const answers = new Map<string, number>();
+	/** Every suite=0 shape as the protocol handler takes it (registerUi.ts:220-225): parse, route, applyLinkE2ee. */
+	const viaHandler = async (label: string, clock: VirtualClock, ctl: YaosController, code: string): Promise<void> => {
+		for (const params of suite0LinkParams(code)) {
+			const parsed = parseSetupLink(params);
+			if (!parsed.ok) {
+				count(t.links, `${label}: rejected`);
+				continue;
+			}
+			const route = routeSetupLink(parsed, ctl.data(), ctl.status());
+			count(t.links, `${label}: ${parsed.kind} suite=${parsed.kind === "setup" ? parsed.e2ee?.suite : "-"} route=${route.kind}`);
+			if (route.kind !== "apply") continue;
+			const vaultId = ctl.data().identity?.vaultId ?? "";
+			count(t.outcomes, `${label}: applyLinkE2ee=${await flowOutcome(clock, applyLinkE2ee(uiHostOf(ctl, answers), vaultId, route.e2ee, simOpts(clock)))}`);
+		}
+	};
 	for (const seed of SEEDS) for (const mode of ["live", "history"] as const) {
 		const clock = newClock();
 		const net = new SimNet(clock, { seed: seed * 17 + (mode === "live" ? 1 : 2), linkMs: 10 });
@@ -782,11 +1071,12 @@ test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refuse
 		dev.vault.userWrite("typed.md", "typed while blocked\n");
 		await clock.advance(3_000);
 
-		// The suite=0 link arrives. The protocol handler's parser refuses it (pairing.ts:503-507: unknown keys).
+		// The suite=0 link arrives. parseSetupLink accepts the sanctioned shapes (§12.4 source (ii)), routeSetupLink
+		// sends them to this vault ("apply"), and applyLinkE2ee's pinSuite0 {link} is refused by main (keyring-seen).
 		const rng = new SeededRandom(seed * 1_000 + (mode === "live" ? 1 : 2));
 		const code = `${SIM_VAULT_ID}.${base64Url(rng.bytes(24))}`;
-		for (const params of suite0LinkParams(code)) count(t.links, parseSetupLink(params).ok ? "accepted" : "rejected");
-		// What any UI would turn it into: pinSuite0 {link}. Main refuses on keyringSeen (pin.ts:68-71) ...
+		await viaHandler("after genesis", clock, ctl, code);
+		// The same command sent to main directly. Main refuses on keyringSeen (refusePinSuite0, pin.ts) ...
 		count(t.outcomes, `ctl pinSuite0 link=${await outcome(clock, ctl.command({ t: "pinSuite0", source: "link" }))}`);
 		// ... and so does this engine incarnation, which read the genesis before k was hidden (keyReader.ts:229).
 		count(t.outcomes, `engine-direct pinSuite0 link (same incarnation)=${await outcome(clock, w.direct({ t: "pinSuite0", source: "link" }))}`);
@@ -809,17 +1099,20 @@ test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refuse
 		assert.ok(await clock.runUntil(() => ctl.status()?.relay.connected === true && ctl.status()?.phase === "key-missing" && ctl.runState().phase === "running", 60_000), "re-paired, blocked");
 		await clock.advance(2_000);
 		count(t.pins, `after re-pair=${fp(ctl.data().e2ee)}`);
+		await viaHandler("after re-pair", clock, ctl, code);
 		count(t.outcomes, `ctl pinSuite0 link after re-pair=${await outcome(clock, ctl.command({ t: "pinSuite0", source: "link" }))}`);
 		// A restart: the engine is not told keyringSeen (e2ee-design.md §18.4 "keyringSeen is not in init.crypto", hostKeys.ts:48); main stays the gate.
 		await settleOn(clock, ctl.restartEngine());
 		assert.ok(await clock.runUntil(() => ctl.status()?.relay.connected === true && ctl.status()?.phase === "key-missing" && ctl.runState().phase === "running", 60_000));
 		await clock.advance(2_000);
+		await viaHandler("after restart", clock, ctl, code);
 		count(t.outcomes, `ctl pinSuite0 link after restart=${await outcome(clock, ctl.command({ t: "pinSuite0", source: "link" }))}`);
 		count(t.outcomes, `engine-direct pinSuite0 link after restart=${await outcome(clock, w.direct({ t: "pinSuite0", source: "link" }))}`);
 		count(t.outcomes, `final=${ctl.status()?.phase}/suite=${ctl.status()?.e2ee?.suite}`);
 		dev.vault.userWrite("typed-2.md", "still blocked\n");
 		await clock.advance(5_000);
 		count(t.pins, `final=${fp(ctl.data().e2ee)}`);
+		count(t.outcomes, `pinSuite0 {link} that reached an engine through main=${w.engineCommands.get("pinSuite0:link") ?? 0}`);
 		for (const d of w.saved) if (d.e2ee?.suite === 0 || d.e2ee?.suite === 1) count(t.pins, "saved suite pin");
 		if (w.statuses.some((st) => st.e2ee?.suite !== null && st.e2ee?.suite !== undefined)) count(t.pins, "status with a suite");
 		sumInto(t.writes, await writesOf(net, w, [J_ID, newId], since));
@@ -830,8 +1123,12 @@ test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refuse
 	assert.equal(t.cases, n);
 	const seen = fp({ suite: null, keyringSeen: true });
 	assert.deepEqual(tallyObj(t.pins), { [`after genesis=${seen}`]: n, [`after UI writes=${seen}`]: n, [`after re-pair=${seen}`]: n, [`final=${seen}`]: n }, "keyringSeen saved and sticky; no suite pin saved or reported");
-	assert.deepEqual(tallyObj(t.links), { rejected: n * suite0LinkParams("x").length }, "every suite=0 link shape is rejected by the parser");
+	const points = ["after genesis", "after re-pair", "after restart"];
+	assert.deepEqual(tallyObj(t.links), tallyObj(new Map(points.flatMap((p) => [[`${p}: rejected`, n * 2], [`${p}: setup suite=0 route=apply`, n * 4]] as const))),
+		"the parser accepts the 4 sanctioned suite=0 shapes and rejects the 2 with unknown keys; each accepted one routes to this vault");
+	assert.deepEqual(tallyObj(answers), { "main answered pinSuite0:link=refused:keyring-seen": n * 4 * points.length }, "main refused every one, once (not retried); no marker call");
 	assert.deepEqual(tallyObj(t.outcomes), {
+		...Object.fromEntries(points.map((p) => [`${p}: applyLinkE2ee=rejected`, n * 4])),
 		"reconnected, k hidden: keyMissing=encrypted-vault keyringSeen(engine)=true": n,
 		"ctl pinSuite0 link=refused:keyring-seen": n,
 		"engine-direct pinSuite0 link (same incarnation)=engine:refused": n,
@@ -841,6 +1138,7 @@ test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refuse
 		// only main pins (pluginController.ts:267 -> pinAfter :294-299), and main refused above.
 		"engine-direct pinSuite0 link after restart=ok": n,
 		"final=key-missing/suite=null": n,
+		"pinSuite0 {link} that reached an engine through main=0": n,
 	});
 	assert.deepEqual(tallyObj(t.writes), ZERO_WRITES, "nothing written after the genesis was read");
 });
@@ -957,28 +1255,22 @@ test("e. creation path: a non-empty vault never becomes creatable; a marker for 
 		}
 	}
 
-	// (4) No link reaches the flow: the protocol handler parses with parseSetupLink and only opens the pair modal
-	// prefilled (registerUi.ts:156-163, openPair :76-79); nothing outside tests calls markCreating (c's census).
-	const rng = new SeededRandom(77);
-	const code = `${SIM_VAULT_ID}.${base64Url(rng.bytes(24))}`;
-	const base = { action: "setup", host: HOST, pairingCode: code };
-	const hostile: Record<string, string>[] = [
-		{ ...base, action: "create" }, { ...base, action: "claim" }, { ...base, action: "new-vault" }, { ...base, action: "enable-e2ee" },
-		{ ...base, create: "1" }, { ...base, creating: SIM_VAULT_ID }, { ...base, vaultId: SIM_VAULT_ID }, { ...base, e2ee: "1" },
-		{ ...base, suite: "1" }, { ...base, key: "AAAA" }, { ...base, rk: "AAAA" }, { ...base, deviceToken: "x" }, { ...base, operatorKey: "x" },
-	];
-	for (const params of hostile) count(t.links, `hostile=${parseSetupLink(params).ok ? "accepted" : "rejected"}`);
-	for (const params of [base, { ...base, action: "yaos" }, { ...base, vault: "My vault" }]) {
-		const r = parseSetupLink(params);
-		count(t.links, `honest=${r.ok ? Object.keys(r).sort().join(",") : "rejected"}`);
-	}
-	const handler = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../host/ui/registerUi.ts"), "utf8");
-	const at = handler.indexOf('registerObsidianProtocolHandler("yaos"');
-	const body = handler.slice(at, handler.indexOf("\n\t});", at));
-	assert.match(body, /parseSetupLink\(params\)/);
-	assert.match(body, /openPair\(\{ host: parsed\.host, pairingCode: parsed\.pairingCode \}\)/);
-	assert.doesNotMatch(body, /markCreating|creating|enableE2ee|pinSuite0|e2ee|suite/, "the handler touches no pin and no creation flow");
-	assert.equal(pinCensus().markCreating, undefined, "markCreating has no production caller");
+	// (4) No link reaches the flow. The protocol handler (registerUi.ts:220-225) is routeSetupLink(parseSetupLink(
+	// params)) and then a Notice ("ignore"), openPair -> PairModal ("pair") or applyLink -> applyLinkE2ee ("apply").
+	// createVault.ts is imported by createVaultModal.ts alone and markCreating is called only there (c's census and
+	// import graph). Behaviourally, over every link class x device state: the route is §12.4's, a pair route enrolls
+	// with a key-free /enroll body and attempt, and an apply route sends only pinSuite0 {link} or installKey {qr}.
+	await linkMatrix(t.links);
+	const register = shippedSource("host/ui/registerUi.ts");
+	const at = register.indexOf('registerObsidianProtocolHandler("yaos"');
+	const body = register.slice(at, register.indexOf("\n\t});", at));
+	assert.match(body, /routeSetupLink\(parseSetupLink\(params\), host\.data\(\), host\.status\(\)\)/);
+	assert.deepEqual([...body.matchAll(/\b(new Notice|openPair|applyLink)\(/g)].map((m) => m[1]), ["new Notice", "openPair", "applyLink"], "three routes, nothing else");
+	assert.doesNotMatch(body, /[Cc]reat|enableE2ee|markCreating|pinSuite0/, "the handler touches no creation flow");
+	const between = (from: string, to: string): string => register.slice(register.indexOf(from), register.indexOf(to));
+	assert.doesNotMatch(between("const applyLink = ", "const openPair = "), /[Cc]reat|markCreating/);
+	assert.doesNotMatch(between("const openPair = ", "const openCreateVault = "), /[Cc]reat|markCreating/);
+	assert.deepEqual(pinCensus().markCreating, { "host/plugin.ts": 1, "host/ui/createVault.ts": 1 }, "markCreating: main's wiring and createVault.ts step 1 only");
 
 	const n = SEEDS.length;
 	const nNot = n * NOT_EMPTY.length;
@@ -997,8 +1289,109 @@ test("e. creation path: a non-empty vault never becomes creatable; a marker for 
 		"other-vault marker: null": nOther, "UI write dropped=true": n * 4,
 	}, "no pin (the visible genesis records keyringSeen; a garbage k row is not a genesis)");
 	assert.deepEqual(tallyObj(t.writes), ZERO_WRITES);
-	assert.deepEqual(tallyObj(t.links), { "hostile=rejected": hostile.length, "honest=host,ok,pairingCode": 3 }, "a link carries only a host and a code");
+	assert.deepEqual(tallyObj(t.links), {
+		// 9 device states x 19 links (13 hostile, 3 key-less, suite=0, key, re-key).
+		"route hostile=ignore": 13 * 9,
+		"route key-less=ignore": 3 * 4, "route key-less=pair": 3 * 5,
+		"route suite=0=apply": 4, "route suite=0=pair": 5,
+		"route key=apply": 4, "route key=pair": 5,
+		"route rekey=apply": 7, "route rekey=ignore": 2,
+		"route differs from §12.4": 0,
+		"data changed by routing": 0,
+		// Pair routes (25): what PairingSession sends and persists, even handed the whole route.
+		"pair: identity=ok enroll body=deviceId,deviceName,deviceToken,enrollmentRequestId,pairingCode attempt=deviceId,deviceName,deviceToken,enrollmentRequestId,host,pairingCode key or suite on the wire=false": 25,
+		// Apply routes (15): applyLinkE2ee on the device's own vault.
+		"apply suite=0: sent=pinSuite0:link outcome=suite0 other host calls=none": 4,
+		"apply key: sent=installKey:qr outcome=pending other host calls=none": 3,
+		"apply key: sent=installKey:qr outcome=verified other host calls=none": 1,
+		"apply rekey: sent=installKey:qr outcome=pending other host calls=none": 5,
+		// "same vault, revoked" and "suite 1": the fake reports the suite-1 pin with nothing missing.
+		"apply rekey: sent=installKey:qr outcome=verified other host calls=none": 2,
+		"apply: key sent is the link's=true, link key zero-filled=true": 4 + 7,
+	}, "no link reaches creation: every link is ignored, joins a vault, or hands over its key");
 });
+
+/** Device states for the link matrix: [name, data, status]. Same vault = paired with SIM_VAULT_ID at HOST, not revoked. */
+function linkDeviceStates(): [string, YaosPluginData, StatusSnapshot | null, boolean][] {
+	const paired = pairedData();
+	const id = paired.identity!;
+	return [
+		["unpaired", defaultPluginData("J"), null, false],
+		["unpaired, marker", { ...defaultPluginData("J"), creating: { vaultId: SIM_VAULT_ID } }, null, false],
+		["same vault, key-missing", paired, snapshot("key-missing"), true],
+		["same vault, revoked", pairedData(J_ID, { e2ee: { suite: 1 } }), snapshot("revoked", { suite: 1, sealEpoch: 1, keyMissing: null }), false],
+		["other vault", { ...paired, identity: { ...id, vaultId: OTHER_VAULT } }, snapshot("key-missing"), false],
+		["other host", { ...paired, identity: { ...id, host: "https://other.example" } }, snapshot("key-missing"), false],
+		["creating marker", pairedData(J_ID, { creating: { vaultId: SIM_VAULT_ID } }), snapshot("key-missing", { creatable: true }), true],
+		["keyringSeen", pairedData(J_ID, { e2ee: { suite: null, keyringSeen: true } }), snapshot("key-missing", { keyMissing: "encrypted-vault", keyringSeen: true }), true],
+		["suite 1", pairedData(J_ID, { e2ee: { suite: 1 } }), snapshot("live", { suite: 1, sealEpoch: 1, keyMissing: null }), true],
+	];
+}
+
+/** e (4): every link class x device state through routeSetupLink, then the pair or apply flow it leads to. */
+async function linkMatrix(out: Map<string, number>): Promise<void> {
+	const rng = new SeededRandom(77);
+	const code = `${SIM_VAULT_ID}.${base64Url(rng.bytes(24))}`;
+	const base = { action: "setup", host: HOST, pairingCode: code };
+	const key = K(1);
+	const keyParam = encodeKeyParam({ e: 1, k: key.slice() });
+	const secrets = [keyParam, base64Url(key)];
+	const links: ["hostile" | "key-less" | "suite=0" | "key" | "rekey", Record<string, string>][] = [
+		...[
+			{ ...base, action: "create" }, { ...base, action: "claim" }, { ...base, action: "new-vault" }, { ...base, action: "enable-e2ee" },
+			{ ...base, create: "1" }, { ...base, creating: SIM_VAULT_ID }, { ...base, vaultId: SIM_VAULT_ID }, { ...base, e2ee: "1" },
+			{ ...base, suite: "1" }, { ...base, key: "AAAA" }, { ...base, rk: "AAAA" }, { ...base, deviceToken: "x" }, { ...base, operatorKey: "x" },
+		].map((l) => ["hostile", l] as ["hostile", Record<string, string>]),
+		["key-less", base], ["key-less", { ...base, action: "yaos" }], ["key-less", { ...base, vault: "My vault" }],
+		["suite=0", { ...base, suite: "0" }],
+		["key", { ...base, key: keyParam }],
+		["rekey", protocolParams(buildRekeyLink({ e: 1, k: key.slice() }))],
+	];
+	for (const [state, data, snap, sameVault] of linkDeviceStates()) {
+		for (const [cls, params] of links) {
+			const before = fp(data);
+			const route = routeSetupLink(parseSetupLink(params), data, snap);
+			count(out, `route ${cls}=${route.kind}`);
+			const want = cls === "hostile" ? "ignore" : cls === "rekey" ? (data.identity ? "apply" : "ignore") : sameVault ? (cls === "key-less" ? "ignore" : "apply") : "pair";
+			out.set("route differs from §12.4", (out.get("route differs from §12.4") ?? 0) + (route.kind === want ? 0 : 1));
+			out.set("data changed by routing", (out.get("data changed by routing") ?? 0) + (fp(data) === before ? 0 : 1));
+			if (route.kind === "pair") {
+				// PairModal.submit sends {host, pairingCode, deviceName} (pairModal.ts:177); hand PairingSession the whole
+				// route anyway: the key must not reach /enroll or the persisted attempt.
+				const requests: HttpRequest[] = [];
+				const attempts: EnrollmentAttempt[] = [];
+				const session = new PairingSession({
+					request: (req) => (requests.push(req), hostileServer(new Map())(req)),
+					randomBytes: (k) => rng.bytes(k),
+					persist: async (a) => void (a && attempts.push(a)),
+				});
+				const r = await session.submit({ ...route, deviceName: "Joiner" }).then(() => "ok", () => "failed");
+				const enroll = requests.find((q) => q.url.endsWith("/enroll"));
+				const bodyKeys = Object.keys(JSON.parse(enroll?.body ?? "{}") as object).sort().join(",");
+				const wire = requests.map((q) => `${q.url}\n${q.body ?? ""}`).join("\n");
+				const leaked = secrets.some((x) => wire.includes(x)) || /[?&](key|suite)=/.test(wire) || /"(key|suite|e2ee)"/.test(wire);
+				count(out, `pair: identity=${r} enroll body=${bodyKeys} attempt=${attempts.map((x) => Object.keys(x).sort().join(",")).join("|")} key or suite on the wire=${leaked}`);
+				if (route.e2ee?.suite === 1) route.e2ee.key.k.fill(0);
+			} else if (route.kind === "apply") {
+				const clock = newClock();
+				const host = new FakeUiHost(data);
+				host.snap = snap;
+				const linkKey = route.e2ee.suite === 1 ? route.e2ee.key.k : null;
+				// As registerUi.ts applyLink: the device's own vault.
+				const r = await settleOn(clock, applyLinkE2ee(host, host.data().identity?.vaultId ?? "", route.e2ee, simOpts(clock)));
+				const sent = host.commands.map((c) => (c.t === "pinSuite0" ? `pinSuite0:${c.source}` : c.t === "installKey" ? `installKey:${c.source}` : c.t)).join(",");
+				const other = host.calls.filter((c) => !c.startsWith("command:")).join(",") || "none";
+				count(out, `apply ${cls}: sent=${sent} outcome=${r.ok ? String(r.value) : "rejected"} other host calls=${other}`);
+				if (linkKey) {
+					const c = host.commands[0];
+					const same = c?.t === "installKey" && c.source === "qr" && c.e === 1 && bytesToHex(c.k) === bytesToHex(key);
+					count(out, `apply: key sent is the link's=${same}, link key zero-filled=${noBytes(linkKey)}`);
+				}
+			}
+		}
+	}
+	key.fill(0);
+}
 
 // --- f. an unverified key ------------------------------------------------------------------------------------
 
@@ -1225,9 +1618,10 @@ test("g. a suite-0 device that sees a k genesis stops with encrypted-vault and i
 	console.log(`[g] cases=${n} final=key-missing/encrypted-vault x${n}; seals after encrypted-vault=0, through a shut gate=0; rows by A after encrypted-vault=0; k rows by A=0`);
 });
 
-/** Pin setters, pin-shaped writes, data.json saves and key commands in src/{core,engine,host,ports,protocol}, by file. */
-function pinCensus(): Record<string, Record<string, number>> {
-	const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const SRC_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+
+/** The shipped sources: src/{core,engine,host,ports,protocol}, without tests, testkits or the spike. */
+function shippedFiles(): string[] {
 	const files: string[] = [];
 	const walk = (dir: string): void => {
 		for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -1237,15 +1631,54 @@ function pinCensus(): Record<string, Record<string, number>> {
 			} else if (e.name.endsWith(".ts") && !e.name.endsWith(".test.ts")) files.push(p);
 		}
 	};
-	for (const d of ["core", "engine", "host", "ports", "protocol"]) walk(join(root, d));
+	for (const d of ["core", "engine", "host", "ports", "protocol"]) walk(join(SRC_ROOT, d));
+	assert.ok(files.length > 100, "walked the sources");
+	return files;
+}
+
+const srcPath = (f: string): string => relative(SRC_ROOT, f).split(sep).join("/");
+
+/** A shipped file's source with comments stripped. */
+function shippedSource(rel: string): string {
+	return stripComments(readFileSync(join(SRC_ROOT, rel), "utf8"));
+}
+
+function stripComments(src: string): string {
+	return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+}
+
+/** For each target (src-relative), the shipped files that import it (static, dynamic or re-export), sorted. */
+function importersOf(targets: readonly string[]): Record<string, string[]> {
+	const out: Record<string, string[]> = Object.fromEntries(targets.map((t) => [t, [] as string[]]));
+	for (const f of shippedFiles()) {
+		const src = stripComments(readFileSync(f, "utf8"));
+		for (const m of src.matchAll(/\b(?:from|import)\s*\(?\s*"(\.{1,2}\/[^"]+)"/g)) {
+			const spec = m[1] ?? "";
+			const r = srcPath(resolve(dirname(f), spec.endsWith(".ts") ? spec : `${spec}.ts`));
+			const list = out[r];
+			if (list && !list.includes(srcPath(f))) list.push(srcPath(f));
+		}
+	}
+	for (const list of Object.values(out)) list.sort();
+	return out;
+}
+
+/** WaitOptions/RetryOptions on the virtual clock, as a UI flow under test needs them. */
+function simOpts(clock: VirtualClock): { now: () => number; sleep: (ms: number) => Promise<void>; setTimer: (ms: number, fn: () => void) => unknown; clearTimer: (h: unknown) => void } {
+	return { now: () => clock.now(), sleep: (ms) => clock.sleep(ms), setTimer: (ms, fn) => clock.setTimer(ms, fn), clearTimer: (h) => clock.clearTimer(h as number) };
+}
+
+/** Pin setters, pin-shaped writes, data.json saves and key commands in the shipped sources, by file. */
+function pinCensus(): Record<string, Record<string, number>> {
+	const files = shippedFiles();
 	const out: Record<string, Record<string, number>> = {};
 	const add = (k: string, f: string): void => {
-		const r = relative(root, f).split(sep).join("/");
+		const r = srcPath(f);
 		const m = (out[k] ??= {});
 		m[r] = (m[r] ?? 0) + 1;
 	};
 	for (const f of files) {
-		const src = readFileSync(f, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+		const src = stripComments(readFileSync(f, "utf8"));
 		for (const m of src.matchAll(/(?<![.\w])(pinnedSuite0|pinnedSuite1|sawKeyring|markedCreating|withoutPin|withPin)\s*\(/g)) {
 			const line = src.slice(src.lastIndexOf("\n", m.index) + 1, src.indexOf("\n", m.index));
 			if (!/\bfunction\s/.test(line)) add(`call:${m[1]}`, f);
@@ -1257,6 +1690,5 @@ function pinCensus(): Record<string, Record<string, number>> {
 		for (const m of src.matchAll(/\bt:\s*"(pinSuite0|enableE2ee|installKey|revokeRekey)"\s*,/g)) add(`command:${m[1]}`, f);
 		for (const _ of src.matchAll(/source:\s*"link"\s*[,}]/g)) add("source-link", f);
 	}
-	assert.ok(files.length > 100, "walked the sources");
 	return out;
 }
