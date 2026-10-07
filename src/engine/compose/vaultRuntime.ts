@@ -37,8 +37,8 @@ import type { FoldedNsFrame } from "../sync/nsRuntime";
 import type { BoundDisk } from "./boundDisk";
 import type { BoundDocs } from "./boundDocs";
 import { foldEffects } from "./foldBridge";
+import type { HostKeyring } from "./hostKeyring";
 import type { HostLink } from "./hostLink";
-import type { KeyringChange } from "../keyring/keyring";
 import type { EngineE2ee } from "../keyring/keyringRuntime";
 import { localDay, LocalDayCounter } from "./localDayCounter";
 import { ComposedLog } from "./logPort";
@@ -52,6 +52,8 @@ export type RestartReason = "retry" | "epoch" | "storage-lost" | "rebuild" | "se
 /** What a runtime needs from the protocol engine that owns it. */
 export interface RuntimeOwner {
 	readonly link: HostLink;
+	/** The keyring main stored (null before init). */
+	readonly keyring: HostKeyring | null;
 	readonly bound: BoundDocs;
 	readonly boundDisk: Pick<BoundDisk, "checkSaved" | "pendingConflictCopies">;
 	onEpochChanged(epoch: VaultEpoch | null): void;
@@ -161,7 +163,7 @@ export class VaultRuntime {
 			onOwnBodySettled: (docIds) => holder.rt?.onOwnBodySettled(docIds),
 			onStatus: (s) => holder.rt?.onLogStatus(s),
 			onHostNotice: (level, code, message) => engine.link.post({ t: "notice", level, code, message }),
-			e2ee: e2eeOf(config.crypto, engine.link),
+			e2ee: e2eeOf(config.crypto, engine.keyring),
 		});
 		const rt = new VaultRuntime(o, log);
 		holder.rt = rt;
@@ -613,17 +615,11 @@ export class VaultRuntime {
 
 /**
  * init.crypto -> EngineOptions.e2ee (e2ee-design §12.4, §18.4). Suite-1 keys reach the crypto port in makePorts,
- * not here. A device whose data.json has no pin arrives as `suite: null` (main maps it; there is no default).
- * `keyringSeen` is main's to enforce on pinSuite0 {link}: init.crypto does not carry it (§18.4 shape).
+ * not here; the records are the set main holds now (a runtime started after a keyring change sees it). The gate
+ * builds no runtime for an unpinned device (pinGate.ts).
  */
-function e2eeOf(crypto: EngineInitConfig["crypto"], link: HostLink): EngineE2ee {
+function e2eeOf(crypto: EngineInitConfig["crypto"], keyring: HostKeyring | null): EngineE2ee {
 	if (crypto.suite === 0) return { suite: 0 };
-	const persist = async (ch: KeyringChange): Promise<void> => {
-		// The message transfers its buffers: hand over copies. The keyring keeps the originals to retry a failed store.
-		const r = await link.request({ t: "keyringChanged", keys: ch.keys.map((x) => ({ e: x.e, k: x.k.slice() })), records: ch.records.map((b) => b.slice()), pending: ch.pending });
-		if (r.t !== "keyringStored") throw new Error(`unexpected keyringChanged answer ${r.t}`);
-		for (const x of ch.keys) x.k.fill(0);
-	};
-	if (crypto.suite === 1) return { suite: 1, records: crypto.records, persist };
-	return { suite: null, creating: crypto.creating, keyringSeen: false, persist };
+	if (crypto.suite === 1 && keyring) return { suite: 1, records: keyring.records, persist: keyring.persist };
+	throw new Error("e2ee: an unpinned device has no vault runtime");
 }

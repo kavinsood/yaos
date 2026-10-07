@@ -22,12 +22,14 @@ let seed = 1;
 const random = () => new SeededRandom(seed++);
 
 /** Builds records as the device holding `keys` would (raw keys retained: the author never sets a seal epoch). */
-export async function record(kind: KeyRecordKind, e: number, keys: readonly { readonly e: number; readonly k: Uint8Array }[], rk?: Uint8Array): Promise<Uint8Array> {
-	const c = await createWebCryptoSuite1({ vaultId: VAULT, random: random(), keys: keys.map((x) => ({ e: x.e, k: x.k.slice() })) });
-	return buildKeyRecord(c, VAULT, e, kind, rk?.slice());
+export async function record(kind: KeyRecordKind, e: number, keys: readonly { readonly e: number; readonly k: Uint8Array }[], rk?: Uint8Array, vaultId = VAULT): Promise<Uint8Array> {
+	const c = await createWebCryptoSuite1({ vaultId, random: random(), keys: keys.map((x) => ({ e: x.e, k: x.k.slice() })) });
+	return buildKeyRecord(c, vaultId, e, kind, rk?.slice());
 }
 
 export const genesis = (rk = RK_A, k1 = K(1)) => record(KeyRecordKind.genesis, 1, [{ e: 1, k: k1 }], rk);
+/** The genesis of K(1) under RK_A for another vault (the sim's SIM_VAULT_ID). */
+export const genesisFor = (vaultId: string, rk = RK_A, k1 = K(1)) => record(KeyRecordKind.genesis, 1, [{ e: 1, k: k1 }], rk, vaultId);
 export const roll = (e: number, prev = K(e - 1), next = K(e)) => record(KeyRecordKind.roll, e, [{ e: e - 1, k: prev }, { e, k: next }]);
 export const revoke = (e: number, rk = RK_A, prev = K(e - 1), next = K(e)) => record(KeyRecordKind.revoke, e, [{ e: e - 1, k: prev }, { e, k: next }], rk);
 

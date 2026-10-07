@@ -28,6 +28,7 @@ import { FakeSecretStorage } from "../host/keys/testkit/fakeSecretStorage";
 import { suite0PinForTest } from "../host/keys/testkit/pinFixture";
 import type { HostIdentity } from "../host/runtimeSupport";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
+import { createWebCryptoSuite1 } from "../engine/adapters/webCryptoSuite1";
 import { createEngine, type ComposedEngine, type EngineHandle } from "../engine/compose/protocolEngine";
 import type { VaultRuntime } from "../engine/compose/vaultRuntime";
 import { residentText } from "../engine/compose/runtimeOps";
@@ -170,13 +171,14 @@ export class SimDevice {
 			onRuntime: (rt) => {
 				if (this.handle === handle) this.vrt = rt;
 			},
-			makePorts: (): EnginePorts => {
+			makePorts: async (config): Promise<EnginePorts> => {
 				if (storageFails) throw new Error("IndexedDB unavailable in worker");
 				const hash = simHashPort();
-				return {
-					relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.deviceClock,
-					random: new SeededRandom(hashLabel(`${this.deviceId}#${n}`)), crypto: createNoopCrypto(hash), hash, blob: this.opts.blob?.() ?? null,
-				};
+				const random = new SeededRandom(hashLabel(`${this.deviceId}#${n}`));
+				const c = config.crypto;
+				// As webEngine.ts: suite 0 seals nothing; unpinned and suite 1 get the suite-1 adapter (keys zero-filled on import).
+				const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
+				return { relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.deviceClock, random, crypto, hash, blob: this.opts.blob?.() ?? null };
 			},
 		});
 		this.pair = pair;

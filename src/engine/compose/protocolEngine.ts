@@ -14,9 +14,11 @@
  * runtime; the last complete listing (+ later vault events) is replayed.
  *
  * The write gate (pinGate.ts, e2ee-design §12.4): a VaultRuntime gets its ports only from the gate, which opens
- * for a suite-0 pin alone. A device without a usable pin runs the KeyReader instead: it reads `k` and writes
- * nothing (no frame, checkpoint, blob, ns entry, reconcile or outbox). The key commands of §18.4 belong to WP-E3's
- * keyring runtime; this engine refuses them (`refused`) and zero-fills their key bytes.
+ * for suite 0, and for suite 1 once the newest stored winner's key is held and verified. A closed device runs the
+ * KeyReader instead: it reads `k` and writes nothing (no frame, checkpoint, blob, ns entry, reconcile or outbox),
+ * except the genesis of enableE2ee on the creation path. Key commands (§18.4) go to the KeyReader while the gate is
+ * shut, and to the runtime's keyring once it runs. When a key-missing suite-1 device installs the key, the gate
+ * re-checks and the runtime starts in this process; an unpinned device waits for main to pin and restart it.
  */
 
 import type { DocId, PathKey, VaultEpoch, VaultPath } from "../../core/types";
@@ -36,11 +38,13 @@ import { BoundBody } from "./boundBody";
 import { BoundDisk } from "./boundDisk";
 import { BoundDocs } from "./boundDocs";
 import { answerHashRequest } from "./hashService";
+import { HostKeyring } from "./hostKeyring";
 import { HostLink } from "./hostLink";
-import { KeyReader } from "./keyReader";
-import { PinGate } from "./pinGate";
+import { KeyReader, type KeyCommand } from "./keyReader";
+import { PinGate, type GateKeys } from "./pinGate";
 import { idleStatus } from "./statusMerge";
-import { dropCommandSecrets, ownFrameNoFloor, prepareEpochMigration } from "./runtimeOps";
+import { ownFrameNoFloor, prepareEpochMigration } from "./runtimeOps";
+import { wipeSecrets } from "../../protocol/workerTransport";
 import type { FrameNoFloor } from "../store/repo";
 import { VaultRuntime, type RestartReason } from "./vaultRuntime";
 
@@ -86,6 +90,8 @@ export class ComposedEngine {
 	rt: VaultRuntime | null = null;
 	/** The write gate of this init (null before init). */
 	gate: PinGate | null = null;
+	/** The keyring main stored, shared by the gate, the KeyReader and each runtime of this init. */
+	keyring: HostKeyring | null = null;
 	/** Runs instead of a VaultRuntime while the gate is closed. */
 	reader: KeyReader | null = null;
 	private starting: Promise<void> | null = null;
@@ -193,7 +199,13 @@ export class ComposedEngine {
 		}
 		this.config = config;
 		this.settings = config.settings;
-		this.gate = new PinGate(config.crypto);
+		this.keyring = new HostKeyring(this.link, config.crypto);
+		try {
+			this.gate = await PinGate.open(config.crypto, this.ports, this.gateKeys());
+		} finally {
+			// makePorts imported the keys (the suite-1 adapter zero-fills them); no copy stays in the config.
+			if (config.crypto.suite === 1) for (const x of config.crypto.keys) x.k.fill(0);
+		}
 		this.link.seedSideFiles(config.sideState.outboxMirror, config.sideState.syncedMirror);
 		if (this.gate.open) {
 			const find = this.options.findKnownEpoch ?? ((c: EngineInitConfig, p: EnginePorts) => findKnownEpoch(p.storage, c.vaultId, c.deviceId));
@@ -257,20 +269,44 @@ export class ComposedEngine {
 		return run;
 	}
 
-	/** Gate closed: read `k` only (keyReader.ts). Never fails init. */
+	private gateKeys(): GateKeys {
+		return { vaultId: this.config!.vaultId, keyring: this.keyring!, diag: (code, fields) => this.log(`${code} ${JSON.stringify(fields)}`) };
+	}
+
+	/** Gate closed: read `k` (keyReader.ts). Never fails init. */
 	private startReader(): null {
 		if (this.reader || this.disposed) return null;
 		const config = this.config!;
 		const gate = this.gate!;
-		this.reader = new KeyReader({
+		const reader: KeyReader = new KeyReader({
 			ports: gate.readerPorts(this.ports!), vaultId: config.vaultId, deviceId: config.deviceId,
-			suite: gate.suite === 1 ? 1 : null, creating: gate.creating, paused: this.paused,
+			suite: gate.suite === 1 ? 1 : null, creating: gate.creating, paused: this.paused, keyring: this.keyring!,
 			reconnectBaseMs: this.options.tuning?.reconnectBaseMs,
 			onChange: () => this.postStatus(),
+			onKeyed: (): Promise<boolean> => this.onKeyed(reader),
 			log: this.options.log,
 		});
-		this.reader.start();
+		this.reader = reader;
+		void reader.start().catch((e) => this.log(`key reader start failed: ${e instanceof Error ? e.message : String(e)}`));
 		return null;
+	}
+
+	/**
+	 * A suite-1 device that started without the key now holds it, stored by main: if the gate opens, the reader
+	 * stops and the VaultRuntime starts in this process (no restart from main needed).
+	 */
+	private async onKeyed(reader: KeyReader): Promise<boolean> {
+		if (this.reader !== reader || this.disposed) return false;
+		const open = await this.gate!.recheck(this.ports!, this.gateKeys());
+		if (!open || this.reader !== reader || this.disposed) return false;
+		this.log("gate open: starting the vault runtime");
+		reader.stop();
+		this.reader = null;
+		const find = this.options.findKnownEpoch ?? ((c: EngineInitConfig, p: EnginePorts) => findKnownEpoch(p.storage, c.vaultId, c.deviceId));
+		this.knownEpoch = await find(this.config!, this.ports!).catch(() => undefined);
+		await this.startRuntime("retry");
+		this.postStatus();
+		return true;
 	}
 
 	private scheduleRetry(): void {
@@ -421,14 +457,6 @@ export class ComposedEngine {
 	private async command(c: UserCommand): Promise<EngineResultValue> {
 		const rt = this.rt;
 		switch (c.t) {
-			case "enableE2ee":
-			case "installKey":
-			case "pinSuite0":
-			case "revokeRekey":
-				// WP-E3's keyring runtime handles these (§18.4). The key bytes die here (§6.3).
-				if (c.t === "installKey") (c.source === "qr" ? c.k : c.rk).fill(0);
-				else if (c.t !== "pinSuite0") c.rk.fill(0);
-				throw new ProtocolFailure({ code: "refused", message: "this engine cannot act on vault keys yet", retryable: false });
 			case "pause":
 				this.paused = true;
 				rt?.setPaused(true);
@@ -467,14 +495,18 @@ export class ComposedEngine {
 			case "installKey":
 			case "pinSuite0":
 			case "revokeRekey":
-				if (!rt) {
-					dropCommandSecrets(c);
-					throw new ProtocolFailure({ code: "not-ready", message: "the sync engine is not running", retryable: true });
-				}
-				return rt.command(c);
+				return this.keyCommand(c);
 			default:
 				return rt ? rt.command(c) : { t: "ok" };
 		}
+	}
+
+	/** §18.4: the KeyReader while the gate is shut, else the runtime's keyring. The key bytes never outlive it (§6.3). */
+	private async keyCommand(c: KeyCommand): Promise<EngineResultValue> {
+		if (this.reader) return this.reader.command(c);
+		if (this.rt) return this.rt.command(c);
+		wipeSecrets({ t: "command", rid: 0, command: c });
+		throw new ProtocolFailure({ code: "not-ready", message: "the sync engine is not running", retryable: true });
 	}
 
 	// --- runtime callbacks -------------------------------------------------------

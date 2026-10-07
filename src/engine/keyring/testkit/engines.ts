@@ -1,7 +1,8 @@
 /**
  * Test-only: keyring engines over SimRelay for the WP-E3 engine tests. `start` plays main's part: it hands the
  * pin and stored keys in (init.crypto, §18.4) and records every keyringChanged; a restart with the stored keys and
- * records stands in for main pinning and restarting the engine (§12.4).
+ * records stands in for main restarting the engine. A LogEngine runs for a pinned device only: unpinned devices
+ * and the creation path are the compose layer's KeyReader (compose/keyReader.test.ts).
  */
 
 import type { EnvelopeKind } from "../../../core/envelope";
@@ -54,31 +55,28 @@ export interface Dev {
 	readonly changes: KeyringChange[];
 }
 
-export type Pin = "unpinned" | "creating" | "seen" | 0 | { readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; readonly records: readonly Uint8Array[] };
+export type Pin = 0 | { readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; readonly records: readonly Uint8Array[] };
 
 export async function start(relay: SimRelay, deviceId: string, pin: Pin, o: { storage?: StoragePort; tuning?: Partial<EngineTuning>; extra?: TestEngineOpts["extra"] } = {}): Promise<Dev> {
 	const changes: KeyringChange[] = [];
 	const persist = async (ch: KeyringChange) => void changes.push({ keys: ch.keys.map((x) => ({ e: x.e, k: x.k.slice() })), records: ch.records, pending: ch.pending });
-	const e2ee: EngineE2ee = pin === 0 ? { suite: 0 }
-		: typeof pin === "object" ? { suite: 1, records: pin.records, persist }
-		: { suite: null, creating: pin === "creating", keyringSeen: pin === "seen", persist };
-	const keys = typeof pin === "object" ? pin.keys.map((x) => ({ e: x.e, k: x.k.slice() })) : [];
+	const e2ee: EngineE2ee = pin === 0 ? { suite: 0 } : { suite: 1, records: pin.records, persist };
+	const keys = pin === 0 ? [] : pin.keys.map((x) => ({ e: x.e, k: x.k.slice() }));
 	const crypto = pin === 0 ? undefined : await createWebCryptoSuite1({ vaultId: VAULT, random: createWebRandom(), keys });
 	const r = await startTestEngine({ relay, deviceId, vaultId: VAULT, e2ee, ...(crypto ? { crypto } : {}), ...(o.storage ? { storage: o.storage } : {}), ...(o.tuning ? { tuning: o.tuning } : {}), ...(o.extra ? { extra: o.extra } : {}) });
 	return { engine: r.engine, storage: r.storage, changes };
 }
 
 /** What main stored from keyringChanged: every key once, the newest record set (§18.4). */
-export function stored(d: Dev, before: Pin = "unpinned"): Exclude<Pin, string | 0> {
-	const keys = new Map<number, Uint8Array>(typeof before === "object" ? before.keys.map((x) => [x.e, x.k]) : []);
+export function stored(d: Dev, before: Exclude<Pin, 0> = { keys: [], records: [] }): Exclude<Pin, 0> {
+	const keys = new Map<number, Uint8Array>(before.keys.map((x) => [x.e, x.k]));
 	for (const c of d.changes) for (const x of c.keys) keys.set(x.e, x.k);
-	const records = d.changes[d.changes.length - 1]?.records ?? (typeof before === "object" ? before.records : []);
+	const records = d.changes[d.changes.length - 1]?.records ?? before.records;
 	return { keys: [...keys].map(([e, k]) => ({ e, k })), records };
 }
 
 export const keyMissing = (d: Dev) => d.engine.status().e2ee?.keyMissing ?? null;
 export const ownRows = (relay: SimRelay, deviceId: string) => relay.streams().flatMap((s) => relay.rows(s)).filter((r) => r.deviceId === deviceId).length;
-export const checkpoints = (relay: SimRelay) => relay.streams().filter((s) => relay.checkpoint(s) !== null).length;
 
 /** Waits until the device read `k` on its session and parked in key-missing for `reason`. */
 export async function parked(d: Dev, reason: string): Promise<void> {

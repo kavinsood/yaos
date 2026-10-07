@@ -96,8 +96,8 @@ export interface EngineOptions {
 	readonly deviceClass?: DeviceClass;
 	readonly clientVersion: string;
 	/**
-	 * The suite pin and keyring inputs (e2ee-design §12.4, §18.4). Required, with no default: an absent pin is
-	 * `{suite: null}` (unpinned: reads `k` only, writes nothing), never suite 0.
+	 * The suite pin and keyring inputs (e2ee-design §12.4, §18.4). Required, with no default. Only a pinned device
+	 * whose gate opened runs a LogEngine (compose/pinGate.ts); an unpinned one runs the KeyReader and has none.
 	 */
 	readonly e2ee: EngineE2ee;
 	/** Known epoch: open the DB before connecting (offline start). Without it the first connect decides. */

@@ -10,6 +10,7 @@ import { secretIdFor, VaultKeyStore } from "./keys/secretStore";
 import { fakeEpochKey, fakeGenesisRecord } from "./keys/testkit/kRecords";
 import { withSuite0PinForTest } from "./keys/testkit/pinFixture";
 import { BAD_VAULT_IDS, testVaultId } from "./keys/testkit/vaultIds";
+import { advanceUntil, settleWith } from "../engine/keyring/testkit/simWait";
 import { hostNotice, PinRefusedError, YaosController } from "./pluginController";
 import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "./ui/api";
 
@@ -57,13 +58,12 @@ function noBytes(b: Uint8Array): boolean {
 	return b.byteLength === 0 || b.every((x) => x === 0);
 }
 
-/** Settles a promise driven by the virtual clock. */
-async function settle<T>(clock: VirtualClock, p: Promise<T>, ms = 1_000): Promise<T> {
-	const out = p.then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
-	await clock.advance(ms);
-	const r = await out;
-	if (!r.ok) throw r.error;
-	return r.value;
+/**
+ * Settles a promise driven by the virtual clock and the engine's real WebCrypto (unpinned and suite-1 engines get
+ * the suite-1 adapter): advances in steps with a real wait between them until it settles.
+ */
+async function settle<T>(clock: VirtualClock, p: Promise<T>, horizonMs = 30_000): Promise<T> {
+	return settleWith(clock, p, Math.max(horizonMs, 30_000));
 }
 
 test("unpaired: no runtime, commands refuse with a safe message", async () => {
@@ -213,24 +213,27 @@ test("keyringSeen: a k record makes it sticky; pinSuite0 link is then refused", 
 	assert.equal(w.net.relay.rows(KEYRING_STREAM).length, 1, "the blocked device appended nothing to k");
 });
 
-test("no suite-0 pin from a key-less join: the engine refuses pinSuite0; create and enableE2ee need the creation marker", async () => {
+test("a key-less join: create and enableE2ee need the creation marker; a QR key waits for its record; pinSuite0 {link} on an empty k pins suite 0", async () => {
 	const w = await started(PAIRED);
-	const link = w.ctl.command({ t: "pinSuite0", source: "link" });
-	await assert.rejects(settle(w.clock, link, 100), /cannot act on vault keys/);
 	await assert.rejects(w.ctl.command({ t: "pinSuite0", source: "create" }), (e: unknown) => e instanceof PinRefusedError && e.refusal === "not-creating");
 	const rk = fakeEpochKey(3);
 	await assert.rejects(w.ctl.command({ t: "enableE2ee", rk }), (e: unknown) => e instanceof PinRefusedError && e.refusal === "not-creating");
 	assert.ok(noBytes(rk), "a refused command's recovery key is zero-filled on main");
-	const k = fakeEpochKey(4);
-	const install = w.ctl.command({ t: "installKey", source: "qr", e: 1, k });
-	await assert.rejects(settle(w.clock, install, 100), /cannot act on vault keys/);
-	assert.ok(noBytes(k), "main keeps no key bytes (transferred)");
 	await assert.rejects(w.ctl.command({ t: "revokeRekey", rk: fakeEpochKey(5) }), (e: unknown) => e instanceof PinRefusedError && e.refusal === "not-encrypted");
-	await w.clock.advance(5_000);
-	assert.equal(w.saved.length, 0, "no pin saved");
-	assert.equal(w.ctl.data().e2ee, undefined);
-	assert.equal(w.dev.engineStarts, 1, "no pin change, no restart");
-	assert.equal(w.net.relay.counters().appendFrames, 0);
+	const k = fakeEpochKey(4);
+	assert.deepEqual(await settle(w.clock, w.ctl.command({ t: "installKey", source: "qr", e: 1, k }), 100), { t: "ok" }, "pending: k shows no record for it");
+	assert.ok(noBytes(k), "main keeps no key bytes (transferred)");
+	assert.equal(w.dev.secrets.writes, 0, "an unverified key is not stored");
+	assert.equal(w.saved.length, 0, "and pins nothing");
+	assert.equal(w.dev.engineStarts, 1);
+	// §12.4 (ii): k read to head on this session and empty, keyringSeen unset: the engine says ok, main pins and restarts.
+	assert.deepEqual(await settle(w.clock, w.ctl.command({ t: "pinSuite0", source: "link" }), 100), { t: "ok" });
+	assert.deepEqual(w.ctl.data().e2ee, { suite: 0 });
+	assert.deepEqual(w.saved.at(-1)?.e2ee, { suite: 0 }, "saved");
+	assert.ok(await advanceUntil(w.clock, () => w.dev.engineStarts === 2 && w.ctl.status()?.phase === "live", 30_000), "restarted pinned, live");
+	assert.equal(w.dev.engine?.config?.crypto.suite, 0);
+	await assert.rejects(w.ctl.command({ t: "pinSuite0", source: "link" }), (e: unknown) => e instanceof PinRefusedError && e.refusal === "already-pinned");
+	assert.equal(w.net.relay.rows(KEYRING_STREAM).length, 0);
 });
 
 test("a suite-0 device takes no key: installKey refused on main, keyringChanged refused unstored", async () => {
@@ -258,13 +261,14 @@ test("keyringChanged: stored in SecretStorage and pinned suite 1 before the ack,
 	const held = new VaultKeyStore(w.dev.secrets, ID.vaultId, w.clock).load();
 	assert.equal(held?.keys.length, 1);
 	assert.deepEqual(held?.keys[0]?.k, sent, "the stored key is the sent key");
-	await w.clock.advance(5_000);
-	assert.equal(w.dev.engineStarts, 2, "restarted with the pinned config");
+	assert.ok(await advanceUntil(w.clock, () => w.dev.engineStarts === 2 && w.ctl.status()?.e2ee?.suite === 1, 30_000), "restarted with the pinned config");
 	const crypto = w.dev.engine?.config?.crypto;
 	assert.equal(crypto?.suite, 1);
 	assert.equal(crypto?.suite === 1 ? crypto.keys.length : -1, 1);
 	assert.equal(crypto?.suite === 1 ? crypto.records.length : -1, 1);
-	assert.equal(w.ctl.status()?.e2ee?.keyMissing, "no-key", "suite 1 stays blocked until WP-E3's keyring runtime");
+	// The stand-in key does not match the stand-in record's kcv: the gate stays shut (pinGate.ts).
+	assert.equal(w.ctl.status()?.e2ee?.keyMissing, "no-key", "a key that fails its record is not used");
+	assert.equal(w.ctl.status()?.phase, "key-missing");
 	assert.equal(w.net.relay.counters().appendFrames, 0);
 	// §6.1 Forget keys: leaving the vault blanks the secret and drops the pin.
 	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: null })), 5_000);
@@ -299,13 +303,26 @@ test("creation marker (§15.1): written before enroll, kept across it; creatable
 	assert.deepEqual(w.saved.at(-1)?.creating, { vaultId: ID.vaultId }, "the enroll keeps the marker");
 	assert.equal(w.dev.engine?.config?.crypto.suite, null);
 	assert.equal(w.ctl.status()?.e2ee?.creatable, true, "empty relay, empty k");
-	// Main lets both creation choices through; this engine (before WP-E3) refuses them, so nothing is pinned.
-	await assert.rejects(settle(w.clock, w.ctl.command({ t: "pinSuite0", source: "create" }), 100), /cannot act on vault keys/);
+	// Main lets the creation choices through; the engine's KeyReader decides (keyReader.ts). enableE2ee: the genesis.
 	const rk = fakeEpochKey(13);
-	await assert.rejects(settle(w.clock, w.ctl.command({ t: "enableE2ee", rk }), 100), /cannot act on vault keys/);
-	assert.ok(noBytes(rk));
-	assert.equal(w.ctl.data().e2ee, undefined);
-	assert.equal(w.net.relay.counters().appendFrames, 0);
+	assert.deepEqual(await settle(w.clock, w.ctl.command({ t: "enableE2ee", rk }), 100), { t: "ok" });
+	assert.ok(noBytes(rk), "the recovery key left main");
+	assert.deepEqual(w.ctl.data().e2ee, { suite: 1 }, "pinned after ok");
+	assert.equal(w.ctl.data().creating, undefined, "the marker goes with the pin");
+	assert.equal(w.net.relay.rows(KEYRING_STREAM).length, 1, "the genesis");
+	assert.equal(w.net.relay.head(), 1, "and nothing else");
+	assert.equal(new VaultKeyStore(w.dev.secrets, ID.vaultId, w.clock).load()?.keys.length, 1, "K_1 stored before the pin");
+	assert.ok(await advanceUntil(w.clock, () => w.dev.engineStarts === 2 && w.ctl.status()?.phase === "live", 30_000), "restarted pinned suite 1: live");
+	assert.equal(w.ctl.status()?.e2ee?.sealEpoch, 1);
+	// pinSuite0 {create}: the other choice, on a second device that just created another vault.
+	const c = setup();
+	await c.ctl.start();
+	await c.ctl.markCreating(ID.vaultId);
+	await settle(c.clock, c.ctl.updateData((d) => ({ ...d, identity: ID })), 5_000);
+	assert.ok(await advanceUntil(c.clock, () => c.ctl.status()?.e2ee?.creatable === true, 30_000));
+	assert.deepEqual(await settle(c.clock, c.ctl.command({ t: "pinSuite0", source: "create" }), 100), { t: "ok" });
+	assert.deepEqual(c.ctl.data().e2ee, { suite: 0 });
+	assert.equal(c.net.relay.rows(KEYRING_STREAM).length, 0);
 	// Enrolling in another vault drops the marker.
 	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: { ...ID, vaultId: testVaultId("v2") } })), 5_000);
 	assert.equal(w.saved.at(-1)?.creating, undefined);

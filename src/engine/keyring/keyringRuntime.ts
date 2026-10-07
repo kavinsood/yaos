@@ -1,7 +1,12 @@
 /**
- * The keyring inside a running engine (e2ee-design §9.3, §11.4, §11.5, §12.4, §15.1). It feeds `k` rows to the
- * Keyring, answers the write gate, moves the phase between key-missing and live, and runs the own-record flows:
- * genesis (creation path), roll (§4.2 trigger), revoke (§14.2) and the re-publish after a reset (§11.5).
+ * The keyring inside a running engine (e2ee-design §9.3, §11.4, §11.5, §14). It feeds `k` rows to the Keyring,
+ * answers the in-session write gate, moves the phase between key-missing and live, and runs the own-record flows:
+ * roll (§4.2 trigger), revoke (§14.2) and the re-publish after a reset (§11.5).
+ *
+ * A VaultRuntime runs only for a pinned device whose gate opened (pinGate.ts): suite 0, or suite 1 holding the
+ * newest stored winner's key. Unpinned devices and the creation path (enableE2ee, pinSuite0) are the KeyReader's
+ * (keyReader.ts). What is held here can only happen during a session: an open revoke, a newer winner without its
+ * key, a `k` record seen under suite 0, and (suite 1) sending before `k` is read on this session.
  *
  * Own `k` records are appended on the session directly, not through the outbox: they carry no envelope and are
  * never sealed, and a lost append is sent again with the same clientFrameId (the relay deduplicates it). A
@@ -26,11 +31,10 @@ import { Keyring, type KeyringChange, type OwnOutcome, type QrResult } from "./k
 import { KeyRecordKind } from "./record";
 import { KeyringRefusedError, keyringCryptoOf } from "./writeGate";
 
-/** EngineOptions.e2ee: the pin main read from data.json (§12.4). Required: there is no default suite. */
+/** EngineOptions.e2ee: the pin main read from data.json (§12.4). Required: there is no default suite, and no unpinned runtime. */
 export type EngineE2ee =
 	| { readonly suite: 0 }
-	| { readonly suite: 1; readonly records: readonly Uint8Array[]; readonly persist: (c: KeyringChange) => Promise<void> }
-	| { readonly suite: null; readonly creating: boolean; readonly keyringSeen: boolean; readonly persist: (c: KeyringChange) => Promise<void> };
+	| { readonly suite: 1; readonly records: readonly Uint8Array[]; readonly persist: (c: KeyringChange) => Promise<void> };
 
 interface OwnFlow {
 	readonly e: number;
@@ -45,9 +49,8 @@ interface OwnFlow {
 const META_WRITE_MS = 30_000;
 
 export class KeyringRuntime {
-	/** Session generation in which `k` was read to VAULT_READY.head (§12.4 (ii), §15.1 step 3). */
+	/** Session generation in which `k` was read to VAULT_READY.head. */
 	private kReadGen = -1;
-	private headZero = false;
 	private wasBlocked = true;
 	private flow: OwnFlow | null = null;
 	/** Own `k` appends without a receipt yet (the flow's record, re-publishes): cfid -> bytes. */
@@ -61,25 +64,22 @@ export class KeyringRuntime {
 	/** The keyring has judged every stored `k` row through this seq (ingestTail). */
 	private kJudged: Seq = 0;
 
-	private constructor(private readonly c: EngineCtx, readonly kr: Keyring, readonly suite: 0 | 1 | null, private readonly creating: boolean) {}
+	private constructor(private readonly c: EngineCtx, readonly kr: Keyring, readonly suite: 0 | 1) {}
 
 	static async open(c: EngineCtx, e2ee: EngineE2ee): Promise<KeyringRuntime> {
 		const crypto = c.ports.crypto;
 		const kc = keyringCryptoOf(crypto);
 		if (e2ee.suite === 0 && crypto.suite !== 0) throw new Error("e2ee: a suite-0 pin needs the suite-0 crypto port");
 		if (e2ee.suite === 1 && (crypto.suite !== 1 || !kc)) throw new Error("e2ee: a suite-1 pin needs the suite-1 crypto port");
-		const persist = e2ee.suite === 0 ? undefined : (ch: KeyringChange) => e2ee.persist(ch);
 		const kr = await Keyring.open({
-			mode: e2ee.suite === 0 ? "suite0" : e2ee.suite === 1 ? "suite1" : "unpinned",
+			mode: e2ee.suite === 0 ? "suite0" : "suite1",
 			vaultId: c.opts.vaultId,
 			kc: e2ee.suite === 0 ? null : kc,
 			records: e2ee.suite === 1 ? e2ee.records : [],
-			keyringSeen: e2ee.suite === null && e2ee.keyringSeen,
-			persist,
+			persist: e2ee.suite === 0 ? undefined : (ch: KeyringChange) => e2ee.persist(ch),
 			diag: (code, f) => c.diag(code, f),
-			onKeyringSeen: () => c.scheduleStatus(),
 		});
-		const rt = new KeyringRuntime(c, kr, e2ee.suite, e2ee.suite === null && e2ee.creating);
+		const rt = new KeyringRuntime(c, kr, e2ee.suite);
 		const meta = await c.repo.getMeta("keyring");
 		if (meta?.key === "keyring" && meta.sealEpoch === kr.sealEpoch()) rt.seals = { epoch: meta.sealEpoch, n: meta.ownSeals };
 		await rt.ingestTail();
@@ -149,17 +149,12 @@ export class KeyringRuntime {
 	blocked(): boolean {
 		return this.kr.keyMissing() !== null;
 	}
-	/** Unpinned, or a vault this pin cannot read: only `k` is read (§9.3, §12.4); ns, cfg and bodies wait. */
+	/** A suite-0 pin on a vault with a `k` record: only `k` is read (§9.3, §12.4); ns, cfg and bodies wait. */
 	readsOnlyK(): boolean {
-		const m = this.kr.keyMissing();
-		return m === "no-pin" || m === "encrypted-vault";
-	}
-	/** §15.1 step 3: started with `creating`, read VAULT_READY.head = 0 and `k` to head, empty, on this session. */
-	creatable(): boolean {
-		return this.suite === null && this.creating && this.headZero && this.kReadGen === this.c.gen && this.c.session !== null && this.kr.rowCount === 0;
+		return this.kr.keyMissing() === "encrypted-vault";
 	}
 	status(): E2eeStatus {
-		return { suite: this.suite, sealEpoch: this.kr.sealEpoch(), keyMissing: this.kr.keyMissing(), keyringSeen: this.kr.keyringSeen, creatable: this.creatable() };
+		return { suite: this.suite, sealEpoch: this.kr.sealEpoch(), keyMissing: this.kr.keyMissing(), keyringSeen: this.kr.keyringSeen, creatable: false };
 	}
 	/** Every seal of the gated crypto port (writeGate.ts). */
 	noteSeal(): void {
@@ -223,7 +218,6 @@ export class KeyringRuntime {
 		const c = this.c;
 		if (gen !== c.gen) return;
 		this.kReadGen = gen;
-		this.headZero = headSeq === 0;
 		const f = this.flow;
 		if (f && f.seq === null) {
 			const o = await this.kr.settleOwn();
@@ -307,37 +301,23 @@ export class KeyringRuntime {
 	// ------------------------------------------------------------------ commands (§18.4)
 
 	async installQr(e: number, k: Uint8Array): Promise<QrResult> {
+		if (this.suite !== 1) {
+			k.fill(0);
+			throw new KeyringRefusedError("this device is pinned to suite 0");
+		}
 		const r = await this.kr.installQr(e, k);
 		await this.afterChange();
 		return r;
 	}
 
 	async installRk(rk: Uint8Array): Promise<"verified" | "pending"> {
+		if (this.suite !== 1) {
+			rk.fill(0);
+			throw new KeyringRefusedError("this device is pinned to suite 0");
+		}
 		const r = await this.kr.installRk(rk);
 		await this.afterChange();
 		return r;
-	}
-
-	/** §15.1 steps 3-4: only while creatable; resolves once the genesis won and main stored K_1 and the record. */
-	async enableE2ee(rk: Uint8Array): Promise<void> {
-		try {
-			if (!this.creatable()) throw new KeyringRefusedError("not on the creation path (needs VAULT_READY.head = 0 and an empty k, read on this session)");
-			const o = await this.runOwn(KeyRecordKind.genesis, rk);
-			if (o !== "won") throw new KeyringRefusedError("another genesis won; this device stays unpinned");
-		} finally {
-			rk.fill(0);
-		}
-	}
-
-	/** §12.4 (ii), (iii): whether main may pin suite 0. The engine never pins; main pins and restarts it. */
-	pinSuite0(source: "link" | "create"): void {
-		if (this.suite !== null) throw new KeyringRefusedError("this device is already pinned");
-		if (source === "create" && !this.creatable()) throw new KeyringRefusedError("not on the creation path");
-		if (source === "link") {
-			if (this.kr.keyringSeen) throw new KeyringRefusedError("this device has read an encryption key record for the vault");
-			if (this.kReadGen !== this.c.gen || !this.c.session) throw new KeyringRefusedError("k is not read to head yet");
-			if (this.kr.rowCount > 0) throw new KeyringRefusedError("k is not empty");
-		}
 	}
 
 	/** §14.2 step 2: a revoke record for r = highest epoch + 1 under `rk` (zero-filled). */

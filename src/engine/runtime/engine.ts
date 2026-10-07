@@ -570,14 +570,6 @@ export class LogEngine {
 	installKeyRk(rk: Uint8Array): Promise<"verified" | "pending"> {
 		return this.c.keyring.installRk(rk);
 	}
-	/** Creation path only (§15.1): resolves once the genesis won and main stored K_1; main then pins suite 1. */
-	enableE2ee(rk: Uint8Array): Promise<void> {
-		return this.c.keyring.enableE2ee(rk);
-	}
-	/** Throws unless main may pin suite 0 (§12.4 (ii), (iii)). */
-	pinSuite0(source: "link" | "create"): void {
-		this.c.keyring.pinSuite0(source);
-	}
 	/** §14.2 step 2: zero-fills `rk`. */
 	revokeRekey(rk: Uint8Array): Promise<OwnOutcome> {
 		return this.c.keyring.revokeRekey(rk);

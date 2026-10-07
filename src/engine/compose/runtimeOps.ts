@@ -128,10 +128,10 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 			rt.sched.request({ t: "full" });
 			return { t: "ok" };
 		}
-		// e2ee-design §18.4. The engine never pins: main stores keys from keyringChanged and sets the pin after `ok`.
+		// e2ee-design §18.4. A runtime runs for a pinned device only (pinGate.ts): the creation path is the KeyReader's.
 		case "enableE2ee":
-			await keyCommand(() => rt.log.enableE2ee(c.rk));
-			return { t: "ok" };
+			c.rk.fill(0);
+			throw refused("this device is already pinned");
 		case "installKey": {
 			const r = await keyCommand(() => (c.source === "qr" ? rt.log.installKeyQr(c.e, c.k) : rt.log.installKeyRk(c.rk)));
 			// pending: kept unverified (nothing persisted) until `k` shows its record (§12.4 (i)); status says key-missing.
@@ -139,8 +139,7 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 			return { t: "ok" };
 		}
 		case "pinSuite0":
-			await keyCommand(() => rt.log.pinSuite0(c.source));
-			return { t: "ok" };
+			throw refused("this device is already pinned");
 		case "revokeRekey": {
 			const o = await keyCommand(() => rt.log.revokeRekey(c.rk));
 			if (o === "lost") throw refused("another key record won the epoch; revoke again");
@@ -161,12 +160,6 @@ async function keyCommand<T>(f: () => T | Promise<T>): Promise<T> {
 	} catch (e) {
 		throw e instanceof KeyringRefusedError ? refused(e.message) : e;
 	}
-}
-
-/** Zero-fills the SECRET buffers of a key command that is not run (no runtime): main keeps no copy (§6.3). */
-export function dropCommandSecrets(c: UserCommand): void {
-	if (c.t === "enableE2ee" || c.t === "revokeRekey" || (c.t === "installKey" && c.source === "rk")) c.rk.fill(0);
-	else if (c.t === "installKey") c.k.fill(0);
 }
 
 async function diagnostics(rt: VaultRuntime, includePaths: boolean): Promise<DiagnosticsBundle> {
