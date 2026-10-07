@@ -218,7 +218,8 @@ export async function lone(R: Report, o: LoneOptions): Promise<void> {
 		}
 
 		for (let i = 0; i < 6; i++) {
-			const bytes = enc(`${JSON.stringify({ alwaysUpdateLinks: true, lone: i }, null, 2)}\n`);
+			// As cfgPlan.ts writes a synced json file (2-space indent, no trailing newline), so the peer's bytes match.
+			const bytes = enc(JSON.stringify({ alwaysUpdateLinks: true, lone: i }, null, 2));
 			const cfgPath = `${a.vault.configDir}/app.json`;
 			await sample(async () => {
 				await a.configDir.writeBytes("app.json", bytes);
