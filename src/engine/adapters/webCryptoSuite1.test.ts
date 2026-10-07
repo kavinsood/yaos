@@ -4,7 +4,6 @@ import { createCipheriv, hkdfSync } from "node:crypto";
 import { concatBytes } from "../../core/codec/lib0";
 import { padmeLen } from "../../core/codec/padme";
 import { hkdfInfo } from "./suite1Primitives";
-import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../../core/limits";
 import type { ContentHash } from "../../core/types";
 import type { BlobAddress, SealPurpose } from "../../ports/crypto";
 import { ScriptedRandom } from "./testkit/scriptedRandom";
@@ -152,7 +151,7 @@ describe("webCryptoSuite1: blobs (§10)", () => {
 		assert.deepEqual(r.plaintext, pt);
 	});
 
-	it("header, epoch, padding and cap failures", async () => {
+	it("header, epoch and padding failures", async () => {
 		const { c, random } = await port({ seal: 1 });
 		random.push(N(7));
 		const sealed = concatBytes(await c.sealBlob({ address: ADDR, plaintext: PT }));
@@ -172,7 +171,6 @@ describe("webCryptoSuite1: blobs (§10)", () => {
 		cipher.setAAD(blobAad(1, 1, VAULT, ADDR));
 		const body = Buffer.concat([N(9), cipher.update(new Uint8Array(256)), cipher.final(), cipher.getAuthTag()]);
 		assert.deepEqual(await open(Uint8Array.from([1, 1, 1, ...body])), { ok: false, reason: "malformed" });
-		await assert.rejects(c.sealBlob({ address: ADDR, plaintext: new Uint8Array(MAX_BLOB_PLAINTEXT_BYTES_SUITE1 + 1) }), /exceeds the cap/);
 	});
 
 	it("addresses: 64 lowercase hex, from K_1 only, bound to the vault", async () => {

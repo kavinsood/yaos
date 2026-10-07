@@ -5,7 +5,6 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../limits";
 import { SNAP_DEFAULT_PART_BYTES, snapPartBytes } from "../snap/bundle";
 import { padmeLen } from "./padme";
 import { decodeBlobHeader, encodeBlobHeader, maxSealedBlobPlaintext, sealedBlobBytes } from "./sealedBlob";
@@ -23,24 +22,24 @@ test("sealedBlobBytes: header (varuint epoch) + nonce + Padmé(n + 1) + tag", ()
 	assert.ok(h.ok && h.keyEpoch === MAX_EPOCH);
 });
 
-test("maxSealedBlobPlaintext: largest n that seals within the cap at any epoch; 10 MiB gives MAX_BLOB_PLAINTEXT_BYTES_SUITE1", () => {
-	const cap = 10 * MIB;
+test("maxSealedBlobPlaintext: largest n that seals within the cap at any epoch; the relay's 100 MB gives 47 x 2 MiB - 1", () => {
+	const cap = 100_000_000; // MAX_BLOB_UPLOAD_BYTES, Cloudflare's request body limit (DECISIONS D9)
 	const n = maxSealedBlobPlaintext(cap);
-	assert.equal(n, MAX_BLOB_PLAINTEXT_BYTES_SUITE1);
-	assert.equal(n, 10_223_615);
-	assert.equal(padmeLen(n + 1), 39 * 256 * 1024, "n + 1 is exactly 39 x 256 KiB");
-	assert.equal(sealedBlobBytes(n, 1), 3 + 12 + 39 * 256 * 1024 + 16);
+	assert.equal(n, 98_566_143);
+	assert.equal(padmeLen(n + 1), 47 * 2 * MIB, "n + 1 is exactly 47 x 2 MiB");
+	assert.equal(sealedBlobBytes(n, 1), 3 + 12 + 47 * 2 * MIB + 16);
 	assert.ok(sealedBlobBytes(n, MAX_EPOCH) <= cap);
 	assert.ok(sealedBlobBytes(n + 1, 1) > cap, "one more byte jumps to the next Padmé bucket");
-	// Never above the suite constant, even for a larger store.
-	assert.equal(maxSealedBlobPlaintext(64 * MIB), MAX_BLOB_PLAINTEXT_BYTES_SUITE1);
+	// Suite 1 has no cap of its own: a larger store fits more.
+	assert.equal(maxSealedBlobPlaintext(10 * MIB), 10_223_615, "39 x 256 KiB - 1");
+	assert.equal(maxSealedBlobPlaintext(200_000_000), 47 * 4 * MIB - 1, "a Business zone's 200 MB: 47 x 4 MiB - 1");
 	assert.equal(maxSealedBlobPlaintext(10 + 28 + 255), -1, "not even the 256-byte floor fits");
 	assert.equal(maxSealedBlobPlaintext(10 + 28 + 256), 255);
-	// Exhaustive below 70 KB, sampled above: the result fits, the next byte does not (or is the suite cap).
-	for (let c = 294; c <= 16 * MIB; c += c < 70_000 ? 1 : 4093) {
+	// Exhaustive below 70 KB, sampled above: the result fits, the next byte does not.
+	for (let c = 294; c <= 128 * MIB; c += c < 70_000 ? 1 : c < 16 * MIB ? 4093 : 1_048_573) {
 		const m = maxSealedBlobPlaintext(c);
 		assert.ok(sealedBlobBytes(m, MAX_EPOCH) <= c, `cap ${c}`);
-		assert.ok(m === MAX_BLOB_PLAINTEXT_BYTES_SUITE1 || sealedBlobBytes(m + 1, MAX_EPOCH) > c, `cap ${c}: ${m} is the largest`);
+		assert.ok(sealedBlobBytes(m + 1, MAX_EPOCH) > c, `cap ${c}: ${m} is the largest`);
 	}
 });
 

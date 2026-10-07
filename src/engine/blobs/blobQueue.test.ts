@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
 import { sha256Hex } from "../../core/hash/sha256";
-import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../../core/limits";
+import { maxSealedBlobPlaintext } from "../../core/codec/sealedBlob";
 import type { ContentHash, DocId, VaultPath } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort, OpenResult, SealedBlobParts } from "../../ports/crypto";
@@ -283,12 +283,12 @@ test("suite 1: two devices upload the same file: different ciphertexts at one ad
 	const c = await make({ store: a.store, crypto: await suite1(0xc1) });
 	assert.equal(await c.q.upload({ hash, docId: D, path: P, bytes }), true);
 	assert.equal(a.store!.puts, 1);
-	assert.equal(c.q.maxBlobBytes, MAX_BLOB_PLAINTEXT_BYTES_SUITE1, "plaintext cap under suite 1");
+	assert.equal(c.q.maxBlobBytes, maxSealedBlobPlaintext(a.store!.maxBlobBytes), "plaintext cap under suite 1");
 });
 
 test("suite 1: a file above the sealed cap is not synced: upload refuses with a notice, nothing stored", async () => {
 	const { q, store, notices } = await make({ crypto: await suite1(0xa2) });
-	const bytes = new Uint8Array(MAX_BLOB_PLAINTEXT_BYTES_SUITE1 + 1);
+	const bytes = new Uint8Array(q.maxBlobBytes + 1);
 	assert.ok(bytes.length < store!.maxBlobBytes, "fits the transport cap as plaintext, not once sealed");
 	assert.equal(await q.upload({ hash: sha256Hex(bytes), docId: D, path: P, bytes }), false);
 	assert.equal(store!.puts, 0);

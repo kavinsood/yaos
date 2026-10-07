@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1, PADME_FLOOR_BYTES } from "../limits";
+import { PADME_FLOOR_BYTES } from "../limits";
 import { pad, padmeLen, unpad } from "./padme";
 import { blobAad, decodeBlobHeader, encodeBlobHeader } from "./sealedBlob";
 import { CryptoSuite } from "../envelope";
@@ -41,11 +41,11 @@ describe("Padmé (§7.3)", () => {
 		// MAX_FRAME_CONTENT_BYTES + 1 marker byte is a bucket point (§8.2, WP-E2), the next byte jumps.
 		assert.equal(padmeLen(1_032_192), 1_032_192);
 		assert.equal(padmeLen(1_032_193), 1_048_576);
-		// The suite-1 blob cap: cap + marker is a bucket point; with header (≤ 10 B) and AEAD (28 B) it fits the 10 MiB upload cap (D9).
-		assert.equal(MAX_BLOB_PLAINTEXT_BYTES_SUITE1 + 1, 39 * 262_144);
-		assert.equal(padmeLen(MAX_BLOB_PLAINTEXT_BYTES_SUITE1 + 1), MAX_BLOB_PLAINTEXT_BYTES_SUITE1 + 1);
-		assert.equal(padmeLen(MAX_BLOB_PLAINTEXT_BYTES_SUITE1 + 2), 40 * 262_144);
-		assert.ok(MAX_BLOB_PLAINTEXT_BYTES_SUITE1 + 1 + 10 + 28 <= 10 * 1024 * 1024);
+		// [2^26, 2^27): E=26, S=5, step 2^21 = 2 MiB. 47 x 2 MiB plus header (≤ 10 B) and AEAD (28 B) fits the 100 MB
+		// upload cap (D9), 48 x 2 MiB does not: the largest suite-1 blob plaintext there is 47 x 2 MiB - 1 (marker).
+		assert.equal(padmeLen(47 * 2_097_152), 47 * 2_097_152);
+		assert.equal(padmeLen(47 * 2_097_152 + 1), 48 * 2_097_152);
+		assert.ok(47 * 2_097_152 + 10 + 28 <= 100_000_000 && 48 * 2_097_152 > 100_000_000);
 	});
 
 	it("rejects bad lengths", () => {

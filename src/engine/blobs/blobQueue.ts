@@ -7,9 +7,9 @@
  *   down = get -> openBlob -> verify sha256
  *
  * maxBlobBytes is a plaintext cap: the store's transport cap under suite 0,
- * what still fits it once sealed under suite 1 (e2ee-design §7.3, ≤
- * MAX_BLOB_PLAINTEXT_BYTES_SUITE1). Larger files are not synced (reconcile
- * excludes them; upload() refuses with a notice).
+ * what still fits it once sealed under suite 1 (e2ee-design §7.3,
+ * maxSealedBlobPlaintext). Larger files are not synced (reconcile excludes
+ * them; upload() refuses with a notice).
  *
  * No store (the relay has no R2 binding): maxBlobBytes is 0, reconcile
  * excludes every blob, and upload / download / prefetch answer at once

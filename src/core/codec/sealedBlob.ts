@@ -11,7 +11,6 @@
  */
 
 import { AAD_BLOB_PREFIX, BLOB_FORMAT_VERSION, CryptoSuite } from "../envelope";
-import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../limits";
 import type { VaultId } from "../types";
 import type { BlobAddress } from "../../ports/crypto";
 import { CodecError, Reader, Writer, utf8Encode } from "./lib0";
@@ -28,16 +27,16 @@ export function sealedBlobBytes(n: number, keyEpoch: number): number {
 }
 
 /**
- * Largest suite-1 plaintext whose sealed blob fits `cap` bytes at any keyEpoch, never above
- * MAX_BLOB_PLAINTEXT_BYTES_SUITE1 (e2ee-design §7.3: BlobPort.maxBlobBytes is the transport cap; the
- * engine compares plaintext against the suite's cap). -1 = nothing fits.
+ * Largest suite-1 plaintext whose sealed blob fits `cap` bytes at any keyEpoch (e2ee-design §7.3:
+ * BlobPort.maxBlobBytes is the transport cap, and suite 1 has no cap of its own; the engine compares
+ * plaintext against this). -1 = nothing fits.
  */
 export function maxSealedBlobPlaintext(cap: number): number {
 	const budget = cap - BLOB_HEADER_MAX_BYTES - BLOB_AEAD_BYTES;
 	if (budget < padmeLen(1)) return -1;
 	// padmeLen is non-decreasing: binary search the largest n with padmeLen(n + 1) <= budget.
 	let lo = 0;
-	let hi = Math.min(budget - 1, MAX_BLOB_PLAINTEXT_BYTES_SUITE1);
+	let hi = budget - 1;
 	while (lo < hi) {
 		const mid = Math.ceil((lo + hi) / 2);
 		if (padmeLen(mid + 1) <= budget) lo = mid;

@@ -18,7 +18,6 @@ import { bytesToHex, hexToBytes } from "../../core/codec/lib0";
 import { pad, unpad } from "../../core/codec/padme";
 import { blobAad, decodeBlobHeader, encodeBlobHeader } from "../../core/codec/sealedBlob";
 import { CryptoSuite } from "../../core/envelope";
-import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../../core/limits";
 import type { VaultId } from "../../core/types";
 import type { BlobAddress, CryptoPort, KeyringCrypto, OpenFailure, OpenResult, WrapRole } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
@@ -128,7 +127,6 @@ export async function createWebCryptoSuite1(o: Suite1Options): Promise<Suite1Cry
 			return typeof r === "string" ? fail(r) : { ok: true, plaintext: r };
 		},
 		async sealBlob({ address, plaintext }) {
-			if (plaintext.length > MAX_BLOB_PLAINTEXT_BYTES_SUITE1) throw new Error(`suite 1: blob of ${plaintext.length} bytes exceeds the cap`);
 			const e = sealEpoch;
 			const key = await sealKey(e, "blob");
 			const header = encodeBlobHeader(CryptoSuite.aes256gcm, e);
