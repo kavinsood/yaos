@@ -14,6 +14,7 @@
  * (server/src/streams/relay.ts schedule(): lead only when pending.length === 1 and now - lastCommitAt >= quietMs).
  */
 import type { AppendFrame, RelayEvent } from "../../src/ports/relay";
+import { CONTROL_PREFIX } from "../../src/engine/adapters/relayFrames";
 import type { WebSocketCtor, WebSocketLike } from "../../src/engine/adapters/wsRelay";
 import type { Report } from "./engineKit";
 
@@ -129,7 +130,12 @@ export class WireTap {
 	webSocket(base?: WebSocketCtor): WebSocketCtor {
 		const Base = base ?? (globalThis.WebSocket as unknown as WebSocketCtor);
 		const onReady = (text: string) => {
-			const gc = (JSON.parse(text) as { limits?: { groupCommit?: Record<string, unknown> } }).limits?.groupCommit;
+			let gc: Record<string, unknown> | undefined;
+			try {
+				gc = (JSON.parse(text.slice(CONTROL_PREFIX.length)) as { limits?: { groupCommit?: Record<string, unknown> } }).limits?.groupCommit;
+			} catch {
+				return; // not ours to judge: the adapter parses the same frame
+			}
 			const n = (k: string) => (typeof gc?.[k] === "number" ? gc[k] : NaN);
 			const limits = { idleMs: n("idleMs"), maxMs: n("maxMs"), maxBytes: n("maxBytes"), minIntervalMs: n("minIntervalMs"), leadMs: n("leadMs"), quietMs: n("quietMs") };
 			if (Object.values(limits).every(Number.isFinite)) this.groupCommit = limits;
@@ -138,7 +144,7 @@ export class WireTap {
 			constructor(url: string) {
 				const ws = new Base(url) as WebSocketLike & { addEventListener(t: string, f: (e: MessageEvent) => void): void };
 				ws.addEventListener("message", (e: MessageEvent) => {
-					if (typeof e.data === "string" && e.data.includes("\"VAULT_READY\"")) onReady(e.data);
+					if (typeof e.data === "string" && e.data.startsWith(CONTROL_PREFIX) && e.data.includes("\"VAULT_READY\"")) onReady(e.data);
 				});
 				return ws;
 			}
