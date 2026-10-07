@@ -1,10 +1,16 @@
 /**
  * Full clients for the full-client e2e (fullClients.ts): one HostRuntime per device over the simulated
  * Obsidian surfaces (SimVault, SimWorkspace, SimConfigDir, SimSideFiles, SimPlatform) and the REAL composed
- * engine (createEngine on the inline carrier) with the production ports: wsRelay, idbStorage on a per-device
+ * engine (createEngine) with the production ports (fullEnginePorts): wsRelay, idbStorage on a per-device
  * fake-indexeddb IDBFactory (kept across restarts), httpBlob when the relay advertises it (else null:
  * attachments ride the log as x: blob chunks), crypto by init.crypto as webEngine.ts picks it (suite 0: the
  * identity adapter; suite 1 and unpinned: webCryptoSuite1), web clock/hash/random. Real timers.
+ *
+ * The engine runs on the inline carrier (main's event loop), or with `carrier: "worker"` on its own thread as in
+ * the plugin (plugin.ts workerCarrier): EngineThread is one worker_threads Worker (fullWorker.ts) for the client's
+ * life, so the device's IndexedDB outlives engine restarts; each carrier is a fresh MessageChannel to it, through
+ * createWorkerHostTransport / createWorkerEngineTransport. Every post of an attachment-sized buffer is counted,
+ * either way, as moved (detached after the post) or copied (EngineThread.posts, the thread's own).
  *
  * A client runs its own HostRuntime (suite-0 fixture pin), or the plugin controller's (`runtimeFor`, e2ee.ts):
  * then main's real pin and key flow (src/host/pluginController.ts) decides the pin and restarts the engine.
@@ -14,15 +20,18 @@
  * With a WireTap (wireTap.ts) the same wrapper timestamps APPENDs and relay events for the latency breakdown;
  * the blob wrapper records every PUT's and GET's start, body size and end (NetSwitch.puts / gets).
  */
+import type { IntervalHistogram } from "node:perf_hooks";
+import { MessageChannel, Worker, type MessagePort } from "node:worker_threads";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import type { Unsubscribe } from "../../src/ports/common";
-import type { BlobPort } from "../../src/ports";
+import type { BlobPort, EnginePorts } from "../../src/ports";
 import type { AppendFrame, RelayEvent, RelayPort, RelaySession } from "../../src/ports/relay";
 import type { BrakeReport, DeviceId, VaultId } from "../../src/core/types";
 import type { ProtocolError } from "../../src/protocol/errors";
 import { createInlinePair } from "../../src/protocol/inlineTransport";
-import type { EngineSettings } from "../../src/protocol/messages";
+import type { EngineInitConfig, EngineSettings } from "../../src/protocol/messages";
 import type { StatusSnapshot } from "../../src/protocol/status";
+import { createWorkerHostTransport, type WorkerLike } from "../../src/protocol/workerTransport";
 import type { EngineCarrier } from "../../src/host/engineHost";
 import { engineHashOracle } from "../../src/host/hashOracle";
 import { HostRuntime, type HostUiSink } from "../../src/host/hostRuntime";
@@ -201,6 +210,263 @@ export class NetSwitch {
 	}
 }
 
+// ---- engine ports (both carriers) ------------------------------------------------
+
+export interface EnginePortDeps {
+	readonly net: NetSwitch;
+	/** The device's IndexedDB (kept across restarts). */
+	readonly factory: IDBFactory;
+	readonly log: (line: string) => void;
+	readonly onBlobKind: (kind: "http" | "none") => void;
+	readonly trace?: BootTrace;
+	readonly tap?: WireTap;
+}
+
+/** The ports of one init, as webEngine.ts makes them, over the device's net switch and IndexedDB. */
+export async function fullEnginePorts(config: EngineInitConfig, d: EnginePortDeps): Promise<EnginePorts> {
+	const clock = createWebClock();
+	const hash = createWebHash();
+	const random = createWebRandom();
+	const tr = d.trace;
+	const tap = d.tap;
+	const relay = d.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random,
+		...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}), ...(tap ? { WebSocketImpl: tap.webSocket(tr?.WebSocket) } : {}) }));
+	const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock, xhr: nodeXhr };
+	// As webEngine.ts: probed at start, and again on a later connect while there is none.
+	const blob = await startupBlob(blobOpts, d.log);
+	d.onBlobKind(blob ? "http" : "none");
+	const probeBlob = async () => {
+		const found = await probeHttpBlob(blobOpts);
+		if (found) d.onBlobKind("http");
+		return d.net.wrapBlob(found);
+	};
+	const storage = createIdbStoragePort(d.factory, IDBKeyRange);
+	const c = config.crypto;
+	// As webEngine.ts: suite-1 keys are zero-filled once imported; unpinned gets the adapter with no key.
+	const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
+	return { relay, storage: tr ? tr.wrapStorage(storage) : storage, clock, random, crypto, hash, blob: d.net.wrapBlob(blob), probeBlob };
+}
+
+// ---- engine thread (carrier "worker") ----------------------------------------------
+
+/** Attachment-sized: a post carrying a buffer this large is counted (LargePost). */
+export const LARGE_BUFFER_BYTES = 1024 * 1024;
+
+/** Wall-clock ms with sub-ms resolution, comparable across threads and processes (calibrate with a round trip). */
+export const absNow = (): number => performance.timeOrigin + performance.now();
+
+/** One post that carried an attachment-sized buffer: moved (detached after the post) or copied by structured clone. */
+export interface LargePost {
+	readonly kind: "post";
+	readonly at: number;
+	readonly dir: "main-to-engine" | "engine-to-main";
+	/** The protocol message's `t`. */
+	readonly t: string;
+	readonly bytes: number;
+	readonly transferred: boolean;
+}
+
+/** Engine-thread diagnostics (FullClientOptions.engineEvents); `at` is the thread's absNow(). */
+export type EngineThreadEvent =
+	| { readonly kind: "append"; readonly at: number; readonly stream: string; readonly frameId: string; readonly bytes: number }
+	| { readonly kind: "relay"; readonly at: number; readonly t: RelayEvent["t"]; readonly stream: string | null; readonly frameId: string | null; readonly deviceId: string | null }
+	| { readonly kind: "blob"; readonly at: number; readonly op: "put" | "get"; readonly phase: "start" | "end" | "error"; readonly bytes: number; readonly error: string | null }
+	/** The thread's 1 ms heartbeat fired this late (>= ENGINE_GAP_EVENT_MS). */
+	| { readonly kind: "gap"; readonly at: number; readonly ms: number }
+	| LargePost;
+
+export const ENGINE_GAP_EVENT_MS = 20;
+
+/** An event-loop delay histogram (monitorEventLoopDelay), ms. */
+export interface LoopStats { readonly n: number; readonly p50: number; readonly p99: number; readonly max: number; readonly mean: number }
+
+export function loopStats(h: IntervalHistogram): LoopStats {
+	const ms = (ns: number) => Math.round(ns / 1e4) / 100;
+	return { n: h.count, p50: ms(h.percentile(50)), p99: ms(h.percentile(99)), max: ms(h.max), mean: ms(h.count > 0 ? h.mean : 0) };
+}
+
+export interface EngineThreadProbe {
+	/** The thread's absNow() when it answered. */
+	readonly at: number;
+	/** monitorEventLoopDelay({ resolution: 1 }) since the last reset. */
+	readonly loop: LoopStats;
+	/** Longest gap of the thread's 1 ms heartbeat since the last reset. */
+	readonly heartbeatMaxGapMs: number;
+	readonly heapUsedBytes: number;
+	/** The thread's own ArrayBuffers (memoryUsage().arrayBuffers is per isolate). */
+	readonly arrayBuffersBytes: number;
+	/** Engine-to-main posts of attachment-sized buffers so far. */
+	readonly posts: readonly LargePost[];
+}
+
+/** Main -> engine thread. */
+export type ToEngineThread =
+	| { readonly t: "carrier"; readonly id: number; readonly port: MessagePort; readonly tuning?: Partial<EngineTuning> }
+	| { readonly t: "dispose"; readonly id: number }
+	| { readonly t: "online"; readonly online: boolean }
+	| { readonly t: "probe"; readonly rid: number; readonly reset: boolean };
+
+/** Engine thread -> main. */
+export type FromEngineThread =
+	| { readonly t: "up" }
+	| { readonly t: "log"; readonly line: string }
+	| { readonly t: "blobKind"; readonly kind: "http" | "none" }
+	| { readonly t: "probe"; readonly rid: number; readonly value: EngineThreadProbe }
+	| { readonly t: "event"; readonly e: EngineThreadEvent };
+
+export interface EngineThreadData {
+	/** Post EngineThreadEvents (FullClientOptions.engineEvents set). */
+	readonly events: boolean;
+}
+
+function largeBuffers(v: unknown, out: Uint8Array[], depth: number): Uint8Array[] {
+	if (depth > 8 || typeof v !== "object" || v === null) return out;
+	if (ArrayBuffer.isView(v)) {
+		if (v.byteLength >= LARGE_BUFFER_BYTES) out.push(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+		return out;
+	}
+	for (const x of Array.isArray(v) ? v : Object.values(v)) largeBuffers(x, out, depth + 1);
+	return out;
+}
+
+/** post(), and the attachment-sized buffers `message` carried: each one detached afterwards was moved, not copied. */
+export function postCounted(dir: LargePost["dir"], message: unknown, post: () => void): LargePost[] {
+	const big = largeBuffers(message, [], 0);
+	const sizes = big.map((b) => b.byteLength);
+	post();
+	if (big.length === 0) return [];
+	const at = absNow();
+	const t = String((message as { t?: unknown }).t);
+	return big.map((b, i) => ({ kind: "post", at, dir, t, bytes: sizes[i]!, transferred: b.byteLength === 0 && b.buffer.byteLength === 0 }));
+}
+
+/** What a carrier's transport hears: a message's data, or a failure's message (workerTransport.ts describe()). */
+type CarrierListener = (ev: { readonly data: unknown; readonly message: string }) => void;
+
+interface EngineThreadSink {
+	log(line: string): void;
+	blobKind(kind: "http" | "none"): void;
+	readonly event?: (e: EngineThreadEvent) => void;
+}
+
+/**
+ * The device's engine thread (fullWorker.ts). One Worker for the client's life (its IndexedDB, net switch and
+ * heartbeat); each carrier() is one engine over a fresh MessageChannel, disposed when the host terminates it. The
+ * thread keeps the process alive only while it starts or a carrier is live.
+ */
+export class EngineThread {
+	/** The thread loaded its modules: a carrier's startup ping (STARTUP_PING_TIMEOUT_MS) only measures the engine. */
+	readonly ready: Promise<void>;
+	/** Main-to-engine posts of attachment-sized buffers. */
+	readonly posts: LargePost[] = [];
+	private readonly worker: Worker;
+	private readonly probes = new Map<number, (p: EngineThreadProbe) => void>();
+	private readonly carriers = new Map<number, Set<CarrierListener>>();
+	private nextId = 1;
+	private nextRid = 1;
+	private up = false;
+
+	constructor(name: string, private readonly sink: EngineThreadSink) {
+		const data: EngineThreadData = { events: sink.event !== undefined };
+		// execArgv is inherited: --import jiti/register loads the TypeScript entry.
+		this.worker = new Worker(new URL("./fullWorker.ts", import.meta.url), { name: `yaos-engine-${name}`, workerData: data });
+		let started!: () => void;
+		let broke!: (e: Error) => void;
+		this.ready = new Promise<void>((resolve, reject) => {
+			started = resolve;
+			broke = reject;
+		});
+		this.worker.on("message", (m: FromEngineThread) => {
+			switch (m.t) {
+				case "up":
+					this.up = true;
+					this.hold();
+					started();
+					return;
+				case "log":
+					sink.log(m.line);
+					return;
+				case "blobKind":
+					sink.blobKind(m.kind);
+					return;
+				case "probe":
+					this.probes.get(m.rid)?.(m.value);
+					this.probes.delete(m.rid);
+					return;
+				case "event":
+					sink.event?.(m.e);
+					return;
+			}
+		});
+		const failAll = (reason: string) => {
+			broke(new Error(reason));
+			for (const listeners of this.carriers.values()) for (const l of [...listeners]) l({ data: null, message: reason });
+		};
+		this.worker.on("error", (e) => failAll(`engine thread error: ${e.message}`));
+		this.worker.on("exit", (code) => failAll(`engine thread exited (${code})`));
+	}
+
+	/** A worker carrier: what plugin.ts workerCarrier returns, over this thread. */
+	carrier(tuning: Partial<EngineTuning> | undefined): EngineCarrier {
+		const { port1, port2 } = new MessageChannel();
+		const id = this.nextId++;
+		const failures = new Set<CarrierListener>();
+		this.carriers.set(id, failures);
+		this.send({ t: "carrier", id, port: port2, ...(tuning ? { tuning } : {}) }, [port2]);
+		this.hold();
+		const worker: WorkerLike = {
+			postMessage: (message, transfer) => {
+				for (const p of postCounted("main-to-engine", message, () => port1.postMessage(message, transfer as ArrayBuffer[]))) {
+					this.posts.push(p);
+					this.sink.event?.(p);
+				}
+			},
+			addEventListener: (type: string, listener: CarrierListener) => {
+				if (type === "message") port1.on("message", (data: unknown) => listener({ data, message: "" }));
+				else if (type === "messageerror") port1.on("messageerror", (e: Error) => listener({ data: null, message: e.message }));
+				else failures.add(listener);
+			},
+			terminate: () => {
+				if (!this.carriers.delete(id)) return;
+				this.send({ t: "dispose", id });
+				port1.close();
+				this.hold();
+			},
+		};
+		const transport = createWorkerHostTransport(worker);
+		return { kind: "worker", transport, dispose: () => transport.close() };
+	}
+
+	/** The thread's loop stats (reset: start a new window); sentAt / gotAt bracket its `at` (clock calibration). */
+	probe(reset: boolean): Promise<{ readonly sentAt: number; readonly gotAt: number; readonly value: EngineThreadProbe }> {
+		const rid = this.nextRid++;
+		const sentAt = absNow();
+		return new Promise((resolve) => {
+			this.probes.set(rid, (value) => resolve({ sentAt, gotAt: absNow(), value }));
+			this.send({ t: "probe", rid, reset });
+		});
+	}
+
+	setOnline(online: boolean): void {
+		this.send({ t: "online", online });
+	}
+
+	/** Ends the thread once its client is stopped for good (nothing restarts it). */
+	async close(): Promise<void> {
+		this.carriers.clear();
+		await this.worker.terminate();
+	}
+
+	private send(m: ToEngineThread, transfer: MessagePort[] = []): void {
+		this.worker.postMessage(m, transfer);
+	}
+
+	private hold(): void {
+		if (!this.up || this.carriers.size > 0) this.worker.ref();
+		else this.worker.unref();
+	}
+}
+
 // ---- full client ---------------------------------------------------------------
 
 export interface ClientUi {
@@ -225,13 +491,17 @@ export interface FullClientOptions {
 	readonly tuning?: Partial<EngineTuning>;
 	/** The vault's wire timeline (fullLatency.ts): APPENDs, relay events, engine disk writes, VAULT_READY limits. */
 	readonly tap?: WireTap;
+	/** Where the engine runs: main's event loop (default) or its own thread, as the plugin's worker. */
+	readonly carrier?: "inline" | "worker";
+	/** carrier "worker": the engine thread's diagnostics (typingDuringUpload.ts). */
+	readonly engineEvents?: (e: EngineThreadEvent) => void;
 }
 
 const LOG_RING = 400;
 
 /** One Obsidian device: simulated vault/workspace/config/platform, real host runtime and engine. */
 export class FullClient {
-	/** The device's IndexedDB (kept across restarts). */
+	/** The device's IndexedDB (kept across restarts), on the inline carrier; the engine thread holds its own. */
 	readonly factory = new IDBFactory();
 	readonly clock = createWebClock();
 	/** Like the plugin: vault preconditions are hashed by the live runtime's engine (main never hashes). */
@@ -261,10 +531,16 @@ export class FullClient {
 	/** Vault cursor of each new vault runtime when it came up (a restart from IndexedDB resumes, not 0). */
 	readonly cursorAtStart: number[] = [];
 	stopped = false;
+	/** carrier "worker": the engine's thread (null on the inline carrier). */
+	readonly thread: EngineThread | null;
 	private handle: EngineHandle | null = null;
 
 	constructor(readonly o: FullClientOptions) {
 		const tap = o.tap;
+		if (o.carrier === "worker" && (tap || o.trace)) throw new Error("tap and trace time main-thread calls: inline carrier only");
+		this.thread = o.carrier === "worker"
+			? new EngineThread(o.name, { log: (line) => this.log(`engine: ${line}`), blobKind: (k) => { this.blobKind = k; }, ...(o.engineEvents ? { event: o.engineEvents } : {}) })
+			: null;
 		this.vault = new SimVault({ clock: this.clock, hashes: this.hashes, profile: "case-sensitive", watcherDelayMs: () => o.watcherDelayMs,
 			...(tap ? { onMutation: (m: { by: string; path: string; to?: string }) => {
 				if (m.by !== "sync") return;
@@ -294,7 +570,7 @@ export class FullClient {
 		if (this.logLines.length > LOG_RING) this.logLines.splice(0, this.logLines.length - LOG_RING);
 	}
 
-	/** Bound-merge conflict copies this engine wrote (the worker's boundDisk); null while no engine runs. */
+	/** Bound-merge conflict copies this engine wrote (the worker's boundDisk); null while no engine runs (or on its own thread). */
 	get conflictCopiesWritten(): number | null {
 		return this.handle?.engine.boundDisk.stats.conflictCopies ?? null;
 	}
@@ -305,43 +581,23 @@ export class FullClient {
 		return ws;
 	}
 
-	private carrier(): EngineCarrier {
+	private inlineCarrier(): EngineCarrier {
 		const pair = createInlinePair();
 		this.engineStarts++;
+		const log = (line: string) => this.log(`engine: ${line}`);
 		const handle = createEngine(pair.engine, {
 			carrier: "inline",
 			clientVersion: "full-e2e",
 			...(this.o.tuning ? { tuning: this.o.tuning } : {}),
 			tzOffsetMinutes: () => 0,
-			log: (line) => this.log(`engine: ${line}`),
+			log,
 			onRuntime: (rt) => {
 				if (this.handle !== handle) return;
 				this.vrt = rt;
 				if (rt) this.cursorAtStart.push(rt.log.c.repo.cursor.vaultSeq);
 			},
-			makePorts: async (config) => {
-				const clock = createWebClock();
-				const hash = createWebHash();
-				const random = createWebRandom();
-				const tr = this.o.trace;
-				const tap = this.o.tap;
-				const relay = this.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random,
-					...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}), ...(tap ? { WebSocketImpl: tap.webSocket(tr?.WebSocket) } : {}) }));
-				const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock, xhr: nodeXhr };
-				// As webEngine.ts: probed at start, and again on a later connect while there is none.
-				const blob = await startupBlob(blobOpts, (line) => this.log(`engine: ${line}`));
-				this.blobKind = blob ? "http" : "none";
-				const probeBlob = async () => {
-					const found = await probeHttpBlob(blobOpts);
-					if (found) this.blobKind = "http";
-					return this.net.wrapBlob(found);
-				};
-				const storage = createIdbStoragePort(this.factory, IDBKeyRange);
-				const c = config.crypto;
-				// As webEngine.ts: suite-1 keys are zero-filled once imported; unpinned gets the adapter with no key.
-				const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
-				return { relay, storage: tr ? tr.wrapStorage(storage) : storage, clock, random, crypto, hash, blob: this.net.wrapBlob(blob), probeBlob };
-			},
+			makePorts: (config) => fullEnginePorts(config, { net: this.net, factory: this.factory, log, onBlobKind: (k) => { this.blobKind = k; },
+				...(this.o.trace ? { trace: this.o.trace } : {}), ...(this.o.tap ? { tap: this.o.tap } : {}) }),
 		});
 		this.handle = handle;
 		this.vrt = null;
@@ -379,8 +635,12 @@ export class FullClient {
 			clock: this.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
 			workspace: this.workspace, platform: this.platform,
 			identity, settings,
-			createWorker: () => null,
-			createInline: () => this.carrier(),
+			createWorker: () => {
+				if (!this.thread) return null;
+				this.engineStarts++;
+				return this.thread.carrier(this.o.tuning);
+			},
+			createInline: () => this.inlineCarrier(),
 			pingEnabled: true,
 			keys,
 			log: (line) => this.log(`host: ${line}`),
@@ -394,8 +654,9 @@ export class FullClient {
 		});
 	}
 
-	start(): Promise<void> {
-		return this.runtime.start();
+	async start(): Promise<void> {
+		await this.thread?.ready;
+		await this.runtime.start();
 	}
 
 	/** App quits: the runtime shuts the engine down; open views close without saving. */
@@ -417,7 +678,8 @@ export class FullClient {
 	}
 
 	setOnline(online: boolean): void {
-		this.net.setOnline(online);
+		if (this.thread) this.thread.setOnline(online);
+		else this.net.setOnline(online);
 		this.platform.emit(online ? "online" : "offline");
 	}
 }

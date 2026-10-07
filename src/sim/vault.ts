@@ -50,6 +50,16 @@ const decoder = new TextDecoder();
 const utf8 = (text: string): Uint8Array => encoder.encode(text);
 const fromUtf8 = (bytes: Uint8Array): string => decoder.decode(bytes);
 
+/**
+ * A version's text, decoded the first time it is read (the invariants read history after a run): decoding a 100 MB
+ * attachment takes about 0.9 s on the thread that wrote it, a cost of the sim alone (Obsidian keeps no history).
+ * `bytes` is the version's own array: commit() replaces a file's bytes and never writes into them.
+ */
+function versionRecord(path: string, bytes: Uint8Array, by: WriterKind, atMs: number): VersionRecord {
+	let text: string | null = null;
+	return { path, by, atMs, get text() { return (text ??= fromUtf8(bytes)); } };
+}
+
 export type CaseProfile = "case-insensitive" | "case-sensitive";
 
 /** External (watcher) modify event -> setViewData lag (spike OR-2 B: 12.8 ms after the event, 25.5 ms after the write; conservative). */
@@ -426,7 +436,7 @@ export class SimVault implements VaultPort {
 			this.files.set(k, f);
 			this.emit({ t: "create", path: f.path, stat: this.stamp(f) }, by, this.reload(f));
 		}
-		this.history.push({ path: f.path, text: fromUtf8(bytes), by, atMs: now });
+		this.history.push(versionRecord(f.path, bytes, by, now));
 		this.opts.onMutation?.({ kind: "write", by, path: f.path });
 		return f;
 	}
