@@ -1026,7 +1026,10 @@ The blocked screen offers exactly two actions, and says why:
 - **No re-enrollment.** The blocked device is already enrolled. When a setup link names the vault it is enrolled in
   (the vaultId is inside the pairing code, DECISIONS D3), it takes only `key` or `suite` from the link and does not
   enroll again. The code expires unused after 15 min.
-- **No third button.** Nothing on this screen sets suite 0, enables encryption or creates a vault.
+- **No third button.** Nothing on this screen sets suite 0, enables encryption or creates a vault. "Create a new
+  vault" is not offered to a blocked device either: the command and the settings action are hidden, and
+  `createAndEnroll` refuses before any request (`canCreateVault`, `src/host/ui/commands.ts:18-22`;
+  `createVault.ts:114`).
 
 **Rules kept.**
 - A suite-0 device that sees a `k` genesis stops: phase `key-missing`, `keyMissing: "encrypted-vault"`. It seals
@@ -1263,6 +1266,11 @@ unpinned and blocked (§12.4).
   - `resumePendingEnrollment`.
 
   All of those are key-less joins (§12.4).
+- **Not started on a blocked device.** "Create a new vault" starts only on an unpaired device, or on a paired one
+  that holds its vault's pin and key (the engine reports nothing missing). A paired device that is blocked for want
+  of a key or pin, or whose engine has not reported yet, only takes a key (§12.4). The command, the settings action
+  and the modal's first screen check `canCreateVault` (`src/host/ui/commands.ts:18-22`), and `createAndEnroll`
+  checks it again: it refuses with "blocked" before any request or write (`src/host/ui/createVault.ts:114`).
 - **Crash recovery.**
   - Right after step 1's response, main writes `creating: {vaultId}` to `data.json`. Nothing else writes it.
   - On restart, an enrolled, unpinned device whose vaultId equals `creating.vaultId` resumes at step 3. Every other
@@ -1305,8 +1313,9 @@ links (§12.4).
 ### 15.2 Migrate an existing vault, or turn encryption off
 
 Both mean **a new vault** (decision D7):
-1. In the plugin, run "Create a new vault" (§15.1) with encryption On, or Off by the opt-out. The device leaves the
-   old vault first. The initial reconcile uploads every file from disk.
+1. In the plugin, run "Create a new vault" (§15.1) with encryption On, or Off by the opt-out, on a device that
+   syncs the old vault (it holds that vault's pin and key; a blocked device only takes a key, §12.4). The device
+   leaves the old vault first. The initial reconcile uploads every file from disk.
 2. Pair the other devices with the plugin-drawn QR (§12.1), or the suite-0 link (§12.4).
 3. Delete the old vault in the console. Deletion runs `deleteAll()` and then purges the R2 prefix `v/<vaultId>/`
    (DECISIONS D5, D9).
@@ -1850,21 +1859,25 @@ runs in the engine):
   `installKey` "rk"). The status bar opens it in phase `key-missing`; the command "Enter recovery key or scan a QR
   code" and the settings "Encryption" group (actions only, no status rows) reach it too.
 - **Create a new vault (§15.1)**, `CreateVaultModal` (`createVaultModal.ts`) over `createVault.ts`:
-  - step 1 `createAndEnroll` (`createVault.ts:107-129`): claim (unclaimed: the operator key is generated on main,
+  - offered and started only unpaired, or paired with the vault's pin and key (`canCreateVault`,
+    `commands.ts:18-22`): the command, the settings action and the modal's first screen check it, and
+    `createAndEnroll` refuses "blocked" before any request (`createVault.ts:114`). A blocked device only takes a
+    key (§12.4);
+  - step 1 `createAndEnroll` (`createVault.ts:113-136`): claim (unclaimed: the operator key is generated on main,
     shown with Copy, and "I saved the operator key" enables the claim) or operator login, create, owner code and
     logout (claimed: the key is typed). The key is cleared from the modal as soon as step 1 returns. Main writes
-    `creating: {vaultId}` right after the response (`:110`);
-  - step 2 enrolls with the in-memory code, which must name that vaultId (`:114`); no `pendingEnrollment`. A
+    `creating: {vaultId}` right after the response (`:117`);
+  - step 2 enrolls with the in-memory code, which must name that vaultId (`:121`); no `pendingEnrollment`. A
     failure before the identity is stored drops the marker;
-  - step 3 `confirmEmptyVault` (`:173`) waits for `status.e2ee.creatable` (head 0 and an empty `k` read on this
+  - step 3 `confirmEmptyVault` (`:180`) waits for `status.e2ee.creatable` (head 0 and an empty `k` read on this
     session). A key record or a head above 0 ends the flow with "The server returned a vault that is not empty"
     and no pin; a timeout keeps the marker, and "Finish creating this vault" resumes at step 3
-    (`resumableCreation`, `:132`);
+    (`resumableCreation`, `:139`);
   - the choice: "End-to-end encryption: On" preselected (a new RK shown once, confirmed by retyping 2 random
     groups, then `enableE2ee`), or the opt-out, confirmed ("You cannot turn end-to-end encryption on later for this
     vault"), then `pinSuite0` "create".
   - Only `createVault.ts` sends `enableE2ee` or `pinSuite0` "create" or marks a vault, and only the modal reaches
-    it, from the command and the settings action (source scans, `createVault.test.ts:326-359`); main refuses both
+    it, from the command and the settings action (source scans, `createVault.test.ts:356-389`); main refuses both
     without the marker (`pin.ts:68-79`). `pinSuite0` "link" comes only from a `suite=0` link.
 - **Recovery key and re-key (§13.2, §14.2, D1, D8).** `RecoveryKeyModal` (`keyModals.ts:176-263`) shows the RK once
   with Copy and "Store it outside this vault: a password manager or paper", then asks for 2 random groups, and
@@ -1925,7 +1938,19 @@ runs in the engine):
     1000 seeds:
     - replays: 45,191 injected, 45,191 ignored, 2000/2000 digests equal;
     - stale epoch: 19,669 injected past S_rot, all stale, 0 quarantined;
-  - `src/engine/compose/downgrade.test.ts` (6f8fad3).
+  - `src/engine/compose/downgrade.test.ts` (6f8fad3). After the E5 merge (d66c0bc), b–e were re-pointed at E5's
+    code paths:
+    - b also runs E5's UI flows on every blocked device. It found "Create a new vault" reachable there: the command
+      was always available, and `createAndEnroll` would claim, write the marker and re-enroll. Fixed fail-closed
+      (`canCreateVault`, §15.1 "Not started on a blocked device"); a control shows the same server creates for an
+      unpaired device.
+    - c counts E5's key-command sites, each behind its guard, and the import graph that reaches them. It shows that
+      createVault's two choices send nothing short of `creatable`, and that a `suite=0` link routed into a suite-1,
+      suite-0 or `keyringSeen` device is refused on main.
+    - d routes the 4 `suite=0` shapes `parseSetupLink` accepts (§12.4 source (ii)) through `routeSetupLink` and
+      `applyLinkE2ee`: refused (`keyring-seen`) after the genesis, a re-pair and a restart.
+    - e routes 19 link classes x 9 device states through `routeSetupLink`: §12.4's route every time, key-free
+      `/enroll` bodies, and no marker call.
 
   Every assertion holds. The header row of the bit-flip test asserts the reason the §9.2 and §10.2 rules predict, not
   only `auth-failed` or `malformed`.

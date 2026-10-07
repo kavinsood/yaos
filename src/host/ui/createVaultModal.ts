@@ -10,6 +10,8 @@
  *   choice     "End-to-end encryption: On" preselected, or the opt-out (decision D2), confirmed
  *
  * "Finish creating this vault" opens the same modal at `check` for the vault named by the `creating` marker.
+ * On a paired device that is blocked for want of a key or pin (§12.4), or whose engine has not said, the modal
+ * shows CREATE_BLOCKED_MESSAGE and nothing else (canCreateVault; createAndEnroll refuses as well).
  *
  * SECRETS: the operator key (shown once when generated here, since handing it to the user is the point; never
  * logged, never stored), the owner code (never displayed), the recovery key (RecoveryKeyModal).
@@ -18,11 +20,12 @@
 import { Modal, Notice, Setting, type App, type ButtonComponent } from "obsidian";
 import type { YaosUiHost } from "./api";
 import { confirmAction } from "./confirmModal";
+import { canCreateVault } from "./commands";
 import {
 	confirmEmptyVault, createAndEnroll, CreateVaultError, enableEncryption, optOutOfEncryption, probeServer, resumableCreation,
 	type ProbedServer,
 } from "./createVault";
-import { DEVICE_NAME_HINT, STORE_RK_ADVICE } from "./e2eeText";
+import { CREATE_BLOCKED_MESSAGE, DEVICE_NAME_HINT, STORE_RK_ADVICE } from "./e2eeText";
 import { errorMessage } from "./format";
 import { askNewRecoveryKey } from "./keyModals";
 import { copyText, obsidianRequest } from "./obsidianEnv";
@@ -60,7 +63,8 @@ export class CreateVaultModal extends Modal {
 		this.contentEl.addClass("yaos-create-vault-modal");
 		this.setTitle("Create a new vault");
 		if (!this.opts.resume) {
-			this.showServer();
+			if (canCreateVault(this.host)) this.showServer();
+			else this.reset().createEl("p", { text: CREATE_BLOCKED_MESSAGE });
 			return;
 		}
 		const vaultId = resumableCreation(this.host.data());

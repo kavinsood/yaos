@@ -9,6 +9,10 @@ import { errorMessage } from "./format";
 /** §15.1: every failed check of the creation path ends with this, and sets no pin. */
 export const NOT_EMPTY_MESSAGE = "The server returned a vault that is not empty";
 
+/** §12.4, §15.1: "Create a new vault" on a paired device without its vault's pin and key, or before the engine says. */
+export const CREATE_BLOCKED_MESSAGE =
+	"This device cannot create a vault until it has the key for the vault it is paired with and YAOS is running. Enter your recovery key or scan a QR code from one of your devices first.";
+
 /** §12.4 no-pin text, verbatim. */
 export const NO_PIN_TEXT =
 	"YAOS can't tell whether this vault is end-to-end encrypted. The server says it holds no encryption key record, but a server can hide one, so this device will not sync until one of your own devices or your recovery key settles it.";
