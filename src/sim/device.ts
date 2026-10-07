@@ -90,7 +90,7 @@ export interface SimDeviceOptions {
 	 * link leaves (so the suite-0 runs sync). null: unpinned, which is blocked and writes nothing.
 	 */
 	readonly pin?: E2eePin | null;
-	/** The engine's blob store for each start (default none). */
+	/** The engine's blob store for each start, and what its connect-time probe finds (default: the net's, SimNet.blobPort). */
 	readonly blob?: () => BlobPort | null;
 	/** Over FAST_TUNING (a roll trigger, the GC grace). */
 	readonly tuning?: Partial<EngineTuning>;
@@ -183,7 +183,8 @@ export class SimDevice {
 				const work = c.suite === 0 ? null : realWorkFor(this.opts.clock);
 				const hash = work ? delayedHash(work, simHashPort()) : simHashPort();
 				const crypto = work ? await createDelayedSuite1(work, { vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] }) : createNoopCrypto(hash);
-				return { relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.deviceClock, random, crypto, hash, blob: this.opts.blob?.() ?? null };
+				const blob = (): BlobPort | null => (this.opts.blob ? this.opts.blob() : this.opts.net.blobPort());
+				return { relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.deviceClock, random, crypto, hash, blob: blob(), probeBlob: async () => blob() };
 			},
 		});
 		this.pair = pair;

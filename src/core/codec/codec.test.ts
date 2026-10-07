@@ -19,10 +19,8 @@ import {
 	sealEnvelope,
 } from "./envelope";
 import {
-	decodeBlobChunk,
 	decodeBodyUpdateRef,
 	decodeCheckpointContent,
-	encodeBlobChunk,
 	encodeBodyUpdateRef,
 	encodeCheckpointContent,
 } from "./contents";
@@ -152,6 +150,7 @@ test("envelope inner: deflate rule, bounded inflate, malformed cases", () => {
 
 	assert.deepEqual(decodeInner(new Uint8Array([99, 0, 0, 0])), { ok: false, reason: "malformed" }, "unknown kind");
 	assert.deepEqual(decodeInner(new Uint8Array([0, 0, 0, 0])), { ok: false, reason: "malformed" }, "kind 0");
+	assert.deepEqual(decodeInner(new Uint8Array([6, 0, 0, 0])), { ok: false, reason: "malformed" }, "kind 6 is retired (was the log blob carrier)");
 	assert.deepEqual(decodeInner(new Uint8Array([2, 0x80, 0, 0, 0])), { ok: false, reason: "malformed" }, "non-minimal authorNsSeq");
 	assert.deepEqual(decodeInner(new Uint8Array([2, 0])), { ok: false, reason: "malformed" }, "truncated flags");
 	assert.deepEqual(decodeInner(new Uint8Array([2, 0, 0])), { ok: false, reason: "malformed" }, "truncated frameNo");
@@ -173,7 +172,7 @@ test("envelope inner: frameNo is >= 1 for nsOps/cfgOps and 0 for every other kin
 	assert.equal(ok([1, 0, 0, 0]), "malformed", "nsOps frameNo 0");
 	assert.equal(ok([4, 0, 0, 0]), "malformed", "cfgOps frameNo 0");
 	assert.equal(ok([1, 0, 0, 0x81, 0x00]), "malformed", "non-minimal frameNo");
-	for (const code of [2, 3, 5, 6, 7]) {
+	for (const code of [2, 3, 5, 7, 8]) {
 		assert.equal(ok([code, 0, 0, 0]), 0, `kind ${code} frameNo 0`);
 		assert.equal(ok([code, 0, 0, 1]), "malformed", `kind ${code} frameNo 1`);
 	}
@@ -222,15 +221,11 @@ test("seal/open with the identity suite: binding checks", async () => {
 		"a suite-0 reader cannot open suite 1");
 });
 
-test("contents: checkpoint / blobChunk / bodyUpdateRef round trip and malformed", () => {
+test("contents: checkpoint / bodyUpdateRef round trip and malformed", () => {
 	const ck = { encoding: CheckpointEncoding.yjsStateV1, coversSeq: 1234, foldRulesVersion: 1, state: new Uint8Array([5, 6]) };
 	assert.deepEqual(decodeCheckpointContent(encodeCheckpointContent(ck)), ck);
 	assert.equal(decodeCheckpointContent(new Uint8Array([9, 0, 0])), null, "unknown encoding");
 	assert.equal(decodeCheckpointContent(new Uint8Array([1, 0x80, 0x00, 0])), null, "non-minimal");
-	const bc = { hash: H1, index: 1, total: 3, totalSize: 99, chunk: new Uint8Array([1, 2, 3]) };
-	assert.deepEqual(decodeBlobChunk(encodeBlobChunk(bc)), bc);
-	assert.equal(decodeBlobChunk(new Uint8Array(31)), null);
-	assert.equal(decodeBlobChunk(new Uint8Array([...new Uint8Array(32), 3, 3, 0])), null, "index >= total");
 	const br = { hash: H2, size: 5_000_000 };
 	assert.deepEqual(decodeBodyUpdateRef(encodeBodyUpdateRef(br)), br);
 	assert.equal(decodeBodyUpdateRef(new Uint8Array([...encodeBodyUpdateRef(br), 0])), null, "trailing");

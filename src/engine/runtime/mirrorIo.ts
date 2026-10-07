@@ -5,19 +5,15 @@
  *
  * The mirror carries sealed bytes + identity only; recovery opens each
  * envelope for kind / flags / content. A bodyUpdateRef's local content (the
- * full update) is rebuilt from the mirrored x: chunk frames, else from the
- * blob store, else left empty (the sealed frame still goes out unchanged).
+ * full update) is fetched back from the blob store, else left empty (the
+ * sealed frame still goes out unchanged).
  */
 
-import type { BlobChunkContent } from "../../core/envelope";
 import { OUTBOX_MIRROR_MAX_BYTES } from "../../core/limits";
-import { streamClass } from "../../core/types";
 import type { SideFileName, SideFilePort } from "../../ports/vault";
 import { resolveRefContent } from "../body/refs";
-import { assembleChunks } from "../blobs/chunks";
 import { openEnvelope } from "../ingest/envelope";
 import type { OutboxMirrorFrame, OutboxRecord } from "../store/schema";
-import { decodeBlobChunk, decodeBodyUpdateRef } from "../../core/codec/contents";
 import type { EngineCtx } from "./context";
 import { decodeOutboxMirror, encodeOutboxMirror, nextMirrorSlot, pickOutboxMirror, selectMirrorFrames, type MirrorIdentity } from "./mirrors";
 
@@ -158,7 +154,6 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 	if (!picked || picked.mirror.frames.length === 0) return 0;
 	const now = c.now();
 	const opened: { f: OutboxMirrorFrame; kind: OutboxRecord["kind"]; flags: number; frameNo: number; keyEpoch: number; content: Uint8Array }[] = [];
-	const chunks = new Map<string, BlobChunkContent[]>();
 	for (const f of picked.mirror.frames) {
 		const o = await openEnvelope(c.ports.crypto, c.opts.vaultId, { t: "frame", stream: f.stream, deviceId: c.self, clientFrameId: f.clientFrameId }, f.sealed);
 		if (!o.ok) {
@@ -166,25 +161,12 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 			continue;
 		}
 		opened.push({ f, kind: o.inner.kind, flags: o.inner.flags, frameNo: o.inner.frameNo, keyEpoch: o.header.keyEpoch, content: o.inner.content });
-		if (streamClass(f.stream) === "blobchunk") {
-			const d = decodeBlobChunk(o.inner.content);
-			if (d) {
-				const l = chunks.get(d.hash) ?? [];
-				l.push(d);
-				chunks.set(d.hash, l);
-			}
-		}
 	}
 	const records: OutboxRecord[] = [];
 	for (const { f, kind, flags, frameNo, keyEpoch, content } of opened) {
 		let local = content;
 		if (kind === "bodyUpdateRef") {
-			local = new Uint8Array(0);
-			const ref = decodeBodyUpdateRef(content);
-			if (ref) {
-				const fromChunks = assembleChunks(ref.hash, chunks.get(ref.hash) ?? []);
-				local = fromChunks.ok ? fromChunks.bytes : (await resolveRefContent(c.deps, f.stream, content)) ?? new Uint8Array(0);
-			}
+			local = (await resolveRefContent(c.deps, f.stream, content)) ?? new Uint8Array(0);
 			if (local.length === 0) c.diag("mirror-ref-content-missing", {});
 		}
 		records.push({

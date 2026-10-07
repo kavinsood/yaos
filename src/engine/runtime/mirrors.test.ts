@@ -69,7 +69,7 @@ const FULL_OUTBOX: OutboxMirror = {
 		}),
 		frame("f-poison", 130, { state: "poisoned", stream: S("cfg"), sealed: new Uint8Array(0) }),
 		frame("f-both", 131, {
-			state: "held", stream: S("x:abc"), dependsOn: F("f-adopt"),
+			state: "held", stream: S("b:docZ"), dependsOn: F("f-adopt"),
 			adoptOf: { deviceId: "dev-C" as DeviceId, clientFrameId: F("f-c") },
 		}),
 	],
@@ -521,7 +521,7 @@ describe("toMirrorFrame / selectMirrorFrames", () => {
 			record("b3", 3, "b:d1", 100),
 			record("ns7", 7, "ns", 100),
 			record("b1", 1, "b:d1", 100),
-			record("x4", 4, "x:h", 100),
+			record("x4", 4, "b:d4", 100),
 			record("cfg9", 9, "cfg", 100),
 			record("c2", 2, "c:d2", 100),
 			record("b8", 8, "b:d3", 100),

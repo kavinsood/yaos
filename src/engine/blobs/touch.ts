@@ -12,7 +12,9 @@
  *    part otherwise), or, without local bytes, its stored object is re-PUT verbatim. A store error holds the
  *    frame (and later frames of its stream) and retries with backoff.
  *
- * A put time in the future (the clock moved back) or missing counts as stale. Inert without a blob store.
+ * A put time in the future (the clock moved back) or missing counts as stale. Without a blob store a
+ * bodyUpdateRef is held (its bytes may never have reached a store; a store found later restarts the runtime)
+ * and every other frame passes: reconcile emits a blob reference only after its upload succeeded.
  */
 
 import { decodeCfgOps } from "../../core/codec/cfgOps";
@@ -25,7 +27,7 @@ import type { BlobPort } from "../../ports/blob";
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { BlobAddress, CryptoPort, HashPort } from "../../ports/crypto";
 import type { OutboxRecord } from "../store/schema";
-import { putAt, storePlaintextCap, type PutPolicy } from "./blobStore";
+import { putAt, type PutPolicy } from "./blobStore";
 
 /** Hashes the committed folds reference: every ns entry's blob (tombstones keep theirs), cfg file blobs, snap parts. */
 export function committedBlobHashes(ns: NsFoldState, cfg: CfgFoldState, snap: SnapFoldState): Set<ContentHash> {
@@ -84,8 +86,6 @@ export interface BlobTouchDeps {
 	readonly committed: () => ReadonlySet<ContentHash> | null;
 	/** Local plaintext of `hash` (vault file, own snapshot part), or null; checked here. */
 	readonly blobBytes: (hash: ContentHash) => Promise<Uint8Array | null>;
-	/** x:<address> is known (own chunk frames or tail rows): readers resolve the ref from the log. */
-	readonly logCarried: (address: BlobAddress) => boolean;
 	/** A held frame may be sendable now (pump the sender). */
 	readonly onReady: () => void;
 	readonly diag: (code: string, fields: Record<string, string | number | boolean | null>) => void;
@@ -168,7 +168,7 @@ export class BlobTouch implements PutPolicy {
 
 	/** R3 sender gate: true = send now; false = held until onReady (re-PUT running, or a store error backing off). */
 	ready(rec: OutboxRecord): boolean {
-		if (!this.deps.store) return true;
+		if (!this.deps.store) return this.refsOf(rec) !== "bodyRef";
 		const cfid = rec.clientFrameId;
 		const mono = this.deps.clock.monotonic();
 		const until = this.cleared.get(cfid);
@@ -213,14 +213,10 @@ export class BlobTouch implements PutPolicy {
 	}
 
 	private async check(rec: OutboxRecord, refs: ContentHash[] | "bodyRef"): Promise<void> {
-		const store = this.deps.store!;
 		const { crypto } = this.deps;
 		if (refs === "bodyRef") {
-			if (rec.content.length > storePlaintextCap(crypto, store)) return; // went to x: chunks (frames.ts)
 			const hash = bytesToHex(await this.deps.hash.sha256(rec.content)) as ContentHash;
-			const address = await crypto.blobAddress(hash);
-			if (this.deps.logCarried(address)) return;
-			await this.refresh(hash, address, rec.content);
+			await this.refresh(hash, await crypto.blobAddress(hash), rec.content);
 			return;
 		}
 		for (const hash of new Set(refs)) await this.refresh(hash, await crypto.blobAddress(hash), null);

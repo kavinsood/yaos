@@ -6,6 +6,7 @@
 import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
 import type { ContentHash, DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
+import type { BlobPort } from "../../ports/blob";
 import type { SideFilePort } from "../../ports/vault";
 import type { FrameNoFloor } from "../store/repo";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
@@ -46,8 +47,6 @@ export interface EngineTuning {
 	readonly nsCandidateModulus: number;
 	/** Gate bound on checkpoint state bytes (the relay cap is on the sealed checkpoint). */
 	readonly maxCheckpointStateBytes: number;
-	/** appendBlobChunks gives up (false) after this long without every receipt. */
-	readonly blobAppendTimeoutMs: number;
 	/** Unresolved bodyUpdateRef rows: retried after refRetryMs, doubling up to refRetryMaxMs (e2ee-design §10.2). */
 	readonly refRetryMs: number;
 	readonly refRetryMaxMs: number;
@@ -84,7 +83,6 @@ export const DEFAULT_TUNING: EngineTuning = {
 	frameStretch: 1,
 	nsCandidateModulus: NS_CANDIDATE_MODULUS,
 	maxCheckpointStateBytes: 32 * 1024 * 1024,
-	blobAppendTimeoutMs: 120_000,
 	refRetryMs: BLOB_RETRY_BASE_MS,
 	refRetryMaxMs: BLOB_RETRY_MAX_MS,
 	blobQuarantineMinMs: BLOB_QUARANTINE_MIN_MS,
@@ -159,6 +157,11 @@ export interface EngineOptions {
 	 * null = not here. Re-uploads before a stale reference is sent (e2ee-design §10.4 R3) and after a GC sweep (R4).
 	 */
 	blobBytes?(hash: ContentHash): Promise<Uint8Array | null>;
+	/**
+	 * Started without a blob store (ports.blob null) and EnginePorts.probeBlob found one on a later connect: the owner
+	 * restarts the runtime on ports with that store (a BlobPort is fixed for a runtime's life).
+	 */
+	onBlobStore?(store: BlobPort): void;
 }
 
 export function resolveTuning(t: Partial<EngineTuning> | undefined): EngineTuning {

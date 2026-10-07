@@ -1,17 +1,20 @@
 /**
  * SimNet: the simulated network of a run. One SimRelay (WP-A) on the run's
- * VirtualClock, plus per-device reachability: an offline device's connect
- * fails "unavailable" and its open sockets drop abruptly (1006), like a lost
- * network. Also the relay-side oracle for the invariants: a fresh observer
- * device (real LogEngine, empty store) bootstraps from the relay and reports
- * the folded vault (live docs and their texts).
+ * VirtualClock and the vault's blob store (R2, SimBlobStore), plus per-device
+ * reachability: an offline device's connect fails "unavailable" and its open
+ * sockets drop abruptly (1006), like a lost network. Also the relay-side
+ * oracle for the invariants: a fresh observer device (real LogEngine, empty
+ * store) bootstraps from the relay and reports the folded vault (live docs and
+ * their texts), and an audit of every committed row (blobs never ride the log).
  */
 
-import { NS_STREAM, type DeviceId, type DocId, type StreamName, type VaultId, type VaultPath } from "../core/types";
+import { NS_STREAM, streamClass, streamDocId, type DeviceId, type DocId, type StreamName, type VaultId, type VaultPath } from "../core/types";
+import type { BlobPort } from "../ports/blob";
 import type { RelayConnectResult, RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { LogEngine } from "../engine/runtime/engine";
 import type { EngineE2ee } from "../engine/keyring/keyringRuntime";
+import { SimBlobStore } from "./blobStore";
 import type { VirtualClock } from "./clock";
 import { createDelayedSuite1, delayedHash, realWorkFor } from "./delayedCrypto";
 import { simHashPort } from "./hash";
@@ -35,14 +38,55 @@ export interface OracleKeys {
 	readonly records: readonly Uint8Array[];
 }
 
+/** Every row the relay committed, by what it could carry (SimNet.logAudit). */
+export interface LogAudit {
+	/** Committed streams outside ns / cfg / snap / k / b: / c: (an attachment carrier on the log would be one). */
+	readonly foreign: readonly StreamName[];
+	/** Largest committed row payload on ns / cfg / snap / k. */
+	readonly largestRecordRow: number;
+	/** Docs with a committed b: / c: row (an attachment doc must never have one). */
+	readonly docStreams: ReadonlySet<DocId>;
+	readonly rows: number;
+	readonly bytes: number;
+}
+
+const LOG_CLASSES = new Set(["ns", "cfg", "snap", "keyring", "body", "canvas"]);
+
 export class SimNet {
 	readonly relay: SimRelay;
+	/** The vault's blob store (relay-wire §11.3) on the run's clock: what a device gets unless given its own. */
+	readonly blobs: SimBlobStore;
+	/** false = the relay has no blob store (capabilities: attachments false): devices start, and probe, without one. */
+	blobsAvailable = true;
 	private readonly offline = new Set<DeviceId>();
 	private oracleRuns = 0;
+	private readonly audit = { foreign: new Set<StreamName>(), largestRecordRow: 0, docStreams: new Set<DocId>(), rows: 0, bytes: 0 };
 
 	constructor(readonly clock: VirtualClock, o: { readonly seed?: number; readonly linkMs?: number; readonly jitterMs?: number } = {}) {
 		const link = { uplinkMs: o.linkMs ?? 20, downlinkMs: o.linkMs ?? 20, jitterMs: o.jitterMs ?? 0, httpMs: o.linkMs ?? 20, connectMs: o.linkMs ?? 20 };
 		this.relay = new SimRelay({ clock, seed: o.seed ?? 1, link });
+		this.blobs = new SimBlobStore({ now: () => clock.now() });
+		this.relay.onCommit((info) => {
+			for (const r of info.rows) {
+				const cls = streamClass(r.stream);
+				this.audit.rows++;
+				this.audit.bytes += r.payload.length;
+				const doc = streamDocId(r.stream);
+				if (!LOG_CLASSES.has(cls)) this.audit.foreign.add(r.stream);
+				else if (doc) this.audit.docStreams.add(doc);
+				else this.audit.largestRecordRow = Math.max(this.audit.largestRecordRow, r.payload.length);
+			}
+		});
+	}
+
+	/** The blob store a device's ports get (and its connect-time probe finds): null while blobsAvailable is false. */
+	blobPort(): BlobPort | null {
+		return this.blobsAvailable ? this.blobs : null;
+	}
+
+	logAudit(): LogAudit {
+		const a = this.audit;
+		return { foreign: [...a.foreign], largestRecordRow: a.largestRecordRow, docStreams: new Set(a.docStreams), rows: a.rows, bytes: a.bytes };
 	}
 
 	/** The RelayPort a device's engine uses. */
@@ -104,7 +148,7 @@ export class SimNet {
 		const crypto = work && suite1 ? await createDelayedSuite1(work, { vaultId: SIM_VAULT_ID, random, keys: suite1.keys.map((x) => ({ e: x.e, k: x.k.slice() })) }) : createNoopCrypto(hash);
 		const e2ee: EngineE2ee = suite1 ? { suite: 1, records: suite1.records.map((r) => r.slice()), persist: async (ch) => { for (const x of ch.keys) x.k.fill(0); } } : { suite: 0 };
 		const started = LogEngine.start({
-			ports: { relay: this.port(deviceId), storage, clock: this.clock, random, crypto, hash, blob: null },
+			ports: { relay: this.port(deviceId), storage, clock: this.clock, random, crypto, hash, blob: this.blobPort() },
 			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-oracle", sideFiles: null, autoReconnect: true, e2ee,
 		}).then((e) => (engine = e), (e) => (error = `oracle start: ${e instanceof Error ? e.message : String(e)}`));
 		await this.clock.runUntil(() => engine !== null || error !== null, horizonMs);

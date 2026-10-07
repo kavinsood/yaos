@@ -71,10 +71,6 @@ export const FRAME_MAX_UPDATES = 256;
 export const FRAME_MAX_BYTES = 64 * 1024;
 /** Main thread coalesces editor updates before posting to the worker. */
 export const MAIN_UPDATE_COALESCE_MS = 16;
-/** Blob chunk payload when the blob store is absent (x:<address> streams). */
-export const BLOB_CHUNK_BYTES = 768 * 1024;
-/** Largest attachment carried on the log without a blob store. */
-export const MAX_LOG_BLOB_BYTES = 8 * 1024 * 1024;
 
 // --- Crypto suite 1 (e2ee-design §7.3) ----------------------------------------
 

@@ -1,8 +1,9 @@
 /**
  * Large updates end to end through SimRelay (DESIGN §b.6, §j.1; §k.3 WP-C #3):
- * > MAX_INLINE_UPDATE_BYTES -> x: chunks + held bodyUpdateRef, resolved by live
- * peers, bound views and fresh catch-up; > MAX_LOG_BLOB_BYTES without a blob
- * store -> oversize-local freeze with the replica reloaded from durable state.
+ * > MAX_INLINE_UPDATE_BYTES -> the update goes to the blob store and only a
+ * small bodyUpdateRef rides the log, resolved by live peers, bound views and
+ * fresh catch-up; without a blob store -> oversize-local freeze with the
+ * replica reloaded from durable state (blobs never ride the relay log).
  * Suite 1 (e2ee-design §10.2): the store path sealed at the blob address, and
  * the download taxonomy end to end (tampered -> blob-corrupt freeze only under
  * a verified key; absent -> retried, never quarantined).
@@ -10,10 +11,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { BLOB_CHUNK_BYTES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
+import { MAX_INLINE_UPDATE_BYTES } from "../../core/limits";
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
 import { concatBytes } from "../../core/codec/lib0";
-import { KEYRING_STREAM, streamClass, type DocId } from "../../core/types";
+import { KEYRING_STREAM, streamClass, type DocId, type StreamName } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort, SealedBlobParts } from "../../ports/crypto";
 import { SeededRandom } from "../../sim/random";
@@ -41,13 +42,14 @@ async function live(...es: LogEngine[]): Promise<void> {
 	await until(() => es.every((e) => e.status().phase === "live"), 3_000, "live");
 }
 
-test("large update: x: chunks + bodyUpdateRef reach a live peer, its bound view, and a fresh engine via catch-up", async () => {
+test("large update: the update goes to the blob store; a small bodyUpdateRef reaches a live peer, its bound view, and a fresh engine via catch-up", async () => {
 	const relay = new SimRelay();
+	const store = new SharedBlobs();
 	const host = boundView();
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", extra: { budgets: BUDGETS } });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", extra: { budgets: BUDGETS, ports: storePorts(relay, store) } });
 	const { engine: b } = await startTestEngine({
 		relay, deviceId: "dev-b",
-		extra: { budgets: BUDGETS, onBoundText: host.onBoundText },
+		extra: { budgets: BUDGETS, onBoundText: host.onBoundText, ports: storePorts(relay, store) },
 	});
 	let c: LogEngine | null = null;
 	try {
@@ -62,16 +64,14 @@ test("large update: x: chunks + bodyUpdateRef reach a live peer, its bound view,
 		const want = "seed;" + big;
 		assert.equal(await b.docText(id), want);
 		assert.equal(host.v.text, want, "bound view got the resolved update");
-		const xs = relay.streams().filter((s) => streamClass(s) === "blobchunk");
-		assert.equal(xs.length, 1);
-		const chunkRows = relay.rows(xs[0]!);
-		assert.ok(chunkRows.length >= 2 && chunkRows.length <= Math.ceil((big.length + 64) / BLOB_CHUNK_BYTES));
+		assert.equal(store.objects.size, 1, "the update went to the blob store");
+		assert.deepEqual(relay.streams().filter((s) => !KNOWN.has(streamClass(s))), [], "no stream outside ns/cfg/snap/k/b:/c:");
 		const refRow = relay.rows(a.streamOf(id)).at(-1)!;
-		assert.ok(refRow.seq > chunkRows.at(-1)!.seq, "ref committed after its last chunk");
 		assert.ok(refRow.payload.length < 1024, "the body row carries only the ref");
+		assert.ok(maxRow(relay) < MAX_INLINE_UPDATE_BYTES + 1024, `no relay row carries the update: ${maxRow(relay)} B`);
 		assert.equal(a.c.outbox.size, 0);
 
-		c = (await startTestEngine({ relay, deviceId: "dev-c", extra: { budgets: BUDGETS } })).engine;
+		c = (await startTestEngine({ relay, deviceId: "dev-c", extra: { budgets: BUDGETS, ports: storePorts(relay, store) } })).engine;
 		await converged([a, b, c], 15_000);
 		assert.equal(await c.docText(id), want);
 		await c.editDoc(id, (t) => t.insert(0, "C;"));
@@ -84,7 +84,7 @@ test("large update: x: chunks + bodyUpdateRef reach a live peer, its bound view,
 	}
 });
 
-test("oversize-local: an update > MAX_LOG_BLOB_BYTES with no blob store freezes the doc, nothing is sent, the replica reloads from durable state", async () => {
+test("oversize-local: an update > MAX_INLINE_UPDATE_BYTES with no blob store freezes the doc, nothing is sent, the replica reloads from durable state", async () => {
 	const relay = new SimRelay();
 	const frozen: string[] = [];
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", extra: { budgets: BUDGETS, onDocFrozen: (_id: DocId, r: string) => frozen.push(r) } });
@@ -94,7 +94,7 @@ test("oversize-local: an update > MAX_LOG_BLOB_BYTES with no blob store freezes 
 		const id = await a.createDoc("over.md", "keep;");
 		await converged([a, b]);
 		const head0 = relay.head();
-		await a.editDoc(id, (t) => t.insert(t.length, "o".repeat(MAX_LOG_BLOB_BYTES + 1000)));
+		await a.editDoc(id, (t) => t.insert(t.length, "o".repeat(MAX_INLINE_UPDATE_BYTES + 1000)));
 		await until(() => a.c.repo.stream(a.streamOf(id))?.frozen === 1, 10_000, "frozen");
 		const rec = a.c.repo.stream(a.streamOf(id))!;
 		assert.equal(rec.frozenReason, "oversize-local");
@@ -147,6 +147,20 @@ class SharedBlobs implements BlobPort {
 	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
 }
 
+const KNOWN = new Set(["ns", "cfg", "snap", "keyring", "body", "canvas"]);
+
+/** Largest committed row payload on the relay. */
+function maxRow(relay: SimRelay): number {
+	let max = 0;
+	for (const s of relay.streams()) for (const r of relay.rows(s)) max = Math.max(max, r.payload.length);
+	return max;
+}
+
+/** Suite-0 test ports on a shared blob store. */
+function storePorts(relay: SimRelay, store: SharedBlobs) {
+	return { ...testPorts(relay, testStorage()), blob: store };
+}
+
 /** A suite-1 engine on the shared store: K_1, KCV-verified unless `unverified` (then keyState reports it unchecked; sealing is unaffected). */
 async function suite1Engine(relay: SimRelay, deviceId: string, store: SharedBlobs, seed: number, unverified = false): Promise<LogEngine> {
 	const s1 = await createWebCryptoSuite1({ vaultId: VAULT1, random: new SeededRandom(seed), keys: [{ e: 1, k: K1.slice() }] });
@@ -177,7 +191,7 @@ test("suite 1: an oversize update goes to the store sealed at blobAddress(sha256
 		await converged([a, b], 15_000);
 		assert.equal(await b.docText(id), "seed;" + big);
 		assert.equal(store.objects.size, 1);
-		assert.equal(relay.streams().filter((s) => streamClass(s) === "blobchunk").length, 0, "store path: no x: stream");
+		assert.deepEqual(relay.streams().filter((s) => !KNOWN.has(streamClass(s))), [], "store path: no stream outside ns/cfg/snap/k/b:/c:");
 		const [addr, sealed] = [...store.objects][0]!;
 		assert.match(addr, /^[0-9a-f]{64}$/);
 		assert.equal(sealed[0], 1, "blobFormat 1");

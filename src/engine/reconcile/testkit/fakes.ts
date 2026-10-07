@@ -1,4 +1,4 @@
-/** Virtual clock, seeded random and an in-memory blob carrier for reconcile tests. */
+/** Virtual clock, seeded random and an in-memory blob store (BlobTransfer) for reconcile tests. */
 
 import type { ContentHash, DocId, VaultPath } from "../../../core/types";
 import { prng } from "../../../core/merge/prng";

@@ -24,6 +24,10 @@
  *   settings           every device's synced config files are equal (JSON parsed)
  *   quiet              no echo loop: after quiescence nothing appends, writes, posts
  *                      or saves
+ *   log                attachment bytes never rode the relay's sequence log (DESIGN
+ *                      §j.1): every committed stream is ns / cfg / snap / k / b: / c:,
+ *                      no ns / cfg / snap / k row exceeds MAX_NS_FRAME_BYTES, and no
+ *                      live attachment doc has a b: / c: row
  *
  * Not checked here: 4 (fold determinism; WP-A's fold fuzz covers it) and 6
  * (resource bounds; WP-C budget tests).
@@ -32,6 +36,7 @@
 import { encodeNsFoldV1 } from "../core/codec/nsFoldV1";
 import { checkNsInvariants } from "../core/ns/verify";
 import { pathKey } from "../core/paths/pathKey";
+import { MAX_NS_FRAME_BYTES } from "../core/limits";
 import { NS_STREAM, type VaultPath } from "../core/types";
 import { SETTING_FILES, tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
@@ -39,7 +44,7 @@ import type { SimDevice } from "./device";
 import type { OracleDoc, SimNet } from "./net";
 
 export interface Violation {
-	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee";
+	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log";
 	readonly detail: string;
 }
 
@@ -113,6 +118,16 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 }
 
 /** Settings converge (LWW per key): every device's synced config files are equal (JSON compared parsed). */
+/** Invariant "log": only small records rode the relay log; attachment bytes went to the blob store only. */
+export function checkLogCarriesNoBlobs(net: SimNet, oracle: { readonly docs: readonly OracleDoc[] }): Violation[] {
+	const out: Violation[] = [];
+	const audit = net.logAudit();
+	for (const s of audit.foreign) out.push({ inv: "log", detail: `foreign stream ${s} on the relay log` });
+	if (audit.largestRecordRow > MAX_NS_FRAME_BYTES) out.push({ inv: "log", detail: `an ns/cfg/snap/k row of ${audit.largestRecordRow} B` });
+	for (const d of oracle.docs) if (d.kind === "blob" && audit.docStreams.has(d.docId)) out.push({ inv: "log", detail: `attachment ${d.path} has a b:/c: stream` });
+	return out;
+}
+
 export function checkSettings(devs: readonly SimDevice[]): Violation[] {
 	const out: Violation[] = [];
 	// JSON settings files sync as per-key registers (§j.3): a file with no keys is the same state as no file.

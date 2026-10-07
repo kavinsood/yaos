@@ -4,9 +4,9 @@
  * / oversize checks with freeze, provisional apply + T_adopt and the
  * adoptable -> pending transition.
  *
- * Unresolved bodyUpdateRef rows (blob unavailable, e2ee-design §10.2) are
- * retried when x: rows arrive and on a per-stream backoff timer (refRetryMs
- * doubling to refRetryMaxMs, reset once every ref resolved). Each attempt's
+ * Unresolved bodyUpdateRef rows (blob store unavailable or missing the
+ * object, e2ee-design §10.2) are retried on a per-stream backoff timer
+ * (refRetryMs doubling to refRetryMaxMs, reset once every ref resolved). Each attempt's
  * outcome feeds a per-row BlobFailureStreaks: once the initial attempt and 3
  * retries all failed deterministically (refs.ts) over >= blobQuarantineMinMs,
  * the doc is frozen "blob-corrupt" (§9.3: deterministic body failures freeze
@@ -160,13 +160,11 @@ export class DocRuntime {
 		});
 	}
 
-	/** Committed body / x: rows (receipts and settled adoptables excluded) -> resident replicas. */
+	/** Committed body rows (receipts and settled adoptables excluded) -> resident replicas. */
 	async applyRows(rows: readonly TailRecord[]): Promise<void> {
 		const byStream = new Map<StreamName, TailRecord[]>();
-		let chunks = false;
 		for (const row of rows) {
 			const cls = streamClass(row.stream);
-			if (cls === "blobchunk") chunks = true;
 			if (cls !== "body" && cls !== "canvas") continue;
 			let l = byStream.get(row.stream);
 			if (!l) byStream.set(row.stream, (l = []));
@@ -183,7 +181,6 @@ export class DocRuntime {
 			await this.applyToHandle(h, list);
 			this.checkDoc(h);
 		}
-		if (chunks) await this.retryRefs();
 	}
 
 	/** Apply rows to one replica in one REMOTE transaction; unresolved refs are kept for retry. */
@@ -210,11 +207,6 @@ export class DocRuntime {
 			}
 		}, ORIGIN.REMOTE);
 		this.c.handles.grow(h, bytes);
-	}
-
-	/** New x: rows: retry every unresolved ref row. */
-	async retryRefs(): Promise<void> {
-		for (const h of [...this.c.handles.all()]) await this.retryHandleRefs(h);
 	}
 
 	private async retryHandleRefs(h: Handle): Promise<void> {
@@ -247,13 +239,13 @@ export class DocRuntime {
 		this.clearRefRetry(stream); // re-armed by a checkDoc that ran before the freeze landed
 	}
 
-	/** Unresolved refs on an unfrozen doc: keep the retry timer armed; none left: reset the backoff. */
+	/** Unresolved refs on an unfrozen doc: keep the retry timer armed; none left: reset the backoff. No store: no timer (one found later restarts the runtime). */
 	private checkRefs(h: Handle): void {
 		if (h.unresolvedRows.length === 0) {
 			this.clearRefRetry(h.stream);
 			return;
 		}
-		if (this.c.repo.stream(h.stream)?.frozen) return;
+		if (this.c.repo.stream(h.stream)?.frozen || !this.c.deps.blob) return;
 		const st = this.refRetry.get(h.stream);
 		if (st && st.timer !== null) return;
 		const delayMs = st ? Math.min(st.delayMs * 2, this.c.tuning.refRetryMaxMs) : this.c.tuning.refRetryMs;

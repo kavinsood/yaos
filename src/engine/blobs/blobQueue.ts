@@ -1,17 +1,21 @@
 /**
  * Blob transfer queue (DESIGN §j.1). Implements the reconcile job's
- * BlobTransfer over either carrier:
+ * BlobTransfer over the blob store (BlobPort, R2 over HTTP), the only carrier
+ * of blob bytes; the relay's sequence log never carries them:
  *
- *   store (BlobPort):  up   = sha256 check -> blobAddress -> has -> put(sealBlob(bytes))
- *                      down = get -> openBlob -> verify sha256
- *   log (no store):    up   = x:<address> blobChunk frames, true once all are receipted
- *                      down = read x:<address>, assemble by index, verify sha256
+ *   up   = sha256 check -> blobAddress -> has -> put(sealBlob(bytes))
+ *   down = get -> openBlob -> verify sha256
  *
  * maxBlobBytes is a plaintext cap: the store's transport cap under suite 0,
  * what still fits it once sealed under suite 1 (e2ee-design §7.3, ≤
- * MAX_BLOB_PLAINTEXT_BYTES_SUITE1), MAX_LOG_BLOB_BYTES on the log. Larger
- * files are not synced (reconcile excludes them; upload() refuses with a
- * notice).
+ * MAX_BLOB_PLAINTEXT_BYTES_SUITE1). Larger files are not synced (reconcile
+ * excludes them; upload() refuses with a notice).
+ *
+ * No store (the relay has no R2 binding): maxBlobBytes is 0, reconcile
+ * excludes every blob, and upload / download / prefetch answer at once
+ * (false / null) without a record, so nothing is queued and no retry is
+ * armed. A store found on a later connect restarts the runtime with it
+ * (EnginePorts.probeBlob), whose full pass then uploads what is pending.
  *
  * The reconcile runner emits nsCreate / nsSetBlob only after upload() returned
  * true, so readers can always fetch what ns references. A failure persists a
@@ -31,8 +35,7 @@
  *
  * Download failures are all "unavailable" and retried with backoff
  * (e2ee-design §10.2). Deterministic ones (blobStore.ts: fetched, but it does
- * not open or verify under a verified key; or assembled log chunks that do not
- * verify) also notice "blob-corrupt". Once BlobFailureStreaks says the rule of
+ * not open or verify under a verified key) also notice "blob-corrupt". Once BlobFailureStreaks says the rule of
  * §10.2 is met (initial attempt + 3 retries, ≥ 3 min, all deterministic), the
  * download is quarantined: notice "blob-quarantined", no further retries
  * (download / prefetch return at once, no due time) until a restart or until
@@ -42,7 +45,6 @@
  */
 
 import { sha256Hex } from "../../core/hash/sha256";
-import { MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import type { ContentHash, DocId, VaultPath } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { ClockPort } from "../../ports/clock";
@@ -52,7 +54,6 @@ import type { BlobTransfer } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
 import { STORE, type BlobQueueRecord } from "../store/schema";
 import { BlobFailureStreaks, getOpened, putSealed, storePlaintextCap, type BlobFetch, type PutPolicy } from "./blobStore";
-import { assembleChunks, splitChunks, type BlobChunkLog } from "./chunks";
 
 export const BLOB_RETRY_BASE_MS = 2_000;
 export const BLOB_RETRY_MAX_MS = 10 * 60_000;
@@ -65,11 +66,10 @@ export interface BlobQueueDeps {
 	readonly db: StorageDb<DiskSchema>;
 	readonly clock: ClockPort;
 	readonly crypto: CryptoPort;
-	/** null = no blob store: log-carried chunks (needs `chunkLog`). */
+	/** null = no blob store: no transfer runs (see the header). */
 	readonly store: BlobPort | null;
 	/** When a present blob may be re-used (e2ee-design §10.4 R2). */
 	readonly touch: PutPolicy;
-	readonly chunkLog: BlobChunkLog | null;
 	readonly notice?: (level: "info" | "warn" | "error", code: string, message: string) => void;
 	/** prefetch() bound: downloads held ahead of their job at once, and their total size. */
 	readonly ahead?: { readonly count: number; readonly bytes: number };
@@ -106,13 +106,9 @@ export class BlobQueue implements BlobTransfer {
 		return q;
 	}
 
-	get via(): BlobQueueRecord["via"] {
-		return this.deps.store ? "store" : "log";
-	}
-
-	/** Largest plaintext this carrier moves under the vault's suite (see the header). */
+	/** Largest plaintext the store moves under the vault's suite (see the header); 0 without a store. */
 	get maxBlobBytes(): number {
-		return this.deps.store ? storePlaintextCap(this.deps.crypto, this.deps.store) : MAX_LOG_BLOB_BYTES;
+		return this.deps.store ? storePlaintextCap(this.deps.crypto, this.deps.store) : 0;
 	}
 
 	/** Hashes whose download is quarantined (diagnostics / tests). */
@@ -149,7 +145,7 @@ export class BlobQueue implements BlobTransfer {
 		const key = `${direction}:${req.hash}`;
 		const attempts = (this.records.get(key)?.attempts ?? 0) + 1;
 		const rec: BlobQueueRecord = {
-			hash: req.hash as ContentHash, direction, docId: req.docId, path: req.path, size, via: this.via, attempts,
+			hash: req.hash as ContentHash, direction, docId: req.docId, path: req.path, size, attempts,
 			nextAttemptAtMs: this.deps.clock.now() + backoffMs(attempts), active: 0,
 		};
 		// keyPath is the hash: an up and a down for one hash share the row (latest wins); the map keeps both.
@@ -202,6 +198,8 @@ export class BlobQueue implements BlobTransfer {
 	}
 
 	upload(req: Req & { readonly bytes: Uint8Array }): Promise<boolean> {
+		const store = this.deps.store;
+		if (!store) return Promise.resolve(false);
 		return this.once(`up:${req.hash}`, async () => {
 			if (req.bytes.length > this.maxBlobBytes) {
 				this.deps.notice?.("warn", "blob-too-large", `attachment too large to sync: ${req.path}`);
@@ -211,10 +209,8 @@ export class BlobQueue implements BlobTransfer {
 			if (this.backingOff("up", req.hash)) return false;
 			let ok = false;
 			try {
-				if (this.deps.store) {
-					await putSealed(this.deps.store, this.deps.crypto, req.hash as ContentHash, req.bytes, this.deps.touch);
-					ok = true;
-				} else ok = await this.putLog(req.hash as ContentHash, req.bytes);
+				await putSealed(store, this.deps.crypto, req.hash as ContentHash, req.bytes, this.deps.touch);
+				ok = true;
 			} catch {
 				ok = false;
 			}
@@ -225,6 +221,7 @@ export class BlobQueue implements BlobTransfer {
 	}
 
 	download(req: Req & { readonly size: number }): Promise<Uint8Array | null> {
+		if (!this.deps.store) return Promise.resolve(null);
 		return this.once(`down:${req.hash}`, async () => {
 			if (req.size > this.maxBlobBytes || this.quarantinedDown.has(req.hash)) return null;
 			const ahead = this.take(req.hash);
@@ -252,6 +249,7 @@ export class BlobQueue implements BlobTransfer {
 	 * `ahead` bound is full (try later).
 	 */
 	prefetch(req: Req & { readonly size: number }): boolean {
+		if (!this.deps.store) return true;
 		if (this.ahead.has(req.hash) || this.inflight.has(`down:${req.hash}`)) return true;
 		if (req.size > this.maxBlobBytes || this.quarantinedDown.has(req.hash) || this.backingOff("down", req.hash)) return true;
 		const bound = this.deps.ahead ?? { count: 0, bytes: 0 };
@@ -278,31 +276,12 @@ export class BlobQueue implements BlobTransfer {
 
 	/** Verified bytes, or why they are unavailable (blobStore.ts BlobFetch). Never throws. */
 	private async getVerified(hash: ContentHash): Promise<BlobFetch> {
+		const store = this.deps.store;
+		if (!store) return { ok: false, reason: "transport", deterministic: false };
 		try {
-			return this.deps.store ? await getOpened(this.deps.store, this.deps.crypto, hash, sha256Hex) : await this.getLog(hash);
+			return await getOpened(store, this.deps.crypto, hash, sha256Hex);
 		} catch {
 			return { ok: false, reason: "transport", deterministic: false };
 		}
-	}
-
-	private async putLog(hash: ContentHash, bytes: Uint8Array): Promise<boolean> {
-		const log = this.deps.chunkLog;
-		if (!log) return false;
-		return log.appendChunks(hash, splitChunks(hash, bytes));
-	}
-
-	/**
-	 * Committed x:<address> chunks, assembled and verified. Missing chunks are "absent" (not yet, or withheld);
-	 * chunks that assemble into other bytes, or disagree on the shape, are deterministic: they passed the gate
-	 * (authentic), the first chunk per index wins, and appending more cannot change the result.
-	 */
-	private async getLog(hash: ContentHash): Promise<BlobFetch> {
-		const log = this.deps.chunkLog;
-		const chunks = log ? await log.readChunks(hash) : null;
-		if (!chunks) return { ok: false, reason: "transport", deterministic: false };
-		const res = assembleChunks(hash, chunks);
-		if (res.ok) return { ok: true, bytes: res.bytes };
-		if (res.reason === "incomplete") return { ok: false, reason: "absent", deterministic: false };
-		return { ok: false, reason: res.reason, deterministic: true };
 	}
 }

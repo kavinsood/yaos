@@ -11,11 +11,12 @@
  * Retry-After, at most GC_RETRY_ATTEMPTS calls and GC_RETRY_MAX_WAIT_MS per wait; the wait rejects as soon as the
  * caller's signal aborts (engine stop).
  *
- * Without an R2 bucket every route answers 503 attachments_unavailable (local
- * dev, the client-e2e deploy, any Free-plan server). That surfaces here as a
+ * Without an R2 bucket every route answers 503 attachments_unavailable (a
+ * relay deployed without the YAOS_BUCKET binding). That surfaces here as a
  * thrown RelayHttpError with code "attachments_unavailable"; callers should
  * use probeHttpBlob(), which returns null when capabilities.attachments is
- * false, and fall back to log-carried blobs (DESIGN §j.1).
+ * false. No store = attachments are not synced (fail closed, DESIGN §j.1);
+ * blob bytes never ride the relay's sequence log.
  *
  * The address is opaque to the relay (DECISIONS D9): it checks ^[0-9a-f]{64}$
  * and nothing else (no hash check, PUT overwrites; server/src/router.ts:549-552),
