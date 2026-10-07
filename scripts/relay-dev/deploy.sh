@@ -6,9 +6,11 @@
 # Config: scripts/relay-dev/config.sh (server/wrangler.toml, name replaced, R2 kept; streams are always on) written
 # to server/wrangler.relay2-<suffix>.toml (git-excluded; the same file start-local.sh feeds `wrangler dev`),
 # then rendered by cf-config.mjs as a cf project in server/.cf-deploy/<suffix>/ (gitignored).
-# cf-config.mjs does not render R2 bindings yet, so this refuses the default (R2) config: the deployed e2e
-# worker needs a YAOS_BUCKET R2 bucket binding before client e2e can run against it (blobs never ride the log).
-# RELAY_DEV_R2=0 deploys without one (attachments not synced: fail closed).
+# The YAOS_BUCKET [[r2_buckets]] binding is kept and rendered as a cf `bindings.r2` binding to the toml's bucket_name
+# (server/wrangler.toml: "yaos"), so the worker stores attachments, bodyUpdateRef updates and snapshot parts (blobs
+# never ride the log) and client e2e runs against it. The bucket must exist on the account before the deploy:
+# `cf r2 buckets list --name-contains <bucket>`, `cf r2 buckets create --name <bucket>` (from /tmp).
+# RELAY_DEV_R2=0 deploys without the binding (503 attachments_unavailable; attachments not synced: fail closed).
 #
 # Deploys with `cf deploy`, authenticated as the cf CLI OAuth session (`cf auth login`); no API token is read,
 # printed or exported (CLOUDFLARE_API_TOKEN is unset so cf uses its own session). cf builds by delegating to
