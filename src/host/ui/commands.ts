@@ -3,11 +3,23 @@
  * actions. Obsidian prefixes ids with the plugin id ("yaos:yaos-pause").
  */
 
-import { isCreating } from "../keys/pin";
+import { isCreating, pinnedSuite } from "../keys/pin";
 import { pendingBrake, type YaosUiHost } from "./api";
 import { engineAcceptsCommands, isPaused } from "./settingsModel";
 
 type StateHost = Pick<YaosUiHost, "data" | "status">;
+
+/**
+ * "Create a new vault" may start (§15.1, §15.2): on an unpaired device, or on a paired one that holds its vault's
+ * pin and key (the engine reports nothing missing). A paired device that is blocked for want of a key or pin, or
+ * whose engine has not said yet, only takes a key (§12.4): the command and the settings action are not offered,
+ * and createAndEnroll refuses before any request.
+ */
+export function canCreateVault(h: StateHost): boolean {
+	const d = h.data();
+	if (d.identity === null) return true;
+	return pinnedSuite(d.e2ee) !== null && h.status()?.e2ee?.keyMissing === null;
+}
 
 /** This device is enrolled in a vault it was creating and has not pinned yet (§15.1: resume at step 3). */
 export function canFinishCreating(h: StateHost): boolean {
@@ -66,7 +78,7 @@ export const UI_COMMANDS: readonly UiCommandSpec[] = Object.freeze([
 	{ id: "yaos-clean-up-attachments", name: "Clean up unused server attachments", available: (h) => engineAcceptsCommands(h.runState()) },
 	// Also offered when the engine failed or stopped: restarting is how to recover.
 	{ id: "yaos-restart-engine", name: "Restart sync engine", available: (h) => h.data().identity !== null },
-	{ id: "yaos-create-vault", name: "Create a new vault", available: () => true },
+	{ id: "yaos-create-vault", name: "Create a new vault", available: canCreateVault },
 	{ id: "yaos-finish-creating-vault", name: "Finish creating this vault", available: canFinishCreating },
 	{ id: "yaos-unlock", name: "Enter recovery key or scan a QR code", available: isKeyMissing },
 	{ id: "yaos-show-rekey-qr", name: "Show re-key QR", available: canRekey },

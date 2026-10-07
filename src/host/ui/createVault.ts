@@ -15,7 +15,9 @@
  * Nothing else reaches this module: not the protocol handler, parseSetupLink, a typed or scanned code, the console's
  * QR or link, a claim response's obsidianUrl or resumePendingEnrollment (createVault.test.ts scans for it). The
  * engine checks `k` itself again when enableE2ee or pinSuite0 "create" arrives (keyReader.ts), and main refuses both
- * without the marker (src/host/keys/pin.ts), so the UI cannot pin from anywhere else either.
+ * without the marker (src/host/keys/pin.ts), so the UI cannot pin from anywhere else either. A paired device that
+ * is blocked for want of a key or pin (§12.4) cannot start step 1 at all (canCreateVault, commands.ts): it only
+ * takes a key.
  *
  * SECRETS: the operator recovery key (held only for step 1, never stored), the operator session, the owner code, the
  * new device token and the recovery key. None appears in an error, progress text or log.
@@ -24,7 +26,8 @@
 import type { StatusSnapshot } from "../../protocol/status";
 import { pinnedSuite } from "../keys/pin";
 import { sameIdentity, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "./api";
-import { keyCommandMessage, NOT_EMPTY_MESSAGE } from "./e2eeText";
+import { canCreateVault } from "./commands";
+import { CREATE_BLOCKED_MESSAGE, keyCommandMessage, NOT_EMPTY_MESSAGE } from "./e2eeText";
 import { waitFor, type WaitOptions } from "./hostWait";
 import { applyPairedIdentity } from "./pairFlow";
 import {
@@ -38,6 +41,8 @@ export type { WaitOptions } from "./hostWait";
 export type CreateVaultHost = Pick<YaosUiHost, "data" | "updateData" | "status" | "onChange" | "command" | "markCreating" | "abandonCreating">;
 
 export type CreateVaultErrorCode =
+	/** The device is paired with a vault it has no pin and key for (§12.4), or its engine has not said: nothing sent. */
+	| "blocked"
 	/** A step-3 check failed (or the engine refused the choice for that reason): marker dropped, no pin. */
 	| "not-empty"
 	/** Step 3 did not finish in time (offline, still reading): the marker stays, so the flow can resume. */
@@ -102,9 +107,11 @@ async function createOnServer(input: CreateVaultInput, deps: PairingDeps): Promi
 /**
  * Steps 1 and 2. On success the device is enrolled in the new vault, its identity is stored and the engine restarts
  * on the creation path; step 3 is confirmEmptyVault. Before the identity is stored, any failure drops the marker
- * (the owner code was in memory only, so nothing can resume) and leaves this device as it was.
+ * (the owner code was in memory only, so nothing can resume) and leaves this device as it was. A blocked device
+ * (canCreateVault) is refused with "blocked" before any request or write.
  */
 export async function createAndEnroll(input: CreateVaultInput, host: CreateVaultHost, deps: PairingDeps): Promise<EnrolledInNewVault> {
+	if (!canCreateVault(host)) throw new CreateVaultError(CREATE_BLOCKED_MESSAGE, "blocked");
 	const created = await createOnServer(input, deps);
 	const vaultId = created.vaultId;
 	await host.markCreating(vaultId);
