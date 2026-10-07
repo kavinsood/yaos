@@ -105,6 +105,11 @@ function sleepOn(clock: ClockPort, ms: number, signal: AbortSignal | undefined, 
 interface Transfer {
 	/** Set once the caller's signal or the idle window ended the transfer. */
 	readonly ended: "aborted" | "stalled" | null;
+	/**
+	 * Aborts when the transfer ends: the fetch's signal, and untilAborted's (relayHttp.ts) around every await on the
+	 * fetch or its body, so the end holds even when a fetch ignores its signal.
+	 */
+	readonly signal: AbortSignal;
 	/** Restarts the idle window: a byte moved. */
 	kick(): void;
 	/** A transport failure as the caller sees it: why the transfer was ended, else network_error. */
@@ -115,10 +120,11 @@ interface Transfer {
 
 /**
  * Starts a transfer's idle window on `clock` and listens to `signal` (one listener; the signal is not combined
- * with another, so no AbortSignal.any, absent before iOS 17.4). The first to trip calls `onEnd` once, with the
- * error the call rejects with; the caller then stops the request.
+ * with another, so no AbortSignal.any, absent before iOS 17.4). The first to trip aborts the transfer's own signal
+ * and calls `onEnd` once, with the error the call rejects with; the caller then stops the request.
  */
-function transfer(route: string, clock: ClockPort, idleMs: number, signal: AbortSignal | undefined, onEnd: (error: RelayHttpError) => void): Transfer {
+function transfer(route: string, clock: ClockPort, idleMs: number, signal: AbortSignal | undefined, onEnd?: (error: RelayHttpError) => void): Transfer {
+	const ctl = new AbortController();
 	let ended: "aborted" | "stalled" | null = null;
 	let timer: TimerHandle | null = null;
 	let closed = false;
@@ -133,7 +139,8 @@ function transfer(route: string, clock: ClockPort, idleMs: number, signal: Abort
 		if (closed) return;
 		ended = why;
 		close();
-		onEnd(fail());
+		ctl.abort(fail());
+		onEnd?.(fail());
 	};
 	const onAbort = () => end("aborted");
 	const kick = () => {
@@ -146,7 +153,7 @@ function transfer(route: string, clock: ClockPort, idleMs: number, signal: Abort
 	};
 	signal?.addEventListener("abort", onAbort, { once: true });
 	kick();
-	return { get ended() { return ended; }, kick, fail, close };
+	return { get ended() { return ended; }, signal: ctl.signal, kick, fail, close };
 }
 
 function isAddress(v: unknown): v is BlobAddress {
@@ -192,7 +199,7 @@ async function readBody(res: Response, reader: ReadableStreamDefaultReader<Uint8
 		if (reader === null) return null;
 		if (t.ended === null) {
 			try {
-				const r = await reader.read();
+				const r = await untilAborted(reader.read(), t.signal);
 				// Ending the transfer cancels the reader, which resolves a pending read as done: not the body's end.
 				if (t.ended === null) return r.done ? null : r.value;
 			} catch {
@@ -254,10 +261,13 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 	const clock = opts.clock ?? createWebClock();
 	const idleMs = opts.idleMs ?? BLOB_TRANSFER_IDLE_MS;
 
-	/** fetch; a rejection is the transfer's end reason when it has one, else "aborted" (signal) or network_error. */
+	/**
+	 * fetch, ended by `init.signal` even when the fetch ignores it (untilAborted); a rejection is the transfer's end
+	 * reason when it has one, else "aborted" (signal) or network_error.
+	 */
 	async function send(route: string, url: string, init: RequestInit, t: Transfer | null): Promise<Response> {
 		try {
-			return await doFetch(url, init);
+			return await untilAborted(doFetch(url, init), init.signal ?? undefined);
 		} catch {
 			throw t !== null ? t.fail() : new RelayHttpError(route, 0, init.signal?.aborted ? "aborted" : "network_error", null);
 		}
@@ -344,20 +354,19 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 			for (let i = 0; i < addresses.length; i += BLOB_EXISTS_BATCH) {
 				if (signal?.aborted) throw abortError(route);
 				const batch = addresses.slice(i, i + BLOB_EXISTS_BATCH);
-				const ctl = new AbortController();
-				const t = transfer(route, clock, idleMs, signal, () => ctl.abort());
+				const t = transfer(route, clock, idleMs, signal);
 				let body: unknown;
 				try {
 					const res = await send(route, `${root}/exists`, {
 						method: "POST",
 						headers: { ...auth, "Content-Type": "application/json" },
 						body: JSON.stringify({ hashes: batch }),
-						signal: ctl.signal,
+						signal: t.signal,
 					}, t);
 					t.kick();
 					if (res.status !== 200) throw await fail(route, res);
 					try {
-						body = await res.json();
+						body = await untilAborted(res.json(), t.signal);
 					} catch (e) {
 						throw t.ended !== null ? t.fail() : new RelayHttpError(route, 200, e instanceof SyntaxError ? "malformed_response" : "network_error", null);
 					}
@@ -384,16 +393,14 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 		async get(address, signal) {
 			const route = "blobs/get";
 			if (signal?.aborted) throw abortError(route);
-			const ctl = new AbortController();
 			let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-			// Aborting the fetch errors its body; the reader is cancelled too, so a body that ignores the abort
-			// still ends the read (readBody checks the transfer after every read).
+			// Aborting the fetch errors its body; the reader is cancelled too, which releases a body that ignores the
+			// abort (readBody stops waiting on it either way: untilAborted).
 			const t = transfer(route, clock, idleMs, signal, () => {
-				ctl.abort();
 				reader?.cancel().catch(() => undefined);
 			});
 			try {
-				const res = await send(route, `${root}/${encodeURIComponent(address)}`, { method: "GET", headers: auth, signal: ctl.signal }, t);
+				const res = await send(route, `${root}/${encodeURIComponent(address)}`, { method: "GET", headers: auth, signal: t.signal }, t);
 				t.kick();
 				if (res.status === 200) {
 					reader = res.body?.getReader() ?? null;

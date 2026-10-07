@@ -377,6 +377,36 @@ describe("httpBlob", () => {
 		assert.deepEqual([notJson.status, notJson.code], [200, "malformed_response"]);
 	});
 
+	it("a fetch or body that ignores its abort still ends at the idle window (untilAborted)", async () => {
+		const clock = new ManualClock();
+		const never = <T>(): Promise<T> => new Promise<T>(() => undefined);
+		// A reply whose body neither ends nor honours cancel / abort.
+		const deafBody = { getReader: () => ({ read: () => never(), cancel: async () => undefined }) };
+		const deafReply = (headers: Record<string, string>) =>
+			({ status: 200, headers: new Headers(headers), body: deafBody, json: () => never(), text: () => never() }) as unknown as Response;
+		const cases: [string, typeof fetch, (port: ReturnType<typeof getPort>, signal?: AbortSignal) => Promise<unknown>][] = [
+			["get, headers", () => never(), (port, s) => port.get(addr(1), s)],
+			["get, body", async () => deafReply({ "Content-Length": "10" }), (port, s) => port.get(addr(1), s)],
+			["has, headers", () => never(), (port, s) => port.has([addr(1)], s)],
+			["has, body", async () => deafReply({}), (port, s) => port.has([addr(1)], s)],
+		];
+		for (const [name, f, call] of cases) {
+			const stalled = track(call(getPort(f, clock)));
+			await flush();
+			clock.advance(IDLE - 1);
+			await flush();
+			assert.equal(stalled.settled(), false, name);
+			clock.advance(1);
+			assert.deepEqual([(await rejection(stalled.p)).code, clock.pendingTimers], ["stalled", 0], name);
+
+			const ctl = new AbortController();
+			const aborted = call(getPort(f, clock), ctl.signal);
+			await flush();
+			ctl.abort();
+			assert.deepEqual([(await rejection(aborted)).code, clock.pendingTimers], ["aborted", 0], name);
+		}
+	});
+
 	it("has() batches by 50 and only reports requested addresses", async () => {
 		const { port, requests } = blob((req) => {
 			const hashes: string[] = JSON.parse(String(req.body)).hashes;

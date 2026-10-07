@@ -48,6 +48,7 @@ import { createWsRelayPort } from "../../src/engine/adapters/wsRelay";
 import { SimPlatform } from "../../src/sim/device";
 import { SimConfigDir, SimSideFiles, SimVault } from "../../src/sim/vault";
 import { SimWorkspace } from "../../src/sim/workspace";
+import { nodeXhr } from "./nodeXhr";
 import type { BootTrace } from "./bootTrace";
 import type { Report } from "./engineKit";
 import type { OnboardDevice, OnboardedVault } from "./onboard";
@@ -326,7 +327,7 @@ export class FullClient {
 				const tap = this.o.tap;
 				const relay = this.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random,
 					...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}), ...(tap ? { WebSocketImpl: tap.webSocket(tr?.WebSocket) } : {}) }));
-				const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock };
+				const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock, xhr: nodeXhr };
 				// As webEngine.ts: probed at start, and again on a later connect while there is none.
 				const blob = await startupBlob(blobOpts, (line) => this.log(`engine: ${line}`));
 				this.blobKind = blob ? "http" : "none";

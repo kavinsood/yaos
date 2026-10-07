@@ -238,6 +238,12 @@ class WsRelaySession implements RelaySession {
 	private readonly listeners = new Set<(event: RelayEvent) => void>();
 	private pending: RelayEvent[] | null = [];
 	private closed = false;
+	/**
+	 * Aborted when the session closes (lost, failed its liveness check, closed by the relay or by the engine): its
+	 * feed / read / readBatch / putCheckpoint calls end then (RelayHttpError "aborted"), and later calls at once.
+	 * A reply after the close would be dropped anyway (the engine reads per session: runtime/sessionLoop.ts).
+	 */
+	private readonly gone = new AbortController();
 	private errorCode: string | null = null;
 
 	private lastRx: number;
@@ -283,22 +289,22 @@ class WsRelaySession implements RelaySession {
 	}
 
 	feed(afterSeq: number) {
-		return this.http.feed(this.vaultId, afterSeq, this.limits.feedPageRows);
+		return this.http.feed(this.vaultId, afterSeq, this.limits.feedPageRows, this.gone.signal);
 	}
 
 	read(stream: StreamName, afterSeq: number, preferCheckpoint: boolean) {
-		return this.http.read(this.vaultId, stream, afterSeq, preferCheckpoint, this.limits.readPageBytes);
+		return this.http.read(this.vaultId, stream, afterSeq, preferCheckpoint, this.limits.readPageBytes, this.gone.signal);
 	}
 
 	async readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]> {
 		const first = reqs[0];
 		if (first === undefined) throw new RangeError("readBatch: no requests");
 		if (this.limits.readBatchStreams <= 1 || reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
-		return this.http.readBatch(this.vaultId, reqs.slice(0, this.limits.readBatchStreams), this.limits.readPageBytes);
+		return this.http.readBatch(this.vaultId, reqs.slice(0, this.limits.readBatchStreams), this.limits.readPageBytes, this.gone.signal);
 	}
 
 	putCheckpoint(stream: StreamName, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array) {
-		return this.http.putCheckpoint(this.vaultId, stream, coversSeq, expectedPrevCoversSeq, bytes);
+		return this.http.putCheckpoint(this.vaultId, stream, coversSeq, expectedPrevCoversSeq, bytes, this.gone.signal);
 	}
 
 	onEvent(listener: (event: RelayEvent) => void): Unsubscribe {
@@ -344,6 +350,7 @@ class WsRelaySession implements RelaySession {
 		this.clearTimers();
 		detach(this.ws);
 		this.join.clear();
+		this.gone.abort();
 		this.emit({ t: "closed", code, errorCode, wasClean });
 	}
 

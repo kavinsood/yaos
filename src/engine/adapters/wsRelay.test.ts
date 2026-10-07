@@ -11,7 +11,7 @@ import {
 	type WsRelayOptions,
 } from "./wsRelay";
 import { CONTROL_PREFIX } from "./relayFrames";
-import { bytesToBase64 } from "./relayHttp";
+import { bytesToBase64, RelayHttpError } from "./relayHttp";
 import { FakeSocket, fakeFetch, fakeSockets, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
 
 const TOKEN = "device-token-SECRET-xyz";
@@ -474,6 +474,35 @@ describe("wsRelay session sending", () => {
 		assert.equal(seen[2]!.url.pathname, "/vault/vault1/streams/checkpoint");
 		for (const req of seen) assert.equal(req.headers.get("authorization"), `Bearer ${TOKEN}`);
 	});
+});
+
+describe("wsRelay session HTTP liveness", () => {
+	/** Serves the ticket; every other request never answers and ignores its signal. */
+	const deaf: typeof fetch = async (input) =>
+		String(input).endsWith("/auth/ticket") ? jsonResponse({ ticket: TICKET, expiresAt: 0, ttlMs: 300000 }) : new Promise<Response>(() => undefined);
+
+	for (const [how, close] of [
+		["the relay closes the socket (lost link)", (x: { socket: FakeSocket; session: RelaySession }) => x.socket.serverClose(1006, false)],
+		["the engine closes the session (pause, park, stop)", (x: { socket: FakeSocket; session: RelaySession }) => x.session.close(1000, "paused")],
+	] as const) {
+		it(`${how}: feed / read / readBatch / putCheckpoint in flight end "aborted", later calls at once`, async () => {
+			const x = await open({ fetch: deaf }, { ...READY, limits: { ...READY.limits, readBatchMaxStreams: 8 } });
+			const calls = [
+				x.session.feed(0),
+				x.session.read(S("ns"), 0, false),
+				x.session.readBatch([{ stream: S("a"), afterSeq: 0, preferCheckpoint: false }, { stream: S("b"), afterSeq: 0, preferCheckpoint: false }]),
+				x.session.putCheckpoint(S("ns"), 2, 0, bytes(1, 2, 3)),
+			];
+			let settled = 0;
+			for (const p of calls) p.then(() => settled++, () => settled++);
+			await flush();
+			assert.equal(settled, 0);
+			close(x);
+			for (const p of calls) await assert.rejects(p, (e: unknown) => e instanceof RelayHttpError && e.status === 0 && e.code === "aborted");
+			await assert.rejects(x.session.read(S("ns"), 0, false), (e: unknown) => e instanceof RelayHttpError && e.code === "aborted");
+			assert.equal(x.clock.pendingTimers, 0, "every deadline timer is cleared");
+		});
+	}
 });
 
 describe("wsRelay batched read", () => {
