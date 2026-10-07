@@ -14,7 +14,12 @@
  *    triggers the close again is poisoned;
  *  - e2ee-design §14.2 step 4: a record sealed below the newest winning revoke
  *    epoch, or a copy not sealed yet (empty `sealed`), is never sent as is: it
- *    goes to deps.reseal and comes back as a new record.
+ *    goes to deps.reseal and comes back as a new record. For ns and cfg, such a
+ *    record, or an own frame still in flight sealed below that epoch (it may
+ *    commit stale and come back as a copy), holds the later frames of its
+ *    stream: the folds apply one author's ops in seq order (a rename by docId,
+ *    an LWW register), so an older op committing after a newer one would undo
+ *    it. Bodies are CRDT updates and do not wait.
  *  - the blob gate (blobs/touch.ts, e2ee-design §10.4 R3): a frame it holds also
  *    holds the later frames of its stream for that pass.
  */
@@ -341,9 +346,14 @@ export class Sender {
 		const held = new Set<StreamName>();
 		for (const e of this.order()) {
 			const cfid = e.rec.clientFrameId;
-			if (this.inflight.has(cfid)) continue;
-			if (this.probe && this.inflight.size > 0) break;
 			const isNs = e.rec.stream === NS_STREAM || e.rec.stream === CFG_STREAM;
+			const belowFloor = e.rec.sealed.length === 0 || e.rec.keyEpoch < minEpoch;
+			if (this.inflight.has(cfid)) {
+				// In flight below the floor: it may commit stale and come back as a copy, which must commit first.
+				if (isNs && belowFloor) held.add(e.rec.stream);
+				continue;
+			}
+			if (this.probe && this.inflight.size > 0) break;
 			if (isNs && (!this.nsOpen || !nsWindow.has(cfid))) continue;
 			if (e.retryAtMono > now) {
 				nextWake = Math.min(nextWake, e.retryAtMono - now);
@@ -351,8 +361,9 @@ export class Sender {
 			}
 			if (held.has(e.rec.stream)) continue;
 			// After the ns window check: an ns/cfg record is re-sealed under its own id only once the late-receipt reads ran.
-			if (e.rec.sealed.length === 0 || e.rec.keyEpoch < minEpoch) {
+			if (belowFloor) {
 				this.deps.reseal(e.rec);
+				if (isNs) held.add(e.rec.stream);
 				continue;
 			}
 			if (this.deps.gate && !this.deps.gate.ready(e.rec)) {
