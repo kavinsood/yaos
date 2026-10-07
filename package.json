@@ -25,6 +25,7 @@
 		"test:client": "node scripts/client-test.mjs",
 		"typecheck:client": "tsc -noEmit -p tsconfig.json && tsc -noEmit -p tsconfig.client-tests.json",
 		"check:deps": "node scripts/check-deps.mjs",
+		"bench:e2ee": "node --import jiti/register scripts/bench-e2ee.mjs",
 		"check:client": "npm run typecheck:client && npm run check:deps && npm run test:client"
 	},
 	"license": "0-BSD",
