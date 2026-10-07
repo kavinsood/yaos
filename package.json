@@ -23,6 +23,7 @@
 		"guard:server-crdt-engine": "node scripts/guard-server-crdt-imports.mjs",
 		"clean:src-js-artifacts": "find src -name '*.js' -o -name '*.js.map' | xargs rm -f 2>/dev/null; echo 'cleaned'",
 		"test:client": "node scripts/client-test.mjs",
+		"test:sim-suite1": "node scripts/sim-suite1.mjs",
 		"typecheck:client": "tsc -noEmit -p tsconfig.json && tsc -noEmit -p tsconfig.client-tests.json",
 		"check:deps": "node scripts/check-deps.mjs",
 		"bench:e2ee": "node --import jiti/register scripts/bench-e2ee.mjs",

@@ -11,6 +11,9 @@
  *              flow; relay restart (STREAM_RESEND, unreceipted frames lost);
  *              graceful drain; HTTP failures; daily limit; vault epoch reset
  *   world      wall-clock jumps (monotonic intact)
+ *   suite 1    key-store loss, forced and concurrent rolls, revoke + re-key,
+ *              point-in-time restore, hostile replay and downgrade
+ *              (e2eeFaults.ts; drawn only by E2EE_FAULTS in a suite-1 run)
  *
  * Token durability across an app crash: a token typed on the crashed device
  * may be lost only if it was on no disk, in no trash and not in the device's
@@ -23,6 +26,7 @@ import type { LifecycleEvent } from "../ports/platform";
 import type { TimerHandle } from "../ports/clock";
 import { tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
+import { E2eeFaults, type E2eeFaultAction } from "./e2eeFaults";
 import type { SeededRandom } from "./random";
 import type { SimDevice } from "./device";
 import { inspectStore } from "./inspect";
@@ -44,13 +48,23 @@ export type FaultAction =
 	| { readonly t: "httpFail"; readonly durationMs: number }
 	| { readonly t: "dailyLimit"; readonly durationMs: number }
 	| { readonly t: "epochReset" }
-	| { readonly t: "clockSkew"; readonly dev: number; readonly deltaMs: number };
+	| { readonly t: "clockSkew"; readonly dev: number; readonly deltaMs: number }
+	| E2eeFaultAction;
 
 export type FaultWeights = Readonly<Record<FaultAction["t"], number>>;
 
 export const DEFAULT_FAULTS: FaultWeights = {
 	engineCrash: 3, appCrash: 2, commitCrash: 2, idbWipe: 1, idbLost: 1, offline: 4, ioFail: 2, background: 3,
 	socketDrop: 4, relayRestart: 1, relayDrain: 1, httpFail: 1, dailyLimit: 0.5, epochReset: 0.3, clockSkew: 1,
+	// Suite-1 faults (e2eeFaults.ts): weight 0 here, so suite-0 plans draw exactly as before (generateFault skips
+	// zero weights, and these keys come last).
+	keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
+};
+
+/** The default matrix plus the suite-1 faults (a `crypto: "suite1"` run; in a suite-0 run they are skipped). */
+export const E2EE_FAULTS: FaultWeights = {
+	...DEFAULT_FAULTS,
+	keyStoreLoss: 1, keyRoll: 1.5, revoke: 0.7, epochRestore: 0.5, hostileReplay: 2, hostileDowngrade: 1,
 };
 
 export function generateFault(rng: SeededRandom, devices: number, weights: FaultWeights): FaultAction {
@@ -81,6 +95,12 @@ export function generateFault(rng: SeededRandom, devices: number, weights: Fault
 		case "dailyLimit": return { t: "dailyLimit", durationMs: rng.range(5_000, 60_000) };
 		case "epochReset": return { t: "epochReset" };
 		case "clockSkew": return { t: "clockSkew", dev, deltaMs: (rng.chance(0.5) ? 1 : -1) * rng.range(60_000, 3 * 86_400_000) };
+		case "keyStoreLoss": return { t: "keyStoreLoss", dev, downMs: rng.range(200, 10_000), rekeyMs: rng.range(2_000, 60_000) };
+		case "keyRoll": return { t: "keyRoll", dev, also: devices > 1 && rng.chance(0.5) ? (dev + 1 + rng.int(devices - 1)) % devices : null };
+		case "revoke": return { t: "revoke", dev, by: (dev + 1 + rng.int(Math.max(1, devices - 1))) % devices, rekeyMs: rng.range(2_000, 60_000), rkSeed: rng.int(0x7fffffff) };
+		case "epochRestore": return { t: "epochRestore", back: rng.range(1, 12) };
+		case "hostileReplay": return { t: "hostileReplay", pick: rng.int(0x7fffffff), copies: rng.range(1, 3) };
+		case "hostileDowngrade": return { t: "hostileDowngrade", pick: rng.int(0x7fffffff), rows: rng.range(1, 3), join: rng.chance(0.3) };
 	}
 }
 
@@ -110,14 +130,25 @@ export class FaultState {
 	readonly counts: Record<FaultAction["t"], number> = {
 		engineCrash: 0, appCrash: 0, commitCrash: 0, idbWipe: 0, idbLost: 0, offline: 0, ioFail: 0, background: 0,
 		socketDrop: 0, relayRestart: 0, relayDrain: 0, httpFail: 0, dailyLimit: 0, epochReset: 0, clockSkew: 0,
+		keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
 	};
+	/** Suite-1 faults (null in a suite-0 run: they are skipped). */
+	readonly e2ee: E2eeFaults | null;
 
 	constructor(
 		private readonly clock: VirtualClock,
 		private readonly devs: readonly SimDevice[],
 		private readonly net: SimNet,
 		private readonly ledger: TokenLedger,
-	) {}
+		o: { readonly suite1?: boolean; readonly weights?: FaultWeights | null; readonly initialRk?: () => Uint8Array } = {},
+	) {
+		this.e2ee = o.suite1 ? new E2eeFaults(clock, devs, net, (i) => this.down.has(i), (o.weights?.epochRestore ?? 0) > 0, o.initialRk ?? null) : null;
+	}
+
+	/** run.ts, after every plan step. */
+	afterStep(): void {
+		this.e2ee?.afterStep();
+	}
 
 	isDown(i: number): boolean {
 		return this.down.has(i);
@@ -164,6 +195,17 @@ export class FaultState {
 				this.net.relay.resetEpoch(epoch);
 				this.counts.epochReset++;
 				return `fault epochReset ${epoch}`;
+			}
+			case "keyRoll":
+			case "revoke":
+			case "epochRestore":
+			case "hostileReplay":
+			case "hostileDowngrade": {
+				if (!this.e2ee) return `skip fault ${f.t}: suite 0`;
+				if ("dev" in f && this.down.has(f.dev)) return `skip fault ${this.devs[f.dev]?.name ?? "?"} ${f.t}: app down`;
+				const line = this.e2ee.run(f);
+				if (!line.startsWith("skip")) this.counts[f.t]++;
+				return line;
 			}
 			default:
 				return this.runDevice(f);
@@ -233,17 +275,25 @@ export class FaultState {
 				d.wallSkewMs += f.deltaMs;
 				this.counts.clockSkew++;
 				return `${tag} ${f.deltaMs}`;
+			case "keyStoreLoss":
+				// SecretStorage (the OS keychain) wiped while the app is down: it restarts pinned, key-missing "no-key".
+				if (!this.e2ee) return `skip ${tag}: suite 0`;
+				this.crash(f.dev, f.downMs, { wipeSecrets: true });
+				this.e2ee.scheduleRekey(f.dev, f.downMs + f.rekeyMs);
+				this.counts.keyStoreLoss++;
+				return `${tag} down ${f.downMs}ms rekey +${f.rekeyMs}ms`;
 		}
 		this.counts[f.t]++;
 		return tag;
 	}
 
 	/** App crash of device i (optionally with an IDB wipe); restart after downMs. */
-	private crash(i: number, downMs: number, o: { readonly wipe?: boolean; readonly dropMirrors?: boolean }): void {
+	private crash(i: number, downMs: number, o: { readonly wipe?: boolean; readonly dropMirrors?: boolean; readonly wipeSecrets?: boolean }): void {
 		const d = this.devs[i]!;
 		const onDisk = diskTokens(this.devs);
 		const candidates = this.ledger.live().filter((e) => e.dev === d.name && !onDisk.has(e.token)).map((e) => e.token);
 		const copy = d.crashApp(o);
+		if (o.wipeSecrets) d.secretBacking.clear();
 		this.armed.delete(i);
 		this.down.add(i);
 		this.backgrounded.delete(i);
@@ -268,7 +318,8 @@ export class FaultState {
 	async settle(horizonMs = 120_000): Promise<boolean> {
 		if (this.inspecting > 0) await this.clock.runUntil(() => this.inspecting === 0, horizonMs);
 		await Promise.all(this.inspections);
-		return this.inspecting === 0;
+		const e2ee = this.e2ee ? await this.e2ee.stop(horizonMs) : true;
+		return this.inspecting === 0 && e2ee;
 	}
 
 	private restart(i: number): void {
@@ -313,5 +364,6 @@ export class FaultState {
 		this.healHttp();
 		this.healLimit();
 		for (const d of this.devs) d.vault.failNextOps = 0;
+		this.e2ee?.heal();
 	}
 }
