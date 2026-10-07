@@ -8,6 +8,11 @@
  *   3 corruption: a takes a second snapshot; one byte of its last part is flipped AT REST in the relay's R2 store
  *     (the miniflare blob file whose sha256 is the part's); b's restore fails `content_corrupt` naming the check,
  *     b gets the notice, b's vault and snapshot list are unchanged, no download parts are left
+ *   4 blob GC (e2ee-design §10.4) with a short test-only grace (EngineTuning.blobGcGraceMs, GC_GRACE_MS on every
+ *     client): an unreferenced upload older than the grace and a replaced attachment's old blob are deleted by
+ *     "Clean up unused server attachments" on b; every ns blob (a tombstone included), every snapshot part and an
+ *     unreferenced upload newer than the grace stay; a second run deletes nothing; offline refuses with zero
+ *     deletes; a fresh device c still gets every file
  *
  *   node --import jiti/register e2e/client/snapshots.ts --host http://127.0.0.1:8796 [--label local] [--state-dir DIR]
  *
@@ -20,6 +25,9 @@ import { join } from "node:path";
 import { formatCanvasBytes, parseCanvasText } from "../../src/core/hash/canvasCanonical";
 import { HostRequestError } from "../../src/host/engineHost";
 import type { EngineResultValue, SnapshotSummary, UserCommand } from "../../src/protocol/messages";
+import type { BlobPort } from "../../src/ports/blob";
+import type { BlobAddress } from "../../src/ports/crypto";
+import { attachmentsCleanedNotice } from "../../src/host/ui/attachmentsCleanup";
 import { Report } from "./engineKit";
 import { bytesOf, conflictCopies, converge, randomBytes, sameBytes } from "./fullCheck";
 import { FullClient } from "./fullKit";
@@ -34,11 +42,13 @@ const LABEL = arg("label", "local");
 const STATE_DIR = arg("state-dir", `${new URL("../../..", import.meta.url).pathname}logs/client-e2e-local-${new URL(HOST).port || "80"}-state`);
 const R = new Report();
 const SETTINGS = { snapshots: { enabled: true, keepDaily: 7, uploadToBlobStore: true } };
+/** Test-only blob GC grace (production: 7 days). Long enough that an upload finishes well inside grace / 2. */
+const GC_GRACE_MS = 8_000;
 const clients: FullClient[] = [];
 let vault: OnboardedVault | null = null;
 
 function newClient(name: string, device: OnboardDevice): FullClient {
-	const c = new FullClient({ name, host: HOST, vaultId: vault!.vaultId, device, watcherDelayMs: 100, settings: SETTINGS });
+	const c = new FullClient({ name, host: HOST, vaultId: vault!.vaultId, device, watcherDelayMs: 100, settings: SETTINGS, tuning: { blobGcGraceMs: GC_GRACE_MS } });
 	clients.push(c);
 	return c;
 }
@@ -79,10 +89,14 @@ function filesWithHash(dir: string, size: number, sha: string): string[] {
 
 async function main(): Promise<void> {
 	R.step("onboard; start a (snapshot upload on); write md, canvas, ~9 MiB of images");
-	vault = await onboardVault(HOST, { devices: 2, label: `snapshots-${LABEL}` });
+	vault = await onboardVault(HOST, { devices: 3, label: `snapshots-${LABEL}` });
 	const a = newClient("a", vault.devices[0]!);
 	await a.start();
 	await converge([a], 60_000);
+	// Step 4's old garbage: an upload nothing ever references (suite 0: address = sha256, stored bytes = plaintext).
+	const orphan = randomBytes(32 * 1024, 700);
+	const orphanAddr = sha256(orphan);
+	await blobOf(a).put(orphanAddr, orphan);
 	a.vault.userWrite("notes/plan.md", "# Plan\n\nship the backup path\n");
 	a.vault.userWrite("notes/gone.md", "this file gets deleted after the snapshot\n");
 	const canvas = parseCanvasText(JSON.stringify({ nodes: [{ id: "n1", type: "text", text: "hi", x: 0, y: 0, width: 200, height: 80 }], edges: [] }));
@@ -165,6 +179,76 @@ async function main(): Promise<void> {
 	R.check("no restore snapshot taken, no download parts left", (await list(b)).filter((s) => s.reason === "restore").length === restoresBefore && dlParts(b).length === 0, dlParts(b));
 	R.check("diagnostic names the snapshot and check", b.logLines.some((l) => l.includes(`content_corrupt snapshot=${id2} check=part-hash`)), b.logLines.filter((l) => l.includes("content_corrupt")).slice(-3));
 	await converge([a, b], 60_000);
+
+	R.step(`blob GC (grace ${GC_GRACE_MS} ms): a replaced attachment and an old orphan are deleted; live, tombstoned, snapshot and newer blobs stay`);
+	const x1 = randomBytes(48 * 1024, 701);
+	a.vault.externalWrite("img/gc.png", x1);
+	await a.runtime.command({ t: "reconcileNow" });
+	await converge([a, b], 60_000);
+	a.vault.externalWrite("img/gc.png", randomBytes(48 * 1024, 702));
+	a.vault.userDelete("img/p9.png");
+	await a.runtime.command({ t: "reconcileNow" });
+	await converge([a, b], 60_000);
+	const replacedAt = Date.now();
+	await new Promise((res) => setTimeout(res, Math.max(0, replacedAt + GC_GRACE_MS + 2_000 - Date.now())));
+	const fresh = randomBytes(32 * 1024, 703);
+	const freshAddr = sha256(fresh);
+	await blobOf(a).put(freshAddr, fresh);
+	const referenced = referencedAddresses(b);
+	const stored0 = await storedAddresses(b);
+	const x1Addr = sha256(x1);
+	R.check("before: the orphan, the replaced blob and the fresh upload are stored; every referenced blob is", stored0.has(orphanAddr) && stored0.has(x1Addr) && stored0.has(freshAddr) && [...referenced].every((x) => stored0.has(x)),
+		{ stored: stored0.size, referenced: referenced.size, missing: [...referenced].filter((x) => !stored0.has(x)).length });
+	const tg = performance.now();
+	const gc = await cmd(b, { t: "cleanUpAttachments" }, "attachmentsCleaned");
+	R.record("gc_ms", performance.now() - tg);
+	const stored1 = await storedAddresses(b);
+	R.extra.gc = { result: gc, notice: attachmentsCleanedNotice(gc), storedBefore: stored0.size, storedAfter: stored1.size };
+	R.check("GC ran (no refusal), deleted the orphan and the replaced blob, kept the newer upload", gc.refused === null && gc.lost === 0 && gc.deleted >= 2 && gc.keptNewer >= 1 && !stored1.has(orphanAddr) && !stored1.has(x1Addr) && stored1.has(freshAddr), gc);
+	const gone = [...referenced].filter((x) => !stored1.has(x));
+	R.check("every ns blob (tombstone included) and snapshot part is still stored", gone.length === 0, { gone: gone.length, referenced: referenced.size });
+	R.check("deleted exactly the unreferenced old blobs", stored0.size - stored1.size === gc.deleted && [...stored0].filter((x) => !stored1.has(x)).every((x) => !referenced.has(x)), { before: stored0.size, after: stored1.size, deleted: gc.deleted });
+	R.check("the notice reports the counts", attachmentsCleanedNotice(gc).message.startsWith(`Deleted ${gc.deleted} unused attachments from the server.`) && attachmentsCleanedNotice(gc).level === "info", attachmentsCleanedNotice(gc));
+	const again = await cmd(b, { t: "cleanUpAttachments" }, "attachmentsCleaned");
+	R.check("a second run deletes nothing", again.refused === null && again.deleted === 0 && (await storedAddresses(b)).size === stored1.size, again);
+	b.setOnline(false);
+	for (let i = 0; i < 100 && b.vrt?.log.c.session; i++) await new Promise((res) => setTimeout(res, 50));
+	const off = await cmd(b, { t: "cleanUpAttachments" }, "attachmentsCleaned");
+	b.setOnline(true);
+	R.check("offline: refused, zero deletes", off.refused === "offline" && off.deleted === 0, off);
+	const c = newClient("c", vault.devices[2]!);
+	await c.start();
+	await converge([a, b, c], 120_000);
+	const want = await contents(a);
+	R.check("a fresh device c gets every file after the GC", (await sameFiles(c, want)).length === 0 && c.vault.snapshot().size === want.size, { differ: await sameFiles(c, want), files: c.vault.snapshot().size, want: want.size });
+}
+
+function sha256(b: Uint8Array): BlobAddress {
+	return createHash("sha256").update(b).digest("hex") as BlobAddress;
+}
+function blobOf(c: FullClient): BlobPort {
+	const s = c.vrt?.log.c.ports.blob;
+	if (!s) throw new Error(`${c.name} has no blob store (relay started without --r2?)`);
+	return s;
+}
+/** Every stored address (the store's listing, paged). */
+async function storedAddresses(c: FullClient): Promise<Set<string>> {
+	const out = new Set<string>();
+	let cursor: BlobAddress | null = null;
+	do {
+		const page = await blobOf(c).list(cursor);
+		for (const it of page.items) out.add(it.address);
+		cursor = page.next;
+	} while (cursor !== null);
+	return out;
+}
+/** Addresses the committed ns / snap folds reference (suite 0: address = sha256). */
+function referencedAddresses(c: FullClient): Set<string> {
+	const log = c.vrt!.log;
+	const out = new Set<string>();
+	for (const e of log.c.ns.state.entries.values()) if (e.blob) out.add(e.blob.hash);
+	for (const e of log.c.snap.state.records.values()) for (const p of e.record.parts) out.add(p.address);
+	return out;
 }
 
 async function waitForRow(c: FullClient, id: string): Promise<void> {
