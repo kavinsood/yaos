@@ -208,7 +208,7 @@ export async function prepareEpochMigration(rt: VaultRuntime): Promise<Map<PathK
 	for (const s of rt.rec.ctx.store.synced.values()) {
 		if (s.kind !== "markdown" || !s.hasBase) continue;
 		const r = byDoc.get(s.docId);
-		const text = r ? readBase(r) : null;
+		const text = r ? await readBase(r, rt.o.ports.hash) : null;
 		if (text !== null) bases.set(pathKey(s.path), text);
 	}
 	return bases;

@@ -9,6 +9,7 @@
  */
 
 import type { DiskOp, DiskOpResult, DiskReadRequest, DiskReadResult, Lane } from "../../../protocol/messages";
+import { refHashPort } from "../../../core/hash/testkit/hashRef";
 import { fingerprintWrites, withFingerprints } from "../../compose/hashService";
 import type { ExecResult } from "../deps";
 import type { TrashMode } from "../../../ports/vault";
@@ -84,7 +85,7 @@ export class FakeGateway implements DiskGateway {
 			}
 			this.executed.push(op);
 			// Like the engine's host link: fingerprint the write before it is sent (detached).
-			const fps = fingerprintWrites([op]);
+			const fps = await fingerprintWrites(refHashPort, [op]);
 			out.push(...withFingerprints([op], fps, [await this.one(op)]));
 			detachWriteBytes(op);
 			if (this.crash && this.crash.after && this.crash.at === n) {

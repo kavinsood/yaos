@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import type { DocId, VaultPath } from "../../core/types";
-import { canvasContentHash, parseCanvasText, rankCanvasInFileOrder } from "../../core/hash/canvasCanonical";
+import { parseCanvasText, rankCanvasInFileOrder } from "../../core/hash/canvasCanonical";
+import { canvasHashRef } from "../../core/hash/testkit/hashRef";
 import { applyCanvas, readCanvas } from "./canvasDoc";
 import { assertConverged, crashPoints, label, runCrashed } from "./testkit/crash";
 import { World } from "./testkit/world";
@@ -36,7 +37,7 @@ const nodeOf = (j: { nodes: Obj[] } | null, id: string): Obj | undefined => j?.n
 const nodeMap = (doc: Y.Doc, id: string): Y.Map<unknown> => doc.getMap<unknown>("nodes").get(id) as Y.Map<unknown>;
 const writes = (w: World): number => w.gateway.executed.filter((o) => o.t === "write").length;
 const sameLogical = (w: World, path: string, id: DocId): void =>
-	assert.equal(canvasContentHash(w.vault.bytesOf(path)!), canvasContentHash(enc(w.log.canvasText(id)!)), `${path}: disk != CRDT`);
+	assert.equal(canvasHashRef(w.vault.bytesOf(path)!), canvasHashRef(enc(w.log.canvasText(id)!)), `${path}: disk != CRDT`);
 
 /** Remote device: set a node's text (minimal Y.Text edit at the end). */
 function remoteText(w: World, id: DocId, node: string, append: string): void {
@@ -65,7 +66,7 @@ test("canvas: local create uploads records (Y.Text for text nodes, ranks), the f
 	assert.equal(typeof (doc.getMap<unknown>("edges").get("e1") as Y.Map<unknown>).get("rank"), "string");
 	assert.ok(w.log.frames.some((f) => f.docId === id), "body frames committed");
 	assert.equal(w.vault.text("board.canvas"), local, "2-space file not rewritten (same logical content)");
-	assert.equal(w.synced(id)?.contentHash, canvasContentHash(enc(local)));
+	assert.equal(w.synced(id)?.contentHash, canvasHashRef(enc(local)));
 	assert.equal(w.synced(id)?.hasBase, true);
 	const m = w.gateway.mutations;
 	const f = w.log.frames.length;
@@ -84,7 +85,7 @@ test("canvas: remote create materializes (also the empty canvas)", async () => {
 	assert.equal(w.vault.text("b/board.canvas"), w.log.canvasText(id));
 	assert.deepEqual(disk(w, "empty.canvas"), { nodes: [], edges: [] });
 	assert.equal(w.synced(id)?.kind, "canvas");
-	assert.equal(w.synced(empty)?.contentHash, canvasContentHash(new Uint8Array(0)), "empty canvas = empty content hash");
+	assert.equal(w.synced(empty)?.contentHash, canvasHashRef(new Uint8Array(0)), "empty canvas = empty content hash");
 	assert.equal(w.r.scan.dirty.size, 0, "own writes are echoes");
 	assert.equal(w.log.submitted.length, 0);
 	await assertConverged(w, "remote create");
@@ -248,7 +249,7 @@ test("canvas: adopt without I/O when the local file has the CRDT's logical conte
 	assert.equal(w.log.frames.length, f, "no body frame");
 	assert.equal(w.log.submitted.length, 0);
 	assert.equal(w.vault.text("board.canvas"), local);
-	assert.equal(w.synced(id)?.contentHash, canvasContentHash(enc(local)));
+	assert.equal(w.synced(id)?.contentHash, canvasHashRef(enc(local)));
 	assert.equal(w.synced(id)?.hasBase, true);
 	assert.deepEqual(w.conflictCopies(), []);
 	await assertConverged(w, "adopt");

@@ -91,6 +91,13 @@ export const ROLL_OWN_SEALS = 2 ** 22;
 
 export const MAX_DOC_TEXT_CHARS = 8 * 1024 * 1024;
 export const MAX_BASE_TEXT_CHARS = 4 * 1024 * 1024;
+/**
+ * Largest input core's synchronous pure-JS SHA-256 (core/hash/sha256.ts) takes; above it, it throws. It runs on the
+ * engine thread and blocks it for the whole digest: ~3 ms per MiB (316 ms for 100 MB, against 42 ms through
+ * WebCrypto, which does not block). Everything else (file, blob, canvas, config, snapshot content, brake ids) is
+ * hashed through HashPort (core/hash/digest.ts digestHex).
+ */
+export const SYNC_HASH_MAX_BYTES = 4096;
 export const MERGE_MAX_INPUT_CHARS = 2 * 1024 * 1024;
 export const MERGE_MAX_EDITS_PER_SIDE = 10_000;
 /** Provisional frame not committed within this window is re-appended by a device that holds it (adopt orphan). */

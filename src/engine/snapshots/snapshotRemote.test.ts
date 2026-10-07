@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { sealedBlobBytes } from "../../core/codec/sealedBlob";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { snapPartBytes } from "../../core/snap/bundle";
 import { snapLive } from "../../core/snap/fold";
 import { snapKey } from "../../core/snap/record";
@@ -53,10 +53,10 @@ test("upload: every part sealed under its blob address, then one index record; a
 	for (const p of record.parts) {
 		assert.equal(p.address, addressOf(p.sha256), "address = CryptoPort.blobAddress(sha256)");
 		const sealed = store.objects.get(p.address as BlobAddress)!;
-		assert.notEqual(sha256Hex(sealed), p.sha256);
+		assert.notEqual(sha256HexRef(sealed), p.sha256);
 		const opened = await sealingCrypto.openBlob({ address: p.address as BlobAddress, sealed });
 		assert.ok(opened.ok);
-		assert.equal(sha256Hex(opened.plaintext), p.sha256, "stored sealed (sealBlob); opens to the part");
+		assert.equal(sha256HexRef(opened.plaintext), p.sha256, "stored sealed (sealBlob); opens to the part");
 	}
 	const before = index.submitted.length;
 	await a.job.maybeDaily();

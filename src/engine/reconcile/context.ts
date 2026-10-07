@@ -12,6 +12,7 @@ import { conflictCopyNotice } from "../../core/plan/conflictName";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
 import { standInPathKey } from "../../core/plan/pathRules";
 import type { ClockPort } from "../../ports/clock";
+import type { HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
 import type { TrashMode, VaultStat } from "../../ports/vault";
 import { LANE, type DiskOp, type DiskReadResult, type Lane } from "../../protocol/messages";
@@ -82,6 +83,8 @@ export interface ReconcilerDeps {
 	readonly disk: DiskGateway;
 	readonly clock: ClockPort;
 	readonly random: RandomPort;
+	/** Every content hash the disk side takes (file reads, bases, canvas projections, brake ids). */
+	readonly hash: HashPort;
 	readonly blobs: BlobTransfer | null;
 	readonly settings: ReconcileSettings;
 	readonly deviceLabel: string;

@@ -7,10 +7,10 @@
  * index does not have it yet.
  */
 import { retentionFloor, snapLive } from "../../core/snap/fold";
-import { sha256Hex } from "../../core/hash/sha256";
+import { digestHex } from "../../core/hash/digest";
 import { snapKey, type SnapOp, type SnapRecord } from "../../core/snap/record";
 import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress, CryptoPort } from "../../ports/crypto";
+import type { BlobAddress, CryptoPort, HashPort } from "../../ports/crypto";
 import type { SideFilePort } from "../../ports/vault";
 import { getOpened, putAt, storePlaintextCap, type PutPolicy } from "../blobs/blobStore";
 import { dlName, partName } from "./localStore";
@@ -19,6 +19,7 @@ import type { SnapIndexPort } from "./snapIndex";
 export interface RemoteDeps {
 	readonly store: BlobPort;
 	readonly crypto: CryptoPort;
+	readonly hash: HashPort;
 	readonly index: SnapIndexPort;
 	readonly touch: PutPolicy;
 }
@@ -32,7 +33,7 @@ export class SnapshotUploadError extends Error {}
  * of this device's uploads). Throws on store errors and on local parts that no longer match the descriptor.
  */
 export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: SnapRecord, keep: number): Promise<UploadOutcome> {
-	const { index, store, crypto, touch } = r;
+	const { index, store, crypto, hash, touch } = r;
 	const before = index.view();
 	if (!before.ready) return "not-ready";
 	const key = snapKey(index.self, record.snapshotId);
@@ -49,7 +50,7 @@ export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: 
 		const want = record.parts[i]!;
 		if (have.has(addresses[i]!) && await touch.reuse(want.sha256, addresses[i]!)) continue;
 		const bytes = await side.read(partName(record.snapshotId, i));
-		if (!bytes || bytes.length !== want.size || sha256Hex(bytes) !== want.sha256) {
+		if (!bytes || bytes.length !== want.size || (await digestHex(hash, bytes)) !== want.sha256) {
 			throw new SnapshotUploadError(`local part ${i + 1}/${record.parts.length} of ${record.snapshotId} is missing or damaged`);
 		}
 		await putAt(store, crypto, touch, want.sha256, addresses[i]!, bytes);

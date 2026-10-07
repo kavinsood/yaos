@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Writer } from "../../core/codec/lib0";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { MAX_INLINE_UPDATE_BYTES } from "../../core/limits";
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
 import { snapshotId, SnapOpTag, type SnapRecord } from "../../core/snap/record";
@@ -44,7 +44,7 @@ const T0 = Date.UTC(2026, 9, 1);
 const BUDGETS = { maxResidentBytes: 1024 * 1024 * 1024, maxResidentDocs: 64 };
 
 const bytesOf = (i: number): Uint8Array => Uint8Array.from({ length: 48 }, (_, j) => (j === 0 ? i >> 8 : j === 1 ? i : i * 7 + j) & 0xff);
-const H = (b: Uint8Array) => sha256Hex(b) as ContentHash;
+const H = (b: Uint8Array) => sha256HexRef(b) as ContentHash;
 let docN = 0;
 const newDoc = () => `gcdoc${String(++docN).padStart(17, "0")}` as DocId;
 const createBlob = (docId: DocId, hash: ContentHash): NsOp => ({ t: "create", docId, kind: "blob", path: `att/${docId}.png` as VaultPath, contentHash: hash, size: 48 });

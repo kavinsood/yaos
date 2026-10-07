@@ -1,7 +1,7 @@
 /**
  * Canvas Y.Doc <-> JSON Canvas (DESIGN §j.2). Pure-ish: works on one Y.Doc,
  * no I/O. Used by the canvas merge job, materialize, intent resume, and by the
- * log side (streams.textHash of a canvas doc = canvasDocHash).
+ * log side (streams.textHash of a canvas doc = the digest of canvasDocHashInput).
  *
  * Layout of a canvas doc ("c:<docId>"):
  *   Y.Map "nodes": id -> Y.Map of fields. Values are JSON (ContentAny) except a
@@ -29,13 +29,15 @@
 import * as Y from "yjs";
 import type { ContentHash } from "../../core/types";
 import {
-	CANVAS_LIMITS, canonicalJson, canvasEdgeJson, canvasJsonValue, canvasLogicalHash, canvasNodeJson, formatCanvasText,
+	CANVAS_LIMITS, canonicalJson, canvasEdgeJson, canvasJsonValue, canvasLogicalHashInput, canvasNodeJson, formatCanvasText,
 	parseCanvasEdge, parseCanvasNode, parseCanvasText,
 	type CanvasEdge, type CanvasNode, type CanvasRanked, type CanvasSemanticData, type JsonValue,
 } from "../../core/hash/canvasCanonical";
 import { orderedCanvasIds } from "../../core/hash/canvasOrdering";
 import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
 import { utf8Encode } from "../../core/hash/utf8";
+import { digestHex } from "../../core/hash/digest";
+import type { HashPort } from "../../ports/crypto";
 
 export const CANVAS_NODE_TYPES: ReadonlySet<string> = new Set(["text", "file", "link", "group"]);
 export const CANVAS_RANK_FIELD = "rank";
@@ -49,8 +51,8 @@ export interface CanvasProjection {
 	/** Disk text (tab indent) and its UTF-8 bytes. */
 	readonly text: string;
 	readonly bytes: Uint8Array;
-	/** Logical ContentHash (== canvasContentHash(bytes)). */
-	readonly hash: ContentHash;
+	/** What its logical ContentHash digests (projectionHash; == canvasHashInput(bytes)), at most CANVAS_LIMITS.canonicalBytes. */
+	readonly hashInput: Uint8Array;
 }
 export type CanvasProjectionResult = CanvasProjection | { readonly ok: false; readonly reason: string };
 
@@ -147,7 +149,7 @@ export function visibleCanvas(r: CanvasRanked): CanvasRanked {
 	return { data: { ...data, edges, edgeOrder: data.edgeOrder.filter((id) => edges.has(id)) }, nodeRanks: r.nodeRanks, edgeRanks };
 }
 
-/** Disk projection of a ranked canvas: visible part, formatted, limit-checked, hashed. */
+/** Disk projection of a ranked canvas: visible part, formatted, limit-checked, hash input taken. */
 export function projectRanked(r: CanvasRanked): CanvasProjectionResult {
 	const visible = visibleCanvas(r);
 	const why = checkCanvasRecords(visible.data);
@@ -156,7 +158,12 @@ export function projectRanked(r: CanvasRanked): CanvasProjectionResult {
 	const parsed = parseCanvasText(text);
 	if (parsed.kind === "oversized") return { ok: false, reason: `oversized ${parsed.limit} ${parsed.measured} > ${parsed.maximum}` };
 	if (parsed.kind === "invalid") return { ok: false, reason: parsed.reason };
-	return { ok: true, ranked: visible, text, bytes: utf8Encode(text), hash: canvasLogicalHash(visible.data) };
+	return { ok: true, ranked: visible, text, bytes: utf8Encode(text), hashInput: canvasLogicalHashInput(visible.data) };
+}
+
+/** Logical ContentHash of a projection (== canvasContentHash(p.bytes)). */
+export async function projectionHash(hash: HashPort, p: CanvasProjection): Promise<ContentHash> {
+	return (await digestHex(hash, p.hashInput)) as ContentHash;
 }
 
 /** Disk projection of the canvas doc. */
@@ -165,10 +172,10 @@ export function projectCanvasBytes(doc: Y.Doc): CanvasProjectionResult {
 	return read.ok ? projectRanked(read.ranked) : read;
 }
 
-/** Logical hash of the doc's projection (streams.textHash of a canvas), null if invalid. */
-export function canvasDocHash(doc: Y.Doc): ContentHash | null {
+/** What the logical hash of the doc's projection digests (streams.textHash of a canvas), null if invalid. */
+export function canvasDocHashInput(doc: Y.Doc): Uint8Array | null {
 	const p = projectCanvasBytes(doc);
-	return p.ok ? p.hash : null;
+	return p.ok ? p.hashInput : null;
 }
 
 function sameJson(a: unknown, b: JsonValue): boolean {

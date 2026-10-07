@@ -2,9 +2,9 @@
  * Local tree helpers (DESIGN §f.1, §f.6): classification (kind, exclusion),
  * hashing of read bytes, and LocalEntry <-> LocalTreeRecord.
  *
- * Hashing is pure JS (core/hash) instead of HashPort: the engine runs in a
- * worker and core/hash is the single implementation of markdown-lf-v1 and the
- * canonical canvas hash. Recorded as a deviation in wp-b-notes.md.
+ * Hashing goes through HashPort (WebCrypto: the digest does not block the
+ * engine thread); core/hash is the single definition of the bytes hashed
+ * (markdown-lf-v1, the canonical canvas form).
  */
 
 import type { ContentHash, DiskFingerprint, DocKind, LocalEntry, PathKey, PathKeyFn, VaultPath } from "../../core/types";
@@ -13,6 +13,7 @@ import { MAX_DOC_TEXT_CHARS } from "../../core/limits";
 import { exactFingerprint, markdownContentHash } from "../../core/hash/markdownLf";
 import { canvasContentHash } from "../../core/hash/canvasCanonical";
 import { utf8Decode } from "../../core/hash/utf8";
+import type { HashPort } from "../../ports/crypto";
 import { isValidVaultPath, standInPathKey } from "../../core/plan/pathRules";
 import type { LocalTreeRecord } from "../store/schema";
 
@@ -93,12 +94,15 @@ export interface Hashed {
 	readonly fingerprint: DiskFingerprint;
 }
 
-/** Logical hash + exact fingerprint of file bytes. */
-export function hashBytes(kind: DocKind, bytes: Uint8Array): Hashed {
-	const fingerprint = exactFingerprint(bytes);
-	if (kind === "markdown") return { hash: markdownContentHash(utf8Decode(bytes)), fingerprint };
-	if (kind === "canvas") return { hash: canvasContentHash(bytes), fingerprint };
-	return { hash: fingerprint as string as ContentHash, fingerprint };
+/** Logical hash + exact fingerprint of file bytes: one digest for a blob (its hash is its fingerprint), two otherwise. */
+export async function hashBytes(hash: HashPort, kind: DocKind, bytes: Uint8Array): Promise<Hashed> {
+	const fingerprint = await exactFingerprint(hash, bytes);
+	return { hash: kind === "blob" ? (fingerprint as string as ContentHash) : await textContentHash(hash, kind, bytes), fingerprint };
+}
+
+/** Logical hash of markdown / canvas file bytes (hashBytes' `hash`). */
+export function textContentHash(hash: HashPort, kind: "markdown" | "canvas", bytes: Uint8Array): Promise<ContentHash> {
+	return kind === "markdown" ? markdownContentHash(hash, utf8Decode(bytes)) : canvasContentHash(hash, bytes);
 }
 
 export function toRecord(e: LocalEntry): LocalTreeRecord {

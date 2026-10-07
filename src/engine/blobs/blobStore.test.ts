@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { maxSealedBlobPlaintext, sealedBlobBytes } from "../../core/codec/sealedBlob";
 import { snapPartBytes } from "../../core/snap/bundle";
 import type { ContentHash } from "../../core/types";
@@ -64,7 +64,7 @@ test("putSealed: one object at blobAddress(sha256) (never the hash), deduped by 
 	const w = await port({ tag: 0xa0, seal: 2 });
 	const store = new MemStore();
 	const pt = bytes(5000);
-	const hash = sha256Hex(pt) as ContentHash;
+	const hash = sha256HexRef(pt) as ContentHash;
 	await putSealed(store, w, hash, pt, REUSE_ALL);
 	await putSealed(store, w, hash, pt, REUSE_ALL);
 	assert.equal(store.puts, 1);
@@ -83,18 +83,18 @@ test("a full snapshot part (8 MiB at a 10 MiB store) sealed under suite 1 is 8 6
 	const store = new MemStore(10 * MIB);
 	const part = bytes(snapPartBytes(store.maxBlobBytes), 3);
 	assert.equal(part.length, 8 * MIB);
-	const hash = sha256Hex(part) as ContentHash;
+	const hash = sha256HexRef(part) as ContentHash;
 	await putSealed(store, w, hash, part, REUSE_ALL);
 	const sealed = store.objects.get(await w.blobAddress(hash))!;
 	assert.equal(sealed.length, 8_650_783);
 	assert.equal(sealed.length, sealedBlobBytes(part.length, 1));
 	assert.ok(sealed.length <= store.maxBlobBytes);
 	const at = await port({ tag: 0xa2 });
-	const got = await getOpened(store, at, hash, sha256Hex);
+	const got = await getOpened(store, at, hash, sha256HexRef);
 	assert.ok(got.ok && got.bytes.length === part.length);
 	// The largest plaintext the suite takes also fits; MemStore refuses anything above maxBlobBytes (413).
 	const max = bytes(storePlaintextCap(w, store), 4);
-	await putSealed(store, w, sha256Hex(max) as ContentHash, max, REUSE_ALL);
+	await putSealed(store, w, sha256HexRef(max) as ContentHash, max, REUSE_ALL);
 	assert.equal(store.puts, 2);
 });
 
@@ -102,7 +102,7 @@ test("getOpened: every failure is unavailable; deterministic only under a verifi
 	const w = await port({ tag: 0xb0, seal: 2 });
 	const store = new MemStore();
 	const pt = bytes(700, 5);
-	const hash = sha256Hex(pt) as ContentHash;
+	const hash = sha256HexRef(pt) as ContentHash;
 	await putSealed(store, w, hash, pt, REUSE_ALL);
 	const addr = await w.blobAddress(hash);
 	const good = store.objects.get(addr)!;
@@ -113,7 +113,7 @@ test("getOpened: every failure is unavailable; deterministic only under a verifi
 	const verdict = async (sealed: Uint8Array | null, c = reader) => {
 		if (sealed) store.objects.set(addr, sealed);
 		else store.objects.delete(addr);
-		const r = await getOpened(store, c, hash, sha256Hex);
+		const r = await getOpened(store, c, hash, sha256HexRef);
 		return r.ok ? "ok" : `${r.reason}/${r.deterministic}`;
 	};
 	assert.equal(await verdict(good), "ok");
@@ -138,19 +138,19 @@ test("getOpened: every failure is unavailable; deterministic only under a verifi
 	assert.equal((await getOpened(store, reader, hash, null)).ok, true);
 	// Store errors throw; the caller treats them as transport.
 	store.down = true;
-	await assert.rejects(getOpened(store, reader, hash, sha256Hex), /503/);
+	await assert.rejects(getOpened(store, reader, hash, sha256HexRef), /503/);
 });
 
 test("getOpened at suite 0: the stored bytes are the plaintext; a mismatch is deterministic (no key involved)", async () => {
 	const c = createNoopCrypto(createWebHash());
 	const store = new MemStore();
 	const pt = bytes(300, 7);
-	const hash = sha256Hex(pt) as ContentHash;
+	const hash = sha256HexRef(pt) as ContentHash;
 	await putSealed(store, c, hash, pt, REUSE_ALL);
 	assert.deepEqual([...store.objects.keys()], [hash], "suite 0: the address is the hash");
-	assert.deepEqual(await getOpened(store, c, hash, sha256Hex), { ok: true, bytes: pt });
+	assert.deepEqual(await getOpened(store, c, hash, sha256HexRef), { ok: true, bytes: pt });
 	store.objects.set(hash, flip(pt, 0));
-	assert.deepEqual(await getOpened(store, c, hash, sha256Hex), { ok: false, reason: "hash-mismatch", deterministic: true });
+	assert.deepEqual(await getOpened(store, c, hash, sha256HexRef), { ok: false, reason: "hash-mismatch", deterministic: true });
 });
 
 test("BlobFailureStreaks: quarantine after the initial attempt + 3 retries, all deterministic, spanning >= 3 min", () => {

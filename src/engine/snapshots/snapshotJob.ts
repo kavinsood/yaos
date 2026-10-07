@@ -19,7 +19,7 @@ import type { DeviceId, DocKind, PathKeyFn, VaultPath } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { PutPolicy } from "../blobs/blobStore";
 import type { ClockPort } from "../../ports/clock";
-import type { CryptoPort } from "../../ports/crypto";
+import type { CryptoPort, HashPort } from "../../ports/crypto";
 import type { SideFilePort } from "../../ports/vault";
 import { ProtocolFailure, badRequest } from "../../protocol/errors";
 import type { DiskGateway } from "../reconcile/deps";
@@ -45,6 +45,8 @@ export interface SnapshotDeps {
 	readonly side: SideFilePort;
 	readonly clock: ClockPort;
 	readonly crypto: CryptoPort;
+	/** Part, entry, manifest and bundle digests (WebCrypto in the worker). */
+	readonly hash: HashPort;
 	/** Current local tree (files the reconciler tracks). */
 	readonly files: () => readonly { readonly path: VaultPath; readonly kind: DocKind; readonly size: number }[];
 	readonly settings: () => { readonly enabled: boolean; readonly keepDaily: number; readonly uploadToBlobStore: boolean };
@@ -76,7 +78,7 @@ export class SnapshotJob {
 
 	constructor(private readonly deps: SnapshotDeps) {
 		this.pk = deps.pathKey ?? standInPathKey;
-		this.rd = deps.remote ? { store: deps.remote.store, index: deps.remote.index, touch: deps.remote.touch, crypto: deps.crypto } : null;
+		this.rd = deps.remote ? { store: deps.remote.store, index: deps.remote.index, touch: deps.remote.touch, crypto: deps.crypto, hash: deps.hash } : null;
 	}
 
 	/** Local snapshots, oldest first (cached; only this job writes snapshot side files). */
@@ -142,11 +144,11 @@ export class SnapshotJob {
 				await this.takeNow("restore");
 				const d = this.deps;
 				const restorer = new Restorer({
-					disk: d.disk, clock: d.clock, pathKey: this.pk, deviceLabel: d.deviceLabel, tzOffsetMinutes: d.tzOffsetMinutes?.() ?? 0,
+					disk: d.disk, clock: d.clock, hash: d.hash, pathKey: this.pk, deviceLabel: d.deviceLabel, tzOffsetMinutes: d.tzOffsetMinutes?.() ?? 0,
 					taken: d.files().map((f) => f.path), nextOpId: () => this.opId++,
 				}, paths ? new Set(paths) : null);
 				const part = src.t === "local" ? (i: number) => d.side.read(partName(src.id, i)) : (i: number) => d.side.read(dlName(i));
-				await this.corruptGuard(src, "pass2", () => verifyBundle({ record: src.record, part, expect: manifest, onEntry: restorer.entry }));
+				await this.corruptGuard(src, "pass2", () => verifyBundle({ hash: d.hash, record: src.record, part, expect: manifest, onEntry: restorer.entry }));
 				return restorer.out;
 			} finally {
 				if (src.t === "remote") await this.dropCache();
@@ -181,7 +183,7 @@ export class SnapshotJob {
 		this.locals = null;
 		try {
 			const r = await exportSnapshot({
-				disk: d.disk, side: d.side, files: d.files(), id, createdAtMs, reason, partBytes, deviceLabel: d.deviceLabel,
+				disk: d.disk, side: d.side, hash: d.hash, files: d.files(), id, createdAtMs, reason, partBytes, deviceLabel: d.deviceLabel,
 				address: async (h) => d.crypto.blobAddress(h),
 			});
 			if (r.t === "too-large") {
@@ -235,13 +237,13 @@ export class SnapshotJob {
 	/** Pass 1: verifies the whole bundle without writing to the vault; a remote one stays in the download cache. */
 	private async verified(src: Source): Promise<SnapManifest> {
 		if (src.t === "local") {
-			return this.corruptGuard(src, "pass1", () => verifyBundle({ record: src.record, part: (i) => this.deps.side.read(partName(src.id, i)) }));
+			return this.corruptGuard(src, "pass1", () => verifyBundle({ hash: this.deps.hash, record: src.record, part: (i) => this.deps.side.read(partName(src.id, i)) }));
 		}
 		if (this.cache?.key === src.key) return this.cache.manifest;
 		await this.dropCache();
 		const rd = this.rd!;
 		try {
-			const manifest = await this.corruptGuard(src, "pass1", () => verifyBundle({ record: src.record, part: remotePart(rd, src.record), onPart: keepPart(this.deps.side) }));
+			const manifest = await this.corruptGuard(src, "pass1", () => verifyBundle({ hash: rd.hash, record: src.record, part: remotePart(rd, src.record), onPart: keepPart(this.deps.side) }));
 			this.cache = { key: src.key, parts: src.record.parts.length, manifest };
 			return manifest;
 		} catch (e) {

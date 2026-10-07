@@ -26,7 +26,7 @@
  */
 
 import type * as Y from "yjs";
-import type { DiskFingerprint, LocalEntry, MergeResult, SyncedEntry } from "../../core/types";
+import type { ContentHash, DiskFingerprint, LocalEntry, MergeResult, SyncedEntry } from "../../core/types";
 import { canonicalizeMarkdown, exactFingerprint, markdownContentHash } from "../../core/hash/markdownLf";
 import { utf8Decode, utf8Length } from "../../core/hash/utf8";
 import { merge } from "../../core/merge/merge";
@@ -76,8 +76,9 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		ctx.notice("warn", "not-utf8", `not valid UTF-8, left alone: ${op.path}`, `utf8:${docId}`);
 		return "fail";
 	}
+	const port = ctx.deps.hash;
 	const D = canonicalizeMarkdown(decoded);
-	const F = exactFingerprint(rd.bytes);
+	const F = await exactFingerprint(port, rd.bytes);
 	const s = ctx.synced(docId);
 	// §c.12: after an epoch migration a doc with no synced record (or a differing re-create loser merged into its
 	// winner, op.pathBase) merges against the old epoch's base at its path, but only while the new epoch's text
@@ -87,12 +88,13 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	// The synced-side fallback below needs a record describing this doc's last sync (not a rebound loser's).
 	const fallback = op.pathBase ? undefined : s;
 	const ytext = h.doc.getText("text");
-	const diskHash = markdownContentHash(D);
+	const diskHash = await markdownContentHash(port, D);
 	// Bound: the disk holds a save of its editors (or the last disk text) that the replica already has: not an edit.
 	// Without this a save followed by more typing on the same line merges as a conflict against the old base.
 	const savedByEditor = h.bound && ctx.deps.boundSavedText?.(docId, D) === true;
 
 	let result: MergeResult | null = null;
+	let mHash: ContentHash | null = null; // markdownContentHash of `result`'s M, once taken
 	let crdt0 = "";
 	let crdt1 = ""; // the CRDT text right after the merge transaction
 	let v0 = h.version();
@@ -102,11 +104,16 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		// No stored base (mirror recovery, too large to keep, a merged alias restarted at the winner's create): a side
 		// still at the synced content is the base, so a one-sided change applies as one instead of a no-base conflict copy.
 		const base = savedByEditor ? D : storedBase ?? trustedEpochBase(epochBase, crdt0)
-			?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : markdownContentHash(crdt0) === fallback.contentHash ? crdt0 : null);
+			?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : (await markdownContentHash(port, crdt0)) === fallback.contentHash ? crdt0 : null);
 		await ctx.deps.clock.yieldNow();
 		const res = merge({ base, disk: D, crdt: crdt0, limits: ctx.mergeLimits });
 		const M = res.kind === "identical" ? D : res.text;
-		if (!h.bound && M !== D && !overwriteAllowed(env, docId, op.path, rd.bytes.length, utf8Length(M), `${markdownContentHash(D)}>${markdownContentHash(M)}`)) {
+		let hashM: ContentHash | null = null; // M's markdownContentHash, when the brake took it
+		const transition = async (): Promise<string> => {
+			hashM = await markdownContentHash(port, M);
+			return `${diskHash}>${hashM}`;
+		};
+		if (!h.bound && M !== D && !(await overwriteAllowed(env, docId, op.path, rd.bytes.length, utf8Length(M), transition))) {
 			return "held";
 		}
 		// Synchronous section: CAS, apply, capture the version.
@@ -116,6 +123,7 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		crdt1 = apply ? res.text : crdt0;
 		v0 = h.version();
 		result = res;
+		mHash = hashM;
 		break;
 	}
 	const v1 = await h.commitEdits();
@@ -129,7 +137,7 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	let intent: IntentRecord | null = null;
 	const local: LocalEntry[] = [];
 	if (result.kind === "conflict") {
-		const cc = await writeConflictCopy(env, op, rd.bytes, markdownContentHash(D), "markdown");
+		const cc = await writeConflictCopy(env, op, rd.bytes, diskHash, "markdown");
 		if (!cc) return "fail";
 		intent = cc.intent;
 		local.push(cc.local);
@@ -140,12 +148,15 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	let stat = rd.stat;
 	let fingerprint = F;
 	let diskText = D;
+	let hash = diskHash;
 	if (!h.bound && M !== D) {
+		// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.
+		const writtenHash = mHash ?? await markdownContentHash(port, M);
 		const res = await ctx.exec({ t: "write", area: "vault", path: diskPath, data: { t: "text", text: M }, precondition: { t: "fingerprint", fingerprint: F }, docId, purpose: "merge" });
 		const out = writeOk(res);
 		if (!out) {
 			// The user edited again: rebase S on D (see header), keep bodyVersion so Rc stays true.
-			const rebased = s ? rebaseOnDisk(ctx, s, D, F, rd.stat) : null;
+			const rebased = s ? rebaseOnDisk(ctx, s, D, diskHash, F, rd.stat) : null;
 			await ctx.commit({
 				intentDrop: intent ? [intent.id] : [],
 				syncedPut: rebased ? [rebased.entry] : [],
@@ -160,11 +171,11 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		stat = out.stat;
 		fingerprint = out.fingerprint;
 		diskText = M;
+		hash = writtenHash;
 	}
 
 	// T_synced + T_intent_end. Bound with M ≠ D: no sync point until the editor's save (header).
 	const awaitingSave = h.bound && M !== D;
-	const hash = markdownContentHash(diskText);
 	const base = makeBase(docId, diskText, hash);
 	const entry = ctx.record({
 		docId, path: op.path, pathKey: ctx.pk(op.path), kind: "markdown", contentHash: hash, fingerprint, size: stat.size, mtimeMs: stat.mtimeMs,
@@ -196,8 +207,8 @@ export function trustedEpochBase(base: string | null, crdt: string): string | nu
 	return i === base.length ? base : null;
 }
 
-function rebaseOnDisk(ctx: Env["ctx"], s: SyncedEntry, D: string, F: DiskFingerprint, stat: { size: number; mtimeMs: number }) {
-	const hash = markdownContentHash(D);
+/** `hash` = markdownContentHash(D). */
+function rebaseOnDisk(ctx: Env["ctx"], s: SyncedEntry, D: string, hash: ContentHash, F: DiskFingerprint, stat: { size: number; mtimeMs: number }) {
 	const base = makeBase(s.docId, D, hash);
 	const { fileGone: _gone, ...live } = s; // the disk holds the doc's file
 	const entry = ctx.record({ ...live, contentHash: hash, fingerprint: F, size: stat.size, mtimeMs: stat.mtimeMs, hasBase: base !== null });

@@ -18,8 +18,8 @@
  *    host's result, so WriteOutcome needs no main-thread hashing.
  */
 
-import { bytesToHex } from "../../core/codec/lib0";
 import { canvasContentHash } from "../../core/hash/canvasCanonical";
+import { digestHex } from "../../core/hash/digest";
 import { canonicalizeMarkdown, exactFingerprint } from "../../core/hash/markdownLf";
 import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
 import { kindOfPath, type DiskFingerprint, type VaultPath } from "../../core/types";
@@ -78,19 +78,15 @@ export function utf16LengthOfUtf8(bytes: Uint8Array): number {
 	return units;
 }
 
-async function sha256Hex(hash: HashPort, bytes: Uint8Array): Promise<string> {
-	return bytesToHex(await hash.sha256(bytes));
-}
-
 /** One item: the hash asked for + textLength. */
 export async function hashOne(item: HashRequestItem, hash: HashPort): Promise<HashValue> {
 	const { bytes } = item;
 	const kind = kindOfPath(item.path as VaultPath);
 	if (item.want === "contentHash" && kind === "markdown") {
 		const text = utf8Decode(bytes); // keeps a BOM: canonicalizeMarkdown strips exactly one
-		return { hash: await sha256Hex(hash, utf8Encode(canonicalizeMarkdown(text))), textLength: text.length };
+		return { hash: await digestHex(hash, utf8Encode(canonicalizeMarkdown(text))), textLength: text.length };
 	}
-	const value = item.want === "contentHash" && kind === "canvas" ? canvasContentHash(bytes) : await sha256Hex(hash, bytes);
+	const value = item.want === "contentHash" && kind === "canvas" ? await canvasContentHash(hash, bytes) : await digestHex(hash, bytes);
 	return { hash: value, textLength: utf16LengthOfUtf8(bytes) };
 }
 
@@ -116,13 +112,18 @@ export async function answerHashRequest(items: readonly HashRequestItem[], ports
 }
 
 /** Fingerprint of the bytes a write puts on disk: text as UTF-8 (lone surrogates -> U+FFFD, like the host's writers). */
-export function writeFingerprint(data: DiskWriteData): DiskFingerprint {
-	return exactFingerprint(data.t === "text" ? utf8Encode(data.text) : data.bytes);
+export function writeFingerprint(hash: HashPort, data: DiskWriteData): Promise<DiskFingerprint> {
+	return exactFingerprint(hash, data.t === "text" ? utf8Encode(data.text) : data.bytes);
 }
 
-/** Per op: the fingerprint of its write data (null for other ops). Call BEFORE posting: write bytes are transferred. */
-export function fingerprintWrites(ops: readonly DiskOp[]): (DiskFingerprint | null)[] {
-	return ops.map((op) => (op.t === "write" ? writeFingerprint(op.data) : null));
+/**
+ * Per op: the fingerprint of its write data (null for other ops), one digest at a time. Call BEFORE posting: write
+ * bytes are transferred.
+ */
+export async function fingerprintWrites(hash: HashPort, ops: readonly DiskOp[]): Promise<(DiskFingerprint | null)[]> {
+	const out: (DiskFingerprint | null)[] = [];
+	for (const op of ops) out.push(op.t === "write" ? await writeFingerprint(hash, op.data) : null);
+	return out;
 }
 
 /** Attach the pre-computed fingerprints to the host's results (one result per op, in op order). */

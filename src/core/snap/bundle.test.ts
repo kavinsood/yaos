@@ -7,7 +7,7 @@ import { unzipSync, strFromU8 } from "fflate";
 import type { ContentHash, DocKind, VaultPath } from "../types";
 import { kindOfPath } from "../types";
 import { utf8Encode } from "../codec/lib0";
-import { sha256Hex } from "../hash/sha256";
+import { refHashPort, sha256HexRef } from "../hash/testkit/hashRef";
 import { snapshotId, type SnapRecord } from "./record";
 import { SnapCorrupt, bundleDigest, encodeManifest, type SnapCheck } from "./bundle";
 import { BundleBuilder, bundleRecord } from "./export";
@@ -34,7 +34,7 @@ const FILES: [string, Uint8Array][] = [
 
 async function build(files: readonly [string, Uint8Array][] = FILES, partSize = 16 * 1024) {
 	const parts: Uint8Array[] = [];
-	const b = new BundleBuilder(ID, T0, "manual", partSize, async (p) => { assert.equal(p.index, parts.length); parts.push(p.bytes); });
+	const b = new BundleBuilder(refHashPort, ID, T0, "manual", partSize, async (p) => { assert.equal(p.index, parts.length); parts.push(p.bytes); });
 	for (const [path, data] of files) await b.addFile(path as VaultPath, kindOfPath(path as VaultPath), data);
 	b.skip("huge.bin", "too-large");
 	const built = await b.finish();
@@ -44,7 +44,7 @@ async function build(files: readonly [string, Uint8Array][] = FILES, partSize = 
 
 async function verify(record: SnapRecord, parts: readonly (Uint8Array | null)[]) {
 	const got: VerifiedEntry[] = [];
-	const m = await verifyBundle({ record, part: async (i) => parts[i] ?? null, onEntry: async (e) => { got.push(e); } });
+	const m = await verifyBundle({ hash: refHashPort, record, part: async (i) => parts[i] ?? null, onEntry: async (e) => { got.push(e); } });
 	return { m, got };
 }
 
@@ -57,11 +57,12 @@ async function expectCorrupt(check: SnapCheck, record: SnapRecord, parts: readon
 }
 
 /** Re-cut `zip` into parts and make a record that is consistent with them (a tamperer who rewrote the index too). */
-function consistentRecord(zip: Uint8Array, partSize: number, base: SnapRecord, manifestBytes: Uint8Array, over: Partial<SnapRecord> = {}) {
+async function consistentRecord(zip: Uint8Array, partSize: number, base: SnapRecord, manifestBytes: Uint8Array, over: Partial<SnapRecord> = {}) {
 	const parts: Uint8Array[] = [];
 	for (let o = 0; o < zip.length; o += partSize) parts.push(zip.slice(o, o + partSize));
-	const ps = parts.map((p) => ({ address: sha256Hex(p), size: p.length, sha256: sha256Hex(p) as ContentHash }));
-	return { record: { ...base, parts: ps, bundleDigest: bundleDigest(base.snapshotId, ps, sha256Hex(manifestBytes)), ...over } as SnapRecord, parts };
+	const ps = parts.map((p) => ({ address: sha256HexRef(p), size: p.length, sha256: sha256HexRef(p) as ContentHash }));
+	const digest = await bundleDigest(refHashPort, base.snapshotId, ps, sha256HexRef(manifestBytes));
+	return { record: { ...base, parts: ps, bundleDigest: digest, ...over } as SnapRecord, parts };
 }
 
 async function rawZip(entries: readonly [string, Uint8Array, boolean][]): Promise<Uint8Array> {
@@ -122,7 +123,7 @@ test("verify: truncated bundle under a consistent record", async () => {
 	const { record, parts } = await build();
 	const zip = join(parts);
 	const cut = zip.subarray(0, zip.length - 30);
-	const t = consistentRecord(cut, 16 * 1024, record, new Uint8Array(0));
+	const t = await consistentRecord(cut, 16 * 1024, record, new Uint8Array(0));
 	await expectCorrupt("truncated", t.record, t.parts);
 });
 
@@ -130,13 +131,13 @@ test("verify: bit flip under a consistent record fails the zip crc", async () =>
 	const { record, parts } = await build();
 	const zip = join(parts).slice();
 	zip[30 + "files/Notes/a.md".length + 10]! ^= 0x40; // inside the first entry's (deflated) data
-	const t = consistentRecord(zip, 16 * 1024, record, new Uint8Array(0));
+	const t = await consistentRecord(zip, 16 * 1024, record, new Uint8Array(0));
 	await expectCorrupt("zip-decode", t.record, t.parts);
 });
 
 test("verify: corrupt zip (garbage) and zip-reader strictness", async () => {
 	const { record } = await build();
-	const t = consistentRecord(rand(5000, 3), 16 * 1024, record, new Uint8Array(0));
+	const t = await consistentRecord(rand(5000, 3), 16 * 1024, record, new Uint8Array(0));
 	await expectCorrupt("zip-decode", t.record, t.parts);
 	// Data-descriptor flag, trailing bytes and a short central directory are all rejected.
 	const good = await rawZip([["files/x.md", enc("x"), false], ["manifest.json", enc("{}"), false]]);
@@ -159,15 +160,15 @@ test("verify: manifest mismatch (entry not listed, sizes or hashes differ)", asy
 	const lie = { ...m, files: m.files.map((f, i) => (i === 0 ? { ...f, hash: "00".repeat(32) as ContentHash } : f)) };
 	const mb = encodeManifest(lie);
 	const zip = await rawZip([...FILES.map(([p, d]): [string, Uint8Array, boolean] => [`files/${p}`, d, kindOfPath(p as VaultPath) !== "blob"]), ["manifest.json", mb, true]]);
-	const t = consistentRecord(zip, 16 * 1024, record, mb);
+	const t = await consistentRecord(zip, 16 * 1024, record, mb);
 	await expectCorrupt("manifest-mismatch", t.record, t.parts);
 	// Manifest that disagrees with the index record (fileCount).
 	const ok = encodeManifest(m);
 	const zip2 = await rawZip([...FILES.map(([p, d]): [string, Uint8Array, boolean] => [`files/${p}`, d, false]), ["manifest.json", ok, true]]);
-	const t2 = consistentRecord(zip2, 16 * 1024, record, ok, { fileCount: FILES.length + 1 });
+	const t2 = await consistentRecord(zip2, 16 * 1024, record, ok, { fileCount: FILES.length + 1 });
 	await expectCorrupt("manifest-mismatch", t2.record, t2.parts);
 	// Bundle digest that does not bind the manifest.
-	const t3 = consistentRecord(zip2, 16 * 1024, record, enc("other"));
+	const t3 = await consistentRecord(zip2, 16 * 1024, record, enc("other"));
 	await expectCorrupt("bundle-digest", t3.record, t3.parts);
 });
 
@@ -192,7 +193,7 @@ test("verify: manifest that fails the strict schema (bad JSON, version, id, file
 		const entries = (mb === bad.at(-1) ? [FILES[0]!, FILES[0]!, ...FILES.slice(2)] : FILES)
 			.map(([p, d]): [string, Uint8Array, boolean] => [`files/${p}`, d, false]);
 		const zip = await rawZip([...entries, ["manifest.json", mb, true]]);
-		const t = consistentRecord(zip, 16 * 1024, record, mb, mb === bad.at(-1) ? { totalBytes: record.totalBytes - FILES[1]![1].length + FILES[0]![1].length } : {});
+		const t = await consistentRecord(zip, 16 * 1024, record, mb, mb === bad.at(-1) ? { totalBytes: record.totalBytes - FILES[1]![1].length + FILES[0]![1].length } : {});
 		await expectCorrupt("manifest-invalid", t.record, t.parts);
 	}
 });
@@ -217,7 +218,7 @@ test("verify: second pass checks entries against the verified manifest", async (
 	const { m } = await verify(record, parts);
 	const lie = { ...m, files: m.files.map((f, i) => (i === 1 ? { ...f, size: f.size + 1 } : f)) };
 	const seen: string[] = [];
-	await assert.rejects(verifyBundle({ record, part: async (i) => parts[i]!, expect: lie, onEntry: async (e) => { seen.push(e.path); } }),
+	await assert.rejects(verifyBundle({ hash: refHashPort, record, part: async (i) => parts[i]!, expect: lie, onEntry: async (e) => { seen.push(e.path); } }),
 		(e: unknown) => e instanceof SnapCorrupt && e.check === "file-hash");
 	assert.deepEqual(seen, [FILES[0]![0]]);
 });

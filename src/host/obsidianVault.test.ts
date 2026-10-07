@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { exactFingerprint, markdownContentHash } from "../core/hash/markdownLf";
+import { fingerprintRef, markdownHashRef } from "../core/hash/testkit/hashRef";
 import { utf8Encode } from "../core/hash/utf8";
 import type { DiskFingerprint, VaultPath } from "../core/types";
 import type { VaultEvent } from "../ports/vault";
@@ -12,7 +12,7 @@ import { followObsidianSystemTrash, ObsidianVault } from "./obsidianVault";
 const P = (p: string) => p as VaultPath;
 const utf8 = utf8Encode;
 /** Test-side reference hashing (core, in-process); the vault itself only asks its HashOracle. */
-const fp = (t: string) => exactFingerprint(utf8(t));
+const fp = (t: string) => fingerprintRef(utf8(t));
 
 function setup(insensitive = false) {
 	const fake = new FakeObsidianVault(insensitive);
@@ -34,7 +34,7 @@ test("write honours absent / fingerprint / hash / any and never writes on a fail
 	assert.equal(good.ok, true);
 	assert.equal(fake.text("n/a.md"), "two");
 	fake.put("n/a.md", "\uFEFFtwo\r\n");
-	const h = markdownContentHash("two\n");
+	const h = markdownHashRef("two\n");
 	const viaHash = await vault.write(P("n/a.md"), "three", { t: "hash", hash: h });
 	assert.equal(viaHash.ok, true, "logical hash ignores BOM and CRLF");
 	assert.equal((await vault.write(P("n/a.md"), "four", { t: "any" })).ok, true);
@@ -63,7 +63,7 @@ test("binary CAS rechecks the stat before modifyBinary", async () => {
 		fake.afterReadBinary = null;
 		fake.put(p, new Uint8Array([9, 9, 9, 9]));
 	};
-	const pre = { t: "fingerprint" as const, fingerprint: exactFingerprint(new Uint8Array([1, 2, 3])) };
+	const pre = { t: "fingerprint" as const, fingerprint: fingerprintRef(new Uint8Array([1, 2, 3])) };
 	const r = await vault.write(P("img.png"), new Uint8Array([7]), pre);
 	assert.equal(r.ok === false && r.reason, "precondition");
 	assert.deepEqual([...(fake.files.get("img.png")?.bytes ?? [])], [9, 9, 9, 9]);
@@ -89,7 +89,7 @@ test("race (i): a stat-visible change after the engine answered fails the precon
 	assert.equal(fake.text("a.md"), "BASE");
 	assert.ok(!fake.calls.includes("process a.md"), "never reaches vault.process");
 	change = () => fake.put("b.png", new Uint8Array([3, 4]));
-	const b = await vault.write(P("b.png"), new Uint8Array([7]), { t: "fingerprint", fingerprint: exactFingerprint(new Uint8Array([1, 2])) });
+	const b = await vault.write(P("b.png"), new Uint8Array([7]), { t: "fingerprint", fingerprint: fingerprintRef(new Uint8Array([1, 2])) });
 	assert.equal(b.ok === false && b.reason, "precondition");
 	assert.deepEqual([...bytesOf(fake, "b.png")], [3, 4]);
 	change = () => fake.put("a.md", "BASE!");
@@ -105,12 +105,12 @@ test("race (ii): a length-changing change after the stat recheck is caught by th
 	const { fake, vault } = setup();
 	fake.put("a.md", "\uFEFFbase\r\n"); // BOM kept on both sides: textLength 7 = what process hands the callback
 	fake.beforeProcess = (p) => silently(fake, p, "\uFEFFbase\r\nuser line\r\n");
-	const r = await vault.write(P("a.md"), "sync", { t: "hash", hash: markdownContentHash("base\n") });
+	const r = await vault.write(P("a.md"), "sync", { t: "hash", hash: markdownHashRef("base\n") });
 	assert.equal(r.ok === false && r.reason, "precondition");
 	assert.equal(fake.text("a.md"), "\uFEFFbase\r\nuser line\r\n");
 	fake.beforeProcess = null;
 	fake.put("a.md", "\uFEFFbase\r\n");
-	assert.equal((await vault.write(P("a.md"), "sync", { t: "hash", hash: markdownContentHash("base\n") })).ok, true, "unchanged BOM file passes the guard");
+	assert.equal((await vault.write(P("a.md"), "sync", { t: "hash", hash: markdownHashRef("base\n") })).ok, true, "unchanged BOM file passes the guard");
 });
 
 test("race (iii), the accepted gap: a same-length change not visible in stat is overwritten", async () => {
@@ -124,7 +124,7 @@ test("race (iii), the accepted gap: a same-length change not visible in stat is 
 	assert.equal(fake.text("a.md"), "sync");
 	fake.put("b.png", new Uint8Array([1, 2]));
 	const bin = new ObsidianVault(fake, oracleThen(() => { bytesOf(fake, "b.png").set([3, 4]); }), false);
-	assert.equal((await bin.write(P("b.png"), new Uint8Array([7]), { t: "fingerprint", fingerprint: exactFingerprint(new Uint8Array([1, 2])) })).ok, true);
+	assert.equal((await bin.write(P("b.png"), new Uint8Array([7]), { t: "fingerprint", fingerprint: fingerprintRef(new Uint8Array([1, 2])) })).ok, true);
 	assert.deepEqual([...bytesOf(fake, "b.png")], [7]);
 });
 

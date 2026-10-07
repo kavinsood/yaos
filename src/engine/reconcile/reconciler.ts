@@ -13,7 +13,7 @@
  */
 
 import type { BrakeReport, DocId, PathKey, PlanScope, PlannerInput, PlannerOp } from "../../core/types";
-import { brakeId, rejectHeld } from "../../core/plan/brake";
+import { brakeId, brakeIdentity, rejectHeld } from "../../core/plan/brake";
 import { planWith } from "../../core/plan/planner";
 import type { VaultEvent } from "../../ports/vault";
 import type { LocalObservation } from "../../protocol/messages";
@@ -60,14 +60,14 @@ export interface PassReport extends RunReport {
 export class Reconciler {
 	private lastJobBrake: { id: string; keys: string[] } | null = null;
 	/** Ops the planner held for the current brake report (rejectBrake turns them into their opposites). */
-	private lastHeld: { id: string; ops: readonly PlannerOp[] } | null = null;
+	private lastHeld: { id: string; identity: string; ops: readonly PlannerOp[] } | null = null;
 	lastPlan: readonly PlannerOp[] = [];
 	private readonly skips = new SkipNoticeGate();
 
 	private constructor(readonly ctx: Ctx, readonly scan: Scanner, private readonly env: Env) {}
 
 	static async open(deps: ReconcilerDeps): Promise<Reconciler> {
-		const store = await ReconcileStore.open(deps.db);
+		const store = await ReconcileStore.open(deps.db, deps.hash);
 		const ctx = new Ctx(deps, store);
 		const scan = new Scanner(ctx);
 		scan.load();
@@ -92,14 +92,14 @@ export class Reconciler {
 		return applyOwnFold(this.ctx, events);
 	}
 
-	/** Approve a brake report (planner-level or job-level overwrite brake). */
+	/** Approve a brake report (planner-level or job-level overwrite brake); an id no report of this runtime has is ignored. */
 	approveBrake(id: string): void {
 		if (this.lastJobBrake && this.lastJobBrake.id === id) {
 			for (const k of this.lastJobBrake.keys) this.env.approvedOverwrites.add(k);
 			this.lastJobBrake = null;
 			return;
 		}
-		this.ctx.brakeApproval = id;
+		if (this.lastHeld && this.lastHeld.id === id) this.ctx.brakeApproval = this.lastHeld.identity;
 	}
 
 	/**
@@ -162,6 +162,7 @@ export class Reconciler {
 		const openIntents = await resumeIntents(this.env);
 		await this.scan.hashPending();
 		await recoverTempNames(this.env);
+		await ctx.log.warmTextHashes();
 		// S1 for own ops that folded up to now, the awaits above included. Nothing may await between the last
 		// drain and the view read: a plan that sees a folded own op before its S1 update writes S from the new
 		// entry (a materialize at a suffixed restore path, a loser rename), and the late S1 then moves S back
@@ -185,9 +186,13 @@ export class Reconciler {
 			...(ctx.deps.pathBaseKeys ? { pathBaseKeys: ctx.deps.pathBaseKeys } : {}),
 		});
 		this.lastPlan = plan.ops;
+		let brake: BrakeReport | null = null;
 		if (plan.brake) {
-			this.lastHeld = { id: plan.brake.id, ops: plan.held };
-			ctx.deps.onBrake?.(plan.brake);
+			const { identity, ...report } = plan.brake;
+			const id = this.lastHeld?.identity === identity ? this.lastHeld.id : await brakeId(ctx.deps.hash, identity);
+			brake = { id, ...report };
+			this.lastHeld = { id, identity, ops: plan.held };
+			ctx.deps.onBrake?.(brake);
 		} else {
 			if (scope.t === "full") this.lastHeld = null;
 			ctx.brakeApproval = null;
@@ -206,10 +211,9 @@ export class Reconciler {
 			// Onboarding / the first pass after start has planned its creates with the hold: later creates are live.
 			if (scope.t === "full") ctx.liveCreates = true;
 		}
-		let brake = plan.brake;
 		if (this.env.heldOverwrites.length > 0) {
 			const units = this.env.heldOverwrites.map((h) => ({ ops: [], destructive: "overwrite" as const, brakeKey: h.key, path: h.path }));
-			const id = brakeId(units);
+			const id = await brakeId(ctx.deps.hash, brakeIdentity(units));
 			this.lastJobBrake = { id, keys: units.map((u) => u.brakeKey) };
 			const report: BrakeReport = {
 				id, reason: "mass-overwrite", heldCount: units.length, syncedCount: ctx.store.synced.size,

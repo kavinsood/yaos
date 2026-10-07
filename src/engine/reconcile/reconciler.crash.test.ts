@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { VaultPath } from "../../core/types";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { assertConverged, crashPoints, label, runCrashed } from "./testkit/crash";
 import { World } from "./testkit/world";
 
@@ -75,7 +75,7 @@ test("crash at every point of a mixed sync: remote rename+edit, merge, delete, c
 		assert.equal(snap["dir/b.md"], "a\na2\n", where);
 		assert.equal(snap["x.md"], "x0\nx1\nx2\nx3\n", where);
 		assert.equal(snap["local.md"], "l\n", where);
-		assert.equal(sha256Hex(w.vault.bytesOf("pic.png")!), sha256Hex(pic), where);
+		assert.equal(sha256HexRef(w.vault.bytesOf("pic.png")!), sha256HexRef(pic), where);
 		assert.equal(w.vault.trashed.length, 1, `${where}: trashed ${w.vault.trashed.map((t) => t.path).join(",")}`);
 		// Gap (recorded): folders emptied before a crash are not remembered, so only the uncrashed run removes them.
 		if (where === "dry") assert.equal(w.vault.hasFolder("old"), false, `${where}: emptied folder left behind`);
@@ -103,7 +103,7 @@ test("crash at every point of a blob keep-both", async () => {
 		const copies = w.conflictCopies();
 		assert.equal(copies.length, 1, `${where}: copies ${JSON.stringify(copies)}`);
 		assert.deepEqual(w.vault.bytesOf(copies[0]!), mine, where);
-		assert.ok(w.blobs!.server.has(sha256Hex(mine)), where);
+		assert.ok(w.blobs!.server.has(sha256HexRef(mine)), where);
 	});
 });
 

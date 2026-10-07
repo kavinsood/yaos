@@ -142,13 +142,14 @@ export async function diskMaterialize(env: Env, op: Op<"diskMaterialize">): Prom
 	try {
 		const text = h.doc.getText("text").toString();
 		const version = h.version();
+		// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.
+		const hash = await markdownContentHash(ctx.deps.hash, text);
 		const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "text", text }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });
 		const out = writeOk(res);
 		if (!out) {
 			env.scan.markDirty(op.path, null);
 			return "fail";
 		}
-		const hash = markdownContentHash(text);
 		const base = makeBase(op.docId, text, hash);
 		ctx.echo.expectWrite(ctx.pk(op.path), out.stat.size, out.stat.mtimeMs);
 		const entry = ctx.record({

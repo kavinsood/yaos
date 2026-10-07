@@ -135,7 +135,7 @@ export class Scanner {
 					put.push({ ...e, excluded: true, size: r.stat.size, mtimeMs: r.stat.mtimeMs });
 					continue;
 				}
-				const h = hashBytes(c.kind, r.bytes);
+				const h = await hashBytes(this.ctx.deps.hash, c.kind, r.bytes);
 				put.push({ ...e, diskPath: r.stat.path, path: c.path, kind: c.kind, size: r.stat.size, mtimeMs: r.stat.mtimeMs, hash: h.hash, fingerprint: h.fingerprint, hashedAtMs: this.ctx.now(), excluded: false });
 				done++;
 			}

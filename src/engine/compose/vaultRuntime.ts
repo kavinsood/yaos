@@ -240,7 +240,7 @@ export class VaultRuntime {
 			wake: (who) => this.sched.request({ t: "docs", docIds: who.map((w) => w.docId), pathKeys: who.map((w) => pathKey(w.path)) }),
 		});
 		this.rec = await Reconciler.open({
-			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, blobs: this.blobs,
+			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, hash: ports.hash, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
 			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
 			pathBaseKeys: o.pathBases ? new Set(o.pathBases.keys()) : undefined,
@@ -253,10 +253,10 @@ export class VaultRuntime {
 		});
 		await this.rec.start();
 		if (this.settings.syncSettings) {
-			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp });
+			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, hash: ports.hash, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp });
 		}
 		this.snaps = new SnapshotJob({
-			disk: link.disk, side: link.sideFiles, clock: ports.clock, crypto, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,
+			disk: link.disk, side: link.sideFiles, clock: ports.clock, crypto, hash: ports.hash, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,
 			remote: blob ? { store: blob, index: this.port.snap, touch: c.touch } : null,
 			pathKey, deviceLabel: config.deviceLabel, tzOffsetMinutes: tz, notice: this.notice, diag: (l) => this.diag(l),
 		});

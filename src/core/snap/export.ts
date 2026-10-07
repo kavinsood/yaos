@@ -5,9 +5,10 @@
  * Paths and contents are not checked here: the caller filters what it adds (restore checks everything again).
  */
 
+import type { HashPort } from "../../ports/crypto";
 import type { ContentHash, DocKind, VaultPath } from "../types";
+import { digestHex } from "../hash/digest";
 import { exactFingerprint } from "../hash/markdownLf";
-import { sha256Hex } from "../hash/sha256";
 import { SNAP_FORMAT_ZIP1, SNAP_RECORD_VERSION, clampSnapLabel, type SnapReason, type SnapRecord } from "./record";
 import {
 	PartCutter, SNAP_ENTRY_PREFIX, SNAP_MANIFEST, bundleDigest, encodeManifest,
@@ -31,13 +32,14 @@ export class BundleBuilder {
 	private total = 0;
 
 	constructor(
+		private readonly hash: HashPort,
 		readonly id: string,
 		readonly createdAtMs: number,
 		readonly reason: SnapReason,
 		partSize: number,
 		onPart: (p: CutPart) => Promise<void>,
 	) {
-		this.cutter = new PartCutter(partSize, onPart);
+		this.cutter = new PartCutter(hash, partSize, onPart);
 		this.zip = new ZipWriter((chunk) => this.cutter.push(chunk));
 	}
 
@@ -46,7 +48,8 @@ export class BundleBuilder {
 
 	async addFile(path: VaultPath, kind: DocKind, data: Uint8Array): Promise<void> {
 		await this.zip.add(SNAP_ENTRY_PREFIX + path, data, kind !== "blob");
-		this.files.push({ path, kind, hash: exactFingerprint(data) as string as ContentHash, size: data.length });
+		const hash = (await exactFingerprint(this.hash, data)) as string as ContentHash;
+		this.files.push({ path, kind, hash, size: data.length });
 		this.total += data.length;
 	}
 
@@ -61,7 +64,8 @@ export class BundleBuilder {
 		await this.zip.finish();
 		await this.cutter.end();
 		const parts = this.cutter.parts;
-		return { manifest, parts, bundleDigest: bundleDigest(this.id, parts, sha256Hex(mbytes)), zipBytes: this.zip.bytesWritten, totalBytes: this.total };
+		const digest = await bundleDigest(this.hash, this.id, parts, await digestHex(this.hash, mbytes));
+		return { manifest, parts, bundleDigest: digest, zipBytes: this.zip.bytesWritten, totalBytes: this.total };
 	}
 }
 

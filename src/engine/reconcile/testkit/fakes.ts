@@ -2,7 +2,7 @@
 
 import type { ContentHash, DocId, VaultPath } from "../../../core/types";
 import { prng } from "../../../core/merge/prng";
-import { sha256Hex } from "../../../core/hash/sha256";
+import { sha256HexRef } from "../../../core/hash/testkit/hashRef";
 import type { ClockPort, TimerHandle } from "../../../ports/clock";
 import type { RandomPort } from "../../../ports/random";
 import type { BlobReq, BlobTransfer, DownloadClaim, UploadClaim, UploadSource } from "../context";
@@ -84,7 +84,7 @@ export class FakeBlobs implements BlobTransfer {
 	constructor(readonly maxBlobBytes = 8 * 1024 * 1024) {}
 
 	put(bytes: Uint8Array): ContentHash {
-		const hash = sha256Hex(bytes) as ContentHash;
+		const hash = sha256HexRef(bytes) as ContentHash;
 		this.server.set(hash, bytes.slice());
 		return hash;
 	}
@@ -106,7 +106,7 @@ export class FakeBlobs implements BlobTransfer {
 		return this.start(key, req, async () => {
 			const bytes = await source.read();
 			if (!bytes) return void this.backingOff.add(key);
-			if (sha256Hex(bytes) !== req.hash) return source.changed();
+			if (sha256HexRef(bytes) !== req.hash) return source.changed();
 			if (await this.upload({ hash: req.hash, docId: req.docId, path: req.path, bytes })) this.confirmed.add(req.hash);
 			else if (!this.refusedHashes.has(req.hash)) this.backingOff.add(key);
 		}) ?? "busy";

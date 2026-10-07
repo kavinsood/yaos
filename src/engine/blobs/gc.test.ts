@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
 import { RELAY_HTTP_BASE_MS } from "../../core/deadline";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import type { ContentHash } from "../../core/types";
 import { BLOB_DELETE_BATCH, type BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort } from "../../ports/crypto";
@@ -27,7 +27,7 @@ const hashPort = createWebHash();
 const noop = createNoopCrypto(hashPort);
 
 const bytesOf = (i: number) => Uint8Array.from({ length: 16 }, (_, j) => (j === 0 ? i >> 8 : j === 1 ? i : i * 7 + j) & 0xff);
-const H = (b: Uint8Array) => sha256Hex(b) as ContentHash;
+const H = (b: Uint8Array) => sha256HexRef(b) as ContentHash;
 
 interface Rig {
 	readonly store: SimBlobStore;
@@ -374,7 +374,7 @@ test("suite 1: live hashes are compared as HMAC addresses; no plaintext hash rea
 test("HTTP adapter: list and delete retry 429 / 503 list_incomplete after Retry-After within one sweep", async () => {
 	const objects = new Map<string, number>();
 	const NOW = 1_800_000_000_000;
-	const addr = (i: number) => sha256Hex(bytesOf(i));
+	const addr = (i: number) => sha256HexRef(bytesOf(i));
 	for (let i = 0; i < 120; i++) objects.set(addr(i), NOW - GRACE - DAY);
 	let lists = 0;
 	let deletes = 0;

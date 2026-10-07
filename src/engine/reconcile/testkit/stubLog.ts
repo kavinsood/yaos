@@ -10,7 +10,8 @@
  *    rows + own committed frames. MERGE-origin updates are framed only by
  *    commitEdits() (T_edit); crash() drops replicas and unframed updates.
  *  - remote devices: remoteCreate / remoteEdit / remoteEditCanvas / remoteRename / remoteDelete / remoteSetBlob.
- *  - textHash: markdownContentHash of the text, canvasDocHash for canvas docs.
+ *  - textHash: markdownContentHash of the text, the canvas logical hash for canvas docs (testkit/hashRef.ts:
+ *    synchronous, so warmTextHashes has nothing to do).
  * The real implementation is WP-C's; nothing here is shipped.
  */
 
@@ -19,12 +20,11 @@ import type {
 	BodyVersion, ContentHash, DocId, DocKind, NsBlobRef, NsEntryState, NsOp, NsOpOutcome, PathKey, RemoteEntry, Seq, StreamName, VaultPath,
 } from "../../../core/types";
 import { kindOfPath } from "../../../core/types";
-import { canvasContentHash, parseCanvasText, rankCanvasInFileOrder } from "../../../core/hash/canvasCanonical";
-import { markdownContentHash } from "../../../core/hash/markdownLf";
-import { sha256Hex } from "../../../core/hash/sha256";
+import { parseCanvasText, rankCanvasInFileOrder } from "../../../core/hash/canvasCanonical";
+import { canvasHashRef, markdownHashRef, sha256HexRef } from "../../../core/hash/testkit/hashRef";
 import { utf8Encode, utf8Length } from "../../../core/hash/utf8";
 import { joinPath, leafOf, parentOf, splitExt, standInPathKey } from "../../../core/plan/pathRules";
-import { applyCanvas, canvasDocHash, projectCanvasBytes } from "../canvasDoc";
+import { applyCanvas, canvasDocHashInput, projectCanvasBytes } from "../canvasDoc";
 import type { BodyHandle, LogPort, OwnFoldEvent, RemoteView, SubmitNsOptions } from "../deps";
 
 export const REMOTE = Symbol("REMOTE");
@@ -62,6 +62,12 @@ interface Body {
 
 function clone(e: Entry): Entry {
 	return { ...e, blob: e.blob ? { ...e.blob } : null };
+}
+
+/** The canvas doc's textHash (the digest of canvasDocHashInput), or null when it does not project. */
+function canvasDocTextHash(doc: Y.Doc): ContentHash | null {
+	const input = canvasDocHashInput(doc);
+	return input === null ? null : (sha256HexRef(input) as ContentHash);
 }
 
 export class StubLog implements LogPort {
@@ -276,6 +282,11 @@ export class StubLog implements LogPort {
 		};
 	}
 
+	/** view() takes every textHash synchronously (testkit/hashRef.ts). */
+	warmTextHashes(): Promise<void> {
+		return Promise.resolve();
+	}
+
 	view(): RemoteView {
 		// Optimistic overlay: committed entries + held own ops at pseudo-seqs.
 		const overlay = new Map<DocId, Entry>();
@@ -298,7 +309,7 @@ export class StubLog implements LogPort {
 			const b = this.bodies.get(e.docId);
 			if (b && e.kind !== "blob") {
 				appliedSeq.set(e.docId, b.maxRowSeq);
-				const h = !b.caughtUp ? null : e.kind === "canvas" ? canvasDocHash(this.canvasDoc(e.docId)) : markdownContentHash(this.text(e.docId));
+				const h = !b.caughtUp ? null : e.kind === "canvas" ? canvasDocTextHash(this.canvasDoc(e.docId)) : markdownHashRef(this.text(e.docId));
 				if (h !== null) textHash.set(e.docId, h);
 				if (b.unframed.length > 0) docsWithPendingBody.add(e.docId);
 			}
@@ -412,7 +423,7 @@ export class StubLog implements LogPort {
 		const kind = kindOfPath(path);
 		if (kind === "blob") {
 			const bytes = content as Uint8Array;
-			const hash = sha256Hex(bytes) as ContentHash;
+			const hash = sha256HexRef(bytes) as ContentHash;
 			this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: hash, size: bytes.length }, ++this.seq);
 			return docId;
 		}
@@ -420,7 +431,7 @@ export class StubLog implements LogPort {
 		if (kind === "canvas") {
 			const parsed = parseCanvasText(text);
 			if (parsed.kind !== "valid") throw new Error(`remoteCreate: invalid canvas ${parsed.kind}`);
-			const hash = canvasContentHash(utf8Encode(text));
+			const hash = canvasHashRef(utf8Encode(text));
 			this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: hash, size: utf8Length(text) }, ++this.seq);
 			const ranked = rankCanvasInFileOrder(parsed.data);
 			if (parsed.data.nodes.size + parsed.data.edges.size + Object.keys(parsed.data.rootFields).length > 0) {
@@ -428,7 +439,7 @@ export class StubLog implements LogPort {
 			} else this.ensureBody(docId);
 			return docId;
 		}
-		this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: markdownContentHash(text), size: utf8Length(text) }, ++this.seq);
+		this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: markdownHashRef(text), size: utf8Length(text) }, ++this.seq);
 		if (text.length > 0) this.remoteRow(docId, (d) => d.getText("text").insert(0, text));
 		else this.ensureBody(docId);
 		return docId;
@@ -440,7 +451,7 @@ export class StubLog implements LogPort {
 
 	/** A remote markdown create whose initial body frames have not arrived (caught up, no content); remoteEdit delivers them. */
 	remoteCreateBodyless(path: VaultPath, text: string, docId: DocId = this.freshId()): DocId {
-		this.foldOp(this.entries, { t: "create", docId, kind: "markdown", path, contentHash: markdownContentHash(text), size: utf8Length(text) }, ++this.seq);
+		this.foldOp(this.entries, { t: "create", docId, kind: "markdown", path, contentHash: markdownHashRef(text), size: utf8Length(text) }, ++this.seq);
 		this.ensureBody(docId);
 		return docId;
 	}
@@ -461,7 +472,7 @@ export class StubLog implements LogPort {
 
 	remoteSetBlob(docId: DocId, bytes: Uint8Array): NsOpOutcome {
 		const e = this.entries.get(docId);
-		return this.foldOp(this.entries, { t: "setBlob", docId, hash: sha256Hex(bytes) as ContentHash, size: bytes.length, baseRev: e?.blob?.rev ?? 0 }, ++this.seq);
+		return this.foldOp(this.entries, { t: "setBlob", docId, hash: sha256HexRef(bytes) as ContentHash, size: bytes.length, baseRev: e?.blob?.rev ?? 0 }, ++this.seq);
 	}
 
 	entry(docId: DocId): RemoteEntry | null {

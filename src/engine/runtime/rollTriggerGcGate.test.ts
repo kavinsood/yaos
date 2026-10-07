@@ -12,7 +12,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { KEYRING_STREAM, NS_STREAM, type ContentHash, type DocId, type NsOp, type VaultPath } from "../../core/types";
 import type { BlobAddress } from "../../ports/crypto";
 import type { RelayPort, RelaySession } from "../../ports/relay";
@@ -31,7 +31,7 @@ import { startTestEngine, testPorts, testStorage, until } from "./testHarness";
 
 const GRACE = 60 * 60_000;
 const T0 = Date.UTC(2026, 9, 1);
-const H = (b: Uint8Array) => sha256Hex(b) as ContentHash;
+const H = (b: Uint8Array) => sha256HexRef(b) as ContentHash;
 const bytesOf = (i: number): Uint8Array => Uint8Array.from({ length: 48 }, (_, j) => (j === 0 ? i >> 8 : j === 1 ? i : i * 7 + j) & 0xff);
 let docN = 0;
 const newDoc = () => `rtgdoc${String(++docN).padStart(16, "0")}` as DocId;

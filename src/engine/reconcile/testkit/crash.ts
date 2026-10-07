@@ -6,9 +6,8 @@
  * before / after the n-th commit), reboots, syncs, and returns the world.
  */
 
-import { canvasContentHash } from "../../../core/hash/canvasCanonical";
-import { sha256Hex } from "../../../core/hash/sha256";
-import { canvasDocHash } from "../canvasDoc";
+import { canvasHashRef, sha256HexRef } from "../../../core/hash/testkit/hashRef";
+import { canvasDocHashInput } from "../canvasDoc";
 import type { VaultPath } from "../../../core/types";
 import { CrashError } from "./fakeGateway";
 import type { World } from "./world";
@@ -83,12 +82,14 @@ export async function assertConverged(w: World, where: string): Promise<void> {
 		if (r.kind === "canvas") {
 			const b = w.vault.bytesOf(r.path);
 			ok(b, `${where}: ${r.path} missing on disk`);
-			eq(canvasContentHash(b), canvasDocHash(w.log.canvasDoc(r.docId)), `${where}: ${r.path} disk != canvas crdt`);
+			const input = canvasDocHashInput(w.log.canvasDoc(r.docId));
+			ok(input, `${where}: ${r.path} canvas crdt does not project`);
+			eq<string>(canvasHashRef(b), sha256HexRef(input), `${where}: ${r.path} disk != canvas crdt`);
 		}
 		if (r.kind === "blob") {
 			const b = w.vault.bytesOf(r.path);
 			ok(b, `${where}: ${r.path} missing on disk`);
-			eq(sha256Hex(b), r.blob!.hash, `${where}: ${r.path} bytes != blob`);
+			eq<string>(sha256HexRef(b), r.blob!.hash, `${where}: ${r.path} bytes != blob`);
 		}
 		const s = w.synced(r.docId);
 		ok(s, `${where}: no synced record for ${r.path}`);

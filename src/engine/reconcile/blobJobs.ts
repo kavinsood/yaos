@@ -37,7 +37,7 @@ export async function conflictCopy(env: Env, op: Op<"conflictCopy">): Promise<Jo
 		env.scan.markDirty(src, null);
 		return "fail";
 	}
-	const h = hashBytes("blob", r.bytes);
+	const h = await hashBytes(ctx.deps.hash, "blob", r.bytes);
 	if (h.hash !== op.expect.hash) {
 		env.scan.markDirty(src, r.stat);
 		return "fail";

@@ -1,6 +1,8 @@
 /**
  * Settings projection planner (DESIGN §j.3). Pure: local snapshot + cfgBase +
  * cfg view (committed fold with own pending ops overlaid) -> per-file actions.
+ * Digests go through the HashPort given (one at a time); the inputs are
+ * snapshots, so nothing changes under the plan while it awaits.
  *
  * Per register (json key, plugin id, file):
  *   local == view                       -> in sync; base := local.
@@ -28,11 +30,13 @@
  * op, no write, cfgBase untouched. Removals and local deletes are never held.
  */
 import { canonicalJson, type JsonValue } from "../../core/hash/canvasCanonical";
+import { digestHex } from "../../core/hash/digest";
 import { exactFingerprint } from "../../core/hash/markdownLf";
 import { sha256Hex } from "../../core/hash/sha256";
 import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
 import { CFG_MAX_FILE_BYTES, CFG_MAX_FILES, CFG_MAX_TOTAL_BYTES } from "../../core/limits";
 import type { CfgFoldState, CfgOp, CfgRegister, ConfigRelPath, ContentHash, DiskFingerprint } from "../../core/types";
+import type { HashPort } from "../../ports/crypto";
 import type { CfgBaseRecord } from "../store/schema";
 import { CFG_INLINE_MAX_BYTES, CFG_PLUGINS_FILE, canApplyPluginData, classifyConfigPath, isDeviceLocalKey, isSyncablePluginId, type CfgFileClass } from "./allowlist";
 
@@ -50,6 +54,7 @@ export interface CfgLocalSnapshot {
 	readonly held: ReadonlyMap<ConfigRelPath, CfgHoldReason>;
 }
 export interface CfgPlanInput {
+	readonly hash: HashPort;
 	readonly local: CfgLocalSnapshot;
 	readonly base: ReadonlyMap<ConfigRelPath, CfgBaseRecord>;
 	readonly view: CfgFoldState;
@@ -88,8 +93,9 @@ export interface CfgPlan {
 	readonly skipped: readonly { readonly file: ConfigRelPath; readonly key: string | null; readonly reason: CfgSkipReason }[];
 }
 
-const hashText = (s: string): ContentHash => sha256Hex(utf8Encode(s)) as ContentHash;
-const H_TRUE = hashText("true");
+const hashText = async (hash: HashPort, s: string): Promise<ContentHash> => (await digestHex(hash, utf8Encode(s))) as ContentHash;
+/** Key hash of an enabled plugin: sha256 of the 4 bytes "true", fixed, so core's pure-JS sha256 takes it. */
+const H_TRUE = sha256Hex(utf8Encode("true")) as ContentHash;
 
 type Skips = { file: ConfigRelPath; key: string | null; reason: CfgSkipReason }[];
 
@@ -113,7 +119,7 @@ export class CfgBudget {
 	close(): void { this.closed = true; }
 }
 
-export function planCfg(input: CfgPlanInput): CfgPlan {
+export async function planCfg(input: CfgPlanInput): Promise<CfgPlan> {
 	const jsonByFile = new Map<ConfigRelPath, Map<string, CfgRegister<string>>>();
 	for (const [k, reg] of input.view.json) {
 		const cut = k.indexOf("\u0000");
@@ -138,10 +144,10 @@ export function planCfg(input: CfgPlanInput): CfgPlan {
 			continue;
 		}
 		const base = input.base.get(file);
-		const ctx: FileCtx = { file, local: input.local.files.get(file), base, firstContact: base === undefined && !input.preferLocal, nowMs: input.nowMs, skipped: [] };
-		const a = cls.t === "json" ? planJson(ctx, jsonByFile.get(file) ?? new Map())
-			: cls.t === "plugins" ? planPlugins(ctx, input.view, input.local, input.mobile)
-			: planFile(ctx, cls, input.view, input.local.installed);
+		const ctx: FileCtx = { hash: input.hash, file, local: input.local.files.get(file), base, firstContact: base === undefined && !input.preferLocal, nowMs: input.nowMs, skipped: [] };
+		const a = cls.t === "json" ? await planJson(ctx, jsonByFile.get(file) ?? new Map())
+			: cls.t === "plugins" ? await planPlugins(ctx, input.view, input.local, input.mobile)
+			: await planFile(ctx, cls, input.view, input.local.installed);
 		const w = a?.write;
 		const after = !w ? ctx.local?.bytes.length ?? null : w.t === "bytes" ? w.bytes.length : w.t === "blob" ? w.size : null;
 		if (!budget.admit(after)) {
@@ -155,6 +161,7 @@ export function planCfg(input: CfgPlanInput): CfgPlan {
 }
 
 interface FileCtx {
+	readonly hash: HashPort;
 	readonly file: ConfigRelPath;
 	readonly local: CfgLocalFile | undefined;
 	readonly base: CfgBaseRecord | undefined;
@@ -175,9 +182,10 @@ function parseJson(bytes: Uint8Array): unknown {
 	try { return JSON.parse(text) as unknown; } catch { return undefined; }
 }
 
-function record(file: ConfigRelPath, bytes: Uint8Array | null, mtimeMs: number, keyHashes: Record<string, ContentHash> | null): CfgBaseRecord | null {
-	if (!bytes) return null;
-	return { file, fingerprint: exactFingerprint(bytes), size: bytes.length, mtimeMs, keyHashes };
+/** cfgBase of `bytes`, whose fingerprint is `fingerprint` (null = absent: drop). */
+function record(file: ConfigRelPath, bytes: Uint8Array | null, fingerprint: DiskFingerprint | null, mtimeMs: number, keyHashes: Record<string, ContentHash> | null): CfgBaseRecord | null {
+	if (!bytes || !fingerprint) return null;
+	return { file, fingerprint, size: bytes.length, mtimeMs, keyHashes };
 }
 
 function tooLarge(ctx: FileCtx, size: number): boolean {
@@ -186,22 +194,24 @@ function tooLarge(ctx: FileCtx, size: number): boolean {
 	return true;
 }
 
-function finish(ctx: FileCtx, ops: CfgOp[], next: Uint8Array | null, keyHashes: Record<string, ContentHash>): CfgFileAction | null {
+async function finish(ctx: FileCtx, ops: CfgOp[], next: Uint8Array | null, keyHashes: Record<string, ContentHash>): Promise<CfgFileAction | null> {
 	if (next && tooLarge(ctx, next.length)) return null;
 	const cur = ctx.local?.bytes ?? null;
-	const bytes = next ?? cur;
+	const expect = cur ? await exactFingerprint(ctx.hash, cur) : null;
+	// cfgBase of what the file holds after the action: `next` when written, else the current bytes (fingerprint `expect`).
+	const after = next ? await exactFingerprint(ctx.hash, next) : expect;
 	return {
 		file: ctx.file,
 		ops,
 		upload: null,
 		write: next ? { t: "bytes", bytes: next } : null,
-		expect: cur ? exactFingerprint(cur) : null,
-		base: record(ctx.file, bytes, next ? ctx.nowMs : ctx.local?.mtimeMs ?? ctx.nowMs, keyHashes),
+		expect,
+		base: record(ctx.file, next ?? cur, after, next ? ctx.nowMs : ctx.local?.mtimeMs ?? ctx.nowMs, keyHashes),
 		reload: next !== null,
 	};
 }
 
-function planJson(ctx: FileCtx, regs: ReadonlyMap<string, CfgRegister<string>>): CfgFileAction | null {
+async function planJson(ctx: FileCtx, regs: ReadonlyMap<string, CfgRegister<string>>): Promise<CfgFileAction | null> {
 	const missing = ctx.local === undefined;
 	const parsed = missing ? {} : parseJson(ctx.local!.bytes);
 	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -217,8 +227,9 @@ function planJson(ctx: FileCtx, regs: ReadonlyMap<string, CfgRegister<string>>):
 		if (isDeviceLocalKey(ctx.file, key)) continue;
 		const L = obj.has(key) ? canonicalJson(obj.get(key) as JsonValue) : undefined;
 		const reg = regs.get(key);
-		const hL = L === undefined ? null : hashText(L);
-		const hF = reg?.value ? hashText(reg.value) : null;
+		// One digest at a time; an in-sync key (same canonical JSON both sides, the common case) is hashed once.
+		const hL = L === undefined ? null : await hashText(ctx.hash, L);
+		const hF = !reg?.value ? null : reg.value === L ? hL : await hashText(ctx.hash, reg.value);
 		const B = ctx.base?.keyHashes?.[key] ?? null;
 		if (hL === hF) {
 			if (hL) hashes[key] = hL;
@@ -238,7 +249,7 @@ function planJson(ctx: FileCtx, regs: ReadonlyMap<string, CfgRegister<string>>):
 	return finish(ctx, ops, next, hashes);
 }
 
-function planPlugins(ctx: FileCtx, view: CfgFoldState, local: CfgLocalSnapshot, mobile: boolean): CfgFileAction | null {
+async function planPlugins(ctx: FileCtx, view: CfgFoldState, local: CfgLocalSnapshot, mobile: boolean): Promise<CfgFileAction | null> {
 	const missing = ctx.local === undefined;
 	const parsed = missing ? [] : parseJson(ctx.local!.bytes);
 	if (!Array.isArray(parsed) || !parsed.every((x) => typeof x === "string")) {
@@ -282,14 +293,14 @@ function planPlugins(ctx: FileCtx, view: CfgFoldState, local: CfgLocalSnapshot, 
 	return finish(ctx, ops, next, hashes);
 }
 
-function planFile(ctx: FileCtx, cls: CfgFileClass, view: CfgFoldState, installed: ReadonlyMap<string, string | null>): CfgFileAction | null {
+async function planFile(ctx: FileCtx, cls: CfgFileClass, view: CfgFoldState, installed: ReadonlyMap<string, string | null>): Promise<CfgFileAction | null> {
 	const isData = cls.t === "pluginData";
 	const localVer = cls.t === "pluginData" ? installed.get(cls.pluginId) ?? null : null;
 	const lb = ctx.local?.bytes ?? null;
-	const L = lb ? exactFingerprint(lb) : null;
+	const L = lb ? await exactFingerprint(ctx.hash, lb) : null;
 	const reg = view.files.get(ctx.file);
 	const F = reg?.value;
-	const hF = F ? (F.content.t === "inline" ? exactFingerprint(F.content.bytes) : (F.content.hash as string as DiskFingerprint)) : null;
+	const hF = F ? (F.content.t === "inline" ? await exactFingerprint(ctx.hash, F.content.bytes) : (F.content.hash as string as DiskFingerprint)) : null;
 	const reload = !ctx.file.startsWith("snippets/");
 	const base = (fp: DiskFingerprint | null, size: number, mtimeMs: number): CfgBaseRecord | null =>
 		fp ? { file: ctx.file, fingerprint: fp, size, mtimeMs, keyHashes: null } : null;

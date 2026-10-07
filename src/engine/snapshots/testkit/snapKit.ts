@@ -4,7 +4,7 @@
  * (XOR seal, prefixed addresses) that proves parts go through the attachments' blob path.
  */
 import { concatBytes } from "../../../core/codec/lib0";
-import { sha256Hex } from "../../../core/hash/sha256";
+import { refHashPort, sha256HexRef } from "../../../core/hash/testkit/hashRef";
 import { applySnapOp, newSnapFold } from "../../../core/snap/fold";
 import type { SnapOp } from "../../../core/snap/record";
 import { kindOfPath, type ContentHash, type DeviceId, type VaultPath } from "../../../core/types";
@@ -70,7 +70,7 @@ export class FaultyStore implements BlobPort {
 
 const xor = (b: Uint8Array) => b.map((x) => x ^ 0x5a);
 /** Keyed-looking blob address (64 hex like the relay's blob routes require), not the plain sha256. */
-export const addressOf = (h: ContentHash) => sha256Hex(new TextEncoder().encode(`addr:${h}`)) as BlobAddress;
+export const addressOf = (h: ContentHash) => sha256HexRef(new TextEncoder().encode(`addr:${h}`)) as BlobAddress;
 export const sealingCrypto = {
 	suite: 0, keyEpoch: 0,
 	seal: async () => { throw new Error("unused"); }, open: async () => { throw new Error("unused"); },
@@ -111,7 +111,7 @@ export function device(o: DevOptions = {}) {
 	const settings = { enabled: o.enabled ?? true, keepDaily: o.keepDaily ?? 7, uploadToBlobStore: o.upload ?? true };
 	const remote = o.store && o.index ? { store: o.store, index: o.index.port(o.self ?? DEV_A), touch: o.touch ?? REUSE_ALL } : null;
 	const job = new SnapshotJob({
-		disk: w.gateway, side, clock: w.clock, crypto: o.crypto ?? sealingCrypto, settings: () => settings, remote, deviceLabel: o.label ?? "laptop",
+		disk: w.gateway, side, clock: w.clock, crypto: o.crypto ?? sealingCrypto, hash: refHashPort, settings: () => settings, remote, deviceLabel: o.label ?? "laptop",
 		files: o.files ?? (() => w.vault.paths().filter((p) => !p.startsWith(".")).map((p) => ({ path: P(p), kind: kindOfPath(P(p)), size: w.vault.bytesOf(p)!.length }))),
 		notice: (level, code, message) => notices.push({ level, code, message: message ?? "" }),
 		diag: (l) => diags.push(l),

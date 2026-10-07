@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { maxSealedBlobPlaintext } from "../../core/codec/sealedBlob";
 import type { ContentHash, DocId, VaultPath } from "../../core/types";
 import { BlobTooLargeError, type BlobPort } from "../../ports/blob";
@@ -139,7 +139,7 @@ async function make(opts: { store?: BlobPort | null; budgetBytes?: number; admit
 test("store: upload seals and puts once; has() short-circuits; download opens and verifies", async () => {
 	const { q, store, crypto } = await make();
 	const bytes = rnd(5000);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), true);
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), true);
 	assert.equal(store!.puts, 1);
@@ -153,9 +153,9 @@ test("store: upload seals and puts once; has() short-circuits; download opens an
 test("store: wrong hash refuses to upload; corrupt download is rejected with a notice", async () => {
 	const { q, store, notices } = await make();
 	const bytes = rnd(100);
-	assert.equal(await q.upload({ hash: sha256Hex(rnd(100, 2)), docId: D, path: P, bytes }), false);
+	assert.equal(await q.upload({ hash: sha256HexRef(rnd(100, 2)), docId: D, path: P, bytes }), false);
 	assert.equal(store!.puts, 0);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	await q.upload({ hash, docId: D, path: P, bytes });
 	for (const [k, v] of store!.objects) store!.objects.set(k, v.map((b, i) => (i === 0 ? b ^ 1 : b)));
 	assert.equal(await q.download({ hash, docId: D, path: P, size: 100 }), null);
@@ -165,7 +165,7 @@ test("store: wrong hash refuses to upload; corrupt download is rejected with a n
 test("store: outage -> backoff record persisted; not retried until due; success clears it", async () => {
 	const { q, store, clock, storage, reopen } = await make();
 	const bytes = rnd(64);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	store!.down = true;
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
 	assert.equal(q.queued().length, 1);
@@ -186,7 +186,7 @@ test("store: outage -> backoff record persisted; not retried until due; success 
 test("store: a put refused by size (413) is refused for good: notice, its backoff record dropped, no retry, no second request", async () => {
 	const { q, store, clock, storage, notices } = await make();
 	const bytes = rnd(64);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	store!.down = true;
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
 	assert.equal(q.queued().length, 1, "an outage first: a backoff record");
@@ -207,14 +207,14 @@ test("store: a put refused by size (413) is refused for good: notice, its backof
 	// Other bytes are still tried.
 	store!.refuse = false;
 	const other = rnd(64, 9);
-	assert.equal(await q.upload({ hash: sha256Hex(other), docId: D, path: P, bytes: other }), true);
-	assert.equal(q.claimUpload({ hash: sha256Hex(other), docId: D, path: P, size: 64 }, src(other)), "stored");
+	assert.equal(await q.upload({ hash: sha256HexRef(other), docId: D, path: P, bytes: other }), true);
+	assert.equal(q.claimUpload({ hash: sha256HexRef(other), docId: D, path: P, size: 64 }, src(other)), "stored");
 });
 
 test("store: backoff is monotonic: a wall clock jumping back 12 h does not park the retry; reopen clamps to the backoff", async () => {
 	const { q, store, clock, reopen } = await make();
 	const bytes = rnd(32);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	store!.down = true;
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
 	store!.down = false;
@@ -230,7 +230,7 @@ test("store: backoff is monotonic: a wall clock jumping back 12 h does not park 
 test("retain drops stale records (memory + store), keeps the rest and a shared row's other direction", async () => {
 	const { q, store, storage } = await make();
 	const a = rnd(16), b = rnd(17);
-	const ha = sha256Hex(a), hb = sha256Hex(b);
+	const ha = sha256HexRef(a), hb = sha256HexRef(b);
 	store!.down = true;
 	await q.upload({ hash: ha, docId: D, path: P, bytes: a });
 	await q.upload({ hash: hb, docId: D, path: P, bytes: b });
@@ -247,7 +247,7 @@ test("retain drops stale records (memory + store), keeps the rest and a shared r
 
 test("store: missing blob on download backs off exponentially", async () => {
 	const { q, clock } = await make();
-	const hash = sha256Hex(rnd(10));
+	const hash = sha256HexRef(rnd(10));
 	assert.equal(await q.download({ hash, docId: D, path: P, size: 10 }), null);
 	assert.equal(q.nextDueInMs(), backoffMs(1));
 	clock.advance(backoffMs(1));
@@ -261,7 +261,7 @@ test("store: missing blob on download backs off exponentially", async () => {
 test("store: oversize upload is refused with a notice", async () => {
 	const { q, notices } = await make();
 	const bytes = new Uint8Array(10 * 1024 * 1024 + 1);
-	assert.equal(await q.upload({ hash: sha256Hex(bytes), docId: D, path: P, bytes }), false);
+	assert.equal(await q.upload({ hash: sha256HexRef(bytes), docId: D, path: P, bytes }), false);
 	assert.ok(notices.includes("blob-too-large"));
 });
 
@@ -269,7 +269,7 @@ test("no blob store: maxBlobBytes 0; upload refuses at once and queues nothing (
 	const { q, storage, notices } = await make({ store: null });
 	assert.equal(q.maxBlobBytes, 0);
 	const bytes = rnd(5000, 3);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
 	assert.equal(await q.download({ hash, docId: D, path: P, size: bytes.length }), null);
 	assert.equal(q.claimUpload({ hash, docId: D, path: P, size: bytes.length }, src(bytes)), "unavailable");
@@ -284,7 +284,7 @@ test("no blob store: maxBlobBytes 0; upload refuses at once and queues nothing (
 test("concurrent uploads of one hash share one transfer", async () => {
 	const { q, store } = await make();
 	const bytes = rnd(10, 9);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	const [a, b] = await Promise.all([q.upload({ hash, docId: D, path: P, bytes }), q.upload({ hash, docId: D, path: P, bytes })]);
 	assert.equal(a && b, true);
 	assert.equal(store!.puts, 1);
@@ -294,8 +294,8 @@ test("liveHashes: queued records, running transfers and confirmed uploads, both 
 	const { q, store, clock } = await make();
 	const queued = rnd(64, 2);
 	const running = rnd(64, 3);
-	const qh = sha256Hex(queued) as ContentHash;
-	const rh = sha256Hex(running) as ContentHash;
+	const qh = sha256HexRef(queued) as ContentHash;
+	const rh = sha256HexRef(running) as ContentHash;
 	store!.down = true;
 	assert.equal(await q.upload({ hash: qh, docId: D, path: P, bytes: queued }), false);
 	assert.deepEqual([...q.liveHashes()], [qh]);
@@ -320,7 +320,7 @@ test("claimUpload: starts in the background, a second doc joins; both are woken 
 	const store = new GatedStore();
 	const { q, woken, clock } = await make({ store });
 	const bytes = rnd(5000, 21);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	let reads = 0;
 	const source: UploadSource = { read: async () => (reads++, bytes), changed: () => assert.fail("the bytes match") };
 	const claim = (docId: DocId, path: VaultPath) => q.claimUpload({ hash, docId, path, size: bytes.length }, source);
@@ -346,14 +346,14 @@ test("claimUpload: starts in the background, a second doc joins; both are woken 
 test("claimUpload: bytes that no longer hash to the claim ask for a re-hash and leave no record; an unreadable file backs off", async () => {
 	const { q, store, woken } = await make();
 	const bytes = rnd(100, 22);
-	const stale = sha256Hex(rnd(100, 23));
+	const stale = sha256HexRef(rnd(100, 23));
 	let changed = 0;
 	assert.equal(q.claimUpload({ hash: stale, docId: D, path: P, size: 100 }, src(bytes, () => changed++)), "busy");
 	await until(() => woken.length === 1, "the wake");
 	assert.equal(changed, 1);
 	assert.equal(store!.puts, 0);
 	assert.deepEqual(q.queued(), [], "not a failure: the re-plan uploads the new bytes");
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	assert.equal(q.claimUpload({ hash, docId: D, path: P, size: 100 }, src(null)), "busy");
 	await until(() => woken.length === 2, "the second wake");
 	assert.deepEqual(q.queued().map((t) => [t.state, t.attempts]), [["backoff", 1]]);
@@ -364,7 +364,7 @@ test("claimDownload: one download for every claimant; the bytes are single use a
 	const store = new GatedStore();
 	const { q, woken } = await make({ store });
 	const bytes = rnd(3000, 24);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	store.gated = false;
 	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), true);
 	store.gated = true;
@@ -400,7 +400,7 @@ test("byte budget: transfers start in claim order while running and ready bytes 
 	const store = new GatedStore();
 	const budget = 2 * BLOB_TRANSFER_MIN_COST;
 	const { q } = await make({ store, budgetBytes: budget });
-	const blobs = [rnd(1000, 31), rnd(1000, 32), rnd(budget + MiB, 33), rnd(1000, 34), rnd(1000, 35)].map((bytes) => ({ bytes, hash: sha256Hex(bytes) }));
+	const blobs = [rnd(1000, 31), rnd(1000, 32), rnd(budget + MiB, 33), rnd(1000, 34), rnd(1000, 35)].map((bytes) => ({ bytes, hash: sha256HexRef(bytes) }));
 	const [s1, s2, big, s3, s4] = blobs.map((b) => b.hash) as [string, string, string, string, string];
 	// One doc per blob: a doc's new claim would drop its claim on bytes not started yet (forget).
 	const claim = (i: number) => q.claimUpload({ hash: blobs[i]!.hash, docId: `doc${i}` as DocId, path: P, size: blobs[i]!.bytes.length }, src(blobs[i]!.bytes));
@@ -436,10 +436,10 @@ test("byte budget: a download no job took yet keeps its share until taken", asyn
 	const { q, woken } = await make({ store, budgetBytes: BLOB_TRANSFER_MIN_COST });
 	const a = rnd(500, 41), b = rnd(500, 42);
 	store.gated = false;
-	for (const bytes of [a, b]) assert.equal(await q.upload({ hash: sha256Hex(bytes), docId: D, path: P, bytes }), true);
+	for (const bytes of [a, b]) assert.equal(await q.upload({ hash: sha256HexRef(bytes), docId: D, path: P, bytes }), true);
 	store.gated = true;
-	const reqA = { hash: sha256Hex(a), docId: D, path: P, size: 500 };
-	const reqB = { hash: sha256Hex(b), docId: D2, path: P2, size: 500 };
+	const reqA = { hash: sha256HexRef(a), docId: D, path: P, size: 500 };
+	const reqB = { hash: sha256HexRef(b), docId: D2, path: P2, size: 500 };
 	q.claimDownload(reqA);
 	q.claimDownload(reqB);
 	await until(() => store.held === 1, "a's get");
@@ -455,8 +455,8 @@ test("stop(): aborts the transfers in flight (the store sees the signal), answer
 	const store = new GatedStore();
 	const { q, woken, storage } = await make({ store });
 	const a = rnd(700, 51), b = rnd(700, 52);
-	assert.equal(q.claimUpload({ hash: sha256Hex(a), docId: D, path: P, size: 700 }, src(a)), "busy");
-	const awaited = q.upload({ hash: sha256Hex(b), docId: D2, path: P2, bytes: b });
+	assert.equal(q.claimUpload({ hash: sha256HexRef(a), docId: D, path: P, size: 700 }, src(a)), "busy");
+	const awaited = q.upload({ hash: sha256HexRef(b), docId: D2, path: P2, bytes: b });
 	await until(() => store.held === 2, "both puts");
 	await q.stop();
 	assert.equal(store.held, 0, "both aborted");
@@ -464,7 +464,7 @@ test("stop(): aborts the transfers in flight (the store sees the signal), answer
 	assert.deepEqual(woken, [], "a stop is no outcome: the next start's pass plans the upload again (L != S)");
 	assert.deepEqual(q.queued(), []);
 	assert.equal(storage.dump("b", "blobQueue").length, 0, "and no backoff for it");
-	assert.equal(q.claimUpload({ hash: sha256Hex(a), docId: D, path: P, size: 700 }, src(a)), "unavailable");
+	assert.equal(q.claimUpload({ hash: sha256HexRef(a), docId: D, path: P, size: 700 }, src(a)), "unavailable");
 	assert.equal(store.puts, 0);
 });
 
@@ -473,7 +473,7 @@ test("admit: nothing starts while it says no; pump() starts the queue once it sa
 	let open = false;
 	const { q } = await make({ store, admit: () => open });
 	const bytes = rnd(300, 61);
-	assert.equal(q.claimUpload({ hash: sha256Hex(bytes), docId: D, path: P, size: 300 }, src(bytes)), "busy");
+	assert.equal(q.claimUpload({ hash: sha256HexRef(bytes), docId: D, path: P, size: 300 }, src(bytes)), "busy");
 	for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
 	assert.equal(store.held, 0);
 	assert.deepEqual(q.queued().map((t) => t.state), ["pending"]);
@@ -488,20 +488,20 @@ test("forget: a doc that claims new bytes drops its claim on the old ones not st
 	const store = new GatedStore();
 	const { q } = await make({ store, budgetBytes: BLOB_TRANSFER_MIN_COST });
 	const [first, old, shared, newer, next] = [71, 72, 73, 74, 75].map((seed) => rnd(200, seed)) as [Uint8Array, Uint8Array, Uint8Array, Uint8Array, Uint8Array];
-	const claim = (bytes: Uint8Array, docId: DocId) => q.claimUpload({ hash: sha256Hex(bytes), docId, path: P, size: 200 }, src(bytes));
+	const claim = (bytes: Uint8Array, docId: DocId) => q.claimUpload({ hash: sha256HexRef(bytes), docId, path: P, size: 200 }, src(bytes));
 	const hashes = () => q.queued().map((t) => t.hash);
 	claim(first, D3); // runs alone (the budget fits one); the rest wait behind it
 	claim(old, D);
 	claim(shared, D2);
 	assert.deepEqual(q.queued().map((t) => t.state), ["running", "pending", "pending"]);
 	claim(shared, D);
-	assert.deepEqual(hashes(), [first, shared].map(sha256Hex), "D moved on from `old`: nobody wants it");
+	assert.deepEqual(hashes(), [first, shared].map(sha256HexRef), "D moved on from `old`: nobody wants it");
 	claim(newer, D);
-	assert.deepEqual(hashes(), [first, shared, newer].map(sha256Hex), "D2 still wants `shared`");
+	assert.deepEqual(hashes(), [first, shared, newer].map(sha256HexRef), "D2 still wants `shared`");
 	claim(next, D2);
-	assert.deepEqual(hashes(), [first, newer, next].map(sha256Hex));
+	assert.deepEqual(hashes(), [first, newer, next].map(sha256HexRef));
 	claim(newer, D3);
-	assert.deepEqual(hashes(), [first, newer, next].map(sha256Hex), "D3 moved on from `first`, but a running transfer is never forgotten");
+	assert.deepEqual(hashes(), [first, newer, next].map(sha256HexRef), "D3 moved on from `first`, but a running transfer is never forgotten");
 	await until(() => store.held === 1, "the first put");
 	store.gated = false;
 	store.releaseAll();
@@ -514,7 +514,7 @@ test("link lost: TransferLink.abort ends the store call in flight; the transfer 
 	const link = new TransferLink();
 	const { q, woken, clock } = await make({ store: link.wrap(store) });
 	const bytes = rnd(900, 81);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	const claim = () => q.claimUpload({ hash, docId: D, path: P, size: 900 }, src(bytes));
 	assert.equal(claim(), "busy");
 	await until(() => store.held === 1, "the put");
@@ -537,7 +537,7 @@ test("a retry pending or running is not due: nextDueInMs skips it until it ends 
 	const link = new TransferLink();
 	const { q, woken, clock } = await make({ store: link.wrap(store), budgetBytes: BLOB_TRANSFER_MIN_COST });
 	const bytes = rnd(700, 82), other = rnd(700, 83);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	const claim = () => q.claimUpload({ hash, docId: D, path: P, size: 700 }, src(bytes));
 	assert.equal(claim(), "busy");
 	await until(() => store.held === 1, "the put");
@@ -547,7 +547,7 @@ test("a retry pending or running is not due: nextDueInMs skips it until it ends 
 	clock.advance(BLOB_RETRY_BASE_MS + 1_000);
 	assert.equal(q.nextDueInMs(), 0, "due: the scheduler's pass claims it");
 	// Another doc's upload holds the whole budget: the retry is claimed but waits.
-	assert.equal(q.claimUpload({ hash: sha256Hex(other), docId: D2, path: P2, size: 700 }, src(other)), "busy");
+	assert.equal(q.claimUpload({ hash: sha256HexRef(other), docId: D2, path: P2, size: 700 }, src(other)), "busy");
 	await until(() => store.held === 1, "the other put");
 	assert.equal(claim(), "busy");
 	assert.equal(q.nextDueInMs(), null, "pending behind the budget: not due");
@@ -582,7 +582,7 @@ test("suite 1: two devices upload the same file: different ciphertexts at one ad
 	const a = await make({ crypto: await suite1(0xa1) });
 	const b = await make({ crypto: await suite1(0xb1) });
 	const bytes = rnd(40_000, 11);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	assert.equal(await a.q.upload({ hash, docId: D, path: P, bytes }), true);
 	assert.equal(await b.q.upload({ hash, docId: D, path: P, bytes }), true);
 	const [ka, ca] = [...a.store!.objects][0]!;
@@ -606,16 +606,16 @@ test("suite 1: a file above the sealed cap is not synced: upload refuses with a 
 	const { q, store, notices } = await make({ crypto: await suite1(0xa2) });
 	const bytes = new Uint8Array(q.maxBlobBytes + 1);
 	assert.ok(bytes.length < store!.maxBlobBytes, "fits the transport cap as plaintext, not once sealed");
-	assert.equal(await q.upload({ hash: sha256Hex(bytes), docId: D, path: P, bytes }), false);
+	assert.equal(await q.upload({ hash: sha256HexRef(bytes), docId: D, path: P, bytes }), false);
 	assert.equal(store!.puts, 0);
 	assert.ok(notices.includes("blob-too-large"));
-	assert.equal(await q.download({ hash: sha256Hex(bytes), docId: D, path: P, size: bytes.length }), null);
+	assert.equal(await q.download({ hash: sha256HexRef(bytes), docId: D, path: P, size: bytes.length }), null);
 });
 
 test("suite 1: tampered at rest: unavailable + blob-corrupt each attempt; quarantined after the initial attempt and 3 retries over >= 3 min", async () => {
 	const w = await make({ crypto: await suite1(0xa3) });
 	const bytes = rnd(3_000, 12);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	await w.q.upload({ hash, docId: D, path: P, bytes });
 	const r = await make({ store: w.store, crypto: await suite1(0xb3) });
 	for (const [k, v] of w.store!.objects) w.store!.objects.set(k, v.map((x, i) => (i === 40 ? x ^ 1 : x)));
@@ -646,7 +646,7 @@ test("suite 1: tampered at rest: unavailable + blob-corrupt each attempt; quaran
 test("suite 1: an open failure under an unverified key, or an unknown key, is never quarantined (and never blob-corrupt)", async () => {
 	const w = await make({ crypto: await suite1(0xa4) });
 	const bytes = rnd(3_000, 13);
-	const hash = sha256Hex(bytes);
+	const hash = sha256HexRef(bytes);
 	await w.q.upload({ hash, docId: D, path: P, bytes });
 	const readers = [
 		await make({ store: w.store, crypto: await suite1(0xb4, { e2: new Uint8Array(32).fill(9), verified: [1], seal: 1 }) }), // wrong K_2, unverified

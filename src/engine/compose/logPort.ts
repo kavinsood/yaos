@@ -8,9 +8,14 @@
  * the owner invalidates it on fold / submit / body change and before a pass.
  */
 
-import { markdownContentHash } from "../../core/hash/markdownLf";
+import { digestHex } from "../../core/hash/digest";
+import { markdownCanonicalBytes } from "../../core/hash/markdownLf";
+import { sha256Hex } from "../../core/hash/sha256";
+import { SYNC_HASH_MAX_BYTES } from "../../core/limits";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
-import { canvasDocHash } from "../reconcile/canvasDoc";
+import type * as Y from "yjs";
+import type { Handle } from "../body/handles";
+import { canvasDocHashInput } from "../reconcile/canvasDoc";
 import type {
 	BodyVersion, CfgFoldState, CfgOp, ContentHash, DocId, NsOp, PathKey, RemoteEntry, Seq, StreamName,
 } from "../../core/types";
@@ -85,15 +90,48 @@ export class ComposedLog implements LogPort {
 		return this.memo;
 	}
 
-	/** streams.textHash for a resident, framed replica (memoized per body version). Never loads a doc. */
+	/**
+	 * streams.textHash for a resident, framed replica: what warmTextHashes took for its body version. Never loads
+	 * a doc and never blocks on a digest: a replica that changed since (a remote row or a keystroke after the warm)
+	 * is hashed here only when its text is at most SYNC_HASH_MAX_BYTES, else it has no textHash in this view (as a
+	 * doc that is not resident; the next pass warms it).
+	 */
 	private residentHash(docId: DocId, kind: "markdown" | "canvas", stream: StreamName, v: BodyVersion): ContentHash | null {
 		const h = this.log.c.handles.peek(stream);
-		if (!h || !h.builder.empty || h.unresolvedRefs > 0) return null;
-		const key = `${v.remoteSeq}:${v.localOrder}`;
+		if (!hashable(h)) return null;
+		const key = versionKey(v);
 		const m = this.hashMemo.get(docId);
 		if (m && m.key === key) return m.hash;
-		const hash = kind === "canvas" ? canvasDocHash(h.doc) : markdownContentHash(h.doc.getText("text").toString());
-		if (hash === null) return null;
+		const input = textHashInput(kind, h.doc, SYNC_HASH_MAX_BYTES);
+		if (input === null || input.length > SYNC_HASH_MAX_BYTES) return null;
+		return this.remember(docId, key, sha256Hex(input) as ContentHash);
+	}
+
+	/**
+	 * Take the textHash of every resident, framed replica whose body version has none yet, through HashPort, one
+	 * at a time (a reconcile pass, before it reads the view). The key is the version the text was read at: a
+	 * replica that moves on during the digest keeps its old key, so view() never pairs a hash with a newer text.
+	 */
+	async warmTextHashes(): Promise<void> {
+		const log = this.log;
+		let added = false;
+		for (const h of [...log.c.handles.all()]) {
+			if (!hashable(h)) continue;
+			const kind = h.cls === "canvas" ? "canvas" : "markdown";
+			const body = log.bodyInfo(h.docId, kind);
+			if (!body || !body.caughtUp) continue;
+			const key = versionKey(body.version);
+			if (this.hashMemo.get(h.docId)?.key === key) continue;
+			const input = textHashInput(kind, h.doc, Infinity);
+			if (input === null) continue;
+			this.remember(h.docId, key, (await digestHex(log.c.ports.hash, input)) as ContentHash);
+			added = true;
+		}
+		if (added) this.invalidate();
+	}
+
+	private remember(docId: DocId, key: string, hash: ContentHash): ContentHash {
+		this.hashMemo.delete(docId);
 		this.hashMemo.set(docId, { key, hash });
 		if (this.hashMemo.size > 4096) this.hashMemo.delete(this.hashMemo.keys().next().value as DocId);
 		return hash;
@@ -164,4 +202,25 @@ function snapIndexPort(log: () => LogEngine, liveOnce: () => boolean): SnapIndex
 			if (ops.length > 0) await log().submitSnap(ops);
 		},
 	};
+}
+
+/** A replica whose text is the doc's (no open frame, no unresolved ref row). */
+function hashable(h: Handle | undefined): h is Handle {
+	return h !== undefined && h.builder.empty && h.unresolvedRefs === 0;
+}
+
+function versionKey(v: BodyVersion): string {
+	return `${v.remoteSeq}:${v.localOrder}`;
+}
+
+/**
+ * What streams.textHash digests: markdownCanonicalBytes of the text, or the canvas projection's hash input (null =
+ * invalid canvas). null also when a markdown text cannot fit in `maxBytes`, so a large doc is not encoded for
+ * nothing: its canonical bytes are at least (UTF-16 length - 1) / 2 (one leading BOM is stripped, a CRLF pair is 2
+ * units and 1 byte, every other unit at least 1 byte).
+ */
+function textHashInput(kind: "markdown" | "canvas", doc: Y.Doc, maxBytes: number): Uint8Array | null {
+	if (kind === "canvas") return canvasDocHashInput(doc);
+	const text = doc.getText("text");
+	return text.length > 2 * maxBytes + 1 ? null : markdownCanonicalBytes(text.toString());
 }

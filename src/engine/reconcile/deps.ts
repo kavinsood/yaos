@@ -88,6 +88,11 @@ export interface SubmitNsOptions {
 export interface LogPort {
 	view(): RemoteView;
 	/**
+	 * Take the textHash of resident replicas through HashPort before a plan reads view() (which never awaits a
+	 * digest: a replica changed since has a textHash there only when it is small).
+	 */
+	warmTextHashes(): Promise<void>;
+	/**
 	 * Hand ns ops to the ns runtime: framed (<= MAX_NS_OPS_PER_FRAME), put in the
 	 * outbox (T_edit) and reflected in the optimistic overlay before resolving.
 	 */

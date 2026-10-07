@@ -7,6 +7,7 @@
 
 import type { BrakeConfig, BrakeReport, DocId, PathKey, SyncedEntry, VaultPath } from "../../../core/types";
 import { DEFAULT_BRAKE } from "../../../core/plan/brake";
+import { refHashPort } from "../../../core/hash/testkit/hashRef";
 import type { VaultEvent } from "../../../ports/vault";
 import { DB_SCHEMA_VERSION, STORE_SPECS } from "../../store/schema";
 import type { ReconcileSettings } from "../context";
@@ -69,7 +70,7 @@ export class World {
 	async boot(): Promise<Reconciler> {
 		const db = await this.storage.open<DiskSchema>(DB, DB_SCHEMA_VERSION, STORE_SPECS);
 		const rec = await Reconciler.open({
-			db, log: this.log, disk: this.gateway, clock: this.clock, random: this.random, blobs: this.blobs,
+			db, log: this.log, disk: this.gateway, clock: this.clock, random: this.random, hash: refHashPort, blobs: this.blobs,
 			settings: { excludePatterns: [], syncAttachments: true, maxAttachmentBytes: 8 * 1024 * 1024, trashMode: "obsidian-trash", ...this.opts.settings },
 			deviceLabel: this.opts.deviceLabel ?? "laptop",
 			brake: { ...DEFAULT_BRAKE, ...this.opts.brake },

@@ -14,7 +14,7 @@ import { KEYRING_STREAM, type DeviceId } from "../core/types";
 import { CryptoSuite } from "../core/envelope";
 import { decodeOuter } from "../core/codec/envelope";
 import { padmeLen } from "../core/codec/padme";
-import { sha256 } from "../core/hash/sha256";
+import { sha256Ref as sha256 } from "../core/hash/testkit/hashRef";
 import { bytesToHex } from "../core/codec/lib0";
 import type { E2eeStatus, StatusSnapshot } from "../protocol/status";
 import { VaultKeyStore, type StoredKeys } from "../host/keys/secretStore";

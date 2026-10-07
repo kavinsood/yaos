@@ -2,11 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import {
-	canvasContentHash, canvasToMergeText, formatCanvasText, parseCanvasText, rankCanvasInFileOrder, type CanvasRanked,
+	canvasToMergeText, formatCanvasText, parseCanvasText, rankCanvasInFileOrder, type CanvasRanked,
 } from "../../core/hash/canvasCanonical";
+import { canvasHashRef, refHashPort as H } from "../../core/hash/testkit/hashRef";
 import { utf8Encode } from "../../core/hash/utf8";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
-import { applyCanvas, canvasDocHash, emptyCanvas, projectCanvasBytes, projectRanked, readCanvas, type CanvasProjection } from "./canvasDoc";
+import { applyCanvas, canvasDocHashInput, emptyCanvas, projectCanvasBytes, projectionHash, projectRanked, readCanvas, type CanvasProjection } from "./canvasDoc";
 import { mergeCanvasSides, parseDiskCanvas, parseMergeText } from "./canvasMerge";
 
 type Obj = Record<string, unknown>;
@@ -36,7 +37,7 @@ function project(d: Y.Doc): CanvasProjection {
 
 const nodeMap = (d: Y.Doc, id: string): Y.Map<unknown> => d.getMap<unknown>("nodes").get(id) as Y.Map<unknown>;
 
-test("canvasDoc: apply onto an empty doc, read back, project = formatted file in rank order", () => {
+test("canvasDoc: apply onto an empty doc, read back, project = formatted file in rank order", async () => {
 	const json = canvasJson([textNode("a", "hello"), fileNode("b", "x.md")], [edge("e1", "a", "b")], { meta: { v: 1 } });
 	const d = docOf(json);
 	const a = nodeMap(d, "a");
@@ -49,15 +50,15 @@ test("canvasDoc: apply onto an empty doc, read back, project = formatted file in
 	const p = project(d);
 	assert.equal(p.text, formatCanvasText(ranked(json).data), "formatted (tab indent), file order preserved through the ranks");
 	assert.deepEqual(JSON.parse(p.text), JSON.parse(json));
-	assert.equal(p.hash, canvasContentHash(utf8Encode(json)));
-	assert.equal(canvasDocHash(d), p.hash);
+	assert.equal(await projectionHash(H, p), canvasHashRef(utf8Encode(json)));
+	assert.deepEqual(canvasDocHashInput(d), p.hashInput);
 	// Re-applying the same target changes nothing.
 	assert.equal(applyCanvas(d, null, readCanvas(d).ok ? (readCanvas(d) as { ranked: CanvasRanked }).ranked : emptyCanvas()), 0);
 });
 
-test("canvasDoc: empty doc projects the empty canvas with the empty-content hash", () => {
+test("canvasDoc: empty doc projects the empty canvas with the empty-content hash", async () => {
 	const p = project(new Y.Doc());
-	assert.equal(p.hash, canvasContentHash(new Uint8Array(0)));
+	assert.equal(await projectionHash(H, p), canvasHashRef(new Uint8Array(0)));
 	assert.equal(JSON.parse(p.text).nodes.length, 0);
 });
 
@@ -112,7 +113,7 @@ test("canvasDoc: invalid CRDT content is reported, not projected", () => {
 	const bad1 = docOf(canvasJson([textNode("a", "A")]));
 	nodeMap(bad1, "a").set("type", "widget");
 	assert.equal(projectCanvasBytes(bad1).ok, false);
-	assert.equal(canvasDocHash(bad1), null);
+	assert.equal(canvasDocHashInput(bad1), null);
 	const bad2 = docOf(canvasJson([textNode("a", "A")]));
 	nodeMap(bad2, "a").set("x", "12");
 	assert.equal(projectCanvasBytes(bad2).ok, false);
@@ -191,7 +192,7 @@ test("canvasMerge: no base -> identical when equal (formatting ignored), else co
 	assert.ok(same.ok);
 	const r1 = mergeCanvasSides({ base: null, disk: same.data, crdt, limits: DEFAULT_MERGE_LIMITS });
 	assert.equal(r1.kind, "identical");
-	assert.equal(r1.projection.hash, crdt.hash);
+	assert.deepEqual(r1.projection.hashInput, crdt.hashInput);
 	const other = parseDiskCanvas(utf8Encode(canvasJson([textNode("q", "Q")])));
 	assert.ok(other.ok);
 	const r2 = mergeCanvasSides({ base: null, disk: other.data, crdt, limits: DEFAULT_MERGE_LIMITS });
@@ -199,5 +200,6 @@ test("canvasMerge: no base -> identical when equal (formatting ignored), else co
 	assert.equal(r2.reason, "no-base");
 	assert.equal(canvasToMergeText(r2.target), canvasToMergeText(crdt.ranked));
 	const p = projectRanked(r2.target);
-	assert.ok(p.ok && p.hash === crdt.hash);
+	assert.ok(p.ok);
+	assert.deepEqual(p.hashInput, crdt.hashInput);
 });
