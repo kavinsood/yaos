@@ -1,22 +1,31 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import type { ClockPort } from "../../ports/clock";
 import type { BlobAddress } from "../../ports/crypto";
 import { BLOB_EXISTS_BATCH, createHttpBlob, DEFAULT_MAX_BLOB_BYTES, GC_RETRY_ATTEMPTS, probeHttpBlob } from "./httpBlob";
 import { RelayHttpError } from "./relayHttp";
-import { fakeFetch, jsonResponse, type FakeRequest } from "./relayTestFakes";
+import { fakeFetch, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
 
 const TOKEN = "device-token-SECRET";
 const addr = (i: number) => i.toString(16).padStart(64, "0") as BlobAddress;
 
+/** A clock whose timers fire at once, recording their delays. */
+function instantClock(waits: number[]): ClockPort {
+	return {
+		now: () => 0, monotonic: () => 0, yieldNow: async () => undefined, clearTimer: () => undefined,
+		setTimer: (ms, fn) => {
+			waits.push(ms);
+			queueMicrotask(fn);
+			return waits.length;
+		},
+	};
+}
+
 function blob(route: (req: FakeRequest) => Response | "network") {
 	const f = fakeFetch(route);
 	const waits: number[] = [];
-	const sleep = async (ms: number, signal?: AbortSignal) => {
-		waits.push(ms);
-		if (signal?.aborted) throw new RelayHttpError("blobs/gc", 0, "aborted", null);
-	};
 	return {
-		port: createHttpBlob({ baseUrl: "https://r.example/", vaultId: "v1", credential: TOKEN, fetch: f.fetch, sleep, now: () => 0 }),
+		port: createHttpBlob({ baseUrl: "https://r.example/", vaultId: "v1", credential: TOKEN, fetch: f.fetch, clock: instantClock(waits) }),
 		requests: f.requests,
 		waits,
 	};
@@ -177,12 +186,14 @@ describe("httpBlob", () => {
 		assert.equal(idle.requests.length, 0);
 
 		const waiting = new AbortController();
+		const clock = new ManualClock();
 		const f = fakeFetch(() => jsonResponse({ error: "too_many_attempts" }, 429, { "Retry-After": "30" }));
-		const port = createHttpBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: f.fetch });
+		const port = createHttpBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: f.fetch, clock });
 		const pending = port.deleteIfUploadedBefore([addr(1)], 5, waiting.signal);
-		await new Promise((r) => setTimeout(r, 5));
+		while (clock.pendingTimers === 0) await new Promise((r) => setImmediate(r));
 		waiting.abort();
 		assert.equal((await rejection(pending)).code, "aborted");
+		assert.equal(clock.pendingTimers, 0, "the wait's timer is cleared");
 		assert.equal(f.requests.length, 1);
 	});
 });

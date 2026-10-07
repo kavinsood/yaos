@@ -26,8 +26,10 @@
  */
 
 import { BLOB_DELETE_BATCH, type BlobDeleteResult, type BlobListItem, type BlobPort } from "../../ports/blob";
+import type { ClockPort } from "../../ports/clock";
 import type { BlobAddress } from "../../ports/crypto";
 import { normalizeBaseUrl, parseRetryAfter, RelayHttpError } from "./relayHttp";
+import { createWebClock } from "./webClock";
 
 export const BLOB_EXISTS_BATCH = 50;
 export const DEFAULT_MAX_BLOB_BYTES = 10 * 1024 * 1024;
@@ -44,29 +46,29 @@ export interface HttpBlobOptions {
 	readonly credential: string;
 	readonly fetch?: typeof fetch;
 	readonly maxBlobBytes?: number;
-	/** Retry-After waits (tests); default setTimeout. Rejects when `signal` aborts. */
-	readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-	readonly now?: () => number;
+	/** Retry-After waits and the HTTP-date form's "now"; default a web clock. */
+	readonly clock?: ClockPort;
 }
 
 function abortError(): Error {
 	return new RelayHttpError("blobs/gc", 0, "aborted", null);
 }
 
-function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+/** Waits `ms` on `clock`; rejects as soon as `signal` aborts. */
+function sleepOn(clock: ClockPort, ms: number, signal: AbortSignal | undefined): Promise<void> {
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) {
 			reject(abortError());
 			return;
 		}
 		const onAbort = () => {
-			clearTimeout(timer);
+			clock.clearTimer(timer);
 			reject(abortError());
 		};
-		const timer = setTimeout(() => {
+		const timer = clock.setTimer(ms, () => {
 			signal?.removeEventListener("abort", onAbort);
 			resolve();
-		}, ms);
+		});
 		signal?.addEventListener("abort", onAbort, { once: true });
 	});
 }
@@ -122,8 +124,7 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 		return new RelayHttpError(route, res.status, await errorCode(res), null);
 	}
 
-	const sleep = opts.sleep ?? defaultSleep;
-	const now = opts.now ?? (() => Date.now());
+	const clock = opts.clock ?? createWebClock();
 
 	/** A GC route call; 429/503 with a usable Retry-After are retried (bounded), anything else is the caller's. */
 	async function gcCall(route: string, url: string, init: RequestInit, signal: AbortSignal | undefined): Promise<Response> {
@@ -131,12 +132,12 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 			if (signal?.aborted) throw abortError();
 			const res = await send(route, url, signal ? { ...init, signal } : init);
 			if (res.status !== 429 && res.status !== 503) return res;
-			const wait = parseRetryAfter(res.headers.get("Retry-After"), now());
+			const wait = parseRetryAfter(res.headers.get("Retry-After"), clock.now());
 			if (wait === null || wait > GC_RETRY_MAX_WAIT_MS || attempt >= GC_RETRY_ATTEMPTS) {
 				throw new RelayHttpError(route, res.status, await errorCode(res), wait);
 			}
 			await res.body?.cancel().catch(() => undefined);
-			await sleep(wait, signal);
+			await sleepOn(clock, wait, signal);
 		}
 	}
 
