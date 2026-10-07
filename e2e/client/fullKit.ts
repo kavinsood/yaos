@@ -35,7 +35,7 @@ import { DEFAULT_ENGINE_SETTINGS } from "../../src/host/ui/api";
 import { createEngine, type EngineHandle } from "../../src/engine/compose/protocolEngine";
 import type { VaultRuntime } from "../../src/engine/compose/vaultRuntime";
 import type { EngineTuning } from "../../src/engine/runtime/options";
-import { createHttpBlob, probeHttpBlob } from "../../src/engine/adapters/httpBlob";
+import { probeHttpBlob, startupBlob } from "../../src/engine/adapters/httpBlob";
 import { createIdbStoragePort } from "../../src/engine/adapters/idbStorage";
 import { createNoopCrypto } from "../../src/engine/adapters/noopCrypto";
 import { createWebCryptoSuite1 } from "../../src/engine/adapters/webCryptoSuite1";
@@ -279,7 +279,7 @@ export class FullClient {
 					...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}), ...(tap ? { WebSocketImpl: tap.webSocket(tr?.WebSocket) } : {}) }));
 				const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock };
 				// As webEngine.ts: probed at start, and again on a later connect while there is none.
-				const blob = await probeHttpBlob(blobOpts).catch(() => createHttpBlob(blobOpts));
+				const blob = await startupBlob(blobOpts, (line) => this.log(`engine: ${line}`));
 				this.blobKind = blob ? "http" : "none";
 				const probeBlob = async () => {
 					const found = await probeHttpBlob(blobOpts);

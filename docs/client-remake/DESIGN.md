@@ -1980,8 +1980,10 @@ ones get conflict copies.
   `ComposedEngine.onBlobStore` sets `ports.blob`, logs "blob store available -> restarting" and restarts the runtime
   with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:531-536`). The restarted runtime's full
   pass uploads what is pending through the normal path. No polling, no new timers.
-- **Production ports** (`src/engine/adapters/webEngine.ts:48-53`): `blob = probeHttpBlob(…)`, the HTTP store when the
-  relay advertises attachments, else null. Capabilities unreachable at startup (offline): assume the store
+- **Production ports** (`src/engine/adapters/webEngine.ts:43-54`): `blob = startupBlob(…)`
+  (`src/engine/adapters/httpBlob.ts:329-336`): `probeHttpBlob`'s answer, the HTTP store when the relay advertises
+  attachments, else null. Capabilities unreachable at startup (offline), or not answered within
+  `CAPABILITIES_TIMEOUT_MS` (10 s, `httpBlob.ts:46`; init awaits this probe, so it is bounded): assume the store
   (`createHttpBlob`) and let the blob queue retry (integration-notes D4). `probeBlob = probeHttpBlob`.
 - `syncAttachments = false` excludes blobs entirely: no ns ops, and remote blobs are not fetched.
 
