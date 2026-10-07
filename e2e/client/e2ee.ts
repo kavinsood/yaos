@@ -376,6 +376,13 @@ async function main(): Promise<void> {
 		[b, c].every((d) => d.client.vault.textOf(NOTE_PATH) === `${NOTE_TEXT}\n`) && a.client.vault.textOf("notes/b-before-key.md") === "typed before the key\n"
 		&& a.client.vault.textOf("notes/from-c.md") === "c writes under K_1\n");
 	R.check("attachment bytes are equal on b and c", sameBytes(await bytesOf(b.client, IMG_PATH), IMG) && sameBytes(await bytesOf(c.client, IMG_PATH), IMG));
+	// 25 MiB sealed (the relay takes up to 100 MB, DECISIONS D9).
+	const clip = randomBytes(25 * 1024 * 1024, 2525), tClip = performance.now();
+	a.client.vault.externalWrite("img/e2ee-clip.mp4", clip);
+	const clipMs = await Promise.all([b, c].map((d) => waitFor(async () => sameBytes(await bytesOf(d.client, "img/e2ee-clip.mp4"), clip),
+		`the 25 MiB attachment on ${d.client.name}`, 120_000, tClip, 50).catch(() => null)));
+	for (const ms of clipMs) if (ms !== null) R.record("attachment_25m_to_peer_ms", ms);
+	R.check("a 25 MiB attachment a sealed reaches b and c byte-identical", clipMs.every((ms) => ms !== null), { ms: clipMs });
 
 	R.step("at rest on the relay: no note text, attachment bytes or file names");
 	const relayFiles = filesUnder(STATE_DIR);

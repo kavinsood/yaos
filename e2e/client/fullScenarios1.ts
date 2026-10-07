@@ -180,6 +180,10 @@ export async function sAttachments(x: FullCtx): Promise<void> {
 	await put(a, "attachments/manual.pdf", randomBytes(2 * 1024 * 1024, 12), "attachment_2m_to_peer_ms");
 	for (let i = 0; i < 4; i++) await put(i % 2 ? b : a, `attachments/small-${i}.jpg`, randomBytes(40 * 1024 + i, 20 + i), "attachment_40k_to_peer_ms");
 	await put(b, "attachments/photo.png", randomBytes(300 * 1024, 13), "attachment_modify_to_peer_ms");
+	// 25 MiB (the relay takes up to 100 MB, DECISIONS D9): its own metric, kept out of attachment_to_peer_ms.
+	const clip = randomBytes(25 * 1024 * 1024, 14), tClip = performance.now();
+	a.vault.externalWrite("attachments/clip.mp4", clip);
+	for (const ms of await reachPeers([b, c], "attachments/clip.mp4", clip, tClip, 120_000)) x.R.record("attachment_25m_to_peer_ms", ms);
 	const t0 = performance.now();
 	c.vault.userDelete("attachments/manual.pdf");
 	for (const ms of await reachPeers([a, b], "attachments/manual.pdf", null, t0, 60_000)) x.R.record("delete_to_peer_ms", ms);
