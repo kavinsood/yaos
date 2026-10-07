@@ -28,6 +28,7 @@ import { suite0PinForTest } from "../../src/host/keys/testkit/pinFixture";
 import { DEFAULT_ENGINE_SETTINGS } from "../../src/host/ui/api";
 import { createEngine, type EngineHandle } from "../../src/engine/compose/protocolEngine";
 import type { VaultRuntime } from "../../src/engine/compose/vaultRuntime";
+import type { EngineTuning } from "../../src/engine/runtime/options";
 import { createHttpBlob, probeHttpBlob } from "../../src/engine/adapters/httpBlob";
 import { createIdbStoragePort } from "../../src/engine/adapters/idbStorage";
 import { createNoopCrypto } from "../../src/engine/adapters/noopCrypto";
@@ -155,6 +156,8 @@ export interface FullClientOptions {
 	readonly settings?: Partial<EngineSettings>;
 	/** Times this client's relay HTTP calls, socket and storage transactions (bootBench.ts). */
 	readonly trace?: BootTrace;
+	/** Engine tuning overrides (snapshots.ts: a short blob GC grace). */
+	readonly tuning?: Partial<EngineTuning>;
 }
 
 const LOG_RING = 400;
@@ -225,6 +228,7 @@ export class FullClient {
 		const handle = createEngine(pair.engine, {
 			carrier: "inline",
 			clientVersion: "full-e2e",
+			...(this.o.tuning ? { tuning: this.o.tuning } : {}),
 			tzOffsetMinutes: () => 0,
 			log: (line) => this.log(`engine: ${line}`),
 			onRuntime: (rt) => {

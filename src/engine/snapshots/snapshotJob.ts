@@ -17,6 +17,7 @@ import { verifyBundle } from "../../core/snap/verify";
 import { standInPathKey } from "../../core/plan/pathRules";
 import type { DeviceId, DocKind, PathKeyFn, VaultPath } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
+import type { PutPolicy } from "../blobs/blobStore";
 import type { ClockPort } from "../../ports/clock";
 import type { CryptoPort } from "../../ports/crypto";
 import type { SideFilePort } from "../../ports/vault";
@@ -48,7 +49,7 @@ export interface SnapshotDeps {
 	readonly files: () => readonly { readonly path: VaultPath; readonly kind: DocKind; readonly size: number }[];
 	readonly settings: () => { readonly enabled: boolean; readonly keepDaily: number; readonly uploadToBlobStore: boolean };
 	/** Blob store and snapshot index; null without a blob store (local snapshots only). */
-	readonly remote?: { readonly store: BlobPort; readonly index: SnapIndexPort } | null;
+	readonly remote?: { readonly store: BlobPort; readonly index: SnapIndexPort; readonly touch: PutPolicy } | null;
 	readonly pathKey?: PathKeyFn;
 	readonly deviceLabel: string;
 	readonly tzOffsetMinutes?: () => number;
@@ -75,7 +76,7 @@ export class SnapshotJob {
 
 	constructor(private readonly deps: SnapshotDeps) {
 		this.pk = deps.pathKey ?? standInPathKey;
-		this.rd = deps.remote ? { store: deps.remote.store, index: deps.remote.index, crypto: deps.crypto } : null;
+		this.rd = deps.remote ? { store: deps.remote.store, index: deps.remote.index, touch: deps.remote.touch, crypto: deps.crypto } : null;
 	}
 
 	/** Local snapshots, oldest first (cached; only this job writes snapshot side files). */

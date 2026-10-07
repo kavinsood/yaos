@@ -1,8 +1,8 @@
 /** The write gate's port wrappers (e2ee-design §9.3, §12.4): no seal and no blob upload while it is shut. */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress } from "../../ports/crypto";
+import { SimBlobStore } from "../../sim/blobStore";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import type { KeyMissingReason } from "../../protocol/status";
@@ -10,18 +10,6 @@ import { KeyMissingError, assertWritable, gatedBlob, gatedCrypto, keyringCryptoO
 import { device } from "./testkit/world";
 
 const ADDR = "a".repeat(64) as BlobAddress;
-
-function memBlob(): BlobPort & { puts: number } {
-	const m = new Map<BlobAddress, Uint8Array>();
-	const b = {
-		maxBlobBytes: 1 << 20,
-		puts: 0,
-		has: async (as: readonly BlobAddress[]) => new Set(as.filter((a) => m.has(a))),
-		put: async (a: BlobAddress, bytes: Uint8Array) => void (b.puts++, m.set(a, bytes)),
-		get: async (a: BlobAddress) => m.get(a) ?? null,
-	};
-	return b;
-}
 
 describe("write gate", () => {
 	it("seal and sealBlob refuse while shut (nothing reaches the inner port, no seal is counted); open still works", async () => {
@@ -40,17 +28,24 @@ describe("write gate", () => {
 		assert.equal((await c.open({ purpose: "frame", suite: 0, keyEpoch: 0, aad: input.aad, sealed })).ok, true, "reading is allowed");
 	});
 
-	it("blob put refuses while shut; has and get pass; no blob port stays null", async () => {
-		let reason: KeyMissingReason | null = "revoked-epoch";
-		const inner = memBlob();
+	it("blob put and GC delete refuse while shut; has, get and list pass; no blob port stays null", async () => {
+		let reason: KeyMissingReason | null = null;
+		let t = 0;
+		const inner = new SimBlobStore({ now: () => t });
 		const b = gatedBlob(inner, () => reason)!;
-		await assert.rejects(b.put(ADDR, new Uint8Array(1)), KeyMissingError);
-		assert.equal(inner.puts, 0);
-		assert.deepEqual([...(await b.has([ADDR]))], []);
-		assert.equal(await b.get(ADDR), null);
-		reason = null;
 		await b.put(ADDR, new Uint8Array(1));
-		assert.equal(inner.puts, 1);
+		t = 10;
+		reason = "revoked-epoch";
+		await assert.rejects(b.put(ADDR, new Uint8Array(2)), KeyMissingError);
+		await assert.rejects(b.deleteIfUploadedBefore([ADDR], 5), KeyMissingError);
+		assert.equal(inner.calls.put, 1);
+		assert.equal(inner.calls.delete, 0);
+		assert.deepEqual([...(await b.has([ADDR]))], [ADDR]);
+		assert.deepEqual(await b.get(ADDR), new Uint8Array(1));
+		assert.deepEqual((await b.list(null)).items.map((i) => i.address), [ADDR]);
+		reason = null;
+		assert.deepEqual(await b.deleteIfUploadedBefore([ADDR], 5), [{ address: ADDR, result: "deleted", uploadedAt: 0 }]);
+		assert.equal(inner.objects.size, 0);
 		assert.equal(gatedBlob(null, () => null), null);
 	});
 

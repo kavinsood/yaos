@@ -19,7 +19,7 @@ import { blobChunkStream, streamClass, type CfgOp, type ClientFrameId, type Cont
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort, HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
-import { putSealed, storePlaintextCap } from "../blobs/blobStore";
+import { putSealed, storePlaintextCap, type PutPolicy } from "../blobs/blobStore";
 import { sealFrame } from "../ingest/envelope";
 import type { NewOutboxFrame } from "../store/repo";
 import { encodeCfgOps } from "../../core/codec/cfgOps";
@@ -38,6 +38,8 @@ export interface FrameCtx {
 	readonly hash: HashPort;
 	readonly random: RandomPort;
 	readonly blob: BlobPort | null;
+	/** When a present blob may be re-used (e2ee-design §10.4 R2). */
+	readonly touch: PutPolicy;
 }
 
 export class FrameTooLargeError extends Error {
@@ -78,7 +80,7 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 	const refContent = encodeBodyUpdateRef({ hash, size: input.content.length });
 	if (ctx.blob && input.content.length <= storePlaintextCap(ctx.crypto, ctx.blob)) {
 		try {
-			await putSealed(ctx.blob, ctx.crypto, hash, input.content);
+			await putSealed(ctx.blob, ctx.crypto, hash, input.content, ctx.touch);
 			return [await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, 0, refContent, input.content, state, input.dependsOn, input.nowMs)];
 		} catch {
 			// Blob store unavailable: fall through to the log path.

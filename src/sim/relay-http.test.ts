@@ -51,8 +51,8 @@ test("relay read: paged by payload bytes (at least one row) and readPageRows; ne
 		after = page.nextAfterSeq;
 	}
 	assert.deepEqual(pages, [[[1, 2], 2, true], [[3], 3, true], [[4], 4, true], [[5], 5, false]]);
-	assert.deepEqual(await read("ns", 5), { checkpoint: null, rows: [], lastSeq: 5, checkpointSeq: 0, nextAfterSeq: 5, more: false });
-	assert.deepEqual(await read("nope", 3), { checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 0, nextAfterSeq: 3, more: false });
+	assert.deepEqual(await read("ns", 5), { checkpoint: null, rows: [], lastSeq: 5, checkpointSeq: 0, gcSeq: 0, nextAfterSeq: 5, more: false });
+	assert.deepEqual(await read("nope", 3), { checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 0, gcSeq: 0, nextAfterSeq: 3, more: false });
 	const row = (await read("ns", 0)).rows[0]!;
 	assert.deepEqual([row.deviceId, row.clientFrameId, row.payload.byteLength], ["A", "r1", 10]);
 	await assert.rejects(read("", 0), rejectsWith("invalid_stream"));

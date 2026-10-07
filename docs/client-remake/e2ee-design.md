@@ -632,23 +632,141 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
 
 ### 10.4 Garbage collection
 
-- **Today** (suite 0 as well): the server has no blob list or delete route (DECISIONS §2.2). Blobs live until the
-  vault is deleted (R2 prefix purge, DECISIONS D5). E2EE changes nothing here until server ask A3.
-- **With A3: client mark-and-sweep.** Cold path: a user command or at most monthly, on one device.
-  1. Live set: the addresses of every sha256 referenced by ns entries (live, plus tombstones inside retention),
-     unresolved `bodyUpdateRef`s, every part address named by a non-tombstoned `snap` record (§8.1), and the
-     local blob queue. The sweep reads `ns` and `snap` to head first. A server that withholds `snap` rows can make
-     the sweep delete snapshot parts, but it can delete them itself anyway (availability is a non-goal, §2.1).
-  2. Page through `GET /vault/:id/blobs` (A3), which returns addresses and upload times.
-  3. For each address that is not live and was uploaded more than 7 days ago, call
-     `DELETE /vault/:id/blobs/:addr?ifUploadedBefore=<ms>` (A3).
-     - The condition is checked against the R2 object's upload time, so a concurrent re-upload (PUT refreshes it)
-       survives.
-     - The grace period covers the gap between a put and the ns frame that references it (DESIGN §j.1 "only after
-       the put succeeds").
-- **Scale caveat (user, 2026-10-07).** The sweep is O(N) on the client: it lists every blob address (~50k on a heavy
-  vault) and does set arithmetic against the live set on whatever device runs it, possibly a phone. It will buckle
-  on heavy vaults. It is acceptable for v1 only because it is a cold, manual path. Future directions, not designed
+The server cannot see which blobs a vault references (under suite 1 it sees opaque addresses), so blob GC is a
+client mark-and-sweep against the server's list and batch conditional delete (server ask A3, built: relay-wire
+§11.3.1). The same code runs under suite 0. Implemented in WP-E6b.
+
+- **Server part** (relay-wire §11.3.1, `server/src/router.ts:639-686`):
+  - `GET /vault/:id/blobs?cursor=` pages `{address, uploadedAt}` in address order, 1000 a page. It may answer
+    `503 list_incomplete` with Retry-After.
+  - `POST /vault/:id/blobs/delete {"ifUploadedBefore", "addresses"}` takes 1–100 addresses and answers
+    `deleted | newer | absent` for each. R2 has no conditional delete, so all the heads run first and then one
+    delete (`:823-835`).
+  - Both routes share 60 requests a minute per vault: `429` with Retry-After (`server/src/vault/host.ts:418-424`).
+- **Client ports.** `BlobPort.list` and `BlobPort.deleteIfUploadedBefore` (`src/ports/blob.ts:44-50`, batches of
+  ≤ `BLOB_DELETE_BATCH` = 100).
+  - The HTTP adapter retries 429/503 after Retry-After, at most 5 calls, waits of ≤ 65 s, abortable on engine stop
+    (`src/engine/adapters/httpBlob.ts:36-39`, `:129-135`).
+  - `SimBlobStore` (`src/sim/blobStore.ts`) stamps `uploadedAt` from the sim clock, refreshes it on PUT, and has
+    hooks for the HEAD→delete race.
+- **Trigger.** Only the Obsidian command "Clean up unused server attachments": one `cleanUpAttachments` command,
+  one sweep in the worker, one notice. It says what was deleted, what was kept as newer, what was repaired or
+  lost, or why nothing was deleted (`src/host/ui/attachmentsCleanup.ts`). There is no schedule, status row,
+  settings row or progress UI.
+  - Path: `src/engine/compose/runtimeOps.ts:129-130` → `src/engine/runtime/blobGc.ts` (preconditions, live set)
+    → `src/engine/blobs/gc.ts` (sweep).
+  - It runs in the writer runtime, which exists only once the suite is pinned (WP-E4 `PinGate.writerPorts`).
+  - One sweep at a time (`busy`); engine stop aborts it (`interrupted`).
+- **Grace** `EngineTuning.blobGcGraceMs` = 7 days (`src/engine/runtime/options.ts:56-60`, `:87`). It is a tuning
+  knob: the e2e uses 8 s.
+
+**Preconditions.** Fail closed: any failure deletes nothing and names the reason in the notice. A live set
+computed from a partial view would delete live data.
+
+| Refusal | Check | Where |
+|---|---|---|
+| `no-store` | The vault has a blob store (VAULT_READY `attachments`) | `src/engine/runtime/blobGc.ts:97` |
+| `keys-unverified` | Suite 1: the sealing epoch is ≥ 1 and verified, and so is K_1, because addresses use the kAddr of K_1 (§5.1) | `:98-103` |
+| `offline`, `read-only` | A relay session, and it is writable | `:104-105` |
+| `not-caught-up` | `ns`, `cfg` and `snap` are read to the relay's head now, in this session (`SessionLoop.readFresh`, `src/engine/runtime/sessionLoop.ts:279-300`), and none is stale | `:115-117` |
+| `fold-incomplete` | No quarantined `ns` / `cfg` / `snap` row. Every fold is complete: not halted, its snapshot decodes, and each tail row opened, passed the gate, decodes, is folded and (for `snap`) has a known record version (`FoldRuntime.gap`, `src/engine/sync/foldRuntime.ts:162-184`; `src/engine/sync/snapRuntime.ts:51`) | `:118-124` |
+| `body-unreadable` | Every body/canvas row the relay still serves opens for this reader. A reader-dependent failure (`isReaderDependent`, `src/engine/ingest/envelope.ts:58`: unsupported version or suite, unknown key, a bad tag under an unverified key) may hide a ref, so it refuses. A deterministic failure is skipped, because no reader can resolve it | `:150-151`, `src/engine/blobs/bodyRefs.ts` |
+| `addressing-mismatch` | Safety net: nothing is deleted until the listing shows one of the addresses that the committed folds reference (else any live one). A listing that never shows one refuses. This guards against a wrong suite or key, under which every live address looks unknown | `src/engine/blobs/gc.ts:117-118`, `:150`, `:153-155` |
+
+**Live set** (`src/engine/runtime/blobGc.ts:125-152`). The `blobAddress` of:
+- every ns entry's blob, tombstones included. Tombstones stay in the fold until the count-based prune
+  (`TOMBSTONE_CAP` 20000, hysteresis 1000; `src/core/limits.ts:20-21`, `src/core/ns/fold.ts:224-226`);
+- every `cfg` file blob, and every part of every record in the `snap` fold. A `del` removes the record, and
+  readers recompute part addresses from the sha256 (`src/engine/snapshots/remote.ts:46`, `:73`). See
+  `committedBlobHashes`, `src/engine/blobs/touch.ts:31-37`;
+- every own outbox frame not yet committed (`frameBlobHashes`, `touch.ts:43-68`). For a `bodyUpdateRef` this is
+  the sha256 of the frame's content;
+- the blob queue: pending and running transfers, both directions (`BlobQueue.liveHashes`);
+- every `bodyUpdateRef` the relay still serves on the body/canvas stream of each ns entry and of each stream this
+  device holds.
+  - "Unresolved" means readable by a joiner. A read from 0 gets the checkpoint plus the rows above `gcSeq`
+    (`server/src/streams/store.ts:476-523`), and checkpoints hold Yjs state, never refs.
+  - So rows above `gcSeq` are scanned: a probe read after `MAX_SAFE_INTEGER` returns `lastSeq`/`gcSeq` only
+    (`server/src/streams/relay.ts:269-274`), then the rows are read from `gcSeq`. If compaction meanwhile moves
+    `gcSeq` past the cursor, the scan restarts at the new `gcSeq` (`src/engine/blobs/bodyRefs.ts:80-81`).
+
+**Sweep** (`src/engine/blobs/gc.ts:96-195`). Calls are sequential and honour Retry-After.
+1. R1 cutoff probe (below).
+2. Mark (above).
+3. Page `list`. An address is a candidate if it is not live and was uploaded before the cutoff; an unreferenced
+   address uploaded later counts as `keptNewer`. Candidates are deleted in batches of ≤ 100 with the same cutoff,
+   so the store re-checks the upload time and a re-upload meanwhile answers `newer`.
+4. R4 repair (below).
+5. Delete the probe. This is best effort: a stray probe is garbage for a later sweep.
+6. Prune put times older than grace/2 (`src/engine/runtime/blobGc.ts:87-90`).
+
+**Races.**
+- **R1, clock skew.** `uploadedAt` is R2's clock, so a device clock days ahead must not shrink the grace.
+  - The cutoff is taken on the store's clock. The sweep PUTs 1 byte at a random probe address and asks
+    `deleteIfUploadedBefore([probe], 0)`, which answers `newer` with R2's upload time T. Then
+    cutoff = T − grace (`gc.ts:197-210`).
+  - If the probe fails, cutoff = device now − grace − `GC_CLOCK_SKEW_MARGIN_MS` (1 day, `gc.ts:34`).
+  - Why not the `Date` header:
+    - it is the Worker's clock, not the clock that stamps `uploadedAt`;
+    - the server exposes no response headers to CORS (`server/src/` sets no `Access-Control-Expose-Headers`), and
+      `Date` is not a CORS-safelisted response header, so a browser `fetch` cannot read it;
+    - the probe needs no new route and behaves the same under miniflare.
+  - The probe runs before the mark. R3 depends on that order.
+- **R2, orphan reuse.** `putSealed` skipped the PUT when `exists` found the address. Re-adding bytes whose blob is
+  a long orphan would then rely on an object that a concurrent sweep may delete before the new reference commits.
+  - Now a found address is reused only if the committed folds reference its hash, or this device PUT it less than
+    grace/2 ago. The folds count only while they are current: a session, not halted, not stale
+    (`src/engine/runtime/context.ts:328-332`).
+  - The put time is persisted (meta `blobPut:<address>`), so it survives a restart.
+  - Otherwise the device PUTs again, which refreshes `uploadedAt` (`touch.ts:134-138`,
+    `src/engine/blobs/blobStore.ts:41-52`).
+  - A snapshot reusing parts of a live `snap` record still skips them (committed), so unchanged parts are not
+    uploaded again.
+- **R3, a pending reference.** A device offline for longer than the grace, with a reference in its outbox.
+  - Before the sender sends an own frame that references blobs (ns `create`/`setBlob` of a blob, cfg `filePut` of
+    a blob, `snap` put, a `bodyUpdateRef` through the store), each hash must be committed or have a fresh own PUT.
+    Otherwise it is PUT again (`touch.ts:169-249`):
+    - from local bytes: the frame's own content for a `bodyUpdateRef`, else a vault file, config file or own
+      snapshot part with that sha256 (`src/engine/compose/vaultRuntime.ts:261-287`);
+    - without local bytes, the stored object is re-PUT verbatim;
+    - a store error holds that frame (and later frames of its stream, `src/engine/body/sender.ts:343-346`) with
+      backoff instead of sending an unprotected reference.
+  - Changes from the first proposal:
+    - a cleared frame stays cleared for only grace/4 (monotonic clock), and a new session re-checks every frame.
+      So a frame committed at S had a PUT at P ≥ S − 3/4·grace;
+    - the verbatim re-PUT, and holding on store errors.
+  - Why it holds: if the sweep's mark did not see the frame, then S > mark > probe time T. So
+    P > T − 3/4·grace > cutoff, and the store answers `newer`.
+- **R4, the HEAD→delete window.** A PUT that lands after the store's head of an address and before its one delete
+  is deleted anyway and reported `deleted` (relay-wire §11.3.1).
+  - After its deletes, the sweep marks again: `ns`/`cfg`/`snap` to head, plus body rows committed since the first
+    mark.
+  - A deleted address that is live now is uploaded again from the plaintext sha256-checked bytes this device
+    holds (own outbox, vault file, config file, own snapshot part): `repaired`.
+  - Without bytes it is counted `lost`. The notice asks the user to add the file again from the device that has it
+    (`gc.ts:162-186`).
+- **What remains unrepairable or unchecked:**
+  - another device PUTs a long-orphaned address inside the HEAD→delete window (at most 17 rounds of 6 heads,
+    sub-second), and either its reference commits after the R4 re-read, or this device has no bytes (`lost`).
+    That device's R2 sees its own fresh PUT and sends the reference, so readers then see the blob as absent until
+    someone uploads it again. Closing this needs a conditional delete or a server-side touch (a server change, not
+    made);
+  - R2 and R3 decide on this device's committed view, which may be slightly stale. For example, a committed entry
+    that is replaced and pruned meanwhile;
+  - device wall-clock jumps backwards by more than grace/4 between a PUT and its reuse check. A future put time
+    already counts as stale;
+  - the fallback cutoff covers device↔R2 skew of ≤ 1 day only;
+  - references inside rows already folded into a local snapshot or relay checkpoint, under a newer `snap` version
+    or encoding this reader ignored before it was upgraded. `FoldRuntime.gap` checks only the tail;
+  - a relay restore to before a sweep. Blobs are not epoch-scoped (relay-wire §11.3), so references restored by
+    the rewind may name deleted blobs;
+  - a verbatim R3 refresh gives this device no plaintext for a later R4 repair;
+  - a failed re-mark leaves the deletes unchecked; the notice detail says so.
+- **Scale caveat (user, 2026-10-07).** The sweep is O(N) on the client. It lists every blob address (~50k on a
+  heavy vault) and does set arithmetic against the live set on whatever device runs it, possibly a phone. Before
+  the safety net sees a witness, the candidates accumulate as well. It will buckle on heavy vaults, and is
+  acceptable for v1 only because it is a cold, manual path. A sweep of N blobs with D orphans costs about
+  N/1000 + D/100 requests (≥ that many seconds at the limit), plus 2 for the probe. Future directions, not designed
   here: a resumable sweep with a persisted cursor, and a live set kept incrementally from the ns fold instead of
   rebuilt per run.
 - Alternative: server refcounts. Rejected: the server cannot see references under E2EE, and keeping refs
@@ -1206,7 +1324,7 @@ rather than an accident.
 | `X-YAOS-Content-SHA256` / `-Size` headers | Would leak the plaintext hash and size. At 7208184 they are only still named in the CORS expose list (`server/src/http.ts:7`); nothing sets or reads them | The client never sends them. Server ask A2 removes the stale names |
 | Server-side debugging of content | Impossible | Diagnostics carry `HMAC(kDiag, ·)` hashes (§6.4). The user shares a bundle and correlates locally |
 | Point-in-time restore (D8b) | **Still works**: opaque rows rewind | Old keys stay in the keyring. `k` is re-published (§11.5) |
-| Blob garbage collection | The server cannot see references | Client mark-and-sweep (§10.4), blocked on A3 |
+| Blob garbage collection | The server cannot see references | Client mark-and-sweep on a user command, over the A3 list and batch delete (§10.4, WP-E6b) |
 | Cross-vault dedupe | Impossible: kAddr is per vault | None, by design |
 | Server search, publish or web view | Impossible | None (out of scope) |
 | Server-held key recovery | Never existed | RK (§13) |
@@ -1440,7 +1558,7 @@ Applied so far: the §j.1 `x:` stream naming (WP-E6a: DESIGN §b.2, §b.4, §b.6
  §j.1 Blobs (:1657)
 -  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<sha256>` as `blobChunk` frames
 +  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<blobAddress>` as `blobChunk` frames
-+- **GC.** Blobs are never deleted until the server has list and delete routes; then client mark-and-sweep (e2ee-design §10.4).
++- **GC.** Client mark-and-sweep on the command "Clean up unused server attachments" (e2ee-design §10.4).
 
  §j.7 Diagnostics (:1766)
 -  - recent events (… **hashed** paths),
@@ -1456,7 +1574,7 @@ Baseline: 7208184. No ask is on the hot path, and none adds cross-DO coordinatio
 |---|---|---|---|
 | A1 | Rewrite relay-wire §11.3 (:464) to DECISIONS §5 row 11.3: opaque `^[0-9a-f]{64}$` addresses, no hash check, R2 key `v/<vaultId>/<address>`, PUT overwrites | The doc still describes sha256 addresses that the server verifies | Doc, before WP-E6a |
 | A2 | Drop `X-YAOS-Content-SHA256, X-YAOS-Content-Size` from `CORS_EXPOSE_HEADERS` (`server/src/http.ts:7`) | Stale names for plaintext-revealing headers. Nothing sets them, but they invite reintroduction | Trivial |
-| A3 | `GET /vault/:id/blobs?cursor=` → `{items: [{address, uploadedAt}], next}` (R2 `list` with prefix `v/<vaultId>/`), and `DELETE /vault/:id/blobs/:address?ifUploadedBefore=<ms>` (R2 `head` then `delete`). Device bearer. Cold path, low rate limit | Blob GC (§10.4). Without it, blobs live until the vault is deleted, under any suite | Before WP-E6b |
+| A3 | `GET /vault/:id/blobs?cursor=` → `{items: [{address, uploadedAt}], next}` (R2 `list` with prefix `v/<vaultId>/`), and a batch conditional delete `POST /vault/:id/blobs/delete {"ifUploadedBefore", "addresses"}` (1–100; R2 `head`s, then one `delete`). Device bearer. Cold path, 60 requests/min per vault | Blob GC (§10.4). Without it, blobs live until the vault is deleted, under any suite | **Done** (relay-wire §11.3.1); used by WP-E6b |
 | A4 | `POST …/blobs/exists`: answer `400` on a malformed entry instead of silently dropping it (`server/src/router.ts:624-650` filters with `BLOB_ADDRESS_PATTERN`) | A client bug in HMAC addressing would look like "absent" and cause re-uploads forever | Low |
 | A5 | Keep restore carrying the pre-restore device rows (already true, DECISIONS D8b "Crosses the rewind: the device rows only") | A revoked device must stay revoked after a restore (§14.3) | Confirm only |
 | A6 | Keep minting a fresh random epoch on reset and restore (already true, D8, D8a, D8b) | The client re-publishes `k` on a new epoch (§11.5) | Confirm only |
@@ -1563,11 +1681,11 @@ There is one agent per package. Sizes: S ≈ 1 agent-day, M ≈ 2–3, L ≈ 4�
 | **E4** Host key storage + protocol | `src/host/keys/**` (SecretStorage adapter, 5 s wait, pin incl. unpinned and `keyringSeen`, Linux notice), `src/protocol/**` (§18.4: unpinned config, `pinSuite0`), persist-before-use; the engine's unpinned mode (reads `k` only) | E1 shape | Restart keeps keys; IDB wipe keeps keys; at-rest leak check (§20.3) is zero; an unpinned engine issues zero writes | M |
 | **E5** Pairing, RK, revoke UX | `src/host/ui/**`: QR (`qrcode`), the `key`/`suite` link parameters stripped before `/enroll`, the blocked key-less screen (§12.4), the "Create a new vault" creation path with its `Origin` check first (§15.1), RK show/confirm/enter, revoke re-key, re-key QR, hiding `mobileSetupUrl` under both suites, device-name hint | E3, E4 | UI tests for each flow; `/enroll` request bodies asserted key-free; the link is never in logs; no path from a link, code or console QR reaches the creation flow or a suite-0 pin | L |
 | **E6a** Blob addressing and format | `src/engine/body/frames.ts` blob path, `src/engine/blobs/blobQueue.ts`, `src/engine/body/refs.ts`, `src/engine/runtime/blobChunks.ts`, `blobChunkStream(address)` | E1, E2 | Sealed-blob golden vector; dedupe via `has`; `x:` names carry no hash | S |
-| **E6b** Blob GC | `src/engine/blobs/gc.ts`, `BlobPort.list/deleteIf` | **A3** | Mark-and-sweep against a sim blob store with races (re-upload during the sweep survives) | M |
+| **E6b** Blob GC | `src/engine/blobs/{gc,bodyRefs,touch}.ts`, `src/engine/runtime/blobGc.ts`, `BlobPort.list/deleteIfUploadedBefore` (HTTP adapter, `SimBlobStore`), the `cleanUpAttachments` command and its one notice | **A3** (done) | **Done.** §10.4: fail-closed preconditions, live set, R1–R4. Unit and engine tests against `SimBlobStore` (pagination with deletes, re-upload survives as `newer`, R2 orphan reuse, R3 resume after > grace offline, R4 repair and loss, every refusal deletes nothing, suite 1 HMAC addresses, 429/503 retry, skewed clock); e2e/client/snapshots.ts GC step on the local relay with `--r2` | M |
 | **E7** Verification | `DelayedCrypto`, sim `crypto: "suite1"`, new faults, the §20.2 measured tests, a perf bench against the §16 budgets | E1–E3 | The suite-1 fault matrix is green at suite-0 seed counts; every §20.2 assertion holds | M |
 | **E8** Docs | Apply §18.5 and §18.6 to relay-wire.md and DESIGN.md | E2 merged | Docs match the code | S |
 
-Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b waits for A3.
+Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b needed A3 (done).
 
 **E3 as built** (where the code differs from the text above; the sections cited are updated):
 - §18.4 protocol shapes landed with E3, not E4: `init.crypto`, the five UserCommands, `keyringChanged` (with a

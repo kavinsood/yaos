@@ -23,7 +23,8 @@ import { bytesToHex as toHex } from "../../core/codec/lib0";
 import { encodeBodyUpdateRef as encodeBodyRef } from "../../core/codec/contents";
 import { FrameBuilder } from "./frameBuilder";
 import { FrameTooLargeError, buildBlobChunkFrame, buildBodyFrames, initialTextUpdates, splitInitialText, type FrameCtx } from "./frames";
-import { assembleChunks, resolveRef, resolveRefContent } from "./refs";
+import { assembleChunks } from "../blobs/chunks";
+import { decodeChunks, resolveRef, resolveRefContent } from "./refs";
 import { decodeBlobChunk, encodeBlobChunk } from "../../core/codec/contents";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
@@ -32,7 +33,7 @@ import { DEFAULT_RELAY_LIMITS } from "../adapters/wsRelay";
 const hash = createWebHash();
 const crypto = createNoopCrypto(hash);
 const VAULT = "v1" as VaultId;
-const ctx: FrameCtx = { vaultId: VAULT, self: "dev1" as DeviceId, crypto, hash, random: createWebRandom(), blob: null };
+const ctx: FrameCtx = { vaultId: VAULT, self: "dev1" as DeviceId, crypto, hash, random: createWebRandom(), blob: null, touch: { reuse: async () => true, noted: async () => {} } };
 const gctx: GateCtx = { crypto, vaultId: VAULT, maxCheckpointStateBytes: 1 << 20, staleCheck: () => null };
 const BODY = "b:doc1" as StreamName;
 
@@ -163,8 +164,8 @@ test("buildBodyFrames: > MAX_INLINE_UPDATE_BYTES without a blob store -> x: chun
 	assert.deepEqual(ref.content, u, "outbox keeps the full update for local reload");
 	const g = await gate(gctx, { t: "row", stream: BODY, seq: 1, deviceId: "d" as never, clientFrameId: ref.clientFrameId, payload: ref.sealed });
 	assert.ok(g.ok && g.t === "bodyRef" && g.ref.hash === h && g.ref.size === u.length);
-	assert.deepEqual(assembleChunks(chunks.map((c) => c.content).reverse(), h), u, "chunks reassemble in any order");
-	assert.equal(assembleChunks(chunks.slice(1).map((c) => c.content), h), null, "incomplete");
+	assert.deepEqual(assembleChunks(h, decodeChunks(chunks.map((c) => c.content).reverse())), { ok: true, bytes: u }, "chunks reassemble in any order");
+	assert.deepEqual(assembleChunks(h, decodeChunks(chunks.slice(1).map((c) => c.content))), { ok: false, reason: "incomplete" });
 
 	const dep = "dep-frame-id-000000000" as ClientFrameId;
 	const withDep = await buildBodyFrames(ctx, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: dep, nowMs: 0 });
@@ -199,6 +200,8 @@ test("buildBodyFrames: BlobPort path puts once (deduped by has), falls back to x
 		async get(a) {
 			return store.get(a) ?? null;
 		},
+		list: async () => { throw new Error("unused"); },
+		deleteIfUploadedBefore: async () => { throw new Error("unused"); },
 	};
 	const bctx = { ...ctx, blob };
 	const u = textUpdate(MAX_INLINE_UPDATE_BYTES + 10);
@@ -294,6 +297,8 @@ test("suite 1, store path: ref blobs sealed at their address; tampered -> determ
 		has: async (as) => { if (down) throw new Error("offline"); return new Set(as.filter((a) => objects.has(a))); },
 		put: async (a, b) => void objects.set(a, b.slice()),
 		get: async (a) => { if (down) throw new Error("offline"); return objects.get(a)?.slice() ?? null; },
+		list: async () => { throw new Error("unused"); },
+		deleteIfUploadedBefore: async () => { throw new Error("unused"); },
 	};
 	const s1 = await suite1(0xe3);
 	const u = textUpdate(MAX_INLINE_UPDATE_BYTES + 10);

@@ -6,11 +6,12 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type ClientFrameId, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, blobChunkStream, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
 import type { DiagnosticsEvent, EnginePhase, KeyMissingReason, StatusSnapshot } from "../../protocol/status";
+import { BlobTouch, committedBlobHashes } from "../blobs/touch";
 import { CheckpointState, type CheckpointDeps } from "../body/checkpoints";
 import { DailyLimitNoticeGate } from "./dailyLimit";
 import type { FrameCtx } from "../body/frames";
@@ -55,6 +56,9 @@ export class EngineCtx {
 	readonly ckpt = new CheckpointState();
 	readonly gateCtx: Mut<GateCtx>;
 	readonly deps: EngineDeps;
+	/** R2 put policy and R3 send gate (e2ee-design §10.4). */
+	readonly touch: BlobTouch;
+	private committedCache: { readonly key: readonly unknown[]; readonly hashes: ReadonlySet<ContentHash> } | null = null;
 	repo!: Repo;
 	ns!: NsRuntime;
 	cfg!: CfgRuntime;
@@ -108,6 +112,25 @@ export class EngineCtx {
 		// The one write gate (writeGate.ts): shut until the keyring is open, then whenever it reports key-missing.
 		const gate = (): KeyMissingReason | null => (c.keyring ? c.keyring.keyMissing() : "no-pin");
 		this.gate = gate;
+		// Every blob write (upload, refresh PUT, GC delete) and every seal goes through the gate.
+		const blob = gatedBlob(opts.ports.blob, gate);
+		const crypto = gatedCrypto(opts.ports.crypto, gate, () => c.keyring?.noteSeal());
+		this.touch = new BlobTouch({
+			store: blob,
+			crypto,
+			hash: opts.ports.hash,
+			clock: opts.ports.clock,
+			graceMs: this.tuning.blobGcGraceMs,
+			times: () => c.repo,
+			committed: () => c.committedBlobs(),
+			blobBytes: (h) => opts.blobBytes?.(h) ?? Promise.resolve(null),
+			logCarried: (address) => {
+				const xs = blobChunkStream(address);
+				return c.outbox.ofStream(xs).length > 0 || c.repo.stream(xs) !== undefined;
+			},
+			onReady: () => c.sender?.poke(),
+			diag: (code, fields) => c.diag(code, fields),
+		});
 		this.deps = {
 			get repo() {
 				return c.repo;
@@ -117,9 +140,10 @@ export class EngineCtx {
 			nowMs: () => c.now(),
 			gateCtx: this.gateCtx,
 			hash: opts.ports.hash,
-			crypto: gatedCrypto(opts.ports.crypto, gate, () => c.keyring?.noteSeal()),
+			crypto,
 			random: opts.ports.random,
-			blob: gatedBlob(opts.ports.blob, gate),
+			blob,
+			touch: this.touch,
 			self: opts.deviceId,
 			vaultId: opts.vaultId,
 			adoptFor: (d, f) => c.adoptFor(d, f),
@@ -331,6 +355,23 @@ export class EngineCtx {
 		} catch (e) {
 			this.diag("callback-failed", { name, error: String(e) });
 		}
+	}
+
+	/**
+	 * Blob hashes the committed ns / cfg / snap folds reference (blobs/touch.ts committedBlobHashes), or null when
+	 * the folds may be behind the relay: no session or live queue, a fold stream stale or halted.
+	 */
+	committedBlobs(): ReadonlySet<ContentHash> | null {
+		if (!this.session || !this.live?.enabled) return null;
+		for (const rt of [this.ns, this.cfg, this.snap]) {
+			if (rt.halted || this.repo.stream(rt.stream)?.stale === 1) return null;
+		}
+		const key = [this.ns.state, this.ns.coversSeq, this.cfg.state, this.cfg.coversSeq, this.snap.state, this.snap.coversSeq];
+		const hit = this.committedCache;
+		if (hit && hit.key.every((k, i) => k === key[i])) return hit.hashes;
+		const hashes = committedBlobHashes(this.ns.state, this.cfg.state, this.snap.state);
+		this.committedCache = { key, hashes };
+		return hashes;
 	}
 
 	/** Own ns create of `docId` still in the outbox (held dependency for its first body frames), else null. */

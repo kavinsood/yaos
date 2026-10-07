@@ -131,6 +131,14 @@ function countingBlob(): { port: BlobPort; puts: number; calls: number } {
 				c.calls++;
 				return null;
 			},
+			list: async () => {
+				c.calls++;
+				return { items: [], next: null };
+			},
+			deleteIfUploadedBefore: async () => {
+				c.calls++;
+				return [];
+			},
 		} as BlobPort,
 	};
 	return c;

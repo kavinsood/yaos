@@ -102,6 +102,8 @@ export interface ReadPage {
 	readonly lastSeq: Seq;
 	/** Stream's current checkpoint coversSeq (0 = none): the CAS base for putCheckpoint. */
 	readonly checkpointSeq: Seq;
+	/** Highest collected seq (0 = none): rows at or below it are gone, every row above it is still served (relay-wire §7). */
+	readonly gcSeq: Seq;
 	/** Pass as afterSeq for the next page. */
 	readonly nextAfterSeq: Seq;
 	readonly more: boolean;

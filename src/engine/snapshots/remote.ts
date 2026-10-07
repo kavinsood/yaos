@@ -1,8 +1,10 @@
 /**
- * Snapshot parts in the blob store (DESIGN §j.4). Parts go through the attachments' one blob path (putSealed /
+ * Snapshot parts in the blob store (DESIGN §j.4). Parts go through the attachments' one blob path (putAt /
  * getOpened: CryptoPort.blobAddress of the part's SHA-256, sealBlob / openBlob), so a crypto suite change applies
- * unchanged. Upload is idempotent and resumable per part: parts already present are not read or sent again, and
- * the index record is appended only after every part is stored and only if the index does not have it yet.
+ * unchanged. Upload is idempotent and resumable per part: a part already present is not read or sent again when
+ * the put policy re-uses it (a live snap record names it, or this device stored it less than half the GC grace
+ * ago, e2ee-design §10.4 R2), and the index record is appended only after every part is stored and only if the
+ * index does not have it yet.
  */
 import { retentionFloor, snapLive } from "../../core/snap/fold";
 import { sha256Hex } from "../../core/hash/sha256";
@@ -10,7 +12,7 @@ import { snapKey, type SnapOp, type SnapRecord } from "../../core/snap/record";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort } from "../../ports/crypto";
 import type { SideFilePort } from "../../ports/vault";
-import { getOpened, putSealed, storePlaintextCap } from "../blobs/blobStore";
+import { getOpened, putAt, storePlaintextCap, type PutPolicy } from "../blobs/blobStore";
 import { dlName, partName } from "./localStore";
 import type { SnapIndexPort } from "./snapIndex";
 
@@ -18,6 +20,7 @@ export interface RemoteDeps {
 	readonly store: BlobPort;
 	readonly crypto: CryptoPort;
 	readonly index: SnapIndexPort;
+	readonly touch: PutPolicy;
 }
 
 export type UploadOutcome = "uploaded" | "present" | "deleted" | "not-ready";
@@ -29,7 +32,7 @@ export class SnapshotUploadError extends Error {}
  * of this device's uploads). Throws on store errors and on local parts that no longer match the descriptor.
  */
 export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: SnapRecord, keep: number): Promise<UploadOutcome> {
-	const { index, store, crypto } = r;
+	const { index, store, crypto, touch } = r;
 	const before = index.view();
 	if (!before.ready) return "not-ready";
 	const key = snapKey(index.self, record.snapshotId);
@@ -43,13 +46,13 @@ export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: 
 	for (const p of record.parts) addresses.push(await crypto.blobAddress(p.sha256));
 	const have = await store.has(addresses);
 	for (let i = 0; i < record.parts.length; i++) {
-		if (have.has(addresses[i]!)) continue;
 		const want = record.parts[i]!;
+		if (have.has(addresses[i]!) && await touch.reuse(want.sha256, addresses[i]!)) continue;
 		const bytes = await side.read(partName(record.snapshotId, i));
 		if (!bytes || bytes.length !== want.size || sha256Hex(bytes) !== want.sha256) {
 			throw new SnapshotUploadError(`local part ${i + 1}/${record.parts.length} of ${record.snapshotId} is missing or damaged`);
 		}
-		await putSealed(store, crypto, want.sha256, bytes);
+		await putAt(store, crypto, touch, want.sha256, addresses[i]!, bytes);
 	}
 	const put: SnapRecord = { ...record, parts: record.parts.map((p, i) => ({ ...p, address: addresses[i]! })) };
 	const view = index.view();

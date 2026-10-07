@@ -44,7 +44,7 @@ export function createWebEngine(transport: EngineTransport, carrier: "worker" | 
 			const random = createWebRandom();
 			const storage = createIdbStoragePort();
 			const relay = createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random });
-			const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential };
+			const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock };
 			const blob = await probeHttpBlob(blobOpts).catch(() => createHttpBlob(blobOpts));
 			const c = config.crypto;
 			// Suite-1 keys are zero-filled once imported (webCryptoSuite1.ts); the port outlives runtime restarts.

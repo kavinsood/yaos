@@ -57,10 +57,11 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 		return this.state.coversSeq;
 	}
 
-	protected reset(snap: SnapshotRecord | undefined): void {
+	protected reset(snap: SnapshotRecord | undefined): boolean {
 		const st = snap && snap.encoding === CheckpointEncoding.nsFoldV1 && snap.bytes.length > 0 ? decodeNsFoldV1(snap.bytes) : null;
 		this.state = st ?? newNsFoldState();
 		this.index = buildIndex(this.state);
+		return !snap || st !== null;
 	}
 
 	protected decodeOps(content: Uint8Array): NsOp[] | null {

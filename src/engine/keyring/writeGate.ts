@@ -56,7 +56,7 @@ export function gatedCrypto(inner: CryptoPort, gate: GateFn, onSeal: () => void)
 	};
 }
 
-/** `inner` with put refused while the gate is shut (has / get stay: reading is allowed). */
+/** `inner` with put and delete refused while the gate is shut (has / get / list stay: reading is allowed). */
 export function gatedBlob(inner: BlobPort | null, gate: GateFn): BlobPort | null {
 	if (!inner) return null;
 	return {
@@ -69,6 +69,11 @@ export function gatedBlob(inner: BlobPort | null, gate: GateFn): BlobPort | null
 			return inner.put(address, bytes);
 		},
 		get: (a) => inner.get(a),
+		list: (cursor, signal) => inner.list(cursor, signal),
+		deleteIfUploadedBefore: async (addresses, cutoffMs, signal) => {
+			assertWritable(gate);
+			return inner.deleteIfUploadedBefore(addresses, cutoffMs, signal);
+		},
 	};
 }
 

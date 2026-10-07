@@ -11,7 +11,7 @@ import { CFG_STREAM, NS_STREAM, type ClientFrameId, type StreamName } from "../.
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { AppendFrame, RelaySession } from "../../ports/relay";
 import type { OutboxRecord } from "../store/schema";
-import { BUFFERED_HIGH_WATER, DURABILITY_RETRY_MS, Sender, TokenBucket } from "./sender";
+import { BUFFERED_HIGH_WATER, DURABILITY_RETRY_MS, Sender, TokenBucket, type SendGate } from "./sender";
 
 class FakeClock implements ClockPort {
 	t = 1_000;
@@ -80,7 +80,7 @@ function rec(stream: StreamName, bytes = 10, over: Partial<OutboxRecord> = {}): 
 }
 const RANK: Record<string, number> = { [BOUND]: 0, [NS_STREAM]: 1, [CFG_STREAM]: 2, [BG]: 3, [X]: 4 };
 
-function mk(maxInflight = 10 * 1024 * 1024) {
+function mk(maxInflight = 10 * 1024 * 1024, sendGate?: SendGate) {
 	const clock = new FakeClock();
 	const ev = { sent: [] as [string, number][], poison: [] as [string, string][], forbidden: 0, daily: [] as number[], diag: [] as string[], reseal: [] as string[] };
 	const gate = { blocked: false, minEpoch: 0 };
@@ -88,7 +88,7 @@ function mk(maxInflight = 10 * 1024 * 1024) {
 		clock, rankOf: (r) => RANK[r.stream] ?? 3, maxInflightBytes: () => maxInflight,
 		onSent: (r, a) => ev.sent.push([r.clientFrameId, a]), onPoison: (r, why) => ev.poison.push([r.clientFrameId, why]),
 		onForbidden: () => ev.forbidden++, onDailyLimit: (ms) => ev.daily.push(ms), writeBlocked: () => gate.blocked, diag: (c) => ev.diag.push(c),
-		minSendEpoch: () => gate.minEpoch, reseal: (r) => ev.reseal.push(r.clientFrameId),
+		minSendEpoch: () => gate.minEpoch, reseal: (r) => ev.reseal.push(r.clientFrameId), gate: sendGate,
 	});
 	const add = (...rs: OutboxRecord[]) => { for (const r of rs) sender.upsert(r); clock.advance(0); return rs; };
 	return { clock, ev, sender, add, gate };
@@ -337,4 +337,27 @@ test("sender: below the revoke floor, or not sealed yet, a record goes to reseal
 	sender.onResend();
 	clock.advance(0);
 	assert.ok(!s.ids().includes(copy!.clientFrameId), "an empty sealed is never sent, whatever the floor");
+});
+
+test("sender: the blob gate holds a frame and the later frames of its stream; poke() sends them; reset per session, forget on remove", () => {
+	const holding = new Set<string>();
+	const calls = { reset: 0, forgot: [] as string[] };
+	const gate: SendGate = {
+		ready: (r) => !holding.has(r.clientFrameId),
+		reset: () => void calls.reset++,
+		forget: (cfid) => void calls.forgot.push(cfid),
+	};
+	const { sender, add, clock } = mk(10 * 1024 * 1024, gate);
+	const [a1, a2, other] = add(rec(BG), rec(BG), rec(BOUND));
+	holding.add(a1!.clientFrameId);
+	const s = new FakeSession();
+	sender.attach(s);
+	assert.equal(calls.reset, 1);
+	assert.deepEqual(s.ids(), [other!.clientFrameId], "a2 waits behind the held a1 of the same stream");
+	holding.delete(a1!.clientFrameId);
+	sender.poke();
+	clock.advance(0);
+	assert.deepEqual(s.ids().slice(1), [a1!.clientFrameId, a2!.clientFrameId]);
+	sender.remove(a1!.clientFrameId);
+	assert.deepEqual(calls.forgot, [a1!.clientFrameId]);
 });

@@ -85,7 +85,15 @@ export interface MetaKeyring {
 	/** Own seals under sealEpoch (the §4.2 roll trigger). */
 	readonly ownSeals: number;
 }
-export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring;
+/**
+ * When this device last PUT a blob address (e2ee-design §10.4 R2/R3), one record per address. Device wall
+ * clock; a lost record or a time in the future reads as "not recent" (one extra PUT, never a skipped one).
+ */
+export interface MetaBlobPut {
+	readonly key: `blobPut:${string}`;
+	readonly atMs: number;
+}
+export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------

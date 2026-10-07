@@ -145,6 +145,10 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 			if (o === "lost") throw refused("another key record won the epoch; revoke again");
 			return { t: "ok" };
 		}
+		case "cleanUpAttachments": {
+			const r = await rt.log.cleanUpBlobs(() => rt.blobs.liveHashes());
+			return { t: "attachmentsCleaned", ...r };
+		}
 		default:
 			return { t: "ok" };
 	}

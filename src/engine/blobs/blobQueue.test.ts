@@ -37,6 +37,8 @@ class FakeStore implements BlobPort {
 	async has(a: readonly BlobAddress[]) { if (this.down) throw new Error("503"); return new Set(a.filter((x) => this.objects.has(x))); }
 	async put(a: BlobAddress, b: Uint8Array) { if (this.down) throw new Error("503"); this.puts++; this.objects.set(a, b.slice()); }
 	async get(a: BlobAddress) { if (this.down) throw new Error("503"); return this.objects.get(a)?.slice() ?? null; }
+	async list(): Promise<never> { throw new Error("unused"); }
+	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
 }
 
 class FakeChunkLog implements BlobChunkLog {
@@ -65,7 +67,7 @@ async function make(opts: { store?: FakeStore | null; log?: FakeChunkLog | null;
 	const notices: string[] = [];
 	const open = async () => BlobQueue.open({
 		db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto: opts.crypto ?? crypto, store, chunkLog: log,
-		notice: (_l, c) => notices.push(c), ahead: opts.ahead,
+		notice: (_l, c) => notices.push(c), ahead: opts.ahead, touch: { reuse: async () => true, noted: async () => {} },
 	});
 	return { storage, clock, crypto, store, log, notices, q: await open(), reopen: open };
 }
@@ -223,6 +225,28 @@ test("concurrent uploads of one hash share one transfer", async () => {
 	const [a, b] = await Promise.all([q.upload({ hash, docId: D, path: P, bytes }), q.upload({ hash, docId: D, path: P, bytes })]);
 	assert.equal(a && b, true);
 	assert.equal(store!.puts, 1);
+});
+
+test("liveHashes: queued records and running transfers, both directions (GC live set); a finished transfer drops out", async () => {
+	const { q, store } = await make();
+	const queued = rnd(64, 2);
+	const running = rnd(64, 3);
+	const qh = sha256Hex(queued) as ContentHash;
+	const rh = sha256Hex(running) as ContentHash;
+	store!.down = true;
+	assert.equal(await q.upload({ hash: qh, docId: D, path: P, bytes: queued }), false);
+	assert.deepEqual([...q.liveHashes()], [qh]);
+	store!.down = false;
+	let release!: () => void;
+	const gate = new Promise<void>((r) => (release = r));
+	const put = store!.put.bind(store);
+	store!.put = async (a, b) => { await gate; return put(a, b); };
+	const up = q.upload({ hash: rh, docId: D, path: P, bytes: running });
+	for (let i = 0; i < 20 && !q.liveHashes().has(rh); i++) await new Promise((r) => setTimeout(r, 1));
+	assert.deepEqual([...q.liveHashes()].sort(), [qh, rh].sort(), "running upload, by hash without its direction prefix");
+	release();
+	assert.equal(await up, true);
+	assert.deepEqual([...q.liveHashes()], [qh]);
 });
 
 test("prefetch: the job's download takes the prefetched fetch; bounded by count and bytes; failures book like a download", async () => {

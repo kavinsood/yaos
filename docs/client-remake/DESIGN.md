@@ -1449,7 +1449,7 @@ transferred buffers.
 | `bodySaveMark{docId, viewId, version, seq}` | — | Obsidian read the view for a save at replica `version` (after push `seq`): a save candidate | — |
 | `docCredit{bytes}` | — | Body event flow control (returns the event `weight`) | — |
 | `hashRequest{items[{path, want, bytes [T]}]}` | yes | Hash bytes the host read (write preconditions, config writes); ≤ 64 items / 8 MiB per batch | `hashes{values[{hash, textLength}]}` |
-| `command{UserCommand}` | yes | pause, resume, reconcileNow, approve/rejectBrake, snapshots, diagnostics, rebuildLocalCache, updateSettings, releaseQuarantine | `ok` / `snapshots` / `diagnostics` |
+| `command{UserCommand}` | yes | pause, resume, reconcileNow, approve/rejectBrake, snapshots, diagnostics, rebuildLocalCache, updateSettings, releaseQuarantine, cleanUpAttachments (§j.1 GC) | `ok` / `snapshots` / `diagnostics` / `attachmentsCleaned` |
 | `result` / `error` `{re}` | — | Answers to engine requests | — |
 
 **Engine → main:**
@@ -1554,6 +1554,10 @@ interface BlobPort {
   has(addresses: readonly BlobAddress[]): Promise<ReadonlySet<BlobAddress>>;
   put(address: BlobAddress, bytes: Uint8Array): Promise<void>;
   get(address: BlobAddress): Promise<Uint8Array | null>;
+  // GC (e2ee-design §10.4, relay-wire §11.3.1): pages of {address, uploadedAt}; batches of 1..100, per-address
+  // deleted | newer | absent.
+  list(cursor: BlobAddress | null, signal?: AbortSignal): Promise<BlobListPage>;
+  deleteIfUploadedBefore(addresses: readonly BlobAddress[], cutoffMs: number, signal?: AbortSignal): Promise<readonly BlobDeleteResult[]>;
 }
 
 // platform.ts
@@ -1816,7 +1820,9 @@ ones get conflict copies.
 - **With a blob store** (`BlobPort`):
   - **Upload** (`blobQueue up`): hash → `crypto.blobAddress(hash)` → `has` → `put(sealBlob(bytes))`. Only **after**
     the put succeeds does the planner emit `nsCreate` / `nsSetBlob` for that hash, so readers can always fetch what
-    ns references.
+    ns references. A `has` hit skips the put only if the committed folds reference the hash or this device put it
+    less than grace/2 ago. Otherwise it puts again, which refreshes the upload time another device's GC sweep
+    checks (e2ee-design §10.4 R2).
   - **Download:** `get` → `openBlob` → verify sha256 → write with precondition (`getOpened`,
     `src/engine/blobs/blobStore.ts:67-79`). Every failure (absent, transport, open failure, hash mismatch) is
     unavailable and retried with backoff (`wait(blob-unavailable)`). Only a failure under a verified key (or with an
@@ -1829,6 +1835,17 @@ ones get conflict copies.
     synced (notice) and never deleted.
     `StatusSnapshot.maxBlobBytes` reports the carrier's limit (8 MiB without a blob store); the attachment size
     setting then reads "This server accepts attachments up to N MB; the smaller limit applies."
+  - **GC** (e2ee-design §10.4). The command "Clean up unused server attachments" runs one client mark-and-sweep in
+    the worker and shows one notice. There is no schedule or status row.
+    - Preconditions fail closed: any doubt about the live set deletes nothing.
+    - The live set is ns entries (tombstones included), cfg blobs, `snap` record parts, body refs the relay still
+      serves, the outbox and the blob queue.
+    - It deletes, in batches of ≤ 100, unreferenced blobs uploaded more than `blobGcGraceMs` (7 days) before a
+      cutoff on the store's clock.
+    - Before the sender sends a frame that references a blob, the hash must be committed or freshly put by this
+      device; else it is put again first (R3).
+    - Scale caveat: the sweep holds O(N) addresses on whatever device runs it. It is acceptable only as a cold,
+      manual path.
 - **Without a blob store** (`blob = null`; the relay answers 503 `attachments_unavailable`):
   - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<address>` as `blobChunk` frames (768 KiB, ≤ 11 rows).
     The ns op is emitted after every chunk is receipted.
@@ -2028,14 +2045,17 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
     A store or transport error is not corruption: the request fails without that notice.
   - **Download cache:** removed after the restore, on any failure, when another remote snapshot is verified, and by
     the sweep. It never holds more than one bundle (≤ 320 MiB).
-- **Blob lifetime (server ask A3, e2ee-design §10.4).** The relay has no blob GC. Until A3 exists, parts of
-  superseded snapshots (below a floor, or deleted) stay in R2 until the vault is deleted. For the A3 mark-and-sweep:
-  - the live set must include the part addresses of every record in the `snap` fold's live set. Records keep
-    `address` for this, because under E2EE the sweep sees addresses, not hashes;
-  - the 7-day grace period covers the gap between the part puts and the index record. A resumed upload skips parts
-    that `has` reports present, and such a part may be older than the grace period, so it could be swept before
-    its record lands. Before A3 ships, either the upload re-sends parts older than a day or `has` reports upload
-    times. A part swept anyway fails a restore as `part-missing`, never silently.
+- **Blob lifetime (e2ee-design §10.4).** Parts of superseded snapshots (below a floor, or deleted) stay in R2 until
+  a "Clean up unused server attachments" sweep deletes them.
+  - The sweep's live set has every part of every record in the `snap` fold, named by `blobAddress(sha256)`. That is
+    how restore names parts too: it never takes the record's `address` (`src/engine/snapshots/remote.ts:46`, `:73`).
+  - The 7-day grace covers the gap between the part puts and the index record.
+  - A resumed upload skips a part that `has` reports present only if the committed folds reference it (a live
+    `snap` record, for example), or this device put it less than grace/2 ago. Otherwise it puts the part again, which refreshes the upload time (R2,
+    `src/engine/snapshots/remote.ts:50`). So unchanged parts of a live snapshot are not re-sent, and an old orphan
+    is not relied on.
+  - The `snap` put is gated before sending like any blob reference (R3).
+  - A part swept anyway fails a restore as `part-missing`, never silently.
 - **Commands** (`src/protocol/messages.ts`):
   - `listSnapshots` → `snapshots` (id, time, reason, file count, bytes). Also `where` (`local` / `remote` / `both`)
     and the uploading device's label (`device`);
