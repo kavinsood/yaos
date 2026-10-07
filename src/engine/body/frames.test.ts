@@ -199,6 +199,8 @@ test("buildBodyFrames: BlobPort path puts once (deduped by has), falls back to x
 		async get(a) {
 			return store.get(a) ?? null;
 		},
+		list: async () => { throw new Error("unused"); },
+		deleteIfUploadedBefore: async () => { throw new Error("unused"); },
 	};
 	const bctx = { ...ctx, blob };
 	const u = textUpdate(MAX_INLINE_UPDATE_BYTES + 10);
@@ -294,6 +296,8 @@ test("suite 1, store path: ref blobs sealed at their address; tampered -> determ
 		has: async (as) => { if (down) throw new Error("offline"); return new Set(as.filter((a) => objects.has(a))); },
 		put: async (a, b) => void objects.set(a, b.slice()),
 		get: async (a) => { if (down) throw new Error("offline"); return objects.get(a)?.slice() ?? null; },
+		list: async () => { throw new Error("unused"); },
+		deleteIfUploadedBefore: async () => { throw new Error("unused"); },
 	};
 	const s1 = await suite1(0xe3);
 	const u = textUpdate(MAX_INLINE_UPDATE_BYTES + 10);

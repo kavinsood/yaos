@@ -140,6 +140,8 @@ class SharedBlobs implements BlobPort {
 		if (this.mode === "tampered") o[40]! ^= 1;
 		return o;
 	}
+	async list(): Promise<never> { throw new Error("unused"); }
+	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
 }
 
 /** A suite-1 engine on the shared store: K_1, KCV-verified unless `unverified` (then keyState reports it unchecked; sealing is unaffected). */

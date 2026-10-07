@@ -37,6 +37,8 @@ class FakeStore implements BlobPort {
 	async has(a: readonly BlobAddress[]) { if (this.down) throw new Error("503"); return new Set(a.filter((x) => this.objects.has(x))); }
 	async put(a: BlobAddress, b: Uint8Array) { if (this.down) throw new Error("503"); this.puts++; this.objects.set(a, b.slice()); }
 	async get(a: BlobAddress) { if (this.down) throw new Error("503"); return this.objects.get(a)?.slice() ?? null; }
+	async list(): Promise<never> { throw new Error("unused"); }
+	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
 }
 
 class FakeChunkLog implements BlobChunkLog {

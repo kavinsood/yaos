@@ -62,6 +62,8 @@ export class FaultyStore implements BlobPort {
 		if (!b) return null;
 		return this.onGet ? this.onGet(address, b.slice()) : b.slice();
 	}
+	async list(): Promise<never> { throw new Error("unused"); }
+	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
 }
 
 const xor = (b: Uint8Array) => b.map((x) => x ^ 0x5a);

@@ -171,6 +171,8 @@ describe("suite 1 golden vectors", () => {
 			has: async (as) => new Set(as.filter((a) => objects.has(a))),
 			put: async (a, b) => void objects.set(a, b.slice()),
 			get: async (a) => objects.get(a)?.slice() ?? null,
+			list: async () => { throw new Error("unused"); },
+			deleteIfUploadedBefore: async () => { throw new Error("unused"); },
 		};
 		await putSealed(store, c, HASH, ABC);
 		assert.deepEqual([...objects.keys()], [GOLDEN.address], "the K_1 address, not the sha256");

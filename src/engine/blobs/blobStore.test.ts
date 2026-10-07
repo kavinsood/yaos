@@ -49,6 +49,8 @@ class MemStore implements BlobPort {
 		this.objects.set(a, b.slice());
 	}
 	async get(a: BlobAddress) { if (this.down) throw new Error("503"); return this.objects.get(a)?.slice() ?? null; }
+	async list(): Promise<never> { throw new Error("unused"); }
+	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
 }
 
 const bytes = (n: number, seed = 1) => { const b = new Uint8Array(n); let x = seed; for (let i = 0; i < n; i++) { x = (Math.imul(x, 1103515245) + 12345) >>> 0; b[i] = x >>> 24; } return b; };
