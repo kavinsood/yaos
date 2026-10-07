@@ -227,6 +227,28 @@ test("concurrent uploads of one hash share one transfer", async () => {
 	assert.equal(store!.puts, 1);
 });
 
+test("liveHashes: queued records and running transfers, both directions (GC live set); a finished transfer drops out", async () => {
+	const { q, store } = await make();
+	const queued = rnd(64, 2);
+	const running = rnd(64, 3);
+	const qh = sha256Hex(queued) as ContentHash;
+	const rh = sha256Hex(running) as ContentHash;
+	store!.down = true;
+	assert.equal(await q.upload({ hash: qh, docId: D, path: P, bytes: queued }), false);
+	assert.deepEqual([...q.liveHashes()], [qh]);
+	store!.down = false;
+	let release!: () => void;
+	const gate = new Promise<void>((r) => (release = r));
+	const put = store!.put.bind(store);
+	store!.put = async (a, b) => { await gate; return put(a, b); };
+	const up = q.upload({ hash: rh, docId: D, path: P, bytes: running });
+	for (let i = 0; i < 20 && !q.liveHashes().has(rh); i++) await new Promise((r) => setTimeout(r, 1));
+	assert.deepEqual([...q.liveHashes()].sort(), [qh, rh].sort(), "running upload, by hash without its direction prefix");
+	release();
+	assert.equal(await up, true);
+	assert.deepEqual([...q.liveHashes()], [qh]);
+});
+
 test("prefetch: the job's download takes the prefetched fetch; bounded by count and bytes; failures book like a download", async () => {
 	const store = new FakeStore();
 	let gets = 0;
