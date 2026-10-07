@@ -125,6 +125,14 @@ export class BlobQueue implements BlobTransfer {
 		return [...this.records.values()];
 	}
 
+	/** Hashes of queued and running transfers, both directions (live for a GC sweep, e2ee-design §10.4). */
+	liveHashes(): Set<ContentHash> {
+		const out = new Set<ContentHash>();
+		for (const r of this.records.values()) out.add(r.hash);
+		for (const key of this.inflight.keys()) out.add(key.slice(key.indexOf(":") + 1) as ContentHash);
+		return out;
+	}
+
 	/** Milliseconds until the earliest retry (0 = due now), or null when nothing is queued. */
 	nextDueInMs(): number | null {
 		let next: number | null = null;

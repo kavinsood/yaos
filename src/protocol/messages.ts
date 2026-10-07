@@ -191,7 +191,7 @@ export interface SnapshotSkippedEntry {
 }
 
 /**
- * User commands. The snapshot commands, createSnapshot and exportDiagnostics fail with `not-ready`
+ * User commands. The snapshot commands, createSnapshot, exportDiagnostics and cleanUpAttachments fail with `not-ready`
  * while the engine has no running vault runtime (instead of answering an empty or `ok` result).
  */
 export type UserCommand =
@@ -212,7 +212,14 @@ export type UserCommand =
 	| { readonly t: "exportDiagnostics"; readonly includePaths: boolean }
 	| { readonly t: "rebuildLocalCache" }
 	| { readonly t: "updateSettings"; readonly settings: EngineSettings }
-	| { readonly t: "releaseQuarantine"; readonly stream: string };
+	| { readonly t: "releaseQuarantine"; readonly stream: string }
+	/** -> `attachmentsCleaned`: one sweep of the server's unreferenced attachments (e2ee-design §10.4). */
+	| { readonly t: "cleanUpAttachments" };
+
+/** Why a clean-up deleted nothing, or ("interrupted") stopped part-way (engine/blobs/gc.ts GcRefusal). */
+export type AttachmentCleanupRefusal =
+	| "no-store" | "keys-unverified" | "offline" | "read-only" | "not-caught-up" | "fold-incomplete" | "body-unreadable"
+	| "addressing-mismatch" | "busy" | "interrupted";
 
 // ---------------------------------------------------------------------------
 // Main -> Engine
@@ -324,7 +331,9 @@ export type EngineResultValue =
 	 * or damaged in the snapshot).
 	 */
 	| { readonly t: "restored"; readonly restored: number; readonly unchanged: number; readonly copies: readonly VaultPath[]; readonly failed: readonly VaultPath[] }
-	| { readonly t: "diagnostics"; readonly bundle: DiagnosticsBundle };
+	| { readonly t: "diagnostics"; readonly bundle: DiagnosticsBundle }
+	/** cleanUpAttachments. keptNewer: unreferenced but uploaded within the grace; repaired / lost: deleted, then found referenced. */
+	| { readonly t: "attachmentsCleaned"; readonly deleted: number; readonly keptNewer: number; readonly repaired: number; readonly lost: number; readonly refused: AttachmentCleanupRefusal | null; readonly detail: string | null };
 
 /** Priority lanes (DESIGN §i.1); also tags disk batches so the host executes higher lanes first. */
 export type Lane = 0 | 1 | 2 | 3 | 4;
