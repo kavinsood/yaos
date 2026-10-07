@@ -9,6 +9,8 @@
  *  - the write gate open (writeGate.ts): a revoked device, or one behind a newer winner it has no key for, reads
  *    rows it cannot open and is refused "keys-unverified" before it lists (its deletes would be refused anyway);
  *  - a relay session, writable;
+ *  - suite 1: this session's `k` read done (KeyringRuntime.sendReady). Before it every row is held (§14.3 kComplete),
+ *    so the sweep's own ns / cfg / snap reads would halt the folds on rows this device opens a moment later;
  *  - ns / cfg / snap read to the relay's head now, in this session (SessionLoop.readFresh), and not stale;
  *  - no quarantined ns / cfg / snap row, and every fold complete: not halted, its snapshot decodes, every tail row opened, decodes, is
  *    folded, and (snap) names no record version this reader does not know (FoldRuntime.gap);
@@ -108,6 +110,7 @@ export class BlobGc {
 		if (shut !== null) return refuse("keys-unverified", `this device may not write to the vault (${shut})`);
 		if (!c.session || c.stopped) return refuse("offline", "not connected to the server");
 		if (c.readOnly || !c.session.canWrite) return refuse("read-only", "this device has read-only access");
+		if (!c.keyring.sendReady()) return refuse("not-caught-up", "the vault's key records are not read on this connection yet");
 		return null;
 	}
 
