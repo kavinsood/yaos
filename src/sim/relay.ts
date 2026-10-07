@@ -188,7 +188,7 @@ export class SimRelay implements RelayPort {
 		const page = this.store.read(stream, afterSeq, maxBytes, preferCheckpoint, this.readPageRows);
 		const last = page.rows.length > 0 ? page.rows[page.rows.length - 1]!.seq : page.checkpoint?.coversSeq ?? afterSeq;
 		return {
-			checkpoint: page.checkpoint, rows: page.rows, lastSeq: page.lastSeq, checkpointSeq: page.checkpointSeq,
+			checkpoint: page.checkpoint, rows: page.rows, lastSeq: page.lastSeq, checkpointSeq: page.checkpointSeq, gcSeq: page.gcSeq,
 			nextAfterSeq: page.nextAfter ?? last, more: page.nextAfter !== null,
 		};
 	}

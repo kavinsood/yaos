@@ -140,7 +140,7 @@ describe("relayHttp read", () => {
 		assert.deepEqual(page, {
 			checkpoint: { coversSeq: 50, bytes: new Uint8Array([1, 2, 3]) },
 			rows: [{ seq: 53, deviceId: "d1", clientFrameId: "c1", payload: new Uint8Array([9]) }],
-			lastSeq: 57, checkpointSeq: 50, nextAfterSeq: 53, more: true,
+			lastSeq: 57, checkpointSeq: 50, gcSeq: 44, nextAfterSeq: 53, more: true,
 		});
 		const q = requests[0]!.url.searchParams;
 		assert.equal(requests[0]!.url.pathname, "/vault/v1/streams/read");
@@ -159,7 +159,7 @@ describe("relayHttp read", () => {
 		assert.equal(cp.nextAfterSeq, 6);
 		assert.deepEqual(cp.checkpoint, { coversSeq: 6, bytes: new Uint8Array(0) });
 		const empty = await page({ lastSeq: 0 }).read("v1", "unknown", 4, false, null);
-		assert.deepEqual(empty, { checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 0, nextAfterSeq: 4, more: false });
+		assert.deepEqual(empty, { checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 0, gcSeq: 0, nextAfterSeq: 4, more: false });
 	});
 
 	it("omits optional query params and throws typed errors", async () => {
