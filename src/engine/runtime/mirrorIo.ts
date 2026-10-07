@@ -9,14 +9,15 @@
  * blob store, else left empty (the sealed frame still goes out unchanged).
  */
 
+import type { BlobChunkContent } from "../../core/envelope";
 import { OUTBOX_MIRROR_MAX_BYTES } from "../../core/limits";
-import { streamClass, type ContentHash } from "../../core/types";
+import { streamClass } from "../../core/types";
 import type { SideFileName, SideFilePort } from "../../ports/vault";
-import { assembleChunks, resolveRefContent } from "../body/refs";
+import { resolveRefContent } from "../body/refs";
+import { assembleChunks } from "../blobs/chunks";
 import { openEnvelope } from "../ingest/envelope";
 import type { OutboxMirrorFrame, OutboxRecord } from "../store/schema";
 import { decodeBlobChunk, decodeBodyUpdateRef } from "../../core/codec/contents";
-import { bytesToHex } from "../../core/codec/lib0";
 import type { EngineCtx } from "./context";
 import { decodeOutboxMirror, encodeOutboxMirror, nextMirrorSlot, pickOutboxMirror, selectMirrorFrames, type MirrorIdentity } from "./mirrors";
 
@@ -157,7 +158,7 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 	if (!picked || picked.mirror.frames.length === 0) return 0;
 	const now = c.now();
 	const opened: { f: OutboxMirrorFrame; kind: OutboxRecord["kind"]; flags: number; frameNo: number; content: Uint8Array }[] = [];
-	const chunks = new Map<string, Uint8Array[]>();
+	const chunks = new Map<string, BlobChunkContent[]>();
 	for (const f of picked.mirror.frames) {
 		const o = await openEnvelope(c.ports.crypto, c.opts.vaultId, { t: "frame", stream: f.stream, deviceId: c.self, clientFrameId: f.clientFrameId }, f.sealed);
 		if (!o.ok) {
@@ -169,7 +170,7 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 			const d = decodeBlobChunk(o.inner.content);
 			if (d) {
 				const l = chunks.get(d.hash) ?? [];
-				l.push(o.inner.content);
+				l.push(d);
 				chunks.set(d.hash, l);
 			}
 		}
@@ -181,9 +182,8 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 			local = new Uint8Array(0);
 			const ref = decodeBodyUpdateRef(content);
 			if (ref) {
-				const fromChunks = assembleChunks(chunks.get(ref.hash) ?? [], ref.hash as ContentHash);
-				if (fromChunks && bytesToHex(await c.ports.hash.sha256(fromChunks)) === ref.hash) local = fromChunks;
-				else local = (await resolveRefContent(c.deps, f.stream, content)) ?? new Uint8Array(0);
+				const fromChunks = assembleChunks(ref.hash, chunks.get(ref.hash) ?? []);
+				local = fromChunks.ok ? fromChunks.bytes : (await resolveRefContent(c.deps, f.stream, content)) ?? new Uint8Array(0);
 			}
 			if (local.length === 0) c.diag("mirror-ref-content-missing", {});
 		}
