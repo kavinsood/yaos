@@ -39,8 +39,16 @@ export interface EnginePorts {
 	readonly random: RandomPort;
 	readonly crypto: CryptoPort;
 	readonly hash: HashPort;
-	/** null = no blob store; attachments ride the log up to MAX_LOG_BLOB_BYTES. */
+	/**
+	 * null = no blob store (the relay's capabilities say no attachments): attachments and oversize body updates
+	 * do not sync (fail closed, DESIGN §j.1). Blobs never ride the relay's sequence log.
+	 */
 	readonly blob: BlobPort | null;
+	/**
+	 * Asks the relay again whether it has a blob store (capabilities). Without one, the engine calls this once per
+	 * session that reaches live; a store found restarts the runtime with it. Absent = never re-asked.
+	 */
+	readonly probeBlob?: () => Promise<BlobPort | null>;
 }
 
 /** Ports the host (Obsidian main thread) is constructed with. */

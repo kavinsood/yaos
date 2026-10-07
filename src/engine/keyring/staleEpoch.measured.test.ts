@@ -7,7 +7,7 @@
  * src/engine/keyring/book.ts:141-147). gateRow (src/engine/sync/ingestRow.ts:46) then makes a stale ns/cfg row a
  * tail row flagged LOCAL_FLAG_STALE_EPOCH with frameNo 0 and empty content (ingestRow.ts:56), which folds as one
  * ignored/stale-epoch event and changes neither the ring nor the window (foldRuntime.ts:150, nsRuntime.ts /
- * cfgRuntime.ts foldStale). A stale body/canvas/blobchunk row is only accounted: no quarantine, no freeze
+ * cfgRuntime.ts foldStale). A stale body/canvas row is only accounted: no quarantine, no freeze
  * (ingestRow.ts:55).
  *
  * Per seed: a reader with a real testkit Keyring (testkit/world.ts) is pinned at epoch 1 (genesis, K_1). The
@@ -17,7 +17,7 @@
  *    K_1, on ns, cfg and b: streams. These are the old-epoch frames committed BEFORE the revoke row, and all of
  *    them must be accepted.
  *  - After S_rot: H1 and H2 seal under K_2. R (revoked, still holding K_1, §14.4) appends K_1 frames on ns, cfg,
- *    b:, c: and x:, with fresh clientFrameIds and frameNos right above its window, so only §14.3 stops them.
+ *    b: and c:, with fresh clientFrameIds and frameNos right above its window, so only §14.3 stops them.
  *    L had not seen the revoke yet: its first post-S_rot ns/cfg frames commit sealed under K_1, and later come its
  *    copies re-sealed under K_2, which keep the frameNo and get a new clientFrameId (ingestRow.ts:84-92 ownCommitCopy,
  *    §14.2 step 4). Half the seeds put an injected row at S_rot + 1, and half put an accepted K_1 row at S_rot − 1.
@@ -37,10 +37,9 @@ import { encodeNsOps } from "../../core/codec/nsOps";
 import type { EnvelopeKind } from "../../core/envelope";
 import { NS_DEDUPE_RING } from "../../core/limits";
 import {
-	CFG_STREAM, NS_STREAM, bodyStream, blobChunkStream, canvasStream, streamClass,
+	CFG_STREAM, NS_STREAM, bodyStream, canvasStream, streamClass,
 	type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsFoldEvent, type NsOp, type Seq, type StreamName, type VaultId, type VaultPath,
 } from "../../core/types";
-import type { BlobAddress } from "../../ports/crypto";
 import { SeededRandom } from "../../sim/random";
 import { createWebCryptoSuite1, type Suite1Crypto } from "../adapters/webCryptoSuite1";
 import { createWebHash } from "../adapters/webHash";
@@ -58,8 +57,8 @@ const SEEDS = 1000;
 const H1 = "dev-h1" as DeviceId, H2 = "dev-h2" as DeviceId, R = "dev-revoked" as DeviceId, L = "dev-lagging" as DeviceId;
 const READER = "dev-reader" as DeviceId;
 const FOLDED = [NS_STREAM, CFG_STREAM] as const;
-type Cls = "ns" | "cfg" | "body" | "canvas" | "blobchunk";
-const CLASSES: readonly Cls[] = ["ns", "cfg", "body", "canvas", "blobchunk"];
+type Cls = "ns" | "cfg" | "body" | "canvas";
+const CLASSES: readonly Cls[] = ["ns", "cfg", "body", "canvas"];
 type Role = "pre" | "post" | "copy" | "injected";
 
 interface Row {
@@ -148,7 +147,6 @@ function timeline(seed: number): { readonly rows: Row[]; readonly sRot: Seq } {
 			case "cfg": stream = CFG_STREAM; kind = "cfgOps"; content = cfgContent(hostile); f = nextFrameNo(dev, stream); break;
 			case "body": stream = bodyStream(rnd.pick(bodyDocs)); kind = "bodyUpdate"; content = ydoc(hostile ? "EVIL " : `t${rnd.int(100)} `); break;
 			case "canvas": stream = canvasStream(rnd.pick(bodyDocs)); kind = "canvasUpdate"; content = ydoc("EVIL", true); break;
-			case "blobchunk": stream = blobChunkStream(hex(rnd.int(1 << 20)) as BlobAddress); kind = "blobChunk"; content = rnd.bytes(48); break;
 		}
 		const row: Row = { stream, seq: s, deviceId: dev, clientFrameId: id22(`f${tag}${(n++).toString(36)}`) as ClientFrameId, role, epoch, kind, frameNo: f, authorNsSeq: lastNs, content };
 		if (stream === NS_STREAM) lastNs = s;
@@ -182,7 +180,7 @@ function timeline(seed: number): { readonly rows: Row[]; readonly sRot: Seq } {
 		const at = first ? sRot + 1 : undefined;
 		first = false;
 		if (t === "H") frame("post", 2, rnd.pick([H1, H2]), honestCls(), at);
-		else if (t === "R") frame("injected", 1, R, rnd.weighted<Cls>([["ns", 3], ["cfg", 3], ["body", 2], ["canvas", 1], ["blobchunk", 1]]), at);
+		else if (t === "R") frame("injected", 1, R, rnd.weighted<Cls>([["ns", 3], ["cfg", 3], ["body", 2], ["canvas", 1]]), at);
 		else if (t === "Lo") originals.push(frame("injected", 1, L, rnd.pick<Cls>(["ns", "cfg"]), at));
 		else {
 			// ownCommitCopy: same frame re-sealed under the current epoch, new clientFrameId, same frameNo.
@@ -262,7 +260,7 @@ describe("stale epoch (e2ee-design §20.2, §14.3), measured over 1000 seeds", (
 						n.staleTail++;
 						tails.get(r.stream)!.b.push(t);
 					} else {
-						assert.equal(res.t, "account", "a stale body/canvas/blobchunk row is accounted only");
+						assert.equal(res.t, "account", "a stale body/canvas row is accounted only");
 						n.accounted++;
 					}
 					continue;

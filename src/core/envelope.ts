@@ -33,7 +33,7 @@ export const EnvelopeKindCode = {
 	canvasUpdate: 3,
 	cfgOps: 4,
 	checkpoint: 5,
-	blobChunk: 6,
+	// 6: retired (was the log blob carrier); never reused. A row of kind 6 is malformed.
 	bodyUpdateRef: 7,
 	/** Snapshot index ops (`snap` stream, DESIGN §j.4). */
 	snapOps: 8,
@@ -86,7 +86,6 @@ export function kindHasFrameNo(kind: EnvelopeKind): boolean {
  * cfgOps:         varuint opCount, then per op: u8 tag, varuint bodyLen, body (CfgOpTag).
  * snapOps:        varuint opCount, then per op: u8 tag, varuint bodyLen, body (SnapOpTag, core/snap/record.ts).
  * checkpoint:     u8 CheckpointEncoding, varuint coversSeq, varuint foldRulesVersion, bytes state.
- * blobChunk:      32B sha256, varuint index, varuint total, varuint totalSize, bytes chunk.
  * bodyUpdateRef:  32B sha256 of the update bytes, varuint size (update stored in the blob store).
  */
 export const NsOpTag = {
@@ -132,14 +131,6 @@ export interface CheckpointContent {
 	readonly state: Uint8Array;
 }
 
-export interface BlobChunkContent {
-	readonly hash: ContentHash;
-	readonly index: number;
-	readonly total: number;
-	readonly totalSize: number;
-	readonly chunk: Uint8Array;
-}
-
 export interface BodyUpdateRefContent {
 	readonly hash: ContentHash;
 	readonly size: number;
@@ -168,13 +159,12 @@ export type EnvelopeOpenResult =
 	| { readonly ok: false; readonly reason: EnvelopeOpenFailure; readonly header?: EnvelopeHeader };
 
 /** Which envelope kinds a stream class may carry. Anything else is quarantined. */
-export const ALLOWED_KINDS: Readonly<Record<"ns" | "cfg" | "snap" | "body" | "canvas" | "blobchunk", readonly EnvelopeKind[]>> = {
+export const ALLOWED_KINDS: Readonly<Record<"ns" | "cfg" | "snap" | "body" | "canvas", readonly EnvelopeKind[]>> = {
 	ns: ["nsOps", "checkpoint"],
 	cfg: ["cfgOps", "checkpoint"],
 	snap: ["snapOps", "checkpoint"],
 	body: ["bodyUpdate", "bodyUpdateRef", "checkpoint"],
 	canvas: ["canvasUpdate", "bodyUpdateRef", "checkpoint"],
-	blobchunk: ["blobChunk", "checkpoint"],
 };
 
 /** AAD prefixes for frames and checkpoints (UTF-8, e2ee-design §7.2). */

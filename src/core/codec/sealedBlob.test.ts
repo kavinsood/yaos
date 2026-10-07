@@ -1,11 +1,11 @@
 /**
  * Sealed-blob size arithmetic (e2ee-design §7.3, §10; WP-E6a): the suite-1 plaintext cap of a store, the
- * snapshot part size against it, and the log path's chunk frames against the frame cap. blobStore.test.ts and
+ * snapshot part size against it. blobStore.test.ts and
  * frames.test.ts check the same numbers on real seals.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { BLOB_CHUNK_BYTES, MAX_BLOB_PLAINTEXT_BYTES_SUITE1, MAX_FRAME_CONTENT_BYTES, MAX_LOG_BLOB_BYTES } from "../limits";
+import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../limits";
 import { SNAP_DEFAULT_PART_BYTES, snapPartBytes } from "../snap/bundle";
 import { padmeLen } from "./padme";
 import { decodeBlobHeader, encodeBlobHeader, maxSealedBlobPlaintext, sealedBlobBytes } from "./sealedBlob";
@@ -57,11 +57,3 @@ test("snapshot parts: min(8 MiB, 7/8 cap); a full part sealed under suite 1 fits
 	assert.ok(sealedBlobBytes(snapPartBytes(421), MAX_EPOCH) > 421, "422 B is tight: below it the 1/8 slack does not cover the overhead");
 });
 
-test("log path: a full x: chunk frame pads to 49 x 16 KiB, under the frame content cap and the 1 MiB relay frame", () => {
-	assert.ok(BLOB_CHUNK_BYTES * Math.ceil(MAX_LOG_BLOB_BYTES / BLOB_CHUNK_BYTES) >= MAX_LOG_BLOB_BYTES);
-	// Chunk bytes plus a generous 1 KiB for the blobChunk fields and the inner frame header.
-	const inner = BLOB_CHUNK_BYTES + 1024;
-	assert.ok(inner <= MAX_FRAME_CONTENT_BYTES);
-	assert.equal(padmeLen(inner + 1), 49 * 16 * 1024);
-	assert.ok(padmeLen(inner + 1) + 28 + 64 <= 1024 * 1024, "sealed frame (outer header <= 64 B) fits 1 MiB");
-});

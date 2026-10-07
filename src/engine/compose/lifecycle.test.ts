@@ -1,17 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { VirtualClock } from "../../sim/clock";
 import { SimDevice } from "../../sim/device";
 import { SimNet } from "../../sim/net";
 import { HIDDEN_CLOSE_MS, type VaultRuntime } from "./vaultRuntime";
 
-async function world(mobileA: boolean): Promise<{ clock: VirtualClock; net: SimNet; a: SimDevice; b: SimDevice }> {
+async function world(mobileA: boolean, blobs = true): Promise<{ clock: VirtualClock; net: SimNet; a: SimDevice; b: SimDevice }> {
 	const clock = new VirtualClock();
 	clock.onError = (e) => {
 		throw e;
 	};
 	const net = new SimNet(clock);
+	net.blobsAvailable = blobs;
 	const a = new SimDevice({ name: "A", clock, net, mobile: mobileA });
 	const b = new SimDevice({ name: "B", clock, net });
 	void a.start();
@@ -106,9 +106,12 @@ test("the user's pause wins over visible and online", async () => {
 	assert.equal(connected(net, a), true);
 });
 
-test("status reports the open carrier's attachment limit (the log's 8 MiB without a blob store) and the host receives it", async () => {
-	const { a } = await world(false);
-	assert.equal(vrt(a).status().maxBlobBytes, MAX_LOG_BLOB_BYTES);
+test("status reports the blob store's attachment limit (0 without a store) and the host receives it", async () => {
+	const { a, net } = await world(false);
+	assert.equal(vrt(a).status().maxBlobBytes, net.blobs.maxBlobBytes);
 	assert.equal(vrt(a).status().maxBlobBytes, vrt(a).blobs.maxBlobBytes);
-	assert.equal(a.ui.statuses.at(-1)?.maxBlobBytes, MAX_LOG_BLOB_BYTES, "posted to the host");
+	assert.equal(a.ui.statuses[a.ui.statuses.length - 1]?.maxBlobBytes, net.blobs.maxBlobBytes, "posted to the host");
+	const none = await world(false, false);
+	assert.equal(vrt(none.a).status().maxBlobBytes, 0);
+	assert.equal(none.a.ui.statuses[none.a.ui.statuses.length - 1]?.maxBlobBytes, 0, "posted to the host");
 });

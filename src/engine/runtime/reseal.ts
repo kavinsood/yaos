@@ -6,7 +6,7 @@
  *    outbox then never committed (and its frameNo stays, §8.2);
  *  - a copy keeps its id (fresh, never sent);
  *  - every other record takes a fresh id: its old one may have committed with other bytes, and a resend under it
- *    would be refused frame-id-conflict (R4). Yjs updates and chunks are idempotent, so a duplicate is harmless.
+ *    would be refused frame-id-conflict (R4). Yjs updates are idempotent, so a duplicate is harmless.
  * Runs only while the write gate is open (the gated crypto port refuses otherwise). The sender asks on every pump
  * until the record is replaced; requests for a record already being sealed are dropped.
  */

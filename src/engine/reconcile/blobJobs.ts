@@ -13,18 +13,12 @@ import { isShrinkingOverwrite } from "../../core/plan/brake";
 import type { WritePrecondition } from "../../ports/vault";
 import type { IntentRecord } from "../store/schema";
 import { hashBytes } from "./localState";
-import { writeOk, type Env, type JobOutcome } from "./diskJobs";
+import { blobStore, writeOk, type Env, type JobOutcome } from "./diskJobs";
 
 type Op<K extends PlannerOp["op"]> = Extract<PlannerOp, { op: K }>;
 
 export function intentId(kind: IntentRecord["kind"], docId: DocId | null, path: VaultPath): string {
 	return `${kind}:${docId ?? path}`;
-}
-
-function carrier(env: Env): NonNullable<Env["ctx"]["deps"]["blobs"]> | null {
-	const blobs = env.ctx.deps.blobs;
-	if (!blobs) env.ctx.notice("warn", "no-blob-carrier", "attachments cannot be transferred: no blob carrier", "no-blob-carrier");
-	return blobs;
 }
 
 /** Copy the local side of a blob conflict to `to` (precondition absent) under a keep-both intent. */
@@ -63,12 +57,12 @@ export async function conflictCopy(env: Env, op: Op<"conflictCopy">): Promise<Jo
 /**
  * Download `hash` and write it over `path` (CAS on `precondition`), then
  * T_synced for the doc + end of any keep-both intent. Used by fetchBlob and by
- * intent resume. "fail" = unavailable now or the file changed.
+ * intent resume. "fail" = unavailable now or the file changed; "held" = no blob store.
  */
 export async function fetchAndWrite(env: Env, docId: DocId, path: VaultPath, hash: ContentHash, size: number, precondition: WritePrecondition): Promise<JobOutcome> {
 	const { ctx } = env;
-	const blobs = carrier(env);
-	if (!blobs) return "fail";
+	const blobs = blobStore(env);
+	if (!blobs) return "held";
 	const bytes = await blobs.download({ hash, docId, path, size });
 	if (!bytes) return "fail";
 	const old = ctx.localAt(path);
@@ -99,15 +93,15 @@ export async function fetchBlob(env: Env, op: Op<"fetchBlob">): Promise<JobOutco
 }
 
 /**
- * Upload the local file's bytes. Only after the carrier confirms are the
+ * Upload the local file's bytes. Only after the store confirms are the
  * doc's deferred ns ops submitted, so no ns entry ever points at a blob that
  * readers cannot fetch. A brand-new doc gets a synced record (blobRev 0,
  * nsTouchSeq 0) unless the S1 fold already wrote one.
  */
 export async function pushBlob(env: Env, op: Op<"pushBlob">): Promise<JobOutcome> {
 	const { ctx } = env;
-	const blobs = carrier(env);
-	if (!blobs) return "fail";
+	const blobs = blobStore(env);
+	if (!blobs) return "held";
 	const path = ctx.diskPathOf(op.path);
 	const r = await ctx.read(path, blobs.maxBlobBytes);
 	if (!r.ok) {

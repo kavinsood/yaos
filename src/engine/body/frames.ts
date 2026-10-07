@@ -2,10 +2,13 @@
  * Sealing own frames into outbox records (DESIGN §d.4 steps 2-4, §b.6, §j.1).
  *
  *  - body/canvas content > MAX_INLINE_UPDATE_BYTES (raw, the size the gate
- *    checks) becomes a bodyUpdateRef: the update goes to the BlobPort, or
- *    without one to `x:<address>` blobChunk frames (the address is
- *    CryptoPort.blobAddress(sha256), e2ee-design §10.1); the ref frame is
- *    then `held` on the last chunk. The ref keeps the plaintext sha256.
+ *    checks) becomes a bodyUpdateRef: the update goes to the BlobPort, sealed
+ *    at CryptoPort.blobAddress(sha256) (e2ee-design §10.1), and only the
+ *    small ref (plaintext sha256 + size) rides the log. A failed PUT still
+ *    emits the ref: BlobTouch (R3) re-PUTs it from the record's content and
+ *    holds the frame until the store has it. Without a store, or above its
+ *    cap, FrameTooLargeError: the doc freezes oversize-local (docRuntime).
+ *    Blob bytes never ride the relay's sequence log.
  *  - The outbox record of a ref keeps the full update as `content` (the local
  *    doc re-applies it at load); the sealed payload carries the ref.
  *  - Initial content is inserted in INITIAL_INSERT_CHUNK_CHARS transactions,
@@ -13,17 +16,17 @@
  */
 
 import * as Y from "yjs";
-import { EnvelopeFlag, type BlobChunkContent, type EnvelopeKind } from "../../core/envelope";
-import { BLOB_CHUNK_BYTES, INITIAL_INSERT_CHUNK_CHARS, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
-import { blobChunkStream, streamClass, type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type NsOp, type Seq, type StreamName, type VaultId } from "../../core/types";
+import { EnvelopeFlag, type EnvelopeKind } from "../../core/envelope";
+import { INITIAL_INSERT_CHUNK_CHARS, MAX_INLINE_UPDATE_BYTES } from "../../core/limits";
+import { streamClass, type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type NsOp, type Seq, type StreamName, type VaultId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress, CryptoPort, HashPort } from "../../ports/crypto";
+import type { CryptoPort, HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
 import { putSealed, storePlaintextCap, type PutPolicy } from "../blobs/blobStore";
 import { sealFrame } from "../ingest/envelope";
 import type { NewOutboxFrame } from "../store/repo";
 import { encodeCfgOps } from "../../core/codec/cfgOps";
-import { encodeBlobChunk, encodeBodyUpdateRef } from "../../core/codec/contents";
+import { encodeBodyUpdateRef } from "../../core/codec/contents";
 import { newClientFrameId } from "../../core/codec/ids";
 import { bytesToHex } from "../../core/codec/lib0";
 import { encodeNsOps } from "../../core/codec/nsOps";
@@ -44,7 +47,7 @@ export interface FrameCtx {
 
 export class FrameTooLargeError extends Error {
 	constructor(readonly bytes: number) {
-		super(`update of ${bytes} bytes exceeds the log blob limit`);
+		super(`update of ${bytes} bytes needs the blob store (none, or above its limit)`);
 	}
 }
 
@@ -68,7 +71,7 @@ export interface BodyFrameInput {
 	readonly nowMs: number;
 }
 
-/** One body/canvas update -> 1 frame, or (oversize) x: chunks / blob put + a held bodyUpdateRef. */
+/** One body/canvas update -> 1 frame: inline, or (oversize) a bodyUpdateRef after a blob put; FrameTooLargeError without a store. */
 export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Promise<NewOutboxFrame[]> {
 	const cls = streamClass(input.stream);
 	const kind: EnvelopeKind = cls === "canvas" ? "canvasUpdate" : "bodyUpdate";
@@ -76,30 +79,15 @@ export async function buildBodyFrames(ctx: FrameCtx, input: BodyFrameInput): Pro
 	if (input.content.length <= MAX_INLINE_UPDATE_BYTES) {
 		return [await seal(ctx, input.stream, kind, input.authorNsSeq, input.flags, 0, input.content, input.content, state, input.dependsOn, input.nowMs)];
 	}
+	if (!ctx.blob || input.content.length > storePlaintextCap(ctx.crypto, ctx.blob)) throw new FrameTooLargeError(input.content.length);
 	const hash = bytesToHex(await ctx.hash.sha256(input.content)) as ContentHash;
 	const refContent = encodeBodyUpdateRef({ hash, size: input.content.length });
-	if (ctx.blob && input.content.length <= storePlaintextCap(ctx.crypto, ctx.blob)) {
-		try {
-			await putSealed(ctx.blob, ctx.crypto, hash, input.content, ctx.touch);
-			return [await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, 0, refContent, input.content, state, input.dependsOn, input.nowMs)];
-		} catch {
-			// Blob store unavailable: fall through to the log path.
-		}
+	try {
+		await putSealed(ctx.blob, ctx.crypto, hash, input.content, ctx.touch);
+	} catch {
+		// Store error: the sender's R3 gate (BlobTouch.ready) re-PUTs from the record's content before it sends the ref.
 	}
-	if (input.content.length > MAX_LOG_BLOB_BYTES) throw new FrameTooLargeError(input.content.length);
-	const xs = blobChunkStream(await ctx.crypto.blobAddress(hash));
-	const total = Math.ceil(input.content.length / BLOB_CHUNK_BYTES);
-	const out: NewOutboxFrame[] = [];
-	for (let i = 0; i < total; i++) {
-		const chunk = input.content.subarray(i * BLOB_CHUNK_BYTES, Math.min(input.content.length, (i + 1) * BLOB_CHUNK_BYTES));
-		const c = encodeBlobChunk({ hash, index: i, total, totalSize: input.content.length, chunk });
-		out.push(await seal(ctx, xs, "blobChunk", input.authorNsSeq, 0, 0, c, c, "pending", null, input.nowMs));
-	}
-	// The ref waits for the last chunk (released when no own x: frame remains, DESIGN §e.1). An explicit
-	// ns-create / adoptable dependency takes precedence; it is re-pointed to the chunk when released.
-	const dep = input.dependsOn ?? out[out.length - 1]!.clientFrameId;
-	out.push(await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, 0, refContent, input.content, "held", dep, input.nowMs));
-	return out;
+	return [await seal(ctx, input.stream, "bodyUpdateRef", input.authorNsSeq, input.flags, 0, refContent, input.content, state, input.dependsOn, input.nowMs)];
 }
 
 /**
@@ -133,12 +121,6 @@ export async function buildCfgFrame(ctx: FrameCtx, stream: StreamName, ops: read
 export async function buildSnapFrame(ctx: FrameCtx, stream: StreamName, ops: readonly SnapOp[], authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
 	const content = encodeSnapOps(ops);
 	return seal(ctx, stream, "snapOps", authorNsSeq, 0, 0, content, content, "pending", null, nowMs);
-}
-
-/** One blobChunk frame of x:<address>, address = blobAddress(chunk.hash) (pending, no dependency). */
-export async function buildBlobChunkFrame(ctx: FrameCtx, address: BlobAddress, chunk: BlobChunkContent, authorNsSeq: Seq, nowMs: number): Promise<NewOutboxFrame> {
-	const content = encodeBlobChunk(chunk);
-	return seal(ctx, blobChunkStream(address), "blobChunk", authorNsSeq, 0, 0, content, content, "pending", null, nowMs);
 }
 
 /** Split text into <= max UTF-16 unit chunks without cutting a surrogate pair. */

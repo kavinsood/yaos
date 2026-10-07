@@ -20,7 +20,8 @@ disallowed types, canvas), size caps, refs, checkpoints → pass / quarantine re
 **Body**:
 - `yjsCounters.ts` — the only `Y.encodeStateAsUpdate` / `Y.mergeUpdates` call sites, counted (hygiene test enforces it).
 - `frameBuilder.ts` — open frame per doc, keystroke batching (`OPEN_FRAME_IDLE_MS` 100 / `OPEN_FRAME_MAX_MS` 300), merges
-  the frame's own small updates only, never stored ones; caps; chunking into `x:` chunks + `bodyUpdateRef`.
+  the frame's own small updates only, never stored ones; caps; chunking into `x:` chunks + `bodyUpdateRef`
+  (the `x:` chunks were later deleted: an oversized update goes to the blob store behind a `bodyUpdateRef`).
 - `frames.ts` (sealing, ns/cfg frames, initial chunking), `refs.ts` (ref resolution), `handles.ts` (residency, bound docs),
   `compaction.ts` (scratch Y.Doc, counted encode), `checkpoints.ts` (checkpoint duty, CAS outcomes).
 - `sender.ts` — rank-ordered sending: ns/cfg window (`NS_SEND_WINDOW` 32, opened by `openNs`), inflight-bytes cap (head-of-line
@@ -97,7 +98,7 @@ clock/hash/random, `blob: null`, in-memory side files. Scenarios:
 - merge-edit / keystroke / burst-typing latency;
 - concurrent edits, rename/delete;
 - offline edits on both sides + reconnect;
-- 1.3 MB update via `x:` chunks;
+- 1.3 MB update via `x:` chunks (the `x:` carrier was later deleted);
 - checkpoint duty, fresh device catch-up;
 - restart from IDB, IDB loss → mirror recovery;
 - relay restart (local only);
@@ -191,7 +192,7 @@ With those two test-side changes: 117/118 (only the foreign hygiene hit left). N
   - there is no quarantine notice (only `frozen:*`);
   - quarantine bytes are not bounded.
 - **Refs, checkpoints and docs:**
-  - A chunked initial ref depends on the ns create, not on the last chunk.
+  - A chunked initial ref depends on the ns create, not on the last chunk (moot: the `x:` chunks were later deleted).
   - A recovered ref with empty content is guarded but not repaired.
   - Retired checkpoints are not adopted. Provisional refs are not adopted.
   - The ns halt is not retried.
@@ -199,7 +200,8 @@ With those two test-side changes: 117/118 (only the foreign hygiene hit left). N
   - Ref tails are not rewritten.
   - A poisoned doc is not rebuilt.
   - Canvas-invalid freezes the doc. Canvas `createDoc` has no initial content.
-  - Blob docs are unsupported (`blob: null` in e2e; the local relay has no blob store).
+  - Blob docs are unsupported (`blob: null` in e2e; the local relay has no blob store). (The local relay now binds R2
+    by default.)
 - **Checkpoint outcome coverage:** the "not advancing" outcome can't be reached through SimRelay's normal path; it is tested via a Proxy.
 - **Code and tests:**
   - The live queue uses `Array.shift` (O(n) on big queues).

@@ -1,7 +1,8 @@
 /**
  * Composed full-client scenarios on the sim (host + protocol + engine + SimRelay):
- * attachments over x: chunk streams, settings sync, IndexedDB loss with mirror
- * recovery, and a relay epoch reset (§c.12) migrating both devices.
+ * attachments through the blob store (never the relay log; without a store they
+ * stay local until a later connect finds one), settings sync, IndexedDB loss
+ * with mirror recovery, and a relay epoch reset (§c.12) migrating both devices.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -54,8 +55,16 @@ async function same(a: SimDevice, b: SimDevice, path: string, want: Uint8Array):
 
 const ATTACH: EngineSettings = { ...SIM_SETTINGS, syncAttachments: true, maxAttachmentBytes: 8 * 1024 * 1024 };
 
-test("attachments ride x: chunk streams: create, multi-chunk update, rename and delete converge byte-identical", async () => {
-	const { clock, devs } = world({ settings: () => ATTACH });
+/** The relay log carried only small records: no foreign stream, no ns/cfg/snap/k row near a blob's size. */
+function logCarriesNoBlobs(net: SimNet, blobBytes: number): void {
+	const audit = net.logAudit();
+	assert.deepEqual(audit.foreign, [], "no stream outside ns/cfg/snap/k/b:/c:");
+	assert.ok(audit.largestRecordRow < 4096, `largest ns/cfg/snap/k row ${audit.largestRecordRow} B`);
+	assert.ok(audit.bytes * 20 < blobBytes, `the log carried ${audit.bytes} B in ${audit.rows} rows for ${blobBytes} B of attachments`);
+}
+
+test("attachments go to the blob store, only small ns records ride the log: create, multi-MB update, rename and delete converge byte-identical", async () => {
+	const { clock, net, devs } = world({ settings: () => ATTACH });
 	const [a, b] = pair(devs);
 	const small = bytes(5_000, 1);
 	a.vault.externalWrite("img/p.png", small);
@@ -63,11 +72,12 @@ test("attachments ride x: chunk streams: create, multi-chunk update, rename and 
 	await clock.advance(10_000);
 	await same(a, b, "img/p.png", small);
 
-	// > 1 chunk (768 KiB chunks).
 	const big = bytes(1_700_000, 2);
 	a.vault.externalWrite("img/p.png", big);
 	await clock.advance(20_000);
 	await same(a, b, "img/p.png", big);
+	assert.equal(net.blobs.objects.size, 2, "both versions in the store");
+	logCarriesNoBlobs(net, small.length + big.length);
 
 	assert.ok(b.vault.userRename("img/p.png", "img/q.png"));
 	await clock.advance(10_000);
@@ -79,6 +89,62 @@ test("attachments ride x: chunk streams: create, multi-chunk update, rename and 
 	assert.equal(b.vault.hasFile("img/q.png"), false, "delete reached B");
 	assert.ok(b.vault.trashed.some((r) => r.path === "img/q.png"), "B trashed it (never a hard delete)");
 	assert.equal(a.vault.snapshot().size + b.vault.snapshot().size, 0);
+	logCarriesNoBlobs(net, small.length + big.length);
+});
+
+/** No ns entry names `path` on `d` (nothing about it reached the relay). */
+function noEntry(d: SimDevice, path: string): void {
+	assert.ok(!d.vrt!.log.listDocs().some((x) => x.path === path), `${d.name}: no ns entry for ${path}`);
+}
+
+test("no blob store: attachments stay local (no ns entry, no transfer queued, no notice), notes sync, status maxBlobBytes 0", async () => {
+	const { clock, net, devs } = world({ settings: () => ATTACH });
+	net.blobsAvailable = false;
+	const [a, b] = pair(devs);
+	const pic = bytes(5_000, 4);
+	a.vault.externalWrite("img/p.png", pic);
+	a.vault.userWrite("n.md", "note");
+	await boot(clock, devs);
+	await clock.advance(20_000);
+	assert.equal(b.vault.textOf("n.md"), "note");
+	assert.equal(b.vault.hasFile("img/p.png"), false);
+	assert.deepEqual(await a.vault.readBytes("img/p.png"), pic, "the local file stays");
+	noEntry(a, "img/p.png");
+	noEntry(b, "img/p.png");
+	for (const d of devs) {
+		assert.deepEqual(d.vrt!.blobs.queued(), [], `${d.name}: nothing queued (no retry timer)`);
+		assert.equal(d.ui.statuses[d.ui.statuses.length - 1]?.maxBlobBytes, 0, `${d.name}: status maxBlobBytes`);
+		assert.deepEqual(d.ui.notices.filter((n) => /blob|attach/i.test(n.code)), [], `${d.name}: no notice about server blob storage`);
+	}
+	assert.equal(net.blobs.calls.put + net.blobs.calls.has + net.blobs.calls.get, 0);
+	assert.deepEqual(net.logAudit().foreign, []);
+	// Only the note's records: nothing blob-sized, nothing for the attachment.
+	assert.ok(net.logAudit().bytes < 4096, `${net.logAudit().bytes} B on the log`);
+});
+
+test("a blob store found on a later connect: the runtime restarts with it, pending attachments upload, the ns record follows", async () => {
+	const { clock, net, devs } = world({ settings: () => ATTACH });
+	net.blobsAvailable = false;
+	const [a, b] = pair(devs);
+	const pic = bytes(900_000, 5);
+	a.vault.externalWrite("img/p.png", pic);
+	await boot(clock, devs);
+	await clock.advance(20_000);
+	assert.equal(b.vault.hasFile("img/p.png"), false);
+	noEntry(a, "img/p.png");
+	const starts = a.engineStarts;
+
+	// The operator binds R2 and redeploys: every socket drops, the next connect's probe finds the store.
+	net.blobsAvailable = true;
+	for (const d of devs) net.setOnline(d.deviceId, false);
+	await clock.advance(1_000);
+	for (const d of devs) net.setOnline(d.deviceId, true);
+	await clock.advance(30_000);
+	await same(a, b, "img/p.png", pic);
+	assert.equal(net.blobs.objects.size, 1);
+	assert.equal(a.engineStarts, starts, "the same engine: only its vault runtime restarted");
+	for (const d of devs) assert.ok((d.ui.statuses[d.ui.statuses.length - 1]?.maxBlobBytes ?? 0) > 0, `${d.name}: status maxBlobBytes`);
+	logCarriesNoBlobs(net, pic.length);
 });
 
 test("attachments off: a binary file stays local", async () => {

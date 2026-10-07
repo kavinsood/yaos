@@ -11,7 +11,7 @@
  */
 
 import * as Y from "yjs";
-import { EnvelopeFlag, type BlobChunkContent } from "../../core/envelope";
+import { EnvelopeFlag } from "../../core/envelope";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import type { SnapFoldState } from "../../core/snap/fold";
 import type { SnapOp } from "../../core/snap/record";
@@ -35,7 +35,6 @@ import { CfgRuntime } from "../sync/cfgRuntime";
 import { SnapRuntime } from "../sync/snapRuntime";
 import { NsRuntime, type DocInfo } from "../sync/nsRuntime";
 import * as api from "./logApi";
-import * as blobs from "./blobChunks";
 import { BlobGc } from "./blobGc";
 import type { GcOutcome } from "../blobs/gc";
 import { EngineCtx } from "./context";
@@ -61,7 +60,7 @@ function rankOf(c: EngineCtx) {
 		if (cls === "ns") return 1;
 		if (cls === "cfg") return 2;
 		if (cls === "snap") return 3;
-		if (cls === "blobchunk" || (rec.flags & EnvelopeFlag.adopted) !== 0) return 4;
+		if ((rec.flags & EnvelopeFlag.adopted) !== 0) return 4;
 		return (c.handles.peek(rec.stream)?.bound ?? 0) > 0 ? 0 : 3;
 	};
 }
@@ -307,17 +306,6 @@ export class LogEngine {
 	/** Body info of a markdown / canvas doc; null = unknown doc or blob. `kind` skips the lookup. */
 	bodyInfo(docId: DocId, kind?: DocKind): RemoteBodyInfo | null {
 		return api.bodyInfo(this.c, docId, kind ?? api.docKind(this.c, docId));
-	}
-
-	/** BlobChunkLog.appendChunks: x:<hash> frames via the outbox; true once all are committed (blobChunks.ts). */
-	async appendBlobChunks(hash: ContentHash, chunks: readonly BlobChunkContent[]): Promise<boolean> {
-		this.c.assertWritable();
-		return blobs.appendBlobChunks(this.c, hash, chunks);
-	}
-
-	/** BlobChunkLog.readChunks: committed chunks of x:<hash> from the relay; null = not readable now. */
-	readBlobChunks(hash: ContentHash): Promise<BlobChunkContent[] | null> {
-		return blobs.readBlobChunks(this.c, hash);
 	}
 
 	/** Docs with own body / canvas frames in the outbox. */

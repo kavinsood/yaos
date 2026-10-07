@@ -8,7 +8,6 @@
  * Everything in src/core is pure: no I/O, no timers, no Date/Math.random.
  */
 
-import type { BlobAddress } from "../ports/crypto";
 
 // ---------------------------------------------------------------------------
 // Identifiers
@@ -36,7 +35,7 @@ export type DiskFingerprint = Brand<string, "DiskFingerprint">;
  * differ). The only key used for path collision decisions.
  */
 export type PathKey = Brand<string, "PathKey">;
-/** Relay stream name: "ns" | "cfg" | "b:<docId>" | "c:<docId>" | "x:<hash>". */
+/** Relay stream name: "ns" | "cfg" | "snap" | "k" | "b:<docId>" | "c:<docId>" (no blob bytes ride the log, DESIGN §j.1). */
 export type StreamName = Brand<string, "StreamName">;
 
 /** Vault-wide relay clock position within one vaultEpoch. 0 = before the first row. */
@@ -61,20 +60,13 @@ export const KEYRING_STREAM = "k" as StreamName;
 /** Snapshot index (DESIGN §j.4). */
 export const SNAP_STREAM = "snap" as StreamName;
 
-export type StreamClass = "ns" | "cfg" | "snap" | "body" | "canvas" | "blobchunk" | "keyring" | "other";
+export type StreamClass = "ns" | "cfg" | "snap" | "body" | "canvas" | "keyring" | "other";
 
 export function bodyStream(docId: DocId): StreamName {
 	return `b:${docId}` as StreamName;
 }
 export function canvasStream(docId: DocId): StreamName {
 	return `c:${docId}` as StreamName;
-}
-/**
- * Log-path blob stream (DESIGN §j.1). Named by the blob address, never the
- * plaintext hash (e2ee-design §10.1): suite 1 addresses are keyed HMACs.
- */
-export function blobChunkStream(address: BlobAddress): StreamName {
-	return `x:${address}` as StreamName;
 }
 export function docStream(kind: DocKind, docId: DocId): StreamName | null {
 	if (kind === "markdown") return bodyStream(docId);
@@ -88,7 +80,6 @@ export function streamClass(stream: StreamName): StreamClass {
 	if (stream === SNAP_STREAM) return "snap";
 	if (stream.startsWith("b:")) return "body";
 	if (stream.startsWith("c:")) return "canvas";
-	if (stream.startsWith("x:")) return "blobchunk";
 	return "other";
 }
 /** DocId of a b:/c: stream, else null. */

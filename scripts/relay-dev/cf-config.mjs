@@ -32,8 +32,11 @@ const fail = (msg) => {
 	process.exit(1);
 };
 
-if (cfg.r2_buckets?.length || cfg.kv_namespaces?.length || cfg.d1_databases?.length || cfg.services?.length) {
-	fail("only Durable Object and text bindings are supported (the streams relay config has no R2/KV/D1/services)");
+if (cfg.r2_buckets?.length) {
+	fail("R2 bindings are not rendered yet: the deployed e2e worker needs the YAOS_BUCKET bucket binding (blobs never ride the relay log); RELAY_DEV_R2=0 deploys without it (attachments not synced)");
+}
+if (cfg.kv_namespaces?.length || cfg.d1_databases?.length || cfg.services?.length) {
+	fail("only Durable Object and text bindings are supported (the streams relay config has no KV/D1/services)");
 }
 
 // Fold [[migrations]] into the final class set.

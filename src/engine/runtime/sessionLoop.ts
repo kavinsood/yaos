@@ -159,6 +159,7 @@ export class SessionLoop {
 			if (gen !== c.gen) return;
 			c.setPhase(c.livePhase());
 			this.st = newReconnectState();
+			this.probeBlobStore();
 			// Reader-dependent quarantine is retried on every session start (new keys / version, §d.6).
 			await retryReaderQuarantine(c).catch((e) => c.diag("quarantine-retry-failed", { error: String(e) }));
 			if (gen !== c.gen) return;
@@ -433,11 +434,25 @@ export class SessionLoop {
 		} else if (cls === "ns") await c.afterNsChange(res.replacedFold);
 		else if (cls === "cfg") await c.afterCfgChange(res.replacedFold);
 		else if (cls === "snap") await c.afterSnapChange(res.replacedFold);
-		else if (cls === "blobchunk" && res.tailPut.length > 0) await c.docs.retryRefs();
 		else if (cls === "keyring") await c.keyring.ingestRows(res.tailPut, true);
 		if (cls !== "ns" && res.removed.length > 0) await c.afterNsChange();
 		if (res.rows > 0 || res.t === "done") c.lastSyncedAtMs = c.now();
 		c.scheduleStatus();
+	}
+
+	/**
+	 * No blob store at start (capabilities: no attachments): ask again once per session that reaches live. A store
+	 * found restarts the runtime on it (onBlobStore); pending attachments then upload through the normal path.
+	 */
+	private probeBlobStore(): void {
+		const c = this.c;
+		if (c.ports.blob || !c.ports.probeBlob || !c.opts.onBlobStore) return;
+		void c.ports.probeBlob().then(
+			(store) => {
+				if (store && !c.stopped) c.opts.onBlobStore?.(store);
+			},
+			(e: unknown) => c.diag("blob-probe-failed", { error: String(e) }),
+		);
 	}
 
 	/**

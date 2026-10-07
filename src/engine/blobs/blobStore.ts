@@ -52,7 +52,7 @@ export async function putAt(store: BlobPort, crypto: CryptoPort, policy: PutPoli
 }
 
 /** Why a blob is unavailable to this reader. */
-export type BlobUnavailable = "absent" | "transport" | OpenFailure | "hash-mismatch" | "inconsistent";
+export type BlobUnavailable = "absent" | "transport" | OpenFailure | "hash-mismatch";
 
 export type BlobFetch =
 	| { readonly ok: true; readonly bytes: Uint8Array }

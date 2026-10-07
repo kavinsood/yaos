@@ -62,7 +62,7 @@ class FakeSession implements RelaySession {
 
 const BOUND = "d:bound" as StreamName;
 const BG = "d:bg" as StreamName;
-const X = "x:chunk" as StreamName;
+const X = "d:low" as StreamName;
 let ord = 0;
 /** Per-stream frameNo counters for ns/cfg records, allocated in outbox order like LogApi does. */
 const frameNos = new Map<StreamName, number>();

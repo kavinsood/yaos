@@ -7,7 +7,6 @@
 import type {
 	BrakeConfig, BrakeReport, DocId, DocKind, LocalEntry, MergeLimits, ObservedRename, PathKey, PathKeyFn, Seq, SyncedEntry, VaultPath,
 } from "../../core/types";
-import { MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { DEFAULT_BRAKE, type BrakeWindow, type DestructiveKind } from "../../core/plan/brake";
 import { conflictCopyNotice } from "../../core/plan/conflictName";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
@@ -23,15 +22,15 @@ import { classify, compileExcludes, toRecord, type Classified, type ClassifySett
 import type { DiskChange, DiskSchema, ReconcileStore } from "./store";
 import type { StorageDb } from "../../ports/storage";
 
-/** What the disk side needs from the blob carrier (src/engine/blobs/blobQueue.ts implements it). */
+/** What the disk side needs from the blob store (src/engine/blobs/blobQueue.ts implements it). */
 export interface BlobTransfer {
-	/** Largest blob this carrier moves (BlobPort.maxBlobBytes or MAX_LOG_BLOB_BYTES). */
+	/** Largest blob the store takes; 0 = no blob store (attachments are not synced, nothing is queued). */
 	readonly maxBlobBytes: number;
-	/** true once readers can fetch `hash` (store put ok / all chunks receipted). false = failed now, queued for retry. */
+	/** true once readers can fetch `hash` (store put ok). false = failed now: queued for retry, or no store. */
 	upload(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly bytes: Uint8Array }): Promise<boolean>;
 	/** Verified bytes, or null = unavailable now (queued with backoff). */
 	download(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly size: number }): Promise<Uint8Array | null>;
-	/** Start a download for a job that runs soon; its download() takes the result. false = the carrier's bound is full. */
+	/** Start a download for a job that runs soon; its download() takes the result. false = the prefetch bound is full. */
 	prefetch?(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly size: number }): boolean;
 	/** Forget prefetched results no job took. */
 	dropPrefetched?(): void;
@@ -116,7 +115,7 @@ export class Ctx {
 			excludePatterns: deps.settings.excludePatterns,
 			syncAttachments: deps.settings.syncAttachments,
 			maxAttachmentBytes: deps.settings.maxAttachmentBytes,
-			maxBlobBytes: deps.blobs?.maxBlobBytes ?? MAX_LOG_BLOB_BYTES,
+			maxBlobBytes: deps.blobs?.maxBlobBytes ?? 0,
 		};
 		this.excludes = compileExcludes(deps.settings.excludePatterns);
 	}

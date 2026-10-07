@@ -262,10 +262,10 @@ const epochSubs = (not: number): number[] => [...new Set([0, 1, 3, 4, 5, 6, 7, 8
 // ---- 1. bit flips ---------------------------------------------------------------------
 
 describe("§20.2 bit flips: every sealed type, every region (measured)", () => {
-	it("frames: 287 B nsOps and 3103 B body (every byte), 64 KiB blobChunk (4096 seeded positions)", async () => {
+	it("frames: 287 B nsOps and 3103 B body (every byte), 64 KiB body (4096 seeded positions)", async () => {
 		const c = await mainPort();
 		const rng = new SeededRandom(101);
-		const objects: [string, string, EnvelopeKind, number][] = [["frame nsOps", "ns", "nsOps", 100], ["frame bodyUpdate", `b:${DOC}`, "bodyUpdate", 3000], ["frame blobChunk 64KiB", `x:${HASH}`, "blobChunk", 65536]];
+		const objects: [string, string, EnvelopeKind, number][] = [["frame nsOps", "ns", "nsOps", 100], ["frame bodyUpdate", `b:${DOC}`, "bodyUpdate", 3000], ["frame bodyUpdate 64KiB", `b:${DOC}`, "bodyUpdate", 65536]];
 		for (const [label, stream, kind, n] of objects) {
 			const bytes = await seal(c, stream, kind, rng.bytes(n));
 			assert.equal(await openFrame(c, frameBinding(stream), bytes), "ok", `${label}: control opens`);
@@ -550,8 +550,8 @@ describe("§20.2 cross-type confusion (measured)", () => {
 		const rng = new SeededRandom(701);
 		const address = await c.blobAddress(HASH);
 		const N = 64;
-		const streams = ["ns", "cfg", `b:${DOC}`, `c:${DOC}`, `x:${HASH}`, "snap"] as const;
-		const kinds: Readonly<Record<string, EnvelopeKind>> = { ns: "nsOps", cfg: "cfgOps", snap: "snapOps", [`b:${DOC}`]: "bodyUpdate", [`c:${DOC}`]: "canvasUpdate", [`x:${HASH}`]: "blobChunk" };
+		const streams = ["ns", "cfg", `b:${DOC}`, `c:${DOC}`, "snap"] as const;
+		const kinds: Readonly<Record<string, EnvelopeKind>> = { ns: "nsOps", cfg: "cfgOps", snap: "snapOps", [`b:${DOC}`]: "bodyUpdate", [`c:${DOC}`]: "canvasUpdate" };
 		const frames = await inBatches(range(0, N), async (i) => {
 			const s = streams[i % streams.length]!;
 			return { s, bytes: await seal(c, s, kinds[s]!, rng.bytes(1 + i * 37), { clientFrameId: `cf${String(i).padStart(20, "0")}` }) };
@@ -643,7 +643,7 @@ describe("§20.2 re-attribution through the ingest gate (measured)", () => {
 		const ydoc = new Y.Doc();
 		ydoc.getText("text").insert(0, "hello");
 		const yUpdate = Y.encodeStateAsUpdate(ydoc);
-		const kinds: readonly [string, EnvelopeKind, () => Uint8Array][] = [["ns", "nsOps", () => rng.bytes(40)], ["cfg", "cfgOps", () => rng.bytes(40)], [`b:${DOC}`, "bodyUpdate", () => yUpdate], [`x:${HASH}`, "blobChunk", () => rng.bytes(200)]];
+		const kinds: readonly [string, EnvelopeKind, () => Uint8Array][] = [["ns", "nsOps", () => rng.bytes(40)], ["cfg", "cfgOps", () => rng.bytes(40)], [`b:${DOC}`, "bodyUpdate", () => yUpdate]];
 		const rows = await inBatches(range(0, 32 * 16), async (i) => {
 			const deviceId = devices[i % 32]!;
 			const [stream, kind, content] = kinds[i % kinds.length]!;
