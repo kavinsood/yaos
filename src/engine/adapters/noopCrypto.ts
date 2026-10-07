@@ -24,7 +24,7 @@ export function createNoopCrypto(hash: HashPort): CryptoPort {
 			return { ok: true, plaintext: sealed };
 		},
 		async sealBlob({ plaintext }) {
-			return plaintext;
+			return [plaintext];
 		},
 		async openBlob({ sealed }) {
 			return { ok: true, plaintext: sealed };

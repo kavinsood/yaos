@@ -49,17 +49,28 @@ export function deriveSubkey(subtle: SubtleCrypto, base: CryptoKey, purpose: Pur
 		: subtle.deriveKey(params, base, { name: "AES-GCM", length: KEY_BYTES * 8 }, false, ["encrypt", "decrypt"]);
 }
 
-/** nonce ‖ AES-GCM(key, plaintext, aad) ‖ tag. The nonce length is checked before WebCrypto sees it (§4.1). */
-export async function gcmSeal(subtle: SubtleCrypto, key: CryptoKey, nonce: Uint8Array, aad: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array> {
+/**
+ * AES-GCM(key, plaintext, aad) ‖ tag, without the nonce: a view of WebCrypto's own output buffer (no copy).
+ * The nonce length is checked before WebCrypto sees it (§4.1).
+ */
+export async function gcmEncrypt(subtle: SubtleCrypto, key: CryptoKey, nonce: Uint8Array, aad: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array> {
 	if (nonce.length !== NONCE_BYTES) throw new Error(`suite 1: nonce must be ${NONCE_BYTES} bytes`);
-	const ct = await subtle.encrypt({ name: "AES-GCM", iv: ab(nonce), additionalData: ab(aad), tagLength: TAG_BYTES * 8 }, key, ab(plaintext));
-	const out = new Uint8Array(NONCE_BYTES + ct.byteLength);
+	return new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv: ab(nonce), additionalData: ab(aad), tagLength: TAG_BYTES * 8 }, key, ab(plaintext)));
+}
+
+/** nonce ‖ AES-GCM(key, plaintext, aad) ‖ tag, in one buffer (frames, checkpoints, wraps: small). */
+export async function gcmSeal(subtle: SubtleCrypto, key: CryptoKey, nonce: Uint8Array, aad: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array> {
+	const ct = await gcmEncrypt(subtle, key, nonce, aad, plaintext);
+	const out = new Uint8Array(NONCE_BYTES + ct.length);
 	out.set(nonce, 0);
-	out.set(new Uint8Array(ct), NONCE_BYTES);
+	out.set(ct, NONCE_BYTES);
 	return out;
 }
 
-/** Inverse of gcmSeal. "malformed": shorter than nonce plus tag; "auth-failed": the tag did not verify. */
+/**
+ * Inverse of gcmSeal. The plaintext is a view of WebCrypto's output buffer (no copy). "malformed": shorter
+ * than nonce plus tag; "auth-failed": the tag did not verify.
+ */
 export async function gcmOpen(subtle: SubtleCrypto, key: CryptoKey, aad: Uint8Array, sealed: Uint8Array): Promise<Uint8Array | "malformed" | "auth-failed"> {
 	if (sealed.length < AEAD_OVERHEAD) return "malformed";
 	const nonce = sealed.subarray(0, NONCE_BYTES);

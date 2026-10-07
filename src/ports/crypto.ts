@@ -13,6 +13,13 @@ import type { CryptoSuite } from "../core/envelope";
 /** Blob-store address. Suite 0: the content hash. Suite 1: hex(HMAC-SHA-256(kAddr, sha256)) (e2ee-design §10.1). */
 export type BlobAddress = Brand<string, "BlobAddress">;
 
+/**
+ * A sealed blob as parts in order; the stored object is their concatenation (e2ee-design §10.2). Suite 1:
+ * [header ‖ nonce, AES-GCM output], so WebCrypto's output buffer is handed on without a copy behind the header;
+ * the transport joins the parts once (httpBlob: one Blob body). Suite 0: [plaintext]. Never mutated.
+ */
+export type SealedBlobParts = readonly Uint8Array[];
+
 /** Which subkey seals an envelope (e2ee-design §5.1): kFrame or kCkpt. */
 export type SealPurpose = "frame" | "checkpoint";
 
@@ -57,8 +64,8 @@ export interface CryptoPort {
 		readonly aad: Uint8Array;
 		readonly sealed: Uint8Array;
 	}): Promise<OpenResult>;
-	/** The whole sealed-blob format incl. header and padding (e2ee-design §10.2). Suite 0: identity. */
-	sealBlob(input: { readonly address: BlobAddress; readonly plaintext: Uint8Array }): Promise<Uint8Array>;
+	/** The whole sealed-blob format incl. header and padding (e2ee-design §10.2), as parts. Suite 0: identity. */
+	sealBlob(input: { readonly address: BlobAddress; readonly plaintext: Uint8Array }): Promise<SealedBlobParts>;
 	openBlob(input: { readonly address: BlobAddress; readonly sealed: Uint8Array }): Promise<OpenResult>;
 	blobAddress(hash: ContentHash): Promise<BlobAddress>;
 	/** Diagnostics digest, 16 hex chars. Suite 0: sha256 prefix; suite 1: HMAC(kDiag, bytes) prefix (§6.4). */

@@ -16,7 +16,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import { checkpointAad, encodeOuter, frameAad } from "../../core/codec/envelope";
-import { Writer, utf8Encode } from "../../core/codec/lib0";
+import { Writer, concatBytes, utf8Encode } from "../../core/codec/lib0";
 import { blobAad } from "../../core/codec/sealedBlob";
 import { AAD_BLOB_PREFIX, AAD_KEYRING_PREFIX, type EnvelopeBinding, type EnvelopeHeader, type EnvelopeKind } from "../../core/envelope";
 import type { ClientFrameId, ContentHash, DeviceId, Seq, StreamName, VaultId } from "../../core/types";
@@ -295,7 +295,7 @@ describe("§20.2 bit flips: every sealed type, every region (measured)", () => {
 		const address = await c.blobAddress(HASH);
 		for (const [label, n] of [["blob 1000B", 1000], ["blob 64KiB", 65536]] as const) {
 			const pt = rng.bytes(n);
-			const bytes = await c.sealBlob({ address, plaintext: pt });
+			const bytes = concatBytes(await c.sealBlob({ address, plaintext: pt }));
 			assert.deepEqual(await c.openBlob({ address, sealed: bytes }), { ok: true, plaintext: pt }, `${label}: control opens`);
 			const run = await flipRun(bytes, 3, (x) => openBlobR(c, address, x), (x) => modelBlobHeader(x, HELD), n + 2);
 			assertRun(label, run, bytes.length, 3);
@@ -464,7 +464,7 @@ describe("§20.2 AAD substitution: every bound field, auth-failed 100% (measured
 		const c = await mainPort();
 		const rng = new SeededRandom(603);
 		const address = await c.blobAddress(HASH);
-		const bytes = await c.sealBlob({ address, plaintext: rng.bytes(500) });
+		const bytes = concatBytes(await c.sealBlob({ address, plaintext: rng.bytes(500) }));
 		const body = bytes.subarray(3);
 		assert.deepEqual(blobAadBy({ address }), blobAad(1, SEAL_E, VAULT, address), "hand-built AAD matches the codec");
 		const kBlob = await deriveSubkey(crypto.subtle, await importBase(crypto.subtle, K(SEAL_E)), "blob", VAULT, SEAL_E);
@@ -560,7 +560,7 @@ describe("§20.2 cross-type confusion (measured)", () => {
 			const s = streams[i % streams.length]!;
 			return { s, cs: 10 + i, bytes: await sealCheckpoint(c, V, s as StreamName, (10 + i) as Seq, rng.bytes(1 + i * 41), 3 as Seq) };
 		});
-		const blobs = await inBatches(range(0, N), async (i) => c.sealBlob({ address, plaintext: rng.bytes(i * 43) }));
+		const blobs = await inBatches(range(0, N), async (i) => concatBytes(await c.sealBlob({ address, plaintext: rng.bytes(i * 43) })));
 		const records = [await genesis(), await roll(2), await revoke(2), await roll(3), await revoke(3)];
 		const recs = records.map(decoded);
 		const out: Tally = {};

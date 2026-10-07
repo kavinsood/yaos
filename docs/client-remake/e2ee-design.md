@@ -623,7 +623,11 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
 
 - One AEAD call per blob. WebCrypto has no streaming AEAD [w3c-webcrypto-73], and blobs are ≤ 10 MiB.
 - [M] At ≥ 2 GB/s on desktop, sealing 10 MiB takes ~5 ms. Mobile is **[U]** (budget §16).
-- Peak memory is about 3 × 10 MiB transient (plaintext, padded copy, ciphertext).
+- [M] Blob-sized transient buffers besides the plaintext itself (`scripts/bench-e2ee.mjs`, `benchBlobMemory`):
+  - Up: 3. The padded copy (AES-GCM takes one contiguous input), the ciphertext, and one `Blob` request body.
+    `sealBlob` returns the parts `[header ‖ nonce, ciphertext]`; the transport joins them once.
+  - Down: 3. The response body, the plaintext (unpad is a view), and the exact-size copy handed to main.
+  - The WebCrypto outputs are inherent. So is the input copy the spec makes encrypt/decrypt take, which Node does not count.
 - **Caps.**
   - Suite 1 plaintext ≤ `MAX_BLOB_PLAINTEXT_BYTES` = 10223615 (§7.3). Above that the file is not synced (notice),
     as today above 10 MiB.
@@ -1329,7 +1333,7 @@ Both mean **a new vault** (decision D7):
 |---|---|---|---|
 | Typing: one frame per `OPEN_FRAME_IDLE_MS` (100 ms, `src/core/limits.ts:67`), sealed after that idle | ≤ 1 ms per frame | ≤ 10 ms | Below 1% of the frame interval. It includes the CPU and WebCrypto worker wake-up: a bare `subtle.encrypt` of 256 B after 100 ms idle alone takes 0.25–0.38 ms **[M]**, so the former 0.05 ms could not be met. The steady-state (back-to-back) cost, 0.019 ms **[M]**, is information only |
 | Bootstrap, 10k docs, 200 MiB of checkpoints and tail | ≤ 0.3 s total crypto | ≤ 3 s (10k × 0.1 ms + 200 MiB ÷ 100 MiB/s) | Downloading 200 MiB dominates |
-| One 10 MiB blob | ≤ 10 ms | ≤ 100 ms | Plus 3 × 10 MiB transient memory (§10.3) |
+| One 10 MiB blob | ≤ 10 ms | ≤ 100 ms | Plus 3 × 10 MiB transient buffers each way, one of them WebCrypto's output (inherent), plus WebCrypto's own input copy (§10.3) |
 | Engine start | ≤ 5 ms | ≤ 20 ms | |
 | Bundle | +0 KB of third-party crypto (WebCrypto) | | `qrcode` +9.6 KB gzip **[M]**. The E2EE code itself is ~15 KB gzip **[M]** (14.8 KB: keyring engine 6.6, compose layer — pinGate, keyReader, hostKeyring — 3.8, host keys 2.1, WebCrypto adapter 1.9, codecs 0.4; `scripts/bench-e2ee.mjs`), accepted |
 

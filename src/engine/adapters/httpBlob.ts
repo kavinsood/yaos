@@ -163,11 +163,13 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 			return present;
 		},
 
-		async put(address, bytes) {
+		async put(address, parts) {
 			const res = await send("blobs/put", `${root}/${encodeURIComponent(address)}`, {
 				method: "PUT",
 				headers: { ...auth, "Content-Type": "application/octet-stream" },
-				body: bytes.slice(),
+				// One Blob joins the parts: the transport's one copy. fetch reads a Blob body as a stream, where a
+				// BufferSource body would be copied again ([Fetch] "extract a body"). Parts are never SharedArrayBuffer views.
+				body: new Blob(parts as Uint8Array<ArrayBuffer>[]),
 			});
 			if (res.status !== 204 && res.status !== 200) throw await fail("blobs/put", res);
 		},

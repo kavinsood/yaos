@@ -12,7 +12,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createCipheriv, createHash, createHmac, hkdfSync } from "node:crypto";
-import { bytesToHex, hexToBytes, utf8Encode } from "../../core/codec/lib0";
+import { bytesToHex, concatBytes, hexToBytes, utf8Encode } from "../../core/codec/lib0";
+import { padmeLen } from "../../core/codec/padme";
 import type { ContentHash } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress } from "../../ports/crypto";
@@ -142,8 +143,17 @@ describe("suite 1 golden vectors", () => {
 		c.setSealEpoch(1);
 		random.push(nonce(0xa4));
 		const address = GOLDEN.address as BlobAddress;
-		assert.equal(bytesToHex(await c.sealBlob({ address, plaintext: PLAINTEXT })), GOLDEN.blob1);
-		assert.deepEqual(await c.openBlob({ address, sealed: h(GOLDEN.blob1) }), { ok: true, plaintext: PLAINTEXT });
+		const parts = await c.sealBlob({ address, plaintext: PLAINTEXT });
+		assert.equal(bytesToHex(concatBytes(parts)), GOLDEN.blob1);
+		// [header ‖ nonce, ct ‖ tag]: the second part is WebCrypto's whole output buffer, not a copy behind the header.
+		const ct = parts[1]!;
+		assert.deepEqual(parts.map((p) => p.length), [3 + 12, padmeLen(PLAINTEXT.length + 1) + 16]);
+		assert.deepEqual([ct.byteOffset, ct.byteLength], [0, ct.buffer.byteLength]);
+		const opened = await c.openBlob({ address, sealed: h(GOLDEN.blob1) });
+		assert.deepEqual(opened, { ok: true, plaintext: PLAINTEXT });
+		// unpad strips in place: the plaintext views WebCrypto's padded output buffer, no copy.
+		const pt = opened.ok ? opened.plaintext : null;
+		assert.deepEqual([pt?.byteOffset, pt?.buffer.byteLength], [0, padmeLen(PLAINTEXT.length + 1)]);
 	});
 
 	it("adapter: next, prev and recovery wraps, and they unwrap to the same keys", async () => {
@@ -169,7 +179,7 @@ describe("suite 1 golden vectors", () => {
 		const store: BlobPort = {
 			maxBlobBytes: 10 * 1024 * 1024,
 			has: async (as) => new Set(as.filter((a) => objects.has(a))),
-			put: async (a, b) => void objects.set(a, b.slice()),
+			put: async (a, parts) => void objects.set(a, concatBytes(parts)),
 			get: async (a) => objects.get(a)?.slice() ?? null,
 			list: async () => { throw new Error("unused"); },
 			deleteIfUploadedBefore: async () => { throw new Error("unused"); },

@@ -24,7 +24,7 @@
  * - bootstrap: openEnvelope (header decode, AAD, AES-GCM open, unpad, inner decode, kind check) of every row a
  *   fresh device reads. Content is incompressible, so no inflate (not crypto, and suite 0 pays it too). Only the
  *   opens are timed; the seal-side setup is not. The engine pattern (see benchBootstrap) is the budgeted number.
- * - blob up: blobAddress (1 HMAC) + sealBlob (Padmé copy, AES-GCM seal, header concat) of the largest suite-1
+ * - blob up: blobAddress (1 HMAC) + sealBlob (Padmé copy, AES-GCM seal; the parts [header ‖ nonce, ciphertext]) of the largest suite-1
  *   blob, MAX_BLOB_PLAINTEXT_BYTES_SUITE1 (§7.3: a full 10 MiB plaintext exceeds the suite-1 cap). sha256 of the
  *   plaintext is excluded ("already done today", §16.1).
  * - blob down: openBlob (header decode, AES-GCM open, unpad). The sha256 check after it is excluded likewise.
@@ -279,6 +279,8 @@ async function benchBlob() {
 		address = await crypto.blobAddress(hash);
 		sealed = await crypto.sealBlob({ address, plaintext });
 	});
+	const { concatBytes } = await load("src/core/codec/lib0.ts");
+	sealed = concatBytes(sealed); // sealBlob returns parts; the stored object is their concatenation (not timed)
 	let last = null;
 	const down = await repeat(R.blobWarm, R.blob, async () => {
 		const r = await crypto.openBlob({ address, sealed });
@@ -289,6 +291,125 @@ async function benchBlob() {
 	const mib = (n / 1048576).toFixed(2);
 	row(`blob up: ${mib} MiB, HMAC addr + seal`, stats(up), 10, "<= 100 ms", true, "max suite-1 plaintext");
 	row(`blob down: ${mib} MiB, open + unpad`, stats(down), 10, "<= 100 ms", true);
+}
+
+/**
+ * Blob memory (e2ee-design §10.3) and the end-to-end store path, information only. Each path runs the real code:
+ * - up (in-memory store): blobStore.putSealed = blobAddress, has, sealBlob, BlobPort.put, over an in-memory BlobPort
+ *   that keeps what put receives by reference (no copy), so the numbers are this code's own buffers.
+ * - up (httpBlob): the same through the real httpBlob.put; its stub fetch builds the real Request from (url, init),
+ *   i.e. Node's fetch body extraction, so the transport's copy of the body is included.
+ * - down: blobStore.getOpened (get, openBlob; the sha256 check excluded as in benchBlob), then owned(): the copy
+ *   hostLink.exec makes when write bytes are not a whole buffer, before transferring them to main.
+ * Memory, from a gc()'d baseline: "allocated" = the process.memoryUsage() delta when the operation returns, before
+ * any gc(); "kept" = the delta after gc(), i.e. what is still referenced (the stored object, the opened and sent
+ * bytes). A GC during the operation would hide some of it: external-memory pressure (tens of MiB) starts one, so
+ * the memory loop turns off incremental marking and counts external memory in the global limit, and still
+ * discards and counts any sample a GC overlapped. Node counts WebCrypto's output buffers in `external` but not in
+ * `arrayBuffers`, and a Blob's copy in `arrayBuffers` but not in `external`: both are shown. Timing runs after,
+ * with the default GC flags and no forced GC, >= 100 repetitions.
+ */
+async function benchBlobMemory() {
+	const v8 = await import("node:v8");
+	const vm = await import("node:vm");
+	const { PerformanceObserver } = await import("node:perf_hooks");
+	if (typeof globalThis.gc !== "function") v8.setFlagsFromString("--expose-gc");
+	const gc = globalThis.gc ?? vm.runInNewContext("gc");
+	const { putSealed, getOpened } = await load("src/engine/blobs/blobStore.ts");
+	const { createHttpBlob } = await load("src/engine/adapters/httpBlob.ts");
+	const { owned } = await load("src/protocol/workerTransport.ts");
+	const { concatBytes } = await load("src/core/codec/lib0.ts");
+	const crypto = await readyCrypto(1);
+	const n = MAX_BLOB_PLAINTEXT_BYTES_SUITE1;
+	const MiB = 1048576;
+	const plaintext = randomBytes(n);
+	const hash = bytesToHex(await createWebHash().sha256(plaintext));
+	const address = await crypto.blobAddress(hash);
+	const policy = { reuse: async () => false, noted: async () => {} };
+	const objects = new Map();
+	const mem = {
+		maxBlobBytes: 10 * MiB,
+		has: async (as) => new Set(as.filter((a) => objects.has(a))),
+		put: async (a, b) => void objects.set(a, b),
+		get: async (a) => objects.get(a) ?? null,
+		list: async () => ({ items: [], next: null }),
+		deleteIfUploadedBefore: async () => [],
+	};
+	let lastRequest = null;
+	const http = createHttpBlob({
+		baseUrl: "http://bench.invalid", vaultId: "bench", credential: "bench", maxBlobBytes: 10 * MiB,
+		fetch: async (url, init) => {
+			if (String(url).endsWith("/exists")) return new Response(JSON.stringify({ present: [] }), { status: 200 });
+			lastRequest = new Request(url, init); // Node's fetch body extraction (undici extractBody)
+			return new Response(null, { status: 204 });
+		},
+	});
+	const sealed = concatBytes(await crypto.sealBlob({ address, plaintext }));
+	const paths = {
+		"up, in-memory store (putSealed)": { run: () => putSealed(mem, crypto, hash, plaintext, policy), reset: () => objects.clear() },
+		"up, httpBlob.put + Request body": { run: () => putSealed(http, crypto, hash, plaintext, policy), reset: () => { lastRequest = null; } },
+		"down, getOpened + owned()": {
+			setup: () => objects.set(address, sealed),
+			run: async () => {
+				const got = await getOpened(mem, crypto, hash, null);
+				if (!got.ok) throw new Error(`getOpened failed: ${got.reason}`);
+				return [got.bytes, owned(got.bytes)];
+			},
+			reset: () => objects.clear(),
+		},
+	};
+	const gcAt = [];
+	const obs = new PerformanceObserver((list) => { for (const e of list.getEntries()) gcAt.push(e.startTime); });
+	obs.observe({ entryTypes: ["gc"] });
+	const flushGcEntries = () => new Promise((r) => setTimeout(r, 5));
+	const m = () => process.memoryUsage();
+	const memReps = QUICK ? 8 : 20;
+	const timeReps = 100;
+	const lines = [];
+	v8.setFlagsFromString("--no-incremental-marking");
+	v8.setFlagsFromString("--external-memory-accounted-in-global-limit");
+	for (const [label, p] of Object.entries(paths)) {
+		const samples = [];
+		let gcHit = 0;
+		for (let i = 0; i < memReps + 2; i++) {
+			p.setup?.();
+			gc(); gc();
+			const a = m();
+			const t0 = performance.now();
+			let keep = await p.run();
+			const t1 = performance.now();
+			const b = m();
+			await flushGcEntries();
+			const hit = gcAt.some((t) => t >= t0 && t <= t1);
+			gc(); gc();
+			const c = m();
+			keep = null;
+			p.reset();
+			if (i < 2) continue; // warm-up
+			if (hit) gcHit++;
+			else samples.push({ ext: b.external - a.external, ab: b.arrayBuffers - a.arrayBuffers, heap: b.heapUsed - a.heapUsed, keptExt: c.external - a.external, keptAb: c.arrayBuffers - a.arrayBuffers });
+			if (keep !== null) throw new Error("unreachable");
+		}
+		const med = (k) => stats(samples.map((s) => s[k])).median / MiB;
+		lines.push({ label, p, ext: med("ext"), ab: med("ab"), heap: med("heap"), keptExt: med("keptExt"), keptAb: med("keptAb"), clean: samples.length, gcHit });
+	}
+	obs.disconnect();
+	v8.setFlagsFromString("--incremental-marking");
+	v8.setFlagsFromString("--no-external-memory-accounted-in-global-limit");
+	for (const l of lines) {
+		l.p.setup?.();
+		l.t = stats(await repeat(5, timeReps, async () => { await l.p.run(); }));
+		l.p.reset();
+		row(`blob ${l.label} (info)`, l.t, null, "-", false, `alloc ext ${l.ext.toFixed(1)} / ab ${l.ab.toFixed(1)} MiB per blob`);
+	}
+	const f = (x) => x.toFixed(2).padStart(7);
+	log("");
+	log(`Blob memory per ${(n / MiB).toFixed(2)} MiB blob (sealed ${(sealed.length / MiB).toFixed(2)} MiB); MiB, medians of clean samples (no GC during the operation)`);
+	log(`  ${"path".padEnd(34)} ${"alloc ext".padStart(9)} ${"alloc ab".padStart(9)} ${"kept ext".padStart(9)} ${"kept ab".padStart(9)} ${"heapUsed".padStart(9)} ${"clean/gc".padStart(9)} ${"p50 ms".padStart(8)} ${"p95 ms".padStart(8)} ${"n".padStart(4)}`);
+	for (const l of lines) {
+		log(`  ${l.label.padEnd(34)} ${f(l.ext).padStart(9)} ${f(l.ab).padStart(9)} ${f(l.keptExt).padStart(9)} ${f(l.keptAb).padStart(9)} ${f(l.heap).padStart(9)} ${`${l.clean}/${l.gcHit}`.padStart(9)} ${l.t.median.toFixed(2).padStart(8)} ${l.t.p95.toFixed(2).padStart(8)} ${String(l.t.n).padStart(4)}`);
+	}
+	log(`  load average: ${os.loadavg().map((x) => x.toFixed(2)).join(" ")}`);
 }
 
 // ---- engine start (§16.2 <= 5 ms) ---------------------------------------------------------------------------
@@ -419,6 +540,7 @@ const TAIL = 4;
 const TAIL_BYTES = 1146;
 await benchBootstrap("B (+40k tail)", PER_DOC - TAIL * TAIL_BYTES, TAIL, TAIL_BYTES, false);
 await benchBlob();
+await benchBlobMemory();
 for (const n of [1, 3, 10]) await benchStart(n);
 if (!NO_BUNDLE) await benchBundle();
 const load1 = os.loadavg();

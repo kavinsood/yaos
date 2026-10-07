@@ -55,12 +55,29 @@ describe("httpBlob", () => {
 			return hit ? new Response(hit.slice()) : jsonResponse({ error: "not found" }, 404);
 		});
 		assert.equal(port.maxBlobBytes, DEFAULT_MAX_BLOB_BYTES);
-		await port.put(addr(1), new Uint8Array([1, 2]));
+		await port.put(addr(1), [new Uint8Array([1]), new Uint8Array([2])]);
 		assert.deepEqual(await port.get(addr(1)), new Uint8Array([1, 2]));
 		assert.equal(await port.get(addr(2)), null);
 		assert.equal(requests[0]!.url.pathname, `/vault/v1/blobs/${addr(1)}`);
 		assert.equal(requests[0]!.headers.get("content-type"), "application/octet-stream");
 		for (const r of requests) assert.equal(r.headers.get("authorization"), `Bearer ${TOKEN}`);
+	});
+
+	it("put sends the parts as one Blob body (no BufferSource for fetch to copy again), bytes in order", async () => {
+		const bodies: unknown[] = [];
+		const port = createHttpBlob({
+			baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN,
+			fetch: async (_url, init) => { bodies.push(init?.body); return new Response(null, { status: 204 }); },
+		});
+		const parts = [new Uint8Array([1, 2, 3]), new Uint8Array(new ArrayBuffer(8), 2, 4).fill(9), new Uint8Array(0)];
+		await port.put(addr(1), parts);
+		await port.put(addr(1), parts); // a retry re-reads the same parts
+		assert.equal(bodies.length, 2);
+		for (const b of bodies) {
+			assert.ok(b instanceof Blob);
+			assert.equal(b.size, 7);
+			assert.deepEqual(new Uint8Array(await b.arrayBuffer()), new Uint8Array([1, 2, 3, 9, 9, 9, 9]));
+		}
 	});
 
 	it("has() batches by 50 and only reports requested addresses", async () => {
@@ -80,11 +97,11 @@ describe("httpBlob", () => {
 
 	it("503 attachments_unavailable and other failures throw RelayHttpError", async () => {
 		const unavailable = blob(() => jsonResponse({ error: "attachments_unavailable" }, 503)).port;
-		for (const p of [unavailable.get(addr(1)), unavailable.put(addr(1), new Uint8Array(1)), unavailable.has([addr(1)])]) {
+		for (const p of [unavailable.get(addr(1)), unavailable.put(addr(1), [new Uint8Array(1)]), unavailable.has([addr(1)])]) {
 			const e = await rejection(p);
 			assert.deepEqual([e.status, e.code], [503, "attachments_unavailable"]);
 		}
-		const mismatch = await rejection(blob(() => jsonResponse({ error: "hash mismatch" }, 400)).port.put(addr(1), new Uint8Array(1)));
+		const mismatch = await rejection(blob(() => jsonResponse({ error: "hash mismatch" }, 400)).port.put(addr(1), [new Uint8Array(1)]));
 		assert.equal(mismatch.code, "hash mismatch");
 		const unknownVault = await rejection(blob(() => jsonResponse({ error: "unknown_vault" }, 404)).port.get(addr(1)));
 		assert.equal(unknownVault.code, "unknown_vault");

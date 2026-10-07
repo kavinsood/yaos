@@ -3,12 +3,13 @@
  * by several devices), a blob store whose stored objects and transport can be faulted, and a sealing crypto port
  * (XOR seal, prefixed addresses) that proves parts go through the attachments' blob path.
  */
+import { concatBytes } from "../../../core/codec/lib0";
 import { sha256Hex } from "../../../core/hash/sha256";
 import { applySnapOp, newSnapFold } from "../../../core/snap/fold";
 import type { SnapOp } from "../../../core/snap/record";
 import { kindOfPath, type ContentHash, type DeviceId, type VaultPath } from "../../../core/types";
 import type { BlobPort } from "../../../ports/blob";
-import type { BlobAddress, CryptoPort } from "../../../ports/crypto";
+import type { BlobAddress, CryptoPort, SealedBlobParts } from "../../../ports/crypto";
 import type { SideFileName, SideFilePort } from "../../../ports/vault";
 import type { PutPolicy } from "../../blobs/blobStore";
 import { World } from "../../reconcile/testkit/world";
@@ -52,10 +53,10 @@ export class FaultyStore implements BlobPort {
 		this.calls.has++;
 		return new Set(addresses.filter((a) => this.objects.has(a)));
 	}
-	async put(address: BlobAddress, bytes: Uint8Array) {
+	async put(address: BlobAddress, parts: SealedBlobParts) {
 		const nth = this.calls.put++;
 		if (this.failPut?.(address, nth)) throw new Error("blob put: network_error");
-		this.objects.set(address, bytes.slice());
+		this.objects.set(address, concatBytes(parts));
 	}
 	async get(address: BlobAddress) {
 		this.calls.get++;
@@ -73,7 +74,7 @@ export const addressOf = (h: ContentHash) => sha256Hex(new TextEncoder().encode(
 export const sealingCrypto = {
 	suite: 0, keyEpoch: 0,
 	seal: async () => { throw new Error("unused"); }, open: async () => { throw new Error("unused"); },
-	sealBlob: async (i: { plaintext: Uint8Array }) => xor(i.plaintext),
+	sealBlob: async (i: { plaintext: Uint8Array }) => [xor(i.plaintext)],
 	openBlob: async (i: { sealed: Uint8Array }) => ({ ok: true, plaintext: xor(i.sealed) }),
 	blobAddress: async (h: ContentHash) => addressOf(h),
 } as unknown as CryptoPort;

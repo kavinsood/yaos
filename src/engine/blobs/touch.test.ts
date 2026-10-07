@@ -5,12 +5,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { encodeCfgOps } from "../../core/codec/cfgOps";
+import { concatBytes } from "../../core/codec/lib0";
 import { encodeNsOps } from "../../core/codec/nsOps";
 import { sha256Hex } from "../../core/hash/sha256";
 import type { ClientFrameId, ConfigRelPath, ContentHash, DocId, Seq, StreamName, VaultPath } from "../../core/types";
 import { CFG_STREAM, NS_STREAM } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress } from "../../ports/crypto";
+import type { BlobAddress, SealedBlobParts } from "../../ports/crypto";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import { FakeClock } from "../reconcile/testkit/fakes";
@@ -28,7 +29,7 @@ class Store implements BlobPort {
 	gets = 0;
 	down = false;
 	async has(a: readonly BlobAddress[]) { if (this.down) throw new Error("503"); return new Set(a.filter((x) => this.objects.has(x))); }
-	async put(a: BlobAddress, b: Uint8Array) { if (this.down) throw new Error("503"); this.puts.push(a); this.objects.set(a, b.slice()); }
+	async put(a: BlobAddress, parts: SealedBlobParts) { if (this.down) throw new Error("503"); this.puts.push(a); this.objects.set(a, concatBytes(parts)); }
 	async get(a: BlobAddress) { if (this.down) throw new Error("503"); this.gets++; return this.objects.get(a)?.slice() ?? null; }
 	async list(): Promise<never> { throw new Error("unused"); }
 	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }

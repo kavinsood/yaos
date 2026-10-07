@@ -12,7 +12,8 @@
  */
 
 import { BLOB_DELETE_BATCH, type BlobDeleteResult, type BlobListItem, type BlobListPage, type BlobPort } from "../ports/blob";
-import type { BlobAddress } from "../ports/crypto";
+import type { BlobAddress, SealedBlobParts } from "../ports/crypto";
+import { concatBytes } from "../core/codec/lib0";
 
 export type SimBlobRoute = "has" | "put" | "get" | "list" | "delete";
 
@@ -62,10 +63,11 @@ export class SimBlobStore implements BlobPort {
 		return new Set(addresses.filter((a) => this.objects.has(a)));
 	}
 
-	async put(address: BlobAddress, bytes: Uint8Array): Promise<void> {
+	async put(address: BlobAddress, parts: SealedBlobParts): Promise<void> {
 		this.enter("put");
+		const bytes = concatBytes(parts);
 		if (bytes.byteLength > this.maxBlobBytes) throw new Error("sim blob put: 413 too large");
-		this.objects.set(address, { bytes: bytes.slice(), uploadedAt: this.opts.now() });
+		this.objects.set(address, { bytes, uploadedAt: this.opts.now() });
 	}
 
 	async get(address: BlobAddress): Promise<Uint8Array | null> {

@@ -12,9 +12,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { BLOB_CHUNK_BYTES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
+import { concatBytes } from "../../core/codec/lib0";
 import { KEYRING_STREAM, streamClass, type DocId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress, CryptoPort } from "../../ports/crypto";
+import type { BlobAddress, CryptoPort, SealedBlobParts } from "../../ports/crypto";
 import { SeededRandom } from "../../sim/random";
 import { SimRelay } from "../../sim/relay";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
@@ -131,8 +132,8 @@ class SharedBlobs implements BlobPort {
 	async has(a: readonly BlobAddress[]): Promise<ReadonlySet<BlobAddress>> {
 		return new Set(a.filter((x) => this.objects.has(x)));
 	}
-	async put(a: BlobAddress, b: Uint8Array): Promise<void> {
-		this.objects.set(a, b.slice());
+	async put(a: BlobAddress, parts: SealedBlobParts): Promise<void> {
+		this.objects.set(a, concatBytes(parts));
 	}
 	async get(a: BlobAddress): Promise<Uint8Array | null> {
 		this.gets++;

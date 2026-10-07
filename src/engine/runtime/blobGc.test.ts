@@ -432,7 +432,7 @@ test("GC R4: a reference committed in the store's check -> delete window is uplo
 					if (raced || !addrs.includes(x.address)) return;
 					raced = true;
 					// b re-uploads and commits a reference after the store's check, before its delete.
-					await w.store.put(x.address, x.bytes);
+					await w.store.put(x.address, [x.bytes]);
 					await b.submitNs([createBlob(d, x.hash)]);
 					await until(() => b.isIdle() && b.c.ns.state.entries.has(d), 5_000, "b committed");
 				};

@@ -239,7 +239,7 @@ export class BlobTouch implements PutPolicy {
 		}
 		const sealed = await store.get(address);
 		if (sealed) {
-			await store.put(address, sealed);
+			await store.put(address, [sealed]);
 			await this.noted(hash, address);
 			this.deps.diag("blob-refreshed", { from: "store" });
 			return;
