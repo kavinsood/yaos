@@ -577,7 +577,9 @@ runs on one device, on a user command or at most monthly.
   - R2 has no conditional delete. All heads run before the one delete, so a PUT that lands after an address's head
     and before the delete (at most 17 rounds of 6 heads, then the delete) is deleted, and its result still says
     `deleted`. The sweep's grace period (E2EE design §10.4: only blobs listed as uploaded more than 7 days ago) keeps
-    the window to re-uploads of long-orphaned bytes; the client handles it.
+    the window to re-uploads of long-orphaned bytes. The client narrows it further (E2EE design §10.4: the sweeping
+    device re-reads the name table after its deletes and re-uploads any deleted blob that became live, when it has
+    the bytes); a blob it has no bytes for is reported lost, not repaired.
 - **Limit.** List and batch delete share **60 requests a minute per vault**, counted in the vault DO in memory (a
   restarted vault DO starts a fresh window). A batch delete of up to 100 addresses is one request. Only requests
   with a valid bearer count, and a refused one does not. Over the limit: `429 {"error":"too_many_attempts"}` with
