@@ -1,6 +1,6 @@
 /**
  * Wires the host UI into the plugin: settings tab, status bar, commands, the obsidian://yaos setup
- * link handler and the safety brake prompt. Returns a disposer; the plugin also cleans up the
+ * and re-key link handler, the encryption modals and the safety brake prompt. Returns a disposer; the plugin also cleans up the
  * commands, tab, status bar item and protocol handler itself on unload.
  *
  * Usage in plugin.ts (onload): `this.register(registerUi(this, host));`
@@ -19,8 +19,11 @@ import { DIAGNOSTICS_WITH_PATHS_CONFIRM, exportDiagnostics } from "./diagnostics
 import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
 import { copyText, obsidianRequest, openPluginSettings } from "./obsidianEnv";
+import { CreateVaultModal } from "./createVaultModal";
+import { applyLinkE2ee, PendingQrKeys, routeSetupLink } from "./keyActions";
+import { EnterRecoveryKeyModal, KeyMissingModal, RekeyAfterRevokeModal, RekeyQrModal } from "./keyModals";
 import { PairingCodeModal, PairModal, type PairPrefill } from "./pairModal";
-import { parseSetupLink, type RequestFn } from "./pairing";
+import { parseSetupLink, type LinkE2ee, type RequestFn } from "./pairing";
 import { SnapshotsModal } from "./snapshotsModal";
 import { YaosSettingTab } from "./settingsTab";
 import { StatusBarController } from "./statusBar";
@@ -73,9 +76,58 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		else new Notice("YAOS: no changes are waiting for approval.");
 	};
 
-	const openPair = (prefill: PairPrefill = {}): void => {
+	// Keys from a QR or link waiting for a matching key record (§12.4 (i)); memory only.
+	const pendingKeys = new PendingQrKeys();
+
+	const openKeyMissing = (): void => {
 		if (disposed) return;
-		track(new PairModal(app, host, prefill, request));
+		track(new KeyMissingModal(app, host, pendingKeys, () => { if (!disposed) track(new EnterRecoveryKeyModal(app, host)); }));
+	};
+
+	/** A link's key or `suite=0`, for the vault this device is enrolled in (§12.4: never a re-enroll). Owns the key. */
+	const applyLink = (vaultId: string, e2ee: LinkE2ee): void => {
+		const working = new Notice(e2ee.suite === 1 ? "YAOS: checking the vault key from the link…" : "YAOS: applying the link's encryption setting…", 0);
+		applyLinkE2ee(host, vaultId, e2ee).then(
+			(outcome) => {
+				working.hide();
+				if (outcome === "verified") {
+					pendingKeys.clear(vaultId);
+					new Notice("YAOS: the vault key matches. This device syncs the vault.", 8000);
+				} else if (outcome === "suite0") {
+					new Notice("YAOS: this device syncs the vault without end-to-end encryption, as the link says.", 8000);
+				} else {
+					pendingKeys.mark(vaultId);
+					openKeyMissing();
+				}
+			},
+			(err: unknown) => {
+				working.hide();
+				new Notice(`YAOS: ${errorMessage(err)}`, 10000);
+			},
+		);
+	};
+
+	const openPair = (prefill: PairPrefill = {}): void => {
+		if (disposed) {
+			if (prefill.e2ee?.suite === 1) prefill.e2ee.key.k.fill(0);
+			return;
+		}
+		track(new PairModal(app, host, prefill, applyLink, request));
+	};
+
+	const openCreateVault = (resume: boolean): void => {
+		if (disposed) return;
+		track(new CreateVaultModal(app, host, { resume, request }));
+	};
+
+	const openRekeyQr = (afterRevoke: boolean): void => {
+		if (disposed) return;
+		track(new RekeyQrModal(app, host, afterRevoke));
+	};
+
+	const openRevokeRekey = (): void => {
+		if (disposed) return;
+		track(new RekeyAfterRevokeModal(app, host, () => openRekeyQr(true)));
 	};
 
 	const openPairAnother = (): void => {
@@ -107,12 +159,17 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 	};
 
 	// Status bar.
-	const statusBar = new StatusBarController(plugin.addStatusBarItem(), host, { openBrake, openSettings });
+	const statusBar = new StatusBarController(plugin.addStatusBarItem(), host, { openBrake, openSettings, openKeyMissing });
 
 	// Settings tab.
 	const tab = new YaosSettingTab(app, plugin, host, {
 		openPair: () => openPair(),
 		openPairAnother,
+		openCreateVault: () => openCreateVault(false),
+		openResumeCreation: () => openCreateVault(true),
+		openKeyMissing,
+		openRekeyQr: () => openRekeyQr(false),
+		openRevokeRekey,
 		openBrake,
 		openSnapshots,
 		exportDiagnostics: () => runExport(false),
@@ -139,6 +196,11 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 			void cleanUpAttachments(host, (message, level) => { new Notice(`YAOS: ${message}`, level === "error" ? 10000 : 6000); });
 		},
 		"yaos-restart-engine": () => { void restartSyncEngine(host); },
+		"yaos-create-vault": () => openCreateVault(false),
+		"yaos-finish-creating-vault": () => openCreateVault(true),
+		"yaos-unlock": openKeyMissing,
+		"yaos-show-rekey-qr": () => openRekeyQr(false),
+		"yaos-rekey-after-revoke": openRevokeRekey,
 	};
 	for (const spec of UI_COMMANDS) {
 		plugin.addCommand({
@@ -152,14 +214,14 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		});
 	}
 
-	// obsidian://yaos?action=setup&host=...&pairingCode=... opens the pair modal prefilled.
+	// obsidian://yaos?action=setup&host=...&pairingCode=...[&key=...|&suite=0] opens the pair modal prefilled, or, for
+	// the vault this device is already in (and for action=rekey), takes only the key or suite=0 (§12.4). A link never
+	// leads anywhere else. The link itself is never logged or shown.
 	plugin.registerObsidianProtocolHandler("yaos", (params) => {
-		const parsed = parseSetupLink(params);
-		if (!parsed.ok) {
-			new Notice(`YAOS: ${parsed.reason}`, 8000);
-			return;
-		}
-		openPair({ host: parsed.host, pairingCode: parsed.pairingCode });
+		const route = routeSetupLink(parseSetupLink(params), host.data(), host.status());
+		if (route.kind === "ignore") new Notice(`YAOS: ${route.message}`, 9000);
+		else if (route.kind === "pair") openPair({ host: route.host, pairingCode: route.pairingCode, e2ee: route.e2ee, fromLink: true });
+		else applyLink(host.data().identity?.vaultId ?? "", route.e2ee);
 	});
 
 	// Safety brake: prompt once per new brake id, including one already pending at startup.

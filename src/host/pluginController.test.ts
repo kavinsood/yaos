@@ -327,3 +327,59 @@ test("creation marker (§15.1): written before enroll, kept across it; creatable
 	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: { ...ID, vaultId: testVaultId("v2") } })), 5_000);
 	assert.equal(w.saved.at(-1)?.creating, undefined);
 });
+
+test("abandonCreating (§15.1 abort): the marker goes, no pin, the engine restarts off the creation path", async () => {
+	const w = setup();
+	await w.ctl.start();
+	await w.ctl.markCreating(ID.vaultId);
+	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: ID })), 5_000);
+	assert.ok(await advanceUntil(w.clock, () => w.ctl.status()?.e2ee?.creatable === true, 30_000));
+	const starts = w.dev.engineStarts;
+	await w.ctl.abandonCreating(testVaultId("other"));
+	assert.deepEqual(w.ctl.data().creating, { vaultId: ID.vaultId }, "another vault's abort leaves this marker");
+	await w.ctl.abandonCreating(ID.vaultId);
+	assert.equal(w.ctl.data().creating, undefined);
+	assert.equal(w.saved.at(-1)?.creating, undefined, "saved");
+	assert.equal(w.ctl.data().e2ee, undefined, "no pin: unpinned and blocked");
+	assert.ok(await advanceUntil(w.clock, () => w.dev.engineStarts === starts + 1 && w.ctl.runState().phase === "running" && w.ctl.status() !== null, 30_000), "restarted");
+	assert.equal(w.ctl.status()?.e2ee?.creatable, false);
+	assert.equal(w.ctl.status()?.e2ee?.keyMissing, "no-pin");
+	await assert.rejects(w.ctl.command({ t: "enableE2ee", rk: fakeEpochKey(21) }), (e: unknown) => e instanceof PinRefusedError && e.refusal === "not-creating");
+	await assert.rejects(w.ctl.command({ t: "pinSuite0", source: "create" }), (e: unknown) => e instanceof PinRefusedError && e.refusal === "not-creating");
+	assert.equal(w.net.relay.rows(KEYRING_STREAM).length, 0);
+});
+
+test("rkChecksum: the engine hashes (main never does); the caller's secret is untouched; needs an engine", async () => {
+	const { createHash } = await import("node:crypto");
+	const idle = setup();
+	await assert.rejects(idle.ctl.rkChecksum(new Uint8Array(32)), /not running/);
+	const w = await started(PAIRED);
+	const secret = new Uint8Array(32).map((_, i) => i * 7 + 1);
+	const before = secret.slice();
+	const sum = await settle(w.clock, w.ctl.rkChecksum(secret), 100);
+	assert.deepEqual([...sum], [...createHash("sha256").update(before).digest().subarray(0, 3)]);
+	assert.deepEqual(secret, before, "a copy was transferred");
+	await assert.rejects(w.ctl.rkChecksum(new Uint8Array(31)), /not running/);
+});
+
+test("vaultKeyForQr: the stored key of the seal epoch, as a copy; null unless suite 1 with a usable key", async () => {
+	const unpinned = await started(PAIRED);
+	assert.equal(unpinned.ctl.vaultKeyForQr(), null, "unpinned");
+	const s0 = await started(withSuite0PinForTest(PAIRED));
+	assert.equal(s0.ctl.vaultKeyForQr(), null, "suite 0");
+	const w = setup();
+	await w.ctl.start();
+	await w.ctl.markCreating(ID.vaultId);
+	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: ID })), 5_000);
+	assert.ok(await advanceUntil(w.clock, () => w.ctl.status()?.e2ee?.creatable === true, 30_000));
+	assert.equal(w.ctl.vaultKeyForQr(), null, "creatable, not pinned yet");
+	await settle(w.clock, w.ctl.command({ t: "enableE2ee", rk: fakeEpochKey(22) }), 100);
+	assert.ok(await advanceUntil(w.clock, () => w.ctl.status()?.phase === "live", 30_000));
+	const key = w.ctl.vaultKeyForQr();
+	assert.ok(key, "suite 1, key usable");
+	assert.equal(key.e, 1);
+	const stored = new VaultKeyStore(w.dev.secrets, ID.vaultId, w.clock).load();
+	assert.deepEqual(key.k, stored?.keys[0]?.k);
+	key.k.fill(0);
+	assert.ok(!noBytes(w.ctl.vaultKeyForQr()!.k), "zero-filling the copy leaves the store alone");
+});

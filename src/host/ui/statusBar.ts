@@ -11,6 +11,7 @@ import type { StatusSnapshot } from "../../protocol/status";
 import type { EngineRunState, YaosUiHost } from "./api";
 import { pendingBrake } from "./api";
 import { brakeHeadline } from "./brake";
+import { isKeyMissing } from "./commands";
 import { formatAgo, formatDuration, plural } from "./format";
 
 export type StatusLevel = "ok" | "busy" | "warn" | "error";
@@ -158,7 +159,7 @@ export function renderStatus(snapshot: StatusSnapshot | null, run: EngineRunStat
 		case "key-missing":
 			text = withUnsynced("encryption key missing", n);
 			level = "error";
-			lines.push("This device can't write. Scan a re-key code from another device, or enter the recovery key.");
+			lines.push("This device can't sync without the vault key. Click to enter your recovery key or scan a QR code from one of your devices.");
 			break;
 		case "error": {
 			text = withUnsynced("error", n);
@@ -212,6 +213,8 @@ export interface StatusBarElement {
 export interface StatusBarOptions {
 	/** Click while a brake is pending. */
 	openBrake(): void;
+	/** Click while this device is blocked for want of a key or pin (e2ee-design §12.4). */
+	openKeyMissing(): void;
 	/** Click otherwise. */
 	openSettings(): void;
 	timers?: StatusBarTimers;
@@ -239,6 +242,7 @@ export class StatusBarController {
 	private disposed = false;
 	private readonly onClick = (): void => {
 		if (pendingBrake(this.host)) this.opts.openBrake();
+		else if (this.host.status()?.phase === "key-missing" || isKeyMissing(this.host)) this.opts.openKeyMissing();
 		else this.opts.openSettings();
 	};
 

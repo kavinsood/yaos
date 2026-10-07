@@ -153,7 +153,27 @@ function stamp(): string {
 	return new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
 }
 
-function recordVault(path: string, logDir: string, label: string, vault: OnboardedVault): void {
+/** SECRET: the operator key the context file holds for `baseUrl`, if any. */
+export function loadOperatorKey(baseUrl: string, logDir = DEFAULT_LOG_DIR): string | undefined {
+	return loadContext(contextPath(baseUrl, logDir)).operatorRecoveryKey;
+}
+
+/**
+ * Keeps an operator key made outside onboardVault (e2ee.ts claims the relay through the plugin's creation flow) in
+ * the 0600 context file, so revokeDevice can log in later. Starts a fresh record when the key changes.
+ */
+export function saveOperatorKey(baseUrl: string, operatorRecoveryKey: string, logDir = DEFAULT_LOG_DIR): void {
+	const path = contextPath(baseUrl, logDir);
+	const saved = loadContext(path);
+	saveContext(path, logDir, { host: baseUrl, operatorRecoveryKey, vaults: saved.operatorRecoveryKey === operatorRecoveryKey ? saved.vaults ?? [] : [] });
+}
+
+/** Adds `vault` (its devices' tokens included) to the context file. */
+export function recordVault(baseUrl: string, label: string, vault: OnboardedVault, logDir = DEFAULT_LOG_DIR): void {
+	recordVaultAt(contextPath(baseUrl, logDir), logDir, label, vault);
+}
+
+function recordVaultAt(path: string, logDir: string, label: string, vault: OnboardedVault): void {
 	const saved = loadContext(path);
 	saveContext(path, logDir, {
 		...saved,
@@ -217,7 +237,7 @@ export async function onboardVault(baseUrlRaw: string, opts: OnboardOptions = {}
 		devices.push(next.device);
 	}
 	const vault: OnboardedVault = { baseUrl, vaultId: owner.vaultId, vaultGeneration: owner.vaultGeneration, via, devices };
-	recordVault(path, logDir, label, vault);
+	recordVaultAt(path, logDir, label, vault);
 	return vault;
 }
 
@@ -238,6 +258,6 @@ export async function pairDevice(vault: OnboardedVault, name: string, logDir = D
 	const next = await enrollDevice(vault.baseUrl, code, name);
 	if (next.vaultId !== vault.vaultId) throw new Error(`device ${name} joined a different vault`);
 	vault.devices.push(next.device);
-	recordVault(contextPath(vault.baseUrl, logDir), logDir, `${name}-added`, { ...vault, devices: [next.device] });
+	recordVaultAt(contextPath(vault.baseUrl, logDir), logDir, `${name}-added`, { ...vault, devices: [next.device] });
 	return next.device;
 }

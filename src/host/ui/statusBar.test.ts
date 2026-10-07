@@ -196,7 +196,7 @@ test("controller renders immediately, then throttles to at most one render per 2
 	const timers = new FakeTimers();
 	const h = makeHost(snap("live"));
 	const opens: string[] = [];
-	const c = new StatusBarController(el, h.host, { openBrake: () => opens.push("brake"), openSettings: () => opens.push("settings"), timers });
+	const c = new StatusBarController(el, h.host, { openBrake: () => opens.push("brake"), openSettings: () => opens.push("settings"), openKeyMissing: () => opens.push("key"), timers });
 	assert.equal(el.textContent, "YAOS: synced");
 	assert.ok(el.classes.has("yaos-status-ok") && el.classes.has("mod-clickable"));
 	assert.equal(el.writes, 1);
@@ -230,7 +230,7 @@ test("controller skips identical renders", () => {
 	const el = new FakeElement();
 	const timers = new FakeTimers();
 	const h = makeHost(snap("live"));
-	new StatusBarController(el, h.host, { openBrake() {}, openSettings() {}, timers });
+	new StatusBarController(el, h.host, { openBrake() {}, openSettings() {}, openKeyMissing() {}, timers });
 	timers.advance(1_000);
 	h.set(snap("live"));
 	timers.advance(1_000);
@@ -242,7 +242,7 @@ test("controller click routes to brake modal when a brake is pending, else setti
 	const timers = new FakeTimers();
 	const h = makeHost(snap("live"));
 	const opens: string[] = [];
-	new StatusBarController(el, h.host, { openBrake: () => opens.push("brake"), openSettings: () => opens.push("settings"), timers });
+	new StatusBarController(el, h.host, { openBrake: () => opens.push("brake"), openSettings: () => opens.push("settings"), openKeyMissing: () => opens.push("key"), timers });
 	el.click();
 	h.setBrake(BRAKE);
 	el.click();
@@ -256,7 +256,7 @@ test("controller merges host.brake() into the snapshot and hides when the status
 	const el = new FakeElement();
 	const timers = new FakeTimers();
 	const h = makeHost(snap("live"));
-	const c = new StatusBarController(el, h.host, { openBrake() {}, openSettings() {}, timers });
+	const c = new StatusBarController(el, h.host, { openBrake() {}, openSettings() {}, openKeyMissing() {}, timers });
 	h.setBrake(BRAKE);
 	timers.advance(300);
 	assert.equal(el.attrs.get("aria-label")?.includes("holding 120 changes"), true);
@@ -267,4 +267,19 @@ test("controller merges host.brake() into the snapshot and hides when the status
 	c.renderNow();
 	assert.equal(el.style.display, "");
 	assert.ok(el.textContent?.startsWith("YAOS: "));
+});
+
+test("key-missing: the text stays, the tooltip says what to do, and a click opens the blocked screen", () => {
+	const r = renderStatus(snap("key-missing"), RUNNING);
+	assert.equal(r.text, "YAOS: encryption key missing");
+	assert.match(r.tooltip, /Click to enter your recovery key or scan a QR code from one of your devices\./);
+	const el = new FakeElement();
+	const timers = new FakeTimers();
+	const h = makeHost(snap("key-missing"));
+	const opens: string[] = [];
+	new StatusBarController(el, h.host, { openBrake: () => opens.push("brake"), openSettings: () => opens.push("settings"), openKeyMissing: () => opens.push("key"), timers });
+	el.click();
+	h.set(snap("live"));
+	el.click();
+	assert.deepEqual(opens, ["key", "settings"]);
 });

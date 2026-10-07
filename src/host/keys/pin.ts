@@ -133,6 +133,17 @@ export function markedCreating<T extends PinFields>(d: T, vaultId: string, enrol
 }
 
 /**
+ * §15.1: the creation flow for `vaultId` failed its step-3 check ("The server returned a vault that is not empty").
+ * The marker goes, so the device stays unpinned and blocked (§12.4) and never resumes as a creation. A marker for
+ * another vault is left alone.
+ */
+export function withoutCreating<T extends PinFields>(d: T, vaultId: string): T {
+	if (d.creating?.vaultId !== vaultId) return d;
+	const { creating: _c, ...rest } = d;
+	return rest as T;
+}
+
+/**
  * The pin fields across a data.json update (the UI never writes them). The pin is kept while the device stays in
  * the same vault and dropped otherwise. The creation marker is written before the enroll it precedes (§15.1), so
  * it survives until the device enrolls in a vault other than the marked one.

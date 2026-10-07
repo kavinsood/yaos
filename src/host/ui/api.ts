@@ -254,6 +254,17 @@ export interface YaosUiHost {
 	brake(): BrakeReport | null;
 	/** Write a file under <configDir>/plugins/yaos/diagnostics/ (returns the vault-relative path). */
 	writeDiagnosticsFile(name: string, text: string): Promise<string>;
+	/**
+	 * e2ee-design §15.1 step 1 done: this device created `vaultId` on the server. Only "Create a new vault"
+	 * (createVault.ts) calls it, right after the creating response.
+	 */
+	markCreating(vaultId: string): Promise<void>;
+	/** §15.1: the creation of `vaultId` failed its step-3 check. Drops the marker; no pin is set. */
+	abandonCreating(vaultId: string): Promise<void>;
+	/** First 3 bytes of SHA-256(secret) for a 32-byte RK secret (§13.1), hashed by the engine. `secret` is unchanged. */
+	rkChecksum(secret: Uint8Array): Promise<Uint8Array>;
+	/** SECRET: the key a pairing or re-key QR carries (a copy; zero-fill it), or null when this device has none to give. */
+	vaultKeyForQr(): { readonly e: number; readonly k: Uint8Array } | null;
 }
 
 /** The pending brake from either source (host.brake() wins). */

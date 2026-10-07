@@ -125,6 +125,10 @@ export default class YaosPlugin extends Plugin {
 			command: (c) => controller.command(c),
 			restartEngine: () => controller.restartEngine(),
 			brake: () => controller.brake(),
+			markCreating: (vaultId) => controller.markCreating(vaultId),
+			abandonCreating: (vaultId) => controller.abandonCreating(vaultId),
+			rkChecksum: (secret) => controller.rkChecksum(secret),
+			vaultKeyForQr: () => controller.vaultKeyForQr(),
 			writeDiagnosticsFile: async (name, text) => {
 				const dir = `${pluginDir}/diagnostics`;
 				if (!(await vaultApi.adapter.exists(dir))) await vaultApi.adapter.mkdir(dir);
