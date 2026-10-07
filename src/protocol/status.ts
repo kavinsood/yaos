@@ -72,7 +72,7 @@ export interface E2eeStatus {
 	/** Epoch of new seals; 0 under suite 0 and while no key is usable. */
 	readonly sealEpoch: number;
 	readonly keyMissing: KeyMissingReason | null;
-	/** Sticky: this device has read a valid-looking `k` genesis for its vault, so a suite-0 link is refused. */
+	/** Sticky: this device has read a decodable `k` record for its vault, so a suite-0 link is refused (§12.4 (ii)). */
 	readonly keyringSeen: boolean;
 	/** Only for an engine started with `creating`, after VAULT_READY.head = 0 and an empty `k` (§15.1). */
 	readonly creatable: boolean;

@@ -51,7 +51,7 @@ function frame(id: string, order: number, over: Partial<OutboxMirrorFrame> = {})
 function record(id: string, order: number, stream: string, sealedLen: number, over: Partial<OutboxRecord> = {}): OutboxRecord {
 	return {
 		clientFrameId: F(id), order, stream: S(stream), kind: "bodyUpdate", state: "pending",
-		sealed: bytesOf(sealedLen, order), content: bytesOf(3, 99), authorNsSeq: 5, flags: 0, frameNo: null,
+		sealed: bytesOf(sealedLen, order), content: bytesOf(3, 99), authorNsSeq: 5, flags: 0, frameNo: null, keyEpoch: 0,
 		dependsOn: null, adoptOf: null, attempts: 0, createdAtMs: 1, lastSentAtMs: 0, ...over,
 	};
 }

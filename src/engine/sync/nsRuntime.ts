@@ -28,7 +28,7 @@ import type { SnapshotRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
 import { FoldRuntime, type FoldCandidate, type FoldedFrame } from "./foldRuntime";
 
-export { LOCAL_FLAG_UNOPENED } from "./foldRuntime";
+export { LOCAL_FLAG_STALE_EPOCH, LOCAL_FLAG_UNOPENED } from "./foldRuntime";
 /** FOLD (V3): an ns row s is a candidate iff floor(s / M) > floor(prev / M) (core/ns/candidate). */
 export const NS_CANDIDATE_MODULUS = NS_CANDIDATE_INTERVAL;
 
@@ -70,6 +70,12 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	protected foldFrame(row: TailRecord, ops: readonly NsOp[]): { events: readonly NsFoldEvent[]; halted: boolean } {
 		const events = foldNsFrame(this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, frameNo: row.frameNo ?? 0, ops });
 		return { events, halted: nsFoldHalted(events) };
+	}
+
+	protected foldStale(row: TailRecord): readonly NsFoldEvent[] {
+		if (row.seq <= this.state.coversSeq) return [];
+		this.state.coversSeq = row.seq;
+		return [{ seq: row.seq, index: -1, deviceId: row.deviceId, clientFrameId: row.clientFrameId, docId: null, outcome: { kind: "ignored", reason: "stale-epoch" } }];
 	}
 
 	encodeState(): Uint8Array {

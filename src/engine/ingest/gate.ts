@@ -14,6 +14,7 @@ import { streamClass } from "../../core/types";
 import type { CryptoPort } from "../../ports/crypto";
 import type { QuarantineReason } from "../store/schema";
 import { decodeCfgOps } from "../../core/codec/cfgOps";
+import { decodeOuter } from "../../core/codec/envelope";
 import { decodeCfgFoldV1, encodeCfgFoldV1 } from "../../core/codec/cfgFoldV1";
 import { decodeBodyUpdateRef, decodeCheckpointContent } from "../../core/codec/contents";
 import { bytesEqual } from "../../core/codec/lib0";
@@ -26,11 +27,20 @@ import { decodeSnapOps, type SnapOp } from "../../core/snap/record";
 import { isReaderDependent, openEnvelope } from "./envelope";
 import { checkYjsUpdate } from "./yjsCheck";
 
+/**
+ * e2ee-design §14.3 for a frame at `seq` (null: a provisional, not committed yet) or a checkpoint at coversSeq,
+ * sealed under keyEpoch. "stale": below the winning revoke and past S_rot. "hold": not decidable by this reader
+ * yet (a revoke it cannot settle, or `k` rows not judged yet); reader-dependent.
+ */
+export type StaleCheck = (keyEpoch: number, seq: Seq | null) => "stale" | "hold" | null;
+
 export interface GateCtx {
 	readonly crypto: CryptoPort;
 	readonly vaultId: VaultId;
 	/** Checkpoint state bound (relay maxCheckpointBytes, inflated states may be larger). */
 	readonly maxCheckpointStateBytes: number;
+	/** The keyring's answer (keyringRuntime.ts); suite 0 and unpinned answer null. */
+	readonly staleCheck: StaleCheck;
 }
 
 export type GateSubject =
@@ -40,6 +50,8 @@ export type GateSubject =
 
 export type GatePass =
 	| { readonly ok: true; readonly t: "ignored" }
+	/** A committed frame below the winning revoke past S_rot (§14.3): ns/cfg fold it as empty, bodies ignore it. */
+	| { readonly ok: true; readonly t: "stale"; readonly keyEpoch: number }
 	/** ops = null: deterministic malformation, folds as an empty frame (§c.3). */
 	| { readonly ok: true; readonly t: "ns"; readonly inner: InnerEnvelope; readonly ops: readonly NsOp[] | null; readonly detail: string | null }
 	/** ops = null: deterministic malformation, folds as an empty frame (§c.11). */
@@ -81,6 +93,8 @@ export async function gate(ctx: GateCtx, subject: GateSubject): Promise<GateResu
 	const cls = streamClass(subject.stream);
 	// keyring: k records carry no envelope (e2ee-design §11); WP-E3 reads them.
 	if (cls === "other" || cls === "keyring") return { ok: true, t: "ignored" };
+	const stale = staleVerdict(ctx, subject);
+	if (stale) return stale;
 	const binding = subject.t === "checkpoint"
 		? { t: "checkpoint" as const, stream: subject.stream, coversSeq: subject.coversSeq }
 		: { t: "frame" as const, stream: subject.stream, deviceId: subject.deviceId, clientFrameId: subject.clientFrameId };
@@ -115,6 +129,23 @@ export async function gate(ctx: GateCtx, subject: GateSubject): Promise<GateResu
 		case "blobchunk":
 			return { ok: true, t: "blobchunk", inner };
 	}
+}
+
+const IGNORED: GatePass = { ok: true, t: "ignored" };
+
+/**
+ * §14.3 before opening: the header's keyEpoch decides, so every reader agrees whether or not it holds that key.
+ * A provisional is never adopted under either verdict (its committed row is judged when it lands).
+ */
+function staleVerdict(ctx: GateCtx, subject: GateSubject): GateResult | null {
+	const outer = decodeOuter(subject.payload);
+	if (!outer.ok || outer.header.keyEpoch === 0) return null;
+	const e = outer.header.keyEpoch;
+	const v = ctx.staleCheck(e, subject.t === "row" ? subject.seq : subject.t === "checkpoint" ? subject.coversSeq : null);
+	if (v === null) return null;
+	if (subject.t === "provisional") return IGNORED;
+	if (v === "hold") return fail("keyring-hold", `keyEpoch ${e}`, true);
+	return subject.t === "row" ? { ok: true, t: "stale", keyEpoch: e } : fail("stale-epoch", `keyEpoch ${e}`);
 }
 
 async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "snap" | "body" | "canvas" | "blobchunk", coversSeq: Seq, inner: InnerEnvelope): Promise<GateResult> {

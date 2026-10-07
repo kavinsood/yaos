@@ -48,7 +48,7 @@ export interface SnapFrame {
 export type SnapOpOutcome =
 	| { readonly t: "applied" }
 	| { readonly t: "same" }
-	| { readonly t: "ignored"; readonly reason: "invalid-op" | "unknown-version" | "deleted" | "below-floor" | "conflict-lost" };
+	| { readonly t: "ignored"; readonly reason: "invalid-op" | "unknown-version" | "deleted" | "below-floor" | "conflict-lost" | "stale-epoch" };
 
 export interface SnapFoldEvent {
 	readonly seq: Seq;

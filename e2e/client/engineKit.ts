@@ -142,6 +142,7 @@ export class Device {
 			clientVersion: "wpc-e2e",
 			sideFiles: this.side,
 			tuning,
+			e2ee: { suite: 0 },
 			onBoundText: (id, changes, _length, origin) => {
 				const text = this.hosts.get(id);
 				if (text === undefined || origin === "editor") return; // "editor" = this device's own typing, already shown

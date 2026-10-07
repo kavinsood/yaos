@@ -3,7 +3,7 @@
  * defaults are the DESIGN values.
  */
 
-import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, type Budgets, type DeviceClass } from "../../core/limits";
+import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
 import type { DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { SideFilePort } from "../../ports/vault";
@@ -14,6 +14,7 @@ import type { TextChanges } from "../body/textChanges";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import { NS_CANDIDATE_MODULUS, type FoldedNsFrame } from "../sync/nsRuntime";
 import { BLOB_RETRY_BASE_MS, BLOB_RETRY_MAX_MS } from "../blobs/blobQueue";
+import type { EngineE2ee } from "../keyring/keyringRuntime";
 
 export interface EngineTuning {
 	/** Local compaction trigger (DESIGN §d.8). */
@@ -52,6 +53,9 @@ export interface EngineTuning {
 	readonly refRetryMaxMs: number;
 	/** §10.2 quarantine: a ref row's deterministic failures must span at least this long (BLOB_QUARANTINE_MIN_MS). */
 	readonly blobQuarantineMinMs: number;
+	/** Roll trigger (e2ee-design §4.2); tests shrink them. */
+	readonly rollSeqSpan: number;
+	readonly rollOwnSeals: number;
 }
 
 export const DEFAULT_TUNING: EngineTuning = {
@@ -78,6 +82,8 @@ export const DEFAULT_TUNING: EngineTuning = {
 	refRetryMs: BLOB_RETRY_BASE_MS,
 	refRetryMaxMs: BLOB_RETRY_MAX_MS,
 	blobQuarantineMinMs: BLOB_QUARANTINE_MIN_MS,
+	rollSeqSpan: ROLL_SEQ_SPAN,
+	rollOwnSeals: ROLL_OWN_SEALS,
 };
 
 /** Why a bound body's text changed: "editor" = applyEditorChanges, "merge" = an engine merge (editDoc, mergeJob). */
@@ -89,6 +95,11 @@ export interface EngineOptions {
 	readonly deviceId: DeviceId;
 	readonly deviceClass?: DeviceClass;
 	readonly clientVersion: string;
+	/**
+	 * The suite pin and keyring inputs (e2ee-design §12.4, §18.4). Required, with no default: an absent pin is
+	 * `{suite: null}` (unpinned: reads `k` only, writes nothing), never suite 0.
+	 */
+	readonly e2ee: EngineE2ee;
 	/** Known epoch: open the DB before connecting (offline start). Without it the first connect decides. */
 	readonly vaultEpoch?: VaultEpoch;
 	/** Outbox mirror (DESIGN §e.4); null/absent = no mirror. */

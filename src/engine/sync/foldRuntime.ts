@@ -7,7 +7,9 @@
  * has them all (appliedSeq), so live rows of a stale stream wait in tail. A
  * tail row flagged LOCAL_FLAG_UNOPENED (reader-dependent gate failure) halts
  * the fold, as does a frame the fold itself refuses (ns upgradeRules above the
- * known version).
+ * known version); resume() lifts it once the row is re-gated (quarantineRelease.ts).
+ * A row flagged LOCAL_FLAG_STALE_EPOCH (e2ee-design §14.3) folds as one
+ * frame-level ignored/stale-epoch event.
  *
  * Own frames are "pending" (overlaid on the committed fold) from T_edit until
  * the committed fold has them: while in the outbox, and after the receipt
@@ -26,6 +28,8 @@ import type { OutboxCache } from "../runtime/outboxCache";
 
 /** Local-only tail flag (never on the wire): the row failed a reader-dependent gate check; content = raw payload. */
 export const LOCAL_FLAG_UNOPENED = 1 << 20;
+/** Local-only tail flag: a stale-epoch frame (e2ee-design §14.3); content is empty. */
+export const LOCAL_FLAG_STALE_EPOCH = 1 << 21;
 
 export interface FoldCandidate {
 	readonly seq: Seq;
@@ -89,6 +93,11 @@ export abstract class FoldRuntime<Op, E> {
 	/** null = deterministic malformation (folds as an empty frame). */
 	protected abstract decodeOps(content: Uint8Array): Op[] | null;
 	protected abstract foldFrame(row: TailRecord, ops: readonly Op[]): { readonly events: readonly E[]; readonly halted: boolean };
+	/**
+	 * A stale-epoch row (§14.3, §9.3): one frame-level ignored/stale-epoch event, coversSeq = seq; neither the
+	 * clientFrameId ring nor the replay window changes (as for replay-*).
+	 */
+	protected abstract foldStale(row: TailRecord): readonly E[];
 	/** Canonical encoding of the committed state (snapshot / checkpoint bytes). */
 	abstract encodeState(): Uint8Array;
 	/** This device's replay right edge R in the committed fold (0 = none). */
@@ -137,7 +146,7 @@ export abstract class FoldRuntime<Op, E> {
 			}
 			const ops = row.content.length > 0 ? this.decodeOps(row.content) ?? [] : [];
 			const prev = this.coversSeq;
-			const { events, halted } = this.foldFrame(row, ops);
+			const { events, halted } = row.flags & LOCAL_FLAG_STALE_EPOCH ? { events: this.foldStale(row), halted: false } : this.foldFrame(row, ops);
 			if (halted) {
 				this.halt(row.seq, "rules-version");
 				return out;
@@ -149,6 +158,16 @@ export abstract class FoldRuntime<Op, E> {
 		}
 		this.through = target;
 		return out;
+	}
+
+	/** The rows that halted the fold were re-gated: lift a reader-dependent halt (serialized with advance). */
+	resume(): Promise<void> {
+		const run = async () => {
+			if (this.halted?.reason === "reader-dependent") this.halted = null;
+		};
+		const p = this.busy.then(run, run);
+		this.busy = p.catch(() => undefined);
+		return p;
 	}
 
 	private halt(seq: Seq, reason: FoldHalt["reason"]): void {

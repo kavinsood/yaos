@@ -45,6 +45,12 @@ export class SnapRuntime extends FoldRuntime<SnapOp, SnapFoldEvent> {
 		return { events, halted: false };
 	}
 
+	protected foldStale(row: TailRecord): readonly SnapFoldEvent[] {
+		if (row.seq <= this.state.coversSeq) return [];
+		this.state.coversSeq = row.seq;
+		return [{ seq: row.seq, index: -1, deviceId: row.deviceId, key: null, outcome: { t: "ignored", reason: "stale-epoch" } }];
+	}
+
 	encodeState(): Uint8Array {
 		return encodeSnapFoldV1(this.state);
 	}

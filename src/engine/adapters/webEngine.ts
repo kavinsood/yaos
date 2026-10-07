@@ -9,8 +9,10 @@
  *    relay advertises attachments. Capabilities unreachable (offline start):
  *    assume the blob store and let the blob queue retry, so refs never depend
  *    on whether the device happened to be online at startup;
- *  - crypto: suite 0 (identity, DESIGN §a); hash, random, clock: WebCrypto /
- *    setTimeout;
+ *  - crypto: by init.crypto (e2ee-design §12.4, §18.4): suite 0 is the identity
+ *    adapter (DESIGN §a); suite 1 and an unpinned device get the suite-1
+ *    adapter (unpinned: no keys, so a QR / RK key can be verified against `k`);
+ *    hash, random, clock: WebCrypto / setTimeout;
  *  - local time zone for conflict-copy names (the core never reads Date).
  */
 
@@ -19,6 +21,7 @@ import { createEngine, type EngineHandle } from "../compose/protocolEngine";
 import { createHttpBlob, probeHttpBlob } from "./httpBlob";
 import { createIdbStoragePort } from "./idbStorage";
 import { createNoopCrypto } from "./noopCrypto";
+import { createWebCryptoSuite1 } from "./webCryptoSuite1";
 import { createWebClock } from "./webClock";
 import { createWebHash } from "./webHash";
 import { createWebRandom } from "./webRandom";
@@ -43,7 +46,10 @@ export function createWebEngine(transport: EngineTransport, carrier: "worker" | 
 			const relay = createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random });
 			const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential };
 			const blob = await probeHttpBlob(blobOpts).catch(() => createHttpBlob(blobOpts));
-			return { relay, storage, clock, random, crypto: createNoopCrypto(hash), hash, blob };
+			const c = config.crypto;
+			// Suite-1 keys are zero-filled once imported (webCryptoSuite1.ts); the port outlives runtime restarts.
+			const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
+			return { relay, storage, clock, random, crypto, hash, blob };
 		},
 	});
 }

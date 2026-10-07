@@ -91,6 +91,10 @@ export const MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 39 * 256 * 1024 - 1;
  */
 export const BLOB_QUARANTINE_RETRIES = 3;
 export const BLOB_QUARANTINE_MIN_MS = 3 * 60_000;
+/** Roll when headSeq − firstSeq(e) reaches this (random-nonce budget, e2ee-design §4.2). */
+export const ROLL_SEQ_SPAN = 2 ** 23;
+/** Roll when this device's own seals under e reach this (§4.2; counted lazily in MetaKeyring). */
+export const ROLL_OWN_SEALS = 2 ** 22;
 
 // --- Content ----------------------------------------------------------------
 

@@ -19,7 +19,8 @@ export type ProtocolErrorCode =
 	| "content_corrupt"
 	/**
 	 * A key or pin command the device's state does not allow (e2ee-design §12.4, §18.4): not on the creation path,
-	 * `k` not empty, already pinned, or an E3-owned command this engine does not implement yet. Not retryable.
+	 * `k` not empty or a key record seen, already pinned, a key that conflicts with the vault's record, another
+	 * device's record won the epoch, or (main) a keyringChanged it must not store. Not retryable.
 	 */
 	| "refused"
 	| "internal";
