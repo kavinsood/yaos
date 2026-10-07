@@ -620,7 +620,7 @@ changes.
 
 ## d. Body engine
 
-The body engine lives in the engine (the worker, or inline). It owns one **worker replica** `Y.Doc` per resident doc,
+The body engine lives in the engine (the worker). It owns one **worker replica** `Y.Doc` per resident doc,
 and that is the only replica: the main thread holds no CRDT, including for docs bound to an open editor (§d.2). Yjs is
 pure JS, and every doc uses `gc: true`.
 
@@ -674,7 +674,9 @@ cold ──load──▶ resident ──bind──▶ bound
   - check-deps forbids `yjs`, `y-protocols`, `lib0` and `y-codemirror.next` anywhere under `src/host`. That covers
     direct, type-only, test and transitive imports (through core/ports/protocol), and it guards whole-document
     reads on main (§k.2).
-  - The one exception is the inline fallback (§g.5): with no Worker, the engine and its Yjs run on main by design.
+  - There is no exception: the engine and its Yjs never run on main (§g.5). check-deps also fails any product
+    host/** module that reaches `protocol/inlineTransport`, or any `engine/**` module but `host/entry.ts` →
+    `engine/workerMain` (§k.2).
 - **No hashing or whole-file decoding on main.** The host reads and writes raw bytes. Every fingerprint and content
   hash it needs (write preconditions, config writes) comes from the engine through `HashOracle` (§h, `hashRequest`
   in §g.2). What that costs in the precondition window is in §f.2.
@@ -686,17 +688,18 @@ cold ──load──▶ resident ──bind──▶ bound
     - UTF-16 slices of `TEXT_CHUNK_UNITS` (65 536) units, each buffer transferred;
     - one macrotask per chunk, with a `setTimer(0)` yield between chunks.
   - This is the only whole-editor read on main, and it never runs per keystroke or per workspace event. It happens
-    at the first bind and at a re-bind (after a resync or an engine restart).
-    - At a re-bind, main also uploads the restart base: the mirror's last durable text.
-    - At every bind of a dirty view, it also uploads the text Obsidian last saved (`saved`). The engine has no disk
-      text for the doc after a restart; taking the editor's unsaved text for it would turn a sibling view's older
-      disk text into an edit that reverts the unsaved one (sim seed 62, sim/device.test.ts).
+    at the first bind and at a re-bind after a resync.
+    - At a resync re-bind, main also uploads the resync base: the mirror's last durable text.
+    - At every bind of a dirty view, it also uploads the text Obsidian last saved (`saved`). A new engine (the
+      user's restart after the engine died, §g.4) has no disk text for the doc; taking the editor's unsaved text
+      for it would turn a sibling view's older disk text into an edit that reverts the unsaved one (sim seed 62,
+      sim/device.test.ts).
   - `bodyAttach{docId, viewId, editor, base, saved}` names the uploads. The user keeps typing meanwhile. Edits made
     after the upload stay in the view client as `pre`.
 - **Bind-time merge, in the worker** (boundBody.attach). If the upload differs from the replica's text, the worker
   runs `merge(base, disk = upload, crdt = replica)` with the one merge engine (§f.3).
   - `base` is the upload itself when the replica has already absorbed it (its last disk text or a save candidate).
-    Otherwise it is the uploaded restart base, the doc's last disk text, or the persisted synced base, in that order.
+    Otherwise it is the uploaded resync base, the doc's last disk text, or the persisted synced base, in that order.
   - The result enters the replica as one MERGE transaction, which reaches the doc's other views as an entry.
   - The view gets `bound{viewId, attach, version, changes, length}`: the ChangeSet that turns its upload into the
     replica's text at `version`. Main applies it behind `pre` (§d.3).
@@ -740,8 +743,10 @@ cold ──load──▶ resident ──bind──▶ bound
   - For `renamed`, `merged` and `frozen`, the host re-opens the doc. `frozen` binds read-only.
   - For `resync`, every view of the doc re-binds: upload, then `bodyAttach` with the mirror's durable text as the
     base.
-- **Engine restart:** `suspend` keeps each doc's durable mirror text as its restart base, and `start` re-binds every
-  view.
+- **Engine death** (§g.4): the runtime stops, and `stop` flushes and unbinds every view; the edits stay in the
+  editors. The user's restart is a new runtime, which binds every view as at a first open. Text the dead engine took
+  but never committed is still in the editor: the bind merge brings it back, or keeps the editor side as a conflict
+  copy when the replica moved meanwhile (sim/device.test.ts "engine killed mid-typing").
 
 ### d.3 Two-way flow without double apply
 
@@ -782,7 +787,7 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
     it again at the newer version; the entries before the reject have already rebased it. Rejects of the pushes
     chained behind it are stale and are ignored.
   - **bound:** the editor applies `c.map(pre, true)`, and the buffer becomes `pre.map(c)`.
-  - **durable{version}:** the mirror keeps that version's text as the restart and resync base. The worker sends this
+  - **durable{version}:** the mirror keeps that version's text as the resync base. The worker sends this
     when everything up to `version` is committed.
   - **reloaded:** see §d.2.
 - **Liveness.** A push lands only if no foreign entry arrives within its round trip. When foreign entries arrive
@@ -1513,13 +1518,15 @@ e2ee-design §18.4).
 
 ### g.1 Carriers
 
-- **Worker.** The engine bundle is built as a string by esbuild (WP-D) and embedded in `main.js`. The host starts it
-  with `new Worker(URL.createObjectURL(new Blob([src], {type: "text/javascript"})))`.
-  - `PlatformInfo.workerSupported` is **probed**: construct the worker, `init`, `ping`, and expect a `pong` within 5 s.
-  - IDB is opened inside the worker. If it is unavailable there (risk OR-1), fall back to inline.
-- **Inline.** The same engine runs on main through `InlineTransport`: structured clone, FIFO, delivery on a macrotask.
-  - Used when the worker cannot start, after `MAX_WORKER_RESTARTS`, and always in Node (simulation and tests).
-  - Inline uses `mainSliceMs` for engine slices and one device class lower for budgets.
+- **Worker: the plugin's only carrier.** The engine bundle is built as a string by esbuild (WP-D) and embedded in
+  `main.js`. The host starts it with `new Worker(URL.createObjectURL(new Blob([src], {type: "text/javascript"})))`.
+  - Startup: construct the worker, `ping`, and expect a `pong` within `STARTUP_PING_TIMEOUT_MS` (5 s); then `init`.
+  - IDB is opened inside the worker. If it is unavailable there (risk OR-1), init answers `storage-lost` and the
+    engine stops (§g.4).
+  - `PlatformInfo.workerSupported` is the platform fact (`Worker` and Blob URLs exist). Nothing probes or overrides it.
+- **In-process pair** (`InlineTransport`, carrier kind `"inline"`). The same engine behind the same protocol in one
+  thread: structured clone, FIFO, delivery on a macrotask. Tests, the simulation and harnesses only: no product
+  host/** module may reach it (check-deps, §k.2), and the engine never runs on the UI thread.
 - **No `SharedArrayBuffer`.** Data crosses only as messages and transferables.
 
 ### g.2 Messages
@@ -1534,12 +1541,12 @@ transferred buffers.
 | `init{config}` | yes | Identity, device class, settings, relay URL + credential (secret), side files `[T]` | `ready{protocolVersion, vaultEpoch, recovered}` / `error(version-mismatch)` |
 | `shutdown{reason}` | yes | Flush builders, `T_edit`, mirror, close relay and IDB | `ok` |
 | `lifecycle{event}` | — | visible / hidden / pagehide / freeze / resume / online / offline / memory-pressure (§i.4) | — |
-| `ping` | yes | Liveness every 10 s | `pong` (no pong within `PING_TIMEOUT_MS` → restart) |
+| `ping` | yes | Liveness every 10 s | `pong` (no pong within `PING_TIMEOUT_MS` → the engine stopped, §g.4) |
 | `observations{scanId, chunk, complete}` | yes | Listing chunks (≤ 2000 stats) | `ok` (the host sends the next chunk after it) |
 | `vaultEvents{events}` | — | Hints, batched ≤ 50 ms / 256 | — |
 | `openDoc{path, viewId}` | yes | Bind request | `bind{docId, kind, frozen}` / `notBindable{reason}` |
 | `closeDoc{docId, viewId}` | — | Unbind | — |
-| `textChunk{uploadId, bytes [T], last}` | — | UTF-16 units of a whole-text upload (editor text, restart base, saved text, reload), ≤ 64 Ki units per chunk, one macrotask each. Bind, re-bind and reload only (§d.2) | — |
+| `textChunk{uploadId, bytes [T], last}` | — | UTF-16 units of a whole-text upload (editor text, resync base, saved text, reload), ≤ 64 Ki units per chunk, one macrotask each. Bind, re-bind and reload only (§d.2) | — |
 | `bodyAttach{docId, viewId, editor, base, saved}` | — | Merge the uploaded editor text into the replica; `base` / `saved` name optional uploads | body `bound` |
 | `bodyPush{docId, viewId, seq, base, after, changes}` | — | Editor ChangeSet JSON, coalesced ≤ 16 ms: against version `base`, or chained after this view's push `after`. Never dropped | body `entry` (author set) / `reject` |
 | `bodyReload{docId, viewId, reload, text}` | — | Obsidian pushed text into a bound view (`setViewData`): merge upload `text` | body `reloaded` |
@@ -1594,20 +1601,26 @@ transferred buffers.
   host/engineHost.ts) → `error(timeout)`; liveness is the ping (`PING_TIMEOUT_MS`). Blob transfers run in the
   engine over fetch, with no fixed timeout (engine/adapters/httpBlob.ts).
 - **Errors.** `ProtocolError{code, message, retryable}`. `message` never contains credentials or file contents.
-  `TERMINAL_ERROR_CODES` (`version-mismatch`, `revoked`) stop automatic retries. `content_corrupt` (a snapshot
-  failed verification, §j.4) is never retryable.
-- **Worker failure** (`onFailure`, or missed pongs):
-  - The host terminates the worker and starts a new one.
-  - Bound views re-run `openDoc` and re-bind (§d.2): main uploads the editor text, with the mirror's last durable
-    text as the merge base. Edits the dead worker never persisted are still in the editor, so the bind merge brings
-    them back. A crash loses only conflict copies the worker had not written yet (§d.2).
-  - After `MAX_WORKER_RESTARTS` within 10 min, the host switches to inline.
+  An error answering `init` stops the host (below); `content_corrupt` (a snapshot failed verification, §j.4) is
+  never retryable.
+- **Worker failure is terminal** (host/engineHost.ts). Each of these stops the engine for that runtime:
+  - the worker cannot be constructed (no `Worker` or Blob URLs, `main.js` is not the bundle, the constructor throws);
+  - no startup `pong` within `STARTUP_PING_TIMEOUT_MS`;
+  - a worker `error` / `messageerror` event, or any other transport failure;
+  - no liveness `pong` within `PING_TIMEOUT_MS`;
+  - `init` answers an error (`storage-lost` included, OR-1), or the engine sends `fatal`.
+  - The host terminates the worker, rejects every pending request (`aborted`) and reports one fatal: the runtime
+    stops, its views unbind (their edits stay in the editors, §d.2), and the UI shows "YAOS stopped: …" and a
+    failed status. Nothing restarts it in the background and nothing runs the engine on main. A new engine is the
+    user's: "Restart sync engine" in settings (a new runtime) or reloading the app.
+  - A crash loses only conflict copies the worker had not written yet (§d.2).
 
-### g.5 Inline fallback
+### g.5 One carrier
 
-- The protocol, messages and ordering are identical. Only the transport changes.
-- Long engine jobs yield via `ClockPort.yieldNow()` every `mainSliceMs`.
-- The phone/constrained budgets apply, and status shows `transport: "inline"`.
+- The plugin runs the engine in the worker only. There is no UI-thread fallback: a device whose worker cannot run
+  (or cannot open IndexedDB in it) does not sync, and says so.
+- The in-process pair keeps the same protocol, messages and ordering; it exists so tests, the simulation and
+  harnesses run the real engine without a worker.
 
 ---
 
@@ -1818,7 +1831,7 @@ The host picks the class and passes it in `EngineInitConfig.deviceClass`:
 | `desktop` | not mobile |
 | `tablet` | `isTablet` |
 | `phone` | mobile and not a tablet |
-| `constrained` | mobile with (`deviceMemoryGiB` < 3, or `hardwareConcurrency` ≤ 2), or phone/tablet running inline |
+| `constrained` | mobile with `deviceMemoryGiB` < 3 or `hardwareConcurrency` ≤ 2 |
 
 Budgets (`BUDGETS` in `limits.ts`):
 
@@ -1854,7 +1867,7 @@ Further caps:
 
 | Event | Action |
 |---|---|
-| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and lanes 3–4, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk (the engine cannot tell an iPad from desktop Obsidian running the engine inline, so tablets count as desktop). Phone and constrained devices pause lanes 3–4 at once (hard-cap compaction is lane 1 and still runs) and close the socket (1000) after 30 s hidden. A background close shows no offline or error phase and arms no backoff. |
+| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and lanes 3–4, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk; tablets get the same treatment. Phone and constrained devices pause lanes 3–4 at once (hard-cap compaction is lane 1 and still runs) and close the socket (1000) after 30 s hidden. A background close shows no offline or error phase and arms no backoff. |
 | `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause lanes 3–4 and close the socket on every device class. Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
 | `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. This tries once even after `offline`, so a missed `online` cannot strand the device; while offline a failure arms no backoff. The user's pause wins over this and over `online`. Check the IDB connection: `onLost` → §i.5. |
 | `online` / `offline` | Connect at once / stop reconnect attempts (an open socket stays until it fails). The outbox keeps accumulating. |
@@ -2299,8 +2312,8 @@ src/
     merge/   merge (MergeFn), myers, diff3, minimalDiff                                        [WP-B]
     plan/    planner (PlanFn), brake, renames, conflictName, order                            [WP-B]
   ports/                     [architect, frozen]
-  protocol/                  messages/errors/status/transport types [architect]; workerTransport, inlineTransport [WP-D]
-  engine/                    worker or inline; yjs allowed; no obsidian, no DOM except adapters/
+  protocol/                  messages/errors/status/transport types [architect]; workerTransport, inlineTransport (tests/sim) [WP-D]
+  engine/                    in the worker (in-process in tests/sim); yjs allowed; no obsidian, no DOM except adapters/
     store/   schema.ts [architect]; repo.ts (all §e.2 transactions)                           [WP-C]
     adapters/ idbStorage, wsRelay (+http feed/read/checkpoint), httpBlob, noopCrypto, webHash [WP-C]
     ingest/  gate, yjsCheck                                                                   [WP-C]
@@ -2313,7 +2326,7 @@ src/
     snapshots/ snapshotJob, exporter, localStore, remote (upload, parts), restore, snapIndex  [WP-B]
     workerMain.ts            worker entry glue                                                [WP-D]
   host/                      Obsidian main thread; obsidian, @codemirror/*; no yjs / lib0 / y-protocols (§k.2)
-    plugin.ts engineHost.ts (spawn, restart, inline fallback) diskExecutor.ts binding.ts bodyClient.ts collab.ts hashOracle.ts
+    plugin.ts engineHost.ts (worker carrier, terminal failures) diskExecutor.ts binding.ts bodyClient.ts collab.ts hashOracle.ts
     obsidianVault.ts obsidianWorkspace.ts configDir.ts sideFiles.ts platform.ts ui/          [WP-D]
   sim/                       tests only, never bundled
     relay.ts storage.ts clock.ts random.ts                                                    [WP-A]
@@ -2331,8 +2344,13 @@ These are enforced by `scripts/check-deps.mjs` (WP-D), a regex import scan run i
   - Never `obsidian` or `host/**`.
   - Browser globals (`indexedDB`, `WebSocket`, `fetch`, `crypto.subtle`) only in `engine/adapters/**`.
 - `host/**` imports `core`, `ports`, `protocol`, `obsidian`, `@codemirror/*` and `qrcode` (the pairing QR). From
-  `engine/` it imports only `engine/adapters/webEngine.ts` (worker spawn and inline fallback), and `host/entry.ts`
-  imports `engine/workerMain.ts`.
+  `engine/` only `host/entry.ts` imports, and only `engine/workerMain.ts` (the worker's entry, §g.1).
+- **No engine on the main thread (§g.5).** The plugin's one carrier is the worker.
+  - No product `host/**` file may import `protocol/inlineTransport.ts` (the in-process pair), type-only included.
+  - `mainReach` (below) also fails if a product `host/**` module reaches `protocol/inlineTransport.ts` or any
+    `engine/**` module through other `host`, `core`, `ports` or `protocol` modules; the one allowed edge is host/entry.ts →
+    engine/workerMain.ts, the worker's entry (`main.js` is also the worker's script, integration-notes D2).
+  - Host tests, `sim/**` and e2e harnesses build in-process engines; they are not main-thread code.
 - **Main-thread rules (§d.2).** The main thread holds CodeMirror state and raw disk I/O only.
   - `MAIN_FORBIDDEN` = `yjs`, `y-codemirror.next`, `y-protocols`, `lib0`. No `host/**` file may import them: not
     tests, not type-only imports.
@@ -2340,8 +2358,8 @@ These are enforced by `scripts/check-deps.mjs` (WP-D), a regex import scan run i
     type-only imports included. HostPorts has no HashPort (§h); every fingerprint, and the SecretStorage id
     (e2ee-design §6.1, the vaultId's bytes in hex), is computed without one. Host tests may import it to compute
     expected values: they are not main-thread code.
-  - `mainReach` follows every product `host/**` module's relative imports through `core`, `ports` and `protocol`
-    (stopping at the two engine entries) and fails if a forbidden package or `core/hash/**` is reachable.
+  - `mainReach` follows every product `host/**` module's relative imports through `host`, `core`, `ports` and
+    `protocol` (never into `engine/`) and fails if a forbidden package or `core/hash/**` is reachable.
   - **Whole-document reads.** `FULL_READS` counts `.getValue(`, `.toString()`, `.sliceDoc(`, `.sliceString(`,
     `.getViewData(` and `Text.of(` per `host/**` file. Each occurrence must be listed in `FULL_READ_ALLOW` with the
     reason it is off the per-keystroke, per-remote-update and per-workspace-event paths, so a new one fails CI.
@@ -2362,7 +2380,7 @@ The only shared files are the frozen architect files. Each WP owns its directori
 | **WP-A: fold, codecs, paths, sim log** | `src/core/{codec,paths,ns,cfg}/**`, `src/sim/{relay,storage,clock,random}.ts` | (1) Every codec round-trips. Canonical re-encode rejects non-minimal input. Malformed ns/cfg frames fold as empty. (2) E1–E12 (§c.14) as unit tests. (3) 10k-op fold fuzz (§l.4) passes 1000 seeds. (4) pathKey: ß/ss, Σ/σ/ς, İ, NFC/NFD, unassigned code points rejected. Table generator reproducible from UCD 15.1. (5) `SimRelay` conformance with relay-wire: contiguous seqs, receipts after broadcasts, dedupe window expiry, older-seq notice, STREAM_RESEND loss, provisional/notice/dropped, feed/read paging, checkpoint CAS + GC, 1 MiB close, rate close, daily limit. (6) `MemStoragePort` crash semantics and tx-inactive detection. |
 | **WP-B: planner, merge, disk side** | `src/core/{hash,merge,plan}/**`, `src/engine/{reconcile,blobs,settings,snapshots}/**` | (1) MergeFn properties: no line of disk or crdt is lost (each appears in `text` or `conflictCopy`); identical/one-sided cases exact; bounded on 2M-char inputs. (2) `minimalDiff` applied to crdt0 equals the target, and its edit size is ≤ the line-diff size. (3) One test per planner table row. Brake thresholds and approval id stability. (4) Rename inference determinism (shuffle-invariant). (5) Conflict names always valid. (6) Reconcile job against `SimVault` + `MemStorage` + a stub log: CAS failures re-plan, echo suppression, intents resume at every crash point. (7) Settings projection gates (yaos dir, data.json version). |
 | **WP-C: log-side engine** | `src/engine/{store/repo.ts,adapters,ingest,body,sync,runtime}/**` | (1) Crash at every transaction boundary (§e.2): the state reconstructs, no outbox frame is lost, and the cursor never passes an unaccounted seq. (2) Gate: malformed, disallowed types, oversize, causal hole → re-read → freeze; `releaseQuarantine`. (3) Frame builder: per-keystroke cost independent of doc size (benchmark: 5 MB doc, 1000 keystrokes, no `encodeStateAsUpdate` calls), size caps, initial chunking, `bodyUpdateRef`. (4) Provisional adopt/settle/drop, R7 settle, STREAM_RESEND resend, send window. (5) Catch-up with GC'd rows → checkpoint union. Compaction exactness: snapshot = fold of rows ≤ C. Checkpoint CAS outcomes. (6) Smoke against the local relay (`scripts/relay-dev`, e2e/relay/smoke.ts scenarios through `WsRelayPort`). |
-| **WP-D: host, protocol carriers, worker, sim runner** | `src/protocol/{workerTransport,inlineTransport}.ts`, `src/engine/workerMain.ts`, `src/host/**`, `src/sim/{vault,workspace,actors,faults,invariants,run}.ts`, `scripts/check-deps.mjs`, esbuild config (worker string bundle) | (1) Worker and inline transport parity on recorded message traces; transfer ownership asserted. (2) Disk executor honours every `WritePrecondition`; rename uses `vault.rename`; trash only. (3) Binding: bind-time merge, no echo loop (update counts), external-reload interception, `docCredit` resync, worker kill mid-typing loses nothing (re-bind merge of the editor text). (4) Lifecycle flush on `pagehide`. (5) Full simulation suite (§l) green on 200 CI seeds. (6) Obsidian smoke on desktop + iOS: the worker starts and IDB opens in the worker (or inline fallback is reported). |
+| **WP-D: host, protocol carriers, worker, sim runner** | `src/protocol/{workerTransport,inlineTransport}.ts`, `src/engine/workerMain.ts`, `src/host/**`, `src/sim/{vault,workspace,actors,faults,invariants,run}.ts`, `scripts/check-deps.mjs`, esbuild config (worker string bundle) | (1) Worker and inline transport parity on recorded message traces; transfer ownership asserted. (2) Disk executor honours every `WritePrecondition`; rename uses `vault.rename`; trash only. (3) Binding: bind-time merge, no echo loop (update counts), external-reload interception, `docCredit` resync, worker kill mid-typing stops the runtime and loses nothing (the user's restart binds the editor text, §g.4). (4) Lifecycle flush on `pagehide`. (5) Full simulation suite (§l) green on 200 CI seeds. (6) Obsidian smoke on desktop + iOS: the worker starts and IDB opens in the worker (or the engine stops and says why, §g.4). |
 
 - **Sequencing.** All four start at once against the frozen types.
   - WP-B and WP-C use stubs of each other's functions until the integration week.

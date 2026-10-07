@@ -2,7 +2,7 @@
 
 Branch `client-remake`. These notes cover the integration pass that merged
 WP-A..WP-D into one client: the host (Obsidian main thread) talks to the
-engine (Web Worker, inline fallback) over the protocol, runs in the
+engine (in a Web Worker, its only carrier) over the protocol, runs in the
 simulation on the composed engine, and syncs through the real relay. Every
 stand-in is gone (922d7d7).
 
@@ -109,13 +109,13 @@ it to the clipboard). Pairing steps for desktop, Android and iOS: §9.0.
 ## 2. Architecture
 
 ```
- Obsidian main thread (src/host)                       Engine (src/engine), Web Worker or inline
+ Obsidian main thread (src/host)                       Engine (src/engine), in a Web Worker
  ------------------------------------                  -------------------------------------------
  plugin.ts            Obsidian Plugin shell             workerMain.ts      worker entry (from entry.ts)
  PluginController     plugin data, lifecycle, UI host   adapters/webEngine createEngine over web ports
  HostRuntime          wires one paired vault            compose/ProtocolEngine   init/ping/route
-   EngineHost         carrier: probe, ping, restart,      VaultRuntime (one per vault epoch)
-                      worker -> inline fallback             LogEngine      (runtime/) log side
+   EngineHost         worker: startup ping, liveness      VaultRuntime (one per vault epoch)
+                      any failure stops it                  LogEngine      (runtime/) log side
    BindingManager     CM6 views as clients of the worker    Reconciler     (reconcile/) disk side
                       replica: ChangeSets, no CRDT          BlobQueue      (blobs/)
    DiskExecutor       engine disk ops: lanes, slices,        CfgSync        (settings/)
@@ -204,8 +204,10 @@ none is reachable from `host/**` through core/ports/protocol (`mainReach`),
 and every whole-document read on main (`getValue()`, `toString()`,
 `sliceDoc()`, `sliceString()`, `getViewData()`, `Text.of()`) must be listed in
 `FULL_READ_ALLOW` with why it is off the typing and event paths. Only tests
-import `sim/**`; the host imports only
-`engine/adapters/webEngine` from the engine (deviation D1); engine core imports
+import `sim/**`; from the engine the host imports only `host/entry.ts` ->
+`engine/workerMain` (the worker's entry, D2), and no product host module
+reaches `protocol/inlineTransport` or any other `engine/**` module, directly
+or through `mainReach` (the plugin's one carrier is the worker); engine core imports
 only the pure adapters (`noopCrypto`, `webHash`, `webClock`, `webRandom`,
 `webEngine`).
 
@@ -214,9 +216,10 @@ only the pure adapters (`noopCrypto`, `webHash`, `webClock`, `webRandom`,
 - **Protocol-ready is not vault-ready.** `init` answers `ready` as soon as the
   ports exist, even offline on a fresh device; the runtime keeps retrying in
   the background. Only an unusable store fails init (`storage-lost`), which
-  makes the host fall back from the worker to inline (OR-1).
-- **One engine, two carriers.** `workerMain.ts` and the inline carrier both run
-  `createWebEngine` from the same code in `main.js` (D2). The worker is a Blob
+  stops the host: that device does not sync, and says so (OR-1, DESIGN §g.4).
+- **One carrier.** `workerMain.ts` runs `createWebEngine` in the worker, from
+  the same `main.js` (D2); tests, the sim and harnesses run the engine over the
+  in-process pair (`protocol/inlineTransport.ts`). The worker is a Blob
   URL whose script is the bundle wrapper's own source text
   (`host/bundleSource.ts`); `host/entry.ts` starts only the engine there.
 - **Pass scheduling.** PassScheduler runs scoped passes on fold/observation
@@ -312,9 +315,9 @@ waiting on the blob queue.
 
 | # | Where | Deviation | Why |
 |---|---|---|---|
-| D1 | §k.2 | The host imports `engine/adapters/webEngine` (the inline carrier's entry), not `engine/runtime/engine.ts`. | The host may not import web adapters, and `engine/runtime/engine.ts` is now only the log side. `webEngine` is the one engine module the host may import; check-deps enforces it. |
-| D2 | §k.1, §k.2 | There is no separate worker build or "bundled worker source string". `main.js` is one bundle wrapped in a named function (`__yaosBundle`); the worker's Blob script is that function's source (`Function.prototype.toString`, ECMA-262 §20.2.3.5) called with the worker scope, and `host/entry.ts` (the only host file allowed to import `engine/workerMain`) lazily starts either the engine (worker) or the plugin (main). | The engine is in `main.js` once, and both carriers keep working without `eval` / `new Function` on main and without reading files. The worker needs only what it needed before: a `blob:` worker, with inline as the fallback. This saves 424 KiB raw (see §8). |
-| D3 | §g.2 | `init` answers `ready` when the ports exist, before the vault runtime has started; the runtime retries in the background. Only an unusable store fails init (`storage-lost`). | A fresh device offline must still get a protocol-ready engine; only storage failure should push the host to the inline carrier (OR-1). |
+| D1 | §k.2 | Withdrawn. The host imported `engine/adapters/webEngine` for the inline carrier; with no UI-thread carrier its one engine import is `host/entry.ts` -> `engine/workerMain` (D2), which §k.2 now states. | check-deps fails any other `engine/**` import, and any `protocol/inlineTransport` import, from product `host/**`, directly or transitively. |
+| D2 | §k.1, §k.2 | There is no separate worker build or "bundled worker source string". `main.js` is one bundle wrapped in a named function (`__yaosBundle`); the worker's Blob script is that function's source (`Function.prototype.toString`, ECMA-262 §20.2.3.5) called with the worker scope, and `host/entry.ts` (the only host file allowed to import `engine/workerMain`) lazily starts either the engine (worker) or the plugin (main). | The engine is in `main.js` once, and the worker starts without `eval` / `new Function` on main and without reading files. The worker needs only what it needed before: a `blob:` worker. This saves 424 KiB raw (see §8). |
+| D3 | §g.2 | `init` answers `ready` when the ports exist, before the vault runtime has started; the runtime retries in the background. Only an unusable store fails init (`storage-lost`). | A fresh device offline must still get a protocol-ready engine; only storage failure should stop the host (OR-1). |
 | D4 | §j.1 | When the relay's capabilities can't be read at startup (offline), the engine assumes the HTTP blob store exists and lets the blob queue retry. | An offline start must not run store-less: that device would not sync attachments and would freeze an oversized update `oversize-local` (`src/engine/runtime/docRuntime.ts:149-154`). (The original reason, one attachment sent as a blob ref by one device and as `x:` chunks by another, went away with the `x:` carrier.) |
 | D5 | §c.12 | `intent{epoch-migration}` is not written. A crash in the middle of a migration restarts on the newest DB (the new epoch): the path bases are gone (no-base handling) and the old DB is not deleted. | Epoch resets are rare operator actions; the snapshot taken before migration (step 1) keeps every file version. |
 | D6 | §j.3 | A JSON settings file whose fold has no keys is not created on peers (a local `{}` and a missing file are the same state). | JSON files are per-key registers; an empty register set has no file identity to project. The sim's settings invariant compares them as equal. |
@@ -409,8 +412,11 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   ~140 ms for a note edit or create, ~240 ms for a disk edit, 250-380 ms for
   an attachment (§7.2). The floor is a server cost bound; the client has no
   cheap way around it (§7.1).
-- The bench and e2e run the inline carrier with the tablet budget (4 lanes,
-  2 blob jobs); desktop numbers with the worker budget are not measured.
+- These numbers were measured with the harness on the in-process carrier,
+  which then ran one device class lower: the tablet budget (4 lanes, 2 blob
+  jobs). The UI-thread fallback is deleted and `deviceClassFor` no longer
+  depends on the carrier, so the harness now gets the desktop budget; the
+  numbers were not re-measured.
 - Deployed requests cost 87-90 ms on the merged server, against a ~24 ms
   edge round trip; before the rewrite they cost ~220 ms (three sequential DO
   hops, `server/src/index.ts:275` at a5ab167). The router is outside
@@ -431,8 +437,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   without a blob store, attachments are not synced.
 
 **Host**
-- With IndexedDB missing in both carriers, the host stays in `starting` and
-  retries with backoff; the UI shows the reason but there is no degraded mode.
+- With IndexedDB missing in the worker (OR-1), `init` answers `storage-lost`
+  and the runtime stops: phase `failed`, "YAOS stopped: …". There is no
+  degraded mode and no retry; the user restarts the engine.
 - The host never hashes: write preconditions and config writes send the raw
   bytes to the engine (`hashRequest`, host/hashOracle.ts). Obsidian has no
   compare-and-swap, and the guards left on main are O(1): a stat recheck right
@@ -444,8 +451,10 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - Bind-time and reload conflict copies are written by the worker
   (boundDisk). One not yet written (I/O error, retried every
   `CONFLICT_COPY_RETRY_MS`) is lost if the worker dies (DESIGN §d.2).
-- With no Worker (inline fallback, §g.5) the engine, Yjs and hashing run on
-  main by design; the main-thread rules cover the host code only.
+- With no Worker the device does not sync (DESIGN §g.5): the runtime stops
+  with "the sync engine could not start: …". The engine, Yjs and hashing
+  never run on main; check-deps fails any product host module that reaches
+  the in-process carrier or `engine/**` (§2.2).
 - `y-codemirror.next` was removed from package.json, but package-lock.json
   was left as it was: this worktree's node_modules is shared, so no
   `npm install` ran. The next install drops the lock entry; nothing imports
@@ -456,7 +465,7 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   93 % of pushes rejected; nothing is lost, only delayed.
 - The worker carrier depends on `Function.prototype.toString` returning the
   bundle's source (D2). If a platform hid it, `workerScript()` returns null and
-  the host uses inline. This is verified in V8 and JavaScriptCore, but not yet on
+  the runtime stops (the worker cannot be constructed, DESIGN §g.4). This is verified in V8 and JavaScriptCore, but not yet on
   an iOS device.
 
 **Legacy parity** (the full map is legacy-parity.md)
@@ -564,7 +573,7 @@ Harness: `e2e/client/fullClients.ts` (from the full-client e2e branch,
 f0b7c63 / 8939943). Each client is a complete `HostRuntime` over the
 simulated Obsidian vault/workspace/config dir/side files, with the real
 composed engine on the production ports (wsRelay, relayHttp, idbStorage on
-fake-indexeddb, suite-0 crypto), the inline carrier and real timers; 3 clients
+fake-indexeddb, suite-0 crypto), the in-process carrier and real timers; 3 clients
 plus a 4th device for bootstrap. Every scenario ends with a byte-identical
 check of every file and every synced `.obsidian` file on every client, and
 clean engine/host state. `smoke.ts` (RelayPort adapters) and `engines.ts`
@@ -669,9 +678,12 @@ Deployed means `yaos-relay2-client-e2e` (§1.1; Worker built from 93d72ee;
 every later commit is client-only). One authenticated deployed request takes ~220 ms from this laptop against a ~24 ms edge round
 trip: the Worker resolves auth state, then the vault DO, then authorizes,
 three sequential DO hops per request (`server/src/index.ts:275`). The
-harness runs the inline carrier (`fullKit.ts:166`), so `deviceClassFor`
-(`runtimeSupport.ts:20-29`) gives the tablet budget: 4 catch-up lanes, 2 blob
-jobs, 4 MiB disk I/O in flight (a desktop with the worker gets 8 / 4 / 8 MiB).
+harness ran the in-process carrier, and `deviceClassFor` then dropped one
+class for it: the tablet budget, 4 catch-up lanes, 2 blob jobs, 4 MiB disk
+I/O in flight (a desktop with the worker gets 8 / 4 / 8 MiB). With the
+UI-thread fallback deleted, `deviceClassFor` (`runtimeSupport.ts:20-24`) no
+longer looks at the carrier and the harness gets the desktop budget; the
+results below predate that.
 
 **Bootstrap root causes and fixes**
 
@@ -876,6 +888,11 @@ strings), and `main.js` loaded twice through Obsidian's loader shape:
   (`scripts/plugin-smoke-env.mjs`), and its script is exactly `main.js`'s
   bundle wrapper.
 
+Since the UI-thread fallback was deleted, the no-`Worker` load instead checks
+that the plugin stops: phase `failed` with "the sync engine could not start:
+this app cannot run background workers", a "YAOS stopped" notice, no status,
+no IndexedDB opened and no worker started (`scripts/plugin-smoke.mjs`).
+
 | Artifact | Before (9b618d5, engine twice) | After (a4e95fb, engine once) |
 |---|---|---|
 | `main.js` raw | 978.5 KiB (1,001,990 B) | 554.6 KiB (567,937 B) |
@@ -889,8 +906,8 @@ gzip.
 
 Main-thread rework (branch `client-remake-mainthread`): `main.js` is 616.3 KiB
 raw / 203 KiB gzip (631,137 / 207,910 B). `y-codemirror.next` is no longer in
-the bundle. yjs and lib0 stay, because the worker runs the same bundle (D2) and
-the inline fallback runs the engine on main; check-deps keeps them out of every
+the bundle. yjs and lib0 stay, because the worker runs the same bundle (D2);
+nothing on main runs the engine, and check-deps keeps them out of every
 `host/**` module. By area (KiB, same method as the table below): `src/engine`
 262.7, `src/core` 114.5, `src/host/ui` 65.1, yjs 58.9, `src/host` 51.2, qrcode
 22.8, lib0 20.4, fflate 13.2, `src/protocol` 5.1. The table below is the
@@ -934,7 +951,8 @@ CSP facts behind D2 (read-only from the app packages):
   IndexedDB with "no CSP violations". iOS has not been run.
 
 D2 therefore depends on no main-thread script CSP. It needs only a `blob:`
-worker, as the old design did, and inline remains the fallback.
+worker, as the old design did; without one the device does not sync (DESIGN
+§g.5).
 
 ## 9. Manual test plan
 
@@ -1012,9 +1030,11 @@ installs one device.
    (images, a PDF), 2 canvases, a `snippets/x.css`. Pair B with an empty vault.
    Expect: status goes `starting` -> `catching up` -> `live`; B ends with the
    same files; attachment bytes identical; no conflict copies.
-2. **Carrier.** Settings tab, engine section: Transport is "Background
-   worker". (There is no user toggle for the inline carrier; the fallback is
-   covered by `engineHost.test.ts` and by 9.3-1.)
+2. **Carrier.** Settings tab, engine section: Engine is "Running in a
+   background worker". There is no other carrier: a worker that cannot start
+   or dies shows "Failed: …" and a "YAOS stopped: …" notice, and nothing
+   restarts it until "Restart sync engine" (the terminal cases are in
+   `engineHost.test.ts`; see also 9.3-1).
 3. **Live typing.** Open the same note on A and B; type on both at once,
    including in the same paragraph. Expect characters on the other side within
    ~1 s, no lost characters, no conflict copies, cursor not jumping.
@@ -1077,8 +1097,10 @@ installs one device.
 ### 9.3 iOS / iPadOS, A = desktop, I = iPhone or iPad
 
 1. Same as 9.2 steps 1-5. Watch the carrier: if WKWebView refuses IDB in
-   the worker, the host must fall back to `inline` (status shows the
-   fallback reason) and still sync.
+   the worker, the engine must stop with "YAOS stopped: the sync engine could
+   not start: …" (storage-lost, OR-1) and the settings tab must show
+   "Failed: …". iOS does not sync in that case; there is no UI-thread
+   fallback.
 2. Lock the phone mid-sync and unlock after 5 min. Expect `freeze`/`resume`
    handled: reconnect, catch-up, nothing lost.
 3. iCloud-backed vault: let iCloud rewrite a file in the background. Expect

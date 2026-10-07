@@ -228,8 +228,7 @@ export function runStateLabel(run: EngineRunState): string {
 		case "stopped": return "Stopped";
 		case "starting": return "Starting…";
 		case "failed": return `Failed: ${run.lastError ?? "unknown error"}`;
-		case "running":
-			return run.transport === "inline" ? "Running on the main thread (background worker unavailable)" : "Running in a background worker";
+		case "running": return "Running in a background worker";
 	}
 }
 
@@ -253,12 +252,11 @@ export function phaseLabel(phase: StatusSnapshot["phase"]): string {
 	}
 }
 
-/** Engine section rows: run state, phase, transport, connection, unsynced count, last sync. */
+/** Engine section rows: run state, phase, connection, unsynced count, last sync. */
 export function engineRows(run: EngineRunState, status: StatusSnapshot | null, nowMs: number): InfoRow[] {
 	const rows: InfoRow[] = [{ name: "Engine", value: runStateLabel(run) }];
 	if (run.phase !== "running" || !status) return rows;
 	rows.push({ name: "Phase", value: phaseLabel(status.phase) });
-	rows.push({ name: "Transport", value: status.transport === "inline" ? "Main thread (inline)" : "Background worker" });
 	const relay = status.relay;
 	let connection: string;
 	if (relay.connected) connection = relay.rttMs !== null ? `Connected (${Math.round(relay.rttMs)} ms round trip)` : "Connected";

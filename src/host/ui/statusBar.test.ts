@@ -94,7 +94,7 @@ test("renderStatus: offline reconnect, error notice, revoked", () => {
 	assert.match(renderStatus(snap("revoked"), RUNNING).tooltip, /Pair this device again/);
 });
 
-test("renderStatus: brake, attention counts, last synced, rtt, inline transport", () => {
+test("renderStatus: brake, attention counts, last synced, rtt", () => {
 	assert.match(renderStatus(snap("braked", { brake: BRAKE }), RUNNING).tooltip, /holding 120 changes/);
 	const liveWithBrake = renderStatus(snap("live", { brake: BRAKE }), RUNNING);
 	assert.equal(liveWithBrake.level, "warn");
@@ -102,10 +102,9 @@ test("renderStatus: brake, attention counts, last synced, rtt, inline transport"
 	const attention = renderStatus(snap("live", { counts: { frozenDocs: 1, quarantinedRows: 2 } }), RUNNING);
 	assert.equal(attention.text, "YAOS: synced · 3 need attention");
 	assert.equal(attention.level, "warn");
-	const rich = renderStatus(snap("live", { lastSyncedAtMs: 1_000, relay: { connected: true, lastCloseCode: null, reconnectInMs: null, rttMs: 41.6 }, transport: "inline" }), RUNNING, 181_000);
+	const rich = renderStatus(snap("live", { lastSyncedAtMs: 1_000, relay: { connected: true, lastCloseCode: null, reconnectInMs: null, rttMs: 41.6 } }), RUNNING, 181_000);
 	assert.match(rich.tooltip, /Last synced 3 min ago/);
 	assert.match(rich.tooltip, /round trip 42 ms/);
-	assert.match(rich.tooltip, /main thread/);
 	assert.doesNotMatch(renderStatus(snap("live", { lastSyncedAtMs: 1_000 }), RUNNING).tooltip, /Last synced/);
 });
 

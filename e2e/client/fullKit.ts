@@ -6,9 +6,10 @@
  * attachments ride the log as x: blob chunks), crypto by init.crypto as webEngine.ts picks it (suite 0: the
  * identity adapter; suite 1 and unpinned: webCryptoSuite1), web clock/hash/random. Real timers.
  *
- * The engine runs on the inline carrier (main's event loop), or with `carrier: "worker"` on its own thread as in
- * the plugin (plugin.ts workerCarrier): EngineThread is one worker_threads Worker (fullWorker.ts) for the client's
- * life, so the device's IndexedDB outlives engine restarts; each carrier is a fresh MessageChannel to it, through
+ * The engine runs on an in-process pair (main's event loop: protocol/inlineTransport.ts, harness only), or with
+ * `carrier: "worker"` on its own thread as in the plugin (plugin.ts workerCarrier, its only carrier): EngineThread
+ * is one worker_threads Worker (fullWorker.ts) for the client's life, so the device's IndexedDB outlives engine
+ * restarts (each a new runtime: restart, runtimeFor); each carrier is a fresh MessageChannel to it, through
  * createWorkerHostTransport / createWorkerEngineTransport. Every post of an attachment-sized buffer is counted,
  * either way, as moved (detached after the post) or copied (EngineThread.posts, the thread's own).
  *
@@ -424,7 +425,7 @@ export interface ClientUi {
 	brakes: BrakeReport[];
 	notices: { level: string; code: string; message: string }[];
 	fatals: ProtocolError[];
-	carriers: { carrier: string | null; ready: boolean; fallbackReason: string | null }[];
+	carriers: { carrier: string | null; ready: boolean }[];
 }
 
 export interface FullClientOptions {
@@ -585,12 +586,11 @@ export class FullClient {
 			clock: this.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
 			workspace: this.workspace, platform: this.platform,
 			identity, settings,
-			createWorker: () => {
-				if (!this.thread) return null;
+			createCarrier: () => {
+				if (!this.thread) return this.inlineCarrier();
 				this.engineStarts++;
 				return this.thread.carrier(this.o.tuning);
 			},
-			createInline: () => this.inlineCarrier(),
 			pingEnabled: true,
 			keys,
 			log: (line) => this.log(`host: ${line}`),
@@ -598,7 +598,7 @@ export class FullClient {
 				onStatus: (s) => { this.ui.statuses.push(s); if (this.ui.statuses.length > 50) this.ui.statuses.shift(); also?.onStatus(s); },
 				onBrake: (b) => { this.ui.brakes.push(b); also?.onBrake(b); },
 				onNotice: (level, code, message) => { this.ui.notices.push({ level, code, message }); also?.onNotice(level, code, message); },
-				onCarrier: (c) => { this.ui.carriers.push({ carrier: c.carrier, ready: c.ready, fallbackReason: c.fallbackReason }); also?.onCarrier(c); },
+				onCarrier: (c) => { this.ui.carriers.push({ carrier: c.carrier, ready: c.ready }); also?.onCarrier(c); },
 				onFatal: (e) => { this.ui.fatals.push(e); also?.onFatal(e); },
 			},
 		});

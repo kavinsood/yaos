@@ -186,7 +186,6 @@ export function renderStatus(snapshot: StatusSnapshot | null, run: EngineRunStat
 	}
 	if (nowMs !== undefined && snapshot.lastSyncedAtMs !== null) lines.push(`Last synced ${formatAgo(snapshot.lastSyncedAtMs, nowMs)}.`);
 	if (snapshot.relay.connected && snapshot.relay.rttMs !== null) lines.push(`Server round trip ${Math.round(snapshot.relay.rttMs)} ms.`);
-	if (snapshot.transport === "inline") lines.push("Running on the main thread (background worker unavailable); sync may be slower.");
 	return { text: `${PREFIX}${text}`, tooltip: lines.join("\n"), level };
 }
 

@@ -3,7 +3,7 @@
  * (host/bundleSource.ts); host/entry.ts calls startWorkerEngine with the
  * worker's scope. Runs the composed engine (log side + disk side) over the web
  * adapters; an IndexedDB open failure in init answers `storage-lost` and the
- * host falls back to the inline carrier (OR-1).
+ * host stops and reports it (OR-1).
  */
 
 import { createWorkerEngineTransport, type WorkerScopeLike } from "../protocol/workerTransport";
@@ -11,6 +11,6 @@ import { createWebEngine } from "./adapters/webEngine";
 
 export function startWorkerEngine(scope: WorkerScopeLike): { dispose(): void } {
 	const transport = createWorkerEngineTransport(scope);
-	const handle = createWebEngine(transport, "worker");
+	const handle = createWebEngine(transport);
 	return { dispose: () => handle.dispose() };
 }

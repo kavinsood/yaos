@@ -16,12 +16,14 @@
  * SECRET buffers (keys, recovery keys: e2ee-design §6.3, §18.4) are transferred too. When a sender falls back to a
  * structured-clone copy (TransferOwnershipError), `wipeSecrets(message)` zero-fills the originals it still holds,
  * so the sending side keeps no copy either way.
+ *
+ * And of the receiver queue (Inbox, macrotaskSchedule) the in-process pair of tests and harnesses
+ * (inlineTransport.ts) reuses, so both carriers deliver alike.
  */
 
 import type { Unsubscribe } from "../ports/common";
 import type { EngineToMain, MainToEngine, UserCommand } from "./messages";
 import type { EngineTransport, HostTransport, Transport } from "./transport";
-import { Inbox, macrotaskSchedule, type Schedule } from "./inlineTransport";
 
 // ---------------------------------------------------------------------------
 // Transfer ownership
@@ -157,6 +159,112 @@ export function wipeSecrets(message: MainToEngine | EngineToMain): void {
 /** Post with the message's own [T] buffers transferred. */
 export function postOwned<Out extends MainToEngine | EngineToMain, In>(transport: Transport<Out, In>, message: Out): void {
 	transport.post(message, transferablesOf(message));
+}
+
+// ---------------------------------------------------------------------------
+// Receiver queue (both carriers)
+// ---------------------------------------------------------------------------
+
+/** Run fn on a later macrotask, FIFO with every other scheduled fn. */
+export type Schedule = (fn: () => void) => void;
+
+export function macrotaskSchedule(): Schedule {
+	// MessageChannel gives an unclamped macrotask in browsers; setTimeout(0) elsewhere.
+	if (typeof MessageChannel === "function") {
+		const queue: (() => void)[] = [];
+		const channel = new MessageChannel();
+		channel.port1.onmessage = () => {
+			const fn = queue.shift();
+			if (fn) fn();
+		};
+		// Node: an open MessagePort keeps the process alive. unref when available.
+		const port = channel.port1 as unknown as { unref?: () => void };
+		const port2 = channel.port2 as unknown as { unref?: () => void };
+		if (typeof port.unref === "function") port.unref();
+		if (typeof port2.unref === "function") port2.unref();
+		return (fn) => {
+			queue.push(fn);
+			channel.port2.postMessage(0);
+		};
+	}
+	return (fn) => {
+		setTimeout(fn, 0);
+	};
+}
+
+/**
+ * Receiver-side queue shared by both carriers: buffers until the first
+ * listener, then drains in order on a scheduled macrotask so that buffered
+ * and newly arriving messages keep FIFO.
+ */
+export class Inbox<In> {
+	private readonly listeners: ((message: In) => void)[] = [];
+	private readonly failureListeners: ((reason: string) => void)[] = [];
+	private readonly buffered: In[] = [];
+	private flushScheduled = false;
+	closed = false;
+
+	constructor(private readonly schedule: Schedule) {}
+
+	deliver(message: In): void {
+		if (this.closed) return;
+		if (this.listeners.length === 0 || this.buffered.length > 0) {
+			this.buffered.push(message);
+			return;
+		}
+		this.dispatch(message);
+	}
+
+	onMessage(listener: (message: In) => void): Unsubscribe {
+		this.listeners.push(listener);
+		if (this.buffered.length > 0 && !this.flushScheduled) {
+			this.flushScheduled = true;
+			this.schedule(() => {
+				this.flushScheduled = false;
+				while (!this.closed && this.listeners.length > 0 && this.buffered.length > 0) {
+					this.dispatch(this.buffered.shift() as In);
+				}
+			});
+		}
+		return () => {
+			const i = this.listeners.indexOf(listener);
+			if (i >= 0) this.listeners.splice(i, 1);
+		};
+	}
+
+	onFailure(listener: (reason: string) => void): Unsubscribe {
+		this.failureListeners.push(listener);
+		return () => {
+			const i = this.failureListeners.indexOf(listener);
+			if (i >= 0) this.failureListeners.splice(i, 1);
+		};
+	}
+
+	failureSnapshot(): ((reason: string) => void)[] {
+		return this.failureListeners.slice();
+	}
+
+	close(): void {
+		this.closed = true;
+		this.buffered.length = 0;
+	}
+
+	private dispatch(message: In): void {
+		for (const l of this.listeners.slice()) {
+			try {
+				l(message);
+			} catch (err) {
+				// A throwing listener must not break FIFO delivery (a worker's onmessage
+				// throwing does not stop the port either).
+				reportListenerError(err);
+			}
+		}
+	}
+}
+
+function reportListenerError(err: unknown): void {
+	const c = (globalThis as { console?: { error?: (...a: unknown[]) => void } }).console;
+	c?.error?.("[yaos] transport listener threw", err);
 }
 
 // ---------------------------------------------------------------------------

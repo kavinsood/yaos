@@ -2,7 +2,8 @@
  * Seeded faults (DESIGN §l.2) on the real stack (composed engine, SimRelay,
  * MemStoragePort):
  *
- *   device     engine (worker) crash; whole-app crash + restart; crash at the
+ *   device     engine (worker) crash (its runtime stops; the user restarts
+ *              it); whole-app crash + restart; crash at the
  *              k-th next storage commit (before/after it lands); IndexedDB
  *              wipe while the app is down (with or without the side-file
  *              mirrors); IndexedDB connection lost while running; offline

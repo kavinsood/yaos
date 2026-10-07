@@ -1,9 +1,9 @@
 /**
  * Main <-> engine messages. DESIGN §g.
  *
- * One protocol, three carriers: a Blob-URL dedicated worker (production), an
- * inline in-process pair on the main thread (fallback when the worker cannot
- * start), and the same inline pair in Node (simulation/tests).
+ * One protocol, two carriers: the Blob-URL dedicated worker (the plugin's
+ * only one) and an in-process pair (inlineTransport.ts) for the simulation,
+ * tests and harnesses.
  *
  * Conventions:
  *  - Requests carry `rid` (per-sender increasing u32). Exactly one `result` or

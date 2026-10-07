@@ -264,35 +264,6 @@ test("binding: onSaveRead posts a save mark naming the mirror version and the ne
 	assert.equal(bm.stats.saveMarks, 1);
 });
 
-test("binding: an engine restart mid-typing loses nothing: re-attach merges the editor against the durable base", async () => {
-	const s = setup();
-	const { clock, ws, engine, bm } = s;
-	file(s, "a.md", "base\n");
-	bm.start();
-	const v = ws.openFile("a.md");
-	assert.ok(v);
-	await clock.advance(5);
-	v.edit(5, 0, "durable\n");
-	await clock.advance(20);
-	engine.markDurable("a.md");
-	await clock.advance(5);
-	v.edit(13, 0, "lost-by-engine\n");
-	await clock.advance(20); // pushed and applied, never durable
-	engine.remote("a.md", 0, 0, "R"); // also not durable
-	await clock.advance(5);
-	engine.delay = () => 7;
-	v.edit(0, 0, "typed-during-restart ");
-	engine.restart();
-	v.edit(v.doc.length, 0, "end\n");
-	await clock.advance(1_000);
-	const want = "typed-during-restart Rbase\ndurable\nlost-by-engine\nend\n";
-	assert.equal(v.getText(), want);
-	assert.equal(engine.text("a.md"), want);
-	const attaches = engine.posts.flatMap((m) => (m.t === "bodyAttach" ? [m] : []));
-	assert.equal(attaches.length, 2);
-	assert.notEqual(attaches[1]?.base, null, "the re-attach carries the durable base");
-});
-
 test("binding: docRetarget resync re-attaches with the mirror as base; renamed/merged re-open; deleted waits for bindable", async () => {
 	const s = setup();
 	const { clock, ws, engine, bm } = s;
