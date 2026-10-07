@@ -197,7 +197,8 @@ export interface SnapshotSkippedEntry {
 
 /**
  * User commands. The snapshot commands, createSnapshot, exportDiagnostics and cleanUpAttachments fail with `not-ready`
- * while the engine has no running vault runtime (instead of answering an empty or `ok` result).
+ * while the engine has no running vault runtime (instead of answering an empty or `ok` result). While the encryption
+ * gate is shut (e2ee-design §12.4) cleanUpAttachments answers `attachmentsCleaned` refused "keys-unverified".
  */
 export type UserCommand =
 	| { readonly t: "pause" }

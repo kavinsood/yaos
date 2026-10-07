@@ -33,6 +33,8 @@ import type { ReaderPorts } from "./pinGate";
 import { idleStatus } from "./statusMerge";
 
 export type KeyCommand = Extract<UserCommand, { t: "enableE2ee" | "installKey" | "pinSuite0" | "revokeRekey" }>;
+/** The commands a closed device answers: the key commands, and the ones it refuses outright (no store, no blob port). */
+export type ReaderCommand = KeyCommand | Extract<UserCommand, { t: "cleanUpAttachments" }>;
 
 export interface KeyReaderOptions {
 	readonly ports: ReaderPorts;
@@ -181,8 +183,12 @@ export class KeyReader {
 	// --- commands (§18.4) -----------------------------------------------------------
 
 	/** A key command while the gate is shut. Zero-fills its SECRET buffer; refusals throw ProtocolFailure `refused`. */
-	async command(c: KeyCommand): Promise<EngineResultValue> {
+	async command(c: ReaderCommand): Promise<EngineResultValue> {
 		switch (c.t) {
+			case "cleanUpAttachments":
+				// Blob GC deletes under kAddr from K_1 and needs a verified sealing key (blobGc.ts preconditions): a closed
+				// device has neither, so it answers the GC's own refusal rather than a retryable not-ready.
+				return { t: "attachmentsCleaned", deleted: 0, keptNewer: 0, repaired: 0, lost: 0, refused: "keys-unverified", detail: "this device has no usable encryption pin or key" };
 			case "installKey": {
 				const kr = await this.keyringFor(() => (c.source === "qr" ? c.k : c.rk).fill(0));
 				if (c.source === "qr") {
