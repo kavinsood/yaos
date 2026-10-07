@@ -11,8 +11,8 @@ import type { LogEngine } from "./engine";
 import { converged, startTestEngine, until } from "./testHarness";
 
 const APP = "app.json" as ConfigRelPath;
-const CKPT = { rows: 1e9, bytes: 1e12, idleMs: 10, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
-const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
+const CKPT = { rows: 1e9, bytes: 1e12, idleMs: 10, settleMs: 1e9, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
+const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
 
 function jsonValue(e: LogEngine, key: string): string | null | undefined {
 	return e.cfgView().json.get(`${APP}\u0000${key}`)?.value;

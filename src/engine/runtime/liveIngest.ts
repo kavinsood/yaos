@@ -19,7 +19,9 @@
  *  - while the keyring allows reading only `k` (e2ee-design §12.4), every
  *    other row becomes a T_stale item and provisionals are dropped;
  *  - a failed tLive drops the batch: its seqs stay unaccounted and the gap
- *    feed / reads recover them.
+ *    feed / reads recover them;
+ *  - ns / cfg / snap rows mark the stream active for the checkpoint settle
+ *    rule (body rows do so in docRuntime.applyRows; DESIGN §d.9).
  *
  * The queue survives a session close (its events are committed facts).
  */
@@ -213,6 +215,8 @@ export class LiveIngest {
 		c.applyOutboxResult(res);
 		await c.keyring.ingestRows(res.tailPut);
 		await c.docs.applyRows(res.tailPut.filter((r) => !skipApply.has(r.seq)));
+		const mono = c.mono();
+		for (const r of res.tailPut) if (r.stream === NS_STREAM || r.stream === CFG_STREAM || r.stream === SNAP_STREAM) c.ckpt.lastActivity.set(r.stream, mono);
 		c.noteBodyChange(res.tailPut.filter((r) => r.deviceId !== c.self || !skipApply.has(r.seq)).map((r) => r.stream));
 		if (res.removed.length > 0 || res.tailPut.some((r) => r.stream === NS_STREAM)) await c.afterNsChange();
 		if (res.tailPut.some((r) => r.stream === CFG_STREAM)) await c.afterCfgChange();

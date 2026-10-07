@@ -1022,11 +1022,49 @@ The planner does no destructive work until ns is caught up (§f.2).
 
 ### d.9 Remote checkpoints (CAS)
 
-- **Body/canvas duty.**
-  - Primary: the author of the stream's newest row (`meta.ckptDuty`), when `rowsSinceRemoteCheckpoint ≥
-    REMOTE_CHECKPOINT_ROWS` or `bytesSinceRemoteCheckpoint ≥ REMOTE_CHECKPOINT_BYTES`, and the stream has been idle
-    for `REMOTE_CHECKPOINT_IDLE_MS`.
-  - Fallback: any device, when the condition has held for 10 min, plus jitter.
+- **Body/canvas duty** (`bodyCheckpointDue`, src/engine/body/checkpoints.ts:148). Two triggers:
+  - *Hot:* `rowsSinceRemoteCheckpoint ≥ REMOTE_CHECKPOINT_ROWS` (256) or `bytesSinceRemoteCheckpoint ≥
+    REMOTE_CHECKPOINT_BYTES` (1 MiB), and the stream has been idle for `REMOTE_CHECKPOINT_IDLE_MS` (30 s)
+    (src/core/limits.ts:118-120).
+  - *Settle:* a fresh device would open more than one envelope for the stream (`settleWanted`, checkpoints.ts:129: a
+    row above the remote checkpoint, or ≥ 2 rows and no checkpoint), and the stream has been idle for
+    `REMOTE_CHECKPOINT_SETTLE_MS` (2 min, limits.ts:126). A stream whose only row is its first frame is left alone:
+    a checkpoint would replace one open with one open (an import of 10k notes costs no checkpoints).
+  - *Idle* means no live row and no own frame on the stream for that long (`lastActivity`, set in
+    src/engine/runtime/docRuntime.ts:144 and :176). Activity also restarts the fallback clock
+    (checkpoints.ts:134), so neither rule writes while a note is being typed in, on any device. Activity before
+    this engine run is unknown (a restart can come in the middle of an edit session), so a stream with no activity
+    seen counts as active at the run's first live maintenance tick (`markLive`, checkpoints.ts:104, called at
+    maintenance.ts:147). After a restart no settle put comes before S, and no hot put before 30 s.
+  - Primary: the author of the stream's newest row (`meta.ckptDuty`). Fallback: any other device, once the
+    condition, idle included, has held for `CHECKPOINT_FALLBACK_MS` (10 min, checkpoints.ts:34) plus a per-stream
+    jitter in [0, 10 min) (src/engine/runtime/maintenance.ts:128).
+  - A fallback device first re-reads the stream's checkpoint seq with `read(stream, appliedSeq, false)`
+    (`refreshRemote`, checkpoints.ts:175; maintenance.ts:157). Relay checkpoints are not broadcast, and the duty
+    device has usually written one. If it covers `appliedSeq`, the counters reset and nothing is compacted, sealed
+    or written.
+  - Only streams this device has caught up on (`stale = 0`) and that are not frozen. Catch-up is eager, so every
+    device can stand in for every stream. The doc does not have to be open (compaction reads the store).
+  - Settle puts are capped at `REMOTE_CHECKPOINT_SETTLE_DAILY` (1000) per device per 24 h, every put counting
+    (limits.ts:133, `CheckpointState.settleOpen` checkpoints.ts:114). The hot rule is not capped.
+  - *Bound.* With its duty device in the foreground, a doc idle for 30 s carries fewer than 256 rows. A doc still
+    being typed in carries the rows since its last 30 s pause: that is the idle gate. In a quiescent vault every
+    stream costs a fresh device one open (its checkpoint, or its single first frame), S = 2 min after the last edit.
+    Without the duty device both rules wait for the fallback: at worst S + 10 + 10 min ≈ 22 min (bootstrap numbers:
+    e2ee-design §16.2). `TAIL_HARD_ROWS` stays the local hard cap.
+  - *Why 256 (was 512):* take a pessimistic steady state of 32 docs, each just under the hot cap. 32 is the number
+    of docs a heavy user (about 1 edit session a minute) leaves unsettled for the worst-case 22 min. At 255 rows per
+    doc a fresh device opens the 10k-doc vault in 279 ms (batches of 48) or 230 ms (8 lanes), within the 300 ms
+    budget (`scripts/bench-e2ee.mjs` scenario S, e2ee-design §16.2). At 511 it takes 429 ms or 300 ms (measured
+    under load average 4.8, where S took 281 ms or 221 ms). 128 would buy about 70 ms more margin for about 310 more
+    rows written a day.
+- **No refire.**
+  - After `ok`, `conflict` or `not-advancing`, and after a refresh, `coveredTo` (checkpoints.ts:165) sets the counters
+    to 0, or to 1 when rows were applied above the covered seq meanwhile, which keeps the stream settle-due.
+  - `not-advancing-local` clears stale counters (checkpoints.ts:190).
+  - A `too-large` stream is not due again until a new row arrives (`tooLarge.seq`, checkpoints.ts:82).
+  - Skipped outcomes back off 60 s (maintenance.ts:18). At most 2 body checkpoints run per 1 s maintenance tick
+    (maintenance.ts:16).
 - **Preconditions:** the local compaction preconditions, plus a fresh local compaction so that `snapshotCoversSeq =
   appliedSeq = C`, and a sealed size ≤ `limits.maxCheckpointBytes`.
 - **Write.** `putCheckpoint(stream, C, remoteCheckpointCoversSeq, sealed)` (checkpoint AAD, §b.1).
@@ -1044,16 +1082,37 @@ The planner does no destructive work until ns is caught up (§f.2).
 
 - **ns.**
   - Only candidate seqs (§b.5). The device keeps the `nsFoldV1` bytes of its newest candidate in memory.
-  - Duty: the author of the candidate row, when ≥ `NS_CHECKPOINT_ROWS` ns rows or ≥ `NS_CHECKPOINT_BYTES` have
-    accumulated since the last checkpoint. Others take over after 10 min.
+  - Duty: the author of the candidate row (`foldCheckpointDue`, checkpoints.ts:302).
+    - Hot: ≥ `NS_CHECKPOINT_ROWS` (1000) ns rows or ≥ `NS_CHECKPOINT_BYTES` have accumulated since the last
+      checkpoint. No idle gate.
+    - Settle: `settleWanted`, and the stream has been idle for `REMOTE_CHECKPOINT_SETTLE_MS`. ns, cfg and snap rows
+      mark activity in src/engine/runtime/liveIngest.ts:219.
+    - Others take over after 10 min plus jitter, with the same refresh read first (maintenance.ts:174).
+  - A settle checkpoint covers the newest candidate. The rows after it stay: fewer than one candidate interval (1000
+    vault seqs). There is at most one settle put per candidate.
   - cfg and snap use the same candidate rule.
 - **`retired`.**
   - For streams of docIds in a fold `pruned` event, or merged aliases that have rows.
   - Duty: the device whose frame caused the prune or merge. Fallback: 10 min.
   - `coversSeq` = the stream's `lastSeq` from `read(stream, 0, false)`.
   - After `ok`, the local stream records are deleted.
-- **Budget.** Checkpoints are at most 1 per 512 rows of a stream (1 per 1000 for ns), so they are a small fraction of
-  daily rows written.
+- **Budget** (Free plan: 100k rows written a day).
+  - Relay cost (docs/server-rewrite/DECISIONS.md §6.2; server/src/streams/store.ts:12-15, :534):
+    - A commit writes 2 rows per touched stream, plus 1 per sealed segment.
+    - A put writes k₀ + k₁ + g + 1: old chunks, new 1 MB chunks, collected segments, and the head. That is about 3–4
+      for a doc (2 for its first checkpoint). A put at `lastSeq` also drops the open segment at no extra row (H7).
+    - A CAS conflict writes nothing, and the fallback refresh is a read.
+  - A heavy desktop day:
+    - Frames: ≤ 20k (soft budget, limits.ts:233; frames are 4× slower beyond it, src/engine/runtime/context.ts:399) ×
+      ≤ 2 rows = ≤ 40k.
+    - Settle: 500 edit sessions × ≤ 4 = 2k. One put per session: a pause of 2 min or more ends one.
+    - Hot: 20k / 256 × 4 ≈ 310.
+    - ns, cfg and snap settle: at most 1 per candidate interval per stream, ≈ 20 × 3 × 4 ≈ 240.
+    - Total ≈ 42.5k. Checkpoints are ≈ 2.5k of it (2.5 % of the plan); before the settle rule they were ≈ 160 (1 per
+      512 rows).
+  - A vault-wide scripted edit (one frame in each of 10k notes) wants 10k settle puts, 30–40k rows. The daily cap
+    keeps that to ≤ 1000 puts (≈ 4k rows) per device per day. The rest keep one row each (2 opens per doc, inside
+    the bootstrap budget) and settle on later days.
 
 ---
 

@@ -5,8 +5,8 @@ import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 
-const CKPT = { rows: 3, bytes: 1e9, idleMs: 10, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
-const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
+const CKPT = { rows: 3, bytes: 1e9, idleMs: 10, settleMs: 1e9, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
+const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
 
 async function live(...es: LogEngine[]): Promise<void> {
 	await until(() => es.every((e) => e.status().phase === "live"), 3_000, "live");

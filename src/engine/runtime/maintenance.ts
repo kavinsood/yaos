@@ -144,15 +144,17 @@ export class Maintenance {
 		const s = c.session;
 		if (!s || !s.canWrite || c.readOnly || c.phase !== "live" || c.background || c.gate() !== null) return;
 		const now = c.mono();
+		c.ckpt.markLive(now);
 		let budget = CHECKPOINTS_PER_TICK;
 		for (const r of [...c.repo.streams()]) {
 			if (budget <= 0 || c.session !== s) return;
 			if (r.cls !== "body" && r.cls !== "canvas") continue;
 			if (c.sess.isReading(r.stream)) continue;
-			if (!bodyCheckpointDue(r, c.repo.hasCkptDuty(r.stream), c.ckpt, c.tuning.checkpoint, now, this.jitter(r.stream))) continue;
+			const duty = c.repo.hasCkptDuty(r.stream);
+			if (!bodyCheckpointDue(r, duty, c.ckpt, c.tuning.checkpoint, now, this.jitter(r.stream))) continue;
 			budget--;
 			try {
-				const o = await writeBodyCheckpoint(c.deps, c.ckpt, s, r.stream);
+				const o = await writeBodyCheckpoint(c.deps, c.ckpt, s, r.stream, { refreshFirst: !duty });
 				this.count(o.t);
 				if (o.t === "ok") this.stats.checkpoints++;
 				else if (o.t === "skipped") c.ckpt.backoffUntil.set(r.stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
@@ -169,7 +171,7 @@ export class Maintenance {
 			if (c.sess.isReading(stream)) continue;
 			if (!foldCheckpointDue(c.repo.stream(stream), fold, c.ckpt, c.tuning.checkpoint, now, this.jitter(stream))) continue;
 			try {
-				const o = await writeFoldCheckpoint(c.deps, c.ckpt, s, fold);
+				const o = await writeFoldCheckpoint(c.deps, c.ckpt, s, fold, { refreshFirst: !fold.candidate?.authoredBySelf });
 				this.count(`${cls}-${o.t}`);
 				if (o.t === "ok") this.stats.checkpoints++;
 				else if (o.t === "skipped") c.ckpt.backoffUntil.set(stream, now + CHECKPOINT_ERROR_BACKOFF_MS);

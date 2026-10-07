@@ -193,20 +193,25 @@ const DOCS = 10_000;
 const TOTAL_BYTES = 200 * 1024 * 1024;
 const PER_DOC = Math.floor(TOTAL_BYTES / DOCS); // 20971 B of content per doc
 
+const { REMOTE_CHECKPOINT_ROWS } = await load("src/core/limits.ts");
+
 /**
  * Scenario streams: one b:<docId> per doc with a checkpoint (preferCheckpoint read of a fresh device) and
- * `tail` frames after it, from three other devices. Sealed through the real sealCheckpoint / sealFrame.
+ * `tailOf(d)` frames after it, from three other devices. Sealed through the real sealCheckpoint / sealFrame.
  */
-async function buildStreams(crypto, ckptBytes, tail, tailBytes) {
+async function buildStreams(crypto, ckptBytes, tailOf, tailBytes) {
 	const ckptContent = randomBytes(ckptBytes); // incompressible: the deflate rule (DESIGN §b.1) leaves it raw
 	const tailContent = randomBytes(Math.max(1, tailBytes));
 	const out = new Array(DOCS);
 	let bytes = 0;
+	let opens = 0;
 	for (let d = 0; d < DOCS; d++) {
 		const stream = bodyStream(newId(random));
 		const coversSeq = 1000 + d;
 		const ckpt = await sealCheckpoint(crypto, VAULT, stream, coversSeq, ckptContent, 7);
 		bytes += ckpt.length;
+		const tail = tailOf(d);
+		opens += 1 + tail;
 		const rowsOut = [];
 		for (let t = 0; t < tail; t++) {
 			const deviceId = PEERS[t % PEERS.length];
@@ -217,7 +222,7 @@ async function buildStreams(crypto, ckptBytes, tail, tailBytes) {
 		}
 		out[d] = { stream, coversSeq, ckpt, rows: rowsOut };
 	}
-	return { streams: out, sealedBytes: bytes, opens: DOCS * (1 + tail) };
+	return { streams: out, sealedBytes: bytes, opens };
 }
 
 /** One stream as readStream gates it: the checkpoint (catchUp.ts:127), then each row in order (catchUp.ts:178-189). */
@@ -248,10 +253,10 @@ const PATTERNS = {
 	all: () => (crypto, streams) => Promise.all(streams.map((s) => openStream(crypto, s))),
 };
 
-async function benchBootstrap(label, ckptBytes, tail, tailBytes, must) {
+async function benchBootstrap(label, ckptBytes, tailOf, tailBytes, must) {
 	const crypto = await readyCrypto(1);
 	const t0 = now();
-	const sc = await buildStreams(crypto, ckptBytes, tail, tailBytes);
+	const sc = await buildStreams(crypto, ckptBytes, tailOf, tailBytes);
 	const setupS = (now() - t0) / 1000;
 	const lanes = BUDGETS.desktop.catchUpConcurrency;
 	const perStream = sc.sealedBytes / DOCS;
@@ -262,7 +267,7 @@ async function benchBootstrap(label, ckptBytes, tail, tailBytes, must) {
 	row(`bootstrap ${label}: engine, ${lanes} lanes`, stats(await run(PATTERNS.lanes(lanes))), 300, "<= 3 s", must, "non-batched relay");
 	row(`bootstrap ${label}: engine, batches of ${width}`, stats(await run(PATTERNS.batches(width))), 300, "<= 3 s", must, "batched relay, 1 lane");
 	row(`bootstrap ${label}: all sequential (info)`, stats(await run(PATTERNS.sequential())), 300, "<= 3 s", false, "no engine path does this");
-	row(`bootstrap ${label}: Promise.all (info)`, stats(await run(PATTERNS.all())), 300, "<= 3 s", false, "unbounded; slower than batches");
+	row(`bootstrap ${label}: Promise.all (info)`, stats(await run(PATTERNS.all())), 300, "<= 3 s", false, "unbounded");
 	sc.streams.length = 0;
 }
 
@@ -534,11 +539,22 @@ log(`load average at start: ${load0.map((x) => x.toFixed(2)).join(" ")}`);
 const t0 = now();
 await benchTyping();
 log("bootstrap scenarios:");
-await benchBootstrap("A (10k ckpt)", PER_DOC, 0, 0, true);
-// B: same 200 MiB, but each doc also carries 4 tail frames (5 opens per doc, 50k opens; 2.5x the §16.2 call model).
+await benchBootstrap("A (10k ckpt)", PER_DOC, () => 0, 0, true);
+// S, the steady state the checkpoint policy leaves (DESIGN §d.9): quiet docs are settled to their checkpoint, and up
+// to 32 docs still in an edit session carry REMOTE_CHECKPOINT_ROWS - 1 typing frames each, the most below the hot
+// rule. They are spread over the stream order, one per batch: the slow case, as each such batch waits for its tail.
+const ACTIVE = 32;
+const ACTIVE_TAIL = REMOTE_CHECKPOINT_ROWS - 1;
+const STRIDE = Math.floor(DOCS / ACTIVE);
+await benchBootstrap(`S (steady ${ACTIVE}x${ACTIVE_TAIL})`, PER_DOC, (d) => (d % STRIDE === 0 && d / STRIDE < ACTIVE ? ACTIVE_TAIL : 0), 128, true);
+// C (information): the settle cap reached on a vault-wide scripted edit, one frame left on every doc (20k opens).
+await benchBootstrap("C (cap +10k tail)", PER_DOC, () => 1, 128, false);
+// B (stress, information): same 200 MiB, but each doc also carries 4 tail frames (5 opens per doc, 50k opens; 2.5x
+// the §16.2 call model). The settle rule checkpoints such tails once the docs are quiet, so a fresh device does not
+// meet it in practice.
 const TAIL = 4;
 const TAIL_BYTES = 1146;
-await benchBootstrap("B (+40k tail)", PER_DOC - TAIL * TAIL_BYTES, TAIL, TAIL_BYTES, false);
+await benchBootstrap("B (stress +40k tail)", PER_DOC - TAIL * TAIL_BYTES, () => TAIL, TAIL_BYTES, false);
 await benchBlob();
 await benchBlobMemory();
 for (const n of [1, 3, 10]) await benchStart(n);

@@ -33,7 +33,7 @@ const P = (s: string) => s as VaultPath;
 /** Small thresholds so compaction and relay checkpoints happen within the run; real frame timing. */
 const TUNING: Partial<EngineTuning> = {
 	compactRows: 40,
-	checkpoint: { rows: 30, bytes: 1e9, idleMs: 300, fallbackMs: 2_000, nsRows: 30, nsBytes: 1e9 },
+	checkpoint: { rows: 30, bytes: 1e9, idleMs: 300, settleMs: 1e9, fallbackMs: 2_000, nsRows: 30, nsBytes: 1e9 },
 	maintenanceMs: 200,
 	reconnectBaseMs: 250,
 	mirrorDebounceMs: 50,

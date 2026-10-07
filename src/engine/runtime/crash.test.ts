@@ -22,7 +22,7 @@ import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, drive, sleep, startTestEngine, testStorage, until } from "./testHarness";
 
-const TUNING = { compactRows: 4, checkpoint: { rows: 3, bytes: 1e9, idleMs: 10, fallbackMs: 40, nsRows: 3, nsBytes: 1e9 } };
+const TUNING = { compactRows: 4, checkpoint: { rows: 3, bytes: 1e9, idleMs: 10, settleMs: 1e9, fallbackMs: 40, nsRows: 3, nsBytes: 1e9 } };
 const SAMPLE = Math.max(1, Number(process.env.YAOS_CRASH_SAMPLE ?? "1"));
 const PAR = 6;
 
