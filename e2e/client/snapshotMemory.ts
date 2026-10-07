@@ -15,8 +15,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { kindOfPath, type DocKind, type VaultPath } from "../../src/core/types";
 import type { SideFileName, SideFilePort } from "../../src/ports/vault";
-import type { DiskOp, DiskOpResult, DiskReadRequest, DiskReadResult, Lane } from "../../src/protocol/messages";
-import type { DiskGateway } from "../../src/engine/reconcile/deps";
+import type { DiskOp, DiskReadRequest, DiskReadResult, Lane } from "../../src/protocol/messages";
+import type { DiskGateway, ExecResult } from "../../src/engine/reconcile/deps";
 import { SnapshotJob } from "../../src/engine/snapshots/snapshotJob";
 
 const gc = (globalThis as { gc?: () => void }).gc;
@@ -68,7 +68,7 @@ const gateway: DiskGateway = {
 			return { path: r.path, ok: true as const, stat, bytes: b.slice() };
 		});
 	},
-	async exec(_ops: readonly DiskOp[], _lane: Lane): Promise<readonly DiskOpResult[]> { throw new Error("bench: no writes"); },
+	async exec(_ops: readonly DiskOp[], _lane: Lane): Promise<readonly ExecResult[]> { throw new Error("bench: no writes"); },
 };
 
 const dir = mkdtempSync(join(tmpdir(), "yaos-snapmem-"));
