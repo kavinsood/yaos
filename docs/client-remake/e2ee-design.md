@@ -1327,15 +1327,19 @@ Both mean **a new vault** (decision D7):
 
 | Path | Desktop | Mobile (assumed) | Note |
 |---|---|---|---|
-| Typing: one frame per `OPEN_FRAME_IDLE_MS` (100 ms, `src/core/limits.ts:67`) | ≤ 0.05 ms per frame | ≤ 0.5 ms | Below 1% of the frame interval |
+| Typing: one frame per `OPEN_FRAME_IDLE_MS` (100 ms, `src/core/limits.ts:67`), sealed after that idle | ≤ 1 ms per frame | ≤ 10 ms | Below 1% of the frame interval. It includes the CPU and WebCrypto worker wake-up: a bare `subtle.encrypt` of 256 B after 100 ms idle alone takes 0.25–0.38 ms **[M]**, so the former 0.05 ms could not be met. The steady-state (back-to-back) cost, 0.019 ms **[M]**, is information only |
 | Bootstrap, 10k docs, 200 MiB of checkpoints and tail | ≤ 0.3 s total crypto | ≤ 3 s (10k × 0.1 ms + 200 MiB ÷ 100 MiB/s) | Downloading 200 MiB dominates |
 | One 10 MiB blob | ≤ 10 ms | ≤ 100 ms | Plus 3 × 10 MiB transient memory (§10.3) |
 | Engine start | ≤ 5 ms | ≤ 20 ms | |
-| Bundle | +0 KB (WebCrypto) | | `qrcode` +9.6 KB gzip **[M]**, plus ~2 KB of base32 and record code [D] |
+| Bundle | +0 KB of third-party crypto (WebCrypto) | | `qrcode` +9.6 KB gzip **[M]**. The E2EE code itself is ~15 KB gzip **[M]** (14.8 KB: keyring engine 6.6, compose layer — pinGate, keyReader, hostKeyring — 3.8, host keys 2.1, WebCrypto adapter 1.9, codecs 0.4; `scripts/bench-e2ee.mjs`), accepted |
 
-Crypto is never on the hot path. Bootstrap is bound by the network and the planner, not by AES. If a mobile run
-(§23.3) misses a budget by more than 2×, the fallback is to batch opens with `Promise.all` (the spike measured
-~2.4 µs per call batched, §3). No format change is needed.
+Crypto is never on the hot path. Bootstrap is bound by the network and the planner, not by AES. The engine opens a
+bootstrap in controlled batches: one batched read of ≤ `readPageBytes` (48 streams of a 21 KB checkpoint each), every
+member gated concurrently, one batch after another. That was measured faster than opening everything at once with
+`Promise.all`, so it stays and there is no `Promise.all` fallback: 10k checkpoints, 205 MiB sealed, open in 139 ms
+in batches of 48 against 174 ms with `Promise.all` (and 252 ms one by one); with 40k tail rows added, 549 ms against
+675 ms **[M]** (M4 Pro, Node 26.5, `scripts/bench-e2ee.mjs`, median of 5). Unbounded concurrency queues tens of
+thousands of operations on the WebCrypto thread pool at once and pays for it in scheduling and memory.
 
 ### 16.3 Transaction rule (correctness, not speed)
 
