@@ -24,7 +24,8 @@ export function installPlugin(c: FullClient): void {
 	c.configDir.files.set("plugins/e2e-plugin/main.js", enc("module.exports = {};\n"));
 }
 
-async function cfgReaches(x: FullCtx, from: FullClient, files: Record<string, Uint8Array | null>, metric: string): Promise<void> {
+/** `metric` null: the change does not follow another arrival (fullScenarios1.ts header). */
+async function cfgReaches(x: FullCtx, from: FullClient, files: Record<string, Uint8Array | null>, metric: string | null): Promise<void> {
 	for (const [p, b] of Object.entries(files)) {
 		if (b) await from.configDir.writeBytes(p, b);
 		else await from.configDir.remove(p);
@@ -37,7 +38,7 @@ async function cfgReaches(x: FullCtx, from: FullClient, files: Record<string, Ui
 		return b === null ? have === null : have !== null && Buffer.compare(have, b) === 0;
 	};
 	const ms = await Promise.all(peers.map((c) => waitFor(() => Object.entries(files).every(([p, b]) => same(c, p, b)), `settings on ${c.name}`, 60_000, t0, 20)));
-	for (const v of ms) x.R.record(metric, v);
+	if (metric) for (const v of ms) x.R.record(metric, v);
 }
 
 /** 5. Synced .obsidian files: json keys, snippets, plugin data.json; never-synced files stay local. */
@@ -47,12 +48,12 @@ export async function sSettings(x: FullCtx): Promise<void> {
 		"app.json": json({ alwaysUpdateLinks: true, e2eKey: "v1" }),
 		"snippets/e2e.css": enc(".e2e { color: red; }\n"),
 		"plugins/e2e-plugin/data.json": json({ count: 1, mode: "full" }),
-	}, "settings_to_peer_ms");
+	}, null);
 	await a.configDir.writeBytes("workspace.json", json({ main: "local only" }));
 	await a.configDir.writeBytes("plugins/yaos/data.json", json({ secretish: "never synced" }));
-	await cfgReaches(x, a, { "app.json": json({ alwaysUpdateLinks: true, e2eKey: "v2" }) }, "settings_to_peer_ms");
-	await cfgReaches(x, b, { "appearance.json": json({ accentColor: "#ff0000", baseFontSize: 16 }), "plugins/e2e-plugin/data.json": json({ count: 2, mode: "full" }) }, "settings_to_peer_ms");
-	await cfgReaches(x, b, { "snippets/e2e.css": null }, "settings_to_peer_ms");
+	await cfgReaches(x, a, { "app.json": json({ alwaysUpdateLinks: true, e2eKey: "v2" }) }, "sustained_settings_to_peer_ms");
+	await cfgReaches(x, b, { "appearance.json": json({ accentColor: "#ff0000", baseFontSize: 16 }), "plugins/e2e-plugin/data.json": json({ count: 2, mode: "full" }) }, "sustained_settings_to_peer_ms");
+	await cfgReaches(x, b, { "snippets/e2e.css": null }, "sustained_settings_to_peer_ms");
 	await settle(x, null);
 	x.R.check("workspace.json and plugins/yaos never synced", x.clients.slice(1).every((c) => !c.configDir.files.has("workspace.json") && !c.configDir.files.has("plugins/yaos/data.json")));
 }
