@@ -12,6 +12,11 @@
  * loss (§i.5), rebuildLocalCache and settings changes that need it. Bound
  * docs are retargeted to their path so the host re-opens them on the new
  * runtime; the last complete listing (+ later vault events) is replayed.
+ *
+ * The write gate (pinGate.ts, e2ee-design §12.4): a VaultRuntime gets its ports only from the gate, which opens
+ * for a suite-0 pin alone. A device without a usable pin runs the KeyReader instead: it reads `k` and writes
+ * nothing (no frame, checkpoint, blob, ns entry, reconcile or outbox). The key commands of §18.4 belong to WP-E3's
+ * keyring runtime; this engine refuses them (`refused`) and zero-fills their key bytes.
  */
 
 import type { DocId, PathKey, VaultEpoch, VaultPath } from "../../core/types";
@@ -32,6 +37,8 @@ import { BoundDisk } from "./boundDisk";
 import { BoundDocs } from "./boundDocs";
 import { answerHashRequest } from "./hashService";
 import { HostLink } from "./hostLink";
+import { KeyReader } from "./keyReader";
+import { PinGate } from "./pinGate";
 import { idleStatus } from "./statusMerge";
 import { ownFrameNoFloor, prepareEpochMigration } from "./runtimeOps";
 import type { FrameNoFloor } from "../store/repo";
@@ -77,6 +84,10 @@ export class ComposedEngine {
 	settings: EngineSettings | null = null;
 	ports: EnginePorts | null = null;
 	rt: VaultRuntime | null = null;
+	/** The write gate of this init (null before init). */
+	gate: PinGate | null = null;
+	/** Runs instead of a VaultRuntime while the gate is closed. */
+	reader: KeyReader | null = null;
 	private starting: Promise<void> | null = null;
 	private disposed = false;
 	paused = false;
@@ -107,7 +118,7 @@ export class ComposedEngine {
 	}
 
 	get vaultEpoch(): VaultEpoch | null {
-		return this.rt?.vaultEpoch ?? this.knownEpoch ?? null;
+		return this.rt?.vaultEpoch ?? this.reader?.vaultEpoch ?? this.knownEpoch ?? null;
 	}
 
 	/** crash = the carrier died (worker killed, app crash; sim/tests): disconnect before anything can flush. */
@@ -119,6 +130,8 @@ export class ComposedEngine {
 		const rt = this.rt;
 		this.rt = null;
 		if (rt) void rt.stop(crash).catch(() => undefined);
+		this.reader?.stop();
+		this.reader = null;
 		this.link.close();
 	}
 
@@ -180,9 +193,12 @@ export class ComposedEngine {
 		}
 		this.config = config;
 		this.settings = config.settings;
+		this.gate = new PinGate(config.crypto);
 		this.link.seedSideFiles(config.sideState.outboxMirror, config.sideState.syncedMirror);
-		const find = this.options.findKnownEpoch ?? ((c: EngineInitConfig, p: EnginePorts) => findKnownEpoch(p.storage, c.vaultId, c.deviceId));
-		this.knownEpoch = await find(config, this.ports).catch(() => undefined);
+		if (this.gate.open) {
+			const find = this.options.findKnownEpoch ?? ((c: EngineInitConfig, p: EnginePorts) => findKnownEpoch(p.storage, c.vaultId, c.deviceId));
+			this.knownEpoch = await find(config, this.ports).catch(() => undefined);
+		}
 		const storageError = await this.startRuntime(null);
 		if (storageError) {
 			this.config = null;
@@ -199,9 +215,10 @@ export class ComposedEngine {
 	 * a retry and leave the engine protocol-ready without a runtime.
 	 */
 	private startRuntime(reason: RestartReason | null): Promise<string | null> {
+		if (!this.gate!.open) return Promise.resolve(this.startReader());
 		const run = (async (): Promise<string | null> => {
 			const config = this.config!;
-			const ports = this.ports!;
+			const ports = this.gate!.writerPorts(this.ports!);
 			try {
 				const rt = await VaultRuntime.start({
 					engine: this, config, settings: this.settings!, ports, carrier: this.options.carrier,
@@ -240,6 +257,22 @@ export class ComposedEngine {
 		return run;
 	}
 
+	/** Gate closed: read `k` only (keyReader.ts). Never fails init. */
+	private startReader(): null {
+		if (this.reader || this.disposed) return null;
+		const config = this.config!;
+		const gate = this.gate!;
+		this.reader = new KeyReader({
+			ports: gate.readerPorts(this.ports!), vaultId: config.vaultId, deviceId: config.deviceId,
+			suite: gate.suite === 1 ? 1 : null, creating: gate.creating, paused: this.paused,
+			reconnectBaseMs: this.options.tuning?.reconnectBaseMs,
+			onChange: () => this.postStatus(),
+			log: this.options.log,
+		});
+		this.reader.start();
+		return null;
+	}
+
 	private scheduleRetry(): void {
 		const ports = this.ports;
 		if (!ports || this.disposed || this.retryTimer !== null) return;
@@ -259,7 +292,7 @@ export class ComposedEngine {
 
 	/** Stop the current runtime and start a new one (same ports, same transport). */
 	async restart(reason: RestartReason, beforeStart?: () => Promise<void>): Promise<void> {
-		if (this.disposed) return;
+		if (this.disposed || this.reader) return;
 		if (this.starting) await this.starting;
 		const old = this.rt;
 		if (reason === "epoch" && old) {
@@ -290,7 +323,9 @@ export class ComposedEngine {
 	}
 
 	postStatus(): void {
-		const status: StatusSnapshot = this.rt?.status() ?? idleStatus({
+		if (this.disposed) return;
+		const deviceClass = this.config?.deviceClass ?? "desktop";
+		const status: StatusSnapshot = this.rt?.status() ?? this.reader?.status(deviceClass, this.options.carrier) ?? idleStatus({
 			deviceClass: this.config?.deviceClass ?? "desktop", transport: this.options.carrier, vaultEpoch: this.vaultEpoch,
 			phase: this.paused ? "paused" : this.lastStartError ? "offline" : "starting", nowMs: this.ports?.clock.now() ?? 0,
 		});
@@ -320,6 +355,8 @@ export class ComposedEngine {
 		switch (m.t) {
 			case "shutdown": {
 				this.rt = null;
+				this.reader?.stop();
+				this.reader = null;
 				this.options.onRuntime?.(null);
 				if (rt) await rt.stop().catch((e) => this.log(`shutdown stop failed: ${String(e)}`));
 				this.answer(m.rid, { t: "ok" });
@@ -327,6 +364,7 @@ export class ComposedEngine {
 			}
 			case "lifecycle":
 				rt?.lifecycle(m.event);
+				this.reader?.lifecycle(m.event);
 				return;
 			case "observations":
 				this.recordListing(m.chunk, m.complete);
@@ -383,15 +421,25 @@ export class ComposedEngine {
 	private async command(c: UserCommand): Promise<EngineResultValue> {
 		const rt = this.rt;
 		switch (c.t) {
+			case "enableE2ee":
+			case "installKey":
+			case "pinSuite0":
+			case "revokeRekey":
+				// WP-E3's keyring runtime handles these (§18.4). The key bytes die here (§6.3).
+				if (c.t === "installKey") (c.source === "qr" ? c.k : c.rk).fill(0);
+				else if (c.t !== "pinSuite0") c.rk.fill(0);
+				throw new ProtocolFailure({ code: "refused", message: "this engine cannot act on vault keys yet", retryable: false });
 			case "pause":
 				this.paused = true;
 				rt?.setPaused(true);
+				this.reader?.setPaused(true);
 				this.postStatus();
 				return { t: "ok" };
 			case "resume":
 				this.paused = false;
 				rt?.setPaused(false);
-				if (!rt && !this.starting) void this.startRuntime("retry");
+				this.reader?.setPaused(false);
+				if (!rt && !this.reader && !this.starting) void this.startRuntime("retry");
 				this.postStatus();
 				return { t: "ok" };
 			case "updateSettings": {

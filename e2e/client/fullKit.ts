@@ -20,6 +20,11 @@ import type { StatusSnapshot } from "../../src/protocol/status";
 import type { EngineCarrier } from "../../src/host/engineHost";
 import { engineHashOracle } from "../../src/host/hashOracle";
 import { HostRuntime } from "../../src/host/hostRuntime";
+import { createHostKeys } from "../../src/host/keys/hostKeys";
+import type { E2eePin } from "../../src/host/keys/pin";
+import { VaultKeyStore } from "../../src/host/keys/secretStore";
+import { FakeSecretStorage } from "../../src/host/keys/testkit/fakeSecretStorage";
+import { suite0PinForTest } from "../../src/host/keys/testkit/pinFixture";
 import { DEFAULT_ENGINE_SETTINGS } from "../../src/host/ui/api";
 import { createEngine, type EngineHandle } from "../../src/engine/compose/protocolEngine";
 import type { VaultRuntime } from "../../src/engine/compose/vaultRuntime";
@@ -164,6 +169,13 @@ export class FullClient {
 	readonly vault: SimVault;
 	readonly configDir: SimConfigDir;
 	readonly sideFiles = new SimSideFiles();
+	/** The device's SecretStorage (kept across restarts, like the OS keychain). */
+	readonly secrets = new FakeSecretStorage();
+	/**
+	 * data.json's pin (e2ee-design §12.4). These runs are suite 0: the test-only fixture writes the state a suite-0
+	 * link leaves, since nothing infers a pin (absent = unpinned = blocked).
+	 */
+	pin: E2eePin | undefined = suite0PinForTest();
 	readonly platform = new SimPlatform({ os: "macos", isMobile: false, isTablet: false, hardwareConcurrency: 8, deviceMemoryGiB: null, workerSupported: false });
 	readonly net = new NetSwitch();
 	readonly ui: ClientUi = { statuses: [], brakes: [], notices: [], fatals: [], carriers: [] };
@@ -256,6 +268,7 @@ export class FullClient {
 			createWorker: () => null,
 			createInline: () => this.carrier(),
 			pingEnabled: true,
+			keys: createHostKeys({ store: new VaultKeyStore(this.secrets, o.vaultId, this.clock), pin: () => this.pin, creating: () => false }),
 			log: (line) => this.log(`host: ${line}`),
 			ui: {
 				onStatus: (s) => { this.ui.statuses.push(s); if (this.ui.statuses.length > 50) this.ui.statuses.shift(); },

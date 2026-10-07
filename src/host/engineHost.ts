@@ -20,7 +20,7 @@ import type { EngineInitConfig, EngineResultValue, EngineToMain, MainResultValue
 import { PROTOCOL_VERSION } from "../protocol/messages";
 import type { HostTransport } from "../protocol/transport";
 import { MAX_WORKER_RESTARTS, PING_INTERVAL_MS, PING_TIMEOUT_MS } from "../protocol/transport";
-import { transferablesOf, TransferOwnershipError } from "../protocol/workerTransport";
+import { transferablesOf, TransferOwnershipError, wipeSecrets } from "../protocol/workerTransport";
 
 export const STARTUP_PING_TIMEOUT_MS = 5_000;
 export const INIT_TIMEOUT_MS = 120_000;
@@ -37,7 +37,7 @@ export interface EngineCarrier {
 	dispose(): void;
 }
 
-export type EngineRequestMessage = Extract<EngineToMain, { t: "readRequest" | "diskOps" | "saveViews" | "sideFileWrite" | "sideFileRead" | "hostIo" }>;
+export type EngineRequestMessage = Extract<EngineToMain, { t: "readRequest" | "diskOps" | "saveViews" | "sideFileWrite" | "sideFileRead" | "hostIo" | "keyringChanged" }>;
 export type EngineEventMessage = Extract<EngineToMain, { t: "body" | "docRetarget" | "bindable" | "status" | "brake" | "notice" }>;
 type HostRequest = Extract<MainToEngine, { rid: number }>;
 type HostRequestBody = HostRequest extends infer M ? (M extends { rid: number } ? Omit<M, "rid"> : never) : never;
@@ -226,7 +226,10 @@ export class EngineHost {
 				if (this.abandon(live)) return "superseded";
 			}
 			const config = await this.deps.initConfig(carrier.kind, this.workerSupported);
-			if (this.abandon(live)) return "superseded";
+			if (this.abandon(live)) {
+				wipeSecrets({ t: "init", rid: 0, config }); // built but never sent: drop the key bytes (§6.3)
+				return "superseded";
+			}
 			const ready = await this.requestOn(live, { t: "init", config }, INIT_TIMEOUT_MS);
 			if (ready.t !== "ready") throw new HostRequestError(protocolError("bad-request", `unexpected init answer ${ready.t}`));
 			if (ready.protocolVersion !== PROTOCOL_VERSION) throw new HostRequestError(protocolError("version-mismatch", `engine protocol ${ready.protocolVersion}, host ${PROTOCOL_VERSION}`, false));
@@ -276,14 +279,20 @@ export class EngineHost {
 	}
 
 	private send(live: Live, message: MainToEngine): void {
-		let transfer: ArrayBuffer[] | undefined;
 		try {
-			transfer = transferablesOf(message);
-		} catch (error) {
-			if (!(error instanceof TransferOwnershipError)) throw error;
-			transfer = undefined; // structured clone copies
+			let transfer: ArrayBuffer[] | undefined;
+			try {
+				transfer = transferablesOf(message);
+			} catch (error) {
+				if (!(error instanceof TransferOwnershipError)) throw error;
+				transfer = undefined; // structured clone copies
+			}
+			live.carrier.transport.post(message, transfer);
+		} finally {
+			// Both carriers clone at post time: a copied SECRET buffer is zero-filled here, so main keeps no key
+			// bytes after handing them to the engine (e2ee-design §6.3).
+			wipeSecrets(message);
 		}
-		live.carrier.transport.post(message, transfer);
 	}
 
 	private requestOn(live: Live, body: HostRequestBody, timeoutMs: number): Promise<EngineResultValue> {
@@ -385,7 +394,8 @@ export class EngineHost {
 			case "saveViews":
 			case "sideFileWrite":
 			case "sideFileRead":
-			case "hostIo": {
+			case "hostIo":
+			case "keyringChanged": {
 				const rid = m.rid;
 				this.deps.handlers.onRequest(m).then(
 					(value) => {

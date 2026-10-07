@@ -97,9 +97,9 @@ export default class YaosPlugin extends Plugin {
 
 		const data = sanitizePluginData(await this.loadData(), defaultDeviceName(Platform));
 		const controller = new YaosController(data, {
-			makeRuntime: (identity, settings, ui) =>
+			makeRuntime: (identity, settings, ui, keys) =>
 				(live = new HostRuntime({
-					clock, vault, configDir, sideFiles, workspace, platform, identity, settings, ui,
+					clock, vault, configDir, sideFiles, workspace, platform, identity, settings, ui, keys,
 					createWorker: workerCarrier,
 					createInline: inlineCarrier,
 					log: (line) => console.debug(`[yaos] ${line}`),
@@ -107,6 +107,10 @@ export default class YaosPlugin extends Plugin {
 			saveData: (d) => this.saveData(d),
 			notice: (_level, message, timeoutMs) => new Notice(message, timeoutMs),
 			log: (line) => console.debug(`[yaos] ${line}`),
+			clock,
+			// obsidian.d.ts :458 (@since 1.11.4); undefined on an older app, which then holds no key (fail closed).
+			secrets: (app as { secretStorage?: typeof app.secretStorage }).secretStorage ?? null,
+			localStorage: { load: (k) => app.loadLocalStorage(k) as unknown, save: (k, v) => app.saveLocalStorage(k, v) },
 		});
 		this.controller = controller;
 

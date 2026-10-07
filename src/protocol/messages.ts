@@ -23,7 +23,7 @@ import type { VaultEvent, VaultStat, WritePrecondition, WriteOutcome, RenameOutc
 import type { ProtocolError } from "./errors";
 import type { StatusSnapshot, DiagnosticsBundle } from "./status";
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 export type RequestId = number;
 
@@ -66,6 +66,11 @@ export interface EngineInitConfig {
 		readonly outboxMirror: readonly (Uint8Array | null)[];
 		readonly syncedMirror: readonly (Uint8Array | null)[];
 	};
+	/** SECRET (keys): never logged or echoed. Buffers are transferred, and main keeps no copy (e2ee-design §6.3). */
+	readonly crypto:
+		| { readonly suite: null; readonly creating: boolean } // unpinned (§12.4): reads `k` only, writes nothing
+		| { readonly suite: 0 }
+		| { readonly suite: 1; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; readonly records: readonly Uint8Array[] };
 }
 
 /** Raw listing entry; the engine classifies (kind, exclude, portability). */
@@ -212,7 +217,13 @@ export type UserCommand =
 	| { readonly t: "exportDiagnostics"; readonly includePaths: boolean }
 	| { readonly t: "rebuildLocalCache" }
 	| { readonly t: "updateSettings"; readonly settings: EngineSettings }
-	| { readonly t: "releaseQuarantine"; readonly stream: string };
+	| { readonly t: "releaseQuarantine"; readonly stream: string }
+	// e2ee-design §18.4 (all SECRET payloads, transferred):
+	| { readonly t: "enableE2ee"; readonly rk: Uint8Array } // creation path only (§15.1): genesis at head = 0
+	| { readonly t: "installKey"; readonly source: "qr"; readonly e: number; readonly k: Uint8Array } // §12.1, §14.2 step 3
+	| { readonly t: "installKey"; readonly source: "rk"; readonly rk: Uint8Array } // §12.4, §13.3
+	| { readonly t: "pinSuite0"; readonly source: "link" | "create" } // §12.4 (ii) / (iii): ok only if `k` is empty at head
+	| { readonly t: "revokeRekey"; readonly rk: Uint8Array }; // §14.2; a new RK is generated on main
 
 // ---------------------------------------------------------------------------
 // Main -> Engine
@@ -274,7 +285,9 @@ export type MainResultValue =
 	| { readonly t: "sideFileWritten" }
 	| { readonly t: "sideFile"; readonly bytes: Uint8Array | null /* [T] */ }
 	| { readonly t: "viewSaved"; readonly saved: readonly DocId[] }
-	| { readonly t: "hostIo"; readonly result: HostIoResult };
+	| { readonly t: "hostIo"; readonly result: HostIoResult }
+	/** keyringChanged is stored (e2ee-design §18.4 persist-before-use). */
+	| { readonly t: "keyringStored" };
 
 // ---------------------------------------------------------------------------
 // Engine -> Main
@@ -300,6 +313,12 @@ export type EngineToMain =
 	| { readonly t: "sideFileWrite"; readonly rid: RequestId; readonly name: SideFileName; readonly bytes: Uint8Array /* [T] */ }
 	| { readonly t: "sideFileRead"; readonly rid: RequestId; readonly name: SideFileName }
 	| { readonly t: "hostIo"; readonly rid: RequestId; readonly op: HostIoOp }
+	/**
+	 * e2ee-design §18.4: the keys and winning records main must store (SECRET); main persists before replying
+	 * (`keyringStored`), and the engine seals under no new epoch until then.
+	 */
+	| { readonly t: "keyringChanged"; readonly rid: RequestId; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
+		readonly records: readonly Uint8Array[]; readonly pending: number | null }
 	| { readonly t: "status"; readonly status: StatusSnapshot }
 	| { readonly t: "brake"; readonly report: BrakeReport }
 	| { readonly t: "notice"; readonly level: "info" | "warn" | "error"; readonly code: string; readonly message: string }

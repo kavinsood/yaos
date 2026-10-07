@@ -10,7 +10,7 @@ import type { ConfigDirPort, SideFileName, SideFilePort } from "../../ports/vaul
 import type { ProtocolError } from "../../protocol/errors";
 import type { DiskOp, DiskReadRequest, DiskReadResult, EngineToMain, HostIoOp, HostIoResult, Lane, MainResultValue } from "../../protocol/messages";
 import type { EngineTransport } from "../../protocol/transport";
-import { owned, postOwned, TransferOwnershipError } from "../../protocol/workerTransport";
+import { owned, postOwned, TransferOwnershipError, wipeSecrets } from "../../protocol/workerTransport";
 import type { DiskGateway, ExecResult } from "../reconcile/deps";
 import { fingerprintWrites, withFingerprints } from "./hashService";
 
@@ -36,13 +36,27 @@ export class HostLink {
 	constructor(private readonly transport: EngineTransport) {}
 
 	post(message: EngineToMain): void {
-		if (this.closed) return;
 		try {
-			postOwned(this.transport, message);
-		} catch (e) {
-			if (!(e instanceof TransferOwnershipError)) throw e;
-			this.transport.post(message); // shared buffer: structured clone copies
+			if (this.closed) return;
+			try {
+				postOwned(this.transport, message);
+			} catch (e) {
+				if (!(e instanceof TransferOwnershipError)) throw e;
+				this.transport.post(message); // shared buffer: structured clone copies
+			}
+		} finally {
+			wipeSecrets(message); // e2ee-design §6.3: the sender keeps no key bytes, transferred or not
 		}
+	}
+
+	/**
+	 * e2ee-design §18.4 persist-before-use: post the keys and winning records main must store, and resolve only once
+	 * main answered `keyringStored` for this rid (it wrote SecretStorage first). The key buffers are transferred, or
+	 * zero-filled after a copy: the caller must not use them afterwards.
+	 */
+	async keyringChanged(change: { readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; readonly records: readonly Uint8Array[]; readonly pending: number | null }): Promise<void> {
+		const v = await this.request({ t: "keyringChanged", keys: change.keys, records: change.records, pending: change.pending });
+		if (v.t !== "keyringStored") throw new Error(`keyringChanged: unexpected answer ${v.t}`);
 	}
 
 	request(body: HostRequestBody): Promise<MainResultValue> {

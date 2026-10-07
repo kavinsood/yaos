@@ -60,6 +60,8 @@ export async function buildInitConfig(input: {
 	readonly caseInsensitiveFs: boolean;
 	readonly settings: EngineSettings;
 	readonly side: SideFilePort;
+	/** SECRET when suite 1: moved into the config as is (transferred by the carrier, §6.3). */
+	readonly crypto: EngineInitConfig["crypto"];
 }): Promise<EngineInitConfig> {
 	const [oa, ob, sa, sb] = await Promise.all([
 		readSide(input.side, SIDE_A_B.outbox[0]),
@@ -80,6 +82,7 @@ export async function buildInitConfig(input: {
 		relay: { url: input.identity.relay.url, credential: input.identity.relay.credential },
 		settings: input.settings,
 		sideState: { outboxMirror: [oa, ob], syncedMirror: [sa, sb] },
+		crypto: input.crypto,
 	};
 }
 
