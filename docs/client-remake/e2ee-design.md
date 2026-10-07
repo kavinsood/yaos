@@ -899,14 +899,15 @@ obsidian://yaos?action=setup&host=<host>&pairingCode=<vaultId.secret>&key=<b64ur
 ```
 
 1. The paired device calls `POST /vault/:id/auth/pairing-code` (DECISIONS §2.2), as today.
-2. It builds the link locally, extending `buildSetupLink` (`src/host/ui/pairing.ts:485`).
+2. It builds the link locally, extending `buildSetupLink` (`src/host/ui/pairing.ts:765`; the `key` value is
+   `encodeKeyParam`, `:710`).
    - `key` holds the newest winning epoch and its key: 1 + 1 + 32 bytes, 46 base64url characters.
    - Older keys come from the `prevWrap` chain (§11.1).
    - The vaultId is already inside the pairing code (DECISIONS D3).
 3. The plugin draws the QR itself, with `qrcode` 1.5.4 (+9.6 KB gzip **[M]**, §23).
 4. The new device scans it. Obsidian hands the parameters to `registerObsidianProtocolHandler`
-   (`src/host/ui/registerUi.ts:152`). `parseSetupLink` (`pairing.ts:501`) accepts `key` or `suite` (§12.4), never
-   both (they join `SETUP_LINK_KEYS`, `pairing.ts:494`, which rejects unknown keys today).
+   (`src/host/ui/registerUi.ts:220`). `parseSetupLink` (`pairing.ts:798`) accepts `key` or `suite` (§12.4), never
+   both (they join `SETUP_LINK_KEYS`, `pairing.ts:790`, which rejects unknown keys).
 5. **The key is stripped before `/enroll`.** DECISIONS D3 requires exactly this: "A future client-only key part
    must be stripped before `/enroll`". The key goes into the pending identity, in memory only. After enroll, the
    device reads `k`, checks kcv and walks the chains (§11.3). It then persists the keys and the suite pin.
@@ -916,9 +917,9 @@ Rules:
 - **NEVER put a key in any URL the server serves**, including the fragment of `GET /mobile-setup`.
   - That page is a static Worker response whose JS reads `location.hash` (`server/src/console/mobileSetup.ts:47`).
   - Its `connect-src 'none'` CSP is set by the same server, so it is no guarantee.
-  - The pair modal stops showing `mobileSetupUrl` (`src/host/ui/pairModal.ts:194`) under **both** suites. That page
-    is server-drawn, so it can carry only a key-less join, and a key-less join is blocked (§12.4). The plugin draws
-    the `obsidian://` QR itself instead (iOS Camera opens it, §3).
+  - The pair modal no longer shows `mobileSetupUrl`, under **both** suites: `requestPairingCode` drops it
+    (`src/host/ui/pairing.ts:419-429`). That page is server-drawn, so it can carry only a key-less join, and a
+    key-less join is blocked (§12.4). The plugin draws the `obsidian://` QR itself instead (iOS Camera opens it, §3).
 - **The link is a secret.** It is shown only after an explicit "Show pairing QR" click and hidden when the code
   expires (15 min, DECISIONS D3) or the modal closes. It is never logged.
   - "Copy setup link" stays, for phone → desktop and for desktops without a camera, with a warning: "This link
@@ -1007,8 +1008,8 @@ The blocked screen offers exactly two actions, and says why:
 
 (For `"encrypted-vault"` the first sentence reads "This vault is end-to-end encrypted.")
 
-- **"Scan QR from one of your devices"** says: on a device that already syncs this vault, open YAOS → "Pair a
-  device" (or "Show re-key QR") and scan it with the camera.
+- **"Scan QR from one of your devices"** says: on a device that already syncs this vault, open YAOS → "Pair
+  another device" (or "Show re-key QR") and scan it with the camera.
   - A suite-1 device's QR carries the key: source (i).
   - A suite-0 device's pairing QR carries `suite=0`: source (ii).
 - **No re-enrollment.** The blocked device is already enrolled. When a setup link names the vault it is enrolled in
@@ -1216,25 +1217,26 @@ answer is `"stale"`, `"hold"` or null (always null under suite 0):
 ### 15.1 Enable: the creation path (new vaults only)
 
 Encryption is chosen only on the **creation path**: a YAOS "Create a new vault" flow in which this device makes
-the vault-creating server call itself. The plugin has no such flow today:
-- every pairing is a key-less enroll by code (`enroll` and `pairDevice`, `src/host/ui/pairing.ts:392`, `:397`);
-- an unclaimed server is refused with "Open it in a browser to claim it first" (`pairing.ts:232-233`).
-
-WP-E5 adds the flow.
+the vault-creating server call itself. Before WP-E5 the plugin had no such flow: every pairing was a key-less enroll
+by code, and an unclaimed server was refused with "Open it in a browser to claim it first". Both still hold for
+pairing (`fetchCapabilities`, `src/host/ui/pairing.ts:227`, accepts an unclaimed server only with
+`allowUnclaimed`, which only `probeServer` passes, `src/host/ui/createVault.ts:62-66`). WP-E5 added the flow
+(`src/host/ui/createVault.ts`; §21 "E5 as built").
 
 **Definition.** A device is on the creation path for vault V if and only if, in one flow that the user started from
 YAOS's own "Create a new vault" command or button, all three steps hold:
 1. **This device sent the call that created V,** and read V's vaultId from the response:
    - **Unclaimed server** (`GET /api/capabilities` says `claimed: false`): `POST /claim` (relay-wire §2.2,
-     `server/src/router.ts:213`).
-     - The claim creates the first vault (`CLAIM_VAULT_NAME`, `router.ts:69`) and returns its `pairingCode`.
-     - The operator recovery key is generated on main, then shown and confirmed as the console does
-       (`server/src/console/console.ts:247-258`).
+     `server/src/router.ts:293-336`).
+     - The claim creates the first vault (`CLAIM_VAULT_NAME`, `router.ts:99`) and returns its `pairingCode`.
+     - The operator recovery key is generated on main as the console makes one (32 random bytes, hex,
+       `server/src/console/console.ts:248-250`), then shown with Copy and an "I saved the operator key" checkbox
+       that enables the claim.
    - **Claimed server**, in this order:
-     - `POST /operator/login` (`router.ts:215`) with the operator recovery key typed into this flow;
-     - `POST /operator/vaults {name}` (`:221`);
-     - `POST /operator/vaults/:id/owner-code` (`:435`) for that vaultId;
-     - `POST /operator/logout`.
+     - `POST /operator/login` (`router.ts:339-352`) with the operator recovery key typed into this flow;
+     - `POST /operator/vaults {name}` (`:373-392`);
+     - `POST /operator/vaults/:id/owner-code` (`:470-488`) for that vaultId;
+     - `POST /operator/logout` (`:355-361`).
 2. **It enrolled with the code from step 1.** The code must name that vaultId, and it never leaves memory: it is
    not displayed, not put in a link and not logged.
 3. **After enrolling, it read `VAULT_READY.head = 0`** (relay-wire §3.2) **and read `k` to head, empty.**
@@ -1244,7 +1246,7 @@ fails, the flow aborts with "The server returned a vault that is not empty" and 
 unpinned and blocked (§12.4).
 
 - **Never entered from:**
-  - the protocol handler (`src/host/ui/registerUi.ts:152`) or `parseSetupLink`;
+  - the protocol handler (`src/host/ui/registerUi.ts:220`) or `parseSetupLink`;
   - a typed or scanned code;
   - the console's QR or link, or a claim response's `obsidianUrl`;
   - `resumePendingEnrollment`.
@@ -1256,12 +1258,18 @@ unpinned and blocked (§12.4).
     unpinned device is blocked (§12.4).
   - The marker is removed once a pin is set.
 - **Secrets.** The operator recovery key is held only for step 1. It is never stored, and the §6.1 NEVER rules
-  apply to it. The settings hint "The operator key stays in the console" (`src/host/ui/settingsTab.ts:116`) gains an
-  exception for this flow.
+  apply to it. The settings hint now reads "The operator key stays in the console; only "Create a new vault" asks
+  for it here, and uses it once." (`src/host/ui/settingsTab.ts:127`).
 - **`Origin` [U].** `/claim` and the operator routes require JSON and an `Origin` equal to the server's origin
-  (`server/src/router.ts:117-127`, DECISIONS D5).
-  - Whether Obsidian's `requestUrl` can send that `Origin` on desktop and mobile is **[U]**. E5 checks it first.
-  - If it cannot, server ask A11 applies (§19).
+  (`server/src/router.ts:153-158`, DECISIONS D5).
+  - The plugin sends both explicitly on every such call (`operatorHeaders`, `src/host/ui/pairing.ts:528-532`). The
+    session goes in a manual `Cookie` header, since `requestUrl` keeps no cookie jar.
+  - Checked against the real relay with Node's fetch (`e2e/client/e2ee.ts` steps 1 and 6). Whether Obsidian's
+    `requestUrl` sends `Origin` and `Cookie` as set, and hands back `Set-Cookie`, on desktop and mobile is still
+    **[U]** (§23.3). The typings say nothing either way: `RequestUrlParam.headers` and
+    `RequestUrlResponse.headers` are plain string records (`node_modules/obsidian/obsidian.d.ts:5455`, `:5469`).
+  - If it cannot, server ask A11 applies (§19). Until then the flow fails closed with a plain message
+    (`forbidden_origin`, `no_session`; `pairing.ts:584-585`, `:649`).
 - **What a lying server gains.** It could return an existing vault in step 1 and fake an empty one in step 3.
   - Under suite 1 (the default), the device seals under a fresh K_1 that the server never sees. That is a fork
     (§2.1), and the server learns nothing.
@@ -1635,7 +1643,7 @@ Baseline: 7208184. No ask is on the hot path, and none adds cross-DO coordinatio
 | A8 | Rename "vault key" in `server/src/vault/ticket.ts` (DECISIONS D4) to "ticket key" in code and docs | Avoids confusion with K_e in reviews and in incident response | Low |
 | A9 | Keep stream names opaque: no server-side meaning for `k` or any prefix (`server/src/streams/protocol.ts:16`, `:53`) | `k` needs no server change | Confirm only |
 | A10 | Keep `MAX_STREAM_CHECKPOINT_BYTES` (`server/src/streams/protocol.ts:25`, 4 MiB) and the 1 MiB frame cap stable, or announce changes in VAULT_READY limits | Suite-1 padding is computed against them (§7.3) | Confirm only |
-| A11 | *(conditional)* Let the plugin's creation path (§15.1) reach `/claim`, `/operator/login`, `/operator/vaults` and `/operator/vaults/:id/owner-code`. Today they demand a same-origin `Origin` (`server/src/router.ts:117-127`). For example, accept a JSON request with **no** `Origin` header, which browsers always send on such POSTs | Only if E5 finds that Obsidian's `requestUrl` cannot send `Origin: <host>`. Without it a device cannot create a vault, so no vault can be set up | Before WP-E5, if needed |
+| A11 | *(conditional)* Let the plugin's creation path (§15.1) reach `/claim`, `/operator/login`, `/operator/vaults` and `/operator/vaults/:id/owner-code`. Today they demand a same-origin `Origin` (`crossSiteRejection`, `server/src/router.ts:153-158`). Proposed change, in `crossSiteRejection`: `const origin = request.headers.get("Origin"); if (origin === null ? !needsJson : origin !== url.origin) return json({ error: "forbidden_origin" }, 403);` and keep the `application/json` check. A cross-site page cannot send a JSON POST without a CORS preflight the server never approves, and browsers always send `Origin` on such POSTs, so a request with no `Origin` and a JSON body comes from a non-browser client | E5 sends `Origin` explicitly (`src/host/ui/pairing.ts:528-532`), and the relay accepts it from Node's fetch (`e2e/client/e2ee.ts`). Needed only if WP-E0 shows that Obsidian's `requestUrl` drops or rewrites the header (§23.3). Without it a device cannot create a vault, so no vault can be set up | Only if WP-E0 finds it needed |
 
 Not asked: a device-list route for clients (the console covers revoke, D7); server-side key storage of any kind;
 per-vault crypto flags on the server (the suite is client-pinned, §12.4).
@@ -1657,7 +1665,10 @@ per-vault crypto flags on the server (the suite is client-pinned, §12.4).
       sha256("abc"), kDiag, raw frame and checkpoint seals (fixed AAD), a frame under K_2, one sealed blob, and
       next/prev/recovery wraps (fake 35-byte RK = 40..62; fixed AAD, since wrap AAD §11.2 is WP-E3);
     - **WP-E2** (`src/engine/adapters/suite1Envelope.test.ts`): one envelope per kind with the §7.2 AAD and padding;
-    - **WP-E3**: genesis/roll/revoke records and the RK encoding; **WP-E5**: the setup link.
+    - **WP-E3**: genesis/roll/revoke records and the RK encoding;
+    - **WP-E5** (`src/host/ui/pairing.test.ts:447-467`): the `key` value for K = 00..1f at e = 1 and e = 300 (varuint
+      `ac 02`), the full setup link with a fixed pairing code, its `suite=0` form and the re-key link, each
+      decoded back.
   - **Cross-checked by a second implementation** in the test: Node `node:crypto` (`createCipheriv`, `hkdfSync`,
     `createHmac`), not WebCrypto, so one implementation's bug cannot certify itself.
 - Codec property tests: Padmé round-trip and bucket monotonicity, varuint and base32 round-trips, and
@@ -1737,7 +1748,7 @@ There is one agent per package. Sizes: S ≈ 1 agent-day, M ≈ 2–3, L ≈ 4�
 | **E2** Envelope v2 | `src/core/envelope.ts`, `src/core/codec/**` (AAD v2, Padmé, frameNo, fold V2 encodings), `src/core/{ns,cfg}/**` (replay window), `src/core/limits.ts`, the send window over frameNo, `diagHash` in the diagnostics bundle (`src/engine/compose/diagnosticsBundle.ts`) | E1 shape | Codec round-trips; replay window unit tests including the §8.2 exactness argument as a property test; suite 0 still passes the whole suite | M–L |
 | **E3** Keyring engine | `src/engine/keyring/**` (record codec, validity, winners, roll, revoke, re-publish, stale-epoch), the catch-up order (`k` first), phase `key-missing` | E1, E2 | §11 and §14.3 rules as unit tests; the forged-roll and duplicate-record tests in §20.2 | L |
 | **E4** Host key storage + protocol | `src/host/keys/**` (SecretStorage adapter, 5 s wait, pin incl. unpinned and `keyringSeen`, Linux notice), `src/protocol/**` (§18.4: unpinned config, `pinSuite0`), persist-before-use; the engine's unpinned mode (reads `k` only) | E1 shape | Restart keeps keys; IDB wipe keeps keys; at-rest leak check (§20.3) is zero; an unpinned engine issues zero writes | M |
-| **E5** Pairing, RK, revoke UX | `src/host/ui/**`: QR (`qrcode`), the `key`/`suite` link parameters stripped before `/enroll`, the blocked key-less screen (§12.4), the "Create a new vault" creation path with its `Origin` check first (§15.1), RK show/confirm/enter, revoke re-key, re-key QR, hiding `mobileSetupUrl` under both suites, device-name hint | E3, E4 | UI tests for each flow; `/enroll` request bodies asserted key-free; the link is never in logs; no path from a link, code or console QR reaches the creation flow or a suite-0 pin | L |
+| **E5** Pairing, RK, revoke UX | `src/host/ui/**`: QR (`qrcode`), the `key`/`suite` link parameters stripped before `/enroll`, the blocked key-less screen (§12.4), the "Create a new vault" creation path with its `Origin` check first (§15.1), RK show/confirm/enter, revoke re-key, re-key QR, hiding `mobileSetupUrl` under both suites, device-name hint | E3, E4 | **Done** ("E5 as built" below). UI tests for each flow; `/enroll` request bodies asserted key-free; the link is never in logs; no path from a link, code or console QR reaches the creation flow or a suite-0 pin | L |
 | **E6a** Blob addressing and format | `src/engine/body/frames.ts` blob path, `src/engine/blobs/blobQueue.ts`, `src/engine/body/refs.ts`, `src/engine/runtime/blobChunks.ts`, `blobChunkStream(address)` | E1, E2 | Sealed-blob golden vector; dedupe via `has`; `x:` names carry no hash | S |
 | **E6b** Blob GC | `src/engine/blobs/{gc,bodyRefs,touch}.ts`, `src/engine/runtime/blobGc.ts`, `BlobPort.list/deleteIfUploadedBefore` (HTTP adapter, `SimBlobStore`), the `cleanUpAttachments` command and its one notice | **A3** (done) | **Done.** §10.4: fail-closed preconditions, live set, R1–R4. Unit and engine tests against `SimBlobStore` (pagination with deletes, re-upload survives as `newer`, R2 orphan reuse, R3 resume after > grace offline, R4 repair and loss, every refusal deletes nothing, suite 1 HMAC addresses, 429/503 retry, skewed clock); e2e/client/snapshots.ts GC step on the local relay with `--r2` | M |
 | **E7** Verification | `DelayedCrypto`, sim `crypto: "suite1"`, new faults, the §20.2 measured tests, a perf bench against the §16 budgets | E1–E3 | The suite-1 fault matrix is green at suite-0 seed counts; every §20.2 assertion holds | M |
@@ -1777,6 +1788,63 @@ Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b needed A
 - **K_1 after a roll** verifies down the prevWrap chain, so blob GC keeps requiring it (§10.4).
 - **End to end:** `e2e/client/e2ee.ts` (enableE2ee, installKey by QR and RK, a sealed note and attachment, a console
   revoke plus re-key, a post-roll join, GC, leak scan) on the local relay.
+
+**E5 as built** (the UI over E3/E4's commands; main does UI and raw I/O only, every check that hashes or reads `k`
+runs in the engine):
+- **Pure modules, thin modals.** The decisions live in modules with no Obsidian runtime, unit-tested over a fake
+  host (`src/host/ui/testkit/fakeUiHost.ts`): `createVault.ts` (§15.1), `keyActions.ts` (links, keys, re-key),
+  `recoveryKeyText.ts` (§13.1 text form), `e2eeText.ts` (every user-facing sentence, and the engine refusals mapped
+  to plain ones) and `hostWait.ts` (waits on host changes, no polling). The modals (`createVaultModal.ts`,
+  `keyModals.ts`, `pairModal.ts`) only draw and call them; they are not unit-tested (Obsidian runtime).
+- **Pairing QR (§12.1).** "Pair another device" (`PairingCodeModal`, `src/host/ui/pairModal.ts:223-363`) draws the
+  QR itself (`qr.ts`) only after "Show pairing QR", hides it when the code expires or the dialog closes, and blanks
+  the canvas. The link's encryption part is `pairingLinkE2ee` (`keyActions.ts:161-167`): `suite=0` on a suite-0
+  device, else the key of the epoch this device seals under from SecretStorage (`vaultKeyForQr`,
+  `src/host/pluginController.ts:388-400`), else nothing (the modal says why and offers only the code). "Copy setup
+  link" carries the §12.1 warning. The link is never logged or put in a notice.
+- **Incoming links** go through `routeSetupLink` (`keyActions.ts:42-61`), called by the protocol handler
+  (`registerUi.ts:220-225`): ignore, apply or pair, never create. A setup link whose pairing code names the vault
+  this device is enrolled in, on the same host, only applies its `key` or `suite=0` (no re-enroll, §12.4); a re-key
+  link `obsidian://yaos?action=rekey&key=…` (`buildRekeyLink`, `pairing.ts:773`) needs a paired device. A key goes
+  to the engine as `installKey` "qr" and is zero-filled (`applyLinkE2ee`, `keyActions.ts:111`); while no record
+  matches it the key stays in engine memory only, and the blocked screen says so (`PendingQrKeys`,
+  `keyActions.ts:239`). The pair modal shows "End-to-end encryption: On" or "Off (from this link)" before pairing
+  (`pairModal.ts:116-119`) and the device-name hint "Visible to the server operator" (`:149`).
+- **Blocked screen (§12.4)**, `KeyMissingModal` (`keyModals.ts:51-94`): the reason text for `no-pin`, `no-key`,
+  `revoked-epoch` or `encrypted-vault` (`e2eeText.ts:17`), a note while a QR key is pending, and exactly two
+  buttons, "Scan QR from one of your devices" (it says where the QR is) and "Enter recovery key"
+  (`EnterRecoveryKeyModal`, `installRecoveryKey`, `keyActions.ts:140`: format and checksum first, then
+  `installKey` "rk"). The status bar opens it in phase `key-missing`; the command "Enter recovery key or scan a QR
+  code" and the settings "Encryption" group (actions only, no status rows) reach it too.
+- **Create a new vault (§15.1)**, `CreateVaultModal` (`createVaultModal.ts`) over `createVault.ts`:
+  - step 1 `createAndEnroll` (`createVault.ts:107-129`): claim (unclaimed: the operator key is generated on main,
+    shown with Copy, and "I saved the operator key" enables the claim) or operator login, create, owner code and
+    logout (claimed: the key is typed). The key is cleared from the modal as soon as step 1 returns. Main writes
+    `creating: {vaultId}` right after the response (`:110`);
+  - step 2 enrolls with the in-memory code, which must name that vaultId (`:114`); no `pendingEnrollment`. A
+    failure before the identity is stored drops the marker;
+  - step 3 `confirmEmptyVault` (`:173`) waits for `status.e2ee.creatable` (head 0 and an empty `k` read on this
+    session). A key record or a head above 0 ends the flow with "The server returned a vault that is not empty"
+    and no pin; a timeout keeps the marker, and "Finish creating this vault" resumes at step 3
+    (`resumableCreation`, `:132`);
+  - the choice: "End-to-end encryption: On" preselected (a new RK shown once, confirmed by retyping 2 random
+    groups, then `enableE2ee`), or the opt-out, confirmed ("You cannot turn end-to-end encryption on later for this
+    vault"), then `pinSuite0` "create".
+  - Only `createVault.ts` sends `enableE2ee` or `pinSuite0` "create" or marks a vault, and only the modal reaches
+    it, from the command and the settings action (source scans, `createVault.test.ts:326-359`); main refuses both
+    without the marker (`pin.ts:68-79`). `pinSuite0` "link" comes only from a `suite=0` link.
+- **Recovery key and re-key (§13.2, §14.2, D1, D8).** `RecoveryKeyModal` (`keyModals.ts:176-263`) shows the RK once
+  with Copy and "Store it outside this vault: a password manager or paper", then asks for 2 random groups, and
+  zero-fills on close. "Re-key after revoking a device" (`RekeyAfterRevokeModal`, `keyModals.ts:335`) takes the
+  existing RK or "Generate a new recovery key"; a typed RK becomes the RK in force (D8, `keyActions.ts:210-211`).
+  Then "Show re-key QR" (`RekeyQrModal`, `keyModals.ts:274`) draws the re-key link from the stored key, and says to
+  re-key EVERY other device the user keeps.
+- **Blob GC refusals** now say which gate refused: a closed device (`keyReader.ts`) or a shut in-session gate
+  (`blobGc.ts`), `src/host/ui/attachmentsCleanup.ts:31-42`; the test reads both engine literals.
+- **End to end** (`e2e/client/e2ee.ts`): device a creates its vault through `createVault.ts` on the fresh,
+  unclaimed relay (claim with explicit `Origin`, marker before identity, step 3, encryption On); e creates a
+  second vault on the claimed relay with the typed key and opts out; f is sent the encrypted vault by a lying
+  create answer and is refused at step 3 with no pin. The leak scan covers the operator key and owner codes too.
 
 ## 22. Decisions (resolved)
 
@@ -1852,7 +1920,7 @@ them here, so they are tagged [User], not [M] or [S].
 | Obsidian Android (System WebView) | Same three runs | Keystore-backed? Camera / Google Lens handling of custom schemes; low-end phone throughput |
 | Obsidian desktop (Electron) macOS, Windows | `run-e2ee`, SecretStorage probe | safeStorage availability; throughput (expected ≈ Chrome) |
 | Obsidian desktop Linux, with and without a keyring | SecretStorage probe | Plaintext fallback and `msgSecretsNotEncrypted` as read in the asar |
-| Obsidian `requestUrl`, desktop and mobile | Send `POST /claim` with `Origin: <host>` | Is the header sent as set? (§15.1; server ask A11 if not) |
+| Obsidian `requestUrl`, desktop and mobile | "Create a new vault" on an unclaimed and on a claimed server | Are `Origin` and a manual `Cookie` sent as set, and does `Set-Cookie` reach `res.headers`? The flow sends them explicitly (`src/host/ui/pairing.ts:528-532`); only Node's fetch against the local relay is verified (`e2e/client/e2ee.ts`). A refusal shows `forbidden_origin` or `no_session`. (§15.1; server ask A11 if not) |
 | Cloudflare (not a device) | Restore after `deleteAll()` | Can PITR bring back a deleted vault's rows (§15.2)? Not stated in [CF-PITR] |
 
 The Obsidian app binary was never launched for this design. Every Obsidian fact above is [S] from read-only files,
