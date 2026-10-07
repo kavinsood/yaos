@@ -19,8 +19,8 @@ import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
 import { clearIdentity } from "./pairFlow";
 import {
-	applyControl, attachmentSizeDesc, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused,
-	MAX_ATTACHMENT_MB, readControl, serverConsoleUrl, TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
+	applyControl, attachmentLimitMb, attachmentSizeDesc, connectionRows, enableSettingsSync, engineAcceptsCommands, engineRows, isControlKey, isPaused,
+	readControl, serverConsoleUrl, TEXT_CONTROL_KEYS, TRASH_MODE_OPTIONS, validateControl,
 	type ControlKey, type SettingsSeed,
 } from "./settingsModel";
 import type { UserCommand } from "../../protocol/messages";
@@ -226,9 +226,9 @@ export class YaosSettingTab extends PluginSettingTab {
 					type: "number",
 					key: "maxAttachmentMb",
 					min: 1,
-					max: MAX_ATTACHMENT_MB,
+					max: this.limitMb(),
 					step: 1,
-					validate: (v: number) => validateControl("maxAttachmentMb", v) ?? undefined,
+					validate: (v: number) => validateControl("maxAttachmentMb", v, this.limitMb()) ?? undefined,
 				},
 			},
 			{
@@ -375,7 +375,12 @@ export class YaosSettingTab extends PluginSettingTab {
 		if (!isControlKey(key)) return undefined;
 		const pending = this.pendingText.get(key);
 		if (pending !== undefined) return pending;
-		return readControl(this.host.data(), key);
+		return readControl(this.host.data(), key, this.limitMb());
+	}
+
+	/** The attachment size control's ceiling: the open vault's blob limit (settingsModel.ts attachmentLimitMb). */
+	private limitMb(): number {
+		return attachmentLimitMb(this.host.status());
 	}
 
 	async setControlValue(key: string, value: unknown): Promise<void> {
@@ -403,13 +408,14 @@ export class YaosSettingTab extends PluginSettingTab {
 	}
 
 	private async persist(key: ControlKey, value: unknown): Promise<void> {
-		const problem = validateControl(key, value);
+		const limitMb = this.limitMb();
+		const problem = validateControl(key, value, limitMb);
 		if (problem) {
 			new Notice(`YAOS: ${problem}`);
 			return;
 		}
 		try {
-			await this.host.updateData((d) => applyControl(d, key, value));
+			await this.host.updateData((d) => applyControl(d, key, value, limitMb));
 		} catch (err) {
 			new Notice(`YAOS: could not save the setting: ${errorMessage(err)}`, 8000);
 		}

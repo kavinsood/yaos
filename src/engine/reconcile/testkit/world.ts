@@ -22,6 +22,8 @@ import { StubLog } from "./stubLog";
 export interface WorldOptions {
 	readonly caseInsensitive?: boolean;
 	readonly blobs?: boolean;
+	/** The blob store's advertised cap (FakeBlobs.maxBlobBytes); default 8 MiB. */
+	readonly maxBlobBytes?: number;
 	readonly brake?: Partial<BrakeConfig>;
 	readonly settings?: Partial<ReconcileSettings>;
 	readonly deviceLabel?: string;
@@ -55,7 +57,7 @@ export class World {
 		this.vault = new FakeVault(opts.caseInsensitive ?? false, () => this.clock.now());
 		this.vault.onEvent((e) => this.pending.push(e));
 		this.gateway = new FakeGateway(this.vault);
-		this.blobs = opts.blobs === false ? null : new FakeBlobs();
+		this.blobs = opts.blobs === false ? null : new FakeBlobs(opts.maxBlobBytes);
 	}
 
 	get r(): Reconciler {
