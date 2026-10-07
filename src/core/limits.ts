@@ -173,6 +173,13 @@ export const KEY_STORE_WAIT_MS = 5_000;
 
 // --- Relay ------------------------------------------------------------------
 
+/**
+ * The relay's blob PUT cap (server/src/router.ts MAX_BLOB_UPLOAD_BYTES): Cloudflare's request body limit on the
+ * Free and Pro plans (developers.cloudflare.com/workers/platform/limits). The client's cap when GET
+ * /api/capabilities could not be read, and the most the settings offer until the open vault reports its own.
+ */
+export const MAX_BLOB_UPLOAD_BYTES = 100_000_000;
+
 export const RELAY_CLOSE = {
 	normal: 1000,
 	goingAway: 1001,

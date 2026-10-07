@@ -11,9 +11,10 @@
  * - Hooks run concurrent work at the two interesting points of a sweep; `fail` throws for one call.
  */
 
-import { BLOB_DELETE_BATCH, type BlobDeleteResult, type BlobListItem, type BlobListPage, type BlobPort } from "../ports/blob";
+import { BLOB_DELETE_BATCH, BlobTooLargeError, type BlobDeleteResult, type BlobListItem, type BlobListPage, type BlobPort } from "../ports/blob";
 import type { BlobAddress, SealedBlobParts } from "../ports/crypto";
 import { concatBytes } from "../core/codec/lib0";
+import { MAX_BLOB_UPLOAD_BYTES } from "../core/limits";
 
 export type SimBlobRoute = "has" | "put" | "get" | "list" | "delete";
 
@@ -30,6 +31,7 @@ export interface SimBlobStoreOptions {
 	/** The store's clock (ms). */
 	readonly now: () => number;
 	readonly pageSize?: number;
+	/** The PUT cap in sealed bytes; default the relay's (MAX_BLOB_UPLOAD_BYTES). Over it, put throws BlobTooLargeError. */
 	readonly maxBlobBytes?: number;
 }
 
@@ -48,7 +50,7 @@ export class SimBlobStore implements BlobPort {
 	private readonly pageSize: number;
 
 	constructor(private readonly opts: SimBlobStoreOptions) {
-		this.maxBlobBytes = opts.maxBlobBytes ?? 10 * 1024 * 1024;
+		this.maxBlobBytes = opts.maxBlobBytes ?? MAX_BLOB_UPLOAD_BYTES;
 		this.pageSize = opts.pageSize ?? 1000;
 	}
 
@@ -66,7 +68,7 @@ export class SimBlobStore implements BlobPort {
 	async put(address: BlobAddress, parts: SealedBlobParts): Promise<void> {
 		this.enter("put");
 		const bytes = concatBytes(parts);
-		if (bytes.byteLength > this.maxBlobBytes) throw new Error("sim blob put: 413 too large");
+		if (bytes.byteLength > this.maxBlobBytes) throw new BlobTooLargeError(bytes.byteLength);
 		this.objects.set(address, { bytes, uploadedAt: this.opts.now() });
 	}
 

@@ -1,8 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { ClockPort } from "../../ports/clock";
+import { MAX_BLOB_UPLOAD_BYTES } from "../../core/limits";
+import { BlobTooLargeError } from "../../ports/blob";
 import type { BlobAddress } from "../../ports/crypto";
-import { BLOB_EXISTS_BATCH, createHttpBlob, DEFAULT_MAX_BLOB_BYTES, GC_RETRY_ATTEMPTS, probeHttpBlob } from "./httpBlob";
+import { BLOB_EXISTS_BATCH, createHttpBlob, GC_RETRY_ATTEMPTS, probeHttpBlob } from "./httpBlob";
 import { RelayHttpError } from "./relayHttp";
 import { fakeFetch, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
 
@@ -54,7 +56,7 @@ describe("httpBlob", () => {
 			const hit = store.get(key);
 			return hit ? new Response(hit.slice()) : jsonResponse({ error: "not found" }, 404);
 		});
-		assert.equal(port.maxBlobBytes, DEFAULT_MAX_BLOB_BYTES);
+		assert.equal(port.maxBlobBytes, MAX_BLOB_UPLOAD_BYTES, "no capabilities read: the relay's own cap");
 		await port.put(addr(1), [new Uint8Array([1]), new Uint8Array([2])]);
 		assert.deepEqual(await port.get(addr(1)), new Uint8Array([1, 2]));
 		assert.equal(await port.get(addr(2)), null);
@@ -78,6 +80,52 @@ describe("httpBlob", () => {
 			assert.equal(b.size, 7);
 			assert.deepEqual(new Uint8Array(await b.arrayBuffer()), new Uint8Array([1, 2, 3, 9, 9, 9, 9]));
 		}
+	});
+
+	it("put answered 413 throws BlobTooLargeError, whatever the body (the relay's JSON, the edge's HTML page)", async () => {
+		for (const res of [
+			() => jsonResponse({ error: "body_too_large" }, 413),
+			() => new Response("<html><head><title>413 Request Entity Too Large</title></head><body>cloudflare</body></html>", { status: 413, headers: { "Content-Type": "text/html" } }),
+		]) {
+			const { port } = blob(res);
+			const e = await port.put(addr(1), [new Uint8Array(5), new Uint8Array(3)]).then(() => null, (err: unknown) => err);
+			assert.ok(e instanceof BlobTooLargeError, String(e));
+			assert.equal(e.bytes, 8);
+		}
+		// Any other refusal stays a RelayHttpError (retried with backoff by the blob queue).
+		assert.equal((await rejection(blob(() => jsonResponse({ error: "length_required" }, 411)).port.put(addr(1), [new Uint8Array(1)]))).status, 411);
+	});
+
+	it("get reads a Content-Length body into one buffer of that size; short, long or oversize bodies are errors", async () => {
+		const body = (chunks: number[][], headers: Record<string, string>, cancelled?: { n: number }) => new Response(new ReadableStream<Uint8Array>({
+			pull(c) {
+				const next = chunks.shift();
+				if (next) c.enqueue(new Uint8Array(next));
+				else c.close();
+			},
+			cancel() { if (cancelled) cancelled.n++; },
+		}), { status: 200, headers });
+		const get = (res: () => Response, maxBlobBytes?: number) => createHttpBlob({
+			baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, maxBlobBytes, fetch: fakeFetch(res).fetch,
+		}).get(addr(1));
+		assert.deepEqual(await get(() => body([[1, 2], [3], [4, 5, 6]], { "Content-Length": "6" })), new Uint8Array([1, 2, 3, 4, 5, 6]));
+		assert.deepEqual(await get(() => body([], { "Content-Length": "0" })), new Uint8Array(0));
+		// No usable length, or an encoded body: arrayBuffer().
+		assert.deepEqual(await get(() => body([[7], [8, 9]], {})), new Uint8Array([7, 8, 9]));
+		assert.deepEqual(await get(() => body([[7], [8, 9]], { "Content-Length": "2", "Content-Encoding": "gzip" })), new Uint8Array([7, 8, 9]));
+		const short = await rejection(get(() => body([[1, 2]], { "Content-Length": "3" })));
+		assert.deepEqual([short.status, short.code], [200, "malformed_response"]);
+		const long = { n: 0 };
+		assert.equal((await rejection(get(() => body([[1, 2], [3, 4], [5], [6]], { "Content-Length": "3" }, long)))).code, "malformed_response");
+		assert.equal(long.n, 1, "the rest of the stream is cancelled");
+		const oversize = { n: 0 };
+		assert.equal((await rejection(get(() => body([[1, 2, 3, 4]], { "Content-Length": "4" }, oversize), 3))).code, "malformed_response");
+		assert.equal(oversize.n, 1, "nothing read past the cap");
+		const broken = new Response(new ReadableStream<Uint8Array>({
+			start(c) { c.enqueue(new Uint8Array([1])); },
+			pull(c) { c.error(new TypeError("connection reset")); },
+		}), { status: 200, headers: { "Content-Length": "4" } });
+		assert.equal((await rejection(get(() => broken))).code, "network_error");
 	});
 
 	it("has() batches by 50 and only reports requested addresses", async () => {

@@ -1,6 +1,6 @@
 /**
  * BlobPort over the relay's blob routes (relay-wire.md §11.3):
- *   PUT  /vault/:id/blobs/<addr>        204 (400 invalid_address, 413 over maxBlobUploadBytes)
+ *   PUT  /vault/:id/blobs/<addr>        204 (400 invalid_address, 411 length_required, 413 over maxBlobUploadBytes)
  *   GET  /vault/:id/blobs/<addr>        200 bytes | 404 {"error":"not found"}
  *   POST /vault/:id/blobs/exists        {"hashes":[<addr>...]} -> {"present":[...]}; more than 50 is 400 too_many_addresses
  *   GET  /vault/:id/blobs?cursor=<addr> {"items":[{address,uploadedAt}],"next"} (§11.3.1; 503 list_incomplete)
@@ -24,16 +24,20 @@
  * suite 0, the keyed address over sealed bytes under suite 1 (e2ee-design
  * §10.1). The exists body's field is named `hashes` on the wire; it carries
  * addresses. Never a plaintext hash under suite 1 (blobs/blobStore.ts).
+ *
+ * No timeout on put / get: a 100 MB body on a 1 MB/s uplink takes 100 s, and a fixed limit would kill a transfer
+ * that is still moving. A put answered 413 (the relay's JSON or Cloudflare's own HTML page, whatever the body) throws
+ * BlobTooLargeError; the blob queue refuses that blob from then on (blobs/blobQueue.ts upload).
  */
 
-import { BLOB_DELETE_BATCH, type BlobDeleteResult, type BlobListItem, type BlobPort } from "../../ports/blob";
+import { MAX_BLOB_UPLOAD_BYTES } from "../../core/limits";
+import { BLOB_DELETE_BATCH, BlobTooLargeError, type BlobDeleteResult, type BlobListItem, type BlobPort } from "../../ports/blob";
 import type { ClockPort } from "../../ports/clock";
 import type { BlobAddress } from "../../ports/crypto";
 import { normalizeBaseUrl, parseRetryAfter, RelayHttpError } from "./relayHttp";
 import { createWebClock } from "./webClock";
 
 export const BLOB_EXISTS_BATCH = 50;
-export const DEFAULT_MAX_BLOB_BYTES = 10 * 1024 * 1024;
 /** Calls per GC request, the first included, while the relay answers 429/503 with Retry-After. */
 export const GC_RETRY_ATTEMPTS = 5;
 /** Longest Retry-After honoured; a longer one fails the call (the GC limit's window is 60 s). */
@@ -97,6 +101,47 @@ function parseDeleteResult(v: unknown, address: BlobAddress): BlobDeleteResult |
 	return null;
 }
 
+/**
+ * A 200 GET body. With a usable Content-Length the bytes are read into one buffer of that size: the stream's
+ * chunks are copied in as they arrive and dropped, where arrayBuffer() holds every chunk until it joins them
+ * (one more blob-sized copy). A body that ends early or runs past its length is a transport error, as is a
+ * length above `max` (the relay never stores more; no attacker-sized allocation). Without one, or with a
+ * Content-Encoding (the length is of the encoded bytes; fetch hands over decoded ones): arrayBuffer().
+ */
+async function readBody(res: Response, max: number): Promise<Uint8Array> {
+	const declared = res.headers.get("Content-Length");
+	const encoding = res.headers.get("Content-Encoding");
+	if (declared === null || !/^\d+$/.test(declared) || (encoding !== null && encoding !== "identity") || !res.body) {
+		return new Uint8Array(await res.arrayBuffer());
+	}
+	const length = Number(declared);
+	const bad = async (): Promise<never> => {
+		await res.body?.cancel().catch(() => undefined);
+		throw new RelayHttpError("blobs/get", res.status, "malformed_response", null);
+	};
+	if (length > max) return bad();
+	const out = new Uint8Array(length);
+	const reader = res.body.getReader();
+	let n = 0;
+	for (;;) {
+		let chunk: ReadableStreamReadResult<Uint8Array>;
+		try {
+			chunk = await reader.read();
+		} catch {
+			throw new RelayHttpError("blobs/get", 0, "network_error", null);
+		}
+		if (chunk.done) break;
+		if (chunk.value.length > length - n) {
+			await reader.cancel().catch(() => undefined);
+			throw new RelayHttpError("blobs/get", res.status, "malformed_response", null);
+		}
+		out.set(chunk.value, n);
+		n += chunk.value.length;
+	}
+	if (n !== length) throw new RelayHttpError("blobs/get", res.status, "malformed_response", null);
+	return out;
+}
+
 async function errorCode(res: Response): Promise<string | null> {
 	try {
 		const body: unknown = await res.json();
@@ -142,8 +187,24 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 		}
 	}
 
+	// Without the capabilities: the relay's own cap. A relay that takes less answers 413 (see the header).
+	const maxBlobBytes = opts.maxBlobBytes ?? MAX_BLOB_UPLOAD_BYTES;
+
+	async function putBody(address: BlobAddress, body: Blob): Promise<void> {
+		const res = await send("blobs/put", `${root}/${encodeURIComponent(address)}`, {
+			method: "PUT",
+			headers: { ...auth, "Content-Type": "application/octet-stream" },
+			body,
+		});
+		if (res.status === 413) {
+			await res.body?.cancel().catch(() => undefined);
+			throw new BlobTooLargeError(body.size);
+		}
+		if (res.status !== 204 && res.status !== 200) throw await fail("blobs/put", res);
+	}
+
 	return {
-		maxBlobBytes: opts.maxBlobBytes ?? DEFAULT_MAX_BLOB_BYTES,
+		maxBlobBytes,
 
 		async has(addresses) {
 			const present = new Set<BlobAddress>();
@@ -164,20 +225,18 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 			return present;
 		},
 
-		async put(address, parts) {
-			const res = await send("blobs/put", `${root}/${encodeURIComponent(address)}`, {
-				method: "PUT",
-				headers: { ...auth, "Content-Type": "application/octet-stream" },
-				// One Blob joins the parts: the transport's one copy. fetch reads a Blob body as a stream, where a
-				// BufferSource body would be copied again ([Fetch] "extract a body"). Parts are never SharedArrayBuffer views.
-				body: new Blob(parts as Uint8Array<ArrayBuffer>[]),
-			});
-			if (res.status !== 204 && res.status !== 200) throw await fail("blobs/put", res);
+		// One Blob joins the parts: the transport's one copy. fetch reads a Blob body as a stream, where a
+		// BufferSource body would be copied again ([Fetch] "extract a body"); fetch sends a Blob's size as its
+		// Content-Length, which the relay requires (411 length_required). Not async: only the Blob outlives this
+		// call, so the parts (the sealed bytes) are garbage for the whole upload, not held by a suspended frame.
+		// Parts are never SharedArrayBuffer views.
+		put(address, parts) {
+			return putBody(address, new Blob(parts as Uint8Array<ArrayBuffer>[]));
 		},
 
 		async get(address) {
 			const res = await send("blobs/get", `${root}/${encodeURIComponent(address)}`, { method: "GET", headers: auth });
-			if (res.status === 200) return new Uint8Array(await res.arrayBuffer());
+			if (res.status === 200) return readBody(res, maxBlobBytes);
 			if (res.status === 404) {
 				const code = await errorCode(res);
 				// "not found" = no such blob; anything else (unknown_vault) is a real error.

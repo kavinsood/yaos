@@ -34,6 +34,8 @@ export interface BlobTransfer {
 	prefetch?(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly size: number }): boolean;
 	/** Forget prefetched results no job took. */
 	dropPrefetched?(): void;
+	/** true = the store refused `hash` by size for good (upload() answers false; the job holds, no retry). */
+	refused?(hash: string): boolean;
 }
 
 export interface ReconcileSettings {
