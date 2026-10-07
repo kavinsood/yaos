@@ -97,19 +97,31 @@ export class World {
 		return events.length;
 	}
 
-	/** Deliver events, let time pass (racy window), reconcile until quiet, deliver the echoes. */
+	/**
+	 * Deliver events, let time pass (racy window, blob backoffs over), reconcile until quiet, deliver the echoes;
+	 * then, while the passes started blob transfers, let them settle and reconcile again (their docs are woken).
+	 */
 	async sync(maxPasses = 12): Promise<{ passes: number; quiet: boolean }> {
 		this.flushEvents();
 		this.clock.advance(5_000);
-		const res = await this.r.runUntilQuiet(maxPasses);
+		this.blobs?.retry();
+		let res = await this.r.runUntilQuiet(maxPasses);
+		let passes = res.passes;
 		this.flushEvents();
-		return { passes: res.passes, quiet: res.quiet };
+		for (let round = 0; this.blobs && round < maxPasses && (await this.blobs.settle()) > 0; round++) {
+			this.flushEvents();
+			res = await this.r.runUntilQuiet(maxPasses);
+			passes += res.passes;
+			this.flushEvents();
+		}
+		return { passes, quiet: res.quiet };
 	}
 
 	/** Process death: storage handles die, the log loses replicas, buffered events are lost; then boot again. */
 	async crashAndReboot(): Promise<Reconciler> {
 		this.storage.crash();
 		this.log.crash();
+		this.blobs?.crash();
 		this.storage.beforeCommit = null;
 		this.storage.afterCommit = null;
 		this.gateway.clearCrash();

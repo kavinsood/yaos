@@ -10,6 +10,10 @@
  *   relay      socket drops (1006/1001/1011) at random points of the frame
  *              flow; relay restart (STREAM_RESEND, unreceipted frames lost);
  *              graceful drain; HTTP failures; daily limit; vault epoch reset
+ *   blob store stalls (the whole path, or PUT bodies only; no byte moves: the idle
+ *              window or a link abort ends the call) and slow periods (12 KiB/s ..
+ *              1 MiB/s), blobStore.ts;
+ *              drawn only by BLOB_FAULTS
  *   world      wall-clock jumps (monotonic intact)
  *   suite 1    key-store loss, forced and concurrent rolls, revoke + re-key,
  *              point-in-time restore, hostile replay and downgrade
@@ -24,6 +28,7 @@
 import type { DeviceId, VaultEpoch } from "../core/types";
 import type { LifecycleEvent } from "../ports/platform";
 import type { TimerHandle } from "../ports/clock";
+import type { SimStallScope } from "./blobStore";
 import { tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
 import { E2eeFaults, type E2eeFaultAction } from "./e2eeFaults";
@@ -49,16 +54,19 @@ export type FaultAction =
 	| { readonly t: "dailyLimit"; readonly durationMs: number }
 	| { readonly t: "epochReset" }
 	| { readonly t: "clockSkew"; readonly dev: number; readonly deltaMs: number }
-	| E2eeFaultAction;
+	| E2eeFaultAction
+	| { readonly t: "blobStall"; readonly durationMs: number; readonly scope: SimStallScope }
+	| { readonly t: "blobSlow"; readonly durationMs: number; readonly bytesPerSec: number };
 
 export type FaultWeights = Readonly<Record<FaultAction["t"], number>>;
 
 export const DEFAULT_FAULTS: FaultWeights = {
 	engineCrash: 3, appCrash: 2, commitCrash: 2, idbWipe: 1, idbLost: 1, offline: 4, ioFail: 2, background: 3,
 	socketDrop: 4, relayRestart: 1, relayDrain: 1, httpFail: 1, dailyLimit: 0.5, epochReset: 0.3, clockSkew: 1,
-	// Suite-1 faults (e2eeFaults.ts): weight 0 here, so suite-0 plans draw exactly as before (generateFault skips
-	// zero weights, and these keys come last).
+	// Suite-1 faults (e2eeFaults.ts) and the blob store's (BLOB_FAULTS): weight 0 here, so the plans draw exactly
+	// as before (generateFault skips zero weights, and these keys come last).
 	keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
+	blobStall: 0, blobSlow: 0,
 };
 
 /** The default matrix plus the suite-1 faults (a `crypto: "suite1"` run; in a suite-0 run they are skipped). */
@@ -66,6 +74,13 @@ export const E2EE_FAULTS: FaultWeights = {
 	...DEFAULT_FAULTS,
 	keyStoreLoss: 1, keyRoll: 1.5, revoke: 0.7, epochRestore: 0.5, hostileReplay: 2, hostileDowngrade: 1,
 };
+
+/** The default matrix plus blob store stalls and slow periods (the "blob stall/slow faults" matrices). */
+export const BLOB_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, blobStall: 5, blobSlow: 5 };
+
+/** Slow-period rates: log-uniform over EDGE / congested cellular (12-25 KiB/s, adapters/httpBlob.ts) .. 1 MiB/s. */
+const SLOW_MIN_BPS = 12 * 1024;
+const SLOW_MAX_BPS = 1024 * 1024;
 
 export function generateFault(rng: SeededRandom, devices: number, weights: FaultWeights): FaultAction {
 	const dev = rng.int(devices);
@@ -101,6 +116,8 @@ export function generateFault(rng: SeededRandom, devices: number, weights: Fault
 		case "epochRestore": return { t: "epochRestore", back: rng.range(1, 12) };
 		case "hostileReplay": return { t: "hostileReplay", pick: rng.int(0x7fffffff), copies: rng.range(1, 3) };
 		case "hostileDowngrade": return { t: "hostileDowngrade", pick: rng.int(0x7fffffff), rows: rng.range(1, 3), join: rng.chance(0.3) };
+		case "blobStall": return { t: "blobStall", durationMs: rng.range(2_000, 90_000), scope: rng.chance(0.5) ? "path" : "put" };
+		case "blobSlow": return { t: "blobSlow", durationMs: rng.range(5_000, 150_000), bytesPerSec: Math.round(SLOW_MIN_BPS * (SLOW_MAX_BPS / SLOW_MIN_BPS) ** rng.float()) };
 	}
 }
 
@@ -131,6 +148,7 @@ export class FaultState {
 		engineCrash: 0, appCrash: 0, commitCrash: 0, idbWipe: 0, idbLost: 0, offline: 0, ioFail: 0, background: 0,
 		socketDrop: 0, relayRestart: 0, relayDrain: 0, httpFail: 0, dailyLimit: 0, epochReset: 0, clockSkew: 0,
 		keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
+		blobStall: 0, blobSlow: 0,
 	};
 	/** Suite-1 faults (null in a suite-0 run: they are skipped). */
 	readonly e2ee: E2eeFaults | null;
@@ -190,6 +208,18 @@ export class FaultState {
 				this.counts.dailyLimit++;
 				this.later(f.durationMs, () => this.healLimit());
 				return `fault dailyLimit ${f.durationMs}ms`;
+			case "blobStall":
+				if (this.net.blobs.stalled !== null) return "skip fault blobStall: already stalled";
+				this.net.blobs.setStall(f.scope);
+				this.counts.blobStall++;
+				this.later(f.durationMs, () => this.net.blobs.setStall(null));
+				return `fault blobStall ${f.scope} ${f.durationMs}ms`;
+			case "blobSlow":
+				if (this.net.blobs.slowRate !== null) return "skip fault blobSlow: already slow";
+				this.net.blobs.setSlow(f.bytesPerSec);
+				this.counts.blobSlow++;
+				this.later(f.durationMs, () => this.net.blobs.setSlow(null));
+				return `fault blobSlow ${f.durationMs}ms ${f.bytesPerSec}B/s`;
 			case "epochReset": {
 				const epoch = `sim-epoch-reset-${++this.epochs}` as VaultEpoch;
 				this.net.relay.resetEpoch(epoch);
@@ -352,7 +382,7 @@ export class FaultState {
 		this.net.relay.setDailyLimit(false);
 	}
 
-	/** All faults off: cancel pending fault timers, reconnect, restart, foreground, no I/O failures. */
+	/** All faults off: cancel pending fault timers, reconnect, restart, foreground, no I/O failures, blob store well. */
 	heal(): void {
 		for (const h of this.timers) this.clock.clearTimer(h);
 		this.timers.clear();
@@ -363,6 +393,9 @@ export class FaultState {
 		this.armed.clear();
 		this.healHttp();
 		this.healLimit();
+		// Calls a stall caught stay dead (blobStore.ts header): their idle windows or link aborts end them.
+		this.net.blobs.setStall(null);
+		this.net.blobs.setSlow(null);
 		for (const d of this.devs) d.vault.failNextOps = 0;
 		this.e2ee?.heal();
 	}

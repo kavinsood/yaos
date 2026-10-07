@@ -142,6 +142,22 @@ export class Reconciler {
 
 	/** One reconcile round: intents, hashes, plan, run. */
 	async pass(scope: PlanScope = { t: "full" }): Promise<PassReport> {
+		const blobs = this.ctx.deps.blobs;
+		const token = blobs?.beginPass?.() ?? 0;
+		try {
+			return await this.passBody(scope);
+		} finally {
+			// Downloads that arrived before this pass and that no job of it took are stale for the docs it planned.
+			if (scope.t === "full") blobs?.endPass?.(token, () => true);
+			else {
+				const docs = new Set(scope.docIds);
+				const keys = new Set(scope.pathKeys);
+				blobs?.endPass?.(token, (docId, path) => docs.has(docId) || keys.has(this.ctx.pk(path)));
+			}
+		}
+	}
+
+	private async passBody(scope: PlanScope): Promise<PassReport> {
 		const { ctx } = this;
 		const openIntents = await resumeIntents(this.env);
 		await this.scan.hashPending();
@@ -202,7 +218,7 @@ export class Reconciler {
 			ctx.deps.onBrake?.(report);
 			brake ??= report;
 		}
-		const actionable = plan.ops.filter((o) => o.op !== "wait" && o.op !== "needHash").length - run.deferred;
+		const actionable = plan.ops.filter((o) => o.op !== "wait" && o.op !== "needHash").length - run.deferred - run.transferring;
 		// Out-of-scope read failures count too: nothing else would re-plan them before the periodic full pass.
 		const unread = Math.max(this.scan.lastUnread, plan.ops.filter((o) => o.op === "needHash").length);
 		ctx.flushConflictCopies();

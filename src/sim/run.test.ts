@@ -3,7 +3,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generatePlan, minimizePlan, runSim, type SimConfig, type SimReport, type Step } from "./run";
-import { DEFAULT_FAULTS } from "./faults";
+import { BLOB_FAULTS, DEFAULT_FAULTS } from "./faults";
+import type { SimBlobLiveness } from "./blobStore";
 import { checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
 import { runUserAction, TokenLedger } from "./actors";
 import { SimDevice } from "./device";
@@ -13,16 +14,22 @@ import type { DocId, VaultPath } from "../core/types";
 
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
-async function sweep(name: string, base: Omit<SimConfig, "seed">, seeds: number, first = 1): Promise<void> {
+/** Asserts the matrix's faults hit what they target, over its clean runs' stats. */
+type Hits = (name: string, stats: readonly SimReport["stats"][]) => void;
+
+async function sweep(name: string, base: Omit<SimConfig, "seed">, seeds: number, first = 1, hits?: Hits): Promise<void> {
 	const failed: SimReport[] = [];
+	const stats: SimReport["stats"][] = [];
 	let tokens = 0;
 	for (let seed = first; seed < first + seeds; seed++) {
 		const r = await runSim({ ...base, seed });
 		tokens += r.stats.tokens.live;
+		stats.push(r.stats);
 		if (r.violations.length > 0) failed.push(r);
 	}
 	if (failed.length === 0) {
 		assert.ok(tokens > seeds * 10, `${name}: the actors did real work (${tokens} live tokens)`);
+		hits?.(name, stats);
 		return;
 	}
 	const r0 = failed[0] as SimReport;
@@ -32,22 +39,34 @@ async function sweep(name: string, base: Omit<SimConfig, "seed">, seeds: number,
 	assert.fail(
 		`${name}: ${failed.length}/${seeds} seeds failed: ${failed.map((r) => r.seed).join(",")}\n` +
 			`seed ${r0.seed}:\n  ${r0.violations.slice(0, 6).map((v) => `${v.inv}: ${v.detail}`).join("\n  ")}\n` +
-			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
+			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
 	);
 }
 
 const CHUNK = 50;
-function chunked(name: string, base: Omit<SimConfig, "seed">, seeds: number): void {
+function chunked(name: string, base: Omit<SimConfig, "seed">, seeds: number, hits?: Hits): void {
 	for (let first = 1; first <= seeds; first += CHUNK) {
 		const n = Math.min(CHUNK, seeds - first + 1);
-		test(`sim: ${name}, seeds ${first}..${first + n - 1}`, async () => sweep(name, base, n, first));
+		test(`sim: ${name}, seeds ${first}..${first + n - 1}`, async () => sweep(name, base, n, first, hits));
 	}
 }
+
+/** The blob store faults reached real transfers: stalls caught calls, both ends fired, slow calls completed. */
+const blobHits: Hits = (name, stats) => {
+	const sum = (f: (b: SimBlobLiveness) => number) => stats.reduce((n, s) => n + f(s.blobs), 0);
+	const got = {
+		stalled: sum((b) => b.stalled.has + b.stalled.put + b.stalled.get), stalledPut: sum((b) => b.stalled.put),
+		watchdog: sum((b) => b.watchdog), aborted: sum((b) => b.aborted), slowDone: sum((b) => b.slowDone), slowCut: sum((b) => b.slowCut),
+	};
+	const ok = got.stalled > 0 && got.stalledPut > 0 && got.watchdog > 0 && got.aborted > 0 && got.slowDone > 0 && got.slowCut === 0;
+	assert.ok(ok, `${name}: the blob faults hit transfers ${JSON.stringify(got)}`);
+};
 
 chunked("2 devices, no faults", { devices: 2, faults: null }, SEEDS);
 chunked("3 devices, seeded faults", { devices: 3, faults: DEFAULT_FAULTS }, SEEDS);
 chunked("5 devices, seeded faults", { devices: 5, faults: DEFAULT_FAULTS }, Math.max(1, Math.ceil(SEEDS / 4)));
 chunked("2 devices, fault-heavy", { devices: 2, faults: DEFAULT_FAULTS, faultRate: 0.35 }, Math.max(1, Math.ceil(SEEDS / 4)));
+chunked("3 devices, blob stall/slow faults", { devices: 3, faults: BLOB_FAULTS, faultRate: 0.3 }, Math.max(1, Math.ceil(SEEDS / 10)), blobHits);
 
 test("sim: same seed, same plan, same trace and same converged bytes (seeded Yjs clientIDs)", async () => {
 	const cfg: SimConfig = { seed: 4242, devices: 3, faults: DEFAULT_FAULTS };

@@ -1933,6 +1933,24 @@ ones get conflict copies.
     unparseable header) is deterministic; once the initial attempt and 3 retries spanning ≥ 3 min all failed
     deterministically, the referencing row is quarantined (e2ee-design §10.2). Absent blobs and failures under an
     unverified key never are.
+  - **In the background** (`src/engine/blobs/blobQueue.ts` header). A plan job never awaits a transfer: `pushBlob`
+    / `fetchBlob` / `diskMaterialize` claim it (start it, or join the one running for that hash) and answer
+    `inflight`; the runner skips that doc's later ops for the pass (`RunReport.transferring`, not actionable), and
+    every other doc goes on. When the transfer settles, the queue wakes a pass over its docs, whose jobs take the
+    outcome: `stored` (then the deferred `nsCreate` / `nsSetBlob` goes out), the verified bytes (written by that
+    pass, from its own plan: a doc that moved on never takes bytes for its old hash; `endPass` drops them), or
+    unavailable (backoff). Crash safety needs no new state: until the ns op goes out the synced record is
+    untouched (L ≠ S), so the next start plans the same upload again; the PUT is idempotent and `has` skips a
+    stored blob. Concurrency is a byte budget (`Budgets.blobBytesInFlight`, 64 MiB on a desktop; each transfer
+    counts at least `BLOB_TRANSFER_MIN_COST`, 4 MiB; ready bytes count until taken): bytes held stay within
+    max(budget, one blob), and a transfer larger than the budget runs alone once nothing else is in flight.
+  - **Liveness.** Every store call carries a signal that the session loop aborts when it declares the relay link
+    dead (close 1006 / 4000, pause, park, stop: `src/engine/blobs/transferLink.ts`,
+    `src/engine/runtime/sessionLoop.ts` `abortTransfers`). The HTTP adapter ends a transfer that moves no byte for
+    `BLOB_TRANSFER_IDLE_MS` (60 s; the download body is read chunk by chunk into a buffer sized from
+    Content-Length, the upload is an XHR whose `upload.onprogress` feeds the same idle check). No fixed deadline
+    ends a transfer that is still moving. An aborted or stalled transfer fails like any transport error and is
+    retried with backoff.
   - Files larger than the store path's plaintext cap (`storePlaintextCap`: `BlobPort.maxBlobBytes`, the server's
     `maxBlobUploadBytes`, `MAX_BLOB_UPLOAD_BYTES` = 100 MB when it sends none or the capabilities probe fails; under
     suite 1 what still fits once sealed, `maxSealedBlobPlaintext`, 98566143 at 100 MB) or
@@ -1965,8 +1983,8 @@ ones get conflict copies.
     reason is silent: no skip notice (`src/engine/reconcile/skipNotice.ts:56`). Attachments are not synced; the
     local file stays and is never deleted.
   - Blob jobs return `held`, which arms no retry timer (`blobJobs.ts:64-65`, `:103-104`;
-    `src/engine/reconcile/diskJobs.ts:34-41`, `:168`). `upload` / `download` / `prefetch` answer at once
-    (false / null) without persisting a queue record (`blobQueue.ts:202`, `:224`, `:252`), so nothing is queued.
+    `src/engine/reconcile/diskJobs.ts:34-41`, `:168`). `upload` / `download` / the claims answer at once
+    (false / null / unavailable) without persisting a queue record (`blobQueue.ts:202`, `:224`, `:252`), so nothing is queued.
   - No ns op for a blob is ever emitted unless the blob is durably stored.
   - An update > `MAX_INLINE_UPDATE_BYTES` (1 MiB − 32 KiB) freezes its doc `oversize-local` (§b.6).
   - The sender's R3 gate holds a `bodyUpdateRef` frame and passes every other frame

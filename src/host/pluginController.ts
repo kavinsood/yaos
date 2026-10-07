@@ -17,6 +17,7 @@ import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { EngineResultValue, EngineSettings, UserCommand } from "../protocol/messages";
 import type { StatusSnapshot } from "../protocol/status";
 import { wipeSecrets } from "../protocol/workerTransport";
+import { HostRequestError } from "./engineHost";
 import type { HostRuntime, HostUiSink } from "./hostRuntime";
 import { createHostKeys, type HostKeys } from "./keys/hostKeys";
 import {
@@ -418,7 +419,10 @@ export class YaosController {
 			try {
 				await this.runtime.command({ t: "updateSettings", settings: next.engine });
 			} catch (e) {
-				this.env.notice("warn", `Settings saved; the engine will apply them on restart (${safeMessage(e)}).`);
+				// A timeout only ends the wait: the engine took the settings first and keeps applying them
+				// (protocolEngine.ts "updateSettings"). Any other error leaves them for its next restart.
+				const timedOut = e instanceof HostRequestError && e.error.code === "timeout";
+				this.env.notice("warn", timedOut ? "Settings saved; the engine is still applying them." : `Settings saved; the engine will apply them on restart (${safeMessage(e)}).`);
 			}
 		}
 		this.changed();

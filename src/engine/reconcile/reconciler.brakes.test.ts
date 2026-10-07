@@ -105,6 +105,9 @@ test("blob: an upload the store refuses by size (413) holds the doc: no nsCreate
 	w.vault.userWrite("big.bin", bytes(1, 2, 3));
 	await w.boot();
 	w.blobs!.refuseUploads = true;
+	const started = await w.r.pass();
+	assert.equal(started.transferring >= 1 && started.failed === 0, true, "the upload runs in the background");
+	await w.blobs!.settle();
 	const first = await w.r.pass();
 	assert.equal(first.held, 1);
 	assert.equal(first.failed, 0, "held, not failed: the scheduler arms no retry (passScheduler.ts)");

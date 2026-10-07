@@ -7,7 +7,8 @@
 // Env:   YAOS_SIM_SEEDS     seeds of the full-count matrices (default 200, as run.test.ts; the others scale with it)
 //        YAOS_SIM_JOBS      worker processes (default: cores - 1)
 //        YAOS_SIM_MINIMIZE  1: ddmin the first failing seed of each matrix (as run.test.ts does; slow)
-// Exit 1 on any violation, crash, RealWork stray, or a matrix whose actors did no real work. Counts only: no keys.
+// Exit 1 on any violation, crash, RealWork stray, a matrix whose actors did no real work, or a blob-fault matrix
+// whose stalls and slow periods hit no transfer (as run.test.ts blobHits). Counts only: no keys.
 import { fork } from "node:child_process";
 import { availableParallelism } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -18,12 +19,14 @@ const SELF = fileURLToPath(import.meta.url);
 function matrices(seeds) {
 	const quarter = Math.max(1, Math.ceil(seeds / 4));
 	const half = Math.max(1, Math.ceil(seeds / 2));
+	const tenth = Math.max(1, Math.ceil(seeds / 10));
 	return [
 		// src/sim/run.test.ts, unchanged but for the crypto.
 		{ name: "2 devices, no faults", base: { devices: 2, faults: null }, seeds },
 		{ name: "3 devices, seeded faults", base: { devices: 3, faults: "DEFAULT_FAULTS" }, seeds },
 		{ name: "5 devices, seeded faults", base: { devices: 5, faults: "DEFAULT_FAULTS" }, seeds: quarter },
 		{ name: "2 devices, fault-heavy", base: { devices: 2, faults: "DEFAULT_FAULTS", faultRate: 0.35 }, seeds: quarter },
+		{ name: "3 devices, blob stall/slow faults", base: { devices: 3, faults: "BLOB_FAULTS", faultRate: 0.3 }, seeds: tenth, blobHits: true },
 		// The suite-1 faults on top of the suite-0 ones (faults.ts E2EE_FAULTS).
 		{ name: "3 devices, E2EE faults", base: { devices: 3, faults: "E2EE_FAULTS", faultRate: 0.3 }, seeds: half },
 		{ name: "4 devices, E2EE faults", base: { devices: 4, faults: "E2EE_FAULTS", faultRate: 0.3 }, seeds: quarter },
@@ -51,7 +54,7 @@ async function worker() {
 			const cfg = cfgOf(job);
 			if (job.t === "run") {
 				const r = await runSim(cfg);
-				process.send({ id: job.id, ok: true, ms: Date.now() - t0, violations: r.violations, tokens: r.stats.tokens.live, e2ee: r.stats.e2ee ?? null, realWork: r.stats.realWork ?? null, faults: r.stats.faults });
+				process.send({ id: job.id, ok: true, ms: Date.now() - t0, violations: r.violations, tokens: r.stats.tokens.live, e2ee: r.stats.e2ee ?? null, realWork: r.stats.realWork ?? null, faults: r.stats.faults, blobs: r.stats.blobs });
 			} else {
 				const r0 = await runSim(cfg);
 				const needle = r0.violations[0]?.detail ?? "";
@@ -113,7 +116,7 @@ function pool(n) {
 
 function addInto(sum, x) {
 	for (const [k, v] of Object.entries(x)) {
-		if (typeof v === "number") sum[k] = (sum[k] ?? 0) + v;
+		if (typeof v === "number") sum[k] = k.endsWith("MaxMs") ? Math.max(sum[k] ?? 0, v) : (sum[k] ?? 0) + v;
 		else if (v && typeof v === "object") addInto((sum[k] ??= {}), v);
 	}
 	return sum;
@@ -147,12 +150,17 @@ async function main() {
 		const sumFaults = rs.reduce((s, r) => addInto(s, r.faults ?? {}), {});
 		const e2ee = rs.reduce((s, r) => (r.e2ee ? addInto(s, r.e2ee) : s), {});
 		const rw = rs.reduce((s, r) => (r.realWork ? addInto(s, r.realWork) : s), {});
-		const ok = failed.length === 0 && strays === 0 && tokens > m.seeds * 10;
+		const blobs = rs.reduce((s, r) => (r.blobs ? addInto(s, r.blobs) : s), {});
+		const stalled = (blobs.stalled?.has ?? 0) + (blobs.stalled?.put ?? 0) + (blobs.stalled?.get ?? 0);
+		const blobsHit = !m.blobHits || (stalled > 0 && blobs.stalled.put > 0 && blobs.watchdog > 0 && blobs.aborted > 0 && blobs.slowDone > 0 && blobs.slowCut === 0);
+		const ok = failed.length === 0 && strays === 0 && tokens > m.seeds * 10 && blobsHit;
 		failedAny ||= !ok;
 		console.log(`${ok ? "ok" : "FAIL"} ${m.name}: ${m.seeds - failed.length}/${m.seeds} seeds clean, ${tokens} live tokens, run p50 ${(runMs[Math.floor(runMs.length / 2)] / 1000).toFixed(1)} s, max ${(runMs[runMs.length - 1] / 1000).toFixed(1)} s`);
 		console.log(`   faults ${JSON.stringify(sumFaults)}`);
 		console.log(`   realWork ${JSON.stringify(rw)}`);
 		if (Object.keys(e2ee).length > 0) console.log(`   e2ee ${JSON.stringify(e2ee)}`);
+		if (m.blobHits) console.log(`   blobs ${JSON.stringify(blobs)}`);
+		if (!blobsHit) console.log("   the blob faults hit no transfer (stalled, stalled PUT, watchdog, aborted, slow done; slowCut 0)");
 		if (strays > 0) console.log(`   RealWork strays: ${strays} (a crypto await bypassed RealWork)`);
 		if (tokens <= m.seeds * 10) console.log(`   the actors did no real work (${tokens} live tokens)`);
 		for (const r of failed.slice(0, 5)) {

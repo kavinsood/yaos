@@ -3,6 +3,11 @@
  * (overwrite an existing file with the remote blob), pushBlob (upload, then
  * submit the deferred nsCreate/nsSetBlob).
  *
+ * Transfers run in the background (blobs/blobQueue.ts): fetchBlob and pushBlob
+ * claim theirs and answer "inflight" until it settled; its docs are then
+ * planned again, and the new pass's job takes the outcome. So every write and
+ * every ns op is decided from the facts of the pass that makes it.
+ *
  * keep-both (E8) runs under a `keep-both-blob` intent: conflictCopy begins it
  * before the copy is written, fetchBlob ends it in its T_synced. A crash in
  * between is resolved by intents.ts.
@@ -10,8 +15,9 @@
 
 import type { ContentHash, DocId, PlannerOp, VaultPath } from "../../core/types";
 import { isShrinkingOverwrite } from "../../core/plan/brake";
-import type { WritePrecondition } from "../../ports/vault";
+import type { VaultStat, WritePrecondition } from "../../ports/vault";
 import type { IntentRecord } from "../store/schema";
+import type { UploadSource } from "./context";
 import { hashBytes } from "./localState";
 import { blobStore, writeOk, type Env, type JobOutcome } from "./diskJobs";
 
@@ -55,16 +61,19 @@ export async function conflictCopy(env: Env, op: Op<"conflictCopy">): Promise<Jo
 }
 
 /**
- * Download `hash` and write it over `path` (CAS on `precondition`), then
+ * Write the downloaded `hash` over `path` (CAS on `precondition`), then
  * T_synced for the doc + end of any keep-both intent. Used by fetchBlob and by
- * intent resume. "fail" = unavailable now or the file changed; "held" = no blob store.
+ * intent resume. "inflight" = downloading (the doc is planned again when it
+ * settles); "fail" = unavailable now or the file changed; "held" = no blob store.
  */
 export async function fetchAndWrite(env: Env, docId: DocId, path: VaultPath, hash: ContentHash, size: number, precondition: WritePrecondition): Promise<JobOutcome> {
 	const { ctx } = env;
 	const blobs = blobStore(env);
 	if (!blobs) return "held";
-	const bytes = await blobs.download({ hash, docId, path, size });
-	if (!bytes) return "fail";
+	const got = blobs.claimDownload({ hash, docId, path, size });
+	if (got.t === "busy") return "inflight";
+	if (got.t === "unavailable") return "fail";
+	const bytes = got.bytes;
 	const old = ctx.localAt(path);
 	const res = await ctx.exec({ t: "write", area: "vault", path: ctx.diskPathOf(path), data: { t: "bytes", bytes }, precondition, docId, purpose: "materialize" });
 	const out = writeOk(res);
@@ -93,30 +102,28 @@ export async function fetchBlob(env: Env, op: Op<"fetchBlob">): Promise<JobOutco
 }
 
 /**
- * Upload the local file's bytes. Only after the store confirms are the
- * doc's deferred ns ops submitted, so no ns entry ever points at a blob that
- * readers cannot fetch. A brand-new doc gets a synced record (blobRev 0,
- * nsTouchSeq 0) unless the S1 fold already wrote one. "held" = no blob store,
- * or the store refused these bytes by size (BlobTransfer.refused): retrying
- * cannot help, so no retry is armed and the doc stays local.
+ * Upload the local file's bytes: claim the upload (started or joined in the
+ * background, "inflight"), and once the store confirmed it, submit the doc's
+ * deferred ns op, so no ns entry ever points at a blob that readers cannot
+ * fetch. A brand-new doc gets a synced record (blobRev 0, nsTouchSeq 0) unless
+ * the S1 fold already wrote one. "held" = no blob store, or the store refused
+ * these bytes by size: retrying cannot help, so no retry is armed and the doc
+ * stays local.
+ *
+ * A crash before the ns op leaves S as it was (L ≠ S): the next start plans
+ * the same upload again (idempotent; has() skips a stored blob).
  */
 export async function pushBlob(env: Env, op: Op<"pushBlob">): Promise<JobOutcome> {
 	const { ctx } = env;
 	const blobs = blobStore(env);
-	if (!blobs || blobs.refused?.(op.hash)) return "held";
-	const path = ctx.diskPathOf(op.path);
-	const r = await ctx.read(path, blobs.maxBlobBytes);
-	if (!r.ok) {
-		if (r.reason === "too-large") ctx.notice("warn", "blob-too-large", `attachment too large to sync: ${op.path}`, `big:${op.path}`);
-		env.scan.markDirty(path, r.reason === "missing" ? null : r.stat);
-		return "fail";
-	}
-	const h = hashBytes("blob", r.bytes);
-	if (h.hash !== op.hash) {
-		env.scan.markDirty(path, r.stat);
-		return "fail";
-	}
-	if (!(await blobs.upload({ hash: h.hash, docId: op.docId, path: op.path, bytes: r.bytes }))) return blobs.refused?.(h.hash) ? "held" : "fail";
+	if (!blobs) return "held";
+	const claim = blobs.claimUpload({ hash: op.hash, docId: op.docId, path: op.path, size: op.size }, uploadSource(env, op.path, blobs.maxBlobBytes));
+	if (claim === "busy") return "inflight";
+	if (claim === "refused") return "held";
+	if (claim === "unavailable") return "fail";
+	// Stored. The plan's local entry is the file that was hashed; it moved on since (re-hash pending): re-plan.
+	const l = ctx.localAt(op.path);
+	if (!l || l.hash !== op.hash || l.fingerprint === null) return "fail";
 	const deferred = env.deferred.get(op.docId);
 	if (deferred) {
 		env.deferred.delete(op.docId);
@@ -124,10 +131,30 @@ export async function pushBlob(env: Env, op: Op<"pushBlob">): Promise<JobOutcome
 	}
 	if (!ctx.synced(op.docId) && deferred?.t === "create") {
 		const entry = ctx.record({
-			docId: op.docId, path: op.path, pathKey: ctx.pk(op.path), kind: "blob", contentHash: h.hash, fingerprint: h.fingerprint, size: r.stat.size,
-			mtimeMs: r.stat.mtimeMs, bodyVersion: null, blobRev: 0, nsTouchSeq: 0, hasBase: false,
+			docId: op.docId, path: op.path, pathKey: ctx.pk(op.path), kind: "blob", contentHash: op.hash, fingerprint: l.fingerprint, size: l.size,
+			mtimeMs: l.mtimeMs, bodyVersion: null, blobRev: 0, nsTouchSeq: 0, hasBase: false,
 		});
 		await ctx.commit({ syncedPut: [entry] });
 	}
 	return "ok";
+}
+
+/** Where pushBlob's upload reads the file when it starts (in the background, after this pass maybe). */
+function uploadSource(env: Env, path: VaultPath, maxBytes: number): UploadSource {
+	const { ctx } = env;
+	const diskPath = ctx.diskPathOf(path);
+	let stat: VaultStat | null = null;
+	return {
+		read: async () => {
+			const r = await ctx.read(diskPath, maxBytes);
+			if (r.ok) {
+				stat = r.stat;
+				return r.bytes;
+			}
+			if (r.reason === "too-large") ctx.notice("warn", "blob-too-large", `attachment too large to sync: ${path}`, `big:${path}`);
+			env.scan.markDirty(diskPath, r.reason === "missing" ? null : r.stat);
+			return null;
+		},
+		changed: () => env.scan.markDirty(diskPath, stat),
+	};
 }

@@ -13,11 +13,15 @@
  *     S ≠ L, so the next pass re-runs the merge instead of waiting forever on
  *     "body-empty" (the planner cannot tell an own unwritten body from another
  *     device's in-flight one);
- *   - disk / content / bookkeeping ops run one by one (per-op gateway exec); the
- *     downloads of upcoming blob jobs start ahead (BlobTransfer.prefetch, bounded
- *     by the carrier), so N attachments cost about N / window round trips, not N;
+ *   - disk / content / bookkeeping ops run one by one (per-op gateway exec); blob
+ *     jobs only claim their transfer, which runs in the background (BlobTransfer,
+ *     bounded by its byte budget), so no attachment holds up the other docs;
  *   - when an op of a doc fails (or is held) the doc's later ops are skipped;
+ *   - an "inflight" job (its transfer runs) skips the doc's later ops too, and
+ *     neither counts as actionable (RunReport.transferring): the transfer's end
+ *     requests the pass that continues the doc;
  *   - a "deferred" job (bound doc awaiting the editor's save) counts as a wait;
+ *   - the runtime stopping (ReconcilerDeps.stopping) starts no further job;
  *   - after the run, folders emptied by renames / trashes are removed, deepest first.
  * Unknown exceptions propagate (a crash is a crash; intents + T_synced make it safe).
  */
@@ -37,6 +41,8 @@ export interface RunReport {
 	readonly held: number;
 	/** Jobs that ran but leave their doc waiting (not actionable until something outside changes). */
 	readonly deferred: number;
+	/** Plan ops waiting on a background blob transfer: the inflight jobs, their deferred ns ops, the docs' later ops. */
+	readonly transferring: number;
 	readonly skipped: number;
 	readonly waits: number;
 	readonly needHash: number;
@@ -85,9 +91,17 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 	const { ctx } = env;
 	const skip = new Set<DocId>(ctx.intentDocs());
 	const failedDocs = new Set<DocId>();
+	const transferDocs = new Set<DocId>();
 	const vacated: VaultPath[] = [];
-	let ok = 0, failed = 0, held = 0, deferred = 0, skipped = 0, waits = 0, needHash = 0, nsSubmitted = 0;
-	const blocked = (op: PlannerOp): boolean => docsOf(op).some((d) => skip.has(d));
+	let ok = 0, failed = 0, held = 0, deferred = 0, transferring = 0, skipped = 0, waits = 0, needHash = 0, nsSubmitted = 0;
+	const stopping = (): boolean => ctx.deps.stopping?.() === true;
+	const blocked = (op: PlannerOp): boolean => {
+		const docs = docsOf(op);
+		if (!docs.some((d) => skip.has(d))) return false;
+		skipped++;
+		if (docs.some((d) => transferDocs.has(d)) && !docs.some((d) => failedDocs.has(d))) transferring++;
+		return true;
+	};
 	const note = (op: PlannerOp, res: JobOutcome): void => {
 		if (res === "ok") {
 			ok++;
@@ -97,6 +111,16 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 			deferred++;
 			return;
 		}
+		if (res === "inflight") {
+			transferring++;
+			for (const d of docsOf(op)) {
+				// Its blob ns op waits in env.deferred (planned, not submitted): waiting on the transfer as well.
+				if (env.deferred.has(d)) transferring++;
+				skip.add(d);
+				transferDocs.add(d);
+			}
+			return;
+		}
 		if (res === "held") held++;
 		else failed++;
 		for (const d of docsOf(op)) {
@@ -104,23 +128,21 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 			failedDocs.add(d);
 		}
 	};
+	const report = (): RunReport => ({ ok, failed, held, deferred, transferring, skipped, waits, needHash, nsSubmitted, failedDocs });
 	env.deferred.clear();
 
 	let i = 0;
 	for (; i < ops.length && ops[i]!.op === "rebind"; i++) {
+		if (stopping()) return report();
 		const op = ops[i]!;
-		if (blocked(op)) skipped++;
-		else note(op, await runOne(env, op));
+		if (!blocked(op)) note(op, await runOne(env, op));
 	}
 
 	const ns: NsOp[] = [];
 	const born: SyncedRecord[] = [];
 	for (; i < ops.length && toNsOp(ops[i]!) !== null; i++) {
 		const op = ops[i]!;
-		if (blocked(op)) {
-			skipped++;
-			continue;
-		}
+		if (blocked(op)) continue;
 		const nsOp = toNsOp(op)!;
 		if ((nsOp.t === "create" && nsOp.kind === "blob") || nsOp.t === "setBlob") {
 			env.deferred.set(nsOp.docId, nsOp);
@@ -149,13 +171,11 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		ok += ns.length;
 	}
 
-	const ahead = prefetcher(env, ops, blocked);
 	for (; i < ops.length; i++) {
 		if (uncork && i > lastLive) {
 			uncork();
 			uncork = null;
 		}
-		ahead.pump(i);
 		const op = ops[i]!;
 		if (op.op === "wait") {
 			waits++;
@@ -165,48 +185,18 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 			needHash++;
 			continue;
 		}
-		if (blocked(op)) {
-			skipped++;
-			continue;
-		}
+		if (blocked(op)) continue;
 		if (toNsOp(op) !== null) throw new Error(`ns op out of order: ${op.op}`);
+		if (stopping()) break;
 		const res = await runOne(env, op);
 		note(op, res);
 		if (res === "ok" && op.op === "diskRename") vacated.push(op.from);
 		if (res === "ok" && op.op === "diskTrash") vacated.push(op.path);
 	}
 	uncork?.();
-	ahead.done();
 	env.deferred.clear();
 	await removeEmptied(env, vacated);
-	return { ok, failed, held, deferred, skipped, waits, needHash, nsSubmitted, failedDocs };
-}
-
-/** The download a blob job will make: diskMaterialize of a live blob doc, fetchBlob. */
-function blobReqOf(env: Env, op: PlannerOp): { hash: string; docId: DocId; path: VaultPath; size: number } | null {
-	if (op.op === "fetchBlob") return { hash: op.hash, docId: op.docId, path: op.path, size: op.size };
-	if (op.op !== "diskMaterialize") return null;
-	const r = env.ctx.log.view().remote.get(op.docId);
-	return r?.state === "live" && r.kind === "blob" && r.blob ? { hash: r.blob.hash, docId: op.docId, path: op.path, size: r.blob.size } : null;
-}
-
-/** Keeps the carrier's prefetch window full with the next blob jobs at or after the running op. */
-function prefetcher(env: Env, ops: readonly PlannerOp[], blocked: (op: PlannerOp) => boolean) {
-	const blobs = env.ctx.deps.blobs;
-	let next = 0;
-	return {
-		pump(at: number): void {
-			if (!blobs?.prefetch) return;
-			for (next = Math.max(next, at); next < ops.length; next++) {
-				const op = ops[next]!;
-				const req = blocked(op) ? null : blobReqOf(env, op);
-				if (req && !blobs.prefetch(req)) return;
-			}
-		},
-		done(): void {
-			blobs?.dropPrefetched?.();
-		},
-	};
+	return report();
 }
 
 /** S for a markdown / canvas doc about to be created: the empty body, stat of the local file. */

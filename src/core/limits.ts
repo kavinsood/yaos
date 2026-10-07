@@ -189,6 +189,14 @@ export const MAX_BLOB_UPLOAD_BYTES = 100_000_000;
  */
 export const BLOB_TRANSFER_IDLE_MS = 60_000;
 
+/**
+ * The least a blob transfer counts against Budgets.blobBytesInFlight, however small the blob: it bounds how many
+ * small transfers run at once (desktop 16, phone 4). More would only queue in the network stack (Chromium opens
+ * at most six HTTP/1.1 connections per host) with no byte moving, which the idle window above would read as a
+ * stall.
+ */
+export const BLOB_TRANSFER_MIN_COST = 4 * 1024 * 1024;
+
 export const RELAY_CLOSE = {
 	normal: 1000,
 	goingAway: 1001,
@@ -221,7 +229,11 @@ export interface Budgets {
 	readonly sliceMs: number;
 	/** Parallel stream reads for catch-up. */
 	readonly catchUpConcurrency: number;
-	readonly blobConcurrency: number;
+	/**
+	 * Blob plaintext bytes in flight (blobs/blobQueue.ts): running uploads and downloads (each at least
+	 * BLOB_TRANSFER_MIN_COST) plus downloaded bytes no job took yet. A transfer larger than this runs alone.
+	 */
+	readonly blobBytesInFlight: number;
 	readonly maxInflightAppendBytes: number;
 	/** Outstanding main-thread read/write payload bytes. */
 	readonly maxDiskIoBytesInFlight: number;
@@ -237,25 +249,25 @@ export interface Budgets {
 export const BUDGETS: Readonly<Record<DeviceClass, Budgets>> = {
 	desktop: {
 		maxResidentDocs: 400, maxResidentBytes: 256 * 1024 * 1024, sliceMs: 10,
-		catchUpConcurrency: 8, blobConcurrency: 4, maxInflightAppendBytes: 1024 * 1024,
+		catchUpConcurrency: 8, blobBytesInFlight: 64 * 1024 * 1024, maxInflightAppendBytes: 1024 * 1024,
 		maxDiskIoBytesInFlight: 8 * 1024 * 1024, diskOpsPerBatch: 32, mainSliceMs: 8,
 		fullReconcileIntervalMs: 5 * 60_000, dailyFrameSoftBudget: 20_000, docUpdateWindowBytes: 512 * 1024,
 	},
 	tablet: {
 		maxResidentDocs: 120, maxResidentBytes: 96 * 1024 * 1024, sliceMs: 10,
-		catchUpConcurrency: 4, blobConcurrency: 2, maxInflightAppendBytes: 512 * 1024,
+		catchUpConcurrency: 4, blobBytesInFlight: 32 * 1024 * 1024, maxInflightAppendBytes: 512 * 1024,
 		maxDiskIoBytesInFlight: 4 * 1024 * 1024, diskOpsPerBatch: 16, mainSliceMs: 6,
 		fullReconcileIntervalMs: 10 * 60_000, dailyFrameSoftBudget: 10_000, docUpdateWindowBytes: 256 * 1024,
 	},
 	phone: {
 		maxResidentDocs: 60, maxResidentBytes: 48 * 1024 * 1024, sliceMs: 8,
-		catchUpConcurrency: 3, blobConcurrency: 2, maxInflightAppendBytes: 512 * 1024,
+		catchUpConcurrency: 3, blobBytesInFlight: 16 * 1024 * 1024, maxInflightAppendBytes: 512 * 1024,
 		maxDiskIoBytesInFlight: 2 * 1024 * 1024, diskOpsPerBatch: 16, mainSliceMs: 5,
 		fullReconcileIntervalMs: 10 * 60_000, dailyFrameSoftBudget: 6_000, docUpdateWindowBytes: 256 * 1024,
 	},
 	constrained: {
 		maxResidentDocs: 24, maxResidentBytes: 24 * 1024 * 1024, sliceMs: 6,
-		catchUpConcurrency: 2, blobConcurrency: 1, maxInflightAppendBytes: 256 * 1024,
+		catchUpConcurrency: 2, blobBytesInFlight: 8 * 1024 * 1024, maxInflightAppendBytes: 256 * 1024,
 		maxDiskIoBytesInFlight: 1024 * 1024, diskOpsPerBatch: 8, mainSliceMs: 4,
 		fullReconcileIntervalMs: 15 * 60_000, dailyFrameSoftBudget: 4_000, docUpdateWindowBytes: 128 * 1024,
 	},
