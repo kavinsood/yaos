@@ -271,12 +271,44 @@ export class SessionLoop {
 		return p;
 	}
 
-	private async readOne(s: RelaySession, gen: number, stream: StreamName, fromSeq: Seq | undefined, first: (ReadRequest & { page: ReadPage }) | undefined): Promise<void> {
+	/**
+	 * Reads each of `streams` to the relay's head now, one after another, each after any read of it already
+	 * running, and folds what it read (postRead). true = every read completed ("done") in the session that was
+	 * current at the call. For decisions that need this session's view of a stream (blobs/gc.ts preconditions).
+	 */
+	async readFresh(streams: readonly StreamName[]): Promise<boolean> {
+		const c = this.c;
+		const s = c.session;
+		if (!s) return false;
+		const gen = c.gen;
+		const current = () => gen === c.gen && c.session === s && !c.stopped;
+		for (const stream of streams) {
+			for (let running = this.reads.get(stream); running; running = this.reads.get(stream)) await running;
+			if (!current()) return false;
+			let done = false;
+			this.lanes++;
+			const p = this.readOne(s, gen, stream, undefined, undefined, (res) => { done = res.t === "done"; }).finally(() => {
+				this.reads.delete(stream);
+				this.lanes--;
+				this.scheduleCatchUp();
+			});
+			this.reads.set(stream, p);
+			await p;
+			if (!done || !current()) return false;
+		}
+		return true;
+	}
+
+	private async readOne(
+		s: RelaySession, gen: number, stream: StreamName, fromSeq: Seq | undefined, first: (ReadRequest & { page: ReadPage }) | undefined,
+		onResult?: (res: ReadResult) => void,
+	): Promise<void> {
 		const c = this.c;
 		this.stats.reads++;
 		try {
 			const res = await readStream(c.deps, s, stream, { headSeq: s.headSeq, fromSeq, first, stillValid: () => gen === c.gen && c.session === s });
 			await this.postRead(stream, res);
+			onResult?.(res);
 		} catch (e) {
 			this.stats.readFailures++;
 			this.readBackoff.set(stream, c.mono() + c.tuning.readBackoffMs);
