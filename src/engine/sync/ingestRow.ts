@@ -6,6 +6,9 @@
  *  - ns/cfg deterministic failure           -> tail row with empty content (folds as an empty frame)
  *  - ns/cfg reader-dependent failure        -> tail row flagged LOCAL_FLAG_UNOPENED, content = raw payload (halts the fold)
  *  - body/canvas/x failure                  -> quarantine record
+ *  - ns/cfg stale-epoch (e2ee-design §14.3)  -> tail row flagged LOCAL_FLAG_STALE_EPOCH, empty content (folds as
+ *                                              ignored/stale-epoch)
+ *  - body/canvas/x stale-epoch              -> accounted only: ignored, no quarantine, no freeze (§9.3)
  *  - k row                                  -> tail row "keyRecord", content = the raw record (no envelope;
  *                                              judged by the keyring, e2ee-design §11.3)
  *  - unknown stream class                   -> accounted only
@@ -18,7 +21,7 @@ import { gate, type GateCtx } from "../ingest/gate";
 import type { QuarantineRecord, TailRecord } from "../store/schema";
 import { bytesToHex } from "../../core/codec/lib0";
 import { KEY_RECORD_MAX_BYTES } from "../keyring/record";
-import { LOCAL_FLAG_UNOPENED } from "./nsRuntime";
+import { LOCAL_FLAG_STALE_EPOCH, LOCAL_FLAG_UNOPENED } from "./foldRuntime";
 
 export interface RowInput {
 	readonly stream: StreamName;
@@ -43,6 +46,9 @@ export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, now
 		switch (g.t) {
 			case "ignored":
 				return { t: "account" };
+			case "stale":
+				if (cls !== "ns" && cls !== "cfg") return { t: "account" };
+				return { t: "row", row: { ...base, kind: cls === "ns" ? "nsOps" : "cfgOps", authorNsSeq: 0, flags: LOCAL_FLAG_STALE_EPOCH, frameNo: 0, content: new Uint8Array(0) } };
 			case "ns":
 			case "cfg":
 			case "body":

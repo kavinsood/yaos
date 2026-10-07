@@ -211,10 +211,12 @@ export class SessionLoop {
 		switch (ev.t) {
 			case "committed":
 				if (ev.frame.seq > cur.headSeqSeen) cur.headSeqSeen = ev.frame.seq;
+				c.keyring.noteArrived(ev); // §14.3: before any batching (keyringRuntime.kComplete)
 				c.live.push(ev);
 				return;
 			case "receipt":
 				if (ev.seq > cur.headSeqSeen) cur.headSeqSeen = ev.seq;
+				c.keyring.noteArrived(ev);
 				c.live.push(ev);
 				return;
 			case "provisional":

@@ -28,7 +28,7 @@ const hash = createWebHash();
 const crypto = createNoopCrypto(hash);
 const VAULT = "v1" as VaultId;
 const ctx: FrameCtx = { vaultId: VAULT, self: "dev1" as DeviceId, crypto, hash, random: createWebRandom(), blob: null };
-const gctx: GateCtx = { crypto, vaultId: VAULT, maxCheckpointStateBytes: 1 << 20 };
+const gctx: GateCtx = { crypto, vaultId: VAULT, maxCheckpointStateBytes: 1 << 20, staleCheck: () => null };
 const BODY = "b:doc1" as StreamName;
 
 function textUpdate(chars: number, ch = "a"): Uint8Array {

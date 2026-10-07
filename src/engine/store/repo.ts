@@ -706,6 +706,30 @@ export class Repo {
 		});
 	}
 
+	/**
+	 * Re-gated ns / cfg rows replace the unopened rows they stand for (quarantineRelease.regateUnopened). A row
+	 * gone meanwhile (snapshot compaction) is skipped; byte accounting follows the new content.
+	 */
+	tReplaceTail(stream: StreamName, rows: readonly TailRecord[], nowMs: number): Promise<number> {
+		return this.serial("tReplaceTail", async () => {
+			let n = 0;
+			const out = await this.db.tx([STORE.tail, STORE.streams], "readwrite", async (tx) => {
+				const r: Mut<StreamRecord> = { ...((await tx.get(STORE.streams, stream)) ?? newStreamRecord(stream, nowMs)) };
+				for (const row of rows) {
+					const old = await tx.get(STORE.tail, [stream, row.seq]);
+					if (!old) continue;
+					tx.put(STORE.tail, row);
+					r.tailBytes = Math.max(0, r.tailBytes - old.content.length + row.content.length);
+					n++;
+				}
+				tx.put(STORE.streams, r);
+				return r;
+			});
+			this.cache.set(stream, out);
+			return n;
+		});
+	}
+
 	/** Delete every record of a stream (retired checkpoint ok, or prune without duty). */
 	tDropStream(stream: StreamName): Promise<void> {
 		return this.serial("tDropStream", async () => {

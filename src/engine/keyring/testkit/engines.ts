@@ -4,6 +4,7 @@
  * records stands in for main pinning and restarting the engine (§12.4).
  */
 
+import type { EnvelopeKind } from "../../../core/envelope";
 import { type ClientFrameId, type DeviceId, type StreamName, type VaultId } from "../../../core/types";
 import type { StoragePort } from "../../../ports/storage";
 import type { SimRelay } from "../../../sim/relay";
@@ -11,15 +12,19 @@ import { createWebCryptoSuite1 } from "../../adapters/webCryptoSuite1";
 import { createWebRandom } from "../../adapters/webRandom";
 import type { LogEngine } from "../../runtime/engine";
 import type { EngineTuning } from "../../runtime/options";
+import { sealFrame } from "../../ingest/envelope";
 import { startTestEngine, until } from "../../runtime/testHarness";
 import type { KeyringChange } from "../keyring";
 import type { EngineE2ee } from "../keyringRuntime";
-import { VAULT } from "./world";
+import { K, VAULT } from "./world";
 
 let raw = 0;
-/** A row appended by some other party (a hostile relay, or a device the test does not run). */
-export async function rawAppend(relay: SimRelay, stream: StreamName, payload: Uint8Array): Promise<number> {
-	const r = await relay.connect({ vaultId: VAULT as VaultId, deviceId: "dev-raw" as DeviceId });
+export const RAW_DEVICE = "dev-raw" as DeviceId;
+/** A row appended by some other party (a hostile relay, or a device the test does not run); `payload` may be sealed for its frame id. */
+export async function rawAppend(relay: SimRelay, stream: StreamName, payload: Uint8Array | ((cf: ClientFrameId) => Promise<Uint8Array>)): Promise<number> {
+	const clientFrameId = `raw${++raw}`.padEnd(22, "A") as ClientFrameId;
+	const bytes = typeof payload === "function" ? await payload(clientFrameId) : payload;
+	const r = await relay.connect({ vaultId: VAULT as VaultId, deviceId: RAW_DEVICE });
 	if (!r.ok) throw new Error(`connect: ${r.reason}`);
 	const s = r.session;
 	const seq = await new Promise<number>((resolve, reject) => {
@@ -27,10 +32,19 @@ export async function rawAppend(relay: SimRelay, stream: StreamName, payload: Ui
 			if (ev.t === "receipt") resolve(ev.seq);
 			else if (ev.t === "refused") reject(new Error(ev.reason));
 		});
-		s.append({ stream, clientFrameId: `raw-${++raw}` as ClientFrameId, payload });
+		s.append({ stream, clientFrameId, payload: bytes });
 	});
 	s.close(1000, "done");
 	return seq;
+}
+
+/** A frame RAW_DEVICE seals under the testkit's K_e: what a revoked device can still do with the keys below r (§14.4). */
+export async function oldEpochFrame(relay: SimRelay, stream: StreamName, e: number, kind: EnvelopeKind, content: Uint8Array, frameNo = 0): Promise<number> {
+	const kc = await createWebCryptoSuite1({ vaultId: VAULT, random: createWebRandom(), keys: [{ e, k: K(e) }] });
+	kc.markVerified(e);
+	kc.setSealEpoch(e);
+	return rawAppend(relay, stream, async (clientFrameId) =>
+		(await sealFrame(kc, VAULT as VaultId, { stream, deviceId: RAW_DEVICE, clientFrameId, kind, authorNsSeq: 0, flags: 0, frameNo, content })).sealed);
 }
 
 export interface Dev {

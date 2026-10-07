@@ -6,7 +6,7 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, streamClass, streamDocId, type ClientFrameId, type DeviceId, type DocId, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, streamClass, streamDocId, type ClientFrameId, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
@@ -99,8 +99,10 @@ export class EngineCtx {
 		this.deviceClass = opts.deviceClass ?? "desktop";
 		this.tuning = resolveTuning(opts.tuning);
 		this.budgets = resolveBudgets(this.deviceClass, opts.budgets);
-		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes };
 		const c = this;
+		// §14.3: held (reader-dependent) until the keyring is open.
+		const staleCheck = (e: number, seq: Seq | null) => (c.keyring ? c.keyring.staleCheck(e, seq) : "hold" as const);
+		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes, staleCheck };
 		// The one write gate (writeGate.ts): shut until the keyring is open, then whenever it reports key-missing.
 		const gate = (): KeyMissingReason | null => (c.keyring ? c.keyring.keyMissing() : "no-pin");
 		this.gate = gate;

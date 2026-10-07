@@ -7,6 +7,9 @@
  * never sealed, and a lost append is sent again with the same clientFrameId (the relay deduplicates it). A
  * receipt becomes the tail row it stands for (the bytes are known), so the keyring judges it in seq order (R2:
  * every `k` row below the receipt's seq was delivered before it).
+ *
+ * The stale-epoch rule (§14.3) is answered only while every `k` row that can precede the row being gated is
+ * judged; otherwise the row is held (reader-dependent) and re-gated after the next keyring change.
  */
 
 import { newClientFrameId } from "../../core/codec/ids";
@@ -15,9 +18,10 @@ import type { TimerHandle } from "../../ports/clock";
 import type { RelayEvent } from "../../ports/relay";
 import type { E2eeStatus, KeyMissingReason } from "../../protocol/status";
 import type { EngineCtx } from "../runtime/context";
-import { retryReaderQuarantine } from "../runtime/quarantineRelease";
+import { regateUnopened, retryReaderQuarantine } from "../runtime/quarantineRelease";
 import type { TailRecord } from "../store/schema";
 import { keyRecordRow } from "../sync/ingestRow";
+import type { StaleVerdict } from "./book";
 import { Keyring, type KeyringChange, type OwnOutcome, type QrResult } from "./keyring";
 import { KeyRecordKind } from "./record";
 import { KeyringRefusedError, keyringCryptoOf } from "./writeGate";
@@ -52,8 +56,10 @@ export class KeyringRuntime {
 	/** Own seals under `epoch` (§4.2), and what MetaKeyring holds. */
 	private seals = { epoch: 0, n: 0 };
 	private stored = { sum: "", n: 0, atMono: -Infinity };
-	/** Main stored new keys: quarantined rows are re-gated (§9.3 "released and re-gated on keyringChanged"). */
-	private keysChanged = false;
+	/** Highest `k` seq that arrived on a session (a live row or an own receipt), judged or not. */
+	private kArrived: Seq = 0;
+	/** The keyring has judged every stored `k` row through this seq (ingestTail). */
+	private kJudged: Seq = 0;
 
 	private constructor(private readonly c: EngineCtx, readonly kr: Keyring, readonly suite: 0 | 1 | null, private readonly creating: boolean) {}
 
@@ -62,11 +68,7 @@ export class KeyringRuntime {
 		const kc = keyringCryptoOf(crypto);
 		if (e2ee.suite === 0 && crypto.suite !== 0) throw new Error("e2ee: a suite-0 pin needs the suite-0 crypto port");
 		if (e2ee.suite === 1 && (crypto.suite !== 1 || !kc)) throw new Error("e2ee: a suite-1 pin needs the suite-1 crypto port");
-		let rt: KeyringRuntime | null = null;
-		const persist = e2ee.suite === 0 ? undefined : async (ch: KeyringChange) => {
-			await e2ee.persist(ch);
-			if (rt) rt.keysChanged = true;
-		};
+		const persist = e2ee.suite === 0 ? undefined : (ch: KeyringChange) => e2ee.persist(ch);
 		const kr = await Keyring.open({
 			mode: e2ee.suite === 0 ? "suite0" : e2ee.suite === 1 ? "suite1" : "unpinned",
 			vaultId: c.opts.vaultId,
@@ -77,7 +79,7 @@ export class KeyringRuntime {
 			diag: (code, f) => c.diag(code, f),
 			onKeyringSeen: () => c.scheduleStatus(),
 		});
-		rt = new KeyringRuntime(c, kr, e2ee.suite, e2ee.suite === null && e2ee.creating);
+		const rt = new KeyringRuntime(c, kr, e2ee.suite, e2ee.suite === null && e2ee.creating);
 		const meta = await c.repo.getMeta("keyring");
 		if (meta?.key === "keyring" && meta.sealEpoch === kr.sealEpoch()) rt.seals = { epoch: meta.sealEpoch, n: meta.ownSeals };
 		await rt.ingestTail();
@@ -95,6 +97,32 @@ export class KeyringRuntime {
 		if (through === 0) return;
 		const rows = (await this.c.repo.getTail(KEYRING_STREAM)).filter((r) => r.seq <= through);
 		if (rows.length > 0) await this.kr.ingest(rows.map((r) => ({ seq: r.seq, bytes: r.content })));
+		if (through > this.kJudged) this.kJudged = through;
+	}
+
+	// ------------------------------------------------------------------ §14.3
+
+	/** sessionLoop, at arrival (before any batching): a `k` row or an own `k` receipt. */
+	noteArrived(ev: RelayEvent): void {
+		const seq = ev.t === "committed" && ev.frame.stream === KEYRING_STREAM ? ev.frame.seq : ev.t === "receipt" && ev.stream === KEYRING_STREAM ? ev.seq : 0;
+		if (seq > this.kArrived) this.kArrived = seq;
+	}
+
+	/**
+	 * Every `k` row that can precede a row being gated now is judged. On a session the rows below a row arrive
+	 * before it (R2), in the session's `k` read or live; so: `k` was read to head on this session, every `k` row
+	 * that arrived since is stored and judged, and `k` is not stale (rows known from a feed only).
+	 */
+	private kComplete(): boolean {
+		const k = this.c.repo.stream(KEYRING_STREAM);
+		return this.c.session !== null && this.kReadGen === this.c.gen && !k?.stale && this.kArrived <= this.kJudged;
+	}
+
+	/** GateCtx.staleCheck (gate.ts). seq null: a provisional, which commits after everything judged so far. */
+	staleCheck(keyEpoch: number, seq: Seq | null): StaleVerdict {
+		if (this.suite !== 1) return null;
+		if (!this.kComplete()) return "hold";
+		return this.kr.staleCheck(keyEpoch, seq ?? Number.MAX_SAFE_INTEGER);
 	}
 
 	// ------------------------------------------------------------------ gate
@@ -132,8 +160,9 @@ export class KeyringRuntime {
 			if (o === "won" || o === "lost") this.finish(f, o);
 		}
 		const c = this.c;
-		if (this.keysChanged && c.session) {
-			this.keysChanged = false;
+		// New keys, a settled revoke or more of `k` judged: held and unopened rows are re-gated (§9.3, §14.3).
+		if (this.suite === 1 && c.session) {
+			await regateUnopened(c).catch((e) => c.diag("unopened-regate-failed", { error: String(e) }));
 			void retryReaderQuarantine(c).catch((e) => c.diag("quarantine-retry-failed", { error: String(e) }));
 		}
 		const b = this.blocked();

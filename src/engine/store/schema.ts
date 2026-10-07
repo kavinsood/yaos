@@ -227,7 +227,14 @@ export type QuarantineReason =
 	| "oversize"
 	| "post-apply-limit"
 	| "canvas-invalid"
-	| "checkpoint-mismatch";
+	| "checkpoint-mismatch"
+	/** A checkpoint sealed under an epoch below the winning revoke, covering past S_rot (e2ee-design §14.3): absent. */
+	| "stale-epoch"
+	/**
+	 * §14.3 undecided for this reader: a revoke it cannot settle yet, or `k` rows not judged yet. Reader-dependent:
+	 * re-gated after the next keyring change.
+	 */
+	| "keyring-hold";
 
 export interface QuarantineRecord {
 	readonly stream: StreamName;

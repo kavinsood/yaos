@@ -16,7 +16,7 @@ import { gate, type GateCtx, type GateResult } from "./gate";
 import { checkYjsUpdate } from "./yjsCheck";
 
 const crypto = createNoopCrypto(createWebHash());
-const ctx: GateCtx = { crypto, vaultId: "v1" as VaultId, maxCheckpointStateBytes: 1 << 20 };
+const ctx: GateCtx = { crypto, vaultId: "v1" as VaultId, maxCheckpointStateBytes: 1 << 20, staleCheck: () => null };
 const BODY = "b:doc1" as StreamName;
 const CANVAS = "c:doc2" as StreamName;
 const CF = "cf-1" as ClientFrameId;
@@ -146,4 +146,29 @@ test("gate: suite-1 failures map to quarantine reasons; only key-dependent ones 
 	const header = { formatVersion: 1, suite: 1, keyEpoch: 1 } as const;
 	const unpadded = await s1.seal({ purpose: "frame", keyEpoch: 1, aad: frameAad(header, vaultId, BODY, DEV, CF), plaintext: new Uint8Array(256) });
 	assert.equal(verdict(await at(encodeOuter(header, unpadded))), "envelope-padding/false");
+});
+
+test("gate: §14.3 stale-epoch from the header before opening: rows stale, checkpoints absent, provisionals ignored, hold reader-dependent", async () => {
+	const calls: [number, number | null][] = [];
+	// A revoke r = 3 at S_rot = 10; epoch 9 is undecidable for this reader.
+	const staleCheck: GateCtx["staleCheck"] = (e, seq) => (calls.push([e, seq]), e === 9 ? "hold" : e < 3 && (seq ?? Infinity) > 10 ? "stale" : null);
+	const c: GateCtx = { ...ctx, staleCheck };
+	const under = (e: number) => encodeOuter({ formatVersion: 1, suite: 1, keyEpoch: e }, new Uint8Array(48).fill(5)); // never opened
+	const at = (t: "row" | "provisional" | "checkpoint", stream: StreamName, e: number, seq: number) =>
+		gate(c, t === "checkpoint" ? { t, stream, coversSeq: seq, payload: under(e) } : t === "row" ? { t, stream, seq, deviceId: DEV, clientFrameId: CF, payload: under(e) } : { t, stream, deviceId: DEV, clientFrameId: CF, payload: under(e) });
+	const verdict = (r: GateResult) => (r.ok ? r.t : `${r.reason}/${r.readerDependent}`);
+	assert.equal(verdict(await at("row", NS_STREAM, 2, 11)), "stale");
+	assert.equal(verdict(await at("row", BODY, 2, 11)), "stale");
+	assert.equal(verdict(await at("checkpoint", BODY, 2, 11)), "stale-epoch/false", "absent, not reader-dependent");
+	assert.equal(verdict(await at("provisional", BODY, 2, 0)), "ignored", "a provisional is never adopted");
+	assert.equal(verdict(await at("row", BODY, 9, 11)), "keyring-hold/true");
+	assert.equal(verdict(await at("checkpoint", NS_STREAM, 9, 11)), "keyring-hold/true");
+	assert.equal(verdict(await at("provisional", BODY, 9, 0)), "ignored");
+	assert.equal(verdict(await at("row", BODY, 2, 10)), "crypto-unknown-key/true", "at S_rot: not stale, opened as usual");
+	assert.equal(verdict(await at("row", BODY, 3, 11)), "crypto-unknown-key/true", "under r: opened as usual");
+	assert.deepEqual(calls, [[2, 11], [2, 11], [2, 11], [2, null], [9, 11], [9, 11], [9, null], [2, 10], [3, 11]], "rows give seq, checkpoints coversSeq, provisionals null");
+	calls.length = 0;
+	await gate(c, { t: "row", stream: BODY, seq: 11, deviceId: DEV, clientFrameId: CF, payload: (await sealFrame(crypto, ctx.vaultId, { stream: BODY, deviceId: DEV, clientFrameId: CF, kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content: upd((d) => d.getText("text").insert(0, "x")) })).sealed });
+	await gate(c, { t: "row", stream: "k" as StreamName, seq: 11, deviceId: DEV, clientFrameId: CF, payload: under(2) });
+	assert.deepEqual(calls, [], "suite-0 bytes (keyEpoch 0) and k rows are never asked");
 });
