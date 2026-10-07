@@ -8,6 +8,9 @@
 // becomes the `exports` lifecycle declaration (one live entry per class), which the upload API reconciles
 // against the classes a redeployed worker already has (same classes = same namespaces). deleted_classes become
 // `deleted` tombstones: the upload API rejects a provisioned namespace that is neither live nor tombstoned.
+// [[r2_buckets]] become `bindings.r2({ name: <bucket_name> })` (cf/config converts that back to the same
+// r2_buckets entry); the bucket must already exist on the account, since a binding without a bucket_name is refused
+// rather than left for cf to provision.
 import { createRequire } from "node:module";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
@@ -32,11 +35,8 @@ const fail = (msg) => {
 	process.exit(1);
 };
 
-if (cfg.r2_buckets?.length) {
-	fail("R2 bindings are not rendered yet: the deployed e2e worker needs the YAOS_BUCKET bucket binding (blobs never ride the relay log); RELAY_DEV_R2=0 deploys without it (attachments not synced)");
-}
 if (cfg.kv_namespaces?.length || cfg.d1_databases?.length || cfg.services?.length) {
-	fail("only Durable Object and text bindings are supported (the streams relay config has no KV/D1/services)");
+	fail("only Durable Object, R2 and text bindings are supported (the streams relay config has no KV/D1/services)");
 }
 
 // Fold [[migrations]] into the final class set.
@@ -64,6 +64,11 @@ for (const b of cfg.durable_objects?.bindings ?? []) {
 	if (b.script_name) fail(`binding ${b.name} points at another worker`);
 	if (!classes.has(b.class_name)) fail(`binding ${b.name} uses class ${b.class_name}, which no migration creates`);
 	env.push(`\t\t\t${q(b.name)}: bindings.durableObject({ worker: ${q(cfg.name)}, exportName: ${q(b.class_name)} }),`);
+}
+for (const b of cfg.r2_buckets ?? []) {
+	if (typeof b.bucket_name !== "string" || !b.bucket_name) fail(`R2 binding ${b.binding} has no bucket_name`);
+	const jurisdiction = b.jurisdiction ? `, jurisdiction: ${q(b.jurisdiction)}` : "";
+	env.push(`\t\t\t${q(b.binding)}: bindings.r2({ name: ${q(b.bucket_name)}${jurisdiction} }),`);
 }
 const exportsLines = [...classes].map(([c, storage]) => `\t\t\t${q(c)}: exports.durableObject({ storage: ${q(storage)} }),`);
 for (const c of deleted) exportsLines.push(`\t\t\t${q(c)}: exports.durableObject({ state: "deleted" }),`);
