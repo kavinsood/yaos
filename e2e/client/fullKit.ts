@@ -11,6 +11,7 @@
  *
  * NetSwitch wraps the RelayPort (and the blob port) so a device can go offline: connect answers
  * "unavailable", live sessions drop abruptly (1006) and session RPCs fail like a lost network (src/sim/net.ts).
+ * With a WireTap (wireTap.ts) the same wrapper timestamps APPENDs and relay events for the latency breakdown.
  */
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import type { Unsubscribe } from "../../src/ports/common";
@@ -49,6 +50,7 @@ import { SimWorkspace } from "../../src/sim/workspace";
 import type { BootTrace } from "./bootTrace";
 import type { Report } from "./engineKit";
 import type { OnboardDevice, OnboardedVault } from "./onboard";
+import type { SessionTap, WireTap } from "./wireTap";
 
 // ---- network switch ------------------------------------------------------------
 
@@ -58,12 +60,16 @@ class DroppableSession implements RelaySession {
 	private dead = false;
 	private readonly listeners = new Set<(e: RelayEvent) => void>();
 	private off: Unsubscribe | null = null;
-	constructor(private readonly inner: RelaySession, private readonly ended: () => void) {}
+	constructor(private readonly inner: RelaySession, private readonly ended: () => void, private readonly tap: SessionTap | null) {}
 	get vaultEpoch() { return this.inner.vaultEpoch; }
 	get headSeq() { return this.inner.headSeq; }
 	get canWrite() { return this.inner.canWrite; }
 	get limits() { return this.inner.limits; }
-	append(frame: AppendFrame): void { if (!this.dead) this.inner.append(frame); }
+	append(frame: AppendFrame): void {
+		if (this.dead) return;
+		this.tap?.append(frame);
+		this.inner.append(frame);
+	}
 	bufferedBytes(): number { return this.dead ? 0 : this.inner.bufferedBytes(); }
 	feed(afterSeq: Parameters<RelaySession["feed"]>[0]) { return this.dead ? Promise.reject(netError("feed")) : this.inner.feed(afterSeq); }
 	read(...a: Parameters<RelaySession["read"]>) { return this.dead ? Promise.reject(netError("read")) : this.inner.read(...a); }
@@ -74,6 +80,7 @@ class DroppableSession implements RelaySession {
 		// Subscribe lazily so the inner session's pre-subscription buffering still applies.
 		this.off ??= this.inner.onEvent((e) => {
 			if (this.dead) return;
+			this.tap?.event(e);
 			if (e.t === "closed") this.end();
 			this.emit(e);
 		});
@@ -105,6 +112,8 @@ class DroppableSession implements RelaySession {
 
 export class NetSwitch {
 	online = true;
+	/** Latency timeline hooks (FullClientOptions.tap). */
+	tap: SessionTap | null = null;
 	private readonly live = new Set<DroppableSession>();
 
 	wrap(inner: RelayPort): RelayPort {
@@ -117,7 +126,7 @@ export class NetSwitch {
 					r.session.close(1000, "e2e offline");
 					return { ok: false, reason: "unavailable", retryAfterMs: null };
 				}
-				const s: DroppableSession = new DroppableSession(r.session, () => this.live.delete(s));
+				const s: DroppableSession = new DroppableSession(r.session, () => this.live.delete(s), this.tap);
 				this.live.add(s);
 				return { ok: true, session: s };
 			},
@@ -164,6 +173,8 @@ export interface FullClientOptions {
 	readonly trace?: BootTrace;
 	/** Engine tuning overrides (snapshots.ts: a short blob GC grace). */
 	readonly tuning?: Partial<EngineTuning>;
+	/** The vault's wire timeline (fullLatency.ts): APPENDs, relay events, engine disk writes, VAULT_READY limits. */
+	readonly tap?: WireTap;
 }
 
 const LOG_RING = 400;
@@ -203,8 +214,23 @@ export class FullClient {
 	private handle: EngineHandle | null = null;
 
 	constructor(readonly o: FullClientOptions) {
-		this.vault = new SimVault({ clock: this.clock, hashes: this.hashes, profile: "case-sensitive", watcherDelayMs: () => o.watcherDelayMs });
+		const tap = o.tap;
+		this.vault = new SimVault({ clock: this.clock, hashes: this.hashes, profile: "case-sensitive", watcherDelayMs: () => o.watcherDelayMs,
+			...(tap ? { onMutation: (m: { by: string; path: string; to?: string }) => {
+				if (m.by !== "sync") return;
+				tap.disk(o.name, m.path);
+				if (m.to) tap.disk(o.name, m.to);
+			} } : {}) });
 		this.configDir = new SimConfigDir(this.clock);
+		if (tap) {
+			const cd = this.configDir;
+			const write = cd.writeBytes.bind(cd);
+			cd.writeBytes = async (p, b) => {
+				await write(p, b);
+				tap.disk(o.name, `${this.vault.configDir}/${p}`);
+			};
+			this.net.tap = tap.forClient(o.name, o.device.deviceId);
+		}
 		this.workspace = this.newWorkspace();
 		this.runtime = this.makeRuntime();
 	}
@@ -248,8 +274,9 @@ export class FullClient {
 				const hash = createWebHash();
 				const random = createWebRandom();
 				const tr = this.o.trace;
+				const tap = this.o.tap;
 				const relay = this.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random,
-					...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}) }));
+					...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}), ...(tap ? { WebSocketImpl: tap.webSocket(tr?.WebSocket) } : {}) }));
 				const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock };
 				// As webEngine.ts: probed at start, and again on a later connect while there is none.
 				const blob = await startupBlob(blobOpts, (line) => this.log(`engine: ${line}`));
@@ -355,6 +382,8 @@ export interface FullCtx {
 	readonly clients: FullClient[];
 	/** Creates (does not start) a client for an onboarded device. */
 	newClient(name: string, device: OnboardDevice): FullClient;
+	/** The vault's wire timeline (every client of newClient feeds it). */
+	readonly tap: WireTap;
 	/** Relay process restart (null when the host is not local). */
 	readonly relay: null | { stop(): void; start(): void };
 }

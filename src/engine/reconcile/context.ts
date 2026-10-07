@@ -99,6 +99,11 @@ export class Ctx {
 	readonly brake: BrakeConfig;
 	readonly mergeLimits: MergeLimits;
 	brakeApproval: string | null = null;
+	/**
+	 * Creates are live (DESIGN §d.4): set after the first full pass with the namespace ready and the scan complete.
+	 * Until then (onboarding, the first pass after every start) creates keep their body frames held until they fold.
+	 */
+	liveCreates = false;
 	readonly classifySettings: ClassifySettings;
 	private readonly excludes: (p: VaultPath) => boolean;
 	private readonly destructive: { kind: DestructiveKind; at: number }[] = [];

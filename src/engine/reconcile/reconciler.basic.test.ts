@@ -280,3 +280,37 @@ test("blob jobs prefetch ahead: every download was started ahead, within the car
 	assert.ok(blobs.drops >= 1);
 	assert.equal(blobs.ahead.size, 0);
 });
+
+test("live creates (DESIGN §d.4): the first full pass after boot holds its creates' bodies; later creates are live, corked until their initial content is framed", async () => {
+	const w = new World();
+	w.vault.userWrite("a.md", "A\n");
+	await w.boot();
+	await w.sync();
+	const a = w.log.liveByPath(P("a.md"))!;
+	assert.deepEqual(w.log.trace, ["ns held", `frame ${a}`], "onboarding pass: held, no cork");
+	w.log.trace.length = 0;
+
+	w.vault.userWrite("b.md", "B\n");
+	w.vault.userWrite("c.md", "C\n");
+	w.vault.userWrite("empty.md", "");
+	await w.sync();
+	const b = w.log.liveByPath(P("b.md"))!;
+	const c = w.log.liveByPath(P("c.md"))!;
+	assert.ok(w.log.liveByPath(P("empty.md")));
+	assert.equal(w.log.trace.length, 5);
+	assert.deepEqual(w.log.trace.slice(0, 2), ["cork", "ns live"]);
+	assert.deepEqual(w.log.trace.slice(2, 4).sort(), [`frame ${b}`, `frame ${c}`].sort(), "both initial bodies framed inside the cork");
+	assert.equal(w.log.trace[4], "uncork");
+	w.log.trace.length = 0;
+
+	w.vault.userWrite("only-empty.md", "");
+	await w.sync();
+	assert.deepEqual(w.log.trace, ["ns live"], "an empty create has no body to wait for: no cork");
+	w.log.trace.length = 0;
+
+	await w.crashAndReboot();
+	w.vault.userWrite("d.md", "D\n");
+	await w.sync();
+	const d = w.log.liveByPath(P("d.md"))!;
+	assert.deepEqual(w.log.trace, ["ns held", `frame ${d}`], "the first pass after a restart holds again");
+});

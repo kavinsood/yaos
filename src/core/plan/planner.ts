@@ -105,8 +105,9 @@ function versionEq(a: BodyVersion, b: BodyVersion | null): boolean {
 type ContentKind = "markdown" | "canvas";
 
 /**
- * §c.13 merged rebind of a markdown/canvas doc. The loser's held body frames
- * were dropped, so the winner never saw the loser's edits after its create: its
+ * §c.13 merged rebind of a markdown/canvas doc. The loser's body frames were
+ * dropped (held or unreceipted) or committed on the loser's stream, which
+ * nobody materializes, so the winner never saw the loser's edits after its create: its
  * sync point is the winner's create, not the loser's last merge. Keeping the
  * loser's base would read those edits as already synced and the winner's text
  * as their deletion. The base survives only when it is the create text; with no
