@@ -42,7 +42,7 @@ export interface DiskSideStatus {
 }
 
 /** Phases the log side owns outright; the disk side never overrides them. */
-const HARD: ReadonlySet<EnginePhase> = new Set(["superseded", "revoked", "upgrade-required", "error", "daily-limit"]);
+const HARD: ReadonlySet<EnginePhase> = new Set(["superseded", "revoked", "upgrade-required", "key-missing", "error", "daily-limit"]);
 
 export function mergeStatus(log: StatusSnapshot, d: DiskSideStatus): StatusSnapshot {
 	let phase = log.phase;

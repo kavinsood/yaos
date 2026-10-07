@@ -253,8 +253,16 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 
 - **Store.** Epoch keys MUST be stored in Obsidian SecretStorage (`app.secretStorage`, §3), as **one secret per
   vault**.
-  - Id: `"yaos-" + hex(sha256(utf8(vaultId)))[0..32]` (ids are lowercase alphanumeric plus dashes). The vaultId is
-    hashed because the mobile store is shared across vaults (§3).
+  - Id: `"yaos-" + hex(base64urlDecode(vaultId))`: the vaultId's 16 bytes in lowercase hex, 37 chars. SecretStorage
+    ids must match `/^[a-z0-9-]+$/` and be at most 64 chars, and the vaultId's own case-sensitive base64url
+    alphabet does not fit. Hex of its bytes does, with no hash: the main thread never hashes (DESIGN §d.2, §k.2). The
+    id is per vault because the mobile store is shared across vaults (§3).
+  - **Strict vaultId.** The client accepts a vaultId only if it is exactly 22 chars of canonical base64url (16 bytes;
+    server/src/vaultId.ts `VAULT_ID_PATTERN`, DECISIONS §2.1; canonical means the 4 unused low bits of the last char are
+    0, as the server's `randomBase64Url(16)` mints it). Canonical makes the id and its bytes one-to-one, so one secret
+    id names one vault. The enroll response (`readEnrollment`), data.json (`sanitizeIdentity`, the creation marker) and
+    `secretIdFor` all refuse anything else, untrimmed and unrepaired. The setup link never carries a vaultId
+    (`parseSetupLink` rejects one), so neither the server nor the link can name another vault's secret.
   - Value: JSON `{ "v": 1, "vaultId", "suite": 1, "keys": [{ "e", "k": b64url(K_e) }], "records": [b64url(k record)] }`.
   - The records are kept so they can be re-published after a reset or restore (§11.5). They are not secret.
   - Value size limits **[U]** (WP-E0, §23.3).
@@ -270,11 +278,13 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
     arrives from an authenticated source (§12.4). Nothing the server says sets or lowers a pin.
   - A pin is never lowered: 1 → 0 does not exist (§15.2).
 - **Startup.** `getSecret` may return null before the store has loaded. Wait for SecretStorage's `changed` event
-  for up to 5 s before deciding the key is missing. The store loads everything at app start, then fires `changed`
-  ([S] asar).
+  for up to 5 s (`KEY_STORE_WAIT_MS`) before deciding the key is missing. The store loads everything at app start,
+  then fires `changed` ([S] asar). A suite-1 start waits; an unpinned or suite-0 start reads nothing.
 - **Linux desktop without an OS keyring.** SecretStorage stores plaintext and Obsidian shows
-  `msgSecretsNotEncrypted` ([S] asar). YAOS adds a persistent status notice, and the vault-folder trust level
-  applies.
+  `msgSecretsNotEncrypted` ([S] asar). YAOS tells the user once per vault, with a notice the first time it stores or
+  loads a key on such a device (`isEncryptionAvailable()` is false; runtime-only, not in obsidian.d.ts). The
+  "shown" flag lives in the vault's local storage (`App.loadLocalStorage` / `saveLocalStorage`), never in
+  `data.json`. The vault-folder trust level applies.
 - **Forget keys** (leave the vault or disable the device) writes `""`. There is no delete API. Whether `""` is
   accepted is **[U]**.
 - **Trust.** Any plugin in the vault can read any secret. Non-extractable CryptoKeys are hygiene, not a boundary:
@@ -643,9 +653,12 @@ client mark-and-sweep against the server's list and batch conditional delete (se
   one sweep in the worker, one notice. It says what was deleted, what was kept as newer, what was repaired or
   lost, or why nothing was deleted (`src/host/ui/attachmentsCleanup.ts`). There is no schedule, status row,
   settings row or progress UI.
-  - Path: `src/engine/compose/runtimeOps.ts:129-130` → `src/engine/runtime/blobGc.ts` (preconditions, live set)
+  - Path: `src/engine/compose/runtimeOps.ts:148-151` → `src/engine/runtime/blobGc.ts` (preconditions, live set)
     → `src/engine/blobs/gc.ts` (sweep).
-  - It runs in the writer runtime, which exists only once the suite is pinned (WP-E4 `PinGate.writerPorts`).
+  - It runs in the writer runtime (a VaultRuntime), which exists only while `PinGate` is open
+    (`src/engine/compose/pinGate.ts:148-162`, §12.4). A closed device (unpinned, or suite 1 without the newest
+    winner's key) runs the KeyReader instead, which answers the command `refused: "keys-unverified"` with zero
+    counts (`src/engine/compose/keyReader.ts:188-191`).
   - One sweep at a time (`busy`); engine stop aborts it (`interrupted`).
 - **Grace** `EngineTuning.blobGcGraceMs` = 7 days (`src/engine/runtime/options.ts:56-60`, `:87`). It is a tuning
   knob: the e2e uses 8 s.
@@ -655,15 +668,21 @@ computed from a partial view would delete live data.
 
 | Refusal | Check | Where |
 |---|---|---|
-| `no-store` | The vault has a blob store (VAULT_READY `attachments`) | `src/engine/runtime/blobGc.ts:97` |
-| `keys-unverified` | Suite 1: the sealing epoch is ≥ 1 and verified, and so is K_1, because addresses use the kAddr of K_1 (§5.1) | `:98-103` |
-| `offline`, `read-only` | A relay session, and it is writable | `:104-105` |
-| `not-caught-up` | `ns`, `cfg` and `snap` are read to the relay's head now, in this session (`SessionLoop.readFresh`, `src/engine/runtime/sessionLoop.ts:279-300`), and none is stale | `:115-117` |
-| `fold-incomplete` | No quarantined `ns` / `cfg` / `snap` row. Every fold is complete: not halted, its snapshot decodes, and each tail row opened, passed the gate, decodes, is folded and (for `snap`) has a known record version (`FoldRuntime.gap`, `src/engine/sync/foldRuntime.ts:162-184`; `src/engine/sync/snapRuntime.ts:51`) | `:118-124` |
-| `body-unreadable` | Every body/canvas row the relay still serves opens for this reader. A reader-dependent failure (`isReaderDependent`, `src/engine/ingest/envelope.ts:58`: unsupported version or suite, unknown key, a bad tag under an unverified key) may hide a ref, so it refuses. A deterministic failure is skipped, because no reader can resolve it | `:150-151`, `src/engine/blobs/bodyRefs.ts` |
+| `no-store` | The vault has a blob store (VAULT_READY `attachments`) | `src/engine/runtime/blobGc.ts:100` |
+| `keys-unverified` | Suite 1: the sealing epoch is ≥ 1 and verified, and so is K_1, because addresses use the kAddr of K_1 (§5.1). And the in-session write gate is open (`writeGate.ts`): a device revoked mid-session, or behind a newer winner it has no key for, is refused before it lists, because its deletes would be refused anyway | `:101-108` |
+| `offline`, `read-only` | A relay session, and it is writable | `:109-110` |
+| `not-caught-up` | `ns`, `cfg` and `snap` are read to the relay's head now, in this session (`SessionLoop.readFresh`, `src/engine/runtime/sessionLoop.ts:279-300`), and none is stale | `:120-122` |
+| `fold-incomplete` | No quarantined `ns` / `cfg` / `snap` row. Every fold is complete: not halted, its snapshot decodes, and each tail row opened, passed the gate, decodes, is folded and (for `snap`) has a known record version (`FoldRuntime.gap`, `src/engine/sync/foldRuntime.ts:162-184`; `src/engine/sync/snapRuntime.ts:51`) | `:123-128` |
+| `body-unreadable` | Every body/canvas row the relay still serves opens for this reader. A reader-dependent failure (`isReaderDependent`, `src/engine/ingest/envelope.ts:58`: unsupported version or suite, unknown key, a bad tag under an unverified key) may hide a ref, so it refuses. A deterministic failure is skipped, because no reader can resolve it | `:155-156`, `src/engine/blobs/bodyRefs.ts` |
 | `addressing-mismatch` | Safety net: nothing is deleted until the listing shows one of the addresses that the committed folds reference (else any live one). A listing that never shows one refuses. This guards against a wrong suite or key, under which every live address looks unknown | `src/engine/blobs/gc.ts:117-118`, `:150`, `:153-155` |
 
-**Live set** (`src/engine/runtime/blobGc.ts:125-152`). The `blobAddress` of:
+- **K_1 after a roll.** A device that joins at epoch ≥ 2 (installKey by QR or RK) still gets K_1 verified: the
+  keyring opens each winner's `prevWrap` with the next epoch's verified key and checks the kcv
+  (`src/engine/keyring/evaluate.ts:104-122`, `:150-151`). So the K_1 condition does not lock out late joiners, and
+  GC keeps requiring it (test: `src/engine/compose/keyReader.test.ts:227`, a QR join at epoch 2 and an RK join
+  at epoch 3; e2e: `e2e/client/e2ee.ts` step 5).
+
+**Live set** (`src/engine/runtime/blobGc.ts:130-157`). The `blobAddress` of:
 - every ns entry's blob, tombstones included. Tombstones stay in the fold until the count-based prune
   (`TOMBSTONE_CAP` 20000, hysteresis 1000; `src/core/limits.ts:20-21`, `src/core/ns/fold.ts:224-226`);
 - every `cfg` file blob, and every part of every record in the `snap` fold. A `del` removes the record, and
@@ -688,7 +707,7 @@ computed from a partial view would delete live data.
    so the store re-checks the upload time and a re-upload meanwhile answers `newer`.
 4. R4 repair (below).
 5. Delete the probe. This is best effort: a stray probe is garbage for a later sweep.
-6. Prune put times older than grace/2 (`src/engine/runtime/blobGc.ts:87-90`).
+6. Prune put times older than grace/2 (`src/engine/runtime/blobGc.ts:90-93`).
 
 **Races.**
 - **R1, clock skew.** `uploadedAt` is R2's clock, so a device clock days ahead must not shrink the grace.
@@ -956,6 +975,15 @@ none is something the server says.
 - `data.json` holds `e2ee` as one of: absent (unpinned), `{suite: null, keyringSeen: true}`, `{suite: 0}` or
   `{suite: 1}`. `keyringSeen` is sticky. It is set the first time an unpinned device reads a `k` genesis for its
   vault, and from then on (ii) is refused.
+- **No migration, no inference.** A `data.json` without `e2ee` is unpinned, whatever else it holds. A device paired
+  before this design (a stored identity, a synced vault, a full IndexedDB) is blocked like any key-less join and is
+  settled only by (i) or (ii). There is no "absent means suite 0" rule. Nothing is inferred from a stored pairing,
+  from local state or from anything the server says. Leaving the vault (unpair, another vault or relay) drops the
+  pin and forgets the keys (§6.1).
+- **Harnesses pin explicitly.** The sim and e2e harnesses either set the pin the way a real device gets it, or use
+  a clearly test-only fixture that writes the same `data.json` state the real flow writes
+  (`src/host/keys/testkit/pinFixture.ts` applies main's own suite-0 transition). `scripts/check-deps.mjs` keeps
+  `testkit/**` out of product code, so no production path can pin by fixture.
 
 **Key-less join.** This is any enrollment by a code that arrived without `key` or `suite`:
 - a code typed into the pair modal;
@@ -1007,6 +1035,44 @@ The mitigations:
 
 What no longer exists is **downgrade by omission**. A user who does what the honest console says, and scans its
 QR, ends up blocked, not downgraded.
+
+**As built (WP-E4, with E3 integrated).**
+- **One gate at start: `PinGate`** (`src/engine/compose/pinGate.ts:128-168`).
+  - It is open for suite 0, and for suite 1 once `Keyring.open` over the records main stored reports
+    `keyMissing() === null`: the adapter holds the newest stored winner's key, verified against its record
+    (`:117-126`). Unpinned is closed.
+  - `writerPorts` (`:159-162`) throws while the gate is closed, and it is the only way to the ports of a
+    VaultRuntime (`src/engine/compose/protocolEngine.ts:230-233`). So a closed device cannot build the one thing
+    that writes.
+- **A closed device runs the KeyReader** (`src/engine/compose/keyReader.ts`) over `readerPorts` (`pinGate.ts:165-167`).
+  - Its ports: a relay that connects and reads (`append` throws, `putCheckpoint` rejects; on the creation path it
+    appends on `k` only, for the enableE2ee genesis), a clock, a random source, and the adapter's key operations
+    without seal, open or any blob op. No storage, blob or hash port reaches it.
+  - It reads `k` to head, and again on every live `k` frame.
+  - It answers `installKey` (QR or RK; the secret buffer is zero-filled), `pinSuite0` and `enableE2ee`, and refuses
+    `revokeRekey`. `cleanUpAttachments` gets `refused: "keys-unverified"` (`keyReader.ts:186-211`).
+- **Two ways out of the reader, by pin:**
+  - **Unpinned.** A verified key goes to main as `keyringChanged`. Main stores it in SecretStorage
+    (`src/host/keys/hostKeys.ts:57-70`; on a suite-0 pin it answers `refused`, `:60`). `pinsFromKeyring`
+    (`src/host/keys/pin.ts:152-154`) then pins suite 1, and saves the pin before the engine gets `keyringStored`.
+    Main then restarts the engine with the pinned config (`src/host/pluginController.ts:305-310`). A successful
+    `enableE2ee` or `pinSuite0` pins the same way (`:294-299`).
+  - **Suite 1 without the key** (`"no-key"`, `"revoked-epoch"`). Once main has stored the key, the reader's `onKeyed`
+    re-checks the gate, and the engine starts its VaultRuntime in the same process (`protocolEngine.ts:298-310`).
+    No restart is needed.
+- **`keyringSeen` is sticky.** Main saves it the first time an unpinned engine's status reports it
+  (`pluginController.ts:186-189`).
+- **Once open, the in-session write gate decides** (`src/engine/keyring/writeGate.ts`). It covers what can shut
+  writes later in a session: an open revoke, a newer winner without its key, or `k` not read yet.
+  - The runtime's crypto and blob ports are `gatedCrypto` and `gatedBlob` (`src/engine/runtime/context.ts:116-117`).
+  - Every writer uses them: the sender, doc frames, the BlobQueue and the SnapshotJob
+    (`src/engine/compose/vaultRuntime.ts:226`, `:243`). Blob GC also refuses up front while the gate is shut
+    (`src/engine/runtime/blobGc.ts:107-108`).
+- **Tests:**
+  - `src/engine/compose/pinGate.test.ts`, `keyReader.test.ts`, `src/host/keys/{pin,hostKeys}.test.ts` and
+    `src/host/pluginController.test.ts`;
+  - the at-rest scan (`src/host/keys/atRest.test.ts`, §20.3);
+  - `e2e/client/e2ee.ts`, which runs suite 1 end to end through the real controller on the local relay.
 
 ## 13. Recovery key
 
@@ -1082,11 +1148,23 @@ vault. Any local copy of the files on disk can seed a new vault.
    devices are already enrolled. Each other device scans it, or enters the RK. It checks kcv against `k`
    (§11.3), stores K_r and leaves `key-missing`.
 4. **Own frames sealed under an epoch < r that commit after S_rot** are stale (§14.3), so readers ignore them.
-   Their author handles them as in `refused frame-id-conflict` (DESIGN §i.6 table):
-   - body: re-seal the same update under a fresh clientFrameId, since Yjs updates are idempotent;
-   - ns and cfg: re-plan the ops under a fresh frame id.
-
-   Unsent outbox frames under an epoch < r are re-sealed under r before sending.
+   As implemented (WP-E3; `src/engine/sync/ingestRow.ts` `ownCommitCopy`, `src/engine/store/repo.ts` `settleOwn`,
+   `src/engine/runtime/reseal.ts`), there is no re-plan:
+   - When the receipt of an own frame comes back stale, or held (§14.3, the device has not judged every `k` row
+     below it), the author stores the row as a reader would and renames the outbox record to an **unsealed copy**:
+     a fresh clientFrameId, empty `sealed`, state pending, and the **same frameNo**. If a held row settles as not
+     stale after all, readers fold the copy as `replay-duplicate`, so ns and cfg ops apply once.
+   - **Unsent or uncommitted outbox records** with `keyEpoch < r`, and the copies, are re-sealed under the
+     current epoch before sending (`OutboxChange {t: "reseal"}`):
+     - ns and cfg, and copies, keep their clientFrameId. The sender opens ns and cfg only after the session's
+       late-receipt reads, so one still in the outbox then never committed;
+     - every other record takes a fresh clientFrameId (a rename at the same outbox order; held dependents are
+       re-pointed), since its old id may have committed with other bytes (R4 `frame-id-conflict`). Yjs updates and
+       chunks are idempotent, so a duplicate is harmless.
+   - A suite-1 sender is write-blocked until the session's `k` read, so an offline device learns r before it sends
+     anything sealed under an older epoch.
+   - Unsealed copies are not mirrored (`selectMirrorFrames`): a mirror recovery re-derives them from disk.
+   - `refused frame-id-conflict` for ns and cfg still poisons, as in DESIGN §i.6.
 5. **Checkpoints.** Nothing is forced. New checkpoints are sealed under r at the normal cadence (DESIGN §d.9
    checkpoint policy). Old checkpoints with coversSeq ≤ S_rot stay valid.
 
@@ -1096,7 +1174,18 @@ For the winning revoke epoch r, committed at S_rot in the current vaultEpoch:
 - a frame with `keyEpoch < r` and `seq > S_rot` is **stale**: ignored, not quarantined (§9.3);
 - a checkpoint with `keyEpoch < r` and `coversSeq > S_rot` is rejected (treated as absent).
 
-Devices that have not re-keyed still learn r from the record header, so they apply the rule too.
+As implemented (WP-E3, `KeyringRuntime.staleCheck`), the rule is decided when the gate judges the row, and the
+answer is `"stale"`, `"hold"` or null (always null under suite 0):
+- **Hold** means the device cannot judge yet. It applies to a row at seq s if some `k` row below s has arrived but
+  is not judged, if `k` was not read on this session, or if the `k` stream is itself stale. A held ns or cfg row is
+  stored unopened (`LOCAL_FLAG_UNOPENED`) and halts the fold; a held body row is quarantined `"keyring-hold"`, which
+  freezes the doc until it settles. A live batch ends after a `k` event, so rows behind a revoke wait for it.
+- **Devices that have not re-keyed** do not learn r from the record header alone: an open revoke (a winning revoke
+  for an epoch whose key the device lacks) shuts the write gate (`revoked-epoch`) and holds every row past it.
+  When the re-key QR or RK arrives (§14.2 step 3), the held and unopened rows are re-gated: stale ones are
+  dismissed and rows under r open.
+- A stale ns or cfg row is stored with `LOCAL_FLAG_STALE_EPOCH` and empty content and folds as `"stale-epoch"`;
+  a stale body, canvas or `x` row is only accounted: ignored, with no quarantine and no freeze (§9.3).
 
 - **After a reset or restore**, S_rot is the seq of the re-published revoke record (§11.5). Between the new
   vaultEpoch's first row and that re-publish, the server could inject old-epoch frames that the revoked device
@@ -1376,8 +1465,8 @@ export interface KeyringCrypto {
   - padding (§7.3) is applied when `suite ≠ 0`, between the inner encoding and `seal`, and stripped after `open`;
   - `sealEnvelope` / `openEnvelope` are the one seal/open implementation (`src/engine/ingest/envelope.ts` wraps
     them). They check the kind against the stream class; checkpoint *content* checks (coversSeq, encoding, size)
-    stay in the ingest gate. Until WP-E3 the keyring stream `k` is treated like an unknown class: the codec
-    answers `kind-stream-mismatch` and the gate ignores `k` rows.
+    stay in the ingest gate. Since WP-E3, `k` rows are not envelopes: the gate stores them as `keyRecord` tail
+    rows and the keyring decodes them (§11.1).
 - `src/core/types.ts`:
   - `NsFoldState` and `CfgFoldState` gain `readonly replay: Map<DeviceId, { r: number; bits: bigint }>` (64-bit
     window);
@@ -1387,15 +1476,17 @@ export interface KeyringCrypto {
   - `MAX_FRAME_CONTENT_BYTES` (:49, today 1 MiB − 4 KiB) → 1015808 (§7.3);
   - new `MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 10223615`;
   - new `REPLAY_WINDOW = 64` and `PADME_FLOOR_BYTES = 256` (WP-E2);
-  - `ROLL_SEQ_SPAN = 2 ** 23` and `ROLL_OWN_SEALS = 2 ** 22` land with the roll (WP-E3), `KEY_STORE_WAIT_MS = 5000`
-    with host key storage (WP-E4): constants arrive with their first user.
-- `QuarantineReason` (`src/engine/store/schema.ts:186`) gains `"crypto-downgrade"` and `"envelope-padding"`.
+  - `ROLL_SEQ_SPAN = 2 ** 23` (:89) and `ROLL_OWN_SEALS = 2 ** 22` (:91) landed with the roll (WP-E3);
+    `KEY_STORE_WAIT_MS = 5000` lands with host key storage (WP-E4): constants arrive with their first user.
+- `QuarantineReason` (`src/engine/store/schema.ts:220`) gains `"crypto-downgrade"` and `"envelope-padding"` (WP-E2),
+  and `"stale-epoch"` (a stale checkpoint, treated as absent) and `"keyring-hold"` (§14.3 undecided; re-gated after
+  the next keyring change) (WP-E3).
 
 ### 18.3 IndexedDB (`src/engine/store/schema.ts`)
 
 | Store / record | Change |
 |---|---|
-| `OutboxRecord` (:156) | + `frameNo: number \| null` (ns/cfg; WP-E2). + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2) lands with the re-seal in WP-E3 |
+| `OutboxRecord` (:156) | + `frameNo: number \| null` (ns/cfg; WP-E2). + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2 step 4; WP-E3). An empty `sealed` is an unsealed copy of an own stale commit, sealed before sending |
 | `TailRecord` | + `frameNo: number` (0 outside ns/cfg and for rows that failed the gate; WP-E2). Own rows carry the allocator's max across restarts (§8.2) |
 | `MetaRecord` | + `MetaKeyring {key: "keyring"; sealEpoch; epochs: {e, firstSeq, kind, verified}[]; revokeEpoch: number \| null; sRot: Seq \| null; ownSeals: number}`. **No key bytes** (§6.1) |
 | `MetaRecord` | + `MetaFrameNoFloor {key: "frameNoFloor"; ns: number; cfg: number}`, written by epoch migration (§8.2) |
@@ -1422,15 +1513,30 @@ readonly crypto:
 | { readonly t: "pinSuite0"; readonly source: "link" | "create" }             // §12.4 (ii) / (iii): ok only if `k` is empty at head
 | { readonly t: "revokeRekey"; readonly rk: Uint8Array }                      // §14.2; a new RK is generated on main
 
-// EngineToMain (:187) gains:
-| { readonly t: "keyringChanged"; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
+// EngineToMain (:187) gains (a request, like hostIo: main answers `result` or `error` with the same rid):
+| { readonly t: "keyringChanged"; readonly rid: RequestId; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
     readonly records: readonly Uint8Array[]; readonly pending: number | null }   // main persists before replying
+
+// MainResultValue gains the reply:
+| { readonly t: "keyringStored" }   // keyringChanged is stored (persist-before-use)
+
+// ProtocolErrorCode gains:
+| "refused"   // a key or pin command the device's pin, state or `k` does not allow; also main's answer to a
+              // keyringChanged it must not store (a suite-0 pin). Not retryable.
+// PROTOCOL_VERSION 2 → 3.
 ```
+
+- **`keyringSeen` is not in `init.crypto`** (the shape above is kept verbatim). The engine starts with
+  `keyringSeen: false` and reports it in `status.e2ee` once it reads a `k` record; main stores the sticky flag
+  from there and enforces it when it handles `pinSuite0 {source: "link"}`
+  (`src/engine/compose/vaultRuntime.ts` `e2eeOf`).
 
 - `status.ts`: `EnginePhase` gains `"key-missing"`, already named in DESIGN §c.3. `StatusSnapshot` gains
   `e2ee: { suite: 0 | 1 | null; sealEpoch: number; keyMissing: "no-pin" | "no-key" | "revoked-epoch" |
   "encrypted-vault" | null; keyringSeen: boolean; creatable: boolean }`. There are no secrets in status.
   - `suite: null` is an unpinned device (§12.4).
+  - `StatusSnapshot.e2ee` is declared optional only so that older snapshot literals type-check; the engine always
+    sets it.
   - `creatable` is true only for an engine started with `creating: true` that has read `VAULT_READY.head = 0` and
     an empty `k` (§15.1 step 3).
   - **The engine never sets a pin.** Main sets it from (i) `keyringChanged` after a verified key, (ii) and (iii)
@@ -1440,6 +1546,20 @@ readonly crypto:
 - **Persist-before-use.** The engine does not seal under a new epoch until main acknowledges `keyringChanged`
   (the result of the same rid). A crash can therefore never leave committed rows under a key no device stored.
 - The RK and QR keys are generated and shown on main (UI). The worker never displays them, and main never logs them.
+- SECRET buffers (`init.crypto` keys, the command's `k` / `rk`, `keyringChanged` keys) are always in the transfer
+  list, and the sender zero-fills whatever it still holds after posting (`wipeSecrets`, `src/protocol/workerTransport.ts`).
+  A command main refuses itself is zero-filled on main and never posted.
+- **Unpinned engine and suite 1 without the key (WP-E4).** `PinGate` (`src/engine/compose/pinGate.ts:128-168`)
+  hands a VaultRuntime its ports only for suite 0, or for suite 1 once the stored keyring has the newest winner's
+  key verified (`keyMissing() === null`, `:117-126`). Any other start runs the KeyReader (`keyReader.ts`).
+  - Its relay session is read-only: `canWrite` is false, `append` throws, `putCheckpoint` rejects. The exception
+    is the creation path, where it may append on `k` only, for the genesis.
+  - It gets no storage, blob or hash port, and only the adapter's key operations, so it cannot write a frame,
+    checkpoint, blob, ns entry, outbox or mirror.
+  - It answers the key commands (§12.4 "As built"), and refuses `cleanUpAttachments` with
+    `refused: "keys-unverified"` (`keyReader.ts:188-191`).
+  - On an unpinned device, main pins suite 1 from the stored `keyringChanged` and restarts the engine. A suite-1
+    device opens in the same process once main stores the key (`protocolEngine.ts:298-310`).
 
 ### 18.5 relay-wire.md
 
@@ -1595,6 +1715,15 @@ Each test counts outcomes and asserts **all** of them; none samples a single cas
 - **At-rest leak check (desktop, WP-E4):** after an integration run, grep the IndexedDB LevelDB, `data.json`,
   the diagnostics bundle and the logs for every key and the RK in hex and base64url. Expect zero hits (the same
   method found Chrome's plaintext CryptoKey bytes, §3).
+  - The sim form runs in `test:client` (`src/host/keys/atRest.test.ts`): it scans the fake IndexedDB, `data.json`
+    saves, side files, local storage, the vault, logs, statuses, notices and relay rows for raw bytes, hex,
+    base64(url), decimal lists and typed-array JSON, outside the vault's own SecretStorage entry. It reports counts
+    only. A second test runs a key-holding suite-1 VaultRuntime (enableE2ee, a join by RK, `revokeRekey` to K_2)
+    and adds both diagnostics bundles (with and without paths) and their formatted text to the scan.
+  - The e2e form (`e2e/client/e2ee.ts`, local relay with `--r2`) scans the same encodings after a run of every key
+    flow. It covers the diagnostics bundles, `data.json`, the fake IndexedDB, logs, statuses and notices, the
+    vault, side files, the relay's state dir (DO SQLite and emulated R2) and its log, and its own results file.
+    Positive controls prove that both scans find a key where one is.
 
 ## 21. Work packages
 
@@ -1615,6 +1744,39 @@ There is one agent per package. Sizes: S ≈ 1 agent-day, M ≈ 2–3, L ≈ 4�
 | **E8** Docs | Apply §18.5 and §18.6 to relay-wire.md and DESIGN.md | E2 merged | Docs match the code | S |
 
 Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b needed A3 (done).
+
+**E3 as built** (where the code differs from the text above; the sections cited are updated):
+- §18.4 protocol shapes landed with E3, not E4: `init.crypto`, the five UserCommands, `keyringChanged` (with a
+  `rid`), the `keyringStored` reply, the `"refused"` error code, `StatusSnapshot.e2ee` and phase `key-missing`.
+  With E4 integrated, main stores `keyringChanged` (refusing it only on a suite-0 pin) and starts each device
+  from its pin (§12.4 "As built").
+- One write gate (`src/engine/keyring/writeGate.ts`): while `keyMissing` is set, the engine's crypto port
+  (`gatedCrypto`) refuses to seal and its blob port (`gatedBlob`) refuses to upload or delete; the sender holds the
+  outbox, doc frames are not closed and maintenance writes no checkpoint. The BlobQueue, the SnapshotJob and blob
+  GC use the gated ports too (§12.4 "As built"). An open revoke shuts it (`revoked-epoch`).
+  There is no "absent means suite 0" default anywhere in the engine.
+- §14.3 is decided at gate time with hold and re-gate; own stale commits become unsealed copies (§14.2 step 4).
+  Unopened rows are re-gated after every keyring change, which also ends the old halt on ns rows under an
+  unknown key.
+- An RK that does not open a genesis or revoke `recoveryWrap` leaves the record pending, not invalid: a wrong or
+  older RK cannot be told from a forged wrap (`src/engine/keyring/evaluate.ts:85`). A device that only has an RK
+  older than the latest revoke needs the re-key QR.
+- An in-engine runtime restart (a new vaultEpoch, or a retry) reuses the ports, so the crypto port keeps keys
+  learned since init.
+
+**E4 integration as built** (E3's names and shapes are kept; §12.4 "As built" and §18.4 hold the details):
+- **One gate for closed devices.** `PinGate` covers both unpinned devices and suite-1 devices without the key. The
+  separate suite-1 "closed until E3" path is gone. A suite-1 device opens in process once main stores its key;
+  an unpinned one is pinned by main and restarted.
+- **One in-session gate.** It is `writeGate.ts`, and every blob write, the BlobQueue's and the SnapshotJob's
+  included, now goes through `gatedBlob`/`gatedCrypto`. Blob seals count toward the §4.2 roll trigger like frame
+  seals.
+- **Host keys.** `HostKeyring.persist` is the `keyringChanged` round trip. Main merges the change into
+  SecretStorage, replacing a re-exported key for the same epoch (`src/host/keys/secretStore.ts`), and pins only on
+  an unpinned device with nothing pending.
+- **K_1 after a roll** verifies down the prevWrap chain, so blob GC keeps requiring it (§10.4).
+- **End to end:** `e2e/client/e2ee.ts` (enableE2ee, installKey by QR and RK, a sealed note and attachment, a console
+  revoke plus re-key, a post-roll join, GC, leak scan) on the local relay.
 
 ## 22. Decisions (resolved)
 

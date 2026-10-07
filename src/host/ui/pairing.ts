@@ -8,6 +8,7 @@
  * SECRETS: deviceToken and pairing codes never appear in thrown messages or progress text.
  */
 
+import { isVaultId } from "../../core/codec/ids";
 import type { PairedIdentity } from "./api";
 import { errorMessage } from "./format";
 
@@ -363,7 +364,8 @@ export async function runEnrollment(attempt: EnrollmentAttempt, deps: PairingDep
 function readEnrollment(attempt: EnrollmentAttempt, json: unknown): PairedIdentity {
 	const r = asRecord(json);
 	const incomplete = (): PairingError => new PairingError("The server returned incomplete pairing details.", "enroll_response_invalid", 200);
-	if (typeof r.vaultId !== "string" || !r.vaultId.trim() || r.vaultId.length > 256) throw incomplete();
+	// Exactly a vaultId (22-char canonical base64url, server DECISIONS §2.1); the server's word is not enough.
+	if (typeof r.vaultId !== "string" || !isVaultId(r.vaultId)) throw incomplete();
 	if (r.deviceId !== undefined && r.deviceId !== attempt.deviceId) throw incomplete();
 	// The server echoes the token it hashed; a different value means a broken or hostile response.
 	if (r.deviceToken !== undefined && r.deviceToken !== attempt.deviceToken) throw incomplete();
@@ -380,7 +382,7 @@ function readEnrollment(attempt: EnrollmentAttempt, json: unknown): PairedIdenti
 	const vaultGeneration = typeof r.vaultGeneration === "string" && r.vaultGeneration.trim() ? r.vaultGeneration : null;
 	return {
 		host: attempt.host,
-		vaultId: r.vaultId.trim(),
+		vaultId: r.vaultId,
 		deviceId: attempt.deviceId,
 		deviceToken: attempt.deviceToken,
 		deviceName,

@@ -45,6 +45,12 @@ export class CfgRuntime extends FoldRuntime<CfgOp, CfgFoldEvent> {
 		return { events: foldCfgFrame(this.state, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, frameNo: row.frameNo ?? 0, ops }), halted: false };
 	}
 
+	protected foldStale(row: TailRecord): readonly CfgFoldEvent[] {
+		if (row.seq <= this.state.coversSeq) return [];
+		this.state.coversSeq = row.seq;
+		return [{ seq: row.seq, index: -1, deviceId: row.deviceId, clientFrameId: row.clientFrameId, register: null, outcome: { t: "ignored", reason: "stale-epoch" } }];
+	}
+
 	encodeState(): Uint8Array {
 		return encodeCfgFoldV1(this.state);
 	}

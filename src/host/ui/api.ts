@@ -9,6 +9,8 @@ import type { EngineSettings, UserCommand, EngineResultValue } from "../../proto
 import type { StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
 import type { TrashMode } from "../../ports/vault";
+import { isVaultId } from "../../core/codec/ids";
+import { sanitizeCreating, sanitizePin, type CreatingMarker, type E2eePin } from "../keys/pin";
 import {
 	DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, normalizeDeviceName, normalizeHost, normalizePairingCode,
 	type EnrollmentAttempt,
@@ -39,6 +41,13 @@ export interface YaosPluginData {
 	 * identical request). Never logged or exported.
 	 */
 	readonly pendingEnrollment?: EnrollmentAttempt;
+	/**
+	 * The suite pin (e2ee-design §6.1, §12.4; not secret). Absent = unpinned: the device writes nothing until main
+	 * pins it from an authenticated source (src/host/keys/pin.ts). Only the controller writes it.
+	 */
+	readonly e2ee?: E2eePin;
+	/** §15.1 crash-recovery marker: this device created that vault and may still choose its encryption. */
+	readonly creating?: CreatingMarker;
 }
 
 export const MIB = 1024 * 1024;
@@ -141,12 +150,13 @@ export function sanitizeIdentity(raw: unknown): PairedIdentity | null {
 	} catch {
 		return null;
 	}
-	if (typeof r.vaultId !== "string" || !r.vaultId.trim() || r.vaultId.length > 256) return null;
+	// Exactly a vaultId (22-char canonical base64url, server DECISIONS §2.1): nothing trimmed, nothing else trusted.
+	if (typeof r.vaultId !== "string" || !isVaultId(r.vaultId)) return null;
 	if (typeof r.deviceId !== "string" || !DEVICE_ID_RE.test(r.deviceId)) return null;
 	if (typeof r.deviceToken !== "string" || !DEVICE_TOKEN_RE.test(r.deviceToken)) return null;
 	return {
 		host,
-		vaultId: r.vaultId.trim(),
+		vaultId: r.vaultId,
 		deviceId: r.deviceId,
 		deviceToken: r.deviceToken,
 		deviceName: typeof r.deviceName === "string" ? normalizeDeviceName(r.deviceName) : "",
@@ -181,13 +191,19 @@ export function sanitizePluginData(raw: unknown, fallbackLabel: string): YaosPlu
 		const r = asRecord(raw);
 		if (!r) return defaultPluginData(fallbackLabel);
 		const pending = sanitizePendingEnrollment(r.pendingEnrollment);
+		const identity = sanitizeIdentity(r.identity);
+		// A pin belongs to the vault the device is enrolled in: without one it is dropped (never inferred, §12.4).
+		const pin = identity ? sanitizePin(r.e2ee) : undefined;
+		const creating = sanitizeCreating(r.creating);
 		return {
 			version: 1,
-			identity: sanitizeIdentity(r.identity),
+			identity,
 			deviceLabel: sanitizeDeviceLabel(r.deviceLabel, fallbackLabel),
 			engine: sanitizeEngineSettings(r.engine),
 			showStatusBar: bool(r.showStatusBar, true),
 			...(pending ? { pendingEnrollment: pending } : {}),
+			...(pin ? { e2ee: pin } : {}),
+			...(creating ? { creating } : {}),
 		};
 	} catch {
 		return defaultPluginData(fallbackLabel);

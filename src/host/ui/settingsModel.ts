@@ -228,6 +228,7 @@ export function phaseLabel(phase: StatusSnapshot["phase"]): string {
 		case "revoked": return "Device access revoked";
 		case "epoch-migrating": return "Re-syncing after a server reset";
 		case "upgrade-required": return "Plugin update required";
+		case "key-missing": return "Encryption key missing";
 		case "error": return "Error";
 	}
 }

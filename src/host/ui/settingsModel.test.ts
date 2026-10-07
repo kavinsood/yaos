@@ -6,10 +6,11 @@ import {
 } from "./settingsModel";
 import { defaultPluginData, MIB, sanitizePluginData, TRASH_MODES, type PairedIdentity } from "./api";
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
+import { testVaultId } from "../keys/testkit/vaultIds";
 
 const TOKEN = "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const IDENTITY: PairedIdentity = {
-	host: "https://sync.example.com", vaultId: "vault-1", deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: TOKEN, deviceName: "Mac", vaultGeneration: null,
+	host: "https://sync.example.com", vaultId: testVaultId("vaultOne"), deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: TOKEN, deviceName: "Mac", vaultGeneration: null,
 };
 
 test("every control key reads back what it writes, through the sanitizer", () => {

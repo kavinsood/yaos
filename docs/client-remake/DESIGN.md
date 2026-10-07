@@ -1410,8 +1410,9 @@ All are in `src/core/types.ts`.
 
 ## g. Main ↔ worker protocol
 
-Types are in `src/protocol/*.ts`. `PROTOCOL_VERSION = 2` (2: the body protocol of §d.3 replaced Yjs updates on the
-binding path, and hashing moved to the engine).
+Types are in `src/protocol/*.ts`. `PROTOCOL_VERSION = 3` (2: the body protocol of §d.3 replaced Yjs updates on the
+binding path, and hashing moved to the engine; 3: `init.crypto`, the key commands and `keyringChanged` of
+e2ee-design §18.4).
 
 ### g.1 Carriers
 
@@ -2204,14 +2205,20 @@ These are enforced by `scripts/check-deps.mjs` (WP-D), a regex import scan run i
 - **Main-thread rules (§d.2).** The main thread holds CodeMirror state and raw disk I/O only.
   - `MAIN_FORBIDDEN` = `yjs`, `y-codemirror.next`, `y-protocols`, `lib0`. No `host/**` file may import them: not
     tests, not type-only imports.
+  - **No hashing on main.** `MAIN_FORBIDDEN_DIRS` = `core/hash`. No product `host/**` file may import `core/hash/**`,
+    type-only imports included. HostPorts has no HashPort (§h); every fingerprint, and the SecretStorage id
+    (e2ee-design §6.1, the vaultId's bytes in hex), is computed without one. Host tests may import it to compute
+    expected values: they are not main-thread code.
   - `mainReach` follows every product `host/**` module's relative imports through `core`, `ports` and `protocol`
-    (stopping at the two engine entries) and fails if a forbidden package is reachable.
+    (stopping at the two engine entries) and fails if a forbidden package or `core/hash/**` is reachable.
   - **Whole-document reads.** `FULL_READS` counts `.getValue(`, `.toString()`, `.sliceDoc(`, `.sliceString(`,
     `.getViewData(` and `Text.of(` per `host/**` file. Each occurrence must be listed in `FULL_READ_ALLOW` with the
     reason it is off the per-keystroke, per-remote-update and per-workspace-event paths, so a new one fails CI.
     Today the list is the bind upload's `sliceString` (binding.ts) plus three `toString()` calls on non-documents
     in host/ui.
 - `sim/**` may import anything. Nothing imports `sim/**` except tests.
+- Test-only support code (`testkit/` dirs, `*/testkit.ts`, `engine/runtime/testHarness.ts`) counts as test code.
+  Only tests and `sim/**` may import `testkit/**`.
 - Shared shapes change only through the architect files plus this document.
 
 ### k.3 Build plan (4 parallel work packages)

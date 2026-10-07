@@ -19,6 +19,7 @@ import type { RelayPort } from "../../ports/relay";
 import type { StoragePort } from "../../ports/storage";
 import type { SideFileName, SideFilePort } from "../../ports/vault";
 import { createNoopCrypto } from "../adapters/noopCrypto";
+import type { EngineE2ee } from "../keyring/keyringRuntime";
 import { createWebClock } from "../adapters/webClock";
 import { createWebHash } from "../adapters/webHash";
 import { createWebRandom } from "../adapters/webRandom";
@@ -90,6 +91,8 @@ export interface TestEngineOpts {
 	readonly sideFiles?: SideFilePort | null;
 	readonly tuning?: Partial<EngineTuning>;
 	readonly extra?: Partial<EngineOptions>;
+	/** The pin (e2ee-design §12.4). Default: suite 0, which only the suite-0 (noop) crypto port can run. */
+	readonly e2ee?: EngineE2ee;
 	/** Deterministic mode (see the header). The relay must run on the same clock. */
 	readonly clock?: VirtualClock;
 }
@@ -126,6 +129,7 @@ export async function startTestEngine(o: TestEngineOpts): Promise<{ engine: LogE
 		clientVersion: "test",
 		sideFiles: o.sideFiles ?? null,
 		tuning: { ...FAST_TUNING, ...(o.tuning ?? {}) },
+		e2ee: o.e2ee ?? { suite: 0 },
 		...(o.extra ?? {}),
 	}), o.clock);
 	return { engine, storage };

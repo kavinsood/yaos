@@ -93,13 +93,19 @@ describe("webCryptoSuite1: raw-key retention", () => {
 		const c = await createWebCryptoSuite1({ vaultId: VAULT, random, keys: [{ e: 1, k: init }] });
 		assert.deepEqual(init, new Uint8Array(32));
 		const mine = K2.slice();
-		await c.install(2, mine);
+		assert.equal(await c.install(2, mine), "installed");
 		assert.deepEqual(mine, new Uint8Array(32));
+		assert.deepEqual(c.exportForHost(), [], "an unverified installed key is never handed to the host (§12.4)");
+		c.markVerified(2);
 		assert.deepEqual(c.exportForHost(), [{ e: 2, k: K2 }], "init keys are already the host's");
 		await assert.rejects(c.install(0, K3.slice()), /bad key epoch/);
 		await assert.rejects(c.install(3, new Uint8Array(31)), /32 bytes/);
-		c.markVerified(2);
-		await assert.rejects(c.install(2, K3.slice()), /already verified/);
+		const other = K3.slice();
+		assert.equal(await c.install(2, other), "conflict", "a verified epoch is never replaced");
+		assert.deepEqual(other, new Uint8Array(32));
+		assert.equal(await c.install(2, K2.slice()), "same");
+		assert.deepEqual(c.keyState(2), { held: true, verified: true });
+		assert.equal(await c.install(1, K3.slice()), "installed", "an unverified epoch is replaced");
 		random.push(new Uint8Array(16));
 		await assert.rejects(c.generate(5), /32 bytes/);
 		await assert.rejects(c.wrap("recovery", 2, AAD), /recovery key required/);
@@ -130,5 +136,22 @@ describe("webCryptoSuite1: unwrap never throws on bad input", () => {
 		d.markVerified(2);
 		assert.equal(await d.unwrap("next", 2, AAD, next), true, "already verified: kept, not replaced");
 		assert.deepEqual(await d.kcv(2), await c.kcv(2));
+	});
+
+	it("never replaces a held key: true only when the payload is that same key, verified or not (§11.3)", async () => {
+		const { c, random } = await make([{ e: 1, k: K1 }, { e: 2, k: K2 }]);
+		nonces(random, 1);
+		const prevGood = await c.wrap("prev", 2, AAD); // K_1 under kWrap_2
+		const { c: o2, random: r2 } = await make([{ e: 1, k: K3 }, { e: 2, k: K2 }]);
+		nonces(r2, 1);
+		const prevForged = await o2.wrap("prev", 2, AAD); // K3 posing as K_1, same kWrap_2
+		for (const verified of [false, true]) {
+			const { c: d } = await make([{ e: 1, k: K1 }, { e: 2, k: K2 }]);
+			if (verified) d.markVerified(1);
+			const kcv1 = await d.kcv(1);
+			assert.equal(await d.unwrap("prev", 2, AAD, prevGood), true);
+			assert.equal(await d.unwrap("prev", 2, AAD, prevForged), false, `verified=${verified}`);
+			assert.deepEqual(await d.kcv(1), kcv1, "held K_1 untouched");
+		}
 	});
 });

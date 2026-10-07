@@ -33,6 +33,7 @@ function config(): EngineInitConfig {
 		relay: { url: "wss://example.invalid", credential: "x" },
 		settings: { excludePatterns: [], syncAttachments: true, maxAttachmentBytes: 1, syncSettings: false, trashMode: "obsidian-trash", provisionalBroadcast: false, snapshots: { enabled: false, keepDaily: 0, uploadToBlobStore: false } },
 		sideState: { outboxMirror: [], syncedMirror: [] },
+		crypto: { suite: 0 },
 	};
 }
 

@@ -73,6 +73,19 @@ export interface MetaRelayCheckpointDuty {
 	readonly streams: readonly StreamName[];
 }
 /**
+ * Keyring diagnostics and the roll counter (e2ee-design §18.3). No key bytes: keys and records live in the
+ * host's SecretStorage (§6.1); this is derived from them and from `k`.
+ */
+export interface MetaKeyring {
+	readonly key: "keyring";
+	readonly sealEpoch: number;
+	readonly epochs: readonly { readonly e: number; readonly firstSeq: Seq | null; readonly kind: number; readonly verified: boolean }[];
+	readonly revokeEpoch: number | null;
+	readonly sRot: Seq | null;
+	/** Own seals under sealEpoch (the §4.2 roll trigger). */
+	readonly ownSeals: number;
+}
+/**
  * When this device last PUT a blob address (e2ee-design §10.4 R2/R3), one record per address. Device wall
  * clock; a lost record or a time in the future reads as "not recent" (one extra PUT, never a skipped one).
  */
@@ -80,7 +93,7 @@ export interface MetaBlobPut {
 	readonly key: `blobPut:${string}`;
 	readonly atMs: number;
 }
-export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaBlobPut;
+export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------
@@ -143,7 +156,8 @@ export interface TailRecord {
 	readonly seq: Seq;
 	readonly deviceId: DeviceId;
 	readonly clientFrameId: ClientFrameId;
-	readonly kind: EnvelopeKind;
+	/** "keyRecord": a `k` row; content is the raw record (no envelope, e2ee-design §11), empty if over 256 B. */
+	readonly kind: EnvelopeKind | "keyRecord";
 	readonly authorNsSeq: Seq;
 	readonly flags: number;
 	/** Inner frameNo (e2ee-design §8.2): ≥ 1 for ns / cfg frames, else 0 (also for gate-failed rows). */
@@ -188,6 +202,12 @@ export interface OutboxRecord {
 	/** ns / cfg only: the frameNo sealed inside `sealed` (e2ee-design §8.2). null for other kinds. */
 	readonly frameNo: number | null;
 	/**
+	 * The key epoch in `sealed`'s header (0 under suite 0). The sender re-seals a record below the newest winning
+	 * revoke epoch before sending it (e2ee-design §14.2 step 4, runtime/reseal.ts). An empty `sealed` is a copy of
+	 * an own frame that committed stale: it is sealed under the current epoch before it is sent.
+	 */
+	readonly keyEpoch: number;
+	/**
 	 * held only: the frame this waits for (DESIGN §e.1): the doc's ns create
 	 * (released when it folds), the newest adoptable of the same stream
 	 * (released when that record is gone), or the last x: chunk of a
@@ -221,7 +241,14 @@ export type QuarantineReason =
 	| "oversize"
 	| "post-apply-limit"
 	| "canvas-invalid"
-	| "checkpoint-mismatch";
+	| "checkpoint-mismatch"
+	/** A checkpoint sealed under an epoch below the winning revoke, covering past S_rot (e2ee-design §14.3): absent. */
+	| "stale-epoch"
+	/**
+	 * §14.3 undecided for this reader: a revoke it cannot settle yet, or `k` rows not judged yet. Reader-dependent:
+	 * re-gated after the next keyring change.
+	 */
+	| "keyring-hold";
 
 export interface QuarantineRecord {
 	readonly stream: StreamName;

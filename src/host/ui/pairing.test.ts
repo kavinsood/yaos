@@ -8,8 +8,10 @@ import {
 	type HttpRequest, type HttpResponse, type PairingDeps,
 } from "./pairing";
 import type { PairedIdentity } from "./api";
+import { BAD_VAULT_IDS, testVaultId } from "../keys/testkit/vaultIds";
 
 const CODE = "pc_ABCDEFGHIJKLMNOPQRSTUVWX";
+const VAULT = testVaultId("vaultOne");
 
 function counterBytes(): (n: number) => Uint8Array {
 	let k = 0;
@@ -56,7 +58,7 @@ function okEnroll(req: HttpRequest): HttpResponse {
 	return {
 		status: 200,
 		json: {
-			host: "https://sync.example.com", deviceToken: b.deviceToken, vaultId: "vault-1", deviceId: b.deviceId,
+			host: "https://sync.example.com", deviceToken: b.deviceToken, vaultId: VAULT, deviceId: b.deviceId,
 			deviceName: b.deviceName ?? "Unnamed", vaultGeneration: "gen-7", originImport: false, principalId: "p1",
 			role: "owner", membershipRevision: 1, deviceCredentialRevision: 1, capabilities: [],
 		},
@@ -124,7 +126,7 @@ test("enroll: 200 posts the §2.4 body without auth and returns the identity", a
 	assert.match(String(body.enrollmentRequestId), ENROLLMENT_REQUEST_ID_RE);
 	assert.notEqual(body.deviceId, body.enrollmentRequestId);
 	assert.deepEqual(id, {
-		host: "https://sync.example.com", vaultId: "vault-1", deviceId: body.deviceId, deviceToken: body.deviceToken,
+		host: "https://sync.example.com", vaultId: VAULT, deviceId: body.deviceId, deviceToken: body.deviceToken,
 		deviceName: "My Mac", vaultGeneration: "gen-7",
 	});
 });
@@ -144,7 +146,7 @@ test("enroll: 202 authorization_fence_pending retries the identical request with
 	assert.equal(f.calls[1]!.body, f.calls[0]!.body);
 	assert.equal(f.calls[2]!.body, f.calls[0]!.body);
 	assert.deepEqual(f.sleeps, [1000, 2000]);
-	assert.equal(id.vaultId, "vault-1");
+	assert.equal(id.vaultId, VAULT);
 	assert.ok(f.progress.some((p) => p.includes("authorize")));
 });
 
@@ -188,7 +190,7 @@ test("enroll: network errors retry twice, then fail with a scrubbed message", as
 	assert.equal(f.calls.length, 3);
 	assert.deepEqual(f.sleeps, [1000, 2000]);
 	const g = fake([new Error("offline"), okEnroll]);
-	assert.equal((await runEnrollment(attempt, g.deps)).vaultId, "vault-1");
+	assert.equal((await runEnrollment(attempt, g.deps)).vaultId, VAULT);
 });
 
 test("enroll: error mapping", async () => {
@@ -222,7 +224,7 @@ test("enroll: error mapping", async () => {
 test("enroll: 503 vault_draining is retried", async () => {
 	const f = fake([{ status: 503, json: { error: "vault_draining" } }, okEnroll]);
 	const id = await enroll({ host: "https://sync.example.com", pairingCode: CODE, deviceName: "Mac" }, f.deps);
-	assert.equal(id.vaultId, "vault-1");
+	assert.equal(id.vaultId, VAULT);
 	assert.equal(f.calls.length, 2);
 });
 
@@ -237,6 +239,17 @@ test("enroll: rejects mismatched or incomplete 200 responses", async () => {
 	for (const respond of bad) {
 		const f = fake([respond]);
 		await assert.rejects(enroll({ host: "https://sync.example.com", pairingCode: CODE, deviceName: "Mac" }, f.deps), PairingError);
+	}
+});
+
+test("enroll: a 200 whose vaultId is not exactly 22-char canonical base64url is incomplete (the server's word is not enough)", async () => {
+	for (const vaultId of [...BAD_VAULT_IDS, 7, null]) {
+		const f = fake([(req) => ({ ...okEnroll(req), json: { ...(okEnroll(req).json as object), vaultId } })]);
+		await assert.rejects(
+			enroll({ host: "https://sync.example.com", pairingCode: CODE, deviceName: "Mac" }, f.deps),
+			(e: unknown) => e instanceof PairingError && e.code === "enroll_response_invalid",
+			JSON.stringify(vaultId),
+		);
 	}
 });
 
@@ -280,7 +293,7 @@ test("pairDevice checks capabilities before enrolling", async () => {
 
 const IDENTITY: PairedIdentity = {
 	host: "https://sync.example.com",
-	vaultId: "vault/1",
+	vaultId: VAULT,
 	deviceId: "dev_AAAAAAAAAAAAAAAA",
 	deviceToken: "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
 	deviceName: "Mac",
@@ -291,7 +304,7 @@ test("requestPairingCode sends Bearer + purpose device and builds the setup link
 	const f = fake([{ status: 200, json: { codeId: "c1", pairingCode: CODE, expiresAt: 1_700_000_900_000, purpose: "device-link", mobileSetupUrl: `https://sync.example.com/mobile-setup#x` } }]);
 	const grant = await requestPairingCode(IDENTITY, f.deps);
 	const call = f.calls[0]!;
-	assert.equal(call.url, "https://sync.example.com/vault/vault%2F1/auth/pairing-code");
+	assert.equal(call.url, `https://sync.example.com/vault/${VAULT}/auth/pairing-code`);
 	assert.equal(call.method, "POST");
 	assert.equal(call.headers?.Authorization, `Bearer ${IDENTITY.deviceToken}`);
 	assert.deepEqual(JSON.parse(call.body ?? ""), { purpose: "device" });
@@ -330,7 +343,7 @@ test("retireDeviceEnrollment: DELETE auth/device with the old Bearer token; 200 
 		await retireDeviceEnrollment(IDENTITY, f.deps);
 		assert.equal(f.calls.length, 1);
 		const call = f.calls[0]!;
-		assert.equal(call.url, "https://sync.example.com/vault/vault%2F1/auth/device");
+		assert.equal(call.url, `https://sync.example.com/vault/${VAULT}/auth/device`);
 		assert.equal(call.method, "DELETE");
 		assert.deepEqual(call.headers, { Authorization: `Bearer ${IDENTITY.deviceToken}` });
 		assert.equal(call.body, undefined);
@@ -367,7 +380,7 @@ test("parseSetupLink accepts host + pairing code only", () => {
 		{ action: "yaos", host: "https://sync.example.com" },
 		{ action: "yaos", pairingCode: CODE },
 		{ action: "yaos", host: "https://sync.example.com", pairingCode: CODE, deviceToken: "t".repeat(43) },
-		{ action: "yaos", host: "https://sync.example.com", pairingCode: CODE, vaultId: "v" },
+		{ action: "yaos", host: "https://sync.example.com", pairingCode: CODE, vaultId: VAULT }, // even a well-formed vaultId: the link never names the vault
 		{ action: "other", host: "https://sync.example.com", pairingCode: CODE },
 		{ action: "yaos", host: "http://sync.example.com", pairingCode: CODE },
 		{ action: "yaos", host: "https://sync.example.com", pairingCode: "short" },

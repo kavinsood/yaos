@@ -5,7 +5,7 @@
  * Ported from the old client's utils/randomId.ts, reworked to 16-byte base64url.
  */
 
-import type { ClientFrameId, ContentHash, DocId } from "../types";
+import type { ClientFrameId, ContentHash, DocId, VaultId } from "../types";
 import type { RandomPort } from "../../ports/random";
 import { CodecError, bytesToHex, hexToBytes } from "./lib0";
 
@@ -57,6 +57,14 @@ export function isDocId(s: string): s is DocId {
 }
 export function isClientFrameId(s: string): s is ClientFrameId {
 	return ID_RE.test(s);
+}
+/**
+ * A vaultId (server DECISIONS §2.1, server/src/vaultId.ts): base64url of 16 random bytes, exactly 22 chars, and
+ * canonical (the last char's 4 unused low bits are 0, as the server mints it). Canonical makes the id and its 16
+ * bytes one-to-one, so the SecretStorage id built from the bytes (e2ee-design §6.1) names one vault only.
+ */
+export function isVaultId(s: string): s is VaultId {
+	return ID_RE.test(s) && base64urlEncode(base64urlDecode(s)) === s;
 }
 
 export function newId(random: RandomPort): string {

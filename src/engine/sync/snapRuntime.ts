@@ -46,6 +46,12 @@ export class SnapRuntime extends FoldRuntime<SnapOp, SnapFoldEvent> {
 		return { events, halted: false };
 	}
 
+	protected foldStale(row: TailRecord): readonly SnapFoldEvent[] {
+		if (row.seq <= this.state.coversSeq) return [];
+		this.state.coversSeq = row.seq;
+		return [{ seq: row.seq, index: -1, deviceId: row.deviceId, key: null, outcome: { t: "ignored", reason: "stale-epoch" } }];
+	}
+
 	/** A put of an unknown record version: its parts are invisible here (blobs/gc.ts must not collect them). */
 	protected rowGap(ops: readonly SnapOp[]): string | null {
 		return ops.some((op) => op.t === "putUnknown") ? "snap record version unknown" : null;

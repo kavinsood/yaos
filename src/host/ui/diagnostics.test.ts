@@ -4,6 +4,7 @@ import { diagnosticsFileName, diagnosticsSettings, exportDiagnostics, formatDiag
 import type { DiagnosticsBundle, StatusSnapshot } from "../../protocol/status";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import { DEFAULT_ENGINE_SETTINGS, type YaosPluginData } from "./api";
+import { testVaultId } from "../keys/testkit/vaultIds";
 
 const STATUS = {
 	phase: "live", deviceClass: "desktop", transport: "worker", vaultEpoch: "e1", vaultSeq: 5, headSeq: 5,
@@ -85,7 +86,7 @@ test("diagnosticsFileName", () => {
 const TOKEN = "dtok_9f8e7d6c5b4a39281706f5e4d3c2b1a0ZZ";
 const DATA: YaosPluginData = {
 	version: 1,
-	identity: { host: "https://sync.example.com", vaultId: "v-123", deviceId: "d-456", deviceToken: TOKEN, deviceName: "Laptop", vaultGeneration: "g1" },
+	identity: { host: "https://sync.example.com", vaultId: testVaultId("v-123"), deviceId: "d-456", deviceToken: TOKEN, deviceName: "Laptop", vaultGeneration: "g1" },
 	deviceLabel: "Laptop",
 	engine: { ...DEFAULT_ENGINE_SETTINGS, excludePatterns: ["Clients/Acme/", "**.tmp"] },
 	showStatusBar: true,
@@ -160,7 +161,7 @@ test("exportDiagnostics: settings section names the device and engine settings, 
 		const s = (JSON.parse(text) as { settings: Record<string, unknown> }).settings;
 		assert.deepEqual(Object.keys(s).sort(), ["deviceId", "deviceLabel", "engine", "host", "pluginVersion", "transport", "vaultId"]);
 		assert.equal(s.host, "https://sync.example.com");
-		assert.equal(s.vaultId, "v-123");
+		assert.equal(s.vaultId, testVaultId("v-123"));
 		assert.equal(s.deviceId, "d-456");
 		assert.equal(s.pluginVersion, "2.1.0");
 		assert.equal(s.transport, "worker");

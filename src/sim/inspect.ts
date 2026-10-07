@@ -64,7 +64,7 @@ export async function inspectStore(clock: VirtualClock, storage: MemStoragePort,
 	try {
 		eng = await LogEngine.start({
 			ports: { relay: OFFLINE, storage, clock, random: new SeededRandom(hashLabel(`inspect:${deviceId}`)), crypto: createNoopCrypto(hash), hash, blob: null },
-			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-inspect", sideFiles: null, autoReconnect: false,
+			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-inspect", sideFiles: null, autoReconnect: false, e2ee: { suite: 0 },
 		});
 	} catch {
 		return out;

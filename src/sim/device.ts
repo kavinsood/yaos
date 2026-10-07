@@ -12,7 +12,7 @@
 import type { DeviceId, VaultPath } from "../core/types";
 import { pathKey } from "../core/paths/pathKey";
 import type { Unsubscribe } from "../ports/common";
-import type { EnginePorts } from "../ports";
+import type { BlobPort, EnginePorts } from "../ports";
 import type { LifecycleEvent, PlatformInfo, PlatformPort } from "../ports/platform";
 import type { BrakeReport } from "../core/types";
 import type { ProtocolError } from "../protocol/errors";
@@ -21,12 +21,19 @@ import type { EngineSettings } from "../protocol/messages";
 import type { StatusSnapshot } from "../protocol/status";
 import type { EngineCarrier } from "../host/engineHost";
 import { HostRuntime, type HostUiSink } from "../host/hostRuntime";
+import { createHostKeys, type HostKeys } from "../host/keys/hostKeys";
+import { pinnedSuite1, pinsFromKeyring, type E2eePin, type PinFields } from "../host/keys/pin";
+import { VaultKeyStore } from "../host/keys/secretStore";
+import { FakeSecretStorage } from "../host/keys/testkit/fakeSecretStorage";
+import { suite0PinForTest } from "../host/keys/testkit/pinFixture";
 import type { HostIdentity } from "../host/runtimeSupport";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
+import { createWebCryptoSuite1 } from "../engine/adapters/webCryptoSuite1";
 import { createEngine, type ComposedEngine, type EngineHandle } from "../engine/compose/protocolEngine";
 import type { VaultRuntime } from "../engine/compose/vaultRuntime";
 import { residentText } from "../engine/compose/runtimeOps";
 import { FAST_TUNING } from "../engine/runtime/testHarness";
+import type { EngineTuning } from "../engine/runtime/options";
 import type { ClockPort } from "../ports/clock";
 import type { VirtualClock } from "./clock";
 import { simHashOracle, simHashPort } from "./hash";
@@ -78,6 +85,15 @@ export interface SimDeviceOptions {
 	readonly watcherDelayMs?: () => number;
 	/** Worker carrier unavailable / fails storage in init (OR-1 paths). */
 	readonly workerMode?: "ok" | "unavailable" | "storage-fails";
+	/**
+	 * The device's data.json pin (e2ee-design §12.4). Default: the test-only suite-0 fixture, the state a suite-0
+	 * link leaves (so the suite-0 runs sync). null: unpinned, which is blocked and writes nothing.
+	 */
+	readonly pin?: E2eePin | null;
+	/** The engine's blob store for each start (default none). */
+	readonly blob?: () => BlobPort | null;
+	/** Over FAST_TUNING (a roll trigger, the GC grace). */
+	readonly tuning?: Partial<EngineTuning>;
 }
 
 export interface SimUiLog {
@@ -109,6 +125,12 @@ export class SimDevice {
 	/** Texts that existed only in host memory when the app crashed (pending conflict copies; known gap). */
 	readonly crashLost: string[] = [];
 	readonly deviceId: DeviceId;
+	/** The device's persistent SecretStorage contents (survives app restarts and IndexedDB wipes, like the OS keychain). */
+	readonly secretBacking = new Map<string, string>();
+	/** This app incarnation's SecretStorage over `secretBacking`. */
+	secrets: FakeSecretStorage;
+	/** The pin fields of this device's data.json. */
+	pinData: PinFields;
 	/** This device's wall-clock error (fault); the relay and other devices keep true time. */
 	wallSkewMs = 0;
 	/** The run's clock as this device sees it: shared timers and monotonic time, skewed wall time. */
@@ -122,6 +144,8 @@ export class SimDevice {
 
 	constructor(readonly opts: SimDeviceOptions) {
 		this.deviceId = `dev-${opts.name}` as DeviceId;
+		this.secrets = new FakeSecretStorage(this.secretBacking);
+		this.pinData = opts.pin === null ? {} : { e2ee: opts.pin ?? suite0PinForTest() };
 		this.storage = new MemStoragePort({ beforeNextTimer: opts.clock.beforeNextTimer });
 		this.vault = new SimVault({ clock: opts.clock, hashes: simHashOracle(), profile: opts.profile ?? "case-sensitive", watcherDelayMs: opts.watcherDelayMs });
 		this.configDir = new SimConfigDir(opts.clock);
@@ -143,20 +167,21 @@ export class SimDevice {
 		const handle = createEngine(pair.engine, {
 			carrier: kind,
 			clientVersion: "sim",
-			tuning: FAST_TUNING,
+			tuning: { ...FAST_TUNING, ...(this.opts.tuning ?? {}) },
 			startRetryMs: 1_000,
 			tzOffsetMinutes: () => 0,
 			log: this.opts.log,
 			onRuntime: (rt) => {
 				if (this.handle === handle) this.vrt = rt;
 			},
-			makePorts: (): EnginePorts => {
+			makePorts: async (config): Promise<EnginePorts> => {
 				if (storageFails) throw new Error("IndexedDB unavailable in worker");
 				const hash = simHashPort();
-				return {
-					relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.deviceClock,
-					random: new SeededRandom(hashLabel(`${this.deviceId}#${n}`)), crypto: createNoopCrypto(hash), hash, blob: null,
-				};
+				const random = new SeededRandom(hashLabel(`${this.deviceId}#${n}`));
+				const c = config.crypto;
+				// As webEngine.ts: suite 0 seals nothing; unpinned and suite 1 get the suite-1 adapter (keys zero-filled on import).
+				const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
+				return { relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.deviceClock, random, crypto, hash, blob: this.opts.blob?.() ?? null };
 			},
 		});
 		this.pair = pair;
@@ -187,8 +212,20 @@ export class SimDevice {
 		);
 	}
 
+	/** Main's keys for `vaultId` over this device's SecretStorage and pin (what the plugin controller builds). */
+	keysFor(vaultId: string): HostKeys {
+		return createHostKeys({
+			store: new VaultKeyStore(this.secrets, vaultId, this.deviceClock),
+			pin: () => this.pinData.e2ee,
+			creating: () => this.pinData.creating?.vaultId === vaultId,
+			stored: async (info) => {
+				if (pinsFromKeyring(this.pinData.e2ee, info.pending, info)) this.pinData = pinnedSuite1(this.pinData);
+			},
+		});
+	}
+
 	/** A HostRuntime over this device's vault/workspace/platform/carriers (plugin controller tests). */
-	runtimeFor(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink): HostRuntime {
+	runtimeFor(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink, keys: HostKeys = this.keysFor(identity.vaultId)): HostRuntime {
 		return new HostRuntime({
 			clock: this.opts.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
 			workspace: this.workspace, platform: this.platform,
@@ -197,6 +234,8 @@ export class SimDevice {
 			createInline: () => this.carrier("inline"),
 			pingEnabled: true,
 			ui,
+			keys,
+			log: this.opts.log ? (line) => this.opts.log?.(`host: ${line}`) : undefined,
 		});
 	}
 
@@ -248,6 +287,7 @@ export class SimDevice {
 
 	/** Fresh app process over the same disk, side files and engine store. */
 	async restartApp(): Promise<void> {
+		this.secrets = new FakeSecretStorage(this.secretBacking);
 		this.workspace = new SimWorkspace({ clock: this.opts.clock, vault: this.vault });
 		this.workspaces.push(this.workspace);
 		this.runtime = this.makeRuntime();

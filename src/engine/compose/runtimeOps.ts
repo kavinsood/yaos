@@ -7,12 +7,14 @@ import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import { ProtocolFailure } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
 import type { FrameNoFloor } from "../store/repo";
 import { dbName, STORE } from "../store/schema";
 import { readBase } from "../reconcile/store";
+import { KeyringRefusedError } from "../keyring/writeGate";
 import type { VaultRuntime } from "./vaultRuntime";
 
 export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number): Promise<EngineResultValue> {
@@ -126,12 +128,41 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 			rt.sched.request({ t: "full" });
 			return { t: "ok" };
 		}
+		// e2ee-design §18.4. A runtime runs for a pinned device only (pinGate.ts): the creation path is the KeyReader's.
+		case "enableE2ee":
+			c.rk.fill(0);
+			throw refused("this device is already pinned");
+		case "installKey": {
+			const r = await keyCommand(() => (c.source === "qr" ? rt.log.installKeyQr(c.e, c.k) : rt.log.installKeyRk(c.rk)));
+			// pending: kept unverified (nothing persisted) until `k` shows its record (§12.4 (i)); status says key-missing.
+			if (r === "conflict") throw refused("the key does not match the vault's key record for its epoch; a verified key is never replaced");
+			return { t: "ok" };
+		}
+		case "pinSuite0":
+			throw refused("this device is already pinned");
+		case "revokeRekey": {
+			const o = await keyCommand(() => rt.log.revokeRekey(c.rk));
+			if (o === "lost") throw refused("another key record won the epoch; revoke again");
+			return { t: "ok" };
+		}
 		case "cleanUpAttachments": {
 			const r = await rt.log.cleanUpBlobs(() => rt.blobs.liveHashes());
 			return { t: "attachmentsCleaned", ...r };
 		}
 		default:
 			return { t: "ok" };
+	}
+}
+
+function refused(message: string): ProtocolFailure {
+	return new ProtocolFailure({ code: "refused", message, retryable: false });
+}
+
+async function keyCommand<T>(f: () => T | Promise<T>): Promise<T> {
+	try {
+		return await f();
+	} catch (e) {
+		throw e instanceof KeyringRefusedError ? refused(e.message) : e;
 	}
 }
 

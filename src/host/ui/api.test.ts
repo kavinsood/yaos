@@ -6,10 +6,11 @@ import {
 } from "./api";
 import type { BrakeReport } from "../../core/types";
 import type { StatusSnapshot } from "../../protocol/status";
+import { BAD_VAULT_IDS, testVaultId } from "../keys/testkit/vaultIds";
 
 const IDENTITY: PairedIdentity = {
 	host: "https://sync.example.com",
-	vaultId: "vault-1",
+	vaultId: testVaultId("vaultOne"),
 	deviceId: "dev_AAAAAAAAAAAAAAAA",
 	deviceToken: "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
 	deviceName: "Mac",
@@ -89,6 +90,12 @@ test("sanitizePluginData: an identity with any invalid credential field is dropp
 		{ ...IDENTITY, host: 5 },
 	];
 	for (const identity of broken) assert.equal(sanitizePluginData({ identity }, "Mac").identity, null);
+});
+
+test("sanitizePluginData: the vaultId is exactly 22-char canonical base64url (server DECISIONS §2.1), never trimmed or repaired", () => {
+	assert.equal(sanitizePluginData({ identity: IDENTITY }, "Mac").identity?.vaultId, IDENTITY.vaultId);
+	for (const vaultId of BAD_VAULT_IDS) assert.equal(sanitizePluginData({ identity: { ...IDENTITY, vaultId } }, "Mac").identity, null, JSON.stringify(vaultId));
+	assert.equal(sanitizePluginData({ identity: { ...IDENTITY, vaultId: 7 } }, "Mac").identity, null);
 });
 
 test("sameIdentity / sameEngineSettings", () => {

@@ -74,22 +74,24 @@ function rec(stream: StreamName, bytes = 10, over: Partial<OutboxRecord> = {}): 
 	return {
 		clientFrameId: `f${String(n).padStart(21, "0")}` as ClientFrameId, order: n, stream,
 		kind: stream === NS_STREAM ? "nsOps" : stream === CFG_STREAM ? "cfgOps" : "bodyUpdate",
-		state: "pending", sealed: new Uint8Array(bytes), content: new Uint8Array(0), authorNsSeq: 0, flags: 0, frameNo, dependsOn: null, adoptOf: null,
+		state: "pending", sealed: new Uint8Array(bytes), content: new Uint8Array(0), authorNsSeq: 0, flags: 0, frameNo, keyEpoch: 0, dependsOn: null, adoptOf: null,
 		attempts: 0, createdAtMs: 0, lastSentAtMs: 0, ...over,
 	};
 }
 const RANK: Record<string, number> = { [BOUND]: 0, [NS_STREAM]: 1, [CFG_STREAM]: 2, [BG]: 3, [X]: 4 };
 
-function mk(maxInflight = 10 * 1024 * 1024, gate?: SendGate) {
+function mk(maxInflight = 10 * 1024 * 1024, sendGate?: SendGate) {
 	const clock = new FakeClock();
-	const ev = { sent: [] as [string, number][], poison: [] as [string, string][], forbidden: 0, daily: [] as number[], diag: [] as string[] };
+	const ev = { sent: [] as [string, number][], poison: [] as [string, string][], forbidden: 0, daily: [] as number[], diag: [] as string[], reseal: [] as string[] };
+	const gate = { blocked: false, minEpoch: 0 };
 	const sender = new Sender({
 		clock, rankOf: (r) => RANK[r.stream] ?? 3, maxInflightBytes: () => maxInflight,
 		onSent: (r, a) => ev.sent.push([r.clientFrameId, a]), onPoison: (r, why) => ev.poison.push([r.clientFrameId, why]),
-		onForbidden: () => ev.forbidden++, onDailyLimit: (ms) => ev.daily.push(ms), diag: (c) => ev.diag.push(c), gate,
+		onForbidden: () => ev.forbidden++, onDailyLimit: (ms) => ev.daily.push(ms), writeBlocked: () => gate.blocked, diag: (c) => ev.diag.push(c),
+		minSendEpoch: () => gate.minEpoch, reseal: (r) => ev.reseal.push(r.clientFrameId), gate: sendGate,
 	});
 	const add = (...rs: OutboxRecord[]) => { for (const r of rs) sender.upsert(r); clock.advance(0); return rs; };
-	return { clock, ev, sender, add };
+	return { clock, ev, sender, add, gate };
 }
 
 test("sender: lane rank then outbox order; ns waits for openNs; resend replays in the same order", () => {
@@ -283,7 +285,7 @@ test("sender: probe mode after 1008/1009 -- one frame in flight, a repeat close 
 });
 
 test("sender: backpressure holds 5 s and halves the rate; pause; upsert replace / non-sendable state removes", () => {
-	const { sender, add, clock } = mk();
+	const { sender, add, clock, gate } = mk();
 	const s = new FakeSession();
 	sender.attach(s);
 	sender.onBackpressure();
@@ -294,12 +296,12 @@ test("sender: backpressure holds 5 s and halves the rate; pause; upsert replace 
 	clock.advance(1);
 	assert.equal(s.appends.length, 1);
 
-	sender.paused = true;
+	gate.blocked = true;
 	const [p] = add(rec(BOUND, 10));
 	clock.advance(1_000);
 	assert.equal(s.appends.length, 1);
 	sender.upsert({ ...p!, sealed: new Uint8Array(20) });
-	sender.paused = false;
+	gate.blocked = false;
 	sender.pump();
 	assert.equal(s.appends.length, 2);
 	assert.equal(s.appends[1]!.payload.length, 20, "the replaced record is what goes out");
@@ -314,6 +316,27 @@ test("sender: backpressure holds 5 s and halves the rate; pause; upsert replace 
 	add(rec(BOUND));
 	clock.advance(10_000);
 	assert.equal(s.appends.length, n, "detached: no timers, no sends");
+});
+
+test("sender: below the revoke floor, or not sealed yet, a record goes to reseal and never out; ns/cfg only inside the open window (e2ee-design §14.2)", () => {
+	const { sender, add, clock, ev, gate } = mk();
+	gate.minEpoch = 2;
+	const [old, cur, copy, ns] = add(rec(BOUND, 10, { keyEpoch: 1 }), rec(BOUND, 10, { keyEpoch: 2 }), rec(BG, 10, { keyEpoch: 2, sealed: new Uint8Array(0) }), rec(NS_STREAM, 10, { keyEpoch: 1 }));
+	const s = new FakeSession();
+	sender.attach(s);
+	assert.deepEqual(s.ids(), [cur!.clientFrameId]);
+	assert.deepEqual(ev.reseal, [old!.clientFrameId, copy!.clientFrameId], "the ns record waits for openNs");
+	sender.openNs();
+	assert.deepEqual([...new Set(ev.reseal)], [old, copy, ns].map((r) => r!.clientFrameId), "asked again on every pump (reseal.ts dedupes)");
+	assert.deepEqual(s.ids(), [cur!.clientFrameId], "nothing below the floor was appended");
+	sender.remove(old!.clientFrameId);
+	add({ ...old!, clientFrameId: "resealed".padEnd(22, "R") as ClientFrameId, keyEpoch: 2 });
+	clock.advance(0);
+	assert.deepEqual(s.ids().slice(1), ["resealed".padEnd(22, "R")]);
+	gate.minEpoch = 0;
+	sender.onResend();
+	clock.advance(0);
+	assert.ok(!s.ids().includes(copy!.clientFrameId), "an empty sealed is never sent, whatever the floor");
 });
 
 test("sender: the blob gate holds a frame and the later frames of its stream; poke() sends them; reset per session, forget on remove", () => {

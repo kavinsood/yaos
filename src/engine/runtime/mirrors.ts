@@ -212,10 +212,12 @@ function isNsOrCfg(stream: StreamName): boolean {
  * still on disk and are re-derived by reconcile.
  *
  * Input order is arbitrary; output is sorted by order. Poisoned records are
- * included (state code 4).
+ * included (state code 4). A record not sealed yet (the copy of an own stale
+ * commit, e2ee-design §14.2 step 4) has no frame to keep: it is left out, and
+ * a recovery re-derives it from disk like a dropped body edit.
  */
 export function selectMirrorFrames(records: readonly OutboxRecord[], maxBytes: number): OutboxMirrorFrame[] {
-	const items = records.map((r) => {
+	const items = records.filter((r) => r.sealed.length > 0).map((r) => {
 		const frame = toMirrorFrame(r);
 		return { frame, size: mirrorFrameSize(frame), priority: isNsOrCfg(r.stream) };
 	});

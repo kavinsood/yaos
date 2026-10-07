@@ -73,7 +73,7 @@ function checkEngineOnce(mainJs) {
 async function smokePlugin(mainJs, manifest, carrier) {
 	const saved = {
 		notices: [],
-		data: { identity: { host: "https://relay.example", vaultId: "smoke-vault", deviceId: "smoke-device-0001", deviceToken: TOKEN, deviceName: "smoke", vaultGeneration: null } },
+		data: { identity: { host: "https://relay.example", vaultId: "smokeVaultAAAAAAAAAAAA", deviceId: "smoke-device-0001", deviceToken: TOKEN, deviceName: "smoke", vaultGeneration: null } },
 	};
 	const stub = obsidianStub(saved, fail);
 	const requested = [];

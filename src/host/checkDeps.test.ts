@@ -88,6 +88,26 @@ test("no CRDT on the main thread: host/** never imports yjs, y-codemirror.next, 
 	assert.equal(check("host/plugin.ts", `import { probe } from "./spike/viewProbe";`).errors.length, 1, "the spike plugin stays out of the product");
 });
 
+test("no hashing on the main thread: product host/** never imports or reaches core/hash/**", () => {
+	for (const spec of ["../core/hash/sha256", "../core/hash/utf8", "../core/hash/markdownLf"]) {
+		assert.equal(check("host/plugin.ts", `import { f } from "${spec}";`).errors.length, 1, spec);
+		assert.equal(check("host/plugin.ts", `import type { T } from "${spec}";`).errors.length, 1, `${spec} type-only`);
+		assert.equal(check("host/plugin.test.ts", `import { f } from "${spec}";`).errors.length, 0, `${spec} in a host test (expected values)`);
+	}
+	assert.equal(check("host/keys/secretStore.ts", `import { sha256Hex } from "../../core/hash/sha256";`).errors.length, 1);
+	assert.equal(check("host/keys/secretStore.ts", `import { bytesToHex } from "../../core/codec/lib0";`).errors.length, 0, "hex is not hashing");
+	assert.equal(check("engine/body/a.ts", `import { sha256 } from "../../core/hash/sha256";`).errors.length, 0, "the engine hashes");
+	const reach = (files: Record<string, string>) => mainReach(new Map(Object.entries(files))) as string[];
+	const viaCore = reach({
+		"host/a.ts": `import { f } from "../core/b";`,
+		"core/b.ts": `import { g } from "./hash/sha256";`,
+		"core/hash/sha256.ts": `export const g = 1;`,
+	});
+	assert.equal(viaCore.length, 1);
+	assert.match(viaCore[0] ?? "", /host\/a\.ts.*core\/hash\/sha256 via host\/a\.ts -> core\/b\.ts/);
+	assert.deepEqual(reach({ "host/a.test.ts": `import { f } from "../core/b";`, "core/b.ts": `import { g } from "./hash/sha256";`, "core/hash/sha256.ts": "" }), [], "tests are not the main thread");
+});
+
 test("whole-document reads on main: only the allowlisted ones", () => {
 	const reads = [
 		"const s = editor.getValue();",

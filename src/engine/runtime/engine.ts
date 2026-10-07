@@ -43,8 +43,11 @@ import { DocRuntime } from "./docRuntime";
 import { LiveIngest } from "./liveIngest";
 import { Maintenance } from "./maintenance";
 import { MirrorWriter, recoverFromMirror } from "./mirrorIo";
+import { Resealer } from "./reseal";
 import type { EngineOptions } from "./options";
 import { SessionLoop } from "./sessionLoop";
+import { KeyringRuntime } from "../keyring/keyringRuntime";
+import type { OwnOutcome, QrResult } from "../keyring/keyring";
 
 export class EngineStartError extends Error {
 	constructor(readonly reason: string) {
@@ -139,6 +142,7 @@ export class LogEngine {
 		repo.monotonic = () => c.mono();
 		repo.priorityFn = (r) => ((c.handles?.peek(r.stream)?.bound ?? 0) > 0 ? -10 : defaultPriority(r));
 		c.repo = repo;
+		c.keyring = await KeyringRuntime.open(c, opts.e2ee);
 		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.cfg = new CfgRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.ns.frameNoFloor = repo.frameNoFloor.ns;
@@ -146,6 +150,7 @@ export class LogEngine {
 		c.snap = new SnapRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.docs = new DocRuntime(c);
 		c.handles = new HandleManager(repo, c.budgets, c.docs.hooks());
+		const resealer = new Resealer(c);
 		c.sender = new Sender({
 			clock: opts.ports.clock,
 			rankOf: rankOf(c),
@@ -160,6 +165,9 @@ export class LogEngine {
 				void c.repo.tOutbox([{ t: "state", clientFrameId: rec.clientFrameId, state: "poisoned" }]).then((r) => c.applyOutboxResult(r));
 			},
 			onForbidden: () => c.onForbidden(),
+			writeBlocked: () => c.gate() !== null || !c.keyring.sendReady(),
+			minSendEpoch: () => c.keyring.minSendEpoch(),
+			reseal: (rec) => resealer.request(rec),
 			onDailyLimit: (ms, retryAfterMs) => {
 				c.dailyLimitUntilMono = c.mono() + ms;
 				c.setPhase("daily-limit");
@@ -216,12 +224,14 @@ export class LogEngine {
 	}
 
 	private async authorNs(ops: readonly NsOp[]): Promise<void> {
+		this.c.assertWritable();
 		await api.submitNs(this.c, ops);
 	}
 
 	async createDoc(path: VaultPath, text: string, kind: DocKind = kindOfPath(path)): Promise<DocId> {
 		const c = this.c;
 		if (kind === "blob") throw new Error("blob docs are not handled by the log engine");
+		c.assertWritable();
 		if (this.listDocs().some((d) => d.path === path && (d.state === "live" || d.state === "pending"))) throw new Error(`path exists: ${path}`);
 		const docId = newDocId(c.ports.random);
 		const stream = docStream(kind, docId)!;
@@ -259,7 +269,8 @@ export class LogEngine {
 	// ------------------------------------------------------------ ns / cfg
 
 	/** Own ns ops -> frames (<= MAX_NS_OPS_PER_FRAME) in the outbox; resolves once committed (in nsView()). */
-	submitNs(ops: readonly NsOp[]): Promise<ClientFrameId[]> {
+	async submitNs(ops: readonly NsOp[]): Promise<ClientFrameId[]> {
+		this.c.assertWritable();
 		return api.submitNs(this.c, ops);
 	}
 
@@ -269,7 +280,8 @@ export class LogEngine {
 	}
 
 	/** Own cfg ops -> frames in the outbox; resolves once committed (in cfgView()). */
-	submitCfg(ops: readonly CfgOp[]): Promise<ClientFrameId[]> {
+	async submitCfg(ops: readonly CfgOp[]): Promise<ClientFrameId[]> {
+		this.c.assertWritable();
 		return api.submitCfg(this.c, ops);
 	}
 
@@ -294,7 +306,8 @@ export class LogEngine {
 	}
 
 	/** BlobChunkLog.appendChunks: x:<hash> frames via the outbox; true once all are committed (blobChunks.ts). */
-	appendBlobChunks(hash: ContentHash, chunks: readonly BlobChunkContent[]): Promise<boolean> {
+	async appendBlobChunks(hash: ContentHash, chunks: readonly BlobChunkContent[]): Promise<boolean> {
+		this.c.assertWritable();
 		return blobs.appendBlobChunks(this.c, hash, chunks);
 	}
 
@@ -327,6 +340,7 @@ export class LogEngine {
 				return h.bound > 0;
 			},
 			commitEdits: async () => {
+				c.assertWritable();
 				await c.docs.closeFrame(h);
 				return version();
 			},
@@ -345,6 +359,7 @@ export class LogEngine {
 		const c = this.c;
 		const stream = this.streamOf(docId);
 		if (c.repo.stream(stream)?.frozen) throw new Error(`doc frozen: ${c.repo.stream(stream)?.frozenReason}`);
+		c.assertWritable();
 		const h = await c.handles.acquire(stream);
 		try {
 			h.doc.transact(() => fn(h.doc.getText("text"), h.doc), ORIGIN.MERGE);
@@ -493,7 +508,8 @@ export class LogEngine {
 		for (const h of c.handles.all()) if (!h.builder.empty) return false;
 		if (c.outbox.unreceipted() > 0) return false;
 		for (const r of c.outbox.values()) if (r.state === "held") return false;
-		for (const r of c.repo.streams()) if (r.stale && r.cls !== "other" && r.cls !== "keyring" && !(r.frozen && r.frozenReason === "checkpoint-disputed")) return false;
+		const onlyK = c.keyring.readsOnlyK();
+		for (const r of c.repo.streams()) if (r.stale && r.cls !== "other" && (!onlyK || r.cls === "keyring") && !(r.frozen && r.frozenReason === "checkpoint-disputed")) return false;
 		return c.repo.cursor.headSeqSeen <= c.repo.cursor.vaultSeq;
 	}
 
@@ -543,6 +559,7 @@ export class LogEngine {
 		}
 		c.sess.disconnect();
 		c.stopped = true;
+		c.keyring.stop();
 		this.maint.stop();
 		c.sess.clearReconnect();
 		c.clearStatusTimer();
@@ -555,6 +572,21 @@ export class LogEngine {
 
 	status(): StatusSnapshot {
 		return this.c.status();
+	}
+
+	// ------------------------------------------------------------ keyring (e2ee-design §18.4)
+
+	/** installKey {source: "qr"}: zero-fills `k`; persists only once it verifies against a `k` record. */
+	installKeyQr(e: number, k: Uint8Array): Promise<QrResult> {
+		return this.c.keyring.installQr(e, k);
+	}
+	/** installKey {source: "rk"}: zero-fills `rk`. */
+	installKeyRk(rk: Uint8Array): Promise<"verified" | "pending"> {
+		return this.c.keyring.installRk(rk);
+	}
+	/** §14.2 step 2: zero-fills `rk`. */
+	revokeRekey(rk: Uint8Array): Promise<OwnOutcome> {
+		return this.c.keyring.revokeRekey(rk);
 	}
 	diagnostics(): readonly DiagnosticsEvent[] {
 		return this.c.diagnostics();

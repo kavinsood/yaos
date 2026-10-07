@@ -12,6 +12,9 @@
  *  - daily-limit hold, canWrite / forbidden, durability backoff;
  *  - probe mode after a 1008/1009 close: one frame in flight; a frame that
  *    triggers the close again is poisoned;
+ *  - e2ee-design §14.2 step 4: a record sealed below the newest winning revoke
+ *    epoch, or a copy not sealed yet (empty `sealed`), is never sent as is: it
+ *    goes to deps.reseal and comes back as a new record.
  *  - the blob gate (blobs/touch.ts, e2ee-design §10.4 R3): a frame it holds also
  *    holds the later frames of its stream for that pass.
  */
@@ -38,6 +41,12 @@ export interface SenderDeps {
 	onForbidden(): void;
 	/** waitMs: the hold; retryAfterMs: the relay's delay to its reset, null when it did not say. */
 	onDailyLimit(waitMs: number, retryAfterMs: number | null): void;
+	/** The engine's write gate is shut (key-missing, e2ee-design §9.3): the outbox is held, nothing is sent. */
+	writeBlocked(): boolean;
+	/** The newest winning revoke epoch, 0 if none (e2ee-design §14.2 step 4). */
+	minSendEpoch(): number;
+	/** Seal `rec` again under the current epoch (runtime/reseal.ts); the result replaces it through upsert. */
+	reseal(rec: OutboxRecord): void;
 	diag(code: string, fields: Record<string, string | number | boolean | null>): void;
 	/** Per-frame send gate (blobs/touch.ts BlobTouch); poke() when a held frame may go. */
 	readonly gate?: SendGate;
@@ -107,7 +116,6 @@ export class Sender {
 	private timerAt = Infinity;
 	private dirty = true;
 	private sorted: Entry[] = [];
-	paused = false;
 	readonly bucket: TokenBucket;
 	stats = { appends: 0, bytes: 0, poisoned: 0 };
 
@@ -320,7 +328,7 @@ export class Sender {
 
 	pump(): void {
 		const s = this.session;
-		if (!s || this.readOnly || this.paused) return;
+		if (!s || this.readOnly || this.deps.writeBlocked()) return;
 		const now = this.deps.clock.monotonic();
 		if (now < this.holdUntilMono) {
 			this.schedule(this.holdUntilMono - now);
@@ -328,6 +336,7 @@ export class Sender {
 		}
 		const nsWindow = this.window();
 		const maxInflight = this.deps.maxInflightBytes();
+		const minEpoch = this.deps.minSendEpoch();
 		let nextWake = Infinity;
 		const held = new Set<StreamName>();
 		for (const e of this.order()) {
@@ -341,6 +350,11 @@ export class Sender {
 				continue;
 			}
 			if (held.has(e.rec.stream)) continue;
+			// After the ns window check: an ns/cfg record is re-sealed under its own id only once the late-receipt reads ran.
+			if (e.rec.sealed.length === 0 || e.rec.keyEpoch < minEpoch) {
+				this.deps.reseal(e.rec);
+				continue;
+			}
 			if (this.deps.gate && !this.deps.gate.ready(e.rec)) {
 				held.add(e.rec.stream);
 				continue;

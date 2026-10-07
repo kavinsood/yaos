@@ -17,6 +17,12 @@ export type ProtocolErrorCode =
 	| "timeout"
 	/** A snapshot failed restore verification (DESIGN §j.4); the message names the snapshot and the failed check. */
 	| "content_corrupt"
+	/**
+	 * A key or pin command the device's state does not allow (e2ee-design §12.4, §18.4): not on the creation path,
+	 * `k` not empty or a key record seen, already pinned, a key that conflicts with the vault's record, another
+	 * device's record won the epoch, or (main) a keyringChanged it must not store. Not retryable.
+	 */
+	| "refused"
 	| "internal";
 
 export interface ProtocolError {

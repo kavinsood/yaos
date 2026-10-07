@@ -12,10 +12,14 @@
  *  - `postOwned(transport, message)` = post with transferablesOf(message).
  * After a post the sender's buffers are detached (byteLength 0) on both
  * carriers: touching them is a bug that shows up immediately.
+ *
+ * SECRET buffers (keys, recovery keys: e2ee-design §6.3, §18.4) are transferred too. When a sender falls back to a
+ * structured-clone copy (TransferOwnershipError), `wipeSecrets(message)` zero-fills the originals it still holds,
+ * so the sending side keeps no copy either way.
  */
 
 import type { Unsubscribe } from "../ports/common";
-import type { EngineToMain, MainToEngine } from "./messages";
+import type { EngineToMain, MainToEngine, UserCommand } from "./messages";
 import type { EngineTransport, HostTransport, Transport } from "./transport";
 import { Inbox, macrotaskSchedule, type Schedule } from "./inlineTransport";
 
@@ -61,8 +65,22 @@ export function transferablesOf(message: MainToEngine | EngineToMain): ArrayBuff
 			const s = message.config.sideState;
 			s.outboxMirror.forEach((b, i) => b && add(out, seen, b, `init.sideState.outboxMirror[${i}]`));
 			s.syncedMirror.forEach((b, i) => b && add(out, seen, b, `init.sideState.syncedMirror[${i}]`));
+			const c = message.config.crypto;
+			if (c.suite === 1) {
+				c.keys.forEach((key, i) => add(out, seen, key.k, `init.crypto.keys[${i}].k`));
+				c.records.forEach((r, i) => add(out, seen, r, `init.crypto.records[${i}]`));
+			}
 			break;
 		}
+		case "command": {
+			const secret = commandSecret(message.command);
+			if (secret) add(out, seen, secret, `command.${message.command.t}`);
+			break;
+		}
+		case "keyringChanged":
+			message.keys.forEach((key, i) => add(out, seen, key.k, `keyringChanged.keys[${i}].k`));
+			message.records.forEach((r, i) => add(out, seen, r, `keyringChanged.records[${i}]`));
+			break;
 		case "textChunk":
 			add(out, seen, message.bytes, "textChunk.bytes");
 			break;
@@ -95,6 +113,45 @@ export function transferablesOf(message: MainToEngine | EngineToMain): ArrayBuff
 			break;
 	}
 	return out;
+}
+
+/** The SECRET buffer a user command carries (e2ee-design §18.4), or null. */
+function commandSecret(c: UserCommand): Uint8Array | null {
+	switch (c.t) {
+		case "enableE2ee":
+		case "revokeRekey":
+			return c.rk;
+		case "installKey":
+			return c.source === "qr" ? c.k : c.rk;
+		default:
+			return null;
+	}
+}
+
+/** Every SECRET buffer of a message: key bytes and recovery keys (records are public and not listed). */
+export function secretBuffersOf(message: MainToEngine | EngineToMain): Uint8Array[] {
+	switch (message.t) {
+		case "init": {
+			const c = message.config.crypto;
+			return c.suite === 1 ? c.keys.map((key) => key.k) : [];
+		}
+		case "command": {
+			const secret = commandSecret(message.command);
+			return secret ? [secret] : [];
+		}
+		case "keyringChanged":
+			return message.keys.map((key) => key.k);
+		default:
+			return [];
+	}
+}
+
+/**
+ * Zero-fill the SECRET buffers the sender still holds after a post. A transferred buffer is detached (length 0)
+ * and left alone; one a structured clone copied is wiped, so no key outlives the post on the sending side.
+ */
+export function wipeSecrets(message: MainToEngine | EngineToMain): void {
+	for (const b of secretBuffersOf(message)) if (b.byteLength > 0) b.fill(0);
 }
 
 /** Post with the message's own [T] buffers transferred. */

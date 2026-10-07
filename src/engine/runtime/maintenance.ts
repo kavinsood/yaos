@@ -61,6 +61,7 @@ export class Maintenance {
 			["compact", () => this.compact()],
 			["checkpoint", () => this.checkpoints()],
 			["daily", () => this.daily()],
+			["keyring", () => c.keyring.tick()],
 		];
 		for (const [name, fn] of steps) {
 			if (c.stopped) return;
@@ -141,7 +142,7 @@ export class Maintenance {
 	private async checkpoints(): Promise<void> {
 		const c = this.c;
 		const s = c.session;
-		if (!s || !s.canWrite || c.readOnly || c.phase !== "live" || c.background) return;
+		if (!s || !s.canWrite || c.readOnly || c.phase !== "live" || c.background || c.gate() !== null) return;
 		const now = c.mono();
 		let budget = CHECKPOINTS_PER_TICK;
 		for (const r of [...c.repo.streams()]) {
@@ -185,6 +186,6 @@ export class Maintenance {
 		if (c.phase !== "daily-limit" || !c.session || c.mono() < c.dailyLimitUntilMono) return;
 		c.sender.releaseDailyHold();
 		c.clearNotice("daily-limit");
-		c.setPhase("live");
+		c.setPhase(c.livePhase());
 	}
 }

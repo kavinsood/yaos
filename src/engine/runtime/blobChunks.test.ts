@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { sha256Hex } from "../../core/hash/sha256";
-import { blobChunkStream, bodyStream, type ContentHash, type DeviceId, type DocId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
+import { KEYRING_STREAM, blobChunkStream, bodyStream, type ContentHash, type DeviceId, type DocId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
 import type { BlobAddress } from "../../ports/crypto";
 import { SeededRandom } from "../../sim/random";
 import { SimRelay } from "../../sim/relay";
 import { MemStoragePort } from "../../sim/storage";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
+import { rawAppend } from "../keyring/testkit/engines";
+import { genesis } from "../keyring/testkit/world";
 import { assembleChunks, splitChunks } from "../blobs/chunks";
 import { Repo } from "../store/repo";
 import { LogEngine } from "./engine";
@@ -127,12 +129,15 @@ test("blob chunks: session drop -> false; offline -> false / null; after reconne
 
 const VAULT1 = "AAAAAAAAAAAAAAAAAAAAAA";
 
-/** A suite-1 engine (shared K_1, verified); a distinct seed per device, so nonces never repeat across devices. */
+/** A suite-1 engine (shared K_1, verified against its stored genesis); a distinct seed per device, so nonces never repeat across devices. */
 async function suite1Engine(relay: SimRelay, deviceId: string, seed: number): Promise<LogEngine> {
-	const crypto = await createWebCryptoSuite1({ vaultId: VAULT1, random: new SeededRandom(seed), keys: [{ e: 1, k: Uint8Array.from({ length: 32 }, (_, i) => i) }] });
-	crypto.markVerified(1);
-	crypto.setSealEpoch(1);
-	return (await startTestEngine({ relay, deviceId, vaultId: VAULT1, crypto })).engine;
+	const k1 = Uint8Array.from({ length: 32 }, (_, i) => i);
+	const crypto = await createWebCryptoSuite1({ vaultId: VAULT1, random: new SeededRandom(seed), keys: [{ e: 1, k: k1.slice() }] });
+	const g = await genesis(undefined, k1);
+	// The vault's `k` holds the genesis, as a created vault does; the device has it stored (§6.1).
+	if (relay.rows(KEYRING_STREAM).length === 0) await rawAppend(relay, KEYRING_STREAM, g);
+	const e2ee = { suite: 1 as const, records: [g], persist: async () => undefined };
+	return (await startTestEngine({ relay, deviceId, vaultId: VAULT1, crypto, e2ee })).engine;
 }
 
 test("blob chunks, suite 1: x:<HMAC address> (never the hash); two devices append the same blob concurrently: different ciphertexts at one address, a third device opens either", async () => {

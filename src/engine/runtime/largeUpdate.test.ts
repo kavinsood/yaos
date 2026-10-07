@@ -12,12 +12,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { BLOB_CHUNK_BYTES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
-import { streamClass, type DocId } from "../../core/types";
+import { KEYRING_STREAM, streamClass, type DocId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort } from "../../ports/crypto";
 import { SeededRandom } from "../../sim/random";
 import { SimRelay } from "../../sim/relay";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
+import { rawAppend } from "../keyring/testkit/engines";
+import { genesis } from "../keyring/testkit/world";
 import { applyChanges, type TextChanges } from "../body/textChanges";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, testPorts, testStorage, until } from "./testHarness";
@@ -147,12 +149,14 @@ class SharedBlobs implements BlobPort {
 /** A suite-1 engine on the shared store: K_1, KCV-verified unless `unverified` (then keyState reports it unchecked; sealing is unaffected). */
 async function suite1Engine(relay: SimRelay, deviceId: string, store: SharedBlobs, seed: number, unverified = false): Promise<LogEngine> {
 	const s1 = await createWebCryptoSuite1({ vaultId: VAULT1, random: new SeededRandom(seed), keys: [{ e: 1, k: K1.slice() }] });
-	s1.markVerified(1);
-	s1.setSealEpoch(1);
+	const g = await genesis(undefined, K1);
+	// The vault's `k` holds the genesis, as a created vault does; the device has it stored (§6.1).
+	if (relay.rows(KEYRING_STREAM).length === 0) await rawAppend(relay, KEYRING_STREAM, g);
+	const e2ee = { suite: 1 as const, records: [g], persist: async () => undefined };
 	const crypto: CryptoPort = unverified ? { ...s1, keyState: (e) => ({ held: s1.keyState(e).held, verified: false }) } : s1;
 	const storage = testStorage();
 	return (await startTestEngine({
-		relay, deviceId, vaultId: VAULT1, storage, crypto, tuning: { blobQuarantineMinMs: 300 },
+		relay, deviceId, vaultId: VAULT1, storage, crypto, e2ee, tuning: { blobQuarantineMinMs: 300 },
 		extra: { budgets: BUDGETS, ports: { ...testPorts(relay, storage, crypto), blob: store } },
 	})).engine;
 }

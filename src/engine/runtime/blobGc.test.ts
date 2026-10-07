@@ -16,7 +16,7 @@ import { sha256Hex } from "../../core/hash/sha256";
 import { MAX_INLINE_UPDATE_BYTES } from "../../core/limits";
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
 import { snapshotId, SnapOpTag, type SnapRecord } from "../../core/snap/record";
-import { NS_STREAM, SNAP_STREAM, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsOp, type StreamName, type VaultId, type VaultPath } from "../../core/types";
+import { KEYRING_STREAM, NS_STREAM, SNAP_STREAM, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsOp, type StreamName, type VaultId, type VaultPath } from "../../core/types";
 import type { ClockPort } from "../../ports/clock";
 import type { BlobAddress, CryptoPort } from "../../ports/crypto";
 import type { RelaySession } from "../../ports/relay";
@@ -30,6 +30,9 @@ import { createWebHash } from "../adapters/webHash";
 import { putSealed } from "../blobs/blobStore";
 import type { GcOutcome } from "../blobs/gc";
 import { openEnvelope, sealFrame } from "../ingest/envelope";
+import type { EngineE2ee } from "../keyring/keyringRuntime";
+import { rawAppend } from "../keyring/testkit/engines";
+import { VAULT as S1_VAULT, genesis } from "../keyring/testkit/world";
 import type { LogEngine } from "./engine";
 import { faultyCrypto, startTestEngine, testPorts, testStorage, until } from "./testHarness";
 
@@ -54,7 +57,7 @@ class World {
 	readonly local = new Map<string, Map<ContentHash, Uint8Array>>();
 	readonly engines: LogEngine[] = [];
 
-	async device(deviceId: string, o: { crypto?: CryptoPort; offset?: { ms: number }; vaultId?: string; blob?: boolean } = {}): Promise<LogEngine> {
+	async device(deviceId: string, o: { crypto?: CryptoPort; e2ee?: EngineE2ee; offset?: { ms: number }; vaultId?: string; blob?: boolean } = {}): Promise<LogEngine> {
 		const storage = testStorage();
 		const base = createWebClock();
 		const offset = o.offset ?? { ms: 0 };
@@ -63,7 +66,7 @@ class World {
 		this.local.set(deviceId, local);
 		const crypto = o.crypto ?? createNoopCrypto(createWebHash());
 		const { engine } = await startTestEngine({
-			relay: this.relay, deviceId, vaultId: o.vaultId ?? VAULT, storage, crypto,
+			relay: this.relay, deviceId, vaultId: o.vaultId ?? VAULT, storage, crypto, e2ee: o.e2ee,
 			tuning: { blobGcGraceMs: GRACE },
 			extra: {
 				budgets: BUDGETS,
@@ -74,6 +77,19 @@ class World {
 		this.engines.push(engine);
 		await until(() => engine.status().phase === "live", 3_000, `${deviceId} live`);
 		return engine;
+	}
+
+	private genesis: Uint8Array | null = null;
+
+	/** Suite 1 as main hands it in (e2ee-design §18.4): K_1, and the genesis `k` holds (appended once per world). */
+	async suite1(seed: number): Promise<{ crypto: CryptoPort; e2ee: EngineE2ee; vaultId: string }> {
+		const k1 = new Uint8Array(32).fill(9);
+		if (!this.genesis) {
+			this.genesis = await genesis(undefined, k1);
+			await rawAppend(this.relay, KEYRING_STREAM, this.genesis);
+		}
+		const s1 = await createWebCryptoSuite1({ vaultId: S1_VAULT, random: new SeededRandom(seed), keys: [{ e: 1, k: k1 }] });
+		return { crypto: s1, e2ee: { suite: 1, records: [this.genesis], persist: async () => undefined }, vaultId: S1_VAULT };
 	}
 
 	/** An object as an upload at the current store time (suite 0: the stored bytes are the plaintext). */
@@ -209,11 +225,12 @@ test("GC preconditions: each refusal deletes nothing", async (t) => {
 	await t.test("keys-unverified (suite 1, K_1 not confirmed)", async () => {
 		const w = new World();
 		try {
-			const s1 = await createWebCryptoSuite1({ vaultId: "AAAAAAAAAAAAAAAAAAAAAA", random: new SeededRandom(5), keys: [{ e: 1, k: new Uint8Array(32).fill(7) }] });
-			s1.markVerified(1);
-			s1.setSealEpoch(1);
-			const crypto: CryptoPort = { ...s1, keyState: (e) => ({ held: s1.keyState(e).held, verified: false }) };
-			const a = await w.device(A, { crypto, vaultId: "AAAAAAAAAAAAAAAAAAAAAA" });
+			// The keyring verifies K_1 against the genesis (the gate opens); the port then reports it unconfirmed.
+			const p = await w.suite1(5);
+			let confirmed = true;
+			const crypto: CryptoPort = { ...p.crypto, keyState: (e) => ({ held: p.crypto.keyState(e).held, verified: confirmed && p.crypto.keyState(e).verified }) };
+			const a = await w.device(A, { ...p, crypto });
+			confirmed = false;
 			garbageOnly(w);
 			noDeletes(w, await sweep(a), "keys-unverified");
 			assert.equal(w.store.calls.list, 0);
@@ -439,16 +456,10 @@ test("GC R4: a reference committed in the store's check -> delete window is uplo
 
 test("GC suite 1: addresses are HMACs; the live blob survives, garbage goes, and no plaintext hash reaches the store", async () => {
 	const w = new World();
-	const vaultId = "AAAAAAAAAAAAAAAAAAAAAA";
 	try {
-		const mk = async (seed: number) => {
-			const s1 = await createWebCryptoSuite1({ vaultId, random: new SeededRandom(seed), keys: [{ e: 1, k: new Uint8Array(32).fill(9) }] });
-			s1.markVerified(1);
-			s1.setSealEpoch(1);
-			return s1;
-		};
-		const crypto = await mk(1);
-		const a = await w.device(A, { crypto, vaultId });
+		const p = await w.suite1(1);
+		const crypto = p.crypto;
+		const a = await w.device(A, p);
 		const keep = bytesOf(50);
 		const drop = bytesOf(51);
 		await putSealed(w.store, crypto, H(keep), keep, a.c.touch);

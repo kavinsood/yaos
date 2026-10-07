@@ -6,11 +6,11 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, blobChunkStream, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, blobChunkStream, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
-import type { DiagnosticsEvent, EnginePhase, StatusSnapshot } from "../../protocol/status";
+import type { DiagnosticsEvent, EnginePhase, KeyMissingReason, StatusSnapshot } from "../../protocol/status";
 import { BlobTouch, committedBlobHashes } from "../blobs/touch";
 import { CheckpointState, type CheckpointDeps } from "../body/checkpoints";
 import { DailyLimitNoticeGate } from "./dailyLimit";
@@ -19,11 +19,13 @@ import type { HandleManager } from "../body/handles";
 import { resolveRefRow, type RefDeps } from "../body/refs";
 import type { Sender } from "../body/sender";
 import type { GateCtx } from "../ingest/gate";
-import type { Mut, Repo } from "../store/repo";
+import type { Mut, OutboxRename, Repo } from "../store/repo";
 import type { OutboxRecord } from "../store/schema";
 import type { CatchUpDeps } from "../sync/catchUp";
 import type { CfgRuntime } from "../sync/cfgRuntime";
 import type { SnapRuntime } from "../sync/snapRuntime";
+import type { KeyringRuntime } from "../keyring/keyringRuntime";
+import { assertWritable, gatedBlob, gatedCrypto } from "../keyring/writeGate";
 import type { NsRuntime } from "../sync/nsRuntime";
 import type { DocRuntime } from "./docRuntime";
 import type { LiveIngest } from "./liveIngest";
@@ -67,6 +69,8 @@ export class EngineCtx {
 	live!: LiveIngest;
 	sess!: SessionLoop;
 	mirror!: MirrorWriter;
+	/** Opened right after the repo, before anything can seal (e2ee-design §12.4). */
+	keyring!: KeyringRuntime;
 
 	phase: EnginePhase = "starting";
 	session: RelaySession | null = null;
@@ -94,17 +98,26 @@ export class EngineCtx {
 	private readonly notices: Notice[] = [];
 	private readonly ring: DiagnosticsEvent[] = [];
 	private statusTimer: TimerHandle | null = null;
+	readonly gate: () => KeyMissingReason | null;
 
 	constructor(readonly opts: EngineOptions) {
 		this.ports = opts.ports;
 		this.deviceClass = opts.deviceClass ?? "desktop";
 		this.tuning = resolveTuning(opts.tuning);
 		this.budgets = resolveBudgets(this.deviceClass, opts.budgets);
-		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes };
 		const c = this;
+		// §14.3: held (reader-dependent) until the keyring is open.
+		const staleCheck = (e: number, seq: Seq | null) => (c.keyring ? c.keyring.staleCheck(e, seq) : "hold" as const);
+		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes, staleCheck };
+		// The one write gate (writeGate.ts): shut until the keyring is open, then whenever it reports key-missing.
+		const gate = (): KeyMissingReason | null => (c.keyring ? c.keyring.keyMissing() : "no-pin");
+		this.gate = gate;
+		// Every blob write (upload, refresh PUT, GC delete) and every seal goes through the gate.
+		const blob = gatedBlob(opts.ports.blob, gate);
+		const crypto = gatedCrypto(opts.ports.crypto, gate, () => c.keyring?.noteSeal());
 		this.touch = new BlobTouch({
-			store: opts.ports.blob,
-			crypto: opts.ports.crypto,
+			store: blob,
+			crypto,
 			hash: opts.ports.hash,
 			clock: opts.ports.clock,
 			graceMs: this.tuning.blobGcGraceMs,
@@ -127,9 +140,9 @@ export class EngineCtx {
 			nowMs: () => c.now(),
 			gateCtx: this.gateCtx,
 			hash: opts.ports.hash,
-			crypto: opts.ports.crypto,
+			crypto,
 			random: opts.ports.random,
-			blob: opts.ports.blob,
+			blob,
 			touch: this.touch,
 			self: opts.deviceId,
 			vaultId: opts.vaultId,
@@ -192,6 +205,17 @@ export class EngineCtx {
 		this.scheduleStatus();
 	}
 
+	/** The phase of a caught-up session: key-missing while the write gate is shut (e2ee-design §9.3). */
+	livePhase(): EnginePhase {
+		if (this.gate() !== null) return "key-missing";
+		return this.dailyLimitUntilMono > this.mono() ? "daily-limit" : "live";
+	}
+
+	/** Host write entry points: refuse up front while the gate is shut (the seal would refuse anyway). */
+	assertWritable(): void {
+		assertWritable(this.gate);
+	}
+
 	onForbidden(): void {
 		if (this.readOnly) return;
 		this.readOnly = true;
@@ -199,7 +223,7 @@ export class EngineCtx {
 	}
 
 	/** Mirror committed outbox transitions into the cache, the sender and the adopt map. */
-	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly updated: readonly OutboxRecord[] }): void {
+	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly updated: readonly OutboxRecord[]; readonly renamed?: readonly OutboxRename[] }): void {
 		const drained = new Set<StreamName>();
 		for (const r of res.removed) {
 			const cls = streamClass(r.stream);
@@ -213,13 +237,25 @@ export class EngineCtx {
 			this.sentPending.delete(r.clientFrameId);
 			this.unregisterAdopt(r.clientFrameId);
 		}
+		// Re-sealed (e2ee-design §14.2 step 4): not committed, so no fold note and the doc is not drained.
+		for (const { old, next } of res.renamed ?? []) {
+			if (next.clientFrameId !== old.clientFrameId) {
+				this.outbox.delete(old.clientFrameId);
+				this.sender.remove(old.clientFrameId);
+				this.sentPending.delete(old.clientFrameId);
+				this.unregisterAdopt(old.clientFrameId);
+				for (const [doc, cf] of this.pendingCreates) if (cf === old.clientFrameId) this.pendingCreates.set(doc, next.clientFrameId);
+			}
+			this.outbox.put(next);
+			this.sender.upsert(next);
+		}
 		for (const r of res.updated) {
 			if (!this.outbox.has(r.clientFrameId)) continue; // removed later in the same result
 			this.outbox.put(r);
 			this.sender.upsert(r);
 			if (r.state !== "adoptable") this.unregisterAdopt(r.clientFrameId);
 		}
-		if (res.removed.length > 0 || res.updated.length > 0) {
+		if (res.removed.length > 0 || res.updated.length > 0 || (res.renamed?.length ?? 0) > 0) {
 			this.mirror.schedule();
 			this.scheduleStatus();
 		}
@@ -376,7 +412,7 @@ export class EngineCtx {
 		if (!this.opts.onStatus || this.statusTimer !== null || this.stopped) return;
 		this.statusTimer = this.ports.clock.setTimer(this.tuning.statusIntervalMs, () => {
 			this.statusTimer = null;
-			if (this.repo) this.opts.onStatus?.(this.status());
+			if (this.repo && this.keyring) this.opts.onStatus?.(this.status());
 		});
 	}
 	clearStatusTimer(): void {

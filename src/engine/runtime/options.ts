@@ -3,7 +3,7 @@
  * defaults are the DESIGN values.
  */
 
-import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, type Budgets, type DeviceClass } from "../../core/limits";
+import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
 import type { ContentHash, DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { SideFilePort } from "../../ports/vault";
@@ -14,6 +14,7 @@ import type { TextChanges } from "../body/textChanges";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import { NS_CANDIDATE_MODULUS, type FoldedNsFrame } from "../sync/nsRuntime";
 import { BLOB_RETRY_BASE_MS, BLOB_RETRY_MAX_MS } from "../blobs/blobQueue";
+import type { EngineE2ee } from "../keyring/keyringRuntime";
 
 export interface EngineTuning {
 	/** Local compaction trigger (DESIGN §d.8). */
@@ -52,6 +53,9 @@ export interface EngineTuning {
 	readonly refRetryMaxMs: number;
 	/** §10.2 quarantine: a ref row's deterministic failures must span at least this long (BLOB_QUARANTINE_MIN_MS). */
 	readonly blobQuarantineMinMs: number;
+	/** Roll trigger (e2ee-design §4.2); tests shrink them. */
+	readonly rollSeqSpan: number;
+	readonly rollOwnSeals: number;
 	/**
 	 * Blob GC grace (e2ee-design §10.4): a sweep deletes an unreferenced blob only if it was uploaded more than this
 	 * long before the cutoff; a device re-uses (R2) or references (R3) a stored blob without re-uploading it only
@@ -84,6 +88,8 @@ export const DEFAULT_TUNING: EngineTuning = {
 	refRetryMs: BLOB_RETRY_BASE_MS,
 	refRetryMaxMs: BLOB_RETRY_MAX_MS,
 	blobQuarantineMinMs: BLOB_QUARANTINE_MIN_MS,
+	rollSeqSpan: ROLL_SEQ_SPAN,
+	rollOwnSeals: ROLL_OWN_SEALS,
 	blobGcGraceMs: 7 * 24 * 60 * 60_000,
 };
 
@@ -96,6 +102,11 @@ export interface EngineOptions {
 	readonly deviceId: DeviceId;
 	readonly deviceClass?: DeviceClass;
 	readonly clientVersion: string;
+	/**
+	 * The suite pin and keyring inputs (e2ee-design §12.4, §18.4). Required, with no default. Only a pinned device
+	 * whose gate opened runs a LogEngine (compose/pinGate.ts); an unpinned one runs the KeyReader and has none.
+	 */
+	readonly e2ee: EngineE2ee;
 	/** Known epoch: open the DB before connecting (offline start). Without it the first connect decides. */
 	readonly vaultEpoch?: VaultEpoch;
 	/** Outbox mirror (DESIGN §e.4); null/absent = no mirror. */

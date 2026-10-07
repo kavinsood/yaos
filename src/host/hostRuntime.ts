@@ -18,8 +18,10 @@ import type { EngineResultValue, EngineSettings, HostIoOp, HostIoResult, MainRes
 import type { StatusSnapshot } from "../protocol/status";
 import { BindingManager } from "./binding";
 import { DiskExecutor } from "./diskExecutor";
-import { EngineHost, type CarrierKind, type EngineCarrier, type EngineEventMessage, type EngineRequestMessage } from "./engineHost";
+import { EngineHost, HostRequestError, type CarrierKind, type EngineCarrier, type EngineEventMessage, type EngineRequestMessage } from "./engineHost";
 import { engineHashOracle } from "./hashOracle";
+import { KeyRefused, type HostKeys } from "./keys/hostKeys";
+import { KeyStoreError } from "./keys/secretStore";
 import { VaultEventBatcher, buildInitConfig, deviceClassFor, observationChunks, type HostIdentity } from "./runtimeSupport";
 
 export interface HostUiSink {
@@ -39,6 +41,8 @@ export interface HostRuntimeDeps {
 	readonly platform: PlatformPort;
 	readonly identity: HostIdentity;
 	readonly settings: () => EngineSettings;
+	/** The engine's keys and the keyringChanged store (e2ee-design §6.3, §18.4). */
+	readonly keys: HostKeys;
 	readonly createWorker: () => EngineCarrier | null;
 	readonly createInline: () => EngineCarrier;
 	readonly ui: HostUiSink;
@@ -95,12 +99,13 @@ export class HostRuntime {
 			forceInline: deps.forceInline,
 			pingEnabled: deps.pingEnabled ?? true,
 			log: deps.log,
-			initConfig: (carrier, workerSupported) => {
+			initConfig: async (carrier, workerSupported) => {
 				this.deviceClass = deviceClassFor(deps.platform.info, carrier);
+				// Keys are loaded per start, as fresh buffers that move into the engine (§6.3).
 				return buildInitConfig({
 					identity: deps.identity, platform: deps.platform.info, carrier, workerSupported,
 					configDir: deps.vault.configDir, caseInsensitiveFs: deps.vault.caseInsensitive,
-					settings: deps.settings(), side: deps.sideFiles,
+					settings: deps.settings(), side: deps.sideFiles, crypto: await deps.keys.crypto(),
 				});
 			},
 			handlers: {
@@ -259,7 +264,24 @@ export class HostRuntime {
 				return { t: "sideFile", bytes: await this.deps.sideFiles.read(m.name) };
 			case "hostIo":
 				return { t: "hostIo", result: await this.hostIo(m.op) };
+			case "keyringChanged":
+				return this.keyringChanged(m);
 		}
+	}
+
+	/**
+	 * §18.4 persist-before-use: the answer goes out only after SecretStorage holds the change and main saved its pin
+	 * decision. Failures carry fixed, secret-free text (never the SecretStorage error or any value).
+	 */
+	private async keyringChanged(m: Extract<EngineRequestMessage, { t: "keyringChanged" }>): Promise<MainResultValue> {
+		try {
+			await this.deps.keys.persist({ keys: m.keys, records: m.records, pending: m.pending });
+		} catch (error) {
+			if (error instanceof KeyRefused) throw new HostRequestError({ code: "refused", message: error.message, retryable: false });
+			if (error instanceof KeyStoreError) throw new HostRequestError({ code: "vault-io", message: error.message, retryable: error.reason === "unavailable" });
+			throw new HostRequestError({ code: "internal", message: "could not store the vault key", retryable: true });
+		}
+		return { t: "keyringStored" };
 	}
 
 	private async hostIo(op: HostIoOp): Promise<HostIoResult> {

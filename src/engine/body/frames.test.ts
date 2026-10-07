@@ -34,7 +34,7 @@ const hash = createWebHash();
 const crypto = createNoopCrypto(hash);
 const VAULT = "v1" as VaultId;
 const ctx: FrameCtx = { vaultId: VAULT, self: "dev1" as DeviceId, crypto, hash, random: createWebRandom(), blob: null, touch: { reuse: async () => true, noted: async () => {} } };
-const gctx: GateCtx = { crypto, vaultId: VAULT, maxCheckpointStateBytes: 1 << 20 };
+const gctx: GateCtx = { crypto, vaultId: VAULT, maxCheckpointStateBytes: 1 << 20, staleCheck: () => null };
 const BODY = "b:doc1" as StreamName;
 
 function textUpdate(chars: number, ch = "a"): Uint8Array {
@@ -243,7 +243,7 @@ async function suite1(tag: number, o: { e2?: Uint8Array | null; verified?: reado
 test("suite 1, log path: x: named by the blob address; full 768 KiB chunk frames seal under the 1 MiB relay frame and pass the gate", async () => {
 	const s1 = await suite1(0xe1);
 	const c1: FrameCtx = { ...ctx, vaultId: VAULT1, crypto: s1 };
-	const g1: GateCtx = { crypto: await suite1(0xe2), vaultId: VAULT1, maxCheckpointStateBytes: 1 << 20 };
+	const g1: GateCtx = { crypto: await suite1(0xe2), vaultId: VAULT1, maxCheckpointStateBytes: 1 << 20, staleCheck: () => null };
 	const u = noiseBytes(3 * BLOB_CHUNK_BYTES - 1000);
 	const h = toHex(await hash.sha256(u)) as ContentHash;
 	const frames = await buildBodyFrames(c1, { stream: BODY, content: u, flags: 0, authorNsSeq: 0 as Seq, dependsOn: null, nowMs: 0 });

@@ -65,7 +65,7 @@ function rec(stream: StreamName, kind: OutboxRecord["kind"], content: Uint8Array
 	return {
 		clientFrameId: `t${String(i).padStart(21, "0")}` as ClientFrameId, order: i, stream, kind, state: "pending",
 		sealed: content, content, authorNsSeq: 0 as Seq, flags: 0, frameNo: null, dependsOn: null, adoptOf: null,
-		attempts: 0, createdAtMs: 0, lastSentAtMs: 0,
+		attempts: 0, createdAtMs: 0, lastSentAtMs: 0, keyEpoch: 0,
 	};
 }
 const nsCreate = (hash: ContentHash) => rec(NS_STREAM, "nsOps", encodeNsOps([

@@ -6,13 +6,15 @@ import {
 } from "./pairFlow";
 import { PairingError, prepareEnrollment, type HttpRequest, type HttpResponse, type PairingDeps } from "./pairing";
 import { defaultPluginData, sanitizePluginData, type PairedIdentity, type YaosPluginData } from "./api";
+import { testVaultId } from "../keys/testkit/vaultIds";
 
 const CODE = "pc_ABCDEFGHIJKLMNOPQRSTUVWX";
+const VAULT = testVaultId("vaultOne");
 const CAPS: HttpResponse = { status: 200, json: { claimed: true, streams: 1 } };
 
 function okEnroll(req: HttpRequest): HttpResponse {
 	const b = JSON.parse(req.body ?? "{}") as Record<string, string>;
-	return { status: 200, json: { host: "https://sync.example.com", deviceToken: b.deviceToken, vaultId: "vault-1", deviceId: b.deviceId, deviceName: b.deviceName ?? "", vaultGeneration: "g1" } };
+	return { status: 200, json: { host: "https://sync.example.com", deviceToken: b.deviceToken, vaultId: VAULT, deviceId: b.deviceId, deviceName: b.deviceName ?? "", vaultGeneration: "g1" } };
 }
 
 function scripted(responses: (HttpResponse | Error | ((r: HttpRequest) => HttpResponse))[]) {
@@ -46,7 +48,7 @@ test("PairingSession reuses the attempt for a retry of the same input, and drops
 	assert.equal(first.enrollmentRequestId, second.enrollmentRequestId);
 	assert.equal(first.deviceToken, second.deviceToken);
 	assert.equal(identity.deviceToken, second.deviceToken);
-	assert.equal(identity.vaultId, "vault-1");
+	assert.equal(identity.vaultId, VAULT);
 });
 
 test("PairingSession uses a fresh attempt when the input changes or after clear()", async () => {
@@ -81,7 +83,7 @@ test("PairingSession is single-flight and rejects bad input before any request",
 });
 
 test("applyPairedIdentity / clearIdentity", () => {
-	const identity: PairedIdentity = { host: "https://h.example", vaultId: "v", deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "t".repeat(43), deviceName: "Work laptop", vaultGeneration: null };
+	const identity: PairedIdentity = { host: "https://h.example", vaultId: testVaultId("v"), deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "t".repeat(43), deviceName: "Work laptop", vaultGeneration: null };
 	const d = defaultPluginData("Mac");
 	const paired = applyPairedIdentity(d, identity);
 	assert.equal(paired.identity, identity);
@@ -139,12 +141,12 @@ test("resumePendingEnrollment sends the stored attempt once with the identical i
 });
 
 test("resumePendingEnrollment reports the identity it replaced, for the caller to revoke", async () => {
-	const old: PairedIdentity = { host: "https://old.example", vaultId: "v0", deviceId: "dev_OLDOLDOLDOLDOLDO", deviceToken: "o".repeat(43), deviceName: "Mac", vaultGeneration: null };
+	const old: PairedIdentity = { host: "https://old.example", vaultId: testVaultId("v0"), deviceId: "dev_OLDOLDOLDOLDOLDO", deviceToken: "o".repeat(43), deviceName: "Mac", vaultGeneration: null };
 	const h = memHost({ ...pendingData(), identity: old });
 	const r = await resumePendingEnrollment(h, scripted([okEnroll]).deps);
 	assert.ok(r?.ok);
 	assert.equal(r.replaced, old);
-	assert.equal(h.data().identity?.vaultId, "vault-1");
+	assert.equal(h.data().identity?.vaultId, VAULT);
 });
 
 test("resumePendingEnrollment keeps the attempt on a server error, drops it on a refusal; nothing pending sends nothing", async () => {
@@ -170,7 +172,7 @@ test("enrollmentFailureIsFinal; pairing and unpairing drop the pending attempt",
 	const d = pendingData();
 	const p = d.pendingEnrollment;
 	assert.ok(p);
-	const identity: PairedIdentity = { host: p.host, vaultId: "v", deviceId: p.deviceId, deviceToken: p.deviceToken, deviceName: "Mac", vaultGeneration: null };
+	const identity: PairedIdentity = { host: p.host, vaultId: testVaultId("v"), deviceId: p.deviceId, deviceToken: p.deviceToken, deviceName: "Mac", vaultGeneration: null };
 	assert.equal(applyPairedIdentity(d, identity).pendingEnrollment, undefined);
 	assert.equal(applyPairedIdentity(d, { ...identity, deviceId: "dev_BBBBBBBBBBBBBBBB" }).pendingEnrollment, p, "another device's attempt stays");
 	assert.equal(clearIdentity(d).pendingEnrollment, undefined);

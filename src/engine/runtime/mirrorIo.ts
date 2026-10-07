@@ -157,7 +157,7 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 	const picked = await pickOutboxMirror(raw, identityOf(c), c.ports.hash);
 	if (!picked || picked.mirror.frames.length === 0) return 0;
 	const now = c.now();
-	const opened: { f: OutboxMirrorFrame; kind: OutboxRecord["kind"]; flags: number; frameNo: number; content: Uint8Array }[] = [];
+	const opened: { f: OutboxMirrorFrame; kind: OutboxRecord["kind"]; flags: number; frameNo: number; keyEpoch: number; content: Uint8Array }[] = [];
 	const chunks = new Map<string, BlobChunkContent[]>();
 	for (const f of picked.mirror.frames) {
 		const o = await openEnvelope(c.ports.crypto, c.opts.vaultId, { t: "frame", stream: f.stream, deviceId: c.self, clientFrameId: f.clientFrameId }, f.sealed);
@@ -165,7 +165,7 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 			c.diag("mirror-frame-unreadable", { reason: o.reason });
 			continue;
 		}
-		opened.push({ f, kind: o.inner.kind, flags: o.inner.flags, frameNo: o.inner.frameNo, content: o.inner.content });
+		opened.push({ f, kind: o.inner.kind, flags: o.inner.flags, frameNo: o.inner.frameNo, keyEpoch: o.header.keyEpoch, content: o.inner.content });
 		if (streamClass(f.stream) === "blobchunk") {
 			const d = decodeBlobChunk(o.inner.content);
 			if (d) {
@@ -176,7 +176,7 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 		}
 	}
 	const records: OutboxRecord[] = [];
-	for (const { f, kind, flags, frameNo, content } of opened) {
+	for (const { f, kind, flags, frameNo, keyEpoch, content } of opened) {
 		let local = content;
 		if (kind === "bodyUpdateRef") {
 			local = new Uint8Array(0);
@@ -189,7 +189,7 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 		}
 		records.push({
 			clientFrameId: f.clientFrameId, order: f.order, stream: f.stream, kind, state: f.state, sealed: f.sealed, content: local,
-			authorNsSeq: f.authorNsSeq, flags, frameNo: frameNo === 0 ? null : frameNo, dependsOn: f.dependsOn,
+			authorNsSeq: f.authorNsSeq, flags, frameNo: frameNo === 0 ? null : frameNo, keyEpoch, dependsOn: f.dependsOn,
 			adoptOf: f.adoptOf ? { ...f.adoptOf, receivedAtMs: now } : null, attempts: 0, createdAtMs: now, lastSentAtMs: 0,
 		});
 	}

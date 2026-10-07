@@ -3,9 +3,10 @@
  * No node imports: typechecks with the strict client tsconfig.
  */
 
-import type { ClientFrameId, DeviceId, Seq, StreamName, VaultId } from "../core/types";
+import type { ClientFrameId, DeviceId, Seq, StreamName } from "../core/types";
 import type { AppendFrame, RelayConnectResult, RelayEvent } from "../ports/relay";
 import type { VirtualClock } from "./clock";
+import { SIM_VAULT_ID } from "./net";
 import type { SimRelay, SimRelaySession } from "./relay";
 
 export interface RelayPeer {
@@ -31,7 +32,7 @@ export function frame(stream: string, clientFrameId: string, payload: string | r
 
 export async function connectRaw(relay: SimRelay, clock: VirtualClock, deviceId: string): Promise<RelayConnectResult> {
 	let result: RelayConnectResult | null = null;
-	void relay.connect({ vaultId: "vault-1" as VaultId, deviceId: deviceId as DeviceId }).then((r) => {
+	void relay.connect({ vaultId: SIM_VAULT_ID, deviceId: deviceId as DeviceId }).then((r) => {
 		result = r;
 	});
 	await clock.runUntil(() => result !== null, 3_600_000);

@@ -4,7 +4,8 @@
  * readStream() pages read(stream, appliedSeq, preferCheckpoint = appliedSeq
  * === 0), gates every page BEFORE its transaction and commits it with
  * T_read_page:
- *  - own row whose clientFrameId is in the outbox  -> late receipt;
+ *  - own row whose clientFrameId is in the outbox  -> late receipt (committed stale: renamed to a copy,
+ *                                                     ownCommitCopy);
  *  - other device's row matching an adoptable      -> settle (stored, not re-applied);
  *  - everything else                               -> gateRow (tail / quarantine / accounted).
  *
@@ -30,16 +31,20 @@
 import { CheckpointEncoding } from "../../core/envelope";
 import { NS_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
 import type { HashPort } from "../../ports/crypto";
+import type { RandomPort } from "../../ports/random";
 import type { ReadPage, RelaySession } from "../../ports/relay";
 import { unionBodyCheckpoint, type CompactDeps } from "../body/compaction";
 import { gate, type GateCtx } from "../ingest/gate";
+import type { OutboxRename, OwnCommitCopy } from "../store/repo";
 import type { OutboxRecord, QuarantineRecord, SnapshotRecord, StreamRecord, TailRecord } from "../store/schema";
-import { gateRow } from "./ingestRow";
+import { gateRow, ownCommitCopy } from "./ingestRow";
 
 export interface CatchUpDeps extends CompactDeps {
 	readonly gateCtx: GateCtx;
 	readonly hash: HashPort;
 	readonly self: DeviceId;
+	/** Ids for the copies of own stale commits. */
+	readonly random: RandomPort;
 	/** Own adoptable shadowing (deviceId, clientFrameId), if any (DESIGN §d.5 settle). */
 	adoptFor(deviceId: DeviceId, clientFrameId: ClientFrameId): ClientFrameId | null;
 	diag(code: string, fields: Record<string, string | number | boolean | null>): void;
@@ -68,6 +73,7 @@ export interface ReadResult {
 	readonly replacedFold: boolean;
 	readonly removed: OutboxRecord[];
 	readonly updated: OutboxRecord[];
+	readonly renamed: OutboxRename[];
 	/** Tail rows to apply to a resident replica (late receipts and settled adoptables excluded). */
 	readonly apply: TailRecord[];
 	/** Every tail row written. */
@@ -85,6 +91,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	const cls = streamClass(stream);
 	const removed: OutboxRecord[] = [];
 	const updated: OutboxRecord[] = [];
+	const renamed: OutboxRename[] = [];
 	const apply: TailRecord[] = [];
 	const tailPut: TailRecord[] = [];
 	let checkpointState: Uint8Array | null = null;
@@ -92,12 +99,13 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	let pages = 0;
 	let rowsSeen = 0;
 	const result = (t: ReadResult["t"], error?: string): ReadResult => ({
-		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, apply, tailPut, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
+		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, renamed, apply, tailPut, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
 	});
-	if (cls === "other" || cls === "keyring") return result("done");
+	if (cls === "other") return result("done");
 	const start = repo.stream(stream);
 	let after = opts.fromSeq ?? start?.appliedSeq ?? 0;
-	let preferCheckpoint = after === 0;
+	// `k` has no checkpoints (e2ee-design §18.3): every record is read.
+	let preferCheckpoint = after === 0 && cls !== "keyring";
 	let disputedRetry = false;
 	let first = opts.first && opts.first.afterSeq === after && opts.first.preferCheckpoint === preferCheckpoint ? opts.first.page : null;
 	for (;;) {
@@ -112,7 +120,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 		if (!opts.stillValid()) return result("aborted");
 		pages++;
 		let freshSnapshot: SnapshotRecord | null = null;
-		const ck = page.checkpoint;
+		const ck = cls === "keyring" ? null : page.checkpoint;
 		const rec = repo.stream(stream);
 		if (ck && ck.coversSeq > (rec?.snapshotCoversSeq ?? 0)) {
 			const disputedBefore = rec !== undefined && rec.disputedCheckpointCoversSeq === ck.coversSeq;
@@ -163,7 +171,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 		}
 		const rows: TailRecord[] = [];
 		const quarantines: QuarantineRecord[] = [];
-		const lateReceipts: { clientFrameId: ClientFrameId; seq: Seq }[] = [];
+		const lateReceipts: { clientFrameId: ClientFrameId; seq: Seq; copy?: OwnCommitCopy }[] = [];
 		const settleAdoptables: ClientFrameId[] = [];
 		const settledSeqs = new Set<Seq>();
 		const receiptSeqs = new Set<Seq>();
@@ -172,7 +180,8 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 			if (r.deviceId === deps.self) {
 				const ob = deps.outbox.get(r.clientFrameId);
 				if (ob && ob.stream === stream) {
-					lateReceipts.push({ clientFrameId: r.clientFrameId, seq: r.seq });
+					const copy = ownCommitCopy(deps.gateCtx, deps.random, deps.self, ob, r.seq);
+					lateReceipts.push(copy ? { clientFrameId: r.clientFrameId, seq: r.seq, copy } : { clientFrameId: r.clientFrameId, seq: r.seq });
 					receiptSeqs.add(r.seq);
 					continue;
 				}
@@ -195,6 +204,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 		}, deps.nowMs());
 		removed.push(...out.removed);
 		updated.push(...out.updated);
+		renamed.push(...out.renamed);
 		tailPut.push(...out.tailPut);
 		for (const row of out.tailPut) if (!receiptSeqs.has(row.seq) && !settledSeqs.has(row.seq)) apply.push(row);
 		if (!page.more) return result("done");

@@ -10,8 +10,10 @@ import {
 	createWorkerHostTransport,
 	owned,
 	postOwned,
+	secretBuffersOf,
 	transferablesOf,
 	TransferOwnershipError,
+	wipeSecrets,
 	type WorkerLike,
 	type WorkerScopeLike,
 } from "./workerTransport";
@@ -104,6 +106,7 @@ function mainTrace(): MainToEngine[] {
 					snapshots: { enabled: false, keepDaily: 3, uploadToBlobStore: false },
 				},
 				sideState: { outboxMirror: [bytes(1, 2, 3), null], syncedMirror: [null, bytes(9)] },
+				crypto: { suite: 1, keys: [{ e: 1, k: bytes(11, 12) }, { e: 2, k: bytes(13) }], records: [bytes(14, 15)] },
 			},
 		},
 		{ t: "ping", rid: 2 },
@@ -123,6 +126,12 @@ function mainTrace(): MainToEngine[] {
 		{ t: "docCredit", bytes: 3 },
 		{ t: "lifecycle", event: "pagehide" },
 		{ t: "error", re: 4, error: { code: "timeout", message: "t", retryable: true } },
+		{ t: "command", rid: 5, command: { t: "installKey", source: "qr", e: 3, k: bytes(21, 22) } },
+		{ t: "command", rid: 6, command: { t: "installKey", source: "rk", rk: bytes(23) } },
+		{ t: "command", rid: 7, command: { t: "enableE2ee", rk: bytes(24) } },
+		{ t: "command", rid: 8, command: { t: "revokeRekey", rk: bytes(25) } },
+		{ t: "command", rid: 9, command: { t: "pinSuite0", source: "link" } },
+		{ t: "result", re: 5, value: { t: "keyringStored" } },
 	];
 }
 
@@ -152,6 +161,7 @@ function engineTrace(): EngineToMain[] {
 		{ t: "sideFileWrite", rid: 3, name: "outbox-a.bin", bytes: bytes(8, 8, 8, 8) },
 		{ t: "docRetarget", docId: D1, change: { t: "renamed", path: "z.md" } },
 		{ t: "notice", level: "warn", code: "c", message: "m" },
+		{ t: "keyringChanged", rid: 5, keys: [{ e: 3, k: bytes(31, 32) }], records: [bytes(33)], pending: null },
 	];
 }
 
@@ -217,6 +227,23 @@ test("transferablesOf: lists every [T] buffer and rejects non-owned views", () =
 		() => transferablesOf({ t: "hashRequest", rid: 1, items: [{ path: "a.md", want: "fingerprint", bytes: shared }, { path: "b.md", want: "fingerprint", bytes: shared }] }),
 		TransferOwnershipError,
 	);
+});
+
+test("SECRET buffers: listed, transferred, and wiped on a copying sender (e2ee-design §6.3, §18.4)", () => {
+	const all = [...mainTrace(), ...engineTrace()];
+	const secrets = all.flatMap((m) => secretBuffersOf(m));
+	// init keys (2), the four secret commands (4), keyringChanged keys (1); records are public.
+	assert.equal(secrets.length, 7);
+	for (const m of all) {
+		const t = new Set(transferablesOf(m));
+		for (const b of secretBuffersOf(m)) assert.ok(t.has(b.buffer as ArrayBuffer), `${m.t}: secret is transferred`);
+	}
+	for (const m of all) wipeSecrets(m);
+	assert.ok(secrets.every((b) => b.every((x) => x === 0)), "a structured-clone sender keeps no key bytes");
+	// A detached (transferred) buffer is left alone.
+	const k = bytes(1, 2);
+	structuredClone(k, { transfer: [k.buffer] });
+	assert.doesNotThrow(() => wipeSecrets({ t: "command", rid: 1, command: { t: "revokeRekey", rk: k } }));
 });
 
 test("worker and inline carriers deliver identical results on the recorded trace; [T] buffers are detached", async () => {
