@@ -109,13 +109,13 @@ test("load() returns fresh buffers each time (zero-filling one leaves the store 
 	assert.ok(sameKeys(store.load()!.keys, [key(1, 9)]));
 });
 
-test("merge never replaces a held epoch; adds new epochs; records follow the latest non-empty set", () => {
+test("merge: a re-export replaces the held epoch (an own key that lost); adds new epochs; records follow the latest non-empty set", () => {
 	const clock = new VirtualClock();
 	const store = new VaultKeyStore(new FakeSecretStorage(), testVaultId("v1"), clock);
 	store.merge({ keys: [key(1, 1)], records: [record(1)] });
 	const c = store.merge({ keys: [key(1, 2), key(2, 3)], records: [record(1), record(2)] });
 	assert.deepEqual(c, { keys: 2, records: 2 });
-	assert.ok(sameKeys(store.load()!.keys, [key(1, 1), key(2, 3)]));
+	assert.ok(sameKeys(store.load()!.keys, [key(1, 2), key(2, 3)]));
 	// Records-only flush (keys: []) keeps the keys and takes the records.
 	const d = store.merge({ keys: [], records: [record(3)] });
 	assert.deepEqual(d, { keys: 2, records: 1 });

@@ -225,8 +225,10 @@ export class VaultKeyStore {
 	}
 
 	/**
-	 * Persist a keyringChanged (§18.4, before main acks it): new epochs are added, a held epoch is never replaced
-	 * (§6.1; the engine never exports two keys for one epoch), and the records become the engine's winning set.
+	 * Persist a keyringChanged (§18.4, before main acks it): each exported key is stored under its epoch, and the
+	 * records become the engine's winning set. The engine exports a key once; it exports another for the same epoch
+	 * only after dropping the first (an own pending key whose record lost, keyring/evaluate.ts), so the newer
+	 * export replaces the held one.
 	 * Returns how many keys and records the store holds afterwards. Throws KeyStoreError (fixed text).
 	 */
 	merge(change: StoredKeys): { readonly keys: number; readonly records: number } {
@@ -241,8 +243,8 @@ export class VaultKeyStore {
 		const keys: EpochKey[] = cur ? [...cur.keys] : [];
 		for (const nk of change.keys) {
 			if (!isEpoch(nk.e) || nk.k.length !== KEY_BYTES) throw new KeyStoreError("write-failed");
-			const held = keys.find((x) => x.e === nk.e);
-			if (held) continue; // never replaced; equal bytes are the common case (a re-export)
+			const i = keys.findIndex((x) => x.e === nk.e);
+			if (i >= 0) keys.splice(i, 1);
 			keys.push({ e: nk.e, k: nk.k.slice() });
 		}
 		keys.sort((a, b) => a.e - b.e);
