@@ -9,19 +9,23 @@
  * payload; resend same id -> deduped receipt with the original seq; feed paging; read paging by maxBytes;
  * checkpoint ok / conflict / not-advancing / ahead-of-stream / stream-not-found, read with checkpoint=1;
  * ping -> head (short liveness override); close/reconnect -> new session whose headSeq covers the
- * earlier rows (also for a peer that missed a row while offline); cross-session dedupe; frame-id-conflict.
+ * earlier rows (also for a peer that missed a row while offline); cross-session dedupe; frame-id-conflict;
+ * the blob store adapter (src/engine/adapters/httpBlob.ts, R2): probe, A puts 300 KiB, B has + gets it. Blobs
+ * travel over HTTP only, never the sequence log.
  *
  * Writes LOG_DIR/client-e2e-wpc-smoke-<label>-<stamp>.json (no secrets) and exits 1 on any failure.
  */
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { probeHttpBlob } from "../../src/engine/adapters/httpBlob";
 import { createRelayHttp, RelayHttpError } from "../../src/engine/adapters/relayHttp";
 import { createWebClock } from "../../src/engine/adapters/webClock";
 import { createWebRandom } from "../../src/engine/adapters/webRandom";
 import { createWsRelayPort, type WsRelayOptions } from "../../src/engine/adapters/wsRelay";
 import { base64urlEncode } from "../../src/core/codec/ids";
 import type { ClientFrameId, DeviceId, StreamName, VaultId } from "../../src/core/types";
+import type { BlobAddress } from "../../src/ports/crypto";
 import type { RelayConnectResult, RelayEvent, RelaySession } from "../../src/ports/relay";
 import { DEFAULT_LOG_DIR, onboardVault, redact, type OnboardedVault, type OnboardDevice } from "./onboard";
 
@@ -182,6 +186,24 @@ async function main(): Promise<OnboardedVault> {
 		{ via: vault.via, vaultIdPrefix: vault.vaultId.slice(0, 8), generation: vault.vaultGeneration });
 	const vaultId = vault.vaultId as VaultId;
 	const httpB = createRelayHttp({ baseUrl: HOST, credential: devB.deviceToken, clock });
+
+	step("blob store (R2) over HTTP");
+	const blobA = await probeHttpBlob({ baseUrl: HOST, vaultId, credential: devA.deviceToken, clock });
+	const blobB = await probeHttpBlob({ baseUrl: HOST, vaultId, credential: devB.deviceToken, clock });
+	check("capabilities: attachments on (R2 bound), maxBlobBytes > 0", !!blobA && !!blobB && blobA.maxBlobBytes > 0, { maxBlobBytes: blobA?.maxBlobBytes ?? null });
+	if (blobA && blobB) {
+		const blob = payloadOf("smoke blob", 300 * 1024);
+		const address = Buffer.from(random.bytes(32)).toString("hex") as BlobAddress;
+		const tPut = now();
+		await blobA.put(address, [blob.subarray(0, 1000), blob.subarray(1000)]);
+		record("blob_put_300k_ms", now() - tPut);
+		const present = await blobB.has([address]);
+		check("B has() the address", present.has(address), [...present].length);
+		const tGet = now();
+		const got = await blobB.get(address);
+		record("blob_get_300k_ms", now() - tGet);
+		check("B get() returns the parts' concatenation", bytesEqual(got, blob), { bytes: got?.byteLength ?? null });
+	}
 
 	step("connect refusals");
 	const bogus = await portFor({ deviceToken: `bogus-${random.bytes(4).join("")}` }).connect({ vaultId, deviceId: devA.deviceId as DeviceId });

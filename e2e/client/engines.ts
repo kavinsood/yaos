@@ -1,7 +1,7 @@
 /**
  * WP-C engine e2e: headless LogEngines (production adapters, fake-indexeddb) syncing through a REAL streams
  * relay. See README.md. Scenarios: create/edit convergence, keystroke -> peer latency (provisional path),
- * concurrent edits, rename/delete, offline edits + reconnect catch-up, large update via x: chunks, checkpoint
+ * concurrent edits, rename/delete, offline edits + reconnect catch-up, large update via the blob store, checkpoint
  * duty, fresh-device catch-up (feed/read/checkpoint), restart from IndexedDB, IDB loss -> outbox mirror
  * recovery, relay process restart (local only; --relay-restart).
  *
@@ -144,11 +144,13 @@ async function main(): Promise<void> {
 	R.check("b outbox drained", b.e.c.outbox.size === 0);
 	R.extra.reconnectReads = b.e.c.sess.stats.reads - reads0;
 
-	R.step("large update via x: chunks");
+	R.step("large update via the blob store (bodyUpdateRef)");
 	const big = "L".repeat(1_300_000);
 	await a.e.editDoc(ids[6]!, (x) => x.insert(x.length, big));
 	R.record("large_update_converge_ms", await converge([a, b], 60_000));
 	R.check("b has the 1.3 MB update", (await b.e.docText(ids[6]!)).length === "b1 body;".length + big.length);
+	const tail = await b.e.c.repo.getTail(b.e.streamOf(ids[6]!), 0);
+	R.check("the update rode the log only as a small bodyUpdateRef (its bytes are in R2)", tail.every((r) => r.content.length < 64 * 1024), { kinds: tail.map((r) => r.kind) });
 
 	R.step("checkpoint duty (relay CAS)");
 	const kdoc = ids[3]!;

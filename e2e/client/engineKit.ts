@@ -1,7 +1,9 @@
 /**
  * Helpers for the engine e2e (engines.ts): checks + JSON report (no secrets), and headless LogEngines on
  * the production adapters: wsRelay + relayHttp (RelayPort), idbStorage on fake-indexeddb (one IDBFactory
- * per device, reused across restarts), suite-0 crypto, web clock/hash/random, in-memory side files.
+ * per device, reused across restarts), suite-0 crypto, web clock/hash/random, in-memory side files, and the
+ * relay's blob store over HTTP (httpBlob; R2, probed at start like webEngine) for updates above
+ * MAX_INLINE_UPDATE_BYTES: their bytes never ride the relay log.
  */
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -9,6 +11,7 @@ import { join } from "node:path";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import type { DeviceId, DocId, VaultId } from "../../src/core/types";
 import { applyChanges, type ChangeSink } from "../../src/engine/body/textChanges";
+import { probeHttpBlob } from "../../src/engine/adapters/httpBlob";
 import { createIdbStoragePort } from "../../src/engine/adapters/idbStorage";
 import { createNoopCrypto } from "../../src/engine/adapters/noopCrypto";
 import { createWebClock } from "../../src/engine/adapters/webClock";
@@ -131,11 +134,13 @@ export class Device {
 		const clock = createWebClock();
 		const random = createWebRandom();
 		const hash = createWebHash();
+		const blobOpts = { baseUrl: host, vaultId, credential: this.dev.deviceToken, clock };
+		const blob = await probeHttpBlob(blobOpts);
 		this.engine = await LogEngine.start({
 			ports: {
 				relay: createWsRelayPort({ baseUrl: host, credential: this.dev.deviceToken, clock, random }),
 				storage: createIdbStoragePort(this.factory, IDBKeyRange),
-				clock, random, crypto: createNoopCrypto(hash), hash, blob: null,
+				clock, random, crypto: createNoopCrypto(hash), hash, blob, probeBlob: () => probeHttpBlob(blobOpts),
 			},
 			vaultId: vaultId as VaultId,
 			deviceId: this.dev.deviceId as DeviceId,

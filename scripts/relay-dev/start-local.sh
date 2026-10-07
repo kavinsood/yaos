@@ -1,9 +1,13 @@
 #!/bin/zsh
-# Local streams relay for the client remake: `wrangler dev` (real workerd + local DO SQLite) with
-# no R2, the same config as the deployed e2e worker (scripts/relay-dev/deploy.sh). --r2 keeps the YAOS_BUCKET
-# binding (a local emulated bucket under the state dir), so attachments and snapshot uploads work.
+# Local streams relay for the client remake: `wrangler dev` (real workerd + local DO SQLite) with the
+# YAOS_BUCKET R2 binding (a local emulated bucket under the state dir; scripts/relay-dev/config.sh), so
+# attachments, oversized updates and snapshot parts upload over HTTP PUT. Blobs never ride the sequence log.
+# --r2 is accepted and does nothing (R2 is the default). --no-r2 drops the binding (503 attachments_unavailable;
+# clients then do not sync attachments): only for the store-less path (conformance T-BLOB-UNAVAILABLE).
+# Every start, including a restart mid-run (e2e/client/fullKit.ts relay.start, engines.ts --relay-restart),
+# keeps the binding unless --no-r2 is passed.
 #
-#   scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--r2] [--var K=V]...
+#   scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--r2 | --no-r2] [--var K=V]...
 #
 # Starts in the background (nohup; log at experiments/logs/client-e2e-local-<port>-<ts>.log), waits until
 # /api/capabilities advertises streams=1, then prints the base URL as the last stdout line.
@@ -20,7 +24,8 @@ while (( $# )); do
   case $1 in
     --port) PORT=$2; shift 2;;
     --fresh) FRESH=1; shift;;
-    --r2) export RELAY_DEV_R2=1; shift;;
+    --r2) shift;;
+    --no-r2) export RELAY_DEV_R2=0; shift;;
     --var) VARS+=("$2"); shift 2;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac

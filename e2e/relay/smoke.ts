@@ -9,14 +9,15 @@
  * key is kept in a 0600 context file under the log dir); a claimed one is entered through operator login
  * (key from that context file or --operator-context <json with operatorRecoveryKey>) and gets a new vault.
  *
- * Steps: enroll A + B, streams tickets, sockets, VAULT_READY; append ns + b:<doc> from A (B sees
+ * Steps: enroll A + B, a blob PUT by A and GET by B (the R2 store: attachments travel over HTTP, never the
+ * sequence log), streams tickets, sockets, VAULT_READY; append ns + b:<doc> from A (B sees
  * PROVISIONAL -> COMMIT_NOTICE and COMMITTED with seqs, A gets receipts); append->receipt latency series;
  * reconnect A + resend (deduped receipts, same seqs, no re-delivery) + id conflict; ping/pong; bulk append
  * (segment seal); feed paging; catch-up read paging; checkpoint CAS ok / 409 conflict / GC / read with checkpoint
  * / advancing CAS. Results (pass/fail + latencies, no secrets) go to <log dir>/client-e2e-smoke-<label>-<ts>.json.
  * Exit code 1 when any check fails.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -344,6 +345,18 @@ async function main() {
 	const vault = await setupVault();
 	check(`vault ready via ${vault.via}`, typeof vault.vaultId === "string" && vault.vaultId.length > 0);
 	const vaultPath = `/vault/${encodeURIComponent(vault.vaultId)}`;
+
+	step("blob store (R2): HTTP PUT + GET, never the relay log");
+	check("attachments capability (R2 bound)", caps.value?.attachments === true, caps.value?.attachments);
+	const blob = randomBytes(300 * 1024);
+	const blobHash = createHash("sha256").update(blob).digest("hex");
+	const put = await http("PUT", `${vaultPath}/blobs/${blobHash}`, { token: vault.a.deviceToken, body: blob, timing: "blob_put_300k_ms" });
+	check("blob PUT 2xx", put.status >= 200 && put.status < 300, put.status);
+	const tGet = now();
+	const got = await fetch(`${HOST}${vaultPath}/blobs/${blobHash}`, { headers: { Authorization: `Bearer ${vault.b.deviceToken}` } });
+	const gotBytes = new Uint8Array(await got.arrayBuffer());
+	record("blob_get_300k_ms", now() - tGet);
+	check("blob GET by the other device returns the bytes", got.status === 200 && Buffer.from(gotBytes).equals(blob), { status: got.status, bytes: gotBytes.byteLength });
 
 	step("tickets + sockets");
 	let a = await StreamSocket.open(vault, vault.a, "A");
