@@ -106,7 +106,7 @@ test("oversize-local: an update > MAX_LOG_BLOB_BYTES with no blob store freezes 
 		assert.equal(await a.docText(id), "keep;", "replica = durable state (unsent update discarded)");
 		await assert.rejects(a.editDoc(id, (t) => t.insert(0, "x")), /frozen/);
 
-		assert.deepEqual(await a.releaseQuarantine(id), { passed: 0, dismissed: 0 });
+		assert.deepEqual(await a.releaseQuarantine(a.streamOf(id)), { passed: 0, dismissed: 0 });
 		assert.equal(a.c.repo.stream(a.streamOf(id))!.frozen, 0);
 		await a.editDoc(id, (t) => t.insert(0, "after;"));
 		await converged([a, b]);
@@ -231,7 +231,7 @@ test("suite 1: tampered at rest -> retried with backoff, then the doc freezes bl
 		await until(async () => (await c.docText(id)) === "seed;" + big, 5_000, "c resolved");
 		await sleep(500);
 		assert.equal(b.c.repo.stream(sb)!.frozen, 1, "frozen stays frozen until released");
-		assert.deepEqual(await b.releaseQuarantine(id), { passed: 0, dismissed: 0 });
+		assert.deepEqual(await b.releaseQuarantine(sb), { passed: 0, dismissed: 0 });
 		await until(async () => (await b.docText(id)) === "seed;" + big, 5_000, "b resolved after release");
 		assert.equal(b.c.repo.stream(sb)!.frozen, 0);
 		assert.ok(!b.status().notices.some((n) => n.code === "frozen:blob-corrupt"));

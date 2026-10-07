@@ -126,8 +126,7 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 		case "exportDiagnostics":
 			return { t: "diagnostics", bundle: await diagnostics(rt, c.includePaths === true) };
 		case "releaseQuarantine": {
-			const docId = streamDocId(c.stream as StreamName);
-			if (docId) await rt.log.releaseQuarantine(docId);
+			if (streamDocId(c.stream as StreamName)) await rt.log.releaseQuarantine(c.stream as StreamName);
 			rt.sched.request({ t: "full" });
 			return { t: "ok" };
 		}

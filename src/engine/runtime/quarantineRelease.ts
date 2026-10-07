@@ -9,6 +9,9 @@
  * A row a re-gate finds stale (e2ee-design §14.3) is settled: dismissed, never
  * applied. `regateUnopened` is the ns / cfg counterpart (§9.3: reader-dependent
  * rows wait in tail and halt the fold): run after every keyring change.
+ * Both run one at a time per engine; a request while one runs runs it again after
+ * (its snapshot may predate the change). `recheckStored` covers a row gated before
+ * a change and stored after the re-gate the change ran.
  */
 
 import { CFG_STREAM, NS_STREAM, type StreamName } from "../../core/types";
@@ -68,8 +71,39 @@ export async function releaseQuarantine(c: EngineCtx, stream: StreamName): Promi
 	return { passed: pass.length, dismissed: settled.length + fail.length };
 }
 
+/** One run at a time per engine and job; a request while one runs makes it run again (new rows, new keys). */
+const flights = new WeakMap<EngineCtx, Map<string, { again: boolean; p: Promise<number> }>>();
+function oneAtATime(c: EngineCtx, job: string, run: () => Promise<number>): Promise<number> {
+	let m = flights.get(c);
+	if (!m) flights.set(c, (m = new Map()));
+	const cur = m.get(job);
+	if (cur) {
+		cur.again = true;
+		return cur.p;
+	}
+	const f = { again: true, p: Promise.resolve(0) };
+	f.p = (async () => {
+		let n = 0;
+		try {
+			while (f.again && !c.stopped) {
+				f.again = false;
+				n += await run();
+			}
+		} finally {
+			m.delete(job);
+		}
+		return n;
+	})();
+	m.set(job, f);
+	return f.p;
+}
+
 /** Automatic retry of reader-dependent quarantine; returns the streams released. */
-export async function retryReaderQuarantine(c: EngineCtx): Promise<number> {
+export function retryReaderQuarantine(c: EngineCtx): Promise<number> {
+	return oneAtATime(c, "quarantine", () => retryOnce(c));
+}
+
+async function retryOnce(c: EngineCtx): Promise<number> {
 	let released = 0;
 	for (const r of [...c.repo.streams()]) {
 		if (r.frozen !== 1 || r.quarantinedRows === 0) continue;
@@ -89,7 +123,11 @@ export async function retryReaderQuarantine(c: EngineCtx): Promise<number> {
  * new keys, a settled revoke or `k` judged further can open them, or find them stale (§14.3). Re-gated rows
  * replace the unopened ones, the halt lifts and the fold advances. Rows still unopened keep waiting.
  */
-export async function regateUnopened(c: EngineCtx): Promise<number> {
+export function regateUnopened(c: EngineCtx): Promise<number> {
+	return oneAtATime(c, "unopened", () => regateUnopenedOnce(c));
+}
+
+async function regateUnopenedOnce(c: EngineCtx): Promise<number> {
 	let n = 0;
 	for (const fold of [c.ns, c.cfg]) {
 		const rows = (await c.repo.getTail(fold.stream, fold.coversSeq)).filter((r) => r.flags & LOCAL_FLAG_UNOPENED);
@@ -107,4 +145,31 @@ export async function regateUnopened(c: EngineCtx): Promise<number> {
 		n += replaced;
 	}
 	return n;
+}
+
+/**
+ * After tLive / tReadPage stored rows (Repo.onStored): a reader-dependent row gated before a change (keys, `k`
+ * judged further) and stored after the re-gate that change ran would wait for the next one. The rows just stored
+ * are gated again; one that opens now starts the re-gate. On a session only: a session start re-gates anyway.
+ */
+export function recheckStored(c: EngineCtx, quarantined: readonly QuarantineRecord[], rows: readonly TailRecord[]): void {
+	if (!c.session) return;
+	const held = quarantined.filter((q) => READER_DEPENDENT.has(q.reason) && q.bytes.length === q.originalSize);
+	const unopened = rows.filter((r) => r.flags & LOCAL_FLAG_UNOPENED);
+	if (held.length === 0 && unopened.length === 0) return;
+	const gate = (r: TailRecord | QuarantineRecord, payload: Uint8Array) =>
+		gateRow(c.gateCtx, c.ports.hash, { stream: r.stream, seq: r.seq, deviceId: r.deviceId, clientFrameId: r.clientFrameId, payload }, c.now());
+	void (async () => {
+		for (const r of unopened) {
+			const g = await gate(r, r.content);
+			if (g.t === "row" && g.row.flags & LOCAL_FLAG_UNOPENED) continue;
+			await regateUnopened(c);
+			break;
+		}
+		for (const q of held) {
+			if ((await gate(q, q.bytes)).t === "quarantine") continue;
+			await retryReaderQuarantine(c);
+			break;
+		}
+	})().catch((e) => c.diag("quarantine-recheck-failed", { error: String(e) }));
 }

@@ -64,7 +64,7 @@ test("quarantine: unknown-key rows freeze the doc, V still advances; releaseQuar
 		assert.equal((await b.c.repo.getTail(stream, 0, relay.head())).length > 0, true, "pre-freeze rows stay in tail");
 
 		fc.failOpen = false;
-		assert.deepEqual(await b.releaseQuarantine(id), { passed: 3, dismissed: 0 });
+		assert.deepEqual(await b.releaseQuarantine(stream), { passed: 3, dismissed: 0 });
 		const after = b.c.repo.stream(stream)!;
 		assert.equal(after.frozen, 0);
 		assert.equal(after.quarantinedRows, 0);
@@ -118,7 +118,7 @@ test("quarantine: disallowed Yjs type from a peer freezes every reader; release 
 		assert.equal(await a.docText(id), await b.docText(id));
 
 		for (const e of [a, b]) {
-			assert.deepEqual(await e.releaseQuarantine(id), { passed: 0, dismissed: 3 });
+			assert.deepEqual(await e.releaseQuarantine(stream), { passed: 0, dismissed: 3 });
 			const rec = e.c.repo.stream(stream)!;
 			assert.equal(rec.frozen, 0);
 			assert.equal(rec.quarantinedRows, 0);
@@ -171,7 +171,7 @@ test("causal hole: missing structs -> re-read causalRetries times -> freeze caus
 		// The relay group-commits: wait for the row to commit, then for a to ingest it.
 		await until(() => relay.head() > h0 && a.c.repo.cursor.vaultSeq === relay.head() && a.c.live.idle, 3_000, "u1 ingested");
 		await sleep(30);
-		assert.deepEqual(await a.releaseQuarantine(id), { passed: 0, dismissed: 0 });
+		assert.deepEqual(await a.releaseQuarantine(stream), { passed: 0, dismissed: 0 });
 		assert.equal(a.c.repo.stream(stream)!.frozen, 0);
 		assert.ok(!a.status().notices.some((n) => n.code === "frozen:causal-hole"));
 		const text = await a.docText(id);
@@ -234,7 +234,7 @@ test("oversize-remote: valid rows pushing the text past MAX_DOC_TEXT_CHARS freez
 		assert.equal(rec.quarantinedRows, 0);
 		await until(() => a.c.repo.cursor.vaultSeq === relay.head(), 5_000, "V at head");
 		assert.ok(a.status().notices.some((n) => n.code === "frozen:oversize-remote"));
-		assert.deepEqual(await a.releaseQuarantine(id), { passed: 0, dismissed: 0 });
+		assert.deepEqual(await a.releaseQuarantine(stream), { passed: 0, dismissed: 0 });
 		await until(() => a.c.repo.stream(stream)!.frozen === 1, 3_000, "release re-checks the doc: still oversize -> frozen again");
 	} finally {
 		x.close();
@@ -272,6 +272,71 @@ test("quarantine: reader-dependent rows are retried automatically on the next se
 		await b.editDoc(id, (t) => t.insert(0, "B;"));
 		await converged([a, b]);
 		assert.equal(await a.docText(id), "B;base;k0;k1;");
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});
+
+// A re-gate runs on a snapshot of the quarantine: a row quarantined while it runs is neither in it nor released
+// by it. Found by the E7 suite-1 sim (a keyring-hold row stored after the retry that `k` completing ran).
+test("quarantine: a release whose snapshot predates a later row keeps the doc frozen with that row counted", async () => {
+	const relay = new SimRelay();
+	const fc = faultyCrypto();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", crypto: fc });
+	try {
+		await live(a, b);
+		const id = await a.createDoc("s.md", "base;");
+		await converged([a, b]);
+		const stream = a.streamOf(id);
+		fc.failOpen = true;
+		for (let i = 0; i < 2; i++) await a.editDoc(id, (t) => t.insert(t.length, `k${i};`));
+		await until(() => b.c.repo.stream(stream)?.quarantinedRows === 2, 3_000, "quarantined");
+		const snapshot = await b.c.repo.quarantineOf(stream);
+		await a.editDoc(id, (t) => t.insert(t.length, "k2;"));
+		await until(() => b.c.repo.stream(stream)?.quarantinedRows === 3, 3_000, "a third row quarantined");
+		const r = await b.c.repo.tReleaseQuarantine(stream, [], snapshot, Date.now());
+		assert.equal(r.frozen, 1, "the later row still freezes the doc");
+		assert.equal(r.quarantinedRows, 1);
+		assert.equal((await b.c.repo.quarantineOf(stream)).filter((q) => !q.detail.startsWith("dismissed:")).length, 1);
+		assert.equal(b.status().counts.frozenDocs, 1);
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});
+
+// The keys arrive between a row's gate and its store: the re-gate they trigger ran before the row was stored.
+test("quarantine: a reader-dependent row this reader opens by the time it is stored is released without a new session", async () => {
+	const relay = new SimRelay();
+	const fc = faultyCrypto();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", crypto: fc });
+	try {
+		await live(a, b);
+		const id = await a.createDoc("t.md", "base;");
+		await converged([a, b]);
+		const stream = a.streamOf(id);
+		const repo = b.c.repo;
+		const tLive = repo.tLive.bind(repo);
+		let raced = 0;
+		repo.tLive = (items, nowMs, day) => {
+			if (fc.failOpen && items.some((it) => it.t === "quarantine")) {
+				fc.failOpen = false; // the key arrives after the gate failed, before the store
+				raced++;
+			}
+			return tLive(items, nowMs, day);
+		};
+		const sessions = b.c.sess.stats.sessions;
+		fc.failOpen = true;
+		await a.editDoc(id, (t) => t.insert(t.length, "k0;"));
+		await until(() => raced === 1, 3_000, "gated while the key was missing");
+		await until(() => repo.stream(stream)?.frozen === 0, 3_000, "released");
+		assert.equal(b.c.sess.stats.sessions, sessions, "on this session");
+		assert.equal(await b.docText(id), "base;k0;");
+		assert.equal(b.status().counts.quarantinedRows, 0);
+		await converged([a, b]);
 	} finally {
 		await a.stop();
 		await b.stop();
