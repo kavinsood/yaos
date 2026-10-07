@@ -274,14 +274,22 @@ export async function lone(R: Report, o: LoneOptions): Promise<void> {
 				`${path} on ${p.name}`, 600_000, tw, 20)));
 			for (const [j, p] of peers.entries()) {
 				const at = done[j]!;
+				const get = p.net.gets.find((x) => x.start >= tw && x.bytes >= BIG);
 				const row = {
 					what, k, peer: p.name, ms: r1(at - t0), putBytes: put.bytes, putMs: put.end === null ? null : r1(put.end - put.start), putOk: put.ok,
 					putStartToEditMs: r1(t0 - put.start), inFlightAtEdit, inFlightAtArrival: put.end === null || put.end > at,
 					arrivalMinusPutEndMs: put.end === null ? null : r1(at - put.end), attachmentOnPeerMs: r1(landed[j]!),
+					putEndAfterEditMs: put.end === null ? null : r1(put.end - t0),
+					// The peer's GET of the attachment (ms after the edit): did the peer write the edit only after its own download?
+					peerGetAfterEditMs: get ? { start: r1(get.start - t0), end: get.end === null ? null : r1(get.end - t0) } : null,
+					// a's frames from the edit to the arrival (ms after the edit): which one waited, on a, at the relay or on the peer.
+					frames: tap.timeline(a.name, p.name, t0, at),
 				};
 				during.push(row);
+				const f = row.frames.map((x) => `${x.stream} +${x.append}/${x.receipt ?? "-"}/${x.arrival ?? "-"}`).join(", ");
 				console.log(`  ${o.prefix} ${what} during upload #${k} -> ${p.name}: ${row.ms} ms; a's PUT ${row.putMs} ms (${put.bytes} B), `
-					+ `edit made ${row.putStartToEditMs} ms into it, in flight at arrival: ${row.inFlightAtArrival} (arrival - PUT end: ${row.arrivalMinusPutEndMs} ms)`);
+					+ `edit made ${row.putStartToEditMs} ms into it, in flight at arrival: ${row.inFlightAtArrival} (arrival - PUT end: ${row.arrivalMinusPutEndMs} ms); `
+					+ `a's frames append/receipt/on-peer: ${f}; ${p.name}'s GET: ${row.peerGetAfterEditMs ? `+${row.peerGetAfterEditMs.start}..+${row.peerGetAfterEditMs.end}` : "-"}`);
 			}
 		};
 		for (let i = 0; i < 2; i++) {

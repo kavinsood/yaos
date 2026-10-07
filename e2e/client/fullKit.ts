@@ -12,7 +12,7 @@
  * NetSwitch wraps the RelayPort (and the blob port) so a device can go offline: connect answers
  * "unavailable", live sessions drop abruptly (1006) and session RPCs fail like a lost network (src/sim/net.ts).
  * With a WireTap (wireTap.ts) the same wrapper timestamps APPENDs and relay events for the latency breakdown;
- * the blob wrapper records every PUT's start, body size and end (NetSwitch.puts).
+ * the blob wrapper records every PUT's and GET's start, body size and end (NetSwitch.puts / gets).
  */
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import type { Unsubscribe } from "../../src/ports/common";
@@ -111,12 +111,15 @@ class DroppableSession implements RelaySession {
 	}
 }
 
-/** One BlobPort.put that went through a NetSwitch (performance.now() times). */
-export interface BlobPutRecord {
+/** One BlobPort.put or get that went through a NetSwitch (performance.now() times). */
+export interface BlobTransferRecord {
 	readonly start: number;
-	/** Total bytes of the `parts` argument: the body on the wire (the sealed blob under suite 1). */
-	readonly bytes: number;
-	/** null while the PUT is in flight. */
+	/**
+	 * Body bytes on the wire. put: the total of the `parts` argument (the sealed blob under suite 1), known at the
+	 * start; get: the returned body's size, set when it resolves (0 while in flight or not found).
+	 */
+	bytes: number;
+	/** null while the transfer is in flight. */
 	end: number | null;
 	ok: boolean | null;
 }
@@ -129,7 +132,9 @@ export class NetSwitch {
 	/** Latency timeline hooks (FullClientOptions.tap). */
 	tap: SessionTap | null = null;
 	/** Every blob PUT this client made, oldest first (fullLatency.ts: is an upload in flight?). */
-	readonly puts: BlobPutRecord[] = [];
+	readonly puts: BlobTransferRecord[] = [];
+	/** Every blob GET this client made, oldest first. */
+	readonly gets: BlobTransferRecord[] = [];
 	private readonly live = new Set<DroppableSession>();
 
 	wrap(inner: RelayPort): RelayPort {
@@ -149,7 +154,7 @@ export class NetSwitch {
 		};
 	}
 
-	/** Every blob call fails like a network error while offline; puts are recorded in `puts`. All arguments are forwarded. */
+	/** Every blob call fails like a network error while offline; puts and gets are recorded. All arguments are forwarded. */
 	wrapBlob(inner: BlobPort | null): BlobPort | null {
 		if (!inner) return null;
 		return new Proxy(inner, {
@@ -159,16 +164,21 @@ export class NetSwitch {
 				const f = v as (...x: unknown[]) => unknown;
 				return (...a: unknown[]) => {
 					if (!this.online) return Promise.reject(netError(`blob ${String(k)}`));
-					return k === "put" ? this.timedPut(partsBytes(a[1]), () => f.apply(t, a)) : f.apply(t, a);
+					if (k === "put") return this.timed(this.puts, partsBytes(a[1]), () => f.apply(t, a));
+					if (k === "get") return this.timed(this.gets, 0, () => f.apply(t, a));
+					return f.apply(t, a);
 				};
 			},
 		});
 	}
 
-	/** Runs one put, recording its start, body size and end. Holds no reference to the parts (only `call` does, until it returns). */
-	private timedPut(bytes: number, call: () => unknown): unknown {
-		const rec: BlobPutRecord = { start: performance.now(), bytes, end: null, ok: null };
-		this.puts.push(rec);
+	/**
+	 * Runs one transfer, recording its start, size and end into `into`. Holds no reference to the parts or the
+	 * fetched body (only `call` sees the arguments, until it returns; a result is only measured).
+	 */
+	private timed(into: BlobTransferRecord[], bytes: number, call: () => unknown): unknown {
+		const rec: BlobTransferRecord = { start: performance.now(), bytes, end: null, ok: null };
+		into.push(rec);
 		const done = (ok: boolean) => { rec.end = performance.now(); rec.ok = ok; };
 		let p: unknown;
 		try {
@@ -177,7 +187,10 @@ export class NetSwitch {
 			done(false);
 			throw e;
 		}
-		Promise.resolve(p).then(() => done(true), () => done(false));
+		Promise.resolve(p).then((v) => {
+			if (v instanceof Uint8Array) rec.bytes = v.byteLength;
+			done(true);
+		}, () => done(false));
 		return p;
 	}
 
