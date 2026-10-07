@@ -110,8 +110,8 @@ test("status reports the blob store's attachment limit (0 without a store) and t
 	const { a, net } = await world(false);
 	assert.equal(vrt(a).status().maxBlobBytes, net.blobs.maxBlobBytes);
 	assert.equal(vrt(a).status().maxBlobBytes, vrt(a).blobs.maxBlobBytes);
-	assert.equal(a.ui.statuses.at(-1)?.maxBlobBytes, net.blobs.maxBlobBytes, "posted to the host");
+	assert.equal(a.ui.statuses[a.ui.statuses.length - 1]?.maxBlobBytes, net.blobs.maxBlobBytes, "posted to the host");
 	const none = await world(false, false);
 	assert.equal(vrt(none.a).status().maxBlobBytes, 0);
-	assert.equal(none.a.ui.statuses.at(-1)?.maxBlobBytes, 0, "posted to the host");
+	assert.equal(none.a.ui.statuses[none.a.ui.statuses.length - 1]?.maxBlobBytes, 0, "posted to the host");
 });

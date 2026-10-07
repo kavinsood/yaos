@@ -113,7 +113,7 @@ test("no blob store: attachments stay local (no ns entry, no transfer queued, no
 	noEntry(b, "img/p.png");
 	for (const d of devs) {
 		assert.deepEqual(d.vrt!.blobs.queued(), [], `${d.name}: nothing queued (no retry timer)`);
-		assert.equal(d.ui.statuses.at(-1)?.maxBlobBytes, 0, `${d.name}: status maxBlobBytes`);
+		assert.equal(d.ui.statuses[d.ui.statuses.length - 1]?.maxBlobBytes, 0, `${d.name}: status maxBlobBytes`);
 		assert.deepEqual(d.ui.notices.filter((n) => /blob|attach/i.test(n.code)), [], `${d.name}: no notice about server blob storage`);
 	}
 	assert.equal(net.blobs.calls.put + net.blobs.calls.has + net.blobs.calls.get, 0);
@@ -143,7 +143,7 @@ test("a blob store found on a later connect: the runtime restarts with it, pendi
 	await same(a, b, "img/p.png", pic);
 	assert.equal(net.blobs.objects.size, 1);
 	assert.equal(a.engineStarts, starts, "the same engine: only its vault runtime restarted");
-	for (const d of devs) assert.ok((d.ui.statuses.at(-1)?.maxBlobBytes ?? 0) > 0, `${d.name}: status maxBlobBytes`);
+	for (const d of devs) assert.ok((d.ui.statuses[d.ui.statuses.length - 1]?.maxBlobBytes ?? 0) > 0, `${d.name}: status maxBlobBytes`);
 	logCarriesNoBlobs(net, pic.length);
 });
 

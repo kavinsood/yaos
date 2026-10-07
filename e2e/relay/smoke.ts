@@ -350,8 +350,8 @@ async function main() {
 	check("attachments capability (R2 bound)", caps.value?.attachments === true, caps.value?.attachments);
 	const blob = randomBytes(300 * 1024);
 	const blobHash = createHash("sha256").update(blob).digest("hex");
-	const put = await http("PUT", `${vaultPath}/blobs/${blobHash}`, { token: vault.a.deviceToken, body: blob, timing: "blob_put_300k_ms" });
-	check("blob PUT 2xx", put.status >= 200 && put.status < 300, put.status);
+	const blobPut = await http("PUT", `${vaultPath}/blobs/${blobHash}`, { token: vault.a.deviceToken, body: blob, timing: "blob_put_300k_ms" });
+	check("blob PUT 2xx", blobPut.status >= 200 && blobPut.status < 300, blobPut.status);
 	const tGet = now();
 	const got = await fetch(`${HOST}${vaultPath}/blobs/${blobHash}`, { headers: { Authorization: `Bearer ${vault.b.deviceToken}` } });
 	const gotBytes = new Uint8Array(await got.arrayBuffer());
