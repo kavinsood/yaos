@@ -863,13 +863,15 @@ async function settleOwn(tx: Tx, ob: OutboxRecord, copy: OwnCommitCopy | undefin
 
 /**
  * `next` replaces `old` at the same order (the order indexes are unique: the old key goes first); held records
- * waiting for `old` wait for `next` (dependsOn: ns creates, adopted records).
+ * waiting for `old` wait for `next` (dependsOn: ns creates, adopted records), and so do the pending / sent body
+ * frames of a live ns create (DESIGN §e.1: they never go before it).
  */
 async function rename(tx: Tx, old: OutboxRecord, next: OutboxRecord, updated: OutboxRecord[]): Promise<void> {
 	if (next.clientFrameId !== old.clientFrameId) tx.delete(STORE.outbox, old.clientFrameId);
 	tx.put(STORE.outbox, next);
 	if (next.clientFrameId === old.clientFrameId) return;
-	for (const h of await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, stateOrderRange("held"))) {
+	const states: OutboxState[] = old.stream === NS_STREAM ? ["held", "pending", "sent"] : ["held"];
+	for (const st of states) for (const h of await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, stateOrderRange(st))) {
 		if (h.dependsOn !== old.clientFrameId) continue;
 		const n: OutboxRecord = { ...h, dependsOn: next.clientFrameId };
 		tx.put(STORE.outbox, n);
@@ -932,9 +934,10 @@ function advance(r: Mut<StreamRecord>, seq: Seq, vAfter: Seq): void {
 
 /**
  * DESIGN §e.1 dependsOn rule. Only adoptables are dependencies released by
- * record removal; ns creates are released by the fold (nsRuntime). A held
- * record whose dependency is gone is re-pointed to the next remaining
- * adoptable of its stream, else released to pending.
+ * record removal; ns creates are released by the fold (nsRuntime; a live
+ * create's pending dependents need no release). A held record whose
+ * dependency is gone is re-pointed to the next remaining adoptable of its
+ * stream, else released to pending.
  */
 async function releaseDependents(tx: Tx, gone: OutboxRecord): Promise<OutboxRecord[]> {
 	// Adoption dependencies: an adoptable, or an adopted record re-appended as pending (dependents wait for its receipt).

@@ -208,7 +208,8 @@ export interface OutboxRecord {
 	 */
 	readonly keyEpoch: number;
 	/**
-	 * held only: the frame this waits for (DESIGN §e.1): the doc's ns create
+	 * pending / sent: the live ns create this body frame goes after (DESIGN §e.1, Sender blockedBy).
+	 * held: the frame this waits for (DESIGN §e.1): the doc's ns create
 	 * (released when it folds) or the newest adoptable of the same stream
 	 * (released when that record is gone).
 	 */

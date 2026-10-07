@@ -38,6 +38,11 @@ import { buildStatus } from "./status";
 export type EngineDeps = CatchUpDeps & CheckpointDeps & RefDeps & FrameCtx;
 type Fields = Record<string, string | number | boolean | null>;
 type Notice = { code: string; level: "info" | "warn" | "error"; atMs: number };
+/** An own ns create in the outbox (EngineCtx.pendingCreates). */
+export interface PendingCreate {
+	readonly cfid: ClientFrameId;
+	readonly live: boolean;
+}
 
 const DIAG_RING = 2_000;
 const ERROR_NOTICES = new Set(["device-revoked", "upgrade-required", "epoch-changed", "vault-unclaimed", "vault-not-found"]);
@@ -93,8 +98,11 @@ export class EngineCtx {
 	readonly adoptMap = new Map<string, ClientFrameId>();
 	readonly adoptRev = new Map<ClientFrameId, string>();
 	readonly adoptTimers = new Map<ClientFrameId, TimerHandle>();
-	/** docId -> cfid of the own ns frame creating it (first body frame dependsOn it while it is in the outbox, §e.1). */
-	readonly pendingCreates = new Map<DocId, ClientFrameId>();
+	/**
+	 * docId -> the own ns frame creating it: its body frames depend on it while it is in the outbox (§e.1). `live`:
+	 * a create outside onboarding / the first reconcile pass; its body frames are pending, sent right after it.
+	 */
+	readonly pendingCreates = new Map<DocId, PendingCreate>();
 	private readonly notices: Notice[] = [];
 	private readonly ring: DiagnosticsEvent[] = [];
 	private statusTimer: TimerHandle | null = null;
@@ -240,7 +248,7 @@ export class EngineCtx {
 				this.sender.remove(old.clientFrameId);
 				this.sentPending.delete(old.clientFrameId);
 				this.unregisterAdopt(old.clientFrameId);
-				for (const [doc, cf] of this.pendingCreates) if (cf === old.clientFrameId) this.pendingCreates.set(doc, next.clientFrameId);
+				for (const [doc, p] of this.pendingCreates) if (p.cfid === old.clientFrameId) this.pendingCreates.set(doc, { ...p, cfid: next.clientFrameId });
 			}
 			this.outbox.put(next);
 			this.sender.upsert(next);
@@ -370,11 +378,11 @@ export class EngineCtx {
 		return hashes;
 	}
 
-	/** Own ns create of `docId` still in the outbox (held dependency for its first body frames), else null. */
-	createDependency(docId: DocId): ClientFrameId | null {
-		const cfid = this.pendingCreates.get(docId);
-		if (cfid === undefined) return null;
-		if (this.outbox.has(cfid)) return cfid;
+	/** Own ns create of `docId` still in the outbox (the dependency of its body frames), else null. */
+	createDependency(docId: DocId): PendingCreate | null {
+		const p = this.pendingCreates.get(docId);
+		if (p === undefined) return null;
+		if (this.outbox.has(p.cfid)) return p;
 		this.pendingCreates.delete(docId);
 		return null;
 	}
