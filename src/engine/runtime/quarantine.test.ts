@@ -342,3 +342,40 @@ test("quarantine: a reader-dependent row this reader opens by the time it is sto
 		await b.stop();
 	}
 });
+
+// Rows a catch-up page quarantined move the doc's body version only when a release applies them (T_read_page does
+// not count a quarantined row as remote; T_live does). The release applied them to the replica without moving
+// the version, so the planner saw no remote change and the disk kept the old text for good. Found by the E7
+// suite-1 sim (E2EE_FAULTS 3 devices seed 88: a device back after a roll it missed, rows `crypto-unknown-key`
+// until the `k` read gave it the key, released by the session start's retry).
+test("quarantine: rows a catch-up page quarantined move the body version once released", async () => {
+	const relay = new SimRelay();
+	const fc = faultyCrypto();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", crypto: fc });
+	try {
+		await live(a, b);
+		const id = await a.createDoc("u.md", "base;");
+		await converged([a, b]);
+		const stream = a.streamOf(id);
+		const before = b.c.repo.stream(stream)!.bodyVersion;
+		b.disconnect();
+		for (let i = 0; i < 2; i++) await a.editDoc(id, (t) => t.insert(t.length, `k${i};`));
+		await until(() => a.isIdle(), 3_000, "a idle");
+		await relay.flush(); // committed before b is back: b reads them in a catch-up page, not live
+		const head = Math.max(...relay.rows(stream).map((r) => r.seq));
+		fc.failOpen = true;
+		await b.reconnect();
+		await until(() => b.c.repo.stream(stream)?.quarantinedRows === 2, 3_000, "quarantined by the catch-up");
+		assert.deepEqual(b.c.repo.stream(stream)!.bodyVersion, before, "not applied, not a remote change yet");
+		fc.failOpen = false;
+		const s2 = b.c.sess.stats.sessions;
+		relay.dropSession("dev-b" as DeviceId);
+		await until(() => b.c.sess.stats.sessions > s2 && b.c.repo.stream(stream)!.frozen === 0, 5_000, "released on reconnect");
+		assert.equal(await b.docText(id), "base;k0;k1;");
+		assert.equal(b.c.repo.stream(stream)!.bodyVersion.remoteSeq, head, "the applied rows are a remote change");
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});
