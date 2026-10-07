@@ -1,7 +1,9 @@
 /**
  * Quarantine release (DESIGN §d.6). `releaseQuarantine{stream}` (user action)
- * re-gates every quarantined row: rows that pass are applied, the rest are
- * dismissed, the doc unfreezes. `retryReaderQuarantine` is the automatic
+ * re-gates every quarantined row: rows that pass are applied, rows still held
+ * `keyring-hold` are kept (waiting for this session's `k` to be judged; the doc
+ * stays frozen until the automatic retry opens them), the rest are dismissed,
+ * and the doc unfreezes once nothing is left. `retryReaderQuarantine` is the automatic
  * "retried on upgrade or new keys" path: run after every session start (the
  * point where a key fetch or a new client version can change what this reader
  * opens). It only releases a stream when every live quarantined row is
@@ -28,11 +30,16 @@ interface Regated {
 	readonly pass: TailRecord[];
 	/** Settled without applying: stale-epoch (§14.3), or a stream class that is only accounted. */
 	readonly settled: QuarantineRecord[];
+	/**
+	 * Still `keyring-hold`: not failed, waiting for this session's `k` to be judged to its seq (§14.3). A release
+	 * keeps it (the doc stays frozen); the retry after the `k` read opens it or finds it stale.
+	 */
+	readonly held: QuarantineRecord[];
 	readonly fail: QuarantineRecord[];
 }
 
 async function regate(c: EngineCtx, stream: StreamName, rows: readonly QuarantineRecord[]): Promise<Regated> {
-	const out: Regated = { pass: [], settled: [], fail: [] };
+	const out: Regated = { pass: [], settled: [], held: [], fail: [] };
 	for (const q of rows) {
 		if (q.bytes.length < q.originalSize) {
 			out.fail.push(q);
@@ -41,6 +48,7 @@ async function regate(c: EngineCtx, stream: StreamName, rows: readonly Quarantin
 		const g = await gateRow(c.gateCtx, c.ports.hash, { stream, seq: q.seq, deviceId: q.deviceId, clientFrameId: q.clientFrameId, payload: q.bytes }, c.now());
 		if (g.t === "row") out.pass.push(g.row);
 		else if (g.t === "account") out.settled.push(q);
+		else if (g.rec.reason === "keyring-hold") out.held.push(q);
 		else out.fail.push(q);
 	}
 	return out;
@@ -64,7 +72,7 @@ async function release(c: EngineCtx, stream: StreamName, pass: readonly TailReco
 	c.scheduleStatus();
 }
 
-/** User release: pass -> applied, the rest dismissed, the doc unfrozen. */
+/** User release: pass -> applied, held kept, the rest dismissed; the doc unfreezes unless a held row is left. */
 export async function releaseQuarantine(c: EngineCtx, stream: StreamName): Promise<{ passed: number; dismissed: number }> {
 	const { pass, settled, fail } = await regate(c, stream, await c.repo.quarantineOf(stream));
 	await release(c, stream, pass, [...settled, ...fail]);
@@ -109,8 +117,8 @@ async function retryOnce(c: EngineCtx): Promise<number> {
 		if (r.frozen !== 1 || r.quarantinedRows === 0) continue;
 		const rows = (await c.repo.quarantineOf(r.stream)).filter((q) => !isDismissed(q));
 		if (rows.length === 0 || !rows.every((q) => READER_DEPENDENT.has(q.reason))) continue;
-		const { pass, settled, fail } = await regate(c, r.stream, rows);
-		if (fail.length > 0) continue;
+		const { pass, settled, held, fail } = await regate(c, r.stream, rows);
+		if (fail.length > 0 || held.length > 0) continue;
 		await release(c, r.stream, pass, settled);
 		c.diag("quarantine-retried", { stream: r.stream, rows: pass.length, settled: settled.length });
 		released++;
