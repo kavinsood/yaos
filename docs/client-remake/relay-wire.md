@@ -652,7 +652,8 @@ scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--r2 | --no-r2] [--var
 scripts/relay-dev/stop-local.sh
 
 # deploy (`cf deploy` as the cf CLI OAuth session; generated server/wrangler.relay2-<suffix>.toml is git-excluded).
-# The YAOS_BUCKET R2 binding is deployed with it (the bucket must exist); RELAY_DEV_R2=0 deploys without it.
+# YAOS_BUCKET is bound to the test bucket yaos-relay2-e2e (config.sh rewrites server/wrangler.toml's "yaos", the
+# legacy production bucket; the test bucket must exist); RELAY_DEV_R2=0 deploys without it.
 scripts/relay-dev/deploy.sh [<yaos-relay2-name>] [--var K=V]
 
 # smoke (fresh vault per run; claim on a fresh server, operator login on a claimed one)

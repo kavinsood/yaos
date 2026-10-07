@@ -3,14 +3,17 @@
 #
 #   scripts/relay-dev/deploy.sh [<yaos-relay2-name>] [--var K=V]... [--dry-run]
 #
-# Config: scripts/relay-dev/config.sh (server/wrangler.toml, name replaced, R2 kept; streams are always on) written
-# to server/wrangler.relay2-<suffix>.toml (git-excluded; the same file start-local.sh feeds `wrangler dev`),
-# then rendered by cf-config.mjs as a cf project in server/.cf-deploy/<suffix>/ (gitignored).
-# The YAOS_BUCKET [[r2_buckets]] binding is kept and rendered as a cf `bindings.r2` binding to the toml's bucket_name
-# (server/wrangler.toml: "yaos"), so the worker stores attachments, bodyUpdateRef updates and snapshot parts (blobs
-# never ride the log) and client e2e runs against it. The bucket must exist on the account before the deploy:
-# `cf r2 buckets list --name-contains <bucket>`, `cf r2 buckets create --name <bucket>` (from /tmp).
-# RELAY_DEV_R2=0 deploys without the binding (503 attachments_unavailable; attachments not synced: fail closed).
+# Config: scripts/relay-dev/config.sh (server/wrangler.toml, name replaced, R2 kept but on the test bucket; streams
+# are always on) written to server/wrangler.relay2-<suffix>.toml (git-excluded; the same file start-local.sh feeds
+# `wrangler dev`), then rendered by cf-config.mjs as a cf project in server/.cf-deploy/<suffix>/ (gitignored).
+# The YAOS_BUCKET [[r2_buckets]] binding becomes a cf `bindings.r2` binding to the test bucket yaos-relay2-e2e
+# (config.sh RELAY_DEV_BUCKET; it replaces server/wrangler.toml's "yaos", the legacy production bucket, which test
+# vaults never write), so the worker stores attachments, bodyUpdateRef updates and snapshot parts (blobs never ride
+# the log) and client e2e runs against it. Every yaos-relay2-* worker shares that bucket; objects live under
+# v/<vaultId>/. It must exist on the account: `cf r2 buckets list --name-contains yaos-relay2-e2e`, else
+# `cf r2 buckets create --name yaos-relay2-e2e` (from /tmp). The deploy fails unless capabilities report
+# "attachments":true. RELAY_DEV_R2=0 deploys without the binding (503 attachments_unavailable; attachments not
+# synced: fail closed).
 #
 # Deploys with `cf deploy`, authenticated as the cf CLI OAuth session (`cf auth login`); no API token is read,
 # printed or exported (CLOUDFLARE_API_TOKEN is unset so cf uses its own session). cf builds by delegating to
@@ -80,4 +83,6 @@ for i in {1..90}; do
   sleep 2
 done
 [[ $BODY == *'"streams":1'* ]] || { echo "capabilities never reported streams (last: ${BODY:0:200})" >&2; exit 1; }
+WANT='"attachments":true'; [[ ${RELAY_DEV_R2:-1} == 1 ]] || WANT='"attachments":false'
+[[ $BODY == *$WANT* ]] || { echo "capabilities do not report $WANT (last: ${BODY:0:200})" >&2; exit 1; }
 echo "=== deployed $URL"
