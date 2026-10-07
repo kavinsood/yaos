@@ -33,6 +33,7 @@ import { createEngine, type ComposedEngine, type EngineHandle } from "../engine/
 import type { VaultRuntime } from "../engine/compose/vaultRuntime";
 import { residentText } from "../engine/compose/runtimeOps";
 import { FAST_TUNING } from "../engine/runtime/testHarness";
+import type { EngineTuning } from "../engine/runtime/options";
 import type { ClockPort } from "../ports/clock";
 import type { VirtualClock } from "./clock";
 import { simHashOracle, simHashPort } from "./hash";
@@ -91,6 +92,8 @@ export interface SimDeviceOptions {
 	readonly pin?: E2eePin | null;
 	/** The engine's blob store for each start (default none). */
 	readonly blob?: () => BlobPort | null;
+	/** Over FAST_TUNING (a roll trigger, the GC grace). */
+	readonly tuning?: Partial<EngineTuning>;
 }
 
 export interface SimUiLog {
@@ -164,7 +167,7 @@ export class SimDevice {
 		const handle = createEngine(pair.engine, {
 			carrier: kind,
 			clientVersion: "sim",
-			tuning: FAST_TUNING,
+			tuning: { ...FAST_TUNING, ...(this.opts.tuning ?? {}) },
 			startRetryMs: 1_000,
 			tzOffsetMinutes: () => 0,
 			log: this.opts.log,
