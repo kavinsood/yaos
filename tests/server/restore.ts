@@ -411,6 +411,9 @@ s.test("D8b flag: 60 s of 503 restore_in_progress on device routes and enroll, u
 			["auth/ticket", { method: "POST", body: JSON.stringify({ purpose: "streams" }), headers: json503 }],
 			["auth/pairing-code", { method: "POST", body: "{}", headers: json503 }],
 			[`blobs/${"d".repeat(64)}`, {}],
+			["blobs", {}],
+			["blobs/delete", { method: "POST", headers: json503,
+				body: JSON.stringify({ ifUploadedBefore: Number.MAX_SAFE_INTEGER, addresses: ["d".repeat(64)] }) }],
 		] as Array<[string, RequestInit]>) {
 			const response = await deviceFetch(world, sc.vaultId, sc.laptop, path, init);
 			assert.deepEqual([response.status, await json(response)], [503, { error: "restore_in_progress" }], path);

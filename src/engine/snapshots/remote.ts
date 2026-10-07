@@ -10,7 +10,7 @@ import { snapKey, type SnapOp, type SnapRecord } from "../../core/snap/record";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort } from "../../ports/crypto";
 import type { SideFilePort } from "../../ports/vault";
-import { getOpened, putSealed } from "../blobs/blobStore";
+import { getOpened, putSealed, storePlaintextCap } from "../blobs/blobStore";
 import { dlName, partName } from "./localStore";
 import type { SnapIndexPort } from "./snapIndex";
 
@@ -35,8 +35,9 @@ export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: 
 	const key = snapKey(index.self, record.snapshotId);
 	if (before.state.records.has(key)) return "present";
 	if (before.state.dels.has(key) || record.createdAtMs < (before.state.floors.get(index.self) ?? 0)) return "deleted";
+	const cap = storePlaintextCap(crypto, store);
 	for (const p of record.parts) {
-		if (p.size > store.maxBlobBytes) throw new SnapshotUploadError(`part of ${p.size} bytes exceeds the store limit ${store.maxBlobBytes}`);
+		if (p.size > cap) throw new SnapshotUploadError(`part of ${p.size} bytes exceeds the store limit ${cap}`);
 	}
 	const addresses: BlobAddress[] = [];
 	for (const p of record.parts) addresses.push(await crypto.blobAddress(p.sha256));
@@ -61,13 +62,27 @@ export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: 
 	return "uploaded";
 }
 
+/** A part this device cannot open for a reader-dependent reason (e2ee-design §9.2): not corruption. */
+export class SnapshotPartUnavailable extends Error {}
+
 /**
  * Part source for verifyBundle over a remote record: part i is fetched by the hash the record names, through the
- * blob path; absent or unopenable is part-missing. verifyBundle checks its size and hash before asking for the
- * next part; `keepPart` (its onPart) then writes it to the download cache.
+ * blob path (the address is recomputed from the sha256, never taken from the record). Absent, or failing to open
+ * deterministically (tampered at rest under a verified key, malformed), is part-missing: content_corrupt, fail
+ * closed. A store error throws, and so does a reader-dependent failure (unknown key, a key not verified yet, an
+ * unsupported suite; blobStore.ts getOpened): the request fails like a transport error, without a corruption
+ * notice. verifyBundle checks its size and hash before asking for the next part; `keepPart` (its onPart) then
+ * writes it to the download cache.
  */
 export function remotePart(r: RemoteDeps, record: SnapRecord): (i: number) => Promise<Uint8Array | null> {
-	return (i) => getOpened(r.store, r.crypto, record.parts[i]!.sha256);
+	return async (i) => {
+		const got = await getOpened(r.store, r.crypto, record.parts[i]!.sha256, null);
+		if (got.ok) return got.bytes;
+		if (!got.deterministic && got.reason !== "absent") {
+			throw new SnapshotPartUnavailable(`snapshot part ${i + 1}/${record.parts.length} cannot be opened on this device (${got.reason})`);
+		}
+		return null;
+	};
 }
 
 export function keepPart(side: SideFilePort): (i: number, bytes: Uint8Array) => Promise<void> {

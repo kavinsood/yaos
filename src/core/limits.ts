@@ -71,7 +71,7 @@ export const FRAME_MAX_UPDATES = 256;
 export const FRAME_MAX_BYTES = 64 * 1024;
 /** Main thread coalesces editor updates before posting to the worker. */
 export const MAIN_UPDATE_COALESCE_MS = 16;
-/** Blob chunk payload when the blob store is absent (x:<hash> streams). */
+/** Blob chunk payload when the blob store is absent (x:<address> streams). */
 export const BLOB_CHUNK_BYTES = 768 * 1024;
 /** Largest attachment carried on the log without a blob store. */
 export const MAX_LOG_BLOB_BYTES = 8 * 1024 * 1024;
@@ -85,6 +85,12 @@ export const PADME_FLOOR_BYTES = 256;
  * padded plus header and AEAD overhead fits the 10 MiB upload cap (DECISIONS D9).
  */
 export const MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 39 * 256 * 1024 - 1;
+/**
+ * Blob download quarantine (e2ee-design §10.2): after the initial attempt and this many retries all failed
+ * deterministically (key verified), spanning at least BLOB_QUARANTINE_MIN_MS, the referencing row is quarantined.
+ */
+export const BLOB_QUARANTINE_RETRIES = 3;
+export const BLOB_QUARANTINE_MIN_MS = 3 * 60_000;
 
 // --- Content ----------------------------------------------------------------
 

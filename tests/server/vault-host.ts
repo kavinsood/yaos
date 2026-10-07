@@ -214,6 +214,11 @@ s.test("§6.1: bearer auth reads meta 1 + devices N once per runtime, then 0 row
 			"simulate-daily-limit: `enabled` must be a boolean");
 		const blobAuth = await object.host.fetch(new Request(`${INTERNAL}/blobs/auth`, { method: "POST", headers: bearer(owner) }));
 		assert.equal(blobAuth.status, 204, "D9: the blob bearer check");
+		const gcAuth = await object.host.fetch(new Request(`${INTERNAL}/blobs/gc-auth`, { method: "POST", headers: bearer(owner) }));
+		assert.equal(gcAuth.status, 204, "A3: the blob GC bearer check");
+		const gcStranger = await object.host.fetch(new Request(`${INTERNAL}/blobs/gc-auth`,
+			{ method: "POST", headers: bearer(newDevice("stranger-device-01")) }));
+		assert.deepEqual([gcStranger.status, await gcStranger.json()], [401, { error: "unauthorized" }]);
 		assert.equal(object.model.totals.cf, 1, "bearer requests write nothing (1 = init)");
 	});
 });

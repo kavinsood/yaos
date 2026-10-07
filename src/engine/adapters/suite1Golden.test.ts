@@ -5,14 +5,18 @@
  * the adapter (WebCrypto), an independent node:crypto reference written
  * below from the design text (hkdfSync, createCipheriv, createHmac), and the
  * committed hex. Per-kind envelope vectors are WP-E2, k records and the RK
- * encoding WP-E3, the setup link WP-E5.
+ * encoding WP-E3, the setup link WP-E5. `storeAbc2` (WP-E6a) is what the blob
+ * store holds for the plaintext "abc" sealed at epoch 2: stored at the K_1
+ * address of its sha256, sealed under K_2.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createCipheriv, createHmac, hkdfSync } from "node:crypto";
-import { bytesToHex, hexToBytes } from "../../core/codec/lib0";
+import { createCipheriv, createHash, createHmac, hkdfSync } from "node:crypto";
+import { bytesToHex, hexToBytes, utf8Encode } from "../../core/codec/lib0";
 import type { ContentHash } from "../../core/types";
+import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress } from "../../ports/crypto";
+import { getOpened, putSealed } from "../blobs/blobStore";
 import { ScriptedRandom } from "./testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "./webCryptoSuite1";
 
@@ -56,9 +60,9 @@ const ref = {
 	address: (k1: Uint8Array) => mac(sub(k1, "addr", 1), h(HASH)).toString("hex"),
 	diag: (k1: Uint8Array) => mac(sub(k1, "diag", 1), PLAINTEXT).toString("hex").slice(0, 16),
 	seal: (k: Uint8Array, purpose: string, e: number, iv: Uint8Array) => gcm(sub(k, purpose, e), iv, AAD, PLAINTEXT),
-	blob: (k: Uint8Array, e: number, iv: Uint8Array, address: string) =>
+	blob: (k: Uint8Array, e: number, iv: Uint8Array, address: string, plaintext: Uint8Array = PLAINTEXT) =>
 		Buffer.from([1, 1, ...varuint(e)]).toString("hex")
-		+ gcm(sub(k, "blob", e), iv, Buffer.concat([utf8("yaos/b2"), Buffer.from([1, 1]), varuint(e), varstring(VAULT), varstring(address)]), padRef(PLAINTEXT)),
+		+ gcm(sub(k, "blob", e), iv, Buffer.concat([utf8("yaos/b2"), Buffer.from([1, 1]), varuint(e), varstring(VAULT), varstring(address)]), padRef(plaintext)),
 	wrap: (by: Uint8Array, byEpoch: number, of: Uint8Array, iv: Uint8Array) => gcm(sub(by, "wrap", byEpoch), iv, AAD, of),
 	recovery: (of: Uint8Array, iv: Uint8Array) =>
 		gcm(Buffer.from(hkdfSync("sha256", RK.subarray(0, 32), utf8("yaos-hkdf-v1"), info("recovery-kek", 0), 32)), iv, AAD, of),
@@ -83,7 +87,14 @@ const GOLDEN = {
 	next2: "a5a5a5a5a5a5a5a5a5a5a5a5ad15eebad20296225f346f3b492d428eab689313c2040ffe96a52db59862ae8134cb9d4d8b242155f7a1104888fe6b63",
 	prev2: "a6a6a6a6a6a6a6a6a6a6a6a6ac136477def448879eaa9cf7385142e4ad635f3ac1fde23284ec97336b189aa52e7c49eebfd504958890ee9e1eefc5cd",
 	recovery1: "a7a7a7a7a7a7a7a7a7a7a7a79c141ec610bf49fdb70e2c52bcd7454c1b01077b157f6f55b99507560cffcf8faad11f793fb9b657b72dd3515faa19b5",
+	storeAbc2:
+		"010102b1b1b1b1b1b1b1b1b1b1b1b17d31266aa06736c6eb4a634fd217cd80fc5e7cd0f4f58071b38c4182056589519eaa8ba9e04d7952bc8e3e928a5774e716"
+		+ "f0682dabc9ebb0df57aad6cc4db29bc6f02fbe9df1f95f5f83f24ccd285eb14e747adf99330872071dadc07b04497b4fa8ff50ff27bc12ea0c7d843334baf775"
+		+ "2476a7e8128cb22033248a1c29374b609111005224b7c7a1f0bd1eb4c2adf75da955dee03f987eeb2e5e7db87b30c0f361830cdee177a157d1ead018f4a775"
+		+ "9f35649e104339726d71699ab61905fef8af654888b319bf43ca376b008ac0369d9abc3be6e1670357e426ee7c23f59d43174047f13d453c7efcdd02a010b19f"
+		+ "9a593657aaddfa34b32f549b7d588e2a6b3f12e0b7e44a0f92ad7d1a7f10373c",
 };
+const ABC = utf8Encode("abc");
 
 async function adapter() {
 	const random = new ScriptedRandom();
@@ -101,7 +112,9 @@ describe("suite 1 golden vectors", () => {
 			frame1: ref.seal(K1, "frame", 1, nonce(0xa1)), checkpoint1: ref.seal(K1, "checkpoint", 1, nonce(0xa2)),
 			frame2: ref.seal(K2, "frame", 2, nonce(0xa3)), blob1: ref.blob(K1, 1, nonce(0xa4), address),
 			next2: ref.wrap(K1, 1, K2, nonce(0xa5)), prev2: ref.wrap(K2, 2, K1, nonce(0xa6)), recovery1: ref.recovery(K1, nonce(0xa7)),
+			storeAbc2: ref.blob(K2, 2, nonce(0xb1), address, ABC),
 		};
+		assert.equal(createHash("sha256").update(ABC).digest("hex"), HASH);
 		assert.deepEqual(got, GOLDEN);
 	});
 
@@ -146,5 +159,28 @@ describe("suite 1 golden vectors", () => {
 			assert.equal(await d.unwrap(role, e, AAD, h(wrapped), RK), true, role);
 			assert.equal(bytesToHex(await d.kcv(gets)), gets === 1 ? GOLDEN.kcv1 : GOLDEN.kcv2, role);
 		}
+	});
+
+	it("store path (WP-E6a): putSealed stores the golden bytes at blobAddress(sha256), never under the hash; another device opens them", async () => {
+		const { c, random } = await adapter();
+		c.setSealEpoch(2);
+		random.push(nonce(0xb1));
+		const objects = new Map<string, Uint8Array>();
+		const store: BlobPort = {
+			maxBlobBytes: 10 * 1024 * 1024,
+			has: async (as) => new Set(as.filter((a) => objects.has(a))),
+			put: async (a, b) => void objects.set(a, b.slice()),
+			get: async (a) => objects.get(a)?.slice() ?? null,
+		};
+		await putSealed(store, c, HASH, ABC);
+		assert.deepEqual([...objects.keys()], [GOLDEN.address], "the K_1 address, not the sha256");
+		assert.equal(bytesToHex(objects.get(GOLDEN.address)!), GOLDEN.storeAbc2);
+		await putSealed(store, c, HASH, ABC);
+		assert.equal(random.calls, 1, "already present (has): not sealed again");
+		const reader = await createWebCryptoSuite1({ vaultId: VAULT, random: new ScriptedRandom(), keys: [{ e: 1, k: K1.slice() }, { e: 2, k: K2.slice() }] });
+		reader.markVerified(1);
+		reader.markVerified(2);
+		const sha = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
+		assert.deepEqual(await getOpened(store, reader, HASH, sha), { ok: true, bytes: ABC });
 	});
 });

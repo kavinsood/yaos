@@ -8,6 +8,8 @@
  * Everything in src/core is pure: no I/O, no timers, no Date/Math.random.
  */
 
+import type { BlobAddress } from "../ports/crypto";
+
 // ---------------------------------------------------------------------------
 // Identifiers
 // ---------------------------------------------------------------------------
@@ -67,8 +69,12 @@ export function bodyStream(docId: DocId): StreamName {
 export function canvasStream(docId: DocId): StreamName {
 	return `c:${docId}` as StreamName;
 }
-export function blobChunkStream(hash: ContentHash): StreamName {
-	return `x:${hash}` as StreamName;
+/**
+ * Log-path blob stream (DESIGN §j.1). Named by the blob address, never the
+ * plaintext hash (e2ee-design §10.1): suite 1 addresses are keyed HMACs.
+ */
+export function blobChunkStream(address: BlobAddress): StreamName {
+	return `x:${address}` as StreamName;
 }
 export function docStream(kind: DocKind, docId: DocId): StreamName | null {
 	if (kind === "markdown") return bodyStream(docId);

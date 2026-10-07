@@ -28,6 +28,15 @@ export const SNAP_MAX_BLOB_BYTES = 1 * MIB;
 export const SNAP_MAX_TEXT_BYTES = 32 * MIB;
 export const SNAP_DEFAULT_PART_BYTES = 8 * MIB;
 
+/**
+ * Zip part size for a store whose transport cap is `maxBlobBytes` (null = local only): min(8 MiB, ⌊7/8 of the
+ * cap⌋). The 1/8 slack covers suite-1 sealing (Padmé, header, AEAD; e2ee-design §7.3, §10): a full part sealed
+ * at any keyEpoch stays within the cap for every cap >= 422 B (sealedBlob.test.ts proves it).
+ */
+export function snapPartBytes(maxBlobBytes: number | null): number {
+	return maxBlobBytes === null ? SNAP_DEFAULT_PART_BYTES : Math.min(SNAP_DEFAULT_PART_BYTES, Math.floor((maxBlobBytes * 7) / 8));
+}
+
 export type SnapSkipReason = "too-large" | "unreadable" | "invalid";
 export interface SnapManifestFile { readonly path: VaultPath; readonly kind: DocKind; readonly hash: ContentHash; readonly size: number }
 export interface SnapManifest {

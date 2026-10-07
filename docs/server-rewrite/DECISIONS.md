@@ -32,7 +32,7 @@ CPU, 5 GB DO storage, 2 MB max row. PITR keeps 30 days and does not exist in loc
 | Component | Owns | Never does |
 |---|---|---|
 | Worker (stateless) | Route table; method/path match; size caps; format checks (vaultId `^[A-Za-z0-9_-]{22}$`, pairing code, blob address, `streamsVersion=1`); body streaming to the DO; unread-body drain in `finally`; R2 I/O for blobs; `claimed=true` cached in isolate memory forever once seen | Crypto; config-DO reads on device routes; storage writes |
-| Vault DO (`idFromName(vaultId)`) | `vault_meta` (vaultId, generation = epoch, ticket key); devices; pairing codes; bearer auth; ticket issue and verify; streams store and relay; dedupe index; per-device rate and socket caps; revoke; reset; restore steps; daily-limit latch | Calls to the config DO |
+| Vault DO (`idFromName(vaultId)`) | `vault_meta` (vaultId, generation = epoch, ticket key); devices; pairing codes; bearer auth; ticket issue and verify; streams store and relay; dedupe index; per-device rate and socket caps; the blob GC request limit (memory); revoke; reset; restore steps; daily-limit latch | Calls to the config DO |
 | Config DO (singleton `idFromName("config")`) | Operator credential hash; operator sessions; vault registry (id, name, createdAt); restore journal, steps and alarm (D8b); claim; in-memory login-failure limiter | Being on the hot path. Only `/claim`, `/operator/*` and pre-claim `/api/capabilities` reach it |
 
 Gone: the config→vault authority mirror, the authorization fence, `202 authorization_fence_pending`, the 5 s
@@ -64,7 +64,8 @@ Auth: `-` none, `C` operator session cookie, `B` device bearer, `T` streams tick
 | `GET /vault/:id/ws/streams` | T | `streamsVersion` check (1008 `update_required`) | vault |
 | `GET /vault/:id/streams/feed`, `/streams/read` | B | | vault |
 | `PUT /vault/:id/streams/checkpoint` | B | Content-Length ≤ 4 MiB else 413; streams body | vault |
-| `PUT`/`GET /vault/:id/blobs/:addr`, `POST /vault/:id/blobs/exists` | B | address regex; ≤ 10 MiB; R2 I/O | vault (bearer check only) |
+| `PUT`/`GET /vault/:id/blobs/:addr`, `POST /vault/:id/blobs/exists` | B | address regex; ≤ 10 MiB; `exists` ≤ 50 entries; R2 I/O | vault (bearer check only) |
+| `GET /vault/:id/blobs?cursor=`, `POST /vault/:id/blobs/delete` | B | cursor format; delete body ≤ 16 KiB with 1–100 distinct addresses and a cutoff; R2 list (≤ 10 calls), or ≤ 100 heads then one delete (D9 GC) | vault (bearer check + GC limit) |
 | `POST /vault/:id/debug/simulate-daily-limit` | B | only when `YAOS_DEBUG_ROUTES=1`, else 404 | vault |
 
 Device routes on an unknown vault answer as for a bad credential: `401 unauthorized` (at upgrade: `unauthorized`
@@ -132,15 +133,17 @@ pairing-code make zero config-DO calls, checked with a counting stub).
   T-PAIR-NOWRITE (WB).
 
 **D4 Tickets.**
-- Key: 32 random bytes per vault in `vault_meta`, made at init, never exported or rotated. The vault DO issues
-  tickets and verifies them at upgrade, with the key and device map in memory.
+- Ticket key: 32 random bytes per vault in `vault_meta` (`ticket_key`), made at init, never exported or rotated.
+  The vault DO issues tickets and verifies them at upgrade, with the key and device map in memory.
 - Payload as today (vaultId, deviceId, D6 constants, aud, purpose, documentId, iat, exp, nonce), signed with the
-  vault key. Wire unchanged: aud `yaos-vault-ws`, purpose `streams`, TTL 5 min (`YAOS_TICKET_TTL_MS`).
+  ticket key. Wire unchanged: aud `yaos-vault-ws`, purpose `streams`, TTL 5 min (`YAOS_TICKET_TTL_MS`).
 - Issuing costs 0 rows (the lastSeen "touch device" write is dropped). Upgrade rejections keep the §3.1 shape
   (accept, `error` frame, close 1008); the DO now produces them.
 - The §3.1 `unclaimed` frame is never sent: it would need a config read at upgrade. An unclaimed server has no
   vaults, so the DO answers `unauthorized`.
-- *Why:* a key per vault makes cross-vault replay impossible by construction. *Tests:* T-TICKET-CROSS-VAULT,
+- The ticket key only signs tickets. It is not the E2EE vault key K_e (e2ee-design.md §5.1), which never reaches
+  the server.
+- *Why:* a ticket key per vault makes cross-vault replay impossible by construction. *Tests:* T-TICKET-CROSS-VAULT,
   T-TICKET-BAD (BB).
 
 **D5 Surviving routes.** Exactly the §2.2 table; everything else → 404.
@@ -266,12 +269,31 @@ The config DO runs the steps (the Worker forwards the request after the session 
 
 **D9 Blobs (R2 only).**
 - Address `^[0-9a-f]{64}$`: format check only, no SHA-256 check. PUT overwrites. Body ≤ 10 MiB
-  (`maxBlobUploadBytes`), else 413. `exists` takes ≤ 50 addresses.
+  (`maxBlobUploadBytes`), else 413. `exists` takes at most 50 entries, more is `400 too_many_addresses`; any entry
+  that is not an address makes it `400 invalid_address` (E2EE design §19 A4: never a silent "absent").
 - No `YAOS_BUCKET` → `503 attachments_unavailable` and `capabilities.attachments=false`.
 - **R2 key `v/<vaultId>/<address>` (mandatory)**, with no generation. Vault delete purges the prefix. *Why:* the
   content address is the identity, so identical bytes are the same blob across resets, restores and epoch bumps.
-- *Why opaque:* E2EE addresses are HMAC(vaultKey, hash), which the server cannot check; the client verifies on
-  download. *Tests:* T-BLOB-OPAQUE, T-BLOB-KEY-RESET (both SKIP when `attachments=false`), T-BLOB-UNAVAILABLE.
+- *Why opaque:* E2EE addresses are HMAC(kAddr, sha256) (e2ee-design.md §10.1), which the server cannot check; the
+  client verifies on download. *Tests:* T-BLOB-OPAQUE, T-BLOB-KEY-RESET (both SKIP when `attachments=false`),
+  T-BLOB-UNAVAILABLE.
+- **GC routes (E2EE design §19 A3).** The client's mark-and-sweep needs a list and a delete that cannot remove a
+  blob re-uploaded during the sweep (relay-wire §11.3.1).
+  - `GET /vault/:id/blobs?cursor=` → `{items:[{address,uploadedAt}],next}`: an R2 `list` of `v/<vaultId>/`, at most
+    1000 items (R2's maximum). The cursor is the page's last address, sent as `startAfter`. An empty truncated R2
+    answer is followed with R2's own cursor, at most 10 list calls a request; then `503 list_incomplete` +
+    `Retry-After: 5`, never `next: null` while R2 says truncated.
+  - `POST /vault/:id/blobs/delete {ifUploadedBefore, addresses}` → `{results:[{address,result,uploadedAt?}]}` in
+    request order, `result` one of `deleted`, `newer`, `absent`. 1–100 distinct addresses. R2 `head` of each, 6 in
+    flight (the Workers limit on simultaneous open connections), then one R2 `delete(keys)` of those uploaded
+    strictly before the cutoff. A PUT refreshes `uploaded`, so a re-upload after the cutoff survives. R2 has no
+    conditional delete, so a PUT between an address's head and the batch delete is lost (accepted, cold path; the
+    client handles it). A full call is 102 subrequests to Cloudflare services (100 heads, 1 delete, 1 DO call),
+    within the Free plan's 1000 a invocation, none external.
+  - Order: bucket (503), formats and the delete body (400, 413), then the vault DO's `POST /blobs/gc-auth`: bearer
+    (401), restore (503), and 60 authenticated requests a minute per vault DO in memory, a batch delete counting as
+    one (`429 too_many_attempts` + Retry-After). No config call, no DO write, no cross-DO coordination.
+  - *Tests:* T-BLOB-GC-LIST, T-BLOB-GC-DELETE, T-BLOB-GC-RACE, T-BLOB-GC-LIMIT, T-BLOB-EXISTS-STRICT (WB).
 
 ---
 
@@ -414,6 +436,7 @@ Classes: **additive** (new; old clients unaffected), **relaxation** (the server 
 | 11.1 | Rate gate per socket → per device; + "Streams sockets per device: 4, a 5th evicts the oldest (1001 `device_socket_limit`)"; group commit row gains "1000 ms min interval" | tightening | one socket per vault per device |
 | 11.2 | Permissions table and the 5 s authority cache removed; revoke shuts the gate at once (D7) | removal | none |
 | 11.3 | `<sha256 hex>` → `<64 lowercase hex address>`; no hash check; `400 hash mismatch` removed; PUT overwrites; capability names gone | relaxation / removal | verify downloads client-side |
+| 11.3 | + `GET /vault/:id/blobs?cursor=` and `POST /vault/:id/blobs/delete` (blob GC: 60 requests/min per vault, page 1000, a batch of 1–100 addresses, `503 list_incomplete`); `exists` with a malformed entry → `400 invalid_address` instead of dropping it, and more than 50 entries → `400 too_many_addresses` instead of answering the first 50 (E2EE design §19 A3, A4) | additive / tightening | send only well-formed addresses, `exists` batches ≤ 50 and delete batches ≤ 100; on 429 or 503 wait `Retry-After` |
 | 11.4 | Unchanged; the simulate route exists only with `YAOS_DEBUG_ROUTES=1` | none | none |
 | 11.5 | + three identity tables; enroll 2 rows, revoke 1, ticket 0; + "the 64 KiB trigger still commits back to back" (H8) | additive | none |
 | 13 | `YAOS_STREAMS` flag gone; the Node/Docker host gone | removal | none |
@@ -496,6 +519,7 @@ uniqueness is checked in code in the same synchronous turn. Minting a code prune
 | Checkpoint | DELETE old chunks (k₀) + INSERT new chunks (k₁) + DELETE collected segments (g) + UPDATE head (SET has no `last_seq`) | k₀+k₁+g+1 |
 | Retired GC (H7) | same head UPDATE | +0 |
 | Dedupe index (H2) | memory only | 0 |
+| Blob routes, blob GC (D9) | none (bearer check and GC limit in memory; the bytes live in R2) | 0 |
 
 ### 6.3 Config DO schema
 
@@ -566,6 +590,11 @@ WB files in `tests/server/` (WB file names are suggestions).
 | T-BLOB-OPAQUE | non-SHA 64-hex address PUT/GET/exists, overwrite | BB | SKIP (no R2) | misc.ts |
 | T-BLOB-KEY-RESET | a blob survives reset-streams byte-identical and in `exists` | BB | SKIP (no R2) | flags.ts |
 | T-BLOB-UNAVAILABLE | 503 attachments_unavailable, attachments=false | BB | PASS | misc.ts |
+| T-BLOB-GC-LIST | pages of 1000 in address order, cursor = last address, uploadedAt from R2, stable under deletes; empty truncated R2 answers followed with R2's cursor (≤ 10 calls), else 503 list_incomplete + Retry-After | WB | n/a (new route) | blobs.ts |
+| T-BLOB-GC-DELETE | one batch: older → deleted; at or after the cutoff → newer; missing → absent; request order; heads (6 in flight) then one delete; 100 addresses accepted, 101 → 400; other vaults untouched | WB | n/a (new route) | blobs.ts |
+| T-BLOB-GC-RACE | a re-upload after the sweep's cutoff survives; a PUT between the head and the delete is deleted (the documented window) | WB | n/a (new route) | blobs.ts |
+| T-BLOB-GC-LIMIT | 60 authenticated GC requests/min per vault (a 100-address batch is one) → 429 + Retry-After; 400s and 413 before the DO; 401 before R2 | WB | n/a (new route) | blobs.ts |
+| T-BLOB-EXISTS-STRICT | a malformed `exists` entry → 400 invalid_address, more than 50 entries → 400 too_many_addresses, no R2 HEAD | WB | FAIL* (legacy dropped the entry, answered the first 50) | blobs.ts |
 | T-CODEC-UTF8 | invalid UTF-8 → 1008 | BB | PASS | socket.ts |
 | T-CODEC-SURROGATE | `ED A0 80` → 1008 | BB | PASS | socket.ts |
 | T-CODEC-OVERLONG | `C0 AF` → 1008 | BB | PASS | socket.ts |
@@ -715,6 +744,29 @@ P3b gap calls (accepted; marked `DECISIONS-GAP` in code):
   daily-limit failure injected at `setAlarm` alone (WB) leaves a row without an alarm: the vault is untouched
   (step 1 never ran), but its authority actions answer `409 restore_in_progress` until the operator presses restore
   again, which resumes the journaled `at`.
+
+E2EE asks (design §19 A2–A4) gap calls (proposed on branch server-remake-e2ee-asks, for review):
+
+- G48 The blob GC limit is 60 authenticated requests a minute per vault DO, shared by list and batch delete (a
+  batch of up to 100 addresses is one request), in memory (the D3 limiter, generalized as `WindowLimiter`). A
+  refused request does not count; strangers cannot spend it. 60/min holds a looping device to one DO request a
+  second, each at most 10 R2 lists or 100 heads and 1 delete.
+- G49 The GC list cursor is the last address of the page, passed to R2 as `startAfter`, not R2's own cursor: the
+  Worker can check it (`400 invalid_cursor`), it cannot leave the vault's prefix, and deletes between pages do not
+  move it. `next` is null once R2 says the listing is not truncated. R2 may answer truncated with no objects; the
+  Worker then follows R2's own cursor inside the same request (never returned to the client) for at most 10 list
+  calls, else `503 list_incomplete` with `Retry-After: 5`. The 10 and the 5 s are judgement calls.
+- G50 The batch delete body is JSON, at most 16 KiB (100 addresses are about 6.6 KiB), else `413 body_too_large`.
+  `addresses` is 1–100 addresses (`400 invalid_addresses`, `too_many_addresses`, `invalid_address`); a repeated
+  address is `400 duplicate_address`, not merged, so the results match the request 1:1. `ifUploadedBefore` is a
+  JSON number that is a safe integer ≥ 0 (a string is refused), else `400 invalid_if_uploaded_before`. One bad
+  field refuses the whole call before the DO. Every address gets a result, `absent` included.
+- G51 `exists` checks the count (more than 50 → `400 too_many_addresses`) and every entry before any R2 HEAD; the
+  silent first-50 slice is gone (the client already chunks at 50).
+- G52 The CORS `Access-Control-Expose-Headers` list is gone with the `X-YAOS-Content-*` headers nothing sets.
+- G53 The batch delete HEADs 6 addresses at a time, the Workers limit on connections waiting for headers
+  (https://developers.cloudflare.com/workers/platform/limits/#simultaneous-open-connections); `exists` keeps the
+  legacy 4. The single-address `DELETE /vault/:id/blobs/:addr` it replaced had no users and is removed.
 
 P5 findings:
 

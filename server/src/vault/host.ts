@@ -1,6 +1,6 @@
 // Vault DO host logic behind the ports (DECISIONS §2.1): vault meta, the device map, bearer auth, pairing codes and
 // enroll (D3), tickets (D4), revoke (D7), vault delete (D5), reset-streams (D8a), the D8b restore steps, the D8c
-// epoch check, the blob bearer check (D9) and the streams relay. vault.ts wraps it in the Cloudflare Durable Object
+// epoch check, the blob bearer checks (D9, and the blob GC limit) and the streams relay. vault.ts wraps it in the Cloudflare Durable Object
 // class; tests run it on Node with SQLite and fake sockets.
 //
 // The Worker forwards a device route as `https://vault.internal/<rest>?<query>` (the path after /vault/:id, or
@@ -14,7 +14,7 @@ import { randomBase64Url } from "../base64url";
 import { DailyLimitLatch, dailyLimitResponse, instrumentStorageForDailyLimit } from "../dailyLimit";
 import { bytesToHex, hexToBytes } from "../hex";
 import { bearerToken, isWebSocketUpgrade, json, notFound, rejectSocket, releaseUnreadBody } from "../http";
-import { FailureLimiter, tooManyAttempts } from "../limiter";
+import { WindowLimiter, tooManyAttempts } from "../limiter";
 import {
 	SYSTEM_CLOCK,
 	describeError,
@@ -57,6 +57,15 @@ const MAX_SMALL_BODY_BYTES = 64 * 1024;
 
 /** D8b: the in-memory `restoring` flag lives 60 s (device routes and enroll → 503, upgrades refused). */
 export const RESTORE_FLAG_TTL_MS = 60_000;
+
+/**
+ * Blob GC (relay-wire §11.3.1, E2EE design §19 A3): the list and batch-delete routes share 60 authenticated
+ * requests a minute per vault DO, in memory like D3 (a new runtime starts a fresh window). A batch delete of up to 100
+ * addresses is one request. A sweep is a cold path (a user command, at most monthly); 60/min caps a looping device at
+ * one DO request a second, and at most 1000 listed or 100 deleted blobs a second.
+ */
+export const BLOB_GC_REQUEST_LIMIT = 60;
+export const BLOB_GC_WINDOW_MS = 60_000;
 
 /**
  * D8b: Durable Object point-in-time recovery, `ctx.storage.getBookmarkForTime`, `ctx.storage
@@ -231,10 +240,12 @@ export class VaultHost {
 	private readonly upgrades: UpgradeRejectPort;
 	private readonly ticketTtlMs: number;
 	/** D3: 20 failed enrolls a minute (unknown, expired or used code) → 429. */
-	private readonly enrollFailures: FailureLimiter;
+	private readonly enrollFailures: WindowLimiter;
+	/** Blob GC: 60 authenticated list or batch-delete requests a minute → 429. */
+	private readonly blobGcRequests: WindowLimiter;
 	/** undefined: not read yet in this runtime; null: never initialized ("no such table", cached per §6.1). */
 	private state: VaultState | null | undefined = undefined;
-	/** The imported HMAC key, once per runtime (D4: the key never rotates; vault delete drops it). */
+	/** The imported ticket key, once per runtime (D4: the key never rotates; vault delete drops it). */
 	private ticketKey: Promise<CryptoKey> | null = null;
 	private readonly pitr: PitrPort | null;
 	/** D8b `restoring` flag (memory only, 60 s TTL): set by prepare, cleared by finish, lost with the runtime. */
@@ -253,7 +264,8 @@ export class VaultHost {
 		this.upgrades = options.upgrades;
 		this.pitr = options.pitr ?? null;
 		this.ticketTtlMs = options.ticketTtlMs ?? TICKET_TTL_MS;
-		this.enrollFailures = new FailureLimiter(ENROLL_FAILURE_LIMIT, ENROLL_FAILURE_WINDOW_MS, this.clock);
+		this.enrollFailures = new WindowLimiter(ENROLL_FAILURE_LIMIT, ENROLL_FAILURE_WINDOW_MS, this.clock);
+		this.blobGcRequests = new WindowLimiter(BLOB_GC_REQUEST_LIMIT, BLOB_GC_WINDOW_MS, this.clock);
 		this.latch = new DailyLimitLatch(() => this.clock.now());
 		this.storage = instrumentStorageForDailyLimit(options.storage, this.latch);
 		// The schema exists exactly when the vault does: init creates it, and no request path runs DDL.
@@ -369,6 +381,7 @@ export class VaultHost {
 			case "POST /auth/ticket":
 			case "POST /auth/pairing-code":
 			case "POST /blobs/auth":
+			case "POST /blobs/gc-auth":
 			case "POST /debug/simulate-daily-limit":
 				break;
 			default:
@@ -402,6 +415,14 @@ export class VaultHost {
 			case "POST /blobs/auth":
 				// D9: the Worker asks this before any R2 call; 204 = an enrolled device's bearer.
 				return new Response(null, { status: 204 });
+			case "POST /blobs/gc-auth": {
+				// A3: the same bearer check for the blob GC routes, plus their request limit. Only an authenticated
+				// request counts, so a stranger cannot spend the vault's window; a refused one does not count.
+				const wait = this.blobGcRequests.retryAfterMs();
+				if (wait > 0) return tooManyAttempts(wait);
+				this.blobGcRequests.record();
+				return new Response(null, { status: 204 });
+			}
 			default:
 				return await this.simulateDailyLimit(request);
 		}
@@ -582,7 +603,7 @@ export class VaultHost {
 	}
 
 	private codeFailure(status: number, error: string): Response {
-		this.enrollFailures.fail();
+		this.enrollFailures.record();
 		return json({ error }, status);
 	}
 
@@ -610,8 +631,8 @@ export class VaultHost {
 	}
 
 	/**
-	 * `GET /ws/streams?ticket=…` (D4): the ticket must verify with this vault's key and generation, and its device
-	 * must be in the device map after the verification (D7). Any failure: the `unauthorized` frame and 1008.
+	 * `GET /ws/streams?ticket=…` (D4): the ticket must verify with this vault's ticket key and generation, and its
+	 * device must be in the device map after the verification (D7). Any failure: the `unauthorized` frame and 1008.
 	 */
 	private async upgrade(request: Request, url: URL, state: VaultState): Promise<Response> {
 		const ticket = url.searchParams.get("ticket");
