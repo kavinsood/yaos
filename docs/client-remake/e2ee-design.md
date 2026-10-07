@@ -253,8 +253,16 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 
 - **Store.** Epoch keys MUST be stored in Obsidian SecretStorage (`app.secretStorage`, §3), as **one secret per
   vault**.
-  - Id: `"yaos-" + hex(sha256(utf8(vaultId)))[0..32]` (ids are lowercase alphanumeric plus dashes). The vaultId is
-    hashed because the mobile store is shared across vaults (§3).
+  - Id: `"yaos-" + hex(base64urlDecode(vaultId))`: the vaultId's 16 bytes in lowercase hex, 37 chars. SecretStorage
+    ids must match `/^[a-z0-9-]+$/` and be at most 64 chars, and the vaultId's own case-sensitive base64url
+    alphabet does not fit. Hex of its bytes does, with no hash: the main thread never hashes (DESIGN §d.2, §k.2). The
+    id is per vault because the mobile store is shared across vaults (§3).
+  - **Strict vaultId.** The client accepts a vaultId only if it is exactly 22 chars of canonical base64url (16 bytes;
+    server/src/vaultId.ts `VAULT_ID_PATTERN`, DECISIONS §2.1; canonical means the 4 unused low bits of the last char are
+    0, as the server's `randomBase64Url(16)` mints it). Canonical makes the id and its bytes one-to-one, so one secret
+    id names one vault. The enroll response (`readEnrollment`), data.json (`sanitizeIdentity`, the creation marker) and
+    `secretIdFor` all refuse anything else, untrimmed and unrepaired. The setup link never carries a vaultId
+    (`parseSetupLink` rejects one), so neither the server nor the link can name another vault's secret.
   - Value: JSON `{ "v": 1, "vaultId", "suite": 1, "keys": [{ "e", "k": b64url(K_e) }], "records": [b64url(k record)] }`.
   - The records are kept so they can be re-published after a reset or restore (§11.5). They are not secret.
   - Value size limits **[U]** (WP-E0, §23.3).
