@@ -13,7 +13,7 @@ import {
 } from "obsidian";
 import { MAX_KEEP_DAILY, pendingBrake, type YaosUiHost } from "./api";
 import { brakeHeadline } from "./brake";
-import { canFinishCreating, canRekey, isKeyMissing } from "./commands";
+import { canCreateVault, canFinishCreating, canRekey, isKeyMissing } from "./commands";
 import { confirmAction } from "./confirmModal";
 import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
@@ -114,6 +114,8 @@ export class YaosSettingTab extends PluginSettingTab {
 			{
 				name: "Create a new vault",
 				desc: "Create an empty vault on your server (setting up a new server first) and pair this device with it. Only a new vault can choose end-to-end encryption.",
+				// §12.4: a paired device blocked for want of a key or pin only takes a key.
+				visible: () => canCreateVault(this.host),
 				action: () => this.actions.openCreateVault(),
 			},
 			{
@@ -492,6 +494,7 @@ export class YaosSettingTab extends PluginSettingTab {
 			engineAcceptsCommands(run),
 			this.host.data().engine.syncAttachments,
 			this.host.data().engine.snapshots.enabled,
+			canCreateVault(this.host),
 			canFinishCreating(this.host),
 			isKeyMissing(this.host),
 			canRekey(this.host),

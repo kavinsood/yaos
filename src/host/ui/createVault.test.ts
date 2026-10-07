@@ -162,6 +162,7 @@ test("a code for another vault, a failed enroll or an enroll into another vault 
 		const log: string[] = [];
 		const prior = identityFor(testVaultId("prior"));
 		const host = loggedHost(log, { identity: prior, e2ee: { suite: 1 } });
+		host.snap = snapshot("live", { suite: 1, sealEpoch: 1, keyMissing: null });
 		const r = relay(log, routes);
 		const err = await createAndEnroll(input(false), host, r.deps).then(() => null, (e: unknown) => e as Error);
 		assert.ok(err, name);
@@ -179,11 +180,40 @@ test("replacing a pairing reports the old identity, and the new vault's marker s
 	const log: string[] = [];
 	const prior = identityFor(testVaultId("prior"));
 	const host = loggedHost(log, { identity: prior, e2ee: { suite: 0 } });
+	host.snap = snapshot("live", { suite: 0, keyMissing: null });
 	const out = await createAndEnroll(input(false), host, relay(log, unclaimedRoutes()).deps);
 	assert.deepEqual(out.replaced, prior);
 	assert.equal(host.data().e2ee, undefined, "the old vault's pin is not carried over");
 	assert.deepEqual(host.data().creating, { vaultId: NEW_VAULT });
 	assert.equal(resumableCreation(host.data()), NEW_VAULT);
+});
+
+test("a paired device blocked for want of a key or pin, or whose engine has not said, cannot start: no request, no write (§12.4)", async () => {
+	const PAIRED = testVaultId("paired");
+	const cases: [string, ConstructorParameters<typeof FakeUiHost>[0], ReturnType<typeof snapshot> | null][] = [
+		["no pin", {}, snapshot("live", { keyMissing: "no-pin" })],
+		["keyring seen", { e2ee: { suite: null, keyringSeen: true } }, snapshot("live", { keyMissing: "encrypted-vault", keyringSeen: true })],
+		["suite 1, key lost", { e2ee: { suite: 1 } }, snapshot("live", { suite: 1, sealEpoch: 1, keyMissing: "no-key" })],
+		["suite 1, revoked epoch", { e2ee: { suite: 1 } }, snapshot("live", { suite: 1, sealEpoch: 2, keyMissing: "revoked-epoch" })],
+		["creating marker, unpinned", { creating: { vaultId: PAIRED } }, snapshot("live", { creatable: true })],
+		["suite 1, engine not reporting", { e2ee: { suite: 1 } }, null],
+	];
+	for (const [name, data, snap] of cases) {
+		for (const claimed of [false, true]) {
+			const log: string[] = [];
+			const host = loggedHost(log, { identity: identityFor(PAIRED), ...data });
+			host.snap = snap;
+			const before = JSON.stringify(host.data());
+			// A server that would hand out a vault, even this device's own vault id.
+			const r = relay(log, claimed ? claimedRoutes() : { ...unclaimedRoutes(), "POST /claim": { status: 200, json: { ok: true, vaultId: PAIRED, pairingCode: `${PAIRED}.${SECRET_PART}` }, headers: setCookie } });
+			const err = await createAndEnroll(input(claimed), host, r.deps).then(() => null, (e: unknown) => e);
+			assert.ok(err instanceof CreateVaultError && err.code === "blocked", name);
+			assert.deepEqual(log, [], name);
+			assert.deepEqual(r.requests, [], name);
+			assert.deepEqual([...host.calls], [], name);
+			assert.equal(JSON.stringify(host.data()), before, name);
+		}
+	}
 });
 
 function creatingHost(): FakeUiHost {
