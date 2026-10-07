@@ -512,7 +512,14 @@ export type PlannerOp =
 	| { readonly op: "pushBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	| { readonly op: "fetchBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	// --- bookkeeping ---
-	| { readonly op: "rebind"; readonly fromDocId: DocId; readonly toDocId: DocId; readonly path: VaultPath }
+	| {
+		readonly op: "rebind"; readonly fromDocId: DocId; readonly toDocId: DocId; readonly path: VaultPath;
+		/**
+		 * §c.12 migrated loser: the loser's record is dropped, not moved. Its sync point is this device's own text, not
+		 * the winner's, so until a merge against the epoch base succeeds the winner stays unsynced (adopted afresh).
+		 */
+		readonly adopt?: true;
+	}
 	| { readonly op: "syncedPut"; readonly entry: SyncedEntry }
 	| { readonly op: "syncedDrop"; readonly docId: DocId }
 	| { readonly op: "needHash"; readonly path: VaultPath }

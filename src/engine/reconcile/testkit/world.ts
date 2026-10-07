@@ -5,7 +5,7 @@
  * which posts events after the diskOps result).
  */
 
-import type { BrakeConfig, BrakeReport, DocId, SyncedEntry, VaultPath } from "../../../core/types";
+import type { BrakeConfig, BrakeReport, DocId, PathKey, SyncedEntry, VaultPath } from "../../../core/types";
 import { DEFAULT_BRAKE } from "../../../core/plan/brake";
 import type { VaultEvent } from "../../../ports/vault";
 import { DB_SCHEMA_VERSION, STORE_SPECS } from "../../store/schema";
@@ -76,6 +76,7 @@ export class World {
 			onConflictCopy: (from, to) => this.conflictCopyEvents.push([from, to]),
 			onRebind: (from, into) => this.rebinds.push([from, into]),
 			pathBase: this.opts.pathBases ? (key) => this.opts.pathBases!.get(key) ?? null : undefined,
+			pathBaseKeys: this.opts.pathBases ? new Set([...this.opts.pathBases.keys()] as PathKey[]) : undefined,
 			...(this.opts.deferOwnFold ? { takeOwnFold: () => this.ownQueue.splice(0) } : {}),
 		});
 		this.log.onOwnFold = this.opts.deferOwnFold ? async (events) => void this.ownQueue.push(...events) : (events) => rec.applyOwnFold(events);
