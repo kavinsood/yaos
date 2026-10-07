@@ -1,6 +1,7 @@
 /**
  * Session lifecycle (DESIGN §d.7 "Reconnect", §i.6): connect -> epoch check ->
- * sender.attach (bodies resend at once) -> feed to the session head -> live
+ * sender.attach (bodies resend at once; under suite 1 once `k` is read,
+ * keyringRuntime.sendReady) -> feed to the session head -> live
  * queue on -> `k` read (e2ee-design §9.3: keys first) -> ns/cfg reads (late
  * receipts) -> ns window open -> held release -> live; then stale streams are
  * read with bounded concurrency. A device that may read only `k` (§12.4: no

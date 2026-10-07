@@ -13,7 +13,7 @@ import { createWebRandom } from "../../adapters/webRandom";
 import type { LogEngine } from "../../runtime/engine";
 import type { EngineTuning } from "../../runtime/options";
 import { sealFrame } from "../../ingest/envelope";
-import { startTestEngine, until } from "../../runtime/testHarness";
+import { startTestEngine, until, type TestEngineOpts } from "../../runtime/testHarness";
 import type { KeyringChange } from "../keyring";
 import type { EngineE2ee } from "../keyringRuntime";
 import { K, VAULT } from "./world";
@@ -56,7 +56,7 @@ export interface Dev {
 
 export type Pin = "unpinned" | "creating" | "seen" | 0 | { readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; readonly records: readonly Uint8Array[] };
 
-export async function start(relay: SimRelay, deviceId: string, pin: Pin, o: { storage?: StoragePort; tuning?: Partial<EngineTuning> } = {}): Promise<Dev> {
+export async function start(relay: SimRelay, deviceId: string, pin: Pin, o: { storage?: StoragePort; tuning?: Partial<EngineTuning>; extra?: TestEngineOpts["extra"] } = {}): Promise<Dev> {
 	const changes: KeyringChange[] = [];
 	const persist = async (ch: KeyringChange) => void changes.push({ keys: ch.keys.map((x) => ({ e: x.e, k: x.k.slice() })), records: ch.records, pending: ch.pending });
 	const e2ee: EngineE2ee = pin === 0 ? { suite: 0 }
@@ -64,7 +64,7 @@ export async function start(relay: SimRelay, deviceId: string, pin: Pin, o: { st
 		: { suite: null, creating: pin === "creating", keyringSeen: pin === "seen", persist };
 	const keys = typeof pin === "object" ? pin.keys.map((x) => ({ e: x.e, k: x.k.slice() })) : [];
 	const crypto = pin === 0 ? undefined : await createWebCryptoSuite1({ vaultId: VAULT, random: createWebRandom(), keys });
-	const r = await startTestEngine({ relay, deviceId, vaultId: VAULT, e2ee, ...(crypto ? { crypto } : {}), ...(o.storage ? { storage: o.storage } : {}), ...(o.tuning ? { tuning: o.tuning } : {}) });
+	const r = await startTestEngine({ relay, deviceId, vaultId: VAULT, e2ee, ...(crypto ? { crypto } : {}), ...(o.storage ? { storage: o.storage } : {}), ...(o.tuning ? { tuning: o.tuning } : {}), ...(o.extra ? { extra: o.extra } : {}) });
 	return { engine: r.engine, storage: r.storage, changes };
 }
 

@@ -194,6 +194,12 @@ export interface OutboxRecord {
 	/** ns / cfg only: the frameNo sealed inside `sealed` (e2ee-design §8.2). null for other kinds. */
 	readonly frameNo: number | null;
 	/**
+	 * The key epoch in `sealed`'s header (0 under suite 0). The sender re-seals a record below the newest winning
+	 * revoke epoch before sending it (e2ee-design §14.2 step 4, runtime/reseal.ts). An empty `sealed` is a copy of
+	 * an own frame that committed stale: it is sealed under the current epoch before it is sent.
+	 */
+	readonly keyEpoch: number;
+	/**
 	 * held only: the frame this waits for (DESIGN §e.1): the doc's ns create
 	 * (released when it folds), the newest adoptable of the same stream
 	 * (released when that record is gone), or the last x: chunk of a

@@ -11,7 +11,11 @@
  *    that are not resident body docs (and not k/ns/cfg) are dropped, the rows
  *    become T_stale items and the stream is read later;
  *  - `k` rows go to the keyring after the batch is stored; a receipt for an
- *    own `k` append is stored as the row it stands for (keyringRuntime.ts);
+ *    own `k` append is stored as the row it stands for (keyringRuntime.ts). A
+ *    batch ends after a `k` event, so the rows behind it are gated once it is
+ *    judged (§14.3), not held;
+ *  - an own frame that committed stale is renamed to a copy that is sealed
+ *    again (ownCommitCopy, e2ee-design §14.2 step 4);
  *  - while the keyring allows reading only `k` (e2ee-design §12.4), every
  *    other row becomes a T_stale item and provisionals are dropped;
  *  - a failed tLive drops the batch: its seqs stay unaccounted and the gap
@@ -20,10 +24,10 @@
  * The queue survives a session close (its events are committed facts).
  */
 
-import { CFG_STREAM, NS_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
+import { CFG_STREAM, KEYRING_STREAM, NS_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
 import type { RelayEvent } from "../../ports/relay";
 import type { LiveItem } from "../store/repo";
-import { gateRow } from "../sync/ingestRow";
+import { gateRow, ownCommitCopy } from "../sync/ingestRow";
 import type { EngineCtx } from "./context";
 
 type QueuedEvent = Extract<RelayEvent, { t: "receipt" | "committed" | "provisional" | "provisionalDropped" }>;
@@ -137,10 +141,19 @@ export class LiveIngest {
 			while (this.q.length > 0 && batch.length < this.c.tuning.liveBatchRows) {
 				const t = this.q[0]!.t;
 				if (t !== "committed" && t !== "receipt") break;
-				batch.push(this.shift());
+				const ev = this.shift();
+				batch.push(ev);
+				if ((ev.t === "committed" ? ev.frame.stream : ev.stream) === KEYRING_STREAM) break;
 			}
 			await this.ingest(batch);
 		}
+	}
+
+	private receipt(stream: StreamName, clientFrameId: ClientFrameId, seq: Seq): LiveItem {
+		const c = this.c;
+		const ob = c.outbox.get(clientFrameId);
+		const copy = ob && ob.stream === stream ? ownCommitCopy(c.gateCtx, c.ports.random, c.self, ob, seq) : null;
+		return copy ? { t: "receipt", stream, clientFrameId, seq, copy } : { t: "receipt", stream, clientFrameId, seq };
 	}
 
 	private async ingest(batch: readonly QueuedEvent[]): Promise<void> {
@@ -158,7 +171,7 @@ export class LiveIngest {
 				continue;
 			}
 			if (ev.t === "receipt") {
-				items.push({ t: "receipt", stream: ev.stream, clientFrameId: ev.clientFrameId, seq: ev.seq });
+				items.push(this.receipt(ev.stream, ev.clientFrameId, ev.seq));
 				skipApply.add(ev.seq);
 				receipts++;
 				continue;
@@ -166,7 +179,7 @@ export class LiveIngest {
 			if (ev.t !== "committed") continue;
 			const f = ev.frame;
 			if (f.deviceId === c.self && c.outbox.get(f.clientFrameId)?.stream === f.stream) {
-				items.push({ t: "receipt", stream: f.stream, clientFrameId: f.clientFrameId, seq: f.seq });
+				items.push(this.receipt(f.stream, f.clientFrameId, f.seq));
 				skipApply.add(f.seq);
 				receipts++;
 				continue;

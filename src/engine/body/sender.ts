@@ -11,7 +11,10 @@
  *    opened only after the reconnect late-receipt reads (DESIGN §d.7);
  *  - daily-limit hold, canWrite / forbidden, durability backoff;
  *  - probe mode after a 1008/1009 close: one frame in flight; a frame that
- *    triggers the close again is poisoned.
+ *    triggers the close again is poisoned;
+ *  - e2ee-design §14.2 step 4: a record sealed below the newest winning revoke
+ *    epoch, or a copy not sealed yet (empty `sealed`), is never sent as is: it
+ *    goes to deps.reseal and comes back as a new record.
  */
 
 import { APPEND_BYTES_PER_SEC, NS_SEND_WINDOW, RELAY_CLOSE } from "../../core/limits";
@@ -38,6 +41,10 @@ export interface SenderDeps {
 	onDailyLimit(waitMs: number, retryAfterMs: number | null): void;
 	/** The engine's write gate is shut (key-missing, e2ee-design §9.3): the outbox is held, nothing is sent. */
 	writeBlocked(): boolean;
+	/** The newest winning revoke epoch, 0 if none (e2ee-design §14.2 step 4). */
+	minSendEpoch(): number;
+	/** Seal `rec` again under the current epoch (runtime/reseal.ts); the result replaces it through upsert. */
+	reseal(rec: OutboxRecord): void;
 	diag(code: string, fields: Record<string, string | number | boolean | null>): void;
 }
 
@@ -309,6 +316,7 @@ export class Sender {
 		}
 		const nsWindow = this.window();
 		const maxInflight = this.deps.maxInflightBytes();
+		const minEpoch = this.deps.minSendEpoch();
 		let nextWake = Infinity;
 		for (const e of this.order()) {
 			const cfid = e.rec.clientFrameId;
@@ -318,6 +326,11 @@ export class Sender {
 			if (isNs && (!this.nsOpen || !nsWindow.has(cfid))) continue;
 			if (e.retryAtMono > now) {
 				nextWake = Math.min(nextWake, e.retryAtMono - now);
+				continue;
+			}
+			// After the ns window check: an ns/cfg record is re-sealed under its own id only once the late-receipt reads ran.
+			if (e.rec.sealed.length === 0 || e.rec.keyEpoch < minEpoch) {
+				this.deps.reseal(e.rec);
 				continue;
 			}
 			const bytes = e.rec.sealed.length;

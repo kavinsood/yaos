@@ -56,8 +56,8 @@ export class KeyringRuntime {
 	/** Own seals under `epoch` (§4.2), and what MetaKeyring holds. */
 	private seals = { epoch: 0, n: 0 };
 	private stored = { sum: "", n: 0, atMono: -Infinity };
-	/** Highest `k` seq that arrived on a session (a live row or an own receipt), judged or not. */
-	private kArrived: Seq = 0;
+	/** `k` seqs that arrived on a session (live rows, own receipts) above kJudged: not judged yet. */
+	private kUnjudged: Seq[] = [];
 	/** The keyring has judged every stored `k` row through this seq (ingestTail). */
 	private kJudged: Seq = 0;
 
@@ -98,6 +98,7 @@ export class KeyringRuntime {
 		const rows = (await this.c.repo.getTail(KEYRING_STREAM)).filter((r) => r.seq <= through);
 		if (rows.length > 0) await this.kr.ingest(rows.map((r) => ({ seq: r.seq, bytes: r.content })));
 		if (through > this.kJudged) this.kJudged = through;
+		this.kUnjudged = this.kUnjudged.filter((s) => s > this.kJudged);
 	}
 
 	// ------------------------------------------------------------------ §14.3
@@ -105,24 +106,39 @@ export class KeyringRuntime {
 	/** sessionLoop, at arrival (before any batching): a `k` row or an own `k` receipt. */
 	noteArrived(ev: RelayEvent): void {
 		const seq = ev.t === "committed" && ev.frame.stream === KEYRING_STREAM ? ev.frame.seq : ev.t === "receipt" && ev.stream === KEYRING_STREAM ? ev.seq : 0;
-		if (seq > this.kArrived) this.kArrived = seq;
+		if (seq > this.kJudged && !this.kUnjudged.includes(seq)) this.kUnjudged.push(seq);
 	}
 
 	/**
-	 * Every `k` row that can precede a row being gated now is judged. On a session the rows below a row arrive
-	 * before it (R2), in the session's `k` read or live; so: `k` was read to head on this session, every `k` row
-	 * that arrived since is stored and judged, and `k` is not stale (rows known from a feed only).
+	 * Every `k` row below `seq` is judged. On a session the rows below a row arrive before it (R2), in the
+	 * session's `k` read or live; so: `k` was read to head on this session, every `k` row below `seq` that arrived
+	 * since is stored and judged, and `k` is not stale (rows known from a feed only).
 	 */
-	private kComplete(): boolean {
+	private kComplete(seq: Seq): boolean {
 		const k = this.c.repo.stream(KEYRING_STREAM);
-		return this.c.session !== null && this.kReadGen === this.c.gen && !k?.stale && this.kArrived <= this.kJudged;
+		return this.c.session !== null && this.kReadGen === this.c.gen && !k?.stale && !this.kUnjudged.some((s) => s < seq);
 	}
 
 	/** GateCtx.staleCheck (gate.ts). seq null: a provisional, which commits after everything judged so far. */
 	staleCheck(keyEpoch: number, seq: Seq | null): StaleVerdict {
 		if (this.suite !== 1) return null;
-		if (!this.kComplete()) return "hold";
-		return this.kr.staleCheck(keyEpoch, seq ?? Number.MAX_SAFE_INTEGER);
+		const at = seq ?? Number.MAX_SAFE_INTEGER;
+		if (!this.kComplete(at)) return "hold";
+		return this.kr.staleCheck(keyEpoch, at);
+	}
+
+	/** The sender re-seals records below this epoch before sending them: the newest winning revoke, 0 if none (§14.2 step 4). */
+	minSendEpoch(): number {
+		return this.suite === 1 ? this.kr.minSendEpoch() : 0;
+	}
+
+	/**
+	 * Under suite 1 the sender waits for the session's `k` read: a revoke that won while this device was away is
+	 * known before any frame goes out, so unsent frames below it are re-sealed instead of committing stale (§14.2
+	 * step 4). Suite 0 sends at once.
+	 */
+	sendReady(): boolean {
+		return this.suite !== 1 || (this.c.session !== null && this.kReadGen === this.c.gen);
 	}
 
 	// ------------------------------------------------------------------ gate
@@ -222,6 +238,7 @@ export class KeyringRuntime {
 			}
 		}
 		await this.afterChange();
+		if (this.suite === 1) c.sender.pump(); // sendReady() just turned true
 	}
 
 	// ------------------------------------------------------------------ own records

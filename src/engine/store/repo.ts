@@ -77,13 +77,29 @@ export function newStreamRecord(stream: StreamName, nowMs: number): StreamRecord
 /** Frame to append to the outbox; order is assigned by the tx. */
 export type NewOutboxFrame = Omit<OutboxRecord, "order" | "attempts" | "lastSentAtMs">;
 
+/**
+ * An own frame that committed under an epoch the §14.3 rule makes stale, or may ("hold"): its record is renamed
+ * to `clientFrameId` with an empty `sealed`, which the sender seals under the current epoch (e2ee-design §14.2
+ * step 4, runtime/reseal.ts). `row` is what is stored for the commit; null: the outbox record's (receiptRow).
+ */
+export interface OwnCommitCopy {
+	readonly clientFrameId: ClientFrameId;
+	readonly row: TailRecord | null;
+}
+
+/** An outbox record that took another id (or was sealed again under its own): `next` replaces `old`. */
+export interface OutboxRename {
+	readonly old: OutboxRecord;
+	readonly next: OutboxRecord;
+}
+
 /** One live relay event, already gated (DESIGN §d.6 stages 1-2). Arrival (= seq) order. */
 export type LiveItem =
 	/** Committed row from another device (or an own row without outbox record). */
 	| { readonly t: "row"; readonly row: TailRecord; readonly settleAdoptable: ClientFrameId | null }
 	| { readonly t: "quarantine"; readonly rec: QuarantineRecord; readonly settleAdoptable: ClientFrameId | null }
 	/** Own frame receipt (or late receipt). Content comes from the outbox record. */
-	| { readonly t: "receipt"; readonly stream: StreamName; readonly clientFrameId: ClientFrameId; readonly seq: Seq }
+	| { readonly t: "receipt"; readonly stream: StreamName; readonly clientFrameId: ClientFrameId; readonly seq: Seq; readonly copy?: OwnCommitCopy }
 	/** Overflow / null payload: record stale, read later (T_stale). */
 	| { readonly t: "stale"; readonly stream: StreamName; readonly seq: Seq }
 	/** Unknown stream class: accounted, nothing stored. */
@@ -96,6 +112,8 @@ export interface LiveResult {
 	readonly removed: readonly OutboxRecord[];
 	/** Held records released to pending or re-pointed. */
 	readonly updated: readonly OutboxRecord[];
+	/** Own stale commits renamed to their copy (OwnCommitCopy). */
+	readonly renamed: readonly OutboxRename[];
 	/** Tail rows written (incl. receipts), for replica apply / fold. */
 	readonly tailPut: readonly TailRecord[];
 }
@@ -104,7 +122,7 @@ export interface ReadPageInput {
 	readonly stream: StreamName;
 	readonly rows: readonly TailRecord[];
 	readonly quarantines: readonly QuarantineRecord[];
-	readonly lateReceipts: readonly { readonly clientFrameId: ClientFrameId; readonly seq: Seq }[];
+	readonly lateReceipts: readonly { readonly clientFrameId: ClientFrameId; readonly seq: Seq; readonly copy?: OwnCommitCopy }[];
 	readonly settleAdoptables: readonly ClientFrameId[];
 	/** Fresh-stream checkpoint: stored directly as the snapshot (exact-key tail deletes <= coversSeq). */
 	readonly freshSnapshot: SnapshotRecord | null;
@@ -131,7 +149,12 @@ export type OutboxChange =
 	| { readonly t: "delete"; readonly clientFrameId: ClientFrameId }
 	| { readonly t: "state"; readonly clientFrameId: ClientFrameId; readonly state: OutboxState }
 	/** held only: wait for another frame instead (a ref whose own x: chunks remain). */
-	| { readonly t: "repoint"; readonly clientFrameId: ClientFrameId; readonly dependsOn: ClientFrameId };
+	| { readonly t: "repoint"; readonly clientFrameId: ClientFrameId; readonly dependsOn: ClientFrameId }
+	/**
+	 * pending/sent only, still sealed under `fromEpoch` with `fromLength` bytes: sealed again under the current epoch
+	 * (e2ee-design §14.2 step 4), under `next.clientFrameId` (its own for ns/cfg, a fresh one otherwise).
+	 */
+	| { readonly t: "reseal"; readonly clientFrameId: ClientFrameId; readonly fromEpoch: number; readonly fromLength: number; readonly next: { readonly clientFrameId: ClientFrameId; readonly sealed: Uint8Array; readonly keyEpoch: number } };
 
 export class Repo {
 	readonly cursor: CursorTracker;
@@ -344,6 +367,7 @@ export class Repo {
 			const recs = new Map<StreamName, Mut<StreamRecord>>();
 			const removed: OutboxRecord[] = [];
 			const updated: OutboxRecord[] = [];
+			const renamed: OutboxRename[] = [];
 			const tailPut: TailRecord[] = [];
 			const duty = new Set(this.ckptDuty);
 			let dutyChanged = false;
@@ -371,11 +395,9 @@ export class Repo {
 						const r = await getRec(it.stream);
 						const ob = await tx.get(STORE.outbox, it.clientFrameId);
 						if (ob && ob.stream === it.stream) {
-							const row = receiptRow(ob, it.seq, self);
+							const row = it.copy?.row ?? receiptRow(ob, it.seq, self);
 							if (await putTail(tx, r, row)) tailPut.push(row);
-							tx.delete(STORE.outbox, ob.clientFrameId);
-							removed.push(ob);
-							updated.push(...(await releaseDependents(tx, ob)));
+							await settleOwn(tx, ob, it.copy, removed, updated, renamed);
 							r.lastOwnSeq = Math.max(r.lastOwnSeq, it.seq);
 							if (it.seq > r.remoteCheckpointCoversSeq) {
 								r.rowsSinceRemoteCheckpoint++;
@@ -442,7 +464,7 @@ export class Repo {
 			this.cursor.commit(seqs, res, this.monotonic());
 			for (const r of recs.values()) this.cache.set(r.stream, r);
 			if (dutyChanged) this.ckptDuty = duty;
-			return { vaultSeq: res, streams: recs, removed, updated, tailPut };
+			return { vaultSeq: res, streams: recs, removed, updated, renamed, tailPut };
 		});
 	}
 
@@ -482,11 +504,12 @@ export class Repo {
 	// T_read_page
 	// -------------------------------------------------------------------------
 
-	tReadPage(input: ReadPageInput, nowMs: number): Promise<{ stream: StreamRecord; removed: OutboxRecord[]; updated: OutboxRecord[]; tailPut: TailRecord[] }> {
+	tReadPage(input: ReadPageInput, nowMs: number): Promise<{ stream: StreamRecord; removed: OutboxRecord[]; updated: OutboxRecord[]; renamed: OutboxRename[]; tailPut: TailRecord[] }> {
 		return this.serial("tReadPage", async () => {
 			const self = this.deviceId;
 			const removed: OutboxRecord[] = [];
 			const updated: OutboxRecord[] = [];
+			const renamed: OutboxRename[] = [];
 			const tailPut: TailRecord[] = [];
 			const out = await this.db.tx([STORE.tail, STORE.quarantine, STORE.outbox, STORE.streams, STORE.snapshots, STORE.meta], "readwrite", async (tx) => {
 				const r: Mut<StreamRecord> = { ...((await tx.get(STORE.streams, input.stream)) ?? newStreamRecord(input.stream, nowMs)) };
@@ -518,11 +541,9 @@ export class Repo {
 				for (const lr of input.lateReceipts) {
 					const ob = await tx.get(STORE.outbox, lr.clientFrameId);
 					if (!ob) continue;
-					const row = receiptRow(ob, lr.seq, self);
+					const row = lr.copy?.row ?? receiptRow(ob, lr.seq, self);
 					if (await putTail(tx, r, row)) tailPut.push(row);
-					tx.delete(STORE.outbox, ob.clientFrameId);
-					removed.push(ob);
-					updated.push(...(await releaseDependents(tx, ob)));
+					await settleOwn(tx, ob, lr.copy, removed, updated, renamed);
 					r.lastOwnSeq = Math.max(r.lastOwnSeq, lr.seq);
 					r.remoteHeadSeq = Math.max(r.remoteHeadSeq, lr.seq);
 				}
@@ -544,7 +565,7 @@ export class Repo {
 				return r;
 			});
 			this.cache.set(out.stream, out);
-			return { stream: out, removed, updated, tailPut };
+			return { stream: out, removed, updated, renamed, tailPut };
 		});
 	}
 
@@ -590,10 +611,11 @@ export class Repo {
 	// adoptable -> pending (dropped / 60 s), poison.
 	// -------------------------------------------------------------------------
 
-	tOutbox(changes: readonly OutboxChange[]): Promise<{ removed: OutboxRecord[]; updated: OutboxRecord[] }> {
+	tOutbox(changes: readonly OutboxChange[]): Promise<{ removed: OutboxRecord[]; updated: OutboxRecord[]; renamed: OutboxRename[] }> {
 		return this.serial("tOutbox", async () => {
 			const removed: OutboxRecord[] = [];
 			const updated: OutboxRecord[] = [];
+			const renamed: OutboxRename[] = [];
 			await this.db.tx([STORE.outbox], "readwrite", async (tx) => {
 				for (const c of changes) {
 					const r = await tx.get(STORE.outbox, c.clientFrameId);
@@ -607,6 +629,11 @@ export class Repo {
 						const n: OutboxRecord = { ...r, state: "pending", dependsOn: null };
 						tx.put(STORE.outbox, n);
 						updated.push(n);
+					} else if (c.t === "reseal") {
+						if ((r.state !== "pending" && r.state !== "sent") || r.keyEpoch !== c.fromEpoch || r.sealed.length !== c.fromLength) continue;
+						const n: OutboxRecord = { ...r, ...c.next, state: "pending", attempts: 0, lastSentAtMs: 0 };
+						await rename(tx, r, n, updated);
+						renamed.push({ old: r, next: n });
 					} else if (c.t === "repoint") {
 						if (r.state !== "held" || r.dependsOn === c.dependsOn) continue;
 						const n: OutboxRecord = { ...r, dependsOn: c.dependsOn };
@@ -623,7 +650,7 @@ export class Repo {
 					}
 				}
 			});
-			return { removed, updated };
+			return { removed, updated, renamed };
 		});
 	}
 
@@ -774,6 +801,35 @@ async function raiseFrameNoFloor(tx: Tx, f: FrameNoFloor): Promise<void> {
 function receiptRow(ob: OutboxRecord, seq: Seq, self: DeviceId): TailRecord {
 	const kind = ob.kind === "bodyUpdateRef" ? (streamClass(ob.stream) === "canvas" ? "canvasUpdate" : "bodyUpdate") : ob.kind;
 	return { stream: ob.stream, seq, deviceId: self, clientFrameId: ob.clientFrameId, kind, authorNsSeq: ob.authorNsSeq, flags: ob.flags, frameNo: ob.frameNo ?? 0, content: ob.content };
+}
+
+/** A receipted own record: gone, or (an own stale commit) renamed to its unsealed copy. */
+async function settleOwn(tx: Tx, ob: OutboxRecord, copy: OwnCommitCopy | undefined, removed: OutboxRecord[], updated: OutboxRecord[], renamed: OutboxRename[]): Promise<void> {
+	if (!copy) {
+		tx.delete(STORE.outbox, ob.clientFrameId);
+		removed.push(ob);
+		updated.push(...(await releaseDependents(tx, ob)));
+		return;
+	}
+	const next: OutboxRecord = { ...ob, clientFrameId: copy.clientFrameId, sealed: new Uint8Array(0), state: "pending", attempts: 0, lastSentAtMs: 0 };
+	await rename(tx, ob, next, updated);
+	renamed.push({ old: ob, next });
+}
+
+/**
+ * `next` replaces `old` at the same order (the order indexes are unique: the old key goes first); held records
+ * waiting for `old` wait for `next` (dependsOn: ns creates, adopted records, x: chunks).
+ */
+async function rename(tx: Tx, old: OutboxRecord, next: OutboxRecord, updated: OutboxRecord[]): Promise<void> {
+	if (next.clientFrameId !== old.clientFrameId) tx.delete(STORE.outbox, old.clientFrameId);
+	tx.put(STORE.outbox, next);
+	if (next.clientFrameId === old.clientFrameId) return;
+	for (const h of await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, stateOrderRange("held"))) {
+		if (h.dependsOn !== old.clientFrameId) continue;
+		const n: OutboxRecord = { ...h, dependsOn: next.clientFrameId };
+		tx.put(STORE.outbox, n);
+		updated.push(n);
+	}
 }
 
 /** Idempotent tail put; rows already covered by the snapshot are skipped. Returns true if written. */

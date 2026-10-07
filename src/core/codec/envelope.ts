@@ -219,6 +219,8 @@ export interface SealedEnvelope {
 	readonly sealed: Uint8Array;
 	/** Flags as sealed (deflate bit included when compressed). */
 	readonly flags: number;
+	/** The header's key epoch (e2ee-design §14.2: the outbox keeps it for the revoke re-seal). */
+	readonly keyEpoch: number;
 }
 
 /** Seal under crypto.sealEpoch(), read once, so the header and the AAD agree even across a concurrent roll. */
@@ -227,7 +229,7 @@ export async function sealEnvelope(crypto: CryptoPort, input: SealInput): Promis
 	const header: EnvelopeHeader = { formatVersion: ENVELOPE_FORMAT_VERSION, suite: crypto.suite, keyEpoch: crypto.sealEpoch() };
 	const plaintext = header.suite === CryptoSuite.none ? inner.bytes : pad(inner.bytes);
 	const sealed = await crypto.seal({ purpose: input.binding.t, keyEpoch: header.keyEpoch, aad: bindingAad(header, input.vaultId, input.binding), plaintext });
-	return { sealed: encodeOuter(header, sealed), flags: inner.flags };
+	return { sealed: encodeOuter(header, sealed), flags: inner.flags, keyEpoch: header.keyEpoch };
 }
 
 export interface OpenInput {

@@ -37,6 +37,7 @@ import { DocRuntime } from "./docRuntime";
 import { LiveIngest } from "./liveIngest";
 import { Maintenance } from "./maintenance";
 import { MirrorWriter, recoverFromMirror } from "./mirrorIo";
+import { Resealer } from "./reseal";
 import type { EngineOptions } from "./options";
 import { SessionLoop } from "./sessionLoop";
 import { KeyringRuntime } from "../keyring/keyringRuntime";
@@ -144,6 +145,7 @@ export class LogEngine {
 		c.cfg.frameNoFloor = repo.frameNoFloor.cfg;
 		c.docs = new DocRuntime(c);
 		c.handles = new HandleManager(repo, c.budgets, c.docs.hooks());
+		const resealer = new Resealer(c);
 		c.sender = new Sender({
 			clock: opts.ports.clock,
 			rankOf: rankOf(c),
@@ -158,7 +160,9 @@ export class LogEngine {
 				void c.repo.tOutbox([{ t: "state", clientFrameId: rec.clientFrameId, state: "poisoned" }]).then((r) => c.applyOutboxResult(r));
 			},
 			onForbidden: () => c.onForbidden(),
-			writeBlocked: () => c.gate() !== null,
+			writeBlocked: () => c.gate() !== null || !c.keyring.sendReady(),
+			minSendEpoch: () => c.keyring.minSendEpoch(),
+			reseal: (rec) => resealer.request(rec),
 			onDailyLimit: (ms, retryAfterMs) => {
 				c.dailyLimitUntilMono = c.mono() + ms;
 				c.setPhase("daily-limit");

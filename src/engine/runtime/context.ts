@@ -18,7 +18,7 @@ import type { HandleManager } from "../body/handles";
 import { resolveRefRow, type RefDeps } from "../body/refs";
 import type { Sender } from "../body/sender";
 import type { GateCtx } from "../ingest/gate";
-import type { Mut, Repo } from "../store/repo";
+import type { Mut, OutboxRename, Repo } from "../store/repo";
 import type { OutboxRecord } from "../store/schema";
 import type { CatchUpDeps } from "../sync/catchUp";
 import type { CfgRuntime } from "../sync/cfgRuntime";
@@ -197,7 +197,7 @@ export class EngineCtx {
 	}
 
 	/** Mirror committed outbox transitions into the cache, the sender and the adopt map. */
-	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly updated: readonly OutboxRecord[] }): void {
+	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly updated: readonly OutboxRecord[]; readonly renamed?: readonly OutboxRename[] }): void {
 		const drained = new Set<StreamName>();
 		for (const r of res.removed) {
 			const cls = streamClass(r.stream);
@@ -210,13 +210,25 @@ export class EngineCtx {
 			this.sentPending.delete(r.clientFrameId);
 			this.unregisterAdopt(r.clientFrameId);
 		}
+		// Re-sealed (e2ee-design §14.2 step 4): not committed, so no fold note and the doc is not drained.
+		for (const { old, next } of res.renamed ?? []) {
+			if (next.clientFrameId !== old.clientFrameId) {
+				this.outbox.delete(old.clientFrameId);
+				this.sender.remove(old.clientFrameId);
+				this.sentPending.delete(old.clientFrameId);
+				this.unregisterAdopt(old.clientFrameId);
+				for (const [doc, cf] of this.pendingCreates) if (cf === old.clientFrameId) this.pendingCreates.set(doc, next.clientFrameId);
+			}
+			this.outbox.put(next);
+			this.sender.upsert(next);
+		}
 		for (const r of res.updated) {
 			if (!this.outbox.has(r.clientFrameId)) continue; // removed later in the same result
 			this.outbox.put(r);
 			this.sender.upsert(r);
 			if (r.state !== "adoptable") this.unregisterAdopt(r.clientFrameId);
 		}
-		if (res.removed.length > 0 || res.updated.length > 0) {
+		if (res.removed.length > 0 || res.updated.length > 0 || (res.renamed?.length ?? 0) > 0) {
 			this.mirror.schedule();
 			this.scheduleStatus();
 		}

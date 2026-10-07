@@ -49,7 +49,7 @@ async function seal(ctx: FrameCtx, stream: StreamName, kind: EnvelopeKind, autho
 	const s = await sealFrame(ctx.crypto, ctx.vaultId, { stream, deviceId: ctx.self, clientFrameId, kind, authorNsSeq, flags, frameNo, content: sealedContent });
 	return {
 		clientFrameId, stream, kind, state, sealed: s.sealed, content: localContent, authorNsSeq, flags: s.flags & ~EnvelopeFlag.deflate,
-		frameNo: frameNo === 0 ? null : frameNo, dependsOn, adoptOf: null, createdAtMs: nowMs,
+		frameNo: frameNo === 0 ? null : frameNo, keyEpoch: s.keyEpoch, dependsOn, adoptOf: null, createdAtMs: nowMs,
 	};
 }
 
@@ -112,7 +112,7 @@ export async function buildAdoptFrame(
 	const s = await sealFrame(ctx.crypto, ctx.vaultId, { stream, deviceId: ctx.self, clientFrameId, kind, authorNsSeq, flags: f, frameNo: 0, content });
 	return {
 		clientFrameId, stream, kind, state: "adoptable", sealed: s.sealed, content, authorNsSeq, flags: s.flags & ~EnvelopeFlag.deflate,
-		frameNo: null, dependsOn: null, adoptOf, createdAtMs: nowMs,
+		frameNo: null, keyEpoch: s.keyEpoch, dependsOn: null, adoptOf, createdAtMs: nowMs,
 	};
 }
 

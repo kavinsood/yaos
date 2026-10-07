@@ -17,7 +17,7 @@
 
 import { decodeBlobChunk } from "../../core/codec/contents";
 import type { BlobChunkContent } from "../../core/envelope";
-import { blobChunkStream, type ClientFrameId, type ContentHash } from "../../core/types";
+import { blobChunkStream, type ContentHash } from "../../core/types";
 import type { RelaySession } from "../../ports/relay";
 import { assembleChunks } from "../blobs/chunks";
 import { buildBlobChunkFrame } from "../body/frames";
@@ -80,12 +80,12 @@ export async function appendBlobChunks(c: EngineCtx, hash: ContentHash, chunks: 
 	const stream = blobChunkStream(hash);
 	const want = new Map<number, BlobChunkContent>();
 	for (const ch of chunks) if (!want.has(ch.index)) want.set(ch.index, ch);
-	const wait = new Set<ClientFrameId>();
+	const wait = new Set<number>();
 	for (const r of c.outbox.ofStream(stream)) {
 		const ch = chunkOf(r.content, hash);
 		if (!ch || !want.has(ch.index)) continue;
 		if (r.state === "poisoned") return false;
-		wait.add(r.clientFrameId);
+		wait.add(ch.index);
 		want.delete(ch.index);
 	}
 	if (want.size > 0) {
@@ -95,26 +95,29 @@ export async function appendBlobChunks(c: EngineCtx, hash: ContentHash, chunks: 
 	}
 	if (want.size > 0) {
 		const parts = [...want.values()];
-		const ids = await c.docs.chain(async () => {
+		await c.docs.chain(async () => {
 			const frames = [];
 			for (const ch of parts) frames.push(await buildBlobChunkFrame(c.deps, ch, c.ns.coversSeq, c.now()));
 			c.addOutbox(await c.repo.tEdit(frames, c.now()));
-			return frames.map((f) => f.clientFrameId);
 		});
-		for (const id of ids) wait.add(id);
+		for (const ch of parts) wait.add(ch.index);
 	}
-	return waitCommitted(c, session, wait, c.tuning.blobAppendTimeoutMs);
+	return waitCommitted(c, session, hash, wait, c.tuning.blobAppendTimeoutMs);
 }
 
-/** Every record gone from the outbox (receipted) -> true; poisoned, session change, stop or timeout -> false. */
-function waitCommitted(c: EngineCtx, session: RelaySession, ids: ReadonlySet<ClientFrameId>, timeoutMs: number): Promise<boolean> {
+/**
+ * No own record of a wanted chunk left in the outbox (receipted) -> true; poisoned, session change, stop or
+ * timeout -> false. By chunk index, not frame id: a re-seal renames a record (runtime/reseal.ts).
+ */
+function waitCommitted(c: EngineCtx, session: RelaySession, hash: ContentHash, indices: ReadonlySet<number>, timeoutMs: number): Promise<boolean> {
 	const deadline = c.mono() + timeoutMs;
+	const stream = blobChunkStream(hash);
 	return new Promise((resolve) => {
 		const check = (): void => {
 			let all = true;
-			for (const id of ids) {
-				const r = c.outbox.get(id);
-				if (!r) continue;
+			for (const r of c.outbox.ofStream(stream)) {
+				const ch = chunkOf(r.content, hash);
+				if (!ch || !indices.has(ch.index)) continue;
 				if (r.state === "poisoned") return resolve(false);
 				all = false;
 			}
