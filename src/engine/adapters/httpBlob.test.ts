@@ -5,7 +5,7 @@ import type { ClockPort } from "../../ports/clock";
 import { MAX_BLOB_UPLOAD_BYTES } from "../../core/limits";
 import { BlobTooLargeError } from "../../ports/blob";
 import type { BlobAddress } from "../../ports/crypto";
-import { BLOB_EXISTS_BATCH, createHttpBlob, GC_RETRY_ATTEMPTS, probeHttpBlob } from "./httpBlob";
+import { BLOB_EXISTS_BATCH, CAPABILITIES_TIMEOUT_MS, createHttpBlob, GC_RETRY_ATTEMPTS, probeHttpBlob, startupBlob } from "./httpBlob";
 import { RelayHttpError } from "./relayHttp";
 import { fakeFetch, fakeXhrs, jsonResponse, ManualClock, routedXhr, type FakeRequest, type FakeXhr } from "./relayTestFakes";
 
@@ -40,6 +40,12 @@ function blob(route: (req: FakeRequest) => Response | "network") {
 		requests: f.requests,
 		waits,
 	};
+}
+
+/** Lets pending promise callbacks run (a fetch fake's async body, a probe's continuation). */
+async function settle(): Promise<void> {
+	for (let i = 0; i < 10; i++) await Promise.resolve();
+	await new Promise((r) => setImmediate(r));
 }
 
 async function rejection(p: Promise<unknown>): Promise<RelayHttpError> {
@@ -407,6 +413,60 @@ describe("httpBlob", () => {
 		const port = await probeHttpBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: on.fetch });
 		assert.equal(port?.maxBlobBytes, 1234);
 		await rejection(probeHttpBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: fakeFetch(() => "network").fetch }));
+	});
+
+	it("probeHttpBlob gives up at CAPABILITIES_TIMEOUT_MS on a reply that never comes (headers or body), signal aborted", async () => {
+		// The fetches ignore their signal: the deadline must hold anyway. Engine init awaits this probe.
+		const never = new Promise<Response>(() => undefined);
+		const stalledBody = () => new Response(new ReadableStream({ start: () => undefined }), { status: 200 });
+		for (const stage of ["headers", "body"] as const) {
+			const clock = new ManualClock();
+			let signal: AbortSignal | null = null;
+			const fetchImpl: typeof fetch = async (_input, init) => {
+				signal = init?.signal ?? null;
+				return stage === "headers" ? never : stalledBody();
+			};
+			let settled = false;
+			const p = probeHttpBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: fetchImpl, clock });
+			void p.then(() => { settled = true; }, () => { settled = true; });
+			await settle();
+			clock.advance(CAPABILITIES_TIMEOUT_MS - 1);
+			await settle();
+			assert.equal(settled, false, `${stage}: still waiting just before the deadline`);
+			clock.advance(1);
+			const e = await rejection(p);
+			assert.deepEqual([e.status, e.code], [0, "timeout"], stage);
+			assert.equal((signal as AbortSignal | null)?.aborted, true, `${stage}: the request is aborted`);
+			assert.equal(clock.pendingTimers, 0, stage);
+		}
+		const clock = new ManualClock();
+		await probeHttpBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, clock,
+			fetch: fakeFetch(() => jsonResponse({ attachments: true })).fetch });
+		assert.equal(clock.pendingTimers, 0, "an answered probe clears its deadline");
+	});
+
+	it("startupBlob: capabilities never answer -> the store is assumed after the deadline (init goes on), logged without secrets", async () => {
+		const clock = new ManualClock();
+		const lines: string[] = [];
+		const requests: string[] = [];
+		const fetchImpl: typeof fetch = async (input, init) => {
+			requests.push(`${init?.method ?? "GET"} ${new URL(String(input)).pathname}`);
+			return new Promise<Response>(() => undefined);
+		};
+		const p = startupBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: fetchImpl, clock }, (l) => lines.push(l));
+		await settle();
+		clock.advance(CAPABILITIES_TIMEOUT_MS);
+		const port = await p;
+		assert.ok(port, "a store is assumed (the blob queue retries), as on an offline start");
+		assert.deepEqual(requests, ["GET /api/capabilities"]);
+		assert.equal(lines.length, 1);
+		assert.match(lines[0]!, /capabilities.*timeout/);
+		assert.ok(!lines[0]!.includes(TOKEN));
+		const off = await startupBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, clock,
+			fetch: fakeFetch(() => jsonResponse({ attachments: false })).fetch });
+		assert.equal(off, null, "a relay without attachments still means no store");
+		assert.ok(await startupBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, clock, fetch: fakeFetch(() => "network").fetch }),
+			"offline start: the store is assumed");
 	});
 
 	it("list() walks pages by the last address and validates their order", async () => {

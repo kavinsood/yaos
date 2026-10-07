@@ -342,7 +342,7 @@ attachment-storage info row is in §3.4.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Attachments travel as content-addressed blobs | adfa7a7:src/sync/blobSync.ts:226, :380 | src/engine/adapters/httpBlob.ts:240-255 (blob store from the server capabilities); src/engine/reconcile/blobJobs.ts:117-121 | ported (DESIGN §j.1) |
+| Attachments travel as content-addressed blobs | adfa7a7:src/sync/blobSync.ts:226, :380 | src/engine/adapters/httpBlob.ts:302-322 (blob store from the server capabilities); src/engine/reconcile/blobJobs.ts:117-121 | ported (DESIGN §j.1) |
 | No object storage: attachments are not synced, with a one-time notice | adfa7a7:src/runtime/attachmentOrchestrator.ts:188-194 ("This file won't sync yet. Attachment sync needs object storage. ...") | src/engine/reconcile/localState.ts:86 (reason `no-blob-store`, silent: src/engine/reconcile/skipNotice.ts:56); src/engine/blobs/blobQueue.ts:110-111 (`maxBlobBytes` 0) | dropped: the one-time notice (user decision 2026-10-07: no notices for server metadata); attachments are still not synced, fail closed (DESIGN §j.1) |
 | Oversized attachment skipped on scan and on upload | adfa7a7:src/sync/blobSync.ts:561, :860, :1077-1083 | src/engine/reconcile/localState.ts:81, :87; src/engine/blobs/blobQueue.ts:204-207; src/engine/reconcile/blobJobs.ts:108 | ported (the warning popup is implemented (c5ca263), §3.2) |
 | Effective cap is the smaller of the user limit and the server's upload limit | adfa7a7:src/settings/settingsStore.ts:14-23; adfa7a7:src/sync/blobSync.ts:482 | src/engine/reconcile/localState.ts:81; src/engine/adapters/httpBlob.ts:36, :252-253 | ported (the field text is the wave-2 row in §3.5) |
