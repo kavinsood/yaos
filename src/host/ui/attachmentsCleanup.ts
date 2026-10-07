@@ -23,9 +23,27 @@ const REFUSAL_TEXT: Readonly<Record<AttachmentCleanupRefusal, string>> = Object.
 	interrupted: "the clean-up was interrupted",
 });
 
+/**
+ * "keys-unverified" has three sources, told apart by the engine's detail text (the detail itself is not shown):
+ * a device whose engine never opened (no pin, or the key is missing: keyReader.ts:191), and a running engine whose
+ * in-session write gate is shut (blobGc.ts:108). Anything else is the unconfirmed-key case (blobGc.ts:104).
+ */
+export const CLOSED_DEVICE_DETAIL = "this device has no usable encryption pin or key";
+export const SHUT_GATE_DETAIL_PREFIX = "this device may not write to the vault (";
+const CLOSED_DEVICE_TEXT = "this device does not have the vault's encryption key yet; enter your recovery key or scan a QR code from one of your devices first";
+const SHUT_GATE_TEXT = "this device may not write to the vault right now (for example, the vault key changed and this device has not been re-keyed yet); try again once it syncs normally";
+
+function refusalText(refused: Exclude<AttachmentCleanupRefusal, "interrupted">, detail: string | null): string {
+	if (refused === "keys-unverified" && detail !== null) {
+		if (detail === CLOSED_DEVICE_DETAIL) return CLOSED_DEVICE_TEXT;
+		if (detail.startsWith(SHUT_GATE_DETAIL_PREFIX)) return SHUT_GATE_TEXT;
+	}
+	return REFUSAL_TEXT[refused];
+}
+
 export function attachmentsCleanedNotice(r: Cleaned): { readonly message: string; readonly level: "info" | "error" } {
 	if (r.refused !== null && r.refused !== "interrupted") {
-		return { message: `Nothing was deleted: ${REFUSAL_TEXT[r.refused]}.`, level: "error" };
+		return { message: `Nothing was deleted: ${refusalText(r.refused, r.detail)}.`, level: "error" };
 	}
 	const parts: string[] = [];
 	if (r.refused === "interrupted") parts.push(`The clean-up stopped part-way${r.detail ? ` (${r.detail})` : ""}.`);

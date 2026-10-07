@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { attachmentsCleanedNotice, cleanUpAttachments } from "./attachmentsCleanup";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { attachmentsCleanedNotice, cleanUpAttachments, CLOSED_DEVICE_DETAIL, SHUT_GATE_DETAIL_PREFIX } from "./attachmentsCleanup";
 import type { AttachmentCleanupRefusal, EngineResultValue, UserCommand } from "../../protocol/messages";
 
 type Cleaned = Extract<EngineResultValue, { t: "attachmentsCleaned" }>;
@@ -48,4 +51,19 @@ test("cleanUpAttachments: one command, one notice; a failure is one error notice
 	notes.length = 0;
 	await cleanUpAttachments({ command: () => Promise.resolve({ t: "ok" }) }, (m, l) => notes.push([m, l]));
 	assert.deepEqual(notes, [["Could not clean up attachments: the sync engine did not run the clean-up", "error"]]);
+});
+
+test("attachmentsCleanedNotice: keys-unverified tells a closed device from a shut in-session gate", () => {
+	const closed = attachmentsCleanedNotice(cleaned({ refused: "keys-unverified", detail: CLOSED_DEVICE_DETAIL })).message;
+	const shut = attachmentsCleanedNotice(cleaned({ refused: "keys-unverified", detail: `${SHUT_GATE_DETAIL_PREFIX}revoked-epoch)` })).message;
+	const unconfirmed = attachmentsCleanedNotice(cleaned({ refused: "keys-unverified", detail: "the vault's encryption key is not confirmed on this device" })).message;
+	assert.equal(new Set([closed, shut, unconfirmed]).size, 3);
+	assert.match(closed, /^Nothing was deleted: this device does not have the vault's encryption key yet; enter your recovery key/);
+	assert.match(shut, /^Nothing was deleted: this device may not write to the vault right now/);
+	assert.ok(!shut.includes("revoked-epoch"), "the detail stays in diagnostics");
+	assert.equal(unconfirmed, "Nothing was deleted: this device has not confirmed the vault's encryption key.");
+	// The details are the engine's literals (keyReader.ts closed device, blobGc.ts shut gate).
+	const src = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "engine");
+	assert.ok(readFileSync(join(src, "compose", "keyReader.ts"), "utf8").includes(`detail: "${CLOSED_DEVICE_DETAIL}"`));
+	assert.ok(readFileSync(join(src, "runtime", "blobGc.ts"), "utf8").includes(`\`${SHUT_GATE_DETAIL_PREFIX}\${shut})\``));
 });

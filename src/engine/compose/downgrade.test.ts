@@ -373,7 +373,7 @@ function mobileSetupPage(url: string): string | null {
 function joinInput(form: JoinForm, code: string): EnrollInput {
 	const fromLink = (params: Record<string, string>): EnrollInput => {
 		const p = parseSetupLink(params);
-		if (!p.ok) throw new Error(`setup link refused (${form})`);
+		if (!p.ok || p.kind !== "setup") throw new Error(`setup link refused (${form})`);
 		return { host: p.host, pairingCode: p.pairingCode, deviceName: "Joiner" };
 	};
 	// The console's link and setup QR (server/src/console/console.ts:160, :169).

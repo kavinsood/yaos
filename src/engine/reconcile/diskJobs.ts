@@ -50,17 +50,22 @@ export function moveOk(res: ExecResult): VaultStat | null {
 	return (res.t === "rename" || res.t === "trash") && res.outcome.ok ? res.outcome.stat : null;
 }
 
-/** rebind: the doc's synced record (and base) now belong to the winner (§c.5 alias, identical-loser collapse). */
+/**
+ * rebind: the doc's synced record (and base) now belong to the winner (§c.5 alias, identical-loser collapse). A §c.12
+ * migrated loser's record is dropped instead (op.adopt): moved, its base (this device's own text) would be the
+ * winner's sync point for any merge before the planned one against the epoch base, and the winner's text would read
+ * as the deletion of this device's edits (E7 suite-1 sim, seed 32: a bound editor's attach, or a retried merge).
+ */
 export async function rebind(env: Env, op: Op<"rebind">): Promise<JobOutcome> {
 	const { ctx } = env;
 	const s = ctx.synced(op.fromDocId);
 	if (!s) return "ok";
-	if (ctx.synced(op.toDocId)) {
+	if (op.adopt || ctx.synced(op.toDocId)) {
 		await ctx.commit({ syncedDrop: [op.fromDocId], baseDrop: [op.fromDocId] });
 		ctx.deps.onRebind?.(op.fromDocId, op.toDocId);
 		return "ok";
 	}
-	// A merged alias restarts at the winner's create, as the planner planned it; a collapse (live loser) keeps S.
+	// A merged alias restarts at the winner's create, as the planner planned it; an identical collapse (live loser) keeps S.
 	const view = ctx.log.view().remote;
 	const winner = view.get(op.toDocId);
 	const from = winner && view.get(op.fromDocId)?.state !== "live" ? restartAtCreate(s, winner.createHash) : s;

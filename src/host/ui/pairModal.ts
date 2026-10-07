@@ -1,22 +1,31 @@
 /**
- * Pairing modals: PairModal (join this device to a vault with a server URL + one-time code) and
- * the "pair another device" code display with a QR code of the mobile setup page and an "Open
- * pairing page" button. Ported from the old client (adfa7a7:src/settings/PairDeviceModal.ts, QR at
- * :40-65, and the enrollment parts of adfa7a7:src/settings/settingsTab.ts). When a pairing
- * replaces another, the old enrollment is revoked on its server after the new one is stored.
+ * Pairing modals: PairModal (join this device to a vault with a server URL + one-time code) and PairingCodeModal
+ * ("Pair another device": a fresh code, and on request a QR code the plugin draws itself). Ported from the old client
+ * (adfa7a7:src/settings/PairDeviceModal.ts, QR at :40-65, and the enrollment parts of
+ * adfa7a7:src/settings/settingsTab.ts). When a pairing replaces another, the old enrollment is revoked on its server
+ * after the new one is stored.
  *
- * SECRETS: the pairing code input is a password field; codes and tokens are never logged. The
- * code shown by PairingCodeModal is displayed only because handing it to the other device is the
- * point of that dialog.
+ * e2ee-design §12.1: the QR and the copied setup link carry this device's vault key (or `suite=0`) in a client-only
+ * `key` param, which never reaches the server (`/enroll` gets only the code). The QR is drawn only after a click on
+ * "Show pairing QR", and hidden when the code expires or the dialog closes. The server's mobile setup page is not
+ * offered: a page the server draws can only carry a key-less join.
+ *
+ * SECRETS: the pairing code input is a password field; codes, tokens, keys and links are never logged or put in a
+ * notice. The code shown by PairingCodeModal is displayed only because handing it to the other device is the point of
+ * that dialog.
  */
 
 import { Modal, Notice, Setting, type App, type ButtonComponent } from "obsidian";
-import { toCanvas } from "qrcode";
-import { sameIdentity, type YaosUiHost } from "./api";
+import { sameIdentity, type PairedIdentity, type YaosUiHost } from "./api";
+import { COPY_LINK_WARNING, DEVICE_NAME_HINT } from "./e2eeText";
 import { errorMessage } from "./format";
+import { pairingLink, pairingLinkE2ee } from "./keyActions";
 import { copyText, obsidianRequest } from "./obsidianEnv";
 import { applyPairedIdentity, formatCountdown, PairingSession, setPendingEnrollment, withoutPendingEnrollment } from "./pairFlow";
-import { requestPairingCode, retireDeviceEnrollment, type PairingCodeGrant, type RequestFn } from "./pairing";
+import {
+	normalizeHost, pairingCodeVaultId, requestPairingCode, retireDeviceEnrollment, type LinkE2ee, type PairingCodeGrant, type RequestFn,
+} from "./pairing";
+import { drawQr } from "./qr";
 
 /** One-click Cloudflare deploy of the server (README "Deploy to Cloudflare"). */
 const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
@@ -24,6 +33,32 @@ const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https:
 export interface PairPrefill {
 	readonly host?: string;
 	readonly pairingCode?: string;
+	/** From a setup link: true. The pair modal then says what the link sets for encryption. */
+	readonly fromLink?: boolean;
+	/**
+	 * SECRET: the link's vault key, or `suite=0`. Handed to `applyLinkE2ee` after pairing, and only when the device
+	 * enrolled in the vault the link's code names on the link's server; zero-filled otherwise and on close.
+	 */
+	readonly e2ee?: LinkE2ee | null;
+}
+
+/** Takes a link's encryption part for the vault this device just enrolled in; owns (and zero-fills) the key. */
+export type ApplyLinkE2ee = (vaultId: string, e2ee: LinkE2ee) => void;
+
+function dropLinkKey(e2ee: LinkE2ee | null): void {
+	if (e2ee?.suite === 1) e2ee.key.k.fill(0);
+}
+
+/** Whether a link's encryption part belongs to the vault this device enrolled in from that link's code (§12.4). */
+export function linkE2eeApplies(prefill: PairPrefill, identity: PairedIdentity): boolean {
+	if (!prefill.host || !prefill.pairingCode) return false;
+	let host: string;
+	try {
+		host = normalizeHost(prefill.host);
+	} catch {
+		return false;
+	}
+	return identity.host === host && pairingCodeVaultId(prefill.pairingCode) === identity.vaultId;
 }
 
 export class PairModal extends Modal {
@@ -34,14 +69,18 @@ export class PairModal extends Modal {
 	private statusEl: HTMLElement | null = null;
 	private pairButton: ButtonComponent | null = null;
 	private open_ = false;
+	/** SECRET until handed on or zero-filled. */
+	private linkE2ee: LinkE2ee | null;
 
 	constructor(
 		app: App,
 		private readonly host: YaosUiHost,
-		prefill: PairPrefill = {},
+		private readonly prefill: PairPrefill = {},
+		private readonly applyE2ee: ApplyLinkE2ee | null = null,
 		private readonly request: RequestFn = obsidianRequest,
 	) {
 		super(app);
+		this.linkE2ee = prefill.e2ee ?? null;
 		this.session = new PairingSession({
 			request,
 			onProgress: (text) => this.setStatus(text, false),
@@ -70,6 +109,19 @@ export class PairModal extends Modal {
 		contentEl.createEl("p", {
 			text: "Enter the server URL and a one-time pairing code. Create a code on a device that is already paired (YAOS settings, \"Pair another device\") or in your server's console.",
 		});
+		if (this.prefill.fromLink) {
+			const e2ee = this.linkE2ee;
+			const line = contentEl.createEl("p", { cls: "yaos-pair-e2ee" });
+			if (e2ee?.suite === 1) {
+				line.createEl("strong", { text: "End-to-end encryption: On" });
+				line.appendText(". This link carries the vault key. YAOS checks it against the vault's key record before this device syncs.");
+			} else if (e2ee?.suite === 0) {
+				line.createEl("strong", { text: "End-to-end encryption: Off (from this link)" });
+				line.appendText(". This device will sync the vault without end-to-end encryption, unless the vault turns out to be encrypted.");
+			} else {
+				line.appendText("This link carries no vault key. If the vault is end-to-end encrypted, this device asks for your recovery key or a QR code from one of your devices after pairing.");
+			}
+		}
 
 		new Setting(contentEl)
 			.setName("Server URL")
@@ -94,7 +146,7 @@ export class PairModal extends Modal {
 			});
 		new Setting(contentEl)
 			.setName("Device name")
-			.setDesc("Sent to your server, which lists it among the vault's devices, and used in this device's conflict copy names.")
+			.setDesc(`${DEVICE_NAME_HINT}. Also used in this device's conflict copy names.`)
 			.addText((text) => {
 				text.setPlaceholder("My laptop").setValue(this.nameValue).onChange((v) => { this.nameValue = v; });
 			});
@@ -128,6 +180,14 @@ export class PairModal extends Modal {
 			await this.host.updateData((d) => applyPairedIdentity(d, identity));
 			this.codeValue = "";
 			new Notice(`YAOS: this device is now paired with ${identity.host}.`);
+			const e2ee = this.linkE2ee;
+			this.linkE2ee = null;
+			if (e2ee && this.applyE2ee && linkE2eeApplies(this.prefill, identity)) {
+				this.applyE2ee(identity.vaultId, e2ee);
+			} else if (e2ee) {
+				dropLinkKey(e2ee);
+				new Notice("YAOS: this device paired with a different code than the link's, so the link's encryption setting was not used.", 9000);
+			}
 			if (this.open_) this.close();
 			// Best effort, only after the new identity is stored: revoke the replaced enrollment
 			// with its own token (adfa7a7:src/runtime/setupLinkController.ts:243-256).
@@ -150,14 +210,20 @@ export class PairModal extends Modal {
 		if (!this.session.busy) {
 			this.session.clear();
 			this.codeValue = "";
+			dropLinkKey(this.linkE2ee);
+			this.linkE2ee = null;
 		}
 	}
 }
 
-/** Shows a fresh one-time code for pairing another device, with copy buttons and an expiry countdown. */
+/**
+ * "Pair another device": a fresh one-time code with copy buttons and an expiry countdown, and on request a QR code
+ * of a setup link with this device's vault key (§12.1).
+ */
 export class PairingCodeModal extends Modal {
 	private timer: number | null = null;
 	private closed = false;
+	private hideQr: (() => void) | null = null;
 
 	constructor(app: App, private readonly host: YaosUiHost, private readonly request: RequestFn = obsidianRequest) {
 		super(app);
@@ -179,7 +245,7 @@ export class PairingCodeModal extends Modal {
 			(grant) => {
 				if (this.closed) return;
 				loading.remove();
-				this.renderGrant(grant);
+				this.renderGrant(identity.host, grant);
 			},
 			(err: unknown) => {
 				if (this.closed) return;
@@ -189,32 +255,78 @@ export class PairingCodeModal extends Modal {
 		);
 	}
 
-	private renderGrant(grant: PairingCodeGrant): void {
-		const { contentEl } = this;
-		const page = grant.mobileSetupUrl;
-		contentEl.createEl("p", {
-			text: `${page ? "Scan the QR code with your phone's camera, or on" : "On"} the other device open the setup link, or open YAOS settings, choose "Pair this device" and enter the server URL and this code. Anyone with this code can join your vault until it is used or expires, so share it only with your own device.`,
-		});
-		if (page) this.renderQr(page);
+	/** The link's encryption part now, or null with a notice saying why this device cannot hand one on. */
+	private linkE2ee(): LinkE2ee | null {
+		const e2ee = pairingLinkE2ee(this.host);
+		if (e2ee) return e2ee;
+		new Notice(
+			this.host.data().e2ee?.suite === 1
+				? "YAOS: this device does not hold the vault's current key, so it cannot pair another device with it. Enter your recovery key on this device first."
+				: "YAOS: this device does not know yet whether the vault is end-to-end encrypted, so it cannot pair another device with a QR code. Use the server URL and code below.",
+			10000,
+		);
+		return null;
+	}
 
-		const field = (label: string, value: string, rows: number): Setting => {
+	private renderGrant(serverUrl: string, grant: PairingCodeGrant): void {
+		const { contentEl } = this;
+		contentEl.createEl("p", {
+			text: "On the other device, scan the pairing QR with its camera, or open YAOS settings there, choose \"Pair this device\" and enter the server URL and this code. Anyone with this code can join your vault until it is used or expires, so share it only with your own device.",
+		});
+		const qrSlot = contentEl.createDiv();
+		const buttons: ButtonComponent[] = [];
+		new Setting(contentEl)
+			.setName("Pairing QR")
+			.setDesc("Carries the vault key. Shown only on request, and hidden when the code expires or you close this dialog.")
+			.addButton((b) => {
+				buttons.push(b);
+				b.setButtonText("Show pairing QR").setCta().onClick(() => {
+					if (this.hideQr) {
+						this.hideQr();
+						this.hideQr = null;
+						b.setButtonText("Show pairing QR");
+						return;
+					}
+					if (grant.expiresAt <= Date.now()) return;
+					const e2ee = this.linkE2ee();
+					if (!e2ee) return;
+					this.hideQr = drawQr(qrSlot, pairingLink(serverUrl, grant.pairingCode, e2ee), "QR code to pair your other device");
+					b.setButtonText("Hide pairing QR");
+				});
+			});
+
+		const field = (label: string, value: string): void => {
 			const s = new Setting(contentEl).setName(label);
 			s.settingEl.addClass("yaos-pairing-code-field");
 			const area = contentEl.createEl("textarea", { cls: "yaos-pairing-code-value" });
 			area.value = value;
 			area.readOnly = true;
-			area.rows = rows;
+			area.rows = 1;
 			area.addEventListener("focus", () => area.select());
-			s.addButton((b) => b.setButtonText("Copy").onClick(() => {
-				copyText(value).then(() => new Notice(`${label} copied.`), () => new Notice(`Could not copy the ${label.toLowerCase()}.`, 6000));
-			}));
-			return s;
+			s.addButton((b) => {
+				buttons.push(b);
+				b.setButtonText("Copy").onClick(() => {
+					copyText(value).then(() => new Notice(`${label} copied.`), () => new Notice(`Could not copy the ${label.toLowerCase()}.`, 6000));
+				});
+			});
 		};
-		field("Server URL", this.host.data().identity?.host ?? "", 1);
-		field("Pairing code", grant.pairingCode, 2);
-		field("Setup link", grant.setupLink, 3);
-		// pairing.ts admits only a URL under the paired server's origin, so opening it is safe.
-		if (page) field("Mobile setup page", page, 2).addButton((b) => b.setButtonText("Open pairing page").onClick(() => { window.open(page, "_blank", "noopener"); }));
+		field("Server URL", serverUrl);
+		field("Pairing code", grant.pairingCode);
+		new Setting(contentEl)
+			.setName("Copy setup link")
+			.setDesc(this.host.data().e2ee?.suite === 0 ? "This link lets a device join your vault. Send it only over a channel you trust." : COPY_LINK_WARNING)
+			.addButton((b) => {
+				buttons.push(b);
+				b.setButtonText("Copy setup link").onClick(() => {
+					if (grant.expiresAt <= Date.now()) return;
+					const e2ee = this.linkE2ee();
+					if (!e2ee) return;
+					copyText(pairingLink(serverUrl, grant.pairingCode, e2ee)).then(
+						() => new Notice("Setup link copied."),
+						() => new Notice("Could not copy the setup link.", 6000),
+					);
+				});
+			});
 
 		const expiry = contentEl.createEl("p", { cls: "yaos-pairing-code-expiry" });
 		const tick = (): void => {
@@ -222,6 +334,9 @@ export class PairingCodeModal extends Modal {
 			if (remaining <= 0) {
 				expiry.setText("This code has expired. Close this dialog and create a new one.");
 				expiry.addClass("mod-warning");
+				this.hideQr?.();
+				this.hideQr = null;
+				for (const b of buttons) b.setDisabled(true);
 				this.stopTimer();
 				return;
 			}
@@ -230,22 +345,7 @@ export class PairingCodeModal extends Modal {
 		tick();
 		this.timer = window.setInterval(tick, 1000);
 
-		new Setting(contentEl).addButton((b) => b.setButtonText("Done").setCta().onClick(() => this.close()));
-	}
-
-	/** The mobile setup page as a QR code (legacy size and error correction); on failure a short note replaces it. */
-	private renderQr(page: string): void {
-		const wrap = this.contentEl.createDiv({ cls: "yaos-pairing-qr" });
-		const canvas = wrap.createEl("canvas", { cls: "yaos-pairing-qr-canvas", attr: { role: "img", "aria-label": "QR code for the mobile setup page" } });
-		canvas.hidden = true;
-		toCanvas(canvas, page, { width: 220, margin: 1, errorCorrectionLevel: "M" }).then(
-			() => { if (!this.closed) canvas.hidden = false; },
-			() => {
-				if (this.closed) return;
-				canvas.remove();
-				wrap.createEl("p", { cls: "mod-warning", text: "Could not draw the QR code. Use the mobile setup page below." });
-			},
-		);
+		new Setting(contentEl).addButton((b) => b.setButtonText("Done").onClick(() => this.close()));
 	}
 
 	private stopTimer(): void {
@@ -256,6 +356,8 @@ export class PairingCodeModal extends Modal {
 	onClose(): void {
 		this.closed = true;
 		this.stopTimer();
+		this.hideQr?.();
+		this.hideQr = null;
 		this.contentEl.empty();
 	}
 }

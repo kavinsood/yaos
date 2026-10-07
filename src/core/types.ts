@@ -35,7 +35,7 @@ export type DiskFingerprint = Brand<string, "DiskFingerprint">;
  * differ). The only key used for path collision decisions.
  */
 export type PathKey = Brand<string, "PathKey">;
-/** Relay stream name: "ns" | "cfg" | "b:<docId>" | "c:<docId>" | "x:<hash>". */
+/** Relay stream name: "ns" | "cfg" | "snap" | "k" | "b:<docId>" | "c:<docId>" (no blob bytes ride the log, DESIGN §j.1). */
 export type StreamName = Brand<string, "StreamName">;
 
 /** Vault-wide relay clock position within one vaultEpoch. 0 = before the first row. */
@@ -503,7 +503,14 @@ export type PlannerOp =
 	| { readonly op: "pushBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	| { readonly op: "fetchBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	// --- bookkeeping ---
-	| { readonly op: "rebind"; readonly fromDocId: DocId; readonly toDocId: DocId; readonly path: VaultPath }
+	| {
+		readonly op: "rebind"; readonly fromDocId: DocId; readonly toDocId: DocId; readonly path: VaultPath;
+		/**
+		 * §c.12 migrated loser: the loser's record is dropped, not moved. Its sync point is this device's own text, not
+		 * the winner's, so until a merge against the epoch base succeeds the winner stays unsynced (adopted afresh).
+		 */
+		readonly adopt?: true;
+	}
 	| { readonly op: "syncedPut"; readonly entry: SyncedEntry }
 	| { readonly op: "syncedDrop"; readonly docId: DocId }
 	| { readonly op: "needHash"; readonly path: VaultPath }
