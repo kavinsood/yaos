@@ -165,6 +165,10 @@ export class Repo {
 	/** meta frameNoFloor (epoch migration, e2ee-design §8.2); read at open. */
 	frameNoFloor: FrameNoFloor = { ns: 0, cfg: 0 };
 	priorityFn: PriorityFn = defaultPriority;
+	/** Streams a quarantine record just froze (tLive / tReadPage, after the commit): the engine retargets their views (§d.6). */
+	onQuarantineFrozen: (recs: readonly StreamRecord[]) => void = () => undefined;
+	/** The quarantine records and tail rows tLive / tReadPage just stored (after the commit): the engine re-checks held ones (§d.6). */
+	onStored: (quarantined: readonly QuarantineRecord[], rows: readonly TailRecord[]) => void = () => undefined;
 	/** Monotonic clock for the cursor gap timer. */
 	monotonic: () => number = () => 0;
 	/** Name of the §e.2 transaction running on the serial queue (crash tests label commits with it). */
@@ -400,6 +404,8 @@ export class Repo {
 			const tailPut: TailRecord[] = [];
 			const duty = new Set(this.ckptDuty);
 			let dutyChanged = false;
+			const froze = new Set<StreamName>();
+			const held: QuarantineRecord[] = [];
 			const res = await this.db.tx([STORE.outbox, STORE.tail, STORE.quarantine, STORE.streams, STORE.meta], "readwrite", async (tx) => {
 				const getRec = async (stream: StreamName): Promise<Mut<StreamRecord>> => {
 					let r = recs.get(stream);
@@ -458,7 +464,8 @@ export class Repo {
 							r.bytesSinceRemoteCheckpoint += it.row.content.length;
 						}
 					} else {
-						await putQuarantine(tx, r, it.rec);
+						held.push(it.rec);
+						if (await putQuarantine(tx, r, it.rec)) froze.add(stream);
 					}
 					// An own row this store never receipted (an earlier store, lost with IDB) is remote here: its text
 					// is not known to be on disk.
@@ -493,6 +500,8 @@ export class Repo {
 			this.cursor.commit(seqs, res, this.monotonic());
 			for (const r of recs.values()) this.cache.set(r.stream, r);
 			if (dutyChanged) this.ckptDuty = duty;
+			if (froze.size > 0) this.onQuarantineFrozen([...froze].map((s) => recs.get(s)!));
+			if (held.length > 0 || tailPut.length > 0) this.onStored(held, tailPut);
 			return { vaultSeq: res, streams: recs, removed, updated, renamed, tailPut };
 		});
 	}
@@ -540,6 +549,7 @@ export class Repo {
 			const updated: OutboxRecord[] = [];
 			const renamed: OutboxRename[] = [];
 			const tailPut: TailRecord[] = [];
+			let froze = false;
 			const out = await this.db.tx([STORE.tail, STORE.quarantine, STORE.outbox, STORE.streams, STORE.snapshots, STORE.meta], "readwrite", async (tx) => {
 				const r: Mut<StreamRecord> = { ...((await tx.get(STORE.streams, input.stream)) ?? newStreamRecord(input.stream, nowMs)) };
 				if (input.freshSnapshot && input.freshSnapshot.coversSeq > r.snapshotCoversSeq) {
@@ -564,7 +574,7 @@ export class Repo {
 					r.remoteHeadSeq = Math.max(r.remoteHeadSeq, row.seq);
 				}
 				for (const q of input.quarantines) {
-					await putQuarantine(tx, r, q);
+					if (await putQuarantine(tx, r, q)) froze = true;
 					r.remoteHeadSeq = Math.max(r.remoteHeadSeq, q.seq);
 				}
 				for (const lr of input.lateReceipts) {
@@ -594,6 +604,8 @@ export class Repo {
 				return r;
 			});
 			this.cache.set(out.stream, out);
+			if (froze) this.onQuarantineFrozen([out]);
+			if (input.quarantines.length > 0 || tailPut.length > 0) this.onStored(input.quarantines, tailPut);
 			return { stream: out, removed, updated, renamed, tailPut };
 		});
 	}
@@ -706,7 +718,12 @@ export class Repo {
 		});
 	}
 
-	/** releaseQuarantine (DESIGN §d.6): rows that pass go to tail; the rest are marked dismissed; the doc unfreezes. */
+	/**
+	 * releaseQuarantine (DESIGN §d.6): rows that pass go to tail and move bodyVersion; the rest are marked dismissed;
+	 * the doc unfreezes.
+	 * The caller re-gated a snapshot: a record stored since (neither passed nor dismissed here) still counts and
+	 * keeps the doc frozen.
+	 */
 	tReleaseQuarantine(stream: StreamName, pass: readonly TailRecord[], dismiss: readonly QuarantineRecord[], nowMs: number): Promise<StreamRecord> {
 		return this.serial("tReleaseQuarantine", async () => {
 			const out = await this.db.tx([STORE.quarantine, STORE.tail, STORE.streams], "readwrite", async (tx) => {
@@ -714,13 +731,20 @@ export class Repo {
 				for (const row of pass) {
 					tx.delete(STORE.quarantine, [stream, row.seq]);
 					await putTail(tx, r, row);
+					// Applied now: a remote change, as T_read_page counts its rows (it does not count a row it quarantines;
+					// T_live does). Without this the planner saw no change and the disk kept the old text (E7 sim seed 88).
+					if (row.deviceId !== this.deviceId || row.seq > r.lastOwnSeq) {
+						r.bodyVersion = { remoteSeq: Math.max(r.bodyVersion.remoteSeq, row.seq), localOrder: r.bodyVersion.localOrder };
+					}
 				}
 				for (const q of dismiss) {
 					if (!q.detail.startsWith("dismissed:")) tx.put(STORE.quarantine, { ...q, detail: `dismissed: ${q.detail}` });
 				}
-				r.quarantinedRows = 0; // dismissed records stay for diagnostics (evicted by age) but no longer count
-				r.frozen = 0;
-				r.frozenReason = null;
+				// Dismissed records stay for diagnostics (evicted by age) but no longer count.
+				const left = (await tx.getAll(STORE.quarantine, tailRange(stream))).filter((q) => !q.detail.startsWith("dismissed:"));
+				r.quarantinedRows = left.length;
+				r.frozen = left.length > 0 ? 1 : 0;
+				r.frozenReason = left[left.length - 1]?.reason ?? null;
 				tx.put(STORE.streams, r);
 				return r;
 			});
@@ -873,13 +897,16 @@ async function putTail(tx: Tx, r: Mut<StreamRecord>, row: TailRecord): Promise<b
 	return true;
 }
 
-async function putQuarantine(tx: Tx, r: Mut<StreamRecord>, q: QuarantineRecord): Promise<void> {
+/** Returns true when this record froze the stream (it was not frozen). */
+async function putQuarantine(tx: Tx, r: Mut<StreamRecord>, q: QuarantineRecord): Promise<boolean> {
 	// quarantinedRows counts undismissed records (a dismissed record re-quarantined by a re-read counts again).
 	const existing = await tx.get(STORE.quarantine, [q.stream, q.seq]);
 	tx.put(STORE.quarantine, q);
 	if (existing === undefined || existing.detail.startsWith("dismissed:")) r.quarantinedRows++;
+	const froze = r.frozen !== 1;
 	r.frozen = 1;
 	r.frozenReason = q.reason;
+	return froze;
 }
 
 async function evictQuarantine(tx: Tx): Promise<void> {

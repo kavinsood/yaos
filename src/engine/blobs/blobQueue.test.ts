@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { concatBytes } from "../../core/codec/lib0";
 import type { BlobChunkContent } from "../../core/envelope";
 import { sha256Hex } from "../../core/hash/sha256";
 import { BLOB_CHUNK_BYTES, MAX_BLOB_PLAINTEXT_BYTES_SUITE1, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import type { ContentHash, DocId, VaultPath } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress, CryptoPort, OpenResult } from "../../ports/crypto";
+import type { BlobAddress, CryptoPort, OpenResult, SealedBlobParts } from "../../ports/crypto";
 import { DB_SCHEMA_VERSION, STORE_SPECS } from "../store/schema";
 import type { DiskSchema } from "../reconcile/store";
 import { FakeClock } from "../reconcile/testkit/fakes";
@@ -23,7 +24,7 @@ class XorCrypto implements CryptoPort {
 	keyState(e: number) { return { held: e === 0, verified: true }; }
 	async seal(input: { plaintext: Uint8Array }): Promise<Uint8Array> { return input.plaintext; }
 	async open(input: { sealed: Uint8Array }) { return { ok: true as const, plaintext: input.sealed }; }
-	async sealBlob(input: { plaintext: Uint8Array }): Promise<Uint8Array> { this.sealCalls++; return input.plaintext.map((b) => b ^ 0x5a); }
+	async sealBlob(input: { plaintext: Uint8Array }): Promise<SealedBlobParts> { this.sealCalls++; return [input.plaintext.map((b) => b ^ 0x5a)]; }
 	async openBlob(input: { sealed: Uint8Array }): Promise<OpenResult> { return { ok: true, plaintext: input.sealed.map((b) => b ^ 0x5a) }; }
 	async blobAddress(hash: ContentHash): Promise<BlobAddress> { return `addr-${hash.slice(0, 16)}` as BlobAddress; }
 	async diagHash(): Promise<string> { return "0".repeat(16); }
@@ -35,7 +36,7 @@ class FakeStore implements BlobPort {
 	puts = 0;
 	down = false;
 	async has(a: readonly BlobAddress[]) { if (this.down) throw new Error("503"); return new Set(a.filter((x) => this.objects.has(x))); }
-	async put(a: BlobAddress, b: Uint8Array) { if (this.down) throw new Error("503"); this.puts++; this.objects.set(a, b.slice()); }
+	async put(a: BlobAddress, parts: SealedBlobParts) { if (this.down) throw new Error("503"); this.puts++; this.objects.set(a, concatBytes(parts)); }
 	async get(a: BlobAddress) { if (this.down) throw new Error("503"); return this.objects.get(a)?.slice() ?? null; }
 	async list(): Promise<never> { throw new Error("unused"); }
 	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }

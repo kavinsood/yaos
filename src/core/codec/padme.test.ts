@@ -60,6 +60,22 @@ describe("Padmé (§7.3)", () => {
 		}
 	});
 
+	it("pad is data ‖ 0x80 ‖ 0x00* byte for byte in one exact-size buffer; unpad returns a view of it (§10.3)", () => {
+		const backing = new Uint8Array(70_010).map((_, i) => (i * 7 + 3) & 0xff);
+		const data = backing.subarray(5, 70_005); // an offset view: pad reads only the view
+		const p = pad(data);
+		const want = new Uint8Array(padmeLen(data.length + 1));
+		for (let i = 0; i < data.length; i++) want[i] = backing[5 + i]!;
+		want[data.length] = 0x80;
+		assert.deepEqual(p, want);
+		assert.equal(p.byteOffset, 0);
+		assert.equal(p.buffer.byteLength, p.length, "no spare capacity");
+		const u = unpad(p)!;
+		assert.equal(u.buffer, p.buffer, "a view, not a copy");
+		assert.equal(u.byteOffset, 0);
+		assert.equal(u.length, data.length);
+	});
+
 	it("unpad rejects a missing or wrong marker", () => {
 		assert.equal(unpad(new Uint8Array(0)), null);
 		assert.equal(unpad(new Uint8Array(256)), null, "all zeros");

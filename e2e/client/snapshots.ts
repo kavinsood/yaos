@@ -96,7 +96,7 @@ async function main(): Promise<void> {
 	// Step 4's old garbage: an upload nothing ever references (suite 0: address = sha256, stored bytes = plaintext).
 	const orphan = randomBytes(32 * 1024, 700);
 	const orphanAddr = sha256(orphan);
-	await blobOf(a).put(orphanAddr, orphan);
+	await blobOf(a).put(orphanAddr, [orphan]);
 	a.vault.userWrite("notes/plan.md", "# Plan\n\nship the backup path\n");
 	a.vault.userWrite("notes/gone.md", "this file gets deleted after the snapshot\n");
 	const canvas = parseCanvasText(JSON.stringify({ nodes: [{ id: "n1", type: "text", text: "hi", x: 0, y: 0, width: 200, height: 80 }], edges: [] }));
@@ -193,7 +193,7 @@ async function main(): Promise<void> {
 	await new Promise((res) => setTimeout(res, Math.max(0, replacedAt + GC_GRACE_MS + 2_000 - Date.now())));
 	const fresh = randomBytes(32 * 1024, 703);
 	const freshAddr = sha256(fresh);
-	await blobOf(a).put(freshAddr, fresh);
+	await blobOf(a).put(freshAddr, [fresh]);
 	const referenced = referencedAddresses(b);
 	const stored0 = await storedAddresses(b);
 	const x1Addr = sha256(x1);

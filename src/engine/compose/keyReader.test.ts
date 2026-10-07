@@ -251,7 +251,7 @@ test("joins after a roll (QR at epoch 2) and after a revoke (RK at epoch 3) veri
 	assert.ok(net.relay.rows(KEYRING_STREAM).length >= 2, "the genesis and a roll");
 	// An object nothing references (an upload whose frame never committed), older than the grace.
 	const orphan = "ab".repeat(32) as BlobAddress;
-	await blobs.put(orphan, new Uint8Array(64));
+	await blobs.put(orphan, [new Uint8Array(64)]);
 	await clock.advance(10_000);
 
 	// J joins by QR with only the post-roll key: K_1 comes from the roll's prevWrap, verified against the genesis.

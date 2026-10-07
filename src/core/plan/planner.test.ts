@@ -571,7 +571,8 @@ test("§c.12 migrated-loser merge: a differing loser at a path with an old-epoch
 	assert.deepEqual(opsOf(planWith(input(sc), ctx)), ["diskRename", "diskMaterialize", "syncedPut"]);
 	const p = planWith(input(sc), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) });
 	assert.deepEqual(p.ops, [
-		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "Inbox/x.md" },
+		// adopt: the loser's sync point (its own text) is not the winner's (diskJobs.ts rebind).
+		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "Inbox/x.md", adopt: true },
 		{ op: "nsDelete", docId: "d4", baseBodySeq: 10 },
 		{ op: "reconcileContent", docId: "d3", path: "Inbox/x.md", kind: "markdown", hasBase: false, pathBase: true },
 	]);

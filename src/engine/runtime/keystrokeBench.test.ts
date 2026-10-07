@@ -21,7 +21,7 @@ import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 
-const QUIET = { compactRows: 1e9, compactBytes: 1e15, checkpoint: { rows: 1e9, bytes: 1e15, idleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e15 } };
+const QUIET = { compactRows: 1e9, compactBytes: 1e15, checkpoint: { rows: 1e9, bytes: 1e15, idleMs: 1e9, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e15 } };
 const BUDGETS = { maxResidentBytes: 512 * 1024 * 1024, maxResidentDocs: 64 };
 
 function bigText(chars: number): string {

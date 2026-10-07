@@ -192,7 +192,9 @@ What the design relies on, and how sure we are. Spike numbers are on an Apple M4
     never commit.
 
   Each subkey (kFrame, kCkpt, kBlob, kWrap) has its own budget. All of them see at most as many seals as frames
-  committed (one per frame; at most one checkpoint or blob per frame), so one trigger covers all of them.
+  committed (one per frame; at most one checkpoint or blob per frame), so one trigger covers all of them. Blob seals
+  with no frame of their own (a refresh or repair PUT, `src/engine/blobs/touch.ts`) are in the own seal count: the
+  write gate counts every seal, blobs included (`onSeal`, `src/engine/keyring/writeGate.ts:44-50`).
 - [D] At the free plan's 100k rows/day, 2^23 frames take ≥ 84 days of writing at the limit. In practice a roll
   happens once in years.
 
@@ -623,7 +625,11 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
 
 - One AEAD call per blob. WebCrypto has no streaming AEAD [w3c-webcrypto-73], and blobs are ≤ 10 MiB.
 - [M] At ≥ 2 GB/s on desktop, sealing 10 MiB takes ~5 ms. Mobile is **[U]** (budget §16).
-- Peak memory is about 3 × 10 MiB transient (plaintext, padded copy, ciphertext).
+- [M] Blob-sized transient buffers besides the plaintext itself (`scripts/bench-e2ee.mjs`, `benchBlobMemory`):
+  - Up: 3. The padded copy (AES-GCM takes one contiguous input), the ciphertext, and one `Blob` request body.
+    `sealBlob` returns the parts `[header ‖ nonce, ciphertext]`; the transport joins them once.
+  - Down: 3. The response body, the plaintext (unpad is a view), and the exact-size copy handed to main.
+  - The WebCrypto outputs are inherent. So is the input copy the spec makes encrypt/decrypt take, which Node does not count.
 - **Caps.**
   - Suite 1 plaintext ≤ `MAX_BLOB_PLAINTEXT_BYTES` = 10223615 (§7.3). Above that the file is not synced (notice),
     as today above 10 MiB.
@@ -887,6 +893,13 @@ Rows already sealed under e−1 stay valid. Outbox frames are not re-sealed: a r
 - Every device keeps all records (§6.1), so any device can re-publish. A device restoring from RK alone needs the
   genesis or a revoke record to be present. After a reset where no device survives, the vault holds nothing
   readable anyway.
+- **An open revoke is stored too.** A revoke the device holds open (pending, no winner for its epoch: the device is
+  `revoked-epoch`) is stored after the winners, at most `STORED_OPEN_REVOKES` (4, `src/engine/keyring/book.ts:51`).
+  After a reset or restore that drops it from `k`, the device stays `revoked-epoch` (it writes and rolls nothing)
+  until it is re-keyed, and then re-publishes it. A revoke winner is re-published even when `k` has another record
+  for its epoch (a roll taken after the reset): revoke outranks roll (§11.3), so devices that took the roll stop
+  instead of forking. A stored revoke the device cannot judge is never re-published; a re-key revoke under the RK
+  (`revokeRekey`) ends it, and it is no longer stored (`src/engine/keyring/openRevokeReset.test.ts`).
 - **Genesis position.** Enable writes the genesis record only on the creation path, at `VAULT_READY.head = 0` (§15.1). Readers do not rely on its
   position: validity alone decides.
 
@@ -1335,15 +1348,34 @@ Both mean **a new vault** (decision D7):
 
 | Path | Desktop | Mobile (assumed) | Note |
 |---|---|---|---|
-| Typing: one frame per `OPEN_FRAME_IDLE_MS` (100 ms, `src/core/limits.ts:67`) | ≤ 0.05 ms per frame | ≤ 0.5 ms | Below 1% of the frame interval |
-| Bootstrap, 10k docs, 200 MiB of checkpoints and tail | ≤ 0.3 s total crypto | ≤ 3 s (10k × 0.1 ms + 200 MiB ÷ 100 MiB/s) | Downloading 200 MiB dominates |
-| One 10 MiB blob | ≤ 10 ms | ≤ 100 ms | Plus 3 × 10 MiB transient memory (§10.3) |
+| Typing: one frame per `OPEN_FRAME_IDLE_MS` (100 ms, `src/core/limits.ts:67`), sealed after that idle | ≤ 1 ms per frame | ≤ 10 ms | Below 1% of the frame interval. It includes the CPU and WebCrypto worker wake-up: a bare `subtle.encrypt` of 256 B after 100 ms idle alone takes 0.25–0.38 ms **[M]**, so the former 0.05 ms could not be met. The steady-state (back-to-back) cost, 0.019 ms **[M]**, is information only |
+| Bootstrap, 10k docs, 200 MiB of checkpoints and the steady-state tail (DESIGN §d.9) | ≤ 0.3 s total crypto | ≤ 3 s (10k × 0.1 ms + 200 MiB ÷ 100 MiB/s) | Downloading 200 MiB dominates |
+| One 10 MiB blob | ≤ 10 ms | ≤ 100 ms | Plus 3 × 10 MiB transient buffers each way, one of them WebCrypto's output (inherent), plus WebCrypto's own input copy (§10.3) |
 | Engine start | ≤ 5 ms | ≤ 20 ms | |
-| Bundle | +0 KB (WebCrypto) | | `qrcode` +9.6 KB gzip **[M]**, plus ~2 KB of base32 and record code [D] |
+| Bundle | +0 KB of third-party crypto (WebCrypto) | | `qrcode` +9.6 KB gzip **[M]**. The E2EE code itself is ~15 KB gzip **[M]** (14.8 KB: keyring engine 6.6, compose layer — pinGate, keyReader, hostKeyring — 3.8, host keys 2.1, WebCrypto adapter 1.9, codecs 0.4; `scripts/bench-e2ee.mjs`), accepted |
 
-Crypto is never on the hot path. Bootstrap is bound by the network and the planner, not by AES. If a mobile run
-(§23.3) misses a budget by more than 2×, the fallback is to batch opens with `Promise.all` (the spike measured
-~2.4 µs per call batched, §3). No format change is needed.
+Crypto is never on the hot path. Bootstrap is bound by the network and the planner, not by AES. The engine opens a
+bootstrap in controlled batches: one batched read of ≤ `readPageBytes` (48 streams of a 21 KB checkpoint each), every
+member gated concurrently, one batch after another (8 lanes against a non-batched relay). Measured **[M]** (M4 Pro,
+Node 26.5, `scripts/bench-e2ee.mjs`, median of 5, load average 1.7–2.1), 10k docs and 205–211 MiB sealed in each case:
+
+| Vault | Opens | Batches of 48 | 8 lanes | `Promise.all` | One by one |
+|---|---|---|---|---|---|
+| A: checkpoints only | 10,000 | 137 ms | 141 ms | 173 ms | 246 ms |
+| S: steady state (the budget): 32 docs with 255 tail rows each | 18,160 | 279 ms | 230 ms | 251 ms | 395 ms |
+| C: settle cap reached, one row left on every doc (information) | 20,000 | 235 ms | 246 ms | 308 ms | 397 ms |
+| B: stress, 4 tail rows on every doc (information) | 50,000 | 530 ms | 539 ms | 667 ms | 864 ms |
+
+- **S is the budget case.** It is the most the checkpoint policy leaves (DESIGN §d.9). A doc idle for 30 s carries
+  fewer than 256 tail rows, and a doc quiet for 2 min carries none. S takes 32 docs still just under the hot cap: a
+  heavy user's docs within the worst-case 22 min fallback window. Its 32 long tails are spread one per batch, the slow
+  case for batches. Each tail opens in order, so it sets its batch's time. That is the one case where `Promise.all`
+  beats batches; both stay inside the budget.
+- **B is not a budget.** It is what a vault accumulated before the settle rule (40k tail rows over 10k docs). The
+  settle rule now checkpoints such tails once the docs are quiet.
+- **Batches stay, with no `Promise.all` fallback.** Everywhere else they beat `Promise.all`. Unbounded concurrency
+  queues tens of thousands of operations on the WebCrypto thread pool at once and pays for it in scheduling and
+  memory.
 
 ### 16.3 Transaction rule (correctness, not speed)
 
@@ -1680,7 +1712,9 @@ Each test counts outcomes and asserts **all** of them; none samples a single cas
 - **Bit flips.**
   - For every sealed type (frame, checkpoint, blob, k wrap), flip each byte of header, nonce, ciphertext and tag:
     every byte for objects ≤ 4 KiB, and 4096 seeded positions otherwise.
-  - Assert `failures == flips`, with the expected reason per region: header → `auth-failed` or `malformed`; tag or
+  - Assert `failures == flips`, with the expected reason per region: header → any open failure (the §9.2 and §10.2
+    header rules decide which: `malformed`, `unsupported-version`, `unsupported-suite`, `suite-downgrade`,
+    `unknown-key` or `auth-failed`; the test predicts each one and asserts the count per reason); nonce, tag or
     ciphertext → `auth-failed`.
 - **AAD substitution.** Change each bound field in turn (vaultId, stream, deviceId, clientFrameId, coversSeq,
   address, keyEpoch, suite, role) and assert `auth-failed`, 100%.
@@ -1714,7 +1748,7 @@ Each test counts outcomes and asserts **all** of them; none samples a single cas
 - `SimConfig.crypto: "none" | "suite1"`. Suite 1 uses the real adapter on Node WebCrypto, wrapped in
   `DelayedCrypto` (§16.3).
 - **The existing fault matrix runs unchanged under suite 1**, with the same seed counts as suite 0
-  (`src/sim/faults.ts:32-48`). The invariants (`src/sim/invariants.ts`) must hold.
+  (`src/sim/run.test.ts:47-50`: 200, 200, 50 and 50 seeds). The invariants (`src/sim/invariants.ts`) must hold.
 - **New faults:**
   - `keyStoreLoss {dev}`: SecretStorage wiped, so the device goes `key-missing`, then re-keys by a sim QR;
   - `keyRoll {dev}`: forced roll, including concurrent rolls on two devices;
@@ -1751,7 +1785,7 @@ There is one agent per package. Sizes: S ≈ 1 agent-day, M ≈ 2–3, L ≈ 4�
 | **E5** Pairing, RK, revoke UX | `src/host/ui/**`: QR (`qrcode`), the `key`/`suite` link parameters stripped before `/enroll`, the blocked key-less screen (§12.4), the "Create a new vault" creation path with its `Origin` check first (§15.1), RK show/confirm/enter, revoke re-key, re-key QR, hiding `mobileSetupUrl` under both suites, device-name hint | E3, E4 | **Done** ("E5 as built" below). UI tests for each flow; `/enroll` request bodies asserted key-free; the link is never in logs; no path from a link, code or console QR reaches the creation flow or a suite-0 pin | L |
 | **E6a** Blob addressing and format | `src/engine/body/frames.ts` blob path, `src/engine/blobs/blobQueue.ts`, `src/engine/body/refs.ts`, `src/engine/runtime/blobChunks.ts`, `blobChunkStream(address)` | E1, E2 | Sealed-blob golden vector; dedupe via `has`; `x:` names carry no hash | S |
 | **E6b** Blob GC | `src/engine/blobs/{gc,bodyRefs,touch}.ts`, `src/engine/runtime/blobGc.ts`, `BlobPort.list/deleteIfUploadedBefore` (HTTP adapter, `SimBlobStore`), the `cleanUpAttachments` command and its one notice | **A3** (done) | **Done.** §10.4: fail-closed preconditions, live set, R1–R4. Unit and engine tests against `SimBlobStore` (pagination with deletes, re-upload survives as `newer`, R2 orphan reuse, R3 resume after > grace offline, R4 repair and loss, every refusal deletes nothing, suite 1 HMAC addresses, 429/503 retry, skewed clock); e2e/client/snapshots.ts GC step on the local relay with `--r2` | M |
-| **E7** Verification | `DelayedCrypto`, sim `crypto: "suite1"`, new faults, the §20.2 measured tests, a perf bench against the §16 budgets | E1–E3 | The suite-1 fault matrix is green at suite-0 seed counts; every §20.2 assertion holds | M |
+| **E7** Verification | `DelayedCrypto`, sim `crypto: "suite1"`, new faults, the §20.2 measured tests, a perf bench against the §16 budgets | E1–E3 | **Done** ("E7 as built" below). The suite-1 fault matrix is green at suite-0 seed counts; every §20.2 assertion holds | M |
 | **E8** Docs | Apply §18.5 and §18.6 to relay-wire.md and DESIGN.md | E2 merged | Docs match the code | S |
 
 Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b needed A3 (done).
@@ -1845,6 +1879,106 @@ runs in the engine):
   unclaimed relay (claim with explicit `Origin`, marker before identity, step 3, encryption On); e creates a
   second vault on the claimed relay with the typed key and opts out; f is sent the encrypted vault by a lying
   create answer and is refused at step 3 with no pin. The leak scan covers the operator key and owner codes too.
+
+**E7 as built** (verification; measured on an M4 Pro with Node 26.5):
+- **The sim stays deterministic under suite 1.** `DelayedCrypto` (`src/sim/delayedCrypto.ts`) runs every WebCrypto
+  call as RealWork and settles it on the virtual clock, in seed order. The same seed gives the same trace, the same
+  digest and byte-identical sealed relay rows, whatever ran before in the process. An explicit plan replays the
+  generated run, and ddmin still works (`src/sim/suite1.test.ts`, in `test:client`). Every suite-1 run asserts
+  `strays == 0` (no crypto await outside RealWork). A crypto await inside a `runTx` body fails the sim (§16.3).
+- **The matrix runs out of band:** `npm run test:sim-suite1` (`scripts/sim-suite1.mjs`; `YAOS_SIM_SEEDS`,
+  `YAOS_SIM_JOBS`, `YAOS_SIM_MINIMIZE`). It is 700 runs in 7 matrices:
+  - the suite-0 matrix under suite 1: 2 devices with no faults (200 seeds), 3 devices with seeded faults (200),
+    5 devices (50), 2 devices fault-heavy (50);
+  - `E2EE_FAULTS`: 3 devices (100), 4 devices (50), 2 devices fault-heavy (50).
+
+  It took 194 s wall on 11 workers. 699 of 700 runs were clean, with 0 strays in every run. The one failure (3 devices,
+  E2EE faults, seed 88) needs the sim's attachments on the log carrier that is being removed. With a blob store, the
+  seed and its 15-step minimized plan are clean.
+- **New faults** (`src/sim/e2eeFaults.ts`, weights in `E2EE_FAULTS`, `src/sim/faults.ts`; weight 0 in
+  `DEFAULT_FAULTS`, so suite-0 plans draw as before):
+  - `keyStoreLoss`;
+  - `keyRoll`, concurrent on two devices half the time;
+  - `revoke` with a re-key by QR (the RK is the fallback);
+  - `epochRestore` to a relay snapshot up to 12 steps back;
+  - `hostileReplay` of any row, `k` included;
+  - `hostileDowngrade`: forged suite-0 body frames, plus a key-less join while `k` is hidden.
+
+  Each run ends with these checks:
+  - no file shows a forged frame;
+  - every stored key record is in `k` in this vault epoch (§11.5);
+  - every device seals under one epoch;
+  - a release dismisses no genuine row;
+  - the joiner ends `no-pin` with zero writes, then `encrypted-vault`;
+  - the leak checks (§20.3).
+
+  In the 3-device E2EE matrix:
+  - rolls: 76 won, 23 lost;
+  - revokes: 27 won;
+  - QR re-keys: 117;
+  - restores: 52;
+  - injected rows: 445 replayed, 219 forged;
+  - joins: 44 key-less, each refused at every step.
+- **§20.2, measured:**
+  - `src/engine/adapters/suite1Tamper.test.ts` and `src/engine/keyring/forgery.test.ts` (2763f7d);
+  - `src/engine/sync/replay.measured.test.ts` and `src/engine/keyring/staleEpoch.measured.test.ts` (6337e46), over
+    1000 seeds:
+    - replays: 45,191 injected, 45,191 ignored, 2000/2000 digests equal;
+    - stale epoch: 19,669 injected past S_rot, all stale, 0 quarantined;
+  - `src/engine/compose/downgrade.test.ts` (6f8fad3).
+
+  Every assertion holds. The header row of the bit-flip test asserts the reason the §9.2 and §10.2 rules predict, not
+  only `auth-failed` or `malformed`.
+- **Open questions:**
+  - (a) A re-sealed ns or cfg record, or one in flight below the epoch floor, holds the later frames of its stream
+    (`src/engine/body/sender.ts:346-371`; `resealOrder.test.ts`).
+  - (b) `keyringChanged` before `ready` is stored in arrival order. The first persist waits until SecretStorage has
+    loaded (`src/host/keys/hostKeys.ts:50, :68`). A key main did not store is dropped from the adapter
+    (`src/engine/keyring/keyring.ts:265-331`; `persistBeforeReady.test.ts`).
+  - (c) Of two concurrent geneses, the first in seq order wins. The other creator cannot judge it, so it stops at
+    `pending` and does not adopt its own later record (`src/engine/keyring/evaluate.ts:50-51`, `keyring.ts:184`;
+    `concurrentGenesis.test.ts`).
+  - (d) The sim is deterministic under suite 1 (above).
+  - (e) Blob seals count toward the §4.2 trigger (`src/engine/keyring/writeGate.ts:44-50`). Blob GC refuses
+    `not-caught-up` before this connection's `k` read (`src/engine/runtime/blobGc.ts:113`;
+    `rollTriggerGcGate.test.ts`).
+- **Engine fixes the suite-1 sim found** (each with a failing test first):
+  - A reader-dependent quarantine record keeps the whole row, so a re-gate on new keys can open it
+    (`src/engine/sync/ingestRow.ts:104`).
+  - A view on a frozen doc binds once the doc is released, and a quarantine freeze retargets bound views
+    (`src/engine/runtime/context.ts:397`, `src/engine/compose/vaultRuntime.ts:341`).
+  - A suite-1 session judges nothing before its `k` read (`src/engine/keyring/keyringRuntime.ts:157`).
+  - Rows stored after a re-gate are re-checked (`src/engine/runtime/quarantineRelease.ts:159`).
+  - Release works by stream (`src/engine/runtime/engine.ts:483`), and keeps `keyring-hold` rows
+    (`quarantineRelease.ts:51`).
+  - Rows a release applies move the stream's body version (`src/engine/store/repo.ts:736`).
+  - An open revoke is stored and survives a reset (§11.5; `src/engine/keyring/book.ts:51`).
+  - A §c.12 migrated loser's synced record is dropped, not moved to the winner (`src/engine/reconcile/diskJobs.ts:54`,
+    `src/core/plan/planner.ts:505`). Otherwise its own text became the winner's sync point, and the winner's text
+    read as the deletion of its edits.
+- **§16.2:** `npm run bench:e2ee` meets every desktop MUST:
+  - typing: 0.44 ms per frame after idle;
+  - bootstrap S: 281 ms in batches of 48 and 229 ms with 8 lanes;
+  - 10 MiB blob: 2.0 ms up and 2.0 ms down;
+  - engine start: 0.33 ms;
+  - third-party crypto: +0 KB;
+  - E2EE code: 15.4 KB gzip.
+
+  Blob temporaries (23c2783): uploads drop from 7 to 3 blob-sized buffers through `httpBlob` and from 4 to 2 in memory.
+  Downloads stay at 3.
+- **Checkpoint policy** (6aea9b1, DESIGN §d.9): the hot cap is 256 rows or 1 MiB, then 30 s idle. A settle
+  checkpoint follows 2 min idle, capped at 1000 puts per device per day (≈ 4k rows, 4 % of the Free plan's 100k). A
+  heavy day writes ≈ 2.5k checkpoint rows of ≈ 42.5k.
+- **Accepted:**
+  - A forged genesis that front-runs creation is a DoS only.
+  - Two concurrent revokes under different RKs fork.
+  - A stored forged open revoke survives resets. It is a DoS, capped at 4, and `revokeRekey` ends it.
+  - A revoke a crash interrupts before its append is not resumed.
+  - Quarantine eviction starts at 500 records, and `QUARANTINE_MAX_BYTES` is not enforced.
+  - A device that took a roll before the revoker re-published stops and needs a re-pair.
+  - A durability-retry frame lets later ns and cfg frames overtake it (`sender.ts:358`).
+  - `revokeRekey` does not verify the RK before it proposes.
+  - A crash between a rebind and its `nsDelete` shows the loser as a duplicate (no data loss).
 
 ## 22. Decisions (resolved)
 

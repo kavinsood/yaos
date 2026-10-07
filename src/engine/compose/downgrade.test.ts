@@ -1,0 +1,1262 @@
+/**
+ * e2ee-design.md §20.2 "Downgrade", measured: every test tallies each outcome over all its cases and
+ * asserts the whole tally (rules: §12.4, §15.1). Every bullet maps to one test; where a single-case test
+ * already covers it, that test is cited and the counting form is added here.
+ *
+ * (a) Suite-0 rows injected into a suite-1 vault -> "a. ...". 26 forged rows (ns, cfg, snap, body, canvas, blob
+ *     chunk; hostile and genuine deviceIds) plus checkpoints: the gate's stage 1 says crypto-downgrade for every
+ *     subject; each of two devices opens all 26 as suite-downgrade; folds, docs, disk, ns/cfg/snap state and a
+ *     replay are unchanged. Existing: webCryptoSuite1.test.ts:62, suite1Envelope.test.ts:139,
+ *     suite1Tamper.test.ts:423.
+ * (b) Hidden k, key-less join -> "b. ...". 6 join forms (typed code, console link, the same with the protocol
+ *     action, plugin link, /mobile-setup QR, resumePendingEnrollment) x 4 vault states (head = 0; head > 0 with
+ *     k empty, hidden, hidden under suite-0 data) x 3 seeds, against a hostile server. Every case ends
+ *     key-missing/"no-pin"/suite=null with 0 frames, rows, checkpoints, blob calls, IndexedDB stores, side files,
+ *     secrets and disk changes; every UI command and key probe is tallied. Only installKey (QR, RK) reaches the
+ *     engine. Existing: pluginController.test.ts:165, pinGate.test.ts:191, pinGate.test.ts:267.
+ *     - The sim relay reports the true head, so a hidden genesis means head > 0. A server that also reports head 0
+ *       gives the device exactly the "empty" state's view.
+ *     - UI-only: the two-button blocked screen (§12.4) is not built yet (WP-E5, src/host/ui/** not edited).
+ *       What is checked here is the host/engine layer (only installKey is accepted; pinSuite0, enableE2ee and
+ *       revokeRekey are refused on main), the palette (commands.ts:30-45: no pin/suite/encryption command) and the
+ *       status tooltip (statusBar.ts:158-162: names the RK and the QR, offers nothing else).
+ * (c) The pin never comes from the server -> "c. ...". Over b's 72 joins: 0 saved e2ee/creating fields, 0
+ *     creatable, keyringSeen or suite statuses, 0 pinSuite0 at an engine. pinCensus() counts every pin setter,
+ *     pin-shaped write, saveData, markCreating and key-command construction in the shipped sources: all are main's
+ *     (pluginController.ts, keys/pin.ts, ui/api.ts's sanitizing loader), and nothing builds a pinSuite0 command or
+ *     calls markCreating. Existing: pin.test.ts:16, pin.test.ts:101, pluginController.test.ts:182.
+ * (d) Suite-0 link after a genesis -> "d. ...". Live and history genesis x 3 seeds; the server then hides k and
+ *     drops the session. 6 suite=0 link shapes are rejected by parseSetupLink. pinSuite0 {link} is refused
+ *     (keyring-seen) by main, also after UI writes, a re-pair and a restart. keyringSeen stays saved; there are 0
+ *     writes. Existing: pluginController.test.ts:200, keyReader.test.ts:91, pinGate.test.ts:227, pin.test.ts:88.
+ *     - A restarted engine is not told keyringSeen (e2ee-design.md §18.4 "keyringSeen is not in init.crypto", hostKeys.ts:48), so its own answer
+ *       is "ok". The engine never pins: only main does (pluginController.ts:267, :294-299), and main refuses.
+ * (e) Creation path -> "e. ...". 5 non-empty vaults (head > 0, or k non-empty) x 3 seeds: never creatable;
+ *     enableE2ee and pinSuite0 {create} are refused; no pin, 0 writes. A marker for another vaultId, set before
+ *     pairing, while paired, or via a UI write, is ignored. 13 hostile setup-link shapes are rejected, and the
+ *     protocol handler (registerUi.ts:156-163) only prefills host and pairing code. Existing: pinGate.test.ts:243,
+ *     pin.test.ts:63, pin.test.ts:29, pluginController.test.ts:295.
+ * (f) Unverified key -> "f. ...". 9 QR/RK keys without a matching k record x 3 seeds x {same engine, restart}:
+ *     unpinned, 0 SecretStorage writes, 0 writes, no key bytes left on main. Existing: keyReader.test.ts:114,
+ *     pluginController.test.ts:216.
+ * (g) A suite-0 device sees a k genesis -> "g. ...". 6 timings (live typing, offline with or without edits,
+ *     restart, wipe, fresh device) x 3 seeds: encrypted-vault every time. The raw crypto port, tapped behind the
+ *     write gate, counts 0 seals after encrypted-vault and 0 through a shut gate. 0 rows and 0 k rows by the
+ *     device after it saw the genesis. Existing: keyring.ops.test.ts:81.
+ *
+ * Residual risk (§12.4): a suite=0 link taken from a hostile source. Here parseSetupLink rejects `suite`
+ * (pairing.ts:503-507), and c's census shows no production code builds pinSuite0.
+ * Output: counts only, never key bytes, recovery keys, codes or links.
+ */
+import { test } from "node:test";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import assert from "node:assert/strict";
+import * as Yjs from "yjs";
+import { CryptoSuite } from "../../core/envelope";
+import { decodeOuter } from "../../core/codec/envelope";
+import { bytesToHex } from "../../core/codec/lib0";
+import { bytesToHash, newClientFrameId, newDocId } from "../../core/codec/ids";
+import { encodeNsOps } from "../../core/codec/nsOps";
+import { encodeCfgOps } from "../../core/codec/cfgOps";
+import { encodeSnapOps } from "../../core/snap/record";
+import {
+	CFG_STREAM, KEYRING_STREAM, NS_STREAM, SNAP_STREAM, bodyStream, canvasStream, blobChunkStream,
+	type ClientFrameId, type DeviceId, type Seq, type StreamName, type VaultPath,
+} from "../../core/types";
+import type { BlobAddress, CryptoPort } from "../../ports/crypto";
+import type { EnvelopeKind } from "../../core/envelope";
+import { createNoopCrypto } from "../adapters/noopCrypto";
+import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
+import { gate, type GateSubject } from "../ingest/gate";
+import { sealCheckpoint, sealFrame } from "../ingest/envelope";
+import { simHashPort } from "../../sim/hash";
+import { SeededRandom } from "../../sim/random";
+import { VirtualClock } from "../../sim/clock";
+import { SimDevice } from "../../sim/device";
+import { SIM_VAULT_ID, SimNet } from "../../sim/net";
+import { e2eeOf, isLive, keyMissing, lastStatus, onboardSuite1, oracleKeys, rowsBy, seededRk, settleOn, storedKeys } from "../../sim/e2ee";
+import { connectPeer, frame } from "../../sim/a-relay-testkit";
+import { FORGED, K, RK_A, RK_B, genesisFor } from "../keyring/testkit/world";
+import type { BlobPort } from "../../ports/blob";
+import type { UserCommand } from "../../protocol/messages";
+import type { StatusSnapshot } from "../../protocol/status";
+import type { HostUiSink } from "../../host/hostRuntime";
+import { PinRefusedError, YaosController } from "../../host/pluginController";
+import { defaultPluginData, type YaosPluginData } from "../../host/ui/api";
+import { base64Url, buildSetupLink, parseSetupLink, prepareEnrollment, type EnrollInput, type RequestFn } from "../../host/ui/pairing";
+import { applyPairedIdentity, PairingSession, resumePendingEnrollment, setPendingEnrollment, withoutPendingEnrollment } from "../../host/ui/pairFlow";
+import { renderStatus } from "../../host/ui/statusBar";
+import { UI_COMMANDS } from "../../host/ui/commands";
+
+// --- shared helpers ------------------------------------------------------------------------------------------
+
+const MARK = "FORGED-S0-MARK";
+const enc = new TextEncoder();
+
+/** Stable JSON of fold state: Maps as sorted entry lists, bytes as hex. */
+function fp(v: unknown): string {
+	return JSON.stringify(v, (_k, x: unknown) => {
+		if (x instanceof Map) return [...x.entries()].map(([k, y]) => [String(k), y]).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+		if (x instanceof Set) return [...x].map(String).sort();
+		if (x instanceof Uint8Array) return `hex:${bytesToHex(x)}`;
+		if (typeof x === "bigint") return x.toString();
+		return x;
+	});
+}
+
+function count<K extends string>(tally: Map<K, number>, k: K): void {
+	tally.set(k, (tally.get(k) ?? 0) + 1);
+}
+
+function tallyObj(tally: ReadonlyMap<string, number>): Record<string, number> {
+	return Object.fromEntries([...tally].sort(([a], [b]) => (a < b ? -1 : 1)));
+}
+
+function newClock(): VirtualClock {
+	const clock = new VirtualClock();
+	clock.onError = (e) => {
+		throw e;
+	};
+	return clock;
+}
+
+// --- a. suite-0 rows forged into a suite-1 vault ----------------------------------------------------------------
+
+interface Forged {
+	readonly what: string;
+	readonly stream: StreamName;
+	readonly deviceId: DeviceId;
+	readonly clientFrameId: ClientFrameId;
+	readonly payload: Uint8Array;
+	/** Every live device reads this stream (ns, cfg, snap, a body it holds): it must open the row. */
+	readonly mustOpen: boolean;
+}
+
+/** The fold and disk view of a device that the forged rows must not change. */
+async function foldView(clock: VirtualClock, d: SimDevice): Promise<{ disk: string; docs: string; texts: string; ns: string; cfg: string; snap: string; replay: string; rings: number }> {
+	const log = d.vrt!.log;
+	const docs = log.listDocs().map((x) => ({ docId: x.docId, path: x.path, kind: x.kind, state: x.state, aliasOf: x.aliasOf })).sort((a, b) => (a.docId < b.docId ? -1 : 1));
+	const texts: Record<string, string | null> = {};
+	for (const x of docs) if (x.state === "live" && x.kind === "markdown") texts[x.path] = d.engineText(x.path);
+	const ns = log.nsView().state;
+	const cfg = log.cfgView();
+	const snap = log.snapView().state;
+	let rings = 0;
+	for (const r of ns.recentFrames.values()) rings += r.length;
+	for (const r of cfg.recentFrames.values()) rings += r.length;
+	void clock;
+	return {
+		disk: fp([...d.vault.snapshot()]),
+		docs: fp(docs),
+		texts: fp(texts),
+		ns: fp(ns.entries),
+		cfg: fp({ json: cfg.json, files: cfg.files, plugins: cfg.plugins }),
+		snap: fp({ floors: snap.floors, dels: snap.dels, records: snap.records }),
+		replay: fp({ ns: ns.replay, cfg: cfg.replay }),
+		rings,
+	};
+}
+
+/** Wraps the device's crypto port open (the ingest gate's, context.ts gateCtx) and tallies suite-0 opens by payload. */
+function tapOpens(d: SimDevice): Map<string, Map<string, number>> {
+	const byPayload = new Map<string, Map<string, number>>();
+	const port = d.vrt!.log.c.gateCtx.crypto as CryptoPort;
+	const inner = port.open.bind(port);
+	(port as { open: CryptoPort["open"] }).open = async (input) => {
+		const r = await inner(input);
+		if (input.suite === CryptoSuite.none) {
+			const key = bytesToHex(input.sealed);
+			let t = byPayload.get(key);
+			if (!t) byPayload.set(key, (t = new Map()));
+			count(t, r.ok ? "opened" : r.reason);
+		}
+		return r;
+	};
+	return byPayload;
+}
+
+async function converged(clock: VirtualClock, devs: readonly SimDevice[], paths: readonly string[], horizonMs = 120_000): Promise<boolean> {
+	return clock.runUntil(() => devs.every((d) => d.vrt?.log.isIdle() === true && d.vault.pendingEvents() === 0 && paths.every((p) => d.vault.snapshot().get(p) !== undefined && devs.every((o) => o.vault.snapshot().get(p) === d.vault.snapshot().get(p)))), horizonMs);
+}
+
+test("a. suite-0 rows forged into a suite-1 vault: every open is suite-downgrade, folds/docs/disk unchanged", async () => {
+	const clock = newClock();
+	const net = new SimNet(clock, { seed: 11 });
+	const X = new SimDevice({ name: "X", clock, net, pin: null });
+	const Y = new SimDevice({ name: "Y", clock, net, pin: null });
+	const ob = await onboardSuite1(clock, [X, Y], new SeededRandom(101));
+	assert.ok(ob.ok, ob.lines.at(-1));
+	X.vault.userWrite("notes/a.md", "alpha\n");
+	X.vault.userWrite("notes/b.md", "beta\n");
+	Y.vault.userWrite("notes/c.md", "gamma\n");
+	assert.ok(await converged(clock, [X, Y], ["notes/a.md", "notes/b.md", "notes/c.md"]), "X and Y converge");
+	await clock.advance(5_000);
+	const devs = [X, Y];
+	const keys = oracleKeys(devs);
+	assert.ok(keys);
+	const before = await Promise.all(devs.map((d) => foldView(clock, d)));
+	const oracleBefore = await net.oracle(120_000, keys);
+	assert.equal(oracleBefore.error, null);
+	const headBefore = net.relay.head();
+
+	// The forged rows: every stream class, under hostile ids and the genuine devices' own ids (a relay can claim any).
+	const docOf = (p: string) => X.vrt!.log.listDocs().find((x) => x.path === p && x.state === "live")!.docId;
+	const live = [docOf("notes/a.md"), docOf("notes/b.md"), docOf("notes/c.md")];
+	const rnd = new SeededRandom(202);
+	const noop = createNoopCrypto(simHashPort());
+	const authors = ["hostile-1" as DeviceId, "hostile-2" as DeviceId, X.deviceId, Y.deviceId];
+	const forged: Forged[] = [];
+	let frameNo = 1;
+	const add = async (what: string, stream: StreamName, kind: EnvelopeKind, content: Uint8Array, deviceId: DeviceId, mustOpen: boolean, fno = 0) => {
+		const clientFrameId = newClientFrameId(rnd);
+		const s = await sealFrame(noop, SIM_VAULT_ID, { stream, deviceId, clientFrameId, kind, authorNsSeq: 0 as Seq, flags: 0, frameNo: fno, content });
+		forged.push({ what, stream, deviceId, clientFrameId, payload: s.sealed, mustOpen });
+	};
+	const hash = bytesToHash(new Uint8Array(32).fill(7));
+	for (const a of authors) {
+		const fresh = newDocId(rnd);
+		await add("ns-create", NS_STREAM, "nsOps", encodeNsOps([{ t: "create", docId: fresh, kind: "markdown", path: `notes/${MARK}-${a}.md` as VaultPath, contentHash: hash, size: 3 }]), a, true, frameNo++);
+		await add("ns-rename", NS_STREAM, "nsOps", encodeNsOps([{ t: "rename", docId: live[0]!, path: `notes/${MARK}-ren-${a}.md` as VaultPath }]), a, true, frameNo++);
+		await add("ns-delete", NS_STREAM, "nsOps", encodeNsOps([{ t: "delete", docId: live[1]!, baseBodySeq: 1_000_000 as Seq }]), a, true, frameNo++);
+		await add("cfg-plugin", CFG_STREAM, "cfgOps", encodeCfgOps([{ t: "pluginSet", pluginId: `forged-${MARK}`, enabled: true }]), a, true, frameNo++);
+		await add("snap-floor", SNAP_STREAM, "snapOps", encodeSnapOps([{ t: "floor", createdAtMs: 9_000_000_000_000 }]), a, true);
+	}
+	const yUpdate = (text: string) => {
+		const doc = new Yjs.Doc();
+		doc.getText("text").insert(0, text);
+		return Yjs.encodeStateAsUpdate(doc);
+	};
+	for (let i = 0; i < live.length; i++) await add("body-live", bodyStream(live[i]!), "bodyUpdate", yUpdate(`${MARK} body ${i}\n`), authors[i % authors.length]!, true);
+	const ghost = newDocId(rnd);
+	await add("body-unknown", bodyStream(ghost), "bodyUpdate", yUpdate(`${MARK} ghost\n`), authors[0]!, false);
+	await add("canvas-unknown", canvasStream(newDocId(rnd)), "bodyUpdate", yUpdate(`${MARK} canvas\n`), authors[1]!, false);
+	await add("blobchunk", blobChunkStream("ab".repeat(32) as BlobAddress), "blobChunk", enc.encode(`${MARK} chunk`), authors[0]!, false);
+
+	// Stage 1 directly, for every forged row and the same bytes as a provisional, plus forged checkpoints.
+	const port = await createWebCryptoSuite1({ vaultId: SIM_VAULT_ID, random: new SeededRandom(5), keys: storedKeys(X)!.keys });
+	const ctx = { crypto: port, vaultId: SIM_VAULT_ID, maxCheckpointStateBytes: 1 << 20, staleCheck: () => null };
+	const direct = new Map<string, number>();
+	const subjects: GateSubject[] = [];
+	for (const f of forged) {
+		subjects.push({ t: "row", stream: f.stream, seq: 1 as Seq, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload: f.payload });
+		subjects.push({ t: "provisional", stream: f.stream, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload: f.payload });
+	}
+	for (const s of [NS_STREAM, CFG_STREAM, SNAP_STREAM, bodyStream(live[0]!), canvasStream(ghost)]) {
+		subjects.push({ t: "checkpoint", stream: s, coversSeq: 7 as Seq, payload: await sealCheckpoint(noop, SIM_VAULT_ID, s, 7 as Seq, enc.encode(`${MARK} checkpoint`), 0 as Seq) });
+	}
+	for (const s of subjects) {
+		const r = await gate(ctx, s);
+		count(direct, r.ok ? `pass:${r.t}` : `${r.reason}/${r.readerDependent ? "dep" : "det"}`);
+	}
+	assert.deepEqual(tallyObj(direct), { "crypto-downgrade/det": subjects.length }, "stage 1: every forged row, provisional and checkpoint is crypto-downgrade, deterministic");
+
+	// Live: the relay commits them and pushes them to every open socket.
+	const taps = devs.map(tapOpens);
+	const rows = net.relay.forge(forged.map((f) => ({ stream: f.stream, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload: f.payload })));
+	assert.equal(rows.length, forged.length);
+	const keyOf = (f: Forged) => bytesToHex(decodeOuter(f.payload).ok ? (decodeOuter(f.payload) as { sealed: Uint8Array }).sealed : new Uint8Array());
+	const opened = (d: number) => forged.filter((f) => taps[d]!.has(keyOf(f)));
+	const mustOpen = forged.filter((f) => f.mustOpen);
+	assert.ok(await clock.runUntil(() => devs.every((d, i) => d.vrt?.log.isIdle() === true && mustOpen.every((f) => taps[i]!.has(keyOf(f)))), 120_000), "both devices read every forged row of a stream they hold");
+	await clock.advance(10_000);
+
+	// Every open of a forged row on either device failed, and only as suite-downgrade (open failures by reason).
+	const reasons = new Map<string, number>();
+	for (const t of taps) for (const per of t.values()) for (const [r, n] of per) reasons.set(r, (reasons.get(r) ?? 0) + n);
+	const openedBy = taps.map((t) => forged.filter((f) => t.has(keyOf(f))).length);
+	assert.deepEqual(openedBy, [forged.length, forged.length], "each device opened every forged row (all classes are pushed live)");
+	assert.deepEqual(tallyObj(reasons), { "suite-downgrade": openedBy[0]! + openedBy[1]! }, "open failures by reason: suite-downgrade only, once per row per device");
+	const after = await Promise.all(devs.map((d) => foldView(clock, d)));
+	const sideStreams = new Set(forged.filter((f) => !["ns", "cfg", "snap"].includes(f.stream)).map((f) => f.stream));
+	for (let i = 0; i < devs.length; i++) {
+		const b = before[i]!;
+		const a = after[i]!;
+		const same = { disk: a.disk === b.disk, docs: a.docs === b.docs, texts: a.texts === b.texts, ns: a.ns === b.ns, cfg: a.cfg === b.cfg, snap: a.snap === b.snap, replay: a.replay === b.replay };
+		assert.deepEqual(same, { disk: true, docs: true, texts: true, ns: true, cfg: true, snap: true, replay: true }, `${devs[i]!.name}: folded vault and docs unchanged`);
+		// ns/cfg rows fold as empty frames (frameNo 0: no replay window touched, §8.2); their cfid enters the dedupe ring.
+		assert.equal(a.rings - b.rings, forged.filter((f) => f.stream === NS_STREAM || f.stream === CFG_STREAM).length, "one ring entry per forged ns/cfg row, nothing else");
+		const q = new Map<string, number>();
+		const frozen = new Map<string, number>();
+		for (const r of devs[i]!.vrt!.log.c.repo.streams()) {
+			if (r.frozen === 1) count(frozen, `${sideStreams.has(r.stream) ? "forged" : "other"}:${r.frozenReason}`);
+			for (const x of await devs[i]!.vrt!.log.c.repo.quarantineOf(r.stream)) count(q, `${r.stream.slice(0, 2)}${x.reason}`);
+		}
+		// §9.3: a body/canvas/x row that fails is quarantined and its doc frozen (DoS only, nothing applied).
+		assert.deepEqual(tallyObj(q), { "b:crypto-downgrade": 4, "c:crypto-downgrade": 1, "x:crypto-downgrade": 1 }, "one quarantine record per forged side-stream row, none for ns/cfg/snap");
+		assert.deepEqual(tallyObj(frozen), { "forged:crypto-downgrade": sideStreams.size }, "only the forged-into streams are frozen, for that reason");
+	}
+	const oracleAfter = await net.oracle(120_000, keys);
+	assert.equal(oracleAfter.error, null);
+	assert.equal(fp(oracleAfter.docs), fp(oracleBefore.docs), "a fresh suite-1 reader folds the same vault");
+	assert.equal(net.relay.head(), headBefore + forged.length);
+	// The ns fold is not halted (no reader-dependent failure): a genuine write still reaches the other device.
+	Y.vault.userWrite("notes/after.md", "after\n");
+	assert.ok(await converged(clock, devs, ["notes/after.md"]), "ns fold still live after the forged rows");
+	let marks = 0;
+	for (const d of devs) {
+		for (const [p, t] of d.vault.snapshot()) if (p.includes(MARK) || t.includes(MARK)) marks++;
+		const v = await foldView(clock, d);
+		for (const s of [v.docs, v.texts, v.ns, v.cfg, v.snap]) if (s.includes(MARK)) marks++;
+	}
+	for (const doc of oracleAfter.docs) if (doc.path.includes(MARK) || (doc.text ?? "").includes(MARK)) marks++;
+	assert.equal(marks, 0, "no forged path, text or plugin id anywhere");
+	console.log(`[a] forged rows=${forged.length} (+${subjects.length - 2 * forged.length} checkpoints, ${forged.length} provisionals) stage-1=crypto-downgrade x${subjects.length}; per device opened=${openedBy.join(",")} suite-downgrade=${reasons.get("suite-downgrade")}; quarantined=6 frozen=${sideStreams.size}; folds unchanged; marks=0`);
+});
+
+// --- b, c. key-less joins through the plugin controller ----------------------------------------------------------
+
+const HOST = "https://relay.example";
+const JOIN_FORMS = ["typed", "console-link", "console-link-protocol-action", "plugin-link", "mobile-setup-qr", "resume"] as const;
+type JoinForm = (typeof JOIN_FORMS)[number];
+/** head = 0 (empty), and head > 0 with `k` empty, hidden, or hidden under suite-0 data. */
+const VAULT_STATES = ["empty", "suite0-data", "hidden-genesis", "hidden-genesis+suite0-data"] as const;
+type VaultState = (typeof VAULT_STATES)[number];
+const JOIN_SEEDS = [1, 2, 3] as const;
+
+/** Fields a hostile server adds to its capabilities and /enroll answers: none may reach the pin (readEnrollment). */
+const HOSTILE_FIELDS = { suite: 0, e2ee: { suite: 0 }, pin: { suite: 0 }, creating: { vaultId: SIM_VAULT_ID }, creatable: true, keyringSeen: false, encryption: "off" };
+const IDENTITY_KEYS = ["deviceId", "deviceName", "deviceToken", "host", "vaultGeneration", "vaultId"];
+
+/** A BlobPort that counts every call (pinGate.test.ts countingBlob). */
+function countingBlob(): { port: BlobPort; calls: Map<string, number> } {
+	const calls = new Map<string, number>();
+	const port: BlobPort = {
+		maxBlobBytes: 1 << 20,
+		has: async () => (count(calls, "has"), new Set()),
+		put: async () => void count(calls, "put"),
+		get: async () => (count(calls, "get"), null),
+		list: async () => (count(calls, "list"), { items: [], next: null }),
+		deleteIfUploadedBefore: async () => (count(calls, "delete"), []),
+	};
+	return { port, calls };
+}
+
+function relayState(net: SimNet): { head: number; checkpoints: string } {
+	return { head: net.relay.head(), checkpoints: net.relay.streams().map((s) => `${s}:${net.relay.checkpoint(s)?.coversSeq ?? "-"}`).join(",") };
+}
+
+/** The relay as a hostile server: claimed streams relay, /enroll accepted, every answer padded with HOSTILE_FIELDS. */
+function hostileServer(requests: Map<string, number>): RequestFn {
+	return async (req) => {
+		const path = req.url.startsWith(HOST) ? req.url.slice(HOST.length) : "other-host";
+		count(requests, `${req.method} ${path}`);
+		if (req.method === "GET" && path === "/api/capabilities") return { status: 200, json: { claimed: true, streams: 1, attachments: true, serverVersion: "sim", ...HOSTILE_FIELDS } };
+		if (req.method === "POST" && path === "/enroll") {
+			const b = JSON.parse(req.body ?? "{}") as { deviceId?: string; deviceToken?: string };
+			return { status: 200, json: { vaultId: SIM_VAULT_ID, deviceId: b.deviceId, deviceToken: b.deviceToken, host: HOST, deviceName: "Joiner", vaultGeneration: null, ...HOSTILE_FIELDS } };
+		}
+		return { status: 404, json: null };
+	};
+}
+
+/** The params Obsidian hands registerObsidianProtocolHandler for an obsidian://yaos?... link (registerUi.ts:156). */
+function protocolParams(link: string, action?: string): Record<string, string> {
+	const params: Record<string, string> = {};
+	for (const [k, v] of new URL(link).searchParams) params[k] = v;
+	if (action !== undefined) params.action = action; // Obsidian may report the protocol action instead (pairing.ts:508)
+	return params;
+}
+
+/** server/src/console/mobileSetup.ts:47-59 as the page runs it: fragment params, checks, then the obsidian link. */
+function mobileSetupPage(url: string): string | null {
+	const u = new URL(url);
+	const params = new URLSearchParams(u.hash.slice(1));
+	const host = (params.get("host") || "").trim().replace(/[/]+$/, "");
+	const code = (params.get("pairingCode") || "").trim();
+	if (!/^[A-Za-z0-9_-]{22}[.][A-Za-z0-9_-]{32}$/.test(code)) return null;
+	if (host !== u.origin) return null;
+	return `obsidian://yaos?${new URLSearchParams({ action: "setup", host, pairingCode: code }).toString()}`;
+}
+
+/** What each key-less form hands PairingSession.submit (the pair modal's fields). Secrets stay in memory. */
+function joinInput(form: JoinForm, code: string): EnrollInput {
+	const fromLink = (params: Record<string, string>): EnrollInput => {
+		const p = parseSetupLink(params);
+		if (!p.ok || p.kind !== "setup") throw new Error(`setup link refused (${form})`);
+		return { host: p.host, pairingCode: p.pairingCode, deviceName: "Joiner" };
+	};
+	// The console's link and setup QR (server/src/console/console.ts:160, :169).
+	const consoleLink = `obsidian://yaos?${new URLSearchParams({ action: "setup", host: HOST, pairingCode: code }).toString()}`;
+	switch (form) {
+		case "typed":
+		case "resume":
+			return { host: "  relay.example/ ", pairingCode: ` ${code}\n`, deviceName: "  Joiner " };
+		case "console-link":
+			return fromLink(protocolParams(consoleLink));
+		case "console-link-protocol-action":
+			return fromLink(protocolParams(consoleLink, "yaos"));
+		case "plugin-link":
+			return fromLink(protocolParams(buildSetupLink(HOST, code)));
+		case "mobile-setup-qr": {
+			const link = mobileSetupPage(`${HOST}/mobile-setup#${new URLSearchParams({ host: HOST, pairingCode: code }).toString()}`);
+			if (!link) throw new Error("mobile-setup page refused the console QR");
+			return fromLink(protocolParams(link));
+		}
+	}
+}
+
+/** Settles `p` on the clock; the outcome as a short label (fixed texts only, never a payload). */
+async function outcome(clock: VirtualClock, p: Promise<unknown>, horizonMs = 60_000): Promise<string> {
+	let r: string | null = null;
+	p.then(
+		(v) => {
+			const x = v as { t?: string; refused?: string | null } | undefined;
+			r = x?.t === "attachmentsCleaned" ? `attachmentsCleaned:${x.refused ?? "none"}` : (x?.t ?? "done");
+		},
+		(e: unknown) => {
+			if (e instanceof PinRefusedError) r = `refused:${e.refusal}`;
+			else {
+				// The engine's error code: on the raw runtime error, or the "code: message" text main rethrows (safeMessage).
+				const m = e instanceof Error ? e.message : String(e);
+				const raw = (e as { error?: { code?: unknown } } | null)?.error?.code;
+				const code = typeof raw === "string" ? raw : /^([a-z][a-z-]*): /.exec(m)?.[1];
+				r = code === "not-ready" || /not running/.test(m) ? "not-ready" : code !== undefined ? `engine:${code}` : `error:${m.slice(0, 80)}`;
+			}
+		},
+	);
+	await clock.runUntil(() => r !== null, horizonMs);
+	return r ?? "unsettled";
+}
+
+/** The relay state a case starts from (before the joining device exists). True when the state hides k from the joiner. */
+async function prepareVault(clock: VirtualClock, net: SimNet, state: VaultState): Promise<boolean> {
+	if (state === "suite0-data" || state === "hidden-genesis+suite0-data") {
+		const b = new SimDevice({ name: "B", clock, net }); // the suite-0 fixture pin: it writes plaintext rows
+		b.vault.userWrite("notes/b.md", "from b\n");
+		b.vault.userWrite("notes/c.md", "more\n");
+		void b.start();
+		assert.ok(await clock.runUntil(() => net.relay.rows(NS_STREAM).length > 0 && b.vrt?.log.isIdle() === true, 60_000), "B wrote");
+		b.crashApp();
+		await clock.advance(1_000);
+	}
+	if (state === "hidden-genesis" || state === "hidden-genesis+suite0-data") {
+		const g = await connectPeer(net.relay, clock, "dev-G");
+		g.session.append(frame(KEYRING_STREAM, "g-genesis", await genesisFor(SIM_VAULT_ID)));
+		await clock.advance(1_000);
+		assert.equal(net.relay.rows(KEYRING_STREAM).length, 1, "the genesis is on the relay");
+		return true;
+	}
+	return false;
+}
+
+interface ControllerWorld {
+	readonly dev: SimDevice;
+	readonly ctl: YaosController;
+	readonly saved: YaosPluginData[];
+	readonly statuses: StatusSnapshot[];
+	readonly engineCommands: Map<string, number>;
+	readonly blob: ReturnType<typeof countingBlob>;
+	/** The current engine's command, bypassing main's refusals (what a buggy or hostile main could send). */
+	readonly direct: (c: UserCommand) => Promise<unknown>;
+}
+
+/** A YaosController over a fresh unpinned SimDevice, with every status, saved data.json and engine command recorded. */
+function controllerWorld(clock: VirtualClock, net: SimNet, initial: YaosPluginData, name = "J"): ControllerWorld {
+	const blob = countingBlob();
+	const dev = new SimDevice({ name, clock, net, pin: null, blob: () => blob.port });
+	const saved: YaosPluginData[] = [];
+	const statuses: StatusSnapshot[] = [];
+	const engineCommands = new Map<string, number>();
+	let inner: ((c: UserCommand) => Promise<unknown>) | null = null;
+	const ctl = new YaosController(initial, {
+		makeRuntime: (identity, settings, ui, keys) => {
+			const sink: HostUiSink = { ...ui, onStatus: (s) => (statuses.push(s), ui.onStatus(s)) };
+			const rt = dev.runtimeFor(identity, settings, sink, keys);
+			const raw = rt.command.bind(rt);
+			inner = raw;
+			rt.command = (c) => (count(engineCommands, c.t === "pinSuite0" ? `pinSuite0:${c.source}` : c.t === "installKey" ? `installKey:${c.source}` : c.t), raw(c));
+			return rt;
+		},
+		saveData: async (d) => void saved.push(JSON.parse(JSON.stringify({ ...d, pendingEnrollment: d.pendingEnrollment ? "set" : undefined })) as YaosPluginData),
+		notice: () => undefined,
+		clock,
+		secrets: dev.secrets,
+	});
+	const direct = (c: UserCommand): Promise<unknown> => (inner ? inner(c) : Promise.reject(new Error("no runtime")));
+	return { dev, ctl, saved, statuses, engineCommands, blob, direct };
+}
+
+const noBytes = (b: Uint8Array): boolean => b.byteLength === 0 || b.every((x) => x === 0);
+
+interface JoinTallies {
+	cases: number;
+	readonly finals: Map<string, number>;
+	readonly uiCommands: Map<string, number>;
+	readonly probes: Map<string, number>;
+	readonly engineCommands: Map<string, number>;
+	readonly savedPins: Map<string, number>;
+	readonly statusFlags: Map<string, number>;
+	readonly writes: Map<string, number>;
+	readonly requests: Map<string, number>;
+	readonly ui: Map<string, number>;
+	headZero: number;
+	headPositive: number;
+}
+
+async function keylessJoin(form: JoinForm, state: VaultState, seed: number, t: JoinTallies): Promise<void> {
+	const clock = newClock();
+	const net = new SimNet(clock, { seed: seed * 101 + VAULT_STATES.indexOf(state), linkMs: 10 });
+	const hideK = await prepareVault(clock, net, state);
+	const rng = new SeededRandom(hashCase(form, state, seed));
+	const code = `${SIM_VAULT_ID}.${base64Url(rng.bytes(24))}`; // a D3 code naming the vault (never printed)
+	const requests = new Map<string, number>();
+	const request = hostileServer(requests);
+	const randomBytes = (n: number) => rng.bytes(n);
+	const input = joinInput(form, code);
+	const initial = form === "resume" ? { ...defaultPluginData("Joiner"), pendingEnrollment: prepareEnrollment(input, randomBytes) } : defaultPluginData("Joiner");
+	const w = controllerWorld(clock, net, initial);
+	const { dev, ctl } = w;
+	// The relay knows the device by its enrolled deviceId (the engine's connect params, net.ts:53): hide k from that id
+	// from the moment the attempt exists, before any engine connects.
+	const hiddenFrom = new Set<string>();
+	const hideFrom = (deviceId: string) => hideK && (hiddenFrom.add(deviceId), net.relay.hideFrom(deviceId as DeviceId, KEYRING_STREAM));
+	if (initial.pendingEnrollment) hideFrom(initial.pendingEnrollment.deviceId);
+	dev.vault.userWrite("mine.md", "local only\n");
+	const before = relayState(net);
+	const appendsBefore = net.relay.counters().appendFrames;
+	if (before.head === 0) t.headZero++;
+	else t.headPositive++;
+
+	// Pair the way each form does (pairModal.ts submit; plugin.ts:137-141 for the resume).
+	if (form === "resume") {
+		const r = await settleOn(clock, resumePendingEnrollment({ data: () => ctl.data(), updateData: (m) => ctl.updateData(m) }, { request, randomBytes }));
+		assert.ok(r.ok && r.value?.ok === true, `resume ${state}`);
+		await settleOn(clock, ctl.start());
+	} else {
+		await settleOn(clock, ctl.start());
+		const session = new PairingSession({ request, randomBytes, persist: (a) => (a && hideFrom(a.deviceId), ctl.updateData((d) => (a ? setPendingEnrollment(d, a) : withoutPendingEnrollment(d)))) });
+		const id = await settleOn(clock, session.submit(input));
+		assert.ok(id.ok, `pair ${form} ${state}`);
+		await settleOn(clock, ctl.updateData((d) => applyPairedIdentity(d, id.value)));
+	}
+	const joiner = ctl.data().identity?.deviceId as DeviceId;
+	assert.ok(joiner && (!hideK || hiddenFrom.has(joiner)), "k hidden from the enrolled device");
+	const blocked = () => ctl.runState().phase === "running" && ctl.status()?.phase === "key-missing" && ctl.status()?.e2ee?.keyMissing === "no-pin" && ctl.status()?.relay.connected === true;
+	assert.ok(await clock.runUntil(blocked, 60_000), `${form} ${state}: blocked, connected`);
+	await clock.advance(3_000);
+
+	// Activity that would make a writer write: local edits, a foreground event.
+	dev.vault.userWrite("typed-while-blocked.md", "typed while blocked\n");
+	dev.platform.emit("visible");
+	await clock.advance(5_000);
+
+	// Every UI command the blocked device accepts (commands.ts UI_COMMANDS), and a restart.
+	const ui: [string, UserCommand][] = [
+		["pause", { t: "pause" }], ["resume", { t: "resume" }], ["reconcileNow", { t: "reconcileNow" }],
+		["exportDiagnostics", { t: "exportDiagnostics", includePaths: false }], ["exportDiagnostics+paths", { t: "exportDiagnostics", includePaths: true }],
+		["createSnapshot", { t: "createSnapshot" }], ["listSnapshots", { t: "listSnapshots" }], ["rebuildLocalCache", { t: "rebuildLocalCache" }],
+		["cleanUpAttachments", { t: "cleanUpAttachments" }],
+	];
+	for (const [label, c] of ui) count(t.uiCommands, `${label}=${await outcome(clock, ctl.command(c))}`);
+	await settleOn(clock, ctl.restartEngine());
+	assert.ok(await clock.runUntil(blocked, 60_000), `${form} ${state}: blocked after the restart`);
+	count(t.uiCommands, "restartEngine=key-missing/no-pin");
+
+	// Host-layer actions: a QR key and the RK (the genuine ones for the hidden genesis), and every pin command.
+	const k = K(1).slice();
+	const rk = RK_A.slice();
+	const rk2 = seededRk(rng.fork("rk2"));
+	const rk3 = seededRk(rng.fork("rk3"));
+	count(t.probes, `installKey:qr=${await outcome(clock, ctl.command({ t: "installKey", source: "qr", e: 1, k }))}`);
+	count(t.probes, `installKey:rk=${await outcome(clock, ctl.command({ t: "installKey", source: "rk", rk }))}`);
+	count(t.probes, `pinSuite0:create=${await outcome(clock, ctl.command({ t: "pinSuite0", source: "create" }))}`);
+	count(t.probes, `enableE2ee=${await outcome(clock, ctl.command({ t: "enableE2ee", rk: rk2 }))}`);
+	count(t.probes, `revokeRekey=${await outcome(clock, ctl.command({ t: "revokeRekey", rk: rk3 }))}`);
+	count(t.probes, `secret buffers wiped=${[k, rk, rk2, rk3].every(noBytes)}`);
+	dev.vault.userWrite("typed-after-keys.md", "still blocked\n");
+	await clock.advance(10_000);
+
+	// The case's outcome.
+	const s = ctl.status();
+	count(t.finals, `${ctl.runState().phase}/${s?.phase}/${s?.e2ee?.keyMissing}/suite=${s?.e2ee?.suite}`);
+	for (const st of w.statuses) {
+		if (st.e2ee?.creatable === true) count(t.statusFlags, "creatable");
+		if (st.e2ee?.keyringSeen === true) count(t.statusFlags, "keyringSeen");
+		if (st.e2ee !== undefined && st.e2ee.suite !== null) count(t.statusFlags, `suite=${st.e2ee.suite}`);
+		if (st.phase === "live") count(t.statusFlags, "live");
+	}
+	if (w.statuses.length > 0) count(t.statusFlags, "cases-with-statuses");
+	for (const d of [...w.saved, ctl.data()]) {
+		if (d.e2ee !== undefined) count(t.savedPins, `e2ee=${fp(d.e2ee)}`);
+		if (d.creating !== undefined) count(t.savedPins, "creating");
+	}
+	count(t.savedPins, `identity-keys=${Object.keys(ctl.data().identity ?? {}).sort().join(",") === IDENTITY_KEYS.join(",")}`);
+	for (const [c, n] of w.engineCommands) t.engineCommands.set(c, (t.engineCommands.get(c) ?? 0) + n);
+	for (const [r, n] of requests) t.requests.set(r, (t.requests.get(r) ?? 0) + n);
+	const after = relayState(net);
+	const writes: Record<string, number> = {
+		appends: net.relay.counters().appendFrames - appendsBefore,
+		rowsByJoiner: rowsBy(net, joiner, 0),
+		headDelta: after.head - before.head,
+		checkpointsChanged: after.checkpoints === before.checkpoints ? 0 : 1,
+		blobCalls: [...w.blob.calls.values()].reduce((a, b) => a + b, 0),
+		indexedDbStores: (await dev.storage.listDatabases()).length,
+		sideFileWrites: dev.sideFiles.writes,
+		secretWrites: dev.secrets.writes,
+		secretsHeld: [...dev.secretBacking.values()].filter((v) => v !== "").length,
+		diskNotUsers: [...dev.vault.snapshot().keys()].filter((p) => !["mine.md", "typed-while-blocked.md", "typed-after-keys.md"].includes(p)).length,
+	};
+	for (const [k2, n] of Object.entries(writes)) t.writes.set(k2, (t.writes.get(k2) ?? 0) + n);
+	// The UI layer (read-only here, src/host/ui/**): the status text and the command list of this state.
+	const r = renderStatus(s, ctl.runState());
+	count(t.ui, `tooltip names RK+QR=${/recovery key/i.test(r.tooltip) && /scan/i.test(r.tooltip)}`);
+	count(t.ui, `tooltip offers plaintext/create=${/unencrypt|without encryption|plain|suite|continue|create|turn off/i.test(r.tooltip)}`);
+	const host = { data: () => ctl.data(), status: () => ctl.status(), runState: () => ctl.runState(), brake: () => ctl.brake() };
+	for (const spec of UI_COMMANDS) if (spec.available(host)) count(t.ui, `command:${spec.id}`);
+	await settleOn(clock, ctl.stop());
+	t.cases++;
+}
+
+function hashCase(form: string, state: string, seed: number): number {
+	let h = seed * 7919;
+	for (const ch of `${form}/${state}`) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+	return h;
+}
+
+let joinMatrix: Promise<JoinTallies> | null = null;
+
+/** Every key-less form x vault state x seed, once per file run (b and c read the same tallies). */
+function keylessJoinMatrix(): Promise<JoinTallies> {
+	joinMatrix ??= (async () => {
+		const t: JoinTallies = {
+			cases: 0, finals: new Map(), uiCommands: new Map(), probes: new Map(), engineCommands: new Map(), savedPins: new Map(),
+			statusFlags: new Map(), writes: new Map(), requests: new Map(), ui: new Map(), headZero: 0, headPositive: 0,
+		};
+		for (const seed of JOIN_SEEDS) for (const state of VAULT_STATES) for (const form of JOIN_FORMS) await keylessJoin(form, state, seed, t);
+		return t;
+	})();
+	return joinMatrix;
+}
+
+test("b. hidden k, key-less join: every form x head state x seed ends key-missing/no-pin with zero writes; only installKey (QR, RK) is accepted", async () => {
+	const t = await keylessJoinMatrix();
+	const n = JOIN_FORMS.length * VAULT_STATES.length * JOIN_SEEDS.length;
+	const resumes = VAULT_STATES.length * JOIN_SEEDS.length;
+	assert.equal(t.cases, n);
+	assert.deepEqual([t.headZero, t.headPositive], [n / VAULT_STATES.length, (n * 3) / VAULT_STATES.length], "head = 0 and head > 0");
+	assert.deepEqual(tallyObj(t.finals), { "running/key-missing/no-pin/suite=null": n }, "every case ends blocked, unpinned");
+	assert.deepEqual(tallyObj(t.writes), {
+		appends: 0, rowsByJoiner: 0, headDelta: 0, checkpointsChanged: 0, blobCalls: 0, indexedDbStores: 0,
+		sideFileWrites: 0, secretWrites: 0, secretsHeld: 0, diskNotUsers: 0,
+	}, "zero writes: no frame on any stream, no checkpoint, no blob call, no outbox/ns store, no key, nothing on disk");
+	assert.deepEqual(tallyObj(t.uiCommands), {
+		"pause=ok": n, "resume=ok": n, "reconcileNow=ok": n, "exportDiagnostics=not-ready": n, "exportDiagnostics+paths=not-ready": n,
+		"createSnapshot=not-ready": n, "listSnapshots=not-ready": n, "rebuildLocalCache=ok": n,
+		"cleanUpAttachments=attachmentsCleaned:keys-unverified": n, "restartEngine=key-missing/no-pin": n,
+	}, "no UI command unblocks or writes");
+	// Host/engine layer: the only key actions that go through are the RK and a QR key (both left pending here: k is
+	// hidden). Everything that would set suite 0, enable encryption or re-key is refused on main.
+	assert.deepEqual(tallyObj(t.probes), {
+		"installKey:qr=ok": n, "installKey:rk=ok": n, "pinSuite0:create=refused:not-creating": n,
+		"enableE2ee=refused:not-creating": n, "revokeRekey=refused:not-encrypted": n, "secret buffers wiped=true": n,
+	});
+	assert.deepEqual(tallyObj(t.engineCommands), {
+		pause: n, resume: n, reconcileNow: n, exportDiagnostics: 2 * n, createSnapshot: n, listSnapshots: n,
+		rebuildLocalCache: n, cleanUpAttachments: n, "installKey:qr": n, "installKey:rk": n,
+	}, "no pinSuite0, enableE2ee or revokeRekey reached an engine");
+	assert.deepEqual(tallyObj(t.requests), { "GET /api/capabilities": n - resumes, "POST /enroll": n }, "every form enrolled against the hostile server");
+	// UI layer (read-only, src/host/ui/**): the status tooltip names exactly the two ways out; no palette command
+	// sets a pin, a suite or encryption. The two-button screen itself is WP-E5 (UI-only).
+	const commands = Object.keys(tallyObj(t.ui)).filter((k) => k.startsWith("command:"));
+	assert.deepEqual(commands.filter((c) => /pin\b|suite|e2ee|encrypt|key|plain|unlock|create-vault/.test(c)), []);
+	assert.ok(commands.every((c) => t.ui.get(c) === n));
+	assert.equal(t.ui.get("tooltip names RK+QR=true"), n);
+	assert.equal(t.ui.get("tooltip offers plaintext/create=false"), n);
+});
+
+test("c. the pin never comes from the server: over every key-less join, 0 suite-0 pins, 0 creatable; every pin setter is main's", async () => {
+	const t = await keylessJoinMatrix();
+	const n = t.cases;
+	assert.ok(n > 0);
+	// Dynamic: what the hostile server sent (suite 0, creating, creatable, keyringSeen=false on every answer) set nothing.
+	assert.deepEqual(tallyObj(t.savedPins), { "identity-keys=true": n }, "no e2ee or creating field was ever saved; identity has its six fields only");
+	assert.deepEqual(tallyObj(t.statusFlags), { "cases-with-statuses": n }, "0 creatable, 0 keyringSeen, 0 suite != null, 0 live statuses");
+	assert.equal(t.engineCommands.get("pinSuite0:link") ?? 0, 0);
+	assert.equal(t.engineCommands.get("pinSuite0:create") ?? 0, 0);
+
+	// Static: every path that can set a pin, counted in the shipped sources (comments stripped; tests, testkits, spike out).
+	const census = pinCensus();
+	assert.deepEqual(census, {
+		// pluginController.ts: onStatus keyringSeen (:188), pinAfter (:295 pinSuite0 / enableE2ee ok), keyringStored (:308),
+		// markCreating (:347, no production caller).
+		"call:sawKeyring": { "host/pluginController.ts": 1 },
+		"call:pinnedSuite0": { "host/pluginController.ts": 1 },
+		"call:pinnedSuite1": { "host/pluginController.ts": 2 },
+		"call:markedCreating": { "host/pluginController.ts": 1 },
+		"call:withPin": { "host/keys/pin.ts": 2 },
+		// Pin-shaped writes: pin.ts withPin / sawKeyring / pinAcross; api.ts the data.json loader (sanitizePin).
+		"e2ee-write": { "host/keys/pin.ts": 3, "host/ui/api.ts": 1 },
+		"creating-write": { "host/keys/pin.ts": 1 },
+		saveData: { "host/pluginController.ts": 2, "host/plugin.ts": 1 },
+	}, "no other pin setter, and no production code builds a pinSuite0/enableE2ee/installKey/revokeRekey command or calls markCreating");
+});
+
+// --- shared: a paired, unpinned controller device ------------------------------------------------------------
+
+const J_ID = "dev-J" as DeviceId;
+const OTHER_VAULT = "otherVaultBBBBBBBBBBBA"; // canonical: 22 chars, last one carries no stray bits
+const SEEDS = [1, 2, 3] as const;
+
+function pairedData(deviceId: string = J_ID, extra: Partial<YaosPluginData> = {}): YaosPluginData {
+	// The token is a fixed test value; it is never printed.
+	return { ...defaultPluginData("J"), identity: { host: HOST, vaultId: SIM_VAULT_ID, deviceId, deviceToken: "test-token-J", deviceName: "J", vaultGeneration: null }, ...extra };
+}
+
+const blockedOn = (ctl: YaosController, reason: string) => (): boolean => {
+	const s = ctl.status();
+	return ctl.runState().phase === "running" && s?.phase === "key-missing" && s.e2ee?.keyMissing === reason && s.relay.connected === true;
+};
+
+/** A peer appends `payload` to `stream` (a forged or honest frame from another device). */
+async function peerAppends(clock: VirtualClock, net: SimNet, name: string, stream: StreamName, payload: Uint8Array): Promise<void> {
+	const peer = await connectPeer(net.relay, clock, `dev-${name}`);
+	peer.session.append(frame(stream, `${name}-${stream}-${clock.now()}`, payload));
+	await clock.advance(1_000);
+}
+
+/** Every relay write the device could make, as counts (0 = none). */
+async function writesOf(net: SimNet, w: ControllerWorld, deviceIds: readonly string[], since: { head: number; appends: number; checkpoints: string }): Promise<Record<string, number>> {
+	const now = relayState(net);
+	return {
+		rows: deviceIds.reduce((n, id) => n + rowsBy(net, id as DeviceId, 0), 0),
+		appends: net.relay.counters().appendFrames - since.appends,
+		headDelta: now.head - since.head,
+		checkpointsChanged: now.checkpoints === since.checkpoints ? 0 : 1,
+		blobCalls: [...w.blob.calls.values()].reduce((a, b) => a + b, 0),
+		indexedDbStores: (await w.dev.storage.listDatabases()).length,
+		secretWrites: w.dev.secrets.writes,
+		secretsHeld: [...w.dev.secretBacking.values()].filter((v) => v !== "").length,
+	};
+}
+
+function sumInto(t: Map<string, number>, r: Record<string, number>): void {
+	for (const [k, n] of Object.entries(r)) t.set(k, (t.get(k) ?? 0) + n);
+}
+
+const ZERO_WRITES = { rows: 0, appends: 0, headDelta: 0, checkpointsChanged: 0, blobCalls: 0, indexedDbStores: 0, secretWrites: 0, secretsHeld: 0 };
+
+/** suite=0 link shapes as Obsidian hands them to the protocol handler (registerUi.ts:156): all must be refused. */
+function suite0LinkParams(code: string): Record<string, string>[] {
+	const base = { action: "setup", host: HOST, pairingCode: code };
+	return [
+		{ ...base, suite: "0" },
+		{ ...base, action: "yaos", suite: "0" },
+		{ ...base, vault: "My vault", suite: "0" },
+		{ ...base, e2ee: "0" },
+		{ ...base, e2ee: "off" },
+		{ host: HOST, pairingCode: code, suite: "0" },
+	];
+}
+
+// --- d. suite-0 link after a genesis ------------------------------------------------------------------------
+
+test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refused at every layer, nothing is written", async () => {
+	const t = { cases: 0, outcomes: new Map<string, number>(), links: new Map<string, number>(), writes: new Map<string, number>(), pins: new Map<string, number>() };
+	for (const seed of SEEDS) for (const mode of ["live", "history"] as const) {
+		const clock = newClock();
+		const net = new SimNet(clock, { seed: seed * 17 + (mode === "live" ? 1 : 2), linkMs: 10 });
+		const genesis = await genesisFor(SIM_VAULT_ID);
+		if (mode === "history") await peerAppends(clock, net, "G", KEYRING_STREAM, genesis);
+		const w = controllerWorld(clock, net, pairedData());
+		const { ctl, dev } = w;
+		dev.vault.userWrite("mine.md", "local only\n");
+		void ctl.start();
+		if (mode === "live") {
+			assert.ok(await clock.runUntil(blockedOn(ctl, "no-pin"), 60_000), "blocked before the genesis");
+			await peerAppends(clock, net, "G", KEYRING_STREAM, genesis);
+		}
+		assert.ok(await clock.runUntil(blockedOn(ctl, "encrypted-vault"), 60_000), `${mode}: encrypted-vault`);
+		await clock.advance(1_000);
+		count(t.pins, `after genesis=${fp(ctl.data().e2ee)}`);
+		const since = { ...relayState(net), appends: net.relay.counters().appendFrames };
+
+		// The server now hides k and cuts the session; the device reconnects to an "empty" k.
+		net.relay.hideFrom(J_ID, KEYRING_STREAM);
+		net.relay.dropSession(J_ID);
+		await clock.advance(500);
+		assert.ok(await clock.runUntil(() => ctl.status()?.relay.connected === true && ctl.status()?.phase === "key-missing", 60_000), "reconnected");
+		await clock.advance(3_000);
+		count(t.outcomes, `reconnected, k hidden: keyMissing=${ctl.status()?.e2ee?.keyMissing} keyringSeen(engine)=${ctl.status()?.e2ee?.keyringSeen}`);
+		dev.vault.userWrite("typed.md", "typed while blocked\n");
+		await clock.advance(3_000);
+
+		// The suite=0 link arrives. The protocol handler's parser refuses it (pairing.ts:503-507: unknown keys).
+		const rng = new SeededRandom(seed * 1_000 + (mode === "live" ? 1 : 2));
+		const code = `${SIM_VAULT_ID}.${base64Url(rng.bytes(24))}`;
+		for (const params of suite0LinkParams(code)) count(t.links, parseSetupLink(params).ok ? "accepted" : "rejected");
+		// What any UI would turn it into: pinSuite0 {link}. Main refuses on keyringSeen (pin.ts:68-71) ...
+		count(t.outcomes, `ctl pinSuite0 link=${await outcome(clock, ctl.command({ t: "pinSuite0", source: "link" }))}`);
+		// ... and so does this engine incarnation, which read the genesis before k was hidden (keyReader.ts:229).
+		count(t.outcomes, `engine-direct pinSuite0 link (same incarnation)=${await outcome(clock, w.direct({ t: "pinSuite0", source: "link" }))}`);
+		// The UI cannot clear the sticky flag (pinAcross keeps main's pin fields, pin.ts:140-146).
+		await settleOn(clock, ctl.updateData((d) => ({ ...d, e2ee: undefined, deviceLabel: "J2" })));
+		await settleOn(clock, ctl.updateData((d) => ({ ...d, e2ee: { suite: 0 } })));
+		count(t.pins, `after UI writes=${fp(ctl.data().e2ee)}`);
+
+		// Re-pair by a key-less link into the same vault (fresh deviceId): keyringSeen survives (same vault).
+		const requests = new Map<string, number>();
+		const session = new PairingSession({
+			request: hostileServer(requests), randomBytes: (n) => rng.bytes(n),
+			persist: (a) => (a && net.relay.hideFrom(a.deviceId as DeviceId, KEYRING_STREAM), ctl.updateData((d) => (a ? setPendingEnrollment(d, a) : withoutPendingEnrollment(d)))),
+		});
+		const repaired = await settleOn(clock, session.submit(joinInput("console-link", code)));
+		assert.ok(repaired.ok, "re-paired");
+		await settleOn(clock, ctl.updateData((d) => applyPairedIdentity(d, repaired.value)));
+		const newId = ctl.data().identity!.deviceId;
+		assert.notEqual(newId, J_ID);
+		assert.ok(await clock.runUntil(() => ctl.status()?.relay.connected === true && ctl.status()?.phase === "key-missing" && ctl.runState().phase === "running", 60_000), "re-paired, blocked");
+		await clock.advance(2_000);
+		count(t.pins, `after re-pair=${fp(ctl.data().e2ee)}`);
+		count(t.outcomes, `ctl pinSuite0 link after re-pair=${await outcome(clock, ctl.command({ t: "pinSuite0", source: "link" }))}`);
+		// A restart: the engine is not told keyringSeen (e2ee-design.md §18.4 "keyringSeen is not in init.crypto", hostKeys.ts:48); main stays the gate.
+		await settleOn(clock, ctl.restartEngine());
+		assert.ok(await clock.runUntil(() => ctl.status()?.relay.connected === true && ctl.status()?.phase === "key-missing" && ctl.runState().phase === "running", 60_000));
+		await clock.advance(2_000);
+		count(t.outcomes, `ctl pinSuite0 link after restart=${await outcome(clock, ctl.command({ t: "pinSuite0", source: "link" }))}`);
+		count(t.outcomes, `engine-direct pinSuite0 link after restart=${await outcome(clock, w.direct({ t: "pinSuite0", source: "link" }))}`);
+		count(t.outcomes, `final=${ctl.status()?.phase}/suite=${ctl.status()?.e2ee?.suite}`);
+		dev.vault.userWrite("typed-2.md", "still blocked\n");
+		await clock.advance(5_000);
+		count(t.pins, `final=${fp(ctl.data().e2ee)}`);
+		for (const d of w.saved) if (d.e2ee?.suite === 0 || d.e2ee?.suite === 1) count(t.pins, "saved suite pin");
+		if (w.statuses.some((st) => st.e2ee?.suite !== null && st.e2ee?.suite !== undefined)) count(t.pins, "status with a suite");
+		sumInto(t.writes, await writesOf(net, w, [J_ID, newId], since));
+		await settleOn(clock, ctl.stop());
+		t.cases++;
+	}
+	const n = SEEDS.length * 2;
+	assert.equal(t.cases, n);
+	const seen = fp({ suite: null, keyringSeen: true });
+	assert.deepEqual(tallyObj(t.pins), { [`after genesis=${seen}`]: n, [`after UI writes=${seen}`]: n, [`after re-pair=${seen}`]: n, [`final=${seen}`]: n }, "keyringSeen saved and sticky; no suite pin saved or reported");
+	assert.deepEqual(tallyObj(t.links), { rejected: n * suite0LinkParams("x").length }, "every suite=0 link shape is rejected by the parser");
+	assert.deepEqual(tallyObj(t.outcomes), {
+		"reconnected, k hidden: keyMissing=encrypted-vault keyringSeen(engine)=true": n,
+		"ctl pinSuite0 link=refused:keyring-seen": n,
+		"engine-direct pinSuite0 link (same incarnation)=engine:refused": n,
+		"ctl pinSuite0 link after re-pair=refused:keyring-seen": n,
+		"ctl pinSuite0 link after restart=refused:keyring-seen": n,
+		// By design the restarted engine does not know keyringSeen (e2ee-design.md §18.4 "keyringSeen is not in init.crypto"): an engine "ok" sets nothing,
+		// only main pins (pluginController.ts:267 -> pinAfter :294-299), and main refused above.
+		"engine-direct pinSuite0 link after restart=ok": n,
+		"final=key-missing/suite=null": n,
+	});
+	assert.deepEqual(tallyObj(t.writes), ZERO_WRITES, "nothing written after the genesis was read");
+});
+
+// --- e. the creation path ------------------------------------------------------------------------------------
+
+/** What a hostile server returns after the creation call: a vault that is not empty (head > 0 or k non-empty). */
+const NOT_EMPTY = ["suite0-data", "forged-body-row", "visible-genesis", "garbage-k-row", "hidden-genesis"] as const;
+
+async function notEmptyVault(clock: VirtualClock, net: SimNet, state: (typeof NOT_EMPTY)[number]): Promise<void> {
+	switch (state) {
+		case "suite0-data":
+			return void (await prepareVault(clock, net, "suite0-data"));
+		case "forged-body-row": {
+			const docId = newDocId(new SeededRandom(5));
+			return peerAppends(clock, net, "F", bodyStream(docId), enc.encode(`${MARK} body`));
+		}
+		case "visible-genesis":
+			return peerAppends(clock, net, "G", KEYRING_STREAM, await genesisFor(SIM_VAULT_ID));
+		case "garbage-k-row":
+			return peerAppends(clock, net, "G", KEYRING_STREAM, new SeededRandom(9).bytes(180));
+		case "hidden-genesis":
+			await peerAppends(clock, net, "G", KEYRING_STREAM, await genesisFor(SIM_VAULT_ID));
+			return net.relay.hideFrom(J_ID, KEYRING_STREAM);
+	}
+}
+
+test("e. creation path: a non-empty vault never becomes creatable; a marker for another vault is ignored; no link reaches the flow", async () => {
+	const t = { outcomes: new Map<string, number>(), flags: new Map<string, number>(), writes: new Map<string, number>(), links: new Map<string, number>(), pins: new Map<string, number>() };
+	const probe = async (label: string, clock: VirtualClock, w: ControllerWorld): Promise<void> => {
+		const rk = seededRk(new SeededRandom(clock.now() + 1));
+		count(t.outcomes, `${label}: enableE2ee=${await outcome(clock, w.ctl.command({ t: "enableE2ee", rk }))}`);
+		count(t.outcomes, `${label}: pinSuite0 create=${await outcome(clock, w.ctl.command({ t: "pinSuite0", source: "create" }))}`);
+		count(t.outcomes, `${label}: rk zero-filled=${noBytes(rk)}`);
+	};
+	const creatableSeen = (w: ControllerWorld): number => w.statuses.filter((st) => st.e2ee?.creatable === true).length;
+
+	for (const seed of SEEDS) {
+		// (1) The marker names this vault, the server returns a vault that is not empty: abort, no pin, no write.
+		for (const state of NOT_EMPTY) {
+			const clock = newClock();
+			const net = new SimNet(clock, { seed: seed * 31 + NOT_EMPTY.indexOf(state), linkMs: 10 });
+			await notEmptyVault(clock, net, state);
+			const w = controllerWorld(clock, net, pairedData(J_ID, { creating: { vaultId: SIM_VAULT_ID } }));
+			w.dev.vault.userWrite("mine.md", "local\n");
+			const since = { ...relayState(net), appends: net.relay.counters().appendFrames };
+			void w.ctl.start();
+			assert.ok(await clock.runUntil(() => w.ctl.status()?.phase === "key-missing" && w.ctl.status()?.relay.connected === true, 60_000), state);
+			await clock.advance(3_000);
+			count(t.flags, `not-empty: creatable statuses=${creatableSeen(w)}`);
+			await probe("not-empty", clock, w);
+			await clock.advance(3_000);
+			count(t.pins, `not-empty: ${fp(w.ctl.data().e2ee ?? null)}`);
+			sumInto(t.writes, await writesOf(net, w, [J_ID], since));
+			await settleOn(clock, w.ctl.stop());
+		}
+
+		// (2) A creating marker for another vaultId, over an empty vault (head 0, k empty: only the marker decides).
+		for (const how of ["in data.json before pairing", "in data.json while paired", "markCreating while paired"] as const) {
+			const clock = newClock();
+			const net = new SimNet(clock, { seed: seed * 37 + how.length, linkMs: 10 });
+			const other = { creating: { vaultId: OTHER_VAULT } };
+			const w = controllerWorld(clock, net, how === "in data.json before pairing" ? { ...defaultPluginData("J"), ...other } : pairedData(J_ID, how === "in data.json while paired" ? other : {}));
+			const since = { ...relayState(net), appends: net.relay.counters().appendFrames };
+			await settleOn(clock, w.ctl.start());
+			if (how === "in data.json before pairing") {
+				const rng = new SeededRandom(seed);
+				const session = new PairingSession({ request: hostileServer(new Map()), randomBytes: (n) => rng.bytes(n), persist: (a) => w.ctl.updateData((d) => (a ? setPendingEnrollment(d, a) : withoutPendingEnrollment(d))) });
+				const id = await settleOn(clock, session.submit(joinInput("typed", `${SIM_VAULT_ID}.${base64Url(rng.bytes(24))}`)));
+				assert.ok(id.ok);
+				await settleOn(clock, w.ctl.updateData((d) => applyPairedIdentity(d, id.value)));
+			}
+			if (how === "markCreating while paired") {
+				assert.ok((await settleOn(clock, w.ctl.markCreating(OTHER_VAULT))).ok, "marked");
+				await settleOn(clock, w.ctl.restartEngine());
+			}
+			assert.ok(await clock.runUntil(blockedOn(w.ctl, "no-pin"), 60_000), how);
+			await clock.advance(3_000);
+			count(t.flags, `other-vault marker: creatable statuses=${creatableSeen(w)}`);
+			count(t.flags, `other-vault marker: kept=${w.ctl.data().creating?.vaultId === OTHER_VAULT}`);
+			await probe("other-vault marker", clock, w);
+			count(t.pins, `other-vault marker: ${fp(w.ctl.data().e2ee ?? null)}`);
+			const ids = [J_ID, w.ctl.data().identity!.deviceId];
+			sumInto(t.writes, await writesOf(net, w, ids, since));
+			await settleOn(clock, w.ctl.stop());
+		}
+
+		// (3) The UI (or a hostile data.json write through updateData) cannot set the marker or a pin (pinAcross).
+		{
+			const clock = newClock();
+			const net = new SimNet(clock, { seed: seed * 41, linkMs: 10 });
+			const w = controllerWorld(clock, net, pairedData());
+			await settleOn(clock, w.ctl.start());
+			assert.ok(await clock.runUntil(blockedOn(w.ctl, "no-pin"), 60_000));
+			for (const forged of [{ creating: { vaultId: SIM_VAULT_ID } }, { e2ee: { suite: 0 as const } }, { e2ee: { suite: 1 as const } }, { e2ee: { suite: 0 as const }, creating: { vaultId: SIM_VAULT_ID } }]) {
+				await settleOn(clock, w.ctl.updateData((d) => ({ ...d, ...forged, deviceLabel: `J${clock.now()}` })));
+				count(t.pins, `UI write dropped=${w.ctl.data().e2ee === undefined && w.ctl.data().creating === undefined}`);
+			}
+			await clock.advance(3_000);
+			count(t.flags, `UI writes: creatable statuses=${creatableSeen(w)}`);
+			await probe("UI writes", clock, w);
+			await settleOn(clock, w.ctl.stop());
+		}
+
+		// Positive control: the marker for this vault over an empty vault is creatable (the refusals above are not vacuous).
+		{
+			const clock = newClock();
+			const net = new SimNet(clock, { seed: seed * 43, linkMs: 10 });
+			const w = controllerWorld(clock, net, pairedData(J_ID, { creating: { vaultId: SIM_VAULT_ID } }));
+			await settleOn(clock, w.ctl.start());
+			assert.ok(await clock.runUntil(() => w.ctl.status()?.e2ee?.creatable === true, 60_000), "control: creatable");
+			count(t.flags, "control: creatable");
+			await settleOn(clock, w.ctl.stop());
+		}
+	}
+
+	// (4) No link reaches the flow: the protocol handler parses with parseSetupLink and only opens the pair modal
+	// prefilled (registerUi.ts:156-163, openPair :76-79); nothing outside tests calls markCreating (c's census).
+	const rng = new SeededRandom(77);
+	const code = `${SIM_VAULT_ID}.${base64Url(rng.bytes(24))}`;
+	const base = { action: "setup", host: HOST, pairingCode: code };
+	const hostile: Record<string, string>[] = [
+		{ ...base, action: "create" }, { ...base, action: "claim" }, { ...base, action: "new-vault" }, { ...base, action: "enable-e2ee" },
+		{ ...base, create: "1" }, { ...base, creating: SIM_VAULT_ID }, { ...base, vaultId: SIM_VAULT_ID }, { ...base, e2ee: "1" },
+		{ ...base, suite: "1" }, { ...base, key: "AAAA" }, { ...base, rk: "AAAA" }, { ...base, deviceToken: "x" }, { ...base, operatorKey: "x" },
+	];
+	for (const params of hostile) count(t.links, `hostile=${parseSetupLink(params).ok ? "accepted" : "rejected"}`);
+	for (const params of [base, { ...base, action: "yaos" }, { ...base, vault: "My vault" }]) {
+		const r = parseSetupLink(params);
+		count(t.links, `honest=${r.ok ? Object.keys(r).sort().join(",") : "rejected"}`);
+	}
+	const handler = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../host/ui/registerUi.ts"), "utf8");
+	const at = handler.indexOf('registerObsidianProtocolHandler("yaos"');
+	const body = handler.slice(at, handler.indexOf("\n\t});", at));
+	assert.match(body, /parseSetupLink\(params\)/);
+	assert.match(body, /openPair\(\{ host: parsed\.host, pairingCode: parsed\.pairingCode \}\)/);
+	assert.doesNotMatch(body, /markCreating|creating|enableE2ee|pinSuite0|e2ee|suite/, "the handler touches no pin and no creation flow");
+	assert.equal(pinCensus().markCreating, undefined, "markCreating has no production caller");
+
+	const n = SEEDS.length;
+	const nNot = n * NOT_EMPTY.length;
+	const nOther = n * 3;
+	assert.deepEqual(tallyObj(t.flags), {
+		"not-empty: creatable statuses=0": nNot, "other-vault marker: creatable statuses=0": nOther, "other-vault marker: kept=true": n * 2,
+		"other-vault marker: kept=false": n, "UI writes: creatable statuses=0": n, "control: creatable": n,
+	}, "creatable never true except the control; the marker for another vault is dropped on pairing into this one, else ignored");
+	assert.deepEqual(tallyObj(t.outcomes), {
+		"not-empty: enableE2ee=engine:refused": nNot, "not-empty: pinSuite0 create=engine:refused": nNot, "not-empty: rk zero-filled=true": nNot,
+		"other-vault marker: enableE2ee=refused:not-creating": nOther, "other-vault marker: pinSuite0 create=refused:not-creating": nOther, "other-vault marker: rk zero-filled=true": nOther,
+		"UI writes: enableE2ee=refused:not-creating": n, "UI writes: pinSuite0 create=refused:not-creating": n, "UI writes: rk zero-filled=true": n,
+	});
+	assert.deepEqual(tallyObj(t.pins), {
+		"not-empty: null": nNot - n, [`not-empty: ${fp({ suite: null, keyringSeen: true })}`]: n,
+		"other-vault marker: null": nOther, "UI write dropped=true": n * 4,
+	}, "no pin (the visible genesis records keyringSeen; a garbage k row is not a genesis)");
+	assert.deepEqual(tallyObj(t.writes), ZERO_WRITES);
+	assert.deepEqual(tallyObj(t.links), { "hostile=rejected": hostile.length, "honest=host,ok,pairingCode": 3 }, "a link carries only a host and a code");
+});
+
+// --- f. an unverified key ------------------------------------------------------------------------------------
+
+interface KeyCase {
+	readonly name: string;
+	/** k on the relay: nothing, records visible to the device, or records hidden from it. */
+	readonly k: () => Promise<{ readonly records: readonly Uint8Array[]; readonly hidden: boolean }>;
+	readonly key: () => UserCommand & { t: "installKey" };
+	/** The case has a matching record behind the hiding: unhiding it must pin suite 1 (the control). */
+	readonly control?: boolean;
+}
+
+const KEY_CASES: readonly KeyCase[] = [
+	{ name: "qr, empty k", k: async () => ({ records: [], hidden: false }), key: () => ({ t: "installKey", source: "qr", e: 1, k: K(1).slice() }) },
+	{ name: "qr, genuine genesis hidden", k: async () => ({ records: [await genesisFor(SIM_VAULT_ID)], hidden: true }), key: () => ({ t: "installKey", source: "qr", e: 1, k: K(1).slice() }), control: true },
+	{ name: "qr, garbage k row", k: async () => ({ records: [new SeededRandom(3).bytes(200)], hidden: false }), key: () => ({ t: "installKey", source: "qr", e: 1, k: K(1).slice() }) },
+	{ name: "qr, genesis for another vault", k: async () => ({ records: [await genesisFor(OTHER_VAULT)], hidden: false }), key: () => ({ t: "installKey", source: "qr", e: 1, k: K(1).slice() }) },
+	{ name: "qr, other key for the genesis epoch", k: async () => ({ records: [await genesisFor(SIM_VAULT_ID)], hidden: false }), key: () => ({ t: "installKey", source: "qr", e: 1, k: K(2).slice() }) },
+	{ name: "qr, epoch with no record", k: async () => ({ records: [await genesisFor(SIM_VAULT_ID)], hidden: false }), key: () => ({ t: "installKey", source: "qr", e: 2, k: K(2).slice() }) },
+	{ name: "qr, forged genesis (attacker RK and key)", k: async () => ({ records: [await genesisFor(SIM_VAULT_ID, RK_B, FORGED(1))], hidden: false }), key: () => ({ t: "installKey", source: "qr", e: 1, k: K(1).slice() }) },
+	{ name: "rk, other recovery key", k: async () => ({ records: [await genesisFor(SIM_VAULT_ID)], hidden: false }), key: () => ({ t: "installKey", source: "rk", rk: RK_B.slice() }) },
+	{ name: "rk, genuine genesis hidden", k: async () => ({ records: [await genesisFor(SIM_VAULT_ID)], hidden: true }), key: () => ({ t: "installKey", source: "rk", rk: RK_A.slice() }), control: true },
+];
+
+test("f. unverified key: a QR key (or RK) with no matching k record leaves the device unpinned and persists nothing", async () => {
+	const t = { outcomes: new Map<string, number>(), state: new Map<string, number>(), writes: new Map<string, number>(), control: new Map<string, number>() };
+	for (const seed of SEEDS) for (const kc of KEY_CASES) for (const restart of [false, true]) {
+		const clock = newClock();
+		const net = new SimNet(clock, { seed: seed * 53 + KEY_CASES.indexOf(kc) * 2 + (restart ? 1 : 0), linkMs: 10 });
+		const k = await kc.k();
+		for (const r of k.records) await peerAppends(clock, net, "G", KEYRING_STREAM, r);
+		if (k.hidden) net.relay.hideFrom(J_ID, KEYRING_STREAM);
+		const w = controllerWorld(clock, net, pairedData());
+		w.dev.vault.userWrite("mine.md", "local\n");
+		const since = { ...relayState(net), appends: net.relay.counters().appendFrames };
+		void w.ctl.start();
+		assert.ok(await clock.runUntil(() => w.ctl.status()?.phase === "key-missing" && w.ctl.status()?.relay.connected === true, 60_000), kc.name);
+		await clock.advance(2_000);
+		const cmd = kc.key();
+		const buf = cmd.source === "qr" ? cmd.k : cmd.rk;
+		count(t.outcomes, `${kc.name}=${await outcome(clock, w.ctl.command(cmd))}`);
+		count(t.outcomes, `key bytes left on main=${!noBytes(buf)}`);
+		w.dev.vault.userWrite("typed.md", "typed\n");
+		await clock.advance(5_000);
+		if (restart) {
+			await settleOn(clock, w.ctl.restartEngine());
+			assert.ok(await clock.runUntil(() => w.ctl.status()?.phase === "key-missing" && w.ctl.status()?.relay.connected === true, 60_000));
+			await clock.advance(2_000);
+		}
+		const s = w.ctl.status();
+		count(t.state, `${s?.phase}/suite=${s?.e2ee?.suite}/pin=${w.ctl.data().e2ee?.suite ?? "none"}`);
+		for (const d of w.saved) if (d.e2ee?.suite === 0 || d.e2ee?.suite === 1) count(t.state, "saved suite pin");
+		sumInto(t.writes, await writesOf(net, w, [J_ID], since));
+		// Control: the same device sees the matching record once the server stops hiding it. Without a restart the
+		// pending key verifies and pins suite 1 (so "nothing persisted" above was the missing record, not a broken
+		// path); after a restart the pending key is gone, because it was never persisted.
+		if (kc.control) {
+			net.relay.unhideFrom(J_ID, KEYRING_STREAM);
+			net.relay.dropSession(J_ID);
+			await clock.runUntil(() => w.ctl.data().e2ee?.suite === 1, 30_000);
+			await clock.advance(2_000);
+			count(t.control, `${restart ? "after restart" : "same engine"}: pin=${w.ctl.data().e2ee?.suite ?? "none"} keyStored=${w.dev.secrets.writes > 0}`);
+		}
+		await settleOn(clock, w.ctl.stop());
+	}
+	const n = SEEDS.length * 2;
+	const qrCases = KEY_CASES.length;
+	assert.deepEqual(tallyObj(t.outcomes), {
+		"qr, empty k=ok": n, "qr, genuine genesis hidden=ok": n, "qr, garbage k row=ok": n, "qr, genesis for another vault=ok": n,
+		"qr, other key for the genesis epoch=ok": n, "qr, epoch with no record=ok": n, "qr, forged genesis (attacker RK and key)=ok": n,
+		"rk, other recovery key=ok": n, "rk, genuine genesis hidden=ok": n,
+		"key bytes left on main=false": qrCases * n,
+	}, "every key is held pending, unverified: \"conflict\" is only against a verified key (webCryptoSuite1.ts:167); a record whose kcv does not match the QR key is judged invalid (evaluate.ts:72-75). Main never keeps the key bytes");
+	assert.deepEqual(tallyObj(t.state), { "key-missing/suite=null/pin=none": qrCases * n }, "every case stays unpinned and blocked");
+	assert.deepEqual(tallyObj(t.writes), ZERO_WRITES, "SecretStorage writes 0, nothing held, nothing written");
+	assert.deepEqual(tallyObj(t.control), { "same engine: pin=1 keyStored=true": 2 * SEEDS.length, "after restart: pin=none keyStored=false": 2 * SEEDS.length });
+});
+
+// --- g. a suite-0 device that sees a k genesis ----------------------------------------------------------------
+
+interface SealTally {
+	total: number;
+	/** Seals that reached the raw port while the write gate was shut (a bypass of writeGate.ts). */
+	whileShut: number;
+	/** Seals after this device first reported "encrypted-vault" (sticky across restarts and wipes). */
+	afterSeen: number;
+	/** Seals after the genesis was on the relay but before the device had read it. */
+	beforeSeen: number;
+	beforeGenesis: number;
+	seen: boolean;
+	genesisOnRelay: boolean;
+}
+
+/** Wraps the seal and sealBlob of the device's raw crypto port (behind gatedCrypto, context.ts:117) once per engine. */
+function tapSeals(d: SimDevice, t: SealTally, tapped: WeakSet<object>): void {
+	const c = d.vrt?.log.c;
+	if (!c) return;
+	const port = c.gateCtx.crypto as CryptoPort;
+	if (tapped.has(port)) return;
+	tapped.add(port);
+	const note = (): void => {
+		t.total++;
+		if (c.gate() !== null) t.whileShut++;
+		if (c.keyring?.keyMissing() === "encrypted-vault") t.seen = true;
+		if (t.seen) t.afterSeen++;
+		else if (t.genesisOnRelay) t.beforeSeen++;
+		else t.beforeGenesis++;
+	};
+	const seal = port.seal.bind(port);
+	const sealBlob = port.sealBlob.bind(port);
+	(port as { seal: CryptoPort["seal"] }).seal = async (input) => (note(), seal(input));
+	(port as { sealBlob: CryptoPort["sealBlob"] }).sealBlob = async (input) => (note(), sealBlob(input));
+}
+
+const G_CASES = ["live, typing through the genesis", "offline, genesis, reconnect", "offline edits, genesis, reconnect", "restart after the genesis", "wipe and restart after the genesis", "fresh suite-0 device, genesis already there"] as const;
+
+test("g. a suite-0 device that sees a k genesis stops with encrypted-vault and issues no seal", async () => {
+	const t = { cases: 0, finals: new Map<string, number>(), seals: new Map<string, number>(), rows: new Map<string, number>() };
+	for (const seed of SEEDS) for (const gc of G_CASES) {
+		const clock = newClock();
+		const net = new SimNet(clock, { seed: seed * 59 + G_CASES.indexOf(gc), linkMs: 10, jitterMs: 5 });
+		const tally: SealTally = { total: 0, whileShut: 0, afterSeen: 0, beforeSeen: 0, beforeGenesis: 0, seen: false, genesisOnRelay: false };
+		const tapped = new WeakSet<object>();
+		const fresh = gc === "fresh suite-0 device, genesis already there";
+		const writer = new SimDevice({ name: fresh ? "W" : "A", clock, net }); // suite-0 fixture pin
+		writer.vault.userWrite("notes/a.md", "a\n");
+		void writer.start();
+		assert.ok(await clock.runUntil(() => isLive(writer) && writer.vrt?.log.isIdle() === true && net.relay.rows(NS_STREAM).length > 0, 60_000), "suite-0 vault live");
+		const d = fresh ? new SimDevice({ name: "A", clock, net }) : writer;
+		if (fresh) writer.crashApp();
+		const drive = async (ms: number, until?: () => boolean): Promise<boolean> =>
+			clock.runUntil(() => {
+				tapSeals(d, tally, tapped);
+				if (keyMissing(d) === "encrypted-vault") tally.seen = true;
+				return until?.() ?? false;
+			}, ms);
+		let typed = 0;
+		const type = (): void => d.vault.userWrite(`typed/${typed++}.md`, `typed ${typed}\n`);
+		// G connects first; the genesis is appended between two clock steps, and from that call on a seal counts as
+		// "after the genesis landed" (conservative: it reaches the relay one link later).
+		const genesisBytes = await genesisFor(SIM_VAULT_ID);
+		const peer = await connectPeer(net.relay, clock, "dev-G");
+		const appendGenesis = (): void => {
+			peer.session.append(frame(KEYRING_STREAM, "g-genesis", genesisBytes));
+			tally.genesisOnRelay = true;
+		};
+		switch (gc) {
+			case "live, typing through the genesis": {
+				await drive(2_000);
+				for (let i = 0; i < 6; i++) (type(), await drive(300));
+				appendGenesis();
+				for (let i = 0; i < 20; i++) (type(), await drive(i < 10 ? 7 : 250)); // edits inside the link delay too
+				break;
+			}
+			case "offline, genesis, reconnect":
+			case "offline edits, genesis, reconnect":
+				await drive(2_000);
+				d.setOnline(false);
+				await drive(1_000);
+				if (gc === "offline edits, genesis, reconnect") for (let i = 0; i < 5; i++) (type(), await drive(500));
+				appendGenesis();
+				await drive(1_000);
+				d.setOnline(true);
+				for (let i = 0; i < 10; i++) (type(), await drive(400));
+				break;
+			case "restart after the genesis":
+			case "wipe and restart after the genesis":
+				await drive(2_000);
+				appendGenesis();
+				assert.ok(await drive(60_000, () => tally.seen), "saw the genesis before the restart");
+				if (gc === "restart after the genesis") await settleOn(clock, d.runtime.stop());
+				d.crashApp({ wipe: gc === "wipe and restart after the genesis" });
+				await drive(1_000);
+				type();
+				void d.restartApp();
+				for (let i = 0; i < 10; i++) (type(), await drive(400));
+				break;
+			case "fresh suite-0 device, genesis already there":
+				appendGenesis();
+				await drive(1_000);
+				d.vault.userWrite("mine.md", "local\n");
+				void d.start();
+				for (let i = 0; i < 10; i++) (type(), await drive(400));
+				break;
+		}
+		assert.ok(await drive(60_000, () => tally.seen && keyMissing(d) === "encrypted-vault"), `${gc}: encrypted-vault`);
+		const seenSeq = net.relay.head();
+		const genesisSeq = net.relay.rows(KEYRING_STREAM)[0]!.seq;
+		for (let i = 0; i < 10; i++) (type(), await drive(500));
+		d.platform.emit("visible");
+		await drive(10_000);
+		count(t.finals, `${lastStatus(d)?.phase}/${keyMissing(d)}/suite=${e2eeOf(d)?.suite}`);
+		count(t.finals, `k rows=${net.relay.rows(KEYRING_STREAM).length}`);
+		sumInto(t.seals, { whileShut: tally.whileShut, afterSeen: tally.afterSeen });
+		sumInto(t.rows, {
+			"rows by A after it reported encrypted-vault": rowsBy(net, d.deviceId, seenSeq),
+			"k rows by A": net.relay.rows(KEYRING_STREAM).filter((r) => r.deviceId === d.deviceId).length,
+		});
+		count(t.rows, `${gc}: seals before the genesis=${tally.beforeGenesis > 0 ? "some" : 0}, rows by A after the genesis=${rowsBy(net, d.deviceId, genesisSeq) > 0 ? "some" : 0}, sealed in the link delay=${tally.beforeSeen > 0 ? "some" : 0}`);
+		await settleOn(clock, d.runtime.stop());
+		t.cases++;
+	}
+	const n = SEEDS.length * G_CASES.length;
+	assert.equal(t.cases, n);
+	assert.deepEqual(tallyObj(t.finals), { "key-missing/encrypted-vault/suite=0": n, "k rows=1": n });
+	assert.deepEqual(tallyObj(t.seals), { whileShut: 0, afterSeen: 0 });
+	const per = (gc: (typeof G_CASES)[number], before: 0 | "some", after: 0 | "some", delay: 0 | "some"): [string, number] => [
+		`${gc}: seals before the genesis=${before}, rows by A after the genesis=${after}, sealed in the link delay=${delay}`,
+		SEEDS.length,
+	];
+	assert.deepEqual(tallyObj(t.rows), {
+		"rows by A after it reported encrypted-vault": 0,
+		"k rows by A": 0,
+		// Only the live case commits rows after the genesis: frames it sealed before reading it (in the link delay).
+		...Object.fromEntries([
+			per("live, typing through the genesis", "some", "some", "some"),
+			per("offline, genesis, reconnect", 0, 0, 0),
+			per("offline edits, genesis, reconnect", "some", 0, 0),
+			per("restart after the genesis", 0, 0, 0),
+			per("wipe and restart after the genesis", 0, 0, 0),
+			per("fresh suite-0 device, genesis already there", 0, 0, 0),
+		]),
+	});
+	console.log(`[g] cases=${n} final=key-missing/encrypted-vault x${n}; seals after encrypted-vault=0, through a shut gate=0; rows by A after encrypted-vault=0; k rows by A=0`);
+});
+
+/** Pin setters, pin-shaped writes, data.json saves and key commands in src/{core,engine,host,ports,protocol}, by file. */
+function pinCensus(): Record<string, Record<string, number>> {
+	const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+	const files: string[] = [];
+	const walk = (dir: string): void => {
+		for (const e of readdirSync(dir, { withFileTypes: true })) {
+			const p = join(dir, e.name);
+			if (e.isDirectory()) {
+				if (e.name !== "testkit" && e.name !== "spike") walk(p);
+			} else if (e.name.endsWith(".ts") && !e.name.endsWith(".test.ts")) files.push(p);
+		}
+	};
+	for (const d of ["core", "engine", "host", "ports", "protocol"]) walk(join(root, d));
+	const out: Record<string, Record<string, number>> = {};
+	const add = (k: string, f: string): void => {
+		const r = relative(root, f).split(sep).join("/");
+		const m = (out[k] ??= {});
+		m[r] = (m[r] ?? 0) + 1;
+	};
+	for (const f of files) {
+		const src = readFileSync(f, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+		for (const m of src.matchAll(/(?<![.\w])(pinnedSuite0|pinnedSuite1|sawKeyring|markedCreating|withoutPin|withPin)\s*\(/g)) {
+			const line = src.slice(src.lastIndexOf("\n", m.index) + 1, src.indexOf("\n", m.index));
+			if (!/\bfunction\s/.test(line)) add(`call:${m[1]}`, f);
+		}
+		for (const _ of src.matchAll(/\be2ee\s*:\s*(pin\b|\{)/g)) add("e2ee-write", f);
+		for (const _ of src.matchAll(/\bcreating\s*:\s*\{/g)) add("creating-write", f);
+		for (const _ of src.matchAll(/\.saveData\(/g)) add("saveData", f);
+		for (const _ of src.matchAll(/\.markCreating\(/g)) add("markCreating", f);
+		for (const m of src.matchAll(/\bt:\s*"(pinSuite0|enableE2ee|installKey|revokeRekey)"\s*,/g)) add(`command:${m[1]}`, f);
+		for (const _ of src.matchAll(/source:\s*"link"\s*[,}]/g)) add("source-link", f);
+	}
+	assert.ok(files.length > 100, "walked the sources");
+	return out;
+}

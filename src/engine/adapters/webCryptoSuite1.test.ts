@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createCipheriv, hkdfSync } from "node:crypto";
+import { concatBytes } from "../../core/codec/lib0";
 import { padmeLen } from "../../core/codec/padme";
 import { hkdfInfo } from "./suite1Primitives";
 import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../../core/limits";
@@ -99,7 +100,7 @@ describe("webCryptoSuite1: blobs (§10)", () => {
 		for (const n of [0, 1, 254, 255, 256, 1000, 70_000]) {
 			random.push(N(n & 0xff));
 			const pt = range(n, n);
-			const sealed = await c.sealBlob({ address: ADDR, plaintext: pt });
+			const sealed = concatBytes(await c.sealBlob({ address: ADDR, plaintext: pt }));
 			assert.equal(sealed.length, 3 + 28 + padmeLen(n + 1), `n=${n}`);
 			assert.deepEqual([sealed[0], sealed[1], sealed[2]], [1, 1, 2]);
 			assert.deepEqual(await c.openBlob({ address: ADDR, sealed }), { ok: true, plaintext: pt });
@@ -107,10 +108,54 @@ describe("webCryptoSuite1: blobs (§10)", () => {
 		}
 	});
 
+	it("no blob-sized copies around WebCrypto (§10.3): the padded input once, its outputs handed on as views", async () => {
+		const seen: { op: string; data: Uint8Array; out: ArrayBuffer }[] = [];
+		const real = globalThis.crypto.subtle;
+		const subtle = new Proxy(real, {
+			get(target, prop) {
+				const v: unknown = Reflect.get(target, prop, target);
+				if (prop !== "encrypt" && prop !== "decrypt") return typeof v === "function" ? v.bind(target) : v;
+				return async (alg: AesGcmParams, key: CryptoKey, data: Uint8Array) => {
+					const out = await (v as SubtleCrypto["encrypt"]).call(target, alg, key, data);
+					seen.push({ op: prop, data, out });
+					return out;
+				};
+			},
+		});
+		const { c, random } = await port({ seal: 1, subtle });
+		const n = 70_000;
+		const pt = range(3, n);
+		random.push(N(5));
+		const parts = await c.sealBlob({ address: ADDR, plaintext: pt });
+		const enc = seen.pop()!;
+		assert.equal(enc.op, "encrypt");
+		// Padding: the one copy of the plaintext, byte for byte data ‖ 0x80 ‖ 0x00*, padmeLen(n + 1) long.
+		const padded = new Uint8Array(padmeLen(n + 1));
+		padded.set(pt);
+		padded[n] = 0x80;
+		assert.deepEqual(enc.data, padded);
+		// [header ‖ nonce, WebCrypto's own output]: ct ‖ tag is not copied behind the header.
+		assert.equal(parts.length, 2);
+		assert.deepEqual(parts[0], Uint8Array.from([1, 1, 1, ...N(5)]));
+		assert.equal(parts[1]!.buffer, enc.out);
+		assert.deepEqual([parts[1]!.byteOffset, parts[1]!.byteLength], [0, enc.out.byteLength]);
+		// Open: decrypt reads a view of the sealed bytes; the plaintext is a view of decrypt's output (unpad strips in place).
+		const sealed = concatBytes(parts);
+		const r = await c.openBlob({ address: ADDR, sealed });
+		const dec = seen.pop()!;
+		assert.equal(dec.op, "decrypt");
+		assert.equal(dec.data.buffer, sealed.buffer);
+		assert.deepEqual([dec.data.byteOffset, dec.data.byteLength], [3 + 12, sealed.length - 15]);
+		assert.ok(r.ok);
+		assert.equal(r.plaintext.buffer, dec.out);
+		assert.deepEqual([r.plaintext.byteOffset, r.plaintext.byteLength, dec.out.byteLength], [0, n, padmeLen(n + 1)]);
+		assert.deepEqual(r.plaintext, pt);
+	});
+
 	it("header, epoch, padding and cap failures", async () => {
 		const { c, random } = await port({ seal: 1 });
 		random.push(N(7));
-		const sealed = await c.sealBlob({ address: ADDR, plaintext: PT });
+		const sealed = concatBytes(await c.sealBlob({ address: ADDR, plaintext: PT }));
 		const with_ = (i: number, v: number) => { const b = sealed.slice(); b[i] = v; return b; };
 		const open = (s: Uint8Array) => c.openBlob({ address: ADDR, sealed: s });
 		assert.deepEqual(await open(with_(0, 2)), { ok: false, reason: "unsupported-suite" }, "blobFormat 2");

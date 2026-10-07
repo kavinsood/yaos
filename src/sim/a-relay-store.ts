@@ -79,6 +79,19 @@ export interface StoreConfig {
 	readonly gcOnCheckpoint: boolean;
 }
 
+/** A RelayStore snapshot (RelayStore.snapshot / restore). */
+export interface StoreSnapshot {
+	readonly head: Seq;
+	readonly streams: readonly StreamState[];
+}
+
+function copyState(st: StreamState): StreamState {
+	return {
+		name: st.name, sealed: st.sealed.map((g) => ({ rows: g.rows.slice(), bytes: g.bytes })), open: { rows: st.open.rows.slice(), bytes: st.open.bytes },
+		lastSeq: st.lastSeq, checkpoint: st.checkpoint, gcSeq: st.gcSeq, history: st.history.slice(),
+	};
+}
+
 function findKey(rows: readonly SimRow[], key: string): SimRow | undefined {
 	for (let i = rows.length - 1; i >= 0; i--) {
 		const row = rows[i]!;
@@ -100,6 +113,34 @@ export class RelayStore {
 	reset(): void {
 		this.headSeq = 0;
 		this.streamMap.clear();
+	}
+
+	/** The whole store as of now (rows are immutable and shared; segment lists are copied). */
+	snapshot(): StoreSnapshot {
+		return { head: this.headSeq, streams: [...this.streamMap.values()].map(copyState) };
+	}
+
+	/** Point-in-time restore: the store becomes `snap` exactly (server D8b "content == T"). */
+	restore(snap: StoreSnapshot): void {
+		this.headSeq = snap.head;
+		this.streamMap.clear();
+		for (const st of snap.streams) this.streamMap.set(st.name, copyState(st));
+	}
+
+	/**
+	 * Hostile relay (sim only, e2ee-design §20.2): append `frames` as new rows, in order, with no dedupe lookup
+	 * (a replayed (deviceId, clientFrameId) lands again at a new seq).
+	 */
+	forge(frames: readonly StoreFrame[]): SimRow[] {
+		let head = this.headSeq;
+		const rows: SimRow[] = [];
+		for (const f of frames) {
+			const row: SimRow = { stream: f.stream, seq: ++head, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload: f.payload };
+			this.writeStream(f.stream, [row]);
+			rows.push(row);
+		}
+		this.headSeq = head;
+		return rows;
 	}
 
 	private lookup(state: StreamState | undefined, key: string): SimRow | undefined {

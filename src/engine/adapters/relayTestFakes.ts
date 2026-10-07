@@ -148,6 +148,7 @@ export function fakeFetch(route: (req: FakeRequest) => Response | "network" | Pr
 			: typeof raw === "string" ? raw
 			: raw instanceof Uint8Array ? raw.slice()
 			: raw instanceof ArrayBuffer ? new Uint8Array(raw).slice()
+			: raw instanceof Blob ? new Uint8Array(await raw.arrayBuffer())
 			: null;
 		const req: FakeRequest = { method: init?.method ?? "GET", url: new URL(href), headers: new Headers(init?.headers), body };
 		requests.push(req);

@@ -501,7 +501,10 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 			push([...prefix, waitOp(s.docId, w.body?.caughtUp ? "body-empty" : "body-not-caught-up")]);
 			return true;
 		}
-		const ops: PlannerOp[] = [...prefix, { op: "rebind", fromDocId: s.docId, toDocId: winner, path: w.path }, { op: "nsDelete", docId: s.docId, baseBodySeq: baseBodySeq(r) }];
+		const ops: PlannerOp[] = [
+			...prefix, { op: "rebind", fromDocId: s.docId, toDocId: winner, path: w.path, ...(migrated ? { adopt: true as const } : {}) },
+			{ op: "nsDelete", docId: s.docId, baseBodySeq: baseBodySeq(r) },
+		];
 		if (migrated) ops.push({ op: "reconcileContent", docId: winner, path: l.path, kind: "markdown", hasBase: false, pathBase: true });
 		push(ops);
 		return true;

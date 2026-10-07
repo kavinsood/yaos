@@ -28,7 +28,7 @@ import { defaultPriority, Repo, type YS } from "../store/repo";
 import { DB_NAME_PREFIX, DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity } from "../store/schema";
 import { newDocId } from "../../core/codec/ids";
 import { bytesToHex, utf8Encode } from "../../core/codec/lib0";
-import { releaseQuarantine, retryReaderQuarantine } from "./quarantineRelease";
+import { recheckStored, releaseQuarantine, retryReaderQuarantine } from "./quarantineRelease";
 import type { BodyHandle } from "../reconcile/deps";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { CfgRuntime } from "../sync/cfgRuntime";
@@ -141,6 +141,10 @@ export class LogEngine {
 		const repo = o.repo;
 		repo.monotonic = () => c.mono();
 		repo.priorityFn = (r) => ((c.handles?.peek(r.stream)?.bound ?? 0) > 0 ? -10 : defaultPriority(r));
+		repo.onQuarantineFrozen = (recs) => {
+			for (const r of recs) c.frozen(r.stream, r.frozenReason ?? "quarantine", r.cls);
+		};
+		repo.onStored = (quarantined, rows) => recheckStored(c, quarantined, rows);
 		c.repo = repo;
 		c.keyring = await KeyringRuntime.open(c, opts.e2ee);
 		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus);
@@ -472,9 +476,12 @@ export class LogEngine {
 		return this.c.handles.peek(this.streamOf(docId));
 	}
 
-	/** Re-gate quarantined rows (key now available, ...): pass -> tail; the rest dismissed; doc unfrozen. */
-	releaseQuarantine(docId: DocId): Promise<{ passed: number; dismissed: number }> {
-		return releaseQuarantine(this.c, this.streamOf(docId));
+	/**
+	 * Re-gate a stream's quarantined rows (key now available, ...): pass -> tail; the rest dismissed; doc unfrozen.
+	 * By stream, not doc id: a merged duplicate's id resolves to another doc's stream (streamOf).
+	 */
+	releaseQuarantine(stream: StreamName): Promise<{ passed: number; dismissed: number }> {
+		return releaseQuarantine(this.c, stream);
 	}
 
 	/**

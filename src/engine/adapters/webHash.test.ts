@@ -16,4 +16,18 @@ describe("webHash", () => {
 		const whole = new TextEncoder().encode("xxabcxx");
 		assert.equal(hex(await hash.sha256(whole.subarray(2, 5))), hex(await hash.sha256(new TextEncoder().encode("abc"))));
 	});
+
+	it("passes an ArrayBuffer-backed view to digest as is (no copy); copies only a SharedArrayBuffer-backed one", async () => {
+		const seen: BufferSource[] = [];
+		const real = globalThis.crypto.subtle;
+		const subtle = { digest: (alg: AlgorithmIdentifier, data: BufferSource) => (seen.push(data), real.digest(alg, data)) } as SubtleCrypto;
+		const hash = createWebHash(subtle);
+		const view = new TextEncoder().encode("xxabcxx").subarray(2, 5);
+		const abc = hex(await hash.sha256(view));
+		assert.equal(seen[0], view);
+		const shared = new Uint8Array(new SharedArrayBuffer(3));
+		shared.set(view);
+		assert.equal(hex(await hash.sha256(shared)), abc);
+		assert.ok(seen[1] instanceof Uint8Array && seen[1].buffer instanceof ArrayBuffer && seen[1] !== shared);
+	});
 });

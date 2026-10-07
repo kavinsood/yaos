@@ -114,6 +114,8 @@ export class RelayEngine {
 	commitHook: CommitHook | null = null;
 	readonly faults: { readonly fault: CommitFault; readonly retryAfterMs: number | null }[] = [];
 	readonly commitListeners = new Set<(info: SimCommitInfo) => void>();
+	/** Hostile relay (SimRelay.hideFrom): rows of a hidden stream are never pushed to that device. */
+	hiddenFor: (deviceId: DeviceId, stream: StreamName) => boolean = () => false;
 	/** Cloudflare-side daily row limit exhausted until this wall time (0 = not). */
 	envDailyUntil = 0;
 	/** Server latch (DailyLimitLatch.until). */
@@ -218,7 +220,7 @@ export class RelayEngine {
 		};
 		if (provisional) {
 			for (const peer of this.streamSockets()) {
-				if (peer === session) continue;
+				if (peer === session || this.hiddenFor(peer.deviceId, entry.stream)) continue;
 				peer.send({ k: "provisional", stream: entry.stream, deviceId: entry.deviceId, clientFrameId: entry.clientFrameId, payload: entry.payload });
 				this.counters.provisionalBroadcasts++;
 			}
@@ -360,7 +362,7 @@ export class RelayEngine {
 			// Rows appended now go to every other socket (a notice for PROVISIONAL holders); a row
 			// deduped against an earlier commit was delivered then: only holders get a notice (R7).
 			for (const peer of sockets) {
-				if (peer === frame.origin) continue;
+				if (peer === frame.origin || this.hiddenFor(peer.deviceId, frame.stream)) continue;
 				if (frame.provisional && peer.ordinal <= frame.ordinal) {
 					peer.send({ k: "notice", stream: frame.stream, seq: outcome.seq, deviceId: frame.deviceId, clientFrameId: frame.clientFrameId });
 					this.counters.notices++;

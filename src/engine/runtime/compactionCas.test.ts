@@ -9,7 +9,7 @@ import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, startTestEngine, until } from "./testHarness";
 
-const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
+const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
 const NO_COMPACT = { compactRows: 1e9, compactBytes: 1e12, checkpoint: NO_CKPT };
 
 async function setup(n = 2, readOnly: string[] = []) {

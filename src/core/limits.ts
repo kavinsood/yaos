@@ -109,9 +109,28 @@ export const PROVISIONAL_ADOPT_MS = 60_000;
 
 export const LOCAL_COMPACT_ROWS = 200;
 export const LOCAL_COMPACT_BYTES = 256 * 1024;
-export const REMOTE_CHECKPOINT_ROWS = 512;
+/**
+ * Remote checkpoint duty (DESIGN §d.9). Hot rule: this many rows (or bytes) behind the stream's remote checkpoint,
+ * then REMOTE_CHECKPOINT_IDLE_MS idle. 256 caps the tail an active doc carries for a fresh device: 32 active docs
+ * at the cap open within the bootstrap budget (e2ee-design §16.2), at 512 they do not. Cost: <= 1 put (3-4 rows
+ * written) per 256 frames, against >= 2 rows written per group commit for the frames themselves.
+ */
+export const REMOTE_CHECKPOINT_ROWS = 256;
 export const REMOTE_CHECKPOINT_BYTES = 1024 * 1024;
 export const REMOTE_CHECKPOINT_IDLE_MS = 30_000;
+/**
+ * Settle rule (DESIGN §d.9): a stream that would cost a fresh device more than one open (any row behind its remote
+ * checkpoint, or two rows and no checkpoint) is checkpointed once it has been idle this long, so a quiescent vault
+ * has no tail. At most one put per edit session (a pause >= 2 min ends one); ns / cfg / snap use it too.
+ */
+export const REMOTE_CHECKPOINT_SETTLE_MS = 2 * 60_000;
+/**
+ * Settle puts per device per 24 h (every put counts; the hot rule is not capped). 1000 puts are <= ~4k rows written,
+ * 4 % of the Free plan's 100k; a heavy day (500 edit sessions) stays under it. A vault-wide scripted edit (one frame
+ * in each of 10k notes) would otherwise cost 30-40k rows in a day; beyond the cap those docs keep their one row
+ * (2 opens each, within the bootstrap budget) and settle on later days.
+ */
+export const REMOTE_CHECKPOINT_SETTLE_DAILY = 1_000;
 export const NS_CHECKPOINT_ROWS = 1_000;
 export const NS_CHECKPOINT_BYTES = 1024 * 1024;
 /** Hard cap on tail rows per stream; beyond it compaction runs in the open-note lane. */

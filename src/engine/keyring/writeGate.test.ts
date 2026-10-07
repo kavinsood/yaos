@@ -33,10 +33,10 @@ describe("write gate", () => {
 		let t = 0;
 		const inner = new SimBlobStore({ now: () => t });
 		const b = gatedBlob(inner, () => reason)!;
-		await b.put(ADDR, new Uint8Array(1));
+		await b.put(ADDR, [new Uint8Array(1)]);
 		t = 10;
 		reason = "revoked-epoch";
-		await assert.rejects(b.put(ADDR, new Uint8Array(2)), KeyMissingError);
+		await assert.rejects(b.put(ADDR, [new Uint8Array(2)]), KeyMissingError);
 		await assert.rejects(b.deleteIfUploadedBefore([ADDR], 5), KeyMissingError);
 		assert.equal(inner.calls.put, 1);
 		assert.equal(inner.calls.delete, 0);

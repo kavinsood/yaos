@@ -35,7 +35,9 @@ describe("noopCrypto", () => {
 		const hash = "a".repeat(64) as ContentHash;
 		const address = await crypto.blobAddress(hash);
 		assert.equal(address, hash as string as BlobAddress);
-		assert.deepEqual(await crypto.sealBlob({ address, plaintext: bytes }), bytes);
+		const parts = await crypto.sealBlob({ address, plaintext: bytes });
+		assert.equal(parts.length, 1);
+		assert.equal(parts[0], bytes, "the plaintext itself, not a copy");
 		assert.deepEqual(await crypto.openBlob({ address, sealed: bytes }), { ok: true, plaintext: bytes });
 	});
 

@@ -27,6 +27,7 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
 		return { t: "notBindable", reason: "untracked" };
 	}
 	const docId = e.docId;
+	const frozen = e.body?.frozen ?? false;
 	const first = rt.engine.bound.add(docId, path, viewId);
 	try {
 		// One replica pin per bound doc (released when its last view closes); the views attach next (bodyAttach).
@@ -35,7 +36,9 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
 		rt.engine.bound.remove(docId, viewId);
 		throw err;
 	}
-	return { t: "bind", bind: { docId, kind: "markdown", frozen: e.body?.frozen ?? false } };
+	// The host closes a frozen bind and waits (host/binding.ts): `bindable` once the doc is released (checkBindable).
+	if (frozen) rt.engine.bound.waiting.add(path);
+	return { t: "bind", bind: { docId, kind: "markdown", frozen } };
 }
 
 /**
@@ -123,8 +126,7 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 		case "exportDiagnostics":
 			return { t: "diagnostics", bundle: await diagnostics(rt, c.includePaths === true) };
 		case "releaseQuarantine": {
-			const docId = streamDocId(c.stream as StreamName);
-			if (docId) await rt.log.releaseQuarantine(docId);
+			if (streamDocId(c.stream as StreamName)) await rt.log.releaseQuarantine(c.stream as StreamName);
 			rt.sched.request({ t: "full" });
 			return { t: "ok" };
 		}

@@ -11,7 +11,9 @@ import { NS_STREAM, type DeviceId, type DocId, type StreamName, type VaultId, ty
 import type { RelayConnectResult, RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { LogEngine } from "../engine/runtime/engine";
+import type { EngineE2ee } from "../engine/keyring/keyringRuntime";
 import type { VirtualClock } from "./clock";
+import { createDelayedSuite1, delayedHash, realWorkFor } from "./delayedCrypto";
 import { simHashPort } from "./hash";
 import { hashLabel, SeededRandom } from "./random";
 import { SimRelay } from "./relay";
@@ -25,6 +27,12 @@ export interface OracleDoc {
 	readonly kind: string;
 	/** Markdown text (null for other kinds). */
 	readonly text: string | null;
+}
+
+/** A suite-1 oracle's keys and keyring records (a keyed device's SecretStorage contents; copied, never printed). */
+export interface OracleKeys {
+	readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[];
+	readonly records: readonly Uint8Array[];
 }
 
 export class SimNet {
@@ -82,17 +90,22 @@ export class SimNet {
 	/**
 	 * Bootstrap a fresh observer from the relay and read the folded vault.
 	 * Runs the clock (the caller must not be inside a clock step).
+	 * `suite1`: open a suite-1 vault with a keyed device's keys and records (DelayedCrypto, as the devices).
 	 */
-	async oracle(horizonMs = 120_000): Promise<{ docs: OracleDoc[]; error: string | null }> {
+	async oracle(horizonMs = 120_000, suite1: OracleKeys | null = null): Promise<{ docs: OracleDoc[]; error: string | null }> {
 		const n = ++this.oracleRuns;
 		const deviceId = `oracle-${n}` as DeviceId;
-		const hash = simHashPort();
-		const storage = new MemStoragePort({ beforeNextTimer: this.clock.beforeNextTimer });
+		const random = new SeededRandom(hashLabel(deviceId));
+		const work = suite1 ? realWorkFor(this.clock) : null;
+		const hash = work ? delayedHash(work, simHashPort()) : simHashPort();
+		const storage = new MemStoragePort({ beforeNextTimer: this.clock.beforeNextTimer, macrotask: this.clock.macrotask });
 		let engine: LogEngine | null = null;
 		let error: string | null = null;
+		const crypto = work && suite1 ? await createDelayedSuite1(work, { vaultId: SIM_VAULT_ID, random, keys: suite1.keys.map((x) => ({ e: x.e, k: x.k.slice() })) }) : createNoopCrypto(hash);
+		const e2ee: EngineE2ee = suite1 ? { suite: 1, records: suite1.records.map((r) => r.slice()), persist: async (ch) => { for (const x of ch.keys) x.k.fill(0); } } : { suite: 0 };
 		const started = LogEngine.start({
-			ports: { relay: this.port(deviceId), storage, clock: this.clock, random: new SeededRandom(hashLabel(deviceId)), crypto: createNoopCrypto(hash), hash, blob: null },
-			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-oracle", sideFiles: null, autoReconnect: true, e2ee: { suite: 0 },
+			ports: { relay: this.port(deviceId), storage, clock: this.clock, random, crypto, hash, blob: null },
+			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-oracle", sideFiles: null, autoReconnect: true, e2ee,
 		}).then((e) => (engine = e), (e) => (error = `oracle start: ${e instanceof Error ? e.message : String(e)}`));
 		await this.clock.runUntil(() => engine !== null || error !== null, horizonMs);
 		await started;

@@ -257,7 +257,7 @@ export interface QuarantineRecord {
 	readonly clientFrameId: ClientFrameId;
 	readonly reason: QuarantineReason;
 	readonly detail: string;
-	/** Truncated to QUARANTINE_ROW_BYTES; full hash kept. */
+	/** Deterministic failures: truncated to QUARANTINE_ROW_BYTES; reader-dependent ones: whole (re-gated). Full hash kept. */
 	readonly bytes: Uint8Array;
 	readonly bytesHash: ContentHash;
 	readonly originalSize: number;

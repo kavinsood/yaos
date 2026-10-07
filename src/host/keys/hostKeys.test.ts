@@ -15,8 +15,13 @@ function key(e: number, seed: number): EpochKey {
 	return { e, k };
 }
 const record = (n: number): Uint8Array => new Uint8Array([0xb0, n, 9]);
+/** Runs `p` while the store's startup wait (§6.1) elapses on `clock`. */
+async function waited<T>(clock: VirtualClock, p: Promise<T>): Promise<T> {
+	await clock.advance(KEY_STORE_WAIT_MS);
+	return p;
+}
 
-test("crypto(): unpinned and suite 0 carry no keys and do not wait for the store", async () => {
+test("crypto(): unpinned and suite 0 carry no keys and do not wait for the store (unpinned starts its wait)", async () => {
 	const clock = new VirtualClock();
 	const fake = new FakeSecretStorage(new Map(), { loaded: false });
 	const store = new VaultKeyStore(fake, testVaultId("v"), clock);
@@ -30,7 +35,31 @@ test("crypto(): unpinned and suite 0 carry no keys and do not wait for the store
 	assert.deepEqual(await hk.crypto(), { suite: null, creating: true });
 	pin = { suite: 0 };
 	assert.deepEqual(await hk.crypto(), { suite: 0 });
+	assert.equal(clock.pendingTimers(), 1, "one startup wait, for a later persist");
+	fake.load();
+	await clock.settleMicrotasks();
 	assert.equal(clock.pendingTimers(), 0);
+});
+
+test("persist(): waits until SecretStorage loaded, so a store it read too early is not replaced (§6.1 Startup)", async () => {
+	const clock = new VirtualClock();
+	const backing = new Map<string, string>();
+	new VaultKeyStore(new FakeSecretStorage(backing), testVaultId("v"), clock).merge({ keys: [key(1, 8)], records: [record(1)] });
+	const fake = new FakeSecretStorage(backing, { loaded: false });
+	const store = new VaultKeyStore(fake, testVaultId("v"), clock);
+	const hk = createHostKeys({ store, pin: () => undefined, creating: () => false });
+	let done = false;
+	const p = hk.persist({ keys: [key(2, 9)], records: [record(1), record(2)], pending: null }).then(() => void (done = true));
+	await clock.advance(10);
+	assert.equal(done, false, "not stored before the load");
+	fake.load();
+	await p;
+	assert.ok(sameKeys(store.load()!.keys, [key(1, 8), key(2, 9)]));
+	// An empty store that loaded long ago: crypto() started the wait at engine start, so a later persist does not wait.
+	const empty = createHostKeys({ store: new VaultKeyStore(new FakeSecretStorage(), testVaultId("w"), clock), pin: () => undefined, creating: () => false });
+	await empty.crypto();
+	await clock.advance(KEY_STORE_WAIT_MS);
+	await empty.persist({ keys: [key(1, 10)], records: [record(1)], pending: null });
 });
 
 test("crypto(): suite 1 waits for the store, then loads fresh key buffers", async () => {
@@ -78,7 +107,7 @@ test("persist(): stores before the pin decision, which completes before persist 
 		},
 	});
 	const change = { keys: [key(1, 2)], records: [record(1)], pending: null };
-	await hk.persist(change).then(() => order.push("acked"));
+	await waited(clock, hk.persist(change).then(() => order.push("acked")));
 	assert.deepEqual(order, ["stored:true:1/1/null", "pinned", "acked"]);
 	assert.ok(change.keys[0]!.k.every((b) => b === 0), "the change's key buffer is zero-filled once stored");
 	assert.ok(sameKeys(store.load()!.keys, [key(1, 2)]));
@@ -113,7 +142,7 @@ test("plaintext notice: shown once per vault when keys are stored or loaded on a
 	const backing = new Map<string, string>();
 	const plain = new FakeSecretStorage(backing, { encryption: false });
 	const hk = createHostKeys({ store: new VaultKeyStore(plain, testVaultId("v"), clock), pin: () => undefined, creating: () => false, plaintext: plaintextNoticeOnce(env) });
-	await hk.persist({ keys: [key(1, 5)], records: [record(1)], pending: null });
+	await waited(clock, hk.persist({ keys: [key(1, 5)], records: [record(1)], pending: null }));
 	await hk.persist({ keys: [key(2, 6)], records: [record(1)], pending: null });
 	assert.equal(shown.length, 1);
 	assert.equal(local.get(PLAINTEXT_NOTICE_KEY), "1");
@@ -123,7 +152,7 @@ test("plaintext notice: shown once per vault when keys are stored or loaded on a
 	assert.equal(shown.length, 1);
 	// An encrypted store never shows it.
 	const enc = createHostKeys({ store: new VaultKeyStore(new FakeSecretStorage(), testVaultId("w"), clock), pin: () => undefined, creating: () => false, plaintext: plaintextNoticeOnce({ ...env, load: () => null }) });
-	await enc.persist({ keys: [key(1, 7)], records: [record(1)], pending: null });
+	await waited(clock, enc.persist({ keys: [key(1, 7)], records: [record(1)], pending: null }));
 	assert.equal(shown.length, 1);
 	assert.ok(!shown[0]!.match(/[0-9a-f]{16}/));
 });

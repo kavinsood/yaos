@@ -4,6 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { concatBytes } from "../../core/codec/lib0";
 import { sha256Hex } from "../../core/hash/sha256";
 import type { ContentHash } from "../../core/types";
 import { BLOB_DELETE_BATCH, type BlobPort } from "../../ports/blob";
@@ -73,7 +74,7 @@ function rig(o: { pageSize?: number; crypto?: CryptoPort; store?: BlobPort } = {
 			const b = bytesOf(i);
 			const hash = H(b);
 			const address = await crypto.blobAddress(hash);
-			r.store.objects.set(address, { bytes: await crypto.sealBlob({ address, plaintext: b }), uploadedAt: r.storeNow - ageMs });
+			r.store.objects.set(address, { bytes: concatBytes(await crypto.sealBlob({ address, plaintext: b })), uploadedAt: r.storeNow - ageMs });
 			return { hash, address };
 		},
 	};

@@ -6,13 +6,14 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { concatBytes } from "../../core/codec/lib0";
 import { sha256Hex } from "../../core/hash/sha256";
 import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../../core/limits";
 import { sealedBlobBytes } from "../../core/codec/sealedBlob";
 import { snapPartBytes } from "../../core/snap/bundle";
 import type { ContentHash } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress } from "../../ports/crypto";
+import type { BlobAddress, SealedBlobParts } from "../../ports/crypto";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
@@ -45,11 +46,12 @@ class MemStore implements BlobPort {
 	down = false;
 	constructor(readonly maxBlobBytes = 10 * MIB) {}
 	async has(a: readonly BlobAddress[]) { if (this.down) throw new Error("503"); return new Set(a.filter((x) => this.objects.has(x))); }
-	async put(a: BlobAddress, b: Uint8Array) {
+	async put(a: BlobAddress, parts: SealedBlobParts) {
 		if (this.down) throw new Error("503");
+		const b = concatBytes(parts);
 		if (b.length > this.maxBlobBytes) throw new Error(`413: ${b.length} > ${this.maxBlobBytes}`);
 		this.puts++;
-		this.objects.set(a, b.slice());
+		this.objects.set(a, b);
 	}
 	async get(a: BlobAddress) { if (this.down) throw new Error("503"); return this.objects.get(a)?.slice() ?? null; }
 	async list(): Promise<never> { throw new Error("unused"); }
@@ -128,7 +130,7 @@ test("getOpened: every failure is unavailable; deterministic only under a verifi
 	assert.equal(await verdict(good.subarray(0, 20), unverifiedRight), "malformed/false");
 	// A key holder sealing other bytes at the address: opens, but not to the reference.
 	w.setSealEpoch(2);
-	const other = await w.sealBlob({ address: addr, plaintext: bytes(700, 6) });
+	const other = concatBytes(await w.sealBlob({ address: addr, plaintext: bytes(700, 6) }));
 	assert.equal(await verdict(other), "hash-mismatch/true");
 	assert.equal(await verdict(other, unverifiedRight), "hash-mismatch/false");
 	// No digest given (verifyBundle checks the part hash itself): opened bytes are returned as they are.

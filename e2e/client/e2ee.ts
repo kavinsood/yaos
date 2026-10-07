@@ -429,7 +429,7 @@ async function main(): Promise<void> {
 		storedEpochs(d));
 	const orphan = randomBytes(16 * 1024, 901);
 	const orphanAddr = nodeRandomBytes(32).toString("hex") as BlobAddress;
-	await blobOf(d).put(orphanAddr, orphan);
+	await blobOf(d).put(orphanAddr, [orphan]);
 	const stored0 = await storedAddresses(d);
 	await sleep(GC_GRACE_MS + 2_000);
 	const gc = await cmd(d, { t: "cleanUpAttachments" }, "attachmentsCleaned");

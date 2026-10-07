@@ -22,7 +22,7 @@ import { MAX_BLOB_PLAINTEXT_BYTES_SUITE1 } from "../../core/limits";
 import type { VaultId } from "../../core/types";
 import type { BlobAddress, CryptoPort, KeyringCrypto, OpenFailure, OpenResult, WrapRole } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
-import { AEAD_OVERHEAD, KCV_BYTES, KEY_BYTES, NONCE_BYTES, WRAP_BYTES, deriveSubkey, gcmOpen, gcmSeal, hkdfInfo, hmac, importBase, type Purpose } from "./suite1Primitives";
+import { AEAD_OVERHEAD, KCV_BYTES, KEY_BYTES, NONCE_BYTES, WRAP_BYTES, deriveSubkey, gcmEncrypt, gcmOpen, gcmSeal, hkdfInfo, hmac, importBase, type Purpose } from "./suite1Primitives";
 
 export type Suite1Crypto = CryptoPort & KeyringCrypto;
 
@@ -132,11 +132,13 @@ export async function createWebCryptoSuite1(o: Suite1Options): Promise<Suite1Cry
 			const e = sealEpoch;
 			const key = await sealKey(e, "blob");
 			const header = encodeBlobHeader(CryptoSuite.aes256gcm, e);
-			const body = await gcmSeal(subtle, key, nonce(), blobAad(CryptoSuite.aes256gcm, e, vaultId, address), pad(plaintext));
-			const out = new Uint8Array(header.length + body.length);
-			out.set(header, 0);
-			out.set(body, header.length);
-			return out;
+			const iv = nonce();
+			const head = new Uint8Array(header.length + NONCE_BYTES);
+			head.set(header, 0);
+			head.set(iv, header.length);
+			// Two parts: joining WebCrypto's blob-sized output behind header ‖ nonce would copy it (§10.3).
+			// pad() is the one copy of the plaintext: AES-GCM takes one contiguous input.
+			return [head, await gcmEncrypt(subtle, key, iv, blobAad(CryptoSuite.aes256gcm, e, vaultId, address), pad(plaintext))];
 		},
 		async openBlob({ address, sealed }) {
 			const h = decodeBlobHeader(sealed);

@@ -149,9 +149,13 @@ export class KeyringRuntime {
 	blocked(): boolean {
 		return this.kr.keyMissing() !== null;
 	}
-	/** A suite-0 pin on a vault with a `k` record: only `k` is read (§9.3, §12.4); ns, cfg and bodies wait. */
+	/**
+	 * Only `k` is read; ns, cfg and bodies wait (live rows stay stale, catch-up skips them): a suite-0 pin on a vault
+	 * with a `k` record (§9.3, §12.4), and under suite 1 a session before its `k` read. Nothing is judged before
+	 * that read (kComplete): a row gated then would be held, quarantined and its doc frozen until a re-gate.
+	 */
 	readsOnlyK(): boolean {
-		return this.kr.keyMissing() === "encrypted-vault";
+		return this.kr.keyMissing() === "encrypted-vault" || (this.suite === 1 && this.c.session !== null && this.kReadGen !== this.c.gen);
 	}
 	status(): E2eeStatus {
 		return { suite: this.suite, sealEpoch: this.kr.sealEpoch(), keyMissing: this.kr.keyMissing(), keyringSeen: this.kr.keyringSeen, creatable: false };

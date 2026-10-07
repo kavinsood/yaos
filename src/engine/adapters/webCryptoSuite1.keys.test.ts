@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createCipheriv, hkdfSync } from "node:crypto";
+import { concatBytes } from "../../core/codec/lib0";
 import type { BlobAddress } from "../../ports/crypto";
 import { hkdfInfo } from "./suite1Primitives";
 import { ScriptedRandom } from "./testkit/scriptedRandom";
@@ -32,7 +33,7 @@ describe("webCryptoSuite1: only non-extractable keys (§6.3)", () => {
 		random.push(N(1), N(2), K2.slice(), N(3), N(4)); // seal, sealBlob, generate, two wraps (FIFO)
 		const sealed = await c.seal({ purpose: "frame", keyEpoch: 1, aad: AAD, plaintext: K3 });
 		assert.equal((await c.open({ purpose: "frame", suite: 1, keyEpoch: 1, aad: AAD, sealed })).ok, true);
-		const blob = await c.sealBlob({ address: "ab".repeat(32) as BlobAddress, plaintext: K3 });
+		const blob = concatBytes(await c.sealBlob({ address: "ab".repeat(32) as BlobAddress, plaintext: K3 }));
 		assert.equal((await c.openBlob({ address: "ab".repeat(32) as BlobAddress, sealed: blob })).ok, true);
 		await c.blobAddress("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" as never);
 		await c.diagHash(K3);

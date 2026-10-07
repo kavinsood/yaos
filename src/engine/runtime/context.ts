@@ -390,10 +390,15 @@ export class EngineCtx {
 			r.frozen = 1;
 			r.frozenReason = reason;
 		} }], this.now());
-		this.diag("doc-frozen", { reason, cls: rec?.cls ?? null });
+		this.frozen(stream, reason, rec?.cls ?? null);
+	}
+
+	/** A stream just froze (freeze, or a quarantine record put by an ingest): notice, and the host retargets its views. */
+	frozen(stream: StreamName, reason: string, cls: string | null): void {
+		this.diag("doc-frozen", { reason, cls });
 		this.notice(`frozen:${reason}`);
 		const docId = streamDocId(stream);
-		if (docId) this.opts.onDocFrozen?.(docId, reason);
+		if (docId) this.emit("onDocFrozen", () => this.opts.onDocFrozen?.(docId, reason));
 	}
 
 	/** Open-frame timer multiplier: x4 beyond the daily soft frame budget (DESIGN §i.6). */

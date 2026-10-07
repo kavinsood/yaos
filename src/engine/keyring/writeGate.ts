@@ -64,9 +64,9 @@ export function gatedBlob(inner: BlobPort | null, gate: GateFn): BlobPort | null
 			return inner.maxBlobBytes;
 		},
 		has: (a) => inner.has(a),
-		put: async (address, bytes) => {
+		put: async (address, parts) => {
 			assertWritable(gate);
-			return inner.put(address, bytes);
+			return inner.put(address, parts);
 		},
 		get: (a) => inner.get(a),
 		list: (cursor, signal) => inner.list(cursor, signal),

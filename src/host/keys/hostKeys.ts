@@ -45,7 +45,11 @@ export function createHostKeys(deps: HostKeysDeps): HostKeys {
 	return {
 		async crypto() {
 			const pin = deps.pin();
-			if (pin === undefined || pin.suite === null) return { suite: null, creating: deps.creating() };
+			if (pin === undefined || pin.suite === null) {
+				// Starts the §6.1 wait without awaiting it, so the first persist (pairing, creation) seldom waits.
+				void deps.store?.ready();
+				return { suite: null, creating: deps.creating() };
+			}
 			if (pin.suite === 0) return { suite: 0 };
 			const store = deps.store;
 			if (!store) return { suite: 1, keys: [], records: [] };
@@ -59,6 +63,9 @@ export function createHostKeys(deps: HostKeysDeps): HostKeys {
 			try {
 				if (deps.pin()?.suite === 0) throw new KeyRefused();
 				if (!deps.store) throw new KeyStoreError("unavailable");
+				// §6.1 Startup: before SecretStorage loaded it reads null but still saves (testkit/fakeSecretStorage.ts), so a
+				// merge then would replace the stored keys. The wait runs once per store, KEY_STORE_WAIT_MS at most.
+				await deps.store.ready();
 				counts = deps.store.merge(change);
 			} finally {
 				zero(change);

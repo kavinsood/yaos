@@ -275,7 +275,7 @@ export function identityCrypto(hash?: HashPort): CryptoPort {
 			suite !== CryptoSuite.none ? { ok: false, reason: "unsupported-suite" }
 			: keyEpoch !== 0 ? { ok: false, reason: "unknown-key" }
 			: { ok: true, plaintext: sealed.slice() },
-		sealBlob: async ({ plaintext }) => plaintext.slice(),
+		sealBlob: async ({ plaintext }) => [plaintext.slice()],
 		openBlob: async ({ sealed }) => ({ ok: true, plaintext: sealed.slice() }),
 		blobAddress: async (h) => h as string as BlobAddress,
 		diagHash: async (bytes) => {

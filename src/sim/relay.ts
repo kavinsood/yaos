@@ -19,7 +19,7 @@ import type { RandomPort } from "../ports/random";
 import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectParams, RelayConnectResult, RelayEvent, RelayLimits, RelayPort } from "../ports/relay";
 import { RelayEngine, type CommitFault, type CommitHook, type SimCommitInfo, type SimRelayCounters } from "./a-relay-engine";
 import { SimRelaySession, type SessionHost } from "./a-relay-session";
-import { RelayStore, type SegmentInfo } from "./a-relay-store";
+import { RelayStore, type SegmentInfo, type StoreFrame, type StoreSnapshot } from "./a-relay-store";
 import {
 	DEFAULT_SIM_DEDUPE_WINDOW,
 	DEFAULT_SIM_GROUP_COMMIT,
@@ -51,7 +51,7 @@ export {
 	SimRelayError,
 	SimRelaySession,
 };
-export type { CommitFault, CommitHook, LinkSpec, SegmentInfo, SimCommitInfo, SimConnectFailureReason, SimRelayCounters, SimRelayOptions, SimRow, SimSessionInfo };
+export type { CommitFault, CommitHook, LinkSpec, SegmentInfo, SimCommitInfo, SimConnectFailureReason, SimRelayCounters, SimRelayOptions, SimRow, SimSessionInfo, StoreFrame, StoreSnapshot };
 
 /** A device's sessions, or one session by id. */
 export type SimTarget = DeviceId | number;
@@ -68,6 +68,10 @@ export class SimRelay implements RelayPort {
 	private readonly host: SessionHost;
 	private readonly readOnly: Set<DeviceId>;
 	private readonly revoked = new Set<DeviceId>();
+	/** Hostile relay: streams hidden from a device (hideFrom). */
+	private readonly hidden = new Map<DeviceId, Set<StreamName>>();
+	/** Rows forge() appended so far (hostile relay). */
+	forgedRows = 0;
 	private defaultLink: LinkSpec;
 	private readonly links = new Map<DeviceId, LinkSpec>();
 	private connectFailure: Failure | null = null;
@@ -109,12 +113,13 @@ export class SimRelay implements RelayPort {
 			groupCommit: { ...DEFAULT_SIM_GROUP_COMMIT, ...options.groupCommit },
 			autoCommit: options.autoCommit ?? true,
 		});
+		this.engine.hiddenFor = (deviceId, stream) => this.isHidden(deviceId, stream);
 		this.host = {
 			clock: this.clock,
 			arrive: (session, msg) => this.engine.arrive(session, msg),
-			feed: (session, afterSeq) => this.http(session, () => this.feedPage(afterSeq)),
-			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.readPage(stream, afterSeq, prefer)),
-			readBatch: (session, reqs) => this.readRequest(session, () => this.readBatchPages(reqs)),
+			feed: (session, afterSeq) => this.http(session, () => this.feedPage(afterSeq, session.deviceId)),
+			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.readPage(stream, afterSeq, prefer, undefined, session.deviceId)),
+			readBatch: (session, reqs) => this.readRequest(session, () => this.readBatchPages(reqs, session.deviceId)),
 			putCheckpoint: (session, stream, coversSeq, expected, bytes) => this.http(session, () => this.checkpointPut(session, stream, coversSeq, expected, bytes)),
 			jitter: (session) => this.jitter(session.link),
 			listenerError: (error) => this.onListenerError(error),
@@ -174,17 +179,20 @@ export class SimRelay implements RelayPort {
 		});
 	}
 
-	private feedPage(afterSeq: Seq): FeedPage {
+	private feedPage(afterSeq: Seq, deviceId: DeviceId | null = null): FeedPage {
 		if (!validSeq(afterSeq)) throw new SimRelayError("invalid_cursor");
 		const limit = Math.max(1, Math.min(SIM_FEED_MAX_LIMIT, Math.floor(this.limits.feedPageRows)));
 		const page = this.store.feed(afterSeq, limit);
-		return { entries: page.changes, throughSeq: page.nextAfter ?? page.head, headSeq: page.head, more: page.nextAfter !== null };
+		const entries = deviceId === null ? page.changes : page.changes.filter((c) => !this.isHidden(deviceId, c.stream));
+		return { entries, throughSeq: page.nextAfter ?? page.head, headSeq: page.head, more: page.nextAfter !== null };
 	}
 
-	private readPage(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean, budget?: number): ReadPage {
+	private readPage(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean, budget?: number, deviceId: DeviceId | null = null): ReadPage {
 		if (!validStreamName(stream)) throw new SimRelayError("invalid_stream");
 		if (!validSeq(afterSeq)) throw new SimRelayError("invalid_cursor");
 		const maxBytes = budget ?? Math.max(1, Math.min(SIM_READ_MAX_BYTES, this.limits.readPageBytes));
+		// A hidden stream reads as one the relay never had (hostile relay, hideFrom).
+		if (deviceId !== null && this.isHidden(deviceId, stream)) return { checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 0, gcSeq: 0, nextAfterSeq: afterSeq, more: false };
 		const page = this.store.read(stream, afterSeq, maxBytes, preferCheckpoint, this.readPageRows);
 		const last = page.rows.length > 0 ? page.rows[page.rows.length - 1]!.seq : page.checkpoint?.coversSeq ?? afterSeq;
 		return {
@@ -194,14 +202,14 @@ export class SimRelay implements RelayPort {
 	}
 
 	/** Server readBatch: request order, one budget; the first entry always served, a later overrun ends the batch. */
-	private readBatchPages(reqs: readonly ReadRequest[]): ReadPage[] {
+	private readBatchPages(reqs: readonly ReadRequest[], deviceId: DeviceId | null = null): ReadPage[] {
 		if (reqs.length === 0 || reqs.length > SIM_READ_BATCH_MAX_STREAMS) throw new SimRelayError("batch_too_large");
 		const maxBytes = Math.max(1, Math.min(SIM_READ_MAX_BYTES, this.limits.readPageBytes));
 		const pages: ReadPage[] = [];
 		let left = maxBytes;
 		for (const r of reqs) {
 			if (pages.length > 0 && left <= 0) break;
-			const page = this.readPage(r.stream, r.afterSeq, r.preferCheckpoint, pages.length > 0 ? left : maxBytes);
+			const page = this.readPage(r.stream, r.afterSeq, r.preferCheckpoint, pages.length > 0 ? left : maxBytes, deviceId);
 			const size = (page.checkpoint?.bytes.byteLength ?? 0) + page.rows.reduce((n, row) => n + row.payload.byteLength, 0);
 			if (pages.length > 0 && size > left) break;
 			pages.push(page);
@@ -407,6 +415,57 @@ export class SimRelay implements RelayPort {
 		this.engine.envDailyUntil = 0;
 		this.epoch = vaultEpoch;
 		for (const session of this.engine.streamSockets().slice()) this.engine.serverClose(session, 1001, null, true);
+	}
+
+	/** The store as of now, for restoreEpoch (a point-in-time-restore target). */
+	snapshot(): StoreSnapshot {
+		return this.store.snapshot();
+	}
+
+	/**
+	 * Point-in-time restore (server D8b: "content == T", a new epoch): buffer dropped, the store becomes `snap`,
+	 * open sockets close 1001. Records committed after T are gone from `k` (e2ee-design §11.5).
+	 */
+	restoreEpoch(snap: StoreSnapshot, vaultEpoch: VaultEpoch): void {
+		this.engine.dropPending();
+		this.store.restore(snap);
+		this.engine.latchUntil = 0;
+		this.engine.envDailyUntil = 0;
+		this.epoch = vaultEpoch;
+		for (const session of this.engine.streamSockets().slice()) this.engine.serverClose(session, 1001, null, true);
+	}
+
+	// ---- hostile relay (e2ee-design §20.2; sim only) ----------------------------------
+
+	/**
+	 * Commit `frames` as new rows (no dedupe: a replay lands again at a new seq) and push each to every open socket
+	 * as committed. Returns the rows.
+	 */
+	forge(frames: readonly StoreFrame[]): readonly SimRow[] {
+		const rows = this.store.forge(frames);
+		this.forgedRows += rows.length;
+		for (const session of this.engine.streamSockets().slice()) {
+			for (const r of rows) {
+				if (this.isHidden(session.deviceId, r.stream)) continue;
+				session.send({ k: "committed", stream: r.stream, seq: r.seq, deviceId: r.deviceId, clientFrameId: r.clientFrameId, payload: r.payload });
+			}
+		}
+		return rows;
+	}
+
+	/** `stream` reads as absent for `deviceId` (feed, read, readBatch) and its rows are not pushed to it; head still counts them. */
+	hideFrom(deviceId: DeviceId, stream: StreamName): void {
+		let set = this.hidden.get(deviceId);
+		if (!set) this.hidden.set(deviceId, (set = new Set()));
+		set.add(stream);
+	}
+
+	unhideFrom(deviceId: DeviceId, stream: StreamName): void {
+		this.hidden.get(deviceId)?.delete(stream);
+	}
+
+	private isHidden(deviceId: DeviceId, stream: StreamName): boolean {
+		return this.hidden.get(deviceId)?.has(stream) ?? false;
 	}
 
 	// ---- introspection -----------------------------------------------------------

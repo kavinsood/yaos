@@ -9,7 +9,7 @@
  * clock (R2's `uploaded`); a PUT overwrite refreshes them.
  */
 
-import type { BlobAddress } from "./crypto";
+import type { BlobAddress, SealedBlobParts } from "./crypto";
 
 /** Addresses per deleteIfUploadedBefore call (relay-wire §11.3.1: 1..100). */
 export const BLOB_DELETE_BATCH = 100;
@@ -36,8 +36,8 @@ export interface BlobPort {
 	readonly maxBlobBytes: number;
 	/** Subset of addresses already stored. */
 	has(addresses: readonly BlobAddress[]): Promise<ReadonlySet<BlobAddress>>;
-	/** Idempotent. Bytes are already sealed by CryptoPort.sealBlob. */
-	put(address: BlobAddress, bytes: Uint8Array): Promise<void>;
+	/** Idempotent. Stores the concatenation of `parts`, as CryptoPort.sealBlob returned them. */
+	put(address: BlobAddress, parts: SealedBlobParts): Promise<void>;
 	/** null = not found (yet). */
 	get(address: BlobAddress): Promise<Uint8Array | null>;
 	/** One page of the vault's blobs after `cursor` (null = from the start). Rejects when `signal` aborts. */

@@ -339,6 +339,35 @@ test("sender: below the revoke floor, or not sealed yet, a record goes to reseal
 	assert.ok(!s.ids().includes(copy!.clientFrameId), "an empty sealed is never sent, whatever the floor");
 });
 
+test("sender: an ns/cfg record to re-seal, or in flight below the floor, holds the later frames of its stream; bodies and other streams do not wait (e2ee-design §14.2)", () => {
+	const { sender, add, clock, ev, gate } = mk();
+	gate.minEpoch = 2;
+	const [n1, n2, c1, b1, b2] = add(rec(NS_STREAM, 10, { keyEpoch: 1 }), rec(NS_STREAM, 10, { keyEpoch: 2 }), rec(CFG_STREAM, 10, { keyEpoch: 2 }), rec(BOUND, 10, { keyEpoch: 1 }), rec(BOUND, 10, { keyEpoch: 2 }));
+	const s = new FakeSession();
+	sender.attach(s);
+	sender.openNs();
+	assert.deepEqual(s.ids(), [b2, c1].map((r) => r!.clientFrameId), "n2 waits behind n1; the body and cfg streams go");
+	assert.deepEqual([...new Set(ev.reseal)], [b1, n1].map((r) => r!.clientFrameId));
+	add({ ...n1!, keyEpoch: 2 });
+	assert.deepEqual(s.ids().slice(2), [n1, n2].map((r) => r!.clientFrameId), "re-sealed: n1, then n2");
+	// A copy (empty sealed) holds the same way.
+	const [copy, n3] = add(rec(CFG_STREAM, 10, { keyEpoch: 2, sealed: new Uint8Array(0) }), rec(CFG_STREAM, 10, { keyEpoch: 2 }));
+	assert.equal(s.ids().length, 4, "n3 waits behind the unsealed copy");
+	add({ ...copy!, sealed: new Uint8Array(10) });
+	assert.deepEqual(s.ids().slice(4), [copy, n3].map((r) => r!.clientFrameId));
+	// In flight under K_1 when the revoke wins: it may commit stale and come back as a copy, so n5 waits for its receipt.
+	sender.remove(b1!.clientFrameId); // replaced by its re-sealed record (fresh id)
+	gate.minEpoch = 0;
+	const [n4] = add(rec(NS_STREAM, 10, { keyEpoch: 1 }));
+	assert.deepEqual(s.ids().slice(6), [n4!.clientFrameId]);
+	gate.minEpoch = 2;
+	const [n5] = add(rec(NS_STREAM, 10, { keyEpoch: 2 }));
+	assert.equal(s.ids().length, 7, "n5 waits for n4's receipt");
+	sender.onReceipt(n4!.clientFrameId);
+	clock.advance(0);
+	assert.deepEqual(s.ids().slice(7), [n5!.clientFrameId]);
+});
+
 test("sender: the blob gate holds a frame and the later frames of its stream; poke() sends them; reset per session, forget on remove", () => {
 	const holding = new Set<string>();
 	const calls = { reset: 0, forgot: [] as string[] };

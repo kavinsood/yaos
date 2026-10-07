@@ -12,9 +12,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { BLOB_CHUNK_BYTES, MAX_INLINE_UPDATE_BYTES, MAX_LOG_BLOB_BYTES } from "../../core/limits";
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
+import { concatBytes } from "../../core/codec/lib0";
 import { KEYRING_STREAM, streamClass, type DocId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { BlobAddress, CryptoPort } from "../../ports/crypto";
+import type { BlobAddress, CryptoPort, SealedBlobParts } from "../../ports/crypto";
 import { SeededRandom } from "../../sim/random";
 import { SimRelay } from "../../sim/relay";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
@@ -105,7 +106,7 @@ test("oversize-local: an update > MAX_LOG_BLOB_BYTES with no blob store freezes 
 		assert.equal(await a.docText(id), "keep;", "replica = durable state (unsent update discarded)");
 		await assert.rejects(a.editDoc(id, (t) => t.insert(0, "x")), /frozen/);
 
-		assert.deepEqual(await a.releaseQuarantine(id), { passed: 0, dismissed: 0 });
+		assert.deepEqual(await a.releaseQuarantine(a.streamOf(id)), { passed: 0, dismissed: 0 });
 		assert.equal(a.c.repo.stream(a.streamOf(id))!.frozen, 0);
 		await a.editDoc(id, (t) => t.insert(0, "after;"));
 		await converged([a, b]);
@@ -131,8 +132,8 @@ class SharedBlobs implements BlobPort {
 	async has(a: readonly BlobAddress[]): Promise<ReadonlySet<BlobAddress>> {
 		return new Set(a.filter((x) => this.objects.has(x)));
 	}
-	async put(a: BlobAddress, b: Uint8Array): Promise<void> {
-		this.objects.set(a, b.slice());
+	async put(a: BlobAddress, parts: SealedBlobParts): Promise<void> {
+		this.objects.set(a, concatBytes(parts));
 	}
 	async get(a: BlobAddress): Promise<Uint8Array | null> {
 		this.gets++;
@@ -230,7 +231,7 @@ test("suite 1: tampered at rest -> retried with backoff, then the doc freezes bl
 		await until(async () => (await c.docText(id)) === "seed;" + big, 5_000, "c resolved");
 		await sleep(500);
 		assert.equal(b.c.repo.stream(sb)!.frozen, 1, "frozen stays frozen until released");
-		assert.deepEqual(await b.releaseQuarantine(id), { passed: 0, dismissed: 0 });
+		assert.deepEqual(await b.releaseQuarantine(sb), { passed: 0, dismissed: 0 });
 		await until(async () => (await b.docText(id)) === "seed;" + big, 5_000, "b resolved after release");
 		assert.equal(b.c.repo.stream(sb)!.frozen, 0);
 		assert.ok(!b.status().notices.some((n) => n.code === "frozen:blob-corrupt"));

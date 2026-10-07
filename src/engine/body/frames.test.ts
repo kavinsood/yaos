@@ -19,7 +19,7 @@ import { createWebHash } from "../adapters/webHash";
 import { createWebRandom } from "../adapters/webRandom";
 import { gate, type GateCtx } from "../ingest/gate";
 import type { Repo } from "../store/repo";
-import { bytesToHex as toHex } from "../../core/codec/lib0";
+import { bytesToHex as toHex, concatBytes } from "../../core/codec/lib0";
 import { encodeBodyUpdateRef as encodeBodyRef } from "../../core/codec/contents";
 import { FrameBuilder } from "./frameBuilder";
 import { FrameTooLargeError, buildBlobChunkFrame, buildBodyFrames, initialTextUpdates, splitInitialText, type FrameCtx } from "./frames";
@@ -193,9 +193,9 @@ test("buildBodyFrames: BlobPort path puts once (deduped by has), falls back to x
 			if (fail) throw new Error("offline");
 			return new Set(as.filter((a) => store.has(a)));
 		},
-		async put(a, b) {
+		async put(a, parts) {
 			puts++;
-			store.set(a, b);
+			store.set(a, concatBytes(parts));
 		},
 		async get(a) {
 			return store.get(a) ?? null;
@@ -295,7 +295,7 @@ test("suite 1, store path: ref blobs sealed at their address; tampered -> determ
 	const blob: BlobPort = {
 		maxBlobBytes: 10 * 1024 * 1024,
 		has: async (as) => { if (down) throw new Error("offline"); return new Set(as.filter((a) => objects.has(a))); },
-		put: async (a, b) => void objects.set(a, b.slice()),
+		put: async (a, parts) => void objects.set(a, concatBytes(parts)),
 		get: async (a) => { if (down) throw new Error("offline"); return objects.get(a)?.slice() ?? null; },
 		list: async () => { throw new Error("unused"); },
 		deleteIfUploadedBefore: async () => { throw new Error("unused"); },
