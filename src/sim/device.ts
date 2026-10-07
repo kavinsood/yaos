@@ -28,7 +28,6 @@ import { FakeSecretStorage } from "../host/keys/testkit/fakeSecretStorage";
 import { suite0PinForTest } from "../host/keys/testkit/pinFixture";
 import type { HostIdentity } from "../host/runtimeSupport";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
-import { createWebCryptoSuite1 } from "../engine/adapters/webCryptoSuite1";
 import { createEngine, type ComposedEngine, type EngineHandle } from "../engine/compose/protocolEngine";
 import type { VaultRuntime } from "../engine/compose/vaultRuntime";
 import { residentText } from "../engine/compose/runtimeOps";
@@ -36,6 +35,7 @@ import { FAST_TUNING } from "../engine/runtime/testHarness";
 import type { EngineTuning } from "../engine/runtime/options";
 import type { ClockPort } from "../ports/clock";
 import type { VirtualClock } from "./clock";
+import { createDelayedSuite1, delayedHash, realWorkFor } from "./delayedCrypto";
 import { simHashOracle, simHashPort } from "./hash";
 import { SIM_VAULT_ID, type SimNet } from "./net";
 import { hashLabel, SeededRandom } from "./random";
@@ -146,7 +146,7 @@ export class SimDevice {
 		this.deviceId = `dev-${opts.name}` as DeviceId;
 		this.secrets = new FakeSecretStorage(this.secretBacking);
 		this.pinData = opts.pin === null ? {} : { e2ee: opts.pin ?? suite0PinForTest() };
-		this.storage = new MemStoragePort({ beforeNextTimer: opts.clock.beforeNextTimer });
+		this.storage = new MemStoragePort({ beforeNextTimer: opts.clock.beforeNextTimer, macrotask: opts.clock.macrotask });
 		this.vault = new SimVault({ clock: opts.clock, hashes: simHashOracle(), profile: opts.profile ?? "case-sensitive", watcherDelayMs: opts.watcherDelayMs });
 		this.configDir = new SimConfigDir(opts.clock);
 		const mobile = opts.mobile ?? false;
@@ -176,11 +176,13 @@ export class SimDevice {
 			},
 			makePorts: async (config): Promise<EnginePorts> => {
 				if (storageFails) throw new Error("IndexedDB unavailable in worker");
-				const hash = simHashPort();
 				const random = new SeededRandom(hashLabel(`${this.deviceId}#${n}`));
 				const c = config.crypto;
-				// As webEngine.ts: suite 0 seals nothing; unpinned and suite 1 get the suite-1 adapter (keys zero-filled on import).
-				const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
+				// As webEngine.ts: suite 0 seals nothing; unpinned and suite 1 get the suite-1 adapter (keys zero-filled on
+				// import), on Node WebCrypto behind DelayedCrypto: crypto and hash settle on a task, in seed order.
+				const work = c.suite === 0 ? null : realWorkFor(this.opts.clock);
+				const hash = work ? delayedHash(work, simHashPort()) : simHashPort();
+				const crypto = work ? await createDelayedSuite1(work, { vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] }) : createNoopCrypto(hash);
 				return { relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.deviceClock, random, crypto, hash, blob: this.opts.blob?.() ?? null };
 			},
 		});
@@ -273,8 +275,8 @@ export class SimDevice {
 		this.workspace.crashAll();
 		void this.runtime.stop().catch(() => undefined);
 		if (o.wipe) {
-			this.storage = new MemStoragePort({ beforeNextTimer: this.opts.clock.beforeNextTimer });
-			copy = new MemStoragePort({ beforeNextTimer: this.opts.clock.beforeNextTimer });
+			this.storage = new MemStoragePort({ beforeNextTimer: this.opts.clock.beforeNextTimer, macrotask: this.opts.clock.macrotask });
+			copy = new MemStoragePort({ beforeNextTimer: this.opts.clock.beforeNextTimer, macrotask: this.opts.clock.macrotask });
 		}
 		if (o.dropMirrors) this.sideFiles.files.clear();
 		return copy;

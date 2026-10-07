@@ -8,6 +8,10 @@
  *   available, else MessageChannel, else setTimeout 0) so all promise chains
  *   settle before virtual time moves. Nothing else in the sim may use real
  *   timers; then the order of events is a pure function of the seed.
+ * - Real work the sim cannot avoid (WebCrypto under DelayedCrypto) registers
+ *   with addRealWork: the clock waits it out before every idle hook and timer,
+ *   and MemStoragePort's idle checks run on `macrotask` (counted) so that work
+ *   can settle only once every armed check has run.
  * - monotonic() starts at 0 and only moves when a timer fires or advance()
  *   runs past the last timer. now() = wallStart + monotonic + skew.
  *
@@ -73,6 +77,8 @@ export class VirtualClock implements ClockPort {
 	private heap: Timer[] = [];
 	private readonly settle = realMacrotask();
 	private idleHooks: (() => void)[] = [];
+	private readonly realWork: (() => Promise<void> | null)[] = [];
+	private realTasks = 0;
 	/** Timers fired so far. */
 	fired = 0;
 	/** Called on every timer throw; the sim records it as a failure. Default: rethrow. */
@@ -132,6 +138,32 @@ export class VirtualClock implements ClockPort {
 		this.idleHooks.push(fn);
 	};
 
+	/**
+	 * A real macrotask for MemStoragePort's idle check (same timing as realMacrotaskCallback), counted so real work
+	 * (RealWork, delayedCrypto.ts) can wait until every armed check has run before it settles anything.
+	 */
+	readonly macrotask = (fn: () => void): void => {
+		this.realTasks++;
+		void this.settle().then(() => {
+			this.realTasks--;
+			fn();
+		});
+	};
+
+	/** Idle-check macrotasks armed and not yet run. */
+	pendingRealTasks(): number {
+		return this.realTasks;
+	}
+
+	/**
+	 * Real work the clock waits for before it runs an idle hook or fires a timer: `busy()` returns a promise that
+	 * settles when the work is done, or null when there is none (DelayedCrypto: virtual time never moves while a
+	 * crypto call is in flight, so its completion order does not depend on host timing).
+	 */
+	addRealWork(busy: () => Promise<void> | null): void {
+		this.realWork.push(busy);
+	}
+
 	/** Inline-transport delivery on virtual time (0 ms, FIFO). */
 	readonly schedule = (fn: () => void): void => {
 		this.setTimer(0, fn, "deliver");
@@ -152,9 +184,26 @@ export class VirtualClock implements ClockPort {
 		return top ? top.at : null;
 	}
 
-	/** Let every promise chain settle (one real macrotask). */
+	/** Let every promise chain settle (one real macrotask, then any registered real work). */
 	async settleMicrotasks(): Promise<void> {
+		await this.quiesce();
+	}
+
+	/** One real macrotask, then wait out registered real work (a no-op without any: one macrotask as before). */
+	private async quiesce(): Promise<void> {
 		await this.settle();
+		for (;;) {
+			let waited = false;
+			for (const busy of this.realWork) {
+				const p = busy();
+				if (p) {
+					await p;
+					waited = true;
+				}
+			}
+			if (!waited) return;
+			await this.settle();
+		}
 	}
 
 	/**
@@ -162,7 +211,7 @@ export class VirtualClock implements ClockPort {
 	 * is due at or before `limit`.
 	 */
 	async step(limit = Number.POSITIVE_INFINITY): Promise<boolean> {
-		await this.settle();
+		await this.quiesce();
 		while (this.idleHooks.length > 0) {
 			const hooks = this.idleHooks;
 			this.idleHooks = [];
@@ -173,7 +222,7 @@ export class VirtualClock implements ClockPort {
 					this.onError(error, "beforeNextTimer");
 				}
 			}
-			await this.settle();
+			await this.quiesce();
 		}
 		this.prune();
 		const top = this.heap[0];
@@ -197,7 +246,7 @@ export class VirtualClock implements ClockPort {
 		while (await this.step(end)) {
 			if (++steps > maxSteps) throw new Error(`VirtualClock.advance: more than ${maxSteps} steps (${this.pendingLabels().slice(0, 5).join(", ")})`);
 		}
-		await this.settle();
+		await this.quiesce();
 		if (this.mono < end) this.mono = end;
 	}
 
@@ -206,10 +255,10 @@ export class VirtualClock implements ClockPort {
 		const end = this.mono + horizonMs;
 		let steps = 0;
 		for (;;) {
-			await this.settle();
+			await this.quiesce();
 			if (done()) return true;
 			if (!(await this.step(end))) {
-				await this.settle();
+				await this.quiesce();
 				if (done()) return true;
 				if (this.mono < end) this.mono = end;
 				return done();
@@ -228,7 +277,7 @@ export class VirtualClock implements ClockPort {
 		while (await this.step(end)) {
 			if (++steps > maxSteps) throw new Error(`VirtualClock.runUntilIdle: more than ${maxSteps} steps (${this.pendingLabels().slice(0, 5).join(", ")})`);
 		}
-		await this.settle();
+		await this.quiesce();
 		return steps;
 	}
 

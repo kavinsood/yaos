@@ -39,7 +39,7 @@ import type { SimDevice } from "./device";
 import type { OracleDoc, SimNet } from "./net";
 
 export interface Violation {
-	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet";
+	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee";
 	readonly detail: string;
 }
 
