@@ -163,6 +163,7 @@ export class LogEngine {
 				c.dailyLimitPopup(retryAfterMs);
 			},
 			diag: (code, f) => c.diag(code, f),
+			gate: c.touch,
 		});
 		c.live = new LiveIngest(c);
 		c.sess = new SessionLoop(c);

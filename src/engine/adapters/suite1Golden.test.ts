@@ -174,10 +174,10 @@ describe("suite 1 golden vectors", () => {
 			list: async () => { throw new Error("unused"); },
 			deleteIfUploadedBefore: async () => { throw new Error("unused"); },
 		};
-		await putSealed(store, c, HASH, ABC);
+		await putSealed(store, c, HASH, ABC, { reuse: async () => true, noted: async () => {} });
 		assert.deepEqual([...objects.keys()], [GOLDEN.address], "the K_1 address, not the sha256");
 		assert.equal(bytesToHex(objects.get(GOLDEN.address)!), GOLDEN.storeAbc2);
-		await putSealed(store, c, HASH, ABC);
+		await putSealed(store, c, HASH, ABC, { reuse: async () => true, noted: async () => {} });
 		assert.equal(random.calls, 1, "already present (has): not sealed again");
 		const reader = await createWebCryptoSuite1({ vaultId: VAULT, random: new ScriptedRandom(), keys: [{ e: 1, k: K1.slice() }, { e: 2, k: K2.slice() }] });
 		reader.markVerified(1);

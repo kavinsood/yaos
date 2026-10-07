@@ -10,6 +10,7 @@ import { kindOfPath, type ContentHash, type DeviceId, type VaultPath } from "../
 import type { BlobPort } from "../../../ports/blob";
 import type { BlobAddress, CryptoPort } from "../../../ports/crypto";
 import type { SideFileName, SideFilePort } from "../../../ports/vault";
+import type { PutPolicy } from "../../blobs/blobStore";
 import { World } from "../../reconcile/testkit/world";
 import { SnapshotJob, type SnapshotDeps } from "../snapshotJob";
 
@@ -94,7 +95,12 @@ export interface DevOptions {
 	readonly files?: SnapshotDeps["files"];
 	/** Default: sealingCrypto (XOR seal). */
 	readonly crypto?: CryptoPort;
+	/** Default: a present part is always re-used. */
+	readonly touch?: PutPolicy;
 }
+
+/** The pre-GC put policy: anything present is re-used, nothing is recorded. */
+export const REUSE_ALL: PutPolicy = { reuse: async () => true, noted: async () => {} };
 
 export function device(o: DevOptions = {}) {
 	const w = new World();
@@ -102,7 +108,7 @@ export function device(o: DevOptions = {}) {
 	const notices: { level: string; code: string; message: string }[] = [];
 	const diags: string[] = [];
 	const settings = { enabled: o.enabled ?? true, keepDaily: o.keepDaily ?? 7, uploadToBlobStore: o.upload ?? true };
-	const remote = o.store && o.index ? { store: o.store, index: o.index.port(o.self ?? DEV_A) } : null;
+	const remote = o.store && o.index ? { store: o.store, index: o.index.port(o.self ?? DEV_A), touch: o.touch ?? REUSE_ALL } : null;
 	const job = new SnapshotJob({
 		disk: w.gateway, side, clock: w.clock, crypto: o.crypto ?? sealingCrypto, settings: () => settings, remote, deviceLabel: o.label ?? "laptop",
 		files: o.files ?? (() => w.vault.paths().filter((p) => !p.startsWith(".")).map((p) => ({ path: P(p), kind: kindOfPath(P(p)), size: w.vault.bytesOf(p)!.length }))),

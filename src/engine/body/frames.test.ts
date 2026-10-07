@@ -33,7 +33,7 @@ import { DEFAULT_RELAY_LIMITS } from "../adapters/wsRelay";
 const hash = createWebHash();
 const crypto = createNoopCrypto(hash);
 const VAULT = "v1" as VaultId;
-const ctx: FrameCtx = { vaultId: VAULT, self: "dev1" as DeviceId, crypto, hash, random: createWebRandom(), blob: null };
+const ctx: FrameCtx = { vaultId: VAULT, self: "dev1" as DeviceId, crypto, hash, random: createWebRandom(), blob: null, touch: { reuse: async () => true, noted: async () => {} } };
 const gctx: GateCtx = { crypto, vaultId: VAULT, maxCheckpointStateBytes: 1 << 20 };
 const BODY = "b:doc1" as StreamName;
 

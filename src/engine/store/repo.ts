@@ -280,6 +280,34 @@ export class Repo {
 	}
 
 	// -------------------------------------------------------------------------
+	// Own blob PUT times (MetaBlobPut, e2ee-design §10.4 R2/R3)
+	// -------------------------------------------------------------------------
+
+	/** When this device last PUT `address` (device wall clock), or null. */
+	async blobPutAt(address: string): Promise<number | null> {
+		const r = await this.db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, `blobPut:${address}`));
+		return r && "atMs" in r ? r.atMs : null;
+	}
+	noteBlobPut(address: string, atMs: number): Promise<void> {
+		return this.serial("noteBlobPut", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
+			tx.put(STORE.meta, { key: `blobPut:${address}`, atMs });
+		}));
+	}
+	/** Drops PUT times older than `beforeMs` or later than `nowMs` (the clock went back); returns how many. */
+	pruneBlobPuts(beforeMs: number, nowMs: number): Promise<number> {
+		return this.serial("pruneBlobPuts", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
+			const all = await tx.getAll(STORE.meta, { lower: "blobPut:", upper: "blobPut;", upperOpen: true });
+			let n = 0;
+			for (const r of all) {
+				if (!("atMs" in r) || (r.atMs >= beforeMs && r.atMs <= nowMs)) continue;
+				tx.delete(STORE.meta, r.key);
+				n++;
+			}
+			return n;
+		}));
+	}
+
+	// -------------------------------------------------------------------------
 	// T_edit / T_adopt: append own frames (or an adoptable)
 	// -------------------------------------------------------------------------
 

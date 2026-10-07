@@ -17,7 +17,10 @@ import { createNoopCrypto } from "../adapters/noopCrypto";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
 import { createWebHash } from "../adapters/webHash";
-import { BlobFailureStreaks, getOpened, putSealed, storePlaintextCap } from "./blobStore";
+import { BlobFailureStreaks, getOpened, putSealed, storePlaintextCap, type PutPolicy } from "./blobStore";
+/** The pre-GC put policy: a present address is re-used, nothing recorded. */
+const REUSE_ALL: PutPolicy = { reuse: async () => true, noted: async () => {} };
+
 
 const VAULT = "AAAAAAAAAAAAAAAAAAAAAA";
 const MIB = 1024 * 1024;
@@ -61,8 +64,8 @@ test("putSealed: one object at blobAddress(sha256) (never the hash), deduped by 
 	const store = new MemStore();
 	const pt = bytes(5000);
 	const hash = sha256Hex(pt) as ContentHash;
-	await putSealed(store, w, hash, pt);
-	await putSealed(store, w, hash, pt);
+	await putSealed(store, w, hash, pt, REUSE_ALL);
+	await putSealed(store, w, hash, pt, REUSE_ALL);
 	assert.equal(store.puts, 1);
 	const [key] = [...store.objects.keys()];
 	assert.equal(key, await w.blobAddress(hash));
@@ -79,7 +82,7 @@ test("a full snapshot part (8 MiB at a 10 MiB store) sealed under suite 1 is 8 6
 	const part = bytes(snapPartBytes(store.maxBlobBytes), 3);
 	assert.equal(part.length, 8 * MIB);
 	const hash = sha256Hex(part) as ContentHash;
-	await putSealed(store, w, hash, part);
+	await putSealed(store, w, hash, part, REUSE_ALL);
 	const sealed = store.objects.get(await w.blobAddress(hash))!;
 	assert.equal(sealed.length, 8_650_783);
 	assert.equal(sealed.length, sealedBlobBytes(part.length, 1));
@@ -89,7 +92,7 @@ test("a full snapshot part (8 MiB at a 10 MiB store) sealed under suite 1 is 8 6
 	assert.ok(got.ok && got.bytes.length === part.length);
 	// The largest plaintext the suite takes also fits; MemStore refuses anything above maxBlobBytes (413).
 	const max = bytes(MAX_BLOB_PLAINTEXT_BYTES_SUITE1, 4);
-	await putSealed(store, w, sha256Hex(max) as ContentHash, max);
+	await putSealed(store, w, sha256Hex(max) as ContentHash, max, REUSE_ALL);
 	assert.equal(store.puts, 2);
 });
 
@@ -98,7 +101,7 @@ test("getOpened: every failure is unavailable; deterministic only under a verifi
 	const store = new MemStore();
 	const pt = bytes(700, 5);
 	const hash = sha256Hex(pt) as ContentHash;
-	await putSealed(store, w, hash, pt);
+	await putSealed(store, w, hash, pt, REUSE_ALL);
 	const addr = await w.blobAddress(hash);
 	const good = store.objects.get(addr)!;
 	const reader = await port({ tag: 0xb1 });
@@ -141,7 +144,7 @@ test("getOpened at suite 0: the stored bytes are the plaintext; a mismatch is de
 	const store = new MemStore();
 	const pt = bytes(300, 7);
 	const hash = sha256Hex(pt) as ContentHash;
-	await putSealed(store, c, hash, pt);
+	await putSealed(store, c, hash, pt, REUSE_ALL);
 	assert.deepEqual([...store.objects.keys()], [hash], "suite 0: the address is the hash");
 	assert.deepEqual(await getOpened(store, c, hash, sha256Hex), { ok: true, bytes: pt });
 	store.objects.set(hash, flip(pt, 0));

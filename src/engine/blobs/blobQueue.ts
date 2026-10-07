@@ -51,7 +51,7 @@ import type { StorageDb } from "../../ports/storage";
 import type { BlobTransfer } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
 import { STORE, type BlobQueueRecord } from "../store/schema";
-import { BlobFailureStreaks, getOpened, putSealed, storePlaintextCap, type BlobFetch } from "./blobStore";
+import { BlobFailureStreaks, getOpened, putSealed, storePlaintextCap, type BlobFetch, type PutPolicy } from "./blobStore";
 import { assembleChunks, splitChunks, type BlobChunkLog } from "./chunks";
 
 export const BLOB_RETRY_BASE_MS = 2_000;
@@ -67,6 +67,8 @@ export interface BlobQueueDeps {
 	readonly crypto: CryptoPort;
 	/** null = no blob store: log-carried chunks (needs `chunkLog`). */
 	readonly store: BlobPort | null;
+	/** When a present blob may be re-used (e2ee-design §10.4 R2). */
+	readonly touch: PutPolicy;
 	readonly chunkLog: BlobChunkLog | null;
 	readonly notice?: (level: "info" | "warn" | "error", code: string, message: string) => void;
 	/** prefetch() bound: downloads held ahead of their job at once, and their total size. */
@@ -202,7 +204,7 @@ export class BlobQueue implements BlobTransfer {
 			let ok = false;
 			try {
 				if (this.deps.store) {
-					await putSealed(this.deps.store, this.deps.crypto, req.hash as ContentHash, req.bytes);
+					await putSealed(this.deps.store, this.deps.crypto, req.hash as ContentHash, req.bytes, this.deps.touch);
 					ok = true;
 				} else ok = await this.putLog(req.hash as ContentHash, req.bytes);
 			} catch {

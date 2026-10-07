@@ -67,7 +67,7 @@ async function make(opts: { store?: FakeStore | null; log?: FakeChunkLog | null;
 	const notices: string[] = [];
 	const open = async () => BlobQueue.open({
 		db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto: opts.crypto ?? crypto, store, chunkLog: log,
-		notice: (_l, c) => notices.push(c), ahead: opts.ahead,
+		notice: (_l, c) => notices.push(c), ahead: opts.ahead, touch: { reuse: async () => true, noted: async () => {} },
 	});
 	return { storage, clock, crypto, store, log, notices, q: await open(), reopen: open };
 }

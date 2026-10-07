@@ -4,7 +4,7 @@
  */
 
 import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, type Budgets, type DeviceClass } from "../../core/limits";
-import type { DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
+import type { ContentHash, DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { SideFilePort } from "../../ports/vault";
 import type { FrameNoFloor } from "../store/repo";
@@ -52,6 +52,12 @@ export interface EngineTuning {
 	readonly refRetryMaxMs: number;
 	/** §10.2 quarantine: a ref row's deterministic failures must span at least this long (BLOB_QUARANTINE_MIN_MS). */
 	readonly blobQuarantineMinMs: number;
+	/**
+	 * Blob GC grace (e2ee-design §10.4): a sweep deletes an unreferenced blob only if it was uploaded more than this
+	 * long before the cutoff; a device re-uses (R2) or references (R3) a stored blob without re-uploading it only
+	 * while its own upload is younger than half of it.
+	 */
+	readonly blobGcGraceMs: number;
 }
 
 export const DEFAULT_TUNING: EngineTuning = {
@@ -78,6 +84,7 @@ export const DEFAULT_TUNING: EngineTuning = {
 	refRetryMs: BLOB_RETRY_BASE_MS,
 	refRetryMaxMs: BLOB_RETRY_MAX_MS,
 	blobQuarantineMinMs: BLOB_QUARANTINE_MIN_MS,
+	blobGcGraceMs: 7 * 24 * 60 * 60_000,
 };
 
 /** Why a bound body's text changed: "editor" = applyEditorChanges, "merge" = an engine merge (editDoc, mergeJob). */
@@ -136,6 +143,11 @@ export interface EngineOptions {
 	onDiag?(event: DiagnosticsEvent): void;
 	/** A popup for the user (status notices stay in onStatus): the daily-limit warning. */
 	onHostNotice?(level: "warn", code: string, message: string): void;
+	/**
+	 * Plaintext of a blob this device holds locally (an attachment, an own snapshot part), checked against `hash`;
+	 * null = not here. Re-uploads before a stale reference is sent (e2ee-design §10.4 R3) and after a GC sweep (R4).
+	 */
+	blobBytes?(hash: ContentHash): Promise<Uint8Array | null>;
 }
 
 export function resolveTuning(t: Partial<EngineTuning> | undefined): EngineTuning {
