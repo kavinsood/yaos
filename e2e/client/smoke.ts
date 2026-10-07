@@ -27,6 +27,7 @@ import { base64urlEncode } from "../../src/core/codec/ids";
 import type { ClientFrameId, DeviceId, StreamName, VaultId } from "../../src/core/types";
 import type { BlobAddress } from "../../src/ports/crypto";
 import type { RelayConnectResult, RelayEvent, RelaySession } from "../../src/ports/relay";
+import { nodeXhr } from "./nodeXhr";
 import { DEFAULT_LOG_DIR, onboardVault, redact, type OnboardedVault, type OnboardDevice } from "./onboard";
 
 function arg(name: string, fallback: string): string {
@@ -188,8 +189,8 @@ async function main(): Promise<OnboardedVault> {
 	const httpB = createRelayHttp({ baseUrl: HOST, credential: devB.deviceToken, clock });
 
 	step("blob store (R2) over HTTP");
-	const blobA = await probeHttpBlob({ baseUrl: HOST, vaultId, credential: devA.deviceToken, clock });
-	const blobB = await probeHttpBlob({ baseUrl: HOST, vaultId, credential: devB.deviceToken, clock });
+	const blobA = await probeHttpBlob({ baseUrl: HOST, vaultId, credential: devA.deviceToken, clock, xhr: nodeXhr });
+	const blobB = await probeHttpBlob({ baseUrl: HOST, vaultId, credential: devB.deviceToken, clock, xhr: nodeXhr });
 	check("capabilities: attachments on (R2 bound), maxBlobBytes > 0", !!blobA && !!blobB && blobA.maxBlobBytes > 0, { maxBlobBytes: blobA?.maxBlobBytes ?? null });
 	if (blobA && blobB) {
 		const blob = payloadOf("smoke blob", 300 * 1024);

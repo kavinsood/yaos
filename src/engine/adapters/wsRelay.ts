@@ -22,6 +22,7 @@
  * an error message.
  */
 
+import { RELAY_CLOSE } from "../../core/limits";
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { RandomPort } from "../../ports/random";
 import type {
@@ -100,7 +101,7 @@ export const DEFAULT_READY_TIMEOUT_MS = 15_000;
 export const DEFAULT_PROVISIONAL_CACHE_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_PROVISIONAL_CACHE_ENTRIES = 4096;
 /** Client-initiated close after a liveness timeout (no pong). */
-export const LIVENESS_CLOSE_CODE = 4000;
+export const LIVENESS_CLOSE_CODE = RELAY_CLOSE.liveness;
 export const LIVENESS_TIMEOUT_ERROR = "liveness_timeout";
 
 const WS_OPEN = 1;

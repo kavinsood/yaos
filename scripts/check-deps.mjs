@@ -15,6 +15,7 @@ const BROWSER_GLOBALS = [
 	["WebSocket", /\bWebSocket\b/],
 	["fetch", /(?<![.\w])fetch\s*\(/],
 	["crypto.subtle", /\bcrypto\.subtle\b/],
+	["XMLHttpRequest", /\bXMLHttpRequest\b/],
 ];
 
 /**

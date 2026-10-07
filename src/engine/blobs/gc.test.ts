@@ -13,7 +13,7 @@ import { SimBlobStore } from "../../sim/blobStore";
 import { SeededRandom } from "../../sim/random";
 import { createHttpBlob } from "../adapters/httpBlob";
 import { createNoopCrypto } from "../adapters/noopCrypto";
-import { fakeFetch, jsonResponse } from "../adapters/relayTestFakes";
+import { fakeFetch, jsonResponse, routedXhr, type FakeRequest } from "../adapters/relayTestFakes";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
 import { createWebHash } from "../adapters/webHash";
 import { FakeClock } from "../reconcile/testkit/fakes";
@@ -347,7 +347,7 @@ test("HTTP adapter: list and delete retry 429 / 503 list_incomplete after Retry-
 	for (let i = 0; i < 120; i++) objects.set(addr(i), NOW - GRACE - DAY);
 	let lists = 0;
 	let deletes = 0;
-	const f = fakeFetch((req) => {
+	const route = (req: FakeRequest): Response => {
 		const path = req.url.pathname;
 		if (req.method === "PUT") {
 			objects.set(path.split("/").pop()!, NOW);
@@ -372,12 +372,23 @@ test("HTTP adapter: list and delete retry 429 / 503 list_incomplete after Retry-
 			}) });
 		}
 		return jsonResponse({ error: "unexpected" }, 500);
-	});
+	};
+	const f = fakeFetch(route);
 	const waits: number[] = [];
 	const clock = new FakeClock();
+	// The retry waits fire at once; the idle window (never reached) neither fires nor counts.
+	const NEVER = Number.MAX_SAFE_INTEGER;
 	const store = createHttpBlob({
-		baseUrl: "https://r.example", vaultId: "v1", credential: "tok", fetch: f.fetch,
-		clock: { ...clock, now: () => clock.now(), monotonic: () => 0, yieldNow: async () => undefined, clearTimer: () => undefined, setTimer: (ms, fn) => { waits.push(ms); queueMicrotask(fn); return waits.length; } },
+		baseUrl: "https://r.example", vaultId: "v1", credential: "tok", fetch: f.fetch, xhr: routedXhr(route, f.requests), idleMs: NEVER,
+		clock: {
+			...clock, now: () => clock.now(), monotonic: () => 0, yieldNow: async () => undefined, clearTimer: () => undefined,
+			setTimer: (ms, fn) => {
+				if (ms === NEVER) return 0;
+				waits.push(ms);
+				queueMicrotask(fn);
+				return waits.length;
+			},
+		},
 	});
 	const r = rig({ store });
 	const out = await sweepBlobs(r.deps());

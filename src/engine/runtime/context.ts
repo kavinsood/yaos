@@ -12,6 +12,7 @@ import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
 import type { DiagnosticsEvent, EnginePhase, KeyMissingReason, StatusSnapshot } from "../../protocol/status";
 import { BlobTouch, committedBlobHashes } from "../blobs/touch";
+import { TransferLink } from "../blobs/transferLink";
 import { CheckpointState, type CheckpointDeps } from "../body/checkpoints";
 import { DailyLimitNoticeGate } from "./dailyLimit";
 import type { FrameCtx } from "../body/frames";
@@ -63,6 +64,8 @@ export class EngineCtx {
 	readonly deps: EngineDeps;
 	/** R2 put policy and R3 send gate (e2ee-design §10.4). */
 	readonly touch: BlobTouch;
+	/** Aborts the blob store calls in flight when the session loop declares the link dead (blobs/transferLink.ts). */
+	readonly blobLink = new TransferLink();
 	private committedCache: { readonly key: readonly unknown[]; readonly hashes: ReadonlySet<ContentHash> } | null = null;
 	repo!: Repo;
 	ns!: NsRuntime;
@@ -120,8 +123,9 @@ export class EngineCtx {
 		// The one write gate (writeGate.ts): shut until the keyring is open, then whenever it reports key-missing.
 		const gate = (): KeyMissingReason | null => (c.keyring ? c.keyring.keyMissing() : "no-pin");
 		this.gate = gate;
-		// Every blob write (upload, refresh PUT, GC delete) and every seal goes through the gate.
-		const blob = gatedBlob(opts.ports.blob, gate);
+		// Every blob write (upload, refresh PUT, GC delete) and every seal goes through the gate; every transfer is
+		// tied to the link.
+		const blob = this.blobLink.wrap(gatedBlob(opts.ports.blob, gate));
 		const crypto = gatedCrypto(opts.ports.crypto, gate, () => c.keyring?.noteSeal());
 		this.touch = new BlobTouch({
 			store: blob,

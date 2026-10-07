@@ -38,6 +38,8 @@ test("§k.2 rules", () => {
 	assert.equal(check("engine/body/a.ts", `const db = indexedDB.open("x");`).errors.length, 1, "browser global outside adapters");
 	assert.equal(check("engine/adapters/idb.ts", `const db = indexedDB.open("x");`).errors.length, 0);
 	assert.equal(check("engine/body/a.ts", `const s = "fetch(";`).errors.length, 0, "strings are ignored");
+	assert.equal(check("engine/blobs/a.ts", `const x = new XMLHttpRequest();`).errors.length, 1, "XMLHttpRequest outside adapters");
+	assert.equal(check("engine/adapters/httpBlob.ts", `const x = new XMLHttpRequest();`).errors.length, 0);
 	assert.equal(check("host/plugin.ts", `import { createWebEngine } from "../engine/adapters/webEngine";`).errors.length, 0);
 	assert.equal(check("host/engineHost.ts", `import { LogEngine } from "../engine/runtime/engine";`).errors.length, 1);
 	assert.equal(check("host/engineHost.ts", `import { x } from "../engine/body/handles";`).errors.length, 1);

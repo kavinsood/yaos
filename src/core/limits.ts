@@ -180,6 +180,15 @@ export const KEY_STORE_WAIT_MS = 5_000;
  */
 export const MAX_BLOB_UPLOAD_BYTES = 100_000_000;
 
+/**
+ * A blob transfer (PUT, GET, exists) that moves no byte for this long is ended as stalled; the blob queue retries
+ * it with its backoff (adapters/httpBlob.ts). Not a deadline: every byte of progress restarts the window, so a
+ * slow transfer that still moves is never cut. 60 s outlasts TCP's own retransmission backoff on a lossy link that
+ * recovers (RFC 6298: 1 + 2 + 4 + 8 + 16 = 31 s for five losses in a row) and a cellular handover, and matches
+ * the relay socket's idle window (wsRelay DEFAULT_LIVENESS: 60 s idle, then a 15 s ping).
+ */
+export const BLOB_TRANSFER_IDLE_MS = 60_000;
+
 export const RELAY_CLOSE = {
 	normal: 1000,
 	goingAway: 1001,
@@ -189,6 +198,8 @@ export const RELAY_CLOSE = {
 	oversize: 1009,
 	rate: 1013,
 	superseded: 4403,
+	/** The client's own close after its liveness check failed (adapters/wsRelay.ts): the link is dead. */
+	liveness: 4000,
 	/** Legacy semantic-epoch reset; never sent on streams sockets (epoch change = VAULT_READY mismatch). */
 	epoch: 4409,
 } as const;

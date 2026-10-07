@@ -21,6 +21,7 @@ import { createWsRelayPort } from "../../src/engine/adapters/wsRelay";
 import { LogEngine } from "../../src/engine/runtime/engine";
 import type { EngineTuning } from "../../src/engine/runtime/options";
 import { MemSideFiles } from "../../src/engine/runtime/testHarness";
+import { nodeXhr } from "./nodeXhr";
 import { redact, type OnboardDevice, type OnboardedVault } from "./onboard";
 
 // ---- checks + report ---------------------------------------------------------
@@ -134,7 +135,7 @@ export class Device {
 		const clock = createWebClock();
 		const random = createWebRandom();
 		const hash = createWebHash();
-		const blobOpts = { baseUrl: host, vaultId, credential: this.dev.deviceToken, clock };
+		const blobOpts = { baseUrl: host, vaultId, credential: this.dev.deviceToken, clock, xhr: nodeXhr };
 		const blob = await probeHttpBlob(blobOpts);
 		this.engine = await LogEngine.start({
 			ports: {
