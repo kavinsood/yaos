@@ -10,6 +10,7 @@ import { SIM_VAULT_ID, SimNet } from "../../sim/net";
 import type { E2eeStatus, StatusSnapshot } from "../../protocol/status";
 import { sameKeys, VaultKeyStore } from "../../host/keys/secretStore";
 import { fakeEpochKey, fakeGenesisRecord } from "../../host/keys/testkit/kRecords";
+import { testVaultId } from "../../host/keys/testkit/vaultIds";
 import { PinGate, WriteRefused } from "./pinGate";
 
 // --- the gate itself -----------------------------------------------------------------------------------------
@@ -182,7 +183,7 @@ test("creatable: only with the creation marker, on an empty relay with an empty 
 	assert.equal(net.relay.counters().appendFrames, 0, "creatable still writes nothing until a pin");
 	// Not creatable: a marker for another vault, or a relay that already holds data.
 	const other = new SimDevice({ name: "O", clock, net, pin: null });
-	other.pinData = { creating: { vaultId: "another-vault" } };
+	other.pinData = { creating: { vaultId: testVaultId("another") } };
 	void other.start();
 	await clock.advance(5_000);
 	assert.equal(e2eeOf(other)?.creatable, false);

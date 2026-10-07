@@ -10,6 +10,7 @@
  * from a stored pairing or from the server, and nothing here offers a way back to unencrypted.
  */
 
+import { isVaultId } from "../core/codec/ids";
 import type { BrakeReport, DeviceId, VaultId } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { EngineResultValue, EngineSettings, UserCommand } from "../protocol/messages";
@@ -342,6 +343,7 @@ export class YaosController {
 	 * the creating response). Only this marker lets enableE2ee or pinSuite0 "create" through.
 	 */
 	async markCreating(vaultId: string): Promise<void> {
+		if (!isVaultId(vaultId)) throw new TypeError("not a vault id");
 		await this.savePin(markedCreating(this.current, vaultId, this.current.identity?.vaultId ?? null));
 	}
 

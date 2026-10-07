@@ -20,6 +20,7 @@ import { createRelayHttp, RelayHttpError } from "../../src/engine/adapters/relay
 import { createWebClock } from "../../src/engine/adapters/webClock";
 import { createWebRandom } from "../../src/engine/adapters/webRandom";
 import { createWsRelayPort, type WsRelayOptions } from "../../src/engine/adapters/wsRelay";
+import { base64urlEncode } from "../../src/core/codec/ids";
 import type { ClientFrameId, DeviceId, StreamName, VaultId } from "../../src/core/types";
 import type { RelayConnectResult, RelayEvent, RelaySession } from "../../src/ports/relay";
 import { DEFAULT_LOG_DIR, onboardVault, redact, type OnboardedVault, type OnboardDevice } from "./onboard";
@@ -186,7 +187,7 @@ async function main(): Promise<OnboardedVault> {
 	const bogus = await portFor({ deviceToken: `bogus-${random.bytes(4).join("")}` }).connect({ vaultId, deviceId: devA.deviceId as DeviceId });
 	check("bad device token -> unauthorized", !bogus.ok && bogus.reason === "unauthorized", describeConnect(bogus));
 	if (bogus.ok) bogus.session.close(1000, "unexpected");
-	const unknownVault = await portFor(devA).connect({ vaultId: "no-such-vault-wpc" as VaultId, deviceId: devA.deviceId as DeviceId });
+	const unknownVault = await portFor(devA).connect({ vaultId: base64urlEncode(random.bytes(16)) as VaultId, deviceId: devA.deviceId as DeviceId });
 	check("unknown vault -> refused (unauthorized|not-found)", !unknownVault.ok
 		&& (unknownVault.reason === "unauthorized" || unknownVault.reason === "not-found"), describeConnect(unknownVault));
 	if (unknownVault.ok) unknownVault.session.close(1000, "unexpected");

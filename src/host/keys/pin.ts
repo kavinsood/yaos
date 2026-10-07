@@ -15,6 +15,8 @@
  * set, and only it allows enableE2ee and pinSuite0 "create".
  */
 
+import { isVaultId } from "../../core/codec/ids";
+
 export type E2eePin =
 	| { readonly suite: null; readonly keyringSeen: true }
 	| { readonly suite: 0 }
@@ -43,7 +45,7 @@ export function sanitizePin(raw: unknown): E2eePin | undefined {
 export function sanitizeCreating(raw: unknown): CreatingMarker | undefined {
 	if (!raw || typeof raw !== "object") return undefined;
 	const v = (raw as { vaultId?: unknown }).vaultId;
-	return typeof v === "string" && v.length > 0 && v.length <= 256 ? { vaultId: v } : undefined;
+	return typeof v === "string" && isVaultId(v) ? { vaultId: v } : undefined;
 }
 
 /** The pinned suite, null when unpinned. */

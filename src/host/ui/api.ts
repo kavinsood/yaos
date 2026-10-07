@@ -9,6 +9,7 @@ import type { EngineSettings, UserCommand, EngineResultValue } from "../../proto
 import type { StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
 import type { TrashMode } from "../../ports/vault";
+import { isVaultId } from "../../core/codec/ids";
 import { sanitizeCreating, sanitizePin, type CreatingMarker, type E2eePin } from "../keys/pin";
 import {
 	DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, normalizeDeviceName, normalizeHost, normalizePairingCode,
@@ -149,12 +150,13 @@ export function sanitizeIdentity(raw: unknown): PairedIdentity | null {
 	} catch {
 		return null;
 	}
-	if (typeof r.vaultId !== "string" || !r.vaultId.trim() || r.vaultId.length > 256) return null;
+	// Exactly a vaultId (22-char canonical base64url, server DECISIONS §2.1): nothing trimmed, nothing else trusted.
+	if (typeof r.vaultId !== "string" || !isVaultId(r.vaultId)) return null;
 	if (typeof r.deviceId !== "string" || !DEVICE_ID_RE.test(r.deviceId)) return null;
 	if (typeof r.deviceToken !== "string" || !DEVICE_TOKEN_RE.test(r.deviceToken)) return null;
 	return {
 		host,
-		vaultId: r.vaultId.trim(),
+		vaultId: r.vaultId,
 		deviceId: r.deviceId,
 		deviceToken: r.deviceToken,
 		deviceName: typeof r.deviceName === "string" ? normalizeDeviceName(r.deviceName) : "",

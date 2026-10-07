@@ -9,7 +9,7 @@ import type { HostUiSink } from "./hostRuntime";
 import { secretIdFor, VaultKeyStore } from "./keys/secretStore";
 import { fakeEpochKey, fakeGenesisRecord } from "./keys/testkit/kRecords";
 import { withSuite0PinForTest } from "./keys/testkit/pinFixture";
-import { testVaultId } from "./keys/testkit/vaultIds";
+import { BAD_VAULT_IDS, testVaultId } from "./keys/testkit/vaultIds";
 import { hostNotice, PinRefusedError, YaosController } from "./pluginController";
 import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "./ui/api";
 
@@ -291,6 +291,8 @@ test("keyringChanged with a pending record, or a store that cannot write, pins n
 test("creation marker (§15.1): written before enroll, kept across it; creatable reaches the status; main lets create through", async () => {
 	const w = setup();
 	await w.ctl.start();
+	for (const bad of BAD_VAULT_IDS) await assert.rejects(w.ctl.markCreating(bad), TypeError, JSON.stringify(bad));
+	assert.equal(w.saved.length, 0, "a non-vaultId never reaches data.json");
 	await w.ctl.markCreating(ID.vaultId);
 	assert.deepEqual(w.saved.at(-1)?.creating, { vaultId: ID.vaultId });
 	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: ID })), 5_000);

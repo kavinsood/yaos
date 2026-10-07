@@ -4,8 +4,9 @@ import { UI_COMMANDS } from "./commands";
 import { defaultPluginData, type EngineRunState, type PairedIdentity, type YaosPluginData } from "./api";
 import type { StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
+import { testVaultId } from "../keys/testkit/vaultIds";
 
-const IDENTITY: PairedIdentity = { host: "https://h.example", vaultId: "v", deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "t".repeat(43), deviceName: "Mac", vaultGeneration: null };
+const IDENTITY: PairedIdentity = { host: "https://h.example", vaultId: testVaultId("v"), deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "t".repeat(43), deviceName: "Mac", vaultGeneration: null };
 
 function host(opts: { run?: EngineRunState["phase"]; phase?: StatusSnapshot["phase"]; brake?: BrakeReport | null; paired?: boolean }) {
 	const data: YaosPluginData = { ...defaultPluginData("Mac"), identity: opts.paired ? IDENTITY : null };
