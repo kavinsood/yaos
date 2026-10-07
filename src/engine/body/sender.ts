@@ -11,11 +11,13 @@
  *    opened only after the reconnect late-receipt reads (DESIGN §d.7);
  *  - daily-limit hold, canWrite / forbidden, durability backoff;
  *  - probe mode after a 1008/1009 close: one frame in flight; a frame that
- *    triggers the close again is poisoned.
+ *    triggers the close again is poisoned;
+ *  - the blob gate (blobs/touch.ts, e2ee-design §10.4 R3): a frame it holds also
+ *    holds the later frames of its stream for that pass.
  */
 
 import { APPEND_BYTES_PER_SEC, NS_SEND_WINDOW, RELAY_CLOSE } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, type ClientFrameId } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, type ClientFrameId, type StreamName } from "../../core/types";
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { RelaySession, RefusalReason } from "../../ports/relay";
 import type { OutboxRecord } from "../store/schema";
@@ -37,6 +39,17 @@ export interface SenderDeps {
 	/** waitMs: the hold; retryAfterMs: the relay's delay to its reset, null when it did not say. */
 	onDailyLimit(waitMs: number, retryAfterMs: number | null): void;
 	diag(code: string, fields: Record<string, string | number | boolean | null>): void;
+	/** Per-frame send gate (blobs/touch.ts BlobTouch); poke() when a held frame may go. */
+	readonly gate?: SendGate;
+}
+
+export interface SendGate {
+	/** false = hold this frame (and later frames of its stream) for now. */
+	ready(rec: OutboxRecord): boolean;
+	/** New session. */
+	reset(): void;
+	/** The record left the sender. */
+	forget(cfid: ClientFrameId): void;
 }
 
 interface Entry {
@@ -132,6 +145,7 @@ export class Sender {
 		this.nsOpen = false;
 		this.readOnly = !session.canWrite;
 		this.bucket.setCapacity(Math.min(MAX_BURST, session.limits.burstBytes || MAX_BURST));
+		this.deps.gate?.reset();
 		this.pump();
 	}
 	detach(): void {
@@ -160,6 +174,7 @@ export class Sender {
 	}
 	remove(cfid: ClientFrameId): void {
 		if (this.entries.delete(cfid)) this.dirty = true;
+		this.deps.gate?.forget(cfid);
 		const b = this.inflight.get(cfid);
 		if (b !== undefined) {
 			this.inflight.delete(cfid);
@@ -249,6 +264,11 @@ export class Sender {
 		this.schedule(0);
 	}
 
+	/** A gated frame may be sendable now. */
+	poke(): void {
+		this.schedule(0);
+	}
+
 	private clearTimer(): void {
 		if (this.timer !== null) this.deps.clock.clearTimer(this.timer);
 		this.timer = null;
@@ -309,6 +329,7 @@ export class Sender {
 		const nsWindow = this.window();
 		const maxInflight = this.deps.maxInflightBytes();
 		let nextWake = Infinity;
+		const held = new Set<StreamName>();
 		for (const e of this.order()) {
 			const cfid = e.rec.clientFrameId;
 			if (this.inflight.has(cfid)) continue;
@@ -317,6 +338,11 @@ export class Sender {
 			if (isNs && (!this.nsOpen || !nsWindow.has(cfid))) continue;
 			if (e.retryAtMono > now) {
 				nextWake = Math.min(nextWake, e.retryAtMono - now);
+				continue;
+			}
+			if (held.has(e.rec.stream)) continue;
+			if (this.deps.gate && !this.deps.gate.ready(e.rec)) {
+				held.add(e.rec.stream);
 				continue;
 			}
 			const bytes = e.rec.sealed.length;

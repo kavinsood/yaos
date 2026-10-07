@@ -126,6 +126,10 @@ export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineR
 			rt.sched.request({ t: "full" });
 			return { t: "ok" };
 		}
+		case "cleanUpAttachments": {
+			const r = await rt.log.cleanUpBlobs(() => rt.blobs.liveHashes());
+			return { t: "attachmentsCleaned", ...r };
+		}
 		default:
 			return { t: "ok" };
 	}

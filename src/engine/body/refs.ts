@@ -16,7 +16,7 @@
  */
 
 import { MAX_DOC_TEXT_CHARS, MAX_LOG_BLOB_BYTES } from "../../core/limits";
-import { blobChunkStream, streamClass, type ContentHash, type StreamName } from "../../core/types";
+import { blobChunkStream, streamClass, type StreamName } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { CryptoPort, HashPort } from "../../ports/crypto";
 import { getOpened } from "../blobs/blobStore";
@@ -24,7 +24,9 @@ import { checkYjsUpdate } from "../ingest/yjsCheck";
 import type { Repo } from "../store/repo";
 import type { TailRecord } from "../store/schema";
 import { decodeBlobChunk, decodeBodyUpdateRef } from "../../core/codec/contents";
-import { bytesToHex, concatBytes } from "../../core/codec/lib0";
+import { bytesToHex } from "../../core/codec/lib0";
+import type { BlobChunkContent } from "../../core/envelope";
+import { assembleChunks } from "../blobs/chunks";
 
 export interface RefDeps {
 	readonly repo: Repo;
@@ -33,25 +35,14 @@ export interface RefDeps {
 	readonly blob: BlobPort | null;
 }
 
-/** Assemble x: chunk contents (any order, duplicates ok). null if incomplete or inconsistent. */
-export function assembleChunks(contents: readonly Uint8Array[], hash: ContentHash): Uint8Array | null {
-	const parts = new Map<number, Uint8Array>();
-	let total = -1;
-	let totalSize = -1;
+/** Decoded x: chunk contents; undecodable ones dropped (the gate admitted them as opaque blobChunk rows). */
+export function decodeChunks(contents: readonly Uint8Array[]): BlobChunkContent[] {
+	const out: BlobChunkContent[] = [];
 	for (const c of contents) {
 		const d = decodeBlobChunk(c);
-		if (!d || d.hash !== hash) continue;
-		if (total === -1) {
-			total = d.total;
-			totalSize = d.totalSize;
-		} else if (d.total !== total || d.totalSize !== totalSize) continue;
-		if (!parts.has(d.index)) parts.set(d.index, d.chunk);
+		if (d) out.push(d);
 	}
-	if (total <= 0 || parts.size !== total || totalSize > MAX_LOG_BLOB_BYTES) return null;
-	const ordered: Uint8Array[] = [];
-	for (let i = 0; i < total; i++) ordered.push(parts.get(i)!);
-	const out = concatBytes(ordered);
-	return out.length === totalSize ? out : null;
+	return out;
 }
 
 export type RefResolution =
@@ -79,11 +70,10 @@ export async function resolveRef(deps: RefDeps, stream: StreamName, refContent: 
 		}
 	}
 	const rows = await deps.repo.getTail(blobChunkStream(await deps.crypto.blobAddress(ref.hash)));
-	const assembled = assembleChunks(rows.map((r) => r.content), ref.hash);
-	if (assembled) {
-		if ((await sha256(assembled)) === ref.hash && valid(assembled)) return { ok: true, bytes: assembled };
-		deterministic = true;
-	}
+	const assembled = assembleChunks(ref.hash, decodeChunks(rows.map((r) => r.content)));
+	if (assembled.ok && valid(assembled.bytes)) return { ok: true, bytes: assembled.bytes };
+	// Committed rows only grow: inconsistent or mismatching chunks stay so; incomplete ones may complete.
+	if (assembled.ok || assembled.reason !== "incomplete") deterministic = true;
 	return { ok: false, deterministic: deterministic && !transient };
 }
 

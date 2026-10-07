@@ -30,9 +30,10 @@ export class SnapRuntime extends FoldRuntime<SnapOp, SnapFoldEvent> {
 		return this.state.coversSeq;
 	}
 
-	protected reset(snap: SnapshotRecord | undefined): void {
+	protected reset(snap: SnapshotRecord | undefined): boolean {
 		const st = snap && snap.encoding === CheckpointEncoding.snapFoldV1 && snap.bytes.length > 0 ? decodeSnapFoldV1(snap.bytes) : null;
 		this.state = st ?? newSnapFold();
+		return !snap || st !== null;
 	}
 
 	protected decodeOps(content: Uint8Array): SnapOp[] | null {
@@ -43,6 +44,11 @@ export class SnapRuntime extends FoldRuntime<SnapOp, SnapFoldEvent> {
 		const events = foldSnapFrame(this.state, { seq: row.seq, deviceId: row.deviceId, ops });
 		for (const e of events) if (e.outcome.t === "ignored" && e.outcome.reason === "unknown-version") this.unknownVersions++;
 		return { events, halted: false };
+	}
+
+	/** A put of an unknown record version: its parts are invisible here (blobs/gc.ts must not collect them). */
+	protected rowGap(ops: readonly SnapOp[]): string | null {
+		return ops.some((op) => op.t === "putUnknown") ? "snap record version unknown" : null;
 	}
 
 	encodeState(): Uint8Array {

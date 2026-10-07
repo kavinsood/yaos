@@ -18,19 +18,37 @@ import { BLOB_QUARANTINE_MIN_MS, BLOB_QUARANTINE_RETRIES } from "../../core/limi
 import { decodeBlobHeader, maxSealedBlobPlaintext } from "../../core/codec/sealedBlob";
 import type { ContentHash } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
-import type { CryptoPort, OpenFailure } from "../../ports/crypto";
+import type { BlobAddress, CryptoPort, OpenFailure } from "../../ports/crypto";
 
 /** Largest plaintext the store path takes under this suite: the transport cap (suite 0), or what still fits it once sealed (suite 1, §7.3). */
 export function storePlaintextCap(crypto: CryptoPort, store: BlobPort): number {
 	return crypto.suite === CryptoSuite.none ? store.maxBlobBytes : maxSealedBlobPlaintext(store.maxBlobBytes);
 }
 
-/** Stores `bytes` (whose sha256 is `hash`) unless the address is already present. Idempotent. */
-export async function putSealed(store: BlobPort, crypto: CryptoPort, hash: ContentHash, bytes: Uint8Array): Promise<void> {
-	const addr = await crypto.blobAddress(hash);
-	const have = await store.has([addr]);
-	if (have.has(addr)) return;
-	await store.put(addr, await crypto.sealBlob({ address: addr, plaintext: bytes }));
+/**
+ * When an upload may re-use a stored blob instead of PUTting it again (e2ee-design §10.4 R2): a GC sweep deletes
+ * unreferenced blobs uploaded more than the grace before its cutoff, so "already stored" alone is not enough.
+ * blobs/touch.ts (BlobTouch) is the engine's policy.
+ */
+export interface PutPolicy {
+	/** The store has `address`: true = skip the PUT. */
+	reuse(hash: ContentHash, address: BlobAddress): Promise<boolean>;
+	/** This device just PUT `address` (persists the PUT time). */
+	noted(hash: ContentHash, address: BlobAddress): Promise<void>;
+}
+
+/** Stores `bytes` (whose sha256 is `hash`) unless the address is present and `policy` re-uses it. Idempotent. */
+export async function putSealed(store: BlobPort, crypto: CryptoPort, hash: ContentHash, bytes: Uint8Array, policy: PutPolicy): Promise<void> {
+	const address = await crypto.blobAddress(hash);
+	const have = await store.has([address]);
+	if (have.has(address) && await policy.reuse(hash, address)) return;
+	await putAt(store, crypto, policy, hash, address, bytes);
+}
+
+/** Seals and PUTs `bytes` at `address` (= blobAddress(hash)) unconditionally; a PUT refreshes the upload time. */
+export async function putAt(store: BlobPort, crypto: CryptoPort, policy: PutPolicy, hash: ContentHash, address: BlobAddress, bytes: Uint8Array): Promise<void> {
+	await store.put(address, await crypto.sealBlob({ address, plaintext: bytes }));
+	await policy.noted(hash, address);
 }
 
 /** Why a blob is unavailable to this reader. */

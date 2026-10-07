@@ -1,16 +1,34 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import type { ClockPort } from "../../ports/clock";
 import type { BlobAddress } from "../../ports/crypto";
-import { BLOB_EXISTS_BATCH, createHttpBlob, DEFAULT_MAX_BLOB_BYTES, probeHttpBlob } from "./httpBlob";
+import { BLOB_EXISTS_BATCH, createHttpBlob, DEFAULT_MAX_BLOB_BYTES, GC_RETRY_ATTEMPTS, probeHttpBlob } from "./httpBlob";
 import { RelayHttpError } from "./relayHttp";
-import { fakeFetch, jsonResponse, type FakeRequest } from "./relayTestFakes";
+import { fakeFetch, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
 
 const TOKEN = "device-token-SECRET";
 const addr = (i: number) => i.toString(16).padStart(64, "0") as BlobAddress;
 
+/** A clock whose timers fire at once, recording their delays. */
+function instantClock(waits: number[]): ClockPort {
+	return {
+		now: () => 0, monotonic: () => 0, yieldNow: async () => undefined, clearTimer: () => undefined,
+		setTimer: (ms, fn) => {
+			waits.push(ms);
+			queueMicrotask(fn);
+			return waits.length;
+		},
+	};
+}
+
 function blob(route: (req: FakeRequest) => Response | "network") {
 	const f = fakeFetch(route);
-	return { port: createHttpBlob({ baseUrl: "https://r.example/", vaultId: "v1", credential: TOKEN, fetch: f.fetch }), requests: f.requests };
+	const waits: number[] = [];
+	return {
+		port: createHttpBlob({ baseUrl: "https://r.example/", vaultId: "v1", credential: TOKEN, fetch: f.fetch, clock: instantClock(waits) }),
+		requests: f.requests,
+		waits,
+	};
 }
 
 async function rejection(p: Promise<unknown>): Promise<RelayHttpError> {
@@ -81,5 +99,101 @@ describe("httpBlob", () => {
 		const port = await probeHttpBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: on.fetch });
 		assert.equal(port?.maxBlobBytes, 1234);
 		await rejection(probeHttpBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: fakeFetch(() => "network").fetch }));
+	});
+
+	it("list() walks pages by the last address and validates their order", async () => {
+		const { port, requests } = blob((req) => {
+			const cursor = req.url.searchParams.get("cursor");
+			if (cursor === null) return jsonResponse({ items: [{ address: addr(1), uploadedAt: 10 }, { address: addr(2), uploadedAt: 20 }], next: addr(2) });
+			return jsonResponse({ items: [{ address: addr(3), uploadedAt: 30 }], next: null });
+		});
+		const first = await port.list(null);
+		assert.deepEqual(first, { items: [{ address: addr(1), uploadedAt: 10 }, { address: addr(2), uploadedAt: 20 }], next: addr(2) });
+		assert.deepEqual(await port.list(first.next), { items: [{ address: addr(3), uploadedAt: 30 }], next: null });
+		assert.equal(requests[0]!.url.pathname, "/vault/v1/blobs");
+		assert.equal(requests[0]!.url.search, "");
+		assert.equal(requests[1]!.url.searchParams.get("cursor"), addr(2));
+		assert.equal(requests[1]!.headers.get("authorization"), `Bearer ${TOKEN}`);
+		for (const bad of [
+			{ items: [{ address: addr(2), uploadedAt: 1 }, { address: addr(1), uploadedAt: 1 }], next: null },
+			{ items: [{ address: "nothex", uploadedAt: 1 }], next: null },
+			{ items: [{ address: addr(1), uploadedAt: -1 }], next: null },
+			{ items: [], next: addr(5) },
+			{ items: [{ address: addr(1), uploadedAt: 1 }] },
+		]) {
+			const e = await rejection(blob(() => jsonResponse(bad)).port.list(addr(5)));
+			assert.equal(e.code, "malformed_response");
+		}
+	});
+
+	it("deleteIfUploadedBefore() posts one batch and returns results in request order", async () => {
+		const { port, requests } = blob((req) => {
+			const body = JSON.parse(String(req.body)) as { ifUploadedBefore: number; addresses: string[] };
+			return jsonResponse({ results: body.addresses.map((address, i) =>
+				i === 0 ? { address, result: "deleted", uploadedAt: 5 } : i === 1 ? { address, result: "newer", uploadedAt: 99 } : { address, result: "absent" }) });
+		});
+		const out = await port.deleteIfUploadedBefore([addr(1), addr(2), addr(3)], 50);
+		assert.deepEqual(out, [
+			{ address: addr(1), result: "deleted", uploadedAt: 5 },
+			{ address: addr(2), result: "newer", uploadedAt: 99 },
+			{ address: addr(3), result: "absent" },
+		]);
+		assert.equal(requests[0]!.method, "POST");
+		assert.equal(requests[0]!.url.pathname, "/vault/v1/blobs/delete");
+		assert.deepEqual(JSON.parse(String(requests[0]!.body)), { ifUploadedBefore: 50, addresses: [addr(1), addr(2), addr(3)] });
+		// Local checks: nothing sent.
+		for (const p of [
+			port.deleteIfUploadedBefore([], 50),
+			port.deleteIfUploadedBefore(Array.from({ length: 101 }, (_v, i) => addr(i)), 50),
+			port.deleteIfUploadedBefore([addr(1), addr(1)], 50),
+			port.deleteIfUploadedBefore([addr(1)], -1),
+		]) await rejection(p);
+		assert.equal(requests.length, 1);
+		const swapped = blob((req) => {
+			const body = JSON.parse(String(req.body)) as { addresses: string[] };
+			return jsonResponse({ results: body.addresses.reverse().map((address) => ({ address, result: "absent" })) });
+		});
+		assert.equal((await rejection(swapped.port.deleteIfUploadedBefore([addr(1), addr(2)], 1))).code, "malformed_response");
+	});
+
+	it("GC routes retry 429/503 after Retry-After, bounded, and give up on a missing or long one", async () => {
+		let calls = 0;
+		const limited = blob(() => (++calls <= 2
+			? jsonResponse({ error: calls === 1 ? "too_many_attempts" : "list_incomplete" }, calls === 1 ? 429 : 503, { "Retry-After": String(calls * 3) })
+			: jsonResponse({ items: [], next: null })));
+		assert.deepEqual(await limited.port.list(null), { items: [], next: null });
+		assert.deepEqual(limited.waits, [3000, 6000]);
+		assert.equal(limited.requests.length, 3);
+
+		const forever = blob(() => jsonResponse({ error: "too_many_attempts" }, 429, { "Retry-After": "1" }));
+		const exhausted = await rejection(forever.port.deleteIfUploadedBefore([addr(1)], 5));
+		assert.deepEqual([exhausted.status, exhausted.code, exhausted.retryAfterMs], [429, "too_many_attempts", 1000]);
+		assert.equal(forever.requests.length, GC_RETRY_ATTEMPTS);
+
+		const bare = blob(() => jsonResponse({ error: "attachments_unavailable" }, 503));
+		assert.equal((await rejection(bare.port.list(null))).code, "attachments_unavailable");
+		assert.equal(bare.requests.length, 1);
+		const long = blob(() => jsonResponse({ error: "too_many_attempts" }, 429, { "Retry-After": "3600" }));
+		assert.equal((await rejection(long.port.list(null))).retryAfterMs, 3_600_000);
+		assert.equal(long.requests.length, 1);
+	});
+
+	it("an aborted signal stops a GC call before it is sent and during a Retry-After wait", async () => {
+		const ctl = new AbortController();
+		ctl.abort();
+		const idle = blob(() => jsonResponse({ items: [], next: null }));
+		assert.equal((await rejection(idle.port.list(null, ctl.signal))).code, "aborted");
+		assert.equal(idle.requests.length, 0);
+
+		const waiting = new AbortController();
+		const clock = new ManualClock();
+		const f = fakeFetch(() => jsonResponse({ error: "too_many_attempts" }, 429, { "Retry-After": "30" }));
+		const port = createHttpBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: f.fetch, clock });
+		const pending = port.deleteIfUploadedBefore([addr(1)], 5, waiting.signal);
+		while (clock.pendingTimers === 0) await new Promise((r) => setImmediate(r));
+		waiting.abort();
+		assert.equal((await rejection(pending)).code, "aborted");
+		assert.equal(clock.pendingTimers, 0, "the wait's timer is cleared");
+		assert.equal(f.requests.length, 1);
 	});
 });

@@ -10,6 +10,7 @@ import { Notice, type Modal, type Plugin } from "obsidian";
 import type { BrakeReport } from "../../core/types";
 import type { UserCommand } from "../../protocol/messages";
 import { pendingBrake, type YaosUiHost } from "./api";
+import { cleanUpAttachments } from "./attachmentsCleanup";
 import { BrakeTracker } from "./brake";
 import { BrakeModal } from "./brakeModal";
 import { UI_COMMANDS, type UiCommandId } from "./commands";
@@ -134,6 +135,9 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		"yaos-create-snapshot": () => send({ t: "createSnapshot" }, "snapshot created."),
 		"yaos-browse-snapshots": openSnapshots,
 		"yaos-rebuild-local-cache": () => { void confirmAndRebuildCache(app, host); },
+		"yaos-clean-up-attachments": () => {
+			void cleanUpAttachments(host, (message, level) => { new Notice(`YAOS: ${message}`, level === "error" ? 10000 : 6000); });
+		},
 		"yaos-restart-engine": () => { void restartSyncEngine(host); },
 	};
 	for (const spec of UI_COMMANDS) {

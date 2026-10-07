@@ -71,6 +71,8 @@ export abstract class FoldRuntime<Op, E> {
 	private allocated = false;
 	/** Floor carried by epoch migration (meta frameNoFloor). */
 	frameNoFloor = 0;
+	/** coversSeq of a stored snapshot reset() could not use (the state started empty), else null. */
+	private unusableSnapshot: Seq | null = null;
 
 	constructor(
 		protected readonly repo: Repo,
@@ -84,8 +86,8 @@ export abstract class FoldRuntime<Op, E> {
 	/** foldRulesVersion written into checkpoints. */
 	abstract readonly rulesVersion: number;
 	abstract get coversSeq(): Seq;
-	/** Replace the committed state from the snapshot (undefined / unusable -> empty). */
-	protected abstract reset(snap: SnapshotRecord | undefined): void;
+	/** Replace the committed state from the snapshot (undefined / unusable -> empty). false = it was unusable. */
+	protected abstract reset(snap: SnapshotRecord | undefined): boolean;
 	/** null = deterministic malformation (folds as an empty frame). */
 	protected abstract decodeOps(content: Uint8Array): Op[] | null;
 	protected abstract foldFrame(row: TailRecord, ops: readonly Op[]): { readonly events: readonly E[]; readonly halted: boolean };
@@ -98,7 +100,7 @@ export abstract class FoldRuntime<Op, E> {
 	async load(): Promise<FoldedFrame<Op, E>[]> {
 		const run = async () => {
 			const snap = await this.repo.getSnapshot(this.stream);
-			this.reset(snap);
+			this.unusableSnapshot = this.reset(snap) ? null : snap!.coversSeq;
 			this.halted = null;
 			this.through = Math.max(this.coversSeq, snap?.coversSeq ?? 0);
 			const folded = await this.doAdvance();
@@ -149,6 +151,41 @@ export abstract class FoldRuntime<Op, E> {
 		}
 		this.through = target;
 		return out;
+	}
+
+	/**
+	 * Why the committed state may lack what the relay's rows say (blobs/gc.ts precondition), or null: the fold
+	 * halted; the stored snapshot did not decode (reset() started empty); a tail row up to appliedSeq did not open
+	 * (reader-dependent), failed the gate (stored empty), does not decode, is not folded yet, or holds an op this
+	 * reader ignores for being newer than it (rowGap). Folds the available rows first.
+	 */
+	async gap(): Promise<{ readonly seq: Seq; readonly reason: string } | null> {
+		await this.advance();
+		const run = async () => {
+			if (this.halted) return { seq: this.halted.seq, reason: `halted (${this.halted.reason})` };
+			if (this.unusableSnapshot !== null) return { seq: this.unusableSnapshot, reason: "snapshot does not decode" };
+			const rec = this.repo.stream(this.stream);
+			if (!rec) return null;
+			const snap = await this.repo.getSnapshot(this.stream);
+			for (const row of await this.repo.getTail(this.stream, snap?.coversSeq ?? 0, rec.appliedSeq)) {
+				if (row.flags & LOCAL_FLAG_UNOPENED) return { seq: row.seq, reason: "row does not open" };
+				if (row.content.length === 0) return { seq: row.seq, reason: "row failed the gate" };
+				const ops = this.decodeOps(row.content);
+				if (!ops) return { seq: row.seq, reason: "row does not decode" };
+				const why = this.rowGap(ops);
+				if (why) return { seq: row.seq, reason: why };
+				if (row.seq > this.coversSeq) return { seq: row.seq, reason: "row not folded" };
+			}
+			return null;
+		};
+		const p = this.busy.then(run, run);
+		this.busy = p.catch(() => undefined);
+		return p;
+	}
+
+	/** An op of a committed row this reader folds as ignored although a newer reader may not (null = none). */
+	protected rowGap(_ops: readonly Op[]): string | null {
+		return null;
 	}
 
 	private halt(seq: Seq, reason: FoldHalt["reason"]): void {

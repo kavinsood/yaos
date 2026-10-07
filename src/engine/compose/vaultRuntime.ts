@@ -13,7 +13,8 @@
  * and after IndexedDB recovery (before the first pass of the new DB).
  */
 
-import type { BrakeReport, DocId, DocKind, PathKey, PlanScope, VaultEpoch, VaultPath } from "../../core/types";
+import type { BrakeReport, ContentHash, DocId, DocKind, PathKey, PlanScope, VaultEpoch, VaultPath } from "../../core/types";
+import { bytesToHex } from "../../core/codec/lib0";
 import type { Budgets } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
@@ -32,6 +33,7 @@ import { LogEngine } from "../runtime/engine";
 import type { EngineTuning } from "../runtime/options";
 import type { FrameNoFloor } from "../store/repo";
 import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
+import { listLocal, partName } from "../snapshots/localStore";
 import { SnapshotJob } from "../snapshots/snapshotJob";
 import type { FoldedNsFrame } from "../sync/nsRuntime";
 import type { BoundDisk } from "./boundDisk";
@@ -159,6 +161,7 @@ export class VaultRuntime {
 			onOwnBodySettled: (docIds) => holder.rt?.onOwnBodySettled(docIds),
 			onStatus: (s) => holder.rt?.onLogStatus(s),
 			onHostNotice: (level, code, message) => engine.link.post({ t: "notice", level, code, message }),
+			blobBytes: (hash) => holder.rt?.localBlobBytes(hash) ?? Promise.resolve(null),
 		});
 		const rt = new VaultRuntime(o, log);
 		holder.rt = rt;
@@ -214,7 +217,7 @@ export class VaultRuntime {
 		const tz = o.tzOffsetMinutes ?? (() => 0);
 		// Prefetch: with the running job's own download, at most blobConcurrency transfers; held bytes bounded.
 		const ahead = { count: Math.max(0, c.budgets.blobConcurrency - 1), bytes: c.budgets.maxDiskIoBytesInFlight };
-		this.blobs = await BlobQueue.open({ db, clock: ports.clock, crypto: ports.crypto, store: ports.blob, chunkLog: this.port.chunks, notice: this.notice, ahead });
+		this.blobs = await BlobQueue.open({ db, clock: ports.clock, crypto: ports.crypto, store: ports.blob, touch: c.touch, chunkLog: this.port.chunks, notice: this.notice, ahead });
 		this.rec = await Reconciler.open({
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
@@ -232,7 +235,7 @@ export class VaultRuntime {
 		}
 		this.snaps = new SnapshotJob({
 			disk: link.disk, side: link.sideFiles, clock: ports.clock, crypto: ports.crypto, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,
-			remote: ports.blob ? { store: ports.blob, index: this.port.snap } : null,
+			remote: ports.blob ? { store: ports.blob, index: this.port.snap, touch: c.touch } : null,
 			pathKey, deviceLabel: config.deviceLabel, tzOffsetMinutes: tz, notice: this.notice, diag: (l) => this.diag(l),
 		});
 		this.mirror = new SyncedMirrorWriter({
@@ -248,6 +251,39 @@ export class VaultRuntime {
 		}));
 		if (this.lastLog?.phase === "live") this.onLogStatus(this.lastLog);
 		this.sched.request({ t: "full" });
+	}
+
+	/**
+	 * Local plaintext of blob `hash` (EngineOptions.blobBytes: e2ee-design §10.4 R3 / R4 re-uploads), checked
+	 * against it: a vault file the local tree has at that hash, a config file the cfg view stores as that blob, or
+	 * a part of an own local snapshot. null = none here.
+	 */
+	async localBlobBytes(hash: ContentHash): Promise<Uint8Array | null> {
+		if (this.stopped || !this.rec) return null;
+		const { ports } = this.o;
+		const link = this.engine.link;
+		const check = async (bytes: Uint8Array | null | undefined): Promise<Uint8Array | null> =>
+			bytes && bytesToHex(await ports.hash.sha256(bytes)) === hash ? bytes : null;
+		for (const l of this.rec.ctx.local.values()) {
+			if (l.excluded || l.kind !== "blob" || l.hash !== hash) continue;
+			const r = await this.rec.ctx.read(l.diskPath, l.size).catch(() => null);
+			const got = await check(r?.ok ? r.bytes : null);
+			if (got) return got;
+		}
+		const c = this.log.c;
+		for (const [file, reg] of c.cfg.view(c.outbox).files) {
+			if (reg.value?.content.t !== "blob" || reg.value.content.hash !== hash) continue;
+			const got = await check(await link.configDir.readBytes(file).catch(() => null));
+			if (got) return got;
+		}
+		for (const s of await listLocal(link.sideFiles).catch(() => [])) {
+			for (let i = 0; i < s.record.parts.length; i++) {
+				if (s.record.parts[i]!.sha256 !== hash) continue;
+				const got = await check(await link.sideFiles.read(partName(s.id, i)).catch(() => null));
+				if (got) return got;
+			}
+		}
+		return null;
 	}
 
 	private snapshotFiles(): { path: VaultPath; kind: DocKind; size: number }[] {

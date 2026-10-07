@@ -31,9 +31,10 @@ export class CfgRuntime extends FoldRuntime<CfgOp, CfgFoldEvent> {
 		return this.state.coversSeq;
 	}
 
-	protected reset(snap: SnapshotRecord | undefined): void {
+	protected reset(snap: SnapshotRecord | undefined): boolean {
 		const st = snap && snap.encoding === CheckpointEncoding.cfgFoldV1 && snap.bytes.length > 0 ? decodeCfgFoldV1(snap.bytes) : null;
 		this.state = st ?? newCfgFoldState();
+		return !snap || st !== null;
 	}
 
 	protected decodeOps(content: Uint8Array): CfgOp[] | null {

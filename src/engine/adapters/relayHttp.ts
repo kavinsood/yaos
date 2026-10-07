@@ -115,6 +115,7 @@ export const READ_BATCH_MAX_QUERY_CHARS = 6000;
 function parsePage(body: Json, afterSeq: number): ReadPage | null {
 	const lastSeq = seqField(body, "lastSeq");
 	const checkpointSeq = seqField(body, "checkpointSeq") ?? 0;
+	const gcSeq = seqField(body, "gcSeq") ?? 0;
 	const rawRows = body["rows"];
 	const nextAfterRaw = body["nextAfter"];
 	const nextAfter = nextAfterRaw === null || nextAfterRaw === undefined ? null : seqField(body, "nextAfter");
@@ -140,7 +141,7 @@ function parsePage(body: Json, afterSeq: number): ReadPage | null {
 		}
 		const lastRow = rows.length > 0 ? rows[rows.length - 1] : undefined;
 		const nextAfterSeq = nextAfter ?? lastRow?.seq ?? checkpoint?.coversSeq ?? afterSeq;
-		return { checkpoint, rows, lastSeq, checkpointSeq, nextAfterSeq, more: nextAfter !== null };
+		return { checkpoint, rows, lastSeq, checkpointSeq, gcSeq, nextAfterSeq, more: nextAfter !== null };
 	} catch {
 		return null; // invalid base64
 	}

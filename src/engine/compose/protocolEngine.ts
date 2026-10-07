@@ -412,6 +412,7 @@ export class ComposedEngine {
 			case "restoreSnapshot":
 			case "deleteSnapshot":
 			case "exportDiagnostics":
+			case "cleanUpAttachments":
 				// An empty list or `ok` here would read as "no snapshots" / "done".
 				if (!rt) throw new ProtocolFailure({ code: "not-ready", message: "the sync engine is not running", retryable: true });
 				return rt.command(c);

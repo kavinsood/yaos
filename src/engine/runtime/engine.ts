@@ -36,6 +36,8 @@ import { SnapRuntime } from "../sync/snapRuntime";
 import { NsRuntime, type DocInfo } from "../sync/nsRuntime";
 import * as api from "./logApi";
 import * as blobs from "./blobChunks";
+import { BlobGc } from "./blobGc";
+import type { GcOutcome } from "../blobs/gc";
 import { EngineCtx } from "./context";
 import { DocRuntime } from "./docRuntime";
 import { LiveIngest } from "./liveIngest";
@@ -63,10 +65,12 @@ function rankOf(c: EngineCtx) {
 
 export class LogEngine {
 	readonly maint: Maintenance;
+	private readonly gc: BlobGc;
 	private readonly boundStreams = new Map<DocId, StreamName>();
 
 	private constructor(readonly c: EngineCtx) {
 		this.maint = new Maintenance(c);
+		this.gc = new BlobGc(c);
 	}
 
 	/**
@@ -163,6 +167,7 @@ export class LogEngine {
 				c.dailyLimitPopup(retryAfterMs);
 			},
 			diag: (code, f) => c.diag(code, f),
+			gate: c.touch,
 		});
 		c.live = new LiveIngest(c);
 		c.sess = new SessionLoop(c);
@@ -457,6 +462,14 @@ export class LogEngine {
 		return releaseQuarantine(this.c, this.streamOf(docId));
 	}
 
+	/**
+	 * One blob GC sweep (runtime/blobGc.ts, e2ee-design §10.4). `queued`: hashes local transfers still need.
+	 * Never throws: a refusal or failure is in the outcome.
+	 */
+	cleanUpBlobs(queued: () => Iterable<ContentHash>): Promise<GcOutcome> {
+		return this.gc.run(queued);
+	}
+
 	/** Automatic retry of reader-dependent quarantine (runs after every session start). */
 	retryQuarantine(): Promise<number> {
 		return retryReaderQuarantine(this.c);
@@ -522,6 +535,7 @@ export class LogEngine {
 	async stop(): Promise<void> {
 		const c = this.c;
 		if (c.stopped) return;
+		await this.gc.stop();
 		try {
 			await this.flush();
 		} catch (e) {
