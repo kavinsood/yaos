@@ -78,7 +78,7 @@ Images, PDFs and other non-note files sync through an R2 bucket bound as `YAOS_B
 - the server refuses attachment uploads;
 - notes keep syncing.
 
-Uploads are limited to 10 MiB per file. Reset and restore keep attachments; deleting a vault removes them.
+Uploads are limited to 100 MB per file, Cloudflare's request size limit on the Free and Pro plans. Reset and restore keep attachments; deleting a vault removes them.
 
 <a href="https://youtu.be/Z7xCMEYfdFM">
   <img src="https://img.youtube.com/vi/Z7xCMEYfdFM/maxresdefault.jpg" width="480" alt="Watch the R2 setup video" />
@@ -128,7 +128,7 @@ server refuses writes until the limit resets; the console shows the reset time.
 
 **Attachments do not sync.** If the console's header line says attachments are off, add the `YAOS_BUCKET` R2 binding
 and redeploy. Also check **Sync attachments** and **Maximum attachment size (MB)** in YAOS settings. The server
-accepts at most 10 MiB per file.
+accepts at most 100 MB per file (Cloudflare's request size limit); an encrypted vault fits a little less, about 98.5 MB.
 
 **Files not syncing.** Check **Excluded paths** in YAOS settings. Then use **Export diagnostics**, which saves a
 file without note contents or credentials. If sync seems stuck, use **Rebuild local cache**.
