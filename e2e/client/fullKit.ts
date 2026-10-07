@@ -3,7 +3,11 @@
  * Obsidian surfaces (SimVault, SimWorkspace, SimConfigDir, SimSideFiles, SimPlatform) and the REAL composed
  * engine (createEngine on the inline carrier) with the production ports: wsRelay, idbStorage on a per-device
  * fake-indexeddb IDBFactory (kept across restarts), httpBlob when the relay advertises it (else null:
- * attachments ride the log as x: blob chunks), suite-0 crypto, web clock/hash/random. Real timers.
+ * attachments ride the log as x: blob chunks), crypto by init.crypto as webEngine.ts picks it (suite 0: the
+ * identity adapter; suite 1 and unpinned: webCryptoSuite1), web clock/hash/random. Real timers.
+ *
+ * A client runs its own HostRuntime (suite-0 fixture pin), or the plugin controller's (`runtimeFor`, e2ee.ts):
+ * then main's real pin and key flow (src/host/pluginController.ts) decides the pin and restarts the engine.
  *
  * NetSwitch wraps the RelayPort (and the blob port) so a device can go offline: connect answers
  * "unavailable", live sessions drop abruptly (1006) and session RPCs fail like a lost network (src/sim/net.ts).
@@ -19,12 +23,13 @@ import type { EngineSettings } from "../../src/protocol/messages";
 import type { StatusSnapshot } from "../../src/protocol/status";
 import type { EngineCarrier } from "../../src/host/engineHost";
 import { engineHashOracle } from "../../src/host/hashOracle";
-import { HostRuntime } from "../../src/host/hostRuntime";
-import { createHostKeys } from "../../src/host/keys/hostKeys";
+import { HostRuntime, type HostUiSink } from "../../src/host/hostRuntime";
+import { createHostKeys, type HostKeys } from "../../src/host/keys/hostKeys";
 import type { E2eePin } from "../../src/host/keys/pin";
 import { VaultKeyStore } from "../../src/host/keys/secretStore";
 import { FakeSecretStorage } from "../../src/host/keys/testkit/fakeSecretStorage";
 import { suite0PinForTest } from "../../src/host/keys/testkit/pinFixture";
+import type { HostIdentity } from "../../src/host/runtimeSupport";
 import { DEFAULT_ENGINE_SETTINGS } from "../../src/host/ui/api";
 import { createEngine, type EngineHandle } from "../../src/engine/compose/protocolEngine";
 import type { VaultRuntime } from "../../src/engine/compose/vaultRuntime";
@@ -32,6 +37,7 @@ import type { EngineTuning } from "../../src/engine/runtime/options";
 import { createHttpBlob, probeHttpBlob } from "../../src/engine/adapters/httpBlob";
 import { createIdbStoragePort } from "../../src/engine/adapters/idbStorage";
 import { createNoopCrypto } from "../../src/engine/adapters/noopCrypto";
+import { createWebCryptoSuite1 } from "../../src/engine/adapters/webCryptoSuite1";
 import { RelayHttpError } from "../../src/engine/adapters/relayHttp";
 import { createWebClock } from "../../src/engine/adapters/webClock";
 import { createWebHash } from "../../src/engine/adapters/webHash";
@@ -247,7 +253,10 @@ export class FullClient {
 				const blob = await probeHttpBlob(blobOpts).catch(() => createHttpBlob(blobOpts));
 				this.blobKind = blob ? "http" : "log";
 				const storage = createIdbStoragePort(this.factory, IDBKeyRange);
-				return { relay, storage: tr ? tr.wrapStorage(storage) : storage, clock, random, crypto: createNoopCrypto(hash), hash, blob: this.net.wrapBlob(blob) };
+				const c = config.crypto;
+				// As webEngine.ts: suite-1 keys are zero-filled once imported; unpinned gets the adapter with no key.
+				const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
+				return { relay, storage: tr ? tr.wrapStorage(storage) : storage, clock, random, crypto, hash, blob: this.net.wrapBlob(blob) };
 			},
 		});
 		this.handle = handle;
@@ -264,22 +273,39 @@ export class FullClient {
 
 	private makeRuntime(): HostRuntime {
 		const { o } = this;
+		return this.hostRuntime(
+			{ vaultId: o.vaultId as VaultId, deviceId: o.device.deviceId as DeviceId, deviceLabel: o.name, relay: { url: o.host, credential: o.device.deviceToken } },
+			() => ({ ...DEFAULT_ENGINE_SETTINGS, syncSettings: true, ...o.settings }),
+			createHostKeys({ store: new VaultKeyStore(this.secrets, o.vaultId, this.clock), pin: () => this.pin, creating: () => false }),
+			null,
+		);
+	}
+
+	/**
+	 * The plugin controller's runtime (ControllerEnv.makeRuntime): it becomes this client's runtime, and the
+	 * controller's UI sink sees everything this client's `ui` records.
+	 */
+	runtimeFor(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink, keys: HostKeys): HostRuntime {
+		this.runtime = this.hostRuntime(identity, settings, keys, ui);
+		return this.runtime;
+	}
+
+	private hostRuntime(identity: HostIdentity, settings: () => EngineSettings, keys: HostKeys, also: HostUiSink | null): HostRuntime {
 		return new HostRuntime({
 			clock: this.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
 			workspace: this.workspace, platform: this.platform,
-			identity: { vaultId: o.vaultId as VaultId, deviceId: o.device.deviceId as DeviceId, deviceLabel: o.name, relay: { url: o.host, credential: o.device.deviceToken } },
-			settings: () => ({ ...DEFAULT_ENGINE_SETTINGS, syncSettings: true, ...o.settings }),
+			identity, settings,
 			createWorker: () => null,
 			createInline: () => this.carrier(),
 			pingEnabled: true,
-			keys: createHostKeys({ store: new VaultKeyStore(this.secrets, o.vaultId, this.clock), pin: () => this.pin, creating: () => false }),
+			keys,
 			log: (line) => this.log(`host: ${line}`),
 			ui: {
-				onStatus: (s) => { this.ui.statuses.push(s); if (this.ui.statuses.length > 50) this.ui.statuses.shift(); },
-				onBrake: (b) => this.ui.brakes.push(b),
-				onNotice: (level, code, message) => this.ui.notices.push({ level, code, message }),
-				onCarrier: (c) => this.ui.carriers.push({ carrier: c.carrier, ready: c.ready, fallbackReason: c.fallbackReason }),
-				onFatal: (e) => this.ui.fatals.push(e),
+				onStatus: (s) => { this.ui.statuses.push(s); if (this.ui.statuses.length > 50) this.ui.statuses.shift(); also?.onStatus(s); },
+				onBrake: (b) => { this.ui.brakes.push(b); also?.onBrake(b); },
+				onNotice: (level, code, message) => { this.ui.notices.push({ level, code, message }); also?.onNotice(level, code, message); },
+				onCarrier: (c) => { this.ui.carriers.push({ carrier: c.carrier, ready: c.ready, fallbackReason: c.fallbackReason }); also?.onCarrier(c); },
+				onFatal: (e) => { this.ui.fatals.push(e); also?.onFatal(e); },
 			},
 		});
 	}

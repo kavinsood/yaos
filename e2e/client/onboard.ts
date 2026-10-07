@@ -221,6 +221,15 @@ export async function onboardVault(baseUrlRaw: string, opts: OnboardOptions = {}
 	return vault;
 }
 
+/** Console revoke (relay D7): DELETE /operator/vaults/:id/devices/:deviceId under an operator session. */
+export async function revokeDevice(vault: OnboardedVault, deviceId: string, logDir = DEFAULT_LOG_DIR): Promise<void> {
+	const key = loadContext(contextPath(vault.baseUrl, logDir)).operatorRecoveryKey;
+	if (!key) throw new Error(`no operator key is known for ${vault.baseUrl}`);
+	const cookie = await operatorLogin(vault.baseUrl, key);
+	const r = await http(vault.baseUrl, "DELETE", `/operator/vaults/${encodeURIComponent(vault.vaultId)}/devices/${encodeURIComponent(deviceId)}`, { cookie });
+	if (r.status !== 200 || r.value.ok !== true) throw new Error(`revoke failed ${r.status} ${errorOf(r.value)}`);
+}
+
 /** Enrolls one more device into an onboarded vault (pairing code minted by device 0). Mutates vault.devices. */
 export async function pairDevice(vault: OnboardedVault, name: string, logDir = DEFAULT_LOG_DIR): Promise<OnboardDevice> {
 	const owner = vault.devices[0];
