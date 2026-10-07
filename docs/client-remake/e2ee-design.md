@@ -949,11 +949,23 @@ vault. Any local copy of the files on disk can seed a new vault.
    devices are already enrolled. Each other device scans it, or enters the RK. It checks kcv against `k`
    (§11.3), stores K_r and leaves `key-missing`.
 4. **Own frames sealed under an epoch < r that commit after S_rot** are stale (§14.3), so readers ignore them.
-   Their author handles them as in `refused frame-id-conflict` (DESIGN §i.6 table):
-   - body: re-seal the same update under a fresh clientFrameId, since Yjs updates are idempotent;
-   - ns and cfg: re-plan the ops under a fresh frame id.
-
-   Unsent outbox frames under an epoch < r are re-sealed under r before sending.
+   As implemented (WP-E3; `src/engine/sync/ingestRow.ts` `ownCommitCopy`, `src/engine/store/repo.ts` `settleOwn`,
+   `src/engine/runtime/reseal.ts`), there is no re-plan:
+   - When the receipt of an own frame comes back stale, or held (§14.3, the device has not judged every `k` row
+     below it), the author stores the row as a reader would and renames the outbox record to an **unsealed copy**:
+     a fresh clientFrameId, empty `sealed`, state pending, and the **same frameNo**. If a held row settles as not
+     stale after all, readers fold the copy as `replay-duplicate`, so ns and cfg ops apply once.
+   - **Unsent or uncommitted outbox records** with `keyEpoch < r`, and the copies, are re-sealed under the
+     current epoch before sending (`OutboxChange {t: "reseal"}`):
+     - ns and cfg, and copies, keep their clientFrameId. The sender opens ns and cfg only after the session's
+       late-receipt reads, so one still in the outbox then never committed;
+     - every other record takes a fresh clientFrameId (a rename at the same outbox order; held dependents are
+       re-pointed), since its old id may have committed with other bytes (R4 `frame-id-conflict`). Yjs updates and
+       chunks are idempotent, so a duplicate is harmless.
+   - A suite-1 sender is write-blocked until the session's `k` read, so an offline device learns r before it sends
+     anything sealed under an older epoch.
+   - Unsealed copies are not mirrored (`selectMirrorFrames`): a mirror recovery re-derives them from disk.
+   - `refused frame-id-conflict` for ns and cfg still poisons, as in DESIGN §i.6.
 5. **Checkpoints.** Nothing is forced. New checkpoints are sealed under r at the normal cadence (DESIGN §d.9
    checkpoint policy). Old checkpoints with coversSeq ≤ S_rot stay valid.
 
@@ -963,7 +975,18 @@ For the winning revoke epoch r, committed at S_rot in the current vaultEpoch:
 - a frame with `keyEpoch < r` and `seq > S_rot` is **stale**: ignored, not quarantined (§9.3);
 - a checkpoint with `keyEpoch < r` and `coversSeq > S_rot` is rejected (treated as absent).
 
-Devices that have not re-keyed still learn r from the record header, so they apply the rule too.
+As implemented (WP-E3, `KeyringRuntime.staleCheck`), the rule is decided when the gate judges the row, and the
+answer is `"stale"`, `"hold"` or null (always null under suite 0):
+- **Hold** means the device cannot judge yet. It applies to a row at seq s if some `k` row below s has arrived but
+  is not judged, if `k` was not read on this session, or if the `k` stream is itself stale. A held ns or cfg row is
+  stored unopened (`LOCAL_FLAG_UNOPENED`) and halts the fold; a held body row is quarantined `"keyring-hold"`, which
+  freezes the doc until it settles. A live batch ends after a `k` event, so rows behind a revoke wait for it.
+- **Devices that have not re-keyed** do not learn r from the record header alone: an open revoke (a winning revoke
+  for an epoch whose key the device lacks) shuts the write gate (`revoked-epoch`) and holds every row past it.
+  When the re-key QR or RK arrives (§14.2 step 3), the held and unopened rows are re-gated: stale ones are
+  dismissed and rows under r open.
+- A stale ns or cfg row is stored with `LOCAL_FLAG_STALE_EPOCH` and empty content and folds as `"stale-epoch"`;
+  a stale body, canvas or `x` row is only accounted: ignored, with no quarantine and no freeze (§9.3).
 
 - **After a reset or restore**, S_rot is the seq of the re-published revoke record (§11.5). Between the new
   vaultEpoch's first row and that re-publish, the server could inject old-epoch frames that the revoked device
@@ -1242,8 +1265,8 @@ export interface KeyringCrypto {
   - padding (§7.3) is applied when `suite ≠ 0`, between the inner encoding and `seal`, and stripped after `open`;
   - `sealEnvelope` / `openEnvelope` are the one seal/open implementation (`src/engine/ingest/envelope.ts` wraps
     them). They check the kind against the stream class; checkpoint *content* checks (coversSeq, encoding, size)
-    stay in the ingest gate. Until WP-E3 the keyring stream `k` is treated like an unknown class: the codec
-    answers `kind-stream-mismatch` and the gate ignores `k` rows.
+    stay in the ingest gate. Since WP-E3, `k` rows are not envelopes: the gate stores them as `keyRecord` tail
+    rows and the keyring decodes them (§11.1).
 - `src/core/types.ts`:
   - `NsFoldState` and `CfgFoldState` gain `readonly replay: Map<DeviceId, { r: number; bits: bigint }>` (64-bit
     window);
@@ -1253,15 +1276,17 @@ export interface KeyringCrypto {
   - `MAX_FRAME_CONTENT_BYTES` (:49, today 1 MiB − 4 KiB) → 1015808 (§7.3);
   - new `MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 10223615`;
   - new `REPLAY_WINDOW = 64` and `PADME_FLOOR_BYTES = 256` (WP-E2);
-  - `ROLL_SEQ_SPAN = 2 ** 23` and `ROLL_OWN_SEALS = 2 ** 22` land with the roll (WP-E3), `KEY_STORE_WAIT_MS = 5000`
-    with host key storage (WP-E4): constants arrive with their first user.
-- `QuarantineReason` (`src/engine/store/schema.ts:186`) gains `"crypto-downgrade"` and `"envelope-padding"`.
+  - `ROLL_SEQ_SPAN = 2 ** 23` (:89) and `ROLL_OWN_SEALS = 2 ** 22` (:91) landed with the roll (WP-E3);
+    `KEY_STORE_WAIT_MS = 5000` lands with host key storage (WP-E4): constants arrive with their first user.
+- `QuarantineReason` (`src/engine/store/schema.ts:220`) gains `"crypto-downgrade"` and `"envelope-padding"` (WP-E2),
+  and `"stale-epoch"` (a stale checkpoint, treated as absent) and `"keyring-hold"` (§14.3 undecided; re-gated after
+  the next keyring change) (WP-E3).
 
 ### 18.3 IndexedDB (`src/engine/store/schema.ts`)
 
 | Store / record | Change |
 |---|---|
-| `OutboxRecord` (:156) | + `frameNo: number \| null` (ns/cfg; WP-E2). + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2) lands with the re-seal in WP-E3 |
+| `OutboxRecord` (:156) | + `frameNo: number \| null` (ns/cfg; WP-E2). + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2 step 4; WP-E3). An empty `sealed` is an unsealed copy of an own stale commit, sealed before sending |
 | `TailRecord` | + `frameNo: number` (0 outside ns/cfg and for rows that failed the gate; WP-E2). Own rows carry the allocator's max across restarts (§8.2) |
 | `MetaRecord` | + `MetaKeyring {key: "keyring"; sealEpoch; epochs: {e, firstSeq, kind, verified}[]; revokeEpoch: number \| null; sRot: Seq \| null; ownSeals: number}`. **No key bytes** (§6.1) |
 | `MetaRecord` | + `MetaFrameNoFloor {key: "frameNoFloor"; ns: number; cfg: number}`, written by epoch migration (§8.2) |
@@ -1288,15 +1313,28 @@ readonly crypto:
 | { readonly t: "pinSuite0"; readonly source: "link" | "create" }             // §12.4 (ii) / (iii): ok only if `k` is empty at head
 | { readonly t: "revokeRekey"; readonly rk: Uint8Array }                      // §14.2; a new RK is generated on main
 
-// EngineToMain (:187) gains:
-| { readonly t: "keyringChanged"; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
+// EngineToMain (:187) gains (a request, like hostIo):
+| { readonly t: "keyringChanged"; readonly rid: RequestId; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
     readonly records: readonly Uint8Array[]; readonly pending: number | null }   // main persists before replying
+
+// MainResultValue gains the reply:
+| { readonly t: "keyringStored" }
+
+// ProtocolErrorCode gains:
+| "refused"   // a key or pin command the device's state does not allow; also main's answer when it cannot store keys
 ```
+
+- **`keyringSeen` is not in `init.crypto`** (the shape above is kept verbatim). The engine starts with
+  `keyringSeen: false` and reports it in `status.e2ee` once it reads a `k` record; main stores the sticky flag
+  from there and enforces it when it handles `pinSuite0 {source: "link"}`
+  (`src/engine/compose/vaultRuntime.ts` `e2eeOf`).
 
 - `status.ts`: `EnginePhase` gains `"key-missing"`, already named in DESIGN §c.3. `StatusSnapshot` gains
   `e2ee: { suite: 0 | 1 | null; sealEpoch: number; keyMissing: "no-pin" | "no-key" | "revoked-epoch" |
   "encrypted-vault" | null; keyringSeen: boolean; creatable: boolean }`. There are no secrets in status.
   - `suite: null` is an unpinned device (§12.4).
+  - `StatusSnapshot.e2ee` is declared optional only so that older snapshot literals type-check; the engine always
+    sets it.
   - `creatable` is true only for an engine started with `creating: true` that has read `VAULT_READY.head = 0` and
     an empty `k` (§15.1 step 3).
   - **The engine never sets a pin.** Main sets it from (i) `keyringChanged` after a verified key, (ii) and (iii)
@@ -1479,6 +1517,23 @@ There is one agent per package. Sizes: S ≈ 1 agent-day, M ≈ 2–3, L ≈ 4�
 | **E8** Docs | Apply §18.5 and §18.6 to relay-wire.md and DESIGN.md | E2 merged | Docs match the code | S |
 
 Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b waits for A3.
+
+**E3 as built** (where the code differs from the text above; the sections cited are updated):
+- §18.4 protocol shapes landed with E3, not E4: `init.crypto`, the five UserCommands, `keyringChanged` (with a
+  `rid`), the `keyringStored` reply, the `"refused"` error code, `StatusSnapshot.e2ee` and phase `key-missing`.
+  Main refuses `keyringChanged` (`"refused"`) until E4 stores keys, and starts every device unpinned.
+- One write gate (`src/engine/keyring/writeGate.ts`): while `keyMissing` is set, the engine's crypto port
+  (`gatedCrypto`) refuses to seal and its blob port (`gatedBlob`) refuses to upload; the sender holds the outbox,
+  doc frames are not closed and maintenance writes no checkpoint. An open revoke shuts it (`revoked-epoch`).
+  There is no "absent means suite 0" default anywhere in the engine.
+- §14.3 is decided at gate time with hold and re-gate; own stale commits become unsealed copies (§14.2 step 4).
+  Unopened rows are re-gated after every keyring change, which also ends the old halt on ns rows under an
+  unknown key.
+- An RK that does not open a genesis or revoke `recoveryWrap` leaves the record pending, not invalid: a wrong or
+  older RK cannot be told from a forged wrap (`src/engine/keyring/evaluate.ts:85`). A device that only has an RK
+  older than the latest revoke needs the re-key QR.
+- An in-engine runtime restart (a new vaultEpoch, or a retry) reuses the ports, so the crypto port keeps keys
+  learned since init.
 
 ## 22. Decisions (resolved)
 
