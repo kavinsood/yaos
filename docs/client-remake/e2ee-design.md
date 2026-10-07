@@ -270,11 +270,13 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
     arrives from an authenticated source (§12.4). Nothing the server says sets or lowers a pin.
   - A pin is never lowered: 1 → 0 does not exist (§15.2).
 - **Startup.** `getSecret` may return null before the store has loaded. Wait for SecretStorage's `changed` event
-  for up to 5 s before deciding the key is missing. The store loads everything at app start, then fires `changed`
-  ([S] asar).
+  for up to 5 s (`KEY_STORE_WAIT_MS`) before deciding the key is missing. The store loads everything at app start,
+  then fires `changed` ([S] asar). A suite-1 start waits; an unpinned or suite-0 start reads nothing.
 - **Linux desktop without an OS keyring.** SecretStorage stores plaintext and Obsidian shows
-  `msgSecretsNotEncrypted` ([S] asar). YAOS adds a persistent status notice, and the vault-folder trust level
-  applies.
+  `msgSecretsNotEncrypted` ([S] asar). YAOS tells the user once per vault, with a notice the first time it stores or
+  loads a key on such a device (`isEncryptionAvailable()` is false; runtime-only, not in obsidian.d.ts). The
+  "shown" flag lives in the vault's local storage (`App.loadLocalStorage` / `saveLocalStorage`), never in
+  `data.json`. The vault-folder trust level applies.
 - **Forget keys** (leave the vault or disable the device) writes `""`. There is no delete API. Whether `""` is
   accepted is **[U]**.
 - **Trust.** Any plugin in the vault can read any secret. Non-extractable CryptoKeys are hygiene, not a boundary:
@@ -823,6 +825,15 @@ none is something the server says.
 - `data.json` holds `e2ee` as one of: absent (unpinned), `{suite: null, keyringSeen: true}`, `{suite: 0}` or
   `{suite: 1}`. `keyringSeen` is sticky. It is set the first time an unpinned device reads a `k` genesis for its
   vault, and from then on (ii) is refused.
+- **No migration, no inference.** A `data.json` without `e2ee` is unpinned, whatever else it holds. A device paired
+  before this design (a stored identity, a synced vault, a full IndexedDB) is blocked like any key-less join and is
+  settled only by (i) or (ii). There is no "absent means suite 0" rule. Nothing is inferred from a stored pairing,
+  from local state or from anything the server says. Leaving the vault (unpair, another vault or relay) drops the
+  pin and forgets the keys (§6.1).
+- **Harnesses pin explicitly.** The sim and e2e harnesses either set the pin the way a real device gets it, or use
+  a clearly test-only fixture that writes the same `data.json` state the real flow writes
+  (`src/host/keys/testkit/pinFixture.ts` applies main's own suite-0 transition). `scripts/check-deps.mjs` keeps
+  `testkit/**` out of product code, so no production path can pin by fixture.
 
 **Key-less join.** This is any enrollment by a code that arrived without `key` or `suite`:
 - a code typed into the pair modal;
@@ -1288,9 +1299,15 @@ readonly crypto:
 | { readonly t: "pinSuite0"; readonly source: "link" | "create" }             // §12.4 (ii) / (iii): ok only if `k` is empty at head
 | { readonly t: "revokeRekey"; readonly rk: Uint8Array }                      // §14.2; a new RK is generated on main
 
-// EngineToMain (:187) gains:
-| { readonly t: "keyringChanged"; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
+// EngineToMain (:187) gains (a request: main answers `result` or `error` with the same rid):
+| { readonly t: "keyringChanged"; readonly rid: RequestId; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
     readonly records: readonly Uint8Array[]; readonly pending: number | null }   // main persists before replying
+
+// MainResultValue gains:
+| { readonly t: "keyringStored" }   // keyringChanged is stored (persist-before-use)
+
+// errors.ts ProtocolErrorCode gains "refused": a key or pin command this device's pin or `k` refuses (not retryable).
+// PROTOCOL_VERSION 2 → 3.
 ```
 
 - `status.ts`: `EnginePhase` gains `"key-missing"`, already named in DESIGN §c.3. `StatusSnapshot` gains
@@ -1306,6 +1323,14 @@ readonly crypto:
 - **Persist-before-use.** The engine does not seal under a new epoch until main acknowledges `keyringChanged`
   (the result of the same rid). A crash can therefore never leave committed rows under a key no device stored.
 - The RK and QR keys are generated and shown on main (UI). The worker never displays them, and main never logs them.
+- SECRET buffers (`init.crypto` keys, the command's `k` / `rk`, `keyringChanged` keys) are always in the transfer
+  list, and the sender zero-fills whatever it still holds after posting (`wipeSecrets`, `src/protocol/workerTransport.ts`).
+  A command main refuses itself is zero-filled on main and never posted.
+- **Unpinned engine (WP-E4).** The engine's one write gate (`src/engine/compose/pinGate.ts`) hands a VaultRuntime
+  its ports only for suite 0. Any other start runs the `k` reader (`keyReader.ts`) over a read-only relay session
+  (`canWrite` false; `append` and `putCheckpoint` throw) with no storage, blob, crypto or hash port, so it cannot
+  write a frame, checkpoint, blob, ns entry, outbox or mirror. Until WP-E3's keyring runtime lands, suite 1 is
+  closed too (`keyMissing: "no-key"`) and the engine refuses the key commands with `refused`.
 
 ### 18.5 relay-wire.md
 
@@ -1459,6 +1484,10 @@ Each test counts outcomes and asserts **all** of them; none samples a single cas
 - **At-rest leak check (desktop, WP-E4):** after an integration run, grep the IndexedDB LevelDB, `data.json`,
   the diagnostics bundle and the logs for every key and the RK in hex and base64url. Expect zero hits (the same
   method found Chrome's plaintext CryptoKey bytes, §3).
+  - The sim form runs in `test:client` (`src/host/keys/atRest.test.ts`): it scans the fake IndexedDB, `data.json`
+    saves, side files, local storage, the vault, logs, statuses, notices and relay rows for raw bytes, hex,
+    base64(url), decimal lists and typed-array JSON, outside the vault's own SecretStorage entry. It reports counts
+    only. The diagnostics bundle joins it once a key-holding engine runs a VaultRuntime (WP-E3).
 
 ## 21. Work packages
 

@@ -1405,8 +1405,9 @@ All are in `src/core/types.ts`.
 
 ## g. Main ↔ worker protocol
 
-Types are in `src/protocol/*.ts`. `PROTOCOL_VERSION = 2` (2: the body protocol of §d.3 replaced Yjs updates on the
-binding path, and hashing moved to the engine).
+Types are in `src/protocol/*.ts`. `PROTOCOL_VERSION = 3` (2: the body protocol of §d.3 replaced Yjs updates on the
+binding path, and hashing moved to the engine; 3: `init.crypto`, the key commands and `keyringChanged` of
+e2ee-design §18.4).
 
 ### g.1 Carriers
 
