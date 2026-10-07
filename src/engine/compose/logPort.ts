@@ -14,7 +14,7 @@ import { canvasDocHash } from "../reconcile/canvasDoc";
 import type {
 	BodyVersion, CfgFoldState, CfgOp, ContentHash, DocId, NsOp, PathKey, RemoteEntry, Seq, StreamName,
 } from "../../core/types";
-import type { BodyHandle, LogPort, RemoteView } from "../reconcile/deps";
+import type { BodyHandle, LogPort, RemoteView, SubmitNsOptions } from "../reconcile/deps";
 import type { LogEngine } from "../runtime/engine";
 import type { CfgLogPort } from "../settings/cfgSync";
 import type { SnapIndexPort } from "../snapshots/snapIndex";
@@ -101,14 +101,18 @@ export class ComposedLog implements LogPort {
 
 	// ---- LogPort writes ----------------------------------------------------------
 
-	async submitNs(ops: readonly NsOp[]): Promise<void> {
+	async submitNs(ops: readonly NsOp[], opts?: SubmitNsOptions): Promise<void> {
 		if (ops.length === 0) return;
 		try {
-			await this.log.submitNs(ops);
+			await this.log.submitNs(ops, opts);
 		} finally {
 			this.invalidate();
 			this.onSubmit();
 		}
+	}
+
+	corkNs(): () => void {
+		return this.log.corkNs();
 	}
 
 	async acquireBody(docId: DocId, kind: "markdown" | "canvas"): Promise<BodyHandle | null> {

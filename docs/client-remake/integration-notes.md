@@ -374,6 +374,17 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - A disk write right after an epoch reset, with the note open, is overwritten
   when the reset saves the open views (the sim models it as Obsidian's own
   overwrite and exempts it).
+- Live creates (§7.2, DESIGN §d.4) send their body frames right behind the
+  ns create. When such a create folds `merged` (two devices create the same
+  path with the same content within one round trip, outside onboarding), the
+  frames the relay already committed stay as junk rows on the loser's stream;
+  nobody materializes them, but they cost rows until the stream is retired.
+  A create ignored as `invalid-path` / `kind-mismatch` sends its frames too,
+  to a stream with no entry. An engine restart turns un-folded live creates
+  back into held ones (`pendingCreates` is rebuilt with `live: false`).
+- `duplicate-docid` creates are not re-planned (DESIGN said so; nothing did):
+  the frames go to the existing doc and devices converge on one doc with both
+  texts. It needs a 128-bit docId collision.
 
 **Latency (§7.1)**
 - Bootstrap storage work is not batched: ~3 IDB tx per note (the per-stream
@@ -392,9 +403,12 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - Each leading-edge commit costs 2 extra rows per stream it touches (free
   plan row budget); at most one per `gcQuietMs` (1.5 s) per vault. Writes
   closer together than that wait for the merged server's H8 floor (commits
-  at least 1000 ms apart): full e2e `edit_to_peer` ~1000 ms and
-  `create_to_peer` ~2000 ms (two commits per create), local and deployed.
-  This is a server cost bound; the client has no cheap way around it (§7.1).
+  at least 1000 ms apart): the full e2e `sustained_*` writes take ~1000 ms to
+  a peer, creates included since §7.2 (~2000 ms before: two commits per
+  create). A lone write after 1.5 s of quiet takes the leading edge: locally
+  ~140 ms for a note edit or create, ~240 ms for a disk edit, 250-380 ms for
+  an attachment (§7.2). The floor is a server cost bound; the client has no
+  cheap way around it (§7.1).
 - The bench and e2e run the inline carrier with the tablet budget (4 lanes,
   2 blob jobs); desktop numbers with the worker budget are not measured.
 - Deployed requests cost 87-90 ms on the merged server, against a ~24 ms
@@ -785,6 +799,70 @@ cheap safe win here. The client cannot drop the second commit without
 reversing the `dependsOn` decision, and the floor itself is H8, a server
 cost bound that this pass does not weaken. Raw logs:
 `experiments/logs/client-e2e-{boot,edit,full}-*-merged-*.json`.
+
+The `dependsOn` decision was later reversed for live creates (§7.2): a
+create now costs one commit, ~1000 ms back to back and ~140 ms alone. The
+numbers above are those of this pass.
+
+### 7.2 Lone and sustained latency, single-commit creates (branch `client-remake-create`)
+
+**Method** (`e2e/client/fullLatency.ts`, `wireTap.ts`, e2e/client/README.md).
+The old full e2e rows timed back-to-back writes, so every one paid the
+relay's `minIntervalMs` floor and no row showed what a single edit costs.
+`fullClients.ts` now reports two series:
+- `lone_*` (suite 1, E2EE on) and `lone_plain_*` (suite 0): one write at a
+  time on a fresh 3-client vault. Before each write the clients are converged
+  and the relay has had no commit for `groupCommit.quietMs` (from VAULT_READY)
+  plus 100 ms, so the write takes the leading-edge commit. Each per-peer
+  sample is split at its critical frame (the last sender frame the peer
+  needed): sender = local change to that frame's APPEND, relay = APPEND to its
+  COMMITTED / COMMIT_NOTICE on the peer (PROVISIONAL for an open view),
+  receiver = to bytes on the peer's disk or in its view.
+- `sustained_*`: the scenario vault's back-to-back writes, next to
+  `extra.sustainedFloorMsPerCommit` (= `minIntervalMs`).
+
+Server config (VAULT_READY): idle 300, max 1500, maxBytes 64 KiB,
+minInterval 1000, lead 20, quiet 1500 ms. Local relay
+(`start-local.sh --fresh --port 8806 --r2`), clients and relay on one laptop,
+with other agents' test runs on it. Base = 3a000642 with `src/` at
+client-remake 4e0a961a (the tree without 228b4d9d); new = 3a000642. Three
+runs each, plus one each under `--cpu-prof`; all 62/62.
+
+**Change** (DESIGN §d.4, §e.1). A live create (every reconcile pass after the
+first full pass with ns ready and the local scan complete) sends its initial
+body frames right behind the ns create (`pending`, `dependsOn` = the create;
+the sender never puts them on the wire before it), and the pass corks the ns
+stream until those frames are built (at most 2 s), so the create and its body
+land in one group commit. Onboarding keeps holding them until the fold.
+
+| ms, p50 / p95 (n) | base | new | sender / relay / receiver p50, base -> new |
+|---|---|---|---|
+| lone_create (E2EE on) | 1137-1138 / 1139-1148 (20) | 138-151 / 140-154 (20) | 108 / 998 / 32 -> 84-90 / 22-26 / 32-35 |
+| lone_plain_create | 1137-1138 / 1138-1139 (20) | 137-148 / 140-153 (20) | 107 / 999 / 31 -> 84-89 / 22-25 / 31-34 |
+| sustained_create | 1998-2001 / 2003 (16) | 999-1000 / 1001-1004 (16) | 970 / 999 / 31 -> 84-89 / 876-884 / 31-35 |
+| burst20_create_converge | 2340-2345 (1) | 1361-1377 (1) | |
+| scenario 1, 29 fresh creates (wall) | 19.5 s | 10.5 s | |
+
+- A lone create now costs one leading-edge cycle: in every run it matches
+  that run's `lone_api_edit` within 3 ms (138 / 138, 149 / 147, 151 / 148,
+  138 / 138). Before, the body waited for the next commit after the create's
+  lead commit: relay part ~1000 ms, the `minIntervalMs` floor.
+- Sustained creates pace at one `minIntervalMs` instead of two.
+- Every lone create still reaches each peer's disk in one write (check
+  "each lone create reached each peer's disk in one write").
+- The other rows do not change with this pass. In both trees they come in
+  two modes about 8-10 ms apart (each part 2-4 ms slower), which flip
+  between runs and are not tied to the tree: base was in the slow mode under
+  `--cpu-prof` and new in the fast one. Fast-mode p50s, E2EE on / off:
+  API edit 138 / 137, disk edit 236 / 236, typing to view 119 / 118, typing
+  to disk 171 / 170, rename 137 / 137, delete 137 / 136, settings 28 / 27,
+  attachment 40 KB 249 / 247, 300 KB 260 / 259, 2 MB 355 / 350. Sustained
+  writes: ~1000 ms (relay part 780-885 ms of waiting for the floor), typing
+  to an open view ~122 ms. Attachments now ride the blob store (cc1834e):
+  their sender part (~190-230 ms) is the 100 ms watcher, hashing and the
+  HTTP PUT before the ns op.
+
+Raw logs: `experiments/logs/client-e2e-full-{create-base,create-base2,create-base3,prof-base,create-new,create-new2,create-new3,prof-new}-20261007T*.json`.
 
 ## 8. Bundle
 

@@ -25,7 +25,7 @@ import { sha256Hex } from "../../../core/hash/sha256";
 import { utf8Encode, utf8Length } from "../../../core/hash/utf8";
 import { joinPath, leafOf, parentOf, splitExt, standInPathKey } from "../../../core/plan/pathRules";
 import { applyCanvas, canvasDocHash, projectCanvasBytes } from "../canvasDoc";
-import type { BodyHandle, LogPort, OwnFoldEvent, RemoteView } from "../deps";
+import type { BodyHandle, LogPort, OwnFoldEvent, RemoteView, SubmitNsOptions } from "../deps";
 
 export const REMOTE = Symbol("REMOTE");
 export const MERGE = Symbol("MERGE");
@@ -87,6 +87,8 @@ export class StubLog implements LogPort {
 	onAcquire: ((docId: DocId) => void) | null = null;
 	/** Called as commitEdits starts, before the frame closes (inject editor keystrokes racing a merge). */
 	onCommitEdits: ((docId: DocId) => void) | null = null;
+	/** "cork", "uncork", "ns live|held" (submitNs), "frame <docId>" (commitEdits), in order. */
+	readonly trace: string[] = [];
 	private nextClient = 1000;
 	private idCounter = 0;
 
@@ -173,7 +175,17 @@ export class StubLog implements LogPort {
 		}
 	}
 
-	async submitNs(ops: readonly NsOp[]): Promise<void> {
+	corkNs(): () => void {
+		this.trace.push("cork");
+		let open = true;
+		return () => {
+			if (open) this.trace.push("uncork");
+			open = false;
+		};
+	}
+
+	async submitNs(ops: readonly NsOp[], opts?: SubmitNsOptions): Promise<void> {
+		if (ops.length > 0) this.trace.push(opts?.liveCreates === true ? "ns live" : "ns held");
 		this.submitted.push(...ops);
 		this.pending.push(...ops);
 		for (const op of ops) if (op.t === "create" && op.kind !== "blob") this.ensureBody(op.docId);
@@ -328,6 +340,7 @@ export class StubLog implements LogPort {
 					for (const u of b.unframed) {
 						b.durable.push(u);
 						this.frames.push({ docId, update: u });
+						this.trace.push(`frame ${docId}`);
 						// Own rows get seqs on receipt; they do not change remoteSeq.
 						b.maxRowSeq = ++this.seq;
 					}

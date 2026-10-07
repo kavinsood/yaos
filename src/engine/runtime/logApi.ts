@@ -64,7 +64,11 @@ export function chunkOps<T>(ops: readonly T[], encode: (ops: readonly T[]) => Ui
 /** Extra frames committed in the same T_edit as the ns frames (createDoc's initial body frames). */
 export type ExtraFrames = (nsFrames: readonly NewOutboxFrame[]) => Promise<readonly NewOutboxFrame[]>;
 
-export async function submitNs(c: EngineCtx, ops: readonly NsOp[], extra?: ExtraFrames): Promise<ClientFrameId[]> {
+/**
+ * `live`: the creates are live (DESIGN §d.4): their body frames are pending and sent right after them; otherwise
+ * held until the creates fold.
+ */
+export async function submitNs(c: EngineCtx, ops: readonly NsOp[], extra?: ExtraFrames, live = false): Promise<ClientFrameId[]> {
 	if (ops.length === 0) return [];
 	const parts = chunkOps(ops, encodeNsOps);
 	return c.docs.chain(async () => {
@@ -73,7 +77,7 @@ export async function submitNs(c: EngineCtx, ops: readonly NsOp[], extra?: Extra
 		const more = extra ? await extra(frames) : [];
 		c.addOutbox(await c.repo.tEdit([...frames, ...more], c.now()));
 		frames.forEach((f, i) => {
-			for (const op of parts[i]!) if (op.t === "create") c.pendingCreates.set(op.docId, f.clientFrameId);
+			for (const op of parts[i]!) if (op.t === "create") c.pendingCreates.set(op.docId, { cfid: f.clientFrameId, live });
 		});
 		return frames.map((f) => f.clientFrameId);
 	});

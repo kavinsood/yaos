@@ -138,8 +138,12 @@ export class DocRuntime {
 		return this.chain(async () => {
 			try {
 				const docId = streamDocId(h.stream);
-				const dependsOn = c.outbox.newestAdoptable(h.stream)?.clientFrameId ?? c.outbox.heldDependency(h.stream) ?? (docId ? c.createDependency(docId) : null);
-				const frames = await buildBodyFrames(c.deps, { stream: h.stream, content: taken.content, flags: taken.flags, authorNsSeq: c.ns.coversSeq, dependsOn, nowMs: c.now() });
+				const held = c.outbox.newestAdoptable(h.stream)?.clientFrameId ?? c.outbox.heldDependency(h.stream);
+				// A live create's body frames are pending and follow it on the wire; an onboarding create's are held
+				// until its fold (DESIGN §e.1).
+				const create = held === null && docId ? c.createDependency(docId) : null;
+				const dependsOn = held ?? create?.cfid ?? null;
+				const frames = await buildBodyFrames(c.deps, { stream: h.stream, content: taken.content, flags: taken.flags, authorNsSeq: c.ns.coversSeq, dependsOn, sendAfter: create?.live === true, nowMs: c.now() });
 				c.addOutbox(await c.repo.tEdit(frames, c.now()));
 				c.ckpt.lastActivity.set(h.stream, c.mono());
 				this.stats.framesClosed++;
