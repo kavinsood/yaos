@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
+import { RELAY_HTTP_BASE_MS } from "../../core/deadline";
 import { sha256Hex } from "../../core/hash/sha256";
 import type { ContentHash } from "../../core/types";
 import { BLOB_DELETE_BATCH, type BlobPort } from "../../ports/blob";
@@ -290,6 +291,36 @@ test("stop: an aborted sweep deletes nothing more", async () => {
 	assert.equal(r.store.deleted.length, 0, "not even the probe (best effort; a later sweep collects it)");
 });
 
+test("stop: the sweep's signal reaches the probe upload; a store call that honours only its signal does not hold the stop", async () => {
+	const r = rig();
+	await r.add(1, GRACE + DAY);
+	const sim = r.store;
+	let probeSignal: AbortSignal | undefined;
+	const hungPut: BlobPort = {
+		maxBlobBytes: sim.maxBlobBytes,
+		has: (a, s) => sim.has(a, s),
+		get: (a, s) => sim.get(a, s),
+		list: (c, s) => sim.list(c, s),
+		deleteIfUploadedBefore: (a, t, s) => sim.deleteIfUploadedBefore(a, t, s),
+		put: (_a, _parts, signal) => new Promise<void>((_resolve, reject) => {
+			probeSignal = signal;
+			signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+		}),
+	};
+	let out: Awaited<ReturnType<typeof sweepBlobs>> | "pending" = "pending";
+	void sweepBlobs({ ...r.deps(), store: hungPut }).then((v) => (out = v));
+	const settled = (): Awaited<ReturnType<typeof sweepBlobs>> | "pending" => out;
+	for (let i = 0; i < 20 && probeSignal === undefined; i++) await new Promise((res) => setImmediate(res));
+	assert.ok(probeSignal, "the probe upload carries the sweep's signal");
+	assert.equal(settled(), "pending");
+	r.ctrl.abort();
+	for (let i = 0; i < 50 && settled() === "pending"; i++) await new Promise((res) => setImmediate(res));
+	const end = settled();
+	assert.ok(end !== "pending", "the stopped sweep ends");
+	assert.equal(end.deleted, 0);
+	assert.equal(sim.deleted.length, 0);
+});
+
 test("a listing that does not advance stops the sweep", async () => {
 	const r = rig();
 	const a = await r.add(1, GRACE + DAY);
@@ -376,14 +407,14 @@ test("HTTP adapter: list and delete retry 429 / 503 list_incomplete after Retry-
 	const f = fakeFetch(route);
 	const waits: number[] = [];
 	const clock = new FakeClock();
-	// The retry waits fire at once; the idle window (never reached) neither fires nor counts.
+	// The retry waits fire at once; the idle window and the calls' deadlines (never reached) neither fire nor count.
 	const NEVER = Number.MAX_SAFE_INTEGER;
 	const store = createHttpBlob({
 		baseUrl: "https://r.example", vaultId: "v1", credential: "tok", fetch: f.fetch, xhr: routedXhr(route, f.requests), idleMs: NEVER,
 		clock: {
 			...clock, now: () => clock.now(), monotonic: () => 0, yieldNow: async () => undefined, clearTimer: () => undefined,
 			setTimer: (ms, fn) => {
-				if (ms === NEVER) return 0;
+				if (ms === NEVER || ms >= RELAY_HTTP_BASE_MS) return 0;
 				waits.push(ms);
 				queueMicrotask(fn);
 				return waits.length;

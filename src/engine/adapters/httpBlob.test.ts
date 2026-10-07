@@ -5,7 +5,11 @@ import type { ClockPort } from "../../ports/clock";
 import { MAX_BLOB_UPLOAD_BYTES } from "../../core/limits";
 import { BlobTooLargeError } from "../../ports/blob";
 import type { BlobAddress } from "../../ports/crypto";
-import { BLOB_EXISTS_BATCH, CAPABILITIES_TIMEOUT_MS, createHttpBlob, GC_RETRY_ATTEMPTS, probeHttpBlob, startupBlob } from "./httpBlob";
+import { RELAY_HTTP_BASE_MS, relayHttpDeadlineMs } from "../../core/deadline";
+import {
+	BLOB_DELETE_CALL_BYTES, BLOB_EXISTS_BATCH, BLOB_LIST_REPLY_BYTES, CAPABILITIES_TIMEOUT_MS, createHttpBlob, GC_RETRY_ATTEMPTS, probeHttpBlob,
+	startupBlob,
+} from "./httpBlob";
 import { RelayHttpError } from "./relayHttp";
 import { fakeFetch, fakeXhrs, jsonResponse, ManualClock, routedXhr, type FakeRequest, type FakeXhr } from "./relayTestFakes";
 
@@ -16,12 +20,15 @@ const IDLE = 1_000;
 /** The idle window of the tests on instantClock, which never fires it. */
 const NEVER = Number.MAX_SAFE_INTEGER;
 
-/** A clock whose timers fire at once, recording their delays; the NEVER idle window is neither fired nor recorded. */
+/**
+ * A clock whose timers fire at once, recording their delays; the NEVER idle window and the GC calls' deadlines
+ * (RELAY_HTTP_BASE_MS and more; the Retry-After waits here are shorter) are neither fired nor recorded.
+ */
 function instantClock(waits: number[]): ClockPort {
 	return {
 		now: () => 0, monotonic: () => 0, yieldNow: async () => undefined, clearTimer: () => undefined,
 		setTimer: (ms, fn) => {
-			if (ms === NEVER) return 0;
+			if (ms === NEVER || ms >= RELAY_HTTP_BASE_MS) return 0;
 			waits.push(ms);
 			queueMicrotask(fn);
 			return waits.length;
@@ -404,6 +411,66 @@ describe("httpBlob", () => {
 			await flush();
 			ctl.abort();
 			assert.deepEqual([(await rejection(aborted)).code, clock.pendingTimers], ["aborted", 0], name);
+		}
+	});
+
+	it("an error reply's body is read within the transfer: a 404 whose body stalls is stalled, never \"absent\"", async () => {
+		const clock = new ManualClock();
+		const never = <T>(): Promise<T> => new Promise<T>(() => undefined);
+		const deafError = (status: number) => async () => ({ status, headers: new Headers(), body: null, json: () => never() }) as unknown as Response;
+		const cases: [string, typeof fetch, (port: ReturnType<typeof getPort>) => Promise<unknown>][] = [
+			["get 404", deafError(404), (port) => port.get(addr(1))],
+			["get 500", deafError(500), (port) => port.get(addr(1))],
+			["has 500", deafError(500), (port) => port.has([addr(1)])],
+		];
+		for (const [name, f, call] of cases) {
+			const stalled = track(call(getPort(f, clock)));
+			await flush();
+			clock.advance(IDLE - 1);
+			await flush();
+			assert.equal(stalled.settled(), false, name);
+			clock.advance(1);
+			assert.deepEqual([(await rejection(stalled.p)).code, clock.pendingTimers], ["stalled", 0], name);
+		}
+		// A 404 whose body is whole: "not found" (or not JSON) is absent; another code is the error it names.
+		assert.equal(await getPort(fakeFetch(() => jsonResponse({ error: "not found" }, 404)).fetch, clock).get(addr(1)), null);
+		assert.equal(await getPort(fakeFetch(() => new Response("<html>", { status: 404 })).fetch, clock).get(addr(1)), null);
+		assert.equal((await rejection(getPort(fakeFetch(() => jsonResponse({ error: "unknown_vault" }, 404)).fetch, clock).get(addr(1)))).code, "unknown_vault");
+		// A body cut off mid-way is a transport error, not a missing code.
+		const cut: typeof fetch = async () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"err')); c.error(new TypeError("terminated")); } }), { status: 404 });
+		assert.equal((await rejection(getPort(cut, clock).get(addr(1)))).code, "network_error");
+	});
+
+	it("GC calls (list, delete) end at their deadline, headers or body, even when the fetch ignores its abort; the caller's signal ends them at once", async () => {
+		// Sized from what each call moves (httpBlob.ts BLOB_GC_ITEM_WIRE_BYTES): a 1000-item page; 100 addresses and results.
+		assert.equal(relayHttpDeadlineMs(BLOB_LIST_REPLY_BYTES), 17_016);
+		assert.equal(relayHttpDeadlineMs(BLOB_DELETE_CALL_BYTES), 15_454);
+		const clock = new ManualClock();
+		const never = <T>(): Promise<T> => new Promise<T>(() => undefined);
+		const deafBody = async () => ({ status: 200, headers: new Headers(), body: null, json: () => never() }) as unknown as Response;
+		const gcPort = (f: typeof fetch) => createHttpBlob({ baseUrl: "https://r.example/", vaultId: "v1", credential: TOKEN, fetch: f, clock });
+		const cases: [string, typeof fetch, number, (port: ReturnType<typeof gcPort>, signal?: AbortSignal) => Promise<unknown>][] = [
+			["list, headers", () => never(), relayHttpDeadlineMs(BLOB_LIST_REPLY_BYTES), (port, s) => port.list(null, s)],
+			["list, body", deafBody, relayHttpDeadlineMs(BLOB_LIST_REPLY_BYTES), (port, s) => port.list(null, s)],
+			["delete, headers", () => never(), relayHttpDeadlineMs(BLOB_DELETE_CALL_BYTES), (port, s) => port.deleteIfUploadedBefore([addr(1)], 5, s)],
+			["delete, body", deafBody, relayHttpDeadlineMs(BLOB_DELETE_CALL_BYTES), (port, s) => port.deleteIfUploadedBefore([addr(1)], 5, s)],
+		];
+		for (const [name, f, deadline, call] of cases) {
+			const hung = track(call(gcPort(f)));
+			await flush();
+			clock.advance(deadline - 1);
+			await flush();
+			assert.equal(hung.settled(), false, name);
+			clock.advance(1);
+			const e = await rejection(hung.p);
+			assert.deepEqual([e.status, e.code, clock.pendingTimers], [0, "timeout", 0], name);
+
+			const ctl = new AbortController();
+			const aborted = call(gcPort(f), ctl.signal);
+			await flush();
+			ctl.abort();
+			assert.deepEqual([(await rejection(aborted)).code, clock.pendingTimers], ["aborted", 0], name);
+			assert.equal(getEventListeners(ctl.signal, "abort").length, 0, name);
 		}
 	});
 

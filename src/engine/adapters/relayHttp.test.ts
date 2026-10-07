@@ -1,10 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
-import {
-	base64ToBytes, bytesToBase64, createRelayHttp, dailyResetDelayMs, parseRetryAfter, RELAY_HTTP_BASE_MS, RELAY_HTTP_FLOOR_BYTES_PER_S, RelayHttpError,
-	relayHttpDeadlineMs,
-} from "./relayHttp";
+import { base64ToBytes, bytesToBase64, createRelayHttp, dailyResetDelayMs, parseRetryAfter, RelayHttpError } from "./relayHttp";
+import { RELAY_HTTP_BASE_MS, RELAY_HTTP_FLOOR_BYTES_PER_S, relayHttpDeadlineMs } from "../../core/deadline";
 import type { StreamName } from "../../core/types";
 import { fakeFetch, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
 

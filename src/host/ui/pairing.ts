@@ -5,12 +5,19 @@
  * Pure: every network call goes through an injected `request` function, randomness through an
  * injected `randomBytes`, waiting through an injected `sleep`. No obsidian runtime import.
  *
+ * Every call ends: at PAIRING_CALL_DEADLINE_MS it fails "Could not reach the server: no answer within 15 s"
+ * (code "network": an enrollment retries it, a pending one is kept for the next load). Obsidian's requestUrl takes
+ * no signal and no timeout, so the wait is raced (core/deadline.ts) and the request itself left to finish unread.
+ *
  * SECRETS: deviceToken, pairing codes, the operator recovery key, the operator session cookie and the vault key of a
  * setup or re-key link never appear in thrown messages or progress text.
  */
 
 import { base64urlDecode, isVaultId } from "../../core/codec/ids";
 import { bytesToHex, Reader, Writer } from "../../core/codec/lib0";
+import { bounded, relayHttpDeadlineMs, RELAY_REPLY_BYTES } from "../../core/deadline";
+import type { ClockPort } from "../../ports/clock";
+import { browserClock } from "../platform";
 import type { PairedIdentity } from "./api";
 import { errorMessage } from "./format";
 
@@ -44,6 +51,8 @@ export interface PairingDeps {
 	readonly request: RequestFn;
 	readonly randomBytes?: RandomBytesFn;
 	readonly sleep?: SleepFn;
+	/** The calls' deadline timers; default setTimeout. */
+	readonly clock?: Pick<ClockPort, "setTimer" | "clearTimer">;
 	/** Progress text for the UI (never contains secrets). */
 	readonly onProgress?: (text: string) => void;
 }
@@ -189,10 +198,25 @@ export function scrubSecrets(text: string, secrets: readonly string[]): string {
 	return out;
 }
 
+/**
+ * The deadline of every pairing, claim and operator call: each is one JSON request and reply of a few hundred bytes
+ * (under RELAY_REPLY_BYTES) to the relay, so the relay's deadline for that size (core/deadline.ts: 15 s for the
+ * request, covering a cold Durable Object and a congested link many times over, plus the bytes at 64 KiB/s).
+ */
+export const PAIRING_CALL_DEADLINE_MS = relayHttpDeadlineMs(RELAY_REPLY_BYTES);
+
+/** `req`, rejecting PairingError "network" when no reply arrived within PAIRING_CALL_DEADLINE_MS. */
+function call(deps: Pick<PairingDeps, "request" | "clock">, req: HttpRequest): Promise<HttpResponse> {
+	return bounded(PAIRING_CALL_DEADLINE_MS, undefined, deps.clock ?? browserClock(), () => deps.request(req), () => new PairingError(
+		`Could not reach the server: no answer within ${Math.round(PAIRING_CALL_DEADLINE_MS / 1000)} s.`, "network",
+	));
+}
+
 async function send(deps: PairingDeps, req: HttpRequest, secrets: readonly string[]): Promise<HttpResponse> {
 	try {
-		return await deps.request(req);
+		return await call(deps, req);
 	} catch (err) {
+		if (err instanceof PairingError) throw err;
 		throw new PairingError(`Could not reach the server: ${scrubSecrets(errorMessage(err), secrets)}`, "network");
 	}
 }
@@ -476,10 +500,10 @@ export const RETIRE_FAILED_MESSAGE = "Could not remove the old server membership
  * authorization_fence_pending, and network errors throw PairingError(RETIRE_FAILED_MESSAGE); the
  * token never appears in it.
  */
-export async function retireDeviceEnrollment(identity: PairedIdentity, deps: Pick<PairingDeps, "request">): Promise<void> {
+export async function retireDeviceEnrollment(identity: PairedIdentity, deps: Pick<PairingDeps, "request" | "clock">): Promise<void> {
 	let res: HttpResponse;
 	try {
-		res = await deps.request({
+		res = await call(deps, {
 			url: `${normalizeHost(identity.host)}/vault/${encodeURIComponent(identity.vaultId)}/auth/device`,
 			method: "DELETE",
 			headers: { Authorization: `Bearer ${identity.deviceToken}` },
@@ -674,10 +698,10 @@ export async function operatorCreateVault(session: OperatorSession, name: string
 	return createdVaultOf(origin, minted.json, vaultId, "pairingCode");
 }
 
-/** `POST /operator/logout` (server/src/router.ts:355-361). Best effort: it never throws. */
-export async function operatorLogout(session: OperatorSession, deps: Pick<PairingDeps, "request">): Promise<void> {
+/** `POST /operator/logout` (server/src/router.ts:355-361). Best effort: it never throws, and ends at the deadline. */
+export async function operatorLogout(session: OperatorSession, deps: Pick<PairingDeps, "request" | "clock">): Promise<void> {
 	try {
-		await deps.request({ url: `${session.host}/operator/logout`, method: "POST", headers: operatorHeaders(session.host, session), body: "{}" });
+		await call(deps, { url: `${session.host}/operator/logout`, method: "POST", headers: operatorHeaders(session.host, session), body: "{}" });
 	} catch {
 		// The session expires on its own (7 days, server/src/config/host.ts:24, router.ts:125-127).
 	}

@@ -6,7 +6,7 @@
  * Authorization header; it never appears in URLs, error messages or logs.
  *
  * No call waits forever. ticket() ends at connect's deadline (wsRelay.ts). feed, read, readBatch and putCheckpoint
- * each move a bounded number of bytes, so each gets a deadline proportional to that bound (relayHttpDeadlineMs),
+ * each move a bounded number of bytes, so each gets a deadline proportional to that bound (core/deadline.ts),
  * and the session's own signal, aborted when the session closes (wsRelay.ts), ends them as soon as the link is
  * gone. untilAborted makes both hold even when a fetch ignores its signal. A blob, up to 100 MB, gets an idle
  * window instead (httpBlob.ts).
@@ -15,6 +15,7 @@
 import type { ClockPort } from "../../ports/clock";
 import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectResult, RelayRow } from "../../ports/relay";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
+import { bounded as boundedCall, relayHttpDeadlineMs, RELAY_REPLY_BYTES, untilAborted } from "../../core/deadline";
 import { createWebClock } from "./webClock";
 
 export type ConnectFailureReason = Extract<RelayConnectResult, { ok: false }>["reason"];
@@ -63,31 +64,6 @@ export interface RelayHttp {
 }
 
 /**
- * The deadline of a session HTTP call that moves at most `bytes` on the wire: RELAY_HTTP_BASE_MS for the request
- * itself plus the bytes at RELAY_HTTP_FLOOR_BYTES_PER_S. Proportional to the bound, so a large page on a slow link
- * gets the time it needs and a small request that nobody answers (a relay or edge that took it and went quiet while
- * the socket stays up) ends soon; the bound itself is generous (RELAY_PAGE_WIRE_FACTOR), so most replies are far
- * smaller and have far more time than the floor gives.
- */
-export function relayHttpDeadlineMs(bytes: number): number {
-	return RELAY_HTTP_BASE_MS + Math.ceil((bytes * 1000) / RELAY_HTTP_FLOOR_BYTES_PER_S);
-}
-
-/**
- * The request itself, whatever its size: on the deployed relay one HTTP request costs about 9 edge RTTs (≈ 220 ms,
- * relay-wire §7.1); 15 s covers a cold Durable Object and a congested link many times over, and is connect's whole
- * budget for ticket + upgrade + VAULT_READY (wsRelay DEFAULT_READY_TIMEOUT_MS).
- */
-export const RELAY_HTTP_BASE_MS = 15_000;
-/**
- * The slowest link the deadlines allow for at their byte bound: 64 KiB/s (512 kbit/s, 3G-class). With the bounds
- * below, a default read (1 MiB budget, bound 16 MiB) gets 271 s: its real reply (at most ~4 MiB of base64 and row
- * fields for 1 MiB of payload) still arrives over a 16 KiB/s link, and a page carrying a 4 MiB checkpoint
- * (~5.3 MiB on the wire) over 20 KiB/s. A slower link is ended at the deadline and the read retries after its
- * backoff (sessionLoop.ts readBackoffMs).
- */
-export const RELAY_HTTP_FLOOR_BYTES_PER_S = 64 * 1024;
-/**
  * Wire bytes per page payload byte. A read page's payload is at most max(maxBytes, one item): maxBytes "bounds
  * payload bytes per page, checkpoint included", but "a page always carries at least one row or the checkpoint"
  * (relay-wire §7, §7.1; server/src/streams/store.ts read), and an item is at most RELAY_PAGE_ITEM_MAX_BYTES. The
@@ -104,38 +80,10 @@ export const RELAY_READ_MAX_BYTES = 4 * 1024 * 1024;
 export const RELAY_FEED_MAX_ENTRIES = 5000;
 /** One feed entry on the wire: {"stream":<name, at most 256 UTF-8 bytes, JSON-escaped>,"lastSeq":<seq>}. */
 export const RELAY_FEED_ENTRY_BYTES = 300;
-/** A reply without rows (feed head, checkpoint result, error body). */
-export const RELAY_REPLY_BYTES = 4096;
 
 /** The byte bound of a read / readBatch reply under a `maxBytes` budget. */
 function pageBound(maxBytes: number | null): number {
 	return RELAY_REPLY_BYTES + RELAY_PAGE_WIRE_FACTOR * Math.max(maxBytes ?? RELAY_READ_MAX_BYTES, RELAY_PAGE_ITEM_MAX_BYTES);
-}
-
-/**
- * `p`, or a rejection (the signal's reason) as soon as `signal` aborts. A deadline then holds even when the fetch
- * behind `p` ignores its signal: a request nobody answers is never awaited past it.
- */
-export function untilAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-	if (!signal) return p;
-	if (signal.aborted) {
-		p.catch(() => undefined);
-		return Promise.reject(signal.reason);
-	}
-	return new Promise<T>((resolve, reject) => {
-		const onAbort = (): void => reject(signal.reason);
-		signal.addEventListener("abort", onAbort, { once: true });
-		p.then(
-			(v) => {
-				signal.removeEventListener("abort", onAbort);
-				resolve(v);
-			},
-			(e: unknown) => {
-				signal.removeEventListener("abort", onAbort);
-				reject(e);
-			},
-		);
-	});
 }
 
 /** Strips trailing slashes: "https://h/" -> "https://h". */
@@ -275,30 +223,11 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	}
 
 	/**
-	 * `run` with a signal that aborts at relayHttpDeadlineMs(`bytes`) or when `signal` does (no AbortSignal.any:
-	 * WebKit has it only from Safari 17.4). The reply, null for a network failure; RelayHttpError "timeout" or
-	 * "aborted" when the call was ended from this side.
+	 * `run` ended at relayHttpDeadlineMs(`bytes`) or when `signal` aborts (core/deadline.ts bounded). The reply, null
+	 * for a network failure; RelayHttpError "timeout" or "aborted" when the call was ended from this side.
 	 */
-	async function bounded(route: string, bytes: number, signal: AbortSignal | undefined, run: (s: AbortSignal) => Promise<HttpReply | null>): Promise<HttpReply | null> {
-		if (signal?.aborted) throw new RelayHttpError(route, 0, "aborted", null);
-		const ctl = new AbortController();
-		let ended: "timeout" | "aborted" | null = null;
-		const end = (why: "timeout" | "aborted"): void => {
-			if (ended !== null) return;
-			ended = why;
-			ctl.abort();
-		};
-		const onAbort = (): void => end("aborted");
-		signal?.addEventListener("abort", onAbort, { once: true });
-		const timer = clock.setTimer(relayHttpDeadlineMs(bytes), () => end("timeout"));
-		try {
-			const reply = await run(ctl.signal);
-			if (ended !== null) throw new RelayHttpError(route, 0, ended, null);
-			return reply;
-		} finally {
-			clock.clearTimer(timer);
-			signal?.removeEventListener("abort", onAbort);
-		}
+	function bounded(route: string, bytes: number, signal: AbortSignal | undefined, run: (s: AbortSignal) => Promise<HttpReply | null>): Promise<HttpReply | null> {
+		return boundedCall(relayHttpDeadlineMs(bytes), signal, clock, run, (why) => new RelayHttpError(route, 0, why, null));
 	}
 
 	function fail(route: string, reply: HttpReply | null): RelayHttpError {

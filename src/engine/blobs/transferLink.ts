@@ -2,8 +2,9 @@
  * Blob store calls tied to the relay link (DESIGN §j.1). The blob store is HTTP over the same network as the
  * relay socket; when the session loop declares that link dead (the socket closed abnormally, the liveness check
  * failed, or the user paused / the app parked / the engine stopped: runtime/sessionLoop.ts), abort() ends every
- * has / put / get in flight instead of leaving it to its adapter's idle watchdog (BLOB_TRANSFER_IDLE_MS). The
- * aborted calls reject; their callers retry as after any transport error (the blob queue with its backoff).
+ * store call in flight instead of leaving it to its adapter's idle watchdog (BLOB_TRANSFER_IDLE_MS, has / put /
+ * get) or deadline (list / deleteIfUploadedBefore, adapters/httpBlob.ts gcCall). The aborted calls reject; their
+ * callers retry as after any transport error (the blob queue with its backoff; a GC sweep ends and reports it).
  *
  * Each call's signal combines the caller's own (the blob queue's stop) with the link's. Not AbortSignal.any:
  * WebKit (every iOS WebView) has it only from Safari 17.4; the listeners here are removed when the call settles.
@@ -36,7 +37,7 @@ export class TransferLink {
 		return n;
 	}
 
-	/** `inner` with every has / put / get also aborted by abort(). */
+	/** `inner` with every call also aborted by abort(). */
 	wrap(inner: BlobPort | null): BlobPort | null {
 		if (!inner) return null;
 		const run = async <T>(signal: AbortSignal | undefined, call: (s: AbortSignal) => Promise<T>): Promise<T> => {
@@ -56,8 +57,8 @@ export class TransferLink {
 			has: (a, signal) => run(signal, (s) => inner.has(a, s)),
 			put: (address, parts, signal) => run(signal, (s) => inner.put(address, parts, s)),
 			get: (a, signal) => run(signal, (s) => inner.get(a, s)),
-			list: (cursor, signal) => inner.list(cursor, signal),
-			deleteIfUploadedBefore: (addresses, cutoffMs, signal) => inner.deleteIfUploadedBefore(addresses, cutoffMs, signal),
+			list: (cursor, signal) => run(signal, (s) => inner.list(cursor, s)),
+			deleteIfUploadedBefore: (addresses, cutoffMs, signal) => run(signal, (s) => inner.deleteIfUploadedBefore(addresses, cutoffMs, s)),
 		};
 	}
 }

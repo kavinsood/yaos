@@ -172,7 +172,7 @@ export async function sweepBlobs(d: GcDeps): Promise<GcOutcome> {
 					const bytes = await d.bytes(h);
 					if (bytes && bytesToHex(await d.hash.sha256(bytes)) === h) {
 						try {
-							await putAt(d.store, d.crypto, d.policy, h, a, bytes);
+							await putAt(d.store, d.crypto, d.policy, h, a, bytes, d.signal);
 							repaired++;
 							continue;
 						} catch (e) {
@@ -197,7 +197,7 @@ export async function sweepBlobs(d: GcDeps): Promise<GcOutcome> {
 /** R1: the cutoff on the store's clock from a probe upload, else on this device's clock with the skew margin. */
 async function probeCutoff(d: GcDeps, probe: BlobAddress, put: () => void): Promise<number> {
 	try {
-		await d.store.put(probe, [d.random.bytes(1)]);
+		await d.store.put(probe, [d.random.bytes(1)], d.signal);
 		put();
 		const [r] = await d.store.deleteIfUploadedBefore([probe], 0, d.signal);
 		if (r?.result !== "newer") throw new Error(`probe answered ${r?.result ?? "nothing"}`);

@@ -51,7 +51,8 @@ import { BLOB_TRANSFER_IDLE_MS, MAX_BLOB_UPLOAD_BYTES } from "../../core/limits"
 import { BLOB_DELETE_BATCH, BlobTooLargeError, type BlobDeleteResult, type BlobListItem, type BlobPort } from "../../ports/blob";
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { BlobAddress } from "../../ports/crypto";
-import { normalizeBaseUrl, parseRetryAfter, RelayHttpError, untilAborted } from "./relayHttp";
+import { bounded, relayHttpDeadlineMs, RELAY_REPLY_BYTES, untilAborted } from "../../core/deadline";
+import { normalizeBaseUrl, parseRetryAfter, RelayHttpError } from "./relayHttp";
 import { createWebClock } from "./webClock";
 
 export const BLOB_EXISTS_BATCH = 50;
@@ -59,6 +60,18 @@ export const BLOB_EXISTS_BATCH = 50;
 export const GC_RETRY_ATTEMPTS = 5;
 /** Longest Retry-After honoured; a longer one fails the call (the GC limit's window is 60 s). */
 export const GC_RETRY_MAX_WAIT_MS = 65_000;
+/** A list page's items at most (relay-wire §11.3.1: "at most 1000 items"). */
+export const BLOB_LIST_PAGE_MAX = 1000;
+/**
+ * One list item, delete result or delete request address on the wire, at most: {"address":"<64 hex>","uploadedAt":<ms>},
+ * is 106 B; a delete result at most 126 B ("newer" with a 16-digit time; server/src/router.ts:810-813); a delete
+ * request carries 67 B per address.
+ */
+export const BLOB_GC_ITEM_WIRE_BYTES = 128;
+/** A list call moves at most this much (17 s at relayHttpDeadlineMs). */
+export const BLOB_LIST_REPLY_BYTES = RELAY_REPLY_BYTES + BLOB_LIST_PAGE_MAX * BLOB_GC_ITEM_WIRE_BYTES;
+/** A delete call, its request and reply, moves at most this much (15.5 s). */
+export const BLOB_DELETE_CALL_BYTES = RELAY_REPLY_BYTES + 2 * BLOB_DELETE_BATCH * BLOB_GC_ITEM_WIRE_BYTES;
 /** probeHttpBlob's budget for the whole capabilities reply (a small JSON body). */
 export const CAPABILITIES_TIMEOUT_MS = 10_000;
 const ADDRESS = /^[0-9a-f]{64}$/;
@@ -106,7 +119,7 @@ interface Transfer {
 	/** Set once the caller's signal or the idle window ended the transfer. */
 	readonly ended: "aborted" | "stalled" | null;
 	/**
-	 * Aborts when the transfer ends: the fetch's signal, and untilAborted's (relayHttp.ts) around every await on the
+	 * Aborts when the transfer ends: the fetch's signal, and untilAborted's (core/deadline.ts) around every await on the
 	 * fetch or its body, so the end holds even when a fetch ignores its signal.
 	 */
 	readonly signal: AbortSignal;
@@ -237,11 +250,17 @@ function codeOf(body: unknown): string | null {
 	return typeof body === "object" && body !== null && "error" in body && typeof body.error === "string" ? body.error : null;
 }
 
-async function errorCode(res: Response): Promise<string | null> {
+/**
+ * The wire code of a non-200 reply's JSON body, read within the transfer: null when the body is not JSON. A body
+ * that stalls or is cut off is the transfer's failure ("stalled", "aborted", network_error), never a missing code: a
+ * 404 whose body never arrived is not "absent".
+ */
+async function errorCode(res: Response, t: Transfer): Promise<string | null> {
 	try {
-		return codeOf(await res.json());
-	} catch {
-		return null; // Not JSON.
+		return codeOf(await untilAborted(res.json(), t.signal));
+	} catch (e) {
+		if (t.ended === null && e instanceof SyntaxError) return null; // Not JSON.
+		throw t.fail();
 	}
 }
 
@@ -273,21 +292,33 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 		}
 	}
 
-	async function fail(route: string, res: Response): Promise<RelayHttpError> {
-		return new RelayHttpError(route, res.status, await errorCode(res), null);
+	async function fail(route: string, res: Response, t: Transfer): Promise<RelayHttpError> {
+		return new RelayHttpError(route, res.status, await errorCode(res, t), null);
 	}
 
-	/** A GC route call; 429/503 with a usable Retry-After are retried (bounded), anything else is the caller's. */
-	async function gcCall(route: string, url: string, init: RequestInit, signal: AbortSignal | undefined): Promise<Response> {
+	/**
+	 * A GC route call whose request and reply move at most `bytes`: each attempt, its whole reply included, ends at
+	 * relayHttpDeadlineMs(`bytes`) ("timeout") or when `signal` aborts ("aborted": the sweep stopped, or the relay
+	 * link was declared dead, blobs/transferLink.ts). 429/503 with a usable Retry-After are retried (bounded); any
+	 * other reply is the caller's. The body is the parsed JSON, null when it is not JSON.
+	 */
+	async function gcCall(route: string, url: string, init: RequestInit, bytes: number, signal: AbortSignal | undefined): Promise<{ readonly status: number; readonly body: unknown }> {
 		for (let attempt = 1; ; attempt++) {
-			if (signal?.aborted) throw abortError(route);
-			const res = await send(route, url, signal ? { ...init, signal } : init, null);
-			if (res.status !== 429 && res.status !== 503) return res;
-			const wait = parseRetryAfter(res.headers.get("Retry-After"), clock.now());
+			const reply = await bounded(relayHttpDeadlineMs(bytes), signal, clock, async (s) => {
+				const res = await send(route, url, { ...init, signal: s }, null);
+				let body: unknown = null;
+				try {
+					body = await untilAborted(res.json(), s);
+				} catch (e) {
+					if (!(e instanceof SyntaxError)) throw new RelayHttpError(route, res.status, "network_error", null);
+				}
+				return { status: res.status, body, retryAfter: res.headers.get("Retry-After") };
+			}, (why) => new RelayHttpError(route, 0, why, null));
+			if (reply.status !== 429 && reply.status !== 503) return reply;
+			const wait = parseRetryAfter(reply.retryAfter, clock.now());
 			if (wait === null || wait > GC_RETRY_MAX_WAIT_MS || attempt >= GC_RETRY_ATTEMPTS) {
-				throw new RelayHttpError(route, res.status, await errorCode(res), wait);
+				throw new RelayHttpError(route, reply.status, codeOf(reply.body), wait);
 			}
-			await res.body?.cancel().catch(() => undefined);
 			await sleepOn(clock, wait, signal, route);
 		}
 	}
@@ -364,7 +395,7 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 						signal: t.signal,
 					}, t);
 					t.kick();
-					if (res.status !== 200) throw await fail(route, res);
+					if (res.status !== 200) throw await fail(route, res, t);
 					try {
 						body = await untilAborted(res.json(), t.signal);
 					} catch (e) {
@@ -407,12 +438,12 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 					return await readBody(res, reader, maxBlobBytes, t);
 				}
 				if (res.status === 404) {
-					const code = await errorCode(res);
+					const code = await errorCode(res, t);
 					// "not found" = no such blob; anything else (unknown_vault) is a real error.
 					if (code === "not found" || code === null) return null;
 					throw new RelayHttpError(route, 404, code, null);
 				}
-				throw await fail(route, res);
+				throw await fail(route, res, t);
 			} finally {
 				t.close();
 			}
@@ -420,9 +451,8 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 
 		async list(cursor, signal) {
 			const url = cursor === null ? root : `${root}?cursor=${encodeURIComponent(cursor)}`;
-			const res = await gcCall("blobs/list", url, { method: "GET", headers: auth }, signal);
-			if (res.status !== 200) throw await fail("blobs/list", res);
-			const body: unknown = await res.json().catch(() => null);
+			const { status, body } = await gcCall("blobs/list", url, { method: "GET", headers: auth }, BLOB_LIST_REPLY_BYTES, signal);
+			if (status !== 200) throw new RelayHttpError("blobs/list", status, codeOf(body), null);
 			const malformed = () => new RelayHttpError("blobs/list", 200, "malformed_response", null);
 			if (typeof body !== "object" || body === null) throw malformed();
 			const { items: rawItems, next } = body as Record<string, unknown>;
@@ -446,13 +476,12 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 				throw new RelayHttpError("blobs/delete", 0, "invalid_addresses", null);
 			}
 			if (!isTime(cutoffMs)) throw new RelayHttpError("blobs/delete", 0, "invalid_if_uploaded_before", null);
-			const res = await gcCall("blobs/delete", `${root}/delete`, {
+			const { status, body } = await gcCall("blobs/delete", `${root}/delete`, {
 				method: "POST",
 				headers: { ...auth, "Content-Type": "application/json" },
 				body: JSON.stringify({ ifUploadedBefore: cutoffMs, addresses }),
-			}, signal);
-			if (res.status !== 200) throw await fail("blobs/delete", res);
-			const body: unknown = await res.json().catch(() => null);
+			}, BLOB_DELETE_CALL_BYTES, signal);
+			if (status !== 200) throw new RelayHttpError("blobs/delete", status, codeOf(body), null);
 			const raw = typeof body === "object" && body !== null ? (body as Record<string, unknown>).results : null;
 			if (!Array.isArray(raw) || raw.length !== addresses.length) throw new RelayHttpError("blobs/delete", 200, "malformed_response", null);
 			return addresses.map((address, i) => {
@@ -472,18 +501,8 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
  */
 export async function probeHttpBlob(opts: HttpBlobOptions, timeoutMs = CAPABILITIES_TIMEOUT_MS): Promise<BlobPort | null> {
 	const doFetch: typeof fetch = opts.fetch ?? ((input, init) => fetch(input, init));
-	const clock = opts.clock ?? createWebClock();
-	const abort = new AbortController();
-	const deadline = clock.setTimer(timeoutMs, () => abort.abort());
-	let body: unknown;
-	try {
-		body = await untilAborted(capabilities(doFetch, `${normalizeBaseUrl(opts.baseUrl)}/api/capabilities`, abort.signal), abort.signal);
-	} catch (e) {
-		if (abort.signal.aborted) throw new RelayHttpError("capabilities", 0, "timeout", null);
-		throw e;
-	} finally {
-		clock.clearTimer(deadline);
-	}
+	const url = `${normalizeBaseUrl(opts.baseUrl)}/api/capabilities`;
+	const body = await bounded(timeoutMs, undefined, opts.clock ?? createWebClock(), (s) => capabilities(doFetch, url, s), (why) => new RelayHttpError("capabilities", 0, why, null));
 	if (typeof body !== "object" || body === null) throw new RelayHttpError("capabilities", 200, "malformed_response", null);
 	if (!("attachments" in body) || body.attachments !== true) return null;
 	const max = "maxBlobUploadBytes" in body && typeof body.maxBlobUploadBytes === "number" && body.maxBlobUploadBytes > 0
@@ -512,6 +531,7 @@ async function capabilities(doFetch: typeof fetch, url: string, signal: AbortSig
 	} catch {
 		throw new RelayHttpError("capabilities", 0, "network_error", null);
 	}
-	if (res.status !== 200) throw new RelayHttpError("capabilities", res.status, await errorCode(res), null);
+	// The whole call, this body included, is raced against probeHttpBlob's deadline (bounded).
+	if (res.status !== 200) throw new RelayHttpError("capabilities", res.status, codeOf(await res.json().catch(() => null)), null);
 	return await res.json();
 }

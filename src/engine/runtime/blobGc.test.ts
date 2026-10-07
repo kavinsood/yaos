@@ -478,3 +478,23 @@ test("GC suite 1: addresses are HMACs; the live blob survives, garbage goes, and
 		await w.stop();
 	}
 });
+
+test("GC stop: engine stop ends a sweep whose fresh read the relay never answers (stop awaits the sweep before it closes the session)", async () => {
+	const w = new World();
+	const a = await w.device(A);
+	let reads = 0;
+	a.c.sess.readFresh = () => (reads++, new Promise<boolean>(() => undefined));
+	let out: GcOutcome | "pending" = "pending";
+	void sweep(a).then((o) => (out = o));
+	const settled = (): GcOutcome | "pending" => out;
+	await until(() => reads === 1, 2_000, "fresh read in flight");
+	assert.equal(settled(), "pending");
+	let stopped = false;
+	const stop = w.stop().then(() => (stopped = true));
+	await until(() => stopped, 2_000, "engine stopped");
+	await stop;
+	await until(() => settled() !== "pending", 1_000, "sweep ended");
+	const end = settled();
+	assert.ok(end !== "pending");
+	assert.equal(end.deleted, 0);
+});

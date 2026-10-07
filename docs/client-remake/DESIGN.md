@@ -1950,7 +1950,12 @@ ones get conflict copies.
     `BLOB_TRANSFER_IDLE_MS` (60 s; the download body is read chunk by chunk into a buffer sized from
     Content-Length, the upload is an XHR whose `upload.onprogress` feeds the same idle check). No fixed deadline
     ends a transfer that is still moving. An aborted or stalled transfer fails like any transport error and is
-    retried with backoff.
+    retried with backoff. Every other network call ends too, through one mechanism (`src/core/deadline.ts`
+    `bounded` / `untilAborted`, which hold even when the transport ignores its signal): a deadline of 15 s plus its
+    byte bound at 64 KiB/s (`relayHttpDeadlineMs`; relay feed / read / readBatch / checkpoint, blob GC list
+    17 s and delete 15.5 s, pairing / claim / operator calls 15 s, the capabilities probe 10 s, connect's
+    ticket + upgrade + `VAULT_READY` 15 s), and the caller's signal (the session's close, the link, a GC sweep's
+    stop). A pairing call that ends so fails "Could not reach the server: no answer within 15 s."
   - Files larger than the store path's plaintext cap (`storePlaintextCap`: `BlobPort.maxBlobBytes`, the server's
     `maxBlobUploadBytes`, `MAX_BLOB_UPLOAD_BYTES` = 100 MB when it sends none or the capabilities probe fails; under
     suite 1 what still fits once sealed, `maxSealedBlobPlaintext`, 98566143 at 100 MB) or
