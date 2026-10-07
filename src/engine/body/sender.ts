@@ -37,7 +37,7 @@ const MAX_BURST = 1024 * 1024;
 
 export interface SenderDeps {
 	readonly clock: ClockPort;
-	/** Rank: 0 bound body, 1 ns, 2 cfg, 3 background body, 4 bulk (x:, adopted). */
+	/** Rank: 0 bound body, 1 ns, 2 cfg, 3 snap / background body, 4 adopted. */
 	rankOf(rec: OutboxRecord): number;
 	maxInflightBytes(): number;
 	/** Lazy T_sent (diagnostics only). */

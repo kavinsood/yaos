@@ -155,9 +155,10 @@ rid-correlated request to the host's DiskExecutor (HostLink, §g.2).
   doc into the next pass scope; the planner projects the change as disk ops:
   plain `vault.rename` for moves, trash for deletes (§f.2).
 - **Attachments** (§j.1). The planner emits `pushBlob` / `fetchBlob`; the
-  BlobQueue moves bytes over the HTTP blob store, or over `x:<hash>` log
-  chunk frames when the relay has no blob store. `nsCreate(kind=blob)` and
-  `setBlob` are deferred until the upload is durable.
+  BlobQueue moves bytes over the HTTP blob store only (the `x:` log carrier
+  was later deleted); with no blob store, attachments are not synced.
+  `nsCreate(kind=blob)` and `setBlob` are deferred until the upload is
+  durable.
 - **Settings** (§j.3). Allow-listed config-dir files sync through the `cfg`
   stream: JSON files as per-key registers, other files whole. Changes are
   picked up by full passes.
@@ -172,14 +173,14 @@ files, ~15.4k lines.
 
 | Module | Files / lines | Role |
 |---|---|---|
-| `core/codec` | 9 / 1334 | lib0 codecs: envelope, nsOps, cfgOps, checkpoints, blob chunks, side-file mirrors |
+| `core/codec` | 9 / 1334 | lib0 codecs: envelope, nsOps, cfgOps, checkpoints, blob chunks (later deleted), side-file mirrors |
 | `core/ns` | 6 / 834 | ns fold (§c), overlay of own pending frames |
 | `core/cfg` | 4 / 659 | settings fold (§c.11) |
 | `core/paths` | 5 / 777 | pathKey (frozen case-fold tables), path validation (§c.2) |
 | `core/plan` | 7 / 1155 | three-tree planner (§f.2) |
 | `core/merge` | 5 / 1164 | merge engine, minimal token diff, applyEditsTo (§f.3) |
 | `core/hash` | 5 / 910 | content hashes (markdown, canvas logical hash, blobs) |
-| `engine/runtime` | 16 / 3070 | LogEngine: session loop, outbox, live ingest, catch-up, compaction, checkpoints, mirrors, quarantine, relay policy, blob chunks |
+| `engine/runtime` | 16 / 3070 | LogEngine: session loop, outbox, live ingest, catch-up, compaction, checkpoints, mirrors, quarantine, relay policy, blob chunks (later deleted) |
 | `engine/store` | 2 / 1213 | IDB schema and transactions (§e) |
 | `engine/body` | 8 / 1245 | body handles, residency, frame builder, counted Yjs calls |
 | `engine/sync` | 6 / 717 | streams, frames, receipts, refs |
@@ -314,7 +315,7 @@ waiting on the blob queue.
 | D1 | §k.2 | The host imports `engine/adapters/webEngine` (the inline carrier's entry), not `engine/runtime/engine.ts`. | The host may not import web adapters, and `engine/runtime/engine.ts` is now only the log side. `webEngine` is the one engine module the host may import; check-deps enforces it. |
 | D2 | §k.1, §k.2 | There is no separate worker build or "bundled worker source string". `main.js` is one bundle wrapped in a named function (`__yaosBundle`); the worker's Blob script is that function's source (`Function.prototype.toString`, ECMA-262 §20.2.3.5) called with the worker scope, and `host/entry.ts` (the only host file allowed to import `engine/workerMain`) lazily starts either the engine (worker) or the plugin (main). | The engine is in `main.js` once, and both carriers keep working without `eval` / `new Function` on main and without reading files. The worker needs only what it needed before: a `blob:` worker, with inline as the fallback. This saves 424 KiB raw (see §8). |
 | D3 | §g.2 | `init` answers `ready` when the ports exist, before the vault runtime has started; the runtime retries in the background. Only an unusable store fails init (`storage-lost`). | A fresh device offline must still get a protocol-ready engine; only storage failure should push the host to the inline carrier (OR-1). |
-| D4 | §j.1 | When the relay's capabilities can't be read at startup (offline), the engine assumes the HTTP blob store exists and lets the blob queue retry. | Refs must not depend on whether a device happened to be online at startup (otherwise one attachment could be sent as a blob ref by one device and as `x:` chunks by another). |
+| D4 | §j.1 | When the relay's capabilities can't be read at startup (offline), the engine assumes the HTTP blob store exists and lets the blob queue retry. | An offline start must not run store-less: that device would not sync attachments and would freeze an oversized update `oversize-local` (`src/engine/runtime/docRuntime.ts:149-154`). (The original reason, one attachment sent as a blob ref by one device and as `x:` chunks by another, went away with the `x:` carrier.) |
 | D5 | §c.12 | `intent{epoch-migration}` is not written. A crash in the middle of a migration restarts on the newest DB (the new epoch): the path bases are gone (no-base handling) and the old DB is not deleted. | Epoch resets are rare operator actions; the snapshot taken before migration (step 1) keeps every file version. |
 | D6 | §j.3 | A JSON settings file whose fold has no keys is not created on peers (a local `{}` and a missing file are the same state). | JSON files are per-key registers; an empty register set has no file identity to project. The sim's settings invariant compares them as equal. |
 | D7 | §l.3 | Sim invariants #4 (fold determinism, V3 digests) and #6 (resource bounds) are not checked by the sim runner. | #4 is covered by WP-A's 10k-op fold fuzz, #6 by WP-C's runtime tests and benchmarks. V3 digests are not implemented (see gaps). |
@@ -380,11 +381,12 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   synced/localTree commit, `reconcile/store.ts:90`). It bounds the local run
   and the last ~1 s of the deployed run. Batching the commit would break the
   write-file-then-record order that crash recovery relies on, so it was left.
-- Blob jobs that run before catch-up has read their `x:` stream still read
-  it from the relay (9 of 22 in the a5ab167 deployed run), the same bytes catch-up
-  reads again. These reads (`readBlobChunks`) do not go through the catch-up
-  lanes, hence the 5th request on the wire. The rare `checkpoint-disputed`
-  retry read also runs outside the lane chain.
+- Blob jobs that ran before catch-up had read their `x:` stream read it
+  from the relay (9 of 22 in the a5ab167 deployed run), the same bytes catch-up
+  read again. These reads (`readBlobChunks`) did not go through the catch-up
+  lanes, hence the 5th request on the wire. Gone with the `x:` carrier: blobs
+  travel only via the blob store. The rare `checkpoint-disputed` retry read
+  also runs outside the lane chain.
 - Session start reads ns (+ cfg) in its own request before catch-up starts:
   one round trip by design (ns is folded before live).
 - Each leading-edge commit costs 2 extra rows per stream it touches (free
@@ -410,8 +412,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - Unpairing leaves the device listed on the server (the confirm dialog
   says so, `settingsTab.ts:347`); there is no in-app way to create a vault
   on a claimed server (operator console only).
-- The relay has no R2 binding, so attachments travel inline as `x:` chunks
-  (cap 8 MiB per blob on this config).
+- The relay had no R2 binding, so attachments travelled inline as `x:` chunks
+  (cap 8 MiB per blob on that config). The `x:` carrier was later deleted:
+  without a blob store, attachments are not synced.
 
 **Host**
 - With IndexedDB missing in both carriers, the host stays in `starting` and
@@ -587,7 +590,8 @@ sends and the Node harness did not, so the first attempt failed at operator
 login with 403 `forbidden_origin` (no client code involved). 5b1803e makes
 the harness onboarding send `Origin: <relay origin>` on those routes; the
 rerun passed. The new build also serves blobs over HTTP (`blobPath` = `http`
-on every client; the local relay and the earlier deployed build used `log`).
+on every client; the local relay and the earlier deployed build used `log`,
+which was later deleted with the `x:` carrier: `blobPath` is `http` or `none`).
 
 Latencies (ms) from the 5735ad5 full-client runs, p50 / p95 (n). The host
 watcher delay is 100 ms, the editor coalesce 16 ms; the clients and the local
@@ -624,8 +628,9 @@ for 2 MB and slower for small files.
 | restart_from_idb_converge | 1410 (1) | 2534 (1) |
 | offline_start_reconnect_converge | 1397 (1) | 2477 (1) |
 
-Locally `attachment_2m` is dominated by chunked upload through the log (no
-R2 in the local relay, so blobs travel as `x:` chunks; `blobPath` = `log`).
+Locally `attachment_2m` was dominated by chunked upload through the log (no
+R2 in the local relay then, so blobs travelled as `x:` chunks; `blobPath` =
+`log`). The local relay now binds R2 by default and the `x:` carrier is gone.
 The deployed fresh bootstrap (5.1 s here, 15.5 s in the earlier deployed run)
 is explained and fixed in §7.1.
 
@@ -680,7 +685,8 @@ jobs, 4 MiB disk I/O in flight (a desktop with the worker gets 8 / 4 / 8 MiB).
    `blobConcurrency - 1`, held bytes <= `maxDiskIoBytesInFlight`, leftovers
    dropped after the pass; 9a76b06), and `readBlobChunks` assembles from the
    local tail when the tail holds the whole blob, else reads the relay
-   (61db34d).
+   (61db34d). (The `x:` carrier, `readBlobChunks` and `runtime/blobChunks.ts`
+   were later deleted; blobs travel only via the blob store.)
 
 Fresh device, 1000 notes + 20 x 40 KB + 2 x 300 KB attachments (1022 files,
 vaultSeq 1047), two fresh devices per run. ms until every file is on disk /

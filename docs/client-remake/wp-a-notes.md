@@ -44,7 +44,7 @@ tsconfig.
   - `ids.ts`: base64url, docId/clientFrameId/contentHash checks, `newDocId`/`newClientFrameId` on a RandomPort;
   - `envelope.ts`: outer/inner, bounded inflate, AADs, `checkBinding`, `sealEnvelope`/`openEnvelope`, `identityCrypto`;
   - `nsOps.ts`, `cfgOps.ts`;
-  - `contents.ts`: checkpoint, blobChunk, bodyUpdateRef;
+  - `contents.ts`: checkpoint, blobChunk (later deleted with the `x:` carrier), bodyUpdateRef;
   - `nsFoldV1.ts`, `cfgFoldV1.ts`;
   - `mirrors.ts`: outbox/synced side-file mirrors, `pickMirror`.
 - `src/core/ns/`:

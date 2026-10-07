@@ -117,7 +117,6 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 	return out;
 }
 
-/** Settings converge (LWW per key): every device's synced config files are equal (JSON compared parsed). */
 /** Invariant "log": only small records rode the relay log; attachment bytes went to the blob store only. */
 export function checkLogCarriesNoBlobs(net: SimNet, oracle: { readonly docs: readonly OracleDoc[] }): Violation[] {
 	const out: Violation[] = [];
@@ -128,6 +127,7 @@ export function checkLogCarriesNoBlobs(net: SimNet, oracle: { readonly docs: rea
 	return out;
 }
 
+/** Settings converge (LWW per key): every device's synced config files are equal (JSON compared parsed). */
 export function checkSettings(devs: readonly SimDevice[]): Violation[] {
 	const out: Violation[] = [];
 	// JSON settings files sync as per-key registers (§j.3): a file with no keys is the same state as no file.
