@@ -3,7 +3,7 @@
 // is a real VaultHost on SQLite; the config DO is a namespace that records every access.
 import assert from "node:assert/strict";
 
-import { Router, type WorkerEnv } from "../../server/src/router";
+import { MAX_BLOB_UPLOAD_BYTES, Router, type WorkerEnv } from "../../server/src/router";
 import * as entry from "../../server/src/worker";
 import { suite } from "../harness.ts";
 import {
@@ -385,7 +385,7 @@ s.test("checkpoint: Content-Length above 4 MiB → 413 before any DO call; a bad
 	});
 });
 
-s.test("blobs: no bucket → 503; address regex; 10 MiB PUT cap: all before any DO call; then one vault-DO bearer check", async () => {
+s.test("blobs: no bucket → 503; address regex; 100 MB PUT cap: all before any DO call; then one vault-DO bearer check", async () => {
 	await withWorld(async (world) => {
 		const v = `/vault/${world.vaultId}`;
 		const address = "a".repeat(64);
@@ -408,7 +408,7 @@ s.test("blobs: no bucket → 503; address regex; 10 MiB PUT cap: all before any 
 			assert.deepEqual(await body(response), { error: "invalid_address" });
 		}
 		const tooLarge = await world.router.fetch(new Request(`${ORIGIN}${v}/blobs/${"b".repeat(64)}`, { method: "PUT",
-			headers: { ...bearer(world.owner), "Content-Length": String(10 * 1024 * 1024 + 1) }, body: "x" }), world.env);
+			headers: { ...bearer(world.owner), "Content-Length": String(MAX_BLOB_UPLOAD_BYTES + 1) }, body: "x" }), world.env);
 		assert.equal(tooLarge.status, 413);
 		assert.deepEqual(await body(tooLarge), { error: "body_too_large" });
 		await assertNotFound(world, "GET", `${v}/blobs/${"c".repeat(64)}/x`);
@@ -426,7 +426,9 @@ s.test("blobs: no bucket → 503; address regex; 10 MiB PUT cap: all before any 
 			world.resetCalls();
 			// The batch delete checks its JSON body before the bearer, so it needs a valid one to reach the check.
 			const payload = path === "blobs/delete" ? JSON.stringify({ ifUploadedBefore: 1, addresses: [address] }) : "x";
-			const response = await world.fetch(`${v}/${path}`, { method, ...(method === "GET" ? {} : { body: payload }) });
+			// A blob PUT declares its length (a network request does); without one it is 411 before the bearer check.
+			const length = method === "PUT" ? { headers: { "Content-Length": String(payload.length) } } : {};
+			const response = await world.fetch(`${v}/${path}`, { method, ...length, ...(method === "GET" ? {} : { body: payload }) });
 			assert.deepEqual([response.status, await body(response)], [401, { error: "unauthorized" }], `${method} ${path}`);
 			assert.deepEqual(world.cluster.fetches.map((call) => [call.method, call.url]),
 				[["POST", `https://vault.internal/blobs/${check}`]], `${method} ${path}: one bearer check`);
@@ -460,7 +462,7 @@ s.test("capabilities: the five kept fields; the config DO is asked only until cl
 		assert.equal(first.status, 200);
 		assert.equal(first.headers.get("Access-Control-Allow-Origin"), "*");
 		assert.equal(await first.text(),
-			"{\"claimed\":false,\"attachments\":false,\"maxBlobUploadBytes\":10485760,\"serverVersion\":\"1.0.0\",\"streams\":1}");
+			"{\"claimed\":false,\"attachments\":false,\"maxBlobUploadBytes\":100000000,\"serverVersion\":\"1.0.0\",\"streams\":1}");
 		assert.ok(world.config.accesses.includes("stub.isClaimed"));
 		world.resetCalls();
 		await world.fetch("/api/capabilities");

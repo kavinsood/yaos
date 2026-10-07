@@ -88,7 +88,7 @@ const HOT_PATHS: HotPath[] = [
 		} },
 	{ name: "blob PUT", status: 204,
 		request: ({ vaultId, device }) => new Request(`${ORIGIN}/vault/${vaultId}/blobs/${BLOB_ADDRESS}`, {
-			method: "PUT", headers: { ...bearer(device), "Content-Type": "application/octet-stream" },
+			method: "PUT", headers: { ...bearer(device), "Content-Type": "application/octet-stream", "Content-Length": "3" },
 			body: new Uint8Array([4, 5, 6]),
 		}) },
 	{ name: "blob GET", status: 200,
