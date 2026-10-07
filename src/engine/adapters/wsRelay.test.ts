@@ -186,6 +186,30 @@ describe("wsRelay connect", () => {
 		socket.control(READY); // late ready is ignored
 	});
 
+	it("a ticket request nobody answers -> unavailable at readyTimeoutMs, aborted, no socket", async () => {
+		// The fetch ignores its signal: the deadline must hold anyway (the session loop retries only once connect settles).
+		const clock = new ManualClock();
+		let signal: AbortSignal | null = null;
+		const fetchImpl: typeof fetch = async (_input, init) => {
+			signal = init?.signal ?? null;
+			return new Promise<Response>(() => undefined);
+		};
+		const ws = fakeSockets();
+		const port = createWsRelayPort({ baseUrl: "https://relay.example", credential: TOKEN, fetch: fetchImpl, WebSocketImpl: ws.Ctor, clock, readyTimeoutMs: 5000 });
+		let settled = false;
+		const p = port.connect({ vaultId: VAULT, deviceId: DEVICE });
+		void p.then(() => { settled = true; });
+		await flush();
+		clock.advance(4999);
+		await flush();
+		assert.equal(settled, false);
+		clock.advance(1);
+		assert.deepEqual(await p, { ok: false, reason: "unavailable", retryAfterMs: null });
+		assert.equal((signal as AbortSignal | null)?.aborted, true);
+		assert.equal(ws.sockets.length, 0);
+		assert.equal(clock.pendingTimers, 0);
+	});
+
 	it("a throwing WebSocket constructor -> unavailable, nothing leaks", async () => {
 		const clock = new ManualClock();
 		const f = fakeFetch(() => jsonResponse({ ticket: TICKET }));

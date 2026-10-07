@@ -3,7 +3,8 @@
  *
  * connect(): fresh ticket (POST /vault/:id/auth/ticket {purpose:"streams"}),
  * then wss://host/vault/:id/ws/streams?ticket=...&streamsVersion=1, then
- * VAULT_READY. Every failure resolves to {ok:false}; connect never rejects.
+ * VAULT_READY, all three within readyTimeoutMs. Every failure (that deadline
+ * included) resolves to {ok:false}; connect never rejects.
  *
  * Session semantics beyond the port contract:
  * - Events that arrive before the first onEvent listener are buffered and
@@ -37,7 +38,7 @@ import type {
 } from "../../ports/relay";
 import type { Unsubscribe } from "../../ports/common";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
-import { createRelayHttp, dailyResetDelayMs, normalizeBaseUrl, type ConnectFailureReason, type RelayHttp } from "./relayHttp";
+import { createRelayHttp, dailyResetDelayMs, normalizeBaseUrl, type ConnectFailureReason, type RelayHttp, type TicketResult } from "./relayHttp";
 import {
 	decodeServerFrame,
 	encodeAppend,
@@ -528,7 +529,16 @@ export function createWsRelayPort(opts: WsRelayOptions): RelayPort {
 		const Impl = resolveWebSocket(opts.WebSocketImpl);
 		if (Impl === null) return { ok: false, reason: "unavailable", retryAfterMs: null };
 		const started = clock.monotonic();
-		const ticket = await http.ticket(params.vaultId);
+		// The ticket is inside the budget too: a ticket request nobody answers must not hold connect (and the session
+		// loop, which retries only once connect resolves) forever.
+		const abort = new AbortController();
+		const deadline = clock.setTimer(readyTimeoutMs, () => abort.abort());
+		let ticket: TicketResult;
+		try {
+			ticket = await http.ticket(params.vaultId, abort.signal);
+		} finally {
+			clock.clearTimer(deadline);
+		}
 		if (!ticket.ok) return { ok: false, reason: ticket.reason, retryAfterMs: ticket.retryAfterMs };
 		const remaining = readyTimeoutMs - (clock.monotonic() - started);
 		if (remaining <= 0) return { ok: false, reason: "unavailable", retryAfterMs: null };

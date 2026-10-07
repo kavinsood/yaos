@@ -29,7 +29,7 @@
 import { BLOB_DELETE_BATCH, type BlobDeleteResult, type BlobListItem, type BlobPort } from "../../ports/blob";
 import type { ClockPort } from "../../ports/clock";
 import type { BlobAddress } from "../../ports/crypto";
-import { normalizeBaseUrl, parseRetryAfter, RelayHttpError } from "./relayHttp";
+import { normalizeBaseUrl, parseRetryAfter, RelayHttpError, untilAborted } from "./relayHttp";
 import { createWebClock } from "./webClock";
 
 export const BLOB_EXISTS_BATCH = 50;
@@ -38,6 +38,8 @@ export const DEFAULT_MAX_BLOB_BYTES = 10 * 1024 * 1024;
 export const GC_RETRY_ATTEMPTS = 5;
 /** Longest Retry-After honoured; a longer one fails the call (the GC limit's window is 60 s). */
 export const GC_RETRY_MAX_WAIT_MS = 65_000;
+/** probeHttpBlob's budget for the whole capabilities reply (a small JSON body). */
+export const CAPABILITIES_TIMEOUT_MS = 10_000;
 const ADDRESS = /^[0-9a-f]{64}$/;
 
 export interface HttpBlobOptions {
@@ -235,21 +237,52 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 
 /**
  * GET /api/capabilities; a BlobPort when attachments are available, else null.
- * Throws RelayHttpError when capabilities cannot be fetched.
+ * Throws RelayHttpError when capabilities cannot be fetched: code "timeout" when
+ * no whole reply arrived within `timeoutMs` (on `opts.clock`). Engine init awaits
+ * this probe, so it is bounded: a request nobody answers fails it, never holds it.
  */
-export async function probeHttpBlob(opts: HttpBlobOptions): Promise<BlobPort | null> {
+export async function probeHttpBlob(opts: HttpBlobOptions, timeoutMs = CAPABILITIES_TIMEOUT_MS): Promise<BlobPort | null> {
 	const doFetch: typeof fetch = opts.fetch ?? ((input, init) => fetch(input, init));
-	let res: Response;
+	const clock = opts.clock ?? createWebClock();
+	const abort = new AbortController();
+	const deadline = clock.setTimer(timeoutMs, () => abort.abort());
+	let body: unknown;
 	try {
-		res = await doFetch(`${normalizeBaseUrl(opts.baseUrl)}/api/capabilities`, { method: "GET" });
-	} catch {
-		throw new RelayHttpError("capabilities", 0, "network_error", null);
+		body = await untilAborted(capabilities(doFetch, `${normalizeBaseUrl(opts.baseUrl)}/api/capabilities`, abort.signal), abort.signal);
+	} catch (e) {
+		if (abort.signal.aborted) throw new RelayHttpError("capabilities", 0, "timeout", null);
+		throw e;
+	} finally {
+		clock.clearTimer(deadline);
 	}
-	if (res.status !== 200) throw new RelayHttpError("capabilities", res.status, await errorCode(res), null);
-	const body: unknown = await res.json();
 	if (typeof body !== "object" || body === null) throw new RelayHttpError("capabilities", 200, "malformed_response", null);
 	if (!("attachments" in body) || body.attachments !== true) return null;
 	const max = "maxBlobUploadBytes" in body && typeof body.maxBlobUploadBytes === "number" && body.maxBlobUploadBytes > 0
 		? body.maxBlobUploadBytes : undefined;
 	return createHttpBlob({ ...opts, maxBlobBytes: opts.maxBlobBytes ?? max });
+}
+
+/**
+ * Engine start (makePorts): the probed store, or, when capabilities cannot be had (offline start, or a relay that does
+ * not answer within CAPABILITIES_TIMEOUT_MS), the store assumed: the blob queue retries, so refs never depend on
+ * whether the device happened to be online at startup. Never rejects.
+ */
+export async function startupBlob(opts: HttpBlobOptions, log?: (line: string) => void): Promise<BlobPort | null> {
+	try {
+		return await probeHttpBlob(opts);
+	} catch (e) {
+		log?.(`capabilities probe failed (${e instanceof RelayHttpError ? e.message : "malformed reply"}); assuming the blob store`);
+		return createHttpBlob(opts);
+	}
+}
+
+async function capabilities(doFetch: typeof fetch, url: string, signal: AbortSignal): Promise<unknown> {
+	let res: Response;
+	try {
+		res = await doFetch(url, { method: "GET", signal });
+	} catch {
+		throw new RelayHttpError("capabilities", 0, "network_error", null);
+	}
+	if (res.status !== 200) throw new RelayHttpError("capabilities", res.status, await errorCode(res), null);
+	return await res.json();
 }

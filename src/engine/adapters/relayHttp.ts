@@ -40,13 +40,39 @@ export interface RelayHttpOptions {
 }
 
 export interface RelayHttp {
-	/** POST /vault/:id/auth/ticket {purpose:"streams"}. Never throws. */
-	ticket(vaultId: string): Promise<TicketResult>;
+	/** POST /vault/:id/auth/ticket {purpose:"streams"}. Never throws; "unavailable" once `signal` aborts (connect's deadline). */
+	ticket(vaultId: string, signal?: AbortSignal): Promise<TicketResult>;
 	feed(vaultId: string, afterSeq: number, limit: number | null): Promise<FeedPage>;
 	read(vaultId: string, stream: string, afterSeq: number, preferCheckpoint: boolean, maxBytes: number | null): Promise<ReadPage>;
 	/** Batched read (relay-wire §7.1): pages for a non-empty prefix of `reqs` (the URL is capped at READ_BATCH_MAX_QUERY_CHARS). */
 	readBatch(vaultId: string, reqs: readonly ReadRequest[], maxBytes: number | null): Promise<ReadPage[]>;
 	putCheckpoint(vaultId: string, stream: string, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array): Promise<PutCheckpointResult>;
+}
+
+/**
+ * `p`, or a rejection (the signal's reason) as soon as `signal` aborts. A deadline then holds even when the fetch
+ * behind `p` ignores its signal: a request nobody answers is never awaited past it.
+ */
+export function untilAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	if (!signal) return p;
+	if (signal.aborted) {
+		p.catch(() => undefined);
+		return Promise.reject(signal.reason);
+	}
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = (): void => reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+		p.then(
+			(v) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(v);
+			},
+			(e: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(e);
+			},
+		);
+	});
 }
 
 /** Strips trailing slashes: "https://h/" -> "https://h". */
@@ -155,24 +181,25 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 
 	const vaultPath = (vaultId: string, rest: string): string => `${base}/vault/${encodeURIComponent(vaultId)}${rest}`;
 
-	/** null = network failure. Never rejects. */
-	async function call(url: string, init: { method: string; body?: BodyInit; contentType?: string }): Promise<HttpReply | null> {
+	/** null = network failure, or `signal` aborted before the whole reply arrived. Never rejects. */
+	async function call(url: string, init: { method: string; body?: BodyInit; contentType?: string }, signal?: AbortSignal): Promise<HttpReply | null> {
 		const headers: Record<string, string> = { Authorization: auth };
 		if (init.contentType) headers["Content-Type"] = init.contentType;
 		let res: Response;
 		try {
-			res = await doFetch(url, { method: init.method, headers, body: init.body });
+			res = await untilAborted(doFetch(url, { method: init.method, headers, body: init.body, ...(signal ? { signal } : {}) }), signal);
 		} catch {
 			return null;
 		}
 		let body: Json | null = null;
 		try {
-			const text = await res.text();
+			const text = await untilAborted(res.text(), signal);
 			if (text !== "") {
 				const parsed: unknown = JSON.parse(text);
 				body = isRecord(parsed) ? parsed : null;
 			}
 		} catch {
+			if (signal?.aborted) return null;
 			body = null;
 		}
 		const code = body !== null && typeof body["error"] === "string" ? body["error"] : null;
@@ -193,12 +220,12 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	}
 
 	return {
-		async ticket(vaultId) {
+		async ticket(vaultId, signal) {
 			const reply = await call(vaultPath(vaultId, "/auth/ticket"), {
 				method: "POST",
 				body: JSON.stringify({ purpose: "streams" }),
 				contentType: "application/json",
-			});
+			}, signal);
 			if (reply === null) return { ok: false, reason: "unavailable", retryAfterMs: null };
 			const { status, code, retryAfterMs } = reply;
 			if (status === 200) {

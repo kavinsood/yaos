@@ -87,6 +87,26 @@ describe("relayHttp ticket", () => {
 		}
 	});
 
+	it("its signal aborting ends a ticket stalled on headers or body -> unavailable, even when the fetch ignores the signal", async () => {
+		const stalledBody = () => new Response(new ReadableStream({ start: () => undefined }), { status: 200 });
+		for (const stage of ["headers", "body"] as const) {
+			const signals: (AbortSignal | null)[] = [];
+			const fetchImpl: typeof fetch = async (_input, init) => {
+				signals.push(init?.signal ?? null);
+				return stage === "headers" ? new Promise<Response>(() => undefined) : stalledBody();
+			};
+			const http = createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: fetchImpl });
+			const abort = new AbortController();
+			const p = http.ticket("v1", abort.signal);
+			await new Promise((r) => setImmediate(r));
+			abort.abort();
+			assert.deepEqual(await p, { ok: false, reason: "unavailable", retryAfterMs: null }, stage);
+			assert.equal(signals[0], abort.signal, `${stage}: the signal reaches the fetch`);
+		}
+		const { http } = client(() => jsonResponse({ ticket: "T1" }));
+		assert.deepEqual(await http.ticket("v1", new AbortController().signal), { ok: true, ticket: "T1" });
+	});
+
 	it("daily-limit without Retry-After falls back to resetAt", async () => {
 		let clock: ManualClock | null = null;
 		const c = client(() => jsonResponse({ error: "cf_daily_limit", resetAt: clock!.now() + 5000 }, 503));
