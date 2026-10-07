@@ -651,9 +651,10 @@ Billed writes:
 scripts/relay-dev/start-local.sh [--port 8787] [--fresh] [--r2 | --no-r2] [--var K=V]
 scripts/relay-dev/stop-local.sh
 
-# deploy (cf CLI credentials fed to wrangler; generated server/wrangler.relay2-<suffix>.toml is git-excluded).
-# Client e2e needs a YAOS_BUCKET binding, which cf-config.mjs does not render yet; RELAY_DEV_R2=0 deploys without it.
-scripts/relay-dev/deploy.sh yaos-relay2-scratch-3 [--var K=V]
+# deploy (`cf deploy` as the cf CLI OAuth session; generated server/wrangler.relay2-<suffix>.toml is git-excluded).
+# YAOS_BUCKET is bound to the test bucket yaos-relay2-e2e (config.sh rewrites server/wrangler.toml's "yaos", the
+# legacy production bucket; the test bucket must exist); RELAY_DEV_R2=0 deploys without it.
+scripts/relay-dev/deploy.sh [<yaos-relay2-name>] [--var K=V]
 
 # smoke (fresh vault per run; claim on a fresh server, operator login on a claimed one)
 node e2e/relay/smoke.ts --host http://127.0.0.1:8787 --label local

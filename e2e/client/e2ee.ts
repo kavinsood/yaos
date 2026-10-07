@@ -415,8 +415,14 @@ async function main(): Promise<void> {
 	await cmd(b, { t: "installKey", source: "qr", e: 2, k: storedKey(a, 2) }, "ok");
 	await waitLive(b, 2, "b live under K_2");
 	await waitFor(() => a.client.vault.textOf("notes/b-held.md") === "written while the gate was shut\n", "b's held note reached a", 60_000, performance.now(), 100);
-	R.check("after the re-key b's held note and attachment sync, sealed under K_2", storedEpochs(b).join() === "1,2" && sameBytes(await bytesOf(a.client, "img/b-held.png"), randomBytes(4 * 1024, 77)),
-		storedEpochs(b));
+	// The attachment lands after the note: b PUTs the blob before its ref rides the log, then a GETs it. On a local relay
+	// both round trips fit in the note's arrival; over a real network they do not, so wait for the bytes too.
+	const heldImg = randomBytes(4 * 1024, 77);
+	const heldMs = await waitFor(async () => sameBytes(await bytesOf(a.client, "img/b-held.png"), heldImg), "b's held attachment reached a", 60_000,
+		performance.now(), 50).catch(() => null);
+	if (heldMs !== null) R.record("held_attachment_after_note_ms", heldMs);
+	R.check("after the re-key b's held note and attachment sync, sealed under K_2", storedEpochs(b).join() === "1,2" && heldMs !== null,
+		{ epochs: storedEpochs(b), attachmentAfterNoteMs: heldMs });
 	a.client.vault.userWrite("notes/after-revoke.md", "c must never read this\n");
 	await sleep(3_000);
 	R.check("c (revoked at the relay) never reads past the revoke", c.client.vault.textOf("notes/after-revoke.md") === null,
