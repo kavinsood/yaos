@@ -141,7 +141,8 @@ test("IDB lost without a mirror: this device's earlier rows read back are remote
 		await a.stop();
 		a2 = (await startTestEngine({ relay, deviceId: "dev-a" })).engine; // fresh DB, no side files
 		await live(a2);
-		assert.equal(await a2.docText(id), "a1;a2;");
+		// "live" is set before the body catch-up reads o.md's stream (sessionLoop.onSession): wait for the read-back.
+		await until(async () => (await a2!.docText(id)) === "a1;a2;", 2_000, "own rows read back");
 		await until(() => (a2!.bodyInfo(id)?.version.remoteSeq ?? 0) > 0, 2_000, "remoteSeq moved");
 		const before = a2.bodyInfo(id)!.version;
 		await a2.editDoc(id, (t) => t.insert(0, "b;"));
