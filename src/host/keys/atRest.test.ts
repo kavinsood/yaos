@@ -3,7 +3,8 @@
  * command, no key or recovery-key byte sequence may appear anywhere but its own SecretStorage entry: not in
  * IndexedDB, data.json, side files, local storage, the vault, logs, statuses, notices or the relay. The scan looks
  * for raw bytes and every text encoding a slip could produce (hex, base64, base64url, decimal lists, typed-array
- * JSON, latin1).
+ * JSON, latin1). The second test runs suite 1 for real (a genesis, a join by RK, a revoke) and adds the diagnostics
+ * bundle a key-holding VaultRuntime exports, the blob store and the blob addresses.
  * Only hit counts are reported, never bytes.
  */
 
@@ -11,13 +12,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { base64urlEncode } from "../../core/codec/ids";
 import { toHex } from "../../core/hash/sha256";
+import { advanceUntil, settleWith } from "../../engine/keyring/testkit/simWait";
+import { RK_A, RK_B } from "../../engine/keyring/testkit/world";
+import { SimBlobStore } from "../../sim/blobStore";
 import { VirtualClock } from "../../sim/clock";
-import { SimDevice } from "../../sim/device";
-import { SimNet } from "../../sim/net";
+import { SIM_SETTINGS, SimDevice } from "../../sim/device";
+import { SIM_VAULT_ID, SimNet } from "../../sim/net";
 import type { StatusSnapshot } from "../../protocol/status";
 import { YaosController } from "../pluginController";
 import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "../ui/api";
-import { secretIdFor } from "./secretStore";
+import { formatDiagnostics } from "../ui/diagnostics";
+import { VaultKeyStore, secretIdFor } from "./secretStore";
 import { fakeEpochKey, fakeGenesisRecord } from "./testkit/kRecords";
 import { testVaultId } from "./testkit/vaultIds";
 
@@ -217,4 +222,78 @@ test("at rest: vault keys and recovery keys appear nowhere but the vault's Secre
 	assert.deepEqual(Object.fromEntries(scanner.hits), {}, "no key material at rest outside SecretStorage");
 	assert.ok(logs.length > 0 && saved.length > 0 && statuses.length > 0, "the scanned sources are not empty");
 	assert.ok(net.relay.head() > 0, "the relay carried traffic");
+});
+
+test("at rest, suite 1 running: a key-holding VaultRuntime's diagnostics bundle, stores, logs, relay and blobs hold no key", async () => {
+	const clock = new VirtualClock();
+	const net = new SimNet(clock, { linkMs: 10 });
+	const blobs = new SimBlobStore({ now: () => clock.now() });
+	const logs: string[] = [];
+	const settings = () => ({ ...SIM_SETTINGS, syncAttachments: true, maxAttachmentBytes: 1 << 20 });
+	const dev = (name: string) => new SimDevice({ name, clock, net, pin: null, settings, blob: () => blobs, log: (l) => logs.push(`${name}: ${l}`) });
+	const wait = async (what: string, done: () => boolean): Promise<void> => assert.ok(await advanceUntil(clock, done, 60_000), what);
+	const restart = async (d: SimDevice): Promise<void> => {
+		await settleWith(clock, d.runtime.stop());
+		await settleWith(clock, d.restartApp());
+	};
+	const sealing = (d: SimDevice, e: number) => d.ui.statuses.at(-1)?.phase === "live" && d.ui.statuses.at(-1)?.e2ee?.sealEpoch === e;
+
+	// X creates an encrypted vault (§15.1), Y joins by recovery key; text and an attachment sync; X revokes (K_2, RK_B).
+	const x = dev("X");
+	x.pinData = { creating: { vaultId: SIM_VAULT_ID } };
+	void x.start();
+	await wait("creatable", () => x.ui.statuses.at(-1)?.e2ee?.creatable === true);
+	await settleWith(clock, x.runtime.command({ t: "enableE2ee", rk: RK_A.slice() }));
+	await wait("X pinned suite 1", () => x.pinData.e2ee?.suite === 1);
+	await restart(x);
+	await wait("X live under K_1", () => sealing(x, 1));
+	x.vault.userWrite("notes/a.md", "a sealed note\n");
+	x.vault.externalWrite("img.png", new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]));
+	await wait("X uploaded the attachment", () => blobs.objects.size > 0);
+	const y = dev("Y");
+	void y.start();
+	await wait("Y sees an encrypted vault", () => y.ui.statuses.at(-1)?.e2ee?.keyMissing === "encrypted-vault");
+	await settleWith(clock, y.runtime.command({ t: "installKey", source: "rk", rk: RK_A.slice() }));
+	await wait("Y pinned suite 1", () => y.pinData.e2ee?.suite === 1);
+	await restart(y);
+	await wait("Y has the attachment", () => y.vault.bytesOf("img.png") !== null);
+	await settleWith(clock, x.runtime.command({ t: "revokeRekey", rk: RK_B.slice() }));
+	await wait("X live under K_2", () => sealing(x, 2));
+	x.vault.userWrite("notes/b.md", "sealed under the second key\n");
+	await clock.advance(10_000);
+	const bundles: unknown[] = [];
+	for (const includePaths of [false, true]) {
+		const r = await settleWith(clock, x.runtime.command({ t: "exportDiagnostics", includePaths }));
+		assert.equal(r.t, "diagnostics");
+		if (r.t === "diagnostics") bundles.push(r.bundle, formatDiagnostics(r.bundle));
+	}
+
+	const held = new VaultKeyStore(x.secrets, SIM_VAULT_ID, clock).load();
+	assert.deepEqual(held?.keys.map((k) => k.e), [1, 2], "main stored K_1 and K_2");
+	const secrets = [...(held?.keys ?? []).map((k) => k.k.slice()), RK_A.slice(), RK_B.slice()];
+	const own = secretIdFor(SIM_VAULT_ID);
+	const control = new LeakScanner(secrets);
+	control.scan("secret-storage", x.secretBacking.get(own));
+	assert.ok(control.total() > 0, "the scanner detects stored key material");
+
+	const scanner = new LeakScanner(secrets);
+	scanner.scan("diagnostics", bundles);
+	for (const d of [x, y]) {
+		for (const [id, value] of d.secretBacking) if (id !== own) scanner.scan("secret-storage:other", value);
+		for (const name of await d.storage.listDatabases()) scanner.scan(`indexeddb:${d.name}`, d.storage.dump(name));
+		scanner.scan(`side-files:${d.name}`, d.sideFiles.files);
+		scanner.scan(`vault:${d.name}`, d.vault.snapshot());
+		scanner.scan(`ui:${d.name}`, d.ui);
+		scanner.scan(`data.json:${d.name}`, d.pinData);
+	}
+	scanner.scan("logs", logs);
+	for (const s of net.relay.streams()) {
+		scanner.scan("relay-rows", net.relay.rows(s, { includeGc: true }).map((r) => r.payload));
+		scanner.scan("relay-checkpoints", net.relay.checkpoint(s)?.bytes);
+	}
+	scanner.scan("blob-store", [...blobs.objects.values()].map((o) => o.bytes));
+	scanner.scan("blob-addresses", [...blobs.objects.keys()]);
+	// Counts only (never bytes).
+	assert.deepEqual(Object.fromEntries(scanner.hits), {}, "no key material outside SecretStorage while suite 1 runs");
+	assert.ok(bundles.length === 4 && logs.length > 0 && blobs.objects.size > 0, "the scanned sources are not empty");
 });
