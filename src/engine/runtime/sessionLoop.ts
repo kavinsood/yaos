@@ -261,6 +261,9 @@ export class SessionLoop {
 		c.live.disable();
 		c.lastCloseCode = ev.code;
 		c.diag("session-closed", { code: ev.code, errorCode: ev.errorCode, wasClean: ev.wasClean });
+		// The link is dead (lost, failed its liveness check) or the device leaves it (pause, park, stop): blob
+		// transfers over it end now. A close the relay sent leaves them to their idle watchdogs.
+		if (c.stopped || this.manual || this.parked || ev.code === RELAY_CLOSE.abnormal || ev.code === RELAY_CLOSE.liveness) this.abortTransfers(`close ${ev.code}`);
 		if (this.parked && !c.stopped && !this.manual) return;
 		if (c.stopped || this.manual) {
 			c.setPhase("offline");
@@ -269,6 +272,12 @@ export class SessionLoop {
 		const bp = this.backpressureFlag;
 		this.backpressureFlag = false;
 		this.decide(sessionClosed(ev.code, ev.errorCode, bp, this.st, this.random, c.tuning.reconnectBaseMs));
+	}
+
+	/** End the blob store calls in flight (blobs/transferLink.ts); their callers retry with backoff. */
+	private abortTransfers(why: string): void {
+		const n = this.c.blobLink.abort(why);
+		if (n > 0) this.c.diag("blob-transfers-aborted", { n, why });
 	}
 
 	/** One read of one stream (deduplicated). Causal-hole re-reads pass fromSeq. */
@@ -485,6 +494,7 @@ export class SessionLoop {
 		this.clearReconnect();
 		const s = c.session;
 		if (!s) {
+			this.abortTransfers("disconnect");
 			c.setPhase("offline");
 			return;
 		}
@@ -511,7 +521,10 @@ export class SessionLoop {
 		this.parked = true;
 		this.clearReconnect();
 		const s = c.session;
-		if (!s) return;
+		if (!s) {
+			this.abortTransfers("park");
+			return;
+		}
 		const gen = c.gen;
 		try {
 			s.close(RELAY_CLOSE.normal, "background");

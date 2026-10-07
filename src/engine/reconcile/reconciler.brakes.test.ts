@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { VaultPath } from "../../core/types";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { World } from "./testkit/world";
 
 const P = (s: string): VaultPath => s as VaultPath;
@@ -72,8 +72,8 @@ test("blob: local edit -> upload then setBlob; remote edit -> download", async (
 	const id = w.log.liveByPath(P("f.bin"))!;
 	w.vault.userWrite("f.bin", bytes(2, 2, 2, 2));
 	await w.sync();
-	assert.equal(w.log.entry(id)!.blob!.hash, sha256Hex(bytes(2, 2, 2, 2)));
-	assert.ok(w.blobs!.server.has(sha256Hex(bytes(2, 2, 2, 2))));
+	assert.equal(w.log.entry(id)!.blob!.hash, sha256HexRef(bytes(2, 2, 2, 2)));
+	assert.ok(w.blobs!.server.has(sha256HexRef(bytes(2, 2, 2, 2))));
 	assert.equal(w.synced(id)!.blobRev, w.log.entry(id)!.blob!.rev);
 	const next = bytes(3, 3);
 	w.blobs!.put(next);
@@ -105,6 +105,9 @@ test("blob: an upload the store refuses by size (413) holds the doc: no nsCreate
 	w.vault.userWrite("big.bin", bytes(1, 2, 3));
 	await w.boot();
 	w.blobs!.refuseUploads = true;
+	const started = await w.r.pass();
+	assert.equal(started.transferring >= 1 && started.failed === 0, true, "the upload runs in the background");
+	await w.blobs!.settle();
 	const first = await w.r.pass();
 	assert.equal(first.held, 1);
 	assert.equal(first.failed, 0, "held, not failed: the scheduler arms no retry (passScheduler.ts)");
@@ -154,8 +157,8 @@ test("blob keep-both: concurrent edits keep the remote bytes at the path and the
 	assert.deepEqual(w.vault.bytesOf(copies[0]!), mine);
 	const copyId = w.log.liveByPath(P(copies[0]!));
 	assert.ok(copyId && copyId !== id);
-	assert.equal(w.log.entry(copyId!)!.blob!.hash, sha256Hex(mine));
-	assert.ok(w.blobs!.server.has(sha256Hex(mine)));
+	assert.equal(w.log.entry(copyId!)!.blob!.hash, sha256HexRef(mine));
+	assert.ok(w.blobs!.server.has(sha256HexRef(mine)));
 	assert.equal(w.intents(), 0);
 	await w.sync();
 	assert.equal(w.conflictCopies().length, 1);
@@ -196,6 +199,6 @@ test("blob S1: an own setBlob folding in one batch with a later remote setBlob k
 	w.log.onOwnFold = hook;
 	await w.sync();
 	assert.deepEqual(w.vault.bytesOf("m.png"), theirs);
-	assert.equal(w.synced(id)!.contentHash, sha256Hex(theirs));
+	assert.equal(w.synced(id)!.contentHash, sha256HexRef(theirs));
 	assert.equal(w.synced(id)!.blobRev, w.log.entry(id)!.blob!.rev);
 });

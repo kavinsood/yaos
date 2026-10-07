@@ -1,5 +1,6 @@
 /** Settings sync test kit: config dir, shared cfg log with LWW fold, device. */
 import type { CfgFoldState, CfgOp, ConfigRelPath, DeviceId } from "../../core/types";
+import { refHashPort } from "../../core/hash/testkit/hashRef";
 import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
 import type { ConfigDirPort } from "../../ports/vault";
 import type { DiskSchema } from "../reconcile/store";
@@ -107,7 +108,7 @@ export class Device {
 	async pass(): Promise<CfgPassResult> {
 		if (!this.sync) {
 			const db = await this.storage.open<DiskSchema>(`cfg-${this.name}`, DB_SCHEMA_VERSION, STORE_SPECS);
-			this.sync = new CfgSync({ db, config: this.config, log: this.log.port(this.name), blobs: this.blobs, clock: this.clock, mobile: this.mobile, seed: this.seed, ...(this.remoteReady === null ? {} : { remoteReady: () => this.remoteReady === true }), notice: (l, c, m) => {
+			this.sync = new CfgSync({ db, config: this.config, log: this.log.port(this.name), blobs: this.blobs, clock: this.clock, hash: refHashPort, mobile: this.mobile, seed: this.seed, ...(this.remoteReady === null ? {} : { remoteReady: () => this.remoteReady === true }), notice: (l, c, m) => {
 				this.notices.push(c);
 				if (l === "warn") this.warnings.push({ code: c, message: m ?? "" });
 			} });

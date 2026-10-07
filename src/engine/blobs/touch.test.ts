@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { encodeCfgOps } from "../../core/codec/cfgOps";
 import { concatBytes } from "../../core/codec/lib0";
 import { encodeNsOps } from "../../core/codec/nsOps";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import type { ClientFrameId, ConfigRelPath, ContentHash, DocId, Seq, StreamName, VaultPath } from "../../core/types";
 import { CFG_STREAM, NS_STREAM } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
@@ -58,7 +58,7 @@ function setup(o: { committed?: Set<ContentHash> | null; local?: Map<ContentHash
 }
 
 const bytes = (n: number, seed: number) => Uint8Array.from({ length: n }, (_, i) => (i * 31 + seed) & 0xff);
-const H = (b: Uint8Array) => sha256Hex(b) as ContentHash;
+const H = (b: Uint8Array) => sha256HexRef(b) as ContentHash;
 let n = 0;
 function rec(stream: StreamName, kind: OutboxRecord["kind"], content: Uint8Array): OutboxRecord {
 	const i = n++;

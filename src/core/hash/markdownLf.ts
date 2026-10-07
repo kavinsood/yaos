@@ -6,8 +6,9 @@
  * of that canonical text; the DiskFingerprint is sha256 of the exact bytes.
  */
 
+import type { HashPort } from "../../ports/crypto";
 import type { ContentHash, DiskFingerprint } from "../types";
-import { sha256Hex } from "./sha256";
+import { digestHex } from "./digest";
 import { utf8Decode, utf8Encode } from "./utf8";
 
 export const MARKDOWN_CODEC = "markdown-lf-v1" as const;
@@ -26,13 +27,14 @@ export function markdownCanonicalBytes(content: string): Uint8Array {
 	return utf8Encode(canonicalizeMarkdown(content));
 }
 
-/** Synchronous logical hash (pure JS). The engine prefers HashPort for large files. */
-export function markdownContentHash(content: string): ContentHash {
-	return sha256Hex(markdownCanonicalBytes(content)) as ContentHash;
+/** Logical hash: sha256 of markdownCanonicalBytes, through HashPort. */
+export async function markdownContentHash(hash: HashPort, content: string): Promise<ContentHash> {
+	return (await digestHex(hash, markdownCanonicalBytes(content))) as ContentHash;
 }
 
-export function exactFingerprint(bytes: Uint8Array): DiskFingerprint {
-	return sha256Hex(bytes) as DiskFingerprint;
+/** DiskFingerprint: sha256 of the exact bytes, through HashPort. */
+export async function exactFingerprint(hash: HashPort, bytes: Uint8Array): Promise<DiskFingerprint> {
+	return (await digestHex(hash, bytes)) as DiskFingerprint;
 }
 
 /** True when the text is already canonical (writing it back changes no bytes). */

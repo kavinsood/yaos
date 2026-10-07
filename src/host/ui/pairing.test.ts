@@ -6,7 +6,7 @@ import {
 	normalizePairingCode, PairingError, parseSetupLink, prepareEnrollment, requestPairingCode, runEnrollment,
 	attemptMatches, pairDevice, retireDeviceEnrollment, RETIRE_FAILED_MESSAGE, scrubSecrets,
 	buildRekeyLink, claimServer, decodeKeyParam, encodeKeyParam, generateOperatorKey, normalizeOperatorKey, operatorCreateVault,
-	operatorLogin, operatorLogout, pairingCodeVaultId,
+	operatorLogin, operatorLogout, PAIRING_CALL_DEADLINE_MS, pairingCodeVaultId,
 	type HttpRequest, type HttpResponse, type LinkKey, type PairingDeps,
 } from "./pairing";
 import type { PairedIdentity } from "./api";
@@ -605,6 +605,84 @@ test("operatorLogin needs the session cookie; operatorCreateVault sends it with 
 	assert.equal(down.calls[0]!.url, `${OP_HOST}/operator/logout`);
 	assert.equal(down.calls[0]!.headers?.Cookie, `yaos_op=${SESSION_TOKEN}`);
 	assert.equal(down.calls[0]!.headers?.Origin, OP_HOST);
+});
+
+/** Deadline timers advanced by hand. */
+function manualTimers(): { readonly clock: NonNullable<PairingDeps["clock"]>; advance(ms: number): void; readonly pending: () => number } {
+	let now = 0, next = 1;
+	const due = new Map<number, { readonly at: number; readonly fn: () => void }>();
+	return {
+		clock: {
+			setTimer: (ms, fn) => (due.set(next, { at: now + ms, fn }), next++),
+			clearTimer: (h) => void due.delete(h as number),
+		},
+		advance(ms) {
+			now += ms;
+			for (const [h, t] of [...due]) if (t.at <= now) (due.delete(h), t.fn());
+		},
+		pending: () => due.size,
+	};
+}
+
+async function turns(): Promise<void> {
+	for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+}
+
+test("every pairing and operator call ends at PAIRING_CALL_DEADLINE_MS: a server that takes the request and never answers is a truthful network failure, retried by enrollment", async () => {
+	assert.equal(PAIRING_CALL_DEADLINE_MS, 15_063);
+	const t = manualTimers();
+	const calls: HttpRequest[] = [];
+	let answer: ((req: HttpRequest) => HttpResponse) | null = null;
+	const deps: PairingDeps = {
+		request: (req) => {
+			calls.push(req);
+			const reply = answer;
+			return reply === null ? new Promise<HttpResponse>(() => undefined) : Promise.resolve(reply(req));
+		},
+		sleep: async () => { answer = okEnroll; }, // the backoff passes and the server is back
+		randomBytes: counterBytes(),
+		clock: t.clock,
+	};
+	const track = (p: Promise<unknown>): (() => unknown) => {
+		let out: unknown = "pending";
+		p.then((v) => (out = v), (e: unknown) => (out = e));
+		return () => out;
+	};
+	const attempt = prepareEnrollment({ host: "https://sync.example.com", pairingCode: CODE, deviceName: "Mac" }, counterBytes());
+	const enrolled = track(runEnrollment(attempt, deps));
+	await turns();
+	t.advance(PAIRING_CALL_DEADLINE_MS - 1);
+	await turns();
+	assert.equal(enrolled(), "pending");
+	assert.equal(calls.length, 1);
+	t.advance(1);
+	await turns();
+	assert.equal(calls.length, 2, "the hung attempt failed as network and was retried");
+	assert.equal((enrolled() as PairedIdentity).vaultId, VAULT);
+	assert.equal(t.pending(), 0);
+
+	// Alone, the hung call fails with the truthful text (no secret in it).
+	answer = null;
+	const single = fake([]);
+	const code = track(requestPairingCode(IDENTITY, { ...single.deps, request: deps.request, clock: t.clock }));
+	await turns();
+	t.advance(PAIRING_CALL_DEADLINE_MS);
+	await turns();
+	const failed = code();
+	assert.ok(failed instanceof PairingError, String(failed));
+	assert.equal(failed.code, "network");
+	assert.equal(failed.message, "Could not reach the server: no answer within 15 s.");
+
+	// Retiring the old membership: the console hint; logging out: quietly done.
+	const retire = track(retireDeviceEnrollment(IDENTITY, { request: deps.request, clock: t.clock }));
+	const logout = track(operatorLogout({ host: OP_HOST, token: SESSION_TOKEN }, { request: deps.request, clock: t.clock }));
+	await turns();
+	t.advance(PAIRING_CALL_DEADLINE_MS);
+	await turns();
+	const retired = retire();
+	assert.ok(retired instanceof PairingError && retired.message === RETIRE_FAILED_MESSAGE && retired.code === "network", String(retired));
+	assert.equal(logout(), undefined, "logout resolved");
+	assert.equal(t.pending(), 0);
 });
 
 test("scrubSecrets", () => {

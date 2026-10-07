@@ -6,10 +6,13 @@
  * would re-create the file as new). The brake holds whole units.
  *
  * Decisions:
- * - `BrakeReport.id` = sha256 of the sorted canonical *brake keys* of the held
- *   units (`kind|docId|path|expectHash`), not of the raw ops: raw ops of
+ * - A brake stands for the sorted canonical *brake keys* of the held units
+ *   (`kind|docId|path|expectHash`, brakeIdentity), not the raw ops: raw ops of
  *   keep-both units contain fresh docIds and minute-stamped conflict names,
- *   which would change the id on every re-plan and make approval impossible.
+ *   which would change it on every re-plan and make approval impossible.
+ *   Approval names the identity itself; `BrakeReport.id` is its sha256, taken
+ *   by the engine through HashPort (brakeId): the identity grows with the
+ *   vault, and this module stays synchronous.
  * - Rolling 10-minute window counts are state, so the engine passes them in
  *   (`BrakeWindow`); the planner adds them to the per-plan counts.
  * - listing-shrank is evaluated only against a complete listing count, and
@@ -22,12 +25,13 @@
  *   mass-delete-remote, mass-overwrite, conflict-flood.
  */
 
-import type { BrakeConfig, BrakeReport, PlannerOp, VaultPath } from "../types";
+import type { HashPort } from "../../ports/crypto";
+import type { BrakeConfig, BrakeReport, PlannedBrake, PlannerOp, VaultPath } from "../types";
 import {
 	BRAKE_LISTING_FLOOR_RATIO, BRAKE_MAX_CONFLICT_COPIES, BRAKE_MIN_COUNT, BRAKE_OVERWRITE_MIN_BYTES,
 	BRAKE_OVERWRITE_SHRINK_RATIO, BRAKE_RATIO,
 } from "../limits";
-import { sha256Hex } from "../hash/sha256";
+import { digestHex } from "../hash/digest";
 import { utf8Encode } from "../hash/utf8";
 
 export const DEFAULT_BRAKE: BrakeConfig = {
@@ -66,22 +70,28 @@ export interface BrakeInput {
 	readonly liveLocalCount: number | null;
 	readonly divergence: boolean;
 	readonly window: BrakeWindow;
+	/** The brakeIdentity the user approved. */
 	readonly approval: string | null;
 }
 
 export interface BrakeOutcome {
 	readonly released: PlanUnit[];
 	readonly held: PlanUnit[];
-	readonly report: BrakeReport | null;
+	readonly report: PlannedBrake | null;
 }
 
 export function brakeKey(kind: DestructiveKind, docId: string, path: string, expect: string): string {
 	return `${kind}|${docId}|${path}|${expect}`;
 }
 
-export function brakeId(units: readonly PlanUnit[]): string {
-	const keys = units.map((u) => u.brakeKey).sort();
-	return sha256Hex(utf8Encode(keys.join("\n")));
+/** What a brake stands for: the sorted brake keys of its held units, one per line (approval compares it). */
+export function brakeIdentity(units: readonly { readonly brakeKey: string }[]): string {
+	return units.map((u) => u.brakeKey).sort().join("\n");
+}
+
+/** BrakeReport.id of a brakeIdentity: its sha256, through HashPort. */
+export async function brakeId(hash: HashPort, identity: string): Promise<string> {
+	return digestHex(hash, utf8Encode(identity));
 }
 
 /** True when a write replacing `oldSize` bytes with `newSize` counts as destructive. */
@@ -115,14 +125,14 @@ export function applyBrake(units: readonly PlanUnit[], input: BrakeInput): Brake
 	for (const t of tripped) for (const k of t.kinds) heldKinds.add(k);
 	const held = units.filter((u) => u.destructive !== null && heldKinds.has(u.destructive));
 	if (held.length === 0) return { released: [...units], held: [], report: null };
-	const id = brakeId(held);
-	if (input.approval === id) return { released: [...units], held: [], report: null };
+	const identity = brakeIdentity(held);
+	if (input.approval === identity) return { released: [...units], held: [], report: null };
 	const heldSet = new Set(held);
 	return {
 		released: units.filter((u) => !heldSet.has(u)),
 		held,
 		report: {
-			id,
+			identity,
 			reason: tripped[0]!.reason,
 			heldCount: held.length,
 			syncedCount: input.syncedCount,

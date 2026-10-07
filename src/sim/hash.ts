@@ -1,18 +1,18 @@
 /**
- * HashPort for simulation and deterministic tests: core's pure-JS SHA-256,
- * resolved on a microtask (WebCrypto's digest resolves on a real thread-pool
- * callback, which would make virtual time nondeterministic).
+ * HashPort for simulation and deterministic tests: node:crypto's SHA-256 (core/hash/testkit/hashRef.ts),
+ * resolved on a microtask (WebCrypto's digest resolves on a real thread-pool callback, which would make virtual
+ * time nondeterministic).
  */
 
-import { sha256 } from "../core/hash/sha256";
+import { refHashPort, sha256Ref } from "../core/hash/testkit/hashRef";
 import type { HashPort } from "../ports/crypto";
 import { hashItems } from "../engine/compose/hashService";
 import type { HashOracle } from "../host/hashOracle";
 
-export const sha256Sync = sha256;
+export const sha256Sync = sha256Ref;
 
 export function simHashPort(): HashPort {
-	return { sha256: (bytes) => Promise.resolve(sha256(bytes)) };
+	return refHashPort;
 }
 
 /**

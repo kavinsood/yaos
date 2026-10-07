@@ -304,8 +304,9 @@ async function benchBlob() {
  * Blob memory (e2ee-design §10.3) and the end-to-end store path, information only. Each path runs the real code:
  * - up (in-memory store): blobStore.putSealed = blobAddress, has, sealBlob, BlobPort.put, over an in-memory BlobPort
  *   that keeps what put receives by reference (no copy), so the numbers are this code's own buffers.
- * - up (httpBlob): the same through the real httpBlob.put; its stub fetch builds the real Request from (url, init),
- *   i.e. Node's fetch body extraction, so the transport's copy of the body is included.
+ * - up (httpBlob): the same through the real httpBlob.put; its stub XMLHttpRequest's send() builds the real Request
+ *   from (url, body), i.e. Node's body extraction, the [Fetch] "extract a body" that XMLHttpRequest.send runs too,
+ *   so the transport's copy of the body is included.
  * - down: blobStore.getOpened (get, openBlob; the sha256 check excluded as in benchBlob), then owned(): the copy
  *   hostLink.exec makes when write bytes are not a whole buffer, before transferring them to main.
  * Memory, from a gc()'d baseline: "allocated" = the process.memoryUsage() delta when the operation returns, before
@@ -343,13 +344,22 @@ async function benchBlobMemory() {
 		deleteIfUploadedBefore: async () => [],
 	};
 	let lastRequest = null;
+	/** The PUT transport: send() extracts the body as XMLHttpRequest.send does (undici extractBody) and answers 204. */
+	class BenchXhr {
+		upload = {};
+		status = 0;
+		open(method, url) { this.method = method; this.url = url; }
+		setRequestHeader() {}
+		send(body) {
+			lastRequest = new Request(this.url, { method: this.method, body });
+			this.status = 204;
+			queueMicrotask(() => this.onload?.());
+		}
+		abort() {}
+	}
 	const http = createHttpBlob({
-		baseUrl: "http://bench.invalid", vaultId: "bench", credential: "bench", maxBlobBytes: 10 * MiB,
-		fetch: async (url, init) => {
-			if (String(url).endsWith("/exists")) return new Response(JSON.stringify({ present: [] }), { status: 200 });
-			lastRequest = new Request(url, init); // Node's fetch body extraction (undici extractBody)
-			return new Response(null, { status: 204 });
-		},
+		baseUrl: "http://bench.invalid", vaultId: "bench", credential: "bench", maxBlobBytes: 10 * MiB, xhr: BenchXhr,
+		fetch: async () => new Response(JSON.stringify({ present: [] }), { status: 200 }), // exists
 	});
 	const sealed = concatBytes(await crypto.sealBlob({ address, plaintext }));
 	const paths = {

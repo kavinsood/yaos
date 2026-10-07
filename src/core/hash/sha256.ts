@@ -1,9 +1,12 @@
 /**
- * Pure-JS SHA-256 (FIPS 180-4). Core is pure (no crypto.subtle), but the
- * planner needs a stable synchronous hash for BrakeReport ids and tests need
- * reference digests. The engine hashes file content through HashPort
- * (WebCrypto); this is for small inputs and as a reference implementation.
+ * Pure-JS SHA-256 (FIPS 180-4) for small fixed-size inputs only: core is pure (no crypto.subtle), and a few
+ * digests are needed synchronously (the empty-content hash constants, the recovery key's 32-byte check). It
+ * refuses any input over SYNC_HASH_MAX_BYTES (fail closed, in production too): it would block the engine thread
+ * for the whole digest. Content of any size is hashed through HashPort (WebCrypto; core/hash/digest.ts), and
+ * tests take reference digests from core/hash/testkit/hashRef.ts.
  */
+
+import { SYNC_HASH_MAX_BYTES } from "../limits";
 
 const K = new Uint32Array([
 	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -17,6 +20,7 @@ const K = new Uint32Array([
 ]);
 
 export function sha256(bytes: Uint8Array): Uint8Array {
+	if (bytes.length > SYNC_HASH_MAX_BYTES) throw new RangeError(`synchronous sha256 of ${bytes.length} bytes (> ${SYNC_HASH_MAX_BYTES}): hash through HashPort`);
 	const h = new Uint32Array([
 		0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 	]);

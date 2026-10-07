@@ -17,8 +17,12 @@ import type { ExecResult, WrittenOk } from "./deps";
 import type { Scanner } from "./scan";
 import { makeBase } from "./store";
 
-/** "deferred": the job ran, the doc now waits outside the engine (a bound editor's save); counted like a wait. */
-export type JobOutcome = "ok" | "fail" | "held" | "deferred";
+/**
+ * "deferred": the job ran, the doc now waits outside the engine (a bound editor's save); counted like a wait.
+ * "inflight": its blob transfer runs in the background (blobJobs.ts); the doc's later ops wait for the pass its
+ * end requests, and none of them counts as actionable meanwhile.
+ */
+export type JobOutcome = "ok" | "fail" | "held" | "deferred" | "inflight";
 
 export interface Env {
 	readonly ctx: Ctx;
@@ -138,13 +142,14 @@ export async function diskMaterialize(env: Env, op: Op<"diskMaterialize">): Prom
 	try {
 		const text = h.doc.getText("text").toString();
 		const version = h.version();
+		// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.
+		const hash = await markdownContentHash(ctx.deps.hash, text);
 		const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "text", text }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });
 		const out = writeOk(res);
 		if (!out) {
 			env.scan.markDirty(op.path, null);
 			return "fail";
 		}
-		const hash = markdownContentHash(text);
 		const base = makeBase(op.docId, text, hash);
 		ctx.echo.expectWrite(ctx.pk(op.path), out.stat.size, out.stat.mtimeMs);
 		const entry = ctx.record({
@@ -166,9 +171,10 @@ async function materializeBlob(env: Env, op: Op<"diskMaterialize">, blob: NsBlob
 	if (!blob) return "fail";
 	const blobs = blobStore(env);
 	if (!blobs) return "held";
-	const bytes = await blobs.download({ hash: blob.hash, docId: op.docId, path: op.path, size: blob.size });
-	if (!bytes) return "fail";
-	const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "bytes", bytes }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });
+	const got = blobs.claimDownload({ hash: blob.hash, docId: op.docId, path: op.path, size: blob.size });
+	if (got.t === "busy") return "inflight";
+	if (got.t === "unavailable") return "fail";
+	const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "bytes", bytes: got.bytes }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });
 	const out = writeOk(res);
 	if (!out) {
 		env.scan.markDirty(op.path, null);

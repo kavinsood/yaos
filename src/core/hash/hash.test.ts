@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { sha256Hex } from "./sha256";
+import { SYNC_HASH_MAX_BYTES } from "../limits";
+import { sha256, sha256Hex } from "./sha256";
+import { refHashPort as H } from "./testkit/hashRef";
 import { utf8Decode, utf8Encode, utf8Length } from "./utf8";
 import { canonicalizeMarkdown, exactFingerprint, markdownContentHash, markdownTextFromBytes } from "./markdownLf";
 import {
@@ -23,12 +25,24 @@ function prng(seed: number): () => number {
 
 test("sha256 matches node:crypto across block boundaries", () => {
 	const rnd = prng(1);
-	for (const len of [0, 1, 3, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 1000, 4096, 100_003]) {
+	for (const len of [0, 1, 3, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 1000, 4095, 4096]) {
 		const bytes = new Uint8Array(len);
 		for (let i = 0; i < len; i++) bytes[i] = Math.floor(rnd() * 256);
 		assert.equal(sha256Hex(bytes), createHash("sha256").update(bytes).digest("hex"), `len ${len}`);
 	}
 	assert.equal(sha256Hex(utf8Encode("abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+});
+
+test("pure-JS sha256 refuses inputs over SYNC_HASH_MAX_BYTES (fail closed)", () => {
+	assert.equal(SYNC_HASH_MAX_BYTES, 4096);
+	for (const len of [SYNC_HASH_MAX_BYTES + 1, 64 * 1024, 100_003]) {
+		const bytes = new Uint8Array(len);
+		assert.throws(() => sha256(bytes), RangeError, `sha256 len ${len}`);
+		assert.throws(() => sha256Hex(bytes), RangeError, `sha256Hex len ${len}`);
+	}
+	// A view over a larger buffer is bounded by its own length.
+	const big = new Uint8Array(SYNC_HASH_MAX_BYTES * 2);
+	assert.equal(sha256Hex(big.subarray(0, SYNC_HASH_MAX_BYTES)), createHash("sha256").update(big.subarray(0, SYNC_HASH_MAX_BYTES)).digest("hex"));
 });
 
 test("utf8 encode/decode match TextEncoder/TextDecoder", () => {
@@ -60,14 +74,17 @@ test("utf8 encode/decode match TextEncoder/TextDecoder", () => {
 	}
 });
 
-test("markdown-lf-v1: one BOM stripped, CRLF/CR -> LF", () => {
+test("markdown-lf-v1: one BOM stripped, CRLF/CR -> LF", async () => {
 	assert.equal(canonicalizeMarkdown("\uFEFF\uFEFFa\r\nb\rc\n"), "\uFEFFa\nb\nc\n");
-	assert.equal(markdownContentHash("a\r\nb"), markdownContentHash("a\nb"));
-	assert.notEqual(markdownContentHash("a\nb"), markdownContentHash("a\nb\n"));
+	assert.equal(await markdownContentHash(H, "a\r\nb"), await markdownContentHash(H, "a\nb"));
+	assert.notEqual(await markdownContentHash(H, "a\nb"), await markdownContentHash(H, "a\nb\n"));
 	const bytes = utf8Encode("\uFEFFx\r\n");
 	assert.equal(markdownTextFromBytes(bytes), "x\n");
-	assert.equal(exactFingerprint(bytes), createHash("sha256").update(bytes).digest("hex"));
-	assert.equal(markdownContentHash("x\n"), createHash("sha256").update("x\n").digest("hex"));
+	assert.equal(await exactFingerprint(H, bytes), createHash("sha256").update(bytes).digest("hex"));
+	assert.equal(await markdownContentHash(H, "x\n"), createHash("sha256").update("x\n").digest("hex"));
+	// Content far over SYNC_HASH_MAX_BYTES hashes through the port.
+	const large = "line\r\n".repeat(200_000);
+	assert.equal(await markdownContentHash(H, large), createHash("sha256").update("line\n".repeat(200_000)).digest("hex"));
 });
 
 const SAMPLE = {
@@ -80,7 +97,7 @@ const SAMPLE = {
 	extra: { k: true },
 };
 
-test("canvas parse/canonical/format", () => {
+test("canvas parse/canonical/format", async () => {
 	const parsed = parseCanvasText(JSON.stringify(SAMPLE));
 	assert.equal(parsed.kind, "valid");
 	if (parsed.kind !== "valid") return;
@@ -91,13 +108,13 @@ test("canvas parse/canonical/format", () => {
 	assert.ok(formatted.includes('\n\t"nodes": ['));
 	// Formatting round-trips to the same logical hash.
 	const fmtBytes = utf8Encode(formatted);
-	assert.equal(canvasContentHash(fmtBytes), canvasContentHash(utf8Encode(JSON.stringify(SAMPLE))));
+	assert.equal(await canvasContentHash(H, fmtBytes), await canvasContentHash(H, utf8Encode(JSON.stringify(SAMPLE))));
 	assert.equal(parseCanvasBytes(utf8Encode('{"nodes":[{"id":"a"}]}')).kind, "invalid");
 	assert.equal(parseCanvasBytes(utf8Encode('{"nodes":[],"edges":[{"id":"e","fromNode":"x","toNode":"y"}]}')).kind, "invalid");
 	assert.equal(parseCanvasBytes(utf8Encode("")).kind, "valid");
 	// Invalid canvases still hash stably (raw bytes).
 	const bad = utf8Encode("{not json");
-	assert.equal(canvasContentHash(bad), sha256Hex(bad));
+	assert.equal(await canvasContentHash(H, bad), sha256Hex(bad));
 });
 
 test("canvas merge text round-trips and is one record per line", () => {
@@ -121,19 +138,19 @@ test("canvas merge text round-trips and is one record per line", () => {
 	assert.equal(canvasToMergeText(canvasFromMergeText(docFirst)!), text);
 });
 
-test("canvas logical hash: empty canvas = empty content; formatting and dangling edges ignored", () => {
+test("canvas logical hash: empty canvas = empty content; formatting and dangling edges ignored", async () => {
 	const empty = sha256Hex(new Uint8Array(0));
-	assert.equal(canvasContentHash(utf8Encode("")), empty);
-	assert.equal(canvasContentHash(utf8Encode('{"nodes":[],"edges":[]}')), empty);
-	assert.equal(canvasContentHash(utf8Encode("{\n  \"nodes\": []\n}\n")), empty);
-	assert.notEqual(canvasContentHash(utf8Encode('{"x":1}')), empty, "root fields are content");
+	assert.equal(await canvasContentHash(H, utf8Encode("")), empty);
+	assert.equal(await canvasContentHash(H, utf8Encode('{"nodes":[],"edges":[]}')), empty);
+	assert.equal(await canvasContentHash(H, utf8Encode("{\n  \"nodes\": []\n}\n")), empty);
+	assert.notEqual(await canvasContentHash(H, utf8Encode('{"x":1}')), empty, "root fields are content");
 	const parsed = parseCanvasText(JSON.stringify(SAMPLE));
 	assert.equal(parsed.kind, "valid");
 	if (parsed.kind !== "valid") return;
-	assert.equal(canvasLogicalHash(parsed.data), canvasContentHash(utf8Encode(formatCanvasText(parsed.data))));
+	assert.equal(await canvasLogicalHash(H, parsed.data), await canvasContentHash(H, utf8Encode(formatCanvasText(parsed.data))));
 	const dangling = { ...parsed.data, edges: new Map(parsed.data.edges), edgeOrder: [...parsed.data.edgeOrder, "zz"] };
 	dangling.edges.set("zz", { id: "zz", endpoints: { fromNode: "a", toNode: "gone" }, decorations: {}, extensions: {} });
-	assert.equal(canvasLogicalHash(dangling), canvasLogicalHash(parsed.data));
+	assert.equal(await canvasLogicalHash(H, dangling), await canvasLogicalHash(H, parsed.data));
 	assert.equal(canvasJsonValue({ a: [1, Infinity] }), undefined);
 	assert.equal(JSON.stringify(canvasJsonValue({ a: [1, "x"] })), '{"a":[1,"x"]}');
 });

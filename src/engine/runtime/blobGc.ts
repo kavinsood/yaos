@@ -24,6 +24,7 @@
  */
 
 import { bytesToHex } from "../../core/codec/lib0";
+import { untilAborted } from "../../core/deadline";
 import { CryptoSuite } from "../../core/envelope";
 import { CFG_STREAM, NS_STREAM, SNAP_STREAM, docStream, streamClass, type ContentHash, type Seq, type StreamName } from "../../core/types";
 import { scanBodyRefs } from "../blobs/bodyRefs";
@@ -120,7 +121,8 @@ export class BlobGc {
 		const pre = this.preconditions();
 		if (pre) return pre;
 		const folds = [NS_STREAM, CFG_STREAM, SNAP_STREAM];
-		if (!(await c.sess.readFresh(folds))) return refuse("not-caught-up", "could not read the vault's file list from the server just now");
+		// readFresh ends at the relay's deadline or the session's close; `signal` (stop) ends the wait sooner.
+		if (!(await untilAborted(c.sess.readFresh(folds), signal))) return refuse("not-caught-up", "could not read the vault's file list from the server just now");
 		for (const s of folds) {
 			if (c.repo.stream(s)?.stale === 1) return refuse("not-caught-up", `${s} is behind the server`);
 			const q = await c.repo.quarantineOf(s);

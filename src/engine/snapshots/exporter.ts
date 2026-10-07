@@ -12,6 +12,7 @@ import { BundleBuilder, bundleRecord } from "../../core/snap/export";
 import { SNAP_MAX_FILES, SNAP_MAX_TOTAL_BYTES, snapRecordProblem, type SnapReason, type SnapRecord } from "../../core/snap/record";
 import { pathInvalidReason } from "../../core/paths/validate";
 import type { ContentHash, DocKind, VaultPath } from "../../core/types";
+import type { HashPort } from "../../ports/crypto";
 import type { SideFilePort } from "../../ports/vault";
 import { LANE } from "../../protocol/messages";
 import type { DiskGateway } from "../reconcile/deps";
@@ -23,6 +24,7 @@ const READ_BATCH_FILES = 32;
 export interface ExportInput {
 	readonly disk: DiskGateway;
 	readonly side: SideFilePort;
+	readonly hash: HashPort;
 	readonly files: readonly { readonly path: VaultPath; readonly kind: DocKind; readonly size: number }[];
 	readonly id: string;
 	readonly createdAtMs: number;
@@ -43,7 +45,7 @@ export async function exportSnapshot(o: ExportInput): Promise<ExportResult> {
 	if (planned > SNAP_MAX_TOTAL_BYTES) return { t: "too-large", detail: `${planned} bytes` };
 	if (eligible.length > SNAP_MAX_FILES) return { t: "too-large", detail: `${eligible.length} files` };
 	let written = 0;
-	const builder = new BundleBuilder(o.id, o.createdAtMs, o.reason, o.partBytes, async (p) => {
+	const builder = new BundleBuilder(o.hash, o.id, o.createdAtMs, o.reason, o.partBytes, async (p) => {
 		await o.side.write(partName(o.id, p.index), p.bytes);
 		written = p.index + 1;
 	});

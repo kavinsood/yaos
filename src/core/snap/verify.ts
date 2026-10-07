@@ -14,10 +14,11 @@
  * verified manifest (each entry is then also checked against it before `onEntry` runs).
  */
 
+import type { HashPort } from "../../ports/crypto";
 import type { ContentHash, DocKind, VaultPath } from "../types";
 import { kindOfPath } from "../types";
+import { digestHex } from "../hash/digest";
 import { exactFingerprint } from "../hash/markdownLf";
-import { sha256Hex } from "../hash/sha256";
 import type { SnapRecord } from "./record";
 import {
 	SNAP_MANIFEST, SnapCorrupt, bundleDigest, contentProblem, entryPath, maxZipEntryBytes, parseManifest,
@@ -28,6 +29,7 @@ import { ZipError, readZip } from "./zip";
 export interface VerifiedEntry { readonly path: VaultPath; readonly kind: DocKind; readonly data: Uint8Array; readonly hash: ContentHash }
 
 export interface VerifyOptions {
+	readonly hash: HashPort;
 	readonly record: SnapRecord;
 	/** Bytes of part `index`, or null when it is missing. Called once per part, in order. */
 	readonly part: (index: number) => Promise<Uint8Array | null>;
@@ -39,7 +41,7 @@ export interface VerifyOptions {
 }
 
 export async function verifyBundle(o: VerifyOptions): Promise<SnapManifest> {
-	const { record } = o;
+	const { record, hash } = o;
 	let next = 0;
 	const source = async (): Promise<Uint8Array | null> => {
 		if (next >= record.parts.length) return null;
@@ -48,7 +50,7 @@ export async function verifyBundle(o: VerifyOptions): Promise<SnapManifest> {
 		const bytes = await o.part(i);
 		if (!bytes) throw new SnapCorrupt("part-missing", `part ${i + 1}/${record.parts.length}`);
 		if (bytes.length !== want.size) throw new SnapCorrupt("part-size", `part ${i + 1}: ${bytes.length} bytes, record says ${want.size}`);
-		if (sha256Hex(bytes) !== want.sha256) throw new SnapCorrupt("part-hash", `part ${i + 1}`);
+		if ((await digestHex(hash, bytes)) !== want.sha256) throw new SnapCorrupt("part-hash", `part ${i + 1}`);
 		if (o.onPart) await o.onPart(i, bytes);
 		return bytes;
 	};
@@ -62,14 +64,14 @@ export async function verifyBundle(o: VerifyOptions): Promise<SnapManifest> {
 			const kind = kindOfPath(path);
 			const problem = contentProblem(kind, entry.data);
 			if (problem) throw new SnapCorrupt("content-invalid", `${problem}: ${path}`);
-			const hash = exactFingerprint(entry.data) as string as ContentHash;
+			const fp = (await exactFingerprint(hash, entry.data)) as string as ContentHash;
 			const i = seen.length;
-			seen.push({ path, kind, size: entry.data.length, hash });
+			seen.push({ path, kind, size: entry.data.length, hash: fp });
 			if (o.expect) {
 				const f = o.expect.files[i];
-				if (!f || f.path !== path || f.kind !== kind || f.size !== entry.data.length || f.hash !== hash) throw new SnapCorrupt("file-hash", path);
+				if (!f || f.path !== path || f.kind !== kind || f.size !== entry.data.length || f.hash !== fp) throw new SnapCorrupt("file-hash", path);
 			}
-			if (o.onEntry) await o.onEntry({ path, kind, data: entry.data, hash });
+			if (o.onEntry) await o.onEntry({ path, kind, data: entry.data, hash: fp });
 		}
 	} catch (e) {
 		if (e instanceof ZipError) throw new SnapCorrupt(e.check, e.message);
@@ -89,7 +91,7 @@ export async function verifyBundle(o: VerifyOptions): Promise<SnapManifest> {
 		if (paths.has(f.path)) throw new SnapCorrupt("manifest-invalid", `duplicate ${f.path}`);
 		paths.add(f.path);
 	});
-	if (bundleDigest(record.snapshotId, record.parts, sha256Hex(manifestBytes)) !== record.bundleDigest) {
+	if ((await bundleDigest(hash, record.snapshotId, record.parts, await digestHex(hash, manifestBytes))) !== record.bundleDigest) {
 		throw new SnapCorrupt("bundle-digest", record.snapshotId);
 	}
 	return m;

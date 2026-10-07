@@ -10,17 +10,22 @@ import { conflictName } from "../../core/plan/conflictName";
 import type { IntentRecord } from "../store/schema";
 import { intentId } from "./blobJobs";
 import { writeOk, type Env } from "./diskJobs";
-import { hashBytes } from "./localState";
+import { textContentHash } from "./localState";
 
 export const MAX_CAS_ATTEMPTS = 3;
 
 export type ReconcileOp = Extract<PlannerOp, { op: "reconcileContent" }>;
 
-/** Job-level mass-overwrite brake for md / canvas writes (the planner cannot know M's size). */
-export function overwriteAllowed(env: Env, docId: DocId, path: VaultPath, oldBytes: number, newBytes: number, transition: string): boolean {
+/**
+ * Job-level mass-overwrite brake for md / canvas writes (the planner cannot know M's size). `transition`
+ * ("<old hash>><new hash>") is taken only for a shrinking write: it may have to hash M.
+ */
+export async function overwriteAllowed(
+	env: Env, docId: DocId, path: VaultPath, oldBytes: number, newBytes: number, transition: () => Promise<string>,
+): Promise<boolean> {
 	const { ctx } = env;
 	if (!isShrinkingOverwrite(ctx.brake, oldBytes, newBytes)) return true;
-	const key = brakeKey("overwrite", docId, path, transition);
+	const key = brakeKey("overwrite", docId, path, await transition());
 	if (env.approvedOverwrites.has(key)) return true;
 	const threshold = Math.max(ctx.brake.minCount, ctx.brake.ratio * ctx.store.synced.size);
 	if (ctx.window().overwrite + 1 <= threshold) return true;
@@ -30,14 +35,16 @@ export function overwriteAllowed(env: Env, docId: DocId, path: VaultPath, oldByt
 
 /**
  * Step 4: T_intent_begin(conflict-copy, subjectHash = logical hash of the disk
- * side), write the exact disk bytes to a fresh conflict name (precondition
- * absent). null = the copy failed (intent dropped, path marked dirty).
+ * side, `bytes`), write the exact disk bytes to a fresh conflict name
+ * (precondition absent). null = the copy failed (intent dropped, path marked
+ * dirty).
  */
 export async function writeConflictCopy(
 	env: Env, op: ReconcileOp, bytes: Uint8Array, subjectHash: ContentHash, kind: "markdown" | "canvas",
 ): Promise<{ intent: IntentRecord; local: LocalEntry } | null> {
 	const { ctx } = env;
 	const docId = op.docId;
+	const copyHash = await textContentHash(ctx.deps.hash, kind, bytes);
 	const view = ctx.log.view();
 	const copyPath = conflictName({
 		path: op.path, docId, deviceLabel: ctx.deps.deviceLabel, nowMs: ctx.now(), tzOffsetMinutes: ctx.deps.tzOffsetMinutes?.() ?? 0,
@@ -49,7 +56,6 @@ export async function writeConflictCopy(
 	};
 	await ctx.commit({ intentPut: [intent] });
 	// exec transfers (detaches) write bytes; the caller still needs its read buffer.
-	const hb = hashBytes(kind, bytes);
 	const res = await ctx.exec({ t: "write", area: "vault", path: copyPath, data: { t: "bytes", bytes: bytes.slice() }, precondition: { t: "absent" }, docId, purpose: "conflict-copy" });
 	const out = writeOk(res);
 	if (!out) {
@@ -59,5 +65,5 @@ export async function writeConflictCopy(
 	}
 	ctx.echo.expectWrite(ctx.pk(copyPath), out.stat.size, out.stat.mtimeMs);
 	ctx.noteConflictCopy(op.path, copyPath);
-	return { intent, local: ctx.localEntry(copyPath, out.stat, kind, hb.hash, out.fingerprint) };
+	return { intent, local: ctx.localEntry(copyPath, out.stat, kind, copyHash, out.fingerprint) };
 }

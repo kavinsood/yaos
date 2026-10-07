@@ -261,26 +261,6 @@ test("bound doc merged, then the editor saved: S gets its sync point, closing wr
 	assert.equal(w.vault.text("b.md"), "Aa\nb\nc\nd\n");
 });
 
-test("blob jobs prefetch ahead: every download was started ahead, within the carrier's window; leftovers dropped", async () => {
-	const w = await booted();
-	const blobs = w.blobs!;
-	blobs.window = 2;
-	const hashes: string[] = [];
-	for (let i = 0; i < 5; i++) {
-		const bytes = new Uint8Array([i, 1, 2, 3]);
-		hashes.push(blobs.put(bytes));
-		w.log.remoteCreate(P(`att/b${i}.bin`), bytes);
-		w.log.remoteCreate(P(`att/n${i}.md`), `note ${i}\n`);
-	}
-	await w.sync();
-	for (let i = 0; i < 5; i++) assert.deepEqual(w.vault.bytesOf(`att/b${i}.bin`), new Uint8Array([i, 1, 2, 3]));
-	assert.deepEqual([...blobs.prefetches].sort(), [...hashes].sort(), "each blob prefetched once");
-	assert.deepEqual([...blobs.taken].sort(), [...hashes].sort(), "each job took its prefetched download");
-	assert.equal(blobs.maxAhead, 2);
-	assert.ok(blobs.drops >= 1);
-	assert.equal(blobs.ahead.size, 0);
-});
-
 test("live creates (DESIGN §d.4): the first full pass after boot holds its creates' bodies; later creates are live, corked until their initial content is framed", async () => {
 	const w = new World();
 	w.vault.userWrite("a.md", "A\n");

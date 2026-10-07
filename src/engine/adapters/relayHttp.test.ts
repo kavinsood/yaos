@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { base64ToBytes, bytesToBase64, createRelayHttp, dailyResetDelayMs, parseRetryAfter, RelayHttpError } from "./relayHttp";
+import { RELAY_HTTP_BASE_MS, RELAY_HTTP_FLOOR_BYTES_PER_S, relayHttpDeadlineMs } from "../../core/deadline";
+import type { StreamName } from "../../core/types";
 import { fakeFetch, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
 
 const TOKEN = "device-token-SECRET-abc123";
@@ -229,5 +232,80 @@ describe("relayHttp putCheckpoint", () => {
 		assert.equal(e.code, "network_error");
 		e = await rejection(client(() => jsonResponse({ error: "checkpoint_conflict" }, 409)).http.putCheckpoint("v1", "s", 2, 1, new Uint8Array(0)));
 		assert.equal(e.code, "malformed_response");
+	});
+});
+
+describe("relayHttp deadlines (feed, read, readBatch, putCheckpoint)", () => {
+	const MiB = 1024 * 1024;
+	/** A fetch that never answers and ignores its signal: only untilAborted ends the wait. */
+	const deaf = (): { fetch: typeof fetch; signals: (AbortSignal | null)[] } => {
+		const signals: (AbortSignal | null)[] = [];
+		return { signals, fetch: async (_input, init) => { signals.push(init?.signal ?? null); return new Promise<Response>(() => undefined); } };
+	};
+	const calls: [string, number, (h: ReturnType<typeof createRelayHttp>, signal?: AbortSignal) => Promise<unknown>][] = [
+		// 4 KiB reply + 1000 entries of 300 B.
+		["feed", relayHttpDeadlineMs(4096 + 1000 * 300), (h, s) => h.feed("v1", 0, 1000, s)],
+		// 4 KiB + 4 x max(1 MiB budget, 4 MiB checkpoint): 271 s, the figure RELAY_HTTP_FLOOR_BYTES_PER_S justifies.
+		["read", 271_063, (h, s) => h.read("v1", "ns", 0, true, MiB, s)],
+		["readBatch", 271_063, (h, s) => h.readBatch("v1", [{ stream: "a" as StreamName, afterSeq: 0, preferCheckpoint: false }, { stream: "b" as StreamName, afterSeq: 0, preferCheckpoint: true }], MiB, s)],
+		// 4 KiB + the body.
+		["putCheckpoint", relayHttpDeadlineMs(4096 + MiB), (h, s) => h.putCheckpoint("v1", "ns", 2, 0, new Uint8Array(MiB), s)],
+	];
+
+	it("deadline = base + bytes at the floor rate", () => {
+		assert.equal(relayHttpDeadlineMs(0), RELAY_HTTP_BASE_MS);
+		assert.equal(relayHttpDeadlineMs(RELAY_HTTP_FLOOR_BYTES_PER_S * 10), RELAY_HTTP_BASE_MS + 10_000);
+		assert.equal(relayHttpDeadlineMs(4096 + 4 * 4 * MiB), 271_063);
+	});
+
+	for (const [name, deadlineMs, call] of calls) {
+		it(`${name}: a request nobody answers ends "timeout" at its size-proportional deadline, even when the fetch ignores its signal`, async () => {
+			const clock = new ManualClock();
+			const f = deaf();
+			const p = call(createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: f.fetch, clock }));
+			let settled = false;
+			p.then(() => (settled = true), () => (settled = true));
+			await new Promise((r) => setImmediate(r));
+			clock.advance(deadlineMs - 1);
+			await new Promise((r) => setImmediate(r));
+			assert.equal(settled, false);
+			clock.advance(1);
+			const e = await rejection(p);
+			assert.deepEqual([e.status, e.code, clock.pendingTimers], [0, "timeout", 0]);
+			assert.equal(f.signals[0]?.aborted, true, "the fetch's signal is aborted too");
+		});
+
+		it(`${name}: the caller's signal ends it "aborted" at once (before or in flight); listeners and timers are released`, async () => {
+			const clock = new ManualClock();
+			const f = deaf();
+			const http = createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: f.fetch, clock });
+			const before = new AbortController();
+			before.abort();
+			assert.equal((await rejection(call(http, before.signal))).code, "aborted");
+			assert.equal(f.signals.length, 0, "nothing is sent");
+			const ctl = new AbortController();
+			const p = call(http, ctl.signal);
+			await new Promise((r) => setImmediate(r));
+			ctl.abort();
+			assert.deepEqual([(await rejection(p)).code, clock.pendingTimers], ["aborted", 0]);
+			assert.equal(getEventListeners(ctl.signal, "abort").length, 0);
+		});
+	}
+
+	it("a reply within the deadline clears its timer; a slow body that still lands before it is read whole", async () => {
+		const clock = new ManualClock();
+		const enc = new TextEncoder();
+		let push!: (s: string) => void;
+		let end!: () => void;
+		const body = new ReadableStream<Uint8Array>({ start(c) { push = (s) => c.enqueue(enc.encode(s)); end = () => c.close(); } });
+		const http = createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: async () => new Response(body, { status: 200 }), clock });
+		const p = http.feed("v1", 0, 1000);
+		await new Promise((r) => setImmediate(r));
+		push('{"vaultEpoch":"E","head":5,');
+		clock.advance(relayHttpDeadlineMs(4096 + 1000 * 300) - 1);
+		push('"changes":[],"nextAfter":null}');
+		end();
+		assert.deepEqual(await p, { entries: [], throughSeq: 5, headSeq: 5, more: false });
+		assert.equal(clock.pendingTimers, 0);
 	});
 });

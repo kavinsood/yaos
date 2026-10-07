@@ -10,6 +10,7 @@ import { conflictName } from "../../core/plan/conflictName";
 import type { VerifiedEntry } from "../../core/snap/verify";
 import type { PathKey, PathKeyFn, VaultPath } from "../../core/types";
 import type { ClockPort } from "../../ports/clock";
+import type { HashPort } from "../../ports/crypto";
 import type { WritePrecondition } from "../../ports/vault";
 import { LANE, type DiskOp, type DiskOpPurpose, type DiskReadResult } from "../../protocol/messages";
 import type { DiskGateway } from "../reconcile/deps";
@@ -25,6 +26,7 @@ export interface RestoreResult {
 export interface RestorerDeps {
 	readonly disk: DiskGateway;
 	readonly clock: ClockPort;
+	readonly hash: HashPort;
 	readonly pathKey: PathKeyFn;
 	readonly deviceLabel: string;
 	readonly tzOffsetMinutes: number;
@@ -47,7 +49,7 @@ export class Restorer {
 		const [cur] = await this.d.disk.read([{ area: "vault", path: e.path, maxBytes: SNAP_MAX_TEXT_BYTES }], LANE.background);
 		let pre: WritePrecondition = { t: "absent" };
 		if (cur?.ok) {
-			const fp = exactFingerprint(cur.bytes);
+			const fp = await exactFingerprint(this.d.hash, cur.bytes);
 			if ((fp as string) === e.hash) { out.unchanged.push(e.path); return; } // both are sha256 of the exact bytes
 			const copy = conflictName({
 				path: e.path, docId: null, deviceLabel: this.d.deviceLabel, nowMs: this.d.clock.now(),

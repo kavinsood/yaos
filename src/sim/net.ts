@@ -54,7 +54,7 @@ const LOG_CLASSES = new Set(["ns", "cfg", "snap", "keyring", "body", "canvas"]);
 
 export class SimNet {
 	readonly relay: SimRelay;
-	/** The vault's blob store (relay-wire §11.3) on the run's clock: what a device gets unless given its own. */
+	/** The vault's blob store (relay-wire §11.3) on the run's clock, with its stall / slow models: what a device gets unless given its own. */
 	readonly blobs: SimBlobStore;
 	/** false = the relay has no blob store (capabilities: attachments false): devices start, and probe, without one. */
 	blobsAvailable = true;
@@ -65,7 +65,7 @@ export class SimNet {
 	constructor(readonly clock: VirtualClock, o: { readonly seed?: number; readonly linkMs?: number; readonly jitterMs?: number } = {}) {
 		const link = { uplinkMs: o.linkMs ?? 20, downlinkMs: o.linkMs ?? 20, jitterMs: o.jitterMs ?? 0, httpMs: o.linkMs ?? 20, connectMs: o.linkMs ?? 20 };
 		this.relay = new SimRelay({ clock, seed: o.seed ?? 1, link });
-		this.blobs = new SimBlobStore({ now: () => clock.now() });
+		this.blobs = new SimBlobStore({ now: () => clock.now(), timers: clock });
 		this.relay.onCommit((info) => {
 			for (const r of info.rows) {
 				const cls = streamClass(r.stream);

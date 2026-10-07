@@ -6,6 +6,7 @@
  * host's DiskExecutor); nothing here touches a file.
  */
 
+import type { HashPort } from "../../ports/crypto";
 import type { ConfigDirPort, SideFileName, SideFilePort } from "../../ports/vault";
 import type { ProtocolError } from "../../protocol/errors";
 import type { DiskOp, DiskReadRequest, DiskReadResult, EngineToMain, HostIoOp, HostIoResult, Lane, MainResultValue } from "../../protocol/messages";
@@ -33,7 +34,8 @@ export class HostLink {
 	/** Mirror bytes the host read before init (DESIGN §e.4), served once instead of a round trip. */
 	private readonly seeded = new Map<SideFileName, Uint8Array | null>();
 
-	constructor(private readonly transport: EngineTransport) {}
+	/** `hash`: the engine ports' HashPort (null before init: no disk op runs then). */
+	constructor(private readonly transport: EngineTransport, private readonly hash: () => HashPort | null) {}
 
 	post(message: EngineToMain): void {
 		try {
@@ -112,7 +114,9 @@ export class HostLink {
 			if (ops.length === 0) return [];
 			// Main never hashes: fingerprint what each write puts on disk here, before posting (the bytes
 			// are transferred, detached afterwards), and attach it to the host's ok outcome.
-			const fps = fingerprintWrites(ops);
+			const hash = this.hash();
+			if (!hash) throw new HostRequestFailed({ code: "not-ready", message: "engine ports not ready", retryable: true });
+			const fps = await fingerprintWrites(hash, ops);
 			// Write bytes are transferred: copy any view that does not own its buffer.
 			const sent = ops.map((op) => (op.t === "write" && op.data.t === "bytes" ? { ...op, data: { t: "bytes" as const, bytes: owned(op.data.bytes) } } : op));
 			const r = await this.request({ t: "diskOps", lane, ops: sent });

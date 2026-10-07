@@ -19,10 +19,8 @@ import type {
 } from "../../../ports/vault";
 import type { ContentHash, VaultPath } from "../../../core/types";
 import { kindOfPath } from "../../../core/types";
-import { sha256Hex } from "../../../core/hash/sha256";
 import { utf8Decode, utf8Encode } from "../../../core/hash/utf8";
-import { exactFingerprint, markdownContentHash } from "../../../core/hash/markdownLf";
-import { canvasContentHash } from "../../../core/hash/canvasCanonical";
+import { canvasHashRef, fingerprintRef, markdownHashRef, sha256HexRef } from "../../../core/hash/testkit/hashRef";
 
 export interface FakeFile {
 	/** Display path (exact casing / normalization as stored). */
@@ -34,9 +32,9 @@ export interface FakeFile {
 
 export function logicalHash(path: string, bytes: Uint8Array): ContentHash {
 	const kind = kindOfPath(path);
-	if (kind === "markdown") return markdownContentHash(utf8Decode(bytes));
-	if (kind === "canvas") return canvasContentHash(bytes);
-	return sha256Hex(bytes) as ContentHash;
+	if (kind === "markdown") return markdownHashRef(utf8Decode(bytes));
+	if (kind === "canvas") return canvasHashRef(bytes);
+	return sha256HexRef(bytes) as ContentHash;
 }
 
 export class FakeVault implements VaultPort {
@@ -81,7 +79,7 @@ export class FakeVault implements VaultPort {
 		switch (pre.t) {
 			case "any": return true;
 			case "absent": return f === undefined;
-			case "fingerprint": return f !== undefined && exactFingerprint(f.bytes) === pre.fingerprint;
+			case "fingerprint": return f !== undefined && fingerprintRef(f.bytes) === pre.fingerprint;
 			case "hash": return f !== undefined && logicalHash(f.path, f.bytes) === pre.hash;
 		}
 	}

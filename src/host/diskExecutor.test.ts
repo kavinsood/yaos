@@ -7,7 +7,7 @@ import { DiskExecutor } from "./diskExecutor";
 import type { HashOracle } from "./hashOracle";
 import { ObsidianVault } from "./obsidianVault";
 import { FakeObsidianVault } from "../sim/fakeObsidian";
-import { exactFingerprint, markdownContentHash } from "../core/hash/markdownLf";
+import { fingerprintRef, markdownHashRef } from "../core/hash/testkit/hashRef";
 import { utf8Encode as utf8 } from "../core/hash/utf8";
 import { VirtualClock } from "../sim/clock";
 import { simHashOracle } from "../sim/hash";
@@ -23,7 +23,7 @@ function setup(profile: CaseProfile = "case-insensitive", bound: Set<string> = n
 }
 
 /** Test-side reference hashing (core, in-process); the executor only asks its HashOracle. */
-const fpOf = (t: string) => exactFingerprint(utf8(t));
+const fpOf = (t: string) => fingerprintRef(utf8(t));
 
 let opId = 1;
 const w = (path: string, text: string, precondition: WritePrecondition, extra: Partial<{ docId: DocId | null; purpose: "materialize" | "merge" | "conflict-copy" | "restore" | "settings"; area: "vault" | "config" }> = {}): DiskOp => ({
@@ -47,7 +47,7 @@ test("diskExecutor: every WritePrecondition passes or fails without writing", as
 	const { vault, exec } = setup();
 	vault.userWrite("a.md", "one\r\n");
 	const fp = fpOf("one\r\n");
-	const lfHash = markdownContentHash("one\n");
+	const lfHash = markdownHashRef("one\n");
 	const historyBefore = vault.history.length;
 
 	// One batch each: inside a batch, ops on the same path after a failure are skipped.
@@ -213,7 +213,7 @@ test("diskExecutor: I/O exceptions map to io outcomes; config area writes are re
 	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), "{}");
 	assert.equal(vault.hasFile("hotkeys.json"), false, "config writes never land in the vault");
 	// The engine hashes the current config bytes: a matching fingerprint/hash passes.
-	const ok = await exec.run(2, [cw("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }), cw("hotkeys.json", "[1]", { t: "hash", hash: exactFingerprint(utf8("[]")) as unknown as ContentHash })]);
+	const ok = await exec.run(2, [cw("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }), cw("hotkeys.json", "[1]", { t: "hash", hash: fingerprintRef(utf8("[]")) as unknown as ContentHash })]);
 	assert.deepEqual(ok.map(outcomeOk), [true, true]);
 	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), '{"a":2}');
 	// Text config payloads are refused: encoding them would be O(N) string work on main.

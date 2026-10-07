@@ -91,6 +91,13 @@ export const ROLL_OWN_SEALS = 2 ** 22;
 
 export const MAX_DOC_TEXT_CHARS = 8 * 1024 * 1024;
 export const MAX_BASE_TEXT_CHARS = 4 * 1024 * 1024;
+/**
+ * Largest input core's synchronous pure-JS SHA-256 (core/hash/sha256.ts) takes; above it, it throws. It runs on the
+ * engine thread and blocks it for the whole digest: ~3 ms per MiB (316 ms for 100 MB, against 42 ms through
+ * WebCrypto, which does not block). Everything else (file, blob, canvas, config, snapshot content, brake ids) is
+ * hashed through HashPort (core/hash/digest.ts digestHex).
+ */
+export const SYNC_HASH_MAX_BYTES = 4096;
 export const MERGE_MAX_INPUT_CHARS = 2 * 1024 * 1024;
 export const MERGE_MAX_EDITS_PER_SIDE = 10_000;
 /** Provisional frame not committed within this window is re-appended by a device that holds it (adopt orphan). */
@@ -180,6 +187,23 @@ export const KEY_STORE_WAIT_MS = 5_000;
  */
 export const MAX_BLOB_UPLOAD_BYTES = 100_000_000;
 
+/**
+ * A blob transfer (PUT, GET, exists) that moves no byte for this long is ended as stalled; the blob queue retries
+ * it with its backoff (adapters/httpBlob.ts). Not a deadline: every byte of progress restarts the window, so a
+ * slow transfer that still moves is never cut. 60 s outlasts TCP's own retransmission backoff on a lossy link that
+ * recovers (RFC 6298: 1 + 2 + 4 + 8 + 16 = 31 s for five losses in a row) and a cellular handover, and matches
+ * the relay socket's idle window (wsRelay DEFAULT_LIVENESS: 60 s idle, then a 15 s ping).
+ */
+export const BLOB_TRANSFER_IDLE_MS = 60_000;
+
+/**
+ * The least a blob transfer counts against Budgets.blobBytesInFlight, however small the blob: it bounds how many
+ * small transfers run at once (desktop 16, phone 4). More would only queue in the network stack (Chromium opens
+ * at most six HTTP/1.1 connections per host) with no byte moving, which the idle window above would read as a
+ * stall.
+ */
+export const BLOB_TRANSFER_MIN_COST = 4 * 1024 * 1024;
+
 export const RELAY_CLOSE = {
 	normal: 1000,
 	goingAway: 1001,
@@ -189,6 +213,8 @@ export const RELAY_CLOSE = {
 	oversize: 1009,
 	rate: 1013,
 	superseded: 4403,
+	/** The client's own close after its liveness check failed (adapters/wsRelay.ts): the link is dead. */
+	liveness: 4000,
 	/** Legacy semantic-epoch reset; never sent on streams sockets (epoch change = VAULT_READY mismatch). */
 	epoch: 4409,
 } as const;
@@ -210,7 +236,11 @@ export interface Budgets {
 	readonly sliceMs: number;
 	/** Parallel stream reads for catch-up. */
 	readonly catchUpConcurrency: number;
-	readonly blobConcurrency: number;
+	/**
+	 * Blob plaintext bytes in flight (blobs/blobQueue.ts): running uploads and downloads (each at least
+	 * BLOB_TRANSFER_MIN_COST) plus downloaded bytes no job took yet. A transfer larger than this runs alone.
+	 */
+	readonly blobBytesInFlight: number;
 	readonly maxInflightAppendBytes: number;
 	/** Outstanding main-thread read/write payload bytes. */
 	readonly maxDiskIoBytesInFlight: number;
@@ -226,25 +256,25 @@ export interface Budgets {
 export const BUDGETS: Readonly<Record<DeviceClass, Budgets>> = {
 	desktop: {
 		maxResidentDocs: 400, maxResidentBytes: 256 * 1024 * 1024, sliceMs: 10,
-		catchUpConcurrency: 8, blobConcurrency: 4, maxInflightAppendBytes: 1024 * 1024,
+		catchUpConcurrency: 8, blobBytesInFlight: 64 * 1024 * 1024, maxInflightAppendBytes: 1024 * 1024,
 		maxDiskIoBytesInFlight: 8 * 1024 * 1024, diskOpsPerBatch: 32, mainSliceMs: 8,
 		fullReconcileIntervalMs: 5 * 60_000, dailyFrameSoftBudget: 20_000, docUpdateWindowBytes: 512 * 1024,
 	},
 	tablet: {
 		maxResidentDocs: 120, maxResidentBytes: 96 * 1024 * 1024, sliceMs: 10,
-		catchUpConcurrency: 4, blobConcurrency: 2, maxInflightAppendBytes: 512 * 1024,
+		catchUpConcurrency: 4, blobBytesInFlight: 32 * 1024 * 1024, maxInflightAppendBytes: 512 * 1024,
 		maxDiskIoBytesInFlight: 4 * 1024 * 1024, diskOpsPerBatch: 16, mainSliceMs: 6,
 		fullReconcileIntervalMs: 10 * 60_000, dailyFrameSoftBudget: 10_000, docUpdateWindowBytes: 256 * 1024,
 	},
 	phone: {
 		maxResidentDocs: 60, maxResidentBytes: 48 * 1024 * 1024, sliceMs: 8,
-		catchUpConcurrency: 3, blobConcurrency: 2, maxInflightAppendBytes: 512 * 1024,
+		catchUpConcurrency: 3, blobBytesInFlight: 16 * 1024 * 1024, maxInflightAppendBytes: 512 * 1024,
 		maxDiskIoBytesInFlight: 2 * 1024 * 1024, diskOpsPerBatch: 16, mainSliceMs: 5,
 		fullReconcileIntervalMs: 10 * 60_000, dailyFrameSoftBudget: 6_000, docUpdateWindowBytes: 256 * 1024,
 	},
 	constrained: {
 		maxResidentDocs: 24, maxResidentBytes: 24 * 1024 * 1024, sliceMs: 6,
-		catchUpConcurrency: 2, blobConcurrency: 1, maxInflightAppendBytes: 256 * 1024,
+		catchUpConcurrency: 2, blobBytesInFlight: 8 * 1024 * 1024, maxInflightAppendBytes: 256 * 1024,
 		maxDiskIoBytesInFlight: 1024 * 1024, diskOpsPerBatch: 8, mainSliceMs: 4,
 		fullReconcileIntervalMs: 15 * 60_000, dailyFrameSoftBudget: 4_000, docUpdateWindowBytes: 128 * 1024,
 	},

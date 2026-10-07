@@ -15,6 +15,7 @@
  */
 
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
+import { untilAborted } from "../../core/deadline";
 import type { ContentHash, Seq, StreamName, VaultId } from "../../core/types";
 import type { CryptoPort } from "../../ports/crypto";
 import type { ReadPage, ReadRequest, RelaySession } from "../../ports/relay";
@@ -52,7 +53,9 @@ export async function scanBodyRefs(deps: BodyRefScanDeps, streams: Iterable<Stre
 	while (queue.length > 0) {
 		if (deps.signal.aborted) throw new Error("aborted");
 		const batch = queue.slice(0, width);
-		const pages = await deps.session.readBatch(batch.map((s): ReadRequest => ({ stream: s.stream, afterSeq: s.after, preferCheckpoint: false })));
+		// Bounded by the relay's own deadline and the session's close (adapters/relayHttp.ts); `signal` (the sweep's
+		// stop) ends the wait sooner: engine stop awaits the sweep before it closes the session.
+		const pages = await untilAborted(deps.session.readBatch(batch.map((s): ReadRequest => ({ stream: s.stream, afterSeq: s.after, preferCheckpoint: false }))), deps.signal);
 		if (pages.length === 0) throw new Error("readBatch returned no page");
 		queue.splice(0, pages.length);
 		for (let i = 0; i < pages.length; i++) {

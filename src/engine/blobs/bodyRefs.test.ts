@@ -196,3 +196,22 @@ test("scanBodyRefs: an aborted signal stops the scan", async () => {
 	await assert.rejects(scanBodyRefs(relay.deps({ signal: ctrl.signal }), [B1]), /aborted/);
 	assert.equal(relay.requests.length, 0);
 });
+
+test("scanBodyRefs: the sweep's stop ends a read the relay never answers (the stop does not wait for the read's own deadline)", async () => {
+	const relay = new FakeRelay();
+	await relay.ref(B1, 1);
+	const ctrl = new AbortController();
+	let reads = 0;
+	const deps = relay.deps({ signal: ctrl.signal });
+	const hung: BodyRefScanDeps = { ...deps, session: { ...deps.session, readBatch: () => (reads++, new Promise<readonly ReadPage[]>(() => undefined)) } };
+	let out: unknown = "pending";
+	scanBodyRefs(hung, [B1]).then((v) => (out = v), (e: unknown) => (out = e));
+	const settled = (): unknown => out;
+	for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+	assert.equal(reads, 1);
+	assert.equal(settled(), "pending");
+	ctrl.abort(new Error("sweep stopped"));
+	for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+	const end = settled();
+	assert.ok(end instanceof Error && end.message === "sweep stopped", String(end));
+});

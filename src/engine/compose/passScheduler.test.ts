@@ -7,7 +7,7 @@ import { PassScheduler } from "./passScheduler";
 
 function report(o: Partial<PassReport> = {}): PassReport {
 	return {
-		ok: 0, failed: 0, held: 0, deferred: 0, skipped: 0, waits: 0, needHash: 0, nsSubmitted: 0, failedDocs: new Set(),
+		ok: 0, failed: 0, held: 0, deferred: 0, transferring: 0, skipped: 0, waits: 0, needHash: 0, nsSubmitted: 0, failedDocs: new Set(),
 		planned: 0, actionable: 0, unread: 0, brake: null, openIntents: 0, ...o,
 	};
 }

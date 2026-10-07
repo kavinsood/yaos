@@ -13,6 +13,7 @@ import type { ContentHash, DocId, PathKey, SyncedEntry } from "../../core/types"
 import { MAX_BASE_TEXT_CHARS } from "../../core/limits";
 import { markdownContentHash } from "../../core/hash/markdownLf";
 import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
+import type { HashPort } from "../../ports/crypto";
 import type { StorageDb } from "../../ports/storage";
 import { STORE, type BaseTextRecord, type IntentRecord, type LocalTreeRecord, type SyncedRecord, type YaosSchema } from "../store/schema";
 
@@ -39,21 +40,28 @@ export type DiskSchema = { readonly [K in keyof YaosSchema]: YaosSchema[K] };
 
 const TX_STORES = [STORE.synced, STORE.baseText, STORE.localTree, STORE.intents] as const;
 
-/** Base record for `text`, or null when it is too large to keep (hasBase = false). */
-export function makeBase(docId: DocId, text: string, hash: ContentHash = markdownContentHash(text)): BaseTextRecord | null {
+/** Base record for `text` (`hash` = its markdownContentHash), or null when it is too large to keep (hasBase = false). */
+export function makeBase(docId: DocId, text: string, hash: ContentHash): BaseTextRecord | null {
 	if (text.length > MAX_BASE_TEXT_CHARS) return null;
 	return { docId, contentHash: hash, deflated: deflateSync(utf8Encode(text)), chars: text.length };
 }
 
+/** makeBase for a text whose hash is not known yet (a canvas merge text); hashed only when it is kept. */
+export async function hashBase(hash: HashPort, docId: DocId, text: string): Promise<BaseTextRecord | null> {
+	if (text.length > MAX_BASE_TEXT_CHARS) return null;
+	return makeBase(docId, text, await markdownContentHash(hash, text));
+}
+
 /** Inflate + verify. null = corrupt or mismatched (treated as "no base"). */
-export function readBase(rec: BaseTextRecord, hashOf: (text: string) => ContentHash = markdownContentHash): string | null {
+export async function readBase(rec: BaseTextRecord, hash: HashPort): Promise<string | null> {
+	let text: string;
 	try {
-		const text = utf8Decode(inflateSync(rec.deflated));
-		if (text.length !== rec.chars || hashOf(text) !== rec.contentHash) return null;
-		return text;
+		text = utf8Decode(inflateSync(rec.deflated));
 	} catch {
 		return null;
 	}
+	if (text.length !== rec.chars || (await markdownContentHash(hash, text)) !== rec.contentHash) return null;
+	return text;
 }
 
 export class ReconcileStore {
@@ -61,10 +69,10 @@ export class ReconcileStore {
 	readonly localTree = new Map<PathKey, LocalTreeRecord>();
 	readonly intents = new Map<string, IntentRecord>();
 
-	private constructor(readonly db: StorageDb<DiskSchema>) {}
+	private constructor(readonly db: StorageDb<DiskSchema>, private readonly hash: HashPort) {}
 
-	static async open(db: StorageDb<DiskSchema>): Promise<ReconcileStore> {
-		const s = new ReconcileStore(db);
+	static async open(db: StorageDb<DiskSchema>, hash: HashPort): Promise<ReconcileStore> {
+		const s = new ReconcileStore(db, hash);
 		const [synced, local, intents] = await db.tx(TX_STORES, "readonly", async (tx) =>
 			Promise.all([tx.getAll(STORE.synced), tx.getAll(STORE.localTree), tx.getAll(STORE.intents)]),
 		);
@@ -80,7 +88,7 @@ export class ReconcileStore {
 
 	async loadBase(docId: DocId): Promise<string | null> {
 		const rec = await this.db.tx([STORE.baseText], "readonly", async (tx) => tx.get(STORE.baseText, docId));
-		return rec ? readBase(rec) : null;
+		return rec ? readBase(rec, this.hash) : null;
 	}
 
 	async commit(c: DiskChange): Promise<void> {

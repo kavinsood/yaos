@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Writer } from "../../core/codec/lib0";
-import { sha256Hex } from "../../core/hash/sha256";
+import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { MAX_INLINE_UPDATE_BYTES } from "../../core/limits";
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
 import { snapshotId, SnapOpTag, type SnapRecord } from "../../core/snap/record";
@@ -44,7 +44,7 @@ const T0 = Date.UTC(2026, 9, 1);
 const BUDGETS = { maxResidentBytes: 1024 * 1024 * 1024, maxResidentDocs: 64 };
 
 const bytesOf = (i: number): Uint8Array => Uint8Array.from({ length: 48 }, (_, j) => (j === 0 ? i >> 8 : j === 1 ? i : i * 7 + j) & 0xff);
-const H = (b: Uint8Array) => sha256Hex(b) as ContentHash;
+const H = (b: Uint8Array) => sha256HexRef(b) as ContentHash;
 let docN = 0;
 const newDoc = () => `gcdoc${String(++docN).padStart(17, "0")}` as DocId;
 const createBlob = (docId: DocId, hash: ContentHash): NsOp => ({ t: "create", docId, kind: "blob", path: `att/${docId}.png` as VaultPath, contentHash: hash, size: 48 });
@@ -477,4 +477,24 @@ test("GC suite 1: addresses are HMACs; the live blob survives, garbage goes, and
 	} finally {
 		await w.stop();
 	}
+});
+
+test("GC stop: engine stop ends a sweep whose fresh read the relay never answers (stop awaits the sweep before it closes the session)", async () => {
+	const w = new World();
+	const a = await w.device(A);
+	let reads = 0;
+	a.c.sess.readFresh = () => (reads++, new Promise<boolean>(() => undefined));
+	let out: GcOutcome | "pending" = "pending";
+	void sweep(a).then((o) => (out = o));
+	const settled = (): GcOutcome | "pending" => out;
+	await until(() => reads === 1, 2_000, "fresh read in flight");
+	assert.equal(settled(), "pending");
+	let stopped = false;
+	const stop = w.stop().then(() => (stopped = true));
+	await until(() => stopped, 2_000, "engine stopped");
+	await stop;
+	await until(() => settled() !== "pending", 1_000, "sweep ended");
+	const end = settled();
+	assert.ok(end !== "pending");
+	assert.equal(end.deleted, 0);
 });

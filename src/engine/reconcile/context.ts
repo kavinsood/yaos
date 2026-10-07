@@ -12,6 +12,7 @@ import { conflictCopyNotice } from "../../core/plan/conflictName";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
 import { standInPathKey } from "../../core/plan/pathRules";
 import type { ClockPort } from "../../ports/clock";
+import type { HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
 import type { TrashMode, VaultStat } from "../../ports/vault";
 import { LANE, type DiskOp, type DiskReadResult, type Lane } from "../../protocol/messages";
@@ -22,20 +23,51 @@ import { classify, compileExcludes, toRecord, type Classified, type ClassifySett
 import type { DiskChange, DiskSchema, ReconcileStore } from "./store";
 import type { StorageDb } from "../../ports/storage";
 
-/** What the disk side needs from the blob store (src/engine/blobs/blobQueue.ts implements it). */
+/** One blob a job moves: content `hash` (sha256 hex of the plaintext) for `docId` at `path`, `size` bytes. */
+export interface BlobReq {
+	readonly hash: string;
+	readonly docId: DocId;
+	readonly path: VaultPath;
+	readonly size: number;
+}
+
+/** Where an upload reads its bytes when it starts (blobJobs.ts pushBlob). */
+export interface UploadSource {
+	/** The file's bytes now; null = unreadable or gone (the path is marked for a re-hash). */
+	read(): Promise<Uint8Array | null>;
+	/** The bytes read no longer hash to the claimed hash: the file changed under the upload (re-hash it). */
+	changed(): void;
+}
+
+/**
+ * A job's claim on an upload. stored = readers can fetch the hash (the store confirmed it): the job submits the
+ * ns op referencing it. busy = started or joined in the background; the doc is planned again when it settles.
+ * unavailable = failed recently (backing off) or no store. refused = the store refused these bytes by size for
+ * good (the job holds; no retry).
+ */
+export type UploadClaim = "stored" | "busy" | "unavailable" | "refused";
+
+/** A job's claim on a download: the verified bytes (single use), busy (as for uploads), or unavailable. */
+export type DownloadClaim = { readonly t: "bytes"; readonly bytes: Uint8Array } | { readonly t: "busy" } | { readonly t: "unavailable" };
+
+/**
+ * What the disk side needs from the blob store (src/engine/blobs/blobQueue.ts implements it). Plan jobs claim
+ * transfers and never wait on one: a transfer runs in the background and its docs are planned again when it
+ * settles, so a 100 MB attachment does not hold up the pass (the plan runner runs jobs one by one).
+ */
 export interface BlobTransfer {
 	/** Largest blob the store takes; 0 = no blob store (attachments are not synced, nothing is queued). */
 	readonly maxBlobBytes: number;
-	/** true once readers can fetch `hash` (store put ok). false = failed now: queued for retry, or no store. */
+	claimUpload(req: BlobReq, source: UploadSource): UploadClaim;
+	claimDownload(req: BlobReq): DownloadClaim;
+	/** A pass begins; returns its token for endPass. */
+	beginPass?(): number;
+	/** The pass ended: downloads ready before it began for docs it covered, and taken by no job, are stale (dropped). */
+	endPass?(token: number, covers: (docId: DocId, path: VaultPath) => boolean): void;
+	/** Awaited upload (settings sync, small files): true once readers can fetch `hash`; false = failed now (queued for retry), or no store. */
 	upload(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly bytes: Uint8Array }): Promise<boolean>;
-	/** Verified bytes, or null = unavailable now (queued with backoff). */
-	download(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly size: number }): Promise<Uint8Array | null>;
-	/** Start a download for a job that runs soon; its download() takes the result. false = the prefetch bound is full. */
-	prefetch?(req: { readonly hash: string; readonly docId: DocId; readonly path: VaultPath; readonly size: number }): boolean;
-	/** Forget prefetched results no job took. */
-	dropPrefetched?(): void;
-	/** true = the store refused `hash` by size for good (upload() answers false; the job holds, no retry). */
-	refused?(hash: string): boolean;
+	/** Awaited download (settings sync): verified bytes, or null = unavailable now (queued with backoff). */
+	download(req: BlobReq): Promise<Uint8Array | null>;
 }
 
 export interface ReconcileSettings {
@@ -51,6 +83,8 @@ export interface ReconcilerDeps {
 	readonly disk: DiskGateway;
 	readonly clock: ClockPort;
 	readonly random: RandomPort;
+	/** Every content hash the disk side takes (file reads, bases, canvas projections, brake ids). */
+	readonly hash: HashPort;
 	readonly blobs: BlobTransfer | null;
 	readonly settings: ReconcileSettings;
 	readonly deviceLabel: string;
@@ -84,6 +118,11 @@ export interface ReconcilerDeps {
 	 * before its plan reads the view, so no plan sees a folded own op without its synced update.
 	 */
 	readonly takeOwnFold?: () => readonly OwnFoldEvent[];
+	/**
+	 * true = the runtime is stopping: the plan runner starts no further job, so a restart (settings, epoch) does
+	 * not wait out a long plan. Stopping between jobs is a subset of crashing between them (DESIGN §f.2).
+	 */
+	readonly stopping?: () => boolean;
 }
 
 export const BRAKE_WINDOW_MS = 10 * 60_000;

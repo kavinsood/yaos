@@ -27,13 +27,13 @@ import { exactFingerprint } from "../../core/hash/markdownLf";
 import { canvasLogicalHash, canvasToMergeText, type CanvasRanked } from "../../core/hash/canvasCanonical";
 import { isShrinkingOverwrite } from "../../core/plan/brake";
 import type { IntentRecord } from "../store/schema";
-import { applyCanvas, emptyCanvas, projectCanvasBytes, readCanvas, visibleCanvas } from "./canvasDoc";
+import { applyCanvas, emptyCanvas, projectCanvasBytes, projectionHash, readCanvas, visibleCanvas } from "./canvasDoc";
 import { isEmptyCanvas, mergeCanvasSides, parseDiskCanvas, parseMergeText, rankDisk, type CanvasMergeOutput } from "./canvasMerge";
 import { MAX_CAS_ATTEMPTS, overwriteAllowed, writeConflictCopy, type ReconcileOp } from "./contentSteps";
 import type { BodyHandle } from "./deps";
 import { writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
-import { makeBase } from "./store";
+import { hashBase } from "./store";
 
 function invalid(env: Env, docId: DocId, path: VaultPath, reason: string, onceKey: string): JobOutcome {
 	env.ctx.notice("warn", "canvas-invalid", `canvas not synced (${reason}): ${path}`, `canvas-invalid:${docId}:${onceKey}`);
@@ -56,15 +56,17 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		env.scan.markDirty(diskPath, rd.reason === "missing" ? null : rd.stat);
 		return "fail";
 	}
-	const F = exactFingerprint(rd.bytes);
+	const port = ctx.deps.hash;
+	const F = await exactFingerprint(port, rd.bytes);
 	const disk = parseDiskCanvas(rd.bytes);
 	if (!disk.ok) return invalid(env, docId, op.path, `disk: ${disk.reason}`, F);
-	const diskHash = canvasLogicalHash(disk.data);
+	const diskHash = await canvasLogicalHash(port, disk.data);
 	const s = ctx.synced(docId);
 	const baseText = op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
 	const storedBase = baseText === null ? null : parseMergeText(baseText);
 
 	let out: CanvasMergeOutput | null = null;
+	let outHash = diskHash; // out.projection's logical hash
 	let v0 = h.version();
 	for (let attempt = 0; ; attempt++) {
 		if (attempt >= MAX_CAS_ATTEMPTS) return "fail"; // remote kept moving: re-plan
@@ -72,11 +74,11 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		if (!crdt.ok) return invalid(env, docId, op.path, `crdt: ${crdt.reason}`, `crdt:${h.version().remoteSeq}`);
 		const token = canvasToMergeText(crdt.ranked);
 		// No stored base: a side still at the synced content is the base (see mergeJob).
-		const base = storedBase ?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : !s ? null : diskHash === s.contentHash ? rankDisk(disk.data, null, crdt.ranked) : crdt.hash === s.contentHash ? crdt.ranked : null);
+		const base = storedBase ?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : !s ? null : diskHash === s.contentHash ? rankDisk(disk.data, null, crdt.ranked) : (await projectionHash(port, crdt)) === s.contentHash ? crdt.ranked : null);
 		await ctx.deps.clock.yieldNow();
 		const m = mergeCanvasSides({ base, disk: disk.data, crdt, limits: ctx.mergeLimits });
-		if (m.projection.hash !== diskHash
-			&& !overwriteAllowed(env, docId, op.path, rd.bytes.length, m.projection.bytes.length, `${diskHash}>${m.projection.hash}`)) {
+		const mHash = await projectionHash(port, m.projection);
+		if (mHash !== diskHash && !(await overwriteAllowed(env, docId, op.path, rd.bytes.length, m.projection.bytes.length, async () => `${diskHash}>${mHash}`))) {
 			return "held";
 		}
 		// Synchronous section: CAS, apply, capture the version.
@@ -84,6 +86,7 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		applyCanvas(h.doc, h.mergeOrigin, m.target);
 		v0 = h.version();
 		out = m;
+		outHash = mHash;
 		break;
 	}
 	const v1 = await h.commitEdits();
@@ -98,17 +101,19 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		local.push(cc.local);
 	}
 
+	// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.
+	const base = await hashBase(port, docId, canvasToMergeText(out.projection.ranked));
 	let stat = rd.stat;
 	let fingerprint = F;
 	let hash = diskHash;
-	if (out.projection.hash !== diskHash) {
+	if (outHash !== diskHash) {
 		const res = await ctx.exec({
 			t: "write", area: "vault", path: diskPath, data: { t: "text", text: out.projection.text },
 			precondition: { t: "fingerprint", fingerprint: F }, docId, purpose: "merge",
 		});
 		const w = writeOk(res);
 		if (!w) {
-			const rebased = s ? rebaseOnDisk(env, s, out.diskRanked, F, rd.stat) : null;
+			const rebased = s ? await rebaseOnDisk(env, s, out.diskRanked, F, rd.stat) : null;
 			await ctx.commit({
 				intentDrop: intent ? [intent.id] : [],
 				syncedPut: rebased ? [rebased.entry] : [],
@@ -122,10 +127,9 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		if (isShrinkingOverwrite(ctx.brake, rd.bytes.length, w.stat.size)) ctx.noteDestructive("overwrite");
 		stat = w.stat;
 		fingerprint = w.fingerprint;
-		hash = out.projection.hash;
+		hash = outHash;
 	}
 
-	const base = makeBase(docId, canvasToMergeText(out.projection.ranked));
 	const entry = ctx.record({
 		docId, path: op.path, pathKey: ctx.pk(op.path), kind: "canvas", contentHash: hash, fingerprint, size: stat.size, mtimeMs: stat.mtimeMs,
 		bodyVersion, blobRev: 0, nsTouchSeq: ctx.touchSeq(docId), hasBase: base !== null,
@@ -138,10 +142,12 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 	return "ok";
 }
 
-function rebaseOnDisk(env: Env, s: SyncedEntry, disk: CanvasRanked, F: DiskFingerprint, stat: { size: number; mtimeMs: number }) {
-	const base = makeBase(s.docId, canvasToMergeText(disk));
+async function rebaseOnDisk(env: Env, s: SyncedEntry, disk: CanvasRanked, F: DiskFingerprint, stat: { size: number; mtimeMs: number }) {
+	const port = env.ctx.deps.hash;
+	const base = await hashBase(port, s.docId, canvasToMergeText(disk));
+	const contentHash = await canvasLogicalHash(port, disk.data);
 	const { fileGone: _gone, ...live } = s; // the disk holds the doc's file
-	const entry = env.ctx.record({ ...live, contentHash: canvasLogicalHash(disk.data), fingerprint: F, size: stat.size, mtimeMs: stat.mtimeMs, hasBase: base !== null });
+	const entry = env.ctx.record({ ...live, contentHash, fingerprint: F, size: stat.size, mtimeMs: stat.mtimeMs, hasBase: base !== null });
 	return { entry, base };
 }
 
@@ -165,6 +171,9 @@ async function materializeCanvas(env: Env, op: MaterializeOp, h: BodyHandle): Pr
 	const version = h.version();
 	const p = projectCanvasBytes(h.doc);
 	if (!p.ok) return invalid(env, op.docId, op.path, `crdt: ${p.reason}`, `crdt:${version.remoteSeq}`);
+	// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.
+	const hash = await projectionHash(ctx.deps.hash, p);
+	const base = await hashBase(ctx.deps.hash, op.docId, canvasToMergeText(p.ranked));
 	const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "text", text: p.text }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });
 	const out = writeOk(res);
 	if (!out) {
@@ -172,14 +181,13 @@ async function materializeCanvas(env: Env, op: MaterializeOp, h: BodyHandle): Pr
 		return "fail";
 	}
 	ctx.echo.expectWrite(ctx.pk(op.path), out.stat.size, out.stat.mtimeMs);
-	const base = makeBase(op.docId, canvasToMergeText(p.ranked));
 	const entry = ctx.record({
-		docId: op.docId, path: op.path, pathKey: ctx.pk(op.path), kind: "canvas", contentHash: p.hash, fingerprint: out.fingerprint,
+		docId: op.docId, path: op.path, pathKey: ctx.pk(op.path), kind: "canvas", contentHash: hash, fingerprint: out.fingerprint,
 		size: out.stat.size, mtimeMs: out.stat.mtimeMs, bodyVersion: version, blobRev: 0, nsTouchSeq: ctx.touchSeq(op.docId), hasBase: base !== null,
 	});
 	await ctx.commit(
 		{ syncedPut: [entry], basePut: base ? [base] : [], baseDrop: base ? [] : [op.docId] },
-		[ctx.localEntry(op.path, out.stat, "canvas", p.hash, out.fingerprint)],
+		[ctx.localEntry(op.path, out.stat, "canvas", hash, out.fingerprint)],
 	);
 	return "ok";
 }

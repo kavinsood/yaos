@@ -198,9 +198,14 @@ export class VaultRuntime {
 	/** After a full unbraked pass: queued blob transfers the plan no longer wants are stale. */
 	private async pruneBlobQueue(): Promise<void> {
 		const want = new Set<string>();
+		const remote = this.port.view().remote;
 		for (const op of this.rec.lastPlan) {
 			if (op.op === "pushBlob") want.add(`up:${op.hash}`);
 			else if (op.op === "fetchBlob") want.add(`down:${op.hash}`);
+			else if (op.op === "diskMaterialize") {
+				const r = remote.get(op.docId);
+				if (r?.state === "live" && r.blob) want.add(`down:${r.blob.hash}`);
+			}
 		}
 		const intentDocs = new Set<string>();
 		for (const i of this.rec.ctx.store.intents.values()) if (i.docId) intentDocs.add(i.docId);
@@ -224,13 +229,18 @@ export class VaultRuntime {
 		this.idbSnapshotDue = this.recovered || o.reason === "storage-lost";
 		if (imported > 0) this.diag(`synced mirror imported: ${imported} records`);
 		const tz = o.tzOffsetMinutes ?? (() => 0);
-		// Prefetch: with the running job's own download, at most blobConcurrency transfers; held bytes bounded.
-		const ahead = { count: Math.max(0, c.budgets.blobConcurrency - 1), bytes: c.budgets.maxDiskIoBytesInFlight };
-		// The write-gated ports (context.ts): no attachment or snapshot-part upload while the keyring reports key-missing.
+		// The write-gated, link-aborted ports (context.ts): no attachment or snapshot-part upload while the keyring
+		// reports key-missing; every transfer in flight ends when the session loop declares the link dead.
 		const { crypto, blob } = c.deps;
-		this.blobs = await BlobQueue.open({ db, clock: ports.clock, crypto, hash: ports.hash, store: blob, touch: c.touch, notice: this.notice, ahead });
+		this.blobs = await BlobQueue.open({
+			db, clock: ports.clock, crypto, hash: ports.hash, store: blob, touch: c.touch, notice: this.notice, diag: (l) => this.diag(l),
+			budgetBytes: c.budgets.blobBytesInFlight,
+			// Transfers start when a pass could run (pump() on unpause / foreground / online); running ones finish.
+			admit: () => !this.stopped && !this.paused && !this.migrating && !this.background,
+			wake: (who) => this.sched.request({ t: "docs", docIds: who.map((w) => w.docId), pathKeys: who.map((w) => pathKey(w.path)) }),
+		});
 		this.rec = await Reconciler.open({
-			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, blobs: this.blobs,
+			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, hash: ports.hash, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
 			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
 			pathBaseKeys: o.pathBases ? new Set(o.pathBases.keys()) : undefined,
@@ -239,13 +249,14 @@ export class VaultRuntime {
 				return b !== undefined && (text === b.diskText || b.candidates.includes(text));
 			},
 			takeOwnFold: () => this.takeOwnFold(),
+			stopping: () => this.stopped,
 		});
 		await this.rec.start();
 		if (this.settings.syncSettings) {
-			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp });
+			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, hash: ports.hash, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp });
 		}
 		this.snaps = new SnapshotJob({
-			disk: link.disk, side: link.sideFiles, clock: ports.clock, crypto, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,
+			disk: link.disk, side: link.sideFiles, clock: ports.clock, crypto, hash: ports.hash, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,
 			remote: blob ? { store: blob, index: this.port.snap, touch: c.touch } : null,
 			pathKey, deviceLabel: config.deviceLabel, tzOffsetMinutes: tz, notice: this.notice, diag: (l) => this.diag(l),
 		});
@@ -587,6 +598,7 @@ export class VaultRuntime {
 				return;
 			case "online":
 				void this.log.setNetwork(true).catch(() => undefined);
+				this.blobs?.pump();
 				this.sched.request({ t: "full" });
 				return;
 		}
@@ -595,6 +607,7 @@ export class VaultRuntime {
 	private setBackground(on: boolean): void {
 		this.background = on;
 		this.log.setBackground(on);
+		if (!on) this.blobs?.pump();
 	}
 
 	private clearHiddenTimer(): void {
@@ -611,6 +624,7 @@ export class VaultRuntime {
 		if (p) this.log.disconnect();
 		else {
 			void this.log.reconnect().catch(() => undefined);
+			this.blobs?.pump();
 			this.sched.poke();
 			this.sched.request({ t: "full" });
 		}
@@ -649,8 +663,11 @@ export class VaultRuntime {
 		this.clearHiddenTimer();
 		if (crash) this.log.disconnect();
 		this.sched.stop();
+		// Transfers end at once (aborted; no pass job awaits one); the pass in flight starts no further job.
+		const blobs = this.blobs?.stop();
 		await this.sched.drain().catch(() => undefined);
 		if (this.cfgRunning) await this.cfgRunning.catch(() => undefined);
+		await blobs?.catch(() => undefined);
 		for (const off of this.offs) off();
 		await this.mirror?.stop();
 		await this.log.stop();

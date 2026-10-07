@@ -23,6 +23,7 @@ import { exactFingerprint } from "../../core/hash/markdownLf";
 import { utf8Decode } from "../../core/hash/utf8";
 import type { CfgFoldState, CfgOp, ConfigRelPath, DocId } from "../../core/types";
 import type { ClockPort } from "../../ports/clock";
+import type { HashPort } from "../../ports/crypto";
 import type { StorageDb } from "../../ports/storage";
 import type { ConfigDirPort } from "../../ports/vault";
 import type { BlobTransfer } from "../reconcile/context";
@@ -48,6 +49,8 @@ export interface CfgSyncDeps {
 	readonly log: CfgLogPort;
 	readonly blobs: BlobTransfer | null;
 	readonly clock: ClockPort;
+	/** Config file and key digests (WebCrypto in the worker). */
+	readonly hash: HashPort;
 	readonly notice?: (level: "info" | "warn", code: string, detail?: string) => void;
 	/** This device is mobile (PlatformInfo.isMobile): desktop-only plugins are not enabled here. */
 	readonly mobile?: boolean;
@@ -152,7 +155,7 @@ export class CfgSync {
 	}
 
 	private async run(): Promise<CfgPassResult> {
-		const { db, config, log, clock } = this.deps;
+		const { db, config, log, clock, hash } = this.deps;
 		const local = await snapshotConfig(config);
 		const clash = detectCfgClash(local.files.get(CFG_CORE_PLUGINS_FILE)?.bytes ?? null, local.files.get(CFG_PLUGINS_FILE)?.bytes ?? null);
 		this.report("settings-clash", clash ? { items: [clash.id], message: clashMessage(clash) } : null);
@@ -164,7 +167,7 @@ export class CfgSync {
 		const base = new Map(rows.map((r) => [r.file, r]));
 		const view = log.view();
 		const preferLocal = this.deps.seed === "device" && rows.length === 0;
-		const plan = planCfg({ local, base, view, nowMs: clock.now(), mobile: this.deps.mobile ?? false, preferLocal });
+		const plan = await planCfg({ hash, local, base, view, nowMs: clock.now(), mobile: this.deps.mobile ?? false, preferLocal });
 		const notices = cfgSkipNotices(plan, local, view);
 		for (const code of CFG_NOTICE_CODES) this.report(code, notices.find((n) => n.code === code) ?? null);
 		const deferred: ConfigRelPath[] = [];
@@ -203,9 +206,9 @@ export class CfgSync {
 	}
 
 	private async applyWrite(a: CfgFileAction): Promise<boolean> {
-		const { config } = this.deps;
+		const { config, hash } = this.deps;
 		const cur = await config.readBytes(a.file);
-		if ((cur ? exactFingerprint(cur) : null) !== a.expect) return false;
+		if ((cur ? await exactFingerprint(hash, cur) : null) !== a.expect) return false;
 		const w = a.write!;
 		if (w.t === "remove") {
 			if (cur) await config.remove(a.file);

@@ -27,10 +27,10 @@ import { utf8Decode } from "../../core/hash/utf8";
 import type { VaultStat } from "../../ports/vault";
 import type { IntentRecord } from "../store/schema";
 import { fetchAndWrite } from "./blobJobs";
-import { projectCanvasBytes } from "./canvasDoc";
+import { projectCanvasBytes, projectionHash } from "./canvasDoc";
 import { writeOk, type Env } from "./diskJobs";
 import { hashBytes, MAX_TEXT_FILE_BYTES } from "./localState";
-import { makeBase } from "./store";
+import { hashBase, makeBase } from "./store";
 
 interface Seen { readonly hash: ContentHash; readonly fingerprint: DiskFingerprint; readonly bytes: Uint8Array; readonly stat: VaultStat }
 
@@ -38,7 +38,7 @@ async function hashAt(env: Env, path: VaultPath, kind: "markdown" | "canvas" | "
 	const max = kind === "blob" ? env.ctx.classifySettings.maxBlobBytes : MAX_TEXT_FILE_BYTES;
 	const r = await env.ctx.read(env.ctx.diskPathOf(path), max);
 	if (!r.ok) return null;
-	const h = hashBytes(kind, r.bytes);
+	const h = await hashBytes(env.ctx.deps.hash, kind, r.bytes);
 	return { hash: h.hash, fingerprint: h.fingerprint, bytes: r.bytes, stat: r.stat };
 }
 
@@ -60,13 +60,16 @@ async function resumeConflictCopy(env: Env, i: IntentRecord, docId: DocId, from:
 		return true;
 	}
 	try {
+		const port = ctx.deps.hash;
 		const crdt = h.doc.getText("text").toString();
 		const version = h.version();
+		const crdtHash = await markdownContentHash(port, crdt);
 		// Default: the disk keeps D (bound editor owns the file, or the CRDT already equals D).
 		let diskText = canonicalizeMarkdown(utf8Decode(orig.bytes));
 		let stat = orig.stat;
 		let fingerprint = orig.fingerprint;
-		if (!h.bound && markdownContentHash(crdt) !== subject) {
+		let hash: ContentHash;
+		if (!h.bound && crdtHash !== subject) {
 			const path = ctx.diskPathOf(from);
 			const res = await ctx.exec({ t: "write", area: "vault", path, data: { t: "text", text: crdt }, precondition: { t: "hash", hash: subject }, docId, purpose: "merge" });
 			const out = writeOk(res);
@@ -79,11 +82,13 @@ async function resumeConflictCopy(env: Env, i: IntentRecord, docId: DocId, from:
 			diskText = crdt;
 			stat = out.stat;
 			fingerprint = out.fingerprint;
+			hash = crdtHash;
+		} else {
+			hash = await markdownContentHash(port, diskText);
 		}
-		const hash = markdownContentHash(diskText);
 		const base = makeBase(docId, diskText, hash);
 		// Bound and the disk lacks the CRDT text: no sync point until the editor's save (mergeJob.ts header).
-		const awaitingSave = h.bound && markdownContentHash(crdt) !== hash;
+		const awaitingSave = h.bound && crdtHash !== hash;
 		const s = ctx.record({
 			docId, path: from, pathKey: ctx.pk(from), kind: "markdown", contentHash: hash, fingerprint, size: stat.size, mtimeMs: stat.mtimeMs,
 			bodyVersion: awaitingSave ? null : version, blobRev: 0, nsTouchSeq: ctx.touchSeq(docId), hasBase: base !== null,
@@ -114,10 +119,13 @@ async function resumeCanvasCopy(env: Env, i: IntentRecord, docId: DocId, from: V
 			return true;
 		}
 		const version = h.version();
+		// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.
+		const pHash = await projectionHash(ctx.deps.hash, p);
+		const base = await hashBase(ctx.deps.hash, docId, canvasToMergeText(p.ranked));
 		let stat = orig.stat;
 		let fingerprint = orig.fingerprint;
 		let hash = orig.hash;
-		if (p.hash !== subject) {
+		if (pHash !== subject) {
 			const path = ctx.diskPathOf(from);
 			const res = await ctx.exec({ t: "write", area: "vault", path, data: { t: "text", text: p.text }, precondition: { t: "hash", hash: subject }, docId, purpose: "merge" });
 			const out = writeOk(res);
@@ -129,9 +137,8 @@ async function resumeCanvasCopy(env: Env, i: IntentRecord, docId: DocId, from: V
 			ctx.echo.expectWrite(ctx.pk(from), out.stat.size, out.stat.mtimeMs);
 			stat = out.stat;
 			fingerprint = out.fingerprint;
-			hash = p.hash;
+			hash = pHash;
 		}
-		const base = makeBase(docId, canvasToMergeText(p.ranked));
 		const s = ctx.record({
 			docId, path: from, pathKey: ctx.pk(from), kind: "canvas", contentHash: hash, fingerprint, size: stat.size, mtimeMs: stat.mtimeMs,
 			bodyVersion: version, blobRev: 0, nsTouchSeq: ctx.touchSeq(docId), hasBase: base !== null,

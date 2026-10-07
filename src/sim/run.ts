@@ -20,7 +20,7 @@ import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
 import { generateUserAction, runUserAction, EXTRA_OPS, FULL_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights } from "./faults";
-import { activity, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, settingsPrint, type Violation } from "./invariants";
+import { activity, checkBlobLiveness, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, settingsPrint, type Violation } from "./invariants";
 import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
 import { SIM_SETTINGS, SimDevice } from "./device";
@@ -30,6 +30,7 @@ import type { CaseProfile } from "./vault";
 import { checkE2eeLeaks, oracleKeys, onboardSuite1, seededRk } from "./e2ee";
 import type { E2eeFaultStats } from "./e2eeFaults";
 import { realWorkFor, type RealWork } from "./delayedCrypto";
+import type { SimBlobLiveness } from "./blobStore";
 
 export interface SimConfig {
 	readonly seed: number;
@@ -78,6 +79,8 @@ export interface SimReport {
 		readonly tokens: { readonly live: number; readonly deleted: number; readonly unacked: number };
 		readonly files: number;
 		readonly faults: Readonly<Record<string, number>>;
+		/** The blob store's stall / slow models (blobStore.ts): calls caught, ended, completed. */
+		readonly blobs: SimBlobLiveness;
 		readonly quiesceMs: number;
 		readonly relayHead: number;
 		/** Tokens app crashes legitimately lost (in no disk, trash or committed storage). */
@@ -245,7 +248,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		if (!(await faults.settle())) violations.push({ inv: "clean", detail: "crash inspections did not finish" });
 		const oracle = await net.oracle(120_000, c.suite1 ? oracleKeys(devs) : null);
 		if (c.suite1) violations.push(...checkE2eeLeaks(devs, net, ledger).violations, ...(faults.e2ee?.check() ?? []));
-		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)));
+		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net));
 		violations.push(...(await checkQuiet(clock, devs, net)));
 
 		const snap = [...(devs[0]?.vault.snapshot() ?? new Map<string, string>())].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
@@ -256,7 +259,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, files: snap.length, faults: { ...faults.counts }, quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
+			stats: { steps: plan.length, skipped, tokens, files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
 		};
 	} finally {
 		seedEntropy(null);

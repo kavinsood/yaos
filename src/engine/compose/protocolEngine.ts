@@ -110,7 +110,7 @@ export class ComposedEngine {
 	private readonly offs: (() => void)[] = [];
 
 	constructor(readonly transport: EngineTransport, readonly options: CreateEngineOptions) {
-		this.link = new HostLink(transport);
+		this.link = new HostLink(transport, () => this.ports?.hash ?? null);
 		this.bound = new BoundDocs({
 			post: (m) => this.link.post(m),
 			window: () => BUDGETS[this.config?.deviceClass ?? "desktop"].docUpdateWindowBytes,

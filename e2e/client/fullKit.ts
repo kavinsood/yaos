@@ -18,7 +18,8 @@
  *
  * NetSwitch wraps the RelayPort (and the blob port) so a device can go offline: connect answers
  * "unavailable", live sessions drop abruptly (1006) and session RPCs fail like a lost network (src/sim/net.ts).
- * With a WireTap (wireTap.ts) the same wrapper timestamps APPENDs and relay events for the latency breakdown.
+ * With a WireTap (wireTap.ts) the same wrapper timestamps APPENDs and relay events for the latency breakdown;
+ * the blob wrapper records every PUT's and GET's start, body size and end (NetSwitch.puts / gets).
  */
 import type { IntervalHistogram } from "node:perf_hooks";
 import { MessageChannel, Worker, type MessagePort } from "node:worker_threads";
@@ -57,6 +58,7 @@ import { createWsRelayPort } from "../../src/engine/adapters/wsRelay";
 import { SimPlatform } from "../../src/sim/device";
 import { SimConfigDir, SimSideFiles, SimVault } from "../../src/sim/vault";
 import { SimWorkspace } from "../../src/sim/workspace";
+import { nodeXhr } from "./nodeXhr";
 import type { BootTrace } from "./bootTrace";
 import type { Report } from "./engineKit";
 import type { OnboardDevice, OnboardedVault } from "./onboard";
@@ -120,10 +122,30 @@ class DroppableSession implements RelaySession {
 	}
 }
 
+/** One BlobPort.put or get that went through a NetSwitch (performance.now() times). */
+export interface BlobTransferRecord {
+	readonly start: number;
+	/**
+	 * Body bytes on the wire. put: the total of the `parts` argument (the sealed blob under suite 1), known at the
+	 * start; get: the returned body's size, set when it resolves (0 while in flight or not found).
+	 */
+	bytes: number;
+	/** null while the transfer is in flight. */
+	end: number | null;
+	ok: boolean | null;
+}
+
+const partsBytes = (parts: unknown): number =>
+	Array.isArray(parts) ? parts.reduce((n: number, p: unknown) => n + (p instanceof Uint8Array ? p.byteLength : 0), 0) : 0;
+
 export class NetSwitch {
 	online = true;
 	/** Latency timeline hooks (FullClientOptions.tap). */
 	tap: SessionTap | null = null;
+	/** Every blob PUT this client made, oldest first (fullLatency.ts: is an upload in flight?). */
+	readonly puts: BlobTransferRecord[] = [];
+	/** Every blob GET this client made, oldest first. */
+	readonly gets: BlobTransferRecord[] = [];
 	private readonly live = new Set<DroppableSession>();
 
 	wrap(inner: RelayPort): RelayPort {
@@ -143,16 +165,44 @@ export class NetSwitch {
 		};
 	}
 
-	/** Every blob call fails like a network error while offline. */
+	/** Every blob call fails like a network error while offline; puts and gets are recorded. All arguments are forwarded. */
 	wrapBlob(inner: BlobPort | null): BlobPort | null {
 		if (!inner) return null;
 		return new Proxy(inner, {
 			get: (t, k, recv) => {
 				const v = Reflect.get(t, k, recv) as unknown;
 				if (typeof v !== "function") return v;
-				return (...a: unknown[]) => (this.online ? (v as (...x: unknown[]) => unknown).apply(t, a) : Promise.reject(netError(`blob ${String(k)}`)));
+				const f = v as (...x: unknown[]) => unknown;
+				return (...a: unknown[]) => {
+					if (!this.online) return Promise.reject(netError(`blob ${String(k)}`));
+					if (k === "put") return this.timed(this.puts, partsBytes(a[1]), () => f.apply(t, a));
+					if (k === "get") return this.timed(this.gets, 0, () => f.apply(t, a));
+					return f.apply(t, a);
+				};
 			},
 		});
+	}
+
+	/**
+	 * Runs one transfer, recording its start, size and end into `into`. Holds no reference to the parts or the
+	 * fetched body (only `call` sees the arguments, until it returns; a result is only measured).
+	 */
+	private timed(into: BlobTransferRecord[], bytes: number, call: () => unknown): unknown {
+		const rec: BlobTransferRecord = { start: performance.now(), bytes, end: null, ok: null };
+		into.push(rec);
+		const done = (ok: boolean) => { rec.end = performance.now(); rec.ok = ok; };
+		let p: unknown;
+		try {
+			p = call();
+		} catch (e) {
+			done(false);
+			throw e;
+		}
+		Promise.resolve(p).then((v) => {
+			if (v instanceof Uint8Array) rec.bytes = v.byteLength;
+			done(true);
+		}, () => done(false));
+		return p;
 	}
 
 	setOnline(online: boolean): void {
@@ -182,7 +232,7 @@ export async function fullEnginePorts(config: EngineInitConfig, d: EnginePortDep
 	const tap = d.tap;
 	const relay = d.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random,
 		...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}), ...(tap ? { WebSocketImpl: tap.webSocket(tr?.WebSocket) } : {}) }));
-	const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock };
+	const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock, xhr: nodeXhr };
 	// As webEngine.ts: probed at start, and again on a later connect while there is none.
 	const blob = await startupBlob(blobOpts, d.log);
 	d.onBlobKind(blob ? "http" : "none");

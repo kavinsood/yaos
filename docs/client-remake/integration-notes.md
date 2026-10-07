@@ -712,7 +712,9 @@ results below predate that.
    dropped after the pass; 9a76b06), and `readBlobChunks` assembles from the
    local tail when the tail holds the whole blob, else reads the relay
    (61db34d). (The `x:` carrier, `readBlobChunks` and `runtime/blobChunks.ts`
-   were later deleted; blobs travel only via the blob store.)
+   were later deleted; blobs travel only via the blob store. The prefetch was
+   later replaced by background transfers under a byte budget, which no pass
+   awaits: `src/engine/blobs/blobQueue.ts` header, DESIGN §j.1.)
 
 Fresh device, 1000 notes + 20 x 40 KB + 2 x 300 KB attachments (1022 files,
 vaultSeq 1047), two fresh devices per run. ms until every file is on disk /

@@ -40,6 +40,7 @@ function strings(v: unknown, out: string[], depth = 0): void {
  */
 export async function inspectStore(clock: VirtualClock, storage: MemStoragePort, deviceId: DeviceId): Promise<string[]> {
 	const out: string[] = [];
+	const hash = simHashPort();
 	let names: readonly string[] = [];
 	try {
 		names = await storage.listDatabases();
@@ -52,14 +53,13 @@ export async function inspectStore(clock: VirtualClock, storage: MemStoragePort,
 		for (const [store, rows] of Object.entries(dump)) {
 			if (store === STORE.baseText) {
 				for (const r of rows) {
-					const t = readBase(r as BaseTextRecord);
+					const t = await readBase(r as BaseTextRecord, hash);
 					if (t !== null) out.push(t);
 				}
 			} else if (store === STORE.intents || store === STORE.synced || store === STORE.localTree) strings(rows, out);
 		}
 	}
 	if (names.length === 0) return out;
-	const hash = simHashPort();
 	let eng: LogEngine;
 	try {
 		eng = await LogEngine.start({

@@ -202,6 +202,17 @@ export class WireTap {
 		};
 	}
 
+	/**
+	 * The sender's APPENDs in [t0, done], oldest first: stream kind, then the APPEND, the sender's receipt and the
+	 * `via` arrival on the peer, in ms after t0 (null = not seen).
+	 */
+	timeline(sender: string, peer: string, t0: number, done: number, via: "committed" | "provisional" = "committed") {
+		return (this.sent.get(sender) ?? []).filter((s) => s.t >= t0 && s.t <= done).map((s) => {
+			const at = this.arrivals[via].get(s.key)?.get(peer);
+			return { stream: s.stream.split(":")[0] ?? s.stream, append: r1(s.t - t0), receipt: s.receiptAt === null ? null : r1(s.receiptAt - t0), arrival: at === undefined ? null : r1(at - t0) };
+		});
+	}
+
 	private arrive(m: Map<string, Map<string, number>>, key: string, client: string, t: number): void {
 		let per = m.get(key);
 		if (!per) m.set(key, (per = new Map()));

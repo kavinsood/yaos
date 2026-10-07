@@ -16,8 +16,9 @@
  *    synced record work for canvases as for markdown "".
  */
 
+import type { HashPort } from "../../ports/crypto";
 import type { ContentHash } from "../types";
-import { sha256Hex } from "./sha256";
+import { digestHex } from "./digest";
 import { utf8Decode, utf8Encode, utf8Length } from "./utf8";
 import { compareRank, initialCanvasRanks } from "./canvasOrdering";
 
@@ -402,27 +403,37 @@ function parseCanvasValue(raw: unknown): CanvasParseResult {
 	return { kind: "valid", data, canonicalBytes };
 }
 
-/**
- * Logical hash of canvas file bytes. Invalid or oversized canvases fall back to
- * the hash of the exact bytes (they are frozen/not merged anyway; the hash only
- * has to be stable).
- */
-export function canvasContentHash(bytes: Uint8Array): ContentHash {
-	const parsed = parseCanvasBytes(bytes);
-	return parsed.kind === "valid" ? hashCanonical(parsed.canonicalBytes) : sha256Hex(bytes) as ContentHash;
-}
-
 const EMPTY_CANONICAL = '{"edges":[],"nodes":[]}';
-const EMPTY_HASH = sha256Hex(new Uint8Array(0)) as ContentHash;
+const NOTHING = new Uint8Array(0);
 
-function hashCanonical(canonical: Uint8Array): ContentHash {
-	if (canonical.byteLength === EMPTY_CANONICAL.length && utf8Decode(canonical) === EMPTY_CANONICAL) return EMPTY_HASH;
-	return sha256Hex(canonical) as ContentHash;
+/** The empty canvas hashes as empty content (the hash of zero bytes); any other canonical form as itself. */
+function canonicalHashInput(canonical: Uint8Array): Uint8Array {
+	return canonical.byteLength === EMPTY_CANONICAL.length && utf8Decode(canonical) === EMPTY_CANONICAL ? NOTHING : canonical;
 }
 
-/** Logical ContentHash of parsed canvas data (dangling edges dropped); the empty canvas = hash of empty content. */
-export function canvasLogicalHash(data: CanvasSemanticData): ContentHash {
-	return hashCanonical(canonicalCanvasBytes(data));
+/**
+ * The bytes whose sha256 is the logical hash of canvas file bytes: their canonical form when valid. Invalid or
+ * oversized canvases fall back to the exact bytes (they are frozen/not merged anyway; the hash only has to be
+ * stable).
+ */
+export function canvasHashInput(bytes: Uint8Array): Uint8Array {
+	const parsed = parseCanvasBytes(bytes);
+	return parsed.kind === "valid" ? canonicalHashInput(parsed.canonicalBytes) : bytes;
+}
+
+/** Logical hash of canvas file bytes (canvasHashInput), through HashPort. */
+export async function canvasContentHash(hash: HashPort, bytes: Uint8Array): Promise<ContentHash> {
+	return (await digestHex(hash, canvasHashInput(bytes))) as ContentHash;
+}
+
+/** The bytes whose sha256 is the logical ContentHash of parsed canvas data (dangling edges dropped). */
+export function canvasLogicalHashInput(data: CanvasSemanticData): Uint8Array {
+	return canonicalHashInput(canonicalCanvasBytes(data));
+}
+
+/** Logical ContentHash of parsed canvas data; the empty canvas = hash of empty content. Through HashPort. */
+export async function canvasLogicalHash(hash: HashPort, data: CanvasSemanticData): Promise<ContentHash> {
+	return (await digestHex(hash, canvasLogicalHashInput(data))) as ContentHash;
 }
 
 // ---------------------------------------------------------------------------

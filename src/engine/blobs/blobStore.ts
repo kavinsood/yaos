@@ -37,17 +37,22 @@ export interface PutPolicy {
 	noted(hash: ContentHash, address: BlobAddress): Promise<void>;
 }
 
-/** Stores `bytes` (whose sha256 is `hash`) unless the address is present and `policy` re-uses it. Idempotent. */
-export async function putSealed(store: BlobPort, crypto: CryptoPort, hash: ContentHash, bytes: Uint8Array, policy: PutPolicy): Promise<void> {
+/**
+ * Stores `bytes` (whose sha256 is `hash`) unless the address is present and `policy` re-uses it. Idempotent.
+ * `signal` aborts the store calls (ports/blob.ts).
+ */
+export async function putSealed(store: BlobPort, crypto: CryptoPort, hash: ContentHash, bytes: Uint8Array, policy: PutPolicy, signal?: AbortSignal): Promise<void> {
 	const address = await crypto.blobAddress(hash);
-	const have = await store.has([address]);
+	const have = await store.has([address], signal);
 	if (have.has(address) && await policy.reuse(hash, address)) return;
-	await putAt(store, crypto, policy, hash, address, bytes);
+	await putAt(store, crypto, policy, hash, address, bytes, signal);
 }
 
 /** Seals and PUTs `bytes` at `address` (= blobAddress(hash)) unconditionally; a PUT refreshes the upload time. */
-export async function putAt(store: BlobPort, crypto: CryptoPort, policy: PutPolicy, hash: ContentHash, address: BlobAddress, bytes: Uint8Array): Promise<void> {
-	await store.put(address, await crypto.sealBlob({ address, plaintext: bytes }));
+export async function putAt(
+	store: BlobPort, crypto: CryptoPort, policy: PutPolicy, hash: ContentHash, address: BlobAddress, bytes: Uint8Array, signal?: AbortSignal,
+): Promise<void> {
+	await store.put(address, await crypto.sealBlob({ address, plaintext: bytes }), signal);
 	await policy.noted(hash, address);
 }
 
@@ -83,10 +88,10 @@ function openDeterministic(reason: OpenFailure, verified: boolean | null): boole
  * not classified here. Store / transport errors throw (the caller treats them as "transport", not deterministic).
  */
 export async function getOpened(
-	store: BlobPort, crypto: CryptoPort, hash: ContentHash, sha256: ((bytes: Uint8Array) => string | Promise<string>) | null,
+	store: BlobPort, crypto: CryptoPort, hash: ContentHash, sha256: ((bytes: Uint8Array) => string | Promise<string>) | null, signal?: AbortSignal,
 ): Promise<BlobFetch> {
 	const address = await crypto.blobAddress(hash);
-	const sealed = await store.get(address);
+	const sealed = await store.get(address, signal);
 	if (!sealed) return { ok: false, reason: "absent", deterministic: false };
 	const opened = await crypto.openBlob({ address, sealed });
 	if (!opened.ok) return { ok: false, reason: opened.reason, deterministic: openDeterministic(opened.reason, sealingKeyVerified(crypto, sealed)) };

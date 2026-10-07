@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { exactFingerprint } from "../core/hash/markdownLf";
+import { fingerprintRef } from "../core/hash/testkit/hashRef";
 import type { EngineResultValue } from "../protocol/messages";
 import { simHashOracle } from "../sim/hash";
 import { engineHashOracle, MAX_BATCH_BYTES, MAX_BATCH_ITEMS, type HashRequestBody } from "./hashOracle";
@@ -42,6 +42,6 @@ test("engineHashOracle rejects on a wrong answer or a stopped engine", async () 
 test("simHashOracle answers like the engine and moves owned buffers like a transfer", async () => {
 	const bytes = new TextEncoder().encode("hello");
 	const [v] = await simHashOracle().hash([{ path: "a.md", want: "fingerprint", bytes }]);
-	assert.deepEqual(v, { hash: exactFingerprint(new TextEncoder().encode("hello")), textLength: 5 });
+	assert.deepEqual(v, { hash: fingerprintRef(new TextEncoder().encode("hello")), textLength: 5 });
 	assert.equal(bytes.byteLength, 0, "detached");
 });

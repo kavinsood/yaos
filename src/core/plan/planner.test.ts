@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { DocId, LocalEntry, Plan, PlannerInput, PlannerOp, RemoteEntry, SyncedEntry } from "../types";
 import { EMPTY_CONTENT_HASH, plan, planWith } from "./planner";
-import { DEFAULT_BRAKE } from "./brake";
+import { brakeId, DEFAULT_BRAKE } from "./brake";
+import { refHashPort } from "../hash/testkit/hashRef";
 import { L, R, S, V, fp, h, id, input, pk, type Scenario } from "./planFixtures";
 import { prng } from "../merge/prng";
 
@@ -733,20 +734,20 @@ test("brake: mass-delete-remote, listing-shrank, conflict-flood, ns-divergence",
 	assert.equal(div.ops.filter((o) => o.op === "nsDelete").length, 0);
 });
 
-test("brake: id is stable across re-plans (fresh ids, time, map order) and approval releases exactly that set", () => {
+test("brake: id is stable across re-plans (fresh ids, time, map order) and approval releases exactly that set", async () => {
 	const sc = deletes(60, 200);
 	const a = run(sc);
 	const b = run({ ...sc, remote: [...sc.remote!].reverse(), synced: [...sc.synced!].reverse(), over: { nowMs: 5, freshDocIds: [id("zz")] } });
 	assert.ok(a.brake && b.brake);
-	assert.equal(a.brake.id, b.brake.id);
-	assert.match(a.brake.id, /^[0-9a-f]{64}$/);
-	const approved = run({ ...sc, over: { brakeApproval: a.brake.id } });
+	assert.equal(a.brake.identity, b.brake.identity);
+	assert.match(await brakeId(refHashPort, a.brake.identity), /^[0-9a-f]{64}$/);
+	const approved = run({ ...sc, over: { brakeApproval: a.brake.identity } });
 	assert.equal(approved.brake, null);
 	assert.equal(approved.ops.filter((o) => o.op === "nsDelete").length, 60);
 	// one more delete changes the held set: the old approval no longer applies
-	const grown = run({ ...deletes(61, 200), over: { brakeApproval: a.brake.id } });
+	const grown = run({ ...deletes(61, 200), over: { brakeApproval: a.brake.identity } });
 	assert.ok(grown.brake);
-	assert.notEqual(grown.brake.id, a.brake.id);
+	assert.notEqual(grown.brake.identity, a.brake.identity);
 	assert.equal(grown.ops.filter((o) => o.op === "nsDelete").length, 0);
 	// non-destructive ops still run while the brake holds
 	const mixed = run({ ...sc, local: [...sc.local!, L("brand-new.md", h("q"))] });

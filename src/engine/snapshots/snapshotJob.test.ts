@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { unzipSync, strFromU8 } from "fflate";
-import { exactFingerprint } from "../../core/hash/markdownLf";
+import { fingerprintRef } from "../../core/hash/testkit/hashRef";
 import { parseSnapshotId, snapshotId, type SnapRecord, decodeSnapRecord } from "../../core/snap/record";
 import type { SnapManifest } from "../../core/snap/bundle";
 import { ProtocolFailure } from "../../protocol/errors";
@@ -40,7 +40,7 @@ test("export: multi-part zip (parts of partBytes) + descriptor; md/canvas/small 
 	assert.deepEqual(m.files.map((f) => f.path).sort(), ["a.md", "d/b.canvas", "img/small.png", "ünï/cödé.md"]);
 	for (const f of m.files) {
 		assert.deepEqual(zip[`files/${f.path}`], w.vault.bytesOf(f.path));
-		assert.equal(f.hash, exactFingerprint(w.vault.bytesOf(f.path)!));
+		assert.equal(f.hash, fingerprintRef(w.vault.bytesOf(f.path)!));
 	}
 	assert.deepEqual(m.skipped, [{ path: "bad.canvas", reason: "invalid" }]);
 	assert.equal(zip["files/img/big.png"], undefined);

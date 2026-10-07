@@ -464,7 +464,7 @@ export interface PlannerInput {
 	/** Committed ns fold coversSeq (authorNsSeq of ops we would emit). */
 	readonly nsCoversSeq: Seq;
 	readonly brake: BrakeConfig;
-	/** User approved the held destructive ops of this brake id. */
+	/** User approved the held destructive ops of this brake (its PlannedBrake.identity). */
 	readonly brakeApproval: string | null;
 	/** Fresh ids for creates; the planner takes from the front, in order. Supplied by RandomPort. */
 	readonly freshDocIds: readonly DocId[];
@@ -535,7 +535,7 @@ export interface BrakeConfig {
 }
 
 export interface BrakeReport {
-	/** Stable id: hash of the sorted held ops; approval references it. */
+	/** Stable id: sha256 of the brake's identity (core/plan/brake.ts brakeIdentity); approval references it. */
 	readonly id: string;
 	readonly reason: "mass-delete-local" | "mass-delete-remote" | "mass-overwrite" | "listing-shrank" | "conflict-flood" | "ns-divergence";
 	readonly heldCount: number;
@@ -543,12 +543,18 @@ export interface BrakeReport {
 	readonly samplePaths: readonly VaultPath[];
 }
 
+/** A brake as the planner trips it: the report without its id, and the identity the id digests (brakeId). */
+export interface PlannedBrake extends Omit<BrakeReport, "id"> {
+	/** Sorted brake keys of the held units, one per line (brakeIdentity). */
+	readonly identity: string;
+}
+
 export interface Plan {
 	/** Executable now, in order. */
 	readonly ops: readonly PlannerOp[];
 	/** Destructive ops held by the safety brake (not executed until approved). */
 	readonly held: readonly PlannerOp[];
-	readonly brake: BrakeReport | null;
+	readonly brake: PlannedBrake | null;
 	/** Fresh docIds consumed from PlannerInput.freshDocIds. */
 	readonly consumedDocIds: number;
 }

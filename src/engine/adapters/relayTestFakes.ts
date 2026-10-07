@@ -158,3 +158,85 @@ export function fakeFetch(route: (req: FakeRequest) => Response | "network" | Pr
 	};
 	return { fetch: impl, requests };
 }
+
+type Handler = ((ev?: unknown) => void) | null;
+
+/** A scriptable XMLHttpRequest, the subset httpBlob uses; the test plays the network with the server-side methods. */
+export class FakeXhr {
+	readyState = 0;
+	status = 0;
+	responseText = "";
+	method = "";
+	url = "";
+	readonly headers = new Headers();
+	body: Blob | null = null;
+	aborts = 0;
+	onreadystatechange: Handler = null;
+	onprogress: Handler = null;
+	onload: Handler = null;
+	onerror: Handler = null;
+	ontimeout: Handler = null;
+	onabort: Handler = null;
+	readonly upload: { onprogress: Handler; onload: Handler } = { onprogress: null, onload: null };
+
+	open(method: string, url: string): void {
+		this.method = method;
+		this.url = url;
+		this.state(1);
+	}
+	setRequestHeader(name: string, value: string): void { this.headers.set(name, value); }
+	send(body: Blob): void { this.body = body; }
+	abort(): void {
+		this.aborts++;
+		this.state(4);
+		this.onabort?.();
+		this.readyState = 0;
+	}
+
+	// ---- network side ----
+	private state(n: number): void {
+		this.readyState = n;
+		this.onreadystatechange?.();
+	}
+	sent(loaded: number): void { this.upload.onprogress?.({ loaded, total: this.body?.size ?? 0, lengthComputable: true }); }
+	uploaded(): void { this.upload.onload?.(); }
+	respond(status: number, text = ""): void {
+		this.status = status;
+		this.state(2);
+		this.state(3);
+		this.responseText = text;
+		this.onprogress?.();
+		this.state(4);
+		this.onload?.();
+	}
+	lose(): void {
+		this.state(4);
+		this.onerror?.();
+	}
+}
+
+export function fakeXhrs(onSend?: (x: FakeXhr) => void): { xhrs: FakeXhr[]; Ctor: typeof XMLHttpRequest } {
+	const xhrs: FakeXhr[] = [];
+	class Registered extends FakeXhr {
+		constructor() {
+			super();
+			xhrs.push(this);
+		}
+		override send(body: Blob): void {
+			super.send(body);
+			onSend?.(this);
+		}
+	}
+	return { xhrs, Ctor: Registered as unknown as typeof XMLHttpRequest };
+}
+
+/** An XMLHttpRequest answered by a fakeFetch route (status and text body), its requests logged with the fetches. */
+export function routedXhr(route: (req: FakeRequest) => Response | "network", requests: FakeRequest[]): typeof XMLHttpRequest {
+	return fakeXhrs((x) => void (async () => {
+		const req: FakeRequest = { method: x.method, url: new URL(x.url), headers: x.headers, body: new Uint8Array(await x.body!.arrayBuffer()) };
+		requests.push(req);
+		const res = route(req);
+		if (res === "network") x.lose();
+		else x.respond(res.status, await res.text());
+	})()).Ctor;
+}

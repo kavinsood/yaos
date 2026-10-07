@@ -28,6 +28,10 @@
  *                      §j.1): every committed stream is ns / cfg / snap / k / b: / c:,
  *                      no ns / cfg / snap / k row exceeds MAX_NS_FRAME_BYTES, and no
  *                      live attachment doc has a b: / c: row
+ *   liveness           blob store calls after the heal (blobStore.ts): none still in
+ *                      flight at quiescence (a stall's dead calls all ended, by their
+ *                      idle window or a link abort), and the idle window never cut a
+ *                      call that kept moving (a slow one)
  *
  * Not checked here: 4 (fold determinism; WP-A's fold fuzz covers it) and 6
  * (resource bounds; WP-C budget tests).
@@ -44,7 +48,7 @@ import type { SimDevice } from "./device";
 import type { OracleDoc, SimNet } from "./net";
 
 export interface Violation {
-	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log";
+	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness";
 	readonly detail: string;
 }
 
@@ -252,6 +256,16 @@ export function checkClean(devs: readonly SimDevice[], net: SimNet, isDown: (i: 
 			if (v.buffer !== disk) bad(`${n}: view ${v.viewId} buffer ${brief(v.buffer)} != disk ${brief(disk)}`);
 		}
 	});
+	return out;
+}
+
+/** Invariant "liveness": no blob store call outlived the heal; the idle window cut no slow call. */
+export function checkBlobLiveness(net: SimNet): Violation[] {
+	const out: Violation[] = [];
+	const s = net.blobs.liveness;
+	if (s.slowCut > 0) out.push({ inv: "liveness", detail: `the idle window cut ${s.slowCut} blob calls that kept moving (slow, never stalled)` });
+	const open = net.blobs.transfers();
+	if (open.length > 0) out.push({ inv: "liveness", detail: `blob store calls still in flight: ${open.map((c) => `${c.route}@${c.startedAt}${c.stalled ? " stalled" : ""}`).join(", ")}` });
 	return out;
 }
 

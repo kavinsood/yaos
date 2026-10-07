@@ -9,6 +9,11 @@
  * list / deleteIfUploadedBefore are the mark-and-sweep routes (relay-wire §11.3.1,
  * e2ee-design §10.4): only blobs/gc.ts calls them. Upload times are the store's
  * clock (R2's `uploaded`); a PUT overwrite refreshes them.
+ *
+ * Every call takes an optional AbortSignal and rejects soon after it aborts (the engine aborts in-flight
+ * transfers when the session loop declares the link dead, blobs/transferLink.ts, and on stop). No call
+ * stays stuck: an adapter ends a transfer that moves no byte for BLOB_TRANSFER_IDLE_MS (core/limits.ts) with a
+ * transport error, and never cuts one that is still moving.
  */
 
 import type { BlobAddress, SealedBlobParts } from "./crypto";
@@ -49,11 +54,11 @@ export class BlobTooLargeError extends Error {
 export interface BlobPort {
 	readonly maxBlobBytes: number;
 	/** Subset of addresses already stored. */
-	has(addresses: readonly BlobAddress[]): Promise<ReadonlySet<BlobAddress>>;
+	has(addresses: readonly BlobAddress[], signal?: AbortSignal): Promise<ReadonlySet<BlobAddress>>;
 	/** Idempotent. Stores the concatenation of `parts`, as CryptoPort.sealBlob returned them. BlobTooLargeError = refused by size. */
-	put(address: BlobAddress, parts: SealedBlobParts): Promise<void>;
+	put(address: BlobAddress, parts: SealedBlobParts, signal?: AbortSignal): Promise<void>;
 	/** null = not found (yet). */
-	get(address: BlobAddress): Promise<Uint8Array | null>;
+	get(address: BlobAddress, signal?: AbortSignal): Promise<Uint8Array | null>;
 	/** One page of the vault's blobs after `cursor` (null = from the start). Rejects when `signal` aborts. */
 	list(cursor: BlobAddress | null, signal?: AbortSignal): Promise<BlobListPage>;
 	/**

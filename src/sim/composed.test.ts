@@ -1,12 +1,14 @@
 /**
  * Composed full-client scenarios on the sim (host + protocol + engine + SimRelay):
  * attachments through the blob store (never the relay log; without a store they
- * stay local until a later connect finds one), settings sync, IndexedDB loss
+ * stay local until a later connect finds one; a store that stalls or crawls:
+ * the idle window, the link abort, retries), settings sync, IndexedDB loss
  * with mirror recovery, and a relay epoch reset (§c.12) migrating both devices.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { VaultEpoch } from "../core/types";
+import { BLOB_TRANSFER_IDLE_MS } from "../core/limits";
 import type { EngineSettings } from "../protocol/messages";
 import { VirtualClock } from "./clock";
 import { SIM_SETTINGS, SimDevice, type SimDeviceOptions } from "./device";
@@ -156,6 +158,142 @@ test("attachments off: a binary file stays local", async () => {
 	await clock.advance(10_000);
 	assert.equal(b.vault.textOf("n.md"), "note");
 	assert.equal(b.vault.hasFile("img/p.png"), false);
+});
+
+// --- blob store stalls and slow periods (sim/blobStore.ts: the adapter's idle window and the link abort) -------
+
+/** Diagnostics `code` events on d's engine so far. */
+function diags(d: SimDevice, code: string): readonly Readonly<Record<string, unknown>>[] {
+	return d.vrt!.log.diagnostics().filter((e) => e.code === code).map((e) => e.fields);
+}
+
+function queuedOf(d: SimDevice): string[] {
+	return d.vrt!.blobs.queued().map((q) => `${q.direction}:${q.path}:${q.state}#${q.attempts}`);
+}
+
+test("blob store stall on the PUT body: a socket drop (1006) aborts the stalled upload through the link, a note edited meanwhile syncs, after the heal the retry converges", async () => {
+	const { clock, net, devs } = world({ settings: () => ATTACH });
+	const [a, b] = pair(devs);
+	a.vault.userWrite("n.md", "note\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("n.md"), "note\n");
+
+	net.blobs.setStall("put"); // the server stops reading upload bodies (httpBlob.ts:39-41); exists answers
+	const pic = bytes(300_000, 7);
+	a.vault.externalWrite("img/p.png", pic);
+	assert.ok(await clock.runUntil(() => net.blobs.transfers().length > 0, 20_000), "the upload's PUT stalls");
+	assert.deepEqual(net.blobs.transfers().map((c) => c.route), ["put"]);
+	assert.equal(net.blobs.calls.has, 1, "exists answered");
+	assert.deepEqual(queuedOf(a), ["up:img/p.png:running#0"]);
+	a.vault.externalWrite("n.md", "note\nedited during the stall\n");
+	await clock.advance(5_000);
+	assert.equal(b.vault.textOf("n.md"), "note\nedited during the stall\n", "the stalled upload holds up no other doc");
+	assert.equal(b.vault.hasFile("img/p.png"), false);
+
+	net.relay.dropSession(a.deviceId); // 1006: the session loop declares the link dead
+	await clock.advance(100);
+	assert.equal(net.blobs.liveness.aborted, 1, "the link abort ended the stalled call");
+	assert.equal(net.blobs.liveness.watchdog, 0, "not the idle window");
+	assert.deepEqual(diags(a, "blob-transfers-aborted"), [{ n: 1, why: "close 1006" }]);
+	assert.deepEqual(net.blobs.transfers(), []);
+	assert.deepEqual(queuedOf(a), ["up:img/p.png:backoff#1"], "a backoff record, not a lost transfer");
+
+	await clock.advance(20_000); // the retry (after the 2 s backoff) stalls again
+	assert.deepEqual(net.blobs.transfers().map((c) => c.route), ["put"]);
+	assert.deepEqual(queuedOf(a), ["up:img/p.png:running#1"]);
+	net.blobs.setStall(null);
+	// The retry's call stays dead (a black-holed stream does not resume): its idle window ends it, the next retry lands.
+	await clock.advance(2 * 60_000);
+	await same(a, b, "img/p.png", pic);
+	assert.deepEqual([net.blobs.liveness.aborted, net.blobs.liveness.watchdog, net.blobs.liveness.stalled.put], [1, 1, 2]);
+	assert.deepEqual([net.blobs.calls.has, net.blobs.calls.put], [3, 3], "three attempts: aborted, cut by the window, stored");
+	for (const d of devs) assert.deepEqual(d.vrt!.blobs.queued(), [], `${d.name}: queue empty`);
+	assert.deepEqual(net.blobs.transfers(), []);
+	assert.equal(b.vault.textOf("n.md"), "note\nedited during the stall\n");
+	logCarriesNoBlobs(net, pic.length);
+});
+
+test("blob store stall, no link loss: the idle window ends the call at BLOB_TRANSFER_IDLE_MS, not before; it backs off, retries and converges after the heal", async () => {
+	const { clock, net, devs } = world({ settings: () => ATTACH });
+	const [a, b] = pair(devs);
+	await boot(clock, devs);
+	await clock.advance(5_000);
+	net.blobs.setStall("path");
+	const pic = bytes(200_000, 8);
+	a.vault.externalWrite("img/p.png", pic);
+	assert.ok(await clock.runUntil(() => net.blobs.transfers().length > 0, 20_000));
+	const [call] = net.blobs.transfers();
+	assert.equal(call?.route, "has", "the upload asks exists first");
+	const t0 = call!.startedAt;
+	await clock.advance(t0 + BLOB_TRANSFER_IDLE_MS - 1 - clock.monotonic());
+	assert.equal(net.blobs.liveness.watchdog, 0, "nothing ended at idle - 1 ms");
+	assert.equal(net.blobs.transfers().length, 1);
+	assert.deepEqual(queuedOf(a), ["up:img/p.png:running#0"]);
+	await clock.advance(1);
+	assert.equal(net.blobs.liveness.watchdog, 1, "ended at the idle window");
+	assert.equal(net.blobs.liveness.aborted, 0);
+	await clock.advance(100);
+	assert.deepEqual(queuedOf(a), ["up:img/p.png:backoff#1"]);
+	assert.equal(b.vault.hasFile("img/p.png"), false);
+
+	net.blobs.setStall(null);
+	await clock.advance(60_000);
+	await same(a, b, "img/p.png", pic);
+	for (const d of devs) assert.deepEqual(d.vrt!.blobs.queued(), [], `${d.name}: queue empty`);
+	assert.deepEqual(net.blobs.transfers(), []);
+});
+
+test("slow blob store: an upload and a download each taking longer than the idle window complete, never cut, with no retry", async () => {
+	const { clock, net, devs } = world({ settings: () => ATTACH });
+	const [a, b] = pair(devs);
+	await boot(clock, devs);
+	await clock.advance(5_000);
+	const rate = 8 * 1024;
+	net.blobs.setSlow(rate);
+	const pic = bytes(600_000, 9);
+	assert.ok(pic.length / rate > 1.2 * (BLOB_TRANSFER_IDLE_MS / 1000), "each transfer outlasts the idle window");
+	a.vault.externalWrite("img/p.png", pic);
+	await clock.advance(4 * 60_000);
+	await same(a, b, "img/p.png", pic);
+	const s = net.blobs.liveness;
+	assert.deepEqual([s.watchdog, s.slowCut, s.aborted], [0, 0, 0], "nothing cut, nothing aborted");
+	assert.ok(s.slowOverIdle >= 2, `the PUT and the GET outlasted the window (${s.slowOverIdle}, max ${s.slowMaxMs} ms)`);
+	assert.ok(s.slowMaxMs > BLOB_TRANSFER_IDLE_MS);
+	assert.deepEqual([net.blobs.calls.put, net.blobs.calls.get], [1, 1], "one PUT, one GET: no retry");
+	for (const d of devs) assert.deepEqual(d.vrt!.blobs.queued(), [], `${d.name}: queue empty`);
+});
+
+test("blob store stall on the receiver's download: the idle window ends it, then a socket drop ends the retry; after the heal the attachment arrives", async () => {
+	const { clock, net, devs } = world({ settings: () => ATTACH });
+	const [a, b] = pair(devs);
+	await boot(clock, devs);
+	await clock.advance(5_000);
+	const pic = bytes(150_000, 10);
+	a.vault.externalWrite("img/p.png", pic);
+	assert.ok(await clock.runUntil(() => net.blobs.objects.size > 0, 20_000), "A's PUT landed");
+	net.blobs.setStall("path");
+	assert.ok(await clock.runUntil(() => net.blobs.transfers().length > 0, 20_000), "B's download stalls");
+	assert.deepEqual(net.blobs.transfers().map((c) => c.route), ["get"]);
+	assert.deepEqual(queuedOf(b), ["down:img/p.png:running#0"]);
+	assert.deepEqual(a.vrt!.blobs.queued(), [], "the upload finished");
+
+	await clock.advance(BLOB_TRANSFER_IDLE_MS);
+	assert.deepEqual([net.blobs.liveness.watchdog, net.blobs.liveness.stalled.get], [1, 1], "the idle window ended the GET");
+	assert.ok(await clock.runUntil(() => net.blobs.transfers().length > 0, 10_000), "the retry stalls too");
+	assert.deepEqual(queuedOf(b), ["down:img/p.png:running#1"]);
+	net.relay.dropSession(b.deviceId);
+	await clock.advance(100);
+	assert.equal(net.blobs.liveness.aborted, 1, "the link abort ended the retry");
+	assert.deepEqual(diags(b, "blob-transfers-aborted"), [{ n: 1, why: "close 1006" }]);
+	assert.deepEqual(queuedOf(b), ["down:img/p.png:backoff#2"]);
+	assert.equal(b.vault.hasFile("img/p.png"), false);
+
+	net.blobs.setStall(null);
+	await clock.advance(60_000);
+	await same(a, b, "img/p.png", pic);
+	for (const d of devs) assert.deepEqual(d.vrt!.blobs.queued(), [], `${d.name}: queue empty`);
+	assert.deepEqual(net.blobs.transfers(), []);
 });
 
 const SETTINGS_ON: EngineSettings = { ...SIM_SETTINGS, syncSettings: true };

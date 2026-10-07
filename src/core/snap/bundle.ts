@@ -3,18 +3,19 @@
  * and the part cutter. Pure; the engine's SnapshotJob drives these through its ports.
  *
  * Bundle = zip entries `files/<path>` (manifest order), then `manifest.json`. The zip is cut into parts of
- * `partSize` bytes (the last may be shorter), each hashed with SHA-256 on its own (there is no incremental
- * SHA-256 in core). Every file is hashed in the manifest (exactFingerprint). The bundle digest binds them:
+ * `partSize` bytes (the last may be shorter), each hashed with SHA-256 on its own through HashPort (there is no
+ * incremental SHA-256). Every file is hashed in the manifest (exactFingerprint). The bundle digest binds them:
  *
  *   bundleDigest = SHA-256( "yaos/snap-bundle/1" || varstring snapshotId || varuint partCount
  *                           || for each part: varuint size || 32B sha256(part)
  *                           || 32B sha256(manifest.json bytes) )
  */
 
+import type { HashPort } from "../../ports/crypto";
 import type { ContentHash, DocKind, VaultPath } from "../types";
 import { kindOfPath } from "../types";
 import { Writer, hexToBytes, utf8DecodeStrict, utf8Encode } from "../codec/lib0";
-import { sha256Hex } from "../hash/sha256";
+import { digestHex } from "../hash/digest";
 import { parseCanvasBytes } from "../hash/canvasCanonical";
 import { pathInvalidReason } from "../paths/validate";
 import { SNAP_MAX_FILES, SNAP_REASONS, parseSnapshotId, type SnapReason } from "./record";
@@ -66,12 +67,14 @@ export function maxZipEntryBytes(name: string): number {
 	return name.startsWith(SNAP_ENTRY_PREFIX) ? maxEntryBytes(kindOfPath(name.slice(SNAP_ENTRY_PREFIX.length) as VaultPath)) : 0;
 }
 
-export function bundleDigest(snapshotId: string, parts: readonly { readonly size: number; readonly sha256: string }[], manifestSha256: string): ContentHash {
+export async function bundleDigest(
+	hash: HashPort, snapshotId: string, parts: readonly { readonly size: number; readonly sha256: string }[], manifestSha256: string,
+): Promise<ContentHash> {
 	const w = new Writer(64 + parts.length * 40);
 	w.raw(utf8Encode("yaos/snap-bundle/1")).varstring(snapshotId).varuint(parts.length);
 	for (const p of parts) w.varuint(p.size).fixed(hexToBytes(p.sha256), 32);
 	w.fixed(hexToBytes(manifestSha256), 32);
-	return sha256Hex(w.finish()) as ContentHash;
+	return (await digestHex(hash, w.finish())) as ContentHash;
 }
 
 /** Content check shared by export (skip as "invalid") and restore (corrupt): null = restorable. */
@@ -143,7 +146,7 @@ export class PartCutter {
 	private index = 0;
 	readonly parts: { readonly size: number; readonly sha256: ContentHash }[] = [];
 
-	constructor(private readonly partSize: number, private readonly sink: (part: CutPart) => Promise<void>) {
+	constructor(private readonly hash: HashPort, private readonly partSize: number, private readonly sink: (part: CutPart) => Promise<void>) {
 		if (!Number.isSafeInteger(partSize) || partSize < 1) throw new Error("bad part size");
 		this.buf = new Uint8Array(partSize);
 	}
@@ -167,7 +170,7 @@ export class PartCutter {
 	private async flush(): Promise<void> {
 		const bytes = this.buf.slice(0, this.fill);
 		this.fill = 0;
-		const hash = sha256Hex(bytes) as ContentHash;
+		const hash = (await digestHex(this.hash, bytes)) as ContentHash;
 		this.parts.push({ size: bytes.length, sha256: hash });
 		await this.sink({ index: this.index++, bytes, sha256: hash });
 	}
