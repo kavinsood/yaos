@@ -3,7 +3,7 @@
  * authority and every bound editor is a client of it in the @codemirror/collab model:
  *
  *  - DocMirror: the replica's text at the last body event main applied (an immutable CodeMirror Text, so each
- *    entry costs O(change · log N)), plus the texts of versions not yet durable, for the restart merge base.
+ *    entry costs O(change · log N)), plus the texts of versions not yet durable, for the resync merge base.
  *  - ViewClient: one editor's unconfirmed local changes: pushes in flight (the first against a replica version,
  *    each later one chained "after" the one before it) plus a buffer not pushed yet. A foreign entry F (any
  *    change of the replica that is not this view's push) is rebased over them, in order:
@@ -20,7 +20,7 @@
 
 import type { ChangeSet, Text } from "@codemirror/state";
 
-/** Non-durable versions kept for the restart base (beyond it the base is an older durable text: safe, coarser). */
+/** Non-durable versions kept for the resync base (beyond it the base is an older durable text: safe, coarser). */
 export const MIRROR_HISTORY = 512;
 
 export class DocMirror {

@@ -31,7 +31,7 @@ import type { WorkspacePort } from "./workspace";
 import type { RelayPort } from "./relay";
 import type { StoragePort } from "./storage";
 
-/** Ports the engine (worker, or inline) is constructed with. No vault access: that goes over the protocol. */
+/** Ports the engine (in the worker; in-process in tests and the sim) is constructed with. No vault access: that goes over the protocol. */
 export interface EnginePorts {
 	readonly relay: RelayPort;
 	readonly storage: StoragePort;

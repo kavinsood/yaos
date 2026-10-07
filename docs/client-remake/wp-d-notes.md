@@ -15,14 +15,17 @@ Branch `client-remake-wp-d`. Scope: DESIGN §k.3 WP-D. Status of the acceptance 
 
 - **Protocol carriers.** `src/protocol/inlineTransport.ts` is an in-process pair on a pluggable schedule (macrotask by default, the virtual clock in the sim). It has kill/failure semantics. `src/protocol/workerTransport.ts` wraps a `Worker` / `DedicatedWorkerGlobalScope`. Both use the `[T]` transfer helpers (`transferablesOf`, `owned`, `postOwned`), so a transferred buffer is detached on the sender.
 - **Worker entry.** `src/engine/workerMain.ts` autostarts only inside a dedicated worker. `importScripts` is the tell: classic Blob-URL workers expose it.
-- **Engine host** (`src/host/engineHost.ts`):
-  - probe: ping, then init;
-  - falls back to inline on no pong within 5 s, on worker storage failure (OR-1), or when no `Worker` exists;
-  - ping liveness;
-  - restarts on a new generation, so stale messages are ignored;
-  - more than 3 restarts in 10 min means inline only;
-  - terminal and fatal errors stop the host.
-  - Once `stop()` begins, no restart or bring-up can create a carrier, and a half-started carrier is torn down without `onReady`.
+- **Engine host** (`src/host/engineHost.ts`). As delivered by WP-D it fell back to inline on no pong within 5 s,
+  on worker storage failure (OR-1) or with no `Worker`, restarted on a new generation, and ran inline only after
+  more than 3 restarts in 10 min. Branch `client-remake-noinline` deleted the UI-thread fallback and the restarts
+  (DESIGN §g.4, §g.5):
+  - one carrier, the worker: startup ping, then init; ping liveness;
+  - terminal for the runtime: the worker cannot be constructed, a missed startup or liveness pong, a worker error
+    or other transport failure, an error answering init (`storage-lost` included), an engine `fatal`. The host
+    stops, pending requests reject `aborted`, one fatal goes to the UI, and nothing restarts in the background;
+  - messages from a torn-down carrier are ignored;
+  - once `stop()` begins, no bring-up can create a carrier, and a half-started carrier is torn down without
+    `onReady`.
 - **Host runtime** (`src/host/hostRuntime.ts`): wires the engine host, the bindings and the disk executor.
   - Vault events go to observation batches.
   - It runs scan and reconcile, handles engine requests (disk ops, side files, config dir, status, brake, notices) and lifecycle flushes.
@@ -40,7 +43,7 @@ Branch `client-remake-wp-d`. Scope: DESIGN §k.3 WP-D. Status of the acceptance 
   of the worker replica (`bodyPush` / `body` events, host/bodyClient.ts, host/collab.ts), and the bind and reload
   merges, conflict copies and save detection run in the worker (DESIGN §d.2, §d.3).
   - Still true: remote changes are never echoed, `docCredit` flow control, split views are clients of one replica,
-    and a restart re-binds every view.
+    and a new runtime (the user's restart) re-binds every view.
 - **Obsidian adapters:**
   - VaultPort (`obsidianVault.ts`): text CAS via `vault.process` with an exact-content guard (since the main-thread
     rework: an engine-hashed precondition plus a stat recheck and a UTF-16 length guard, DESIGN §f.2); `vault.create` when the file is absent; `vault.rename` only; `vault.trash` only; empty-folder removal only when the folder has zero children.
@@ -58,7 +61,7 @@ Branch `client-remake-wp-d`. Scope: DESIGN §k.3 WP-D. Status of the acceptance 
   - `production` writes `main.js` and `dist/yaos-client/{main.js,manifest.json,yaos/,yaos.zip}`, then runs `scripts/plugin-smoke.mjs`. The smoke checks are:
     - zip layout;
     - no WebAssembly;
-    - `main.js` loads as a CJS plugin against a stub `obsidian`, reaches phase `running` on the inline carrier over the in-memory fake vault (`src/sim/fakeObsidian.ts`), never logs the token, and unloads;
+    - `main.js` loads as a CJS plugin against a stub `obsidian`, reaches phase `running` on the inline carrier over the in-memory fake vault (`src/sim/fakeObsidian.ts`), never logs the token, and unloads (today, with no UI-thread fallback, the no-`Worker` load must reach phase `failed` with a "YAOS stopped" notice and open no IndexedDB, and a worker-thread load reaches `running`: `scripts/plugin-smoke.mjs`);
     - the worker IIFE answers ping in a `node:vm` context.
 - **check-deps** (`scripts/check-deps.mjs`) implements the §k.2 import rules:
   - areas;
@@ -122,7 +125,7 @@ Other gates that pass:
 Install steps. Use a test vault only.
 1. Copy the `yaos/` folder to `<vault>/.obsidian/plugins/yaos/`. Use the unzipped `yaos.zip` or `dist/yaos-client/yaos/`.
 2. Settings → Community plugins → enable "YAOS".
-3. The status bar shows the carrier: worker, or inline with a reason.
+3. Settings → YAOS, engine section: "Running in a background worker" (as delivered, the status bar showed the carrier: worker, or inline with a reason; there is no inline carrier now, and a worker that cannot start shows "Failed: …" with a "YAOS stopped: …" notice).
 4. Until integration, the engine is the stand-in. It works locally only and has no relay.
 
 **Day-1 spike (OR-1 / OR-2).** Build it with `node scripts/build-spike.mjs`. This writes `dist/yaos-client/spike/yaos-spike.zip`, whose top level is `yaos-spike/`. Run it only in a throwaway vault, never a real one.
@@ -170,7 +173,7 @@ If B shows that `adapter.write` bypasses the wrapper, those writes reach YAOS on
   - persist before projecting and on `boundSaved`, so the store is never older than the disk. Otherwise a stale store re-derives a delete by diff on restart.
 - **Engine host stop is final.** A carrier failure that arrives while `stop()` awaits the shutdown answer used to restart the engine. In the sim, that zombie engine joined the hub under the live device's member id after an app crash, and its edits never came back. Now:
   - `halting` is set at the top of `stop()`;
-  - every await in `tryStart` re-checks it;
+  - every await in bring-up re-checks it (`tryStart` then; `bringUp` / `abandon` since the restarts were deleted);
   - teardown in `stop()` uses the current carrier, because teardown is not idempotent.
 - **Conflict copies retry I/O errors** (backoff 250 ms up to 30 s, until written or until unload) before the merged buffer is saved over the disk side. Before this change, a single failed write dropped the external side.
 - **A frozen doc stays unbound,** with the notice `doc-frozen`. WorkspacePort has no read-only bind.
@@ -192,13 +195,15 @@ If B shows that `adapter.write` bypasses the wrapper, those writes reach YAOS on
   - `seededEntropy.ts`: stays.
 
 **INTEGRATION: `createEngine` contract for WP-C.** Two places call it:
-- `host/plugin.ts`, for inline: `createEngine(pair.engine, { carrier: "inline", makePorts })`;
+- `host/plugin.ts`, for inline: `createEngine(pair.engine, { carrier: "inline", makePorts })` (deleted with the
+  UI-thread fallback: the plugin's one carrier is the worker; tests, the sim and harnesses still build in-process
+  engines);
 - `engine/workerMain.ts`, for the worker: `createEngine(transport, { carrier: "worker", makePorts })`.
 
 `makePorts(config)` builds the IndexedDB, WebSocket and WebCrypto adapters. The engine host expects:
 - `ping` answered with `pong` in every phase, including before `init`;
 - `init` answered with `ready{protocolVersion}` within 120 s;
-- an IndexedDB open failure in the worker answered with error `storage-lost`, non-retryable, which means OR-1 → inline;
+- an IndexedDB open failure in the worker answered with error `storage-lost`, non-retryable, which means OR-1 → inline (today: the host stops, DESIGN §g.4);
 - `shutdown` answered with `ok` within 3 s;
 - `version-mismatch` and `revoked` are terminal.
 

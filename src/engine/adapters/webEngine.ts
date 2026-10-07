@@ -1,10 +1,9 @@
 /**
- * Production engine entry (worker and inline fallback): createEngine over the
- * web adapters. The only engine module the host imports (inline carrier);
- * workerMain.ts runs the same function inside the Blob-URL worker.
+ * Production engine: createEngine over the web adapters, run by workerMain.ts
+ * inside the Blob-URL worker (the only carrier; no host module imports this).
  *
- *  - storage: IndexedDB (an open failure answers init `storage-lost`, the host
- *    falls back to the inline carrier, OR-1);
+ *  - storage: IndexedDB (an open failure answers init `storage-lost`: the host
+ *    stops and reports it, OR-1);
  *  - relay: WebSocket streams + HTTP tickets; blobs: HTTP blob store when the
  *    relay advertises attachments, else none (attachments are not synced; a
  *    later connect probes again, probeBlob). Capabilities unreachable (offline
@@ -34,9 +33,9 @@ export interface WebEngineOptions {
 	readonly log?: (line: string) => void;
 }
 
-export function createWebEngine(transport: EngineTransport, carrier: "worker" | "inline", o: WebEngineOptions = {}): EngineHandle {
+export function createWebEngine(transport: EngineTransport, o: WebEngineOptions = {}): EngineHandle {
 	return createEngine(transport, {
-		carrier,
+		carrier: "worker",
 		clientVersion: o.clientVersion ?? "dev",
 		log: o.log,
 		tzOffsetMinutes: () => -new Date().getTimezoneOffset(),

@@ -72,7 +72,7 @@ test("worker entry answers ping before init, inits on IndexedDB and accepts obse
 	const config = await buildInitConfig({
 		identity: { vaultId: "v" as VaultId, deviceId: "d" as DeviceId, deviceLabel: "test", relay: { url: "wss://x", credential: "c" } },
 		platform: { os: "linux", isMobile: false, isTablet: false, hardwareConcurrency: 4, deviceMemoryGiB: null, workerSupported: true },
-		carrier: "worker", workerSupported: true, configDir: ".obsidian", caseInsensitiveFs: false, settings: SIM_SETTINGS, side: new SimSideFiles(),
+		configDir: ".obsidian", caseInsensitiveFs: false, settings: SIM_SETTINGS, side: new SimSideFiles(),
 		crypto: { suite: 0 },
 	});
 	post({ t: "init", rid: 2, config });

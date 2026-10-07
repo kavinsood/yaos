@@ -194,7 +194,8 @@ export class E2eeFaults {
 			return `skip fault revoke: ${b.name} cannot revoke now`;
 		}
 		const rk = seededRk(new SeededRandom(rkSeed));
-		// The command transfers (detaches) the new RK on a worker carrier; the inline one zero-fills it (keyringRuntime).
+		// The command hands the new RK to the engine: transferred (detached) or copied, and main's bytes zero-filled
+		// either way (engineHost.ts send, wipeSecrets).
 		// "pending" also answers ok: the record may still win, so the user keeps the new RK too.
 		void b.runtime.command({ t: "revokeRekey", rk }).then(
 			() => {

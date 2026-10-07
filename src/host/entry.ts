@@ -2,8 +2,8 @@
  * Bundle entry (esbuild.config.mjs, integration-notes D2). main.js is one bundle
  * with two roles, so the engine is in it once:
  *  - main thread: Obsidian evaluates main.js as a CommonJS module and takes
- *    `module.exports.default`: the plugin (host/plugin.ts), whose inline
- *    carrier runs the engine from this same code;
+ *    `module.exports.default`: the plugin (host/plugin.ts), which never runs
+ *    the engine;
  *  - worker: the host starts a Blob-URL worker from the bundle's own source
  *    (host/bundleSource.ts) with `__yaosWorkerScope` set; the entry starts the
  *    engine (engine/workerMain.ts) and never evaluates the host modules, which

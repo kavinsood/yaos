@@ -40,7 +40,7 @@ test("DocMirror: entries apply in version order; a gap or a length mismatch is o
 	assert.equal(m.text.toString(), "aXbc", "a refused entry changes nothing");
 });
 
-test("DocMirror: markDurable keeps the text of the durable version as the restart base; history is bounded", () => {
+test("DocMirror: markDurable keeps the text of the durable version as the resync base; history is bounded", () => {
 	const m = new DocMirror(0, T(""));
 	for (let v = 0; v < 5; v++) assert.ok(m.apply(v, v + 1, ins(v, v, String(v)), v + 1));
 	const durable = () => m.durable?.toString() ?? null; // a call: no narrowing across markDurable

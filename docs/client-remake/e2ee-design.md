@@ -315,7 +315,7 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
      bytes are zero-filled when the seal epoch moves past them. Keys from `init.crypto` count as exported.
 3. New keys (adopted by roll, entered by QR or RK) are produced in the worker and posted back once in
    `keyringChanged` (SECRET). Main persists them to SecretStorage.
-4. Inline mode runs the same code on main.
+4. The engine never runs on main (DESIGN §g.5); tests and the sim run the same code over the in-process pair.
 
 ### 6.4 Side files and local state (DESIGN §e.4)
 

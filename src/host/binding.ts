@@ -5,13 +5,13 @@
  * as ChangeSet JSON in pre-change coordinates with only the inserted text; the replica's changes come back as
  * entries applied as CodeMirror transactions outside the undo history.
  *
- * Whole texts cross only at a bind (first open, re-open after a resync or an engine restart: the editor text,
+ * Whole texts cross only at a bind (first open, re-open after a resync: the editor text,
  * plus the merge base when there is one, plus the text Obsidian last saved when the editor is dirty) and when Obsidian pushes text into a bound view (an external reload,
  * a properties edit, an unbound view's quick preview): uploaded as transferred UTF-16 chunks of
  * TEXT_CHUNK_UNITS with a yield between chunks. The worker compares, merges and diffs; main never does.
  *
- * Engine restart: views unbind (their edits stay in the editors) and re-bind on start with the last durable
- * text as merge base, so a worker killed mid-typing loses nothing: the editor text is merged back.
+ * The engine dying stops the runtime (engineHost.ts): views unbind and their edits stay in the editors; the next
+ * runtime (the user's restart) binds them as at a first open.
  */
 
 import { ChangeSet, type Text } from "@codemirror/state";
@@ -28,7 +28,7 @@ import { DocMirror, ViewClient } from "./bodyClient";
 export interface BindingLink {
 	/** Post to the engine (the host handles [T] ownership). */
 	post(message: MainToEngine): void;
-	/** openDoc request; rejects when the engine errors or restarts. */
+	/** openDoc request; rejects when the engine errors or stops. */
 	openDoc(path: VaultPath, viewId: number): Promise<EngineResultValue>;
 }
 
@@ -95,7 +95,7 @@ const ofString = (s: string): TextSource => ({ length: s.length, slice: (a, b) =
 export class BindingManager {
 	private readonly slots = new Map<number, ViewSlot>();
 	private readonly docs = new Map<DocId, BoundDoc>();
-	/** Merge base for the next binds of a doc after a resync / restart (until every view of it is bound). */
+	/** Merge base for the next binds of a doc after a resync (until every view of it is bound). */
 	private readonly bases = new Map<DocId, Text>();
 	private running = false;
 	private offWorkspace: Unsubscribe | null = null;
@@ -120,20 +120,10 @@ export class BindingManager {
 		for (const slot of this.slots.values()) void this.open(slot);
 	}
 
-	/** Engine is gone (restart): unbind every view, keeping the restart merge base; start() re-binds them. */
-	suspend(): void {
-		this.running = false;
-		for (const doc of this.docs.values()) {
-			const base = doc.mirror?.durable ?? null;
-			if (base) this.bases.set(doc.docId, base);
-		}
-		for (const slot of this.slots.values()) this.unbindSlot(slot, false);
-	}
-
-	/** Plugin unload: flush and unbind everything. */
+	/** Plugin unload or the engine stopped (fatal): flush and unbind everything. */
 	stop(): void {
 		this.flushAll();
-		for (const slot of [...this.slots.values()]) this.unbindSlot(slot, true);
+		for (const slot of [...this.slots.values()]) this.unbindSlot(slot);
 		this.slots.clear();
 		this.bases.clear();
 		this.offWorkspace?.();
@@ -267,7 +257,7 @@ export class BindingManager {
 		// resync: the worker dropped events (main fell behind its window); the mirror is behind but consistent.
 		if (change.t === "resync") return this.resync(doc, doc.mirror?.text ?? null);
 		for (const slot of [...doc.slots]) {
-			this.unbindSlot(slot, true);
+			this.unbindSlot(slot);
 			if (change.t === "deleted") slot.state = "waiting";
 			else void this.open(slot);
 		}
@@ -338,7 +328,7 @@ export class BindingManager {
 		switch (e.t) {
 			case "opened": {
 				const existing = this.slots.get(e.view.viewId);
-				if (existing) this.unbindSlot(existing, true);
+				if (existing) this.unbindSlot(existing);
 				const slot = this.newSlot(e.view);
 				this.slots.set(slot.viewId, slot);
 				void this.open(slot);
@@ -349,7 +339,7 @@ export class BindingManager {
 				if (!slot) {
 					slot = this.newSlot(e.view);
 					this.slots.set(slot.viewId, slot);
-				} else this.unbindSlot(slot, true);
+				} else this.unbindSlot(slot);
 				slot.reloadText = null; // another file now: its pending reload is moot
 				void this.open(slot);
 				return;
@@ -357,7 +347,7 @@ export class BindingManager {
 			case "closed": {
 				const slot = this.slots.get(e.viewId);
 				if (!slot) return;
-				this.unbindSlot(slot, true);
+				this.unbindSlot(slot);
 				this.slots.delete(e.viewId);
 				return;
 			}
@@ -563,9 +553,9 @@ export class BindingManager {
 
 	// --- internals: unbind / resync -------------------------------------------
 
-	private unbindSlot(slot: ViewSlot, sendClose: boolean): void {
+	private unbindSlot(slot: ViewSlot): void {
 		const doc = slot.doc;
-		if (doc && sendClose) this.flushSlot(slot); // pushed before closeDoc: the engine applies it first
+		if (doc) this.flushSlot(slot); // pushed before closeDoc: the engine applies it first
 		if (slot.timer !== null) this.deps.clock.clearTimer(slot.timer);
 		slot.timer = null;
 		slot.seq++;
@@ -574,7 +564,7 @@ export class BindingManager {
 		Object.assign(slot, { binding: null, client: null, unintercept: null, doc: null, attachDoc: null, attachPosted: false, state: "idle" });
 		if (!doc) return;
 		doc.slots.delete(slot);
-		if (sendClose && this.running) this.deps.link.post({ t: "closeDoc", docId: doc.docId, viewId: slot.viewId });
+		if (this.running) this.deps.link.post({ t: "closeDoc", docId: doc.docId, viewId: slot.viewId });
 		if (doc.slots.size === 0) this.docs.delete(doc.docId);
 	}
 
@@ -584,7 +574,7 @@ export class BindingManager {
 		if (!doc) return;
 		this.stats.resyncs++;
 		if (base && !this.bases.has(doc.docId)) this.bases.set(doc.docId, base);
-		this.unbindSlot(slot, true);
+		this.unbindSlot(slot);
 		void this.open(slot);
 	}
 

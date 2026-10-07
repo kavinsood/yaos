@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import vm from "node:vm";
 import { BUNDLE_FUNCTION_NAME, workerScript, workerScriptFrom } from "./bundleSource";
 
-test("outside the built bundle there is no worker script (inline carrier)", () => {
+test("outside the built bundle there is no worker script (the plugin cannot start its worker)", () => {
 	assert.equal(workerScript(), null);
 });
 

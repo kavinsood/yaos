@@ -1,14 +1,12 @@
 /**
  * YAOS plugin entry (main thread). Wires the Obsidian adapters, the engine
- * carriers (Blob-URL worker started from this bundle's own source, see
- * bundleSource.ts; inline fallback), the HostRuntime (through YaosController)
- * and the UI. The inline carrier runs the same composed engine as the worker
- * (engine/adapters/webEngine.ts) on the main thread. Loaded through entry.ts.
+ * carrier (a Blob-URL worker started from this bundle's own source, see
+ * bundleSource.ts), the HostRuntime (through YaosController) and the UI.
+ * The engine only ever runs in that worker: when it cannot start or dies,
+ * the runtime stops and says why (engineHost.ts). Loaded through entry.ts.
  */
 
 import { Notice, Platform, Plugin } from "obsidian";
-import { createWebEngine } from "../engine/adapters/webEngine";
-import { createInlinePair } from "../protocol/inlineTransport";
 import { createWorkerHostTransport, type WorkerLike } from "../protocol/workerTransport";
 import { workerScript } from "./bundleSource";
 import { codeMirrorEditors, collabExtension } from "./collab";
@@ -36,10 +34,13 @@ function resumedEnrollmentNotice(r: ResumedEnrollment | null): void {
 	if (r?.ok && r.replaced) retireDeviceEnrollment(r.replaced, { request: obsidianRequest }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
 }
 
-function workerCarrier(): EngineCarrier | null {
-	if (typeof Worker === "undefined" || typeof Blob === "undefined" || typeof URL.createObjectURL !== "function") return null;
+/** The engine's carrier. Throws, with the reason, when the worker cannot be built (terminal: EngineHost). */
+function workerCarrier(): EngineCarrier {
+	if (typeof Worker === "undefined" || typeof Blob === "undefined" || typeof URL.createObjectURL !== "function") {
+		throw new Error("this app cannot run background workers (Worker or Blob URLs are unavailable)");
+	}
 	const script = workerScript();
-	if (script === null) return null;
+	if (script === null) throw new Error("the plugin's main.js is not the YAOS bundle, so it cannot start its background worker");
 	let url: string | null = null;
 	try {
 		url = URL.createObjectURL(new Blob([script], { type: "text/javascript" }));
@@ -54,23 +55,10 @@ function workerCarrier(): EngineCarrier | null {
 				URL.revokeObjectURL(u);
 			},
 		};
-	} catch {
+	} catch (error) {
 		if (url) URL.revokeObjectURL(url);
-		return null;
+		throw new Error(`creating the background worker failed: ${errorMessage(error)}`);
 	}
-}
-
-function inlineCarrier(): EngineCarrier {
-	const pair = createInlinePair();
-	const handle = createWebEngine(pair.engine, "inline");
-	return {
-		kind: "inline",
-		transport: pair.host,
-		dispose: () => {
-			handle.dispose();
-			pair.host.close();
-		},
-	};
 }
 
 export default class YaosPlugin extends Plugin {
@@ -100,8 +88,7 @@ export default class YaosPlugin extends Plugin {
 			makeRuntime: (identity, settings, ui, keys) =>
 				(live = new HostRuntime({
 					clock, vault, configDir, sideFiles, workspace, platform, identity, settings, ui, keys,
-					createWorker: workerCarrier,
-					createInline: inlineCarrier,
+					createCarrier: workerCarrier,
 					log: (line) => console.debug(`[yaos] ${line}`),
 				})),
 			saveData: (d) => this.saveData(d),

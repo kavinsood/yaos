@@ -21,7 +21,8 @@ const BROWSER_GLOBALS = [
 /**
  * The main thread holds CodeMirror state and raw disk I/O only (DESIGN §d.2): no CRDT package anywhere under
  * host/** (tests and type-only imports included), and none reachable from host/** through core/ports/protocol.
- * The engine reaches main only through the two documented entries (integration-notes D2).
+ * The engine never runs on main: the bundle's one engine entry is host/entry.ts -> engine/workerMain, taken only
+ * when main.js runs as the worker script (integration-notes D2).
  */
 export const MAIN_FORBIDDEN = ["yjs", "y-codemirror.next", "y-protocols", "lib0"];
 /**
@@ -31,7 +32,14 @@ export const MAIN_FORBIDDEN = ["yjs", "y-codemirror.next", "y-protocols", "lib0"
  */
 export const MAIN_FORBIDDEN_DIRS = ["core/hash"];
 const isMainForbiddenPath = (p) => MAIN_FORBIDDEN_DIRS.some((d) => p === d || p.startsWith(`${d}/`));
-const ENGINE_ENTRIES = new Set(["engine/adapters/webEngine", "engine/workerMain"]);
+/** The one host -> engine edge: the bundle entry starts the worker's engine (main.js is also the worker script). */
+const WORKER_ENTRY = { from: "host/entry.ts", to: "engine/workerMain" };
+const isWorkerEntry = (from, target) => from === WORKER_ENTRY.from && target === WORKER_ENTRY.to;
+/**
+ * The in-process carrier: tests, the sim and harnesses only. The plugin's one carrier is the worker (DESIGN §g.5),
+ * so no product host/** module may import it, directly or through core/ports/protocol.
+ */
+export const INLINE_TRANSPORT = "protocol/inlineTransport";
 
 /** Throwaway day-1 spike plugin (scripts/build-spike.mjs): its own bundle, never imported by the product. */
 const isSpike = (f) => f.startsWith("host/spike/");
@@ -51,7 +59,7 @@ export const FULL_READS = [
 /** file -> pattern -> [count, why]. */
 export const FULL_READ_ALLOW = {
 	"host/binding.ts": {
-		"sliceString()": [1, "bind upload (attach, resync, restart): TEXT_CHUNK_UNITS-unit slices of the editor Text, one chunk per macrotask, transferred"],
+		"sliceString()": [1, "bind upload (attach, resync): TEXT_CHUNK_UNITS-unit slices of the editor Text, one chunk per macrotask, transferred"],
 	},
 	"host/ui/pairing.ts": { "toString()": [1, "URLSearchParams of the pairing link, not a document"] },
 	"host/ui/pairFlow.ts": { "toString()": [1, "a number (countdown seconds)"] },
@@ -159,6 +167,10 @@ export function checkSource(file, text) {
 				err(line, `the spike plugin is not part of the product: ${spec}`);
 				continue;
 			}
+			if (area === "host" && !test && !isSpike(file) && target === INLINE_TRANSPORT) {
+				err(line, `no engine on the main thread: host/** must not import ${spec} (the in-process carrier is for tests, the sim and harnesses; the plugin's one carrier is the worker)`);
+				continue;
+			}
 			if (test || area === "sim") continue;
 			checkInternal(file, area, target, tArea, typeOnly, spec, line, err, warn);
 		} else {
@@ -207,11 +219,10 @@ function checkInternal(file, area, target, tArea, typeOnly, spec, line, err, war
 		case "host":
 			if (["core", "ports", "protocol", "host"].includes(tArea)) return;
 			if (tArea === "engine") {
-				// Deviations from DESIGN §k.2 (integration-notes D2): the inline-fallback entry is the composed web
-				// engine, and the bundle entry starts the worker's engine (main.js is also the worker script).
-				if (target === "engine/adapters/webEngine") return;
-				if (target === "engine/workerMain" && file === "host/entry.ts") return;
-				return err(line, `host/** may import from engine/ only engine/adapters/webEngine.ts (and host/entry.ts engine/workerMain.ts): ${spec}`);
+				// DESIGN §k.2: the bundle entry starts the worker's engine (main.js is also the worker script). Nothing else
+				// on main imports the engine: it never runs on the UI thread.
+				if (isWorkerEntry(file, target)) return;
+				return err(line, `no engine on the main thread: host/** may import from engine/ only host/entry.ts -> engine/workerMain.ts (the worker's entry): ${spec}`);
 			}
 			return err(line, `host/** must not import ${tArea}/**: ${spec}`);
 		default:
@@ -245,16 +256,17 @@ function walk(dir, out) {
 }
 
 /**
- * Transitive MAIN_FORBIDDEN check: from every product host/** module, follow relative imports (not into the
- * engine entries) and fail on a CRDT package import, or an import of a MAIN_FORBIDDEN_DIRS module, anywhere along
- * the way. `sources`: src-relative path -> text.
+ * Transitive main-thread check: from every product host/** module, follow relative imports (not into the worker
+ * entry) and fail on a CRDT package import, an import of a MAIN_FORBIDDEN_DIRS module, of INLINE_TRANSPORT, or of
+ * any engine/** module other than host/entry.ts -> engine/workerMain, anywhere along the way (direct imports are
+ * checkSource's). `sources`: src-relative path -> text.
  */
 export function mainReach(sources) {
 	const errors = [];
 	const memo = new Map();
 	const resolve = (from, spec) => {
 		const r = resolveRel(from, spec);
-		if (r.outside || ENGINE_ENTRIES.has(r.path)) return null;
+		if (r.outside || areaOf(r.path) === "engine") return null;
 		return [`${r.path}.ts`, `${r.path}/index.ts`].find((c) => sources.has(c)) ?? null;
 	};
 	const via = (mod, stack) => {
@@ -267,7 +279,8 @@ export function mainReach(sources) {
 				if (MAIN_FORBIDDEN.includes(pkgName(spec))) found = [mod, spec];
 			} else {
 				const r = resolveRel(mod, spec);
-				if (!r.outside && isMainForbiddenPath(r.path)) {
+				const engine = !r.outside && areaOf(r.path) === "engine" && !isWorkerEntry(mod, r.path);
+				if (!r.outside && (isMainForbiddenPath(r.path) || r.path === INLINE_TRANSPORT || engine)) {
 					found = [mod, r.path];
 				} else {
 					const next = resolve(mod, spec);

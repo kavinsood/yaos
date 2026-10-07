@@ -8,14 +8,17 @@
 //      window.eval of `(function anonymous(require,module,exports){...})`)
 //      against a stub "obsidian" (real @codemirror/* from node_modules: they are
 //      external), the default export extends Plugin, and onload() against an
-//      in-memory vault (src/sim/fakeObsidian.ts) with a paired identity reaches
-//      phase "running", registers the editor extension / settings tab / status
-//      bar, never logs the device token, and onunload() stops it. Twice:
-//      a. inline carrier: no `Worker` (node), so the host runs the engine on main;
+//      in-memory vault (src/sim/fakeObsidian.ts) with a paired identity
+//      registers the editor extension / settings tab / status bar, never logs
+//      the device token, and onunload() stops it. Twice:
+//      a. no `Worker` (node): the engine never runs. Run phase "failed" with
+//         the reason, the "YAOS stopped" notice, no worker, no status snapshot
+//         and no IndexedDB database (nothing ran the engine on main);
 //      b. worker carrier: a `Worker` (SmokeWorker, a real thread) is available;
 //         the host builds the worker from main.js's own source, the worker
-//         answers the startup ping and init, and its script is exactly
-//         main.js's bundle wrapper (no second engine copy anywhere).
+//         answers the startup ping and init, the run reaches phase "running",
+//         and its script is exactly main.js's bundle wrapper (no second engine
+//         copy anywhere).
 import esbuild from "esbuild";
 import { strFromU8, unzipSync } from "fflate";
 import { readFileSync } from "node:fs";
@@ -27,6 +30,8 @@ const ROOT = new URL("..", import.meta.url).pathname;
 const nodeRequire = createRequire(new URL("../package.json", import.meta.url));
 const PLUGIN_ID = "yaos";
 const TOKEN = "smoke_token_0123456789abcdefghijklmnopqrstuvwxyz";
+/** The run's lastError without a Worker (plugin.ts workerCarrier via engineHost.ts start). */
+const NO_WORKER_ERROR = "the sync engine could not start: this app cannot run background workers";
 /** Strings that exist once per copy of the engine: yjs's import guard, the IDB adapter, the protocol engine. */
 const ENGINE_MARKERS = ["__ $YJS$ __", "createIdbStoragePort: IndexedDB is not available", "already initialized"];
 
@@ -70,6 +75,7 @@ function checkEngineOnce(mainJs) {
 	}
 }
 
+/** carrier "worker": SmokeWorker is the global Worker; "none": no Worker at all (the engine must not start). */
 async function smokePlugin(mainJs, manifest, carrier) {
 	const saved = {
 		notices: [],
@@ -105,7 +111,7 @@ async function smokePlugin(mainJs, manifest, carrier) {
 	if (carrier === "worker") {
 		SmokeWorker.base = `${ROOT}package.json`;
 		g.Worker = SmokeWorker;
-	} else if (typeof g.Worker !== "undefined") fail("node has a global Worker; the inline smoke needs none");
+	} else if (typeof g.Worker !== "undefined") fail("node has a global Worker; the no-Worker smoke needs none");
 	const logged = [];
 	const origDebug = console.debug;
 	g.document = eventTarget({ visibilityState: "visible", hidden: false });
@@ -125,8 +131,16 @@ async function smokePlugin(mainJs, manifest, carrier) {
 		const state = () => `${JSON.stringify(ctl.runState())}; log: ${logged.slice(-8).join(" | ").replaceAll(TOKEN, "<token>")}`;
 		await waitUntil(() => ctl.runState().phase === "running" || ctl.runState().phase === "failed", 10_000, () => `engine running on ${carrier} (${state()})`);
 		const rs = ctl.runState();
-		if (rs.phase !== "running" || rs.transport !== carrier) fail(`${carrier}: run state ${state()}`);
-		await waitUntil(() => ctl.status() !== null, 3000, "status snapshot");
+		if (carrier === "worker") {
+			if (rs.phase !== "running" || rs.transport !== carrier) fail(`${carrier}: run state ${state()}`);
+			await waitUntil(() => ctl.status() !== null, 3000, "status snapshot");
+		} else {
+			if (rs.phase !== "failed" || !rs.lastError?.includes(NO_WORKER_ERROR)) fail(`no Worker: run state ${state()} (expected failed: ${NO_WORKER_ERROR})`);
+			if (!saved.notices.some((n) => n.startsWith("YAOS stopped: ") && n.includes(NO_WORKER_ERROR))) fail(`no Worker: no "YAOS stopped" notice (${JSON.stringify(saved.notices)})`);
+			if (ctl.status() !== null) fail("no Worker: an engine reported status");
+			const dbs = await g.indexedDB.databases();
+			if (dbs.length !== 0) fail(`no Worker: IndexedDB databases opened on main: ${dbs.map((d) => d.name).join(",")}`);
+		}
 		if (g.document.listeners("visibilitychange") === 0 || g.window.listeners("pagehide") === 0) fail("lifecycle listeners not attached");
 		const scripts = workerScripts.slice(scriptsBefore);
 		await plugin.onunload();
@@ -156,8 +170,8 @@ export async function smokeCheck({ mainJs, zipPath, manifest, bundleFunctionName
 	checkEngineOnce(mainJs);
 	const wrapper = wrapperSource(mainJs, bundleFunctionName);
 
-	const inline = await smokePlugin(mainJs, manifest, "inline");
-	if (inline.scripts.length !== 0) fail("inline smoke started a worker");
+	const none = await smokePlugin(mainJs, manifest, "none");
+	if (none.scripts.length !== 0) fail("no-Worker smoke started a worker");
 	const worker = await smokePlugin(mainJs, manifest, "worker");
 	if (worker.scripts.length !== 1) fail(`worker smoke started ${worker.scripts.length} workers (expected 1)`);
 	const script = worker.scripts[0];
@@ -165,6 +179,6 @@ export async function smokeCheck({ mainJs, zipPath, manifest, bundleFunctionName
 	if (occurrences(script, ENGINE_MARKERS[0]) !== 1) fail("worker script carries more than one engine");
 	console.log(
 		`plugin smoke: OK  zip layout, no WASM, engine once (${ENGINE_MARKERS.length} markers x1), ` +
-			`onload -> running/inline -> unload (${inline.commands} commands), onload -> running/worker (script = main.js wrapper, ${(script.length / 1024).toFixed(1)} KiB) -> unload`,
+			`no Worker: onload -> failed ("YAOS stopped", no engine on main) -> unload (${none.commands} commands), onload -> running/worker (script = main.js wrapper, ${(script.length / 1024).toFixed(1)} KiB) -> unload`,
 	);
 }

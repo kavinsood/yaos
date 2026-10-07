@@ -1,39 +1,42 @@
 /**
  * EngineHost: owns the engine carrier (DESIGN §g.1, §g.4, §g.5).
  *
- * - Startup probe: construct the Blob-URL worker, ping (pong within 5 s), then
- *   init. No pong, a worker error, or a storage failure in init (IDB not
- *   usable inside the worker, risk OR-1) => fall back to the inline engine.
+ * - One carrier per host, from `createCarrier`: the Blob-URL worker in the
+ *   plugin (plugin.ts), an in-process pair in tests and harnesses. Startup:
+ *   ping (pong within STARTUP_PING_TIMEOUT_MS), then init.
  * - Liveness: ping every PING_INTERVAL_MS; no pong within PING_TIMEOUT_MS =>
- *   restart. Transport failure => restart. More than MAX_WORKER_RESTARTS
- *   restarts within 10 minutes => inline from then on.
- * - Every carrier instance has a generation; messages and request answers of
- *   an old generation are ignored. Pending requests are rejected with
- *   "aborted" when the carrier goes away.
- * - `fatal` from the engine and TERMINAL_ERROR_CODES stop the host (no retry).
+ *   the engine is dead.
+ * - Every carrier failure is terminal (§g.4): the carrier cannot be built,
+ *   misses the startup pong, errors or its transport fails, misses a liveness
+ *   pong, or init fails (storage-lost included); so are `fatal` from the
+ *   engine and a protocol-version mismatch. The host stops: pending requests
+ *   are rejected with "aborted", onFatal reports why, once, and no second
+ *   carrier is ever built (nothing restarts it, nothing runs the engine on the
+ *   UI thread). A new engine is a new host: the user's restart or a reload.
+ * - Once the carrier is torn down, its late messages and request answers are
+ *   ignored.
  */
 
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { ProtocolError } from "../protocol/errors";
-import { TERMINAL_ERROR_CODES } from "../protocol/errors";
 import type { EngineInitConfig, EngineResultValue, EngineToMain, MainResultValue, MainToEngine } from "../protocol/messages";
 import { PROTOCOL_VERSION } from "../protocol/messages";
 import type { HostTransport } from "../protocol/transport";
-import { MAX_WORKER_RESTARTS, PING_INTERVAL_MS, PING_TIMEOUT_MS } from "../protocol/transport";
+import { PING_INTERVAL_MS, PING_TIMEOUT_MS } from "../protocol/transport";
 import { transferablesOf, TransferOwnershipError, wipeSecrets } from "../protocol/workerTransport";
 
 export const STARTUP_PING_TIMEOUT_MS = 5_000;
 export const INIT_TIMEOUT_MS = 120_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
-export const RESTART_WINDOW_MS = 10 * 60_000;
 const SHUTDOWN_TIMEOUT_MS = 3_000;
 
+/** "inline": the in-process pair of tests and harnesses (protocol/inlineTransport.ts); the plugin runs "worker" only. */
 export type CarrierKind = "worker" | "inline";
 
 export interface EngineCarrier {
 	readonly kind: CarrierKind;
 	readonly transport: HostTransport;
-	/** Terminate the worker / dispose the inline engine. Idempotent. */
+	/** Terminate the worker / dispose the in-process engine. Idempotent. */
 	dispose(): void;
 }
 
@@ -53,23 +56,20 @@ export class HostRequestError extends Error {
 export interface EngineHostHandlers {
 	onEvent(message: EngineEventMessage): void;
 	onRequest(message: EngineRequestMessage): Promise<MainResultValue>;
-	/** Engine answered init. `restart` = not the first start. */
-	onReady(info: { readonly carrier: CarrierKind; readonly ready: Extract<EngineResultValue, { t: "ready" }>; readonly restart: boolean }): void;
-	/** Carrier lost (before a restart). */
-	onDown(reason: string): void;
+	/** Engine answered init. */
+	onReady(info: { readonly carrier: CarrierKind; readonly ready: Extract<EngineResultValue, { t: "ready" }> }): void;
+	/** The host stopped for good (every carrier failure, `fatal` from the engine); called at most once. */
 	onFatal(error: ProtocolError): void;
 }
 
 export interface EngineHostDeps {
 	readonly clock: ClockPort;
-	/** null when Worker / Blob URLs are unavailable. */
-	readonly createWorker: () => EngineCarrier | null;
-	readonly createInline: () => EngineCarrier;
-	/** Built per start (side files re-read, device class depends on the carrier). */
-	readonly initConfig: (carrier: CarrierKind, workerSupported: boolean) => Promise<EngineInitConfig>;
+	/** The one carrier of this host. Throws (with the reason) when it cannot be built: terminal. */
+	readonly createCarrier: () => EngineCarrier;
+	/** Built per start (side files re-read, keys loaded fresh). */
+	readonly initConfig: () => Promise<EngineInitConfig>;
 	readonly handlers: EngineHostHandlers;
 	readonly pingEnabled?: boolean;
-	readonly forceInline?: boolean;
 	readonly log?: (line: string) => void;
 }
 
@@ -80,7 +80,6 @@ interface Pending {
 }
 
 interface Live {
-	readonly gen: number;
 	readonly carrier: EngineCarrier;
 	readonly pending: Map<number, Pending>;
 	nextRid: number;
@@ -93,25 +92,18 @@ function protocolError(code: ProtocolError["code"], message: string, retryable =
 	return { code, message, retryable };
 }
 
+function messageOf(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 export class EngineHost {
 	private live: Live | null = null;
-	private gen = 0;
-	private restartTimes: number[] = [];
-	private inlineOnly: boolean;
 	private stopped = false;
-	/** Set the moment stop() begins: no restart/bring-up may start a new carrier after this. */
+	/** Set the moment stop() begins: no bring-up may start a carrier after this. */
 	private halting = false;
 	private started = false;
-	private workerSupported = false;
-	private restarting = false;
-	private inlineBackoffMs = 1_000;
-	/** For status/UI and tests. */
-	restarts = 0;
-	lastFallbackReason: string | null = null;
 
-	constructor(private readonly deps: EngineHostDeps) {
-		this.inlineOnly = deps.forceInline ?? false;
-	}
+	constructor(private readonly deps: EngineHostDeps) {}
 
 	get carrierKind(): CarrierKind | null {
 		return this.live?.carrier.kind ?? null;
@@ -129,14 +121,18 @@ export class EngineHost {
 		return this.stopped || this.halting;
 	}
 
-	get probedWorkerSupported(): boolean {
-		return this.workerSupported;
-	}
-
 	async start(): Promise<void> {
 		if (this.started) return;
 		this.started = true;
-		await this.bringUp(false);
+		if (this.down) return;
+		let carrier: EngineCarrier;
+		try {
+			carrier = this.deps.createCarrier();
+		} catch (error) {
+			this.fatal(protocolError("internal", `the sync engine could not start: ${messageOf(error)}`, false));
+			return;
+		}
+		await this.bringUp(carrier);
 	}
 
 	/** Fire-and-forget message; dropped while no ready engine (callers resend state on onReady). */
@@ -170,91 +166,46 @@ export class EngineHost {
 		if (cur) this.teardown(cur, "stopped");
 	}
 
-	/** Test/diagnostic hook: treat the current carrier as failed. */
-	simulateFailure(reason: string): void {
-		const live = this.live;
-		if (live) this.onCarrierFailure(live, reason);
-	}
-
 	// --- internals ------------------------------------------------------------
 
 	private log(line: string): void {
 		this.deps.log?.(line);
 	}
 
-	private async bringUp(restart: boolean): Promise<void> {
-		if (this.down) return;
-		if (!this.inlineOnly) {
-			const worker = this.safeCreateWorker();
-			if (worker) {
-				const outcome = await this.tryStart(worker, restart);
-				if (outcome === "ok" || outcome === "fatal" || this.down) return;
-				this.lastFallbackReason = outcome;
-				this.log(`worker start failed (${outcome}); falling back to inline`);
-				this.inlineOnly = true;
-			} else {
-				this.lastFallbackReason = "worker-unavailable";
-				this.inlineOnly = true;
-			}
-		}
-		const inline = this.deps.createInline();
-		const outcome = await this.tryStart(inline, restart);
-		if (outcome !== "ok" && outcome !== "fatal" && !this.down) {
-			this.log(`inline start failed (${outcome}); retrying in ${this.inlineBackoffMs} ms`);
-			const delay = this.inlineBackoffMs;
-			this.inlineBackoffMs = Math.min(this.inlineBackoffMs * 2, 60_000);
-			this.deps.clock.setTimer(delay, () => void this.bringUp(true));
-		}
-	}
-
-	private safeCreateWorker(): EngineCarrier | null {
-		try {
-			return this.deps.createWorker();
-		} catch (error) {
-			this.log(`worker construction threw: ${error instanceof Error ? error.message : String(error)}`);
-			return null;
-		}
-	}
-
-	/** Returns "ok", "fatal", or a fallback reason. */
-	private async tryStart(carrier: EngineCarrier, restart: boolean): Promise<string> {
+	private async bringUp(carrier: EngineCarrier): Promise<void> {
 		const live = this.attach(carrier);
+		let stage = "startup-ping";
 		try {
-			if (carrier.kind === "worker") {
-				await this.requestOn(live, { t: "ping" }, STARTUP_PING_TIMEOUT_MS);
-				this.workerSupported = true;
-				if (this.abandon(live)) return "superseded";
-			}
-			const config = await this.deps.initConfig(carrier.kind, this.workerSupported);
+			await this.requestOn(live, { t: "ping" }, STARTUP_PING_TIMEOUT_MS);
+			if (this.abandon(live)) return;
+			stage = "init";
+			const config = await this.deps.initConfig();
 			if (this.abandon(live)) {
 				wipeSecrets({ t: "init", rid: 0, config }); // built but never sent: drop the key bytes (§6.3)
-				return "superseded";
+				return;
 			}
 			const ready = await this.requestOn(live, { t: "init", config }, INIT_TIMEOUT_MS);
-			if (ready.t !== "ready") throw new HostRequestError(protocolError("bad-request", `unexpected init answer ${ready.t}`));
+			if (ready.t !== "ready") throw new HostRequestError(protocolError("bad-request", `unexpected init answer ${ready.t}`, false));
 			if (ready.protocolVersion !== PROTOCOL_VERSION) throw new HostRequestError(protocolError("version-mismatch", `engine protocol ${ready.protocolVersion}, host ${PROTOCOL_VERSION}`, false));
-			if (this.abandon(live)) return "superseded";
+			if (this.abandon(live)) return;
 			live.ready = true;
-			this.inlineBackoffMs = 1_000;
 			this.schedulePing(live);
-			this.deps.handlers.onReady({ carrier: carrier.kind, ready, restart });
-			return "ok";
+			this.deps.handlers.onReady({ carrier: carrier.kind, ready });
 		} catch (error) {
-			const perr = error instanceof HostRequestError ? error.error : protocolError("internal", error instanceof Error ? error.message : String(error));
-			if (this.live === live) this.teardown(live, perr.code);
-			if (TERMINAL_ERROR_CODES.includes(perr.code)) {
-				this.fatal(perr);
-				return "fatal";
-			}
-			return `${carrier.kind}:${perr.code}`;
+			if (this.live !== live || this.down) return; // stopped meanwhile, or the carrier's failure already ended the host
+			const perr = error instanceof HostRequestError ? error.error : protocolError("internal", messageOf(error));
+			const message = stage === "startup-ping" && perr.code === "timeout"
+				? `the sync engine did not answer within ${STARTUP_PING_TIMEOUT_MS / 1000} s of starting`
+				: `the sync engine could not start: ${perr.message}`;
+			this.fatal({ code: perr.code, message, retryable: false });
 		}
 	}
 
 	private attach(carrier: EngineCarrier): Live {
-		const live: Live = { gen: ++this.gen, carrier, pending: new Map(), nextRid: 1, ready: false, offs: [], pingTimer: null };
+		const live: Live = { carrier, pending: new Map(), nextRid: 1, ready: false, offs: [], pingTimer: null };
 		this.live = live;
 		live.offs.push(carrier.transport.onMessage((m) => this.onMessage(live, m)));
-		live.offs.push(carrier.transport.onFailure((reason) => this.onCarrierFailure(live, `failure: ${reason}`)));
+		live.offs.push(carrier.transport.onFailure((reason) => this.onCarrierFailure(live, `the sync engine failed: ${reason}`)));
 		return live;
 	}
 
@@ -310,12 +261,12 @@ export class EngineHost {
 			} catch (error) {
 				live.pending.delete(rid);
 				if (pending.timer !== null) this.deps.clock.clearTimer(pending.timer);
-				reject(new HostRequestError(protocolError("internal", error instanceof Error ? error.message : String(error))));
+				reject(new HostRequestError(protocolError("internal", messageOf(error))));
 			}
 		});
 	}
 
-	/** After an await in tryStart: superseded, or stop() began (tear the half-started carrier down). */
+	/** After an await in bringUp: stop() began (tear the half-started carrier down) or the host already ended. */
 	private abandon(live: Live): boolean {
 		if (this.live !== live) return true;
 		if (!this.down) return false;
@@ -333,43 +284,24 @@ export class EngineHost {
 					if (this.live === live) this.schedulePing(live);
 				},
 				(error: unknown) => {
-					if (this.live !== live) return;
+					if (this.live !== live || this.down) return;
 					const code = error instanceof HostRequestError ? error.error.code : "internal";
-					if (code === "timeout") this.onCarrierFailure(live, "ping-timeout");
+					if (code === "timeout") this.onCarrierFailure(live, `the sync engine stopped answering (no pong within ${PING_TIMEOUT_MS / 1000} s)`);
 					else this.schedulePing(live);
 				},
 			);
 		});
 	}
 
-	private onCarrierFailure(live: Live, reason: string): void {
+	/** Worker error, transport failure, missed liveness pong: terminal. */
+	private onCarrierFailure(live: Live, message: string): void {
 		if (this.live !== live || this.down) return;
-		const wasReady = live.ready;
-		this.teardown(live, reason);
-		if (!wasReady) return; // tryStart handles startup failures
-		this.log(`engine down: ${reason}`);
-		this.deps.handlers.onDown(reason);
-		this.restart();
-	}
-
-	private restart(): void {
-		if (this.restarting || this.down) return;
-		this.restarting = true;
-		this.restarts++;
-		const now = this.deps.clock.monotonic();
-		this.restartTimes = this.restartTimes.filter((t) => now - t < RESTART_WINDOW_MS);
-		this.restartTimes.push(now);
-		if (!this.inlineOnly && this.restartTimes.length > MAX_WORKER_RESTARTS) {
-			this.inlineOnly = true;
-			this.lastFallbackReason = "too-many-restarts";
-			this.log("too many worker restarts; switching to inline");
-		}
-		void this.bringUp(true).finally(() => {
-			this.restarting = false;
-		});
+		this.log(message);
+		this.fatal(protocolError("internal", message, false));
 	}
 
 	private fatal(error: ProtocolError): void {
+		if (this.stopped) return;
 		this.stopped = true;
 		const live = this.live;
 		if (live) this.teardown(live, "fatal");
@@ -377,7 +309,7 @@ export class EngineHost {
 	}
 
 	private onMessage(live: Live, m: EngineToMain): void {
-		if (this.live !== live) return; // stale generation
+		if (this.live !== live) return; // torn down
 		switch (m.t) {
 			case "result":
 			case "error": {
