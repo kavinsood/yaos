@@ -141,6 +141,9 @@ export class LogEngine {
 		const repo = o.repo;
 		repo.monotonic = () => c.mono();
 		repo.priorityFn = (r) => ((c.handles?.peek(r.stream)?.bound ?? 0) > 0 ? -10 : defaultPriority(r));
+		repo.onQuarantineFrozen = (recs) => {
+			for (const r of recs) c.frozen(r.stream, r.frozenReason ?? "quarantine", r.cls);
+		};
 		c.repo = repo;
 		c.keyring = await KeyringRuntime.open(c, opts.e2ee);
 		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus);

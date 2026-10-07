@@ -19,7 +19,7 @@ import type { EngineCtx } from "./context";
 
 const isDismissed = (q: QuarantineRecord): boolean => q.detail.startsWith("dismissed:");
 /** Gate failures that depend on this reader's version or keys (envelope isReaderDependent). */
-const READER_DEPENDENT: ReadonlySet<QuarantineRecord["reason"]> = new Set(["envelope-version", "crypto-unknown-key", "crypto-auth", "keyring-hold"]);
+export const READER_DEPENDENT: ReadonlySet<QuarantineRecord["reason"]> = new Set(["envelope-version", "crypto-unknown-key", "crypto-auth", "keyring-hold"]);
 
 interface Regated {
 	readonly pass: TailRecord[];
@@ -56,6 +56,7 @@ async function release(c: EngineCtx, stream: StreamName, pass: readonly TailReco
 		if (pass.length > 0) await c.docs.applyToHandle(h, pass);
 		c.docs.checkDoc(h);
 	}
+	c.noteBodyChange([stream]); // passed rows to project; a view waiting on the frozen doc binds (compose checkBindable)
 	c.sess.scheduleCatchUp();
 	c.scheduleStatus();
 }

@@ -165,6 +165,8 @@ export class Repo {
 	/** meta frameNoFloor (epoch migration, e2ee-design §8.2); read at open. */
 	frameNoFloor: FrameNoFloor = { ns: 0, cfg: 0 };
 	priorityFn: PriorityFn = defaultPriority;
+	/** Streams a quarantine record just froze (tLive / tReadPage, after the commit): the engine retargets their views (§d.6). */
+	onQuarantineFrozen: (recs: readonly StreamRecord[]) => void = () => undefined;
 	/** Monotonic clock for the cursor gap timer. */
 	monotonic: () => number = () => 0;
 	/** Name of the §e.2 transaction running on the serial queue (crash tests label commits with it). */
@@ -400,6 +402,7 @@ export class Repo {
 			const tailPut: TailRecord[] = [];
 			const duty = new Set(this.ckptDuty);
 			let dutyChanged = false;
+			const froze = new Set<StreamName>();
 			const res = await this.db.tx([STORE.outbox, STORE.tail, STORE.quarantine, STORE.streams, STORE.meta], "readwrite", async (tx) => {
 				const getRec = async (stream: StreamName): Promise<Mut<StreamRecord>> => {
 					let r = recs.get(stream);
@@ -457,9 +460,7 @@ export class Repo {
 							r.rowsSinceRemoteCheckpoint++;
 							r.bytesSinceRemoteCheckpoint += it.row.content.length;
 						}
-					} else {
-						await putQuarantine(tx, r, it.rec);
-					}
+					} else if (await putQuarantine(tx, r, it.rec)) froze.add(stream);
 					// An own row this store never receipted (an earlier store, lost with IDB) is remote here: its text
 					// is not known to be on disk.
 					if (deviceId !== self || seq > r.lastOwnSeq) {
@@ -493,6 +494,7 @@ export class Repo {
 			this.cursor.commit(seqs, res, this.monotonic());
 			for (const r of recs.values()) this.cache.set(r.stream, r);
 			if (dutyChanged) this.ckptDuty = duty;
+			if (froze.size > 0) this.onQuarantineFrozen([...froze].map((s) => recs.get(s)!));
 			return { vaultSeq: res, streams: recs, removed, updated, renamed, tailPut };
 		});
 	}
@@ -540,6 +542,7 @@ export class Repo {
 			const updated: OutboxRecord[] = [];
 			const renamed: OutboxRename[] = [];
 			const tailPut: TailRecord[] = [];
+			let froze = false;
 			const out = await this.db.tx([STORE.tail, STORE.quarantine, STORE.outbox, STORE.streams, STORE.snapshots, STORE.meta], "readwrite", async (tx) => {
 				const r: Mut<StreamRecord> = { ...((await tx.get(STORE.streams, input.stream)) ?? newStreamRecord(input.stream, nowMs)) };
 				if (input.freshSnapshot && input.freshSnapshot.coversSeq > r.snapshotCoversSeq) {
@@ -564,7 +567,7 @@ export class Repo {
 					r.remoteHeadSeq = Math.max(r.remoteHeadSeq, row.seq);
 				}
 				for (const q of input.quarantines) {
-					await putQuarantine(tx, r, q);
+					if (await putQuarantine(tx, r, q)) froze = true;
 					r.remoteHeadSeq = Math.max(r.remoteHeadSeq, q.seq);
 				}
 				for (const lr of input.lateReceipts) {
@@ -594,6 +597,7 @@ export class Repo {
 				return r;
 			});
 			this.cache.set(out.stream, out);
+			if (froze) this.onQuarantineFrozen([out]);
 			return { stream: out, removed, updated, renamed, tailPut };
 		});
 	}
@@ -873,13 +877,16 @@ async function putTail(tx: Tx, r: Mut<StreamRecord>, row: TailRecord): Promise<b
 	return true;
 }
 
-async function putQuarantine(tx: Tx, r: Mut<StreamRecord>, q: QuarantineRecord): Promise<void> {
+/** Returns true when this record froze the stream (it was not frozen). */
+async function putQuarantine(tx: Tx, r: Mut<StreamRecord>, q: QuarantineRecord): Promise<boolean> {
 	// quarantinedRows counts undismissed records (a dismissed record re-quarantined by a re-read counts again).
 	const existing = await tx.get(STORE.quarantine, [q.stream, q.seq]);
 	tx.put(STORE.quarantine, q);
 	if (existing === undefined || existing.detail.startsWith("dismissed:")) r.quarantinedRows++;
+	const froze = r.frozen !== 1;
 	r.frozen = 1;
 	r.frozenReason = q.reason;
+	return froze;
 }
 
 async function evictQuarantine(tx: Tx): Promise<void> {

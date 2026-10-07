@@ -338,6 +338,7 @@ export class VaultRuntime {
 		}
 		this.stats.bodyChanges += docIds.length;
 		this.sched.request({ t: "docs", docIds: [...docIds], pathKeys });
+		this.checkBindable(); // a body that arrived or a doc released (quarantineRelease.ts) may bind now
 	}
 
 	/**
@@ -359,6 +360,7 @@ export class VaultRuntime {
 	}
 
 	onFrozen(docId: DocId, reason: string): void {
+		this.port.invalidate(); // view() carries body.frozen: a stale one re-binds the doc (openDoc) and loops on attach
 		if (!this.engine.bound.isBound(docId)) return;
 		this.engine.bound.drop(docId);
 		this.log.unbind(docId);
@@ -492,13 +494,13 @@ export class VaultRuntime {
 		this.postStatus();
 	}
 
-	/** Paths answered `untracked` that the optimistic remote now knows: tell the host. */
+	/** Paths answered `untracked` that the optimistic remote now knows, or a frozen bind whose doc thawed: tell the host. */
 	checkBindable(): void {
 		const waiting = this.engine.bound.waiting;
 		if (waiting.size === 0) return;
 		for (const path of [...waiting]) {
 			const e = ops.bindTarget(this, pathKey(path));
-			if (!e || e.kind === "blob") continue;
+			if (!e || e.kind === "blob" || e.body?.frozen) continue;
 			waiting.delete(path);
 			this.stats.bindable++;
 			this.engine.link.post({ t: "bindable", path });

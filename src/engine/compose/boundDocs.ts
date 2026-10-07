@@ -75,7 +75,7 @@ export function eventWeight(e: BodyEvent): number {
 
 export class BoundDocs {
 	readonly byId = new Map<DocId, BoundDoc>();
-	/** Paths answered `untracked` by openDoc, keyed by the requested path. */
+	/** Paths answered `untracked` by openDoc, or bound `frozen` (the host waits), keyed by the requested path. */
 	readonly waiting = new Set<VaultPath>();
 	private creditUsed = 0;
 	private readonly queues = new Map<DocId, Queue>();
