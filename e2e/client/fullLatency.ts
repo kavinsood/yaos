@@ -14,6 +14,11 @@
  * Metrics: <prefix>_<what>_to_peer_ms and _sender_ms / _relay_ms / _receiver_ms. With e2ee the vault is suite 1
  * through the real plugin controller (a enables encryption, b and c install the key by QR, as e2ee.ts); without,
  * suite 0 (the fixture pin).
+ *
+ * Last, edits made while a uploads a 90 MB attachment (its PUT seen in flight on a's NetSwitch.puts):
+ * disk_edit_during_upload (an external write of a note no editor has open) and typing_during_upload (typing into
+ * a note open on a; b and c have it closed, so the sample ends on their disk). <prefix>_during_upload in the
+ * results holds, per sample, the PUT's duration and whether it was still in flight when the edit arrived.
  */
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 import { makeRecoveryKey } from "../../src/core/codec/recoveryKey";
@@ -150,22 +155,24 @@ export async function lone(R: Report, o: LoneOptions): Promise<void> {
 		}
 		a.vault.userWrite("lone/edit.md", NOTE_LINES("edit"));
 		a.vault.userWrite("lone/typing.md", NOTE_LINES("typing"));
+		a.vault.userWrite("lone/edit-during-upload.md", NOTE_LINES("edit during upload"));
 
 		const m = (what: string) => `${o.prefix}_${what}_to_peer`;
 		/** Converge, wait for the relay to go quiet, act, and time each peer. */
-		const sample = async (act: () => void | Promise<void>, arrive: (p: FullClient, t0: number) => Promise<void>) => {
+		const sample = async (act: () => void | Promise<void>, arrive: (p: FullClient, t0: number) => Promise<unknown>) => {
 			await converge(clients, 120_000, 50);
 			waits.push(await tap.quiet(MARGIN_MS));
 			const t0 = performance.now();
 			await act();
 			await Promise.all(peers.map((p) => arrive(p, t0)));
 		};
-		/** Bytes at `path` on the peer (null = absent), timed at the peer engine's last write of `path`. */
-		const file = (metric: string, path: string, want: Uint8Array | null, writes?: number[]) => async (p: FullClient, t0: number) => {
-			const seen = t0 + await waitFor(async () => sameBytes(await bytesOf(p, path), want), `${path} on ${p.name}`, 120_000, t0, 2);
+		/** Bytes at `path` on the peer (null = absent), timed at the peer engine's last write of `path`; returns that time. */
+		const file = (metric: string, path: string, want: Uint8Array | null, writes?: number[], timeoutMs = 120_000) => async (p: FullClient, t0: number) => {
+			const seen = t0 + await waitFor(async () => sameBytes(await bytesOf(p, path), want), `${path} on ${p.name}`, timeoutMs, t0, 2);
 			const w = tap.diskWrites(p.name, path, t0, seen);
 			writes?.push(w.n);
 			recordSample(R, tap, metric, a.name, p.name, t0, w.last ?? seen, "committed", w.n);
+			return w.last ?? seen;
 		};
 
 		const createWrites: number[] = [];
@@ -231,8 +238,8 @@ export async function lone(R: Report, o: LoneOptions): Promise<void> {
 			});
 		}
 
-		// 25m: well above the old 10 MiB cap (the relay takes up to 100 MB, DECISIONS D9). Last, so only the final
-		// converge fingerprints it.
+		// 25m: well above the old 10 MiB cap (the relay takes up to 100 MB, DECISIONS D9). Attachments last, so only
+		// the converges after them fingerprint (and decode) the big files.
 		const sizes = [["40k", 40 * 1024, 4, "jpg"], ["300k", 300 * 1024, 3, "png"], ["2m", 2 * 1024 * 1024, 2, "pdf"], ["25m", 25 * 1024 * 1024, 1, "mp4"]] as const;
 		for (const [tag, size, n, ext] of sizes) {
 			for (let i = 0; i < n; i++) {
@@ -241,6 +248,62 @@ export async function lone(R: Report, o: LoneOptions): Promise<void> {
 				await sample(() => a.vault.externalWrite(path, bytes), file(m(`attachment_${tag}`), path, bytes));
 			}
 		}
+
+		// Edits while a uploads a 90 MB attachment (the relay takes 100 MB, MAX_BLOB_UPLOAD_BYTES; sealed under
+		// suite 1 that still fits: maxSealedBlobPlaintext(100_000_000) = 98_566_143). Once a's PUT is in flight the
+		// edit is made and timed on each peer; then the attachment must arrive before the next round.
+		const BIG = 90_000_000;
+		const r1 = (ms: number) => Math.round(ms * 10) / 10;
+		const during: Record<string, unknown>[] = [];
+		R.extra[`${o.prefix}_during_upload`] = during;
+		const duringUpload = async (k: number, what: string, act: () => void, arrive: (p: FullClient, t0: number) => Promise<number>) => {
+			const path = `lone/att-90m-${k}.bin`;
+			const bytes = randomBytes(BIG + k, 900 + k);
+			await converge(clients, 300_000, 50);
+			waits.push(await tap.quiet(MARGIN_MS));
+			const tw = performance.now();
+			a.vault.externalWrite(path, bytes);
+			const putOf = () => a.net.puts.find((x) => x.start >= tw && x.bytes >= BIG);
+			await waitFor(() => putOf() !== undefined, `a's PUT of ${path}`, 120_000, tw, 1);
+			const put = putOf()!;
+			const t0 = performance.now();
+			const inFlightAtEdit = put.end === null;
+			act();
+			const done = await Promise.all(peers.map((p) => arrive(p, t0)));
+			const landed = await Promise.all(peers.map((p) => waitFor(async () => (await p.vault.stat(path))?.size === bytes.byteLength && sameBytes(await bytesOf(p, path), bytes),
+				`${path} on ${p.name}`, 600_000, tw, 20)));
+			for (const [j, p] of peers.entries()) {
+				const at = done[j]!;
+				const row = {
+					what, k, peer: p.name, ms: r1(at - t0), putBytes: put.bytes, putMs: put.end === null ? null : r1(put.end - put.start), putOk: put.ok,
+					putStartToEditMs: r1(t0 - put.start), inFlightAtEdit, inFlightAtArrival: put.end === null || put.end > at,
+					arrivalMinusPutEndMs: put.end === null ? null : r1(at - put.end), attachmentOnPeerMs: r1(landed[j]!),
+				};
+				during.push(row);
+				console.log(`  ${o.prefix} ${what} during upload #${k} -> ${p.name}: ${row.ms} ms; a's PUT ${row.putMs} ms (${put.bytes} B), `
+					+ `edit made ${row.putStartToEditMs} ms into it, in flight at arrival: ${row.inFlightAtArrival} (arrival - PUT end: ${row.arrivalMinusPutEndMs} ms)`);
+			}
+		};
+		for (let i = 0; i < 2; i++) {
+			const path = "lone/edit-during-upload.md";
+			const text = `${a.vault.textOf(path)}disk edit during upload ${i}\n`;
+			await duringUpload(i, "disk_edit", () => a.vault.externalWrite(path, text), file(m("disk_edit_during_upload"), path, enc(text), undefined, 600_000));
+		}
+		// Typing: only a has the note open; b and c write it to disk.
+		const vt = a.workspace.openFile("lone/typing.md")!;
+		await waitFor(() => vt.isBound(), "a's typing view bound", 15_000);
+		for (let i = 0; i < 2; i++) {
+			const tok = ` [during upload ${i}]`;
+			await duringUpload(2 + i, "typing", () => vt.edit(vt.buffer.length, 0, tok), async (p, t0) => {
+				const seen = t0 + await waitFor(() => (p.vault.textOf("lone/typing.md") ?? "").includes(tok), `${tok} on ${p.name}`, 600_000, t0, 2);
+				const w = tap.diskWrites(p.name, "lone/typing.md", t0, seen);
+				recordSample(R, tap, m("typing_during_upload"), a.name, p.name, t0, w.last ?? seen, "committed", w.n);
+				return w.last ?? seen;
+			});
+		}
+		await a.workspace.closeView(vt.viewId);
+		R.check("each edit during an upload was made while a's 90 MB PUT was in flight",
+			during.length === 8 && during.every((r) => r.inFlightAtEdit === true), during.map((r) => r.inFlightAtEdit));
 
 		await converge(clients, 120_000);
 		R.check("lone run converged; every sample split at a critical frame",

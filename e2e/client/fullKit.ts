@@ -11,7 +11,8 @@
  *
  * NetSwitch wraps the RelayPort (and the blob port) so a device can go offline: connect answers
  * "unavailable", live sessions drop abruptly (1006) and session RPCs fail like a lost network (src/sim/net.ts).
- * With a WireTap (wireTap.ts) the same wrapper timestamps APPENDs and relay events for the latency breakdown.
+ * With a WireTap (wireTap.ts) the same wrapper timestamps APPENDs and relay events for the latency breakdown;
+ * the blob wrapper records every PUT's start, body size and end (NetSwitch.puts).
  */
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import type { Unsubscribe } from "../../src/ports/common";
@@ -110,10 +111,25 @@ class DroppableSession implements RelaySession {
 	}
 }
 
+/** One BlobPort.put that went through a NetSwitch (performance.now() times). */
+export interface BlobPutRecord {
+	readonly start: number;
+	/** Total bytes of the `parts` argument: the body on the wire (the sealed blob under suite 1). */
+	readonly bytes: number;
+	/** null while the PUT is in flight. */
+	end: number | null;
+	ok: boolean | null;
+}
+
+const partsBytes = (parts: unknown): number =>
+	Array.isArray(parts) ? parts.reduce((n: number, p: unknown) => n + (p instanceof Uint8Array ? p.byteLength : 0), 0) : 0;
+
 export class NetSwitch {
 	online = true;
 	/** Latency timeline hooks (FullClientOptions.tap). */
 	tap: SessionTap | null = null;
+	/** Every blob PUT this client made, oldest first (fullLatency.ts: is an upload in flight?). */
+	readonly puts: BlobPutRecord[] = [];
 	private readonly live = new Set<DroppableSession>();
 
 	wrap(inner: RelayPort): RelayPort {
@@ -133,16 +149,36 @@ export class NetSwitch {
 		};
 	}
 
-	/** Every blob call fails like a network error while offline. */
+	/** Every blob call fails like a network error while offline; puts are recorded in `puts`. All arguments are forwarded. */
 	wrapBlob(inner: BlobPort | null): BlobPort | null {
 		if (!inner) return null;
 		return new Proxy(inner, {
 			get: (t, k, recv) => {
 				const v = Reflect.get(t, k, recv) as unknown;
 				if (typeof v !== "function") return v;
-				return (...a: unknown[]) => (this.online ? (v as (...x: unknown[]) => unknown).apply(t, a) : Promise.reject(netError(`blob ${String(k)}`)));
+				const f = v as (...x: unknown[]) => unknown;
+				return (...a: unknown[]) => {
+					if (!this.online) return Promise.reject(netError(`blob ${String(k)}`));
+					return k === "put" ? this.timedPut(partsBytes(a[1]), () => f.apply(t, a)) : f.apply(t, a);
+				};
 			},
 		});
+	}
+
+	/** Runs one put, recording its start, body size and end. Holds no reference to the parts (only `call` does, until it returns). */
+	private timedPut(bytes: number, call: () => unknown): unknown {
+		const rec: BlobPutRecord = { start: performance.now(), bytes, end: null, ok: null };
+		this.puts.push(rec);
+		const done = (ok: boolean) => { rec.end = performance.now(); rec.ok = ok; };
+		let p: unknown;
+		try {
+			p = call();
+		} catch (e) {
+			done(false);
+			throw e;
+		}
+		Promise.resolve(p).then(() => done(true), () => done(false));
+		return p;
 	}
 
 	setOnline(online: boolean): void {
