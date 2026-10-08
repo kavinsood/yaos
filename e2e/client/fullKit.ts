@@ -2,9 +2,9 @@
  * Full clients for the full-client e2e (fullClients.ts): one HostRuntime per device over the simulated
  * Obsidian surfaces (SimVault, SimWorkspace, SimConfigDir, SimSideFiles, SimPlatform) and the REAL composed
  * engine (createEngine) with the production ports (fullEnginePorts): wsRelay, idbStorage on a per-device
- * fake-indexeddb IDBFactory (kept across restarts), httpBlob when the relay advertises it (else null:
- * attachments ride the log as x: blob chunks), crypto by init.crypto as webEngine.ts picks it (suite 0: the
- * identity adapter; suite 1 and unpinned: webCryptoSuite1), web clock/hash/random. Real timers.
+ * fake-indexeddb IDBFactory (kept across restarts), httpBlob when the relay advertises it (else null: attachments
+ * are not synced, fail closed), crypto by init.crypto as webEngine.ts picks it (suite 0: the identity adapter;
+ * suite 1 and unpinned: webCryptoSuite1), web clock/hash/random. Real timers.
  *
  * The engine runs on an in-process pair (main's event loop: protocol/inlineTransport.ts, harness only), or with
  * `carrier: "worker"` on its own thread as in the plugin (plugin.ts workerCarrier, its only carrier): EngineThread

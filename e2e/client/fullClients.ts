@@ -13,9 +13,9 @@
  *        [--relay-scripts DIR] [--watcher-ms 100] [--lone both|e2ee|none]
  *
  * --relay-scripts: directory with start-local.sh/stop-local.sh for scenario 7 (default: env YAOS_RELAY_DEV_DIR,
- * else this checkout's scripts/relay-dev). --lone: which lone runs (default both; they need attachment storage,
- * start-local.sh --r2). Writes LOG_DIR/client-e2e-full-<label>-<stamp>.json (no secrets) and exits 1 on any
- * failed check.
+ * else this checkout's scripts/relay-dev). --lone: which lone runs (default both). Every run needs the relay's
+ * attachment storage (R2, which start-local.sh binds by default). Writes LOG_DIR/client-e2e-full-<label>-<stamp>.json
+ * (no secrets) and exits 1 on any failed check.
  */
 import { execFileSync } from "node:child_process";
 import { Report } from "./engineKit";

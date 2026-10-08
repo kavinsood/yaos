@@ -7,7 +7,7 @@
  * precedence predicts. All rows of every seed are checked; nothing is sampled.
  *
  * Path: relay payloads are sealed by the suite-1 adapter (createWebCryptoSuite1, testkit K(1), seeded RandomPort),
- * then go through gateRow (src/engine/sync/ingestRow.ts:46, the entry the engine runs on every committed row),
+ * then go through gateRow (src/engine/sync/ingestRow.ts:47, the entry the engine runs on every committed row),
  * then NsRuntime / CfgRuntime.load() over a minimal Repo that holds only the snapshot and the tail
  * (src/engine/sync/foldRuntime.ts:109-163). Every replay authenticates: the AAD binds vaultId, stream, deviceId
  * and clientFrameId (§7.2), and a replay repeats those columns byte for byte. Its gated row carries the recorded

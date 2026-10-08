@@ -1,5 +1,5 @@
 // YAOS spike: E2EE platform probe for the suite-1 design (docs/client-remake/e2ee-design.md).
-// Runs unchanged inside the Blob-URL worker and on the main thread (inline fallback):
+// Runs unchanged inside the Blob-URL worker and on the main thread (the day-1 inline fallback's realm):
 //   getRandomValues; importKey(extractable:false) + exportKey refusal; HKDF (RFC 5869 A.1),
 //   HMAC-SHA-256 (RFC 4231 4.3) and AES-256-GCM (GCM spec test case 16) known answers;
 //   AES-GCM tamper / wrong-AAD / wrong-nonce rejection; a non-extractable CryptoKey stored in

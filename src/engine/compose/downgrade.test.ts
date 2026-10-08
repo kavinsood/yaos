@@ -6,7 +6,7 @@
  * (a) Suite-0 rows injected into a suite-1 vault -> "a. ...". 25 forged rows (ns, cfg, snap, body, canvas;
  *     hostile and genuine deviceIds) plus checkpoints: the gate's stage 1 says crypto-downgrade for every
  *     subject; each of two devices opens all 25 as suite-downgrade; folds, docs, disk, ns/cfg/snap state and a
- *     replay are unchanged. Existing: webCryptoSuite1.test.ts:62, suite1Envelope.test.ts:139,
+ *     replay are unchanged. Existing: webCryptoSuite1.test.ts:61, suite1Envelope.test.ts:146,
  *     suite1Tamper.test.ts:423.
  * (b) Hidden k, key-less join -> "b. ...". 6 join forms (typed code, console link, the same with the protocol
  *     action, plugin link, /mobile-setup QR, resumePendingEnrollment) x 4 vault states (head = 0; head > 0 with
@@ -32,23 +32,23 @@
  *     user-initiated modals and the protocol handler (import graph). Behaviourally: createVault's two choices
  *     send nothing short of "creatable", and a suite=0 link routed through routeSetupLink and applyLinkE2ee into
  *     a suite-1, suite-0 or keyringSeen device is refused on main, with 0 engine pins and 0 writes.
- *     Existing: pin.test.ts:16, pin.test.ts:101, pluginController.test.ts:182.
+ *     Existing: pin.test.ts:17, pin.test.ts:111, pluginController.test.ts:182.
  * (d) Suite-0 link after a genesis -> "d. ...". Live and history genesis x 3 seeds; the server then hides k and
  *     drops the session. parseSetupLink accepts the 4 `suite=0` shapes (§12.4 source (ii)) and rejects the 2
  *     with unknown keys. Every accepted one routes "apply" (routeSetupLink) and applyLinkE2ee's pinSuite0 {link}
  *     is refused (keyring-seen) by main, also after UI writes, a re-pair and a restart. keyringSeen stays saved;
  *     there are 0 writes. Existing: pluginController.test.ts:200, keyReader.test.ts:91, pinGate.test.ts:227,
- *     pin.test.ts:88.
+ *     pin.test.ts:89.
  *     - A restarted engine is not told keyringSeen (e2ee-design.md §18.4 "keyringSeen is not in init.crypto", hostKeys.ts:48), so its own answer
- *       is "ok". The engine never pins: only main does (pluginController.ts:267, :294-299), and main refuses.
+ *       is "ok". The engine never pins: only main does (pluginController.ts:269, :296-301), and main refuses.
  * (e) Creation path -> "e. ...". 5 non-empty vaults (head > 0, or k non-empty) x 3 seeds: never creatable;
  *     enableE2ee and pinSuite0 {create} are refused; no pin, 0 writes. A marker for another vaultId, set before
  *     pairing, while paired, or via a UI write, is ignored. No link reaches the flow: every link class (13
  *     hostile shapes, key-less, suite=0, key, re-key) x 9 device states goes through the protocol handler's
  *     routeSetupLink(parseSetupLink(params)) (registerUi.ts:220-225) to ignore, apply or pair, as §12.4 says;
  *     a pair route enrolls with a key-free /enroll body and attempt, and an apply route sends only pinSuite0
- *     {link} or installKey {qr}, never markCreating. Existing: pinGate.test.ts:243, pin.test.ts:63,
- *     pin.test.ts:29, pluginController.test.ts:295.
+ *     {link} or installKey {qr}, never markCreating. Existing: pinGate.test.ts:243, pin.test.ts:64,
+ *     pin.test.ts:30, pluginController.test.ts:295.
  * (f) Unverified key -> "f. ...". 9 QR/RK keys without a matching k record x 3 seeds x {same engine, restart}:
  *     unpinned, 0 SecretStorage writes, 0 writes, no key bytes left on main. Existing: keyReader.test.ts:114,
  *     pluginController.test.ts:216.
@@ -370,11 +370,11 @@ function hostileServer(requests: Map<string, number>): RequestFn {
 	};
 }
 
-/** The params Obsidian hands registerObsidianProtocolHandler for an obsidian://yaos?... link (registerUi.ts:156). */
+/** The params Obsidian hands registerObsidianProtocolHandler for an obsidian://yaos?... link (registerUi.ts:220). */
 function protocolParams(link: string, action?: string): Record<string, string> {
 	const params: Record<string, string> = {};
 	for (const [k, v] of new URL(link).searchParams) params[k] = v;
-	if (action !== undefined) params.action = action; // Obsidian may report the protocol action instead (pairing.ts:508)
+	if (action !== undefined) params.action = action; // Obsidian may report the protocol action instead (host/ui/pairing.ts:828-830)
 	return params;
 }
 
@@ -587,7 +587,7 @@ async function keylessJoin(form: JoinForm, state: VaultState, seed: number, t: J
 	const initial = form === "resume" ? { ...defaultPluginData("Joiner"), pendingEnrollment: prepareEnrollment(input, randomBytes) } : defaultPluginData("Joiner");
 	const w = controllerWorld(clock, net, initial);
 	const { dev, ctl } = w;
-	// The relay knows the device by its enrolled deviceId (the engine's connect params, net.ts:53): hide k from that id
+	// The relay knows the device by its enrolled deviceId (the engine's connect params, net.ts:97): hide k from that id
 	// from the moment the attempt exists, before any engine connects.
 	const hiddenFrom = new Set<string>();
 	const hideFrom = (deviceId: string) => hideK && (hiddenFrom.add(deviceId), net.relay.hideFrom(deviceId as DeviceId, KEYRING_STREAM));
@@ -598,7 +598,7 @@ async function keylessJoin(form: JoinForm, state: VaultState, seed: number, t: J
 	if (before.head === 0) t.headZero++;
 	else t.headPositive++;
 
-	// Pair the way each form does (pairModal.ts submit; plugin.ts:137-141 for the resume).
+	// Pair the way each form does (pairModal.ts submit; plugin.ts:130-134 for the resume).
 	if (form === "resume") {
 		const r = await settleOn(clock, resumePendingEnrollment({ data: () => ctl.data(), updateData: (m) => ctl.updateData(m) }, { request, randomBytes }));
 		assert.ok(r.ok && r.value?.ok === true, `resume ${state}`);
@@ -819,8 +819,8 @@ test("c. the pin never comes from the server: over every key-less join, 0 suite-
 	// Static: every path that can set a pin, counted in the shipped sources (comments stripped; tests, testkits, spike out).
 	const census = pinCensus();
 	assert.deepEqual(census, {
-		// pluginController.ts: onStatus keyringSeen (:189), pinAfter (:296, only after an engine "ok" to pinSuite0 /
-		// enableE2ee that main let through), keyringStored (:309), markCreating (:348).
+		// pluginController.ts: onStatus keyringSeen (:190), pinAfter (:297, only after an engine "ok" to pinSuite0 /
+		// enableE2ee that main let through), keyringStored (:310), markCreating (:349).
 		"call:sawKeyring": { "host/pluginController.ts": 1 },
 		"call:pinnedSuite0": { "host/pluginController.ts": 1 },
 		"call:pinnedSuite1": { "host/pluginController.ts": 2 },
@@ -831,7 +831,7 @@ test("c. the pin never comes from the server: over every key-less join, 0 suite-
 		"e2ee-write": { "host/keys/pin.ts": 3, "host/ui/api.ts": 1, "host/ui/keyActions.ts": 1 },
 		"creating-write": { "host/keys/pin.ts": 1 },
 		saveData: { "host/pluginController.ts": 2, "host/plugin.ts": 1 },
-		// plugin.ts:128 wires YaosUiHost.markCreating to main. createVault.ts:117: step 1, after canCreateVault (:114)
+		// plugin.ts:115 wires YaosUiHost.markCreating to main. createVault.ts:117: step 1, after canCreateVault (:114)
 		// and the server's creating response; main's markedCreating still refuses it under a pin for that vault.
 		markCreating: { "host/plugin.ts": 1, "host/ui/createVault.ts": 1 },
 		// createVault.ts:211 enableE2ee and :223 pinSuite0 {create}: only when creationCheck (:206, :221) says
@@ -1079,7 +1079,7 @@ test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refuse
 		count(t.outcomes, `ctl pinSuite0 link=${await outcome(clock, ctl.command({ t: "pinSuite0", source: "link" }))}`);
 		// ... and so does this engine incarnation, which read the genesis before k was hidden (keyReader.ts:229).
 		count(t.outcomes, `engine-direct pinSuite0 link (same incarnation)=${await outcome(clock, w.direct({ t: "pinSuite0", source: "link" }))}`);
-		// The UI cannot clear the sticky flag (pinAcross keeps main's pin fields, pin.ts:140-146).
+		// The UI cannot clear the sticky flag (pinAcross keeps main's pin fields, pin.ts:151-157).
 		await settleOn(clock, ctl.updateData((d) => ({ ...d, e2ee: undefined, deviceLabel: "J2" })));
 		await settleOn(clock, ctl.updateData((d) => ({ ...d, e2ee: { suite: 0 } })));
 		count(t.pins, `after UI writes=${fp(ctl.data().e2ee)}`);
@@ -1134,7 +1134,7 @@ test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refuse
 		"ctl pinSuite0 link after re-pair=refused:keyring-seen": n,
 		"ctl pinSuite0 link after restart=refused:keyring-seen": n,
 		// By design the restarted engine does not know keyringSeen (e2ee-design.md §18.4 "keyringSeen is not in init.crypto"): an engine "ok" sets nothing,
-		// only main pins (pluginController.ts:267 -> pinAfter :294-299), and main refused above.
+		// only main pins (pluginController.ts:269 -> pinAfter :296-301), and main refused above.
 		"engine-direct pinSuite0 link after restart=ok": n,
 		"final=key-missing/suite=null": n,
 		"pinSuite0 {link} that reached an engine through main=0": n,
@@ -1484,7 +1484,7 @@ interface SealTally {
 	genesisOnRelay: boolean;
 }
 
-/** Wraps the seal and sealBlob of the device's raw crypto port (behind gatedCrypto, context.ts:117) once per engine. */
+/** Wraps the seal and sealBlob of the device's raw crypto port (behind gatedCrypto, runtime/context.ts:129) once per engine. */
 function tapSeals(d: SimDevice, t: SealTally, tapped: WeakSet<object>): void {
 	const c = d.vrt?.log.c;
 	if (!c) return;

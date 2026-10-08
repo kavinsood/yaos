@@ -493,12 +493,12 @@ export async function requestPairingCode(
 export const RETIRE_FAILED_MESSAGE = "Could not remove the old server membership. Remove it from the old server console.";
 
 /**
- * Revokes an enrollment that a new pairing has replaced, authenticated by that enrollment's own
- * token: the server revokes the device the token belongs to (relay2 server/src/routes/enroll.ts:391-399).
- * Same request and outcome rule as the old client (adfa7a7:src/main.ts:3439-3473): 200 (revoked) and
- * 401 (the token is already dead) count as done. Anything else, including 202
- * authorization_fence_pending, and network errors throw PairingError(RETIRE_FAILED_MESSAGE); the
- * token never appears in it.
+ * Revokes an enrollment that a new pairing has replaced, authenticated by that enrollment's own token: the
+ * legacy server revoked the token's device (adfa7a7:server/src/routes/enroll.ts:391-399); the relay in server/
+ * has no such route (404, server/src/router.ts:588). Same request and outcome rule as the old client
+ * (adfa7a7:src/main.ts:3439-3473): 200 (revoked) and 401 (the token is already dead) count as done. Anything
+ * else, including 202 authorization_fence_pending, and network errors throw PairingError(RETIRE_FAILED_MESSAGE);
+ * the token never appears in it.
  */
 export async function retireDeviceEnrollment(identity: PairedIdentity, deps: Pick<PairingDeps, "request" | "clock">): Promise<void> {
 	let res: HttpResponse;
@@ -519,13 +519,13 @@ export async function retireDeviceEnrollment(identity: PairedIdentity, deps: Pic
 // Claim and operator routes: "Create a new vault" only (relay-wire §2.2, e2ee-design §15.1)
 // ---------------------------------------------------------------------------
 
-/** D5 operator session cookie name (server/src/router.ts:97). */
+/** D5 operator session cookie name (server/src/router.ts:103). */
 const OPERATOR_COOKIE = "yaos_op";
 /** server/src/config/host.ts:26. */
 const SESSION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
-/** server/src/router.ts:188-191: the trimmed operator recovery key is at least 32 characters. */
+/** server/src/router.ts:194-197: the trimmed operator recovery key is at least 32 characters. */
 const MIN_OPERATOR_KEY_CHARS = 32;
-/** server/src/router.ts:103. */
+/** server/src/router.ts:109. */
 export const MAX_VAULT_NAME_CHARS = 80;
 
 /**
@@ -545,7 +545,7 @@ export interface CreatedVault {
 }
 
 /**
- * `/claim` and the operator routes need JSON and `Origin` equal to the server's origin (server/src/router.ts:153-158,
+ * `/claim` and the operator routes need JSON and `Origin` equal to the server's origin (server/src/router.ts:153-164,
  * DECISIONS D5). Obsidian's requestUrl is not a browser fetch, so the header is sent explicitly. The session token
  * goes in `Cookie`: requestUrl keeps no cookie jar.
  */
@@ -643,7 +643,7 @@ function createdVaultOf(origin: string, json: unknown, vaultId: unknown, codeFie
 }
 
 /**
- * `POST /claim` on an unclaimed server (server/src/router.ts:293-336): makes the first vault and returns its owner
+ * `POST /claim` on an unclaimed server (server/src/router.ts:299-342): makes the first vault and returns its owner
  * code. The response's `obsidianUrl` is ignored: the code is used in memory only (§15.1 step 2). The session cookie
  * it sets is not needed and is ended with operatorLogout.
  */
@@ -662,7 +662,7 @@ export async function claimServer(host: string, operatorKey: string, deps: Pairi
 	return { vault: createdVaultOf(origin, res.json, r.vaultId, "pairingCode"), session };
 }
 
-/** `POST /operator/login` (server/src/router.ts:339-352). */
+/** `POST /operator/login` (server/src/router.ts:345-358). */
 export async function operatorLogin(host: string, operatorKey: string, deps: PairingDeps): Promise<OperatorSession> {
 	const origin = normalizeHost(host);
 	const key = normalizeOperatorKey(operatorKey);
@@ -675,7 +675,7 @@ export async function operatorLogin(host: string, operatorKey: string, deps: Pai
 	return { host: origin, token };
 }
 
-/** `POST /operator/vaults {name}` then `POST /operator/vaults/:id/owner-code` (server/src/router.ts:373-392, :470-488). */
+/** `POST /operator/vaults {name}` then `POST /operator/vaults/:id/owner-code` (server/src/router.ts:379-398, :476-494). */
 export async function operatorCreateVault(session: OperatorSession, name: string, deps: PairingDeps): Promise<CreatedVault> {
 	const origin = session.host;
 	const created = await send(deps, {
@@ -698,12 +698,12 @@ export async function operatorCreateVault(session: OperatorSession, name: string
 	return createdVaultOf(origin, minted.json, vaultId, "pairingCode");
 }
 
-/** `POST /operator/logout` (server/src/router.ts:355-361). Best effort: it never throws, and ends at the deadline. */
+/** `POST /operator/logout` (server/src/router.ts:361-367). Best effort: it never throws, and ends at the deadline. */
 export async function operatorLogout(session: OperatorSession, deps: Pick<PairingDeps, "request" | "clock">): Promise<void> {
 	try {
 		await call(deps, { url: `${session.host}/operator/logout`, method: "POST", headers: operatorHeaders(session.host, session), body: "{}" });
 	} catch {
-		// The session expires on its own (7 days, server/src/config/host.ts:24, router.ts:125-127).
+		// The session expires on its own (7 days, server/src/config/host.ts:24, router.ts:131-133).
 	}
 }
 

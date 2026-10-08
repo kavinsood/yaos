@@ -4,11 +4,11 @@
  * The editor in both is a real @codemirror/state EditorState (Obsidian's editor minus the DOM, whose cost is the
  * same either way); posts are structuredClone'd (postMessage serializes on the sending thread).
  *
- *  - before (6f7129b): a Yjs replica on main bound through y-codemirror.next 0.3.5 with a Y.UndoManager
- *    (host/collab.ts:34-35 at 6f7129b). Keystroke: y-sync update() applies the transaction to the Y.Text
- *    (src/y-sync.js:132-152), the replica update is copied and posted (host/binding.ts:470-498 at 6f7129b). Remote
- *    update: Y.applyUpdate on main (binding.ts:231-239), then y-sync's observer reads event.delta and dispatches
- *    (src/y-sync.js:107-125). Bind: the worker state applied on main plus its toString (binding.ts:380-382).
+ *  - before (6f7129b, where the host/ lines cited here are): a Yjs replica on main bound through y-codemirror.next
+ *    0.3.5 with a Y.UndoManager (host/collab.ts:34-35). Keystroke: y-sync update() applies the transaction to the
+ *    Y.Text (src/y-sync.js:132-152), the replica update is copied and posted (host/binding.ts:470-498). Remote
+ *    update: Y.applyUpdate on main (host/binding.ts:231-239), then y-sync's observer reads event.delta and
+ *    dispatches (src/y-sync.js:107-125). Bind: worker state applied on main plus its toString (host/binding.ts:380-382).
  *  - after: the real BindingManager (host/binding.ts, host/bodyClient.ts) over the EditorState, with the sim
  *    worker (sim/bodyEngine.ts) answering. Keystroke: the transaction's ChangeSet to onLocal, the coalesced push
  *    (toJSON + post), and the confirming entry. Remote update: the entry (fromJSON, mirror apply, rebase, dispatch).

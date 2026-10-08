@@ -7,7 +7,7 @@
  *   POST /vault/:id/blobs/delete        {"ifUploadedBefore":ms,"addresses":[1..100]} -> {"results":[...]} (§11.3.1)
  *
  * The two GC routes share a per-vault request limit (429 too_many_attempts + Retry-After, server/src/vault/host.ts:418-424)
- * and list may answer 503 list_incomplete + Retry-After (server/src/router.ts:651-655). Both are retried here after
+ * and list may answer 503 list_incomplete + Retry-After (server/src/router.ts:652-656). Both are retried here after
  * Retry-After, at most GC_RETRY_ATTEMPTS calls and GC_RETRY_MAX_WAIT_MS per wait; the wait rejects as soon as the
  * caller's signal aborts (engine stop).
  *
@@ -19,7 +19,7 @@
  * blob bytes never ride the relay's sequence log.
  *
  * The address is opaque to the relay (DECISIONS D9): it checks ^[0-9a-f]{64}$
- * and nothing else (no hash check, PUT overwrites; server/src/router.ts:549-552),
+ * and nothing else (no hash check, PUT overwrites; server/src/router.ts:591-594),
  * so it carries CryptoPort.blobAddress as is: the plaintext SHA-256 under
  * suite 0, the keyed address over sealed bytes under suite 1 (e2ee-design
  * §10.1). The exists body's field is named `hashes` on the wire; it carries

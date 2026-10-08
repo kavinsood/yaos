@@ -92,7 +92,7 @@ export class DocRuntime {
 			ytext.observe((ev, tr) => {
 				const hook = this.c.opts.onBoundText;
 				if (h.bound === 0 || !hook) return;
-				// ev.delta walks the text's items (Yjs YText.js:655-721): worker-side cost, main gets O(change) JSON.
+				// ev.delta walks the text's items (yjs 13.6.29 src/types/YText.js:655-839): worker-side cost, main gets O(change) JSON.
 				hook(h.docId, deltaToChanges(ev.delta, ytext.length), ytext.length, boundOrigin(tr.origin));
 			});
 		}

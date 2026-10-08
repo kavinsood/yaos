@@ -1,6 +1,6 @@
 // YAOS day-1 spike plugin entry (throwaway). Answers:
 //   OR-1  does a Blob-URL dedicated worker start on this platform, and does
-//         IndexedDB open inside it? (else: inline/main-thread fallback)
+//         IndexedDB open inside it? (else: the day-1 inline/main-thread fallback, since dropped)
 //   OR-2  how does Obsidian reload an open MarkdownView when its file changes,
 //         and can a per-instance setViewData wrapper intercept it?
 //   E2EE  do getRandomValues, importKey(extractable:false), HKDF, HMAC, AES-GCM
