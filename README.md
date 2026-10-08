@@ -36,19 +36,15 @@ If you want the official, fully managed experience, use Obsidian Sync. If you wa
 </a>
 
 1. **Deploy the server.** Click **Deploy to Cloudflare** above.
-2. **Claim it.** Open the Worker URL and click **Generate a recovery key**.
-   - Save the operator recovery key in your password manager. It is shown only once, and it is the only way to
-     sign in to the console. It cannot be reset.
-   - Tick **I have saved the recovery key**, then click **Claim server**.
-   - Claiming creates your first vault and shows a one-time pairing code with a QR code.
-3. **Install YAOS.** Install the plugin from Obsidian's Community plugins on each device.
-4. **Pair a device.**
+2. **Install YAOS.** Install the plugin from Obsidian's Community plugins on each device.
+3. **Create the vault in Obsidian.** On one device, run **YAOS: Create a new vault** and enter the Worker URL.
+   - On a new server this claims it: save the operator recovery key it shows in your password manager. It is shown
+     only once, and it is the only way to sign in to the console. It cannot be reset.
+   - The vault and its encryption keys are made on this device. The server never makes a vault.
+4. **Pair more devices.** On a device that is already paired, open YAOS settings and choose **Pair another device**.
    - On a phone, scan the QR code and tap **Connect Obsidian**.
-   - On a computer, click **Open in Obsidian**, or open YAOS settings, choose **Pair this device**, and enter the
-     server URL and the code.
+   - On a computer, open YAOS settings, choose **Pair this device**, and enter the server URL and the code.
    - A code works once and expires after 15 minutes.
-5. **Pair more devices.** Click **Pair a device** on the vault in the console. Or, on a device that is already paired,
-   open YAOS settings and choose **Pair another device**.
 
 The operator recovery key opens the server console. It is not a device credential; never paste it into plugin
 settings.
@@ -57,8 +53,10 @@ settings.
 
 - **One operator.** The person who claims the server is its only operator, and the console at the Worker URL is
   theirs. YAOS has no members, invitations or roles. Every paired device can read and change its whole vault.
-- **Vaults.** One server holds any number of vaults. Create them in the console with **Create vault**. Each vault
-  syncs on its own.
+- **Vaults.** One server holds any number of vaults. Create each one in Obsidian with **YAOS: Create a new vault**;
+  the console only lists, restores and deletes them. Each vault syncs on its own.
+- **Lost every device?** **Pair a device** on the vault in the console gives a one-time code for that existing vault.
+  An encrypted vault also needs its recovery key on the device.
 - **Devices.** A device stays paired until you revoke it. **Devices** on a vault lists them.
   - **Revoke** cuts a device off at once: its connections close, and changes it had not yet synced are dropped. To
     use it again, pair it again.

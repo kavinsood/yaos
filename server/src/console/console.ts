@@ -1,7 +1,7 @@
 // Operator console, `GET /` (DECISIONS D5): one static page with inline CSS and JS and no external asset. It calls
 // exactly the D5 operator routes of §2.2 with the D5, D7, D8a and D8b bodies, and maps every documented error code to
-// a plain message. Secrets: the recovery key lives only in a form field until claim or sign-in, a pairing code only in
-// the pairing panel. Neither is logged, sent in a request URL or written to web storage; the session cookie is HttpOnly.
+// a plain message. Secrets: the recovery key lives only in a form field until sign-in, a pairing code only in the
+// pairing panel. Neither is logged, sent in a request URL or written to web storage; the session cookie is HttpOnly.
 //
 // DECISIONS-GAP (response shapes §2.2/D5 leave open; the console reads only these fields and tolerates their absence):
 // - `GET /operator/state` → `{vaults: [{vaultId, name, createdAt?}], pendingRestores: [{vaultId, at}]}`; the banner
@@ -10,12 +10,13 @@
 // - The setup link and the setup QR's URL are built from `location.origin`, not from a response
 //   `host`/`obsidianUrl`/`mobileSetupUrl`, so they always name the server that served the console.
 // - Every non-GET sends `Content-Type: application/json` and a JSON body (`{}` for logout and revoke); GETs send none.
-// - Claim: the key is generated in the page and must be confirmed saved before `/claim` is sent, so a lost 200 cannot
-//   lose it; 0/500/≥502 read as "may have gone through" (D5: a failure after the claim is 503; re-probe and log in).
-// - Create needs a non-empty name (maxlength 80, no server limit is specified). Not a gap: login sends nothing under
-//   32 characters, the §2.2 claim minimum (the generated key is 64 hex).
+// - The console never claims the server or creates a vault: only a client's "Create a new vault" may pin a vault's
+//   encryption (e2ee-design §15.1), so a vault made here could never be opened. An unclaimed server's page only says
+//   to run that command in Obsidian, which sends `/claim` (or `/operator/vaults` on a claimed server) itself and shows
+//   the operator recovery key. The console manages existing vaults: list, devices, owner code, reset, restore, delete.
+// - Not a gap: login sends nothing under 32 characters, the §2.2 claim minimum.
 import { inlineJson, staticPage } from "./page";
-// The page draws the setup QR: in the Worker it cost claim 64 ms and owner-code up to 46 ms of CPU (DECISIONS O12).
+// The page draws the setup QR: in the Worker it cost owner-code up to 46 ms of CPU (DECISIONS O12).
 // The encoder is qrcode-generator's browser build, inlined verbatim as its own nonce script; it only defines the
 // global `qrcode`. wrangler.toml's Text rule makes this import the file's source text; the Node tests alias it to
 // tests/mocks/qrcodeScript.ts.
@@ -23,15 +24,12 @@ import QRCODE_SCRIPT from "qrcode-generator/dist/qrcode.js";
 
 /**
  * Plain messages by error code: every code the operator routes document (§2.2, D3, D5, D7, D8a, D8b, §5 row 2.7), the
- * P1 Worker codes (G8 `internal_error`, `not_implemented`), and the console's own (`network`, `wrong_key`,
- * `claim_unknown`).
+ * P1 Worker codes (G8 `internal_error`, `not_implemented`), and the console's own (`network`, `wrong_key`).
  */
 export const CONSOLE_MESSAGES: Readonly<Record<string, string>> = {
 	network: "Could not reach the server. Check the connection and try again.",
 	unauthorized: "Your session has ended. Sign in again.",
 	wrong_key: "That recovery key does not match this server.",
-	already_claimed: "This server is already claimed. Sign in with its recovery key (if you just claimed it, the key you saved).",
-	claim_unknown: "The claim may have gone through. Keep the key you saved, reload this page and sign in, then use Pair a device on the vault.",
 	// DECISIONS-GAP: D2.1 names an in-memory login-failure limiter but no code; D3's `too_many_attempts` (and any 429).
 	too_many_attempts: "Too many failed attempts. Wait a minute and try again.",
 	confirmation_mismatch: "The typed vault ID does not match this vault. Nothing was changed.",
@@ -81,26 +79,21 @@ img.qr { width: 240px; height: 240px; background: #fff; }
 <noscript><p>The console needs JavaScript.</p></noscript>
 <p id="msg" role="status" aria-live="polite"></p>
 <div id="pair"></div>
-<section id="claim" hidden>
-<h2>Claim this server</h2>
-<p>This server has no operator yet. Claiming makes you its operator and creates your first vault.</p>
-<button id="claim-start">Generate a recovery key</button>
-<div id="claim-step" hidden>
-<p class="warn"><strong>Save this operator recovery key in your password manager now.</strong> It is shown only
-once and is the only way to sign in to this console; nobody can reset it. It is not a device pairing code: never
-paste it into Obsidian.</p>
-<div class="row"><input id="claim-key" class="mono" readonly autocomplete="off" aria-label="Operator recovery key"><button id="claim-copy">Copy</button></div>
-<label class="row"><input id="claim-saved" type="checkbox"> I have saved the recovery key.</label>
-<button id="claim-go" disabled>Claim server</button>
-</div>
+<section id="unclaimed" hidden>
+<h2>Set up this server from Obsidian</h2>
+<p>This server has no operator and no vault yet. Vaults are created in Obsidian, not here: open Obsidian, run
+<strong>YAOS: Create a new vault</strong> and enter this server's address, <span id="origin" class="mono"></span>.
+That device claims the server, shows you the operator recovery key to save, and makes the vault and its keys.
+Other devices then join by scanning a QR code from that device.</p>
+<p>Afterwards, sign in here with the operator recovery key to see your vaults and revoke devices.</p>
 </section>
 <section id="login" hidden>
 <h2>Sign in</h2>
-<p>Paste the operator recovery key you saved when you claimed this server.</p>
+<p>Paste the operator recovery key you saved when Obsidian set up this server.</p>
 <form id="login-form" class="row"><input id="login-key" class="mono" type="password" autocomplete="current-password" aria-label="Operator recovery key"><button>Sign in</button></form>
 </section>
 <div id="main" hidden>
-<div class="row"><input id="new-name" maxlength="80" placeholder="New vault name" aria-label="New vault name"><button id="create">Create vault</button><button id="logout">Sign out</button></div>
+<div class="row"><button id="logout">Sign out</button></div>
 <div id="vaults"></div>
 </div>
 <script nonce="${nonce}">
@@ -124,8 +117,7 @@ function copy(text) {
   navigator.clipboard.writeText(text).then(() => say("Copied.", "ok"), () => say("Copy failed: select the text and copy it by hand.", "err"));
 }
 function show(view) {
-  for (const id of ["claim", "login", "main"]) $(id).hidden = id !== view;
-  if (view !== "claim") $("claim-key").value = "";
+  for (const id of ["unclaimed", "login", "main"]) $(id).hidden = id !== view;
 }
 async function api(method, path, body) {
   const init = { method, headers: {} };
@@ -152,7 +144,7 @@ async function load() {
   show("main");
   const pending = new Map((Array.isArray(r.data.pendingRestores) ? r.data.pendingRestores : []).map((p) => [p.vaultId, p]));
   const vaults = Array.isArray(r.data.vaults) ? r.data.vaults : [];
-  $("vaults").replaceChildren(...(vaults.length ? vaults.map((v) => vaultCard(v, pending.get(v.vaultId))) : [h("p", { textContent: "No vaults yet." })]));
+  $("vaults").replaceChildren(...(vaults.length ? vaults.map((v) => vaultCard(v, pending.get(v.vaultId))) : [h("p", { textContent: "No vaults yet. Create one in Obsidian with YAOS: Create a new vault." })]));
 }
 /** The setup QR: the URL setupQr.ts's buildMobileSetupUrl builds, as the SVG the Worker used to send (O12). */
 function setupQr(code) {
@@ -169,6 +161,7 @@ function showCode(data, label) {
   const link = "obsidian://yaos?" + new URLSearchParams({ action: "setup", host: location.origin, pairingCode: code });
   $("pair").replaceChildren(h("section", { className: "warn" },
     h("h2", { textContent: "Pair a device with " + label }),
+    h("p", { textContent: "This adds a device to the existing vault " + label + "; it does not set up a vault. An encrypted vault also needs its key on the new device: scan a key QR from one of its devices or enter its recovery key." }),
     h("p", { textContent: "One-time pairing code, valid until " + when(data.expiresAt || data.pairingExpiresAt) + ". It is shown only here; reloading removes it." }),
     h("div", { className: "row" }, h("input", { className: "mono", readOnly: true, value: code }), h("button", { textContent: "Copy", onclick: () => copy(code) })),
     h("p", {}, h("a", { href: link, textContent: "Open in Obsidian on this device" })),
@@ -244,28 +237,6 @@ function vaultCard(v, pending) {
         done(r, "Delete vault", label + " is deleted. Its devices can no longer sync.");
       })));
 }
-$("claim-start").onclick = () => {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  $("claim-key").value = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-  $("claim-start").hidden = true;
-  $("claim-step").hidden = false;
-};
-$("claim-copy").onclick = () => copy($("claim-key").value);
-$("claim-saved").onchange = () => { $("claim-go").disabled = !$("claim-saved").checked; };
-$("claim-go").onclick = async () => {
-  $("claim-go").disabled = true;
-  say("Claiming the server…");
-  const r = await api("POST", "/claim", { operatorRecoveryKey: $("claim-key").value });
-  $("claim-go").disabled = false;
-  if (r.status === 200) {
-    show("main");
-    showCode(r.data, r.data.vaultName || "your first vault");
-    say("Server claimed. Pair your first device with the code below.", "ok");
-    return load();
-  }
-  if (r.data.error === "already_claimed") { show("login"); return say(MESSAGES.already_claimed, "err"); }
-  say(r.status === 0 || r.status === 500 || r.status >= 502 ? MESSAGES.claim_unknown : failure("Claim", r), "err");
-};
 $("login-form").onsubmit = async (event) => {
   event.preventDefault();
   const key = $("login-key").value.trim();
@@ -282,21 +253,13 @@ $("logout").onclick = async () => {
   show("login");
   say("Signed out.");
 };
-$("create").onclick = async () => {
-  const name = $("new-name").value.trim();
-  if (!name) return say("Enter a name for the new vault.", "err");
-  const r = await api("POST", "/operator/vaults", { name });
-  if (r.status !== 200) return say(failure("Create vault", r), "err");
-  $("new-name").value = "";
-  say(name + " is created. Use Pair a device to connect Obsidian to it.", "ok");
-  load();
-};
 (async () => {
   const caps = await api("GET", "/api/capabilities");
   if (caps.status !== 200) return say(failure("Reaching the server", caps), "err");
   $("info").textContent = "Server " + caps.data.serverVersion + ", attachments " + (caps.data.attachments ? "on (R2)" : "off");
   if (caps.data.claimed === true) return load();
-  show("claim");
+  $("origin").textContent = location.origin;
+  show("unclaimed");
 })();
 </script>
 </body>

@@ -294,7 +294,7 @@ export class Router {
 	/**
 	 * `POST /claim` (D5): vault init → config claim (operator, vault, session: 3 rows) → owner code. The body and
 	 * response are the legacy ones (§5 row 2.2). A failure after the config claim → 503: the server is claimed, and the
-	 * operator logs in and uses owner-code.
+	 * operator logs in and uses owner-code. Only the client's "Create a new vault" sends it; the console does not.
 	 */
 	private async claim(request: Request, env: WorkerEnv, url: URL): Promise<Response> {
 		const rejected = crossSiteRejection(request, url, true);
@@ -375,7 +375,10 @@ export class Router {
 		return json({ vaults: state.vaults, pendingRestores: state.pendingRestores });
 	}
 
-	/** `POST /operator/vaults` (D5): vault init first (1 row there), the registry row last (1 row). */
+	/**
+	 * `POST /operator/vaults` (D5): vault init first (1 row there), the registry row last (1 row). Only the client's
+	 * "Create a new vault" sends it; the console does not.
+	 */
 	private async createVault(request: Request, env: WorkerEnv, url: URL): Promise<Response> {
 		const rejected = crossSiteRejection(request, url, true);
 		if (rejected) return rejected;
@@ -470,8 +473,9 @@ export class Router {
 	}
 
 	/**
-	 * `POST /operator/vaults/:id/owner-code`: §5 row 2.5 fields. The console draws the setup QR (O12). Purpose: absent
-	 * → owner-bootstrap; any D3 purpose; anything else `400 invalid_purpose` (the bearer route's rule).
+	 * `POST /operator/vaults/:id/owner-code`: §5 row 2.5 fields. The client calls it right after creating a vault; the
+	 * console calls it to add a device to an existing vault and draws the setup QR (O12). Purpose: absent →
+	 * owner-bootstrap; any D3 purpose; anything else `400 invalid_purpose` (the bearer route's rule).
 	 */
 	private async ownerCode(request: Request, url: URL, vault: DurableObjectStub<VaultDO>): Promise<Response> {
 		const body = await readJsonObject(request);

@@ -1,5 +1,5 @@
 /**
- * Builds owner-code's `mobileSetupUrl`; the console's setup QR encodes the same URL. The one-time pairing code
+ * Builds owner-code's `mobileSetupUrl`; the console's setup QR for an existing vault encodes the same URL. The one-time pairing code
  * remains in the fragment so scanners never send it in the mobile page request.
  */
 export function buildMobileSetupUrl(host: string, pairingCode: string): string {
