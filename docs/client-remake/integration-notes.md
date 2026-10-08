@@ -90,6 +90,16 @@ ignored it reports 2078 problems: 1279 in `src/`, 767 in `packages/cli`
 server, PR #82) and 32 in `server/`. The new
 client has never been linted.
 
+Docs pass, branch `client-remake-docs` (code of 1e1a7b6 plus the idbStorage
+test fix 465a65a; every other code edit is a comment):
+- `npm run typecheck:client`: clean; `node scripts/check-deps.mjs`: 465
+  files, 0 errors, 0 warnings;
+- `npm run test:client`, one run: 1420 pass, 1 fail (dot reporter, describe
+  blocks included). The failure is the blobQueue byte-budget order race (§5,
+  Tests and sim).
+- `idbStorage.test.ts`: 10 of 10 runs pass after the fix; before it, 2 of 200
+  runs failed idle and 8 of 200 under load.
+
 ### 1.1 Real-device relay
 
 `https://yaos-relay2-client-e2e.kavinsood.workers.dev`: the streams relay
@@ -157,8 +167,10 @@ rid-correlated request to the host's DiskExecutor (HostLink, §g.2).
 - **Attachments** (§j.1). The planner emits `pushBlob` / `fetchBlob`; the
   BlobQueue moves bytes over the HTTP blob store only (the `x:` log carrier
   was later deleted); with no blob store, attachments are not synced.
-  `nsCreate(kind=blob)` and `setBlob` are deferred until the upload is
-  durable.
+  Transfers run in the background: a job claims one and the pass goes on
+  without it; a settled transfer wakes a pass over its docs
+  (`engine/blobs/blobQueue.ts` header). `nsCreate(kind=blob)` and `setBlob`
+  are deferred until the store confirmed the bytes.
 - **Settings** (§j.3). Allow-listed config-dir files sync through the `cfg`
   stream: JSON files as per-key registers, other files whole. Changes are
   picked up by full passes.
@@ -168,34 +180,41 @@ rid-correlated request to the host's DiskExecutor (HostLink, §g.2).
 
 ### 2.2 Module map
 
-Source under `src/` (excluding tests): 214 files, ~38.9k lines. Tests: 82
-files, ~15.4k lines.
+Source under `src/` (excluding tests, testkits included): 298 files, ~57.6k
+lines. Tests: 168 files, ~35.2k lines. Counted at 1e1a7b6 (`git ls-files`,
+`wc -l`).
 
 | Module | Files / lines | Role |
 |---|---|---|
-| `core/codec` | 9 / 1334 | lib0 codecs: envelope, nsOps, cfgOps, checkpoints, blob chunks (later deleted), side-file mirrors |
-| `core/ns` | 6 / 834 | ns fold (§c), overlay of own pending frames |
-| `core/cfg` | 4 / 659 | settings fold (§c.11) |
+| `core` (root) | 5 / 1234 | types, envelope, limits, network deadlines (`deadline.ts`), replay window |
+| `core/codec` | 13 / 1679 | lib0 codecs: envelope, nsOps, cfgOps, fold checkpoints (ns, cfg, snap), sealed blobs, Padmé padding, recovery key, side-file mirrors |
+| `core/ns` | 6 / 860 | ns fold (§c), overlay of own pending frames |
+| `core/cfg` | 4 / 684 | settings fold (§c.11) |
 | `core/paths` | 5 / 777 | pathKey (frozen case-fold tables), path validation (§c.2) |
-| `core/plan` | 7 / 1155 | three-tree planner (§f.2) |
+| `core/plan` | 7 / 1360 | three-tree planner (§f.2), brake |
 | `core/merge` | 5 / 1164 | merge engine, minimal token diff, applyEditsTo (§f.3) |
-| `core/hash` | 5 / 910 | content hashes (markdown, canvas logical hash, blobs) |
-| `engine/runtime` | 16 / 3070 | LogEngine: session loop, outbox, live ingest, catch-up, compaction, checkpoints, mirrors, quarantine, relay policy, blob chunks (later deleted) |
-| `engine/store` | 2 / 1213 | IDB schema and transactions (§e) |
-| `engine/body` | 8 / 1245 | body handles, residency, frame builder, counted Yjs calls |
-| `engine/sync` | 6 / 717 | streams, frames, receipts, refs |
-| `engine/ingest` | 3 / 285 | ingest gate (§d.6) |
-| `engine/reconcile` | 18 / 2566 | Reconciler: scan, rename inference, jobs, intents, brakes, S1 own fold |
-| `engine/blobs` | 2 / 284 | BlobQueue (persisted transfers, monotonic backoff) |
-| `engine/settings` | 4 / 638 | CfgSync, per-key JSON plan |
-| `engine/snapshots` | 1 / 230 | client snapshots (§j.4) |
-| `engine/compose` | 11 / 2071 | ProtocolEngine, VaultRuntime, fold bridge, bound docs, HostLink, synced mirror, pass scheduler |
-| `engine/adapters` | 11 / 2210 | web ports: IDB, WebSocket relay, HTTP blob, WebCrypto hash, clock, random |
-| `host` | 16 / 3075 | EngineHost, HostRuntime, binding, DiskExecutor, Obsidian vault/workspace ports, plugin |
-| `host/ui` | 16 / 2591 | status, settings tab, modals, notices |
-| `ports` | 11 / 610 | port interfaces (§h) |
-| `protocol` | 7 / 749 | main <-> engine messages, transports, ids (§g) |
-| `sim` | 22 / 6111 | SimRelay, MemStoragePort, VirtualClock, SimNet, devices, actors, faults, invariants, runner |
+| `core/hash` | 7 / 993 | markdown and canvas canonical forms and hashes, digests through HashPort (`digest.ts`); the pure-JS sha256 takes ≤ 4 KiB; `testkit/hashRef.ts` for tests |
+| `core/snap` | 6 / 995 | snapshot bundle format, export, verify (§j.4) |
+| `engine` (root) | 1 / 16 | `workerMain.ts`, the worker's entry |
+| `engine/runtime` | 18 / 4039 | LogEngine: session loop, outbox, live ingest, catch-up, compaction, checkpoints, mirrors, quarantine, relay policy |
+| `engine/store` | 2 / 1434 | IDB schema and transactions (§e) |
+| `engine/body` | 9 / 1597 | body handles, residency, frame builder, sender, counted Yjs calls |
+| `engine/sync` | 7 / 972 | catch-up, cursor, ns / cfg / snap fold runtimes, row ingest |
+| `engine/ingest` | 3 / 335 | ingest gate (§d.6) |
+| `engine/reconcile` | 26 / 4641 | Reconciler: scan, rename inference, jobs, intents, brakes, S1 own fold |
+| `engine/blobs` | 6 / 1361 | BlobQueue (background transfers under a byte budget, persisted backoff), sealed put / verified get, TransferLink, blob GC |
+| `engine/settings` | 6 / 1028 | CfgSync, per-key JSON plan, allowlist |
+| `engine/snapshots` | 7 / 797 | client snapshots (§j.4) |
+| `engine/keyring` | 10 / 1521 | E2EE keyring stream `k`, write gate (e2ee-design §11) |
+| `engine/compose` | 19 / 4057 | ProtocolEngine, VaultRuntime, fold bridge, bound docs, HostLink, synced mirror, pass scheduler |
+| `engine/adapters` | 15 / 3199 | web ports: IDB, WebSocket relay, relay HTTP, HTTP blob, WebCrypto hash and suite 1, clock, random |
+| `host` | 19 / 3575 | EngineHost, HostRuntime, binding, DiskExecutor, Obsidian vault/workspace ports, plugin |
+| `host/keys` | 8 / 706 | main's side of the vault keys: suite pin, SecretStorage |
+| `host/spike` | 9 / 2667 | platform spike plugin (not part of the product; check-deps keeps it out) |
+| `host/ui` | 29 / 5910 | status, settings tab, modals, notices, pairing |
+| `ports` | 11 / 804 | port interfaces (§h) |
+| `protocol` | 8 / 1038 | main <-> engine messages, transports, ids (§g) |
+| `sim` | 27 / 8172 | SimRelay, MemStoragePort, VirtualClock, SimNet, devices, actors, faults, invariants, runner |
 
 Dependency rules (§k.2) are enforced by `scripts/check-deps.mjs` (and
 `host/checkDeps.test.ts`). No `host/**` file imports `yjs`, `lib0`,
@@ -225,11 +244,14 @@ only the pure adapters (`noopCrypto`, `webHash`, `webClock`, `webRandom`,
 - **Pass scheduling.** PassScheduler runs scoped passes on fold/observation
   events and full passes on a 5-15 min cadence (full passes also re-read
   settings). Unproductive passes back off; a blob retry timer is armed at the
-  earliest due transfer (+5 ms).
+  earliest due transfer that is not running (+5 ms, `passScheduler.ts:181`,
+  `blobQueue.ts:274-278`), and a settled transfer requests a pass over its
+  docs (`vaultRuntime.ts:240`).
 - **S1 own fold.** Own ns frames move the synced tree forward only when they
   commit (`ownFold.ts`); the blob rev is the frame's own seq (bug 13).
 - **Blob keep-both.** conflictCopy -> fetchBlob -> nsCreate(copy) ->
-  pushBlob(copy), with the ns ops deferred until the upload returns true.
+  pushBlob(copy), with the ns ops deferred until the store confirmed the
+  upload (the claim answers `stored`, `reconcile/blobJobs.ts:120-130`).
 - **Bound-view retargets.** Fold events retarget bound docs when an entry
   becomes an alias (`merged`); renames re-open waiting views at the new path
   (bug 11).
@@ -318,7 +340,7 @@ waiting on the blob queue.
 | D1 | §k.2 | Withdrawn. The host imported `engine/adapters/webEngine` for the inline carrier; with no UI-thread carrier its one engine import is `host/entry.ts` -> `engine/workerMain` (D2), which §k.2 now states. | check-deps fails any other `engine/**` import, and any `protocol/inlineTransport` import, from product `host/**`, directly or transitively. |
 | D2 | §k.1, §k.2 | There is no separate worker build or "bundled worker source string". `main.js` is one bundle wrapped in a named function (`__yaosBundle`); the worker's Blob script is that function's source (`Function.prototype.toString`, ECMA-262 §20.2.3.5) called with the worker scope, and `host/entry.ts` (the only host file allowed to import `engine/workerMain`) lazily starts either the engine (worker) or the plugin (main). | The engine is in `main.js` once, and the worker starts without `eval` / `new Function` on main and without reading files. The worker needs only what it needed before: a `blob:` worker. This saves 424 KiB raw (see §8). |
 | D3 | §g.2 | `init` answers `ready` when the ports exist, before the vault runtime has started; the runtime retries in the background. Only an unusable store fails init (`storage-lost`). | A fresh device offline must still get a protocol-ready engine; only storage failure should stop the host (OR-1). |
-| D4 | §j.1 | When the relay's capabilities can't be read at startup (offline), the engine assumes the HTTP blob store exists and lets the blob queue retry. | An offline start must not run store-less: that device would not sync attachments and would freeze an oversized update `oversize-local` (`src/engine/runtime/docRuntime.ts:149-154`). (The original reason, one attachment sent as a blob ref by one device and as `x:` chunks by another, went away with the `x:` carrier.) |
+| D4 | §j.1 | When the relay's capabilities can't be read at startup (offline), the engine assumes the HTTP blob store exists and lets the blob queue retry. | An offline start must not run store-less: that device would not sync attachments and would freeze an oversized update `oversize-local` (`src/engine/runtime/docRuntime.ts:153-159`). (The original reason, one attachment sent as a blob ref by one device and as `x:` chunks by another, went away with the `x:` carrier.) |
 | D5 | §c.12 | `intent{epoch-migration}` is not written. A crash in the middle of a migration restarts on the newest DB (the new epoch): the path bases are gone (no-base handling) and the old DB is not deleted. | Epoch resets are rare operator actions; the snapshot taken before migration (step 1) keeps every file version. |
 | D6 | §j.3 | A JSON settings file whose fold has no keys is not created on peers (a local `{}` and a missing file are the same state). | JSON files are per-key registers; an empty register set has no file identity to project. The sim's settings invariant compares them as equal. |
 | D7 | §l.3 | Sim invariants #4 (fold determinism, V3 digests) and #6 (resource bounds) are not checked by the sim runner. | #4 is covered by WP-A's 10k-op fold fuzz, #6 by WP-C's runtime tests and benchmarks. V3 digests are not implemented (see gaps). |
@@ -379,20 +401,72 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   overwrite and exempts it).
 - Live creates (§7.2, DESIGN §d.4) send their body frames right behind the
   ns create. When such a create folds `merged` (two devices create the same
-  path with the same content within one round trip, outside onboarding), the
-  frames the relay already committed stay as junk rows on the loser's stream;
-  nobody materializes them, but they cost rows until the stream is retired.
-  A create ignored as `invalid-path` / `kind-mismatch` sends its frames too,
-  to a stream with no entry. An engine restart turns un-folded live creates
-  back into held ones (`pendingCreates` is rebuilt with `live: false`).
+  path with the same content within one round trip, outside onboarding), its
+  unsent and unreceipted frames are deleted (`engine/sync/nsRuntime.ts:141-144`),
+  but the frames the relay already committed stay as junk rows on the loser's
+  stream; nobody materializes them, but they cost rows until the stream is
+  retired. A create ignored as `invalid-path` / `kind-mismatch` sends its
+  frames too, to a stream with no entry.
+- A pass that created docs corks the ns stream from `submitNs` until the last
+  `reconcileContent` of those docs (`engine/reconcile/runner.ts:166-177`,
+  `:196`). While corked, no own ns frame leaves (`engine/body/sender.ts:397`):
+  the pass's other ops and any rename, delete or create submitted meanwhile
+  wait up to `NS_CORK_MAX_MS` (2 s, `sender.ts:44`, `:304-314`).
+- An engine restart turns un-folded live creates back into held ones: the
+  start rebuilds `pendingCreates` from the outbox with `live: false`
+  (`engine/runtime/engine.ts:200-203`), so body frames built after the restart
+  wait until the create folds (two commits to a peer instead of one).
 - `duplicate-docid` creates are not re-planned (DESIGN said so; nothing did):
-  the frames go to the existing doc and devices converge on one doc with both
-  texts. It needs a 128-bit docId collision.
+  the fold ignores the create (`core/ns/fold.ts:120`), its frames are released
+  to the existing doc (`nsRuntime.ts:145-146`), and devices converge on one doc
+  with both texts. It needs a 128-bit docId collision.
+- Settings writes have a read→write gap with no precondition.
+  `CfgSync.applyWrite` reads the file, compares its fingerprint (a HashPort
+  digest) and, for a file stored as a blob, downloads it, then writes
+  (`engine/settings/cfgSync.ts:208-226`). `ConfigDirPort.writeBytes` takes no
+  precondition (`ports/vault.ts:89`), the engine's adapter sends `any`
+  (`engine/compose/hostLink.ts:169-171`), and the host writes without
+  re-checking (`host/diskExecutor.ts:220-224`). A settings file that Obsidian
+  or a plugin changes between the read and the write is overwritten: the
+  change is not merged and no copy is kept.
+
+**Blobs**
+- The blob cap is 100 MB. The relay refuses a PUT body over
+  `MAX_BLOB_UPLOAD_BYTES` = 100,000,000 and advertises it as
+  `maxBlobUploadBytes` (`server/src/router.ts:43`, `:286`). The client takes
+  the advertised cap (`engine/adapters/httpBlob.ts:508-510`), or its own
+  `MAX_BLOB_UPLOAD_BYTES` (`core/limits.ts:188`) when capabilities can't be
+  read (`httpBlob.ts:327`); under suite 1 the plaintext cap is what fits once
+  sealed, 98,566,143 (`maxSealedBlobPlaintext`, `core/codec/sealedBlob.ts:34-46`).
+  On 2026-10-07 (UTC) the deployed Cloudflare worker accepted a full
+  100,000,000-byte PUT (suite 0) and a 98,566,175-byte sealed PUT (suite 1),
+  both verified on the peer
+  (`experiments/logs/client-e2e-typing-xfer-deployed2-20261007T225440Z.json`,
+  client 7602a7b). Business and Enterprise zones accept larger bodies at the
+  edge, but the relay still caps them at 100 MB (`router.ts:36-42`). Until the
+  open vault reports its cap, the attachment setting offers at most 93 MB, what
+  fits 100 MB once sealed, in whole MiB rounded down
+  (`host/ui/settingsModel.ts:53-56`). The setting's own ceiling, and its
+  default, is 1 GiB (`MAX_ATTACHMENT_BYTES_LIMIT`, `host/ui/api.ts:54`, `:70`),
+  so the effective cap is the server's until the user lowers it.
+- A PUT answered 413 (`BlobTooLargeError`, `engine/adapters/httpBlob.ts:368`)
+  is refused in memory only: `refusedUp` (`engine/blobs/blobQueue.ts:200-201`,
+  set at `:542-546`) makes later claims answer `refused` at once (`:344`,
+  `:392`), and no record is persisted. After an engine restart the next full
+  pass uploads those bytes again: one more refused PUT and one more
+  `blob-too-large` notice per engine start.
+- Sealing a blob under suite 1 makes one padded copy of the plaintext:
+  AES-GCM takes one contiguous input, so `sealBlob` pads into a fresh buffer
+  (`engine/adapters/webCryptoSuite1.ts:138-139`, `core/codec/padme.ts:30-31`).
+  Measured peak RSS at N = 95 MB: `sealBlob` 3.05 N against the 2.00 N floor
+  of a bare WebCrypto encrypt (e2ee-design §10.3, `scripts/bench-e2ee.mjs`
+  `benchBlobMemory`, 2026-10-07; the seal path has not changed since).
+  Suite 0 seals without a copy (`engine/adapters/noopCrypto.ts:26-27`).
 
 **Latency (§7.1)**
 - Bootstrap storage work is not batched: ~3 IDB tx per note (the per-stream
-  catch-up apply, `store/repo.ts:471`; the materialize read; the per-note
-  synced/localTree commit, `reconcile/store.ts:90`). It bounds the local run
+  catch-up apply, `store/repo.ts:550`, `tReadPage`; the materialize read; the per-note
+  synced/localTree commit, `reconcile/store.ts:98`). It bounds the local run
   and the last ~1 s of the deployed run. Batching the commit would break the
   write-file-then-record order that crash recovery relies on, so it was left.
 - Blob jobs that ran before catch-up had read their `x:` stream read it
@@ -430,11 +504,18 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   none of its classes are used by `src/host/ui`, and the zip does not ship it
   (the modals render unstyled, which works).
 - Unpairing leaves the device listed on the server (the confirm dialog
-  says so, `settingsTab.ts:347`); there is no in-app way to create a vault
+  says so, `settingsTab.ts:467`); there is no in-app way to create a vault
   on a claimed server (operator console only).
 - The relay had no R2 binding, so attachments travelled inline as `x:` chunks
   (cap 8 MiB per blob on that config). The `x:` carrier was later deleted:
   without a blob store, attachments are not synced.
+- Pairing a paired device again tries to revoke the replaced enrollment with
+  its own token, `DELETE /vault/:id/auth/device` (`host/ui/pairing.ts:503-516`,
+  called from `host/ui/pairModal.ts:195` and `host/plugin.ts:34`). The
+  rewritten server has no such route and answers 404 (`server/src/router.ts:588`),
+  so every such pairing shows "Could not remove the old server membership.
+  Remove it from the old server console." (`host/ui/pairing.ts:493`), and the old
+  device stays enrolled until the operator revokes it in the console.
 
 **Host**
 - With IndexedDB missing in the worker (OR-1), `init` answers `storage-lost`
@@ -467,6 +548,36 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   bundle's source (D2). If a platform hid it, `workerScript()` returns null and
   the runtime stops (the worker cannot be constructed, DESIGN §g.4). This is verified in V8 and JavaScriptCore, but not yet on
   an iOS device.
+- Every main→engine request (`command`, `openDoc`, `observations`,
+  `hashRequest`) has the fixed `DEFAULT_REQUEST_TIMEOUT_MS` (60 s,
+  `host/engineHost.ts:30`, `:146`), and nothing can cancel one: `request`
+  takes no signal and the protocol has no cancel message. The timer only
+  rejects main's promise with `timeout` (`engineHost.ts:253-257`); the engine
+  goes on, and its late answer is dropped (`:316-317`). A command still
+  running at 60 s reports a timeout while the engine finishes it.
+
+**Open decisions** (current behaviour; the user decides)
+- A worker crash mid-typing. After the user's restart the open view binds as
+  at a first open: merge(base = the synced base text, disk = the editor text,
+  crdt = the new engine's replica) (`engine/compose/boundBody.ts:93-96`,
+  `:110`). The merge is the line-level diff3 (`core/merge/merge.ts:1-38`), so
+  when the crashed engine had already framed part of the typing on a line but
+  not the rest, both sides changed that line: the conflict keeps the
+  replica's side in the note and writes the editor's whole text as a conflict
+  copy (`boundBody.ts:112`, `:127`). The note (editor and disk) then shows
+  only the framed prefix. `sim/device.test.ts:94-128`: on "start", " one" framed,
+  " two" in the coalesce buffer, " three" typed while the engine was down,
+  with B offline, ends on both devices as `a.md` = "start one" and
+  `a (conflict A <time>).md` = "start one two three". Nothing is lost.
+- Tablets in the background (DESIGN §i.4). A tablet's `hidden` only flushes
+  and keeps the socket and lanes 3–4, like a desktop's
+  (`engine/compose/vaultRuntime.ts:574-575`); phone and constrained devices
+  pause lanes 3–4 and close the socket after `HIDDEN_CLOSE_MS` (30 s, `:97`).
+  The reason recorded with 4a14c02 is gone: the engine could not tell an iPad
+  from a desktop running the engine inline, which `deviceClassFor` ran as
+  `tablet`. There is no inline carrier now, and `deviceClassFor` returns
+  `tablet` only for `isTablet` (`host/runtimeSupport.ts:20-24`). `pagehide` /
+  `freeze` still flush, pause and close on every class.
 
 **Legacy parity** (the full map is legacy-parity.md)
 - Device and member management (roster, revoke, rename, invite a person,
@@ -474,14 +585,15 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   plugin pairs this device and creates pairing codes for your other devices.
 - A snapshot uploaded to attachment storage can be listed, verified and
   restored on any paired device (§j.4). A damaged one is refused as
-  `content_corrupt`. Parts of superseded snapshots stay in R2 until the vault
-  is deleted, because there is no blob GC before server ask A3.
+  `content_corrupt`. Parts of superseded snapshots stay in R2 until a user
+  runs "Clean up unused server attachments" (DESIGN §j.4, e2ee-design §10.4);
+  no sweep runs on its own (`engine/blobs/gc.ts:1-5`).
 - Settings sync: while `cfgBase` is empty, a pass waits until this runtime has
   read the cfg stream to the relay head (the log reached `live`, 66c8a4c). A
   device that never reaches `live` never runs its first settings pass.
-- Lifecycle (4a14c02): on desktop and tablet `hidden` only flushes and keeps
-  the socket (an occluded desktop window also reports hidden). The hidden
-  state is not carried across an engine restart.
+- Lifecycle (4a14c02): on desktop `hidden` only flushes and keeps the socket
+  (an occluded desktop window also reports hidden); tablets too, an open
+  decision (above). The hidden state is not carried across an engine restart.
 - Since 4a14c02 a backgrounded app runs no passes, so the sim's users no
   longer act on a hidden or frozen app; the external writer still does
   (1a69e4a, §6 seed 131). Several disk writes made while the app is in the
@@ -517,8 +629,16 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   composed test for that scenario passes without it too, because its engine
   restart re-binds the views on its own; it guards the scenario, not the
   method. The planner half has a unit test that fails without the fix.
-- `idbStorage.test.ts` "even a zero-delay timer is enough to lose the tx" is
-  timing-sensitive and failed once under heavy machine load (passes alone).
+- `blobQueue.test.ts` "byte budget: transfers start in claim order …"
+  (`src/engine/blobs/blobQueue.test.ts:399`) failed once in the gate run of
+  the docs pass ("timed out waiting for s1 stored"). By reading: it releases
+  `store.calls[0]` as if s1's put arrived first (`:413-414`), but each upload
+  reaches `put` only after its own read and WebCrypto digest
+  (`engine/blobs/blobQueue.ts:527`, `:534`; the test uses `createWebHash()`,
+  `blobQueue.test.ts:131`), and two digests can settle in either order. When
+  s2's put is first, the release stores s2 and s1 waits until the 10 s bound.
+  The queue starts transfers in claim order; the order in which their store
+  calls arrive is not promised. Not fixed (test-only).
 
 ## 6. Simulation results
 
@@ -677,7 +797,7 @@ node --import jiti/register e2e/client/editTrace.ts --host URL --label L
 Deployed means `yaos-relay2-client-e2e` (§1.1; Worker built from 93d72ee;
 every later commit is client-only). One authenticated deployed request takes ~220 ms from this laptop against a ~24 ms edge round
 trip: the Worker resolves auth state, then the vault DO, then authorizes,
-three sequential DO hops per request (`server/src/index.ts:275`). The
+three sequential DO hops per request (`server/src/index.ts:275` at 93d72ee). The
 harness ran the in-process carrier, and `deviceClassFor` then dropped one
 class for it: the tablet budget, 4 catch-up lanes, 2 blob jobs, 4 MiB disk
 I/O in flight (a desktop with the worker gets 8 / 4 / 8 MiB). With the
@@ -699,14 +819,14 @@ results below predate that.
    lane, so a lane never has two requests on the wire (ba01198).
 2. *Attachments, one round trip each, read twice.* The plan runner runs ops
    in order (§f.2; `reconcile/runner.ts:138-157` at ba01198). Each blob
-   materialize awaited `blobs.download` (`diskJobs.ts:158`) -> `BlobQueue` ->
+   materialize awaited `blobs.download` (`diskJobs.ts:158` at ba01198) -> `BlobQueue` ->
    `readBlobChunks` -> one relay read per blob (`runtime/blobChunks.ts:53` at
    ba01198).
    22 attachments were ~22 serial requests (~5 s deployed), and the 1000
    notes waited behind them in the same pass (`att/` sorts first). The read
    timeline showed it: single ~55 KB reads back to back from 1.7 s to 6.5 s,
    after catch-up had already put every `x:` stream in the local tail
-   (rank 4, `engine.ts:59`) at 3.4 s. Fixes: blob jobs prefetch the next
+   (rank 4, `engine.ts:59` at ba01198) at 3.4 s. Fixes: blob jobs prefetch the next
    downloads while the current op runs (`BlobQueue.prefetch`, window
    `blobConcurrency - 1`, held bytes <= `maxDiskIoBytesInFlight`, leftovers
    dropped after the pass; 9a76b06), and `readBlobChunks` assembles from the
@@ -774,7 +894,7 @@ e2e writes edits back to back, so its `edit_to_peer` stays ~430 ms local /
 measured at 33d3631 against the redeployed relay (§1.1) and a fresh local
 relay. The merge keeps the batched read and the leading edge next to the
 rewrite's H6/H8; the H8 floor applies to lead commits too
-(`server/src/streams/relay.ts:676-680`). Deployed requests got faster:
+(`server/src/streams/relay.ts:676-681`). Deployed requests got faster:
 87-90 ms per relay request (`rttMs`) against 216-224 ms before.
 
 | 1k notes + 22 attachments, files on disk / clean (ms) | pre-merge a5ab167 | merged 33d3631 |
@@ -801,7 +921,7 @@ Full e2e p50 (ms), pre-merge -> merged:
 | attachment_40k_to_peer | 899 -> 2002 | 1406 / 1360 -> 2003 |
 | delete_to_peer | 426 -> 1002 | 511 / 481 -> 999 |
 
-Back-to-back writes now pay H8 (DECISIONS.md:358-364): commits at least
+Back-to-back writes now pay H8 (DECISIONS.md:385-391): commits at least
 1000 ms apart, the price of about 1 row/s/vault on the free plan's daily
 row budget. A write that needs one commit lands at ~1000 ms. A create needs
 two commits, so ~2000 ms: the ns create, then its initial body frames,
@@ -993,11 +1113,11 @@ In Obsidian: Settings -> Community plugins -> turn community plugins on
 bar shows `YAOS: not paired`. Obsidian mobile has no status bar; use the YAOS
 settings tab (Phase, Unsynced changes) there. Never copy
 `.obsidian/plugins/yaos/data.json` between devices or vault copies: it holds
-the device credential (`src/host/ui/api.ts:16-21`), and a copy makes two
+the device credential (`src/host/ui/api.ts:22-30`), and a copy makes two
 installs one device.
 
 **First device (vault owner).**
-1. Open the relay URL (the console, `server/src/router.ts:205-206`) -> "Sign
+1. Open the relay URL (the console, `server/src/router.ts:243-244`) -> "Sign
    in" -> paste the key -> Sign in.
 2. Enter a vault name -> Create vault, then "Pair a device" on its card
    (`server/src/console/console.ts:226-229`). The console shows a one-time
@@ -1024,7 +1144,7 @@ installs one device.
    device" and paste the URL and code.
 6. Expect `YAOS: synced` and the vault's files. The console's "Pair a device"
    (step 2) also pairs further devices; its codes have the owner-bootstrap
-   purpose (`server/src/router.ts:435-443`), step 4's the device purpose.
+   purpose (`server/src/router.ts:473-481`), step 4's the device purpose.
 
 ### 9.1 Desktop (macOS / Windows / Linux), two desktops A and B
 

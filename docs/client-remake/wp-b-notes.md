@@ -57,7 +57,7 @@ Measured on an Apple M4 Pro with Node 26.5 (`merge.test.ts` diagnostics). Inputs
 ## Deviations and decisions
 
 ### Core
-- **Hashing is pure JS** (`core/hash`), not `HashPort`. The engine runs in a worker, and `core/hash` is the single implementation of markdown-lf-v1 and the canonical canvas hash.
+- **Hashing was pure JS** (`core/hash`), not `HashPort`. The engine runs in a worker, and `core/hash` is the single implementation of markdown-lf-v1 and the canonical canvas hash. Since 5be1c96b every content digest goes through `HashPort` (`core/hash/digest.ts`), and the pure-JS sha256 refuses inputs over `SYNC_HASH_MAX_BYTES` (4096 B, `core/hash/sha256.ts:22-23`).
 - **Canvas disk format** is `JSON.stringify(_, null, "\t")` (§j.2). Legacy used 2 spaces plus "\n".
 - **Planner decisions** are listed in the `core/plan/planner.ts` header. In short:
   - `createSize = 0` is tested as `createHash == hash("")`;

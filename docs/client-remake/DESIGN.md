@@ -47,24 +47,31 @@ Every relay payload, frames and checkpoints alike, is one envelope (`src/core/en
 ```
 outer (plaintext)
   u8      formatVersion   = 1
-  u8      cryptoSuite     0 = none (v1); 1 = reserved XChaCha20-Poly1305
+  u8      cryptoSuite     0 = none; 1 = AES-256-GCM (e2ee-design.md; src/core/envelope.ts:23-28)
   varuint keyEpoch        0 when suite = 0
   bytes   sealed          rest of payload; suite 0: inner verbatim
-inner (CryptoPort.open(suite, keyEpoch, aad, sealed))
+inner (CryptoPort.open(suite, keyEpoch, aad, sealed), then unpad when suite ≠ 0)
   u8      kind            EnvelopeKindCode
   varuint authorNsSeq     author's committed ns coversSeq when the frame was sealed
   varuint flags           initial | adopted | deflate | fromDisk
+  varuint frameNo         nsOps/cfgOps: per-(device, stream) counter ≥ 1 (§c.3); every other kind 0
   bytes   content         rest; deflate-raw (fflate) iff flags & deflate
 ```
 
-- **AAD** (UTF-8 prefix, then lib0 varstrings):
-  - frames: `"yaos/f1" ‖ varstring vaultId ‖ varstring stream ‖ varstring clientFrameId`;
-  - checkpoints: `"yaos/c1" ‖ varstring vaultId ‖ varstring stream ‖ varuint coversSeq`.
+- **AAD** (UTF-8 prefix, then the outer header `u8 formatVersion ‖ u8 suite ‖ varuint keyEpoch`, then lib0
+  varstrings; `src/core/codec/envelope.ts:178-186`, e2ee-design §7.2):
+  - frames: `"yaos/f2" ‖ header ‖ vaultId ‖ stream ‖ deviceId ‖ clientFrameId`;
+  - checkpoints: `"yaos/c2" ‖ header ‖ vaultId ‖ stream ‖ varuint coversSeq`.
+- **frameNo** must be ≥ 1 for nsOps/cfgOps and 0 for every other kind; anything else is malformed
+  (`checkFrameNo`, `src/core/codec/envelope.ts:101-103`, `:161`).
+- **Padding.** Suite ≠ 0: Padmé (`data ‖ 0x80 ‖ 0x00*`) inside the AEAD, floor `PADME_FLOOR_BYTES` = 256 B
+  (`src/core/codec/padme.ts:1-20`, `src/core/limits.ts:78`, e2ee-design §7.3). Bad padding under a valid tag is
+  `bad-padding` (`src/core/codec/envelope.ts:255-256`). Suite 0 never pads.
 - **Binding checks** run even with suite 0, where the AAD is unused:
   - the kind must be in `ALLOWED_KINDS[streamClass]`;
   - for a checkpoint, the inner `CheckpointContent.coversSeq` MUST equal the relay's `coversSeq`, else quarantine.
 - **Compression.** Deflate the content when it is ≥ 4096 B and deflating saves ≥ 10 %.
-- **E2EE later.** Suite 1 swaps the `CryptoPort` only. No layout changes: blob addresses become `hex(HMAC-SHA-256(kAddr, sha256))` (`src/ports/crypto.ts:13`, e2ee-design §10.1).
+- **E2EE.** Suite 1 is specified in e2ee-design.md. Blob addresses are `hex(HMAC-SHA-256(kAddr, sha256))` (`src/ports/crypto.ts:13`, e2ee-design §10.1).
 - **Unknown values.** An unknown `formatVersion`, `cryptoSuite` or `keyEpoch` is *non-deterministic* (it depends on
   the reader's version and keys): see §d.6 for what each stream does with it.
 
@@ -77,6 +84,7 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed))
 | `snap` | snap | `snapOps` | `snapFoldV1` | commit-only | devices that upload or delete snapshots (§j.4) |
 | `b:<docId>` | body | `bodyUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the note |
 | `c:<docId>` | canvas | `canvasUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the canvas |
+| `k` | keyring | k records, no envelope (e2ee-design §11.2, `src/engine/keyring/record.ts:93`) | none (read with `preferCheckpoint = false`, `src/engine/runtime/sessionLoop.ts:362`) | commit-only | key-holding or joining devices (`src/engine/keyring/keyringRuntime.ts:248`, `src/engine/compose/keyReader.ts:259`) |
 
 - No stream carries blob bytes. Attachments, oversized updates and snapshot parts go to the `BlobPort` only; the
   log carries only their small records (ns / cfg / snap ops, `bodyUpdateRef`) (§j.1).
@@ -84,6 +92,8 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed))
   - A `clientFrameId` is never reused, on any stream, ever. The relay does not detect reuse across streams.
 - Streams of any other class (`streamClass` "other", `src/core/types.ts:76-84`, the retired `x:` names included)
   are ignored: the cursor still advances and nothing is stored (`src/engine/ingest/gate.ts:94`).
+- `k` rows skip the envelope gate (`gate.ts:93-94`) and are stored as key-record rows for the keyring
+  (`src/engine/sync/ingestRow.ts:50`, `src/engine/runtime/sessionLoop.ts:446`).
 - Every socket receives every stream (relay-wire §5.3). The cost of a row for a non-resident doc is bounded at
   gate stage 1–2 plus one tail put (§d.6).
 
@@ -135,7 +145,7 @@ opCount × { u8 tag, varuint bodyLen, body[bodyLen] }
     not malformed: the fold ignores it and reports it.
 - **`bodyUpdateRef`.** `32B sha256(update bytes), varuint size`.
   - The update bytes live only in the `BlobPort` (sealed, at `CryptoPort.blobAddress(sha256)`), never on the log.
-  - The ref frame is built after the blob put (`buildBodyFrames`, `src/engine/body/frames.ts:82-90`). A failed put
+  - The ref frame is built after the blob put (`buildBodyFrames`, `src/engine/body/frames.ts:87-95`). A failed put
     still emits the ref: the sender's R3 gate re-PUTs from the outbox record's content before it sends the ref (§j.1).
 - **Kind code 6** is retired (it was the log blob carrier) and never reused; a row of kind 6 is malformed
   (`src/core/envelope.ts:36`).
@@ -248,7 +258,7 @@ the union adds nothing, and rows > coversSeq still apply.
 | snap frame | ≤ 16 ops, records ≤ 48 KiB | One upload is one frame: `put` plus an optional `floor` (§j.4). |
 | Body frame | soft 256 updates / 64 KiB | Holds whole updates. A single update may exceed 64 KiB. |
 | Initial content of a new note | `INITIAL_INSERT_CHUNK_CHARS` = 192 Ki UTF-16 units | Inserted as consecutive transactions of ≤ 192 Ki units: one update, one frame (flag `initial`) each, so ≤ 576 KiB UTF-8. |
-| Any single update > content limit after deflate | `MAX_INLINE_UPDATE_BYTES` = `MAX_FRAME_CONTENT_BYTES` | `bodyUpdateRef`: the bytes go to the `BlobPort` only, the log carries the 32 B sha256 + size. No blob store, or larger than its cap (`storePlaintextCap`): the doc is frozen `oversize-local` (`src/engine/body/frames.ts:82`, `src/engine/runtime/docRuntime.ts:149-154`), the disk file is left untouched, and a notice is shown. |
+| Any single update > content limit after deflate | `MAX_INLINE_UPDATE_BYTES` = `MAX_FRAME_CONTENT_BYTES` | `bodyUpdateRef`: the bytes go to the `BlobPort` only, the log carries the 32 B sha256 + size. No blob store, or larger than its cap (`storePlaintextCap`): the doc is frozen `oversize-local` (`src/engine/body/frames.ts:87`, `src/engine/runtime/docRuntime.ts:153-159`), the disk file is left untouched, and a notice is shown. |
 | Checkpoint | `maxCheckpointBytes` (4 MiB) | Larger: skip. The stream keeps its rows. An ns state > 4 MiB (roughly 40k entries) is open risk OR-3. |
 | Attachment | min(`settings.maxAttachmentBytes`, `storePlaintextCap`): `BlobPort.maxBlobBytes` is the relay's `maxBlobUploadBytes` (100 MB); under suite 1 what fits once sealed (98566143); 0 without a blob store | Larger: not synced, never deleted, notice. A PUT answered 413 refuses that blob (notice, no retry). No store: no attachment is synced, silently (§j.1). |
 | Snapshot part | `min(8 MiB, ⌊maxBlobBytes × 7/8⌋)`; ≤ 512 parts, zip ≤ 320 MiB | Parts go to the `BlobPort` only, never to the log (§j.4). |
@@ -316,13 +326,21 @@ For each committed ns row, in seq order:
    - Deterministic decode failures make the frame malformed (§b.3), which folds as an empty frame.
 2. **Dedupe.** If `clientFrameId ∈ recentFrames[deviceId]`, emit one frame-level event `ignored/duplicate-frame`
    and stop. Otherwise append the id and trim the ring to `NS_DEDUPE_RING` (64), oldest out.
+   - **Replay window** (ns and cfg, e2ee-design §8.2), checked after the ring hit test and before the append, for
+     frameNo `f` ≥ 1 only (`src/core/ns/fold.ts:277-286`, `src/core/cfg/fold.ts:215-224`). Per device: right edge R and
+     a `REPLAY_WINDOW` (64)-bit bitmap (`src/core/replayWindow.ts:30-35`). `f ≤ R − 64` → `ignored/replay-stale`;
+     a set bit → `ignored/replay-duplicate`; either sets `coversSeq = seq` and changes neither ring nor window.
+     An accepted frame updates both. frameNo 0 on an nsOps/cfgOps envelope is a decode failure (§b.1); a row that
+     failed the gate is stored with frameNo 0 (`src/engine/sync/ingestRow.ts:72-74`), folds as empty and never
+     touches the window.
 3. **Fold.** Fold each op in index order (§c.5–§c.10). Each op emits one `NsFoldEvent`.
 4. **Prune** if needed (§c.9).
 5. Set `coversSeq = seq`.
 
 **Why the ring is exact.** The relay dedupes resends only within a recent window (relay-wire §5.4, §12). The
 writer-side **send window** closes the gap:
-- own ns frame `k` may be sent only when every own ns frame ≤ `k − NS_SEND_WINDOW` (32) is receipted;
+- an own ns frame with frameNo `f` may be sent only when every own frame of the stream with frameNo ≤
+  `f − NS_SEND_WINDOW` (32) is receipted (`src/engine/body/sender.ts:353-369`, `src/core/limits.ts:32`);
 - so a resend of `k` can only happen while fewer than 32 later own frames exist, and `k` is still among the device's
   newest 64 ids;
 - after a receipt a frame is never resent.
@@ -660,7 +678,8 @@ cold ──load──▶ resident ──bind──▶ bound
 - **Budgets.** `maxResidentDocs` and `maxResidentBytes` per device class (§i.2).
   - When over budget with no clean handle, new loads wait: lane 3/4 jobs queue, and lane 0/1 loads may exceed the
     budget by one doc.
-  - `memory-pressure` evicts every clean handle.
+  - `memory-pressure` is declared (`src/ports/platform.ts:26`) but no host source raises it, and
+    `HandleCache.evictAllClean` (`src/engine/body/handles.ts:196-197`) is called only by tests. Nothing runs.
 
 ### d.2 Bound views: the worker replica is the only replica
 
@@ -811,8 +830,8 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   - **Per keystroke:** one compose, one `toJSON` of the changed ranges, one post. About 11 µs, flat in note size and
     history. Before: 22–90 µs, growing with the Yjs item count.
   - **Per remote update:** `fromJSON`, a `Text` replace, a map over unconfirmed changes, one dispatch. About 7 µs.
-    Before: 73–400 µs, because y-codemirror's observer reads `event.delta`, which walks every item (yjs
-    src/types/YText.js:655-721).
+    Before: 73–400 µs, because y-codemirror's observer reads `event.delta`, which walks every item
+    (`node_modules/yjs/src/types/YText.js:655-839`, yjs 13.6.29: the `delta` getter, whose loop at :721-824 visits every item).
 - **Unbound docs → disk.** A remote change marks the doc `bodyVersion`-dirty. The planner (§f.2) emits
   `reconcileContent`, which writes the CRDT text with a CAS precondition (§f, preconditions hashed by the engine).
   Disk changes flow back the same way. Echo suppression is in §f.4.
@@ -845,7 +864,7 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   - every frame of the doc built before its create folds carries `dependsOn` = the ns create frame
     (`Ctx.pendingCreates`, docRuntime closeFrame).
 - **Live creates** (every pass after the reconciler's first full pass with ns ready and the local scan complete,
-  `Ctx.liveCreates`, reconciler.ts:207):
+  `Ctx.liveCreates`, reconciler.ts:212):
   - the frames are `pending`, not `held` (frames.ts `sendAfter`);
   - the pass corks the ns stream (`Sender.corkNs`, at most `NS_CORK_MAX_MS` = 2 s) from `submitNs` until the last
     `reconcileContent` of the docs it created (runner.ts), so the creates and their body frames reach the relay
@@ -859,7 +878,7 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   pass after every engine start): the frames are `held` and are released when the create folds `applied` /
   `suffixed`. Identical concurrent imports merge (§c.5), and holding keeps them at zero body rows. A restart also
   turns un-folded live creates back into held ones: `pendingCreates` is rebuilt from the outbox with `live: false`
-  (engine.ts:203), so frames built after the restart are held.
+  (engine.ts:202), so frames built after the restart are held.
 - **Create folds `merged`** (nsRuntime.reconcileHeld):
   - its held, pending and sent-but-unreceipted frames are deleted, and the doc is rebound to the winner (§c.13);
   - the winner already has the create's content (a merge needs the same create hash, place.ts). Edits made after
@@ -939,8 +958,8 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
      on the bytes (`resolveRef`, `src/engine/body/refs.ts:37-55`).
      - If they are unavailable yet, the ref row is stored and retried with backoff, and the doc shows
        `wait/blob-unavailable`. Under the §j.1 quarantine rule (deterministic failures only) the doc is frozen
-       `blob-corrupt` (`src/engine/runtime/docRuntime.ts:221-240`); `releaseQuarantine` unfreezes it and retries.
-     - Without a blob store the row stays unresolved and arms no retry timer (`docRuntime.ts:243-248`); a store found
+       `blob-corrupt` (`src/engine/runtime/docRuntime.ts:224-244`); `releaseQuarantine` unfreezes it and retries.
+     - Without a blob store the row stays unresolved and arms no retry timer (`docRuntime.ts:246-252`); a store found
        on a later connect restarts the runtime (§j.1).
      - Once resolved, the tail row is rewritten as `bodyUpdate` (a local cache only).
    - Cold docs stop here: the row is stored in `tail` (§e.2 `T_ingest`), and nothing is loaded.
@@ -957,11 +976,19 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 
 **Failures by stream class:**
 
-| Failure | ns / cfg / snap | body / canvas / x |
+| Failure | ns / cfg / snap | body / canvas |
 |---|---|---|
 | Deterministic malformation (bytes, decode) | Fold as empty frame (§c.3); diagnostics event | Quarantine, freeze doc |
 | Reader-dependent (unknown version, suite or key; auth failure) | **Halt** the fold at the row (`upgrade-required` / `key-missing`); rows wait in `tail` | Quarantine with the whole row, freeze doc (retried on upgrade or new keys) |
 | Kind not allowed | Fold as empty | Quarantine, freeze |
+| `suite-downgrade`, `bad-padding`; `auth-failed` under a verified key (`CryptoPort.keyState(e).verified`) | Deterministic: as malformation | As malformation |
+| `auth-failed` under an unverified key | Reader-dependent: halt | Reader-dependent: quarantine |
+| Stale epoch (e2ee-design §14.3, decided from the header's keyEpoch before opening) | ns/cfg: stored flagged stale-epoch, fold as empty; snap: accounted, not stored | Accounted, not stored, not quarantined |
+| Stale epoch not yet decidable (`hold`: `k` not judged) | Reader-dependent (`keyring-hold`) | Reader-dependent (`keyring-hold`) |
+
+- Verified-key split: `src/engine/ingest/gate.ts:101-104`, `src/engine/ingest/envelope.ts:58-71` (e2ee-design §9.2,
+  §9.3). Stale verdict: `staleVerdict`, `gate.ts:137-146`; row handling `src/engine/sync/ingestRow.ts:57-59`. A
+  stale provisional is ignored; a stale checkpoint fails `stale-epoch` (`gate.ts:143`, `:145`).
 
 - **The cursor always advances.** Quarantined, stored-cold, stale-recorded and halted rows are all *accounted*.
 - **Frozen docs:**
@@ -992,7 +1019,9 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 2. **Live queue.** Attach the event listener at once. The adapter buffers until then (port contract), so every seq > H
    is captured.
    - Live events go to an in-memory **live queue**.
-   - Rows for resident or bound docs are processed at lane priority. The rest are processed after gate stages 1–2.
+   - Rows are processed in arrival order, committed rows in batches (one `tLive` per batch), provisionals one at a
+     time (`src/engine/runtime/liveIngest.ts:1-7`); no lane decides the order. Stored body rows are applied only
+     to a resident (or loading) replica; the rest stay in the tail (`src/engine/runtime/docRuntime.ts:168-187`).
    - **Overflow** (> 4 MiB or > 1000 queued rows): drop payloads of rows for non-resident docs. Record those streams
      as stale with `remoteHeadSeq = max(…, seq)`. The seq counts as accounted, and the rows are read later.
 3. **Feed.** If V < H: run `feed(V)` pages. Each page runs `T_feed_page`:
@@ -1001,6 +1030,11 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - unknown stream classes are skipped;
    - set V to `throughSeq`.
    - V reaches H after about `streams / 1000` pages, with no row reads.
+3a. **Keyring.** Live ingest is enabled, then `k` is read to head if stale, and the keyring settles
+   (`keyring.afterKRead`) before any other stream is read; a `k` still stale after the read fails the session
+   (`src/engine/runtime/sessionLoop.ts:140-146`, e2ee-design §11.3). If the keyring allows reading only `k`, the
+   phase becomes `key-missing` and catch-up stops there (`sessionLoop.ts:148-152`). Then ns, cfg, snap are read in
+   that order (`sessionLoop.ts:153`).
 4. **Reads.** Catch-up jobs take stale streams by `byStalePriority`, up to `catchUpConcurrency` at once. Open notes
    run in lane 1 and ns/cfg/snap in lane 2, first (in that order).
    - Each job calls `read(stream, appliedSeq, preferCheckpoint = appliedSeq === 0)` and gates each page.
@@ -1065,13 +1099,13 @@ The planner does no destructive work until ns is caught up (§f.2).
 - **Body/canvas duty** (`bodyCheckpointDue`, src/engine/body/checkpoints.ts:148). Two triggers:
   - *Hot:* `rowsSinceRemoteCheckpoint ≥ REMOTE_CHECKPOINT_ROWS` (256) or `bytesSinceRemoteCheckpoint ≥
     REMOTE_CHECKPOINT_BYTES` (1 MiB), and the stream has been idle for `REMOTE_CHECKPOINT_IDLE_MS` (30 s)
-    (src/core/limits.ts:118-120).
+    (src/core/limits.ts:116-118).
   - *Settle:* a fresh device would open more than one envelope for the stream (`settleWanted`, checkpoints.ts:129: a
     row above the remote checkpoint, or ≥ 2 rows and no checkpoint), and the stream has been idle for
-    `REMOTE_CHECKPOINT_SETTLE_MS` (2 min, limits.ts:126). A stream whose only row is its first frame is left alone:
+    `REMOTE_CHECKPOINT_SETTLE_MS` (2 min, limits.ts:124). A stream whose only row is its first frame is left alone:
     a checkpoint would replace one open with one open (an import of 10k notes costs no checkpoints).
   - *Idle* means no live row and no own frame on the stream for that long (`lastActivity`, set in
-    src/engine/runtime/docRuntime.ts:144 and :176). Activity also restarts the fallback clock
+    src/engine/runtime/docRuntime.ts:148 and :178). Activity also restarts the fallback clock
     (checkpoints.ts:134), so neither rule writes while a note is being typed in, on any device. Activity before
     this engine run is unknown (a restart can come in the middle of an edit session), so a stream with no activity
     seen counts as active at the run's first live maintenance tick (`markLive`, checkpoints.ts:104, called at
@@ -1086,7 +1120,7 @@ The planner does no destructive work until ns is caught up (§f.2).
   - Only streams this device has caught up on (`stale = 0`) and that are not frozen. Catch-up is eager, so every
     device can stand in for every stream. The doc does not have to be open (compaction reads the store).
   - Settle puts are capped at `REMOTE_CHECKPOINT_SETTLE_DAILY` (1000) per device per 24 h, every put counting
-    (limits.ts:133, `CheckpointState.settleOpen` checkpoints.ts:114). The hot rule is not capped.
+    (limits.ts:131, `CheckpointState.settleOpen` checkpoints.ts:114). The hot rule is not capped.
   - *Bound.* With its duty device in the foreground, a doc idle for 30 s carries fewer than 256 rows. A doc still
     being typed in carries the rows since its last 30 s pause: that is the idle gate. In a quiescent vault every
     stream costs a fresh device one open (its checkpoint, or its single first frame), S = 2 min after the last edit.
@@ -1143,7 +1177,7 @@ The planner does no destructive work until ns is caught up (§f.2).
       for a doc (2 for its first checkpoint). A put at `lastSeq` also drops the open segment at no extra row (H7).
     - A CAS conflict writes nothing, and the fallback refresh is a read.
   - A heavy desktop day:
-    - Frames: ≤ 20k (soft budget, limits.ts:254; frames are 4× slower beyond it, src/engine/runtime/context.ts:413-415) ×
+    - Frames: ≤ 20k (soft budget, limits.ts:261; frames are 4× slower beyond it, src/engine/runtime/context.ts:413-415) ×
       ≤ 2 rows = ≤ 40k.
     - Settle: 500 edit sessions × ≤ 4 = 2k. One put per session: a pause of 2 min or more ends one.
     - Hot: 20k / 256 × 4 ≈ 310.
@@ -1179,7 +1213,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | `localTree` | `pathKey` | — | `LocalTreeRecord` | 1 per vault file |
 | `intents` | `id` | — | `IntentRecord` | In-flight multi-step disk ops (< 1000); deleted on completion |
 | `cfgBase` | `file` | — | `CfgBaseRecord` | Allowlisted config files |
-| `blobQueue` | `hash` | `byActiveDue [active, nextAttemptAtMs]` | `BlobQueueRecord` | 1 per pending transfer |
+| `blobQueue` | `hash` | `byActiveDue [active, nextAttemptAtMs]` | `BlobQueueRecord` | 1 per failed transfer backing off; a running transfer has none, success deletes it (`src/engine/blobs/blobQueue.ts:285-297`) |
 
 - **`dependsOn` rule.** A `held` record waits for one of two things:
   - the doc's ns create, during onboarding (released when it folds, §d.4);
@@ -1322,6 +1356,19 @@ All are in `src/core/types.ts`.
   - `ContentHash` is the logical hash: markdown-lf-v1 canonical bytes for markdown, canonical JSON for canvas, raw
     bytes for blobs.
   - `DiskFingerprint` is the exact-bytes hash, used only for echo suppression and CAS.
+  - Both are SHA-256 hex, digested in the engine through `HashPort` (WebCrypto; `digestHex`,
+    `src/core/hash/digest.ts:11`), like every other digest: blobs, canvas, config, snapshots, mirrors, ns fold
+    digests, brake ids. Core's pure-JS SHA-256 throws a `RangeError` above `SYNC_HASH_MAX_BYTES` (4096 B,
+    `src/core/limits.ts:100`, `src/core/hash/sha256.ts:22-23`), in production too. It takes only bounded inputs: the
+    empty-content hash (`src/core/plan/planner.ts:68`), the recovery key's 32-byte check
+    (`src/core/codec/recoveryKey.ts:26`, `:34`), cfg's `H_TRUE` (4 B, `src/engine/settings/cfgPlan.ts:98`) and the
+    resident-text fallback below.
+  - `streams.textHash` of a resident replica (the planner's remote hash for a caught-up markdown/canvas doc) is
+    digested through `HashPort` before each pass reads the view (`warmTextHashes`,
+    `src/engine/compose/logPort.ts:115-131`, called at `src/engine/reconcile/reconciler.ts:165`). A replica that
+    changed after the warm is hashed by the view only if its input fits `SYNC_HASH_MAX_BYTES`; otherwise the view
+    has no `textHash` for it and the planner's remote hash is unknown (`logPort.ts:99-108`,
+    `src/core/plan/planner.ts:204-210`).
 
 ### f.2 Planner
 
@@ -1402,7 +1449,8 @@ All are in `src/core/types.ts`.
 - **Justification.** M1 (branch a `Y.Doc` at the sync point, apply the disk diff to the branch, merge the branches)
   needs Yjs history at the sync point. `gc: true` destroys it. Keeping `gc: false` grows docs without bound, and IDB
   loss loses the branch point anyway. M2 needs only the base text (`baseText`, deflated), the disk text and the CRDT
-  text. It behaves the same on main (bind and external reload) and in the worker.
+  text. It runs only in the worker, bind and external-reload merges included (§d.2; `src/engine/compose/boundBody.ts:110`,
+  `src/engine/compose/boundDisk.ts:80`).
   - Alternative: M1 with gc-off snapshots. Rejected for the reasons above.
 - **Algorithm:**
   1. `disk === crdt` → `identical`.
@@ -1417,7 +1465,7 @@ All are in `src/core/types.ts`.
      - Exceeding the edit cap → `too-large`.
 - **Canvas** uses the same `MergeFn` over canonical canvas text: one node or edge record per line, with stable key
   order (§j.2). The merged text must parse and validate, else `conflict(both-edited)`.
-- **Applying to the CRDT** (worker job, or main for bound reloads):
+- **Applying to the CRDT** (in the worker, §d.2):
   1. Read `crdt0 = ytext.toString()`.
   2. Merge.
   3. Within one synchronous section: **CAS** `ytext.toString() === crdt0`, compute the minimal diff `crdt0 → text`
@@ -1465,10 +1513,15 @@ All are in `src/core/types.ts`.
 | `ns-divergence` | All destructive ops | V3 mismatch (§b.5) |
 
 - **Held ops** go to `Plan.held`. The rest of the plan runs.
-- **Report.** `BrakeReport.id = sha256(sorted canonical held ops)`, and the engine posts a `brake` event.
-- **Approval.** `approveBrake{id}` sets `brakeApproval`. The next plan releases the held set only if it recomputes to
-  the same id. A recovery snapshot of the affected files is taken first (§j.4). `rejectBrake` converts held remote
-  deletes into nothing (the files stay; `syncedDrop`) and held local deletes into re-creates.
+- **Report.** The brake's identity is the sorted brake keys (`kind|docId|path|expect`) of its held ops, one per line
+  (`brakeKey`, `brakeIdentity`, `src/core/plan/brake.ts:83-90`). `BrakeReport.id` is the identity's sha256 through
+  `HashPort` (`brakeId`, `brake.ts:93-95`): the planner returns the identity, and the reconciler digests it and the
+  engine posts a `brake` event (`src/engine/reconcile/reconciler.ts:190-195`).
+- **Approval.** `approveBrake{id}` maps the id back to the identity of the report it names and sets `brakeApproval`
+  to that identity (`reconciler.ts:96-103`; an id no report of this runtime has is ignored). The next plan releases
+  the held set only if its held ops have the same identity (`brake.ts:128-129`). A recovery snapshot (reason
+  `brake`, with snapshots enabled, §j.4) is taken first (`src/engine/compose/runtimeOps.ts:80-83`). `rejectBrake`
+  converts held remote deletes into nothing (the files stay; `syncedDrop`) and held local deletes into re-creates.
 - Counting is per plan **and** per rolling 10-minute window, so slow drips also trip it.
 
 ### f.6 Startup scan and rename inference
@@ -1518,8 +1571,12 @@ e2ee-design §18.4).
 
 ### g.1 Carriers
 
-- **Worker: the plugin's only carrier.** The engine bundle is built as a string by esbuild (WP-D) and embedded in
-  `main.js`. The host starts it with `new Worker(URL.createObjectURL(new Blob([src], {type: "text/javascript"})))`.
+- **Worker: the plugin's only carrier.** There is no separate engine build: `main.js` is one esbuild bundle of
+  `src/host/entry.ts`, wrapped in a function named `__yaosBundle` (`esbuild.config.mjs:27-31`). The worker's script
+  is that function's source text (`Function.prototype.toString`) called with the worker's scope (`workerScriptFrom`,
+  `src/host/bundleSource.ts:24-27`), so the engine is in `main.js` once, and in the worker `host/entry.ts` starts
+  only the engine (`src/host/entry.ts:22-29`; integration-notes §4 D2). The host starts it with
+  `new Worker(URL.createObjectURL(new Blob([script], {type: "text/javascript"})))` (`src/host/plugin.ts:46-47`).
   - Startup: construct the worker, `ping`, and expect a `pong` within `STARTUP_PING_TIMEOUT_MS` (5 s); then `init`.
   - IDB is opened inside the worker. If it is unavailable there (risk OR-1), init answers `storage-lost` and the
     engine stops (§g.4).
@@ -1540,7 +1597,7 @@ transferred buffers.
 |---|---|---|---|
 | `init{config}` | yes | Identity, device class, settings, relay URL + credential (secret), side files `[T]` | `ready{protocolVersion, vaultEpoch, recovered}` / `error(version-mismatch)` |
 | `shutdown{reason}` | yes | Flush builders, `T_edit`, mirror, close relay and IDB | `ok` |
-| `lifecycle{event}` | — | visible / hidden / pagehide / freeze / resume / online / offline / memory-pressure (§i.4) | — |
+| `lifecycle{event}` | — | visible / hidden / pagehide / freeze / resume / online / offline / memory-pressure (declared, never raised; §i.4) | — |
 | `ping` | yes | Liveness every 10 s | `pong` (no pong within `PING_TIMEOUT_MS` → the engine stopped, §g.4) |
 | `observations{scanId, chunk, complete}` | yes | Listing chunks (≤ 2000 stats) | `ok` (the host sends the next chunk after it) |
 | `vaultEvents{events}` | — | Hints, batched ≤ 50 ms / 256 | — |
@@ -1598,8 +1655,12 @@ transferred buffers.
 - **Timeouts.** Engine→main requests (disk I/O, side files) have no fixed timeout: a slow mobile disk is still
   progressing. They end with the engine (`aborted`, engine/compose/hostLink.ts `close`), and the engine re-plans
   the scope; nothing is assumed done. Main→engine requests time out after `DEFAULT_REQUEST_TIMEOUT_MS` (60 s,
-  host/engineHost.ts) → `error(timeout)`; liveness is the ping (`PING_TIMEOUT_MS`). Blob transfers run in the
-  engine over fetch, with no fixed timeout (engine/adapters/httpBlob.ts).
+  host/engineHost.ts) → `error(timeout)`; liveness is the ping (`PING_TIMEOUT_MS`). The engine's own network calls
+  all end (§j.1 Liveness): relay HTTP calls at a deadline proportional to their byte bound
+  (`relayHttpDeadlineMs`, `src/core/deadline.ts:63`); blob bodies (GET over fetch, PUT over XMLHttpRequest) at no
+  fixed deadline but after `BLOB_TRANSFER_IDLE_MS` (60 s) without a byte moving (`src/engine/adapters/httpBlob.ts:28-44`);
+  and every blob store call at once when the session loop declares the relay link dead
+  (`src/engine/blobs/transferLink.ts`).
 - **Errors.** `ProtocolError{code, message, retryable}`. `message` never contains credentials or file contents.
   An error answering `init` stops the host (below); `content_corrupt` (a snapshot failed verification, §j.4) is
   never retryable.
@@ -1646,27 +1707,32 @@ interface ClockPort {
 // random.ts — seeded in simulation
 interface RandomPort { bytes(length: number): Uint8Array; float(): number }
 
-// crypto.ts — suite 0 = identity
+// crypto.ts — suite 0 = identity; suite 1 (AES-256-GCM, WebCrypto): e2ee-design §18.1
 type BlobAddress = Brand<string, "BlobAddress">;
-type OpenFailure = "unknown-key" | "auth-failed" | "unsupported-suite";
+type SealedBlobParts = readonly Uint8Array[];   // the stored object is their concatenation
+type SealPurpose = "frame" | "checkpoint";
+type OpenFailure = "unknown-key" | "auth-failed" | "unsupported-suite" | "suite-downgrade" | "malformed";
+type OpenResult = { ok: true; plaintext: Uint8Array } | { ok: false; reason: OpenFailure };
+interface KeyState { readonly held: boolean; readonly verified: boolean }
 interface CryptoPort {
   readonly suite: CryptoSuite;
-  readonly keyEpoch: number;
-  seal(input: { aad: Uint8Array; plaintext: Uint8Array }): Promise<Uint8Array>;
-  open(input: { suite: CryptoSuite; keyEpoch: number; aad: Uint8Array; sealed: Uint8Array }):
-    Promise<{ ok: true; plaintext: Uint8Array } | { ok: false; reason: OpenFailure }>;
-  sealBlob(plaintext: Uint8Array): Promise<Uint8Array>;
-  openBlob(sealed: Uint8Array): Promise<Uint8Array | null>;
+  sealEpoch(): number;
+  keyState(keyEpoch: number): KeyState;
+  seal(input: { purpose: SealPurpose; keyEpoch: number; aad: Uint8Array; plaintext: Uint8Array }): Promise<Uint8Array>;
+  open(input: { purpose: SealPurpose; suite: CryptoSuite; keyEpoch: number; aad: Uint8Array; sealed: Uint8Array }): Promise<OpenResult>;
+  sealBlob(input: { address: BlobAddress; plaintext: Uint8Array }): Promise<SealedBlobParts>;
+  openBlob(input: { address: BlobAddress; sealed: Uint8Array }): Promise<OpenResult>;
   blobAddress(hash: ContentHash): Promise<BlobAddress>;
+  diagHash(bytes: Uint8Array): Promise<string>;   // diagnostics pseudonyms (§j.7)
 }
-interface HashPort { sha256(bytes: Uint8Array): Promise<Uint8Array> }
+interface HashPort { sha256(bytes: Uint8Array): Promise<Uint8Array> }   // WebCrypto; every content digest (§f.1)
 
 // blob.ts — engine receives BlobPort | null
 interface BlobPort {
   readonly maxBlobBytes: number;
-  has(addresses: readonly BlobAddress[]): Promise<ReadonlySet<BlobAddress>>;
-  put(address: BlobAddress, bytes: Uint8Array): Promise<void>;
-  get(address: BlobAddress): Promise<Uint8Array | null>;
+  has(addresses: readonly BlobAddress[], signal?: AbortSignal): Promise<ReadonlySet<BlobAddress>>;
+  put(address: BlobAddress, parts: SealedBlobParts, signal?: AbortSignal): Promise<void>;   // BlobTooLargeError = refused by size
+  get(address: BlobAddress, signal?: AbortSignal): Promise<Uint8Array | null>;
   // GC (e2ee-design §10.4, relay-wire §11.3.1): pages of {address, uploadedAt}; batches of 1..100, per-address
   // deleted | newer | absent.
   list(cursor: BlobAddress | null, signal?: AbortSignal): Promise<BlobListPage>;
@@ -1679,6 +1745,7 @@ interface PlatformInfo {
   readonly hardwareConcurrency: number; readonly deviceMemoryGiB: number | null; readonly workerSupported: boolean;
 }
 type LifecycleEvent = "visible" | "hidden" | "pagehide" | "freeze" | "resume" | "online" | "offline" | "memory-pressure";
+// "memory-pressure" is declared only: no host source raises it (§i.4).
 interface PlatformPort {
   readonly info: PlatformInfo;
   isVisible(): boolean;
@@ -1775,6 +1842,7 @@ interface RelaySession {
   bufferedBytes(): number;
   feed(afterSeq: Seq): Promise<FeedPage>;
   read(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean): Promise<ReadPage>;
+  readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]>;   // ReadRequest = read()'s arguments
   putCheckpoint(stream: StreamName, coversSeq: Seq, expectedPrevCoversSeq: Seq, bytes: Uint8Array): Promise<PutCheckpointResult>;
   onEvent(listener: (event: RelayEvent) => void): Unsubscribe;   // buffers until the first listener
   close(code: number, reason: string): void;
@@ -1812,15 +1880,23 @@ interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; r
 | 1 | `openCatchUp` | Reads, union and merges for bound or just-opened docs; hard-limit compaction |
 | 2 | `namespace` | ns/cfg/snap ingest, fold, ns/cfg/snap reads, planner runs, ns frames, settings projection |
 | 3 | `background` | Body reads for stale streams, merges, projection writes, materialization, scan hashing |
-| 4 | `bulk` | Blobs, compaction, remote checkpoints, retired checkpoints, snapshots, mirrors |
+| 4 | `bulk` | Compaction, remote checkpoints, retired checkpoints, snapshots, mirrors |
 
-- **Scheduler.** Cooperative and single-threaded in the engine.
-  - Each slice runs jobs from the highest non-empty lane until `sliceMs` has elapsed, then calls `yieldNow()`.
-  - **Aging:** every 8th slice serves the oldest job of lanes ≥ 3, so bulk work never starves.
-  - Relay events are queued immediately (O(1)). Their processing is scheduled by lane.
-- **Sender** order: lane 0 frames, ns, cfg, then snap and background, then bulk (adopted frames).
-- **Host** executes `diskOps` batches lane-first within `mainSliceMs` slices, and puts editor work ahead of all of
-  it.
+- **Blob transfers are not lane work.** They run in the background in the blob queue, within its byte budget
+  (§j.1); only their disk reads and writes are lane-tagged (lane 3: `src/engine/reconcile/context.ts:193-200`).
+- **No engine scheduler.** Lanes are priority tags, not a queue the engine drains; there is no slice loop and no
+  aging. They take effect in two places:
+  - **Sender** order: lane rank, then outbox order; a frame waiting on another record sorts at that record's rank or
+    later (`src/engine/body/sender.ts:335-346`). Ranks: bound-doc frames 0, ns 1, cfg 2, snap and other
+    streams 3, adopted frames 4 (`src/engine/runtime/engine.ts:57-65`).
+  - **Host** `DiskExecutor` runs the next op of the highest-priority (lowest lane) batch, FIFO within a lane, keeps
+    order inside a batch, and yields a macrotask every `mainSliceMs` (`src/host/diskExecutor.ts:1-8`, `:102-108`,
+    `:124-127`).
+- Long engine loops yield a macrotask through `ClockPort.yieldNow` (e.g. `src/engine/reconcile/mergeJob.ts:108`,
+  `src/engine/reconcile/canvasJob.ts:78`, `src/engine/compose/hashService.ts:102`, `src/engine/blobs/gc.ts:109`).
+- Relay events are queued at once (`src/engine/runtime/liveIngest.ts:65-66`) and processed in arrival order:
+  committed/receipt events in batches of ≤ `liveBatchRows`, provisionals one at a time (`liveIngest.ts:4-7`,
+  `:143`). Not by lane.
 
 ### i.2 Device classes and budgets
 
@@ -1833,13 +1909,14 @@ The host picks the class and passes it in `EngineInitConfig.deviceClass`:
 | `phone` | mobile and not a tablet |
 | `constrained` | mobile with `deviceMemoryGiB` < 3 or `hardwareConcurrency` ≤ 2 |
 
-Budgets (`BUDGETS` in `limits.ts`):
+Budgets (`BUDGETS` in `limits.ts`). `Budgets.sliceMs` (`src/core/limits.ts:236`) is set (10 / 10 / 8 / 6 ms) but
+never read.
 
 | | desktop | tablet | phone | constrained |
 |---|---|---|---|---|
 | Resident docs / bytes | 400 / 256 MiB | 120 / 96 MiB | 60 / 48 MiB | 24 / 24 MiB |
-| Engine slice / main slice | 10 / 8 ms | 10 / 6 ms | 8 / 5 ms | 6 / 4 ms |
-| Catch-up / blob concurrency | 8 / 4 | 4 / 2 | 3 / 2 | 2 / 1 |
+| Main-thread disk slice (`mainSliceMs`, §i.1) | 8 ms | 6 ms | 5 ms | 4 ms |
+| Catch-up concurrency / blob bytes in flight (`blobBytesInFlight`, §j.1) | 8 / 64 MiB | 4 / 32 MiB | 3 / 16 MiB | 2 / 8 MiB |
 | In-flight append bytes | 1 MiB | 512 KiB | 512 KiB | 256 KiB |
 | Disk I/O in flight / ops per batch | 8 MiB / 32 | 4 MiB / 16 | 2 MiB / 16 | 1 MiB / 8 |
 | Full reconcile interval | 5 min | 10 min | 10 min | 15 min |
@@ -1867,11 +1944,11 @@ Further caps:
 
 | Event | Action |
 |---|---|
-| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and lanes 3–4, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk; tablets get the same treatment. Phone and constrained devices pause lanes 3–4 at once (hard-cap compaction is lane 1 and still runs) and close the socket (1000) after 30 s hidden. A background close shows no offline or error phase and arms no backoff. |
-| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause lanes 3–4 and close the socket on every device class. Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
+| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and lanes 3–4, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk; tablets get the same treatment. Phone and constrained devices pause lanes 3–4 at once (hard-cap compaction is lane 1 and still runs; no new blob transfer starts, `src/engine/compose/vaultRuntime.ts:239`) and close the socket (1000) after 30 s hidden, which also ends the blob transfers in flight (§j.1). A background close shows no offline or error phase and arms no backoff. |
+| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause lanes 3–4 and close the socket on every device class (ending the blob transfers in flight). Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
 | `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. This tries once even after `offline`, so a missed `online` cannot strand the device; while offline a failure arms no backoff. The user's pause wins over this and over `online`. Check the IDB connection: `onLost` → §i.5. |
 | `online` / `offline` | Connect at once / stop reconnect attempts (an open socket stays until it fails). The outbox keeps accumulating. |
-| `memory-pressure` | Evict all clean docs, drop live-queue payloads for cold docs (stale-record), drop candidate caches except the newest. |
+| `memory-pressure` | None. Declared in `LifecycleEvent` (`src/ports/platform.ts:26`) but never raised by the host; nothing handles it (§d.1). |
 
 ### i.5 IDB loss and recovery
 
@@ -1922,6 +1999,7 @@ ones get conflict copies.
 | `refused forbidden` / `canWrite = false` | Read-only: no appends or checkpoints. Outbox kept. Notice. |
 | `resendUnreceipted` (STREAM_RESEND) | §d.5. |
 | 1001 / 1006 / network | Reconnect with full-jitter exponential backoff `RECONNECT_BASE_MS` → `RECONNECT_MAX_MS`. Immediate on `online` / `visible`. |
+| A relay HTTP call (feed, read, readBatch, checkpoint) ends at its deadline (`timeout`: 15 s plus its byte bound at 64 KiB/s) or as `aborted` when its session closes (§j.1 Liveness) | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:339-342`, `:364-369`); a failed session-start feed closes the session and reconnects with backoff (`:167-175`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
 | Ticket TTL 5 min | The adapter fetches a fresh ticket for every connect. |
 
 ---
@@ -1935,9 +2013,12 @@ ones get conflict copies.
   only the small record: `nsCreate` / `nsSetBlob` (hash + size) once the upload finished, or the `bodyUpdateRef`
   (32 B sha256 + varuint size). There is no log carrier (envelope kind 6 is retired, §b.4).
 - **With a blob store** (`BlobPort`):
-  - **Upload** (`blobQueue up`): hash → `crypto.blobAddress(hash)` → `has` → `put(sealBlob(bytes))`. Only **after**
-    the put succeeds does the planner emit `nsCreate` / `nsSetBlob` for that hash (`pushBlob`,
-    `src/engine/reconcile/blobJobs.ts:120-130`), so readers can always fetch what ns references. A `has` hit skips
+  - **Upload** (`blobQueue up`): read the file once → its sha256 through `HashPort`, checked against the planned
+    hash (one read and one digest per transfer; changed bytes re-plan: `src/engine/blobs/blobQueue.ts:527`,
+    `:534-537`) → `crypto.blobAddress(hash)` → `has` → `put(sealBlob(bytes))` (`putSealed`,
+    `src/engine/blobs/blobStore.ts:44-49`). Only **after** the put succeeds is the planned `nsCreate` / `nsSetBlob`
+    for that hash submitted (`pushBlob`, `src/engine/reconcile/blobJobs.ts:120-131`), so readers can always fetch
+    what ns references. A `has` hit skips
     the put only if the committed folds reference the hash or this device put it less than grace/2 ago. Otherwise it
     puts again, which refreshes the upload time another device's GC sweep checks (e2ee-design §10.4 R2).
   - **Download:** `get` → `openBlob` → verify sha256 → write with precondition (`getOpened`,
@@ -1997,11 +2078,11 @@ ones get conflict copies.
   routes answer 503 `attachments_unavailable`): **fail closed**.
   - `BlobQueue.maxBlobBytes` is 0 (`src/engine/blobs/blobQueue.ts:220-221`), and so is `StatusSnapshot.maxBlobBytes`
     (the setting then names no server limit).
-  - Reconcile excludes every blob file, reason `no-blob-store` (`src/engine/reconcile/localState.ts:70`, `:86`). The
-    reason is silent: no skip notice (`src/engine/reconcile/skipNotice.ts:56`). Attachments are not synced; the
+  - Reconcile excludes every blob file, reason `no-blob-store` (`src/engine/reconcile/localState.ts:71`, `:87`). The
+    reason is silent: no skip notice (`src/engine/reconcile/skipNotice.ts:57`). Attachments are not synced; the
     local file stays and is never deleted.
   - Blob jobs return `held`, which arms no retry timer (`blobJobs.ts:71-72`, `:118-119`;
-    `src/engine/reconcile/diskJobs.ts:38-45`, `:172`). `upload` / `download` / the claims answer at once
+    `src/engine/reconcile/diskJobs.ts:38-45`, `:173`). `upload` / `download` / the claims answer at once
     (false / null / unavailable) without persisting a queue record (`blobQueue.ts:392`, `:407`, `:343`, `:359`), so
     nothing is queued.
   - No ns op for a blob is ever emitted unless the blob is durably stored.
@@ -2017,7 +2098,7 @@ ones get conflict copies.
   `ComposedEngine.onBlobStore` sets `ports.blob`, logs "blob store available -> restarting" and restarts the runtime
   with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:531-536`). The restarted runtime's full
   pass uploads what is pending through the normal path. No polling, no new timers.
-- **Production ports** (`src/engine/adapters/webEngine.ts:43-54`): `blob = startupBlob(…)`
+- **Production ports** (`src/engine/adapters/webEngine.ts:42-54`): `blob = startupBlob(…)`
   (`src/engine/adapters/httpBlob.ts:518-525`): `probeHttpBlob`'s answer, the HTTP store when the relay advertises
   attachments, else null. Capabilities unreachable at startup (offline), or not answered within
   `CAPABILITIES_TIMEOUT_MS` (10 s, `httpBlob.ts:76`; init awaits this probe, so it is bounded): assume the store
@@ -2119,8 +2200,8 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
   - **Parts:** the zip byte stream is cut into parts of exactly `partSize` bytes; only the last may be shorter.
     `partSize = min(8 MiB, ⌊maxBlobBytes × 7/8⌋)` (headroom for sealing), or 8 MiB without a blob store. The limits
     are ≤ 512 parts of ≤ 16 MiB and a zip ≤ 320 MiB.
-  - **Hashing:** each part is hashed (SHA-256) when it is cut, while the next one fills. The bundle digest binds the
-    parts and the manifest:
+  - **Hashing:** each part is hashed (SHA-256, through `HashPort`) as it is cut, before the next one fills
+    (`PartCutter`, `src/core/snap/bundle.ts:170-176`). The bundle digest binds the parts and the manifest:
     `bundleDigest = SHA-256("yaos/snap-bundle/1" ‖ varstring id ‖ varuint n ‖ n × (varuint size ‖ 32B sha256(part)) ‖ 32B sha256(manifest.json))`.
   - **Export** (`exporter.ts`) reads files in small batches and adds them one at a time. Each finished part goes
     straight to its side file. Peak memory is one part buffer, one read batch with its deflated copy, the central
@@ -2216,11 +2297,11 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 - **Blob lifetime (e2ee-design §10.4).** Parts of superseded snapshots (below a floor, or deleted) stay in R2 until
   a "Clean up unused server attachments" sweep deletes them.
   - The sweep's live set has every part of every record in the `snap` fold, named by `blobAddress(sha256)`. That is
-    how restore names parts too: it never takes the record's `address` (`src/engine/snapshots/remote.ts:46`, `:73`).
+    how restore names parts too: it never takes the record's `address` (`src/engine/snapshots/remote.ts:47`, `:83`).
   - The 7-day grace covers the gap between the part puts and the index record.
   - A resumed upload skips a part that `has` reports present only if the committed folds reference it (a live
     `snap` record, for example), or this device put it less than grace/2 ago. Otherwise it puts the part again, which refreshes the upload time (R2,
-    `src/engine/snapshots/remote.ts:50`). So unchanged parts of a live snapshot are not re-sent, and an old orphan
+    `src/engine/snapshots/remote.ts:51`). So unchanged parts of a live snapshot are not re-sent, and an old orphan
     is not relied on.
   - The `snap` put is gated before sending like any blob reference (R3).
   - A part swept anyway fails a restore as `part-missing`, never silently.
@@ -2283,7 +2364,9 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 2. **ns first.** `read("ns", 0, true)`: verify the checkpoint (V1 + V2), then fold the rows. The Remote tree is now
    complete, and status shows `bootstrap {docsTotal}`.
 3. **Bodies lazily, by priority.** Bound or opened docs (lane 1) first, then live docs by `lastTouchSeq` descending,
-   small first within a bucket (`priority = bucket(lastTouchSeq) × 4 + sizeClass`), then blobs (lane 4).
+   small first within a bucket (`priority = bucket(lastTouchSeq) × 4 + sizeClass`). Blobs have no stream: the pass
+   that plans a blob's materialization claims its download, which runs in the background within the blob byte
+   budget (§j.1).
    - Reads use `preferCheckpoint = true`, so a body costs about one checkpoint plus few rows.
 4. **Progressive disk writes.** Each doc is materialized as soon as its body is caught up (`diskMaterialize`, expect
    absent), so `docsMaterialized` rises steadily. Folders are created implicitly by writes.
@@ -2301,12 +2384,17 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
   - the whole 2000-entry ring of `DiagnosticsEvent`, oldest first (numbers, booleans, stream classes, error
     messages). The whole ring, not a tail: the window before an incident is what support needs;
   - quarantine summary (at most 200 rows), frozen doc streams, per-store counts, status;
-  - never credentials, tickets or file contents. `error` fields are error messages as thrown, not scrubbed.
-- **Pseudonyms.** Every stream and path is replaced by 12 hex chars of SHA-256 over a fresh random per-bundle salt and
-  the file's vault path (or its stream name when the path is unknown).
+  - never credentials, tickets or file contents. `error` fields are error messages as thrown, not scrubbed;
+  - never key material, recovery keys or setup links: the bundle type has no field for them, and the host redacts
+    `recoverykey`/`secret`-like keys as a backstop (`src/host/ui/diagnostics.ts:19-38`). The at-rest test exports the
+    bundle of a key-holding suite-1 runtime and scans it, raw and formatted, for every key and recovery-key encoding
+    (`src/host/keys/atRest.test.ts:227-280`).
+- **Pseudonyms.** Every stream and path is replaced by the first 12 hex chars of `CryptoPort.diagHash` (a SHA-256
+  prefix under suite 0, HMAC under `kDiag` under suite 1, e2ee-design §6.4) over a fresh random per-bundle salt and
+  the file's vault path, or its stream name when the path is unknown (`src/engine/compose/diagnosticsBundle.ts:40-51`).
   - The salt is not exported, so pseudonyms cannot be matched across bundles or tested against guessed paths.
   - Within one bundle a file has one pseudonym everywhere: doc streams read `b:`/`c:` + pseudonym, and brake
-    `samplePaths` hold the same pseudonym. `ns` and `cfg` keep their names.
+    `samplePaths` hold the same pseudonym. `ns`, `cfg`, `snap` and `k` keep their names (`diagnosticsBundle.ts:57`).
 - **`paths`** is null unless the user opted in. With opt-in it maps each pseudonym whose path the engine knows to
   that vault path, sorted by path. The command "Export diagnostics (include file names)" asks for confirmation
   first; the file name ends in `-with-file-names`.
@@ -2323,38 +2411,52 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 
 ### k.1 Layout
 
+As built (file names without `.ts`; tests and testkits left out).
+
 ```
 src/
   core/                      PURE: no I/O, timers, Date, Math.random, yjs, DOM
-    types.ts envelope.ts limits.ts            [architect, frozen]
-    codec/   lib0 helpers, envelope, nsOps, cfgOps, nsFoldV1, cfgFoldV1, snapFoldV1, bodyUpdateRef, mirrors [WP-A]
+    types.ts envelope.ts limits.ts            [architect, frozen]; deadline (network deadlines), replayWindow
+    codec/   lib0, ids, envelope, contents, nsOps, cfgOps, nsFoldV1, cfgFoldV1, snapFoldV1, mirrors     [WP-A];
+             sealedBlob, padme, recoveryKey                                                    [E2EE]
     paths/   pathKey (+ generated casefold15_1, assigned15_1), validate, segments              [WP-A]
     ns/      fold, index, place, overlay, verify (V1/V2), candidate (V3 digest rule)          [WP-A]
-    cfg/     fold, projection (pure JSON register → file bytes)                               [WP-A]
+    cfg/     fold, json, projection (pure JSON register → file bytes), verify                 [WP-A]
     snap/    record (snapOps), fold, zip, bundle (parts, digest, manifest), export, verify (§j.4)
-    hash/    markdownLf (ported markdownCodec), canvasCanonical (ported canvasCodec/Ordering) [WP-B]
+    hash/    markdownLf (ported markdownCodec), canvasCanonical + canvasOrdering (ported canvasCodec/Ordering),
+             utf8, digest (HashPort), sha256 (pure JS, ≤ SYNC_HASH_MAX_BYTES)                 [WP-B]
     merge/   merge (MergeFn), myers, diff3, minimalDiff                                        [WP-B]
-    plan/    planner (PlanFn), brake, renames, conflictName, order                            [WP-B]
+    plan/    planner (PlanFn), brake, renames, conflictName, order, pathRules                 [WP-B]
   ports/                     [architect, frozen]
   protocol/                  messages/errors/status/transport types [architect]; workerTransport, inlineTransport (tests/sim) [WP-D]
   engine/                    in the worker (in-process in tests/sim); yjs allowed; no obsidian, no DOM except adapters/
     store/   schema.ts [architect]; repo.ts (all §e.2 transactions)                           [WP-C]
-    adapters/ idbStorage, wsRelay (+http feed/read/checkpoint), httpBlob, noopCrypto, webHash [WP-C]
-    ingest/  gate, yjsCheck                                                                   [WP-C]
-    body/    handles, frameBuilder, sender, provisional, compaction, checkpoints, canvasDoc    [WP-C]
-    sync/    cursor, catchUp, nsRuntime (fold host, overlay, duties), cfgRuntime, snapRuntime [WP-C]
-    runtime/ engine.ts (createEngine), lanes, budgets, lifecycle, status, diagnostics, recovery [WP-C]
-    reconcile/ localTree, scan, planRunner, mergeJob, echo, intents                           [WP-B]
-    blobs/   blobQueue (the BlobPort is the only carrier)                                     [WP-B]
-    settings/ cfgScan, cfgProject                                                             [WP-B]
+    adapters/ idbStorage, wsRelay, relayHttp (feed/read/checkpoint), relayFrames, httpBlob, noopCrypto, webHash,
+             webClock, webRandom, webEngine [WP-C]; webCryptoSuite1, suite1Primitives      [E2EE]
+    ingest/  gate, envelope, yjsCheck                                                         [WP-C]
+    body/    handles, frameBuilder, frames, refs, sender, compaction, checkpoints, textChanges, yjsCounters [WP-C]
+    sync/    cursor, catchUp, foldRuntime, nsRuntime (fold host, overlay, duties), cfgRuntime, snapRuntime, ingestRow [WP-C]
+    runtime/ engine (createEngine), context, sessionLoop, liveIngest, docRuntime, logApi, maintenance, mirrors,
+             mirrorIo, outboxCache, quarantineRelease, relayPolicy, dailyLimit, reseal, status, blobGc, options [WP-C]
+    reconcile/ reconciler, scan, localState, store, runner, contentSteps, mergeJob, canvasDoc, canvasJob,
+             canvasMerge, diskJobs, blobJobs, echo, intents, ownFold, tempRecovery, skipNotice  [WP-B]
+    blobs/   blobQueue (the BlobPort is the only carrier), blobStore, transferLink (abort on link loss), gc,
+             touch, bodyRefs                                                                  [WP-B]
+    settings/ cfgSync, cfgPlan, allowlist, clash, cfgNotices                                  [WP-B]
     snapshots/ snapshotJob, exporter, localStore, remote (upload, parts), restore, snapIndex  [WP-B]
+    keyring/ keyring, book, record, build, evaluate, keyringRuntime, writeGate (e2ee-design §11)  [E2EE]
+    compose/ protocolEngine, vaultRuntime, passScheduler, logPort, foldBridge, boundDocs, boundBody, boundDisk,
+             hostLink, hashService, syncedMirror, runtimeOps, statusMerge, diagnosticsBundle, key glue [integration]
     workerMain.ts            worker entry glue                                                [WP-D]
   host/                      Obsidian main thread; obsidian, @codemirror/*; no yjs / lib0 / y-protocols (§k.2)
-    plugin.ts engineHost.ts (worker carrier, terminal failures) diskExecutor.ts binding.ts bodyClient.ts collab.ts hashOracle.ts
-    obsidianVault.ts obsidianWorkspace.ts configDir.ts sideFiles.ts platform.ts ui/          [WP-D]
+    entry.ts bundleSource.ts (the one bundle, §g.1) plugin.ts pluginController.ts hostRuntime.ts
+    engineHost.ts (worker carrier, terminal failures) runtimeSupport.ts diskExecutor.ts binding.ts bodyClient.ts
+    collab.ts hashOracle.ts obsidianApi.ts obsidianVault.ts obsidianWorkspace.ts configDir.ts sideFiles.ts
+    platform.ts ui/                                                                           [WP-D]; keys/ [E2EE]
   sim/                       tests only, never bundled
-    relay.ts storage.ts clock.ts random.ts                                                    [WP-A]
-    vault.ts workspace.ts actors.ts faults.ts invariants.ts run.ts                            [WP-D]
+    relay.ts a-relay-*.ts storage.ts clock.ts random.ts                                       [WP-A]
+    vault.ts workspace.ts device.ts actors.ts faults.ts invariants.ts run.ts                  [WP-D]
+    net.ts blobStore.ts e2ee.ts fakeObsidian.ts and the rest                                  [integration and later]
 ```
 
 ### k.2 Dependency rules
@@ -2404,7 +2506,7 @@ The only shared files are the frozen architect files. Each WP owns its directori
 | **WP-A: fold, codecs, paths, sim log** | `src/core/{codec,paths,ns,cfg}/**`, `src/sim/{relay,storage,clock,random}.ts` | (1) Every codec round-trips. Canonical re-encode rejects non-minimal input. Malformed ns/cfg frames fold as empty. (2) E1–E12 (§c.14) as unit tests. (3) 10k-op fold fuzz (§l.4) passes 1000 seeds. (4) pathKey: ß/ss, Σ/σ/ς, İ, NFC/NFD, unassigned code points rejected. Table generator reproducible from UCD 15.1. (5) `SimRelay` conformance with relay-wire: contiguous seqs, receipts after broadcasts, dedupe window expiry, older-seq notice, STREAM_RESEND loss, provisional/notice/dropped, feed/read paging, checkpoint CAS + GC, 1 MiB close, rate close, daily limit. (6) `MemStoragePort` crash semantics and tx-inactive detection. |
 | **WP-B: planner, merge, disk side** | `src/core/{hash,merge,plan}/**`, `src/engine/{reconcile,blobs,settings,snapshots}/**` | (1) MergeFn properties: no line of disk or crdt is lost (each appears in `text` or `conflictCopy`); identical/one-sided cases exact; bounded on 2M-char inputs. (2) `minimalDiff` applied to crdt0 equals the target, and its edit size is ≤ the line-diff size. (3) One test per planner table row. Brake thresholds and approval id stability. (4) Rename inference determinism (shuffle-invariant). (5) Conflict names always valid. (6) Reconcile job against `SimVault` + `MemStorage` + a stub log: CAS failures re-plan, echo suppression, intents resume at every crash point. (7) Settings projection gates (yaos dir, data.json version). |
 | **WP-C: log-side engine** | `src/engine/{store/repo.ts,adapters,ingest,body,sync,runtime}/**` | (1) Crash at every transaction boundary (§e.2): the state reconstructs, no outbox frame is lost, and the cursor never passes an unaccounted seq. (2) Gate: malformed, disallowed types, oversize, causal hole → re-read → freeze; `releaseQuarantine`. (3) Frame builder: per-keystroke cost independent of doc size (benchmark: 5 MB doc, 1000 keystrokes, no `encodeStateAsUpdate` calls), size caps, initial chunking, `bodyUpdateRef`. (4) Provisional adopt/settle/drop, R7 settle, STREAM_RESEND resend, send window. (5) Catch-up with GC'd rows → checkpoint union. Compaction exactness: snapshot = fold of rows ≤ C. Checkpoint CAS outcomes. (6) Smoke against the local relay (`scripts/relay-dev`, e2e/relay/smoke.ts scenarios through `WsRelayPort`). |
-| **WP-D: host, protocol carriers, worker, sim runner** | `src/protocol/{workerTransport,inlineTransport}.ts`, `src/engine/workerMain.ts`, `src/host/**`, `src/sim/{vault,workspace,actors,faults,invariants,run}.ts`, `scripts/check-deps.mjs`, esbuild config (worker string bundle) | (1) Worker and inline transport parity on recorded message traces; transfer ownership asserted. (2) Disk executor honours every `WritePrecondition`; rename uses `vault.rename`; trash only. (3) Binding: bind-time merge, no echo loop (update counts), external-reload interception, `docCredit` resync, worker kill mid-typing stops the runtime and loses nothing (the user's restart binds the editor text, §g.4). (4) Lifecycle flush on `pagehide`. (5) Full simulation suite (§l) green on 200 CI seeds. (6) Obsidian smoke on desktop + iOS: the worker starts and IDB opens in the worker (or the engine stops and says why, §g.4). |
+| **WP-D: host, protocol carriers, worker, sim runner** | `src/protocol/{workerTransport,inlineTransport}.ts`, `src/engine/workerMain.ts`, `src/host/**`, `src/sim/{vault,workspace,actors,faults,invariants,run}.ts`, `scripts/check-deps.mjs`, esbuild config (one bundle, §g.1) | (1) Worker and inline transport parity on recorded message traces; transfer ownership asserted. (2) Disk executor honours every `WritePrecondition`; rename uses `vault.rename`; trash only. (3) Binding: bind-time merge, no echo loop (update counts), external-reload interception, `docCredit` resync, worker kill mid-typing stops the runtime and loses nothing (the user's restart binds the editor text, §g.4). (4) Lifecycle flush on `pagehide`. (5) Full simulation suite (§l) green on 200 CI seeds. (6) Obsidian smoke on desktop + iOS: the worker starts and IDB opens in the worker (or the engine stops and says why, §g.4). |
 
 - **Sequencing.** All four start at once against the frozen types.
   - WP-B and WP-C use stubs of each other's functions until the integration week.
@@ -2477,7 +2579,7 @@ After healing (all faults off, all online, run until every queue is idle and no 
 7. **No blobs on the log** (`checkLogCarriesNoBlobs`, `src/sim/invariants.ts:124-132`, run by `src/sim/run.ts:251`):
    no foreign stream on the relay log, no ns / cfg / snap / k row over `MAX_NS_FRAME_BYTES`, no `b:`/`c:` stream for
    an attachment doc. Sim devices get the net's `SimBlobStore` (`SimNet.blobs`, `blobsAvailable`, `blobPort()`,
-   `src/sim/net.ts:58-85`) and its probe by default (`src/sim/device.ts:186-187`).
+   `src/sim/net.ts:58-85`) and its probe by default (`src/sim/device.ts:196-197`).
 
 ### l.4 10k-op fold fuzz (WP-A)
 
@@ -2500,16 +2602,16 @@ After healing (all faults off, all online, run until every queue is idle and no 
 ### m.1 Port
 
 Port means copying the logic with tests, adapted to the new types. No runtime coupling to legacy code.
-The old client was deleted once the port was done; `adfa7a7:src/...` names its files at that commit
-(`git show adfa7a7:src/<path>`).
+The old client was deleted once the port was done, and the legacy server's shared modules are gone too;
+`adfa7a7:<path>` names such a file at that commit (`git show adfa7a7:<path>`).
 
 | Legacy | New location | Notes |
 |---|---|---|
-| `server/src/shared/markdownCodec.ts` | `src/core/hash/markdownLf.ts` | markdown-lf-v1 canonicalization, logical hash, exact fingerprint |
-| `server/src/shared/vaultPath.ts`, `adfa7a7:src/paths/canonicalPath.ts` | `src/core/paths/validate.ts` | Reworked to §c.2 rules (frozen Unicode, reserved stems) |
+| `adfa7a7:server/src/shared/markdownCodec.ts` | `src/core/hash/markdownLf.ts` | markdown-lf-v1 canonicalization, logical hash, exact fingerprint |
+| `adfa7a7:server/src/shared/vaultPath.ts`, `adfa7a7:src/paths/canonicalPath.ts` | `src/core/paths/validate.ts` | Reworked to §c.2 rules (frozen Unicode, reserved stems) |
 | `adfa7a7:src/paths/pathCollision.ts` | `src/core/paths/pathKey.ts` (tests) | Collision fixtures only. The key function is new (frozen case fold) |
 | `adfa7a7:src/paths/pathCategory.ts`, `adfa7a7:src/sync/exclude.ts` | `src/engine/reconcile/localState.ts` | Exclude patterns, kind classification |
-| `server/src/shared/canvasCodec.ts`, `canvasOrdering.ts`, `canvasTypes.ts`, `canvasLimits.ts` | `src/core/hash/canvasCanonical.ts`, `src/engine/reconcile/canvasDoc.ts` | Canonical bytes, Obsidian formatting, ranks, validation |
+| `adfa7a7:server/src/shared/canvasCodec.ts`, `canvasOrdering.ts`, `canvasTypes.ts`, `canvasLimits.ts` | `src/core/hash/canvasCanonical.ts`, `src/engine/reconcile/canvasDoc.ts` | Canonical bytes, Obsidian formatting, ranks, validation |
 | `adfa7a7:src/sync/lineMerge.ts`, `threeWayMerge.ts` | `src/core/merge/{myers,diff3}.ts` | Line diff3 core and limits. Policy wrappers dropped |
 | `adfa7a7:src/sync/boundedTextDiff.ts`, `diff.ts` (`tryApplyDiffToYText` only) | `src/core/merge/minimalDiff.ts`, `src/engine/reconcile/mergeJob.ts` | Minimal diff + CAS apply. `forceReplaceYText` is **dropped** |
 | `adfa7a7:src/sync/dailyLimit.ts` | `src/engine/adapters/relayHttp.ts` (`dailyResetDelayMs`), `src/engine/runtime/relayPolicy.ts` (retry), `src/engine/runtime/dailyLimit.ts` (notice gate + text) | `resetAt` parsing, probe schedule, notice gate |
@@ -2534,7 +2636,7 @@ The old client was deleted once the port was done; `adfa7a7:src/...` names its f
 - **Multiple merge/divergence policies** (`bindDivergencePolicy`, `closedFileConflict`, `externalEditPolicy`,
   `preservedUnresolved`, `runtime/reconcile/*` policies, `ThreeWayConflictModal`). One `MergeFn` + conflict copies,
   and no interactive merge UI.
-  - `server/src/shared/canvasMerge.ts` is also dropped: canvas uses the same `MergeFn` (§j.2).
+  - `adfa7a7:server/src/shared/canvasMerge.ts` is also dropped: canvas uses the same `MergeFn` (§j.2).
 - **`forceReplaceYText`** and any whole-text replacement.
 - **Full-doc IDB persistence** (`vaultIndexedDb`, `vaultPersistence`, `diskMirror`). Replaced by the snapshot + tail
   + outbox schema.

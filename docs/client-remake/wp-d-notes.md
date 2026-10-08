@@ -55,14 +55,16 @@ Branch `client-remake-wp-d`. Scope: DESIGN §k.3 WP-D. Status of the acceptance 
   - `YaosController` (`pluginController.ts`) handles data persistence, runtime lifecycle, run state, commands, and applying settings and identity.
   - UI shells: settings tab, pair and pairing-code modals, brake modal, status bar, setup-link handler, diagnostics export.
 - **Day-1 spike plugin** (`src/host/spike/**`, `scripts/build-spike.mjs`): throwaway OR-1 and OR-2 probes, with a results modal and a Save-report button.
-- **Build** (`esbuild.config.mjs`). There are two bundles:
+- **Build** (`esbuild.config.mjs`). As delivered there were two bundles (since replaced by one, integration-notes D2:
+  `main.js` is one bundle wrapped in `__yaosBundle`, and the worker's Blob script is that function's source):
   - The worker IIFE string, exposed as `virtual:yaos-engine-worker` and started from a Blob URL.
   - CJS `main.js`. obsidian, electron, `@codemirror/*` and `@lezer/*` are external.
   - `production` writes `main.js` and `dist/yaos-client/{main.js,manifest.json,yaos/,yaos.zip}`, then runs `scripts/plugin-smoke.mjs`. The smoke checks are:
     - zip layout;
     - no WebAssembly;
     - `main.js` loads as a CJS plugin against a stub `obsidian`, reaches phase `running` on the inline carrier over the in-memory fake vault (`src/sim/fakeObsidian.ts`), never logs the token, and unloads (today, with no UI-thread fallback, the no-`Worker` load must reach phase `failed` with a "YAOS stopped" notice and open no IndexedDB, and a worker-thread load reaches `running`: `scripts/plugin-smoke.mjs`);
-    - the worker IIFE answers ping in a `node:vm` context.
+    - the worker IIFE answers ping in a `node:vm` context (today the worker-thread load runs `main.js`'s own bundle
+      wrapper the same way, `scripts/plugin-smoke-env.mjs:131-145`).
 - **check-deps** (`scripts/check-deps.mjs`) implements the §k.2 import rules:
   - areas;
   - type-only imports;
@@ -141,7 +143,7 @@ Install steps. Use a test vault only.
 2. Settings → Community plugins → turn Restricted mode off → enable "YAOS Spike".
 3. Command palette → **"YAOS Spike: Run probes"**. Wait about 45 s and do not touch the probe tab. The results modal then opens.
 4. Read the lines:
-   - `OR-1: ...`: a Blob-URL worker started and IndexedDB opened inside it, or the reason and the inline fallback result.
+   - `OR-1: ...`: a Blob-URL worker started and IndexedDB opened inside it, or the reason and the inline fallback result (the spike still probes the day-1 fallback; the product has none).
    - `OR-2 A/B/C/C2/D/E/R`, one line per scenario:
      - A: `vault.modify` reaches the per-instance `setViewData` wrapper (clear flags);
      - B: an `adapter.write` from another app reaches it (timing, modify event);
