@@ -19,16 +19,19 @@ const VAULT_ID = "AbCdEfGhIjKlMnOpQrStUv";
 const DEVICE_ID = "device-0001-abcdef";
 const CODE = `${VAULT_ID}.${"s".repeat(32)}`;
 
-/** §2.2 rows the console may call: discovery plus the D5 operator list (`:id` is any path parameter). */
+/**
+ * §2.2 rows the console may call: discovery plus the D5 operator list (`:id` is any path parameter). Not `POST /claim`
+ * or `POST /operator/vaults`: only the client's "Create a new vault" claims or creates (G26).
+ */
 const ROUTES = [
-	"GET /api/capabilities", "POST /claim", "POST /operator/login", "POST /operator/logout", "GET /operator/state",
-	"POST /operator/vaults", "POST /operator/vaults/:id/owner-code", "DELETE /operator/vaults/:id",
+	"GET /api/capabilities", "POST /operator/login", "POST /operator/logout", "GET /operator/state",
+	"POST /operator/vaults/:id/owner-code", "DELETE /operator/vaults/:id",
 	"GET /operator/vaults/:id/devices", "DELETE /operator/vaults/:id/devices/:id", "POST /operator/vaults/:id/reset-streams",
 	"POST /operator/vaults/:id/restore",
 ];
-/** Error codes the operator routes document: §5 row 2.2, §2.2, D3 (limiter), D5, D8a, D8b, G8. */
+/** Error codes the operator routes the console calls document: §2.2, D3 (limiter), D5, D8a, D8b, G8. */
 const DOCUMENTED_CODES = [
-	"already_claimed", "unauthorized", "too_many_attempts", "confirmation_mismatch", "purge_incomplete",
+	"unauthorized", "too_many_attempts", "confirmation_mismatch", "purge_incomplete",
 	"restore_in_progress", "restore_incomplete", "invalid_restore_point", "restore_unsupported", "cf_daily_limit",
 	"not_found", "body_too_large", "internal_error",
 ];
@@ -108,7 +111,7 @@ class Page {
 
 	$(id: string): FakeElement { const el = this.elements.get(id); assert.ok(el, `#${id}`); return el; }
 	get msg(): string { return this.$("msg").textContent; }
-	visible(): string { return ["claim", "login", "main"].filter((id) => !this.$(id).hidden).join(","); }
+	visible(): string { return ["unclaimed", "login", "main"].filter((id) => !this.$(id).hidden).join(","); }
 	reply(route: string, status: number, body: unknown = {}): void { this.replies.set(route, [status, body]); }
 	last(): Call { const call = this.calls.at(-1); assert.ok(call, "a request"); return call; }
 	card(): FakeElement { return this.$("vaults").find("section"); }
@@ -246,53 +249,22 @@ s.test("secrets: no web storage, cookie access or console output anywhere in the
 
 // ---- console flows -------------------------------------------------------------------
 
-s.test("claim: the key is shown and confirmed before POST /claim {operatorRecoveryKey}; then code, link and QR", async () => {
-	const page = await consoleWith(false);
-	assert.equal(page.visible(), "claim");
-	await page.press(page.$("claim-start"));
-	const key = page.$("claim-key").value;
-	assert.match(key, /^[0-9a-f]{64}$/);
-	assert.equal(page.$("claim-go").disabled, true, "claim waits for the saved checkbox");
-	assert.deepEqual(page.calls.map((c) => c.path), ["/api/capabilities"], "nothing sent before the confirmation");
-	page.$("claim-saved").checked = true;
-	page.$("claim-saved").onchange?.();
-	page.reply("POST /claim", 200, { ok: true, host: ORIGIN, vaultId: VAULT_ID, vaultName: "Personal", pairingCode: CODE,
-		pairingExpiresAt: Date.now() + 900_000, obsidianUrl: "obsidian://ignored", capabilities: {} });
-	page.reply("GET /operator/state", 200, STATE);
-	await page.press(page.$("claim-go"));
-	const claim = page.calls.find((c) => c.path === "/claim")!;
-	assert.deepEqual([claim.method, claim.headers, claim.body], ["POST", { "Content-Type": "application/json" }, { operatorRecoveryKey: key }]);
-	assert.equal(page.last().path, "/operator/state");
-	assert.equal(page.visible(), "main");
-	assert.equal(page.$("claim-key").value, "", "the key leaves the page");
-	const pair = page.$("pair");
-	assertSetupQr(pair.find("img"), CODE);
-	assert.equal(pair.find("input").value, CODE);
-	assert.equal(pair.find("a").href, `obsidian://yaos?action=setup&host=${encodeURIComponent(ORIGIN)}&pairingCode=${encodeURIComponent(CODE)}`);
-	assert.match(pair.textContent, /Pair a device with Personal/);
-	assert.equal(page.card().find("h3").textContent, "Notes");
-	page.assertClean([key, CODE]);
+s.test("G26: the console has no claim or create-vault control, and never sends /claim or POST /operator/vaults", async () => {
+	const html = await consolePage().text();
+	const script = inlineScript(html);
+	assert.ok(!/id="(new-name|create|claim-start|claim-key|claim-saved|claim-go|claim-copy)"/.test(html), "no claim or create control");
+	assert.ok(!/Create vault|Claim server|Generate a recovery key/.test(html.replace(QRCODE_SCRIPT, "")), "no claim or create wording");
+	assert.ok(!/"\/claim"|"\/operator\/vaults"\s*,/.test(script), "no /claim or create-vault request");
 });
 
-s.test("claim: 409 already_claimed → sign-in; 503 or no answer keeps the key and says the claim may have gone through", async () => {
-	for (const reply of [[503, { error: "internal_error" }], "network", [409, { error: "already_claimed" }]] as const) {
-		const page = await consoleWith(false);
-		await page.press(page.$("claim-start"));
-		const key = page.$("claim-key").value;
-		page.$("claim-saved").checked = true;
-		page.$("claim-saved").onchange?.();
-		page.replies.set("POST /claim", reply === "network" ? reply : [reply[0], reply[1]]);
-		await page.press(page.$("claim-go"));
-		if (reply !== "network" && reply[0] === 409) {
-			assert.equal(page.visible(), "login");
-			assert.equal(page.msg, CONSOLE_MESSAGES.already_claimed);
-		} else {
-			assert.equal(page.visible(), "claim");
-			assert.equal(page.$("claim-key").value, key, "the saved key stays visible");
-			assert.equal(page.msg, CONSOLE_MESSAGES.claim_unknown);
-		}
-		page.assertClean([key]);
-	}
+s.test("unclaimed: the page points to YAOS: Create a new vault with this server's address and sends nothing else", async () => {
+	const page = await consoleWith(false);
+	assert.equal(page.visible(), "unclaimed");
+	assert.equal(page.$("origin").textContent, ORIGIN);
+	assert.match(page.html, /run\s+<strong>YAOS: Create a new vault<\/strong>/);
+	assert.deepEqual(page.calls.map((c) => `${c.method} ${c.path}`), ["GET /api/capabilities"]);
+	assert.equal(page.$("pair").children.length, 0, "no pairing code or QR");
+	page.assertClean([]);
 });
 
 s.test("login: POST /operator/login {operatorRecoveryKey}; 401 → wrong key; 200 → vault list, field cleared", async () => {
@@ -317,14 +289,9 @@ s.test("login: POST /operator/login {operatorRecoveryKey}; 401 → wrong key; 20
 	page.assertClean([key]);
 });
 
-s.test("vault: create, owner code + QR, devices + revoke (D7), and the pending-restore banner (D8b)", async () => {
+s.test("vault: owner code + QR, devices + revoke (D7), and the pending-restore banner (D8b)", async () => {
 	const page = await consoleWith(true, { ...STATE, pendingRestores: [{ vaultId: VAULT_ID, at: "2026-10-05T10:00:00.000Z" }] });
 	assert.match(page.card().textContent, /Restore incomplete: the restore to 2026-10-05 10:00:00 UTC has not finished/);
-	page.$("new-name").value = "Work";
-	page.reply("POST /operator/vaults", 200, { vault: { vaultId: "WwWwWwWwWwWwWwWwWwWwWw", name: "Work" } });
-	await page.press(page.$("create"));
-	assert.deepEqual(page.calls.find((c) => c.path === "/operator/vaults")!.body, { name: "Work" });
-	assert.equal(page.last().path, "/operator/state");
 	const base = `/operator/vaults/${VAULT_ID}`;
 	page.reply(`POST ${base}/owner-code`, 409, { error: "restore_in_progress" });
 	await page.press(page.card().button("Pair a device"));
@@ -333,6 +300,7 @@ s.test("vault: create, owner code + QR, devices + revoke (D7), and the pending-r
 		obsidianUrl: "obsidian://ignored", mobileSetupUrl: "https://elsewhere.test/mobile-setup#x" });
 	await page.press(page.card().button("Pair a device"));
 	assert.equal(page.$("pair").find("input").value, CODE);
+	assert.match(page.$("pair").textContent, /adds a device to the existing vault Notes; it does not set up a vault/);
 	assertSetupQr(page.$("pair").find("img"), CODE);
 	page.reply(`GET ${base}/devices`, 200, { devices: [{ deviceId: DEVICE_ID, deviceName: "Phone", enrolledAt: 1_790_000_000_000 }] });
 	await page.press(page.card().button("Devices"));

@@ -149,8 +149,8 @@ pairing-code make zero config-DO calls, checked with a counting stub).
 **D5 Surviving routes.** Exactly the §2.2 table; everything else → 404.
 - Static Worker responses, no DO call: the console (`GET /`), `GET /mobile-setup` (the target of `mobileSetupUrl`
   and the console's setup QR) and CORS preflight.
-- The console is one server-rendered page with inline JS and no external assets. It covers claim, login, the
-  vault list, create vault, owner code + QR (drawn in the page, O12), devices + revoke, reset streams behind a typed vaultId
+- The console is one server-rendered page with inline JS and no external assets. It covers login, the
+  vault list, owner code + QR (drawn in the page, O12), devices + revoke, reset streams behind a typed vaultId
   confirmation, and the D8b "Restore incomplete" banner.
 - Operator JSON routes require `Content-Type: application/json` and a same-origin `Origin`. The cookie is
   HttpOnly, Secure, SameSite=Strict, 7 days.
@@ -691,7 +691,9 @@ P2 and P4 gap calls (accepted; marked `DECISIONS-GAP` in code). G7 is closed: ro
 - G25 Operator response shapes (the console reads only these): state `{vaults:[{vaultId,name,createdAt}],
   pendingRestores:[{vaultId,at}]}`; devices `{devices:[{deviceId,deviceName,enrolledAt}]}`; owner-code adds
   `mobileSetupUrl`. Neither claim nor owner-code carries a QR; the console draws it (O12).
-- G26 The console generates the recovery key in the page and sends `/claim` only after "I have saved it" is ticked.
+- G26 The console neither claims nor creates a vault (the user's call, 2026-10-08): only a client's "Create a new
+  vault" may pin a vault's encryption, so a console-made vault was a dead end. An unclaimed server's console says to
+  run that command in Obsidian; the client sends `/claim` or `/operator/vaults` itself.
 - G27 The entry module (`worker.ts`) exports only the fetch handler and the DO classes: workerd treats every named
   export as an entrypoint and refuses to start on a constant. The route table is `router.ts`; a WB test guards it.
 
