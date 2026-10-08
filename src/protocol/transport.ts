@@ -14,7 +14,7 @@ export interface Transport<Out, In> {
 	/** FIFO. `transfer` lists buffers the receiver takes ownership of. */
 	post(message: Out, transfer?: readonly ArrayBuffer[]): void;
 	onMessage(listener: (message: In) => void): Unsubscribe;
-	/** Worker crashed / was terminated (worker transport only). */
+	/** Worker crashed / was terminated; on the in-process pair, its kill() test hook (inlineTransport.ts). */
 	onFailure(listener: (reason: string) => void): Unsubscribe;
 	close(): void;
 }

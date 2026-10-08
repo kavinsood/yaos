@@ -60,7 +60,7 @@ export interface StatusSnapshot {
 	 */
 	readonly maxBlobBytes: number | null;
 	readonly notices: readonly { readonly code: string; readonly level: "info" | "warn" | "error"; readonly atMs: number }[];
-	/** End-to-end encryption state (e2ee-design §18.4). No secrets. The engine always sets it; optional only so older snapshot literals still type-check. */
+	/** End-to-end encryption state (e2ee-design §18.4). No secrets. Set by the vault runtime and the key reader; absent from the idle status before either exists (compose/statusMerge.ts idleStatus). */
 	readonly e2ee?: E2eeStatus;
 }
 

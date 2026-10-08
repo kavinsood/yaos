@@ -145,7 +145,7 @@ These are deliberate. Each was decided without asking, as the brief allowed.
    - a version is `(varuint seq, varuint index, varstring deviceId)`.
 2. **Mirrors take a hash port.** The outbox/synced mirror codecs live in `core/codec/mirrors.ts`.
    - They use local structural types, because core cannot import `engine/store/schema.ts`.
-   - They take an async `Pick<HashPort, "sha256">` for the checksum, because core has no sha256 of its own.
+   - They take an async `Pick<HashPort, "sha256">` for the checksum, because core had no sha256 of its own. (WP-B's pure-JS sha256 refuses inputs over 4 KiB since 5be1c96b, so the port stays.)
    - V3 digests (`nsFoldDigest`) take the same parameter.
 3. **SimRelay is port-level, not wire-level.**
    - `SimRelaySession` plays the wsRelay adapter's role: wire message → `RelayEvent` (held PROVISIONALs, notice join, receipts → head, VAULT_ERROR → refused).

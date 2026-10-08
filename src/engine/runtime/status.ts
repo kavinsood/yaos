@@ -18,7 +18,7 @@ export function buildStatus(c: EngineCtx): StatusSnapshot {
 	return {
 		phase: c.phase,
 		deviceClass: c.deviceClass,
-		transport: "inline",
+		transport: "inline", // LogEngine alone (tests, harnesses); the composed engine reports its carrier (compose/statusMerge.ts)
 		vaultEpoch: c.repo.identity.vaultEpoch,
 		vaultSeq: c.repo.cursor.vaultSeq,
 		headSeq: c.repo.cursor.headSeqSeen,

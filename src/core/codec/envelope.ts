@@ -263,7 +263,7 @@ export async function openEnvelope(crypto: CryptoPort, input: OpenInput): Promis
 
 /**
  * Suite-0 CryptoPort (identity). Handy for tests; production and the sim use
- * engine/adapters/noopCrypto. diagHash needs a HashPort (core has no digest).
+ * engine/adapters/noopCrypto. diagHash needs a HashPort (core's own sha256 takes only SYNC_HASH_MAX_BYTES).
  */
 export function identityCrypto(hash?: HashPort): CryptoPort {
 	return {

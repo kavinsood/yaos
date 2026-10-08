@@ -19,8 +19,8 @@ of scope (DECISIONS §1 removes them server-side too). §2.4 lists what this des
   - **[User]** confirmed by the user on 2026-10-07 (their devices or Obsidian's documentation). Not measured by the
     spike and not read in a source here, so it is kept apart from [M] and [S] (§23.3).
 - Terms:
-  - **K_e**: the 32-byte vault key of key epoch `e` (`e ≥ 1`). "Vault key" in `server/src/vault/ticket.ts` (DECISIONS D4) is the relay's
-    ticket-signing key and is unrelated (server ask A8).
+  - **K_e**: the 32-byte vault key of key epoch `e` (`e ≥ 1`). The relay's ticket-signing key (`server/src/vault/ticket.ts`,
+    DECISIONS D4) is unrelated; it was called "vault key" at 7208184 and is the "ticket key" since server ask A8 (f3ef81ba).
   - **keyEpoch** (this document) vs **vaultEpoch** (the relay generation, DESIGN §c.12). They are independent.
   - **RK**: the recovery key (§13). **k**: the keyring stream (§11).
   - **S_rot**: the seq at which a revoke-kind keyring record committed (§14).
@@ -87,9 +87,9 @@ recovery · [14](#14-rotation-and-revocation) rotation · [15](#15-enable-migrat
 | File contents and settings | **Mitigated** | Sealed. |
 | Attachment equality with a known file | **Mitigated** | The address is `HMAC(kAddr, sha256)`, not sha256 (§10.1). |
 | Exact frame, checkpoint and blob sizes | **Mitigated (bucketed)** | Padmé leaks O(log log M) bits per size, with ≤ 12 % overhead [Padmé] (§7.3). |
-| Plaintext sha256 and size in HTTP headers | **Mitigated** | The client never sends `X-YAOS-Content-*`, and at 7208184 the server neither sets nor reads them. Server ask A2 drops the stale CORS names. |
+| Plaintext sha256 and size in HTTP headers | **Mitigated** | The client never sends `X-YAOS-Content-*`, and at 7208184 the server neither sets nor reads them. Server ask A2 dropped the stale CORS names (cd335f64). |
 | Number of streams, i.e. roughly the number of notes plus canvases | Accepted | One stream per doc is the relay's cost model (relay-wire §11.4). |
-| Stream class (`b:` vs `c:` vs `ns`/`cfg`/`k`) | Accepted | The relay's provisional broadcast keys on `b:`/`c:` (`server/src/streams/protocol.ts:54-56`). |
+| Stream class (`b:` vs `c:` vs `ns`/`cfg`/`k`) | Accepted | The relay's provisional broadcast keys on `b:`/`c:` (`server/src/streams/protocol.ts:52-54`). |
 | Which stream was touched when, and by which device | Accepted | Row timing, seq order and deviceId are relay-visible by design. This reveals editing activity per note. |
 | Bucketed sizes and growth of each stream | Accepted | Residual after padding. |
 | Device count, deviceName, IPs, user agents, connection times | Accepted | deviceName defaults to a neutral label under suite 1 (§12.3). |
@@ -273,7 +273,7 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 - **NEVER persist a key in `data.json`** (`<configDir>/plugins/yaos/data.json`). Folder sync and backup tools copy
   the config dir.
 - **NEVER put keys or RK in** logs, `StatusSnapshot`, `DiagnosticsBundle`, `Error` messages, notices or the URL bar.
-  Protocol fields that carry keys are marked SECRET, like `relay.credential` (`src/protocol/messages.ts:56`).
+  Protocol fields that carry keys are marked SECRET, like `relay.credential` (`src/protocol/messages.ts:61-62`).
 - **The suite pin** (`e2ee: { suite: 0 | 1 }`, not secret) lives in `data.json` next to the device token.
   - If the pin says 1 and the secret is missing, the device enters phase `key-missing`: re-key by QR or RK.
   - **No pin** (just enrolled by a key-less code, or `data.json` lost) means the device writes nothing until a pin
@@ -315,15 +315,17 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
      bytes are zero-filled when the seal epoch moves past them. Keys from `init.crypto` count as exported.
 3. New keys (adopted by roll, entered by QR or RK) are produced in the worker and posted back once in
    `keyringChanged` (SECRET). Main persists them to SecretStorage.
-4. The engine never runs on main (DESIGN §g.5); tests and the sim run the same code over the in-process pair.
+4. The engine never runs on main (DESIGN §g.5): the worker is the only carrier, and every carrier failure is terminal,
+   with no restart and no UI-thread fallback (`src/host/engineHost.ts:1-17`). Tests and the sim run the same code over
+   the in-process pair.
 
 ### 6.4 Side files and local state (DESIGN §e.4)
 
 | File | Content under suite 1 | Verdict |
 |---|---|---|
-| Outbox mirror | `sealed` bytes, i.e. ciphertext. Re-opened with keys by `recoverFromMirror` (`src/engine/runtime/mirrorIo.ts:162`) | Fine |
+| Outbox mirror | `sealed` bytes, i.e. ciphertext. Re-opened with keys by `recoverFromMirror` (`src/engine/runtime/mirrorIo.ts:144`) | Fine |
 | Synced mirror | Plaintext docId, path, contentHash, seqs | Accepted: the vault folder holds the same plaintext |
-| Local snapshots (zip) | Plaintext | Accepted (local). Uploads go through `putSealed` → `sealBlob` (`src/engine/snapshots/remote.ts:52`, `src/engine/blobs/blobStore.ts:29-34`) |
+| Local snapshots (zip) | Plaintext | Accepted (local). Uploads go through `putAt` → `sealBlob` (`src/engine/snapshots/remote.ts:56`, `src/engine/blobs/blobStore.ts:52-57`) |
 | IndexedDB `tail`, `snapshots`, `baseText`, ... | Plaintext (T_receipt stores outbox content, DESIGN §e.2) | Accepted (non-goal: local at-rest encryption) |
 | Diagnostics bundle | Hashes MUST be `HMAC(kDiag, ·)`, not sha256 (DESIGN §j.7). Pseudonym = the first 12 hex of `CryptoPort.diagHash(salt ‖ 0x00 ‖ value)`; the per-bundle random salt stays, so two bundles do not correlate unless the user shares both (`src/engine/compose/diagnosticsBundle.ts`) | Done in WP-E2 |
 
@@ -408,12 +410,13 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
   - Checkpoints. `maxCheckpointBytes` = 4194304 (relay-wire §3.2; Worker cap 4 MiB, DECISIONS §2.2).
     - [D] For lengths in [2^21, 2^22), Padmé pads to multiples of 64 KiB.
     - The writer's existing `sealed.length > maxCheckpointBytes` branch handles the ≤ 12 % growth
-      (`src/engine/body/checkpoints.ts:174-176`).
+      (`src/engine/body/checkpoints.ts:288-292`, `:333-336`).
   - Blobs. `maxBlobUploadBytes` = 100 MB = 100000000 B, Cloudflare's request body limit on the Free and Pro plans
     (DECISIONS D9; a larger request gets the edge's own 413).
     - [D] For lengths in [2^26, 2^27), Padmé pads to multiples of 2 MiB. The largest padded plaintext that fits
-      with header and overhead is 47 × 2 MiB = 98566144 B (sealed: 98566179 B at the largest keyEpoch; 48 × 2 MiB
-      seals to 100663327 B).
+      with header and overhead is 47 × 2 MiB = 98566144 B. Sealed = header + 28 + padded, and the header is 3 B at
+      keyEpoch 1 and 10 B at the largest keyEpoch, 2^53 − 1 (`src/core/codec/sealedBlob.ts:20-26`): 98566175 B at
+      keyEpoch 1, 98566182 B at the largest. 48 × 2 MiB seals to 100663327 B at keyEpoch 1, over the cap.
     - So the largest suite-1 plaintext is `maxSealedBlobPlaintext(100000000)` = **98566143**, the 0x80 marker
       included. Suite 1 has no cap of its own: `maxSealedBlobPlaintext(cap)` derives it from whatever transport cap
       the relay reports (`src/core/codec/sealedBlob.ts`).
@@ -516,7 +519,7 @@ pre-restore frames from the abandoned timeline into the new epoch. This is accep
   - every relay payload (`ns`, `cfg`, `b:`, `c:`, `snap`);
   - every checkpoint;
   - every blob: attachments, oversize body updates behind `bodyUpdateRef`, and uploaded snapshot bundles (multi-part
-    zips indexed by `snap`; each part stored through `src/engine/snapshots/remote.ts:52`);
+    zips indexed by `snap`; each part stored through `src/engine/snapshots/remote.ts:56`);
   - the key material inside `k` records (§11).
 - **Visible to the server:**
   - stream names: `b:`/`c:` + a random docId, plus `ns`, `cfg`, `k`, `snap`;
@@ -584,7 +587,7 @@ A device with no suite pin never reaches this table: it opens nothing (§12.4).
   a blob hash or address (DESIGN §j.1).
 - **Dedupe** is per vault. Identical plaintexts get identical addresses, so a `has` hit can skip the upload
   (`putSealed`, `src/engine/blobs/blobStore.ts:40-48`, for frames and attachments; snapshot parts batch the same
-  check, `src/engine/snapshots/remote.ts:47-55`). There is no cross-vault dedupe: kAddr differs per vault.
+  check, `src/engine/snapshots/remote.ts:48-56`). There is no cross-vault dedupe: kAddr differs per vault.
 - **Accepted leak.** Equality of two attachments inside one vault, and blob count and bucketed sizes (§2.2).
 - Alternative: convergent per-blob keys `K = H(plaintext)`. Rejected: they allow confirmation of guessed files by
   anyone with the ciphertext, and add a key per blob for no single-user gain.
@@ -617,13 +620,13 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
     `suite-downgrade` or a sha256 mismatch under a verified sealing key, or a header that does not parse.
     Absent, transport errors, `unknown-key`, `unsupported-suite` and anything under an unverified key reset the
     count.
-  - A body/canvas ref freezes the doc `blob-corrupt` (§9.3; `src/engine/runtime/docRuntime.ts:221-240`). No
+  - A body/canvas ref freezes the doc `blob-corrupt` (§9.3; `src/engine/runtime/docRuntime.ts:225-244`). No
     QuarantineRecord is written, because the row holds no sealed blob; `releaseQuarantine` unfreezes it and the
     count starts over.
   - An attachment is quarantined in memory on the blob queue (notice `blob-quarantined`,
     `src/engine/blobs/blobQueue.ts:571-574`), because an ns row cannot be quarantined. A restart retries.
   - A snapshot restore fails `content_corrupt` only on a deterministic failure or an absent part. A
-    reader-dependent failure fails the request with no corruption notice (`src/engine/snapshots/remote.ts:77-85`).
+    reader-dependent failure fails the request with no corruption notice (`src/engine/snapshots/remote.ts:81-89`).
 
 ### 10.3 No chunking
 
@@ -632,9 +635,11 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
 - [M] At ≥ 2 GB/s on desktop, sealing 10 MiB takes ~5 ms; 95 MB seals in 70 ms and opens in 63 ms (node, below).
   Mobile is **[U]** (budget §16).
 - [M] Blob-sized transient buffers besides the plaintext itself (`scripts/bench-e2ee.mjs`, `benchBlobMemory`):
-  - Up: 3. The padded copy (AES-GCM takes one contiguous input), the ciphertext, and one `Blob` request body.
-    `sealBlob` returns the parts `[header ‖ nonce, ciphertext]`; the transport joins them once. `put` is not
-    async, so only the `Blob` is reachable while the PUT runs (`src/engine/adapters/httpBlob.ts`).
+  - Up: 3. The padded copy (AES-GCM takes one contiguous input; `pad`, `src/core/codec/padme.ts:30-35`, called at
+    `src/engine/adapters/webCryptoSuite1.ts:139`), the ciphertext, and one `Blob` request body. `sealBlob` returns
+    the parts `[header ‖ nonce, ciphertext]`; the transport joins them once. `put` is not async, so only the `Blob`
+    is reachable while the PUT runs. The PUT runs over XMLHttpRequest since 5a55d3be, which reads the `Blob` as a
+    stream (`src/engine/adapters/httpBlob.ts:415-422`).
   - Down: 3. The response body, the plaintext (unpad is a view), and the exact-size copy handed to main. A GET
     with a `Content-Length` is read into one buffer of that size as chunks arrive (`readBody`), where
     `arrayBuffer()` held every chunk until it joined them; only the plaintext is reachable once it is open.
@@ -644,13 +649,25 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
   output); `sealBlob` 3.05 N (the floor plus the padded copy); `openBlob` 2.03 N; `httpBlob.get` 1.08 N (2.07 N
   with `arrayBuffer()`); `putSealed` through `httpBlob` 5.12 N and `getOpened` plus the copy for main 4.11 N, both
   including garbage not yet collected (reachability after gc(): during the PUT only the `Blob`; after the open only
-  the plaintext).
+  the plaintext). These were measured with the fetch PUT, before 5a55d3be. The bench now drives `httpBlob.put`
+  through a stub XMLHttpRequest whose `send()` runs the same body extraction (`scripts/bench-e2ee.mjs:307-309`),
+  and has not been re-run for this document.
+- **Several transfers at once.** The figures above are per transfer. The blob queue runs transfers concurrently
+  within a byte budget (`Budgets.blobBytesInFlight`, 64 MiB on desktop, `src/core/limits.ts:243`, `:259`), and each
+  transfer counts at least `BLOB_TRANSFER_MIN_COST` = 4 MiB (`:205`). A transfer larger than the budget runs alone,
+  so the bytes held stay within max(budget, one blob), plus the seal and open copies of those bytes
+  (`src/engine/blobs/blobQueue.ts:34-41`). A transfer never blocks a reconcile pass: the plan job claims it
+  (`claimUpload` / `claimDownload`, `:342`, `:358`), and the queue wakes a pass over its docs when it settles.
 - **Caps.**
   - Suite 1 plaintext ≤ `maxSealedBlobPlaintext(maxBlobBytes)`: 98566143 at the relay's 100 MB (§7.3). Above
     that, or above the attachment size setting, the file is not synced (skip notice) and nothing is uploaded.
+    **[M]** A deployed Worker (workers.dev, code 7602a7bf, 2026-10-07T22:54Z,
+    `experiments/logs/client-e2e-typing-xfer-deployed2-20261007T225440Z.json`) took a 100000000 B suite-0
+    attachment and a 98566143 B suite-1 one (98566175 B sealed at keyEpoch 1, §7.3); each arrived sha256-identical
+    on the peer.
   - A PUT answered 413, by the relay or by Cloudflare's edge (whatever the body), refuses that blob for the life
     of the engine: one notice, no outage record, no retry; changed bytes are a new hash and are tried
-    (`src/engine/blobs/blobQueue.ts` `upload`).
+    (`src/engine/blobs/blobQueue.ts:542-547`, `runUpload`).
   - No blob store (`blob = null`): attachments are not synced (fail closed, DESIGN §j.1). The log carries no
     blob bytes.
 
@@ -660,31 +677,38 @@ The server cannot see which blobs a vault references (under suite 1 it sees opaq
 client mark-and-sweep against the server's list and batch conditional delete (server ask A3, built: relay-wire
 §11.3.1). The same code runs under suite 0. Implemented in WP-E6b.
 
-- **Server part** (relay-wire §11.3.1, `server/src/router.ts:639-686`):
+- **Server part** (relay-wire §11.3.1; these routes post-date the 7208184 baseline, so their lines are at 7cf68234,
+  `server/src/router.ts:640-687`):
   - `GET /vault/:id/blobs?cursor=` pages `{address, uploadedAt}` in address order, 1000 a page. It may answer
     `503 list_incomplete` with Retry-After.
   - `POST /vault/:id/blobs/delete {"ifUploadedBefore", "addresses"}` takes 1–100 addresses and answers
     `deleted | newer | absent` for each. R2 has no conditional delete, so all the heads run first and then one
-    delete (`:823-835`).
-  - Both routes share 60 requests a minute per vault: `429` with Retry-After (`server/src/vault/host.ts:418-424`).
+    delete (`:825-834`).
+  - Both routes share 60 requests a minute per vault: `429` with Retry-After (`server/src/vault/host.ts:418-424`
+    at 7cf68234).
 - **Client ports.** `BlobPort.list` and `BlobPort.deleteIfUploadedBefore` (`src/ports/blob.ts:63-69`, batches of
   ≤ `BLOB_DELETE_BATCH` = 100).
   - The HTTP adapter retries 429/503 after Retry-After, at most 5 calls, waits of ≤ 65 s, abortable on engine stop
-    (`src/engine/adapters/httpBlob.ts:59-62`, `:305-322`).
+    (`src/engine/adapters/httpBlob.ts:59-62`, `:305-322`). Each attempt, its reply included, ends at a deadline
+    sized to what it can move: about 17 s for a list page and 15.5 s for a delete batch (`relayHttpDeadlineMs`,
+    15 s plus the bytes at 64 KiB/s, `src/core/deadline.ts:63-65`; `httpBlob.ts:72-74`).
   - `SimBlobStore` (`src/sim/blobStore.ts`) stamps `uploadedAt` from the sim clock, refreshes it on PUT, and has
     hooks for the HEAD→delete race.
 - **Trigger.** Only the Obsidian command "Clean up unused server attachments": one `cleanUpAttachments` command,
   one sweep in the worker, one notice. It says what was deleted, what was kept as newer, what was repaired or
   lost, or why nothing was deleted (`src/host/ui/attachmentsCleanup.ts`). There is no schedule, status row,
   settings row or progress UI.
-  - Path: `src/engine/compose/runtimeOps.ts:148-151` → `src/engine/runtime/blobGc.ts` (preconditions, live set)
+  - Path: `src/engine/compose/runtimeOps.ts:150-153` → `src/engine/runtime/blobGc.ts` (preconditions, live set)
     → `src/engine/blobs/gc.ts` (sweep).
   - It runs in the writer runtime (a VaultRuntime), which exists only while `PinGate` is open
     (`src/engine/compose/pinGate.ts:148-162`, §12.4). A closed device (unpinned, or suite 1 without the newest
     winner's key) runs the KeyReader instead, which answers the command `refused: "keys-unverified"` with zero
     counts (`src/engine/compose/keyReader.ts:188-191`).
-  - One sweep at a time (`busy`); engine stop aborts it (`interrupted`).
-- **Grace** `EngineTuning.blobGcGraceMs` = 7 days (`src/engine/runtime/options.ts:56-60`, `:87`). It is a tuning
+  - One sweep at a time (`busy`); engine stop aborts it (`interrupted`). The session loop declaring the relay link
+    dead aborts the sweep's store calls in flight too: they go through the engine's `TransferLink`
+    (`src/engine/blobs/transferLink.ts:1-7`, `src/engine/runtime/context.ts:128`), and a list or delete that fails so
+    ends the sweep `interrupted` (`src/engine/blobs/gc.ts:157-160`).
+- **Grace** `EngineTuning.blobGcGraceMs` = 7 days (`src/engine/runtime/options.ts:58-63`, `:91`). It is a tuning
   knob: the e2e uses 8 s.
 
 **Preconditions.** Fail closed: any failure deletes nothing and names the reason in the notice. A live set
@@ -696,13 +720,13 @@ computed from a partial view would delete live data.
 | `keys-unverified` | Suite 1: the sealing epoch is ≥ 1 and verified, and so is K_1, because addresses use the kAddr of K_1 (§5.1). And the in-session write gate is open (`writeGate.ts`): a device revoked mid-session, or behind a newer winner it has no key for, is refused before it lists, because its deletes would be refused anyway | `:104-111` |
 | `offline`, `read-only` | A relay session, and it is writable | `:112-113` |
 | `not-caught-up` | `ns`, `cfg` and `snap` are read to the relay's head now, in this session (`SessionLoop.readFresh`, `src/engine/runtime/sessionLoop.ts:306-327`), and none is stale | `:125-127` |
-| `fold-incomplete` | No quarantined `ns` / `cfg` / `snap` row. Every fold is complete: not halted, its snapshot decodes, and each tail row opened, passed the gate, decodes, is folded and (for `snap`) has a known record version (`FoldRuntime.gap`, `src/engine/sync/foldRuntime.ts:162-184`; `src/engine/sync/snapRuntime.ts:51`) | `:128-133` |
+| `fold-incomplete` | No quarantined `ns` / `cfg` / `snap` row. Every fold is complete: not halted, its snapshot decodes, and each tail row opened, passed the gate, decodes, is folded and (for `snap`) has a known record version (`FoldRuntime.gap`, `src/engine/sync/foldRuntime.ts:181-202`; `src/engine/sync/snapRuntime.ts:56-58`) | `:128-133` |
 | `body-unreadable` | Every body/canvas row the relay still serves opens for this reader. A reader-dependent failure (`isReaderDependent`, `src/engine/ingest/envelope.ts:58`: unsupported version or suite, unknown key, a bad tag under an unverified key) may hide a ref, so it refuses. A deterministic failure is skipped, because no reader can resolve it | `:160-161`, `src/engine/blobs/bodyRefs.ts` |
 | `addressing-mismatch` | Safety net: nothing is deleted until the listing shows one of the addresses that the committed folds reference (else any live one). A listing that never shows one refuses. This guards against a wrong suite or key, under which every live address looks unknown | `src/engine/blobs/gc.ts:117-118`, `:150`, `:153-155` |
 
 - **K_1 after a roll.** A device that joins at epoch ≥ 2 (installKey by QR or RK) still gets K_1 verified: the
   keyring opens each winner's `prevWrap` with the next epoch's verified key and checks the kcv
-  (`src/engine/keyring/evaluate.ts:104-122`, `:150-151`). So the K_1 condition does not lock out late joiners, and
+  (`src/engine/keyring/evaluate.ts:112-130`, `:158-164`). So the K_1 condition does not lock out late joiners, and
   GC keeps requiring it (test: `src/engine/compose/keyReader.test.ts:227`, a QR join at epoch 2 and an RK join
   at epoch 3; e2e: `e2e/client/e2ee.ts` step 5).
 
@@ -710,9 +734,9 @@ computed from a partial view would delete live data.
 - every ns entry's blob, tombstones included. Tombstones stay in the fold until the count-based prune
   (`TOMBSTONE_CAP` 20000, hysteresis 1000; `src/core/limits.ts:20-21`, `src/core/ns/fold.ts:224-226`);
 - every `cfg` file blob, and every part of every record in the `snap` fold. A `del` removes the record, and
-  readers recompute part addresses from the sha256 (`src/engine/snapshots/remote.ts:46`, `:73`). See
-  `committedBlobHashes`, `src/engine/blobs/touch.ts:31-37`;
-- every own outbox frame not yet committed (`frameBlobHashes`, `touch.ts:43-68`). For a `bodyUpdateRef` this is
+  readers recompute part addresses from the sha256 (`src/engine/snapshots/remote.ts:47`, `:74`). See
+  `committedBlobHashes`, `src/engine/blobs/touch.ts:32-39`;
+- every own outbox frame not yet committed (`frameBlobHashes`, `touch.ts:41-70`). For a `bodyUpdateRef` this is
   the sha256 of the frame's content;
 - the blob queue: pending and running transfers, both directions (`BlobQueue.liveHashes`);
 - every `bodyUpdateRef` the relay still serves on the body/canvas stream of each ns entry and of each stream this
@@ -720,8 +744,9 @@ computed from a partial view would delete live data.
   - "Unresolved" means readable by a joiner. A read from 0 gets the checkpoint plus the rows above `gcSeq`
     (`server/src/streams/store.ts:476-523`), and checkpoints hold Yjs state, never refs.
   - So rows above `gcSeq` are scanned: a probe read after `MAX_SAFE_INTEGER` returns `lastSeq`/`gcSeq` only
-    (`server/src/streams/relay.ts:269-274`), then the rows are read from `gcSeq`. If compaction meanwhile moves
-    `gcSeq` past the cursor, the scan restarts at the new `gcSeq` (`src/engine/blobs/bodyRefs.ts:83-84`).
+    (`server/src/streams/relay.ts:252-257` accepts it as a cursor, `:922-935` answers), then the rows are read from
+    `gcSeq`. If compaction meanwhile moves `gcSeq` past the cursor, the scan restarts at the new `gcSeq`
+    (`src/engine/blobs/bodyRefs.ts:83-84`).
 
 **Sweep** (`src/engine/blobs/gc.ts:96-195`). Calls are sequential and honour Retry-After.
 1. R1 cutoff probe (below).
@@ -762,7 +787,7 @@ computed from a partial view would delete live data.
     - from local bytes: the frame's own content for a `bodyUpdateRef`, else a vault file, config file or own
       snapshot part with that sha256 (`src/engine/compose/vaultRuntime.ts:283-309`);
     - without local bytes, the stored object is re-PUT verbatim;
-    - a store error holds that frame (and later frames of its stream, `src/engine/body/sender.ts:343-346`) with
+    - a store error holds that frame (and later frames of its stream, `src/engine/body/sender.ts:414-417`) with
       backoff instead of sending an unprotected reference.
   - Changes from the first proposal:
     - a cleared frame stays cleared for only grace/4 (monotonic clock), and a new session re-checks every frame.
@@ -808,7 +833,7 @@ computed from a partial view would delete live data.
 ## 11. Keyring stream `k`
 
 The keyring is an ordinary relay stream named `k`. The relay treats stream names as opaque, so it needs no server
-change (`server/src/streams/protocol.ts:16`; server ask A9). `streamClass` gains `"keyring"` (`src/core/types.ts:74`).
+change (`server/src/streams/protocol.ts:62-63`; server ask A9). `streamClass` gains `"keyring"` (`src/core/types.ts:79`).
 `k` frames carry a **k record** as payload, not an envelope. `k` has no checkpoints: a vault sees a handful of
 records in its lifetime, and each is under 256 bytes.
 
@@ -937,8 +962,8 @@ obsidian://yaos?action=setup&host=<host>&pairingCode=<vaultId.secret>&key=<b64ur
    - The vaultId is already inside the pairing code (DECISIONS D3).
 3. The plugin draws the QR itself, with `qrcode` 1.5.4 (+9.6 KB gzip **[M]**, §23).
 4. The new device scans it. Obsidian hands the parameters to `registerObsidianProtocolHandler`
-   (`src/host/ui/registerUi.ts:220`). `parseSetupLink` (`pairing.ts:822`) accepts `key` or `suite` (§12.4), never
-   both (they join `SETUP_LINK_KEYS`, `pairing.ts:814`, which rejects unknown keys).
+   (`src/host/ui/registerUi.ts:220`). `parseSetupLink` (`src/host/ui/pairing.ts:822`) accepts `key` or `suite`
+   (§12.4), never both (they join `SETUP_LINK_KEYS`, `pairing.ts:814`, which rejects unknown keys).
 5. **The key is stripped before `/enroll`.** DECISIONS D3 requires exactly this: "A future client-only key part
    must be stripped before `/enroll`". The key goes into the pending identity, in memory only. After enroll, the
    device reads `k`, checks kcv and walks the chains (§11.3). It then persists the keys and the suite pin.
@@ -980,7 +1005,7 @@ one of the user's devices. It can never set suite 0 and never reaches the creati
 - deviceName is plaintext on the server, shown in the console and stored in device rows
   (`server/src/vault/host.ts:544`).
 - The default is already a platform label such as "iPhone" or "Mac" (`src/host/ui/deviceName.ts`). The server
-  de-duplicates repeats (`uniqueDeviceName`, `host.ts:544`).
+  de-duplicates repeats (`uniqueDeviceName`, `server/src/vault/host.ts:544`).
 - Under suite 1 the pair modal shows a hint next to the name field: "Visible to the server operator". No server
   change is needed (decision D6).
 
@@ -1077,7 +1102,7 @@ QR, ends up blocked, not downgraded.
     `keyMissing() === null`: the adapter holds the newest stored winner's key, verified against its record
     (`:117-126`). Unpinned is closed.
   - `writerPorts` (`:159-162`) throws while the gate is closed, and it is the only way to the ports of a
-    VaultRuntime (`src/engine/compose/protocolEngine.ts:230-233`). So a closed device cannot build the one thing
+    VaultRuntime (`src/engine/compose/protocolEngine.ts:230-234`). So a closed device cannot build the one thing
     that writes.
 - **A closed device runs the KeyReader** (`src/engine/compose/keyReader.ts`) over `readerPorts` (`pinGate.ts:165-167`).
   - Its ports: a relay that connects and reads (`append` throws, `putCheckpoint` rejects; on the creation path it
@@ -1088,8 +1113,8 @@ QR, ends up blocked, not downgraded.
     `revokeRekey`. `cleanUpAttachments` gets `refused: "keys-unverified"` (`keyReader.ts:186-211`).
 - **Two ways out of the reader, by pin:**
   - **Unpinned.** A verified key goes to main as `keyringChanged`. Main stores it in SecretStorage
-    (`src/host/keys/hostKeys.ts:57-70`; on a suite-0 pin it answers `refused`, `:60`). `pinsFromKeyring`
-    (`src/host/keys/pin.ts:152-154`) then pins suite 1, and saves the pin before the engine gets `keyringStored`.
+    (`src/host/keys/hostKeys.ts:61-75`; on a suite-0 pin it answers `refused`, `:64`). `pinsFromKeyring`
+    (`src/host/keys/pin.ts:163-165`) then pins suite 1, and saves the pin before the engine gets `keyringStored`.
     Main then restarts the engine with the pinned config (`src/host/pluginController.ts:306-311`). A successful
     `enableE2ee` or `pinSuite0` pins the same way (`:295-300`).
   - **Suite 1 without the key** (`"no-key"`, `"revoked-epoch"`). Once main has stored the key, the reader's `onKeyed`
@@ -1254,23 +1279,25 @@ Encryption is chosen only on the **creation path**: a YAOS "Create a new vault" 
 the vault-creating server call itself. Before WP-E5 the plugin had no such flow: every pairing was a key-less enroll
 by code, and an unclaimed server was refused with "Open it in a browser to claim it first". Both still hold for
 pairing (`fetchCapabilities`, `src/host/ui/pairing.ts:251`, accepts an unclaimed server only with
-`allowUnclaimed`, which only `probeServer` passes, `src/host/ui/createVault.ts:62-66`). WP-E5 added the flow
+`allowUnclaimed`, which only `probeServer` passes, `src/host/ui/createVault.ts:67-69`). WP-E5 added the flow
 (`src/host/ui/createVault.ts`; §21 "E5 as built").
 
 **Definition.** A device is on the creation path for vault V if and only if, in one flow that the user started from
 YAOS's own "Create a new vault" command or button, all three steps hold:
 1. **This device sent the call that created V,** and read V's vaultId from the response:
    - **Unclaimed server** (`GET /api/capabilities` says `claimed: false`): `POST /claim` (relay-wire §2.2,
-     `server/src/router.ts:293-336`).
-     - The claim creates the first vault (`CLAIM_VAULT_NAME`, `router.ts:99`) and returns its `pairingCode`.
+     `server/src/router.ts:256-304`).
+     - The claim creates the first vault (`CLAIM_VAULT_NAME`, `router.ts:70`) and returns its `pairingCode`.
      - The operator recovery key is generated on main as the console makes one (32 random bytes, hex,
        `server/src/console/console.ts:248-250`), then shown with Copy and an "I saved the operator key" checkbox
        that enables the claim.
    - **Claimed server**, in this order:
-     - `POST /operator/login` (`router.ts:339-352`) with the operator recovery key typed into this flow;
-     - `POST /operator/vaults {name}` (`:373-392`);
-     - `POST /operator/vaults/:id/owner-code` (`:470-488`) for that vaultId;
-     - `POST /operator/logout` (`:355-361`).
+     - `POST /operator/login` (`router.ts:306-320`) with the operator recovery key typed into this flow;
+     - `POST /operator/vaults {name}` (`:340-360`);
+     - `POST /operator/vaults/:id/owner-code` (`:434-456`) for that vaultId;
+     - `POST /operator/logout` (`:322-329`).
+   - Every claim, operator and pairing call fails with "no answer within 15 s" when no reply arrives in time
+     (`PAIRING_CALL_DEADLINE_MS`, `src/host/ui/pairing.ts:201-212`).
 2. **It enrolled with the code from step 1.** The code must name that vaultId, and it never leaves memory: it is
    not displayed, not put in a link and not logged.
 3. **After enrolling, it read `VAULT_READY.head = 0`** (relay-wire §3.2) **and read `k` to head, empty.**
@@ -1298,9 +1325,9 @@ unpinned and blocked (§12.4).
   - The marker is removed once a pin is set.
 - **Secrets.** The operator recovery key is held only for step 1. It is never stored, and the §6.1 NEVER rules
   apply to it. The settings hint now reads "The operator key stays in the console; only "Create a new vault" asks
-  for it here, and uses it once." (`src/host/ui/settingsTab.ts:127`).
+  for it here, and uses it once." (`src/host/ui/settingsTab.ts:129`).
 - **`Origin` [U].** `/claim` and the operator routes require JSON and an `Origin` equal to the server's origin
-  (`server/src/router.ts:153-158`, DECISIONS D5).
+  (`server/src/router.ts:118-129`, DECISIONS D5).
   - The plugin sends both explicitly on every such call (`operatorHeaders`, `src/host/ui/pairing.ts:552-556`). The
     session goes in a manual `Cookie` header, since `requestUrl` keeps no cookie jar.
   - Checked against the real relay with Node's fetch (`e2e/client/e2ee.ts` steps 1 and 6). Whether Obsidian's
@@ -1308,7 +1335,7 @@ unpinned and blocked (§12.4).
     **[U]** (§23.3). The typings say nothing either way: `RequestUrlParam.headers` and
     `RequestUrlResponse.headers` are plain string records (`node_modules/obsidian/obsidian.d.ts:5455`, `:5469`).
   - If it cannot, server ask A11 applies (§19). Until then the flow fails closed with a plain message
-    (`forbidden_origin`, `no_session`; `pairing.ts:608-609`, `:673`).
+    (`forbidden_origin`, `no_session`; `src/host/ui/pairing.ts:608-609`, `:673`).
 - **What a lying server gains.** It could return an existing vault in step 1 and fake an empty one in step 3.
   - Under suite 1 (the default), the device seals under a fresh K_1 that the server never sees. That is a fork
     (§2.1), and the server learns nothing.
@@ -1365,8 +1392,8 @@ Both mean **a new vault** (decision D7):
 | Operation | Crypto calls |
 |---|---|
 | Frame seal or open | 1 AES-GCM, plus 1 padding copy |
-| Blob up | sha256 (already done today), 1 HMAC (address), 1 AES-GCM |
-| Blob down | 1 AES-GCM, sha256 (already done today) |
+| Blob up | 1 sha256 of the bytes read for the transfer (one read, one HashPort digest on WebCrypto, `src/engine/blobs/blobQueue.ts:527`, `:534`; a suite-0 upload does the same), 1 HMAC (address), 1 AES-GCM |
+| Blob down | 1 AES-GCM, 1 HashPort sha256 to verify (`getVerified`, `blobQueue.ts:580-584`) |
 | Engine start | 1 HKDF import per held epoch, plus 7 `deriveKey` (§5.1) |
 | Older epoch, first use | 5 `deriveKey`, lazily |
 | Re-key | ≤ 3 unwraps per record walked, plus 1 kcv per epoch |
@@ -1410,22 +1437,26 @@ Node 26.5, `scripts/bench-e2ee.mjs`, median of 5, load average 1.7–2.1), 10k d
   transaction auto-commit early, and later writes then fail.
 - **NEVER await a CryptoPort or HashPort call inside a `runTx` body** (`src/engine/adapters/idbStorage.ts:187`).
   Seal before the transaction and open after it.
-- **Static audit (this worktree).** Every crypto call site seals or opens outside the transaction body:
-  - `src/engine/runtime/docRuntime.ts:125, :211, :319, :329`;
-  - `src/engine/runtime/engine.ts:167, :225`;
-  - `src/engine/sync/ingestRow.ts:36`;
-  - `src/engine/sync/catchUp.ts:112`;
-  - `src/engine/runtime/quarantineRelease.ts:28`;
-  - `src/engine/runtime/mirrorIo.ts:186`.
+- **Static audit (this worktree).** Every crypto call site seals or opens outside any transaction body:
+  - seals: `src/engine/body/frames.ts:57, :108`; `src/engine/runtime/reseal.ts:51`;
+    `src/engine/body/checkpoints.ts:287, :332`; `src/engine/blobs/blobStore.ts:55`;
+  - opens through the ingest gate (`gateRow`): `src/engine/runtime/liveIngest.ts:194`;
+    `src/engine/sync/catchUp.ts:189`; `src/engine/runtime/quarantineRelease.ts:48, :144, :169`;
+  - other opens: `src/engine/runtime/mirrorIo.ts:158`; `src/engine/blobs/bodyRefs.ts:87`;
+    `src/engine/blobs/blobStore.ts:96`.
 
   The engine is changing in parallel, so this is re-checked by test, not by reading.
-- **Why the sim cannot see it today.** `identityCrypto` resolves on microtasks (`src/core/codec/envelope.ts:242`).
-  `MemStoragePort` trips `tx-inactive` only when a body awaits a macrotask (`src/sim/storage.ts:29-44`).
-- **Fix (WP-E7).** A `DelayedCrypto` double settles every call after `setTimeout(0)`. Any future crypto await
-  inside a transaction then fails the sim and the unit tests, exactly as on a device.
+- **Why a suite-0 sim cannot see it.** The suite-0 ports resolve on microtasks: `createNoopCrypto`
+  (`src/engine/adapters/noopCrypto.ts:13`), `identityCrypto` (`src/core/codec/envelope.ts:268`) and the sim's
+  HashPort (`src/sim/hash.ts:1-5`). `MemStoragePort` trips `tx-inactive` only when a body awaits a macrotask
+  (`src/sim/storage.ts:29-44`).
+- **Fix (WP-E7, built).** `DelayedCrypto` settles every CryptoPort, KeyringCrypto and HashPort call after a real
+  `setTimeout(0)` (`src/sim/delayedCrypto.ts:1-5`). Sim devices use it for suite 1 and unpinned
+  (`src/sim/device.ts:193-195`), so a crypto or hash await inside a transaction fails the sim and the unit tests,
+  exactly as on a device.
 - **WP-E2 status.** E2 adds no IndexedDB path. frameNo allocation and sealing run on the edit chain before
   `repo.tEdit` (`src/engine/runtime/logApi.ts`), the gate opens before T_receipt, and the receipt only writes the
-  already-known frameNo. The double is still WP-E7's.
+  already-known frameNo. The double came with WP-E7 (above).
 
 ## 17. Lost server features and client replacements
 
@@ -1435,7 +1466,7 @@ rather than an accident.
 | Feature (legacy or possible) | Under suite 1 | Client replacement |
 |---|---|---|
 | Server check that a blob's bytes match its sha256 | Impossible: opaque address | AEAD tag plus sha256 after open (`getOpened`, `src/engine/blobs/blobStore.ts:98-100`; body refs use it too, `src/engine/body/refs.ts:49`) |
-| `X-YAOS-Content-SHA256` / `-Size` headers | Would leak the plaintext hash and size. At 7208184 they are only still named in the CORS expose list (`server/src/http.ts:7`); nothing sets or reads them | The client never sends them. Server ask A2 removes the stale names |
+| `X-YAOS-Content-SHA256` / `-Size` headers | Would leak the plaintext hash and size. At 7208184 they are only still named in the CORS expose list (`server/src/http.ts:7`); nothing sets or reads them | The client never sends them. Server ask A2 removed the stale names (cd335f64) |
 | Server-side debugging of content | Impossible | Diagnostics carry `HMAC(kDiag, ·)` hashes (§6.4). The user shares a bundle and correlates locally |
 | Point-in-time restore (D8b) | **Still works**: opaque rows rewind | Old keys stay in the keyring. `k` is re-published (§11.5) |
 | Blob garbage collection | The server cannot see references | Client mark-and-sweep on a user command, over the A3 list and batch delete (§10.4, WP-E6b) |
@@ -1455,6 +1486,8 @@ checkpoint encodings and IDB schema are edited rather than versioned. If a build
 
 ```ts
 export type BlobAddress = Brand<string, "BlobAddress">;   // suite 0: sha256 hex; suite 1: HMAC(kAddr, sha256) hex
+/** Sealed blob as parts in order; the stored object is their concatenation. Suite 1: [header ‖ nonce, AES-GCM output]. */
+export type SealedBlobParts = readonly Uint8Array[];
 export type SealPurpose = "frame" | "checkpoint";
 export type OpenFailure =
   | "unknown-key" | "auth-failed" | "unsupported-suite"
@@ -1472,8 +1505,8 @@ export interface CryptoPort {
   /** keyEpoch is the one already written into the header (the AAD binds it), so a concurrent roll cannot split them. */
   seal(input: { readonly purpose: SealPurpose; readonly keyEpoch: number; readonly aad: Uint8Array; readonly plaintext: Uint8Array }): Promise<Uint8Array>;
   open(input: { readonly purpose: SealPurpose; readonly suite: CryptoSuite; readonly keyEpoch: number; readonly aad: Uint8Array; readonly sealed: Uint8Array }): Promise<OpenResult>;
-  /** Whole sealed-blob format incl. header and padding (§10.2). Suite 0: identity. */
-  sealBlob(input: { readonly address: BlobAddress; readonly plaintext: Uint8Array }): Promise<Uint8Array>;
+  /** Whole sealed-blob format incl. header and padding (§10.2), as parts. Suite 0: identity. */
+  sealBlob(input: { readonly address: BlobAddress; readonly plaintext: Uint8Array }): Promise<SealedBlobParts>;
   openBlob(input: { readonly address: BlobAddress; readonly sealed: Uint8Array }): Promise<OpenResult>;
   blobAddress(hash: ContentHash): Promise<BlobAddress>;
   /** Diagnostics digest, 16 hex chars. Suite 0: sha256 prefix; suite 1: HMAC(kDiag, bytes) prefix (§6.4). */
@@ -1483,7 +1516,7 @@ export interface CryptoPort {
 /** Suite-1 adapter only; used by the keyring engine (WP-E3). Raw keys never cross this interface outward. */
 export interface KeyringCrypto {
   generate(e: number): Promise<void>;                                  // new K_e, held as pending
-  install(e: number, raw: Uint8Array): Promise<void>;                  // QR / RK path; zero-fills raw
+  install(e: number, raw: Uint8Array): Promise<"installed" | "same" | "conflict">; // QR / RK path; zero-fills raw
   kcv(e: number): Promise<Uint8Array>;
   wrap(role: "next" | "prev" | "recovery", e: number, aad: Uint8Array, rk?: Uint8Array): Promise<Uint8Array>;
   unwrap(role: "next" | "prev" | "recovery", e: number, aad: Uint8Array, wrapped: Uint8Array, rk?: Uint8Array): Promise<boolean>;
@@ -1495,12 +1528,15 @@ export interface KeyringCrypto {
 ```
 
 - `openBlob` returns a result rather than `Uint8Array | null`, so the caller can classify the failure (§10.2).
-  The callers classify through `getOpened` (`src/engine/blobs/blobStore.ts:90-102`): `src/engine/body/refs.ts:73`,
-  `src/engine/blobs/blobQueue.ts:584` and `src/engine/snapshots/remote.ts:79`.
+  The callers classify through `getOpened` (`src/engine/blobs/blobStore.ts:90-102`): `src/engine/body/refs.ts:49`,
+  `src/engine/blobs/blobQueue.ts:584` and `src/engine/snapshots/remote.ts:83`.
 - **The suite-0 adapter** (`src/engine/adapters/noopCrypto.ts`) and `identityCrypto`
   (`src/core/codec/envelope.ts`) implement the new shape. `sealEpoch()` returns 0.
-  - core has no digest, so `identityCrypto(hash?: HashPort)` takes an optional HashPort for `diagHash`; without one,
-    `diagHash` throws. `DIAG_HASH_HEX_CHARS = 16` lives in `src/core/codec/envelope.ts`.
+  - core hashes content only through an injected HashPort (`digestHex`, `src/core/hash/digest.ts:11`). Its pure-JS
+    sha256 takes at most `SYNC_HASH_MAX_BYTES` = 4096 B and throws a RangeError above it, in production too
+    (`src/core/limits.ts:100`, `src/core/hash/sha256.ts:22-23`). So `identityCrypto(hash?: HashPort)` takes an
+    optional HashPort for `diagHash`; without one, `diagHash` throws. `DIAG_HASH_HEX_CHARS = 16` lives in
+    `src/core/codec/envelope.ts`.
 - **The suite-1 adapter is new**, at `src/engine/adapters/webCryptoSuite1.ts` (WP-E1), with the primitives in
   `suite1Primitives.ts`. It holds non-extractable CryptoKeys only, plus the raw bytes §6.3 step 2 allows.
   - `sealEpoch()` is 0 until `setSealEpoch`, so a fresh port seals nothing. `seal` throws under an unheld or
@@ -1523,12 +1559,12 @@ export interface KeyringCrypto {
   - the inner layout gains `varuint frameNo` after `flags`. It is 0 for kinds outside ns and cfg, and non-zero
     for ns and cfg (§8.2). A violation is `malformed` on decode and a `CodecError` on encode;
   - `EnvelopeOpenResult.reason` gains `"suite-downgrade"` and `"bad-padding"` (§9.2). Replay is a fold
-    decision, not an open failure: `NsIgnoreReason` (`src/core/types.ts:232`) and the cfg equivalent gain
+    decision, not an open failure: `NsIgnoreReason` (`src/core/types.ts:253`) and the cfg equivalent gain
     `"replay-stale"`, `"replay-duplicate"` and `"stale-epoch"` (§8.2, §14.3);
   - `CheckpointEncoding`: `nsFoldV1` and `cfgFoldV1` are redefined in place to carry the replay window (named
     V2 in this document).
 - `src/core/codec/envelope.ts`:
-  - `bindingAad` (lines 155-162) writes the §7.2 fields: header plus deviceId for frames, header for checkpoints;
+  - `bindingAad` (lines 188-192) writes the §7.2 fields: header plus deviceId for frames, header for checkpoints;
   - padding (§7.3) is applied when `suite ≠ 0`, between the inner encoding and `seal`, and stripped after `open`;
   - `sealEnvelope` / `openEnvelope` are the one seal/open implementation (`src/engine/ingest/envelope.ts` wraps
     them). They check the kind against the stream class; checkpoint *content* checks (coversSeq, encoding, size)
@@ -1540,13 +1576,13 @@ export interface KeyringCrypto {
   - `StreamClass` gains `"keyring"`, and `streamClass("k") === "keyring"`;
   - `blobChunkStream(address: BlobAddress)` (later deleted with the `x:` carrier).
 - `src/core/limits.ts`:
-  - `MAX_FRAME_CONTENT_BYTES` (:49, today 1 MiB − 4 KiB) → 1015808 (§7.3);
+  - `MAX_FRAME_CONTENT_BYTES` (:60) is 1015808, down from 1 MiB − 4 KiB (§7.3);
   - new `MAX_BLOB_PLAINTEXT_BYTES_SUITE1 = 10223615`, since deleted: suite 1's cap is derived from the transport cap
     (§7.3);
-  - new `REPLAY_WINDOW = 64` and `PADME_FLOOR_BYTES = 256` (WP-E2);
-  - `ROLL_SEQ_SPAN = 2 ** 23` (:89) and `ROLL_OWN_SEALS = 2 ** 22` (:91) landed with the roll (WP-E3);
-    `KEY_STORE_WAIT_MS = 5000` lands with host key storage (WP-E4): constants arrive with their first user.
-- `QuarantineReason` (`src/engine/store/schema.ts:220`) gains `"crypto-downgrade"` and `"envelope-padding"` (WP-E2),
+  - new `REPLAY_WINDOW = 64` (:38) and `PADME_FLOOR_BYTES = 256` (:78) (WP-E2);
+  - `ROLL_SEQ_SPAN = 2 ** 23` (:86) and `ROLL_OWN_SEALS = 2 ** 22` (:88) landed with the roll (WP-E3), and
+    `KEY_STORE_WAIT_MS = 5000` (:179) with host key storage (WP-E4): constants arrive with their first user.
+- `QuarantineReason` (`src/engine/store/schema.ts:228`) gains `"crypto-downgrade"` and `"envelope-padding"` (WP-E2),
   and `"stale-epoch"` (a stale checkpoint, treated as absent) and `"keyring-hold"` (§14.3 undecided; re-gated after
   the next keyring change) (WP-E3).
 
@@ -1554,7 +1590,7 @@ export interface KeyringCrypto {
 
 | Store / record | Change |
 |---|---|
-| `OutboxRecord` (:156) | + `frameNo: number \| null` (ns/cfg; WP-E2). + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2 step 4; WP-E3). An empty `sealed` is an unsealed copy of an own stale commit, sealed before sending |
+| `OutboxRecord` (:190) | + `frameNo: number \| null` (ns/cfg; WP-E2). + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2 step 4; WP-E3). An empty `sealed` is an unsealed copy of an own stale commit, sealed before sending |
 | `TailRecord` | + `frameNo: number` (0 outside ns/cfg and for rows that failed the gate; WP-E2). Own rows carry the allocator's max across restarts (§8.2) |
 | `MetaRecord` | + `MetaKeyring {key: "keyring"; sealEpoch; epochs: {e, firstSeq, kind, verified}[]; revokeEpoch: number \| null; sRot: Seq \| null; ownSeals: number}`. **No key bytes** (§6.1) |
 | `MetaRecord` | + `MetaFrameNoFloor {key: "frameNoFloor"; ns: number; cfg: number}`, written by epoch migration (§8.2) |
@@ -1567,21 +1603,21 @@ No store or index is added or removed, so `upgrade()` (`src/engine/adapters/idbS
 ### 18.4 Protocol (`src/protocol/*`)
 
 ```ts
-// messages.ts — EngineInitConfig (:46) gains:
+// messages.ts — EngineInitConfig (:51) gains:
 /** SECRET (keys): never logged or echoed. Buffers are transferred, and main keeps no copy (§6.3). */
 readonly crypto:
   | { readonly suite: null; readonly creating: boolean }   // unpinned (§12.4): reads `k` only, writes nothing
   | { readonly suite: 0 }
   | { readonly suite: 1; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; readonly records: readonly Uint8Array[] };
 
-// UserCommand (:132) gains (all SECRET payloads, transferred):
+// UserCommand (:203) gains (all SECRET payloads, transferred):
 | { readonly t: "enableE2ee"; readonly rk: Uint8Array }                       // creation path only (§15.1): genesis at head = 0
 | { readonly t: "installKey"; readonly source: "qr"; readonly e: number; readonly k: Uint8Array }   // §12.1, §14.2 step 3
 | { readonly t: "installKey"; readonly source: "rk"; readonly rk: Uint8Array }                      // §12.4, §13.3
 | { readonly t: "pinSuite0"; readonly source: "link" | "create" }             // §12.4 (ii) / (iii): ok only if `k` is empty at head
 | { readonly t: "revokeRekey"; readonly rk: Uint8Array }                      // §14.2; a new RK is generated on main
 
-// EngineToMain (:187) gains (a request, like hostIo: main answers `result` or `error` with the same rid):
+// EngineToMain (:304) gains (a request, like hostIo: main answers `result` or `error` with the same rid):
 | { readonly t: "keyringChanged"; readonly rid: RequestId; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
     readonly records: readonly Uint8Array[]; readonly pending: number | null }   // main persists before replying
 
@@ -1635,16 +1671,21 @@ readonly crypto:
 |---|---|
 | §1 Model | Note that stream `k` (keyring) is client-defined and opaque to the relay, like every stream |
 | §2.4 Enroll | "Any client-only key part of a setup link is stripped before `/enroll`" (DECISIONS D3) |
-| §11.3 Blobs (:464, stale) | Rewrite to DECISIONS §5 row 11.3: opaque `^[0-9a-f]{64}$` addresses, no hash verification, R2 key `v/<vaultId>/<address>`, PUT overwrites, ≤ `maxBlobUploadBytes` (100 MB). Drop `X-YAOS-Content-SHA256` / `-Size` (server ask A1, A2) |
+| §11.3 Blobs | **Applied** (server ask A1): opaque `^[0-9a-f]{64}$` addresses, no hash verification, R2 key `v/<vaultId>/<address>`, PUT overwrites, ≤ `maxBlobUploadBytes` (100 MB), no `X-YAOS-Content-SHA256` / `-Size` (A2) |
 | §11.1 Limits | Note that suite-1 payloads are padded, so the client caps content at 1015808 bytes (§7.3) |
 
 ### 18.6 DESIGN.md diffs
 
 Applied so far: the §j.1 `x:` stream naming (WP-E6a: DESIGN §b.2, §b.4, §b.6, §d.6, §j.1 then said `x:<address>`).
 The `x:` carrier was later deleted, so the §j.1 hunk below is superseded: blobs travel only via the blob store.
+**Applied (E8):** every hunk below is now in DESIGN.md, as built. Differences from the hunks: the AAD header is
+`u8 formatVersion ‖ u8 suite ‖ varuint keyEpoch`; the replay window sits inside §c.3 step 2, after the ring hit test,
+and frameNo 0 never reaches it (decode rejects it; failed rows are stored with frameNo 0 and fold as empty); the `k`
+row says commit-only and no checkpoint (the hunk's "yes" was not a broadcast value); stale-epoch snap rows are
+accounted, not stored; the keyring read is §d.7 step 3a, after the feed, not step 0; the §j.1 `x:` hunk stays superseded.
 
 ```diff
- §b.1 Envelope (:43)
+ §b.1 Envelope
 -  u8      cryptoSuite     0 = none (v1); 1 = reserved XChaCha20-Poly1305
 +  u8      cryptoSuite     0 = none; 1 = AES-256-GCM (e2ee-design.md)
    …
@@ -1661,28 +1702,28 @@ The `x:` carrier was later deleted, so the §j.1 hunk below is superseded: blobs
 
  §b.2 Streams: table gains   | `k` | keyring | k records (no envelope) | none | yes | any device |
 
- §c.3 Frame-level rules (:290)
+ §c.3 Frame-level rules
 +2a. **Replay window** (ns/cfg). frameNo `f` vs per-device (R, 64-bit bitmap): f = 0 malformed; f ≤ R−64 or a
 +    set bit → `ignored/replay-*`, fold as empty. Update only after open and decode (e2ee-design §8.2).
 -own ns frame `k` may be sent only when every own ns frame ≤ `k − NS_SEND_WINDOW` (32) is receipted;
 +own ns frame with frameNo `f` may be sent only when every own frame with frameNo ≤ `f − NS_SEND_WINDOW` is receipted;
 
- §d.6 Ingest gate (:782) table gains rows:
+ §d.6 Ingest gate table gains rows:
 +| `suite-downgrade`, `bad-padding`, `auth-failed` under a verified key | deterministic (as malformation) |
 +| `auth-failed` under an unverified key | reader-dependent |
 +| stale-epoch (e2ee-design §14.3) | ignored; ns/cfg fold as empty; bodies not quarantined |
 
- §d.7 Catch-up (:840)
+ §d.7 Catch-up
 +0. **Keyring.** Read `k` to head and settle keys (e2ee-design §11.3) before any other stream.
 
- §h Ports (:1399): replace the CryptoPort block with e2ee-design §18.1.
+ §h Ports: replace the CryptoPort block with e2ee-design §18.1.
 
- §j.1 Blobs (:1657)
+ §j.1 Blobs
 -  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<sha256>` as `blobChunk` frames
 +  - Attachments ≤ `MAX_LOG_BLOB_BYTES` (8 MiB) ride stream `x:<blobAddress>` as `blobChunk` frames
 +- **GC.** Client mark-and-sweep on the command "Clean up unused server attachments" (e2ee-design §10.4).
 
- §j.7 Diagnostics (:1766)
+ §j.7 Diagnostics
 -  - recent events (… **hashed** paths),
 +  - recent events (… paths hashed with `CryptoPort.diagHash`: HMAC(kDiag) under suite 1),
 +  - never key material, recovery keys or setup links.
@@ -1694,17 +1735,17 @@ Baseline: 7208184. No ask is on the hot path, and none adds cross-DO coordinatio
 
 | # | Ask | Why | Priority |
 |---|---|---|---|
-| A1 | Rewrite relay-wire §11.3 (:464) to DECISIONS §5 row 11.3: opaque `^[0-9a-f]{64}$` addresses, no hash check, R2 key `v/<vaultId>/<address>`, PUT overwrites | The doc still describes sha256 addresses that the server verifies | Doc, before WP-E6a |
-| A2 | Drop `X-YAOS-Content-SHA256, X-YAOS-Content-Size` from `CORS_EXPOSE_HEADERS` (`server/src/http.ts:7`) | Stale names for plaintext-revealing headers. Nothing sets them, but they invite reintroduction | Trivial |
+| A1 | Rewrite relay-wire §11.3 to DECISIONS §5 row 11.3: opaque `^[0-9a-f]{64}$` addresses, no hash check, R2 key `v/<vaultId>/<address>`, PUT overwrites | The doc described sha256 addresses that the server verifies | **Done** (relay-wire §11.3) |
+| A2 | Drop `X-YAOS-Content-SHA256, X-YAOS-Content-Size` from `CORS_EXPOSE_HEADERS` (`server/src/http.ts:7`) | Stale names for plaintext-revealing headers. Nothing sets them, but they invite reintroduction | **Done** (cd335f64) |
 | A3 | `GET /vault/:id/blobs?cursor=` → `{items: [{address, uploadedAt}], next}` (R2 `list` with prefix `v/<vaultId>/`), and a batch conditional delete `POST /vault/:id/blobs/delete {"ifUploadedBefore", "addresses"}` (1–100; R2 `head`s, then one `delete`). Device bearer. Cold path, 60 requests/min per vault | Blob GC (§10.4). Without it, blobs live until the vault is deleted, under any suite | **Done** (relay-wire §11.3.1); used by WP-E6b |
-| A4 | `POST …/blobs/exists`: answer `400` on a malformed entry instead of silently dropping it (`server/src/router.ts:624-650` filters with `BLOB_ADDRESS_PATTERN`) | A client bug in HMAC addressing would look like "absent" and cause re-uploads forever | Low |
+| A4 | `POST …/blobs/exists`: answer `400` on a malformed entry instead of silently dropping it (`server/src/router.ts:624-650` filters with `BLOB_ADDRESS_PATTERN`) | A client bug in HMAC addressing would look like "absent" and cause re-uploads forever | **Done** (29619150: `400 invalid_address`) |
 | A5 | Keep restore carrying the pre-restore device rows (already true, DECISIONS D8b "Crosses the rewind: the device rows only") | A revoked device must stay revoked after a restore (§14.3) | Confirm only |
 | A6 | Keep minting a fresh random epoch on reset and restore (already true, D8, D8a, D8b) | The client re-publishes `k` on a new epoch (§11.5) | Confirm only |
 | A7 | *(withdrawn)* Neutral device names. Already accepted: any string, de-duplicated by `uniqueDeviceName` (`server/src/vault/host.ts:544`) | | None |
-| A8 | Rename "vault key" in `server/src/vault/ticket.ts` (DECISIONS D4) to "ticket key" in code and docs | Avoids confusion with K_e in reviews and in incident response | Low |
-| A9 | Keep stream names opaque: no server-side meaning for `k` or any prefix (`server/src/streams/protocol.ts:16`, `:53`) | `k` needs no server change | Confirm only |
+| A8 | Rename "vault key" in `server/src/vault/ticket.ts` (DECISIONS D4) to "ticket key" in code and docs | Avoids confusion with K_e in reviews and in incident response | **Done** (f3ef81ba) |
+| A9 | Keep stream names opaque: no server-side meaning for `k` or any prefix (`server/src/streams/protocol.ts:62-63`, `:53`) | `k` needs no server change | Confirm only |
 | A10 | Keep `MAX_STREAM_CHECKPOINT_BYTES` (`server/src/streams/protocol.ts:25`, 4 MiB) and the 1 MiB frame cap stable, or announce changes in VAULT_READY limits | Suite-1 padding is computed against them (§7.3) | Confirm only |
-| A11 | *(conditional)* Let the plugin's creation path (§15.1) reach `/claim`, `/operator/login`, `/operator/vaults` and `/operator/vaults/:id/owner-code`. Today they demand a same-origin `Origin` (`crossSiteRejection`, `server/src/router.ts:153-158`). Proposed change, in `crossSiteRejection`: `const origin = request.headers.get("Origin"); if (origin === null ? !needsJson : origin !== url.origin) return json({ error: "forbidden_origin" }, 403);` and keep the `application/json` check. A cross-site page cannot send a JSON POST without a CORS preflight the server never approves, and browsers always send `Origin` on such POSTs, so a request with no `Origin` and a JSON body comes from a non-browser client | E5 sends `Origin` explicitly (`src/host/ui/pairing.ts:552-556`), and the relay accepts it from Node's fetch (`e2e/client/e2ee.ts`). Needed only if WP-E0 shows that Obsidian's `requestUrl` drops or rewrites the header (§23.3). Without it a device cannot create a vault, so no vault can be set up | Only if WP-E0 finds it needed |
+| A11 | *(conditional)* Let the plugin's creation path (§15.1) reach `/claim`, `/operator/login`, `/operator/vaults` and `/operator/vaults/:id/owner-code`. Today they demand a same-origin `Origin` (`crossSiteRejection`, `server/src/router.ts:124-129`). Proposed change, in `crossSiteRejection`: `const origin = request.headers.get("Origin"); if (origin === null ? !needsJson : origin !== url.origin) return json({ error: "forbidden_origin" }, 403);` and keep the `application/json` check. A cross-site page cannot send a JSON POST without a CORS preflight the server never approves, and browsers always send `Origin` on such POSTs, so a request with no `Origin` and a JSON body comes from a non-browser client | E5 sends `Origin` explicitly (`src/host/ui/pairing.ts:552-556`), and the relay accepts it from Node's fetch (`e2e/client/e2ee.ts`). Needed only if WP-E0 shows that Obsidian's `requestUrl` drops or rewrites the header (§23.3). Without it a device cannot create a vault, so no vault can be set up | Only if WP-E0 finds it needed |
 
 Not asked: a device-list route for clients (the console covers revoke, D7); server-side key storage of any kind;
 per-vault crypto flags on the server (the suite is client-pinned, §12.4).
@@ -1777,7 +1818,8 @@ Each test counts outcomes and asserts **all** of them; none samples a single cas
 - `SimConfig.crypto: "none" | "suite1"`. Suite 1 uses the real adapter on Node WebCrypto, wrapped in
   `DelayedCrypto` (§16.3).
 - **The existing fault matrix runs unchanged under suite 1**, with the same seed counts as suite 0
-  (`src/sim/run.test.ts:47-50`: 200, 200, 50 and 50 seeds). The invariants (`src/sim/invariants.ts`) must hold.
+  (`src/sim/run.test.ts:65-69`: 200, 200, 50 and 50 seeds, plus 20 for the blob stall/slow faults added with the
+  background transfer queue, 3fecf30c). The invariants (`src/sim/invariants.ts`) must hold.
 - **New faults:**
   - `keyStoreLoss {dev}`: SecretStorage wiped, so the device goes `key-missing`, then re-keys by a sim QR;
   - `keyRoll {dev}`: forced roll, including concurrent rolls on two devices;
@@ -1833,7 +1875,7 @@ Order: E0 ∥ E1 → E2 ∥ E4 → E3 ∥ E6a → E5 ∥ E7 → E8. E6b needed A
   Unopened rows are re-gated after every keyring change, which also ends the old halt on ns rows under an
   unknown key.
 - An RK that does not open a genesis or revoke `recoveryWrap` leaves the record pending, not invalid: a wrong or
-  older RK cannot be told from a forged wrap (`src/engine/keyring/evaluate.ts:85`). A device that only has an RK
+  older RK cannot be told from a forged wrap (`src/engine/keyring/evaluate.ts:92-93`). A device that only has an RK
   older than the latest revoke needs the re-key QR.
 - An in-engine runtime restart (a new vaultEpoch, or a retry) reuses the ports, so the crypto port keeps keys
   learned since init.
@@ -1868,7 +1910,7 @@ runs in the engine):
 - **Incoming links** go through `routeSetupLink` (`keyActions.ts:42-61`), called by the protocol handler
   (`registerUi.ts:220-225`): ignore, apply or pair, never create. A setup link whose pairing code names the vault
   this device is enrolled in, on the same host, only applies its `key` or `suite=0` (no re-enroll, §12.4); a re-key
-  link `obsidian://yaos?action=rekey&key=…` (`buildRekeyLink`, `pairing.ts:797`) needs a paired device. A key goes
+  link `obsidian://yaos?action=rekey&key=…` (`buildRekeyLink`, `src/host/ui/pairing.ts:797`) needs a paired device. A key goes
   to the engine as `installKey` "qr" and is zero-filled (`applyLinkE2ee`, `keyActions.ts:111`); while no record
   matches it the key stays in engine memory only, and the blocked screen says so (`PendingQrKeys`,
   `keyActions.ts:239`). The pair modal shows "End-to-end encryption: On" or "Off (from this link)" before pairing
@@ -1927,8 +1969,9 @@ runs in the engine):
 
   It took 194 s wall on 11 workers. 699 of 700 runs were clean, with 0 strays in every run. The one failure (3 devices,
   E2EE faults, seed 88) needed the sim's attachments on the log carrier, which was later deleted. Sim devices now get
-  the net's blob store by default (`src/sim/device.ts:186-187`), and the matrix is 700 of 700 clean (156.6 s wall,
-  seed 88 included).
+  the net's blob store by default (`src/sim/device.ts:196-197`), and the matrix is 700 of 700 clean (156.6 s wall,
+  seed 88 included). Since 3fecf30c the script also runs the 3-device blob stall/slow fault matrix (20 seeds, so 720
+  runs in 8 matrices, `scripts/sim-suite1.mjs:29`); that count was not re-run for this document.
 - **New faults** (`src/sim/e2eeFaults.ts`, weights in `E2EE_FAULTS`, `src/sim/faults.ts`; weight 0 in
   `DEFAULT_FAULTS`, so suite-0 plans draw as before):
   - `keyStoreLoss`;
@@ -1977,10 +2020,10 @@ runs in the engine):
   only `auth-failed` or `malformed`.
 - **Open questions:**
   - (a) A re-sealed ns or cfg record, or one in flight below the epoch floor, holds the later frames of its stream
-    (`src/engine/body/sender.ts:346-371`; `resealOrder.test.ts`).
+    (`src/engine/body/sender.ts:390-412`; `resealOrder.test.ts`).
   - (b) `keyringChanged` before `ready` is stored in arrival order. The first persist waits until SecretStorage has
     loaded (`src/host/keys/hostKeys.ts:50, :68`). A key main did not store is dropped from the adapter
-    (`src/engine/keyring/keyring.ts:265-331`; `persistBeforeReady.test.ts`).
+    (`src/engine/keyring/keyring.ts:262-267`, `:331-336`; `persistBeforeReady.test.ts`).
   - (c) Of two concurrent geneses, the first in seq order wins. The other creator cannot judge it, so it stops at
     `pending` and does not adopt its own later record (`src/engine/keyring/evaluate.ts:50-51`, `keyring.ts:184`;
     `concurrentGenesis.test.ts`).
@@ -1990,14 +2033,14 @@ runs in the engine):
     `rollTriggerGcGate.test.ts`).
 - **Engine fixes the suite-1 sim found** (each with a failing test first):
   - A reader-dependent quarantine record keeps the whole row, so a re-gate on new keys can open it
-    (`src/engine/sync/ingestRow.ts:104`).
+    (`src/engine/sync/ingestRow.ts:102-107`).
   - A view on a frozen doc binds once the doc is released, and a quarantine freeze retargets bound views
     (`src/engine/runtime/context.ts:405`, `src/engine/compose/vaultRuntime.ts:356`).
   - A suite-1 session judges nothing before its `k` read (`src/engine/keyring/keyringRuntime.ts:157`).
   - Rows stored after a re-gate are re-checked (`src/engine/runtime/quarantineRelease.ts:159`).
-  - Release works by stream (`src/engine/runtime/engine.ts:483`), and keeps `keyring-hold` rows
+  - Release works by stream (`src/engine/runtime/engine.ts:481-482`), and keeps `keyring-hold` rows
     (`quarantineRelease.ts:51`).
-  - Rows a release applies move the stream's body version (`src/engine/store/repo.ts:736`).
+  - Rows a release applies move the stream's body version (`src/engine/store/repo.ts:728-730`).
   - An open revoke is stored and survives a reset (§11.5; `src/engine/keyring/book.ts:51`).
   - A §c.12 migrated loser's synced record is dropped, not moved to the winner (`src/engine/reconcile/diskJobs.ts:67`,
     `src/core/plan/planner.ts:505`). Otherwise its own text became the winner's sync point, and the winner's text
@@ -2015,8 +2058,10 @@ runs in the engine):
 - **Blob cap = the platform's** (client-remake-cap): the relay takes 100 MB (Cloudflare Free/Pro), suite 1 derives
   98566143 from it (§7.3), and `MAX_BLOB_PLAINTEXT_BYTES_SUITE1` is gone. The attachment setting defaults to the
   most it allows (1 GiB) and offers at most what the vault's relay takes. A 413 refuses the blob, no retry (§10.3).
-  `httpBlob` has no fixed timeout on put / get. Peak RSS at 95 MB is in §10.3; `httpBlob.get` dropped from 2.07 N
-  to 1.08 N, and the sealed parts are no longer reachable during a PUT.
+  `httpBlob` has no fixed timeout on put / get. Since 5a55d3be an idle window ends a transfer that moves no byte
+  for `BLOB_TRANSFER_IDLE_MS` (60 s, `src/core/limits.ts:197`; the PUT runs over XMLHttpRequest for its upload
+  progress), and the blob queue retries it after its backoff. Peak RSS at 95 MB is in §10.3; `httpBlob.get`
+  dropped from 2.07 N to 1.08 N, and the sealed parts are no longer reachable during a PUT.
 - **Checkpoint policy** (6aea9b1, DESIGN §d.9): the hot cap is 256 rows or 1 MiB, then 30 s idle. A settle
   checkpoint follows 2 min idle, capped at 1000 puts per device per day (≈ 4k rows, 4 % of the Free plan's 100k). A
   heavy day writes ≈ 2.5k checkpoint rows of ≈ 42.5k.
@@ -2027,7 +2072,7 @@ runs in the engine):
   - A revoke a crash interrupts before its append is not resumed.
   - Quarantine eviction starts at 500 records, and `QUARANTINE_MAX_BYTES` is not enforced.
   - A device that took a roll before the revoker re-published stops and needs a re-pair.
-  - A durability-retry frame lets later ns and cfg frames overtake it (`sender.ts:358`).
+  - A durability-retry frame lets later ns and cfg frames overtake it (`sender.ts:398-401`).
   - `revokeRekey` does not verify the RK before it proposes.
   - A crash between a rebind and its `nsDelete` shows the loser as a duplicate (no data loss).
 

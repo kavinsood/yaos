@@ -50,15 +50,32 @@ async function count(db: StorageDb<KvSchema>): Promise<number> {
 	return db.tx(["kv"], "readonly", (tx) => tx.count("kv"));
 }
 
+/**
+ * Awaited inside a readwrite tx on "kv": a promise that is none of that tx's
+ * requests and settles only after the tx finished, because a tx created later
+ * with an overlapping scope can't start before then (IndexedDB transaction
+ * scheduling; fake-indexeddb lib/Database.js processTransactions). Resolves
+ * with the keys that tx sees.
+ *
+ * Not a timer. In a browser a setTimeout callback already finds the tx
+ * inactive, but fake-indexeddb keeps a started tx "active" until its
+ * setImmediate request loop drains (FDBTransaction.js _start), and Node's
+ * 1 ms timer can fire first: the next op then succeeds.
+ */
+function afterAutoCommit(db: StorageDb<KvSchema>): Promise<StorageKey[]> {
+	return db.tx(["kv"], "readonly", (tx) => tx.getAllKeys("kv"));
+}
+
 describe("createIdbStoragePort (fake-indexeddb)", () => {
-	it("awaiting a timer inside the body auto-commits the tx; later ops fail tx-inactive", async () => {
+	it("awaiting a non-IDB promise inside the body auto-commits the tx; later ops fail tx-inactive", async () => {
 		const { open } = setup();
 		const db = await open();
 		let putError: unknown = null;
+		let seen: StorageKey[] = [];
 		await rejectsWith(
 			db.tx(["kv"], "readwrite", async (tx) => {
 				tx.put("kv", { k: 1 });
-				await sleep(5); // not an IDB request: IndexedDB commits what it has
+				seen = await afterAutoCommit(db); // not this tx's request: IndexedDB commits what it has
 				try {
 					tx.put("kv", { k: 2 });
 				} catch (e) {
@@ -69,16 +86,17 @@ describe("createIdbStoragePort (fake-indexeddb)", () => {
 			"tx-inactive",
 		);
 		assert.ok(isStorageError(putError) && putError.failure === "tx-inactive", String(putError));
-		// The write issued before the await WAS committed; the one after was not.
+		// The write issued before the await WAS committed, before the body ended; the one after was not.
+		assert.deepEqual(seen, [1]);
 		assert.deepEqual(await db.tx(["kv"], "readonly", (tx) => tx.getAllKeys("kv")), [1]);
 	});
 
-	it("even a zero-delay timer is enough to lose the tx; a body that swallows the error resolves", async () => {
+	it("after the auto-commit, reads and abort() fail tx-inactive; a body that swallows the error resolves", async () => {
 		const { open } = setup();
 		const db = await open();
 		const out = await db.tx(["kv"], "readwrite", async (tx) => {
 			tx.put("kv", { k: "a" });
-			await sleep(0);
+			await afterAutoCommit(db);
 			const r = await tx.count("kv").then(
 				() => "still active",
 				(e: unknown) => (isStorageError(e) ? e.failure : "other"),

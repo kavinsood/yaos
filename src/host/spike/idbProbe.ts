@@ -1,5 +1,5 @@
 // YAOS spike: IndexedDB open/put/get/close/delete probe. Runs unchanged on the
-// main thread (inline fallback path) and inside the Blob-URL worker. Every step
+// main thread (the day-1 inline fallback path) and inside the Blob-URL worker. Every step
 // has a timeout so a hang is reported as `hang: true` instead of stalling.
 import { defaultNow, errInfo, r1, settle, skipped, toStep, type ErrInfo, type IdbProbeReport, type StepResult } from "./report";
 

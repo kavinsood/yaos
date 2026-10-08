@@ -2,11 +2,11 @@
  * SimBlobStore: the relay's R2 blob store as the sim sees it (relay-wire §11.3, §11.3.1), one per vault.
  *
  * - Upload times are the run's clock (the "server" clock: true time, never a device's skewed one); a PUT,
- *   overwrite included, refreshes the time like R2's `uploaded` (server/src/router.ts:786-807).
+ *   overwrite included, refreshes the time like R2's `uploaded` (server/src/router.ts:787-807).
  * - list() answers address order after the cursor, `pageSize` at a time; `next` is the last address returned
  *   while more remain, so deletes between pages do not move the walk.
  * - deleteIfUploadedBefore() checks every address first, then deletes the old ones in one step, like the
- *   relay's HEADs-then-one-delete (server/src/router.ts:821-835): a PUT that lands in between (the
+ *   relay's HEADs-then-one-delete (server/src/router.ts:822-836): a PUT that lands in between (the
  *   `beforeDelete` hook) is still deleted and reported "deleted".
  * - Hooks run concurrent work at the two interesting points of a sweep; `fail` throws for one call.
  *

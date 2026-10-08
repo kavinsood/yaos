@@ -26,7 +26,7 @@ const REFUSAL_TEXT: Readonly<Record<AttachmentCleanupRefusal, string>> = Object.
 /**
  * "keys-unverified" has three sources, told apart by the engine's detail text (the detail itself is not shown):
  * a device whose engine never opened (no pin, or the key is missing: keyReader.ts:191), and a running engine whose
- * in-session write gate is shut (blobGc.ts:108). Anything else is the unconfirmed-key case (blobGc.ts:104).
+ * in-session write gate is shut (blobGc.ts:111). Anything else is the unconfirmed-key case (blobGc.ts:107).
  */
 export const CLOSED_DEVICE_DETAIL = "this device has no usable encryption pin or key";
 export const SHUT_GATE_DETAIL_PREFIX = "this device may not write to the vault (";

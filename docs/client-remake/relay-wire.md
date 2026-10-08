@@ -5,12 +5,12 @@ authenticated, ordered, durable mailbox. It sequences, stores and forwards **opa
 validates, merges, hashes or compacts CRDT content. Merging, checkpoint contents and the meaning of streams all
 belong to the client.
 
-- Server code: `server/src/streams/{protocol,store,relay}.ts`, wired in `server/src/server.ts`,
-  `server/src/index.ts`, `server/src/routes/{vault,ticket,auth}.ts`. Nothing under `server/src/streams/`
-  imports the CRDT engine (no ywasm on this path).
-- Feature flag: Worker var `YAOS_STREAMS = "true"`. When it is absent, every route below returns 404 and the
-  capability is not advertised.
-- Tests: `node tests/run-typescript.mjs --test-aliases tests/server/streams-relay.ts` (15 tests, including a
+- Server code: `server/src/streams/{protocol,store,relay,dedupe}.ts`, wired in `server/src/router.ts` (HTTP routes,
+  capabilities) and the vault Durable Object, `server/src/vault/{host,vault,ticket,schema}.ts`. Nothing under
+  `server/src/streams/` imports a CRDT engine.
+- No feature flag: the rewritten server always serves streams (DECISIONS; `server/src/router.ts` advertises
+  `STREAMS_CAPABILITY_VERSION`).
+- Tests: `node tests/run-typescript.mjs --test-aliases tests/server/streams-relay.ts` (17 tests, including a
   Cloudflare row-billing model).
 - End-to-end smoke: `node e2e/relay/smoke.ts --host <url>`. See [Running](#running).
 
@@ -26,7 +26,7 @@ rate knobs live in `readStreamRelayConfig` (`server/src/streams/relay.ts`).
 | vault | One Durable Object (DO SQLite), addressed by `vaultId`. |
 | `vaultEpoch` | The vault generation string (`vaultGeneration`). Seqs are only comparable within one epoch. A new epoch (vault destroyed and re-created) means all client cursors are void. |
 | `seq` | Vault-wide, monotonic, **contiguous** integer starting at 1. Every committed row gets the next seq. Rejected, failed and deduplicated appends never consume a seq. |
-| stream | An opaque name: any non-empty string of ≤ 256 UTF-8 bytes. Conventions: `ns` (namespace), `b:<docId>` (body), `c:<docId>` (canvas/other CRDT). Only one rule is name-based: `b:*` and `c:*` are broadcast provisionally (§5.2). |
+| stream | An opaque name: any non-empty string of ≤ 256 UTF-8 bytes. The client's names (`src/core/types.ts:56-84`): `ns` (namespace), `cfg` (settings), `snap` (snapshot index), `k` (keyring, e2ee-design §11), `b:<docId>` (body), `c:<docId>` (canvas/other CRDT). All are client-defined and opaque to the relay. Only one rule is name-based: `b:*` and `c:*` are broadcast provisionally (§5.2). |
 | frame / row | One appended payload: `(stream, deviceId, clientFrameId, payload)`. Once committed it becomes a row `(seq, deviceId, clientFrameId, payload)`. |
 | `clientFrameId` | Client-chosen id, 1–128 UTF-8 bytes, **unique per device across the whole vault**. Appends are idempotent by `(deviceId, clientFrameId)`. |
 | `head` | The highest committed seq in the vault (0 for an empty vault). |
@@ -79,9 +79,12 @@ fields are legacy (§14).
     a hash of it.
   - `enrollmentRequestId`: `[A-Za-z0-9_-]{16,128}`.
 - A body that breaks these rules gets `400 invalid enrollment request`.
-- `200 {host, deviceToken, vaultId, deviceId, deviceName, vaultGeneration, originImport, principalId, role, membershipRevision, deviceCredentialRevision, capabilities, principal, actor}`
-- `202 {"error":"authorization_fence_pending"}`: the enrollment committed, but the authority fence has not
-  settled yet. Retry the identical request after about 1 s.
+- The body is exactly these fields. A setup link's client-only part (`key`, or `suite=0`, e2ee-design §12.1) never
+  reaches `/enroll` (`src/host/ui/pairing.ts:346-352`; DECISIONS D3).
+- `200 {host, deviceToken, vaultId, deviceId, deviceName, vaultGeneration}`: exactly these six fields
+  (`server/src/vault/host.ts:599-602`, DECISIONS D3).
+- The rewritten server never answers `202 authorization_fence_pending`; the client still retries one with the
+  identical body (`src/host/ui/pairing.ts:340-343`).
 
 ### 2.5 Pair another device
 
@@ -105,8 +108,7 @@ The new device then calls `/enroll` (§2.4).
 | Status | `error` | Client action |
 |---|---|---|
 | 401 | `unauthorized` | Token unknown or revoked. Stop syncing and re-pair. |
-| 403 | capability reason, e.g. `capability_denied` | The role lacks the capability (read-only member). Do not retry. |
-| 404 | `unknown_vault`, `not_found` | Wrong vault, or the server runs without `YAOS_STREAMS`. Check capabilities. |
+| 404 | `unknown_vault`, `not_found` | Wrong vault. |
 | 409 | `vault_<state>`, `authority_superseded`, `vault_generation_mismatch` | Re-fetch identity. If the epoch changed, reset local cursors. |
 | 413 | `body_too_large` | The checkpoint is over 4 MiB. Split or shrink it. |
 | 503 | `cf_daily_limit` (+ `resetAt`, `kind`, `Retry-After`) | Free-plan row limit (§11.4). Wait until `resetAt`. |
@@ -137,9 +139,8 @@ __YPS:{"type":"error","code":"update_required","reason":"streams_version_mismatc
 **Upgrade rejections in the DO** come back as plain HTTP. The WebSocket handshake fails, so a browser sees an
 error followed by close 1006:
 
-- `409 authority_superseded` (actor revisions are stale);
-- `429 stream_socket_limit` + `Retry-After: 1` (more than 1000 streams sockets in the vault);
-- `403` when `vault.content.read` is missing.
+- `409 authority_superseded` (the device is no longer enrolled, `server/src/streams/relay.ts:434`);
+- `429 stream_socket_limit` + `Retry-After: 1` (more than 1000 streams sockets in the vault).
 
 ### 3.2 VAULT_READY (first frame on every accepted socket)
 
@@ -170,8 +171,9 @@ error followed by close 1006:
 
 - `head` is the vault head when the socket was admitted. **Every seq > `head` is delivered live on this
   socket** (§5.3).
-- `canWrite` is `false` without `vault.content.write`. Appends are then answered with
-  `STREAM_APPEND_REJECTED write_forbidden`.
+- `canWrite` is always `true`: there are no roles (DECISIONS H4; `server/src/vault/host.ts:667`). On a socket
+  with `canWrite: false` the relay would answer appends with `STREAM_APPEND_REJECTED write_forbidden`
+  (`server/src/streams/relay.ts:632`).
 
 ---
 
@@ -326,7 +328,7 @@ For a socket admitted with `VAULT_READY.head = H`:
 
 ## 6. Feed (what changed since S)
 
-`GET /vault/:vaultId/streams/feed?after=<S>&limit=<N>` (Bearer, `vault.content.read`)
+`GET /vault/:vaultId/streams/feed?after=<S>&limit=<N>` (Bearer)
 
 ```json
 { "vaultEpoch": "...", "head": 57, "changes": [ { "stream": "ns", "lastSeq": 41 }, { "stream": "b:x", "lastSeq": 57 } ], "nextAfter": null }
@@ -345,7 +347,7 @@ For a socket admitted with `VAULT_READY.head = H`:
 
 ## 7. Catch-up read (rows of one stream)
 
-`GET /vault/:vaultId/streams/read?stream=<name>&after=<S>&maxBytes=<B>[&checkpoint=1]` (Bearer, `vault.content.read`)
+`GET /vault/:vaultId/streams/read?stream=<name>&after=<S>&maxBytes=<B>[&checkpoint=1]` (Bearer)
 
 ```json
 {
@@ -391,8 +393,7 @@ form.
 
 ## 8. Checkpoint (CAS put + GC)
 
-`PUT /vault/:vaultId/streams/checkpoint?stream=<name>&coversSeq=<N>&expectedCoversSeq=<M>` (Bearer,
-`vault.content.write`). The body is raw `application/octet-stream`, 0 – 4 MiB.
+`PUT /vault/:vaultId/streams/checkpoint?stream=<name>&coversSeq=<N>&expectedCoversSeq=<M>` (Bearer). The body is raw `application/octet-stream`, 0 – 4 MiB.
 
 **The client's promise.** The bytes represent the merge of every row of `stream` with `seq ≤ N`. The server
 cannot check this.
@@ -443,11 +444,11 @@ cannot check this.
 |---|---|---|
 | 1000 | Client closed | none |
 | 1001 | Server drain (code update, eviction), vault deleted | Reconnect with backoff and a fresh ticket. Resend unacked appends. An unauthorized upgrade after a delete means the vault is gone. |
-| 1006 | Network loss, platform reset, or a DO-level upgrade rejection (409/429/403 HTTP) | Reconnect with backoff. Repeated failures: probe the ticket, then capabilities. |
+| 1006 | Network loss, platform reset, or a DO-level upgrade rejection (409/429 HTTP) | Reconnect with backoff. Repeated failures: probe the ticket, then capabilities. |
 | 1008 | Malformed APPEND, or a Worker upgrade rejection (`error` frame `unauthorized` / `unclaimed` / `update_required` first) | Malformed: client bug, so drop that frame and log it. `unauthorized`: re-ticket, and if the ticket fails 401, re-pair. `update_required`: client too old or new. |
 | 1009 | Message over the cap (binary over 1 MiB + 1 KiB, text over 64 KiB) or payload over 1 MiB | Client bug. Never resend that frame; split the payload. |
 | 1013 | Rate gate overdraft (`VAULT_BACKPRESSURE relay_rate_limit` first) | Back off for at least 1 s, reconnect, resend unacked appends (deduped), pace sends at or below `rateBytesPerSec`. |
-| 4403 | Authority superseded: device revoked, credential rotated, membership or role changed (`error authority_superseded` first) | Fetch a new ticket. A 401 from that means revoked, so stop and re-pair. Otherwise reconnect (capabilities may have changed). |
+| 4403 | Authority superseded: the device was revoked (`server/src/vault/host.ts:680-700`), or is no longer enrolled when the vault wakes (`server/src/streams/relay.ts:497`) (`error authority_superseded` first) | Fetch a new ticket. A 401 from that means revoked, so stop and re-pair. Otherwise reconnect (capabilities may have changed). |
 | 4409 | Never on streams sockets (legacy semantic epoch reset) | n/a |
 
 ---
@@ -460,7 +461,7 @@ cannot check this.
 |---|---|
 | Stream name | 1–256 UTF-8 bytes |
 | clientFrameId | 1–128 UTF-8 bytes |
-| APPEND payload | 1 MiB (raw binary message ≤ 1 MiB + 1 KiB). Keep encoded frames ≤ 1 MiB to stay within the platform WebSocket message limit. |
+| APPEND payload | 1 MiB (raw binary message ≤ 1 MiB + 1 KiB). Keep encoded frames ≤ 1 MiB to stay within the platform WebSocket message limit. The client caps frame content at `MAX_FRAME_CONTENT_BYTES` = 1015808 (1 MiB − 32 KiB, `src/core/limits.ts:60`), so a padded suite-1 payload still fits (e2ee-design §7.3). |
 | Text (control) message | 64 KiB |
 | Checkpoint | 4 MiB, stored in 1 MB rows |
 | Feed page | default 1000, max 5000 streams |
@@ -485,12 +486,9 @@ The effective values are echoed in `VAULT_READY.limits`.
 
 ### 11.2 Permissions
 
-| Operation | Capability |
-|---|---|
-| Socket, feed, read | `vault.content.read` |
-| APPEND, checkpoint | `vault.content.write` |
-
-Socket authority is re-validated (cached for 5 s) on every append and ping. A failure closes the socket with 4403.
+No roles: every enrolled device may read and write (DECISIONS H4; the vault accepts each socket with `canWrite`
+true, `server/src/vault/host.ts:667`). A revoke shuts the device's gate in one synchronous turn and sends each of
+its sockets `authority_superseded` + close 4403 (`server/src/vault/host.ts:680-700`).
 
 ### 11.3 Blobs (R2, optional)
 

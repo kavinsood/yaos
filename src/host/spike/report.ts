@@ -1,9 +1,9 @@
 // YAOS day-1 spike: pure report types and helpers (no obsidian runtime imports,
 // so node:test can load this file). Throwaway code: answers OR-1 (Blob-URL
-// worker + IndexedDB inside it, else inline fallback) and OR-2 (how an open
-// MarkdownView is reloaded when its file changes underneath, and whether a
-// per-instance setViewData wrapper can intercept it). The E2EE part measures the
-// WebCrypto facts the suite-1 design depends on (see cryptoProbe.ts).
+// worker + IndexedDB inside it, else the day-1 inline fallback, since dropped)
+// and OR-2 (how an open MarkdownView is reloaded when its file changes
+// underneath, and whether a per-instance setViewData wrapper can intercept it).
+// The E2EE part measures the WebCrypto facts the suite-1 design depends on (see cryptoProbe.ts).
 import type { BenchRow, CryptoProbeReport } from "./cryptoProbe";
 
 export interface ErrInfo {
@@ -388,7 +388,7 @@ export interface E2eeReport {
 	/** A separate Blob-URL worker that runs only the crypto step (OR-1's worker run is unchanged). */
 	worker: WorkerProbeReport | null;
 	workerCrash?: ErrInfo;
-	/** Same probe on the main thread (the engine's inline fallback realm). */
+	/** Same probe on the main thread (the realm of the inline fallback planned at day 1; the product has none). */
 	main: CryptoProbeReport | null;
 	mainCrash?: ErrInfo;
 }
