@@ -9,12 +9,15 @@
 import { Notice, type Modal, type Plugin } from "obsidian";
 import type { BrakeReport } from "../../core/types";
 import type { UserCommand } from "../../protocol/messages";
+import type { DeviceCheckMode } from "../../protocol/status";
 import { pendingBrake, type YaosUiHost } from "./api";
 import { cleanUpAttachments } from "./attachmentsCleanup";
 import { BrakeTracker } from "./brake";
 import { BrakeModal } from "./brakeModal";
 import { UI_COMMANDS, type UiCommandId } from "./commands";
 import { confirmAction } from "./confirmModal";
+import { largeCheckConfirm, runDeviceCheck } from "./deviceCheck";
+import { DeviceCheckModal } from "./deviceCheckModal";
 import { DIAGNOSTICS_WITH_PATHS_CONFIRM, exportDiagnostics } from "./diagnostics";
 import { confirmAndRebuildCache, restartSyncEngine } from "./engineActions";
 import { errorMessage } from "./format";
@@ -151,6 +154,27 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		}, { includePaths });
 	};
 
+	// The device check runs in the engine; main shows a notice while it runs, then the results. One at a time.
+	let deviceChecking = false;
+	const runCheck = (mode: DeviceCheckMode): void => {
+		if (deviceChecking) {
+			new Notice("YAOS: a device check is already running.");
+			return;
+		}
+		deviceChecking = true;
+		const working = new Notice(mode === "quick" ? "YAOS: running the device check (about 10–30 s)…" : "YAOS: running the large attachment check. This can take a few minutes…", 0);
+		runDeviceCheck(host, mode).then(
+			(run) => {
+				working.hide();
+				if (!disposed) track(new DeviceCheckModal(app, run, { copy: copyText, save: (name, text) => host.writeDiagnosticsFile(name, text) }));
+			},
+			(err: unknown) => {
+				working.hide();
+				new Notice(`YAOS: the device check did not finish: ${errorMessage(err)}`, 10000);
+			},
+		).finally(() => { deviceChecking = false; });
+	};
+
 	const send = (command: UserCommand, done: string): void => {
 		host.command(command).then(
 			() => { new Notice(`YAOS: ${done}`); },
@@ -201,6 +225,10 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 		"yaos-unlock": openKeyMissing,
 		"yaos-show-rekey-qr": () => openRekeyQr(false),
 		"yaos-rekey-after-revoke": openRevokeRekey,
+		"yaos-device-check": () => runCheck("quick"),
+		"yaos-device-check-large": () => {
+			void confirmAction(app, largeCheckConfirm(host.status()?.maxBlobBytes ?? null)).then((ok) => { if (ok && !disposed) runCheck("large"); });
+		},
 	};
 	for (const spec of UI_COMMANDS) {
 		plugin.addCommand({

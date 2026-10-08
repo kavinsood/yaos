@@ -13,6 +13,7 @@ import { parentPort, workerData, type MessagePort } from "node:worker_threads";
 import { IDBFactory } from "fake-indexeddb";
 import type { BlobPort } from "../../src/ports";
 import { createEngine, type EngineHandle } from "../../src/engine/compose/protocolEngine";
+import { webDeviceEnv } from "../../src/engine/adapters/webDeviceEnv";
 import { createWorkerEngineTransport, type WorkerScopeLike } from "../../src/protocol/workerTransport";
 import {
 	absNow, ENGINE_GAP_EVENT_MS, fullEnginePorts, loopStats, NetSwitch, postCounted,
@@ -114,6 +115,12 @@ port.on("message", (m: ToEngineThread) => {
 				...(m.tuning ? { tuning: m.tuning } : {}),
 				tzOffsetMinutes: () => 0,
 				log,
+				// The thread's own facts (navigator, performance); XMLHttpRequest and IndexedDB are the harness's (nodeXhr,
+				// fake-indexeddb), handed to the ports instead of being globals.
+				deviceEnv: () => {
+					const env = webDeviceEnv();
+					return { ...env, apis: { ...env.apis, xmlHttpRequest: true, idb: true } };
+				},
 				makePorts: async (config) => {
 					const ports = await fullEnginePorts(config, { net, factory, log, onBlobKind: (kind) => send({ t: "blobKind", kind }) });
 					const probe = ports.probeBlob;

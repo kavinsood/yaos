@@ -130,6 +130,7 @@ export class LogEngine {
 		const { storage } = opts.ports;
 		const ident = { vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion };
 		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null };
+		const openedAt = c.mono();
 		let o = await Repo.open(storage, ident, c.now(), openOpts);
 		if (!o.repo) {
 			o.db.close();
@@ -137,6 +138,7 @@ export class LogEngine {
 			o = await Repo.open(storage, ident, c.now(), openOpts);
 			if (!o.repo) throw new EngineStartError("db-identity");
 		}
+		c.repoOpenMs = c.mono() - openedAt;
 		const repo = o.repo;
 		repo.monotonic = () => c.mono();
 		repo.priorityFn = (r) => ((c.handles?.peek(r.stream)?.bound ?? 0) > 0 ? -10 : defaultPriority(r));

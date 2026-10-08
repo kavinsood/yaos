@@ -566,6 +566,26 @@ describe("wsRelay liveness", () => {
 		assert.equal(pings(socket).length, 2, "next ping after another idle window");
 	});
 
+	it("ping() resolves on its own pong with the head; another probe's pong does not; a close rejects it", async () => {
+		const { socket, session } = await open();
+		const events = collect(session);
+		assert.ok(session.ping, "the adapter pings on demand");
+		let got: { headSeq: number } | null = null;
+		const p = session.ping().then((v) => { got = v; });
+		const probeId = String(pings(socket)[0]!["probeId"]);
+		socket.control({ type: "VAULT_PONG", probeId: `${probeId}-other`, head: 1 });
+		await flush();
+		assert.equal(got, null, "not its pong");
+		socket.control({ type: "VAULT_PONG", probeId, documentId: "streams", vaultGeneration: "E1", runtimeEpoch: "R1", head: 43 });
+		await p;
+		assert.deepEqual(got, { headSeq: 43 });
+		assert.deepEqual(events, [{ t: "head", headSeq: 1 }, { t: "head", headSeq: 43 }], "pongs still report the head");
+		const lost = session.ping();
+		socket.serverClose(1006, false);
+		await assert.rejects(lost, /relay session closed \(1006\) before the pong/);
+		await assert.rejects(session.ping(), /relay session closed/);
+	});
+
 	it("opts.liveness overrides VAULT_READY.liveness", async () => {
 		const { socket, session, clock } = await open({ liveness: { idleMs: 100, timeoutMs: 50 } });
 		const events = collect(session);

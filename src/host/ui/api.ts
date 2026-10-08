@@ -6,7 +6,7 @@
 
 import type { App } from "obsidian";
 import type { EngineSettings, UserCommand, EngineResultValue } from "../../protocol/messages";
-import type { StatusSnapshot } from "../../protocol/status";
+import type { DeviceCheckMode, DeviceCheckReport, StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
 import type { TrashMode } from "../../ports/vault";
 import { isVaultId } from "../../core/codec/ids";
@@ -255,6 +255,8 @@ export interface YaosUiHost {
 	brake(): BrakeReport | null;
 	/** Write a file under <configDir>/plugins/yaos/diagnostics/ (returns the vault-relative path). */
 	writeDiagnosticsFile(name: string, text: string): Promise<string>;
+	/** The on-device self-test, run in the engine (deviceCheck.ts); rejects with an Error whose message is safe to show. */
+	deviceCheck(mode: DeviceCheckMode): Promise<DeviceCheckReport>;
 	/**
 	 * e2ee-design §15.1 step 1 done: this device created `vaultId` on the server. Only "Create a new vault"
 	 * (createVault.ts) calls it, right after the creating response.

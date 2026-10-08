@@ -183,6 +183,13 @@ export interface RelaySession {
 	putCheckpoint(stream: StreamName, coversSeq: Seq, expectedPrevCoversSeq: Seq, bytes: Uint8Array): Promise<PutCheckpointResult>;
 	/** Events received before the first listener is attached are buffered, so nothing after headSeq is lost. */
 	onEvent(listener: (event: RelayEvent) => void): Unsubscribe;
+	/**
+	 * One round trip on this socket with the liveness frames (VAULT_PING / VAULT_PONG, relay-wire §4.2-4.3): resolves with the
+	 * pong's head once the pong for this probe arrives, rejects when the session closes first. No deadline of its own.
+	 * Only the device check calls it (engine/compose/deviceCheck.ts); the wsRelay adapter has it, the sim and test fakes
+	 * need not.
+	 */
+	ping?(): Promise<{ readonly headSeq: Seq }>;
 	close(code: number, reason: string): void;
 }
 

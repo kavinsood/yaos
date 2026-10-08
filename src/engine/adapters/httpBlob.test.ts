@@ -225,6 +225,31 @@ describe("httpBlob", () => {
 		assert.equal(clock.pendingTimers, 0);
 	});
 
+	it("put / get hand the caller's observer each upload progress event and each body chunk (the device check counts them)", async () => {
+		const { xhrs, Ctor } = fakeXhrs();
+		const clock = new ManualClock();
+		const sent: number[] = [];
+		const put = xhrPort(Ctor, clock).put(addr(1), [new Uint8Array(10)], undefined, (n) => sent.push(n));
+		const x = xhrs[0]!;
+		x.sent(4);
+		x.sent(10);
+		x.uploaded();
+		x.respond(204);
+		await put;
+		assert.deepEqual(sent, [4, 10], "upload progress events only, not the upload's end or readyState changes");
+		const body = feed();
+		const chunks: number[] = [];
+		const get = getPort(fakeFetch(() => new Response(body.stream, { status: 200, headers: { "Content-Length": "5" } })).fetch, clock).get(addr(1), undefined, (n) => chunks.push(n));
+		await flush();
+		body.push([1, 2]);
+		await flush();
+		body.push([3, 4, 5]);
+		body.end();
+		assert.deepEqual(await get, new Uint8Array([1, 2, 3, 4, 5]));
+		assert.deepEqual(chunks, [2, 3]);
+		assert.equal(clock.pendingTimers, 0);
+	});
+
 	it("put answered 413 throws BlobTooLargeError, whatever the body (the relay's JSON, the edge's HTML page)", async () => {
 		for (const res of [
 			() => jsonResponse({ error: "body_too_large" }, 413),

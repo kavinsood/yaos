@@ -5,7 +5,7 @@
  */
 
 import type { UserCommand, EngineResultValue } from "../../../protocol/messages";
-import type { E2eeStatus, EnginePhase, StatusSnapshot } from "../../../protocol/status";
+import type { DeviceCheckMode, DeviceCheckReport, E2eeStatus, EnginePhase, StatusSnapshot } from "../../../protocol/status";
 import { markedCreating, pinAcross, withoutCreating } from "../../keys/pin";
 import { defaultPluginData, type EngineRunState, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "../api";
 
@@ -54,6 +54,8 @@ export class FakeUiHost implements YaosUiHost {
 	readonly calls: string[] = [];
 	handler: CommandHandler = () => ({ t: "ok" });
 	qrKey: { readonly e: number; readonly k: Uint8Array } | null = null;
+	/** deviceCheck answers (a test sets it); the default refuses as an engine that is not running would. */
+	deviceCheckHandler: (mode: DeviceCheckMode) => Promise<DeviceCheckReport> = async () => { throw new Error("YAOS is not running."); };
 	private readonly listeners = new Set<() => void>();
 
 	constructor(data: Partial<YaosPluginData> = {}) {
@@ -109,6 +111,11 @@ export class FakeUiHost implements YaosUiHost {
 	async restartEngine(): Promise<void> {}
 	brake(): null { return null; }
 	async writeDiagnosticsFile(name: string): Promise<string> { return name; }
+
+	async deviceCheck(mode: DeviceCheckMode): Promise<DeviceCheckReport> {
+		this.calls.push(`deviceCheck:${mode}`);
+		return this.deviceCheckHandler(mode);
+	}
 
 	async markCreating(vaultId: string): Promise<void> {
 		this.calls.push(`markCreating:${vaultId}`);

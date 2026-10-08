@@ -14,7 +14,8 @@
  *   "committed" with the payload; evicted entries yield payload:null.
  * - Liveness: after VAULT_READY.liveness.idleMs without any received frame a
  *   VAULT_PING is sent; with nothing received within timeoutMs the socket is
- *   closed with LIVENESS_CLOSE_CODE and "closed" is emitted.
+ *   closed with LIVENESS_CLOSE_CODE and "closed" is emitted. ping() sends one
+ *   on demand (the device check's round trip) and resolves on its own pong.
  * - Exactly one "closed" event ends every session. close() emits it
  *   synchronously; later socket callbacks are ignored.
  *
@@ -245,6 +246,8 @@ class WsRelaySession implements RelaySession {
 	 */
 	private readonly gone = new AbortController();
 	private errorCode: string | null = null;
+	/** ping() calls waiting for their pong, by probe id. */
+	private readonly probes = new Map<string, { resolve(headSeq: number): void; reject(error: Error): void }>();
 
 	private lastRx: number;
 	private idleTimer: TimerHandle | null = null;
@@ -325,6 +328,19 @@ class WsRelaySession implements RelaySession {
 		this.finish(code, null, true);
 	}
 
+	ping(): Promise<{ readonly headSeq: number }> {
+		if (this.closed) return Promise.reject(new Error("relay session closed"));
+		const probeId = this.nextProbeId();
+		return new Promise((resolve, reject) => {
+			this.probes.set(probeId, { resolve: (headSeq) => resolve({ headSeq }), reject });
+			try {
+				this.ws.send(encodePing(probeId));
+			} catch {
+				// The close event follows and rejects it.
+			}
+		});
+	}
+
 	// ---- internals -----------------------------------------------------------
 
 	private deliver(listener: (event: RelayEvent) => void, event: RelayEvent): void {
@@ -351,6 +367,9 @@ class WsRelaySession implements RelaySession {
 		detach(this.ws);
 		this.join.clear();
 		this.gone.abort();
+		const probes = [...this.probes.values()];
+		this.probes.clear();
+		for (const p of probes) p.reject(new Error(`relay session closed (${code}${errorCode === null ? "" : ` ${errorCode}`}) before the pong`));
 		this.emit({ t: "closed", code, errorCode, wasClean });
 	}
 
@@ -371,11 +390,11 @@ class WsRelaySession implements RelaySession {
 				this.scheduleIdle(this.idleMs - silent);
 				return;
 			}
-			this.ping();
+			this.livenessPing();
 		});
 	}
 
-	private ping(): void {
+	private livenessPing(): void {
 		try {
 			this.ws.send(encodePing(this.nextProbeId()));
 		} catch {
@@ -474,9 +493,15 @@ class WsRelaySession implements RelaySession {
 				this.join.clear();
 				this.emit({ t: "resendUnreceipted", headSeq: control.head });
 				return;
-			case "VAULT_PONG":
+			case "VAULT_PONG": {
+				const probe = control.probeId === null ? undefined : this.probes.get(control.probeId);
+				if (probe && control.probeId !== null) {
+					this.probes.delete(control.probeId);
+					probe.resolve(control.head);
+				}
 				this.emit({ t: "head", headSeq: control.head });
 				return;
+			}
 			case "VAULT_BACKPRESSURE":
 				this.emit({ t: "backpressure" });
 				return;
