@@ -119,3 +119,51 @@ export interface DiagnosticsBundle {
 	 */
 	readonly paths: readonly { readonly pseudonym: string; readonly path: VaultPath }[] | null;
 }
+
+/** Which device check (deviceCheck request): "quick" round-trips small test blobs; "large" one at the engine's max blob size. */
+export type DeviceCheckMode = "quick" | "large";
+
+/** One step of a device check. */
+export interface DeviceCheckStep {
+	/** Stable key ("sha256-10mb", "blob-max", ...). */
+	readonly id: string;
+	readonly name: string;
+	readonly status: "pass" | "fail" | "skip";
+	/** Wall time of the step. */
+	readonly ms: number;
+	/** One line: what was measured, or why it failed or was skipped. */
+	readonly detail: string;
+	/** The error message when a call threw (storage, network and crypto code never put a credential in one). */
+	readonly error: string | null;
+	/** The step's measurements. */
+	readonly data: Readonly<Record<string, string | number | boolean | null>>;
+}
+
+/**
+ * deviceCheck answer (engine/compose/deviceCheck.ts): the on-device self-test, run in the engine on its live ports.
+ * No secrets, no file contents, no vault paths.
+ */
+export interface DeviceCheckReport {
+	readonly mode: DeviceCheckMode;
+	readonly clientVersion: string;
+	readonly startedAtMs: number;
+	readonly totalMs: number;
+	readonly steps: readonly DeviceCheckStep[];
+	/** What the reader should know (the test blobs left in the store, what was not measured). */
+	readonly notes: readonly string[];
+}
+
+/**
+ * What the engine's own scope exposes (engine/adapters/webDeviceEnv.ts in the worker), read when a device check
+ * runs. null fields: not exposed there.
+ */
+export interface DeviceEnv {
+	readonly userAgent: string | null;
+	readonly hardwareConcurrency: number | null;
+	/** navigator.deviceMemory (Chromium; rounded, capped at 8). */
+	readonly deviceMemoryGiB: number | null;
+	/** performance.memory (Chromium only). */
+	readonly jsHeap: { readonly usedBytes: number; readonly totalBytes: number; readonly limitBytes: number } | null;
+	/** The engine's platform dependencies are present in this scope. */
+	readonly apis: { readonly xmlHttpRequest: boolean; readonly webSocket: boolean; readonly idb: boolean; readonly subtleCrypto: boolean };
+}

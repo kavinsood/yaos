@@ -1232,5 +1232,29 @@ installs one device.
 5. Split view on iPad with the same note open twice: both views stay in sync
    and saving one does not revert the other.
 
+### 9.4 Device check (any device, from the command palette)
+
+Both commands run every step in the engine worker (`src/engine/compose/deviceCheck.ts`)
+against the relay the device is paired with; main only shows the results.
+- **YAOS: Run device check** (10-30 s on a phone; changes nothing in the
+  vault): engine basics (carrier must be the worker; ready time, runtime start,
+  IndexedDB open; platform; the web APIs the engine needs in the worker), SHA-256
+  of 1 MB and 10 MB, seal + open of 10 MB (E2EE vaults only), the relay socket
+  (one ping/pong) and one HTTP feed read, a 1 MB and a 10 MB blob round trip
+  on the transfer queue's path (upload progress events and download chunks are
+  counted; an upload with no progress event fails), the blob caps and the memory
+  the platform exposes.
+- **YAOS: Run large attachment check (max size)**: after a confirm, the same
+  round trip at the engine's max blob size (100 MB, 98.6 MB under E2EE). It uses
+  about 300 MB of memory; if the phone kills the worker, sync stops ("YAOS
+  stopped") until "Restart sync engine". This is the test of whether a max-size
+  attachment survives on that phone.
+
+The results show one line per step (✓ / ✗ / –, time, detail) with Copy report
+and Save report; Save writes the redacted JSON to
+`<configDir>/plugins/yaos/diagnostics/yaos-device-check-<time>.json` (or
+`yaos-large-attachment-check-...`). The test blobs belong to no file: "Clean up
+unused server attachments" deletes them after its 7-day grace.
+
 For every failure, collect: the "Export diagnostics" command output, the
 relay head for the vault, and the conflict copies / trash entries made.

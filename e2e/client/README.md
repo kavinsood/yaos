@@ -19,6 +19,7 @@
 - `editTrace.ts`: edit-to-peer breakdown between a writer and a reader on a fresh vault, for API writes, external disk writes and typing in a bound view: the writer's first APPEND, the reader's PROVISIONAL / COMMITTED and COMMIT_NOTICE, the writer's STREAM_RECEIPTS, the reader's disk write. It writes `LOG_DIR/client-e2e-edit-<label>-<stamp>.json`.
 - `mainThreadBench.ts`: main-thread cost per keystroke, per remote update and per bind on a ~1 MB note, for the Yjs replica on main of 6f7129b, the current BindingManager and a bare editor (no relay, no worker). It prints the rows (`--json` adds the raw result) and exits 1 unless both bindings converge.
 - `snapshotMemory.ts`: peak memory of the streaming snapshot export and verification on a generated vault (no relay).
+- `deviceCheck.ts`: the engine side of the commands "Run device check" and "Run large attachment check (max size)" (`src/engine/compose/deviceCheck.ts`) through the worker carrier (`FullClient` option `carrier: "worker"`, `fullWorker.ts`), one full client per vault driven by the plugin controller (`YaosController.deviceCheck`, the `deviceCheck` request with its size-scaled deadline). On a plain (suite 0) and an E2EE (suite 1) vault it runs the quick check and, with `--mode both`, the large one at the engine's `maxBlobBytes`. Checks: every step passes (seal skipped on the plain vault), the carrier is the worker, every test upload had progress events and every download chunks, the large check's size equals the status `maxBlobBytes`, and the redacted report (`formatDeviceCheck`, what Copy and Save write) holds neither the device token nor the vault key. It writes `LOG_DIR/client-e2e-device-check-<label>-<stamp>.json`. `--mode quick` against a deployed host moves 22 MB per vault.
 - `tsconfig.json`: `npx tsc -p e2e/client/tsconfig.json` typechecks these scripts. They are not part of `typecheck:client`.
 
 LOG_DIR defaults to `/Users/kavin/personal/obsidiansync/experiments/logs`. Override it with `YAOS_E2E_LOG_DIR`.
@@ -38,5 +39,8 @@ zsh scripts/relay-dev/stop-local.sh --port 8796
 
 URL=$(zsh scripts/relay-dev/start-local.sh --fresh --port 8809 | tail -1)
 node --import jiti/register e2e/client/typingDuringUpload.ts --host "$URL" --label local --vault both
+node --import jiti/register e2e/client/deviceCheck.ts --host "$URL" --label local --vault both --mode both
 zsh scripts/relay-dev/stop-local.sh --port 8809
+
+node --import jiti/register e2e/client/deviceCheck.ts --host https://yaos-relay2-client-e2e.kavinsood.workers.dev --label deployed --mode quick
 ```

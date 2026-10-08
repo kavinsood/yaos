@@ -32,6 +32,11 @@ export function isKeyMissing(h: StateHost): boolean {
 	return reason !== undefined && reason !== null;
 }
 
+/** The device check runs in the engine on its live ports: a paired device whose engine is running. */
+export function canRunDeviceCheck(h: Pick<YaosUiHost, "data" | "runState">): boolean {
+	return h.data().identity !== null && engineAcceptsCommands(h.runState());
+}
+
 /** Pinned to suite 1 and holding the current key: it can show a re-key QR and re-key after a revoke (§14.2). */
 export function canRekey(h: StateHost): boolean {
 	return h.data().e2ee?.suite === 1 && h.status()?.e2ee?.keyMissing === null;
@@ -55,7 +60,9 @@ export type UiCommandId =
 	| "yaos-finish-creating-vault"
 	| "yaos-unlock"
 	| "yaos-show-rekey-qr"
-	| "yaos-rekey-after-revoke";
+	| "yaos-rekey-after-revoke"
+	| "yaos-device-check"
+	| "yaos-device-check-large";
 
 export interface UiCommandSpec {
 	readonly id: UiCommandId;
@@ -83,4 +90,6 @@ export const UI_COMMANDS: readonly UiCommandSpec[] = Object.freeze([
 	{ id: "yaos-unlock", name: "Enter recovery key or scan a QR code", available: isKeyMissing },
 	{ id: "yaos-show-rekey-qr", name: "Show re-key QR", available: canRekey },
 	{ id: "yaos-rekey-after-revoke", name: "Re-key after revoking a device", available: canRekey },
+	{ id: "yaos-device-check", name: "Run device check", available: canRunDeviceCheck },
+	{ id: "yaos-device-check-large", name: "Run large attachment check (max size)", available: canRunDeviceCheck },
 ] satisfies UiCommandSpec[]);

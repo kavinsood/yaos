@@ -31,13 +31,14 @@ import { isStorageError } from "../../ports/storage";
 import type { VaultEvent } from "../../ports/vault";
 import { ProtocolFailure, type ProtocolError } from "../../protocol/errors";
 import { PROTOCOL_VERSION, type EngineInitConfig, type EngineResultValue, type EngineSettings, type LocalObservation, type MainToEngine, type UserCommand } from "../../protocol/messages";
-import type { StatusSnapshot } from "../../protocol/status";
+import type { DeviceCheckMode, DeviceEnv, StatusSnapshot } from "../../protocol/status";
 import type { EngineTransport } from "../../protocol/transport";
 import type { Budgets } from "../../core/limits";
 import type { EngineTuning } from "../runtime/options";
 import { BoundBody } from "./boundBody";
 import { BoundDisk } from "./boundDisk";
 import { BoundDocs } from "./boundDocs";
+import { runDeviceCheck, type DeviceCheckDeps } from "./deviceCheck";
 import { answerHashRequest } from "./hashService";
 import { HostKeyring } from "./hostKeyring";
 import { HostLink } from "./hostLink";
@@ -66,6 +67,8 @@ export interface CreateEngineOptions {
 	readonly tzOffsetMinutes?: () => number;
 	/** Epoch of an existing local DB for this vault/device (offline start); undefined = connect first. */
 	findKnownEpoch?(config: EngineInitConfig, ports: EnginePorts): Promise<VaultEpoch | undefined>;
+	/** What the engine's own scope exposes, for the device check (webEngine.ts: adapters/webDeviceEnv.ts). Absent = not probed. */
+	readonly deviceEnv?: () => DeviceEnv;
 }
 
 export interface EngineHandle {
@@ -105,6 +108,11 @@ export class ComposedEngine {
 	private retryTimer: number | null = null;
 	private lastStartError: string | null = null;
 	private knownEpoch: VaultEpoch | undefined;
+	/** The engine clock when init answered ready, and the last runtime start's duration (the device check reports them). */
+	private readyAtMs: number | null = null;
+	private runtimeStartMs: number | null = null;
+	/** The device check running (one at a time); aborted by dispose. */
+	private deviceChecking: AbortController | null = null;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
 	private migration: { bases: Map<PathKey, string>; oldEpoch: VaultEpoch; frameNoFloor: FrameNoFloor } | null = null;
 	private readonly offs: (() => void)[] = [];
@@ -132,6 +140,7 @@ export class ComposedEngine {
 	dispose(crash = false): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.deviceChecking?.abort();
 		for (const off of this.offs) off();
 		if (this.retryTimer !== null && this.ports) this.ports.clock.clearTimer(this.retryTimer);
 		const rt = this.rt;
@@ -218,6 +227,7 @@ export class ComposedEngine {
 			this.fail(rid, { code: "storage-lost", message: storageError, retryable: true });
 			return;
 		}
+		this.readyAtMs = this.ports.clock.monotonic();
 		this.answer(rid, { t: "ready", protocolVersion: PROTOCOL_VERSION, vaultEpoch: this.vaultEpoch, recovered: this.rt?.recovered ?? false });
 		this.postStatus();
 	}
@@ -232,6 +242,7 @@ export class ComposedEngine {
 		const run = (async (): Promise<string | null> => {
 			const config = this.config!;
 			const ports = this.gate!.writerPorts(this.ports!);
+			const startedAt = ports.clock.monotonic();
 			try {
 				const rt = await VaultRuntime.start({
 					engine: this, config, settings: this.settings!, ports, carrier: this.options.carrier,
@@ -245,6 +256,7 @@ export class ComposedEngine {
 					return null;
 				}
 				this.rt = rt;
+				this.runtimeStartMs = ports.clock.monotonic() - startedAt;
 				this.knownEpoch = rt.vaultEpoch;
 				this.migration = null;
 				this.lastStartError = null;
@@ -452,7 +464,57 @@ export class ComposedEngine {
 			case "hashRequest":
 				this.answer(m.rid, await answerHashRequest(m.items, this.ports));
 				return;
+			case "deviceCheck":
+				this.answer(m.rid, await this.deviceCheck(m.mode));
+				return;
 		}
+	}
+
+	/** The on-device self-test on the live ports (deviceCheck.ts). One at a time. */
+	private async deviceCheck(mode: DeviceCheckMode): Promise<EngineResultValue> {
+		if (this.deviceChecking) throw new ProtocolFailure({ code: "bad-request", message: "a device check is already running", retryable: true });
+		const ctl = new AbortController();
+		this.deviceChecking = ctl;
+		try {
+			return { t: "deviceCheck", report: await runDeviceCheck(mode, this.deviceCheckDeps(ctl.signal)) };
+		} finally {
+			if (this.deviceChecking === ctl) this.deviceChecking = null;
+		}
+	}
+
+	private deviceCheckDeps(signal: AbortSignal): DeviceCheckDeps {
+		const config = this.config!;
+		const ports = this.ports!;
+		const rt = this.rt;
+		const c = rt?.log.c ?? null;
+		const why = this.reader
+			? "the vault key is missing or not verified: only the key reader runs, no vault runtime"
+			: `the vault runtime is not running${this.lastStartError !== null ? ` (its last start failed: ${this.lastStartError})` : " yet"}`;
+		return {
+			carrier: this.options.carrier,
+			clientVersion: this.options.clientVersion ?? "dev",
+			platform: config.platform,
+			deviceClass: config.deviceClass,
+			suite: config.crypto.suite,
+			startup: { readyAtMs: this.readyAtMs, runtimeStartMs: this.runtimeStartMs, repoOpenMs: c?.repoOpenMs ?? null },
+			env: this.options.deviceEnv ?? (() => null),
+			clock: ports.clock,
+			random: ports.random,
+			hash: ports.hash,
+			signal,
+			live: rt && c ? {
+				crypto: c.deps.crypto,
+				blob: c.deps.blob,
+				maxBlobBytes: rt.blobs.maxBlobBytes,
+				maxAttachmentBytes: rt.settings.maxAttachmentBytes,
+				blobBytesInFlight: c.budgets.blobBytesInFlight,
+				blobGcGraceMs: c.tuning.blobGcGraceMs,
+				phase: () => c.phase,
+				session: () => c.session,
+				vaultSeq: () => c.repo.cursor.vaultSeq,
+				linkGen: () => c.gen,
+			} : why,
+		};
 	}
 
 	private async command(c: UserCommand): Promise<EngineResultValue> {

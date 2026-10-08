@@ -73,18 +73,26 @@ export function diagnosticsSettings(host: Pick<YaosUiHost, "data" | "pluginVersi
 	};
 }
 
+/** Pretty JSON with recursively sorted keys (stable across runs) and every secret-looking key redacted. */
+export function redactedJson(value: unknown): string {
+	return `${JSON.stringify(canonicalize(value, 0), null, 2)}\n`;
+}
+
 /** Pretty JSON with recursively sorted keys (stable across runs), plus a format tag. */
 export function formatDiagnostics(bundle: DiagnosticsBundle, settings?: DiagnosticsSettings): string {
-	return `${JSON.stringify(canonicalize({ format: DIAGNOSTICS_FORMAT, bundle, settings }, 0), null, 2)}\n`;
+	return redactedJson({ format: DIAGNOSTICS_FORMAT, bundle, settings });
+}
+
+/** `2026-10-05T12-34-56-789Z`: an ISO time with no ':' or '.', valid in a file name on every OS. */
+export function fileStamp(atMs: number): string {
+	return new Date(Number.isFinite(atMs) ? atMs : 0).toISOString().replace(/[:.]/g, "-");
 }
 
 /**
- * `yaos-diagnostics-2026-10-05T12-34-56-789Z.json` (no ':' so the name is valid on every OS);
- * `...-with-file-names.json` when the file lists vault paths.
+ * `yaos-diagnostics-2026-10-05T12-34-56-789Z.json`; `...-with-file-names.json` when the file lists vault paths.
  */
 export function diagnosticsFileName(atMs: number, includePaths = false): string {
-	const iso = new Date(Number.isFinite(atMs) ? atMs : 0).toISOString().replace(/[:.]/g, "-");
-	return `yaos-diagnostics-${iso}${includePaths ? "-with-file-names" : ""}.json`;
+	return `yaos-diagnostics-${fileStamp(atMs)}${includePaths ? "-with-file-names" : ""}.json`;
 }
 
 /** Asked before exportDiagnostics{includePaths: true}. */

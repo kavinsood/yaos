@@ -15,7 +15,7 @@ import { hexToBytes } from "../core/codec/lib0";
 import type { BrakeReport, DeviceId, VaultId } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { EngineResultValue, EngineSettings, UserCommand } from "../protocol/messages";
-import type { StatusSnapshot } from "../protocol/status";
+import type { DeviceCheckMode, DeviceCheckReport, StatusSnapshot } from "../protocol/status";
 import { wipeSecrets } from "../protocol/workerTransport";
 import { HostRequestError } from "./engineHost";
 import type { HostRuntime, HostUiSink } from "./hostRuntime";
@@ -28,6 +28,7 @@ import { plaintextNoticeOnce, type PlaintextNoticeEnv } from "./keys/plaintextNo
 import { VaultKeyStore, type EpochKey, type SecretStorageLike } from "./keys/secretStore";
 import type { HostIdentity } from "./runtimeSupport";
 import { sameEngineSettings, sameIdentity, type EngineRunState, type PairedIdentity, type YaosPluginData } from "./ui/api";
+import { deviceCheckDeadlineMs } from "./ui/deviceCheck";
 
 export interface ControllerEnv {
 	makeRuntime(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink, keys: HostKeys): HostRuntime;
@@ -379,6 +380,23 @@ export class YaosController {
 		const hash = r.t === "hashes" && r.values.length === 1 ? r.values[0]!.hash : "";
 		if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error("YAOS: the engine returned no checksum.");
 		return hexToBytes(hash.slice(0, 6));
+	}
+
+	/**
+	 * The on-device self-test: the engine runs it on its live ports (engine/compose/deviceCheck.ts); its deadline scales
+	 * with the bytes it moves (ui/deviceCheck.ts), not the default request timeout.
+	 */
+	async deviceCheck(mode: DeviceCheckMode): Promise<DeviceCheckReport> {
+		const rt = this.runtime;
+		if (!rt || this.run.phase !== "running") throw new Error("YAOS is not running.");
+		let r: EngineResultValue;
+		try {
+			r = await rt.engine.request({ t: "deviceCheck", mode }, deviceCheckDeadlineMs(mode, this.snapshot?.maxBlobBytes ?? null));
+		} catch (e) {
+			throw new Error(safeMessage(e));
+		}
+		if (r.t !== "deviceCheck") throw new Error("the sync engine returned no device check report");
+		return r.report;
 	}
 
 	/**

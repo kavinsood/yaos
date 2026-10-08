@@ -14,7 +14,8 @@
  *    adapter (DESIGN §a); suite 1 and an unpinned device get the suite-1
  *    adapter (unpinned: no keys, so a QR / RK key can be verified against `k`);
  *    hash, random, clock: WebCrypto / setTimeout;
- *  - local time zone for conflict-copy names (the core never reads Date).
+ *  - local time zone for conflict-copy names (the core never reads Date);
+ *  - the worker scope's facts for the device check (webDeviceEnv.ts).
  */
 
 import type { EngineTransport } from "../../protocol/transport";
@@ -24,6 +25,7 @@ import { createIdbStoragePort } from "./idbStorage";
 import { createNoopCrypto } from "./noopCrypto";
 import { createWebCryptoSuite1 } from "./webCryptoSuite1";
 import { createWebClock } from "./webClock";
+import { webDeviceEnv } from "./webDeviceEnv";
 import { createWebHash } from "./webHash";
 import { createWebRandom } from "./webRandom";
 import { createWsRelayPort } from "./wsRelay";
@@ -39,6 +41,7 @@ export function createWebEngine(transport: EngineTransport, o: WebEngineOptions 
 		clientVersion: o.clientVersion ?? "dev",
 		log: o.log,
 		tzOffsetMinutes: () => -new Date().getTimezoneOffset(),
+		deviceEnv: webDeviceEnv,
 		makePorts: async (config) => {
 			const clock = createWebClock();
 			const hash = createWebHash();

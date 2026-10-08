@@ -64,11 +64,11 @@ export function gatedBlob(inner: BlobPort | null, gate: GateFn): BlobPort | null
 			return inner.maxBlobBytes;
 		},
 		has: (a, signal) => inner.has(a, signal),
-		put: async (address, parts, signal) => {
+		put: async (address, parts, signal, progress) => {
 			assertWritable(gate);
-			return inner.put(address, parts, signal);
+			return inner.put(address, parts, signal, progress);
 		},
-		get: (a, signal) => inner.get(a, signal),
+		get: (a, signal, progress) => inner.get(a, signal, progress),
 		list: (cursor, signal) => inner.list(cursor, signal),
 		deleteIfUploadedBefore: async (addresses, cutoffMs, signal) => {
 			assertWritable(gate);

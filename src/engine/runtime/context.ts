@@ -90,6 +90,8 @@ export class EngineCtx {
 	readOnly = false;
 	lastCloseCode: number | null = null;
 	lastSyncedAtMs: number | null = null;
+	/** How long this engine's Repo.open took (IndexedDB open and identity check; the device check reports it). */
+	repoOpenMs: number | null = null;
 	dailyLimitUntilMono = 0;
 	private readonly dailyLimitNotices = new DailyLimitNoticeGate();
 	daily = { day: "", frames: 0 };

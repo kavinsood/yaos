@@ -732,7 +732,7 @@ function keylessJoinMatrix(): Promise<JoinTallies> {
 
 /** commands.ts UI_COMMANDS available on a paired device blocked for want of a key (running, not paused, no brake). */
 const PALETTE_WHEN_BLOCKED = [
-	"yaos-browse-snapshots", "yaos-clean-up-attachments", "yaos-create-snapshot", "yaos-export-diagnostics",
+	"yaos-browse-snapshots", "yaos-clean-up-attachments", "yaos-create-snapshot", "yaos-device-check", "yaos-device-check-large", "yaos-export-diagnostics",
 	"yaos-export-diagnostics-with-paths", "yaos-pair-another-device", "yaos-pair-device", "yaos-pause",
 	"yaos-rebuild-local-cache", "yaos-reconcile-now", "yaos-restart-engine", "yaos-unlock",
 ] as const;

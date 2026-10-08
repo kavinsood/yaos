@@ -55,8 +55,8 @@ export class TransferLink {
 				return inner.maxBlobBytes;
 			},
 			has: (a, signal) => run(signal, (s) => inner.has(a, s)),
-			put: (address, parts, signal) => run(signal, (s) => inner.put(address, parts, s)),
-			get: (a, signal) => run(signal, (s) => inner.get(a, s)),
+			put: (address, parts, signal, progress) => run(signal, (s) => inner.put(address, parts, s, progress)),
+			get: (a, signal, progress) => run(signal, (s) => inner.get(a, s, progress)),
 			list: (cursor, signal) => run(signal, (s) => inner.list(cursor, s)),
 			deleteIfUploadedBefore: (addresses, cutoffMs, signal) => run(signal, (s) => inner.deleteIfUploadedBefore(addresses, cutoffMs, s)),
 		};

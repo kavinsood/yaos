@@ -51,14 +51,22 @@ export class BlobTooLargeError extends Error {
 	}
 }
 
+/**
+ * Watches one put or get while its bytes move, through the same events that restart the adapter's idle window: for a
+ * put, each upload progress event (`bytes` = sent so far); for a get, each body chunk (`bytes` = its size). Only the
+ * device check passes one (engine/compose/deviceCheck.ts: a real upload with no progress event would be cut by the
+ * idle window); the blob queue passes none.
+ */
+export type BlobProgress = (bytes: number) => void;
+
 export interface BlobPort {
 	readonly maxBlobBytes: number;
 	/** Subset of addresses already stored. */
 	has(addresses: readonly BlobAddress[], signal?: AbortSignal): Promise<ReadonlySet<BlobAddress>>;
 	/** Idempotent. Stores the concatenation of `parts`, as CryptoPort.sealBlob returned them. BlobTooLargeError = refused by size. */
-	put(address: BlobAddress, parts: SealedBlobParts, signal?: AbortSignal): Promise<void>;
+	put(address: BlobAddress, parts: SealedBlobParts, signal?: AbortSignal, progress?: BlobProgress): Promise<void>;
 	/** null = not found (yet). */
-	get(address: BlobAddress, signal?: AbortSignal): Promise<Uint8Array | null>;
+	get(address: BlobAddress, signal?: AbortSignal, progress?: BlobProgress): Promise<Uint8Array | null>;
 	/** One page of the vault's blobs after `cursor` (null = from the start). Rejects when `signal` aborts. */
 	list(cursor: BlobAddress | null, signal?: AbortSignal): Promise<BlobListPage>;
 	/**

@@ -48,7 +48,7 @@
  */
 
 import { BLOB_TRANSFER_IDLE_MS, MAX_BLOB_UPLOAD_BYTES } from "../../core/limits";
-import { BLOB_DELETE_BATCH, BlobTooLargeError, type BlobDeleteResult, type BlobListItem, type BlobPort } from "../../ports/blob";
+import { BLOB_DELETE_BATCH, BlobTooLargeError, type BlobDeleteResult, type BlobListItem, type BlobPort, type BlobProgress } from "../../ports/blob";
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { BlobAddress } from "../../ports/crypto";
 import { bounded, relayHttpDeadlineMs, RELAY_REPLY_BYTES, untilAborted } from "../../core/deadline";
@@ -200,7 +200,7 @@ function parseDeleteResult(v: unknown, address: BlobAddress): BlobDeleteResult |
  * Without one, or with a Content-Encoding (the length is of the encoded bytes; fetch hands over decoded ones): the
  * chunks are collected, their running total held to `max`, and joined once.
  */
-async function readBody(res: Response, reader: ReadableStreamDefaultReader<Uint8Array> | null, max: number, t: Transfer): Promise<Uint8Array> {
+async function readBody(res: Response, reader: ReadableStreamDefaultReader<Uint8Array> | null, max: number, t: Transfer, progress: BlobProgress | undefined): Promise<Uint8Array> {
 	const declared = res.headers.get("Content-Length");
 	const encoding = res.headers.get("Content-Encoding");
 	const length = declared !== null && /^\d+$/.test(declared) && (encoding === null || encoding === "identity") ? Number(declared) : null;
@@ -227,6 +227,7 @@ async function readBody(res: Response, reader: ReadableStreamDefaultReader<Uint8
 	let n = 0;
 	for (let chunk = await next(); chunk !== null; chunk = await next()) {
 		t.kick();
+		progress?.(chunk.length);
 		if (chunk.length > (out === null ? max : out.length) - n) return bad();
 		if (out === null) chunks.push(chunk);
 		else out.set(chunk, n);
@@ -328,9 +329,9 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 
 	/**
 	 * One PUT over XMLHttpRequest. The idle window restarts on every upload progress event, the end of the upload,
-	 * every response progress event and every readyState change.
+	 * every response progress event and every readyState change. `progress` sees the upload progress events.
 	 */
-	function putBody(url: string, body: Blob, signal: AbortSignal | undefined): Promise<void> {
+	function putBody(url: string, body: Blob, signal: AbortSignal | undefined, progress: BlobProgress | undefined): Promise<void> {
 		const route = "blobs/put";
 		return new Promise((resolve, reject) => {
 			if (Xhr === undefined) {
@@ -362,7 +363,11 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 				x.open("PUT", url);
 				x.setRequestHeader("Authorization", auth.Authorization);
 				x.setRequestHeader("Content-Type", "application/octet-stream");
-				x.upload.onprogress = x.upload.onload = x.onprogress = x.onreadystatechange = kick;
+				x.upload.onload = x.onprogress = x.onreadystatechange = kick;
+				x.upload.onprogress = progress === undefined ? kick : (ev: ProgressEvent) => {
+					kick();
+					progress(ev.loaded);
+				};
 				x.onerror = x.ontimeout = x.onabort = lost;
 				x.onload = () => {
 					if (x.status === 413) settle(new BlobTooLargeError(body.size));
@@ -417,11 +422,11 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 		// size as its Content-Length, which the relay requires (411 length_required). Not async: only the Blob
 		// outlives this call, so the parts (the sealed bytes) are garbage for the whole upload, not held by a
 		// suspended frame. Parts are never SharedArrayBuffer views.
-		put(address, parts, signal) {
-			return putBody(`${root}/${encodeURIComponent(address)}`, new Blob(parts as Uint8Array<ArrayBuffer>[]), signal);
+		put(address, parts, signal, progress) {
+			return putBody(`${root}/${encodeURIComponent(address)}`, new Blob(parts as Uint8Array<ArrayBuffer>[]), signal, progress);
 		},
 
-		async get(address, signal) {
+		async get(address, signal, progress) {
 			const route = "blobs/get";
 			if (signal?.aborted) throw abortError(route);
 			let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -435,7 +440,7 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 				t.kick();
 				if (res.status === 200) {
 					reader = res.body?.getReader() ?? null;
-					return await readBody(res, reader, maxBlobBytes, t);
+					return await readBody(res, reader, maxBlobBytes, t, progress);
 				}
 				if (res.status === 404) {
 					const code = await errorCode(res, t);

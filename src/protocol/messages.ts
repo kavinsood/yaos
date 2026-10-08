@@ -21,7 +21,7 @@ import type { DeviceClass } from "../core/limits";
 import type { PlatformInfo, LifecycleEvent } from "../ports/platform";
 import type { VaultEvent, VaultStat, WritePrecondition, WriteOutcome, RenameOutcome, TrashMode, SideFileName } from "../ports/vault";
 import type { ProtocolError } from "./errors";
-import type { StatusSnapshot, DiagnosticsBundle } from "./status";
+import type { StatusSnapshot, DiagnosticsBundle, DeviceCheckMode, DeviceCheckReport } from "./status";
 
 export const PROTOCOL_VERSION = 3;
 
@@ -228,6 +228,12 @@ export type UserCommand =
 	/** -> `attachmentsCleaned`: one sweep of the server's unreferenced attachments (e2ee-design §10.4). */
 	| { readonly t: "cleanUpAttachments" };
 
+/**
+ * The quick device check's test blob sizes, in bytes: each is hashed and round-tripped through the blob store; the
+ * largest is also sealed and opened under suite 1 (engine/compose/deviceCheck.ts).
+ */
+export const DEVICE_CHECK_QUICK_BYTES: readonly number[] = Object.freeze([1_000_000, 10_000_000]);
+
 /** Why a clean-up deleted nothing, or ("interrupted") stopped part-way (engine/blobs/gc.ts GcRefusal). */
 export type AttachmentCleanupRefusal =
 	| "no-store" | "keys-unverified" | "offline" | "read-only" | "not-caught-up" | "fold-incomplete" | "body-unreadable"
@@ -282,6 +288,13 @@ export type MainToEngine =
 	| { readonly t: "docCredit"; readonly bytes: number }
 	/** Hash raw bytes the host read (write preconditions, config writes); answered by `hashes`. [T] */
 	| { readonly t: "hashRequest"; readonly rid: RequestId; readonly items: readonly { readonly path: string; readonly want: HashWant; readonly bytes: Uint8Array /* [T] */ }[] }
+	/**
+	 * The on-device self-test (commands "Run device check", "Run large attachment check"): the engine runs it on its
+	 * live ports and answers `deviceCheck`; main only shows the report. Its deadline scales with the bytes it moves
+	 * (host/ui/deviceCheck.ts deviceCheckDeadlineMs), not DEFAULT_REQUEST_TIMEOUT_MS. One at a time: a second while one
+	 * runs fails `bad-request`.
+	 */
+	| { readonly t: "deviceCheck"; readonly rid: RequestId; readonly mode: DeviceCheckMode }
 	| { readonly t: "result"; readonly re: RequestId; readonly value: MainResultValue }
 	| { readonly t: "error"; readonly re: RequestId; readonly error: ProtocolError }
 	| { readonly t: "command"; readonly rid: RequestId; readonly command: UserCommand };
@@ -352,6 +365,7 @@ export type EngineResultValue =
 	 */
 	| { readonly t: "restored"; readonly restored: number; readonly unchanged: number; readonly copies: readonly VaultPath[]; readonly failed: readonly VaultPath[] }
 	| { readonly t: "diagnostics"; readonly bundle: DiagnosticsBundle }
+	| { readonly t: "deviceCheck"; readonly report: DeviceCheckReport }
 	/** cleanUpAttachments. keptNewer: unreferenced but uploaded within the grace; repaired / lost: deleted, then found referenced. */
 	| { readonly t: "attachmentsCleaned"; readonly deleted: number; readonly keptNewer: number; readonly repaired: number; readonly lost: number; readonly refused: AttachmentCleanupRefusal | null; readonly detail: string | null };
 

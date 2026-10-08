@@ -148,7 +148,7 @@ async function smokePlugin(mainJs, manifest, carrier) {
 		if (ctl.runState().phase !== "stopped") fail(`after unload: ${JSON.stringify(ctl.runState())}`);
 		if (logged.join("\n").includes(TOKEN) || saved.notices.join("\n").includes(TOKEN)) fail("device token leaked to logs/notices");
 		if (vault.trashed.length !== 0 || vault.text("hello.md") !== "hello from the smoke vault") fail("smoke run modified the vault");
-		return { commands: plugin.commands.length, scripts };
+		return { commands: plugin.commands.map((c) => c.name), scripts };
 	} finally {
 		console.debug = origDebug;
 		for (const [k, v] of Object.entries(prev)) {
@@ -172,6 +172,7 @@ export async function smokeCheck({ mainJs, zipPath, manifest, bundleFunctionName
 
 	const none = await smokePlugin(mainJs, manifest, "none");
 	if (none.scripts.length !== 0) fail("no-Worker smoke started a worker");
+	for (const name of ["Run device check", "Run large attachment check (max size)"]) if (!none.commands.includes(name)) fail(`command "${name}" not registered`);
 	const worker = await smokePlugin(mainJs, manifest, "worker");
 	if (worker.scripts.length !== 1) fail(`worker smoke started ${worker.scripts.length} workers (expected 1)`);
 	const script = worker.scripts[0];
@@ -179,6 +180,7 @@ export async function smokeCheck({ mainJs, zipPath, manifest, bundleFunctionName
 	if (occurrences(script, ENGINE_MARKERS[0]) !== 1) fail("worker script carries more than one engine");
 	console.log(
 		`plugin smoke: OK  zip layout, no WASM, engine once (${ENGINE_MARKERS.length} markers x1), ` +
-			`no Worker: onload -> failed ("YAOS stopped", no engine on main) -> unload (${none.commands} commands), onload -> running/worker (script = main.js wrapper, ${(script.length / 1024).toFixed(1)} KiB) -> unload`,
+			`no Worker: onload -> failed ("YAOS stopped", no engine on main) -> unload (${none.commands.length} commands), onload -> running/worker (script = main.js wrapper, ${(script.length / 1024).toFixed(1)} KiB) -> unload`,
 	);
+	console.log(`plugin smoke: commands: ${none.commands.join(" | ")}`);
 }

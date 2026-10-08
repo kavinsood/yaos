@@ -25,6 +25,7 @@ test("command ids match the contract", () => {
 		"yaos-browse-snapshots", "yaos-clean-up-attachments", "yaos-create-snapshot", "yaos-export-diagnostics", "yaos-export-diagnostics-with-paths", "yaos-pair-another-device", "yaos-pair-device", "yaos-pause",
 		"yaos-rebuild-local-cache", "yaos-reconcile-now", "yaos-restart-engine", "yaos-resume", "yaos-show-brake",
 		"yaos-create-vault", "yaos-finish-creating-vault", "yaos-rekey-after-revoke", "yaos-show-rekey-qr", "yaos-unlock",
+		"yaos-device-check", "yaos-device-check-large",
 	].sort());
 	for (const c of UI_COMMANDS) assert.ok(c.name.length > 0 && c.name[0] === c.name[0]?.toUpperCase());
 });
@@ -32,7 +33,7 @@ test("command ids match the contract", () => {
 test("command availability follows engine, pause, brake and pairing state; restart stays available when the engine is down", () => {
 	assert.deepEqual(available(host({ run: "unpaired" })), ["yaos-create-vault", "yaos-pair-device"]);
 	// These paired devices hold no pin and their engine reports no e2ee state: "Create a new vault" is not offered.
-	const running = ["yaos-browse-snapshots", "yaos-clean-up-attachments", "yaos-create-snapshot", "yaos-export-diagnostics", "yaos-export-diagnostics-with-paths", "yaos-pair-another-device", "yaos-pair-device", "yaos-rebuild-local-cache", "yaos-reconcile-now", "yaos-restart-engine"];
+	const running = ["yaos-browse-snapshots", "yaos-clean-up-attachments", "yaos-create-snapshot", "yaos-device-check", "yaos-device-check-large", "yaos-export-diagnostics", "yaos-export-diagnostics-with-paths", "yaos-pair-another-device", "yaos-pair-device", "yaos-rebuild-local-cache", "yaos-reconcile-now", "yaos-restart-engine"];
 	assert.deepEqual(available(host({ paired: true, phase: "live" })), [...running, "yaos-pause"].sort());
 	assert.deepEqual(available(host({ paired: true, phase: "paused" })), [...running, "yaos-resume"].sort());
 	const brake: BrakeReport = { id: "b", reason: "listing-shrank", heldCount: 1, syncedCount: 1, samplePaths: [] };
