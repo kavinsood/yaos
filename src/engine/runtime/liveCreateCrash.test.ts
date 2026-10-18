@@ -129,11 +129,11 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 			const op = create(A(), "same.md", hash);
 			losers.add(docStream("markdown", op.docId)!);
 			const [cf] = await run(A().submitNs([op], { liveCreates: true }));
-			await until(() => storage.dead || (A().c.outbox.get(cf!)?.state === "sent" && relay.pendingCount() === 1), 2_000, "create at the relay", clock);
+			await until(() => storage.dead || (A().c.sender.isInflight(cf!) && relay.pendingCount() === 1), 2_000, "create at the relay", clock);
 			relay.commitNow();
 			await run(write(A(), op.docId, "LOSER3;"));
 			const body = A().c.outbox.ofStream(docStream("markdown", op.docId)!)[0];
-			await until(() => storage.dead || A().c.outbox.get(body!.clientFrameId)?.state === "sent", 2_000, "body sent before the receipt", clock);
+			await until(() => storage.dead || A().c.sender.isInflight(body!.clientFrameId), 2_000, "body sent before the receipt", clock);
 			await until(() => storage.dead || A().c.ns.state.entries.get(op.docId)?.state === "merged", 3_000, "merged", clock);
 			relay.resumeCommits();
 			relay.setLink("dev-a" as DeviceId, {});

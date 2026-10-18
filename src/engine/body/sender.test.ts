@@ -76,7 +76,7 @@ function rec(stream: StreamName, bytes = 10, over: Partial<OutboxRecord> = {}): 
 		clientFrameId: `f${String(n).padStart(21, "0")}` as ClientFrameId, order: n, stream,
 		kind: stream === NS_STREAM ? "nsOps" : stream === CFG_STREAM ? "cfgOps" : "bodyUpdate",
 		state: "pending", sealed: new Uint8Array(bytes), content: new Uint8Array(0), authorNsSeq: 0, flags: 0, frameNo, keyEpoch: 0, dependsOn: null, adoptOf: null,
-		attempts: 0, createdAtMs: 0, lastSentAtMs: 0, ...over,
+		createdAtMs: 0, ...over,
 	};
 }
 const RANK: Record<string, number> = { [BOUND]: 0, [NS_STREAM]: 1, [CFG_STREAM]: 2, [BG]: 3, [X]: 4 };
@@ -313,8 +313,8 @@ test("sender: backpressure holds 5 s and halves the rate; pause; upsert replace 
 	const [h] = add(rec(BOUND));
 	sender.upsert({ ...h!, state: "held" });
 	assert.equal(sender.has(h!.clientFrameId), false);
-	sender.upsert({ ...h!, state: "sent" });
-	assert.equal(sender.has(h!.clientFrameId), true, "sent records are still maybe-unsent");
+	sender.upsert({ ...h!, state: "pending" });
+	assert.equal(sender.has(h!.clientFrameId), true, "released to pending: sendable again");
 	sender.detach();
 	const n = s.appends.length;
 	add(rec(BOUND));

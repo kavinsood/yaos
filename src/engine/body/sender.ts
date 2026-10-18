@@ -1,8 +1,8 @@
 /**
  * Sender (DESIGN §d.4, §d.5, §d.6, §i.1, §i.6).
  *
- * Sends `pending`/`sent` outbox records (both are "maybe sent" after any
- * restart; correctness relies only on idempotence, R4) in lane order, then
+ * Sends `pending` outbox records ("maybe sent": in-flight state is this
+ * sender's memory only; correctness relies only on idempotence, R4) in lane order, then
  * outbox order, within:
  *  - a token bucket (APPEND_BYTES_PER_SEC, halved for 10 min after backpressure);
  *  - maxInflightAppendBytes of sent-unreceipted bytes (one frame always allowed);
@@ -49,8 +49,8 @@ export interface SenderDeps {
 	/** Rank: 0 bound body, 1 ns, 2 cfg, 3 snap / background body, 4 adopted. */
 	rankOf(rec: OutboxRecord): number;
 	maxInflightBytes(): number;
-	/** Lazy T_sent (diagnostics only). */
-	onSent(rec: OutboxRecord, attempts: number): void;
+	/** A record was written to the session (`attempts` counts this sender's writes of it). Observation only. */
+	onSent?(rec: OutboxRecord, attempts: number): void;
 	onPoison(rec: OutboxRecord, why: string): void;
 	onForbidden(): void;
 	/** waitMs: the hold; retryAfterMs: the relay's delay to its reset, null when it did not say. */
@@ -188,15 +188,15 @@ export class Sender {
 		this.pump();
 	}
 
-	/** Add or replace a sendable record (pending / sent). Other states are removed. */
+	/** Add or replace a sendable (pending) record. Other states are removed. */
 	upsert(rec: OutboxRecord): void {
-		if (rec.state !== "pending" && rec.state !== "sent") {
+		if (rec.state !== "pending") {
 			this.remove(rec.clientFrameId);
 			return;
 		}
 		const e = this.entries.get(rec.clientFrameId);
 		if (e) e.rec = rec;
-		else this.entries.set(rec.clientFrameId, { rec, attempts: rec.attempts, retryAtMono: 0 });
+		else this.entries.set(rec.clientFrameId, { rec, attempts: 0, retryAtMono: 0 });
 		this.dirty = true;
 		this.schedule(0);
 	}
@@ -432,7 +432,7 @@ export class Sender {
 			this.stats.appends++;
 			this.stats.bytes += bytes;
 			s.append({ stream: e.rec.stream, clientFrameId: cfid, payload: e.rec.sealed });
-			this.deps.onSent(e.rec, e.attempts);
+			this.deps.onSent?.(e.rec, e.attempts);
 		}
 		if (nextWake < Infinity) this.schedule(nextWake);
 	}

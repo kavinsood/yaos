@@ -52,7 +52,7 @@ function record(id: string, order: number, stream: string, sealedLen: number, ov
 	return {
 		clientFrameId: F(id), order, stream: S(stream), kind: "bodyUpdate", state: "pending",
 		sealed: bytesOf(sealedLen, order), content: bytesOf(3, 99), authorNsSeq: 5, flags: 0, frameNo: null, keyEpoch: 0,
-		dependsOn: null, adoptOf: null, attempts: 0, createdAtMs: 1, lastSentAtMs: 0, ...over,
+		dependsOn: null, adoptOf: null, createdAtMs: 1, ...over,
 	};
 }
 
@@ -94,7 +94,7 @@ const FULL_SYNCED: SyncedMirror = {
 // Independent layout builders (DESIGN §e.4), with hooks to forge bad files.
 // ---------------------------------------------------------------------------
 
-const STATE_CODES: Record<OutboxState, number> = { held: 1, pending: 2, sent: 3, poisoned: 4, adoptable: 5 };
+const STATE_CODES: Record<OutboxMirrorFrame["state"], number> = { held: 1, pending: 2, sent: 3, poisoned: 4, adoptable: 5 };
 const KIND_CODES: Record<DocKind, number> = { markdown: 1, canvas: 2, blob: 3 };
 
 interface Forge {
@@ -505,7 +505,7 @@ describe("toMirrorFrame / selectMirrorFrames", () => {
 		const records = [
 			record("c", 30, "b:d1", 10),
 			record("p", 5, "b:d2", 10, { state: "poisoned" }),
-			record("n", 20, "ns", 10, { state: "sent" }),
+			record("n", 20, "ns", 10),
 			record("a", 10, "cfg", 10, { state: "held", dependsOn: F("n") }),
 		];
 		const out = selectMirrorFrames(records, OUTBOX_MIRROR_MAX_BYTES);

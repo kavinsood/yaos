@@ -94,11 +94,10 @@ export class EngineCtx {
 	repoOpenMs: number | null = null;
 	dailyLimitUntilMono = 0;
 	private readonly dailyLimitNotices = new DailyLimitNoticeGate();
+	/** Own frames receipted on `day` (daily soft budget, DESIGN §i.6). Starts from meta daily at boot. */
 	daily = { day: "", frames: 0 };
 	/** Monotonic time the head hint was first seen above V with an idle live queue. */
 	headAheadSince: number | null = null;
-	/** Lazy T_sent batch (diagnostics only). */
-	readonly sentPending = new Map<ClientFrameId, { attempts: number; atMs: number }>();
 	/** (deviceId, provisional cfid) -> own adoptable cfid, and the reverse; adopt timers. */
 	readonly adoptMap = new Map<string, ClientFrameId>();
 	readonly adoptRev = new Map<ClientFrameId, string>();
@@ -244,7 +243,6 @@ export class EngineCtx {
 			else if (r.stream === SNAP_STREAM) this.snap.noteCommitted(r);
 			this.outbox.delete(r.clientFrameId);
 			this.sender.remove(r.clientFrameId);
-			this.sentPending.delete(r.clientFrameId);
 			this.unregisterAdopt(r.clientFrameId);
 		}
 		// Re-sealed (e2ee-design §14.2 step 4): not committed, so no fold note and the doc is not drained.
@@ -252,7 +250,6 @@ export class EngineCtx {
 			if (next.clientFrameId !== old.clientFrameId) {
 				this.outbox.delete(old.clientFrameId);
 				this.sender.remove(old.clientFrameId);
-				this.sentPending.delete(old.clientFrameId);
 				this.unregisterAdopt(old.clientFrameId);
 				for (const [doc, p] of this.pendingCreates) if (p.cfid === old.clientFrameId) this.pendingCreates.set(doc, { ...p, cfid: next.clientFrameId });
 			}

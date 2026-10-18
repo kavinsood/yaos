@@ -664,13 +664,13 @@ cold ──load──▶ resident ──bind──▶ bound
 - **load** (lane of the requester), in one `Y.transact(doc, …, LOAD)`:
   1. apply the `snapshot`;
   2. apply every `tail` row of the stream in seq order, resolving `bodyUpdateRef` rows (§d.6);
-  3. apply the `content` of every own outbox record of the stream (held, pending, sent, adoptable) in `order`.
+  3. apply the `content` of every own outbox record of the stream (held, pending, adoptable) in `order`.
   - Poisoned records are skipped.
   - Cost is O(doc) and happens once per residency, never per edit.
 - **resident.** The replica is in memory, and the frame builder and merge jobs may use it.
   - Estimated heap: `3 × (snapshot bytes + tail bytes + applied update bytes)`.
 - **bound.** Resident, with one or more editor views attached as clients (§d.2). A bound doc is pinned and never evicted.
-- **evict.** LRU (`streams.lastAccessMs`) over **clean** handles only. A handle is clean when:
+- **evict.** LRU (the handle's in-memory `lastAccessMono`, `src/engine/body/handles.ts`) over **clean** handles only. A handle is clean when:
   - its frame builder is empty (flushed through `T_edit`);
   - no merge, projection, catch-up or compaction job holds it;
   - it is not bound.
@@ -905,8 +905,9 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   - Picks `pending` records by lane (§i.1), then by `order`. A live create's body frame waits for its create (above).
   - Respects all of: the token bucket (`APPEND_BYTES_PER_SEC`, burst ≤ `limits.burstBytes`), `maxInflightAppendBytes`
     of sent-unreceipted bytes, `session.bufferedBytes()`, and the ns/cfg send window (§c.3).
-  - Record state `sent` is persisted lazily and only for diagnostics. After any restart, `pending` and `sent` are both
-    "maybe sent" and are resent. Correctness relies only on idempotence (R4).
+  - What is in flight is the sender's memory only (`Sender.isInflight`); a record stays `pending` until its receipt.
+    After any restart every `pending` record is "maybe sent" and is resent. Correctness relies only on idempotence
+    (R4).
 
 ### d.5 Provisional vs committed
 
@@ -930,7 +931,7 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
 - **`resendUnreceipted`:**
   - The adapter has discarded un-noticed provisionals.
   - Adoptables keep their timers, because the author resends its own frames after the same STREAM_RESEND.
-  - Every own `pending` / `sent` record is resent in `order`, body frames immediately. For ns/cfg, the late-receipt
+  - Every own `pending` record is resent in `order`, body frames immediately. For ns/cfg, the late-receipt
     pass runs first (§d.7).
 - **Older-seq notices (R7).** A `committed` or receipt with `seq ≤ streams[stream].appliedSeq` is a **settle**: delete
   the matching outbox or adoptable record and put the tail row idempotently. Nothing advances.
@@ -1025,8 +1026,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - **Overflow** (> 4 MiB or > 1000 queued rows): drop payloads of rows for non-resident docs. Record those streams
      as stale with `remoteHeadSeq = max(…, seq)`. The seq counts as accounted, and the rows are read later.
 3. **Feed.** If V < H: run `feed(V)` pages. Each page runs `T_feed_page`:
-   - for each `{stream, lastSeq}`: set `remoteHeadSeq` to the max, `stale = appliedSeq < remoteHeadSeq`, and the
-     priority (§j.6);
+   - for each `{stream, lastSeq}`: set `remoteHeadSeq` to the max and `stale = appliedSeq < remoteHeadSeq`;
    - unknown stream classes are skipped;
    - set V to `throughSeq`.
    - V reaches H after about `streams / 1000` pages, with no row reads.
@@ -1035,7 +1035,8 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    (`src/engine/runtime/sessionLoop.ts:140-146`, e2ee-design §11.3). If the keyring allows reading only `k`, the
    phase becomes `key-missing` and catch-up stops there (`sessionLoop.ts:148-152`). Then ns, cfg, snap are read in
    that order (`sessionLoop.ts:153`).
-4. **Reads.** Catch-up jobs take stale streams by `byStalePriority`, up to `catchUpConcurrency` at once. Open notes
+4. **Reads.** Catch-up jobs take stale streams in priority order (§j.6; `staleOrder` over the in-memory stream cache,
+   `src/engine/sync/catchUp.ts`, nothing stored), up to `catchUpConcurrency` at once. Open notes
    run in lane 1 and ns/cfg/snap in lane 2, first (in that order).
    - Each job calls `read(stream, appliedSeq, preferCheckpoint = appliedSeq === 0)` and gates each page.
    - **`T_read_page`:** put tail rows. An own row (`deviceId` = self) whose `clientFrameId` is in the outbox is a
@@ -1077,7 +1078,7 @@ The planner does no destructive work until ns is caught up (§f.2).
   `tailRows > TAIL_HARD_ROWS` it runs in lane 1.
 - **Preconditions:**
   - the stream is not stale;
-  - no own outbox record of the stream is `pending`, `sent` or `held`. A late receipt could otherwise land at a seq ≤
+  - no own outbox record of the stream is `pending` or `held`. A late receipt could otherwise land at a seq ≤
     the new snapshot. It would still be loaded, since load applies all tail rows, but the snapshot would no longer be
     exact.
 - **Job:**
@@ -1177,7 +1178,7 @@ The planner does no destructive work until ns is caught up (§f.2).
       for a doc (2 for its first checkpoint). A put at `lastSeq` also drops the open segment at no extra row (H7).
     - A CAS conflict writes nothing, and the fallback refresh is a read.
   - A heavy desktop day:
-    - Frames: ≤ 20k (soft budget, limits.ts:261; frames are 4× slower beyond it, src/engine/runtime/context.ts:413-415) ×
+    - Frames: ≤ 20k (soft budget, limits.ts:261; frames are 4× slower beyond it, src/engine/runtime/context.ts:411-414) ×
       ≤ 2 rows = ≤ 40k.
     - Settle: 500 edit sessions × ≤ 4 = 2k. One put per session: a pause of 2 min or more ends one.
     - Hot: 20k / 256 × 4 ≈ 310.
@@ -1202,18 +1203,18 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 
 | Store | Key path | Indexes | Value | Bound |
 |---|---|---|---|---|
-| `meta` | `key` | — | `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty` | 5 records |
-| `streams` | `stream` | `byStalePriority [stale, priority]`, `byAccess lastAccessMs` | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap; deleted after `retired` |
+| `meta` | `key` | — | Singletons `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty`, `frameNoFloor`, `keyring`; one `blobPut:<address>` per blob address this device PUT (e2ee-design §10.4) | 7 singletons + `blobPut:*`, which is **unbounded** between prunes: each blob GC pass drops entries older than `blobGcGraceMs / 2` (`src/engine/runtime/blobGc.ts:95`) |
+| `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; never deleted (retired streams are a gap, `src/engine/sync/catchUp.ts:148`) |
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | Soft `OUTBOX_SOFT_BYTES` (16 MiB): builders stretch, notice. **Never dropped** |
 | `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes + hash: ≤ 256 KiB for a deterministic failure, whole for a reader-dependent one so it can be re-gated) | `QUARANTINE_MAX_RECORDS` / `_BYTES`; oldest evicted (the doc stays frozen) |
-| `synced` | `docId` | `byPathKey pathKey` (non-unique: transient during rebind) | `SyncedRecord` | 1 per synced doc |
+| `synced` | `docId` | — | `SyncedRecord` | 1 per synced doc |
 | `baseText` | `docId` | — | `BaseTextRecord` (deflated, ≤ `MAX_BASE_TEXT_CHARS`) | markdown/canvas synced docs |
 | `localTree` | `pathKey` | — | `LocalTreeRecord` | 1 per vault file |
 | `intents` | `id` | — | `IntentRecord` | In-flight multi-step disk ops (< 1000); deleted on completion |
 | `cfgBase` | `file` | — | `CfgBaseRecord` | Allowlisted config files |
-| `blobQueue` | `hash` | `byActiveDue [active, nextAttemptAtMs]` | `BlobQueueRecord` | 1 per failed transfer backing off; a running transfer has none, success deletes it (`src/engine/blobs/blobQueue.ts:285-297`) |
+| `blobQueue` | `hash` | — | `BlobQueueRecord` | 1 per failed transfer backing off; a running transfer has none, success deletes it (`src/engine/blobs/blobQueue.ts:285-297`) |
 
 - **`dependsOn` rule.** A `held` record waits for one of two things:
   - the doc's ns create, during onboarding (released when it folds, §d.4);
@@ -1223,7 +1224,12 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
   create is in the outbox, the frame goes only once the create is inflight on the same session. It is deleted when
   the create folds `merged`. When the create's record is replaced under a new `clientFrameId` (own stale-epoch copy,
   repo.ts `rename`), the frame is re-pointed like a held one.
-- **IDB booleans.** `stale`, `frozen` and `active` are `0 | 1` because IDB cannot index booleans.
+- **IDB booleans.** `stale` and `frozen` are stored as `0 | 1` (IDB cannot index booleans); no index uses them.
+- **Schema version.** `DB_SCHEMA_VERSION` (`src/engine/store/schema.ts`) changes with any store, index or record
+  shape. A DB whose `identity.schemaVersion` differs fails the identity check and is rebuilt (§i.5). Version 2 dropped
+  the unused indexes `streams.byStalePriority` / `byAccess`, `synced.byPathKey` and `blobQueue.byActiveDue`, the
+  fields only they read (`priority`, `lastAccessMs`, `active`), and the outbox `sent` state with `attempts` /
+  `lastSentAtMs`.
 
 ### e.2 Transactions
 
@@ -1236,18 +1242,17 @@ Rules:
 
 | Tx | Stores | Writes | Crash reasoning |
 |---|---|---|---|
-| `T_edit` (frame close) | outbox, meta, streams | Outbox record (`pending` / `held`); `outboxOrder.next++`; `bodyVersion.localOrder`, `lastAccessMs` | **Commits before `append`.** Before commit: the edit is on disk via the editor save (§d.4). After commit: resent at startup. |
-| `T_sent` (lazy, coalesced) | outbox | `state: sent`, `attempts`, `lastSentAtMs` | Diagnostics only: `pending` / `sent` are both "maybe sent". |
-| `T_receipt` (one per `STREAM_RECEIPTS` batch) | outbox, tail, streams, meta | Per receipt: tail put `(stream, seq)` with outbox content; outbox delete; release dependents; `lastOwnSeq`, `remoteHeadSeq`, `appliedSeq` (if not stale), checkpoint counters, `ckptDuty`; cursor | A missing outbox record is a no-op (idempotent). Before commit: re-delivered as a late receipt via read, or resent and then deduped (relay window, fold ring, or CRDT). |
+| `T_edit` (frame close) | outbox, meta, streams | Outbox record (`pending` / `held`); `outboxOrder.next++`; `bodyVersion.localOrder` | **Commits before `append`.** Before commit: the edit is on disk via the editor save (§d.4). After commit: resent at startup. |
+| `T_receipt` (one per `STREAM_RECEIPTS` batch) | outbox, tail, streams, meta | Per receipt: tail put `(stream, seq)` with outbox content; outbox delete; release dependents; `lastOwnSeq`, `remoteHeadSeq`, `appliedSeq` (if not stale), checkpoint counters, `ckptDuty`; `daily.framesSent`; cursor | A missing outbox record is a no-op (idempotent). Before commit: re-delivered as a late receipt via read, or resent and then deduped (relay window, fold ring, or CRDT). |
 | `T_ingest` (batch ≤ 64 rows / 1 MiB per slice) | tail, quarantine, streams, outbox, meta | Tail or quarantine puts; adoptable deletes and releases; `remoteHeadSeq`, `appliedSeq`, `bodyVersion.remoteSeq`, counters; cursor | Before commit: the rows are unaccounted and re-fetched. Replica already applied: idempotent. |
 | `T_stale` | streams, meta | `remoteHeadSeq`, `stale = 1`; cursor | Overflow or null payload: the row is read later. |
-| `T_feed_page` | streams, meta | Stream heads, stale, priority; cursor = `throughSeq` | Before commit: the page is re-fetched. |
+| `T_feed_page` | streams, meta | Stream heads, stale; cursor = `throughSeq` | Before commit: the page is re-fetched. |
 | `T_read_page` | tail, quarantine, outbox, streams, snapshots | Rows; late receipts; fresh-stream checkpoint snapshot + exact-key deletes of tail ≤ coversSeq; `appliedSeq` / `stale` when complete | Idempotent puts. The page is re-read from `appliedSeq`. |
 | `T_snapshot` (checkpoint union) / `T_compact` | snapshots, tail, streams | CAS on `snapshotCoversSeq`; snapshot put; exact-key tail deletes | Old snapshot + tail and new snapshot + less tail reconstruct the same state. |
 | `T_adopt` | outbox, meta | Adoptable record | Before commit: the provisional was applied to the bound replica only. The edit reaches disk through the editor and is re-merged. The commit or the author's resend brings it anyway. |
 | `T_intent_begin` / `T_intent_end` | intents | Put / delete the intent | §f.7: startup completes or rolls back each intent from disk state. |
 | `T_synced` (after a disk-op batch) | synced, baseText, localTree, intents | Synced put/drop, base put, stat cache, intent end | Before commit: the next reconcile sees L = R ≠ S, which is the "identical" path. Only S advances. |
-| `T_cfg` | cfgBase, streams, meta | Settings sync base after projection | As `T_synced`. |
+| `T_cfg` | cfgBase | Settings sync base after projection (`src/engine/settings/cfgSync.ts:229`) | As `T_synced`. |
 
 - **Compaction and remote checkpoint gate.** They require "no own unreceipted frames of the stream". This is the only
   coupling between outbox and snapshots.
@@ -1261,8 +1266,8 @@ Rules:
 - Quarantine is bounded with oldest-first eviction.
 - The outbox is never evicted; it is bounded only by user activity while offline, and the soft limit triggers a notice
   plus frame stretching.
-- `streams` / `snapshots` / `tail` of pruned docs are deleted after their `retired` checkpoint, or locally after the
-  prune if this device has no duty.
+- `streams` / `snapshots` / `tail` of pruned docs are **not** deleted yet: a `retired` checkpoint is skipped
+  (`src/engine/sync/catchUp.ts:148`, gap) and no transaction drops a stream.
 - **Quota error:**
   1. evict `quarantine` bytes;
   2. compact everything eligible;
@@ -1285,7 +1290,7 @@ varuint generation, varuint writtenAtMs
 varuint frameCount
 frameCount × {
   varstring clientFrameId, varstring stream, varuint order,
-  u8 state (1 held, 2 pending, 3 sent, 4 poisoned, 5 adoptable),
+  u8 state (1 held, 2 pending, 3 sent (written before DB schema 2; read as pending), 4 poisoned, 5 adoptable),
   varuint authorNsSeq,
   u8 hasDep [varstring dependsOn],
   u8 hasAdopt [varstring deviceId, varstring clientFrameId],
@@ -1338,7 +1343,7 @@ All are in `src/core/types.ts`.
 
 - **`RemoteEntry`** = **OptimisticRemote**(committed `NsFoldState` + own pending ns frames) joined with
   `RemoteBodyInfo`.
-  - The overlay re-folds own `pending` / `sent` / `held` ns frames, in outbox order, on a copy-on-write view of the
+  - The overlay re-folds own `pending` / `held` ns frames, in outbox order, on a copy-on-write view of the
     committed state, with pseudo-seqs above `coversSeq`.
   - Entries touched by the overlay have `pendingLocal = true`. The planner never moves, deletes or replaces local
     files for them, so local state stays pinned until the fold confirms or rejects.
@@ -1960,7 +1965,7 @@ Further caps:
 
 **Procedure** (phase `recovering`):
 1. Open a fresh DB under the same name. On a WebKit connection loss, try reopening first.
-2. Import the outbox mirror: same `clientFrameId`s, `order`s and states (sent → pending), and `outboxOrder.next =
+2. Import the outbox mirror: same `clientFrameId`s, `order`s and states (a legacy `sent` → pending), and `outboxOrder.next =
    max + 1`.
 3. Import the synced mirror as `SyncedEntry` with `hasBase = false` and `bodyVersion = null`. With `bodyVersion =
    null` the planner compares content instead: `Rc := streams.textHash ≠ S.contentHash`.

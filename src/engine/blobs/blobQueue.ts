@@ -205,12 +205,11 @@ export class BlobQueue implements BlobTransfer {
 	static async open(deps: BlobQueueDeps): Promise<BlobQueue> {
 		const q = new BlobQueue(deps);
 		const rows = await deps.db.tx([STORE.blobQueue], "readonly", (tx) => tx.getAll(STORE.blobQueue));
-		// A record left "in flight" by a crash is simply queued again.
 		const now = deps.clock.now();
 		const mono = deps.clock.monotonic();
 		for (const r of rows) {
 			const key = `${r.direction}:${r.hash}`;
-			q.records.set(key, { ...r, active: 0 });
+			q.records.set(key, r);
 			q.due.set(key, mono + Math.min(Math.max(0, r.nextAttemptAtMs - now), backoffMs(r.attempts)));
 		}
 		return q;
@@ -287,7 +286,7 @@ export class BlobQueue implements BlobTransfer {
 		const attempts = (this.records.get(key)?.attempts ?? 0) + 1;
 		const rec: BlobQueueRecord = {
 			hash: req.hash as ContentHash, direction, docId: req.docId, path: req.path, size, attempts,
-			nextAttemptAtMs: this.deps.clock.now() + backoffMs(attempts), active: 0,
+			nextAttemptAtMs: this.deps.clock.now() + backoffMs(attempts),
 		};
 		// In memory first: a failing database must not turn the backoff into a hot retry.
 		this.records.set(key, rec);

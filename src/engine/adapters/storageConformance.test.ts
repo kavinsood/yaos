@@ -14,7 +14,7 @@ import { isStorageError } from "../../ports/storage";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, tailRange,
-	type MetaRecord, type OutboxRecord, type OutboxState, type SnapshotRecord, type StreamRecord, type TailRecord,
+	type MetaRecord, type OutboxRecord, type OutboxState, type SnapshotRecord, type TailRecord,
 	type YaosSchema as YaosSchemaInterface,
 } from "../store/schema";
 import { createIdbStoragePort } from "./idbStorage";
@@ -39,7 +39,7 @@ function outbox(id: string, order: number, state: OutboxState = "pending", strea
 	return {
 		clientFrameId: F(id), order, stream: S(stream), kind: "bodyUpdate", state,
 		sealed: new Uint8Array([order & 255, 1, 2, 3]), content: new Uint8Array([order & 255]),
-		authorNsSeq: 0, flags: 0, frameNo: null, keyEpoch: 0, dependsOn: null, adoptOf: null, attempts: 0, createdAtMs: 1000 + order, lastSentAtMs: 0,
+		authorNsSeq: 0, flags: 0, frameNo: null, keyEpoch: 0, dependsOn: null, adoptOf: null, createdAtMs: 1000 + order,
 	};
 }
 
@@ -50,20 +50,15 @@ function tail(stream: string, seq: number): TailRecord {
 	};
 }
 
-function streamRec(stream: string, stale: 0 | 1, priority: number, lastAccessMs = 0): StreamRecord {
-	return {
-		stream: S(stream), cls: "body", docId: null, appliedSeq: 0, remoteHeadSeq: stale, stale, priority, snapshotCoversSeq: 0,
-		tailRows: 0, tailBytes: 0, remoteCheckpointCoversSeq: 0, rowsSinceRemoteCheckpoint: 0, bytesSinceRemoteCheckpoint: 0,
-		lastOwnSeq: 0, bodyVersion: { remoteSeq: 0, localOrder: 0 }, quarantinedRows: 0, frozen: 0, frozenReason: null,
-		disputedCheckpointCoversSeq: 0, lastAccessMs, textHash: null,
-	};
-}
-
 /** Small custom schema for key-ordering / index-validity cases. */
 type KvRecord = { readonly k: StorageKey; readonly v?: unknown; readonly u?: unknown };
 type KvSchema = { readonly kv: { readonly record: KvRecord; readonly key: StorageKey; readonly indexes: "byV" | "byU" } };
 const KV_SPECS = { kv: { keyPath: "k", indexes: { byV: { keyPath: "v", unique: false }, byU: { keyPath: "u", unique: true } } } } as const;
 const KV_SPECS_NO_INDEX = { kv: { keyPath: "k", indexes: {} } } as const;
+/** Non-unique compound and scalar indexes (the YAOS schema's only non-unique one, quarantine byAt, is scalar). */
+type RankRecord = { readonly id: string; readonly a: number; readonly b: number; readonly c: number };
+type RankSchema = { readonly ranks: { readonly record: RankRecord; readonly key: string; readonly indexes: "byAB" | "byC" } };
+const RANK_SPECS = { ranks: { keyPath: "id", indexes: { byAB: { keyPath: ["a", "b"], unique: false }, byC: { keyPath: "c", unique: false } } } } as const;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -159,9 +154,9 @@ for (const impl of IMPLS) {
 
 			// put replaces by key
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
-				tx.put(STORE.outbox, { ...o, state: "sent", attempts: 1 });
+				tx.put(STORE.outbox, { ...o, state: "poisoned" });
 			});
-			assert.equal((await db.tx([STORE.outbox], "readonly", (tx) => tx.get(STORE.outbox, F("f1"))))?.state, "sent");
+			assert.equal((await db.tx([STORE.outbox], "readonly", (tx) => tx.get(STORE.outbox, F("f1"))))?.state, "poisoned");
 			assert.equal(await db.tx([STORE.outbox], "readonly", (tx) => tx.count(STORE.outbox)), 1);
 
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
@@ -224,11 +219,11 @@ for (const impl of IMPLS) {
 			const db = await openYaos(impl.make());
 			const recs = [
 				outbox("a", 1, "pending", "b:x"),
-				outbox("b", 2, "sent", "b:y"),
+				outbox("b", 2, "poisoned", "b:y"),
 				outbox("c", 3, "pending", "b:y"),
 				outbox("d", 4, "held", "b:x"),
 				outbox("e", 5, "pending", "b:x"),
-				outbox("f", 6, "sent", "b:x"),
+				outbox("f", 6, "poisoned", "b:x"),
 			];
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
 				for (const r of [...recs].reverse()) tx.put(STORE.outbox, r);
@@ -239,9 +234,9 @@ for (const impl of IMPLS) {
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("pending"))), ["a", "c", "e"]);
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("pending", 1, true))), ["c", "e"]);
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("pending"), 2)), ["a", "c"]);
-				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("sent"))), ["b", "f"]);
-				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("poisoned"))), []);
-				// whole index: "held" < "pending" < "sent"
+				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("poisoned"))), ["b", "f"]);
+				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("adoptable"))), []);
+				// whole index: "held" < "pending" < "poisoned"
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState)), ["d", "a", "c", "e", "b", "f"]);
 				assert.equal(await tx.countByIndex(STORE.outbox, INDEX.outboxByState, state("pending")), 3);
 				assert.equal(await tx.countByIndex(STORE.outbox, INDEX.outboxByState), 6);
@@ -261,12 +256,12 @@ for (const impl of IMPLS) {
 
 			// index entries follow updates and deletes
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
-				tx.put(STORE.outbox, { ...recs[0]!, state: "sent" });
+				tx.put(STORE.outbox, { ...recs[0]!, state: "poisoned" });
 				tx.delete(STORE.outbox, F("c"));
 			});
 			await db.tx([STORE.outbox], "readonly", async (tx) => {
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("pending"))), ["e"]);
-				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("sent"))), ["a", "b", "f"]);
+				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("poisoned"))), ["a", "b", "f"]);
 				assert.equal(await tx.countByIndex(STORE.outbox, INDEX.outboxByStream, stream2("b:y")), 1);
 			});
 			function stream2(s: string): KeyRange {
@@ -274,24 +269,25 @@ for (const impl of IMPLS) {
 			}
 		});
 
-		it("non-unique index: streams byStalePriority orders by (index key, primary key)", async () => {
-			const db = await openYaos(impl.make());
-			await db.tx([STORE.streams], "readwrite", async (tx) => {
-				tx.put(STORE.streams, streamRec("b:z", 1, 5, 30));
-				tx.put(STORE.streams, streamRec("b:m", 1, 5, 10));
-				tx.put(STORE.streams, streamRec("ns", 1, 0, 20));
-				tx.put(STORE.streams, streamRec("b:a", 0, 0, 40));
-				tx.put(STORE.streams, streamRec("b:q", 1, 9, 10));
+		it("non-unique index: compound and scalar keys order by (index key, primary key)", async () => {
+			const db = await impl.make().open<RankSchema>("ranks", 1, RANK_SPECS);
+			const r = (id: string, a: number, b: number, c: number): RankRecord => ({ id, a, b, c });
+			await db.tx(["ranks"], "readwrite", async (tx) => {
+				tx.put("ranks", r("b:z", 1, 5, 30));
+				tx.put("ranks", r("b:m", 1, 5, 10));
+				tx.put("ranks", r("ns", 1, 0, 20));
+				tx.put("ranks", r("b:a", 0, 0, 40));
+				tx.put("ranks", r("b:q", 1, 9, 10));
 			});
-			await db.tx([STORE.streams], "readonly", async (tx) => {
-				// [1] < [1, x] < [2]: all stale streams by priority, ties by stream name
-				const stale = await tx.getAllByIndex(STORE.streams, INDEX.streamsByStale, { lower: [1], upper: [2], upperOpen: true });
-				assert.deepEqual(stale.map((r) => r.stream), ["ns", "b:m", "b:z", "b:q"]);
-				assert.equal(await tx.countByIndex(STORE.streams, INDEX.streamsByStale, { lower: [1], upper: [2], upperOpen: true }), 4);
-				const first = await tx.getAllByIndex(STORE.streams, INDEX.streamsByStale, { lower: [1], upper: [2], upperOpen: true }, 1);
-				assert.deepEqual(first.map((r) => r.stream), ["ns"]);
-				const byAccess = await tx.getAllByIndex(STORE.streams, INDEX.streamsByAccess, { upper: 20 });
-				assert.deepEqual(byAccess.map((r) => r.stream), ["b:m", "b:q", "ns"]);
+			await db.tx(["ranks"], "readonly", async (tx) => {
+				// [1] < [1, x] < [2]: every a = 1 record by b, ties by primary key
+				const ones = await tx.getAllByIndex("ranks", "byAB", { lower: [1], upper: [2], upperOpen: true });
+				assert.deepEqual(ones.map((x) => x.id), ["ns", "b:m", "b:z", "b:q"]);
+				assert.equal(await tx.countByIndex("ranks", "byAB", { lower: [1], upper: [2], upperOpen: true }), 4);
+				const first = await tx.getAllByIndex("ranks", "byAB", { lower: [1], upper: [2], upperOpen: true }, 1);
+				assert.deepEqual(first.map((x) => x.id), ["ns"]);
+				const byC = await tx.getAllByIndex("ranks", "byC", { upper: 20 });
+				assert.deepEqual(byC.map((x) => x.id), ["b:m", "b:q", "ns"]);
 			});
 		});
 
@@ -333,7 +329,7 @@ for (const impl of IMPLS) {
 			await rejectsWith(
 				db.tx([STORE.outbox], "readwrite", async (tx) => {
 					tx.put(STORE.outbox, outbox("three", 3));
-					tx.put(STORE.outbox, outbox("dup2", 1, "sent", "b:other"));
+					tx.put(STORE.outbox, outbox("dup2", 1, "poisoned", "b:other"));
 					await tx.get(STORE.outbox, F("one"));
 					return "unreachable?";
 				}),
@@ -346,7 +342,7 @@ for (const impl of IMPLS) {
 			assert.equal(meta, undefined);
 			// re-putting the same record under its own key is not a violation
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
-				tx.put(STORE.outbox, { ...outbox("one", 1), attempts: 2 });
+				tx.put(STORE.outbox, { ...outbox("one", 1), createdAtMs: 2 });
 			});
 		});
 

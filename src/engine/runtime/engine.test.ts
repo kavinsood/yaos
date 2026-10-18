@@ -60,3 +60,23 @@ test("engine: a no-op editor change (retain only) produces no frame and keeps th
 		await a.stop();
 	}
 });
+
+test("engine: the daily soft budget count (meta daily, DESIGN §i.6) survives a restart", async () => {
+	const relay = new SimRelay();
+	const { engine: a, storage } = await startTestEngine({ relay, deviceId: "dev-a" });
+	let a2: Awaited<ReturnType<typeof startTestEngine>>["engine"] | null = null;
+	try {
+		await until(() => a.status().phase === "live", 3_000, "live");
+		const id = await a.createDoc("d.md", "one;");
+		await a.editDoc(id, (t) => t.insert(t.length, "two;"));
+		await until(() => a.isIdle(), 3_000, "idle");
+		const used = a.status().dailyFramesUsed;
+		assert.ok(used >= 2, `frames counted (${used})`);
+		await a.stop();
+		a2 = (await startTestEngine({ relay, deviceId: "dev-a", storage, extra: { vaultEpoch: relay.vaultEpoch() } })).engine;
+		assert.equal(a2.status().dailyFramesUsed, used, "loaded at open, not reset to 0");
+	} finally {
+		await a.stop();
+		await a2?.stop();
+	}
+});

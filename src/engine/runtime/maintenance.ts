@@ -1,6 +1,6 @@
 /**
  * Periodic engine work (one tick every maintenanceMs, never overlapping):
- * gap feed (DESIGN §d.7), lazy T_sent, local compaction (§d.8), remote
+ * gap feed (DESIGN §d.7), local compaction (§d.8), remote
  * checkpoint duty (§d.9), daily-limit release, residency budget, catch-up
  * scheduling.
  */
@@ -57,7 +57,6 @@ export class Maintenance {
 		this.stats.ticks++;
 		const steps: [string, () => Promise<void> | void][] = [
 			["gap", () => this.gap()],
-			["sent", () => this.flushSent()],
 			["compact", () => this.compact()],
 			["checkpoint", () => this.checkpoints()],
 			["daily", () => this.daily()],
@@ -94,14 +93,6 @@ export class Maintenance {
 		c.diag("gap-feed", { v: cur.vaultSeq, head: cur.headSeqSeen, above: cur.pendingAbove() });
 		await c.sess.feedTo(c.gen, cur.headSeqSeen);
 		c.sess.scheduleCatchUp();
-	}
-
-	async flushSent(): Promise<void> {
-		const c = this.c;
-		if (c.sentPending.size === 0) return;
-		const ups = [...c.sentPending].map(([clientFrameId, v]) => ({ clientFrameId, attempts: v.attempts, lastSentAtMs: v.atMs }));
-		c.sentPending.clear();
-		await c.repo.tSent(ups);
 	}
 
 	private async compact(): Promise<void> {

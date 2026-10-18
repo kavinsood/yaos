@@ -78,18 +78,18 @@ export class OutboxCache {
 		return best ? best.dependsOn : null;
 	}
 
-	/** Compaction precondition (DESIGN §d.8): no own pending / sent / held record of the stream. */
+	/** Compaction precondition (DESIGN §d.8): no own pending / held record of the stream. */
 	blocksCompaction(stream: StreamName): boolean {
 		const m = this.byStream.get(stream);
 		if (!m) return false;
-		for (const r of m.values()) if (r.state === "pending" || r.state === "sent" || r.state === "held") return true;
+		for (const r of m.values()) if (r.state === "pending" || r.state === "held") return true;
 		return false;
 	}
 
-	/** Unreceipted (pending / sent) count. */
+	/** Unreceipted (pending) count. */
 	unreceipted(): number {
 		let n = 0;
-		for (const r of this.byId.values()) if (r.state === "pending" || r.state === "sent") n++;
+		for (const r of this.byId.values()) if (r.state === "pending") n++;
 		return n;
 	}
 }

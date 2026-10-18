@@ -102,7 +102,7 @@ void test("live create merged away (§c.5 identical duplicate) with frames sent:
 		relay.pauseCommits();
 		const l2 = create(a, "same.md", hash);
 		const [c2] = await a.submitNs([l2], { liveCreates: true });
-		await until(() => a.c.outbox.get(c2!)?.state === "sent", 3_000, "create sent");
+		await until(() => a.c.sender.isInflight(c2!), 3_000, "create sent");
 		relay.setConnectFailure("unavailable");
 		relay.dropSession("dev-a" as DeviceId);
 		await write(a, l2.docId, "LOSER2");
@@ -117,12 +117,12 @@ void test("live create merged away (§c.5 identical duplicate) with frames sent:
 		relay.pauseCommits();
 		const l3 = create(a, "same.md", hash);
 		const [c3] = await a.submitNs([l3], { liveCreates: true });
-		await until(() => a.c.outbox.get(c3!)?.state === "sent", 3_000, "create sent");
+		await until(() => a.c.sender.isInflight(c3!), 3_000, "create sent");
 		relay.commitNow();
 		await write(a, l3.docId, "LOSER3");
 		const b3 = a.c.outbox.ofStream(docStream("markdown", l3.docId)!)[0]!;
 		assert.equal(b3.dependsOn, c3);
-		await until(() => a.c.outbox.get(b3.clientFrameId)?.state === "sent", 3_000, "body sent before the receipt");
+		await until(() => a.c.sender.isInflight(b3.clientFrameId), 3_000, "body sent before the receipt");
 		await until(() => a.c.ns.state.entries.get(l3.docId)?.state === "merged" && a.c.outbox.size === 0, 8_000, "sent body dropped at the merge");
 		relay.resumeCommits();
 		await relay.flush();
