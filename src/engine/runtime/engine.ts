@@ -205,9 +205,7 @@ export class LogEngine {
 			}
 		}
 		c.mirror.scheduleIfBehind(c.outbox.all());
-		await c.afterNsChange(true);
-		await c.afterCfgChange(true);
-		await c.afterSnapChange(true);
+		await c.refold(true);
 		eng.maint.start();
 		if (first) void c.sess.onSession(first);
 		else c.sess.startLoop();

@@ -6,7 +6,7 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
+import { streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
@@ -24,6 +24,7 @@ import type { Mut, OutboxRename, Repo } from "../store/repo";
 import type { OutboxRecord } from "../store/schema";
 import type { CatchUpDeps } from "../sync/catchUp";
 import type { CfgRuntime } from "../sync/cfgRuntime";
+import type { FoldRuntime } from "../sync/foldRuntime";
 import type { SnapRuntime } from "../sync/snapRuntime";
 import type { KeyringRuntime } from "../keyring/keyringRuntime";
 import { assertWritable, gatedBlob, gatedCrypto } from "../keyring/writeGate";
@@ -48,6 +49,13 @@ export interface PendingCreate {
 const DIAG_RING = 2_000;
 const ERROR_NOTICES = new Set(["device-revoked", "upgrade-required", "epoch-changed", "vault-unclaimed", "vault-not-found"]);
 const INFO_NOTICES = new Set(["recovered-from-mirror"]);
+
+/** A fold runtime and its after-change hook (EngineCtx.folds). */
+export interface Fold {
+	readonly rt: FoldRuntime<unknown, unknown>;
+	/** Fold the newly available rows (reload: the snapshot was replaced, refold from it) and report them. */
+	after(reload: boolean): Promise<void>;
+}
 
 export function adoptKey(deviceId: DeviceId, cfid: ClientFrameId): string {
 	return `${deviceId}\u0000${cfid}`;
@@ -239,9 +247,7 @@ export class EngineCtx {
 			const cls = streamClass(r.stream);
 			if (cls === "body" || cls === "canvas") drained.add(r.stream);
 			// ns/cfg/snap records leave the outbox only on (late) receipt: keep them in the overlay until folded.
-			if (r.stream === NS_STREAM) this.ns.noteCommitted(r);
-			else if (r.stream === CFG_STREAM) this.cfg.noteCommitted(r);
-			else if (r.stream === SNAP_STREAM) this.snap.noteCommitted(r);
+			this.foldOf(r.stream)?.rt.noteCommitted(r);
 			this.outbox.delete(r.clientFrameId);
 			this.sender.remove(r.clientFrameId);
 			this.sentPending.delete(r.clientFrameId);
@@ -321,6 +327,26 @@ export class EngineCtx {
 	}
 
 	/**
+	 * Every fold runtime with its after-change hook, in fold order (ns first: the cfg / snap reports come after the
+	 * held releases its fold allows). The one list whatever folds walks: the unopened-row re-gate
+	 * (quarantineRelease.ts), a refold of all and the outbox mirror; a new fold is added here.
+	 */
+	folds(): readonly Fold[] {
+		return [
+			{ rt: this.ns, after: (reload) => this.afterNsChange(reload) },
+			{ rt: this.cfg, after: (reload) => this.afterCfgChange(reload) },
+			{ rt: this.snap, after: (reload) => this.afterSnapChange(reload) },
+		];
+	}
+	foldOf(stream: StreamName): Fold | undefined {
+		return this.folds().find((f) => f.rt.stream === stream);
+	}
+	/** Every fold folds what is available (engine start: reload from the snapshots; session start: rows read). */
+	async refold(reload: boolean): Promise<void> {
+		for (const f of this.folds()) await f.after(reload);
+	}
+
+	/**
 	 * Fold newly available ns rows (reload: snapshot replaced, refold from it), then release / delete held
 	 * records whose create folded (DESIGN §e.1), then report the folded frames.
 	 */
@@ -373,7 +399,7 @@ export class EngineCtx {
 	 */
 	committedBlobs(): ReadonlySet<ContentHash> | null {
 		if (!this.session || !this.live?.enabled) return null;
-		for (const rt of [this.ns, this.cfg, this.snap]) {
+		for (const { rt } of this.folds()) {
 			if (rt.halted || this.repo.stream(rt.stream)?.stale === 1) return null;
 		}
 		const key = [this.ns.state, this.ns.coversSeq, this.cfg.state, this.cfg.coversSeq, this.snap.state, this.snap.coversSeq];

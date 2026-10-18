@@ -9,14 +9,14 @@
  * opens). It only releases a stream when every live quarantined row is
  * reader-dependent and now passes; otherwise nothing changes (no dismissals).
  * A row a re-gate finds stale (e2ee-design §14.3) is settled: dismissed, never
- * applied. `regateUnopened` is the ns / cfg counterpart (§9.3: reader-dependent
- * rows wait in tail and halt the fold): run after every keyring change.
+ * applied. `regateUnopened` is the fold-stream counterpart (ns, cfg, snap; §9.3:
+ * reader-dependent rows wait in tail and halt the fold): run after every keyring change.
  * Both run one at a time per engine; a request while one runs runs it again after
  * (its snapshot may predate the change). `recheckStored` covers a row gated before
  * a change and stored after the re-gate the change ran.
  */
 
-import { CFG_STREAM, NS_STREAM, type StreamName } from "../../core/types";
+import type { StreamName } from "../../core/types";
 import type { QuarantineRecord, TailRecord } from "../store/schema";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import { gateRow } from "../sync/ingestRow";
@@ -127,9 +127,10 @@ async function retryOnce(c: EngineCtx): Promise<number> {
 }
 
 /**
- * Re-gate the unfolded ns / cfg rows a reader-dependent failure left unopened (raw payload, LOCAL_FLAG_UNOPENED):
- * new keys, a settled revoke or `k` judged further can open them, or find them stale (§14.3). Re-gated rows
- * replace the unopened ones, the halt lifts and the fold advances. Rows still unopened keep waiting.
+ * Re-gate the unfolded rows of every fold (EngineCtx.folds) a reader-dependent failure left unopened (raw payload,
+ * LOCAL_FLAG_UNOPENED): new keys, a settled revoke or `k` judged further can open them, or find them stale (§14.3).
+ * Re-gated rows replace the unopened ones, the halt lifts and the fold advances through its after-change hook.
+ * Rows still unopened keep waiting.
  */
 export function regateUnopened(c: EngineCtx): Promise<number> {
 	return oneAtATime(c, "unopened", () => regateUnopenedOnce(c));
@@ -137,19 +138,18 @@ export function regateUnopened(c: EngineCtx): Promise<number> {
 
 async function regateUnopenedOnce(c: EngineCtx): Promise<number> {
 	let n = 0;
-	for (const fold of [c.ns, c.cfg]) {
-		const rows = (await c.repo.getTail(fold.stream, fold.coversSeq)).filter((r) => r.flags & LOCAL_FLAG_UNOPENED);
+	for (const { rt, after } of c.folds()) {
+		const rows = (await c.repo.getTail(rt.stream, rt.coversSeq)).filter((r) => r.flags & LOCAL_FLAG_UNOPENED);
 		const out: TailRecord[] = [];
 		for (const r of rows) {
 			const g = await gateRow(c.gateCtx, c.ports.hash, { stream: r.stream, seq: r.seq, deviceId: r.deviceId, clientFrameId: r.clientFrameId, payload: r.content }, c.now());
 			if (g.t === "row" && !(g.row.flags & LOCAL_FLAG_UNOPENED)) out.push(g.row);
 		}
 		if (out.length === 0) continue;
-		const replaced = await c.repo.tReplaceTail(fold.stream, out, c.now());
-		c.diag("unopened-regated", { stream: fold.stream, rows: replaced });
-		await fold.resume();
-		if (fold.stream === NS_STREAM) await c.afterNsChange();
-		else if (fold.stream === CFG_STREAM) await c.afterCfgChange();
+		const replaced = await c.repo.tReplaceTail(rt.stream, out, c.now());
+		c.diag("unopened-regated", { stream: rt.stream, rows: replaced });
+		await rt.resume();
+		await after(false);
 		n += replaced;
 	}
 	return n;

@@ -153,9 +153,7 @@ export class SessionLoop {
 			await this.readInOrder([NS_STREAM, CFG_STREAM, SNAP_STREAM].filter((s) => c.repo.stream(s)?.stale));
 			if (gen !== c.gen) return;
 			c.sender.openNs();
-			await c.afterNsChange();
-			await c.afterCfgChange();
-			await c.afterSnapChange();
+			await c.refold(false);
 			if (gen !== c.gen) return;
 			c.setPhase(c.livePhase());
 			this.st = newReconnectState();

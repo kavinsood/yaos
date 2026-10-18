@@ -779,7 +779,7 @@ export class Repo {
 	}
 
 	/**
-	 * Re-gated ns / cfg rows replace the unopened rows they stand for (quarantineRelease.regateUnopened). A row
+	 * Re-gated fold rows (ns, cfg, snap) replace the unopened rows they stand for (quarantineRelease.regateUnopened). A row
 	 * gone meanwhile (snapshot compaction) is skipped; byte accounting follows the new content.
 	 */
 	tReplaceTail(stream: StreamName, rows: readonly TailRecord[], nowMs: number): Promise<number> {
