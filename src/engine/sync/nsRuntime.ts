@@ -127,7 +127,11 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	reconcileHeld(outbox: OutboxCache): OutboxChange[] {
 		const changes: OutboxChange[] = [];
 		for (const r of outbox.values()) {
-			if (!r.dependsOn || outbox.has(r.dependsOn)) continue;
+			if (!r.dependsOn) continue;
+			// Only an ns create holds a frame. A store from before adoptables stopped holding (DESIGN §d.5) can still
+			// have frames held behind an adopted record: they count as dependency-gone.
+			const dep = outbox.get(r.dependsOn);
+			if (dep && dep.adoptOf === null) continue;
 			const held = r.state === "held";
 			if (!held && r.state !== "pending" && r.state !== "sent") continue;
 			const cls = streamClass(r.stream);

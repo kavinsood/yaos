@@ -207,9 +207,9 @@ function isNsOrCfg(stream: StreamName): boolean {
  * (even if they alone exceed the limit: their identity is what the mirror
  * exists for), then the other frames in `order` while they fit, stopping at
  * the first that does not. Keeping an order prefix means a kept frame's
- * dependency (lower order: an earlier body update, the adoptable it waits
- * for) is kept too. Dropped body edits are
- * still on disk and are re-derived by reconcile.
+ * dependency (lower order: an earlier body update of its doc; its ns create
+ * is kept anyway) is kept too. Dropped body edits are still on disk and are
+ * re-derived by reconcile.
  *
  * Input order is arbitrary; output is sorted by order. Poisoned records are
  * included (state code 4). A record not sealed yet (the copy of an own stale
