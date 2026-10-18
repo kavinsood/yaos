@@ -526,7 +526,7 @@ export class LogEngine {
 		return this.c.sess.reconnect();
 	}
 
-	/** DESIGN §i.4: lanes 3–4 (stale reads, compaction, checkpoints) wait while backgrounded. */
+	/** DESIGN §i.4: background work (stale reads, compaction, checkpoints) waits while backgrounded. */
 	setBackground(on: boolean): void {
 		const c = this.c;
 		if (c.background === on) return;

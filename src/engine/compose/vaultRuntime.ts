@@ -111,7 +111,7 @@ export class VaultRuntime {
 	brake: BrakeReport | null = null;
 	settings: EngineSettings;
 	migrating = false;
-	/** Backgrounded (DESIGN §i.4): passes (lanes 3–4) wait until visible / resume. */
+	/** Backgrounded (DESIGN §i.4): reconcile passes wait until visible / resume. */
 	background = false;
 	private hiddenTimer: TimerHandle | null = null;
 	private idbSnapshotDue = false;
@@ -559,7 +559,7 @@ export class VaultRuntime {
 	}
 
 	/**
-	 * DESIGN §i.4. hidden: flush; phone / constrained also pause lanes 3–4 and close the socket after
+	 * DESIGN §i.4. hidden: flush; phone / constrained also pause background work and close the socket after
 	 * HIDDEN_CLOSE_MS (desktop and tablet keep syncing: an occluded desktop window reports hidden too).
 	 * pagehide / freeze: flush, pause, close now. visible / resume: reconnect at once, full pass.
 	 * Background closes keep the phase and never back off; the user's pause wins over visible / online.
