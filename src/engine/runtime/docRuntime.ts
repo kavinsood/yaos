@@ -164,29 +164,6 @@ export class DocRuntime {
 		});
 	}
 
-	/** Committed body rows (receipts and settled adoptables excluded) -> resident replicas. */
-	async applyRows(rows: readonly TailRecord[]): Promise<void> {
-		const byStream = new Map<StreamName, TailRecord[]>();
-		for (const row of rows) {
-			const cls = streamClass(row.stream);
-			if (cls !== "body" && cls !== "canvas") continue;
-			let l = byStream.get(row.stream);
-			if (!l) byStream.set(row.stream, (l = []));
-			l.push(row);
-		}
-		for (const [stream, list] of byStream) {
-			this.c.ckpt.lastActivity.set(stream, this.c.mono());
-			let h = this.c.handles.peek(stream);
-			if (!h) {
-				const loading = this.c.handles.loadingOf(stream);
-				if (loading) h = await loading.catch(() => undefined);
-			}
-			if (!h) continue;
-			await this.applyToHandle(h, list);
-			this.checkDoc(h);
-		}
-	}
-
 	/** Apply rows to one replica in one REMOTE transaction; unresolved refs are kept for retry. */
 	async applyToHandle(h: Handle, rows: readonly TailRecord[], extra: Uint8Array | null = null): Promise<void> {
 		const updates: Uint8Array[] = extra && extra.length > 0 ? [extra] : [];

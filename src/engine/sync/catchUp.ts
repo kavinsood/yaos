@@ -72,10 +72,10 @@ export interface ReadResult {
 	readonly removed: OutboxRecord[];
 	readonly updated: OutboxRecord[];
 	readonly renamed: OutboxRename[];
-	/** Tail rows to apply to a resident replica (late receipts and settled adoptables excluded). */
-	readonly apply: TailRecord[];
 	/** Every tail row written. */
 	readonly tailPut: TailRecord[];
+	/** Seqs of tailPut not to apply to a replica: late receipts and settled adoptables (notApplied). */
+	readonly skip: ReadonlySet<Seq>;
 	readonly stream: StreamRecord | null;
 	readonly error?: string;
 }
@@ -90,14 +90,14 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	const removed: OutboxRecord[] = [];
 	const updated: OutboxRecord[] = [];
 	const renamed: OutboxRename[] = [];
-	const apply: TailRecord[] = [];
 	const tailPut: TailRecord[] = [];
+	const skip = new Set<Seq>();
 	let checkpointState: Uint8Array | null = null;
 	let replacedFold = false;
 	let pages = 0;
 	let rowsSeen = 0;
 	const result = (t: ReadResult["t"], error?: string): ReadResult => ({
-		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, renamed, apply, tailPut, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
+		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, renamed, tailPut, skip, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
 	});
 	if (cls === "other") return result("done");
 	const start = repo.stream(stream);
@@ -181,7 +181,6 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 			// "stale" needs a payload not held: a read page holds every one.
 			if (it.t !== "receipt" && it.t !== "stale" && it.settleAdoptable) settleAdoptables.push(it.settleAdoptable);
 		}
-		const skip = notApplied(items);
 		if (!opts.stillValid()) return result("aborted");
 		const completeThrough = page.more ? null : Math.max(opts.headSeq, page.lastSeq);
 		const out = await repo.tReadPage({
@@ -191,7 +190,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 		updated.push(...out.updated);
 		renamed.push(...out.renamed);
 		tailPut.push(...out.tailPut);
-		for (const row of out.tailPut) if (!skip.has(row.seq)) apply.push(row);
+		notApplied(items, skip);
 		if (!page.more) return result("done");
 		after = Math.max(after, page.nextAfterSeq);
 		preferCheckpoint = false;

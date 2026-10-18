@@ -20,13 +20,14 @@
  *    other row becomes a T_stale item and provisionals are dropped;
  *  - a failed tLive drops the batch: its seqs stay unaccounted and the gap
  *    feed / reads recover them;
- *  - ns / cfg / snap rows mark the stream active for the checkpoint settle
- *    rule (body rows do so in docRuntime.applyRows; DESIGN §d.9).
+ *  - the stored batch goes through EngineCtx.afterStored as a read page
+ *    does; live rows (only they) mark their streams active for the checkpoint
+ *    idle rule (DESIGN §d.9).
  *
  * The queue survives a session close (its events are committed facts).
  */
 
-import { CFG_STREAM, KEYRING_STREAM, NS_STREAM, SNAP_STREAM, streamClass, type ClientFrameId, type DeviceId, type StreamName } from "../../core/types";
+import { KEYRING_STREAM, streamClass, type ClientFrameId, type DeviceId, type StreamName } from "../../core/types";
 import type { RelayEvent } from "../../ports/relay";
 import type { LiveItem } from "../store/repo";
 import { classifyRow, notApplied, receiptItem } from "../sync/ingestRow";
@@ -167,7 +168,6 @@ export class LiveIngest {
 			const payload = onlyK && streamClass(f.stream) !== "keyring" ? null : f.payload;
 			items.push(await classifyRow(c.deps, { stream: f.stream, seq: f.seq, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload }));
 		}
-		const skipApply = notApplied(items);
 		const receipts = items.filter((it) => it.t === "receipt").length;
 		const stale = items.filter((it) => it.t === "stale").length;
 		let res;
@@ -184,16 +184,7 @@ export class LiveIngest {
 		this.stats.stale += stale;
 		if (receipts > 0) c.countReceipts(receipts);
 		c.lastSyncedAtMs = c.now();
-		c.applyOutboxResult(res);
-		await c.keyring.ingestRows(res.tailPut);
-		await c.docs.applyRows(res.tailPut.filter((r) => !skipApply.has(r.seq)));
-		const mono = c.mono();
-		for (const r of res.tailPut) if (r.stream === NS_STREAM || r.stream === CFG_STREAM || r.stream === SNAP_STREAM) c.ckpt.lastActivity.set(r.stream, mono);
-		c.noteBodyChange(res.tailPut.filter((r) => r.deviceId !== c.self || !skipApply.has(r.seq)).map((r) => r.stream));
-		if (res.removed.length > 0 || res.tailPut.some((r) => r.stream === NS_STREAM)) await c.afterNsChange();
-		if (res.tailPut.some((r) => r.stream === CFG_STREAM)) await c.afterCfgChange();
-		if (res.tailPut.some((r) => r.stream === SNAP_STREAM)) await c.afterSnapChange();
+		await c.afterStored({ ...res, skip: notApplied(items), live: true });
 		if (stale > 0) c.sess.scheduleCatchUp();
-		c.scheduleStatus();
 	}
 }

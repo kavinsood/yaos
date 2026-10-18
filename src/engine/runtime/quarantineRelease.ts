@@ -62,14 +62,9 @@ async function release(c: EngineCtx, stream: StreamName, pass: readonly TailReco
 		const reason = n.code.slice("frozen:".length);
 		if (![...c.repo.streams()].some((r) => r.frozen === 1 && r.frozenReason === reason)) c.clearNotice(n.code);
 	}
-	const h = c.handles.peek(stream);
-	if (h) {
-		if (pass.length > 0) await c.docs.applyToHandle(h, pass);
-		c.docs.checkDoc(h);
-	}
-	c.noteBodyChange([stream]); // passed rows to project; a view waiting on the frozen doc binds (compose checkBindable)
+	// Passed rows to project; a view waiting on the frozen doc binds (compose checkBindable): reported as done.
+	await c.afterStored({ removed: [], updated: [], tailPut: pass, skip: new Set(), live: false, read: { stream, done: true, checkpointState: null, replacedFold: false } });
 	c.sess.scheduleCatchUp();
-	c.scheduleStatus();
 }
 
 /** User release: pass -> applied, held kept, the rest dismissed; the doc unfreezes unless a held row is left. */

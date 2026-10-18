@@ -422,29 +422,9 @@ export class SessionLoop {
 
 	private async postRead(stream: StreamName, res: ReadResult): Promise<void> {
 		const c = this.c;
-		c.applyOutboxResult(res);
 		if (res.t === "retry" || (res.t === "aborted" && res.error)) this.readBackoff.set(stream, c.mono() + c.tuning.readBackoffMs);
-		const cls = streamClass(stream);
-		if (cls === "body" || cls === "canvas") {
-			let h = c.handles.peek(stream);
-			if (!h) {
-				const loading = c.handles.loadingOf(stream);
-				if (loading) h = await loading.catch(() => undefined);
-			}
-			if (h) {
-				if (res.checkpointState || res.apply.length > 0) await c.docs.applyToHandle(h, res.apply, res.checkpointState);
-				c.docs.checkDoc(h);
-			}
-			// A completed read makes the stream caught up (§d.7), which the disk side waits on, even when
-			// every row is own (the author re-reading after its DB was lost); own plain rows change content too.
-			if (res.checkpointState || res.t === "done" || res.apply.length > 0 || res.tailPut.some((r) => r.deviceId !== c.self)) c.noteBodyChange([stream]);
-		} else if (cls === "ns") await c.afterNsChange(res.replacedFold);
-		else if (cls === "cfg") await c.afterCfgChange(res.replacedFold);
-		else if (cls === "snap") await c.afterSnapChange(res.replacedFold);
-		else if (cls === "keyring") await c.keyring.ingestRows(res.tailPut, true);
-		if (cls !== "ns" && res.removed.length > 0) await c.afterNsChange();
 		if (res.rows > 0 || res.t === "done") c.lastSyncedAtMs = c.now();
-		c.scheduleStatus();
+		await c.afterStored({ ...res, live: false, read: { stream, done: res.t === "done", checkpointState: res.checkpointState, replacedFold: res.replacedFold } });
 	}
 
 	/**
