@@ -31,8 +31,8 @@ Each invariant from report.md is enforced by named structures, not by care.
 |---|---|---|
 | I1 | Never lose a local edit: it stays in the durable outbox until the receipt. | `outbox` store (§e.1). `T_edit` commits **before** `append` (§e.2). The record is deleted only by `T_receipt` or a late receipt found by `T_read_page`. The outbox mirror side files survive IDB loss (§e.4). Before `T_edit`, the durable copy is the disk file: Obsidian's save for bound notes, and the merge order "Y apply + `T_edit` → disk write" (§e.2) for merges. Poisoned frames are re-derived from disk, never dropped silently (§d.5). Y.Text is never wholesale-replaced (§f.3). |
 | I2 | Never destroy a file on disk without a recoverable copy. | `VaultPort` exposes only `trash`, never a permanent delete. Every destructive `DiskOp` carries a CAS precondition (`WritePrecondition`). `conflictCopy` runs before any conflicting overwrite. `intents` store (§e.1). The safety brake counts deletes, trashes and overwrites that shrink a file by ≥ 50 % (§f.5). Fold losers are renamed, never deleted (§c.13). Recovery snapshots are taken before brake approval, epoch migration and IDB recovery (§j.4). |
-| I3 | The same log prefix gives the same state everywhere. | Pure fold `FoldNsFrame` over `(seq, index)` (§c). `FOLD` constants in `limits.ts`. Frozen Unicode case folding (§c.2). Duplicate-frame ring plus send window (§c.3). `upgradeRules` halts instead of guessing (§c.10). Canonical `nsFoldV1` checkpoints are verified by re-encode and digests (§b.5). `cfg` is LWW on `(seq, index)` (§c.11). `snap` is an order-independent join (§j.4). Bodies are Yjs CRDTs. |
-| I4 | One device's bad update can't corrupt others. | One ingest gate: verify → decode in scratch → check → apply, or quarantine (§d.6). `quarantine` store; per-doc `frozen`. Checkpoints are UNIONed into local state, never replace it (§d.7). A malformed ns frame folds as empty, deterministically. Merges run only against a caught-up CRDT (§f.3). The brake holds mass destruction (§f.5). The ns-divergence alarm holds destructive ops (§b.5). |
+| I3 | The same log prefix gives the same state everywhere. | Pure fold `FoldNsFrame` over `(seq, index)` (§c). `FOLD` constants in `limits.ts`. Frozen Unicode case folding (§c.2). Duplicate-frame ring plus send window (§c.3). `upgradeRules` halts instead of guessing (§c.10). Canonical `nsFoldV1` checkpoints are verified by re-encode and structural invariants (V1 + V2, §b.5). `cfg` is LWW on `(seq, index)` (§c.11). `snap` is an order-independent join (§j.4). Bodies are Yjs CRDTs. |
+| I4 | One device's bad update can't corrupt others. | One ingest gate: verify → decode in scratch → check → apply, or quarantine (§d.6). `quarantine` store; per-doc `frozen`. Body checkpoints are UNIONed into local state, never replace it (§d.7); ns, cfg and snap checkpoints pass V1 + V2 at the gate before they replace a fold (§b.5). A malformed ns frame folds as empty, deterministically. Merges run only against a caught-up CRDT (§f.3). The brake holds mass destruction (§f.5). |
 | I5 | Bounded resources per device class (memory, CPU, battery, rows written). | `BUDGETS[deviceClass]` (§i.2). Clean-only LRU residency (§d.1). Frame builder caps (§d.4). Store bounds (§e.3). Priority lanes and slices (§i.1). Token bucket and daily soft budget (§i.6). Compaction thresholds (§d.8). No O(document) work per keystroke: frames are `Y.mergeUpdates` of small batches, never `encodeStateAsUpdate`, and nothing rewrites a full doc per edit. |
 | I6 | Disk events are hints; a periodic full reconcile is the truth check. | `VaultEvent`s only mark paths dirty. The `LocalEntry` stat cache is confirmed by hash (§f.6). A full reconcile runs every `fullReconcileIntervalMs` and on resume. The planner is a pure function of the three trees (§f.2). Echo suppression only drops events; it never decides anything (§f.4). |
 
@@ -165,8 +165,7 @@ never depends on a checkpoint existing: a stream without one just costs more row
 - Alternative: verify body checkpoints by digest. Rejected: the union already protects every caught-up reader, and
   a digest needs the rows the checkpoint exists to replace.
 
-**Namespace (`nsFoldV1`).** The state is the canonical encoding of `NsFoldState`. The envelope deflates it; digests
-are computed over the uncompressed bytes.
+**Namespace (`nsFoldV1`).** The state is the canonical encoding of `NsFoldState`. The envelope deflates it.
 
 ```
 varuint formatVersion (= 1)
@@ -196,7 +195,9 @@ deviceCount × (ascending deviceId)
 
 `pathKey`, `byPathKey`, `folderRefs` and `tombstones` are derived (`NsFoldIndex`) and never encoded.
 
-A peer **verifies** an ns checkpoint before using it:
+A peer **verifies** an ns checkpoint before using it. The ingest gate runs both checks on every remote ns
+checkpoint (`gateCheckpoint`, `src/engine/ingest/gate.ts`, via `verifyNsCheckpoint`, `src/core/ns/verify.ts`), and
+catch-up reads (`src/engine/sync/catchUp.ts`) are the only place a remote checkpoint is adopted:
 
 1. **V1, canonical form.** Decode, re-encode, and compare byte-for-byte. This rejects non-minimal varints, unsorted
    entries, duplicate docIds and trailing bytes.
@@ -208,24 +209,24 @@ A peer **verifies** an ns checkpoint before using it:
    - all seqs ≤ coversSeq, and `createdSeq ≤ lastTouchSeq`;
    - live pathKeys are unique, and no live file key equals a live folder prefix key;
    - all live entries under one folder key share its display casing;
-   - tombstones ≤ `TOMBSTONE_CAP`, and each ring holds 1–64 unique valid ids;
-   - `foldRulesVersion` ≤ `FOLD_RULES_VERSION`, else the ns fold halts as `upgrade-required`;
+   - tombstones ≤ `TOMBSTONE_CAP`, and each ring holds 1–64 unique non-empty ids (not necessarily 22-char ids: a
+     malformed or gate-failed row enters the ring with whatever `clientFrameId` the relay committed, §b.3, §c.3);
+   - `foldRulesVersion` ≤ `FOLD_RULES_VERSION`, else the gate fails reader-dependent (`envelope-version`), and the
+     header's `foldRulesVersion` equals the state's;
    - inner coversSeq equals the relay's coversSeq.
-3. **V3, digest at candidates** (live devices only).
-   - An ns row `s` is a **candidate** iff `floor(s / 1000) > floor(prev / 1000)`, where `prev` is the fold's
-     coversSeq before `s`. Every device that folds `s` evaluates this the same way.
-   - At each candidate a device records `(s, sha256(nsFoldV1 bytes))` in a 16-entry ring held in memory and in
-     `streams["ns"].textHash` for the newest.
-   - Checkpoints are written **only** at candidates (§d.9).
-   - A device verifies the relay's current ns checkpoint whenever `read("ns")` reports a `checkpointSeq` that it
-     holds a digest for and has not verified yet. It fetches the checkpoint with `read("ns", checkpointSeq − 1,
-     true)`. The same check runs after losing a CAS and every 6 h.
-   - **Mismatch** means the `ns-divergence` alarm:
-     - the brake holds every destructive op (`BrakeReport.reason = "ns-divergence"`);
-     - a diagnostics event and notice are raised;
-     - the device never overwrites the checkpoint or its own fold.
-   - A fresh device has no rows to compare (the relay GCs them), so it relies on V1 + V2. Alternative: a fresh
-     device re-folds from seq 1. Rejected: the rows are gone.
+
+A failure is a gate failure: `decode-failed` (V1), `checkpoint-mismatch` (coversSeq) or `checkpoint-invariant` (the
+rest of V2). Catch-up treats any of them as a disputed checkpoint: it re-reads the page without the checkpoint, and
+if the rows below it are gone it freezes the stream `checkpoint-disputed` (`readStream`, catchUp.ts). On a
+40k-entry (4.2 MiB) state the gate takes about 285 ms, against about 200 ms for V1 alone; both are linear.
+
+No device compares fold digests with another: a checkpoint that passes V1 + V2 but is not the fold of its rows (a
+buggy writer, or a hostile one holding the vault key) is adopted by every device that reads it, and nothing raises
+an alarm. A fresh device could not check it anyway: the relay GCs the rows below it.
+
+Checkpoints are written only at **candidate** seqs (§d.9). An ns row `s` is a candidate iff
+`floor(s / 1000) > floor(prev / 1000)`, where `prev` is the fold's coversSeq before `s` (`isCandidateSeq`,
+`src/core/ns/candidate.ts`). Every device that folds `s` evaluates this the same way.
 
 **Settings (`cfgFoldV1`).** Same shape as `nsFoldV1`:
 - header `varuint formatVersion, varuint coversSeq`;
@@ -235,12 +236,15 @@ A peer **verifies** an ns checkpoint before using it:
 - `plugins` sorted by id.
 
 Each register is `value? (u8 present + bytes), varuint seq, varuint index, varstring deviceId`. Verification is
-V1 + V2.
+V1 + V2 at the gate (`verifyCfgCheckpoint`, `src/core/cfg/verify.ts`): rings as in ns; every register key and value
+valid; every version `1 ≤ seq ≤ coversSeq`, `index < 512`, unique across registers, one deviceId per seq; header
+`foldRulesVersion` equal to `CFG_FOLD_RULES_VERSION` (a newer one is reader-dependent).
 
 **Snapshot index (`snapFoldV1`, encoding 5).** Header `varuint formatVersion, varuint coversSeq`, then floors
 sorted by deviceId, dels sorted by key and records sorted by key (key = `deviceId/snapshotId`; a record is
 `varstring deviceId, varbytes put body`). Verification: strict decode (every id, record and bound), then the
 canonical re-encode must be byte-identical; `foldRulesVersion` ≤ 1, and the inner coversSeq equals the relay's.
+There is no separate invariant checker: the strict decoder is the snap index's V2.
 
 **`retired`.** An empty state that tells the relay it may GC every row ≤ coversSeq. It is written only for:
 - `b:`/`c:` streams of docIds the fold has pruned, or that are merged aliases with rows.
@@ -948,6 +952,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - Check the kind against `ALLOWED_KINDS[class]`, and the checkpoint coversSeq binding.
 2. **Decode and bound** (no doc needed).
    - **ns / cfg / snap:** the full op decode (§b.3, §b.4). For snap that includes every record bound (§j.4).
+   - **ns / cfg / snap checkpoints:** V1 + V2 on the fold state (§b.5); snap's V2 is its strict decoder.
    - **body / canvas:** `Y.decodeUpdate` (structural). Then all of:
      - root parent names ⊆ the allowed roots of the class;
      - content types limited to strings, deletes, `ContentType` (`Y.Text`/`Y.Map` per §j.2), `ContentAny` and
@@ -1041,7 +1046,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - **`T_read_page`:** put tail rows. An own row (`deviceId` = self) whose `clientFrameId` is in the outbox is a
      **late receipt**, handled exactly like `T_receipt`. An own row without an outbox record is a plain row.
    - **Checkpoint** `coversSeq > snapshotCoversSeq`:
-     - fresh stream: store it as the snapshot after the gate (for ns, V1 + V2);
+     - fresh stream: store it as the snapshot after the gate (ns and cfg: V1 + V2; snap: strict decode + V1);
      - otherwise: **union job**: scratch doc = local snapshot + every local tail row ≤ coversSeq + the checkpoint →
        `T_snapshot`. For ns: verify, then replace the fold state, and own pending ops re-overlay (§f.1).
    - **Caught up:** when a read completes (`more = false`) in the current session, every row of the stream ≤
@@ -1146,7 +1151,7 @@ The planner does no destructive work until ns is caught up (§f.2).
 | Result | Action |
 |---|---|
 | `ok` | `remoteCheckpointCoversSeq = C`; reset counters |
-| `conflict{current}` | Record `current`. Retry later only if `current < C`. ns: run the V3 check on `current` |
+| `conflict{current}` | Record `current`. Retry later only if `current < C`. |
 | `refused not-advancing` | Refresh with `read(stream, C, false)` |
 | `refused ahead-of-stream` | Bug: diagnostics, skip |
 | `refused stream-not-found` | Skip |
@@ -1357,18 +1362,18 @@ All are in `src/core/types.ts`.
     bytes for blobs.
   - `DiskFingerprint` is the exact-bytes hash, used only for echo suppression and CAS.
   - Both are SHA-256 hex, digested in the engine through `HashPort` (WebCrypto; `digestHex`,
-    `src/core/hash/digest.ts:11`), like every other digest: blobs, canvas, config, snapshots, mirrors, ns fold
-    digests, brake ids. Core's pure-JS SHA-256 throws a `RangeError` above `SYNC_HASH_MAX_BYTES` (4096 B,
-    `src/core/limits.ts:100`, `src/core/hash/sha256.ts:22-23`), in production too. It takes only bounded inputs: the
-    empty-content hash (`src/core/plan/planner.ts:68`), the recovery key's 32-byte check
+    `src/core/hash/digest.ts:11`), like every other digest: blobs, canvas, config, snapshots, mirrors, brake ids.
+    Core's pure-JS SHA-256 throws a `RangeError` above `SYNC_HASH_MAX_BYTES` (4096 B, `src/core/limits.ts:100`,
+    `src/core/hash/sha256.ts:22-23`), in production too. It takes only bounded inputs: the
+    empty-content hash (`src/core/plan/planner.ts:67`), the recovery key's 32-byte check
     (`src/core/codec/recoveryKey.ts:26`, `:34`), cfg's `H_TRUE` (4 B, `src/engine/settings/cfgPlan.ts:98`) and the
     resident-text fallback below.
   - `streams.textHash` of a resident replica (the planner's remote hash for a caught-up markdown/canvas doc) is
     digested through `HashPort` before each pass reads the view (`warmTextHashes`,
-    `src/engine/compose/logPort.ts:115-131`, called at `src/engine/reconcile/reconciler.ts:165`). A replica that
+    `src/engine/compose/logPort.ts:114-130`, called at `src/engine/reconcile/reconciler.ts:165`). A replica that
     changed after the warm is hashed by the view only if its input fits `SYNC_HASH_MAX_BYTES`; otherwise the view
-    has no `textHash` for it and the planner's remote hash is unknown (`logPort.ts:99-108`,
-    `src/core/plan/planner.ts:204-210`).
+    has no `textHash` for it and the planner's remote hash is unknown (`logPort.ts:98-107`,
+    `src/core/plan/planner.ts:201-207`).
 
 ### f.2 Planner
 
@@ -1510,16 +1515,15 @@ All are in `src/core/types.ts`.
 | `mass-delete-remote` | `diskTrash` | same |
 | `mass-overwrite` | Writes over a file ≥ `BRAKE_OVERWRITE_MIN_BYTES` leaving < `BRAKE_OVERWRITE_SHRINK_RATIO` of its size | same |
 | `conflict-flood` | `conflictCopy` | `> BRAKE_MAX_CONFLICT_COPIES` |
-| `ns-divergence` | All destructive ops | V3 mismatch (§b.5) |
 
 - **Held ops** go to `Plan.held`. The rest of the plan runs.
 - **Report.** The brake's identity is the sorted brake keys (`kind|docId|path|expect`) of its held ops, one per line
-  (`brakeKey`, `brakeIdentity`, `src/core/plan/brake.ts:83-90`). `BrakeReport.id` is the identity's sha256 through
-  `HashPort` (`brakeId`, `brake.ts:93-95`): the planner returns the identity, and the reconciler digests it and the
+  (`brakeKey`, `brakeIdentity`, `src/core/plan/brake.ts:82-89`). `BrakeReport.id` is the identity's sha256 through
+  `HashPort` (`brakeId`, `brake.ts:92-94`): the planner returns the identity, and the reconciler digests it and the
   engine posts a `brake` event (`src/engine/reconcile/reconciler.ts:190-195`).
 - **Approval.** `approveBrake{id}` maps the id back to the identity of the report it names and sets `brakeApproval`
   to that identity (`reconciler.ts:96-103`; an id no report of this runtime has is ignored). The next plan releases
-  the held set only if its held ops have the same identity (`brake.ts:128-129`). A recovery snapshot (reason
+  the held set only if its held ops have the same identity (`brake.ts:126-127`). A recovery snapshot (reason
   `brake`, with snapshots enabled, §j.4) is taken first (`src/engine/compose/runtimeOps.ts:80-83`). `rejectBrake`
   converts held remote deletes into nothing (the files stay; `syncedDrop`) and held local deletes into re-creates.
 - Counting is per plan **and** per rolling 10-minute window, so slow drips also trip it.
@@ -2420,7 +2424,7 @@ src/
     codec/   lib0, ids, envelope, contents, nsOps, cfgOps, nsFoldV1, cfgFoldV1, snapFoldV1, mirrors     [WP-A];
              sealedBlob, padme, recoveryKey                                                    [E2EE]
     paths/   pathKey (+ generated casefold15_1, assigned15_1), validate, segments              [WP-A]
-    ns/      fold, index, place, overlay, verify (V1/V2), candidate (V3 digest rule)          [WP-A]
+    ns/      fold, index, place, overlay, verify (V1/V2), candidate (checkpoint seqs, §d.9)   [WP-A]
     cfg/     fold, json, projection (pure JSON register → file bytes), verify                 [WP-A]
     snap/    record (snapOps), fold, zip, bundle (parts, digest, manifest), export, verify (§j.4)
     hash/    markdownLf (ported markdownCodec), canvasCanonical + canvasOrdering (ported canvasCodec/Ordering),
@@ -2570,8 +2574,8 @@ After healing (all faults off, all online, run until every queue is idle and no 
 3. **Nothing destroyed without a copy.** Every file version that existed on any disk and was not superseded by a user
    edit containing it is present in the vault, in the trash, in a conflict copy, or in a snapshot. Every trash
    happened with a passing precondition.
-4. **Fold determinism.** For every device and every candidate seq, the V3 digests match. Folding from any checkpoint
-   plus the rest equals the full fold.
+4. **Fold determinism.** Folding from any checkpoint plus the rest equals the full fold, and every checkpoint an
+   honest device writes passes V1 + V2.
 5. **Clean state.** Outbox empty, no `held` or `adoptable` records, cursors at head, no frozen docs unless a malicious
    frame was injected, no open intents.
 6. **Resource bounds held throughout:** resident docs/bytes ≤ budget (+1 doc), tail ≤ hard rows, live queue ≤ bound,

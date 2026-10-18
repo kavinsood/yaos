@@ -274,7 +274,7 @@ storage" (:270), and "Show status in the status bar" (:329).
 | Device-name hint in the pair dialog | adfa7a7:src/settings/settingsTab.ts:362-364 | src/host/ui/pairModal.ts:149 | implemented (a6d3385) |
 | Default device name | adfa7a7:src/utils/defaultDeviceName.ts:12 | src/host/ui/deviceName.ts:17 | ported |
 | "Invite person" pairing (`kind: "person"`) | adfa7a7:src/settings/PairDeviceModal.ts:21, :31-36; adfa7a7:src/main.ts:3252 | MISSING | dropped: governance moved to the server operator console (§18) |
-| First join with existing local files (durable, resumable importer with a summary) | adfa7a7:src/onboarding/localVaultImport.ts:215, :244; adfa7a7:src/main.ts:920 | src/core/plan/planner.ts:641-648 (local-only files become creates on the first full pass, DESIGN §j.5) | ported (no separate importer) |
+| First join with existing local files (durable, resumable importer with a summary) | adfa7a7:src/onboarding/localVaultImport.ts:215, :244; adfa7a7:src/main.ts:920 | src/core/plan/planner.ts:638-645 (local-only files become creates on the first full pass, DESIGN §j.5) | ported (no separate importer) |
 | Operator-provisioned vault check before the first sync | adfa7a7:src/onboarding/provisioningClient.ts:51; adfa7a7:src/main.ts:940 | src/host/ui/pairing.ts:251 (capabilities are checked before enrolling) | ported |
 
 New only: the pairing code shows a live expiry countdown (src/host/ui/pairModal.ts:331-346).
@@ -373,8 +373,8 @@ Without a blob store the client fails closed: attachments are not synced and the
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
 | Markdown conflict copy name `name (YAOS conflict from <device> <ISO time>).md` | adfa7a7:src/runtime/reconcile/markdownConflictArtifact.ts:13-31, :72 | src/core/plan/conflictName.ts:1-14, :81 (`name (conflict <label> <YYYY-MM-DD HHmm>).md`); src/engine/compose/boundDisk.ts:176-187 (bind-time copies, named and written in the worker) | implemented (5d39472) (new pattern, DESIGN §f.7) |
-| Attachment conflict copy name `name (YAOS remote conflict <time>).ext` | adfa7a7:src/sync/blobSync.ts:274-291 | src/core/plan/planner.ts:394, :627 (the same `conflictName` pattern) | ported (DESIGN §f.7, "Blob keep-both uses the same pattern") |
-| Attachment conflict copy is local only (never uploaded) | adfa7a7:src/sync/blobSync.ts:1783-1790 | src/core/plan/planner.ts:396-397, :629-630 (the copy is created and pushed) | dropped: the copy is a normal synced file in the new client (DESIGN §f.7) |
+| Attachment conflict copy name `name (YAOS remote conflict <time>).ext` | adfa7a7:src/sync/blobSync.ts:274-291 | src/core/plan/planner.ts:391, :624 (the same `conflictName` pattern) | ported (DESIGN §f.7, "Blob keep-both uses the same pattern") |
+| Attachment conflict copy is local only (never uploaded) | adfa7a7:src/sync/blobSync.ts:1783-1790 | src/core/plan/planner.ts:393-394, :626-627 (the copy is created and pushed) | dropped: the copy is a normal synced file in the new client (DESIGN §f.7) |
 | Reuse an existing copy with identical content | adfa7a7:src/runtime/reconcile/markdownConflictArtifact.ts:52 | MISSING (identical content makes no copy, src/core/merge/merge.ts:26) | dropped: identical-content conflict copy reuse (coordinator decision) |
 | Conflict notice, throttled, with the suppressed count | adfa7a7:src/runtime/reconciliationController.ts:2701-2714; adfa7a7:src/sync/blobSync.ts:1827-1830 | src/engine/reconcile/context.ts:247-254; src/engine/reconcile/reconciler.ts:228 | implemented (2d6bac5) |
 | Count of conflict copies today | adfa7a7:src/runtime/reconciliationController.ts:2704 (only a per-notice suppressed count) | src/engine/compose/localDayCounter.ts:14; src/engine/compose/vaultRuntime.ts:649; src/protocol/status.ts:48 | implemented (0db3bb7) |
@@ -494,7 +494,7 @@ vault" and the person fields are rows in §3.4, §3.5 and §4.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Safety brake on mass destructive changes | adfa7a7:src/runtime/reconcile/safetyBrakePolicy.ts:22, :25, :68 (never called outside tests; adfa7a7:src/runtime/reconciliationController.ts:514 hard-codes `safetyBrakeTriggered: false`) | src/core/plan/brake.ts:37; src/core/limits.ts:146-151; src/host/ui/brake.ts:68; src/host/ui/brakeModal.ts:9; src/host/ui/registerUi.ts:227-234 | ported (live now, DESIGN §f.5) |
+| Safety brake on mass destructive changes | adfa7a7:src/runtime/reconcile/safetyBrakePolicy.ts:22, :25, :68 (never called outside tests; adfa7a7:src/runtime/reconciliationController.ts:514 hard-codes `safetyBrakeTriggered: false`) | src/core/plan/brake.ts:37; src/core/limits.ts:146-151; src/host/ui/brake.ts:65; src/host/ui/brakeModal.ts:9; src/host/ui/registerUi.ts:227-234 | ported (live now, DESIGN §f.5) |
 | Recovery-loop quarantines (amplification, fingerprint) | adfa7a7:src/runtime/reconcile/amplificationQuarantinePolicy.ts:29, :95; adfa7a7:src/runtime/reconcile/fingerprintQuarantinePolicy.ts:28, :104 | MISSING (bounded planner and the brake) | dropped: DESIGN §m.2 (`runtime/reconcile/*` policies) |
 | Live editor binding (legacy: y-codemirror over a main-thread Y.Doc) | adfa7a7:src/sync/editorBinding.ts:181 | src/host/binding.ts:95; src/host/collab.ts:60; src/host/bodyClient.ts:64 (CodeMirror ChangeSets against the worker replica, no CRDT on main) | ported (reworked onto the worker replica: DESIGN §d.2, §d.3) |
 | Bind-divergence decisions (adopt body or adopt editor) | adfa7a7:src/sync/editorBinding.ts:146 | MISSING (one `MergeFn` plus a conflict copy) | dropped: DESIGN §m.2 (merge and divergence policies) |
