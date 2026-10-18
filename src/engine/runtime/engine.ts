@@ -15,14 +15,14 @@ import { EnvelopeFlag } from "../../core/envelope";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import type { SnapFoldState } from "../../core/snap/fold";
 import type { SnapOp } from "../../core/snap/record";
-import { NS_STREAM, docStream, kindOfPath, streamClass, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type DeviceId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
+import { NS_STREAM, docStream, kindOfPath, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type DeviceId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { RelaySession } from "../../ports/relay";
 import type { StoragePort } from "../../ports/storage";
 import { buildBodyFrames, initialTextUpdates } from "../body/frames";
 import { HandleManager, type Handle } from "../body/handles";
 import { applyChanges, changesBaseLength, type TextChanges } from "../body/textChanges";
-import { Sender } from "../body/sender";
+import { Sender, sendRank } from "../body/sender";
 import { ORIGIN } from "../body/yjsCounters";
 import { defaultPriority, Repo, type YS } from "../store/repo";
 import { DB_NAME_PREFIX, DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity } from "../store/schema";
@@ -52,17 +52,6 @@ export class EngineStartError extends Error {
 	constructor(readonly reason: string) {
 		super(`engine start failed: ${reason}`);
 	}
-}
-
-function rankOf(c: EngineCtx) {
-	return (rec: { stream: StreamName; flags: number }): number => {
-		const cls = streamClass(rec.stream);
-		if (cls === "ns") return 1;
-		if (cls === "cfg") return 2;
-		if (cls === "snap") return 3;
-		if ((rec.flags & EnvelopeFlag.adopted) !== 0) return 4;
-		return (c.handles.peek(rec.stream)?.bound ?? 0) > 0 ? 0 : 3;
-	};
 }
 
 export class LogEngine {
@@ -158,7 +147,7 @@ export class LogEngine {
 		const resealer = new Resealer(c);
 		c.sender = new Sender({
 			clock: opts.ports.clock,
-			rankOf: rankOf(c),
+			rankOf: (rec) => sendRank(rec, (stream) => (c.handles.peek(stream)?.bound ?? 0) > 0),
 			maxInflightBytes: () => c.budgets.maxInflightAppendBytes,
 			onSent: (rec, attempts) => {
 				c.sentPending.set(rec.clientFrameId, { attempts, atMs: c.now() });
