@@ -2,7 +2,7 @@
  * cfg checkpoint verification (DESIGN §b.5 "Verification is V1 + V2").
  *
  * V2 (decided by WP-A, wp-a-notes.md):
- * - formatVersion 1, coversSeq a count, rings as in ns (1..64 unique valid ids).
+ * - formatVersion 1, coversSeq a count, rings as in ns (1..64 unique non-empty ids, ns/verify.ts isRingId).
  * - json keys are file + "\0" + key with a valid config path; values canonical JSON.
  * - files keys are valid config paths; contents valid; pluginVersion null or non-empty.
  * - plugin ids valid.
@@ -18,7 +18,7 @@ import { CheckpointEncoding, type CheckpointContent } from "../envelope";
 import { MAX_NS_OPS_PER_FRAME, NS_DEDUPE_RING } from "../limits";
 import { replayWindowValid } from "../replayWindow";
 import { bytesEqual } from "../codec/lib0";
-import { isClientFrameId } from "../codec/ids";
+import { isRingId } from "../ns/verify";
 import { decodeCfgFoldV1, encodeCfgFoldV1 } from "../codec/cfgFoldV1";
 import { CFG_FOLD_RULES_VERSION, isCfgFileContent, isConfigRelPath, isPluginId, splitJsonRegisterKey } from "./fold";
 import { isCanonicalJson } from "./json";
@@ -40,7 +40,7 @@ export function checkCfgInvariants(state: CfgFoldState): string | null {
 		if (typeof device !== "string" || device.length === 0) return "empty deviceId in rings";
 		if (ring.length < 1 || ring.length > NS_DEDUPE_RING) return `ring ${device} size ${ring.length}`;
 		if (new Set(ring).size !== ring.length) return `ring ${device} has duplicates`;
-		for (const f of ring) if (!isClientFrameId(f)) return `ring ${device} has invalid id`;
+		for (const f of ring) if (!isRingId(f)) return `ring ${device} has invalid id`;
 	}
 	for (const [device, w] of state.replay) {
 		if (typeof device !== "string" || device.length === 0) return "empty deviceId in replay";

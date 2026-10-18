@@ -7,6 +7,10 @@
  *   createdSeq === lastTouchSeq (both hold for every state the v1 fold reaches).
  * - merged entries must have the same kind as their aliasOf target.
  * - deleteBaseBodySeq is a body-stream seq and is not bounded by coversSeq.
+ * - Ring ids need only be non-empty strings, not 22-char ids: a malformed or
+ *   gate-failed row still enters the ring with whatever clientFrameId the
+ *   relay committed (DESIGN §b.3, §c.3; relay-wire allows 1-128 bytes), so a
+ *   stricter check would refuse honest checkpoints after one odd frame.
  * - Checkpoint content: foldRulesVersion in the content header must equal the
  *   state's; content coversSeq and state coversSeq must equal the relay's.
  */
@@ -17,7 +21,7 @@ import { CheckpointEncoding, type CheckpointContent } from "../envelope";
 import { FOLD_RULES_VERSION, NS_DEDUPE_RING, TOMBSTONE_CAP } from "../limits";
 import { replayWindowValid } from "../replayWindow";
 import { bytesEqual } from "../codec/lib0";
-import { isClientFrameId, isContentHash, isDocId } from "../codec/ids";
+import { isContentHash, isDocId } from "../codec/ids";
 import { decodeNsFoldV1, encodeNsFoldV1 } from "../codec/nsFoldV1";
 import { pathKey } from "../paths/pathKey";
 import { isValidPath } from "../paths/validate";
@@ -41,6 +45,9 @@ interface EntryCheck {
 const entryCache = new WeakMap<NsEntry, EntryCheck>();
 
 const isCount = (n: number) => Number.isSafeInteger(n) && n >= 0;
+
+/** A dedupe-ring id the fold can reach (see the decisions above); cfg/verify.ts shares it. */
+export const isRingId = (f: string): boolean => typeof f === "string" && f.length > 0;
 
 function checkEntrySelf(e: NsEntry): EntryCheck {
 	const hit = entryCache.get(e);
@@ -127,7 +134,7 @@ export function checkNsInvariants(state: NsFoldState, index?: NsFoldIndex, opts:
 		if (typeof device !== "string" || device.length === 0) return "empty deviceId in rings";
 		if (ring.length < 1 || ring.length > NS_DEDUPE_RING) return `ring ${device} size ${ring.length}`;
 		if (new Set(ring).size !== ring.length) return `ring ${device} has duplicates`;
-		for (const f of ring) if (!isClientFrameId(f)) return `ring ${device} has invalid id`;
+		for (const f of ring) if (!isRingId(f)) return `ring ${device} has invalid id`;
 	}
 	for (const [device, w] of state.replay) {
 		if (typeof device !== "string" || device.length === 0) return "empty deviceId in replay";

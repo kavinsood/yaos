@@ -505,7 +505,8 @@ test("verify V2: invariant violations and upgrade-required", () => {
 	bad((s) => patch(s, d2, { blob: null }), /blob presence/);
 	bad((s) => { s.foldRulesVersion = 2; }, "upgrade-required");
 	bad((s) => { s.foldRulesVersion = 0; }, /foldRulesVersion/);
-	bad((s) => { s.recentFrames.set(B, ["short" as ClientFrameId]); }, /invalid id/);
+	bad((s) => { s.recentFrames.set(B, ["" as ClientFrameId]); }, /invalid id/);
+	assert.ok(verifyNsFoldBytes(encodeNsFoldV1((() => { const s = base(); s.recentFrames.set(B, ["short" as ClientFrameId]); return s; })()), 1).ok, "any relay-committed id may be ringed (§c.3)");
 	bad((s) => {
 		patch(s, d2, { path: "notes/b.md", kind: "markdown", blob: null });
 	}, /casing/);
