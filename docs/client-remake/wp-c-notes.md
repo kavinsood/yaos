@@ -5,7 +5,7 @@ and `e2e/client/`. No frozen-file changes (`git diff <base> -- src/core src/port
 
 ## What is built
 
-**Store** — `store/repo.ts`: every DESIGN §e.2 transaction (tFeedPage, tReadPage, tEdit, tLive, tOutbox, tSent, tSnapshot,
+**Store** — `store/repo.ts`: every DESIGN §e.2 transaction (tFeedPage, tReadPage, tEdit, tLive, tOutbox, tSnapshot,
 tPatchStreams, quarantine/release, ...) on a serial write queue with a stream-row cache; `txLabel` per tx (used by the crash sweep).
 
 **Adapters** (only place with browser globals):

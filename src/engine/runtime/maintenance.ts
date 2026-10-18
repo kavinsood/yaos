@@ -1,6 +1,6 @@
 /**
  * Periodic engine work (one tick every maintenanceMs, never overlapping):
- * gap feed (DESIGN §d.7), lazy T_sent, local compaction (§d.8), remote
+ * gap feed (DESIGN §d.7), local compaction (§d.8), remote
  * checkpoint duty (§d.9), daily-limit release, residency budget, catch-up
  * scheduling.
  */

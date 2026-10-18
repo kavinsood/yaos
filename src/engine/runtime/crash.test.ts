@@ -2,7 +2,7 @@
  * Crash at every §e.2 transaction boundary (DESIGN §k.3 WP-C #1).
  *
  * One scenario (feed + read on start, create, edits, live rows from a peer,
- * receipts, lazy T_sent, local compaction, remote checkpoints, rename, delete,
+ * receipts, local compaction, remote checkpoints, rename, delete,
  * relay restart + resend) is run once to count device A's read-write commits,
  * then once per commit index k with A's storage crashing just before / just
  * after commit k. After each crash: the committed state is probed (cursor V
