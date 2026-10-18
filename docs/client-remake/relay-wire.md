@@ -155,12 +155,12 @@ error followed by close 1006:
   "runtimeEpoch": "<uuid of this DO runtime>",
   "head": 42,
   "liveness": { "version": 1, "idleMs": 60000, "timeoutMs": 15000 },
-  "capabilities": { "streams": 1 },
+  "capabilities": { "streams": 1, "subscriptions": 1 },
   "limits": {
     "maxStreamNameBytes": 256, "maxClientFrameIdBytes": 128, "maxPayloadBytes": 1048576,
     "maxBinaryMessageBytes": 1049600, "maxTextMessageBytes": 65536, "maxCheckpointBytes": 4194304,
     "feedDefaultLimit": 1000, "feedMaxLimit": 5000, "readDefaultBytes": 1048576, "readMaxBytes": 4194304,
-    "readBatchMaxStreams": 128, "rateBytesPerSec": 262144, "burstBytes": 2097152,
+    "readBatchMaxStreams": 128, "maxSubscriptions": 128, "rateBytesPerSec": 262144, "burstBytes": 2097152,
     "groupCommit": { "idleMs": 300, "maxMs": 1500, "maxBytes": 65536, "minIntervalMs": 1000, "leadMs": 20, "quietMs": 1500 }
   },
   "canWrite": true,
@@ -174,6 +174,8 @@ error followed by close 1006:
 - `canWrite` is always `true`: there are no roles (DECISIONS H4; `server/src/vault/host.ts:667`). On a socket
   with `canWrite: false` the relay would answer appends with `STREAM_APPEND_REJECTED write_forbidden`
   (`server/src/streams/relay.ts:632`).
+- `capabilities.subscriptions: 1` and `limits.maxSubscriptions` announce per-stream subscriptions (§5.6). A relay
+  without them never filters: do not send `STREAM_SUBSCRIBE` to it, and treat `maxSubscriptions` as 0.
 
 ---
 
@@ -197,6 +199,7 @@ Two framings share the socket:
 | `0x10` PROVISIONAL | server → client | `varstring stream`, `varstring deviceId`, `varstring clientFrameId`, `varbytes payload` |
 | `0x11` COMMITTED | server → client | `varuint seq`, `varstring stream`, `varstring deviceId`, `varstring clientFrameId`, `varbytes payload` |
 | `0x12` COMMIT_NOTICE | server → client | `varuint seq`, `varstring stream`, `varstring deviceId`, `varstring clientFrameId` (no payload; settles an earlier PROVISIONAL) |
+| `0x13` STREAM_SKIPPED | server → client | `varuint streamCount`, then per stream: `varstring stream`, `varuint n` (≥ 1), `varuint firstSeq`, `varuint delta` × (n−1) (seq[i] − seq[i−1], each > 0). Committed seqs this socket is not sent (§5.6) |
 
 A malformed APPEND closes the socket:
 
@@ -210,6 +213,7 @@ A close for a malformed APPEND is a client bug. Do not resend that frame.
 | Message | Effect |
 |---|---|
 | `{"type":"VAULT_PING","probeId":"<1–128 printable chars>"}` | Answered with VAULT_PONG. Send it after `liveness.idleMs` of silence. If no pong arrives within `timeoutMs`, reconnect. |
+| `{"type":"STREAM_SUBSCRIBE","streams":["b:…","c:…",…]}` | Replaces this socket's subscription set (§5.6). No ack; `STREAM_SUBSCRIBE_REJECTED` on invalid input. |
 
 ### 4.3 Control messages, server → client
 
@@ -220,6 +224,7 @@ A close for a malformed APPEND is a client bug. Do not resend that frame.
 | `STREAM_APPEND_REJECTED {stream, clientFrameId, code, seq?}` | `code`: `client_frame_id_conflict` (the id was used with different bytes or a different stream; `seq` is the stored row when known) or `write_forbidden`. Final: do not resend. |
 | `STREAM_PROVISIONAL_DROPPED {stream, deviceId, clientFrameId, reason}` | A PROVISIONAL you hold will never commit. `reason` is `commit_failed` or `client_frame_id_conflict`. Discard it. The origin resends if it can. |
 | `STREAM_RESEND {reason:"runtime_restarted", runtimeEpoch, head}` | The DO runtime restarted under this socket (hibernation wake or eviction). Appends that were buffered but not receipted may be gone. Resend every unacknowledged append. Discard PROVISIONALs older than this message that have no notice yet, and re-read the affected streams if needed. |
+| `STREAM_SUBSCRIBE_REJECTED {code, max}` | The last `STREAM_SUBSCRIBE` was refused and the previous set still applies. `code`: `invalid` (not an array, or a name that is not a valid stream name) or `too_many` (more than `max` = `maxSubscriptions` distinct names). |
 | `VAULT_PONG {probeId, documentId:"streams", vaultGeneration, runtimeEpoch, head}` | Liveness reply. `head` doubles as a cheap gap probe. |
 | `VAULT_BACKPRESSURE {reason:"relay_rate_limit"}` | Sent just before a **1013** close. |
 | `VAULT_ERROR {code:"durability_failed", message, stream, clientFrameIds}` | These appends were not committed (a storage error). Resend later. |
@@ -249,7 +254,7 @@ order.
 
 Only after the transaction returns does the server send, in this order:
 
-1. COMMITTED and COMMIT_NOTICE frames to the other sockets, in seq order;
+1. COMMITTED, COMMIT_NOTICE and STREAM_SKIPPED frames to the other sockets, in seq order (§5.6);
 2. one `STREAM_RECEIPTS` per origin socket.
 
 The invariant is: **durable before receipt, and no seq is visible before its commit.**
@@ -259,11 +264,11 @@ the round trip for an isolated append (leading edge).
 
 ### 5.2 Provisional broadcast (`b:*`, `c:*`)
 
-A `b:`/`c:` APPEND is sent at once as PROVISIONAL to every other streams socket that is open at that moment, then
-buffered. Every PROVISIONAL is later settled on that socket by exactly one of:
+A `b:`/`c:` APPEND is sent at once as PROVISIONAL to every other streams socket that is open at that moment and
+wants the stream (§5.6: every socket that has not subscribed), then buffered. Every PROVISIONAL is later settled on that socket by exactly one of:
 
 - a `COMMIT_NOTICE` carrying the seq;
-- `STREAM_PROVISIONAL_DROPPED`;
+- `STREAM_PROVISIONAL_DROPPED` (sent only to the sockets that were sent the PROVISIONAL);
 - the socket closing;
 - a `STREAM_RESEND` (runtime restart; the buffer is gone).
 
@@ -281,19 +286,24 @@ For a socket admitted with `VAULT_READY.head = H`:
   on the socket:
   - `STREAM_RECEIPTS` entry with `deduped:false` if the socket is the origin;
   - `COMMIT_NOTICE` if it holds the PROVISIONAL;
+  - a seq in a `STREAM_SKIPPED` run if it has subscribed and does not want the stream (§5.6);
   - `COMMITTED` otherwise.
   Seqs are contiguous, so **any gap means a bug or a lost socket**. Recover with feed + read (§9).
-  - `deduped:true` receipts are extra acknowledgements, not deliveries. Example: a second socket of the same device
-    re-sends a frame that is still pending. That socket gets the peer delivery and also a deduped receipt.
+  - `deduped:true` receipts are extra acknowledgements. Example: a second socket of the same device re-sends a
+    frame that is still pending. That socket is a duplicate waiter: like the origin, it gets only the (deduped)
+    receipt, no COMMITTED, notice or skip for that frame. A PROVISIONAL it got for the frame before its resend is
+    settled by that receipt.
 - **Ordering.**
-  - COMMITTED frames arrive in strictly increasing seq order.
+  - COMMITTED frames, new-row notices and skipped seqs arrive in strictly increasing seq order, and every one of
+    them for a commit arrives before that commit's `STREAM_RECEIPTS` on the same socket.
   - Notices for new rows are in order. A notice for a frame that was store-deduped (a peer re-sent an old
     `b:` frame) may carry an **older** seq. Treat it as a settle, not as progress.
   - PROVISIONALs follow arrival order at the DO and interleave freely with commits.
 - **No echo.** The origin socket never receives its own frames back. Other sockets of the same device do, so
   filter on `deviceId` if needed.
 - **No re-delivery.** A deduplicated resend of a commit-only frame is not re-delivered to peers.
-- **No filtering.** Every streams socket receives every stream. There is no subscription filter.
+- **Filtering only by subscription.** A socket that never sent `STREAM_SUBSCRIBE` receives every stream. A
+  subscribed socket receives payloads as §5.6 says, and every other seq as skipped.
 
 ### 5.4 Idempotency, resend and conflicts
 
@@ -323,6 +333,51 @@ For a socket admitted with `VAULT_READY.head = H`:
   restarted runtime sends `STREAM_RESEND`.
 - A graceful drain commits the buffer first. Sockets then close with 1001.
 - A deploy of new Worker code drops all sockets (1001 or 1006). Reconnect.
+
+### 5.6 Subscriptions (per-stream live push)
+
+Normative. Code: `server/src/streams/relay.ts` (`subscribe`, `wants`, `flush`), `protocol.ts` (`encodeSkipped`).
+
+- **Capability.** `VAULT_READY.capabilities.subscriptions: 1` and `limits.maxSubscriptions: 128`. Both directions
+  are additive: an old client never subscribes and is served exactly as before; a client must not subscribe on a
+  relay without the capability.
+- **Set.** `STREAM_SUBSCRIBE {streams}` replaces the socket's whole set (idempotent, safe to resend). It is
+  allowed on read-only sockets and charged to the device's rate bucket like any message.
+  - `streams` must be an array of valid stream names (§11.1) with at most `maxSubscriptions` distinct entries;
+    repeats count once. Otherwise `STREAM_SUBSCRIBE_REJECTED {code: "invalid" | "too_many", max}`, and the
+    previous set (or "all") stays.
+  - Names without a `b:`/`c:` prefix are stored and have no effect: those streams are always pushed.
+  - It takes effect for frames admitted and commits flushed after the relay handles the message. There is no ack;
+    a later `VAULT_PING` answered by `VAULT_PONG` proves it was handled.
+- **wants(socket, row)** is true when any of these holds:
+  - the socket has no set ("all");
+  - the stream is not `b:`/`c:`;
+  - the set contains the stream;
+  - the row's `deviceId` is the socket's own device (the device's other sockets get its rows, so receipts lost
+    with an earlier socket are never deferred).
+- **PROVISIONAL** goes only where wants holds. The relay records each frame's recipients; COMMIT_NOTICE and
+  `STREAM_PROVISIONAL_DROPPED` go to those recipients only.
+- **Per commit, per socket, in frame (seq) order.** The origin and every duplicate waiter of a frame get only
+  receipts. Every other socket gets:
+  1. `COMMIT_NOTICE` if it was sent the PROVISIONAL (even if it has since unsubscribed);
+  2. else, for a newly appended row it wants, `COMMITTED` (also when it subscribed after the PROVISIONAL went out);
+  3. else, for a newly appended row it does not want, the seq is added to its pending skip run;
+  4. a store-deduped row (§5.3) is neither COMMITTED nor skipped, as before.
+
+  The pending run is sent as one `STREAM_SKIPPED` before the socket's next COMMITTED or COMMIT_NOTICE, and once
+  after the commit's last frame, before any `STREAM_RECEIPTS`. So each socket sees every seq once, ascending.
+  Within one frame, streams appear in order of their first seq and seqs ascend. A commit may produce several
+  STREAM_SKIPPED frames for one socket, interleaved with its live frames.
+- **Client handling.** A skipped `(stream, seq)` accounts that seq for the cursor exactly like a delivery, and
+  marks the stream stale: read it (§7) when it needs to be current. Subscribing does not make a stream current:
+  rows committed before the relay handled the subscribe were skipped.
+- **Persistence.** The set lives in relay memory and, when the JSON encoding of its names is at most 1024 UTF-8
+  bytes (`SUBSCRIPTION_ATTACHMENT_BYTES`), in the socket attachment as `subs`. A larger set is persisted as
+  `subs: null, subsOverflow: true`. A new runtime that adopts the socket (hibernation wake, eviction) restores the
+  persisted set; an overflowed set falls back to "all". A runtime restart always comes with
+  `STREAM_RESEND {runtime_restarted}`, and the client resends its set on every `STREAM_RESEND` (cheap, and it
+  covers overflow). Falling back to "all" is always safe: it only moves rows from "pulled later" to "pushed now". There is no `STREAM_SUBSCRIPTION_RESET`.
+- **Counters** (`diagnostics().counters`): `skippedRows`, `skipFrames`, `subscribes`, `subscribeRejects`.
 
 ---
 
@@ -424,13 +479,15 @@ cannot check this.
 
 1. `GET /api/capabilities`, then `streams === 1`.
 2. Get a ticket, connect, and wait for `VAULT_READY`. Note `vaultEpoch` and `head = H`. Buffer live frames from
-   here on.
+   here on. If `capabilities.subscriptions` is 1, send `STREAM_SUBSCRIBE` with the streams you need live (§5.6),
+   and resend it after every `STREAM_RESEND`.
 3. If `vaultEpoch` differs from the stored one, drop all cursors.
 4. Feed from the stored vault cursor `C` up to `nextAfter = null`. For every stream you track whose
    `lastSeq > its cursor`, page `read` from that stream's cursor. Always track `ns`.
 5. Apply the buffered live frames, skipping seqs ≤ the stream cursor you already hold. Then set `C = max(H, feed head)`.
 6. Live:
    - apply COMMITTED;
+   - account STREAM_SKIPPED seqs and mark their streams stale (§5.6);
    - settle PROVISIONALs on NOTICE or DROPPED;
    - drop your outbox entries on receipts.
    - If you detect a gap (a seq jump), a `STREAM_RESEND`, or a reconnect, return to step 4 from `C`.
@@ -467,6 +524,7 @@ cannot check this.
 | Feed page | default 1000, max 5000 streams |
 | Read page | default 1 MiB, max 4 MiB payload (JSON base64 adds about 33%) |
 | Batched read | 128 streams per request (`readBatchMaxStreams`), one page budget for the batch |
+| Subscription set | 128 distinct streams per socket (`maxSubscriptions`); persisted across a wake up to 1024 bytes of names (§5.6) |
 | Streams sockets per vault | 1000 (`YAOS_STREAMS_MAX_SOCKETS`) |
 | Rate gate (per socket) | Token bucket of 256 KiB/s with a 2 MiB burst, charged on raw received bytes (text counted in UTF-16 units). Overdraft gives 1013. |
 | Group commit | 300 ms idle / 1500 ms max / 64 KiB; 20 ms leading edge after 1500 ms without a commit |
@@ -730,31 +788,35 @@ export const STREAM_FRAME_APPEND = 0x01;        // client -> server
 export const STREAM_FRAME_PROVISIONAL = 0x10;   // server -> client
 export const STREAM_FRAME_COMMITTED = 0x11;
 export const STREAM_FRAME_COMMIT_NOTICE = 0x12;
+export const STREAM_FRAME_SKIPPED = 0x13;
 
 export interface AppendFrame { stream: string; clientFrameId: string; payload: Uint8Array }
 export type ServerStreamFrame =
   | { kind: "provisional"; stream: string; deviceId: string; clientFrameId: string; payload: Uint8Array }
   | { kind: "committed"; seq: number; stream: string; deviceId: string; clientFrameId: string; payload: Uint8Array }
-  | { kind: "notice"; seq: number; stream: string; deviceId: string; clientFrameId: string };
+  | { kind: "notice"; seq: number; stream: string; deviceId: string; clientFrameId: string }
+  | { kind: "skipped"; runs: Array<{ stream: string; seqs: number[] }> };  // seqs ascending, ≥ 1 per run
 
 // ---- control (text frames: "__YPS:" + JSON) ----
 export interface StreamLimits {
   maxStreamNameBytes: number; maxClientFrameIdBytes: number; maxPayloadBytes: number;
   maxBinaryMessageBytes: number; maxTextMessageBytes: number; maxCheckpointBytes: number;
   feedDefaultLimit: number; feedMaxLimit: number; readDefaultBytes: number; readMaxBytes: number;
-  readBatchMaxStreams: number; rateBytesPerSec: number; burstBytes: number;
+  readBatchMaxStreams: number; maxSubscriptions: number; rateBytesPerSec: number; burstBytes: number;
   groupCommit: { idleMs: number; maxMs: number; maxBytes: number; minIntervalMs: number; leadMs: number; quietMs: number };
 }
 export interface VaultReady {
   type: "VAULT_READY"; documentId: "streams"; socketSessionId: string;
   vaultId: string; vaultGeneration: string; vaultEpoch: string; runtimeEpoch: string; head: number;
   liveness: { version: 1; idleMs: number; timeoutMs: number };
-  capabilities: { streams: 1 }; limits: StreamLimits; canWrite: boolean;
+  capabilities: { streams: 1; subscriptions?: 1 }; limits: StreamLimits; canWrite: boolean;
   principalId: string; deviceId: string; role: "owner" | "member";
   membershipRevision: number; deviceCredentialRevision: number; policyVersion: number; capabilityDigest: string;
 }
 export interface StreamReceipt { stream: string; clientFrameId: string; seq: number; deduped: boolean }
-export type ClientControl = { type: "VAULT_PING"; probeId: string };
+export type ClientControl =
+  | { type: "VAULT_PING"; probeId: string }
+  | { type: "STREAM_SUBSCRIBE"; streams: string[] };
 export type ServerControl =
   | VaultReady
   | { type: "STREAM_RECEIPTS"; head: number; receipts: StreamReceipt[] }
@@ -762,6 +824,7 @@ export type ServerControl =
       code: "client_frame_id_conflict" | "write_forbidden"; seq?: number }
   | { type: "STREAM_PROVISIONAL_DROPPED"; stream: string; deviceId: string; clientFrameId: string;
       reason: "commit_failed" | "client_frame_id_conflict" }
+  | { type: "STREAM_SUBSCRIBE_REJECTED"; code: "invalid" | "too_many"; max: number }
   | { type: "STREAM_RESEND"; reason: "runtime_restarted"; runtimeEpoch: string; head: number }
   | { type: "VAULT_PONG"; probeId: string; documentId: "streams"; vaultGeneration: string; runtimeEpoch: string; head: number }
   | { type: "VAULT_BACKPRESSURE"; reason: "relay_rate_limit" }

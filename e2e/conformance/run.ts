@@ -28,6 +28,7 @@ import { tests as commit } from "./tests/commit.ts";
 import { tests as operator } from "./tests/operator.ts";
 import { tests as flags } from "./tests/flags.ts";
 import { tests as revoke } from "./tests/revoke.ts";
+import { tests as subscribe } from "./tests/subscribe.ts";
 
 function arg(name: string): string | undefined {
 	const index = process.argv.indexOf(`--${name}`);
@@ -47,10 +48,11 @@ const STARTED = new Date();
 const STAMP = STARTED.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
 
 // Order matters: shared fixtures first, destructive / revoking tests last.
-const ALL: TestDef[] = [...happy, ...onboarding, ...socket, ...checkpoint, ...misc, ...commit, ...operator, ...flags, ...revoke];
+const ALL: TestDef[] = [...happy, ...onboarding, ...socket, ...checkpoint, ...misc, ...commit, ...operator, ...flags, ...subscribe, ...revoke];
 const ORDER = ["T-HAPPY", "T-READY-SHAPE", "T-MININTERVAL-READY", "T-PAIR-FORMAT", "T-PAIR-MALFORMED", "T-PAIR-UNKNOWN-VAULT", "T-PAIR-USED",
 	"T-TICKET-CROSS-VAULT", "T-TICKET-BAD", "T-CODEC-UTF8", "T-CODEC-SURROGATE", "T-CODEC-OVERLONG", "T-CODEC-NONMINIMAL", "T-CODEC-TRAILING",
-	"T-CODEC-VALID", "T-OVERSIZE-1009", "T-TWO-SOCKETS", "T-DEDUPE-CONFLICT", "T-MININTERVAL-TIMING", "T-EPOCH-MISMATCH", "T-EPOCH-MATCH",
+	"T-CODEC-VALID", "T-OVERSIZE-1009", "T-TWO-SOCKETS", "T-DEDUPE-CONFLICT", "T-SUBSCRIBE-READY", "T-SUBSCRIBE-FILTER",
+	"T-SUBSCRIBE-ORDER", "T-SUBSCRIBE-REJECT", "T-MININTERVAL-TIMING", "T-EPOCH-MISMATCH", "T-EPOCH-MATCH",
 	"T-EPOCH-ABSENT", "T-CKPT-MULTICHUNK", "T-RETIRED-GC", "T-PARTIAL-GC", "T-BLOB-OPAQUE", "T-BLOB-UNAVAILABLE", "T-DAILY", "T-DEDUPE-LARGE",
 	"T-DEDUPE-SMALL", "T-RATE-SOCKET", "T-RATE-DEVICE", "T-SOCKET-CAP-DEVICE", "T-DEVICES-LIST", "T-REVOKE-GATE", "T-REVOKE-SILENCE",
 	"T-REVOKE-BUFFER", "T-REVOKE-4403", "T-REVOKE-401", "T-RESET",

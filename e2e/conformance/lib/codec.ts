@@ -10,6 +10,7 @@ export const APPEND = 0x01;
 export const PROVISIONAL = 0x10;
 export const COMMITTED = 0x11;
 export const NOTICE = 0x12;
+export const SKIPPED = 0x13;
 
 export class Writer {
 	bytes: number[] = [];
@@ -86,13 +87,17 @@ export function rawAppend(fields: { streamLen?: number[]; stream: ArrayLike<numb
 
 export function utf8Bytes(value: string): Uint8Array { return utf8.encode(value); }
 
+export interface SkippedRun { stream: string; seqs: number[] }
+
+/** A STREAM_SKIPPED frame has seq null, empty identity strings, payload null and its `runs`. */
 export interface ServerFrame {
-	kind: "provisional" | "committed" | "notice";
+	kind: "provisional" | "committed" | "notice" | "skipped";
 	seq: number | null;
 	stream: string;
 	deviceId: string;
 	clientFrameId: string;
 	payload: Uint8Array | null;
+	runs?: SkippedRun[];
 }
 
 /** Decodes one server -> client binary message. Throws on malformed input (incl. invalid UTF-8 / trailing bytes). */
@@ -111,6 +116,22 @@ export function decodeServerFrame(bytes: Uint8Array): ServerFrame {
 		frame = kind === COMMITTED
 			? { kind: "committed", seq, stream, deviceId, clientFrameId, payload: r.varBytes() }
 			: { kind: "notice", seq, stream, deviceId, clientFrameId, payload: null };
+	} else if (kind === SKIPPED) {
+		// relay-wire §5.6: varuint streamCount, then per stream varstring | varuint n | varuint firstSeq | varuint delta×(n-1).
+		const runs: SkippedRun[] = [];
+		for (let streams = r.varUint(); streams > 0; streams--) {
+			const stream = r.varString();
+			const count = r.varUint();
+			if (count < 1) throw new Error("empty skipped run");
+			const seqs = [r.varUint()];
+			for (let i = 1; i < count; i++) {
+				const delta = r.varUint();
+				if (delta < 1) throw new Error("non-ascending skipped run");
+				seqs.push(seqs[i - 1]! + delta);
+			}
+			runs.push({ stream, seqs });
+		}
+		frame = { kind: "skipped", seq: null, stream: "", deviceId: "", clientFrameId: "", payload: null, runs };
 	} else {
 		throw new Error(`unknown server frame kind ${kind}`);
 	}

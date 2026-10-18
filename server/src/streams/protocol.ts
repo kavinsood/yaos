@@ -38,6 +38,14 @@ export const STREAM_READ_BATCH_MAX_STREAMS = 128;
 export const MAX_STREAM_SOCKETS = 1000;
 /** H6: concurrent streams sockets per device; a 5th connect closes the device's oldest (1001 `device_socket_limit`). */
 export const MAX_STREAM_SOCKETS_PER_DEVICE = 4;
+/** Streams in one STREAM_SUBSCRIBE set (after dedupe); VAULT_READY `limits.maxSubscriptions`. */
+export const MAX_STREAM_SUBSCRIPTIONS = 128;
+/**
+ * A subscription set is persisted in the socket attachment (it survives a hibernation wake) only while its JSON
+ * encoding is at most this many UTF-8 bytes; a larger set is kept in memory and persisted as overflow ("all" after a
+ * wake, until the client resends). The attachment itself is capped at 2,048 bytes and carries about 450 already.
+ */
+export const SUBSCRIPTION_ATTACHMENT_BYTES = 1024;
 
 /** Client -> server binary frame kinds (byte 0). */
 export const STREAM_FRAME_APPEND = 0x01;
@@ -45,6 +53,7 @@ export const STREAM_FRAME_APPEND = 0x01;
 export const STREAM_FRAME_PROVISIONAL = 0x10;
 export const STREAM_FRAME_COMMITTED = 0x11;
 export const STREAM_FRAME_COMMIT_NOTICE = 0x12;
+export const STREAM_FRAME_SKIPPED = 0x13;
 
 /**
  * Streams whose frames are broadcast before the commit (PROVISIONAL, then a
@@ -201,10 +210,34 @@ export function encodeCommitNotice(frame: StreamFrameIdentity & { seq: number })
 	return encoding.toUint8Array(encoder);
 }
 
+/** One stream's run in a STREAM_SKIPPED frame: seqs strictly ascending, at least one. */
+export interface SkippedRun {
+	stream: string;
+	seqs: number[];
+}
+
+/**
+ * 0x13 STREAM_SKIPPED: `varuint streamCount`, then per stream `varstring stream | varuint n | varuint firstSeq |
+ * varuint delta×(n-1)`. The caller orders `runs` by first seq; seqs ascend within a run (every delta > 0).
+ */
+export function encodeSkipped(runs: readonly SkippedRun[]): Uint8Array {
+	const encoder = encoding.createEncoder();
+	encoding.writeUint8(encoder, STREAM_FRAME_SKIPPED);
+	encoding.writeVarUint(encoder, runs.length);
+	for (const run of runs) {
+		encoding.writeVarString(encoder, run.stream);
+		encoding.writeVarUint(encoder, run.seqs.length);
+		encoding.writeVarUint(encoder, run.seqs[0]!);
+		for (let index = 1; index < run.seqs.length; index++) encoding.writeVarUint(encoder, run.seqs[index]! - run.seqs[index - 1]!);
+	}
+	return encoding.toUint8Array(encoder);
+}
+
 export type ServerStreamFrame =
 	| ({ kind: "provisional"; payload: Uint8Array } & StreamFrameIdentity)
 	| ({ kind: "committed"; seq: number; payload: Uint8Array } & StreamFrameIdentity)
-	| ({ kind: "notice"; seq: number } & StreamFrameIdentity);
+	| ({ kind: "notice"; seq: number } & StreamFrameIdentity)
+	| { kind: "skipped"; runs: SkippedRun[] };
 
 /** Decodes one server -> client binary message (tests and tooling). Throws on malformed input. */
 export function decodeServerFrame(bytes: Uint8Array): ServerStreamFrame {
@@ -224,6 +257,22 @@ export function decodeServerFrame(bytes: Uint8Array): ServerStreamFrame {
 		return kind === STREAM_FRAME_COMMITTED
 			? { kind: "committed", seq, stream, deviceId, clientFrameId, payload: decoding.readVarUint8Array(decoder) }
 			: { kind: "notice", seq, stream, deviceId, clientFrameId };
+	}
+	if (kind === STREAM_FRAME_SKIPPED) {
+		const runs: SkippedRun[] = [];
+		for (let streams = decoding.readVarUint(decoder); streams > 0; streams--) {
+			const stream = decoding.readVarString(decoder);
+			const count = decoding.readVarUint(decoder);
+			if (count < 1) throw new Error("empty skipped run");
+			const seqs = [decoding.readVarUint(decoder)];
+			for (let index = 1; index < count; index++) {
+				const delta = decoding.readVarUint(decoder);
+				if (delta < 1) throw new Error("non-ascending skipped run");
+				seqs.push(seqs[index - 1]! + delta);
+			}
+			runs.push({ stream, seqs });
+		}
+		return { kind: "skipped", runs };
 	}
 	throw new Error(`unknown server stream frame kind ${kind}`);
 }

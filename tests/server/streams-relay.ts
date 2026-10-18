@@ -14,6 +14,7 @@ import type { SocketPort, SocketRegistryPort, StoragePort, TimerPort } from "../
 import {
 	MAX_STREAM_BINARY_MESSAGE_BYTES,
 	MAX_STREAM_PAYLOAD_BYTES,
+	MAX_STREAM_SUBSCRIPTIONS,
 	decodeAppendFrame,
 	decodeRows,
 	decodeServerFrame,
@@ -22,6 +23,7 @@ import {
 	encodeCommitted,
 	encodeProvisional,
 	encodeRow,
+	encodeSkipped,
 } from "../../server/src/streams/protocol";
 import {
 	DEFAULT_STREAM_RELAY_CONFIG,
@@ -50,6 +52,8 @@ type Control = Record<string, unknown> & { type: string };
 class FakeSocket implements SocketPort {
 	readonly binary: Uint8Array[] = [];
 	readonly controls: Control[] = [];
+	/** Every message in send order: a binary frame's kind (`skipped`, `committed`, ...) or a control's type. */
+	readonly timeline: string[] = [];
 	closed: { code?: number; reason?: string } | null = null;
 	attachment: unknown = null;
 	close(code?: number, reason?: string): void { this.closed ??= { code, reason }; }
@@ -60,15 +64,26 @@ class FakeSocket implements SocketPort {
 		if (typeof message === "string") {
 			assert.ok(message.startsWith("__YPS:"), "control frames carry the __YPS: prefix");
 			this.controls.push(JSON.parse(message.slice(6)) as Control);
+			this.timeline.push(this.controls.at(-1)!.type);
 		} else {
 			const view = message instanceof ArrayBuffer ? new Uint8Array(message)
 				: new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
 			this.binary.push(view.slice());
+			this.timeline.push(decodeServerFrame(view).kind);
 		}
 	}
 	all(type: string): Control[] { return this.controls.filter((value) => value.type === type); }
 	last(type: string): Control | undefined { return this.all(type).at(-1); }
 	frames() { return this.binary.map((bytes) => decodeServerFrame(bytes)); }
+	/** Every seq this socket was told about, per stream, in arrival order (live frames and skipped runs). */
+	seqs(): Record<string, number[]> {
+		const out: Record<string, number[]> = {};
+		for (const frame of this.frames()) {
+			if (frame.kind === "skipped") for (const run of frame.runs) (out[run.stream] ??= []).push(...run.seqs);
+			else if (frame.kind !== "provisional") (out[frame.stream] ??= []).push(frame.seq);
+		}
+		return out;
+	}
 	receipts(): Array<{ stream: string; clientFrameId: string; seq: number; deduped: boolean }> {
 		return this.all("STREAM_RECEIPTS").flatMap((value) => value.receipts as never[]);
 	}
@@ -121,6 +136,8 @@ interface Harness {
 	failWrites: { on: boolean };
 	connect(actor?: StreamActor, canWrite?: boolean): FakeSocket;
 	append(socket: FakeSocket, stream: string, clientFrameId: string, payload: Uint8Array | string): void;
+	/** Sends STREAM_SUBSCRIBE with `streams` as is. */
+	subscribe(socket: FakeSocket, streams: unknown): void;
 	/** A new runtime over the same storage and sockets (hibernation wake / eviction). */
 	fresh(runtimeEpoch: string): StreamRelayService;
 }
@@ -180,6 +197,9 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 		append(socket, stream, clientFrameId, payload) {
 			const frame = encodeAppendFrame({ stream, clientFrameId, payload: typeof payload === "string" ? bytes(payload) : payload });
 			harness.service.message(socket, arrayBuffer(frame));
+		},
+		subscribe(socket, streams) {
+			harness.service.message(socket, `__YPS:${JSON.stringify({ type: "STREAM_SUBSCRIBE", streams })}`);
 		},
 		fresh(runtimeEpoch) { harness.service = make(runtimeEpoch); return harness.service; },
 	};
@@ -248,7 +268,8 @@ s.test("append: VAULT_READY, provisional b:, committed ns, contiguous seqs, rece
 		assert.equal(ready.vaultEpoch, GENERATION);
 		assert.equal(ready.head, 0);
 		assert.equal(ready.canWrite, true);
-		assert.deepEqual(ready.capabilities, { streams: 1 });
+		assert.deepEqual(ready.capabilities, { streams: 1, subscriptions: 1 });
+		assert.equal((ready.limits as Record<string, unknown>).maxSubscriptions, MAX_STREAM_SUBSCRIPTIONS);
 		assert.equal((ready.limits as Record<string, unknown>).maxPayloadBytes, MAX_STREAM_PAYLOAD_BYTES);
 		append(a, "ns", "a-1", "ns-one");
 		append(a, "b:doc-1", "a-2", "body-one");
@@ -267,7 +288,7 @@ s.test("append: VAULT_READY, provisional b:, committed ns, contiguous seqs, rece
 			{ stream: "ns", clientFrameId: "a-3", seq: 3, deduped: false },
 		]);
 		const frames = b.frames();
-		assert.deepEqual(frames.map((frame) => [frame.kind, "seq" in frame ? frame.seq : null, frame.stream]), [
+		assert.deepEqual(frames.map((frame) => [frame.kind, "seq" in frame ? frame.seq : null, "stream" in frame ? frame.stream : null]), [
 			["provisional", null, "b:doc-1"], ["committed", 1, "ns"], ["notice", 2, "b:doc-1"], ["committed", 3, "ns"],
 		]);
 		const ns = frames[1]!;
@@ -382,7 +403,7 @@ s.test("dedupe: pending resend shares the receipt, reconnect resend is deduped f
 			{ stream: "ns", clientFrameId: "f-3", seq: 3, deduped: false },
 		]);
 		assert.equal(store.head(), 3, "no new seq for deduped resends");
-		const fresh = b.frames().slice(before).map((frame) => [frame.kind, "seq" in frame ? frame.seq : null, frame.clientFrameId]);
+		const fresh = b.frames().slice(before).map((frame) => [frame.kind, "seq" in frame ? frame.seq : null, "clientFrameId" in frame ? frame.clientFrameId : null]);
 		assert.deepEqual(fresh, [["provisional", null, "f-1"], ["notice", 1, "f-1"], ["committed", 3, "f-3"]],
 			"a deduped ns resend is not re-delivered; a re-broadcast provisional is settled with its old seq");
 		append(a2, "ns", "f-2", "tampered");
@@ -408,6 +429,207 @@ s.test("late joiner: a socket admitted after the provisional gets COMMITTED, ear
 		assert.deepEqual(b.frames().map((frame) => frame.kind), ["provisional", "notice"]);
 		const [only] = c.frames();
 		assert.ok(only?.kind === "committed" && only.seq === 1 && text(only.payload) === "canvas-update");
+	});
+});
+
+// ---- subscriptions --------------------------------------------------------------
+
+s.test("codec: STREAM_SKIPPED carries per-stream ascending runs as first seq + deltas", () => {
+	const runs = [{ stream: "b:x", seqs: [3, 4, 9] }, { stream: "c:é", seqs: [5] }];
+	const encoded = encodeSkipped(runs);
+	assert.deepEqual([...encoded.subarray(0, 6)], [0x13, 2, 3, ...bytes("b:x")]);
+	assert.deepEqual(decodeServerFrame(encoded), { kind: "skipped", runs });
+	assert.throws(() => decodeServerFrame(new Uint8Array([0x13, 1, 1, 0x78, 2, 5, 0])), /non-ascending/);
+});
+
+s.test("subscriptions: filtered fanout; unsubscribed b:/c: rows become skip runs; vault-global streams always pushed", async () => {
+	await withStreams(({ connect, append, subscribe, timers, service }) => {
+		const a = connect(ownerA);
+		const none = connect(deviceB);
+		const all = connect(deviceC);
+		const some = connect({ ...ownerA, deviceId: "device-d" });
+		subscribe(none, []);
+		subscribe(some, ["b:x", "ns"]);
+		append(a, "b:x", "f-1", "x1");
+		append(a, "b:y", "f-2", "y1");
+		append(a, "ns", "f-3", "ns1");
+		append(a, "b:y", "f-4", "y2");
+		append(a, "c:z", "f-5", "z1");
+		append(a, "b:x", "f-6", "x2");
+		assert.deepEqual(none.frames(), [], "no PROVISIONAL for unsubscribed streams");
+		assert.deepEqual(some.frames().map((frame) => frame.kind === "provisional" && frame.clientFrameId), ["f-1", "f-6"]);
+		assert.equal(all.frames().length, 5, "an unsubscribed socket gets every PROVISIONAL");
+		timers.advance(300);
+		assert.deepEqual(none.frames().map((frame) => frame.kind === "committed" ? ["committed", frame.seq] : frame), [
+			{ kind: "skipped", runs: [{ stream: "b:x", seqs: [1] }, { stream: "b:y", seqs: [2] }] },
+			["committed", 3],
+			{ kind: "skipped", runs: [{ stream: "b:y", seqs: [4] }, { stream: "c:z", seqs: [5] }, { stream: "b:x", seqs: [6] }] },
+		]);
+		assert.deepEqual(some.timeline.slice(-5), ["notice", "skipped", "committed", "skipped", "notice"]);
+		assert.deepEqual(some.seqs(), { "b:x": [1, 6], "b:y": [2, 4], ns: [3], "c:z": [5] });
+		assert.deepEqual(all.frames().slice(5).map((frame) => frame.kind), ["notice", "notice", "committed", "notice", "notice", "notice"]);
+		assert.deepEqual(a.binary, [], "the origin still gets no echo");
+		assert.equal(a.receipts().length, 6);
+		const { skippedRows, skipFrames, subscribes, subscribeRejects } = service.counters;
+		assert.deepEqual({ skippedRows, skipFrames, subscribes, subscribeRejects },
+			{ skippedRows: 5 + 3, skipFrames: 2 + 2, subscribes: 2, subscribeRejects: 0 });
+		assert.deepEqual(service.diagnostics().counters.skippedRows, 8, "surfaced in diagnostics");
+	});
+});
+
+s.test("subscriptions: per-socket seqs ascend when a PROVISIONAL for a later frame follows a skip; skips precede receipts", async () => {
+	await withStreams(({ connect, append, subscribe, timers }) => {
+		const a = connect(ownerA);
+		const b = connect(deviceB);
+		subscribe(b, []);
+		append(a, "b:x", "f-1", "one");
+		subscribe(b, ["b:x"]);
+		append(a, "b:x", "f-2", "two");
+		append(b, "b:mine", "g-1", "own");
+		append(a, "b:x", "f-3", "three");
+		subscribe(b, []);
+		append(a, "b:x", "f-4", "four");
+		timers.advance(300);
+		assert.deepEqual(b.timeline.slice(1), ["provisional", "provisional", "skipped", "notice", "notice", "skipped",
+			"STREAM_RECEIPTS"], "the pending skip run goes out before the next live frame and before the receipts");
+		assert.deepEqual(b.seqs(), { "b:x": [1, 2, 4, 5] });
+		assert.deepEqual(b.receipts(), [{ stream: "b:mine", clientFrameId: "g-1", seq: 3, deduped: false }]);
+	});
+});
+
+s.test("subscriptions: own device's other sockets get its rows; origin and duplicate waiters get only receipts", async () => {
+	await withStreams(({ connect, append, subscribe, timers }) => {
+		const a = connect(ownerA);
+		const a2 = connect(ownerA);
+		const b = connect(deviceB);
+		subscribe(a2, []);
+		subscribe(b, []);
+		append(a, "b:x", "f-1", "one");
+		assert.equal(a2.frames()[0]?.kind, "provisional", "own device: wanted regardless of the set");
+		const a3 = connect(ownerA);
+		subscribe(a3, []);
+		append(a, "c:y", "f-2", "two");
+		append(a2, "c:y", "f-2", "two"); // a resend from the device's other socket: a duplicate waiter
+		timers.advance(300);
+		assert.deepEqual(a2.timeline.slice(1).filter((type) => type !== "STREAM_RECEIPTS"), ["provisional", "provisional", "notice"],
+			"no notice, COMMITTED or skip for the frame a2 waits on");
+		assert.deepEqual(a2.receipts(), [{ stream: "c:y", clientFrameId: "f-2", seq: 2, deduped: true }]);
+		assert.deepEqual(a3.frames().map((frame) => [frame.kind, "seq" in frame ? frame.seq : null]),
+			[["provisional", null], ["committed", 1], ["notice", 2]],
+			"admitted after f-1's PROVISIONAL: COMMITTED, never a skip, for its own device");
+		assert.deepEqual(b.frames(), [{ kind: "skipped", runs: [{ stream: "b:x", seqs: [1] }, { stream: "c:y", seqs: [2] }] }]);
+	});
+});
+
+s.test("subscriptions: a set change between PROVISIONAL and commit: subscribe → COMMITTED, unsubscribe → notice", async () => {
+	await withStreams(({ connect, append, subscribe, timers }) => {
+		const a = connect(ownerA);
+		const late = connect(deviceB);
+		const leaving = connect(deviceC);
+		subscribe(late, []);
+		append(a, "b:x", "f-1", "one");
+		subscribe(late, ["b:x"]);
+		subscribe(leaving, []);
+		timers.advance(300);
+		const [committed] = late.frames();
+		assert.ok(committed?.kind === "committed" && committed.seq === 1 && text(committed.payload) === "one");
+		assert.deepEqual(leaving.frames().map((frame) => frame.kind), ["provisional", "notice"],
+			"the holder of the PROVISIONAL is settled, not skipped");
+	});
+});
+
+s.test("subscriptions: STREAM_PROVISIONAL_DROPPED goes only to PROVISIONAL recipients (conflict, failed commit, revoke)", async () => {
+	await withStreams(({ connect, append, subscribe, timers, failWrites, latch, revoked, service }) => {
+		const a = connect(ownerA);
+		const skipper = connect(deviceB);
+		const holder = connect(deviceC);
+		subscribe(skipper, []);
+		append(a, "b:x", "f-1", "one");
+		timers.advance(300);
+		append(a, "b:x", "f-1", "conflicting");
+		timers.advance(300);
+		assert.equal(a.last("STREAM_APPEND_REJECTED")?.code, "client_frame_id_conflict");
+		assert.equal(holder.all("STREAM_PROVISIONAL_DROPPED").length, 1);
+		append(a, "b:x", "f-2", "two");
+		failWrites.on = true;
+		timers.advance(300);
+		failWrites.on = false;
+		latch.clear();
+		assert.equal(holder.all("STREAM_PROVISIONAL_DROPPED").length, 2);
+		append(a, "b:x", "f-3", "three");
+		revoked.add("device-a");
+		service.revokeDevice("device-a");
+		assert.equal(holder.all("STREAM_PROVISIONAL_DROPPED").length, 3);
+		assert.deepEqual(skipper.all("STREAM_PROVISIONAL_DROPPED"), []);
+		assert.deepEqual(skipper.frames(), [{ kind: "skipped", runs: [{ stream: "b:x", seqs: [1] }] }]);
+	});
+});
+
+s.test("subscriptions: invalid and too_many are rejected and keep the set; duplicates count once; read-only may subscribe", async () => {
+	await withStreams(({ connect, append, subscribe, timers, service }) => {
+		const a = connect(ownerA);
+		const b = connect(deviceB, false);
+		subscribe(b, ["b:keep"]);
+		const many = Array.from({ length: MAX_STREAM_SUBSCRIPTIONS + 1 }, (_, index) => `b:${index}`);
+		for (const streams of [null, "b:x", [""], ["b:x", 7], ["x".repeat(257)]]) subscribe(b, streams);
+		subscribe(b, many);
+		assert.deepEqual(b.all("STREAM_SUBSCRIBE_REJECTED").map((value) => value.code),
+			["invalid", "invalid", "invalid", "invalid", "invalid", "too_many"]);
+		assert.equal(b.last("STREAM_SUBSCRIBE_REJECTED")!.max, MAX_STREAM_SUBSCRIPTIONS);
+		assert.equal(service.counters.subscribeRejects, 6);
+		append(a, "b:keep", "f-1", "kept");
+		append(a, "b:other", "f-2", "skipped");
+		timers.advance(300);
+		assert.deepEqual(b.timeline.filter((type) => type !== "STREAM_SUBSCRIBE_REJECTED").slice(1),
+			["provisional", "notice", "skipped"], "the previous set still applies");
+		subscribe(b, [...many.slice(0, MAX_STREAM_SUBSCRIPTIONS), ...many.slice(0, 10)]);
+		assert.equal(b.all("STREAM_SUBSCRIBE_REJECTED").length, 6, "128 distinct names plus repeats are accepted");
+		assert.equal(b.closed, null);
+	});
+});
+
+s.test("subscriptions: persisted in the attachment and restored by a new runtime; an oversized set overflows to all", async () => {
+	await withStreams((harness) => {
+		const { connect, append, subscribe, timers } = harness;
+		const a = connect(ownerA);
+		const small = connect(deviceB);
+		const big = connect(deviceC);
+		subscribe(small, ["b:x"]);
+		const names = Array.from({ length: MAX_STREAM_SUBSCRIPTIONS }, (_, index) => `b:${"n".repeat(20)}-${index}`);
+		subscribe(big, names);
+		const smallAttachment = small.attachment as Record<string, unknown>;
+		assert.deepEqual([smallAttachment.subs, smallAttachment.subsOverflow, smallAttachment.deviceId], [["b:x"], undefined, "device-b"]);
+		const bigAttachment = big.attachment as Record<string, unknown>;
+		assert.deepEqual([bigAttachment.subs, bigAttachment.subsOverflow], [null, true]);
+		append(a, "b:y", "f-1", "one");
+		timers.advance(300);
+		assert.equal(big.frames()[0]?.kind, "skipped", "in memory the oversized set still filters");
+		const service = harness.fresh("runtime-b");
+		append(a, "b:y", "f-2", "two");
+		timers.advance(300);
+		assert.equal(small.last("STREAM_RESEND")?.runtimeEpoch, "runtime-b");
+		assert.deepEqual(small.frames().map((frame) => frame.kind), ["skipped", "skipped"], "restored on adopt");
+		assert.deepEqual(big.frames().slice(1).map((frame) => frame.kind), ["provisional", "notice"], "overflow: all after a wake");
+		assert.deepEqual((small.attachment as Record<string, unknown>).subs, ["b:x"], "the runtime update keeps subs");
+		subscribe(small, []);
+		assert.deepEqual((small.attachment as Record<string, unknown>).subs, []);
+		assert.equal(service.counters.subscribes, 1);
+	});
+});
+
+s.test("subscriptions: a socket that never subscribes gets every PROVISIONAL, notice and COMMITTED and no skip", async () => {
+	await withStreams(({ connect, append, timers, service }) => {
+		const a = connect(ownerA);
+		const b = connect(deviceB);
+		append(a, "b:x", "f-1", "one");
+		append(a, "ns", "f-2", "two");
+		const c = connect(deviceC);
+		append(a, "c:y", "f-3", "three");
+		timers.advance(300);
+		assert.deepEqual(b.timeline.slice(1), ["provisional", "provisional", "notice", "committed", "notice"]);
+		assert.deepEqual(c.timeline.slice(1), ["provisional", "committed", "committed", "notice"]);
+		assert.equal(service.counters.skipFrames, 0);
+		assert.equal((b.attachment as Record<string, unknown>).subs, undefined);
 	});
 });
 

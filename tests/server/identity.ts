@@ -430,7 +430,7 @@ s.test("T-REVOKE-GATE/-BUFFER/-SILENCE/-4403/-401: revoke is one synchronous tur
 		object.host.webSocketMessage(victimSockets[0]!, appendBytes("b:doc", "victim-provisional"));
 		object.host.webSocketMessage(victimSockets[1]!, appendBytes("ns", "victim-ns"));
 		object.host.webSocketMessage(ownerSocket, appendBytes("ns", "owner-ns"));
-		assert.deepEqual(serverFrames(ownerSocket).map((frame) => [frame.kind, frame.clientFrameId]),
+		assert.deepEqual(serverFrames(ownerSocket).map((frame) => [frame.kind, frame.kind === "skipped" ? null : frame.clientFrameId]),
 			[["provisional", "victim-provisional"]], "the owner holds the victim's PROVISIONAL");
 		assert.equal(object.host.relay.pendingFrames(), 3);
 		assert.equal(object.host.relay.head(), 0);
