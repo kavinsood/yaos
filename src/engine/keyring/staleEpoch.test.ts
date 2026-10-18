@@ -72,7 +72,8 @@ describe("stale-epoch rule (§14.3) in the engine", () => {
 			await x!.engine.createDoc("new.md" as VaultPath, "under r");
 			await converged([x!.engine]);
 			const head = relay.head();
-			await until(() => y!.engine.status().vaultSeq >= head, 5_000, "y read through head");
+			// new.md's body rows reach y as skipped (it has no binding) and are read: wait for that read too.
+			await until(() => y!.engine.status().vaultSeq >= head && y!.engine.status().counts.staleStreams === 0 && y!.engine.c.sess.readsInFlight === 0, 5_000, "y read through head");
 			assert.deepEqual(paths(y!), ["a.md"], "held: neither the stale row nor the r rows behind it fold");
 			assert.deepEqual((await y!.engine.c.repo.quarantineOf(y!.engine.streamOf(id))).map((q) => q.reason), ["keyring-hold"], "the body row waits");
 			assert.equal(y!.engine.status().counts.quarantinedRows, 2, "and new.md's body under r: unknown key");

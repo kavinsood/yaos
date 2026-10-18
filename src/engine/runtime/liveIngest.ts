@@ -20,8 +20,14 @@
  *    other row becomes a T_stale item and provisionals are dropped;
  *  - a failed tLive drops the batch: its seqs stay unaccounted and the gap
  *    feed / reads recover them;
+ *  - skipped rows (STREAM_SKIPPED: other devices' b:/c: rows outside the
+ *    subscription, DESIGN §d.7) are one queue entry each, in arrival order,
+ *    batched with committed rows, never dropped by the overflow; they become
+ *    T_stale items, and the stream's read is deferred (subscriptions.ts);
  *  - ns / cfg / snap rows mark the stream active for the checkpoint settle
- *    rule (body rows do so in docRuntime.applyRows; DESIGN §d.9).
+ *    rule (body rows do so in docRuntime.applyRows; DESIGN §d.9); so do the
+ *    seqs of a body stream that turns or stays stale (skipped, overflow): its
+ *    author is still writing, and a stale stream is never due.
  *
  * The queue survives a session close (its events are committed facts).
  */
@@ -32,7 +38,14 @@ import type { LiveItem } from "../store/repo";
 import { gateRow, ownCommitCopy } from "../sync/ingestRow";
 import type { EngineCtx } from "./context";
 
-type QueuedEvent = Extract<RelayEvent, { t: "receipt" | "committed" | "provisional" | "provisionalDropped" }>;
+/** One row of a STREAM_SKIPPED event (sessionLoop expands the event row by row). */
+export interface SkippedRow {
+	readonly t: "skipped";
+	readonly stream: StreamName;
+	readonly seq: Seq;
+}
+
+type QueuedEvent = Extract<RelayEvent, { t: "receipt" | "committed" | "provisional" | "provisionalDropped" }> | SkippedRow;
 
 /** Events that hold a payload (the residency the overflow bounds; payload-less events are a few dozen bytes). */
 function heavy(ev: QueuedEvent): 0 | 1 {
@@ -51,7 +64,7 @@ export class LiveIngest {
 	private qRows = 0;
 	private draining = false;
 	enabled = false;
-	stats = { batches: 0, rows: 0, receipts: 0, stale: 0, overflows: 0, failedBatches: 0 };
+	stats = { batches: 0, rows: 0, receipts: 0, stale: 0, skipped: 0, overflows: 0, failedBatches: 0 };
 
 	constructor(private readonly c: EngineCtx) {}
 
@@ -142,10 +155,10 @@ export class LiveIngest {
 			const batch: QueuedEvent[] = [];
 			while (this.q.length > 0 && batch.length < this.c.tuning.liveBatchRows) {
 				const t = this.q[0]!.t;
-				if (t !== "committed" && t !== "receipt") break;
+				if (t !== "committed" && t !== "receipt" && t !== "skipped") break;
 				const ev = this.shift();
 				batch.push(ev);
-				if ((ev.t === "committed" ? ev.frame.stream : ev.stream) === KEYRING_STREAM) break;
+				if (ev.t !== "skipped" && (ev.t === "committed" ? ev.frame.stream : ev.stream) === KEYRING_STREAM) break;
 			}
 			await this.ingest(batch);
 		}
@@ -164,9 +177,19 @@ export class LiveIngest {
 		const skipApply = new Set<Seq>();
 		let stale = 0;
 		let receipts = 0;
+		const skipped = new Map<StreamName, number>();
+		const staleStreams = new Set<StreamName>();
 		const now = c.now();
 		const onlyK = c.keyring.readsOnlyK();
 		for (const ev of batch) {
+			if (ev.t === "skipped") {
+				// Never an own row (relay-wire §19): another device wrote it, which hands the checkpoint duty on.
+				items.push({ t: "stale", stream: ev.stream, seq: ev.seq, foreign: true });
+				skipped.set(ev.stream, (skipped.get(ev.stream) ?? 0) + 1);
+				staleStreams.add(ev.stream);
+				stale++;
+				continue;
+			}
 			const kr = ev.t === "receipt" ? c.keyring.receiptRow(ev) : null;
 			if (kr) {
 				items.push({ t: "row", row: kr, settleAdoptable: null });
@@ -187,7 +210,8 @@ export class LiveIngest {
 				continue;
 			}
 			if (f.payload === null || (onlyK && streamClass(f.stream) !== "keyring")) {
-				items.push({ t: "stale", stream: f.stream, seq: f.seq });
+				items.push({ t: "stale", stream: f.stream, seq: f.seq, foreign: f.deviceId !== c.self });
+				staleStreams.add(f.stream);
 				stale++;
 				continue;
 			}
@@ -210,6 +234,10 @@ export class LiveIngest {
 		this.stats.rows += items.length;
 		this.stats.receipts += receipts;
 		this.stats.stale += stale;
+		for (const [stream, n] of skipped) {
+			this.stats.skipped += n;
+			c.subs.noteSkipped(stream, n);
+		}
 		if (receipts > 0) c.countReceipts(receipts);
 		c.lastSyncedAtMs = c.now();
 		c.applyOutboxResult(res);
@@ -217,6 +245,7 @@ export class LiveIngest {
 		await c.docs.applyRows(res.tailPut.filter((r) => !skipApply.has(r.seq)));
 		const mono = c.mono();
 		for (const r of res.tailPut) if (r.stream === NS_STREAM || r.stream === CFG_STREAM || r.stream === SNAP_STREAM) c.ckpt.lastActivity.set(r.stream, mono);
+		for (const stream of staleStreams) c.ckpt.lastActivity.set(stream, mono);
 		c.noteBodyChange(res.tailPut.filter((r) => r.deviceId !== c.self || !skipApply.has(r.seq)).map((r) => r.stream));
 		if (res.removed.length > 0 || res.tailPut.some((r) => r.stream === NS_STREAM)) await c.afterNsChange();
 		if (res.tailPut.some((r) => r.stream === CFG_STREAM)) await c.afterCfgChange();

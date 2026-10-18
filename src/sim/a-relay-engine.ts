@@ -1,8 +1,10 @@
 /**
  * SimRelay engine: per-socket raw admission (token bucket), APPEND parsing
  * and admission, the vault-wide pending buffer, group commit (idle / max /
- * bytes timers on the ClockPort), fan-out and failures. Mirrors
- * server/src/streams/relay.ts (StreamRelayService) message for message.
+ * bytes timers on the ClockPort), fan-out and failures, subscriptions
+ * (relay-wire §19: STREAM_SUBSCRIBE, filtered fan-out with inline
+ * STREAM_SKIPPED runs, the set persisted in the "attachment" when it fits).
+ * Mirrors server/src/streams/relay.ts (StreamRelayService) message for message.
  */
 
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../core/types";
@@ -11,11 +13,14 @@ import type { AppendFrame, RelayLimits } from "../ports/relay";
 import type { SimRelaySession } from "./a-relay-session";
 import type { RelayStore, StoreOutcome } from "./a-relay-store";
 import {
+	SIM_MAX_SUBSCRIPTIONS,
 	SIM_MESSAGE_SLACK_BYTES,
+	SIM_SUBSCRIPTION_ATTACHMENT_BYTES,
 	bytesEqual,
 	frameKey,
 	isProvisionalStream,
 	nextUtcMidnight,
+	utf8Length,
 	validClientFrameId,
 	validStreamName,
 	type GroupCommitSpec,
@@ -33,8 +38,8 @@ export interface PendingFrame {
 	/** Resends of the same frame while pending: each gets a deduped:true receipt. */
 	readonly duplicates: SimRelaySession[];
 	readonly provisional: boolean;
-	/** Highest socket ordinal at admission: sockets with ordinal <= this got the PROVISIONAL. */
-	readonly ordinal: number;
+	/** Sockets that were sent the PROVISIONAL (they get a COMMIT_NOTICE or STREAM_PROVISIONAL_DROPPED). */
+	readonly provisionalTo: Set<SimRelaySession>;
 }
 
 export type FlushReason = "idle" | "max" | "bytes" | "forced";
@@ -85,6 +90,17 @@ export interface SimRelayCounters {
 	wakeNotices: number;
 	authorityCloses: number;
 	droppedPending: number;
+	/** Subscriptions: appended rows sent as a STREAM_SKIPPED seq instead of a payload, and the frames carrying them. */
+	skippedRows: number;
+	skipFrames: number;
+	subscribes: number;
+	subscribeRejects: number;
+}
+
+/** Per device, over all its sockets: b:/c: rows pushed (COMMITTED / COMMIT_NOTICE) and skipped. */
+export interface SimDeviceFanout {
+	pushedRows: number;
+	skippedRows: number;
 }
 
 export function newCounters(): SimRelayCounters {
@@ -92,7 +108,8 @@ export function newCounters(): SimRelayCounters {
 		appendFrames: 0, pendingDedupes: 0, storeDedupes: 0, conflicts: 0, commits: 0, committedRows: 0, commitFailures: 0,
 		flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0, notices: 0, committedBroadcasts: 0,
 		provisionalDrops: 0, rateCloses: 0, oversizeCloses: 0, policyCloses: 0, rawDrops: 0, writeForbidden: 0,
-		dailyLimitRejects: 0, wakeNotices: 0, authorityCloses: 0, droppedPending: 0,
+		dailyLimitRejects: 0, wakeNotices: 0, authorityCloses: 0, droppedPending: 0, skippedRows: 0, skipFrames: 0,
+		subscribes: 0, subscribeRejects: 0,
 	};
 }
 
@@ -104,6 +121,7 @@ export interface EngineConfig {
 
 export class RelayEngine {
 	readonly counters = newCounters();
+	readonly fanout = new Map<DeviceId, SimDeviceFanout>();
 	/** Accepted sockets in ordinal order (closed ones are pruned lazily). */
 	open: SimRelaySession[] = [];
 	socketOrdinal = 0;
@@ -176,7 +194,37 @@ export class RelayEngine {
 			return;
 		}
 		if (!this.charge(session, msg.bytes)) return;
-		this.append(session, msg.frame);
+		if (msg.k === "subscribe") this.subscribe(session, msg.streams);
+		else this.append(session, msg.frame);
+	}
+
+	/**
+	 * STREAM_SUBSCRIBE: replaces the socket's set (read-only sockets too). An invalid name or more than
+	 * SIM_MAX_SUBSCRIPTIONS distinct names is rejected and the previous set kept. Persisted in the attachment when its
+	 * JSON fits SIM_SUBSCRIPTION_ATTACHMENT_BYTES, else as overflow ("all" after a restart).
+	 */
+	private subscribe(session: SimRelaySession, streams: readonly string[]): void {
+		const code = !streams.every(validStreamName) ? "invalid" : new Set(streams).size > SIM_MAX_SUBSCRIPTIONS ? "too_many" : null;
+		if (code !== null) {
+			this.counters.subscribeRejects++;
+			session.send({ k: "subscribeRejected", code });
+			return;
+		}
+		this.counters.subscribes++;
+		session.subs = new Set(streams);
+		const subs = [...session.subs];
+		session.persistedSubs = utf8Length(JSON.stringify(subs)) <= SIM_SUBSCRIPTION_ATTACHMENT_BYTES ? subs : null;
+	}
+
+	/** The socket is pushed `frame`'s payload (else, once appended, it is sent the seq as skipped). */
+	private wants(peer: SimRelaySession, frame: { readonly stream: StreamName; readonly deviceId: DeviceId }): boolean {
+		return peer.subs === null || !isProvisionalStream(frame.stream) || peer.subs.has(frame.stream) || frame.deviceId === peer.deviceId;
+	}
+
+	private tally(deviceId: DeviceId): SimDeviceFanout {
+		let t = this.fanout.get(deviceId);
+		if (t === undefined) this.fanout.set(deviceId, (t = { pushedRows: 0, skippedRows: 0 }));
+		return t;
 	}
 
 	private append(session: SimRelaySession, frame: AppendFrame): void {
@@ -216,11 +264,12 @@ export class RelayEngine {
 		const provisional = isProvisionalStream(frame.stream);
 		const entry: PendingFrame = {
 			key, stream: frame.stream, deviceId: session.deviceId, clientFrameId: frame.clientFrameId, payload: frame.payload,
-			origin: session, duplicates: [], provisional, ordinal: this.socketOrdinal,
+			origin: session, duplicates: [], provisional, provisionalTo: new Set(),
 		};
 		if (provisional) {
 			for (const peer of this.streamSockets()) {
-				if (peer === session || this.hiddenFor(peer.deviceId, entry.stream)) continue;
+				if (peer === session || this.hiddenFor(peer.deviceId, entry.stream) || !this.wants(peer, entry)) continue;
+				entry.provisionalTo.add(peer);
 				peer.send({ k: "provisional", stream: entry.stream, deviceId: entry.deviceId, clientFrameId: entry.clientFrameId, payload: entry.payload });
 				this.counters.provisionalBroadcasts++;
 			}
@@ -338,13 +387,27 @@ export class RelayEngine {
 		return false;
 	}
 
+	/**
+	 * Per frame and peer socket, in frame order (relay-wire §19): the origin and duplicate waiters get receipts only;
+	 * a PROVISIONAL recipient gets the COMMIT_NOTICE; an appended row the socket wants goes as COMMITTED, one it does
+	 * not want joins the socket's pending skip run; a store-deduped row is neither (R7). A socket's run is flushed as
+	 * one STREAM_SKIPPED before its next live frame and after the loop, before the receipts.
+	 */
 	private fanOut(frames: readonly PendingFrame[], outcomes: readonly StoreOutcome[]): void {
 		const sockets = this.streamSockets().slice();
 		const receipts = new Map<SimRelaySession, { stream: StreamName; clientFrameId: ClientFrameId; seq: Seq; deduped: boolean }[]>();
+		const skips = new Map<SimRelaySession, { stream: StreamName; seq: Seq }[]>();
 		const addReceipt = (session: SimRelaySession, receipt: { stream: StreamName; clientFrameId: ClientFrameId; seq: Seq; deduped: boolean }): void => {
 			const list = receipts.get(session);
 			if (list === undefined) receipts.set(session, [receipt]);
 			else list.push(receipt);
+		};
+		const flushSkips = (peer: SimRelaySession): void => {
+			const run = skips.get(peer);
+			if (run === undefined || run.length === 0) return;
+			skips.delete(peer);
+			peer.send({ k: "skipped", rows: run });
+			this.counters.skipFrames++;
 		};
 		for (let i = 0; i < frames.length; i++) {
 			const frame = frames[i]!;
@@ -354,34 +417,43 @@ export class RelayEngine {
 				for (const waiter of [frame.origin, ...frame.duplicates]) {
 					waiter.send({ k: "rejected", stream: frame.stream, clientFrameId: frame.clientFrameId, code: "client_frame_id_conflict", seq: outcome.seq });
 				}
-				if (frame.provisional) this.dropProvisional(sockets, frame, "client_frame_id_conflict");
+				if (frame.provisional) this.dropProvisional(frame, "client_frame_id_conflict");
 				continue;
 			}
 			if (outcome.kind === "appended") this.counters.committedRows++;
 			else this.counters.storeDedupes++;
-			// Rows appended now go to every other socket (a notice for PROVISIONAL holders); a row
-			// deduped against an earlier commit was delivered then: only holders get a notice (R7).
 			for (const peer of sockets) {
-				if (peer === frame.origin || this.hiddenFor(peer.deviceId, frame.stream)) continue;
-				if (frame.provisional && peer.ordinal <= frame.ordinal) {
+				if (peer === frame.origin || frame.duplicates.includes(peer) || this.hiddenFor(peer.deviceId, frame.stream)) continue;
+				const doc = isProvisionalStream(frame.stream);
+				if (frame.provisionalTo.has(peer)) {
+					flushSkips(peer);
 					peer.send({ k: "notice", stream: frame.stream, seq: outcome.seq, deviceId: frame.deviceId, clientFrameId: frame.clientFrameId });
 					this.counters.notices++;
-				} else if (outcome.kind === "appended") {
+					if (doc) this.tally(peer.deviceId).pushedRows++;
+				} else if (outcome.kind === "appended" && this.wants(peer, frame)) {
+					flushSkips(peer);
 					peer.send({ k: "committed", stream: frame.stream, seq: outcome.seq, deviceId: frame.deviceId, clientFrameId: frame.clientFrameId, payload: frame.payload });
 					this.counters.committedBroadcasts++;
+					if (doc) this.tally(peer.deviceId).pushedRows++;
+				} else if (outcome.kind === "appended") {
+					const run = skips.get(peer);
+					if (run === undefined) skips.set(peer, [{ stream: frame.stream, seq: outcome.seq }]);
+					else run.push({ stream: frame.stream, seq: outcome.seq });
+					this.counters.skippedRows++;
+					this.tally(peer.deviceId).skippedRows++;
 				}
 			}
 			const receipt = { stream: frame.stream, clientFrameId: frame.clientFrameId, seq: outcome.seq, deduped: outcome.kind === "deduped" };
 			addReceipt(frame.origin, receipt);
 			for (const duplicate of frame.duplicates) addReceipt(duplicate, { ...receipt, deduped: true });
 		}
+		for (const peer of [...skips.keys()]) flushSkips(peer);
 		const head = this.store.head();
 		for (const [session, list] of receipts) session.send({ k: "receipts", head, receipts: list });
 	}
 
-	private dropProvisional(sockets: readonly SimRelaySession[], frame: PendingFrame, reason: string): void {
-		for (const peer of sockets) {
-			if (peer === frame.origin || peer.ordinal > frame.ordinal) continue;
+	private dropProvisional(frame: PendingFrame, reason: string): void {
+		for (const peer of frame.provisionalTo) {
 			peer.send({ k: "dropped", stream: frame.stream, deviceId: frame.deviceId, clientFrameId: frame.clientFrameId, reason });
 			this.counters.provisionalDrops++;
 		}
@@ -389,7 +461,6 @@ export class RelayEngine {
 
 	/** A failed commit: nothing written. One VAULT_ERROR per (socket, stream); PROVISIONAL holders drop. */
 	private failed(frames: readonly PendingFrame[], code: "durability_failed" | "cf_daily_limit"): void {
-		const sockets = this.streamSockets().slice();
 		const byOrigin = new Map<SimRelaySession, Map<StreamName, ClientFrameId[]>>();
 		for (const frame of frames) {
 			for (const waiter of [frame.origin, ...frame.duplicates]) {
@@ -399,7 +470,7 @@ export class RelayEngine {
 				if (ids === undefined) streams.set(frame.stream, [frame.clientFrameId]);
 				else ids.push(frame.clientFrameId);
 			}
-			if (frame.provisional) this.dropProvisional(sockets, frame, "commit_failed");
+			if (frame.provisional) this.dropProvisional(frame, "commit_failed");
 		}
 		const resetAt = code === "cf_daily_limit" ? this.latchUntil : null;
 		for (const [session, streams] of byOrigin) {
@@ -421,14 +492,18 @@ export class RelayEngine {
 	/**
 	 * Runtime restart (eviction / hibernation wake): the buffer is gone unacked,
 	 * rate gates and the latch are in-memory and reset, and every open socket
-	 * gets STREAM_RESEND with the head. Sockets themselves survive (hibernation).
+	 * gets STREAM_RESEND with the head. Sockets themselves survive (hibernation),
+	 * their subscription restored from the attachment ("all" when it overflowed,
+	 * or with `loseSubscriptions`: every set as if it had).
 	 */
-	restart(): void {
+	restart(loseSubscriptions = false): void {
 		this.dropPending();
 		this.latchUntil = 0;
 		const head = this.store.head();
 		for (const session of this.streamSockets()) {
 			session.gate = null;
+			if (loseSubscriptions) session.persistedSubs = null;
+			session.subs = session.persistedSubs === null ? null : new Set(session.persistedSubs);
 			session.send({ k: "resend", head });
 			this.counters.wakeNotices++;
 		}

@@ -88,6 +88,7 @@ export function trace(events: readonly RelayEvent[]): string[] {
 			case "refused": return `refused ${e.clientFrameId} ${e.reason}${e.conflictSeq !== null ? `@${e.conflictSeq}` : ""}`;
 			case "provisionalDropped": return `dropped ${e.clientFrameId}`;
 			case "resendUnreceipted": return `resend ${e.headSeq}`;
+			case "skipped": return `skipped ${e.rows.map((r) => `${r.stream}@${r.seq}`).join(",")}`;
 			case "backpressure": return "backpressure";
 			case "head": return `head ${e.headSeq}`;
 			case "closed": return `closed ${e.code}${e.errorCode !== null ? ` ${e.errorCode}` : ""}${e.wasClean ? "" : " unclean"}`;

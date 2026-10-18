@@ -9,12 +9,21 @@
  *     space is unrelated to any legacy vault sequence.
  *  R2 A session admitted with headSeq H delivers every seq > H committed while
  *     it is open exactly once, in seq order: as "committed" (another device's
- *     frame, payload joined from PROVISIONAL + COMMIT_NOTICE for b:/c:) or as a
- *     "receipt" (own frame; never echoed). Receipts for one group commit come
- *     after that commit's broadcasts, so a receipt for seq s arrives after
- *     every seq < s was delivered. A gap means a lost socket or a bug: the
- *     engine recovers with feed + read (DESIGN §d.7).
- *  R3 There is no subscription filter: every session receives every stream.
+ *     frame, payload joined from PROVISIONAL + COMMIT_NOTICE for b:/c:), as a
+ *     "receipt" (own frame; never echoed), or as a "skipped" row (another
+ *     device's b:/c: row outside the session's subscription: only (stream,
+ *     seq), the payload is read later). Receipts for one group commit come
+ *     after that commit's broadcasts and skips, so a receipt for seq s arrives
+ *     after every seq < s was delivered. A gap means a lost socket or a bug:
+ *     the engine recovers with feed + read (DESIGN §d.7).
+ *  R3 Payloads are pushed for every vault-global stream (anything not b:/c:),
+ *     for the b:/c: streams of the session's last subscribe() set, and for
+ *     rows of this device's other sockets; a session that never subscribed
+ *     (or a relay without the capability: limits.maxSubscriptions 0) gets
+ *     every stream. The relay keeps the set across a runtime restart only when
+ *     it is small; the adapter resends it on STREAM_RESEND, and until then the
+ *     session may get every stream again. Any set is correct: it only moves
+ *     rows between "pushed now" and "skipped, read later".
  *     Frames are committed in arrival order; a group commit fails or succeeds
  *     as a whole and does NOT fence later frames; a close or a relay restart
  *     ("resendUnreceipted") loses every unreceipted frame. The client never
@@ -57,6 +66,11 @@ export interface RelayLimits {
 	readonly readPageBytes: number;
 	/** Streams per readBatch() request (VAULT_READY readBatchMaxStreams); 1 = the relay has no batch form. */
 	readonly readBatchStreams: number;
+	/**
+	 * Streams per subscribe() set (VAULT_READY limits.maxSubscriptions, with capabilities.subscriptions 1); 0 = the
+	 * relay has no subscriptions: never subscribe, every stream is pushed (R3).
+	 */
+	readonly maxSubscriptions: number;
 }
 
 export interface AppendFrame {
@@ -152,6 +166,11 @@ export type RelayEvent =
 	 * notice are discarded by the adapter (their streams may need a read).
 	 */
 	| { readonly t: "resendUnreceipted"; readonly headSeq: Seq }
+	/**
+	 * STREAM_SKIPPED: committed rows of other devices' b:/c: streams outside this session's subscription (R2, R3),
+	 * in seq order. Each seq is accounted like a committed row whose payload the engine reads later.
+	 */
+	| { readonly t: "skipped"; readonly rows: readonly { readonly stream: StreamName; readonly seq: Seq }[] }
 	/** VAULT_BACKPRESSURE: a 1013 close follows. */
 	| { readonly t: "backpressure" }
 	/** Head hint (STREAM_RECEIPTS.head, VAULT_PONG.head): a gap probe. */
@@ -171,6 +190,12 @@ export interface RelaySession {
 	append(frame: AppendFrame): void;
 	/** Bytes queued but not yet written to the socket (backpressure). */
 	bufferedBytes(): number;
+	/**
+	 * Replace the set of b:/c: streams whose rows are pushed live (R3); at most limits.maxSubscriptions names. No
+	 * reply: the set takes effect for commits after the relay processed it. The adapter keeps the last set and
+	 * sends it again on STREAM_RESEND. Absent (or maxSubscriptions 0): every stream is pushed.
+	 */
+	subscribe?(streams: readonly StreamName[]): void;
 	feed(afterSeq: Seq): Promise<FeedPage>;
 	/** preferCheckpoint: also take a newer checkpoint when rows still exist (fresh docs). */
 	read(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean): Promise<ReadPage>;

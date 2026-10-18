@@ -48,7 +48,7 @@ class FakeSession implements RelaySession {
 	buffered = 0;
 	readonly limits;
 	constructor(readonly canWrite = true, burstBytes = 2 * 1024 * 1024) {
-		this.limits = { maxFrameBytes: 1 << 20, maxCheckpointBytes: 1 << 20, appendBytesPerSec: 256 * 1024, burstBytes, feedPageRows: 100, readPageBytes: 1 << 20, readBatchStreams: 1 };
+		this.limits = { maxFrameBytes: 1 << 20, maxCheckpointBytes: 1 << 20, appendBytesPerSec: 256 * 1024, burstBytes, feedPageRows: 100, readPageBytes: 1 << 20, readBatchStreams: 1, maxSubscriptions: 0 };
 	}
 	append(f: AppendFrame): void { this.appends.push(f); }
 	bufferedBytes(): number { return this.buffered; }

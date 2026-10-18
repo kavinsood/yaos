@@ -17,6 +17,7 @@ export const DEFAULT_SIM_RELAY_LIMITS: RelayLimits = Object.freeze({
 	feedPageRows: 1000,
 	readPageBytes: 1024 * 1024,
 	readBatchStreams: 128,
+	maxSubscriptions: 128,
 });
 
 /** STREAM_DEDUPE_TAIL_ROWS: the newest sealed segment is searched while the open segment has fewer rows. */
@@ -30,6 +31,10 @@ export const SIM_READ_MAX_BYTES = 4 * 1024 * 1024;
 /** STREAM_READ_BATCH_MAX_STREAMS: entries of one batched read. */
 export const SIM_READ_BATCH_MAX_STREAMS = 128;
 export const SIM_MAX_SOCKETS = 1000;
+/** MAX_STREAM_SUBSCRIPTIONS: distinct names in one STREAM_SUBSCRIBE set. */
+export const SIM_MAX_SUBSCRIPTIONS = 128;
+/** SUBSCRIPTION_ATTACHMENT_BYTES: a set whose JSON is longer is not persisted ("all" after a restart until resent). */
+export const SIM_SUBSCRIPTION_ATTACHMENT_BYTES = 1024;
 
 export interface GroupCommitSpec {
 	readonly idleMs: number;
@@ -112,6 +117,9 @@ export type DownMsg =
 	| { readonly k: "vaultError"; readonly code: "durability_failed" | "cf_daily_limit"; readonly stream: StreamName; readonly clientFrameIds: readonly ClientFrameId[]; readonly resetAt: number | null }
 	| { readonly k: "dropped"; readonly stream: StreamName; readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly reason: string }
 	| { readonly k: "resend"; readonly head: Seq }
+	/** STREAM_SKIPPED: one stream run's seqs per entry, rows in seq order. */
+	| { readonly k: "skipped"; readonly rows: readonly { readonly stream: StreamName; readonly seq: Seq }[] }
+	| { readonly k: "subscribeRejected"; readonly code: "invalid" | "too_many" }
 	| { readonly k: "backpressure" }
 	| { readonly k: "pong"; readonly head: Seq }
 	| { readonly k: "error"; readonly code: string }
@@ -122,6 +130,8 @@ export type DownMsg =
 /** Client -> server socket traffic. */
 export type UpMsg =
 	| { readonly k: "append"; readonly frame: AppendFrame; readonly bytes: number }
+	/** STREAM_SUBSCRIBE (text frame of `bytes` bytes). */
+	| { readonly k: "subscribe"; readonly streams: readonly string[]; readonly bytes: number }
 	| { readonly k: "close"; readonly code: number };
 
 export function frameKey(deviceId: string, clientFrameId: string): string {

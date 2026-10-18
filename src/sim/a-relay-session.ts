@@ -1,7 +1,8 @@
 /**
  * One simulated streams socket. Server side: open flag, ordinal, rate gate.
  * Client side: the wsRelay adapter role (relay-wire -> RelayEvent mapping,
- * PROVISIONAL join map, pre-listener buffer, exactly one "closed").
+ * PROVISIONAL join map, pre-listener buffer, exactly one "closed", the last
+ * subscribe() set resent on STREAM_RESEND).
  * Uplink and downlink are FIFO timed queues with per-message jitter.
  */
 
@@ -10,7 +11,7 @@ import type { ClockPort } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
 import type { AppendFrame, FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayEvent, RelayLimits, RelaySession } from "../ports/relay";
 import { TimedQueue } from "./a-relay-link";
-import { appendMessageBytes, heldKey, type DownMsg, type LinkSpec, type UpMsg } from "./a-relay-util";
+import { appendMessageBytes, heldKey, utf8Length, type DownMsg, type LinkSpec, type UpMsg } from "./a-relay-util";
 
 export interface SessionHost {
 	readonly clock: ClockPort;
@@ -36,6 +37,10 @@ export class SimRelaySession implements RelaySession {
 	/** The server still treats the socket as open (fan-out target, accepts messages). */
 	srvOpen = true;
 	gate: RateGate | null = null;
+	/** The accepted STREAM_SUBSCRIBE set; null = "all" (never subscribed, or lost in a restart). */
+	subs: Set<string> | null = null;
+	/** The set as persisted in the socket attachment (survives a restart); null = none, or it overflowed. */
+	persistedSubs: readonly string[] | null = null;
 
 	// ---- client (adapter) side ----
 	/** PROVISIONAL payloads held until their COMMIT_NOTICE. */
@@ -44,6 +49,8 @@ export class SimRelaySession implements RelaySession {
 	private errorCode: string | null = null;
 	private queue: RelayEvent[] = [];
 	private readonly listeners = new Set<(event: RelayEvent) => void>();
+	/** The last subscribe() set (client side); resent on STREAM_RESEND. */
+	private subscription: readonly string[] | null = null;
 	private everListened = false;
 	private inFlightBytes = 0;
 	private readonly up: TimedQueue<UpMsg>;
@@ -88,6 +95,26 @@ export class SimRelaySession implements RelaySession {
 		this.inFlightBytes += bytes;
 		const rate = this.link.uplinkBytesPerSec ?? 0;
 		this.up.push(this.delay(this.link.uplinkMs), { k: "append", frame: copy, bytes }, rate > 0 ? (bytes * 1000) / rate : 0);
+	}
+
+	/** STREAM_SUBSCRIBE on the uplink (in order with appends). Only when the relay has the capability. */
+	subscribe(streams: readonly StreamName[]): void {
+		if (this.ended || this.limits.maxSubscriptions <= 0) return;
+		if (streams.length > this.limits.maxSubscriptions) throw new RangeError(`sim subscribe: ${streams.length} streams exceed maxSubscriptions`);
+		this.subscription = [...streams];
+		this.sendSubscription();
+	}
+
+	private sendSubscription(): void {
+		if (this.ended || this.subscription === null) return;
+		const streams = this.subscription;
+		const bytes = utf8Length(`__YPS:${JSON.stringify({ type: "STREAM_SUBSCRIBE", streams })}`);
+		this.up.push(this.delay(this.link.uplinkMs), { k: "subscribe", streams, bytes });
+	}
+
+	/** The client's last subscribe() set (null: never subscribed). */
+	get subscribed(): readonly string[] | null {
+		return this.subscription;
 	}
 
 	/** Uplink bytes not yet delivered to the relay. */
@@ -199,6 +226,8 @@ export class SimRelaySession implements RelaySession {
 				return;
 			}
 			case "receipts":
+				// A PROVISIONAL of this device's own frame that this socket resent gets no COMMIT_NOTICE (wsRelay).
+				for (const r of msg.receipts) this.held.delete(heldKey(r.stream, this.deviceId, r.clientFrameId));
 				for (const r of msg.receipts) this.emit({ t: "receipt", stream: r.stream, clientFrameId: r.clientFrameId, seq: r.seq, deduped: r.deduped });
 				this.emit({ t: "head", headSeq: msg.head });
 				return;
@@ -220,8 +249,15 @@ export class SimRelaySession implements RelaySession {
 				this.held.delete(heldKey(msg.stream, msg.deviceId, msg.clientFrameId));
 				this.emit({ t: "provisionalDropped", stream: msg.stream, deviceId: msg.deviceId, clientFrameId: msg.clientFrameId });
 				return;
+			case "skipped":
+				this.emit({ t: "skipped", rows: msg.rows.map((r) => ({ stream: r.stream, seq: r.seq })) });
+				return;
+			case "subscribeRejected":
+				return; // the previous set stays; the engine never sends an invalid one
 			case "resend":
 				this.held.clear();
+				// The restart may have lost the set (an overflowed attachment): resend it, as wsRelay does.
+				this.sendSubscription();
 				this.emit({ t: "resendUnreceipted", headSeq: msg.head });
 				return;
 			case "backpressure":

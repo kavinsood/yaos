@@ -44,6 +44,10 @@ export const FAST_TUNING: Partial<EngineTuning> = {
 	reconnectBaseMs: 20,
 	refRetryMs: 50,
 	refRetryMaxMs: 400,
+	subscribeDebounceMs: 20,
+	// Skipped streams are read at once: tests that wait for isIdle() need no deferral (subscriptions.ts).
+	skipSettleMs: 0,
+	skipMaxDeferMs: 0,
 };
 
 export interface FaultyCrypto extends CryptoPort {

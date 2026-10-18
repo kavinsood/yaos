@@ -16,6 +16,7 @@ export const FRAME_APPEND = 0x01;
 export const FRAME_PROVISIONAL = 0x10;
 export const FRAME_COMMITTED = 0x11;
 export const FRAME_COMMIT_NOTICE = 0x12;
+export const FRAME_SKIPPED = 0x13;
 
 export const CONTROL_PREFIX = "__YPS:";
 export const STREAMS_VERSION = 1;
@@ -29,7 +30,14 @@ export interface WireAppend {
 export type WireServerFrame =
 	| { readonly kind: "provisional"; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string; readonly payload: Uint8Array }
 	| { readonly kind: "committed"; readonly seq: number; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string; readonly payload: Uint8Array }
-	| { readonly kind: "notice"; readonly seq: number; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string };
+	| { readonly kind: "notice"; readonly seq: number; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string }
+	/** STREAM_SKIPPED (relay-wire §19): the rows of one frame merged into seq order. */
+	| { readonly kind: "skipped"; readonly rows: readonly WireSkippedRow[] };
+
+export interface WireSkippedRow {
+	readonly stream: string;
+	readonly seq: number;
+}
 
 export function encodeAppend(frame: WireAppend): Uint8Array {
 	const encoder = encoding.createEncoder();
@@ -56,9 +64,66 @@ export function decodeAppend(bytes: Uint8Array): WireAppend | null {
 	}
 }
 
+/**
+ * 0x13 STREAM_SKIPPED body from rows in seq order: one run per stream, the streams in order of their first seq
+ * (server encodeSkipped; tests and fakes).
+ */
+function writeSkipped(encoder: encoding.Encoder, rows: readonly WireSkippedRow[]): void {
+	const runs = new Map<string, number[]>();
+	for (const r of rows) {
+		const run = runs.get(r.stream);
+		if (run) run.push(r.seq);
+		else runs.set(r.stream, [r.seq]);
+	}
+	encoding.writeVarUint(encoder, runs.size);
+	for (const [stream, seqs] of runs) {
+		encoding.writeVarString(encoder, stream);
+		encoding.writeVarUint(encoder, seqs.length);
+		encoding.writeVarUint(encoder, seqs[0]!);
+		for (let i = 1; i < seqs.length; i++) encoding.writeVarUint(encoder, seqs[i]! - seqs[i - 1]!);
+	}
+}
+
+/**
+ * Strict 0x13 body: at least one stream, each named once with n >= 1 seqs, every delta > 0, first seqs ascending
+ * across streams (the order the relay writes them), every seq a positive safe integer. Rows come back merged into
+ * seq order (the order the relay skipped them in). Throws on anything else.
+ */
+function readSkipped(decoder: decoding.Decoder): WireSkippedRow[] {
+	const streamCount = decoding.readVarUint(decoder);
+	if (streamCount < 1) throw new RangeError("empty STREAM_SKIPPED");
+	const rows: WireSkippedRow[] = [];
+	const seen = new Set<string>();
+	let prevFirst = 0;
+	for (let i = 0; i < streamCount; i++) {
+		const stream = decoding.readVarString(decoder);
+		const n = decoding.readVarUint(decoder);
+		if (stream.length === 0 || seen.has(stream) || n < 1) throw new RangeError("bad STREAM_SKIPPED run");
+		seen.add(stream);
+		let seq = decoding.readVarUint(decoder);
+		if (seq <= prevFirst || !Number.isSafeInteger(seq)) throw new RangeError("bad STREAM_SKIPPED first seq");
+		prevFirst = seq;
+		rows.push({ stream, seq });
+		for (let k = 1; k < n; k++) {
+			const delta = decoding.readVarUint(decoder);
+			seq += delta;
+			if (delta < 1 || !Number.isSafeInteger(seq)) throw new RangeError("bad STREAM_SKIPPED delta");
+			rows.push({ stream, seq });
+		}
+	}
+	rows.sort((a, b) => a.seq - b.seq);
+	for (let i = 1; i < rows.length; i++) if (rows[i]!.seq === rows[i - 1]!.seq) throw new RangeError("duplicate STREAM_SKIPPED seq");
+	return rows;
+}
+
 /** Server-side encoder (tests and fakes). */
 export function encodeServerFrame(frame: WireServerFrame): Uint8Array {
 	const encoder = encoding.createEncoder();
+	if (frame.kind === "skipped") {
+		encoding.writeUint8(encoder, FRAME_SKIPPED);
+		writeSkipped(encoder, frame.rows);
+		return encoding.toUint8Array(encoder);
+	}
 	if (frame.kind === "provisional") {
 		encoding.writeUint8(encoder, FRAME_PROVISIONAL);
 	} else {
@@ -102,6 +167,11 @@ export function decodeServerFrame(bytes: Uint8Array): WireServerFrame | null {
 			if (decoder.pos !== bytes.byteLength) return null;
 			return { kind: "committed", seq, stream, deviceId, clientFrameId, payload };
 		}
+		if (kind === FRAME_SKIPPED) {
+			const rows = readSkipped(decoder);
+			if (decoder.pos !== bytes.byteLength) return null;
+			return { kind: "skipped", rows };
+		}
 		return null;
 	} catch {
 		return null;
@@ -119,6 +189,7 @@ export interface WireLimits {
 	readonly feedDefaultLimit: number | null;
 	readonly readDefaultBytes: number | null;
 	readonly readBatchMaxStreams: number | null;
+	readonly maxSubscriptions: number | null;
 }
 
 export interface WireReceipt {
@@ -138,6 +209,8 @@ export type WireControl =
 		readonly runtimeEpoch: string | null;
 		readonly liveness: { readonly idleMs: number; readonly timeoutMs: number } | null;
 		readonly limits: WireLimits;
+		/** VAULT_READY.capabilities.subscriptions (null: absent, the relay has no subscriptions). */
+		readonly subscriptions: number | null;
 	}
 	| { readonly type: "STREAM_RECEIPTS"; readonly head: number; readonly receipts: readonly WireReceipt[] }
 	| { readonly type: "STREAM_APPEND_REJECTED"; readonly stream: string; readonly clientFrameId: string; readonly code: string; readonly seq: number | null }
@@ -157,6 +230,11 @@ export type WireControl =
 
 export function encodeControl(message: Readonly<Record<string, unknown>>): string {
 	return CONTROL_PREFIX + JSON.stringify(message);
+}
+
+/** STREAM_SUBSCRIBE (relay-wire §19): the full replacement set. */
+export function encodeSubscribe(streams: readonly string[]): string {
+	return encodeControl({ type: "STREAM_SUBSCRIBE", streams });
 }
 
 export function encodePing(probeId: string): string {
@@ -194,6 +272,7 @@ function parseLimits(value: unknown): WireLimits {
 		feedDefaultLimit: positive(o, "feedDefaultLimit"),
 		readDefaultBytes: positive(o, "readDefaultBytes"),
 		readBatchMaxStreams: positive(o, "readBatchMaxStreams"),
+		maxSubscriptions: positive(o, "maxSubscriptions"),
 	};
 }
 
@@ -246,6 +325,7 @@ export function parseControl(text: string): WireControl | null {
 				runtimeEpoch: str(o, "runtimeEpoch"),
 				liveness,
 				limits: parseLimits(o["limits"]),
+				subscriptions: isRecord(o["capabilities"]) ? positive(o["capabilities"], "subscriptions") : null,
 			};
 		}
 		case "STREAM_RECEIPTS": {

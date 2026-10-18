@@ -25,6 +25,7 @@ import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
 import { SIM_SETTINGS, SimDevice } from "./device";
 import type { EngineSettings } from "../protocol/messages";
+import type { EngineTuning } from "../engine/runtime/options";
 import { SimNet } from "./net";
 import type { CaseProfile } from "./vault";
 import { checkE2eeLeaks, oracleKeys, onboardSuite1, seededRk } from "./e2ee";
@@ -59,6 +60,11 @@ export interface SimConfig {
 	 * the relay leak checks run. Default "none" (the suite-0 pin fixture).
 	 */
 	readonly crypto?: "none" | "suite1";
+	/**
+	 * Engine tuning over FAST_TUNING for every device. { skipSettleMs: null, skipMaxDeferMs: null } runs the
+	 * device classes' real deferral of skipped streams (FAST_TUNING reads them at once).
+	 */
+	readonly tuning?: Partial<EngineTuning>;
 }
 
 export type Step =
@@ -87,6 +93,11 @@ export interface SimReport {
 		readonly crashUnacked: number;
 		/** Editor saves that overwrote an unseen external write (Obsidian race, exempt). */
 		readonly clobbers: number;
+		/**
+		 * Subscriptions over the run: b:/c: rows the relay pushed to and skipped for the devices (all sockets), and the
+		 * STREAM_SUBSCRIBE sets it accepted.
+		 */
+		readonly subs: { readonly pushedRows: number; readonly skippedRows: number; readonly subscribes: number };
 		/** Suite-1 fault outcomes (e2eeFaults.ts), in a suite-1 run with faults. */
 		readonly e2ee?: E2eeFaultStats;
 		/** Suite 1: the run's DelayedCrypto counters (strays must be 0: every crypto await went through RealWork). */
@@ -165,6 +176,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				log: cfg.log ? (line) => cfg.log!(name, `${clock.monotonic()} ${line}`) : undefined,
 				watcherDelayMs: c.faults ? () => watch.range(0, 400) : undefined,
 				pin: c.suite1 ? null : undefined,
+				...(cfg.tuning ? { tuning: cfg.tuning } : {}),
 			});
 		});
 		const ledger = new TokenLedger();
@@ -259,11 +271,22 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
+			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
 		};
 	} finally {
 		seedEntropy(null);
 	}
+}
+
+function subsStats(net: SimNet, devs: readonly SimDevice[]): SimReport["stats"]["subs"] {
+	let pushedRows = 0;
+	let skippedRows = 0;
+	for (const d of devs) {
+		const f = net.relay.fanout(d.deviceId);
+		pushedRows += f.pushedRows;
+		skippedRows += f.skippedRows;
+	}
+	return { pushedRows, skippedRows, subscribes: net.relay.counters().subscribes };
 }
 
 /** ddmin over plan steps: the smallest plan (within `maxRuns`) for which `fails(report)` still holds. */

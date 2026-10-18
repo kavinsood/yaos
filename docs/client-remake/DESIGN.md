@@ -94,8 +94,11 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed), then unpad when suite ≠ 
   are ignored: the cursor still advances and nothing is stored (`src/engine/ingest/gate.ts:94`).
 - `k` rows skip the envelope gate (`gate.ts:93-94`) and are stored as key-record rows for the keyring
   (`src/engine/sync/ingestRow.ts:50`, `src/engine/runtime/sessionLoop.ts:446`).
-- Every socket receives every stream (relay-wire §5.3). The cost of a row for a non-resident doc is bounded at
-  gate stage 1–2 plus one tail put (§d.6).
+- Every socket receives every vault-global stream (ns, cfg, snap, `k`). For `b:`/`c:` it receives payloads only for
+  the streams it subscribed to, and for rows of its own device; any other `b:`/`c:` row arrives as a skipped
+  `(stream, seq)` and is read later (§d.7 "Subscriptions", relay-wire §19). A socket that never subscribed, or one
+  on a relay without the capability, receives every stream. The cost of a pushed row for a non-resident doc is
+  bounded at gate stage 1–2 plus one tail put (§d.6); a skipped row costs one stale mark.
 
 ### b.3 `nsOps` content
 
@@ -1024,6 +1027,9 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
      to a resident (or loading) replica; the rest stay in the tail (`src/engine/runtime/docRuntime.ts:168-187`).
    - **Overflow** (> 4 MiB or > 1000 queued rows): drop payloads of rows for non-resident docs. Record those streams
      as stale with `remoteHeadSeq = max(…, seq)`. The seq counts as accounted, and the rows are read later.
+   - **Skipped** rows (`skipped` events, one queue entry per row, batched with committed rows, never dropped by the
+     overflow) take the same path: stale with `remoteHeadSeq = max(…, seq)`, the seq accounted. A skipped row is
+     always another device's, so a seq past `lastOwnSeq` hands the checkpoint duty on, as a row would (§d.9).
 3. **Feed.** If V < H: run `feed(V)` pages. Each page runs `T_feed_page`:
    - for each `{stream, lastSeq}`: set `remoteHeadSeq` to the max, `stale = appliedSeq < remoteHeadSeq`, and the
      priority (§j.6);
@@ -1046,7 +1052,8 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
        `T_snapshot`. For ns: verify, then replace the fold state, and own pending ops re-overlay (§f.1).
    - **Caught up:** when a read completes (`more = false`) in the current session, every row of the stream ≤
      `max(H, lastSeq)` is known, because the read started after `VAULT_READY` and everything ≤ H was committed then.
-     Every row > H arrives live (R2). So `appliedSeq := remoteHeadSeq` and `stale := 0`.
+     Every row > H arrives live (R2), with its payload or as a skip. A skip of a seq the read already covered changes
+     nothing; one above it makes the stream stale again. So `appliedSeq := remoteHeadSeq` and `stale := 0`.
    - Reads may lag live delivery (relay-wire §12): the group-commit buffer is not flushed. This is harmless, because
      tail puts are idempotent and rows above the read arrive live.
 5. **Live rows for a stale stream:**
@@ -1055,6 +1062,26 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - **ns/cfg/snap:** stored and **not folded** until the stream is caught up. After that, rows arrive live in order (R2)
      and fold immediately.
 
+**Subscriptions** (`src/engine/runtime/subscriptions.ts`, relay-wire §19).
+- The set: bound streams, then streams with own outbox records, then the 8 most recently unbound docs for 10 min,
+  capped at `limits.maxSubscriptions` (0 = the relay has none: nothing is sent). It is sent right after
+  `VAULT_READY`, before the feed; later changes are debounced (250 ms) and sent only when the set changed, except
+  that a bind is sent at once. The adapter resends the set on `STREAM_RESEND`; the relay keeps a set that fits the
+  socket attachment (≤ 1024 B) across a restart, and pushes every stream until the resend otherwise.
+- Any set is correct. It only moves rows between "pushed now" and "skipped, read later"; nothing assumes
+  "subscribed ⇒ current", and a freshly subscribed stream is read like any stale one.
+- **Deferred read.** A stream made stale by skips is read once no skip arrived for `skipSettleMs`, or `skipMaxDeferMs`
+  after the first (desktop 5 s / 30 s, phone and tablet 150 s / 10 min, constrained 150 s / 15 min: `SKIP_DEFER`).
+  The longer mobile wait outlasts the author's checkpoint settle rule (2 min), so a read after a burst usually
+  returns one checkpoint, batched with every other quiet stream. The maintenance tick re-runs catch-up scheduling,
+  so an expired deferral needs no timer. Skip times live in memory: after a restart a stale stream is read under the
+  normal rules.
+- **Never deferred:** a bound stream; a stream with own outbox records (its adoptables settle and its frames
+  sequence through what it reads); a doc the disk side waits for (a plan's `body-not-caught-up` / `body-empty`
+  wait calls `wantFresh`, which holds until a read leaves the stream caught up).
+- `isIdle()` counts a deferred stream as stale (not converged); status `staleStreams` does not (nothing is being
+  fetched). Tests that wait for quiescence run with `skipSettleMs = 0`.
+
 **Cursor advance.**
 - V advances while V+1 is accounted. Accounted seqs above V are tracked in memory.
 - V is persisted only inside the transaction that accounts the seq (`T_ingest`, `T_receipt`, `T_feed_page`,
@@ -1062,6 +1089,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 - **Gap:** V+1 is unaccounted for > 5 s while higher seqs are, or a `head` hint is above V. Run `feed(V)`. The page
   marks the affected streams stale.
 - **`committed` with `payload: null`:** stale, read.
+- **`skipped`:** stale, read after the deferral above.
 
 **Reconnect order:**
 1. feed;
@@ -1110,6 +1138,10 @@ The planner does no destructive work until ns is caught up (§f.2).
     this engine run is unknown (a restart can come in the middle of an edit session), so a stream with no activity
     seen counts as active at the run's first live maintenance tick (`markLive`, checkpoints.ts:104, called at
     maintenance.ts:147). After a restart no settle put comes before S, and no hot put before 30 s.
+  - A device that sees a stream through skips (§d.7) sees its rows late. Skipped and stale seqs and read pages count
+    as activity too, and a stale stream is never due and restarts its fallback clock, so a reader never falls back
+    on a stream it has not caught up on. The duty moves on a skipped seq (always another device's) or a read row of
+    another device past `lastOwnSeq`, as it does on a live row.
   - Primary: the author of the stream's newest row (`meta.ckptDuty`). Fallback: any other device, once the
     condition, idle included, has held for `CHECKPOINT_FALLBACK_MS` (10 min, checkpoints.ts:34) plus a per-stream
     jitter in [0, 10 min) (src/engine/runtime/maintenance.ts:128).

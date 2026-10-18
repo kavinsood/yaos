@@ -37,6 +37,9 @@ const TUNING: Partial<EngineTuning> = {
 	maintenanceMs: 200,
 	reconnectBaseMs: 250,
 	mirrorDebounceMs: 50,
+	// Skipped streams are read at once: converge() waits for isIdle(), which waits out a deferral (fanout.ts measures it).
+	skipSettleMs: 0,
+	skipMaxDeferMs: 0,
 };
 
 const devices: Device[] = [];

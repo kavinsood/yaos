@@ -51,6 +51,7 @@ export {
 	SimRelayError,
 	SimRelaySession,
 };
+export type { SimDeviceFanout } from "./a-relay-engine";
 export type { CommitFault, CommitHook, LinkSpec, SegmentInfo, SimCommitInfo, SimConnectFailureReason, SimRelayCounters, SimRelayOptions, SimRow, SimSessionInfo, StoreFrame, StoreSnapshot };
 
 /** A device's sessions, or one session by id. */
@@ -293,9 +294,24 @@ export class SimRelay implements RelayPort {
 		return this.tracked.every((s) => s.idle);
 	}
 
-	/** Runtime restart: buffer lost unacked, gates/latch reset, every open socket gets STREAM_RESEND. */
-	restart(): void {
-		this.engine.restart();
+	/**
+	 * Runtime restart: buffer lost unacked, gates/latch reset, subscriptions back to what the attachments kept,
+	 * every open socket gets STREAM_RESEND. loseSubscriptions: every attachment overflowed (all sockets "all" until
+	 * their clients resend).
+	 */
+	restart(loseSubscriptions = false): void {
+		this.engine.restart(loseSubscriptions);
+	}
+
+	/** b:/c: rows pushed vs skipped per device (all its sockets) since the relay started. */
+	fanout(deviceId: DeviceId): { readonly pushedRows: number; readonly skippedRows: number } {
+		const t = this.engine.fanout.get(deviceId);
+		return { pushedRows: t?.pushedRows ?? 0, skippedRows: t?.skippedRows ?? 0 };
+	}
+
+	/** The server's current subscription of each open socket of a device (null = "all"). */
+	subscriptionsOf(deviceId: DeviceId): (readonly string[] | null)[] {
+		return this.engine.streamSockets().filter((s) => s.deviceId === deviceId).map((s) => (s.subs === null ? null : [...s.subs].sort()));
 	}
 
 	/** Graceful drain (deploy/eviction): commit the buffer, then every socket closes 1001. */

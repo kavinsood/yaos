@@ -153,6 +153,10 @@ export class ComposedLog implements LogPort {
 		return this.log.corkNs();
 	}
 
+	wantFresh(docIds: readonly DocId[]): void {
+		this.log.wantFresh(docIds);
+	}
+
 	async acquireBody(docId: DocId, kind: "markdown" | "canvas"): Promise<BodyHandle | null> {
 		const known = this.view().remote.get(docId);
 		if (!known || known.kind !== kind) return null;

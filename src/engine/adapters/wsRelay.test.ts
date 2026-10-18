@@ -98,7 +98,7 @@ describe("wsRelay connect", () => {
 		assert.equal(session.canWrite, true);
 		assert.deepEqual(session.limits, {
 			maxFrameBytes: 1048576, maxCheckpointBytes: 4194304, appendBytesPerSec: 262144, burstBytes: 2097152,
-			feedPageRows: 1000, readPageBytes: 1048576, readBatchStreams: 1,
+			feedPageRows: 1000, readPageBytes: 1048576, readBatchStreams: 1, maxSubscriptions: 0,
 		});
 	});
 
@@ -409,6 +409,70 @@ describe("wsRelay session events", () => {
 		onmessage?.({ data: `${CONTROL_PREFIX}{"type":"VAULT_BACKPRESSURE"}` } as MessageEvent);
 		assert.deepEqual(events.slice(1), [{ t: "closed", code: 1006, errorCode: null, wasClean: false }]);
 		assert.equal(session.bufferedBytes(), 0);
+	});
+});
+
+describe("wsRelay subscriptions", () => {
+	const SUBS_READY = { ...READY, capabilities: { streams: 1, subscriptions: 1 }, limits: { ...READY.limits, maxSubscriptions: 3 } };
+	const subscribes = (socket: FakeSocket) => socket.sent.filter((m): m is string => typeof m === "string" && m.includes("STREAM_SUBSCRIBE"))
+		.map((m) => JSON.parse(m.slice(CONTROL_PREFIX.length)) as unknown);
+
+	it("maxSubscriptions needs both the capability and the limit", async () => {
+		assert.equal((await open({}, SUBS_READY)).session.limits.maxSubscriptions, 3);
+		assert.equal((await open({}, { ...SUBS_READY, capabilities: { streams: 1 } })).session.limits.maxSubscriptions, 0, "no capability");
+		assert.equal((await open({}, { ...SUBS_READY, limits: READY.limits })).session.limits.maxSubscriptions, 0, "no limit");
+	});
+
+	it("subscribe sends the full set; a relay without subscriptions gets nothing", async () => {
+		const { socket, session } = await open({}, SUBS_READY);
+		session.subscribe!([S("b:x"), S("c:y")]);
+		session.subscribe!([]);
+		assert.deepEqual(subscribes(socket), [{ type: "STREAM_SUBSCRIBE", streams: ["b:x", "c:y"] }, { type: "STREAM_SUBSCRIBE", streams: [] }]);
+		assert.throws(() => session.subscribe!([S("b:1"), S("b:2"), S("b:3"), S("b:4")]), RangeError, "over maxSubscriptions");
+
+		const old = await open();
+		old.session.subscribe!([S("b:x")]);
+		assert.deepEqual(subscribes(old.socket), [], "never sent without the capability");
+	});
+
+	it("STREAM_RESEND resends the last set before resendUnreceipted; nothing when never subscribed", async () => {
+		const { socket, session } = await open({}, SUBS_READY);
+		const events = collect(session);
+		socket.control({ type: "STREAM_RESEND", reason: "runtime_restarted", runtimeEpoch: "R2", head: 50 });
+		assert.deepEqual(subscribes(socket), []);
+		session.subscribe!([S("b:x")]);
+		socket.control({ type: "STREAM_RESEND", reason: "runtime_restarted", runtimeEpoch: "R3", head: 51 });
+		assert.deepEqual(subscribes(socket), [{ type: "STREAM_SUBSCRIBE", streams: ["b:x"] }, { type: "STREAM_SUBSCRIBE", streams: ["b:x"] }]);
+		assert.deepEqual(events, [{ t: "resendUnreceipted", headSeq: 50 }, { t: "resendUnreceipted", headSeq: 51 }]);
+	});
+
+	it("STREAM_SKIPPED -> one skipped event, rows in seq order; a malformed frame is ignored", async () => {
+		const { socket, session } = await open({}, SUBS_READY);
+		const events = collect(session);
+		socket.binary({ kind: "skipped", rows: [{ stream: "b:x", seq: 43 }, { stream: "c:y", seq: 44 }, { stream: "b:x", seq: 46 }] });
+		socket.binary(bytes(0x13, 0));
+		assert.deepEqual(events, [{ t: "skipped", rows: [{ stream: "b:x", seq: 43 }, { stream: "c:y", seq: 44 }, { stream: "b:x", seq: 46 }] }]);
+	});
+
+	it("a receipt drops a held PROVISIONAL of the device's own frame (a duplicate waiter gets no COMMIT_NOTICE)", async () => {
+		const { socket, session } = await open({ provisionalCacheEntries: 4 }, SUBS_READY);
+		const events = collect(session);
+		// Our frame f1, sent on an earlier socket of this device, was pushed here as a PROVISIONAL; this socket resent it.
+		socket.binary({ kind: "provisional", stream: "b:x", deviceId: "devA", clientFrameId: "f1", payload: bytes(1, 2) });
+		socket.binary({ kind: "provisional", stream: "b:x", deviceId: "devB", clientFrameId: "f1", payload: bytes(3) });
+		socket.control({ type: "STREAM_RECEIPTS", head: 60, receipts: [{ stream: "b:x", clientFrameId: "f1", seq: 60, deduped: true }] });
+		// A stray notice for it afterwards finds nothing held; another device's same-id provisional is untouched.
+		socket.binary({ kind: "notice", seq: 60, stream: "b:x", deviceId: "devA", clientFrameId: "f1" });
+		socket.binary({ kind: "notice", seq: 61, stream: "b:x", deviceId: "devB", clientFrameId: "f1" });
+		const committed = events.flatMap((e) => (e.t === "committed" ? [[e.frame.deviceId, e.frame.payload]] : []));
+		assert.deepEqual(committed, [["devA", null], ["devB", bytes(3)]]);
+	});
+
+	it("subscribe after close sends nothing", async () => {
+		const { socket, session } = await open({}, SUBS_READY);
+		session.close(1000, "bye");
+		session.subscribe!([S("b:x")]);
+		assert.deepEqual(subscribes(socket), []);
 	});
 });
 

@@ -3,7 +3,7 @@
  * defaults are the DESIGN values.
  */
 
-import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
+import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, RECENT_UNBOUND_KEEP, RECENT_UNBOUND_MS, SKIP_DEFER, SUBSCRIBE_DEBOUNCE_MS, type SkipDefer, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
 import type { ContentHash, DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
@@ -61,6 +61,17 @@ export interface EngineTuning {
 	 * while its own upload is younger than half of it.
 	 */
 	readonly blobGcGraceMs: number;
+	/** Subscription set changes are debounced this long (DESIGN §d.7). */
+	readonly subscribeDebounceMs: number;
+	/** Recently unbound docs kept subscribed: how many, and for how long after the unbind. */
+	readonly recentUnboundKeep: number;
+	readonly recentUnboundMs: number;
+	/**
+	 * Deferred read of a stream made stale by skipped rows (core/limits SKIP_DEFER); null = the device class's value.
+	 * 0 reads at once (tests that wait for quiescence).
+	 */
+	readonly skipSettleMs: number | null;
+	readonly skipMaxDeferMs: number | null;
 }
 
 export const DEFAULT_TUNING: EngineTuning = {
@@ -89,6 +100,11 @@ export const DEFAULT_TUNING: EngineTuning = {
 	rollSeqSpan: ROLL_SEQ_SPAN,
 	rollOwnSeals: ROLL_OWN_SEALS,
 	blobGcGraceMs: 7 * 24 * 60 * 60_000,
+	subscribeDebounceMs: SUBSCRIBE_DEBOUNCE_MS,
+	recentUnboundKeep: RECENT_UNBOUND_KEEP,
+	recentUnboundMs: RECENT_UNBOUND_MS,
+	skipSettleMs: null,
+	skipMaxDeferMs: null,
 };
 
 /** Why a bound body's text changed: "editor" = applyEditorChanges, "merge" = an engine merge (editDoc, mergeJob). */
@@ -115,6 +131,11 @@ export interface EngineOptions {
 	readonly provisionalBroadcast?: boolean;
 	readonly tuning?: Partial<EngineTuning>;
 	readonly budgets?: Partial<Budgets>;
+	/**
+	 * Default true. false = never send a subscription: the relay pushes every stream (the behaviour before
+	 * subscriptions; e2e/client/fanout.ts compares the two).
+	 */
+	readonly subscribe?: boolean;
 	/** Default true. false = connect once; reconnect() only. */
 	readonly autoReconnect?: boolean;
 	/**
@@ -166,6 +187,11 @@ export interface EngineOptions {
 
 export function resolveTuning(t: Partial<EngineTuning> | undefined): EngineTuning {
 	return { ...DEFAULT_TUNING, ...(t ?? {}), checkpoint: { ...DEFAULT_CHECKPOINT_TUNING, ...(t?.checkpoint ?? {}) } };
+}
+
+/** The deferral window of skipped streams: the tuning's values, else the device class's (SKIP_DEFER). */
+export function resolveSkipDefer(cls: DeviceClass, t: EngineTuning): SkipDefer {
+	return { settleMs: t.skipSettleMs ?? SKIP_DEFER[cls].settleMs, maxDeferMs: t.skipMaxDeferMs ?? SKIP_DEFER[cls].maxDeferMs };
 }
 
 export function resolveBudgets(cls: DeviceClass, b: Partial<Budgets> | undefined): Budgets {

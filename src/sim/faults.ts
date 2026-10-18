@@ -9,7 +9,9 @@
  *              mirrors); IndexedDB connection lost while running; offline
  *              periods; vault I/O failures; backgrounding; slow watchers (run.ts)
  *   relay      socket drops (1006/1001/1011) at random points of the frame
- *              flow; relay restart (STREAM_RESEND, unreceipted frames lost);
+ *              flow; relay restart (STREAM_RESEND, unreceipted frames lost;
+ *              with relaySubsLost every subscription falls back to "all"
+ *              until its client resends it);
  *              graceful drain; HTTP failures; daily limit; vault epoch reset
  *   blob store stalls (the whole path, or PUT bodies only; no byte moves: the idle
  *              window or a link abort ends the call) and slow periods (12 KiB/s ..
@@ -50,6 +52,8 @@ export type FaultAction =
 	| { readonly t: "background"; readonly dev: number; readonly event: "hidden" | "pagehide" | "freeze"; readonly durationMs: number }
 	| { readonly t: "socketDrop"; readonly dev: number; readonly code: number }
 	| { readonly t: "relayRestart" }
+	/** Relay restart whose socket attachments kept no subscription (overflow): every socket "all" until resent. */
+	| { readonly t: "relaySubsLost" }
 	| { readonly t: "relayDrain" }
 	| { readonly t: "httpFail"; readonly durationMs: number }
 	| { readonly t: "dailyLimit"; readonly durationMs: number }
@@ -68,7 +72,15 @@ export const DEFAULT_FAULTS: FaultWeights = {
 	// as before (generateFault skips zero weights, and these keys come last).
 	keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
 	blobStall: 0, blobSlow: 0,
+	// Subscriptions (SUBS_FAULTS): last and weight 0 here, so the default plans draw as before.
+	relaySubsLost: 0,
 };
+
+/**
+ * Subscription churn: relay restarts (sets restored from the attachments, then resent), restarts that lose every
+ * set, socket drops (a new session subscribes again) and backgrounding (park / wake), over the default matrix.
+ */
+export const SUBS_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, relayRestart: 3, relaySubsLost: 3, socketDrop: 6, background: 4 };
 
 /** The default matrix plus the suite-1 faults (a `crypto: "suite1"` run; in a suite-0 run they are skipped). */
 export const E2EE_FAULTS: FaultWeights = {
@@ -106,6 +118,7 @@ export function generateFault(rng: SeededRandom, devices: number, weights: Fault
 		case "background": return { t: "background", dev, event: rng.pick(["hidden", "pagehide", "freeze"] as const), durationMs: rng.range(100, 30_000) };
 		case "socketDrop": return { t: "socketDrop", dev, code: rng.pick([1006, 1006, 1001, 1011]) };
 		case "relayRestart": return { t: "relayRestart" };
+		case "relaySubsLost": return { t: "relaySubsLost" };
 		case "relayDrain": return { t: "relayDrain" };
 		case "httpFail": return { t: "httpFail", durationMs: rng.range(1_000, 30_000) };
 		case "dailyLimit": return { t: "dailyLimit", durationMs: rng.range(5_000, 60_000) };
@@ -149,7 +162,7 @@ export class FaultState {
 		engineCrash: 0, appCrash: 0, commitCrash: 0, idbWipe: 0, idbLost: 0, offline: 0, ioFail: 0, background: 0,
 		socketDrop: 0, relayRestart: 0, relayDrain: 0, httpFail: 0, dailyLimit: 0, epochReset: 0, clockSkew: 0,
 		keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
-		blobStall: 0, blobSlow: 0,
+		blobStall: 0, blobSlow: 0, relaySubsLost: 0,
 	};
 	/** Suite-1 faults (null in a suite-0 run: they are skipped). */
 	readonly e2ee: E2eeFaults | null;
@@ -191,6 +204,10 @@ export class FaultState {
 				this.net.relay.restart();
 				this.counts.relayRestart++;
 				return "fault relayRestart";
+			case "relaySubsLost":
+				this.net.relay.restart(true);
+				this.counts.relaySubsLost++;
+				return "fault relaySubsLost";
 			case "relayDrain":
 				this.net.relay.drain();
 				this.counts.relayDrain++;
