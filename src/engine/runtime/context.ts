@@ -6,7 +6,7 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
+import { NS_STREAM, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
@@ -21,9 +21,10 @@ import { resolveRefRow, type RefDeps } from "../body/refs";
 import type { Sender } from "../body/sender";
 import type { GateCtx } from "../ingest/gate";
 import type { Mut, OutboxRename, Repo } from "../store/repo";
-import type { OutboxRecord } from "../store/schema";
+import type { OutboxRecord, TailRecord } from "../store/schema";
 import type { CatchUpDeps } from "../sync/catchUp";
 import type { CfgRuntime } from "../sync/cfgRuntime";
+import type { FoldRuntime } from "../sync/foldRuntime";
 import type { SnapRuntime } from "../sync/snapRuntime";
 import type { KeyringRuntime } from "../keyring/keyringRuntime";
 import { assertWritable, gatedBlob, gatedCrypto } from "../keyring/writeGate";
@@ -48,6 +49,41 @@ export interface PendingCreate {
 const DIAG_RING = 2_000;
 const ERROR_NOTICES = new Set(["device-revoked", "upgrade-required", "epoch-changed", "vault-unclaimed", "vault-not-found"]);
 const INFO_NOTICES = new Set(["recovered-from-mirror"]);
+
+/** A fold runtime and its after-change hook (EngineCtx.folds). */
+export interface Fold {
+	readonly rt: FoldRuntime<unknown, unknown>;
+	/** Fold the newly available rows (reload: the snapshot was replaced, refold from it) and report them. */
+	readonly after: (reload: boolean) => Promise<void>;
+}
+
+/** What one ingest transaction stored (tLive, tReadPage pages, a quarantine release): EngineCtx.afterStored. */
+export interface Stored {
+	readonly removed: readonly OutboxRecord[];
+	readonly updated: readonly OutboxRecord[];
+	readonly renamed?: readonly OutboxRename[];
+	/** Every tail row written. */
+	readonly tailPut: readonly TailRecord[];
+	/** Seqs of tailPut not applied to replicas (notApplied: own receipts, settled adoptables). */
+	readonly skip: ReadonlySet<Seq>;
+	/** Live rows: their streams count as active for the checkpoint idle rule (§d.9 "idle"); read rows do not. */
+	readonly live: boolean;
+	/** A read of one stream, or a quarantine release: its doc is checked and its fold runs even without new rows. */
+	readonly read?: {
+		readonly stream: StreamName;
+		/** Read to completion (§d.7 caught up): reported to the host, which waits on it, even if every row was own. */
+		readonly done: boolean;
+		/** body/canvas checkpoint state adopted (fresh or union): applied with the rows. */
+		readonly checkpointState: Uint8Array | null;
+		/** The fold snapshot was replaced by a checkpoint: the fold reloads. */
+		readonly replacedFold: boolean;
+	};
+}
+
+const isBody = (stream: StreamName): boolean => {
+	const cls = streamClass(stream);
+	return cls === "body" || cls === "canvas";
+};
 
 export function adoptKey(deviceId: DeviceId, cfid: ClientFrameId): string {
 	return `${deviceId}\u0000${cfid}`;
@@ -238,9 +274,7 @@ export class EngineCtx {
 			const cls = streamClass(r.stream);
 			if (cls === "body" || cls === "canvas") drained.add(r.stream);
 			// ns/cfg/snap records leave the outbox only on (late) receipt: keep them in the overlay until folded.
-			if (r.stream === NS_STREAM) this.ns.noteCommitted(r);
-			else if (r.stream === CFG_STREAM) this.cfg.noteCommitted(r);
-			else if (r.stream === SNAP_STREAM) this.snap.noteCommitted(r);
+			this.foldOf(r.stream)?.rt.noteCommitted(r);
 			this.outbox.delete(r.clientFrameId);
 			this.sender.remove(r.clientFrameId);
 			this.unregisterAdopt(r.clientFrameId);
@@ -318,10 +352,73 @@ export class EngineCtx {
 	}
 
 	/**
+	 * After an ingest transaction (Stored): mirror the outbox result, hand `k` rows to the keyring, apply body rows to
+	 * resident (or loading) replicas, report the docs that changed, and run the after-change hook of every fold the
+	 * rows touched (ns also when an outbox record went: held records may depend on it, §e.1). The one dispatch of live
+	 * ingest, catch-up reads and quarantine releases.
+	 */
+	async afterStored(s: Stored): Promise<void> {
+		this.applyOutboxResult(s);
+		const read = s.read ?? null;
+		await this.keyring.ingestRows(s.tailPut, read !== null && streamClass(read.stream) === "keyring");
+		const mono = this.mono();
+		const bodies = new Map<StreamName, TailRecord[]>();
+		if (read && isBody(read.stream)) bodies.set(read.stream, []);
+		for (const r of s.tailPut) {
+			if (s.live && this.foldOf(r.stream)) this.ckpt.lastActivity.set(r.stream, mono);
+			if (!isBody(r.stream) || s.skip.has(r.seq)) continue;
+			let l = bodies.get(r.stream);
+			if (!l) bodies.set(r.stream, (l = []));
+			l.push(r);
+		}
+		for (const [stream, rows] of bodies) {
+			if (s.live) this.ckpt.lastActivity.set(stream, mono);
+			let h = this.handles.peek(stream);
+			if (!h) {
+				const loading = this.handles.loadingOf(stream);
+				if (loading) h = await loading.catch(() => undefined);
+			}
+			if (!h) continue;
+			const ck = read?.stream === stream ? read.checkpointState : null;
+			if (ck || rows.length > 0) await this.docs.applyToHandle(h, rows, ck);
+			this.docs.checkDoc(h);
+		}
+		// Own receipts are the only rows that change nothing here (own plain rows are an earlier store's, §d.7).
+		const changed = s.tailPut.filter((r) => r.deviceId !== this.self || !s.skip.has(r.seq)).map((r) => r.stream);
+		if (read && (read.done || read.checkpointState)) changed.push(read.stream);
+		this.noteBodyChange(changed);
+		for (const f of this.folds()) {
+			const own = read?.stream === f.rt.stream;
+			if (own || s.tailPut.some((r) => r.stream === f.rt.stream) || (f.rt.stream === NS_STREAM && s.removed.length > 0)) await f.after(own && read.replacedFold);
+		}
+		this.scheduleStatus();
+	}
+
+	/**
+	 * Every fold runtime with its after-change hook, in fold order (ns first: the cfg / snap reports come after the
+	 * held releases its fold allows). The one list whatever folds walks: the unopened-row re-gate
+	 * (quarantineRelease.ts), a refold of all and the outbox mirror; a new fold is added here.
+	 */
+	folds(): readonly Fold[] {
+		return [
+			{ rt: this.ns, after: (reload) => this.afterNsChange(reload) },
+			{ rt: this.cfg, after: (reload) => this.afterCfgChange(reload) },
+			{ rt: this.snap, after: (reload) => this.afterSnapChange(reload) },
+		];
+	}
+	foldOf(stream: StreamName): Fold | undefined {
+		return this.folds().find((f) => f.rt.stream === stream);
+	}
+	/** Every fold folds what is available (engine start: reload from the snapshots; session start: rows read). */
+	async refold(reload: boolean): Promise<void> {
+		for (const f of this.folds()) await f.after(reload);
+	}
+
+	/**
 	 * Fold newly available ns rows (reload: snapshot replaced, refold from it), then release / delete held
 	 * records whose create folded (DESIGN §e.1), then report the folded frames.
 	 */
-	async afterNsChange(reload = false): Promise<void> {
+	private async afterNsChange(reload: boolean): Promise<void> {
 		const folded = reload ? await this.ns.load() : await this.ns.advance();
 		const changes = this.ns.reconcileHeld(this.outbox);
 		if (changes.length > 0) this.applyOutboxResult(await this.repo.tOutbox(changes));
@@ -329,7 +426,7 @@ export class EngineCtx {
 	}
 
 	/** Fold newly available cfg rows (reload: snapshot replaced) and report them. */
-	async afterCfgChange(reload = false): Promise<void> {
+	private async afterCfgChange(reload: boolean): Promise<void> {
 		const folded = reload ? await this.cfg.load() : await this.cfg.advance();
 		if (folded.length === 0 && !reload) return;
 		const events = folded.flatMap((f) => f.events);
@@ -337,7 +434,7 @@ export class EngineCtx {
 	}
 
 	/** Fold newly available snap rows (reload: snapshot replaced). The index is read on demand (snapView). */
-	async afterSnapChange(reload = false): Promise<void> {
+	private async afterSnapChange(reload: boolean): Promise<void> {
 		const before = this.snap.unknownVersions;
 		const folded = reload ? await this.snap.load() : await this.snap.advance();
 		if (this.snap.unknownVersions > before) this.diag("snap-unknown-version", { ops: this.snap.unknownVersions - before });
@@ -370,7 +467,7 @@ export class EngineCtx {
 	 */
 	committedBlobs(): ReadonlySet<ContentHash> | null {
 		if (!this.session || !this.live?.enabled) return null;
-		for (const rt of [this.ns, this.cfg, this.snap]) {
+		for (const { rt } of this.folds()) {
 			if (rt.halted || this.repo.stream(rt.stream)?.stale === 1) return null;
 		}
 		const key = [this.ns.state, this.ns.coversSeq, this.cfg.state, this.cfg.coversSeq, this.snap.state, this.snap.coversSeq];

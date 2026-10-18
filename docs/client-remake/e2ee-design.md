@@ -620,7 +620,7 @@ bytes   nonce(12) ‖ AES-GCM(kBlob_e, plaintext ‖ pad §7.3, AAD "yaos/b2" §
     `suite-downgrade` or a sha256 mismatch under a verified sealing key, or a header that does not parse.
     Absent, transport errors, `unknown-key`, `unsupported-suite` and anything under an unverified key reset the
     count.
-  - A body/canvas ref freezes the doc `blob-corrupt` (§9.3; `src/engine/runtime/docRuntime.ts:225-244`). No
+  - A body/canvas ref freezes the doc `blob-corrupt` (§9.3; `src/engine/runtime/docRuntime.ts:202-221`). No
     QuarantineRecord is written, because the row holds no sealed blob; `releaseQuarantine` unfreezes it and the
     count starts over.
   - An attachment is quarantined in memory on the blob queue (notice `blob-quarantined`,
@@ -706,7 +706,7 @@ client mark-and-sweep against the server's list and batch conditional delete (se
     counts (`src/engine/compose/keyReader.ts:188-191`).
   - One sweep at a time (`busy`); engine stop aborts it (`interrupted`). The session loop declaring the relay link
     dead aborts the sweep's store calls in flight too: they go through the engine's `TransferLink`
-    (`src/engine/blobs/transferLink.ts:1-7`, `src/engine/runtime/context.ts:128`), and a list or delete that fails so
+    (`src/engine/blobs/transferLink.ts:1-7`, `src/engine/runtime/context.ts:164`), and a list or delete that fails so
     ends the sweep `interrupted` (`src/engine/blobs/gc.ts:157-160`).
 - **Grace** `EngineTuning.blobGcGraceMs` = 7 days (`src/engine/runtime/options.ts:58-63`, `:91`). It is a tuning
   knob: the e2e uses 8 s.
@@ -719,7 +719,7 @@ computed from a partial view would delete live data.
 | `no-store` | The vault has a blob store (VAULT_READY `attachments`) | `src/engine/runtime/blobGc.ts:103` |
 | `keys-unverified` | Suite 1: the sealing epoch is ≥ 1 and verified, and so is K_1, because addresses use the kAddr of K_1 (§5.1). And the in-session write gate is open (`writeGate.ts`): a device revoked mid-session, or behind a newer winner it has no key for, is refused before it lists, because its deletes would be refused anyway | `:104-111` |
 | `offline`, `read-only` | A relay session, and it is writable | `:112-113` |
-| `not-caught-up` | `ns`, `cfg` and `snap` are read to the relay's head now, in this session (`SessionLoop.readFresh`, `src/engine/runtime/sessionLoop.ts:306-327`), and none is stale | `:125-127` |
+| `not-caught-up` | `ns`, `cfg` and `snap` are read to the relay's head now, in this session (`SessionLoop.readFresh`, `src/engine/runtime/sessionLoop.ts:304-325`), and none is stale | `:125-127` |
 | `fold-incomplete` | No quarantined `ns` / `cfg` / `snap` row. Every fold is complete: not halted, its snapshot decodes, and each tail row opened, passed the gate, decodes, is folded and (for `snap`) has a known record version (`FoldRuntime.gap`, `src/engine/sync/foldRuntime.ts:181-202`; `src/engine/sync/snapRuntime.ts:56-58`) | `:128-133` |
 | `body-unreadable` | Every body/canvas row the relay still serves opens for this reader. A reader-dependent failure (`isReaderDependent`, `src/engine/ingest/envelope.ts:58`: unsupported version or suite, unknown key, a bad tag under an unverified key) may hide a ref, so it refuses. A deterministic failure is skipped, because no reader can resolve it | `:160-161`, `src/engine/blobs/bodyRefs.ts` |
 | `addressing-mismatch` | Safety net: nothing is deleted until the listing shows one of the addresses that the committed folds reference (else any live one). A listing that never shows one refuses. This guards against a wrong suite or key, under which every live address looks unknown | `src/engine/blobs/gc.ts:117-118`, `:150`, `:153-155` |
@@ -774,7 +774,7 @@ computed from a partial view would delete live data.
   a long orphan would then rely on an object that a concurrent sweep may delete before the new reference commits.
   - Now a found address is reused only if the committed folds reference its hash, or this device PUT it less than
     grace/2 ago. The folds count only while they are current: a session, not halted, not stale
-    (`src/engine/runtime/context.ts:372-376`).
+    (`src/engine/runtime/context.ts:469-474`).
   - The put time is persisted (meta `blobPut:<address>`), so it survives a restart.
   - Otherwise the device PUTs again, which refreshes `uploadedAt` (`touch.ts:134-138`,
     `src/engine/blobs/blobStore.ts:44-57`).
@@ -1124,7 +1124,7 @@ QR, ends up blocked, not downgraded.
   (`pluginController.ts:187-190`).
 - **Once open, the in-session write gate decides** (`src/engine/keyring/writeGate.ts`). It covers what can shut
   writes later in a session: an open revoke, a newer winner without its key, or `k` not read yet.
-  - The runtime's crypto and blob ports are `gatedCrypto` and `gatedBlob` (`src/engine/runtime/context.ts:128-129`).
+  - The runtime's crypto and blob ports are `gatedCrypto` and `gatedBlob` (`src/engine/runtime/context.ts:164-165`).
   - Every writer uses them: the sender, doc frames, the BlobQueue and the SnapshotJob
     (`src/engine/compose/vaultRuntime.ts:234`, `:258`). Blob GC also refuses up front while the gate is shut
     (`src/engine/runtime/blobGc.ts:110-111`).
@@ -1440,8 +1440,8 @@ Node 26.5, `scripts/bench-e2ee.mjs`, median of 5, load average 1.7–2.1), 10k d
 - **Static audit (this worktree).** Every crypto call site seals or opens outside any transaction body:
   - seals: `src/engine/body/frames.ts:57, :108`; `src/engine/runtime/reseal.ts:51`;
     `src/engine/body/checkpoints.ts:287, :332`; `src/engine/blobs/blobStore.ts:55`;
-  - opens through the ingest gate (`gateRow`): `src/engine/runtime/liveIngest.ts:194`;
-    `src/engine/sync/catchUp.ts:189`; `src/engine/runtime/quarantineRelease.ts:48, :144, :169`;
+  - opens through the ingest gate (`gateRow`): `src/engine/sync/ingestRow.ts:110` (classifyRow: live ingest and
+    catch-up); `src/engine/runtime/quarantineRelease.ts:48, :140, :164`;
   - other opens: `src/engine/runtime/mirrorIo.ts:158`; `src/engine/blobs/bodyRefs.ts:87`;
     `src/engine/blobs/blobStore.ts:96`.
 
@@ -2033,14 +2033,14 @@ runs in the engine):
     `rollTriggerGcGate.test.ts`).
 - **Engine fixes the suite-1 sim found** (each with a failing test first):
   - A reader-dependent quarantine record keeps the whole row, so a re-gate on new keys can open it
-    (`src/engine/sync/ingestRow.ts:102-107`).
+    (`src/engine/sync/ingestRow.ts:155-160`).
   - A view on a frozen doc binds once the doc is released, and a quarantine freeze retargets bound views
-    (`src/engine/runtime/context.ts:405`, `src/engine/compose/vaultRuntime.ts:356`).
+    (`src/engine/runtime/context.ts:502`, `src/engine/compose/vaultRuntime.ts:356`).
   - A suite-1 session judges nothing before its `k` read (`src/engine/keyring/keyringRuntime.ts:157`).
-  - Rows stored after a re-gate are re-checked (`src/engine/runtime/quarantineRelease.ts:159`).
-  - Release works by stream (`src/engine/runtime/engine.ts:481-482`), and keeps `keyring-hold` rows
+  - Rows stored after a re-gate are re-checked (`src/engine/runtime/quarantineRelease.ts:154`).
+  - Release works by stream (`src/engine/runtime/engine.ts:479-480`), and keeps `keyring-hold` rows
     (`quarantineRelease.ts:51`).
-  - Rows a release applies move the stream's body version (`src/engine/store/repo.ts:728-730`).
+  - Rows a release applies move the stream's body version (`src/engine/store/repo.ts:721-723`).
   - An open revoke is stored and survives a reset (§11.5; `src/engine/keyring/book.ts:51`).
   - A §c.12 migrated loser's synced record is dropped, not moved to the winner (`src/engine/reconcile/diskJobs.ts:67`,
     `src/core/plan/planner.ts:502`). Otherwise its own text became the winner's sync point, and the winner's text

@@ -3,11 +3,9 @@
  *
  * readStream() pages read(stream, appliedSeq, preferCheckpoint = appliedSeq
  * === 0), gates every page BEFORE its transaction and commits it with
- * T_read_page:
- *  - own row whose clientFrameId is in the outbox  -> late receipt (committed stale: renamed to a copy,
- *                                                     ownCommitCopy);
- *  - other device's row matching an adoptable      -> settle (stored, not re-applied);
- *  - everything else                               -> gateRow (tail / quarantine / accounted).
+ * T_read_page. Rows are classified as live ones are (classifyRow, ingestRow.ts): a late receipt (committed
+ * stale: renamed to a copy), else gated (tail / quarantine / accounted); another device's row matching an
+ * adoptable settles it (stored, not re-applied).
  *
  * Checkpoint with coversSeq > snapshotCoversSeq (after the gate):
  *  - fresh stream (no snapshot, no tail): stored as the snapshot in the page tx;
@@ -35,9 +33,9 @@ import type { RandomPort } from "../../ports/random";
 import type { ReadPage, RelaySession } from "../../ports/relay";
 import { unionBodyCheckpoint, type CompactDeps } from "../body/compaction";
 import { gate, type GateCtx } from "../ingest/gate";
-import type { OutboxRename, OwnCommitCopy } from "../store/repo";
+import type { LiveItem, OutboxRename, OwnCommitCopy } from "../store/repo";
 import type { OutboxRecord, QuarantineRecord, SnapshotRecord, StreamRecord, TailRecord } from "../store/schema";
-import { gateRow, ownCommitCopy } from "./ingestRow";
+import { classifyRow, notApplied } from "./ingestRow";
 
 export interface CatchUpDeps extends CompactDeps {
 	readonly gateCtx: GateCtx;
@@ -74,10 +72,10 @@ export interface ReadResult {
 	readonly removed: OutboxRecord[];
 	readonly updated: OutboxRecord[];
 	readonly renamed: OutboxRename[];
-	/** Tail rows to apply to a resident replica (late receipts and settled adoptables excluded). */
-	readonly apply: TailRecord[];
 	/** Every tail row written. */
 	readonly tailPut: TailRecord[];
+	/** Seqs of tailPut not to apply to a replica: late receipts and settled adoptables (notApplied). */
+	readonly skip: ReadonlySet<Seq>;
 	readonly stream: StreamRecord | null;
 	readonly error?: string;
 }
@@ -92,14 +90,14 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	const removed: OutboxRecord[] = [];
 	const updated: OutboxRecord[] = [];
 	const renamed: OutboxRename[] = [];
-	const apply: TailRecord[] = [];
 	const tailPut: TailRecord[] = [];
+	const skip = new Set<Seq>();
 	let checkpointState: Uint8Array | null = null;
 	let replacedFold = false;
 	let pages = 0;
 	let rowsSeen = 0;
 	const result = (t: ReadResult["t"], error?: string): ReadResult => ({
-		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, renamed, apply, tailPut, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
+		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, renamed, tailPut, skip, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
 	});
 	if (cls === "other") return result("done");
 	const start = repo.stream(stream);
@@ -169,33 +167,19 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 				replacedFold = true;
 			}
 		}
+		const items: LiveItem[] = [];
+		for (const r of page.rows) items.push(await classifyRow(deps, { stream, seq: r.seq, deviceId: r.deviceId, clientFrameId: r.clientFrameId, payload: r.payload }));
+		rowsSeen += items.length;
 		const rows: TailRecord[] = [];
 		const quarantines: QuarantineRecord[] = [];
 		const lateReceipts: { clientFrameId: ClientFrameId; seq: Seq; copy?: OwnCommitCopy }[] = [];
 		const settleAdoptables: ClientFrameId[] = [];
-		const settledSeqs = new Set<Seq>();
-		const receiptSeqs = new Set<Seq>();
-		for (const r of page.rows) {
-			rowsSeen++;
-			if (r.deviceId === deps.self) {
-				const ob = deps.outbox.get(r.clientFrameId);
-				if (ob && ob.stream === stream) {
-					const copy = ownCommitCopy(deps.gateCtx, deps.random, deps.self, ob, r.seq);
-					lateReceipts.push(copy ? { clientFrameId: r.clientFrameId, seq: r.seq, copy } : { clientFrameId: r.clientFrameId, seq: r.seq });
-					receiptSeqs.add(r.seq);
-					continue;
-				}
-			}
-			const g = await gateRow(deps.gateCtx, deps.hash, { stream, seq: r.seq, deviceId: r.deviceId, clientFrameId: r.clientFrameId, payload: r.payload }, deps.nowMs());
-			if (g.t === "row") rows.push(g.row);
-			else if (g.t === "quarantine") quarantines.push(g.rec);
-			if (r.deviceId !== deps.self) {
-				const a = deps.adoptFor(r.deviceId, r.clientFrameId);
-				if (a) {
-					settleAdoptables.push(a);
-					settledSeqs.add(r.seq);
-				}
-			}
+		for (const it of items) {
+			if (it.t === "receipt") lateReceipts.push(it.copy ? { clientFrameId: it.clientFrameId, seq: it.seq, copy: it.copy } : { clientFrameId: it.clientFrameId, seq: it.seq });
+			else if (it.t === "row") rows.push(it.row);
+			else if (it.t === "quarantine") quarantines.push(it.rec);
+			// "stale" needs a payload not held: a read page holds every one.
+			if (it.t !== "receipt" && it.t !== "stale" && it.settleAdoptable) settleAdoptables.push(it.settleAdoptable);
 		}
 		if (!opts.stillValid()) return result("aborted");
 		const completeThrough = page.more ? null : Math.max(opts.headSeq, page.lastSeq);
@@ -206,7 +190,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 		updated.push(...out.updated);
 		renamed.push(...out.renamed);
 		tailPut.push(...out.tailPut);
-		for (const row of out.tailPut) if (!receiptSeqs.has(row.seq) && !settledSeqs.has(row.seq)) apply.push(row);
+		notApplied(items, skip);
 		if (!page.more) return result("done");
 		after = Math.max(after, page.nextAfterSeq);
 		preferCheckpoint = false;
