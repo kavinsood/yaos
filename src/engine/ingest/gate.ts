@@ -15,12 +15,12 @@ import type { CryptoPort } from "../../ports/crypto";
 import type { QuarantineReason } from "../store/schema";
 import { decodeCfgOps } from "../../core/codec/cfgOps";
 import { decodeOuter } from "../../core/codec/envelope";
-import { decodeCfgFoldV1, encodeCfgFoldV1 } from "../../core/codec/cfgFoldV1";
 import { decodeBodyUpdateRef, decodeCheckpointContent } from "../../core/codec/contents";
 import { bytesEqual } from "../../core/codec/lib0";
-import { decodeNsFoldV1, encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { CFG_FOLD_RULES_VERSION } from "../../core/cfg/fold";
+import { verifyCfgCheckpoint, type CfgVerifyResult } from "../../core/cfg/verify";
+import { verifyNsCheckpoint, type NsVerifyResult } from "../../core/ns/verify";
 import { decodeSnapFoldV1, encodeSnapFoldV1 } from "../../core/codec/snapFoldV1";
 import { SNAP_FOLD_RULES_VERSION, type SnapFoldState } from "../../core/snap/fold";
 import { decodeSnapOps, type SnapOp } from "../../core/snap/record";
@@ -145,6 +145,22 @@ function staleVerdict(ctx: GateCtx, subject: GateSubject): GateResult | null {
 	return subject.t === "row" ? { ok: true, t: "stale", keyEpoch: e } : fail("stale-epoch", `keyEpoch ${e}`);
 }
 
+/**
+ * A failed ns / cfg verify (core/ns/verify.ts, core/cfg/verify.ts) as a gate failure. Only a newer foldRulesVersion
+ * depends on the reader (§c.10 upgrade-required); the rest is the writer's fault. catchUp.ts treats any failure as
+ * a disputed checkpoint: re-read the rows without it, or freeze the stream if they are gone.
+ */
+function verifyFail(what: string, v: Extract<NsVerifyResult | CfgVerifyResult, { ok: false }>): GateFail {
+	switch (v.reason) {
+		case "malformed":
+		case "non-canonical": return fail("decode-failed", `${what}: ${v.detail}`);
+		case "covers-seq": return fail("checkpoint-mismatch", `${what}: ${v.detail}`);
+		case "upgrade-required": return fail("envelope-version", `${what}: ${v.detail}`, true);
+		case "invariant":
+		case "rules-version": return fail("checkpoint-invariant", `${what}: ${v.detail}`);
+	}
+}
+
 async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "snap" | "body" | "canvas", coversSeq: Seq, inner: InnerEnvelope): Promise<GateResult> {
 	const ck = decodeCheckpointContent(inner.content);
 	if (!ck) return fail("decode-failed", "checkpoint content");
@@ -162,21 +178,18 @@ async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "snap" | "body" 
 		case "ns": {
 			if (ck.encoding !== CheckpointEncoding.nsFoldV1) return fail("kind-not-allowed", `encoding ${ck.encoding}`);
 			if (ck.foldRulesVersion > FOLD_RULES_VERSION) return fail("envelope-version", `foldRulesVersion ${ck.foldRulesVersion}`, true);
-			const st = decodeNsFoldV1(ck.state);
-			if (!st) return fail("decode-failed", "nsFoldV1");
-			// V1 canonical form; V2 subset: coversSeq binding.
-			if (!bytesEqual(encodeNsFoldV1(st), ck.state)) return fail("decode-failed", "nsFoldV1 not canonical");
-			if (st.coversSeq !== coversSeq) return fail("checkpoint-mismatch", "nsFoldV1 coversSeq");
-			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: st, cfgState: null };
+			// V1 (canonical re-encode) + V2 (structural invariants, foldRulesVersion, coversSeq binding), §b.5.
+			const v = verifyNsCheckpoint(ck, coversSeq);
+			if (!v.ok) return verifyFail("nsFoldV1", v);
+			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: v.state, cfgState: null };
 		}
 		case "cfg": {
 			if (ck.encoding !== CheckpointEncoding.cfgFoldV1) return fail("kind-not-allowed", `encoding ${ck.encoding}`);
 			if (ck.foldRulesVersion > CFG_FOLD_RULES_VERSION) return fail("envelope-version", `cfg foldRulesVersion ${ck.foldRulesVersion}`, true);
-			const st = decodeCfgFoldV1(ck.state);
-			if (!st) return fail("decode-failed", "cfgFoldV1");
-			if (!bytesEqual(encodeCfgFoldV1(st), ck.state)) return fail("decode-failed", "cfgFoldV1 not canonical");
-			if (st.coversSeq !== coversSeq) return fail("checkpoint-mismatch", "cfgFoldV1 coversSeq");
-			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: st };
+			// V1 + V2 as ns (§b.5 "Verification is V1 + V2").
+			const v = verifyCfgCheckpoint(ck, coversSeq);
+			if (!v.ok) return verifyFail("cfgFoldV1", v);
+			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: v.state };
 		}
 		case "snap": {
 			if (ck.encoding !== CheckpointEncoding.snapFoldV1) return fail("kind-not-allowed", `encoding ${ck.encoding}`);

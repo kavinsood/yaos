@@ -242,6 +242,8 @@ export type QuarantineReason =
 	| "post-apply-limit"
 	| "canvas-invalid"
 	| "checkpoint-mismatch"
+	/** An ns / cfg checkpoint that decodes canonically but breaks a V2 structural invariant (DESIGN §b.5). */
+	| "checkpoint-invariant"
 	/** A checkpoint sealed under an epoch below the winning revoke, covering past S_rot (e2ee-design §14.3): absent. */
 	| "stale-epoch"
 	/**
