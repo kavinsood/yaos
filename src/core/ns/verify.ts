@@ -1,6 +1,7 @@
 /**
  * ns checkpoint verification (DESIGN §b.5): V1 canonical form, V2 structural
- * invariants. V3 (digests at candidates) is in ./candidate.ts.
+ * invariants. The ingest gate runs both on every remote ns checkpoint
+ * (engine/ingest/gate.ts).
  *
  * Decisions (wp-a-notes.md):
  * - deleted entries must have deletedSeq === lastTouchSeq and merged entries

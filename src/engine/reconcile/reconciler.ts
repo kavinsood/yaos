@@ -180,7 +180,7 @@ export class Reconciler {
 			brake: ctx.brake, brakeApproval: ctx.brakeApproval, freshDocIds, deviceLabel: ctx.deps.deviceLabel, nowMs: ctx.now(),
 		};
 		const plan = planWith(input, {
-			pathKey: ctx.pk, nsReady: view.nsReady, divergence: view.divergence, brakeWindow: ctx.window(),
+			pathKey: ctx.pk, nsReady: view.nsReady, brakeWindow: ctx.window(),
 			tzOffsetMinutes: ctx.deps.tzOffsetMinutes?.() ?? 0, remoteTextHash: view.textHash, bodyAppliedSeq: view.appliedSeq, restoreDuty: view.restoreDuty,
 			lostCreateBody: view.lostCreateBody,
 			...(ctx.deps.pathBaseKeys ? { pathBaseKeys: ctx.deps.pathBaseKeys } : {}),

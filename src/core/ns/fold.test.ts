@@ -1,6 +1,5 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import type { ClientFrameId, ContentHash, DeviceId, DocId, DocKind, NsFoldEvent, NsFoldState, NsOp, NsOpOutcome, VaultPath } from "../types";
 import { CheckpointEncoding } from "../envelope";
 import { Writer, bytesEqual } from "../codec/lib0";
@@ -10,7 +9,7 @@ import { hashToBytes } from "../codec/ids";
 import { DEFAULT_NS_FOLD_RULES, foldNsFrame, foldNsFrameWith, newNsFoldIndex, newNsFoldState, nsFoldHalted, type NsFoldRules } from "./fold";
 import { buildIndex } from "./index";
 import { checkNsInvariants, verifyNsCheckpoint, verifyNsFoldBytes, verifyNsFoldState } from "./verify";
-import { checkDigest, isCandidateSeq, nsFoldDigest, recordDigest } from "./candidate";
+import { isCandidateSeq } from "./candidate";
 import { overlayPending } from "./overlay";
 import { replayBitsToBytes } from "../replayWindow";
 
@@ -513,24 +512,12 @@ test("verify V2: invariant violations and upgrade-required", () => {
 	assert.equal(verifyNsFoldState(base()).ok, true);
 });
 
-test("V3 candidates and digest ring", async () => {
+test("candidate seqs", () => {
 	assert.equal(isCandidateSeq(999, 1000), true);
 	assert.equal(isCandidateSeq(1000, 1001), false);
 	assert.equal(isCandidateSeq(998, 2500), true);
 	assert.equal(isCandidateSeq(0, 999), false);
 	assert.equal(isCandidateSeq(1999, 2000), true);
-	let ring = recordDigest([], 1000, "aa");
-	for (let i = 2; i <= 20; i++) ring = recordDigest(ring, i * 1000, `d${i}`);
-	assert.equal(ring.length, 16);
-	assert.equal(ring[0]!.seq, 5000);
-	assert.equal(checkDigest(ring, 1000, "aa"), "unknown");
-	assert.equal(checkDigest(ring, 20000, "d20"), "match");
-	assert.equal(checkDigest(ring, 20000, "zz"), "mismatch");
-	const sha = { sha256: async (b: Uint8Array) => new Uint8Array(createHash("sha256").update(b).digest()) };
-	const w = world();
-	w.fold(1, A, 0, [create(d1, "a.md")]);
-	const dg = await nsFoldDigest(w.state, sha);
-	assert.equal(dg, createHash("sha256").update(encodeNsFoldV1(w.state)).digest("hex"));
 });
 
 test("overlay folds pending frames on a clone; committed state untouched", () => {

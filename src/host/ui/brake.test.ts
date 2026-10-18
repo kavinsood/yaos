@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { brakeCopy, brakeHeadline, brakeReasonShort, brakeReasonText, BrakeTracker, MAX_SAMPLE_PATHS_SHOWN } from "./brake";
 import type { BrakeReport } from "../../core/types";
 
-const REASONS: BrakeReport["reason"][] = ["mass-delete-local", "mass-delete-remote", "mass-overwrite", "listing-shrank", "conflict-flood", "ns-divergence"];
+const REASONS: BrakeReport["reason"][] = ["mass-delete-local", "mass-delete-remote", "mass-overwrite", "listing-shrank", "conflict-flood"];
 
 function report(over: Partial<BrakeReport> = {}): BrakeReport {
 	return { id: "b1", reason: "mass-delete-local", heldCount: 3, syncedCount: 10, samplePaths: ["a.md", "b.md", "c.md"], ...over };
