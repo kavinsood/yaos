@@ -23,8 +23,8 @@ const rec = (createdAtMs: number): SnapRecord => ({
 	fileCount: 1, totalBytes: 10, bundleDigest: H(1), parts: [{ address: H(2), size: 120, sha256: H(2) }],
 });
 
-describe("unopened snap rows (§d.6, §14.3)", () => {
-	it("halt the snap fold until keys change; the re-gate opens them and the fold advances", async () => {
+void describe("unopened snap rows (§d.6, §14.3)", () => {
+	void it("halt the snap fold until keys change; the re-gate opens them and the fold advances", async () => {
 		const relay = new SimRelay();
 		const g = await genesis();
 		await rawAppend(relay, KEYRING_STREAM, g);

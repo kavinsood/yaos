@@ -17,6 +17,13 @@
  *  - unknown stream class                   -> accounted only
  *
  * ownCommitCopy: an own frame (outbox record) that committed stale is renamed to an unsealed copy instead.
+ *
+ * classifyRow is the one per-row step of live ingest (liveIngest.ts) and catch-up reads (catchUp.ts), before the
+ * gate (DESIGN §d.5, §d.7):
+ *  - own row whose clientFrameId is in the outbox for this stream -> (late) receipt (committed stale: a copy)
+ *  - payload not held (live only: overflow, or reading only `k`) -> T_stale, read later
+ *  - everything else                                              -> gateRow (tail / quarantine / accounted),
+ *                                                                   with the own adoptable it settles, if any
  */
 
 import { QUARANTINE_ROW_BYTES } from "../../core/limits";
@@ -25,7 +32,7 @@ import type { HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
 import { newClientFrameId } from "../../core/codec/ids";
 import { gate, type GateCtx } from "../ingest/gate";
-import type { OwnCommitCopy } from "../store/repo";
+import type { LiveItem, OwnCommitCopy } from "../store/repo";
 import type { OutboxRecord, QuarantineRecord, TailRecord } from "../store/schema";
 import { bytesToHex } from "../../core/codec/lib0";
 import { KEY_RECORD_MAX_BYTES } from "../keyring/record";
@@ -74,6 +81,52 @@ export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, now
 		return { t: "row", row: { ...base, kind, authorNsSeq: 0, flags: 0, frameNo: 0, content: new Uint8Array(0) } };
 	}
 	return { t: "quarantine", rec: await quarantineRecord(hash, input, g.reason, g.detail, nowMs, g.readerDependent) };
+}
+
+/** What classifyRow reads (CatchUpDeps; EngineCtx.deps is one). */
+export interface ClassifyDeps {
+	readonly gateCtx: GateCtx;
+	readonly hash: HashPort;
+	readonly random: RandomPort;
+	readonly self: DeviceId;
+	readonly outbox: { get(clientFrameId: ClientFrameId): OutboxRecord | undefined };
+	/** Own adoptable shadowing (deviceId, clientFrameId), if any (DESIGN §d.5 settle). */
+	adoptFor(deviceId: DeviceId, clientFrameId: ClientFrameId): ClientFrameId | null;
+	nowMs(): number;
+}
+
+/**
+ * One committed row, classified (module comment). `payload` null: the caller does not hold it (live: dropped by
+ * the overflow, or the keyring allows reading only `k`, e2ee-design §12.4); a read page always holds it. The
+ * commit of another device settles the own adoptable shadowing it whatever the row gates to (§d.5: "commit
+ * observed"): an accounted row (stale epoch, §14.3) is settled too, so it is not re-sent after the 60 s fallback.
+ */
+export async function classifyRow(deps: ClassifyDeps, input: Omit<RowInput, "payload"> & { readonly payload: Uint8Array | null }): Promise<LiveItem> {
+	if (input.deviceId === deps.self) {
+		const ob = deps.outbox.get(input.clientFrameId);
+		if (ob && ob.stream === input.stream) return receiptItem(deps, input.stream, input.clientFrameId, input.seq, ob);
+	}
+	if (input.payload === null) return { t: "stale", stream: input.stream, seq: input.seq };
+	const g = await gateRow(deps.gateCtx, deps.hash, { ...input, payload: input.payload }, deps.nowMs());
+	const settleAdoptable = input.deviceId !== deps.self ? deps.adoptFor(input.deviceId, input.clientFrameId) : null;
+	if (g.t === "row") return { t: "row", row: g.row, settleAdoptable };
+	if (g.t === "quarantine") return { t: "quarantine", rec: g.rec, settleAdoptable };
+	return { t: "account", seq: input.seq, settleAdoptable };
+}
+
+/** An own frame's receipt; an outbox record of this stream that committed stale is renamed to its copy (ownCommitCopy). */
+export function receiptItem(deps: ClassifyDeps, stream: StreamName, clientFrameId: ClientFrameId, seq: Seq, ob = deps.outbox.get(clientFrameId)): LiveItem {
+	const copy = ob && ob.stream === stream ? ownCommitCopy(deps.gateCtx, deps.random, deps.self, ob, seq) : null;
+	return copy ? { t: "receipt", stream, clientFrameId, seq, copy } : { t: "receipt", stream, clientFrameId, seq };
+}
+
+/** Seqs of classified rows whose stored row is not applied to a replica: own receipts (the replica made them) and settled adoptables (applied as the provisional). */
+export function notApplied(items: readonly LiveItem[], into = new Set<Seq>()): Set<Seq> {
+	for (const it of items) {
+		if (it.t === "receipt") into.add(it.seq);
+		else if (it.t !== "stale" && it.settleAdoptable) into.add(it.t === "row" ? it.row.seq : it.t === "quarantine" ? it.rec.seq : it.seq);
+	}
+	return into;
 }
 
 /**

@@ -93,7 +93,11 @@ export interface OutboxRename {
 	readonly next: OutboxRecord;
 }
 
-/** One live relay event, already gated (DESIGN §d.6 stages 1-2). Arrival (= seq) order. */
+/**
+ * One relay row (or live receipt), classified and gated (classifyRow, DESIGN §d.6 stages 1-2): what tLive stores, in
+ * arrival (= seq) order; a read page partitions the same items into ReadPageInput. settleAdoptable: the own adoptable
+ * the commit settles (§d.5), whatever the row gates to.
+ */
 export type LiveItem =
 	/** Committed row from another device (or an own row without outbox record). */
 	| { readonly t: "row"; readonly row: TailRecord; readonly settleAdoptable: ClientFrameId | null }
@@ -102,8 +106,8 @@ export type LiveItem =
 	| { readonly t: "receipt"; readonly stream: StreamName; readonly clientFrameId: ClientFrameId; readonly seq: Seq; readonly copy?: OwnCommitCopy }
 	/** Overflow / null payload: record stale, read later (T_stale). */
 	| { readonly t: "stale"; readonly stream: StreamName; readonly seq: Seq }
-	/** Unknown stream class: accounted, nothing stored. */
-	| { readonly t: "account"; readonly seq: Seq };
+	/** Accounted, nothing stored (unknown stream class, a stale-epoch body row, §14.3). */
+	| { readonly t: "account"; readonly seq: Seq; readonly settleAdoptable: ClientFrameId | null };
 
 export interface LiveResult {
 	readonly vaultSeq: Seq;
@@ -415,7 +419,10 @@ export class Repo {
 				let receipts = 0;
 				let receiptBytes = 0;
 				for (const it of items) {
-					if (it.t === "account") continue;
+					if (it.t === "account") {
+						if (it.settleAdoptable) await settleAdoptable(tx, it.settleAdoptable, removed, updated);
+						continue;
+					}
 					if (it.t === "stale") {
 						const r = await getRec(it.stream);
 						r.remoteHeadSeq = Math.max(r.remoteHeadSeq, it.seq);
@@ -472,14 +479,7 @@ export class Repo {
 					if (deviceId !== self && seq > r.lastOwnSeq && duty.delete(stream)) dutyChanged = true;
 					advance(r, seq, vAfter);
 					r.priority = this.priorityFn(r);
-					if (it.settleAdoptable) {
-						const ob = await tx.get(STORE.outbox, it.settleAdoptable);
-						if (ob && ob.state === "adoptable") {
-							tx.delete(STORE.outbox, ob.clientFrameId);
-							removed.push(ob);
-							updated.push(...(await releaseDependents(tx, ob)));
-						}
-					}
+					if (it.settleAdoptable) await settleAdoptable(tx, it.settleAdoptable, removed, updated);
 				}
 				for (const r of recs.values()) tx.put(STORE.streams, r);
 				const cur = (await tx.get(STORE.meta, "cursor") as MetaCursor | undefined) ?? { key: "cursor", vaultSeq: 0, headSeqSeen: 0 };
@@ -583,14 +583,7 @@ export class Repo {
 					r.lastOwnSeq = Math.max(r.lastOwnSeq, lr.seq);
 					r.remoteHeadSeq = Math.max(r.remoteHeadSeq, lr.seq);
 				}
-				for (const cfid of input.settleAdoptables) {
-					const ob = await tx.get(STORE.outbox, cfid);
-					if (ob && ob.state === "adoptable") {
-						tx.delete(STORE.outbox, cfid);
-						removed.push(ob);
-						updated.push(...(await releaseDependents(tx, ob)));
-					}
-				}
+				for (const cfid of input.settleAdoptables) await settleAdoptable(tx, cfid, removed, updated);
 				r.remoteHeadSeq = Math.max(r.remoteHeadSeq, input.lastSeq);
 				if (input.checkpointSeq > r.remoteCheckpointCoversSeq) r.remoteCheckpointCoversSeq = input.checkpointSeq;
 				if (input.completeThrough !== null) r.appliedSeq = Math.max(r.appliedSeq, Math.min(r.remoteHeadSeq, input.completeThrough));
@@ -930,6 +923,15 @@ function advance(r: Mut<StreamRecord>, seq: Seq, vAfter: Seq): void {
 	if (caughtUp && seq > r.appliedSeq && seq <= vAfter) r.appliedSeq = seq;
 	r.remoteHeadSeq = Math.max(r.remoteHeadSeq, seq);
 	r.stale = r.appliedSeq < r.remoteHeadSeq ? 1 : 0;
+}
+
+/** DESIGN §d.5: the commit it shadows was observed: delete the adoptable without re-applying, release its dependents. */
+async function settleAdoptable(tx: Tx, cfid: ClientFrameId, removed: OutboxRecord[], updated: OutboxRecord[]): Promise<void> {
+	const ob = await tx.get(STORE.outbox, cfid);
+	if (!ob || ob.state !== "adoptable") return;
+	tx.delete(STORE.outbox, cfid);
+	removed.push(ob);
+	updated.push(...(await releaseDependents(tx, ob)));
 }
 
 /**

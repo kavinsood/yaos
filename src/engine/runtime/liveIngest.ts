@@ -26,10 +26,10 @@
  * The queue survives a session close (its events are committed facts).
  */
 
-import { CFG_STREAM, KEYRING_STREAM, NS_STREAM, SNAP_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
+import { CFG_STREAM, KEYRING_STREAM, NS_STREAM, SNAP_STREAM, streamClass, type ClientFrameId, type DeviceId, type StreamName } from "../../core/types";
 import type { RelayEvent } from "../../ports/relay";
 import type { LiveItem } from "../store/repo";
-import { gateRow, ownCommitCopy } from "../sync/ingestRow";
+import { classifyRow, notApplied, receiptItem } from "../sync/ingestRow";
 import type { EngineCtx } from "./context";
 
 type QueuedEvent = Extract<RelayEvent, { t: "receipt" | "committed" | "provisional" | "provisionalDropped" }>;
@@ -151,53 +151,25 @@ export class LiveIngest {
 		}
 	}
 
-	private receipt(stream: StreamName, clientFrameId: ClientFrameId, seq: Seq): LiveItem {
-		const c = this.c;
-		const ob = c.outbox.get(clientFrameId);
-		const copy = ob && ob.stream === stream ? ownCommitCopy(c.gateCtx, c.ports.random, c.self, ob, seq) : null;
-		return copy ? { t: "receipt", stream, clientFrameId, seq, copy } : { t: "receipt", stream, clientFrameId, seq };
-	}
-
 	private async ingest(batch: readonly QueuedEvent[]): Promise<void> {
 		const c = this.c;
 		const items: LiveItem[] = [];
-		const skipApply = new Set<Seq>();
-		let stale = 0;
-		let receipts = 0;
-		const now = c.now();
 		const onlyK = c.keyring.readsOnlyK();
 		for (const ev of batch) {
-			const kr = ev.t === "receipt" ? c.keyring.receiptRow(ev) : null;
-			if (kr) {
-				items.push({ t: "row", row: kr, settleAdoptable: null });
-				continue;
-			}
 			if (ev.t === "receipt") {
-				items.push(this.receipt(ev.stream, ev.clientFrameId, ev.seq));
-				skipApply.add(ev.seq);
-				receipts++;
+				const kr = c.keyring.receiptRow(ev);
+				items.push(kr ? { t: "row", row: kr, settleAdoptable: null } : receiptItem(c.deps, ev.stream, ev.clientFrameId, ev.seq));
 				continue;
 			}
 			if (ev.t !== "committed") continue;
 			const f = ev.frame;
-			if (f.deviceId === c.self && c.outbox.get(f.clientFrameId)?.stream === f.stream) {
-				items.push(this.receipt(f.stream, f.clientFrameId, f.seq));
-				skipApply.add(f.seq);
-				receipts++;
-				continue;
-			}
-			if (f.payload === null || (onlyK && streamClass(f.stream) !== "keyring")) {
-				items.push({ t: "stale", stream: f.stream, seq: f.seq });
-				stale++;
-				continue;
-			}
-			const g = await gateRow(c.gateCtx, c.ports.hash, { stream: f.stream, seq: f.seq, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload: f.payload }, now);
-			const settle = f.deviceId !== c.self ? c.adoptFor(f.deviceId, f.clientFrameId) : null;
-			if (settle) skipApply.add(f.seq);
-			if (g.t === "row") items.push({ t: "row", row: g.row, settleAdoptable: settle });
-			else if (g.t === "quarantine") items.push({ t: "quarantine", rec: g.rec, settleAdoptable: settle });
-			else items.push({ t: "account", seq: f.seq });
+			// Reading only `k` (§12.4): every other row is left stale, as one whose payload the overflow dropped.
+			const payload = onlyK && streamClass(f.stream) !== "keyring" ? null : f.payload;
+			items.push(await classifyRow(c.deps, { stream: f.stream, seq: f.seq, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload }));
 		}
+		const skipApply = notApplied(items);
+		const receipts = items.filter((it) => it.t === "receipt").length;
+		const stale = items.filter((it) => it.t === "stale").length;
 		let res;
 		try {
 			res = await c.repo.tLive(items, c.now(), c.day());

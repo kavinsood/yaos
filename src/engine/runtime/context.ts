@@ -54,7 +54,7 @@ const INFO_NOTICES = new Set(["recovered-from-mirror"]);
 export interface Fold {
 	readonly rt: FoldRuntime<unknown, unknown>;
 	/** Fold the newly available rows (reload: the snapshot was replaced, refold from it) and report them. */
-	after(reload: boolean): Promise<void>;
+	readonly after: (reload: boolean) => Promise<void>;
 }
 
 export function adoptKey(deviceId: DeviceId, cfid: ClientFrameId): string {
