@@ -160,11 +160,6 @@ export class LogEngine {
 			clock: opts.ports.clock,
 			rankOf: rankOf(c),
 			maxInflightBytes: () => c.budgets.maxInflightAppendBytes,
-			onSent: (rec, attempts) => {
-				c.sentPending.set(rec.clientFrameId, { attempts, atMs: c.now() });
-				const cur = c.outbox.get(rec.clientFrameId);
-				if (cur?.state === "pending") c.outbox.put({ ...cur, state: "sent", attempts, lastSentAtMs: c.now() });
-			},
 			onPoison: (rec, why) => {
 				c.diag("frame-poisoned", { why });
 				void c.repo.tOutbox([{ t: "state", clientFrameId: rec.clientFrameId, state: "poisoned" }]).then((r) => c.applyOutboxResult(r));
@@ -499,12 +494,11 @@ export class LogEngine {
 
 	// ------------------------------------------------------------ lifecycle
 
-	/** Close every open frame, persist T_sent, write the mirror. */
+	/** Close every open frame, write the mirror. */
 	async flush(): Promise<void> {
 		const c = this.c;
 		for (const h of [...c.handles.all()]) if (!h.builder.empty) void c.docs.closeFrame(h);
 		await c.docs.chain(async () => undefined);
-		await this.maint.flushSent();
 		await c.mirror.flush();
 	}
 

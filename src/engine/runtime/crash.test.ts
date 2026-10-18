@@ -140,14 +140,11 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 			relay.pauseCommits();
 			await run(A().editDoc(a1, (t) => t.insert(0, "paused;")));
 			await until(() => storage.dead || A().c.sender.inflightCount > 0, 2_000, "inflight", clock);
-			// Lazy T_sent while the frame is unreceipted (commits paused, so no receipt can clear sentPending first).
-			const sent = labels.filter((l) => l === "tSent").length;
-			await until(() => storage.dead || labels.filter((l) => l === "tSent").length > sent, 2_000, "tSent", clock);
 			relay.restart();
 			relay.resumeCommits();
 		});
 		relay.resumeCommits();
-		await step(() => sleep(120, clock)); // checkpoints / compaction / T_sent ticks
+		await step(() => sleep(120, clock)); // checkpoints / compaction ticks
 		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle 4", clock));
 		if (k === null) {
 			assert.equal(storage.dead, false);
@@ -213,7 +210,7 @@ test("crash sweep: baseline scenario converges and exercises every e.2 transacti
 	const r = await scenario(null, "commit");
 	baseline = r.labels;
 	const kinds = new Set(baseline);
-	for (const t of ["open", "tFeedPage", "tReadPage", "tEdit", "tLive", "tSent", "tSnapshot", "tPatchStreams"]) assert.ok(kinds.has(t), `scenario runs ${t} (got ${[...kinds].join(",")})`);
+	for (const t of ["open", "tFeedPage", "tReadPage", "tEdit", "tLive", "tSnapshot", "tPatchStreams"]) assert.ok(kinds.has(t), `scenario runs ${t} (got ${[...kinds].join(",")})`);
 	console.log(`crash baseline: ${baseline.length} commits: ${[...kinds].map((t) => `${t}x${baseline.filter((l) => l === t).length}`).join(" ")}`);
 });
 

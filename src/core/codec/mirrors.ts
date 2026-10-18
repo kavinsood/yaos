@@ -19,6 +19,7 @@ export const OUTBOX_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x4f,
 export const SYNCED_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x53, 0x59, 0x4e, 0x31]);
 export const MIRROR_FORMAT_VERSION = 1;
 
+/** "sent" (code 3) is no longer written (DB schema 2) but still decoded: older mirrors carry it; recovery imports it as pending. */
 export type MirrorOutboxState = "held" | "pending" | "sent" | "poisoned" | "adoptable";
 const OUTBOX_STATES: readonly MirrorOutboxState[] = ["held", "pending", "sent", "poisoned", "adoptable"];
 

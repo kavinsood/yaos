@@ -20,7 +20,7 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
  * Bumped on any change to stores, indexes or record shapes. An older DB fails Repo.open's identity check
  * (schemaVersion) and is deleted and rebuilt from relay + disk + side-file mirrors (DESIGN §i.5).
  * 2: dropped the unused streams byStalePriority / byAccess, synced byPathKey and blobQueue byActiveDue indexes
- * and the fields only they read.
+ * and the fields only they read; dropped the outbox "sent" state, attempts and lastSentAtMs (T_sent).
  */
 export const DB_SCHEMA_VERSION = 2;
 export const DB_NAME_PREFIX = "yaos2";
@@ -177,10 +177,11 @@ export type TailKey = readonly [StreamName, Seq];
 export type OutboxState =
 	/** Waiting for a dependency (initial body frame held until its ns create is folded, DESIGN §j.5). */
 	| "held"
-	/** Persisted, not yet written to a session. */
+	/**
+	 * Persisted, awaiting receipt: "maybe sent" (DESIGN §d.4). What is in flight on the current session is the
+	 * sender's memory only (Sender.isInflight); every pending record is resent after a restart or STREAM_RESEND.
+	 */
 	| "pending"
-	/** Written to a session; awaiting receipt. */
-	| "sent"
 	/** Refused as oversize/invalid; kept for recovery, never resent automatically. */
 	| "poisoned"
 	/**
@@ -211,7 +212,7 @@ export interface OutboxRecord {
 	 */
 	readonly keyEpoch: number;
 	/**
-	 * pending / sent: the live ns create this body frame goes after (DESIGN §e.1, Sender blockedBy).
+	 * pending: the live ns create this body frame goes after (DESIGN §e.1, Sender blockedBy).
 	 * held: the frame this waits for (DESIGN §e.1): the doc's ns create
 	 * (released when it folds) or the newest adoptable of the same stream
 	 * (released when that record is gone).
@@ -219,9 +220,7 @@ export interface OutboxRecord {
 	readonly dependsOn: ClientFrameId | null;
 	/** adoptable only: identity of the provisional frame being shadowed. */
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly receivedAtMs: number } | null;
-	readonly attempts: number;
 	readonly createdAtMs: number;
-	readonly lastSentAtMs: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +425,8 @@ export interface OutboxMirrorFrame {
 	readonly clientFrameId: ClientFrameId;
 	readonly stream: StreamName;
 	readonly order: number;
-	readonly state: OutboxState;
+	/** Mirrors written before DB schema 2 may say "sent" (a pending record then in flight); recovery imports it as pending. */
+	readonly state: OutboxState | "sent";
 	readonly authorNsSeq: Seq;
 	readonly dependsOn: ClientFrameId | null;
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId } | null;

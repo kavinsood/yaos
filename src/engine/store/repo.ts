@@ -74,7 +74,7 @@ export function newStreamRecord(stream: StreamName): StreamRecord {
 }
 
 /** Frame to append to the outbox; order is assigned by the tx. */
-export type NewOutboxFrame = Omit<OutboxRecord, "order" | "attempts" | "lastSentAtMs">;
+export type NewOutboxFrame = Omit<OutboxRecord, "order">;
 
 /**
  * An own frame that committed under an epoch the §14.3 rule makes stale, or may ("hold"): its record is renamed
@@ -148,7 +148,7 @@ export type OutboxChange =
 	| { readonly t: "delete"; readonly clientFrameId: ClientFrameId }
 	| { readonly t: "state"; readonly clientFrameId: ClientFrameId; readonly state: OutboxState }
 	/**
-	 * pending/sent only, still sealed under `fromEpoch` with `fromLength` bytes: sealed again under the current epoch
+	 * pending only, still sealed under `fromEpoch` with `fromLength` bytes: sealed again under the current epoch
 	 * (e2ee-design §14.2 step 4), under `next.clientFrameId` (its own for ns/cfg, a fresh one otherwise).
 	 */
 	| { readonly t: "reseal"; readonly clientFrameId: ClientFrameId; readonly fromEpoch: number; readonly fromLength: number; readonly next: { readonly clientFrameId: ClientFrameId; readonly sealed: Uint8Array; readonly keyEpoch: number } };
@@ -341,7 +341,7 @@ export class Repo {
 				let next = Math.max(meta.next, this.outboxNext);
 				const recs: OutboxRecord[] = [];
 				for (const f of frames) {
-					const rec: OutboxRecord = { ...f, order: next++, attempts: 0, lastSentAtMs: 0 };
+					const rec: OutboxRecord = { ...f, order: next++ };
 					tx.put(STORE.outbox, rec);
 					recs.push(rec);
 					if (touchStream) {
@@ -358,21 +358,6 @@ export class Repo {
 			for (const s of touched.values()) this.cache.set(s.stream, s);
 			return out.recs;
 		});
-	}
-
-	// -------------------------------------------------------------------------
-	// T_sent (lazy, diagnostics only)
-	// -------------------------------------------------------------------------
-
-	tSent(updates: readonly { readonly clientFrameId: ClientFrameId; readonly attempts: number; readonly lastSentAtMs: number }[]): Promise<void> {
-		if (updates.length === 0) return Promise.resolve();
-		return this.serial("tSent", () => this.db.tx([STORE.outbox], "readwrite", async (tx) => {
-			for (const u of updates) {
-				const r = await tx.get(STORE.outbox, u.clientFrameId);
-				if (!r || (r.state !== "pending" && r.state !== "sent")) continue;
-				tx.put(STORE.outbox, { ...r, state: "sent", attempts: u.attempts, lastSentAtMs: u.lastSentAtMs });
-			}
-		}));
 	}
 
 	// -------------------------------------------------------------------------
@@ -652,8 +637,8 @@ export class Repo {
 						tx.put(STORE.outbox, n);
 						updated.push(n);
 					} else if (c.t === "reseal") {
-						if ((r.state !== "pending" && r.state !== "sent") || r.keyEpoch !== c.fromEpoch || r.sealed.length !== c.fromLength) continue;
-						const n: OutboxRecord = { ...r, ...c.next, state: "pending", attempts: 0, lastSentAtMs: 0 };
+						if (r.state !== "pending" || r.keyEpoch !== c.fromEpoch || r.sealed.length !== c.fromLength) continue;
+						const n: OutboxRecord = { ...r, ...c.next };
 						await rename(tx, r, n, updated);
 						renamed.push({ old: r, next: n });
 					} else {
@@ -729,9 +714,8 @@ export class Repo {
 		});
 	}
 
-	/** Recovery (DESIGN §i.5): import mirrored outbox frames (sent -> pending), outboxOrder.next = max + 1. */
 	/**
-	 * Mirror recovery into a fresh DB. Imported body / canvas frames move their stream's bodyVersion.localOrder
+	 * Mirror recovery into a fresh DB (DESIGN §i.5): outboxOrder.next = max + 1. Imported body / canvas frames move their stream's bodyVersion.localOrder
 	 * like T_edit: the imported synced records carry no localOrder, and nothing says the frames' text (editor
 	 * keystrokes never saved, merges whose write died) is on disk, so Rc must hold until a merge settles it.
 	 */
@@ -741,7 +725,7 @@ export class Repo {
 			const next = await this.db.tx([STORE.outbox, STORE.meta, STORE.streams], "readwrite", async (tx) => {
 				let max = 0;
 				for (const r of records) {
-					tx.put(STORE.outbox, r.state === "sent" ? { ...r, state: "pending" } : r);
+					tx.put(STORE.outbox, r);
 					max = Math.max(max, r.order);
 					const cls = streamClass(r.stream);
 					if (cls !== "body" && cls !== "canvas") continue;
@@ -827,21 +811,21 @@ async function settleOwn(tx: Tx, ob: OutboxRecord, copy: OwnCommitCopy | undefin
 		updated.push(...(await releaseDependents(tx, ob)));
 		return;
 	}
-	const next: OutboxRecord = { ...ob, clientFrameId: copy.clientFrameId, sealed: new Uint8Array(0), state: "pending", attempts: 0, lastSentAtMs: 0 };
+	const next: OutboxRecord = { ...ob, clientFrameId: copy.clientFrameId, sealed: new Uint8Array(0), state: "pending" };
 	await rename(tx, ob, next, updated);
 	renamed.push({ old: ob, next });
 }
 
 /**
  * `next` replaces `old` at the same order (the order indexes are unique: the old key goes first); held records
- * waiting for `old` wait for `next` (dependsOn: ns creates, adopted records), and so do the pending / sent body
+ * waiting for `old` wait for `next` (dependsOn: ns creates, adopted records), and so do the pending body
  * frames of a live ns create (DESIGN §e.1: they never go before it).
  */
 async function rename(tx: Tx, old: OutboxRecord, next: OutboxRecord, updated: OutboxRecord[]): Promise<void> {
 	if (next.clientFrameId !== old.clientFrameId) tx.delete(STORE.outbox, old.clientFrameId);
 	tx.put(STORE.outbox, next);
 	if (next.clientFrameId === old.clientFrameId) return;
-	const states: OutboxState[] = old.stream === NS_STREAM ? ["held", "pending", "sent"] : ["held"];
+	const states: OutboxState[] = old.stream === NS_STREAM ? ["held", "pending"] : ["held"];
 	for (const st of states) for (const h of await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, stateOrderRange(st))) {
 		if (h.dependsOn !== old.clientFrameId) continue;
 		const n: OutboxRecord = { ...h, dependsOn: next.clientFrameId };

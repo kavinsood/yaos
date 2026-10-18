@@ -39,7 +39,7 @@ function outbox(id: string, order: number, state: OutboxState = "pending", strea
 	return {
 		clientFrameId: F(id), order, stream: S(stream), kind: "bodyUpdate", state,
 		sealed: new Uint8Array([order & 255, 1, 2, 3]), content: new Uint8Array([order & 255]),
-		authorNsSeq: 0, flags: 0, frameNo: null, keyEpoch: 0, dependsOn: null, adoptOf: null, attempts: 0, createdAtMs: 1000 + order, lastSentAtMs: 0,
+		authorNsSeq: 0, flags: 0, frameNo: null, keyEpoch: 0, dependsOn: null, adoptOf: null, createdAtMs: 1000 + order,
 	};
 }
 
@@ -154,9 +154,9 @@ for (const impl of IMPLS) {
 
 			// put replaces by key
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
-				tx.put(STORE.outbox, { ...o, state: "sent", attempts: 1 });
+				tx.put(STORE.outbox, { ...o, state: "poisoned" });
 			});
-			assert.equal((await db.tx([STORE.outbox], "readonly", (tx) => tx.get(STORE.outbox, F("f1"))))?.state, "sent");
+			assert.equal((await db.tx([STORE.outbox], "readonly", (tx) => tx.get(STORE.outbox, F("f1"))))?.state, "poisoned");
 			assert.equal(await db.tx([STORE.outbox], "readonly", (tx) => tx.count(STORE.outbox)), 1);
 
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
@@ -219,11 +219,11 @@ for (const impl of IMPLS) {
 			const db = await openYaos(impl.make());
 			const recs = [
 				outbox("a", 1, "pending", "b:x"),
-				outbox("b", 2, "sent", "b:y"),
+				outbox("b", 2, "poisoned", "b:y"),
 				outbox("c", 3, "pending", "b:y"),
 				outbox("d", 4, "held", "b:x"),
 				outbox("e", 5, "pending", "b:x"),
-				outbox("f", 6, "sent", "b:x"),
+				outbox("f", 6, "poisoned", "b:x"),
 			];
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
 				for (const r of [...recs].reverse()) tx.put(STORE.outbox, r);
@@ -234,9 +234,9 @@ for (const impl of IMPLS) {
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("pending"))), ["a", "c", "e"]);
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("pending", 1, true))), ["c", "e"]);
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("pending"), 2)), ["a", "c"]);
-				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("sent"))), ["b", "f"]);
-				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("poisoned"))), []);
-				// whole index: "held" < "pending" < "sent"
+				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("poisoned"))), ["b", "f"]);
+				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("adoptable"))), []);
+				// whole index: "held" < "pending" < "poisoned"
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState)), ["d", "a", "c", "e", "b", "f"]);
 				assert.equal(await tx.countByIndex(STORE.outbox, INDEX.outboxByState, state("pending")), 3);
 				assert.equal(await tx.countByIndex(STORE.outbox, INDEX.outboxByState), 6);
@@ -256,12 +256,12 @@ for (const impl of IMPLS) {
 
 			// index entries follow updates and deletes
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
-				tx.put(STORE.outbox, { ...recs[0]!, state: "sent" });
+				tx.put(STORE.outbox, { ...recs[0]!, state: "poisoned" });
 				tx.delete(STORE.outbox, F("c"));
 			});
 			await db.tx([STORE.outbox], "readonly", async (tx) => {
 				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("pending"))), ["e"]);
-				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("sent"))), ["a", "b", "f"]);
+				assert.deepEqual(ids(await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, state("poisoned"))), ["a", "b", "f"]);
 				assert.equal(await tx.countByIndex(STORE.outbox, INDEX.outboxByStream, stream2("b:y")), 1);
 			});
 			function stream2(s: string): KeyRange {
@@ -329,7 +329,7 @@ for (const impl of IMPLS) {
 			await rejectsWith(
 				db.tx([STORE.outbox], "readwrite", async (tx) => {
 					tx.put(STORE.outbox, outbox("three", 3));
-					tx.put(STORE.outbox, outbox("dup2", 1, "sent", "b:other"));
+					tx.put(STORE.outbox, outbox("dup2", 1, "poisoned", "b:other"));
 					await tx.get(STORE.outbox, F("one"));
 					return "unreachable?";
 				}),
@@ -342,7 +342,7 @@ for (const impl of IMPLS) {
 			assert.equal(meta, undefined);
 			// re-putting the same record under its own key is not a violation
 			await db.tx([STORE.outbox], "readwrite", async (tx) => {
-				tx.put(STORE.outbox, { ...outbox("one", 1), attempts: 2 });
+				tx.put(STORE.outbox, { ...outbox("one", 1), createdAtMs: 2 });
 			});
 		});
 

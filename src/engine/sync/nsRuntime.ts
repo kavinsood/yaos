@@ -129,7 +129,7 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 		for (const r of outbox.values()) {
 			if (!r.dependsOn || outbox.has(r.dependsOn)) continue;
 			const held = r.state === "held";
-			if (!held && r.state !== "pending" && r.state !== "sent") continue;
+			if (!held && r.state !== "pending") continue;
 			const cls = streamClass(r.stream);
 			const docId = cls === "body" || cls === "canvas" ? streamDocId(r.stream) : null;
 			if (!docId) {

@@ -170,9 +170,10 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 			if (local.length === 0) c.diag("mirror-ref-content-missing", {});
 		}
 		records.push({
-			clientFrameId: f.clientFrameId, order: f.order, stream: f.stream, kind, state: f.state, sealed: f.sealed, content: local,
+			// "sent" (mirrors before DB schema 2) was a pending record in flight: maybe sent, resent like any pending one.
+			clientFrameId: f.clientFrameId, order: f.order, stream: f.stream, kind, state: f.state === "sent" ? "pending" : f.state, sealed: f.sealed, content: local,
 			authorNsSeq: f.authorNsSeq, flags, frameNo: frameNo === 0 ? null : frameNo, keyEpoch, dependsOn: f.dependsOn,
-			adoptOf: f.adoptOf ? { ...f.adoptOf, receivedAtMs: now } : null, attempts: 0, createdAtMs: now, lastSentAtMs: 0,
+			adoptOf: f.adoptOf ? { ...f.adoptOf, receivedAtMs: now } : null, createdAtMs: now,
 		});
 	}
 	if (records.length === 0) return 0;
