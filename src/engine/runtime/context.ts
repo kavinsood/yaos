@@ -94,6 +94,7 @@ export class EngineCtx {
 	repoOpenMs: number | null = null;
 	dailyLimitUntilMono = 0;
 	private readonly dailyLimitNotices = new DailyLimitNoticeGate();
+	/** Own frames receipted on `day` (daily soft budget, DESIGN §i.6). Starts from meta daily at boot. */
 	daily = { day: "", frames: 0 };
 	/** Monotonic time the head hint was first seen above V with an idle live queue. */
 	headAheadSince: number | null = null;

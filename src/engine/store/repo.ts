@@ -160,6 +160,8 @@ export class Repo {
 	private ckptDuty = new Set<StreamName>();
 	/** meta frameNoFloor (epoch migration, e2ee-design §8.2); read at open. */
 	frameNoFloor: FrameNoFloor = { ns: 0, cfg: 0 };
+	/** meta daily as read at open (the engine's live counter starts from it; T_live keeps the record). */
+	dailyAtOpen: { readonly day: string; readonly frames: number } = { day: "", frames: 0 };
 	/** Catch-up order of stale streams (sessionLoop, catchUp.ts staleOrder; DESIGN §j.6). Computed, never stored. */
 	priorityFn: PriorityFn = defaultPriority;
 	/** Streams a quarantine record just froze (tLive / tReadPage, after the commit): the engine retargets their views (§d.6). */
@@ -219,15 +221,20 @@ export class Repo {
 	}
 
 	private async loadCache(): Promise<void> {
-		const { streams, duty, floor } = await this.db.tx([STORE.streams, STORE.meta], "readonly", async (tx) => {
+		const { streams, duty, floor, daily } = await this.db.tx([STORE.streams, STORE.meta], "readonly", async (tx) => {
 			const streams = await tx.getAll(STORE.streams);
 			const d = await tx.get(STORE.meta, "ckptDuty");
 			const f = await tx.get(STORE.meta, "frameNoFloor");
-			return { streams, duty: d && d.key === "ckptDuty" ? d.streams : [], floor: f && f.key === "frameNoFloor" ? { ns: f.ns, cfg: f.cfg } : { ns: 0, cfg: 0 } };
+			const y = await tx.get(STORE.meta, "daily");
+			return {
+				streams, duty: d && d.key === "ckptDuty" ? d.streams : [], floor: f && f.key === "frameNoFloor" ? { ns: f.ns, cfg: f.cfg } : { ns: 0, cfg: 0 },
+				daily: y && y.key === "daily" ? { day: y.day, frames: y.framesSent } : { day: "", frames: 0 },
+			};
 		});
 		for (const s of streams) this.cache.set(s.stream, s);
 		this.ckptDuty = new Set(duty);
 		this.frameNoFloor = floor;
+		this.dailyAtOpen = daily;
 	}
 
 	/** Serial queue for read-write transactions. */
@@ -388,7 +395,6 @@ export class Repo {
 					return r;
 				};
 				let receipts = 0;
-				let receiptBytes = 0;
 				for (const it of items) {
 					if (it.t === "account") continue;
 					if (it.t === "stale") {
@@ -414,7 +420,6 @@ export class Repo {
 								dutyChanged = true;
 							}
 							receipts++;
-							receiptBytes += ob.sealed.length;
 							advance(r, it.seq, vAfter);
 						} else {
 							// Missing record: already settled (late receipt / duplicate). The seq is still accounted.
@@ -460,8 +465,7 @@ export class Repo {
 				if (dutyChanged) tx.put(STORE.meta, { key: "ckptDuty", streams: [...duty] });
 				if (receipts > 0) {
 					const d = await tx.get(STORE.meta, "daily") as MetaDaily | undefined;
-					const base = d && d.day === day ? d : { key: "daily" as const, day, framesSent: 0, bytesSent: 0 };
-					tx.put(STORE.meta, { ...base, framesSent: base.framesSent + receipts, bytesSent: base.bytesSent + receiptBytes });
+					tx.put(STORE.meta, { key: "daily", day, framesSent: (d && d.day === day ? d.framesSent : 0) + receipts });
 				}
 				if (await tx.count(STORE.quarantine) > QUARANTINE_MAX_RECORDS) await evictQuarantine(tx);
 				return v;

@@ -56,12 +56,14 @@ export interface MetaOutboxOrder {
 	/** Next local order number; strictly increasing, never reused within this DB. */
 	readonly next: number;
 }
+/**
+ * Own frames receipted on `day` (EngineCtx.day(), YYYY-MM-DD per ClockPort.now()): the daily soft budget (DESIGN
+ * §i.6). Written by T_live; read at open, so the budget survives a restart within the day.
+ */
 export interface MetaDaily {
 	readonly key: "daily";
-	/** Local calendar day (YYYY-MM-DD) per ClockPort.now(). */
 	readonly day: string;
 	readonly framesSent: number;
-	readonly bytesSent: number;
 }
 /**
  * Highest own ns / cfg frameNo of the abandoned timeline, carried by epoch
