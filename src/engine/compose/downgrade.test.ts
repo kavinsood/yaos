@@ -1484,7 +1484,7 @@ interface SealTally {
 	genesisOnRelay: boolean;
 }
 
-/** Wraps the seal and sealBlob of the device's raw crypto port (behind gatedCrypto, runtime/context.ts:129) once per engine. */
+/** Wraps the seal and sealBlob of the device's raw crypto port (behind gatedCrypto, runtime/context.ts:165) once per engine. */
 function tapSeals(d: SimDevice, t: SealTally, tapped: WeakSet<object>): void {
 	const c = d.vrt?.log.c;
 	if (!c) return;

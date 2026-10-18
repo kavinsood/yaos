@@ -84,7 +84,7 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed), then unpad when suite ≠ 
 | `snap` | snap | `snapOps` | `snapFoldV1` | commit-only | devices that upload or delete snapshots (§j.4) |
 | `b:<docId>` | body | `bodyUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the note |
 | `c:<docId>` | canvas | `canvasUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the canvas |
-| `k` | keyring | k records, no envelope (e2ee-design §11.2, `src/engine/keyring/record.ts:93`) | none (read with `preferCheckpoint = false`, `src/engine/runtime/sessionLoop.ts:362`) | commit-only | key-holding or joining devices (`src/engine/keyring/keyringRuntime.ts:248`, `src/engine/compose/keyReader.ts:259`) |
+| `k` | keyring | k records, no envelope (e2ee-design §11.2, `src/engine/keyring/record.ts:93`) | none (read with `preferCheckpoint = false`, `src/engine/runtime/sessionLoop.ts:360`) | commit-only | key-holding or joining devices (`src/engine/keyring/keyringRuntime.ts:248`, `src/engine/compose/keyReader.ts:259`) |
 
 - No stream carries blob bytes. Attachments, oversized updates and snapshot parts go to the `BlobPort` only; the
   log carries only their small records (ns / cfg / snap ops, `bodyUpdateRef`) (§j.1).
@@ -93,7 +93,7 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed), then unpad when suite ≠ 
 - Streams of any other class (`streamClass` "other", `src/core/types.ts:76-84`, the retired `x:` names included)
   are ignored: the cursor still advances and nothing is stored (`src/engine/ingest/gate.ts:94`).
 - `k` rows skip the envelope gate (`gate.ts:93-94`) and are stored as key-record rows for the keyring
-  (`src/engine/sync/ingestRow.ts:50`, `src/engine/runtime/sessionLoop.ts:446`).
+  (`src/engine/sync/ingestRow.ts:57`, `src/engine/runtime/context.ts:366`).
 - Every socket receives every stream (relay-wire §5.3). The cost of a row for a non-resident doc is bounded at
   gate stage 1–2 plus one tail put (§d.6).
 
@@ -331,7 +331,7 @@ For each committed ns row, in seq order:
      a `REPLAY_WINDOW` (64)-bit bitmap (`src/core/replayWindow.ts:30-35`). `f ≤ R − 64` → `ignored/replay-stale`;
      a set bit → `ignored/replay-duplicate`; either sets `coversSeq = seq` and changes neither ring nor window.
      An accepted frame updates both. frameNo 0 on an nsOps/cfgOps envelope is a decode failure (§b.1); a row that
-     failed the gate is stored with frameNo 0 (`src/engine/sync/ingestRow.ts:72-74`), folds as empty and never
+     failed the gate is stored with frameNo 0 (`src/engine/sync/ingestRow.ts:79-81`), folds as empty and never
      touches the window.
 3. **Fold.** Fold each op in index order (§c.5–§c.10). Each op emits one `NsFoldEvent`.
 4. **Prune** if needed (§c.9).
@@ -958,8 +958,8 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
      on the bytes (`resolveRef`, `src/engine/body/refs.ts:37-55`).
      - If they are unavailable yet, the ref row is stored and retried with backoff, and the doc shows
        `wait/blob-unavailable`. Under the §j.1 quarantine rule (deterministic failures only) the doc is frozen
-       `blob-corrupt` (`src/engine/runtime/docRuntime.ts:224-244`); `releaseQuarantine` unfreezes it and retries.
-     - Without a blob store the row stays unresolved and arms no retry timer (`docRuntime.ts:246-252`); a store found
+       `blob-corrupt` (`src/engine/runtime/docRuntime.ts:201-221`); `releaseQuarantine` unfreezes it and retries.
+     - Without a blob store the row stays unresolved and arms no retry timer (`docRuntime.ts:223-229`); a store found
        on a later connect restarts the runtime (§j.1).
      - Once resolved, the tail row is rewritten as `bodyUpdate` (a local cache only).
    - Cold docs stop here: the row is stored in `tail` (§e.2 `T_ingest`), and nothing is loaded.
@@ -987,7 +987,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 | Stale epoch not yet decidable (`hold`: `k` not judged) | Reader-dependent (`keyring-hold`) | Reader-dependent (`keyring-hold`) |
 
 - Verified-key split: `src/engine/ingest/gate.ts:101-104`, `src/engine/ingest/envelope.ts:58-71` (e2ee-design §9.2,
-  §9.3). Stale verdict: `staleVerdict`, `gate.ts:137-146`; row handling `src/engine/sync/ingestRow.ts:57-59`. A
+  §9.3). Stale verdict: `staleVerdict`, `gate.ts:137-146`; row handling `src/engine/sync/ingestRow.ts:64-66`. A
   stale provisional is ignored; a stale checkpoint fails `stale-epoch` (`gate.ts:143`, `:145`).
 
 - **The cursor always advances.** Quarantined, stored-cold, stale-recorded and halted rows are all *accounted*.
@@ -1021,7 +1021,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - Live events go to an in-memory **live queue**.
    - Rows are processed in arrival order, committed rows in batches (one `tLive` per batch), provisionals one at a
      time (`src/engine/runtime/liveIngest.ts:1-7`); no lane decides the order. Stored body rows are applied only
-     to a resident (or loading) replica; the rest stay in the tail (`src/engine/runtime/docRuntime.ts:168-187`).
+     to a resident (or loading) replica; the rest stay in the tail (`src/engine/runtime/context.ts:377-388`).
    - **Overflow** (> 4 MiB or > 1000 queued rows): drop payloads of rows for non-resident docs. Record those streams
      as stale with `remoteHeadSeq = max(…, seq)`. The seq counts as accounted, and the rows are read later.
 3. **Feed.** If V < H: run `feed(V)` pages. Each page runs `T_feed_page`:
@@ -1105,7 +1105,7 @@ The planner does no destructive work until ns is caught up (§f.2).
     `REMOTE_CHECKPOINT_SETTLE_MS` (2 min, limits.ts:124). A stream whose only row is its first frame is left alone:
     a checkpoint would replace one open with one open (an import of 10k notes costs no checkpoints).
   - *Idle* means no live row and no own frame on the stream for that long (`lastActivity`, set in
-    src/engine/runtime/docRuntime.ts:148 and :178). Activity also restarts the fallback clock
+    src/engine/runtime/docRuntime.ts:148 and context.ts:378). Activity also restarts the fallback clock
     (checkpoints.ts:134), so neither rule writes while a note is being typed in, on any device. Activity before
     this engine run is unknown (a restart can come in the middle of an edit session), so a stream with no activity
     seen counts as active at the run's first live maintenance tick (`markLive`, checkpoints.ts:104, called at
@@ -1160,7 +1160,7 @@ The planner does no destructive work until ns is caught up (§f.2).
     - Hot: ≥ `NS_CHECKPOINT_ROWS` (1000) ns rows or ≥ `NS_CHECKPOINT_BYTES` have accumulated since the last
       checkpoint. No idle gate.
     - Settle: `settleWanted`, and the stream has been idle for `REMOTE_CHECKPOINT_SETTLE_MS`. ns, cfg and snap rows
-      mark activity in src/engine/runtime/liveIngest.ts:219.
+      mark activity in src/engine/runtime/context.ts:371.
     - Others take over after 10 min plus jitter, with the same refresh read first (maintenance.ts:174).
   - A settle checkpoint covers the newest candidate. The rows after it stay: fewer than one candidate interval (1000
     vault seqs). There is at most one settle put per candidate.
@@ -1177,7 +1177,7 @@ The planner does no destructive work until ns is caught up (§f.2).
       for a doc (2 for its first checkpoint). A put at `lastSeq` also drops the open segment at no extra row (H7).
     - A CAS conflict writes nothing, and the fallback refresh is a read.
   - A heavy desktop day:
-    - Frames: ≤ 20k (soft budget, limits.ts:261; frames are 4× slower beyond it, src/engine/runtime/context.ts:413-415) ×
+    - Frames: ≤ 20k (soft budget, limits.ts:261; frames are 4× slower beyond it, src/engine/runtime/context.ts:510-512) ×
       ≤ 2 rows = ≤ 40k.
     - Settle: 500 edit sessions × ≤ 4 = 2k. One put per session: a pause of 2 min or more ends one.
     - Hot: 20k / 256 × 4 ≈ 310.
@@ -1894,7 +1894,7 @@ interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; r
     `:124-127`).
 - Long engine loops yield a macrotask through `ClockPort.yieldNow` (e.g. `src/engine/reconcile/mergeJob.ts:108`,
   `src/engine/reconcile/canvasJob.ts:78`, `src/engine/compose/hashService.ts:102`, `src/engine/blobs/gc.ts:109`).
-- Relay events are queued at once (`src/engine/runtime/liveIngest.ts:65-66`) and processed in arrival order:
+- Relay events are queued at once (`src/engine/runtime/liveIngest.ts:66-67`) and processed in arrival order:
   committed/receipt events in batches of ≤ `liveBatchRows`, provisionals one at a time (`liveIngest.ts:4-7`,
   `:143`). Not by lane.
 
@@ -1999,7 +1999,7 @@ ones get conflict copies.
 | `refused forbidden` / `canWrite = false` | Read-only: no appends or checkpoints. Outbox kept. Notice. |
 | `resendUnreceipted` (STREAM_RESEND) | §d.5. |
 | 1001 / 1006 / network | Reconnect with full-jitter exponential backoff `RECONNECT_BASE_MS` → `RECONNECT_MAX_MS`. Immediate on `online` / `visible`. |
-| A relay HTTP call (feed, read, readBatch, checkpoint) ends at its deadline (`timeout`: 15 s plus its byte bound at 64 KiB/s) or as `aborted` when its session closes (§j.1 Liveness) | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:339-342`, `:364-369`); a failed session-start feed closes the session and reconnects with backoff (`:167-175`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
+| A relay HTTP call (feed, read, readBatch, checkpoint) ends at its deadline (`timeout`: 15 s plus its byte bound at 64 KiB/s) or as `aborted` when its session closes (§j.1 Liveness) | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:337-340`, `:362-367`); a failed session-start feed closes the session and reconnects with backoff (`:165-173`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
 | Ticket TTL 5 min | The adapter fetches a fresh ticket for every connect. |
 
 ---
@@ -2093,7 +2093,7 @@ ones get conflict copies.
   - There is no UI row, notice, banner or setting about server blob storage (no server-metadata UI); only a log line.
 - **A store found on a later connect.** `EnginePorts.probeBlob` (`src/ports/index.ts:51`) asks the relay again. The
   session loop calls it once per session that reaches live, only while `ports.blob` is null
-  (`src/engine/runtime/sessionLoop.ts:162`, `:452-465`). A store found → `EngineOptions.onBlobStore`
+  (`src/engine/runtime/sessionLoop.ts:160`, `:430-443`). A store found → `EngineOptions.onBlobStore`
   (`src/engine/runtime/options.ts:160-164`) → `VaultRuntime` (`src/engine/compose/vaultRuntime.ts:64-65`, `:173`) →
   `ComposedEngine.onBlobStore` sets `ports.blob`, logs "blob store available -> restarting" and restarts the runtime
   with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:531-536`). The restarted runtime's full
