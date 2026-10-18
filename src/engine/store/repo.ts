@@ -284,21 +284,11 @@ export class Repo {
 	async outboxAll(): Promise<OutboxRecord[]> {
 		return this.db.tx([STORE.outbox], "readonly", (tx) => tx.getAllByIndex(STORE.outbox, INDEX.outboxByOrder));
 	}
-	async outboxOf(stream: StreamName): Promise<OutboxRecord[]> {
-		return this.db.tx([STORE.outbox], "readonly", (tx) => tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(stream)));
-	}
-	async getOutbox(cfid: ClientFrameId): Promise<OutboxRecord | undefined> {
-		return this.db.tx([STORE.outbox], "readonly", (tx) => tx.get(STORE.outbox, cfid));
-	}
 	async quarantineOf(stream: StreamName): Promise<QuarantineRecord[]> {
 		return this.db.tx([STORE.quarantine], "readonly", (tx) => tx.getAll(STORE.quarantine, tailRange(stream)));
 	}
 	async count(store: StoreKey): Promise<number> {
 		return this.db.tx([store], "readonly", (tx) => tx.count(store));
-	}
-	async staleStreams(limit: number): Promise<StreamRecord[]> {
-		return this.db.tx([STORE.streams], "readonly", (tx) =>
-			tx.getAllByIndex(STORE.streams, INDEX.streamsByStale, { lower: [1, -MAXK], upper: [1, MAXK] }, limit));
 	}
 	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "frameNoFloor" | "keyring">(key: K) {
 		return this.db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, key));
@@ -799,19 +789,6 @@ export class Repo {
 			});
 			this.cache.set(stream, out);
 			return n;
-		});
-	}
-
-	/** Delete every record of a stream (retired checkpoint ok, or prune without duty). */
-	tDropStream(stream: StreamName): Promise<void> {
-		return this.serial("tDropStream", async () => {
-			await this.db.tx([STORE.streams, STORE.snapshots, STORE.tail, STORE.quarantine], "readwrite", async (tx) => {
-				tx.delete(STORE.streams, stream);
-				tx.delete(STORE.snapshots, stream);
-				tx.deleteRange(STORE.tail, tailRange(stream));
-				tx.deleteRange(STORE.quarantine, tailRange(stream));
-			});
-			this.cache.delete(stream);
 		});
 	}
 
