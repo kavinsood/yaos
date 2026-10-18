@@ -197,8 +197,8 @@ export class Ctx {
 		return res;
 	}
 
-	async read(path: string, maxBytes: number, lane: Lane = LANE.background): Promise<DiskReadResult> {
-		const [res] = await this.deps.disk.read([{ area: "vault", path, maxBytes }], lane);
+	async read(path: string, maxBytes: number): Promise<DiskReadResult> {
+		const [res] = await this.deps.disk.read([{ area: "vault", path, maxBytes }]);
 		if (!res) throw new Error("disk gateway returned no read result");
 		return res;
 	}

@@ -46,7 +46,7 @@ export class Restorer {
 	readonly entry = async (e: VerifiedEntry): Promise<void> => {
 		if (this.want && !this.want.has(e.path)) return;
 		const { out } = this;
-		const [cur] = await this.d.disk.read([{ area: "vault", path: e.path, maxBytes: SNAP_MAX_TEXT_BYTES }], LANE.background);
+		const [cur] = await this.d.disk.read([{ area: "vault", path: e.path, maxBytes: SNAP_MAX_TEXT_BYTES }]);
 		let pre: WritePrecondition = { t: "absent" };
 		if (cur?.ok) {
 			const fp = await exactFingerprint(this.d.hash, cur.bytes);

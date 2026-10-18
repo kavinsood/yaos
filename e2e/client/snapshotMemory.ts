@@ -60,7 +60,7 @@ let base = 0;
 const sample = () => { samples.push(live() - base); };
 
 const gateway: DiskGateway = {
-	async read(reads: readonly DiskReadRequest[], _lane: Lane): Promise<readonly DiskReadResult[]> {
+	async read(reads: readonly DiskReadRequest[]): Promise<readonly DiskReadResult[]> {
 		sample();
 		return reads.map((r) => {
 			const b = vault.get(r.path);

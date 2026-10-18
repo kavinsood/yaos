@@ -116,7 +116,7 @@ export class Scanner {
 			const toRead = batch.filter((e) => !e.excluded);
 			for (const e of batch) if (e.excluded) put.push(e);
 			const reqs = toRead.map((e) => ({ area: "vault" as const, path: e.diskPath, maxBytes: this.ctx.classify(e.diskPath, 0).maxBytes }));
-			const results = reqs.length > 0 ? await this.ctx.deps.disk.read(reqs, 3) : [];
+			const results = reqs.length > 0 ? await this.ctx.deps.disk.read(reqs) : [];
 			for (let j = 0; j < toRead.length; j++) {
 				const e = toRead[j]!;
 				const r = results[j];

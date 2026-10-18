@@ -151,7 +151,7 @@ function engineTrace(): EngineToMain[] {
 		{
 			t: "diskOps",
 			rid: 2,
-			lane: 3,
+			lane: 1,
 			ops: [
 				{ t: "write", opId: 1, area: "vault", path: "n.md", data: { t: "text", text: "x" }, precondition: { t: "absent" }, docId: null, purpose: "materialize" },
 				{ t: "write", opId: 2, area: "vault", path: "img.png", data: { t: "bytes", bytes: bytes(137, 80) }, precondition: { t: "any" }, docId: null, purpose: "materialize" },

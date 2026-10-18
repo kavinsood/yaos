@@ -69,7 +69,7 @@ export class BoundDisk {
 		this.stats.reloads++;
 		let incoming = text;
 		if (incoming === null) {
-			const rd = await rt.rec.ctx.read(b.path, MAX_TEXT_FILE_BYTES, LANE.openNote).catch(() => null);
+			const rd = await rt.rec.ctx.read(b.path, MAX_TEXT_FILE_BYTES).catch(() => null);
 			if (this.deps.runtime() !== rt || this.deps.bound.get(docId) !== b || !b.attached.has(viewId)) return;
 			incoming = rd?.ok ? utf8Decode(rd.bytes) : null;
 		}
@@ -122,11 +122,11 @@ export class BoundDisk {
 		if (!rt || this.deps.bound.get(b.docId) !== b) return;
 		const path = b.path;
 		const ctx = rt.rec.ctx;
-		const rd = await ctx.read(path, MAX_TEXT_FILE_BYTES, LANE.openNote).catch(() => null);
+		const rd = await ctx.read(path, MAX_TEXT_FILE_BYTES).catch(() => null);
 		if (!rd || (!rd.ok && rd.reason === "io")) return this.scheduleCheck(b, CHECK_SAVED_RETRY_MS);
 		if (!rd.ok) return;
 		// maxBytes 0: a stat (a non-empty file answers too-large with its stat).
-		const after = await ctx.read(path, 0, LANE.openNote).catch(() => null);
+		const after = await ctx.read(path, 0).catch(() => null);
 		const stat: VaultStat | null = after?.stat ?? null;
 		// Changed while reading: the write's own vault event schedules another check.
 		if (!stat || stat.size !== rd.bytes.byteLength || stat.mtimeMs !== rd.stat.mtimeMs) return;

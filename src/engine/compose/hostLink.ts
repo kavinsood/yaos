@@ -9,7 +9,7 @@
 import type { HashPort } from "../../ports/crypto";
 import type { ConfigDirPort, SideFileName, SideFilePort } from "../../ports/vault";
 import type { ProtocolError } from "../../protocol/errors";
-import type { DiskOp, DiskReadRequest, DiskReadResult, EngineToMain, HostIoOp, HostIoResult, Lane, MainResultValue } from "../../protocol/messages";
+import { LANE, type DiskOp, type DiskReadRequest, type DiskReadResult, type EngineToMain, type HostIoOp, type HostIoResult, type Lane, type MainResultValue } from "../../protocol/messages";
 import type { EngineTransport } from "../../protocol/transport";
 import { owned, postOwned, TransferOwnershipError, wipeSecrets } from "../../protocol/workerTransport";
 import type { DiskGateway, ExecResult } from "../reconcile/deps";
@@ -104,7 +104,7 @@ export class HostLink {
 	}
 
 	readonly disk: DiskGateway = {
-		read: async (reads: readonly DiskReadRequest[], _lane: Lane): Promise<readonly DiskReadResult[]> => {
+		read: async (reads: readonly DiskReadRequest[]): Promise<readonly DiskReadResult[]> => {
 			if (reads.length === 0) return [];
 			const r = await this.request({ t: "readRequest", reads });
 			if (r.t !== "reads") throw new Error(`unexpected read answer ${r.t}`);
@@ -158,7 +158,7 @@ export class HostLink {
 			return r.t === "configListing" ? r.entries : [];
 		},
 		readBytes: async (path) => {
-			const [res] = await this.disk.read([{ area: "config", path, maxBytes: CONFIG_READ_MAX }], 3);
+			const [res] = await this.disk.read([{ area: "config", path, maxBytes: CONFIG_READ_MAX }]);
 			if (!res || !res.ok) {
 				if (res && !res.ok && res.reason === "missing") return null;
 				if (!res || res.reason === "io") throw new Error(`config read failed: ${path}`);
@@ -167,7 +167,7 @@ export class HostLink {
 			return res.bytes;
 		},
 		writeBytes: async (path, bytes) => {
-			const [res] = await this.disk.exec([{ t: "write", opId: 0, area: "config", path, data: { t: "bytes", bytes: bytes.slice() }, precondition: { t: "any" }, docId: null, purpose: "settings" }], 3);
+			const [res] = await this.disk.exec([{ t: "write", opId: 0, area: "config", path, data: { t: "bytes", bytes: bytes.slice() }, precondition: { t: "any" }, docId: null, purpose: "settings" }], LANE.background);
 			if (!res || res.t !== "write" || !res.outcome.ok) throw new Error(`config write failed: ${path}`);
 		},
 		remove: async (path) => {
