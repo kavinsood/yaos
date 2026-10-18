@@ -23,9 +23,9 @@ const stream = "b:doc" as StreamName;
 
 function rec(o: Partial<StreamRecord>): StreamRecord {
 	return {
-		stream, cls: "body", docId: null, appliedSeq: 10, remoteHeadSeq: 10, stale: 0, priority: 0, snapshotCoversSeq: 0, tailRows: 0, tailBytes: 0,
+		stream, cls: "body", docId: null, appliedSeq: 10, remoteHeadSeq: 10, stale: 0, snapshotCoversSeq: 0, tailRows: 0, tailBytes: 0,
 		remoteCheckpointCoversSeq: 0, rowsSinceRemoteCheckpoint: 0, bytesSinceRemoteCheckpoint: 0, lastOwnSeq: 0, bodyVersion: 0 as never,
-		quarantinedRows: 0, frozen: 0, frozenReason: null, disputedCheckpointCoversSeq: 0, lastAccessMs: 0, textHash: null, ...o,
+		quarantinedRows: 0, frozen: 0, frozenReason: null, disputedCheckpointCoversSeq: 0, textHash: null, ...o,
 	};
 }
 
