@@ -33,7 +33,7 @@ import type { OutboxCache } from "../runtime/outboxCache";
 import { FoldRuntime, type FoldCandidate, type FoldedFrame } from "./foldRuntime";
 
 export { LOCAL_FLAG_STALE_EPOCH, LOCAL_FLAG_UNOPENED } from "./foldRuntime";
-/** FOLD (V3): an ns row s is a candidate iff floor(s / M) > floor(prev / M) (core/ns/candidate). */
+/** An ns row s is a checkpoint candidate iff floor(s / M) > floor(prev / M) (core/ns/candidate, §d.9). */
 export const NS_CANDIDATE_MODULUS = NS_CANDIDATE_INTERVAL;
 
 export type NsCandidate = FoldCandidate;

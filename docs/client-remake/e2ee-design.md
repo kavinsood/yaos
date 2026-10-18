@@ -2043,7 +2043,7 @@ runs in the engine):
   - Rows a release applies move the stream's body version (`src/engine/store/repo.ts:728-730`).
   - An open revoke is stored and survives a reset (§11.5; `src/engine/keyring/book.ts:51`).
   - A §c.12 migrated loser's synced record is dropped, not moved to the winner (`src/engine/reconcile/diskJobs.ts:67`,
-    `src/core/plan/planner.ts:505`). Otherwise its own text became the winner's sync point, and the winner's text
+    `src/core/plan/planner.ts:502`). Otherwise its own text became the winner's sync point, and the winner's text
     read as the deletion of its edits.
 - **§16.2:** `npm run bench:e2ee` meets every desktop MUST:
   - typing: 0.44 ms per frame after idle;

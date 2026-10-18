@@ -343,7 +343,7 @@ waiting on the blob queue.
 | D4 | §j.1 | When the relay's capabilities can't be read at startup (offline), the engine assumes the HTTP blob store exists and lets the blob queue retry. | An offline start must not run store-less: that device would not sync attachments and would freeze an oversized update `oversize-local` (`src/engine/runtime/docRuntime.ts:153-159`). (The original reason, one attachment sent as a blob ref by one device and as `x:` chunks by another, went away with the `x:` carrier.) |
 | D5 | §c.12 | `intent{epoch-migration}` is not written. A crash in the middle of a migration restarts on the newest DB (the new epoch): the path bases are gone (no-base handling) and the old DB is not deleted. | Epoch resets are rare operator actions; the snapshot taken before migration (step 1) keeps every file version. |
 | D6 | §j.3 | A JSON settings file whose fold has no keys is not created on peers (a local `{}` and a missing file are the same state). | JSON files are per-key registers; an empty register set has no file identity to project. The sim's settings invariant compares them as equal. |
-| D7 | §l.3 | Sim invariants #4 (fold determinism, V3 digests) and #6 (resource bounds) are not checked by the sim runner. | #4 is covered by WP-A's 10k-op fold fuzz, #6 by WP-C's runtime tests and benchmarks. V3 digests are not implemented (see gaps). |
+| D7 | §l.3 | Sim invariants #4 (fold determinism) and #6 (resource bounds) are not checked by the sim runner as invariants. | #4 is covered by WP-A's 10k-op fold fuzz, and every checkpoint a sim device adopts passes the gate's V1 + V2; #6 by WP-C's runtime tests and benchmarks. |
 | D8 | §f.2 / §j.1 | The blob queue drops transfers the plan no longer wants after every full unbraked pass (keeps settings blobs and docs with open intents). | Not in DESIGN; without it a superseded transfer stayed due forever (bug 14). |
 | D9 | §i | Blob retry backoff is monotonic in memory; the persisted wall time is only clamped to the backoff on reopen. | A wall clock jump must not park uploads (bug 12). |
 | D10 | §i.4 | A settings change that touches reconcile or cfg options restarts the vault runtime (with the listing replayed). | Simpler than hot-swapping options in the planner and CfgSync; settings changes are rare. |
@@ -365,7 +365,8 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - The fallback restore duty has no 30 s grace and no hash timer (D11); a
   delete waits while the deleter's own body frames are unsequenced, so a body
   record stuck in the outbox (poisoned) holds that delete until it is resolved.
-- Divergence (V3 digest) is not implemented; `divergence` is always false.
+- Devices do not compare ns fold digests (DESIGN §b.5): a checkpoint that
+  passes V1 + V2 but is not the fold of its rows is adopted without alarm.
 - Bootstrap progress is null in status. `conflictCopiesToday` (0db3bb7) is
   kept in memory: it restarts at 0 with the engine and does not count copies
   made from an open editor.

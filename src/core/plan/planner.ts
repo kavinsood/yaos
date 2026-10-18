@@ -7,7 +7,6 @@
  * frozen `PlanFn` signature and the engine can pass the extra facts through
  * `planWith(input, ctx)`:
  *   - nsReady: ns caught up once this session and not halted (§f.2 gates, §c.10)
- *   - divergence: V3 mismatch (§b.5) for the ns-divergence brake
  *   - brakeWindow: destructive ops executed in the rolling 10-minute window
  *   - tzOffsetMinutes: local time for conflict names (core may not read Date)
  *   - remoteTextHash: streams.textHash of caught-up md/canvas docs
@@ -70,7 +69,6 @@ export const EMPTY_CONTENT_HASH = sha256Hex(new Uint8Array(0)) as ContentHash;
 export interface PlannerContext {
 	readonly pathKey: PathKeyFn;
 	readonly nsReady: boolean;
-	readonly divergence: boolean;
 	readonly brakeWindow: BrakeWindow;
 	readonly tzOffsetMinutes: number;
 	readonly remoteTextHash: ReadonlyMap<DocId, ContentHash>;
@@ -84,7 +82,6 @@ export interface PlannerContext {
 export const DEFAULT_PLANNER_CONTEXT: PlannerContext = {
 	pathKey: standInPathKey,
 	nsReady: true,
-	divergence: false,
 	brakeWindow: EMPTY_WINDOW,
 	tzOffsetMinutes: 0,
 	remoteTextHash: new Map(),
@@ -677,7 +674,6 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		config: input.brake,
 		syncedCount: input.synced.size,
 		liveLocalCount,
-		divergence: ctx.divergence,
 		window: ctx.brakeWindow,
 		approval: input.brakeApproval,
 	});

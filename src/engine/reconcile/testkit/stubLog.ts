@@ -86,7 +86,6 @@ export class StubLog implements LogPort {
 	nsReady = true;
 	/** RemoteView.lostCreateBody as the test sets it. */
 	lostCreateBody = new Set<DocId>();
-	divergence = false;
 	/** S1 hook (Reconciler.applyOwnFold). */
 	onOwnFold: ((events: readonly OwnFoldEvent[]) => Promise<void>) | null = null;
 	/** Called right before acquireBody returns (inject concurrent remote edits). */
@@ -315,7 +314,7 @@ export class StubLog implements LogPort {
 			}
 		}
 		return {
-			remote, remoteByPathKey: byKey, nsCoversSeq: this.seq, nsReady: this.nsReady, divergence: this.divergence,
+			remote, remoteByPathKey: byKey, nsCoversSeq: this.seq, nsReady: this.nsReady,
 			docsWithPendingBody, restoreDuty: new Set(), lostCreateBody: this.lostCreateBody, textHash, appliedSeq,
 		};
 	}

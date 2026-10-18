@@ -1,6 +1,6 @@
 /**
- * nsFoldV1: canonical NsFoldState bytes (DESIGN §b.5). Digests (V3) are over
- * these uncompressed bytes; the envelope deflates them.
+ * nsFoldV1: canonical NsFoldState bytes (DESIGN §b.5). The envelope deflates
+ * them.
  *
  * The encoder is canonical (entries by ascending docId, devices by ascending
  * deviceId, UTF-16 code-unit order). The decoder is strict about bytes

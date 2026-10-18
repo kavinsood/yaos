@@ -697,7 +697,7 @@ test("brake: mass-delete-local holds above max(minCount, ratio*|S|)", () => {
 	assert.equal(goneAll.ops.filter((o) => o.op === "nsDelete").length, 51);
 });
 
-test("brake: mass-delete-remote, listing-shrank, conflict-flood, ns-divergence", () => {
+test("brake: mass-delete-remote, listing-shrank, conflict-flood", () => {
 	const trash = (n: number) => {
 		const sc = deletes(0, 100);
 		return { ...sc, remote: sc.remote!.map((r, i) => (i < n ? { ...r, state: "deleted" as const, deletedSeq: 70 } : r)) };
@@ -728,10 +728,6 @@ test("brake: mass-delete-remote, listing-shrank, conflict-flood, ns-divergence",
 	assert.equal(flood.held.length, 201);
 	const under = planWith(input({ remote: remote.slice(1), local: local.slice(1) }), { remoteTextHash: hashes });
 	assert.equal(under.brake, null);
-
-	const div = run(deletes(1, 100), { divergence: true });
-	assert.equal(div.brake?.reason, "ns-divergence");
-	assert.equal(div.ops.filter((o) => o.op === "nsDelete").length, 0);
 });
 
 test("brake: id is stable across re-plans (fresh ids, time, map order) and approval releases exactly that set", async () => {
