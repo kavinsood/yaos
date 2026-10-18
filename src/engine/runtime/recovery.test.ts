@@ -11,6 +11,9 @@ import type { LogEngine } from "./engine";
 import type { SideFilePort } from "../../ports/vault";
 import { MemStoragePort } from "../../sim/storage";
 import { MemSideFiles, converged, sleep, startTestEngine, until } from "./testHarness";
+import { decodeOutboxMirror, encodeOutboxMirror } from "./mirrors";
+import { DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity } from "../store/schema";
+import type { YS } from "../store/repo";
 
 async function live(...es: LogEngine[]): Promise<void> {
 	await until(() => es.every((e) => e.status().phase === "live"), 3_000, "live");
@@ -73,6 +76,62 @@ for (const committed of [false, true]) {
 		}
 	});
 }
+
+/**
+ * DB_SCHEMA_VERSION bump (2: unused indexes, fields and the outbox "sent" state dropped). An older DB fails Repo.open's
+ * identity check and is deleted; the fresh DB imports the outbox mirror, whose frames an older build may have written
+ * as "sent". They come back pending and are resent (DESIGN §i.5).
+ */
+test("schema upgrade: an older DB is rebuilt fresh and imports the mirror, legacy \"sent\" frames as pending", async () => {
+	const relay = new SimRelay();
+	const side = new MemSideFiles();
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	const { engine: a, storage } = await startTestEngine({ relay, deviceId: "dev-a", sideFiles: side });
+	let a2: LogEngine | null = null;
+	try {
+		await live(a, b);
+		const id = await a.createDoc("u.md", "base;");
+		await converged([a, b]);
+		relay.pauseCommits();
+		await a.editDoc(id, (t) => t.insert(t.length, "inflight;"));
+		await until(() => a.c.sender.inflightCount >= 1, 2_000, "sent");
+		const frames = [...a.c.outbox.values()].map((r) => r.clientFrameId);
+		await sleep(60); // mirror debounce
+		const hash = a.c.ports.hash;
+		const name = dbName(a.c.opts.vaultId, a.c.repo.identity.vaultEpoch, a.c.self);
+		a.disconnect();
+		await a.stop();
+		relay.restart(); // the relay lost the frames: only the mirror has them
+		relay.resumeCommits();
+		// What an older build left behind: in-flight frames mirrored as "sent", and a DB of the previous schema.
+		let legacy = 0;
+		for (const [file, bytes] of side.files) {
+			const m = await decodeOutboxMirror(bytes, hash);
+			if (!m) continue;
+			const frames2 = m.frames.map((f) => (f.state === "pending" ? (legacy++, { ...f, state: "sent" as const }) : f));
+			side.files.set(file, await encodeOutboxMirror({ ...m, frames: frames2 }, hash));
+		}
+		assert.ok(legacy > 0, "mirror has frames to mark sent");
+		const db = await storage.open<YS>(name, DB_SCHEMA_VERSION, STORE_SPECS);
+		await db.tx([STORE.meta], "readwrite", async (tx) => {
+			const ident = await tx.get(STORE.meta, "identity") as MetaIdentity;
+			tx.put(STORE.meta, { ...ident, schemaVersion: DB_SCHEMA_VERSION - 1 });
+		});
+		db.close();
+		a2 = (await startTestEngine({ relay, deviceId: "dev-a", sideFiles: side, storage, extra: { vaultEpoch: relay.vaultEpoch() } })).engine;
+		assert.equal(a2.c.repo.identity.schemaVersion, DB_SCHEMA_VERSION, "rebuilt under the current schema");
+		assert.ok(a2.status().notices.some((n) => n.code === "recovered-from-mirror"));
+		const stored = await a2.c.repo.outboxAll();
+		assert.ok(stored.length > 0 && stored.every((r) => r.state === "pending"), `imported as pending: ${stored.map((r) => r.state).join(",")}`);
+		await converged([a2, b], 10_000);
+		assert.equal(await b.docText(id), "base;inflight;");
+		const counts = countsByFrame(relay);
+		for (const f of frames) assert.equal(counts.get(f), 1, `frame ${f} committed exactly once`);
+	} finally {
+		await b.stop();
+		await a2?.stop();
+	}
+});
 
 /** Side files of an app process that can die: after kill() nothing it writes lands. */
 function mortal(side: MemSideFiles): { port: SideFilePort; kill: () => void } {
