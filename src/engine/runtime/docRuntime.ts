@@ -138,9 +138,11 @@ export class DocRuntime {
 		return this.chain(async () => {
 			try {
 				const docId = streamDocId(h.stream);
-				const held = c.outbox.newestAdoptable(h.stream)?.clientFrameId ?? c.outbox.heldDependency(h.stream);
 				// A live create's body frames are pending and follow it on the wire; an onboarding create's are held
-				// until its fold (DESIGN §e.1).
+				// until its fold, and so are the doc's later frames (DESIGN §e.1). An adoptable holds nothing: the peer's
+				// frame reached the relay before we saw it, and a re-sent adopted copy that lands after ours leaves
+				// peers a causal hole well inside the §d.6 retry window (§d.5).
+				const held = c.outbox.heldDependency(h.stream);
 				const create = held === null && docId ? c.createDependency(docId) : null;
 				const dependsOn = held ?? create?.cfid ?? null;
 				const frames = await buildBodyFrames(c.deps, { stream: h.stream, content: taken.content, flags: taken.flags, authorNsSeq: c.ns.coversSeq, dependsOn, sendAfter: create?.live === true, nowMs: c.now() });

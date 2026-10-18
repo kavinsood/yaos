@@ -29,7 +29,7 @@ export type ExecResult =
  * `exec` transfers write bytes ([T]): after the call they are detached, never reuse them.
  */
 export interface DiskGateway {
-	read(reads: readonly DiskReadRequest[], lane: Lane): Promise<readonly DiskReadResult[]>;
+	read(reads: readonly DiskReadRequest[]): Promise<readonly DiskReadResult[]>;
 	exec(ops: readonly DiskOp[], lane: Lane): Promise<readonly ExecResult[]>;
 }
 

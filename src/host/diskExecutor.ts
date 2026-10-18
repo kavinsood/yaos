@@ -1,9 +1,9 @@
 /**
  * Main-thread disk executor (DESIGN §d.4, §g.3 diskOps/readRequest, §i.1).
  *
- * - Batches are queued per lane; at every op boundary the executor takes the
- *   next op of the highest-priority (lowest lane number) batch, FIFO within a
- *   lane. Order inside one batch is always preserved.
+ * - Batches are queued per lane (LANE: openNote, background); at every op
+ *   boundary the executor takes the next op of the oldest openNote batch, else
+ *   of the oldest background batch. Order inside one batch is always preserved.
  * - Work runs in slices of budgets.mainSliceMs, yielding a macrotask between
  *   slices so the editor stays responsive.
  * - Every op carries a WritePrecondition, passed to VaultPort, which checks it

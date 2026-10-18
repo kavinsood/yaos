@@ -1,5 +1,5 @@
 /**
- * Reconcile pass scheduler (DESIGN §f.2 scope, §i.1 lanes). One pass at a
+ * Reconcile pass scheduler (DESIGN §f.2 scope). One pass at a
  * time; triggers that arrive while a pass runs merge into the next one.
  *
  *  - gated: no pass before the first complete listing, while paused or

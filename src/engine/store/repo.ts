@@ -11,7 +11,7 @@
  * The in-memory `streams` cache is updated only after a commit.
  */
 
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId } from "../../core/types";
+import { NS_STREAM, streamClass, streamDocId } from "../../core/types";
 import type { ClientFrameId, DeviceId, Seq, StreamName, VaultEpoch, VaultId } from "../../core/types";
 import { QUARANTINE_MAX_RECORDS } from "../../core/limits";
 import type { KeyRange, StorageDb, StoragePort, StorageTx } from "../../ports/storage";
@@ -454,7 +454,6 @@ export class Repo {
 						if (ob && ob.state === "adoptable") {
 							tx.delete(STORE.outbox, ob.clientFrameId);
 							removed.push(ob);
-							updated.push(...(await releaseDependents(tx, ob)));
 						}
 					}
 				}
@@ -563,7 +562,6 @@ export class Repo {
 					if (ob && ob.state === "adoptable") {
 						tx.delete(STORE.outbox, cfid);
 						removed.push(ob);
-						updated.push(...(await releaseDependents(tx, ob)));
 					}
 				}
 				r.remoteHeadSeq = Math.max(r.remoteHeadSeq, input.lastSeq);
@@ -634,7 +632,6 @@ export class Repo {
 					if (c.t === "delete") {
 						tx.delete(STORE.outbox, r.clientFrameId);
 						removed.push(r);
-						updated.push(...(await releaseDependents(tx, r)));
 					} else if (c.t === "release") {
 						if (r.state !== "held") continue;
 						const n: OutboxRecord = { ...r, state: "pending", dependsOn: null };
@@ -650,9 +647,6 @@ export class Repo {
 						const n: OutboxRecord = { ...r, state: c.state, dependsOn: c.state === "pending" ? null : r.dependsOn };
 						tx.put(STORE.outbox, n);
 						updated.push(n);
-						// adoptable -> pending keeps its dependents held until the adopted frame's receipt (causal
-						// order on the relay); a poisoned dependency releases them.
-						if (c.state === "poisoned") updated.push(...(await releaseDependents(tx, r)));
 					}
 				}
 			});
@@ -812,7 +806,6 @@ async function settleOwn(tx: Tx, ob: OutboxRecord, copy: OwnCommitCopy | undefin
 	if (!copy) {
 		tx.delete(STORE.outbox, ob.clientFrameId);
 		removed.push(ob);
-		updated.push(...(await releaseDependents(tx, ob)));
 		return;
 	}
 	const next: OutboxRecord = { ...ob, clientFrameId: copy.clientFrameId, sealed: new Uint8Array(0), state: "pending" };
@@ -822,8 +815,8 @@ async function settleOwn(tx: Tx, ob: OutboxRecord, copy: OwnCommitCopy | undefin
 
 /**
  * `next` replaces `old` at the same order (the order indexes are unique: the old key goes first); held records
- * waiting for `old` wait for `next` (dependsOn: ns creates, adopted records), and so do the pending body
- * frames of a live ns create (DESIGN §e.1: they never go before it).
+ * waiting for `old` (an onboarding ns create) wait for `next`, and so do the pending body frames of a live ns
+ * create (DESIGN §e.1: they never go before it).
  */
 async function rename(tx: Tx, old: OutboxRecord, next: OutboxRecord, updated: OutboxRecord[]): Promise<void> {
 	if (next.clientFrameId !== old.clientFrameId) tx.delete(STORE.outbox, old.clientFrameId);
@@ -889,32 +882,4 @@ function advance(r: Mut<StreamRecord>, seq: Seq, vAfter: Seq): void {
 	if (caughtUp && seq > r.appliedSeq && seq <= vAfter) r.appliedSeq = seq;
 	r.remoteHeadSeq = Math.max(r.remoteHeadSeq, seq);
 	r.stale = r.appliedSeq < r.remoteHeadSeq ? 1 : 0;
-}
-
-/**
- * DESIGN §e.1 dependsOn rule. Only adoptables are dependencies released by
- * record removal; ns creates are released by the fold (nsRuntime; a live
- * create's pending dependents need no release). A held record whose
- * dependency is gone is re-pointed to the next remaining adoptable of its
- * stream, else released to pending.
- */
-async function releaseDependents(tx: Tx, gone: OutboxRecord): Promise<OutboxRecord[]> {
-	// Adoption dependencies: an adoptable, or an adopted record re-appended as pending (dependents wait for its receipt).
-	if (gone.adoptOf === null) return [];
-	if (gone.stream === NS_STREAM || gone.stream === CFG_STREAM || gone.stream === SNAP_STREAM) return [];
-	const held = await tx.getAllByIndex(STORE.outbox, INDEX.outboxByState, stateOrderRange("held"));
-	const out: OutboxRecord[] = [];
-	for (const h of held) {
-		if (h.dependsOn !== gone.clientFrameId) continue;
-		let best: OutboxRecord | null = null;
-		const candidates = (await tx.getAllByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(h.stream))).filter((c) => c.adoptOf !== null && c.state !== "poisoned");
-		for (const c of candidates) {
-			if (c.clientFrameId !== gone.clientFrameId && c.order < h.order && (!best || c.order > best.order)) best = c;
-		}
-		const dep: ClientFrameId | null = best ? best.clientFrameId : null;
-		const n: OutboxRecord = dep ? { ...h, dependsOn: dep } : { ...h, state: "pending", dependsOn: null };
-		tx.put(STORE.outbox, n);
-		out.push(n);
-	}
-	return out;
 }

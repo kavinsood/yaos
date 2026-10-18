@@ -85,7 +85,7 @@ export class EngineCtx {
 	/** Bumped on every session start / end; stale callbacks compare it. */
 	gen = 0;
 	stopped = false;
-	/** App backgrounded (DESIGN §i.4): lanes 3–4 (stale reads, compaction, checkpoints) wait. */
+	/** App backgrounded (DESIGN §i.4): background work (stale reads, compaction, checkpoints) waits. */
 	background = false;
 	readOnly = false;
 	lastCloseCode: number | null = null;

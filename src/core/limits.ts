@@ -131,7 +131,7 @@ export const REMOTE_CHECKPOINT_SETTLE_MS = 2 * 60_000;
 export const REMOTE_CHECKPOINT_SETTLE_DAILY = 1_000;
 export const NS_CHECKPOINT_ROWS = 1_000;
 export const NS_CHECKPOINT_BYTES = 1024 * 1024;
-/** Hard cap on tail rows per stream; beyond it compaction runs in the open-note lane. */
+/** Hard cap on tail rows per stream; beyond it compaction runs even while the app is backgrounded (DESIGN §d.8). */
 export const TAIL_HARD_ROWS = 2_000;
 
 // --- Echo / reconcile -------------------------------------------------------

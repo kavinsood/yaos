@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ContentHash, DiskFingerprint, DocId } from "../core/types";
-import type { DiskOp, DiskOpResult, Lane } from "../protocol/messages";
+import { LANE, type DiskOp, type DiskOpResult, type Lane } from "../protocol/messages";
 import type { WritePrecondition } from "../ports/vault";
 import { DiskExecutor } from "./diskExecutor";
 import type { HashOracle } from "./hashOracle";
@@ -57,19 +57,19 @@ test("diskExecutor: every WritePrecondition passes or fails without writing", as
 		w("a.md", "x", { t: "fingerprint", fingerprint: "00".repeat(32) as DiskFingerprint }),
 		w("a.md", "x", { t: "hash", hash: "11".repeat(32) as ContentHash }),
 		w("new.md", "x", { t: "fingerprint", fingerprint: fp }),
-	]) res.push(...(await exec.run(3, [op])));
+	]) res.push(...(await exec.run(LANE.background, [op])));
 	assert.deepEqual(res.map((r) => r.t === "write" && !r.outcome.ok && r.outcome.reason), ["precondition", "precondition", "precondition", "precondition"]);
 	assert.equal(vault.history.length, historyBefore, "a failed precondition never writes");
 	assert.equal(vault.textOf("a.md"), "one\r\n");
 	assert.equal(vault.hasFile("new.md"), false);
 
 	// hash = logical (markdown canonical): CRLF on disk matches the LF hash.
-	const ok1 = await exec.run(3, [w("a.md", "two\n", { t: "hash", hash: lfHash })]);
+	const ok1 = await exec.run(LANE.background, [w("a.md", "two\n", { t: "hash", hash: lfHash })]);
 	assert.ok(outcomeOk(ok1[0]));
 	const fp2 = fpOf("two\n");
 	const r1 = ok1[0];
 	assert.ok(r1 && r1.t === "write" && r1.outcome.ok && !("fingerprint" in r1.outcome), "main reports no fingerprint (the engine computes it)");
-	const ok2 = await exec.run(3, [w("a.md", "three", { t: "fingerprint", fingerprint: fp2 }), w("b.md", "bee", ABSENT), w("b.md", "bee2", ANY)]);
+	const ok2 = await exec.run(LANE.background, [w("a.md", "three", { t: "fingerprint", fingerprint: fp2 }), w("b.md", "bee", ABSENT), w("b.md", "bee2", ANY)]);
 	assert.deepEqual(ok2.map(outcomeOk), [true, true, true]);
 	assert.equal(vault.textOf("a.md"), "three");
 	assert.equal(vault.textOf("b.md"), "bee2");
@@ -78,13 +78,13 @@ test("diskExecutor: every WritePrecondition passes or fails without writing", as
 test("diskExecutor: case-insensitive profile makes absent fail on a case variant; case-sensitive creates both", async () => {
 	const ci = setup("case-insensitive");
 	ci.vault.userWrite("Note.md", "a");
-	const r = await ci.exec.run(3, [w("note.md", "b", ABSENT)]);
+	const r = await ci.exec.run(LANE.background, [w("note.md", "b", ABSENT)]);
 	assert.equal(outcomeOk(r[0]), false);
 	assert.equal(ci.vault.textOf("Note.md"), "a");
 
 	const cs = setup("case-sensitive");
 	cs.vault.userWrite("Note.md", "a");
-	const r2 = await cs.exec.run(3, [w("note.md", "b", ABSENT)]);
+	const r2 = await cs.exec.run(LANE.background, [w("note.md", "b", ABSENT)]);
 	assert.equal(outcomeOk(r2[0]), true);
 	assert.equal(cs.vault.snapshot().size, 2);
 });
@@ -94,7 +94,7 @@ test("diskExecutor: renames use VaultPort.rename, deletes use VaultPort.trash on
 	vault.userWrite("x/a.md", "A");
 	vault.userWrite("b.md", "B");
 	const fpA = fpOf("A");
-	const res = await exec.run(2, [
+	const res = await exec.run(LANE.background, [
 		{ t: "rename", opId: opId++, from: "x/a.md", to: "y/z/a.md", precondition: { t: "fingerprint", fingerprint: fpA }, docId: "d1" as DocId, purpose: "remote-move" },
 		{ t: "trash", opId: opId++, path: "b.md", mode: "obsidian-trash", precondition: { t: "fingerprint", fingerprint: "ff".repeat(32) as DiskFingerprint }, docId: "d2" as DocId, purpose: "remote-delete" },
 		{ t: "trash", opId: opId++, path: "missing.md", mode: "system-trash", precondition: ANY, docId: null, purpose: "remote-delete" },
@@ -111,7 +111,7 @@ test("diskExecutor: renames use VaultPort.rename, deletes use VaultPort.trash on
 	assert.equal(vault.calls.trash, 2);
 
 	const fpB = fpOf("B");
-	const res2 = await exec.run(2, [{ t: "trash", opId: opId++, path: "b.md", mode: "system-trash", precondition: { t: "fingerprint", fingerprint: fpB }, docId: null, purpose: "remote-delete" }]);
+	const res2 = await exec.run(LANE.background, [{ t: "trash", opId: opId++, path: "b.md", mode: "system-trash", precondition: { t: "fingerprint", fingerprint: fpB }, docId: null, purpose: "remote-delete" }]);
 	assert.equal(outcomeOk(res2[0]), true);
 	assert.equal(vault.hasFile("b.md"), false);
 	assert.deepEqual(vault.trashed.map((t) => [t.path, t.text, t.mode]), [["b.md", "B", "system-trash"]], "deletes are recoverable copies");
@@ -121,7 +121,7 @@ test("diskExecutor: dependency skip (shared path or docId) but independent ops p
 	const { vault, exec } = setup();
 	vault.userWrite("a.md", "A");
 	const d1 = "d1" as DocId;
-	const res = await exec.run(3, [
+	const res = await exec.run(LANE.background, [
 		w("a.md", "A2", ABSENT, { docId: d1 }), // fails: exists
 		{ t: "rename", opId: opId++, from: "a.md", to: "c.md", precondition: ANY, docId: null, purpose: "remote-move" }, // shares path -> skipped
 		w("C.md", "C", ABSENT), // shares (case-folded) path with the skipped rename -> skipped
@@ -147,12 +147,12 @@ test("diskExecutor: bound guard blocks content writes to an open note, not confl
 		w("open.md", "merged", ANY, { purpose: "merge" }),
 		w("open.md", "restored", ANY, { purpose: "restore" }),
 		w("open (conflict).md", "copy", ABSENT, { purpose: "conflict-copy" }),
-	]) res.push(...(await exec.run(0, [op])));
+	]) res.push(...(await exec.run(LANE.openNote, [op])));
 	const reasons = res.map((r) => (r.t === "write" && !r.outcome.ok ? r.outcome.message : "ok"));
 	assert.deepEqual(reasons, ["bound", "bound", "bound", "ok"]);
 	assert.equal(vault.textOf("open.md"), "editor owns this");
 	bound.clear();
-	const res2 = await exec.run(0, [w("open.md", "remote", ANY)]);
+	const res2 = await exec.run(LANE.openNote, [w("open.md", "remote", ANY)]);
 	assert.equal(outcomeOk(res2[0]), true, "guard is live: unbound path is writable");
 });
 
@@ -168,10 +168,10 @@ test("diskExecutor: trash of a bound note with unsent editor edits posts them an
 	});
 	vault.userWrite("open.md", "typed");
 	const trash = (): DiskOp => ({ t: "trash", opId: opId++, path: "open.md", mode: "obsidian-trash", precondition: ANY, docId: "d1" as DocId, purpose: "remote-delete" });
-	const r1 = (await exec.run(0, [trash()]))[0];
+	const r1 = (await exec.run(LANE.openNote, [trash()]))[0];
 	assert.ok(r1 && r1.t === "trash" && !r1.outcome.ok && r1.outcome.reason === "precondition" && r1.outcome.message === "bound-unsent-edits");
 	assert.equal(vault.hasFile("open.md"), true, "edits were unsent: the engine must replan before trashing");
-	assert.equal(outcomeOk((await exec.run(0, [trash()]))[0]), true, "nothing left to post: bound notes are still trashable");
+	assert.equal(outcomeOk((await exec.run(LANE.openNote, [trash()]))[0]), true, "nothing left to post: bound notes are still trashable");
 	assert.deepEqual(flushed, ["open.md", "open.md"]);
 	assert.equal(vault.hasFile("open.md"), false);
 });
@@ -186,24 +186,24 @@ test("diskExecutor: lanes execute open-note first; order within a batch is prese
 		return origWrite(path, data, pre);
 	};
 	const batch = (lane: Lane, prefix: string, n: number) => exec.run(lane, Array.from({ length: n }, (_, i) => w(`${prefix}${i}.md`, "x", ANY)));
-	const bulk = batch(4, "bulk", 4);
-	const bg = batch(3, "bg", 2);
-	const open = batch(0, "open", 2);
-	await Promise.all([bulk, bg, open]);
-	assert.deepEqual(order, ["bulk0.md", "open0.md", "open1.md", "bg0.md", "bg1.md", "bulk1.md", "bulk2.md", "bulk3.md"]);
+	const bg1 = batch(LANE.background, "bg", 4);
+	const bg2 = batch(LANE.background, "late", 2);
+	const open = batch(LANE.openNote, "open", 2);
+	await Promise.all([bg1, bg2, open]);
+	assert.deepEqual(order, ["bg0.md", "open0.md", "open1.md", "bg1.md", "bg2.md", "bg3.md", "late0.md", "late1.md"], "FIFO between background batches");
 });
 
 test("diskExecutor: I/O exceptions map to io outcomes; config area writes are read-compare-write", async () => {
 	const { vault, exec, configDir } = setup();
 	vault.failNextOps = 1;
-	const res = await exec.run(3, [w("a.md", "x", ANY), w("b.md", "y", ANY)]);
+	const res = await exec.run(LANE.background, [w("a.md", "x", ANY), w("b.md", "y", ANY)]);
 	const r0 = res[0];
 	assert.ok(r0 && r0.t === "write" && !r0.outcome.ok && r0.outcome.reason === "io");
 	assert.equal(outcomeOk(res[1]), true);
 
 	await configDir.writeBytes("app.json", utf8("{}"));
 	const fp = fpOf("{}");
-	const cfg = await exec.run(2, [
+	const cfg = await exec.run(LANE.background, [
 		cw("app.json", '{"a":1}', { t: "fingerprint", fingerprint: "00".repeat(32) as DiskFingerprint }),
 		cw("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }),
 		cw("hotkeys.json", "[]", ABSENT),
@@ -213,11 +213,11 @@ test("diskExecutor: I/O exceptions map to io outcomes; config area writes are re
 	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), "{}");
 	assert.equal(vault.hasFile("hotkeys.json"), false, "config writes never land in the vault");
 	// The engine hashes the current config bytes: a matching fingerprint/hash passes.
-	const ok = await exec.run(2, [cw("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }), cw("hotkeys.json", "[1]", { t: "hash", hash: fingerprintRef(utf8("[]")) as unknown as ContentHash })]);
+	const ok = await exec.run(LANE.background, [cw("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }), cw("hotkeys.json", "[1]", { t: "hash", hash: fingerprintRef(utf8("[]")) as unknown as ContentHash })]);
 	assert.deepEqual(ok.map(outcomeOk), [true, true]);
 	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), '{"a":2}');
 	// Text config payloads are refused: encoding them would be O(N) string work on main.
-	const text = await exec.run(2, [w("app.json", "{}", ANY, { area: "config", purpose: "settings" })]);
+	const text = await exec.run(LANE.background, [w("app.json", "{}", ANY, { area: "config", purpose: "settings" })]);
 	assert.ok(text[0]?.t === "write" && !text[0].outcome.ok && text[0].outcome.reason === "io");
 });
 
@@ -254,16 +254,16 @@ test("diskExecutor over ObsidianVault: precondition races (i) stat-visible, (ii)
 	// (i) a stat-visible same-length change after the engine answered: precondition, nothing written.
 	fake.put("a.md", "base");
 	afterHash = () => fake.put("a.md", "BASE");
-	assert.equal(reason((await exec.run(3, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("base") })]))[0]), "precondition");
+	assert.equal(reason((await exec.run(LANE.background, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("base") })]))[0]), "precondition");
 	assert.equal(fake.text("a.md"), "BASE");
 	// (ii) a change not yet in TFile.stat that changes the length, landing after the recheck: process guard.
 	fake.beforeProcess = (p) => { fake.files.get(p)!.bytes = utf8("BASE and more"); };
-	assert.equal(reason((await exec.run(3, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("BASE") })]))[0]), "precondition");
+	assert.equal(reason((await exec.run(LANE.background, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("BASE") })]))[0]), "precondition");
 	assert.equal(fake.text("a.md"), "BASE and more");
 	// (iii) accepted gap (ObsidianVault header, DESIGN §f.2): same length, not in stat -> overwritten.
 	fake.put("a.md", "base");
 	fake.beforeProcess = (p) => { fake.files.get(p)!.bytes = utf8("BASE"); };
-	assert.equal(reason((await exec.run(3, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("base") })]))[0]), "ok");
+	assert.equal(reason((await exec.run(LANE.background, [w("a.md", "sync", { t: "fingerprint", fingerprint: fpOf("base") })]))[0]), "ok");
 	assert.equal(fake.text("a.md"), "sync");
 	fake.beforeProcess = null;
 });
@@ -276,7 +276,7 @@ test("diskExecutor config CAS: a change between the read and writeBytes is not d
 	const inner = simHashOracle();
 	const hashes: HashOracle = { hash: async (items) => { const v = await inner.hash(items); await configDir.writeBytes("app.json", utf8('{"user":1}')); return v; } };
 	const exec = new DiskExecutor({ vault: new SimVault({ clock, hashes, profile: "case-insensitive" }), configDir, clock, hashes, isBoundPath: () => false, budgets: () => ({ mainSliceMs: 8 }) });
-	const r = await exec.run(2, [cw("app.json", '{"a":1}', { t: "fingerprint", fingerprint: fpOf("{}") })]);
+	const r = await exec.run(LANE.background, [cw("app.json", '{"a":1}', { t: "fingerprint", fingerprint: fpOf("{}") })]);
 	assert.equal(outcomeOk(r[0]), true);
 	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), '{"a":1}');
 });

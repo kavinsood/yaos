@@ -570,9 +570,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   with B offline, ends on both devices as `a.md` = "start one" and
   `a (conflict A <time>).md` = "start one two three". Nothing is lost.
 - Tablets in the background (DESIGN §i.4). A tablet's `hidden` only flushes
-  and keeps the socket and lanes 3–4, like a desktop's
+  and keeps the socket and background work (DESIGN §i.1), like a desktop's
   (`engine/compose/vaultRuntime.ts:574-575`); phone and constrained devices
-  pause lanes 3–4 and close the socket after `HIDDEN_CLOSE_MS` (30 s, `:97`).
+  pause background work and close the socket after `HIDDEN_CLOSE_MS` (30 s, `:97`).
   The reason recorded with 4a14c02 is gone: the engine could not tell an iPad
   from a desktop running the engine inline, which `deviceClassFor` ran as
   `tablet`. There is no inline carrier now, and `deviceClassFor` returns

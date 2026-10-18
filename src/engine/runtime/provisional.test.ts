@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { DocId } from "../../core/types";
+import { bodyStream, type ClientFrameId, type DocId } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import { applyChanges, type TextChanges } from "../body/textChanges";
 import type { LogEngine } from "./engine";
+import type { EngineTuning } from "./options";
 import { converged, sleep, startTestEngine, until } from "./testHarness";
 
 /** A bound editor as main keeps it: bind() + boundText, onBoundText changes from others, typing via applyEditorChanges. */
@@ -28,10 +29,10 @@ class View {
 	}
 }
 
-async function pair(relay: SimRelay) {
+async function pair(relay: SimRelay, tuning: Partial<EngineTuning> = {}) {
 	const views = new Map<string, View>();
 	const origins: Record<string, string[]> = { a: [], b: [] };
-	const mk = (dev: "a" | "b") => startTestEngine({ relay, deviceId: `dev-${dev}`, extra: {
+	const mk = (dev: "a" | "b") => startTestEngine({ relay, deviceId: `dev-${dev}`, tuning, extra: {
 		onBoundText: (d: DocId, changes: TextChanges, _length: number, o: string) => {
 			origins[dev]!.push(o);
 			if (o !== "editor") views.get(`${dev}:${d}`)?.receive(changes);
@@ -48,6 +49,11 @@ async function pair(relay: SimRelay) {
 	};
 	return { a, b, view, origins };
 }
+
+/** The device's adoptable on `id`'s stream (DESIGN §d.5), if any. */
+const adoptableOf = (e: LogEngine, id: DocId) => e.c.outbox.ofStream(bodyStream(id)).find((r) => r.state === "adoptable") ?? null;
+/** The device's own (non-adopted) outbox records on `id`'s stream. */
+const ownOf = (e: LogEngine, id: DocId) => e.c.outbox.ofStream(bodyStream(id)).filter((r) => r.adoptOf === null);
 
 test("provisional: bound peer applies provisional, adopts, settles on commit", async () => {
 	const relay = new SimRelay();
@@ -82,12 +88,15 @@ test("provisional: dropped provisional -> adoptable sent as own frame; converges
 		const vb = await view("b", b, id);
 		relay.failNextCommit("durability");
 		va.type("Y");
+		await until(() => vb.text === "xY", 3_000, "b applied the provisional");
+		vb.type("Z");
 		await until(() => b.c.docs.stats.adoptToPending >= 1, 3_000, "adopt -> pending on drop");
 		await converged([a, b]);
-		assert.equal(vb.text, "xY");
-		assert.equal(await b.docText(id), "xY");
-		assert.equal(await a.docText(id), "xY");
-		assert.ok(relay.rows(("b:" + id) as never).some((r) => r.deviceId === "dev-b"), "b re-appended the adopted frame");
+		assert.equal(vb.text, "xYZ");
+		assert.equal(await b.docText(id), "xYZ");
+		assert.equal(await a.docText(id), "xYZ");
+		const fromB = relay.rows(("b:" + id) as never).filter((r) => r.deviceId === "dev-b");
+		assert.ok(fromB.length >= 2, "b re-appended the adopted frame, and its own edit");
 	} finally {
 		await a.stop();
 		await b.stop();
@@ -101,14 +110,52 @@ test("provisional: no commit within provisionalAdoptMs -> pending; commits once 
 		const id = await a.createDoc("t.md", "");
 		await converged([a, b]);
 		const va = await view("a", a, id);
-		await view("b", b, id);
+		const vb = await view("b", b, id);
 		relay.pauseCommits();
 		va.type("slow");
-		await until(() => b.c.docs.stats.adopted >= 1, 3_000, "adopted");
+		await until(() => b.c.docs.stats.adopted >= 1 && vb.text === "slow", 3_000, "adopted");
+		const adopted = adoptableOf(b, id)!.clientFrameId;
+		vb.type("!");
 		await until(() => b.c.docs.stats.adoptToPending >= 1, 3_000, "timeout -> pending");
+		await until(() => b.c.sender.inflightCount >= 2, 3_000, "the adopted copy is re-appended next to b's own frame");
 		relay.resumeCommits();
 		await converged([a, b]);
-		assert.equal(await b.docText(id), "slow");
+		assert.equal(await b.docText(id), "slow!");
+		assert.equal(await a.docText(id), "slow!");
+		assert.ok(relay.rows(("b:" + id) as never).some((r) => r.deviceId === "dev-b" && r.clientFrameId === adopted), "b's adopted copy committed");
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});
+
+test("provisional: an adoptable holds nothing: own frames typed on top are pending and go out before the adopted frame's commit", async () => {
+	const relay = new SimRelay();
+	// A long adopt timeout: the adoptable stays adoptable for the whole test.
+	const { a, b, view } = await pair(relay, { provisionalAdoptMs: 60_000 });
+	try {
+		const id = await a.createDoc("h.md", "");
+		await converged([a, b]);
+		const va = await view("a", a, id);
+		const vb = await view("b", b, id);
+		relay.pauseCommits();
+		va.type("A");
+		await until(() => adoptableOf(b, id) !== null && vb.text === "A", 3_000, "b adopted a's provisional");
+		const adopted: ClientFrameId = adoptableOf(b, id)!.clientFrameId;
+		vb.type("B");
+		await until(() => ownOf(b, id).length > 0, 3_000, "b closed a frame");
+		const [own] = ownOf(b, id);
+		assert.notEqual(own!.state, "held", "not held behind the adoptable");
+		assert.equal(own!.dependsOn, null);
+		await until(() => b.c.sender.inflightCount === 1, 3_000, "b's frame is on the wire");
+		assert.equal(relay.pendingCount(), 2, "a's frame and b's, neither committed");
+		assert.equal(adoptableOf(b, id)?.clientFrameId, adopted, "the adoptable is still waiting for a's commit");
+		relay.resumeCommits();
+		await converged([a, b]);
+		assert.equal(await a.docText(id), "AB");
+		assert.equal(await b.docText(id), "AB");
+		assert.equal(b.c.outbox.size, 0, "the adoptable settled on a's commit");
+		assert.ok(!relay.rows(("b:" + id) as never).some((r) => r.clientFrameId === adopted), "and was never appended");
 	} finally {
 		await a.stop();
 		await b.stop();

@@ -105,7 +105,7 @@ export class Maintenance {
 			if (r.stale || r.frozen || c.sess.isReading(r.stream)) continue;
 			if ((this.compactSkip.get(r.stream) ?? 0) > now) continue;
 			if (!needsCompaction(r, c.tuning.compactRows, c.tuning.compactBytes)) continue;
-			if (c.background && r.tailRows <= TAIL_HARD_ROWS) continue; // lane 4 waits; the hard cap is lane 1
+			if (c.background && r.tailRows <= TAIL_HARD_ROWS) continue; // waits while backgrounded; the hard cap does not
 			budget--;
 			const res = r.cls === "ns" ? await compactFold(c.deps, c.ns) : r.cls === "cfg" ? await compactFold(c.deps, c.cfg)
 				: r.cls === "snap" ? await compactFold(c.deps, c.snap) : await compactBody(c.deps, r.stream);

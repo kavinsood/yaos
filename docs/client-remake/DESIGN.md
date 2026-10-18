@@ -33,7 +33,7 @@ Each invariant from report.md is enforced by named structures, not by care.
 | I2 | Never destroy a file on disk without a recoverable copy. | `VaultPort` exposes only `trash`, never a permanent delete. Every destructive `DiskOp` carries a CAS precondition (`WritePrecondition`). `conflictCopy` runs before any conflicting overwrite. `intents` store (§e.1). The safety brake counts deletes, trashes and overwrites that shrink a file by ≥ 50 % (§f.5). Fold losers are renamed, never deleted (§c.13). Recovery snapshots are taken before brake approval, epoch migration and IDB recovery (§j.4). |
 | I3 | The same log prefix gives the same state everywhere. | Pure fold `FoldNsFrame` over `(seq, index)` (§c). `FOLD` constants in `limits.ts`. Frozen Unicode case folding (§c.2). Duplicate-frame ring plus send window (§c.3). `upgradeRules` halts instead of guessing (§c.10). Canonical `nsFoldV1` checkpoints are verified by re-encode and digests (§b.5). `cfg` is LWW on `(seq, index)` (§c.11). `snap` is an order-independent join (§j.4). Bodies are Yjs CRDTs. |
 | I4 | One device's bad update can't corrupt others. | One ingest gate: verify → decode in scratch → check → apply, or quarantine (§d.6). `quarantine` store; per-doc `frozen`. Checkpoints are UNIONed into local state, never replace it (§d.7). A malformed ns frame folds as empty, deterministically. Merges run only against a caught-up CRDT (§f.3). The brake holds mass destruction (§f.5). The ns-divergence alarm holds destructive ops (§b.5). |
-| I5 | Bounded resources per device class (memory, CPU, battery, rows written). | `BUDGETS[deviceClass]` (§i.2). Clean-only LRU residency (§d.1). Frame builder caps (§d.4). Store bounds (§e.3). Priority lanes and slices (§i.1). Token bucket and daily soft budget (§i.6). Compaction thresholds (§d.8). No O(document) work per keystroke: frames are `Y.mergeUpdates` of small batches, never `encodeStateAsUpdate`, and nothing rewrites a full doc per edit. |
+| I5 | Bounded resources per device class (memory, CPU, battery, rows written). | `BUDGETS[deviceClass]` (§i.2). Clean-only LRU residency (§d.1). Frame builder caps (§d.4). Store bounds (§e.3). Send ranks, disk lanes and slices (§i.1). Token bucket and daily soft budget (§i.6). Compaction thresholds (§d.8). No O(document) work per keystroke: frames are `Y.mergeUpdates` of small batches, never `encodeStateAsUpdate`, and nothing rewrites a full doc per edit. |
 | I6 | Disk events are hints; a periodic full reconcile is the truth check. | `VaultEvent`s only mark paths dirty. The `LocalEntry` stat cache is confirmed by hash (§f.6). A full reconcile runs every `fullReconcileIntervalMs` and on resume. The planner is a pure function of the three trees (§f.2). Echo suppression only drops events; it never decides anything (§f.4). |
 
 ---
@@ -661,7 +661,7 @@ cold ──load──▶ resident ──bind──▶ bound
 
 - **cold.** Only IDB records exist: `streams`, `snapshots`, `tail`, `outbox`. Rows for cold docs are gated (§d.6
   stages 1–2) and stored without building a `Y.Doc`.
-- **load** (lane of the requester), in one `Y.transact(doc, …, LOAD)`:
+- **load**, in one `Y.transact(doc, …, LOAD)`:
   1. apply the `snapshot`;
   2. apply every `tail` row of the stream in seq order, resolving `bodyUpdateRef` rows (§d.6);
   3. apply the `content` of every own outbox record of the stream (held, pending, adoptable) in `order`.
@@ -676,8 +676,8 @@ cold ──load──▶ resident ──bind──▶ bound
   - it is not bound.
   - Eviction just drops the `Y.Doc`. Everything it holds is already in IDB.
 - **Budgets.** `maxResidentDocs` and `maxResidentBytes` per device class (§i.2).
-  - When over budget with no clean handle, new loads wait: lane 3/4 jobs queue, and lane 0/1 loads may exceed the
-    budget by one doc.
+  - A load never waits: it first evicts clean handles, LRU first, and goes over budget when none is clean
+    (`HandleCache.enforceBudget`, `src/engine/body/handles.ts`).
   - `memory-pressure` is declared (`src/ports/platform.ts:26`) but no host source raises it, and
     `HandleCache.evictAllClean` (`src/engine/body/handles.ts:196-197`) is called only by tests. Nothing runs.
 
@@ -872,8 +872,8 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
     tick, takes the leading-edge commit, and the body waits `minIntervalMs` for the next one;
   - the sender never puts a frame on the wire before its create (`blockedBy`, sender.ts pump). While the create is in
     the outbox, its body frame waits until the create is inflight on the same session, and holds the stream's later
-    frames behind it. This applies to resends after a reconnect too. In the lane order, a frame ranks no earlier
-    than its create.
+    frames behind it. This applies to resends after a reconnect too. In the send order (§i.1), a frame ranks no
+    earlier than its create.
 - **Onboarding** (the passes before that, against a remote that may already hold the same files; and the first full
   pass after every engine start): the frames are `held` and are released when the create folds `applied` /
   `suffixed`. Identical concurrent imports merge (§c.5), and holding keeps them at zero body rows. A restart also
@@ -902,7 +902,7 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
 - **Alternative:** hold every create's frames until it folds, the earlier rule. Rejected for live creates: every
   create→peer takes two group commits. Kept for onboarding, where merged duplicates are the common case.
 - **Sender.**
-  - Picks `pending` records by lane (§i.1), then by `order`. A live create's body frame waits for its create (above).
+  - Picks `pending` records by rank (§i.1), then by `order`. A live create's body frame waits for its create (above).
   - Respects all of: the token bucket (`APPEND_BYTES_PER_SEC`, burst ≤ `limits.burstBytes`), `maxInflightAppendBytes`
     of sent-unreceipted bytes, `session.bufferedBytes()`, and the ns/cfg send window (§c.3).
   - What is in flight is the sender's memory only (`Sender.isInflight`); a record stays `pending` until its receipt.
@@ -920,11 +920,18 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   2. Apply with origin `REMOTE` and forward to main.
   3. `T_adopt` puts an **adoptable** outbox record: a fresh own `clientFrameId`, `adoptOf = {deviceId, clientFrameId,
      receivedAtMs}`, the content re-sealed under the own AAD, flag `adopted`.
-  - Frames the builder seals for that stream while an adoptable exists are `held` with `dependsOn` = the newest
-    adoptable, so own edits built on provisional structs never reach the log before those structs do.
+  - Frames the builder seals for that stream while an adoptable exists are plain `pending` records, with no
+    `dependsOn` on the adoptable, and rank hot like it (§i.1). They need no hold. The relay broadcasts a PROVISIONAL
+    only after the author's append is in its buffer (relay-wire §5.2), so the provisional structs commit no later
+    than an own frame appended after seeing them. If the author's frame is dropped or orphaned, the adoptable is
+    re-sent (below). Own frames that committed ahead of it then leave peers a causal hole only until it commits,
+    well inside the §d.6 re-read window (3 tries over ≥ 3 min, ≥ 2 × `PROVISIONAL_ADOPT_MS`).
+  - **Alternative:** hold own frames behind the newest adoptable until its commit or receipt, the earlier rule.
+    Rejected: typing in a co-edited note waited on the peer's commit, and on a dropped peer frame it waited for the
+    adopted copy, which then ranked below background bodies and could sit behind a bulk import for minutes.
 - **Settling an adoptable:**
   - **commit observed** (`committed` with matching `(deviceId, clientFrameId)`, live or in a read page): store the
-    row in `tail`, delete the adoptable without re-applying, and release its dependents (same transaction);
+    row in `tail` and delete the adoptable without re-applying (same transaction);
   - **`provisionalDropped`, or `PROVISIONAL_ADOPT_MS` (60 s) passes without a commit:** the adoptable becomes
     `pending`, is re-appended, and its receipt settles it like an own frame.
   - A duplicate (the original also commits later) is harmless (CRDT).
@@ -1021,7 +1028,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    is captured.
    - Live events go to an in-memory **live queue**.
    - Rows are processed in arrival order, committed rows in batches (one `tLive` per batch), provisionals one at a
-     time (`src/engine/runtime/liveIngest.ts:1-7`); no lane decides the order. Stored body rows are applied only
+     time (`src/engine/runtime/liveIngest.ts:1-7`); no rank decides the order. Stored body rows are applied only
      to a resident (or loading) replica; the rest stay in the tail (`src/engine/runtime/docRuntime.ts:168-187`).
    - **Overflow** (> 4 MiB or > 1000 queued rows): drop payloads of rows for non-resident docs. Record those streams
      as stale with `remoteHeadSeq = max(…, seq)`. The seq counts as accounted, and the rows are read later.
@@ -1036,8 +1043,8 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    phase becomes `key-missing` and catch-up stops there (`sessionLoop.ts:148-152`). Then ns, cfg, snap are read in
    that order (`sessionLoop.ts:153`).
 4. **Reads.** Catch-up jobs take stale streams in priority order (§j.6; `staleOrder` over the in-memory stream cache,
-   `src/engine/sync/catchUp.ts`, nothing stored), up to `catchUpConcurrency` at once. Open notes
-   run in lane 1 and ns/cfg/snap in lane 2, first (in that order).
+   `src/engine/sync/catchUp.ts`, nothing stored), up to `catchUpConcurrency` at once. Bound docs go first; ns, cfg
+   and snap were read in step 3a.
    - Each job calls `read(stream, appliedSeq, preferCheckpoint = appliedSeq === 0)` and gates each page.
    - **`T_read_page`:** put tail rows. An own row (`deviceId` = self) whose `clientFrameId` is in the outbox is a
      **late receipt**, handled exactly like `T_receipt`. An own row without an outbox record is a plain row.
@@ -1074,8 +1081,9 @@ The planner does no destructive work until ns is caught up (§f.2).
 
 ### d.8 Local compaction
 
-- **Trigger:** `tailRows > LOCAL_COMPACT_ROWS` or `tailBytes > LOCAL_COMPACT_BYTES`, run in lane 4 when idle. At
-  `tailRows > TAIL_HARD_ROWS` it runs in lane 1.
+- **Trigger:** `tailRows > LOCAL_COMPACT_ROWS` or `tailBytes > LOCAL_COMPACT_BYTES`, run by the maintenance tick. It
+  is background work and waits while the app is backgrounded (§i.4), except at `tailRows > TAIL_HARD_ROWS`
+  (`src/engine/runtime/maintenance.ts`).
 - **Preconditions:**
   - the stream is not stale;
   - no own outbox record of the stream is `pending` or `held`. A late receipt could otherwise land at a seq ≤
@@ -1216,10 +1224,10 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | `cfgBase` | `file` | — | `CfgBaseRecord` | Allowlisted config files |
 | `blobQueue` | `hash` | — | `BlobQueueRecord` | 1 per failed transfer backing off; a running transfer has none, success deletes it (`src/engine/blobs/blobQueue.ts:285-297`) |
 
-- **`dependsOn` rule.** A `held` record waits for one of two things:
-  - the doc's ns create, during onboarding (released when it folds, §d.4);
-  - the newest adoptable of the stream (released when that record is gone).
-  - Releasing a record means `held → pending` in the same transaction that removes the dependency.
+- **`dependsOn` rule.** A `held` record waits for the doc's ns create, during onboarding, and is released
+  (`held → pending`) when that create folds (§d.4, `NsRuntime.reconcileHeld`). Adoptables hold nothing (§d.5). A
+  store written before that rule can still have frames held behind an adopted record; `reconcileHeld` treats
+  those as dependency-gone.
 - **`pending` with `dependsOn`** is a live create's body frame (§d.4). It is sent only after that create: while the
   create is in the outbox, the frame goes only once the create is inflight on the same session. It is deleted when
   the create folds `merged`. When the create's record is replaced under a new `clientFrameId` (own stale-epoch copy,
@@ -1243,8 +1251,8 @@ Rules:
 | Tx | Stores | Writes | Crash reasoning |
 |---|---|---|---|
 | `T_edit` (frame close) | outbox, meta, streams | Outbox record (`pending` / `held`); `outboxOrder.next++`; `bodyVersion.localOrder` | **Commits before `append`.** Before commit: the edit is on disk via the editor save (§d.4). After commit: resent at startup. |
-| `T_receipt` (one per `STREAM_RECEIPTS` batch) | outbox, tail, streams, meta | Per receipt: tail put `(stream, seq)` with outbox content; outbox delete; release dependents; `lastOwnSeq`, `remoteHeadSeq`, `appliedSeq` (if not stale), checkpoint counters, `ckptDuty`; `daily.framesSent`; cursor | A missing outbox record is a no-op (idempotent). Before commit: re-delivered as a late receipt via read, or resent and then deduped (relay window, fold ring, or CRDT). |
-| `T_ingest` (batch ≤ 64 rows / 1 MiB per slice) | tail, quarantine, streams, outbox, meta | Tail or quarantine puts; adoptable deletes and releases; `remoteHeadSeq`, `appliedSeq`, `bodyVersion.remoteSeq`, counters; cursor | Before commit: the rows are unaccounted and re-fetched. Replica already applied: idempotent. |
+| `T_receipt` (one per `STREAM_RECEIPTS` batch) | outbox, tail, streams, meta | Per receipt: tail put `(stream, seq)` with outbox content; outbox delete; `lastOwnSeq`, `remoteHeadSeq`, `appliedSeq` (if not stale), checkpoint counters, `ckptDuty`; `daily.framesSent`; cursor | A missing outbox record is a no-op (idempotent). Before commit: re-delivered as a late receipt via read, or resent and then deduped (relay window, fold ring, or CRDT). |
+| `T_ingest` (batch ≤ 64 rows / 1 MiB per slice) | tail, quarantine, streams, outbox, meta | Tail or quarantine puts; adoptable deletes; `remoteHeadSeq`, `appliedSeq`, `bodyVersion.remoteSeq`, counters; cursor | Before commit: the rows are unaccounted and re-fetched. Replica already applied: idempotent. |
 | `T_stale` | streams, meta | `remoteHeadSeq`, `stale = 1`; cursor | Overflow or null payload: the row is read later. |
 | `T_feed_page` | streams, meta | Stream heads, stale; cursor = `throughSeq` | Before commit: the page is re-fetched. |
 | `T_read_page` | tail, quarantine, outbox, streams, snapshots | Rows; late receipts; fresh-stream checkpoint snapshot + exact-key deletes of tail ≤ coversSeq; `appliedSeq` / `stale` when complete | Idempotent puts. The page is re-read from `appliedSeq`. |
@@ -1418,7 +1426,7 @@ All are in `src/core/types.ts`.
   8. bookkeeping.
 - **Disk ops** become `DiskOp`s with `WritePrecondition`s (`expect hash` → `{t: "hash"}`; for fresh writes, `{t:
   "fingerprint"}` with the fingerprint read by the job). They are sent in `diskOps` batches of ≤ `diskOpsPerBatch`,
-  tagged with the lane.
+  in the `background` lane (§i.1).
 - **Failed precondition:** that doc is re-planned in the next scoped pass. Nothing is retried blindly.
 - **Bound docs.** `reconcileContent` merges into the worker replica (origin `MERGE` → body `entry` → editor), and
   Obsidian's save writes the disk. The projection never writes a bound file (§d.2).
@@ -1487,8 +1495,8 @@ All are in `src/core/types.ts`.
   6. `T_synced` (base = M, hashes, bodyVersion) + `T_intent_end`.
   - If step 5's precondition fails, the user edited again. S stays at B, the next round merges (B, D′, M), and diff3
     treats the already-applied identical hunks as non-conflicting.
-- **Bounded time.** Inputs above the caps never run diff (`too-large`). Merge jobs run in lane 3 (or 0/1 for open
-  docs) and yield between docs.
+- **Bounded time.** Inputs above the caps never run diff (`too-large`). Merge jobs write in the `background` disk
+  lane (§i.1) and yield between docs.
 
 ### f.4 Echo suppression
 
@@ -1654,8 +1662,8 @@ transferred buffers.
     transferred (host/hashOracle.ts);
   - `observations` are chunked and acknowledged;
   - `readRequest` is bounded by `maxDiskIoBytesInFlight`;
-  - `diskOps` batches are ≤ `diskOpsPerBatch`, and the host runs lane 0 batches before others, within `mainSliceMs`
-    slices;
+  - `diskOps` batches are ≤ `diskOpsPerBatch`, and the host runs `openNote` batches before `background` ones
+    (§i.1), within `mainSliceMs` slices;
   - `vaultEvents` and `bodyPush` are small and unbounded by design. Main never drops them.
 - **Timeouts.** Engine→main requests (disk I/O, side files) have no fixed timeout: a slow mobile disk is still
   progressing. They end with the engine (`aborted`, engine/compose/hostLink.ts `close`), and the engine re-plans
@@ -1877,31 +1885,48 @@ interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; r
 
 ## i. Runtime
 
-### i.1 Priority lanes
+### i.1 Priorities
 
-| Lane | `LANE` | Work |
+Two small priority scales, each applied in exactly one place. There is no engine scheduler: no queue the engine
+drains, no slice loop, no aging.
+
+**Send ranks** (`RANK`, `sendRank`, `src/engine/body/sender.ts`). The sender sends `pending` / `sent` records by
+rank, then by outbox `order` (`Sender.order`). A frame waiting for its create sorts at the create's rank or later,
+so a body never sorts ahead of its create (§d.4).
+
+| Rank | `RANK` | Frames |
 |---|---|---|
-| 0 | `openNote` | `bodyPush` apply, frame close and **send** for bound docs, receipts, body event forwarding, provisionals for bound docs, bind requests and bind merges |
-| 1 | `openCatchUp` | Reads, union and merges for bound or just-opened docs; hard-limit compaction |
-| 2 | `namespace` | ns/cfg/snap ingest, fold, ns/cfg/snap reads, planner runs, ns frames, settings projection |
-| 3 | `background` | Body reads for stale streams, merges, projection writes, materialization, scan hashing |
-| 4 | `bulk` | Compaction, remote checkpoints, retired checkpoints, snapshots, mirrors |
+| 0 | `hot` | Body frames of bound docs, and every adopted frame (§d.5) |
+| 1 | `nsCfg` | ns and cfg frames |
+| 2 | `background` | snap frames, and every other body frame (imports, merges, initial content of docs that are not open) |
 
-- **Blob transfers are not lane work.** They run in the background in the blob queue, within its byte budget
-  (§j.1); only their disk reads and writes are lane-tagged (lane 3: `src/engine/reconcile/context.ts:193-200`).
-- **No engine scheduler.** Lanes are priority tags, not a queue the engine drains; there is no slice loop and no
-  aging. They take effect in two places:
-  - **Sender** order: lane rank, then outbox order; a frame waiting on another record sorts at that record's rank or
-    later (`src/engine/body/sender.ts:335-346`). Ranks: bound-doc frames 0, ns 1, cfg 2, snap and other
-    streams 3, adopted frames 4 (`src/engine/runtime/engine.ts:57-65`).
-  - **Host** `DiskExecutor` runs the next op of the highest-priority (lowest lane) batch, FIFO within a lane, keeps
-    order inside a batch, and yields a macrotask every `mainSliceMs` (`src/host/diskExecutor.ts:1-8`, `:102-108`,
-    `:124-127`).
+- Adopted frames are hot even after their note closes: they exist only for bound docs (`DocRuntime.onProvisional`)
+  and are few. Ranked below background bodies, a peer's dropped edit could sit behind a bulk import that the token
+  bucket (§i.6) meters out over minutes.
+
+**Disk lanes** (`LANE`, `src/protocol/messages.ts`). Every `diskOps` batch carries one. The host `DiskExecutor`
+runs the next op of the oldest `openNote` batch, else of the oldest `background` batch, keeps order inside a
+batch, and yields a macrotask every `mainSliceMs` (`src/host/diskExecutor.ts`).
+
+| Lane | `LANE` | Batches |
+|---|---|---|
+| 0 | `openNote` | Writes for an open note that the user waits on: a bound doc's conflict copy (`src/engine/compose/boundDisk.ts`) |
+| 1 | `background` | Everything else: reconcile and merge writes, materialization, renames, trashes, snapshot restores, settings |
+
+- `readRequest` has no lane: reads go to the vault in arrival order. Bound docs merge into the worker replica, not
+  through disk writes (§f.2).
+- **Blob transfers** are not ranked. They run in the blob queue within its byte budget (§j.1); their disk writes
+  are `background` batches.
+
+**Background work** is what waits while the app is backgrounded (§i.4, `EngineCtx.background`,
+`VaultRuntime.background`): reconcile passes, new blob transfers, stale-stream reads, local compaction below
+`TAIL_HARD_ROWS` (§d.8) and remote checkpoints.
+
 - Long engine loops yield a macrotask through `ClockPort.yieldNow` (e.g. `src/engine/reconcile/mergeJob.ts:108`,
   `src/engine/reconcile/canvasJob.ts:78`, `src/engine/compose/hashService.ts:102`, `src/engine/blobs/gc.ts:109`).
 - Relay events are queued at once (`src/engine/runtime/liveIngest.ts:65-66`) and processed in arrival order:
   committed/receipt events in batches of ≤ `liveBatchRows`, provisionals one at a time (`liveIngest.ts:4-7`,
-  `:143`). Not by lane.
+  `:143`). Not by rank.
 
 ### i.2 Device classes and budgets
 
@@ -1949,8 +1974,8 @@ Further caps:
 
 | Event | Action |
 |---|---|
-| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and lanes 3–4, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk; tablets get the same treatment. Phone and constrained devices pause lanes 3–4 at once (hard-cap compaction is lane 1 and still runs; no new blob transfer starts, `src/engine/compose/vaultRuntime.ts:239`) and close the socket (1000) after 30 s hidden, which also ends the blob transfers in flight (§j.1). A background close shows no offline or error phase and arms no backoff. |
-| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause lanes 3–4 and close the socket on every device class (ending the blob transfers in flight). Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
+| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and background work, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk; tablets get the same treatment. Phone and constrained devices pause background work at once (hard-cap compaction still runs; no new blob transfer starts, `src/engine/compose/vaultRuntime.ts:239`) and close the socket (1000) after 30 s hidden, which also ends the blob transfers in flight (§j.1). A background close shows no offline or error phase and arms no backoff. |
+| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause background work and close the socket on every device class (ending the blob transfers in flight). Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
 | `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. This tries once even after `offline`, so a missed `online` cannot strand the device; while offline a failure arms no backoff. The user's pause wins over this and over `online`. Check the IDB connection: `onLost` → §i.5. |
 | `online` / `offline` | Connect at once / stop reconnect attempts (an open socket stays until it fails). The outbox keeps accumulating. |
 | `memory-pressure` | None. Declared in `LifecycleEvent` (`src/ports/platform.ts:26`) but never raised by the host; nothing handles it (§d.1). |
@@ -2262,9 +2287,9 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
   - **Live set:** records not deleted and not below their device's floor, at most the newest 100 per device.
   - **Retention:** each upload appends `floor = createdAtMs` of this device's `keepDaily`-th newest upload, so every
     reader drops older ones. Dels below a floor are pruned, so the state stays bounded by retention.
-  - **Wiring, like `cfg`:** read after `ns` and `cfg` in catch-up, folded by a FoldRuntime, lane 2, compacted, and
-    checkpointed as `snapFoldV1` (strict decode plus canonical re-encode, §b.5). The record adds no crypto of its own;
-    the envelope seals it like any frame.
+  - **Wiring, like `cfg`:** read after `ns` and `cfg` in catch-up, folded by a FoldRuntime, sent at the background
+    rank (§i.1), compacted, and checkpointed as `snapFoldV1` (strict decode plus canonical re-encode, §b.5). The
+    record adds no crypto of its own; the envelope seals it like any frame.
 - **Restore and verification** (`verify.ts`, `snapshotJob.ts`). The relay is trusted for neither content nor paths,
   so every check runs on the client.
   1. **Resolve** the id: a local descriptor, else this device's uploaded record, else `<id>@<deviceId>` in the live
@@ -2368,7 +2393,7 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 1. **Connect, then feed from 0.** All streams are recorded stale with priorities. There are about streams/1000 pages.
 2. **ns first.** `read("ns", 0, true)`: verify the checkpoint (V1 + V2), then fold the rows. The Remote tree is now
    complete, and status shows `bootstrap {docsTotal}`.
-3. **Bodies lazily, by priority.** Bound or opened docs (lane 1) first, then live docs by `lastTouchSeq` descending,
+3. **Bodies lazily, by priority.** Bound or opened docs first, then live docs by `lastTouchSeq` descending,
    small first within a bucket (`priority = bucket(lastTouchSeq) × 4 + sizeClass`). Blobs have no stream: the pass
    that plans a blob's materialization claims its download, which runs in the background within the blob byte
    budget (§j.1).
@@ -2631,7 +2656,7 @@ The old client was deleted once the port was done, and the legacy server's share
 ### m.2 Deliberately dropped
 
 - **`adfa7a7:src/main.ts`, `VaultSync`, the runtime coordinators** (`runtime/*`: admission, residency, overdue-work
-  kernels, connection controllers). Replaced by lanes, budgets, the pure planner and ports.
+  kernels, connection controllers). Replaced by send ranks, disk lanes, budgets, the pure planner and ports.
 - **Server-side CRDT and WASM engine** (`@yaos/crdt-engine`, ywasm). Pure JS Yjs only, client-side.
 - **Semantic epochs, fenced WebSocket, legacy receipts, bootstrap client** (`semanticEpochTransition`,
   `fencedWebSocket`, `relayReceipts`, `bootstrapClient`, `serverCapabilities`). Replaced by the streams relay

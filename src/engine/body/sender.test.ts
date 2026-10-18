@@ -1,18 +1,19 @@
 /**
  * Sender unit tests (DESIGN §d.4-§d.6, §i.1, §i.6) with a fake clock and session:
- * lane/outbox order, ns/cfg send window, inflight byte cap, buffered high water,
+ * rank/outbox order (adopted frames hot), ns/cfg send window, inflight byte cap, buffered high water,
  * token bucket, refusals, probe mode, STREAM_RESEND, backpressure, pause, a live
  * create's body frames behind their ns create, the ns cork.
  */
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { EnvelopeFlag } from "../../core/envelope";
 import { NS_SEND_WINDOW, RELAY_CLOSE } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, type ClientFrameId, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, type ClientFrameId, type StreamName } from "../../core/types";
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { AppendFrame, RelaySession } from "../../ports/relay";
 import type { OutboxRecord } from "../store/schema";
-import { BUFFERED_HIGH_WATER, DURABILITY_RETRY_MS, NS_CORK_MAX_MS, Sender, TokenBucket, type SendGate } from "./sender";
+import { BUFFERED_HIGH_WATER, DURABILITY_RETRY_MS, NS_CORK_MAX_MS, RANK, Sender, TokenBucket, sendRank, type SendGate } from "./sender";
 
 class FakeClock implements ClockPort {
 	t = 1_000;
@@ -61,9 +62,11 @@ class FakeSession implements RelaySession {
 	ids(): string[] { return this.appends.map((a) => a.clientFrameId); }
 }
 
-const BOUND = "d:bound" as StreamName;
-const BG = "d:bg" as StreamName;
-const X = "d:low" as StreamName;
+/** Open note (bound): the only stream the tests' rankOf counts as bound. */
+const BOUND = "b:bound" as StreamName;
+const BG = "b:bg" as StreamName;
+/** A closed note that still has an adopted frame. */
+const X = "b:adopted" as StreamName;
 let ord = 0;
 /** Per-stream frameNo counters for ns/cfg records, allocated in outbox order like LogApi does. */
 const frameNos = new Map<StreamName, number>();
@@ -79,7 +82,7 @@ function rec(stream: StreamName, bytes = 10, over: Partial<OutboxRecord> = {}): 
 		createdAtMs: 0, ...over,
 	};
 }
-const RANK: Record<string, number> = { [BOUND]: 0, [NS_STREAM]: 1, [CFG_STREAM]: 2, [BG]: 3, [X]: 4 };
+const adopted = (stream: StreamName, bytes = 10) => rec(stream, bytes, { flags: EnvelopeFlag.adopted });
 
 function mk(maxInflight = 10 * 1024 * 1024, sendGate?: SendGate) {
 	const clock = new FakeClock();
@@ -88,7 +91,7 @@ function mk(maxInflight = 10 * 1024 * 1024, sendGate?: SendGate) {
 	/** The outbox as blockedBy sees it (EngineCtx.outbox): add() puts records in, tests take them out. */
 	const outbox = new Set<ClientFrameId>();
 	const sender = new Sender({
-		clock, rankOf: (r) => RANK[r.stream] ?? 3, maxInflightBytes: () => maxInflight,
+		clock, rankOf: (r) => sendRank(r, (st) => st === BOUND), maxInflightBytes: () => maxInflight,
 		onSent: (r, a) => ev.sent.push([r.clientFrameId, a]), onPoison: (r, why) => ev.poison.push([r.clientFrameId, why]),
 		onForbidden: () => ev.forbidden++, onDailyLimit: (ms) => ev.daily.push(ms), writeBlocked: () => gate.blocked, diag: (c) => ev.diag.push(c),
 		minSendEpoch: () => gate.minEpoch, reseal: (r) => ev.reseal.push(r.clientFrameId), gate: sendGate,
@@ -98,25 +101,56 @@ function mk(maxInflight = 10 * 1024 * 1024, sendGate?: SendGate) {
 	return { clock, ev, sender, add, gate, outbox };
 }
 
-test("sender: lane rank then outbox order; ns waits for openNs; resend replays in the same order", () => {
+test("sendRank: three ranks; adopted frames are hot even once their note is closed", () => {
+	const bound = (st: StreamName) => st === BOUND;
+	assert.equal(sendRank(rec(BOUND), bound), RANK.hot);
+	assert.equal(sendRank(adopted(X), bound), RANK.hot);
+	assert.equal(sendRank(rec(NS_STREAM), bound), RANK.nsCfg);
+	assert.equal(sendRank(rec(CFG_STREAM), bound), RANK.nsCfg);
+	assert.equal(sendRank(rec(SNAP_STREAM), bound), RANK.background);
+	assert.equal(sendRank(rec(BG), bound), RANK.background);
+	assert.equal(sendRank(rec(X), bound), RANK.background, "a closed note's own frames are background");
+	assert.deepEqual(new Set(Object.values(RANK)), new Set([0, 1, 2]));
+});
+
+test("sender: rank then outbox order; ns waits for openNs; resend replays in the same order", () => {
 	const { sender, add, clock, ev } = mk();
-	const [bg, ns, b1, x, b2] = add(rec(BG), rec(NS_STREAM), rec(BOUND), rec(X), rec(BOUND));
+	const [bg, ns, b1, x, b2] = add(rec(BG), rec(NS_STREAM), rec(BOUND), adopted(X), rec(BOUND));
 	const s = new FakeSession();
 	sender.attach(s);
-	assert.deepEqual(s.ids(), [b1, b2, bg, x].map((r) => r!.clientFrameId), "ns/cfg held until late-receipt reads");
+	assert.deepEqual(s.ids(), [b1, x, b2, bg].map((r) => r!.clientFrameId), "ns/cfg held until late-receipt reads");
 	assert.equal(sender.nsWindowOpen, false);
 	sender.openNs();
 	assert.deepEqual(s.ids().slice(4), [ns!.clientFrameId]);
 	assert.equal(sender.inflightCount, 5);
 	sender.onResend();
 	clock.advance(0);
-	assert.deepEqual(s.ids().slice(5), [b1, b2, ns, bg, x].map((r) => r!.clientFrameId));
+	assert.deepEqual(s.ids().slice(5), [b1, x, b2, ns, bg].map((r) => r!.clientFrameId));
 	assert.ok(ev.sent.slice(5).every(([, a]) => a === 2), "attempts counted per send");
 	sender.detach();
 	const s2 = new FakeSession();
 	sender.attach(s2);
 	assert.equal(sender.nsWindowOpen, false, "a new session closes the window again");
 	assert.equal(s2.appends.length, 4);
+});
+
+test("sender: under a tight token bucket, an adopted frame and the open note's new frames go before a background backlog", () => {
+	// The inversion this guards against: adopted frames once ranked below background, so a bulk import metered out
+	// by the bucket kept a dropped peer edit (and, through the adoption hold, the user's own typing) off the wire.
+	const { sender, add, clock } = mk();
+	const backlog = add(...Array.from({ length: 40 }, () => rec(BG, 5_000)), ...Array.from({ length: 5 }, () => rec(SNAP_STREAM, 5_000)));
+	const s = new FakeSession(true, 10_000);
+	sender.attach(s);
+	sender.openNs();
+	assert.equal(s.appends.length, 2, "the bucket (10 KB burst) lets two background frames out");
+	const [x] = add(adopted(X, 2_000));
+	const [own1, own2] = add(rec(BOUND, 2_000), rec(BOUND, 2_000));
+	const [create] = add(rec(NS_STREAM, 2_000));
+	const rate = sender.bucket.rate(clock.monotonic());
+	for (let i = 0; i < 60 && s.appends.length < 6; i++) clock.advance(Math.ceil((2_000 * 1000) / rate));
+	assert.deepEqual(s.ids().slice(2, 6), [x, own1, own2, create].map((r) => r!.clientFrameId), "hot, then ns, then the backlog");
+	clock.advance(Math.ceil((backlog.length * 5_000 * 1000) / rate) + 1_000);
+	assert.equal(s.appends.length, backlog.length + 4, "the backlog still drains");
 });
 
 test("sender: ns and cfg windows are frameNo < lowest unreceipted own frameNo + NS_SEND_WINDOW, independently (e2ee-design §8.2)", () => {

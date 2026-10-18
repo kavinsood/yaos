@@ -369,12 +369,14 @@ export type EngineResultValue =
 	/** cleanUpAttachments. keptNewer: unreferenced but uploaded within the grace; repaired / lost: deleted, then found referenced. */
 	| { readonly t: "attachmentsCleaned"; readonly deleted: number; readonly keptNewer: number; readonly repaired: number; readonly lost: number; readonly refused: AttachmentCleanupRefusal | null; readonly detail: string | null };
 
-/** Priority lanes (DESIGN §i.1); also tags disk batches so the host executes higher lanes first. */
-export type Lane = 0 | 1 | 2 | 3 | 4;
+/**
+ * Disk-batch lanes (DESIGN §i.1): the host runs the next op of an openNote batch before any background one. Only
+ * diskOps carry a lane; reads go straight to the vault in arrival order.
+ */
+export type Lane = 0 | 1;
 export const LANE = {
+	/** Writes for an open note that the user is waiting on (boundDisk's conflict copy). */
 	openNote: 0,
-	openCatchUp: 1,
-	namespace: 2,
-	background: 3,
-	bulk: 4,
+	/** Everything else: reconcile writes, materialization, restores, settings. */
+	background: 1,
 } as const;

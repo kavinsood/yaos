@@ -215,9 +215,7 @@ export interface OutboxRecord {
 	readonly keyEpoch: number;
 	/**
 	 * pending: the live ns create this body frame goes after (DESIGN §e.1, Sender blockedBy).
-	 * held: the frame this waits for (DESIGN §e.1): the doc's ns create
-	 * (released when it folds) or the newest adoptable of the same stream
-	 * (released when that record is gone).
+	 * held: the onboarding ns create of the doc this frame waits for (DESIGN §e.1), released when it folds.
 	 */
 	readonly dependsOn: ClientFrameId | null;
 	/** adoptable only: identity of the provisional frame being shadowed. */
