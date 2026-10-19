@@ -9,12 +9,12 @@
  * Path: relay payloads are sealed by the suite-1 adapter (createWebCryptoSuite1, testkit K(1), seeded RandomPort),
  * then go through gateRow (src/engine/sync/ingestRow.ts:54, the entry the engine runs on every committed row),
  * then NsRuntime / CfgRuntime.load() over a minimal Repo that holds only the snapshot and the tail
- * (src/engine/sync/foldRuntime.ts:109-163). Every replay authenticates: the AAD binds vaultId, stream, deviceId
+ * (src/engine/sync/foldRuntime.ts:149-203). Every replay authenticates: the AAD binds vaultId, stream, deviceId
  * and clientFrameId (§7.2), and a replay repeats those columns byte for byte. Its gated row carries the recorded
  * frameNo and content, and the fold still ignores it.
  *
  * Honest sequences only (e2ee-design §8.2; see also core/ns/replayExactness.test.ts):
- *  - frameNos per (device, stream) follow FoldRuntime.allocFrameNo (foldRuntime.ts:239-247): 1 + the highest own
+ *  - frameNos per (device, stream) follow FoldRuntime.allocFrameNo (foldRuntime.ts:279-287): 1 + the highest own
  *    frameNo, plus NS_DEDUPE_RING on a runtime's first allocation. A fresh device therefore starts at 65, and a
  *    restart (a quarter of the lanes) leaves a gap of 64.
  *  - All of a seed's frames are authored (and sealed) before its first commit, so authorNsSeq and setBlob baseRev
@@ -80,7 +80,7 @@ const DEV: Record<Cls, DeviceId> = { L1: "dev-L1" as DeviceId, L2: "dev-L2" as D
 const READER = "dev-reader" as DeviceId;
 const AGES_OF: Record<Cls, readonly Age[]> = { L1: AGES, L2: [1, 63, 64, 65, 1000], F: [1, 63, 64, 65] };
 const PREFIX_FRAMES = { L1: 100_200, L2: 1_100 } as const;
-/** First frameNo of a fresh runtime (foldRuntime.ts:239-247). */
+/** First frameNo of a fresh runtime (foldRuntime.ts:279-287). */
 const FIRST = NS_DEDUPE_RING + 1;
 const STREAMS = [NS_STREAM, CFG_STREAM] as const;
 type Reason = "replay-stale" | "replay-duplicate" | "duplicate-frame";
@@ -285,7 +285,7 @@ function makeLane(rnd: SeededRandom, seed: number, prefix: Prefix, stream: Strea
 	const restartAt = rnd.chance(0.25) ? rnd.int(n) : null;
 	const frames: Frame[] = [];
 	const byFrameNo = new Map<number, Frame>();
-	// allocFrameNo (foldRuntime.ts:239-247): L1/L2 continue the prefix runtime; F is fresh; a restart skips NS_DEDUPE_RING.
+	// allocFrameNo (foldRuntime.ts:279-287): L1/L2 continue the prefix runtime; F is fresh; a restart skips NS_DEDUPE_RING.
 	let max = prefixMax;
 	let allocated = cls !== "F";
 	let docs = 0;

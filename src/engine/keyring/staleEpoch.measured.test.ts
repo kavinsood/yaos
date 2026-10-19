@@ -3,10 +3,10 @@
  * and committed past S_rot are all ignored, nothing is quarantined, and the ns/cfg fold digests equal those of the
  * same rows without them. Old-epoch frames committed before the revoke row are still accepted. 1000 seeds; every
  * row of every seed is checked, nothing sampled. The rule is §14.3, as the gate implements it: the verdict
- * comes from the outer header's keyEpoch before any open (src/engine/ingest/gate.ts:137-146, keyring answer
+ * comes from the outer header's keyEpoch before any open (src/engine/ingest/gate.ts:163-172, keyring answer
  * src/engine/keyring/book.ts:158-165). gateRow (src/engine/sync/ingestRow.ts:54) then makes a stale ns/cfg row a
  * tail row flagged LOCAL_FLAG_STALE_EPOCH with frameNo 0 and empty content (ingestRow.ts:66), which folds as one
- * ignored/stale-epoch event and changes neither the ring nor the window (foldRuntime.ts:151, nsRuntime.ts /
+ * ignored/stale-epoch event and changes neither the ring nor the window (foldRuntime.ts:191, nsRuntime.ts /
  * cfgRuntime.ts foldStale). A stale body/canvas row is only accounted: no quarantine, no freeze
  * (ingestRow.ts:65).
  *
@@ -118,7 +118,7 @@ function timeline(seed: number): { readonly rows: Row[]; readonly sRot: Seq } {
 	const bodyDocs = [id22(`b${tag}x`) as DocId, id22(`b${tag}y`) as DocId];
 	const nextFrameNo = (dev: DeviceId, stream: StreamName) => {
 		const k = `${dev}|${stream}`;
-		const f = (frameNo.get(k) ?? NS_DEDUPE_RING) + 1; // fresh runtimes start at 65 (foldRuntime.ts:239-247)
+		const f = (frameNo.get(k) ?? NS_DEDUPE_RING) + 1; // fresh runtimes start at 65 (foldRuntime.ts:279-287)
 		frameNo.set(k, f);
 		return f;
 	};

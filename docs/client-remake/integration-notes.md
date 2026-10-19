@@ -403,7 +403,7 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - Live creates (§7.2, DESIGN §d.4) send their body frames right behind the
   ns create. When such a create folds `merged` (two devices create the same
   path with the same content within one round trip, outside onboarding), its
-  unsent and unreceipted frames are deleted (`engine/sync/nsRuntime.ts:141-144`),
+  unsent and unreceipted frames are deleted (`engine/sync/nsRuntime.ts:149-152`),
   but the frames the relay already committed stay as junk rows on the loser's
   stream; nobody materializes them, but they cost rows until the stream is
   retired. A create ignored as `invalid-path` / `kind-mismatch` sends its
@@ -419,12 +419,12 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   wait until the create folds (two commits to a peer instead of one).
 - `duplicate-docid` creates are not re-planned (DESIGN said so; nothing did):
   the fold ignores the create (`core/ns/fold.ts:120`), its frames are released
-  to the existing doc (`nsRuntime.ts:145-146`), and devices converge on one doc
+  to the existing doc (`nsRuntime.ts:153-154`), and devices converge on one doc
   with both texts. It needs a 128-bit docId collision.
 - Settings writes have a read→write gap with no precondition.
   `CfgSync.applyWrite` reads the file, compares its fingerprint (a HashPort
   digest) and, for a file stored as a blob, downloads it, then writes
-  (`engine/settings/cfgSync.ts:208-226`). `ConfigDirPort.writeBytes` takes no
+  (`engine/settings/cfgSync.ts:214-232`). `ConfigDirPort.writeBytes` takes no
   precondition (`ports/vault.ts:89`), the engine's adapter sends `any`
   (`engine/compose/hostLink.ts:165-167`), and the host writes without
   re-checking (`host/diskExecutor.ts:220-224`). A settings file that Obsidian
@@ -572,7 +572,7 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   `a (conflict A <time>).md` = "start one two three". Nothing is lost.
 - Tablets in the background (DESIGN §i.4). A tablet's `hidden` only flushes
   and keeps the socket and background work (DESIGN §i.1), like a desktop's
-  (`engine/compose/vaultRuntime.ts:574-575`); phone and constrained devices
+  (`engine/compose/vaultRuntime.ts:576-577`); phone and constrained devices
   pause background work and close the socket after `HIDDEN_CLOSE_MS` (30 s, `:97`).
   The reason recorded with 4a14c02 is gone: the engine could not tell an iPad
   from a desktop running the engine inline, which `deviceClassFor` ran as
