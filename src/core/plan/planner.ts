@@ -605,7 +605,7 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		const identical = wh !== null && wh === l.hash;
 		// §c.12: devices re-creating the vault after an epoch reset race on every path. A differing loser at a
 		// path with an old-epoch base merges into the winner (3-way against that base) instead of a loser rename.
-		const migrated = !identical && s.kind === "markdown" && ctx.pathBaseKeys.has(s.pathKey);
+		const migrated = !identical && s.kind !== "blob" && ctx.pathBaseKeys.has(s.pathKey);
 		if (!identical && !migrated) return false;
 		handled.add(winner);
 		if (migrated && (!w.body?.caughtUp || (!w.body.hasContent && w.createHash !== EMPTY_CONTENT_HASH))) {
@@ -616,7 +616,7 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 			...prefix, { op: "rebind", fromDocId: s.docId, toDocId: winner, path: w.path, ...(migrated ? { adopt: true as const } : {}) },
 			{ op: "nsDelete", docId: s.docId, baseBodySeq: baseBodySeq(r) },
 		];
-		if (migrated) ops.push({ op: "reconcileContent", docId: winner, path: l.path, kind: "markdown", hasBase: false, pathBase: true });
+		if (migrated) ops.push({ op: "reconcileContent", docId: winner, path: l.path, kind: s.kind, hasBase: false, pathBase: true });
 		push(ops);
 		return true;
 	};

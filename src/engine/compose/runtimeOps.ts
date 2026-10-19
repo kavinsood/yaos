@@ -205,7 +205,7 @@ export async function prepareEpochMigration(rt: VaultRuntime): Promise<Map<PathK
 	const rows = await rt.db.tx([STORE.baseText], "readonly", (tx) => tx.getAll(STORE.baseText)).catch(() => []);
 	const byDoc = new Map(rows.map((r) => [r.docId, r]));
 	for (const s of rt.rec.ctx.store.synced.values()) {
-		if (s.kind !== "markdown" || !s.hasBase) continue;
+		if (s.kind === "blob" || !s.hasBase) continue; // markdown text or canvas merge text
 		const r = byDoc.get(s.docId);
 		const text = r ? await readBase(r, rt.o.ports.hash) : null;
 		if (text !== null) bases.set(pathKey(s.path), text);

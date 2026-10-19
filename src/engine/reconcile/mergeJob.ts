@@ -34,7 +34,7 @@ import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
 import { isShrinkingOverwrite } from "../../core/plan/brake";
 import type { IntentRecord } from "../store/schema";
 import { mergeCanvas } from "./canvasJob";
-import { MAX_CAS_ATTEMPTS, overwriteAllowed, writeConflictCopy, type ReconcileOp } from "./contentSteps";
+import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writeConflictCopy, type ReconcileOp } from "./contentSteps";
 import type { BodyHandle } from "./deps";
 import { writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
@@ -80,10 +80,9 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	const D = canonicalizeMarkdown(decoded);
 	const F = await exactFingerprint(port, rd.bytes);
 	const s = ctx.synced(docId);
-	// §c.12: after an epoch migration a doc with no synced record (or a differing re-create loser merged into its
-	// winner, op.pathBase) merges against the old epoch's base at its path, but only while the new epoch's text
-	// still contains that base (trustedEpochBase): a base ahead of the new epoch would read as deletions.
-	const epochBase = op.pathBase || !s ? ctx.deps.pathBase?.(ctx.pk(op.path)) ?? null : null;
+	// §c.12: the old epoch's base at the path, only while the new epoch's text still contains it (trustedEpochBase):
+	// a base ahead of the new epoch would read as deletions.
+	const epochBase = epochBaseOf(env, op, s);
 	const storedBase = !op.pathBase && !op.noBase && op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
 	// The synced-side fallback below needs a record describing this doc's last sync (not a rebound loser's, nor
 	// another file's: op.noBase).
@@ -189,23 +188,6 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		local,
 	);
 	return awaitingSave ? "deferred" : "ok";
-}
-
-/**
- * §c.12 path base, trusted only when the new epoch's text still holds all of it
- * (base is a subsequence of crdt). The old base can be ahead of the new epoch:
- * it includes own edits the old relay never received (offline imports, pending
- * creates) and acked edits the migrating peer never saw before the reset. A
- * 3-way merge against such a base reads the peer's staleness as deletions and
- * drops local text. With base ⊑ crdt the crdt side only inserted, so no disk
- * text can be lost; otherwise null: the no-base merge keeps the disk side as a
- * conflict copy.
- */
-export function trustedEpochBase(base: string | null, crdt: string): string | null {
-	if (base === null || base.length > crdt.length) return null;
-	let i = 0;
-	for (let j = 0; i < base.length && j < crdt.length; j++) if (base.charCodeAt(i) === crdt.charCodeAt(j)) i++;
-	return i === base.length ? base : null;
 }
 
 /** `hash` = markdownContentHash(D). */

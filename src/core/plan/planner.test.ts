@@ -713,6 +713,20 @@ test("§c.12 migrated-loser merge: a differing loser at a path with an old-epoch
 	assert.deepEqual(planWith(input(empty), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) }).ops, [{ op: "wait", docId: "d4", reason: "body-empty" }]);
 });
 
+test("§c.12 migrated-loser merge applies to canvases too", () => {
+	const sc = {
+		remote: [R("d3", "b/x.canvas", { kind: "canvas" }), R("d4", "b/x (2).canvas", { kind: "canvas" })],
+		synced: [S("d4", "b/x.canvas", { kind: "canvas", contentHash: h("L"), nsTouchSeq: 0 })],
+		local: [L("b/x.canvas", h("L"), { kind: "canvas" })],
+	};
+	const ctx = { remoteTextHash: new Map([[id("d3"), h("W")]]) };
+	assert.deepEqual(planWith(input(sc), { ...ctx, pathBaseKeys: new Set([pk("b/x.canvas")]) }).ops, [
+		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "b/x.canvas", adopt: true },
+		{ op: "nsDelete", docId: "d4", baseBodySeq: 10 },
+		{ op: "reconcileContent", docId: "d3", path: "b/x.canvas", kind: "canvas", hasBase: false, pathBase: true },
+	]);
+});
+
 test("remote-move target already on disk (crash after rename): adopt the path, no disk op", () => {
 	const p = run({ remote: [R("d1", "b.md", { lastTouchSeq: 8 })], synced: [S("d1", "a.md")], local: [L("b.md", h("c0"))] });
 	assert.deepEqual(opsOf(p), ["syncedPut"]);
