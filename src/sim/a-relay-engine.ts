@@ -193,6 +193,10 @@ export class RelayEngine {
 			if (session.gate?.refused === true) this.counters.rawDrops++;
 			return;
 		}
+		if (msg.k === "ping") {
+			session.send({ k: "pong", head: this.store.head(), probeId: msg.probeId });
+			return;
+		}
 		if (!this.charge(session, msg.bytes)) return;
 		if (msg.k === "subscribe") this.subscribe(session, msg.streams);
 		else this.append(session, msg.frame);

@@ -405,7 +405,7 @@ export class SimRelay implements RelayPort {
 
 	/** VAULT_PONG with the head (a "head" event). */
 	ping(target: SimTarget): void {
-		for (const session of this.targets(target)) session.send({ k: "pong", head: this.store.head() });
+		for (const session of this.targets(target)) session.send({ k: "pong", head: this.store.head(), probeId: null });
 	}
 
 	/** While on, feed/read/putCheckpoint reject with SimRelayError("network_error"). */

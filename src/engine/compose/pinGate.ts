@@ -82,6 +82,7 @@ function readOnly(s: RelaySession, kOnly: boolean): RelaySession {
 			return Promise.reject(new WriteRefused("checkpoint"));
 		},
 		onEvent: (listener) => s.onEvent(listener),
+		ping: () => s.ping(),
 		close: (code, reason) => s.close(code, reason),
 	};
 }

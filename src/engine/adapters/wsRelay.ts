@@ -92,17 +92,6 @@ export interface WsRelayOptions {
 	readonly liveness?: { readonly idleMs?: number; readonly timeoutMs?: number };
 }
 
-export const DEFAULT_RELAY_LIMITS: RelayLimits = {
-	maxFrameBytes: 1024 * 1024,
-	maxCheckpointBytes: 4 * 1024 * 1024,
-	appendBytesPerSec: 256 * 1024,
-	burstBytes: 2 * 1024 * 1024,
-	feedPageRows: 1000,
-	readPageBytes: 1024 * 1024,
-	readBatchStreams: 1,
-	maxSubscriptions: 128,
-};
-
 export const DEFAULT_LIVENESS = { idleMs: 60_000, timeoutMs: 15_000 } as const;
 export const DEFAULT_READY_TIMEOUT_MS = 15_000;
 export const DEFAULT_PROVISIONAL_CACHE_BYTES = 16 * 1024 * 1024;
@@ -116,14 +105,14 @@ const WS_OPEN = 1;
 /** VAULT_READY limits -> RelayLimits. */
 export function mapLimits(wire: WireLimits): RelayLimits {
 	return {
-		maxFrameBytes: wire.maxPayloadBytes ?? DEFAULT_RELAY_LIMITS.maxFrameBytes,
-		maxCheckpointBytes: wire.maxCheckpointBytes ?? DEFAULT_RELAY_LIMITS.maxCheckpointBytes,
-		appendBytesPerSec: wire.rateBytesPerSec ?? DEFAULT_RELAY_LIMITS.appendBytesPerSec,
-		burstBytes: wire.burstBytes ?? DEFAULT_RELAY_LIMITS.burstBytes,
-		feedPageRows: wire.feedDefaultLimit ?? DEFAULT_RELAY_LIMITS.feedPageRows,
-		readPageBytes: wire.readDefaultBytes ?? DEFAULT_RELAY_LIMITS.readPageBytes,
-		readBatchStreams: Math.max(1, Math.floor(wire.readBatchMaxStreams ?? DEFAULT_RELAY_LIMITS.readBatchStreams)),
-		maxSubscriptions: Math.floor(wire.maxSubscriptions ?? DEFAULT_RELAY_LIMITS.maxSubscriptions),
+		maxFrameBytes: wire.maxPayloadBytes,
+		maxCheckpointBytes: wire.maxCheckpointBytes,
+		appendBytesPerSec: wire.rateBytesPerSec,
+		burstBytes: wire.burstBytes,
+		feedPageRows: wire.feedDefaultLimit,
+		readPageBytes: wire.readDefaultBytes,
+		readBatchStreams: Math.max(1, Math.floor(wire.readBatchMaxStreams)),
+		maxSubscriptions: Math.max(1, Math.floor(wire.maxSubscriptions)),
 	};
 }
 
@@ -224,6 +213,8 @@ interface SessionInit {
 	readonly clock: ClockPort;
 	readonly nextProbeId: () => string;
 	readonly ready: Extract<WireControl, { type: "VAULT_READY" }>;
+	/** ready.limits, already checked present. */
+	readonly limits: WireLimits;
 	readonly join: ProvisionalJoin;
 	readonly onListenerError: (error: unknown) => void;
 	readonly liveness: { readonly idleMs?: number; readonly timeoutMs?: number } | undefined;
@@ -278,7 +269,7 @@ class WsRelaySession implements RelaySession {
 		this.vaultEpoch = init.ready.vaultEpoch;
 		this.headSeq = init.ready.head;
 		this.canWrite = init.ready.canWrite;
-		this.limits = mapLimits(init.ready.limits);
+		this.limits = mapLimits(init.limits);
 		this.idleMs = init.liveness?.idleMs ?? init.ready.liveness?.idleMs ?? DEFAULT_LIVENESS.idleMs;
 		this.timeoutMs = init.liveness?.timeoutMs ?? init.ready.liveness?.timeoutMs ?? DEFAULT_LIVENESS.timeoutMs;
 		this.lastRx = this.clock.monotonic();
@@ -331,7 +322,7 @@ class WsRelaySession implements RelaySession {
 	async readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]> {
 		const first = reqs[0];
 		if (first === undefined) throw new RangeError("readBatch: no requests");
-		if (this.limits.readBatchStreams <= 1 || reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
+		if (reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
 		return this.http.readBatch(this.vaultId, reqs.slice(0, this.limits.readBatchStreams), this.limits.readPageBytes, this.gone.signal);
 	}
 
@@ -654,6 +645,11 @@ export function createWsRelayPort(opts: WsRelayOptions): RelayPort {
 					return;
 				}
 				if (control.type !== "VAULT_READY") return;
+				// A relay that omits or zeroes a required limit speaks a protocol this client does not: fail closed.
+				if (control.limits === null) {
+					fail("update-required");
+					return;
+				}
 				const session = new WsRelaySession({
 					ws,
 					http,
@@ -662,6 +658,7 @@ export function createWsRelayPort(opts: WsRelayOptions): RelayPort {
 					clock,
 					nextProbeId,
 					ready: control,
+					limits: control.limits,
 					join: new ProvisionalJoin(cacheBytes, cacheEntries),
 					onListenerError,
 					liveness: opts.liveness,

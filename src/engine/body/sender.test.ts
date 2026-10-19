@@ -56,6 +56,7 @@ class FakeSession implements RelaySession {
 	feed(): never { throw new Error("unused"); }
 	read(): never { throw new Error("unused"); }
 	readBatch(): never { throw new Error("unused"); }
+	ping(): never { throw new Error("unused"); }
 	putCheckpoint(): never { throw new Error("unused"); }
 	onEvent(): () => void { return () => {}; }
 	close(): void {}

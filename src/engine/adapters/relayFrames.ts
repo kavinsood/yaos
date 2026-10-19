@@ -1,5 +1,5 @@
 /**
- * Streams wire v1 codec (docs/client-remake/relay-wire.md §4, §16).
+ * Streams wire v1 codec (docs/client-remake/relay-wire.md §4, §15).
  *
  * Binary frames use the lib0 primitives (u8 kind, varuint, varstring,
  * varbytes). Control messages are text frames: "__YPS:" + one JSON object.
@@ -180,16 +180,16 @@ export function decodeServerFrame(bytes: Uint8Array): WireServerFrame | null {
 
 // ---- control ---------------------------------------------------------------
 
-/** Subset of VAULT_READY.limits the client uses; absent or invalid fields are null. */
+/** Subset of VAULT_READY.limits the client uses. Every field is required and positive. */
 export interface WireLimits {
-	readonly maxPayloadBytes: number | null;
-	readonly maxCheckpointBytes: number | null;
-	readonly rateBytesPerSec: number | null;
-	readonly burstBytes: number | null;
-	readonly feedDefaultLimit: number | null;
-	readonly readDefaultBytes: number | null;
-	readonly readBatchMaxStreams: number | null;
-	readonly maxSubscriptions: number | null;
+	readonly maxPayloadBytes: number;
+	readonly maxCheckpointBytes: number;
+	readonly rateBytesPerSec: number;
+	readonly burstBytes: number;
+	readonly feedDefaultLimit: number;
+	readonly readDefaultBytes: number;
+	readonly readBatchMaxStreams: number;
+	readonly maxSubscriptions: number;
 }
 
 export interface WireReceipt {
@@ -208,7 +208,8 @@ export type WireControl =
 		readonly deviceId: string | null;
 		readonly runtimeEpoch: string | null;
 		readonly liveness: { readonly idleMs: number; readonly timeoutMs: number } | null;
-		readonly limits: WireLimits;
+		/** null when any required limit is absent or not positive: the connect fails closed. */
+		readonly limits: WireLimits | null;
 	}
 	| { readonly type: "STREAM_RECEIPTS"; readonly head: number; readonly receipts: readonly WireReceipt[] }
 	| { readonly type: "STREAM_APPEND_REJECTED"; readonly stream: string; readonly clientFrameId: string; readonly code: string; readonly seq: number | null }
@@ -260,18 +261,21 @@ function positive(o: Json, key: string): number | null {
 	return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
 }
 
-function parseLimits(value: unknown): WireLimits {
-	const o: Json = isRecord(value) ? value : {};
-	return {
-		maxPayloadBytes: positive(o, "maxPayloadBytes"),
-		maxCheckpointBytes: positive(o, "maxCheckpointBytes"),
-		rateBytesPerSec: positive(o, "rateBytesPerSec"),
-		burstBytes: positive(o, "burstBytes"),
-		feedDefaultLimit: positive(o, "feedDefaultLimit"),
-		readDefaultBytes: positive(o, "readDefaultBytes"),
-		readBatchMaxStreams: positive(o, "readBatchMaxStreams"),
-		maxSubscriptions: positive(o, "maxSubscriptions"),
-	};
+const LIMIT_KEYS = [
+	"maxPayloadBytes", "maxCheckpointBytes", "rateBytesPerSec", "burstBytes",
+	"feedDefaultLimit", "readDefaultBytes", "readBatchMaxStreams", "maxSubscriptions",
+] as const satisfies readonly (keyof WireLimits)[];
+
+/** null when any required limit is absent or not positive. */
+function parseLimits(value: unknown): WireLimits | null {
+	if (!isRecord(value)) return null;
+	const out: Partial<Record<keyof WireLimits, number>> = {};
+	for (const key of LIMIT_KEYS) {
+		const v = positive(value, key);
+		if (v === null) return null;
+		out[key] = v;
+	}
+	return out as WireLimits;
 }
 
 function parseReceipts(value: unknown): WireReceipt[] | null {

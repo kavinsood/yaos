@@ -64,7 +64,7 @@ export interface RelayLimits {
 	readonly feedPageRows: number;
 	/** Payload bytes per read() page, and per readBatch() request. */
 	readonly readPageBytes: number;
-	/** Streams per readBatch() request (VAULT_READY readBatchMaxStreams); 1 = the relay has no batch form. */
+	/** Streams per readBatch() request (VAULT_READY readBatchMaxStreams, required). */
 	readonly readBatchStreams: number;
 	/** Streams per subscribe() set (VAULT_READY limits.maxSubscriptions). */
 	readonly maxSubscriptions: number;
@@ -198,8 +198,8 @@ export interface RelaySession {
 	read(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean): Promise<ReadPage>;
 	/**
 	 * The first page of each request, for a non-empty prefix of `reqs` in order: one relay request under one
-	 * readPageBytes budget (relay-wire §7.1). Requests without a page are re-requested later. With
-	 * readBatchStreams 1 this is read(reqs[0]).
+	 * readPageBytes budget (relay-wire §7.1). Requests without a page are re-requested later. At most
+	 * readBatchStreams requests are sent; a single request is read(reqs[0]).
 	 */
 	readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]>;
 	putCheckpoint(stream: StreamName, coversSeq: Seq, expectedPrevCoversSeq: Seq, bytes: Uint8Array): Promise<PutCheckpointResult>;
@@ -208,10 +208,9 @@ export interface RelaySession {
 	/**
 	 * One round trip on this socket with the liveness frames (VAULT_PING / VAULT_PONG, relay-wire §4.2-4.3): resolves with the
 	 * pong's head once the pong for this probe arrives, rejects when the session closes first. No deadline of its own.
-	 * Only the device check calls it (engine/compose/deviceCheck.ts); the wsRelay adapter has it, the sim and test fakes
-	 * need not.
+	 * Only the device check calls it (engine/compose/deviceCheck.ts).
 	 */
-	ping?(): Promise<{ readonly headSeq: Seq }>;
+	ping(): Promise<{ readonly headSeq: Seq }>;
 	close(code: number, reason: string): void;
 }
 

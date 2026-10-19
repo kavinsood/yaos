@@ -53,6 +53,9 @@ export class SimRelaySession implements RelaySession {
 	private subscription: readonly string[] | null = null;
 	private everListened = false;
 	private inFlightBytes = 0;
+	/** ping() calls waiting for their pong, by probe id. */
+	private readonly probes = new Map<string, { resolve(headSeq: Seq): void; reject(error: Error): void }>();
+	private probeCounter = 0;
 	private readonly up: TimedQueue<UpMsg>;
 	private readonly down: TimedQueue<DownMsg>;
 	/** Every RelayEvent produced, in order (introspection; includes buffered ones). */
@@ -133,7 +136,7 @@ export class SimRelaySession implements RelaySession {
 	async readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]> {
 		const first = reqs[0];
 		if (first === undefined) throw new RangeError("readBatch: no requests");
-		if (this.limits.readBatchStreams <= 1 || reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
+		if (reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
 		return this.host.readBatch(this, reqs.slice(0, this.limits.readBatchStreams));
 	}
 
@@ -158,10 +161,27 @@ export class SimRelaySession implements RelaySession {
 		};
 	}
 
+	/** VAULT_PING on the uplink; resolves with the matching pong's head, rejects when the session closes first. */
+	ping(): Promise<{ readonly headSeq: Seq }> {
+		if (this.ended) return Promise.reject(new Error("relay session closed before the pong"));
+		const probeId = `p${++this.probeCounter}`;
+		return new Promise((resolve, reject) => {
+			this.probes.set(probeId, { resolve: (headSeq) => resolve({ headSeq }), reject });
+			this.up.push(this.delay(this.link.uplinkMs), { k: "ping", probeId });
+		});
+	}
+
+	private failProbes(): void {
+		const probes = [...this.probes.values()];
+		this.probes.clear();
+		for (const p of probes) p.reject(new Error("relay session closed before the pong"));
+	}
+
 	/** Emits "closed" synchronously; frames already on the uplink still reach the relay (then the close). */
 	close(code: number, _reason: string): void {
 		if (this.ended) return;
 		this.ended = true;
+		this.failProbes();
 		this.held.clear();
 		this.down.clear();
 		if (this.everListened) this.queue = [];
@@ -263,14 +283,21 @@ export class SimRelaySession implements RelaySession {
 			case "backpressure":
 				this.emit({ t: "backpressure" });
 				return;
-			case "pong":
+			case "pong": {
+				const probe = msg.probeId === null ? undefined : this.probes.get(msg.probeId);
+				if (probe && msg.probeId !== null) {
+					this.probes.delete(msg.probeId);
+					probe.resolve(msg.head);
+				}
 				this.emit({ t: "head", headSeq: msg.head });
 				return;
+			}
 			case "error":
 				this.errorCode = msg.code;
 				return;
 			case "close":
 				this.ended = true;
+				this.failProbes();
 				this.held.clear();
 				this.up.clear();
 				this.inFlightBytes = 0;
@@ -279,6 +306,7 @@ export class SimRelaySession implements RelaySession {
 			case "event":
 				if (msg.event.t === "closed") {
 					this.ended = true;
+				this.failProbes();
 					this.held.clear();
 					this.up.clear();
 					this.inFlightBytes = 0;

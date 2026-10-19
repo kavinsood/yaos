@@ -121,7 +121,8 @@ export type DownMsg =
 	| { readonly k: "skipped"; readonly rows: readonly { readonly stream: StreamName; readonly seq: Seq }[] }
 	| { readonly k: "subscribeRejected"; readonly code: "invalid" | "too_many" }
 	| { readonly k: "backpressure" }
-	| { readonly k: "pong"; readonly head: Seq }
+	/** probeId: the VAULT_PING answered, null for an unsolicited pong. */
+	| { readonly k: "pong"; readonly head: Seq; readonly probeId: string | null }
 	| { readonly k: "error"; readonly code: string }
 	| { readonly k: "close"; readonly code: number; readonly wasClean: boolean }
 	/** inject(): an arbitrary port event, delivered in order. */
@@ -132,6 +133,8 @@ export type UpMsg =
 	| { readonly k: "append"; readonly frame: AppendFrame; readonly bytes: number }
 	/** STREAM_SUBSCRIBE (text frame of `bytes` bytes). */
 	| { readonly k: "subscribe"; readonly streams: readonly string[]; readonly bytes: number }
+	/** VAULT_PING with a probe id (text frame, not rate-charged). */
+	| { readonly k: "ping"; readonly probeId: string }
 	| { readonly k: "close"; readonly code: number };
 
 export function frameKey(deviceId: string, clientFrameId: string): string {

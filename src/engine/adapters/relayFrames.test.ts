@@ -110,7 +110,7 @@ describe("relayFrames control", () => {
 		assert.equal(parseControl(`${CONTROL_PREFIX}{"type":"VAULT_FUTURE"}`), null);
 	});
 
-	it("parses VAULT_READY with limits and liveness; tolerates missing optional parts", () => {
+	it("parses VAULT_READY with limits and liveness; tolerates missing optional parts; limits are all-or-null", () => {
 		const full = parseControl(CONTROL_PREFIX + JSON.stringify({
 			type: "VAULT_READY", vaultEpoch: "E1", head: 42, canWrite: true, deviceId: "dev", runtimeEpoch: "R",
 			liveness: { version: 1, idleMs: 60000, timeoutMs: 15000 },
@@ -126,8 +126,9 @@ describe("relayFrames control", () => {
 		assert.ok(bare && bare.type === "VAULT_READY");
 		assert.equal(bare.canWrite, false);
 		assert.equal(bare.liveness, null);
-		assert.equal(bare.limits.maxPayloadBytes, null);
-		assert.equal(bare.limits.maxSubscriptions, null);
+		assert.equal(bare.limits, null, "a non-positive or missing limit voids the set");
+		const noLimits = parseControl(CONTROL_PREFIX + JSON.stringify({ type: "VAULT_READY", vaultEpoch: "E", head: 0 }));
+		assert.ok(noLimits && noLimits.type === "VAULT_READY" && noLimits.limits === null);
 		assert.equal(parseControl(CONTROL_PREFIX + JSON.stringify({ type: "VAULT_READY", head: 1 })), null, "vaultEpoch required");
 	});
 

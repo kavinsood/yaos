@@ -105,7 +105,6 @@ const PUSHED = ["b:wpc-smoke-doc", "b:wpc-conflict-doc"];
 /** Subscribes `peer` to PUSHED and waits for a pong: the relay handles a socket's messages in order. */
 async function subscribe(peer: Peer): Promise<void> {
 	peer.session.subscribe(PUSHED.map(asStream));
-	if (!peer.session.ping) throw new Error(`${peer.name}: the adapter cannot ping`);
 	await peer.session.ping();
 }
 

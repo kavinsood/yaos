@@ -7,7 +7,7 @@
  * read with bounded concurrency. A device that may read only `k` (§12.4: no
  * pin, or a vault its pin cannot read) stops after the `k` read in key-missing.
  *
- * Catch-up reads are batched when the relay has the batch form (limits.readBatchStreams > 1): one request reads
+ * Catch-up reads are batched (width min(limits.readBatchStreams, tuning.readBatchStreams)): one request reads
  * the first page of up to readBatchStreams stale streams under one readPageBytes budget, and each served stream
  * then runs readStream (which pages on alone if it has more). On the deployed relay a request costs ~9 edge RTTs
  * whatever it carries, so a fresh device reads its N notes in about N / readBatchStreams requests instead of N.

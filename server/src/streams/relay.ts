@@ -130,7 +130,7 @@ export function readStreamRelayConfig(env: StreamsEnv | null | undefined): Strea
 
 // ---- actor and socket attachment ----------------------------------------------
 
-/** VAULT_READY `role` (relay-wire §16): the type keeps "member"; only "owner" is sent (DECISIONS D6). */
+/** VAULT_READY `role` (relay-wire §15): the type keeps "member"; only "owner" is sent (DECISIONS D6). */
 export type VaultRole = "owner" | "member";
 
 /** The identity a streams socket is admitted with (the D6 constants plus the device). */
