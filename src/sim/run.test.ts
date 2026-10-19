@@ -64,6 +64,15 @@ test("sim: a delete made while key-missing goes out once the device is re-keyed 
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Suite-1 seed 355 (3 devices): B revoked and re-keyed; C, backgrounded, then crashed with its keychain lost, so the
+// engine stopped and the revokeRekey command rejected although its record had gone out and won. The keeper noted the
+// new RK only on success, so nobody could re-key C from it and C stayed key-missing. The user wrote the RK down when
+// the dialog showed it: the keeper keeps it whatever the command answers.
+test("sim: an RK whose revoke command was cut off by a crash still re-keys a device (suite-1 seed 355)", async () => {
+	const r = await runSim({ seed: 355, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */
