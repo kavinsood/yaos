@@ -117,6 +117,14 @@ test("sim: S follows a pending own rename by its requested path (hot canvas, sui
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Hot canvas seed 570 with suite 1 (sim only): after an IDB wipe without mirrors A set a colour twice on disk; the
+// no-base merge put the file into a conflict copy, which the user deleted. The oracle discarded only the copy's
+// value, so A's first colour, replaced by its own second one, counted as a lost write.
+test("sim: deleting a conflict copy discards the values its own writes replaced (hot canvas, suite-1 seed 570)", async () => {
+	const r = await runSim({ seed: 570, devices: 2, faults: CANVAS_FAULTS, faultRate: 0.2, steps: 80, canvas: { rate: 3, ops: CANVAS_HOT_OPS, pool: 2, hot: true }, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */

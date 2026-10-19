@@ -382,7 +382,8 @@ export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[]
  *                Y.Text char merge of concurrent edits keeps both)
  *   writes       no lost update on a tracked field (canvas.ts oracle): a write that replaced value V (its
  *                saw-chain passes through V) is never undone back to V in every canvas holding the record. Values
- *                the user threw away with a conflict copy, fields of deleted records, and fields of an edge left
+ *                the user threw away with a conflict copy (with the copy writer's own earlier values in that file
+ *                it replaced, unless another canvas holds them), fields of deleted records, and fields of an edge left
  *                dangling by a user's node delete (only conflict copies show it; the CRDT keeps it), are exempt. Unknown
  *                fields at the top level, on nodes and on edges are tracked fields
  *   order        an uncontested reorder holds: "bring to front / send to back" of node n on device X still puts n

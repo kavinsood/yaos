@@ -716,19 +716,40 @@ export class CanvasWorld {
 		if (isConflictCopy(path)) {
 			// Throwing a conflict copy away discards its values; records only in it go with it.
 			const others = new Set<string>();
+			const held = new Set<string>();
 			for (const p of canvasFiles(d)) {
 				if (p === path) continue;
 				const m = readModel(d.vault.textOf(p) ?? "");
-				for (const n of m?.nodes ?? []) others.add(`n:${n.id as string}`);
-				for (const e of m?.edges ?? []) others.add(`e:${e.id as string}`);
+				for (const [kind, list] of [["n", m?.nodes ?? []], ["e", m?.edges ?? []]] as const) {
+					for (const o of list) {
+						const rec = `${kind}:${o.id as string}`;
+						others.add(rec);
+						for (const [f, v] of this.fieldsOf(o)) held.add(`${rec}|${f}|${v}`);
+					}
+				}
 			}
+			// With a copy's value go the values its writer's own earlier writes of the field had in the same file,
+			// which that value replaced there, unless another canvas still holds them (hot canvas seed 570: a no-base
+			// merge put A's two successive colours into a conflict copy, the user deleted it, the first colour was
+			// counted as lost).
+			const discard = (rec: string, f: string, v: string): void => {
+				this.oracle.discarded.add(`${rec}|${f}|${v}`);
+				const w = this.oracle.writes.get(`${rec}|${f}|${v}`);
+				for (let cur = w; cur && cur.saw !== null && cur.saw !== ABSENT; ) {
+					const prev = this.oracle.writes.get(`${rec}|${f}|${cur.saw}`);
+					const k = `${rec}|${f}|${cur.saw}`;
+					if (!prev || prev.dev !== w!.dev || prev.path !== w!.path || held.has(k) || this.oracle.discarded.has(k)) break;
+					this.oracle.discarded.add(k);
+					cur = prev;
+				}
+			};
 			for (const text of seen) {
 				const m = readModel(text);
 				if (!m) continue;
 				for (const [kind, list] of [["n", m.nodes], ["e", m.edges]] as const) {
 					for (const o of list) {
 						const rec = `${kind}:${o.id as string}`;
-						for (const [f, v] of this.fieldsOf(o)) this.oracle.discarded.add(`${rec}|${f}|${v}`);
+						for (const [f, v] of this.fieldsOf(o)) discard(rec, f, v);
 						if (!others.has(rec)) this.oracle.deleted(rec, { dev: d.name, step, atMs, how: "file", saw: this.fieldsOf(o), doc: docIdOf(d, path) });
 					}
 				}
