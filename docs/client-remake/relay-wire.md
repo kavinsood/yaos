@@ -310,6 +310,7 @@ For a socket admitted with `VAULT_READY.head = H`:
   - in the pending buffer (vault-wide by `(deviceId, clientFrameId)`, comparing stream and bytes);
   - against the stream's open segment;
   - against the newest sealed segment while the open segment has fewer than 64 rows.
+  - against the rows a retiring checkpoint dropped from the open segment (§8), in its place: deduped, uncompared.
   - Outside that window a resend is appended again with a new seq. Payloads must therefore be idempotent to
     apply, which CRDT updates are. In practice the window covers minutes of activity per stream.
 - **Conflicts.** The same `(deviceId, clientFrameId)` with different bytes, or with a different stream while the
@@ -414,8 +415,12 @@ cannot check this.
 
 - **What is deleted.** Every sealed segment of the stream whose last seq is ≤ N.
 - **`gcSeq`.** Rises to the highest collected seq. Rows ≤ `gcSeq` are only reachable through the checkpoint.
-- **What survives.** The open segment (the newest rows, under 64 KiB) is never collected, so readers just behind
-  the checkpoint can still replay rows.
+- **What survives.** The open segment (the newest rows, under 64 KiB) is kept, so readers just behind the
+  checkpoint can still replay rows. Exception: a checkpoint at the stream's `lastSeq` retires the stream (server
+  H7, `server/src/streams/store.ts` `putCheckpoint`): the open segment is dropped too and `gcSeq = lastSeq`, so
+  every row of the stream is then reachable only through the checkpoint. Those rows stay in the dedupe scope the
+  open segment was (§5.4; the server's H2 index keeps their keys): a resend of one is deduped with its original
+  seq, without a bytes comparison.
 - **Live sockets.** They are unaffected.
 
 ---
@@ -633,7 +638,8 @@ Billed writes:
 - **Backups.** Legacy recovery projections (R2) and snapshots do not cover streams. A vault's stream rows live only
   in its DO.
 - **Socket version.** The version param is `streamsVersion=1`, not `schemaVersion` / `protocolVersion`.
-- **GC.** A checkpoint never collects the open segment. GC removes whole sealed segments, never single rows.
+- **GC.** A checkpoint below `lastSeq` never collects the open segment; one at `lastSeq` drops it (H7, §8). GC
+  removes whole segments, never single rows.
 - **Notices for deduped resends.** These may carry older seqs (§5.3).
 - **Deployment name.** The account is at Cloudflare's 500 Durable Object namespace cap (error 10067; each YAOS
   Worker uses 3), so the e2e target is the idle `yaos-relay2-scratch-3` redeployed with this code rather than a new

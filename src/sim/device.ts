@@ -162,7 +162,9 @@ export class SimDevice {
 	};
 
 	constructor(readonly opts: SimDeviceOptions) {
-		this.deviceId = `dev-${opts.name}` as DeviceId;
+		// A real device id is 16..128 of [A-Za-z0-9_-] (relay-wire §2 enroll; the snap index ignores records of any
+		// other, core/snap/record.ts), so "dev-A" alone would make every snapshot upload a silent no-op.
+		this.deviceId = `dev-${opts.name}-0000000000000` as DeviceId;
 		this.secrets = new FakeSecretStorage(this.secretBacking);
 		this.pinData = opts.pin === null ? {} : { e2ee: opts.pin ?? suite0PinForTest() };
 		this.storage = new MemStoragePort({ beforeNextTimer: opts.clock.beforeNextTimer, macrotask: opts.clock.macrotask });
@@ -207,7 +209,7 @@ export class SimDevice {
 			},
 			makePorts: async (config): Promise<EnginePorts> => {
 				if (storageFails) throw new Error("IndexedDB unavailable in worker");
-				const random = new SeededRandom(hashLabel(`${this.deviceId}#${n}`));
+				const random = new SeededRandom(hashLabel(`dev-${this.opts.name}#${n}`));
 				const c = config.crypto;
 				// As webEngine.ts: suite 0 seals nothing; unpinned and suite 1 get the suite-1 adapter (keys zero-filled on
 				// import), on Node WebCrypto behind DelayedCrypto: crypto and hash settle on a task, in seed order.

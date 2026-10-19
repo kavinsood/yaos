@@ -71,6 +71,8 @@ export class SnapshotJob {
 	private chain: Promise<unknown> = Promise.resolve();
 	private opId = 1;
 	private busy: string | null = null;
+	/** Operations in the serial chain, queued or running. */
+	private queued = 0;
 	private locals: LocalSnapshot[] | null = null;
 	private uploadAfterMs = 0;
 	/** The remote snapshot whose verified parts are in the download cache (one at most). */
@@ -88,9 +90,18 @@ export class SnapshotJob {
 	}
 
 	private serial<T>(fn: () => Promise<T>): Promise<T> {
+		this.queued++;
 		const run = this.chain.then(fn, fn);
-		this.chain = run.catch(() => undefined);
+		const done = () => {
+			this.queued--;
+		};
+		this.chain = run.then(done, done);
 		return run;
+	}
+
+	/** No operation queued or running (the sim's quiescence: a daily snapshot export / upload is work in flight). */
+	get idle(): boolean {
+		return this.queued === 0;
 	}
 
 	/** Takes a snapshot; null when too large or disabled (manual and the pre-restore one are taken regardless). */

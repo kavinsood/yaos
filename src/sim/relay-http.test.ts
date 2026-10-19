@@ -125,11 +125,19 @@ test("relay checkpoint: CAS order (not found, conflict, not advancing, ahead), G
 	assert.deepEqual(await read(2, true), ["3:ck3", [4, 5], 3, 5], "preferCheckpoint and after < coversSeq");
 	assert.deepEqual(await read(3, true), [null, [4, 5], 3, 5]);
 
-	assert.deepEqual(await put("ns", 5, 3, "ck5"), { t: "ok" });
+	assert.deepEqual(await put("ns", 4, 3, "ck4"), { t: "ok" });
 	assert.equal(relay.gcSeq(ns), 4);
-	assert.deepEqual(relay.store.segments(ns), { sealed: [], open: { firstSeq: 5, lastSeq: 5, rows: 1, bytes: 17 } }, "the open segment is never collected");
+	assert.deepEqual(relay.store.segments(ns), { sealed: [], open: { firstSeq: 5, lastSeq: 5, rows: 1, bytes: 17 } }, "below lastSeq the open segment is kept");
+	assert.deepEqual(await read(0, false), ["4:ck4", [5], 4, 5]);
+	assert.deepEqual(await read(4, false), [null, [5], 4, 5]);
+
+	assert.deepEqual(await put("ns", 5, 4, "ck5"), { t: "ok" });
+	assert.equal(relay.gcSeq(ns), 5, "a checkpoint at lastSeq retires the stream (server H7)");
+	assert.deepEqual(relay.store.segments(ns), { sealed: [], open: null }, "the open segment goes too");
 	assert.deepEqual(await read(0, false), ["5:ck5", [], 5, 5]);
-	assert.deepEqual(await read(4, false), [null, [5], 5, 5]);
+	assert.deepEqual(await read(4, false), ["5:ck5", [], 5, 5], "after < gcSeq: rows 5 are reachable only through the checkpoint");
+	await commitEach(clock, a, [["ns", "c6", 10]]);
+	assert.deepEqual(await read(5, false), [null, [6], 5, 6], "rows after a retire append and read as before");
 });
 
 test("relay checkpoint: gcOnCheckpoint false keeps segments; a checkpoint consumes read budget", async () => {

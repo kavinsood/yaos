@@ -7,6 +7,8 @@
 // Env:   YAOS_SIM_SEEDS     seeds of the full-count matrices (default 200, as run.test.ts; the others scale with it)
 //        YAOS_SIM_CRYPTO    "none": the src/sim/run.test.ts matrices as they are (suite 0, no E2EE matrices), the
 //                           parallel sweep of the default suite; default "suite1"
+//        YAOS_SIM_CHECKPOINTS "production": DESIGN's checkpoint thresholds, no late join, no snapshots (runSim's
+//                           `checkpoints`, for comparing with the sim before checkpoint coverage); default "scaled"
 //        YAOS_SIM_JOBS      worker processes (default: cores - 1)
 //        YAOS_SIM_MINIMIZE  1: ddmin the first failing seed of each matrix (as run.test.ts does; slow)
 // Exit 1 on any violation, crash, RealWork stray, a matrix whose actors did no real work, or a blob-fault matrix
@@ -19,6 +21,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SELF = fileURLToPath(import.meta.url);
 
 const CRYPTO = process.env.YAOS_SIM_CRYPTO === "none" ? "none" : "suite1";
+const CHECKPOINTS = process.env.YAOS_SIM_CHECKPOINTS === "production" ? "production" : "scaled";
 
 function matrices(seeds) {
 	const quarter = Math.max(1, Math.ceil(seeds / 4));
@@ -51,7 +54,7 @@ async function load(rel) {
 async function worker() {
 	const { runSim, minimizePlan } = await load("../src/sim/run.ts");
 	const weights = await load("../src/sim/faults.ts");
-	const cfgOf = (job) => ({ ...job.base, faults: job.base.faults ? weights[job.base.faults] : null, crypto: CRYPTO, seed: job.seed });
+	const cfgOf = (job) => ({ ...job.base, faults: job.base.faults ? weights[job.base.faults] : null, crypto: CRYPTO, checkpoints: CHECKPOINTS, seed: job.seed });
 	process.on("message", async (job) => {
 		if (job.t === "exit") process.exit(0);
 		const t0 = Date.now();
@@ -139,7 +142,7 @@ async function main() {
 	const order = [...ms].sort((a, b) => (b.base.devices + (b.base.faults ? 2 : 0)) - (a.base.devices + (a.base.faults ? 2 : 0)));
 	let done = 0;
 	const total = ms.reduce((n, m) => n + m.seeds, 0);
-	console.log(`sim-suite1: ${total} runs in ${ms.length} matrices over ${jobsN} workers (crypto ${CRYPTO})`);
+	console.log(`sim-suite1: ${total} runs in ${ms.length} matrices over ${jobsN} workers (crypto ${CRYPTO}, checkpoints ${CHECKPOINTS})`);
 	await Promise.all(order.flatMap((m) => Array.from({ length: m.seeds }, (_, i) => p.run({ t: "run", base: m.base, seed: i + 1 }).then((r) => {
 		results.get(m.name).push({ seed: i + 1, ...r });
 		if (++done % 50 === 0) console.log(`  ${done}/${total} (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
@@ -175,7 +178,7 @@ async function main() {
 		}
 		if (failed.length > 0) {
 			console.log(`   failed seeds: ${failed.map((r) => r.seed).join(",")}`);
-			console.log(`   replay one: runSim({ ...${JSON.stringify(m.base)}, faults: ${m.base.faults ?? "null"}, crypto: "${CRYPTO}", seed })`);
+			console.log(`   replay one: runSim({ ...${JSON.stringify(m.base)}, faults: ${m.base.faults ?? "null"}, crypto: "${CRYPTO}", checkpoints: "${CHECKPOINTS}", seed })`);
 			if (process.env.YAOS_SIM_MINIMIZE === "1" && failed[0].ok) minimize.push({ m, seed: failed[0].seed });
 		}
 	}

@@ -8,7 +8,11 @@
  * of before the commit). Rows are pre-sealed before the open segment would
  * pass maxSegmentBytes and sealed after the commit once >= sealBytes.
  * putCheckpoint is a CAS; it deletes sealed segments wholly <= coversSeq and
- * gcSeq becomes the highest deleted seq. The open segment is never collected.
+ * gcSeq becomes the highest deleted seq. The open segment is the retain window,
+ * except that a checkpoint at lastSeq retires the stream (server H7,
+ * store.ts putCheckpoint): the open segment goes too and gcSeq = lastSeq. Its
+ * rows stay in the dedupe window as the open segment's (server H2 keeps their
+ * keys); a resend of one is deduped at the original seq.
  */
 
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../core/types";
@@ -71,6 +75,11 @@ interface StreamState {
 	gcSeq: Seq;
 	/** Every committed row (introspection only). */
 	readonly history: SimRow[];
+	/**
+	 * The rows of the open segment a checkpoint at lastSeq retired (H7), for dedupe only: they stay in the window
+	 * the open segment was (the server's H2 index keeps their keys; an original at or below gcSeq counts as deduped).
+	 */
+	retired: SimRow[];
 }
 
 export interface StoreConfig {
@@ -89,7 +98,7 @@ export interface StoreSnapshot {
 function copyState(st: StreamState): StreamState {
 	return {
 		name: st.name, sealed: st.sealed.map((g) => ({ rows: g.rows.slice(), bytes: g.bytes })), open: { rows: st.open.rows.slice(), bytes: st.open.bytes },
-		lastSeq: st.lastSeq, checkpoint: st.checkpoint, gcSeq: st.gcSeq, history: st.history.slice(),
+		lastSeq: st.lastSeq, checkpoint: st.checkpoint, gcSeq: st.gcSeq, history: st.history.slice(), retired: st.retired.slice(),
 	};
 }
 
@@ -147,7 +156,8 @@ export class RelayStore {
 	private lookup(state: StreamState | undefined, key: string): SimRow | undefined {
 		if (state === undefined) return undefined;
 		const open = findKey(state.open.rows, key);
-		if (open !== undefined || state.open.rows.length >= this.config.tailRows || state.sealed.length === 0) return open;
+		if (open !== undefined || state.open.rows.length >= this.config.tailRows) return open;
+		if (state.sealed.length === 0) return findKey(state.retired, key);
 		return findKey(state.sealed[state.sealed.length - 1]!.rows, key);
 	}
 
@@ -168,7 +178,9 @@ export class RelayStore {
 			}
 			const stored = this.lookup(this.streamMap.get(frame.stream), key);
 			if (stored !== undefined) {
-				outcomes.push(bytesEqual(stored.payload, frame.payload) ? { kind: "deduped", seq: stored.seq } : { kind: "conflict", seq: stored.seq });
+				// A collected original (H7 retire) cannot be compared: deduped, the checkpoint covers it (server H2).
+				const collected = stored.seq <= (this.streamMap.get(frame.stream)?.gcSeq ?? 0);
+				outcomes.push(collected || bytesEqual(stored.payload, frame.payload) ? { kind: "deduped", seq: stored.seq } : { kind: "conflict", seq: stored.seq });
 				continue;
 			}
 			const seq = ++head;
@@ -188,7 +200,7 @@ export class RelayStore {
 	private writeStream(stream: StreamName, rows: readonly SimRow[]): void {
 		let state = this.streamMap.get(stream);
 		if (state === undefined) {
-			state = { name: stream, sealed: [], open: { rows: [], bytes: 0 }, lastSeq: 0, checkpoint: null, gcSeq: 0, history: [] };
+			state = { name: stream, sealed: [], open: { rows: [], bytes: 0 }, lastSeq: 0, checkpoint: null, gcSeq: 0, history: [], retired: [] };
 			this.streamMap.set(stream, state);
 		}
 		for (const row of rows) {
@@ -254,7 +266,7 @@ export class RelayStore {
 		return { lastSeq: state.lastSeq, checkpointSeq: cp?.coversSeq ?? 0, gcSeq: state.gcSeq, checkpoint, rows, nextAfter: more && last !== null ? last : null };
 	}
 
-	/** CAS on the current checkpoint coversSeq, then GC of sealed segments wholly <= coversSeq. */
+	/** CAS on the current checkpoint coversSeq, then GC of sealed segments wholly <= coversSeq (and of the open one at lastSeq). */
 	putCheckpoint(stream: StreamName, coversSeq: Seq, expectedPrevCoversSeq: Seq, bytes: Uint8Array): StoreCheckpointResult {
 		const state = this.streamMap.get(stream);
 		if (state === undefined) return { ok: false, error: "stream_not_found" };
@@ -272,6 +284,12 @@ export class RelayStore {
 				state.sealed.shift();
 				state.gcSeq = Math.max(state.gcSeq, lastSeq);
 				deletedSegments++;
+			}
+			// H7: a checkpoint at lastSeq retires the stream; the open segment is dropped with the same head update.
+			if (coversSeq === state.lastSeq) {
+				if (state.open.rows.length > 0) state.retired = state.open.rows;
+				state.open = { rows: [], bytes: 0 };
+				state.gcSeq = state.lastSeq;
 			}
 		}
 		return { ok: true, gcSeq: state.gcSeq, deletedSegments };
