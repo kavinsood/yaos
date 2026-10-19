@@ -58,7 +58,8 @@ test("relay faults: restart-after writes rows without fan-out — resends dedupe
 	assert.equal(b.events.length, 3, "deduped commit-only frame: not re-delivered");
 	const page = await pump(clock, b.session.feed(1));
 	assert.deepEqual(page.entries, [{ stream: ns, lastSeq: 2 }]);
-	assert.deepEqual(seen, ["0:idle:1", "1:idle:1", "2:idle:1", "3:idle:1"]);
+	// no row written before commit 1 (restart-before writes nothing): the first two are leading-edge commits
+	assert.deepEqual(seen, ["0:lead:1", "1:lead:1", "2:idle:1", "3:idle:1"]);
 	relay.setCommitHook(null);
 });
 
@@ -93,7 +94,7 @@ test("relay daily limit (latch): commit fails until 00:00 UTC; later appends ref
 	relay.failNextCommit("daily-limit");
 	await clock.runUntilIdle();
 	const failedAt = clock.now();
-	assert.equal(failedAt - t0, 300);
+	assert.equal(failedAt - t0, 1000, "the idle window is held to minIntervalMs after n0's commit");
 	assert.deepEqual(trace(a.events).slice(2), ["refused n1 daily-limit"]);
 	assert.equal(a.of("refused")[0]!.retryAfterMs, DAY - (failedAt - Date.UTC(2026, 0, 1)));
 	assert.ok(relay.dailyLimitActive());
@@ -138,7 +139,7 @@ test("relay daily limit (env): setDailyLimit fails commits even after a restart 
 	a.session.append(frame("ns", "n1", "op")); // admitted (latch gone), the commit hits the limit and re-latches
 	await clock.runUntilIdle();
 	assert.deepEqual(trace(a.events).slice(1), ["resend 0", "refused n1 daily-limit"]);
-	assert.equal(a.of("refused")[1]!.retryAfterMs, 60_000 - 300);
+	assert.equal(a.of("refused")[1]!.retryAfterMs, 60_000 - 20, "no commit yet: leading edge");
 	assert.equal(relay.counters().commitFailures, 1);
 	await clock.advance(60_000);
 	assert.ok(!relay.dailyLimitActive());

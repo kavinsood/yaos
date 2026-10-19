@@ -51,10 +51,12 @@ export interface GroupCommitSpec {
 	readonly quietMs: number;
 }
 /**
- * Server DEFAULT_STREAM_RELAY_CONFIG is minIntervalMs 1000, leadMs 20, quietMs 1500 (relay-wire §4.1); the sim
- * defaults keep the plain 300 ms idle window (no floor, leading edge off). Pass the server values via groupCommit.
+ * Opt-out (tests that stage interleavings on the plain 300 ms idle window): no leading edge, no min interval.
+ * Pass as SimRelayOptions.groupCommit.
  */
-export const DEFAULT_SIM_GROUP_COMMIT: GroupCommitSpec = Object.freeze({ idleMs: 300, maxMs: 1500, maxBytes: 64 * 1024, minIntervalMs: 0, leadMs: 20, quietMs: 0 });
+export const SIM_IDLE_ONLY_GROUP_COMMIT: Partial<GroupCommitSpec> = Object.freeze({ minIntervalMs: 0, quietMs: 0 });
+/** Server DEFAULT_STREAM_RELAY_CONFIG (relay-wire §4.1 limits.groupCommit). */
+export const DEFAULT_SIM_GROUP_COMMIT: GroupCommitSpec = Object.freeze({ idleMs: 300, maxMs: 1500, maxBytes: 64 * 1024, minIntervalMs: 1000, leadMs: 20, quietMs: 1500 });
 
 /** One socket's link. Delays are virtual ms; jitter adds uniform [0, jitterMs) per message (FIFO is kept). */
 export interface LinkSpec {

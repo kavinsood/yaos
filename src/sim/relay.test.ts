@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { DeviceId, StreamName } from "../core/types";
 import type { RelayEvent } from "../ports/relay";
 import { VirtualClock } from "./clock";
-import { SimRelay, type SimCommitInfo, type SimRelaySession } from "./relay";
+import { SIM_IDLE_ONLY_GROUP_COMMIT, SimRelay, type SimCommitInfo, type SimRelaySession } from "./relay";
 import { attach, connectPeer, connectRaw, frame, trace } from "./a-relay-testkit";
 import { SeededRandom } from "./random";
 
@@ -32,7 +32,7 @@ test("relay: contiguous vault seqs in arrival order; broadcasts before receipts;
 	assert.equal(relay.counters().commits, 1);
 });
 
-test("relay: group commit — 300 ms idle, 1500 ms max, 64 KiB pending payload bytes", async () => {
+test("relay: group commit (server defaults) — 20 ms leading edge after 1500 ms quiet, 300 ms idle held to 1000 ms after the last commit, 1500 ms max, 64 KiB pending payload bytes", async () => {
 	const clock = new VirtualClock();
 	const relay = new SimRelay({ clock });
 	const commits: { at: number; info: SimCommitInfo }[] = [];
@@ -41,7 +41,7 @@ test("relay: group commit — 300 ms idle, 1500 ms max, 64 KiB pending payload b
 	const t0 = clock.monotonic();
 	a.session.append(frame("ns", "i1", "x"));
 	await clock.runUntilIdle();
-	assert.deepEqual(commits.map((c) => [c.at - t0, c.info.reason, c.info.rows.length]), [[300, "idle", 1]]);
+	assert.deepEqual(commits.map((c) => [c.at - t0, c.info.reason, c.info.rows.length]), [[20, "lead", 1]]);
 
 	commits.length = 0;
 	const t1 = clock.monotonic();
@@ -50,7 +50,8 @@ test("relay: group commit — 300 ms idle, 1500 ms max, 64 KiB pending payload b
 		await clock.advance(200); // never idle for 300 ms
 	}
 	await clock.runUntilIdle();
-	assert.deepEqual(commits.map((c) => [c.at - t1, c.info.reason, c.info.rows.length]), [[1500, "max", 8], [2100, "idle", 2]]);
+	// m8 (+1600) and m9 (+1800) follow the max commit at +1500: no lead (not quiet), idle held to +1500 + 1000
+	assert.deepEqual(commits.map((c) => [c.at - t1, c.info.reason, c.info.rows.length]), [[1500, "max", 8], [2500, "idle", 2]]);
 	assert.equal(commits.reduce((n, c) => n + c.info.rows.length, 0), 10);
 
 	commits.length = 0;
@@ -65,7 +66,8 @@ test("relay: group commit — 300 ms idle, 1500 ms max, 64 KiB pending payload b
 
 test("relay: b:/c: provisional to sockets open at admission; notice joins the held payload; later sockets get the row; forgotten -> null", async () => {
 	const clock = new VirtualClock();
-	const relay = new SimRelay({ clock });
+	// Opt-out: the PROVISIONAL must be seen at +100 before the commit (a leading-edge commit lands at 20 ms).
+	const relay = new SimRelay({ clock, groupCommit: SIM_IDLE_ONLY_GROUP_COMMIT });
 	const a = await connectPeer(relay, clock, "A");
 	const b = await connectPeer(relay, clock, "B", ["b:doc"]);
 	const d = await connectPeer(relay, clock, "D", ["b:doc"]);

@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import { KEYRING_STREAM, type DeviceId, type VaultPath } from "../../core/types";
-import { SimRelay } from "../../sim/relay";
+import { SIM_IDLE_ONLY_GROUP_COMMIT, SimRelay } from "../../sim/relay";
 import { converged, sleep, until, createDoc, docText } from "../runtime/testHarness";
 import { live, oldEpochFrame, rawAppend, start } from "./testkit/engines";
 import { K, genesis, roll } from "./testkit/world";
@@ -23,7 +23,8 @@ function insert(text: string): Uint8Array {
 
 describe("live rows before the session's k read (§14.3)", () => {
 	it("are read after it: no keyring-hold quarantine, no freeze", async () => {
-		const relay = new SimRelay();
+		// Opt-out: needs >= 5 commits inside one slow session start; the server's 1000 ms commit floor allows ~1.
+		const relay = new SimRelay({ groupCommit: SIM_IDLE_ONLY_GROUP_COMMIT });
 		const g = await genesis();
 		await rawAppend(relay, KEYRING_STREAM, g);
 		const frozen: string[] = [];

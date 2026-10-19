@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { StreamName } from "../core/types";
 import { VirtualClock } from "./clock";
-import { SimRelay, SimRelayError, type SimRelayOptions } from "./relay";
+import { SIM_IDLE_ONLY_GROUP_COMMIT, SimRelay, SimRelayError, type SimRelayOptions } from "./relay";
 import { bytes, connectPeer, frame, pump, type RelayPeer } from "./a-relay-testkit";
 
 const ns = "ns" as StreamName;
@@ -152,7 +152,8 @@ test("relay checkpoint: gcOnCheckpoint false keeps segments; a checkpoint consum
 });
 
 test("relay http: answered from state at request arrival (httpMs each way); does not flush the buffer; setHttpFailure -> network_error", async () => {
-	const { clock, relay, a } = await setup({ link: { httpMs: 30 } });
+	// Opt-out: the frame must stay buffered across the 60 ms round trip (a leading-edge commit lands at 20 ms).
+	const { clock, relay, a } = await setup({ link: { httpMs: 30 }, groupCommit: SIM_IDLE_ONLY_GROUP_COMMIT });
 	a.session.append(frame("ns", "n1", "x"));
 	await clock.advance(1);
 	const t = clock.monotonic();

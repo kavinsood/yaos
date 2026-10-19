@@ -49,7 +49,8 @@ export const FAST_TUNING: Partial<EngineTuning> = {
 	gapMs: 150,
 	statusIntervalMs: 50,
 	mirrorDebounceMs: 10,
-	provisionalAdoptMs: 400,
+	// Above the relay's worst commit latency (maxMs 1500 held by minIntervalMs 1000): an adoptable settles on its commit.
+	provisionalAdoptMs: 3000,
 	causalRetryMs: 60,
 	causalRetries: 2,
 	readBackoffMs: 50,
