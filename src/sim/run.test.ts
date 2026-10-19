@@ -8,10 +8,21 @@ import type { SimBlobLiveness } from "./blobStore";
 import { checkCanvas, checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
 import { ABSENT, CANVAS_HOT_OPS, CanvasOracle, type FieldWrite } from "./canvas";
 import { runUserAction, TokenLedger } from "./actors";
-import { SimDevice } from "./device";
+import { SIM_TUNING, SimDevice } from "./device";
+import { DURABILITY_RETRY_MS } from "../engine/body/sender";
 import { SimNet } from "./net";
 import { VirtualClock } from "./clock";
 import type { DocId, VaultPath } from "../core/types";
+
+// Seed 520 (3 devices): C's frame refused at a daily-limit latch that lifted before its next frame, which committed,
+// left A a causal hole for ~750 ms until the 1 s retry. Sim tuning re-read 3 times over 180 ms and froze the doc for good.
+test("sim tuning: the causal-hole re-read window outlasts an own frame's retry (DESIGN §d.6)", () => {
+	const t = SIM_TUNING;
+	const window = t.causalRetryMs! * (t.causalRetries! + 1);
+	assert.ok(window >= 2 * t.provisionalAdoptMs!, `window ${window} ms < 2 x provisionalAdoptMs`);
+	// sender.ts: durability retry and the daily-limit floor are both DURABILITY_RETRY_MS (untuned); then a group commit.
+	assert.ok(window >= 2 * DURABILITY_RETRY_MS, `window ${window} ms < 2 x the own-frame retry`);
+});
 
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 

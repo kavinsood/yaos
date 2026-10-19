@@ -100,9 +100,16 @@ export interface SimDeviceOptions {
 	readonly pin?: E2eePin | null;
 	/** The engine's blob store for each start, and what its connect-time probe finds (default: the net's, SimNet.blobPort). */
 	readonly blob?: () => BlobPort | null;
-	/** Over FAST_TUNING (a roll trigger, the GC grace). */
+	/** Over SIM_TUNING (a roll trigger, the GC grace). */
 	readonly tuning?: Partial<EngineTuning>;
 }
+
+/**
+ * FAST_TUNING, with DESIGN §d.6's causal re-read window kept at its production proportions: ≥ 2 × provisionalAdoptMs
+ * and well past an own frame's untuned 1 s retry (sender.ts: durability, the daily-limit floor). A frame refused
+ * while a later one of the same author commits leaves peers a hole for that long; FAST_TUNING's 3 × 60 ms froze it.
+ */
+export const SIM_TUNING: Partial<EngineTuning> = { ...FAST_TUNING, causalRetryMs: 1_000 };
 
 export interface SimUiLog {
 	statuses: StatusSnapshot[];
@@ -189,7 +196,7 @@ export class SimDevice {
 		const handle = createEngine(pair.engine, {
 			carrier: "worker",
 			clientVersion: "sim",
-			tuning: { ...FAST_TUNING, ...(this.opts.tuning ?? {}) },
+			tuning: { ...SIM_TUNING, ...(this.opts.tuning ?? {}) },
 			startRetryMs: 1_000,
 			tzOffsetMinutes: () => 0,
 			log: this.opts.log,

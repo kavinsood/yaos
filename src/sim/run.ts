@@ -87,7 +87,7 @@ export interface CanvasConfig {
 
 /** The checkpoint side of a run's world (DESIGN §b.5, §d.8, §d.9), a pure function of the seed. */
 export interface CheckpointWorld {
-	/** Over FAST_TUNING for every device. */
+	/** Over SIM_TUNING for every device. */
 	readonly tuning: Partial<EngineTuning>;
 	/** The relay's segment seal threshold (server: 64 KiB); null = the default. */
 	readonly sealBytes: number | null;
