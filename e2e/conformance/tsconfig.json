@@ -1,0 +1,7 @@
+{
+	// Typechecks the standalone conformance suite (npm run typecheck:tests). It runs on plain node with type
+	// stripping, so nothing else would catch a type error in it.
+	"extends": "../../tsconfig.tests.json",
+	"compilerOptions": { "types": ["node"], "lib": ["ES2024", "DOM"] },
+	"include": ["**/*.ts"]
+}

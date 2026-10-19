@@ -7,7 +7,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Seq } from "../../core/types";
-import type { EnginePorts } from "../../ports";
 import type { EngineInitConfig } from "../../protocol/messages";
 import { VirtualClock } from "../../sim/clock";
 import { SimDevice } from "../../sim/device";
@@ -71,7 +70,7 @@ test("a key the gate's store failed to persist is not sealed under when the gate
 	const r2 = await roll(2);
 	const crypto: EngineInitConfig["crypto"] = { suite: 1, keys: [], records: [g, r2] };
 	const kc = await suite1([{ e: 1, k: K(1) }]);
-	const ports = { relay: null, clock: null, random: null, crypto: kc } as unknown as EnginePorts;
+	const ports = { crypto: kc };
 	const gate = await PinGate.open(crypto, ports, { vaultId: VAULT, keyring: new HostKeyring(failingLink, crypto) });
 	assert.equal(gate.open, false, "K_2 (from the roll's nextWrap) was not stored: closed");
 	const main = storingLink();

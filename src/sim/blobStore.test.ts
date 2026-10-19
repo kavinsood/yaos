@@ -22,6 +22,17 @@ describe("SimBlobStore", () => {
 		assert.equal(p2.next, null);
 	});
 
+	it("put / get report progress as httpBlob does (sealed bytes sent, body chunk length); a miss reports none", async () => {
+		const s = new SimBlobStore({ now: () => 1000 });
+		const sent: number[] = [];
+		await s.put(addr(1), [new Uint8Array(3), new Uint8Array(4)], undefined, (n) => sent.push(n));
+		assert.deepEqual(sent, [7]);
+		const got: number[] = [];
+		assert.equal((await s.get(addr(1), undefined, (n) => got.push(n)))?.byteLength, 7);
+		assert.equal(await s.get(addr(2), undefined, (n) => got.push(n)), null);
+		assert.deepEqual(got, [7]);
+	});
+
 	it("a PUT refreshes uploadedAt (newer); a PUT in the HEAD -> delete window is deleted anyway", async () => {
 		let t = 1000;
 		const s = new SimBlobStore({ now: () => t });

@@ -11,7 +11,6 @@ import { Router, type WorkerEnv } from "../../server/src/router";
 import { suite } from "../harness.ts";
 import {
 	FakeBucket,
-	RecordingUpgrades,
 	VaultCluster,
 	appendCommitted,
 	bearer,
@@ -20,6 +19,7 @@ import {
 	recordingConfigNamespace,
 	type DeviceSeed,
 } from "./helpers/workerHarness.ts";
+import { RecordingUpgrades } from "./helpers/fakePorts.ts";
 
 const s = suite("hotpath");
 

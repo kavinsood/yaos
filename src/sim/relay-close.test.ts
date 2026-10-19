@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { DeviceId, StreamName } from "../core/types";
+import { encodeAppend } from "../engine/adapters/relayFrames";
 import { VirtualClock } from "./clock";
-import { SimRelay } from "./relay";
+import { SIM_IDLE_ONLY_GROUP_COMMIT, SimRelay } from "./relay";
 import { connectPeer, connectRaw, frame, pump, trace } from "./a-relay-testkit";
 
 const ns = "ns" as StreamName;
@@ -21,7 +22,9 @@ test("relay close: payload > maxFrameBytes -> 1009; raw message > max+1024 -> 10
 	for (const [stream, id, size, code] of cases) {
 		const p = await connectPeer(relay, clock, "A");
 		p.session.append(frame("ns", "ok", 100));
-		p.session.append(frame(stream, id, size));
+		// wsRelay throws on a payload over maxFrameBytes before sending; the relay's own check needs a raw message.
+		if (size > 100) assert.throws(() => p.session.append(frame(stream, id, size)), RangeError);
+		p.session.sendRawBinary(encodeAppend(frame(stream, id, size)));
 		p.session.append(frame("ns", "after", 1)); // the socket is closed: dropped
 		await clock.runUntilIdle();
 		assert.deepEqual(trace(p.events), [`closed ${code}`], `${stream.length}/${id.length}/${size}`);
@@ -46,7 +49,8 @@ test("relay close: token bucket — refill at rate, overdraft -> backpressure + 
 	a.session.append(frame("ns", "f4", 40)); // 7 tokens: overdraft
 	a.session.append(frame("ns", "f5", 1));
 	await clock.runUntilIdle();
-	assert.deepEqual(trace(a.events), ["backpressure", "closed 1013"]);
+	// f1+f2 commit on the leading edge (20 ms), before the overdraft: their receipts precede the close
+	assert.deepEqual(trace(a.events), ["receipt f1@1", "receipt f2@2", "head 2", "backpressure", "closed 1013"]);
 	assert.deepEqual(trace(b.events), ["committed f1@1", "committed f2@2", "committed f3@3"]);
 	const c = relay.counters();
 	assert.deepEqual([c.rateCloses, c.rawDrops], [1, 1]);
@@ -163,7 +167,8 @@ test("relay connect: one-shot failures first, then the persistent one; maxSocket
 
 test("relay link: jitter keeps per-socket FIFO; uplinkBytesPerSec serializes (bufferedBytes drains); ping and inject", async () => {
 	const clock = new VirtualClock();
-	const relay = new SimRelay({ clock, seed: 7, link: { uplinkMs: 10, downlinkMs: 10, jitterMs: 100 } });
+	// Opt-out: asserts the commit lands one plain idle window (300 ms) after the serialized arrival.
+	const relay = new SimRelay({ clock, seed: 7, link: { uplinkMs: 10, downlinkMs: 10, jitterMs: 100 }, groupCommit: SIM_IDLE_ONLY_GROUP_COMMIT });
 	const a = await connectPeer(relay, clock, "A");
 	const b = await connectPeer(relay, clock, "B");
 	for (let i = 0; i < 20; i++) a.session.append(frame("ns", `f${i}`, "x"));

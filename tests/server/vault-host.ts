@@ -13,7 +13,6 @@ import { OWNER_CAPABILITY_DIGEST } from "../../server/src/vault/host";
 import { suite } from "../harness.ts";
 import { NodeSqliteStorage } from "./helpers/nodeSqliteStorage";
 import {
-	FakeSocket,
 	VaultCluster,
 	appendCommitted,
 	bearer,
@@ -21,6 +20,7 @@ import {
 	newVaultId,
 	type VaultObject,
 } from "./helpers/workerHarness.ts";
+import { FakeSocket } from "./helpers/fakePorts.ts";
 
 const s = suite("vault-host");
 

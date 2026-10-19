@@ -8,7 +8,6 @@ import * as entry from "../../server/src/worker";
 import { suite } from "../harness.ts";
 import {
 	FakeBucket,
-	RecordingUpgrades,
 	VaultCluster,
 	appendCommitted,
 	bearer,
@@ -18,6 +17,7 @@ import {
 	type DeviceSeed,
 	type VaultObject,
 } from "./helpers/workerHarness.ts";
+import { RecordingUpgrades } from "./helpers/fakePorts.ts";
 
 const s = suite("worker-router");
 

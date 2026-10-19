@@ -6,7 +6,8 @@ import { CF_DO_ROWS_WRITTEN_LIMIT_MESSAGE } from "../../server/src/dailyLimit";
 import { blobKey } from "../../server/src/router";
 import { encodeAppendFrame } from "../../server/src/streams/protocol";
 import { suite } from "../harness.ts";
-import { appendCommitted, newDevice, type DeviceSeed, type FakeSocket, type VaultObject } from "./helpers/workerHarness.ts";
+import type { FakeSocket } from "./helpers/fakePorts.ts";
+import { appendCommitted, newDevice, type DeviceSeed, type VaultObject } from "./helpers/workerHarness.ts";
 import {
 	claim,
 	deviceFeed,

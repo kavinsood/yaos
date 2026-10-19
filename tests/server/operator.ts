@@ -8,7 +8,8 @@ import { SESSION_TTL_MS } from "../../server/src/config/host";
 import { PAIRING_CODE_TTL_MS } from "../../server/src/vault/pairing";
 import { MAX_PURGE_BATCHES, Router, type WorkerEnv } from "../../server/src/router";
 import { suite } from "../harness.ts";
-import { RecordingUpgrades, bearer, newDevice } from "./helpers/workerHarness.ts";
+import { RecordingUpgrades } from "./helpers/fakePorts.ts";
+import { bearer, newDevice } from "./helpers/workerHarness.ts";
 import {
 	COOKIE_PATTERN,
 	ORIGIN,

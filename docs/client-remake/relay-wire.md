@@ -547,7 +547,7 @@ cannot check this.
 | Batched read | 128 streams per request (`readBatchMaxStreams`), one page budget for the batch |
 | Subscription set | 128 distinct streams per socket (`maxSubscriptions`); persisted across a wake up to 1024 bytes of names (§5.6) |
 | Streams sockets per vault | 1000 (`YAOS_STREAMS_MAX_SOCKETS`) |
-| Rate gate (per socket) | Token bucket of 256 KiB/s with a 2 MiB burst, charged on raw received bytes (text counted in UTF-16 units). Overdraft gives 1013. |
+| Rate gate (per device, shared by its sockets) | Token bucket of 256 KiB/s with a 2 MiB burst, charged on raw received bytes (text counted in UTF-16 units). Overdraft gives 1013. |
 | Group commit | 300 ms idle / 1500 ms max / 64 KiB; 20 ms leading edge after 1500 ms without a commit |
 | Ticket TTL | 5 min |
 | Pairing code TTL | 15 min |

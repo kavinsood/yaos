@@ -27,6 +27,10 @@ export const SIM_SEGMENT_SEAL_BYTES = 64 * 1024;
 export const SIM_SEGMENT_MAX_BYTES = 1_500_000;
 /** Raw binary message cap = maxFrameBytes + this (MAX_STREAM_BINARY_MESSAGE_BYTES). */
 export const SIM_MESSAGE_SLACK_BYTES = 1024;
+/** MAX_STREAM_TEXT_MESSAGE_BYTES: a longer text message (counted in UTF-16 units) closes 1009. */
+export const SIM_MAX_TEXT_MESSAGE_BYTES = 64 * 1024;
+/** MAX_STREAM_SOCKETS_PER_DEVICE: a connect at the cap first closes the device's oldest socket (1001). */
+export const SIM_MAX_SOCKETS_PER_DEVICE = 4;
 export const SIM_FEED_MAX_LIMIT = 5000;
 export const SIM_READ_MAX_BYTES = 4 * 1024 * 1024;
 /** STREAM_READ_BATCH_MAX_STREAMS: entries of one batched read. */
@@ -42,8 +46,17 @@ export interface GroupCommitSpec {
 	readonly maxMs: number;
 	readonly maxBytes: number;
 	readonly minIntervalMs: number;
+	/** Leading edge: commit leadMs after an append into an empty buffer when no commit happened for quietMs (0 = off). */
+	readonly leadMs: number;
+	readonly quietMs: number;
 }
-export const DEFAULT_SIM_GROUP_COMMIT: GroupCommitSpec = Object.freeze({ idleMs: 300, maxMs: 1500, maxBytes: 64 * 1024, minIntervalMs: 0 });
+/**
+ * Opt-out (tests that stage interleavings on the plain 300 ms idle window): no leading edge, no min interval.
+ * Pass as SimRelayOptions.groupCommit.
+ */
+export const SIM_IDLE_ONLY_GROUP_COMMIT: Partial<GroupCommitSpec> = Object.freeze({ minIntervalMs: 0, quietMs: 0 });
+/** Server DEFAULT_STREAM_RELAY_CONFIG (relay-wire §4.1 limits.groupCommit). */
+export const DEFAULT_SIM_GROUP_COMMIT: GroupCommitSpec = Object.freeze({ idleMs: 300, maxMs: 1500, maxBytes: 64 * 1024, minIntervalMs: 1000, leadMs: 20, quietMs: 1500 });
 
 /** One socket's link. Delays are virtual ms; jitter adds uniform [0, jitterMs) per message (FIFO is kept). */
 export interface LinkSpec {
@@ -131,11 +144,12 @@ export type DownMsg =
 
 /** Client -> server socket traffic. */
 export type UpMsg =
-	| { readonly k: "append"; readonly frame: AppendFrame; readonly bytes: number }
+	/** The binary APPEND message (relayFrames encodeAppend); decoded and validated on arrival. */
+	| { readonly k: "append"; readonly wire: Uint8Array; readonly bytes: number }
 	/** STREAM_SUBSCRIBE (text frame of `bytes` bytes). */
 	| { readonly k: "subscribe"; readonly streams: readonly string[]; readonly bytes: number }
 	/** VAULT_PING with a probe id (text frame, not rate-charged). */
-	| { readonly k: "ping"; readonly probeId: string }
+	| { readonly k: "ping"; readonly probeId: string; readonly bytes: number }
 	| { readonly k: "close"; readonly code: number };
 
 export function frameKey(deviceId: string, clientFrameId: string): string {

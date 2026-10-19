@@ -10,11 +10,13 @@
 import { bytesEqual, utf8ByteLength } from "../core/codec/lib0";
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
-import type { AppendFrame, RelayLimits } from "../ports/relay";
+import type { RelayLimits } from "../ports/relay";
+import { decodeAppend } from "../engine/adapters/relayFrames";
 import type { SimRelaySession } from "./a-relay-session";
 import type { RelayStore, StoreOutcome } from "./a-relay-store";
 import {
 	SIM_MAX_SUBSCRIPTIONS,
+	SIM_MAX_TEXT_MESSAGE_BYTES,
 	SIM_MESSAGE_SLACK_BYTES,
 	SIM_SUBSCRIPTION_ATTACHMENT_BYTES,
 	frameKey,
@@ -41,7 +43,7 @@ export interface PendingFrame {
 	readonly provisionalTo: Set<SimRelaySession>;
 }
 
-export type FlushReason = "idle" | "max" | "bytes" | "forced";
+export type FlushReason = "lead" | "idle" | "max" | "bytes" | "forced";
 
 /**
  * Outcome of one group commit. durability / daily-limit: nothing written,
@@ -72,6 +74,7 @@ export interface SimRelayCounters {
 	commits: number;
 	committedRows: number;
 	commitFailures: number;
+	flushLead: number;
 	flushIdle: number;
 	flushMax: number;
 	flushBytes: number;
@@ -105,7 +108,7 @@ export interface SimDeviceFanout {
 export function newCounters(): SimRelayCounters {
 	return {
 		appendFrames: 0, pendingDedupes: 0, storeDedupes: 0, conflicts: 0, commits: 0, committedRows: 0, commitFailures: 0,
-		flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0, notices: 0, committedBroadcasts: 0,
+		flushLead: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0, notices: 0, committedBroadcasts: 0,
 		provisionalDrops: 0, rateCloses: 0, oversizeCloses: 0, policyCloses: 0, rawDrops: 0, writeForbidden: 0,
 		dailyLimitRejects: 0, wakeNotices: 0, authorityCloses: 0, droppedPending: 0, skippedRows: 0, skipFrames: 0,
 		subscribes: 0, subscribeRejects: 0,
@@ -141,6 +144,10 @@ export class RelayEngine {
 	private idleTimer: TimerHandle | null = null;
 	private maxTimer: TimerHandle | null = null;
 	private lastCommitAt = Number.NEGATIVE_INFINITY;
+	/** Leading-edge commit due time (server leadAt): set by the first append after quietMs without a commit. */
+	private leadAt: number | null = null;
+	/** H6 rate buckets, per device (shared by all its sockets, like the server's); in-memory, reset on restart. */
+	readonly buckets = new Map<DeviceId, { tokens: number; at: number }>();
 
 	constructor(private readonly clock: ClockPort, readonly store: RelayStore, private readonly config: EngineConfig) {}
 
@@ -192,13 +199,11 @@ export class RelayEngine {
 			if (session.gate?.refused === true) this.counters.rawDrops++;
 			return;
 		}
-		if (msg.k === "ping") {
-			session.send({ k: "pong", head: this.store.head(), probeId: msg.probeId });
-			return;
-		}
-		if (!this.charge(session, msg.bytes)) return;
-		if (msg.k === "subscribe") this.subscribe(session, msg.streams);
-		else this.append(session, msg.frame);
+		// Every message is charged before parsing, text (subscribe, ping) in UTF-16 units (server message()).
+		if (!this.charge(session, msg.bytes, msg.k !== "append")) return;
+		if (msg.k === "ping") session.send({ k: "pong", head: this.store.head(), probeId: msg.probeId });
+		else if (msg.k === "subscribe") this.subscribe(session, msg.streams);
+		else this.append(session, msg.wire);
 	}
 
 	/**
@@ -233,7 +238,15 @@ export class RelayEngine {
 		return t;
 	}
 
-	private append(session: SimRelaySession, frame: AppendFrame): void {
+	/** Admits one binary APPEND (server append(): decode, then 1008 malformed/invalid, 1009 payload too large). */
+	private append(session: SimRelaySession, wire: Uint8Array): void {
+		const decoded = decodeAppend(wire);
+		const frame = decoded === null ? null : { stream: decoded.stream as StreamName, clientFrameId: decoded.clientFrameId as ClientFrameId, payload: decoded.payload };
+		if (frame === null) {
+			this.counters.policyCloses++;
+			this.serverClose(session, 1008, null, true);
+			return;
+		}
 		if (!validStreamName(frame.stream) || !validClientFrameId(frame.clientFrameId)) {
 			this.counters.policyCloses++;
 			this.serverClose(session, 1008, null, true);
@@ -300,11 +313,18 @@ export class RelayEngine {
 				this.flush("max");
 			});
 		}
+		// Server schedule(): leading edge (leadMs after an append into an empty buffer with no commit for quietMs),
+		// else the idle window; minIntervalMs holds both.
+		const now = this.clock.monotonic();
+		const quiet = gc.quietMs > 0 && now - this.lastCommitAt >= gc.quietMs;
+		if (this.pending.length === 1 && quiet) this.leadAt = now + gc.leadMs;
 		if (this.idleTimer !== null) this.clock.clearTimer(this.idleTimer);
-		const wait = Math.max(gc.idleMs, this.lastCommitAt + gc.minIntervalMs - this.clock.monotonic());
+		const floor = this.lastCommitAt + gc.minIntervalMs - now;
+		const lead = this.leadAt !== null;
+		const wait = lead ? Math.max(0, this.leadAt! - now, floor) : Math.max(gc.idleMs, floor);
 		this.idleTimer = this.clock.setTimer(wait, () => {
 			this.idleTimer = null;
-			this.flush("idle");
+			this.flush(lead ? "lead" : "idle");
 		});
 	}
 
@@ -313,6 +333,7 @@ export class RelayEngine {
 		if (this.maxTimer !== null) this.clock.clearTimer(this.maxTimer);
 		this.idleTimer = null;
 		this.maxTimer = null;
+		this.leadAt = null;
 	}
 
 	/** Commits every buffered frame in one transaction, then broadcasts (frame order) and receipts per origin socket. */
@@ -324,7 +345,7 @@ export class RelayEngine {
 		this.pending = [];
 		this.pendingBytes = 0;
 		this.pendingByKey.clear();
-		const key = reason === "idle" ? "flushIdle" : reason === "max" ? "flushMax" : reason === "bytes" ? "flushBytes" : "flushForced";
+		const key = reason === "lead" ? "flushLead" : reason === "idle" ? "flushIdle" : reason === "max" ? "flushMax" : reason === "bytes" ? "flushBytes" : "flushForced";
 		this.counters[key]++;
 		const index = this.commitIndex++;
 		const queued = this.faults.shift();
@@ -361,34 +382,40 @@ export class RelayEngine {
 	}
 
 	/** Raw admission on the received size; oversize closes 1009, overdraft VAULT_BACKPRESSURE + 1013. */
-	private charge(session: SimRelaySession, size: number): boolean {
+	private charge(session: SimRelaySession, size: number, text: boolean): boolean {
 		const { burstBytes, appendBytesPerSec, maxFrameBytes } = this.config.limits;
 		const now = this.clock.monotonic();
 		let gate = session.gate;
 		if (gate === null) {
-			gate = { tokens: burstBytes, at: now, refused: false };
+			gate = { refused: false };
 			session.gate = gate;
 		}
 		if (gate.refused) {
 			this.counters.rawDrops++;
 			return false;
 		}
-		const max = maxFrameBytes + SIM_MESSAGE_SLACK_BYTES;
-		gate.tokens = Math.min(burstBytes, gate.tokens + (Math.max(0, now - gate.at) * appendBytesPerSec) / 1000);
-		gate.at = now;
-		if (size <= max && gate.tokens >= size) {
-			gate.tokens -= size;
+		const max = text ? SIM_MAX_TEXT_MESSAGE_BYTES : maxFrameBytes + SIM_MESSAGE_SLACK_BYTES;
+		if (size > max) {
+			// Oversize: closed uncharged (server charge()).
+			gate.refused = true;
+			this.counters.oversizeCloses++;
+			this.serverClose(session, 1009, null, true);
+			session.gate = gate;
+			return false;
+		}
+		// The bucket is the device's, shared by every socket of it (server H6 buckets by deviceId).
+		let bucket = this.buckets.get(session.deviceId);
+		if (bucket === undefined) this.buckets.set(session.deviceId, (bucket = { tokens: burstBytes, at: now }));
+		bucket.tokens = Math.min(burstBytes, bucket.tokens + (Math.max(0, now - bucket.at) * appendBytesPerSec) / 1000);
+		bucket.at = now;
+		if (bucket.tokens >= size) {
+			bucket.tokens -= size;
 			return true;
 		}
 		gate.refused = true;
-		if (size > max) {
-			this.counters.oversizeCloses++;
-			this.serverClose(session, 1009, null, true);
-		} else {
-			this.counters.rateCloses++;
-			session.send({ k: "backpressure" });
-			this.serverClose(session, 1013, null, true);
-		}
+		this.counters.rateCloses++;
+		session.send({ k: "backpressure" });
+		this.serverClose(session, 1013, null, true);
 		session.gate = gate; // keep refusing until the socket record is gone
 		return false;
 	}
@@ -505,6 +532,7 @@ export class RelayEngine {
 	restart(loseSubscriptions = false): void {
 		this.dropPending();
 		this.latchUntil = 0;
+		this.buckets.clear();
 		const head = this.store.head();
 		for (const session of this.streamSockets()) {
 			session.gate = null;

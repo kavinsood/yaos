@@ -242,6 +242,12 @@ export type ServerStreamFrame =
 /** Decodes one server -> client binary message (tests and tooling). Throws on malformed input. */
 export function decodeServerFrame(bytes: Uint8Array): ServerStreamFrame {
 	const decoder = decoding.createDecoder(bytes);
+	const frame = decodeServerFrameBody(decoder);
+	if (decoder.pos !== bytes.byteLength) throw new Error(`trailing bytes in server stream frame ${frame.kind}`);
+	return frame;
+}
+
+function decodeServerFrameBody(decoder: decoding.Decoder): ServerStreamFrame {
 	const kind = decoding.readUint8(decoder);
 	if (kind === STREAM_FRAME_PROVISIONAL) {
 		const stream = decoding.readVarString(decoder);

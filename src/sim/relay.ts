@@ -12,7 +12,8 @@
  * hooks. See docs/client-remake/wp-a-notes.md for the decisions.
  */
 
-import { streamClass, type DeviceId, type Seq, type StreamName, type VaultEpoch } from "../core/types";
+import { decodeReadReply, encodeReadReply, type WireReadPage } from "../engine/adapters/relayFrames";
+import { streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName, type VaultEpoch } from "../core/types";
 import type { ClockPort } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
 import type { RandomPort } from "../ports/random";
@@ -25,7 +26,9 @@ import {
 	DEFAULT_SIM_GROUP_COMMIT,
 	DEFAULT_SIM_RELAY_LIMITS,
 	SIM_FEED_MAX_LIMIT,
+	SIM_IDLE_ONLY_GROUP_COMMIT,
 	SIM_MAX_SOCKETS,
+	SIM_MAX_SOCKETS_PER_DEVICE,
 	SIM_READ_BATCH_MAX_STREAMS,
 	SIM_READ_MAX_BYTES,
 	SIM_SEGMENT_MAX_BYTES,
@@ -47,6 +50,7 @@ export {
 	DEFAULT_SIM_GROUP_COMMIT,
 	DEFAULT_SIM_RELAY_LIMITS,
 	SIM_SEGMENT_MAX_BYTES,
+	SIM_IDLE_ONLY_GROUP_COMMIT,
 	SIM_SEGMENT_SEAL_BYTES,
 	SimRelayError,
 	SimRelaySession,
@@ -133,8 +137,8 @@ export class SimRelay implements RelayPort {
 			clock: this.clock,
 			arrive: (session, msg) => this.engine.arrive(session, msg),
 			feed: (session, afterSeq) => this.http(session, () => this.feedPage(afterSeq, session.deviceId)),
-			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.readPage(stream, afterSeq, prefer, undefined, session.deviceId)),
-			readBatch: (session, reqs) => this.readRequest(session, () => this.readBatchPages(reqs, session.deviceId)),
+			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.viaWire([{ stream, afterSeq, preferCheckpoint: prefer }], [this.readPage(stream, afterSeq, prefer, undefined, session.deviceId)])[0]!),
+			readBatch: (session, reqs) => this.readRequest(session, () => this.viaWire(reqs, this.readBatchPages(reqs, session.deviceId))),
 			putCheckpoint: (session, stream, coversSeq, expected, bytes) => this.http(session, () => this.checkpointPut(session, stream, coversSeq, expected, bytes)),
 			jitter: (session) => this.jitter(session.link),
 			listenerError: (error) => this.onListenerError(error),
@@ -152,6 +156,10 @@ export class SimRelay implements RelayPort {
 				const failure = this.connectFailures.shift() ?? this.connectFailure;
 				if (failure !== null) return resolve({ ok: false, reason: failure.reason, retryAfterMs: failure.retryAfterMs });
 				if (this.revoked.has(params.deviceId)) return resolve({ ok: false, reason: "unauthorized", retryAfterMs: null });
+				// Server accept(): a device at MAX_STREAM_SOCKETS_PER_DEVICE first closes its oldest socket (1001
+				// device_socket_limit, no control error), before the vault-wide cap.
+				const own = this.engine.streamSockets().filter((s) => s.deviceId === params.deviceId);
+				for (let i = 0; own.length - i >= SIM_MAX_SOCKETS_PER_DEVICE; i++) this.engine.serverClose(own[i]!, 1001, null, true);
 				if (this.engine.streamSockets().length >= this.maxSockets) return resolve({ ok: false, reason: "unavailable", retryAfterMs: 1000 });
 				const session = new SimRelaySession(
 					this.host, this.nextSessionId++, this.engine.nextOrdinal(), params.deviceId, this.epoch,
@@ -220,6 +228,25 @@ export class SimRelay implements RelayPort {
 		};
 	}
 
+	/**
+	 * The pages as the binary read reply (relay-wire §7.2): encoded and decoded with the client codec (relayFrames),
+	 * then mapped as relayHttp pageFromWire does (cursor: nextAfter, else the last row, else the checkpoint, else afterSeq).
+	 */
+	private viaWire(reqs: readonly ReadRequest[], pages: readonly ReadPage[]): ReadPage[] {
+		const wire: WireReadPage[] = pages.map((p, i) => ({
+			stream: reqs[i]!.stream, lastSeq: p.lastSeq, checkpointSeq: p.checkpointSeq, gcSeq: p.gcSeq, checkpoint: p.checkpoint,
+			rows: p.rows, nextAfter: p.more ? p.nextAfterSeq : null,
+		}));
+		const reply = decodeReadReply(encodeReadReply({ vaultEpoch: this.epoch, head: this.store.head(), pages: wire }));
+		if (reply === null || reply.pages.length === 0 || reply.pages.length > reqs.length) throw new SimRelayError("malformed_response");
+		return reply.pages.map((page, i) => {
+			if (page.stream !== reqs[i]!.stream) throw new SimRelayError("malformed_response");
+			const rows = page.rows.map((r) => ({ seq: r.seq, deviceId: r.deviceId as DeviceId, clientFrameId: r.clientFrameId as ClientFrameId, payload: r.payload }));
+			const nextAfterSeq = page.nextAfter ?? rows[rows.length - 1]?.seq ?? page.checkpoint?.coversSeq ?? reqs[i]!.afterSeq;
+			return { checkpoint: page.checkpoint, rows, lastSeq: page.lastSeq, checkpointSeq: page.checkpointSeq, gcSeq: page.gcSeq, nextAfterSeq, more: page.nextAfter !== null };
+		});
+	}
+
 	/** Server readBatch: request order, one budget; the first entry always served, a later overrun ends the batch. */
 	private readBatchPages(reqs: readonly ReadRequest[], deviceId: DeviceId | null = null): ReadPage[] {
 		if (reqs.length === 0 || reqs.length > SIM_READ_BATCH_MAX_STREAMS) throw new SimRelayError("batch_too_large");
@@ -253,6 +280,8 @@ export class SimRelay implements RelayPort {
 		if (!Number.isSafeInteger(coversSeq) || coversSeq < 1) throw new SimRelayError("invalid_covers_seq");
 		if (!validSeq(expected)) throw new SimRelayError("invalid_expected_covers_seq");
 		if (bytes.byteLength > this.limits.maxCheckpointBytes) return { t: "refused", reason: "too-large", retryAfterMs: null };
+		// The server has no up-front latch check here: its store write fails (503 cf_daily_limit) while the Cloudflare
+		// limit holds. A latched sim (failNextCommit daily-limit) stands for that limit, so the latch refuses too.
 		if (!this.engine.dailyActive() && this.engine.envDailyActive()) this.engine.latchDaily(null);
 		if (this.engine.dailyActive()) return { t: "refused", reason: "daily-limit", retryAfterMs: Math.max(0, this.engine.latchUntil - this.clock.now()) };
 		const before = this.store.rows(stream).length;
@@ -400,7 +429,7 @@ export class SimRelay implements RelayPort {
 			this.engine.counters.rateCloses++;
 			session.send({ k: "backpressure" });
 			this.engine.serverClose(session, 1013, null, true);
-			session.gate = { tokens: 0, at: this.clock.monotonic(), refused: true };
+			session.gate = { refused: true };
 		}
 	}
 

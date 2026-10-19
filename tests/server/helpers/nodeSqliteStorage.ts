@@ -5,18 +5,37 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export type SqliteBinding = string | number | bigint | null | Uint8Array;
+export type SqliteBinding = string | number | null | Uint8Array;
 export type SqliteRowValue = ArrayBuffer | string | number | null;
 
+/**
+ * Durable Object SQL limits (developers.cloudflare.com/durable-objects/platform/limits/): what workerd refuses is
+ * refused here too, so a query that only works on Node fails its suite.
+ */
+export const DO_SQL_MAX_BINDINGS = 100;
+export const DO_SQL_MAX_STATEMENT_BYTES = 100 * 1024;
+export const DO_SQL_MAX_VALUE_BYTES = 2 * 1024 * 1024;
+/** workerd refuses these through `sql.exec`: transactions go through `transactionSync`. */
+const DO_SQL_FORBIDDEN = /^\s*(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
+
 function bindSqliteValue(value: unknown): SqliteBinding {
-	if (value instanceof ArrayBuffer) return new Uint8Array(value);
-	if (ArrayBuffer.isView(value)) {
-		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+	let bound: SqliteBinding;
+	if (value instanceof ArrayBuffer) bound = new Uint8Array(value);
+	else if (ArrayBuffer.isView(value)) bound = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+	// Durable Object SQL takes ArrayBuffer(View) | string | number | null; a bigint or boolean throws there.
+	else if (value === null || typeof value === "string" || typeof value === "number") bound = value;
+	else throw new TypeError(`unsupported SQLite binding: ${typeof value}`);
+	const size = typeof bound === "string" ? Buffer.byteLength(bound) : bound instanceof Uint8Array ? bound.byteLength : 0;
+	if (size > DO_SQL_MAX_VALUE_BYTES) throw new RangeError(`SQL value of ${size} bytes is over the Durable Object limit`);
+	return bound;
+}
+
+function assertDurableObjectSql(query: string, statements: readonly string[], bindings: number): void {
+	if (Buffer.byteLength(query) > DO_SQL_MAX_STATEMENT_BYTES) throw new RangeError("SQL statement too long for a Durable Object");
+	if (bindings > DO_SQL_MAX_BINDINGS) throw new RangeError(`too many SQL variables (${bindings} > ${DO_SQL_MAX_BINDINGS})`);
+	for (const statement of statements) {
+		if (DO_SQL_FORBIDDEN.test(statement)) throw new Error(`Durable Object SQL refuses "${statement.slice(0, 20)}": use transactionSync`);
 	}
-	if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "bigint") {
-		return value;
-	}
-	throw new TypeError(`unsupported SQLite binding: ${typeof value}`);
 }
 
 function readSqliteBlob(value: Uint8Array): ArrayBuffer {
@@ -234,6 +253,7 @@ export class NodeSqliteStorage {
 	exec<T extends Record<string, SqliteRowValue>>(query: string, ...bindings: unknown[]): NodeSqlCursor<T> {
 		this.assertOpen();
 		const statements = splitSqlStatements(query);
+		assertDurableObjectSql(query, statements, bindings.length);
 		if (statements.length === 0) return new NodeSqlCursor<T>(this.database, null, totalChanges(this.database));
 		if (statements.length > 1) {
 			if (bindings.length !== 0) throw new Error("bindings are not supported for multi-statement SQLite exec");
