@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import { ManualClock } from "../engine/adapters/relayTestFakes";
-import { bounded, relayHttpDeadlineMs, RELAY_HTTP_BASE_MS, untilAborted, type BoundedEnd } from "./deadline";
+import { bounded, relayHttpDeadlineMs, RELAY_HTTP_BASE_MS, untilAborted, watched, type BoundedEnd } from "./deadline";
 
 class Ended extends Error {
 	constructor(readonly why: BoundedEnd) {
@@ -73,4 +73,52 @@ test("untilAborted rejects with the signal's reason when the promise never settl
 	assert.equal(getEventListeners(ctl.signal, "abort").length, 0);
 	assert.equal(relayHttpDeadlineMs(0), RELAY_HTTP_BASE_MS);
 	assert.equal(relayHttpDeadlineMs(4096), 15_063);
+});
+
+test("watched: no first byte ends \"timeout\" at firstByteMs; after it, no progress for idleMs ends \"stalled\"; progress keeps it alive until totalMs", async () => {
+	const limits = { firstByteMs: 1000, idleMs: 300, totalMs: 5000 };
+	const clock = new ManualClock();
+	const silent = track(watched(limits, undefined, clock, () => never(), (w) => new Error(w)));
+	clock.advance(999);
+	await flush();
+	assert.equal(silent.out(), "pending");
+	clock.advance(1);
+	await flush();
+	assert.equal((silent.out() as Error).message, "timeout");
+	assert.equal(clock.pendingTimers, 0);
+
+	let progress!: () => void;
+	const stalled = track(watched(limits, undefined, clock, (_s, p) => ((progress = p), never()), (w) => new Error(w)));
+	clock.advance(900);
+	progress(); // headers
+	clock.advance(299);
+	await flush();
+	assert.equal(stalled.out(), "pending", "the idle window replaced the first-byte window");
+	clock.advance(1);
+	await flush();
+	assert.equal((stalled.out() as Error).message, "stalled");
+	assert.equal(clock.pendingTimers, 0);
+
+	let answer!: (v: number) => void;
+	const slow = track(watched(limits, undefined, clock, (_s, p) => ((progress = p), new Promise<number>((r) => (answer = r))), (w) => new Error(w)));
+	for (let t = 0; t < 4800; t += 200) {
+		clock.advance(200);
+		progress();
+	}
+	await flush();
+	assert.equal(slow.out(), "pending", "progress every 200 ms is never cut by the idle window");
+	answer(9);
+	await flush();
+	assert.equal(slow.out(), 9);
+	assert.equal(clock.pendingTimers, 0);
+
+	const trickle = track(watched(limits, undefined, clock, (_s, p) => ((progress = p), never()), (w) => new Error(w)));
+	for (let t = 0; t < 4800; t += 200) {
+		clock.advance(200);
+		progress();
+	}
+	clock.advance(200);
+	await flush();
+	assert.equal((trickle.out() as Error).message, "timeout", "the total backstop holds");
+	assert.equal(clock.pendingTimers, 0);
 });

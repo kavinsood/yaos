@@ -1,10 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
-import { createRelayHttp, dailyResetDelayMs, parseRetryAfter, RelayHttpError } from "./relayHttp";
-import { RELAY_HTTP_BASE_MS, RELAY_HTTP_FLOOR_BYTES_PER_S, relayHttpDeadlineMs } from "../../core/deadline";
+import { createRelayHttp, dailyResetDelayMs, parseRetryAfter, readPageBound, RELAY_READ_CLIENT_MAX_BYTES, RelayHttpError } from "./relayHttp";
+import { RELAY_HTTP_BASE_MS, RELAY_HTTP_FLOOR_BYTES_PER_S, RELAY_HTTP_IDLE_MS, relayHttpDeadlineMs } from "../../core/deadline";
 import type { StreamName } from "../../core/types";
-import { fakeFetch, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
+import { fakeFetch, jsonResponse, ManualClock, readResponse, type FakeRequest } from "./relayTestFakes";
 import { encodeReadReply, READ_BINARY_TYPE, type WireReadPage } from "./relayFrames";
 
 const TOKEN = "device-token-SECRET-abc123";
@@ -206,7 +206,7 @@ describe("relayHttp read (binary reply, relay-wire §7.2)", () => {
 		const c = client(() => jsonResponse({ error: "invalid_stream" }, 400));
 		const e = await rejection(c.http.read("v1", "", 0, false, null));
 		assert.deepEqual([e.status, e.code], [400, "invalid_stream"]);
-		assert.equal(c.requests[0]!.url.search, "?stream=&after=0");
+		assert.equal(c.requests[0]!.url.search, "?stream=&after=0&maxBytes=2097152");
 	});
 });
 
@@ -249,46 +249,84 @@ describe("relayHttp putCheckpoint", () => {
 	});
 });
 
-describe("relayHttp deadlines (feed, read, readBatch, putCheckpoint)", () => {
+describe("relayHttp liveness (feed, read, readBatch watched; putCheckpoint bounded)", () => {
 	const MiB = 1024 * 1024;
+	const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
 	/** A fetch that never answers and ignores its signal: only untilAborted ends the wait. */
 	const deaf = (): { fetch: typeof fetch; signals: (AbortSignal | null)[] } => {
 		const signals: (AbortSignal | null)[] = [];
 		return { signals, fetch: async (_input, init) => { signals.push(init?.signal ?? null); return new Promise<Response>(() => undefined); } };
 	};
-	const calls: [string, number, (h: ReturnType<typeof createRelayHttp>, signal?: AbortSignal) => Promise<unknown>][] = [
-		// 4 KiB reply + 1000 entries of 300 B.
-		["feed", relayHttpDeadlineMs(4096 + 1000 * 300), (h, s) => h.feed("v1", 0, 1000, s)],
-		// 4 KiB + 2 x max(1 MiB budget, 4 MiB checkpoint): 143 s, the figure RELAY_HTTP_FLOOR_BYTES_PER_S justifies.
-		["read", 143_063, (h, s) => h.read("v1", "ns", 0, true, MiB, s)],
-		["readBatch", 143_063, (h, s) => h.readBatch("v1", [{ stream: "a" as StreamName, afterSeq: 0, preferCheckpoint: false }, { stream: "b" as StreamName, afterSeq: 0, preferCheckpoint: true }], MiB, s)],
-		// 4 KiB + the body.
-		["putCheckpoint", relayHttpDeadlineMs(4096 + MiB), (h, s) => h.putCheckpoint("v1", "ns", 2, 0, new Uint8Array(MiB), s)],
+	/** A fetch that answers headers at once and then plays the body by hand; the body ignores the signal. */
+	const streaming = (): { fetch: typeof fetch; push: (b: Uint8Array) => void; end: () => void; cancelled: () => boolean } => {
+		let ctl!: ReadableStreamDefaultController<Uint8Array>;
+		let cancelled = false;
+		const body = new ReadableStream<Uint8Array>({ start(c) { ctl = c; }, cancel() { cancelled = true; } });
+		return {
+			fetch: async () => new Response(body, { status: 200, headers: { "content-type": READ_BINARY_TYPE } }),
+			push: (b) => ctl.enqueue(b), end: () => ctl.close(), cancelled: () => cancelled,
+		};
+	};
+	const readCall = (h: ReturnType<typeof createRelayHttp>, s?: AbortSignal) => h.read("v1", "ns", 0, true, MiB, s);
+	const watchedCalls: [string, (h: ReturnType<typeof createRelayHttp>, signal?: AbortSignal) => Promise<unknown>][] = [
+		["feed", (h, s) => h.feed("v1", 0, 1000, s)],
+		["read", readCall],
+		["readBatch", (h, s) => h.readBatch("v1", [{ stream: "a" as StreamName, afterSeq: 0, preferCheckpoint: false }, { stream: "b" as StreamName, afterSeq: 0, preferCheckpoint: true }], MiB, s)],
+	];
+	const allCalls: [string, (h: ReturnType<typeof createRelayHttp>, signal?: AbortSignal) => Promise<unknown>][] = [
+		...watchedCalls,
+		["putCheckpoint", (h, s) => h.putCheckpoint("v1", "ns", 2, 0, new Uint8Array(MiB), s)],
 	];
 
-	it("deadline = base + bytes at the floor rate", () => {
+	it("backstops: base + byte bound at the floor; every read page is bounded by one 4 MiB checkpoint (79 s, was 143 s)", () => {
 		assert.equal(relayHttpDeadlineMs(0), RELAY_HTTP_BASE_MS);
 		assert.equal(relayHttpDeadlineMs(RELAY_HTTP_FLOOR_BYTES_PER_S * 10), RELAY_HTTP_BASE_MS + 10_000);
-		assert.equal(relayHttpDeadlineMs(4096 + 2 * 4 * MiB), 143_063);
+		assert.equal(readPageBound(MiB), 4096 + 4 * MiB);
+		assert.equal(readPageBound(RELAY_READ_CLIENT_MAX_BYTES), 4096 + 4 * MiB, "the client's largest budget adds nothing");
+		assert.equal(relayHttpDeadlineMs(readPageBound(RELAY_READ_CLIENT_MAX_BYTES)), 79_063);
 	});
 
-	for (const [name, deadlineMs, call] of calls) {
-		it(`${name}: a request nobody answers ends "timeout" at its size-proportional deadline, even when the fetch ignores its signal`, async () => {
+	it("a read never asks for more than RELAY_READ_CLIENT_MAX_BYTES, and names a budget when the caller does not", async () => {
+		const f = fakeFetch(() => readResponse([{ stream: "ns", checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 0, gcSeq: 0, nextAfter: null }]));
+		const http = createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: f.fetch, clock: new ManualClock() });
+		await http.read("v1", "ns", 0, false, 4 * MiB);
+		await http.read("v1", "ns", 0, false, null);
+		assert.deepEqual(f.requests.map((r) => r.url.searchParams.get("maxBytes")), [String(RELAY_READ_CLIENT_MAX_BYTES), String(RELAY_READ_CLIENT_MAX_BYTES)]);
+	});
+
+	for (const [name, call] of watchedCalls) {
+		it(`${name}: a request nobody answers ends "timeout" after RELAY_HTTP_BASE_MS, whatever its size, even when the fetch ignores its signal`, async () => {
 			const clock = new ManualClock();
 			const f = deaf();
 			const p = call(createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: f.fetch, clock }));
 			let settled = false;
 			p.then(() => (settled = true), () => (settled = true));
-			await new Promise((r) => setImmediate(r));
-			clock.advance(deadlineMs - 1);
-			await new Promise((r) => setImmediate(r));
+			await tick();
+			clock.advance(RELAY_HTTP_BASE_MS - 1);
+			await tick();
 			assert.equal(settled, false);
 			clock.advance(1);
 			const e = await rejection(p);
 			assert.deepEqual([e.status, e.code, clock.pendingTimers], [0, "timeout", 0]);
 			assert.equal(f.signals[0]?.aborted, true, "the fetch's signal is aborted too");
 		});
+	}
 
+	it("putCheckpoint (no upload progress): ends \"timeout\" at its size-proportional deadline", async () => {
+		const clock = new ManualClock();
+		const f = deaf();
+		const p = createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: f.fetch, clock }).putCheckpoint("v1", "ns", 2, 0, new Uint8Array(MiB));
+		let settled = false;
+		p.then(() => (settled = true), () => (settled = true));
+		await tick();
+		clock.advance(relayHttpDeadlineMs(4096 + MiB) - 1);
+		await tick();
+		assert.equal(settled, false);
+		clock.advance(1);
+		assert.deepEqual([(await rejection(p)).code, clock.pendingTimers], ["timeout", 0]);
+	});
+
+	for (const [name, call] of allCalls) {
 		it(`${name}: the caller's signal ends it "aborted" at once (before or in flight); listeners and timers are released`, async () => {
 			const clock = new ManualClock();
 			const f = deaf();
@@ -299,27 +337,82 @@ describe("relayHttp deadlines (feed, read, readBatch, putCheckpoint)", () => {
 			assert.equal(f.signals.length, 0, "nothing is sent");
 			const ctl = new AbortController();
 			const p = call(http, ctl.signal);
-			await new Promise((r) => setImmediate(r));
+			await tick();
 			ctl.abort();
 			assert.deepEqual([(await rejection(p)).code, clock.pendingTimers], ["aborted", 0]);
 			assert.equal(getEventListeners(ctl.signal, "abort").length, 0);
 		});
 	}
 
-	it("a reply within the deadline clears its timer; a slow body that still lands before it is read whole", async () => {
+	it("stalled after headers: no body byte for RELAY_HTTP_IDLE_MS ends it \"stalled\" and cancels the body", async () => {
 		const clock = new ManualClock();
-		const enc = new TextEncoder();
-		let push!: (s: string) => void;
-		let end!: () => void;
-		const body = new ReadableStream<Uint8Array>({ start(c) { push = (s) => c.enqueue(enc.encode(s)); end = () => c.close(); } });
-		const http = createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: async () => new Response(body, { status: 200 }), clock });
-		const p = http.feed("v1", 0, 1000);
-		await new Promise((r) => setImmediate(r));
-		push('{"vaultEpoch":"E","head":5,');
-		clock.advance(relayHttpDeadlineMs(4096 + 1000 * 300) - 1);
-		push('"changes":[],"nextAfter":null}');
-		end();
-		assert.deepEqual(await p, { entries: [], throughSeq: 5, headSeq: 5, more: false });
-		assert.equal(clock.pendingTimers, 0);
+		const s = streaming();
+		const p = readCall(createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: s.fetch, clock }));
+		let settled = false;
+		p.then(() => (settled = true), () => (settled = true));
+		await tick();
+		clock.advance(RELAY_HTTP_IDLE_MS - 1);
+		await tick();
+		assert.equal(settled, false);
+		clock.advance(1);
+		assert.deepEqual([(await rejection(p)).code, clock.pendingTimers], ["stalled", 0]);
+		await tick();
+		assert.equal(s.cancelled(), true);
+	});
+
+	it("stalled mid-body: bytes, then silence, ends \"stalled\" RELAY_HTTP_IDLE_MS after the last chunk", async () => {
+		const clock = new ManualClock();
+		const s = streaming();
+		const p = readCall(createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: s.fetch, clock }));
+		let settled = false;
+		p.then(() => (settled = true), () => (settled = true));
+		await tick();
+		for (let i = 0; i < 5; i++) {
+			clock.advance(RELAY_HTTP_IDLE_MS - 1);
+			s.push(new Uint8Array(1024));
+			await tick();
+		}
+		assert.equal(settled, false);
+		clock.advance(RELAY_HTTP_IDLE_MS - 1);
+		await tick();
+		assert.equal(settled, false);
+		clock.advance(1);
+		assert.deepEqual([(await rejection(p)).code, clock.pendingTimers], ["stalled", 0]);
+	});
+
+	it("slow but progressing: a page trickling for longer than the idle window many times over is read whole", async () => {
+		const clock = new ManualClock();
+		const s = streaming();
+		const p = readCall(createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: s.fetch, clock }));
+		await tick();
+		const reply = encodeReadReply({ vaultEpoch: "E1", head: 3, pages: [{ stream: "ns", checkpoint: null, rows: [{ seq: 3, deviceId: "d", clientFrameId: "f", payload: new Uint8Array(4000) }], lastSeq: 3, checkpointSeq: 0, gcSeq: 0, nextAfter: null }] });
+		// Six gaps of 9 s, just under the idle window (54 s in all, five idle windows), then the rest.
+		for (let i = 0; i < 6; i++) {
+			clock.advance(RELAY_HTTP_IDLE_MS - 1000);
+			s.push(reply.subarray(i, i + 1));
+			await tick();
+		}
+		s.push(reply.subarray(6));
+		s.end();
+		const page = await p as Awaited<ReturnType<typeof readCall>>;
+		assert.deepEqual([page.rows.length, page.lastSeq, clock.pendingTimers], [1, 3, 0]);
+	});
+
+	it("a reply that keeps trickling ends \"timeout\" at its backstop", async () => {
+		const clock = new ManualClock();
+		const s = streaming();
+		const p = readCall(createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: s.fetch, clock }));
+		let settled = false;
+		p.then(() => (settled = true), () => (settled = true));
+		await tick();
+		const backstop = relayHttpDeadlineMs(readPageBound(MiB));
+		for (let t = 5000; t < backstop; t += 5000) {
+			clock.advance(5000);
+			s.push(new Uint8Array(1));
+			await tick();
+		}
+		assert.equal(settled, false);
+		clock.advance(backstop % 5000);
+		assert.deepEqual([(await rejection(p)).code, clock.pendingTimers], ["timeout", 0]);
 	});
 });

@@ -5,17 +5,23 @@
  * The credential (device token) is a secret. It is only ever placed in the
  * Authorization header; it never appears in URLs, error messages or logs.
  *
- * No call waits forever. ticket() ends at connect's deadline (wsRelay.ts). feed, read, readBatch and putCheckpoint
- * each move a bounded number of bytes, so each gets a deadline proportional to that bound (core/deadline.ts),
- * and the session's own signal, aborted when the session closes (wsRelay.ts), ends them as soon as the link is
- * gone. untilAborted makes both hold even when a fetch ignores its signal. A blob, up to 100 MB, gets an idle
- * window instead (httpBlob.ts).
+ * No call waits forever (core/deadline.ts). ticket() ends at connect's deadline (wsRelay.ts). feed, read and
+ * readBatch are watched: their reply body is read chunk by chunk, so a dead connection ends in seconds, not at a
+ * deadline sized to the largest page: RELAY_HTTP_BASE_MS (15 s) to the response headers, then RELAY_HTTP_IDLE_MS
+ * (10 s) without a chunk ends the call "stalled", and a backstop (relayHttpDeadlineMs of the reply's byte bound:
+ * 79 s for the largest read page, a 4 MiB checkpoint) ends a reply that trickles. putCheckpoint is bounded: a fetch
+ * reports no upload progress (httpBlob.ts has the evidence), so its deadline is proportional to the body it sends
+ * (15 s + 64 KiB/s); it is background duty, retried, and on no read path. The session's own signal, aborted when
+ * the session closes (wsRelay.ts), ends every call as soon as the link is gone. untilAborted makes all of this
+ * hold even when a fetch ignores its signal. These calls always run on the engine's fetch (a streaming body), never
+ * on Obsidian's requestUrl (it buffers the reply and takes no signal). A blob, up to 100 MB, gets an idle window
+ * and no total (httpBlob.ts).
  */
 
 import type { ClockPort } from "../../ports/clock";
 import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectResult, RelayRow } from "../../ports/relay";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
-import { bounded as boundedCall, relayHttpDeadlineMs, RELAY_REPLY_BYTES, untilAborted } from "../../core/deadline";
+import { bounded as boundedCall, relayHttpDeadlineMs, RELAY_HTTP_BASE_MS, RELAY_HTTP_IDLE_MS, RELAY_REPLY_BYTES, untilAborted, watched } from "../../core/deadline";
 import { decodeReadReply, type WireReadPage } from "./relayFrames";
 import { createWebClock } from "./webClock";
 
@@ -49,8 +55,9 @@ export interface RelayHttpOptions {
 }
 
 /**
- * feed / read / readBatch / putCheckpoint: each rejects with RelayHttpError status 0, code "timeout" at its deadline
- * (relayHttpDeadlineMs of its byte bound) and "aborted" as soon as `signal` aborts (the session closed).
+ * feed / read / readBatch reject with RelayHttpError status 0, code "timeout" without response headers within
+ * RELAY_HTTP_BASE_MS or past their backstop, "stalled" when the body delivers nothing for RELAY_HTTP_IDLE_MS;
+ * putCheckpoint with "timeout" at its deadline. Each rejects "aborted" as soon as `signal` aborts (the session closed).
  */
 export interface RelayHttp {
 	/** POST /vault/:id/auth/ticket {purpose:"streams"}. Never throws; "unavailable" once `signal` aborts (connect's deadline). */
@@ -65,27 +72,39 @@ export interface RelayHttp {
 }
 
 /**
- * Wire bytes per page payload byte. A read page's payload is at most max(maxBytes, one item): maxBytes "bounds
- * payload bytes per page, checkpoint included", but "a page always carries at least one row or the checkpoint"
- * (relay-wire §7, §7.1; server/src/streams/store.ts read), and an item is at most RELAY_PAGE_ITEM_MAX_BYTES. The
- * payload travels raw in the binary reply (relay-wire §7.2), with per-row fields (varuint seq, deviceId,
- * clientFrameId and the payload length: at most ~300 B at the relay's name limits, ~50 B with this client's ids);
- * 2× covers rows of 300 B or more at the limits, 50 B or more in practice. A page of smaller rows can exceed its
- * bound; its deadline then assumes a faster link, by that ratio.
+ * Wire bytes per page payload byte of rows. The payload travels raw in the binary reply (relay-wire §7.2), with
+ * per-row fields (varuint seq, deviceId, clientFrameId and the payload length: at most ~300 B at the relay's name
+ * limits, ~50 B with this client's ids); 2× covers rows of 300 B or more at the limits, 50 B or more in practice. A
+ * page of smaller rows can exceed its bound; its backstop then assumes a faster link, by that ratio.
  */
 export const RELAY_PAGE_WIRE_FACTOR = 2;
 /** The largest single item of a read page: a checkpoint (relay-wire §8: 413 over 4 MiB); a frame is at most 1 MiB. */
 export const RELAY_PAGE_ITEM_MAX_BYTES = 4 * 1024 * 1024;
-/** The relay's read budget cap (relay-wire §7: "the max is 4 MiB"): the page budget when the call names none. */
-export const RELAY_READ_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * The largest read budget this client asks for (the relay's own cap is 4 MiB, relay-wire §7), and the budget when
+ * the call names none. At 2 MiB a page of rows (2 × 2 MiB on the wire) is no larger than a page carrying one
+ * checkpoint, so every read's backstop is that of the checkpoint page (readPageBound: 79 s); a 4 MiB budget would
+ * double it for nothing a 220 ms round trip per page costs (the relay's default, 1 MiB, is below it anyway).
+ */
+export const RELAY_READ_CLIENT_MAX_BYTES = 2 * 1024 * 1024;
 /** The relay's feed page cap (relay-wire §6: "the max is 5000"): the page size when the call names none. */
 export const RELAY_FEED_MAX_ENTRIES = 5000;
 /** One feed entry on the wire: {"stream":<name, at most 256 UTF-8 bytes, JSON-escaped>,"lastSeq":<seq>}. */
 export const RELAY_FEED_ENTRY_BYTES = 300;
 
-/** The byte bound of a read / readBatch reply under a `maxBytes` budget. */
-function pageBound(maxBytes: number | null): number {
-	return RELAY_REPLY_BYTES + RELAY_PAGE_WIRE_FACTOR * Math.max(maxBytes ?? RELAY_READ_MAX_BYTES, RELAY_PAGE_ITEM_MAX_BYTES);
+/** The read budget sent: the call's, at most RELAY_READ_CLIENT_MAX_BYTES. */
+function readBudget(maxBytes: number | null): number {
+	return Math.max(1, Math.min(maxBytes ?? RELAY_READ_CLIENT_MAX_BYTES, RELAY_READ_CLIENT_MAX_BYTES));
+}
+
+/**
+ * The byte bound of a read / readBatch reply under a `budget`. maxBytes "bounds payload bytes per page, checkpoint
+ * included", but "a page always carries at least one row or the checkpoint" (relay-wire §7, §7.1;
+ * server/src/streams/store.ts read): a page is either rows within the budget (with their fields, ×
+ * RELAY_PAGE_WIRE_FACTOR) or one item past it, a checkpoint (raw) or a frame, at most RELAY_PAGE_ITEM_MAX_BYTES.
+ */
+export function readPageBound(budget: number): number {
+	return RELAY_REPLY_BYTES + Math.max(RELAY_PAGE_WIRE_FACTOR * budget, RELAY_PAGE_ITEM_MAX_BYTES);
 }
 
 /** Strips trailing slashes: "https://h/" -> "https://h". */
@@ -156,9 +175,46 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 
 	const vaultPath = (vaultId: string, rest: string): string => `${base}/vault/${encodeURIComponent(vaultId)}${rest}`;
 
-	/** null = network failure, or `signal` aborted before the whole reply arrived. Never rejects. */
-	/** `binary`: a 200 reply is the binary read reply (relay-wire §7.2), returned as bytes; errors are JSON. */
-	async function call(url: string, init: { method: string; body?: BodyInit; contentType?: string; binary?: true }, signal?: AbortSignal): Promise<HttpReply | null> {
+	/**
+	 * The whole body, read chunk by chunk; `progress` on every chunk (the watched call's idle window). Rejects when the
+	 * body fails or `signal` aborts (the reader is then cancelled).
+	 */
+	async function readAll(res: Response, signal: AbortSignal | undefined, progress: () => void): Promise<Uint8Array> {
+		if (res.body === null) return new Uint8Array(await untilAborted(res.arrayBuffer(), signal));
+		const reader = res.body.getReader();
+		const chunks: Uint8Array[] = [];
+		let n = 0;
+		try {
+			for (;;) {
+				const r = await untilAborted(reader.read(), signal);
+				if (signal?.aborted) throw signal.reason;
+				if (r.done) break;
+				progress();
+				chunks.push(r.value);
+				n += r.value.length;
+			}
+		} catch (e) {
+			reader.cancel().catch(() => undefined);
+			throw e;
+		}
+		if (chunks.length === 1) return chunks[0]!;
+		const out = new Uint8Array(n);
+		let at = 0;
+		for (const c of chunks) {
+			out.set(c, at);
+			at += c.length;
+		}
+		return out;
+	}
+
+	/**
+	 * null = network failure, or `signal` aborted before the whole reply arrived. Never rejects. `binary`: a 200 reply
+	 * is the binary read reply (relay-wire §7.2), returned as bytes; errors are JSON. `progress` on the headers and
+	 * on every body chunk.
+	 */
+	async function call(
+		url: string, init: { method: string; body?: BodyInit; contentType?: string; binary?: true }, signal?: AbortSignal, progress: () => void = () => undefined,
+	): Promise<HttpReply | null> {
 		const headers: Record<string, string> = { Authorization: auth };
 		if (init.contentType) headers["Content-Type"] = init.contentType;
 		let res: Response;
@@ -167,22 +223,23 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 		} catch {
 			return null;
 		}
-		if (init.binary && res.status === 200) {
-			try {
-				return { status: res.status, body: null, bytes: new Uint8Array(await untilAborted(res.arrayBuffer(), signal)), code: null, retryAfterMs: null };
-			} catch {
-				return null;
-			}
+		progress();
+		let raw: Uint8Array;
+		try {
+			raw = await readAll(res, signal, progress);
+		} catch {
+			if (signal?.aborted || (init.binary && res.status === 200)) return null;
+			raw = new Uint8Array(0);
 		}
+		if (init.binary && res.status === 200) return { status: res.status, body: null, bytes: raw, code: null, retryAfterMs: null };
 		let body: Json | null = null;
 		try {
-			const text = await untilAborted(res.text(), signal);
+			const text = new TextDecoder().decode(raw);
 			if (text !== "") {
 				const parsed: unknown = JSON.parse(text);
 				body = isRecord(parsed) ? parsed : null;
 			}
 		} catch {
-			if (signal?.aborted) return null;
 			body = null;
 		}
 		const code = body !== null && typeof body["error"] === "string" ? body["error"] : null;
@@ -194,9 +251,16 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	}
 
 	/**
-	 * `run` ended at relayHttpDeadlineMs(`bytes`) or when `signal` aborts (core/deadline.ts bounded). The reply, null
-	 * for a network failure; RelayHttpError "timeout" or "aborted" when the call was ended from this side.
+	 * A watched call (core/deadline.ts watched): RELAY_HTTP_BASE_MS to the headers, RELAY_HTTP_IDLE_MS between body
+	 * chunks, relayHttpDeadlineMs(`bytes`) in all, or until `signal` aborts. The reply, null for a network failure;
+	 * RelayHttpError "timeout", "stalled" or "aborted" when the call was ended from this side.
 	 */
+	function watch(route: string, bytes: number, signal: AbortSignal | undefined, run: (s: AbortSignal, progress: () => void) => Promise<HttpReply | null>): Promise<HttpReply | null> {
+		const limits = { firstByteMs: RELAY_HTTP_BASE_MS, idleMs: RELAY_HTTP_IDLE_MS, totalMs: relayHttpDeadlineMs(bytes) };
+		return watched(limits, signal, clock, run, (why) => new RelayHttpError(route, 0, why, null));
+	}
+
+	/** A call whose transport reports no progress (a fetch PUT): ended at relayHttpDeadlineMs(`bytes`) or when `signal` aborts. */
 	function bounded(route: string, bytes: number, signal: AbortSignal | undefined, run: (s: AbortSignal) => Promise<HttpReply | null>): Promise<HttpReply | null> {
 		return boundedCall(relayHttpDeadlineMs(bytes), signal, clock, run, (why) => new RelayHttpError(route, 0, why, null));
 	}
@@ -238,7 +302,7 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 		async feed(vaultId, afterSeq, limit, signal) {
 			const q = `after=${afterSeq}${limit !== null ? `&limit=${limit}` : ""}`;
 			const bound = RELAY_REPLY_BYTES + Math.min(limit ?? RELAY_FEED_MAX_ENTRIES, RELAY_FEED_MAX_ENTRIES) * RELAY_FEED_ENTRY_BYTES;
-			const reply = await bounded("feed", bound, signal, (s) => call(vaultPath(vaultId, `/streams/feed?${q}`), { method: "GET" }, s));
+			const reply = await watch("feed", bound, signal, (s, p) => call(vaultPath(vaultId, `/streams/feed?${q}`), { method: "GET" }, s, p));
 			if (reply === null || reply.status !== 200) throw fail("feed", reply);
 			const body = reply.body;
 			if (body === null) throw malformed("feed", reply.status);
@@ -261,10 +325,10 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 		},
 
 		async read(vaultId, stream, afterSeq, preferCheckpoint, maxBytes, signal) {
-			const q = `stream=${encodeURIComponent(stream)}&after=${afterSeq}`
-				+ (maxBytes !== null ? `&maxBytes=${maxBytes}` : "")
+			const budget = readBudget(maxBytes);
+			const q = `stream=${encodeURIComponent(stream)}&after=${afterSeq}&maxBytes=${budget}`
 				+ (preferCheckpoint ? "&checkpoint=1" : "");
-			const reply = await bounded("read", pageBound(maxBytes), signal, (s) => call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET", binary: true }, s));
+			const reply = await watch("read", readPageBound(budget), signal, (s, p) => call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET", binary: true }, s, p));
 			if (reply === null || reply.status !== 200) throw fail("read", reply);
 			const wire = reply.bytes === null ? null : decodeReadReply(reply.bytes);
 			if (wire === null || wire.pages.length !== 1 || wire.pages[0]!.stream !== stream) throw malformed("read", reply.status);
@@ -272,17 +336,18 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 		},
 
 		async readBatch(vaultId, reqs, maxBytes, signal) {
-			let q = maxBytes !== null ? `maxBytes=${maxBytes}` : "";
+			const budget = readBudget(maxBytes);
+			let q = `maxBytes=${budget}`;
 			let sent = 0;
 			for (const r of reqs) {
 				const entry = `r=${r.afterSeq}.${r.preferCheckpoint ? 1 : 0}.${encodeURIComponent(r.stream)}`;
 				if (sent > 0 && q.length + entry.length + 1 > READ_BATCH_MAX_QUERY_CHARS) break;
-				q += `${q === "" ? "" : "&"}${entry}`;
+				q += `&${entry}`;
 				sent++;
 			}
 			if (sent === 0) throw new RangeError("readBatch: no requests");
 			// One budget for the whole batch (relay-wire §7.1), so one page's bound.
-			const reply = await bounded("read", pageBound(maxBytes), signal, (s) => call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET", binary: true }, s));
+			const reply = await watch("read", readPageBound(budget), signal, (s, p) => call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET", binary: true }, s, p));
 			if (reply === null || reply.status !== 200) throw fail("read", reply);
 			const wire = reply.bytes === null ? null : decodeReadReply(reply.bytes);
 			if (wire === null || wire.pages.length === 0 || wire.pages.length > sent) throw malformed("read", reply.status);

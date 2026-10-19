@@ -1778,8 +1778,9 @@ transferred buffers.
   progressing. They end with the engine (`aborted`, engine/compose/hostLink.ts `close`), and the engine re-plans
   the scope; nothing is assumed done. Main→engine requests time out after `DEFAULT_REQUEST_TIMEOUT_MS` (60 s,
   host/engineHost.ts) → `error(timeout)`; liveness is the ping (`PING_TIMEOUT_MS`). The engine's own network calls
-  all end (§j.1 Liveness): relay HTTP calls at a deadline proportional to their byte bound
-  (`relayHttpDeadlineMs`, `src/core/deadline.ts:63`); blob bodies (GET over fetch, PUT over XMLHttpRequest) at no
+  all end (§j.1 Liveness): relay feed / read / readBatch when no response headers arrive within 15 s or no body
+  chunk within 10 s (`watched`, `src/core/deadline.ts`), with a backstop proportional to their byte bound; other
+  relay HTTP calls at a deadline proportional to their byte bound (`relayHttpDeadlineMs`); blob bodies (GET over fetch, PUT over XMLHttpRequest) at no
   fixed deadline but after `BLOB_TRANSFER_IDLE_MS` (60 s) without a byte moving (`src/engine/adapters/httpBlob.ts:28-44`);
   and every blob store call at once when the session loop declares the relay link dead
   (`src/engine/blobs/transferLink.ts`).
@@ -2136,7 +2137,7 @@ ones get conflict copies.
 | `refused forbidden` / `canWrite = false` | Read-only: no appends or checkpoints. Outbox kept. Notice. |
 | `resendUnreceipted` (STREAM_RESEND) | §d.5. |
 | 1001 / 1006 / network | Reconnect with full-jitter exponential backoff `RECONNECT_BASE_MS` → `RECONNECT_MAX_MS`. Immediate on `online` / `visible`. |
-| A relay HTTP call (feed, read, readBatch, checkpoint) ends at its deadline (`timeout`: 15 s plus its byte bound at 64 KiB/s) or as `aborted` when its session closes (§j.1 Liveness) | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:357-360`, `:382-387`); a failed session-start feed closes the session and reconnects with backoff (`:185-193`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
+| A relay HTTP call ends from this side (§j.1 Liveness): feed / read / readBatch as `timeout` without response headers in 15 s or past their backstop (79 s for the largest read page), as `stalled` after 10 s without a body chunk; checkpoint as `timeout` at 15 s plus its body at 64 KiB/s; any of them as `aborted` when its session closes | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:357-360`, `:382-387`); a failed session-start feed closes the session and reconnects with backoff (`:185-193`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
 | Ticket TTL 5 min | The adapter fetches a fresh ticket for every connect. |
 
 ---
@@ -2182,8 +2183,16 @@ ones get conflict copies.
     Content-Length, the upload is an XHR whose `upload.onprogress` feeds the same idle check). No fixed deadline
     ends a transfer that is still moving. An aborted or stalled transfer fails like any transport error and is
     retried with backoff. Every other network call ends too, through one mechanism (`src/core/deadline.ts`
-    `bounded` / `untilAborted`, which hold even when the transport ignores its signal): a deadline of 15 s plus its
-    byte bound at 64 KiB/s (`relayHttpDeadlineMs`; relay feed / read / readBatch / checkpoint, blob GC list
+    `watched` / `bounded` / `untilAborted`, which hold even when the transport ignores its signal). Relay feed /
+    read / readBatch run on the engine's fetch and read the reply body chunk by chunk, so a dead connection is
+    seen in seconds, not at a deadline sized to the largest page: 15 s to the response headers
+    (`RELAY_HTTP_BASE_MS`), then 10 s without a body chunk ends the call `stalled` (`RELAY_HTTP_IDLE_MS`: three TCP
+    retransmissions in a row), and a backstop of 15 s plus the reply's byte bound at 64 KiB/s ends a reply that
+    trickles. The client asks for at most 2 MiB per read page (`RELAY_READ_CLIENT_MAX_BYTES`), so every page is
+    bounded by one 4 MiB checkpoint and its backstop is 79 s (`readPageBound`). A slow link that keeps moving is
+    never cut before the backstop. Calls whose transport reports no progress get one deadline of 15 s plus their
+    byte bound at 64 KiB/s (`relayHttpDeadlineMs`; the checkpoint PUT, whose fetch upload reports nothing: up to
+    79 s for a 4 MiB checkpoint, background duty on no read path; blob GC list
     17 s and delete 15.5 s, pairing / claim / operator calls 15 s, the capabilities probe 10 s, connect's
     ticket + upgrade + `VAULT_READY` 15 s), and the caller's signal (the session's close, the link, a GC sweep's
     stop). A pairing call that ends so fails "Could not reach the server: no answer within 15 s."

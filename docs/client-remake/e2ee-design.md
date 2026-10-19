@@ -691,7 +691,7 @@ client mark-and-sweep against the server's list and batch conditional delete (se
   - The HTTP adapter retries 429/503 after Retry-After, at most 5 calls, waits of ≤ 65 s, abortable on engine stop
     (`src/engine/adapters/httpBlob.ts:59-62`, `:305-322`). Each attempt, its reply included, ends at a deadline
     sized to what it can move: about 17 s for a list page and 15.5 s for a delete batch (`relayHttpDeadlineMs`,
-    15 s plus the bytes at 64 KiB/s, `src/core/deadline.ts:63-65`; `httpBlob.ts:72-74`).
+    15 s plus the bytes at 64 KiB/s, `src/core/deadline.ts`; `httpBlob.ts:72-74`).
   - `SimBlobStore` (`src/sim/blobStore.ts`) stamps `uploadedAt` from the sim clock, refreshes it on PUT, and has
     hooks for the HEAD→delete race.
 - **Trigger.** Only the Obsidian command "Clean up unused server attachments": one `cleanUpAttachments` command,
