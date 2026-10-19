@@ -318,7 +318,16 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 	};
 
 	// ---- rename inference ------------------------------------------------------
-	const freshLocal = inScopeLocal.filter((l) => !l.excluded && !syncedByKey.has(l.pathKey) && !remoteOwns(l.pathKey));
+	/**
+	 * The file at `key` is new although a synced doc sits there: that doc's file is gone (decided delete, fileGone)
+	 * and the user renamed another file there (sim seed 703 F DEV3). It takes part in inference as a new file.
+	 */
+	const goneHere = (key: PathKey): boolean => {
+		const id = syncedByKey.get(key);
+		const s = id === undefined ? undefined : input.synced.get(id);
+		return s?.fileGone === true && arrivedElsewhere(key, s);
+	};
+	const freshLocal = inScopeLocal.filter((l) => !l.excluded && (goneHere(l.pathKey) || (!syncedByKey.has(l.pathKey) && !remoteOwns(l.pathKey))));
 	const unhashedFresh = freshLocal.some((l) => l.hash === null);
 	const missing: SyncedEntry[] = [];
 	for (const id of docIds) {
@@ -569,7 +578,13 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		if (Rc) {
 			// Edit beats delete. A decided delete whose path holds a new file by now: the file merges into the doc
 			// after all (the next pass sees it as the doc's), there is no free path to restore the doc at.
-			if (fileGone && r.pathKey === s.pathKey && input.local.has(s.pathKey)) return push([...prefix, { op: "syncedPut", entry: s }]);
+			// Unless the file there is another doc's: renamed there by the user from elsewhere, or synced as another
+			// doc's (sim seed 703 F DEV3). The doc then waits for its path.
+			if (fileGone && r.pathKey === s.pathKey && input.local.has(s.pathKey)) {
+				const other = arrivedElsewhere(s.pathKey, s) || claimed.has(s.pathKey)
+					|| [...input.synced.values()].some((o) => o.docId !== docId && o.pathKey === s.pathKey && !o.fileGone);
+				return push(other ? prefix : [...prefix, { op: "syncedPut", entry: s }]);
+			}
 			return push([...prefix, { op: "diskMaterialize", docId, path: r.path, expect: { t: "absent" } }]);
 		}
 		if (r.pendingLocal) return hold(waitOp(docId, "pending-ns"));

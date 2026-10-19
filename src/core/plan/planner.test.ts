@@ -320,6 +320,26 @@ test("row live/present/absent: an observed rename that waits on ns survives an e
 	assert.equal(put.renamedTo, undefined);
 });
 
+test("a file another doc's observed rename brought onto a fileGone path is that doc's, not a save of the gone doc", () => {
+	// Sim seed 703 F DEV3: offline, A renamed seed0 -> r6 and deleted r6 (the delete waited: fileGone), then renamed
+	// seed2 -> r6; a peer deleted seed2's doc and edited seed0's. The kept rename could not pair seed2's doc with r6
+	// (r6 was the gone doc's synced path), so seed2's doc was restored at seed2 and r6 merged into seed0's doc as
+	// edit beats delete: a conflict copy every pass, and the disk never converged.
+	const edited = R("d1", "r6.md", { body: { ...R("d1", "r6.md").body!, version: V(11) } });
+	const del = R("d2", "seed2.md", { state: "deleted", deletedSeq: 57 });
+	const gone1 = { ...S("d1", "r6.md"), fileGone: true as const };
+	const gone2 = { ...S("d2", "seed2.md", { contentHash: h("c2") }), fileGone: true as const, renamedTo: { to: "r6.md", atMs: 9 } };
+	const sc = { remote: [edited, del], synced: [gone1, gone2], local: [L("r6.md", h("c5"))] };
+	const p = planWith(input(sc), { restoreDuty: new Set([id("d2")]) });
+	assert.deepEqual(find(p, "nsRestore"), { op: "nsRestore", docId: "d2", path: "r6.md", againstDeleteSeq: 57 });
+	assert.equal(find(p, "reconcileContent").docId, "d2");
+	// the gone doc does not take the file (no merge-after-all put, no materialize into the occupied path)
+	assert.ok(!p.ops.some((o) => "docId" in o && o.docId === "d1" && o.op !== "wait"), JSON.stringify(p.ops));
+	// next pass, d2's record at r6: still not d1's file
+	const next = planWith(input({ remote: [edited, R("d2", "r6.md")], synced: [gone1, S("d2", "r6.md", { contentHash: h("c5") })], local: [L("r6.md", h("c5"))] }));
+	assert.ok(!next.ops.some((o) => "docId" in o && o.docId === "d1" && o.op !== "wait"), JSON.stringify(next.ops));
+});
+
 test("row live/present/absent: a delete that waits marks fileGone; a file re-created at the path is new, not a save", () => {
 	// Sim heavy seed 92: A deleted n0.md offline (ns not ready, own body frames unacked), then created a new n0.md.
 	// The planner merged it into the doc as a save; the peer had deleted the old text, which took the brackets the
