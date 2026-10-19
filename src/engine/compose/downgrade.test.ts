@@ -13,7 +13,7 @@
  *     k empty, hidden, hidden under suite-0 data) x 3 seeds, against a hostile server. Every case ends
  *     key-missing/"no-pin"/suite=null with 0 frames, rows, checkpoints, blob calls, IndexedDB stores, side files,
  *     secrets and disk changes; every UI command and key probe is tallied. Only installKey (QR, RK) reaches the
- *     engine. Existing: pluginController.test.ts:165, pinGate.test.ts:191, pinGate.test.ts:267.
+ *     engine. Existing: pluginController.test.ts:165, pinGate.test.ts:193, pinGate.test.ts:269.
  *     - The sim relay reports the true head, so a hidden genesis means head > 0. A server that also reports head 0
  *       gives the device exactly the "empty" state's view.
  *     - The UI layer (src/host/ui/**) over the same controller: the palette is exact, and its only key command is
@@ -32,12 +32,12 @@
  *     user-initiated modals and the protocol handler (import graph). Behaviourally: createVault's two choices
  *     send nothing short of "creatable", and a suite=0 link routed through routeSetupLink and applyLinkE2ee into
  *     a suite-1, suite-0 or keyringSeen device is refused on main, with 0 engine pins and 0 writes.
- *     Existing: pin.test.ts:17, pin.test.ts:111, pluginController.test.ts:182.
+ *     Existing: pin.test.ts:17, pin.test.ts:106, pluginController.test.ts:182.
  * (d) Suite-0 link after a genesis -> "d. ...". Live and history genesis x 3 seeds; the server then hides k and
  *     drops the session. parseSetupLink accepts the 4 `suite=0` shapes (§12.4 source (ii)) and rejects the 2
  *     with unknown keys. Every accepted one routes "apply" (routeSetupLink) and applyLinkE2ee's pinSuite0 {link}
  *     is refused (keyring-seen) by main, also after UI writes, a re-pair and a restart. keyringSeen stays saved;
- *     there are 0 writes. Existing: pluginController.test.ts:200, keyReader.test.ts:91, pinGate.test.ts:227,
+ *     there are 0 writes. Existing: pluginController.test.ts:200, keyReader.test.ts:91, pinGate.test.ts:229,
  *     pin.test.ts:89.
  *     - A restarted engine is not told keyringSeen (e2ee-design.md §18.4 "keyringSeen is not in init.crypto", hostKeys.ts:48), so its own answer
  *       is "ok". The engine never pins: only main does (pluginController.ts:269, :296-301), and main refuses.
@@ -47,7 +47,7 @@
  *     hostile shapes, key-less, suite=0, key, re-key) x 9 device states goes through the protocol handler's
  *     routeSetupLink(parseSetupLink(params)) (registerUi.ts:220-225) to ignore, apply or pair, as §12.4 says;
  *     a pair route enrolls with a key-free /enroll body and attempt, and an apply route sends only pinSuite0
- *     {link} or installKey {qr}, never markCreating. Existing: pinGate.test.ts:243, pin.test.ts:64,
+ *     {link} or installKey {qr}, never markCreating. Existing: pinGate.test.ts:245, pin.test.ts:64,
  *     pin.test.ts:30, pluginController.test.ts:295.
  * (f) Unverified key -> "f. ...". 9 QR/RK keys without a matching k record x 3 seeds x {same engine, restart}:
  *     unpinned, 0 SecretStorage writes, 0 writes, no key bytes left on main. Existing: keyReader.test.ts:114,
@@ -374,7 +374,7 @@ function hostileServer(requests: Map<string, number>): RequestFn {
 function protocolParams(link: string, action?: string): Record<string, string> {
 	const params: Record<string, string> = {};
 	for (const [k, v] of new URL(link).searchParams) params[k] = v;
-	if (action !== undefined) params.action = action; // Obsidian may report the protocol action instead (host/ui/pairing.ts:828-830)
+	if (action !== undefined) params.action = action; // Obsidian may report the protocol action instead (host/ui/pairing.ts:823-825)
 	return params;
 }
 
@@ -587,7 +587,7 @@ async function keylessJoin(form: JoinForm, state: VaultState, seed: number, t: J
 	const initial = form === "resume" ? { ...defaultPluginData("Joiner"), pendingEnrollment: prepareEnrollment(input, randomBytes) } : defaultPluginData("Joiner");
 	const w = controllerWorld(clock, net, initial);
 	const { dev, ctl } = w;
-	// The relay knows the device by its enrolled deviceId (the engine's connect params, net.ts:97): hide k from that id
+	// The relay knows the device by its enrolled deviceId (the engine's connect params, net.ts:98): hide k from that id
 	// from the moment the attempt exists, before any engine connects.
 	const hiddenFrom = new Set<string>();
 	const hideFrom = (deviceId: string) => hideK && (hiddenFrom.add(deviceId), net.relay.hideFrom(deviceId as DeviceId, KEYRING_STREAM));
@@ -1079,7 +1079,7 @@ test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refuse
 		count(t.outcomes, `ctl pinSuite0 link=${await outcome(clock, ctl.command({ t: "pinSuite0", source: "link" }))}`);
 		// ... and so does this engine incarnation, which read the genesis before k was hidden (keyReader.ts:229).
 		count(t.outcomes, `engine-direct pinSuite0 link (same incarnation)=${await outcome(clock, w.direct({ t: "pinSuite0", source: "link" }))}`);
-		// The UI cannot clear the sticky flag (pinAcross keeps main's pin fields, pin.ts:151-157).
+		// The UI cannot clear the sticky flag (pinAcross keeps main's pin fields, pin.ts:144-150).
 		await settleOn(clock, ctl.updateData((d) => ({ ...d, e2ee: undefined, deviceLabel: "J2" })));
 		await settleOn(clock, ctl.updateData((d) => ({ ...d, e2ee: { suite: 0 } })));
 		count(t.pins, `after UI writes=${fp(ctl.data().e2ee)}`);
@@ -1355,7 +1355,7 @@ async function linkMatrix(out: Map<string, number>): Promise<void> {
 			out.set("route differs from §12.4", (out.get("route differs from §12.4") ?? 0) + (route.kind === want ? 0 : 1));
 			out.set("data changed by routing", (out.get("data changed by routing") ?? 0) + (fp(data) === before ? 0 : 1));
 			if (route.kind === "pair") {
-				// PairModal.submit sends {host, pairingCode, deviceName} (pairModal.ts:177); hand PairingSession the whole
+				// PairModal.submit sends {host, pairingCode, deviceName} (pairModal.ts:169); hand PairingSession the whole
 				// route anyway: the key must not reach /enroll or the persisted attempt.
 				const requests: HttpRequest[] = [];
 				const attempts: EnrollmentAttempt[] = [];
@@ -1484,7 +1484,7 @@ interface SealTally {
 	genesisOnRelay: boolean;
 }
 
-/** Wraps the seal and sealBlob of the device's raw crypto port (behind gatedCrypto, runtime/context.ts:129) once per engine. */
+/** Wraps the seal and sealBlob of the device's raw crypto port (behind gatedCrypto, runtime/context.ts:169) once per engine. */
 function tapSeals(d: SimDevice, t: SealTally, tapped: WeakSet<object>): void {
 	const c = d.vrt?.log.c;
 	if (!c) return;
@@ -1678,7 +1678,7 @@ function pinCensus(): Record<string, Record<string, number>> {
 	};
 	for (const f of files) {
 		const src = stripComments(readFileSync(f, "utf8"));
-		for (const m of src.matchAll(/(?<![.\w])(pinnedSuite0|pinnedSuite1|sawKeyring|markedCreating|withoutPin|withPin)\s*\(/g)) {
+		for (const m of src.matchAll(/(?<![.\w])(pinnedSuite0|pinnedSuite1|sawKeyring|markedCreating|withPin)\s*\(/g)) {
 			const line = src.slice(src.lastIndexOf("\n", m.index) + 1, src.indexOf("\n", m.index));
 			if (!/\bfunction\s/.test(line)) add(`call:${m[1]}`, f);
 		}

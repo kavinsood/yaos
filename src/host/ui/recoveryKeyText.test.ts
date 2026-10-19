@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { test } from "node:test";
-import { decodeRecoveryKey, encodeRecoveryKey, makeRecoveryKey } from "../../core/codec/recoveryKey";
+import { decodeRecoveryKey, encodeRecoveryKey, makeRecoveryKey } from "../../core/codec/testkit/recoveryKey";
 import {
 	formatRecoveryKey,
 	groupMatches,

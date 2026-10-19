@@ -5,9 +5,9 @@
  */
 
 import type { HashPort } from "../../ports/crypto";
-import { toHex } from "./sha256";
+import { bytesToHex } from "../codec/lib0";
 
 /** Lowercase hex SHA-256 of `bytes`. */
 export async function digestHex(hash: HashPort, bytes: Uint8Array): Promise<string> {
-	return toHex(await hash.sha256(bytes));
+	return bytesToHex(await hash.sha256(bytes));
 }

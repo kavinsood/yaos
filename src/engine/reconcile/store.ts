@@ -12,7 +12,7 @@ import { deflateSync, inflateSync } from "fflate";
 import type { ContentHash, DocId, PathKey, SyncedEntry } from "../../core/types";
 import { MAX_BASE_TEXT_CHARS } from "../../core/limits";
 import { markdownContentHash } from "../../core/hash/markdownLf";
-import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
+import { utf8Decode, utf8Encode } from "../../core/codec/lib0";
 import type { HashPort } from "../../ports/crypto";
 import type { StorageDb } from "../../ports/storage";
 import { STORE, type BaseTextRecord, type IntentRecord, type LocalTreeRecord, type SyncedRecord, type YaosSchema } from "../store/schema";

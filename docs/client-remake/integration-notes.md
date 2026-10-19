@@ -244,7 +244,7 @@ only the pure adapters (`noopCrypto`, `webHash`, `webClock`, `webRandom`,
 - **Pass scheduling.** PassScheduler runs scoped passes on fold/observation
   events and full passes on a 5-15 min cadence (full passes also re-read
   settings). Unproductive passes back off; a blob retry timer is armed at the
-  earliest due transfer that is not running (+5 ms, `passScheduler.ts:181`,
+  earliest due transfer that is not running (+5 ms, `passScheduler.ts:158`,
   `blobQueue.ts:274-278`), and a settled transfer requests a pass over its
   docs (`vaultRuntime.ts:240`).
 - **S1 own fold.** Own ns frames move the synced tree forward only when they
@@ -327,11 +327,21 @@ devices).
 | 42 | The user renamed n2 -> r5 and created a new n2.md before ns was ready while a peer moved the doc n2 -> r1. The re-occupied-source inference (bug 19) only looked at docs whose remote path was still the synced path, so the new n2.md was carried to r1.md as the doc's file and r5.md became a new doc. | sim seed 21 F DEV3 | b6e2686: the observed rename wins over a concurrent remote move as well (nsRename to r5); the file at the old path is planned as new once S has left it. |
 | 43 | A local delete that waited (`pending-body` or ns not ready, D12) left S in place, so a new file the user then created at the path merged into the old doc as a save. The diff kept fragments of the old text, the peer's concurrent delete of that text took them, and a token of the new note was lost. | heavy seed 92 (fix sweep: heavy 22, DEV5 F 140) | e3982bc: the waiting delete is decided (`SyncedEntry.fileGone`): the file at S's path is a new file from then on, and is created once the delete has gone out (a productive pass's follow-up covers the paths it vacated). A file at the doc's remote path is still its own (heavy 22: an own rename marked offline). See D17. |
 | 44 | A renamed the open note n6 -> r4 before ns was ready (a waiting delete, D17) and another note n4 -> r2, while a peer moved the doc n6 -> r2. The first ns-ready pass took the file at r2, the doc's remote path, as the doc's own: the other note merged into the doc as a conflict, r4 became a duplicate doc, and the views on r4 stayed bound to the old doc. That doc's merge never wrote r2 (a bound doc waits for the editor's save, and that save could only reach r4). | sim seed 452 F DEV3 | 5735ad5: a file that an observed rename brought from another path is not the doc's (`localFor`, `remoteOwns`), so the doc follows its own rename and the other note is a new doc. Engine side: `BoundDocs.path` follows vault renames (the views move with the file), and a pass that creates a doc at a bound view's path retargets those views to it. |
+| 45 | `SnapshotJob.takeNow` used the clock reading as `createdAtMs` and built the id from it. The id holds whole ms and the record check requires the two to match, so a clock reading fractional ms (ClockPort allows it; the sim's does) failed every snapshot with "createdAtMs does not match the id". | sim seed 688 F DEV3 (checkpoint coverage round) | 2a2b1ebb: `createdAtMs` is floored before the id is built. |
+| 46 | Offline, A edited n2.md and renamed it r6.md while a peer deleted the doc and created a new n2.md. Rename inference only paired live docs, so the deleted doc was dropped; the observed rename then paired with the new n2 doc once it was materialized, and A's text merged into its body. | sim seed 157 F DEV5 (checkpoint coverage round) | 007b029d: remotely deleted docs take part in observed-rename inference; a doc paired so is restored at the new path (the unseen rename wins, E6), with a content reconcile when the file changed. Before ns is ready such a record is kept, not dropped. DESIGN §f table updated. |
+| 47 | A fold row stored unopened (reader-dependent gate failure) whose re-gate came out "accounted only" (a snap row `k` judged stale-epoch, e2ee-design §9.3) was skipped by `regateUnopened`: it stayed unopened and the snap fold stayed halted behind it for good. | sim heavy E2EE seed 42 (suite 1) | facea307: such a row leaves the tail (`tReplaceTail` `drop`), as a reader that gated it so at first never stored it; the fold resumes. |
+| 48 | After an IDB wipe, S for B's attachment came back from a mirror older than the fold's suffix move (a2 -> "a2 (2)"); C's attachment had taken a2. The planner took C's file as the doc's, trashed B's own file at the remote path as a stray copy (bug 38's rule) and pushed C's bytes as an edit of B's attachment. | sim seed 630 F DEV3 (production checkpoint thresholds) | e3b46533: when the file at S's path holds other bytes and the file at the remote path holds S's bytes, still the doc's remote bytes, the doc's file is the one at the remote path (D18). |
+| 49 | A crashed after its ns frame committed and before the receipt; a peer's ns checkpoint at lastSeq retired the stream (H7). A restarted, adopted the checkpoint (covering the frame) and resent the frame, which the relay deduped at its old seq. The receipt put the frame back in the overlay as committed-not-folded, but its row lay under the snapshot: one pending ns frame for good. The sim's dedupe window lost retired rows (the resend was appended again), which hid it. | sim heavy seed 27 (the "pending ns frames" failures) | 58eca457: receipts carry their commit seq to `noteCommitted`; a frame whose seq the fold already covers is not pending. |
 
 Sim-only fixes found on the way (no client change): epoch names reused across
 resets, one global clock skew instead of per-device, ledger coverage of
 deletes, JSON settings `{}` equal to a missing file (D6), the heal loop
-waiting on the blob queue.
+waiting on the blob queue. From the checkpoint coverage round (89c5accd,
+§6.1): RelayStore did not retire a stream on a checkpoint at lastSeq (server
+H7; the retired rows stay in its dedupe window, as H2 keeps their keys), sim
+device ids were shorter than the relay's 16 characters (every snap
+row was ignored), and quiescence ignored blob store calls outside the blob
+queue and a running snapshot job.
 
 ## 4. Deviations from DESIGN
 
@@ -343,7 +353,7 @@ waiting on the blob queue.
 | D4 | §j.1 | When the relay's capabilities can't be read at startup (offline), the engine assumes the HTTP blob store exists and lets the blob queue retry. | An offline start must not run store-less: that device would not sync attachments and would freeze an oversized update `oversize-local` (`src/engine/runtime/docRuntime.ts:153-159`). (The original reason, one attachment sent as a blob ref by one device and as `x:` chunks by another, went away with the `x:` carrier.) |
 | D5 | §c.12 | `intent{epoch-migration}` is not written. A crash in the middle of a migration restarts on the newest DB (the new epoch): the path bases are gone (no-base handling) and the old DB is not deleted. | Epoch resets are rare operator actions; the snapshot taken before migration (step 1) keeps every file version. |
 | D6 | §j.3 | A JSON settings file whose fold has no keys is not created on peers (a local `{}` and a missing file are the same state). | JSON files are per-key registers; an empty register set has no file identity to project. The sim's settings invariant compares them as equal. |
-| D7 | §l.3 | Sim invariants #4 (fold determinism, V3 digests) and #6 (resource bounds) are not checked by the sim runner. | #4 is covered by WP-A's 10k-op fold fuzz, #6 by WP-C's runtime tests and benchmarks. V3 digests are not implemented (see gaps). |
+| D7 | §l.3 | Sim invariant #6 (resource bounds) is not checked by the sim runner as an invariant. #4 (fold determinism) is, since the checkpoint coverage round (§6.1): every device's ns, cfg and snap fold encodings must equal each other's and the oracle's, which folds from whatever checkpoints the relay holds. | #6 is covered by WP-C's runtime tests and benchmarks. Before §6.1 the note here said every checkpoint a sim device adopts passes V1 + V2; the sim adopted almost none. |
 | D8 | §f.2 / §j.1 | The blob queue drops transfers the plan no longer wants after every full unbraked pass (keeps settings blobs and docs with open intents). | Not in DESIGN; without it a superseded transfer stayed due forever (bug 14). |
 | D9 | §i | Blob retry backoff is monotonic in memory; the persisted wall time is only clamped to the backoff on reopen. | A wall clock jump must not park uploads (bug 12). |
 | D10 | §i.4 | A settings change that touches reconcile or cfg options restarts the vault runtime (with the listing replayed). | Simpler than hot-swapping options in the planner and CfgSync; settings changes are rare. |
@@ -354,6 +364,7 @@ waiting on the blob queue.
 | D15 | §f.6 | An observed rename onto the path of a remote doc never materialized here moves the renamed doc; the remote doc waits for the path (bug 34). | The file came from the rename source, so it is the moved doc's; merging it into the remote doc made the bound editor refuse writes and every pass add a conflict copy. |
 | D16 | §f.2 | A remote move whose target holds an untracked copy of the doc's own bytes trashes that copy (no sync op, `diskTrash` with a hash precondition, braked like any trash), then moves (bug 38). Other bytes at the target are a new file (created; the move waits). | The copy can never be created (it folds as a duplicate of the doc moving in), so the move would wait forever. Trash keeps the bytes. |
 | D17 | §c.7, §f.2 | A local delete that has to wait marks `SyncedEntry.fileGone` (bug 43): the delete is decided at the first pass that sees the file missing, even offline or before ns is ready. A file then at S's path is a new doc (created after the delete goes out), not a save of the old one. The mark is a braked `nsDelete` unit (rejecting the brake re-materializes the doc); the later `nsDelete` is not braked again. Edit beats delete still applies while waiting: with a remote edit the doc re-materializes at its remote path, or, if the new file sits at that same path, the file merges into the doc (the mark is cleared). The mark is not in the synced mirror. | DESIGN treats delete-then-create at one path as a save. Merging an unrelated new note into the old doc lost text (the diff keeps fragments of the old text, which a peer's concurrent delete then removes). Rename inference is off before ns is ready, so a file at the doc's remote path stays its own, unless an observed rename brought it there from another path (bug 44). |
+| D18 | §f.2 | `localFor` takes the file at the doc's remote path instead of the one at S's path when the latter holds other bytes and the former holds S's bytes, which are still the doc's remote bytes. | S can be behind a move of its doc (restored from a mirror older than the move, after an IDB loss) while another doc's file sits at S's old path (bug 48). Nothing is trashed or overwritten by the rule, and any doubt (a remote change since S, unhashed files) leaves the old lookup. |
 
 ## 5. Honest gaps
 
@@ -365,7 +376,8 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - The fallback restore duty has no 30 s grace and no hash timer (D11); a
   delete waits while the deleter's own body frames are unsequenced, so a body
   record stuck in the outbox (poisoned) holds that delete until it is resolved.
-- Divergence (V3 digest) is not implemented; `divergence` is always false.
+- Devices do not compare ns fold digests (DESIGN §b.5): a checkpoint that
+  passes V1 + V2 but is not the fold of its rows is adopted without alarm.
 - Bootstrap progress is null in status. `conflictCopiesToday` (0db3bb7) is
   kept in memory: it restarts at 0 with the engine and does not count copies
   made from an open editor.
@@ -402,7 +414,7 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - Live creates (§7.2, DESIGN §d.4) send their body frames right behind the
   ns create. When such a create folds `merged` (two devices create the same
   path with the same content within one round trip, outside onboarding), its
-  unsent and unreceipted frames are deleted (`engine/sync/nsRuntime.ts:141-144`),
+  unsent and unreceipted frames are deleted (`engine/sync/nsRuntime.ts:149-152`),
   but the frames the relay already committed stay as junk rows on the loser's
   stream; nobody materializes them, but they cost rows until the stream is
   retired. A create ignored as `invalid-path` / `kind-mismatch` sends its
@@ -414,18 +426,18 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   wait up to `NS_CORK_MAX_MS` (2 s, `sender.ts:44`, `:304-314`).
 - An engine restart turns un-folded live creates back into held ones: the
   start rebuilds `pendingCreates` from the outbox with `live: false`
-  (`engine/runtime/engine.ts:200-203`), so body frames built after the restart
+  (`engine/runtime/engine.ts:161-164`), so body frames built after the restart
   wait until the create folds (two commits to a peer instead of one).
 - `duplicate-docid` creates are not re-planned (DESIGN said so; nothing did):
   the fold ignores the create (`core/ns/fold.ts:120`), its frames are released
-  to the existing doc (`nsRuntime.ts:145-146`), and devices converge on one doc
+  to the existing doc (`nsRuntime.ts:153-154`), and devices converge on one doc
   with both texts. It needs a 128-bit docId collision.
 - Settings writes have a read→write gap with no precondition.
   `CfgSync.applyWrite` reads the file, compares its fingerprint (a HashPort
   digest) and, for a file stored as a blob, downloads it, then writes
-  (`engine/settings/cfgSync.ts:208-226`). `ConfigDirPort.writeBytes` takes no
+  (`engine/settings/cfgSync.ts:214-232`). `ConfigDirPort.writeBytes` takes no
   precondition (`ports/vault.ts:89`), the engine's adapter sends `any`
-  (`engine/compose/hostLink.ts:169-171`), and the host writes without
+  (`engine/compose/hostLink.ts:165-167`), and the host writes without
   re-checking (`host/diskExecutor.ts:220-224`). A settings file that Obsidian
   or a plugin changes between the read and the write is overwritten: the
   change is not merged and no copy is kept.
@@ -435,9 +447,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   `MAX_BLOB_UPLOAD_BYTES` = 100,000,000 and advertises it as
   `maxBlobUploadBytes` (`server/src/router.ts:43`, `:286`). The client takes
   the advertised cap (`engine/adapters/httpBlob.ts:508-510`), or its own
-  `MAX_BLOB_UPLOAD_BYTES` (`core/limits.ts:188`) when capabilities can't be
+  `MAX_BLOB_UPLOAD_BYTES` (`core/limits.ts:185`) when capabilities can't be
   read (`httpBlob.ts:327`); under suite 1 the plaintext cap is what fits once
-  sealed, 98,566,143 (`maxSealedBlobPlaintext`, `core/codec/sealedBlob.ts:34-46`).
+  sealed, 98,566,143 (`maxSealedBlobPlaintext`, `core/codec/sealedBlob.ts:29-41`).
   On 2026-10-07 (UTC) the deployed Cloudflare worker accepted a full
   100,000,000-byte PUT (suite 0) and a 98,566,175-byte sealed PUT (suite 1),
   both verified on the peer
@@ -510,11 +522,11 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   (cap 8 MiB per blob on that config). The `x:` carrier was later deleted:
   without a blob store, attachments are not synced.
 - Pairing a paired device again tries to revoke the replaced enrollment with
-  its own token, `DELETE /vault/:id/auth/device` (`host/ui/pairing.ts:503-516`,
-  called from `host/ui/pairModal.ts:195` and `host/plugin.ts:34`). The
+  its own token, `DELETE /vault/:id/auth/device` (`host/ui/pairing.ts:498-511`,
+  called from `host/ui/pairModal.ts:187` and `host/plugin.ts:34`). The
   rewritten server has no such route and answers 404 (`server/src/router.ts:588`),
   so every such pairing shows "Could not remove the old server membership.
-  Remove it from the old server console." (`host/ui/pairing.ts:493`), and the old
+  Remove it from the old server console." (`host/ui/pairing.ts:488`), and the old
   device stays enrolled until the operator revokes it in the console.
 
 **Host**
@@ -570,9 +582,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   with B offline, ends on both devices as `a.md` = "start one" and
   `a (conflict A <time>).md` = "start one two three". Nothing is lost.
 - Tablets in the background (DESIGN §i.4). A tablet's `hidden` only flushes
-  and keeps the socket and lanes 3–4, like a desktop's
-  (`engine/compose/vaultRuntime.ts:574-575`); phone and constrained devices
-  pause lanes 3–4 and close the socket after `HIDDEN_CLOSE_MS` (30 s, `:97`).
+  and keeps the socket and background work (DESIGN §i.1), like a desktop's
+  (`engine/compose/vaultRuntime.ts:576-577`); phone and constrained devices
+  pause background work and close the socket after `HIDDEN_CLOSE_MS` (30 s, `:97`).
   The reason recorded with 4a14c02 is gone: the engine could not tell an iPad
   from a desktop running the engine inline, which `deviceClassFor` ran as
   `tablet`. There is no inline carrier now, and `deviceClassFor` returns
@@ -685,6 +697,57 @@ while a device is backgrounded, and external writes still run (DESIGN §l.1).
 At 1a69e4a the sweep found no bad seeds: 3 devices with faults, seeds
 1-1000; 5 devices, 1-250; heavy, 1-500. The same 1000-seed sweep at 9b618d5
 found none either.
+
+
+### 6.1 Checkpoint coverage (branch client-remake-audit-sim)
+
+With DESIGN's thresholds a 120-step run never wrote an ns, cfg or snap
+checkpoint, wrote 413 body checkpoints in 1951 runs, and never collected
+a row (the sim relay also lacked the server's H7 retire). Since
+89c5accd `runSim` defaults to `checkpoints: "scaled"`: `checkpointWorld`
+draws per seed, from the seed alone, the compaction / checkpoint / candidate
+thresholds and timers (engine tuning only, not production limits), the
+relay's seal size, a fallback that races the duty device in a third of the
+seeds, a late joining device in about a third of the suite-0 seeds (fresh,
+after GC), and snapshots with uploads in 40%. `"production"` keeps the old
+world. The relay counts checkpoint puts by class and outcome, GCs and served
+pages; the engine reports adoptions and fold checkpoints written with own
+frames pending (e1942ae2). New invariants: identical fold encodings on every
+device and the oracle, no checkpoint disputed for a reader-independent
+reason, no stream frozen, stale or behind the relay after the heal.
+
+Default suite (`YAOS_SIM_CRYPTO=none YAOS_SIM_SEEDS=750 node
+scripts/sim-suite1.mjs`, 1951 runs), summed over the five matrices:
+
+| Class | Before: puts ok / CAS conflict | GC puts (rows) | adopted: devices (behind) / oracle | After: puts ok / CAS conflict | GC puts (rows) | adopted: devices (behind) / oracle |
+|---|---|---|---|---|---|---|
+| body | 413 / 5 | 0 | 0 / 6 | 38365 / 6208 | 38222 (81892) | 9260 (4092) / 12730 |
+| ns | 0 | 0 | 0 / 0 | 6368 / 1216 | 4203 (28376) | 1532 (758) / 1832 |
+| cfg | 0 | 0 | 0 / 0 | 1818 / 149 | 812 (1910) | 349 (89) / 1292 |
+| snap | 0 | 0 | 0 / 0 | 1400 / 222 | 1247 (3281) | 406 (189) / 678 |
+| canvas | 0 | 0 | 0 / 0 | 0 | 0 | 0 |
+
+"Behind" counts adoptions by a device that already had the stream (offline,
+crashed or wiped across a checkpoint and its GC). 447 ns, 9 cfg and 9 snap
+checkpoints were written with own frames of the stream pending. No
+checkpoint was refused at the gate in suite 0. Wall time: 318 s before, 274
+s after on the same machine (p50 per run unchanged within noise). Canvas
+has no coverage: the actors never create a canvas.
+
+The round found bugs 45-49 (§3) and the sim-only fixes listed under the
+table there. Bug 49 is the "pending ns frames" failure seen before the
+round; it needed the sim relay to keep retired rows in its dedupe window as
+the server does. Final state: the scaled sweep above and the same sweep with
+`YAOS_SIM_CHECKPOINTS=production` are clean (1951 runs each).
+
+Open: in suite 1 (`npm run test:sim-suite1`) 21 of 720 runs fail, all from
+one cause. A checkpoint whose gate failure depends on the reader
+(`crypto-unknown-key` before a key arrives, `keyring-hold` before `k` is
+judged) is treated as disputed by `catchUp.readStream`: the stream is re-read
+without it and, its rows collected, frozen `checkpoint-disputed` for good.
+With such failures returning `retry` instead (an experiment, not committed)
+all 21 runs pass. That branch is being reworked separately
+(newer fold rules), so it is left as it is here.
 
 
 ## 7. End-to-end results
@@ -826,7 +889,7 @@ results below predate that.
    notes waited behind them in the same pass (`att/` sorts first). The read
    timeline showed it: single ~55 KB reads back to back from 1.7 s to 6.5 s,
    after catch-up had already put every `x:` stream in the local tail
-   (rank 4, `engine.ts:59` at ba01198) at 3.4 s. Fixes: blob jobs prefetch the next
+   (rank 4, `engine.ts:53` at ba01198) at 3.4 s. Fixes: blob jobs prefetch the next
    downloads while the current op runs (`BlobQueue.prefetch`, window
    `blobConcurrency - 1`, held bytes <= `maxDiskIoBytesInFlight`, leftovers
    dropped after the pass; 9a76b06), and `readBlobChunks` assembles from the

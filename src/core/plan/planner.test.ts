@@ -4,8 +4,8 @@ import type { DocId, LocalEntry, Plan, PlannerInput, PlannerOp, RemoteEntry, Syn
 import { EMPTY_CONTENT_HASH, plan, planWith } from "./planner";
 import { brakeId, DEFAULT_BRAKE } from "./brake";
 import { refHashPort } from "../hash/testkit/hashRef";
-import { L, R, S, V, fp, h, id, input, pk, type Scenario } from "./planFixtures";
-import { prng } from "../merge/prng";
+import { L, R, S, V, fp, h, id, input, pk, type Scenario } from "./testkit/planFixtures";
+import { prng } from "../merge/testkit/prng";
 
 const opsOf = (p: Plan): string[] => p.ops.map((o) => o.op);
 const find = <K extends PlannerOp["op"]>(p: Plan, k: K): Extract<PlannerOp, { op: K }> => {
@@ -69,6 +69,27 @@ test("row live/present/present: remote move onto an untracked copy of the doc's 
 	const other = run({ ...base, local: [L("a.md", h("c1")), L("b.md", h("c9"))] });
 	assert.ok(!opsOf(other).includes("diskTrash") && !opsOf(other).includes("diskRename"), JSON.stringify(opsOf(other)));
 	assert.equal(find(other, "nsCreate").path, "b.md");
+});
+
+test("row live/present/present: S behind a move (stale mirror), the doc's bytes at R.path and other bytes at S.path -> the doc is at R.path", () => {
+	// Sim seed 630 F DEV3 (production checkpoints): after an IDB loss B's S for its attachment came back from a mirror
+	// older than the fold's suffix move a2 -> "a2 (2)"; C's attachment had taken a2. The planner trashed B's own
+	// file at "a2 (2)" as a copy, moved C's file there and pushed C's bytes as an edit of B's attachment.
+	const base = { remote: [R("d9", "a (2).png")], synced: [S("d9", "a.png")] };
+	const p = run({ ...base, local: [L("a.png", h("b9")), L("a (2).png", h("b0"))] });
+	assert.deepEqual(p.ops, [{ op: "syncedPut", entry: { ...S("d9", "a (2).png"), fingerprint: fp("b0") } }]);
+	// next pass, S moved: the other file is new
+	const next = run({ ...base, synced: [S("d9", "a (2).png", { fingerprint: fp("b0") })], local: [L("a.png", h("b9")), L("a (2).png", h("b0"))] });
+	assert.deepEqual(opsOf(next), ["nsCreate", "pushBlob"]);
+	assert.equal(find(next, "nsCreate").path, "a.png");
+	// the remote changed the doc since S: no claim from bytes (the file at S.path stays the doc's, as before)
+	const changed = run({ remote: [R("d9", "a (2).png", { blob: { hash: h("b5"), size: 10, rev: 51 } })], synced: [S("d9", "a.png")], local: [L("a.png", h("b9")), L("a (2).png", h("b0"))] });
+	assert.equal(find(changed, "conflictCopy").from, "a.png");
+	assert.ok(!changed.ops.some((o) => o.op === "syncedPut" && o.entry.docId === "d9" && o.entry.path === "a (2).png"));
+	// markdown: the same rule, through the remote text hash
+	const md = planWith(input({ remote: [R("d1", "b.md")], synced: [S("d1", "a.md")], local: [L("a.md", h("c9")), L("b.md", h("c0"))] }), { remoteTextHash: new Map([[id("d1"), h("c0")]]) });
+	assert.deepEqual(opsOf(md), ["syncedPut"]);
+	assert.equal(find(md, "syncedPut").entry.path, "b.md");
 });
 
 test("row live/present/present: markdown content Rc / Lc / both -> reconcileContent", () => {
@@ -306,6 +327,30 @@ test("row live/present/absent: a delete that waits marks fileGone; a file re-cre
 test("row deleted/present/absent -> syncedDrop", () => {
 	const p = run({ remote: [R("d1", "a.md", { state: "deleted", deletedSeq: 41 })], synced: [S("d1", "a.md")] });
 	assert.deepEqual(p.ops, [{ op: "syncedDrop", docId: "d1" }]);
+});
+
+test("row deleted/present/absent, the file renamed here (observed) -> nsRestore at the new path; the source path's new doc is not paired", () => {
+	// Sim DEV5 F seed 157: offline, A edited and renamed n2 -> r6 while a peer deleted the doc and re-created n2.
+	// The doc was dropped and the observed rename then paired with the new n2 doc: A's text merged into its body.
+	const del = R("d1", "a.md", { state: "deleted", deletedSeq: 41 });
+	const recreated = R("d2", "a.md");
+	const gone: SyncedEntry = { ...S("d1", "a.md"), fileGone: true };
+	const renames = [{ from: "a.md", to: "b.md", atMs: 1 }];
+	const edited = run({ remote: [del, recreated], synced: [gone], local: [L("b.md", h("c1"))], over: { renames } });
+	assert.deepEqual(edited.ops.filter((o) => o.op !== "diskMaterialize"), [
+		{ op: "nsRestore", docId: "d1", path: "b.md", againstDeleteSeq: 41 },
+		{ op: "reconcileContent", docId: "d1", path: "b.md", kind: "markdown", hasBase: true },
+	]);
+	assert.deepEqual(find(edited, "diskMaterialize"), { op: "diskMaterialize", docId: "d2", path: "a.md", expect: { t: "absent" } });
+	// unedited: the rename alone still wins over the unseen delete (E6); the synced record follows the file
+	const { fileGone: _g, ...live } = gone;
+	const same = run({ remote: [del], synced: [gone], local: [L("b.md", h("c0"))], over: { renames } });
+	assert.deepEqual(same.ops, [
+		{ op: "nsRestore", docId: "d1", path: "b.md", againstDeleteSeq: 41 },
+		{ op: "syncedPut", entry: { ...live, path: "b.md", pathKey: "b.md" } },
+	]);
+	// before ns is ready (no inference) the record is kept, not dropped
+	assert.deepEqual(planWith(input({ remote: [del], synced: [gone], local: [L("b.md", h("c1"))], over: { renames } }), { nsReady: false }).ops, []);
 });
 
 test("row deleted/present/present unchanged -> diskTrash(expect S hash) + syncedDrop; restore duty -> nsRestore", () => {
@@ -697,7 +742,7 @@ test("brake: mass-delete-local holds above max(minCount, ratio*|S|)", () => {
 	assert.equal(goneAll.ops.filter((o) => o.op === "nsDelete").length, 51);
 });
 
-test("brake: mass-delete-remote, listing-shrank, conflict-flood, ns-divergence", () => {
+test("brake: mass-delete-remote, listing-shrank, conflict-flood", () => {
 	const trash = (n: number) => {
 		const sc = deletes(0, 100);
 		return { ...sc, remote: sc.remote!.map((r, i) => (i < n ? { ...r, state: "deleted" as const, deletedSeq: 70 } : r)) };
@@ -728,10 +773,6 @@ test("brake: mass-delete-remote, listing-shrank, conflict-flood, ns-divergence",
 	assert.equal(flood.held.length, 201);
 	const under = planWith(input({ remote: remote.slice(1), local: local.slice(1) }), { remoteTextHash: hashes });
 	assert.equal(under.brake, null);
-
-	const div = run(deletes(1, 100), { divergence: true });
-	assert.equal(div.brake?.reason, "ns-divergence");
-	assert.equal(div.ops.filter((o) => o.op === "nsDelete").length, 0);
 });
 
 test("brake: id is stable across re-plans (fresh ids, time, map order) and approval releases exactly that set", async () => {

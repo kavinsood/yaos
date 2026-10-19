@@ -1,8 +1,8 @@
 /**
  * Sender (DESIGN §d.4, §d.5, §d.6, §i.1, §i.6).
  *
- * Sends `pending`/`sent` outbox records (both are "maybe sent" after any
- * restart; correctness relies only on idempotence, R4) in lane order, then
+ * Sends `pending` outbox records ("maybe sent": in-flight state is this
+ * sender's memory only; correctness relies only on idempotence, R4) in rank order (RANK), then
  * outbox order, within:
  *  - a token bucket (APPEND_BYTES_PER_SEC, halved for 10 min after backpressure);
  *  - maxInflightAppendBytes of sent-unreceipted bytes (one frame always allowed);
@@ -31,8 +31,9 @@
  *    bodies leave together.
  */
 
+import { EnvelopeFlag } from "../../core/envelope";
 import { APPEND_BYTES_PER_SEC, NS_SEND_WINDOW, RELAY_CLOSE } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, type ClientFrameId, type StreamName } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, streamClass, type ClientFrameId, type StreamName } from "../../core/types";
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { RelaySession, RefusalReason } from "../../ports/relay";
 import type { OutboxRecord } from "../store/schema";
@@ -44,13 +45,35 @@ export const DURABILITY_RETRY_MS = 1_000;
 export const NS_CORK_MAX_MS = 2_000;
 const MAX_BURST = 1024 * 1024;
 
+/** Send ranks (DESIGN §i.1), lowest first. */
+export const RANK = {
+	/** Body frames of open notes: own edits and adopted copies of a peer's. */
+	hot: 0,
+	/** ns and cfg: the folds every device needs before it can plan. */
+	nsCfg: 1,
+	/** snap and every other body frame (imports, merges, reconcile writes). */
+	background: 2,
+} as const;
+
+/**
+ * A record's rank. Adopted frames are hot whether or not the note is still open: they exist only for bound docs
+ * (DocRuntime.onProvisional), there are few of them, and a peer edit the relay dropped must not wait behind a
+ * bulk import that the token bucket meters out over minutes.
+ */
+export function sendRank(rec: Pick<OutboxRecord, "stream" | "flags">, bound: (stream: StreamName) => boolean): number {
+	const cls = streamClass(rec.stream);
+	if (cls === "ns" || cls === "cfg") return RANK.nsCfg;
+	if (cls === "snap") return RANK.background;
+	return (rec.flags & EnvelopeFlag.adopted) !== 0 || bound(rec.stream) ? RANK.hot : RANK.background;
+}
+
 export interface SenderDeps {
 	readonly clock: ClockPort;
-	/** Rank: 0 bound body, 1 ns, 2 cfg, 3 snap / background body, 4 adopted. */
+	/** RANK of a record (sendRank); lower goes first. */
 	rankOf(rec: OutboxRecord): number;
 	maxInflightBytes(): number;
-	/** Lazy T_sent (diagnostics only). */
-	onSent(rec: OutboxRecord, attempts: number): void;
+	/** A record was written to the session (`attempts` counts this sender's writes of it). Observation only. */
+	onSent?(rec: OutboxRecord, attempts: number): void;
 	onPoison(rec: OutboxRecord, why: string): void;
 	onForbidden(): void;
 	/** waitMs: the hold; retryAfterMs: the relay's delay to its reset, null when it did not say. */
@@ -188,15 +211,15 @@ export class Sender {
 		this.pump();
 	}
 
-	/** Add or replace a sendable record (pending / sent). Other states are removed. */
+	/** Add or replace a sendable (pending) record. Other states are removed. */
 	upsert(rec: OutboxRecord): void {
-		if (rec.state !== "pending" && rec.state !== "sent") {
+		if (rec.state !== "pending") {
 			this.remove(rec.clientFrameId);
 			return;
 		}
 		const e = this.entries.get(rec.clientFrameId);
 		if (e) e.rec = rec;
-		else this.entries.set(rec.clientFrameId, { rec, attempts: rec.attempts, retryAtMono: 0 });
+		else this.entries.set(rec.clientFrameId, { rec, attempts: 0, retryAtMono: 0 });
 		this.dirty = true;
 		this.schedule(0);
 	}
@@ -332,7 +355,7 @@ export class Sender {
 		});
 	}
 
-	/** Lane rank, then outbox order. A frame waiting for another record sorts at that record's rank or later. */
+	/** Rank, then outbox order. A frame waiting for another record (its create) sorts at that record's rank or later. */
 	private order(): Entry[] {
 		if (this.dirty) {
 			const own = new Map<ClientFrameId, number>();
@@ -432,7 +455,7 @@ export class Sender {
 			this.stats.appends++;
 			this.stats.bytes += bytes;
 			s.append({ stream: e.rec.stream, clientFrameId: cfid, payload: e.rec.sealed });
-			this.deps.onSent(e.rec, e.attempts);
+			this.deps.onSent?.(e.rec, e.attempts);
 		}
 		if (nextWake < Infinity) this.schedule(nextWake);
 	}

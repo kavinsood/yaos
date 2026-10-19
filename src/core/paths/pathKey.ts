@@ -55,14 +55,3 @@ export function pathKey(path: VaultPath): PathKey {
 	return foldKey(path) as PathKey;
 }
 
-/** Keys of every prefix: "A/b/c.md" -> ["a", "a/b", "a/b/c.md"]. */
-export function prefixKeys(path: VaultPath): PathKey[] {
-	const segs = path.split("/");
-	const out: PathKey[] = [];
-	let acc = "";
-	for (let i = 0; i < segs.length; i++) {
-		acc = i === 0 ? foldKey(segs[i]!) : `${acc}/${foldKey(segs[i]!)}`;
-		out.push(acc as PathKey);
-	}
-	return out;
-}

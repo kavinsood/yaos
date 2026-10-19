@@ -245,11 +245,11 @@ export type AttachmentCleanupRefusal =
 
 export type MainToEngine =
 	| { readonly t: "init"; readonly rid: RequestId; readonly config: EngineInitConfig }
-	| { readonly t: "shutdown"; readonly rid: RequestId; readonly reason: "unload" | "restart" | "epoch-switch" }
+	| { readonly t: "shutdown"; readonly rid: RequestId }
 	| { readonly t: "lifecycle"; readonly event: LifecycleEvent }
 	| { readonly t: "ping"; readonly rid: RequestId }
 	/** Full listing (complete=true on the last chunk) or incremental re-stats. */
-	| { readonly t: "observations"; readonly rid: RequestId; readonly scanId: number; readonly chunk: readonly LocalObservation[]; readonly complete: boolean }
+	| { readonly t: "observations"; readonly rid: RequestId; readonly chunk: readonly LocalObservation[]; readonly complete: boolean }
 	/** Batched vault events (hints), <= 50 ms or 256 events per message. */
 	| { readonly t: "vaultEvents"; readonly events: readonly VaultEvent[] }
 	| { readonly t: "openDoc"; readonly rid: RequestId; readonly path: VaultPath; readonly viewId: number }
@@ -323,7 +323,7 @@ export type EngineToMain =
 	 * Doc identity changed under a bound view (merged alias, remote rename, delete, freeze), or (`resync`) the
 	 * engine dropped body events past 4x the credit window: the host re-binds those views.
 	 */
-	| { readonly t: "docRetarget"; readonly docId: DocId; readonly change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "deleted" } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" } }
+	| { readonly t: "docRetarget"; readonly docId: DocId; readonly change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" } }
 	/** A path became bindable (e.g. its create was planned): host retries openDoc for open views. */
 	| { readonly t: "bindable"; readonly path: VaultPath }
 	| { readonly t: "readRequest"; readonly rid: RequestId; readonly reads: readonly DiskReadRequest[] }
@@ -342,9 +342,7 @@ export type EngineToMain =
 		readonly records: readonly Uint8Array[]; readonly pending: number | null }
 	| { readonly t: "status"; readonly status: StatusSnapshot }
 	| { readonly t: "brake"; readonly report: BrakeReport }
-	| { readonly t: "notice"; readonly level: "info" | "warn" | "error"; readonly code: string; readonly message: string }
-	/** Engine cannot continue (version mismatch, storage unusable after retries). */
-	| { readonly t: "fatal"; readonly error: ProtocolError };
+	| { readonly t: "notice"; readonly level: "info" | "warn" | "error"; readonly code: string; readonly message: string };
 
 export type EngineResultValue =
 	| { readonly t: "ready"; readonly protocolVersion: number; readonly vaultEpoch: VaultEpoch | null; readonly recovered: boolean }
@@ -369,12 +367,14 @@ export type EngineResultValue =
 	/** cleanUpAttachments. keptNewer: unreferenced but uploaded within the grace; repaired / lost: deleted, then found referenced. */
 	| { readonly t: "attachmentsCleaned"; readonly deleted: number; readonly keptNewer: number; readonly repaired: number; readonly lost: number; readonly refused: AttachmentCleanupRefusal | null; readonly detail: string | null };
 
-/** Priority lanes (DESIGN §i.1); also tags disk batches so the host executes higher lanes first. */
-export type Lane = 0 | 1 | 2 | 3 | 4;
+/**
+ * Disk-batch lanes (DESIGN §i.1): the host runs the next op of an openNote batch before any background one. Only
+ * diskOps carry a lane; reads go straight to the vault in arrival order.
+ */
+export type Lane = 0 | 1;
 export const LANE = {
+	/** Writes for an open note that the user is waiting on (boundDisk's conflict copy). */
 	openNote: 0,
-	openCatchUp: 1,
-	namespace: 2,
-	background: 3,
-	bulk: 4,
+	/** Everything else: reconcile writes, materialization, restores, settings. */
+	background: 1,
 } as const;

@@ -1,6 +1,6 @@
 /**
  * Periodic engine work (one tick every maintenanceMs, never overlapping):
- * gap feed (DESIGN §d.7), lazy T_sent, local compaction (§d.8), remote
+ * gap feed (DESIGN §d.7), local compaction (§d.8), remote
  * checkpoint duty (§d.9), daily-limit release, residency budget, catch-up
  * scheduling.
  */
@@ -57,7 +57,6 @@ export class Maintenance {
 		this.stats.ticks++;
 		const steps: [string, () => Promise<void> | void][] = [
 			["gap", () => this.gap()],
-			["sent", () => this.flushSent()],
 			["compact", () => this.compact()],
 			["checkpoint", () => this.checkpoints()],
 			["daily", () => this.daily()],
@@ -96,14 +95,6 @@ export class Maintenance {
 		c.sess.scheduleCatchUp();
 	}
 
-	async flushSent(): Promise<void> {
-		const c = this.c;
-		if (c.sentPending.size === 0) return;
-		const ups = [...c.sentPending].map(([clientFrameId, v]) => ({ clientFrameId, attempts: v.attempts, lastSentAtMs: v.atMs }));
-		c.sentPending.clear();
-		await c.repo.tSent(ups);
-	}
-
 	private async compact(): Promise<void> {
 		const c = this.c;
 		const now = c.mono();
@@ -114,7 +105,7 @@ export class Maintenance {
 			if (r.stale || r.frozen || c.sess.isReading(r.stream)) continue;
 			if ((this.compactSkip.get(r.stream) ?? 0) > now) continue;
 			if (!needsCompaction(r, c.tuning.compactRows, c.tuning.compactBytes)) continue;
-			if (c.background && r.tailRows <= TAIL_HARD_ROWS) continue; // lane 4 waits; the hard cap is lane 1
+			if (c.background && r.tailRows <= TAIL_HARD_ROWS) continue; // waits while backgrounded; the hard cap does not
 			budget--;
 			const res = r.cls === "ns" ? await compactFold(c.deps, c.ns) : r.cls === "cfg" ? await compactFold(c.deps, c.cfg)
 				: r.cls === "snap" ? await compactFold(c.deps, c.snap) : await compactBody(c.deps, r.stream);
@@ -173,7 +164,12 @@ export class Maintenance {
 			try {
 				const o = await writeFoldCheckpoint(c.deps, c.ckpt, s, fold, { refreshFirst: !fold.candidate?.authoredBySelf });
 				this.count(`${cls}-${o.t}`);
-				if (o.t === "ok") this.stats.checkpoints++;
+				if (o.t === "ok") {
+					this.stats.checkpoints++;
+					let pending = 0;
+					for (const r of c.outbox.values()) if (r.stream === stream) pending++;
+					c.diag("checkpoint-written", { cls, coversSeq: o.coversSeq, pendingOwn: pending });
+				}
 				else if (o.t === "skipped") c.ckpt.backoffUntil.set(stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
 			} catch (e) {
 				this.count(`${cls}-error`);

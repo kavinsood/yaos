@@ -21,7 +21,7 @@
  *   unmounted vault of >= 10 files is still caught, smaller ones are below
  *   every other threshold anyway and recoverable from trash/snapshots).
  * - Several tripped reasons: all their units are held; the report names the
- *   first in priority order ns-divergence, listing-shrank, mass-delete-local,
+ *   first in priority order listing-shrank, mass-delete-local,
  *   mass-delete-remote, mass-overwrite, conflict-flood.
  */
 
@@ -32,7 +32,7 @@ import {
 	BRAKE_OVERWRITE_SHRINK_RATIO, BRAKE_RATIO,
 } from "../limits";
 import { digestHex } from "../hash/digest";
-import { utf8Encode } from "../hash/utf8";
+import { utf8Encode } from "../codec/lib0";
 
 export const DEFAULT_BRAKE: BrakeConfig = {
 	minCount: BRAKE_MIN_COUNT,
@@ -68,7 +68,6 @@ export interface BrakeInput {
 	readonly syncedCount: number;
 	/** Live (non-excluded) local files of a COMPLETE listing; null = listing incomplete, skip listing-shrank. */
 	readonly liveLocalCount: number | null;
-	readonly divergence: boolean;
 	readonly window: BrakeWindow;
 	/** The brakeIdentity the user approved. */
 	readonly approval: string | null;
@@ -108,7 +107,6 @@ export function applyBrake(units: readonly PlanUnit[], input: BrakeInput): Brake
 	const threshold = Math.max(config.minCount, config.ratio * input.syncedCount);
 	const count = (kind: DestructiveKind) => units.filter((u) => u.destructive === kind).length;
 	const tripped: { reason: BrakeReport["reason"]; kinds: readonly DestructiveKind[] }[] = [];
-	if (input.divergence) tripped.push({ reason: "ns-divergence", kinds: DESTRUCTIVE });
 	if (
 		input.liveLocalCount !== null &&
 		input.syncedCount - input.liveLocalCount >= LISTING_SHRANK_MIN_MISSING &&

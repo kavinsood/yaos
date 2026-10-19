@@ -3,7 +3,7 @@ import { test } from "node:test";
 import type { RelayPort, RelaySession } from "../../ports/relay";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { converged, startTestEngine, until } from "./testHarness";
+import { converged, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
 
 const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
 const DOCS = 30;
@@ -13,10 +13,10 @@ async function seeded(relay: SimRelay, long = false): Promise<LogEngine> {
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { checkpoint: NO_CKPT } });
 	await until(() => a.status().phase === "live", 3_000, "a live");
 	for (let i = 0; i < DOCS; i++) {
-		const id = await a.createDoc(`d/n${i}.md`, `note ${i} `.repeat(4));
+		const id = await createDoc(a, `d/n${i}.md`, `note ${i} `.repeat(4));
 		if (!long || i % 3 !== 0) continue;
 		for (let k = 0; k < 6; k++) {
-			await a.editDoc(id, (t) => t.insert(t.length, ` row ${k} `.repeat(15)));
+			await editDoc(a, id, (t) => t.insert(t.length, ` row ${k} `.repeat(15)));
 			await a.flush();
 		}
 	}
@@ -86,7 +86,7 @@ test("batched catch-up: a small page budget serves a prefix per request; the res
 		const used = relay.readRequests - before;
 		const onWire = relay.maxReadsOnWire;
 		assert.ok(onWire <= b.c.budgets.catchUpConcurrency, `${onWire} read requests at once (continuations stay in their batch's lane)`);
-		for (const d of a.listDocs()) assert.equal(await b.docText(d.docId), await a.docText(d.docId));
+		for (const d of a.listDocs()) assert.equal(await docText(b, d.docId), await docText(a, d.docId));
 
 		const mid = relay.readRequests;
 		const { engine: c } = await startTestEngine({ relay, deviceId: "dev-c", tuning: { checkpoint: NO_CKPT, readBatchStreams: 1 } });
@@ -110,7 +110,7 @@ test("batched catch-up: streams that need more pages read on one at a time per b
 		await converged([a, b], 15_000);
 		assert.ok(relay.readRequests > 10, "multi-page streams read on");
 		assert.ok(relay.maxReadsOnWire <= b.c.budgets.catchUpConcurrency, `${relay.maxReadsOnWire} read requests at once`);
-		for (const d of a.listDocs()) assert.equal(await b.docText(d.docId), await a.docText(d.docId));
+		for (const d of a.listDocs()) assert.equal(await docText(b, d.docId), await docText(a, d.docId));
 	} finally {
 		for (const e of engines) await e.stop();
 	}

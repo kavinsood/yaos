@@ -23,7 +23,7 @@ import type { TimerHandle } from "../../ports/clock";
 import type { StorageDb } from "../../ports/storage";
 import type { VaultEvent, VaultStat } from "../../ports/vault";
 import type { EngineInitConfig, EngineResultValue, EngineSettings, LocalObservation, UserCommand } from "../../protocol/messages";
-import type { StatusSnapshot } from "../../protocol/status";
+import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { LifecycleEvent } from "../../ports/platform";
 import { BlobQueue } from "../blobs/blobQueue";
 import { Reconciler, type PassReport } from "../reconcile/reconciler";
@@ -79,6 +79,8 @@ export interface VaultRuntimeStart {
 	readonly paused: boolean;
 	readonly tzOffsetMinutes?: () => number;
 	readonly log?: (line: string) => void;
+	/** The LogEngine's diagnostics events (test hook, CreateEngineOptions.onDiag). */
+	readonly onDiag?: (event: DiagnosticsEvent) => void;
 	/** Path-keyed bases carried over an epoch migration (§c.12 step 3). */
 	readonly pathBases?: ReadonlyMap<PathKey, string> | null;
 	/** Old epoch whose DB is deleted once the new one reaches live (§c.12 step 6). */
@@ -111,7 +113,7 @@ export class VaultRuntime {
 	brake: BrakeReport | null = null;
 	settings: EngineSettings;
 	migrating = false;
-	/** Backgrounded (DESIGN §i.4): passes (lanes 3–4) wait until visible / resume. */
+	/** Backgrounded (DESIGN §i.4): reconcile passes wait until visible / resume. */
 	background = false;
 	private hiddenTimer: TimerHandle | null = null;
 	private idbSnapshotDue = false;
@@ -167,6 +169,7 @@ export class VaultRuntime {
 			onBodyChange: (docIds) => holder.rt?.onBodyChange(docIds),
 			onOwnBodySettled: (docIds) => holder.rt?.onOwnBodySettled(docIds),
 			onStatus: (s) => holder.rt?.onLogStatus(s),
+			...(o.onDiag ? { onDiag: o.onDiag } : {}),
 			onHostNotice: (level, code, message) => engine.link.post({ t: "notice", level, code, message }),
 			e2ee: e2eeOf(config.crypto, engine.keyring),
 			blobBytes: (hash) => holder.rt?.localBlobBytes(hash) ?? Promise.resolve(null),
@@ -253,7 +256,7 @@ export class VaultRuntime {
 		});
 		await this.rec.start();
 		if (this.settings.syncSettings) {
-			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, hash: ports.hash, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp });
+			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, hash: ports.hash, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp, upgradeRequired: () => this.log.c.cfg.halted?.upgrade === true });
 		}
 		this.snaps = new SnapshotJob({
 			disk: link.disk, side: link.sideFiles, clock: ports.clock, crypto, hash: ports.hash, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,
@@ -271,7 +274,7 @@ export class VaultRuntime {
 			this.diag(`storage lost: ${failure}`);
 			this.engine.onStorageLost();
 		}));
-		if (this.lastLog?.phase === "live") this.onLogStatus(this.lastLog);
+		if (this.lastLog?.phase === "live" || this.lastLog?.phase === "upgrade-required") this.onLogStatus(this.lastLog);
 		this.sched.request({ t: "full" });
 	}
 
@@ -385,7 +388,9 @@ export class VaultRuntime {
 	onLogStatus(s: StatusSnapshot): void {
 		this.lastLog = s;
 		if (this.stopped) return;
-		if (s.phase === "live" && !this.port.nsCaughtUp && this.rec) {
+		// upgrade-required with a session: a fold is halted for a newer writer (§c.10) and the session caught up;
+		// the planner's nsReady and the cfg / snap readiness still see that fold's halt.
+		if ((s.phase === "live" || (s.phase === "upgrade-required" && s.relay.connected)) && !this.port.nsCaughtUp && this.rec) {
 			this.port.nsCaughtUp = true;
 			this.port.invalidate();
 			this.sched.request({ t: "full" });
@@ -559,7 +564,7 @@ export class VaultRuntime {
 	}
 
 	/**
-	 * DESIGN §i.4. hidden: flush; phone / constrained also pause lanes 3–4 and close the socket after
+	 * DESIGN §i.4. hidden: flush; phone / constrained also pause background work and close the socket after
 	 * HIDDEN_CLOSE_MS (desktop and tablet keep syncing: an occluded desktop window reports hidden too).
 	 * pagehide / freeze: flush, pause, close now. visible / resume: reconnect at once, full pass.
 	 * Background closes keep the phase and never back off; the user's pause wins over visible / online.

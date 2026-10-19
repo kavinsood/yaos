@@ -4,8 +4,21 @@ import * as Y from "yjs"; // tests only: the Y.Text interleaving check (shipped 
 import type { MergeResult } from "../types";
 import { DEFAULT_MERGE_LIMITS, merge, mergeValidated } from "./merge";
 import { splitLines } from "./myers";
-import { applyEditsTo, applyTextEdits, editSize, isTokenBoundary, lineDiffSize, minimalDiff } from "./minimalDiff";
-import { prng } from "./prng";
+import { applyEditsTo, editSize, isTokenBoundary, lineDiffSize, minimalDiff, type TextEdit } from "./minimalDiff";
+import { prng } from "./testkit/prng";
+
+/** Apply ascending non-overlapping edits to a string (the oracle; the engine applies them to Y.Text). */
+function applyTextEdits(from: string, edits: readonly TextEdit[]): string {
+	const parts: string[] = [];
+	let cursor = 0;
+	for (const edit of edits) {
+		if (edit.start < cursor || edit.end < edit.start) throw new Error("edits must be ascending and non-overlapping");
+		parts.push(from.slice(cursor, edit.start), edit.text);
+		cursor = edit.end;
+	}
+	parts.push(from.slice(cursor));
+	return parts.join("");
+}
 
 const VOCAB = ["", "a", "b", "# heading", "- item", "same", "same", "😀 emoji", "\t tab", "x y z", "}", "{"];
 

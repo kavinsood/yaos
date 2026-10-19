@@ -33,7 +33,7 @@ import { canonicalJson, type JsonValue } from "../../core/hash/canvasCanonical";
 import { digestHex } from "../../core/hash/digest";
 import { exactFingerprint } from "../../core/hash/markdownLf";
 import { sha256Hex } from "../../core/hash/sha256";
-import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
+import { utf8Decode, utf8Encode } from "../../core/codec/lib0";
 import { CFG_MAX_FILE_BYTES, CFG_MAX_FILES, CFG_MAX_TOTAL_BYTES } from "../../core/limits";
 import type { CfgFoldState, CfgOp, CfgRegister, ConfigRelPath, ContentHash, DiskFingerprint } from "../../core/types";
 import type { HashPort } from "../../ports/crypto";

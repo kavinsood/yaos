@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until } from "../runtime/testHarness";
+import { converged, until, createDoc, docText, editDoc, retryQuarantine } from "../runtime/testHarness";
 import { live, rawAppend, start } from "./testkit/engines";
 import { K, genesis } from "./testkit/world";
 
@@ -24,14 +24,14 @@ describe("releaseQuarantine and keyring-hold rows (§d.6, §14.3)", () => {
 		try {
 			await live(x);
 			await live(y);
-			const id = await x.engine.createDoc("a.md" as VaultPath, "base;");
+			const id = await createDoc(x.engine, "a.md" as VaultPath, "base;");
 			await converged([x.engine, y.engine]);
 			const stream = x.engine.streamOf(id);
 			// y's `k` is not judged past what it has (a `k` row arrived and is not read yet): rows above it are held.
 			const ctx = y.engine.c.gateCtx;
 			const judged = ctx.staleCheck;
 			ctx.staleCheck = () => "hold";
-			for (let i = 0; i < 2; i++) await x.engine.editDoc(id, (t) => t.insert(t.length, `h${i};`));
+			for (let i = 0; i < 2; i++) await editDoc(x.engine, id, (t) => t.insert(t.length, `h${i};`));
 			await until(() => y.engine.c.repo.stream(stream)?.quarantinedRows === 2, 5_000, "held");
 			assert.equal(y.engine.c.repo.stream(stream)?.frozen, 1);
 
@@ -41,10 +41,10 @@ describe("releaseQuarantine and keyring-hold rows (§d.6, §14.3)", () => {
 			assert.equal(y.engine.c.repo.stream(stream)?.frozen, 1, "still frozen: its rows are not applied yet");
 
 			ctx.staleCheck = judged; // `k` judged
-			assert.equal(await y.engine.retryQuarantine(), 1);
+			assert.equal(await retryQuarantine(y.engine), 1);
 			assert.equal(y.engine.c.repo.stream(stream)?.frozen, 0);
 			await converged([x.engine, y.engine]);
-			assert.equal(await y.engine.docText(id), "base;h0;h1;");
+			assert.equal(await docText(y.engine, id), "base;h0;h1;");
 			assert.equal(y.engine.status().counts.quarantinedRows, 0);
 		} finally {
 			await y.engine.stop();

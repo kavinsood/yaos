@@ -12,7 +12,7 @@ import { kindOfPath } from "../../core/types";
 import { MAX_DOC_TEXT_CHARS } from "../../core/limits";
 import { exactFingerprint, markdownContentHash } from "../../core/hash/markdownLf";
 import { canvasContentHash } from "../../core/hash/canvasCanonical";
-import { utf8Decode } from "../../core/hash/utf8";
+import { utf8Decode } from "../../core/codec/lib0";
 import type { HashPort } from "../../ports/crypto";
 import { isValidVaultPath, standInPathKey } from "../../core/plan/pathRules";
 import type { LocalTreeRecord } from "../store/schema";

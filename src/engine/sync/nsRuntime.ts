@@ -20,7 +20,7 @@ import { FOLD_RULES_VERSION } from "../../core/limits";
 import { decodeNsFoldV1, encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
-import { buildIndex, foldNsFrame, newNsFoldState, nsFoldHalted } from "../../core/ns/fold";
+import { DEFAULT_NS_FOLD_RULES, buildIndex, foldNsFrameWith, newNsFoldState, nsFoldHalted, type NsFoldRules } from "../../core/ns/fold";
 import { overlayPending, type NsOverlay, type PendingNsFrame } from "../../core/ns/overlay";
 import { pathKey } from "../../core/paths/pathKey";
 import {
@@ -33,7 +33,7 @@ import type { OutboxCache } from "../runtime/outboxCache";
 import { FoldRuntime, type FoldCandidate, type FoldedFrame } from "./foldRuntime";
 
 export { LOCAL_FLAG_STALE_EPOCH, LOCAL_FLAG_UNOPENED } from "./foldRuntime";
-/** FOLD (V3): an ns row s is a candidate iff floor(s / M) > floor(prev / M) (core/ns/candidate). */
+/** An ns row s is a checkpoint candidate iff floor(s / M) > floor(prev / M) (core/ns/candidate, §d.9). */
 export const NS_CANDIDATE_MODULUS = NS_CANDIDATE_INTERVAL;
 
 export type NsCandidate = FoldCandidate;
@@ -49,16 +49,24 @@ export interface DocInfo {
 
 export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	readonly encoding = CheckpointEncoding.nsFoldV1;
-	readonly rulesVersion = FOLD_RULES_VERSION;
 	state: NsFoldState = newNsFoldState();
 	index: NsFoldIndex = buildIndex(this.state);
 
-	constructor(repo: Repo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS) {
+	/** knownRulesVersion: the highest fold rules this reader implements (tests raise it: an upgraded client). */
+	private readonly rules: NsFoldRules;
+
+	constructor(repo: Repo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS, knownRulesVersion = FOLD_RULES_VERSION) {
 		super(repo, self, NS_STREAM, candidateModulus);
+		this.rules = knownRulesVersion === DEFAULT_NS_FOLD_RULES.knownRulesVersion ? DEFAULT_NS_FOLD_RULES : { ...DEFAULT_NS_FOLD_RULES, knownRulesVersion };
 	}
 
 	get coversSeq(): Seq {
 		return this.state.coversSeq;
+	}
+
+	/** The state's own version (upgradeRules moves it), not this build's FOLD_RULES_VERSION: header = state (§b.5 V2). */
+	get rulesVersion(): number {
+		return this.state.foldRulesVersion;
 	}
 
 	protected reset(snap: SnapshotRecord | undefined): boolean {
@@ -73,7 +81,7 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	}
 
 	protected foldFrame(row: TailRecord, ops: readonly NsOp[]): { events: readonly NsFoldEvent[]; halted: boolean } {
-		const events = foldNsFrame(this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, frameNo: row.frameNo ?? 0, ops });
+		const events = foldNsFrameWith(this.rules, this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, frameNo: row.frameNo ?? 0, ops });
 		return { events, halted: nsFoldHalted(events) };
 	}
 
@@ -109,7 +117,7 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	/** Committed fold + own pending frames (§f.1). */
 	overlay(outbox: OutboxCache): NsOverlay & { readonly pending: readonly PendingNsFrame[] } {
 		const pending = this.pendingFrames(outbox);
-		return { ...overlayPending(this.state, this.index, this.self, pending), pending };
+		return { ...overlayPending(this.state, this.index, this.self, pending, this.rules), pending };
 	}
 
 	/** Docs of the optimistic view; "pending" = not in the committed fold yet. */
@@ -127,9 +135,13 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	reconcileHeld(outbox: OutboxCache): OutboxChange[] {
 		const changes: OutboxChange[] = [];
 		for (const r of outbox.values()) {
-			if (!r.dependsOn || outbox.has(r.dependsOn)) continue;
+			if (!r.dependsOn) continue;
+			// Only an ns create holds a frame. A store from before adoptables stopped holding (DESIGN §d.5) can still
+			// have frames held behind an adopted record: they count as dependency-gone.
+			const dep = outbox.get(r.dependsOn);
+			if (dep && dep.adoptOf === null) continue;
 			const held = r.state === "held";
-			if (!held && r.state !== "pending" && r.state !== "sent") continue;
+			if (!held && r.state !== "pending") continue;
 			const cls = streamClass(r.stream);
 			const docId = cls === "body" || cls === "canvas" ? streamDocId(r.stream) : null;
 			if (!docId) {

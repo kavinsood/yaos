@@ -66,7 +66,7 @@ export interface BodyFrameInput {
 	readonly content: Uint8Array;
 	readonly flags: number;
 	readonly authorNsSeq: Seq;
-	/** Held dependency (ns create or newest adoptable); null = pending. */
+	/** The doc's ns create (DESIGN §e.1): held until it folds, unless sendAfter; null = pending. */
 	readonly dependsOn: ClientFrameId | null;
 	/**
 	 * dependsOn is a live ns create (DESIGN §e.1): the frame is pending, not held, and the sender sends it only

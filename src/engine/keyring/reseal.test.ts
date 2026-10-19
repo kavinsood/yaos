@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { decodeOuter } from "../../core/codec/envelope";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until } from "../runtime/testHarness";
+import { converged, until, createDoc, docText, editDoc } from "../runtime/testHarness";
 import { keyMissing, live, rawAppend, start, stored, type Dev } from "./testkit/engines";
 import { K, RK_A, genesis } from "./testkit/world";
 
@@ -37,12 +37,12 @@ describe("revoke re-seal (§14.2 step 4) in the engine", () => {
 		const [x, y0] = await pair(relay, "dev-x", "dev-y");
 		let y: Dev | null = null;
 		try {
-			const id = await x!.engine.createDoc("a.md" as VaultPath, "base");
+			const id = await createDoc(x!.engine, "a.md" as VaultPath, "base");
 			await converged([x!.engine, y0!.engine]);
 			await y0!.engine.stop();
 			relay.setConnectFailure("unavailable");
 			y = await start(relay, "dev-y", stored(y0!, { keys: [{ e: 1, k: K(1) }], records: [] }), { storage: y0!.storage, extra: { vaultEpoch: relay.vaultEpoch() } });
-			await y.engine.editDoc(id, (t) => t.insert(t.length, " offline"));
+			await editDoc(y.engine, id, (t) => t.insert(t.length, " offline"));
 			await until(() => y!.engine.c.outbox.all().some((r) => r.keyEpoch === 1), 5_000, "sealed under K_1 offline");
 			assert.equal(await x!.engine.revokeRekey(RK_A.slice()), "won");
 			const sRot = lastK(relay);
@@ -52,7 +52,7 @@ describe("revoke re-seal (§14.2 step 4) in the engine", () => {
 			assert.deepEqual(rowsPast(relay, "dev-y", sRot), [], "nothing sent under K_1 past S_rot, nothing while key-less");
 			assert.equal(await y.engine.installKeyQr(2, k2Of(x!).slice()), "verified");
 			await converged([x!.engine, y.engine], 8_000);
-			assert.equal(await x!.engine.docText(id), "base offline");
+			assert.equal(await docText(x!.engine, id), "base offline");
 			const ys = rowsPast(relay, "dev-y", sRot);
 			assert.ok(ys.length > 0 && ys.every((e) => e === 2), `every y row past S_rot under r: ${ys.join(",")}`);
 		} finally {
@@ -66,14 +66,14 @@ describe("revoke re-seal (§14.2 step 4) in the engine", () => {
 		const relay = new SimRelay();
 		const [x, y] = await pair(relay, "dev-x", "dev-y");
 		try {
-			const id = await x!.engine.createDoc("a.md" as VaultPath, "base");
+			const id = await createDoc(x!.engine, "a.md" as VaultPath, "base");
 			await converged([x!.engine, y!.engine]);
 			relay.pauseCommits();
 			const won = x!.engine.revokeRekey(RK_A.slice());
 			await until(() => relay.pendingCount() === 1, 5_000, "the revoke is in flight");
-			await x!.engine.editDoc(id, (t) => t.insert(t.length, " X"));
+			await editDoc(x!.engine, id, (t) => t.insert(t.length, " X"));
 			await until(() => relay.pendingCount() === 2, 5_000, "x's edit behind it");
-			await y!.engine.editDoc(id, (t) => t.insert(0, "Y "));
+			await editDoc(y!.engine, id, (t) => t.insert(0, "Y "));
 			await until(() => relay.pendingCount() === 3, 5_000, "y's edit behind it");
 			relay.resumeCommits();
 			assert.equal(await won, "won");
@@ -83,8 +83,8 @@ describe("revoke re-seal (§14.2 step 4) in the engine", () => {
 			await until(() => keyMissing(y!) === "revoked-epoch", 5_000, "y read the revoke");
 			assert.equal(await y!.engine.installKeyQr(2, k2Of(x!).slice()), "verified");
 			await converged([x!.engine, y!.engine], 8_000);
-			assert.equal(await x!.engine.docText(id), "Y base X");
-			assert.equal(await y!.engine.docText(id), "Y base X");
+			assert.equal(await docText(x!.engine, id), "Y base X");
+			assert.equal(await docText(y!.engine, id), "Y base X");
 			assert.ok(rowsPast(relay, "dev-y", sRot).includes(2), "y sent its copy under r");
 			assert.equal(x!.engine.status().counts.quarantinedRows + y!.engine.status().counts.quarantinedRows, 0);
 		} finally {

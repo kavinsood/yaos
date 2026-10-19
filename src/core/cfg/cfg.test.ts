@@ -7,7 +7,6 @@ import { decodeCfgFoldV1, encodeCfgFoldV1 } from "../codec/cfgFoldV1";
 import { decodeCfgOps, encodeCfgOps } from "../codec/cfgOps";
 import {
 	CFG_FOLD_RULES_VERSION,
-	changedRegisters,
 	cloneCfgFold,
 	foldCfgFrame,
 	foldCfgFrameWith,
@@ -20,21 +19,6 @@ import {
 	type CfgFoldEvent,
 } from "./fold";
 import { canonicalJson, canonicalizeJsonText, isCanonicalJson } from "./json";
-import {
-	applyJsonKeys,
-	canApplyPluginData,
-	diffCommunityPlugins,
-	diffJsonFile,
-	enabledPlugins,
-	isYaosOwnPath,
-	jsonFilesOf,
-	jsonRegistersOf,
-	pluginIdOfDataJson,
-	projectCommunityPlugins,
-	projectJsonFile,
-	readCommunityPlugins,
-	readJsonTopLevel,
-} from "./projection";
 import { checkCfgInvariants, verifyCfgCheckpoint, verifyCfgFoldBytes } from "./verify";
 
 const A = "devA" as DeviceId;
@@ -42,7 +26,6 @@ const B = "devB" as DeviceId;
 let fid = 0;
 const F = () => `c${(fid++).toString().padStart(21, "0")}` as ClientFrameId;
 const H = (n: number) => n.toString(16).padStart(2, "0").repeat(32) as ContentHash;
-const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
 /** frameNo 0 skips the replay window (a gate-failed row); the window has its own tests below. */
 function fold(s: CfgFoldState, seq: number, deviceId: DeviceId, ops: CfgOp[], clientFrameId = F(), frameNo = 0): CfgFoldEvent[] {
@@ -98,7 +81,6 @@ test("fold: LWW by (seq, index), tombstones, events, coversSeq", () => {
 	assert.equal(s.coversSeq, 1);
 	assert.equal(s.json.get(jsonRegisterKey("app.json", "vimMode"))!.value, "false");
 	assert.deepEqual(s.json.get(jsonRegisterKey("app.json", "vimMode"))!.version, { seq: 1, index: 1, deviceId: A });
-	assert.deepEqual(changedRegisters(ev).map((r) => `${r.map}:${r.key}`), ["json:app.json\u0000vimMode", "plugins:dataview", "files:snippets/a.css"]);
 
 	ev = fold(s, 2, B, [
 		{ t: "jsonSet", file: "app.json", key: "vimMode", valueJson: "false" },
@@ -112,7 +94,6 @@ test("fold: LWW by (seq, index), tombstones, events, coversSeq", () => {
 	assert.equal(s.json.get(jsonRegisterKey("app.json", "missing"))!.value, null);
 	assert.equal(s.plugins.get("dataview")!.value, null);
 	assert.equal(s.files.get("snippets/b.css")!.value, null);
-	assert.deepEqual(changedRegisters(ev).map((r) => r.key), ["app.json\u0000missing", "dataview", "snippets/b.css"]);
 
 	// Already folded seq: nothing.
 	const before = encodeCfgFoldV1(s);
@@ -232,7 +213,9 @@ test("cfgFoldV1 round-trip, V1 non-canonical rejection, V2 violations, checkpoin
 	const content = { encoding: CheckpointEncoding.cfgFoldV1, coversSeq: 3, foldRulesVersion: CFG_FOLD_RULES_VERSION, state: bytes };
 	assert.ok(verifyCfgCheckpoint(content, 3).ok);
 	assert.equal((verifyCfgCheckpoint({ ...content, encoding: CheckpointEncoding.nsFoldV1 }, 3) as { reason: string }).reason, "malformed");
-	assert.equal((verifyCfgCheckpoint({ ...content, foldRulesVersion: 2 }, 3) as { reason: string }).reason, "rules-version");
+	assert.equal((verifyCfgCheckpoint({ ...content, foldRulesVersion: 2 }, 3) as { reason: string }).reason, "upgrade-required", "newer rules: the reader must upgrade");
+	assert.equal((verifyCfgCheckpoint({ ...content, foldRulesVersion: 0 }, 3) as { reason: string }).reason, "rules-version", "no cfg rules 0: a bad writer");
+	assert.ok(verifyCfgCheckpoint({ ...content, foldRulesVersion: 2 }, 3, 2).ok, "a reader that knows rules 2");
 	assert.equal((verifyCfgCheckpoint(content, 5) as { reason: string }).reason, "covers-seq");
 });
 
@@ -249,101 +232,6 @@ test("overlay: pending frames on a copy", () => {
 	assert.deepEqual(o.state.plugins.get("p")!.version, { seq: 6, index: 0, deviceId: A });
 	assert.equal(o.state.json.get(jsonRegisterKey("app.json", "k"))!.version.seq, 7);
 	assert.equal(o.events.length, 2);
-});
-
-test("projection: JSON files", () => {
-	const local = utf8Encode('{\n  "z": 1,\n  "vimMode": false,\n  "deviceLocal": "x",\n  "gone": [1]\n}');
-	assert.deepEqual([...readJsonTopLevel(local)!], [["z", "1"], ["vimMode", "false"], ["deviceLocal", '"x"'], ["gone", "[1]"]]);
-	assert.equal(readJsonTopLevel(utf8Encode("[1]")), null);
-	assert.equal(readJsonTopLevel(utf8Encode("{bad")), null);
-	assert.equal(readJsonTopLevel(new Uint8Array([0xff])), null);
-	assert.deepEqual([...readJsonTopLevel(utf8Encode('﻿{"a":1}'))!], [["a", "1"]]);
-
-	const r = applyJsonKeys(local, new Map<string, string | null>([
-		["vimMode", "true"], ["gone", null], ["b", '{"y":[1,2],"x":"s"}'], ["a", "2"], ["deviceLocal", '"remote"'],
-	]), new Set(["deviceLocal"]))!;
-	assert.ok(r.changed);
-	assert.equal(dec(r.bytes), '{\n  "z": 1,\n  "vimMode": true,\n  "deviceLocal": "x",\n  "a": 2,\n  "b": {\n    "x": "s",\n    "y": [\n      1,\n      2\n    ]\n  }\n}');
-	// Output is exactly JSON.stringify(_, null, 2) of the same object.
-	assert.equal(dec(r.bytes), JSON.stringify({ z: 1, vimMode: true, deviceLocal: "x", a: 2, b: { x: "s", y: [1, 2] } }, null, 2));
-	// No-op updates return the local bytes untouched (formatting preserved).
-	const odd = utf8Encode('{"a":1,  "b":2}');
-	const n = applyJsonKeys(odd, new Map([["a", "1"], ["c", null]]))!;
-	assert.ok(!n.changed);
-	assert.equal(n.bytes, odd);
-	// Absent file: created.
-	const c = applyJsonKeys(null, new Map([["k", '"v"']]))!;
-	assert.ok(c.changed);
-	assert.equal(dec(c.bytes), '{\n  "k": "v"\n}');
-	assert.equal(dec(applyJsonKeys(null, new Map())!.bytes), "{}");
-	// Unparsable local: refuse.
-	assert.equal(applyJsonKeys(utf8Encode("{oops"), new Map([["k", "1"]])), null);
-	// __proto__ key is handled as data.
-	const p = applyJsonKeys(utf8Encode("{}"), new Map([["__proto__", '{"polluted":true}']]))!;
-	assert.equal(dec(p.bytes), '{\n  "__proto__": {\n    "polluted": true\n  }\n}');
-	assert.equal(({} as Record<string, unknown>).polluted, undefined);
-
-	// diffJsonFile.
-	const base = new Map([["a", "1"], ["b", "2"], ["deny", "0"]]);
-	const now = new Map([["a", "1"], ["b", "3"], ["c", "[]"], ["deny", "9"]]);
-	assert.deepEqual(diffJsonFile("app.json", base, now, new Set(["deny"])), [
-		{ t: "jsonSet", file: "app.json", key: "b", valueJson: "3" },
-		{ t: "jsonSet", file: "app.json", key: "c", valueJson: "[]" },
-	]);
-	assert.deepEqual(diffJsonFile("app.json", base, new Map([["a", "1"]])), [
-		{ t: "jsonDel", file: "app.json", key: "b" },
-		{ t: "jsonDel", file: "app.json", key: "deny" },
-	]);
-	assert.equal(diffJsonFile("app.json", null, now).length, 4);
-
-	// projectJsonFile over the fold.
-	const s = newCfgFoldState();
-	fold(s, 1, A, diffJsonFile("app.json", null, now));
-	fold(s, 2, A, [{ t: "jsonDel", file: "app.json", key: "a" }, { t: "jsonSet", file: "app.jsonx", key: "q", valueJson: "1" }]);
-	assert.deepEqual([...jsonRegistersOf(s, "app.json").keys()], ["a", "b", "c", "deny"]);
-	assert.deepEqual(jsonFilesOf(s), ["app.json", "app.jsonx"]);
-	const pj = projectJsonFile(s, "app.json", utf8Encode('{"a":1,"local":true}'), new Set(["deny"]))!;
-	assert.equal(dec(pj.bytes), JSON.stringify({ local: true, b: 3, c: [] }, null, 2));
-});
-
-test("projection: community plugins, plugin data gate, paths", () => {
-	const s = newCfgFoldState();
-	fold(s, 1, A, [
-		{ t: "pluginSet", pluginId: "zeta", enabled: true },
-		{ t: "pluginSet", pluginId: "alpha", enabled: true },
-		{ t: "pluginSet", pluginId: "off", enabled: false },
-		{ t: "pluginSet", pluginId: "yaos", enabled: true },
-		{ t: "pluginDel", pluginId: "gone" },
-		{ t: "filePut", file: "plugins/dv/data.json", content: { t: "inline", bytes: utf8Encode("{}") }, pluginVersion: "1.2.0" },
-		{ t: "filePut", file: "plugins/nv/data.json", content: { t: "inline", bytes: utf8Encode("{}") }, pluginVersion: null },
-	]);
-	assert.deepEqual(enabledPlugins(s), ["alpha", "zeta"]);
-	assert.equal(dec(projectCommunityPlugins(s)), '[\n  "alpha",\n  "zeta"\n]');
-	assert.deepEqual(readCommunityPlugins(utf8Encode('["b","a","b"]')), ["b", "a"]);
-	assert.equal(readCommunityPlugins(utf8Encode('["b",1]')), null);
-	assert.equal(readCommunityPlugins(utf8Encode("{}")), null);
-	assert.deepEqual(diffCommunityPlugins(["a", "b", "yaos"], ["b", "c", "yaos"]), [
-		{ t: "pluginSet", pluginId: "a", enabled: false },
-		{ t: "pluginSet", pluginId: "c", enabled: true },
-	]);
-	assert.deepEqual(diffCommunityPlugins(null, ["b", "a"]).map((o) => (o as { pluginId: string }).pluginId), ["a", "b"]);
-
-	const dv = s.files.get("plugins/dv/data.json");
-	assert.ok(canApplyPluginData("1.2.0", dv));
-	assert.ok(!canApplyPluginData("1.2.1", dv));
-	assert.ok(!canApplyPluginData("", dv));
-	assert.ok(!canApplyPluginData(null, dv));
-	assert.ok(!canApplyPluginData("1.2.0", undefined));
-	assert.ok(!canApplyPluginData("1.2.0", s.files.get("plugins/nv/data.json")));
-	fold(s, 2, B, [{ t: "fileDel", file: "plugins/dv/data.json" }]);
-	assert.ok(!canApplyPluginData("1.2.0", s.files.get("plugins/dv/data.json")));
-
-	assert.ok(isYaosOwnPath("plugins/yaos/data.json"));
-	assert.ok(isYaosOwnPath("plugins/yaos"));
-	assert.ok(!isYaosOwnPath("plugins/yaos2/data.json"));
-	assert.equal(pluginIdOfDataJson("plugins/dv/data.json"), "dv");
-	assert.equal(pluginIdOfDataJson("plugins/dv/main.js"), null);
-	assert.equal(pluginIdOfDataJson("plugins/a/b/data.json"), null);
 });
 
 // Small deterministic cfg fuzz: random frames (incl. codec round-trip of ops,

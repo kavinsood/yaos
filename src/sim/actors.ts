@@ -102,11 +102,13 @@ export type UserAction =
 	| { readonly t: "attach"; readonly dev: number; readonly name: number; readonly size: number }
 	| { readonly t: "attachRename"; readonly dev: number; readonly file: number; readonly name: number }
 	| { readonly t: "attachDelete"; readonly dev: number; readonly file: number }
-	| { readonly t: "setting"; readonly dev: number; readonly file: number; readonly key: number; readonly del: boolean };
+	| { readonly t: "setting"; readonly dev: number; readonly file: number; readonly key: number; readonly del: boolean }
+	// The user's "Create snapshot" command (DESIGN §j.4): uploaded at once when the device uploads snapshots (snap rows).
+	| { readonly t: "snapshot"; readonly dev: number };
 
 export type OpWeights = Readonly<Record<UserAction["t"], number>>;
 
-const NO_EXTRAS = { attach: 0, attachRename: 0, attachDelete: 0, setting: 0 } as const;
+const NO_EXTRAS = { attach: 0, attachRename: 0, attachDelete: 0, setting: 0, snapshot: 0 } as const;
 /** Edits only (no deletes/renames). */
 export const EDIT_OPS: OpWeights = { type: 30, paste: 2, deleteToken: 6, open: 8, close: 4, switch: 3, mode: 2, create: 6, diskInsert: 8, diskDeleteToken: 3, rename: 0, delete: 0, ...NO_EXTRAS };
 /** The full mix (the default). */
@@ -117,8 +119,11 @@ export const FULL_OPS: OpWeights = { ...EDIT_OPS, rename: 3, delete: 2 };
  */
 export const EXTRA_OPS: OpWeights = {
 	type: 0, paste: 0, deleteToken: 0, open: 0, close: 0, switch: 0, mode: 0, create: 0, diskInsert: 0, diskDeleteToken: 0, rename: 0, delete: 0,
-	attach: 6, attachRename: 1, attachDelete: 1, setting: 4,
+	attach: 6, attachRename: 1, attachDelete: 1, setting: 4, snapshot: 0,
 };
+
+/** Manual snapshots only (run.ts draws them from their own stream, in the seeds that upload snapshots). */
+export const SNAPSHOT_OPS: OpWeights = { ...EXTRA_OPS, attach: 0, attachRename: 0, attachDelete: 0, setting: 0, snapshot: 1 };
 
 /** Synced config files the setting actor edits (DESIGN §j.3 allowlist). */
 export const SETTING_FILES = ["app.json", "appearance.json", "snippets/s0.css", "snippets/s1.css"] as const;
@@ -158,6 +163,7 @@ export function generateUserAction(rng: SeededRandom, devices: number, weights: 
 		case "attachRename": return { t: "attachRename", dev, file: f(), name: rng.int(4) };
 		case "attachDelete": return { t: "attachDelete", dev, file: f() };
 		case "setting": return { t: "setting", dev, file: rng.int(SETTING_FILES.length), key: rng.int(4), del: rng.chance(0.2) };
+		case "snapshot": return { t: "snapshot", dev };
 	}
 }
 
@@ -336,6 +342,10 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 			d.vault.userDelete(path);
 			return `${tag} ${path}`;
 		}
+		case "snapshot":
+			// A user command: its export and upload run on the engine's own time (the step does not wait).
+			void d.runtime.command({ t: "createSnapshot" }).catch(() => undefined);
+			return tag;
 		case "setting": {
 			// Settings are last-writer-wins per key: no token ledger, convergence only (invariants checkSettings).
 			const file = SETTING_FILES[a.file] ?? "app.json";

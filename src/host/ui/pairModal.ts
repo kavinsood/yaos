@@ -19,6 +19,7 @@ import { Modal, Notice, Setting, type App, type ButtonComponent } from "obsidian
 import { sameIdentity, type PairedIdentity, type YaosUiHost } from "./api";
 import { COPY_LINK_WARNING, DEVICE_NAME_HINT } from "./e2eeText";
 import { errorMessage } from "./format";
+import { plainInput, StatusLine } from "./modalParts";
 import { pairingLink, pairingLinkE2ee } from "./keyActions";
 import { copyText, obsidianRequest } from "./obsidianEnv";
 import { applyPairedIdentity, formatCountdown, PairingSession, setPendingEnrollment, withoutPendingEnrollment } from "./pairFlow";
@@ -66,7 +67,7 @@ export class PairModal extends Modal {
 	private hostValue: string;
 	private codeValue: string;
 	private nameValue: string;
-	private statusEl: HTMLElement | null = null;
+	private readonly statusLine = new StatusLine();
 	private pairButton: ButtonComponent | null = null;
 	private open_ = false;
 	/** SECRET until handed on or zero-filled. */
@@ -83,7 +84,7 @@ export class PairModal extends Modal {
 		this.linkE2ee = prefill.e2ee ?? null;
 		this.session = new PairingSession({
 			request,
-			onProgress: (text) => this.setStatus(text, false),
+			onProgress: (text) => this.statusLine.set(text, false),
 			persist: (attempt) => host.updateData((d) => (attempt ? setPendingEnrollment(d, attempt) : withoutPendingEnrollment(d))),
 		});
 		const data = host.data();
@@ -132,17 +133,14 @@ export class PairModal extends Modal {
 			}))
 			.addText((text) => {
 				text.setPlaceholder("https://sync.example.com").setValue(this.hostValue).onChange((v) => { this.hostValue = v; });
-				text.inputEl.autocomplete = "off";
-				text.inputEl.spellcheck = false;
+				plainInput(text.inputEl);
 			});
 		new Setting(contentEl)
 			.setName("Pairing code")
 			.setDesc("Works once and expires 15 minutes after it was created.")
 			.addText((text) => {
 				text.setPlaceholder("Paste the pairing code").setValue(this.codeValue).onChange((v) => { this.codeValue = v; });
-				text.inputEl.type = "password";
-				text.inputEl.autocomplete = "off";
-				text.inputEl.spellcheck = false;
+				plainInput(text.inputEl, { secret: true });
 			});
 		new Setting(contentEl)
 			.setName("Device name")
@@ -151,7 +149,7 @@ export class PairModal extends Modal {
 				text.setPlaceholder("My laptop").setValue(this.nameValue).onChange((v) => { this.nameValue = v; });
 			});
 
-		this.statusEl = contentEl.createEl("p", { cls: "yaos-pair-status" });
+		this.statusLine.attach(contentEl);
 		new Setting(contentEl)
 			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
 			.addButton((b) => {
@@ -162,16 +160,10 @@ export class PairModal extends Modal {
 			});
 	}
 
-	private setStatus(text: string, isError: boolean): void {
-		if (!this.open_ || !this.statusEl) return;
-		this.statusEl.setText(text);
-		this.statusEl.toggleClass("mod-warning", isError);
-	}
-
 	private async submit(): Promise<void> {
 		if (this.session.busy) return;
 		this.pairButton?.setDisabled(true);
-		this.setStatus("Pairing…", false);
+		this.statusLine.set("Pairing…", false);
 		const previous = this.host.data().identity;
 		try {
 			const identity = await this.session.submit({ host: this.hostValue, pairingCode: this.codeValue, deviceName: this.nameValue });
@@ -195,7 +187,7 @@ export class PairModal extends Modal {
 				retireDeviceEnrollment(previous, { request: this.request }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
 			}
 		} catch (err) {
-			this.setStatus(errorMessage(err), true);
+			this.statusLine.set(errorMessage(err), true);
 			if (!this.open_) new Notice(`YAOS pairing failed: ${errorMessage(err)}`, 8000);
 		} finally {
 			this.pairButton?.setDisabled(false);
@@ -205,7 +197,7 @@ export class PairModal extends Modal {
 	onClose(): void {
 		this.open_ = false;
 		this.contentEl.empty();
-		this.statusEl = null;
+		this.statusLine.detach();
 		this.pairButton = null;
 		if (!this.session.busy) {
 			this.session.clear();
@@ -360,10 +352,4 @@ export class PairingCodeModal extends Modal {
 		this.hideQr = null;
 		this.contentEl.empty();
 	}
-}
-
-export function showPairingCodeModal(app: App, host: YaosUiHost, request: RequestFn = obsidianRequest): PairingCodeModal {
-	const modal = new PairingCodeModal(app, host, request);
-	modal.open();
-	return modal;
 }

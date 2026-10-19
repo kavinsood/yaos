@@ -19,8 +19,8 @@
 import type { HashPort } from "../../ports/crypto";
 import type { ContentHash } from "../types";
 import { digestHex } from "./digest";
-import { utf8Decode, utf8Encode, utf8Length } from "./utf8";
-import { compareRank, initialCanvasRanks } from "./canvasOrdering";
+import { utf8Decode, utf8Encode, utf8ByteLength } from "../codec/lib0";
+import { compareRank } from "./canvasOrdering";
 
 export const CANVAS_CODEC = "json-canvas-canonical-v1" as const;
 
@@ -142,7 +142,7 @@ function invalid(reason: CanvasParseReason, detail?: string): CanvasParseResult 
 	return detail !== undefined ? { kind: "invalid", reason, detail } : { kind: "invalid", reason };
 }
 function validateId(value: unknown): value is string {
-	return validString(value) && value.length > 0 && utf8Length(value) <= CANVAS_LIMITS.identifierBytes;
+	return validString(value) && value.length > 0 && utf8ByteLength(value) <= CANVAS_LIMITS.identifierBytes;
 }
 
 export function parseCanvasNode(raw: Record<string, unknown>): CanvasNode | null {
@@ -318,14 +318,6 @@ export function canonicalCanvasBytes(data: CanvasSemanticData): Uint8Array {
 	return utf8Encode(canonicalJson(canvasToJson(data)));
 }
 
-/** Ported as-is: `{"item":<node|edge json>,"orderRank":rank}`. */
-export function canonicalCanvasItemBytes(item: CanvasNode | CanvasEdge, orderRank: string | null): Uint8Array {
-	const value: JsonObject = "position" in item
-		? { item: canvasNodeJson(item), orderRank }
-		: { item: canvasEdgeJson(item), orderRank };
-	return utf8Encode(canonicalJson(value));
-}
-
 /** Obsidian's on-disk formatting (tab indent, no trailing newline). */
 export function formatCanvasText(data: CanvasSemanticData): string {
 	return JSON.stringify(canvasToJson(data), null, "\t");
@@ -365,7 +357,7 @@ function parseCanvasValue(raw: unknown): CanvasParseResult {
 		if (key === "nodes" || key === "edges") continue;
 		const value = checkedJsonValue(raw[key]);
 		if (value === undefined) return invalid("invalid_json_value", key);
-		const size = utf8Length(canonicalJson(value));
+		const size = utf8ByteLength(canonicalJson(value));
 		if (size > CANVAS_LIMITS.unknownValueBytes) return oversized("unknownValueBytes", size);
 		rootFields[key] = value;
 	}
@@ -378,7 +370,7 @@ function parseCanvasValue(raw: unknown): CanvasParseResult {
 		if (!node) return invalid("invalid_node", validString(entry.id) ? entry.id : undefined);
 		if (nodes.has(node.id)) return invalid("duplicate_node_id", node.id);
 		if (node.text !== undefined) {
-			const measured = utf8Length(node.text);
+			const measured = utf8ByteLength(node.text);
 			if (measured > CANVAS_LIMITS.textBytes) return oversized("textBytes", measured);
 			aggregateTextBytes += measured;
 		}
@@ -445,11 +437,6 @@ export interface CanvasRanked {
 	/** id -> fractional rank (canvasOrdering). Missing ids sort first by id. */
 	readonly nodeRanks: ReadonlyMap<string, string>;
 	readonly edgeRanks: ReadonlyMap<string, string>;
-}
-
-/** Assign initial ranks in file order (used for disk canvases that carry no ranks). */
-export function rankCanvasInFileOrder(data: CanvasSemanticData): CanvasRanked {
-	return { data, nodeRanks: initialCanvasRanks(data.nodeOrder), edgeRanks: initialCanvasRanks(data.edgeOrder) };
 }
 
 function rankedIds(ids: Iterable<string>, ranks: ReadonlyMap<string, string>): string[] {

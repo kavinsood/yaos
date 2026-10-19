@@ -119,10 +119,6 @@ export function encodeInnerFlags(inner: InnerEnvelope, opts?: { readonly deflate
 	return { bytes: w.finish(), flags };
 }
 
-export function encodeInner(inner: InnerEnvelope, opts?: { readonly deflate?: "auto" | "never" }): Uint8Array {
-	return encodeInnerFlags(inner, opts).bytes;
-}
-
 /** Bounded deflate-raw inflate. Throws CodecError on invalid streams or output > maxBytes. */
 export function inflateBounded(z: Uint8Array, maxBytes: number): Uint8Array {
 	if (z.length === 0) throw new CodecError("empty deflate stream");

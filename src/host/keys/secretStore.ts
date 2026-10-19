@@ -15,7 +15,7 @@
  *
  * The secret id is `"yaos-" + hex(base64urlDecode(vaultId))`: the vaultId's 16 bytes in lowercase hex, 37 chars,
  * valid for setSecret's `/^[a-z0-9-]+$/` and its 64-char limit. No hash: main never hashes (DESIGN §d.2; §h
- * HostPorts has no HashPort; scripts/check-deps.mjs keeps core/hash/** off the main thread).
+ * gives the host no HashPort; scripts/check-deps.mjs keeps core/hash/** off the main thread).
  */
 
 import { KEY_STORE_WAIT_MS } from "../../core/limits";
@@ -142,12 +142,6 @@ function encodeValue(vaultId: string, v: StoredKeys): string {
 		records: v.records.map((r) => base64urlEncode(r)),
 	};
 	return JSON.stringify(value);
-}
-
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-	return true;
 }
 
 /** The secret of one vault. Construct per vault id; holds no key bytes between calls. */
@@ -285,9 +279,4 @@ export class VaultKeyStore {
 			return false;
 		}
 	}
-}
-
-/** True when `a` and `b` hold the same epoch keys (tests). */
-export function sameKeys(a: readonly EpochKey[], b: readonly EpochKey[]): boolean {
-	return a.length === b.length && a.every((x, i) => x.e === b[i]!.e && sameBytes(x.k, b[i]!.k));
 }

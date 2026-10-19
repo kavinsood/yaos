@@ -8,6 +8,10 @@
  * tail row flagged LOCAL_FLAG_UNOPENED (reader-dependent gate failure) halts
  * the fold, as does a frame the fold itself refuses (ns upgradeRules above the
  * known version); resume() lifts it once the row is re-gated (quarantineRelease.ts).
+ * A remote checkpoint of newer rules or format (catchUp.ts) halts it too
+ * (haltAtCheckpoint): the stream stays stale, and nothing of the halt is stored,
+ * so an upgraded client reads and adopts the checkpoint on its next start.
+ * FoldHalt.upgrade: only a newer client can lift the halt (phase upgrade-required).
  * A row flagged LOCAL_FLAG_STALE_EPOCH (e2ee-design §14.3) folds as one
  * frame-level ignored/stale-epoch event.
  *
@@ -19,6 +23,7 @@
  */
 
 import type { CheckpointEncoding } from "../../core/envelope";
+import { decodeOuter } from "../../core/codec/envelope";
 import { NS_DEDUPE_RING } from "../../core/limits";
 import { NS_CANDIDATE_INTERVAL, isCandidateSeq } from "../../core/ns/candidate";
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../../core/types";
@@ -36,11 +41,26 @@ export interface FoldCandidate {
 	/** Canonical fold bytes (nsFoldV1 / cfgFoldV1) at seq. */
 	readonly bytes: Uint8Array;
 	readonly authoredBySelf: boolean;
+	/** foldRulesVersion of the state in `bytes` (the checkpoint header must equal it, §b.5 V2). */
+	readonly rulesVersion: number;
 }
 
 export interface FoldHalt {
+	/** The row the fold stopped before, or the coversSeq of the checkpoint it cannot adopt. */
 	readonly seq: Seq;
-	readonly reason: "reader-dependent" | "rules-version";
+	/**
+	 * reader-dependent: a tail row did not open (LOCAL_FLAG_UNOPENED); rules-version: the fold refused a frame (ns
+	 * upgradeRules above the known version); newer-checkpoint: the stream's checkpoint has newer rules or format.
+	 */
+	readonly reason: "reader-dependent" | "rules-version" | "newer-checkpoint";
+	/** Only an upgraded client gets past it (a newer writer); false: waiting for keys or `k` (§d.6). */
+	readonly upgrade: boolean;
+}
+
+/** An unopened payload whose envelope formatVersion or suite byte this build does not know: a newer writer. */
+export function newerEnvelope(payload: Uint8Array): boolean {
+	const o = decodeOuter(payload);
+	return !o.ok && (o.reason === "unsupported-version" || o.reason === "unsupported-suite");
 }
 
 /** One committed frame as folded. */
@@ -61,7 +81,10 @@ export interface OwnPendingFrame<Op> {
 }
 
 export abstract class FoldRuntime<Op, E> {
-	halted: FoldHalt | null = null;
+	/** Halt from a row (unopened or refused): load() and resume() clear it, the rows decide again. */
+	private rowHalt: FoldHalt | null = null;
+	/** Halt from a newer checkpoint: kept across load() for the runtime's life (the stream stays stale). */
+	private checkpointHalt: FoldHalt | null = null;
 	candidate: FoldCandidate | null = null;
 	foldedRows = 0;
 	/** Highest tail seq looked at (rows in (through, appliedSeq] are next). */
@@ -87,7 +110,7 @@ export abstract class FoldRuntime<Op, E> {
 
 	/** Snapshot / checkpoint encoding of the committed state (nsFoldV1 / cfgFoldV1). */
 	abstract readonly encoding: CheckpointEncoding;
-	/** foldRulesVersion written into checkpoints. */
+	/** foldRulesVersion of the committed state (written into its checkpoints). */
 	abstract readonly rulesVersion: number;
 	abstract get coversSeq(): Seq;
 	/** Replace the committed state from the snapshot (undefined / unusable -> empty). false = it was unusable. */
@@ -105,12 +128,26 @@ export abstract class FoldRuntime<Op, E> {
 	/** This device's replay right edge R in the committed fold (0 = none). */
 	protected abstract ownReplayEdge(): number;
 
+	/** Why the fold stopped (a row halt first), or null. */
+	get halted(): FoldHalt | null {
+		return this.rowHalt ?? this.checkpointHalt;
+	}
+
+	/** The stream's checkpoint at coversSeq has rules or a format this reader does not implement (catchUp.ts). */
+	haltAtCheckpoint(coversSeq: Seq): void {
+		this.checkpointHalt = { seq: coversSeq, reason: "newer-checkpoint", upgrade: true };
+	}
+	/** A read of the stream completed or adopted a checkpoint: no newer checkpoint stands in the way. */
+	clearCheckpointHalt(): void {
+		this.checkpointHalt = null;
+	}
+
 	/** (Re)load from the snapshot and refold the tail. */
 	async load(): Promise<FoldedFrame<Op, E>[]> {
 		const run = async () => {
 			const snap = await this.repo.getSnapshot(this.stream);
 			this.unusableSnapshot = this.reset(snap) ? null : snap!.coversSeq;
-			this.halted = null;
+			this.rowHalt = null;
 			this.through = Math.max(this.coversSeq, snap?.coversSeq ?? 0);
 			const folded = await this.doAdvance();
 			// Own rows above the fold (stale stream / halt) stay in the overlay.
@@ -135,7 +172,7 @@ export abstract class FoldRuntime<Op, E> {
 
 	private async doAdvance(): Promise<FoldedFrame<Op, E>[]> {
 		const rec = this.repo.stream(this.stream);
-		if (!rec || this.halted) return [];
+		if (!rec || this.rowHalt) return [];
 		if (rec.appliedSeq <= this.through) return [];
 		const target = rec.appliedSeq;
 		const rows = await this.repo.getTail(this.stream, this.through, target);
@@ -143,19 +180,19 @@ export abstract class FoldRuntime<Op, E> {
 		for (const row of rows) {
 			if (row.seq <= this.coversSeq) continue;
 			if (row.flags & LOCAL_FLAG_UNOPENED) {
-				this.halt(row.seq, "reader-dependent");
+				this.halt(row.seq, "reader-dependent", newerEnvelope(row.content));
 				return out;
 			}
 			const ops = row.content.length > 0 ? this.decodeOps(row.content) ?? [] : [];
 			const prev = this.coversSeq;
 			const { events, halted } = row.flags & LOCAL_FLAG_STALE_EPOCH ? { events: this.foldStale(row), halted: false } : this.foldFrame(row, ops);
 			if (halted) {
-				this.halt(row.seq, "rules-version");
+				this.halt(row.seq, "rules-version", true);
 				return out;
 			}
 			this.foldedRows++;
 			if (row.deviceId === this.self) this.committedOwn = this.committedOwn.filter((f) => f.clientFrameId !== row.clientFrameId);
-			if (this.isCandidate(prev, row.seq)) this.candidate = { seq: row.seq, bytes: this.encodeState(), authoredBySelf: row.deviceId === this.self };
+			if (this.isCandidate(prev, row.seq)) this.candidate = { seq: row.seq, bytes: this.encodeState(), authoredBySelf: row.deviceId === this.self, rulesVersion: this.rulesVersion };
 			out.push({ seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, ops, events });
 		}
 		this.through = target;
@@ -165,7 +202,7 @@ export abstract class FoldRuntime<Op, E> {
 	/** The rows that halted the fold were re-gated: lift a reader-dependent halt (serialized with advance). */
 	resume(): Promise<void> {
 		const run = async () => {
-			if (this.halted?.reason === "reader-dependent") this.halted = null;
+			if (this.rowHalt?.reason === "reader-dependent") this.rowHalt = null;
 		};
 		const p = this.busy.then(run, run);
 		this.busy = p.catch(() => undefined);
@@ -207,8 +244,8 @@ export abstract class FoldRuntime<Op, E> {
 		return null;
 	}
 
-	private halt(seq: Seq, reason: FoldHalt["reason"]): void {
-		this.halted = { seq, reason };
+	private halt(seq: Seq, reason: FoldHalt["reason"], upgrade: boolean): void {
+		this.rowHalt = { seq, reason, upgrade };
 		this.through = seq - 1;
 	}
 
@@ -217,10 +254,15 @@ export abstract class FoldRuntime<Op, E> {
 		return m === NS_CANDIDATE_INTERVAL ? isCandidateSeq(prev, s) : Math.floor(s / m) > Math.floor(prev / m);
 	}
 
-	/** The receipt removed an own outbox record of this stream: keep it pending until folded. */
-	noteCommitted(rec: OutboxRecord): void {
+	/**
+	 * The receipt removed an own outbox record of this stream: keep it pending until folded. A commit seq the fold
+	 * already covers is not pending: folded, or under the snapshot (a late receipt, e.g. a resend deduped against a
+	 * row a checkpoint collected, after this device adopted that checkpoint). Kept, it never left the overlay.
+	 */
+	noteCommitted(rec: OutboxRecord, seq: Seq | null = null): void {
 		if (rec.stream !== this.stream || rec.state === "poisoned" || rec.content.length === 0) return;
 		this.seeFrameNo(rec.frameNo ?? 0);
+		if (seq !== null && seq <= this.coversSeq) return;
 		if (this.committedOwn.some((f) => f.clientFrameId === rec.clientFrameId)) return;
 		this.committedOwn.push({ clientFrameId: rec.clientFrameId, authorNsSeq: rec.authorNsSeq, frameNo: rec.frameNo ?? 0, ops: this.decodeOps(rec.content) ?? [] });
 	}

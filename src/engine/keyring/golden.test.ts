@@ -10,7 +10,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createCipheriv, createHash, createHmac, hkdfSync } from "node:crypto";
 import { bytesToHex, hexToBytes } from "../../core/codec/lib0";
-import { decodeRecoveryKey, encodeRecoveryKey, makeRecoveryKey } from "../../core/codec/recoveryKey";
+import { decodeRecoveryKey, encodeRecoveryKey, makeRecoveryKey } from "../../core/codec/testkit/recoveryKey";
 import type { WrapRole } from "../../ports/crypto";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";

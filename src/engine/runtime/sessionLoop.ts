@@ -24,7 +24,7 @@ import type { ReadPage, ReadRequest, RelayConnectResult, RelayEvent, RelaySessio
 import { readStream, staleOrder, type ReadResult } from "../sync/catchUp";
 import type { EngineCtx } from "./context";
 import { connectFailure, newReconnectState, sessionClosed, type ReconnectDecision } from "./relayPolicy";
-import { retryReaderQuarantine } from "./quarantineRelease";
+import { regateUnopened, retryReaderQuarantine } from "./quarantineRelease";
 
 type Closed = Extract<RelayEvent, { t: "closed" }>;
 
@@ -45,6 +45,12 @@ export class SessionLoop {
 	private feeding: Promise<void> | null = null;
 	private readonly reads = new Map<StreamName, Promise<void>>();
 	private readonly readBackoff = new Map<StreamName, number>();
+	/**
+	 * Streams whose read stopped at a checkpoint this reader cannot use yet (ReadResult "held"), with the session
+	 * that read it: not read again in that session (a key or `k` change releases the wait, releaseHeld). Nothing
+	 * is stored: the next session reads them again.
+	 */
+	private readonly held = new Map<StreamName, { readonly gen: number; readonly upgrade: boolean }>();
 	/** Catch-up lanes in use: single reads and batches (bounded by catchUpConcurrency). */
 	private lanes = 0;
 	stats = { sessions: 0, connectFailures: 0, feedPages: 0, reads: 0, readFailures: 0, readBatches: 0 };
@@ -59,6 +65,16 @@ export class SessionLoop {
 	}
 	isReading(stream: StreamName): boolean {
 		return this.reads.has(stream);
+	}
+	/** Held at a checkpoint in this session (catchUp "held"): catch-up skips it, isIdle does not wait for it. */
+	isHeld(stream: StreamName): boolean {
+		return this.held.get(stream)?.gen === this.c.gen;
+	}
+	/** Keys or `k` changed: checkpoints held for a key are read again (one held for an upgrade waits for a restart). */
+	releaseHeld(): void {
+		let n = 0;
+		for (const [stream, h] of this.held) if (!h.upgrade && this.held.delete(stream)) n++;
+		if (n > 0) this.scheduleCatchUp();
 	}
 
 	startLoop(): void {
@@ -150,12 +166,14 @@ export class SessionLoop {
 				this.st = newReconnectState();
 				return;
 			}
+			// Unopened fold rows are re-gated on every session start, as quarantine is below: a client upgraded
+			// since (a newer envelope it now opens) or new keys lift the halt (suite 1 did it in afterKRead too).
+			await regateUnopened(c).catch((e) => c.diag("unopened-regate-failed", { error: String(e) }));
+			if (gen !== c.gen) return;
 			await this.readInOrder([NS_STREAM, CFG_STREAM, SNAP_STREAM].filter((s) => c.repo.stream(s)?.stale));
 			if (gen !== c.gen) return;
 			c.sender.openNs();
-			await c.afterNsChange();
-			await c.afterCfgChange();
-			await c.afterSnapChange();
+			await c.refold(false);
 			if (gen !== c.gen) return;
 			c.setPhase(c.livePhase());
 			this.st = newReconnectState();
@@ -195,7 +213,7 @@ export class SessionLoop {
 			const v = c.repo.cursor.vaultSeq;
 			const page = await s.feed(v);
 			if (gen !== c.gen) return;
-			const res = await c.repo.tFeedPage(page.entries, page.throughSeq, page.headSeq, c.now());
+			const res = await c.repo.tFeedPage(page.entries, page.throughSeq, page.headSeq);
 			this.stats.feedPages++;
 			if (page.headSeq > c.repo.cursor.headSeqSeen) c.repo.cursor.headSeqSeen = page.headSeq;
 			noProgress = res.vaultSeq > v ? 0 : noProgress + 1;
@@ -424,29 +442,18 @@ export class SessionLoop {
 
 	private async postRead(stream: StreamName, res: ReadResult): Promise<void> {
 		const c = this.c;
-		c.applyOutboxResult(res);
 		if (res.t === "retry" || (res.t === "aborted" && res.error)) this.readBackoff.set(stream, c.mono() + c.tuning.readBackoffMs);
-		const cls = streamClass(stream);
-		if (cls === "body" || cls === "canvas") {
-			let h = c.handles.peek(stream);
-			if (!h) {
-				const loading = c.handles.loadingOf(stream);
-				if (loading) h = await loading.catch(() => undefined);
-			}
-			if (h) {
-				if (res.checkpointState || res.apply.length > 0) await c.docs.applyToHandle(h, res.apply, res.checkpointState);
-				c.docs.checkDoc(h);
-			}
-			// A completed read makes the stream caught up (§d.7), which the disk side waits on, even when
-			// every row is own (the author re-reading after its DB was lost); own plain rows change content too.
-			if (res.checkpointState || res.t === "done" || res.apply.length > 0 || res.tailPut.some((r) => r.deviceId !== c.self)) c.noteBodyChange([stream]);
-		} else if (cls === "ns") await c.afterNsChange(res.replacedFold);
-		else if (cls === "cfg") await c.afterCfgChange(res.replacedFold);
-		else if (cls === "snap") await c.afterSnapChange(res.replacedFold);
-		else if (cls === "keyring") await c.keyring.ingestRows(res.tailPut, true);
-		if (cls !== "ns" && res.removed.length > 0) await c.afterNsChange();
+		const fold = c.foldOf(stream)?.rt;
+		if (res.t === "held" && res.held) {
+			this.held.set(stream, { gen: c.gen, upgrade: res.held.upgrade });
+			// Newer rules or format: the fold halts at the checkpoint (phase upgrade-required through noteHalts).
+			if (res.held.upgrade) fold?.haltAtCheckpoint(res.held.coversSeq);
+		} else if (res.t === "done") {
+			this.held.delete(stream);
+			fold?.clearCheckpointHalt();
+		}
 		if (res.rows > 0 || res.t === "done") c.lastSyncedAtMs = c.now();
-		c.scheduleStatus();
+		await c.afterStored({ ...res, live: false, read: { stream, done: res.t === "done", checkpointState: res.checkpointState, replacedFold: res.replacedFold } });
 	}
 
 	/**
@@ -477,7 +484,7 @@ export class SessionLoop {
 		const now = c.mono();
 		const onlyK = c.keyring.readsOnlyK();
 		const order = staleOrder(c.repo.streams(), (r) => c.repo.priorityFn(r), (r) =>
-			this.reads.has(r.stream) || r.cls === "other" || (onlyK && r.cls !== "keyring") || (r.frozen === 1 && r.frozenReason === "checkpoint-disputed") || (this.readBackoff.get(r.stream) ?? 0) > now);
+			this.reads.has(r.stream) || r.cls === "other" || (onlyK && r.cls !== "keyring") || (r.frozen === 1 && r.frozenReason === "checkpoint-disputed") || this.isHeld(r.stream) || (this.readBackoff.get(r.stream) ?? 0) > now);
 		const per = this.batching(s);
 		for (let i = 0; slots > 0 && i < order.length; slots--) {
 			const group = order.slice(i, i + per).map((r) => r.stream);
@@ -557,9 +564,5 @@ export class SessionLoop {
 		this.clearReconnect();
 		this.st = newReconnectState();
 		await this.connectOnce();
-	}
-
-	async idleReads(): Promise<void> {
-		while (this.reads.size > 0 || this.feeding) await Promise.all([...this.reads.values(), this.feeding]);
 	}
 }

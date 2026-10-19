@@ -1,4 +1,4 @@
-/** Seeded PRNG (mulberry32) for deterministic property tests and sims. Pure. */
+/** Seeded PRNG (mulberry32) for deterministic property tests and the reconcile fakes. Pure. */
 export function prng(seed: number): () => number {
 	let s = seed >>> 0;
 	return () => {

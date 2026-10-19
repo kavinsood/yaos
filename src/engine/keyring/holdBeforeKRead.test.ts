@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import * as Y from "yjs";
 import { KEYRING_STREAM, type DeviceId, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, sleep, until } from "../runtime/testHarness";
+import { converged, sleep, until, createDoc, docText } from "../runtime/testHarness";
 import { live, oldEpochFrame, rawAppend, start } from "./testkit/engines";
 import { K, genesis, roll } from "./testkit/world";
 
@@ -33,7 +33,7 @@ describe("live rows before the session's k read (§14.3)", () => {
 		try {
 			await live(x);
 			await live(y);
-			const id = await x.engine.createDoc("a.md" as VaultPath, "base;");
+			const id = await createDoc(x.engine, "a.md" as VaultPath, "base;");
 			await converged([x.engine, y.engine]);
 			y.engine.disconnect();
 			// `k` moves while y is away (a roll x applies), so y's session start reads `k` over a slow link.
@@ -51,8 +51,8 @@ describe("live rows before the session's k read (§14.3)", () => {
 			assert.ok(rows >= 5, `${rows} rows during the session start`);
 			relay.setLink("dev-y" as DeviceId, {});
 			await converged([x.engine, y.engine]);
-			const text = await x.engine.docText(id);
-			assert.equal(await y.engine.docText(id), text);
+			const text = await docText(x.engine, id);
+			assert.equal(await docText(y.engine, id), text);
 			assert.equal(text.length, "base;".length + Array.from({ length: rows }, (_, i) => `r${i};`).join("").length);
 			assert.deepEqual(frozen, [], "nothing froze");
 			assert.equal(y.engine.status().counts.quarantinedRows, 0);

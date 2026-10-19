@@ -12,6 +12,7 @@
  *   await rec.applyOwnFold(events);            // S1, from the ns runtime
  */
 
+import { newDocId } from "../../core/codec/ids";
 import type { BrakeReport, DocId, PathKey, PlanScope, PlannerInput, PlannerOp } from "../../core/types";
 import { brakeId, brakeIdentity, rejectHeld } from "../../core/plan/brake";
 import { planWith } from "../../core/plan/planner";
@@ -27,20 +28,6 @@ import { Scanner } from "./scan";
 import { SkipNoticeGate, unexpectedSkips } from "./skipNotice";
 import { recoverTempNames } from "./tempRecovery";
 import { ReconcileStore } from "./store";
-
-const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-/** base64url without padding (16 random bytes -> 22 chars). */
-export function base64url(bytes: Uint8Array): string {
-	let out = "";
-	for (let i = 0; i < bytes.length; i += 3) {
-		const b0 = bytes[i]!, b1 = bytes[i + 1], b2 = bytes[i + 2];
-		out += B64URL[b0 >> 2]! + B64URL[((b0 & 3) << 4) | ((b1 ?? 0) >> 4)]!;
-		if (b1 !== undefined) out += B64URL[((b1 & 15) << 2) | ((b2 ?? 0) >> 6)]!;
-		if (b2 !== undefined) out += B64URL[b2 & 63]!;
-	}
-	return out;
-}
 
 export interface PassReport extends RunReport {
 	readonly planned: number;
@@ -127,7 +114,7 @@ export class Reconciler {
 
 	private freshIds(n: number): DocId[] {
 		const out: DocId[] = [];
-		for (let i = 0; i < n; i++) out.push(base64url(this.ctx.deps.random.bytes(16)) as DocId);
+		for (let i = 0; i < n; i++) out.push(newDocId(this.ctx.deps.random));
 		return out;
 	}
 
@@ -180,7 +167,7 @@ export class Reconciler {
 			brake: ctx.brake, brakeApproval: ctx.brakeApproval, freshDocIds, deviceLabel: ctx.deps.deviceLabel, nowMs: ctx.now(),
 		};
 		const plan = planWith(input, {
-			pathKey: ctx.pk, nsReady: view.nsReady, divergence: view.divergence, brakeWindow: ctx.window(),
+			pathKey: ctx.pk, nsReady: view.nsReady, brakeWindow: ctx.window(),
 			tzOffsetMinutes: ctx.deps.tzOffsetMinutes?.() ?? 0, remoteTextHash: view.textHash, bodyAppliedSeq: view.appliedSeq, restoreDuty: view.restoreDuty,
 			lostCreateBody: view.lostCreateBody,
 			...(ctx.deps.pathBaseKeys ? { pathBaseKeys: ctx.deps.pathBaseKeys } : {}),

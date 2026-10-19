@@ -1,16 +1,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-	base64Url, buildSetupLink, DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, enroll, fetchCapabilities,
+	base64Url, buildSetupLink, DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, fetchCapabilities,
 	FENCE_RETRY_DELAYS_MS, generateDeviceId, generateDeviceToken, generateEnrollmentRequestId, normalizeHost,
 	normalizePairingCode, PairingError, parseSetupLink, prepareEnrollment, requestPairingCode, runEnrollment,
 	attemptMatches, pairDevice, retireDeviceEnrollment, RETIRE_FAILED_MESSAGE, scrubSecrets,
 	buildRekeyLink, claimServer, decodeKeyParam, encodeKeyParam, generateOperatorKey, normalizeOperatorKey, operatorCreateVault,
 	operatorLogin, operatorLogout, PAIRING_CALL_DEADLINE_MS, pairingCodeVaultId,
-	type HttpRequest, type HttpResponse, type LinkKey, type PairingDeps,
+	type EnrollInput, type HttpRequest, type HttpResponse, type LinkKey, type PairingDeps,
 } from "./pairing";
 import type { PairedIdentity } from "./api";
 import { BAD_VAULT_IDS, testVaultId } from "../keys/testkit/vaultIds";
+
+/** A fresh attempt, then the enrollment: the two calls the pairing and creation flows make. */
+const enroll = (input: EnrollInput, deps: PairingDeps): Promise<PairedIdentity> => runEnrollment(prepareEnrollment(input, deps.randomBytes), deps);
 
 const CODE = "pc_ABCDEFGHIJKLMNOPQRSTUVWX";
 const VAULT = testVaultId("vaultOne");

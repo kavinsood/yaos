@@ -14,7 +14,7 @@ import { bodyCheckpointDue, CHECKPOINT_FALLBACK_MS, CheckpointState, DEFAULT_CHE
 import type { StreamRecord } from "../store/schema";
 import type { FoldRuntime } from "../sync/foldRuntime";
 import type { LogEngine } from "./engine";
-import { converged, drive, sleep, startTestEngine, until } from "./testHarness";
+import { converged, drive, sleep, startTestEngine, until, createDoc, editDoc } from "./testHarness";
 
 const S = REMOTE_CHECKPOINT_SETTLE_MS;
 const F = CHECKPOINT_FALLBACK_MS;
@@ -23,9 +23,9 @@ const stream = "b:doc" as StreamName;
 
 function rec(o: Partial<StreamRecord>): StreamRecord {
 	return {
-		stream, cls: "body", docId: null, appliedSeq: 10, remoteHeadSeq: 10, stale: 0, priority: 0, snapshotCoversSeq: 0, tailRows: 0, tailBytes: 0,
+		stream, cls: "body", docId: null, appliedSeq: 10, remoteHeadSeq: 10, stale: 0, snapshotCoversSeq: 0, tailRows: 0, tailBytes: 0,
 		remoteCheckpointCoversSeq: 0, rowsSinceRemoteCheckpoint: 0, bytesSinceRemoteCheckpoint: 0, lastOwnSeq: 0, bodyVersion: 0 as never,
-		quarantinedRows: 0, frozen: 0, frozenReason: null, disputedCheckpointCoversSeq: 0, lastAccessMs: 0, textHash: null, ...o,
+		quarantinedRows: 0, frozen: 0, frozenReason: null, disputedCheckpointCoversSeq: 0, textHash: null, ...o,
 	};
 }
 
@@ -145,16 +145,16 @@ test("engine: a quiescent vault ends with no tail; the typed-in doc is not check
 	const [a, b] = es as [LogEngine, LogEngine];
 	try {
 		await until(() => es.every((e) => e.status().phase === "live"), 10_000, "live", clock);
-		const single = await drive(a.createDoc("single.md" as VaultPath, "one row"), clock);
-		const typing = await drive(a.createDoc("typing.md" as VaultPath, "draft"), clock);
+		const single = await drive(createDoc(a, "single.md" as VaultPath, "one row"), clock);
+		const typing = await drive(createDoc(a, "typing.md" as VaultPath, "draft"), clock);
 		const ids: DocId[] = [];
-		for (let i = 0; i < 8; i++) ids.push(await drive(a.createDoc(`d${i}.md` as VaultPath, `seed ${i};`), clock));
+		for (let i = 0; i < 8; i++) ids.push(await drive(createDoc(a, `d${i}.md` as VaultPath, `seed ${i};`), clock));
 		await converged(es, 30_000, clock);
 		// Below the hot threshold: 2..9 edits per doc; odd docs end on b, every third doc is edited by both.
 		for (let i = 0; i < ids.length; i++) {
 			for (let k = 0; k < 2 + i; k++) {
 				const e = i % 3 === 0 ? (k % 2 === 0 ? a : b) : i % 2 === 1 ? b : a;
-				await drive(e.editDoc(ids[i]!, (t) => t.insert(t.length, `e${k};`)), clock);
+				await drive(editDoc(e, ids[i]!, (t) => t.insert(t.length, `e${k};`)), clock);
 				await sleep(200, clock);
 			}
 		}
@@ -167,7 +167,7 @@ test("engine: a quiescent vault ends with no tail; the typed-in doc is not check
 		let typed = 0;
 		const typeFor = async (ms: number) => {
 			for (let t = 0; t < ms; t += 5_000) {
-				await drive(a.editDoc(typing, (x) => x.insert(x.length, "x")), clock);
+				await drive(editDoc(a, typing, (x) => x.insert(x.length, "x")), clock);
 				typed++;
 				await sleep(5_000, clock);
 			}
@@ -216,8 +216,8 @@ test("engine: the duty device goes away before S; the other device checkpoints a
 		await until(() => a.status().phase === "live" && b.status().phase === "live", 10_000, "live", clock);
 		const ids: DocId[] = [];
 		for (let i = 0; i < 4; i++) {
-			ids.push(await drive(a.createDoc(`g${i}.md` as VaultPath, `seed ${i};`), clock));
-			for (let k = 0; k < 3; k++) await drive(a.editDoc(ids[i]!, (t) => t.insert(t.length, `e${k};`)), clock);
+			ids.push(await drive(createDoc(a, `g${i}.md` as VaultPath, `seed ${i};`), clock));
+			for (let k = 0; k < 3; k++) await drive(editDoc(a, ids[i]!, (t) => t.insert(t.length, `e${k};`)), clock);
 		}
 		await converged([a, b], 30_000, clock);
 		const streams = ids.map((id) => a.streamOf(id));
@@ -242,8 +242,8 @@ test("engine: a restart in the middle of an edit session waits S after going liv
 	let a = first.engine;
 	try {
 		await until(() => a.status().phase === "live", 10_000, "live", clock);
-		const id = await drive(a.createDoc("r.md" as VaultPath, "seed;"), clock);
-		for (let k = 0; k < 3; k++) await drive(a.editDoc(id, (t) => t.insert(t.length, `e${k};`)), clock);
+		const id = await drive(createDoc(a, "r.md" as VaultPath, "seed;"), clock);
+		for (let k = 0; k < 3; k++) await drive(editDoc(a, id, (t) => t.insert(t.length, `e${k};`)), clock);
 		await converged([a], 30_000, clock);
 		const s = a.streamOf(id);
 		await sleep(60_000, clock); // the restart comes before S of quiet
@@ -267,14 +267,14 @@ test("engine: ns settles at its newest candidate once quiet (below NS_CHECKPOINT
 	const a = (await startTestEngine({ relay, deviceId: "dev-a", clock, tuning: TUNING })).engine;
 	try {
 		await until(() => a.status().phase === "live", 10_000, "live", clock);
-		const x = await drive(a.createDoc("x.md" as VaultPath, "x"), clock);
-		await drive(a.createDoc("y.md" as VaultPath, "y"), clock);
+		const x = await drive(createDoc(a, "x.md" as VaultPath, "x"), clock);
+		await drive(createDoc(a, "y.md" as VaultPath, "y"), clock);
 		// Move the vault seq past the first candidate boundary with body frames, then add an ns row there.
 		while ((relay.rows(a.streamOf(x), { includeGc: true }).at(-1)?.seq ?? 0) < 1_000) {
-			await drive(a.editDoc(x, (t) => t.insert(t.length, "z")), clock);
+			await drive(editDoc(a, x, (t) => t.insert(t.length, "z")), clock);
 			await sleep(20, clock);
 		}
-		await drive(a.createDoc("z.md" as VaultPath, "z"), clock);
+		await drive(createDoc(a, "z.md" as VaultPath, "z"), clock);
 		await until(() => (a.c.ns.candidate?.seq ?? 0) > 1_000, 30_000, "ns candidate", clock);
 		const cand = a.c.ns.candidate!.seq;
 		assert.ok(relay.rows(NS_STREAM).length < DEFAULT_CHECKPOINT_TUNING.nsRows, "below the ns hot threshold");

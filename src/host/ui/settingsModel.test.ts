@@ -154,9 +154,9 @@ function snap(phase: EnginePhase, over: Partial<StatusSnapshot> = {}): StatusSna
 }
 
 test("engine rows and labels", () => {
-	const running = { phase: "running", transport: "worker", lastError: null } as const;
-	assert.deepEqual(engineRows({ phase: "unpaired", transport: null, lastError: null }, null, 0), [{ name: "Engine", value: "Not paired" }]);
-	assert.match(runStateLabel({ phase: "failed", transport: null, lastError: "boom" }), /boom/);
+	const running = { phase: "running", lastError: null } as const;
+	assert.deepEqual(engineRows({ phase: "unpaired", lastError: null }, null, 0), [{ name: "Engine", value: "Not paired" }]);
+	assert.match(runStateLabel({ phase: "failed", lastError: "boom" }), /boom/);
 	assert.equal(runStateLabel(running), "Running in a background worker");
 	const rows = engineRows(running, snap("live", { lastSyncedAtMs: 0 }), 120_000);
 	const byName = Object.fromEntries(rows.map((r) => [r.name, r.value]));
@@ -170,9 +170,13 @@ test("engine rows and labels", () => {
 	const phases: EnginePhase[] = ["starting", "recovering", "bootstrapping", "catching-up", "live", "offline", "paused", "braked", "daily-limit", "superseded", "revoked", "epoch-migrating", "upgrade-required", "error"];
 	assert.equal(new Set(phases.map(phaseLabel)).size, phases.length);
 	assert.equal(engineAcceptsCommands(running), true);
-	assert.equal(engineAcceptsCommands({ phase: "stopped", transport: null, lastError: null }), false);
+	assert.equal(engineAcceptsCommands({ phase: "stopped", lastError: null }), false);
 	assert.equal(isPaused(snap("paused")), true);
 	assert.equal(isPaused(null), false);
+	// A vault-side upgrade (a fold halted, DESIGN §c.10) says what to do; the server's does not add the row.
+	const upgrade = engineRows(running, snap("upgrade-required", { notices: [{ code: "upgrade-required:snap", level: "error", atMs: 0 }] }), 0);
+	assert.equal(Object.fromEntries(upgrade.map((r) => [r.name, r.value]))["Update required"], "This vault was written by a newer YAOS. Update the plugin to keep syncing. Until then, vault snapshots are paused.");
+	assert.ok(!engineRows(running, snap("upgrade-required"), 0).some((r) => r.name === "Update required"));
 });
 
 test("attachment size description names the open carrier's limit when the status has it, rounded down", () => {

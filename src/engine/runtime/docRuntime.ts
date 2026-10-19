@@ -138,13 +138,15 @@ export class DocRuntime {
 		return this.chain(async () => {
 			try {
 				const docId = streamDocId(h.stream);
-				const held = c.outbox.newestAdoptable(h.stream)?.clientFrameId ?? c.outbox.heldDependency(h.stream);
 				// A live create's body frames are pending and follow it on the wire; an onboarding create's are held
-				// until its fold (DESIGN §e.1).
+				// until its fold, and so are the doc's later frames (DESIGN §e.1). An adoptable holds nothing: the peer's
+				// frame reached the relay before we saw it, and a re-sent adopted copy that lands after ours leaves
+				// peers a causal hole well inside the §d.6 retry window (§d.5).
+				const held = c.outbox.heldDependency(h.stream);
 				const create = held === null && docId ? c.createDependency(docId) : null;
 				const dependsOn = held ?? create?.cfid ?? null;
 				const frames = await buildBodyFrames(c.deps, { stream: h.stream, content: taken.content, flags: taken.flags, authorNsSeq: c.ns.coversSeq, dependsOn, sendAfter: create?.live === true, nowMs: c.now() });
-				c.addOutbox(await c.repo.tEdit(frames, c.now()));
+				c.addOutbox(await c.repo.tEdit(frames));
 				c.ckpt.lastActivity.set(h.stream, c.mono());
 				this.stats.framesClosed++;
 				durable?.(true);
@@ -162,29 +164,6 @@ export class DocRuntime {
 				c.handles.unpin(h);
 			}
 		});
-	}
-
-	/** Committed body rows (receipts and settled adoptables excluded) -> resident replicas. */
-	async applyRows(rows: readonly TailRecord[]): Promise<void> {
-		const byStream = new Map<StreamName, TailRecord[]>();
-		for (const row of rows) {
-			const cls = streamClass(row.stream);
-			if (cls !== "body" && cls !== "canvas") continue;
-			let l = byStream.get(row.stream);
-			if (!l) byStream.set(row.stream, (l = []));
-			l.push(row);
-		}
-		for (const [stream, list] of byStream) {
-			this.c.ckpt.lastActivity.set(stream, this.c.mono());
-			let h = this.c.handles.peek(stream);
-			if (!h) {
-				const loading = this.c.handles.loadingOf(stream);
-				if (loading) h = await loading.catch(() => undefined);
-			}
-			if (!h) continue;
-			await this.applyToHandle(h, list);
-			this.checkDoc(h);
-		}
 	}
 
 	/** Apply rows to one replica in one REMOTE transaction; unresolved refs are kept for retry. */
@@ -343,7 +322,7 @@ export class DocRuntime {
 				const now = c.now();
 				const f = await buildAdoptFrame(c.deps, ev.stream, g.inner.kind, g.inner.authorNsSeq, g.inner.flags, g.update,
 					{ deviceId: ev.deviceId, clientFrameId: ev.clientFrameId, receivedAtMs: now }, now);
-				c.addOutbox(await c.repo.tEdit([f], now, false));
+				c.addOutbox(await c.repo.tEdit([f], false));
 				this.stats.adopted++;
 				adopted = true;
 			});

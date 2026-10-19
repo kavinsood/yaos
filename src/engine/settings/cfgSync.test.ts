@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { utf8Encode } from "../../core/hash/utf8";
+import { utf8Encode } from "../../core/codec/lib0";
 import { FakeBlobs } from "../reconcile/testkit/fakes";
 import { CFG_INLINE_MAX_BYTES, CFG_JSON_FILES, classifyConfigPath } from "./allowlist";
 import { Device, SharedCfgLog } from "./testkit";

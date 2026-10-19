@@ -79,7 +79,7 @@ test("worker entry answers ping before init, inits on IndexedDB and accepts obse
 	const ready = await waitFor((m) => (m.t === "result" || m.t === "error") && m.re === 2);
 	assert.equal(ready.t, "result", JSON.stringify(ready));
 	assert.equal(ready.t === "result" && ready.value.t === "ready" && ready.value.protocolVersion, PROTOCOL_VERSION);
-	post({ t: "observations", rid: 3, scanId: 1, complete: true, chunk: [{ stat: { path: "a.md", size: 2, mtimeMs: 1, ctimeMs: 1 } }] });
+	post({ t: "observations", rid: 3, complete: true, chunk: [{ stat: { path: "a.md", size: 2, mtimeMs: 1, ctimeMs: 1 } }] });
 	// No relay here (wss://x is unreachable) and no known epoch: the disk side waits for the
 	// first connect, so the observations are accepted but no read follows (the sim covers that).
 	const obs = await waitFor((m) => (m.t === "result" || m.t === "error") && m.re === 3);

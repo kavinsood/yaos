@@ -21,7 +21,7 @@
  * results holds, per sample, the PUT's duration and whether it was still in flight when the edit arrived.
  */
 import { randomBytes as nodeRandomBytes } from "node:crypto";
-import { makeRecoveryKey } from "../../src/core/codec/recoveryKey";
+import { makeRecoveryKey } from "../../src/core/codec/testkit/recoveryKey";
 import { YaosController } from "../../src/host/pluginController";
 import { VaultKeyStore } from "../../src/host/keys/secretStore";
 import { DEFAULT_ENGINE_SETTINGS, defaultPluginData, type YaosPluginData } from "../../src/host/ui/api";

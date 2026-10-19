@@ -78,7 +78,7 @@ export interface DeviceCheckRun {
 }
 
 /** Asks the engine for the check and formats its report. Rejects with a message safe to show. */
-export async function runDeviceCheck(host: Pick<YaosUiHost, "deviceCheck" | "data" | "pluginVersion" | "runState">, mode: DeviceCheckMode): Promise<DeviceCheckRun> {
+export async function runDeviceCheck(host: Pick<YaosUiHost, "deviceCheck" | "data" | "pluginVersion">, mode: DeviceCheckMode): Promise<DeviceCheckRun> {
 	const report = await host.deviceCheck(mode);
 	return { report, text: formatDeviceCheck(report, diagnosticsSettings(host, false)), fileName: deviceCheckFileName(report.startedAtMs, mode) };
 }

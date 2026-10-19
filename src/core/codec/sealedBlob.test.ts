@@ -7,7 +7,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { SNAP_DEFAULT_PART_BYTES, snapPartBytes } from "../snap/bundle";
 import { padmeLen } from "./padme";
-import { decodeBlobHeader, encodeBlobHeader, maxSealedBlobPlaintext, sealedBlobBytes } from "./sealedBlob";
+import { decodeBlobHeader, encodeBlobHeader, maxSealedBlobPlaintext } from "./sealedBlob";
+import { sealedBlobBytes } from "./testkit/sealedBlobSize";
 
 const MIB = 1024 * 1024;
 const MAX_EPOCH = Number.MAX_SAFE_INTEGER;

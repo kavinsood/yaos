@@ -7,7 +7,6 @@
  * frozen `PlanFn` signature and the engine can pass the extra facts through
  * `planWith(input, ctx)`:
  *   - nsReady: ns caught up once this session and not halted (§f.2 gates, §c.10)
- *   - divergence: V3 mismatch (§b.5) for the ns-divergence brake
  *   - brakeWindow: destructive ops executed in the rolling 10-minute window
  *   - tzOffsetMinutes: local time for conflict names (core may not read Date)
  *   - remoteTextHash: streams.textHash of caught-up md/canvas docs
@@ -70,7 +69,6 @@ export const EMPTY_CONTENT_HASH = sha256Hex(new Uint8Array(0)) as ContentHash;
 export interface PlannerContext {
 	readonly pathKey: PathKeyFn;
 	readonly nsReady: boolean;
-	readonly divergence: boolean;
 	readonly brakeWindow: BrakeWindow;
 	readonly tzOffsetMinutes: number;
 	readonly remoteTextHash: ReadonlyMap<DocId, ContentHash>;
@@ -84,7 +82,6 @@ export interface PlannerContext {
 export const DEFAULT_PLANNER_CONTEXT: PlannerContext = {
 	pathKey: standInPathKey,
 	nsReady: true,
-	divergence: false,
 	brakeWindow: EMPTY_WINDOW,
 	tzOffsetMinutes: 0,
 	remoteTextHash: new Map(),
@@ -242,13 +239,24 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		// rename took it (sim DEV3 F seed 452: the doc's file renamed n6 -> r4 offline, another note n4 -> r2,
 		// the doc moved to r2 by a peer; r2's note merged into the doc as a conflict and r4 became a duplicate).
 		const l = s.fileGone ? undefined : input.local.get(s.pathKey);
+		const movable = r !== undefined && r.state === "live" && r.pathKey !== s.pathKey && !syncedByKey.has(r.pathKey) && !arrivedElsewhere(r.pathKey, s);
+		const atR = movable ? input.local.get(r.pathKey) : undefined;
+		if (l && atR && ownBytesAt(s, r!, l, atR)) return { l: atR, atRemote: true };
 		if (l) return { l, atRemote: false };
-		if (r && r.state === "live" && r.pathKey !== s.pathKey && !syncedByKey.has(r.pathKey) && !arrivedElsewhere(r.pathKey, s)) {
-			const atR = input.local.get(r.pathKey);
-			if (atR) return { l: atR, atRemote: true };
-		}
+		if (atR) return { l: atR, atRemote: true };
 		return { l: undefined, atRemote: false };
 	};
+	/**
+	 * S is behind a move of the doc (an S restored from a mirror older than the move, after an IDB loss): the file at
+	 * the doc's remote path holds S's bytes, which are still the doc's current ones, and the file at S's path holds
+	 * other bytes. The doc's file is the one at the remote path; the other is a new file (another doc's, which took
+	 * S's old path). Taking the file at S's path instead trashed the doc's own file as a copy (`ownCopyAt`) and
+	 * pushed the other file's bytes as an edit of the doc (sim seed 630 F DEV3, production checkpoints: B's
+	 * attachment got C's bytes at the same path).
+	 */
+	const ownBytesAt = (s: SyncedEntry, r: RemoteEntry, l: LocalEntry, atR: LocalEntry): boolean =>
+		!atR.excluded && atR.kind === s.kind && l.hash !== null && atR.hash !== null &&
+		atR.hash === s.contentHash && l.hash !== s.contentHash && remoteHash(r) === s.contentHash;
 
 	// ---- remote moves into occupied paths ---------------------------------------
 	// A file at a live remote entry's path is that doc's, unless the doc is synced at another path and its file is
@@ -295,6 +303,21 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 	}
 	const inferred = new Map<DocId, InferredRename>();
 	if (ctx.nsReady) for (const rn of inferRenames(missing, freshLocal, input.renames, input.localComplete, pk)) inferred.set(rn.docId, rn);
+	// A doc deleted remotely whose file the user renamed here (observed only: the rename is the user's, not a
+	// guess): the file is still the doc's. Unpaired, the doc is dropped and the observed rename later pairs with
+	// whatever doc takes the source path next, merging this file into it (sim DEV5 F seed 157: an offline edit and
+	// rename of a note a peer deleted and re-created at its path; the edits landed in the new note's body).
+	if (ctx.nsReady && input.renames.length > 0) {
+		const gone: SyncedEntry[] = [];
+		for (const id of docIds) {
+			const s = input.synced.get(id);
+			const r = s ? resolve(id) : undefined;
+			if (s && r && r.state === "deleted" && localFor(s, r).l === undefined) gone.push(s);
+		}
+		const used = new Set([...inferred.values()].map((rn) => rn.to.pathKey));
+		const rest = freshLocal.filter((l) => !used.has(l.pathKey));
+		if (gone.length > 0) for (const rn of inferRenames(gone, rest, input.renames, false, pk)) inferred.set(rn.docId, rn);
+	}
 	// Observed renames off a re-occupied source path (header): observed-only inference over the rest.
 	const renamedFrom = new Set(input.renames.map((e) => pk(e.from)));
 	const movedAway = new Set<DocId>();
@@ -416,7 +439,11 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		push([...prefix, { op: "nsCreate", docId: id, kind: l.kind, path: l.path, contentHash: l.hash!, size: l.size }, ...initialContent(id, l), drop(s.docId)]);
 	};
 
-	const deleted = (s: SyncedEntry, r: RemoteEntry, l: LocalEntry | undefined, prefix: PlannerOp[]): void => {
+	const deleted = (s: SyncedEntry, origId: DocId, r: RemoteEntry, l: LocalEntry | undefined, prefix: PlannerOp[]): void => {
+		// Before ns is ready inference is off: S carries the identity an observed rename of the file still needs.
+		if (!l && !ctx.nsReady) return push(prefix);
+		const inf = l ? undefined : inferred.get(origId);
+		if (inf && !claimed.has(inf.to.pathKey)) return deletedRenamed(s, r, inf.to, prefix);
 		if (!l) return push([...prefix, drop(s.docId)]);
 		if (!ctx.nsReady) return push(prefix);
 		const Lc = l.hash !== s.contentHash;
@@ -437,6 +464,30 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 			}
 		}
 		push(ops);
+	};
+
+	/**
+	 * The user renamed the file of a doc deleted remotely (observed rename, not yet published). The rename is an
+	 * edit of the doc the deleter never saw: it wins as an ns rename does (E6), so the doc is restored at the new
+	 * path, with the file's content (`reconcileContent` records the synced path; otherwise a `syncedPut` does).
+	 */
+	const deletedRenamed = (s0: SyncedEntry, r: RemoteEntry, l2: LocalEntry, prefix: PlannerOp[]): void => {
+		const { fileGone: _gone, ...s } = s0;
+		claimed.add(l2.pathKey);
+		if (l2.hash === null) return push([...prefix, { op: "needHash", path: l2.path }]);
+		if (r.pendingLocal) return push([...prefix, waitOp(s.docId, "pending-ns")]);
+		const ops: PlannerOp[] = [...prefix, { op: "nsRestore", docId: s.docId, path: l2.path, againstDeleteSeq: r.deletedSeq }];
+		const moved: PlannerOp = { op: "syncedPut", entry: { ...s, path: l2.path, pathKey: l2.pathKey } };
+		if (l2.hash === s.contentHash) ops.push(moved);
+		else if (s.kind === "blob") {
+			ops.push({ op: "nsSetBlob", docId: s.docId, hash: l2.hash, size: l2.size, baseRev: r.blob?.rev ?? 0 });
+			ops.push({ op: "pushBlob", docId: s.docId, path: l2.path, hash: l2.hash, size: l2.size }, moved);
+		} else if (r.body && r.body.caughtUp) {
+			ops.push({ op: "reconcileContent", docId: s.docId, path: l2.path, kind: s.kind as ContentKind, hasBase: s.hasBase });
+		} else {
+			ops.push(waitOp(s.docId, "body-not-caught-up"), moved);
+		}
+		push(ops, null, "", l2.path);
 	};
 
 	const liveMissing = (s0: SyncedEntry, origId: DocId, r: RemoteEntry, prefix: PlannerOp[]): void => {
@@ -580,7 +631,7 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		if (r?.body?.frozen) return push([...prefix, waitOp(s.docId, "frozen")]);
 		if (l && l.hash === null) return push([...prefix, { op: "needHash", path: l.path }]);
 		if (!r) return pruned(s, l, prefix);
-		if (r.state === "deleted") return deleted(s, r, l, prefix);
+		if (r.state === "deleted") return deleted(s, s0.docId, r, l, prefix);
 		if (r.state !== "live") return push(prefix);
 		if (!l) return liveMissing(s, s0.docId, r, prefix);
 		livePresent(s, r, l, found.atRemote, prefix);
@@ -677,7 +728,6 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		config: input.brake,
 		syncedCount: input.synced.size,
 		liveLocalCount,
-		divergence: ctx.divergence,
 		window: ctx.brakeWindow,
 		approval: input.brakeApproval,
 	});

@@ -34,7 +34,7 @@ import type { EngineE2ee } from "../keyring/keyringRuntime";
 import { rawAppend } from "../keyring/testkit/engines";
 import { VAULT as S1_VAULT, genesis } from "../keyring/testkit/world";
 import type { LogEngine } from "./engine";
-import { faultyCrypto, startTestEngine, testPorts, testStorage, until } from "./testHarness";
+import { faultyCrypto, startTestEngine, testPorts, testStorage, until, createDoc, editDoc } from "./testHarness";
 
 const GRACE = 60 * 60_000;
 const A = "dev-a-0123456789abcdef";
@@ -166,8 +166,8 @@ test("GC live set: ns entries and tombstones, cfg blobs, live snap parts, outbox
 		await b.submitSnap([{ t: "put", record: snapRec(T0, [snapPart.hash]) }, { t: "put", record: snapRec(T0 + 1000, [deadPart.hash]) }]);
 		await idle(a, b);
 		await b.submitSnap([{ t: "del", deviceId: B as DeviceId, snapshotId: snapRec(T0 + 1000, []).snapshotId }]);
-		const doc = await a.createDoc("big.md", "seed;");
-		await a.editDoc(doc, (t) => t.insert(t.length, "z".repeat(MAX_INLINE_UPDATE_BYTES + 1000)));
+		const doc = await createDoc(a, "big.md", "seed;");
+		await editDoc(a, doc, (t) => t.insert(t.length, "z".repeat(MAX_INLINE_UPDATE_BYTES + 1000)));
 		await idle(a, b);
 		await until(() => a.c.snap.state.records.size === 1 && (a.c.ns.state.entries.get(dTomb)?.deletedSeq ?? 0) > 0, 3_000, "folded");
 		const stream = a.streamOf(doc);
@@ -307,7 +307,7 @@ test("GC preconditions: each refusal deletes nothing", async (t) => {
 			const fc = faultyCrypto();
 			const a = await w.device(A, { crypto: fc });
 			const b = await w.device(B);
-			const doc = await b.createDoc("n.md", "hello");
+			const doc = await createDoc(b, "n.md", "hello");
 			await idle(b);
 			await until(() => a.listDocs().some((d) => d.docId === doc) && a.isIdle(), 3_000, "a has the doc");
 			fc.failOpen = true;

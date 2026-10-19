@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { QUARANTINE_ROW_BYTES } from "../../core/limits";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until } from "../runtime/testHarness";
+import { converged, until, createDoc, docText, editDoc } from "../runtime/testHarness";
 import { keyMissing, live, rawAppend, start } from "./testkit/engines";
 import { K, RK_A, genesis } from "./testkit/world";
 
@@ -32,11 +32,11 @@ describe("reader-dependent quarantine of a large row (§d.6)", () => {
 			await live(y!);
 			assert.equal(await x!.engine.revokeRekey(RK_A.slice()), "won");
 			const k2 = x!.changes.flatMap((c) => c.keys).find((k) => k.e === 2)!.k;
-			const id = await x!.engine.createDoc("big.md" as VaultPath, "seed;");
+			const id = await createDoc(x!.engine, "big.md" as VaultPath, "seed;");
 			const inline = noiseText(QUARANTINE_ROW_BYTES + 300_000); // one bodyUpdate row, inline
-			await x!.engine.editDoc(id, (t) => t.insert(t.length, inline));
+			await editDoc(x!.engine, id, (t) => t.insert(t.length, inline));
 			await converged([x!.engine]);
-			const text = await x!.engine.docText(id);
+			const text = await docText(x!.engine, id);
 			assert.equal(text, "seed;" + inline);
 			const head = relay.head();
 			await until(() => y!.engine.status().vaultSeq >= head, 10_000, "y read through head");
@@ -50,7 +50,7 @@ describe("reader-dependent quarantine of a large row (§d.6)", () => {
 			await until(() => y!.engine.status().counts.frozenDocs === 0, 10_000, "released on the new key");
 			await converged([x!.engine, y!.engine]);
 			assert.equal(y!.engine.status().counts.quarantinedRows, 0);
-			assert.equal(await y!.engine.docText(id), text);
+			assert.equal(await docText(y!.engine, id), text);
 			assert.equal(keyMissing(y!), null);
 		} finally {
 			await y!.engine.stop();

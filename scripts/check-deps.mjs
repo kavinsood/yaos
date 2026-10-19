@@ -26,7 +26,7 @@ const BROWSER_GLOBALS = [
  */
 export const MAIN_FORBIDDEN = ["yjs", "y-codemirror.next", "y-protocols", "lib0"];
 /**
- * The main thread never hashes (§d.2; HostPorts has no HashPort, §h): no product host/** module may import
+ * The main thread never hashes (§d.2; the host is given no HashPort, §h): no product host/** module may import
  * core/hash/** (type-only imports included), directly or through core/ports/protocol. Tests may, to compute
  * expected values.
  */

@@ -35,7 +35,7 @@ import { randomBytes as nodeRandomBytes } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { makeRecoveryKey } from "../../src/core/codec/recoveryKey";
+import { makeRecoveryKey } from "../../src/core/codec/testkit/recoveryKey";
 import { YaosController } from "../../src/host/pluginController";
 import { VaultKeyStore, secretIdFor } from "../../src/host/keys/secretStore";
 import { defaultPluginData, type YaosPluginData } from "../../src/host/ui/api";

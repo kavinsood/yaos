@@ -11,7 +11,7 @@ import { NS_DEDUPE_RING } from "../../core/limits";
 import { CFG_STREAM, NS_STREAM, type ConfigRelPath, type StreamName, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { startTestEngine, until } from "./testHarness";
+import { startTestEngine, until, createDoc } from "./testHarness";
 
 const APP = "app.json" as ConfigRelPath;
 const R = NS_DEDUPE_RING;
@@ -33,8 +33,8 @@ test("frameNo: first allocation skips NS_DEDUPE_RING, then consecutive; the max 
 	try {
 		await settle(a);
 		relay.pauseCommits();
-		await a.createDoc("one.md" as VaultPath, "1");
-		await a.createDoc("two.md" as VaultPath, "2");
+		await createDoc(a, "one.md" as VaultPath, "1");
+		await createDoc(a, "two.md" as VaultPath, "2");
 		void cfg(a, "1");
 		await until(() => [...a.c.outbox.ofStream(CFG_STREAM)].length === 1, 3_000, "cfg queued");
 		assert.deepEqual(await ownFrameNos(a, NS_STREAM), [R + 1, R + 2], "outbox frames, before any receipt");
@@ -47,8 +47,8 @@ test("frameNo: first allocation skips NS_DEDUPE_RING, then consecutive; the max 
 
 		({ engine: a2 } = await startTestEngine({ relay, deviceId: "dev-a", storage }));
 		await settle(a2);
-		await a2.createDoc("three.md" as VaultPath, "3");
-		await a2.createDoc("four.md" as VaultPath, "4");
+		await createDoc(a2, "three.md" as VaultPath, "3");
+		await createDoc(a2, "four.md" as VaultPath, "4");
 		await settle(a2);
 		assert.deepEqual(await ownFrameNos(a2, NS_STREAM), [R + 1, R + 2, 2 * R + 3, 2 * R + 4], "restart: skip again from the persisted max");
 	} finally {
@@ -64,7 +64,7 @@ test("frameNo: the epoch-migration floor raises allocation and is kept in meta (
 	try {
 		await settle(a);
 		assert.deepEqual(a.c.repo.frameNoFloor, { ns: 1000, cfg: 5 });
-		await a.createDoc("one.md" as VaultPath, "1");
+		await createDoc(a, "one.md" as VaultPath, "1");
 		await cfg(a, "1");
 		await settle(a);
 		assert.deepEqual(await ownFrameNos(a, NS_STREAM), [1000 + R + 1]);

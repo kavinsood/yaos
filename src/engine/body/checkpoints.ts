@@ -25,7 +25,7 @@ import { streamClass, type Seq, type StreamName, type VaultId } from "../../core
 import type { CryptoPort } from "../../ports/crypto";
 import type { PutCheckpointResult, RelaySession } from "../../ports/relay";
 import { sealCheckpoint } from "../ingest/envelope";
-import type { Mut, Repo } from "../store/repo";
+import type { Mut } from "../store/repo";
 import type { StreamRecord } from "../store/schema";
 import type { FoldRuntime } from "../sync/foldRuntime";
 import { encodeCheckpointContent } from "../../core/codec/contents";
@@ -179,7 +179,7 @@ async function refreshRemote(deps: CheckpointDeps, st: CheckpointState, session:
 	await deps.repo.tPatchStreams([{ stream: rec.stream, patch: (r) => {
 		r.remoteCheckpointCoversSeq = Math.max(r.remoteCheckpointCoversSeq, cur);
 		if (cur >= want) coveredTo(r, cur);
-	} }], deps.nowMs());
+	} }]);
 	if (cur < want) return null;
 	st.condSince.delete(rec.stream);
 	st.count("refreshed");
@@ -191,7 +191,7 @@ async function clearCounters(deps: CheckpointDeps, rec: StreamRecord): Promise<v
 	if (rec.rowsSinceRemoteCheckpoint === 0 && rec.bytesSinceRemoteCheckpoint === 0) return;
 	await deps.repo.tPatchStreams([{ stream: rec.stream, patch: (r) => {
 		if (r.appliedSeq <= r.remoteCheckpointCoversSeq) coveredTo(r, r.remoteCheckpointCoversSeq);
-	} }], deps.nowMs());
+	} }]);
 }
 
 export interface WriteCheckpointOpts {
@@ -204,7 +204,6 @@ async function applyOutcome(
 	deps: CheckpointDeps, st: CheckpointState, session: RelaySession, stream: StreamName, c: Seq, snapshotBytes: number, res: PutCheckpointResult,
 ): Promise<CheckpointOutcome> {
 	const repo = deps.repo;
-	const now = deps.nowMs();
 	st.count(res.t === "refused" ? res.reason : res.t);
 	switch (res.t) {
 		case "ok":
@@ -213,14 +212,14 @@ async function applyOutcome(
 			await repo.tPatchStreams([{ stream, patch: (r) => {
 				r.remoteCheckpointCoversSeq = Math.max(r.remoteCheckpointCoversSeq, c);
 				coveredTo(r, c);
-			} }], now);
+			} }]);
 			return { t: "ok", coversSeq: c };
 		case "conflict": {
 			const current = res.currentCoversSeq;
 			await repo.tPatchStreams([{ stream, patch: (r) => {
 				r.remoteCheckpointCoversSeq = current;
 				if (current >= c) coveredTo(r, current);
-			} }], now);
+			} }]);
 			deps.diag("checkpoint-conflict", { cls: streamClass(stream), current, coversSeq: c });
 			return { t: "conflict", current, retry: current < c };
 		}
@@ -232,7 +231,7 @@ async function applyOutcome(
 					await repo.tPatchStreams([{ stream, patch: (r) => {
 						r.remoteCheckpointCoversSeq = Math.max(r.remoteCheckpointCoversSeq, cur);
 						if (cur >= c) coveredTo(r, cur);
-					} }], now);
+					} }]);
 					return { t: "not-advancing", refreshed: cur };
 				}
 				case "ahead-of-stream":
@@ -328,7 +327,7 @@ export async function writeFoldCheckpoint(deps: CheckpointDeps, st: CheckpointSt
 		rec = deps.repo.stream(stream)!;
 	}
 	if (cand.seq <= rec.remoteCheckpointCoversSeq) return { t: "skipped", reason: "not-advancing-local" };
-	const content = encodeCheckpointContent({ encoding: fold.encoding, coversSeq: cand.seq, foldRulesVersion: fold.rulesVersion, state: cand.bytes });
+	const content = encodeCheckpointContent({ encoding: fold.encoding, coversSeq: cand.seq, foldRulesVersion: cand.rulesVersion, state: cand.bytes });
 	const sealed = await sealCheckpoint(deps.crypto, deps.vaultId, stream, cand.seq, content, deps.authorNsSeq());
 	if (sealed.length > session.limits.maxCheckpointBytes) {
 		st.tooLarge.set(stream, { bytes: cand.bytes.length, seq: cand.seq });

@@ -7,9 +7,9 @@ import { inferRenames } from "./renames";
 import { orderOps, parseTempPath, sortRenames, tempPathFor } from "./order";
 import { applyBrake, brakeId, brakeIdentity, DEFAULT_BRAKE, EMPTY_WINDOW, rejectHeld, type PlanUnit } from "./brake";
 import { refHashPort, sha256HexRef } from "../hash/testkit/hashRef";
-import { utf8Encode } from "../hash/utf8";
-import { L, S, h, id } from "./planFixtures";
-import { prng } from "../merge/prng";
+import { utf8Encode } from "../codec/lib0";
+import { L, S, h, id } from "./testkit/planFixtures";
+import { prng } from "../merge/testkit/prng";
 
 const pk = standInPathKey;
 
@@ -193,7 +193,7 @@ test("order: random rename permutations are always executable", () => {
 test("brake unit: approval id, rejectHeld", async () => {
 	const unit = (k: string): PlanUnit => ({ ops: [{ op: "nsDelete", docId: id(k), baseBodySeq: 0 }], destructive: "nsDelete", brakeKey: `nsDelete|${k}`, path: `${k}.md` });
 	const units = Array.from({ length: 60 }, (_, i) => unit(`u${i}`));
-	const base = { config: DEFAULT_BRAKE, syncedCount: 100, liveLocalCount: null, divergence: false, window: EMPTY_WINDOW, approval: null };
+	const base = { config: DEFAULT_BRAKE, syncedCount: 100, liveLocalCount: null, window: EMPTY_WINDOW, approval: null };
 	const out = applyBrake(units, base);
 	assert.equal(out.report?.identity, brakeIdentity([...units].reverse()));
 	assert.equal(await brakeId(refHashPort, out.report!.identity), sha256HexRef(utf8Encode(out.report!.identity)));

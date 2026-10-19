@@ -28,7 +28,7 @@
 import type * as Y from "yjs";
 import type { ContentHash, DiskFingerprint, LocalEntry, MergeResult, SyncedEntry } from "../../core/types";
 import { canonicalizeMarkdown, exactFingerprint, markdownContentHash } from "../../core/hash/markdownLf";
-import { utf8Decode, utf8Length } from "../../core/hash/utf8";
+import { utf8Decode, utf8ByteLength } from "../../core/codec/lib0";
 import { merge } from "../../core/merge/merge";
 import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
 import { isShrinkingOverwrite } from "../../core/plan/brake";
@@ -113,7 +113,7 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 			hashM = await markdownContentHash(port, M);
 			return `${diskHash}>${hashM}`;
 		};
-		if (!h.bound && M !== D && !(await overwriteAllowed(env, docId, op.path, rd.bytes.length, utf8Length(M), transition))) {
+		if (!h.bound && M !== D && !(await overwriteAllowed(env, docId, op.path, rd.bytes.length, utf8ByteLength(M), transition))) {
 			return "held";
 		}
 		// Synchronous section: CAS, apply, capture the version.

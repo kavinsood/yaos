@@ -6,11 +6,11 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
+import { NS_STREAM, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
-import type { DiagnosticsEvent, EnginePhase, KeyMissingReason, StatusSnapshot } from "../../protocol/status";
+import { VAULT_UPGRADE_NOTICE, VAULT_UPGRADE_STOPPED, VAULT_UPGRADE_TEXT, type DiagnosticsEvent, type EnginePhase, type KeyMissingReason, type StatusSnapshot, type UpgradeFold } from "../../protocol/status";
 import { BlobTouch, committedBlobHashes } from "../blobs/touch";
 import { TransferLink } from "../blobs/transferLink";
 import { CheckpointState, type CheckpointDeps } from "../body/checkpoints";
@@ -21,9 +21,10 @@ import { resolveRefRow, type RefDeps } from "../body/refs";
 import type { Sender } from "../body/sender";
 import type { GateCtx } from "../ingest/gate";
 import type { Mut, OutboxRename, Repo } from "../store/repo";
-import type { OutboxRecord } from "../store/schema";
+import type { OutboxRecord, TailRecord } from "../store/schema";
 import type { CatchUpDeps } from "../sync/catchUp";
 import type { CfgRuntime } from "../sync/cfgRuntime";
+import type { FoldRuntime } from "../sync/foldRuntime";
 import type { SnapRuntime } from "../sync/snapRuntime";
 import type { KeyringRuntime } from "../keyring/keyringRuntime";
 import { assertWritable, gatedBlob, gatedCrypto } from "../keyring/writeGate";
@@ -48,6 +49,43 @@ export interface PendingCreate {
 const DIAG_RING = 2_000;
 const ERROR_NOTICES = new Set(["device-revoked", "upgrade-required", "epoch-changed", "vault-unclaimed", "vault-not-found"]);
 const INFO_NOTICES = new Set(["recovered-from-mirror"]);
+
+/** A fold runtime and its after-change hook (EngineCtx.folds). */
+export interface Fold {
+	readonly rt: FoldRuntime<unknown, unknown>;
+	/** Fold the newly available rows (reload: the snapshot was replaced, refold from it) and report them. */
+	readonly after: (reload: boolean) => Promise<void>;
+}
+
+/** What one ingest transaction stored (tLive, tReadPage pages, a quarantine release): EngineCtx.afterStored. */
+export interface Stored {
+	readonly removed: readonly OutboxRecord[];
+	/** Commit seqs of the receipted records among `removed`. */
+	readonly receipts?: ReadonlyMap<ClientFrameId, Seq>;
+	readonly updated: readonly OutboxRecord[];
+	readonly renamed?: readonly OutboxRename[];
+	/** Every tail row written. */
+	readonly tailPut: readonly TailRecord[];
+	/** Seqs of tailPut not applied to replicas (notApplied: own receipts, settled adoptables). */
+	readonly skip: ReadonlySet<Seq>;
+	/** Live rows: their streams count as active for the checkpoint idle rule (§d.9 "idle"); read rows do not. */
+	readonly live: boolean;
+	/** A read of one stream, or a quarantine release: its doc is checked and its fold runs even without new rows. */
+	readonly read?: {
+		readonly stream: StreamName;
+		/** Read to completion (§d.7 caught up): reported to the host, which waits on it, even if every row was own. */
+		readonly done: boolean;
+		/** body/canvas checkpoint state adopted (fresh or union): applied with the rows. */
+		readonly checkpointState: Uint8Array | null;
+		/** The fold snapshot was replaced by a checkpoint: the fold reloads. */
+		readonly replacedFold: boolean;
+	};
+}
+
+const isBody = (stream: StreamName): boolean => {
+	const cls = streamClass(stream);
+	return cls === "body" || cls === "canvas";
+};
 
 export function adoptKey(deviceId: DeviceId, cfid: ClientFrameId): string {
 	return `${deviceId}\u0000${cfid}`;
@@ -85,7 +123,7 @@ export class EngineCtx {
 	/** Bumped on every session start / end; stale callbacks compare it. */
 	gen = 0;
 	stopped = false;
-	/** App backgrounded (DESIGN §i.4): lanes 3–4 (stale reads, compaction, checkpoints) wait. */
+	/** App backgrounded (DESIGN §i.4): background work (stale reads, compaction, checkpoints) waits. */
 	background = false;
 	readOnly = false;
 	lastCloseCode: number | null = null;
@@ -94,11 +132,10 @@ export class EngineCtx {
 	repoOpenMs: number | null = null;
 	dailyLimitUntilMono = 0;
 	private readonly dailyLimitNotices = new DailyLimitNoticeGate();
+	/** Own frames receipted on `day` (daily soft budget, DESIGN §i.6). Starts from meta daily at boot. */
 	daily = { day: "", frames: 0 };
 	/** Monotonic time the head hint was first seen above V with an idle live queue. */
 	headAheadSince: number | null = null;
-	/** Lazy T_sent batch (diagnostics only). */
-	readonly sentPending = new Map<ClientFrameId, { attempts: number; atMs: number }>();
 	/** (deviceId, provisional cfid) -> own adoptable cfid, and the reverse; adopt timers. */
 	readonly adoptMap = new Map<string, ClientFrameId>();
 	readonly adoptRev = new Map<ClientFrameId, string>();
@@ -112,6 +149,9 @@ export class EngineCtx {
 	private readonly ring: DiagnosticsEvent[] = [];
 	private statusTimer: TimerHandle | null = null;
 	readonly gate: () => KeyMissingReason | null;
+	/** Folds halted for a newer writer, as last noticed (noteHalts); popups shown, once per fold per engine. */
+	private upgradeHalted = new Set<UpgradeFold>();
+	private readonly upgradePopups = new Set<UpgradeFold>();
 
 	constructor(readonly opts: EngineOptions) {
 		this.ports = opts.ports;
@@ -121,7 +161,7 @@ export class EngineCtx {
 		const c = this;
 		// §14.3: held (reader-dependent) until the keyring is open.
 		const staleCheck = (e: number, seq: Seq | null) => (c.keyring ? c.keyring.staleCheck(e, seq) : "hold" as const);
-		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes, staleCheck };
+		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes, staleCheck, knownRules: this.tuning.knownRules };
 		// The one write gate (writeGate.ts): shut until the keyring is open, then whenever it reports key-missing.
 		const gate = (): KeyMissingReason | null => (c.keyring ? c.keyring.keyMissing() : "no-pin");
 		this.gate = gate;
@@ -188,7 +228,7 @@ export class EngineCtx {
 	}
 
 	notice(code: string): void {
-		const level = ERROR_NOTICES.has(code) ? "error" : INFO_NOTICES.has(code) ? "info" : "warn";
+		const level = ERROR_NOTICES.has(code) || code.startsWith(VAULT_UPGRADE_NOTICE) ? "error" : INFO_NOTICES.has(code) ? "info" : "warn";
 		const i = this.notices.findIndex((n) => n.code === code);
 		if (i >= 0) this.notices.splice(i, 1);
 		this.notices.push({ code, level, atMs: this.now() });
@@ -215,10 +255,49 @@ export class EngineCtx {
 		this.scheduleStatus();
 	}
 
-	/** The phase of a caught-up session: key-missing while the write gate is shut (e2ee-design §9.3). */
+	/**
+	 * The phase of a caught-up session: key-missing while the write gate is shut (e2ee-design §9.3), upgrade-required
+	 * while a fold is halted for a newer writer (§c.10; the session stays up, the other streams keep syncing).
+	 */
 	livePhase(): EnginePhase {
 		if (this.gate() !== null) return "key-missing";
+		if (this.upgradeHalted.size > 0) return "upgrade-required";
 		return this.dailyLimitUntilMono > this.mono() ? "daily-limit" : "live";
+	}
+
+	/**
+	 * A caught-up session's phase follows a change of the gate or the folds; other phases are left alone, and so is
+	 * the server's upgrade-required (no session: the relay refused this client, relayPolicy.ts).
+	 */
+	refreshLivePhase(): void {
+		const p = this.phase;
+		if (p === "live" || p === "daily-limit" || p === "key-missing" || (p === "upgrade-required" && this.session)) this.setPhase(this.livePhase());
+	}
+
+	/**
+	 * After a fold changed: a fold halted for a newer writer (FoldHalt.upgrade) raises its error notice
+	 * (VAULT_UPGRADE_NOTICE + fold) and, once per engine, a popup; a lifted halt clears it. The phase follows.
+	 */
+	noteHalts(): void {
+		const now = new Set<UpgradeFold>();
+		for (const { rt } of this.folds()) {
+			const h = rt.halted;
+			if (!h?.upgrade) continue;
+			const fold = streamClass(rt.stream) as UpgradeFold;
+			now.add(fold);
+			if (this.upgradeHalted.has(fold)) continue;
+			this.diag("upgrade-required", { cls: fold, seq: h.seq, reason: h.reason });
+			this.notice(VAULT_UPGRADE_NOTICE + fold);
+			if (!this.upgradePopups.has(fold)) {
+				this.upgradePopups.add(fold);
+				this.opts.onHostNotice?.("error", VAULT_UPGRADE_NOTICE + fold, `YAOS: ${VAULT_UPGRADE_TEXT} ${VAULT_UPGRADE_STOPPED[fold]}`);
+			}
+		}
+		const changed = now.size !== this.upgradeHalted.size || [...now].some((f) => !this.upgradeHalted.has(f));
+		for (const fold of this.upgradeHalted) if (!now.has(fold)) this.clearNotice(VAULT_UPGRADE_NOTICE + fold);
+		this.upgradeHalted = now;
+		this.refreshLivePhase();
+		if (changed) this.scheduleStatus();
 	}
 
 	/** Host write entry points: refuse up front while the gate is shut (the seal would refuse anyway). */
@@ -233,18 +312,15 @@ export class EngineCtx {
 	}
 
 	/** Mirror committed outbox transitions into the cache, the sender and the adopt map. */
-	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly updated: readonly OutboxRecord[]; readonly renamed?: readonly OutboxRename[] }): void {
+	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly receipts?: ReadonlyMap<ClientFrameId, Seq>; readonly updated: readonly OutboxRecord[]; readonly renamed?: readonly OutboxRename[] }): void {
 		const drained = new Set<StreamName>();
 		for (const r of res.removed) {
 			const cls = streamClass(r.stream);
 			if (cls === "body" || cls === "canvas") drained.add(r.stream);
 			// ns/cfg/snap records leave the outbox only on (late) receipt: keep them in the overlay until folded.
-			if (r.stream === NS_STREAM) this.ns.noteCommitted(r);
-			else if (r.stream === CFG_STREAM) this.cfg.noteCommitted(r);
-			else if (r.stream === SNAP_STREAM) this.snap.noteCommitted(r);
+			this.foldOf(r.stream)?.rt.noteCommitted(r, res.receipts?.get(r.clientFrameId) ?? null);
 			this.outbox.delete(r.clientFrameId);
 			this.sender.remove(r.clientFrameId);
-			this.sentPending.delete(r.clientFrameId);
 			this.unregisterAdopt(r.clientFrameId);
 		}
 		// Re-sealed (e2ee-design §14.2 step 4): not committed, so no fold note and the doc is not drained.
@@ -252,7 +328,6 @@ export class EngineCtx {
 			if (next.clientFrameId !== old.clientFrameId) {
 				this.outbox.delete(old.clientFrameId);
 				this.sender.remove(old.clientFrameId);
-				this.sentPending.delete(old.clientFrameId);
 				this.unregisterAdopt(old.clientFrameId);
 				for (const [doc, p] of this.pendingCreates) if (p.cfid === old.clientFrameId) this.pendingCreates.set(doc, { ...p, cfid: next.clientFrameId });
 			}
@@ -321,10 +396,74 @@ export class EngineCtx {
 	}
 
 	/**
+	 * After an ingest transaction (Stored): mirror the outbox result, hand `k` rows to the keyring, apply body rows to
+	 * resident (or loading) replicas, report the docs that changed, and run the after-change hook of every fold the
+	 * rows touched (ns also when an outbox record went: held records may depend on it, §e.1). The one dispatch of live
+	 * ingest, catch-up reads and quarantine releases.
+	 */
+	async afterStored(s: Stored): Promise<void> {
+		this.applyOutboxResult(s);
+		const read = s.read ?? null;
+		await this.keyring.ingestRows(s.tailPut, read !== null && streamClass(read.stream) === "keyring");
+		const mono = this.mono();
+		const bodies = new Map<StreamName, TailRecord[]>();
+		if (read && isBody(read.stream)) bodies.set(read.stream, []);
+		for (const r of s.tailPut) {
+			if (s.live && this.foldOf(r.stream)) this.ckpt.lastActivity.set(r.stream, mono);
+			if (!isBody(r.stream) || s.skip.has(r.seq)) continue;
+			let l = bodies.get(r.stream);
+			if (!l) bodies.set(r.stream, (l = []));
+			l.push(r);
+		}
+		for (const [stream, rows] of bodies) {
+			if (s.live) this.ckpt.lastActivity.set(stream, mono);
+			let h = this.handles.peek(stream);
+			if (!h) {
+				const loading = this.handles.loadingOf(stream);
+				if (loading) h = await loading.catch(() => undefined);
+			}
+			if (!h) continue;
+			const ck = read?.stream === stream ? read.checkpointState : null;
+			if (ck || rows.length > 0) await this.docs.applyToHandle(h, rows, ck);
+			this.docs.checkDoc(h);
+		}
+		// Own receipts are the only rows that change nothing here (own plain rows are an earlier store's, §d.7).
+		const changed = s.tailPut.filter((r) => r.deviceId !== this.self || !s.skip.has(r.seq)).map((r) => r.stream);
+		if (read && (read.done || read.checkpointState)) changed.push(read.stream);
+		this.noteBodyChange(changed);
+		for (const f of this.folds()) {
+			const own = read?.stream === f.rt.stream;
+			if (own || s.tailPut.some((r) => r.stream === f.rt.stream) || (f.rt.stream === NS_STREAM && s.removed.length > 0)) await f.after(own && read.replacedFold);
+		}
+		this.scheduleStatus();
+	}
+
+	/**
+	 * Every fold runtime with its after-change hook, in fold order (ns first: the cfg / snap reports come after the
+	 * held releases its fold allows). The one list whatever folds walks: the unopened-row re-gate
+	 * (quarantineRelease.ts), a refold of all and the outbox mirror; a new fold is added here.
+	 */
+	folds(): readonly Fold[] {
+		const then = (p: Promise<void>) => p.then(() => this.noteHalts());
+		return [
+			{ rt: this.ns, after: (reload) => then(this.afterNsChange(reload)) },
+			{ rt: this.cfg, after: (reload) => then(this.afterCfgChange(reload)) },
+			{ rt: this.snap, after: (reload) => then(this.afterSnapChange(reload)) },
+		];
+	}
+	foldOf(stream: StreamName): Fold | undefined {
+		return this.folds().find((f) => f.rt.stream === stream);
+	}
+	/** Every fold folds what is available (engine start: reload from the snapshots; session start: rows read). */
+	async refold(reload: boolean): Promise<void> {
+		for (const f of this.folds()) await f.after(reload);
+	}
+
+	/**
 	 * Fold newly available ns rows (reload: snapshot replaced, refold from it), then release / delete held
 	 * records whose create folded (DESIGN §e.1), then report the folded frames.
 	 */
-	async afterNsChange(reload = false): Promise<void> {
+	private async afterNsChange(reload: boolean): Promise<void> {
 		const folded = reload ? await this.ns.load() : await this.ns.advance();
 		const changes = this.ns.reconcileHeld(this.outbox);
 		if (changes.length > 0) this.applyOutboxResult(await this.repo.tOutbox(changes));
@@ -332,7 +471,7 @@ export class EngineCtx {
 	}
 
 	/** Fold newly available cfg rows (reload: snapshot replaced) and report them. */
-	async afterCfgChange(reload = false): Promise<void> {
+	private async afterCfgChange(reload: boolean): Promise<void> {
 		const folded = reload ? await this.cfg.load() : await this.cfg.advance();
 		if (folded.length === 0 && !reload) return;
 		const events = folded.flatMap((f) => f.events);
@@ -340,7 +479,7 @@ export class EngineCtx {
 	}
 
 	/** Fold newly available snap rows (reload: snapshot replaced). The index is read on demand (snapView). */
-	async afterSnapChange(reload = false): Promise<void> {
+	private async afterSnapChange(reload: boolean): Promise<void> {
 		const before = this.snap.unknownVersions;
 		const folded = reload ? await this.snap.load() : await this.snap.advance();
 		if (this.snap.unknownVersions > before) this.diag("snap-unknown-version", { ops: this.snap.unknownVersions - before });
@@ -373,7 +512,7 @@ export class EngineCtx {
 	 */
 	committedBlobs(): ReadonlySet<ContentHash> | null {
 		if (!this.session || !this.live?.enabled) return null;
-		for (const rt of [this.ns, this.cfg, this.snap]) {
+		for (const { rt } of this.folds()) {
 			if (rt.halted || this.repo.stream(rt.stream)?.stale === 1) return null;
 		}
 		const key = [this.ns.state, this.ns.coversSeq, this.cfg.state, this.cfg.coversSeq, this.snap.state, this.snap.coversSeq];
@@ -399,7 +538,7 @@ export class EngineCtx {
 		await this.repo.tPatchStreams([{ stream, patch: (r) => {
 			r.frozen = 1;
 			r.frozenReason = reason;
-		} }], this.now());
+		} }]);
 		this.frozen(stream, reason, rec?.cls ?? null);
 	}
 

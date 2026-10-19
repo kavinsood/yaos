@@ -27,7 +27,7 @@ function vrt(d: SimDevice): VaultRuntime {
 const connected = (net: SimNet, d: SimDevice): boolean => net.relay.sessions().some((s) => s.deviceId === d.deviceId);
 const phases = (d: SimDevice, from: number): string[] => d.ui.statuses.slice(from).map((s) => s.phase);
 
-test("phone hidden: lanes 3-4 pause at once, the socket closes (1000) after 30 s without offline or backoff; visible reconnects and catches up", async () => {
+test("phone hidden: background work pauses at once, the socket closes (1000) after 30 s without offline or backoff; visible reconnects and catches up", async () => {
 	const { clock, net, a, b } = await world(true);
 	assert.equal(connected(net, a), true);
 	const seen = a.ui.statuses.length;
@@ -35,7 +35,7 @@ test("phone hidden: lanes 3-4 pause at once, the socket closes (1000) after 30 s
 	b.vault.userWrite("from-b.md", "while hidden\n");
 	await clock.advance(HIDDEN_CLOSE_MS - 1_000);
 	assert.equal(connected(net, a), true, "socket kept for 30 s");
-	assert.equal(a.vault.textOf("from-b.md"), null, "materialization (lane 3) waits while hidden");
+	assert.equal(a.vault.textOf("from-b.md"), null, "materialization waits while hidden");
 	await clock.advance(2_000);
 	assert.equal(connected(net, a), false, "socket closed after 30 s hidden");
 	const closes = vrt(a).log.c.lastCloseCode;

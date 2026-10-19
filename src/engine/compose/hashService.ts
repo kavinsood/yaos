@@ -21,7 +21,7 @@
 import { canvasContentHash } from "../../core/hash/canvasCanonical";
 import { digestHex } from "../../core/hash/digest";
 import { canonicalizeMarkdown, exactFingerprint } from "../../core/hash/markdownLf";
-import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
+import { utf8Decode, utf8Encode } from "../../core/codec/lib0";
 import { kindOfPath, type DiskFingerprint, type VaultPath } from "../../core/types";
 import type { ClockPort } from "../../ports/clock";
 import type { HashPort } from "../../ports/crypto";

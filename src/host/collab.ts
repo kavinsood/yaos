@@ -57,7 +57,7 @@ export function editorViewOf(editor: unknown): EditorView | null {
 }
 
 /** Attach the binding to `cm` (replacing any earlier one; that one is void). */
-export function attachCollab(cm: EditorView, spec: EditorBindingSpec): EditorBinding {
+function attachCollab(cm: EditorView, spec: EditorBindingSpec): EditorBinding {
 	const prev = listeners.get(cm);
 	if (prev) prev.live = false;
 	const l: Listener = { spec, live: true };

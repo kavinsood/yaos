@@ -9,14 +9,14 @@
  * opens). It only releases a stream when every live quarantined row is
  * reader-dependent and now passes; otherwise nothing changes (no dismissals).
  * A row a re-gate finds stale (e2ee-design §14.3) is settled: dismissed, never
- * applied. `regateUnopened` is the ns / cfg counterpart (§9.3: reader-dependent
- * rows wait in tail and halt the fold): run after every keyring change.
+ * applied. `regateUnopened` is the fold-stream counterpart (ns, cfg, snap; §9.3:
+ * reader-dependent rows wait in tail and halt the fold): run after every keyring change.
  * Both run one at a time per engine; a request while one runs runs it again after
  * (its snapshot may predate the change). `recheckStored` covers a row gated before
  * a change and stored after the re-gate the change ran.
  */
 
-import { CFG_STREAM, NS_STREAM, type StreamName } from "../../core/types";
+import type { Seq, StreamName } from "../../core/types";
 import type { QuarantineRecord, TailRecord } from "../store/schema";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import { gateRow } from "../sync/ingestRow";
@@ -55,21 +55,16 @@ async function regate(c: EngineCtx, stream: StreamName, rows: readonly Quarantin
 }
 
 async function release(c: EngineCtx, stream: StreamName, pass: readonly TailRecord[], dismiss: readonly QuarantineRecord[]): Promise<void> {
-	await c.repo.tReleaseQuarantine(stream, pass, dismiss, c.now());
+	await c.repo.tReleaseQuarantine(stream, pass, dismiss);
 	c.docs.clearCausal(stream);
 	for (const n of c.noticeList()) {
 		if (!n.code.startsWith("frozen:")) continue;
 		const reason = n.code.slice("frozen:".length);
 		if (![...c.repo.streams()].some((r) => r.frozen === 1 && r.frozenReason === reason)) c.clearNotice(n.code);
 	}
-	const h = c.handles.peek(stream);
-	if (h) {
-		if (pass.length > 0) await c.docs.applyToHandle(h, pass);
-		c.docs.checkDoc(h);
-	}
-	c.noteBodyChange([stream]); // passed rows to project; a view waiting on the frozen doc binds (compose checkBindable)
+	// Passed rows to project; a view waiting on the frozen doc binds (compose checkBindable): reported as done.
+	await c.afterStored({ removed: [], updated: [], tailPut: pass, skip: new Set(), live: false, read: { stream, done: true, checkpointState: null, replacedFold: false } });
 	c.sess.scheduleCatchUp();
-	c.scheduleStatus();
 }
 
 /** User release: pass -> applied, held kept, the rest dismissed; the doc unfreezes unless a held row is left. */
@@ -127,29 +122,34 @@ async function retryOnce(c: EngineCtx): Promise<number> {
 }
 
 /**
- * Re-gate the unfolded ns / cfg rows a reader-dependent failure left unopened (raw payload, LOCAL_FLAG_UNOPENED):
- * new keys, a settled revoke or `k` judged further can open them, or find them stale (§14.3). Re-gated rows
- * replace the unopened ones, the halt lifts and the fold advances. Rows still unopened keep waiting.
+ * Re-gate the unfolded rows of every fold (EngineCtx.folds) a reader-dependent failure left unopened (raw payload,
+ * LOCAL_FLAG_UNOPENED): new keys, a settled revoke or `k` judged further can open them, or find them stale (§14.3).
+ * Re-gated rows replace the unopened ones, the halt lifts and the fold advances through its after-change hook.
+ * Rows still unopened keep waiting.
  */
 export function regateUnopened(c: EngineCtx): Promise<number> {
 	return oneAtATime(c, "unopened", () => regateUnopenedOnce(c));
 }
 
 async function regateUnopenedOnce(c: EngineCtx): Promise<number> {
+	// The same change may open a checkpoint a read held for a key (catchUp.ts "held").
+	c.sess.releaseHeld();
 	let n = 0;
-	for (const fold of [c.ns, c.cfg]) {
-		const rows = (await c.repo.getTail(fold.stream, fold.coversSeq)).filter((r) => r.flags & LOCAL_FLAG_UNOPENED);
+	for (const { rt, after } of c.folds()) {
+		const rows = (await c.repo.getTail(rt.stream, rt.coversSeq)).filter((r) => r.flags & LOCAL_FLAG_UNOPENED);
 		const out: TailRecord[] = [];
+		const drop: Seq[] = [];
 		for (const r of rows) {
 			const g = await gateRow(c.gateCtx, c.ports.hash, { stream: r.stream, seq: r.seq, deviceId: r.deviceId, clientFrameId: r.clientFrameId, payload: r.content }, c.now());
 			if (g.t === "row" && !(g.row.flags & LOCAL_FLAG_UNOPENED)) out.push(g.row);
+			// Accounted only now (a snap row judged stale-epoch, §14.3): never folded, so it must not hold the fold.
+			else if (g.t === "account") drop.push(r.seq);
 		}
-		if (out.length === 0) continue;
-		const replaced = await c.repo.tReplaceTail(fold.stream, out, c.now());
-		c.diag("unopened-regated", { stream: fold.stream, rows: replaced });
-		await fold.resume();
-		if (fold.stream === NS_STREAM) await c.afterNsChange();
-		else if (fold.stream === CFG_STREAM) await c.afterCfgChange();
+		if (out.length === 0 && drop.length === 0) continue;
+		const replaced = await c.repo.tReplaceTail(rt.stream, out, drop);
+		c.diag("unopened-regated", { stream: rt.stream, rows: replaced });
+		await rt.resume();
+		await after(false);
 		n += replaced;
 	}
 	return n;

@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ContentHash, DeviceId } from "../types";
-import { CodecError, Writer, bytesEqual } from "../codec/lib0";
+import { CodecError, Writer, bytesEqual, bytesToHex, compareCodeUnits } from "../codec/lib0";
 import { decodeSnapFoldV1, encodeSnapFoldV1 } from "../codec/snapFoldV1";
 import {
 	SNAP_MAX_PARTS, SNAP_MAX_PART_BYTES, SNAP_MAX_LABEL_BYTES, SNAP_MAX_OPS, SNAP_MAX_TOTAL_BYTES, SnapOpTag,
@@ -13,10 +13,18 @@ import {
 	remoteSnapshotId, snapRecordProblem, snapshotId, type SnapOp, type SnapReason, type SnapRecord,
 } from "./record";
 import {
-	foldSnapFrame, newSnapFold, overlayPendingSnap, retentionFloor, snapFoldFingerprint, snapLive, type SnapFrame,
+	foldSnapFrame, newSnapFold, overlayPendingSnap, retentionFloor, snapLive, type SnapFoldState, type SnapFrame,
 } from "./fold";
 
 declare const process: { env: Record<string, string | undefined> };
+
+/** Stable digest of the join: coversSeq excluded. */
+function snapFoldFingerprint(s: SnapFoldState): string {
+	const floors = [...s.floors.entries()].sort(([a], [b]) => compareCodeUnits(a, b)).map(([d, f]) => `${d}=${f}`);
+	const dels = [...s.dels.keys()].sort(compareCodeUnits);
+	const recs = [...s.records.entries()].sort(([a], [b]) => compareCodeUnits(a, b)).map(([k, e]) => `${k}:${bytesToHex(e.bytes)}`);
+	return JSON.stringify([floors, dels, recs]);
+}
 
 const A = "deviceAAAAAAAAAAAAAAAA" as DeviceId;
 const B = "deviceBBBBBBBBBBBBBBBB" as DeviceId;

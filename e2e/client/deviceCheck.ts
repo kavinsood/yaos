@@ -17,7 +17,7 @@
  */
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 import { bytesToHex } from "../../src/core/codec/lib0";
-import { makeRecoveryKey } from "../../src/core/codec/recoveryKey";
+import { makeRecoveryKey } from "../../src/core/codec/testkit/recoveryKey";
 import { VaultKeyStore } from "../../src/host/keys/secretStore";
 import { YaosController } from "../../src/host/pluginController";
 import { DEFAULT_ENGINE_SETTINGS, defaultPluginData, type PairedIdentity, type YaosPluginData } from "../../src/host/ui/api";
@@ -92,12 +92,12 @@ async function runVault(R: Report, kind: VaultKind, modes: readonly DeviceCheckM
 			return s?.phase === "live" && s.e2ee?.suite === suite && s.e2ee.keyMissing === null && s.maxBlobBytes !== null;
 		}, `a live on suite ${suite}`, 60_000, performance.now(), 50);
 		const secrets = [d.deviceToken, ...keyStrings(a, vault.vaultId)];
-		R.check(`${kind}: setup, a runs its engine on the worker carrier`, ctl.runState().transport === "worker", ctl.runState());
+		R.check(`${kind}: setup, a runs its engine on the worker carrier`, ctl.status()?.transport === "worker", ctl.status()?.transport);
 		for (const mode of modes) {
 			const t0 = performance.now();
 			const report = await ctl.deviceCheck(mode);
 			const wallMs = Math.round(performance.now() - t0);
-			const text = formatDeviceCheck(report, diagnosticsSettings({ data: () => ctl.data(), pluginVersion: "e2e", runState: () => ctl.runState() }, false));
+			const text = formatDeviceCheck(report, diagnosticsSettings({ data: () => ctl.data(), pluginVersion: "e2e" }, false));
 			console.log(`-- ${kind} ${mode}: ${summaryLine(report)} (request ${wallMs} ms)`);
 			for (const s of report.steps) console.log(`   ${stepLine(s)}`);
 			for (const n of report.notes) console.log(`   note: ${n}`);

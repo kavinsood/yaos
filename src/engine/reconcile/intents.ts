@@ -23,7 +23,7 @@ import type { ContentHash, DiskFingerprint, DocId, VaultPath } from "../../core/
 import { kindOfPath } from "../../core/types";
 import { canvasToMergeText } from "../../core/hash/canvasCanonical";
 import { canonicalizeMarkdown, markdownContentHash } from "../../core/hash/markdownLf";
-import { utf8Decode } from "../../core/hash/utf8";
+import { utf8Decode } from "../../core/codec/lib0";
 import type { VaultStat } from "../../ports/vault";
 import type { IntentRecord } from "../store/schema";
 import { fetchAndWrite } from "./blobJobs";

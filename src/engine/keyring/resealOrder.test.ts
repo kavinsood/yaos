@@ -17,7 +17,7 @@ import { decodeOuter } from "../../core/codec/envelope";
 import { CFG_STREAM, KEYRING_STREAM, NS_STREAM, type ConfigRelPath, type DocId, type StreamName, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "../runtime/engine";
-import { converged, until } from "../runtime/testHarness";
+import { converged, until, createDoc, renameDoc } from "../runtime/testHarness";
 import { keyMissing, live, rawAppend, start, stored, type Dev } from "./testkit/engines";
 import { K, RK_A, genesis } from "./testkit/world";
 
@@ -87,9 +87,9 @@ describe("a reseal holds the later frames of its stream (§14.2 step 4, §8.2)",
 		let id: DocId | null = null;
 		await scenario(
 			NS_STREAM,
-			async (x) => void (id = await x.createDoc("a.md" as VaultPath, "base")),
-			(x) => x.renameDoc(id!, "b.md" as VaultPath),
-			(x) => x.renameDoc(id!, "c.md" as VaultPath),
+			async (x) => void (id = await createDoc(x, "a.md" as VaultPath, "base")),
+			(x) => renameDoc(x, id!, "b.md" as VaultPath),
+			(x) => renameDoc(x, id!, "c.md" as VaultPath),
 			(e, who) => assert.equal(pathOf(e, id!), "c.md", `${who}: the last own rename wins`),
 		);
 	});

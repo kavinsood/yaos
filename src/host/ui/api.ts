@@ -234,7 +234,6 @@ export function sameEngineSettings(a: EngineSettings, b: EngineSettings): boolea
 
 export type EngineRunState = {
 	readonly phase: "unpaired" | "stopped" | "starting" | "running" | "failed";
-	readonly transport: "worker" | "inline" | null;
 	readonly lastError: string | null;
 };
 

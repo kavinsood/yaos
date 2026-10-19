@@ -47,7 +47,7 @@ export class FakeGateway implements DiskGateway {
 		this.crash = null;
 	}
 
-	async read(reads: readonly DiskReadRequest[], _lane: Lane): Promise<readonly DiskReadResult[]> {
+	async read(reads: readonly DiskReadRequest[]): Promise<readonly DiskReadResult[]> {
 		if (this.beforeRead) await this.beforeRead(reads);
 		const out: DiskReadResult[] = [];
 		for (const r of reads) {

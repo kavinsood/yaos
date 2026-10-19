@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fingerprintRef, markdownHashRef } from "../core/hash/testkit/hashRef";
-import { utf8Encode } from "../core/hash/utf8";
+import { utf8Encode } from "../core/codec/lib0";
 import type { DiskFingerprint, VaultPath } from "../core/types";
 import type { VaultEvent } from "../ports/vault";
 import { simHashOracle } from "../sim/hash";

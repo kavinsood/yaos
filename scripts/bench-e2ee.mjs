@@ -481,7 +481,7 @@ const npmPath = (p) => p.replace(/^.*?node_modules\//, "node_modules/");
 const GROUPS = [
 	["WebCrypto adapter", (p) => p === "src/engine/adapters/webCryptoSuite1.ts" || p === "src/engine/adapters/suite1Primitives.ts"],
 	["keyring engine", (p) => p.startsWith("src/engine/keyring/") && !p.includes("/testkit/") && !p.endsWith(".test.ts")],
-	["E2EE codecs (base32 RK, Padme, sealed blob)", (p) => ["src/core/codec/recoveryKey.ts", "src/core/codec/padme.ts", "src/core/codec/sealedBlob.ts"].includes(p)],
+	["E2EE codecs (base32 RK, Padme, sealed blob)", (p) => ["src/host/ui/recoveryKeyText.ts", "src/core/codec/padme.ts", "src/core/codec/sealedBlob.ts"].includes(p)],
 	["host keys (src/host/keys)", (p) => p.startsWith("src/host/keys/") && !p.includes("/testkit/") && !p.endsWith(".test.ts")],
 	["E2EE compose (pinGate, keyReader, hostKeyring)", (p) => ["src/engine/compose/pinGate.ts", "src/engine/compose/keyReader.ts", "src/engine/compose/hostKeyring.ts"].includes(p)],
 	["qrcode (+ dijkstrajs)", (p) => /^node_modules\/(qrcode|dijkstrajs)\//.test(npmPath(p))],
@@ -535,7 +535,7 @@ async function benchBundle() {
 	log(`  ${"third-party crypto libraries".padEnd(48)} ${String(crypto3p.length).padStart(5)} ${kb(crypto3pRaw).padStart(18)}`);
 	log(`  qrcode alone (toCanvas, own minified bundle): ${kb(qrBytes.length)} raw, ${kb(qrGz)} gzip (§16.2 says +9.6 KB gzip [M])`);
 	log("  * gzip est. = raw bytesInOutput x the whole bundle's gzip ratio (per-input gzip is not separable)");
-	const named = ["src/core/codec/recoveryKey.ts", "src/core/codec/sealedBlob.ts", "src/engine/compose/pinGate.ts", "src/engine/compose/keyReader.ts", "src/engine/compose/hostKeyring.ts"];
+	const named = ["src/host/ui/recoveryKeyText.ts", "src/core/codec/sealedBlob.ts", "src/engine/compose/pinGate.ts", "src/engine/compose/keyReader.ts", "src/engine/compose/hostKeyring.ts"];
 	const absent = named.filter((f) => !inputs.some(([p]) => p === f));
 	if (absent.length > 0) log(`  not reachable from src/host/entry.ts (0 B in the bundle): ${absent.join(", ")}`);
 	rows.push({ path: "bundle: third-party crypto (WebCrypto +0 KB)", median: crypto3pRaw / 1000, p95: null, n: 1, budgetMs: 0, mobile: "-", must: true, unit: "KB", note: `${crypto3p.length} files`, pass: crypto3pRaw === 0 });

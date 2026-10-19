@@ -20,9 +20,10 @@ import type {
 	BodyVersion, ContentHash, DocId, DocKind, NsBlobRef, NsEntryState, NsOp, NsOpOutcome, PathKey, RemoteEntry, Seq, StreamName, VaultPath,
 } from "../../../core/types";
 import { kindOfPath } from "../../../core/types";
-import { parseCanvasText, rankCanvasInFileOrder } from "../../../core/hash/canvasCanonical";
+import { parseCanvasText } from "../../../core/hash/canvasCanonical";
+import { rankCanvasInFileOrder } from "../../../core/hash/testkit/canvasRanks";
 import { canvasHashRef, markdownHashRef, sha256HexRef } from "../../../core/hash/testkit/hashRef";
-import { utf8Encode, utf8Length } from "../../../core/hash/utf8";
+import { utf8Encode, utf8ByteLength } from "../../../core/codec/lib0";
 import { joinPath, leafOf, parentOf, splitExt, standInPathKey } from "../../../core/plan/pathRules";
 import { applyCanvas, canvasDocHashInput, projectCanvasBytes } from "../canvasDoc";
 import type { BodyHandle, LogPort, OwnFoldEvent, RemoteView, SubmitNsOptions } from "../deps";
@@ -86,7 +87,6 @@ export class StubLog implements LogPort {
 	nsReady = true;
 	/** RemoteView.lostCreateBody as the test sets it. */
 	lostCreateBody = new Set<DocId>();
-	divergence = false;
 	/** S1 hook (Reconciler.applyOwnFold). */
 	onOwnFold: ((events: readonly OwnFoldEvent[]) => Promise<void>) | null = null;
 	/** Called right before acquireBody returns (inject concurrent remote edits). */
@@ -315,7 +315,7 @@ export class StubLog implements LogPort {
 			}
 		}
 		return {
-			remote, remoteByPathKey: byKey, nsCoversSeq: this.seq, nsReady: this.nsReady, divergence: this.divergence,
+			remote, remoteByPathKey: byKey, nsCoversSeq: this.seq, nsReady: this.nsReady,
 			docsWithPendingBody, restoreDuty: new Set(), lostCreateBody: this.lostCreateBody, textHash, appliedSeq,
 		};
 	}
@@ -432,14 +432,14 @@ export class StubLog implements LogPort {
 			const parsed = parseCanvasText(text);
 			if (parsed.kind !== "valid") throw new Error(`remoteCreate: invalid canvas ${parsed.kind}`);
 			const hash = canvasHashRef(utf8Encode(text));
-			this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: hash, size: utf8Length(text) }, ++this.seq);
+			this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: hash, size: utf8ByteLength(text) }, ++this.seq);
 			const ranked = rankCanvasInFileOrder(parsed.data);
 			if (parsed.data.nodes.size + parsed.data.edges.size + Object.keys(parsed.data.rootFields).length > 0) {
 				this.remoteRow(docId, (d) => applyCanvas(d, null, ranked));
 			} else this.ensureBody(docId);
 			return docId;
 		}
-		this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: markdownHashRef(text), size: utf8Length(text) }, ++this.seq);
+		this.foldOp(this.entries, { t: "create", docId, kind, path, contentHash: markdownHashRef(text), size: utf8ByteLength(text) }, ++this.seq);
 		if (text.length > 0) this.remoteRow(docId, (d) => d.getText("text").insert(0, text));
 		else this.ensureBody(docId);
 		return docId;
@@ -451,7 +451,7 @@ export class StubLog implements LogPort {
 
 	/** A remote markdown create whose initial body frames have not arrived (caught up, no content); remoteEdit delivers them. */
 	remoteCreateBodyless(path: VaultPath, text: string, docId: DocId = this.freshId()): DocId {
-		this.foldOp(this.entries, { t: "create", docId, kind: "markdown", path, contentHash: markdownHashRef(text), size: utf8Length(text) }, ++this.seq);
+		this.foldOp(this.entries, { t: "create", docId, kind: "markdown", path, contentHash: markdownHashRef(text), size: utf8ByteLength(text) }, ++this.seq);
 		this.ensureBody(docId);
 		return docId;
 	}

@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import { MAX_NS_OPS_PER_FRAME } from "../../core/limits";
-import { CFG_STREAM, docStream, type CfgOp, type ConfigRelPath, type NsOp, type VaultPath } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, docStream, type CfgOp, type ConfigRelPath, type NsOp, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import type { CfgLogPort } from "../settings/cfgSync";
 import type { FoldedNsFrame } from "../sync/nsRuntime";
 import { chunkOps } from "./logApi";
 import type { LogEngine } from "./engine";
-import { converged, startTestEngine, until } from "./testHarness";
+import { converged, startTestEngine, until, createDoc, docText } from "./testHarness";
 
 const APP = "app.json" as ConfigRelPath;
 const CKPT = { rows: 1e9, bytes: 1e12, idleMs: 10, settleMs: 1e9, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
@@ -99,7 +99,7 @@ test("ns: submitNs splits into frames, nsView shows them pending, onNsFold repor
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", extra: { onNsFold: (f) => foldB.push(...f) } });
 	try {
 		relay.pauseCommits();
-		const d = await a.createDoc("r/start.md" as VaultPath, "hello");
+		const d = await createDoc(a, "r/start.md" as VaultPath, "hello");
 		const n = MAX_NS_OPS_PER_FRAME + 88;
 		const ops: NsOp[] = Array.from({ length: n }, (_, i) => ({ t: "rename", docId: d, path: `r/n${i}.md` as VaultPath }));
 		const ids = await a.submitNs(ops);
@@ -129,6 +129,31 @@ test("ns: submitNs splits into frames, nsView shows them pending, onNsFold repor
 	}
 });
 
+test("ns: a late receipt at a seq the fold already covers leaves no pending frame (sim heavy seed 27)", async () => {
+	// Sim: A's ns frame committed while A crashed before the receipt; B's checkpoint at lastSeq retired the stream
+	// (H7); A restarted, adopted the checkpoint (covering the frame) and resent the frame, which the relay deduped at
+	// its old seq. The receipt put the frame back in the overlay ("committed, not folded yet") and nothing ever
+	// folded it: one pending ns frame for good.
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	try {
+		relay.pauseCommits();
+		await createDoc(a, "late.md" as VaultPath, "x");
+		const rec = a.c.outbox.ofStream(NS_STREAM)[0]!;
+		relay.resumeCommits();
+		await until(() => a.isIdle() && a.nsView().pending.length === 0, 3_000, "a folded its create");
+		const seq = relay.rows(NS_STREAM).find((r) => r.clientFrameId === rec.clientFrameId)!.seq;
+		assert.ok(a.c.ns.coversSeq >= seq);
+		a.c.applyOutboxResult({ removed: [rec], receipts: new Map([[rec.clientFrameId, seq]]), updated: [] });
+		assert.equal(a.nsView().pending.length, 0, "covered by the fold: not pending");
+		// A receipt above the fold is still pending until folded.
+		a.c.applyOutboxResult({ removed: [rec], receipts: new Map([[rec.clientFrameId, a.c.ns.coversSeq + 1]]), updated: [] });
+		assert.equal(a.nsView().pending.length, 1);
+	} finally {
+		await stopAll(a);
+	}
+});
+
 test("bodyInfo / openBody: pending create, body frame held on the create, remote doc info", async () => {
 	const relay = new SimRelay();
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
@@ -136,7 +161,7 @@ test("bodyInfo / openBody: pending create, body frame held on the create, remote
 	try {
 		assert.equal(a.bodyInfo("d-unknown" as never), null);
 		relay.pauseCommits();
-		const d = await a.createDoc("notes/x.md" as VaultPath, "");
+		const d = await createDoc(a, "notes/x.md" as VaultPath, "");
 		const stream = docStream("markdown", d)!;
 		const createCfid = a.nsView().pending.find((f) => f.ops.some((o) => o.t === "create" && o.docId === d))!.clientFrameId;
 		const info0 = a.bodyInfo(d)!;
@@ -163,7 +188,7 @@ test("bodyInfo / openBody: pending create, body frame held on the create, remote
 
 		relay.resumeCommits();
 		await converged([a, b]);
-		assert.equal(await b.docText(d), "body text");
+		assert.equal(await docText(b, d), "body text");
 		const ib = b.bodyInfo(d)!;
 		assert.equal(ib.stream, stream);
 		assert.equal(ib.hasContent, true);
@@ -179,7 +204,7 @@ test("bodyInfo / openBody: pending create, body frame held on the create, remote
 		const r2 = a.c.outbox.ofStream(stream);
 		assert.ok(r2.every((r) => r.dependsOn === null), "no dependency once the create is folded");
 		await converged([a, b]);
-		assert.equal(await b.docText(d), ">body text");
+		assert.equal(await docText(b, d), ">body text");
 	} finally {
 		await stopAll(a, b);
 	}

@@ -424,11 +424,6 @@ function readEnrollment(attempt: EnrollmentAttempt, json: unknown): PairedIdenti
 	};
 }
 
-/** Convenience: prepare + run. Use prepareEnrollment/runEnrollment to keep ids across retries. */
-export async function enroll(input: EnrollInput, deps: PairingDeps): Promise<PairedIdentity> {
-	return runEnrollment(prepareEnrollment(input, deps.randomBytes), deps);
-}
-
 /** Capabilities check, then enrollment. */
 export async function pairDevice(attempt: EnrollmentAttempt, deps: PairingDeps): Promise<PairedIdentity> {
 	deps.onProgress?.("Checking the server…");

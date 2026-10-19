@@ -16,6 +16,7 @@ import type { CfgFoldEvent } from "../../core/cfg/fold";
 import { NS_CANDIDATE_MODULUS, type FoldedNsFrame } from "../sync/nsRuntime";
 import { BLOB_RETRY_BASE_MS, BLOB_RETRY_MAX_MS } from "../blobs/blobQueue";
 import type { EngineE2ee } from "../keyring/keyringRuntime";
+import { KNOWN_RULES, type KnownRules } from "../ingest/gate";
 
 export interface EngineTuning {
 	/** Local compaction trigger (DESIGN §d.8). */
@@ -61,6 +62,8 @@ export interface EngineTuning {
 	 * while its own upload is younger than half of it.
 	 */
 	readonly blobGcGraceMs: number;
+	/** Fold rules this reader implements (DESIGN §c.10); tests raise them to play an upgraded client. */
+	readonly knownRules: KnownRules;
 }
 
 export const DEFAULT_TUNING: EngineTuning = {
@@ -89,6 +92,7 @@ export const DEFAULT_TUNING: EngineTuning = {
 	rollSeqSpan: ROLL_SEQ_SPAN,
 	rollOwnSeals: ROLL_OWN_SEALS,
 	blobGcGraceMs: 7 * 24 * 60 * 60_000,
+	knownRules: KNOWN_RULES,
 };
 
 /** Why a bound body's text changed: "editor" = applyEditorChanges, "merge" = an engine merge (editDoc, mergeJob). */
@@ -150,8 +154,8 @@ export interface EngineOptions {
 	onOwnBodySettled?(docIds: readonly DocId[]): void;
 	onStatus?(status: StatusSnapshot): void;
 	onDiag?(event: DiagnosticsEvent): void;
-	/** A popup for the user (status notices stay in onStatus): the daily-limit warning. */
-	onHostNotice?(level: "warn", code: string, message: string): void;
+	/** A popup for the user (status notices stay in onStatus): the daily-limit warning, a vault-side upgrade. */
+	onHostNotice?(level: "warn" | "error", code: string, message: string): void;
 	/**
 	 * Plaintext of a blob this device holds locally (an attachment, an own snapshot part), checked against `hash`;
 	 * null = not here. Re-uploads before a stale reference is sent (e2ee-design §10.4 R3) and after a GC sweep (R4).

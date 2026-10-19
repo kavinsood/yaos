@@ -8,8 +8,8 @@
  *   the engine is dead.
  * - Every carrier failure is terminal (§g.4): the carrier cannot be built,
  *   misses the startup pong, errors or its transport fails, misses a liveness
- *   pong, or init fails (storage-lost included); so are `fatal` from the
- *   engine and a protocol-version mismatch. The host stops: pending requests
+ *   pong, or init fails (storage-lost included); so is a protocol-version
+ *   mismatch. The host stops: pending requests
  *   are rejected with "aborted", onFatal reports why, once, and no second
  *   carrier is ever built (nothing restarts it, nothing runs the engine on the
  *   UI thread). A new engine is a new host: the user's restart or a reload.
@@ -58,7 +58,7 @@ export interface EngineHostHandlers {
 	onRequest(message: EngineRequestMessage): Promise<MainResultValue>;
 	/** Engine answered init. */
 	onReady(info: { readonly carrier: CarrierKind; readonly ready: Extract<EngineResultValue, { t: "ready" }> }): void;
-	/** The host stopped for good (every carrier failure, `fatal` from the engine); called at most once. */
+	/** The host stopped for good (every carrier failure); called at most once. */
 	onFatal(error: ProtocolError): void;
 }
 
@@ -156,7 +156,7 @@ export class EngineHost {
 		const live = this.live;
 		if (live && live.ready) {
 			try {
-				await this.requestOn(live, { t: "shutdown", reason: "unload" }, SHUTDOWN_TIMEOUT_MS);
+				await this.requestOn(live, { t: "shutdown" }, SHUTDOWN_TIMEOUT_MS);
 			} catch {
 				// best effort
 			}
@@ -342,9 +342,6 @@ export class EngineHost {
 				);
 				return;
 			}
-			case "fatal":
-				this.fatal(m.error);
-				return;
 			default:
 				// status/notice may arrive during init; pass everything through.
 				this.deps.handlers.onEvent(m);

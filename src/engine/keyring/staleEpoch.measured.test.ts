@@ -3,12 +3,12 @@
  * and committed past S_rot are all ignored, nothing is quarantined, and the ns/cfg fold digests equal those of the
  * same rows without them. Old-epoch frames committed before the revoke row are still accepted. 1000 seeds; every
  * row of every seed is checked, nothing sampled. The rule is §14.3, as the gate implements it: the verdict
- * comes from the outer header's keyEpoch before any open (src/engine/ingest/gate.ts:137-146, keyring answer
- * src/engine/keyring/book.ts:158-165). gateRow (src/engine/sync/ingestRow.ts:47) then makes a stale ns/cfg row a
- * tail row flagged LOCAL_FLAG_STALE_EPOCH with frameNo 0 and empty content (ingestRow.ts:59), which folds as one
- * ignored/stale-epoch event and changes neither the ring nor the window (foldRuntime.ts:151, nsRuntime.ts /
+ * comes from the outer header's keyEpoch before any open (src/engine/ingest/gate.ts:163-172, keyring answer
+ * src/engine/keyring/book.ts:158-165). gateRow (src/engine/sync/ingestRow.ts:54) then makes a stale ns/cfg row a
+ * tail row flagged LOCAL_FLAG_STALE_EPOCH with frameNo 0 and empty content (ingestRow.ts:66), which folds as one
+ * ignored/stale-epoch event and changes neither the ring nor the window (foldRuntime.ts:191, nsRuntime.ts /
  * cfgRuntime.ts foldStale). A stale body/canvas row is only accounted: no quarantine, no freeze
- * (ingestRow.ts:58).
+ * (ingestRow.ts:65).
  *
  * Per seed: a reader with a real testkit Keyring (testkit/world.ts) is pinned at epoch 1 (genesis, K_1). The
  * revoke(2) record is its `k` row at S_rot, and installQr(2, K_2) settles it as the winner, the same steps as
@@ -19,7 +19,7 @@
  *  - After S_rot: H1 and H2 seal under K_2. R (revoked, still holding K_1, §14.4) appends K_1 frames on ns, cfg,
  *    b: and c:, with fresh clientFrameIds and frameNos right above its window, so only §14.3 stops them.
  *    L had not seen the revoke yet: its first post-S_rot ns/cfg frames commit sealed under K_1, and later come its
- *    copies re-sealed under K_2, which keep the frameNo and get a new clientFrameId (ingestRow.ts:86-94 ownCommitCopy,
+ *    copies re-sealed under K_2, which keep the frameNo and get a new clientFrameId (ingestRow.ts:139-147 ownCommitCopy,
  *    §14.2 step 4). Half the seeds put an injected row at S_rot + 1, and half put an accepted K_1 row at S_rot − 1.
  *  - Checkpoints (§14.3, second half): a K_1 checkpoint at a coversSeq <= S_rot opens, a K_1 checkpoint at a
  *    coversSeq > S_rot is rejected as stale-epoch (not reader-dependent: treated as absent), and a K_2 one at the
@@ -118,7 +118,7 @@ function timeline(seed: number): { readonly rows: Row[]; readonly sRot: Seq } {
 	const bodyDocs = [id22(`b${tag}x`) as DocId, id22(`b${tag}y`) as DocId];
 	const nextFrameNo = (dev: DeviceId, stream: StreamName) => {
 		const k = `${dev}|${stream}`;
-		const f = (frameNo.get(k) ?? NS_DEDUPE_RING) + 1; // fresh runtimes start at 65 (foldRuntime.ts:239-247)
+		const f = (frameNo.get(k) ?? NS_DEDUPE_RING) + 1; // fresh runtimes start at 65 (foldRuntime.ts:279-287)
 		frameNo.set(k, f);
 		return f;
 	};

@@ -2,15 +2,15 @@
  * cfg checkpoint verification (DESIGN §b.5 "Verification is V1 + V2").
  *
  * V2 (decided by WP-A, wp-a-notes.md):
- * - formatVersion 1, coversSeq a count, rings as in ns (1..64 unique valid ids).
+ * - formatVersion 1, coversSeq a count, rings as in ns (1..64 unique non-empty ids, ns/verify.ts isRingId).
  * - json keys are file + "\0" + key with a valid config path; values canonical JSON.
  * - files keys are valid config paths; contents valid; pluginVersion null or non-empty.
  * - plugin ids valid.
  * - every version: 1 <= seq <= coversSeq, 0 <= index < MAX_FRAME_OPS, deviceId
  *   non-empty; versions are unique across all registers (one op writes one
  *   register) and all registers with the same seq share one deviceId.
- * - Checkpoint content: encoding cfgFoldV1, foldRulesVersion ===
- *   CFG_FOLD_RULES_VERSION, coversSeq equal to the relay's and the state's.
+ * - Checkpoint content: encoding cfgFoldV1, foldRulesVersion from CFG_FOLD_RULES_VERSION to the reader's known
+ *   version (above it: upgrade-required, DESIGN §c.10), coversSeq equal to the relay's and the state's.
  */
 
 import type { CfgFoldState, CfgRegister, CfgVersion } from "../types";
@@ -18,7 +18,7 @@ import { CheckpointEncoding, type CheckpointContent } from "../envelope";
 import { MAX_NS_OPS_PER_FRAME, NS_DEDUPE_RING } from "../limits";
 import { replayWindowValid } from "../replayWindow";
 import { bytesEqual } from "../codec/lib0";
-import { isClientFrameId } from "../codec/ids";
+import { isRingId } from "../ns/verify";
 import { decodeCfgFoldV1, encodeCfgFoldV1 } from "../codec/cfgFoldV1";
 import { CFG_FOLD_RULES_VERSION, isCfgFileContent, isConfigRelPath, isPluginId, splitJsonRegisterKey } from "./fold";
 import { isCanonicalJson } from "./json";
@@ -28,7 +28,7 @@ const MAX_FRAME_OPS = MAX_NS_OPS_PER_FRAME;
 
 export type CfgVerifyResult =
 	| { readonly ok: true; readonly state: CfgFoldState }
-	| { readonly ok: false; readonly reason: "malformed" | "non-canonical" | "invariant" | "covers-seq" | "rules-version"; readonly detail: string };
+	| { readonly ok: false; readonly reason: "malformed" | "non-canonical" | "invariant" | "covers-seq" | "rules-version" | "upgrade-required"; readonly detail: string };
 
 const isCount = (n: number) => Number.isSafeInteger(n) && n >= 0;
 
@@ -40,7 +40,7 @@ export function checkCfgInvariants(state: CfgFoldState): string | null {
 		if (typeof device !== "string" || device.length === 0) return "empty deviceId in rings";
 		if (ring.length < 1 || ring.length > NS_DEDUPE_RING) return `ring ${device} size ${ring.length}`;
 		if (new Set(ring).size !== ring.length) return `ring ${device} has duplicates`;
-		for (const f of ring) if (!isClientFrameId(f)) return `ring ${device} has invalid id`;
+		for (const f of ring) if (!isRingId(f)) return `ring ${device} has invalid id`;
 	}
 	for (const [device, w] of state.replay) {
 		if (typeof device !== "string" || device.length === 0) return "empty deviceId in replay";
@@ -91,10 +91,11 @@ export function verifyCfgFoldBytes(bytes: Uint8Array, expectedCoversSeq: number)
 	return { ok: true, state };
 }
 
-/** Full check of a decoded cfg checkpoint content. */
-export function verifyCfgCheckpoint(content: CheckpointContent, relayCoversSeq: number): CfgVerifyResult {
+/** Full check of a decoded cfg checkpoint content; `knownRulesVersion`: the highest cfg rules this reader implements. */
+export function verifyCfgCheckpoint(content: CheckpointContent, relayCoversSeq: number, knownRulesVersion = CFG_FOLD_RULES_VERSION): CfgVerifyResult {
 	if (content.encoding !== CheckpointEncoding.cfgFoldV1) return { ok: false, reason: "malformed", detail: `encoding ${content.encoding}` };
-	if (content.foldRulesVersion !== CFG_FOLD_RULES_VERSION) return { ok: false, reason: "rules-version", detail: `foldRulesVersion ${content.foldRulesVersion}` };
+	if (content.foldRulesVersion > knownRulesVersion) return { ok: false, reason: "upgrade-required", detail: `foldRulesVersion ${content.foldRulesVersion}` };
+	if (content.foldRulesVersion < CFG_FOLD_RULES_VERSION) return { ok: false, reason: "rules-version", detail: `foldRulesVersion ${content.foldRulesVersion}` };
 	if (content.coversSeq !== relayCoversSeq) return { ok: false, reason: "covers-seq", detail: `content ${content.coversSeq} != relay ${relayCoversSeq}` };
 	return verifyCfgFoldBytes(content.state, relayCoversSeq);
 }

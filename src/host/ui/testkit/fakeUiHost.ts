@@ -9,7 +9,7 @@ import type { DeviceCheckMode, DeviceCheckReport, E2eeStatus, EnginePhase, Statu
 import { markedCreating, pinAcross, withoutCreating } from "../../keys/pin";
 import { defaultPluginData, type EngineRunState, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "../api";
 
-export const RUNNING: EngineRunState = { phase: "running", transport: "worker", lastError: null };
+export const RUNNING: EngineRunState = { phase: "running", lastError: null };
 
 export function snapshot(phase: EnginePhase, e2ee: Partial<E2eeStatus> = {}, over: Partial<StatusSnapshot> = {}): StatusSnapshot {
 	return {

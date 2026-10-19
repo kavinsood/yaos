@@ -21,7 +21,7 @@
  * re-checks and the runtime starts in this process; an unpinned device waits for main to pin and restart it.
  */
 
-import type { DocId, PathKey, VaultEpoch, VaultPath } from "../../core/types";
+import type { PathKey, VaultEpoch } from "../../core/types";
 import { BUDGETS } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
@@ -31,7 +31,7 @@ import { isStorageError } from "../../ports/storage";
 import type { VaultEvent } from "../../ports/vault";
 import { ProtocolFailure, type ProtocolError } from "../../protocol/errors";
 import { PROTOCOL_VERSION, type EngineInitConfig, type EngineResultValue, type EngineSettings, type LocalObservation, type MainToEngine, type UserCommand } from "../../protocol/messages";
-import type { DeviceCheckMode, DeviceEnv, StatusSnapshot } from "../../protocol/status";
+import type { DeviceCheckMode, DeviceEnv, DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { EngineTransport } from "../../protocol/transport";
 import type { Budgets } from "../../core/limits";
 import type { EngineTuning } from "../runtime/options";
@@ -63,6 +63,8 @@ export interface CreateEngineOptions {
 	readonly onRuntime?: (rt: VaultRuntime | null) => void;
 	/** Test hook: diagnostics lines (never secrets). */
 	readonly log?: (line: string) => void;
+	/** Test hook: the LogEngine's structured diagnostics events (EngineOptions.onDiag), every runtime. */
+	readonly onDiag?: (event: DiagnosticsEvent) => void;
 	/** Local time zone offset in minutes (conflict-copy names); the engine core never reads Date. */
 	readonly tzOffsetMinutes?: () => number;
 	/** Epoch of an existing local DB for this vault/device (offline start); undefined = connect first. */
@@ -248,7 +250,7 @@ export class ComposedEngine {
 					engine: this, config, settings: this.settings!, ports, carrier: this.options.carrier,
 					clientVersion: this.options.clientVersion ?? "dev", vaultEpoch: this.knownEpoch, reason,
 					tuning: this.options.tuning, budgets: this.options.budgets, paused: this.paused,
-					tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log,
+					tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log, onDiag: this.options.onDiag,
 					pathBases: this.migration?.bases ?? null, retireEpoch: this.migration?.oldEpoch ?? null, frameNoFloor: this.migration?.frameNoFloor ?? null,
 				});
 				if (this.disposed) {
@@ -365,10 +367,6 @@ export class ComposedEngine {
 		if (reason === "epoch") this.knownEpoch = undefined;
 		await this.startRuntime(reason);
 		this.postStatus();
-	}
-
-	setKnownEpoch(epoch: VaultEpoch | undefined): void {
-		this.knownEpoch = epoch;
 	}
 
 	postStatus(): void {
@@ -595,17 +593,6 @@ export class ComposedEngine {
 		this.ports = { ...this.ports, blob: store };
 		this.log("blob store available -> restarting");
 		void this.restart("blob-store").then(() => undefined, (e) => this.log(`blob-store restart failed: ${String(e)}`));
-	}
-
-	/** Tests / diagnostics. */
-	get runtimeStarting(): Promise<void> | null {
-		return this.starting;
-	}
-	boundDocIds(): DocId[] {
-		return [...this.bound.byId.keys()];
-	}
-	waitingPaths(): VaultPath[] {
-		return [...this.bound.waiting];
 	}
 }
 

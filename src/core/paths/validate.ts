@@ -8,7 +8,8 @@
 import type { VaultPath } from "../types";
 import { FORBIDDEN_PATH_CHARS, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, RESERVED_STEMS } from "../limits";
 import { ASSIGNED_15_1 } from "./assigned15_1";
-import { asciiLower, utf8ByteLength } from "./segments";
+import { utf8ByteLength } from "../codec/lib0";
+import { asciiLower } from "./segments";
 
 export type PathInvalidReason =
 	| "empty"

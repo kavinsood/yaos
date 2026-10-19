@@ -36,6 +36,7 @@ import type {
 import { NS_DEDUPE_RING } from "../limits";
 import { replayAccept, replayCheck } from "../replayWindow";
 import { isContentHash } from "../codec/ids";
+import { bytesEqual } from "../codec/lib0";
 import { isCanonicalJson } from "./json";
 
 /** cfg checkpoints carry this foldRulesVersion in the content header. cfg has no upgradeRules op. */
@@ -166,18 +167,12 @@ export function compareCfgVersion(a: CfgVersion, b: CfgVersion): number {
 	return a.seq !== b.seq ? a.seq - b.seq : a.index - b.index;
 }
 
-function bytesSame(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-	return true;
-}
-
 export function cfgFileValuesEqual(a: CfgFileValue | null, b: CfgFileValue | null): boolean {
 	if (a === null || b === null) return a === b;
 	if (a.pluginVersion !== b.pluginVersion) return false;
 	const x = a.content;
 	const y = b.content;
-	if (x.t === "inline") return y.t === "inline" && bytesSame(x.bytes, y.bytes);
+	if (x.t === "inline") return y.t === "inline" && bytesEqual(x.bytes, y.bytes);
 	return y.t === "blob" && x.hash === y.hash && x.size === y.size;
 }
 
@@ -260,20 +255,6 @@ export function foldCfgFrameWith(rules: CfgFoldRules, state: CfgFoldState, frame
 
 export function foldCfgFrame(state: CfgFoldState, frame: CfgFrame): CfgFoldEvent[] {
 	return foldCfgFrameWith(DEFAULT_CFG_FOLD_RULES, state, frame);
-}
-
-/** Registers whose value changed in these events (deduplicated, in event order). */
-export function changedRegisters(events: readonly CfgFoldEvent[]): CfgRegisterRef[] {
-	const seen = new Set<string>();
-	const out: CfgRegisterRef[] = [];
-	for (const e of events) {
-		if (e.outcome.t !== "applied" || e.register === null) continue;
-		const id = `${e.register.map}:${e.register.key}`;
-		if (seen.has(id)) continue;
-		seen.add(id);
-		out.push(e.register);
-	}
-	return out;
 }
 
 // ---------------------------------------------------------------------------

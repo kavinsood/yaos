@@ -16,7 +16,13 @@ import type {
 } from "../../core/types";
 import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
 
-export const DB_SCHEMA_VERSION = 1;
+/**
+ * Bumped on any change to stores, indexes or record shapes. An older DB fails Repo.open's identity check
+ * (schemaVersion) and is deleted and rebuilt from relay + disk + side-file mirrors (DESIGN §i.5).
+ * 2: dropped the unused streams byStalePriority / byAccess, synced byPathKey and blobQueue byActiveDue indexes
+ * and the fields only they read; dropped the outbox "sent" state, attempts and lastSentAtMs (T_sent).
+ */
+export const DB_SCHEMA_VERSION = 2;
 export const DB_NAME_PREFIX = "yaos2";
 
 /** `yaos2:<vaultId>:<vaultEpoch>:<deviceId>`, each part URI-component encoded (the epoch is an opaque string). */
@@ -50,12 +56,14 @@ export interface MetaOutboxOrder {
 	/** Next local order number; strictly increasing, never reused within this DB. */
 	readonly next: number;
 }
+/**
+ * Own frames receipted on `day` (EngineCtx.day(), YYYY-MM-DD per ClockPort.now()): the daily soft budget (DESIGN
+ * §i.6). Written by T_live; read at open, so the budget survives a restart within the day.
+ */
 export interface MetaDaily {
 	readonly key: "daily";
-	/** Local calendar day (YYYY-MM-DD) per ClockPort.now(). */
 	readonly day: string;
 	readonly framesSent: number;
-	readonly bytesSent: number;
 }
 /**
  * Highest own ns / cfg frameNo of the abandoned timeline, carried by epoch
@@ -108,10 +116,8 @@ export interface StreamRecord {
 	readonly appliedSeq: Seq;
 	/** Highest seq known to exist for this stream (feed, push, receipt). */
 	readonly remoteHeadSeq: Seq;
-	/** 1 iff appliedSeq < remoteHeadSeq. Indexed (IDB cannot index booleans). */
+	/** 1 iff appliedSeq < remoteHeadSeq. Catch-up order is computed in memory (catchUp.ts staleOrder), not stored. */
 	readonly stale: 0 | 1;
-	/** Catch-up priority when stale: lower first (DESIGN §j.6). */
-	readonly priority: number;
 	readonly snapshotCoversSeq: Seq;
 	readonly tailRows: number;
 	readonly tailBytes: number;
@@ -129,7 +135,6 @@ export interface StreamRecord {
 	readonly frozenReason: string | null;
 	/** Remote checkpoint failed verification; do not adopt it. */
 	readonly disputedCheckpointCoversSeq: Seq;
-	readonly lastAccessMs: number;
 	/** Logical hash of the doc text at bodyVersion, if computed. */
 	readonly textHash: ContentHash | null;
 }
@@ -174,10 +179,11 @@ export type TailKey = readonly [StreamName, Seq];
 export type OutboxState =
 	/** Waiting for a dependency (initial body frame held until its ns create is folded, DESIGN §j.5). */
 	| "held"
-	/** Persisted, not yet written to a session. */
+	/**
+	 * Persisted, awaiting receipt: "maybe sent" (DESIGN §d.4). What is in flight on the current session is the
+	 * sender's memory only (Sender.isInflight); every pending record is resent after a restart or STREAM_RESEND.
+	 */
 	| "pending"
-	/** Written to a session; awaiting receipt. */
-	| "sent"
 	/** Refused as oversize/invalid; kept for recovery, never resent automatically. */
 	| "poisoned"
 	/**
@@ -208,17 +214,13 @@ export interface OutboxRecord {
 	 */
 	readonly keyEpoch: number;
 	/**
-	 * pending / sent: the live ns create this body frame goes after (DESIGN §e.1, Sender blockedBy).
-	 * held: the frame this waits for (DESIGN §e.1): the doc's ns create
-	 * (released when it folds) or the newest adoptable of the same stream
-	 * (released when that record is gone).
+	 * pending: the live ns create this body frame goes after (DESIGN §e.1, Sender blockedBy).
+	 * held: the onboarding ns create of the doc this frame waits for (DESIGN §e.1), released when it folds.
 	 */
 	readonly dependsOn: ClientFrameId | null;
 	/** adoptable only: identity of the provisional frame being shadowed. */
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly receivedAtMs: number } | null;
-	readonly attempts: number;
 	readonly createdAtMs: number;
-	readonly lastSentAtMs: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +244,8 @@ export type QuarantineReason =
 	| "post-apply-limit"
 	| "canvas-invalid"
 	| "checkpoint-mismatch"
+	/** An ns / cfg checkpoint that decodes canonically but breaks a V2 structural invariant (DESIGN §b.5). */
+	| "checkpoint-invariant"
 	/** A checkpoint sealed under an epoch below the winning revoke, covering past S_rot (e2ee-design §14.3): absent. */
 	| "stale-epoch"
 	/**
@@ -341,8 +345,6 @@ export interface BlobQueueRecord {
 	readonly size: number;
 	readonly attempts: number;
 	readonly nextAttemptAtMs: number;
-	/** 0 = queued, 1 = in flight. Indexed with nextAttemptAtMs. */
-	readonly active: 0 | 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -365,41 +367,31 @@ export const STORE = {
 } as const;
 
 export const INDEX = {
-	streamsByStale: "byStalePriority",
-	streamsByAccess: "byAccess",
 	outboxByOrder: "byOrder",
 	outboxByStream: "byStreamOrder",
 	outboxByState: "byStateOrder",
 	quarantineByAt: "byAt",
-	syncedByPathKey: "byPathKey",
-	blobQueueByDue: "byActiveDue",
 } as const;
 
 /** Schema map for StoragePort typing. */
 export interface YaosSchema {
 	readonly [STORE.meta]: { readonly record: MetaRecord; readonly key: MetaKey; readonly indexes: never };
-	readonly [STORE.streams]: { readonly record: StreamRecord; readonly key: StreamName; readonly indexes: typeof INDEX.streamsByStale | typeof INDEX.streamsByAccess };
+	readonly [STORE.streams]: { readonly record: StreamRecord; readonly key: StreamName; readonly indexes: never };
 	readonly [STORE.snapshots]: { readonly record: SnapshotRecord; readonly key: StreamName; readonly indexes: never };
 	readonly [STORE.tail]: { readonly record: TailRecord; readonly key: TailKey; readonly indexes: never };
 	readonly [STORE.outbox]: { readonly record: OutboxRecord; readonly key: ClientFrameId; readonly indexes: typeof INDEX.outboxByOrder | typeof INDEX.outboxByStream | typeof INDEX.outboxByState };
 	readonly [STORE.quarantine]: { readonly record: QuarantineRecord; readonly key: TailKey; readonly indexes: typeof INDEX.quarantineByAt };
-	readonly [STORE.synced]: { readonly record: SyncedRecord; readonly key: DocId; readonly indexes: typeof INDEX.syncedByPathKey };
+	readonly [STORE.synced]: { readonly record: SyncedRecord; readonly key: DocId; readonly indexes: never };
 	readonly [STORE.baseText]: { readonly record: BaseTextRecord; readonly key: DocId; readonly indexes: never };
 	readonly [STORE.localTree]: { readonly record: LocalTreeRecord; readonly key: PathKey; readonly indexes: never };
 	readonly [STORE.intents]: { readonly record: IntentRecord; readonly key: string; readonly indexes: never };
 	readonly [STORE.cfgBase]: { readonly record: CfgBaseRecord; readonly key: ConfigRelPath; readonly indexes: never };
-	readonly [STORE.blobQueue]: { readonly record: BlobQueueRecord; readonly key: ContentHash; readonly indexes: typeof INDEX.blobQueueByDue };
+	readonly [STORE.blobQueue]: { readonly record: BlobQueueRecord; readonly key: ContentHash; readonly indexes: never };
 }
 
 export const STORE_SPECS: Readonly<Record<keyof YaosSchema, StoreSpec>> = {
 	meta: { keyPath: "key", indexes: {} },
-	streams: {
-		keyPath: "stream",
-		indexes: {
-			[INDEX.streamsByStale]: { keyPath: ["stale", "priority"], unique: false },
-			[INDEX.streamsByAccess]: { keyPath: "lastAccessMs", unique: false },
-		},
-	},
+	streams: { keyPath: "stream", indexes: {} },
 	snapshots: { keyPath: "stream", indexes: {} },
 	tail: { keyPath: ["stream", "seq"], indexes: {} },
 	outbox: {
@@ -411,12 +403,12 @@ export const STORE_SPECS: Readonly<Record<keyof YaosSchema, StoreSpec>> = {
 		},
 	},
 	quarantine: { keyPath: ["stream", "seq"], indexes: { [INDEX.quarantineByAt]: { keyPath: "atMs", unique: false } } },
-	synced: { keyPath: "docId", indexes: { [INDEX.syncedByPathKey]: { keyPath: "pathKey", unique: false } } },
+	synced: { keyPath: "docId", indexes: {} },
 	baseText: { keyPath: "docId", indexes: {} },
 	localTree: { keyPath: "pathKey", indexes: {} },
 	intents: { keyPath: "id", indexes: {} },
 	cfgBase: { keyPath: "file", indexes: {} },
-	blobQueue: { keyPath: "hash", indexes: { [INDEX.blobQueueByDue]: { keyPath: ["active", "nextAttemptAtMs"], unique: false } } },
+	blobQueue: { keyPath: "hash", indexes: {} },
 };
 
 /** All tail rows of one stream: [stream, 0] .. [stream, +inf]. */
@@ -435,7 +427,8 @@ export interface OutboxMirrorFrame {
 	readonly clientFrameId: ClientFrameId;
 	readonly stream: StreamName;
 	readonly order: number;
-	readonly state: OutboxState;
+	/** Mirrors written before DB schema 2 may say "sent" (a pending record then in flight); recovery imports it as pending. */
+	readonly state: OutboxState | "sent";
 	readonly authorNsSeq: Seq;
 	readonly dependsOn: ClientFrameId | null;
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId } | null;

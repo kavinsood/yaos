@@ -53,7 +53,7 @@ tsconfig.
   - `place.ts`: placement, suffixes, recases;
   - `overlay.ts`: `overlayPending`;
   - `verify.ts`: V1/V2;
-  - `candidate.ts`: V3 candidate seqs and digest ring.
+  - `candidate.ts`: checkpoint candidate seqs (the V3 digest ring was deleted unused).
 - `src/core/cfg/`:
   - `fold.ts`: LWW fold, op checks, `overlayPendingCfg`, register keys;
   - `json.ts`: canonical JSON;
@@ -85,7 +85,7 @@ a temp dir; the raw UCD files are never committed. `--check` regenerates in memo
 | `core/paths/paths.test.ts` | 12 | ß/ẞ/SS, Σσς, İ/ı, NFC/NFD, legacy collision fixtures, ASCII fast path, table well-formedness, unassigned/post-15.1, §c.2 rules, byte limits |
 | `core/codec/codec.test.ts` | 10 | lib0 strictness, ids, envelope (seal/open, AAD, binding, bounded inflate), nsOps/cfgOps, contents |
 | `core/codec/folds.test.ts` | 5 | nsFoldV1/cfgFoldV1 canonical round-trip and rejection, mirrors |
-| `core/ns/fold.test.ts` | 22 | E1–E12, op rules, prune, halt, V1/V2, V3 candidates, overlay |
+| `core/ns/fold.test.ts` | 22 | E1–E12, op rules, prune, halt, V1/V2, candidate seqs, overlay |
 | `core/ns/fuzz.test.ts` | 2 | 10k-op fuzz (default 4 seeds) and generator coverage of every outcome |
 | `core/cfg/cfg.test.ts` | 9 | cfg fold, V1/V2, projection, community-plugins, data.json gate, cfg fuzz (20 seeds, about 1.8 s) |
 | `sim/clock.test.ts` | 4 | (dueAt, insertion) order, promise chains settle between timers, runUntil/runUntilIdle, onError, heap churn |
@@ -146,7 +146,6 @@ These are deliberate. Each was decided without asking, as the brief allowed.
 2. **Mirrors take a hash port.** The outbox/synced mirror codecs live in `core/codec/mirrors.ts`.
    - They use local structural types, because core cannot import `engine/store/schema.ts`.
    - They take an async `Pick<HashPort, "sha256">` for the checksum, because core had no sha256 of its own. (WP-B's pure-JS sha256 refuses inputs over 4 KiB since 5be1c96b, so the port stays.)
-   - V3 digests (`nsFoldDigest`) take the same parameter.
 3. **SimRelay is port-level, not wire-level.**
    - `SimRelaySession` plays the wsRelay adapter's role: wire message → `RelayEvent` (held PROVISIONALs, notice join, receipts → head, VAULT_ERROR → refused).
    - The server-side semantics are mirrored from `server/src/streams` (store.ts, relay.ts).
@@ -349,8 +348,7 @@ foldNsFrameWith(rules: NsFoldRules, state, index, frame): NsEvent[] ; DEFAULT_NS
 newNsFoldState(), newNsFoldIndex(), buildIndex(state), cloneNsFold(state, index)
 overlayPending(state, index, deviceId, frames: PendingNsFrame[], rules?): NsOverlay   // {state,index,events,touched,halted}
 checkNsInvariants(state, index), verifyNsFoldState(state), verifyNsFoldBytes(bytes, expectedCoversSeq), verifyNsCheckpoint(content, relayCoversSeq)
-isCandidateSeq(seq), async nsFoldDigest(state, hash), recordDigest(ring, seq, digest), checkDigest(ring, seq, digest): "match"|"mismatch"|"unknown"
-NS_CANDIDATE_INTERVAL = 1000, NS_DIGEST_RING = 16
+isCandidateSeq(prevCoversSeq, seq) ; NS_CANDIDATE_INTERVAL = 1000
 ```
 
 core/cfg:

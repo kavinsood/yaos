@@ -19,11 +19,33 @@ export class CodecError extends Error {
 
 const MAX_SAFE = 9007199254740991; // 2^53 - 1
 
+// The one UTF-8 implementation of core and the engine. Lone surrogates encode as U+FFFD (TextEncoder); decoding keeps
+// a leading BOM (the markdown codec strips one itself, and hashRequest's textLength counts it).
 const encoder = new TextEncoder();
 const fatalDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const lenientDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 export function utf8Encode(s: string): Uint8Array {
 	return encoder.encode(s);
+}
+
+/**
+ * UTF-8 byte length of utf8Encode(s), without allocating: a lone surrogate counts as U+FFFD (3 bytes). Path and
+ * segment limits are measured with it, so every device counts the same bytes.
+ */
+export function utf8ByteLength(s: string): number {
+	let n = 0;
+	for (let i = 0; i < s.length; i++) {
+		const c = s.charCodeAt(i);
+		if (c < 0x80) n += 1;
+		else if (c < 0x800) n += 2;
+		else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+			const d = s.charCodeAt(i + 1);
+			if (d >= 0xdc00 && d <= 0xdfff) { n += 4; i++; }
+			else n += 3;
+		} else n += 3;
+	}
+	return n;
 }
 
 /** Throws CodecError on invalid UTF-8. A leading BOM is kept. */
@@ -32,6 +54,21 @@ export function utf8DecodeStrict(bytes: Uint8Array): string {
 		return fatalDecoder.decode(bytes);
 	} catch {
 		throw new CodecError("invalid utf-8");
+	}
+}
+
+/**
+ * Decode UTF-8, keeping a leading BOM. Malformed sequences become U+FFFD (one per maximal invalid subpart); with
+ * `fatal`, null instead.
+ */
+export function utf8Decode(bytes: Uint8Array, fatal: true): string | null;
+export function utf8Decode(bytes: Uint8Array, fatal?: false): string;
+export function utf8Decode(bytes: Uint8Array, fatal = false): string | null {
+	if (!fatal) return lenientDecoder.decode(bytes);
+	try {
+		return fatalDecoder.decode(bytes);
+	} catch {
+		return null;
 	}
 }
 

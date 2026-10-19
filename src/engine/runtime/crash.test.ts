@@ -2,7 +2,7 @@
  * Crash at every §e.2 transaction boundary (DESIGN §k.3 WP-C #1).
  *
  * One scenario (feed + read on start, create, edits, live rows from a peer,
- * receipts, lazy T_sent, local compaction, remote checkpoints, rename, delete,
+ * receipts, local compaction, remote checkpoints, rename, delete,
  * relay restart + resend) is run once to count device A's read-write commits,
  * then once per commit index k with A's storage crashing just before / just
  * after commit k. After each crash: the committed state is probed (cursor V
@@ -20,7 +20,7 @@ import { VirtualClock } from "../../sim/clock";
 import { MemStoragePort, type CommitDecision } from "../../sim/storage";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { converged, drive, sleep, startTestEngine, testStorage, until } from "./testHarness";
+import { converged, drive, sleep, startTestEngine, testStorage, until, createDoc, deleteDoc, docText, editDoc, renameDoc } from "./testHarness";
 
 const TUNING = { compactRows: 4, checkpoint: { rows: 3, bytes: 1e9, idleMs: 10, settleMs: 1e9, fallbackMs: 40, nsRows: 3, nsBytes: 1e9 } };
 const SAMPLE = Math.max(1, Number(process.env.YAOS_CRASH_SAMPLE ?? "1"));
@@ -99,7 +99,7 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 	let a2: LogEngine | null = null;
 	try {
 		await until(() => b.status().phase === "live", 3_000, "b live", clock);
-		const pre = await run(b.createDoc("pre.md", "b-before;"));
+		const pre = await run(createDoc(b, "pre.md", "b-before;"));
 		await until(() => b.isIdle(), 3_000, "b idle", clock);
 		const step = async (fn: () => Promise<unknown>) => {
 			if (storage.dead) return;
@@ -122,32 +122,29 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 		const A = () => a!;
 		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle", clock));
 		let a1 = "" as never;
-		await step(async () => void (a1 = await run(A().createDoc("a1.md", "alpha;")) as never));
+		await step(async () => void (a1 = await run(createDoc(A(), "a1.md", "alpha;")) as never));
 		for (let i = 0; i < 6; i++) {
-			await step(() => run(A().editDoc(a1, (t) => t.insert(t.length, `e${i};`))));
+			await step(() => run(editDoc(A(), a1, (t) => t.insert(t.length, `e${i};`))));
 			await step(() => sleep(15, clock));
 		}
-		await run(b.editDoc(pre, (t) => t.insert(t.length, "b-live;")));
+		await run(editDoc(b, pre, (t) => t.insert(t.length, "b-live;")));
 		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle 2", clock));
-		await step(() => run(A().editDoc(pre, (t) => t.insert(0, "a-on-pre;"))));
-		await step(() => run(A().renameDoc(a1, "a1-renamed.md")));
+		await step(() => run(editDoc(A(), pre, (t) => t.insert(0, "a-on-pre;"))));
+		await step(() => run(renameDoc(A(), a1, "a1-renamed.md")));
 		await step(async () => {
-			const tmp = await run(A().createDoc("tmp.md", "gone soon"));
+			const tmp = await run(createDoc(A(), "tmp.md", "gone soon"));
 			await until(() => storage.dead || A().isIdle(), 3_000, "a idle 3", clock);
-			await run(A().deleteDoc(tmp));
+			await run(deleteDoc(A(), tmp));
 		});
 		await step(async () => {
 			relay.pauseCommits();
-			await run(A().editDoc(a1, (t) => t.insert(0, "paused;")));
+			await run(editDoc(A(), a1, (t) => t.insert(0, "paused;")));
 			await until(() => storage.dead || A().c.sender.inflightCount > 0, 2_000, "inflight", clock);
-			// Lazy T_sent while the frame is unreceipted (commits paused, so no receipt can clear sentPending first).
-			const sent = labels.filter((l) => l === "tSent").length;
-			await until(() => storage.dead || labels.filter((l) => l === "tSent").length > sent, 2_000, "tSent", clock);
 			relay.restart();
 			relay.resumeCommits();
 		});
 		relay.resumeCommits();
-		await step(() => sleep(120, clock)); // checkpoints / compaction / T_sent ticks
+		await step(() => sleep(120, clock)); // checkpoints / compaction ticks
 		await step(() => until(() => storage.dead || A().isIdle(), 3_000, "a idle 4", clock));
 		if (k === null) {
 			assert.equal(storage.dead, false);
@@ -168,7 +165,7 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 		for (const id of durable) assert.equal(mine.get(id), 1, `durable frame ${id} committed exactly once (crash ${decision} #${k} ${(crashed as RunResult["crashed"])?.label})`);
 		assert.equal(a2.c.outbox.size, 0, "outbox drained");
 		assert.equal(a2.c.repo.cursor.vaultSeq, relay.head());
-		assert.ok((await run(b.docText(pre))).includes("b-before;b-live;"));
+		assert.ok((await run(docText(b, pre))).includes("b-before;b-live;"));
 		return { labels, crashed };
 	} catch (e) {
 		throw new Error(`crash ${decision} #${k} (${(crashed as RunResult["crashed"])?.label ?? "-"}): ${String(e instanceof Error ? e.stack : e)}`);
@@ -197,11 +194,11 @@ test("crash probe is not vacuous: a V jump past unread rows is reported", async 
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
 	try {
 		await until(() => b.status().phase === "live", 3_000, "live");
-		await b.createDoc("x.md", "rows");
+		await createDoc(b, "x.md", "rows");
 		await until(() => b.isIdle(), 3_000, "idle");
 		const storage = new MemStoragePort();
 		const o = await Repo.open(storage, IDENT, Date.now());
-		await o.repo!.tFeedPage([], relay.head(), relay.head(), Date.now()); // bug: V jumps, no stream marked stale
+		await o.repo!.tFeedPage([], relay.head(), relay.head()); // bug: V jumps, no stream marked stale
 		o.repo!.close();
 		await assert.rejects(probe(storage, relay), /passes unaccounted seq/);
 	} finally {
@@ -213,7 +210,7 @@ test("crash sweep: baseline scenario converges and exercises every e.2 transacti
 	const r = await scenario(null, "commit");
 	baseline = r.labels;
 	const kinds = new Set(baseline);
-	for (const t of ["open", "tFeedPage", "tReadPage", "tEdit", "tLive", "tSent", "tSnapshot", "tPatchStreams"]) assert.ok(kinds.has(t), `scenario runs ${t} (got ${[...kinds].join(",")})`);
+	for (const t of ["open", "tFeedPage", "tReadPage", "tEdit", "tLive", "tSnapshot", "tPatchStreams"]) assert.ok(kinds.has(t), `scenario runs ${t} (got ${[...kinds].join(",")})`);
 	console.log(`crash baseline: ${baseline.length} commits: ${[...kinds].map((t) => `${t}x${baseline.filter((l) => l === t).length}`).join(" ")}`);
 });
 

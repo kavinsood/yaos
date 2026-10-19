@@ -5,7 +5,7 @@ import { defaultPluginData, type EngineRunState, type YaosPluginData } from "./a
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
 
-const RUNNING: EngineRunState = { phase: "running", transport: "worker", lastError: null };
+const RUNNING: EngineRunState = { phase: "running", lastError: null };
 
 type Counts = StatusSnapshot["counts"];
 
@@ -112,13 +112,13 @@ test("renderStatus: run phases take precedence over the snapshot", () => {
 	const live = snap("live");
 	assert.deepEqual(
 		[
-			renderStatus(live, { phase: "unpaired", transport: null, lastError: null }),
-			renderStatus(live, { phase: "stopped", transport: null, lastError: null }),
-			renderStatus(live, { phase: "starting", transport: null, lastError: null }),
+			renderStatus(live, { phase: "unpaired", lastError: null }),
+			renderStatus(live, { phase: "stopped", lastError: null }),
+			renderStatus(live, { phase: "starting", lastError: null }),
 		].map((r) => [r.text, r.level]),
 		[["YAOS: not paired", "warn"], ["YAOS: stopped", "warn"], ["YAOS: starting…", "busy"]],
 	);
-	const failed = renderStatus(live, { phase: "failed", transport: null, lastError: "worker crashed" });
+	const failed = renderStatus(live, { phase: "failed", lastError: "worker crashed" });
 	assert.equal(failed.text, "YAOS: stopped (error)");
 	assert.equal(failed.level, "error");
 	assert.match(failed.tooltip, /worker crashed/);
@@ -281,4 +281,18 @@ test("key-missing: the text stays, the tooltip says what to do, and a click open
 	h.set(snap("live"));
 	el.click();
 	assert.deepEqual(opens, ["key", "settings"]);
+});
+
+test("renderStatus: upgrade-required names the vault and what stopped when a fold halted, else the server", () => {
+	const notice = (code: string) => ({ code, level: "error" as const, atMs: 1 });
+	const vault = renderStatus(snap("upgrade-required", { notices: [notice("upgrade-required:cfg"), notice("upgrade-required:ns")] }), RUNNING);
+	assert.equal(vault.text, "YAOS: update required");
+	assert.equal(vault.level, "error");
+	assert.deepEqual(vault.tooltip.split("\n").slice(0, 3), [
+		"This vault was written by a newer YAOS. Update the plugin to keep syncing.",
+		"Until then, files created, renamed or deleted on other devices are not applied here.",
+		"Until then, settings sync is paused.",
+	]);
+	const server = renderStatus(snap("upgrade-required", { relay: { connected: false, lastCloseCode: null, reconnectInMs: null, rttMs: null }, notices: [notice("upgrade-required")] }), RUNNING);
+	assert.match(server.tooltip, /^The server needs a newer YAOS plugin/);
 });

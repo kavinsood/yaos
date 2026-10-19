@@ -14,7 +14,6 @@ import { pathInvalidReason } from "../../core/paths/validate";
 import type { ContentHash, DocKind, VaultPath } from "../../core/types";
 import type { HashPort } from "../../ports/crypto";
 import type { SideFilePort } from "../../ports/vault";
-import { LANE } from "../../protocol/messages";
 import type { DiskGateway } from "../reconcile/deps";
 import { partName, writeDescriptor } from "./localStore";
 
@@ -51,7 +50,7 @@ export async function exportSnapshot(o: ExportInput): Promise<ExportResult> {
 	});
 	try {
 		for (const batch of batches(eligible)) {
-			const res = await o.disk.read(batch.map((f) => ({ area: "vault" as const, path: f.path, maxBytes: maxEntryBytes(f.kind) })), LANE.bulk);
+			const res = await o.disk.read(batch.map((f) => ({ area: "vault" as const, path: f.path, maxBytes: maxEntryBytes(f.kind) })));
 			for (let j = 0; j < batch.length; j++) {
 				const f = batch[j]!;
 				const r = res[j];

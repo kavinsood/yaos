@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { KEY_STORE_WAIT_MS } from "../../core/limits";
 import { VirtualClock } from "../../sim/clock";
-import { KeyStoreError, VaultKeyStore, sameKeys, secretIdFor, type EpochKey } from "./secretStore";
+import { KeyStoreError, VaultKeyStore, secretIdFor, type EpochKey } from "./secretStore";
+import { sameKeys } from "./testkit/sameKeys";
 import { FakeSecretStorage } from "./testkit/fakeSecretStorage";
 import { BAD_VAULT_IDS, testVaultId } from "./testkit/vaultIds";
 

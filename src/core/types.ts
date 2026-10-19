@@ -537,7 +537,7 @@ export interface BrakeConfig {
 export interface BrakeReport {
 	/** Stable id: sha256 of the brake's identity (core/plan/brake.ts brakeIdentity); approval references it. */
 	readonly id: string;
-	readonly reason: "mass-delete-local" | "mass-delete-remote" | "mass-overwrite" | "listing-shrank" | "conflict-flood" | "ns-divergence";
+	readonly reason: "mass-delete-local" | "mass-delete-remote" | "mass-overwrite" | "listing-shrank" | "conflict-flood";
 	readonly heldCount: number;
 	readonly syncedCount: number;
 	readonly samplePaths: readonly VaultPath[];

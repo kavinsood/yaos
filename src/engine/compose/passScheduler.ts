@@ -1,5 +1,5 @@
 /**
- * Reconcile pass scheduler (DESIGN §f.2 scope, §i.1 lanes). One pass at a
+ * Reconcile pass scheduler (DESIGN §f.2 scope). One pass at a
  * time; triggers that arrive while a pass runs merge into the next one.
  *
  *  - gated: no pass before the first complete listing, while paused or
@@ -40,7 +40,6 @@ export class PassScheduler {
 	private periodic: TimerHandle | null = null;
 	private failures = 0;
 	private stopped = false;
-	private idleWaiters: (() => void)[] = [];
 	stats = { passes: 0, fullPasses: 0, errors: 0, lastFullAtMs: null as number | null };
 	last: PassReport | null = null;
 
@@ -62,22 +61,11 @@ export class PassScheduler {
 		if (this.want) this.kick(0);
 	}
 
-	get idle(): boolean {
-		return this.running === null && this.debounce === null && (this.want === null || !this.deps.ready());
-	}
-
-	/** Resolves when no pass runs or is due (gated requests count as idle). */
-	whenIdle(): Promise<void> {
-		if (this.idle) return Promise.resolve();
-		return new Promise((r) => this.idleWaiters.push(r));
-	}
-
 	stop(): void {
 		this.stopped = true;
 		for (const t of [this.debounce, this.retry, this.periodic]) if (t !== null) this.deps.clock.clearTimer(t);
 		this.debounce = this.retry = this.periodic = null;
 		this.want = null;
-		this.settleIdle();
 	}
 
 	/** Wait for the running pass (stop path). */
@@ -97,13 +85,6 @@ export class PassScheduler {
 		});
 	}
 
-	private settleIdle(): void {
-		if (!this.idle) return;
-		const w = this.idleWaiters;
-		this.idleWaiters = [];
-		for (const r of w) r();
-	}
-
 	private take(): PlanScope | null {
 		const w = this.want;
 		if (!w) return null;
@@ -114,14 +95,10 @@ export class PassScheduler {
 
 	private loop(): void {
 		if (this.stopped || this.running) return;
-		if (!this.deps.ready() || !this.want) {
-			this.settleIdle();
-			return;
-		}
+		if (!this.deps.ready() || !this.want) return;
 		this.running = this.chain().finally(() => {
 			this.running = null;
 			if (this.want && this.deps.ready()) this.kick(0);
-			this.settleIdle();
 		});
 	}
 

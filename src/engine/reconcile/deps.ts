@@ -29,7 +29,7 @@ export type ExecResult =
  * `exec` transfers write bytes ([T]): after the call they are detached, never reuse them.
  */
 export interface DiskGateway {
-	read(reads: readonly DiskReadRequest[], lane: Lane): Promise<readonly DiskReadResult[]>;
+	read(reads: readonly DiskReadRequest[]): Promise<readonly DiskReadResult[]>;
 	exec(ops: readonly DiskOp[], lane: Lane): Promise<readonly ExecResult[]>;
 }
 
@@ -41,8 +41,6 @@ export interface RemoteView {
 	readonly nsCoversSeq: Seq;
 	/** ns caught up once in this session and not halted (§f.2 gates). */
 	readonly nsReady: boolean;
-	/** V3 digest mismatch (§b.5). */
-	readonly divergence: boolean;
 	readonly docsWithPendingBody: ReadonlySet<DocId>;
 	/** Restore duty (§c.7) beyond docsWithPendingBody. */
 	readonly restoreDuty: ReadonlySet<DocId>;

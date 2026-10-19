@@ -9,7 +9,7 @@
 
 import type { PathKey, PathKeyFn, VaultPath } from "../types";
 import { FORBIDDEN_PATH_CHARS, MAX_PATH_BYTES, MAX_SEGMENT_BYTES, RESERVED_STEMS } from "../limits";
-import { utf8Length } from "../hash/utf8";
+import { utf8ByteLength } from "../codec/lib0";
 
 /** REPLACE AT INTEGRATION with WP-A's pathKey (src/core/paths/pathKey.ts). */
 export const standInPathKey: PathKeyFn = (path: VaultPath): PathKey => path.normalize("NFC").toLowerCase().normalize("NFC") as PathKey;
@@ -28,7 +28,7 @@ export function pathInvalidReason(path: string, assigned?: (codePoint: number) =
 	if (path.length === 0) return "empty";
 	if (path !== path.normalize("NFC")) return "not-nfc";
 	if (path.startsWith("/") || path.endsWith("/")) return "slash";
-	if (utf8Length(path) > MAX_PATH_BYTES) return "path-too-long";
+	if (utf8ByteLength(path) > MAX_PATH_BYTES) return "path-too-long";
 	for (let i = 0; i < path.length; i++) {
 		const c = path.charCodeAt(i);
 		if (c < 0x20 || c === 0x7f) return "control-char";
@@ -46,7 +46,7 @@ export function pathInvalidReason(path: string, assigned?: (codePoint: number) =
 	for (const segment of path.split("/")) {
 		if (segment.length === 0) return "empty-segment";
 		if (segment.startsWith(".")) return "dot-segment"; // includes "." and ".."
-		if (utf8Length(segment) > MAX_SEGMENT_BYTES) return "segment-too-long";
+		if (utf8ByteLength(segment) > MAX_SEGMENT_BYTES) return "segment-too-long";
 		if (segment.endsWith(".") || segment.endsWith(" ")) return "trailing-dot-or-space";
 		const dot = segment.indexOf(".");
 		const stem = (dot < 0 ? segment : segment.slice(0, dot)).replace(/[A-Z]/g, (ch) => ch.toLowerCase());

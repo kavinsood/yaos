@@ -10,8 +10,8 @@ import { createHash } from "node:crypto";
 import { encodeNsFoldV1 } from "../../src/core/codec/nsFoldV1";
 import { pathKey } from "../../src/core/paths/pathKey";
 import type { ConfigRelPath, VaultPath } from "../../src/core/types";
-import { residentText } from "../../src/engine/compose/runtimeOps";
 import { classifyConfigPath } from "../../src/engine/settings/allowlist";
+import { residentText } from "../../src/sim/device";
 import type { FullClient } from "./fullKit";
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));

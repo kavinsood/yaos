@@ -1,8 +1,8 @@
 /**
  * The recovery key's text form on main (e2ee-design §13.1), without hashing: main never hashes
  * (scripts/check-deps.mjs keeps core/hash off main), so the 3-byte checksum comes from the engine
- * (YaosUiHost.rkChecksum). The bit loops are core/codec/recoveryKey.ts's; recoveryKeyText.test.ts checks both
- * agree on every key it tries.
+ * (YaosUiHost.rkChecksum). recoveryKeyText.test.ts checks it against the reference codec
+ * core/codec/testkit/recoveryKey.ts on every key it tries.
  *
  *   RK = 32 secret bytes ‖ first 3 bytes of SHA-256(those 32)   (35 bytes)
  *   text = "YAOS-RK1-" + 14 groups of 4 Crockford base32 characters (MSB first, 56 characters)

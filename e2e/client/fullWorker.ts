@@ -11,7 +11,7 @@
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { parentPort, workerData, type MessagePort } from "node:worker_threads";
 import { IDBFactory } from "fake-indexeddb";
-import type { BlobPort } from "../../src/ports";
+import type { BlobPort } from "../../src/ports/blob";
 import { createEngine, type EngineHandle } from "../../src/engine/compose/protocolEngine";
 import { webDeviceEnv } from "../../src/engine/adapters/webDeviceEnv";
 import { createWorkerEngineTransport, type WorkerScopeLike } from "../../src/protocol/workerTransport";

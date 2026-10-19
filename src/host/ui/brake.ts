@@ -19,7 +19,6 @@ export function brakeReasonShort(reason: BrakeReport["reason"]): string {
 		case "mass-overwrite": return "many files would shrink a lot";
 		case "listing-shrank": return "far fewer files than expected";
 		case "conflict-flood": return "many conflicts at once";
-		case "ns-divergence": return "file list disagrees with the server";
 	}
 }
 
@@ -36,8 +35,6 @@ export function brakeReasonText(reason: BrakeReport["reason"]): string {
 			return "This vault folder has far fewer files than YAOS expected. The folder may be missing, moved or not mounted. YAOS paused every delete until you confirm.";
 		case "conflict-flood":
 			return "An unusually large number of conflict copies would be created at once. YAOS paused before creating them.";
-		case "ns-divergence":
-			return "This device's view of the file list does not match the server's. YAOS paused destructive changes until you decide.";
 	}
 }
 

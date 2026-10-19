@@ -31,9 +31,9 @@ Each invariant from report.md is enforced by named structures, not by care.
 |---|---|---|
 | I1 | Never lose a local edit: it stays in the durable outbox until the receipt. | `outbox` store (§e.1). `T_edit` commits **before** `append` (§e.2). The record is deleted only by `T_receipt` or a late receipt found by `T_read_page`. The outbox mirror side files survive IDB loss (§e.4). Before `T_edit`, the durable copy is the disk file: Obsidian's save for bound notes, and the merge order "Y apply + `T_edit` → disk write" (§e.2) for merges. Poisoned frames are re-derived from disk, never dropped silently (§d.5). Y.Text is never wholesale-replaced (§f.3). |
 | I2 | Never destroy a file on disk without a recoverable copy. | `VaultPort` exposes only `trash`, never a permanent delete. Every destructive `DiskOp` carries a CAS precondition (`WritePrecondition`). `conflictCopy` runs before any conflicting overwrite. `intents` store (§e.1). The safety brake counts deletes, trashes and overwrites that shrink a file by ≥ 50 % (§f.5). Fold losers are renamed, never deleted (§c.13). Recovery snapshots are taken before brake approval, epoch migration and IDB recovery (§j.4). |
-| I3 | The same log prefix gives the same state everywhere. | Pure fold `FoldNsFrame` over `(seq, index)` (§c). `FOLD` constants in `limits.ts`. Frozen Unicode case folding (§c.2). Duplicate-frame ring plus send window (§c.3). `upgradeRules` halts instead of guessing (§c.10). Canonical `nsFoldV1` checkpoints are verified by re-encode and digests (§b.5). `cfg` is LWW on `(seq, index)` (§c.11). `snap` is an order-independent join (§j.4). Bodies are Yjs CRDTs. |
-| I4 | One device's bad update can't corrupt others. | One ingest gate: verify → decode in scratch → check → apply, or quarantine (§d.6). `quarantine` store; per-doc `frozen`. Checkpoints are UNIONed into local state, never replace it (§d.7). A malformed ns frame folds as empty, deterministically. Merges run only against a caught-up CRDT (§f.3). The brake holds mass destruction (§f.5). The ns-divergence alarm holds destructive ops (§b.5). |
-| I5 | Bounded resources per device class (memory, CPU, battery, rows written). | `BUDGETS[deviceClass]` (§i.2). Clean-only LRU residency (§d.1). Frame builder caps (§d.4). Store bounds (§e.3). Priority lanes and slices (§i.1). Token bucket and daily soft budget (§i.6). Compaction thresholds (§d.8). No O(document) work per keystroke: frames are `Y.mergeUpdates` of small batches, never `encodeStateAsUpdate`, and nothing rewrites a full doc per edit. |
+| I3 | The same log prefix gives the same state everywhere. | Pure fold `FoldNsFrame` over `(seq, index)` (§c). `FOLD` constants in `limits.ts`. Frozen Unicode case folding (§c.2). Duplicate-frame ring plus send window (§c.3). `upgradeRules` halts instead of guessing (§c.10). Canonical `nsFoldV1` checkpoints are verified by re-encode and structural invariants (V1 + V2, §b.5). `cfg` is LWW on `(seq, index)` (§c.11). `snap` is an order-independent join (§j.4). Bodies are Yjs CRDTs. |
+| I4 | One device's bad update can't corrupt others. | One ingest gate: verify → decode in scratch → check → apply, or quarantine (§d.6). `quarantine` store; per-doc `frozen`. Body checkpoints are UNIONed into local state, never replace it (§d.7); ns, cfg and snap checkpoints pass V1 + V2 at the gate before they replace a fold (§b.5). A malformed ns frame folds as empty, deterministically. Merges run only against a caught-up CRDT (§f.3). The brake holds mass destruction (§f.5). |
+| I5 | Bounded resources per device class (memory, CPU, battery, rows written). | `BUDGETS[deviceClass]` (§i.2). Clean-only LRU residency (§d.1). Frame builder caps (§d.4). Store bounds (§e.3). Send ranks, disk lanes and slices (§i.1). Token bucket and daily soft budget (§i.6). Compaction thresholds (§d.8). No O(document) work per keystroke: frames are `Y.mergeUpdates` of small batches, never `encodeStateAsUpdate`, and nothing rewrites a full doc per edit. |
 | I6 | Disk events are hints; a periodic full reconcile is the truth check. | `VaultEvent`s only mark paths dirty. The `LocalEntry` stat cache is confirmed by hash (§f.6). A full reconcile runs every `fullReconcileIntervalMs` and on resume. The planner is a pure function of the three trees (§f.2). Echo suppression only drops events; it never decides anything (§f.4). |
 
 ---
@@ -59,14 +59,14 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed), then unpad when suite ≠ 
 ```
 
 - **AAD** (UTF-8 prefix, then the outer header `u8 formatVersion ‖ u8 suite ‖ varuint keyEpoch`, then lib0
-  varstrings; `src/core/codec/envelope.ts:178-186`, e2ee-design §7.2):
+  varstrings; `src/core/codec/envelope.ts:174-182`, e2ee-design §7.2):
   - frames: `"yaos/f2" ‖ header ‖ vaultId ‖ stream ‖ deviceId ‖ clientFrameId`;
   - checkpoints: `"yaos/c2" ‖ header ‖ vaultId ‖ stream ‖ varuint coversSeq`.
 - **frameNo** must be ≥ 1 for nsOps/cfgOps and 0 for every other kind; anything else is malformed
-  (`checkFrameNo`, `src/core/codec/envelope.ts:101-103`, `:161`).
+  (`checkFrameNo`, `src/core/codec/envelope.ts:101-103`, `:157`).
 - **Padding.** Suite ≠ 0: Padmé (`data ‖ 0x80 ‖ 0x00*`) inside the AEAD, floor `PADME_FLOOR_BYTES` = 256 B
   (`src/core/codec/padme.ts:1-20`, `src/core/limits.ts:78`, e2ee-design §7.3). Bad padding under a valid tag is
-  `bad-padding` (`src/core/codec/envelope.ts:255-256`). Suite 0 never pads.
+  `bad-padding` (`src/core/codec/envelope.ts:251-252`). Suite 0 never pads.
 - **Binding checks** run even with suite 0, where the AAD is unused:
   - the kind must be in `ALLOWED_KINDS[streamClass]`;
   - for a checkpoint, the inner `CheckpointContent.coversSeq` MUST equal the relay's `coversSeq`, else quarantine.
@@ -84,16 +84,16 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed), then unpad when suite ≠ 
 | `snap` | snap | `snapOps` | `snapFoldV1` | commit-only | devices that upload or delete snapshots (§j.4) |
 | `b:<docId>` | body | `bodyUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the note |
 | `c:<docId>` | canvas | `canvasUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the canvas |
-| `k` | keyring | k records, no envelope (e2ee-design §11.2, `src/engine/keyring/record.ts:93`) | none (read with `preferCheckpoint = false`, `src/engine/runtime/sessionLoop.ts:362`) | commit-only | key-holding or joining devices (`src/engine/keyring/keyringRuntime.ts:248`, `src/engine/compose/keyReader.ts:259`) |
+| `k` | keyring | k records, no envelope (e2ee-design §11.2, `src/engine/keyring/record.ts:93`) | none (read with `preferCheckpoint = false`, `src/engine/runtime/sessionLoop.ts:380`) | commit-only | key-holding or joining devices (`src/engine/keyring/keyringRuntime.ts:248`, `src/engine/compose/keyReader.ts:259`) |
 
 - No stream carries blob bytes. Attachments, oversized updates and snapshot parts go to the `BlobPort` only; the
   log carries only their small records (ns / cfg / snap ops, `bodyUpdateRef`) (§j.1).
 - `docId` and `clientFrameId` are 16 random bytes encoded as base64url without padding (22 chars).
   - A `clientFrameId` is never reused, on any stream, ever. The relay does not detect reuse across streams.
 - Streams of any other class (`streamClass` "other", `src/core/types.ts:76-84`, the retired `x:` names included)
-  are ignored: the cursor still advances and nothing is stored (`src/engine/ingest/gate.ts:94`).
-- `k` rows skip the envelope gate (`gate.ts:93-94`) and are stored as key-record rows for the keyring
-  (`src/engine/sync/ingestRow.ts:50`, `src/engine/runtime/sessionLoop.ts:446`).
+  are ignored: the cursor still advances and nothing is stored (`src/engine/ingest/gate.ts:117`).
+- `k` rows skip the envelope gate (`gate.ts:116-117`) and are stored as key-record rows for the keyring
+  (`src/engine/sync/ingestRow.ts:57`, `src/engine/runtime/context.ts:408`).
 - Every socket receives every stream (relay-wire §5.3). The cost of a row for a non-resident doc is bounded at
   gate stage 1–2 plus one tail put (§d.6).
 
@@ -165,8 +165,7 @@ never depends on a checkpoint existing: a stream without one just costs more row
 - Alternative: verify body checkpoints by digest. Rejected: the union already protects every caught-up reader, and
   a digest needs the rows the checkpoint exists to replace.
 
-**Namespace (`nsFoldV1`).** The state is the canonical encoding of `NsFoldState`. The envelope deflates it; digests
-are computed over the uncompressed bytes.
+**Namespace (`nsFoldV1`).** The state is the canonical encoding of `NsFoldState`. The envelope deflates it.
 
 ```
 varuint formatVersion (= 1)
@@ -196,7 +195,9 @@ deviceCount × (ascending deviceId)
 
 `pathKey`, `byPathKey`, `folderRefs` and `tombstones` are derived (`NsFoldIndex`) and never encoded.
 
-A peer **verifies** an ns checkpoint before using it:
+A peer **verifies** an ns checkpoint before using it. The ingest gate runs both checks on every remote ns
+checkpoint (`gateCheckpoint`, `src/engine/ingest/gate.ts`, via `verifyNsCheckpoint`, `src/core/ns/verify.ts`), and
+catch-up reads (`src/engine/sync/catchUp.ts`) are the only place a remote checkpoint is adopted:
 
 1. **V1, canonical form.** Decode, re-encode, and compare byte-for-byte. This rejects non-minimal varints, unsorted
    entries, duplicate docIds and trailing bytes.
@@ -208,24 +209,41 @@ A peer **verifies** an ns checkpoint before using it:
    - all seqs ≤ coversSeq, and `createdSeq ≤ lastTouchSeq`;
    - live pathKeys are unique, and no live file key equals a live folder prefix key;
    - all live entries under one folder key share its display casing;
-   - tombstones ≤ `TOMBSTONE_CAP`, and each ring holds 1–64 unique valid ids;
-   - `foldRulesVersion` ≤ `FOLD_RULES_VERSION`, else the ns fold halts as `upgrade-required`;
+   - tombstones ≤ `TOMBSTONE_CAP`, and each ring holds 1–64 unique non-empty ids (not necessarily 22-char ids: a
+     malformed or gate-failed row enters the ring with whatever `clientFrameId` the relay committed, §b.3, §c.3);
+   - `foldRulesVersion` ≤ the reader's known rules (`FOLD_RULES_VERSION`), else the gate fails as a newer writer
+     (below), and the header's `foldRulesVersion` equals the state's;
    - inner coversSeq equals the relay's coversSeq.
-3. **V3, digest at candidates** (live devices only).
-   - An ns row `s` is a **candidate** iff `floor(s / 1000) > floor(prev / 1000)`, where `prev` is the fold's
-     coversSeq before `s`. Every device that folds `s` evaluates this the same way.
-   - At each candidate a device records `(s, sha256(nsFoldV1 bytes))` in a 16-entry ring held in memory and in
-     `streams["ns"].textHash` for the newest.
-   - Checkpoints are written **only** at candidates (§d.9).
-   - A device verifies the relay's current ns checkpoint whenever `read("ns")` reports a `checkpointSeq` that it
-     holds a digest for and has not verified yet. It fetches the checkpoint with `read("ns", checkpointSeq − 1,
-     true)`. The same check runs after losing a CAS and every 6 h.
-   - **Mismatch** means the `ns-divergence` alarm:
-     - the brake holds every destructive op (`BrakeReport.reason = "ns-divergence"`);
-     - a diagnostics event and notice are raised;
-     - the device never overwrites the checkpoint or its own fold.
-   - A fresh device has no rows to compare (the relay GCs them), so it relies on V1 + V2. Alternative: a fresh
-     device re-folds from seq 1. Rejected: the rows are gone.
+
+A failure is a gate failure, of one of two kinds (`GateFail.newer`, `src/engine/ingest/gate.ts`):
+
+- **Newer writer** (reason `envelope-version`, reader-dependent, `newer`): the checkpoint holds what only a newer
+  client reads. For every checkpoint: an encoding byte above the known `CheckpointEncoding`s (an encoding this
+  build knows but the wrong one for the stream is still `kind-not-allowed`). For ns, cfg and snap: a state
+  `formatVersion` above 1 (checked before any decode) or a `foldRulesVersion` above the reader's known rules
+  (`KnownRules`: `FOLD_RULES_VERSION`, `CFG_FOLD_RULES_VERSION`, `SNAP_FOLD_RULES_VERSION`; tests raise them through
+  `EngineTuning.knownRules` to play an upgraded client), in the header or in the ns state. Catch-up halts the fold
+  at the checkpoint in `upgrade-required` (§c.10, §d.7). It is never disputed.
+- **Bad bytes** from a writer of this version: `decode-failed` (V1), `checkpoint-mismatch` (coversSeq) or
+  `checkpoint-invariant` (the rest of V2). Catch-up treats any of them as a disputed checkpoint: it re-reads the page
+  without the checkpoint, and if the rows below it are gone it freezes the stream `checkpoint-disputed` (`readStream`,
+  catchUp.ts).
+
+A checkpoint that fails the envelope stage for a reader-dependent reason other than a newer writer (a key, a pin,
+`k` not judged yet) is neither: it waits (§d.7). On a 40k-entry (4.2 MiB) state the gate takes about 285 ms, against
+about 200 ms for V1 alone; both are linear.
+
+No device compares fold digests with another: a checkpoint that passes V1 + V2 but is not the fold of its rows (a
+buggy writer, or a hostile one holding the vault key) is adopted by every device that reads it, and nothing raises
+an alarm. A fresh device could not check it anyway: the relay GCs the rows below it.
+
+A writer's checkpoint header carries the `foldRulesVersion` of the state it encodes (`FoldCandidate.rulesVersion`;
+for ns the state's own version, which `upgradeRules` moves), not the build's constant: a newer build on a vault
+still at rules 1 writes rules 1, which every reader adopts.
+
+Checkpoints are written only at **candidate** seqs (§d.9). An ns row `s` is a candidate iff
+`floor(s / 1000) > floor(prev / 1000)`, where `prev` is the fold's coversSeq before `s` (`isCandidateSeq`,
+`src/core/ns/candidate.ts`). Every device that folds `s` evaluates this the same way.
 
 **Settings (`cfgFoldV1`).** Same shape as `nsFoldV1`:
 - header `varuint formatVersion, varuint coversSeq`;
@@ -235,12 +253,17 @@ A peer **verifies** an ns checkpoint before using it:
 - `plugins` sorted by id.
 
 Each register is `value? (u8 present + bytes), varuint seq, varuint index, varstring deviceId`. Verification is
-V1 + V2.
+V1 + V2 at the gate (`verifyCfgCheckpoint`, `src/core/cfg/verify.ts`): rings as in ns; every register key and value
+valid; every version `1 ≤ seq ≤ coversSeq`, `index < 512`, unique across registers, one deviceId per seq; header
+`foldRulesVersion` from `CFG_FOLD_RULES_VERSION` to the reader's known cfg rules (above: a newer writer; below: bad
+bytes).
 
 **Snapshot index (`snapFoldV1`, encoding 5).** Header `varuint formatVersion, varuint coversSeq`, then floors
 sorted by deviceId, dels sorted by key and records sorted by key (key = `deviceId/snapshotId`; a record is
 `varstring deviceId, varbytes put body`). Verification: strict decode (every id, record and bound), then the
-canonical re-encode must be byte-identical; `foldRulesVersion` ≤ 1, and the inner coversSeq equals the relay's.
+canonical re-encode must be byte-identical; `foldRulesVersion` ≤ the reader's known snap rules (`SNAP_FOLD_RULES_VERSION`
+= 1; above: a newer writer), and the inner coversSeq equals the relay's.
+There is no separate invariant checker: the strict decoder is the snap index's V2.
 
 **`retired`.** An empty state that tells the relay it may GC every row ≤ coversSeq. It is written only for:
 - `b:`/`c:` streams of docIds the fold has pruned, or that are merged aliases with rows.
@@ -321,17 +344,21 @@ For each committed ns row, in seq order:
 
 1. **Open and decode.**
    - Envelope failures that depend on the reader (unknown suite/keyEpoch, auth failure, unsupported
-     `formatVersion`) **halt** the ns fold at this row: phase `upgrade-required` or `key-missing`, with the rows
-     kept in `tail`.
+     `formatVersion`) **halt** the ns fold at this row, with the rows kept in `tail` (stored unopened,
+     `LOCAL_FLAG_UNOPENED`). A `formatVersion` or suite byte this build does not know is a newer writer: the halt
+     is an upgrade halt (`FoldHalt.upgrade`, phase `upgrade-required`, §c.10). The rest wait for keys or `k`
+     (phase `key-missing` when the write gate says so). Unopened rows are re-gated on every session start and after
+     every keyring change (`regateUnopened`, `src/engine/runtime/quarantineRelease.ts`), so an upgraded client or
+     new keys lift the halt.
    - Deterministic decode failures make the frame malformed (§b.3), which folds as an empty frame.
 2. **Dedupe.** If `clientFrameId ∈ recentFrames[deviceId]`, emit one frame-level event `ignored/duplicate-frame`
    and stop. Otherwise append the id and trim the ring to `NS_DEDUPE_RING` (64), oldest out.
    - **Replay window** (ns and cfg, e2ee-design §8.2), checked after the ring hit test and before the append, for
-     frameNo `f` ≥ 1 only (`src/core/ns/fold.ts:277-286`, `src/core/cfg/fold.ts:215-224`). Per device: right edge R and
+     frameNo `f` ≥ 1 only (`src/core/ns/fold.ts:277-286`, `src/core/cfg/fold.ts:210-219`). Per device: right edge R and
      a `REPLAY_WINDOW` (64)-bit bitmap (`src/core/replayWindow.ts:30-35`). `f ≤ R − 64` → `ignored/replay-stale`;
      a set bit → `ignored/replay-duplicate`; either sets `coversSeq = seq` and changes neither ring nor window.
      An accepted frame updates both. frameNo 0 on an nsOps/cfgOps envelope is a decode failure (§b.1); a row that
-     failed the gate is stored with frameNo 0 (`src/engine/sync/ingestRow.ts:72-74`), folds as empty and never
+     failed the gate is stored with frameNo 0 (`src/engine/sync/ingestRow.ts:79-81`), folds as empty and never
      touches the window.
 3. **Fold.** Fold each op in index order (§c.5–§c.10). Each op emits one `NsFoldEvent`.
 4. **Prune** if needed (§c.9).
@@ -496,6 +523,38 @@ path (example E8).
   - Otherwise set `foldRulesVersion = version`; it governs every later `(seq, index)`.
 - v1 clients never emit `upgradeRules`. The rollout policy for v2 is out of scope.
 
+**Every upgrade halt** (`FoldHalt.upgrade`, `src/engine/sync/foldRuntime.ts`) has one of three causes, and is
+handled the same way:
+
+| Cause | Halts | Where |
+|---|---|---|
+| ns `upgradeRules` above the known version | ns, before that frame (`rules-version`) | the fold |
+| A row whose envelope `formatVersion` or suite byte this build does not know | ns / cfg / snap, before that row (`reader-dependent`, `upgrade`) | the fold, from the unopened row |
+| A checkpoint of newer rules or format (§b.5) | ns / cfg / snap, at the checkpoint (`newer-checkpoint`) | catch-up (§d.7) |
+
+- **No guessing.** Nothing past the halt is folded on this reader's rules: not the rows past an `upgradeRules`
+  frame, and not the rows below a newer checkpoint (even where the relay still has them).
+- **Nothing persists.** The halt lives in the fold runtime only. A checkpoint halt stores nothing: no row of its
+  page, no snapshot, no cursor or `appliedSeq` move (the stream stays stale), no `disputedCheckpointCoversSeq`, no
+  freeze, no quarantine. Row halts keep their rows in `tail`, as always.
+- **Phase and notice.** While any fold has an upgrade halt the phase of a caught-up session is `upgrade-required`
+  (`EngineCtx.livePhase`, after `key-missing`); the session stays up. Each halted fold raises the error notice
+  `upgrade-required:<fold>` (ns, cfg, snap; `noteHalts`) and, once per engine, a popup. The status bar shows
+  "update required"; its tooltip and the settings tab say "This vault was written by a newer YAOS. Update the
+  plugin to keep syncing." and what stopped (`VAULT_UPGRADE_TEXT`, `VAULT_UPGRADE_STOPPED`,
+  `src/protocol/status.ts`). Phase `upgrade-required` without these notices is the server's (§i.6).
+- **What stops.** Only the halted fold's feature:
+  - ns: the planner (nsReady false: no ns ops, no ns-derived destructive disk ops), ns checkpoints, blob GC (the
+    committed folds are incomplete);
+  - cfg: settings sync (no pass: no ops on old rules, no writes from the stopped view, `CfgSyncDeps.upgradeRequired`);
+  - snap: the snapshot index is not ready (`snapView().caughtUp` false), so snapshots wait.
+  - Body streams, and the other folds, keep syncing. Remote checkpoints and key rolls run in phase `live` only, so
+    they wait too.
+- **Recovery.** An upgraded client (known rules ≥ the vault's) starts from the same store: a checkpoint halt reads
+  the checkpoint again and adopts it (§d.7); a row halt refolds the stored rows (`upgradeRules` now folds) or
+  re-gates the unopened rows at session start. Nothing to release by hand. A read that completes clears a
+  checkpoint halt (`clearCheckpointHalt`).
+
 ### c.11 Settings fold (`cfg`)
 
 - `CfgFoldState` is LWW registers ordered by `(seq, index)`, with the same duplicate-frame ring and send window as
@@ -630,8 +689,8 @@ changes.
   - An offline device with `synced` for a pruned doc: L unchanged → `diskTrash` (braked); L changed → `nsCreate` of a
     fresh doc and `syncedDrop` of the old.
 - **E12, upgradeRules halt.** A v1 device folds seq 9100 `upgradeRules{2}`.
-  - The ns fold halts with `coversSeq 9099` and phase `upgrade-required`. Rows ≥ 9100 stay in `tail` until the
-    client is upgraded.
+  - The ns fold halts with `coversSeq 9099` and phase `upgrade-required`, notice `upgrade-required:ns`. Rows ≥ 9100
+    stay in `tail` until the client is upgraded; the upgraded client refolds them on its next start.
   - Bodies keep syncing. No ns ops are emitted and no remote moves or deletes are applied locally.
 
 ---
@@ -661,23 +720,23 @@ cold ──load──▶ resident ──bind──▶ bound
 
 - **cold.** Only IDB records exist: `streams`, `snapshots`, `tail`, `outbox`. Rows for cold docs are gated (§d.6
   stages 1–2) and stored without building a `Y.Doc`.
-- **load** (lane of the requester), in one `Y.transact(doc, …, LOAD)`:
+- **load**, in one `Y.transact(doc, …, LOAD)`:
   1. apply the `snapshot`;
   2. apply every `tail` row of the stream in seq order, resolving `bodyUpdateRef` rows (§d.6);
-  3. apply the `content` of every own outbox record of the stream (held, pending, sent, adoptable) in `order`.
+  3. apply the `content` of every own outbox record of the stream (held, pending, adoptable) in `order`.
   - Poisoned records are skipped.
   - Cost is O(doc) and happens once per residency, never per edit.
 - **resident.** The replica is in memory, and the frame builder and merge jobs may use it.
   - Estimated heap: `3 × (snapshot bytes + tail bytes + applied update bytes)`.
 - **bound.** Resident, with one or more editor views attached as clients (§d.2). A bound doc is pinned and never evicted.
-- **evict.** LRU (`streams.lastAccessMs`) over **clean** handles only. A handle is clean when:
+- **evict.** LRU (the handle's in-memory `lastAccessMono`, `src/engine/body/handles.ts`) over **clean** handles only. A handle is clean when:
   - its frame builder is empty (flushed through `T_edit`);
   - no merge, projection, catch-up or compaction job holds it;
   - it is not bound.
   - Eviction just drops the `Y.Doc`. Everything it holds is already in IDB.
 - **Budgets.** `maxResidentDocs` and `maxResidentBytes` per device class (§i.2).
-  - When over budget with no clean handle, new loads wait: lane 3/4 jobs queue, and lane 0/1 loads may exceed the
-    budget by one doc.
+  - A load never waits: it first evicts clean handles, LRU first, and goes over budget when none is clean
+    (`HandleCache.enforceBudget`, `src/engine/body/handles.ts`).
   - `memory-pressure` is declared (`src/ports/platform.ts:26`) but no host source raises it, and
     `HandleCache.evictAllClean` (`src/engine/body/handles.ts:196-197`) is called only by tests. Nothing runs.
 
@@ -758,7 +817,7 @@ cold ──load──▶ resident ──bind──▶ bound
     `reconcileContent` against the replica.
 - **Unbind** (`closeDoc{docId, viewId}`, on `file-changed`, view close, or `EditorView.setState` via `onReset`): the
   binding detaches. The worker replica stays resident (clean, LRU).
-- **`docRetarget`** (renamed, merged, deleted, frozen, resync) works as before.
+- **`docRetarget`** (renamed, merged, frozen, resync) works as before.
   - For `renamed`, `merged` and `frozen`, the host re-opens the doc. `frozen` binds read-only.
   - For `resync`, every view of the doc re-binds: upload, then `bodyAttach` with the mirror's durable text as the
     base.
@@ -864,7 +923,7 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   - every frame of the doc built before its create folds carries `dependsOn` = the ns create frame
     (`Ctx.pendingCreates`, docRuntime closeFrame).
 - **Live creates** (every pass after the reconciler's first full pass with ns ready and the local scan complete,
-  `Ctx.liveCreates`, reconciler.ts:212):
+  `Ctx.liveCreates`, reconciler.ts:199):
   - the frames are `pending`, not `held` (frames.ts `sendAfter`);
   - the pass corks the ns stream (`Sender.corkNs`, at most `NS_CORK_MAX_MS` = 2 s) from `submitNs` until the last
     `reconcileContent` of the docs it created (runner.ts), so the creates and their body frames reach the relay
@@ -872,13 +931,13 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
     tick, takes the leading-edge commit, and the body waits `minIntervalMs` for the next one;
   - the sender never puts a frame on the wire before its create (`blockedBy`, sender.ts pump). While the create is in
     the outbox, its body frame waits until the create is inflight on the same session, and holds the stream's later
-    frames behind it. This applies to resends after a reconnect too. In the lane order, a frame ranks no earlier
-    than its create.
+    frames behind it. This applies to resends after a reconnect too. In the send order (§i.1), a frame ranks no
+    earlier than its create.
 - **Onboarding** (the passes before that, against a remote that may already hold the same files; and the first full
   pass after every engine start): the frames are `held` and are released when the create folds `applied` /
   `suffixed`. Identical concurrent imports merge (§c.5), and holding keeps them at zero body rows. A restart also
   turns un-folded live creates back into held ones: `pendingCreates` is rebuilt from the outbox with `live: false`
-  (engine.ts:202), so frames built after the restart are held.
+  (engine.ts:163), so frames built after the restart are held.
 - **Create folds `merged`** (nsRuntime.reconcileHeld):
   - its held, pending and sent-but-unreceipted frames are deleted, and the doc is rebound to the winner (§c.13);
   - the winner already has the create's content (a merge needs the same create hash, place.ts). Edits made after
@@ -902,11 +961,12 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
 - **Alternative:** hold every create's frames until it folds, the earlier rule. Rejected for live creates: every
   create→peer takes two group commits. Kept for onboarding, where merged duplicates are the common case.
 - **Sender.**
-  - Picks `pending` records by lane (§i.1), then by `order`. A live create's body frame waits for its create (above).
+  - Picks `pending` records by rank (§i.1), then by `order`. A live create's body frame waits for its create (above).
   - Respects all of: the token bucket (`APPEND_BYTES_PER_SEC`, burst ≤ `limits.burstBytes`), `maxInflightAppendBytes`
     of sent-unreceipted bytes, `session.bufferedBytes()`, and the ns/cfg send window (§c.3).
-  - Record state `sent` is persisted lazily and only for diagnostics. After any restart, `pending` and `sent` are both
-    "maybe sent" and are resent. Correctness relies only on idempotence (R4).
+  - What is in flight is the sender's memory only (`Sender.isInflight`); a record stays `pending` until its receipt.
+    After any restart every `pending` record is "maybe sent" and is resent. Correctness relies only on idempotence
+    (R4).
 
 ### d.5 Provisional vs committed
 
@@ -919,18 +979,25 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   2. Apply with origin `REMOTE` and forward to main.
   3. `T_adopt` puts an **adoptable** outbox record: a fresh own `clientFrameId`, `adoptOf = {deviceId, clientFrameId,
      receivedAtMs}`, the content re-sealed under the own AAD, flag `adopted`.
-  - Frames the builder seals for that stream while an adoptable exists are `held` with `dependsOn` = the newest
-    adoptable, so own edits built on provisional structs never reach the log before those structs do.
+  - Frames the builder seals for that stream while an adoptable exists are plain `pending` records, with no
+    `dependsOn` on the adoptable, and rank hot like it (§i.1). They need no hold. The relay broadcasts a PROVISIONAL
+    only after the author's append is in its buffer (relay-wire §5.2), so the provisional structs commit no later
+    than an own frame appended after seeing them. If the author's frame is dropped or orphaned, the adoptable is
+    re-sent (below). Own frames that committed ahead of it then leave peers a causal hole only until it commits,
+    well inside the §d.6 re-read window (3 tries over ≥ 3 min, ≥ 2 × `PROVISIONAL_ADOPT_MS`).
+  - **Alternative:** hold own frames behind the newest adoptable until its commit or receipt, the earlier rule.
+    Rejected: typing in a co-edited note waited on the peer's commit, and on a dropped peer frame it waited for the
+    adopted copy, which then ranked below background bodies and could sit behind a bulk import for minutes.
 - **Settling an adoptable:**
   - **commit observed** (`committed` with matching `(deviceId, clientFrameId)`, live or in a read page): store the
-    row in `tail`, delete the adoptable without re-applying, and release its dependents (same transaction);
+    row in `tail` and delete the adoptable without re-applying (same transaction);
   - **`provisionalDropped`, or `PROVISIONAL_ADOPT_MS` (60 s) passes without a commit:** the adoptable becomes
     `pending`, is re-appended, and its receipt settles it like an own frame.
   - A duplicate (the original also commits later) is harmless (CRDT).
 - **`resendUnreceipted`:**
   - The adapter has discarded un-noticed provisionals.
   - Adoptables keep their timers, because the author resends its own frames after the same STREAM_RESEND.
-  - Every own `pending` / `sent` record is resent in `order`, body frames immediately. For ns/cfg, the late-receipt
+  - Every own `pending` record is resent in `order`, body frames immediately. For ns/cfg, the late-receipt
     pass runs first (§d.7).
 - **Older-seq notices (R7).** A `committed` or receipt with `seq ≤ streams[stream].appliedSeq` is a **settle**: delete
   the matching outbox or adoptable record and put the tail row idempotently. Nothing advances.
@@ -948,6 +1015,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - Check the kind against `ALLOWED_KINDS[class]`, and the checkpoint coversSeq binding.
 2. **Decode and bound** (no doc needed).
    - **ns / cfg / snap:** the full op decode (§b.3, §b.4). For snap that includes every record bound (§j.4).
+   - **ns / cfg / snap checkpoints:** V1 + V2 on the fold state (§b.5); snap's V2 is its strict decoder.
    - **body / canvas:** `Y.decodeUpdate` (structural). Then all of:
      - root parent names ⊆ the allowed roots of the class;
      - content types limited to strings, deletes, `ContentType` (`Y.Text`/`Y.Map` per §j.2), `ContentAny` and
@@ -958,8 +1026,8 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
      on the bytes (`resolveRef`, `src/engine/body/refs.ts:37-55`).
      - If they are unavailable yet, the ref row is stored and retried with backoff, and the doc shows
        `wait/blob-unavailable`. Under the §j.1 quarantine rule (deterministic failures only) the doc is frozen
-       `blob-corrupt` (`src/engine/runtime/docRuntime.ts:224-244`); `releaseQuarantine` unfreezes it and retries.
-     - Without a blob store the row stays unresolved and arms no retry timer (`docRuntime.ts:246-252`); a store found
+       `blob-corrupt` (`src/engine/runtime/docRuntime.ts:201-221`); `releaseQuarantine` unfreezes it and retries.
+     - Without a blob store the row stays unresolved and arms no retry timer (`docRuntime.ts:223-229`); a store found
        on a later connect restarts the runtime (§j.1).
      - Once resolved, the tail row is rewritten as `bodyUpdate` (a local cache only).
    - Cold docs stop here: the row is stored in `tail` (§e.2 `T_ingest`), and nothing is loaded.
@@ -979,16 +1047,25 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 | Failure | ns / cfg / snap | body / canvas |
 |---|---|---|
 | Deterministic malformation (bytes, decode) | Fold as empty frame (§c.3); diagnostics event | Quarantine, freeze doc |
-| Reader-dependent (unknown version, suite or key; auth failure) | **Halt** the fold at the row (`upgrade-required` / `key-missing`); rows wait in `tail` | Quarantine with the whole row, freeze doc (retried on upgrade or new keys) |
+| Reader-dependent, newer writer (`GateFail.newer`: unknown `formatVersion` or suite byte) | **Halt** the fold at the row, an upgrade halt (§c.10: phase `upgrade-required`); rows wait in `tail` | Quarantine with the whole row, freeze doc (retried on upgrade) |
+| Reader-dependent, waiting (a known suite this port cannot open, unknown key; auth failure under an unverified key) | **Halt** the fold at the row (`key-missing` when the gate says so); rows wait in `tail`, re-gated at session start and on keyring change | Quarantine with the whole row, freeze doc (retried on new keys) |
 | Kind not allowed | Fold as empty | Quarantine, freeze |
 | `suite-downgrade`, `bad-padding`; `auth-failed` under a verified key (`CryptoPort.keyState(e).verified`) | Deterministic: as malformation | As malformation |
 | `auth-failed` under an unverified key | Reader-dependent: halt | Reader-dependent: quarantine |
 | Stale epoch (e2ee-design §14.3, decided from the header's keyEpoch before opening) | ns/cfg: stored flagged stale-epoch, fold as empty; snap: accounted, not stored | Accounted, not stored, not quarantined |
 | Stale epoch not yet decidable (`hold`: `k` not judged) | Reader-dependent (`keyring-hold`) | Reader-dependent (`keyring-hold`) |
 
-- Verified-key split: `src/engine/ingest/gate.ts:101-104`, `src/engine/ingest/envelope.ts:58-71` (e2ee-design §9.2,
-  §9.3). Stale verdict: `staleVerdict`, `gate.ts:137-146`; row handling `src/engine/sync/ingestRow.ts:57-59`. A
-  stale provisional is ignored; a stale checkpoint fails `stale-epoch` (`gate.ts:143`, `:145`).
+- **Checkpoints** (§b.5, §d.7) are never quarantined:
+
+  | Checkpoint failure | ns / cfg / snap | body / canvas |
+  |---|---|---|
+  | Newer writer (rules, encoding, state format, envelope version or suite byte) | Upgrade halt at the checkpoint (§c.10); nothing of the page stored | As waiting (Yjs rows are not rules: re-reading them is not guessing) |
+  | Waiting (key, pin, `keyring-hold`, unverified-key auth) | Re-read without it if the read preferred it; rows gone → held | same |
+  | Bad bytes (deterministic) | Disputed: re-read without it; rows gone → frozen `checkpoint-disputed` | same |
+
+- Verified-key split: `src/engine/ingest/gate.ts:124-131`, `src/engine/ingest/envelope.ts:58-71` (e2ee-design §9.2,
+  §9.3). Stale verdict: `staleVerdict`, `gate.ts:163-172`; row handling `src/engine/sync/ingestRow.ts:64-66`. A
+  stale provisional is ignored; a stale checkpoint fails `stale-epoch` (`gate.ts:169`, `:171`).
 
 - **The cursor always advances.** Quarantined, stored-cold, stale-recorded and halted rows are all *accounted*.
 - **Frozen docs:**
@@ -1020,30 +1097,42 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    is captured.
    - Live events go to an in-memory **live queue**.
    - Rows are processed in arrival order, committed rows in batches (one `tLive` per batch), provisionals one at a
-     time (`src/engine/runtime/liveIngest.ts:1-7`); no lane decides the order. Stored body rows are applied only
-     to a resident (or loading) replica; the rest stay in the tail (`src/engine/runtime/docRuntime.ts:168-187`).
+     time (`src/engine/runtime/liveIngest.ts:1-7`); no rank decides the order. Stored body rows are applied only
+     to a resident (or loading) replica; the rest stay in the tail (`src/engine/runtime/context.ts:419-430`).
    - **Overflow** (> 4 MiB or > 1000 queued rows): drop payloads of rows for non-resident docs. Record those streams
      as stale with `remoteHeadSeq = max(…, seq)`. The seq counts as accounted, and the rows are read later.
 3. **Feed.** If V < H: run `feed(V)` pages. Each page runs `T_feed_page`:
-   - for each `{stream, lastSeq}`: set `remoteHeadSeq` to the max, `stale = appliedSeq < remoteHeadSeq`, and the
-     priority (§j.6);
+   - for each `{stream, lastSeq}`: set `remoteHeadSeq` to the max and `stale = appliedSeq < remoteHeadSeq`;
    - unknown stream classes are skipped;
    - set V to `throughSeq`.
    - V reaches H after about `streams / 1000` pages, with no row reads.
 3a. **Keyring.** Live ingest is enabled, then `k` is read to head if stale, and the keyring settles
    (`keyring.afterKRead`) before any other stream is read; a `k` still stale after the read fails the session
-   (`src/engine/runtime/sessionLoop.ts:140-146`, e2ee-design §11.3). If the keyring allows reading only `k`, the
-   phase becomes `key-missing` and catch-up stops there (`sessionLoop.ts:148-152`). Then ns, cfg, snap are read in
-   that order (`sessionLoop.ts:153`).
-4. **Reads.** Catch-up jobs take stale streams by `byStalePriority`, up to `catchUpConcurrency` at once. Open notes
-   run in lane 1 and ns/cfg/snap in lane 2, first (in that order).
+   (`src/engine/runtime/sessionLoop.ts:156-162`, e2ee-design §11.3). If the keyring allows reading only `k`, the
+   phase becomes `key-missing` and catch-up stops there (`sessionLoop.ts:164-168`). Then ns, cfg, snap are read in
+   that order (`sessionLoop.ts:173`).
+4. **Reads.** Catch-up jobs take stale streams in priority order (§j.6; `staleOrder` over the in-memory stream cache,
+   `src/engine/sync/catchUp.ts`, nothing stored), up to `catchUpConcurrency` at once. Bound docs go first; ns, cfg
+   and snap were read in step 3a.
    - Each job calls `read(stream, appliedSeq, preferCheckpoint = appliedSeq === 0)` and gates each page.
    - **`T_read_page`:** put tail rows. An own row (`deviceId` = self) whose `clientFrameId` is in the outbox is a
      **late receipt**, handled exactly like `T_receipt`. An own row without an outbox record is a plain row.
    - **Checkpoint** `coversSeq > snapshotCoversSeq`:
-     - fresh stream: store it as the snapshot after the gate (for ns, V1 + V2);
+     - fresh stream: store it as the snapshot after the gate (ns and cfg: V1 + V2; snap: strict decode + V1);
      - otherwise: **union job**: scratch doc = local snapshot + every local tail row ≤ coversSeq + the checkpoint →
        `T_snapshot`. For ns: verify, then replace the fold state, and own pending ops re-overlay (§f.1).
+   - **Checkpoint gate failures** (`readStream`, `src/engine/sync/catchUp.ts`; table in §d.6):
+     - *newer writer* on ns/cfg/snap: the read ends `held` (upgrade) at once, before any row of the page is
+       stored. The session loop halts the fold at the checkpoint (`haltAtCheckpoint`) and does not read the stream
+       again in this session; the stream stays stale. The next session reads it again (and halts again); an
+       upgraded client adopts it;
+     - *waiting* (or a newer body checkpoint): if the read preferred the checkpoint, the page is re-read without
+       it and the rows gate on their own (an unopened fold row halts the fold, a body row is quarantined, as live).
+       If it comes back the rows below it are gone: the read ends `held`, the stream stays stale, nothing is
+       marked. A keyring change (`regateUnopened` → `SessionLoop.releaseHeld`) or the next session reads it again;
+     - *bad bytes*: disputed (§b.5); a disputed checkpoint is remembered (`disputedCheckpointCoversSeq`) and not
+       gated again.
+     - A held stream does not keep the engine from idle (`isIdle`), like a frozen `checkpoint-disputed` one.
    - **Caught up:** when a read completes (`more = false`) in the current session, every row of the stream ≤
      `max(H, lastSeq)` is known, because the read started after `VAULT_READY` and everything ≤ H was committed then.
      Every row > H arrives live (R2). So `appliedSeq := remoteHeadSeq` and `stale := 0`.
@@ -1073,11 +1162,12 @@ The planner does no destructive work until ns is caught up (§f.2).
 
 ### d.8 Local compaction
 
-- **Trigger:** `tailRows > LOCAL_COMPACT_ROWS` or `tailBytes > LOCAL_COMPACT_BYTES`, run in lane 4 when idle. At
-  `tailRows > TAIL_HARD_ROWS` it runs in lane 1.
+- **Trigger:** `tailRows > LOCAL_COMPACT_ROWS` or `tailBytes > LOCAL_COMPACT_BYTES`, run by the maintenance tick. It
+  is background work and waits while the app is backgrounded (§i.4), except at `tailRows > TAIL_HARD_ROWS`
+  (`src/engine/runtime/maintenance.ts`).
 - **Preconditions:**
   - the stream is not stale;
-  - no own outbox record of the stream is `pending`, `sent` or `held`. A late receipt could otherwise land at a seq ≤
+  - no own outbox record of the stream is `pending` or `held`. A late receipt could otherwise land at a seq ≤
     the new snapshot. It would still be loaded, since load applies all tail rows, but the snapshot would no longer be
     exact.
 - **Job:**
@@ -1105,7 +1195,7 @@ The planner does no destructive work until ns is caught up (§f.2).
     `REMOTE_CHECKPOINT_SETTLE_MS` (2 min, limits.ts:124). A stream whose only row is its first frame is left alone:
     a checkpoint would replace one open with one open (an import of 10k notes costs no checkpoints).
   - *Idle* means no live row and no own frame on the stream for that long (`lastActivity`, set in
-    src/engine/runtime/docRuntime.ts:148 and :178). Activity also restarts the fallback clock
+    src/engine/runtime/docRuntime.ts:148 and context.ts:420). Activity also restarts the fallback clock
     (checkpoints.ts:134), so neither rule writes while a note is being typed in, on any device. Activity before
     this engine run is unknown (a restart can come in the middle of an edit session), so a stream with no activity
     seen counts as active at the run's first live maintenance tick (`markLive`, checkpoints.ts:104, called at
@@ -1146,7 +1236,7 @@ The planner does no destructive work until ns is caught up (§f.2).
 | Result | Action |
 |---|---|
 | `ok` | `remoteCheckpointCoversSeq = C`; reset counters |
-| `conflict{current}` | Record `current`. Retry later only if `current < C`. ns: run the V3 check on `current` |
+| `conflict{current}` | Record `current`. Retry later only if `current < C`. |
 | `refused not-advancing` | Refresh with `read(stream, C, false)` |
 | `refused ahead-of-stream` | Bug: diagnostics, skip |
 | `refused stream-not-found` | Skip |
@@ -1156,11 +1246,11 @@ The planner does no destructive work until ns is caught up (§f.2).
 
 - **ns.**
   - Only candidate seqs (§b.5). The device keeps the `nsFoldV1` bytes of its newest candidate in memory.
-  - Duty: the author of the candidate row (`foldCheckpointDue`, checkpoints.ts:302).
+  - Duty: the author of the candidate row (`foldCheckpointDue`, checkpoints.ts:301).
     - Hot: ≥ `NS_CHECKPOINT_ROWS` (1000) ns rows or ≥ `NS_CHECKPOINT_BYTES` have accumulated since the last
       checkpoint. No idle gate.
     - Settle: `settleWanted`, and the stream has been idle for `REMOTE_CHECKPOINT_SETTLE_MS`. ns, cfg and snap rows
-      mark activity in src/engine/runtime/liveIngest.ts:219.
+      mark activity in src/engine/runtime/context.ts:413.
     - Others take over after 10 min plus jitter, with the same refresh read first (maintenance.ts:174).
   - A settle checkpoint covers the newest candidate. The rows after it stay: fewer than one candidate interval (1000
     vault seqs). There is at most one settle put per candidate.
@@ -1177,7 +1267,7 @@ The planner does no destructive work until ns is caught up (§f.2).
       for a doc (2 for its first checkpoint). A put at `lastSeq` also drops the open segment at no extra row (H7).
     - A CAS conflict writes nothing, and the fallback refresh is a read.
   - A heavy desktop day:
-    - Frames: ≤ 20k (soft budget, limits.ts:261; frames are 4× slower beyond it, src/engine/runtime/context.ts:413-415) ×
+    - Frames: ≤ 20k (soft budget, limits.ts:256; frames are 4× slower beyond it, src/engine/runtime/context.ts:553-555) ×
       ≤ 2 rows = ≤ 40k.
     - Settle: 500 edit sessions × ≤ 4 = 2k. One put per session: a pause of 2 min or more ends one.
     - Hot: 20k / 256 × 4 ≈ 310.
@@ -1202,28 +1292,33 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 
 | Store | Key path | Indexes | Value | Bound |
 |---|---|---|---|---|
-| `meta` | `key` | — | `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty` | 5 records |
-| `streams` | `stream` | `byStalePriority [stale, priority]`, `byAccess lastAccessMs` | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap; deleted after `retired` |
+| `meta` | `key` | — | Singletons `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty`, `frameNoFloor`, `keyring`; one `blobPut:<address>` per blob address this device PUT (e2ee-design §10.4) | 7 singletons + `blobPut:*`, which is **unbounded** between prunes: each blob GC pass drops entries older than `blobGcGraceMs / 2` (`src/engine/runtime/blobGc.ts:95`) |
+| `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; never deleted (retired streams are a gap, `src/engine/sync/catchUp.ts:177`) |
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | Soft `OUTBOX_SOFT_BYTES` (16 MiB): builders stretch, notice. **Never dropped** |
-| `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes + hash: ≤ 256 KiB for a deterministic failure, whole for a reader-dependent one so it can be re-gated) | `QUARANTINE_MAX_RECORDS` / `_BYTES`; oldest evicted (the doc stays frozen) |
-| `synced` | `docId` | `byPathKey pathKey` (non-unique: transient during rebind) | `SyncedRecord` | 1 per synced doc |
+| `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes + hash: ≤ 256 KiB for a deterministic failure, whole for a reader-dependent one so it can be re-gated) | `QUARANTINE_MAX_RECORDS` (500), by count only (no byte bound); oldest evicted (the doc stays frozen) |
+| `synced` | `docId` | — | `SyncedRecord` | 1 per synced doc |
 | `baseText` | `docId` | — | `BaseTextRecord` (deflated, ≤ `MAX_BASE_TEXT_CHARS`) | markdown/canvas synced docs |
 | `localTree` | `pathKey` | — | `LocalTreeRecord` | 1 per vault file |
 | `intents` | `id` | — | `IntentRecord` | In-flight multi-step disk ops (< 1000); deleted on completion |
 | `cfgBase` | `file` | — | `CfgBaseRecord` | Allowlisted config files |
-| `blobQueue` | `hash` | `byActiveDue [active, nextAttemptAtMs]` | `BlobQueueRecord` | 1 per failed transfer backing off; a running transfer has none, success deletes it (`src/engine/blobs/blobQueue.ts:285-297`) |
+| `blobQueue` | `hash` | — | `BlobQueueRecord` | 1 per failed transfer backing off; a running transfer has none, success deletes it (`src/engine/blobs/blobQueue.ts:285-297`) |
 
-- **`dependsOn` rule.** A `held` record waits for one of two things:
-  - the doc's ns create, during onboarding (released when it folds, §d.4);
-  - the newest adoptable of the stream (released when that record is gone).
-  - Releasing a record means `held → pending` in the same transaction that removes the dependency.
+- **`dependsOn` rule.** A `held` record waits for the doc's ns create, during onboarding, and is released
+  (`held → pending`) when that create folds (§d.4, `NsRuntime.reconcileHeld`). Adoptables hold nothing (§d.5). A
+  store written before that rule can still have frames held behind an adopted record; `reconcileHeld` treats
+  those as dependency-gone.
 - **`pending` with `dependsOn`** is a live create's body frame (§d.4). It is sent only after that create: while the
   create is in the outbox, the frame goes only once the create is inflight on the same session. It is deleted when
   the create folds `merged`. When the create's record is replaced under a new `clientFrameId` (own stale-epoch copy,
   repo.ts `rename`), the frame is re-pointed like a held one.
-- **IDB booleans.** `stale`, `frozen` and `active` are `0 | 1` because IDB cannot index booleans.
+- **IDB booleans.** `stale` and `frozen` are stored as `0 | 1` (IDB cannot index booleans); no index uses them.
+- **Schema version.** `DB_SCHEMA_VERSION` (`src/engine/store/schema.ts`) changes with any store, index or record
+  shape. A DB whose `identity.schemaVersion` differs fails the identity check and is rebuilt (§i.5). Version 2 dropped
+  the unused indexes `streams.byStalePriority` / `byAccess`, `synced.byPathKey` and `blobQueue.byActiveDue`, the
+  fields only they read (`priority`, `lastAccessMs`, `active`), and the outbox `sent` state with `attempts` /
+  `lastSentAtMs`.
 
 ### e.2 Transactions
 
@@ -1236,18 +1331,17 @@ Rules:
 
 | Tx | Stores | Writes | Crash reasoning |
 |---|---|---|---|
-| `T_edit` (frame close) | outbox, meta, streams | Outbox record (`pending` / `held`); `outboxOrder.next++`; `bodyVersion.localOrder`, `lastAccessMs` | **Commits before `append`.** Before commit: the edit is on disk via the editor save (§d.4). After commit: resent at startup. |
-| `T_sent` (lazy, coalesced) | outbox | `state: sent`, `attempts`, `lastSentAtMs` | Diagnostics only: `pending` / `sent` are both "maybe sent". |
-| `T_receipt` (one per `STREAM_RECEIPTS` batch) | outbox, tail, streams, meta | Per receipt: tail put `(stream, seq)` with outbox content; outbox delete; release dependents; `lastOwnSeq`, `remoteHeadSeq`, `appliedSeq` (if not stale), checkpoint counters, `ckptDuty`; cursor | A missing outbox record is a no-op (idempotent). Before commit: re-delivered as a late receipt via read, or resent and then deduped (relay window, fold ring, or CRDT). |
-| `T_ingest` (batch ≤ 64 rows / 1 MiB per slice) | tail, quarantine, streams, outbox, meta | Tail or quarantine puts; adoptable deletes and releases; `remoteHeadSeq`, `appliedSeq`, `bodyVersion.remoteSeq`, counters; cursor | Before commit: the rows are unaccounted and re-fetched. Replica already applied: idempotent. |
+| `T_edit` (frame close) | outbox, meta, streams | Outbox record (`pending` / `held`); `outboxOrder.next++`; `bodyVersion.localOrder` | **Commits before `append`.** Before commit: the edit is on disk via the editor save (§d.4). After commit: resent at startup. |
+| `T_receipt` (one per `STREAM_RECEIPTS` batch) | outbox, tail, streams, meta | Per receipt: tail put `(stream, seq)` with outbox content; outbox delete; `lastOwnSeq`, `remoteHeadSeq`, `appliedSeq` (if not stale), checkpoint counters, `ckptDuty`; `daily.framesSent`; cursor | A missing outbox record is a no-op (idempotent). Before commit: re-delivered as a late receipt via read, or resent and then deduped (relay window, fold ring, or CRDT). |
+| `T_ingest` (batch ≤ 64 rows / 1 MiB per slice) | tail, quarantine, streams, outbox, meta | Tail or quarantine puts; adoptable deletes; `remoteHeadSeq`, `appliedSeq`, `bodyVersion.remoteSeq`, counters; cursor | Before commit: the rows are unaccounted and re-fetched. Replica already applied: idempotent. |
 | `T_stale` | streams, meta | `remoteHeadSeq`, `stale = 1`; cursor | Overflow or null payload: the row is read later. |
-| `T_feed_page` | streams, meta | Stream heads, stale, priority; cursor = `throughSeq` | Before commit: the page is re-fetched. |
+| `T_feed_page` | streams, meta | Stream heads, stale; cursor = `throughSeq` | Before commit: the page is re-fetched. |
 | `T_read_page` | tail, quarantine, outbox, streams, snapshots | Rows; late receipts; fresh-stream checkpoint snapshot + exact-key deletes of tail ≤ coversSeq; `appliedSeq` / `stale` when complete | Idempotent puts. The page is re-read from `appliedSeq`. |
 | `T_snapshot` (checkpoint union) / `T_compact` | snapshots, tail, streams | CAS on `snapshotCoversSeq`; snapshot put; exact-key tail deletes | Old snapshot + tail and new snapshot + less tail reconstruct the same state. |
 | `T_adopt` | outbox, meta | Adoptable record | Before commit: the provisional was applied to the bound replica only. The edit reaches disk through the editor and is re-merged. The commit or the author's resend brings it anyway. |
 | `T_intent_begin` / `T_intent_end` | intents | Put / delete the intent | §f.7: startup completes or rolls back each intent from disk state. |
 | `T_synced` (after a disk-op batch) | synced, baseText, localTree, intents | Synced put/drop, base put, stat cache, intent end | Before commit: the next reconcile sees L = R ≠ S, which is the "identical" path. Only S advances. |
-| `T_cfg` | cfgBase, streams, meta | Settings sync base after projection | As `T_synced`. |
+| `T_cfg` | cfgBase | Settings sync base after projection (`src/engine/settings/cfgSync.ts:235`) | As `T_synced`. |
 
 - **Compaction and remote checkpoint gate.** They require "no own unreceipted frames of the stream". This is the only
   coupling between outbox and snapshots.
@@ -1261,8 +1355,8 @@ Rules:
 - Quarantine is bounded with oldest-first eviction.
 - The outbox is never evicted; it is bounded only by user activity while offline, and the soft limit triggers a notice
   plus frame stretching.
-- `streams` / `snapshots` / `tail` of pruned docs are deleted after their `retired` checkpoint, or locally after the
-  prune if this device has no duty.
+- `streams` / `snapshots` / `tail` of pruned docs are **not** deleted yet: a `retired` checkpoint is skipped
+  (`src/engine/sync/catchUp.ts:177`, gap) and no transaction drops a stream.
 - **Quota error:**
   1. evict `quarantine` bytes;
   2. compact everything eligible;
@@ -1285,7 +1379,7 @@ varuint generation, varuint writtenAtMs
 varuint frameCount
 frameCount × {
   varstring clientFrameId, varstring stream, varuint order,
-  u8 state (1 held, 2 pending, 3 sent, 4 poisoned, 5 adoptable),
+  u8 state (1 held, 2 pending, 3 sent (written before DB schema 2; read as pending), 4 poisoned, 5 adoptable),
   varuint authorNsSeq,
   u8 hasDep [varstring dependsOn],
   u8 hasAdopt [varstring deviceId, varstring clientFrameId],
@@ -1295,8 +1389,7 @@ frameCount × {
 ```
 
 - **Write:**
-  - debounce `OUTBOX_MIRROR_DEBOUNCE_MS` after any outbox put, and `OUTBOX_MIRROR_TRIM_DEBOUNCE_MS` after
-    receipts;
+  - debounce `OUTBOX_MIRROR_DEBOUNCE_MS` after any outbox change (puts, receipts, state changes);
   - immediately on `hidden` / `pagehide`;
   - the target is the slot with the lower or invalid generation.
 - **Size limit.** Over `OUTBOX_MIRROR_MAX_BYTES`, the mirror keeps all ns/cfg/snap frames first, then body frames by
@@ -1338,7 +1431,7 @@ All are in `src/core/types.ts`.
 
 - **`RemoteEntry`** = **OptimisticRemote**(committed `NsFoldState` + own pending ns frames) joined with
   `RemoteBodyInfo`.
-  - The overlay re-folds own `pending` / `sent` / `held` ns frames, in outbox order, on a copy-on-write view of the
+  - The overlay re-folds own `pending` / `held` ns frames, in outbox order, on a copy-on-write view of the
     committed state, with pseudo-seqs above `coversSeq`.
   - Entries touched by the overlay have `pendingLocal = true`. The planner never moves, deletes or replaces local
     files for them, so local state stays pinned until the fold confirms or rejects.
@@ -1357,18 +1450,18 @@ All are in `src/core/types.ts`.
     bytes for blobs.
   - `DiskFingerprint` is the exact-bytes hash, used only for echo suppression and CAS.
   - Both are SHA-256 hex, digested in the engine through `HashPort` (WebCrypto; `digestHex`,
-    `src/core/hash/digest.ts:11`), like every other digest: blobs, canvas, config, snapshots, mirrors, ns fold
-    digests, brake ids. Core's pure-JS SHA-256 throws a `RangeError` above `SYNC_HASH_MAX_BYTES` (4096 B,
-    `src/core/limits.ts:100`, `src/core/hash/sha256.ts:22-23`), in production too. It takes only bounded inputs: the
-    empty-content hash (`src/core/plan/planner.ts:68`), the recovery key's 32-byte check
-    (`src/core/codec/recoveryKey.ts:26`, `:34`), cfg's `H_TRUE` (4 B, `src/engine/settings/cfgPlan.ts:98`) and the
-    resident-text fallback below.
+    `src/core/hash/digest.ts:11`), like every other digest: blobs, canvas, config, snapshots, mirrors, brake ids.
+    Core's pure-JS SHA-256 throws a `RangeError` above `SYNC_HASH_MAX_BYTES` (4096 B, `src/core/limits.ts:100`,
+    `src/core/hash/sha256.ts:23-24`), in production too. It takes only bounded inputs: the
+    empty-content hash (`src/core/plan/planner.ts:67`), cfg's `H_TRUE` (4 B, `src/engine/settings/cfgPlan.ts:98`)
+    and the resident-text fallback below. The recovery key's checksum is a `hashRequest` (`rkChecksum`,
+    `src/host/pluginController.ts:368`).
   - `streams.textHash` of a resident replica (the planner's remote hash for a caught-up markdown/canvas doc) is
     digested through `HashPort` before each pass reads the view (`warmTextHashes`,
-    `src/engine/compose/logPort.ts:115-131`, called at `src/engine/reconcile/reconciler.ts:165`). A replica that
+    `src/engine/compose/logPort.ts:114-130`, called at `src/engine/reconcile/reconciler.ts:152`). A replica that
     changed after the warm is hashed by the view only if its input fits `SYNC_HASH_MAX_BYTES`; otherwise the view
-    has no `textHash` for it and the planner's remote hash is unknown (`logPort.ts:99-108`,
-    `src/core/plan/planner.ts:204-210`).
+    has no `textHash` for it and the planner's remote hash is unknown (`logPort.ts:98-107`,
+    `src/core/plan/planner.ts:201-207`).
 
 ### f.2 Planner
 
@@ -1389,7 +1482,7 @@ All are in `src/core/types.ts`.
 |---|---|---|---|
 | live | present | present | 1. If `Rm` and not `pendingLocal`: `diskRename(S.path → R.path, expect hash)` (remote move; plain rename; case-only via temp on case-insensitive FS; folder-casing-only differences tolerated there). 2. Content: neither changed → `syncedPut` if the stat moved; `Rc` only → `reconcileContent` (crdt-only write) / blob `fetchBlob`; `Lc` only → `reconcileContent` (disk-only, frames) / blob `pushBlob` + `nsSetBlob(baseRev = R.blob.rev)`; both → `reconcileContent` (3-way) / blob keep-both (`conflictCopy`, `fetchBlob`, `nsCreate` for the copy). |
 | live | present | absent | Inferred or observed rename to a leftover L entry → `nsRename` (+ content step at the new path). Else if `Rc` (remote edited since sync) → `diskMaterialize(R.path, expect absent)` (edit beats delete). Else → `nsDelete(baseBodySeq = streams.appliedSeq)` (brake: mass-delete-local). |
-| deleted | present | absent | `syncedDrop`. |
+| deleted | present | absent | Observed rename (not hash inference) to a leftover L entry → `nsRestore(path = L.path, againstDeleteSeq = R.deletedSeq)` (the unseen rename wins, as in E6) + `reconcileContent` if L hash ≠ S.contentHash, else `syncedPut` at L.path. Else → `syncedDrop` (kept while ns is not ready). |
 | deleted | present | present, ¬`Lc` | If the doc has own pending body frames and the restore condition holds → `nsRestore`. Else → `diskTrash(S.path, expect hash = S.contentHash)` + `syncedDrop` (brake: mass-delete-remote). |
 | deleted | present | present, `Lc` | Local edit beats remote delete: `nsRestore(path = S.path, againstDeleteSeq = R.deletedSeq)` + `reconcileContent`. |
 | merged → W | present | any | `rebind(S.docId → W)`, then plan as W. |
@@ -1413,7 +1506,7 @@ All are in `src/core/types.ts`.
   8. bookkeeping.
 - **Disk ops** become `DiskOp`s with `WritePrecondition`s (`expect hash` → `{t: "hash"}`; for fresh writes, `{t:
   "fingerprint"}` with the fingerprint read by the job). They are sent in `diskOps` batches of ≤ `diskOpsPerBatch`,
-  tagged with the lane.
+  in the `background` lane (§i.1).
 - **Failed precondition:** that doc is re-planned in the next scoped pass. Nothing is retried blindly.
 - **Bound docs.** `reconcileContent` merges into the worker replica (origin `MERGE` → body `entry` → editor), and
   Obsidian's save writes the disk. The projection never writes a bound file (§d.2).
@@ -1482,8 +1575,8 @@ All are in `src/core/types.ts`.
   6. `T_synced` (base = M, hashes, bodyVersion) + `T_intent_end`.
   - If step 5's precondition fails, the user edited again. S stays at B, the next round merges (B, D′, M), and diff3
     treats the already-applied identical hunks as non-conflicting.
-- **Bounded time.** Inputs above the caps never run diff (`too-large`). Merge jobs run in lane 3 (or 0/1 for open
-  docs) and yield between docs.
+- **Bounded time.** Inputs above the caps never run diff (`too-large`). Merge jobs write in the `background` disk
+  lane (§i.1) and yield between docs.
 
 ### f.4 Echo suppression
 
@@ -1510,17 +1603,16 @@ All are in `src/core/types.ts`.
 | `mass-delete-remote` | `diskTrash` | same |
 | `mass-overwrite` | Writes over a file ≥ `BRAKE_OVERWRITE_MIN_BYTES` leaving < `BRAKE_OVERWRITE_SHRINK_RATIO` of its size | same |
 | `conflict-flood` | `conflictCopy` | `> BRAKE_MAX_CONFLICT_COPIES` |
-| `ns-divergence` | All destructive ops | V3 mismatch (§b.5) |
 
 - **Held ops** go to `Plan.held`. The rest of the plan runs.
 - **Report.** The brake's identity is the sorted brake keys (`kind|docId|path|expect`) of its held ops, one per line
-  (`brakeKey`, `brakeIdentity`, `src/core/plan/brake.ts:83-90`). `BrakeReport.id` is the identity's sha256 through
-  `HashPort` (`brakeId`, `brake.ts:93-95`): the planner returns the identity, and the reconciler digests it and the
-  engine posts a `brake` event (`src/engine/reconcile/reconciler.ts:190-195`).
+  (`brakeKey`, `brakeIdentity`, `src/core/plan/brake.ts:82-89`). `BrakeReport.id` is the identity's sha256 through
+  `HashPort` (`brakeId`, `brake.ts:92-94`): the planner returns the identity, and the reconciler digests it and the
+  engine posts a `brake` event (`src/engine/reconcile/reconciler.ts:177-182`).
 - **Approval.** `approveBrake{id}` maps the id back to the identity of the report it names and sets `brakeApproval`
-  to that identity (`reconciler.ts:96-103`; an id no report of this runtime has is ignored). The next plan releases
-  the held set only if its held ops have the same identity (`brake.ts:128-129`). A recovery snapshot (reason
-  `brake`, with snapshots enabled, §j.4) is taken first (`src/engine/compose/runtimeOps.ts:80-83`). `rejectBrake`
+  to that identity (`reconciler.ts:83-90`; an id no report of this runtime has is ignored). The next plan releases
+  the held set only if its held ops have the same identity (`brake.ts:126-127`). A recovery snapshot (reason
+  `brake`, with snapshots enabled, §j.4) is taken first (`src/engine/compose/runtimeOps.ts:79-82`). `rejectBrake`
   converts held remote deletes into nothing (the files stay; `syncedDrop`) and held local deletes into re-creates.
 - Counting is per plan **and** per rolling 10-minute window, so slow drips also trip it.
 
@@ -1596,10 +1688,10 @@ transferred buffers.
 | Message | rid | Purpose | Answer |
 |---|---|---|---|
 | `init{config}` | yes | Identity, device class, settings, relay URL + credential (secret), side files `[T]` | `ready{protocolVersion, vaultEpoch, recovered}` / `error(version-mismatch)` |
-| `shutdown{reason}` | yes | Flush builders, `T_edit`, mirror, close relay and IDB | `ok` |
+| `shutdown` | yes | Flush builders, `T_edit`, mirror, close relay and IDB | `ok` |
 | `lifecycle{event}` | — | visible / hidden / pagehide / freeze / resume / online / offline / memory-pressure (declared, never raised; §i.4) | — |
 | `ping` | yes | Liveness every 10 s | `pong` (no pong within `PING_TIMEOUT_MS` → the engine stopped, §g.4) |
-| `observations{scanId, chunk, complete}` | yes | Listing chunks (≤ 2000 stats) | `ok` (the host sends the next chunk after it) |
+| `observations{chunk, complete}` | yes | Listing chunks (≤ 2000 stats) | `ok` (the host sends the next chunk after it) |
 | `vaultEvents{events}` | — | Hints, batched ≤ 50 ms / 256 | — |
 | `openDoc{path, viewId}` | yes | Bind request | `bind{docId, kind, frozen}` / `notBindable{reason}` |
 | `closeDoc{docId, viewId}` | — | Unbind | — |
@@ -1618,7 +1710,7 @@ transferred buffers.
 | Message | rid | Purpose | Answer |
 |---|---|---|---|
 | `body{docId, event, weight}` | — | Body event of a bound doc (`entry` / `bound` / `reject` / `durable` / `reloaded`, §d.3), FIFO per doc, within credit | `docCredit{weight}` |
-| `docRetarget{docId, change}` | — | renamed / merged / deleted / frozen: the host unbinds and re-opens; `resync`: the host re-binds every view of the doc (§d.2) | — |
+| `docRetarget{docId, change}` | — | renamed / merged / frozen: the host unbinds and re-opens; `resync`: the host re-binds every view of the doc (§d.2) | — |
 | `bindable{path}` | — | A path became bindable | Host `openDoc` |
 | `readRequest{reads}` | yes | Disk reads (area vault/config, maxBytes) | `reads{DiskReadResult[] [T]}` |
 | `diskOps{lane, ops}` | yes | Ordered ops with preconditions. A failed op does not stop independent later ones; dependents report `skipped` | `diskOps{DiskOpResult[]}` |
@@ -1627,14 +1719,12 @@ transferred buffers.
 | `status{StatusSnapshot}` | — | Throttled to ≤ 4/s and sent on phase change | — |
 | `brake{BrakeReport}` | — | User approval needed | Host shows UI → `command` |
 | `notice{level, code, message}` | — | User-facing notice | — |
-| `fatal{error}` | — | Engine cannot continue | Host stops, shows error |
 | `result` / `error` `{re}` | — | Answers to main requests | — |
 
 ### g.3 Ids
 
 - **`rid`** is per sender, starts at 1 and increases. Ids are never reused within one transport instance.
 - **`opId`** is unique per engine instance across all `diskOps` batches, and is used in diagnostics and intents.
-- **`scanId`** increases per listing.
 - **`viewId`** is assigned by the host per editor leaf.
 - **`docId`** is the fold docId.
 
@@ -1649,8 +1739,8 @@ transferred buffers.
     transferred (host/hashOracle.ts);
   - `observations` are chunked and acknowledged;
   - `readRequest` is bounded by `maxDiskIoBytesInFlight`;
-  - `diskOps` batches are ≤ `diskOpsPerBatch`, and the host runs lane 0 batches before others, within `mainSliceMs`
-    slices;
+  - `diskOps` batches are ≤ `diskOpsPerBatch`, and the host runs `openNote` batches before `background` ones
+    (§i.1), within `mainSliceMs` slices;
   - `vaultEvents` and `bodyPush` are small and unbounded by design. Main never drops them.
 - **Timeouts.** Engine→main requests (disk I/O, side files) have no fixed timeout: a slow mobile disk is still
   progressing. They end with the engine (`aborted`, engine/compose/hostLink.ts `close`), and the engine re-plans
@@ -1669,7 +1759,7 @@ transferred buffers.
   - no startup `pong` within `STARTUP_PING_TIMEOUT_MS`;
   - a worker `error` / `messageerror` event, or any other transport failure;
   - no liveness `pong` within `PING_TIMEOUT_MS`;
-  - `init` answers an error (`storage-lost` included, OR-1), or the engine sends `fatal`.
+  - `init` answers an error (`storage-lost` included, OR-1).
   - The host terminates the worker, rejects every pending request (`aborted`) and reports one fatal: the runtime
     stops, its views unbind (their edits stay in the editors, §d.2), and the UI shows "YAOS stopped: …" and a
     failed status. Nothing restarts it in the background and nothing runs the engine on main. A new engine is the
@@ -1849,9 +1939,8 @@ interface RelaySession {
 }
 interface RelayPort { connect(params: { vaultId: VaultId; deviceId: DeviceId }): Promise<RelayConnectResult> }
 
-// index.ts — bundles
+// index.ts — the engine's bundle. The host takes its ports one by one and is given no HashPort: main never hashes (§d.2)
 interface EnginePorts { relay; storage; clock; random; crypto; hash; blob: BlobPort | null; probeBlob?: () => Promise<BlobPort | null> }
-interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; random }   // no hash: main never hashes (§d.2)
 ```
 
 - **Not a port: `HashOracle`** (host/hashOracle.ts). The host's only hashing entry point:
@@ -1872,31 +1961,48 @@ interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; r
 
 ## i. Runtime
 
-### i.1 Priority lanes
+### i.1 Priorities
 
-| Lane | `LANE` | Work |
+Two small priority scales, each applied in exactly one place. There is no engine scheduler: no queue the engine
+drains, no slice loop, no aging.
+
+**Send ranks** (`RANK`, `sendRank`, `src/engine/body/sender.ts`). The sender sends `pending` / `sent` records by
+rank, then by outbox `order` (`Sender.order`). A frame waiting for its create sorts at the create's rank or later,
+so a body never sorts ahead of its create (§d.4).
+
+| Rank | `RANK` | Frames |
 |---|---|---|
-| 0 | `openNote` | `bodyPush` apply, frame close and **send** for bound docs, receipts, body event forwarding, provisionals for bound docs, bind requests and bind merges |
-| 1 | `openCatchUp` | Reads, union and merges for bound or just-opened docs; hard-limit compaction |
-| 2 | `namespace` | ns/cfg/snap ingest, fold, ns/cfg/snap reads, planner runs, ns frames, settings projection |
-| 3 | `background` | Body reads for stale streams, merges, projection writes, materialization, scan hashing |
-| 4 | `bulk` | Compaction, remote checkpoints, retired checkpoints, snapshots, mirrors |
+| 0 | `hot` | Body frames of bound docs, and every adopted frame (§d.5) |
+| 1 | `nsCfg` | ns and cfg frames |
+| 2 | `background` | snap frames, and every other body frame (imports, merges, initial content of docs that are not open) |
 
-- **Blob transfers are not lane work.** They run in the background in the blob queue, within its byte budget
-  (§j.1); only their disk reads and writes are lane-tagged (lane 3: `src/engine/reconcile/context.ts:193-200`).
-- **No engine scheduler.** Lanes are priority tags, not a queue the engine drains; there is no slice loop and no
-  aging. They take effect in two places:
-  - **Sender** order: lane rank, then outbox order; a frame waiting on another record sorts at that record's rank or
-    later (`src/engine/body/sender.ts:335-346`). Ranks: bound-doc frames 0, ns 1, cfg 2, snap and other
-    streams 3, adopted frames 4 (`src/engine/runtime/engine.ts:57-65`).
-  - **Host** `DiskExecutor` runs the next op of the highest-priority (lowest lane) batch, FIFO within a lane, keeps
-    order inside a batch, and yields a macrotask every `mainSliceMs` (`src/host/diskExecutor.ts:1-8`, `:102-108`,
-    `:124-127`).
+- Adopted frames are hot even after their note closes: they exist only for bound docs (`DocRuntime.onProvisional`)
+  and are few. Ranked below background bodies, a peer's dropped edit could sit behind a bulk import that the token
+  bucket (§i.6) meters out over minutes.
+
+**Disk lanes** (`LANE`, `src/protocol/messages.ts`). Every `diskOps` batch carries one. The host `DiskExecutor`
+runs the next op of the oldest `openNote` batch, else of the oldest `background` batch, keeps order inside a
+batch, and yields a macrotask every `mainSliceMs` (`src/host/diskExecutor.ts`).
+
+| Lane | `LANE` | Batches |
+|---|---|---|
+| 0 | `openNote` | Writes for an open note that the user waits on: a bound doc's conflict copy (`src/engine/compose/boundDisk.ts`) |
+| 1 | `background` | Everything else: reconcile and merge writes, materialization, renames, trashes, snapshot restores, settings |
+
+- `readRequest` has no lane: reads go to the vault in arrival order. Bound docs merge into the worker replica, not
+  through disk writes (§f.2).
+- **Blob transfers** are not ranked. They run in the blob queue within its byte budget (§j.1); their disk writes
+  are `background` batches.
+
+**Background work** is what waits while the app is backgrounded (§i.4, `EngineCtx.background`,
+`VaultRuntime.background`): reconcile passes, new blob transfers, stale-stream reads, local compaction below
+`TAIL_HARD_ROWS` (§d.8) and remote checkpoints.
+
 - Long engine loops yield a macrotask through `ClockPort.yieldNow` (e.g. `src/engine/reconcile/mergeJob.ts:108`,
   `src/engine/reconcile/canvasJob.ts:78`, `src/engine/compose/hashService.ts:102`, `src/engine/blobs/gc.ts:109`).
-- Relay events are queued at once (`src/engine/runtime/liveIngest.ts:65-66`) and processed in arrival order:
+- Relay events are queued at once (`src/engine/runtime/liveIngest.ts:66-67`) and processed in arrival order:
   committed/receipt events in batches of ≤ `liveBatchRows`, provisionals one at a time (`liveIngest.ts:4-7`,
-  `:143`). Not by lane.
+  `:143`). Not by rank.
 
 ### i.2 Device classes and budgets
 
@@ -1909,8 +2015,7 @@ The host picks the class and passes it in `EngineInitConfig.deviceClass`:
 | `phone` | mobile and not a tablet |
 | `constrained` | mobile with `deviceMemoryGiB` < 3 or `hardwareConcurrency` ≤ 2 |
 
-Budgets (`BUDGETS` in `limits.ts`). `Budgets.sliceMs` (`src/core/limits.ts:236`) is set (10 / 10 / 8 / 6 ms) but
-never read.
+Budgets (`BUDGETS` in `limits.ts`).
 
 | | desktop | tablet | phone | constrained |
 |---|---|---|---|---|
@@ -1944,8 +2049,8 @@ Further caps:
 
 | Event | Action |
 |---|---|
-| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and lanes 3–4, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk; tablets get the same treatment. Phone and constrained devices pause lanes 3–4 at once (hard-cap compaction is lane 1 and still runs; no new blob transfer starts, `src/engine/compose/vaultRuntime.ts:239`) and close the socket (1000) after 30 s hidden, which also ends the blob transfers in flight (§j.1). A background close shows no offline or error phase and arms no backoff. |
-| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause lanes 3–4 and close the socket on every device class (ending the blob transfers in flight). Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
+| `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and background work, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk; tablets get the same treatment. Phone and constrained devices pause background work at once (hard-cap compaction still runs; no new blob transfer starts, `src/engine/compose/vaultRuntime.ts:239`) and close the socket (1000) after 30 s hidden, which also ends the blob transfers in flight (§j.1). A background close shows no offline or error phase and arms no backoff. |
+| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause background work and close the socket on every device class (ending the blob transfers in flight). Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
 | `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. This tries once even after `offline`, so a missed `online` cannot strand the device; while offline a failure arms no backoff. The user's pause wins over this and over `online`. Check the IDB connection: `onLost` → §i.5. |
 | `online` / `offline` | Connect at once / stop reconnect attempts (an open socket stays until it fails). The outbox keeps accumulating. |
 | `memory-pressure` | None. Declared in `LifecycleEvent` (`src/ports/platform.ts:26`) but never raised by the host; nothing handles it (§d.1). |
@@ -1960,7 +2065,7 @@ Further caps:
 
 **Procedure** (phase `recovering`):
 1. Open a fresh DB under the same name. On a WebKit connection loss, try reopening first.
-2. Import the outbox mirror: same `clientFrameId`s, `order`s and states (sent → pending), and `outboxOrder.next =
+2. Import the outbox mirror: same `clientFrameId`s, `order`s and states (a legacy `sent` → pending), and `outboxOrder.next =
    max + 1`.
 3. Import the synced mirror as `SyncedEntry` with `hasBase = false` and `bodyVersion = null`. With `bodyVersion =
    null` the planner compares content instead: `Rc := streams.textHash ≠ S.contentHash`.
@@ -1989,7 +2094,7 @@ ones get conflict copies.
 | `backpressure` (VAULT_BACKPRESSURE), then 1013 | Stop sending at once. Reconnect after ≥ 5 s. Client token bucket at 50 % for 10 min. |
 | 1009 oversize / 1008 malformed APPEND | Probe mode, poison (§d.6). |
 | 1008 + upgrade error `unauthorized` | Re-ticket once. Connect `unauthorized` (ticket 401) → phase `revoked`, stop, "re-pair device" notice. |
-| `update_required` / connect `update-required` | Phase `upgrade-required`, no reconnect until the plugin updates. |
+| `update_required` / connect `update-required` | Phase `upgrade-required` (notice `upgrade-required`: "The server needs a newer YAOS plugin"), no reconnect until the plugin updates. The vault's own demand (a fold halted, §c.10) keeps the session and has notices `upgrade-required:<fold>`. |
 | `unclaimed` / `not-found` | Phase `error` with notice, retry hourly. |
 | 4403 `authority_superseded` / connect `superseded` | Re-ticket and reconnect. Repeated: phase `superseded`, retry every `SUPERSEDED_RETRY_MS`. |
 | 4409 | Not sent on streams sockets. If seen: reconnect and compare `VAULT_READY.vaultEpoch` (§c.12). |
@@ -1999,7 +2104,7 @@ ones get conflict copies.
 | `refused forbidden` / `canWrite = false` | Read-only: no appends or checkpoints. Outbox kept. Notice. |
 | `resendUnreceipted` (STREAM_RESEND) | §d.5. |
 | 1001 / 1006 / network | Reconnect with full-jitter exponential backoff `RECONNECT_BASE_MS` → `RECONNECT_MAX_MS`. Immediate on `online` / `visible`. |
-| A relay HTTP call (feed, read, readBatch, checkpoint) ends at its deadline (`timeout`: 15 s plus its byte bound at 64 KiB/s) or as `aborted` when its session closes (§j.1 Liveness) | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:339-342`, `:364-369`); a failed session-start feed closes the session and reconnects with backoff (`:167-175`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
+| A relay HTTP call (feed, read, readBatch, checkpoint) ends at its deadline (`timeout`: 15 s plus its byte bound at 64 KiB/s) or as `aborted` when its session closes (§j.1 Liveness) | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:357-360`, `:382-387`); a failed session-start feed closes the session and reconnects with backoff (`:185-193`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
 | Ticket TTL 5 min | The adapter fetches a fresh ticket for every connect. |
 
 ---
@@ -2058,7 +2163,7 @@ ones get conflict copies.
     throws `BlobTooLargeError`. The queue refuses that hash until the engine restarts: one notice, the outage record
     dropped, no backoff; `pushBlob` holds the doc (`held`, no pass retry). Changed bytes are a new hash and are tried
     (`src/engine/blobs/blobQueue.ts` `upload`, `src/engine/reconcile/blobJobs.ts`).
-    `StatusSnapshot.maxBlobBytes` reports that cap (`src/engine/compose/vaultRuntime.ts:650`); the attachment size
+    `StatusSnapshot.maxBlobBytes` reports that cap (`src/engine/compose/vaultRuntime.ts:652`); the attachment size
     setting then reads "This server accepts attachments up to N MB." and offers at most N (`attachmentLimitMb`,
     `src/host/ui/settingsModel.ts`; 93 MB, what fits 100 MB once sealed, until a vault reports its own). The
     setting can only lower the server's limit: its default (1 GiB, the most there is) follows it, and choosing
@@ -2091,12 +2196,12 @@ ones get conflict copies.
     (`src/engine/blobs/touch.ts:170-171`).
   - A reader leaves a `bodyUpdateRef` row unresolved and arms no retry timer (§d.6).
   - There is no UI row, notice, banner or setting about server blob storage (no server-metadata UI); only a log line.
-- **A store found on a later connect.** `EnginePorts.probeBlob` (`src/ports/index.ts:51`) asks the relay again. The
+- **A store found on a later connect.** `EnginePorts.probeBlob` (`src/ports/index.ts:30`) asks the relay again. The
   session loop calls it once per session that reaches live, only while `ports.blob` is null
-  (`src/engine/runtime/sessionLoop.ts:162`, `:452-465`). A store found → `EngineOptions.onBlobStore`
-  (`src/engine/runtime/options.ts:160-164`) → `VaultRuntime` (`src/engine/compose/vaultRuntime.ts:64-65`, `:173`) →
+  (`src/engine/runtime/sessionLoop.ts:180`, `:459-472`). A store found → `EngineOptions.onBlobStore`
+  (`src/engine/runtime/options.ts:164-168`) → `VaultRuntime` (`src/engine/compose/vaultRuntime.ts:64-65`, `:173`) →
   `ComposedEngine.onBlobStore` sets `ports.blob`, logs "blob store available -> restarting" and restarts the runtime
-  with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:531-536`). The restarted runtime's full
+  with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:527-532`). The restarted runtime's full
   pass uploads what is pending through the normal path. No polling, no new timers.
 - **Production ports** (`src/engine/adapters/webEngine.ts:42-54`): `blob = startupBlob(…)`
   (`src/engine/adapters/httpBlob.ts:518-525`): `probeHttpBlob`'s answer, the HTTP store when the relay advertises
@@ -2118,7 +2223,7 @@ ones get conflict copies.
   - **Validation:** unique string ids; node `type ∈ {text, file, link, group}`; numeric `x / y / width / height`;
     edges reference existing nodes (dangling edges are dropped from the projection, kept in the CRDT). Invalid →
     freeze `canvas-invalid`.
-- **Merge.** The ONE `MergeFn` runs over the canonical record-per-line text (`canonicalCanvasItemBytes` with rank),
+- **Merge.** The ONE `MergeFn` runs over the canonical record-per-line text (`canvasToMergeText`: one node or edge and its rank per line),
   so concurrent edits to different nodes merge, and the same node conflicts.
   - The CRDT apply is record-level: changed fields are set, and the `text` field gets a minimal `Y.Text` diff. Node
     maps are never replaced wholesale.
@@ -2257,9 +2362,9 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
   - **Live set:** records not deleted and not below their device's floor, at most the newest 100 per device.
   - **Retention:** each upload appends `floor = createdAtMs` of this device's `keepDaily`-th newest upload, so every
     reader drops older ones. Dels below a floor are pruned, so the state stays bounded by retention.
-  - **Wiring, like `cfg`:** read after `ns` and `cfg` in catch-up, folded by a FoldRuntime, lane 2, compacted, and
-    checkpointed as `snapFoldV1` (strict decode plus canonical re-encode, §b.5). The record adds no crypto of its own;
-    the envelope seals it like any frame.
+  - **Wiring, like `cfg`:** read after `ns` and `cfg` in catch-up, folded by a FoldRuntime, sent at the background
+    rank (§i.1), compacted, and checkpointed as `snapFoldV1` (strict decode plus canonical re-encode, §b.5). The
+    record adds no crypto of its own; the envelope seals it like any frame.
 - **Restore and verification** (`verify.ts`, `snapshotJob.ts`). The relay is trusted for neither content nor paths,
   so every check runs on the client.
   1. **Resolve** the id: a local descriptor, else this device's uploaded record, else `<id>@<deviceId>` in the live
@@ -2363,7 +2468,7 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 1. **Connect, then feed from 0.** All streams are recorded stale with priorities. There are about streams/1000 pages.
 2. **ns first.** `read("ns", 0, true)`: verify the checkpoint (V1 + V2), then fold the rows. The Remote tree is now
    complete, and status shows `bootstrap {docsTotal}`.
-3. **Bodies lazily, by priority.** Bound or opened docs (lane 1) first, then live docs by `lastTouchSeq` descending,
+3. **Bodies lazily, by priority.** Bound or opened docs first, then live docs by `lastTouchSeq` descending,
    small first within a bucket (`priority = bucket(lastTouchSeq) × 4 + sizeClass`). Blobs have no stream: the pass
    that plans a blob's materialization claims its download, which runs in the background within the blob byte
    budget (§j.1).
@@ -2380,6 +2485,8 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
   (`maxBlobBytes`, null until a vault is open, 0 without a blob store), notices.
   - Posted on phase change, and otherwise at most 4/s.
   - The status bar shows phase + unsynced count.
+  - Phase `upgrade-required`: the tooltip (and the settings tab's "Update required" row) is the vault's message when
+    a `upgrade-required:<fold>` notice is present (§c.10), else the server's.
 - **`DiagnosticsBundle`** (`exportDiagnostics{includePaths}`, built in `src/engine/compose/diagnosticsBundle.ts`):
   - the whole 2000-entry ring of `DiagnosticsEvent`, oldest first (numbers, booleans, stream classes, error
     messages). The whole ring, not a tail: the window before an incident is what support needs;
@@ -2420,7 +2527,7 @@ src/
     codec/   lib0, ids, envelope, contents, nsOps, cfgOps, nsFoldV1, cfgFoldV1, snapFoldV1, mirrors     [WP-A];
              sealedBlob, padme, recoveryKey                                                    [E2EE]
     paths/   pathKey (+ generated casefold15_1, assigned15_1), validate, segments              [WP-A]
-    ns/      fold, index, place, overlay, verify (V1/V2), candidate (V3 digest rule)          [WP-A]
+    ns/      fold, index, place, overlay, verify (V1/V2), candidate (checkpoint seqs, §d.9)   [WP-A]
     cfg/     fold, json, projection (pure JSON register → file bytes), verify                 [WP-A]
     snap/    record (snapOps), fold, zip, bundle (parts, digest, manifest), export, verify (§j.4)
     hash/    markdownLf (ported markdownCodec), canvasCanonical + canvasOrdering (ported canvasCodec/Ordering),
@@ -2481,7 +2588,7 @@ These are enforced by `scripts/check-deps.mjs` (WP-D), a regex import scan run i
   - `MAIN_FORBIDDEN` = `yjs`, `y-codemirror.next`, `y-protocols`, `lib0`. No `host/**` file may import them: not
     tests, not type-only imports.
   - **No hashing on main.** `MAIN_FORBIDDEN_DIRS` = `core/hash`. No product `host/**` file may import `core/hash/**`,
-    type-only imports included. HostPorts has no HashPort (§h); every fingerprint, and the SecretStorage id
+    type-only imports included. The host is given no HashPort (§h); every fingerprint, and the SecretStorage id
     (e2ee-design §6.1, the vaultId's bytes in hex), is computed without one. Host tests may import it to compute
     expected values: they are not main-thread code.
   - `mainReach` follows every product `host/**` module's relative imports through `host`, `core`, `ports` and
@@ -2570,8 +2677,8 @@ After healing (all faults off, all online, run until every queue is idle and no 
 3. **Nothing destroyed without a copy.** Every file version that existed on any disk and was not superseded by a user
    edit containing it is present in the vault, in the trash, in a conflict copy, or in a snapshot. Every trash
    happened with a passing precondition.
-4. **Fold determinism.** For every device and every candidate seq, the V3 digests match. Folding from any checkpoint
-   plus the rest equals the full fold.
+4. **Fold determinism.** Folding from any checkpoint plus the rest equals the full fold, and every checkpoint an
+   honest device writes passes V1 + V2.
 5. **Clean state.** Outbox empty, no `held` or `adoptable` records, cursors at head, no frozen docs unless a malicious
    frame was injected, no open intents.
 6. **Resource bounds held throughout:** resident docs/bytes ≤ budget (+1 doc), tail ≤ hard rows, live queue ≤ bound,
@@ -2579,7 +2686,7 @@ After healing (all faults off, all online, run until every queue is idle and no 
 7. **No blobs on the log** (`checkLogCarriesNoBlobs`, `src/sim/invariants.ts:124-132`, run by `src/sim/run.ts:251`):
    no foreign stream on the relay log, no ns / cfg / snap / k row over `MAX_NS_FRAME_BYTES`, no `b:`/`c:` stream for
    an attachment doc. Sim devices get the net's `SimBlobStore` (`SimNet.blobs`, `blobsAvailable`, `blobPort()`,
-   `src/sim/net.ts:58-85`) and its probe by default (`src/sim/device.ts:196-197`).
+   `src/sim/net.ts:59-86`) and its probe by default (`src/sim/device.ts:202-203`).
 
 ### l.4 10k-op fold fuzz (WP-A)
 
@@ -2616,7 +2723,7 @@ The old client was deleted once the port was done, and the legacy server's share
 | `adfa7a7:src/sync/boundedTextDiff.ts`, `diff.ts` (`tryApplyDiffToYText` only) | `src/core/merge/minimalDiff.ts`, `src/engine/reconcile/mergeJob.ts` | Minimal diff + CAS apply. `forceReplaceYText` is **dropped** |
 | `adfa7a7:src/sync/dailyLimit.ts` | `src/engine/adapters/relayHttp.ts` (`dailyResetDelayMs`), `src/engine/runtime/relayPolicy.ts` (retry), `src/engine/runtime/dailyLimit.ts` (notice gate + text) | `resetAt` parsing, probe schedule, notice gate |
 | `server/src/shared/socketCloseCodes.ts` | `src/engine/adapters/wsRelay.ts` | Mapped onto `RELAY_CLOSE` / `RelayEvent.closed` |
-| `adfa7a7:src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*`, `src/core/cfg/projection.ts` | Allowlist, plugin version gate, canonical JSON |
+| `adfa7a7:src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*` | Allowlist, plugin version gate, canonical JSON |
 | `adfa7a7:src/utils/{randomId,sha256,semver,defaultDeviceName,format}.ts` | `src/core/codec/ids.ts`, `src/engine/adapters/webHash.ts`, `src/host/*` | Ids become 16-byte base64url |
 | `adfa7a7:src/snapshots/{snapshotService,vaultExport}.ts` | `src/engine/snapshots/snapshotJob.ts` | Zip writing only |
 | `adfa7a7:src/onboarding/{provisioningClient,localVaultImport}.ts` | `src/host/ui/pairing.ts`, §j.5 | Pairing HTTP calls. Import is now just "plan L-only files" |
@@ -2626,7 +2733,7 @@ The old client was deleted once the port was done, and the legacy server's share
 ### m.2 Deliberately dropped
 
 - **`adfa7a7:src/main.ts`, `VaultSync`, the runtime coordinators** (`runtime/*`: admission, residency, overdue-work
-  kernels, connection controllers). Replaced by lanes, budgets, the pure planner and ports.
+  kernels, connection controllers). Replaced by send ranks, disk lanes, budgets, the pure planner and ports.
 - **Server-side CRDT and WASM engine** (`@yaos/crdt-engine`, ywasm). Pure JS Yjs only, client-side.
 - **Semantic epochs, fenced WebSocket, legacy receipts, bootstrap client** (`semanticEpochTransition`,
   `fencedWebSocket`, `relayReceipts`, `bootstrapClient`, `serverCapabilities`). Replaced by the streams relay

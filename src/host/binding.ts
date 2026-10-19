@@ -172,10 +172,6 @@ export class BindingManager {
 		return this.slots.get(viewId)?.state ?? null;
 	}
 
-	docOfView(viewId: number): DocId | null {
-		return this.slots.get(viewId)?.doc?.docId ?? null;
-	}
-
 	// --- engine -> main -------------------------------------------------------
 
 	/** A body event of `docId` (FIFO per doc). Its weight returns as docCredit once applied. */
@@ -251,15 +247,14 @@ export class BindingManager {
 		this.flushSlot(s);
 	}
 
-	onDocRetarget(docId: DocId, change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "deleted" } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" }): void {
+	onDocRetarget(docId: DocId, change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" }): void {
 		const doc = this.docs.get(docId);
 		if (!doc) return;
 		// resync: the worker dropped events (main fell behind its window); the mirror is behind but consistent.
 		if (change.t === "resync") return this.resync(doc, doc.mirror?.text ?? null);
 		for (const slot of [...doc.slots]) {
 			this.unbindSlot(slot);
-			if (change.t === "deleted") slot.state = "waiting";
-			else void this.open(slot);
+			void this.open(slot);
 		}
 	}
 

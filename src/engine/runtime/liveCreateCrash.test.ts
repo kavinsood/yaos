@@ -17,7 +17,7 @@ import { VirtualClock } from "../../sim/clock";
 import type { CommitDecision } from "../../sim/storage";
 import { SimRelay, type SimCommitInfo } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { converged, drive, sleep, startTestEngine, testStorage, until } from "./testHarness";
+import { converged, drive, sleep, startTestEngine, testStorage, until, createDoc, docText } from "./testHarness";
 
 const SAMPLE = Math.max(1, Number(process.env.YAOS_CRASH_SAMPLE ?? "1"));
 const PAR = 6;
@@ -78,7 +78,7 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 	let a2: LogEngine | null = null;
 	try {
 		await until(() => b.status().phase === "live", 3_000, "b live", clock);
-		const w = await run(b.createDoc("same.md", "WINNER;"));
+		const w = await run(createDoc(b, "same.md", "WINNER;"));
 		await until(() => b.isIdle(), 3_000, "b idle", clock);
 		const hash = b.nsView().state.entries.get(w)!.createHash;
 		const step = async (fn: () => Promise<unknown>) => {
@@ -129,11 +129,11 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 			const op = create(A(), "same.md", hash);
 			losers.add(docStream("markdown", op.docId)!);
 			const [cf] = await run(A().submitNs([op], { liveCreates: true }));
-			await until(() => storage.dead || (A().c.outbox.get(cf!)?.state === "sent" && relay.pendingCount() === 1), 2_000, "create at the relay", clock);
+			await until(() => storage.dead || (A().c.sender.isInflight(cf!) && relay.pendingCount() === 1), 2_000, "create at the relay", clock);
 			relay.commitNow();
 			await run(write(A(), op.docId, "LOSER3;"));
 			const body = A().c.outbox.ofStream(docStream("markdown", op.docId)!)[0];
-			await until(() => storage.dead || A().c.outbox.get(body!.clientFrameId)?.state === "sent", 2_000, "body sent before the receipt", clock);
+			await until(() => storage.dead || A().c.sender.isInflight(body!.clientFrameId), 2_000, "body sent before the receipt", clock);
 			await until(() => storage.dead || A().c.ns.state.entries.get(op.docId)?.state === "merged", 3_000, "merged", clock);
 			relay.resumeCommits();
 			relay.setLink("dev-a" as DeviceId, {});
@@ -165,7 +165,7 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 			const [l2, l3] = [...losers];
 			assert.ok(commits.some((c) => streams(c).includes(NS_STREAM) && streams(c).includes(l2!)), "same.md #2: body committed with its create (junk)");
 			assert.ok(commits.some((c) => streams(c).includes(l3!)), "same.md #3: body sent before the receipt, dropped, still committed (junk)");
-			assert.equal(await run(b.docText(w)), "WINNER;");
+			assert.equal(await run(docText(b, w)), "WINNER;");
 			return { labels, crashed };
 		}
 		await kill(a, clock);
@@ -188,7 +188,7 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 			else assert.equal(n, 1, `durable frame ${id} committed exactly once ${at}`);
 		}
 		assert.equal(a2.c.outbox.size, 0, "outbox drained: no orphaned held or gated record");
-		assert.equal(await run(b.docText(w)), "WINNER;", "no loser content in the winner");
+		assert.equal(await run(docText(b, w)), "WINNER;", "no loser content in the winner");
 		assert.equal(a2.c.repo.cursor.vaultSeq, relay.head());
 		return { labels, crashed };
 	} catch (e) {

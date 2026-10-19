@@ -212,11 +212,6 @@ export class BoundDocs {
 		this.pump();
 	}
 
-	/** Weight posted and not yet credited back (tests). */
-	get inFlightWeight(): number {
-		return this.creditUsed;
-	}
-
 	private pump(): void {
 		const window = this.deps.window();
 		for (const [docId, q] of [...this.queues]) {

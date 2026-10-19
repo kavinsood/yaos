@@ -4,7 +4,7 @@
  * shallow Map copy is a valid copy-on-write snapshot (overlay).
  */
 
-import type { DocId, NsEntry, NsFoldIndex, NsFoldState, PathKey, VaultPath } from "../types";
+import type { NsEntry, NsFoldIndex, NsFoldState, PathKey, VaultPath } from "../types";
 import { FOLD_RULES_VERSION } from "../limits";
 
 export function newNsFoldState(): NsFoldState {
@@ -89,8 +89,4 @@ export function indexesEqual(a: NsFoldIndex, b: NsFoldIndex): string | null {
 		if (!w || w.path !== v.path || w.count !== v.count) return `folderRefs[${k}] ${JSON.stringify(v)} != ${JSON.stringify(w)}`;
 	}
 	return null;
-}
-
-export function sortedDocIds(ids: Iterable<DocId>): DocId[] {
-	return [...ids].sort();
 }

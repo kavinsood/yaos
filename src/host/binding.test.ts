@@ -24,9 +24,9 @@ function setup() {
 	return { clock, vault, ws, engine, bm, notices };
 }
 
-function file(s: ReturnType<typeof setup>, path: string, text: string): void {
+function file(s: ReturnType<typeof setup>, path: string, text: string): DocId {
 	s.vault.userWrite(path, text);
-	s.engine.add(path, text);
+	return s.engine.add(path, text);
 }
 
 test("binding: bind uploads the editor once; typing coalesces into one push of the change only; remote entries are not echoed", async () => {
@@ -264,26 +264,28 @@ test("binding: onSaveRead posts a save mark naming the mirror version and the ne
 	assert.equal(bm.stats.saveMarks, 1);
 });
 
-test("binding: docRetarget resync re-attaches with the mirror as base; renamed/merged re-open; deleted waits for bindable", async () => {
+test("binding: docRetarget resync re-attaches with the mirror as base; frozen waits for bindable; renamed re-opens", async () => {
 	const s = setup();
-	const { clock, ws, engine, bm } = s;
-	file(s, "a.md", "abc\n");
+	const { clock, ws, engine, bm, notices } = s;
+	const docId = file(s, "a.md", "abc\n");
 	bm.start();
 	const v = ws.openFile("a.md");
 	assert.ok(v);
 	await clock.advance(5);
-	const docId = bm.docOfView(v.viewId);
-	assert.ok(docId);
 	bm.onDocRetarget(docId, { t: "resync" });
 	v.edit(4, 0, "d\n");
 	await clock.advance(50);
 	assert.equal(bm.slotState(v.viewId), "bound");
 	assert.equal(bm.stats.resyncs, 1);
 	assert.equal(engine.text("a.md"), "abc\nd\n");
-	bm.onDocRetarget(docId, { t: "deleted" });
+	engine.frozen.add("a.md");
+	bm.onDocRetarget(docId, { t: "frozen", reason: "test" });
+	await clock.advance(5);
 	assert.equal(bm.slotState(v.viewId), "waiting");
+	assert.deepEqual(notices, ["doc-frozen"]);
 	assert.equal(bm.isBoundPath("a.md"), false);
 	v.edit(0, 0, "x\n"); // unbound: goes in by the line merge at re-attach
+	engine.frozen.delete("a.md");
 	bm.onBindable("A.md" as never); // case-insensitive vault
 	await clock.advance(50);
 	assert.equal(bm.slotState(v.viewId), "bound");
@@ -320,7 +322,7 @@ test("binding: a frozen doc stays unbound with a notice; notBindable waits until
 test("binding: flushPath (case-insensitive), flushAll and saveViews push and save the bound views", async () => {
 	const s = setup();
 	const { clock, ws, engine, bm, vault } = s;
-	file(s, "R.md", "r");
+	const docId = file(s, "R.md", "r");
 	bm.start();
 	const v = ws.openFile("R.md");
 	assert.ok(v);
@@ -332,8 +334,6 @@ test("binding: flushPath (case-insensitive), flushAll and saveViews push and sav
 	v.edit(2, 0, "2");
 	bm.flushAll();
 	assert.equal(engine.count("bodyPush"), 2);
-	const docId = bm.docOfView(v.viewId);
-	assert.ok(docId);
 	const saved = await bm.saveViews([docId, "d:none" as DocId]);
 	assert.deepEqual(saved, [docId]);
 	assert.equal(vault.textOf("R.md"), "r12");

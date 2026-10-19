@@ -100,7 +100,7 @@ export class YaosController {
 		private current: YaosPluginData,
 		private readonly env: ControllerEnv,
 	) {
-		this.run = { phase: current.identity ? "stopped" : "unpaired", transport: null, lastError: null };
+		this.run = { phase: current.identity ? "stopped" : "unpaired", lastError: null };
 		this.plaintextNotice = plaintextNoticeOnce({
 			load: (k) => env.localStorage?.load(k) ?? null,
 			save: (k, v) => env.localStorage?.save(k, v),
@@ -177,7 +177,7 @@ export class YaosController {
 	private async startNow(): Promise<void> {
 		const identity = this.current.identity;
 		if (!identity) {
-			this.setRun({ phase: "unpaired", transport: null });
+			this.setRun({ phase: "unpaired" });
 			return;
 		}
 		if (this.runtime) return;
@@ -204,7 +204,7 @@ export class YaosController {
 			},
 			onCarrier: (c) => {
 				if (this.runtime !== rt || this.run.phase === "failed") return;
-				this.setRun({ phase: c.ready ? "running" : "starting", transport: c.carrier });
+				this.setRun({ phase: c.ready ? "running" : "starting" });
 			},
 			onFatal: (e) => {
 				if (this.runtime !== rt) return;
@@ -223,7 +223,7 @@ export class YaosController {
 		const rt = this.env.makeRuntime(hostIdentityOf(identity, this.current.deviceLabel), () => this.current.engine, ui, keys);
 		this.runtime = rt;
 		this.pendingBrake = null;
-		this.setRun({ phase: "starting", transport: null, lastError: null });
+		this.setRun({ phase: "starting", lastError: null });
 		try {
 			await rt.start();
 		} catch (e) {
@@ -248,7 +248,7 @@ export class YaosController {
 				this.env.log?.(`stop failed: ${safeMessage(e)}`);
 			}
 		}
-		this.setRun({ phase: this.current.identity ? "stopped" : "unpaired", transport: null });
+		this.setRun({ phase: this.current.identity ? "stopped" : "unpaired" });
 	}
 
 	async command(command: UserCommand): Promise<EngineResultValue> {

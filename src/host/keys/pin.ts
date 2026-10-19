@@ -115,13 +115,6 @@ export function sawKeyring<T extends PinFields>(d: T): T {
 	return d.e2ee === undefined ? { ...d, e2ee: { suite: null, keyringSeen: true } } : d;
 }
 
-/** Leaving a vault (unpair, another vault or relay): the pin and marker belong to the old vault. */
-export function withoutPin<T extends PinFields>(d: T): T {
-	if (d.e2ee === undefined && d.creating === undefined) return d;
-	const { e2ee: _e, creating: _c, ...rest } = d;
-	return rest as T;
-}
-
 /**
  * §15.1 step 1 done: this device created `vaultId` on the server. Written before enrolling (crash recovery), so the
  * device may still be enrolled in another vault; it is refused only for the vault the device is enrolled in and

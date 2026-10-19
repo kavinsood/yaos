@@ -19,7 +19,7 @@ import type {
 } from "../../../ports/vault";
 import type { ContentHash, VaultPath } from "../../../core/types";
 import { kindOfPath } from "../../../core/types";
-import { utf8Decode, utf8Encode } from "../../../core/hash/utf8";
+import { utf8Decode, utf8Encode } from "../../../core/codec/lib0";
 import { canvasHashRef, fingerprintRef, markdownHashRef, sha256HexRef } from "../../../core/hash/testkit/hashRef";
 
 export interface FakeFile {

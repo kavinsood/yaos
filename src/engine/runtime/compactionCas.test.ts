@@ -7,7 +7,7 @@ import { CheckpointState, writeBodyCheckpoint } from "../body/checkpoints";
 import { compactBody } from "../body/compaction";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { converged, startTestEngine, until } from "./testHarness";
+import { converged, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
 
 const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
 const NO_COMPACT = { compactRows: 1e9, compactBytes: 1e12, checkpoint: NO_CKPT };
@@ -42,11 +42,11 @@ function forced(s: RelaySession, res: PutCheckpointResult): RelaySession {
 test("compaction exactness: snapshot = fold of (old snapshot + every tail row <= C); rows deleted; replica untouched", async () => {
 	const { es: [a, b] } = await setup();
 	try {
-		const id = await a!.createDoc("c.md", "seed;");
+		const id = await createDoc(a!, "c.md", "seed;");
 		await converged([a!, b!]);
 		for (let i = 0; i < 5; i++) {
-			await a!.editDoc(id, (t) => t.insert(t.length, `a${i};`));
-			await b!.editDoc(id, (t) => t.insert(0, `b${i};`));
+			await editDoc(a!, id, (t) => t.insert(t.length, `a${i};`));
+			await editDoc(b!, id, (t) => t.insert(0, `b${i};`));
 		}
 		await converged([a!, b!]);
 		const stream = a!.streamOf(id) as StreamName;
@@ -64,7 +64,7 @@ test("compaction exactness: snapshot = fold of (old snapshot + every tail row <=
 			const got = textOf(snap.bytes);
 			assert.equal(got.text, expect.getText("text").toString());
 			assert.deepEqual(got.sv, Y.encodeStateVector(expect));
-			assert.equal(got.text, await e.docText(id), "replica text equals snapshot");
+			assert.equal(got.text, await docText(e, id), "replica text equals snapshot");
 			assert.equal((await e.c.repo.getTail(stream, 0, C)).length, 0, "tail <= C deleted");
 			const after = e.c.repo.stream(stream)!;
 			assert.equal(after.snapshotCoversSeq, C);
@@ -73,10 +73,10 @@ test("compaction exactness: snapshot = fold of (old snapshot + every tail row <=
 			expect.destroy();
 		}
 		// Second round folds on top of the first snapshot.
-		await a!.editDoc(id, (t) => t.insert(0, "Z;"));
+		await editDoc(a!, id, (t) => t.insert(0, "Z;"));
 		await converged([a!, b!]);
 		assert.equal((await compactBody(b!.c.deps, stream)).t, "ok");
-		assert.equal(textOf((await b!.c.repo.getSnapshot(stream))!.bytes).text, await a!.docText(id));
+		assert.equal(textOf((await b!.c.repo.getSnapshot(stream))!.bytes).text, await docText(a!, id));
 	} finally {
 		await a!.stop();
 		await b!.stop();
@@ -86,10 +86,10 @@ test("compaction exactness: snapshot = fold of (old snapshot + every tail row <=
 test("compaction is blocked while the stream has unreceipted outbox frames", async () => {
 	const { relay, es: [a] } = await setup(1);
 	try {
-		const id = await a!.createDoc("blk.md", "x");
+		const id = await createDoc(a!, "blk.md", "x");
 		await until(() => a!.isIdle(), 3_000, "idle");
 		relay.pauseCommits();
-		await a!.editDoc(id, (t) => t.insert(1, "y"));
+		await editDoc(a!, id, (t) => t.insert(1, "y"));
 		await until(() => a!.c.outbox.size > 0, 2_000, "outbox");
 		assert.deepEqual(await compactBody(a!.c.deps, a!.streamOf(id)), { t: "skip", reason: "outbox" });
 		relay.resumeCommits();
@@ -103,8 +103,8 @@ test("compaction is blocked while the stream has unreceipted outbox frames", asy
 test("checkpoint CAS: ok / not-advancing-local / conflict -> refresh -> ok / daily-limit hold / forbidden", async () => {
 	const { relay, es: [a, b, c] } = await setup(3, ["dev-c"]);
 	try {
-		const id = await a!.createDoc("cas.md", "v0;");
-		for (let i = 1; i < 4; i++) await a!.editDoc(id, (t) => t.insert(t.length, `v${i};`));
+		const id = await createDoc(a!, "cas.md", "v0;");
+		for (let i = 1; i < 4; i++) await editDoc(a!, id, (t) => t.insert(t.length, `v${i};`));
 		await converged([a!, b!, c!]);
 		const stream = a!.streamOf(id);
 		const sa = new CheckpointState();
@@ -116,7 +116,7 @@ test("checkpoint CAS: ok / not-advancing-local / conflict -> refresh -> ok / dai
 		assert.equal(a!.c.repo.stream(stream)!.rowsSinceRemoteCheckpoint, 0);
 		assert.deepEqual(await writeBodyCheckpoint(a!.c.deps, sa, a!.c.session!, stream), { t: "skipped", reason: "not-advancing-local" });
 
-		await b!.editDoc(id, (t) => t.insert(0, "B;"));
+		await editDoc(b!, id, (t) => t.insert(0, "B;"));
 		await converged([a!, b!, c!]);
 		const sb = new CheckpointState();
 		const pre = b!.c.repo.stream(stream)!.remoteCheckpointCoversSeq;
@@ -130,7 +130,7 @@ test("checkpoint CAS: ok / not-advancing-local / conflict -> refresh -> ok / dai
 		const st = textOf((await b!.c.repo.getSnapshot(stream))!.bytes);
 		assert.equal(st.text, "B;v0;v1;v2;v3;");
 
-		await a!.editDoc(id, (t) => t.insert(t.length, "more;"));
+		await editDoc(a!, id, (t) => t.insert(t.length, "more;"));
 		await converged([a!, b!, c!]);
 		relay.setDailyLimit(true, 5_000);
 		const r3 = await writeBodyCheckpoint(a!.c.deps, sa, a!.c.session!, stream);
@@ -152,8 +152,8 @@ test("checkpoint CAS: ok / not-advancing-local / conflict -> refresh -> ok / dai
 test("checkpoint outcome table: not-advancing refresh, too-large hold, ahead-of-stream / stream-not-found backoff", async () => {
 	const { relay, es: [a] } = await setup(1);
 	try {
-		const id = await a!.createDoc("tbl.md", "1;");
-		for (let i = 2; i < 5; i++) await a!.editDoc(id, (t) => t.insert(t.length, `${i};`));
+		const id = await createDoc(a!, "tbl.md", "1;");
+		for (let i = 2; i < 5; i++) await editDoc(a!, id, (t) => t.insert(t.length, `${i};`));
 		await until(() => a!.isIdle(), 3_000, "idle");
 		const stream = a!.streamOf(id);
 		const s = a!.c.session!;
@@ -161,13 +161,13 @@ test("checkpoint outcome table: not-advancing refresh, too-large hold, ahead-of-
 		const C = a!.c.repo.stream(stream)!.appliedSeq;
 		// Another device's checkpoint at C landed unseen: relay says not-advancing; the read refreshes it.
 		assert.equal((await writeBodyCheckpoint(a!.c.deps, new CheckpointState(), s, stream)).t, "ok");
-		await a!.c.repo.tPatchStreams([{ stream, patch: (r) => { r.remoteCheckpointCoversSeq = 0; r.rowsSinceRemoteCheckpoint = 7; } }], a!.c.now());
+		await a!.c.repo.tPatchStreams([{ stream, patch: (r) => { r.remoteCheckpointCoversSeq = 0; r.rowsSinceRemoteCheckpoint = 7; } }]);
 		const na = await writeBodyCheckpoint(a!.c.deps, st, forced(s, { t: "refused", reason: "not-advancing", retryAfterMs: null }), stream);
 		assert.deepEqual(na, { t: "not-advancing", refreshed: C });
 		assert.equal(a!.c.repo.stream(stream)!.remoteCheckpointCoversSeq, C);
 		assert.equal(a!.c.repo.stream(stream)!.rowsSinceRemoteCheckpoint, 0);
 
-		await a!.editDoc(id, (t) => t.insert(0, "x;"));
+		await editDoc(a!, id, (t) => t.insert(0, "x;"));
 		await until(() => a!.isIdle(), 3_000, "idle");
 		const tl = await writeBodyCheckpoint(a!.c.deps, st, forced(s, { t: "refused", reason: "too-large", retryAfterMs: null }), stream);
 		assert.deepEqual(tl, { t: "refused", reason: "too-large" });

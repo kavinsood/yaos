@@ -84,7 +84,6 @@ export class ComposedLog implements LogPort {
 		this.memo = {
 			remote, remoteByPathKey, nsCoversSeq: ns.coversSeq,
 			nsReady: this.nsCaughtUp && ns.halted === null && !ns.overlayHalted,
-			divergence: false,
 			docsWithPendingBody: pending, restoreDuty, lostCreateBody, textHash, appliedSeq,
 		};
 		return this.memo;

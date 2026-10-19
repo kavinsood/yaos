@@ -53,11 +53,6 @@ export function formatBytes(bytes: number): string {
 	return `${v >= 10 ? Math.round(v) : Math.round(v * 10) / 10} ${units[i] ?? "TiB"}`;
 }
 
-/** Abbreviate long opaque ids for display: "abcd…wxyz". */
-export function shortenMiddle(value: string, keep = 6): string {
-	return value.length <= keep * 2 + 1 ? value : `${value.slice(0, keep)}…${value.slice(-keep)}`;
-}
-
 /** Fixed-width mask for a secret: never reveals any character or the length. */
 export function maskSecret(secret: string | null | undefined): string {
 	return secret ? "••••••••••••" : "(none)";

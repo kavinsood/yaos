@@ -20,7 +20,7 @@ import { createWebRandom } from "../../src/engine/adapters/webRandom";
 import { createWsRelayPort } from "../../src/engine/adapters/wsRelay";
 import { LogEngine } from "../../src/engine/runtime/engine";
 import type { EngineTuning } from "../../src/engine/runtime/options";
-import { MemSideFiles } from "../../src/engine/runtime/testHarness";
+import { MemSideFiles, docText } from "../../src/engine/runtime/testHarness";
 import { nodeXhr } from "./nodeXhr";
 import { redact, type OnboardDevice, type OnboardedVault } from "./onboard";
 
@@ -215,7 +215,7 @@ export async function converge(ds: readonly Device[], timeoutMs = 30_000): Promi
 	const sig = async (e: LogEngine) => {
 		const docs = e.listDocs().filter((d) => d.state === "live").sort((a, b) => (a.docId < b.docId ? -1 : 1));
 		const parts: string[] = [];
-		for (const d of docs) parts.push(`${d.docId}|${d.path}|${await e.docText(d.docId)}`);
+		for (const d of docs) parts.push(`${d.docId}|${d.path}|${await docText(e, d.docId)}`);
 		return parts.join("\n");
 	};
 	await until(async () => {

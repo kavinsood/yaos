@@ -21,11 +21,6 @@ export const BLOB_AEAD_BYTES = 12 + 16;
 /** Largest header: blobFormat, suite, and a varuint keyEpoch of up to 2^53 − 1 (8 bytes). */
 export const BLOB_HEADER_MAX_BYTES = 2 + 8;
 
-/** Sealed suite-1 size of an n-byte plaintext at keyEpoch: header ‖ nonce ‖ padmeLen(n + 1) ‖ tag. */
-export function sealedBlobBytes(n: number, keyEpoch: number): number {
-	return encodeBlobHeader(CryptoSuite.aes256gcm, keyEpoch).length + BLOB_AEAD_BYTES + padmeLen(n + 1);
-}
-
 /**
  * Largest suite-1 plaintext whose sealed blob fits `cap` bytes at any keyEpoch (e2ee-design §7.3:
  * BlobPort.maxBlobBytes is the transport cap, and suite 1 has no cap of its own; the engine compares

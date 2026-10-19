@@ -15,12 +15,12 @@ import type { CryptoPort } from "../../ports/crypto";
 import type { QuarantineReason } from "../store/schema";
 import { decodeCfgOps } from "../../core/codec/cfgOps";
 import { decodeOuter } from "../../core/codec/envelope";
-import { decodeCfgFoldV1, encodeCfgFoldV1 } from "../../core/codec/cfgFoldV1";
 import { decodeBodyUpdateRef, decodeCheckpointContent } from "../../core/codec/contents";
-import { bytesEqual } from "../../core/codec/lib0";
-import { decodeNsFoldV1, encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
+import { bytesEqual, Reader } from "../../core/codec/lib0";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { CFG_FOLD_RULES_VERSION } from "../../core/cfg/fold";
+import { verifyCfgCheckpoint, type CfgVerifyResult } from "../../core/cfg/verify";
+import { verifyNsCheckpoint, type NsVerifyResult } from "../../core/ns/verify";
 import { decodeSnapFoldV1, encodeSnapFoldV1 } from "../../core/codec/snapFoldV1";
 import { SNAP_FOLD_RULES_VERSION, type SnapFoldState } from "../../core/snap/fold";
 import { decodeSnapOps, type SnapOp } from "../../core/snap/record";
@@ -34,6 +34,19 @@ import { checkYjsUpdate } from "./yjsCheck";
  */
 export type StaleCheck = (keyEpoch: number, seq: Seq | null) => "stale" | "hold" | null;
 
+/**
+ * The highest fold rules version this reader implements, per fold (DESIGN §c.10). Production: the constants
+ * (FOLD_RULES_VERSION, CFG_FOLD_RULES_VERSION, SNAP_FOLD_RULES_VERSION); tests raise them to stand in for an
+ * upgraded client (EngineTuning.knownRules).
+ */
+export interface KnownRules {
+	readonly ns: number;
+	readonly cfg: number;
+	readonly snap: number;
+}
+
+export const KNOWN_RULES: KnownRules = { ns: FOLD_RULES_VERSION, cfg: CFG_FOLD_RULES_VERSION, snap: SNAP_FOLD_RULES_VERSION };
+
 export interface GateCtx {
 	readonly crypto: CryptoPort;
 	readonly vaultId: VaultId;
@@ -41,6 +54,8 @@ export interface GateCtx {
 	readonly maxCheckpointStateBytes: number;
 	/** The keyring's answer (keyringRuntime.ts); suite 0 and unpinned answer null. */
 	readonly staleCheck: StaleCheck;
+	/** Default KNOWN_RULES. */
+	readonly knownRules?: KnownRules;
 }
 
 export type GateSubject =
@@ -69,13 +84,21 @@ export interface GateFail {
 	readonly ok: false;
 	readonly reason: QuarantineReason;
 	readonly detail: string;
-	/** Depends on this reader's version/keys: ns/cfg halt, bodies quarantine (retried on upgrade). */
+	/** Depends on this reader's version/keys: ns/cfg/snap halt, bodies quarantine (retried on upgrade or new keys). */
 	readonly readerDependent: boolean;
+	/**
+	 * Reader-dependent because the writer is newer: an envelope formatVersion or suite byte, a checkpoint encoding,
+	 * a fold state formatVersion or a foldRulesVersion this reader does not implement. Only an upgrade opens it
+	 * (phase upgrade-required); the other reader-dependent failures wait for keys or `k`.
+	 */
+	readonly newer: boolean;
 }
 
 export type GateResult = GatePass | GateFail;
 
-const fail = (reason: QuarantineReason, detail: string, readerDependent = false): GateFail => ({ ok: false, reason, detail, readerDependent });
+const fail = (reason: QuarantineReason, detail: string, readerDependent = false, newer = false): GateFail => ({ ok: false, reason, detail, readerDependent, newer });
+/** A newer writer (GateFail.newer). */
+const newer = (detail: string): GateFail => fail("envelope-version", detail, true, true);
 
 const QUARANTINE_REASON: Readonly<Record<EnvelopeOpenFailure, QuarantineReason>> = {
 	"malformed": "envelope-malformed",
@@ -101,7 +124,10 @@ export async function gate(ctx: GateCtx, subject: GateSubject): Promise<GateResu
 	if (!opened.ok) {
 		// auth-failed is reader-dependent only while the epoch's key is unverified (e2ee-design §9.2).
 		const keyVerified = opened.header ? ctx.crypto.keyState(opened.header.keyEpoch).verified : false;
-		return fail(QUARANTINE_REASON[opened.reason], opened.reason, isReaderDependent(opened.reason, keyVerified));
+		// A formatVersion or a suite byte this build does not know (no header: decodeOuter refused it) is a newer
+		// writer; a known suite this port cannot open is a missing key or pin.
+		const isNewer = opened.reason === "unsupported-version" || (opened.reason === "unsupported-suite" && !opened.header);
+		return fail(QUARANTINE_REASON[opened.reason], opened.reason, isReaderDependent(opened.reason, keyVerified), isNewer);
 	}
 	const inner = opened.inner;
 	if (subject.t === "checkpoint") return gateCheckpoint(ctx, cls, subject.coversSeq, inner);
@@ -145,42 +171,80 @@ function staleVerdict(ctx: GateCtx, subject: GateSubject): GateResult | null {
 	return subject.t === "row" ? { ok: true, t: "stale", keyEpoch: e } : fail("stale-epoch", `keyEpoch ${e}`);
 }
 
+/**
+ * A failed ns / cfg verify (core/ns/verify.ts, core/cfg/verify.ts) as a gate failure. Only a newer foldRulesVersion
+ * depends on the reader (§c.10 upgrade-required: catchUp.ts halts the fold at the checkpoint); the rest is the
+ * writer's fault (a disputed checkpoint: re-read the rows without it, or freeze the stream if they are gone).
+ */
+function verifyFail(what: string, v: Extract<NsVerifyResult | CfgVerifyResult, { ok: false }>): GateFail {
+	switch (v.reason) {
+		case "malformed":
+		case "non-canonical": return fail("decode-failed", `${what}: ${v.detail}`);
+		case "covers-seq": return fail("checkpoint-mismatch", `${what}: ${v.detail}`);
+		case "upgrade-required": return newer(`${what}: ${v.detail}`);
+		case "invariant":
+		case "rules-version": return fail("checkpoint-invariant", `${what}: ${v.detail}`);
+	}
+}
+
+/** Highest checkpoint encoding this build knows: a byte above it is a newer writer's, below it a bad one. */
+const MAX_KNOWN_ENCODING = Math.max(...Object.values(CheckpointEncoding));
+
+const ENCODING_OF: Readonly<Record<"ns" | "cfg" | "snap" | "body" | "canvas", CheckpointEncoding>> = {
+	ns: CheckpointEncoding.nsFoldV1, cfg: CheckpointEncoding.cfgFoldV1, snap: CheckpointEncoding.snapFoldV1,
+	body: CheckpointEncoding.yjsStateV1, canvas: CheckpointEncoding.yjsStateV1,
+};
+
+/** The leading varuint of a fold state (its formatVersion), or null when there is none. */
+function leadingVersion(state: Uint8Array): number | null {
+	try {
+		return new Reader(state).varuint();
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Stage 1-2 for checkpoints. Newer-writer cases are checked before any decode, so a format this reader cannot
+ * parse halts (upgrade-required) instead of looking corrupt: an encoding byte above the known ones, a fold state
+ * formatVersion above 1, a foldRulesVersion above KnownRules.
+ */
 async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "snap" | "body" | "canvas", coversSeq: Seq, inner: InnerEnvelope): Promise<GateResult> {
 	const ck = decodeCheckpointContent(inner.content);
-	if (!ck) return fail("decode-failed", "checkpoint content");
+	if (!ck) {
+		const enc = inner.content[0];
+		return enc !== undefined && enc > MAX_KNOWN_ENCODING ? newer(`checkpoint encoding ${enc}`) : fail("decode-failed", "checkpoint content");
+	}
 	if (ck.coversSeq !== coversSeq) return fail("checkpoint-mismatch", `inner ${ck.coversSeq} != relay ${coversSeq}`);
 	if (ck.state.length > ctx.maxCheckpointStateBytes) return fail("oversize", `checkpoint state ${ck.state.length}`);
 	if (ck.encoding === CheckpointEncoding.retired) return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: null };
+	if (ck.encoding !== ENCODING_OF[cls]) return fail("kind-not-allowed", `encoding ${ck.encoding}`);
+	const known = ctx.knownRules ?? KNOWN_RULES;
+	if (cls === "ns" || cls === "cfg" || cls === "snap") {
+		const format = leadingVersion(ck.state);
+		if (format !== null && format > 1) return newer(`${cls} state formatVersion ${format}`);
+		if (ck.foldRulesVersion > known[cls]) return newer(`${cls} foldRulesVersion ${ck.foldRulesVersion}`);
+	}
 	switch (cls) {
 		case "body":
 		case "canvas": {
-			if (ck.encoding !== CheckpointEncoding.yjsStateV1) return fail("kind-not-allowed", `encoding ${ck.encoding}`);
 			const r = checkYjsUpdate(ck.state, cls, { maxBytes: ctx.maxCheckpointStateBytes, maxChars: MAX_DOC_TEXT_CHARS });
 			if (!r.ok) return fail(r.reason, `checkpoint: ${r.detail}`);
 			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: null };
 		}
 		case "ns": {
-			if (ck.encoding !== CheckpointEncoding.nsFoldV1) return fail("kind-not-allowed", `encoding ${ck.encoding}`);
-			if (ck.foldRulesVersion > FOLD_RULES_VERSION) return fail("envelope-version", `foldRulesVersion ${ck.foldRulesVersion}`, true);
-			const st = decodeNsFoldV1(ck.state);
-			if (!st) return fail("decode-failed", "nsFoldV1");
-			// V1 canonical form; V2 subset: coversSeq binding.
-			if (!bytesEqual(encodeNsFoldV1(st), ck.state)) return fail("decode-failed", "nsFoldV1 not canonical");
-			if (st.coversSeq !== coversSeq) return fail("checkpoint-mismatch", "nsFoldV1 coversSeq");
-			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: st, cfgState: null };
+			// V1 (canonical re-encode) + V2 (structural invariants, foldRulesVersion, coversSeq binding), §b.5.
+			const v = verifyNsCheckpoint(ck, coversSeq, { knownRulesVersion: known.ns });
+			if (!v.ok) return verifyFail("nsFoldV1", v);
+			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: v.state, cfgState: null };
 		}
 		case "cfg": {
-			if (ck.encoding !== CheckpointEncoding.cfgFoldV1) return fail("kind-not-allowed", `encoding ${ck.encoding}`);
-			if (ck.foldRulesVersion > CFG_FOLD_RULES_VERSION) return fail("envelope-version", `cfg foldRulesVersion ${ck.foldRulesVersion}`, true);
-			const st = decodeCfgFoldV1(ck.state);
-			if (!st) return fail("decode-failed", "cfgFoldV1");
-			if (!bytesEqual(encodeCfgFoldV1(st), ck.state)) return fail("decode-failed", "cfgFoldV1 not canonical");
-			if (st.coversSeq !== coversSeq) return fail("checkpoint-mismatch", "cfgFoldV1 coversSeq");
-			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: st };
+			// V1 + V2 as ns (§b.5 "Verification is V1 + V2").
+			const v = verifyCfgCheckpoint(ck, coversSeq, known.cfg);
+			if (!v.ok) return verifyFail("cfgFoldV1", v);
+			return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: v.state };
 		}
 		case "snap": {
-			if (ck.encoding !== CheckpointEncoding.snapFoldV1) return fail("kind-not-allowed", `encoding ${ck.encoding}`);
-			if (ck.foldRulesVersion > SNAP_FOLD_RULES_VERSION) return fail("envelope-version", `snap foldRulesVersion ${ck.foldRulesVersion}`, true);
 			const st = decodeSnapFoldV1(ck.state);
 			if (!st) return fail("decode-failed", "snapFoldV1");
 			if (!bytesEqual(encodeSnapFoldV1(st), ck.state)) return fail("decode-failed", "snapFoldV1 not canonical");

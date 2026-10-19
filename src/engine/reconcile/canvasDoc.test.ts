@@ -2,10 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import {
-	canvasToMergeText, formatCanvasText, parseCanvasText, rankCanvasInFileOrder, type CanvasRanked,
+	canvasToMergeText, formatCanvasText, parseCanvasText, type CanvasRanked,
 } from "../../core/hash/canvasCanonical";
+import { rankCanvasInFileOrder } from "../../core/hash/testkit/canvasRanks";
 import { canvasHashRef, refHashPort as H } from "../../core/hash/testkit/hashRef";
-import { utf8Encode } from "../../core/hash/utf8";
+import { utf8Encode } from "../../core/codec/lib0";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
 import { applyCanvas, canvasDocHashInput, emptyCanvas, projectCanvasBytes, projectionHash, projectRanked, readCanvas, type CanvasProjection } from "./canvasDoc";
 import { mergeCanvasSides, parseDiskCanvas, parseMergeText } from "./canvasMerge";

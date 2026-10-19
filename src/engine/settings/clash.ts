@@ -5,7 +5,7 @@
  * (community-plugins.json). While one is, settings sync emits and applies
  * nothing; note sync is not affected. Pure.
  */
-import { utf8Decode } from "../../core/hash/utf8";
+import { utf8Decode } from "../../core/codec/lib0";
 
 export const CFG_CORE_PLUGINS_FILE = "core-plugins.json";
 /** Clashing plugin ids -> display names, in detection order (Obsidian Sync first). */

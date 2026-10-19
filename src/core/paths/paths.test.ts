@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { caseFold15_1, foldKey, pathKey, prefixKeys } from "./pathKey";
+import { caseFold15_1, foldKey, pathKey } from "./pathKey";
 import { isAssigned15_1, isValidPath, pathInvalidReason } from "./validate";
-import { dropLastCodePoint, splitExt, stripTrailingDotsSpaces, utf8ByteLength } from "./segments";
+import { utf8ByteLength } from "../codec/lib0";
+import { dropLastCodePoint, splitExt, stripTrailingDotsSpaces } from "./segments";
 import { CASE_FOLD_15_1 } from "./casefold15_1";
 import { ASSIGNED_15_1 } from "./assigned15_1";
 
@@ -58,16 +59,9 @@ test("pathKey: legacy collision fixtures (pathCollision.ts) under the new key", 
 	assert.equal(isValidPath("./notes/file.md"), false, "leading ./ is invalid, not normalized");
 });
 
-test("pathKey is segment-wise and prefixKeys matches", () => {
+test("pathKey is segment-wise", () => {
 	const samples = ["Notes/Sub/A.md", "Maße/ΟΔΟΣ/İ.png", "x", "J̌/ß", "K/Å/a"];
-	for (const p of samples) {
-		const segs = p.split("/");
-		assert.equal(k(p), segs.map(foldKey).join("/"));
-		const pk = prefixKeys(p);
-		assert.equal(pk.length, segs.length);
-		assert.equal(pk[pk.length - 1], k(p));
-		for (let i = 0; i < segs.length; i++) assert.equal(pk[i], k(segs.slice(0, i + 1).join("/")));
-	}
+	for (const p of samples) assert.equal(k(p), p.split("/").map(foldKey).join("/"));
 });
 
 test("pathKey: ASCII fast path equals the table path", () => {

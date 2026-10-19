@@ -2,10 +2,10 @@
 
 import type {
 	BodyVersion, ContentHash, DiskFingerprint, DocId, LocalEntry, PathKey, PlannerInput, RemoteEntry, StreamName, SyncedEntry,
-} from "../types";
-import { kindOfPath } from "../types";
-import { DEFAULT_BRAKE } from "./brake";
-import { standInPathKey } from "./pathRules";
+} from "../../types";
+import { kindOfPath } from "../../types";
+import { DEFAULT_BRAKE } from "../brake";
+import { standInPathKey } from "../pathRules";
 
 export const pk = standInPathKey;
 export const h = (s: string): ContentHash => `h-${s}` as ContentHash;
