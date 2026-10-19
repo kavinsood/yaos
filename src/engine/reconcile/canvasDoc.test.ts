@@ -9,7 +9,7 @@ import { canvasHashRef, refHashPort as H } from "../../core/hash/testkit/hashRef
 import { utf8Encode } from "../../core/codec/lib0";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
 import { applyCanvas, canvasDocHashInput, emptyCanvas, projectCanvasBytes, projectionHash, projectRanked, readCanvas, type CanvasProjection } from "./canvasDoc";
-import { mergeCanvasSides, parseDiskCanvas, parseMergeText } from "./canvasMerge";
+import { canvasMergeStats, mergeCanvasSides, parseDiskCanvas, parseMergeText } from "./canvasMerge";
 
 type Obj = Record<string, unknown>;
 const textNode = (id: string, text: string, x = 0): Obj => ({ id, type: "text", text, x, y: 0, width: 100, height: 50 });
@@ -203,4 +203,46 @@ test("canvasMerge: no base -> identical when equal (formatting ignored), else co
 	const p = projectRanked(r2.target);
 	assert.ok(p.ok);
 	assert.deepEqual(p.hashInput, crdt.hashInput);
+});
+
+test("canvasMerge: a merged text that does not validate is a conflict keeping the CRDT (disk re-ranks a node the CRDT edited)", () => {
+	// Disk brings a to the front (its line moves to the end), the CRDT resizes a. The line merge conflicts on a's old
+	// line and takes the disk's new line cleanly: two lines for a. That text is rejected, not half-applied.
+	const disk = canvasJson([textNode("b", "B"), textNode("c", "C", 7), textNode("a", "A")], [edge("e", "a", "b")]);
+	const rejected0 = canvasMergeStats.rejected;
+	const { d, out } = sides(BASE, disk, (doc) => nodeMap(doc, "a").set("width", 300));
+	assert.equal(canvasMergeStats.rejected - rejected0, 1);
+	assert.equal(out.kind, "conflict");
+	assert.equal(out.reason, "both-edited");
+	assert.equal(canvasToMergeText(out.target), canvasToMergeText(project(d).ranked), "target = the CRDT side, unchanged");
+	assert.equal(JSON.parse(out.projection.text).nodes.find((n: Obj) => n.id === "c").x, 0, "the clean disk hunk goes to the conflict copy only");
+});
+
+test("canvasDoc: a field holding a value canonical JSON rejects (a peer's NaN) is replaced by the applied value", () => {
+	const d = docOf(BASE);
+	nodeMap(d, "a").set("x", Number.NaN);
+	assert.equal(readCanvas(d).ok, false, "NaN geometry is not a valid canvas");
+	applyCanvas(d, null, ranked(BASE));
+	assert.equal(nodeMap(d, "a").get("x"), 0);
+	assert.ok(readCanvas(d).ok);
+});
+
+test("canvasDoc: hostile CRDT records (not a map, bad rank, invalid edge, nested type) are reported, never projected", () => {
+	const reason = (edit: (d: Y.Doc) => void): string => {
+		const d = docOf(BASE);
+		edit(d);
+		const r = readCanvas(d);
+		assert.equal(r.ok, false);
+		return r.ok ? "" : r.reason;
+	};
+	assert.equal(reason((d) => d.getMap<unknown>("nodes").set("z", "plain string")), "node z: not a map");
+	assert.equal(reason((d) => nodeMap(d, "a").set("rank", 7)), "node a: bad rank");
+	assert.equal(reason((d) => (d.getMap<unknown>("edges").get("e") as Y.Map<unknown>).set("rank", "r".repeat(200))), "edge e: bad rank");
+	assert.equal(reason((d) => d.getMap<unknown>("edges").set("f", 1)), "edge f: not a map");
+	assert.equal(reason((d) => (d.getMap<unknown>("edges").get("e") as Y.Map<unknown>).set("fromNode", 5)), "edge e: invalid");
+	// A nested Y type reads as its JSON: a Y.Array where the geometry must be a number is an invalid node.
+	assert.equal(reason((d) => nodeMap(d, "b").set("x", new Y.Array())), "node b: invalid");
+	assert.equal(projectCanvasBytes(docOf(BASE)).ok, true);
+	const big = parseDiskCanvas(utf8Encode(JSON.stringify({ nodes: Array.from({ length: 20_001 }, (_, i) => ({ ...textNode(`n${i}`, ""), id: `n${i}` })), edges: [] })));
+	assert.deepEqual(big.ok ? null : big.reason, "oversized nodes 20001 > 20000");
 });

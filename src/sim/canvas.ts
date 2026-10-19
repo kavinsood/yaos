@@ -492,11 +492,6 @@ export class CanvasWorld {
 
 	constructor(private readonly w: CanvasActorWorld, private readonly clock: VirtualClock, private readonly opts: CanvasOptions = {}) {}
 
-	/** Pending completions of broken saves. */
-	pendingFixes(): number {
-		return this.fixes.size;
-	}
-
 	private recPick(pick: number): number {
 		return this.opts.hot ? pick ** 3 : pick;
 	}

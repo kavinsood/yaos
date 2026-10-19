@@ -7,7 +7,7 @@ import { refHashPort as H } from "./testkit/hashRef";
 import { utf8Encode } from "../codec/lib0";
 import { canonicalizeMarkdown, exactFingerprint, markdownContentHash } from "./markdownLf";
 import {
-	canonicalCanvasBytes, canvasContentHash, canvasFromMergeText, canvasJsonValue, canvasLogicalHash, canvasToMergeText, formatCanvasText,
+	CANVAS_LIMITS, canonicalCanvasBytes, canvasContentHash, canvasFromMergeText, canvasJsonValue, canvasLogicalHash, canvasToMergeText, formatCanvasBytes, formatCanvasText,
 	parseCanvasBytes, parseCanvasText,
 } from "./canvasCanonical";
 import { rankCanvasInFileOrder } from "./testkit/canvasRanks";
@@ -79,6 +79,7 @@ test("canvas parse/canonical/format", async () => {
 	assert.ok(formatted.includes('\n\t"nodes": ['));
 	// Formatting round-trips to the same logical hash.
 	const fmtBytes = utf8Encode(formatted);
+	assert.deepEqual(formatCanvasBytes(parsed.data), fmtBytes);
 	assert.equal(await canvasContentHash(H, fmtBytes), await canvasContentHash(H, utf8Encode(JSON.stringify(SAMPLE))));
 	assert.equal(parseCanvasBytes(utf8Encode('{"nodes":[{"id":"a"}]}')).kind, "invalid");
 	assert.equal(parseCanvasBytes(utf8Encode('{"nodes":[],"edges":[{"id":"e","fromNode":"x","toNode":"y"}]}')).kind, "invalid");
@@ -86,6 +87,23 @@ test("canvas parse/canonical/format", async () => {
 	// Invalid canvases still hash stably (raw bytes).
 	const bad = utf8Encode("{not json");
 	assert.equal(await canvasContentHash(H, bad), sha256Hex(bad));
+});
+
+test("canvas limits: raw bytes, node and edge counts, canonical bytes -> oversized (never parsed into a merge)", () => {
+	const node = (i: number) => ({ id: `n${i}`, type: "text", text: "", x: 0, y: 0, width: 1, height: 1 });
+	const of = (v: unknown) => parseCanvasBytes(utf8Encode(JSON.stringify(v)));
+	const huge = of({ nodes: [{ ...node(0), text: "x".repeat(CANVAS_LIMITS.canonicalBytes * 2) }], edges: [] });
+	assert.deepEqual(huge.kind === "oversized" && huge.limit, "canonicalBytes", "raw bytes over twice the canonical limit");
+	const many = of({ nodes: Array.from({ length: CANVAS_LIMITS.nodes + 1 }, (_, i) => node(i)), edges: [] });
+	assert.deepEqual(many.kind === "oversized" && [many.limit, many.measured], ["nodes", CANVAS_LIMITS.nodes + 1]);
+	const edges = Array.from({ length: CANVAS_LIMITS.edges + 1 }, (_, i) => ({ id: `e${i}`, fromNode: "n0", toNode: "n0" }));
+	const wired = of({ nodes: [node(0)], edges });
+	assert.deepEqual(wired.kind === "oversized" && wired.limit, "edges");
+	// Under the raw-byte bound and every per-field limit, over the canonical one (unknown fields of 200 KiB each).
+	const fat = (n: number) => of({ nodes: Array.from({ length: n }, (_, i) => ({ ...node(i), z: "x".repeat(200 * 1024) })), edges: [] });
+	const big = fat(6);
+	assert.deepEqual(big.kind === "oversized" && big.limit, "canonicalBytes", "canonical bytes over the limit");
+	assert.equal(fat(4).kind, "valid");
 });
 
 test("canvas merge text round-trips and is one record per line", () => {
@@ -135,4 +153,22 @@ test("canvas ranks", () => {
 	assert.equal(re.rebalanced, false);
 	assert.equal(re.ranks.get("a"), ranks.get("a"));
 	assert.ok(re.ranks.get("x")! > ranks.get("a")! && re.ranks.get("x")! < ranks.get("b")!);
+	// Repeated "send to back": each new first record halves the gap below the old one until none is left, and the
+	// whole order is re-ranked from scratch, in the desired order.
+	let order = ["a", "b", "c"];
+	let cur: Map<string, string> = ranks;
+	let rebalances = 0;
+	for (let i = 0; i < 12; i++) {
+		order = [`s${i}`, ...order];
+		const r = reconcileCanvasRanks(order, cur);
+		if (r.rebalanced) {
+			rebalances++;
+			assert.deepEqual(r.ranks, initialCanvasRanks(order));
+		}
+		cur = r.ranks;
+		assert.deepEqual([...cur.entries()].sort((x, y) => (x[1] < y[1] ? -1 : 1)).map(([id]) => id), order);
+	}
+	assert.equal(rebalances, 1, "ten halvings of the first gap, then one rebalance");
+	assert.equal(rankBetween("0000001!", null), null, "a malformed rank allocates nothing");
+	assert.equal(rankBetween(null, "zzzzzzzzzzzz"), null, "a rank past 2^53 allocates nothing");
 });
