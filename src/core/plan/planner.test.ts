@@ -71,6 +71,27 @@ test("row live/present/present: remote move onto an untracked copy of the doc's 
 	assert.equal(find(other, "nsCreate").path, "b.md");
 });
 
+test("row live/present/present: S behind a move (stale mirror), the doc's bytes at R.path and other bytes at S.path -> the doc is at R.path", () => {
+	// Sim seed 630 F DEV3 (production checkpoints): after an IDB loss B's S for its attachment came back from a mirror
+	// older than the fold's suffix move a2 -> "a2 (2)"; C's attachment had taken a2. The planner trashed B's own
+	// file at "a2 (2)" as a copy, moved C's file there and pushed C's bytes as an edit of B's attachment.
+	const base = { remote: [R("d9", "a (2).png")], synced: [S("d9", "a.png")] };
+	const p = run({ ...base, local: [L("a.png", h("b9")), L("a (2).png", h("b0"))] });
+	assert.deepEqual(p.ops, [{ op: "syncedPut", entry: { ...S("d9", "a (2).png"), fingerprint: fp("b0") } }]);
+	// next pass, S moved: the other file is new
+	const next = run({ ...base, synced: [S("d9", "a (2).png", { fingerprint: fp("b0") })], local: [L("a.png", h("b9")), L("a (2).png", h("b0"))] });
+	assert.deepEqual(opsOf(next), ["nsCreate", "pushBlob"]);
+	assert.equal(find(next, "nsCreate").path, "a.png");
+	// the remote changed the doc since S: no claim from bytes (the file at S.path stays the doc's, as before)
+	const changed = run({ remote: [R("d9", "a (2).png", { blob: { hash: h("b5"), size: 10, rev: 51 } })], synced: [S("d9", "a.png")], local: [L("a.png", h("b9")), L("a (2).png", h("b0"))] });
+	assert.equal(find(changed, "conflictCopy").from, "a.png");
+	assert.ok(!changed.ops.some((o) => o.op === "syncedPut" && o.entry.docId === "d9" && o.entry.path === "a (2).png"));
+	// markdown: the same rule, through the remote text hash
+	const md = planWith(input({ remote: [R("d1", "b.md")], synced: [S("d1", "a.md")], local: [L("a.md", h("c9")), L("b.md", h("c0"))] }), { remoteTextHash: new Map([[id("d1"), h("c0")]]) });
+	assert.deepEqual(opsOf(md), ["syncedPut"]);
+	assert.equal(find(md, "syncedPut").entry.path, "b.md");
+});
+
 test("row live/present/present: markdown content Rc / Lc / both -> reconcileContent", () => {
 	const rc = run({ remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(12) } })], synced: [S("d1", "a.md")], local: [L("a.md", h("c0"))] });
 	assert.deepEqual(rc.ops, [{ op: "reconcileContent", docId: "d1", path: "a.md", kind: "markdown", hasBase: true }]);

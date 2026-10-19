@@ -239,13 +239,24 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		// rename took it (sim DEV3 F seed 452: the doc's file renamed n6 -> r4 offline, another note n4 -> r2,
 		// the doc moved to r2 by a peer; r2's note merged into the doc as a conflict and r4 became a duplicate).
 		const l = s.fileGone ? undefined : input.local.get(s.pathKey);
+		const movable = r !== undefined && r.state === "live" && r.pathKey !== s.pathKey && !syncedByKey.has(r.pathKey) && !arrivedElsewhere(r.pathKey, s);
+		const atR = movable ? input.local.get(r.pathKey) : undefined;
+		if (l && atR && ownBytesAt(s, r!, l, atR)) return { l: atR, atRemote: true };
 		if (l) return { l, atRemote: false };
-		if (r && r.state === "live" && r.pathKey !== s.pathKey && !syncedByKey.has(r.pathKey) && !arrivedElsewhere(r.pathKey, s)) {
-			const atR = input.local.get(r.pathKey);
-			if (atR) return { l: atR, atRemote: true };
-		}
+		if (atR) return { l: atR, atRemote: true };
 		return { l: undefined, atRemote: false };
 	};
+	/**
+	 * S is behind a move of the doc (an S restored from a mirror older than the move, after an IDB loss): the file at
+	 * the doc's remote path holds S's bytes, which are still the doc's current ones, and the file at S's path holds
+	 * other bytes. The doc's file is the one at the remote path; the other is a new file (another doc's, which took
+	 * S's old path). Taking the file at S's path instead trashed the doc's own file as a copy (`ownCopyAt`) and
+	 * pushed the other file's bytes as an edit of the doc (sim seed 630 F DEV3, production checkpoints: B's
+	 * attachment got C's bytes at the same path).
+	 */
+	const ownBytesAt = (s: SyncedEntry, r: RemoteEntry, l: LocalEntry, atR: LocalEntry): boolean =>
+		!atR.excluded && atR.kind === s.kind && l.hash !== null && atR.hash !== null &&
+		atR.hash === s.contentHash && l.hash !== s.contentHash && remoteHash(r) === s.contentHash;
 
 	// ---- remote moves into occupied paths ---------------------------------------
 	// A file at a live remote entry's path is that doc's, unless the doc is synced at another path and its file is
