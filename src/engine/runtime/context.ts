@@ -262,8 +262,15 @@ export class EngineCtx {
 	livePhase(): EnginePhase {
 		if (this.gate() !== null) return "key-missing";
 		if (this.upgradeHalted.size > 0) return "upgrade-required";
+		if (this.startReadsPending) return "catching-up";
 		return this.dailyLimitUntilMono > this.mono() ? "daily-limit" : "live";
 	}
+
+	/**
+	 * The session's ns and cfg reads have not completed yet (sessionLoop afterStartReads): a read held for a key or
+	 * failed keeps the phase catching-up, as the planner takes a live phase for ns caught up.
+	 */
+	startReadsPending = true;
 
 	/**
 	 * A caught-up session's phase follows a change of the gate or the folds; other phases are left alone, and so is
@@ -271,7 +278,8 @@ export class EngineCtx {
 	 */
 	refreshLivePhase(): void {
 		const p = this.phase;
-		if (p === "live" || p === "daily-limit" || p === "key-missing" || (p === "upgrade-required" && this.session)) this.setPhase(this.livePhase());
+		const caughtUp = p === "live" || p === "daily-limit" || p === "key-missing" || (p === "upgrade-required" && this.session);
+		if (caughtUp || (p === "catching-up" && this.session && !this.startReadsPending)) this.setPhase(this.livePhase());
 	}
 
 	/**

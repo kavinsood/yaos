@@ -80,6 +80,20 @@ test("sim: rows forged by the last step are still released by the user after the
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Suite-1 seed 163 (2 devices, fault-heavy): A's IndexedDB was wiped and its ns read stayed held (a checkpoint under
+// a key it lacked). It created docs meanwhile with ns frameNos 65.., numbers its earlier frames had used, and the
+// ns sends were open although the read had not completed: every reader ignored the frame as replay-duplicate, the
+// creates never folded and their bodies were held for ever (e2ee-design §8.2).
+// Seed 51 (same matrix): A's IndexedDB was wiped and its ns/cfg reads failed (HTTP down) while the socket was up. It
+// went live anyway: the planner trashed its synced files against the empty ns view, and its new creates went out as
+// replay-stale frames, lost. The phase stays catching-up and the ns sends closed until the reads complete.
+test("sim: ns frames allocated before a lost store read ns are not ignored as replays (suite-1 seeds 163, 51)", async () => {
+	for (const seed of [163, 51]) {
+		const r = await runSim({ seed, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+		assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), [], `seed ${seed}`);
+	}
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */

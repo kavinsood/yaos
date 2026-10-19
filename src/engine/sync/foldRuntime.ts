@@ -96,6 +96,8 @@ export abstract class FoldRuntime<Op, E> {
 	private ownFrameNoSeen = 0;
 	/** The first allocation of this runtime skips NS_DEDUPE_RING numbers (e2ee-design §8.2). */
 	private allocated = false;
+	/** Highest frameNo this runtime allocated (or renumbered to). */
+	private allocatedMax = 0;
 	/** Floor carried by epoch migration (meta frameNoFloor). */
 	frameNoFloor = 0;
 	/** coversSeq of a stored snapshot reset() could not use (the state started empty), else null. */
@@ -127,6 +129,8 @@ export abstract class FoldRuntime<Op, E> {
 	abstract encodeState(): Uint8Array;
 	/** This device's replay right edge R in the committed fold (0 = none). */
 	protected abstract ownReplayEdge(): number;
+	/** This device's clientFrameIds in the committed fold's duplicate-frame ring (the newest 64). */
+	protected abstract ownRecentFrames(): readonly ClientFrameId[];
 
 	/** Why the fold stopped (a row halt first), or null. */
 	get halted(): FoldHalt | null {
@@ -276,16 +280,55 @@ export abstract class FoldRuntime<Op, E> {
 	 * frameNo known (fold R, own tail rows and receipts above the fold, the
 	 * outbox incl. poisoned, the epoch-migration floor, earlier allocations).
 	 * The first allocation of a runtime adds NS_DEDUPE_RING, skipping numbers
-	 * an in-flight frame may have used when IndexedDB was lost. Gaps are fine.
+	 * an in-flight frame may have used when IndexedDB was lost, and so does the
+	 * first one after the fold showed an own frame above every allocation of
+	 * this runtime (they were made blind). Gaps are fine.
 	 */
 	allocFrameNo(outbox: OutboxCache): number {
 		let max = this.maxOwnFrameNo(outbox);
-		if (!this.allocated) {
+		// The skip again once the fold shows an own frame above all this runtime allocated: the earlier allocations
+		// were made without this store's committed frames (IndexedDB lost, the stream not read yet).
+		if (!this.allocated || this.committedOwnMax() > this.allocatedMax) {
 			max += NS_DEDUPE_RING;
 			this.allocated = true;
 		}
 		this.ownFrameNoSeen = max + 1;
+		this.allocatedMax = max + 1;
 		return max + 1;
+	}
+
+	/** Highest own frameNo committed or receipted: fold R, own frames above the fold, the migration floor (§8.2). */
+	committedOwnMax(): number {
+		let max = Math.max(this.ownReplayEdge(), this.frameNoFloor);
+		for (const f of this.committedOwn) max = Math.max(max, f.frameNo);
+		return max;
+	}
+
+	/**
+	 * Own outbox frames to number again before ns/cfg sends open (e2ee-design §8.2): a store that lost IndexedDB
+	 * allocates from what it knows, so a frame allocated before it read the stream can take a number its committed
+	 * frames already used, and every reader would ignore it as a replay. Once the stream is read, a frame at or below
+	 * the committed edge whose id is not in the fold's ring is such a frame: one allocated with the edge known is
+	 * above it, and one that did commit (a frame recovered from the outbox mirror whose row a checkpoint covers, so no
+	 * late receipt came) is in the ring and keeps its bytes, its resend deduped. Then every own frame of the stream
+	 * not in the ring (all allocated as blindly) takes a new number in outbox order from above every own number
+	 * known + NS_DEDUPE_RING, as a first allocation would; [] when none collides.
+	 */
+	async renumberBlind(outbox: OutboxCache): Promise<{ readonly rec: OutboxRecord; readonly frameNo: number }[]> {
+		let edge = this.committedOwnMax();
+		// Own rows stored above the fold (a halted fold has not reached them) are committed too.
+		for (const r of await this.repo.getTail(this.stream, this.coversSeq)) if (r.deviceId === this.self) edge = Math.max(edge, r.frameNo ?? 0);
+		const ring = new Set(this.ownRecentFrames());
+		const recs = outbox.ofStream(this.stream);
+		const unsent = recs.filter((r) => r.state !== "poisoned" && !ring.has(r.clientFrameId));
+		if (!unsent.some((r) => (r.frameNo ?? 0) <= edge)) return [];
+		let next = edge + NS_DEDUPE_RING;
+		for (const r of recs) if (!unsent.includes(r)) next = Math.max(next, r.frameNo ?? 0);
+		const out = unsent.map((rec) => ({ rec, frameNo: ++next }));
+		this.seeFrameNo(next);
+		this.allocated = true;
+		this.allocatedMax = next;
+		return out;
 	}
 
 	/** Highest own frameNo this runtime knows of (epoch migration carries it, §8.2). */

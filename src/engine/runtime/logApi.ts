@@ -21,6 +21,7 @@ import {
 	type CfgFoldState, type CfgOp, type ClientFrameId, type DocId, type DocKind, type NsFoldIndex, type NsFoldState, type NsOp, type RemoteBodyInfo, type Seq,
 } from "../../core/types";
 import { buildCfgFrame, buildNsFrame, buildSnapFrame } from "../body/frames";
+import { sealFrame } from "../ingest/envelope";
 import type { NewOutboxFrame } from "../store/repo";
 import type { FoldHalt } from "../sync/foldRuntime";
 import type { EngineCtx } from "./context";
@@ -91,6 +92,31 @@ export async function submitCfg(c: EngineCtx, ops: readonly CfgOp[]): Promise<Cl
 		for (const part of parts) frames.push(await buildCfgFrame(c.deps, CFG_STREAM, part, c.ns.coversSeq, c.cfg.allocFrameNo(c.outbox), c.now()));
 		c.addOutbox(await c.repo.tEdit(frames));
 		return frames.map((f) => f.clientFrameId);
+	});
+}
+
+/**
+ * Before ns/cfg sends open, once both streams are read (sessionLoop): own frames allocated before this store knew its
+ * committed frames are numbered again and sealed again under their own ids (FoldRuntime.renumberBlind, e2ee-design
+ * §8.2). On the edit chain, so no allocation runs meanwhile and frameNo order stays outbox order.
+ */
+export function renumberBlindFrames(c: EngineCtx): Promise<void> {
+	return c.docs.chain(async () => {
+		for (const rt of [c.ns, c.cfg]) {
+			const plan = await rt.renumberBlind(c.outbox);
+			if (plan.length === 0) continue;
+			const changes = [];
+			for (const { rec, frameNo } of plan) {
+				const s = await sealFrame(c.deps.crypto, c.opts.vaultId, {
+					stream: rec.stream, deviceId: c.self, clientFrameId: rec.clientFrameId, kind: rec.kind, authorNsSeq: rec.authorNsSeq, flags: rec.flags, frameNo, content: rec.content,
+				});
+				changes.push({ t: "reseal" as const, clientFrameId: rec.clientFrameId, fromEpoch: rec.keyEpoch, fromLength: rec.sealed.length, fromFrameNo: rec.frameNo, next: { clientFrameId: rec.clientFrameId, sealed: s.sealed, keyEpoch: s.keyEpoch, frameNo } });
+			}
+			if (c.stopped) return;
+			const res = await c.repo.tOutbox(changes);
+			c.applyOutboxResult(res);
+			c.diag("frame-renumbered", { stream: rt.stream, frames: res.renamed.length, from: plan[0]!.rec.frameNo, to: plan[0]!.frameNo });
+		}
 	});
 }
 

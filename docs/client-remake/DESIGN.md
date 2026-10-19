@@ -1174,7 +1174,11 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 **Reconnect order:**
 1. feed;
 2. ns, cfg and snap reads (their late receipts remove outbox records);
-3. resend the remaining ns/cfg frames under the send window, then snap frames;
+3. resend the remaining ns/cfg frames under the send window, then snap frames. They wait until both reads
+   completed in this session (a held or failed read keeps them back until a later one completes), and own frames
+   numbered at or below the committed edge are numbered again first (e2ee-design §8.2, a store that lost IDB).
+   Until then the phase stays catching-up (key-missing and upgrade-required still show): the planner takes a live
+   phase for ns caught up, and an unread ns after IDB loss would read as every synced file deleted remotely;
 4. body frames are resent right after `VAULT_READY`, because CRDT idempotence makes duplicates harmless.
 
 The planner does no destructive work until ns is caught up (§f.2).

@@ -156,9 +156,10 @@ export type OutboxChange =
 	| { readonly t: "state"; readonly clientFrameId: ClientFrameId; readonly state: OutboxState }
 	/**
 	 * pending only, still sealed under `fromEpoch` with `fromLength` bytes: sealed again under the current epoch
-	 * (e2ee-design §14.2 step 4), under `next.clientFrameId` (its own for ns/cfg, a fresh one otherwise).
+	 * (e2ee-design §14.2 step 4), under `next.clientFrameId` (its own for ns/cfg, a fresh one otherwise). Also a
+	 * renumbered ns/cfg frame (`next.frameNo`, FoldRuntime.renumberBlind), still numbered `fromFrameNo`.
 	 */
-	| { readonly t: "reseal"; readonly clientFrameId: ClientFrameId; readonly fromEpoch: number; readonly fromLength: number; readonly next: { readonly clientFrameId: ClientFrameId; readonly sealed: Uint8Array; readonly keyEpoch: number } };
+	| { readonly t: "reseal"; readonly clientFrameId: ClientFrameId; readonly fromEpoch: number; readonly fromLength: number; readonly fromFrameNo: number | null; readonly next: { readonly clientFrameId: ClientFrameId; readonly sealed: Uint8Array; readonly keyEpoch: number; readonly frameNo?: number } };
 
 export class Repo {
 	readonly cursor: CursorTracker;
@@ -640,7 +641,7 @@ export class Repo {
 						tx.put(STORE.outbox, n);
 						updated.push(n);
 					} else if (c.t === "reseal") {
-						if (r.state !== "pending" || r.keyEpoch !== c.fromEpoch || r.sealed.length !== c.fromLength) continue;
+						if (r.state !== "pending" || r.keyEpoch !== c.fromEpoch || r.sealed.length !== c.fromLength || r.frameNo !== c.fromFrameNo) continue;
 						const n: OutboxRecord = { ...r, ...c.next };
 						await rename(tx, r, n, updated);
 						renamed.push({ old: r, next: n });

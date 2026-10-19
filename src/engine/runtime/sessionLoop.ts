@@ -4,7 +4,8 @@
  * keyringRuntime.sendReady) -> feed to the session head -> live
  * queue on -> `k` read (e2ee-design §9.3: keys first) -> ns/cfg reads (late
  * receipts) -> ns window open -> held release -> live; then stale streams are
- * read with bounded concurrency. A device that may read only `k` (§12.4: no
+ * read with bounded concurrency. The ns window and the live phase wait until
+ * the ns and cfg reads completed (afterStartReads). A device that may read only `k` (§12.4: no
  * pin, or a vault its pin cannot read) stops after the `k` read in key-missing.
  *
  * Catch-up reads are batched when the relay has the batch form (limits.readBatchStreams > 1): one request reads
@@ -24,6 +25,7 @@ import type { ReadPage, ReadRequest, RelayConnectResult, RelayEvent, RelaySessio
 import { readStream, staleOrder, type ReadResult } from "../sync/catchUp";
 import type { EngineCtx } from "./context";
 import { connectFailure, newReconnectState, sessionClosed, type ReconnectDecision } from "./relayPolicy";
+import { renumberBlindFrames } from "./logApi";
 import { regateUnopened, retryReaderQuarantine } from "./quarantineRelease";
 
 type Closed = Extract<RelayEvent, { t: "closed" }>;
@@ -143,6 +145,7 @@ export class SessionLoop {
 		}
 		const gen = ++c.gen;
 		c.session = session;
+		c.startReadsPending = true;
 		this.netDown = false;
 		this.stats.sessions++;
 		this.backpressureFlag = false;
@@ -172,8 +175,10 @@ export class SessionLoop {
 			if (gen !== c.gen) return;
 			await this.readInOrder([NS_STREAM, CFG_STREAM, SNAP_STREAM].filter((s) => c.repo.stream(s)?.stale));
 			if (gen !== c.gen) return;
-			c.sender.openNs();
+			this.nsGen = gen;
 			await c.refold(false);
+			if (gen !== c.gen) return;
+			await this.afterStartReads(gen);
 			if (gen !== c.gen) return;
 			c.setPhase(c.livePhase());
 			this.st = newReconnectState();
@@ -440,6 +445,34 @@ export class SessionLoop {
 		for (const st of rest) await this.runRead(st);
 	}
 
+	/** Session whose start reached the ns/cfg reads: from then on a completed read of either may finish the start. */
+	private nsGen = -1;
+
+	/**
+	 * The end of a session start, once ns and cfg are read in this session (a read held for a key or failed waits for
+	 * a later read that completes; postRead calls this again):
+	 *  - ns/cfg sends open: the late-receipt reads ran (DESIGN §d.7) and the own committed frames are known
+	 *    (e2ee-design §8.2), so own frames allocated before that are renumbered first (renumberBlindFrames);
+	 *  - the phase may go live (EngineCtx.livePhase: catching-up until then, key-missing / upgrade-required first):
+	 *    the planner takes a live phase for ns caught up, and an empty ns view after IDB loss reads as "every
+	 *    synced file deleted remotely".
+	 * A read held for a newer writer counts as read: the fold halts there (upgrade-required) until a restart.
+	 */
+	private async afterStartReads(gen: number): Promise<void> {
+		const c = this.c;
+		if (gen !== c.gen || this.nsGen !== gen || c.stopped) return;
+		const read = (s: StreamName) => !c.repo.stream(s)?.stale || (this.isHeld(s) && this.held.get(s)!.upgrade);
+		if (!read(NS_STREAM) || !read(CFG_STREAM)) return;
+		if (!c.sender.nsWindowOpen) {
+			await renumberBlindFrames(c);
+			if (gen !== c.gen || c.stopped) return;
+			c.sender.openNs();
+		}
+		if (!c.startReadsPending) return;
+		c.startReadsPending = false;
+		c.refreshLivePhase();
+	}
+
 	private async postRead(stream: StreamName, res: ReadResult): Promise<void> {
 		const c = this.c;
 		if (res.t === "retry" || (res.t === "aborted" && res.error)) this.readBackoff.set(stream, c.mono() + c.tuning.readBackoffMs);
@@ -454,6 +487,7 @@ export class SessionLoop {
 		}
 		if (res.rows > 0 || res.t === "done") c.lastSyncedAtMs = c.now();
 		await c.afterStored({ ...res, live: false, read: { stream, done: res.t === "done", checkpointState: res.checkpointState, replacedFold: res.replacedFold } });
+		if (res.t === "done" && (stream === NS_STREAM || stream === CFG_STREAM)) await this.afterStartReads(c.gen);
 	}
 
 	/**

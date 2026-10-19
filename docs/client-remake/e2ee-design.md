@@ -459,6 +459,18 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
     that a frame may have used while it was in flight when IndexedDB was lost.
   - Allocation and the outbox write share the engine's edit chain (`src/engine/runtime/logApi.ts`), so frameNo
     order is outbox order.
+  - **A store that lost IndexedDB** knows its own committed frames only once it has read the stream, so a frame it
+    allocates before that (offline, or while the read is held for a key or failing) can take a number its earlier
+    frames already used; every reader would ignore it as a replay and its ops would be lost. So ns/cfg sends open
+    only once both streams are read in the session (a held or failed read keeps them closed, and the phase
+    catching-up, until a later read completes). First, when an own unsent frame sits at or below the committed edge
+    (fold R, own rows above the fold, the floor) and its clientFrameId is not in the fold's ring, every own frame of
+    the stream not in the ring is numbered again, in outbox order from above every own number known +
+    NS_DEDUPE_RING, and sealed again under its own id (`FoldRuntime.renumberBlind`, `renumberBlindFrames`,
+    `SessionLoop.afterStartReads`). A frame allocated with the edge known is above it. A frame in the ring did
+    commit (one recovered from the outbox mirror whose row a checkpoint covers gets no late receipt): it keeps its
+    bytes and its resend is deduped. Later allocations skip NS_DEDUPE_RING again once the fold shows an own frame
+    above every allocation of the runtime.
   - No new persistent counter: the fold state (in IDB and in checkpoints), own tail rows and the outbox already
     hold it.
   - Epoch migration (DESIGN §c.12 step 3) carries the device's highest own frameNo per stream into the new DB as
