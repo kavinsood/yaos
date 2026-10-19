@@ -163,6 +163,8 @@ s.test("codec: APPEND round-trips; malformed, trailing, invalid names and oversi
 	assert.deepEqual(decodeServerFrame(encodeCommitted({ ...identity, seq: 300, payload: bytes("c") })),
 		{ kind: "committed", seq: 300, ...identity, payload: bytes("c") });
 	assert.deepEqual(decodeServerFrame(encodeCommitNotice({ ...identity, seq: 301 })), { kind: "notice", seq: 301, ...identity });
+	assert.throws(() => decodeServerFrame(new Uint8Array([...encodeCommitNotice({ ...identity, seq: 301 }), 7])), /trailing bytes/);
+	assert.throws(() => decodeServerFrame(new Uint8Array([...encodeProvisional({ ...identity, payload: bytes("p") }), 0])), /trailing bytes/);
 	const rows = [{ seq: 1, deviceId: "d", clientFrameId: "a", payload: bytes("x") }, { seq: 9, deviceId: "e", clientFrameId: "b", payload: new Uint8Array(0) }];
 	const blob = new Uint8Array([...encodeRow(rows[0]!), ...encodeRow(rows[1]!)]);
 	assert.deepEqual(decodeRows(blob).map((row) => ({ ...row, payload: [...row.payload] })),
@@ -372,6 +374,7 @@ s.test("codec: STREAM_SKIPPED carries per-stream ascending runs as first seq + d
 	assert.deepEqual([...encoded.subarray(0, 6)], [0x13, 2, 3, ...bytes("b:x")]);
 	assert.deepEqual(decodeServerFrame(encoded), { kind: "skipped", runs });
 	assert.throws(() => decodeServerFrame(new Uint8Array([0x13, 1, 1, 0x78, 2, 5, 0])), /non-ascending/);
+	assert.throws(() => decodeServerFrame(new Uint8Array([...encoded, 0])), /trailing bytes/);
 });
 
 s.test("subscriptions: filtered fanout; unsubscribed b:/c: rows become skip runs; vault-global streams always pushed", async () => {
