@@ -1482,7 +1482,7 @@ All are in `src/core/types.ts`.
 |---|---|---|---|
 | live | present | present | 1. If `Rm` and not `pendingLocal`: `diskRename(S.path → R.path, expect hash)` (remote move; plain rename; case-only via temp on case-insensitive FS; folder-casing-only differences tolerated there). 2. Content: neither changed → `syncedPut` if the stat moved; `Rc` only → `reconcileContent` (crdt-only write) / blob `fetchBlob`; `Lc` only → `reconcileContent` (disk-only, frames) / blob `pushBlob` + `nsSetBlob(baseRev = R.blob.rev)`; both → `reconcileContent` (3-way) / blob keep-both (`conflictCopy`, `fetchBlob`, `nsCreate` for the copy). |
 | live | present | absent | Inferred or observed rename to a leftover L entry → `nsRename` (+ content step at the new path). Else if `Rc` (remote edited since sync) → `diskMaterialize(R.path, expect absent)` (edit beats delete). Else → `nsDelete(baseBodySeq = streams.appliedSeq)` (brake: mass-delete-local). |
-| deleted | present | absent | Observed rename (not hash inference) to a leftover L entry → `nsRestore(path = L.path, againstDeleteSeq = R.deletedSeq)` (the unseen rename wins, as in E6) + `reconcileContent` if L hash ≠ S.contentHash, else `syncedPut` at L.path. Else → `syncedDrop` (kept while ns is not ready). |
+| deleted | present | absent | Observed rename (not hash inference) to a leftover L entry → `nsRestore(path = L.path, againstDeleteSeq = R.deletedSeq)` (the unseen rename wins, as in E6) + `reconcileContent` if L hash ≠ S.contentHash, else `syncedPut` at L.path. Else, with restore duty (§c.7: own rows the delete did not cover) → `nsRestore(R.path)`, S kept: the next pass is live/present/absent, so the local delete goes out again with a base covering the own rows (or edit beats delete). Dropping S left the restore to the no-S row, which brought the doc back for good. Else → `syncedDrop` (kept while ns is not ready). |
 | deleted | present | present, ¬`Lc` | If the doc has own pending body frames and the restore condition holds → `nsRestore`. Else → `diskTrash(S.path, expect hash = S.contentHash)` + `syncedDrop` (brake: mass-delete-remote). |
 | deleted | present | present, `Lc` | Local edit beats remote delete: `nsRestore(path = S.path, againstDeleteSeq = R.deletedSeq)` + `reconcileContent`. |
 | merged → W | present | any | `rebind(S.docId → W)`, then plan as W. |
@@ -1631,6 +1631,14 @@ All are in `src/core/types.ts`.
     name, then same parent folder), with ties broken by path code-unit order. Unpaired ones become delete + create.
   - Observed `rename` events that the scan verified (the target exists) win over inference, and may carry a content
     change (rename + edit).
+  - Observed renames live in memory. One that took a synced doc's file away while inference was off (ns not ready)
+    is kept in the doc's `fileGone` mark (`SyncedEntry.renamedTo`) and replayed after an engine restart. Without it
+    a new file at the old path merged into the doc as an edit (edit beats delete), deleting the old content.
+  - An observed rename wins even when the source path is re-occupied. If the file there holds exactly S's bytes, the
+    engine re-materialized the doc there before the event arrived, so S describes that file and not the moved one.
+    The moved file then merges with no base (`reconcileContent.noBase`): neither S's stored base nor its
+    contentHash. Otherwise its older bytes merge against the projection, and every record or line a peer added
+    since reads as a local delete.
   - Folder renames arrive as per-child events, and become one `nsRename` per child, packed into frames.
   - Alternative: similarity-based inference. Rejected: non-deterministic and expensive.
 
@@ -2228,6 +2236,29 @@ ones get conflict copies.
   - The CRDT apply is record-level: changed fields are set, and the `text` field gets a minimal `Y.Text` diff. Node
     maps are never replaced wholesale.
   - Canvas views are not bound. Every user edit reaches the CRDT through a disk save and merge.
+- **Merge semantics** (what the simulator's canvas invariant tests, `src/sim/invariants.ts` `checkCanvas`):
+  - *Convergence is canonical, not byte-identical.* After the heal every device's file, its resident replica's
+    projection and a fresh device's read of the stream (checkpoint plus tail) are equal as canonical JSON (keys
+    sorted, records in file order). A file that differs from the projection only in formatting (key order, indent,
+    CRLF, BOM, trailing newline) is never rewritten. The empty file is the empty canvas (Obsidian's "New canvas"
+    writes 0 bytes).
+  - *Across devices* (the CRDT): fields are last-writer-wins per field, unknown fields included (root, node and edge
+    keys the client does not know survive and sync like known ones). A text node's text merges character-wise, and
+    concurrent edits keep both. A record delete beats a concurrent edit inside the record, which goes with it.
+    `rank` is a last-writer-wins register. A "bring to front / send to back" that nobody contests holds, but
+    concurrent reorders of the same node keep one.
+  - *Disk against CRDT on one device* (the line merge): different records merge. The same record changed on both
+    sides, or changed on one and deleted on the other, conflicts: the CRDT keeps its side and the exact disk bytes go
+    to a conflict copy. Without a base (store lost, or the synced record describes another file) a differing disk
+    file is a conflict copy too. A user's deletion of a record is never undone except by a concurrent unseen edit, a
+    conflict copy, or a store wipe that lost the unsent delete.
+  - *No silent loss:* a field write is never undone back to a value it replaced, a created record survives unless a
+    user deleted it, and typed text survives, except as the rules above discard it. Discarded data is either in a
+    conflict copy or lost to a concurrent record delete.
+  - *Broken files* (truncated, not JSON, duplicate ids, bad types or numbers, an edge to a missing node) are never merged and
+    never written over. The job fails with `canvas-invalid` until a valid save arrives, which then merges normally.
+    The engine never writes an invalid canvas.
+  - *Dangling edges in the CRDT* (a peer deleted the endpoint) are dropped from the projection and kept in the CRDT. They return with their node.
 
 ### j.3 Settings sync (`cfg`)
 

@@ -332,6 +332,14 @@ devices).
 | 47 | A fold row stored unopened (reader-dependent gate failure) whose re-gate came out "accounted only" (a snap row `k` judged stale-epoch, e2ee-design §9.3) was skipped by `regateUnopened`: it stayed unopened and the snap fold stayed halted behind it for good. | sim heavy E2EE seed 42 (suite 1) | facea307: such a row leaves the tail (`tReplaceTail` `drop`), as a reader that gated it so at first never stored it; the fold resumes. |
 | 48 | After an IDB wipe, S for B's attachment came back from a mirror older than the fold's suffix move (a2 -> "a2 (2)"); C's attachment had taken a2. The planner took C's file as the doc's, trashed B's own file at the remote path as a stray copy (bug 38's rule) and pushed C's bytes as an edit of B's attachment. | sim seed 630 F DEV3 (production checkpoint thresholds) | e3b46533: when the file at S's path holds other bytes and the file at the remote path holds S's bytes, still the doc's remote bytes, the doc's file is the one at the remote path (D18). |
 | 49 | A crashed after its ns frame committed and before the receipt; a peer's ns checkpoint at lastSeq retired the stream (H7). A restarted, adopted the checkpoint (covering the frame) and resent the frame, which the relay deduped at its old seq. The receipt put the frame back in the overlay as committed-not-folded, but its row lay under the snapshot: one pending ns frame for good. The sim's dedupe window lost retired rows (the resend was appended again), which hid it. | sim heavy seed 27 (the "pending ns frames" failures) | 58eca457: receipts carry their commit seq to `noteCommitted`; a frame whose seq the fold already covers is not pending. |
+| 50 | C deleted a canvas while B, offline, edited it and then deleted the file too. B's planner saw deleted/present/absent and dropped S; the next pass, with no S but B's restore duty (its rows after the delete's base), restored the doc and undid both deletes. | sim blob stall/slow seed 5 F DEV3 (canvas round) | db8096f6: with restore duty the row restores keeping S (a pending own ns op waits); the next pass sees live/present/absent and deletes with B's rows covered, or edit-beats-delete. DESIGN §f.2. |
+| 51 | During IDB-wipe recovery the engine re-materialized boards/c2 before the user's late rename event c2 -> c1 arrived, writing S and the base from the projection. The rename moved S onto c1, which held A's older bytes; the merge used the projection as base, so every record B had added read as deleted by A, and B's node was lost. Markdown takes the same path. | sim hot canvas seed 0 | 265b876a: an observed rename off a re-occupied source whose file holds exactly S's bytes reconciles the moved file with `noBase`; the md and canvas jobs skip the stored base and the S-hash fallback (CRDT kept, disk differences to a conflict copy). DESIGN §f.6. |
+| 52 | Offline with ns not ready, B renamed canvas c0 -> boards/c2, kept editing and created a new c0. The pass marked the doc fileGone; the observed rename lived only in memory and a crash dropped it. Online, edit-beats-delete merged the new c0 into the doc (deleting every old record, a peer's text edit with them) and boards/c2 became a new doc. | sim hot canvas seed 705 | af93fcba: the fileGone mark keeps the end of the observed rename chain (`SyncedEntry.renamedTo`), replayed as an observed rename while the mark stands; cleared with fileGone. DESIGN §f.6. |
+| 53 | A doc with fileGone kept claiming its path key; when another doc's observed rename moved its file onto that path, the gone doc took the bytes as its own save and put S back. Two docs owned notes/r6.md and the devices diverged. | sim seed 703 F DEV3 (canvas round sweep) | 97478c9e: a file brought onto a gone doc's path by another doc's rename (`arrivedElsewhere`), or held by another live record, is that doc's: fresh local for it, and the gone doc's row does not re-adopt it. |
+| 54 | Sim only: C's frame was refused at a daily-limit latch that lifted before C's next frame, which committed. A held a causal hole for ~750 ms until C's 1 s retry, but the sim's FAST_TUNING re-read 3 x 60 ms and froze the note for good; its rename never applied on A and five tokens were lost. DESIGN §d.6 requires a window of at least 2 x PROVISIONAL_ADOPT_MS (production: 4 x 60 s against the 1 s retry). | sim seed 520 F DEV3 (canvas round sweep) | 513f6e1a: sim devices run `SIM_TUNING` (1 s re-read interval); a test pins the window against the own-frame retry. No client change. |
+| 55 | Sim only: A rewired an edge to a new node and labelled it while C deleted that node. The CRDT kept the edge (label included) and the projection dropped it as dangling, as DESIGN §j.2 says; only an older conflict copy showed the edge, so the lost-write check flagged the label. | suite-1 seed 167 F DEV3 | f430b91d: fields of an edge whose endpoint a user deleted are exempt while only conflict copies hold it (record survival already was). Self-test. |
+| 56 | Sim only: revoked B brought a node to the front; an epoch restore made B re-onboard and its canvas survived as the suffixed duplicate "c5 (2).canvas" with B's order, but the order check counted only conflict copies as copies. | suite-1 seed 34 E2EE DEV3 | 31bf71de: a canvas of another doc holding the node counts as a copy (as for the delete rule). Seed pinned. |
+| 57 | A revoked C, which deleted an attachment while key-missing. Every pass planned the nsDelete and failed on the write gate, so the scheduler backed off (32 s and more). Re-keyed, C had no pass due until the backoff ran out, after the heal: the delete never left. | suite-1 seed 23 E2EE DEV3 | 3ed8afec: VaultRuntime requests a full pass at once when the phase leaves key-missing. Seed pinned. |
 
 Sim-only fixes found on the way (no client change): epoch names reused across
 resets, one global clock skew instead of per-device, ledger coverage of
@@ -341,7 +349,12 @@ waiting on the blob queue. From the checkpoint coverage round (89c5accd,
 H7; the retired rows stay in its dedupe window, as H2 keeps their keys), sim
 device ids were shorter than the relay's 16 characters (every snap
 row was ignored), and quiescence ignored blob store calls outside the blob
-queue and a running snapshot job.
+queue and a running snapshot job. From the canvas round (§6.2): the canvas oracle attributes
+root fields to a canvas's lineage (a `simCanvas` marker), not its doc id,
+which conflict copies, IDB wipes and epoch resets do not keep; a broken save
+followed by a delete marks the records of both the broken and the last good
+text deleted; a delete the device lost to an IDB wipe without mirrors is
+exempt.
 
 ## 4. Deviations from DESIGN
 
@@ -732,7 +745,7 @@ crashed or wiped across a checkpoint and its GC). 447 ns, 9 cfg and 9 snap
 checkpoints were written with own frames of the stream pending. No
 checkpoint was refused at the gate in suite 0. Wall time: 318 s before, 274
 s after on the same machine (p50 per run unchanged within noise). Canvas
-has no coverage: the actors never create a canvas.
+had no coverage then: the actors never created a canvas (see §6.2).
 
 The round found bugs 45-49 (§3) and the sim-only fixes listed under the
 table there. Bug 49 is the "pending ns frames" failure seen before the
@@ -749,6 +762,94 @@ With such failures returning `retry` instead (an experiment, not committed)
 all 21 runs pass. That branch is being reworked separately
 (newer fold rules), so it is left as it is here.
 
+
+### 6.2 Canvas coverage (branch client-remake-audit-canvas)
+
+Since e6c40b87 every matrix edits `.canvas` files the way Obsidian, other
+programs and broken saves do (`src/sim/canvas.ts`). The edits are creates,
+node add / move / resize / color / text, edge add / rewire / relabel /
+delete, node delete with its edges, front/back reorders, unknown root, node
+and edge fields, link-updater rewrites, big boards (150-1200 nodes), renames,
+deletes, external reformatting and half-written saves that complete later.
+Canvas steps draw from their own seeded fork. A new matrix, "2 devices,
+concurrent offline canvas edits" (CANVAS_FAULTS, offline weight 16, fault
+rate 0.2, 3 canvas actions per step on a pool of 2 canvases), makes both
+devices edit the same records offline. `checkCanvas` (bf4f2c73) checks the
+semantics stated in DESIGN §j.2 "Merge semantics": canonical convergence
+with the replica and a fresh relay read (checkpoint parity), validity of
+every file and every engine write, projection-exact engine bytes, no lost
+records, no resurrected deletes, no field write undone (saw-chains over
+unique values, unknown fields included), and uncontested reorders kept.
+Text-node edits carry ledger tokens.
+
+Counts per matrix, `YAOS_SIM_CRYPTO=none YAOS_SIM_SEEDS=750 node
+scripts/sim-suite1.mjs` (2045 runs). The hot row is the hot matrix alone at
+750 seeds (`YAOS_SIM_SEEDS=6000 ... "canvas edits"`).
+
+| Matrix | Seeds | Canvas actions | Creates | Broken saves | Merges | 3-way (divergent) | clean / conflict / rejected | Conflict copies | Invalid notices | c: checkpoints ok / GC puts / adopted / oracle |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2 devices, no faults | 750 | 21047 | 1713 | 605 | 35388 | 263 | 170 / 159 / 3 | 151 | 462 | 9570 / 9472 / 377 / 1558 |
+| 3 devices, default faults | 750 | 19252 | 1704 | 576 | 36559 | 219 | 116 / 447 / 3 | 436 | 514 | 6884 / 6830 / 2450 / 1462 |
+| 5 devices, default faults | 188 | 5253 | 441 | 139 | 17153 | 72 | 43 / 135 / 2 | 132 | 126 | 2138 / 2119 / 917 / 419 |
+| 2 devices, heavy faults | 188 | 3607 | 403 | 96 | 4056 | 13 | 5 / 126 / 0 | 126 | 90 | 730 / 727 / 271 / 278 |
+| 3 devices, blob stall/slow | 75 | 1764 | 172 | 58 | 3292 | 15 | 9 / 74 / 0 | 73 | 48 | 583 / 582 / 268 / 146 |
+| concurrent offline canvas (hot) | 94 | 14724 | 228 | 325 | 14698 | 161 | 86 / 130 / 3 | 124 | 260 | 1056 / 1043 / 276 / 217 |
+| hot, alone | 750 | 115652 | 1837 | 2476 | 116135 | 1241 | 704 / 949 / 23 | 880 | 2062 | 9042 / 8953 / 2175 / 1663 |
+
+The suite's hit check fails the hot matrix unless it has real 3-way merges,
+conflicts, invalid-file notices and canvas checkpoints written and adopted.
+
+Coverage of the canvas files (node test coverage through an esbuild loader
+with source maps; jiti's maps misplace lines). Run over canvasDoc.test,
+reconciler.canvas.test, hash.test, run.test (16 seeds) and 25 hot + 20
+seeds of each default matrix:
+
+| File | Lines | Branches | Functions |
+|---|---|---|---|
+| core/hash/canvasCanonical.ts | 100% of code (96.8% incl. the header) | 87.0% (240/276) | 100% |
+| core/hash/canvasOrdering.ts | 100% (96.1%) | 95.7% (66/69) | 100% |
+| engine/reconcile/canvasDoc.ts | 100% (90.8%) | 93.8% (106/113) | 100% |
+| engine/reconcile/canvasJob.ts | 100% (88.1%) | 84.5% (60/71) | 100% |
+| engine/reconcile/canvasMerge.ts | 100% (84.4%) | 96.8% (61/63) | 100% |
+| sim/canvas.ts | 100% (97.3%) | 93.8% (530/565) | 100% |
+
+The uncovered "lines" are each file's header (doc comment and imports,
+which the transform drops). Before the round the sweeps never reached the
+parser limits, the rejected-merge fallback in a unit test, a canvas merge
+write refused by the fingerprint precondition (rebaseOnDisk), the
+shrinking-overwrite brake on a canvas, hostile CRDT records, a rank
+rebalance (ten sends to the back exhaust the gap below the first record),
+or `formatCanvasBytes` (used by e2e only). Tests now cover each of them
+(commit "canvas: cover the paths..."). `CanvasActor.pendingFixes` was dead
+and is deleted. The branches still unreached are defensive:
+- parser rejection reasons the sim's broken saves do not draw: over-deep
+  JSON, invalid UTF-8, nodes or edges not arrays, per-text, per-field and
+  aggregate size limits, non-string optional fields, and malformed
+  merge-text lines;
+- race guards in canvasJob: the doc row gone or not a canvas mid-job, the
+  CAS miss limit, the conflict-copy write failing, and an invalid CRDT met
+  at materialize;
+- `??` fallbacks in canvasMerge and canvasOrdering for records without a
+  rank, which the engine never writes.
+
+Runtime, this machine, base 1d60535e against the final commit:
+- `npm run test:client`: 11:53 (one blobQueue "byte budget" flake) against 15:28 (1466 tests, none failing);
+- `npm run test:sim-suite1` (crypto suite1, 200 seeds): 228.0 s against 303.5 s;
+- the default suite at 750 seeds: 279.1 s for 1951 runs against 433.5 s for 2045 runs (run p50 1.0 to 1.5 s
+  with 2 devices);
+- the hot matrix alone at 750 seeds: 144.1 s.
+Canvas steps, checkCanvas and the new matrix account for the difference.
+
+The round found bugs 50-57 (§3). Five are client bugs: four in the planner,
+which markdown hits on the same paths, and the key-missing re-plan. Three
+are sim bugs (the tuning, and two oracle exemptions that the suite-1
+E2EE runs exposed).
+
+Open: after an epoch migration a canvas gets no path-keyed base. The
+planner's migrated-loser merge (§c.12, `pathBase`) is markdown-only, so a
+locally changed canvas re-onboards as a suffixed duplicate ("c5 (2)") and
+is not 3-way merged. Nothing is lost (seed 34), but it is one more file
+than markdown would leave.
 
 ## 7. End-to-end results
 

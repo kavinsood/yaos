@@ -572,7 +572,8 @@ A device with no suite pin never reaches this table: it opens nothing (§12.4).
 
   The device is read-only: it seals nothing, uploads no blob, and its outbox is held. An unpinned device does not
   even run the reconcile, so it has no outbox. The status names the remedy: "Scan a re-key code from another
-  device, or enter the recovery key".
+  device, or enter the recovery key". When the phase leaves `key-missing` the engine plans the vault at once
+  (a full pass), so edits and deletes made while read-only go out without waiting for the failed passes' backoff.
 
 ## 10. Blobs
 
