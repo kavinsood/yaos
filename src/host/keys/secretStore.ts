@@ -144,12 +144,6 @@ function encodeValue(vaultId: string, v: StoredKeys): string {
 	return JSON.stringify(value);
 }
 
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-	return true;
-}
-
 /** The secret of one vault. Construct per vault id; holds no key bytes between calls. */
 export class VaultKeyStore {
 	readonly id: string;
@@ -285,9 +279,4 @@ export class VaultKeyStore {
 			return false;
 		}
 	}
-}
-
-/** True when `a` and `b` hold the same epoch keys (tests). */
-export function sameKeys(a: readonly EpochKey[], b: readonly EpochKey[]): boolean {
-	return a.length === b.length && a.every((x, i) => x.e === b[i]!.e && sameBytes(x.k, b[i]!.k));
 }

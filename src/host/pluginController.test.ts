@@ -84,7 +84,7 @@ test("pairing starts the engine; status, commands, settings and unpairing flow t
 	assert.equal(saved.length, 1);
 	assert.equal(saved[0]?.e2ee, undefined, "pairing sets no pin");
 	assert.equal(ctl.runState().phase, "running");
-	assert.equal(ctl.runState().transport, "worker");
+	assert.equal(ctl.status()?.transport, "worker");
 	assert.ok(ctl.status(), "status snapshot received");
 	assert.equal(ctl.status()?.phase, "key-missing", "a key-less join is blocked");
 	assert.equal(ctl.status()?.e2ee?.keyMissing, "no-pin");

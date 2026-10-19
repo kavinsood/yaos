@@ -101,7 +101,7 @@ function fakeHost(result: EngineResultValue | Error, writeFails = false, data: Y
 		host: {
 			pluginVersion: "2.1.0",
 			data: () => data,
-			runState: () => ({ phase: "running" as const, transport: "worker" as const, lastError: null }),
+			runState: () => ({ phase: "running" as const, lastError: null }),
 			async command(c: UserCommand): Promise<EngineResultValue> {
 				commands.push(c);
 				if (result instanceof Error) throw result;
@@ -159,12 +159,11 @@ test("exportDiagnostics: settings section names the device and engine settings, 
 			assert.ok(!out.includes(TOKEN.slice(5, 20)), "part of the device token leaked");
 		}
 		const s = (JSON.parse(text) as { settings: Record<string, unknown> }).settings;
-		assert.deepEqual(Object.keys(s).sort(), ["deviceId", "deviceLabel", "engine", "host", "pluginVersion", "transport", "vaultId"]);
+		assert.deepEqual(Object.keys(s).sort(), ["deviceId", "deviceLabel", "engine", "host", "pluginVersion", "vaultId"]);
 		assert.equal(s.host, "https://sync.example.com");
 		assert.equal(s.vaultId, testVaultId("v-123"));
 		assert.equal(s.deviceId, "d-456");
 		assert.equal(s.pluginVersion, "2.1.0");
-		assert.equal(s.transport, "worker");
 		const engine = s.engine as Record<string, unknown>;
 		assert.equal(engine.excludePatternCount, 2);
 		assert.equal(engine.syncAttachments, DEFAULT_ENGINE_SETTINGS.syncAttachments);
@@ -175,7 +174,7 @@ test("exportDiagnostics: settings section names the device and engine settings, 
 });
 
 test("diagnosticsSettings: unpaired device has null identity fields", () => {
-	const s = diagnosticsSettings({ pluginVersion: "2.1.0", data: () => ({ ...DATA, identity: null }), runState: () => ({ phase: "stopped", transport: null, lastError: null }) }, false);
-	assert.deepEqual([s.host, s.vaultId, s.deviceId, s.transport], [null, null, null, null]);
+	const s = diagnosticsSettings({ pluginVersion: "2.1.0", data: () => ({ ...DATA, identity: null }) }, false);
+	assert.deepEqual([s.host, s.vaultId, s.deviceId], [null, null, null]);
 	assert.equal("excludePatterns" in s.engine, false);
 });

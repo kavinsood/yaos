@@ -50,7 +50,6 @@ function canonicalize(value: unknown, depth: number): unknown {
  */
 export interface DiagnosticsSettings {
 	readonly pluginVersion: string;
-	readonly transport: "worker" | "inline" | null;
 	readonly host: string | null;
 	readonly vaultId: string | null;
 	readonly deviceId: string | null;
@@ -58,13 +57,12 @@ export interface DiagnosticsSettings {
 	readonly engine: Omit<EngineSettings, "excludePatterns"> & { readonly excludePatternCount: number; readonly excludePatterns?: readonly string[] };
 }
 
-export function diagnosticsSettings(host: Pick<YaosUiHost, "data" | "pluginVersion" | "runState">, includePaths: boolean): DiagnosticsSettings {
+export function diagnosticsSettings(host: Pick<YaosUiHost, "data" | "pluginVersion">, includePaths: boolean): DiagnosticsSettings {
 	const data = host.data();
 	const id = data.identity;
 	const { excludePatterns, ...engine } = data.engine;
 	return {
 		pluginVersion: host.pluginVersion,
-		transport: host.runState().transport,
 		host: id?.host ?? null,
 		vaultId: id?.vaultId ?? null,
 		deviceId: id?.deviceId ?? null,
@@ -118,7 +116,7 @@ export interface ExportDiagnosticsResult {
  * reported through notify and return null.
  */
 export async function exportDiagnostics(
-	host: Pick<YaosUiHost, "command" | "writeDiagnosticsFile" | "data" | "pluginVersion" | "runState">,
+	host: Pick<YaosUiHost, "command" | "writeDiagnosticsFile" | "data" | "pluginVersion">,
 	deps: ExportDiagnosticsDeps,
 	options: { readonly includePaths: boolean } = { includePaths: false },
 ): Promise<ExportDiagnosticsResult | null> {

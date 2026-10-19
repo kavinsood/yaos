@@ -132,8 +132,9 @@ async function smokePlugin(mainJs, manifest, carrier) {
 		await waitUntil(() => ctl.runState().phase === "running" || ctl.runState().phase === "failed", 10_000, () => `engine running on ${carrier} (${state()})`);
 		const rs = ctl.runState();
 		if (carrier === "worker") {
-			if (rs.phase !== "running" || rs.transport !== carrier) fail(`${carrier}: run state ${state()}`);
+			if (rs.phase !== "running") fail(`${carrier}: run state ${state()}`);
 			await waitUntil(() => ctl.status() !== null, 3000, "status snapshot");
+			if (ctl.status().transport !== carrier) fail(`${carrier}: status transport ${ctl.status().transport}`);
 		} else {
 			if (rs.phase !== "failed" || !rs.lastError?.includes(NO_WORKER_ERROR)) fail(`no Worker: run state ${state()} (expected failed: ${NO_WORKER_ERROR})`);
 			if (!saved.notices.some((n) => n.startsWith("YAOS stopped: ") && n.includes(NO_WORKER_ERROR))) fail(`no Worker: no "YAOS stopped" notice (${JSON.stringify(saved.notices)})`);

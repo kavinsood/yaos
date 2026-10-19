@@ -172,10 +172,6 @@ export class BindingManager {
 		return this.slots.get(viewId)?.state ?? null;
 	}
 
-	docOfView(viewId: number): DocId | null {
-		return this.slots.get(viewId)?.doc?.docId ?? null;
-	}
-
 	// --- engine -> main -------------------------------------------------------
 
 	/** A body event of `docId` (FIFO per doc). Its weight returns as docCredit once applied. */

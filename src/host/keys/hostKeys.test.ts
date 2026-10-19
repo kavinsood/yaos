@@ -5,7 +5,8 @@ import { VirtualClock } from "../../sim/clock";
 import { createHostKeys, KeyRefused } from "./hostKeys";
 import type { E2eePin } from "./pin";
 import { plaintextNoticeOnce, PLAINTEXT_NOTICE_KEY } from "./plaintextNotice";
-import { KeyStoreError, VaultKeyStore, sameKeys, type EpochKey } from "./secretStore";
+import { KeyStoreError, VaultKeyStore, type EpochKey } from "./secretStore";
+import { sameKeys } from "./testkit/sameKeys";
 import { FakeSecretStorage } from "./testkit/fakeSecretStorage";
 import { testVaultId } from "./testkit/vaultIds";
 

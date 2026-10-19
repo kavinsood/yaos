@@ -21,6 +21,7 @@ import {
 	COPY_LINK_WARNING, keyMissingText, PENDING_QR_TEXT, REKEY_EVERY_DEVICE_TEXT, SCAN_QR_TEXT, STORE_RK_ADVICE,
 } from "./e2eeText";
 import { errorMessage } from "./format";
+import { plainInput, StatusLine } from "./modalParts";
 import { installRecoveryKey, PendingQrKeys, rekeyBlocked, rekeyLinkNow, revokeRekey, RK_CHECKSUM_MESSAGE, RK_MALFORMED_MESSAGE } from "./keyActions";
 import { copyText } from "./obsidianEnv";
 import { defaultRandomBytes } from "./pairing";
@@ -31,12 +32,11 @@ import { groupMatches, newRecoveryKey, pickConfirmGroups, readRecoveryKey, recov
 export const RK_PENDING_TEXT =
 	"YAOS could not open this vault's key records with that recovery key yet. It keeps the key in memory and tries again as records arrive. If this device stays blocked, check that it is the recovery key of this vault.";
 
-function inputFor(setting: Setting, opts: { placeholder: string; mono?: boolean }, onChange: (v: string) => void): HTMLInputElement {
+function inputFor(setting: Setting, opts: { placeholder: string; mono?: boolean; secret?: boolean }, onChange: (v: string) => void): HTMLInputElement {
 	let el: HTMLInputElement | null = null;
 	setting.addText((t) => {
 		t.setPlaceholder(opts.placeholder).onChange(onChange);
-		t.inputEl.autocomplete = "off";
-		t.inputEl.spellcheck = false;
+		plainInput(t.inputEl, { secret: opts.secret });
 		t.inputEl.setAttribute("autocapitalize", "characters");
 		if (opts.mono) t.inputEl.addClass("yaos-mono");
 		el = t.inputEl;
@@ -99,7 +99,7 @@ export class KeyMissingModal extends Modal {
 
 export class EnterRecoveryKeyModal extends Modal {
 	private value = "";
-	private statusEl: HTMLElement | null = null;
+	private readonly statusLine = new StatusLine();
 	private button: ButtonComponent | null = null;
 	private busy = false;
 	private open_ = false;
@@ -115,10 +115,9 @@ export class EnterRecoveryKeyModal extends Modal {
 		this.setTitle("Enter recovery key");
 		contentEl.createEl("p", { text: "Type the recovery key you saved when this vault was created or last re-keyed. It starts with YAOS-RK1-. Case, spaces and dashes do not matter." });
 		const s = new Setting(contentEl).setName("Recovery key");
-		const input = inputFor(s, { placeholder: "YAOS-RK1-XXXX-XXXX-…", mono: true }, (v) => { this.value = v; });
-		input.type = "password";
+		const input = inputFor(s, { placeholder: "YAOS-RK1-XXXX-XXXX-…", mono: true, secret: true }, (v) => { this.value = v; });
 		input.addEventListener("keydown", (ev) => { if (ev.key === "Enter") void this.submit(); });
-		this.statusEl = contentEl.createEl("p", { cls: "yaos-pair-status" });
+		this.statusLine.attach(contentEl);
 		new Setting(contentEl)
 			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
 			.addButton((b) => {
@@ -127,17 +126,11 @@ export class EnterRecoveryKeyModal extends Modal {
 			});
 	}
 
-	private setStatus(text: string, warn: boolean): void {
-		if (!this.open_ || !this.statusEl) return;
-		this.statusEl.setText(text);
-		this.statusEl.toggleClass("mod-warning", warn);
-	}
-
 	private async submit(): Promise<void> {
 		if (this.busy) return;
 		this.busy = true;
 		this.button?.setDisabled(true);
-		this.setStatus("Checking the recovery key…", false);
+		this.statusLine.set("Checking the recovery key…", false);
 		try {
 			const outcome = await installRecoveryKey(this.host, this.value);
 			if (outcome === "verified") {
@@ -145,10 +138,10 @@ export class EnterRecoveryKeyModal extends Modal {
 				this.value = "";
 				if (this.open_) this.close();
 			} else {
-				this.setStatus(RK_PENDING_TEXT, true);
+				this.statusLine.set(RK_PENDING_TEXT, true);
 			}
 		} catch (err) {
-			this.setStatus(errorMessage(err), true);
+			this.statusLine.set(errorMessage(err), true);
 		} finally {
 			this.busy = false;
 			this.button?.setDisabled(false);
@@ -159,7 +152,7 @@ export class EnterRecoveryKeyModal extends Modal {
 		this.open_ = false;
 		this.value = "";
 		this.contentEl.empty();
-		this.statusEl = null;
+		this.statusLine.detach();
 		this.button = null;
 	}
 }
@@ -336,7 +329,7 @@ export class RekeyAfterRevokeModal extends Modal {
 	private typed = "";
 	private busy = false;
 	private open_ = false;
-	private statusEl: HTMLElement | null = null;
+	private readonly statusLine = new StatusLine();
 
 	constructor(app: App, private readonly host: YaosUiHost, private readonly openRekeyQr: () => void) {
 		super(app);
@@ -355,31 +348,24 @@ export class RekeyAfterRevokeModal extends Modal {
 		contentEl.createEl("p", { text: "Do this after you removed a device in your server console. YAOS makes a new vault key that the removed device never gets, so it cannot read changes made from now on. Notes it already synced stay readable to it." });
 		contentEl.createEl("p", { text: "The new key is wrapped under a recovery key. Enter the one you have, or make a new one: the old recovery key then opens only the older keys." });
 		const s = new Setting(contentEl).setName("Your recovery key");
-		const input = inputFor(s, { placeholder: "YAOS-RK1-XXXX-XXXX-…", mono: true }, (v) => { this.typed = v; });
-		input.type = "password";
+		inputFor(s, { placeholder: "YAOS-RK1-XXXX-XXXX-…", mono: true, secret: true }, (v) => { this.typed = v; });
 		s.addButton((b) => b.setButtonText("Re-key with this recovery key").setCta().onClick(() => { void this.withTypedKey(); }));
 		new Setting(contentEl)
 			.setName("Generate a new recovery key")
 			.setDesc("Shown once; you confirm you saved it before the key changes.")
 			.addButton((b) => b.setButtonText("Generate a new recovery key").onClick(() => { void this.withNewKey(); }));
-		this.statusEl = contentEl.createEl("p", { cls: "yaos-pair-status" });
-	}
-
-	private setStatus(text: string, warn: boolean): void {
-		if (!this.open_ || !this.statusEl) return;
-		this.statusEl.setText(text);
-		this.statusEl.toggleClass("mod-warning", warn);
+		this.statusLine.attach(contentEl);
 	}
 
 	private async withTypedKey(): Promise<void> {
 		if (this.busy) return;
 		const read = await readRecoveryKey(this.typed, (s) => this.host.rkChecksum(s)).catch((err: unknown) => {
-			this.setStatus(errorMessage(err), true);
+			this.statusLine.set(errorMessage(err), true);
 			return null;
 		});
 		if (!read) return;
 		if (!read.ok) {
-			this.setStatus(read.reason === "malformed" ? RK_MALFORMED_MESSAGE : RK_CHECKSUM_MESSAGE, true);
+			this.statusLine.set(read.reason === "malformed" ? RK_MALFORMED_MESSAGE : RK_CHECKSUM_MESSAGE, true);
 			return;
 		}
 		await this.rekey(read.rk);
@@ -397,7 +383,7 @@ export class RekeyAfterRevokeModal extends Modal {
 
 	private async rekey(rk: Uint8Array): Promise<void> {
 		this.busy = true;
-		this.setStatus("Changing the vault key…", false);
+		this.statusLine.set("Changing the vault key…", false);
 		try {
 			await revokeRekey(this.host, rk);
 			this.typed = "";
@@ -405,7 +391,7 @@ export class RekeyAfterRevokeModal extends Modal {
 			if (this.open_) this.close();
 			this.openRekeyQr();
 		} catch (err) {
-			this.setStatus(errorMessage(err), true);
+			this.statusLine.set(errorMessage(err), true);
 			if (!this.open_) new Notice(`YAOS: ${errorMessage(err)}`, 10000);
 		} finally {
 			this.busy = false;
@@ -415,7 +401,7 @@ export class RekeyAfterRevokeModal extends Modal {
 	onClose(): void {
 		this.open_ = false;
 		this.typed = "";
-		this.statusEl = null;
+		this.statusLine.detach();
 		this.contentEl.empty();
 	}
 }

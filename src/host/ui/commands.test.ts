@@ -12,7 +12,7 @@ function host(opts: { run?: EngineRunState["phase"]; phase?: StatusSnapshot["pha
 	const data: YaosPluginData = { ...defaultPluginData("Mac"), identity: opts.paired ? IDENTITY : null };
 	return {
 		data: () => data,
-		runState: (): EngineRunState => ({ phase: opts.run ?? "running", transport: "worker", lastError: null }),
+		runState: (): EngineRunState => ({ phase: opts.run ?? "running", lastError: null }),
 		status: () => (opts.phase ? ({ phase: opts.phase, brake: null } as unknown as StatusSnapshot) : null),
 		brake: () => opts.brake ?? null,
 	};
@@ -65,7 +65,7 @@ test("\"Create a new vault\" is offered unpaired, or paired with the vault's pin
 	for (const [name, h, want] of cases) {
 		assert.equal(canCreateVault(h), want, name);
 		const spec = UI_COMMANDS.find((c) => c.id === "yaos-create-vault");
-		assert.equal(spec?.available({ ...h, runState: () => ({ phase: "running", transport: "worker", lastError: null }), brake: () => null }), want, name);
+		assert.equal(spec?.available({ ...h, runState: () => ({ phase: "running", lastError: null }), brake: () => null }), want, name);
 	}
 });
 
@@ -76,7 +76,7 @@ test("encryption commands: finish creating only on the creation path, unlock onl
 		const d: YaosPluginData = { ...defaultPluginData("Mac"), identity: IDENTITY, ...data };
 		return {
 			data: () => d,
-			runState: (): EngineRunState => ({ phase: "running", transport: "worker", lastError: null }),
+			runState: (): EngineRunState => ({ phase: "running", lastError: null }),
 			status: () => ({ phase: "live", brake: null, e2ee: status } as unknown as StatusSnapshot),
 			brake: () => null,
 		};

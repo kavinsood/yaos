@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	isCreating, keyringSeenOf, markedCreating, pinAcross, pinnedSuite, pinnedSuite0, pinnedSuite1, pinsFromKeyring, refuseEnableE2ee,
-	refuseKeyCommand, refusePinSuite0, sanitizeCreating, sanitizePin, sawKeyring, withoutCreating, withoutPin, PIN_REFUSAL_TEXT,
+	refuseKeyCommand, refusePinSuite0, sanitizeCreating, sanitizePin, sawKeyring, withoutCreating, PIN_REFUSAL_TEXT,
 	type PinFields,
 } from "./pin";
 import { sanitizePluginData } from "../ui/api";
@@ -101,11 +101,6 @@ test("withoutCreating: an aborted creation drops only its own marker and never t
 	assert.equal(withoutCreating(creating, W), creating, "another vault's marker stays");
 	assert.deepEqual(withoutCreating({ ...SEEN, creating: { vaultId: V } }, V), SEEN);
 	assert.equal(withoutCreating(S1, V), S1);
-});
-
-test("leaving the vault drops pin and marker", () => {
-	assert.deepEqual(withoutPin({ ...S1, creating: { vaultId: V } }), {});
-	assert.equal(withoutPin(ABSENT), ABSENT);
 });
 
 test("pinAcross: the UI cannot write or lower a pin; another vault drops it; the creation marker survives its enroll", () => {

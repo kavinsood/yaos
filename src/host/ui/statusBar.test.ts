@@ -5,7 +5,7 @@ import { defaultPluginData, type EngineRunState, type YaosPluginData } from "./a
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
 
-const RUNNING: EngineRunState = { phase: "running", transport: "worker", lastError: null };
+const RUNNING: EngineRunState = { phase: "running", lastError: null };
 
 type Counts = StatusSnapshot["counts"];
 
@@ -112,13 +112,13 @@ test("renderStatus: run phases take precedence over the snapshot", () => {
 	const live = snap("live");
 	assert.deepEqual(
 		[
-			renderStatus(live, { phase: "unpaired", transport: null, lastError: null }),
-			renderStatus(live, { phase: "stopped", transport: null, lastError: null }),
-			renderStatus(live, { phase: "starting", transport: null, lastError: null }),
+			renderStatus(live, { phase: "unpaired", lastError: null }),
+			renderStatus(live, { phase: "stopped", lastError: null }),
+			renderStatus(live, { phase: "starting", lastError: null }),
 		].map((r) => [r.text, r.level]),
 		[["YAOS: not paired", "warn"], ["YAOS: stopped", "warn"], ["YAOS: starting…", "busy"]],
 	);
-	const failed = renderStatus(live, { phase: "failed", transport: null, lastError: "worker crashed" });
+	const failed = renderStatus(live, { phase: "failed", lastError: "worker crashed" });
 	assert.equal(failed.text, "YAOS: stopped (error)");
 	assert.equal(failed.level, "error");
 	assert.match(failed.tooltip, /worker crashed/);

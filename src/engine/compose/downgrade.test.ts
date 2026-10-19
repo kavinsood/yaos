@@ -1678,7 +1678,7 @@ function pinCensus(): Record<string, Record<string, number>> {
 	};
 	for (const f of files) {
 		const src = stripComments(readFileSync(f, "utf8"));
-		for (const m of src.matchAll(/(?<![.\w])(pinnedSuite0|pinnedSuite1|sawKeyring|markedCreating|withoutPin|withPin)\s*\(/g)) {
+		for (const m of src.matchAll(/(?<![.\w])(pinnedSuite0|pinnedSuite1|sawKeyring|markedCreating|withPin)\s*\(/g)) {
 			const line = src.slice(src.lastIndexOf("\n", m.index) + 1, src.indexOf("\n", m.index));
 			if (!/\bfunction\s/.test(line)) add(`call:${m[1]}`, f);
 		}

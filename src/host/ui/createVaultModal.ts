@@ -27,6 +27,7 @@ import {
 } from "./createVault";
 import { CREATE_BLOCKED_MESSAGE, DEVICE_NAME_HINT, STORE_RK_ADVICE } from "./e2eeText";
 import { errorMessage } from "./format";
+import { plainInput, StatusLine } from "./modalParts";
 import { askNewRecoveryKey } from "./keyModals";
 import { copyText, obsidianRequest } from "./obsidianEnv";
 import { generateOperatorKey, MAX_VAULT_NAME_CHARS, retireDeviceEnrollment, type RequestFn } from "./pairing";
@@ -47,7 +48,7 @@ export class CreateVaultModal extends Modal {
 	private operatorKey = "";
 	private vaultName: string;
 	private deviceName: string;
-	private statusEl: HTMLElement | null = null;
+	private readonly statusLine = new StatusLine();
 
 	constructor(app: App, private readonly host: YaosUiHost, private readonly opts: CreateVaultModalOptions = {}) {
 		super(app);
@@ -79,18 +80,8 @@ export class CreateVaultModal extends Modal {
 	private reset(): HTMLElement {
 		const { contentEl } = this;
 		contentEl.empty();
-		this.statusEl = null;
+		this.statusLine.detach();
 		return contentEl;
-	}
-
-	private status(el: HTMLElement): void {
-		this.statusEl = el.createEl("p", { cls: "yaos-pair-status" });
-	}
-
-	private setStatus(text: string, warn: boolean): void {
-		if (!this.open_ || !this.statusEl) return;
-		this.statusEl.setText(text);
-		this.statusEl.toggleClass("mod-warning", warn);
 	}
 
 	// -- server --------------------------------------------------------------------------------------------------
@@ -112,11 +103,9 @@ export class CreateVaultModal extends Modal {
 			.setDesc("Your YAOS server. A server that is not set up yet is set up now, with this vault as its first.")
 			.addText((t) => {
 				t.setPlaceholder("https://sync.example.com").setValue(this.serverValue).onChange((v) => { this.serverValue = v; });
-				t.inputEl.autocomplete = "off";
-				t.inputEl.spellcheck = false;
-				t.inputEl.addEventListener("keydown", (ev) => { if (ev.key === "Enter") next?.buttonEl.click(); });
+				plainInput(t.inputEl).addEventListener("keydown", (ev) => { if (ev.key === "Enter") next?.buttonEl.click(); });
 			});
-		this.status(el);
+		this.statusLine.attach(el);
 		new Setting(el)
 			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
 			.addButton((b) => {
@@ -125,12 +114,12 @@ export class CreateVaultModal extends Modal {
 					if (this.busy) return;
 					this.busy = true;
 					b.setDisabled(true);
-					this.setStatus("Contacting the server…", false);
+					this.statusLine.set("Contacting the server…", false);
 					try {
 						this.server = await probeServer(this.serverValue, { request: this.request });
 						if (this.open_) this.showAccount();
 					} catch (err) {
-						this.setStatus(errorMessage(err), true);
+						this.statusLine.set(errorMessage(err), true);
 					} finally {
 						this.busy = false;
 						b.setDisabled(false);
@@ -171,9 +160,7 @@ export class CreateVaultModal extends Modal {
 				.setName("Operator key")
 				.addText((t) => {
 					t.setPlaceholder("Operator key").onChange((v) => { this.operatorKey = v; refresh(); });
-					t.inputEl.type = "password";
-					t.inputEl.autocomplete = "off";
-					t.inputEl.spellcheck = false;
+					plainInput(t.inputEl, { secret: true });
 				});
 			new Setting(el)
 				.setName("Vault name")
@@ -187,7 +174,7 @@ export class CreateVaultModal extends Modal {
 			.setName("Device name")
 			.setDesc(`${DEVICE_NAME_HINT}. Also used in this device's conflict copy names.`)
 			.addText((t) => t.setPlaceholder("My laptop").setValue(this.deviceName).onChange((v) => { this.deviceName = v; }));
-		this.status(el);
+		this.statusLine.attach(el);
 		new Setting(el)
 			.addButton((b) => b.setButtonText("Back").onClick(() => {
 				if (this.busy) return;
@@ -204,12 +191,12 @@ export class CreateVaultModal extends Modal {
 		if (this.busy) return;
 		this.busy = true;
 		const operatorKey = this.operatorKey;
-		this.setStatus("Creating the vault…", false);
+		this.statusLine.set("Creating the vault…", false);
 		try {
 			const result = await createAndEnroll(
 				{ server, operatorKey, vaultName: this.vaultName, deviceName: this.deviceName },
 				this.host,
-				{ request: this.request, onProgress: (text) => this.setStatus(text, false) },
+				{ request: this.request, onProgress: (text) => this.statusLine.set(text, false) },
 			);
 			this.operatorKey = "";
 			if (result.replaced) {
@@ -218,7 +205,7 @@ export class CreateVaultModal extends Modal {
 			if (this.open_) void this.check(result.vaultId);
 			else new Notice("YAOS: the new vault exists. Open YAOS settings and choose \"Finish creating this vault\".", 10000);
 		} catch (err) {
-			this.setStatus(errorMessage(err), true);
+			this.statusLine.set(errorMessage(err), true);
 			if (!this.open_) new Notice(`YAOS: ${errorMessage(err)}`, 9000);
 		} finally {
 			this.busy = false;
@@ -230,7 +217,7 @@ export class CreateVaultModal extends Modal {
 	private async check(vaultId: string): Promise<void> {
 		const el = this.reset();
 		el.createEl("p", { text: "Checking that the new vault is empty…" });
-		this.status(el);
+		this.statusLine.attach(el);
 		try {
 			await confirmEmptyVault(this.host, vaultId);
 			if (this.open_) this.showChoice(vaultId);
@@ -267,7 +254,7 @@ export class CreateVaultModal extends Modal {
 		};
 		option(true, "End-to-end encryption: On (recommended)", "Notes and attachments are encrypted on your devices. Your server stores them but cannot read them. You get a recovery key to save.");
 		option(false, "End-to-end encryption: Off", "Your server can read this vault's notes and attachments.");
-		this.status(el);
+		this.statusLine.attach(el);
 		new Setting(el).addButton((b) => b.setButtonText("Continue").setCta().onClick(async () => {
 			if (this.busy) return;
 			this.busy = true;
@@ -289,10 +276,10 @@ export class CreateVaultModal extends Modal {
 			confirmText: "Turn on encryption",
 		});
 		if (!rk) {
-			this.setStatus("Nothing was decided yet. Continue when you are ready to save a recovery key.", false);
+			this.statusLine.set("Nothing was decided yet. Continue when you are ready to save a recovery key.", false);
 			return;
 		}
-		this.setStatus("Turning on end-to-end encryption…", false);
+		this.statusLine.set("Turning on end-to-end encryption…", false);
 		try {
 			await enableEncryption(this.host, vaultId, rk);
 			new Notice("YAOS: the new vault is end-to-end encrypted.", 8000);
@@ -309,7 +296,7 @@ export class CreateVaultModal extends Modal {
 			confirmText: "Sync without encryption",
 		});
 		if (!ok) return;
-		this.setStatus("Saving your choice…", false);
+		this.statusLine.set("Saving your choice…", false);
 		try {
 			await optOutOfEncryption(this.host, vaultId);
 			new Notice("YAOS: the new vault syncs without end-to-end encryption.", 8000);
@@ -325,13 +312,13 @@ export class CreateVaultModal extends Modal {
 			return;
 		}
 		if (err instanceof CreateVaultError && err.code !== "unconfirmed") this.failed(err, vaultId);
-		else this.setStatus(errorMessage(err), true);
+		else this.statusLine.set(errorMessage(err), true);
 	}
 
 	onClose(): void {
 		this.open_ = false;
 		this.operatorKey = "";
 		this.contentEl.empty();
-		this.statusEl = null;
+		this.statusLine.detach();
 	}
 }
