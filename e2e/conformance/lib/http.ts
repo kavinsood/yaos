@@ -1,5 +1,6 @@
 /** Minimal HTTP helper (global fetch). Never logs headers or bodies. */
 import type { Ctx } from "./context.ts";
+import { decodeReadReply, READ_BINARY_TYPE } from "./codec.ts";
 import { now, round } from "./util.ts";
 
 export interface HttpResult { status: number; value: any; headers: Headers; ms: number }
@@ -25,9 +26,15 @@ export async function http(ctx: Ctx, method: string, path: string, options: Http
 	const t0 = now();
 	const response = await fetch(`${ctx.host}${path}`, { method, headers, body, redirect: "manual",
 		signal: AbortSignal.timeout(options.timeoutMs ?? 60000) });
-	const text = await response.text();
+	const bytes = new Uint8Array(await response.arrayBuffer());
 	let value: any = null;
-	try { value = text ? JSON.parse(text) : null; } catch { value = { raw: text.slice(0, 120) }; }
+	if ((response.headers.get("content-type") ?? "").startsWith(READ_BINARY_TYPE)) {
+		// A read reply (relay-wire §7.2): decoded; a malformed body is reported like an unparsable one.
+		try { value = decodeReadReply(bytes); } catch (error) { value = { raw: `binary: ${(error as Error).message}` }; }
+	} else {
+		const text = new TextDecoder().decode(bytes);
+		try { value = text ? JSON.parse(text) : null; } catch { value = { raw: text.slice(0, 120) }; }
+	}
 	return { status: response.status, value, headers: response.headers, ms: round(now() - t0) };
 }
 

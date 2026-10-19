@@ -38,6 +38,14 @@ export const STREAM_READ_BATCH_MAX_STREAMS = 128;
 export const MAX_STREAM_SOCKETS = 1000;
 /** H6: concurrent streams sockets per device; a 5th connect closes the device's oldest (1001 `device_socket_limit`). */
 export const MAX_STREAM_SOCKETS_PER_DEVICE = 4;
+/** Streams in one STREAM_SUBSCRIBE set (after dedupe); VAULT_READY `limits.maxSubscriptions`. */
+export const MAX_STREAM_SUBSCRIPTIONS = 128;
+/**
+ * A subscription set is persisted in the socket attachment (it survives a hibernation wake) only while its JSON
+ * encoding is at most this many UTF-8 bytes; a larger set is kept in memory only and restores as empty after a wake
+ * (until the client resends). The attachment itself is capped at 2,048 bytes and carries about 450 already.
+ */
+export const SUBSCRIPTION_ATTACHMENT_BYTES = 1024;
 
 /** Client -> server binary frame kinds (byte 0). */
 export const STREAM_FRAME_APPEND = 0x01;
@@ -45,6 +53,7 @@ export const STREAM_FRAME_APPEND = 0x01;
 export const STREAM_FRAME_PROVISIONAL = 0x10;
 export const STREAM_FRAME_COMMITTED = 0x11;
 export const STREAM_FRAME_COMMIT_NOTICE = 0x12;
+export const STREAM_FRAME_SKIPPED = 0x13;
 
 /**
  * Streams whose frames are broadcast before the commit (PROVISIONAL, then a
@@ -201,10 +210,34 @@ export function encodeCommitNotice(frame: StreamFrameIdentity & { seq: number })
 	return encoding.toUint8Array(encoder);
 }
 
+/** One stream's run in a STREAM_SKIPPED frame: seqs strictly ascending, at least one. */
+export interface SkippedRun {
+	stream: string;
+	seqs: number[];
+}
+
+/**
+ * 0x13 STREAM_SKIPPED: `varuint streamCount`, then per stream `varstring stream | varuint n | varuint firstSeq |
+ * varuint delta×(n-1)`. The caller orders `runs` by first seq; seqs ascend within a run (every delta > 0).
+ */
+export function encodeSkipped(runs: readonly SkippedRun[]): Uint8Array {
+	const encoder = encoding.createEncoder();
+	encoding.writeUint8(encoder, STREAM_FRAME_SKIPPED);
+	encoding.writeVarUint(encoder, runs.length);
+	for (const run of runs) {
+		encoding.writeVarString(encoder, run.stream);
+		encoding.writeVarUint(encoder, run.seqs.length);
+		encoding.writeVarUint(encoder, run.seqs[0]!);
+		for (let index = 1; index < run.seqs.length; index++) encoding.writeVarUint(encoder, run.seqs[index]! - run.seqs[index - 1]!);
+	}
+	return encoding.toUint8Array(encoder);
+}
+
 export type ServerStreamFrame =
 	| ({ kind: "provisional"; payload: Uint8Array } & StreamFrameIdentity)
 	| ({ kind: "committed"; seq: number; payload: Uint8Array } & StreamFrameIdentity)
-	| ({ kind: "notice"; seq: number } & StreamFrameIdentity);
+	| ({ kind: "notice"; seq: number } & StreamFrameIdentity)
+	| { kind: "skipped"; runs: SkippedRun[] };
 
 /** Decodes one server -> client binary message (tests and tooling). Throws on malformed input. */
 export function decodeServerFrame(bytes: Uint8Array): ServerStreamFrame {
@@ -225,7 +258,101 @@ export function decodeServerFrame(bytes: Uint8Array): ServerStreamFrame {
 			? { kind: "committed", seq, stream, deviceId, clientFrameId, payload: decoding.readVarUint8Array(decoder) }
 			: { kind: "notice", seq, stream, deviceId, clientFrameId };
 	}
+	if (kind === STREAM_FRAME_SKIPPED) {
+		const runs: SkippedRun[] = [];
+		for (let streams = decoding.readVarUint(decoder); streams > 0; streams--) {
+			const stream = decoding.readVarString(decoder);
+			const count = decoding.readVarUint(decoder);
+			if (count < 1) throw new Error("empty skipped run");
+			const seqs = [decoding.readVarUint(decoder)];
+			for (let index = 1; index < count; index++) {
+				const delta = decoding.readVarUint(decoder);
+				if (delta < 1) throw new Error("non-ascending skipped run");
+				seqs.push(seqs[index - 1]! + delta);
+			}
+			runs.push({ stream, seqs });
+		}
+		return { kind: "skipped", runs };
+	}
 	throw new Error(`unknown server stream frame kind ${kind}`);
+}
+
+// ---- binary catch-up reads (relay-wire §7.2) -----------------------------------
+
+/** Content-Type of every read reply (relay-wire §7.2). */
+export const STREAM_READ_BINARY_TYPE = "application/vnd.yaos.streams-read.v1+binary";
+/** Byte 0 of a binary read reply. */
+export const STREAM_READ_BINARY_VERSION = 1;
+
+export interface StreamReadReplyPage {
+	stream: string;
+	lastSeq: number;
+	checkpointSeq: number;
+	gcSeq: number;
+	checkpoint: { coversSeq: number; bytes: Uint8Array } | null;
+	rows: StreamRow[];
+	nextAfter: number | null;
+}
+
+/**
+ * A single or batched read reply: `u8 1 | varstring vaultEpoch | varuint head | varuint pageCount`, then per page
+ * `varstring stream | varuint lastSeq | varuint checkpointSeq | varuint gcSeq | varuint nextAfter+1 (0: none) |
+ * u8 hasCheckpoint [varuint coversSeq | varbytes checkpoint] | varuint rowCount | row×rowCount` (rows as encodeRow).
+ * Payloads and checkpoints travel as raw bytes.
+ */
+export function encodeReadReply(vaultEpoch: string, head: number, pages: readonly StreamReadReplyPage[]): Uint8Array {
+	const encoder = encoding.createEncoder();
+	encoding.writeUint8(encoder, STREAM_READ_BINARY_VERSION);
+	encoding.writeVarString(encoder, vaultEpoch);
+	encoding.writeVarUint(encoder, head);
+	encoding.writeVarUint(encoder, pages.length);
+	for (const page of pages) {
+		encoding.writeVarString(encoder, page.stream);
+		encoding.writeVarUint(encoder, page.lastSeq);
+		encoding.writeVarUint(encoder, page.checkpointSeq);
+		encoding.writeVarUint(encoder, page.gcSeq);
+		encoding.writeVarUint(encoder, page.nextAfter === null ? 0 : page.nextAfter + 1);
+		encoding.writeUint8(encoder, page.checkpoint ? 1 : 0);
+		if (page.checkpoint) {
+			encoding.writeVarUint(encoder, page.checkpoint.coversSeq);
+			encoding.writeVarUint8Array(encoder, page.checkpoint.bytes);
+		}
+		encoding.writeVarUint(encoder, page.rows.length);
+		for (const row of page.rows) {
+			encoding.writeVarUint(encoder, row.seq);
+			encoding.writeVarString(encoder, row.deviceId);
+			encoding.writeVarString(encoder, row.clientFrameId);
+			encoding.writeVarUint8Array(encoder, row.payload);
+		}
+	}
+	return encoding.toUint8Array(encoder);
+}
+
+/** Decodes a binary read reply (tests and tooling). Throws on malformed input. */
+export function decodeReadReply(bytes: Uint8Array): { vaultEpoch: string; head: number; pages: StreamReadReplyPage[] } {
+	const decoder = decoding.createDecoder(bytes);
+	const version = decoding.readUint8(decoder);
+	if (version !== STREAM_READ_BINARY_VERSION) throw new Error(`unknown read reply version ${version}`);
+	const vaultEpoch = decoding.readVarString(decoder);
+	const head = decoding.readVarUint(decoder);
+	const pages: StreamReadReplyPage[] = [];
+	for (let count = decoding.readVarUint(decoder); count > 0; count--) {
+		const stream = decoding.readVarString(decoder);
+		const lastSeq = decoding.readVarUint(decoder);
+		const checkpointSeq = decoding.readVarUint(decoder);
+		const gcSeq = decoding.readVarUint(decoder);
+		const nextAfterRaw = decoding.readVarUint(decoder);
+		const checkpoint = decoding.readUint8(decoder) === 1
+			? { coversSeq: decoding.readVarUint(decoder), bytes: decoding.readVarUint8Array(decoder) } : null;
+		const rows: StreamRow[] = [];
+		for (let rowCount = decoding.readVarUint(decoder); rowCount > 0; rowCount--) {
+			rows.push({ seq: decoding.readVarUint(decoder), deviceId: decoding.readVarString(decoder),
+				clientFrameId: decoding.readVarString(decoder), payload: decoding.readVarUint8Array(decoder) });
+		}
+		pages.push({ stream, lastSeq, checkpointSeq, gcSeq, checkpoint, rows, nextAfter: nextAfterRaw === 0 ? null : nextAfterRaw - 1 });
+	}
+	if (decoder.pos !== bytes.byteLength) throw new Error("trailing bytes in read reply");
+	return { vaultEpoch, head, pages };
 }
 
 // ---- stored row records (segment blobs) -------------------------------------

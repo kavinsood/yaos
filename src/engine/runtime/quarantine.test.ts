@@ -317,6 +317,9 @@ test("quarantine: a reader-dependent row this reader opens by the time it is sto
 		await live(a, b);
 		const id = await createDoc(a, "t.md", "base;");
 		await converged([a, b]);
+		// Bound on b: subscribed, so a's row arrives live (an unbound doc's rows are skipped and read: tReadPage).
+		await b.bind(id);
+		await converged([a, b]);
 		const stream = a.streamOf(id);
 		const repo = b.c.repo;
 		const tLive = repo.tLive.bind(repo);

@@ -7,8 +7,10 @@ export function buildStatus(c: EngineCtx): StatusSnapshot {
 	let staleStreams = 0;
 	let quarantinedRows = 0;
 	let frozenDocs = 0;
+	const now = c.mono();
 	for (const r of c.repo.streams()) {
-		if (r.stale && r.cls !== "other") staleStreams++;
+		// A deferred read (skipped rows, DESIGN §d.7) is not being fetched: not "behind" in the status.
+		if (r.stale && r.cls !== "other" && !(c.subs?.deferred(r, now) ?? false)) staleStreams++;
 		quarantinedRows += r.quarantinedRows;
 		if (r.frozen) frozenDocs++;
 	}

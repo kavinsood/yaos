@@ -221,6 +221,27 @@ export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 5 * 60_000;
 export const SUPERSEDED_RETRY_MS = 60_000;
 
+// --- Stream subscriptions (DESIGN §d.7) ---------------------------------------
+
+/** Subscription set changes are sent at most this often (debounced). */
+export const SUBSCRIBE_DEBOUNCE_MS = 250;
+/** Recently unbound docs stay subscribed: the newest this many ... */
+export const RECENT_UNBOUND_KEEP = 8;
+/** ... for this long after their unbind. */
+export const RECENT_UNBOUND_MS = 10 * 60_000;
+
+/**
+ * Deferred read of a stream made stale by skipped rows (not bound, nothing own in flight): read once it was quiet for
+ * settleMs (no skip since), or at the latest maxDeferMs after its first skip. A read returns a checkpoint instead
+ * of rows only once the author's checkpoint duty fired (>= REMOTE_CHECKPOINT_ROWS / _BYTES behind and
+ * REMOTE_CHECKPOINT_IDLE_MS idle, or the REMOTE_CHECKPOINT_SETTLE_MS settle rule): phones wait past the settle rule,
+ * desktops read short edits as rows, which are still coalesced and batched.
+ */
+export interface SkipDefer {
+	readonly settleMs: number;
+	readonly maxDeferMs: number;
+}
+
 // --- Device classes and budgets (DESIGN §i.2) -------------------------------
 
 export type DeviceClass = "desktop" | "tablet" | "phone" | "constrained";
@@ -247,6 +268,13 @@ export interface Budgets {
 	readonly dailyFrameSoftBudget: number;
 	readonly docUpdateWindowBytes: number;
 }
+
+export const SKIP_DEFER: Readonly<Record<DeviceClass, SkipDefer>> = {
+	desktop: { settleMs: 5_000, maxDeferMs: 30_000 },
+	tablet: { settleMs: 150_000, maxDeferMs: 10 * 60_000 },
+	phone: { settleMs: 150_000, maxDeferMs: 10 * 60_000 },
+	constrained: { settleMs: 150_000, maxDeferMs: 15 * 60_000 },
+};
 
 export const BUDGETS: Readonly<Record<DeviceClass, Budgets>> = {
 	desktop: {

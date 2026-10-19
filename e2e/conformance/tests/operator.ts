@@ -6,6 +6,7 @@ import { device, operatorCookie, vault } from "../lib/fixture.ts";
 import type { Device, Vault } from "../lib/fixture.ts";
 import { brief, http, isRouteMissing } from "../lib/http.ts";
 import type { HttpResult } from "../lib/http.ts";
+import { readPage } from "../lib/streams.ts";
 import { StreamSocket } from "../lib/socket.ts";
 import { findDeviceEntries, id, now, payloadOf, round, tokenLikeKeys } from "../lib/util.ts";
 
@@ -44,7 +45,7 @@ async function bearerProbe(ctx: Ctx, v: Vault, d: Device) {
 	const results = {
 		ticket: await http(ctx, "POST", `${v.path}/auth/ticket`, { token, json: { purpose: "streams" } }),
 		feed: await http(ctx, "GET", `${v.path}/streams/feed?after=0`, { token }),
-		read: await http(ctx, "GET", `${v.path}/streams/read?stream=ns&after=0`, { token }),
+		read: await readPage(ctx, `${v.path}/streams/read?stream=ns&after=0`, { token }),
 		pairingCode: await http(ctx, "POST", `${v.path}/auth/pairing-code`, { token, json: { purpose: "device" } }),
 	};
 	for (const r of Object.values(results)) guard(ctx, r.value);

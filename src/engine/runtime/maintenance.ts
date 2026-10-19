@@ -1,8 +1,9 @@
 /**
  * Periodic engine work (one tick every maintenanceMs, never overlapping):
  * gap feed (DESIGN §d.7), local compaction (§d.8), remote
- * checkpoint duty (§d.9), daily-limit release, residency budget, catch-up
- * scheduling.
+ * checkpoint duty (§d.9), daily-limit release, residency budget, expiry of
+ * recently unbound subscriptions, catch-up scheduling (which also starts the
+ * reads whose skip deferral ran out, §d.7).
  */
 
 import { TAIL_HARD_ROWS } from "../../core/limits";
@@ -71,6 +72,7 @@ export class Maintenance {
 			}
 		}
 		c.handles.enforceBudget();
+		c.subs.tick();
 		c.sess.scheduleCatchUp();
 		c.scheduleStatus();
 	}

@@ -12,7 +12,7 @@ test("relay restart: buffer lost unacked, STREAM_RESEND{head} to every socket, h
 	const clock = new VirtualClock();
 	const relay = new SimRelay({ clock });
 	const a = await connectPeer(relay, clock, "A");
-	const b = await connectPeer(relay, clock, "B");
+	const b = await connectPeer(relay, clock, "B", ["b:x"]);
 	a.session.append(frame("b:x", "p1", "v"));
 	a.session.append(frame("ns", "n1", "op"));
 	await clock.advance(10);
@@ -66,7 +66,7 @@ test("relay faults: durability failure refuses every frame of the commit (one VA
 	const clock = new VirtualClock();
 	const relay = new SimRelay({ clock });
 	const a = await connectPeer(relay, clock, "A");
-	const b = await connectPeer(relay, clock, "B");
+	const b = await connectPeer(relay, clock, "B", ["b:x"]);
 	a.session.append(frame("b:x", "p1", "v"));
 	a.session.append(frame("ns", "n1", "op"));
 	a.session.append(frame("ns", "n2", "op"));

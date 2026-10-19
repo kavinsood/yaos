@@ -6,7 +6,7 @@
 
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { WebSocketCtor, WebSocketLike } from "./wsRelay";
-import { CONTROL_PREFIX, decodeAppend, encodeServerFrame, type WireAppend, type WireServerFrame } from "./relayFrames";
+import { CONTROL_PREFIX, decodeAppend, encodeReadReply, encodeServerFrame, READ_BINARY_TYPE, type WireAppend, type WireReadPage, type WireServerFrame } from "./relayFrames";
 
 export class ManualClock implements ClockPort {
 	private mono = 0;
@@ -133,6 +133,11 @@ export interface FakeRequest {
 
 export function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
 	return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+}
+
+/** A 200 read reply (relay-wire §7.2) carrying `pages`: one for a single read, the served prefix for a batch. */
+export function readResponse(pages: readonly WireReadPage[], head = 42, vaultEpoch = "E1"): Response {
+	return new Response(encodeReadReply({ vaultEpoch, head, pages }), { status: 200, headers: { "content-type": READ_BINARY_TYPE } });
 }
 
 /** A fetch that routes every call through `route`; `"network"` simulates a TypeError (offline). */

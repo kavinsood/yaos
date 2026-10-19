@@ -104,8 +104,11 @@ export type LiveItem =
 	| { readonly t: "quarantine"; readonly rec: QuarantineRecord; readonly settleAdoptable: ClientFrameId | null }
 	/** Own frame receipt (or late receipt). Content comes from the outbox record. */
 	| { readonly t: "receipt"; readonly stream: StreamName; readonly clientFrameId: ClientFrameId; readonly seq: Seq; readonly copy?: OwnCommitCopy }
-	/** Overflow / null payload: record stale, read later (T_stale). */
-	| { readonly t: "stale"; readonly stream: StreamName; readonly seq: Seq }
+	/**
+	 * Overflow / null payload / skipped row: record stale, read later (T_stale). foreign: the row is known to be
+	 * another device's (skipped rows always are): a seq past lastOwnSeq hands the checkpoint duty on, as a row does.
+	 */
+	| { readonly t: "stale"; readonly stream: StreamName; readonly seq: Seq; readonly foreign?: boolean }
 	/** Accounted, nothing stored (unknown stream class, a stale-epoch body row, §14.3). */
 	| { readonly t: "account"; readonly seq: Seq; readonly settleAdoptable: ClientFrameId | null };
 
@@ -410,6 +413,7 @@ export class Repo {
 					}
 					if (it.t === "stale") {
 						const r = await getRec(it.stream);
+						if (it.foreign === true && it.seq > r.lastOwnSeq && duty.delete(it.stream)) dutyChanged = true;
 						r.remoteHeadSeq = Math.max(r.remoteHeadSeq, it.seq);
 						r.stale = r.appliedSeq < r.remoteHeadSeq ? 1 : 0;
 						continue;
@@ -528,8 +532,18 @@ export class Repo {
 			const renamed: OutboxRename[] = [];
 			const tailPut: TailRecord[] = [];
 			let froze = false;
+			let dropDuty = false;
 			const out = await this.db.tx([STORE.tail, STORE.quarantine, STORE.outbox, STORE.streams, STORE.snapshots, STORE.meta], "readwrite", async (tx) => {
 				const r: Mut<StreamRecord> = { ...((await tx.get(STORE.streams, input.stream)) ?? newStreamRecord(input.stream)) };
+				// Another device's row past our last own one hands the checkpoint duty on (as in tLive): with
+				// subscriptions such rows often arrive by a read, not live.
+				const lastOwn = input.lateReceipts.reduce((m, lr) => Math.max(m, lr.seq), r.lastOwnSeq);
+				dropDuty = this.ckptDuty.has(input.stream) && input.rows.some((row) => row.deviceId !== self && row.seq > lastOwn);
+				if (dropDuty) {
+					const duty = new Set(this.ckptDuty);
+					duty.delete(input.stream);
+					tx.put(STORE.meta, { key: "ckptDuty", streams: [...duty] });
+				}
 				if (input.freshSnapshot && input.freshSnapshot.coversSeq > r.snapshotCoversSeq) {
 					const c = input.freshSnapshot.coversSeq;
 					await deleteTailThrough(tx, r, input.stream, c);
@@ -575,6 +589,11 @@ export class Repo {
 				return r;
 			});
 			this.cache.set(out.stream, out);
+			if (dropDuty) {
+				const duty = new Set(this.ckptDuty);
+				duty.delete(input.stream);
+				this.ckptDuty = duty;
+			}
 			if (froze) this.onQuarantineFrozen([out]);
 			if (input.quarantines.length > 0 || tailPut.length > 0) this.onStored(input.quarantines, tailPut);
 			return { stream: out, removed, receipts: receiptSeqs, updated, renamed, tailPut };

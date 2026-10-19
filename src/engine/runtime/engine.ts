@@ -37,7 +37,8 @@ import { LiveIngest } from "./liveIngest";
 import { Maintenance } from "./maintenance";
 import { MirrorWriter, recoverFromMirror } from "./mirrorIo";
 import { Resealer } from "./reseal";
-import type { EngineOptions } from "./options";
+import { resolveSkipDefer, type EngineOptions } from "./options";
+import { Subscriptions } from "./subscriptions";
 import { SessionLoop } from "./sessionLoop";
 import { KeyringRuntime } from "../keyring/keyringRuntime";
 import type { OwnOutcome, QrResult } from "../keyring/keyring";
@@ -131,6 +132,7 @@ export class LogEngine {
 		});
 		c.live = new LiveIngest(c);
 		c.sess = new SessionLoop(c);
+		c.subs = new Subscriptions(c, resolveSkipDefer(c.deviceClass, c.tuning));
 		c.mirror = new MirrorWriter(c, opts.sideFiles ?? null);
 		const eng = new LogEngine(c);
 		if (o.outcome.t === "fresh" && opts.sideFiles) {
@@ -338,6 +340,8 @@ export class LogEngine {
 		const h = await c.handles.load(stream);
 		h.bound++;
 		this.boundStreams.set(docId, stream);
+		// Subscribed (debounced) and read at once: a bound stream is never deferred, and first in catch-up order.
+		c.subs.noteBound(stream);
 		c.sess.scheduleCatchUp();
 	}
 
@@ -349,6 +353,7 @@ export class LogEngine {
 		h.bound = Math.max(0, h.bound - 1);
 		if (h.bound > 0) return;
 		this.boundStreams.delete(docId);
+		c.subs.noteUnbound(h.stream);
 		if (!h.builder.empty) void c.docs.closeFrame(h);
 		c.handles.enforceBudget();
 	}
@@ -379,7 +384,27 @@ export class LogEngine {
 		await c.mirror.flush();
 	}
 
-	/** Nothing open, queued, unreceipted, stale or above V. */
+	/**
+	 * The disk side waits for these docs' bodies (a plan's "body-not-caught-up"): their reads are not deferred
+	 * (DESIGN §d.7). Unknown docs are ignored.
+	 */
+	wantFresh(docIds: readonly DocId[]): void {
+		const streams: StreamName[] = [];
+		for (const id of docIds) {
+			try {
+				streams.push(this.streamOf(id));
+			} catch {
+				// unknown doc: nothing to read
+			}
+		}
+		this.c.subs.wantFresh(streams);
+	}
+
+	/**
+	 * Nothing open, queued, unreceipted, stale or above V: converged with the relay. A stream whose read is deferred
+	 * (skipped rows, DESIGN §d.7) is stale, so it keeps the engine busy until read; tests that wait for quiescence
+	 * use tuning skipSettleMs 0 (FAST_TUNING). Status staleStreams leaves deferred streams out (nothing is fetched).
+	 */
 	isIdle(): boolean {
 		const c = this.c;
 		if (!c.session || !c.live.enabled || !c.docs.editIdle || !c.live.idle || c.sess.readsInFlight > 0 || c.sess.isFeeding) return false;

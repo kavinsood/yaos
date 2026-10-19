@@ -5,8 +5,9 @@ import { device, ensureDevice, vault } from "../lib/fixture.ts";
 import type { Device, Vault } from "../lib/fixture.ts";
 import { rawAppend, utf8Bytes, varUintBytes } from "../lib/codec.ts";
 import { brief, http } from "../lib/http.ts";
+import { readPage } from "../lib/streams.ts";
 import { StreamSocket } from "../lib/socket.ts";
-import { b64, bytesEqual, id, median, payloadOf, round, sleep } from "../lib/util.ts";
+import { bytesEqual, id, median, payloadOf, round, sleep } from "../lib/util.ts";
 
 const isStr = (x: unknown) => typeof x === "string" && x.length > 0;
 const isUint = (x: unknown) => Number.isSafeInteger(x) && (x as number) >= 0;
@@ -111,6 +112,7 @@ export const tests: TestDef[] = [
 			const body = payloadOf("valid", 128);
 			const a = await StreamSocket.connect(ctx, v.vaultId, device(v, "A"), "A");
 			const b = await StreamSocket.connect(ctx, v.vaultId, device(v, "B"), "B");
+			await b.subscribe([stream]);
 			const fromB = b.mark();
 			const frame = rawAppend({ stream: utf8Bytes(stream), id: utf8Bytes(fid), payload: Array.from(body) });
 			t.check("encoder emits minimal lengths", frame[1] === utf8Bytes(stream).byteLength && varUintBytes(utf8Bytes(stream).byteLength).length === 1);
@@ -126,9 +128,9 @@ export const tests: TestDef[] = [
 			t.check("peer PROVISIONAL + NOTICE carry the identical stream string", provisional?.stream === stream && notice?.value.stream === stream
 				&& bytesEqual(provisional?.payload, body), { provisional: provisional ? JSON.stringify(provisional.stream) : null,
 				notice: notice ? JSON.stringify(notice.value.stream) : null });
-			const read = await http(ctx, "GET", `${v.path}/streams/read?stream=${encodeURIComponent(stream)}&after=0`, { token: device(v, "B").token });
+			const read = await readPage(ctx, `${v.path}/streams/read?stream=${encodeURIComponent(stream)}&after=0`, { token: device(v, "B").token });
 			t.check("read by name returns the row byte-identical", read.status === 200 && read.value?.stream === stream
-				&& read.value.rows?.length === 1 && bytesEqual(b64(read.value.rows[0].payload), body), brief(read, { rows: read.value?.rows?.length }));
+				&& read.value.rows?.length === 1 && bytesEqual(read.value.rows[0].payload, body), brief(read, { rows: read.value?.rows?.length }));
 			const feed = await http(ctx, "GET", `${v.path}/streams/feed?after=0`, { token: device(v, "B").token });
 			t.check("feed lists the identical stream string", (feed.value?.changes ?? []).some((c: any) => c.stream === stream), brief(feed));
 		},
@@ -165,6 +167,7 @@ export const tests: TestDef[] = [
 			const plainStream = `t:two-${id(6)}`;
 			const pb = payloadOf("two-b", 500);
 			const pt = payloadOf("two-t", 700);
+			for (const socket of [a1, a2]) await socket.subscribe([docStream]);
 			const marks = [a1.mark(), a2.mark()];
 			const receipts = await b.appendAll([{ stream: docStream, id: "two-b", payload: pb }, { stream: plainStream, id: "two-t", payload: pt }]);
 			t.check("origin got both receipts", receipts.size === 2, [...receipts.values()].map((r) => ({ seq: r.seq, deduped: r.deduped })));

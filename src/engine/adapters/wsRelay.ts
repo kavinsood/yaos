@@ -16,6 +16,9 @@
  *   VAULT_PING is sent; with nothing received within timeoutMs the socket is
  *   closed with LIVENESS_CLOSE_CODE and "closed" is emitted. ping() sends one
  *   on demand (the device check's round trip) and resolves on its own pong.
+ * - Subscriptions (relay-wire §5.6): subscribe() sends STREAM_SUBSCRIBE and keeps the set; STREAM_RESEND (a relay
+ *   runtime restart, which may have lost it) sends it again before the event is emitted. STREAM_SKIPPED decodes
+ *   to "skipped".
  * - Exactly one "closed" event ends every session. close() emits it
  *   synchronously; later socket callbacks are ignored.
  *
@@ -45,6 +48,7 @@ import {
 	decodeServerFrame,
 	encodeAppend,
 	encodePing,
+	encodeSubscribe,
 	parseControl,
 	STREAMS_VERSION,
 	type WireControl,
@@ -88,16 +92,6 @@ export interface WsRelayOptions {
 	readonly liveness?: { readonly idleMs?: number; readonly timeoutMs?: number };
 }
 
-export const DEFAULT_RELAY_LIMITS: RelayLimits = {
-	maxFrameBytes: 1024 * 1024,
-	maxCheckpointBytes: 4 * 1024 * 1024,
-	appendBytesPerSec: 256 * 1024,
-	burstBytes: 2 * 1024 * 1024,
-	feedPageRows: 1000,
-	readPageBytes: 1024 * 1024,
-	readBatchStreams: 1,
-};
-
 export const DEFAULT_LIVENESS = { idleMs: 60_000, timeoutMs: 15_000 } as const;
 export const DEFAULT_READY_TIMEOUT_MS = 15_000;
 export const DEFAULT_PROVISIONAL_CACHE_BYTES = 16 * 1024 * 1024;
@@ -108,15 +102,17 @@ export const LIVENESS_TIMEOUT_ERROR = "liveness_timeout";
 
 const WS_OPEN = 1;
 
+/** VAULT_READY limits -> RelayLimits. */
 export function mapLimits(wire: WireLimits): RelayLimits {
 	return {
-		maxFrameBytes: wire.maxPayloadBytes ?? DEFAULT_RELAY_LIMITS.maxFrameBytes,
-		maxCheckpointBytes: wire.maxCheckpointBytes ?? DEFAULT_RELAY_LIMITS.maxCheckpointBytes,
-		appendBytesPerSec: wire.rateBytesPerSec ?? DEFAULT_RELAY_LIMITS.appendBytesPerSec,
-		burstBytes: wire.burstBytes ?? DEFAULT_RELAY_LIMITS.burstBytes,
-		feedPageRows: wire.feedDefaultLimit ?? DEFAULT_RELAY_LIMITS.feedPageRows,
-		readPageBytes: wire.readDefaultBytes ?? DEFAULT_RELAY_LIMITS.readPageBytes,
-		readBatchStreams: Math.max(1, Math.floor(wire.readBatchMaxStreams ?? DEFAULT_RELAY_LIMITS.readBatchStreams)),
+		maxFrameBytes: wire.maxPayloadBytes,
+		maxCheckpointBytes: wire.maxCheckpointBytes,
+		appendBytesPerSec: wire.rateBytesPerSec,
+		burstBytes: wire.burstBytes,
+		feedPageRows: wire.feedDefaultLimit,
+		readPageBytes: wire.readDefaultBytes,
+		readBatchStreams: Math.max(1, Math.floor(wire.readBatchMaxStreams)),
+		maxSubscriptions: Math.max(1, Math.floor(wire.maxSubscriptions)),
 	};
 }
 
@@ -212,9 +208,13 @@ interface SessionInit {
 	readonly ws: WebSocketLike;
 	readonly http: RelayHttp;
 	readonly vaultId: string;
+	/** This device (connect params): a receipt ends any PROVISIONAL of its own frame held here. */
+	readonly deviceId: string;
 	readonly clock: ClockPort;
 	readonly nextProbeId: () => string;
 	readonly ready: Extract<WireControl, { type: "VAULT_READY" }>;
+	/** ready.limits, already checked present. */
+	readonly limits: WireLimits;
 	readonly join: ProvisionalJoin;
 	readonly onListenerError: (error: unknown) => void;
 	readonly liveness: { readonly idleMs?: number; readonly timeoutMs?: number } | undefined;
@@ -229,6 +229,7 @@ class WsRelaySession implements RelaySession {
 	private readonly ws: WebSocketLike;
 	private readonly http: RelayHttp;
 	private readonly vaultId: string;
+	private readonly deviceId: string;
 	private readonly clock: ClockPort;
 	private readonly nextProbeId: () => string;
 	private readonly join: ProvisionalJoin;
@@ -249,6 +250,9 @@ class WsRelaySession implements RelaySession {
 	/** ping() calls waiting for their pong, by probe id. */
 	private readonly probes = new Map<string, { resolve(headSeq: number): void; reject(error: Error): void }>();
 
+	/** The last subscribe() set sent (null: never subscribed); resent on STREAM_RESEND. */
+	private subscription: readonly string[] | null = null;
+
 	private lastRx: number;
 	private idleTimer: TimerHandle | null = null;
 	private timeoutTimer: TimerHandle | null = null;
@@ -257,6 +261,7 @@ class WsRelaySession implements RelaySession {
 		this.ws = init.ws;
 		this.http = init.http;
 		this.vaultId = init.vaultId;
+		this.deviceId = init.deviceId;
 		this.clock = init.clock;
 		this.nextProbeId = init.nextProbeId;
 		this.join = init.join;
@@ -264,7 +269,7 @@ class WsRelaySession implements RelaySession {
 		this.vaultEpoch = init.ready.vaultEpoch;
 		this.headSeq = init.ready.head;
 		this.canWrite = init.ready.canWrite;
-		this.limits = mapLimits(init.ready.limits);
+		this.limits = mapLimits(init.limits);
 		this.idleMs = init.liveness?.idleMs ?? init.ready.liveness?.idleMs ?? DEFAULT_LIVENESS.idleMs;
 		this.timeoutMs = init.liveness?.timeoutMs ?? init.ready.liveness?.timeoutMs ?? DEFAULT_LIVENESS.timeoutMs;
 		this.lastRx = this.clock.monotonic();
@@ -291,6 +296,21 @@ class WsRelaySession implements RelaySession {
 		return this.closed ? 0 : this.ws.bufferedAmount;
 	}
 
+	subscribe(streams: readonly StreamName[]): void {
+		if (streams.length > this.limits.maxSubscriptions) throw new RangeError(`relay subscribe: ${streams.length} streams exceed maxSubscriptions ${this.limits.maxSubscriptions}`);
+		this.subscription = [...streams];
+		this.sendSubscription();
+	}
+
+	private sendSubscription(): void {
+		if (this.subscription === null || this.closed || this.ws.readyState !== WS_OPEN) return;
+		try {
+			this.ws.send(encodeSubscribe(this.subscription));
+		} catch {
+			// The close event follows; the next session subscribes again.
+		}
+	}
+
 	feed(afterSeq: number) {
 		return this.http.feed(this.vaultId, afterSeq, this.limits.feedPageRows, this.gone.signal);
 	}
@@ -302,7 +322,7 @@ class WsRelaySession implements RelaySession {
 	async readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]> {
 		const first = reqs[0];
 		if (first === undefined) throw new RangeError("readBatch: no requests");
-		if (this.limits.readBatchStreams <= 1 || reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
+		if (reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
 		return this.http.readBatch(this.vaultId, reqs.slice(0, this.limits.readBatchStreams), this.limits.readPageBytes, this.gone.signal);
 	}
 
@@ -432,6 +452,10 @@ class WsRelaySession implements RelaySession {
 	}
 
 	private onFrame(frame: WireServerFrame): void {
+		if (frame.kind === "skipped") {
+			this.emit({ t: "skipped", rows: frame.rows.map((r) => ({ stream: r.stream as StreamName, seq: r.seq })) });
+			return;
+		}
 		const stream = frame.stream as StreamName;
 		const deviceId = frame.deviceId as DeviceId;
 		const clientFrameId = frame.clientFrameId as ClientFrameId;
@@ -455,6 +479,10 @@ class WsRelaySession implements RelaySession {
 		switch (control.type) {
 			case "STREAM_RECEIPTS":
 				for (const r of control.receipts) {
+					// This socket may hold a PROVISIONAL of its own frame (own-device rows are pushed to every socket of
+					// the device); one that resent the frame while it was pending gets this receipt and no
+					// COMMIT_NOTICE (relay-wire §5.6), so the payload would never be joined.
+					this.join.delete(ProvisionalJoin.key(r.stream, this.deviceId, r.clientFrameId));
 					this.emit({
 						t: "receipt",
 						stream: r.stream as StreamName,
@@ -491,6 +519,8 @@ class WsRelaySession implements RelaySession {
 				return;
 			case "STREAM_RESEND":
 				this.join.clear();
+				// The restarted runtime may have lost the set (one too large for its socket attachment): resend it.
+				this.sendSubscription();
 				this.emit({ t: "resendUnreceipted", headSeq: control.head });
 				return;
 			case "VAULT_PONG": {
@@ -615,13 +645,20 @@ export function createWsRelayPort(opts: WsRelayOptions): RelayPort {
 					return;
 				}
 				if (control.type !== "VAULT_READY") return;
+				// A relay that omits or zeroes a required limit speaks a protocol this client does not: fail closed.
+				if (control.limits === null) {
+					fail("update-required");
+					return;
+				}
 				const session = new WsRelaySession({
 					ws,
 					http,
 					vaultId: params.vaultId,
+					deviceId: params.deviceId,
 					clock,
 					nextProbeId,
 					ready: control,
+					limits: control.limits,
 					join: new ProvisionalJoin(cacheBytes, cacheEntries),
 					onListenerError,
 					liveness: opts.liveness,

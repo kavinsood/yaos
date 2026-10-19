@@ -116,6 +116,31 @@ function decodeServerFrame(bytes: Uint8Array): Frame {
 	throw new Error(`unknown server frame kind ${kind}`);
 }
 
+/** Content-Type of every GET /streams/read reply (relay-wire §7.2). */
+const READ_BINARY_TYPE = "application/vnd.yaos.streams-read.v1+binary";
+
+/**
+ * relay-wire §7.2: `u8 1 | varstring vaultEpoch | varuint head | varuint pageCount | page*`. This script only issues
+ * single reads, so the one page is returned flattened next to vaultEpoch and head.
+ */
+function decodeReadPage(bytes: Uint8Array) {
+	const r = new Reader(bytes);
+	if (r.u8() !== 1) throw new Error("unknown read reply version");
+	const vaultEpoch = r.varString();
+	const head = r.varUint();
+	if (r.varUint() !== 1) throw new Error("a single read has one page");
+	const stream = r.varString();
+	const lastSeq = r.varUint();
+	const checkpointSeq = r.varUint();
+	const gcSeq = r.varUint();
+	const nextAfterRaw = r.varUint();
+	const checkpoint = r.u8() === 1 ? { coversSeq: r.varUint(), bytes: r.varBytes() } : null;
+	const rows: Array<{ seq: number; deviceId: string; clientFrameId: string; payload: Uint8Array }> = [];
+	for (let k = r.varUint(); k > 0; k--) rows.push({ seq: r.varUint(), deviceId: r.varString(), clientFrameId: r.varString(), payload: r.varBytes() });
+	if (r.pos !== bytes.byteLength) throw new Error("trailing bytes");
+	return { vaultEpoch, head, stream, lastSeq, checkpointSeq, gcSeq, nextAfter: nextAfterRaw === 0 ? null : nextAfterRaw - 1, checkpoint, rows };
+}
+
 // ---------------------------------------------------------------- results
 interface Check { step: string; name: string; ok: boolean; detail?: unknown }
 const checks: Check[] = [];
@@ -135,7 +160,6 @@ const id = (bytes = 12) => randomBytes(bytes).toString("base64url");
 function bytesEqual(a: Uint8Array | null | undefined, b: Uint8Array) {
 	return !!a && a.byteLength === b.byteLength && a.every((value, index) => value === b[index]);
 }
-const b64 = (value: string) => new Uint8Array(Buffer.from(value, "base64"));
 function payloadOf(label: string, size = 0): Uint8Array {
 	const head = utf8.encode(`${label}|`);
 	const out = new Uint8Array(Math.max(head.byteLength, size));
@@ -157,10 +181,15 @@ async function http(method: string, path: string, options: { token?: string; coo
 	if (options.body) { headers["Content-Type"] = "application/octet-stream"; body = options.body; }
 	const t0 = now();
 	const response = await fetch(`${HOST}${path}`, { method, headers, body });
-	const text = await response.text();
+	const bytes = new Uint8Array(await response.arrayBuffer());
 	if (options.timing) record(options.timing, now() - t0);
 	let value: any = null;
-	try { value = text ? JSON.parse(text) : null; } catch { value = { raw: text.slice(0, 200) }; }
+	if ((response.headers.get("content-type") ?? "").startsWith(READ_BINARY_TYPE)) {
+		try { value = decodeReadPage(bytes); } catch (error) { value = { raw: `binary: ${(error as Error).message}` }; }
+	} else {
+		const text = utf8d.decode(bytes);
+		try { value = text ? JSON.parse(text) : null; } catch { value = { raw: text.slice(0, 200) }; }
+	}
 	return { status: response.status, value, headers: response.headers };
 }
 
@@ -377,6 +406,10 @@ async function main() {
 	const nsPayload = payloadOf("ns-1 rename note.md -> other.md", 300);
 	const bPayload = payloadOf("b-1 yjs-update-bytes", 2000);
 	sent.set("a-ns-1", nsPayload); sent.set("a-b-1", bPayload);
+	// B is pushed b:<doc> only once subscribed (relay-wire §5.6); the PONG of a later ping means the set is in effect.
+	b.control({ type: "STREAM_SUBSCRIBE", streams: [doc] });
+	b.control({ type: "VAULT_PING", probeId: "subscribed" });
+	await b.waitFor((e) => e.control?.type === "VAULT_PONG" ? true : undefined, 10000, "PONG after STREAM_SUBSCRIBE");
 	let fromA = a.mark(); let fromB = b.mark();
 	const t0 = a.append("ns", "a-ns-1", nsPayload);
 	a.append(doc, "a-b-1", bPayload);
@@ -501,7 +534,7 @@ async function main() {
 	}
 	const expected = ["a-b-1", ...Array.from({ length: LATENCY_SAMPLES }, (_, i) => `a-lat-${i}`), ...bulkIds];
 	check("read returns every b:<doc> row once, ascending, unmerged", rows.length === expected.length
-		&& rows.every((row, index) => row.clientFrameId === expected[index] && bytesEqual(b64(row.payload), sent.get(row.clientFrameId)!)
+		&& rows.every((row, index) => row.clientFrameId === expected[index] && bytesEqual(row.payload, sent.get(row.clientFrameId)!)
 			&& (index === 0 || row.seq > rows[index - 1].seq) && row.deviceId === vault.a.deviceId),
 	{ rows: rows.length, expected: expected.length, first: rows[0]?.clientFrameId });
 	check("read paginated by maxBytes", pages >= 4, pages);
@@ -521,7 +554,7 @@ async function main() {
 	const afterGc = await http("GET", `${vaultPath}/streams/read?stream=${encodeURIComponent(doc)}&after=0`, { token: vault.b.deviceToken,
 		timing: "read_page_ms" });
 	check("read after=0 post-GC returns the checkpoint (rows start after it)", afterGc.status === 200
-		&& afterGc.value.checkpoint?.coversSeq === lastSeq && bytesEqual(b64(afterGc.value.checkpoint.bytes), ckpt)
+		&& afterGc.value.checkpoint?.coversSeq === lastSeq && bytesEqual(afterGc.value.checkpoint.bytes, ckpt)
 		&& afterGc.value.rows.every((row: any) => row.seq > lastSeq) && afterGc.value.gcSeq === put.value.gcSeq,
 	{ checkpoint: afterGc.value?.checkpoint?.coversSeq, rows: afterGc.value?.rows?.length, gcSeq: afterGc.value?.gcSeq });
 	fromA = a.mark();

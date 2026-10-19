@@ -7,7 +7,7 @@ import { devicePairingCode, enrollBody, newDeviceIdentity, operatorCookie, vault
 import { brief, http, isRouteMissing, vaultPath } from "../lib/http.ts";
 import type { HttpResult } from "../lib/http.ts";
 import { StreamSocket } from "../lib/socket.ts";
-import { checkpointPath } from "../lib/streams.ts";
+import { checkpointPath, readPage } from "../lib/streams.ts";
 import { bytesEqual, id, payloadOf, sha256hex, sleep } from "../lib/util.ts";
 
 const enc = encodeURIComponent;
@@ -147,7 +147,7 @@ export const tests: TestDef[] = [
 				["ticket", () => http(ctx, "POST", `${path}/auth/ticket`, { token, json: { purpose: "streams" } })],
 				["pairing-code", () => http(ctx, "POST", `${path}/auth/pairing-code`, { token, json: { purpose: "device" } })],
 				["feed", () => http(ctx, "GET", `${path}/streams/feed?after=0`, { token })],
-				["read", () => http(ctx, "GET", `${path}/streams/read?stream=ns&after=0`, { token })],
+				["read", () => readPage(ctx, `${path}/streams/read?stream=ns&after=0`, { token })],
 				["checkpoint", () => http(ctx, "PUT", checkpointPath(path, "ns", 1, 0), { token, body: payloadOf("ck", 16) })],
 			];
 			for (const [name, run] of cases) {

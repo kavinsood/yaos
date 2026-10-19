@@ -198,10 +198,8 @@ async function socketStep(d: DeviceCheckDeps): Promise<Outcome> {
 	const live = d.live;
 	const s = live.session();
 	if (!s) return { status: "fail", detail: `not connected (phase ${live.phase()})`, data: { connected: false, phase: live.phase() } };
-	if (!s.ping) return { status: "fail", detail: "this relay session cannot ping", data: { connected: true, phase: live.phase() } };
-	const ping = s.ping.bind(s);
 	const t0 = d.clock.monotonic();
-	const pong = await bounded(RELAY_PING_TIMEOUT_MS, d.signal, d.clock, () => ping(),
+	const pong = await bounded(RELAY_PING_TIMEOUT_MS, d.signal, d.clock, () => s.ping(),
 		(why) => new Error(why === "timeout" ? `no pong within ${RELAY_PING_TIMEOUT_MS / 1000} s` : "aborted"));
 	const ms = d.clock.monotonic() - t0;
 	return { detail: `connected (${live.phase()}), round trip ${msText(ms)}`, data: { connected: true, phase: live.phase(), canWrite: s.canWrite, rttMs: r1(ms), headSeq: pong.headSeq } };

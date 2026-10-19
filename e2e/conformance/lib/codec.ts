@@ -10,6 +10,7 @@ export const APPEND = 0x01;
 export const PROVISIONAL = 0x10;
 export const COMMITTED = 0x11;
 export const NOTICE = 0x12;
+export const SKIPPED = 0x13;
 
 export class Writer {
 	bytes: number[] = [];
@@ -86,13 +87,17 @@ export function rawAppend(fields: { streamLen?: number[]; stream: ArrayLike<numb
 
 export function utf8Bytes(value: string): Uint8Array { return utf8.encode(value); }
 
+export interface SkippedRun { stream: string; seqs: number[] }
+
+/** A STREAM_SKIPPED frame has seq null, empty identity strings, payload null and its `runs`. */
 export interface ServerFrame {
-	kind: "provisional" | "committed" | "notice";
+	kind: "provisional" | "committed" | "notice" | "skipped";
 	seq: number | null;
 	stream: string;
 	deviceId: string;
 	clientFrameId: string;
 	payload: Uint8Array | null;
+	runs?: SkippedRun[];
 }
 
 /** Decodes one server -> client binary message. Throws on malformed input (incl. invalid UTF-8 / trailing bytes). */
@@ -111,9 +116,56 @@ export function decodeServerFrame(bytes: Uint8Array): ServerFrame {
 		frame = kind === COMMITTED
 			? { kind: "committed", seq, stream, deviceId, clientFrameId, payload: r.varBytes() }
 			: { kind: "notice", seq, stream, deviceId, clientFrameId, payload: null };
+	} else if (kind === SKIPPED) {
+		// relay-wire §5.6: varuint streamCount, then per stream varstring | varuint n | varuint firstSeq | varuint delta×(n-1).
+		const runs: SkippedRun[] = [];
+		for (let streams = r.varUint(); streams > 0; streams--) {
+			const stream = r.varString();
+			const count = r.varUint();
+			if (count < 1) throw new Error("empty skipped run");
+			const seqs = [r.varUint()];
+			for (let i = 1; i < count; i++) {
+				const delta = r.varUint();
+				if (delta < 1) throw new Error("non-ascending skipped run");
+				seqs.push(seqs[i - 1]! + delta);
+			}
+			runs.push({ stream, seqs });
+		}
+		frame = { kind: "skipped", seq: null, stream: "", deviceId: "", clientFrameId: "", payload: null, runs };
 	} else {
 		throw new Error(`unknown server frame kind ${kind}`);
 	}
 	if (r.pos !== bytes.byteLength) throw new Error(`server frame has ${bytes.byteLength - r.pos} trailing bytes`);
 	return frame;
+}
+
+/** Accept / Content-Type of the binary read reply (relay-wire §7.2). */
+export const READ_BINARY_TYPE = "application/vnd.yaos.streams-read.v1+binary";
+
+export interface BinaryReadPage {
+	stream: string; lastSeq: number; checkpointSeq: number; gcSeq: number; nextAfter: number | null;
+	checkpoint: { coversSeq: number; bytes: Uint8Array } | null;
+	rows: Array<{ seq: number; deviceId: string; clientFrameId: string; payload: Uint8Array }>;
+}
+
+/** relay-wire §7.2: `u8 1 | varstring vaultEpoch | varuint head | varuint pageCount | page*`. Throws on malformed input. */
+export function decodeReadReply(bytes: Uint8Array): { vaultEpoch: string; head: number; pages: BinaryReadPage[] } {
+	const r = new Reader(bytes);
+	if (r.u8() !== 1) throw new Error("unknown read reply version");
+	const vaultEpoch = r.varString();
+	const head = r.varUint();
+	const pages: BinaryReadPage[] = [];
+	for (let n = r.varUint(); n > 0; n--) {
+		const stream = r.varString();
+		const lastSeq = r.varUint();
+		const checkpointSeq = r.varUint();
+		const gcSeq = r.varUint();
+		const nextAfterRaw = r.varUint();
+		const checkpoint = r.u8() === 1 ? { coversSeq: r.varUint(), bytes: r.varBytes() } : null;
+		const rows: BinaryReadPage["rows"] = [];
+		for (let k = r.varUint(); k > 0; k--) rows.push({ seq: r.varUint(), deviceId: r.varString(), clientFrameId: r.varString(), payload: r.varBytes() });
+		pages.push({ stream, lastSeq, checkpointSeq, gcSeq, nextAfter: nextAfterRaw === 0 ? null : nextAfterRaw - 1, checkpoint, rows });
+	}
+	if (r.pos !== bytes.byteLength) throw new Error("trailing bytes");
+	return { vaultEpoch, head, pages };
 }

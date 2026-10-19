@@ -7,7 +7,7 @@
  * read with bounded concurrency. A device that may read only `k` (§12.4: no
  * pin, or a vault its pin cannot read) stops after the `k` read in key-missing.
  *
- * Catch-up reads are batched when the relay has the batch form (limits.readBatchStreams > 1): one request reads
+ * Catch-up reads are batched (width min(limits.readBatchStreams, tuning.readBatchStreams)): one request reads
  * the first page of up to readBatchStreams stale streams under one readPageBytes budget, and each served stream
  * then runs readStream (which pages on alone if it has more). On the deployed relay a request costs ~9 edge RTTs
  * whatever it carries, so a fresh device reads its N notes in about N / readBatchStreams requests instead of N.
@@ -147,6 +147,8 @@ export class SessionLoop {
 		this.stats.sessions++;
 		this.backpressureFlag = false;
 		this.unsub = session.onEvent((ev) => this.onEvent(gen, ev));
+		// Right after VAULT_READY, before the feed: rows committed from here on are pushed or skipped by this set.
+		c.subs.onSession();
 		c.gateCtx.maxCheckpointStateBytes = Math.max(c.tuning.maxCheckpointStateBytes, session.limits.maxCheckpointBytes * 8);
 		const cur = c.repo.cursor;
 		if (session.headSeq > cur.headSeqSeen) cur.headSeqSeen = session.headSeq;
@@ -240,6 +242,12 @@ export class SessionLoop {
 				c.keyring.noteArrived(ev);
 				c.live.push(ev);
 				return;
+			case "skipped":
+				for (const r of ev.rows) {
+					if (r.seq > cur.headSeqSeen) cur.headSeqSeen = r.seq;
+					c.live.push({ t: "skipped", stream: r.stream, seq: r.seq });
+				}
+				return;
 			case "provisional":
 			case "provisionalDropped":
 				c.live.push(ev);
@@ -277,6 +285,7 @@ export class SessionLoop {
 		c.sender.onClosed(ev.code);
 		c.keyring.onClosed();
 		c.live.disable();
+		c.subs.onClosed();
 		c.lastCloseCode = ev.code;
 		c.diag("session-closed", { code: ev.code, errorCode: ev.errorCode, wasClean: ev.wasClean });
 		// The link is dead (lost, failed its liveness check) or the device leaves it (pause, park, stop): blob
@@ -307,6 +316,7 @@ export class SessionLoop {
 		if (!s) return Promise.resolve();
 		const gen = c.gen;
 		this.lanes++;
+		c.subs.readStarted(stream);
 		const p = this.readOne(s, gen, stream, fromSeq, undefined).finally(() => {
 			this.reads.delete(stream);
 			this.lanes--;
@@ -442,6 +452,7 @@ export class SessionLoop {
 
 	private async postRead(stream: StreamName, res: ReadResult): Promise<void> {
 		const c = this.c;
+		c.subs.readEnded(stream);
 		if (res.t === "retry" || (res.t === "aborted" && res.error)) this.readBackoff.set(stream, c.mono() + c.tuning.readBackoffMs);
 		const fold = c.foldOf(stream)?.rt;
 		if (res.t === "held" && res.held) {
@@ -473,7 +484,9 @@ export class SessionLoop {
 
 	/**
 	 * Start reads for stale streams, bound docs first: up to catchUpConcurrency lanes, batched when the relay can.
-	 * Only `k` while the keyring says this device may read nothing else (§12.4).
+	 * Only `k` while the keyring says this device may read nothing else (§12.4). A stream made stale by skipped rows
+	 * waits while subs.deferred says so (DESIGN §d.7); the maintenance tick calls this every maintenanceMs, which
+	 * starts it once its deferral ran out.
 	 */
 	scheduleCatchUp(): void {
 		const c = this.c;
@@ -484,13 +497,17 @@ export class SessionLoop {
 		const now = c.mono();
 		const onlyK = c.keyring.readsOnlyK();
 		const order = staleOrder(c.repo.streams(), (r) => c.repo.priorityFn(r), (r) =>
-			this.reads.has(r.stream) || r.cls === "other" || (onlyK && r.cls !== "keyring") || (r.frozen === 1 && r.frozenReason === "checkpoint-disputed") || this.isHeld(r.stream) || (this.readBackoff.get(r.stream) ?? 0) > now);
+			this.reads.has(r.stream) || r.cls === "other" || (onlyK && r.cls !== "keyring") || (r.frozen === 1 && r.frozenReason === "checkpoint-disputed") || this.isHeld(r.stream) || (this.readBackoff.get(r.stream) ?? 0) > now
+			|| c.subs.deferred(r, now));
 		const per = this.batching(s);
 		for (let i = 0; slots > 0 && i < order.length; slots--) {
 			const group = order.slice(i, i + per).map((r) => r.stream);
 			i += group.length;
 			if (group.length === 1) void this.runRead(group[0]!);
-			else void this.runBatch(s, group, false);
+			else {
+				for (const stream of group) c.subs.readStarted(stream);
+				void this.runBatch(s, group, false);
+			}
 		}
 	}
 

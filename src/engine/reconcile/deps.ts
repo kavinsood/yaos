@@ -100,6 +100,11 @@ export interface LogPort {
 	 * a pass's live creates then leave with their initial body frames (DESIGN §d.4).
 	 */
 	corkNs(): () => void;
+	/**
+	 * The plan waits for these docs' bodies (wait "body-not-caught-up" / "body-empty"): read them now and until caught
+	 * up, not after a deferral of skipped rows (DESIGN §d.7). Optional: a log without deferral reads them anyway.
+	 */
+	wantFresh?(docIds: readonly DocId[]): void;
 	/** Load (or pin) the worker replica. null = the doc has no body stream (unknown / blob). */
 	acquireBody(docId: DocId, kind: "markdown" | "canvas"): Promise<BodyHandle | null>;
 }

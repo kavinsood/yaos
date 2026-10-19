@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generatePlan, minimizePlan, runSim, type SimConfig, type SimReport, type Step } from "./run";
-import { BLOB_FAULTS, DEFAULT_FAULTS } from "./faults";
+import { BLOB_FAULTS, DEFAULT_FAULTS, SUBS_FAULTS } from "./faults";
 import type { SimBlobLiveness } from "./blobStore";
 import { checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
 import { runUserAction, TokenLedger } from "./actors";
@@ -39,7 +39,7 @@ async function sweep(name: string, base: Omit<SimConfig, "seed">, seeds: number,
 	assert.fail(
 		`${name}: ${failed.length}/${seeds} seeds failed: ${failed.map((r) => r.seed).join(",")}\n` +
 			`seed ${r0.seed}:\n  ${r0.violations.slice(0, 6).map((v) => `${v.inv}: ${v.detail}`).join("\n  ")}\n` +
-			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
+			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults === SUBS_FAULTS ? "SUBS_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
 	);
 }
 
@@ -62,10 +62,23 @@ const blobHits: Hits = (name, stats) => {
 	assert.ok(ok, `${name}: the blob faults hit transfers ${JSON.stringify(got)}`);
 };
 
+/** Subscriptions filtered for real: rows were skipped and pushed, sets were sent, the subscription faults ran. */
+const subsHits: Hits = (name, stats) => {
+	const sum = (f: (s: SimReport["stats"]) => number) => stats.reduce((n, s) => n + f(s), 0);
+	const got = {
+		skipped: sum((s) => s.subs.skippedRows), pushed: sum((s) => s.subs.pushedRows), subscribes: sum((s) => s.subs.subscribes),
+		subsLost: sum((s) => s.faults.relaySubsLost ?? 0), restarts: sum((s) => s.faults.relayRestart ?? 0),
+	};
+	assert.ok(got.skipped > 0 && got.pushed > 0 && got.subscribes > 0 && got.subsLost > 0 && got.restarts > 0, `${name}: subscriptions at work ${JSON.stringify(got)}`);
+};
+
 chunked("2 devices, no faults", { devices: 2, faults: null }, SEEDS);
 chunked("3 devices, seeded faults", { devices: 3, faults: DEFAULT_FAULTS }, SEEDS);
 chunked("5 devices, seeded faults", { devices: 5, faults: DEFAULT_FAULTS }, Math.max(1, Math.ceil(SEEDS / 4)));
 chunked("2 devices, fault-heavy", { devices: 2, faults: DEFAULT_FAULTS, faultRate: 0.35 }, Math.max(1, Math.ceil(SEEDS / 4)));
+chunked("3 devices, subscription churn faults", { devices: 3, faults: SUBS_FAULTS, faultRate: 0.3 }, Math.max(1, Math.ceil(SEEDS / 10)), subsHits);
+// The device classes' own deferral of skipped streams (desktop 5 s / 30 s, phone 150 s / 10 min): quiescence waits it out.
+chunked("3 devices, real skip deferral", { devices: 3, faults: SUBS_FAULTS, faultRate: 0.2, tuning: { skipSettleMs: null, skipMaxDeferMs: null } }, Math.max(1, Math.ceil(SEEDS / 20)), subsHits);
 chunked("3 devices, blob stall/slow faults", { devices: 3, faults: BLOB_FAULTS, faultRate: 0.3 }, Math.max(1, Math.ceil(SEEDS / 10)), blobHits);
 
 test("sim: same seed, same plan, same trace and same converged bytes (seeded Yjs clientIDs)", async () => {

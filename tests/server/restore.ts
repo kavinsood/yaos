@@ -11,6 +11,7 @@ import { blobKey } from "../../server/src/router";
 import { suite } from "../harness.ts";
 import { appendCommitted, crash, newDevice, type DeviceSeed, type FakeSocket, type VaultObject } from "./helpers/workerHarness.ts";
 import { claim, deviceFeed, deviceFetch, enrollVia, json, ownerCode, resetRows, withWorld, type World } from "./helpers/operatorWorld.ts";
+import { readPage } from "./helpers/readReply.ts";
 
 const s = suite("restore");
 
@@ -60,7 +61,7 @@ function commit(vault: VaultObject, socket: FakeSocket, stream: string, clientFr
 
 async function content(world: World, vaultId: string, device: DeviceSeed): Promise<Content> {
 	const feed = await json(await deviceFeed(world, vaultId, device));
-	const read = await json(await deviceFetch(world, vaultId, device, "streams/read?stream=ns&after=0"));
+	const read = await readPage(await deviceFetch(world, vaultId, device, "streams/read?stream=ns&after=0"));
 	return { head: feed.head, changes: feed.changes, rows: read.rows };
 }
 

@@ -20,20 +20,32 @@
  *    other row becomes a T_stale item and provisionals are dropped;
  *  - a failed tLive drops the batch: its seqs stay unaccounted and the gap
  *    feed / reads recover them;
+ *  - skipped rows (STREAM_SKIPPED: other devices' b:/c: rows outside the
+ *    subscription, DESIGN §d.7) are one queue entry each, in arrival order,
+ *    batched with committed rows, never dropped by the overflow; they become
+ *    T_stale items, and the stream's read is deferred (subscriptions.ts);
  *  - the stored batch goes through EngineCtx.afterStored as a read page
  *    does; live rows (only they) mark their streams active for the checkpoint
- *    idle rule (DESIGN §d.9).
+ *    idle rule (DESIGN §d.9), and so do the seqs of a stream that turns or
+ *    stays stale (skipped, overflow): its author is still writing.
  *
  * The queue survives a session close (its events are committed facts).
  */
 
-import { KEYRING_STREAM, streamClass, type ClientFrameId, type DeviceId, type StreamName } from "../../core/types";
+import { KEYRING_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, type StreamName } from "../../core/types";
 import type { RelayEvent } from "../../ports/relay";
 import type { LiveItem } from "../store/repo";
 import { classifyRow, notApplied, receiptItem } from "../sync/ingestRow";
 import type { EngineCtx } from "./context";
 
-type QueuedEvent = Extract<RelayEvent, { t: "receipt" | "committed" | "provisional" | "provisionalDropped" }>;
+/** One row of a STREAM_SKIPPED event (sessionLoop expands the event row by row). */
+export interface SkippedRow {
+	readonly t: "skipped";
+	readonly stream: StreamName;
+	readonly seq: Seq;
+}
+
+type QueuedEvent = Extract<RelayEvent, { t: "receipt" | "committed" | "provisional" | "provisionalDropped" }> | SkippedRow;
 
 /** Events that hold a payload (the residency the overflow bounds; payload-less events are a few dozen bytes). */
 function heavy(ev: QueuedEvent): 0 | 1 {
@@ -52,7 +64,7 @@ export class LiveIngest {
 	private qRows = 0;
 	private draining = false;
 	enabled = false;
-	stats = { batches: 0, rows: 0, receipts: 0, stale: 0, overflows: 0, failedBatches: 0 };
+	stats = { batches: 0, rows: 0, receipts: 0, stale: 0, skipped: 0, overflows: 0, failedBatches: 0 };
 
 	constructor(private readonly c: EngineCtx) {}
 
@@ -143,10 +155,10 @@ export class LiveIngest {
 			const batch: QueuedEvent[] = [];
 			while (this.q.length > 0 && batch.length < this.c.tuning.liveBatchRows) {
 				const t = this.q[0]!.t;
-				if (t !== "committed" && t !== "receipt") break;
+				if (t !== "committed" && t !== "receipt" && t !== "skipped") break;
 				const ev = this.shift();
 				batch.push(ev);
-				if ((ev.t === "committed" ? ev.frame.stream : ev.stream) === KEYRING_STREAM) break;
+				if (ev.t !== "skipped" && (ev.t === "committed" ? ev.frame.stream : ev.stream) === KEYRING_STREAM) break;
 			}
 			await this.ingest(batch);
 		}
@@ -155,8 +167,17 @@ export class LiveIngest {
 	private async ingest(batch: readonly QueuedEvent[]): Promise<void> {
 		const c = this.c;
 		const items: LiveItem[] = [];
+		const skipped = new Map<StreamName, number>();
+		const staleStreams = new Set<StreamName>();
 		const onlyK = c.keyring.readsOnlyK();
 		for (const ev of batch) {
+			if (ev.t === "skipped") {
+				// Never an own row (relay-wire §5.6): another device wrote it, which hands the checkpoint duty on.
+				items.push({ t: "stale", stream: ev.stream, seq: ev.seq, foreign: true });
+				skipped.set(ev.stream, (skipped.get(ev.stream) ?? 0) + 1);
+				staleStreams.add(ev.stream);
+				continue;
+			}
 			if (ev.t === "receipt") {
 				const kr = c.keyring.receiptRow(ev);
 				items.push(kr ? { t: "row", row: kr, settleAdoptable: null } : receiptItem(c.deps, ev.stream, ev.clientFrameId, ev.seq));
@@ -166,7 +187,9 @@ export class LiveIngest {
 			const f = ev.frame;
 			// Reading only `k` (§12.4): every other row is left stale, as one whose payload the overflow dropped.
 			const payload = onlyK && streamClass(f.stream) !== "keyring" ? null : f.payload;
-			items.push(await classifyRow(c.deps, { stream: f.stream, seq: f.seq, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload }));
+			const item = await classifyRow(c.deps, { stream: f.stream, seq: f.seq, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload });
+			if (item.t === "stale") staleStreams.add(f.stream);
+			items.push(item.t === "stale" && f.deviceId !== c.self ? { ...item, foreign: true } : item);
 		}
 		const receipts = items.filter((it) => it.t === "receipt").length;
 		const stale = items.filter((it) => it.t === "stale").length;
@@ -182,9 +205,15 @@ export class LiveIngest {
 		this.stats.rows += items.length;
 		this.stats.receipts += receipts;
 		this.stats.stale += stale;
+		for (const [stream, n] of skipped) {
+			this.stats.skipped += n;
+			c.subs.noteSkipped(stream, n);
+		}
 		if (receipts > 0) c.countReceipts(receipts);
 		c.lastSyncedAtMs = c.now();
 		await c.afterStored({ ...res, skip: notApplied(items), live: true });
+		const mono = c.mono();
+		for (const stream of staleStreams) c.ckpt.lastActivity.set(stream, mono);
 		if (stale > 0) c.sess.scheduleCatchUp();
 	}
 }

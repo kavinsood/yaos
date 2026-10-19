@@ -52,10 +52,16 @@ export function attach(session: SimRelaySession): RelayPeer {
 	};
 }
 
-export async function connectPeer(relay: SimRelay, clock: VirtualClock, deviceId: string): Promise<RelayPeer> {
+/**
+ * A connected, listening session. `subscribe`: the b:/c: streams it subscribes to at once; without it the socket
+ * keeps the empty set (pushed only vault-global streams and its own device's rows, relay-wire §5.6).
+ */
+export async function connectPeer(relay: SimRelay, clock: VirtualClock, deviceId: string, subscribe?: readonly string[]): Promise<RelayPeer> {
 	const result = await connectRaw(relay, clock, deviceId);
 	if (!result.ok) throw new Error(`connect refused: ${result.reason}`);
-	return attach(result.session as SimRelaySession);
+	const peer = attach(result.session as SimRelaySession);
+	if (subscribe) peer.session.subscribe(subscribe as readonly StreamName[]);
+	return peer;
 }
 
 /** Resolves a promise produced against the virtual clock. */
@@ -88,6 +94,7 @@ export function trace(events: readonly RelayEvent[]): string[] {
 			case "refused": return `refused ${e.clientFrameId} ${e.reason}${e.conflictSeq !== null ? `@${e.conflictSeq}` : ""}`;
 			case "provisionalDropped": return `dropped ${e.clientFrameId}`;
 			case "resendUnreceipted": return `resend ${e.headSeq}`;
+			case "skipped": return `skipped ${e.rows.map((r) => `${r.stream}@${r.seq}`).join(",")}`;
 			case "backpressure": return "backpressure";
 			case "head": return `head ${e.headSeq}`;
 			case "closed": return `closed ${e.code}${e.errorCode !== null ? ` ${e.errorCode}` : ""}${e.wasClean ? "" : " unclean"}`;

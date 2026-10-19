@@ -68,6 +68,11 @@ export interface SimConfig {
 	 * server's 64 KiB seal, no late join, no snapshots (what the sim ran before; it wrote almost no checkpoint).
 	 */
 	readonly checkpoints?: "scaled" | "production";
+	/**
+	 * Engine tuning over the checkpoint world's for every device. { skipSettleMs: null, skipMaxDeferMs: null } runs
+	 * the device classes' real deferral of skipped streams (FAST_TUNING reads them at once).
+	 */
+	readonly tuning?: Partial<EngineTuning>;
 }
 
 /** The checkpoint side of a run's world (DESIGN §b.5, §d.8, §d.9), a pure function of the seed. */
@@ -151,6 +156,11 @@ export interface SimReport {
 		readonly crashUnacked: number;
 		/** Editor saves that overwrote an unseen external write (Obsidian race, exempt). */
 		readonly clobbers: number;
+		/**
+		 * Subscriptions over the run: b:/c: rows the relay pushed to and skipped for the devices (all sockets), and the
+		 * STREAM_SUBSCRIBE sets it accepted.
+		 */
+		readonly subs: { readonly pushedRows: number; readonly skippedRows: number; readonly subscribes: number };
 		/** Suite-1 fault outcomes (e2eeFaults.ts), in a suite-1 run with faults. */
 		readonly e2ee?: E2eeFaultStats;
 		/** Checkpoint coverage: relay puts / GC / served pages, and adoptions / gate disputes on the devices and the oracle. */
@@ -270,7 +280,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			return new SimDevice({
 				name, clock, net, profile,
 				settings: cw.snapshots[di] ? () => SNAPSHOT_SETTINGS : () => RUN_SETTINGS,
-				tuning: cw.tuning,
+				tuning: { ...cw.tuning, ...cfg.tuning },
 				mobile: dr.chance(0.3),
 				log: cfg.log ? (line) => cfg.log!(name, `${clock.monotonic()} ${line}`) : undefined,
 				watcherDelayMs: c.faults ? () => watch.range(0, 400) : undefined,
@@ -384,11 +394,22 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), checkpoints: checkpointStats(devs, net), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
+			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), checkpoints: checkpointStats(devs, net), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
 		};
 	} finally {
 		seedEntropy(null);
 	}
+}
+
+function subsStats(net: SimNet, devs: readonly SimDevice[]): SimReport["stats"]["subs"] {
+	let pushedRows = 0;
+	let skippedRows = 0;
+	for (const d of devs) {
+		const f = net.relay.fanout(d.deviceId);
+		pushedRows += f.pushedRows;
+		skippedRows += f.skippedRows;
+	}
+	return { pushedRows, skippedRows, subscribes: net.relay.counters().subscribes };
 }
 
 /** ddmin over plan steps: the smallest plan (within `maxRuns`) for which `fails(report)` still holds. */

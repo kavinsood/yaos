@@ -53,11 +53,10 @@ class FakeStore implements BlobPort {
 	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
 }
 
-function session(o: { ping?: (() => Promise<{ headSeq: Seq }>) | null } = {}): RelaySession {
-	const ping = o.ping === undefined ? async () => ({ headSeq: 7 as Seq }) : o.ping;
+function session(o: { ping?: () => Promise<{ headSeq: Seq }> } = {}): RelaySession {
 	return {
 		canWrite: true,
-		...(ping ? { ping } : {}),
+		ping: o.ping ?? (async () => ({ headSeq: 7 as Seq })),
 		feed: async () => ({ entries: [], throughSeq: 7 as Seq, headSeq: 7 as Seq, more: false }),
 	} as unknown as RelaySession;
 }
@@ -166,12 +165,10 @@ test("engine basics fails off the worker carrier and when the engine's scope lac
 	assert.match(unprobed.get("limits")!.detail, /device memory not exposed; performance.memory not exposed/);
 });
 
-test("relay socket: not connected, no ping, and a pong that never comes all fail the step", async () => {
+test("relay socket: not connected and a pong that never comes all fail the step", async () => {
 	const off = byId(await runDeviceCheck("quick", deps({ live: { session: () => null, phase: () => "offline" } })));
 	assert.equal(off.get("relay-socket")!.detail, "not connected (phase offline)");
 	assert.equal(off.get("relay-http")!.status, "fail");
-	const noPing = byId(await runDeviceCheck("quick", deps({ live: { session: () => session({ ping: null }) } })));
-	assert.equal(noPing.get("relay-socket")!.detail, "this relay session cannot ping");
 	// The ping's deadline on a clock whose long timers fire at once.
 	const clock = createWebClock();
 	const fast = { ...clock, setTimer: (ms: number, fn: () => void) => clock.setTimer(ms >= 15_000 ? 0 : ms, fn) };
@@ -217,7 +214,7 @@ test("deviceCheck over the protocol: the engine answers with a report; a second 
 	if (value.t !== "deviceCheck") return;
 	const s = byId(value.report);
 	assert.equal(s.get("engine")!.status, "pass", s.get("engine")!.detail);
-	assert.equal(s.get("relay-socket")!.detail, "this relay session cannot ping", "the sim relay has no ping");
+	assert.equal(s.get("relay-socket")!.status, "pass", s.get("relay-socket")!.detail);
 	assert.equal(s.get("relay-http")!.status, "pass", s.get("relay-http")!.detail);
 	assert.equal(s.get("blob-10mb")!.status, "pass", s.get("blob-10mb")!.detail);
 	assert.ok((s.get("engine")!.data.repoOpenMs as number) >= 0);

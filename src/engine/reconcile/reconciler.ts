@@ -173,6 +173,10 @@ export class Reconciler {
 			...(ctx.deps.pathBaseKeys ? { pathBaseKeys: ctx.deps.pathBaseKeys } : {}),
 		});
 		this.lastPlan = plan.ops;
+		// A doc the plan holds for its body (not caught up, or a create's frames not here yet) must not wait out a
+		// deferred read of skipped rows (§d.7): those rows announce no body change, the read does.
+		const fresh = [...plan.ops, ...plan.held].flatMap((o) => (o.op === "wait" && (o.reason === "body-not-caught-up" || o.reason === "body-empty") ? [o.docId] : []));
+		if (fresh.length > 0) ctx.log.wantFresh?.(fresh);
 		let brake: BrakeReport | null = null;
 		if (plan.brake) {
 			const { identity, ...report } = plan.brake;

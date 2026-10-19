@@ -89,7 +89,7 @@ test("relay readBatch: first pages in request order under one readPageBytes budg
 	single.a.session.append(frame("b:2", "y2", 10));
 	await single.clock.runUntilIdle();
 	const one = await pump(single.clock, single.a.session.readBatch([req("b:1"), req("b:2")]));
-	assert.deepEqual(one.map((p) => p.rows.map((r) => r.seq)), [[1]], "no batch form: read(reqs[0])");
+	assert.deepEqual(one.map((p) => p.rows.map((r) => r.seq)), [[1]], "readBatchStreams 1 caps a batch at its first stream");
 });
 
 test("relay checkpoint: CAS order (not found, conflict, not advancing, ahead), GC of covered sealed segments, reads take the checkpoint after GC", async () => {

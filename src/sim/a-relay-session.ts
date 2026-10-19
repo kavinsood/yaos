@@ -1,7 +1,8 @@
 /**
  * One simulated streams socket. Server side: open flag, ordinal, rate gate.
  * Client side: the wsRelay adapter role (relay-wire -> RelayEvent mapping,
- * PROVISIONAL join map, pre-listener buffer, exactly one "closed").
+ * PROVISIONAL join map, pre-listener buffer, exactly one "closed", the last
+ * subscribe() set resent on STREAM_RESEND).
  * Uplink and downlink are FIFO timed queues with per-message jitter.
  */
 
@@ -9,6 +10,7 @@ import type { DeviceId, Seq, StreamName, VaultEpoch } from "../core/types";
 import type { ClockPort } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
 import type { AppendFrame, FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayEvent, RelayLimits, RelaySession } from "../ports/relay";
+import { utf8ByteLength } from "../core/codec/lib0";
 import { TimedQueue } from "./a-relay-link";
 import { appendMessageBytes, heldKey, type DownMsg, type LinkSpec, type UpMsg } from "./a-relay-util";
 
@@ -36,6 +38,10 @@ export class SimRelaySession implements RelaySession {
 	/** The server still treats the socket as open (fan-out target, accepts messages). */
 	srvOpen = true;
 	gate: RateGate | null = null;
+	/** The accepted STREAM_SUBSCRIBE set; empty until the socket subscribes (or after a restart that lost it). */
+	subs: Set<string> = new Set();
+	/** The set as persisted in the socket attachment (survives a restart); null = none, or it overflowed. */
+	persistedSubs: readonly string[] | null = null;
 
 	// ---- client (adapter) side ----
 	/** PROVISIONAL payloads held until their COMMIT_NOTICE. */
@@ -44,8 +50,13 @@ export class SimRelaySession implements RelaySession {
 	private errorCode: string | null = null;
 	private queue: RelayEvent[] = [];
 	private readonly listeners = new Set<(event: RelayEvent) => void>();
+	/** The last subscribe() set (client side); resent on STREAM_RESEND. */
+	private subscription: readonly string[] | null = null;
 	private everListened = false;
 	private inFlightBytes = 0;
+	/** ping() calls waiting for their pong, by probe id. */
+	private readonly probes = new Map<string, { resolve(headSeq: Seq): void; reject(error: Error): void }>();
+	private probeCounter = 0;
 	private readonly up: TimedQueue<UpMsg>;
 	private readonly down: TimedQueue<DownMsg>;
 	/** Every RelayEvent produced, in order (introspection; includes buffered ones). */
@@ -90,6 +101,26 @@ export class SimRelaySession implements RelaySession {
 		this.up.push(this.delay(this.link.uplinkMs), { k: "append", frame: copy, bytes }, rate > 0 ? (bytes * 1000) / rate : 0);
 	}
 
+	/** STREAM_SUBSCRIBE on the uplink (in order with appends). */
+	subscribe(streams: readonly StreamName[]): void {
+		if (this.ended) return;
+		if (streams.length > this.limits.maxSubscriptions) throw new RangeError(`sim subscribe: ${streams.length} streams exceed maxSubscriptions`);
+		this.subscription = [...streams];
+		this.sendSubscription();
+	}
+
+	private sendSubscription(): void {
+		if (this.ended || this.subscription === null) return;
+		const streams = this.subscription;
+		const bytes = utf8ByteLength(`__YPS:${JSON.stringify({ type: "STREAM_SUBSCRIBE", streams })}`);
+		this.up.push(this.delay(this.link.uplinkMs), { k: "subscribe", streams, bytes });
+	}
+
+	/** The client's last subscribe() set (null: never subscribed). */
+	get subscribed(): readonly string[] | null {
+		return this.subscription;
+	}
+
 	/** Uplink bytes not yet delivered to the relay. */
 	bufferedBytes(): number {
 		return this.inFlightBytes;
@@ -106,7 +137,7 @@ export class SimRelaySession implements RelaySession {
 	async readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]> {
 		const first = reqs[0];
 		if (first === undefined) throw new RangeError("readBatch: no requests");
-		if (this.limits.readBatchStreams <= 1 || reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
+		if (reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
 		return this.host.readBatch(this, reqs.slice(0, this.limits.readBatchStreams));
 	}
 
@@ -131,10 +162,27 @@ export class SimRelaySession implements RelaySession {
 		};
 	}
 
+	/** VAULT_PING on the uplink; resolves with the matching pong's head, rejects when the session closes first. */
+	ping(): Promise<{ readonly headSeq: Seq }> {
+		if (this.ended) return Promise.reject(new Error("relay session closed before the pong"));
+		const probeId = `p${++this.probeCounter}`;
+		return new Promise((resolve, reject) => {
+			this.probes.set(probeId, { resolve: (headSeq) => resolve({ headSeq }), reject });
+			this.up.push(this.delay(this.link.uplinkMs), { k: "ping", probeId });
+		});
+	}
+
+	private failProbes(): void {
+		const probes = [...this.probes.values()];
+		this.probes.clear();
+		for (const p of probes) p.reject(new Error("relay session closed before the pong"));
+	}
+
 	/** Emits "closed" synchronously; frames already on the uplink still reach the relay (then the close). */
 	close(code: number, _reason: string): void {
 		if (this.ended) return;
 		this.ended = true;
+		this.failProbes();
 		this.held.clear();
 		this.down.clear();
 		if (this.everListened) this.queue = [];
@@ -199,6 +247,8 @@ export class SimRelaySession implements RelaySession {
 				return;
 			}
 			case "receipts":
+				// A PROVISIONAL of this device's own frame that this socket resent gets no COMMIT_NOTICE (wsRelay).
+				for (const r of msg.receipts) this.held.delete(heldKey(r.stream, this.deviceId, r.clientFrameId));
 				for (const r of msg.receipts) this.emit({ t: "receipt", stream: r.stream, clientFrameId: r.clientFrameId, seq: r.seq, deduped: r.deduped });
 				this.emit({ t: "head", headSeq: msg.head });
 				return;
@@ -220,21 +270,35 @@ export class SimRelaySession implements RelaySession {
 				this.held.delete(heldKey(msg.stream, msg.deviceId, msg.clientFrameId));
 				this.emit({ t: "provisionalDropped", stream: msg.stream, deviceId: msg.deviceId, clientFrameId: msg.clientFrameId });
 				return;
+			case "skipped":
+				this.emit({ t: "skipped", rows: msg.rows.map((r) => ({ stream: r.stream, seq: r.seq })) });
+				return;
+			case "subscribeRejected":
+				return; // the previous set stays; the engine never sends an invalid one
 			case "resend":
 				this.held.clear();
+				// The restart may have lost the set (an overflowed attachment): resend it, as wsRelay does.
+				this.sendSubscription();
 				this.emit({ t: "resendUnreceipted", headSeq: msg.head });
 				return;
 			case "backpressure":
 				this.emit({ t: "backpressure" });
 				return;
-			case "pong":
+			case "pong": {
+				const probe = msg.probeId === null ? undefined : this.probes.get(msg.probeId);
+				if (probe && msg.probeId !== null) {
+					this.probes.delete(msg.probeId);
+					probe.resolve(msg.head);
+				}
 				this.emit({ t: "head", headSeq: msg.head });
 				return;
+			}
 			case "error":
 				this.errorCode = msg.code;
 				return;
 			case "close":
 				this.ended = true;
+				this.failProbes();
 				this.held.clear();
 				this.up.clear();
 				this.inFlightBytes = 0;
@@ -243,6 +307,7 @@ export class SimRelaySession implements RelaySession {
 			case "event":
 				if (msg.event.t === "closed") {
 					this.ended = true;
+				this.failProbes();
 					this.held.clear();
 					this.up.clear();
 					this.inFlightBytes = 0;

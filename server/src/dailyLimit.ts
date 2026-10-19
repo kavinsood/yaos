@@ -94,7 +94,7 @@ export function dailyLimitResponse(now: number, kind: DailyLimitKind = "rows-wri
 	});
 }
 
-/** The `VAULT_ERROR cf_daily_limit` control frame (relay-wire §16) for appends refused or failed on the daily limit (H3). */
+/** The `VAULT_ERROR cf_daily_limit` control frame (relay-wire §15) for appends refused or failed on the daily limit (H3). */
 export function dailyLimitControl(now: number, kind: DailyLimitKind, stream: string, clientFrameIds: readonly string[]) {
 	const body = dailyLimitBody(now, kind);
 	return { type: "VAULT_ERROR" as const, code: DAILY_LIMIT_ERROR_CODE, cause: "durability_failed" as const, kind: body.kind,

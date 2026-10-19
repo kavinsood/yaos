@@ -9,11 +9,16 @@
 // order); a frame that opens a buffer after a quiet spell commits after the short
 // lead window instead of the idle window. After the commit: COMMITTED frames (or COMMIT_NOTICEs for sockets that
 // already got the PROVISIONAL), then one STREAM_RECEIPTS per origin socket.
+// Subscriptions (relay-wire §5.6): a socket that sent STREAM_SUBSCRIBE is pushed b:/c: payloads only for the
+// streams in its set (and its own device's rows); every other appended row of a commit reaches it as a seq in a
+// STREAM_SKIPPED run, flushed before the socket's next live frame and before the receipts, so each socket still
+// sees every seq once, ascending. A socket that has not subscribed has the empty set: it is pushed only
+// vault-global streams and its own device's rows. The set is kept in memory and, when small, in the socket
+// attachment (restored on a wake; a set that did not fit restores as empty).
 // Invariant: durable before receipt, and every seq is delivered live only after
 // its commit. H2 fallback: a stream's frames commit only once its dedupe index
 // is built; builds advance one bounded step per incoming message and per timer
 // flush (StreamStore.stepDedupe).
-import { bytesToBase64 } from "../base64url";
 import { dailyLimitControl, dailyLimitKind, dailyLimitResponse, isCloudflareDailyLimitError, type DailyLimitKind } from "../dailyLimit";
 import { SYSTEM_CLOCK, SYSTEM_TIMERS, type ClockPort, type SocketPort, type SocketRegistryPort, type TimerPort } from "../ports";
 import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
@@ -27,6 +32,7 @@ import {
 	MAX_STREAM_PAYLOAD_BYTES,
 	MAX_STREAM_SOCKETS,
 	MAX_STREAM_SOCKETS_PER_DEVICE,
+	MAX_STREAM_SUBSCRIPTIONS,
 	MAX_STREAM_TEXT_MESSAGE_BYTES,
 	STREAM_FEED_DEFAULT_LIMIT,
 	STREAM_FEED_MAX_LIMIT,
@@ -35,13 +41,19 @@ import {
 	STREAM_READ_MAX_BYTES,
 	STREAMS_CAPABILITY_VERSION,
 	STREAMS_DOCUMENT_ID,
+	STREAM_READ_BINARY_TYPE,
+	SUBSCRIPTION_ATTACHMENT_BYTES,
 	bytesEqual,
 	decodeAppendFrame,
 	encodeCommitNotice,
 	encodeCommitted,
 	encodeProvisional,
+	encodeReadReply,
+	encodeSkipped,
 	isProvisionalStream,
+	utf8Length,
 	validStreamName,
+	type SkippedRun,
 } from "./protocol";
 import { frameKey, type StreamAppendOutcome, type StreamReadPage, type StreamStore } from "./store";
 
@@ -118,7 +130,7 @@ export function readStreamRelayConfig(env: StreamsEnv | null | undefined): Strea
 
 // ---- actor and socket attachment ----------------------------------------------
 
-/** VAULT_READY `role` (relay-wire §16): the type keeps "member"; only "owner" is sent (DECISIONS D6). */
+/** VAULT_READY `role` (relay-wire §15): the type keeps "member"; only "owner" is sent (DECISIONS D6). */
 export type VaultRole = "owner" | "member";
 
 /** The identity a streams socket is admitted with (the D6 constants plus the device). */
@@ -151,6 +163,15 @@ export interface StreamSocketAttachment {
 	capabilityDigest: string;
 	canWrite: boolean;
 	admittedAt: number;
+	/** The last accepted STREAM_SUBSCRIBE set, when it fits SUBSCRIPTION_ATTACHMENT_BYTES; absent: the empty set. */
+	subs?: string[];
+}
+
+/** The persisted subscription of an attachment: empty when it has none, it overflowed, or it is not a valid set. */
+function persistedSubscription(attachment: StreamSocketAttachment): Set<string> {
+	const subs = attachment.subs;
+	if (!Array.isArray(subs) || subs.length > MAX_STREAM_SUBSCRIPTIONS || !subs.every(validStreamName)) return new Set();
+	return new Set(subs);
 }
 
 export function parseStreamSocketAttachment(value: unknown): StreamSocketAttachment | null {
@@ -225,8 +246,8 @@ interface PendingFrame {
 	/** Resends of the same frame while it was pending: they get the same receipt. */
 	duplicates: Waiter[];
 	provisional: boolean;
-	/** Socket ordinal at the PROVISIONAL broadcast: later sockets get COMMITTED instead of a notice. */
-	ordinal: number;
+	/** Sockets the PROVISIONAL was sent to: they get the COMMIT_NOTICE or STREAM_PROVISIONAL_DROPPED, nobody else. */
+	provisionalTo: Set<SocketPort>;
 	/** H2: a flush held it back while its stream's index builds; its bytes no longer count toward the bytes trigger. */
 	held: boolean;
 }
@@ -258,6 +279,12 @@ export interface StreamRelayCounters {
 	wakeNotices: number;
 	/** H2: frames a flush held back because their stream's index was still building (once per flush). */
 	dedupeHeld: number;
+	/** Subscriptions: appended rows sent as a STREAM_SKIPPED seq instead of a payload, and the frames carrying them. */
+	skippedRows: number;
+	skipFrames: number;
+	/** Accepted and rejected STREAM_SUBSCRIBE messages. */
+	subscribes: number;
+	subscribeRejects: number;
 }
 
 export type StreamReceipt = { stream: string; clientFrameId: string; seq: number; deduped: boolean };
@@ -273,27 +300,14 @@ function nonNegativeInteger(raw: string | null, fallback: number): number | null
 	return Number.isSafeInteger(value) ? value : null;
 }
 
-/** One read page on the wire (single read body / one batched read entry). */
-function wirePage(page: StreamReadPage) {
-	return {
-		stream: page.stream,
-		lastSeq: page.lastSeq,
-		checkpointSeq: page.checkpointSeq,
-		gcSeq: page.gcSeq,
-		checkpoint: page.checkpoint ? { coversSeq: page.checkpoint.coversSeq, bytes: bytesToBase64(page.checkpoint.bytes) } : null,
-		rows: page.rows.map((row) => ({ seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId,
-			payload: bytesToBase64(row.payload) })),
-		nextAfter: page.nextAfter,
-	};
-}
-
 export class StreamRelayService {
 	readonly config: StreamRelayConfig;
 	readonly counters: StreamRelayCounters = {
 		appendFrames: 0, commits: 0, committedRows: 0, storeDedupes: 0, pendingDedupes: 0, conflicts: 0,
 		commitFailures: 0, flushLead: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0,
 		committedBroadcasts: 0, notices: 0, rateCloses: 0, oversizeCloses: 0, deviceSocketEvictions: 0, rawDrops: 0,
-		authorityCloses: 0, dailyLimitRejects: 0, wakeNotices: 0, dedupeHeld: 0,
+		authorityCloses: 0, dailyLimitRejects: 0, wakeNotices: 0, dedupeHeld: 0, skippedRows: 0, skipFrames: 0,
+		subscribes: 0, subscribeRejects: 0,
 	};
 	private readonly clock: ClockPort;
 	private readonly timers: TimerPort;
@@ -311,8 +325,8 @@ export class StreamRelayService {
 	private readonly closing = new WeakSet<object>();
 	/** H6: one bucket per device, full when first used in a runtime, kept for the runtime (a reconnect does not refill it), deleted on revoke. */
 	private readonly buckets = new Map<string, DeviceBucket>();
-	private readonly ordinals = new WeakMap<object, number>();
-	private socketOrdinal = 0;
+	/** Each subscribed socket's STREAM_SUBSCRIBE set; absent: the empty set (never subscribed). */
+	private readonly subscriptions = new WeakMap<object, Set<string>>();
 	private pending: PendingFrame[] = [];
 	/** Payload bytes of the buffered frames not held back (H2): the bytes trigger. */
 	private pendingBytes = 0;
@@ -380,11 +394,23 @@ export class StreamRelayService {
 		const entry = this.cache?.get(socket);
 		if (!entry) return;
 		this.cache!.delete(socket);
+		this.subscriptions.delete(socket);
 		const own = this.byDevice.get(entry.attachment.deviceId);
 		if (!own) return;
 		const at = own.indexOf(socket);
 		if (at >= 0) own.splice(at, 1);
 		if (own.length === 0) this.byDevice.delete(entry.attachment.deviceId);
+	}
+
+	/** Subscriptions: whether `socket` is pushed `frame`'s payload (else it is sent the seq as skipped). */
+	private wants(socket: SocketPort, attachment: StreamSocketAttachment, frame: PendingFrame): boolean {
+		if (!isProvisionalStream(frame.stream) || frame.deviceId === attachment.deviceId) return true;
+		return this.subscriptions.get(socket)?.has(frame.stream) === true;
+	}
+
+	/** Sets the socket's subscription from its attachment (empty when it has none, or it overflowed). */
+	private restoreSubscription(socket: SocketPort, attachment: StreamSocketAttachment): void {
+		this.subscriptions.set(socket, persistedSubscription(attachment));
 	}
 
 	/** Closes a socket this relay refuses: it leaves the fanout set in this turn and its later messages are dropped. */
@@ -416,6 +442,7 @@ export class StreamRelayService {
 			readDefaultBytes: STREAM_READ_DEFAULT_BYTES,
 			readMaxBytes: STREAM_READ_MAX_BYTES,
 			readBatchMaxStreams: STREAM_READ_BATCH_MAX_STREAMS,
+			maxSubscriptions: MAX_STREAM_SUBSCRIPTIONS,
 			rateBytesPerSec: this.config.rateBytesPerSec,
 			burstBytes: this.config.burstBytes,
 			groupCommit: { idleMs: this.config.gcIdleMs, maxMs: this.config.gcMaxMs, maxBytes: this.config.gcMaxBytes,
@@ -465,7 +492,6 @@ export class StreamRelayService {
 		this.options.sockets.accept(server);
 		this.attachments.set(server, attachment);
 		this.cacheAdd(server, attachment);
-		this.ordinals.set(server, ++this.socketOrdinal);
 		this.options.sendControl(server, {
 			type: "VAULT_READY",
 			documentId: STREAMS_DOCUMENT_ID,
@@ -494,7 +520,8 @@ export class StreamRelayService {
 	 * Once per runtime, H5 rebuild: the socket cache is built from `getWebSockets()`, each attachment parsed once.
 	 * Streams sockets admitted by an earlier runtime (hibernation wake, or an eviction that may have dropped
 	 * buffered frames) are told to resend every unacknowledged append; resends are deduplicated. A surviving socket
-	 * whose device is no longer in the device map is skipped and gets authority_superseded + 4403 (D7, O3).
+	 * whose device is no longer in the device map is skipped and gets authority_superseded + 4403 (D7, O3). Every
+	 * kept socket's subscription is restored from its attachment (an overflowed set restores as empty).
 	 */
 	ensureWakeNotice(): void {
 		if (this.cache !== null) return;
@@ -516,6 +543,7 @@ export class StreamRelayService {
 					runtimeEpoch: this.options.runtimeEpoch, head });
 				this.counters.wakeNotices++;
 			}
+			this.restoreSubscription(socket, attachment);
 			kept.push({ socket, attachment });
 		}
 		kept.sort((left, right) => left.attachment.admittedAt - right.attachment.admittedAt);
@@ -533,8 +561,12 @@ export class StreamRelayService {
 			if (this.closing.has(socket)) { this.counters.rawDrops++; return; }
 			const attachment = this.attachmentOf(socket);
 			if (!attachment) { this.closeSocket(socket, 1008, "not a streams socket"); return; }
-			// An open streams socket the cache lost track of: admitted → back into the set; otherwise superseded below.
-			if (this.options.validateActor(actorOf(attachment))) this.cacheAdd(socket, attachment);
+			// An open streams socket the cache lost track of: admitted → back into the set, its subscription as
+			// persisted (empty without one); otherwise superseded below.
+			if (this.options.validateActor(actorOf(attachment))) {
+				this.cacheAdd(socket, attachment);
+				this.restoreSubscription(socket, attachment);
+			}
 			entry = { attachment, actor: actorOf(attachment) };
 		}
 		// D7: the device map is checked first, before any echo, PROVISIONAL broadcast or buffering.
@@ -604,6 +636,10 @@ export class StreamRelayService {
 		if (!message.startsWith("__YPS:")) return;
 		let value: unknown;
 		try { value = JSON.parse(message.slice(6)); } catch { return; }
+		if (value !== null && typeof value === "object" && (value as { type?: unknown }).type === "STREAM_SUBSCRIBE") {
+			this.subscribe(socket, attachment, (value as { streams?: unknown }).streams);
+			return;
+		}
 		const ping = parseVaultPingFrame(value);
 		if (!ping) return;
 		this.options.sendControl(socket, {
@@ -614,6 +650,33 @@ export class StreamRelayService {
 			runtimeEpoch: this.options.runtimeEpoch,
 			head: this.head(),
 		});
+	}
+
+	/**
+	 * STREAM_SUBSCRIBE (relay-wire §5.6): replaces the socket's set, read-only sockets included. A non-array, an
+	 * invalid name or more than MAX_STREAM_SUBSCRIPTIONS distinct names is rejected and the previous set kept. The
+	 * set takes effect for frames admitted and commits flushed after this message, and is persisted in the
+	 * attachment when it fits (else dropped from it).
+	 */
+	private subscribe(socket: SocketPort, attachment: StreamSocketAttachment, streams: unknown): void {
+		const code = !Array.isArray(streams) || !streams.every(validStreamName) ? "invalid"
+			: new Set(streams).size > MAX_STREAM_SUBSCRIPTIONS ? "too_many" : null;
+		if (code !== null) {
+			this.counters.subscribeRejects++;
+			this.options.sendControl(socket, { type: "STREAM_SUBSCRIBE_REJECTED", code, max: MAX_STREAM_SUBSCRIPTIONS });
+			return;
+		}
+		const set = new Set(streams as string[]);
+		this.counters.subscribes++;
+		this.subscriptions.set(socket, set);
+		const subs = [...set];
+		const fits = utf8Length(JSON.stringify(subs)) <= SUBSCRIPTION_ATTACHMENT_BYTES;
+		const { subs: _subs, ...base } = attachment;
+		const updated: StreamSocketAttachment = fits ? { ...base, subs } : base;
+		try { socket.serializeAttachment(updated); } catch { return; /* closed */ }
+		this.attachments.set(socket, updated);
+		const cached = this.cache?.get(socket);
+		if (cached) cached.attachment = updated;
 	}
 
 	private reject(socket: SocketPort, stream: string, clientFrameId: string, code: string, extra: Record<string, unknown> = {}): void {
@@ -653,13 +716,17 @@ export class StreamRelayService {
 		const provisional = isProvisionalStream(frame.stream);
 		const entry: PendingFrame = { key, stream: frame.stream, deviceId: attachment.deviceId,
 			clientFrameId: frame.clientFrameId, payload: frame.payload, origin: waiter, duplicates: [],
-			provisional, ordinal: this.socketOrdinal, held: false };
+			provisional, provisionalTo: new Set(), held: false };
 		if (provisional) {
 			const message = encodeProvisional({ stream: frame.stream, deviceId: attachment.deviceId,
 				clientFrameId: frame.clientFrameId, payload: frame.payload });
 			for (const peer of this.streamSockets()) {
-				if (peer.attachment.socketId === attachment.socketId) continue;
-				try { peer.socket.send(message); this.counters.provisionalBroadcasts++; } catch { /* closed */ }
+				if (peer.attachment.socketId === attachment.socketId || !this.wants(peer.socket, peer.attachment, entry)) continue;
+				try {
+					peer.socket.send(message);
+					entry.provisionalTo.add(peer.socket);
+					this.counters.provisionalBroadcasts++;
+				} catch { /* closed */ }
 			}
 		}
 		this.pending.push(entry);
@@ -756,6 +823,15 @@ export class StreamRelayService {
 			if (!entry) { entry = { socket: waiter.socket, receipts: [] }; receipts.set(waiter.socketId, entry); }
 			entry.receipts.push(receipt);
 		};
+		// Subscriptions: each socket's pending STREAM_SKIPPED runs (in first-seq order), sent before its next live
+		// frame and at the end, before the receipts, so the socket sees ascending seqs per stream.
+		const skips = new Map<SocketPort, { runs: SkippedRun[]; byStream: Map<string, SkippedRun> }>();
+		const flushSkips = (socket: SocketPort) => {
+			const pendingSkips = skips.get(socket);
+			if (!pendingSkips) return;
+			skips.delete(socket);
+			try { socket.send(encodeSkipped(pendingSkips.runs)); this.counters.skipFrames++; } catch { /* closed */ }
+		};
 		for (let index = 0; index < frames.length; index++) {
 			const frame = frames[index]!;
 			const outcome = outcomes[index]!;
@@ -773,29 +849,43 @@ export class StreamRelayService {
 			if (outcome.kind === "appended") { this.counters.committedRows++; this.writes++; }
 			else this.counters.storeDedupes++;
 			// Live delivery: rows appended now go to every other socket (notice for those
-			// that hold the PROVISIONAL); a row deduped against an earlier commit was
-			// delivered then, so only holders of the new PROVISIONAL get a notice.
+			// that hold the PROVISIONAL, a skipped seq for those not subscribed to the
+			// stream); a row deduped against an earlier commit was delivered then, so only
+			// holders of the new PROVISIONAL get a notice. The origin and the duplicate
+			// waiters get only their receipts.
 			let committed: Uint8Array | null = null;
 			let notice: Uint8Array | null = null;
 			for (const peer of sockets) {
-				if (peer.attachment.socketId === frame.origin.socketId) continue;
-				const sawProvisional = frame.provisional && (this.ordinals.get(peer.socket) ?? 0) <= frame.ordinal;
-				try {
-					if (sawProvisional) {
-						notice ??= encodeCommitNotice({ ...identity, seq });
-						peer.socket.send(notice);
-						this.counters.notices++;
-					} else if (outcome.kind === "appended") {
-						committed ??= encodeCommitted({ ...identity, seq, payload: frame.payload });
-						peer.socket.send(committed);
-						this.counters.committedBroadcasts++;
+				if (peer.attachment.socketId === frame.origin.socketId
+					|| frame.duplicates.some((duplicate) => duplicate.socketId === peer.attachment.socketId)) continue;
+				if (frame.provisionalTo.has(peer.socket)) {
+					flushSkips(peer.socket);
+					notice ??= encodeCommitNotice({ ...identity, seq });
+					try { peer.socket.send(notice); this.counters.notices++; } catch { /* closed */ }
+				} else if (outcome.kind !== "appended") {
+					continue;
+				} else if (this.wants(peer.socket, peer.attachment, frame)) {
+					flushSkips(peer.socket);
+					committed ??= encodeCommitted({ ...identity, seq, payload: frame.payload });
+					try { peer.socket.send(committed); this.counters.committedBroadcasts++; } catch { /* closed */ }
+				} else {
+					let pendingSkips = skips.get(peer.socket);
+					if (!pendingSkips) { pendingSkips = { runs: [], byStream: new Map() }; skips.set(peer.socket, pendingSkips); }
+					const run = pendingSkips.byStream.get(frame.stream);
+					if (run) run.seqs.push(seq);
+					else {
+						const created = { stream: frame.stream, seqs: [seq] };
+						pendingSkips.runs.push(created);
+						pendingSkips.byStream.set(frame.stream, created);
 					}
-				} catch { /* closed */ }
+					this.counters.skippedRows++;
+				}
 			}
 			const receipt = { stream: frame.stream, clientFrameId: frame.clientFrameId, seq, deduped: outcome.kind === "deduped" };
 			addReceipt(frame.origin, receipt);
 			for (const duplicate of frame.duplicates) addReceipt(duplicate, { ...receipt, deduped: true });
 		}
+		for (const socket of [...skips.keys()]) flushSkips(socket);
 		const head = this.head();
 		for (const entry of receipts.values()) {
 			this.options.sendControl(entry.socket, { type: "STREAM_RECEIPTS", head, receipts: entry.receipts });
@@ -805,8 +895,7 @@ export class StreamRelayService {
 	private dropProvisional(sockets: ReadonlyArray<{ socket: SocketPort; attachment: StreamSocketAttachment }>,
 		frame: PendingFrame, reason: string): void {
 		for (const peer of sockets) {
-			if (peer.attachment.socketId === frame.origin.socketId) continue;
-			if ((this.ordinals.get(peer.socket) ?? 0) > frame.ordinal) continue;
+			if (!frame.provisionalTo.has(peer.socket)) continue;
 			this.options.sendControl(peer.socket, { type: "STREAM_PROVISIONAL_DROPPED", stream: frame.stream,
 				deviceId: frame.deviceId, clientFrameId: frame.clientFrameId, reason });
 		}
@@ -954,7 +1043,8 @@ export class StreamRelayService {
 	 * GET /streams/read?maxBytes=B&r=<after>.<0|1>.<stream>&r=... (at most STREAM_READ_BATCH_MAX_STREAMS entries):
 	 * the first page of each entry in request order under one maxBytes budget. The first entry always gets its
 	 * page (as a single read); a later page that would overrun the remaining budget ends the batch, and the
-	 * client re-requests the entries without a page.
+	 * client re-requests the entries without a page. Pages travel as the binary read reply (relay-wire §7.2); errors
+	 * are JSON.
 	 */
 	read(url: URL): Response {
 		const maxBytes = nonNegativeInteger(url.searchParams.get("maxBytes"), STREAM_READ_DEFAULT_BYTES);
@@ -968,7 +1058,7 @@ export class StreamRelayService {
 		if (after === null) return json({ error: "invalid_cursor" }, 400);
 		return this.dailyLimitAware(() => {
 			const page = this.options.store().read(stream, after, budget, url.searchParams.get("checkpoint") === "1");
-			return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), ...wirePage(page) });
+			return this.binaryRead([page]);
 		});
 	}
 
@@ -984,17 +1074,24 @@ export class StreamRelayService {
 		}
 		return this.dailyLimitAware(() => {
 			const store = this.options.store();
-			const pages: ReturnType<typeof wirePage>[] = [];
+			const pages: StreamReadPage[] = [];
 			let left = maxBytes;
 			for (const entry of entries) {
 				if (pages.length > 0 && left <= 0) break;
 				const page = store.read(entry.stream, entry.after, pages.length > 0 ? left : maxBytes, entry.checkpoint);
 				const size = (page.checkpoint?.bytes.byteLength ?? 0) + page.rows.reduce((total, row) => total + row.payload.byteLength, 0);
 				if (pages.length > 0 && size > left) break;
-				pages.push(wirePage(page));
+				pages.push(page);
 				left -= size;
 			}
-			return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), pages });
+			return this.binaryRead(pages);
+		});
+	}
+
+	/** The binary read reply (relay-wire §7.2): one page for a single read, the served prefix for a batch. */
+	private binaryRead(pages: readonly StreamReadPage[]): Response {
+		return new Response(encodeReadReply(this.options.vaultGeneration(), this.head(), pages), {
+			headers: { "Content-Type": STREAM_READ_BINARY_TYPE, "Cache-Control": "no-store" },
 		});
 	}
 

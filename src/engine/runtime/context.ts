@@ -35,6 +35,7 @@ import type { MirrorWriter } from "./mirrorIo";
 import { resolveBudgets, resolveTuning, type EngineOptions, type EngineTuning } from "./options";
 import { OutboxCache } from "./outboxCache";
 import type { SessionLoop } from "./sessionLoop";
+import type { Subscriptions } from "./subscriptions";
 import { buildStatus } from "./status";
 
 export type EngineDeps = CatchUpDeps & CheckpointDeps & RefDeps & FrameCtx;
@@ -115,6 +116,8 @@ export class EngineCtx {
 	live!: LiveIngest;
 	sess!: SessionLoop;
 	mirror!: MirrorWriter;
+	/** Stream subscriptions and the deferral of skipped streams (DESIGN §d.7). */
+	subs!: Subscriptions;
 	/** Opened right after the repo, before anything can seal (e2ee-design §12.4). */
 	keyring!: KeyringRuntime;
 
@@ -343,6 +346,7 @@ export class EngineCtx {
 		if (res.removed.length > 0 || res.updated.length > 0 || (res.renamed?.length ?? 0) > 0) {
 			this.mirror.schedule();
 			this.scheduleStatus();
+			this.subs.poke();
 		}
 		const settled: DocId[] = [];
 		for (const s of drained) {
@@ -361,6 +365,7 @@ export class EngineCtx {
 		}
 		this.mirror.schedule();
 		this.scheduleStatus();
+		this.subs.poke();
 	}
 
 	registerAdopt(r: OutboxRecord): void {

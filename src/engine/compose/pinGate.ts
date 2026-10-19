@@ -74,6 +74,7 @@ function readOnly(s: RelaySession, kOnly: boolean): RelaySession {
 			s.append(frame);
 		},
 		bufferedBytes: () => s.bufferedBytes(),
+		subscribe: (streams) => s.subscribe(streams),
 		feed: (afterSeq) => s.feed(afterSeq),
 		read: (stream, afterSeq, preferCheckpoint) => s.read(stream, afterSeq, preferCheckpoint),
 		readBatch: (reqs) => s.readBatch(reqs),
@@ -81,6 +82,7 @@ function readOnly(s: RelaySession, kOnly: boolean): RelaySession {
 			return Promise.reject(new WriteRefused("checkpoint"));
 		},
 		onEvent: (listener) => s.onEvent(listener),
+		ping: () => s.ping(),
 		close: (code, reason) => s.close(code, reason),
 	};
 }

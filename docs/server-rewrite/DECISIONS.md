@@ -107,7 +107,7 @@ New code (about 3k): Worker router 350, vault DO host 700, config DO 300, strict
 ## 3. Decisions D2–D9
 
 **D2 Topology.** As in §2.1. `/api/capabilities` needs only `claimed`, and the Worker caches `true` forever.
-*Why:* the config DO was a serial hop on every device request (§15: ticket 107 ms p50 deployed) and the source of
+*Why:* the config DO was a serial hop on every device request (relay-wire §14: ticket 107 ms p50 deployed) and the source of
 the fence. *Tests:* T-ENROLL-200 (BB), T-HOTPATH (WB: feed, read, checkpoint, ticket, socket, enroll and
 pairing-code make zero config-DO calls, checked with a counting stub).
 
@@ -819,7 +819,7 @@ P5 findings:
 | P2 Identity | Claim, login and sessions, vaults, owner code, D3 codes, enroll (replay, D3), D4 tickets, devices list and revoke (D7 gate) | D2–D7 BB + BASELINE green on local dev; T-PAIR-NOWRITE, T-HOTPATH, T-ROWS-WB (identity rows) green |
 | P3 Hardening | H1–H8, D8a/D8c, D9 (`v/<vaultId>/<address>` keys); D8b | Every BB row except T-RESTORE-MANUAL green locally (blob rows with local R2); all WB green; H2 cold-scan CPU and D8a DROP+CREATE billing measured |
 | P4 Console | `GET /` page and `GET /mobile-setup` (D5) | Manual run on local dev: claim → vault → QR → enroll → revoke → reset; no external assets |
-| P5 Deploy over scratch-3 | The coordinator deploys: migration v3 deletes the old DO classes, then v4 adds the two new ones (one migration doing both failed with `10067` at the 500-namespace cap: the API counts the new classes before the deletions) | The full suite is green on scratch-3 except the documented SKIPs; T-RESTORE-MANUAL done once by hand; §15 latencies re-measured |
+| P5 Deploy over scratch-3 | The coordinator deploys: migration v3 deletes the old DO classes, then v4 adds the two new ones (one migration doing both failed with `10067` at the 500-namespace cap: the API counts the new classes before the deletions) | The full suite is green on scratch-3 except the documented SKIPs; T-RESTORE-MANUAL done once by hand; relay-wire §14 latencies re-measured |
 
 Status 2026-10-06: P0–P3 done. Combined local run at 15e9bf3: `conformance-local-final-20261006T105356Z.json`,
 49 pass, 0 fail, 1 SKIP (T-BLOB-UNAVAILABLE needs an unbound bucket; it passes in
@@ -835,11 +835,11 @@ Status 2026-10-06 (P5): deployed over scratch-3 in two steps (v3, then v4; §9 r
 T-DAILY: no debug route). The fail, T-CODEC-VALID ("timeout waiting for VAULT_READY"), was the network: the Worker
 logged `responseStreamDisconnected` 40 ms in and the vault DO's fetch `canceled` after 1 ms, on a client behind
 WARP; three re-runs pass (`conformance-scratch3-codecvalid-rerun{1,2,3}-*.json`). e2e/relay/smoke.ts, with `Origin`
-on operator writes (G15), 31/31 three times (`client-e2e-smoke-deployed-new-{1,2,3}-*.json`). §15 p50 medians, old
+on operator writes (G15), 31/31 three times (`client-e2e-smoke-deployed-new-{1,2,3}-*.json`). relay-wire §14 p50 medians, old
 deployed → new: ticket 107 → 91; socket connect 317 → 170; peer PROVISIONAL 57 → 61; own receipt 370 → 989; peer
 COMMIT_NOTICE 357 → 994; peer COMMITTED 395 → 374; ping 67 → 64; 12 × 8 KiB burst 467 → 1150; feed 249 → 97; read
 page 238 → 93; checkpoint put 266 → 117. The three slower rows are H8: smoke sends each append right after the last
-receipt, inside the 1 s `minIntervalMs`; its first sample, from idle, is 372 ms (old 405). relay-wire §15 (the text
+receipt, inside the 1 s `minIntervalMs`; its first sample, from idle, is 372 ms (old 405). relay-wire §14 (the text
 after the table) and :163 (`minIntervalMs: 0`) are updated in the PR into client-remake, with :56 (O12).
 T-RESTORE-MANUAL failed first: PITR refused T, 11 s after the vault's init, and the runner retried forever with the
 vault's authority frozen; fixed in 55cfd32 and f9ce3a1 (G37, G42, O15). Re-run on 55cfd32 (version 243e812e) with T

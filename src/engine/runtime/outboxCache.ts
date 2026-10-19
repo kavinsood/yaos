@@ -36,6 +36,24 @@ export class OutboxCache {
 		return m ? [...m.values()].sort((a, b) => a.order - b.order) : [];
 	}
 
+	/** Streams with at least one record that is not poisoned (still to be sent, adopted or settled). */
+	*liveStreams(): IterableIterator<StreamName> {
+		for (const [stream, m] of this.byStream) {
+			for (const r of m.values()) {
+				if (r.state === "poisoned") continue;
+				yield stream;
+				break;
+			}
+		}
+	}
+
+	/** The stream has a record that is not poisoned. */
+	hasLive(stream: StreamName): boolean {
+		const m = this.byStream.get(stream);
+		if (m) for (const r of m.values()) if (r.state !== "poisoned") return true;
+		return false;
+	}
+
 	put(rec: OutboxRecord): void {
 		this.delete(rec.clientFrameId);
 		this.byId.set(rec.clientFrameId, rec);

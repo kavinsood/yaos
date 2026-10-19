@@ -1,10 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
-import { base64ToBytes, bytesToBase64, createRelayHttp, dailyResetDelayMs, parseRetryAfter, RelayHttpError } from "./relayHttp";
+import { createRelayHttp, dailyResetDelayMs, parseRetryAfter, RelayHttpError } from "./relayHttp";
 import { RELAY_HTTP_BASE_MS, RELAY_HTTP_FLOOR_BYTES_PER_S, relayHttpDeadlineMs } from "../../core/deadline";
 import type { StreamName } from "../../core/types";
 import { fakeFetch, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
+import { encodeReadReply, READ_BINARY_TYPE, type WireReadPage } from "./relayFrames";
 
 const TOKEN = "device-token-SECRET-abc123";
 const BASE = "https://relay.example/";
@@ -43,14 +44,6 @@ describe("relayHttp helpers", () => {
 		assert.equal(dailyResetDelayMs(reset, reset - 60_000), 60_000);
 		assert.equal(dailyResetDelayMs(reset, reset - 3 * 86_400_000), 86_400_000, "slow clock");
 		assert.equal(dailyResetDelayMs(reset, reset + 5_000), null, "fast clock");
-	});
-
-	it("base64 round-trips binary and large inputs", () => {
-		const small = new Uint8Array([0, 255, 1, 128, 64]);
-		assert.deepEqual(base64ToBytes(bytesToBase64(small)), small);
-		const big = new Uint8Array(200_000).map((_v, i) => (i * 7) & 0xff);
-		assert.deepEqual(base64ToBytes(bytesToBase64(big)), big);
-		assert.equal(bytesToBase64(new Uint8Array([104, 105])), "aGk=");
 	});
 });
 
@@ -149,16 +142,16 @@ describe("relayHttp feed", () => {
 	});
 });
 
-describe("relayHttp read", () => {
-	const b64 = (...v: number[]) => bytesToBase64(new Uint8Array(v));
+describe("relayHttp read (binary reply, relay-wire §7.2)", () => {
+	const binary = (pages: WireReadPage[], status = 200) =>
+		new Response(encodeReadReply({ vaultEpoch: "E", head: 57, pages }), { status, headers: { "content-type": READ_BINARY_TYPE } });
+	const pageOf = (stream: string, extra: Partial<WireReadPage> = {}): WireReadPage => ({
+		stream, lastSeq: 57, checkpointSeq: 50, gcSeq: 44, checkpoint: { coversSeq: 50, bytes: new Uint8Array([1, 2, 3]) },
+		rows: [{ seq: 53, deviceId: "d1", clientFrameId: "c1", payload: new Uint8Array([9]) }], nextAfter: 53, ...extra,
+	});
 
-	it("decodes rows and the checkpoint; passes maxBytes and checkpoint=1", async () => {
-		const { http, requests } = client(() => jsonResponse({
-			vaultEpoch: "E", head: 57, stream: "b:x", lastSeq: 57, checkpointSeq: 50, gcSeq: 44,
-			checkpoint: { coversSeq: 50, bytes: b64(1, 2, 3) },
-			rows: [{ seq: 53, deviceId: "d1", clientFrameId: "c1", payload: b64(9) }],
-			nextAfter: 53,
-		}));
+	it("decodes rows and the checkpoint; passes maxBytes and checkpoint=1; sends no Accept", async () => {
+		const { http, requests } = client(() => binary([pageOf("b:x y")]));
 		const page = await http.read("v1", "b:x y", 0, true, 4096);
 		assert.deepEqual(page, {
 			checkpoint: { coversSeq: 50, bytes: new Uint8Array([1, 2, 3]) },
@@ -168,31 +161,52 @@ describe("relayHttp read", () => {
 		const q = requests[0]!.url.searchParams;
 		assert.equal(requests[0]!.url.pathname, "/vault/v1/streams/read");
 		assert.deepEqual([q.get("stream"), q.get("after"), q.get("maxBytes"), q.get("checkpoint")], ["b:x y", "0", "4096", "1"]);
+		assert.equal(requests[0]!.headers.get("accept"), null);
 	});
 
 	it("nextAfterSeq on the last page: last row, else checkpoint, else afterSeq", async () => {
-		const page = (body: Record<string, unknown>) => client(() => jsonResponse({
-			vaultEpoch: "E", head: 9, stream: "s", lastSeq: 9, checkpointSeq: 0, gcSeq: 0, checkpoint: null, rows: [], nextAfter: null, ...body,
-		})).http;
-		const rows = await (page({ rows: [{ seq: 8, deviceId: "d", clientFrameId: "a", payload: "" }, { seq: 9, deviceId: "d", clientFrameId: "b", payload: "" }] }))
+		const page = (extra: Partial<WireReadPage>) => client(() => binary([pageOf("s", { lastSeq: 9, checkpointSeq: 0, gcSeq: 0, checkpoint: null,
+			rows: [], nextAfter: null, ...extra })])).http;
+		const empty = new Uint8Array(0);
+		const rows = await page({ rows: [{ seq: 8, deviceId: "d", clientFrameId: "a", payload: empty }, { seq: 9, deviceId: "d", clientFrameId: "b", payload: empty }] })
 			.read("v1", "s", 3, false, null);
 		assert.equal(rows.nextAfterSeq, 9);
 		assert.equal(rows.more, false);
-		const cp = await page({ checkpointSeq: 6, checkpoint: { coversSeq: 6, bytes: "" } }).read("v1", "s", 0, true, null);
+		const cp = await page({ checkpointSeq: 6, checkpoint: { coversSeq: 6, bytes: empty } }).read("v1", "s", 0, true, null);
 		assert.equal(cp.nextAfterSeq, 6);
 		assert.deepEqual(cp.checkpoint, { coversSeq: 6, bytes: new Uint8Array(0) });
-		const empty = await page({ lastSeq: 0 }).read("v1", "unknown", 4, false, null);
-		assert.deepEqual(empty, { checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 0, gcSeq: 0, nextAfterSeq: 4, more: false });
+		const unknown = await client(() => binary([pageOf("unknown", { lastSeq: 0, checkpointSeq: 0, gcSeq: 0, checkpoint: null, rows: [], nextAfter: null })]))
+			.http.read("v1", "unknown", 4, false, null);
+		assert.deepEqual(unknown, { checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 0, gcSeq: 0, nextAfterSeq: 4, more: false });
 	});
 
-	it("omits optional query params and throws typed errors", async () => {
+	it("readBatch decodes the served prefix and checks each page's stream", async () => {
+		const reqs = [{ stream: "a" as StreamName, afterSeq: 0, preferCheckpoint: true }, { stream: "b" as StreamName, afterSeq: 7, preferCheckpoint: false }];
+		const { http } = client(() => binary([pageOf("a")]));
+		const pages = await http.readBatch("v1", reqs, null);
+		assert.equal(pages.length, 1);
+		assert.equal(pages[0]!.nextAfterSeq, 53);
+		const wrong = await rejection(client(() => binary([pageOf("b")])).http.readBatch("v1", reqs, null));
+		assert.equal(wrong.code, "malformed_response");
+		const many = await rejection(client(() => binary([pageOf("a"), pageOf("b"), pageOf("c")])).http.readBatch("v1", reqs, null));
+		assert.equal(many.code, "malformed_response");
+		const none = await rejection(client(() => binary([])).http.readBatch("v1", reqs, null));
+		assert.equal(none.code, "malformed_response");
+	});
+
+	it("truncated, trailing, wrong-version, wrong-stream or JSON 200 replies are malformed; errors are JSON", async () => {
+		const full = encodeReadReply({ vaultEpoch: "E", head: 57, pages: [pageOf("s")] });
+		const raw = (bytes: Uint8Array) => () => new Response(bytes, { headers: { "content-type": READ_BINARY_TYPE } });
+		for (const bytes of [full.subarray(0, full.byteLength - 1), new Uint8Array([...full, 0]), new Uint8Array([2, ...full.subarray(1)])]) {
+			assert.equal((await rejection(client(raw(bytes)).http.read("v1", "s", 0, false, null))).code, "malformed_response");
+		}
+		assert.equal((await rejection(client(() => binary([pageOf("t")])).http.read("v1", "s", 0, false, null))).code, "malformed_response");
+		const json = client(() => jsonResponse({ vaultEpoch: "E", head: 9, stream: "s", lastSeq: 9, checkpoint: null, rows: [], nextAfter: null }));
+		assert.equal((await rejection(json.http.read("v1", "s", 3, false, null))).code, "malformed_response");
 		const c = client(() => jsonResponse({ error: "invalid_stream" }, 400));
 		const e = await rejection(c.http.read("v1", "", 0, false, null));
 		assert.deepEqual([e.status, e.code], [400, "invalid_stream"]);
 		assert.equal(c.requests[0]!.url.search, "?stream=&after=0");
-		const bad = await rejection(client(() => jsonResponse({ lastSeq: 1, rows: [{ seq: 1, deviceId: "d", clientFrameId: "c", payload: "!!" }], nextAfter: null }))
-			.http.read("v1", "s", 0, false, null));
-		assert.equal(bad.code, "malformed_response");
 	});
 });
 
@@ -245,9 +259,9 @@ describe("relayHttp deadlines (feed, read, readBatch, putCheckpoint)", () => {
 	const calls: [string, number, (h: ReturnType<typeof createRelayHttp>, signal?: AbortSignal) => Promise<unknown>][] = [
 		// 4 KiB reply + 1000 entries of 300 B.
 		["feed", relayHttpDeadlineMs(4096 + 1000 * 300), (h, s) => h.feed("v1", 0, 1000, s)],
-		// 4 KiB + 4 x max(1 MiB budget, 4 MiB checkpoint): 271 s, the figure RELAY_HTTP_FLOOR_BYTES_PER_S justifies.
-		["read", 271_063, (h, s) => h.read("v1", "ns", 0, true, MiB, s)],
-		["readBatch", 271_063, (h, s) => h.readBatch("v1", [{ stream: "a" as StreamName, afterSeq: 0, preferCheckpoint: false }, { stream: "b" as StreamName, afterSeq: 0, preferCheckpoint: true }], MiB, s)],
+		// 4 KiB + 2 x max(1 MiB budget, 4 MiB checkpoint): 143 s, the figure RELAY_HTTP_FLOOR_BYTES_PER_S justifies.
+		["read", 143_063, (h, s) => h.read("v1", "ns", 0, true, MiB, s)],
+		["readBatch", 143_063, (h, s) => h.readBatch("v1", [{ stream: "a" as StreamName, afterSeq: 0, preferCheckpoint: false }, { stream: "b" as StreamName, afterSeq: 0, preferCheckpoint: true }], MiB, s)],
 		// 4 KiB + the body.
 		["putCheckpoint", relayHttpDeadlineMs(4096 + MiB), (h, s) => h.putCheckpoint("v1", "ns", 2, 0, new Uint8Array(MiB), s)],
 	];
@@ -255,7 +269,7 @@ describe("relayHttp deadlines (feed, read, readBatch, putCheckpoint)", () => {
 	it("deadline = base + bytes at the floor rate", () => {
 		assert.equal(relayHttpDeadlineMs(0), RELAY_HTTP_BASE_MS);
 		assert.equal(relayHttpDeadlineMs(RELAY_HTTP_FLOOR_BYTES_PER_S * 10), RELAY_HTTP_BASE_MS + 10_000);
-		assert.equal(relayHttpDeadlineMs(4096 + 4 * 4 * MiB), 271_063);
+		assert.equal(relayHttpDeadlineMs(4096 + 2 * 4 * MiB), 143_063);
 	});
 
 	for (const [name, deadlineMs, call] of calls) {

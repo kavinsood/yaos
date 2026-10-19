@@ -146,7 +146,13 @@ function dutyOrFallback(st: CheckpointState, stream: StreamName, hasDuty: boolea
 
 /** Duty test for a body/canvas stream (DESIGN §d.9): hot after idleMs, settle after settleMs. */
 export function bodyCheckpointDue(rec: StreamRecord, hasDuty: boolean, st: CheckpointState, tuning: CheckpointTuning, nowMono: number, jitterMs: number): boolean {
-	if (rec.stale || rec.frozen || st.tooLarge.get(rec.stream)?.seq === rec.appliedSeq) return false;
+	// A stale stream (rows skipped or not read yet) has rows this device has not seen: the fallback clock starts
+	// over once it is caught up, so a reader that sees a busy stream only through late reads never falls back early.
+	if (rec.stale) {
+		st.condSince.delete(rec.stream);
+		return false;
+	}
+	if (rec.frozen || st.tooLarge.get(rec.stream)?.seq === rec.appliedSeq) return false;
 	const hot = rec.rowsSinceRemoteCheckpoint >= tuning.rows || rec.bytesSinceRemoteCheckpoint >= tuning.bytes;
 	if (!hot && (!settleWanted(rec) || !st.settleOpen(nowMono))) {
 		st.condSince.delete(rec.stream);
@@ -301,6 +307,7 @@ export async function writeBodyCheckpoint(deps: CheckpointDeps, st: CheckpointSt
 export function foldCheckpointDue(rec: StreamRecord | undefined, fold: FoldRuntime<unknown, unknown>, st: CheckpointState, tuning: CheckpointTuning, nowMono: number, jitterMs: number): boolean {
 	const cand = fold.candidate;
 	const stream = fold.stream;
+	if (rec?.stale) st.condSince.delete(stream);
 	if (!rec || !cand || rec.stale || fold.halted) return false;
 	if (cand.seq <= rec.remoteCheckpointCoversSeq || st.tooLarge.get(stream)?.seq === cand.seq) return false;
 	if (nowMono < st.holdUntilMono) return false;

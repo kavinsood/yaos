@@ -99,6 +99,15 @@ function brief(event: RelayEvent): unknown {
 
 // ---- session wrapper --------------------------------------------------------
 
+/** The b: streams the peer B checks live pushes of. */
+const PUSHED = ["b:wpc-smoke-doc", "b:wpc-conflict-doc"];
+
+/** Subscribes `peer` to PUSHED and waits for a pong: the relay handles a socket's messages in order. */
+async function subscribe(peer: Peer): Promise<void> {
+	peer.session.subscribe(PUSHED.map(asStream));
+	await peer.session.ping();
+}
+
 /** Records every event of one session and lets the smoke await them. */
 class Peer {
 	readonly events: RelayEvent[] = [];
@@ -218,6 +227,8 @@ async function main(): Promise<OnboardedVault> {
 	step("connect + VAULT_READY");
 	const a = await connect("A", vault, devA);
 	const b = await connect("B", vault, devB);
+	// B is pushed the b: rows it checks only once subscribed (relay-wire §5.6); the pong proves the set is in effect.
+	await subscribe(b);
 	for (const peer of [a, b]) {
 		const s = peer.session;
 		check(`${peer.name}: vaultEpoch = vaultGeneration, head 0, canWrite`, s.vaultEpoch === vault.vaultGeneration && s.headSeq === 0 && s.canWrite,
@@ -422,6 +433,7 @@ async function main(): Promise<OnboardedVault> {
 	const missedSeq = (await a2.receipt("ns", "a-ns-missed", fromA2)).seq;
 	check("A2 append while B offline: seq = head + 1", missedSeq === head + 1, { missedSeq });
 	const b2 = await connect("B2", vault, devB);
+	await subscribe(b2);
 	check("B2 headSeq covers the row it missed", b2.session.headSeq === missedSeq, { headSeq: b2.session.headSeq, missedSeq });
 	const catchUp = await b2.session.feed(head);
 	const nsRead = await b2.session.read(asStream("ns"), nsReceipt.seq, false);

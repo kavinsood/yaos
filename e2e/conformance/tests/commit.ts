@@ -4,7 +4,7 @@ import type { TestDef } from "../lib/results.ts";
 import { ensureDevice, vault } from "../lib/fixture.ts";
 import { readAll } from "../lib/streams.ts";
 import { StreamSocket } from "../lib/socket.ts";
-import { b64, bytesEqual, id, now, payloadOf, round, sleep } from "../lib/util.ts";
+import { bytesEqual, id, now, payloadOf, round, sleep } from "../lib/util.ts";
 
 const KiB = 1024;
 const RATE = 256 * KiB;
@@ -143,7 +143,7 @@ export const tests: TestDef[] = [
 			const committed = rows.map((r) => r.clientFrameId);
 			const sendIds = order.map((i) => i.id);
 			const prefix = committed.every((cid, index) => cid === sendIds[index])
-				&& rows.every((r) => bytesEqual(b64(r.payload), order.find((i) => i.id === r.clientFrameId)!.payload));
+				&& rows.every((r) => bytesEqual(r.payload, order.find((i) => i.id === r.clientFrameId)!.payload));
 			t.check("committed rows are a prefix of the send order (byte-identical)", prefix, { committed: committed.length });
 			t.check("frames after the trip were not committed", committed.length < order.length, { committed: committed.length, sent: order.length });
 			t.check("every receipted frame is committed with its receipt seq", [...receipted].every(([cid, seq]) => rows.find((r) => r.clientFrameId === cid)?.seq === seq),

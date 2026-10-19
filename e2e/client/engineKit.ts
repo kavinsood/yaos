@@ -17,7 +17,8 @@ import { createNoopCrypto } from "../../src/engine/adapters/noopCrypto";
 import { createWebClock } from "../../src/engine/adapters/webClock";
 import { createWebHash } from "../../src/engine/adapters/webHash";
 import { createWebRandom } from "../../src/engine/adapters/webRandom";
-import { createWsRelayPort } from "../../src/engine/adapters/wsRelay";
+import { createWsRelayPort, type WebSocketCtor } from "../../src/engine/adapters/wsRelay";
+import type { DeviceClass } from "../../src/core/limits";
 import { LogEngine } from "../../src/engine/runtime/engine";
 import type { EngineTuning } from "../../src/engine/runtime/options";
 import { MemSideFiles, docText } from "../../src/engine/runtime/testHarness";
@@ -116,6 +117,12 @@ export async function until(pred: () => boolean | Promise<boolean>, timeoutMs: n
 
 // ---- devices -------------------------------------------------------------------
 
+export interface DeviceStartOptions {
+	readonly deviceClass?: DeviceClass;
+	readonly WebSocketImpl?: WebSocketCtor;
+	readonly fetch?: typeof fetch;
+}
+
 /** One device: its credentials, its IndexedDB (fake-indexeddb factory), side files and bound host docs. */
 export class Device {
 	factory = new IDBFactory();
@@ -131,7 +138,11 @@ export class Device {
 		return this.engine;
 	}
 
-	async start(host: string, vaultId: string, tuning: Partial<EngineTuning>): Promise<LogEngine> {
+	/**
+	 * `opts`: extra engine options (fanout.ts: a device class) and transport wrappers that see the
+	 * production adapters' socket and HTTP traffic (measurement only).
+	 */
+	async start(host: string, vaultId: string, tuning: Partial<EngineTuning>, opts: DeviceStartOptions = {}): Promise<LogEngine> {
 		const clock = createWebClock();
 		const random = createWebRandom();
 		const hash = createWebHash();
@@ -139,7 +150,10 @@ export class Device {
 		const blob = await probeHttpBlob(blobOpts);
 		this.engine = await LogEngine.start({
 			ports: {
-				relay: createWsRelayPort({ baseUrl: host, credential: this.dev.deviceToken, clock, random }),
+				relay: createWsRelayPort({
+					baseUrl: host, credential: this.dev.deviceToken, clock, random,
+					...(opts.WebSocketImpl ? { WebSocketImpl: opts.WebSocketImpl } : {}), ...(opts.fetch ? { fetch: opts.fetch } : {}),
+				}),
 				storage: createIdbStoragePort(this.factory, IDBKeyRange),
 				clock, random, crypto: createNoopCrypto(hash), hash, blob, probeBlob: () => probeHttpBlob(blobOpts),
 			},
@@ -149,6 +163,7 @@ export class Device {
 			sideFiles: this.side,
 			tuning,
 			e2ee: { suite: 0 },
+			...(opts.deviceClass ? { deviceClass: opts.deviceClass } : {}),
 			onBoundText: (id, changes, _length, origin) => {
 				const text = this.hosts.get(id);
 				if (text === undefined || origin === "editor") return; // "editor" = this device's own typing, already shown

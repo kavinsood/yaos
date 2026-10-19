@@ -212,6 +212,7 @@ async function streamingCycle(ctx: Ctx, n: number, withSpareTicket: boolean) {
 	const stream = `b:gate-${id(6)}`;
 	const prefix = `g${n}`;
 	const b = await StreamSocket.connect(ctx, v.vaultId, B, `B${n}`);
+	await b.subscribe([stream]);
 	const a = track(ctx, await RawSocket.connect(ctx, v.vaultId, A, `A${n}`, ADVERSARIAL));
 	const spareTicket = withSpareTicket ? await StreamSocket.ticket(ctx, v.vaultId, A.token) : null;
 	const rtt = await pingRtt(b);
@@ -281,6 +282,7 @@ async function hibernationCycle(ctx: Ctx, n: number, idleMs: number, offsets: nu
 	const stream = `b:gate-${id(6)}`;
 	const prefix = `h${n}`;
 	const b = await StreamSocket.connect(ctx, v.vaultId, B, `B${n}`);
+	await b.subscribe([stream]);
 	const a = track(ctx, await RawSocket.connect(ctx, v.vaultId, A, `A${n}`, ADVERSARIAL));
 	const warm: Sent[] = [];
 	for (let i = 0; i < 3; i++) { const fid = `${prefix}-warm-${i}`; const r = a.append(stream, fid, payloadOf(fid, 48)); warm.push({ id: fid, ...r }); }
@@ -358,7 +360,12 @@ async function silence(ctx: Ctx, t: Recorder) {
 	const b = await StreamSocket.connect(ctx, v.vaultId, B, "B");
 	const a1 = track(ctx, await RawSocket.connect(ctx, v.vaultId, A, "A-polite", POLITE));
 	const a2 = track(ctx, await RawSocket.connect(ctx, v.vaultId, A, "A-ignores-close", ADVERSARIAL));
-	// Positive control: before the revoke both A sockets receive B's data.
+	// Positive control: before the revoke both A sockets (subscribed to bs) receive B's data.
+	for (const a of [a1, a2]) {
+		a.control({ type: "STREAM_SUBSCRIBE", streams: [bs] });
+		a.control({ type: "VAULT_PING", probeId: "subscribed" });
+		await a.waitFor((e) => e.control?.type === "VAULT_PONG" ? true : undefined, 10000, "PONG after STREAM_SUBSCRIBE");
+	}
 	await b.appendAll([{ stream: bs, id: "pre-b", payload: payloadOf("pre-b", 64) }, { stream: xs, id: "pre-x", payload: payloadOf("pre-x", 64) }]);
 	await sleep(500);
 	const control = (a: RawSocket) => ({
@@ -419,6 +426,7 @@ async function buffered(ctx: Ctx, t: Recorder) {
 	const { v, A, B, cookie } = await setup(ctx, "revoke-buffer");
 	const stream = `b:buf-${id(6)}`;
 	const b = await StreamSocket.connect(ctx, v.vaultId, B, "B");
+	await b.subscribe([stream]);
 	const a = track(ctx, await RawSocket.connect(ctx, v.vaultId, A, "A", ADVERSARIAL));
 	const gc = b.ready?.limits?.groupCommit ?? null;
 	const bFrom = b.mark();

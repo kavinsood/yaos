@@ -1,5 +1,5 @@
 /**
- * Streams wire v1 codec (docs/client-remake/relay-wire.md §4, §16).
+ * Streams wire v1 codec (docs/client-remake/relay-wire.md §4, §15).
  *
  * Binary frames use the lib0 primitives (u8 kind, varuint, varstring,
  * varbytes). Control messages are text frames: "__YPS:" + one JSON object.
@@ -16,6 +16,7 @@ export const FRAME_APPEND = 0x01;
 export const FRAME_PROVISIONAL = 0x10;
 export const FRAME_COMMITTED = 0x11;
 export const FRAME_COMMIT_NOTICE = 0x12;
+export const FRAME_SKIPPED = 0x13;
 
 export const CONTROL_PREFIX = "__YPS:";
 export const STREAMS_VERSION = 1;
@@ -29,7 +30,14 @@ export interface WireAppend {
 export type WireServerFrame =
 	| { readonly kind: "provisional"; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string; readonly payload: Uint8Array }
 	| { readonly kind: "committed"; readonly seq: number; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string; readonly payload: Uint8Array }
-	| { readonly kind: "notice"; readonly seq: number; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string };
+	| { readonly kind: "notice"; readonly seq: number; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string }
+	/** STREAM_SKIPPED (relay-wire §5.6): the rows of one frame merged into seq order. */
+	| { readonly kind: "skipped"; readonly rows: readonly WireSkippedRow[] };
+
+export interface WireSkippedRow {
+	readonly stream: string;
+	readonly seq: number;
+}
 
 export function encodeAppend(frame: WireAppend): Uint8Array {
 	const encoder = encoding.createEncoder();
@@ -56,9 +64,66 @@ export function decodeAppend(bytes: Uint8Array): WireAppend | null {
 	}
 }
 
+/**
+ * 0x13 STREAM_SKIPPED body from rows in seq order: one run per stream, the streams in order of their first seq
+ * (server encodeSkipped; tests and fakes).
+ */
+function writeSkipped(encoder: encoding.Encoder, rows: readonly WireSkippedRow[]): void {
+	const runs = new Map<string, number[]>();
+	for (const r of rows) {
+		const run = runs.get(r.stream);
+		if (run) run.push(r.seq);
+		else runs.set(r.stream, [r.seq]);
+	}
+	encoding.writeVarUint(encoder, runs.size);
+	for (const [stream, seqs] of runs) {
+		encoding.writeVarString(encoder, stream);
+		encoding.writeVarUint(encoder, seqs.length);
+		encoding.writeVarUint(encoder, seqs[0]!);
+		for (let i = 1; i < seqs.length; i++) encoding.writeVarUint(encoder, seqs[i]! - seqs[i - 1]!);
+	}
+}
+
+/**
+ * Strict 0x13 body: at least one stream, each named once with n >= 1 seqs, every delta > 0, first seqs ascending
+ * across streams (the order the relay writes them), every seq a positive safe integer. Rows come back merged into
+ * seq order (the order the relay skipped them in). Throws on anything else.
+ */
+function readSkipped(decoder: decoding.Decoder): WireSkippedRow[] {
+	const streamCount = decoding.readVarUint(decoder);
+	if (streamCount < 1) throw new RangeError("empty STREAM_SKIPPED");
+	const rows: WireSkippedRow[] = [];
+	const seen = new Set<string>();
+	let prevFirst = 0;
+	for (let i = 0; i < streamCount; i++) {
+		const stream = decoding.readVarString(decoder);
+		const n = decoding.readVarUint(decoder);
+		if (stream.length === 0 || seen.has(stream) || n < 1) throw new RangeError("bad STREAM_SKIPPED run");
+		seen.add(stream);
+		let seq = decoding.readVarUint(decoder);
+		if (seq <= prevFirst || !Number.isSafeInteger(seq)) throw new RangeError("bad STREAM_SKIPPED first seq");
+		prevFirst = seq;
+		rows.push({ stream, seq });
+		for (let k = 1; k < n; k++) {
+			const delta = decoding.readVarUint(decoder);
+			seq += delta;
+			if (delta < 1 || !Number.isSafeInteger(seq)) throw new RangeError("bad STREAM_SKIPPED delta");
+			rows.push({ stream, seq });
+		}
+	}
+	rows.sort((a, b) => a.seq - b.seq);
+	for (let i = 1; i < rows.length; i++) if (rows[i]!.seq === rows[i - 1]!.seq) throw new RangeError("duplicate STREAM_SKIPPED seq");
+	return rows;
+}
+
 /** Server-side encoder (tests and fakes). */
 export function encodeServerFrame(frame: WireServerFrame): Uint8Array {
 	const encoder = encoding.createEncoder();
+	if (frame.kind === "skipped") {
+		encoding.writeUint8(encoder, FRAME_SKIPPED);
+		writeSkipped(encoder, frame.rows);
+		return encoding.toUint8Array(encoder);
+	}
 	if (frame.kind === "provisional") {
 		encoding.writeUint8(encoder, FRAME_PROVISIONAL);
 	} else {
@@ -102,6 +167,11 @@ export function decodeServerFrame(bytes: Uint8Array): WireServerFrame | null {
 			if (decoder.pos !== bytes.byteLength) return null;
 			return { kind: "committed", seq, stream, deviceId, clientFrameId, payload };
 		}
+		if (kind === FRAME_SKIPPED) {
+			const rows = readSkipped(decoder);
+			if (decoder.pos !== bytes.byteLength) return null;
+			return { kind: "skipped", rows };
+		}
 		return null;
 	} catch {
 		return null;
@@ -110,15 +180,16 @@ export function decodeServerFrame(bytes: Uint8Array): WireServerFrame | null {
 
 // ---- control ---------------------------------------------------------------
 
-/** Subset of VAULT_READY.limits the client uses; absent or invalid fields are null. */
+/** Subset of VAULT_READY.limits the client uses. Every field is required and positive. */
 export interface WireLimits {
-	readonly maxPayloadBytes: number | null;
-	readonly maxCheckpointBytes: number | null;
-	readonly rateBytesPerSec: number | null;
-	readonly burstBytes: number | null;
-	readonly feedDefaultLimit: number | null;
-	readonly readDefaultBytes: number | null;
-	readonly readBatchMaxStreams: number | null;
+	readonly maxPayloadBytes: number;
+	readonly maxCheckpointBytes: number;
+	readonly rateBytesPerSec: number;
+	readonly burstBytes: number;
+	readonly feedDefaultLimit: number;
+	readonly readDefaultBytes: number;
+	readonly readBatchMaxStreams: number;
+	readonly maxSubscriptions: number;
 }
 
 export interface WireReceipt {
@@ -137,7 +208,8 @@ export type WireControl =
 		readonly deviceId: string | null;
 		readonly runtimeEpoch: string | null;
 		readonly liveness: { readonly idleMs: number; readonly timeoutMs: number } | null;
-		readonly limits: WireLimits;
+		/** null when any required limit is absent or not positive: the connect fails closed. */
+		readonly limits: WireLimits | null;
 	}
 	| { readonly type: "STREAM_RECEIPTS"; readonly head: number; readonly receipts: readonly WireReceipt[] }
 	| { readonly type: "STREAM_APPEND_REJECTED"; readonly stream: string; readonly clientFrameId: string; readonly code: string; readonly seq: number | null }
@@ -157,6 +229,11 @@ export type WireControl =
 
 export function encodeControl(message: Readonly<Record<string, unknown>>): string {
 	return CONTROL_PREFIX + JSON.stringify(message);
+}
+
+/** STREAM_SUBSCRIBE (relay-wire §5.6): the full replacement set. */
+export function encodeSubscribe(streams: readonly string[]): string {
+	return encodeControl({ type: "STREAM_SUBSCRIBE", streams });
 }
 
 export function encodePing(probeId: string): string {
@@ -184,17 +261,21 @@ function positive(o: Json, key: string): number | null {
 	return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
 }
 
-function parseLimits(value: unknown): WireLimits {
-	const o: Json = isRecord(value) ? value : {};
-	return {
-		maxPayloadBytes: positive(o, "maxPayloadBytes"),
-		maxCheckpointBytes: positive(o, "maxCheckpointBytes"),
-		rateBytesPerSec: positive(o, "rateBytesPerSec"),
-		burstBytes: positive(o, "burstBytes"),
-		feedDefaultLimit: positive(o, "feedDefaultLimit"),
-		readDefaultBytes: positive(o, "readDefaultBytes"),
-		readBatchMaxStreams: positive(o, "readBatchMaxStreams"),
-	};
+const LIMIT_KEYS = [
+	"maxPayloadBytes", "maxCheckpointBytes", "rateBytesPerSec", "burstBytes",
+	"feedDefaultLimit", "readDefaultBytes", "readBatchMaxStreams", "maxSubscriptions",
+] as const satisfies readonly (keyof WireLimits)[];
+
+/** null when any required limit is absent or not positive. */
+function parseLimits(value: unknown): WireLimits | null {
+	if (!isRecord(value)) return null;
+	const out: Partial<Record<keyof WireLimits, number>> = {};
+	for (const key of LIMIT_KEYS) {
+		const v = positive(value, key);
+		if (v === null) return null;
+		out[key] = v;
+	}
+	return out as WireLimits;
 }
 
 function parseReceipts(value: unknown): WireReceipt[] | null {
@@ -302,5 +383,91 @@ export function parseControl(text: string): WireControl | null {
 		}
 		default:
 			return null;
+	}
+}
+
+// ---- binary catch-up reads (relay-wire §7.2) ----------------------------------
+
+/** Content-Type of every 200 read reply (the client does not check it; tests and fakes set it). */
+export const READ_BINARY_TYPE = "application/vnd.yaos.streams-read.v1+binary";
+const READ_BINARY_VERSION = 1;
+
+export interface WireReadPage {
+	readonly stream: string;
+	readonly lastSeq: number;
+	readonly checkpointSeq: number;
+	readonly gcSeq: number;
+	readonly checkpoint: { readonly coversSeq: number; readonly bytes: Uint8Array } | null;
+	readonly rows: readonly { readonly seq: number; readonly deviceId: string; readonly clientFrameId: string; readonly payload: Uint8Array }[];
+	readonly nextAfter: number | null;
+}
+
+export interface WireReadReply {
+	readonly vaultEpoch: string;
+	readonly head: number;
+	readonly pages: readonly WireReadPage[];
+}
+
+/**
+ * `u8 1 | varstring vaultEpoch | varuint head | varuint pageCount`, then per page `varstring stream | varuint
+ * lastSeq | varuint checkpointSeq | varuint gcSeq | varuint nextAfter+1 (0: none) | u8 hasCheckpoint [varuint
+ * coversSeq | varbytes] | varuint rowCount | (varuint seq | varstring deviceId | varstring clientFrameId |
+ * varbytes payload)×rowCount`. Encoder for tests and fakes.
+ */
+export function encodeReadReply(reply: WireReadReply): Uint8Array {
+	const e = encoding.createEncoder();
+	encoding.writeUint8(e, READ_BINARY_VERSION);
+	encoding.writeVarString(e, reply.vaultEpoch);
+	encoding.writeVarUint(e, reply.head);
+	encoding.writeVarUint(e, reply.pages.length);
+	for (const p of reply.pages) {
+		encoding.writeVarString(e, p.stream);
+		encoding.writeVarUint(e, p.lastSeq);
+		encoding.writeVarUint(e, p.checkpointSeq);
+		encoding.writeVarUint(e, p.gcSeq);
+		encoding.writeVarUint(e, p.nextAfter === null ? 0 : p.nextAfter + 1);
+		encoding.writeUint8(e, p.checkpoint ? 1 : 0);
+		if (p.checkpoint) {
+			encoding.writeVarUint(e, p.checkpoint.coversSeq);
+			encoding.writeVarUint8Array(e, p.checkpoint.bytes);
+		}
+		encoding.writeVarUint(e, p.rows.length);
+		for (const r of p.rows) {
+			encoding.writeVarUint(e, r.seq);
+			encoding.writeVarString(e, r.deviceId);
+			encoding.writeVarString(e, r.clientFrameId);
+			encoding.writeVarUint8Array(e, r.payload);
+		}
+	}
+	return encoding.toUint8Array(e);
+}
+
+/** The binary read reply, or null when malformed (unknown version, a short field, trailing bytes). Payloads are views into `bytes`. */
+export function decodeReadReply(bytes: Uint8Array): WireReadReply | null {
+	try {
+		const d = decoding.createDecoder(bytes);
+		if (decoding.readUint8(d) !== READ_BINARY_VERSION) return null;
+		const vaultEpoch = decoding.readVarString(d);
+		const head = decoding.readVarUint(d);
+		const pages: WireReadPage[] = [];
+		for (let n = decoding.readVarUint(d); n > 0; n--) {
+			const stream = decoding.readVarString(d);
+			const lastSeq = decoding.readVarUint(d);
+			const checkpointSeq = decoding.readVarUint(d);
+			const gcSeq = decoding.readVarUint(d);
+			const nextAfterRaw = decoding.readVarUint(d);
+			const flag = decoding.readUint8(d);
+			if (flag > 1) return null;
+			const checkpoint = flag === 1 ? { coversSeq: decoding.readVarUint(d), bytes: decoding.readVarUint8Array(d) } : null;
+			const rows: { seq: number; deviceId: string; clientFrameId: string; payload: Uint8Array }[] = [];
+			for (let k = decoding.readVarUint(d); k > 0; k--) {
+				if (d.pos >= bytes.byteLength) return null;
+				rows.push({ seq: decoding.readVarUint(d), deviceId: decoding.readVarString(d), clientFrameId: decoding.readVarString(d), payload: decoding.readVarUint8Array(d) });
+			}
+			pages.push({ stream, lastSeq, checkpointSeq, gcSeq, checkpoint, rows, nextAfter: nextAfterRaw === 0 ? null : nextAfterRaw - 1 });
+		}
+		return d.pos === bytes.byteLength ? { vaultEpoch, head, pages } : null;
+	} catch {
+		return null;
 	}
 }
