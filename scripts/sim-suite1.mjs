@@ -5,6 +5,10 @@
 //
 // Usage: npm run test:sim-suite1 [-- <substring> ...]   (run only the matrices whose name contains a substring)
 // Env:   YAOS_SIM_SEEDS     seeds of the full-count matrices (default 200, as run.test.ts; the others scale with it)
+//        YAOS_SIM_CRYPTO    "none": the src/sim/run.test.ts matrices as they are (suite 0, no E2EE matrices), the
+//                           parallel sweep of the default suite; default "suite1"
+//        YAOS_SIM_CHECKPOINTS "production": DESIGN's checkpoint thresholds, no late join, no snapshots (runSim's
+//                           `checkpoints`, for comparing with the sim before checkpoint coverage); default "scaled"
 //        YAOS_SIM_JOBS      worker processes (default: cores - 1)
 //        YAOS_SIM_MINIMIZE  1: ddmin the first failing seed of each matrix (as run.test.ts does; slow)
 // Exit 1 on any violation, crash, RealWork stray, a matrix whose actors did no real work, or a blob-fault matrix
@@ -16,11 +20,14 @@ import { fileURLToPath } from "node:url";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SELF = fileURLToPath(import.meta.url);
 
+const CRYPTO = process.env.YAOS_SIM_CRYPTO === "none" ? "none" : "suite1";
+const CHECKPOINTS = process.env.YAOS_SIM_CHECKPOINTS === "production" ? "production" : "scaled";
+
 function matrices(seeds) {
 	const quarter = Math.max(1, Math.ceil(seeds / 4));
 	const half = Math.max(1, Math.ceil(seeds / 2));
 	const tenth = Math.max(1, Math.ceil(seeds / 10));
-	return [
+	const all = [
 		// src/sim/run.test.ts, unchanged but for the crypto.
 		{ name: "2 devices, no faults", base: { devices: 2, faults: null }, seeds },
 		{ name: "3 devices, seeded faults", base: { devices: 3, faults: "DEFAULT_FAULTS" }, seeds },
@@ -32,6 +39,7 @@ function matrices(seeds) {
 		{ name: "4 devices, E2EE faults", base: { devices: 4, faults: "E2EE_FAULTS", faultRate: 0.3 }, seeds: quarter },
 		{ name: "2 devices, E2EE fault-heavy", base: { devices: 2, faults: "E2EE_FAULTS", faultRate: 0.45 }, seeds: quarter },
 	];
+	return CRYPTO === "none" ? all.filter((m) => !m.name.includes("E2EE")) : all;
 }
 
 if (process.argv.includes("--worker")) await worker();
@@ -46,7 +54,7 @@ async function load(rel) {
 async function worker() {
 	const { runSim, minimizePlan } = await load("../src/sim/run.ts");
 	const weights = await load("../src/sim/faults.ts");
-	const cfgOf = (job) => ({ ...job.base, faults: job.base.faults ? weights[job.base.faults] : null, crypto: "suite1", seed: job.seed });
+	const cfgOf = (job) => ({ ...job.base, faults: job.base.faults ? weights[job.base.faults] : null, crypto: CRYPTO, checkpoints: CHECKPOINTS, seed: job.seed });
 	process.on("message", async (job) => {
 		if (job.t === "exit") process.exit(0);
 		const t0 = Date.now();
@@ -54,7 +62,7 @@ async function worker() {
 			const cfg = cfgOf(job);
 			if (job.t === "run") {
 				const r = await runSim(cfg);
-				process.send({ id: job.id, ok: true, ms: Date.now() - t0, violations: r.violations, tokens: r.stats.tokens.live, e2ee: r.stats.e2ee ?? null, realWork: r.stats.realWork ?? null, faults: r.stats.faults, blobs: r.stats.blobs });
+				process.send({ id: job.id, ok: true, ms: Date.now() - t0, violations: r.violations, tokens: r.stats.tokens.live, e2ee: r.stats.e2ee ?? null, realWork: r.stats.realWork ?? null, faults: r.stats.faults, blobs: r.stats.blobs, checkpoints: r.stats.checkpoints });
 			} else {
 				const r0 = await runSim(cfg);
 				const needle = r0.violations[0]?.detail ?? "";
@@ -134,7 +142,7 @@ async function main() {
 	const order = [...ms].sort((a, b) => (b.base.devices + (b.base.faults ? 2 : 0)) - (a.base.devices + (a.base.faults ? 2 : 0)));
 	let done = 0;
 	const total = ms.reduce((n, m) => n + m.seeds, 0);
-	console.log(`sim-suite1: ${total} runs in ${ms.length} matrices over ${jobsN} workers`);
+	console.log(`sim-suite1: ${total} runs in ${ms.length} matrices over ${jobsN} workers (crypto ${CRYPTO}, checkpoints ${CHECKPOINTS})`);
 	await Promise.all(order.flatMap((m) => Array.from({ length: m.seeds }, (_, i) => p.run({ t: "run", base: m.base, seed: i + 1 }).then((r) => {
 		results.get(m.name).push({ seed: i + 1, ...r });
 		if (++done % 50 === 0) console.log(`  ${done}/${total} (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
@@ -151,6 +159,7 @@ async function main() {
 		const e2ee = rs.reduce((s, r) => (r.e2ee ? addInto(s, r.e2ee) : s), {});
 		const rw = rs.reduce((s, r) => (r.realWork ? addInto(s, r.realWork) : s), {});
 		const blobs = rs.reduce((s, r) => (r.blobs ? addInto(s, r.blobs) : s), {});
+		const ckpt = rs.reduce((s, r) => (r.checkpoints ? addInto(s, r.checkpoints) : s), {});
 		const stalled = (blobs.stalled?.has ?? 0) + (blobs.stalled?.put ?? 0) + (blobs.stalled?.get ?? 0);
 		const blobsHit = !m.blobHits || (stalled > 0 && blobs.stalled.put > 0 && blobs.watchdog > 0 && blobs.aborted > 0 && blobs.slowDone > 0 && blobs.slowCut === 0);
 		const ok = failed.length === 0 && strays === 0 && tokens > m.seeds * 10 && blobsHit;
@@ -159,6 +168,7 @@ async function main() {
 		console.log(`   faults ${JSON.stringify(sumFaults)}`);
 		console.log(`   realWork ${JSON.stringify(rw)}`);
 		if (Object.keys(e2ee).length > 0) console.log(`   e2ee ${JSON.stringify(e2ee)}`);
+		console.log(`   checkpoints ${JSON.stringify(ckpt)}`);
 		if (m.blobHits) console.log(`   blobs ${JSON.stringify(blobs)}`);
 		if (!blobsHit) console.log("   the blob faults hit no transfer (stalled, stalled PUT, watchdog, aborted, slow done; slowCut 0)");
 		if (strays > 0) console.log(`   RealWork strays: ${strays} (a crypto await bypassed RealWork)`);
@@ -168,7 +178,7 @@ async function main() {
 		}
 		if (failed.length > 0) {
 			console.log(`   failed seeds: ${failed.map((r) => r.seed).join(",")}`);
-			console.log(`   replay one: runSim({ ...${JSON.stringify(m.base)}, faults: ${m.base.faults ?? "null"}, crypto: "suite1", seed })`);
+			console.log(`   replay one: runSim({ ...${JSON.stringify(m.base)}, faults: ${m.base.faults ?? "null"}, crypto: "${CRYPTO}", checkpoints: "${CHECKPOINTS}", seed })`);
 			if (process.env.YAOS_SIM_MINIMIZE === "1" && failed[0].ok) minimize.push({ m, seed: failed[0].seed });
 		}
 	}

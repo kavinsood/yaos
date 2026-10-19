@@ -137,6 +137,10 @@ export class SimDevice {
 	/** crashApp until restartApp. */
 	private appDown = false;
 	engineStarts = 0;
+	/** LogEngine diagnostics of every engine this device ran, counted by `code` or `code:cls` (sim stats). */
+	readonly diagCounts: Record<string, number> = {};
+	/** Checkpoints the gate refused on this device (checkpoint-disputed), with their detail. */
+	readonly disputed: string[] = [];
 	/** Texts that existed only in host memory when the app crashed (pending conflict copies; known gap). */
 	readonly crashLost: string[] = [];
 	readonly deviceId: DeviceId;
@@ -158,7 +162,9 @@ export class SimDevice {
 	};
 
 	constructor(readonly opts: SimDeviceOptions) {
-		this.deviceId = `dev-${opts.name}` as DeviceId;
+		// A real device id is 16..128 of [A-Za-z0-9_-] (relay-wire §2 enroll; the snap index ignores records of any
+		// other, core/snap/record.ts), so "dev-A" alone would make every snapshot upload a silent no-op.
+		this.deviceId = `dev-${opts.name}-0000000000000` as DeviceId;
 		this.secrets = new FakeSecretStorage(this.secretBacking);
 		this.pinData = opts.pin === null ? {} : { e2ee: opts.pin ?? suite0PinForTest() };
 		this.storage = new MemStoragePort({ beforeNextTimer: opts.clock.beforeNextTimer, macrotask: opts.clock.macrotask });
@@ -187,12 +193,23 @@ export class SimDevice {
 			startRetryMs: 1_000,
 			tzOffsetMinutes: () => 0,
 			log: this.opts.log,
+			onDiag: (ev) => {
+				this.opts.log?.(`diag ${ev.code} ${JSON.stringify(ev.fields)}`);
+				const cls = ev.fields["cls"];
+				const k = typeof cls === "string" ? `${ev.code}:${cls}` : ev.code;
+				this.diagCounts[k] = (this.diagCounts[k] ?? 0) + 1;
+				const also = (code: string) => (this.diagCounts[`${code}:${String(cls)}`] = (this.diagCounts[`${code}:${String(cls)}`] ?? 0) + 1);
+				if (ev.code === "checkpoint-written" && Number(ev.fields["pendingOwn"]) > 0) also("checkpoint-written-pending");
+				// Not fresh: the device had state and its rows were collected meanwhile (offline, crashed, backgrounded).
+				if (ev.code === "checkpoint-adopted" && ev.fields["how"] !== "fresh") also("checkpoint-adopted-behind");
+				if (ev.code === "checkpoint-disputed" && this.disputed.length < 10) this.disputed.push(`${String(cls)}@${String(ev.fields["coversSeq"])} ${String(ev.fields["detail"])}`);
+			},
 			onRuntime: (rt) => {
 				if (this.handle === handle) this.vrt = rt;
 			},
 			makePorts: async (config): Promise<EnginePorts> => {
 				if (storageFails) throw new Error("IndexedDB unavailable in worker");
-				const random = new SeededRandom(hashLabel(`${this.deviceId}#${n}`));
+				const random = new SeededRandom(hashLabel(`dev-${this.opts.name}#${n}`));
 				const c = config.crypto;
 				// As webEngine.ts: suite 0 seals nothing; unpinned and suite 1 get the suite-1 adapter (keys zero-filled on
 				// import), on Node WebCrypto behind DelayedCrypto: crypto and hash settle on a task, in seed order.

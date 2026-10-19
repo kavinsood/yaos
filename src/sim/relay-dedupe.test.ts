@@ -95,3 +95,16 @@ test("relay store: batch-level dedupe is vault-wide; pre-seal before maxSegmentB
 	assert.deepEqual(store.segments(ns), { sealed: [{ firstSeq: 1, lastSeq: 2, rows: 2, bytes: 53 }], open: { firstSeq: 3, lastSeq: 3, rows: 1, bytes: 46 } });
 	assert.equal(store.lastSeq("cfg" as StreamName), 0);
 });
+
+test("relay store: rows a checkpoint at lastSeq retired (H7) stay in the dedupe window; a resend is deduped at its seq, even with other bytes", () => {
+	// Without this a device that crashed before its receipt resent a frame the retire had collected and it was
+	// committed twice (crash.test.ts "durable frame committed exactly once"); the server's H2 index keeps the key.
+	const store = new RelayStore({ sealBytes: 1000, maxSegmentBytes: 1000, tailRows: 2, gcOnCheckpoint: true });
+	const f = (id: string, payload: string) => ({ stream: ns, deviceId: "A" as DeviceId, clientFrameId: id as ClientFrameId, payload: bytes(payload) });
+	store.commit([f("a", "x"), f("b", "x")]);
+	assert.deepEqual(store.putCheckpoint(ns, 2, 0, bytes("ck")), { ok: true, gcSeq: 2, deletedSegments: 0 });
+	assert.equal(store.segments(ns).open, null);
+	assert.deepEqual(store.commit([f("b", "x"), f("a", "zz")]).outcomes, [{ kind: "deduped", seq: 2 }, { kind: "deduped", seq: 1 }]);
+	store.commit([f("c", "x"), f("d", "x")]);
+	assert.ok(!store.inDedupeWindow(ns, "A" as DeviceId, "a" as ClientFrameId), "open holds tailRows rows: the retired rows leave the window");
+});

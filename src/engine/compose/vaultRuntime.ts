@@ -23,7 +23,7 @@ import type { TimerHandle } from "../../ports/clock";
 import type { StorageDb } from "../../ports/storage";
 import type { VaultEvent, VaultStat } from "../../ports/vault";
 import type { EngineInitConfig, EngineResultValue, EngineSettings, LocalObservation, UserCommand } from "../../protocol/messages";
-import type { StatusSnapshot } from "../../protocol/status";
+import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { LifecycleEvent } from "../../ports/platform";
 import { BlobQueue } from "../blobs/blobQueue";
 import { Reconciler, type PassReport } from "../reconcile/reconciler";
@@ -79,6 +79,8 @@ export interface VaultRuntimeStart {
 	readonly paused: boolean;
 	readonly tzOffsetMinutes?: () => number;
 	readonly log?: (line: string) => void;
+	/** The LogEngine's diagnostics events (test hook, CreateEngineOptions.onDiag). */
+	readonly onDiag?: (event: DiagnosticsEvent) => void;
 	/** Path-keyed bases carried over an epoch migration (§c.12 step 3). */
 	readonly pathBases?: ReadonlyMap<PathKey, string> | null;
 	/** Old epoch whose DB is deleted once the new one reaches live (§c.12 step 6). */
@@ -167,6 +169,7 @@ export class VaultRuntime {
 			onBodyChange: (docIds) => holder.rt?.onBodyChange(docIds),
 			onOwnBodySettled: (docIds) => holder.rt?.onOwnBodySettled(docIds),
 			onStatus: (s) => holder.rt?.onLogStatus(s),
+			...(o.onDiag ? { onDiag: o.onDiag } : {}),
 			onHostNotice: (level, code, message) => engine.link.post({ t: "notice", level, code, message }),
 			e2ee: e2eeOf(config.crypto, engine.keyring),
 			blobBytes: (hash) => holder.rt?.localBlobBytes(hash) ?? Promise.resolve(null),

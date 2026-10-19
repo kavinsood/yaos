@@ -77,6 +77,8 @@ export interface ReadResult {
 	/** ns/cfg snapshot replaced by a checkpoint: reload the fold. */
 	readonly replacedFold: boolean;
 	readonly removed: OutboxRecord[];
+	/** Commit seqs of the receipted records among `removed`. */
+	readonly receipts: Map<ClientFrameId, Seq>;
 	readonly updated: OutboxRecord[];
 	readonly renamed: OutboxRename[];
 	/** Every tail row written. */
@@ -97,6 +99,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	const repo = deps.repo;
 	const cls = streamClass(stream);
 	const removed: OutboxRecord[] = [];
+	const receipts = new Map<ClientFrameId, Seq>();
 	const updated: OutboxRecord[] = [];
 	const renamed: OutboxRename[] = [];
 	const tailPut: TailRecord[] = [];
@@ -106,7 +109,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	let pages = 0;
 	let rowsSeen = 0;
 	const result = (t: ReadResult["t"], error?: string, held?: ReadResult["held"]): ReadResult => ({
-		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, renamed, tailPut, skip, stream: repo.stream(stream) ?? null,
+		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, receipts, updated, renamed, tailPut, skip, stream: repo.stream(stream) ?? null,
 		...(error ? { error } : {}), ...(held ? { held } : {}),
 	});
 	if (cls === "other") return result("done");
@@ -178,11 +181,13 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 				freshSnapshot = { stream, coversSeq: ck.coversSeq, encoding: content.encoding, bytes: content.state, createdAtMs: deps.nowMs() };
 				if (cls === "body" || cls === "canvas") checkpointState = content.state;
 				else replacedFold = true;
+				deps.diag("checkpoint-adopted", { cls, coversSeq: ck.coversSeq, how: "fresh" });
 			} else if (cls === "body" || cls === "canvas") {
 				const out = await unionBodyCheckpoint(deps, stream, ck.coversSeq, content.state);
 				if (!opts.stillValid()) return result("aborted");
 				if (!out || out.snapshotCoversSeq < ck.coversSeq) return result("retry", "union failed (CAS or unresolved ref)");
 				checkpointState = content.state;
+				deps.diag("checkpoint-adopted", { cls, coversSeq: ck.coversSeq, how: "union" });
 			} else if (cls === "ns" || cls === "cfg" || cls === "snap") {
 				const cur = repo.stream(stream)!;
 				const tail = await repo.getTail(stream, 0, ck.coversSeq);
@@ -194,6 +199,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 				if (!opts.stillValid()) return result("aborted");
 				if (!out) return result("retry", "fold snapshot CAS");
 				replacedFold = true;
+				deps.diag("checkpoint-adopted", { cls, coversSeq: ck.coversSeq, how: "replace" });
 			}
 		}
 		const items: LiveItem[] = [];
@@ -216,6 +222,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 			stream, rows, quarantines, lateReceipts, settleAdoptables, freshSnapshot, completeThrough, lastSeq: page.lastSeq, checkpointSeq: page.checkpointSeq,
 		});
 		removed.push(...out.removed);
+		for (const [cfid, seq] of out.receipts) receipts.set(cfid, seq);
 		updated.push(...out.updated);
 		renamed.push(...out.renamed);
 		tailPut.push(...out.tailPut);

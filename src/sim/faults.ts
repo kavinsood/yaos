@@ -134,6 +134,8 @@ export function diskTokens(devs: readonly SimDevice[]): Set<string> {
 
 export class FaultState {
 	private readonly down = new Set<number>();
+	/** Devices that have not joined yet (holdBack); also in `down`. */
+	private readonly held = new Set<number>();
 	private readonly offline = new Set<number>();
 	private readonly armed = new Set<number>();
 	private readonly backgrounded = new Map<number, LifecycleEvent>();
@@ -353,6 +355,19 @@ export class FaultState {
 		return this.inspecting === 0 && e2ee;
 	}
 
+	/** A device whose app has not started yet (run.ts late join): down for actors and faults until join(i) or heal. */
+	holdBack(i: number): void {
+		this.held.add(i);
+		this.down.add(i);
+	}
+
+	/** The held-back device's app starts (a fresh device joining the vault); false if it was not held back. */
+	join(i: number): boolean {
+		if (!this.held.delete(i)) return false;
+		this.restart(i);
+		return true;
+	}
+
 	private restart(i: number): void {
 		const d = this.devs[i];
 		if (!d || !this.down.delete(i)) return;
@@ -389,6 +404,7 @@ export class FaultState {
 		this.timers.clear();
 		for (const i of [...this.offline]) this.reconnect(i);
 		for (const i of [...this.backgrounded.keys()]) this.foreground(i);
+		this.held.clear();
 		for (const i of [...this.down]) this.restart(i);
 		for (const i of [...this.armed]) this.devs[i]?.storage.setCommitHook(null);
 		this.armed.clear();

@@ -55,4 +55,39 @@ void describe("unopened snap rows (§d.6, §14.3)", () => {
 			await x.engine.stop();
 		}
 	});
+
+	void it("a row the re-gate finds stale-epoch leaves the tail and stops holding the fold (sim heavy E2EE seed 42)", async () => {
+		// A stale snap row is accounted only (never stored, §9.3). Stored unopened first (`k` not judged yet), its
+		// re-gate came out "account", which the re-gate skipped: the row stayed unopened and the snap fold halted for
+		// good, behind every later row (sim: A's index lacked B's manual snapshot that the oracle and B had).
+		const relay = new SimRelay();
+		const g = await genesis();
+		await rawAppend(relay, KEYRING_STREAM, g);
+		const pin = { keys: [{ e: 1, k: K(1) }], records: [g] };
+		const x = await start(relay, "dev-x-0123456789abcdef", pin);
+		const y = await start(relay, "dev-y-0123456789abcdef", pin);
+		try {
+			await live(x);
+			await live(y);
+			const yc = y.engine.c;
+			const judged = yc.gateCtx.staleCheck;
+			yc.gateCtx.staleCheck = () => "hold";
+			await x.engine.submitSnap([{ t: "put", record: rec(T0) }]);
+			await until(() => yc.snap.halted !== null, 5_000, "snap fold halted");
+			const staleSeq = (await yc.repo.getTail(SNAP_STREAM, 0))[0]!.seq;
+
+			yc.gateCtx.staleCheck = (e, seq) => (seq === staleSeq ? "stale" : judged(e, seq)); // `k` judged: stale
+			assert.equal(await regateUnopened(yc), 1, "the stale row was re-gated");
+			assert.equal(yc.snap.halted, null, "halt lifted");
+			assert.deepEqual(await yc.repo.getTail(SNAP_STREAM, 0), [], "the accounted row left the tail");
+			assert.equal(yc.repo.stream(SNAP_STREAM)?.tailRows, 0);
+
+			await x.engine.submitSnap([{ t: "put", record: rec(T0 + 1_000) }]);
+			await until(() => snapLive(y.engine.snapView().state).length === 1, 5_000, "a later row folds");
+			assert.deepEqual(snapLive(y.engine.snapView().state).map((s) => s.record.snapshotId), [rec(T0 + 1_000).snapshotId]);
+		} finally {
+			await y.engine.stop();
+			await x.engine.stop();
+		}
+	});
 });

@@ -164,7 +164,12 @@ export class Maintenance {
 			try {
 				const o = await writeFoldCheckpoint(c.deps, c.ckpt, s, fold, { refreshFirst: !fold.candidate?.authoredBySelf });
 				this.count(`${cls}-${o.t}`);
-				if (o.t === "ok") this.stats.checkpoints++;
+				if (o.t === "ok") {
+					this.stats.checkpoints++;
+					let pending = 0;
+					for (const r of c.outbox.values()) if (r.stream === stream) pending++;
+					c.diag("checkpoint-written", { cls, coversSeq: o.coversSeq, pendingOwn: pending });
+				}
 				else if (o.t === "skipped") c.ckpt.backoffUntil.set(stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
 			} catch (e) {
 				this.count(`${cls}-error`);

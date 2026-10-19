@@ -12,7 +12,7 @@
  * hooks. See docs/client-remake/wp-a-notes.md for the decisions.
  */
 
-import type { DeviceId, Seq, StreamName, VaultEpoch } from "../core/types";
+import { streamClass, type DeviceId, type Seq, type StreamName, type VaultEpoch } from "../core/types";
 import type { ClockPort } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
 import type { RandomPort } from "../ports/random";
@@ -51,6 +51,16 @@ export {
 	SimRelayError,
 	SimRelaySession,
 };
+/**
+ * Checkpoint traffic the relay saw, by stream class (ns, cfg, snap, body, canvas): puts by outcome, puts that
+ * collected rows (and how many rows), and read pages that carried the checkpoint (served).
+ */
+export interface SimCheckpointStats {
+	readonly put: Record<string, Record<string, number>>;
+	readonly gc: Record<string, { puts: number; rows: number }>;
+	readonly served: Record<string, number>;
+}
+
 export type { CommitFault, CommitHook, LinkSpec, SegmentInfo, SimCommitInfo, SimConnectFailureReason, SimRelayCounters, SimRelayOptions, SimRow, SimSessionInfo, StoreFrame, StoreSnapshot };
 
 /** A device's sessions, or one session by id. */
@@ -72,6 +82,8 @@ export class SimRelay implements RelayPort {
 	private readonly hidden = new Map<DeviceId, Set<StreamName>>();
 	/** Rows forge() appended so far (hostile relay). */
 	forgedRows = 0;
+	/** Seqs of the rows forge() appended (a reader rightly never applies them). */
+	readonly forgedSeqs = new Set<Seq>();
 	private defaultLink: LinkSpec;
 	private readonly links = new Map<DeviceId, LinkSpec>();
 	private connectFailure: Failure | null = null;
@@ -86,6 +98,8 @@ export class SimRelay implements RelayPort {
 	private readonly maxSockets: number;
 	/** Catch-up read requests (single and batched): total, on the wire now, most on the wire at once. */
 	readRequests = 0;
+	/** Checkpoint puts, GCs and checkpoint-carrying read pages (sim coverage stats). */
+	readonly ckpt: SimCheckpointStats = { put: {}, gc: {}, served: {} };
 	readsOnWire = 0;
 	maxReadsOnWire = 0;
 	/** Listener exceptions: rethrown asynchronously by default (like wsRelay). */
@@ -194,6 +208,10 @@ export class SimRelay implements RelayPort {
 		// A hidden stream reads as one the relay never had (hostile relay, hideFrom).
 		if (deviceId !== null && this.isHidden(deviceId, stream)) return { checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 0, gcSeq: 0, nextAfterSeq: afterSeq, more: false };
 		const page = this.store.read(stream, afterSeq, maxBytes, preferCheckpoint, this.readPageRows);
+		if (page.checkpoint) {
+			const cls = streamClass(stream);
+			this.ckpt.served[cls] = (this.ckpt.served[cls] ?? 0) + 1;
+		}
 		const last = page.rows.length > 0 ? page.rows[page.rows.length - 1]!.seq : page.checkpoint?.coversSeq ?? afterSeq;
 		return {
 			checkpoint: page.checkpoint, rows: page.rows, lastSeq: page.lastSeq, checkpointSeq: page.checkpointSeq, gcSeq: page.gcSeq,
@@ -220,6 +238,15 @@ export class SimRelay implements RelayPort {
 
 	/** Route permission, argument validation, body size, daily limit, then the store CAS (server order). */
 	private checkpointPut(session: SimRelaySession, stream: StreamName, coversSeq: Seq, expected: Seq, bytes: Uint8Array): PutCheckpointResult {
+		const res = this.checkpointPutInner(session, stream, coversSeq, expected, bytes);
+		const cls = streamClass(stream);
+		const by = (this.ckpt.put[cls] ??= {});
+		const k = res.t === "refused" ? res.reason : res.t;
+		by[k] = (by[k] ?? 0) + 1;
+		return res;
+	}
+
+	private checkpointPutInner(session: SimRelaySession, stream: StreamName, coversSeq: Seq, expected: Seq, bytes: Uint8Array): PutCheckpointResult {
 		if (!session.canWrite) return { t: "refused", reason: "forbidden", retryAfterMs: null };
 		if (!validStreamName(stream)) throw new SimRelayError("invalid_stream");
 		if (!Number.isSafeInteger(coversSeq) || coversSeq < 1) throw new SimRelayError("invalid_covers_seq");
@@ -227,8 +254,17 @@ export class SimRelay implements RelayPort {
 		if (bytes.byteLength > this.limits.maxCheckpointBytes) return { t: "refused", reason: "too-large", retryAfterMs: null };
 		if (!this.engine.dailyActive() && this.engine.envDailyActive()) this.engine.latchDaily(null);
 		if (this.engine.dailyActive()) return { t: "refused", reason: "daily-limit", retryAfterMs: Math.max(0, this.engine.latchUntil - this.clock.now()) };
+		const before = this.store.rows(stream).length;
 		const result = this.store.putCheckpoint(stream, coversSeq, expected, bytes);
-		if (result.ok) return { t: "ok" };
+		if (result.ok) {
+			const collected = before - this.store.rows(stream).length;
+			if (collected > 0) {
+				const g = (this.ckpt.gc[streamClass(stream)] ??= { puts: 0, rows: 0 });
+				g.puts++;
+				g.rows += collected;
+			}
+			return { t: "ok" };
+		}
 		switch (result.error) {
 			case "stream_not_found": return { t: "refused", reason: "stream-not-found", retryAfterMs: null };
 			case "checkpoint_conflict": return { t: "conflict", currentCoversSeq: result.current };
@@ -444,6 +480,7 @@ export class SimRelay implements RelayPort {
 	forge(frames: readonly StoreFrame[]): readonly SimRow[] {
 		const rows = this.store.forge(frames);
 		this.forgedRows += rows.length;
+		for (const r of rows) this.forgedSeqs.add(r.seq);
 		for (const session of this.engine.streamSockets().slice()) {
 			for (const r of rows) {
 				if (this.isHidden(session.deviceId, r.stream)) continue;
