@@ -36,6 +36,8 @@ export interface FoldCandidate {
 	/** Canonical fold bytes (nsFoldV1 / cfgFoldV1) at seq. */
 	readonly bytes: Uint8Array;
 	readonly authoredBySelf: boolean;
+	/** foldRulesVersion of the state in `bytes` (the checkpoint header must equal it, §b.5 V2). */
+	readonly rulesVersion: number;
 }
 
 export interface FoldHalt {
@@ -87,7 +89,7 @@ export abstract class FoldRuntime<Op, E> {
 
 	/** Snapshot / checkpoint encoding of the committed state (nsFoldV1 / cfgFoldV1). */
 	abstract readonly encoding: CheckpointEncoding;
-	/** foldRulesVersion written into checkpoints. */
+	/** foldRulesVersion of the committed state (written into its checkpoints). */
 	abstract readonly rulesVersion: number;
 	abstract get coversSeq(): Seq;
 	/** Replace the committed state from the snapshot (undefined / unusable -> empty). false = it was unusable. */
@@ -155,7 +157,7 @@ export abstract class FoldRuntime<Op, E> {
 			}
 			this.foldedRows++;
 			if (row.deviceId === this.self) this.committedOwn = this.committedOwn.filter((f) => f.clientFrameId !== row.clientFrameId);
-			if (this.isCandidate(prev, row.seq)) this.candidate = { seq: row.seq, bytes: this.encodeState(), authoredBySelf: row.deviceId === this.self };
+			if (this.isCandidate(prev, row.seq)) this.candidate = { seq: row.seq, bytes: this.encodeState(), authoredBySelf: row.deviceId === this.self, rulesVersion: this.rulesVersion };
 			out.push({ seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, ops, events });
 		}
 		this.through = target;

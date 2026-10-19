@@ -327,7 +327,7 @@ export async function writeFoldCheckpoint(deps: CheckpointDeps, st: CheckpointSt
 		rec = deps.repo.stream(stream)!;
 	}
 	if (cand.seq <= rec.remoteCheckpointCoversSeq) return { t: "skipped", reason: "not-advancing-local" };
-	const content = encodeCheckpointContent({ encoding: fold.encoding, coversSeq: cand.seq, foldRulesVersion: fold.rulesVersion, state: cand.bytes });
+	const content = encodeCheckpointContent({ encoding: fold.encoding, coversSeq: cand.seq, foldRulesVersion: cand.rulesVersion, state: cand.bytes });
 	const sealed = await sealCheckpoint(deps.crypto, deps.vaultId, stream, cand.seq, content, deps.authorNsSeq());
 	if (sealed.length > session.limits.maxCheckpointBytes) {
 		st.tooLarge.set(stream, { bytes: cand.bytes.length, seq: cand.seq });

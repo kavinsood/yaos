@@ -16,7 +16,6 @@
  */
 
 import { CheckpointEncoding } from "../../core/envelope";
-import { FOLD_RULES_VERSION } from "../../core/limits";
 import { decodeNsFoldV1, encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
@@ -49,7 +48,6 @@ export interface DocInfo {
 
 export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	readonly encoding = CheckpointEncoding.nsFoldV1;
-	readonly rulesVersion = FOLD_RULES_VERSION;
 	state: NsFoldState = newNsFoldState();
 	index: NsFoldIndex = buildIndex(this.state);
 
@@ -59,6 +57,11 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 
 	get coversSeq(): Seq {
 		return this.state.coversSeq;
+	}
+
+	/** The state's own version (upgradeRules moves it), not this build's FOLD_RULES_VERSION: header = state (§b.5 V2). */
+	get rulesVersion(): number {
+		return this.state.foldRulesVersion;
 	}
 
 	protected reset(snap: SnapshotRecord | undefined): boolean {
