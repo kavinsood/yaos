@@ -217,10 +217,15 @@ export abstract class FoldRuntime<Op, E> {
 		return m === NS_CANDIDATE_INTERVAL ? isCandidateSeq(prev, s) : Math.floor(s / m) > Math.floor(prev / m);
 	}
 
-	/** The receipt removed an own outbox record of this stream: keep it pending until folded. */
-	noteCommitted(rec: OutboxRecord): void {
+	/**
+	 * The receipt removed an own outbox record of this stream: keep it pending until folded. A commit seq the fold
+	 * already covers is not pending: folded, or under the snapshot (a late receipt, e.g. a resend deduped against a
+	 * row a checkpoint collected, after this device adopted that checkpoint). Kept, it never left the overlay.
+	 */
+	noteCommitted(rec: OutboxRecord, seq: Seq | null = null): void {
 		if (rec.stream !== this.stream || rec.state === "poisoned" || rec.content.length === 0) return;
 		this.seeFrameNo(rec.frameNo ?? 0);
+		if (seq !== null && seq <= this.coversSeq) return;
 		if (this.committedOwn.some((f) => f.clientFrameId === rec.clientFrameId)) return;
 		this.committedOwn.push({ clientFrameId: rec.clientFrameId, authorNsSeq: rec.authorNsSeq, frameNo: rec.frameNo ?? 0, ops: this.decodeOps(rec.content) ?? [] });
 	}

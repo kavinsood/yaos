@@ -70,6 +70,8 @@ export interface ReadResult {
 	/** ns/cfg snapshot replaced by a checkpoint: reload the fold. */
 	readonly replacedFold: boolean;
 	readonly removed: OutboxRecord[];
+	/** Commit seqs of the receipted records among `removed`. */
+	readonly receipts: Map<ClientFrameId, Seq>;
 	readonly updated: OutboxRecord[];
 	readonly renamed: OutboxRename[];
 	/** Every tail row written. */
@@ -88,6 +90,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	const repo = deps.repo;
 	const cls = streamClass(stream);
 	const removed: OutboxRecord[] = [];
+	const receipts = new Map<ClientFrameId, Seq>();
 	const updated: OutboxRecord[] = [];
 	const renamed: OutboxRename[] = [];
 	const tailPut: TailRecord[] = [];
@@ -97,7 +100,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	let pages = 0;
 	let rowsSeen = 0;
 	const result = (t: ReadResult["t"], error?: string): ReadResult => ({
-		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, renamed, tailPut, skip, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
+		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, receipts, updated, renamed, tailPut, skip, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
 	});
 	if (cls === "other") return result("done");
 	const start = repo.stream(stream);
@@ -190,6 +193,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 			stream, rows, quarantines, lateReceipts, settleAdoptables, freshSnapshot, completeThrough, lastSeq: page.lastSeq, checkpointSeq: page.checkpointSeq,
 		});
 		removed.push(...out.removed);
+		for (const [cfid, seq] of out.receipts) receipts.set(cfid, seq);
 		updated.push(...out.updated);
 		renamed.push(...out.renamed);
 		tailPut.push(...out.tailPut);

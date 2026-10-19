@@ -114,6 +114,8 @@ export interface LiveResult {
 	readonly streams: ReadonlyMap<StreamName, StreamRecord>;
 	/** Outbox records deleted (receipted / settled adoptables). */
 	readonly removed: readonly OutboxRecord[];
+	/** Commit seqs of the receipted records among `removed`. */
+	readonly receipts: ReadonlyMap<ClientFrameId, Seq>;
 	/** Held records released to pending or re-pointed. */
 	readonly updated: readonly OutboxRecord[];
 	/** Own stale commits renamed to their copy (OwnCommitCopy). */
@@ -383,6 +385,7 @@ export class Repo {
 			const self = this.deviceId;
 			const recs = new Map<StreamName, Mut<StreamRecord>>();
 			const removed: OutboxRecord[] = [];
+			const receiptSeqs = new Map<ClientFrameId, Seq>();
 			const updated: OutboxRecord[] = [];
 			const renamed: OutboxRename[] = [];
 			const tailPut: TailRecord[] = [];
@@ -418,6 +421,7 @@ export class Repo {
 							const row = it.copy?.row ?? receiptRow(ob, it.seq, self);
 							if (await putTail(tx, r, row)) tailPut.push(row);
 							await settleOwn(tx, ob, it.copy, removed, updated, renamed);
+							if (!it.copy) receiptSeqs.set(ob.clientFrameId, it.seq);
 							r.lastOwnSeq = Math.max(r.lastOwnSeq, it.seq);
 							if (it.seq > r.remoteCheckpointCoversSeq) {
 								r.rowsSinceRemoteCheckpoint++;
@@ -476,7 +480,7 @@ export class Repo {
 			if (dutyChanged) this.ckptDuty = duty;
 			if (froze.size > 0) this.onQuarantineFrozen([...froze].map((s) => recs.get(s)!));
 			if (held.length > 0 || tailPut.length > 0) this.onStored(held, tailPut);
-			return { vaultSeq: res, streams: recs, removed, updated, renamed, tailPut };
+			return { vaultSeq: res, streams: recs, removed, receipts: receiptSeqs, updated, renamed, tailPut };
 		});
 	}
 
@@ -515,10 +519,11 @@ export class Repo {
 	// T_read_page
 	// -------------------------------------------------------------------------
 
-	tReadPage(input: ReadPageInput): Promise<{ stream: StreamRecord; removed: OutboxRecord[]; updated: OutboxRecord[]; renamed: OutboxRename[]; tailPut: TailRecord[] }> {
+	tReadPage(input: ReadPageInput): Promise<{ stream: StreamRecord; removed: OutboxRecord[]; receipts: Map<ClientFrameId, Seq>; updated: OutboxRecord[]; renamed: OutboxRename[]; tailPut: TailRecord[] }> {
 		return this.serial("tReadPage", async () => {
 			const self = this.deviceId;
 			const removed: OutboxRecord[] = [];
+			const receiptSeqs = new Map<ClientFrameId, Seq>();
 			const updated: OutboxRecord[] = [];
 			const renamed: OutboxRename[] = [];
 			const tailPut: TailRecord[] = [];
@@ -556,6 +561,7 @@ export class Repo {
 					const row = lr.copy?.row ?? receiptRow(ob, lr.seq, self);
 					if (await putTail(tx, r, row)) tailPut.push(row);
 					await settleOwn(tx, ob, lr.copy, removed, updated, renamed);
+					if (!lr.copy) receiptSeqs.set(ob.clientFrameId, lr.seq);
 					r.lastOwnSeq = Math.max(r.lastOwnSeq, lr.seq);
 					r.remoteHeadSeq = Math.max(r.remoteHeadSeq, lr.seq);
 				}
@@ -571,7 +577,7 @@ export class Repo {
 			this.cache.set(out.stream, out);
 			if (froze) this.onQuarantineFrozen([out]);
 			if (input.quarantines.length > 0 || tailPut.length > 0) this.onStored(input.quarantines, tailPut);
-			return { stream: out, removed, updated, renamed, tailPut };
+			return { stream: out, removed, receipts: receiptSeqs, updated, renamed, tailPut };
 		});
 	}
 

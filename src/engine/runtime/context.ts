@@ -60,6 +60,8 @@ export interface Fold {
 /** What one ingest transaction stored (tLive, tReadPage pages, a quarantine release): EngineCtx.afterStored. */
 export interface Stored {
 	readonly removed: readonly OutboxRecord[];
+	/** Commit seqs of the receipted records among `removed`. */
+	readonly receipts?: ReadonlyMap<ClientFrameId, Seq>;
 	readonly updated: readonly OutboxRecord[];
 	readonly renamed?: readonly OutboxRename[];
 	/** Every tail row written. */
@@ -268,13 +270,13 @@ export class EngineCtx {
 	}
 
 	/** Mirror committed outbox transitions into the cache, the sender and the adopt map. */
-	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly updated: readonly OutboxRecord[]; readonly renamed?: readonly OutboxRename[] }): void {
+	applyOutboxResult(res: { readonly removed: readonly OutboxRecord[]; readonly receipts?: ReadonlyMap<ClientFrameId, Seq>; readonly updated: readonly OutboxRecord[]; readonly renamed?: readonly OutboxRename[] }): void {
 		const drained = new Set<StreamName>();
 		for (const r of res.removed) {
 			const cls = streamClass(r.stream);
 			if (cls === "body" || cls === "canvas") drained.add(r.stream);
 			// ns/cfg/snap records leave the outbox only on (late) receipt: keep them in the overlay until folded.
-			this.foldOf(r.stream)?.rt.noteCommitted(r);
+			this.foldOf(r.stream)?.rt.noteCommitted(r, res.receipts?.get(r.clientFrameId) ?? null);
 			this.outbox.delete(r.clientFrameId);
 			this.sender.remove(r.clientFrameId);
 			this.unregisterAdopt(r.clientFrameId);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import { MAX_NS_OPS_PER_FRAME } from "../../core/limits";
-import { CFG_STREAM, docStream, type CfgOp, type ConfigRelPath, type NsOp, type VaultPath } from "../../core/types";
+import { CFG_STREAM, NS_STREAM, docStream, type CfgOp, type ConfigRelPath, type NsOp, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import type { CfgLogPort } from "../settings/cfgSync";
 import type { FoldedNsFrame } from "../sync/nsRuntime";
@@ -126,6 +126,31 @@ test("ns: submitNs splits into frames, nsView shows them pending, onNsFold repor
 		}
 	} finally {
 		await stopAll(a, b);
+	}
+});
+
+test("ns: a late receipt at a seq the fold already covers leaves no pending frame (sim heavy seed 27)", async () => {
+	// Sim: A's ns frame committed while A crashed before the receipt; B's checkpoint at lastSeq retired the stream
+	// (H7); A restarted, adopted the checkpoint (covering the frame) and resent the frame, which the relay deduped at
+	// its old seq. The receipt put the frame back in the overlay ("committed, not folded yet") and nothing ever
+	// folded it: one pending ns frame for good.
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	try {
+		relay.pauseCommits();
+		await createDoc(a, "late.md" as VaultPath, "x");
+		const rec = a.c.outbox.ofStream(NS_STREAM)[0]!;
+		relay.resumeCommits();
+		await until(() => a.isIdle() && a.nsView().pending.length === 0, 3_000, "a folded its create");
+		const seq = relay.rows(NS_STREAM).find((r) => r.clientFrameId === rec.clientFrameId)!.seq;
+		assert.ok(a.c.ns.coversSeq >= seq);
+		a.c.applyOutboxResult({ removed: [rec], receipts: new Map([[rec.clientFrameId, seq]]), updated: [] });
+		assert.equal(a.nsView().pending.length, 0, "covered by the fold: not pending");
+		// A receipt above the fold is still pending until folded.
+		a.c.applyOutboxResult({ removed: [rec], receipts: new Map([[rec.clientFrameId, a.c.ns.coversSeq + 1]]), updated: [] });
+		assert.equal(a.nsView().pending.length, 1);
+	} finally {
+		await stopAll(a);
 	}
 });
 
