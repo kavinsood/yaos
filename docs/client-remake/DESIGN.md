@@ -582,10 +582,23 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
 
 1. Enters phase `epoch-migrating`, saves bound views (`saveViews`) and takes a local snapshot (§j.4).
 2. Writes `intent{epoch-migration}`.
-3. Reads the old DB's `synced` and `baseText` into memory as **path-keyed bases**. Old docIds are meaningless in the
-   new epoch.
+3. Reads the old DB's `synced` and `baseText` into memory as **path-keyed bases**: the base text of every markdown doc
+   and canvas with one (a canvas's is its merge text, §j.2). Blobs have none. Old docIds are meaningless in the new epoch.
 4. Creates the new DB `yaos2:<vaultId>:<newEpoch>:<deviceId>` and onboards against the new epoch as in §j.5. Path-keyed
-   bases turn the "no-base" merges into 3-way merges where the paths match.
+   bases turn the "no-base" merges into 3-way merges where the paths match, for markdown and canvases alike:
+   - **No synced record.** A doc with no synced record merges against the base at its path.
+   - **Migrated loser.** Every device re-creates its files, so a device's own create can lose the path race (§c.13
+     S1). A differing loser at a path with a base then merges into the winner instead of taking a loser rename:
+     `rebind{adopt}`, then `nsDelete` of the loser, then `reconcileContent{pathBase}`. The collapse conditions are in
+     §c.13.
+   - **Trust.** A base is trusted only while the new epoch's text still contains it: as a character subsequence for
+     markdown, and as a subsequence of whole record lines of the merge text for a canvas. A base ahead of the new
+     epoch would read as deletions. Without trust, the no-base merge keeps the disk side as a conflict copy.
+   - **Memory only.** A runtime restart before the merges run loses the bases, and the device's re-creates fall
+     back to loser renames.
+   - **Deletes.** A record or text deleted before the epoch change can come back: a restored relay state may predate
+     the delete, step 5 drops an unsent delete, and a peer's file may never have received it. The base cannot tell
+     such content from content added in the new epoch.
 5. Drops the old outbox. Its edits are on disk, so the scan re-derives them.
 6. Deletes the old DB once the new one reaches `live`.
 
@@ -604,6 +617,12 @@ changes.
   - emits `nsDelete(loser, baseBodySeq)`;
   - performs no disk op.
   - This removes the residual conflict copies of concurrent onboarding.
+- **Collapse conditions.** These apply to the identical-loser collapse and to the migrated loser (§c.12).
+  - The loser's remote text must still be what this device synced: caught up, and readable here (resident). A loser
+    another device has written to (it materialized the loser under its suffixed name and edited it) is a doc of its
+    own: deleting it would drop that edit, so it keeps the loser rename. A loser that is not caught up waits.
+  - The loser's own create frames must be acked. Otherwise the delete's base would sit below them, and the restore
+    duty (§c.7) would bring the loser back under a suffixed name. The collapse waits, as a user delete does.
 - **Merged.** A `rebind(loser → winner)` follows. Held initial body frames of the loser are dropped (§e.2).
 - **Ignored precondition ops** (`stale-delete`, `rev-mismatch`, `stale-revive`): the planner re-evaluates from the
   three trees, and nothing destructive follows from the ignored op. A `rev-mismatch` keeps both (§c.8).

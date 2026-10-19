@@ -338,8 +338,12 @@ devices).
 | 53 | A doc with fileGone kept claiming its path key; when another doc's observed rename moved its file onto that path, the gone doc took the bytes as its own save and put S back. Two docs owned notes/r6.md and the devices diverged. | sim seed 703 F DEV3 (canvas round sweep) | 97478c9e: a file brought onto a gone doc's path by another doc's rename (`arrivedElsewhere`), or held by another live record, is that doc's: fresh local for it, and the gone doc's row does not re-adopt it. |
 | 54 | Sim only: C's frame was refused at a daily-limit latch that lifted before C's next frame, which committed. A held a causal hole for ~750 ms until C's 1 s retry, but the sim's FAST_TUNING re-read 3 x 60 ms and froze the note for good; its rename never applied on A and five tokens were lost. DESIGN §d.6 requires a window of at least 2 x PROVISIONAL_ADOPT_MS (production: 4 x 60 s against the 1 s retry). | sim seed 520 F DEV3 (canvas round sweep) | 513f6e1a: sim devices run `SIM_TUNING` (1 s re-read interval); a test pins the window against the own-frame retry. No client change. |
 | 55 | Sim only: A rewired an edge to a new node and labelled it while C deleted that node. The CRDT kept the edge (label included) and the projection dropped it as dangling, as DESIGN §j.2 says; only an older conflict copy showed the edge, so the lost-write check flagged the label. | suite-1 seed 167 F DEV3 | f430b91d: fields of an edge whose endpoint a user deleted are exempt while only conflict copies hold it (record survival already was). Self-test. |
-| 56 | Sim only: revoked B brought a node to the front; an epoch restore made B re-onboard and its canvas survived as the suffixed duplicate "c5 (2).canvas" with B's order, but the order check counted only conflict copies as copies. | suite-1 seed 34 E2EE DEV3 | 31bf71de: a canvas of another doc holding the node counts as a copy (as for the delete rule). Seed pinned. |
+| 56 | Sim only: revoked B brought a node to the front; an epoch restore made B re-onboard and its canvas survived as the suffixed duplicate "c5 (2).canvas" with B's order, but the order check counted only conflict copies as copies. | suite-1 seed 34 E2EE DEV3 | 31bf71de: a canvas of another doc holding the node counts as a copy (as for the delete rule). Seed pinned. Reverted in 90c717e7: the duplicate was a client bug (58). |
 | 57 | A revoked C, which deleted an attachment while key-missing. Every pass planned the nsDelete and failed on the write gate, so the scheduler backed off (32 s and more). Re-keyed, C had no pass due until the backoff ran out, after the heal: the delete never left. | suite-1 seed 23 E2EE DEV3 | 3ed8afec: VaultRuntime requests a full pass at once when the phase leaves key-missing. Seed pinned. |
+| 58 | After an epoch migration a locally changed canvas came back as a suffixed duplicate ("c1 (2).canvas") instead of being 3-way merged. The §c.12 mechanism was markdown-only: prepareEpochMigration kept only markdown bases, the planner's migrated-loser collapse fired only for markdown, and the canvas job never looked up a path base. So a canvas's own re-create that lost the path race took a loser rename. | suite-1 seed 24 E2EE DEV3 (seed 34 before 3ed8afec) | c26726a6: bases for every text kind (a canvas's is its merge text); the collapse fires for canvases; the trust rule and path-base lookup move to contentSteps.ts, shared, with the rule matching whole record lines for a canvas. Unit tests; seed pinned (90c717e7). |
+| 59 | The re-create collapse (identical or migrated loser) sent the loser's nsDelete while the loser's own create frames were still unsequenced. Its base sat below them, every device got the §c.7 restore duty, and the loser came back as "x (2)". Markdown and canvas alike. | suite-1 seeds 89, 171 E2EE DEV3 | 6a9184b5: the collapse waits on pending-body, as a user delete does. Planner test. |
+| 60 | The re-create collapse deleted a loser another device had already edited (it had materialized the loser as "c3 (3).canvas" and added a node). The nsDelete covered that edit, so the node and its token were lost. This was latent for markdown and showed up once canvases took the migrated collapse, which waits for the winner's body. | seed 581 F DEV3 (also 37, 244) | 6a9184b5: collapse only while the loser's remote text is still what this device synced; otherwise, or when it can't be read here, the loser keeps its rename. Planner test; seed pinned. |
+| 61 | Sim only: with the canvas epoch base, a record deleted just before an epoch restore (or while the device was still on the epoch the relay had left) comes back without a conflict copy, so the delete rule flagged it. Before the fix it also came back, but beside a conflict copy that the rule accepted. The restored state holds the record and the base cannot tell it from an addition: DESIGN §c.12, markdown text alike. | suite-1 seeds 103 E2EE DEV4, 19 E2EE DEV2 heavy | 90c717e7: the oracle records restores and stale-epoch deletes; the delete rule exempts them. Seeds pinned. |
 
 Sim-only fixes found on the way (no client change): epoch names reused across
 resets, one global clock skew instead of per-device, ledger coverage of
@@ -417,6 +421,14 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - D17 keeps one merge case: a waiting delete, a remote edit of the doc, and a
   new file at the doc's remote path merge that file into the doc (edit beats
   delete). It is rare enough to accept; no sweep hit it.
+- The §c.12 path-keyed bases live in memory only. A runtime restart (app or
+  commit crash) between the migration and the merges loses them, and the
+  device's re-creates fall back to loser renames ("x (2)" duplicates; nothing
+  lost; suite-1 seed 65).
+- After an epoch change, a deletion is re-derived only against the old
+  epoch's base. A record or text the new epoch still holds (a restored state
+  from before the delete, a dropped unsent delete, a peer's file that never
+  got it) comes back, for markdown and canvases alike (DESIGN §c.12).
 - The bind-time merge (openDoc) does not use the §c.12 path-keyed epoch base
   that the merge job uses (`trustedEpochBase`): a note edited offline while
   open across an epoch reset gets two conflict copies where a 3-way merge was
@@ -845,11 +857,31 @@ which markdown hits on the same paths, and the key-missing re-plan. Three
 are sim bugs (the tuning, and two oracle exemptions that the suite-1
 E2EE runs exposed).
 
-Open: after an epoch migration a canvas gets no path-keyed base. The
-planner's migrated-loser merge (§c.12, `pathBase`) is markdown-only, so a
-locally changed canvas re-onboards as a suffixed duplicate ("c5 (2)") and
-is not 3-way merged. Nothing is lost (seed 34), but it is one more file
-than markdown would leave.
+Resolved (bugs 58-61): after an epoch migration a locally changed canvas is
+3-way merged like markdown, not left as a suffixed duplicate, and the order
+check no longer counts such a duplicate as a copy. These were the epoch
+migration's markdown-only paths:
+- `prepareEpochMigration` read only markdown bases;
+- the planner's migrated-loser collapse (`migrated`) required markdown and
+  emitted `kind: "markdown"`;
+- `mergeCanvas` never looked up the path base (`epochBaseOf`) and had no
+  trust rule (`trustedEpochBase` was a character check in mergeJob.ts).
+Two places stay markdown-only because canvases have no bound editor: the
+`saveViews` step and the bind-time merge (§5).
+
+Sweeps at 90c717e7:
+- `YAOS_SIM_CRYPTO=none YAOS_SIM_SEEDS=750` (2045 runs) is all clean, and so
+  is the hot matrix alone at 750 seeds.
+- With crypto suite1 at 750 seeds (2796 runs) every non-E2EE matrix is clean.
+- The E2EE matrices fail 11 seeds:
+  - 3 devices: 112, 217, 355;
+  - fault-heavy: 51, 74, 115, 148, 149, 163, 167, 184.
+
+  All 11 fail the same way on the parent of c26726a6, which also failed 139
+  and 164 (fixed here). They are frozen docs and quiescence timeouts, a lost
+  canvas write with no epoch change (217) and a lost attachment token (51).
+- The hot matrix alone with crypto suite1 at 750 seeds fails 208, 503 and
+  570, also unchanged from before.
 
 ## 7. End-to-end results
 
