@@ -678,7 +678,7 @@ test("S1 identical-loser collapse: rebind to the winner + nsDelete(loser), no di
 		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
 		synced: [S("d4", "Inbox/x.md", { contentHash: h("X"), nsTouchSeq: 0 })],
 		local: [L("Inbox/x.md", h("X"))],
-	}), { remoteTextHash: new Map([[id("d3"), h("X")]]) });
+	}), { remoteTextHash: new Map([[id("d3"), h("X")], [id("d4"), h("X")]]) });
 	assert.deepEqual(p.ops, [
 		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "Inbox/x.md" },
 		{ op: "nsDelete", docId: "d4", baseBodySeq: 10 },
@@ -698,7 +698,7 @@ test("§c.12 migrated-loser merge: a differing loser at a path with an old-epoch
 		synced: [S("d4", "Inbox/x.md", { contentHash: h("L"), nsTouchSeq: 0 })],
 		local: [L("Inbox/x.md", h("L"))],
 	};
-	const ctx = { remoteTextHash: new Map([[id("d3"), h("W")]]) };
+	const ctx = { remoteTextHash: new Map([[id("d3"), h("W")], [id("d4"), h("L")]]) };
 	// No path base: a plain loser rename.
 	assert.deepEqual(opsOf(planWith(input(sc), ctx)), ["diskRename", "diskMaterialize", "syncedPut"]);
 	const p = planWith(input(sc), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) });
@@ -711,6 +711,24 @@ test("§c.12 migrated-loser merge: a differing loser at a path with an old-epoch
 	// The winner's body must be readable first.
 	const empty = { ...sc, remote: [R("d3", "Inbox/x.md", { body: { ...R("d3", "Inbox/x.md").body!, hasContent: false } }), R("d4", "Inbox/x (2).md")] };
 	assert.deepEqual(planWith(input(empty), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) }).ops, [{ op: "wait", docId: "d4", reason: "body-empty" }]);
+	// The loser must be caught up (its text is checked to be just what this device synced) ...
+	const behind = { ...sc, remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md", { body: { ...R("d4", "Inbox/x (2).md").body!, caughtUp: false } })] };
+	assert.deepEqual(planWith(input(behind), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) }).ops, [{ op: "wait", docId: "d4", reason: "body-not-caught-up" }]);
+	// ... and its text readable here (resident): otherwise the loser rename, which loses nothing.
+	assert.deepEqual(opsOf(planWith(input(sc), { remoteTextHash: new Map([[id("d3"), h("W")]]), pathBaseKeys: new Set([pk("Inbox/x.md")]) })), ["diskRename", "diskMaterialize", "syncedPut"]);
+});
+
+test("re-create collapse leaves a loser another device wrote to: its nsDelete would drop that edit (sim seed 581)", () => {
+	// Another device materialized the loser as "x (2)" and edited it there: the loser's text is no longer the
+	// synced one. It keeps the loser rename, migrated or identical.
+	const edited = (local: string) => ({
+		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
+		synced: [S("d4", "Inbox/x.md", { contentHash: h(local), nsTouchSeq: 0 })],
+		local: [L("Inbox/x.md", h(local))],
+	});
+	const other = (winner: string) => ({ remoteTextHash: new Map([[id("d3"), h(winner)], [id("d4"), h("E")]]) });
+	assert.deepEqual(opsOf(planWith(input(edited("L")), { ...other("W"), pathBaseKeys: new Set([pk("Inbox/x.md")]) })), ["diskRename", "diskMaterialize", "syncedPut"]);
+	assert.deepEqual(opsOf(planWith(input(edited("X")), other("X"))), ["diskRename", "diskMaterialize", "syncedPut"]);
 });
 
 test("§c.12 migrated-loser merge applies to canvases too", () => {
@@ -719,12 +737,29 @@ test("§c.12 migrated-loser merge applies to canvases too", () => {
 		synced: [S("d4", "b/x.canvas", { kind: "canvas", contentHash: h("L"), nsTouchSeq: 0 })],
 		local: [L("b/x.canvas", h("L"), { kind: "canvas" })],
 	};
-	const ctx = { remoteTextHash: new Map([[id("d3"), h("W")]]) };
+	const ctx = { remoteTextHash: new Map([[id("d3"), h("W")], [id("d4"), h("L")]]) };
 	assert.deepEqual(planWith(input(sc), { ...ctx, pathBaseKeys: new Set([pk("b/x.canvas")]) }).ops, [
 		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "b/x.canvas", adopt: true },
 		{ op: "nsDelete", docId: "d4", baseBodySeq: 10 },
 		{ op: "reconcileContent", docId: "d3", path: "b/x.canvas", kind: "canvas", hasBase: false, pathBase: true },
 	]);
+});
+
+test("re-create collapse waits for the loser's own create frames: an nsDelete below them is a restore duty (§c.7)", () => {
+	const pending = { docsWithPendingBody: new Set([id("d4")]) };
+	// Migrated (differing) loser and identical loser alike: the delete waits as a user delete does.
+	const migrated = run({
+		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
+		synced: [S("d4", "Inbox/x.md", { contentHash: h("L"), nsTouchSeq: 0 })],
+		local: [L("Inbox/x.md", h("L"))], over: pending,
+	}, { remoteTextHash: new Map([[id("d3"), h("W")], [id("d4"), h("L")]]), pathBaseKeys: new Set([pk("Inbox/x.md")]) });
+	assert.deepEqual(migrated.ops, [{ op: "wait", docId: "d4", reason: "pending-body" }]);
+	const identical = run({
+		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
+		synced: [S("d4", "Inbox/x.md", { contentHash: h("X"), nsTouchSeq: 0 })],
+		local: [L("Inbox/x.md", h("X"))], over: pending,
+	}, { remoteTextHash: new Map([[id("d3"), h("X")], [id("d4"), h("X")]]) });
+	assert.deepEqual(identical.ops, [{ op: "wait", docId: "d4", reason: "pending-body" }]);
 });
 
 test("remote-move target already on disk (crash after rename): adopt the path, no disk op", () => {

@@ -607,9 +607,27 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		// path with an old-epoch base merges into the winner (3-way against that base) instead of a loser rename.
 		const migrated = !identical && s.kind !== "blob" && ctx.pathBaseKeys.has(s.pathKey);
 		if (!identical && !migrated) return false;
+		// The loser must still hold just what this device synced: once another device wrote to it (it materialized
+		// the loser under its suffixed name and edited it there), its nsDelete would drop that edit with it. It is a
+		// doc of its own then, and keeps the loser rename, as it does when its text cannot be read here to tell
+		// (caught up but not resident: no textHash).
+		if (r.body && !r.body.caughtUp) {
+			handled.add(winner);
+			push([...prefix, waitOp(s.docId, "body-not-caught-up")]);
+			return true;
+		}
+		const lh = remoteHash(r);
+		if (lh === null || lh !== s.contentHash) return false;
 		handled.add(winner);
 		if (migrated && (!w.body?.caughtUp || (!w.body.hasContent && w.createHash !== EMPTY_CONTENT_HASH))) {
 			push([...prefix, waitOp(s.docId, w.body?.caughtUp ? "body-empty" : "body-not-caught-up")]);
+			return true;
+		}
+		// The loser's own create frames still unsequenced: its nsDelete would carry a base below them and hand every
+		// device a restore duty (§c.7), bringing the loser back under a suffixed name. Collapse once they are acked,
+		// as a user delete waits.
+		if (input.docsWithPendingBody.has(s.docId)) {
+			push([...prefix, waitOp(s.docId, "pending-body")]);
 			return true;
 		}
 		const ops: PlannerOp[] = [

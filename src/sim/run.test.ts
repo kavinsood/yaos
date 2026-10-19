@@ -31,6 +31,14 @@ test("sim: a reorder kept only in the duplicate an epoch migration leaves is not
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Seed 581 (3 devices): B's own re-create of c3 lost the race after an epoch reset and waited to merge into the winner;
+// meanwhile C materialized the loser as "c3 (3).canvas" and added a node to it. B's collapse deleted the loser, C's
+// node with it. A loser another device wrote to keeps the loser rename.
+test("sim: a re-create loser another device edited is not collapsed (seed 581)", async () => {
+	const r = await runSim({ seed: 581, devices: 3, faults: DEFAULT_FAULTS });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 // Suite-1 seed 23: C, revoked, deleted an attachment while key-missing; its passes failed on the write gate and
 // backed off. Re-keyed, it planned nothing until the backoff ran out (past the heal), so the delete never left.
 test("sim: a delete made while key-missing goes out once the device is re-keyed (suite-1 seed 23)", async () => {
