@@ -507,7 +507,13 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 			const l2 = inf.to;
 			claimed.add(l2.pathKey);
 			if (l2.hash === null) return push([...prefix, { op: "needHash", path: l2.path }]);
-			const step = contentStep(s, r, l2, l2.path, l2.path, true);
+			// The source path holds S's own bytes again (the engine re-materialized the doc there before the rename
+			// event arrived): S is that file's record, and the moved file's base is unknown (sim hot canvas seed 0).
+			const stale = movedAway.has(docId) && input.local.get(s.pathKey)?.hash === s.contentHash;
+			const step0 = contentStep(s, r, l2, l2.path, l2.path, true);
+			const step = !stale ? step0 : {
+				...step0, ops: step0.ops.map((o): PlannerOp => (o.op === "reconcileContent" ? { ...o, hasBase: false, noBase: true } : o)),
+			};
 			const hasContentOp = step.ops.some((o) => o.op !== "syncedPut" && o.op !== "wait");
 			const renameOps: PlannerOp[] = [{ op: "nsRename", docId, path: l2.path }];
 			// The content job writes the synced path itself; otherwise record the move now.

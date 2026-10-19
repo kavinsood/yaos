@@ -499,6 +499,11 @@ export type PlannerOp =
 		readonly op: "reconcileContent"; readonly docId: DocId; readonly path: VaultPath; readonly kind: "markdown" | "canvas"; readonly hasBase: boolean;
 		/** Merge against the old epoch's path-keyed base (§c.12), not the synced record's. */
 		readonly pathBase?: true;
+		/**
+		 * The synced record describes another file than this one (an observed rename moved the doc's earlier file off
+		 * a path the engine re-occupied with S's bytes): neither its base nor its contentHash is this file's base.
+		 */
+		readonly noBase?: true;
 	}
 	| { readonly op: "pushBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	| { readonly op: "fetchBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }

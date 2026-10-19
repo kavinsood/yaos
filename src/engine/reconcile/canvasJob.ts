@@ -62,7 +62,7 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 	if (!disk.ok) return invalid(env, docId, op.path, `disk: ${disk.reason}`, F);
 	const diskHash = await canvasLogicalHash(port, disk.data);
 	const s = ctx.synced(docId);
-	const baseText = op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
+	const baseText = op.hasBase && !op.noBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
 	const storedBase = baseText === null ? null : parseMergeText(baseText);
 
 	let out: CanvasMergeOutput | null = null;
@@ -74,7 +74,7 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		if (!crdt.ok) return invalid(env, docId, op.path, `crdt: ${crdt.reason}`, `crdt:${h.version().remoteSeq}`);
 		const token = canvasToMergeText(crdt.ranked);
 		// No stored base: a side still at the synced content is the base (see mergeJob).
-		const base = storedBase ?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : !s ? null : diskHash === s.contentHash ? rankDisk(disk.data, null, crdt.ranked) : (await projectionHash(port, crdt)) === s.contentHash ? crdt.ranked : null);
+		const base = storedBase ?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : !s || op.noBase ? null : diskHash === s.contentHash ? rankDisk(disk.data, null, crdt.ranked) : (await projectionHash(port, crdt)) === s.contentHash ? crdt.ranked : null);
 		await ctx.deps.clock.yieldNow();
 		const m = mergeCanvasSides({ base, disk: disk.data, crdt, limits: ctx.mergeLimits });
 		const mHash = await projectionHash(port, m.projection);

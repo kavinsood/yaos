@@ -249,6 +249,25 @@ test("observed rename off a re-occupied source path wins over a concurrent remot
 	assert.ok(!opsOf(byHash).includes("nsRename"));
 });
 
+test("observed rename off a source path re-occupied by S's own bytes: the moved file merges with no base", () => {
+	// Sim hot canvas seed 0: A's user renamed boards/c2 -> boards/c1 while the engine recovered from an IDB wipe.
+	// The engine found boards/c2 gone before the rename event arrived and re-materialized the doc there (S = the
+	// projection, base included). The late event then moved S onto boards/c1, whose older bytes merged against the
+	// projection as the base: every record a peer had added since read as a local delete (B's node and its
+	// later edits were lost). S describes the file at the source, not the moved one.
+	const sc = { remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
+	const p = run({ ...sc, local: [L("a.md", h("c0")), L("b.md", h("c3"))] });
+	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d1", path: "b.md" });
+	assert.deepEqual(find(p, "reconcileContent"), { op: "reconcileContent", docId: "d1", path: "b.md", kind: "markdown", hasBase: false, noBase: true });
+	// a new file of other bytes at the source: S still describes the moved file, its base stands
+	const other = run({ ...sc, local: [L("a.md", h("c7")), L("b.md", h("c3"))] });
+	assert.deepEqual(find(other, "reconcileContent"), { op: "reconcileContent", docId: "d1", path: "b.md", kind: "markdown", hasBase: true });
+	// canvas alike
+	const cv = { remote: [R("d1", "a.canvas")], synced: [S("d1", "a.canvas")], over: { renames: [{ from: "a.canvas", to: "b.canvas", atMs: 1 }] } };
+	const pc = run({ ...cv, local: [L("a.canvas", h("c0")), L("b.canvas", h("c3"))] });
+	assert.equal(find(pc, "reconcileContent").noBase, true);
+});
+
 test("row live/present/absent: remote edited -> diskMaterialize (edit beats delete); else nsDelete + syncedDrop", () => {
 	const edited = run({ remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] });
 	assert.deepEqual(edited.ops, [{ op: "diskMaterialize", docId: "d1", path: "a.md", expect: { t: "absent" } }]);

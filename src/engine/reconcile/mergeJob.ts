@@ -84,9 +84,10 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	// winner, op.pathBase) merges against the old epoch's base at its path, but only while the new epoch's text
 	// still contains that base (trustedEpochBase): a base ahead of the new epoch would read as deletions.
 	const epochBase = op.pathBase || !s ? ctx.deps.pathBase?.(ctx.pk(op.path)) ?? null : null;
-	const storedBase = !op.pathBase && op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
-	// The synced-side fallback below needs a record describing this doc's last sync (not a rebound loser's).
-	const fallback = op.pathBase ? undefined : s;
+	const storedBase = !op.pathBase && !op.noBase && op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
+	// The synced-side fallback below needs a record describing this doc's last sync (not a rebound loser's, nor
+	// another file's: op.noBase).
+	const fallback = op.pathBase || op.noBase ? undefined : s;
 	const ytext = h.doc.getText("text");
 	const diskHash = await markdownContentHash(port, D);
 	// Bound: the disk holds a save of its editors (or the last disk text) that the replica already has: not an edit.
