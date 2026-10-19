@@ -94,6 +94,14 @@ test("sim: ns frames allocated before a lost store read ns are not ignored as re
 	}
 });
 
+// Suite-1 seed 217 (3 devices): A moved node a-1n0 on disk while a-1n1, the next line of the merge text, changed on
+// both sides. The line diff3 joined the two lines into one conflicting hunk and kept the CRDT's a-1n0: the move lived
+// only in the conflict copy, which a user deleted. The canvas merge resolves record by record.
+test("sim: a canvas edit next to a conflicting record is merged, not left to the conflict copy (suite-1 seed 217)", async () => {
+	const r = await runSim({ seed: 217, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */

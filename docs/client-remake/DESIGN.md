@@ -2255,7 +2255,9 @@ ones get conflict copies.
     edges reference existing nodes (dangling edges are dropped from the projection, kept in the CRDT). Invalid →
     freeze `canvas-invalid`.
 - **Merge.** The ONE `MergeFn` runs over the canonical record-per-line text (`canvasToMergeText`: one node or edge and its rank per line),
-  so concurrent edits to different nodes merge, and the same node conflicts.
+  so concurrent edits to different nodes merge, and the same node conflicts. When all three texts differ, its
+  both-edited step resolves record by record, keyed by id (`mergeRecordLines`): a line diff3 joins adjacent changed
+  lines into one hunk, so one record's conflict would swallow the disk's edit of the record on the next line.
   - The CRDT apply is record-level: changed fields are set, and the `text` field gets a minimal `Y.Text` diff. Node
     maps are never replaced wholesale.
   - Canvas views are not bound. Every user edit reaches the CRDT through a disk save and merge.

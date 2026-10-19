@@ -21,9 +21,13 @@
  *  - Validation (as mergeValidated, §f.3): a merged text that does not parse,
  *    has an unknown node type, or whose projection breaks the limits becomes
  *    conflict(both-edited) keeping the unextended CRDT side.
- *  - Edits to different records merge (touching lines merge cleanly in the
- *    diff3); edits to the same record conflict: the CRDT keeps its side of the
- *    overlapping records plus the clean disk hunks, the job copies the disk file.
+ *  - Edits to different records merge; edits to the same record (or an edit
+ *    against a delete) conflict: the CRDT keeps its side of those records plus
+ *    every disk change to the others, the job copies the disk file. When all
+ *    three texts differ, the both-edited step of the merge resolves record by
+ *    record (mergeRecordLines): a line diff3 joins adjacent changed lines into
+ *    one hunk, so a conflict on one record would swallow the disk's edit of its
+ *    neighbour (suite-1 seed 217).
  */
 
 import type { ConflictReason, MergeLimits, MergeResult } from "../../core/types";
@@ -152,7 +156,8 @@ export function mergeCanvasSides(input: CanvasMergeInput): CanvasMergeOutput {
 	const dText = canvasToMergeText(d);
 	const bText = b ? canvasToMergeText(b) : null;
 	const cText = canvasToMergeText(c);
-	const res = merge({ base: bText, disk: dText, crdt: cText, limits });
+	let res = merge({ base: bText, disk: dText, crdt: cText, limits });
+	if (bText !== null && (res.kind === "clean" || (res.kind === "conflict" && res.reason === "both-edited"))) res = mergeRecordLines(bText, dText, cText);
 	const stats = canvasMergeStats;
 	stats.merges++;
 	if (bText !== null && dText !== bText && cText !== bText && dText !== cText) stats.divergent++;
@@ -170,4 +175,61 @@ export function mergeCanvasSides(input: CanvasMergeInput): CanvasMergeOutput {
 	stats.rejected++;
 	stats.conflict++;
 	return { kind: "conflict", reason: reason ?? "both-edited", diskRanked, target: crdt.ranked, projection: crdt };
+}
+
+/** Merge-text line -> its record key ("n:" / "e:" + id, or "doc"); null when malformed. */
+function lineKey(line: string): string | null {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(line);
+	} catch {
+		return null;
+	}
+	if (typeof raw !== "object" || raw === null) return null;
+	const o = raw as { node?: { id?: unknown }; edge?: { id?: unknown }; doc?: unknown };
+	if (o.node && typeof o.node.id === "string") return `n:${o.node.id}`;
+	if (o.edge && typeof o.edge.id === "string") return `e:${o.edge.id}`;
+	return o.doc !== undefined ? "doc" : null;
+}
+
+function recordLines(text: string): Map<string, string> | null {
+	const out = new Map<string, string>();
+	for (const line of text.split("\n")) {
+		if (line === "") continue;
+		const k = lineKey(line);
+		if (k === null || out.has(k)) return null;
+		out.set(k, line);
+	}
+	return out;
+}
+
+/**
+ * The both-edited step for canvases (header): a 3-way merge per record line, keyed by record id (a line holds the
+ * record and its rank). A record one side changed (or deleted, or added) and the other kept takes that side; one
+ * both sides changed differently conflicts and keeps the CRDT's line. Lines come out nodes, edges, root (the parse
+ * orders by rank). Unparseable text keeps the CRDT, as a conflict.
+ */
+export function mergeRecordLines(base: string, disk: string, crdt: string): MergeResult {
+	const b = recordLines(base);
+	const d = recordLines(disk);
+	const c = recordLines(crdt);
+	if (!b || !d || !c) return { kind: "conflict", text: crdt, conflictCopy: disk, reason: "both-edited" };
+	let conflict = false;
+	const out: string[] = [];
+	for (const k of new Set([...b.keys(), ...d.keys(), ...c.keys()])) {
+		const lb = b.get(k);
+		const ld = d.get(k);
+		const lc = c.get(k);
+		let line: string | undefined;
+		if (ld === lc || ld === lb) line = lc;
+		else if (lc === lb) line = ld;
+		else {
+			conflict = true;
+			line = lc;
+		}
+		if (line !== undefined) out.push(line);
+	}
+	const order = (l: string): number => (l.startsWith('{"node"') ? 0 : l.startsWith('{"edge"') ? 1 : 2);
+	const text = out.sort((x, y) => order(x) - order(y)).map((l) => `${l}\n`).join("");
+	return conflict ? { kind: "conflict", text, conflictCopy: disk, reason: "both-edited" } : { kind: "clean", text };
 }

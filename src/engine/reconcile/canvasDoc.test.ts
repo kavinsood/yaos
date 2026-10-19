@@ -186,6 +186,27 @@ test("canvasMerge: edits to the same node conflict; target = CRDT side of that n
 	assert.equal(txt("c"), "C disk", "the clean disk hunk is kept");
 });
 
+// Suite-1 seed 217: a line diff3 joins adjacent changed lines into one hunk, so the disk's edit of a, next to b which
+// both sides changed, fell into b's conflict and the CRDT kept a's old line: a's edit survived only in the conflict
+// copy (DESIGN §j.2: different records merge, the same record conflicts).
+test("canvasMerge: a disk edit next to a record both sides changed is kept; only that record conflicts", () => {
+	const disk = canvasJson([textNode("a", "A", 25), textNode("b", "B", 13), textNode("c", "C")], [edge("e", "a", "b")]);
+	const { out } = sides(BASE, disk, (doc) => nodeMap(doc, "b").set("x", 12));
+	assert.equal(out.kind, "conflict");
+	assert.equal(out.reason, "both-edited");
+	assert.equal(out.target.data.nodes.get("a")!.position.x, 25, "a: changed on disk only");
+	assert.equal(out.target.data.nodes.get("b")!.position.x, 12, "b: changed on both sides, the CRDT keeps its side");
+});
+
+test("canvasMerge: a disk edit next to a record deleted on disk and edited in the CRDT is kept", () => {
+	const disk = canvasJson([textNode("a", "A", 25), textNode("c", "C")], []);
+	const { out } = sides(BASE, disk, (doc) => nodeMap(doc, "b").set("x", 12));
+	assert.equal(out.kind, "conflict");
+	assert.equal(out.target.data.nodes.get("a")!.position.x, 25, "a: changed on disk only");
+	assert.equal(out.target.data.nodes.get("b")!.position.x, 12, "b: deleted on disk, edited in the CRDT: the CRDT keeps it");
+	assert.ok(!out.target.data.edges.has("e"), "e: deleted on disk only");
+});
+
 test("canvasMerge: no base -> identical when equal (formatting ignored), else conflict(no-base) keeping the CRDT", () => {
 	const d = docOf(BASE);
 	const crdt = project(d);
@@ -205,17 +226,20 @@ test("canvasMerge: no base -> identical when equal (formatting ignored), else co
 	assert.deepEqual(p.hashInput, crdt.hashInput);
 });
 
-test("canvasMerge: a merged text that does not validate is a conflict keeping the CRDT (disk re-ranks a node the CRDT edited)", () => {
-	// Disk brings a to the front (its line moves to the end), the CRDT resizes a. The line merge conflicts on a's old
-	// line and takes the disk's new line cleanly: two lines for a. That text is rejected, not half-applied.
+test("canvasMerge: disk re-ranks a node the CRDT edited: that node conflicts, the other disk edit merges", () => {
+	// Disk brings a to the front (a new rank on its line) and moves c, the CRDT resizes a. A line diff3 saw a's line
+	// move as a delete plus an insert and produced two lines for a, a text that was rejected whole, c's move with it.
+	// Per record: a changed on both sides keeps the CRDT's line, c changed on disk only takes the disk's.
 	const disk = canvasJson([textNode("b", "B"), textNode("c", "C", 7), textNode("a", "A")], [edge("e", "a", "b")]);
 	const rejected0 = canvasMergeStats.rejected;
 	const { d, out } = sides(BASE, disk, (doc) => nodeMap(doc, "a").set("width", 300));
-	assert.equal(canvasMergeStats.rejected - rejected0, 1);
+	assert.equal(canvasMergeStats.rejected - rejected0, 0);
 	assert.equal(out.kind, "conflict");
 	assert.equal(out.reason, "both-edited");
-	assert.equal(canvasToMergeText(out.target), canvasToMergeText(project(d).ranked), "target = the CRDT side, unchanged");
-	assert.equal(JSON.parse(out.projection.text).nodes.find((n: Obj) => n.id === "c").x, 0, "the clean disk hunk goes to the conflict copy only");
+	const crdt = project(d).ranked;
+	assert.equal(out.target.data.nodes.get("a")!.size.width, 300);
+	assert.equal(out.target.nodeRanks.get("a"), crdt.nodeRanks.get("a"), "a keeps the CRDT's rank");
+	assert.equal(out.target.data.nodes.get("c")!.position.x, 7, "c's disk move is merged");
 });
 
 test("canvasDoc: a field holding a value canonical JSON rejects (a peer's NaN) is replaced by the applied value", () => {
