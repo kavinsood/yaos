@@ -185,7 +185,8 @@ export class SnapshotJob {
 	private async takeNow(reason: SnapReason): Promise<SnapRecord | null> {
 		const d = this.deps;
 		if (!d.settings().enabled && reason !== "manual" && reason !== "restore") return null;
-		let createdAtMs = d.clock.now();
+		// The id holds whole ms and the record must match it (record.ts); a ClockPort may read fractional ms.
+		let createdAtMs = Math.floor(d.clock.now());
 		while (await readLocal(d.side, snapshotId(createdAtMs, reason))) createdAtMs++;
 		const id = snapshotId(createdAtMs, reason);
 		const store = this.rd?.store;

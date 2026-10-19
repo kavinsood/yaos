@@ -175,3 +175,16 @@ test("damaged local snapshot: content_corrupt (notice + diagnostic + failure nam
 		await assert.rejects(job.manifest(snap.id), (e: unknown) => e instanceof ProtocolFailure && e.error.code === "content_corrupt");
 	}
 });
+
+test("a fractional clock reading (ClockPort may return one; sim seed 688 F DEV3) still takes and lists the snapshot", async () => {
+	const { w, job } = device();
+	w.vault.userWrite("a.md", "a");
+	w.clock.advance(0.25);
+	assert.notEqual(w.clock.now() % 1, 0, "the test needs a fractional reading");
+	const id = await job.maybeDaily();
+	assert.ok(id, "the daily snapshot was taken");
+	assert.equal(parseSnapshotId(id)?.createdAtMs, Math.floor(w.clock.now()));
+	assert.deepEqual((await job.list()).map((s) => s.id), [id]);
+	const manual = (await job.take("manual"))!;
+	assert.deepEqual((await job.list()).map((s) => s.id), [id, manual.id]);
+});
