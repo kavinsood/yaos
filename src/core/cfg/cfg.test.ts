@@ -213,7 +213,9 @@ test("cfgFoldV1 round-trip, V1 non-canonical rejection, V2 violations, checkpoin
 	const content = { encoding: CheckpointEncoding.cfgFoldV1, coversSeq: 3, foldRulesVersion: CFG_FOLD_RULES_VERSION, state: bytes };
 	assert.ok(verifyCfgCheckpoint(content, 3).ok);
 	assert.equal((verifyCfgCheckpoint({ ...content, encoding: CheckpointEncoding.nsFoldV1 }, 3) as { reason: string }).reason, "malformed");
-	assert.equal((verifyCfgCheckpoint({ ...content, foldRulesVersion: 2 }, 3) as { reason: string }).reason, "rules-version");
+	assert.equal((verifyCfgCheckpoint({ ...content, foldRulesVersion: 2 }, 3) as { reason: string }).reason, "upgrade-required", "newer rules: the reader must upgrade");
+	assert.equal((verifyCfgCheckpoint({ ...content, foldRulesVersion: 0 }, 3) as { reason: string }).reason, "rules-version", "no cfg rules 0: a bad writer");
+	assert.ok(verifyCfgCheckpoint({ ...content, foldRulesVersion: 2 }, 3, 2).ok, "a reader that knows rules 2");
 	assert.equal((verifyCfgCheckpoint(content, 5) as { reason: string }).reason, "covers-seq");
 });
 

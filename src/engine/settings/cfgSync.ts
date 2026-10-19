@@ -65,6 +65,11 @@ export interface CfgSyncDeps {
 	 * Absent: always ready (unit tests).
 	 */
 	readonly remoteReady?: () => boolean;
+	/**
+	 * The cfg fold is halted on rules or a format only a newer YAOS reads (DESIGN §c.10): no pass runs (no ops on old
+	 * rules, no writes from a view that stopped), the engine's notice tells the user. Absent: never.
+	 */
+	readonly upgradeRequired?: () => boolean;
 }
 
 export interface CfgPassResult {
@@ -160,6 +165,7 @@ export class CfgSync {
 		const clash = detectCfgClash(local.files.get(CFG_CORE_PLUGINS_FILE)?.bytes ?? null, local.files.get(CFG_PLUGINS_FILE)?.bytes ?? null);
 		this.report("settings-clash", clash ? { items: [clash.id], message: clashMessage(clash) } : null);
 		if (clash) return { plan: { actions: [], skipped: [] }, emitted: 0, written: [], deferred: [], paused: clash.id };
+		if (this.deps.upgradeRequired?.()) return { plan: { actions: [], skipped: [] }, emitted: 0, written: [], deferred: [], paused: null };
 		const rows = await db.tx([STORE.cfgBase], "readonly", (tx) => tx.getAll(STORE.cfgBase));
 		if (rows.length === 0 && this.deps.remoteReady && !this.deps.remoteReady()) {
 			return { plan: { actions: [], skipped: [] }, emitted: 0, written: [], deferred: [], paused: null };

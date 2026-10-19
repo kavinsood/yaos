@@ -84,16 +84,16 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed), then unpad when suite ≠ 
 | `snap` | snap | `snapOps` | `snapFoldV1` | commit-only | devices that upload or delete snapshots (§j.4) |
 | `b:<docId>` | body | `bodyUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the note |
 | `c:<docId>` | canvas | `canvasUpdate`, `bodyUpdateRef` | `yjsStateV1` / `retired` | provisional + notice | any editor of the canvas |
-| `k` | keyring | k records, no envelope (e2ee-design §11.2, `src/engine/keyring/record.ts:93`) | none (read with `preferCheckpoint = false`, `src/engine/runtime/sessionLoop.ts:360`) | commit-only | key-holding or joining devices (`src/engine/keyring/keyringRuntime.ts:248`, `src/engine/compose/keyReader.ts:259`) |
+| `k` | keyring | k records, no envelope (e2ee-design §11.2, `src/engine/keyring/record.ts:93`) | none (read with `preferCheckpoint = false`, `src/engine/runtime/sessionLoop.ts:380`) | commit-only | key-holding or joining devices (`src/engine/keyring/keyringRuntime.ts:248`, `src/engine/compose/keyReader.ts:259`) |
 
 - No stream carries blob bytes. Attachments, oversized updates and snapshot parts go to the `BlobPort` only; the
   log carries only their small records (ns / cfg / snap ops, `bodyUpdateRef`) (§j.1).
 - `docId` and `clientFrameId` are 16 random bytes encoded as base64url without padding (22 chars).
   - A `clientFrameId` is never reused, on any stream, ever. The relay does not detect reuse across streams.
 - Streams of any other class (`streamClass` "other", `src/core/types.ts:76-84`, the retired `x:` names included)
-  are ignored: the cursor still advances and nothing is stored (`src/engine/ingest/gate.ts:94`).
-- `k` rows skip the envelope gate (`gate.ts:93-94`) and are stored as key-record rows for the keyring
-  (`src/engine/sync/ingestRow.ts:57`, `src/engine/runtime/context.ts:366`).
+  are ignored: the cursor still advances and nothing is stored (`src/engine/ingest/gate.ts:117`).
+- `k` rows skip the envelope gate (`gate.ts:116-117`) and are stored as key-record rows for the keyring
+  (`src/engine/sync/ingestRow.ts:57`, `src/engine/runtime/context.ts:408`).
 - Every socket receives every stream (relay-wire §5.3). The cost of a row for a non-resident doc is bounded at
   gate stage 1–2 plus one tail put (§d.6).
 
@@ -211,18 +211,35 @@ catch-up reads (`src/engine/sync/catchUp.ts`) are the only place a remote checkp
    - all live entries under one folder key share its display casing;
    - tombstones ≤ `TOMBSTONE_CAP`, and each ring holds 1–64 unique non-empty ids (not necessarily 22-char ids: a
      malformed or gate-failed row enters the ring with whatever `clientFrameId` the relay committed, §b.3, §c.3);
-   - `foldRulesVersion` ≤ `FOLD_RULES_VERSION`, else the gate fails reader-dependent (`envelope-version`), and the
-     header's `foldRulesVersion` equals the state's;
+   - `foldRulesVersion` ≤ the reader's known rules (`FOLD_RULES_VERSION`), else the gate fails as a newer writer
+     (below), and the header's `foldRulesVersion` equals the state's;
    - inner coversSeq equals the relay's coversSeq.
 
-A failure is a gate failure: `decode-failed` (V1), `checkpoint-mismatch` (coversSeq) or `checkpoint-invariant` (the
-rest of V2). Catch-up treats any of them as a disputed checkpoint: it re-reads the page without the checkpoint, and
-if the rows below it are gone it freezes the stream `checkpoint-disputed` (`readStream`, catchUp.ts). On a
-40k-entry (4.2 MiB) state the gate takes about 285 ms, against about 200 ms for V1 alone; both are linear.
+A failure is a gate failure, of one of two kinds (`GateFail.newer`, `src/engine/ingest/gate.ts`):
+
+- **Newer writer** (reason `envelope-version`, reader-dependent, `newer`): the checkpoint holds what only a newer
+  client reads. For every checkpoint: an encoding byte above the known `CheckpointEncoding`s (an encoding this
+  build knows but the wrong one for the stream is still `kind-not-allowed`). For ns, cfg and snap: a state
+  `formatVersion` above 1 (checked before any decode) or a `foldRulesVersion` above the reader's known rules
+  (`KnownRules`: `FOLD_RULES_VERSION`, `CFG_FOLD_RULES_VERSION`, `SNAP_FOLD_RULES_VERSION`; tests raise them through
+  `EngineTuning.knownRules` to play an upgraded client), in the header or in the ns state. Catch-up halts the fold
+  at the checkpoint in `upgrade-required` (§c.10, §d.7). It is never disputed.
+- **Bad bytes** from a writer of this version: `decode-failed` (V1), `checkpoint-mismatch` (coversSeq) or
+  `checkpoint-invariant` (the rest of V2). Catch-up treats any of them as a disputed checkpoint: it re-reads the page
+  without the checkpoint, and if the rows below it are gone it freezes the stream `checkpoint-disputed` (`readStream`,
+  catchUp.ts).
+
+A checkpoint that fails the envelope stage for a reader-dependent reason other than a newer writer (a key, a pin,
+`k` not judged yet) is neither: it waits (§d.7). On a 40k-entry (4.2 MiB) state the gate takes about 285 ms, against
+about 200 ms for V1 alone; both are linear.
 
 No device compares fold digests with another: a checkpoint that passes V1 + V2 but is not the fold of its rows (a
 buggy writer, or a hostile one holding the vault key) is adopted by every device that reads it, and nothing raises
 an alarm. A fresh device could not check it anyway: the relay GCs the rows below it.
+
+A writer's checkpoint header carries the `foldRulesVersion` of the state it encodes (`FoldCandidate.rulesVersion`;
+for ns the state's own version, which `upgradeRules` moves), not the build's constant: a newer build on a vault
+still at rules 1 writes rules 1, which every reader adopts.
 
 Checkpoints are written only at **candidate** seqs (§d.9). An ns row `s` is a candidate iff
 `floor(s / 1000) > floor(prev / 1000)`, where `prev` is the fold's coversSeq before `s` (`isCandidateSeq`,
@@ -238,12 +255,14 @@ Checkpoints are written only at **candidate** seqs (§d.9). An ns row `s` is a c
 Each register is `value? (u8 present + bytes), varuint seq, varuint index, varstring deviceId`. Verification is
 V1 + V2 at the gate (`verifyCfgCheckpoint`, `src/core/cfg/verify.ts`): rings as in ns; every register key and value
 valid; every version `1 ≤ seq ≤ coversSeq`, `index < 512`, unique across registers, one deviceId per seq; header
-`foldRulesVersion` equal to `CFG_FOLD_RULES_VERSION` (a newer one is reader-dependent).
+`foldRulesVersion` from `CFG_FOLD_RULES_VERSION` to the reader's known cfg rules (above: a newer writer; below: bad
+bytes).
 
 **Snapshot index (`snapFoldV1`, encoding 5).** Header `varuint formatVersion, varuint coversSeq`, then floors
 sorted by deviceId, dels sorted by key and records sorted by key (key = `deviceId/snapshotId`; a record is
 `varstring deviceId, varbytes put body`). Verification: strict decode (every id, record and bound), then the
-canonical re-encode must be byte-identical; `foldRulesVersion` ≤ 1, and the inner coversSeq equals the relay's.
+canonical re-encode must be byte-identical; `foldRulesVersion` ≤ the reader's known snap rules (`SNAP_FOLD_RULES_VERSION`
+= 1; above: a newer writer), and the inner coversSeq equals the relay's.
 There is no separate invariant checker: the strict decoder is the snap index's V2.
 
 **`retired`.** An empty state that tells the relay it may GC every row ≤ coversSeq. It is written only for:
@@ -325,8 +344,12 @@ For each committed ns row, in seq order:
 
 1. **Open and decode.**
    - Envelope failures that depend on the reader (unknown suite/keyEpoch, auth failure, unsupported
-     `formatVersion`) **halt** the ns fold at this row: phase `upgrade-required` or `key-missing`, with the rows
-     kept in `tail`.
+     `formatVersion`) **halt** the ns fold at this row, with the rows kept in `tail` (stored unopened,
+     `LOCAL_FLAG_UNOPENED`). A `formatVersion` or suite byte this build does not know is a newer writer: the halt
+     is an upgrade halt (`FoldHalt.upgrade`, phase `upgrade-required`, §c.10). The rest wait for keys or `k`
+     (phase `key-missing` when the write gate says so). Unopened rows are re-gated on every session start and after
+     every keyring change (`regateUnopened`, `src/engine/runtime/quarantineRelease.ts`), so an upgraded client or
+     new keys lift the halt.
    - Deterministic decode failures make the frame malformed (§b.3), which folds as an empty frame.
 2. **Dedupe.** If `clientFrameId ∈ recentFrames[deviceId]`, emit one frame-level event `ignored/duplicate-frame`
    and stop. Otherwise append the id and trim the ring to `NS_DEDUPE_RING` (64), oldest out.
@@ -500,6 +523,38 @@ path (example E8).
   - Otherwise set `foldRulesVersion = version`; it governs every later `(seq, index)`.
 - v1 clients never emit `upgradeRules`. The rollout policy for v2 is out of scope.
 
+**Every upgrade halt** (`FoldHalt.upgrade`, `src/engine/sync/foldRuntime.ts`) has one of three causes, and is
+handled the same way:
+
+| Cause | Halts | Where |
+|---|---|---|
+| ns `upgradeRules` above the known version | ns, before that frame (`rules-version`) | the fold |
+| A row whose envelope `formatVersion` or suite byte this build does not know | ns / cfg / snap, before that row (`reader-dependent`, `upgrade`) | the fold, from the unopened row |
+| A checkpoint of newer rules or format (§b.5) | ns / cfg / snap, at the checkpoint (`newer-checkpoint`) | catch-up (§d.7) |
+
+- **No guessing.** Nothing past the halt is folded on this reader's rules: not the rows past an `upgradeRules`
+  frame, and not the rows below a newer checkpoint (even where the relay still has them).
+- **Nothing persists.** The halt lives in the fold runtime only. A checkpoint halt stores nothing: no row of its
+  page, no snapshot, no cursor or `appliedSeq` move (the stream stays stale), no `disputedCheckpointCoversSeq`, no
+  freeze, no quarantine. Row halts keep their rows in `tail`, as always.
+- **Phase and notice.** While any fold has an upgrade halt the phase of a caught-up session is `upgrade-required`
+  (`EngineCtx.livePhase`, after `key-missing`); the session stays up. Each halted fold raises the error notice
+  `upgrade-required:<fold>` (ns, cfg, snap; `noteHalts`) and, once per engine, a popup. The status bar shows
+  "update required"; its tooltip and the settings tab say "This vault was written by a newer YAOS. Update the
+  plugin to keep syncing." and what stopped (`VAULT_UPGRADE_TEXT`, `VAULT_UPGRADE_STOPPED`,
+  `src/protocol/status.ts`). Phase `upgrade-required` without these notices is the server's (§i.6).
+- **What stops.** Only the halted fold's feature:
+  - ns: the planner (nsReady false: no ns ops, no ns-derived destructive disk ops), ns checkpoints, blob GC (the
+    committed folds are incomplete);
+  - cfg: settings sync (no pass: no ops on old rules, no writes from the stopped view, `CfgSyncDeps.upgradeRequired`);
+  - snap: the snapshot index is not ready (`snapView().caughtUp` false), so snapshots wait.
+  - Body streams, and the other folds, keep syncing. Remote checkpoints and key rolls run in phase `live` only, so
+    they wait too.
+- **Recovery.** An upgraded client (known rules ≥ the vault's) starts from the same store: a checkpoint halt reads
+  the checkpoint again and adopts it (§d.7); a row halt refolds the stored rows (`upgradeRules` now folds) or
+  re-gates the unopened rows at session start. Nothing to release by hand. A read that completes clears a
+  checkpoint halt (`clearCheckpointHalt`).
+
 ### c.11 Settings fold (`cfg`)
 
 - `CfgFoldState` is LWW registers ordered by `(seq, index)`, with the same duplicate-frame ring and send window as
@@ -634,8 +689,8 @@ changes.
   - An offline device with `synced` for a pruned doc: L unchanged → `diskTrash` (braked); L changed → `nsCreate` of a
     fresh doc and `syncedDrop` of the old.
 - **E12, upgradeRules halt.** A v1 device folds seq 9100 `upgradeRules{2}`.
-  - The ns fold halts with `coversSeq 9099` and phase `upgrade-required`. Rows ≥ 9100 stay in `tail` until the
-    client is upgraded.
+  - The ns fold halts with `coversSeq 9099` and phase `upgrade-required`, notice `upgrade-required:ns`. Rows ≥ 9100
+    stay in `tail` until the client is upgraded; the upgraded client refolds them on its next start.
   - Bodies keep syncing. No ns ops are emitted and no remote moves or deletes are applied locally.
 
 ---
@@ -992,16 +1047,25 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 | Failure | ns / cfg / snap | body / canvas |
 |---|---|---|
 | Deterministic malformation (bytes, decode) | Fold as empty frame (§c.3); diagnostics event | Quarantine, freeze doc |
-| Reader-dependent (unknown version, suite or key; auth failure) | **Halt** the fold at the row (`upgrade-required` / `key-missing`); rows wait in `tail` | Quarantine with the whole row, freeze doc (retried on upgrade or new keys) |
+| Reader-dependent, newer writer (`GateFail.newer`: unknown `formatVersion` or suite byte) | **Halt** the fold at the row, an upgrade halt (§c.10: phase `upgrade-required`); rows wait in `tail` | Quarantine with the whole row, freeze doc (retried on upgrade) |
+| Reader-dependent, waiting (a known suite this port cannot open, unknown key; auth failure under an unverified key) | **Halt** the fold at the row (`key-missing` when the gate says so); rows wait in `tail`, re-gated at session start and on keyring change | Quarantine with the whole row, freeze doc (retried on new keys) |
 | Kind not allowed | Fold as empty | Quarantine, freeze |
 | `suite-downgrade`, `bad-padding`; `auth-failed` under a verified key (`CryptoPort.keyState(e).verified`) | Deterministic: as malformation | As malformation |
 | `auth-failed` under an unverified key | Reader-dependent: halt | Reader-dependent: quarantine |
 | Stale epoch (e2ee-design §14.3, decided from the header's keyEpoch before opening) | ns/cfg: stored flagged stale-epoch, fold as empty; snap: accounted, not stored | Accounted, not stored, not quarantined |
 | Stale epoch not yet decidable (`hold`: `k` not judged) | Reader-dependent (`keyring-hold`) | Reader-dependent (`keyring-hold`) |
 
-- Verified-key split: `src/engine/ingest/gate.ts:101-104`, `src/engine/ingest/envelope.ts:58-71` (e2ee-design §9.2,
-  §9.3). Stale verdict: `staleVerdict`, `gate.ts:137-146`; row handling `src/engine/sync/ingestRow.ts:64-66`. A
-  stale provisional is ignored; a stale checkpoint fails `stale-epoch` (`gate.ts:143`, `:145`).
+- **Checkpoints** (§b.5, §d.7) are never quarantined:
+
+  | Checkpoint failure | ns / cfg / snap | body / canvas |
+  |---|---|---|
+  | Newer writer (rules, encoding, state format, envelope version or suite byte) | Upgrade halt at the checkpoint (§c.10); nothing of the page stored | As waiting (Yjs rows are not rules: re-reading them is not guessing) |
+  | Waiting (key, pin, `keyring-hold`, unverified-key auth) | Re-read without it if the read preferred it; rows gone → held | same |
+  | Bad bytes (deterministic) | Disputed: re-read without it; rows gone → frozen `checkpoint-disputed` | same |
+
+- Verified-key split: `src/engine/ingest/gate.ts:124-131`, `src/engine/ingest/envelope.ts:58-71` (e2ee-design §9.2,
+  §9.3). Stale verdict: `staleVerdict`, `gate.ts:163-172`; row handling `src/engine/sync/ingestRow.ts:64-66`. A
+  stale provisional is ignored; a stale checkpoint fails `stale-epoch` (`gate.ts:169`, `:171`).
 
 - **The cursor always advances.** Quarantined, stored-cold, stale-recorded and halted rows are all *accounted*.
 - **Frozen docs:**
@@ -1034,7 +1098,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - Live events go to an in-memory **live queue**.
    - Rows are processed in arrival order, committed rows in batches (one `tLive` per batch), provisionals one at a
      time (`src/engine/runtime/liveIngest.ts:1-7`); no rank decides the order. Stored body rows are applied only
-     to a resident (or loading) replica; the rest stay in the tail (`src/engine/runtime/context.ts:377-388`).
+     to a resident (or loading) replica; the rest stay in the tail (`src/engine/runtime/context.ts:419-430`).
    - **Overflow** (> 4 MiB or > 1000 queued rows): drop payloads of rows for non-resident docs. Record those streams
      as stale with `remoteHeadSeq = max(…, seq)`. The seq counts as accounted, and the rows are read later.
 3. **Feed.** If V < H: run `feed(V)` pages. Each page runs `T_feed_page`:
@@ -1044,9 +1108,9 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - V reaches H after about `streams / 1000` pages, with no row reads.
 3a. **Keyring.** Live ingest is enabled, then `k` is read to head if stale, and the keyring settles
    (`keyring.afterKRead`) before any other stream is read; a `k` still stale after the read fails the session
-   (`src/engine/runtime/sessionLoop.ts:140-146`, e2ee-design §11.3). If the keyring allows reading only `k`, the
-   phase becomes `key-missing` and catch-up stops there (`sessionLoop.ts:148-152`). Then ns, cfg, snap are read in
-   that order (`sessionLoop.ts:153`).
+   (`src/engine/runtime/sessionLoop.ts:156-162`, e2ee-design §11.3). If the keyring allows reading only `k`, the
+   phase becomes `key-missing` and catch-up stops there (`sessionLoop.ts:164-168`). Then ns, cfg, snap are read in
+   that order (`sessionLoop.ts:173`).
 4. **Reads.** Catch-up jobs take stale streams in priority order (§j.6; `staleOrder` over the in-memory stream cache,
    `src/engine/sync/catchUp.ts`, nothing stored), up to `catchUpConcurrency` at once. Bound docs go first; ns, cfg
    and snap were read in step 3a.
@@ -1057,6 +1121,18 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
      - fresh stream: store it as the snapshot after the gate (ns and cfg: V1 + V2; snap: strict decode + V1);
      - otherwise: **union job**: scratch doc = local snapshot + every local tail row ≤ coversSeq + the checkpoint →
        `T_snapshot`. For ns: verify, then replace the fold state, and own pending ops re-overlay (§f.1).
+   - **Checkpoint gate failures** (`readStream`, `src/engine/sync/catchUp.ts`; table in §d.6):
+     - *newer writer* on ns/cfg/snap: the read ends `held` (upgrade) at once, before any row of the page is
+       stored. The session loop halts the fold at the checkpoint (`haltAtCheckpoint`) and does not read the stream
+       again in this session; the stream stays stale. The next session reads it again (and halts again); an
+       upgraded client adopts it;
+     - *waiting* (or a newer body checkpoint): if the read preferred the checkpoint, the page is re-read without
+       it and the rows gate on their own (an unopened fold row halts the fold, a body row is quarantined, as live).
+       If it comes back the rows below it are gone: the read ends `held`, the stream stays stale, nothing is
+       marked. A keyring change (`regateUnopened` → `SessionLoop.releaseHeld`) or the next session reads it again;
+     - *bad bytes*: disputed (§b.5); a disputed checkpoint is remembered (`disputedCheckpointCoversSeq`) and not
+       gated again.
+     - A held stream does not keep the engine from idle (`isIdle`), like a frozen `checkpoint-disputed` one.
    - **Caught up:** when a read completes (`more = false`) in the current session, every row of the stream ≤
      `max(H, lastSeq)` is known, because the read started after `VAULT_READY` and everything ≤ H was committed then.
      Every row > H arrives live (R2). So `appliedSeq := remoteHeadSeq` and `stale := 0`.
@@ -1119,7 +1195,7 @@ The planner does no destructive work until ns is caught up (§f.2).
     `REMOTE_CHECKPOINT_SETTLE_MS` (2 min, limits.ts:124). A stream whose only row is its first frame is left alone:
     a checkpoint would replace one open with one open (an import of 10k notes costs no checkpoints).
   - *Idle* means no live row and no own frame on the stream for that long (`lastActivity`, set in
-    src/engine/runtime/docRuntime.ts:148 and context.ts:378). Activity also restarts the fallback clock
+    src/engine/runtime/docRuntime.ts:148 and context.ts:420). Activity also restarts the fallback clock
     (checkpoints.ts:134), so neither rule writes while a note is being typed in, on any device. Activity before
     this engine run is unknown (a restart can come in the middle of an edit session), so a stream with no activity
     seen counts as active at the run's first live maintenance tick (`markLive`, checkpoints.ts:104, called at
@@ -1174,7 +1250,7 @@ The planner does no destructive work until ns is caught up (§f.2).
     - Hot: ≥ `NS_CHECKPOINT_ROWS` (1000) ns rows or ≥ `NS_CHECKPOINT_BYTES` have accumulated since the last
       checkpoint. No idle gate.
     - Settle: `settleWanted`, and the stream has been idle for `REMOTE_CHECKPOINT_SETTLE_MS`. ns, cfg and snap rows
-      mark activity in src/engine/runtime/context.ts:371.
+      mark activity in src/engine/runtime/context.ts:413.
     - Others take over after 10 min plus jitter, with the same refresh read first (maintenance.ts:174).
   - A settle checkpoint covers the newest candidate. The rows after it stay: fewer than one candidate interval (1000
     vault seqs). There is at most one settle put per candidate.
@@ -1191,7 +1267,7 @@ The planner does no destructive work until ns is caught up (§f.2).
       for a doc (2 for its first checkpoint). A put at `lastSeq` also drops the open segment at no extra row (H7).
     - A CAS conflict writes nothing, and the fallback refresh is a read.
   - A heavy desktop day:
-    - Frames: ≤ 20k (soft budget, limits.ts:256; frames are 4× slower beyond it, src/engine/runtime/context.ts:510-512) ×
+    - Frames: ≤ 20k (soft budget, limits.ts:256; frames are 4× slower beyond it, src/engine/runtime/context.ts:553-555) ×
       ≤ 2 rows = ≤ 40k.
     - Settle: 500 edit sessions × ≤ 4 = 2k. One put per session: a pause of 2 min or more ends one.
     - Hot: 20k / 256 × 4 ≈ 310.
@@ -1217,7 +1293,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | Store | Key path | Indexes | Value | Bound |
 |---|---|---|---|---|
 | `meta` | `key` | — | Singletons `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty`, `frameNoFloor`, `keyring`; one `blobPut:<address>` per blob address this device PUT (e2ee-design §10.4) | 7 singletons + `blobPut:*`, which is **unbounded** between prunes: each blob GC pass drops entries older than `blobGcGraceMs / 2` (`src/engine/runtime/blobGc.ts:95`) |
-| `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; never deleted (retired streams are a gap, `src/engine/sync/catchUp.ts:148`) |
+| `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; never deleted (retired streams are a gap, `src/engine/sync/catchUp.ts:177`) |
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | Soft `OUTBOX_SOFT_BYTES` (16 MiB): builders stretch, notice. **Never dropped** |
@@ -1265,7 +1341,7 @@ Rules:
 | `T_adopt` | outbox, meta | Adoptable record | Before commit: the provisional was applied to the bound replica only. The edit reaches disk through the editor and is re-merged. The commit or the author's resend brings it anyway. |
 | `T_intent_begin` / `T_intent_end` | intents | Put / delete the intent | §f.7: startup completes or rolls back each intent from disk state. |
 | `T_synced` (after a disk-op batch) | synced, baseText, localTree, intents | Synced put/drop, base put, stat cache, intent end | Before commit: the next reconcile sees L = R ≠ S, which is the "identical" path. Only S advances. |
-| `T_cfg` | cfgBase | Settings sync base after projection (`src/engine/settings/cfgSync.ts:229`) | As `T_synced`. |
+| `T_cfg` | cfgBase | Settings sync base after projection (`src/engine/settings/cfgSync.ts:235`) | As `T_synced`. |
 
 - **Compaction and remote checkpoint gate.** They require "no own unreceipted frames of the stream". This is the only
   coupling between outbox and snapshots.
@@ -1280,7 +1356,7 @@ Rules:
 - The outbox is never evicted; it is bounded only by user activity while offline, and the soft limit triggers a notice
   plus frame stretching.
 - `streams` / `snapshots` / `tail` of pruned docs are **not** deleted yet: a `retired` checkpoint is skipped
-  (`src/engine/sync/catchUp.ts:148`, gap) and no transaction drops a stream.
+  (`src/engine/sync/catchUp.ts:177`, gap) and no transaction drops a stream.
 - **Quota error:**
   1. evict `quarantine` bytes;
   2. compact everything eligible;
@@ -2018,7 +2094,7 @@ ones get conflict copies.
 | `backpressure` (VAULT_BACKPRESSURE), then 1013 | Stop sending at once. Reconnect after ≥ 5 s. Client token bucket at 50 % for 10 min. |
 | 1009 oversize / 1008 malformed APPEND | Probe mode, poison (§d.6). |
 | 1008 + upgrade error `unauthorized` | Re-ticket once. Connect `unauthorized` (ticket 401) → phase `revoked`, stop, "re-pair device" notice. |
-| `update_required` / connect `update-required` | Phase `upgrade-required`, no reconnect until the plugin updates. |
+| `update_required` / connect `update-required` | Phase `upgrade-required` (notice `upgrade-required`: "The server needs a newer YAOS plugin"), no reconnect until the plugin updates. The vault's own demand (a fold halted, §c.10) keeps the session and has notices `upgrade-required:<fold>`. |
 | `unclaimed` / `not-found` | Phase `error` with notice, retry hourly. |
 | 4403 `authority_superseded` / connect `superseded` | Re-ticket and reconnect. Repeated: phase `superseded`, retry every `SUPERSEDED_RETRY_MS`. |
 | 4409 | Not sent on streams sockets. If seen: reconnect and compare `VAULT_READY.vaultEpoch` (§c.12). |
@@ -2028,7 +2104,7 @@ ones get conflict copies.
 | `refused forbidden` / `canWrite = false` | Read-only: no appends or checkpoints. Outbox kept. Notice. |
 | `resendUnreceipted` (STREAM_RESEND) | §d.5. |
 | 1001 / 1006 / network | Reconnect with full-jitter exponential backoff `RECONNECT_BASE_MS` → `RECONNECT_MAX_MS`. Immediate on `online` / `visible`. |
-| A relay HTTP call (feed, read, readBatch, checkpoint) ends at its deadline (`timeout`: 15 s plus its byte bound at 64 KiB/s) or as `aborted` when its session closes (§j.1 Liveness) | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:337-340`, `:362-367`); a failed session-start feed closes the session and reconnects with backoff (`:165-173`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
+| A relay HTTP call (feed, read, readBatch, checkpoint) ends at its deadline (`timeout`: 15 s plus its byte bound at 64 KiB/s) or as `aborted` when its session closes (§j.1 Liveness) | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:357-360`, `:382-387`); a failed session-start feed closes the session and reconnects with backoff (`:185-193`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
 | Ticket TTL 5 min | The adapter fetches a fresh ticket for every connect. |
 
 ---
@@ -2087,7 +2163,7 @@ ones get conflict copies.
     throws `BlobTooLargeError`. The queue refuses that hash until the engine restarts: one notice, the outage record
     dropped, no backoff; `pushBlob` holds the doc (`held`, no pass retry). Changed bytes are a new hash and are tried
     (`src/engine/blobs/blobQueue.ts` `upload`, `src/engine/reconcile/blobJobs.ts`).
-    `StatusSnapshot.maxBlobBytes` reports that cap (`src/engine/compose/vaultRuntime.ts:650`); the attachment size
+    `StatusSnapshot.maxBlobBytes` reports that cap (`src/engine/compose/vaultRuntime.ts:652`); the attachment size
     setting then reads "This server accepts attachments up to N MB." and offers at most N (`attachmentLimitMb`,
     `src/host/ui/settingsModel.ts`; 93 MB, what fits 100 MB once sealed, until a vault reports its own). The
     setting can only lower the server's limit: its default (1 GiB, the most there is) follows it, and choosing
@@ -2122,8 +2198,8 @@ ones get conflict copies.
   - There is no UI row, notice, banner or setting about server blob storage (no server-metadata UI); only a log line.
 - **A store found on a later connect.** `EnginePorts.probeBlob` (`src/ports/index.ts:30`) asks the relay again. The
   session loop calls it once per session that reaches live, only while `ports.blob` is null
-  (`src/engine/runtime/sessionLoop.ts:160`, `:430-443`). A store found → `EngineOptions.onBlobStore`
-  (`src/engine/runtime/options.ts:160-164`) → `VaultRuntime` (`src/engine/compose/vaultRuntime.ts:64-65`, `:173`) →
+  (`src/engine/runtime/sessionLoop.ts:180`, `:459-472`). A store found → `EngineOptions.onBlobStore`
+  (`src/engine/runtime/options.ts:164-168`) → `VaultRuntime` (`src/engine/compose/vaultRuntime.ts:64-65`, `:173`) →
   `ComposedEngine.onBlobStore` sets `ports.blob`, logs "blob store available -> restarting" and restarts the runtime
   with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:527-532`). The restarted runtime's full
   pass uploads what is pending through the normal path. No polling, no new timers.
@@ -2409,6 +2485,8 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
   (`maxBlobBytes`, null until a vault is open, 0 without a blob store), notices.
   - Posted on phase change, and otherwise at most 4/s.
   - The status bar shows phase + unsynced count.
+  - Phase `upgrade-required`: the tooltip (and the settings tab's "Update required" row) is the vault's message when
+    a `upgrade-required:<fold>` notice is present (§c.10), else the server's.
 - **`DiagnosticsBundle`** (`exportDiagnostics{includePaths}`, built in `src/engine/compose/diagnosticsBundle.ts`):
   - the whole 2000-entry ring of `DiagnosticsEvent`, oldest first (numbers, booleans, stream classes, error
     messages). The whole ring, not a tail: the window before an incident is what support needs;

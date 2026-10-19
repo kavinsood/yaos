@@ -13,10 +13,17 @@
  *    checkpoint) -> T_snapshot(fromRemote);
  *  - ns/cfg otherwise: the verified fold state replaces the snapshot (tail <= C
  *    deleted) and the caller reloads the fold.
- * A checkpoint that fails the gate is "disputed": if preferCheckpoint was set
- * the page is re-read without it (rows may still exist); if it comes back the
- * rows below it are gone, the stream is frozen `checkpoint-disputed` and the
- * read stops without completing (the stream stays stale).
+ * A checkpoint that fails the gate (DESIGN §d.7 "Checkpoint gate failures"):
+ *  - newer rules or format on ns/cfg/snap (GateFail.newer): "held" at once, upgrade = true. Nothing of the
+ *    page is stored, no row past it is folded on these rules, nothing is marked: the caller halts the fold
+ *    (upgrade-required) and an upgraded client adopts the checkpoint on its next read;
+ *  - otherwise reader-dependent (a key, a pin or `k` not judged yet; a newer body checkpoint): if
+ *    preferCheckpoint was set the page is re-read without it (the rows gate on their own, as live rows do);
+ *    if it comes back the rows below it are gone and the read is "held" (upgrade = GateFail.newer), the
+ *    stream stale, nothing marked: the next session or keyring change reads it again;
+ *  - deterministic (bad bytes from a writer of this version): "disputed". If preferCheckpoint was set the
+ *    page is re-read without it (rows may still exist); if it comes back the rows below it are gone, the
+ *    stream is frozen `checkpoint-disputed` and the read stops without completing (the stream stays stale).
  *
  * A batched read (sessionLoop) hands its page in as `first`; it stands in for the first read() only when it
  * was read from the same cursor and checkpoint preference this read starts with.
@@ -62,7 +69,7 @@ export interface ReadOptions {
 }
 
 export interface ReadResult {
-	readonly t: "done" | "aborted" | "retry" | "disputed" | "partial";
+	readonly t: "done" | "aborted" | "retry" | "disputed" | "held" | "partial";
 	readonly pages: number;
 	readonly rows: number;
 	/** body/canvas checkpoint state adopted (fresh or union): apply to a resident replica. */
@@ -78,6 +85,8 @@ export interface ReadResult {
 	readonly skip: ReadonlySet<Seq>;
 	readonly stream: StreamRecord | null;
 	readonly error?: string;
+	/** t = "held": the checkpoint this reader cannot use yet; upgrade = only a newer client can (GateFail.newer). */
+	readonly held?: { readonly coversSeq: Seq; readonly upgrade: boolean; readonly detail: string };
 }
 
 function isFresh(rec: StreamRecord | undefined): boolean {
@@ -96,8 +105,9 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	let replacedFold = false;
 	let pages = 0;
 	let rowsSeen = 0;
-	const result = (t: ReadResult["t"], error?: string): ReadResult => ({
-		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, renamed, tailPut, skip, stream: repo.stream(stream) ?? null, ...(error ? { error } : {}),
+	const result = (t: ReadResult["t"], error?: string, held?: ReadResult["held"]): ReadResult => ({
+		t, pages, rows: rowsSeen, checkpointState, replacedFold, removed, updated, renamed, tailPut, skip, stream: repo.stream(stream) ?? null,
+		...(error ? { error } : {}), ...(held ? { held } : {}),
 	});
 	if (cls === "other") return result("done");
 	const start = repo.stream(stream);
@@ -105,6 +115,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 	// `k` has no checkpoints (e2ee-design §18.3): every record is read.
 	let preferCheckpoint = after === 0 && cls !== "keyring";
 	let disputedRetry = false;
+	let heldRetry = false;
 	let first = opts.first && opts.first.afterSeq === after && opts.first.preferCheckpoint === preferCheckpoint ? opts.first.page : null;
 	for (;;) {
 		if (opts.maxPages !== undefined && pages >= opts.maxPages) return result("partial");
@@ -124,6 +135,24 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 			const disputedBefore = rec !== undefined && rec.disputedCheckpointCoversSeq === ck.coversSeq;
 			const g = disputedBefore ? null : await gate(deps.gateCtx, { t: "checkpoint", stream, coversSeq: ck.coversSeq, payload: ck.bytes });
 			if (!opts.stillValid()) return result("aborted");
+			if (g && !g.ok && g.readerDependent) {
+				// Not this checkpoint's fault: never disputed, never frozen, nothing stored.
+				const detail = `${g.reason}: ${g.detail}`;
+				const fold = cls === "ns" || cls === "cfg" || cls === "snap";
+				if (g.newer && fold) {
+					// Rows past it would be folded on rules this reader does not have: halt here (§c.10).
+					deps.diag("checkpoint-upgrade-required", { cls, coversSeq: ck.coversSeq, detail });
+					return result("held", detail, { coversSeq: ck.coversSeq, upgrade: true, detail });
+				}
+				if (preferCheckpoint && !heldRetry) {
+					deps.diag("checkpoint-held", { cls, coversSeq: ck.coversSeq, detail, reread: true });
+					heldRetry = true;
+					preferCheckpoint = false;
+					continue;
+				}
+				deps.diag("checkpoint-held", { cls, coversSeq: ck.coversSeq, detail, reread: false });
+				return result("held", detail, { coversSeq: ck.coversSeq, upgrade: g.newer, detail });
+			}
 			if (!g || !g.ok || g.t !== "checkpoint") {
 				const detail = g && !g.ok ? `${g.reason}: ${g.detail}` : disputedBefore ? "disputed before" : "not a checkpoint";
 				deps.diag("checkpoint-disputed", { cls, coversSeq: ck.coversSeq, detail });

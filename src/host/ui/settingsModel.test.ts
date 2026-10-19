@@ -173,6 +173,10 @@ test("engine rows and labels", () => {
 	assert.equal(engineAcceptsCommands({ phase: "stopped", lastError: null }), false);
 	assert.equal(isPaused(snap("paused")), true);
 	assert.equal(isPaused(null), false);
+	// A vault-side upgrade (a fold halted, DESIGN §c.10) says what to do; the server's does not add the row.
+	const upgrade = engineRows(running, snap("upgrade-required", { notices: [{ code: "upgrade-required:snap", level: "error", atMs: 0 }] }), 0);
+	assert.equal(Object.fromEntries(upgrade.map((r) => [r.name, r.value]))["Update required"], "This vault was written by a newer YAOS. Update the plugin to keep syncing. Until then, vault snapshots are paused.");
+	assert.ok(!engineRows(running, snap("upgrade-required"), 0).some((r) => r.name === "Update required"));
 });
 
 test("attachment size description names the open carrier's limit when the status has it, rounded down", () => {

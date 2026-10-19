@@ -253,7 +253,7 @@ export class VaultRuntime {
 		});
 		await this.rec.start();
 		if (this.settings.syncSettings) {
-			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, hash: ports.hash, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp });
+			this.cfg = new CfgSync({ db, config: link.configDir, log: this.port.cfg, blobs: this.blobs, clock: ports.clock, hash: ports.hash, notice: this.notice, mobile: config.platform.isMobile, seed: this.settings.syncSettingsSeed, remoteReady: () => this.port.nsCaughtUp, upgradeRequired: () => this.log.c.cfg.halted?.upgrade === true });
 		}
 		this.snaps = new SnapshotJob({
 			disk: link.disk, side: link.sideFiles, clock: ports.clock, crypto, hash: ports.hash, files: () => this.snapshotFiles(), settings: () => this.settings.snapshots,
@@ -271,7 +271,7 @@ export class VaultRuntime {
 			this.diag(`storage lost: ${failure}`);
 			this.engine.onStorageLost();
 		}));
-		if (this.lastLog?.phase === "live") this.onLogStatus(this.lastLog);
+		if (this.lastLog?.phase === "live" || this.lastLog?.phase === "upgrade-required") this.onLogStatus(this.lastLog);
 		this.sched.request({ t: "full" });
 	}
 
@@ -385,7 +385,9 @@ export class VaultRuntime {
 	onLogStatus(s: StatusSnapshot): void {
 		this.lastLog = s;
 		if (this.stopped) return;
-		if (s.phase === "live" && !this.port.nsCaughtUp && this.rec) {
+		// upgrade-required with a session: a fold is halted for a newer writer (§c.10) and the session caught up;
+		// the planner's nsReady and the cfg / snap readiness still see that fold's halt.
+		if ((s.phase === "live" || (s.phase === "upgrade-required" && s.relay.connected)) && !this.port.nsCaughtUp && this.rec) {
 			this.port.nsCaughtUp = true;
 			this.port.invalidate();
 			this.sched.request({ t: "full" });

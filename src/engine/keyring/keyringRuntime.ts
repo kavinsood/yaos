@@ -185,7 +185,7 @@ export class KeyringRuntime {
 		if (b === this.wasBlocked) return;
 		this.wasBlocked = b;
 		c.diag("keyring/gate", { open: !b, reason: this.kr.keyMissing() });
-		if (c.phase === "live" || c.phase === "daily-limit" || c.phase === "key-missing") c.setPhase(c.livePhase());
+		c.refreshLivePhase();
 		if (b) return;
 		c.sender.pump();
 		for (const h of [...c.handles.all()]) if (!h.builder.empty) void c.docs.closeFrame(h);

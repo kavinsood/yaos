@@ -9,8 +9,8 @@
  * - every version: 1 <= seq <= coversSeq, 0 <= index < MAX_FRAME_OPS, deviceId
  *   non-empty; versions are unique across all registers (one op writes one
  *   register) and all registers with the same seq share one deviceId.
- * - Checkpoint content: encoding cfgFoldV1, foldRulesVersion ===
- *   CFG_FOLD_RULES_VERSION, coversSeq equal to the relay's and the state's.
+ * - Checkpoint content: encoding cfgFoldV1, foldRulesVersion from CFG_FOLD_RULES_VERSION to the reader's known
+ *   version (above it: upgrade-required, DESIGN §c.10), coversSeq equal to the relay's and the state's.
  */
 
 import type { CfgFoldState, CfgRegister, CfgVersion } from "../types";
@@ -28,7 +28,7 @@ const MAX_FRAME_OPS = MAX_NS_OPS_PER_FRAME;
 
 export type CfgVerifyResult =
 	| { readonly ok: true; readonly state: CfgFoldState }
-	| { readonly ok: false; readonly reason: "malformed" | "non-canonical" | "invariant" | "covers-seq" | "rules-version"; readonly detail: string };
+	| { readonly ok: false; readonly reason: "malformed" | "non-canonical" | "invariant" | "covers-seq" | "rules-version" | "upgrade-required"; readonly detail: string };
 
 const isCount = (n: number) => Number.isSafeInteger(n) && n >= 0;
 
@@ -91,10 +91,11 @@ export function verifyCfgFoldBytes(bytes: Uint8Array, expectedCoversSeq: number)
 	return { ok: true, state };
 }
 
-/** Full check of a decoded cfg checkpoint content. */
-export function verifyCfgCheckpoint(content: CheckpointContent, relayCoversSeq: number): CfgVerifyResult {
+/** Full check of a decoded cfg checkpoint content; `knownRulesVersion`: the highest cfg rules this reader implements. */
+export function verifyCfgCheckpoint(content: CheckpointContent, relayCoversSeq: number, knownRulesVersion = CFG_FOLD_RULES_VERSION): CfgVerifyResult {
 	if (content.encoding !== CheckpointEncoding.cfgFoldV1) return { ok: false, reason: "malformed", detail: `encoding ${content.encoding}` };
-	if (content.foldRulesVersion !== CFG_FOLD_RULES_VERSION) return { ok: false, reason: "rules-version", detail: `foldRulesVersion ${content.foldRulesVersion}` };
+	if (content.foldRulesVersion > knownRulesVersion) return { ok: false, reason: "upgrade-required", detail: `foldRulesVersion ${content.foldRulesVersion}` };
+	if (content.foldRulesVersion < CFG_FOLD_RULES_VERSION) return { ok: false, reason: "rules-version", detail: `foldRulesVersion ${content.foldRulesVersion}` };
 	if (content.coversSeq !== relayCoversSeq) return { ok: false, reason: "covers-seq", detail: `content ${content.coversSeq} != relay ${relayCoversSeq}` };
 	return verifyCfgFoldBytes(content.state, relayCoversSeq);
 }

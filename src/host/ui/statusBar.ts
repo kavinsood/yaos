@@ -7,7 +7,7 @@
  * given, and its timers are injectable, so it is testable in Node with a fake element.
  */
 
-import type { StatusSnapshot } from "../../protocol/status";
+import { VAULT_UPGRADE_STOPPED, VAULT_UPGRADE_TEXT, vaultUpgradeFolds, type StatusSnapshot } from "../../protocol/status";
 import type { EngineRunState, YaosUiHost } from "./api";
 import { pendingBrake } from "./api";
 import { brakeHeadline } from "./brake";
@@ -151,11 +151,15 @@ export function renderStatus(snapshot: StatusSnapshot | null, run: EngineRunStat
 			level = "busy";
 			lines.push("The server vault was reset. Re-syncing this device against the new vault.");
 			break;
-		case "upgrade-required":
+		case "upgrade-required": {
 			text = "update required";
 			level = "error";
-			lines.push("The server needs a newer YAOS plugin. Update the plugin to continue syncing.");
+			// The vault's demand (a fold halted, DESIGN §c.10) names what stopped; otherwise the server refused us.
+			const folds = vaultUpgradeFolds(snapshot);
+			if (folds.length > 0) lines.push(VAULT_UPGRADE_TEXT, ...folds.map((f) => VAULT_UPGRADE_STOPPED[f]));
+			else lines.push("The server needs a newer YAOS plugin. Update the plugin to continue syncing.");
 			break;
+		}
 		case "key-missing":
 			text = withUnsynced("encryption key missing", n);
 			level = "error";

@@ -91,7 +91,7 @@ controls have no counterpart.
 | Themes | adfa7a7:src/sync/settingsSync/apply.ts:282 (installed from the catalog), :478 (uninstall) | src/engine/settings/allowlist.ts:10 (theme.css and manifest.json are copied as files); src/engine/settings/cfgPlan.ts:314 (removal) | ported (the mechanism is new: files, not a catalog install) |
 | Plugin data.json | adfa7a7:src/sync/settingsSync/allowlist.ts:51-55 | src/engine/settings/allowlist.ts:9; src/engine/settings/cfgPlan.ts:296 | ported |
 | data.json version gate | adfa7a7:src/sync/settingsSync/dataJsonGate.ts:14 | src/engine/settings/allowlist.ts:100; src/engine/settings/cfgPlan.ts:316-318 | ported |
-| Version-mismatch notice ("settingsSync hold ... Update plugin") | adfa7a7:src/sync/settingsSync/apply.ts:364-368 | src/engine/settings/cfgNotices.ts:15, :66; src/engine/settings/cfgSync.ts:171-172 | implemented (59c7bea) |
+| Version-mismatch notice ("settingsSync hold ... Update plugin") | adfa7a7:src/sync/settingsSync/apply.ts:364-368 | src/engine/settings/cfgNotices.ts:15, :66; src/engine/settings/cfgSync.ts:177-178 | implemented (59c7bea) |
 | Plugin skip list (yaos, yaos-qa-harness); YAOS never overwrites itself | adfa7a7:src/sync/settingsSync/types.ts:17; adfa7a7:src/sync/settingsSync/apply.ts:305 | src/engine/settings/allowlist.ts:38 | ported |
 | Files that must never be written | adfa7a7:src/sync/settingsSync/apply.ts:30 | src/engine/settings/allowlist.ts:64 (closed allowlist) | ported |
 | Community plugin enablement | adfa7a7:src/sync/settingsSync/pluginIntent.ts:17-26 (install intents; community-plugins.json itself unsynced at adfa7a7:src/sync/settingsSync/allowlist.ts:23) | src/engine/settings/allowlist.ts:36; src/engine/settings/cfgPlan.ts:252 | ported (the mechanism is new: enable or disable per plugin id, installed plugins only) |
@@ -104,18 +104,18 @@ controls have no counterpart.
 | Per-file size cap (1 MB) | adfa7a7:src/sync/settingsSync/types.ts:2; adfa7a7:src/sync/settingsSync/apply.ts:262-265 | src/engine/settings/cfgPlan.ts:191-195 | implemented (59c7bea) |
 | Total cap (256 files, 4 MB) | adfa7a7:src/sync/settingsSync/types.ts:3, :7 | src/engine/settings/cfgPlan.ts:103-120 | implemented (59c7bea) |
 | Invalid JSON is not applied | adfa7a7:src/sync/settingsSync/apply.ts:267 | src/engine/settings/cfgPlan.ts:256 ("unparseable" skip); src/engine/settings/cfgNotices.ts:17 | ported |
-| Restart/reload notice after a settings write | adfa7a7:src/sync/settingsSync/apply.ts:643-649 (app.json and hotkeys.json only, :34) | src/engine/settings/cfgPlan.ts:210; src/engine/settings/cfgSync.ts:197; src/host/pluginController.ts:56 | implemented (a0031d0); asking on every JSON write is kept on purpose |
+| Restart/reload notice after a settings write | adfa7a7:src/sync/settingsSync/apply.ts:643-649 (app.json and hotkeys.json only, :34) | src/engine/settings/cfgPlan.ts:210; src/engine/settings/cfgSync.ts:203; src/host/pluginController.ts:56 | implemented (a0031d0); asking on every JSON write is kept on purpose |
 | "Restart required" settings row | adfa7a7:src/settings/settingsTab.ts:682 | MISSING | dropped: the reload notice replaces it (a0031d0) |
-| Clash pause (Obsidian Sync, Remotely Save, Self-hosted LiveSync, Relay) | adfa7a7:src/sync/settingsSync/clash.ts:1-10; adfa7a7:src/sync/settingsSync/engine.ts:198-201; adfa7a7:src/settings/settingsTab.ts:672 | src/engine/settings/clash.ts:12-16, :41, :49; src/engine/settings/cfgSync.ts:160-162 | implemented (59c7bea) |
-| First-enable seed: "seed from this device" or "take the remote seed" | adfa7a7:src/sync/settingsSync/engine.ts:212-222, :343, :363; adfa7a7:src/settings/settingsTab.ts:601, :624 | src/host/ui/settingsTab.ts:49-70, :427-431; src/protocol/messages.ts:43; src/engine/settings/cfgSync.ts:169 | implemented (13068c6, 4b8ca1a) |
+| Clash pause (Obsidian Sync, Remotely Save, Self-hosted LiveSync, Relay) | adfa7a7:src/sync/settingsSync/clash.ts:1-10; adfa7a7:src/sync/settingsSync/engine.ts:198-201; adfa7a7:src/settings/settingsTab.ts:672 | src/engine/settings/clash.ts:12-16, :41, :49; src/engine/settings/cfgSync.ts:165-167 | implemented (59c7bea) |
+| First-enable seed: "seed from this device" or "take the remote seed" | adfa7a7:src/sync/settingsSync/engine.ts:212-222, :343, :363; adfa7a7:src/settings/settingsTab.ts:601, :624 | src/host/ui/settingsTab.ts:49-70, :427-431; src/protocol/messages.ts:43; src/engine/settings/cfgSync.ts:175 | implemented (13068c6, 4b8ca1a) |
 | "Decide initial seed later" | adfa7a7:src/settings/settingsTab.ts:647 | src/host/ui/settingsTab.ts:49-70 (closing the question leaves settings sync off) | implemented (4b8ca1a) |
-| First pass on a new device does not let an empty view win | adfa7a7:src/sync/settingsSync/engine.ts:1085 (probeBlank) | src/engine/settings/cfgSync.ts:164-166; src/engine/compose/vaultRuntime.ts:256 | implemented (66c8a4c) |
+| First pass on a new device does not let an empty view win | adfa7a7:src/sync/settingsSync/engine.ts:1085 (probeBlank) | src/engine/settings/cfgSync.ts:170-172; src/engine/compose/vaultRuntime.ts:256 | implemented (66c8a4c) |
 | "Apply remote environment" and "Replace remote settings environment" buttons | adfa7a7:src/settings/settingsTab.ts:592, :656 | MISSING | dropped: per-key projection is automatic, and there is no environment (DESIGN §j.3) |
 | Settings sync state rows (config-folder key, state, environment, pending apply queue) | adfa7a7:src/settings/settingsTab.ts:580-590 | MISSING | dropped: no environment model; skips surface as notices |
 | "Ignored unknown configuration files" list | adfa7a7:src/sync/settingsSync/allowlist.ts:74; adfa7a7:src/settings/settingsTab.ts:677; adfa7a7:src/sync/settingsSync/status.ts:15 | MISSING | dropped: unknown root JSON list (coordinator decision) |
 | Server capability check for settings sync | adfa7a7:src/sync/settingsSync/engine.ts:160 | MISSING | dropped: settings ride the stream protocol, so there is nothing to probe |
 | Apply only while Obsidian is in the foreground | adfa7a7:src/sync/settingsSync/engine.ts:425-432; adfa7a7:src/sync/settingsSync/apply.ts:206-210 | MISSING | dropped: foreground-only settings apply (coordinator decision) |
-| Change detection | adfa7a7:src/sync/settingsSync/watch.ts:10 (2 s poll), :11 (data.json debounce) | src/engine/settings/cfgSync.ts:94-142 (a snapshot of the config folder on every settings pass) | ported (the cadence is new: full passes and focus) |
+| Change detection | adfa7a7:src/sync/settingsSync/watch.ts:10 (2 s poll), :11 (data.json debounce) | src/engine/settings/cfgSync.ts:99-147 (a snapshot of the config folder on every settings pass) | ported (the cadence is new: full passes and focus) |
 
 ## 2. Commands and the command palette
 
@@ -152,19 +152,19 @@ restart the sync engine (:80), and the vault-creation and encryption commands (:
 | Status bar item added on load | adfa7a7:src/main.ts:822 | src/host/ui/registerUi.ts:162 | ported |
 | Connection labels (Disconnected, Loading, Connecting, Connected, Offline) | adfa7a7:src/status/statusBarController.ts:36-50 | src/host/ui/statusBar.ts:65-126 (starting, downloading, catching up, synced, syncing, offline, paused) | ported |
 | Auth failures (server unclaimed, misconfigured, format unsupported, auth rejected) | adfa7a7:src/status/statusBarController.ts:51-67 | src/host/ui/statusBar.ts:144-148 ("re-pair device"), :164-170 (error with its code) | ported |
-| "Update required" | adfa7a7:src/status/statusBarController.ts:68-70 | src/host/ui/statusBar.ts:154-158 | ported |
+| "Update required" | adfa7a7:src/status/statusBarController.ts:68-70 | src/host/ui/statusBar.ts:154-161 | ported |
 | "Local storage error" | adfa7a7:src/status/statusBarController.ts:71-73 | src/host/ui/statusBar.ts:59-64 ("stopped (error)") | ported |
-| Transfer status suffix | adfa7a7:src/status/statusBarController.ts:78 | src/host/ui/statusBar.ts:173-175 (queued, pending disk writes and pending attachments, in the tooltip) | ported |
-| "N files need attention" | adfa7a7:src/status/statusBarController.ts:82-83 | src/host/ui/statusBar.ts:176-182 | ported |
+| Transfer status suffix | adfa7a7:src/status/statusBarController.ts:78 | src/host/ui/statusBar.ts:177-179 (queued, pending disk writes and pending attachments, in the tooltip) | ported |
+| "N files need attention" | adfa7a7:src/status/statusBarController.ts:82-83 | src/host/ui/statusBar.ts:180-186 | ported |
 | "Server not saving" | adfa7a7:src/status/statusBarController.ts:89-90 | MISSING | dropped: the server receipts a frame only after it commits it, so unsaved work shows as unsynced changes (DESIGN invariant I1) |
 | Daily-limit label | adfa7a7:src/status/statusBarController.ts:94-95 | src/host/ui/statusBar.ts:134-138 | ported |
 | "Recovery ..." suffix | adfa7a7:src/status/statusBarController.ts:97-98 | MISSING | dropped: recovery-job UI (the snapshot browser replaces it) |
 | Resource-pressure suffix | adfa7a7:src/status/statusBarController.ts:100-101 | MISSING | dropped: DESIGN §m.2 (runtime coordinators); per-class budgets replace residency pressure (src/core/limits.ts:251) |
-| Server receipt label | adfa7a7:src/status/statusBarController.ts:121-144 | src/host/ui/statusBar.ts:173 (queued and awaiting-receipt counts in the tooltip) | ported |
-| Tooltip | adfa7a7:src/status/statusBarController.ts:178 | src/host/ui/statusBar.ts:189, :292 | ported |
+| Server receipt label | adfa7a7:src/status/statusBarController.ts:121-144 | src/host/ui/statusBar.ts:177 (queued and awaiting-receipt counts in the tooltip) | ported |
+| Tooltip | adfa7a7:src/status/statusBarController.ts:178 | src/host/ui/statusBar.ts:193, :296 | ported |
 
 New only: a click opens the held-changes review, the key entry while the vault key is missing, or the settings
-(src/host/ui/statusBar.ts:242-246), and the item can be hidden (src/host/ui/statusBar.ts:278-283; setting at
+(src/host/ui/statusBar.ts:246-250), and the item can be hidden (src/host/ui/statusBar.ts:282-287; setting at
 src/host/ui/settingsTab.ts:329).
 
 ### 3.2 Notices
@@ -174,10 +174,10 @@ src/host/ui/settingsTab.ts:329).
 | "Join this folder with a server URL and pairing code." on load when not enrolled | adfa7a7:src/main.ts:849 | MISSING (the status bar says "not paired", src/host/ui/statusBar.ts:58) | dropped: "Join this folder" notice (coordinator decision) |
 | Unencrypted HTTP warning | adfa7a7:src/main.ts:857-870 | src/host/ui/pairing.ts:145 (http is refused except on loopback) | ported (stricter: refused, not warned) |
 | Initialization failure | adfa7a7:src/main.ts:1518 | src/host/pluginController.ts:211 ("YAOS stopped: ...") | ported |
-| Fatal sync notices (unclaimed, revoked, unauthorized, update required) | adfa7a7:src/runtime/fatalSyncNotice.ts:14-55; adfa7a7:src/main.ts:3775 | src/host/ui/statusBar.ts:144-158; src/host/pluginController.ts:211 | ported |
+| Fatal sync notices (unclaimed, revoked, unauthorized, update required) | adfa7a7:src/runtime/fatalSyncNotice.ts:14-55; adfa7a7:src/main.ts:3775 | src/host/ui/statusBar.ts:144-161; src/host/pluginController.ts:211 | ported |
 | "YAOS preserved an offline edit as ..." | adfa7a7:src/main.ts:1069 | src/engine/reconcile/context.ts:241, :247-254 | implemented (2d6bac5) |
 | Conflict-copy notice (30 s cooldown, suppressed count) | adfa7a7:src/runtime/reconciliationController.ts:2701-2714; adfa7a7:src/sync/blobSync.ts:1827-1830 | src/engine/reconcile/context.ts:247-254; src/core/plan/conflictName.ts:107 (one warning per pass with the count and the first copy) | implemented (2d6bac5) |
-| Daily-limit popup (20 s, once per window) | adfa7a7:src/main.ts:2886-2891; adfa7a7:src/sync/dailyLimit.ts:19 | src/host/pluginController.ts:58; src/engine/runtime/context.ts:233-236; src/engine/runtime/dailyLimit.ts:22, :28 | implemented (52d5ea0) |
+| Daily-limit popup (20 s, once per window) | adfa7a7:src/main.ts:2886-2891; adfa7a7:src/sync/dailyLimit.ts:19 | src/host/pluginController.ts:58; src/engine/runtime/context.ts:236-239; src/engine/runtime/dailyLimit.ts:22, :28 | implemented (52d5ea0) |
 | Server persistence degraded / restored | adfa7a7:src/main.ts:2900-2909 | MISSING | dropped: no such state (see "Server not saving" in §3.1) |
 | Skipped file (too large, or a name other systems cannot store) | adfa7a7:src/sync/blobSync.ts:860, :1077 | src/engine/reconcile/skipNotice.ts:68, :76; src/engine/reconcile/reconciler.ts:216-218 | implemented (c5ca263) |
 | Engine warnings (too large, no attachment storage, read failed, invalid canvas) | various | src/host/pluginController.ts:59 (every warn and error notice is shown); src/engine/reconcile/blobJobs.ts:154 (too large; there is no attachment-storage warning, see §8); src/engine/reconcile/scan.ts:129; src/engine/reconcile/canvasJob.ts:39 | ported |
@@ -244,7 +244,7 @@ src/host/ui/api.ts:66-75. The settings sync fields are in §1 and the exclude fi
 | `externalEditPolicy` ("Edits from other apps": always, closed-only, never) | adfa7a7:src/settings/settingsStore.ts:136; adfa7a7:src/settings/settingsTab.ts:488-492 (options at :138-142) | MISSING | dropped: DESIGN §m.2 (externalEditPolicy) |
 | `enableAttachmentSync` ("Sync attachments", default on) | adfa7a7:src/settings/settingsStore.ts:137; adfa7a7:src/settings/settingsTab.ts:416-421 | src/host/ui/api.ts:68; src/host/ui/settingsTab.ts:217 | ported |
 | `attachmentSyncExplicitlyConfigured` and its migration | adfa7a7:src/settings/settingsStore.ts:138, :286-292 | MISSING | dropped: legacy settings migration (zero users) |
-| Attachment size limit: field text and effective cap (wave 2) | adfa7a7:src/settings/settingsTab.ts:422-441: number field "Maximum attachment size in kilobytes", text "Attachments larger than this are skipped. Maximum N KB.", min 1, max N, and validation that rejects values above N ("Enter N or less."). N is `attachmentSizeCapKB(serverMaxBlobUploadBytes)` (adfa7a7:src/settings/settingsStore.ts:14-23): min(10240, floor(server max upload bytes / 1024)), or 10240 KB (`MAX_ATTACHMENT_SIZE_KB`, :12) when the server reports no cap. Default 10240 KB (:139). Shown only when the server has attachment storage and sync attachments is on. | src/host/ui/settingsTab.ts:221-232 ("Maximum attachment size (MB)", min 1, max and validation `attachmentLimitMb(status)`, src/host/ui/settingsModel.ts:53-56: the open vault's limit in whole MB, rounded down, or 93 MB (what fits `MAX_BLOB_UPLOAD_BYTES` = 100 MB once sealed, src/core/limits.ts) until one is known; values above it are rejected ("Enter a whole number of MB from 1 to N.", src/host/ui/settingsModel.ts:108-110, :130); shown while "Sync attachments" is on); default `MAX_ATTACHMENT_BYTES_LIMIT` = 1 GiB (src/host/ui/api.ts:54, :70), so the effective cap is the server's until the user lowers it, and choosing the maximum stores the default again (src/host/ui/settingsModel.ts:164-167); src/host/ui/settingsModel.ts:59-64 (the text "Larger attachments stay on this device." adds "This server accepts attachments up to N MB." once the status carries the limit, rounded down); src/protocol/status.ts:61 (`StatusSnapshot.maxBlobBytes`, null until a vault is open), set at src/engine/compose/vaultRuntime.ts:650 and src/engine/compose/statusMerge.ts:65 from src/engine/blobs/blobQueue.ts:220-222 (the server's `maxBlobUploadBytes`, src/engine/adapters/httpBlob.ts:508-510, sealed under suite 1; `MAX_BLOB_UPLOAD_BYTES` when the probe fails, :327 via src/engine/adapters/webEngine.ts:49; 0 without a blob store, and the text then names no server limit); the effective cap is min(setting, store limit), src/engine/reconcile/localState.ts:82 | implemented (0d0ff69; the cap follows the server, client-remake-cap). Same as legacy: the field's maximum is the server's limit and values above it are rejected. Differences: MB, not KB; the default follows the server (legacy defaulted to 10240 KB); before a vault reports its limit the maximum is 93 MB, not the legacy 10240 KB |
+| Attachment size limit: field text and effective cap (wave 2) | adfa7a7:src/settings/settingsTab.ts:422-441: number field "Maximum attachment size in kilobytes", text "Attachments larger than this are skipped. Maximum N KB.", min 1, max N, and validation that rejects values above N ("Enter N or less."). N is `attachmentSizeCapKB(serverMaxBlobUploadBytes)` (adfa7a7:src/settings/settingsStore.ts:14-23): min(10240, floor(server max upload bytes / 1024)), or 10240 KB (`MAX_ATTACHMENT_SIZE_KB`, :12) when the server reports no cap. Default 10240 KB (:139). Shown only when the server has attachment storage and sync attachments is on. | src/host/ui/settingsTab.ts:221-232 ("Maximum attachment size (MB)", min 1, max and validation `attachmentLimitMb(status)`, src/host/ui/settingsModel.ts:53-56: the open vault's limit in whole MB, rounded down, or 93 MB (what fits `MAX_BLOB_UPLOAD_BYTES` = 100 MB once sealed, src/core/limits.ts) until one is known; values above it are rejected ("Enter a whole number of MB from 1 to N.", src/host/ui/settingsModel.ts:108-110, :130); shown while "Sync attachments" is on); default `MAX_ATTACHMENT_BYTES_LIMIT` = 1 GiB (src/host/ui/api.ts:54, :70), so the effective cap is the server's until the user lowers it, and choosing the maximum stores the default again (src/host/ui/settingsModel.ts:164-167); src/host/ui/settingsModel.ts:59-64 (the text "Larger attachments stay on this device." adds "This server accepts attachments up to N MB." once the status carries the limit, rounded down); src/protocol/status.ts:85 (`StatusSnapshot.maxBlobBytes`, null until a vault is open), set at src/engine/compose/vaultRuntime.ts:652 and src/engine/compose/statusMerge.ts:65 from src/engine/blobs/blobQueue.ts:220-222 (the server's `maxBlobUploadBytes`, src/engine/adapters/httpBlob.ts:508-510, sealed under suite 1; `MAX_BLOB_UPLOAD_BYTES` when the probe fails, :327 via src/engine/adapters/webEngine.ts:49; 0 without a blob store, and the text then names no server limit); the effective cap is min(setting, store limit), src/engine/reconcile/localState.ts:82 | implemented (0d0ff69; the cap follows the server, client-remake-cap). Same as legacy: the field's maximum is the server's limit and values above it are rejected. Differences: MB, not KB; the default follows the server (legacy defaulted to 10240 KB); before a vault reports its limit the maximum is 93 MB, not the legacy 10240 KB |
 | `attachmentConcurrency` ("Parallel transfers", 1-5, default 1) | adfa7a7:src/settings/settingsStore.ts:141; adfa7a7:src/settings/settingsTab.ts:442-456 | MISSING (per-device-class byte budget `blobBytesInFlight` 64/32/16/8 MiB, src/core/limits.ts `BUDGETS`) | dropped: attachmentConcurrency setting (fixed per-class budgets, DESIGN §i.2) |
 | `showRemoteCursors` | adfa7a7:src/settings/settingsStore.ts:142; adfa7a7:src/settings/settingsTab.ts:460-470 | MISSING | dropped: DESIGN §m.2 (awareness/cursor presence) |
 | `updateRepoUrl`, `updateRepoBranch` ("Deployment repository URL", "Deployment default branch") | adfa7a7:src/settings/settingsStore.ts:143-144; adfa7a7:src/settings/settingsTab.ts:478-487 | MISSING | dropped: DESIGN §m.2 (plugin install/update flows) |
@@ -288,7 +288,7 @@ verify and restore them. The server never parses them.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Daily snapshot | adfa7a7:src/snapshots/snapshotService.ts:99; adfa7a7:src/main.ts:1514 | src/engine/snapshots/snapshotJob.ts:107; src/engine/compose/vaultRuntime.ts:432 | ported |
+| Daily snapshot | adfa7a7:src/snapshots/snapshotService.ts:99; adfa7a7:src/main.ts:1514 | src/engine/snapshots/snapshotJob.ts:107; src/engine/compose/vaultRuntime.ts:434 | ported |
 | Manual snapshot | adfa7a7:src/snapshots/snapshotService.ts:113 | src/engine/snapshots/snapshotJob.ts:97; src/engine/compose/runtimeOps.ts:96 | ported (the command is in §2) |
 | Snapshot reasons (initial, daily, manual, pre-bulk-operation) | adfa7a7:src/snapshots/recoveryClient.ts:44 | src/protocol/messages.ts:169 (daily, brake, epoch, idb, restore, manual) | implemented (687d5bc) (reasons shown in listings) |
 | Retention | adfa7a7:src/snapshots/recoveryClient.ts:887; adfa7a7:src/snapshots/snapshotService.ts:180 | src/engine/snapshots/snapshotJob.ts:276-286 (keep N dailies and 10 others; uploads: a per-device floor, src/engine/snapshots/remote.ts:62-64); src/host/ui/settingsTab.ts:258 | ported |
@@ -316,7 +316,7 @@ verify and restore them. The server never parses them.
 | Export with file names (opt-in) | adfa7a7:src/telemetry/installTelemetryRuntime.ts:258 | src/engine/compose/diagnosticsBundle.ts:97-99; src/host/ui/commands.ts:71 | implemented (5d42e55) |
 | Recent events in the bundle | adfa7a7:src/telemetry/debug/flightRecorder.ts:79 | src/engine/runtime/context.ts:49 (the whole 2000-event ring) | implemented (5d42e55) |
 | Settings section without secrets | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:143; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:293 | src/host/ui/diagnostics.ts:19-21, :60 | implemented (5d42e55) |
-| Platform information | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:39 | src/protocol/status.ts:25 (device class in the status) | ported (device class, not the OS name) |
+| Platform information | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:39 | src/protocol/status.ts:49 (device class in the status) | ported (device class, not the OS name) |
 | Copy to the clipboard and say where the file is | adfa7a7:src/telemetry/installTelemetryRuntime.ts:194 | src/host/ui/diagnostics.ts:144 | ported |
 | Vault-versus-CRDT comparison | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:77; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:314 | MISSING | dropped: disk-vs-state hash in diagnostics (coordinator decision) |
 | Leak check and content-fingerprint redaction | adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:352, :385 | MISSING | dropped: diagnostics leak check (pseudonymization replaces it) |
@@ -350,7 +350,7 @@ attachment-storage info row is in §3.4.
 | Effective cap is the smaller of the user limit and the server's upload limit | adfa7a7:src/settings/settingsStore.ts:14-23; adfa7a7:src/sync/blobSync.ts:482 | src/engine/reconcile/localState.ts:82; src/engine/adapters/httpBlob.ts:327, :508-509 | ported (the field text is the wave-2 row in §3.5) |
 | Downloaded attachment verified against its hash | adfa7a7:src/sync/blobSync.ts:1494-1505 | src/engine/blobs/blobQueue.ts:584; src/engine/blobs/blobStore.ts:98-100 | ported |
 | Transfer concurrency from the "Parallel transfers" setting | adfa7a7:src/sync/blobSync.ts:481 | src/core/limits.ts `BUDGETS` (`blobBytesInFlight` per device class) | dropped: attachmentConcurrency setting (fixed limits in src/core/limits.ts) |
-| "R2 backend detected" notice, and a daily snapshot when storage appears | adfa7a7:src/runtime/capabilityUpdateService.ts:498-509 | MISSING (a store found on a later connect restarts the runtime silently, src/engine/compose/protocolEngine.ts:527-532) | dropped: user decision 2026-10-07: no capability polling or notices for server metadata; the session loop probes once per live session while no store is set (src/engine/runtime/sessionLoop.ts:160) |
+| "R2 backend detected" notice, and a daily snapshot when storage appears | adfa7a7:src/runtime/capabilityUpdateService.ts:498-509 | MISSING (a store found on a later connect restarts the runtime silently, src/engine/compose/protocolEngine.ts:527-532) | dropped: user decision 2026-10-07: no capability polling or notices for server metadata; the session loop probes once per live session while no store is set (src/engine/runtime/sessionLoop.ts:180) |
 
 Without a blob store the client fails closed: attachments are not synced and the log never carries blob bytes
 (src/engine/blobs/blobQueue.ts:220-221, src/engine/reconcile/localState.ts:87, DESIGN §j.1).
@@ -377,7 +377,7 @@ Without a blob store the client fails closed: attachments are not synced and the
 | Attachment conflict copy is local only (never uploaded) | adfa7a7:src/sync/blobSync.ts:1783-1790 | src/core/plan/planner.ts:393-394, :626-627 (the copy is created and pushed) | dropped: the copy is a normal synced file in the new client (DESIGN §f.7) |
 | Reuse an existing copy with identical content | adfa7a7:src/runtime/reconcile/markdownConflictArtifact.ts:52 | MISSING (identical content makes no copy, src/core/merge/merge.ts:26) | dropped: identical-content conflict copy reuse (coordinator decision) |
 | Conflict notice, throttled, with the suppressed count | adfa7a7:src/runtime/reconciliationController.ts:2701-2714; adfa7a7:src/sync/blobSync.ts:1827-1830 | src/engine/reconcile/context.ts:247-254; src/engine/reconcile/reconciler.ts:215 | implemented (2d6bac5) |
-| Count of conflict copies today | adfa7a7:src/runtime/reconciliationController.ts:2704 (only a per-notice suppressed count) | src/engine/compose/localDayCounter.ts:14; src/engine/compose/vaultRuntime.ts:649; src/protocol/status.ts:48 | implemented (0db3bb7) |
+| Count of conflict copies today | adfa7a7:src/runtime/reconciliationController.ts:2704 (only a per-notice suppressed count) | src/engine/compose/localDayCounter.ts:14; src/engine/compose/vaultRuntime.ts:651; src/protocol/status.ts:72 | implemented (0db3bb7) |
 
 New only: more than 200 conflict copies in one pass hold the changes for review (src/core/limits.ts:148,
 DESIGN §f.5), and a multi-step copy is resumed after a crash from its intent record (DESIGN §f.7).
@@ -429,7 +429,7 @@ New only:
 | Fetch a release manifest (latest server and plugin versions) | adfa7a7:src/update/updateManifest.ts:3, :14, :27; adfa7a7:src/runtime/capabilityUpdateService.ts:584-590 | MISSING | dropped: DESIGN §m.2 (plugin install/update flows) |
 | "Server update available" notices | adfa7a7:src/runtime/capabilityUpdateService.ts:625-640 | MISSING | dropped: DESIGN §m.2 (plugin install/update flows) |
 | Updates group in settings (versions, refresh, open update action, initialize updater) | adfa7a7:src/settings/settingsTab.ts:310-335 | MISSING | dropped: DESIGN §m.2 (plugin install/update flows) |
-| Compatibility guard when the server's protocol or formats differ | adfa7a7:src/runtime/capabilityUpdateService.ts:308-315, :622 | src/engine/runtime/relayPolicy.ts:59 (`upgrade-required`, no retry); src/host/ui/statusBar.ts:154-158 | ported |
+| Compatibility guard when the server's protocol or formats differ | adfa7a7:src/runtime/capabilityUpdateService.ts:308-315, :622 | src/engine/runtime/relayPolicy.ts:59 (`upgrade-required`, no retry); src/host/ui/statusBar.ts:154-161 | ported |
 
 ## 15. Telemetry and observability
 
@@ -438,7 +438,7 @@ New only:
 | Flight recorder files under `plugins/yaos/flight-logs` (10 MB files, 100 MB total, 7 days) | adfa7a7:src/telemetry/debug/flightRecorder.ts:22-24, :79, :526 | MISSING (an in-memory ring of 2000 events, src/engine/runtime/context.ts:49) | dropped: DESIGN §m.2 (telemetry and observability) |
 | Trace controller, and fetching the server's recent trace (`/debug/recent`) | adfa7a7:src/telemetry/debug/flightTraceController.ts:147, :757-766 | MISSING | dropped: DESIGN §m.2 (telemetry and observability) |
 | Trace ids appended to server requests | adfa7a7:src/observability/traceContext.ts:9, :37 | MISSING | dropped: DESIGN §m.2 (telemetry and observability) |
-| Product event taxonomy | adfa7a7:src/observability/productEventKinds.ts:26 | MISSING (diagnostic events in the ring, src/protocol/status.ts:100-121) | dropped: DESIGN §m.2 (telemetry and observability) |
+| Product event taxonomy | adfa7a7:src/observability/productEventKinds.ts:26 | MISSING (diagnostic events in the ring, src/protocol/status.ts:124-145) | dropped: DESIGN §m.2 (telemetry and observability) |
 | QA debug port for the test harness | adfa7a7:src/telemetry/debug/ports/yaosDebugPort.ts:38; adfa7a7:src/main.ts:694 | MISSING | dropped: the QA harness was deleted (f451274) |
 
 Nothing leaves the device in the new client: the diagnostics file (§6) is the only export.
@@ -447,10 +447,10 @@ Nothing leaves the device in the new client: the diagnostics file (§6) is the o
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Hidden app: flush writes, mark the socket as background | adfa7a7:src/runtime/connectionController.ts:291-301 | src/host/platform.ts:89-91; src/engine/compose/vaultRuntime.ts:567-576 | implemented (4a14c02) |
-| Mobile in the background: optional work paused, documents released | adfa7a7:src/runtime/residencyAdmissionCoordinator.ts:241-243, :502, :533-535 | src/engine/compose/vaultRuntime.ts:97, :574-585 (phone and constrained close the socket after 30 s hidden) | implemented (4a14c02) (DESIGN §i.4) |
-| Visible again: reconnect and catch up | adfa7a7:src/runtime/connectionController.ts:303-312 | src/host/platform.ts:89, :92; src/engine/compose/vaultRuntime.ts:588-595 | implemented (4a14c02) |
-| Network online and offline events | adfa7a7:src/runtime/connectionController.ts:327-345 | src/host/platform.ts:93-94; src/engine/compose/vaultRuntime.ts:596-603 | implemented (4a14c02) |
+| Hidden app: flush writes, mark the socket as background | adfa7a7:src/runtime/connectionController.ts:291-301 | src/host/platform.ts:89-91; src/engine/compose/vaultRuntime.ts:569-578 | implemented (4a14c02) |
+| Mobile in the background: optional work paused, documents released | adfa7a7:src/runtime/residencyAdmissionCoordinator.ts:241-243, :502, :533-535 | src/engine/compose/vaultRuntime.ts:97, :576-587 (phone and constrained close the socket after 30 s hidden) | implemented (4a14c02) (DESIGN §i.4) |
+| Visible again: reconnect and catch up | adfa7a7:src/runtime/connectionController.ts:303-312 | src/host/platform.ts:89, :92; src/engine/compose/vaultRuntime.ts:590-597 | implemented (4a14c02) |
+| Network online and offline events | adfa7a7:src/runtime/connectionController.ts:327-345 | src/host/platform.ts:93-94; src/engine/compose/vaultRuntime.ts:598-605 | implemented (4a14c02) |
 | Platform split (desktop or mobile) | adfa7a7:src/main.ts:1250-1254; adfa7a7:src/runtime/residencyAdmissionCoordinator.ts:4 | src/host/runtimeSupport.ts:20-24 (desktop, tablet, phone, constrained); src/core/limits.ts:251-276 (budgets per class) | ported (DESIGN §i.2) |
 | Default device name from the platform (iPhone, iPad, Android, ...) | adfa7a7:src/utils/defaultDeviceName.ts:12-19 | src/host/ui/deviceName.ts:17-19; src/host/plugin.ts:86 | ported |
 
@@ -460,7 +460,7 @@ The desktop-only plugin hold on mobile is a settings sync row in §1.
 
 The legacy stylesheet (adfa7a7:styles.css, 163 lines) was deleted in f451274. The new UI uses Obsidian's own classes
 (`mod-cta`, `mod-warning`, `mod-clickable`, Setting rows). It still sets a few `yaos-*` class names
-(src/host/ui/statusBar.ts:224, :255; src/host/ui/pairModal.ts:100, :228; src/host/ui/qr.ts:11-12; src/host/ui/brakeModal.ts:26, :33),
+(src/host/ui/statusBar.ts:228, :259; src/host/ui/pairModal.ts:100, :228; src/host/ui/qr.ts:11-12; src/host/ui/brakeModal.ts:26, :33),
 but no stylesheet styles them.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |

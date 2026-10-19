@@ -281,3 +281,46 @@ test("gate: §14.3 stale-epoch from the header before opening: rows stale, check
 	await gate(c, { t: "row", stream: "k" as StreamName, seq: 11, deviceId: DEV, clientFrameId: CF, payload: under(2) });
 	assert.deepEqual(calls, [], "suite-0 bytes (keyEpoch 0) and k rows are never asked");
 });
+
+test("gate: a newer writer (GateFail.newer, upgrade-required) vs a missing key or `k` (wait) vs bad bytes (DESIGN §d.6)", async () => {
+	const verdict = (r: GateResult) => (r.ok ? r.t : `${r.reason}/${r.readerDependent ? (r.newer ? "newer" : "wait") : "det"}`);
+	const nsState = encodeNsFoldV1(newNsFoldState());
+	const ckAt = async (stream: StreamName, encoding: number, foldRulesVersion: number, state: Uint8Array, c: GateCtx = ctx) => {
+		// The encoder refuses unknown encodings: encode a known one and set the byte.
+		const content = encodeCheckpointContent({ encoding: CheckpointEncoding.nsFoldV1, coversSeq: 0, foldRulesVersion, state });
+		content[0] = encoding;
+		return gate(c, { t: "checkpoint", stream, coversSeq: 0, payload: await sealCheckpoint(crypto, ctx.vaultId, stream, 0, content, 0) });
+	};
+	// Newer fold rules, per fold; a reader that implements them (knownRules) adopts the same bytes.
+	assert.equal(verdict(await ckAt(NS_STREAM, CheckpointEncoding.nsFoldV1, FOLD_RULES_VERSION + 1, nsState)), "envelope-version/newer");
+	assert.equal(verdict(await ckAt(CFG_STREAM, CheckpointEncoding.cfgFoldV1, CFG_FOLD_RULES_VERSION + 1, encodeCfgFoldV1(newCfgFoldState()))), "envelope-version/newer");
+	assert.equal(verdict(await ckAt(SNAP_STREAM, CheckpointEncoding.snapFoldV1, SNAP_FOLD_RULES_VERSION + 1, encodeSnapFoldV1(newSnapFold()))), "envelope-version/newer");
+	const upgraded: GateCtx = { ...ctx, knownRules: { ns: FOLD_RULES_VERSION + 1, cfg: CFG_FOLD_RULES_VERSION + 1, snap: SNAP_FOLD_RULES_VERSION + 1 } };
+	const v2 = decodeNsFoldV1(nsState)!;
+	v2.foldRulesVersion = FOLD_RULES_VERSION + 1;
+	assert.equal(verdict(await ckAt(NS_STREAM, CheckpointEncoding.nsFoldV1, FOLD_RULES_VERSION + 1, encodeNsFoldV1(v2), upgraded)), "checkpoint");
+	assert.equal(verdict(await ckAt(CFG_STREAM, CheckpointEncoding.cfgFoldV1, CFG_FOLD_RULES_VERSION + 1, encodeCfgFoldV1(newCfgFoldState()), upgraded)), "checkpoint");
+	assert.equal(verdict(await ckAt(SNAP_STREAM, CheckpointEncoding.snapFoldV1, SNAP_FOLD_RULES_VERSION + 1, encodeSnapFoldV1(newSnapFold()), upgraded)), "checkpoint");
+	// A checkpoint encoding above the known ones, or a fold state formatVersion above 1: a newer format.
+	assert.equal(verdict(await ckAt(NS_STREAM, Math.max(...Object.values(CheckpointEncoding)) + 1, FOLD_RULES_VERSION, nsState)), "envelope-version/newer");
+	assert.equal(verdict(await ckAt(NS_STREAM, CheckpointEncoding.nsFoldV1, FOLD_RULES_VERSION, new Uint8Array([2, ...nsState.subarray(1)]))), "envelope-version/newer");
+	assert.equal(verdict(await ckAt(CFG_STREAM, CheckpointEncoding.cfgFoldV1, CFG_FOLD_RULES_VERSION, new Uint8Array([2, 0]))), "envelope-version/newer");
+	assert.equal(verdict(await ckAt(SNAP_STREAM, CheckpointEncoding.snapFoldV1, SNAP_FOLD_RULES_VERSION, new Uint8Array([2, 0]))), "envelope-version/newer");
+	// Same version, bad bytes: deterministic (a disputed checkpoint). Encoding 0, a wrong-class encoding, junk state.
+	assert.equal(verdict(await ckAt(NS_STREAM, 0, FOLD_RULES_VERSION, nsState)), "decode-failed/det");
+	assert.equal(verdict(await ckAt(CFG_STREAM, CheckpointEncoding.nsFoldV1, CFG_FOLD_RULES_VERSION, new Uint8Array([2, 0]))), "kind-not-allowed/det", "a wrong-class encoding is not read as newer");
+	assert.equal(verdict(await ckAt(NS_STREAM, CheckpointEncoding.nsFoldV1, FOLD_RULES_VERSION, new Uint8Array([1, 9, 9]))), "decode-failed/det");
+	assert.equal(verdict(await ckAt(CFG_STREAM, CheckpointEncoding.cfgFoldV1, 0, encodeCfgFoldV1(newCfgFoldState()))), "checkpoint-invariant/det", "no cfg rules 0");
+	// Envelope stage: a formatVersion or suite byte this build does not know is newer; a known suite this port
+	// cannot open, an unknown key or a `k` not judged yet waits.
+	const sealed = (await sealFrame(crypto, ctx.vaultId, { stream: NS_STREAM, deviceId: DEV, clientFrameId: CF, kind: "nsOps", authorNsSeq: 0, flags: 0, frameNo: 1, content: new Uint8Array([1]) })).sealed;
+	const atRow = (payload: Uint8Array, c: GateCtx = ctx) => gate(c, { t: "row", stream: NS_STREAM, seq: 1, deviceId: DEV, clientFrameId: CF, payload });
+	assert.equal(verdict(await atRow(new Uint8Array([2, ...sealed.subarray(1)]))), "envelope-version/newer");
+	assert.equal(verdict(await atRow(encodeOuter({ formatVersion: 1, suite: 7 as never, keyEpoch: 1 }, new Uint8Array(48)))), "crypto-unknown-key/newer", "an unknown suite byte");
+	assert.equal(verdict(await atRow(encodeOuter({ formatVersion: 1, suite: 1, keyEpoch: 1 }, new Uint8Array(48)))), "crypto-unknown-key/wait", "suite 1 to a suite-0 port: a pin or key");
+	const fc = faultyCrypto();
+	fc.failOpen = true;
+	assert.equal(verdict(await atRow(sealed, { ...ctx, crypto: fc })), "crypto-unknown-key/wait");
+	assert.equal(verdict(await atRow(encodeOuter({ formatVersion: 1, suite: 1, keyEpoch: 9 }, new Uint8Array(48)), { ...ctx, staleCheck: () => "hold" })), "keyring-hold/wait");
+	assert.equal(verdict(await atRow(new Uint8Array([1, 0]))), "envelope-malformed/det");
+});

@@ -99,7 +99,7 @@ export class LogEngine {
 		c.repo = repo;
 		c.daily = { ...repo.dailyAtOpen }; // the daily soft budget (§i.6) counts across restarts
 		c.keyring = await KeyringRuntime.open(c, opts.e2ee);
-		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus);
+		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus, c.tuning.knownRules.ns);
 		c.cfg = new CfgRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.ns.frameNoFloor = repo.frameNoFloor.ns;
 		c.cfg.frameNoFloor = repo.frameNoFloor.cfg;
@@ -387,7 +387,7 @@ export class LogEngine {
 		if (c.outbox.unreceipted() > 0) return false;
 		for (const r of c.outbox.values()) if (r.state === "held") return false;
 		const onlyK = c.keyring.readsOnlyK();
-		for (const r of c.repo.streams()) if (r.stale && r.cls !== "other" && (!onlyK || r.cls === "keyring") && !(r.frozen && r.frozenReason === "checkpoint-disputed")) return false;
+		for (const r of c.repo.streams()) if (r.stale && r.cls !== "other" && (!onlyK || r.cls === "keyring") && !(r.frozen && r.frozenReason === "checkpoint-disputed") && !c.sess.isHeld(r.stream)) return false;
 		return c.repo.cursor.headSeqSeen <= c.repo.cursor.vaultSeq;
 	}
 
