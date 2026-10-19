@@ -437,6 +437,32 @@ export class SessionLoop {
 		});
 	}
 
+	/** ns, cfg and snap streams not read to head (rows or checkpoints waiting for a key, a gap). */
+	staleFolds(): StreamName[] {
+		return [NS_STREAM, CFG_STREAM, SNAP_STREAM].filter((s) => this.c.repo.stream(s)?.stale);
+	}
+
+	/**
+	 * The write gate opened on a caught-up session (key-missing, e2ee-design §9.3) with folds still stale: their
+	 * rows and checkpoints that waited for the key are read before the phase turns live, as at session start. Live
+	 * tells the host the namespace is caught up: onboarding plans against that fold, and the first frameNo
+	 * allocation takes the own replay edge R from it (§8.2).
+	 */
+	async afterGateOpen(): Promise<void> {
+		const c = this.c;
+		const gen = c.gen;
+		c.setPhase("catching-up");
+		try {
+			await this.readInOrder(this.staleFolds());
+			if (gen !== c.gen) return;
+			await c.refold(false);
+		} catch (e) {
+			c.diag("gate-open-read-failed", { error: String(e) });
+		}
+		if (gen !== c.gen || c.phase !== "catching-up") return;
+		c.setPhase(c.livePhase());
+	}
+
 	/** Reads `streams` one after another (session start: ns, cfg); batched into one request when possible. */
 	private async readInOrder(streams: readonly StreamName[]): Promise<void> {
 		const s = this.c.session;

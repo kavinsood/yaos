@@ -274,6 +274,10 @@ export class EngineCtx {
 	 */
 	refreshLivePhase(): void {
 		const p = this.phase;
+		if (p === "key-missing" && this.session && this.gate() === null && this.sess.staleFolds().length > 0) {
+			void this.sess.afterGateOpen();
+			return;
+		}
 		if (p === "live" || p === "daily-limit" || p === "key-missing" || (p === "upgrade-required" && this.session)) this.setPhase(this.livePhase());
 	}
 

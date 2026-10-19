@@ -8,8 +8,11 @@
  * reconcileHeld() is state-based so it is crash-safe: a held record whose
  * dependency record is gone is released when the fold has its doc (live /
  * deleted), deleted when the doc was merged away, and waits while the doc is
- * absent (create not folded yet). A live create's body frames (pending / sent,
- * dependsOn = the create, DESIGN §e.1) are deleted once their create folded
+ * absent and the create is not folded yet (in the outbox, or receipted with
+ * its row not folded), and is deleted when the create folded without its doc
+ * (the fold ignored the frame: replay-stale, duplicate-frame, stale-epoch).
+ * A live create's body frames (pending / sent, dependsOn = the create,
+ * DESIGN §e.1) are deleted once their create folded
  * merged away; the ones the relay already committed are junk rows on the
  * loser's stream, which nobody materializes (§d.4). Otherwise they stay
  * pending, like released held frames.
@@ -149,7 +152,12 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 				continue;
 			}
 			const e = this.state.entries.get(docId);
-			if (!e) continue; // create not folded yet (or still stale): wait
+			if (!e) {
+				// Create not folded yet (or still stale): wait. Folded without the doc (the fold ignored the frame, e.g.
+				// replay-stale after a lost store reused its frameNo): the doc never exists, so its frames are junk.
+				if (!dep && !this.committedPending(r.dependsOn) && !this.halted) changes.push({ t: "delete", clientFrameId: r.clientFrameId });
+				continue;
+			}
 			if (e.state === "merged") {
 				changes.push({ t: "delete", clientFrameId: r.clientFrameId });
 				continue;
