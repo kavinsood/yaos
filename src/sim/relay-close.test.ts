@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { DeviceId, StreamName } from "../core/types";
+import { encodeAppend } from "../engine/adapters/relayFrames";
 import { VirtualClock } from "./clock";
 import { SimRelay } from "./relay";
 import { connectPeer, connectRaw, frame, pump, trace } from "./a-relay-testkit";
@@ -21,7 +22,9 @@ test("relay close: payload > maxFrameBytes -> 1009; raw message > max+1024 -> 10
 	for (const [stream, id, size, code] of cases) {
 		const p = await connectPeer(relay, clock, "A");
 		p.session.append(frame("ns", "ok", 100));
-		p.session.append(frame(stream, id, size));
+		// wsRelay throws on a payload over maxFrameBytes before sending; the relay's own check needs a raw message.
+		if (size > 100) assert.throws(() => p.session.append(frame(stream, id, size)), RangeError);
+		p.session.sendRawBinary(encodeAppend(frame(stream, id, size)));
 		p.session.append(frame("ns", "after", 1)); // the socket is closed: dropped
 		await clock.runUntilIdle();
 		assert.deepEqual(trace(p.events), [`closed ${code}`], `${stream.length}/${id.length}/${size}`);

@@ -57,7 +57,7 @@ export interface RelayLimits {
 	/** maxPayloadBytes (1 MiB): the sealed envelope must fit. */
 	readonly maxFrameBytes: number;
 	readonly maxCheckpointBytes: number;
-	/** Per-socket token bucket (rateBytesPerSec / burstBytes); overdraft closes 1013. */
+	/** Per-device token bucket shared by its sockets (rateBytesPerSec / burstBytes); overdraft closes 1013. */
 	readonly appendBytesPerSec: number;
 	readonly burstBytes: number;
 	/** Streams per feed() page. */

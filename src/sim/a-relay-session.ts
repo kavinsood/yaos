@@ -6,13 +6,17 @@
  * Uplink and downlink are FIFO timed queues with per-message jitter.
  */
 
-import type { DeviceId, Seq, StreamName, VaultEpoch } from "../core/types";
+import type { ClientFrameId, DeviceId, Seq, StreamName, VaultEpoch } from "../core/types";
 import type { ClockPort } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
 import type { AppendFrame, FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayEvent, RelayLimits, RelaySession } from "../ports/relay";
-import { utf8ByteLength } from "../core/codec/lib0";
+import { decodeServerFrame, encodeAppend, encodePing, encodeServerFrame, encodeSubscribe } from "../engine/adapters/relayFrames";
+import { READ_BATCH_MAX_QUERY_CHARS } from "../engine/adapters/relayHttp";
 import { TimedQueue } from "./a-relay-link";
-import { appendMessageBytes, heldKey, type DownMsg, type LinkSpec, type UpMsg } from "./a-relay-util";
+import { heldKey, type DownMsg, type LinkSpec, type UpMsg } from "./a-relay-util";
+
+/** A server binary frame on the downlink, encoded with the wire codec (relayFrames) and decoded on receipt, like wsRelay. */
+type WireDown = DownMsg | { readonly k: "binary"; readonly wire: Uint8Array };
 
 export interface SessionHost {
 	readonly clock: ClockPort;
@@ -27,9 +31,8 @@ export interface SessionHost {
 	listenerError(error: unknown): void;
 }
 
+/** Per-socket admission state: refused once the socket was closed for size or rate (tokens live in the device's bucket). */
 export interface RateGate {
-	tokens: number;
-	at: number;
 	refused: boolean;
 }
 
@@ -58,7 +61,7 @@ export class SimRelaySession implements RelaySession {
 	private readonly probes = new Map<string, { resolve(headSeq: Seq): void; reject(error: Error): void }>();
 	private probeCounter = 0;
 	private readonly up: TimedQueue<UpMsg>;
-	private readonly down: TimedQueue<DownMsg>;
+	private readonly down: TimedQueue<WireDown>;
 	/** Every RelayEvent produced, in order (introspection; includes buffered ones). */
 	readonly log: RelayEvent[] = [];
 
@@ -93,12 +96,23 @@ export class SimRelaySession implements RelaySession {
 	// ---- RelaySession -------------------------------------------------------
 
 	append(frame: AppendFrame): void {
+		// wsRelay: an oversize payload is a caller bug, thrown before anything is sent (even on a closed session).
+		if (frame.payload.byteLength > this.limits.maxFrameBytes) {
+			throw new RangeError(`relay append: payload ${frame.payload.byteLength} B exceeds maxFrameBytes ${this.limits.maxFrameBytes}`);
+		}
 		if (this.ended) return;
-		const copy: AppendFrame = { stream: frame.stream, clientFrameId: frame.clientFrameId, payload: frame.payload.slice() };
-		const bytes = appendMessageBytes(copy);
+		const wire = encodeAppend(frame);
+		const bytes = wire.byteLength;
 		this.inFlightBytes += bytes;
 		const rate = this.link.uplinkBytesPerSec ?? 0;
-		this.up.push(this.delay(this.link.uplinkMs), { k: "append", frame: copy, bytes }, rate > 0 ? (bytes * 1000) / rate : 0);
+		this.up.push(this.delay(this.link.uplinkMs), { k: "append", wire, bytes }, rate > 0 ? (bytes * 1000) / rate : 0);
+	}
+
+	/** Test hook (a buggy or hostile client): one raw binary message on the uplink, without append()'s size check. */
+	sendRawBinary(wire: Uint8Array): void {
+		if (this.ended) return;
+		this.inFlightBytes += wire.byteLength;
+		this.up.push(this.delay(this.link.uplinkMs), { k: "append", wire: wire.slice(), bytes: wire.byteLength });
 	}
 
 	/** STREAM_SUBSCRIBE on the uplink (in order with appends). */
@@ -112,7 +126,8 @@ export class SimRelaySession implements RelaySession {
 	private sendSubscription(): void {
 		if (this.ended || this.subscription === null) return;
 		const streams = this.subscription;
-		const bytes = utf8ByteLength(`__YPS:${JSON.stringify({ type: "STREAM_SUBSCRIBE", streams })}`);
+		// Text frames are charged in UTF-16 units (server charge()).
+		const bytes = encodeSubscribe(streams).length;
 		this.up.push(this.delay(this.link.uplinkMs), { k: "subscribe", streams, bytes });
 	}
 
@@ -138,7 +153,17 @@ export class SimRelaySession implements RelaySession {
 		const first = reqs[0];
 		if (first === undefined) throw new RangeError("readBatch: no requests");
 		if (reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
-		return this.host.readBatch(this, reqs.slice(0, this.limits.readBatchStreams));
+		// relayHttp.readBatch: at most readBatchStreams entries, and only those that fit the URL query budget.
+		const capped = reqs.slice(0, this.limits.readBatchStreams);
+		let q = `maxBytes=${this.limits.readPageBytes}`.length;
+		let sent = 0;
+		for (const r of capped) {
+			const entry = `r=${r.afterSeq}.${r.preferCheckpoint ? 1 : 0}.${encodeURIComponent(r.stream)}`;
+			if (sent > 0 && q + entry.length + 1 > READ_BATCH_MAX_QUERY_CHARS) break;
+			q += entry.length + 1;
+			sent++;
+		}
+		return this.host.readBatch(this, capped.slice(0, sent));
 	}
 
 	putCheckpoint(stream: StreamName, coversSeq: Seq, expectedPrevCoversSeq: Seq, bytes: Uint8Array): Promise<PutCheckpointResult> {
@@ -168,7 +193,7 @@ export class SimRelaySession implements RelaySession {
 		const probeId = `p${++this.probeCounter}`;
 		return new Promise((resolve, reject) => {
 			this.probes.set(probeId, { resolve: (headSeq) => resolve({ headSeq }), reject });
-			this.up.push(this.delay(this.link.uplinkMs), { k: "ping", probeId });
+			this.up.push(this.delay(this.link.uplinkMs), { k: "ping", probeId, bytes: encodePing(probeId).length });
 		});
 	}
 
@@ -199,7 +224,7 @@ export class SimRelaySession implements RelaySession {
 	/** Queues a server message on the downlink (dropped once the server closed the socket). */
 	send(msg: DownMsg): void {
 		if (!this.srvOpen) return;
-		this.down.push(this.delay(this.link.downlinkMs), msg);
+		this.down.push(this.delay(this.link.downlinkMs), toWire(msg));
 	}
 
 	/**
@@ -229,8 +254,10 @@ export class SimRelaySession implements RelaySession {
 
 	// ---- adapter: wire -> RelayEvent -------------------------------------------
 
-	private receive(msg: DownMsg): void {
+	private receive(raw: WireDown): void {
 		if (this.ended) return;
+		const msg = raw.k === "binary" ? fromWire(raw.wire) : raw;
+		if (msg === null) return; // wsRelay ignores a frame it cannot decode
 		switch (msg.k) {
 			case "provisional":
 				this.held.set(heldKey(msg.stream, msg.deviceId, msg.clientFrameId), msg.payload);
@@ -334,4 +361,25 @@ export class SimRelaySession implements RelaySession {
 			this.host.listenerError(error);
 		}
 	}
+}
+
+/** Binary server frames (PROVISIONAL / COMMITTED / COMMIT_NOTICE / STREAM_SKIPPED) go through the wire codec. */
+function toWire(msg: DownMsg): WireDown {
+	switch (msg.k) {
+		case "provisional": return { k: "binary", wire: encodeServerFrame({ kind: "provisional", stream: msg.stream, deviceId: msg.deviceId, clientFrameId: msg.clientFrameId, payload: msg.payload }) };
+		case "committed": return { k: "binary", wire: encodeServerFrame({ kind: "committed", seq: msg.seq, stream: msg.stream, deviceId: msg.deviceId, clientFrameId: msg.clientFrameId, payload: msg.payload }) };
+		case "notice": return { k: "binary", wire: encodeServerFrame({ kind: "notice", seq: msg.seq, stream: msg.stream, deviceId: msg.deviceId, clientFrameId: msg.clientFrameId }) };
+		case "skipped": return { k: "binary", wire: encodeServerFrame({ kind: "skipped", rows: msg.rows }) };
+		default: return msg;
+	}
+}
+
+function fromWire(wire: Uint8Array): DownMsg | null {
+	const f = decodeServerFrame(wire);
+	if (f === null) return null;
+	if (f.kind === "skipped") return { k: "skipped", rows: f.rows.map((r) => ({ stream: r.stream as StreamName, seq: r.seq })) };
+	const id = { stream: f.stream as StreamName, deviceId: f.deviceId as DeviceId, clientFrameId: f.clientFrameId as ClientFrameId };
+	if (f.kind === "provisional") return { k: "provisional", ...id, payload: f.payload };
+	if (f.kind === "committed") return { k: "committed", ...id, seq: f.seq, payload: f.payload };
+	return { k: "notice", ...id, seq: f.seq };
 }
