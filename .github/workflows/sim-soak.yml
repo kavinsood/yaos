@@ -1,0 +1,44 @@
+name: Sim soak
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Soak time budget (minutes)"
+        required: false
+        default: "60"
+      master_seed:
+        description: "Master seed (empty: random; the log prints it)"
+        required: false
+        default: ""
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Soak
+        env:
+          YAOS_SOAK_MINUTES: ${{ inputs.minutes || '60' }}
+          YAOS_SOAK_MASTER_SEED: ${{ inputs.master_seed || '' }}
+        run: npm run sim:soak -- --out sim-failures
+
+      - name: Upload failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures-${{ github.run_id }}
+          path: sim-failures/
+          if-no-files-found: ignore
+          retention-days: 30
