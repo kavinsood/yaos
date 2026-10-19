@@ -86,8 +86,16 @@ class DroppableSession implements RelaySession {
 	bufferedBytes(): number { return this.dead ? 0 : this.inner.bufferedBytes(); }
 	subscribe(streams: Parameters<RelaySession["subscribe"]>[0]): void { if (!this.dead) this.inner.subscribe(streams); }
 	feed(afterSeq: Parameters<RelaySession["feed"]>[0]) { return this.dead ? Promise.reject(netError("feed")) : this.inner.feed(afterSeq); }
-	read(...a: Parameters<RelaySession["read"]>) { return this.dead ? Promise.reject(netError("read")) : this.inner.read(...a); }
-	readBatch(...a: Parameters<RelaySession["readBatch"]>) { return this.dead ? Promise.reject(netError("read")) : this.inner.readBatch(...a); }
+	read(...a: Parameters<RelaySession["read"]>) {
+		if (this.dead) return Promise.reject(netError("read"));
+		const t = performance.now();
+		return this.inner.read(...a).then((p) => (this.tap?.read?.([a[0]], t, [p]), p));
+	}
+	readBatch(...a: Parameters<RelaySession["readBatch"]>) {
+		if (this.dead) return Promise.reject(netError("read"));
+		const t = performance.now();
+		return this.inner.readBatch(...a).then((ps) => (this.tap?.read?.(a[0].map((r) => r.stream), t, ps), ps));
+	}
 	putCheckpoint(...a: Parameters<RelaySession["putCheckpoint"]>) { return this.dead ? Promise.reject(netError("checkpoint")) : this.inner.putCheckpoint(...a); }
 	ping() { return this.dead ? Promise.reject(netError("ping")) : this.inner.ping(); }
 	onEvent(listener: (e: RelayEvent) => void): Unsubscribe {

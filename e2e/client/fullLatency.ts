@@ -7,11 +7,21 @@
  * edit costs, not where it fell in the relay's 1 s minimum interval (back-to-back edits: the sustained_* series
  * of fullScenarios1.ts).
  *
- * Every sample (one per peer) is split at its critical frame (wireTap.ts breakdown()):
- *   sender   local change -> the APPEND of the last frame the peer needed, on a's socket
- *   relay    that APPEND -> its COMMITTED / COMMIT_NOTICE on the peer (PROVISIONAL for b's open editor)
- *   receiver that arrival -> bytes on the peer's disk (its engine's vault write) or in its open view
- * Metrics: <prefix>_<what>_to_peer_ms and _sender_ms / _relay_ms / _receiver_ms. With e2ee the vault is suite 1
+ * Every sample (one per peer) is split at its critical frame (wireTap.ts breakdown()), by how the frame reached
+ * the peer. The relay pushes b:/c: payloads only for streams in the peer's subscription (bound docs, own outbox,
+ * recently unbound docs; relay-wire §5.6, DESIGN §d.7); every other row comes as STREAM_SKIPPED and the peer reads
+ * it over HTTP once no skip came for settleMs (core/limits SKIP_DEFER), at once when its disk side wants it (a create).
+ *   pushed (a subscribed stream: b's open editor, a recently closed note)
+ *     sender   local change -> the APPEND of the last frame the peer needed, on a's socket
+ *     relay    that APPEND -> its COMMITTED / COMMIT_NOTICE on the peer (PROVISIONAL for b's open editor)
+ *     receiver that arrival -> bytes on the peer's disk (its engine's vault write) or in its open view
+ *   read (a note the peer does not have open: skipped, then read)
+ *     sender   as above
+ *     relay    that APPEND -> the response of the peer's read that covered it, made of
+ *              skip (APPEND -> STREAM_SKIPPED on the peer), defer (-> the read's request), read (request -> response)
+ *     receiver the response -> bytes on the peer's disk
+ * Metrics: <prefix>_<what>_to_peer_ms (every sample), and <prefix>_<what>_to_peer_<path>_ms with _sender_ms /
+ * _relay_ms / _receiver_ms (and for path read _skip_ms / _defer_ms / _quiet_ms / _read_ms). With e2ee the vault is suite 1
  * through the real plugin controller (a enables encryption, b and c install the key by QR, as e2ee.ts); without,
  * suite 0 (the fixture pin).
  *
@@ -24,6 +34,8 @@ import { randomBytes as nodeRandomBytes } from "node:crypto";
 import { makeRecoveryKey } from "../../src/core/codec/testkit/recoveryKey";
 import { YaosController } from "../../src/host/pluginController";
 import { VaultKeyStore } from "../../src/host/keys/secretStore";
+import { SKIP_DEFER } from "../../src/core/limits";
+import { DEFAULT_TUNING } from "../../src/engine/runtime/options";
 import { DEFAULT_ENGINE_SETTINGS, defaultPluginData, type YaosPluginData } from "../../src/host/ui/api";
 import type { UserCommand } from "../../src/protocol/messages";
 import type { Report } from "./engineKit";
@@ -35,6 +47,12 @@ import { recordSample, WireTap } from "./wireTap";
 
 /** Slack on top of quietMs: the relay saw its last commit before any client did, so this only adds idle time. */
 const MARGIN_MS = 100;
+/**
+ * Slack on a read sample's quiet (its stream's last skip -> the read's request) beyond settleMs + maintenanceMs:
+ * timer lateness on a loaded test host. The deferral is checked by the maintenance tick, so an expired one starts
+ * up to one maintenanceMs late.
+ */
+const DEFER_SLACK_MS = 500;
 const NOTE_LINES = (tag: string) => `# ${tag}\n\n${Array.from({ length: 10 }, (_, k) => `line ${k} of ${tag}`).join("\n")}\n`;
 
 export interface LoneOptions {
@@ -286,10 +304,10 @@ export async function lone(R: Report, o: LoneOptions): Promise<void> {
 					frames: tap.timeline(a.name, p.name, t0, at),
 				};
 				during.push(row);
-				const f = row.frames.map((x) => `${x.stream} +${x.append}/${x.receipt ?? "-"}/${x.arrival ?? "-"}`).join(", ");
+				const f = row.frames.map((x) => `${x.stream} +${x.append}/${x.receipt ?? "-"}/${x.path === "read" ? `skip ${x.skip ?? "-"} read ${x.readStart}..` : ""}${x.arrival ?? "-"}`).join(", ");
 				console.log(`  ${o.prefix} ${what} during upload #${k} -> ${p.name}: ${row.ms} ms; a's PUT ${row.putMs} ms (${put.bytes} B), `
 					+ `edit made ${row.putStartToEditMs} ms into it, in flight at arrival: ${row.inFlightAtArrival} (arrival - PUT end: ${row.arrivalMinusPutEndMs} ms); `
-					+ `a's frames append/receipt/on-peer: ${f}; ${p.name}'s GET: ${row.peerGetAfterEditMs ? `+${row.peerGetAfterEditMs.start}..+${row.peerGetAfterEditMs.end}` : "-"}`);
+					+ `a's frames append/receipt/on-peer (read: skip, read request..response): ${f}; ${p.name}'s GET: ${row.peerGetAfterEditMs ? `+${row.peerGetAfterEditMs.start}..+${row.peerGetAfterEditMs.end}` : "-"}`);
 			}
 		};
 		for (let i = 0; i < 2; i++) {
@@ -317,6 +335,23 @@ export async function lone(R: Report, o: LoneOptions): Promise<void> {
 		R.check("lone run converged; every sample split at a critical frame",
 			Object.entries(tap.samples).every(([, rows]) => rows.every((r) => r.split !== null)),
 			Object.fromEntries(Object.entries(tap.samples).map(([k, rows]) => [k, rows.filter((r) => r.split === null).length])));
+		// The open editor gets the typing pushed (b subscribes to its bound doc): live delivery is owed only there.
+		const view = tap.samples[m("typing_view")] ?? [];
+		R.check("b's open editor got every keystroke pushed (subscribed stream)", view.length === 10 && view.every((r) => r.split?.path === "pushed"),
+			view.map((r) => r.split?.path ?? null));
+		// A peer without the note open gets it by skip + read, by design (DESIGN §d.7): its latency is bounded by the
+		// deferral, not by live delivery. The read starts once no skip of the stream came for settleMs (checked each
+		// maintenance tick), and never later than maxDeferMs after the first skip.
+		const cls = b.runtime.currentDeviceClass;
+		const sd = SKIP_DEFER[cls];
+		const tick = DEFAULT_TUNING.maintenanceMs;
+		const reads = Object.entries(tap.samples).flatMap(([k, rows]) => rows.filter((r) => r.split?.path === "read").map((r) => ({ k, peer: r.peer, ...r.split! })));
+		const late = reads.filter((r) => (r.quiet ?? 0) > sd.settleMs + tick + DEFER_SLACK_MS || (r.defer ?? 0) > sd.maxDeferMs + tick + DEFER_SLACK_MS);
+		R.check(`each read sample's deferral held to its bound (quiet <= settleMs ${sd.settleMs} + maintenanceMs ${tick} + ${DEFER_SLACK_MS} ms, ${cls})`,
+			late.length === 0, { reads: reads.length, late: late.slice(0, 10) });
+		const paths: Record<string, Record<string, number>> = {};
+		for (const [k, rows] of Object.entries(tap.samples)) for (const r of rows) (paths[k] ??= {})[r.split?.path ?? "none"] = ((paths[k] ??= {})[r.split?.path ?? "none"] ?? 0) + 1;
+		R.extra[`${o.prefix}_paths`] = paths;
 	} finally {
 		R.extra[`${o.prefix}_quietWaitMs`] = waits.length ? { n: waits.length, max: Math.round(Math.max(...waits)) } : null;
 		R.extra[`${o.prefix}_samples`] = tap.samples;
