@@ -21,7 +21,7 @@
  * re-checks and the runtime starts in this process; an unpinned device waits for main to pin and restart it.
  */
 
-import type { DocId, PathKey, VaultEpoch, VaultPath } from "../../core/types";
+import type { PathKey, VaultEpoch } from "../../core/types";
 import { BUDGETS } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
@@ -367,10 +367,6 @@ export class ComposedEngine {
 		this.postStatus();
 	}
 
-	setKnownEpoch(epoch: VaultEpoch | undefined): void {
-		this.knownEpoch = epoch;
-	}
-
 	postStatus(): void {
 		if (this.disposed) return;
 		const deviceClass = this.config?.deviceClass ?? "desktop";
@@ -595,17 +591,6 @@ export class ComposedEngine {
 		this.ports = { ...this.ports, blob: store };
 		this.log("blob store available -> restarting");
 		void this.restart("blob-store").then(() => undefined, (e) => this.log(`blob-store restart failed: ${String(e)}`));
-	}
-
-	/** Tests / diagnostics. */
-	get runtimeStarting(): Promise<void> | null {
-		return this.starting;
-	}
-	boundDocIds(): DocId[] {
-		return [...this.bound.byId.keys()];
-	}
-	waitingPaths(): VaultPath[] {
-		return [...this.bound.waiting];
 	}
 }
 

@@ -15,7 +15,7 @@
  *
  * The secret id is `"yaos-" + hex(base64urlDecode(vaultId))`: the vaultId's 16 bytes in lowercase hex, 37 chars,
  * valid for setSecret's `/^[a-z0-9-]+$/` and its 64-char limit. No hash: main never hashes (DESIGN §d.2; §h
- * HostPorts has no HashPort; scripts/check-deps.mjs keeps core/hash/** off the main thread).
+ * gives the host no HashPort; scripts/check-deps.mjs keeps core/hash/** off the main thread).
  */
 
 import { KEY_STORE_WAIT_MS } from "../../core/limits";

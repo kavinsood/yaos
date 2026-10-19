@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { KEYRING_STREAM, type DeviceId, type StreamName } from "../../core/types";
-import type { BlobPort, EnginePorts } from "../../ports";
+import type { EnginePorts } from "../../ports";
+import type { BlobPort } from "../../ports/blob";
 import type { EngineInitConfig } from "../../protocol/messages";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";

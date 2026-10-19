@@ -57,7 +57,6 @@ export class HostRuntime {
 	private readonly batcher: VaultEventBatcher;
 	private readonly offs: (() => void)[] = [];
 	private readonly deviceClass: DeviceClass;
-	private scanId = 0;
 	private scanning: Promise<void> | null = null;
 	private rescanWanted = false;
 	private reconcileTimer: TimerHandle | null = null;
@@ -168,14 +167,13 @@ export class HostRuntime {
 
 	private async scanOnce(): Promise<void> {
 		if (!this.engine.isReady) return;
-		const scanId = ++this.scanId;
 		this.stats.scans++;
 		const stats = await this.deps.vault.list();
 		const chunks = observationChunks(stats);
 		for (let i = 0; i < chunks.length; i++) {
 			const chunk = chunks[i] ?? [];
 			try {
-				await this.engine.request({ t: "observations", scanId, chunk, complete: i === chunks.length - 1 });
+				await this.engine.request({ t: "observations", chunk, complete: i === chunks.length - 1 });
 			} catch {
 				return; // engine stopped (unload or fatal)
 			}

@@ -14,7 +14,8 @@
 import type { DeviceId, VaultPath } from "../core/types";
 import { pathKey } from "../core/paths/pathKey";
 import type { Unsubscribe } from "../ports/common";
-import type { BlobPort, EnginePorts } from "../ports";
+import type { EnginePorts } from "../ports";
+import type { BlobPort } from "../ports/blob";
 import type { LifecycleEvent, PlatformInfo, PlatformPort } from "../ports/platform";
 import type { BrakeReport } from "../core/types";
 import type { ProtocolError } from "../protocol/errors";

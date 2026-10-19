@@ -11,7 +11,7 @@ import { createWorkerHostTransport, type WorkerLike } from "../protocol/workerTr
 import { VirtualClock } from "../sim/clock";
 import { EngineHost, HostRequestError, STARTUP_PING_TIMEOUT_MS, type EngineCarrier, type EngineEventMessage } from "./engineHost";
 
-type Mode = "ok" | "silent" | { initError: ProtocolErrorCode } | { fatalOnInit: ProtocolErrorCode } | "no-pong-after-init";
+type Mode = "ok" | "silent" | { initError: ProtocolErrorCode } | "no-pong-after-init";
 
 interface FakeEngineHandle {
 	readonly received: MainToEngine[];
@@ -55,10 +55,6 @@ function respond(h: FakeEngineHandle, mode: Mode, m: MainToEngine, post: (m: Eng
 		case "init":
 			if (typeof mode === "object" && "initError" in mode) {
 				post({ t: "error", re: rid, error: { code: mode.initError, message: "no idb", retryable: true } });
-				return;
-			}
-			if (typeof mode === "object" && "fatalOnInit" in mode) {
-				post({ t: "fatal", error: { code: mode.fatalOnInit, message: "nope", retryable: false } });
 				return;
 			}
 			post({ t: "notice", level: "info", code: "booting", message: "init" });
@@ -352,13 +348,6 @@ test("protocol error answering init stops the host", async () => {
 	const h = harness(worker({ initError: "version-mismatch" }));
 	await startAndSettle(h);
 	await assertTerminal(h, { pending: [], message: /could not start/, code: "version-mismatch", constructions: 1 });
-});
-
-test("fatal message from the engine stops the host", async () => {
-	const h = harness(worker({ fatalOnInit: "storage-lost" }));
-	await startAndSettle(h);
-	assert.equal(h.fatals[0]?.message, "nope");
-	await assertTerminal(h, { pending: [], message: /^nope$/, code: "storage-lost", constructions: 1 });
 });
 
 // --- teardown races ----------------------------------------------------------

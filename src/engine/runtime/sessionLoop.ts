@@ -536,8 +536,4 @@ export class SessionLoop {
 		this.st = newReconnectState();
 		await this.connectOnce();
 	}
-
-	async idleReads(): Promise<void> {
-		while (this.reads.size > 0 || this.feeding) await Promise.all([...this.reads.values(), this.feeding]);
-	}
 }

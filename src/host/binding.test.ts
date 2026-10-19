@@ -264,9 +264,9 @@ test("binding: onSaveRead posts a save mark naming the mirror version and the ne
 	assert.equal(bm.stats.saveMarks, 1);
 });
 
-test("binding: docRetarget resync re-attaches with the mirror as base; renamed/merged re-open; deleted waits for bindable", async () => {
+test("binding: docRetarget resync re-attaches with the mirror as base; frozen waits for bindable; renamed re-opens", async () => {
 	const s = setup();
-	const { clock, ws, engine, bm } = s;
+	const { clock, ws, engine, bm, notices } = s;
 	file(s, "a.md", "abc\n");
 	bm.start();
 	const v = ws.openFile("a.md");
@@ -280,10 +280,14 @@ test("binding: docRetarget resync re-attaches with the mirror as base; renamed/m
 	assert.equal(bm.slotState(v.viewId), "bound");
 	assert.equal(bm.stats.resyncs, 1);
 	assert.equal(engine.text("a.md"), "abc\nd\n");
-	bm.onDocRetarget(docId, { t: "deleted" });
+	engine.frozen.add("a.md");
+	bm.onDocRetarget(docId, { t: "frozen", reason: "test" });
+	await clock.advance(5);
 	assert.equal(bm.slotState(v.viewId), "waiting");
+	assert.deepEqual(notices, ["doc-frozen"]);
 	assert.equal(bm.isBoundPath("a.md"), false);
 	v.edit(0, 0, "x\n"); // unbound: goes in by the line merge at re-attach
+	engine.frozen.delete("a.md");
 	bm.onBindable("A.md" as never); // case-insensitive vault
 	await clock.advance(50);
 	assert.equal(bm.slotState(v.viewId), "bound");

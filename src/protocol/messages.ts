@@ -245,11 +245,11 @@ export type AttachmentCleanupRefusal =
 
 export type MainToEngine =
 	| { readonly t: "init"; readonly rid: RequestId; readonly config: EngineInitConfig }
-	| { readonly t: "shutdown"; readonly rid: RequestId; readonly reason: "unload" | "restart" | "epoch-switch" }
+	| { readonly t: "shutdown"; readonly rid: RequestId }
 	| { readonly t: "lifecycle"; readonly event: LifecycleEvent }
 	| { readonly t: "ping"; readonly rid: RequestId }
 	/** Full listing (complete=true on the last chunk) or incremental re-stats. */
-	| { readonly t: "observations"; readonly rid: RequestId; readonly scanId: number; readonly chunk: readonly LocalObservation[]; readonly complete: boolean }
+	| { readonly t: "observations"; readonly rid: RequestId; readonly chunk: readonly LocalObservation[]; readonly complete: boolean }
 	/** Batched vault events (hints), <= 50 ms or 256 events per message. */
 	| { readonly t: "vaultEvents"; readonly events: readonly VaultEvent[] }
 	| { readonly t: "openDoc"; readonly rid: RequestId; readonly path: VaultPath; readonly viewId: number }
@@ -323,7 +323,7 @@ export type EngineToMain =
 	 * Doc identity changed under a bound view (merged alias, remote rename, delete, freeze), or (`resync`) the
 	 * engine dropped body events past 4x the credit window: the host re-binds those views.
 	 */
-	| { readonly t: "docRetarget"; readonly docId: DocId; readonly change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "deleted" } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" } }
+	| { readonly t: "docRetarget"; readonly docId: DocId; readonly change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" } }
 	/** A path became bindable (e.g. its create was planned): host retries openDoc for open views. */
 	| { readonly t: "bindable"; readonly path: VaultPath }
 	| { readonly t: "readRequest"; readonly rid: RequestId; readonly reads: readonly DiskReadRequest[] }
@@ -342,9 +342,7 @@ export type EngineToMain =
 		readonly records: readonly Uint8Array[]; readonly pending: number | null }
 	| { readonly t: "status"; readonly status: StatusSnapshot }
 	| { readonly t: "brake"; readonly report: BrakeReport }
-	| { readonly t: "notice"; readonly level: "info" | "warn" | "error"; readonly code: string; readonly message: string }
-	/** Engine cannot continue (version mismatch, storage unusable after retries). */
-	| { readonly t: "fatal"; readonly error: ProtocolError };
+	| { readonly t: "notice"; readonly level: "info" | "warn" | "error"; readonly code: string; readonly message: string };
 
 export type EngineResultValue =
 	| { readonly t: "ready"; readonly protocolVersion: number; readonly vaultEpoch: VaultEpoch | null; readonly recovered: boolean }

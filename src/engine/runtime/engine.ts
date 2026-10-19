@@ -12,20 +12,17 @@
 
 import * as Y from "yjs";
 import { EnvelopeFlag } from "../../core/envelope";
-import type { CfgFoldEvent } from "../../core/cfg/fold";
 import type { SnapFoldState } from "../../core/snap/fold";
 import type { SnapOp } from "../../core/snap/record";
-import { NS_STREAM, docStream, kindOfPath, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type DeviceId, type VaultEpoch, type VaultId, type VaultPath } from "../../core/types";
+import { NS_STREAM, docStream, kindOfPath, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { RelaySession } from "../../ports/relay";
-import type { StoragePort } from "../../ports/storage";
 import { buildBodyFrames, initialTextUpdates } from "../body/frames";
 import { HandleManager, type Handle } from "../body/handles";
 import { applyChanges, changesBaseLength, type TextChanges } from "../body/textChanges";
 import { Sender, sendRank } from "../body/sender";
 import { ORIGIN } from "../body/yjsCounters";
-import { defaultPriority, Repo, type YS } from "../store/repo";
-import { DB_NAME_PREFIX, DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity } from "../store/schema";
+import { defaultPriority, Repo } from "../store/repo";
 import { newDocId } from "../../core/codec/ids";
 import { bytesToHex, utf8Encode } from "../../core/codec/lib0";
 import { recheckStored, releaseQuarantine, retryReaderQuarantine } from "./quarantineRelease";
@@ -62,39 +59,6 @@ export class LogEngine {
 	private constructor(readonly c: EngineCtx) {
 		this.maint = new Maintenance(c);
 		this.gc = new BlobGc(c);
-	}
-
-	/**
-	 * Epoch of an existing local DB of (vaultId, deviceId), from the DB names
-	 * (store/schema dbName); several: the most recently created. undefined =
-	 * none. Pass it as opts.vaultEpoch to boot offline (start() never looks it up
-	 * itself: without vaultEpoch the first connect decides, which is what an
-	 * epoch change needs). A relay on another epoch moves the phase to epoch-migrating.
-	 */
-	static async findKnownEpoch(storage: StoragePort, vaultId: VaultId, deviceId: DeviceId): Promise<VaultEpoch | undefined> {
-		const found: VaultEpoch[] = [];
-		for (const name of await storage.listDatabases()) {
-			const parts = name.split(":");
-			if (parts.length !== 4 || parts[0] !== DB_NAME_PREFIX) continue;
-			try {
-				if (decodeURIComponent(parts[1]!) !== vaultId || decodeURIComponent(parts[3]!) !== deviceId) continue;
-				found.push(decodeURIComponent(parts[2]!) as VaultEpoch);
-			} catch {
-				continue; // not URI-encoded by dbName: not ours
-			}
-		}
-		if (found.length <= 1) return found[0];
-		let best: { epoch: VaultEpoch; at: number } | undefined;
-		for (const epoch of found) {
-			const db = await storage.open<YS>(dbName(vaultId, epoch, deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
-			try {
-				const ident = await db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, "identity")) as MetaIdentity | undefined;
-				if (ident && ident.vaultEpoch === epoch && (!best || ident.createdAtMs > best.at)) best = { epoch, at: ident.createdAtMs };
-			} finally {
-				db.close();
-			}
-		}
-		return best?.epoch;
 	}
 
 	static async start(opts: EngineOptions): Promise<LogEngine> {
@@ -502,16 +466,6 @@ export class LogEngine {
 		return c.repo.cursor.headSeqSeen <= c.repo.cursor.vaultSeq;
 	}
 
-	async waitIdle(timeoutMs = 30_000, pollMs = 20): Promise<boolean> {
-		const c = this.c;
-		const start = c.mono();
-		for (;;) {
-			if (this.isIdle()) return true;
-			if (c.mono() - start > timeoutMs) return false;
-			await new Promise<void>((r) => c.ports.clock.setTimer(pollMs, r));
-		}
-	}
-
 	disconnect(): void {
 		this.c.sess.disconnect();
 	}
@@ -582,6 +536,3 @@ export class LogEngine {
 	}
 }
 
-export function startEngine(opts: EngineOptions): Promise<LogEngine> {
-	return LogEngine.start(opts);
-}

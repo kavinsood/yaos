@@ -762,7 +762,7 @@ cold ──load──▶ resident ──bind──▶ bound
     `reconcileContent` against the replica.
 - **Unbind** (`closeDoc{docId, viewId}`, on `file-changed`, view close, or `EditorView.setState` via `onReset`): the
   binding detaches. The worker replica stays resident (clean, LRU).
-- **`docRetarget`** (renamed, merged, deleted, frozen, resync) works as before.
+- **`docRetarget`** (renamed, merged, frozen, resync) works as before.
   - For `renamed`, `merged` and `frozen`, the host re-opens the doc. `frozen` binds read-only.
   - For `resync`, every view of the doc re-binds: upload, then `bodyAttach` with the mirror's durable text as the
     base.
@@ -1613,10 +1613,10 @@ transferred buffers.
 | Message | rid | Purpose | Answer |
 |---|---|---|---|
 | `init{config}` | yes | Identity, device class, settings, relay URL + credential (secret), side files `[T]` | `ready{protocolVersion, vaultEpoch, recovered}` / `error(version-mismatch)` |
-| `shutdown{reason}` | yes | Flush builders, `T_edit`, mirror, close relay and IDB | `ok` |
+| `shutdown` | yes | Flush builders, `T_edit`, mirror, close relay and IDB | `ok` |
 | `lifecycle{event}` | — | visible / hidden / pagehide / freeze / resume / online / offline / memory-pressure (declared, never raised; §i.4) | — |
 | `ping` | yes | Liveness every 10 s | `pong` (no pong within `PING_TIMEOUT_MS` → the engine stopped, §g.4) |
-| `observations{scanId, chunk, complete}` | yes | Listing chunks (≤ 2000 stats) | `ok` (the host sends the next chunk after it) |
+| `observations{chunk, complete}` | yes | Listing chunks (≤ 2000 stats) | `ok` (the host sends the next chunk after it) |
 | `vaultEvents{events}` | — | Hints, batched ≤ 50 ms / 256 | — |
 | `openDoc{path, viewId}` | yes | Bind request | `bind{docId, kind, frozen}` / `notBindable{reason}` |
 | `closeDoc{docId, viewId}` | — | Unbind | — |
@@ -1635,7 +1635,7 @@ transferred buffers.
 | Message | rid | Purpose | Answer |
 |---|---|---|---|
 | `body{docId, event, weight}` | — | Body event of a bound doc (`entry` / `bound` / `reject` / `durable` / `reloaded`, §d.3), FIFO per doc, within credit | `docCredit{weight}` |
-| `docRetarget{docId, change}` | — | renamed / merged / deleted / frozen: the host unbinds and re-opens; `resync`: the host re-binds every view of the doc (§d.2) | — |
+| `docRetarget{docId, change}` | — | renamed / merged / frozen: the host unbinds and re-opens; `resync`: the host re-binds every view of the doc (§d.2) | — |
 | `bindable{path}` | — | A path became bindable | Host `openDoc` |
 | `readRequest{reads}` | yes | Disk reads (area vault/config, maxBytes) | `reads{DiskReadResult[] [T]}` |
 | `diskOps{lane, ops}` | yes | Ordered ops with preconditions. A failed op does not stop independent later ones; dependents report `skipped` | `diskOps{DiskOpResult[]}` |
@@ -1644,14 +1644,12 @@ transferred buffers.
 | `status{StatusSnapshot}` | — | Throttled to ≤ 4/s and sent on phase change | — |
 | `brake{BrakeReport}` | — | User approval needed | Host shows UI → `command` |
 | `notice{level, code, message}` | — | User-facing notice | — |
-| `fatal{error}` | — | Engine cannot continue | Host stops, shows error |
 | `result` / `error` `{re}` | — | Answers to main requests | — |
 
 ### g.3 Ids
 
 - **`rid`** is per sender, starts at 1 and increases. Ids are never reused within one transport instance.
 - **`opId`** is unique per engine instance across all `diskOps` batches, and is used in diagnostics and intents.
-- **`scanId`** increases per listing.
 - **`viewId`** is assigned by the host per editor leaf.
 - **`docId`** is the fold docId.
 
@@ -1686,7 +1684,7 @@ transferred buffers.
   - no startup `pong` within `STARTUP_PING_TIMEOUT_MS`;
   - a worker `error` / `messageerror` event, or any other transport failure;
   - no liveness `pong` within `PING_TIMEOUT_MS`;
-  - `init` answers an error (`storage-lost` included, OR-1), or the engine sends `fatal`.
+  - `init` answers an error (`storage-lost` included, OR-1).
   - The host terminates the worker, rejects every pending request (`aborted`) and reports one fatal: the runtime
     stops, its views unbind (their edits stay in the editors, §d.2), and the UI shows "YAOS stopped: …" and a
     failed status. Nothing restarts it in the background and nothing runs the engine on main. A new engine is the
@@ -1866,9 +1864,8 @@ interface RelaySession {
 }
 interface RelayPort { connect(params: { vaultId: VaultId; deviceId: DeviceId }): Promise<RelayConnectResult> }
 
-// index.ts — bundles
+// index.ts — the engine's bundle. The host takes its ports one by one and is given no HashPort: main never hashes (§d.2)
 interface EnginePorts { relay; storage; clock; random; crypto; hash; blob: BlobPort | null; probeBlob?: () => Promise<BlobPort | null> }
-interface HostPorts { vault; configDir; sideFiles; workspace; platform; clock; random }   // no hash: main never hashes (§d.2)
 ```
 
 - **Not a port: `HashOracle`** (host/hashOracle.ts). The host's only hashing entry point:
@@ -2515,7 +2512,7 @@ These are enforced by `scripts/check-deps.mjs` (WP-D), a regex import scan run i
   - `MAIN_FORBIDDEN` = `yjs`, `y-codemirror.next`, `y-protocols`, `lib0`. No `host/**` file may import them: not
     tests, not type-only imports.
   - **No hashing on main.** `MAIN_FORBIDDEN_DIRS` = `core/hash`. No product `host/**` file may import `core/hash/**`,
-    type-only imports included. HostPorts has no HashPort (§h); every fingerprint, and the SecretStorage id
+    type-only imports included. The host is given no HashPort (§h); every fingerprint, and the SecretStorage id
     (e2ee-design §6.1, the vaultId's bytes in hex), is computed without one. Host tests may import it to compute
     expected values: they are not main-thread code.
   - `mainReach` follows every product `host/**` module's relative imports through `host`, `core`, `ports` and
