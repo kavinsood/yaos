@@ -109,6 +109,14 @@ test("sim: a rename onto the same path does not hold a canvas's edits back (hot 
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Hot canvas seed 503 with suite 1: the late fold of an own rename came back suffixed while a later own rename of the
+// doc was pending; S1 judged "moved on" by the overlay's projection of that rename, which suffixed it, and put S back.
+// The next pass merged another doc's file into the note and B's edits were lost.
+test("sim: S follows a pending own rename by its requested path (hot canvas, suite-1 seed 503)", async () => {
+	const r = await runSim({ seed: 503, devices: 2, faults: CANVAS_FAULTS, faultRate: 0.2, steps: 80, canvas: { rate: 3, ops: CANVAS_HOT_OPS, pool: 2, hot: true }, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */

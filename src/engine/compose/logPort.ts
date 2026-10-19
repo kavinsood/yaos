@@ -12,6 +12,7 @@ import { digestHex } from "../../core/hash/digest";
 import { markdownCanonicalBytes } from "../../core/hash/markdownLf";
 import { sha256Hex } from "../../core/hash/sha256";
 import { SYNC_HASH_MAX_BYTES } from "../../core/limits";
+import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import type * as Y from "yjs";
 import type { Handle } from "../body/handles";
@@ -81,10 +82,19 @@ export class ComposedLog implements LogPort {
 			}
 		}
 		for (const [key, id] of ns.index.byPathKey) remoteByPathKey.set(key, id);
+		const pendingMoves = new Map<DocId, Set<PathKey>>();
+		for (const f of ns.pending) {
+			for (const op of f.ops) {
+				if (op.t !== "rename" && op.t !== "restore") continue;
+				let keys = pendingMoves.get(op.docId);
+				if (!keys) pendingMoves.set(op.docId, (keys = new Set()));
+				keys.add(pathKey(op.path));
+			}
+		}
 		this.memo = {
 			remote, remoteByPathKey, nsCoversSeq: ns.coversSeq,
 			nsReady: this.nsCaughtUp && ns.halted === null && !ns.overlayHalted,
-			docsWithPendingBody: pending, restoreDuty, lostCreateBody, textHash, appliedSeq,
+			docsWithPendingBody: pending, restoreDuty, lostCreateBody, textHash, appliedSeq, pendingMoves,
 		};
 		return this.memo;
 	}
