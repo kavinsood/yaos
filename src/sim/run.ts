@@ -339,7 +339,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				ledger.add(`[Y.${k}]`, "Y", -1, "seed-variant");
 			}
 		}
-		const canvasWorld = new CanvasWorld({ devs, ledger, isDown: (i) => faults.isDown(i), isBackground: (i) => faults.isBackground(i) }, clock, { hot: c.canvas?.hot ?? false, trace: (line) => trace.push(`${clock.monotonic()} ${line}`) });
+		const canvasWorld = new CanvasWorld({ devs, ledger, isDown: (i) => faults.isDown(i), isBackground: (i) => faults.isBackground(i), relayEpoch: () => net.relay.vaultEpoch() }, clock, { hot: c.canvas?.hot ?? false, trace: (line) => trace.push(`${clock.monotonic()} ${line}`) });
 		// Onboarding canvases (own stream): one on A in half the seeds; B has it too (identical) or its own version.
 		if (c.canvas) {
 			const ci = new SeededRandom(cfg.seed).fork("canvas-init");
@@ -382,6 +382,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			const line = "user" in step ? await runUserAction(actorWorld, step.user, step.i) : "canvas" in step ? await canvasWorld.run(step.canvas, step.i) : faults.run(step.fault);
 			if (line.startsWith("skip")) skipped++;
 			else if ("fault" in step && step.fault.t === "idbWipe" && !step.fault.mirrors) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
+			else if ("fault" in step && step.fault.t === "epochRestore") canvasWorld.oracle.restored(clock.now());
 			trace.push(`${step.i} ${line}`);
 			faults.afterStep();
 			cfg.observe?.(String(step.i), devs, net);

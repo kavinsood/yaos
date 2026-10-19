@@ -372,8 +372,12 @@ export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[]
  *                device edited it without having seen the delete (a concurrent edit; the disk/CRDT merge keeps the
  *                CRDT side and copies the disk file) or the deleting device wrote a conflict copy lacking it after
  *                the delete (its merge had no base, or met a concurrent edit), or an IDB wipe without mirrors hit
- *                the deleting device after the delete (its unsent delete is gone). Other docs holding it (conflict
- *                copies, a duplicate a wipe or an epoch reset left under a suffixed name) are copies, not the doc
+ *                the deleting device after the delete (its unsent delete is gone), or the delete precedes an epoch
+ *                restore, or was made on an epoch the relay had already left (DESIGN §c.12: the restored relay
+ *                state may predate the delete, the old outbox is dropped, and the old epoch's base cannot tell a
+ *                record the new epoch still holds from one added there, for canvases as for markdown text). Other
+ *                docs holding it (conflict copies, a duplicate a wipe or an epoch reset left under a suffixed name)
+ *                are copies, not the doc
  *   text         canvas text-node edits carry ledger tokens: checkTokens / checkNothingDestroyed cover them (a
  *                Y.Text char merge of concurrent edits keeps both)
  *   writes       no lost update on a tracked field (canvas.ts oracle): a write that replaced value V (its
@@ -383,8 +387,7 @@ export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[]
  *                fields at the top level, on nodes and on edges are tracked fields
  *   order        an uncontested reorder holds: "bring to front / send to back" of node n on device X still puts n
  *                above / below every node that was on the canvas then, unless another device reordered n or one of
- *                those nodes, X reordered them later, a program sorted them, or a copy holds them (a conflict
- *                copy, or another doc: the duplicate a re-onboarding after a wipe or an epoch migration leaves)
+ *                those nodes, X reordered them later, a program sorted them, or a conflict copy holds them
  */
 export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): Violation[] {
 	const out: Violation[] = [];
@@ -472,7 +475,11 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 		const copied = dev?.vault.history.some((v) => v.by === "sync" && isConflictCopy(v.path) && v.path.endsWith(".canvas") && v.atMs >= del.atMs && !v.text.includes(`"${r.key.slice(2)}"`)) ?? false;
 		// The deleting device's store was wiped with its mirrors after the delete: an unsent delete is gone with it.
 		const wiped = oracle.wipes.some((x) => x.dev === del.dev && x.atMs >= del.atMs);
-		if (!concurrent && !copied && !wiped) bad(`${r.key} deleted on ${del.dev} at step ${del.step} is back in ${back.map((h) => h.path).join(", ")} with no concurrent edit and no conflict copy`);
+		// A point-in-time restore after the delete (doc ids kept), or a delete made on the epoch the relay had left:
+		// the new epoch may hold the record, and the re-onboarding merge against the old epoch's base reads it as
+		// added there (DESIGN §c.12).
+		const restored = del.staleEpoch === true || oracle.restores.some((t) => t >= del.atMs);
+		if (!concurrent && !copied && !wiped && !restored) bad(`${r.key} deleted on ${del.dev} at step ${del.step} is back in ${back.map((h) => h.path).join(", ")} with no concurrent edit and no conflict copy`);
 	}
 
 	// writes (lost updates)
@@ -512,12 +519,9 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 	}
 
 	// order
-	// A copy of the reordered canvas holds the node: a conflict copy, or another doc (the duplicate a wipe or an epoch
-	// migration leaves under a suffixed name when the device re-onboards its file), like the delete rule's copies.
-	const inCopy = (id: string, doc: string | null) => (holders.get(`n:${id}`) ?? []).some((h) => isConflictCopy(h.path) || (doc !== null && h.doc !== null && h.doc !== doc));
+	const inCopy = (id: string) => (holders.get(`n:${id}`) ?? []).some((h) => isConflictCopy(h.path));
 	for (const r of oracle.reorders) {
-		const inCopy1 = (id: string) => inCopy(id, r.doc);
-		if (deletedNode(r.node) || oracle.sorted.has(r.node) || inCopy1(r.node)) continue;
+		if (deletedNode(r.node) || oracle.sorted.has(r.node) || inCopy(r.node)) continue;
 		const group = new Set([r.node, ...r.siblings]);
 		if (oracle.reorders.some((x) => x.dev !== r.dev && group.has(x.node))) continue;
 		if (oracle.reorders.some((x) => x.dev === r.dev && x.node === r.node && x.atMs > r.atMs)) continue;
@@ -528,7 +532,7 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 			if (at < 0) continue;
 			for (const m of r.siblings) {
 				const mi = ids.indexOf(m);
-				if (mi < 0 || deletedNode(m) || oracle.sorted.has(m) || inCopy1(m)) continue;
+				if (mi < 0 || deletedNode(m) || oracle.sorted.has(m) || inCopy(m)) continue;
 				if (oracle.reorders.some((x) => x.dev === r.dev && x.node === m && x.atMs > r.atMs)) continue;
 				if (r.front ? at < mi : at > mi) bad(`reorder of ${r.node} to the ${r.front ? "front" : "back"} on ${r.dev} at step ${r.step} lost against ${m} in ${path}`);
 			}

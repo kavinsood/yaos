@@ -6,7 +6,7 @@ import { generatePlan, minimizePlan, runSim, type SimConfig, type SimReport, typ
 import { BLOB_FAULTS, CANVAS_FAULTS, DEFAULT_FAULTS, E2EE_FAULTS } from "./faults";
 import type { SimBlobLiveness } from "./blobStore";
 import { checkCanvas, checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
-import { ABSENT, CANVAS_HOT_OPS, CanvasOracle, type FieldWrite } from "./canvas";
+import { ABSENT, CANVAS_HOT_OPS, CanvasOracle, suffixedDuplicates, type FieldWrite } from "./canvas";
 import { runUserAction, TokenLedger } from "./actors";
 import { SIM_TUNING, SimDevice } from "./device";
 import { DURABILITY_RETRY_MS } from "../engine/body/sender";
@@ -24,11 +24,29 @@ test("sim tuning: the causal-hole re-read window outlasts an own frame's retry (
 	assert.ok(window >= 2 * DURABILITY_RETRY_MS, `window ${window} ms < 2 x the own-frame retry`);
 });
 
-// Suite-1 seed 34: an epoch restore made revoked B re-onboard; its canvas, holding B's "bring to front", collided
-// with the restored doc and survives as "c5 (2).canvas", a copy like a conflict copy. Pinned with E2EE.
-test("sim: a reorder kept only in the duplicate an epoch migration leaves is not lost (suite-1 seed 34)", async () => {
-	const r = await runSim({ seed: 34, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+// Suite-1 seed 24: after an epoch migration the devices re-create the vault and race on every path. A device's own
+// re-create of canvas c1, changed locally, lost the race and was kept as "c1 (2).canvas" beside the winner: the
+// old-epoch path-keyed bases and the migrated-loser merge (DESIGN §c.12) were markdown-only. It merges into the
+// winner now, against the old epoch's base. Pinned with E2EE.
+test("sim: a canvas re-created across an epoch migration merges into the winner, no suffixed duplicate (suite-1 seed 24)", async () => {
+	let dups: string[] = [];
+	const r = await runSim({
+		seed: 24, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1",
+		observe: (label, devs) => { if (label === "end") dups = devs.flatMap((d) => suffixedDuplicates(d).map((x) => `${d.name}: ${x}`)); },
+	});
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+	assert.deepEqual(dups, []);
+});
+
+// Suite-1 seeds 103 (4 devices) and 19 (2 devices, fault-heavy): a node / edge deleted just before an epoch restore,
+// or on the epoch the relay had already left, is back after the migration: the restored state still held it and the
+// merge against the old epoch's base reads it as added there (DESIGN §c.12; markdown text alike). The delete rule
+// exempts deletes an epoch restore overtook.
+test("sim: a canvas delete overtaken by an epoch restore is not a delete-rule violation (suite-1 seeds 103, 19)", async () => {
+	const a = await runSim({ seed: 103, devices: 4, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(a.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+	const b = await runSim({ seed: 19, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+	assert.deepEqual(b.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
 // Seed 581 (3 devices): B's own re-create of c3 lost the race after an epoch reset and waited to merge into the winner;
