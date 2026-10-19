@@ -378,7 +378,8 @@ export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[]
  *                Y.Text char merge of concurrent edits keeps both)
  *   writes       no lost update on a tracked field (canvas.ts oracle): a write that replaced value V (its
  *                saw-chain passes through V) is never undone back to V in every canvas holding the record. Values
- *                the user threw away with a conflict copy, and fields of deleted records, are exempt. Unknown
+ *                the user threw away with a conflict copy, fields of deleted records, and fields of an edge left
+ *                dangling by a user's node delete (only conflict copies show it; the CRDT keeps it), are exempt. Unknown
  *                fields at the top level, on nodes and on edges are tracked fields
  *   order        an uncontested reorder holds: "bring to front / send to back" of node n on device X still puts n
  *                above / below every node that was on the canvas then, unless another device reordered n or one of
@@ -493,9 +494,14 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 		const removedAfter = removals.some((rm) => rm.saw === null || !anc.has(rm.saw));
 		return finals.every((f) => (f === ABSENT ? anc.has(ABSENT) && !removedAfter : anc.has(f)));
 	};
+	// An edge with an endpoint a user deleted that no canvas but a conflict copy holds is dangling in its doc: kept in
+	// the CRDT with its fields and dropped from the projection (DESIGN §j.2), so its writes are not on any disk.
+	const dangling = (rec: string): boolean => rec.startsWith("e:") && [...(oracle.record(rec)?.endpoints ?? [])].some(deletedNode)
+		&& !(holders.get(rec) ?? []).some((h) => !isConflictCopy(h.path));
 	const all = [...oracle.writes.values(), ...[...oracle.removals.values()].flat()];
 	for (const w of all) {
 		if (w.rec !== "root" && oracle.record(w.rec)?.deleted) continue;
+		if (dangling(w.rec)) continue;
 		if (oracle.discarded.has(`${w.rec}|${w.field}|${w.value}`)) continue;
 		const finals = finalsOf(w.rec, w.field, w.lineage, w.value === ABSENT);
 		if (!finals) continue;

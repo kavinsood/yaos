@@ -274,6 +274,24 @@ test("invariants: canvas validity, lost records, lost field writes and discarded
 		d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
 		d.vault.userDelete("c (conflict A 2026-01-01 0001).canvas");
 	}
+	// An edge a user rewired and labelled while another deleted its new endpoint: the CRDT keeps it dangling, so no
+	// canvas shows it but a conflict copy from before the label (suite-1 seed 167). Visible with the old label: lost.
+	const e1 = (label: string) => `{"id":"e1","fromNode":"n1","toNode":"n3"${label}}`;
+	o.created("n:n3", "B", 9, "c.canvas");
+	o.created("e:e1", "A", 9, "c.canvas").endpoints.add("n1").add("n3");
+	o.write(w("e:e1", "label", "\"E1\"", ABSENT, 10));
+	o.deleted("n:n3", { dev: "B", step: 11, atMs: 11, how: "record", saw: new Map(), doc: null });
+	for (const d of [a, b]) {
+		d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+		d.vault.userWrite("c (conflict A 2026-01-01 0002).canvas", board(`${textNode("n1", 5)},${textNode("n3", 1)}`, e1("")));
+	}
+	assert.deepEqual(checkCanvas([a, b], o), []);
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(`${textNode("n1", 5)},${textNode("n3", 1)}`, e1("")));
+	assert.ok(checkCanvas([a, b], o).some((x) => x.detail.startsWith("lost write e:e1.label=\"E1\"")));
+	for (const d of [a, b]) {
+		d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+		d.vault.userDelete("c (conflict A 2026-01-01 0002).canvas");
+	}
 	await a.vault.write("f.canvas" as VaultPath, ` ${board(textNode("n1", 5))}`, { t: "absent" });
 	assert.deepEqual(checkCanvas([a, b], o).map((x) => x.detail.slice(0, 81)), ["A: f.canvas holds bytes neither the projection's formatting nor written by a user"]);
 });
