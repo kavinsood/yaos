@@ -40,9 +40,11 @@ describe("reader-dependent quarantine of a large row (§d.6)", () => {
 			assert.equal(text, "seed;" + inline);
 			const head = relay.head();
 			await until(() => y!.engine.status().vaultSeq >= head, 10_000, "y read through head");
-			const held = (await Promise.all([...y!.engine.c.repo.streams()].map((r) => y!.engine.c.repo.quarantineOf(r.stream)))).flat();
-			const big = held.filter((q) => q.originalSize > QUARANTINE_ROW_BYTES);
-			assert.ok(big.some((q) => q.stream === x!.engine.streamOf(id)), "the inline body row is held");
+			// vaultSeq passes a row accounted stale (its payload not held live) before the read that quarantines it.
+			const heldNow = async () => (await Promise.all([...y!.engine.c.repo.streams()].map((r) => y!.engine.c.repo.quarantineOf(r.stream)))).flat();
+			const isBig = (q: { originalSize: number; stream: string }) => q.originalSize > QUARANTINE_ROW_BYTES && q.stream === x!.engine.streamOf(id);
+			await until(async () => (await heldNow()).some(isBig), 10_000, "the inline body row is held");
+			const held = await heldNow();
 			assert.ok(held.every((q) => q.reason === "crypto-unknown-key"), held.map((q) => q.reason).join(","));
 			assert.ok(held.every((q) => q.bytes.length === q.originalSize), "reader-dependent rows are kept whole");
 			assert.ok(y!.engine.status().counts.frozenDocs > 0);
