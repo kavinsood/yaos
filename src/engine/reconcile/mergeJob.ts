@@ -211,7 +211,7 @@ export function trustedEpochBase(base: string | null, crdt: string): string | nu
 /** `hash` = markdownContentHash(D). */
 function rebaseOnDisk(ctx: Env["ctx"], s: SyncedEntry, D: string, hash: ContentHash, F: DiskFingerprint, stat: { size: number; mtimeMs: number }) {
 	const base = makeBase(s.docId, D, hash);
-	const { fileGone: _gone, ...live } = s; // the disk holds the doc's file
+	const { fileGone: _gone, renamedTo: _to, ...live } = s; // the disk holds the doc's file
 	const entry = ctx.record({ ...live, contentHash: hash, fingerprint: F, size: stat.size, mtimeMs: stat.mtimeMs, hasBase: base !== null });
 	return { entry, base };
 }

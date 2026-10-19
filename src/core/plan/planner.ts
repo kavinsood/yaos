@@ -53,7 +53,7 @@
  */
 
 import type {
-	ContentHash, DiskFingerprint, DocId, DocKind, LocalEntry, PathKey, PathKeyFn, Plan, PlanFn, PlannerInput, PlannerOp, RemoteEntry, Seq,
+	ContentHash, DiskFingerprint, DocId, DocKind, LocalEntry, ObservedRename, PathKey, PathKeyFn, Plan, PlanFn, PlannerInput, PlannerOp, RemoteEntry, Seq,
 	SyncedEntry, VaultPath, BodyVersion,
 } from "../types";
 import { sha256Hex } from "../hash/sha256";
@@ -117,9 +117,36 @@ export function restartAtCreate(s: SyncedEntry, createHash: ContentHash): Synced
 
 export const plan: PlanFn = (input) => planWith(input);
 
-export function planWith(input: PlannerInput, options: Partial<PlannerContext> = {}): Plan {
+/**
+ * The observed renames, plus the one each fileGone record kept (`renamedTo`): observed before ns was ready, it is
+ * gone from memory after an engine restart, and without it the file is lost track of (sim hot canvas seed 705).
+ */
+function withKeptRenames(input: PlannerInput, pk: PathKeyFn): PlannerInput {
+	const kept: ObservedRename[] = [];
+	for (const s of input.synced.values()) {
+		if (!s.fileGone || !s.renamedTo) continue;
+		const e = { from: s.path, to: s.renamedTo.to, atMs: s.renamedTo.atMs };
+		if (!input.renames.some((x) => pk(x.from) === pk(e.from) && pk(x.to) === pk(e.to))) kept.push(e);
+	}
+	return kept.length === 0 ? input : { ...input, renames: [...input.renames, ...kept] };
+}
+
+/** The end of the observed rename chain starting at `key` (its last event), if any. */
+function renamedAway(renames: readonly ObservedRename[], key: PathKey, pk: PathKeyFn): { to: VaultPath; atMs: number } | null {
+	let at = key;
+	let last: ObservedRename | null = null;
+	for (const e of [...renames].sort((x, y) => x.atMs - y.atMs)) {
+		if (pk(e.from) !== at) continue;
+		at = pk(e.to);
+		last = e;
+	}
+	return last && at !== key ? { to: last.to, atMs: last.atMs } : null;
+}
+
+export function planWith(input0: PlannerInput, options: Partial<PlannerContext> = {}): Plan {
 	const ctx: PlannerContext = { ...DEFAULT_PLANNER_CONTEXT, ...options };
 	const pk = ctx.pathKey;
+	const input = withKeptRenames(input0, pk);
 	const units: PlanUnit[] = [];
 	const handled = new Set<DocId>();
 	const claimed = new Set<PathKey>();
@@ -481,7 +508,7 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 	 * path, with the file's content (`reconcileContent` records the synced path; otherwise a `syncedPut` does).
 	 */
 	const deletedRenamed = (s0: SyncedEntry, r: RemoteEntry, l2: LocalEntry, prefix: PlannerOp[]): void => {
-		const { fileGone: _gone, ...s } = s0;
+		const { fileGone: _gone, renamedTo: _to, ...s } = s0;
 		claimed.add(l2.pathKey);
 		if (l2.hash === null) return push([...prefix, { op: "needHash", path: l2.path }]);
 		if (r.pendingLocal) return push([...prefix, waitOp(s.docId, "pending-ns")]);
@@ -500,7 +527,7 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 	};
 
 	const liveMissing = (s0: SyncedEntry, origId: DocId, r: RemoteEntry, prefix: PlannerOp[]): void => {
-		const { fileGone, ...s } = s0;
+		const { fileGone, renamedTo: _to, ...s } = s0;
 		const docId = s.docId;
 		const inf = inferred.get(origId);
 		if (inf && !claimed.has(inf.to.pathKey)) {
@@ -529,7 +556,9 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		const hold = (...ops: PlannerOp[]): void => {
 			push([...prefix, ...ops]);
 			if (!fileGone && input.localComplete) {
-				push([{ op: "syncedPut", entry: { ...s, fileGone: true } }], "nsDelete", brakeKey("nsDelete", docId, s.path, s.contentHash), s.path);
+				const away = renamedAway(input.renames, s.pathKey, pk);
+				const entry: SyncedEntry = { ...s, fileGone: true, ...(away ? { renamedTo: away } : {}) };
+				push([{ op: "syncedPut", entry }], "nsDelete", brakeKey("nsDelete", docId, s.path, s.contentHash), s.path);
 			}
 		};
 		if (s.kind !== "blob" && (!r.body || !r.body.caughtUp)) return hold(waitOp(docId, "body-not-caught-up"));
@@ -635,7 +664,7 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		}
 		const found = movedAway.has(s.docId) ? { l: undefined, atRemote: false } : localFor(s, r);
 		if (found.atRemote && s.fileGone) {
-			const { fileGone: _gone, ...live } = s; // the doc's file is at its remote path: not gone, and the put records it there
+			const { fileGone: _gone, renamedTo: _to, ...live } = s; // the doc's file is at its remote path: not gone, and the put records it there
 			s = live;
 		}
 		const l = found.l;

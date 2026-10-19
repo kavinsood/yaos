@@ -168,7 +168,8 @@ test("row live/present/absent: edit-beats-delete waits for rename inference (ns 
 	const edited = { remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] };
 	const renamed = { ...edited, local: [L("b.md", h("c0"))], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
 	const gone: PlannerOp = { op: "syncedPut", entry: { ...S("d1", "a.md"), fileGone: true } };
-	assert.deepEqual(run(renamed, { nsReady: false }).ops, [gone]); // the file left a.md either way
+	// the file left a.md either way; the mark keeps the observed rename (test below)
+	assert.deepEqual(run(renamed, { nsReady: false }).ops, [{ op: "syncedPut", entry: { ...S("d1", "a.md"), fileGone: true, renamedTo: { to: "b.md", atMs: 1 } } }]);
 	assert.deepEqual(run({ ...edited, over: { localComplete: false } }).ops, []);
 	assert.deepEqual(run({ ...edited, local: [L("z.md", null)] }).ops, [gone, { op: "needHash", path: "z.md" }]);
 	// once ns is ready the observed rename wins: nsRename + reconcile at the new path
@@ -289,6 +290,34 @@ test("row live/present/absent: remote edited -> diskMaterialize (edit beats dele
 	// an unhashed new local file might be the renamed doc: no delete yet
 	const unhashed = run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], local: [L("z.md", null)] });
 	assert.deepEqual(unhashed.ops, [gone, { op: "needHash", path: "z.md" }]);
+});
+
+test("row live/present/absent: an observed rename that waits on ns survives an engine restart in the fileGone mark", () => {
+	// Sim hot canvas seed 705: B, offline after a crash (ns not ready), renamed c0 -> boards/c2, edited it and created
+	// a new c0. The pass marked the doc's file gone; the observed rename lived only in memory and a second crash
+	// dropped it. Online, the doc's file was gone and its path held a new file: edit beats delete merged the new
+	// canvas into the doc, deleting every record of the old one (A's concurrent text edit went with its node), and
+	// boards/c2 became a new doc.
+	const base = { remote: [R("d1", "a.canvas")], synced: [S("d1", "a.canvas")] };
+	const renames = [{ from: "a.canvas", to: "b.canvas", atMs: 7 }];
+	const waiting = run({ ...base, local: [L("b.canvas", h("c3"))], over: { renames } }, { nsReady: false });
+	const gone = { ...S("d1", "a.canvas"), fileGone: true as const, renamedTo: { to: "b.canvas", atMs: 7 } };
+	assert.deepEqual(waiting.ops, [{ op: "syncedPut", entry: gone }]);
+	// restarted (no observed renames), ns ready, a peer edited the doc, a new file at its old path
+	const edited = R("d1", "a.canvas", { body: { ...R("d1", "a.canvas").body!, version: V(11) } });
+	const after = run({ remote: [edited], synced: [gone], local: [L("a.canvas", h("c7")), L("b.canvas", h("c3"))] });
+	assert.deepEqual(find(after, "nsRename"), { op: "nsRename", docId: "d1", path: "b.canvas" });
+	assert.deepEqual(opsOf(after), ["nsRename", "reconcileContent"]);
+	assert.equal(find(after, "reconcileContent").path, "b.canvas");
+	// the new file at the old path is created once the doc's record has left it
+	const next = run({ remote: [R("d1", "b.canvas")], synced: [S("d1", "b.canvas", { contentHash: h("c3") })], local: [L("a.canvas", h("c7")), L("b.canvas", h("c3"))] });
+	assert.equal(find(next, "nsCreate").path, "a.canvas");
+	// the doc's record at the new path carries neither mark
+	const moved = run({ remote: [R("d1", "a.canvas")], synced: [gone], local: [L("b.canvas", h("c0"))] });
+	const put = find(moved, "syncedPut").entry;
+	assert.equal(put.path, "b.canvas");
+	assert.equal(put.fileGone, undefined);
+	assert.equal(put.renamedTo, undefined);
 });
 
 test("row live/present/absent: a delete that waits marks fileGone; a file re-created at the path is new, not a save", () => {

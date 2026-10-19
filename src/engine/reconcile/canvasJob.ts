@@ -146,7 +146,7 @@ async function rebaseOnDisk(env: Env, s: SyncedEntry, disk: CanvasRanked, F: Dis
 	const port = env.ctx.deps.hash;
 	const base = await hashBase(port, s.docId, canvasToMergeText(disk));
 	const contentHash = await canvasLogicalHash(port, disk.data);
-	const { fileGone: _gone, ...live } = s; // the disk holds the doc's file
+	const { fileGone: _gone, renamedTo: _to, ...live } = s; // the disk holds the doc's file
 	const entry = env.ctx.record({ ...live, contentHash, fingerprint: F, size: stat.size, mtimeMs: stat.mtimeMs, hasBase: base !== null });
 	return { entry, base };
 }

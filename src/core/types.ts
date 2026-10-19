@@ -432,6 +432,11 @@ export interface SyncedEntry {
 	 * ("pending-body"). The delete is decided: a file at `path` from now on is a new file, not this doc's.
 	 */
 	readonly fileGone?: true;
+	/**
+	 * With fileGone: the user's rename of the file, observed while inference was off (ns not ready). Observed renames
+	 * live in memory; this keeps the one that took the file away across an engine restart (the planner replays it).
+	 */
+	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
 }
 
 /** Vault event hint: a rename observed live; verified by the next reconcile. */
