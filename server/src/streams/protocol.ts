@@ -277,6 +277,87 @@ export function decodeServerFrame(bytes: Uint8Array): ServerStreamFrame {
 	throw new Error(`unknown server stream frame kind ${kind}`);
 }
 
+// ---- binary catch-up reads (relay-wire §7.2) -----------------------------------
+
+/**
+ * The read reply a client asks for with `Accept: STREAM_READ_BINARY_TYPE` (relay-wire §7.2). A relay without it
+ * ignores the header and answers JSON, so the client picks its parser by the reply's Content-Type.
+ */
+export const STREAM_READ_BINARY_TYPE = "application/vnd.yaos.streams-read.v1+binary";
+/** Byte 0 of a binary read reply. */
+export const STREAM_READ_BINARY_VERSION = 1;
+
+export interface StreamReadReplyPage {
+	stream: string;
+	lastSeq: number;
+	checkpointSeq: number;
+	gcSeq: number;
+	checkpoint: { coversSeq: number; bytes: Uint8Array } | null;
+	rows: StreamRow[];
+	nextAfter: number | null;
+}
+
+/**
+ * A single or batched read reply: `u8 1 | varstring vaultEpoch | varuint head | varuint pageCount`, then per page
+ * `varstring stream | varuint lastSeq | varuint checkpointSeq | varuint gcSeq | varuint nextAfter+1 (0: none) |
+ * u8 hasCheckpoint [varuint coversSeq | varbytes checkpoint] | varuint rowCount | row×rowCount` (rows as encodeRow).
+ * Payloads and checkpoints travel as raw bytes (the JSON reply carries them as base64).
+ */
+export function encodeReadReply(vaultEpoch: string, head: number, pages: readonly StreamReadReplyPage[]): Uint8Array {
+	const encoder = encoding.createEncoder();
+	encoding.writeUint8(encoder, STREAM_READ_BINARY_VERSION);
+	encoding.writeVarString(encoder, vaultEpoch);
+	encoding.writeVarUint(encoder, head);
+	encoding.writeVarUint(encoder, pages.length);
+	for (const page of pages) {
+		encoding.writeVarString(encoder, page.stream);
+		encoding.writeVarUint(encoder, page.lastSeq);
+		encoding.writeVarUint(encoder, page.checkpointSeq);
+		encoding.writeVarUint(encoder, page.gcSeq);
+		encoding.writeVarUint(encoder, page.nextAfter === null ? 0 : page.nextAfter + 1);
+		encoding.writeUint8(encoder, page.checkpoint ? 1 : 0);
+		if (page.checkpoint) {
+			encoding.writeVarUint(encoder, page.checkpoint.coversSeq);
+			encoding.writeVarUint8Array(encoder, page.checkpoint.bytes);
+		}
+		encoding.writeVarUint(encoder, page.rows.length);
+		for (const row of page.rows) {
+			encoding.writeVarUint(encoder, row.seq);
+			encoding.writeVarString(encoder, row.deviceId);
+			encoding.writeVarString(encoder, row.clientFrameId);
+			encoding.writeVarUint8Array(encoder, row.payload);
+		}
+	}
+	return encoding.toUint8Array(encoder);
+}
+
+/** Decodes a binary read reply (tests and tooling). Throws on malformed input. */
+export function decodeReadReply(bytes: Uint8Array): { vaultEpoch: string; head: number; pages: StreamReadReplyPage[] } {
+	const decoder = decoding.createDecoder(bytes);
+	const version = decoding.readUint8(decoder);
+	if (version !== STREAM_READ_BINARY_VERSION) throw new Error(`unknown read reply version ${version}`);
+	const vaultEpoch = decoding.readVarString(decoder);
+	const head = decoding.readVarUint(decoder);
+	const pages: StreamReadReplyPage[] = [];
+	for (let count = decoding.readVarUint(decoder); count > 0; count--) {
+		const stream = decoding.readVarString(decoder);
+		const lastSeq = decoding.readVarUint(decoder);
+		const checkpointSeq = decoding.readVarUint(decoder);
+		const gcSeq = decoding.readVarUint(decoder);
+		const nextAfterRaw = decoding.readVarUint(decoder);
+		const checkpoint = decoding.readUint8(decoder) === 1
+			? { coversSeq: decoding.readVarUint(decoder), bytes: decoding.readVarUint8Array(decoder) } : null;
+		const rows: StreamRow[] = [];
+		for (let rowCount = decoding.readVarUint(decoder); rowCount > 0; rowCount--) {
+			rows.push({ seq: decoding.readVarUint(decoder), deviceId: decoding.readVarString(decoder),
+				clientFrameId: decoding.readVarString(decoder), payload: decoding.readVarUint8Array(decoder) });
+		}
+		pages.push({ stream, lastSeq, checkpointSeq, gcSeq, checkpoint, rows, nextAfter: nextAfterRaw === 0 ? null : nextAfterRaw - 1 });
+	}
+	if (decoder.pos !== bytes.byteLength) throw new Error("trailing bytes in read reply");
+	return { vaultEpoch, head, pages };
+}
+
 // ---- stored row records (segment blobs) -------------------------------------
 
 export interface StreamRow {

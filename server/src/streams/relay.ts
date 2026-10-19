@@ -41,12 +41,14 @@ import {
 	STREAM_READ_MAX_BYTES,
 	STREAMS_CAPABILITY_VERSION,
 	STREAMS_DOCUMENT_ID,
+	STREAM_READ_BINARY_TYPE,
 	SUBSCRIPTION_ATTACHMENT_BYTES,
 	bytesEqual,
 	decodeAppendFrame,
 	encodeCommitNotice,
 	encodeCommitted,
 	encodeProvisional,
+	encodeReadReply,
 	encodeSkipped,
 	isProvisionalStream,
 	utf8Length,
@@ -1060,25 +1062,28 @@ export class StreamRelayService {
 	 * GET /streams/read?maxBytes=B&r=<after>.<0|1>.<stream>&r=... (at most STREAM_READ_BATCH_MAX_STREAMS entries):
 	 * the first page of each entry in request order under one maxBytes budget. The first entry always gets its
 	 * page (as a single read); a later page that would overrun the remaining budget ends the batch, and the
-	 * client re-requests the entries without a page.
+	 * client re-requests the entries without a page. `accept` naming STREAM_READ_BINARY_TYPE gets the binary reply
+	 * (relay-wire §7.2); errors stay JSON.
 	 */
-	read(url: URL): Response {
+	read(url: URL, accept: string | null = null): Response {
+		const binary = accept !== null && accept.includes(STREAM_READ_BINARY_TYPE);
 		const maxBytes = nonNegativeInteger(url.searchParams.get("maxBytes"), STREAM_READ_DEFAULT_BYTES);
 		if (maxBytes === null || maxBytes < 1) return json({ error: "invalid_max_bytes" }, 400);
 		const budget = Math.min(maxBytes, STREAM_READ_MAX_BYTES);
 		const entries = url.searchParams.getAll("r");
-		if (entries.length > 0) return this.readBatch(entries, budget);
+		if (entries.length > 0) return this.readBatch(entries, budget, binary);
 		const stream = url.searchParams.get("stream");
 		if (!validStreamName(stream)) return json({ error: "invalid_stream" }, 400);
 		const after = nonNegativeInteger(url.searchParams.get("after"), 0);
 		if (after === null) return json({ error: "invalid_cursor" }, 400);
 		return this.dailyLimitAware(() => {
 			const page = this.options.store().read(stream, after, budget, url.searchParams.get("checkpoint") === "1");
+			if (binary) return this.binaryRead([page]);
 			return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), ...wirePage(page) });
 		});
 	}
 
-	private readBatch(raw: string[], maxBytes: number): Response {
+	private readBatch(raw: string[], maxBytes: number, binary: boolean): Response {
 		if (raw.length > STREAM_READ_BATCH_MAX_STREAMS) return json({ error: "batch_too_large", max: STREAM_READ_BATCH_MAX_STREAMS }, 400);
 		const entries: { stream: string; after: number; checkpoint: boolean }[] = [];
 		for (const entry of raw) {
@@ -1090,17 +1095,25 @@ export class StreamRelayService {
 		}
 		return this.dailyLimitAware(() => {
 			const store = this.options.store();
-			const pages: ReturnType<typeof wirePage>[] = [];
+			const pages: StreamReadPage[] = [];
 			let left = maxBytes;
 			for (const entry of entries) {
 				if (pages.length > 0 && left <= 0) break;
 				const page = store.read(entry.stream, entry.after, pages.length > 0 ? left : maxBytes, entry.checkpoint);
 				const size = (page.checkpoint?.bytes.byteLength ?? 0) + page.rows.reduce((total, row) => total + row.payload.byteLength, 0);
 				if (pages.length > 0 && size > left) break;
-				pages.push(wirePage(page));
+				pages.push(page);
 				left -= size;
 			}
-			return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), pages });
+			if (binary) return this.binaryRead(pages);
+			return json({ vaultEpoch: this.options.vaultGeneration(), head: this.head(), pages: pages.map(wirePage) });
+		});
+	}
+
+	/** The binary read reply (relay-wire §7.2): one page for a single read, the served prefix for a batch. */
+	private binaryRead(pages: readonly StreamReadPage[]): Response {
+		return new Response(encodeReadReply(this.options.vaultGeneration(), this.head(), pages), {
+			headers: { "Content-Type": STREAM_READ_BINARY_TYPE, "Cache-Control": "no-store" },
 		});
 	}
 

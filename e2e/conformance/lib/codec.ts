@@ -138,3 +138,34 @@ export function decodeServerFrame(bytes: Uint8Array): ServerFrame {
 	if (r.pos !== bytes.byteLength) throw new Error(`server frame has ${bytes.byteLength - r.pos} trailing bytes`);
 	return frame;
 }
+
+/** Accept / Content-Type of the binary read reply (relay-wire §7.2). */
+export const READ_BINARY_TYPE = "application/vnd.yaos.streams-read.v1+binary";
+
+export interface BinaryReadPage {
+	stream: string; lastSeq: number; checkpointSeq: number; gcSeq: number; nextAfter: number | null;
+	checkpoint: { coversSeq: number; bytes: Uint8Array } | null;
+	rows: Array<{ seq: number; deviceId: string; clientFrameId: string; payload: Uint8Array }>;
+}
+
+/** relay-wire §7.2: `u8 1 | varstring vaultEpoch | varuint head | varuint pageCount | page*`. Throws on malformed input. */
+export function decodeReadReply(bytes: Uint8Array): { vaultEpoch: string; head: number; pages: BinaryReadPage[] } {
+	const r = new Reader(bytes);
+	if (r.u8() !== 1) throw new Error("unknown read reply version");
+	const vaultEpoch = r.varString();
+	const head = r.varUint();
+	const pages: BinaryReadPage[] = [];
+	for (let n = r.varUint(); n > 0; n--) {
+		const stream = r.varString();
+		const lastSeq = r.varUint();
+		const checkpointSeq = r.varUint();
+		const gcSeq = r.varUint();
+		const nextAfterRaw = r.varUint();
+		const checkpoint = r.u8() === 1 ? { coversSeq: r.varUint(), bytes: r.varBytes() } : null;
+		const rows: BinaryReadPage["rows"] = [];
+		for (let k = r.varUint(); k > 0; k--) rows.push({ seq: r.varUint(), deviceId: r.varString(), clientFrameId: r.varString(), payload: r.varBytes() });
+		pages.push({ stream, lastSeq, checkpointSeq, gcSeq, nextAfter: nextAfterRaw === 0 ? null : nextAfterRaw - 1, checkpoint, rows });
+	}
+	if (r.pos !== bytes.byteLength) throw new Error("trailing bytes");
+	return { vaultEpoch, head, pages };
+}

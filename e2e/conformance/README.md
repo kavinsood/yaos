@@ -45,6 +45,7 @@ node e2e/conformance/run.ts --host https://<worker>.workers.dev --label <label> 
 | T-SUBSCRIBE-FILTER | A subscribed reader gets PROVISIONAL/NOTICE only for its streams, COMMITTED for vault-global streams, STREAM_SKIPPED for the rest, every seq once and ascending; the own device's other socket gets its rows, never skips; a socket that never subscribed is unchanged |
 | T-SUBSCRIBE-ORDER | A subscribed socket that also writes: skipped seqs ascend, and none below a receipt's seq arrives after that receipt |
 | T-SUBSCRIBE-REJECT | `STREAM_SUBSCRIBE_REJECTED invalid` / `too_many`, the previous set keeps filtering; 128 distinct names plus repeats are accepted |
+| T-READ-BINARY | `Accept: application/vnd.yaos.streams-read.v1+binary` on a single and a batched read: the binary reply (relay-wire §7.2) with the same pages as JSON and raw payloads; errors stay JSON |
 | T-RATE-SOCKET | Bursting past the socket bucket → `VAULT_BACKPRESSURE relay_rate_limit` then 1013; the committed rows form a prefix; resends dedupe to the same seqs |
 
 ### Decision and hardening (most are expected to fail before the rewrite)

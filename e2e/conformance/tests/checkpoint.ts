@@ -7,6 +7,7 @@ import { brief, http } from "../lib/http.ts";
 import type { HttpResult } from "../lib/http.ts";
 import { checkpointPath, readAll } from "../lib/streams.ts";
 import { StreamSocket } from "../lib/socket.ts";
+import { decodeReadReply, READ_BINARY_TYPE } from "../lib/codec.ts";
 import { b64, bytesEqual, id, payloadOf } from "../lib/util.ts";
 
 /** Appends `n` small rows to a fresh stream with device A of `v`; returns stream + seqs. */
@@ -146,6 +147,36 @@ export const tests: TestDef[] = [
 			t.check("read checkpoint=1: checkpoint@coversSeq + rows above", withCkpt.value?.checkpoint?.coversSeq === covers
 				&& withCkpt.value?.rows?.map((r: any) => r.seq).join() === seeded.seqs.slice(3).join(),
 			brief(withCkpt, { checkpoint: withCkpt.value?.checkpoint?.coversSeq ?? null, rows: withCkpt.value?.rows?.map((r: any) => r.seq) }));
+		},
+	},
+	{
+		id: "T-READ-BINARY", group: "baseline", area: "§7.2 binary read", expectedBefore: "PASS",
+		async run(ctx, t) {
+			const v = await vault(ctx, "main");
+			const one = await seedStream(ctx, v, "rbin", 3, 300);
+			const two = await seedStream(ctx, v, "rbim", 1, 100);
+			const token = v.owner.token;
+			const binary = async (query: string) => {
+				const response = await fetch(`${ctx.host}${v.path}/streams/read?${query}`, {
+					headers: { Authorization: `Bearer ${token}`, Accept: READ_BINARY_TYPE }, signal: AbortSignal.timeout(60000) });
+				const type = response.headers.get("content-type") ?? "";
+				return { status: response.status, type, reply: type.startsWith(READ_BINARY_TYPE) ? decodeReadReply(new Uint8Array(await response.arrayBuffer())) : null };
+			};
+			t.expect("Accept: binary -> 200 with the binary type; the same rows and fields as JSON, payloads raw");
+			const json = await http(ctx, "GET", `${v.path}/streams/read?stream=${encodeURIComponent(one.stream)}&after=0`, { token });
+			const single = await binary(`stream=${encodeURIComponent(one.stream)}&after=0`);
+			const page = single.reply?.pages[0];
+			t.check("single read: binary type, one page", single.status === 200 && single.reply?.pages.length === 1 && page?.stream === one.stream,
+				{ status: single.status, type: single.type });
+			t.check("single read: seqs, lastSeq and nextAfter match JSON", !!page && page.rows.map((r) => r.seq).join() === json.value?.rows?.map((r: any) => r.seq).join()
+				&& page.lastSeq === json.value?.lastSeq && page.nextAfter === json.value?.nextAfter, { rows: page?.rows.map((r) => r.seq) });
+			t.check("single read: payloads equal the appended bytes", !!page && page.rows.every((r, i) => bytesEqual(r.payload, one.items[i]!.payload))
+				&& json.value?.rows?.every((r: any, i: number) => bytesEqual(b64(r.payload), one.items[i]!.payload)));
+			const batch = await binary(`r=0.0.${encodeURIComponent(one.stream)}&r=0.0.${encodeURIComponent(two.stream)}`);
+			t.check("batched read: pages in request order", batch.status === 200 && batch.reply?.pages.map((p) => p.stream).join() === [one.stream, two.stream].join()
+				&& batch.reply.pages[1]!.rows.map((r) => r.seq).join() === two.seqs.join(), { pages: batch.reply?.pages.map((p) => p.rows.length) });
+			const bad = await binary("after=0");
+			t.check("an error stays JSON", bad.status === 400 && bad.reply === null && bad.type.includes("json"), { status: bad.status, type: bad.type });
 		},
 	},
 ];

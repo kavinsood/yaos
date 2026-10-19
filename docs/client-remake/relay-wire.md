@@ -414,7 +414,8 @@ Normative. Code: `server/src/streams/relay.ts` (`subscribe`, `wants`, `flush`), 
 }
 ```
 
-- **Rows.** Returned oldest first, exactly as appended: unmerged, with standard base64 payloads.
+- **Rows.** Returned oldest first, exactly as appended: unmerged, with standard base64 payloads (raw in the binary
+  reply, §7.2).
 - **Checkpoint inclusion.** `checkpoint` is included when `checkpointSeq > 0` and either:
   - `after < gcSeq` (the rows were collected, so the checkpoint is mandatory); or
   - `checkpoint=1` and `after < checkpointSeq` (you prefer the checkpoint to replaying rows).
@@ -445,6 +446,35 @@ form.
   Durable Object calls, then the vault Durable Object). A fresh device reads one stream per note, so one request
   per stream made a 1000-note bootstrap take a minute; batching makes it a handful of requests.
 - **Errors.** As above, plus `400 invalid_read_entry` and `400 batch_too_large`.
+
+### 7.2 Binary read reply
+
+A single or batched read sent with `Accept: application/vnd.yaos.streams-read.v1+binary` is answered `200` with
+that Content-Type and a lib0 binary body instead of JSON:
+
+```
+u8        1                               format version
+varstring vaultEpoch
+varuint   head
+varuint   pageCount                       1 for a single read; the served prefix for a batch
+page × pageCount:
+  varstring stream
+  varuint   lastSeq | checkpointSeq | gcSeq
+  varuint   nextAfter + 1                 0 = null
+  u8        hasCheckpoint                 1: varuint coversSeq | varbytes checkpoint
+  varuint   rowCount
+  row × rowCount: varuint seq | varstring deviceId | varstring clientFrameId | varbytes payload
+```
+
+- **Same pages.** Every field, the checkpoint rule, paging and the batch budget are those of §7 and §7.1. Only the
+  encoding differs: payloads and checkpoints are raw bytes. Base64 inside JSON costs 4/3 of them, and parsing the
+  JSON costs more again.
+- **Errors stay JSON.** Any non-`200` reply keeps the JSON error body and Content-Type.
+- **Negotiation.** There is no capability flag. A relay without the format ignores `Accept` and answers JSON. The
+  client always sends the header and picks its parser by the reply's Content-Type, so old and new relays and
+  clients mix freely.
+- **CORS.** `Accept` with this value is a CORS-safelisted request header and Content-Type is a safelisted response
+  header, so the browser preflight is unchanged.
 
 ## 8. Checkpoint (CAS put + GC)
 

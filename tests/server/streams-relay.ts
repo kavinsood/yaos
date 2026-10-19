@@ -15,7 +15,9 @@ import {
 	MAX_STREAM_BINARY_MESSAGE_BYTES,
 	MAX_STREAM_PAYLOAD_BYTES,
 	MAX_STREAM_SUBSCRIPTIONS,
+	STREAM_READ_BINARY_TYPE,
 	decodeAppendFrame,
+	decodeReadReply,
 	decodeRows,
 	decodeServerFrame,
 	encodeAppendFrame,
@@ -793,6 +795,44 @@ s.test("checkpoint: CAS ok, conflict, not advancing, ahead of stream; GC of seal
 		assert.equal(retired.checkpoint?.coversSeq, 5);
 		assert.deepEqual(retired.rows, [], "only the checkpoint is left");
 		assert.equal((await read("stream=b:gc&after=5")).checkpoint, null);
+	});
+});
+
+s.test("binary read (relay-wire §7.2): Accept gets raw rows and checkpoints, same pages as JSON; errors stay JSON", async () => {
+	await withStreams(async ({ connect, append, timers, service }) => {
+		const a = connect();
+		append(a, "b:one", "o-1", new Uint8Array([0, 255, 7]));
+		append(a, "b:one", "o-2", "two");
+		append(a, "b:two", "t-1", "three");
+		timers.advance(300);
+		const ckpt = "stream=b:two&coversSeq=3&expectedCoversSeq=0";
+		assert.equal((await service.putCheckpoint(new Request(`https://do/streams/checkpoint?${ckpt}`, { method: "PUT", body: bytes("ck") }),
+			new URL(`https://do/streams/checkpoint?${ckpt}`))).status, 200);
+		const binary = async (query: string) => {
+			const response = service.read(new URL(`https://do/streams/read?${query}`), `${STREAM_READ_BINARY_TYPE}, application/json`);
+			assert.equal(response.headers.get("content-type"), STREAM_READ_BINARY_TYPE);
+			return decodeReadReply(new Uint8Array(await response.arrayBuffer()));
+		};
+		const asJson = async (query: string) => await service.read(new URL(`https://do/streams/read?${query}`)).json() as Record<string, unknown>;
+		const single = await binary("stream=b:one&after=0&maxBytes=1");
+		assert.equal(single.pages.length, 1);
+		assert.equal(single.head, 3);
+		const page = single.pages[0]!;
+		const json = await asJson("stream=b:one&after=0&maxBytes=1");
+		assert.deepEqual([page.stream, page.lastSeq, page.checkpointSeq, page.gcSeq, page.nextAfter],
+			[json.stream, json.lastSeq, json.checkpointSeq, json.gcSeq, json.nextAfter]);
+		assert.deepEqual(page.rows.map((row) => [row.seq, [...row.payload]]), [[1, [0, 255, 7]]], "raw payload bytes, one row under maxBytes=1");
+		const batch = await binary("r=0.0.b:one&r=0.1.b:two&r=0.0.missing");
+		assert.deepEqual(batch.pages.map((p) => p.stream), ["b:one", "b:two", "missing"]);
+		assert.deepEqual(batch.pages[0]!.rows.map((row) => text(row.payload)).slice(1), ["two"]);
+		assert.equal(batch.pages[0]!.nextAfter, null);
+		assert.equal(text(batch.pages[1]!.checkpoint!.bytes), "ck", "checkpoint bytes raw");
+		assert.equal(batch.pages[1]!.checkpoint!.coversSeq, 3);
+		assert.deepEqual(batch.pages[2]!.rows, []);
+		const error = service.read(new URL("https://do/streams/read?after=0"), STREAM_READ_BINARY_TYPE);
+		assert.equal(error.status, 400);
+		assert.deepEqual(await error.json(), { error: "invalid_stream" });
+		assert.match(service.read(new URL("https://do/streams/read?stream=b:one"), "application/json").headers.get("content-type") ?? "", /json/);
 	});
 });
 
