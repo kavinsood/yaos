@@ -383,7 +383,8 @@ export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[]
  *                fields at the top level, on nodes and on edges are tracked fields
  *   order        an uncontested reorder holds: "bring to front / send to back" of node n on device X still puts n
  *                above / below every node that was on the canvas then, unless another device reordered n or one of
- *                those nodes, X reordered them later, a program sorted them, or a conflict copy holds them
+ *                those nodes, X reordered them later, a program sorted them, or a copy holds them (a conflict
+ *                copy, or another doc: the duplicate a re-onboarding after a wipe or an epoch migration leaves)
  */
 export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): Violation[] {
 	const out: Violation[] = [];
@@ -511,9 +512,12 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 	}
 
 	// order
-	const inCopy = (id: string) => (holders.get(`n:${id}`) ?? []).some((h) => isConflictCopy(h.path));
+	// A copy of the reordered canvas holds the node: a conflict copy, or another doc (the duplicate a wipe or an epoch
+	// migration leaves under a suffixed name when the device re-onboards its file), like the delete rule's copies.
+	const inCopy = (id: string, doc: string | null) => (holders.get(`n:${id}`) ?? []).some((h) => isConflictCopy(h.path) || (doc !== null && h.doc !== null && h.doc !== doc));
 	for (const r of oracle.reorders) {
-		if (deletedNode(r.node) || oracle.sorted.has(r.node) || inCopy(r.node)) continue;
+		const inCopy1 = (id: string) => inCopy(id, r.doc);
+		if (deletedNode(r.node) || oracle.sorted.has(r.node) || inCopy1(r.node)) continue;
 		const group = new Set([r.node, ...r.siblings]);
 		if (oracle.reorders.some((x) => x.dev !== r.dev && group.has(x.node))) continue;
 		if (oracle.reorders.some((x) => x.dev === r.dev && x.node === r.node && x.atMs > r.atMs)) continue;
@@ -524,7 +528,7 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 			if (at < 0) continue;
 			for (const m of r.siblings) {
 				const mi = ids.indexOf(m);
-				if (mi < 0 || deletedNode(m) || oracle.sorted.has(m) || inCopy(m)) continue;
+				if (mi < 0 || deletedNode(m) || oracle.sorted.has(m) || inCopy1(m)) continue;
 				if (oracle.reorders.some((x) => x.dev === r.dev && x.node === m && x.atMs > r.atMs)) continue;
 				if (r.front ? at < mi : at > mi) bad(`reorder of ${r.node} to the ${r.front ? "front" : "back"} on ${r.dev} at step ${r.step} lost against ${m} in ${path}`);
 			}

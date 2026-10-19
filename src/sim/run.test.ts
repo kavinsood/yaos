@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generatePlan, minimizePlan, runSim, type SimConfig, type SimReport, type Step } from "./run";
-import { BLOB_FAULTS, CANVAS_FAULTS, DEFAULT_FAULTS } from "./faults";
+import { BLOB_FAULTS, CANVAS_FAULTS, DEFAULT_FAULTS, E2EE_FAULTS } from "./faults";
 import type { SimBlobLiveness } from "./blobStore";
 import { checkCanvas, checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
 import { ABSENT, CANVAS_HOT_OPS, CanvasOracle, type FieldWrite } from "./canvas";
@@ -22,6 +22,13 @@ test("sim tuning: the causal-hole re-read window outlasts an own frame's retry (
 	assert.ok(window >= 2 * t.provisionalAdoptMs!, `window ${window} ms < 2 x provisionalAdoptMs`);
 	// sender.ts: durability retry and the daily-limit floor are both DURABILITY_RETRY_MS (untuned); then a group commit.
 	assert.ok(window >= 2 * DURABILITY_RETRY_MS, `window ${window} ms < 2 x the own-frame retry`);
+});
+
+// Suite-1 seed 34: an epoch restore made revoked B re-onboard; its canvas, holding B's "bring to front", collided
+// with the restored doc and survives as "c5 (2).canvas", a copy like a conflict copy. Pinned with E2EE.
+test("sim: a reorder kept only in the duplicate an epoch migration leaves is not lost (suite-1 seed 34)", async () => {
+	const r = await runSim({ seed: 34, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
