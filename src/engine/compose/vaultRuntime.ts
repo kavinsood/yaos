@@ -386,8 +386,13 @@ export class VaultRuntime {
 	}
 
 	onLogStatus(s: StatusSnapshot): void {
+		const was = this.lastLog?.phase;
 		this.lastLog = s;
 		if (this.stopped) return;
+		// Writes are back (a re-key settled the vault key): the passes that failed on the write gate meanwhile only
+		// retry on their backoff (up to a minute), so plan the vault now; local deletes and edits made while
+		// key-missing go out at once.
+		if (was === "key-missing" && s.phase !== "key-missing" && this.rec) this.sched.request({ t: "full" }, true);
 		// upgrade-required with a session: a fold is halted for a newer writer (§c.10) and the session caught up;
 		// the planner's nsReady and the cfg / snap readiness still see that fold's halt.
 		if ((s.phase === "live" || (s.phase === "upgrade-required" && s.relay.connected)) && !this.port.nsCaughtUp && this.rec) {

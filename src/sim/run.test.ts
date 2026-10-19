@@ -31,6 +31,13 @@ test("sim: a reorder kept only in the duplicate an epoch migration leaves is not
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Suite-1 seed 23: C, revoked, deleted an attachment while key-missing; its passes failed on the write gate and
+// backed off. Re-keyed, it planned nothing until the backoff ran out (past the heal), so the delete never left.
+test("sim: a delete made while key-missing goes out once the device is re-keyed (suite-1 seed 23)", async () => {
+	const r = await runSim({ seed: 23, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */
