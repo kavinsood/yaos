@@ -139,7 +139,6 @@ export const TAIL_HARD_ROWS = 2_000;
 export const ECHO_TTL_MS = 10_000;
 /** mtime within this window of the hash time is racily clean: re-hash next pass. */
 export const RACY_WINDOW_MS = 2_000;
-export const BOUND_BASE_PERSIST_MS = 60_000;
 
 // --- Safety brake defaults --------------------------------------------------
 
@@ -153,12 +152,10 @@ export const BRAKE_OVERWRITE_SHRINK_RATIO = 0.5;
 // --- Stores -----------------------------------------------------------------
 
 export const QUARANTINE_MAX_RECORDS = 500;
-export const QUARANTINE_MAX_BYTES = 32 * 1024 * 1024;
 export const QUARANTINE_ROW_BYTES = 256 * 1024;
 export const OUTBOX_SOFT_BYTES = 16 * 1024 * 1024;
 export const OUTBOX_MIRROR_MAX_BYTES = 32 * 1024 * 1024;
 export const OUTBOX_MIRROR_DEBOUNCE_MS = 1_000;
-export const OUTBOX_MIRROR_TRIM_DEBOUNCE_MS = 5_000;
 export const SYNCED_MIRROR_DEBOUNCE_MS = 30_000;
 
 // --- Settings sync (DESIGN §j.3; legacy settingsSync/types.ts) ---------------
@@ -232,8 +229,6 @@ export interface Budgets {
 	readonly maxResidentDocs: number;
 	/** Estimated Y.Doc heap (3 x encoded state). */
 	readonly maxResidentBytes: number;
-	/** Worker cooperative slice before yielding to the message loop. */
-	readonly sliceMs: number;
 	/** Parallel stream reads for catch-up. */
 	readonly catchUpConcurrency: number;
 	/**
@@ -255,25 +250,25 @@ export interface Budgets {
 
 export const BUDGETS: Readonly<Record<DeviceClass, Budgets>> = {
 	desktop: {
-		maxResidentDocs: 400, maxResidentBytes: 256 * 1024 * 1024, sliceMs: 10,
+		maxResidentDocs: 400, maxResidentBytes: 256 * 1024 * 1024,
 		catchUpConcurrency: 8, blobBytesInFlight: 64 * 1024 * 1024, maxInflightAppendBytes: 1024 * 1024,
 		maxDiskIoBytesInFlight: 8 * 1024 * 1024, diskOpsPerBatch: 32, mainSliceMs: 8,
 		fullReconcileIntervalMs: 5 * 60_000, dailyFrameSoftBudget: 20_000, docUpdateWindowBytes: 512 * 1024,
 	},
 	tablet: {
-		maxResidentDocs: 120, maxResidentBytes: 96 * 1024 * 1024, sliceMs: 10,
+		maxResidentDocs: 120, maxResidentBytes: 96 * 1024 * 1024,
 		catchUpConcurrency: 4, blobBytesInFlight: 32 * 1024 * 1024, maxInflightAppendBytes: 512 * 1024,
 		maxDiskIoBytesInFlight: 4 * 1024 * 1024, diskOpsPerBatch: 16, mainSliceMs: 6,
 		fullReconcileIntervalMs: 10 * 60_000, dailyFrameSoftBudget: 10_000, docUpdateWindowBytes: 256 * 1024,
 	},
 	phone: {
-		maxResidentDocs: 60, maxResidentBytes: 48 * 1024 * 1024, sliceMs: 8,
+		maxResidentDocs: 60, maxResidentBytes: 48 * 1024 * 1024,
 		catchUpConcurrency: 3, blobBytesInFlight: 16 * 1024 * 1024, maxInflightAppendBytes: 512 * 1024,
 		maxDiskIoBytesInFlight: 2 * 1024 * 1024, diskOpsPerBatch: 16, mainSliceMs: 5,
 		fullReconcileIntervalMs: 10 * 60_000, dailyFrameSoftBudget: 6_000, docUpdateWindowBytes: 256 * 1024,
 	},
 	constrained: {
-		maxResidentDocs: 24, maxResidentBytes: 24 * 1024 * 1024, sliceMs: 6,
+		maxResidentDocs: 24, maxResidentBytes: 24 * 1024 * 1024,
 		catchUpConcurrency: 2, blobBytesInFlight: 8 * 1024 * 1024, maxInflightAppendBytes: 256 * 1024,
 		maxDiskIoBytesInFlight: 1024 * 1024, diskOpsPerBatch: 8, mainSliceMs: 4,
 		fullReconcileIntervalMs: 15 * 60_000, dailyFrameSoftBudget: 4_000, docUpdateWindowBytes: 128 * 1024,

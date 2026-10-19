@@ -17,7 +17,7 @@
  */
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 import { bytesToHex } from "../../src/core/codec/lib0";
-import { makeRecoveryKey } from "../../src/core/codec/recoveryKey";
+import { makeRecoveryKey } from "../../src/core/codec/testkit/recoveryKey";
 import { VaultKeyStore } from "../../src/host/keys/secretStore";
 import { YaosController } from "../../src/host/pluginController";
 import { DEFAULT_ENGINE_SETTINGS, defaultPluginData, type PairedIdentity, type YaosPluginData } from "../../src/host/ui/api";

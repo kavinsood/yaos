@@ -8,7 +8,7 @@
  */
 
 import { pathKey as defaultPathKey } from "../../core/paths/pathKey";
-import { utf8Decode } from "../../core/hash/utf8";
+import { utf8Decode } from "../../core/codec/lib0";
 import { DEFAULT_MERGE_LIMITS, merge } from "../../core/merge/merge";
 import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
 import { conflictCopyNotice, conflictName } from "../../core/plan/conflictName";

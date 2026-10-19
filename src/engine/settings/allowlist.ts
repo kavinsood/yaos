@@ -103,14 +103,6 @@ export function canApplyPluginData(localManifestVersion: string | null, pluginVe
 		&& localManifestVersion === pluginVersion;
 }
 
-/** Ported configDirKey: basename(app.vault.configDir) sanitized, or null. */
-export function sanitizeConfigDirKey(basename: string): string | null {
-	if (basename.length === 0 || basename.length > 64) return null;
-	if (basename === "." || basename === "..") return null;
-	if (basename.includes("/") || basename.includes("\\") || basename.includes("\0")) return null;
-	return basename;
-}
-
 export interface PluginManifestInfo {
 	readonly version: string | null;
 	/** Display name. */

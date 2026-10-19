@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sealedBlobBytes } from "../../core/codec/sealedBlob";
+import { sealedBlobBytes } from "../../core/codec/testkit/sealedBlobSize";
 import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { snapPartBytes } from "../../core/snap/bundle";
 import { snapLive } from "../../core/snap/fold";

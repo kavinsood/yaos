@@ -569,16 +569,3 @@ export function applyEditsTo(target: TextSink, from: string, edits: readonly Tex
 		if (m > e.start) target.delete(e.start, m - e.start);
 	}
 }
-
-/** Apply ascending non-overlapping edits (reference implementation; the engine applies to Y.Text). */
-export function applyTextEdits(from: string, edits: readonly TextEdit[]): string {
-	const parts: string[] = [];
-	let cursor = 0;
-	for (const edit of edits) {
-		if (edit.start < cursor || edit.end < edit.start) throw new Error("edits must be ascending and non-overlapping");
-		parts.push(from.slice(cursor, edit.start), edit.text);
-		cursor = edit.end;
-	}
-	parts.push(from.slice(cursor));
-	return parts.join("");
-}

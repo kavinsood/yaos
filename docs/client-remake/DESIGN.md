@@ -1221,7 +1221,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | Soft `OUTBOX_SOFT_BYTES` (16 MiB): builders stretch, notice. **Never dropped** |
-| `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes + hash: ≤ 256 KiB for a deterministic failure, whole for a reader-dependent one so it can be re-gated) | `QUARANTINE_MAX_RECORDS` / `_BYTES`; oldest evicted (the doc stays frozen) |
+| `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes + hash: ≤ 256 KiB for a deterministic failure, whole for a reader-dependent one so it can be re-gated) | `QUARANTINE_MAX_RECORDS` (500), by count only (no byte bound); oldest evicted (the doc stays frozen) |
 | `synced` | `docId` | — | `SyncedRecord` | 1 per synced doc |
 | `baseText` | `docId` | — | `BaseTextRecord` (deflated, ≤ `MAX_BASE_TEXT_CHARS`) | markdown/canvas synced docs |
 | `localTree` | `pathKey` | — | `LocalTreeRecord` | 1 per vault file |
@@ -1313,8 +1313,7 @@ frameCount × {
 ```
 
 - **Write:**
-  - debounce `OUTBOX_MIRROR_DEBOUNCE_MS` after any outbox put, and `OUTBOX_MIRROR_TRIM_DEBOUNCE_MS` after
-    receipts;
+  - debounce `OUTBOX_MIRROR_DEBOUNCE_MS` after any outbox change (puts, receipts, state changes);
   - immediately on `hidden` / `pagehide`;
   - the target is the slot with the lower or invalid generation.
 - **Size limit.** Over `OUTBOX_MIRROR_MAX_BYTES`, the mirror keeps all ns/cfg/snap frames first, then body frames by
@@ -1378,9 +1377,9 @@ All are in `src/core/types.ts`.
     `src/core/hash/digest.ts:11`), like every other digest: blobs, canvas, config, snapshots, mirrors, brake ids.
     Core's pure-JS SHA-256 throws a `RangeError` above `SYNC_HASH_MAX_BYTES` (4096 B, `src/core/limits.ts:100`,
     `src/core/hash/sha256.ts:22-23`), in production too. It takes only bounded inputs: the
-    empty-content hash (`src/core/plan/planner.ts:67`), the recovery key's 32-byte check
-    (`src/core/codec/recoveryKey.ts:26`, `:34`), cfg's `H_TRUE` (4 B, `src/engine/settings/cfgPlan.ts:98`) and the
-    resident-text fallback below.
+    empty-content hash (`src/core/plan/planner.ts:67`), cfg's `H_TRUE` (4 B, `src/engine/settings/cfgPlan.ts:98`)
+    and the resident-text fallback below. The recovery key's checksum is a `hashRequest` (`rkChecksum`,
+    `src/host/pluginController.ts:368`).
   - `streams.textHash` of a resident replica (the planner's remote hash for a caught-up markdown/canvas doc) is
     digested through `HashPort` before each pass reads the view (`warmTextHashes`,
     `src/engine/compose/logPort.ts:114-130`, called at `src/engine/reconcile/reconciler.ts:165`). A replica that
@@ -1940,8 +1939,7 @@ The host picks the class and passes it in `EngineInitConfig.deviceClass`:
 | `phone` | mobile and not a tablet |
 | `constrained` | mobile with `deviceMemoryGiB` < 3 or `hardwareConcurrency` ≤ 2 |
 
-Budgets (`BUDGETS` in `limits.ts`). `Budgets.sliceMs` (`src/core/limits.ts:236`) is set (10 / 10 / 8 / 6 ms) but
-never read.
+Budgets (`BUDGETS` in `limits.ts`).
 
 | | desktop | tablet | phone | constrained |
 |---|---|---|---|---|
@@ -2149,7 +2147,7 @@ ones get conflict copies.
   - **Validation:** unique string ids; node `type ∈ {text, file, link, group}`; numeric `x / y / width / height`;
     edges reference existing nodes (dangling edges are dropped from the projection, kept in the CRDT). Invalid →
     freeze `canvas-invalid`.
-- **Merge.** The ONE `MergeFn` runs over the canonical record-per-line text (`canonicalCanvasItemBytes` with rank),
+- **Merge.** The ONE `MergeFn` runs over the canonical record-per-line text (`canvasToMergeText`: one node or edge and its rank per line),
   so concurrent edits to different nodes merge, and the same node conflicts.
   - The CRDT apply is record-level: changed fields are set, and the `text` field gets a minimal `Y.Text` diff. Node
     maps are never replaced wholesale.
@@ -2647,7 +2645,7 @@ The old client was deleted once the port was done, and the legacy server's share
 | `adfa7a7:src/sync/boundedTextDiff.ts`, `diff.ts` (`tryApplyDiffToYText` only) | `src/core/merge/minimalDiff.ts`, `src/engine/reconcile/mergeJob.ts` | Minimal diff + CAS apply. `forceReplaceYText` is **dropped** |
 | `adfa7a7:src/sync/dailyLimit.ts` | `src/engine/adapters/relayHttp.ts` (`dailyResetDelayMs`), `src/engine/runtime/relayPolicy.ts` (retry), `src/engine/runtime/dailyLimit.ts` (notice gate + text) | `resetAt` parsing, probe schedule, notice gate |
 | `server/src/shared/socketCloseCodes.ts` | `src/engine/adapters/wsRelay.ts` | Mapped onto `RELAY_CLOSE` / `RelayEvent.closed` |
-| `adfa7a7:src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*`, `src/core/cfg/projection.ts` | Allowlist, plugin version gate, canonical JSON |
+| `adfa7a7:src/sync/settingsSync/{allowlist,dataJsonGate,configDirKey}.ts`, `lwwReconcile.ts` (canonical JSON) | `src/engine/settings/*` | Allowlist, plugin version gate, canonical JSON |
 | `adfa7a7:src/utils/{randomId,sha256,semver,defaultDeviceName,format}.ts` | `src/core/codec/ids.ts`, `src/engine/adapters/webHash.ts`, `src/host/*` | Ids become 16-byte base64url |
 | `adfa7a7:src/snapshots/{snapshotService,vaultExport}.ts` | `src/engine/snapshots/snapshotJob.ts` | Zip writing only |
 | `adfa7a7:src/onboarding/{provisioningClient,localVaultImport}.ts` | `src/host/ui/pairing.ts`, §j.5 | Pairing HTTP calls. Import is now just "plan L-only files" |

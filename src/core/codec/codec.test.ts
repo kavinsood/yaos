@@ -3,14 +3,15 @@ import assert from "node:assert/strict";
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import { deflateSync } from "fflate";
-import { CodecError, Reader, Writer, bytesToHex, hexToBytes, hasLoneSurrogate } from "./lib0";
+import { CodecError, Reader, Writer, bytesToHex, hexToBytes, hasLoneSurrogate, utf8ByteLength, utf8Decode, utf8Encode } from "./lib0";
+import { prng } from "../merge/testkit/prng";
 import { base64urlDecode, base64urlEncode, isDocId, newDocId } from "./ids";
 import {
 	DEFLATE_MIN_BYTES,
 	checkpointAad,
 	decodeInner,
 	decodeOuter,
-	encodeInner,
+	encodeInnerFlags,
 	encodeOuter,
 	frameAad,
 	identityCrypto,
@@ -83,6 +84,31 @@ test("lib0: varstring matches lib0, strict UTF-8, BOM kept, lone surrogates refu
 	assert.throws(() => r.end(), CodecError, "trailing");
 });
 
+test("lib0: utf8ByteLength counts what utf8Encode writes; utf8Decode keeps a BOM", () => {
+	const rnd = prng(2);
+	for (let round = 0; round < 300; round++) {
+		let s = "";
+		const n = Math.floor(rnd() * 40);
+		for (let i = 0; i < n; i++) {
+			const r = rnd();
+			if (r < 0.4) s += String.fromCharCode(32 + Math.floor(rnd() * 90));
+			else if (r < 0.6) s += String.fromCharCode(0x80 + Math.floor(rnd() * 0x780));
+			else if (r < 0.8) s += String.fromCharCode(0x800 + Math.floor(rnd() * 0xd000));
+			else if (r < 0.95) s += String.fromCodePoint(0x10000 + Math.floor(rnd() * 0xfffff));
+			else s += String.fromCharCode(0xd800 + Math.floor(rnd() * 0x800)); // lone surrogate
+		}
+		assert.equal(utf8ByteLength(s), utf8Encode(s).length, JSON.stringify(s));
+	}
+	assert.equal(utf8ByteLength("a\uD800"), 4, "a lone surrogate counts as U+FFFD");
+	assert.deepEqual([...utf8Encode("\uDC00")], [0xef, 0xbf, 0xbd]);
+	const bom = utf8Encode("\uFEFFx");
+	assert.equal(utf8Decode(bom), "\uFEFFx");
+	assert.equal(utf8Decode(bom, true), "\uFEFFx");
+	assert.equal(utf8Decode(new Uint8Array([0x61, 0xf0, 0x9f, 0x62])), "a\uFFFDb", "one U+FFFD per maximal invalid subpart");
+	assert.equal(utf8Decode(new Uint8Array([0x61, 0xf0, 0x9f, 0x62]), true), null);
+	assert.equal(utf8Decode(new Uint8Array([0xed, 0xa0, 0x80]), true), null, "encoded surrogate");
+});
+
 test("hex and base64url", () => {
 	assert.equal(bytesToHex(new Uint8Array([0, 15, 255])), "000fff");
 	assert.deepEqual(hexToBytes("000fff"), new Uint8Array([0, 15, 255]));
@@ -120,7 +146,7 @@ test("envelope outer: round trip, version/suite/keyEpoch handling", () => {
 
 test("envelope inner: deflate rule, bounded inflate, malformed cases", () => {
 	const small = new Uint8Array(DEFLATE_MIN_BYTES - 1).fill(65);
-	const e1 = encodeInner({ kind: "bodyUpdate", authorNsSeq: 3, flags: EnvelopeFlag.deflate, frameNo: 0, content: small });
+	const e1 = encodeInnerFlags({ kind: "bodyUpdate", authorNsSeq: 3, flags: EnvelopeFlag.deflate, frameNo: 0, content: small }).bytes;
 	const d1 = decodeInner(e1);
 	assert.ok(d1.ok);
 	if (d1.ok) {
@@ -128,7 +154,7 @@ test("envelope inner: deflate rule, bounded inflate, malformed cases", () => {
 		assert.deepEqual(d1.inner.content, small);
 	}
 	const big = new Uint8Array(DEFLATE_MIN_BYTES).fill(65);
-	const e2 = encodeInner({ kind: "nsOps", authorNsSeq: 300, flags: EnvelopeFlag.initial, frameNo: 7, content: big });
+	const e2 = encodeInnerFlags({ kind: "nsOps", authorNsSeq: 300, flags: EnvelopeFlag.initial, frameNo: 7, content: big }).bytes;
 	assert.ok(e2.length < 200);
 	const d2 = decodeInner(e2);
 	assert.ok(d2.ok);
@@ -142,10 +168,10 @@ test("envelope inner: deflate rule, bounded inflate, malformed cases", () => {
 	// Incompressible content >= 4096 stays raw.
 	const rnd = lcg(1);
 	const noise = new Uint8Array(8192).map(() => Math.floor(rnd() * 256));
-	const d3 = decodeInner(encodeInner({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content: noise }));
+	const d3 = decodeInner(encodeInnerFlags({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content: noise }).bytes);
 	assert.ok(d3.ok && d3.inner.flags === 0 && d3.inner.content.length === 8192);
 	// never
-	const d4 = decodeInner(encodeInner({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content: big }, { deflate: "never" }));
+	const d4 = decodeInner(encodeInnerFlags({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content: big }, { deflate: "never" }).bytes);
 	assert.ok(d4.ok && d4.inner.flags === 0);
 
 	assert.deepEqual(decodeInner(new Uint8Array([99, 0, 0, 0])), { ok: false, reason: "malformed" }, "unknown kind");
@@ -177,9 +203,9 @@ test("envelope inner: frameNo is >= 1 for nsOps/cfgOps and 0 for every other kin
 		assert.equal(ok([code, 0, 0, 1]), "malformed", `kind ${code} frameNo 1`);
 	}
 	const content = new Uint8Array([1]);
-	assert.throws(() => encodeInner({ kind: "nsOps", authorNsSeq: 0, flags: 0, frameNo: 0, content }), CodecError);
-	assert.throws(() => encodeInner({ kind: "cfgOps", authorNsSeq: 0, flags: 0, frameNo: 1.5, content }), CodecError);
-	assert.throws(() => encodeInner({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 2, content }), CodecError);
+	assert.throws(() => encodeInnerFlags({ kind: "nsOps", authorNsSeq: 0, flags: 0, frameNo: 0, content }), CodecError);
+	assert.throws(() => encodeInnerFlags({ kind: "cfgOps", authorNsSeq: 0, flags: 0, frameNo: 1.5, content }), CodecError);
+	assert.throws(() => encodeInnerFlags({ kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 2, content }), CodecError);
 });
 
 test("AAD layout v2", () => {

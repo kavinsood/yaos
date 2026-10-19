@@ -39,7 +39,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes as nodeRandomBytes, randomFillSync } from "node:crypto";
 import { monitorEventLoopDelay, type IntervalHistogram } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
-import { makeRecoveryKey } from "../../src/core/codec/recoveryKey";
+import { makeRecoveryKey } from "../../src/core/codec/testkit/recoveryKey";
 import { maxSealedBlobPlaintext } from "../../src/core/codec/sealedBlob";
 import { probeHttpBlob } from "../../src/engine/adapters/httpBlob";
 import { createWebClock } from "../../src/engine/adapters/webClock";

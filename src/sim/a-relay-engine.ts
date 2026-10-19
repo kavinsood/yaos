@@ -5,6 +5,7 @@
  * server/src/streams/relay.ts (StreamRelayService) message for message.
  */
 
+import { bytesEqual } from "../core/codec/lib0";
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { AppendFrame, RelayLimits } from "../ports/relay";
@@ -12,7 +13,6 @@ import type { SimRelaySession } from "./a-relay-session";
 import type { RelayStore, StoreOutcome } from "./a-relay-store";
 import {
 	SIM_MESSAGE_SLACK_BYTES,
-	bytesEqual,
 	frameKey,
 	isProvisionalStream,
 	nextUtcMidnight,

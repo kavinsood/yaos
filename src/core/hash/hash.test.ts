@@ -4,12 +4,13 @@ import { createHash } from "node:crypto";
 import { SYNC_HASH_MAX_BYTES } from "../limits";
 import { sha256, sha256Hex } from "./sha256";
 import { refHashPort as H } from "./testkit/hashRef";
-import { utf8Decode, utf8Encode, utf8Length } from "./utf8";
-import { canonicalizeMarkdown, exactFingerprint, markdownContentHash, markdownTextFromBytes } from "./markdownLf";
+import { utf8Encode } from "../codec/lib0";
+import { canonicalizeMarkdown, exactFingerprint, markdownContentHash } from "./markdownLf";
 import {
 	canonicalCanvasBytes, canvasContentHash, canvasFromMergeText, canvasJsonValue, canvasLogicalHash, canvasToMergeText, formatCanvasText,
-	parseCanvasBytes, parseCanvasText, rankCanvasInFileOrder,
+	parseCanvasBytes, parseCanvasText,
 } from "./canvasCanonical";
+import { rankCanvasInFileOrder } from "./testkit/canvasRanks";
 import { initialCanvasRanks, rankBetween, reconcileCanvasRanks } from "./canvasOrdering";
 
 function prng(seed: number): () => number {
@@ -45,41 +46,11 @@ test("pure-JS sha256 refuses inputs over SYNC_HASH_MAX_BYTES (fail closed)", () 
 	assert.equal(sha256Hex(big.subarray(0, SYNC_HASH_MAX_BYTES)), createHash("sha256").update(big.subarray(0, SYNC_HASH_MAX_BYTES)).digest("hex"));
 });
 
-test("utf8 encode/decode match TextEncoder/TextDecoder", () => {
-	const rnd = prng(2);
-	const enc = new TextEncoder();
-	for (let round = 0; round < 300; round++) {
-		let s = "";
-		const n = Math.floor(rnd() * 40);
-		for (let i = 0; i < n; i++) {
-			const r = rnd();
-			if (r < 0.4) s += String.fromCharCode(32 + Math.floor(rnd() * 90));
-			else if (r < 0.6) s += String.fromCharCode(0x80 + Math.floor(rnd() * 0x780));
-			else if (r < 0.8) s += String.fromCharCode(0x800 + Math.floor(rnd() * 0xd000));
-			else if (r < 0.95) s += String.fromCodePoint(0x10000 + Math.floor(rnd() * 0xfffff));
-			else s += String.fromCharCode(0xd800 + Math.floor(rnd() * 0x800)); // lone surrogate
-		}
-		const mine = utf8Encode(s);
-		assert.deepEqual(mine, enc.encode(s));
-		assert.equal(utf8Length(s), mine.length);
-		assert.equal(utf8Decode(mine), new TextDecoder().decode(mine));
-	}
-	for (let round = 0; round < 300; round++) {
-		const bytes = new Uint8Array(Math.floor(rnd() * 20));
-		for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(rnd() * 256);
-		assert.equal(utf8Decode(bytes), new TextDecoder().decode(bytes));
-		let fatalRef: string | null;
-		try { fatalRef = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); } catch { fatalRef = null; }
-		assert.equal(utf8Decode(bytes, true), fatalRef);
-	}
-});
-
 test("markdown-lf-v1: one BOM stripped, CRLF/CR -> LF", async () => {
 	assert.equal(canonicalizeMarkdown("\uFEFF\uFEFFa\r\nb\rc\n"), "\uFEFFa\nb\nc\n");
 	assert.equal(await markdownContentHash(H, "a\r\nb"), await markdownContentHash(H, "a\nb"));
 	assert.notEqual(await markdownContentHash(H, "a\nb"), await markdownContentHash(H, "a\nb\n"));
 	const bytes = utf8Encode("\uFEFFx\r\n");
-	assert.equal(markdownTextFromBytes(bytes), "x\n");
 	assert.equal(await exactFingerprint(H, bytes), createHash("sha256").update(bytes).digest("hex"));
 	assert.equal(await markdownContentHash(H, "x\n"), createHash("sha256").update("x\n").digest("hex"));
 	// Content far over SYNC_HASH_MAX_BYTES hashes through the port.

@@ -16,7 +16,7 @@
  */
 
 import type { ContentHash, DeviceId } from "../types";
-import { CodecError, Reader, Writer, bytesToHex, hasLoneSurrogate, hexToBytes } from "../codec/lib0";
+import { CodecError, Reader, Writer, bytesToHex, hasLoneSurrogate, hexToBytes, utf8ByteLength } from "../codec/lib0";
 import { decodeTaggedOps } from "../codec/nsOps";
 
 const MIB = 1024 * 1024;
@@ -111,7 +111,7 @@ export function clampSnapLabel(label: string): string {
 	let n = 0;
 	for (const ch of label) {
 		const c = hasLoneSurrogate(ch) ? "\ufffd" : ch;
-		const b = utf8Bytes(c);
+		const b = utf8ByteLength(c);
 		if (n + b > SNAP_MAX_LABEL_BYTES) break;
 		out += c;
 		n += b;
@@ -123,9 +123,6 @@ export function clampSnapLabel(label: string): string {
 // Validation (also applied to own records before they are sent)
 // ---------------------------------------------------------------------------
 
-function utf8Bytes(s: string): number {
-	return new TextEncoder().encode(s).length;
-}
 const isCount = (n: number, max: number, min = 0) => Number.isSafeInteger(n) && n >= min && n <= max;
 
 /** null = valid; else the first problem. */
@@ -134,7 +131,7 @@ export function snapRecordProblem(r: SnapRecord): string | null {
 	if (!id) return "snapshotId";
 	if (r.createdAtMs !== id.createdAtMs) return "createdAtMs does not match the id";
 	if (r.reason !== id.reason) return "reason does not match the id";
-	if (typeof r.deviceLabel !== "string" || hasLoneSurrogate(r.deviceLabel) || utf8Bytes(r.deviceLabel) > SNAP_MAX_LABEL_BYTES) return "deviceLabel";
+	if (typeof r.deviceLabel !== "string" || hasLoneSurrogate(r.deviceLabel) || utf8ByteLength(r.deviceLabel) > SNAP_MAX_LABEL_BYTES) return "deviceLabel";
 	if (!isCount(r.format, 255)) return "format";
 	if (!isCount(r.fileCount, SNAP_MAX_FILES)) return "fileCount";
 	if (!isCount(r.totalBytes, SNAP_MAX_TOTAL_BYTES)) return "totalBytes";

@@ -20,7 +20,7 @@
  * the same ops (idempotent LWW values).
  */
 import { exactFingerprint } from "../../core/hash/markdownLf";
-import { utf8Decode } from "../../core/hash/utf8";
+import { utf8Decode } from "../../core/codec/lib0";
 import type { CfgFoldState, CfgOp, ConfigRelPath, DocId } from "../../core/types";
 import type { ClockPort } from "../../ports/clock";
 import type { HashPort } from "../../ports/crypto";

@@ -1,7 +1,7 @@
 /** Settings sync test kit: config dir, shared cfg log with LWW fold, device. */
 import type { CfgFoldState, CfgOp, ConfigRelPath, DeviceId } from "../../core/types";
 import { refHashPort } from "../../core/hash/testkit/hashRef";
-import { utf8Decode, utf8Encode } from "../../core/hash/utf8";
+import { utf8Decode, utf8Encode } from "../../core/codec/lib0";
 import type { ConfigDirPort } from "../../ports/vault";
 import type { DiskSchema } from "../reconcile/store";
 import { FakeBlobs, FakeClock } from "../reconcile/testkit/fakes";

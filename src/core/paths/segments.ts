@@ -1,28 +1,6 @@
 /**
- * Small pure string helpers for vault paths (DESIGN §c.2, §c.4). UTF-8 byte
- * counts are computed by code point, so lone surrogates count as U+FFFD (3 B),
- * matching TextEncoder.
+ * Small pure string helpers for vault paths (DESIGN §c.2, §c.4).
  */
-
-/** UTF-8 byte length of a JS string (lone surrogates count as 3 bytes, like TextEncoder's U+FFFD). */
-export function utf8ByteLength(s: string): number {
-	let n = 0;
-	for (let i = 0; i < s.length; i++) {
-		const c = s.charCodeAt(i);
-		if (c < 0x80) n += 1;
-		else if (c < 0x800) n += 2;
-		else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
-			const d = s.charCodeAt(i + 1);
-			if (d >= 0xdc00 && d <= 0xdfff) { n += 4; i++; }
-			else n += 3;
-		} else n += 3;
-	}
-	return n;
-}
-
-export function splitPath(path: string): string[] {
-	return path.split("/");
-}
 
 /** "a/b/c.md" -> "c.md". */
 export function leafOf(path: string): string {

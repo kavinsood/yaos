@@ -4,6 +4,7 @@
  * queue for per-socket links, and a real-time ClockPort fallback.
  */
 
+import { utf8ByteLength } from "../core/codec/lib0";
 import type { ClientFrameId, DeviceId, Seq, StreamName, VaultEpoch } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { RandomPort } from "../ports/random";
@@ -136,33 +137,13 @@ export function isProvisionalStream(stream: string): boolean {
 	return stream.startsWith("b:") || stream.startsWith("c:");
 }
 
-export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.byteLength !== b.byteLength) return false;
-	for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
-	return true;
-}
-
-export function utf8Length(s: string): number {
-	let n = 0;
-	for (let i = 0; i < s.length; i++) {
-		const c = s.charCodeAt(i);
-		if (c < 0x80) n += 1;
-		else if (c < 0x800) n += 2;
-		else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
-			n += 4;
-			i++;
-		} else n += 3;
-	}
-	return n;
-}
-
 export function validStreamName(stream: string): boolean {
-	const n = utf8Length(stream);
+	const n = utf8ByteLength(stream);
 	return n >= 1 && n <= 256;
 }
 
 export function validClientFrameId(id: string): boolean {
-	const n = utf8Length(id);
+	const n = utf8ByteLength(id);
 	return n >= 1 && n <= 128;
 }
 
@@ -180,7 +161,7 @@ export function varUintLength(n: number): number {
 }
 
 function varStringLength(s: string): number {
-	const n = utf8Length(s);
+	const n = utf8ByteLength(s);
 	return varUintLength(n) + n;
 }
 

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { utf8Encode } from "../../core/hash/utf8";
+import { utf8Encode } from "../../core/codec/lib0";
 import { clashMessage, detectCfgClash } from "./clash";
 import { Device, SharedCfgLog } from "./testkit";
 

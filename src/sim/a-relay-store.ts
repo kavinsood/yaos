@@ -13,7 +13,8 @@
 
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../core/types";
 import type { RelayRow } from "../ports/relay";
-import { bytesEqual, frameKey, rowBytes, type SimRow } from "./a-relay-util";
+import { bytesEqual } from "../core/codec/lib0";
+import { frameKey, rowBytes, type SimRow } from "./a-relay-util";
 
 export interface StoreFrame {
 	readonly stream: StreamName;

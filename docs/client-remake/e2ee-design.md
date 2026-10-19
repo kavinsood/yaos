@@ -2070,7 +2070,7 @@ runs in the engine):
   - Two concurrent revokes under different RKs fork.
   - A stored forged open revoke survives resets. It is a DoS, capped at 4, and `revokeRekey` ends it.
   - A revoke a crash interrupts before its append is not resumed.
-  - Quarantine eviction starts at 500 records, and `QUARANTINE_MAX_BYTES` is not enforced.
+  - Quarantine is bounded by record count only (500, oldest evicted first); there is no byte bound.
   - A device that took a roll before the revoker re-published stops and needs a re-pair.
   - A durability-retry frame lets later ns and cfg frames overtake it (`sender.ts:398-401`).
   - `revokeRekey` does not verify the RK before it proposes.

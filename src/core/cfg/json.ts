@@ -51,12 +51,3 @@ export function canonicalizeJsonText(text: string): string | null {
 export function isCanonicalJson(text: string): boolean {
 	return typeof text === "string" && canonicalizeJsonText(text) === text;
 }
-
-/** Parses JSON text; undefined if invalid. */
-export function tryParseJson(text: string): { readonly value: unknown } | undefined {
-	try {
-		return { value: JSON.parse(text) as unknown };
-	} catch {
-		return undefined;
-	}
-}

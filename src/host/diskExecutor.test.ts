@@ -8,7 +8,7 @@ import type { HashOracle } from "./hashOracle";
 import { ObsidianVault } from "./obsidianVault";
 import { FakeObsidianVault } from "../sim/fakeObsidian";
 import { fingerprintRef, markdownHashRef } from "../core/hash/testkit/hashRef";
-import { utf8Encode as utf8 } from "../core/hash/utf8";
+import { utf8Encode as utf8 } from "../core/codec/lib0";
 import { VirtualClock } from "../sim/clock";
 import { simHashOracle } from "../sim/hash";
 import { SimConfigDir, SimVault, type CaseProfile } from "../sim/vault";

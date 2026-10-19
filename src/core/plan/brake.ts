@@ -32,7 +32,7 @@ import {
 	BRAKE_OVERWRITE_SHRINK_RATIO, BRAKE_RATIO,
 } from "../limits";
 import { digestHex } from "../hash/digest";
-import { utf8Encode } from "../hash/utf8";
+import { utf8Encode } from "../codec/lib0";
 
 export const DEFAULT_BRAKE: BrakeConfig = {
 	minCount: BRAKE_MIN_COUNT,

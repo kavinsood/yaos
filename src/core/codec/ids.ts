@@ -48,10 +48,6 @@ export function base64urlDecode(s: string): Uint8Array {
 	return out.subarray(0, o);
 }
 
-/** 22-char base64url string (DESIGN §b.3 malformation rule). */
-export function isIdString(s: string): boolean {
-	return ID_RE.test(s);
-}
 export function isDocId(s: string): s is DocId {
 	return ID_RE.test(s);
 }

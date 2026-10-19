@@ -15,7 +15,7 @@
  */
 
 import type { DeviceId, Seq } from "../types";
-import { bytesToHex, compareCodeUnits } from "../codec/lib0";
+import { compareCodeUnits } from "../codec/lib0";
 import {
 	SNAP_VIEW_PER_DEVICE, encodeSnapRecord, isDeviceId, isValidSnapOp, parseSnapshotId, snapKey,
 	type SnapOp, type SnapRecord,
@@ -155,12 +155,4 @@ export function retentionFloor(createdAts: readonly number[], keep: number): num
 	if (createdAts.length <= k) return null;
 	const sorted = [...createdAts].sort((a, b) => b - a);
 	return sorted[k - 1]!;
-}
-
-/** Stable digest of the join (tests and diagnostics): coversSeq excluded. */
-export function snapFoldFingerprint(s: SnapFoldState): string {
-	const floors = [...s.floors.entries()].sort(([a], [b]) => compareCodeUnits(a, b)).map(([d, f]) => `${d}=${f}`);
-	const dels = [...s.dels.keys()].sort(compareCodeUnits);
-	const recs = [...s.records.entries()].sort(([a], [b]) => compareCodeUnits(a, b)).map(([k, e]) => `${k}:${bytesToHex(e.bytes)}`);
-	return JSON.stringify([floors, dels, recs]);
 }

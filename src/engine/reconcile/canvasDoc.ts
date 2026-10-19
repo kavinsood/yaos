@@ -35,7 +35,7 @@ import {
 } from "../../core/hash/canvasCanonical";
 import { orderedCanvasIds } from "../../core/hash/canvasOrdering";
 import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
-import { utf8Encode } from "../../core/hash/utf8";
+import { utf8Encode } from "../../core/codec/lib0";
 import { digestHex } from "../../core/hash/digest";
 import type { HashPort } from "../../ports/crypto";
 

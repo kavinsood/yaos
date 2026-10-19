@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { base64urlEncode } from "../../core/codec/ids";
-import { toHex } from "../../core/hash/sha256";
+import { bytesToHex as toHex } from "../../core/codec/lib0";
 import { advanceUntil, settleWith } from "../../engine/keyring/testkit/simWait";
 import { RK_A, RK_B } from "../../engine/keyring/testkit/world";
 import { SimBlobStore } from "../../sim/blobStore";

@@ -71,6 +71,3 @@ export function replayBitsFromBytes(bytes: Uint8Array): bigint {
 	return b;
 }
 
-export function cloneReplay(m: ReadonlyMap<DeviceId, ReplayWindow>): ReplayState {
-	return new Map(m);
-}

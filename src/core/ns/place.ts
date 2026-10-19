@@ -18,7 +18,8 @@
 import type { ContentHash, DocId, DocKind, NsEntry, NsFoldIndex, NsFoldState, PathKey, VaultPath } from "../types";
 import { MAX_PATH_BYTES, MAX_SEGMENT_BYTES, MAX_SUFFIX_N, SUFFIX_DOCID_CHARS } from "../limits";
 import { foldKey } from "../paths/pathKey";
-import { dropLastCodePoint, splitExt, stripTrailingDotsSpaces, utf8ByteLength } from "../paths/segments";
+import { utf8ByteLength } from "../codec/lib0";
+import { dropLastCodePoint, splitExt, stripTrailingDotsSpaces } from "../paths/segments";
 import { segmentInvalidReason } from "../paths/validate";
 import { indexAddLive, indexRemoveLive } from "./index";
 

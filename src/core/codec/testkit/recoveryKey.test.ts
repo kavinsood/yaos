@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { CodecError } from "./lib0";
+import { CodecError } from "../lib0";
 import { RK_BYTES, RK_PREFIX, RK_SECRET_BYTES, decodeRecoveryKey, encodeRecoveryKey, makeRecoveryKey } from "./recoveryKey";
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";

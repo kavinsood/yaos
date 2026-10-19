@@ -1,5 +1,7 @@
 /**
- * Recovery key format (e2ee-design §13.1).
+ * Recovery key format (e2ee-design §13.1): the reference codec for tests and e2e scripts. Never shipped: the
+ * product's text form is host/ui/recoveryKeyText.ts (its checksum hashed by the engine), which
+ * recoveryKeyText.test.ts checks against this one.
  *
  *   RK = 32 secret bytes ‖ first 3 bytes of SHA-256(those 32)   (35 bytes; KEK_RK uses RK[0..32], §5.1)
  *
@@ -9,8 +11,8 @@
  * typos before any crypto).
  */
 
-import { sha256 } from "../hash/sha256";
-import { CodecError, bytesEqual } from "./lib0";
+import { sha256 } from "../../hash/sha256";
+import { CodecError, bytesEqual } from "../lib0";
 
 export const RK_BYTES = 35;
 export const RK_SECRET_BYTES = 32;

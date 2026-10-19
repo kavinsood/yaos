@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { utf8Encode } from "../../core/hash/utf8";
+import { utf8Encode } from "../../core/codec/lib0";
 import { CFG_MAX_FILE_BYTES } from "../../core/limits";
 import { FakeBlobs } from "../reconcile/testkit/fakes";
 import { olderVersion } from "./cfgNotices";

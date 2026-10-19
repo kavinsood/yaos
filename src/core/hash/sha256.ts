@@ -6,6 +6,7 @@
  * tests take reference digests from core/hash/testkit/hashRef.ts.
  */
 
+import { bytesToHex } from "../codec/lib0";
 import { SYNC_HASH_MAX_BYTES } from "../limits";
 
 const K = new Uint32Array([
@@ -81,14 +82,6 @@ export function sha256(bytes: Uint8Array): Uint8Array {
 	return out;
 }
 
-const HEX = "0123456789abcdef";
-
-export function toHex(bytes: Uint8Array): string {
-	let out = "";
-	for (let i = 0; i < bytes.length; i++) out += HEX[bytes[i]! >>> 4]! + HEX[bytes[i]! & 15]!;
-	return out;
-}
-
 export function sha256Hex(bytes: Uint8Array): string {
-	return toHex(sha256(bytes));
+	return bytesToHex(sha256(bytes));
 }
