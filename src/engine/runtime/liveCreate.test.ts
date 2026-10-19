@@ -10,7 +10,7 @@ import { newDocId } from "../../core/codec/ids";
 import { NS_STREAM, docStream, type ContentHash, type DeviceId, type DocId, type NsOp } from "../../core/types";
 import { SimRelay, type SimCommitInfo } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { converged, startTestEngine, until } from "./testHarness";
+import { converged, startTestEngine, until, createDoc, docText } from "./testHarness";
 
 async function stopAll(...es: LogEngine[]): Promise<void> {
 	for (const e of es) await e.stop();
@@ -47,7 +47,7 @@ void test("live create: body frames pending behind the create, sent right after 
 		assert.equal(commits.length, 0, "corked: nothing sent yet");
 		uncork();
 		await converged([a, b]);
-		assert.equal(await b.docText(op.docId), "second first ");
+		assert.equal(await docText(b, op.docId), "second first ");
 		const withCreate = commits.find((c) => c.frames.some((f) => f.clientFrameId === createCfid))!;
 		assert.deepEqual(withCreate.frames.map((f) => f.stream), [NS_STREAM, stream, stream], "one commit: the create, then its body frames");
 		assert.equal(a.c.outbox.size, 0);
@@ -71,7 +71,7 @@ void test("non-live create (onboarding, first pass after start): body frames hel
 		assert.equal(recs[0]!.dependsOn, createCfid);
 		relay.resumeCommits();
 		await converged([a, b]);
-		assert.equal(await b.docText(op.docId), "body");
+		assert.equal(await docText(b, op.docId), "body");
 	} finally {
 		await stopAll(a, b);
 	}
@@ -84,7 +84,7 @@ void test("live create merged away (§c.5 identical duplicate) with frames sent:
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
 	try {
-		const w = await b.createDoc("same.md", "WINNER");
+		const w = await createDoc(b, "same.md", "WINNER");
 		await converged([a, b]);
 		const hash = b.nsView().state.entries.get(w)!.createHash;
 
@@ -137,7 +137,7 @@ void test("live create merged away (§c.5 identical duplicate) with frames sent:
 		for (const e of [a, b]) {
 			const live = e.listDocs().filter((d) => d.state === "live");
 			assert.deepEqual(live.map((d) => d.docId), [w], "only the winner is live");
-			assert.equal(await e.docText(w), "WINNER", "the loser's frames never reach the winner");
+			assert.equal(await docText(e, w), "WINNER", "the loser's frames never reach the winner");
 			for (const l of [l1, l2, l3]) assert.equal(e.listDocs().find((d) => d.docId === l.docId)?.state, "merged");
 		}
 	} finally {
@@ -150,7 +150,7 @@ void test("live create ignored as duplicate-docid (a docId collision): its body 
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
 	try {
-		const w = await b.createDoc("theirs.md", "THEIRS");
+		const w = await createDoc(b, "theirs.md", "THEIRS");
 		await converged([a, b]);
 		// Fresh docIds are 16 random bytes (Reconciler.freshIds): the collision is forced here.
 		const dup = { ...create(a, "mine.md"), docId: w };
@@ -164,7 +164,7 @@ void test("live create ignored as duplicate-docid (a docId collision): its body 
 		await converged([a, b]);
 		assert.equal(a.c.outbox.size, 0, "no orphaned record");
 		for (const e of [a, b]) {
-			assert.equal(await e.docText(w), "MINETHEIRS");
+			assert.equal(await docText(e, w), "MINETHEIRS");
 			assert.deepEqual(e.listDocs().map((d) => [d.docId, d.path, d.state]), [[w, "theirs.md", "live"]], "the create was ignored");
 		}
 	} finally {

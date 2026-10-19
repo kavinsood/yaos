@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SimRelay } from "../../sim/relay";
 import { OPEN_FRAME_MAX_MS } from "../../core/limits";
-import { converged, sleep, startTestEngine, until } from "./testHarness";
+import { converged, sleep, startTestEngine, until, createDoc, docText, editDoc, renameDoc } from "./testHarness";
 
 test("engine: two engines converge on ns + body through SimRelay", async () => {
 	const relay = new SimRelay();
@@ -10,17 +10,17 @@ test("engine: two engines converge on ns + body through SimRelay", async () => {
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
 	try {
 		await until(() => a.status().phase === "live" && b.status().phase === "live", 3_000, "live");
-		const id = await a.createDoc("notes/one.md", "hello world");
+		const id = await createDoc(a, "notes/one.md", "hello world");
 		await converged([a, b]);
-		assert.equal(await b.docText(id), "hello world");
+		assert.equal(await docText(b, id), "hello world");
 		assert.equal(b.listDocs().find((d) => d.docId === id)?.path, "notes/one.md");
 
-		await b.editDoc(id, (t) => t.insert(t.length, " from b"));
-		await a.editDoc(id, (t) => t.insert(0, "A: "));
+		await editDoc(b, id, (t) => t.insert(t.length, " from b"));
+		await editDoc(a, id, (t) => t.insert(0, "A: "));
 		await converged([a, b]);
-		assert.equal(await a.docText(id), "A: hello world from b");
+		assert.equal(await docText(a, id), "A: hello world from b");
 
-		await a.renameDoc(id, "notes/renamed.md");
+		await renameDoc(a, id, "notes/renamed.md");
 		await converged([a, b]);
 		assert.equal(b.listDocs().find((d) => d.docId === id)?.path, "notes/renamed.md");
 
@@ -38,8 +38,8 @@ test("engine: a no-op editor change (retain only) produces no frame and keeps th
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	try {
 		await until(() => a.status().phase === "live", 3_000, "live");
-		const id = await a.createDoc("n.md", "hello world");
-		await a.editDoc(id, (t) => t.delete(0, 6));
+		const id = await createDoc(a, "n.md", "hello world");
+		await editDoc(a, id, (t) => t.delete(0, 6));
 		await converged([a]);
 		const stream = `b:${id}` as never;
 		const rows0 = relay.rows(stream).length;
@@ -55,7 +55,7 @@ test("engine: a no-op editor change (retain only) produces no frame and keeps th
 		// A real edit still goes out.
 		assert.equal(a.applyEditorChanges(id, [[0, "x"], 5]), true);
 		await until(() => relay.rows(stream).length === rows0 + 1, 3_000, "edit row");
-		assert.equal(await a.docText(id), "xworld");
+		assert.equal(await docText(a, id), "xworld");
 	} finally {
 		await a.stop();
 	}
@@ -67,8 +67,8 @@ test("engine: the daily soft budget count (meta daily, DESIGN §i.6) survives a 
 	let a2: Awaited<ReturnType<typeof startTestEngine>>["engine"] | null = null;
 	try {
 		await until(() => a.status().phase === "live", 3_000, "live");
-		const id = await a.createDoc("d.md", "one;");
-		await a.editDoc(id, (t) => t.insert(t.length, "two;"));
+		const id = await createDoc(a, "d.md", "one;");
+		await editDoc(a, id, (t) => t.insert(t.length, "two;"));
 		await until(() => a.isIdle(), 3_000, "idle");
 		const used = a.status().dailyFramesUsed;
 		assert.ok(used >= 2, `frames counted (${used})`);

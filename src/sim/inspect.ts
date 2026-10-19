@@ -12,6 +12,7 @@ import type { DeviceId } from "../core/types";
 import type { RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { LogEngine } from "../engine/runtime/engine";
+import { docText } from "../engine/runtime/testHarness";
 import { readBase } from "../engine/reconcile/store";
 import { STORE, type BaseTextRecord } from "../engine/store/schema";
 import type { VirtualClock } from "./clock";
@@ -73,7 +74,7 @@ export async function inspectStore(clock: VirtualClock, storage: MemStoragePort,
 		for (const d of eng.listDocs()) {
 			if (d.kind !== "markdown" || (d.state !== "live" && d.state !== "pending")) continue;
 			try {
-				out.push(await eng.docText(d.docId));
+				out.push(await docText(eng, d.docId));
 			} catch {
 				// unreadable doc: holds nothing recoverable
 			}

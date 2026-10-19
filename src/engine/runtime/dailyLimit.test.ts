@@ -4,7 +4,7 @@ import type { VaultPath } from "../../core/types";
 import { VirtualClock } from "../../sim/clock";
 import { SimRelay } from "../../sim/relay";
 import { DailyLimitNoticeGate, dailyLimitMessage, nextUtcMidnight } from "./dailyLimit";
-import { drive, sleep, startTestEngine, until } from "./testHarness";
+import { drive, sleep, startTestEngine, until, createDoc, editDoc } from "./testHarness";
 
 const T0 = Date.UTC(2026, 2, 10, 15, 20);
 
@@ -42,9 +42,9 @@ test("engine: refused appends raise one daily-limit host notice per window, with
 	try {
 		await until(() => a.status().phase === "live", 5_000, "live", clock);
 		relay.setDailyLimit(true, 10 * 60_000);
-		const id = await drive(a.createDoc("a.md" as VaultPath, "one"), clock);
+		const id = await drive(createDoc(a, "a.md" as VaultPath, "one"), clock);
 		await until(() => a.status().phase === "daily-limit", 10_000, "daily-limit", clock);
-		await drive(a.editDoc(id, (t) => t.insert(t.length, " two")), clock);
+		await drive(editDoc(a, id, (t) => t.insert(t.length, " two")), clock);
 		await sleep(30_000, clock);
 		assert.equal(popups.length, 1, popups.join("\n"));
 		assert.match(popups[0] ?? "", /^warn:daily-limit:YAOS: Cloudflare's daily free limit was reached\. Sync is paused until 12:10 UTC;/);
@@ -52,7 +52,7 @@ test("engine: refused appends raise one daily-limit host notice per window, with
 		relay.setDailyLimit(false);
 		await sleep(10 * 60_000, clock);
 		relay.setDailyLimit(true, 60 * 60_000);
-		await drive(a.editDoc(id, (t) => t.insert(t.length, " three")), clock);
+		await drive(editDoc(a, id, (t) => t.insert(t.length, " three")), clock);
 		await sleep(30_000, clock);
 		assert.equal(popups.length, 2, "a new window pops again");
 	} finally {

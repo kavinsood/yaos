@@ -5,7 +5,7 @@ import type { MergeResult } from "../types";
 import { DEFAULT_MERGE_LIMITS, merge, mergeValidated } from "./merge";
 import { splitLines } from "./myers";
 import { applyEditsTo, applyTextEdits, editSize, isTokenBoundary, lineDiffSize, minimalDiff } from "./minimalDiff";
-import { prng } from "./prng";
+import { prng } from "./testkit/prng";
 
 const VOCAB = ["", "a", "b", "# heading", "- item", "same", "same", "😀 emoji", "\t tab", "x y z", "}", "{"];
 

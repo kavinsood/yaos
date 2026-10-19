@@ -6,7 +6,7 @@ import { SYNC_HASH_MAX_BYTES } from "../../core/limits";
 import { markdownCanonicalBytes } from "../../core/hash/markdownLf";
 import { markdownHashRef } from "../../core/hash/testkit/hashRef";
 import { SimRelay } from "../../sim/relay";
-import { startTestEngine, until } from "../runtime/testHarness";
+import { startTestEngine, until, createDoc, editDoc } from "../runtime/testHarness";
 import { ComposedLog } from "./logPort";
 
 const NOT_EMPTY = "ab".repeat(32) as ContentHash;
@@ -23,7 +23,7 @@ test("lostCreateBody: own live create with no rows and nothing pending; not a pe
 			{ t: "create", docId: lost, kind: "markdown", path: "lost.md" as VaultPath, contentHash: NOT_EMPTY, size: 9 },
 			{ t: "create", docId: born, kind: "markdown", path: "empty.md" as VaultPath, contentHash: EMPTY_CONTENT_HASH, size: 0 },
 		]);
-		const withBody = await a.createDoc("body.md" as VaultPath, "some text");
+		const withBody = await createDoc(a, "body.md" as VaultPath, "some text");
 		await until(() => a.isIdle() && a.c.outbox.size === 0, 2_000, "a receipted");
 		await until(() => b.nsView().state.entries.has(withBody), 2_000, "b folded");
 
@@ -49,17 +49,17 @@ test("textHash: warmTextHashes digests resident replicas through HashPort; view(
 		const smallText = "small\r\n";
 		const bigText = "line of text\r\n".repeat(1000);
 		assert.ok(markdownCanonicalBytes(bigText).length > SYNC_HASH_MAX_BYTES);
-		const small = await a.createDoc("small.md" as VaultPath, smallText);
-		const big = await a.createDoc("big.md" as VaultPath, bigText);
+		const small = await createDoc(a, "small.md" as VaultPath, smallText);
+		const big = await createDoc(a, "big.md" as VaultPath, bigText);
 		await until(() => a.isIdle() && a.c.outbox.size === 0, 2_000, "a receipted");
-		assert.ok(a.handleOf(small) && a.handleOf(big), "both replicas resident");
+		assert.ok(a.c.handles.peek(a.streamOf(small)) && a.c.handles.peek(a.streamOf(big)), "both replicas resident");
 		const la = new ComposedLog(a);
 		assert.equal(la.view().textHash.get(small), markdownHashRef(smallText), "a small text is hashed by view() itself");
 		assert.equal(la.view().textHash.has(big), false, "a large one only by the warm (view() never blocks on a digest)");
 		await la.warmTextHashes();
 		assert.equal(la.view().textHash.get(big), markdownHashRef(bigText));
 		// An edit moves the body version: the hash taken for the old text is never paired with the new one.
-		await a.editDoc(big, (t) => t.insert(0, "x"));
+		await editDoc(a, big, (t) => t.insert(0, "x"));
 		la.invalidate();
 		assert.equal(la.view().textHash.has(big), false);
 		assert.equal(la.view().textHash.get(small), markdownHashRef(smallText), "unchanged: still from the memo");

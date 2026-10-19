@@ -3,10 +3,9 @@
  * user commands, diagnostics and the epoch-migration steps (§c.12).
  */
 
-import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
-import { streamDocId, type DocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import { streamDocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
 import { ProtocolFailure } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
@@ -230,10 +229,4 @@ export async function retireOldEpoch(rt: VaultRuntime, old: VaultEpoch): Promise
 	} catch (e) {
 		rt.diag(`old epoch DB delete failed: ${String(e)}`);
 	}
-}
-
-/** Y.Doc text of a resident replica (tests). */
-export function residentText(rt: VaultRuntime, docId: DocId): string | null {
-	const h = rt.log.handleOf(docId);
-	return h ? (h.doc as Y.Doc).getText("text").toString() : null;
 }

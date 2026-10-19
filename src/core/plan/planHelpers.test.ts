@@ -8,8 +8,8 @@ import { orderOps, parseTempPath, sortRenames, tempPathFor } from "./order";
 import { applyBrake, brakeId, brakeIdentity, DEFAULT_BRAKE, EMPTY_WINDOW, rejectHeld, type PlanUnit } from "./brake";
 import { refHashPort, sha256HexRef } from "../hash/testkit/hashRef";
 import { utf8Encode } from "../hash/utf8";
-import { L, S, h, id } from "./planFixtures";
-import { prng } from "../merge/prng";
+import { L, S, h, id } from "./testkit/planFixtures";
+import { prng } from "../merge/testkit/prng";
 
 const pk = standInPathKey;
 

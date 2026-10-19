@@ -10,9 +10,17 @@
  * every timer; virtual time only moves inside until / sleep / drive, so any
  * engine call that may wait on a timer (start, stop, flush) must go through
  * drive().
+ *
+ * Authoring: createDoc / renameDoc / deleteDoc / editDoc / docText drive an
+ * engine the way a test wants to, without the host's reconciler (production
+ * authors through submitNs and openBody).
  */
 
-import type { DeviceId, VaultId } from "../../core/types";
+import type * as Y from "yjs";
+import { EnvelopeFlag } from "../../core/envelope";
+import { newDocId } from "../../core/codec/ids";
+import { bytesToHex, utf8Encode } from "../../core/codec/lib0";
+import { docStream, kindOfPath, type ContentHash, type DeviceId, type DocId, type DocKind, type VaultId, type VaultPath } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { CryptoPort } from "../../ports/crypto";
 import type { RelayPort } from "../../ports/relay";
@@ -23,12 +31,16 @@ import type { EngineE2ee } from "../keyring/keyringRuntime";
 import { createWebClock } from "../adapters/webClock";
 import { createWebHash } from "../adapters/webHash";
 import { createWebRandom } from "../adapters/webRandom";
+import { buildBodyFrames, initialTextUpdates } from "../body/frames";
+import { ORIGIN } from "../body/yjsCounters";
 import type { VirtualClock } from "../../sim/clock";
 import { hashLabel, SeededRandom } from "../../sim/random";
 import { MemStoragePort } from "../../sim/storage";
 import { simHashPort } from "../../sim/hash";
 import { LogEngine } from "./engine";
+import { submitNs } from "./logApi";
 import type { EngineOptions, EngineTuning } from "./options";
+import { retryReaderQuarantine } from "./quarantineRelease";
 
 /** Timers shrunk so multi-engine tests settle in well under a second. */
 export const FAST_TUNING: Partial<EngineTuning> = {
@@ -183,11 +195,78 @@ export async function converged(engines: readonly LogEngine[], timeoutMs = 8_000
 		const sig = async (e: LogEngine) => {
 			const docs = e.listDocs().filter((d) => d.state === "live").sort((a, b) => (a.docId < b.docId ? -1 : 1));
 			const parts: string[] = [];
-			for (const d of docs) parts.push(`${d.docId}|${d.path}|${await e.docText(d.docId)}`);
+			for (const d of docs) parts.push(`${d.docId}|${d.path}|${await docText(e, d.docId)}`);
 			return parts.join("\n");
 		};
 		const first = await sig(engines[0]!);
 		for (const e of engines.slice(1)) if ((await sig(e)) !== first) return false;
 		return true;
 	}, timeoutMs, "convergence", clock);
+}
+
+// ---------------------------------------------------------------- authoring
+
+/** A create and its initial body frames, committed in one T_edit. */
+export async function createDoc(e: LogEngine, path: VaultPath, text: string, kind: DocKind = kindOfPath(path)): Promise<DocId> {
+	const c = e.c;
+	if (kind === "blob") throw new Error("blob docs are not handled by the log engine");
+	c.assertWritable();
+	if (e.listDocs().some((d) => d.path === path && (d.state === "live" || d.state === "pending"))) throw new Error(`path exists: ${path}`);
+	const docId = newDocId(c.ports.random);
+	const stream = docStream(kind, docId)!;
+	const bytes = utf8Encode(text);
+	const contentHash = bytesToHex(await c.ports.hash.sha256(bytes)) as ContentHash;
+	const h = await c.handles.acquire(stream);
+	try {
+		await submitNs(c, [{ t: "create", docId, kind, path, contentHash, size: bytes.length }], async ([nsFrame]) => {
+			const frames = [];
+			if (kind === "markdown" && text.length > 0) {
+				for (const u of initialTextUpdates(h.doc, text)) {
+					frames.push(...await buildBodyFrames(c.deps, { stream, content: u, flags: EnvelopeFlag.initial, authorNsSeq: c.ns.coversSeq, dependsOn: nsFrame!.clientFrameId, nowMs: c.now() }));
+				}
+			}
+			return frames;
+		});
+	} catch (err) {
+		c.handles.unpin(h);
+		c.handles.drop(stream);
+		throw err;
+	}
+	c.handles.unpin(h);
+	return docId;
+}
+
+export async function renameDoc(e: LogEngine, docId: DocId, path: VaultPath): Promise<void> {
+	await e.submitNs([{ t: "rename", docId, path }]);
+}
+
+export async function deleteDoc(e: LogEngine, docId: DocId): Promise<void> {
+	const rec = e.c.repo.stream(e.streamOf(docId));
+	await e.submitNs([{ t: "delete", docId, baseBodySeq: Math.max(rec?.appliedSeq ?? 0, rec?.lastOwnSeq ?? 0) }]);
+}
+
+/** Disk-merge style edit: one MERGE transaction, frame closed at once. */
+export async function editDoc(e: LogEngine, docId: DocId, fn: (text: Y.Text, doc: Y.Doc) => void): Promise<void> {
+	const c = e.c;
+	const stream = e.streamOf(docId);
+	if (c.repo.stream(stream)?.frozen) throw new Error(`doc frozen: ${c.repo.stream(stream)?.frozenReason}`);
+	c.assertWritable();
+	const h = await c.handles.acquire(stream);
+	try {
+		h.doc.transact(() => fn(h.doc.getText("text"), h.doc), ORIGIN.MERGE);
+		await c.docs.closeFrame(h);
+	} finally {
+		c.handles.unpin(h);
+	}
+}
+
+/** The doc's replica text (loads it). */
+export async function docText(e: LogEngine, docId: DocId): Promise<string> {
+	const h = await e.c.handles.load(e.streamOf(docId));
+	return h.doc.getText("text").toString();
+}
+
+/** The retry of reader-dependent quarantine that runs after every session start, run now. */
+export function retryQuarantine(e: LogEngine): Promise<number> {
+	return retryReaderQuarantine(e.c);
 }

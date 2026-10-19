@@ -4,8 +4,8 @@ import type { DocId, LocalEntry, Plan, PlannerInput, PlannerOp, RemoteEntry, Syn
 import { EMPTY_CONTENT_HASH, plan, planWith } from "./planner";
 import { brakeId, DEFAULT_BRAKE } from "./brake";
 import { refHashPort } from "../hash/testkit/hashRef";
-import { L, R, S, V, fp, h, id, input, pk, type Scenario } from "./planFixtures";
-import { prng } from "../merge/prng";
+import { L, R, S, V, fp, h, id, input, pk, type Scenario } from "./testkit/planFixtures";
+import { prng } from "../merge/testkit/prng";
 
 const opsOf = (p: Plan): string[] => p.ops.map((o) => o.op);
 const find = <K extends PlannerOp["op"]>(p: Plan, k: K): Extract<PlannerOp, { op: K }> => {

@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until } from "../runtime/testHarness";
+import { converged, until, createDoc, editDoc } from "../runtime/testHarness";
 import { keyMissing, live, rawAppend, start } from "./testkit/engines";
 import { K, genesis } from "./testkit/world";
 
@@ -21,14 +21,14 @@ describe("suite 1 in the engine", () => {
 		const x = await start(relay, "dev-x", pin, { tuning: { rollSeqSpan: 6 } });
 		try {
 			await live(x);
-			const id = await x.engine.createDoc("a.md" as VaultPath, "one");
-			for (let i = 0; i < 8; i++) await x.engine.editDoc(id, (t) => t.insert(t.length, ` ${i}`));
+			const id = await createDoc(x.engine, "a.md" as VaultPath, "one");
+			for (let i = 0; i < 8; i++) await editDoc(x.engine, id, (t) => t.insert(t.length, ` ${i}`));
 			await until(() => x.engine.status().e2ee?.sealEpoch === 2, 8_000, "rolled to epoch 2");
 			assert.equal(relay.rows(KEYRING_STREAM).length, 2);
 			const e2 = x.changes.filter((c) => c.keys.some((k) => k.e === 2));
 			assert.equal(e2.length, 1, "K_2 persisted once");
 			assert.equal(e2[0]!.pending, 2, "persisted before its record won");
-			await x.engine.editDoc(id, (t) => t.insert(t.length, " after"));
+			await editDoc(x.engine, id, (t) => t.insert(t.length, " after"));
 			await converged([x.engine]);
 			assert.equal(keyMissing(x), null);
 		} finally {
@@ -46,7 +46,7 @@ describe("suite 1 in the engine", () => {
 			const k = relay.rows(KEYRING_STREAM);
 			assert.equal(k.length, 1);
 			assert.deepEqual(k[0]!.payload, g, "byte-identical");
-			await x.engine.createDoc("b.md" as VaultPath, "after the reset");
+			await createDoc(x.engine, "b.md" as VaultPath, "after the reset");
 			await converged([x.engine]);
 			assert.equal(relay.rows(KEYRING_STREAM).length, 1, "published once");
 		} finally {

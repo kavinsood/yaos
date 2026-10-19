@@ -8,7 +8,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until } from "../runtime/testHarness";
+import { converged, until, createDoc, editDoc } from "../runtime/testHarness";
 import { live, rawAppend, start, type Dev } from "./testkit/engines";
 import { K, genesis } from "./testkit/world";
 
@@ -22,11 +22,11 @@ async function adopted(relay: SimRelay): Promise<{ x: Dev; y: Dev; stream: Retur
 	const y = await start(relay, "dev-y", pin, { tuning: { provisionalAdoptMs: 60_000 } });
 	await live(x);
 	await live(y);
-	const id = await x.engine.createDoc("a.md" as VaultPath, "base;");
+	const id = await createDoc(x.engine, "a.md" as VaultPath, "base;");
 	await converged([x.engine, y.engine]);
 	await y.engine.bind(id);
 	relay.pauseCommits();
-	await x.engine.editDoc(id, (t) => t.insert(t.length, "p;"));
+	await editDoc(x.engine, id, (t) => t.insert(t.length, "p;"));
 	await until(() => y.engine.c.docs.stats.adopted === 1 && y.engine.c.adoptMap.size === 1, 5_000, "y adopted");
 	return { x, y, stream: x.engine.streamOf(id) };
 }

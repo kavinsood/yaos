@@ -13,6 +13,7 @@
 import { execFileSync } from "node:child_process";
 import type { DocId, VaultPath } from "../../src/core/types";
 import type { EngineTuning } from "../../src/engine/runtime/options";
+import { createDoc, deleteDoc, docText, editDoc, renameDoc } from "../../src/engine/runtime/testHarness";
 import { Device, Report, converge, engineStats, sleep, until } from "./engineKit";
 import { DEFAULT_LOG_DIR, onboardVault, type OnboardedVault } from "./onboard";
 
@@ -58,13 +59,13 @@ async function main(): Promise<void> {
 
 	R.step("create + edit -> converge");
 	const ids: DocId[] = [];
-	for (let i = 0; i < 5; i++) ids.push(await a.e.createDoc(P(`notes/a${i}.md`), `a${i} body;`));
-	for (let i = 0; i < 2; i++) ids.push(await b.e.createDoc(P(`notes/b${i}.md`), `b${i} body;`));
+	for (let i = 0; i < 5; i++) ids.push(await createDoc(a.e, P(`notes/a${i}.md`), `a${i} body;`));
+	for (let i = 0; i < 2; i++) ids.push(await createDoc(b.e, P(`notes/b${i}.md`), `b${i} body;`));
 	R.record("converge_ms", await converge([a, b]));
-	await b.e.editDoc(ids[0]!, (x) => x.insert(x.length, "b-edit;"));
+	await editDoc(b.e, ids[0]!, (x) => x.insert(x.length, "b-edit;"));
 	R.record("converge_ms", await converge([a, b]));
-	R.check("a0 text on a", (await a.e.docText(ids[0]!)) === "a0 body;b-edit;", await a.e.docText(ids[0]!));
-	R.check("b1 created by b visible on a", (await a.e.docText(ids[6]!)) === "b1 body;");
+	R.check("a0 text on a", (await docText(a.e, ids[0]!)) === "a0 body;b-edit;", await docText(a.e, ids[0]!));
+	R.check("b1 created by b visible on a", (await docText(a.e, ids[6]!)) === "b1 body;");
 	R.check("7 live docs on both", a.e.listDocs().filter((d) => d.state === "live").length === 7);
 
 	R.step("edits + keystrokes -> peer bound view latency");
@@ -73,7 +74,7 @@ async function main(): Promise<void> {
 	for (let i = 0; i < 30; i++) {
 		const mark = `<m${i}>`;
 		const t0 = R.now();
-		await a.e.editDoc(doc, (x) => x.insert(x.length, mark)); // merge edit: frame closed at once
+		await editDoc(a.e, doc, (x) => x.insert(x.length, mark)); // merge edit: frame closed at once
 		await b.hostText(doc, (s) => s.includes(mark), 10_000);
 		R.record("merge_edit_to_peer_view_ms", R.now() - t0);
 		await sleep(20);
@@ -103,24 +104,24 @@ async function main(): Promise<void> {
 	const frames = a.e.c.sender.stats.appends - appends0;
 	R.extra.typingFrames = { keys: KEYS, frames };
 	R.check("burst typing is batched into frames (max age 300 ms)", frames <= KEYS / 4, { frames, keys: KEYS });
-	R.check("bound views equal the replicas", a.hosts.get(doc) === (await a.e.docText(doc))
-		&& b.hosts.get(doc) === (await b.e.docText(doc)));
+	R.check("bound views equal the replicas", a.hosts.get(doc) === (await docText(a.e, doc))
+		&& b.hosts.get(doc) === (await docText(b.e, doc)));
 
 	R.step("concurrent edits on one doc");
 	const cdoc = ids[2]!;
 	await Promise.all([a, b].map(async (d) => {
 		for (let i = 0; i < 20; i++) {
-			await d.e.editDoc(cdoc, (x) => x.insert(i % 2 ? 0 : x.length, `${d.name}${i};`));
+			await editDoc(d.e, cdoc, (x) => x.insert(i % 2 ? 0 : x.length, `${d.name}${i};`));
 			await sleep(15);
 		}
 	}));
 	R.record("converge_ms", await converge([a, b]));
-	const ctext = await a.e.docText(cdoc);
+	const ctext = await docText(a.e, cdoc);
 	R.check("all 40 concurrent inserts present", [a, b].every((d) => Array.from({ length: 20 }, (_, i) => `${d.name}${i};`).every((m) => ctext.includes(m))));
 
 	R.step("rename + delete");
-	await a.e.renameDoc(ids[3]!, P("moved/a3.md"));
-	await b.e.deleteDoc(ids[4]!);
+	await renameDoc(a.e, ids[3]!, P("moved/a3.md"));
+	await deleteDoc(b.e, ids[4]!);
 	R.record("converge_ms", await converge([a, b]));
 	R.check("rename visible on b", b.e.listDocs().find((d) => d.docId === ids[3])?.path === "moved/a3.md");
 	R.check("delete visible on a", a.e.listDocs().find((d) => d.docId === ids[4])?.state !== "live");
@@ -128,10 +129,10 @@ async function main(): Promise<void> {
 	R.step("offline edits on both sides + reconnect catch-up");
 	b.e.disconnect();
 	await until(() => b.e.status().phase !== "live", 5_000, "b offline");
-	for (let i = 0; i < 10; i++) await a.e.editDoc(ids[5]!, (x) => x.insert(x.length, `on${i};`));
-	const off1 = await a.e.createDoc(P("offline/new1.md"), "made while b offline;");
-	await b.e.editDoc(ids[0]!, (x) => x.insert(0, "b-offline;"));
-	const bOff = await b.e.createDoc(P("offline/fromb.md"), "b made offline;");
+	for (let i = 0; i < 10; i++) await editDoc(a.e, ids[5]!, (x) => x.insert(x.length, `on${i};`));
+	const off1 = await createDoc(a.e, P("offline/new1.md"), "made while b offline;");
+	await editDoc(b.e, ids[0]!, (x) => x.insert(0, "b-offline;"));
+	const bOff = await createDoc(b.e, P("offline/fromb.md"), "b made offline;");
 	await sleep(300);
 	R.check("b holds its offline frames", b.e.c.outbox.size > 0, b.e.c.outbox.size);
 	const reads0 = b.e.c.sess.stats.reads;
@@ -139,23 +140,23 @@ async function main(): Promise<void> {
 	await b.e.reconnect();
 	await converge([a, b]);
 	R.record("reconnect_converge_ms", R.now() - t);
-	R.check("a's offline-period edits reached b", (await b.e.docText(ids[5]!)).endsWith("on9;") && (await b.e.docText(off1)) === "made while b offline;");
-	R.check("b's offline edits reached a", (await a.e.docText(ids[0]!)).startsWith("b-offline;") && (await a.e.docText(bOff)) === "b made offline;");
+	R.check("a's offline-period edits reached b", (await docText(b.e, ids[5]!)).endsWith("on9;") && (await docText(b.e, off1)) === "made while b offline;");
+	R.check("b's offline edits reached a", (await docText(a.e, ids[0]!)).startsWith("b-offline;") && (await docText(a.e, bOff)) === "b made offline;");
 	R.check("b outbox drained", b.e.c.outbox.size === 0);
 	R.extra.reconnectReads = b.e.c.sess.stats.reads - reads0;
 
 	R.step("large update via the blob store (bodyUpdateRef)");
 	const big = "L".repeat(1_300_000);
-	await a.e.editDoc(ids[6]!, (x) => x.insert(x.length, big));
+	await editDoc(a.e, ids[6]!, (x) => x.insert(x.length, big));
 	R.record("large_update_converge_ms", await converge([a, b], 60_000));
-	R.check("b has the 1.3 MB update", (await b.e.docText(ids[6]!)).length === "b1 body;".length + big.length);
+	R.check("b has the 1.3 MB update", (await docText(b.e, ids[6]!)).length === "b1 body;".length + big.length);
 	const tail = await b.e.c.repo.getTail(b.e.streamOf(ids[6]!), 0);
 	R.check("the update rode the log only as a small bodyUpdateRef (its bytes are in R2)", tail.every((r) => r.content.length < 64 * 1024), { kinds: tail.map((r) => r.kind) });
 
 	R.step("checkpoint duty (relay CAS)");
 	const kdoc = ids[3]!;
 	for (let i = 0; i < 45; i++) {
-		await a.e.editDoc(kdoc, (x) => x.insert(x.length, `k${i};`));
+		await editDoc(a.e, kdoc, (x) => x.insert(x.length, `k${i};`));
 		await sleep(i % 5 === 4 ? 350 : 5);
 	}
 	await converge([a, b]);
@@ -182,7 +183,7 @@ async function phase2(a: Device, b: Device, c: Device, ids: DocId[]): Promise<vo
 	R.check("c converged with a and b", true, { ms });
 	const kStream = c.e.streamOf(ids[3]!);
 	R.extra.freshCatchup = { feedPages: c.e.c.sess.stats.feedPages, reads: c.e.c.sess.stats.reads, snapshotCoversSeq: c.e.c.repo.stream(kStream)!.snapshotCoversSeq };
-	R.check("c text of a checkpointed doc", (await c.e.docText(ids[3]!)).endsWith("k44;"));
+	R.check("c text of a checkpointed doc", (await docText(c.e, ids[3]!)).endsWith("k44;"));
 	const ckMax = Math.max(...[a, b].map((d) => d.e.c.repo.stream(kStream)!.remoteCheckpointCoversSeq));
 	R.check("c started that doc from the relay checkpoint", ckMax > 0 && c.e.c.repo.stream(kStream)!.snapshotCoversSeq >= ckMax,
 		{ ckMax, snapshotCoversSeq: c.e.c.repo.stream(kStream)!.snapshotCoversSeq });
@@ -190,20 +191,20 @@ async function phase2(a: Device, b: Device, c: Device, ids: DocId[]): Promise<vo
 	R.step("restart a from IndexedDB");
 	const cursor = a.e.c.repo.cursor.vaultSeq;
 	await a.stop();
-	for (let i = 0; i < 5; i++) await b.e.editDoc(ids[0]!, (x) => x.insert(x.length, `while-a-down${i};`));
+	for (let i = 0; i < 5; i++) await editDoc(b.e, ids[0]!, (x) => x.insert(x.length, `while-a-down${i};`));
 	t = R.now();
 	await a.start(HOST, vaultId, TUNING);
 	R.check("a resumes from its cursor", a.e.c.repo.cursor.vaultSeq >= cursor, { before: cursor, after: a.e.c.repo.cursor.vaultSeq });
 	await converge([a, b, c], 30_000);
 	R.record("restart_converge_ms", R.now() - t);
-	R.check("a got edits made while down", (await a.e.docText(ids[0]!)).endsWith("while-a-down4;"));
+	R.check("a got edits made while down", (await docText(a.e, ids[0]!)).endsWith("while-a-down4;"));
 	R.extra.restartReads = a.e.c.sess.stats.reads;
 
 	R.step("IndexedDB loss -> outbox mirror recovery");
 	b.e.disconnect();
 	await until(() => b.e.status().phase !== "live", 5_000, "b offline");
-	await b.e.editDoc(ids[1]!, (x) => x.insert(0, "mirror-me;"));
-	const mdoc = await b.e.createDoc(P("mirror/rec.md"), "recovered via mirror;");
+	await editDoc(b.e, ids[1]!, (x) => x.insert(0, "mirror-me;"));
+	const mdoc = await createDoc(b.e, P("mirror/rec.md"), "recovered via mirror;");
 	await b.e.flush();
 	R.check("b has unreceipted frames", b.e.c.outbox.size > 0, b.e.c.outbox.size);
 	await b.stop();
@@ -211,19 +212,19 @@ async function phase2(a: Device, b: Device, c: Device, ids: DocId[]): Promise<vo
 	await b.start(HOST, vaultId, TUNING);
 	R.check("recovered-from-mirror notice", b.e.status().notices.some((n) => n.code === "recovered-from-mirror"));
 	await converge([a, b, c], 60_000);
-	R.check("mirrored edits reached a", (await a.e.docText(ids[1]!)).startsWith("mirror-me;") && (await a.e.docText(mdoc)) === "recovered via mirror;");
+	R.check("mirrored edits reached a", (await docText(a.e, ids[1]!)).startsWith("mirror-me;") && (await docText(a.e, mdoc)) === "recovered via mirror;");
 
 	if (RELAY_RESTART) {
 		R.step("relay process restart (state kept)");
 		execFileSync("zsh", [`${WT}scripts/relay-dev/stop-local.sh`, "--port", RELAY_PORT], { stdio: "inherit" });
 		await sleep(500);
-		await a.e.editDoc(ids[2]!, (x) => x.insert(0, "during-relay-down;"));
+		await editDoc(a.e, ids[2]!, (x) => x.insert(0, "during-relay-down;"));
 		execFileSync("zsh", [`${WT}scripts/relay-dev/start-local.sh`, "--port", RELAY_PORT], { stdio: ["ignore", "ignore", "inherit"] });
 		t = R.now();
 		await until(() => [a, b, c].every((d) => d.e.status().phase === "live"), 60_000, "auto-reconnect");
 		R.record("relay_restart_reconnect_ms", R.now() - t);
 		await converge([a, b, c], 60_000);
-		R.check("edit made while relay was down converged", (await c.e.docText(ids[2]!)).startsWith("during-relay-down;"));
+		R.check("edit made while relay was down converged", (await docText(c.e, ids[2]!)).startsWith("during-relay-down;"));
 	}
 
 	R.step("final invariants");

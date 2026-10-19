@@ -11,7 +11,7 @@
  * settings (restartEngine) brings up the next one.
  */
 
-import type { DeviceId, VaultPath } from "../core/types";
+import type { DeviceId, DocId, VaultPath } from "../core/types";
 import { pathKey } from "../core/paths/pathKey";
 import type { Unsubscribe } from "../ports/common";
 import type { EnginePorts } from "../ports";
@@ -33,7 +33,6 @@ import type { HostIdentity } from "../host/runtimeSupport";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { createEngine, type ComposedEngine, type EngineHandle } from "../engine/compose/protocolEngine";
 import type { VaultRuntime } from "../engine/compose/vaultRuntime";
-import { residentText } from "../engine/compose/runtimeOps";
 import { FAST_TUNING } from "../engine/runtime/testHarness";
 import type { EngineTuning } from "../engine/runtime/options";
 import type { ClockPort } from "../ports/clock";
@@ -45,6 +44,12 @@ import { hashLabel, SeededRandom } from "./random";
 import { MemStoragePort } from "./storage";
 import { SimConfigDir, SimSideFiles, SimVault, type CaseProfile } from "./vault";
 import { SimWorkspace } from "./workspace";
+
+/** Text of the engine's resident replica of a doc (null: not resident). */
+export function residentText(rt: VaultRuntime, docId: DocId): string | null {
+	const h = rt.log.c.handles.peek(rt.log.streamOf(docId));
+	return h ? h.doc.getText("text").toString() : null;
+}
 
 export class SimPlatform implements PlatformPort {
 	private readonly listeners = new Set<(e: LifecycleEvent) => void>();

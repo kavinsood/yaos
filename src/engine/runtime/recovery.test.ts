@@ -10,7 +10,7 @@ import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import type { SideFilePort } from "../../ports/vault";
 import { MemStoragePort } from "../../sim/storage";
-import { MemSideFiles, converged, sleep, startTestEngine, until } from "./testHarness";
+import { MemSideFiles, converged, sleep, startTestEngine, until, createDoc, docText, editDoc, renameDoc } from "./testHarness";
 import { decodeOutboxMirror, encodeOutboxMirror } from "./mirrors";
 import { DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity } from "../store/schema";
 import type { YS } from "../store/repo";
@@ -35,12 +35,12 @@ for (const committed of [false, true]) {
 		let a2: LogEngine | null = null;
 		try {
 			await live(a, b);
-			const id = await a.createDoc("m.md", "base;");
+			const id = await createDoc(a, "m.md", "base;");
 			await converged([a, b]);
 			relay.pauseCommits();
-			await a.editDoc(id, (t) => t.insert(t.length, "lost1;"));
-			const made = await a.createDoc("new.md", "made offline-ish;");
-			await a.renameDoc(id, "m-renamed.md");
+			await editDoc(a, id, (t) => t.insert(t.length, "lost1;"));
+			const made = await createDoc(a, "new.md", "made offline-ish;");
+			await renameDoc(a, id, "m-renamed.md");
 			await until(() => a.c.sender.inflightCount >= 3, 2_000, "sent");
 			const frames = [...a.c.outbox.values()].map((r) => r.clientFrameId as ClientFrameId);
 			assert.ok(frames.length >= 4);
@@ -58,8 +58,8 @@ for (const committed of [false, true]) {
 			a2 = (await startTestEngine({ relay, deviceId: "dev-a", sideFiles: side })).engine; // new MemStoragePort: the DB is gone
 			assert.ok(a2.status().notices.some((n) => n.code === "recovered-from-mirror"));
 			await converged([a2, b], 10_000);
-			assert.equal(await b.docText(id), "base;lost1;");
-			assert.equal(await b.docText(made), "made offline-ish;");
+			assert.equal(await docText(b, id), "base;lost1;");
+			assert.equal(await docText(b, made), "made offline-ish;");
 			assert.equal(b.listDocs().find((d) => d.docId === id)?.path, "m-renamed.md");
 			const counts = countsByFrame(relay);
 			for (const f of frames) assert.equal(counts.get(f), 1, `frame ${f} committed exactly once`);
@@ -67,9 +67,9 @@ for (const committed of [false, true]) {
 			assert.equal(a2.c.repo.cursor.vaultSeq, relay.head());
 			// The imported synced records carry no localOrder: the imported frames' text is not known to be on disk.
 			assert.ok((a2.bodyInfo(id)?.version.localOrder ?? 0) > 0, "imported body frames move localOrder");
-			await a2.editDoc(id, (t) => t.insert(0, "A2;"));
+			await editDoc(a2, id, (t) => t.insert(0, "A2;"));
 			await converged([a2, b]);
-			assert.equal(await b.docText(id), "A2;base;lost1;");
+			assert.equal(await docText(b, id), "A2;base;lost1;");
 		} finally {
 			await b.stop();
 			await a2?.stop();
@@ -90,10 +90,10 @@ test("schema upgrade: an older DB is rebuilt fresh and imports the mirror, legac
 	let a2: LogEngine | null = null;
 	try {
 		await live(a, b);
-		const id = await a.createDoc("u.md", "base;");
+		const id = await createDoc(a, "u.md", "base;");
 		await converged([a, b]);
 		relay.pauseCommits();
-		await a.editDoc(id, (t) => t.insert(t.length, "inflight;"));
+		await editDoc(a, id, (t) => t.insert(t.length, "inflight;"));
 		await until(() => a.c.sender.inflightCount >= 1, 2_000, "sent");
 		const frames = [...a.c.outbox.values()].map((r) => r.clientFrameId);
 		await sleep(60); // mirror debounce
@@ -124,7 +124,7 @@ test("schema upgrade: an older DB is rebuilt fresh and imports the mirror, legac
 		const stored = await a2.c.repo.outboxAll();
 		assert.ok(stored.length > 0 && stored.every((r) => r.state === "pending"), `imported as pending: ${stored.map((r) => r.state).join(",")}`);
 		await converged([a2, b], 10_000);
-		assert.equal(await b.docText(id), "base;inflight;");
+		assert.equal(await docText(b, id), "base;inflight;");
 		const counts = countsByFrame(relay);
 		for (const f of frames) assert.equal(counts.get(f), 1, `frame ${f} committed exactly once`);
 	} finally {
@@ -156,10 +156,10 @@ test("mirror recovery: a restart over stored frames the mirror lacks rewrites it
 	let a3: LogEngine | null = null;
 	try {
 		await live(a, b);
-		const id = await a.createDoc("m.md", "base;");
+		const id = await createDoc(a, "m.md", "base;");
 		await converged([a, b]);
 		relay.pauseCommits();
-		await a.editDoc(id, (t) => t.insert(t.length, "kept;"));
+		await editDoc(a, id, (t) => t.insert(t.length, "kept;"));
 		await until(() => a.c.outbox.size > 0, 2_000, "frame stored");
 		p1.kill(); // dies before the debounced mirror write
 		const copy = (storage as MemStoragePort).crash();
@@ -179,7 +179,7 @@ test("mirror recovery: a restart over stored frames the mirror lacks rewrites it
 		a3 = (await startTestEngine({ relay, deviceId: "dev-a", sideFiles: side })).engine; // fresh DB
 		assert.ok(a3.status().notices.some((n) => n.code === "recovered-from-mirror"), "recovered from the mirror");
 		await converged([a3, b], 10_000);
-		assert.equal(await b.docText(id), "base;kept;");
+		assert.equal(await docText(b, id), "base;kept;");
 	} finally {
 		await b.stop();
 		await a3?.stop();
@@ -193,18 +193,18 @@ test("IDB lost without a mirror: this device's earlier rows read back are remote
 	let a2: LogEngine | null = null;
 	try {
 		await live(a);
-		const id = await a.createDoc("o.md", "a1;");
-		await a.editDoc(id, (t) => t.insert(t.length, "a2;"));
+		const id = await createDoc(a, "o.md", "a1;");
+		await editDoc(a, id, (t) => t.insert(t.length, "a2;"));
 		await until(() => a.c.outbox.size === 0, 2_000, "receipted");
 		assert.equal(a.bodyInfo(id)?.version.remoteSeq, 0, "own receipted rows are local in their store");
 		await a.stop();
 		a2 = (await startTestEngine({ relay, deviceId: "dev-a" })).engine; // fresh DB, no side files
 		await live(a2);
 		// "live" is set before the body catch-up reads o.md's stream (sessionLoop.onSession): wait for the read-back.
-		await until(async () => (await a2!.docText(id)) === "a1;a2;", 2_000, "own rows read back");
+		await until(async () => (await docText(a2!, id)) === "a1;a2;", 2_000, "own rows read back");
 		await until(() => (a2!.bodyInfo(id)?.version.remoteSeq ?? 0) > 0, 2_000, "remoteSeq moved");
 		const before = a2.bodyInfo(id)!.version;
-		await a2.editDoc(id, (t) => t.insert(0, "b;"));
+		await editDoc(a2, id, (t) => t.insert(0, "b;"));
 		await until(() => a2!.c.outbox.size === 0, 2_000, "receipted again");
 		assert.equal(a2.bodyInfo(id)!.version.remoteSeq, before.remoteSeq, "rows this store receipted stay local");
 	} finally {
@@ -220,13 +220,13 @@ test("live overflow: queue over liveQueueMaxRows drops cold payloads -> stale ->
 		await live(a, b);
 		relay.pauseCommits();
 		const ids = [];
-		for (let i = 0; i < 12; i++) ids.push(await a.createDoc(`o${i}.md`, `body ${i};`));
+		for (let i = 0; i < 12; i++) ids.push(await createDoc(a, `o${i}.md`, `body ${i};`));
 		await until(() => a.c.sender.inflightCount >= 12, 2_000, "ns creates sent (bodies held on them)");
 		relay.resumeCommits();
 		await converged([a, b], 10_000);
 		assert.ok(b.c.live.stats.overflows > 0, "overflowed");
 		assert.ok(b.c.live.stats.stale > 0, "rows recorded stale");
-		for (let i = 0; i < ids.length; i++) assert.equal(await b.docText(ids[i]!), `body ${i};`);
+		for (let i = 0; i < ids.length; i++) assert.equal(await docText(b, ids[i]!), `body ${i};`);
 		assert.equal(b.c.repo.cursor.vaultSeq, relay.head());
 		assert.equal([...b.c.repo.streams()].filter((r) => r.stale).length, 0);
 	} finally {

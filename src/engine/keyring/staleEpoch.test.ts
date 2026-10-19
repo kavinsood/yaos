@@ -10,7 +10,7 @@ import * as Y from "yjs";
 import { encodeNsOps } from "../../core/codec/nsOps";
 import { KEYRING_STREAM, NS_STREAM, type ContentHash, type DocId, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until } from "../runtime/testHarness";
+import { converged, until, createDoc, docText } from "../runtime/testHarness";
 import { keyMissing, live, oldEpochFrame, rawAppend, start, type Dev } from "./testkit/engines";
 import { K, RK_A, genesis } from "./testkit/world";
 
@@ -37,7 +37,7 @@ describe("stale-epoch rule (§14.3) in the engine", () => {
 		const relay = new SimRelay();
 		const [x] = await pair(relay, "dev-x");
 		try {
-			const id = await x!.engine.createDoc("a.md" as VaultPath, "kept");
+			const id = await createDoc(x!.engine, "a.md" as VaultPath, "kept");
 			await converged([x!.engine]);
 			await oldEpochFrame(relay, NS_STREAM, 1, "nsOps", create("before.md"), 1);
 			await until(() => paths(x!).includes("before.md"), 5_000, "pre-revoke frame folded");
@@ -47,10 +47,10 @@ describe("stale-epoch rule (§14.3) in the engine", () => {
 			const ns = await oldEpochFrame(relay, NS_STREAM, 1, "nsOps", create("evil.md"), 2);
 			const body = await oldEpochFrame(relay, x!.engine.streamOf(id), 1, "bodyUpdate", evilUpdate());
 			assert.ok(ns > sRot && body > sRot);
-			await x!.engine.createDoc("after.md" as VaultPath, "after"); // folds past the stale row
+			await createDoc(x!.engine, "after.md" as VaultPath, "after"); // folds past the stale row
 			await converged([x!.engine]);
 			assert.deepEqual(paths(x!), ["a.md", "after.md", "before.md"]);
-			assert.equal(await x!.engine.docText(id), "kept");
+			assert.equal(await docText(x!.engine, id), "kept");
 			assert.equal(x!.engine.status().counts.quarantinedRows, 0, "ignored, not quarantined");
 			assert.equal(x!.engine.status().counts.frozenDocs, 0);
 			assert.equal(keyMissing(x!), null);
@@ -63,28 +63,28 @@ describe("stale-epoch rule (§14.3) in the engine", () => {
 		const relay = new SimRelay();
 		const [x, y] = await pair(relay, "dev-x", "dev-y");
 		try {
-			const id = await x!.engine.createDoc("a.md" as VaultPath, "kept");
+			const id = await createDoc(x!.engine, "a.md" as VaultPath, "kept");
 			await converged([x!.engine, y!.engine]);
 			assert.equal(await x!.engine.revokeRekey(RK_A.slice()), "won");
 			const k2 = x!.changes.flatMap((c) => c.keys).find((k) => k.e === 2)!.k;
 			await oldEpochFrame(relay, NS_STREAM, 1, "nsOps", create("evil.md"), 1);
 			await oldEpochFrame(relay, y!.engine.streamOf(id), 1, "bodyUpdate", evilUpdate());
-			await x!.engine.createDoc("new.md" as VaultPath, "under r");
+			await createDoc(x!.engine, "new.md" as VaultPath, "under r");
 			await converged([x!.engine]);
 			const head = relay.head();
 			await until(() => y!.engine.status().vaultSeq >= head, 5_000, "y read through head");
 			assert.deepEqual(paths(y!), ["a.md"], "held: neither the stale row nor the r rows behind it fold");
 			assert.deepEqual((await y!.engine.c.repo.quarantineOf(y!.engine.streamOf(id))).map((q) => q.reason), ["keyring-hold"], "the body row waits");
 			assert.equal(y!.engine.status().counts.quarantinedRows, 2, "and new.md's body under r: unknown key");
-			assert.equal(await y!.engine.docText(id), "kept");
+			assert.equal(await docText(y!.engine, id), "kept");
 			assert.equal(await y!.engine.installKeyQr(2, k2.slice()), "verified");
 			await until(() => paths(y!).includes("new.md"), 5_000, "unopened r rows re-gated");
 			await converged([x!.engine, y!.engine]);
 			assert.deepEqual(paths(y!), ["a.md", "new.md"]);
-			assert.equal(await y!.engine.docText(id), "kept");
+			assert.equal(await docText(y!.engine, id), "kept");
 			assert.equal(y!.engine.status().counts.quarantinedRows, 0, "the hold settled as stale (dismissed); the r body opened");
 			assert.equal(y!.engine.status().counts.frozenDocs, 0);
-			assert.equal(await y!.engine.docText(y!.engine.listDocs().find((d) => d.path === "new.md")!.docId), "under r");
+			assert.equal(await docText(y!.engine, y!.engine.listDocs().find((d) => d.path === "new.md")!.docId), "under r");
 			assert.equal(keyMissing(y!), null);
 			assert.equal(y!.engine.status().e2ee?.sealEpoch, 2);
 		} finally {

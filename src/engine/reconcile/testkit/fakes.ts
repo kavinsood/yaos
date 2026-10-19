@@ -1,7 +1,7 @@
 /** Virtual clock, seeded random and an in-memory blob store (BlobTransfer) for reconcile tests. */
 
 import type { ContentHash, DocId, VaultPath } from "../../../core/types";
-import { prng } from "../../../core/merge/prng";
+import { prng } from "../../../core/merge/testkit/prng";
 import { sha256HexRef } from "../../../core/hash/testkit/hashRef";
 import type { ClockPort, TimerHandle } from "../../../ports/clock";
 import type { RandomPort } from "../../../ports/random";

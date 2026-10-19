@@ -8,7 +8,7 @@ import type { CfgLogPort } from "../settings/cfgSync";
 import type { FoldedNsFrame } from "../sync/nsRuntime";
 import { chunkOps } from "./logApi";
 import type { LogEngine } from "./engine";
-import { converged, startTestEngine, until } from "./testHarness";
+import { converged, startTestEngine, until, createDoc, docText } from "./testHarness";
 
 const APP = "app.json" as ConfigRelPath;
 const CKPT = { rows: 1e9, bytes: 1e12, idleMs: 10, settleMs: 1e9, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
@@ -99,7 +99,7 @@ test("ns: submitNs splits into frames, nsView shows them pending, onNsFold repor
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", extra: { onNsFold: (f) => foldB.push(...f) } });
 	try {
 		relay.pauseCommits();
-		const d = await a.createDoc("r/start.md" as VaultPath, "hello");
+		const d = await createDoc(a, "r/start.md" as VaultPath, "hello");
 		const n = MAX_NS_OPS_PER_FRAME + 88;
 		const ops: NsOp[] = Array.from({ length: n }, (_, i) => ({ t: "rename", docId: d, path: `r/n${i}.md` as VaultPath }));
 		const ids = await a.submitNs(ops);
@@ -136,7 +136,7 @@ test("bodyInfo / openBody: pending create, body frame held on the create, remote
 	try {
 		assert.equal(a.bodyInfo("d-unknown" as never), null);
 		relay.pauseCommits();
-		const d = await a.createDoc("notes/x.md" as VaultPath, "");
+		const d = await createDoc(a, "notes/x.md" as VaultPath, "");
 		const stream = docStream("markdown", d)!;
 		const createCfid = a.nsView().pending.find((f) => f.ops.some((o) => o.t === "create" && o.docId === d))!.clientFrameId;
 		const info0 = a.bodyInfo(d)!;
@@ -163,7 +163,7 @@ test("bodyInfo / openBody: pending create, body frame held on the create, remote
 
 		relay.resumeCommits();
 		await converged([a, b]);
-		assert.equal(await b.docText(d), "body text");
+		assert.equal(await docText(b, d), "body text");
 		const ib = b.bodyInfo(d)!;
 		assert.equal(ib.stream, stream);
 		assert.equal(ib.hasContent, true);
@@ -179,7 +179,7 @@ test("bodyInfo / openBody: pending create, body frame held on the create, remote
 		const r2 = a.c.outbox.ofStream(stream);
 		assert.ok(r2.every((r) => r.dependsOn === null), "no dependency once the create is folded");
 		await converged([a, b]);
-		assert.equal(await b.docText(d), ">body text");
+		assert.equal(await docText(b, d), ">body text");
 	} finally {
 		await stopAll(a, b);
 	}

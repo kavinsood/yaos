@@ -87,10 +87,6 @@ export class HostLink {
 		for (const p of all) p.reject(new HostRequestFailed({ code: "aborted", message: "engine closed", retryable: true }));
 	}
 
-	get pendingCount(): number {
-		return this.pending.size;
-	}
-
 	seedSideFiles(outbox: readonly (Uint8Array | null)[], synced: readonly (Uint8Array | null)[]): void {
 		const names: SideFileName[] = ["outbox-a.bin", "outbox-b.bin"];
 		names.forEach((n, i) => this.seeded.set(n, outbox[i] ?? null));

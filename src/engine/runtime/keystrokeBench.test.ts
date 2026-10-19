@@ -19,7 +19,7 @@ import type { TextChanges } from "../body/textChanges";
 import { resetYjsCounters, yjsCounters } from "../body/yjsCounters";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { converged, sleep, startTestEngine, until } from "./testHarness";
+import { converged, sleep, startTestEngine, until, createDoc, docText } from "./testHarness";
 
 const QUIET = { compactRows: 1e9, compactBytes: 1e15, checkpoint: { rows: 1e9, bytes: 1e15, idleMs: 1e9, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e15 } };
 const BUDGETS = { maxResidentBytes: 512 * 1024 * 1024, maxResidentDocs: 64 };
@@ -68,7 +68,7 @@ async function setupDoc(relay: SimRelay, chars: number) {
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: QUIET, extra: { budgets: BUDGETS } });
 	await until(() => a.status().phase === "live", 3_000, "live");
 	const t0 = performance.now();
-	const id = await a.createDoc("big.md", bigText(chars));
+	const id = await createDoc(a, "big.md", bigText(chars));
 	await until(() => a.isIdle(), 30_000, "created");
 	const createMs = performance.now() - t0;
 	await a.bind(id);
@@ -80,7 +80,7 @@ test("benchmark: 5 MB doc, 1000 keystrokes (burst + paced) -> zero encodeStateAs
 	const { a, id, createMs } = await setupDoc(relay, 5 * 1024 * 1024);
 	let b: LogEngine | null = null;
 	try {
-		assert.equal(await a.docText(id), a.boundText(id));
+		assert.equal(await docText(a, id), a.boundText(id));
 		const burst = await typeInto(a, id, 1000, false);
 		assert.equal(burst.encodes, 0, "burst: no full-state encode");
 		assert.ok(burst.frames >= 4 && burst.frames <= 40, `burst frames ${burst.frames} (FRAME_MAX_UPDATES caps)`);
@@ -89,7 +89,7 @@ test("benchmark: 5 MB doc, 1000 keystrokes (burst + paced) -> zero encodeStateAs
 		assert.ok(paced.frames >= 200, `paced frames ${paced.frames}`);
 		assert.equal(a.c.outbox.size, 0);
 		const want = a.boundText(id);
-		assert.equal(await a.docText(id), want);
+		assert.equal(await docText(a, id), want);
 		const stream = a.streamOf(id);
 		const c0 = performance.now();
 		resetYjsCounters();
@@ -101,7 +101,7 @@ test("benchmark: 5 MB doc, 1000 keystrokes (burst + paced) -> zero encodeStateAs
 			`paced ${paced.frames} frames, ${(paced.syncMsPerKey * 1000).toFixed(1)}us/key sync, ${paced.totalMs.toFixed(0)}ms total; encodes ${burst.encodes}/${paced.encodes}, merges ${burst.merges}/${paced.merges}; one compaction ${compactMs.toFixed(0)}ms`);
 		b = (await startTestEngine({ relay, deviceId: "dev-b", tuning: QUIET, extra: { budgets: BUDGETS } })).engine;
 		await converged([a, b], 30_000);
-		assert.equal(await b.docText(id), want);
+		assert.equal(await docText(b, id), want);
 	} finally {
 		await a.stop();
 		await b?.stop();

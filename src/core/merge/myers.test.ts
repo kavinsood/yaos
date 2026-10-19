@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { diffTokens, lineDiff, myers, splitLines, type Hunk } from "./myers";
-import { prng } from "./prng";
+import { prng } from "./testkit/prng";
 
 function applyHunks(a: Int32Array, b: Int32Array, hunks: readonly Hunk[]): number[] {
 	const out: number[] = [];

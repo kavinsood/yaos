@@ -13,6 +13,7 @@ import type { BlobPort } from "../ports/blob";
 import type { RelayConnectResult, RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { LogEngine } from "../engine/runtime/engine";
+import { docText } from "../engine/runtime/testHarness";
 import type { EngineE2ee } from "../engine/keyring/keyringRuntime";
 import { SimBlobStore } from "./blobStore";
 import type { VirtualClock } from "./clock";
@@ -163,7 +164,7 @@ export class SimNet {
 			if (d.state !== "live") continue;
 			let text: string | null = null;
 			if (d.kind === "markdown") {
-				const p = eng.docText(d.docId);
+				const p = docText(eng, d.docId);
 				let out: string | null = null;
 				void p.then((t) => (out = t), () => (out = null));
 				await this.clock.runUntil(() => out !== null, 30_000);

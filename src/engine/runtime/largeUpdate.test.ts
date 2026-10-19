@@ -24,7 +24,7 @@ import { rawAppend } from "../keyring/testkit/engines";
 import { genesis } from "../keyring/testkit/world";
 import { applyChanges, type TextChanges } from "../body/textChanges";
 import type { LogEngine } from "./engine";
-import { converged, sleep, startTestEngine, testPorts, testStorage, until } from "./testHarness";
+import { converged, sleep, startTestEngine, testPorts, testStorage, until, createDoc, docText, editDoc } from "./testHarness";
 
 const BUDGETS = { maxResidentBytes: 1024 * 1024 * 1024, maxResidentDocs: 64 };
 
@@ -54,15 +54,15 @@ test("large update: the update goes to the blob store; a small bodyUpdateRef rea
 	let c: LogEngine | null = null;
 	try {
 		await live(a, b);
-		const id = await a.createDoc("big.md", "seed;");
+		const id = await createDoc(a, "big.md", "seed;");
 		await converged([a, b]);
 		await b.bind(id);
 		host.v.text = b.boundText(id);
 		const big = "z".repeat(MAX_INLINE_UPDATE_BYTES + 300_000);
-		await a.editDoc(id, (t) => t.insert(t.length, big));
+		await editDoc(a, id, (t) => t.insert(t.length, big));
 		await converged([a, b], 15_000);
 		const want = "seed;" + big;
-		assert.equal(await b.docText(id), want);
+		assert.equal(await docText(b, id), want);
 		assert.equal(host.v.text, want, "bound view got the resolved update");
 		assert.equal(store.objects.size, 1, "the update went to the blob store");
 		assert.deepEqual(relay.streams().filter((s) => !KNOWN.has(streamClass(s))), [], "no stream outside ns/cfg/snap/k/b:/c:");
@@ -73,10 +73,10 @@ test("large update: the update goes to the blob store; a small bodyUpdateRef rea
 
 		c = (await startTestEngine({ relay, deviceId: "dev-c", extra: { budgets: BUDGETS, ports: storePorts(relay, store) } })).engine;
 		await converged([a, b, c], 15_000);
-		assert.equal(await c.docText(id), want);
-		await c.editDoc(id, (t) => t.insert(0, "C;"));
+		assert.equal(await docText(c, id), want);
+		await editDoc(c, id, (t) => t.insert(0, "C;"));
 		await converged([a, b, c], 15_000);
-		assert.ok((await a.docText(id)).startsWith("C;seed;zzz"));
+		assert.ok((await docText(a, id)).startsWith("C;seed;zzz"));
 	} finally {
 		await a.stop();
 		await b.stop();
@@ -91,10 +91,10 @@ test("oversize-local: an update > MAX_INLINE_UPDATE_BYTES with no blob store fre
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", extra: { budgets: BUDGETS } });
 	try {
 		await live(a, b);
-		const id = await a.createDoc("over.md", "keep;");
+		const id = await createDoc(a, "over.md", "keep;");
 		await converged([a, b]);
 		const head0 = relay.head();
-		await a.editDoc(id, (t) => t.insert(t.length, "o".repeat(MAX_INLINE_UPDATE_BYTES + 1000)));
+		await editDoc(a, id, (t) => t.insert(t.length, "o".repeat(MAX_INLINE_UPDATE_BYTES + 1000)));
 		await until(() => a.c.repo.stream(a.streamOf(id))?.frozen === 1, 10_000, "frozen");
 		const rec = a.c.repo.stream(a.streamOf(id))!;
 		assert.equal(rec.frozenReason, "oversize-local");
@@ -103,14 +103,14 @@ test("oversize-local: an update > MAX_INLINE_UPDATE_BYTES with no blob store fre
 		await sleep(100);
 		assert.equal(relay.head(), head0, "nothing appended");
 		assert.equal(a.c.outbox.size, 0);
-		assert.equal(await a.docText(id), "keep;", "replica = durable state (unsent update discarded)");
-		await assert.rejects(a.editDoc(id, (t) => t.insert(0, "x")), /frozen/);
+		assert.equal(await docText(a, id), "keep;", "replica = durable state (unsent update discarded)");
+		await assert.rejects(editDoc(a, id, (t) => t.insert(0, "x")), /frozen/);
 
 		assert.deepEqual(await a.releaseQuarantine(a.streamOf(id)), { passed: 0, dismissed: 0 });
 		assert.equal(a.c.repo.stream(a.streamOf(id))!.frozen, 0);
-		await a.editDoc(id, (t) => t.insert(0, "after;"));
+		await editDoc(a, id, (t) => t.insert(0, "after;"));
 		await converged([a, b]);
-		assert.equal(await b.docText(id), "after;keep;");
+		assert.equal(await docText(b, id), "after;keep;");
 		assert.equal(b.c.repo.stream(b.streamOf(id))!.frozen, 0, "peer never saw a dependency on unsent structs");
 	} finally {
 		await a.stop();
@@ -183,13 +183,13 @@ test("suite 1: an oversize update goes to the store sealed at blobAddress(sha256
 	const b = await suite1Engine(relay, "dev-b", store, 12);
 	try {
 		await live(a, b);
-		const id = await a.createDoc("big.md", "seed;");
+		const id = await createDoc(a, "big.md", "seed;");
 		await converged([a, b]);
 		await b.bind(id);
 		const big = "z".repeat(MAX_INLINE_UPDATE_BYTES + 300_000);
-		await a.editDoc(id, (t) => t.insert(t.length, big));
+		await editDoc(a, id, (t) => t.insert(t.length, big));
 		await converged([a, b], 15_000);
-		assert.equal(await b.docText(id), "seed;" + big);
+		assert.equal(await docText(b, id), "seed;" + big);
 		assert.equal(store.objects.size, 1);
 		assert.deepEqual(relay.streams().filter((s) => !KNOWN.has(streamClass(s))), [], "store path: no stream outside ns/cfg/snap/k/b:/c:");
 		const [addr, sealed] = [...store.objects][0]!;
@@ -220,33 +220,33 @@ test("suite 1: tampered at rest -> retried with backoff, then the doc freezes bl
 	const c = await suite1Engine(relay, "dev-c", store, 23, true);
 	try {
 		await live(a, b, c);
-		const id = await a.createDoc("big.md", "seed;");
+		const id = await createDoc(a, "big.md", "seed;");
 		await converged([a, b, c]);
 		await b.bind(id);
 		await c.bind(id);
 		store.mode = "tampered";
 		const t0 = Date.now();
 		const big = "q".repeat(MAX_INLINE_UPDATE_BYTES + 200_000);
-		await a.editDoc(id, (t) => t.insert(t.length, big));
+		await editDoc(a, id, (t) => t.insert(t.length, big));
 		const sb = b.streamOf(id);
 		await until(() => b.c.repo.stream(sb)?.frozen === 1, 10_000, "b frozen");
 		assert.ok(Date.now() - t0 >= 300, "not before blobQuarantineMinMs");
 		assert.equal(b.c.repo.stream(sb)!.frozenReason, "blob-corrupt");
 		assert.ok(b.status().notices.some((n) => n.code === "frozen:blob-corrupt"));
-		assert.equal(await b.docText(id), "seed;", "nothing applied");
+		assert.equal(await docText(b, id), "seed;", "nothing applied");
 		// The same bytes under a key that is not KCV-checked: never deterministic, so c keeps retrying unfrozen.
 		const gets = store.gets;
 		await sleep(600);
 		assert.equal(c.c.repo.stream(c.streamOf(id))!.frozen, 0);
 		assert.ok(store.gets > gets, "still retried");
-		assert.equal(await c.docText(id), "seed;");
+		assert.equal(await docText(c, id), "seed;");
 		// Repaired at rest: c resolves on its own timer; b only after the user releases the doc.
 		store.mode = "ok";
-		await until(async () => (await c.docText(id)) === "seed;" + big, 5_000, "c resolved");
+		await until(async () => (await docText(c, id)) === "seed;" + big, 5_000, "c resolved");
 		await sleep(500);
 		assert.equal(b.c.repo.stream(sb)!.frozen, 1, "frozen stays frozen until released");
 		assert.deepEqual(await b.releaseQuarantine(sb), { passed: 0, dismissed: 0 });
-		await until(async () => (await b.docText(id)) === "seed;" + big, 5_000, "b resolved after release");
+		await until(async () => (await docText(b, id)) === "seed;" + big, 5_000, "b resolved after release");
 		assert.equal(b.c.repo.stream(sb)!.frozen, 0);
 		assert.ok(!b.status().notices.some((n) => n.code === "frozen:blob-corrupt"));
 	} finally {
@@ -263,18 +263,18 @@ test("suite 1: an absent blob is retried with backoff and never quarantined; it 
 	const b = await suite1Engine(relay, "dev-b", store, 32);
 	try {
 		await live(a, b);
-		const id = await a.createDoc("big.md", "seed;");
+		const id = await createDoc(a, "big.md", "seed;");
 		await converged([a, b]);
 		await b.bind(id);
 		store.mode = "absent";
 		const big = "w".repeat(MAX_INLINE_UPDATE_BYTES + 100_000);
-		await a.editDoc(id, (t) => t.insert(t.length, big));
+		await editDoc(a, id, (t) => t.insert(t.length, big));
 		await until(() => store.gets >= 6, 10_000, "several attempts");
 		await sleep(400);
 		assert.equal(b.c.repo.stream(b.streamOf(id))!.frozen, 0, "absent: not deterministic");
-		assert.equal(await b.docText(id), "seed;");
+		assert.equal(await docText(b, id), "seed;");
 		store.mode = "ok";
-		await until(async () => (await b.docText(id)) === "seed;" + big, 5_000, "resolved on the retry timer");
+		await until(async () => (await docText(b, id)) === "seed;" + big, 5_000, "resolved on the retry timer");
 	} finally {
 		await a.stop();
 		await b.stop();

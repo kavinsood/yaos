@@ -5,7 +5,7 @@ import { SimRelay } from "../../sim/relay";
 import { applyChanges, type TextChanges } from "../body/textChanges";
 import type { LogEngine } from "./engine";
 import type { EngineTuning } from "./options";
-import { converged, sleep, startTestEngine, until } from "./testHarness";
+import { converged, sleep, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
 
 /** A bound editor as main keeps it: bind() + boundText, onBoundText changes from others, typing via applyEditorChanges. */
 class View {
@@ -59,7 +59,7 @@ test("provisional: bound peer applies provisional, adopts, settles on commit", a
 	const relay = new SimRelay();
 	const { a, b, view, origins } = await pair(relay);
 	try {
-		const id = await a.createDoc("p.md", "base");
+		const id = await createDoc(a, "p.md", "base");
 		await converged([a, b]);
 		const va = await view("a", a, id);
 		const vb = await view("b", b, id);
@@ -82,7 +82,7 @@ test("provisional: dropped provisional -> adoptable sent as own frame; converges
 	const relay = new SimRelay();
 	const { a, b, view } = await pair(relay);
 	try {
-		const id = await a.createDoc("d.md", "x");
+		const id = await createDoc(a, "d.md", "x");
 		await converged([a, b]);
 		const va = await view("a", a, id);
 		const vb = await view("b", b, id);
@@ -93,8 +93,8 @@ test("provisional: dropped provisional -> adoptable sent as own frame; converges
 		await until(() => b.c.docs.stats.adoptToPending >= 1, 3_000, "adopt -> pending on drop");
 		await converged([a, b]);
 		assert.equal(vb.text, "xYZ");
-		assert.equal(await b.docText(id), "xYZ");
-		assert.equal(await a.docText(id), "xYZ");
+		assert.equal(await docText(b, id), "xYZ");
+		assert.equal(await docText(a, id), "xYZ");
 		const fromB = relay.rows(("b:" + id) as never).filter((r) => r.deviceId === "dev-b");
 		assert.ok(fromB.length >= 2, "b re-appended the adopted frame, and its own edit");
 	} finally {
@@ -107,7 +107,7 @@ test("provisional: no commit within provisionalAdoptMs -> pending; commits once 
 	const relay = new SimRelay();
 	const { a, b, view } = await pair(relay);
 	try {
-		const id = await a.createDoc("t.md", "");
+		const id = await createDoc(a, "t.md", "");
 		await converged([a, b]);
 		const va = await view("a", a, id);
 		const vb = await view("b", b, id);
@@ -120,8 +120,8 @@ test("provisional: no commit within provisionalAdoptMs -> pending; commits once 
 		await until(() => b.c.sender.inflightCount >= 2, 3_000, "the adopted copy is re-appended next to b's own frame");
 		relay.resumeCommits();
 		await converged([a, b]);
-		assert.equal(await b.docText(id), "slow!");
-		assert.equal(await a.docText(id), "slow!");
+		assert.equal(await docText(b, id), "slow!");
+		assert.equal(await docText(a, id), "slow!");
 		assert.ok(relay.rows(("b:" + id) as never).some((r) => r.deviceId === "dev-b" && r.clientFrameId === adopted), "b's adopted copy committed");
 	} finally {
 		await a.stop();
@@ -134,7 +134,7 @@ test("provisional: an adoptable holds nothing: own frames typed on top are pendi
 	// A long adopt timeout: the adoptable stays adoptable for the whole test.
 	const { a, b, view } = await pair(relay, { provisionalAdoptMs: 60_000 });
 	try {
-		const id = await a.createDoc("h.md", "");
+		const id = await createDoc(a, "h.md", "");
 		await converged([a, b]);
 		const va = await view("a", a, id);
 		const vb = await view("b", b, id);
@@ -152,8 +152,8 @@ test("provisional: an adoptable holds nothing: own frames typed on top are pendi
 		assert.equal(adoptableOf(b, id)?.clientFrameId, adopted, "the adoptable is still waiting for a's commit");
 		relay.resumeCommits();
 		await converged([a, b]);
-		assert.equal(await a.docText(id), "AB");
-		assert.equal(await b.docText(id), "AB");
+		assert.equal(await docText(a, id), "AB");
+		assert.equal(await docText(b, id), "AB");
 		assert.equal(b.c.outbox.size, 0, "the adoptable settled on a's commit");
 		assert.ok(!relay.rows(("b:" + id) as never).some((r) => r.clientFrameId === adopted), "and was never appended");
 	} finally {
@@ -166,15 +166,15 @@ test("resend: relay restart loses unreceipted frames; STREAM_RESEND resends them
 	const relay = new SimRelay();
 	const { a, b } = await pair(relay);
 	try {
-		const id = await a.createDoc("r.md", "one");
+		const id = await createDoc(a, "r.md", "one");
 		await converged([a, b]);
 		relay.pauseCommits();
-		await a.editDoc(id, (t) => t.insert(3, " two"));
+		await editDoc(a, id, (t) => t.insert(3, " two"));
 		await until(() => a.c.sender.inflightCount > 0, 2_000, "inflight");
 		relay.restart();
 		relay.resumeCommits();
 		await converged([a, b]);
-		assert.equal(await b.docText(id), "one two");
+		assert.equal(await docText(b, id), "one two");
 		assert.equal(a.c.outbox.size, 0);
 	} finally {
 		await a.stop();
@@ -188,15 +188,15 @@ test("send window: many frames stay within maxInflightAppendBytes and all commit
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
 	try {
 		await until(() => a.status().phase === "live", 3_000, "live");
-		const id = await a.createDoc("w.md", "");
+		const id = await createDoc(a, "w.md", "");
 		relay.pauseCommits();
-		for (let i = 0; i < 20; i++) await a.editDoc(id, (t) => t.insert(t.length, `line ${i} ${"z".repeat(300)}\n`));
+		for (let i = 0; i < 20; i++) await editDoc(a, id, (t) => t.insert(t.length, `line ${i} ${"z".repeat(300)}\n`));
 		await sleep(50);
 		assert.ok(a.c.sender.inflightByteCount <= 2_000 + 400, `inflight bytes ${a.c.sender.inflightByteCount}`);
 		assert.ok(a.c.sender.queued > 0, "window held frames back");
 		relay.resumeCommits();
 		await converged([a, b]);
-		assert.equal((await b.docText(id)).split("\n").length, 21);
+		assert.equal((await docText(b, id)).split("\n").length, 21);
 	} finally {
 		await a.stop();
 		await b.stop();

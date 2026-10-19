@@ -3,29 +3,26 @@
  * (IDB cache), ns fold, doc handles, sender, live ingest, session loop,
  * maintenance and the outbox mirror behind a small host-facing API.
  *
- * Host contract (WP-D wires it): createDoc / renameDoc / deleteDoc author ns
- * ops; bind() pins the replica for bound views, applyEditorChanges() applies
- * their CodeMirror changes (O(change), never re-encodes the doc), editDoc()
- * applies a disk-merge edit; onBoundText reports every change of a bound body
- * as CodeMirror changes (DESIGN §d.3).
+ * Host contract (WP-D wires it): submitNs authors ns ops; bind() pins the
+ * replica for bound views, applyEditorChanges() applies their CodeMirror
+ * changes (O(change), never re-encodes the doc), openBody() hands a merge job
+ * the replica; onBoundText reports every change of a bound body as CodeMirror
+ * changes (DESIGN §d.3). The tests' authoring calls (createDoc, editDoc, ...)
+ * are in testHarness.ts.
  */
 
 import * as Y from "yjs";
-import { EnvelopeFlag } from "../../core/envelope";
 import type { SnapFoldState } from "../../core/snap/fold";
 import type { SnapOp } from "../../core/snap/record";
-import { NS_STREAM, docStream, kindOfPath, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import { NS_STREAM, docStream, type BodyVersion, type CfgFoldState, type CfgOp, type ClientFrameId, type ContentHash, type DocId, type DocKind, type NsOp, type RemoteBodyInfo, type StreamName, type VaultEpoch } from "../../core/types";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { RelaySession } from "../../ports/relay";
-import { buildBodyFrames, initialTextUpdates } from "../body/frames";
-import { HandleManager, type Handle } from "../body/handles";
+import { HandleManager } from "../body/handles";
 import { applyChanges, changesBaseLength, type TextChanges } from "../body/textChanges";
 import { Sender, sendRank } from "../body/sender";
 import { ORIGIN } from "../body/yjsCounters";
 import { defaultPriority, Repo } from "../store/repo";
-import { newDocId } from "../../core/codec/ids";
-import { bytesToHex, utf8Encode } from "../../core/codec/lib0";
-import { recheckStored, releaseQuarantine, retryReaderQuarantine } from "./quarantineRelease";
+import { recheckStored, releaseQuarantine } from "./quarantineRelease";
 import type { BodyHandle } from "../reconcile/deps";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { CfgRuntime } from "../sync/cfgRuntime";
@@ -177,49 +174,6 @@ export class LogEngine {
 		return s;
 	}
 
-	private async authorNs(ops: readonly NsOp[]): Promise<void> {
-		this.c.assertWritable();
-		await api.submitNs(this.c, ops);
-	}
-
-	async createDoc(path: VaultPath, text: string, kind: DocKind = kindOfPath(path)): Promise<DocId> {
-		const c = this.c;
-		if (kind === "blob") throw new Error("blob docs are not handled by the log engine");
-		c.assertWritable();
-		if (this.listDocs().some((d) => d.path === path && (d.state === "live" || d.state === "pending"))) throw new Error(`path exists: ${path}`);
-		const docId = newDocId(c.ports.random);
-		const stream = docStream(kind, docId)!;
-		const bytes = utf8Encode(text);
-		const contentHash = bytesToHex(await c.ports.hash.sha256(bytes)) as ContentHash;
-		const h = await c.handles.acquire(stream);
-		try {
-			await api.submitNs(c, [{ t: "create", docId, kind, path, contentHash, size: bytes.length }], async ([nsFrame]) => {
-				const frames = [];
-				if (kind === "markdown" && text.length > 0) {
-					for (const u of initialTextUpdates(h.doc, text)) {
-						frames.push(...await buildBodyFrames(c.deps, { stream, content: u, flags: EnvelopeFlag.initial, authorNsSeq: c.ns.coversSeq, dependsOn: nsFrame!.clientFrameId, nowMs: c.now() }));
-					}
-				}
-				return frames;
-			});
-		} catch (e) {
-			c.handles.unpin(h);
-			c.handles.drop(stream);
-			throw e;
-		}
-		c.handles.unpin(h);
-		return docId;
-	}
-
-	renameDoc(docId: DocId, path: VaultPath): Promise<void> {
-		return this.authorNs([{ t: "rename", docId, path }]);
-	}
-
-	deleteDoc(docId: DocId): Promise<void> {
-		const rec = this.c.repo.stream(this.streamOf(docId));
-		return this.authorNs([{ t: "delete", docId, baseBodySeq: Math.max(rec?.appliedSeq ?? 0, rec?.lastOwnSeq ?? 0) }]);
-	}
-
 	// ------------------------------------------------------------ ns / cfg
 
 	/**
@@ -303,21 +257,6 @@ export class LogEngine {
 				c.handles.unpin(h);
 			},
 		};
-	}
-
-	/** Disk-merge style edit: one MERGE transaction, frame closed at once. */
-	async editDoc(docId: DocId, fn: (text: Y.Text, doc: Y.Doc) => void): Promise<void> {
-		const c = this.c;
-		const stream = this.streamOf(docId);
-		if (c.repo.stream(stream)?.frozen) throw new Error(`doc frozen: ${c.repo.stream(stream)?.frozenReason}`);
-		c.assertWritable();
-		const h = await c.handles.acquire(stream);
-		try {
-			h.doc.transact(() => fn(h.doc.getText("text"), h.doc), ORIGIN.MERGE);
-			await c.docs.closeFrame(h);
-		} finally {
-			c.handles.unpin(h);
-		}
 	}
 
 	/**
@@ -414,15 +353,6 @@ export class LogEngine {
 		c.handles.enforceBudget();
 	}
 
-	async docText(docId: DocId): Promise<string> {
-		const h = await this.c.handles.load(this.streamOf(docId));
-		return h.doc.getText("text").toString();
-	}
-
-	handleOf(docId: DocId): Handle | undefined {
-		return this.c.handles.peek(this.streamOf(docId));
-	}
-
 	/**
 	 * Re-gate a stream's quarantined rows (key now available, ...): pass -> tail; the rest dismissed; doc unfrozen.
 	 * By stream, not doc id: a merged duplicate's id resolves to another doc's stream (streamOf).
@@ -437,11 +367,6 @@ export class LogEngine {
 	 */
 	cleanUpBlobs(queued: () => Iterable<ContentHash>): Promise<GcOutcome> {
 		return this.gc.run(queued);
-	}
-
-	/** Automatic retry of reader-dependent quarantine (runs after every session start). */
-	retryQuarantine(): Promise<number> {
-		return retryReaderQuarantine(this.c);
 	}
 
 	// ------------------------------------------------------------ lifecycle

@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until } from "../runtime/testHarness";
+import { converged, until, createDoc, editDoc } from "../runtime/testHarness";
 import { keyMissing, ownRows, parked, rawAppend, start } from "./testkit/engines";
 import { genesis } from "./testkit/world";
 import { KeyMissingError } from "./writeGate";
@@ -17,13 +17,13 @@ describe("fail closed (§12.4)", () => {
 		const relay = new SimRelay();
 		let a = await start(relay, "dev-a", 0);
 		await until(() => a.engine.status().phase === "live", 5_000, "a live");
-		const id = await a.engine.createDoc("a.md" as VaultPath, "plain");
+		const id = await createDoc(a.engine, "a.md" as VaultPath, "plain");
 		await converged([a.engine]);
 		const before = ownRows(relay, "dev-a");
 		await rawAppend(relay, KEYRING_STREAM, await genesis());
 		try {
 			await parked(a, "encrypted-vault");
-			await assert.rejects(a.engine.editDoc(id, (t) => t.insert(0, "more ")), KeyMissingError);
+			await assert.rejects(editDoc(a.engine, id, (t) => t.insert(0, "more ")), KeyMissingError);
 			await new Promise((r) => setTimeout(r, 300));
 			assert.equal(ownRows(relay, "dev-a"), before, "no frame after the genesis");
 			assert.equal(a.engine.status().e2ee?.sealEpoch, 0);
