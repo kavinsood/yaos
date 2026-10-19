@@ -16,6 +16,7 @@ import type { ClientFrameId, DeviceId, Seq, StreamName, VaultEpoch, VaultId } fr
 import { QUARANTINE_MAX_RECORDS } from "../../core/limits";
 import type { KeyRange, StorageDb, StoragePort, StorageTx } from "../../ports/storage";
 import { CursorTracker } from "../sync/cursor";
+import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
 	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaKeyring, type MetaOutboxOrder, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
@@ -740,10 +741,12 @@ export class Repo {
 	}
 
 	/**
-	 * Re-gated fold rows (ns, cfg, snap) replace the unopened rows they stand for (quarantineRelease.regateUnopened). A row
-	 * gone meanwhile (snapshot compaction) is skipped; byte accounting follows the new content.
+	 * Re-gated fold rows (ns, cfg, snap) replace the unopened rows they stand for (quarantineRelease.regateUnopened);
+	 * `drop`: unopened rows that re-gated as accounted only (a snap row found stale-epoch, an ignored frame) leave
+	 * the tail, as a reader that gated them so at first never stored them. A row gone meanwhile (snapshot
+	 * compaction) is skipped; byte accounting follows the new content.
 	 */
-	tReplaceTail(stream: StreamName, rows: readonly TailRecord[]): Promise<number> {
+	tReplaceTail(stream: StreamName, rows: readonly TailRecord[], drop: readonly Seq[] = []): Promise<number> {
 		return this.serial("tReplaceTail", async () => {
 			let n = 0;
 			const out = await this.db.tx([STORE.tail, STORE.streams], "readwrite", async (tx) => {
@@ -753,6 +756,14 @@ export class Repo {
 					if (!old) continue;
 					tx.put(STORE.tail, row);
 					r.tailBytes = Math.max(0, r.tailBytes - old.content.length + row.content.length);
+					n++;
+				}
+				for (const seq of drop) {
+					const old = await tx.get(STORE.tail, [stream, seq]);
+					if (!old || !(old.flags & LOCAL_FLAG_UNOPENED)) continue;
+					tx.delete(STORE.tail, [stream, seq]);
+					r.tailRows = Math.max(0, r.tailRows - 1);
+					r.tailBytes = Math.max(0, r.tailBytes - old.content.length);
 					n++;
 				}
 				tx.put(STORE.streams, r);

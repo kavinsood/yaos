@@ -16,7 +16,7 @@
  * a change and stored after the re-gate the change ran.
  */
 
-import type { StreamName } from "../../core/types";
+import type { Seq, StreamName } from "../../core/types";
 import type { QuarantineRecord, TailRecord } from "../store/schema";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import { gateRow } from "../sync/ingestRow";
@@ -136,12 +136,15 @@ async function regateUnopenedOnce(c: EngineCtx): Promise<number> {
 	for (const { rt, after } of c.folds()) {
 		const rows = (await c.repo.getTail(rt.stream, rt.coversSeq)).filter((r) => r.flags & LOCAL_FLAG_UNOPENED);
 		const out: TailRecord[] = [];
+		const drop: Seq[] = [];
 		for (const r of rows) {
 			const g = await gateRow(c.gateCtx, c.ports.hash, { stream: r.stream, seq: r.seq, deviceId: r.deviceId, clientFrameId: r.clientFrameId, payload: r.content }, c.now());
 			if (g.t === "row" && !(g.row.flags & LOCAL_FLAG_UNOPENED)) out.push(g.row);
+			// Accounted only now (a snap row judged stale-epoch, §14.3): never folded, so it must not hold the fold.
+			else if (g.t === "account") drop.push(r.seq);
 		}
-		if (out.length === 0) continue;
-		const replaced = await c.repo.tReplaceTail(rt.stream, out);
+		if (out.length === 0 && drop.length === 0) continue;
+		const replaced = await c.repo.tReplaceTail(rt.stream, out, drop);
 		c.diag("unopened-regated", { stream: rt.stream, rows: replaced });
 		await rt.resume();
 		await after(false);
