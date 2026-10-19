@@ -44,6 +44,7 @@ import { hashLabel, SeededRandom } from "./random";
 import { MemStoragePort } from "./storage";
 import { SimConfigDir, SimSideFiles, SimVault, type CaseProfile } from "./vault";
 import { SimWorkspace } from "./workspace";
+import { CoverageSink } from "./coverage";
 
 /** Text of the engine's resident replica of a doc (null: not resident). */
 export function residentText(rt: VaultRuntime, docId: DocId): string | null {
@@ -150,6 +151,11 @@ export class SimDevice {
 	readonly disputed: string[] = [];
 	/** Texts that existed only in host memory when the app crashed (pending conflict copies; known gap). */
 	readonly crashLost: string[] = [];
+	/** Engine-side semantic counters over every engine this device ran (coverage.ts). */
+	readonly coverage = new CoverageSink();
+	/** Stats objects of every runtime / engine this device ran (hostStats sums them). */
+	private readonly statSources = new Set<{ readonly adoptToPending: number }>();
+	private readonly boundDisks = new Set<{ readonly conflictCopies: number }>();
 	readonly deviceId: DeviceId;
 	/** The device's persistent SecretStorage contents (survives app restarts and IndexedDB wipes, like the OS keychain). */
 	readonly secretBacking = new Map<string, string>();
@@ -184,6 +190,15 @@ export class SimDevice {
 		this.runtime = this.makeRuntime();
 	}
 
+	/** host.* coverage counters, summed over every runtime and engine of this device. */
+	hostStats(): Record<string, number> {
+		let adoptToPending = 0;
+		let boundConflictCopies = 0;
+		for (const s of this.statSources) adoptToPending += s.adoptToPending;
+		for (const s of this.boundDisks) boundConflictCopies += s.conflictCopies;
+		return { adoptToPending, boundConflictCopies };
+	}
+
 	get name(): string {
 		return this.opts.name;
 	}
@@ -211,7 +226,12 @@ export class SimDevice {
 				if (ev.code === "checkpoint-adopted" && ev.fields["how"] !== "fresh") also("checkpoint-adopted-behind");
 				if (ev.code === "checkpoint-disputed" && this.disputed.length < 10) this.disputed.push(`${String(cls)}@${String(ev.fields["coversSeq"])} ${String(ev.fields["detail"])}`);
 			},
+			observe: {
+				nsFold: (frames) => this.coverage.nsFold(frames),
+				pass: (ops, report) => this.coverage.pass(ops, report),
+			},
 			onRuntime: (rt) => {
+				if (rt) this.statSources.add(rt.log.c.docs.stats);
 				if (this.handle === handle) this.vrt = rt;
 			},
 			makePorts: async (config): Promise<EnginePorts> => {
@@ -230,6 +250,7 @@ export class SimDevice {
 		this.pair = pair;
 		this.handle = handle;
 		this.engine = handle.engine;
+		this.boundDisks.add(handle.engine.boundDisk.stats);
 		this.vrt = null;
 		return {
 			kind: "worker",

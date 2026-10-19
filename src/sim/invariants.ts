@@ -40,8 +40,19 @@
  *                      idle window or a link abort), and the idle window never cut a
  *                      call that kept moving (a slow one)
  *
- * Not checked here: 4 (fold determinism; WP-A's fold fuzz covers it) and 6
- * (resource bounds; WP-C budget tests).
+ *   4 fold             the relay's committed ns / cfg / snap rows (collected ones included),
+ *                      gated as a reader gates them, fold to the devices' bytes whether
+ *                      delivered at once, in seeded random pages, or as a snapshot at a
+ *                      seeded cut plus the rest; every device's state re-encodes to the
+ *                      same bytes after decode (checkFoldDeterminism)
+ *   5 (outbox/cursor)  no outbox record in any state (held / adoptable / poisoned too),
+ *                      vault cursor at the relay head (checkOutboxAndCursor; the rest of 5
+ *                      is in "clean" and "checkpoint")
+ *   6 bounds           sampled after every step and heal tick: resident docs <= budget + 1,
+ *                      resident bytes <= budget + one doc, local tail <= TAIL_HARD_ROWS per
+ *                      stream, ns dedupe rings <= NS_DEDUPE_RING, tombstones <= TOMBSTONE_CAP
+ *                      (checkBounds). At sim scale the residency budgets (24..400 docs) are
+ *                      not approached; the keystroke-path encode counter is keystrokeBench's.
  */
 
 import { encodeNsFoldV1 } from "../core/codec/nsFoldV1";
@@ -49,8 +60,15 @@ import { READER_DEPENDENT } from "../engine/runtime/quarantineRelease";
 import type { QuarantineRecord } from "../engine/store/schema";
 import { checkNsInvariants } from "../core/ns/verify";
 import { pathKey } from "../core/paths/pathKey";
-import { MAX_NS_FRAME_BYTES } from "../core/limits";
-import { NS_STREAM, type VaultPath } from "../core/types";
+import { MAX_NS_FRAME_BYTES, NS_DEDUPE_RING, TAIL_HARD_ROWS, TOMBSTONE_CAP } from "../core/limits";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, type DeviceId, type StreamName, type VaultPath } from "../core/types";
+import type { Repo } from "../engine/store/repo";
+import type { SnapshotRecord, TailRecord } from "../engine/store/schema";
+import { gateRow } from "../engine/sync/ingestRow";
+import { NsRuntime } from "../engine/sync/nsRuntime";
+import { CfgRuntime } from "../engine/sync/cfgRuntime";
+import { SnapRuntime } from "../engine/sync/snapRuntime";
+import type { SeededRandom } from "./random";
 import { SETTING_FILES, tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
 import type { SimDevice } from "./device";
@@ -59,7 +77,7 @@ import { ABSENT, canvasCanonical, canvasFiles, canvasProblem, docIdOf, engineCan
 import { canonicalJson, formatCanvasText, parseCanvasText, type JsonValue } from "../core/hash/canvasCanonical";
 
 export interface Violation {
-	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness" | "checkpoint" | "canvas";
+	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness" | "checkpoint" | "canvas" | "fold" | "bounds";
 	readonly detail: string;
 }
 
@@ -534,6 +552,156 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 				if (oracle.reorders.some((x) => x.dev === r.dev && x.node === m && x.atMs > r.atMs)) continue;
 				if (r.front ? at < mi : at > mi) bad(`reorder of ${r.node} to the ${r.front ? "front" : "back"} on ${r.dev} at step ${r.step} lost against ${m} in ${path}`);
 			}
+		}
+	}
+	return out;
+}
+
+
+// --- 4 fold determinism ----------------------------------------------------------------------
+
+/** The rows of one stream as a fold runtime reads them from its Repo: no snapshot or one, rows up to `applied`. */
+class RowRepo {
+	applied = 0;
+	constructor(readonly rows: readonly TailRecord[], readonly snap: SnapshotRecord | undefined = undefined) {}
+	stream(): { readonly appliedSeq: number } {
+		return { appliedSeq: this.applied };
+	}
+	async getSnapshot(): Promise<SnapshotRecord | undefined> {
+		return this.snap;
+	}
+	async getTail(_stream: StreamName, after = 0, through = Number.MAX_SAFE_INTEGER): Promise<TailRecord[]> {
+		return this.rows.filter((r) => r.seq > after && r.seq <= through);
+	}
+}
+
+type FoldRt = NsRuntime | CfgRuntime | SnapRuntime;
+const FOLD_STREAMS = [["ns", NS_STREAM], ["cfg", CFG_STREAM], ["snap", SNAP_STREAM]] as const;
+
+function newFold(cls: "ns" | "cfg" | "snap", repo: RowRepo, self: DeviceId): FoldRt {
+	const r = repo as unknown as Repo;
+	return cls === "ns" ? new NsRuntime(r, self) : cls === "cfg" ? new CfgRuntime(r, self) : new SnapRuntime(r, self);
+}
+
+/**
+ * Invariant 4 (DESIGN §l.3), at quiescence, per fold class (ns, cfg, snap): the fold of every row the relay ever
+ * committed in this epoch (collected rows included: the sim relay keeps them), gated as a reader gates them,
+ * equals the devices' folds byte for byte, however it is delivered:
+ *   - all rows at once (no checkpoint);
+ *   - in seeded random pages (advance() per page);
+ *   - from a snapshot of the paged fold at a seeded cut, plus the rest (checkpoint + tail);
+ * and the canonical encoding round-trips: the device's state bytes, loaded as a snapshot, re-encode identically.
+ * The gate runs on devs[0]'s keys (suite 1) and stale-epoch view; run it with the clock running (gates may await
+ * crypto on it).
+ */
+export async function checkFoldDeterminism(devs: readonly SimDevice[], net: SimNet, rng: SeededRandom): Promise<Violation[]> {
+	const out: Violation[] = [];
+	const bad = (detail: string) => out.push({ inv: "fold", detail });
+	const ref = devs.find((d) => d.vrt);
+	const c = ref?.vrt?.log.c;
+	if (!ref || !c) return out;
+	for (const [cls, stream] of FOLD_STREAMS) {
+		const want = (cls === "ns" ? c.ns : cls === "cfg" ? c.cfg : c.snap).encodeState();
+		const rows: TailRecord[] = [];
+		for (const r of net.relay.rows(stream, { includeGc: true })) {
+			const g = await gateRow(c.gateCtx, c.ports.hash, { stream, seq: r.seq, deviceId: r.deviceId, clientFrameId: r.clientFrameId, payload: r.payload }, 0);
+			if (g.t === "row") rows.push(g.row);
+		}
+		const last = rows[rows.length - 1]?.seq ?? 0;
+		const check = async (how: string, rt: FoldRt) => {
+			if (rt.halted) bad(`${cls} ${how}: fold halted at ${rt.halted.seq} (${rt.halted.reason})`);
+			const got = rt.encodeState();
+			if (hex(got) !== hex(want)) bad(`${cls} ${how}: ${hex(got)} != ${ref.name}'s ${hex(want)} (${rows.length} rows to ${last})`);
+		};
+		// All at once.
+		const whole = new RowRepo(rows);
+		whole.applied = last;
+		const full = newFold(cls, whole, ref.deviceId);
+		await full.load();
+		await check("full refold", full);
+		// Paged, with a snapshot at a cut point.
+		const paged = new RowRepo(rows);
+		const p = newFold(cls, paged, ref.deviceId);
+		await p.load();
+		const cut = rows.length > 0 ? rows[rng.int(rows.length)]!.seq : 0;
+		let snap: SnapshotRecord | undefined;
+		for (let i = 0; i < rows.length;) {
+			i = Math.min(rows.length, i + rng.range(1, 8));
+			paged.applied = rows[i - 1]!.seq;
+			await p.advance();
+			if (snap === undefined && paged.applied >= cut) snap = { stream, coversSeq: p.coversSeq, encoding: p.encoding, bytes: p.encodeState(), createdAtMs: 0 };
+		}
+		await check("paged refold", p);
+		const tail = new RowRepo(rows, snap);
+		tail.applied = last;
+		const fromCut = newFold(cls, tail, ref.deviceId);
+		await fromCut.load();
+		await check(`snapshot@${snap?.coversSeq ?? 0} + tail`, fromCut);
+		// encode -> decode -> encode.
+		for (const d of devs) {
+			const dc = d.vrt?.log.c;
+			if (!dc) continue;
+			const own = cls === "ns" ? dc.ns : cls === "cfg" ? dc.cfg : dc.snap;
+			const bytes = own.encodeState();
+			const rt = newFold(cls, new RowRepo([], { stream, coversSeq: own.coversSeq, encoding: own.encoding, bytes, createdAtMs: 0 }), d.deviceId);
+			await rt.load();
+			if (hex(rt.encodeState()) !== hex(bytes)) bad(`${cls} ${d.name}: encode(decode(state)) ${hex(rt.encodeState())} != ${hex(bytes)}`);
+		}
+	}
+	return out;
+}
+
+// --- 5 outbox / cursor / held ----------------------------------------------------------------
+
+/**
+ * Invariant 5's outbox and cursor part (DESIGN §l.3), read off the engine directly (checkClean reads the last
+ * status): no outbox record of any state (pending, held, adoptable, poisoned), no adoptable registered, the vault
+ * cursor at the relay head.
+ */
+export function checkOutboxAndCursor(devs: readonly SimDevice[], net: SimNet): Violation[] {
+	const out: Violation[] = [];
+	const head = net.relay.head();
+	for (const d of devs) {
+		const c = d.vrt?.log.c;
+		if (!c) continue;
+		if (c.outbox.size > 0) {
+			const by: Record<string, number> = {};
+			for (const r of c.outbox.values()) by[r.state] = (by[r.state] ?? 0) + 1;
+			out.push({ inv: "clean", detail: `${d.name}: outbox holds ${c.outbox.size} records ${JSON.stringify(by)}` });
+		}
+		const v = c.repo.cursor.vaultSeq;
+		if (v < head) out.push({ inv: "clean", detail: `${d.name}: vault cursor ${v} below relay head ${head} (above: ${c.repo.cursor.pendingAbove()})` });
+	}
+	return out;
+}
+
+// --- 6 resource bounds -----------------------------------------------------------------------
+
+/**
+ * Invariant 6 (DESIGN §l.3), sampled after every step and heal tick: resident docs <= maxResidentDocs + 1,
+ * resident bytes <= maxResidentBytes + the largest resident doc, every stream's local tail <= TAIL_HARD_ROWS,
+ * the ns fold's per-device dedupe ring <= NS_DEDUPE_RING and its tombstone pool <= TOMBSTONE_CAP.
+ * (No encodeStateAsUpdate on the keystroke path: keystrokeBench.test.ts, not the sim.)
+ */
+export function checkBounds(devs: readonly SimDevice[]): Violation[] {
+	const out: Violation[] = [];
+	const bad = (detail: string) => out.push({ inv: "bounds", detail });
+	for (const d of devs) {
+		const c = d.vrt?.log.c;
+		if (!c || c.stopped) continue;
+		const h = c.handles;
+		if (h) {
+			if (h.count > c.budgets.maxResidentDocs + 1) bad(`${d.name}: ${h.count} resident docs, budget ${c.budgets.maxResidentDocs}`);
+			let largest = 0;
+			for (const x of h.all()) largest = Math.max(largest, x.bytesEstimate);
+			if (h.bytes - largest > c.budgets.maxResidentBytes) bad(`${d.name}: ${h.bytes} resident bytes, budget ${c.budgets.maxResidentBytes}`);
+		}
+		for (const r of c.repo?.streams() ?? []) if (r.tailRows > TAIL_HARD_ROWS) bad(`${d.name}: ${r.stream} tail ${r.tailRows} rows > ${TAIL_HARD_ROWS}`);
+		const st = c.ns?.state;
+		if (st) {
+			for (const [dev, ring] of st.recentFrames) if (ring.length > NS_DEDUPE_RING) bad(`${d.name}: ns ring of ${dev} holds ${ring.length} > ${NS_DEDUPE_RING}`);
+			const tomb = c.ns.index.tombstones;
+			if (tomb > TOMBSTONE_CAP) bad(`${d.name}: ${tomb} ns tombstones > ${TOMBSTONE_CAP}`);
 		}
 	}
 	return out;

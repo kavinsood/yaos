@@ -20,7 +20,8 @@ import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
 import { generateUserAction, runUserAction, tokensIn, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
-import { activity, checkBlobLiveness, checkCanvas, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
+import { activity, checkBlobLiveness, checkCanvas, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, checkBounds, checkFoldDeterminism, checkOutboxAndCursor, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
+import { collectCoverage } from "./coverage";
 import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
 import { SIM_SETTINGS, SimDevice } from "./device";
@@ -215,6 +216,11 @@ export interface SimReport {
 		readonly realWork?: RealWork["stats"];
 		/** Canvas coverage: actions, merges the engine ran, broken saves, notices, conflict copies. */
 		readonly canvas: CanvasRunStats;
+		/**
+		 * Semantic coverage (coverage.ts): ns fold outcomes, planner ops, brakes, diagnostics and host counters the
+		 * engines reported, summed over the devices. Every COVERAGE_KEYS key is present, 0 if it never fired.
+		 */
+		readonly coverage: Readonly<Record<string, number>>;
 	};
 }
 
@@ -425,6 +431,12 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		}
 		await clock.advance(500);
 
+		// Invariant 6 is sampled throughout (after every step and heal tick); the first few distinct breaches are kept.
+		const bounds = new Map<string, Violation>();
+		const sampleBounds = () => {
+			if (bounds.size >= 5) return;
+			for (const v of checkBounds(devs)) if (bounds.size < 5 && !bounds.has(v.detail)) bounds.set(v.detail, v);
+		};
 		const actorWorld = {
 			devs, ledger, isDown: (i: number) => faults.isDown(i), isBackground: (i: number) => faults.isBackground(i),
 			onUserRename: (i: number, from: string, to: string, step: number) => {
@@ -442,6 +454,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			else if ("fault" in step && step.fault.t === "idbWipe" && !step.fault.mirrors) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
 			trace.push(`${step.i} ${line}`);
 			faults.afterStep();
+			sampleBounds();
 			cfg.observe?.(String(step.i), devs, net);
 		}
 
@@ -457,6 +470,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const print = () => `${activity(devs, net)}|${devs.map((d) => `${[...d.vault.snapshot()].join(";")}#${settingsPrint(d)}`).join("|")}`;
 		for (let t = 0; t < c.healHorizonMs && stable < 5; t += 1_000) {
 			await clock.advance(1_000);
+			sampleBounds();
 			// Blob store calls outside the blob queue (a snapshot upload's) count too: a stalled one ends by its idle window.
 			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty()));
 			const fp = print();
@@ -494,8 +508,13 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const oracle = await net.oracle(120_000, c.suite1 ? oracleKeys(devs) : null);
 		if (c.suite1) violations.push(...checkE2eeLeaks(devs, net, ledger).violations, ...(faults.e2ee?.check() ?? []));
 		canvasWorld.finalize();
-		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net), ...checkCanvas(devs, canvasWorld.oracle));
+		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net), ...checkCanvas(devs, canvasWorld.oracle), ...checkOutboxAndCursor(devs, net), ...bounds.values());
 		violations.push(...(await checkQuiet(clock, devs, net)));
+		// Invariant 4: refold the relay's rows (gates may await crypto on the clock, so it runs).
+		let fold: Violation[] | null = null;
+		void checkFoldDeterminism(devs, net, new SeededRandom(cfg.seed).fork("fold-determinism")).then((v) => (fold = v), (e) => (fold = [{ inv: "fold", detail: `refold threw: ${e instanceof Error ? e.stack ?? e.message : String(e)}` }]));
+		await clock.runUntil(() => fold !== null, 120_000);
+		violations.push(...(fold ?? [{ inv: "fold" as const, detail: "refold did not finish" }]));
 
 		const present = vaultTokens(devs);
 		for (const t of clobberedTokens(devs)) present.add(t);
@@ -518,7 +537,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, checkpoints: checkpointStats(devs, net), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
+			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
 		};
 	} finally {
 		seedEntropy(null);
