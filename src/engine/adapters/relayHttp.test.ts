@@ -5,6 +5,7 @@ import { base64ToBytes, bytesToBase64, createRelayHttp, dailyResetDelayMs, parse
 import { RELAY_HTTP_BASE_MS, RELAY_HTTP_FLOOR_BYTES_PER_S, relayHttpDeadlineMs } from "../../core/deadline";
 import type { StreamName } from "../../core/types";
 import { fakeFetch, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
+import { encodeReadReply, READ_BINARY_TYPE, type WireReadPage } from "./relayFrames";
 
 const TOKEN = "device-token-SECRET-abc123";
 const BASE = "https://relay.example/";
@@ -193,6 +194,58 @@ describe("relayHttp read", () => {
 		const bad = await rejection(client(() => jsonResponse({ lastSeq: 1, rows: [{ seq: 1, deviceId: "d", clientFrameId: "c", payload: "!!" }], nextAfter: null }))
 			.http.read("v1", "s", 0, false, null));
 		assert.equal(bad.code, "malformed_response");
+	});
+});
+
+describe("relayHttp binary read (relay-wire §7.2)", () => {
+	const binary = (pages: WireReadPage[], status = 200) =>
+		new Response(encodeReadReply({ vaultEpoch: "E", head: 57, pages }), { status, headers: { "content-type": READ_BINARY_TYPE } });
+	const pageOf = (stream: string, extra: Partial<WireReadPage> = {}): WireReadPage => ({
+		stream, lastSeq: 57, checkpointSeq: 50, gcSeq: 44, checkpoint: { coversSeq: 50, bytes: new Uint8Array([1, 2, 3]) },
+		rows: [{ seq: 53, deviceId: "d1", clientFrameId: "c1", payload: new Uint8Array([9]) }], nextAfter: 53, ...extra,
+	});
+
+	it("asks for the binary reply and decodes it like the JSON one", async () => {
+		const { http, requests } = client(() => binary([pageOf("b:x y")]));
+		const page = await http.read("v1", "b:x y", 0, true, 4096);
+		assert.equal(requests[0]!.headers.get("accept"), READ_BINARY_TYPE);
+		assert.deepEqual(page, {
+			checkpoint: { coversSeq: 50, bytes: new Uint8Array([1, 2, 3]) },
+			rows: [{ seq: 53, deviceId: "d1", clientFrameId: "c1", payload: new Uint8Array([9]) }],
+			lastSeq: 57, checkpointSeq: 50, gcSeq: 44, nextAfterSeq: 53, more: true,
+		});
+		const last = await client(() => binary([pageOf("s", { checkpoint: null, rows: [], nextAfter: null, lastSeq: 0 })])).http.read("v1", "s", 4, false, null);
+		assert.deepEqual(last, { checkpoint: null, rows: [], lastSeq: 0, checkpointSeq: 50, gcSeq: 44, nextAfterSeq: 4, more: false });
+	});
+
+	it("readBatch decodes the served prefix and checks each page's stream", async () => {
+		const reqs = [{ stream: "a" as StreamName, afterSeq: 0, preferCheckpoint: true }, { stream: "b" as StreamName, afterSeq: 7, preferCheckpoint: false }];
+		const { http, requests } = client(() => binary([pageOf("a")]));
+		const pages = await http.readBatch("v1", reqs, null);
+		assert.equal(requests[0]!.headers.get("accept"), READ_BINARY_TYPE);
+		assert.equal(pages.length, 1);
+		assert.equal(pages[0]!.nextAfterSeq, 53);
+		const wrong = await rejection(client(() => binary([pageOf("b")])).http.readBatch("v1", reqs, null));
+		assert.equal(wrong.code, "malformed_response");
+		const many = await rejection(client(() => binary([pageOf("a"), pageOf("b"), pageOf("c")])).http.readBatch("v1", reqs, null));
+		assert.equal(many.code, "malformed_response");
+	});
+
+	it("a relay without it answers JSON: parsed as before", async () => {
+		const page = await client(() => jsonResponse({ vaultEpoch: "E", head: 9, stream: "s", lastSeq: 9, checkpointSeq: 0, gcSeq: 0, checkpoint: null, rows: [], nextAfter: null }))
+			.http.read("v1", "s", 3, false, null);
+		assert.equal(page.nextAfterSeq, 3);
+	});
+
+	it("truncated, trailing or wrong-stream binary replies are malformed; errors stay JSON", async () => {
+		const full = encodeReadReply({ vaultEpoch: "E", head: 57, pages: [pageOf("s")] });
+		const raw = (bytes: Uint8Array) => () => new Response(bytes, { headers: { "content-type": READ_BINARY_TYPE } });
+		for (const bytes of [full.subarray(0, full.byteLength - 1), new Uint8Array([...full, 0]), new Uint8Array([2, ...full.subarray(1)])]) {
+			assert.equal((await rejection(client(raw(bytes)).http.read("v1", "s", 0, false, null))).code, "malformed_response");
+		}
+		assert.equal((await rejection(client(() => binary([pageOf("t")])).http.read("v1", "s", 0, false, null))).code, "malformed_response");
+		const e = await rejection(client(() => jsonResponse({ error: "invalid_stream" }, 400)).http.read("v1", "", 0, false, null));
+		assert.deepEqual([e.status, e.code], [400, "invalid_stream"]);
 	});
 });
 

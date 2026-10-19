@@ -384,3 +384,89 @@ export function parseControl(text: string): WireControl | null {
 			return null;
 	}
 }
+
+// ---- binary catch-up reads (relay-wire §7.2) ----------------------------------
+
+/** Accept / Content-Type of the binary read reply; a relay without it answers JSON (the reply's Content-Type tells). */
+export const READ_BINARY_TYPE = "application/vnd.yaos.streams-read.v1+binary";
+const READ_BINARY_VERSION = 1;
+
+export interface WireReadPage {
+	readonly stream: string;
+	readonly lastSeq: number;
+	readonly checkpointSeq: number;
+	readonly gcSeq: number;
+	readonly checkpoint: { readonly coversSeq: number; readonly bytes: Uint8Array } | null;
+	readonly rows: readonly { readonly seq: number; readonly deviceId: string; readonly clientFrameId: string; readonly payload: Uint8Array }[];
+	readonly nextAfter: number | null;
+}
+
+export interface WireReadReply {
+	readonly vaultEpoch: string;
+	readonly head: number;
+	readonly pages: readonly WireReadPage[];
+}
+
+/**
+ * `u8 1 | varstring vaultEpoch | varuint head | varuint pageCount`, then per page `varstring stream | varuint
+ * lastSeq | varuint checkpointSeq | varuint gcSeq | varuint nextAfter+1 (0: none) | u8 hasCheckpoint [varuint
+ * coversSeq | varbytes] | varuint rowCount | (varuint seq | varstring deviceId | varstring clientFrameId |
+ * varbytes payload)×rowCount`. Encoder for tests and fakes.
+ */
+export function encodeReadReply(reply: WireReadReply): Uint8Array {
+	const e = encoding.createEncoder();
+	encoding.writeUint8(e, READ_BINARY_VERSION);
+	encoding.writeVarString(e, reply.vaultEpoch);
+	encoding.writeVarUint(e, reply.head);
+	encoding.writeVarUint(e, reply.pages.length);
+	for (const p of reply.pages) {
+		encoding.writeVarString(e, p.stream);
+		encoding.writeVarUint(e, p.lastSeq);
+		encoding.writeVarUint(e, p.checkpointSeq);
+		encoding.writeVarUint(e, p.gcSeq);
+		encoding.writeVarUint(e, p.nextAfter === null ? 0 : p.nextAfter + 1);
+		encoding.writeUint8(e, p.checkpoint ? 1 : 0);
+		if (p.checkpoint) {
+			encoding.writeVarUint(e, p.checkpoint.coversSeq);
+			encoding.writeVarUint8Array(e, p.checkpoint.bytes);
+		}
+		encoding.writeVarUint(e, p.rows.length);
+		for (const r of p.rows) {
+			encoding.writeVarUint(e, r.seq);
+			encoding.writeVarString(e, r.deviceId);
+			encoding.writeVarString(e, r.clientFrameId);
+			encoding.writeVarUint8Array(e, r.payload);
+		}
+	}
+	return encoding.toUint8Array(e);
+}
+
+/** The binary read reply, or null when malformed (unknown version, a short field, trailing bytes). Payloads are views into `bytes`. */
+export function decodeReadReply(bytes: Uint8Array): WireReadReply | null {
+	try {
+		const d = decoding.createDecoder(bytes);
+		if (decoding.readUint8(d) !== READ_BINARY_VERSION) return null;
+		const vaultEpoch = decoding.readVarString(d);
+		const head = decoding.readVarUint(d);
+		const pages: WireReadPage[] = [];
+		for (let n = decoding.readVarUint(d); n > 0; n--) {
+			const stream = decoding.readVarString(d);
+			const lastSeq = decoding.readVarUint(d);
+			const checkpointSeq = decoding.readVarUint(d);
+			const gcSeq = decoding.readVarUint(d);
+			const nextAfterRaw = decoding.readVarUint(d);
+			const flag = decoding.readUint8(d);
+			if (flag > 1) return null;
+			const checkpoint = flag === 1 ? { coversSeq: decoding.readVarUint(d), bytes: decoding.readVarUint8Array(d) } : null;
+			const rows: { seq: number; deviceId: string; clientFrameId: string; payload: Uint8Array }[] = [];
+			for (let k = decoding.readVarUint(d); k > 0; k--) {
+				if (d.pos >= bytes.byteLength) return null;
+				rows.push({ seq: decoding.readVarUint(d), deviceId: decoding.readVarString(d), clientFrameId: decoding.readVarString(d), payload: decoding.readVarUint8Array(d) });
+			}
+			pages.push({ stream, lastSeq, checkpointSeq, gcSeq, checkpoint, rows, nextAfter: nextAfterRaw === 0 ? null : nextAfterRaw - 1 });
+		}
+		return d.pos === bytes.byteLength ? { vaultEpoch, head, pages } : null;
+	} catch {
+		return null;
+	}
+}
