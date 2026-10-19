@@ -12,7 +12,8 @@
 //        YAOS_SIM_JOBS      worker processes (default: cores - 1)
 //        YAOS_SIM_MINIMIZE  1: ddmin the first failing seed of each matrix (as run.test.ts does; slow)
 // Exit 1 on any violation, crash, RealWork stray, a matrix whose actors did no real work, or a blob-fault matrix
-// whose stalls and slow periods hit no transfer (as run.test.ts blobHits). Counts only: no keys.
+// whose stalls and slow periods hit no transfer (as run.test.ts blobHits), or a canvas matrix whose actions reached no
+// 3-way merge, conflict, invalid notice or canvas checkpoint (as run.test.ts canvasHits). Counts only: no keys.
 import { fork } from "node:child_process";
 import { availableParallelism } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -27,6 +28,7 @@ function matrices(seeds) {
 	const quarter = Math.max(1, Math.ceil(seeds / 4));
 	const half = Math.max(1, Math.ceil(seeds / 2));
 	const tenth = Math.max(1, Math.ceil(seeds / 10));
+	const eighth = Math.max(1, Math.ceil(seeds / 8));
 	const all = [
 		// src/sim/run.test.ts, unchanged but for the crypto.
 		{ name: "2 devices, no faults", base: { devices: 2, faults: null }, seeds },
@@ -34,6 +36,8 @@ function matrices(seeds) {
 		{ name: "5 devices, seeded faults", base: { devices: 5, faults: "DEFAULT_FAULTS" }, seeds: quarter },
 		{ name: "2 devices, fault-heavy", base: { devices: 2, faults: "DEFAULT_FAULTS", faultRate: 0.35 }, seeds: quarter },
 		{ name: "3 devices, blob stall/slow faults", base: { devices: 3, faults: "BLOB_FAULTS", faultRate: 0.3 }, seeds: tenth, blobHits: true },
+		// Most actions are concurrent offline edits of the same two canvases (src/sim/run.test.ts, the canvas matrix).
+		{ name: "2 devices, concurrent offline canvas edits", base: { devices: 2, faults: "CANVAS_FAULTS", faultRate: 0.2, steps: 80, canvas: { rate: 3, ops: "CANVAS_HOT_OPS", pool: 2, hot: true } }, seeds: eighth, canvasHits: true },
 		// The suite-1 faults on top of the suite-0 ones (faults.ts E2EE_FAULTS).
 		{ name: "3 devices, E2EE faults", base: { devices: 3, faults: "E2EE_FAULTS", faultRate: 0.3 }, seeds: half },
 		{ name: "4 devices, E2EE faults", base: { devices: 4, faults: "E2EE_FAULTS", faultRate: 0.3 }, seeds: quarter },
@@ -54,7 +58,11 @@ async function load(rel) {
 async function worker() {
 	const { runSim, minimizePlan } = await load("../src/sim/run.ts");
 	const weights = await load("../src/sim/faults.ts");
-	const cfgOf = (job) => ({ ...job.base, faults: job.base.faults ? weights[job.base.faults] : null, crypto: CRYPTO, checkpoints: CHECKPOINTS, seed: job.seed });
+	const canvasOps = await load("../src/sim/canvas.ts");
+	const cfgOf = (job) => ({
+		...job.base, faults: job.base.faults ? weights[job.base.faults] : null, crypto: CRYPTO, checkpoints: CHECKPOINTS, seed: job.seed,
+		...(job.base.canvas ? { canvas: { ...job.base.canvas, ops: job.base.canvas.ops ? canvasOps[job.base.canvas.ops] : undefined } } : {}),
+	});
 	process.on("message", async (job) => {
 		if (job.t === "exit") process.exit(0);
 		const t0 = Date.now();
@@ -62,7 +70,7 @@ async function worker() {
 			const cfg = cfgOf(job);
 			if (job.t === "run") {
 				const r = await runSim(cfg);
-				process.send({ id: job.id, ok: true, ms: Date.now() - t0, violations: r.violations, tokens: r.stats.tokens.live, e2ee: r.stats.e2ee ?? null, realWork: r.stats.realWork ?? null, faults: r.stats.faults, blobs: r.stats.blobs, checkpoints: r.stats.checkpoints });
+				process.send({ id: job.id, ok: true, ms: Date.now() - t0, violations: r.violations, tokens: r.stats.tokens.live, e2ee: r.stats.e2ee ?? null, realWork: r.stats.realWork ?? null, faults: r.stats.faults, blobs: r.stats.blobs, checkpoints: r.stats.checkpoints, canvas: r.stats.canvas });
 			} else {
 				const r0 = await runSim(cfg);
 				const needle = r0.violations[0]?.detail ?? "";
@@ -160,16 +168,21 @@ async function main() {
 		const rw = rs.reduce((s, r) => (r.realWork ? addInto(s, r.realWork) : s), {});
 		const blobs = rs.reduce((s, r) => (r.blobs ? addInto(s, r.blobs) : s), {});
 		const ckpt = rs.reduce((s, r) => (r.checkpoints ? addInto(s, r.checkpoints) : s), {});
+		const canvas = rs.reduce((s, r) => (r.canvas ? addInto(s, r.canvas) : s), {});
 		const stalled = (blobs.stalled?.has ?? 0) + (blobs.stalled?.put ?? 0) + (blobs.stalled?.get ?? 0);
 		const blobsHit = !m.blobHits || (stalled > 0 && blobs.stalled.put > 0 && blobs.watchdog > 0 && blobs.aborted > 0 && blobs.slowDone > 0 && blobs.slowCut === 0);
-		const ok = failed.length === 0 && strays === 0 && tokens > m.seeds * 10 && blobsHit;
+		const ckptCanvas = (ckpt.put?.canvas?.ok ?? 0) > 0 && (ckpt.adopted?.canvas ?? 0) > 0;
+		const canvasHit = !m.canvasHits || ((canvas.actions ?? 0) > m.seeds * 50 && canvas.merges?.divergent > 0 && canvas.merges?.conflict > 0 && canvas.invalidNotices > 0 && ckptCanvas);
+		const ok = failed.length === 0 && strays === 0 && tokens > m.seeds * 10 && blobsHit && canvasHit;
 		failedAny ||= !ok;
 		console.log(`${ok ? "ok" : "FAIL"} ${m.name}: ${m.seeds - failed.length}/${m.seeds} seeds clean, ${tokens} live tokens, run p50 ${(runMs[Math.floor(runMs.length / 2)] / 1000).toFixed(1)} s, max ${(runMs[runMs.length - 1] / 1000).toFixed(1)} s`);
 		console.log(`   faults ${JSON.stringify(sumFaults)}`);
 		console.log(`   realWork ${JSON.stringify(rw)}`);
 		if (Object.keys(e2ee).length > 0) console.log(`   e2ee ${JSON.stringify(e2ee)}`);
 		console.log(`   checkpoints ${JSON.stringify(ckpt)}`);
+		console.log(`   canvas ${JSON.stringify(canvas)}`);
 		if (m.blobHits) console.log(`   blobs ${JSON.stringify(blobs)}`);
+		if (!canvasHit) console.log("   the canvas actions hit no merge path (divergent, conflict, invalid notice, canvas checkpoint written and adopted)");
 		if (!blobsHit) console.log("   the blob faults hit no transfer (stalled, stalled PUT, watchdog, aborted, slow done; slowCut 0)");
 		if (strays > 0) console.log(`   RealWork strays: ${strays} (a crypto await bypassed RealWork)`);
 		if (tokens <= m.seeds * 10) console.log(`   the actors did no real work (${tokens} live tokens)`);

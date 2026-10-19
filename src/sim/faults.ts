@@ -76,6 +76,12 @@ export const E2EE_FAULTS: FaultWeights = {
 	keyStoreLoss: 1, keyRoll: 1.5, revoke: 0.7, epochRestore: 0.5, hostileReplay: 2, hostileDowngrade: 1,
 };
 
+/**
+ * "Two devices edit the same canvas offline" (the concurrent canvas matrices): offline periods dominate (both
+ * devices are often offline at once, each editing its own copy of the same canvases), the default faults around them.
+ */
+export const CANVAS_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, offline: 16 };
+
 /** The default matrix plus blob store stalls and slow periods (the "blob stall/slow faults" matrices). */
 export const BLOB_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, blobStall: 5, blobSlow: 5 };
 

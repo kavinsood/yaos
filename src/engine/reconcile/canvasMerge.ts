@@ -135,6 +135,13 @@ export interface CanvasMergeOutput {
 	readonly projection: CanvasProjection;
 }
 
+/**
+ * Process-wide counters of mergeCanvasSides (diagnostics only; the simulator reads them around a run). `divergent`:
+ * base, disk and CRDT all differ after the extension pre-step (a real 3-way merge); `rejected`: a merged text that
+ * did not validate became a conflict.
+ */
+export const canvasMergeStats = { merges: 0, divergent: 0, clean: 0, oneSided: 0, conflict: 0, identical: 0, rejected: 0 };
+
 export function mergeCanvasSides(input: CanvasMergeInput): CanvasMergeOutput {
 	const { base, crdt, limits } = input;
 	const diskRanked = rankDisk(input.disk, base, crdt.ranked);
@@ -143,11 +150,24 @@ export function mergeCanvasSides(input: CanvasMergeInput): CanvasMergeOutput {
 	let c = crdt.ranked;
 	if (base) ({ b, d, c } = extendOneSided(base, diskRanked, crdt.ranked));
 	const dText = canvasToMergeText(d);
-	const res = merge({ base: b ? canvasToMergeText(b) : null, disk: dText, crdt: canvasToMergeText(c), limits });
+	const bText = b ? canvasToMergeText(b) : null;
+	const cText = canvasToMergeText(c);
+	const res = merge({ base: bText, disk: dText, crdt: cText, limits });
+	const stats = canvasMergeStats;
+	stats.merges++;
+	if (bText !== null && dText !== bText && cText !== bText && dText !== cText) stats.divergent++;
 	const merged = res.kind === "identical" ? dText : res.text;
 	const target = parseMergeText(merged);
 	const projection = target ? projectRanked(target) : null;
 	const reason = res.kind === "conflict" ? res.reason : null;
-	if (target && projection?.ok) return { kind: res.kind, reason, diskRanked, target, projection };
+	if (target && projection?.ok) {
+		if (res.kind === "identical") stats.identical++;
+		else if (res.kind === "conflict") stats.conflict++;
+		else if (res.kind === "clean") stats.clean++;
+		else stats.oneSided++;
+		return { kind: res.kind, reason, diskRanked, target, projection };
+	}
+	stats.rejected++;
+	stats.conflict++;
 	return { kind: "conflict", reason: reason ?? "both-edited", diskRanked, target: crdt.ranked, projection: crdt };
 }

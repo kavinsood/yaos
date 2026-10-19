@@ -3,9 +3,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generatePlan, minimizePlan, runSim, type SimConfig, type SimReport, type Step } from "./run";
-import { BLOB_FAULTS, DEFAULT_FAULTS } from "./faults";
+import { BLOB_FAULTS, CANVAS_FAULTS, DEFAULT_FAULTS } from "./faults";
 import type { SimBlobLiveness } from "./blobStore";
 import { checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
+import { CANVAS_HOT_OPS } from "./canvas";
 import { runUserAction, TokenLedger } from "./actors";
 import { SimDevice } from "./device";
 import { SimNet } from "./net";
@@ -39,7 +40,7 @@ async function sweep(name: string, base: Omit<SimConfig, "seed">, seeds: number,
 	assert.fail(
 		`${name}: ${failed.length}/${seeds} seeds failed: ${failed.map((r) => r.seed).join(",")}\n` +
 			`seed ${r0.seed}:\n  ${r0.violations.slice(0, 6).map((v) => `${v.inv}: ${v.detail}`).join("\n  ")}\n` +
-			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
+			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults === CANVAS_FAULTS ? "CANVAS_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
 	);
 }
 
@@ -67,6 +68,19 @@ chunked("3 devices, seeded faults", { devices: 3, faults: DEFAULT_FAULTS }, SEED
 chunked("5 devices, seeded faults", { devices: 5, faults: DEFAULT_FAULTS }, Math.max(1, Math.ceil(SEEDS / 4)));
 chunked("2 devices, fault-heavy", { devices: 2, faults: DEFAULT_FAULTS, faultRate: 0.35 }, Math.max(1, Math.ceil(SEEDS / 4)));
 chunked("3 devices, blob stall/slow faults", { devices: 3, faults: BLOB_FAULTS, faultRate: 0.3 }, Math.max(1, Math.ceil(SEEDS / 10)), blobHits);
+
+/** The hot canvas matrix reached the merge paths it exists for: real 3-way merges, conflicts, broken saves, checkpoints. */
+const canvasHits: Hits = (name, stats) => {
+	const sum = (f: (s: SimReport["stats"]) => number) => stats.reduce((n, s) => n + f(s), 0);
+	const got = {
+		actions: sum((s) => s.canvas.actions), divergent: sum((s) => s.canvas.merges.divergent), conflict: sum((s) => s.canvas.merges.conflict),
+		invalid: sum((s) => s.canvas.invalidNotices), written: sum((s) => s.checkpoints.put.canvas?.ok ?? 0), adopted: sum((s) => s.checkpoints.adopted.canvas ?? 0),
+	};
+	const ok = got.actions > stats.length * 50 && got.divergent > 0 && got.conflict > 0 && got.invalid > 0 && got.written > 0 && got.adopted > 0;
+	assert.ok(ok, `${name}: the canvas actions hit the merge paths ${JSON.stringify(got)}`);
+};
+const HOT_CANVAS = { rate: 3, ops: CANVAS_HOT_OPS, pool: 2, hot: true };
+chunked("2 devices, concurrent offline canvas edits", { devices: 2, faults: CANVAS_FAULTS, faultRate: 0.2, steps: 80, canvas: HOT_CANVAS }, Math.max(1, Math.ceil(SEEDS / 8)), canvasHits);
 
 test("sim: same seed, same plan, same trace and same converged bytes (seeded Yjs clientIDs)", async () => {
 	const cfg: SimConfig = { seed: 4242, devices: 3, faults: DEFAULT_FAULTS };
