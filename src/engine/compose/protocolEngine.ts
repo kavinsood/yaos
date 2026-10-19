@@ -49,7 +49,7 @@ import { ownFrameNoFloor, prepareEpochMigration } from "./runtimeOps";
 import { wipeSecrets } from "../../protocol/workerTransport";
 import type { FrameNoFloor } from "../store/repo";
 import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
-import { VaultRuntime, type RestartReason } from "./vaultRuntime";
+import { VaultRuntime, type RestartReason, type RuntimeObserver } from "./vaultRuntime";
 
 export interface CreateEngineOptions {
 	readonly carrier: "worker" | "inline";
@@ -69,6 +69,8 @@ export interface CreateEngineOptions {
 	readonly log?: (line: string) => void;
 	/** Test hook: the LogEngine's structured diagnostics events (EngineOptions.onDiag), every runtime. */
 	readonly onDiag?: (event: DiagnosticsEvent) => void;
+	/** Test hook (sim coverage): observes every runtime's ns folds and reconcile plans (VaultRuntimeStart.observe). */
+	readonly observe?: RuntimeObserver;
 	/** Local time zone offset in minutes (conflict-copy names); the engine core never reads Date. */
 	readonly tzOffsetMinutes?: () => number;
 	/** Epoch of an existing local DB for this vault/device (offline start); undefined = connect first. */
@@ -264,7 +266,7 @@ export class ComposedEngine {
 					engine: this, config, settings: this.settings!, ports, carrier: this.options.carrier,
 					clientVersion: this.options.clientVersion ?? "dev", vaultEpoch: this.knownEpoch, reason,
 					tuning: this.options.tuning, budgets: this.options.budgets, paused: this.paused,
-					tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log, onDiag: this.options.onDiag,
+					tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log, onDiag: this.options.onDiag, observe: this.options.observe,
 					pathBases: this.migration?.bases ?? null, docDeletes: this.migration?.docDeletes ?? null, frameNoFloor: this.migration?.frameNoFloor ?? null,
 				});
 				if (this.disposed) {

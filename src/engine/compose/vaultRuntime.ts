@@ -13,7 +13,7 @@
  * and after IndexedDB recovery (before the first pass of the new DB).
  */
 
-import type { BrakeReport, ContentHash, DocId, DocKind, PathKey, PlanScope, VaultEpoch, VaultPath } from "../../core/types";
+import type { BrakeReport, ContentHash, DocId, DocKind, PathKey, PlanScope, PlannerOp, VaultEpoch, VaultPath } from "../../core/types";
 import { bytesToHex } from "../../core/codec/lib0";
 import { FULL_RECONCILE_IDLE_MAX_MS, type Budgets } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
@@ -83,12 +83,21 @@ export interface VaultRuntimeStart {
 	readonly log?: (line: string) => void;
 	/** The LogEngine's diagnostics events (test hook, CreateEngineOptions.onDiag). */
 	readonly onDiag?: (event: DiagnosticsEvent) => void;
+	/** Test hook (sim coverage, CreateEngineOptions.observe): committed ns frames folded, and every reconcile pass's plan. */
+	readonly observe?: RuntimeObserver;
 	/** Path-keyed bases carried over an epoch migration (§c.12 step 3), stored in the new DB (epochBases.ts). */
 	readonly pathBases?: readonly MetaPathBase[] | null;
 	/** The old epoch's docs' deletes by docId (§c.12 "Deletes"), stored in the new DB (epochBases.ts). */
 	readonly docDeletes?: readonly MetaDocDeletes[] | null;
 	/** Highest own ns / cfg frameNo of the old epoch (§c.12 step 3, e2ee-design §8.2). */
 	readonly frameNoFloor?: FrameNoFloor | null;
+}
+
+/** Observational test hook: called after the engine acted; it must not change anything (production: absent). */
+export interface RuntimeObserver {
+	nsFold?(frames: readonly FoldedNsFrame[], reloaded: boolean): void;
+	/** A reconcile pass ran `ops` (its executable plan) and reported `report`. */
+	pass?(ops: readonly PlannerOp[], report: PassReport): void;
 }
 
 export function reconcileSettings(s: EngineSettings): ReconcileSettings {
@@ -333,6 +342,7 @@ export class VaultRuntime {
 
 	onNsFold(frames: readonly FoldedNsFrame[], reloaded: boolean): void {
 		if (this.stopped) return;
+		this.o.observe?.nsFold?.(frames, reloaded);
 		this.port.invalidate();
 		const c = this.log.c;
 		const bound = this.engine.bound;
@@ -442,6 +452,7 @@ export class VaultRuntime {
 		this.port.invalidate();
 		const syncedBefore = this.syncedSignature();
 		const r = await this.rec.pass(scope);
+		this.o.observe?.pass?.(this.rec.lastPlan, r);
 		this.port.invalidate();
 		this.stats.passes++;
 		if (r.brake === null && this.brake !== null) {
