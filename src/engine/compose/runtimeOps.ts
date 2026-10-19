@@ -52,10 +52,11 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
  * saw). Binding then merges one doc's file into another's CRDT. The view waits: `bindable` follows the pass that
  * settles the path, or the host asks again at the path the file moves to.
  *
- * Nor while the create's initial content is still missing from the body (another device's frames in flight, or an
- * own create whose first merge has not run yet, e.g. the re-create right after an epoch migration): the bind-time
- * merge would take the empty text, with no base, as the other side of a conflict, empty the editor and write it out
- * as a conflict copy. Same gate as the planner's "body-empty" wait; the pass that fills the body posts `bindable`.
+ * Nor while the create's initial content is still missing from the replica (another device's frames in flight, or
+ * announced but not applied yet; or an own create whose first merge has not run yet, e.g. the re-create right after an
+ * epoch migration): the bind-time merge would take the empty text as the other side, empty the editor (against a base
+ * at the create's content) or write it out as a conflict copy (no base); see replicaHasCreate. Same gate as the
+ * planner's "body-empty" wait; the pass that applies the body posts `bindable`.
  *
  * Nor a doc whose delete is decided and waits on its own body records (`fileGone`), at its synced path: a file there
  * now is new, and the pass that creates its doc posts `bindable`. At the doc's remote path the file is its own.
@@ -65,7 +66,7 @@ export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefi
 	const id = view.remoteByPathKey.get(key);
 	const e = id ? view.remote.get(id) : undefined;
 	if (!e || e.state !== "live") return undefined;
-	if (e.body !== null && !e.body.hasContent && e.createHash !== EMPTY_CONTENT_HASH) return undefined;
+	if (e.body !== null && e.createHash !== EMPTY_CONTENT_HASH && !replicaHasCreate(e.body)) return undefined;
 	const ctx = rt.rec.ctx;
 	const s = ctx.synced(e.docId);
 	if (s?.fileGone && s.pathKey === key) return undefined;
@@ -73,6 +74,19 @@ export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefi
 	if (!ctx.local.has(key)) return e;
 	for (const o of ctx.store.synced.values()) if (o.pathKey === key && o.docId !== e.docId) return undefined;
 	return e;
+}
+
+/**
+ * The replica may hold the create's content. `hasContent` alone does not say so: it also counts rows the relay
+ * announced (remoteHeadSeq) that are not applied yet. While not caught up, the replica holds the create only if a row
+ * or checkpoint from another device was applied or this device produced a frame. Otherwise the bind-time merge would
+ * see "" against a base at the create's content (a §c.5 merged alias restarts its synced record at the winner's
+ * create) and empty the editor: sim seed 23, an epoch migration where concurrent re-creates merge before the
+ * winner's frames arrive (src/sim/regressions/epoch-merged-alias-bind-empty.json).
+ */
+function replicaHasCreate(b: NonNullable<RemoteEntry["body"]>): boolean {
+	if (!b.hasContent) return false;
+	return b.caughtUp || b.version.remoteSeq > 0 || b.version.localOrder > 0;
 }
 
 export async function command(rt: VaultRuntime, c: UserCommand): Promise<EngineResultValue> {

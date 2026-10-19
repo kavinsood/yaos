@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { VirtualClock } from "../../sim/clock";
 import { SimDevice } from "../../sim/device";
 import { SimNet } from "../../sim/net";
+import type { DocId, PathKey, RemoteBodyInfo, RemoteEntry, StreamName } from "../../core/types";
+import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
+import { bindTarget } from "./runtimeOps";
+import type { VaultRuntime } from "./vaultRuntime";
 
 function world(): { clock: VirtualClock; a: SimDevice; b: SimDevice } {
 	const clock = new VirtualClock();
@@ -46,9 +50,8 @@ test("openDoc: a path the remote moved a doc onto, holding a file of this device
 	assert.equal(v.getText(), "two\n");
 });
 
-test("bindTarget: a doc whose delete waits (fileGone) does not bind at its synced path; at its remote path the file is its own", async () => {
-	const { bindTarget } = await import("./runtimeOps");
-	const live = (docId: string, path: string) => ({ docId, path, pathKey: path, state: "live", createHash: "h0", body: { hasContent: true } });
+test("bindTarget: a doc whose delete waits (fileGone) does not bind at its synced path; at its remote path the file is its own", () => {
+	const live = (docId: string, path: string) => ({ docId, path, pathKey: path, state: "live", createHash: "h0", body: { hasContent: true, caughtUp: true, version: { remoteSeq: 1, localOrder: 0 } } });
 	const fake = (remote: ReturnType<typeof live>[], synced: { docId: string; pathKey: string; fileGone?: true }[], local: string[]) => {
 		const s = new Map(synced.map((e) => [e.docId, e]));
 		return {
@@ -64,4 +67,52 @@ test("bindTarget: a doc whose delete waits (fileGone) does not bind at its synce
 	// not gone: the doc's file still at a.md blocks the bind at b.md (the planner has not moved it yet)
 	const notGone = fake([live("d1", "b.md")], [{ docId: "d1", pathKey: "a.md" }], ["a.md", "b.md"]);
 	assert.equal(bindTarget(notGone, "b.md" as never), undefined);
+});
+
+/**
+ * bindTarget (DESIGN §d.2), create content: a view does not bind while the replica lacks the create's content.
+ * `hasContent` also counts body rows the relay announced but this device has not applied, so it alone is not enough: sim seed 23
+ * (src/sim/regressions/epoch-merged-alias-bind-empty.json) bound a view to a §c.5 merged alias whose synced record
+ * restarts at the winner's create while the winner's frames were announced, not applied. The bind-time merge read
+ * the empty replica against that base as a deletion, emptied the editor, and its save destroyed the note.
+ */
+const KEY = "notes/a.md" as PathKey;
+const DOC = "doc-a" as DocId;
+
+function entry(body: Partial<RemoteBodyInfo>, createHash = "c".repeat(64)): RemoteEntry {
+	return {
+		docId: DOC, kind: "markdown", path: KEY as never, pathKey: KEY, state: "live", lastTouchSeq: 1, deletedSeq: 0, deleteBaseBodySeq: 0,
+		createHash: createHash as never, blob: null, aliasOf: null, pendingLocal: false,
+		body: { stream: `b:${DOC}` as StreamName, version: { remoteSeq: 0, localOrder: 0 }, caughtUp: true, hasContent: true, frozen: false, ...body },
+	};
+}
+
+function rt(e: RemoteEntry): VaultRuntime {
+	const view = { remote: new Map([[DOC, e]]), remoteByPathKey: new Map([[KEY, DOC]]) };
+	const ctx = { synced: () => undefined, local: new Map(), store: { synced: new Map() } };
+	return { port: { view: () => view }, rec: { ctx } } as unknown as VaultRuntime;
+}
+
+const binds = (body: Partial<RemoteBodyInfo>, createHash?: string): boolean => bindTarget(rt(entry(body, createHash)), KEY) !== undefined;
+
+test("bindTarget: binds a caught-up doc with content", () => {
+	assert.equal(binds({}), true);
+});
+
+test("bindTarget: waits while the create's frames are not here (no content)", () => {
+	assert.equal(binds({ hasContent: false }), false);
+	assert.equal(binds({ hasContent: false, caughtUp: false }), false);
+});
+
+test("bindTarget: waits while the create's rows are announced but none applied (seed 23)", () => {
+	assert.equal(binds({ hasContent: true, caughtUp: false }), false);
+});
+
+test("bindTarget: binds a doc behind on rows once some content is applied or produced here", () => {
+	assert.equal(binds({ caughtUp: false, version: { remoteSeq: 7, localOrder: 0 } }), true);
+	assert.equal(binds({ caughtUp: false, version: { remoteSeq: 0, localOrder: 3 } }), true);
+});
+
+test("bindTarget: an empty create binds without content", () => {
+	assert.equal(binds({ hasContent: false, caughtUp: false }, EMPTY_CONTENT_HASH), true);
 });
