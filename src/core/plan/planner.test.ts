@@ -329,6 +329,24 @@ test("row deleted/present/absent -> syncedDrop", () => {
 	assert.deepEqual(p.ops, [{ op: "syncedDrop", docId: "d1" }]);
 });
 
+test("row deleted/present/absent with restore duty -> nsRestore keeping S (the local delete then covers the own rows)", () => {
+	// Sim blob seed 5: C deleted the doc while B, offline, edited it and then deleted the file. B dropped S, and
+	// the next pass (deleted, no S, restore duty for B's uncovered row) restored the doc at its path: both users'
+	// deletes undone. Kept, S makes the pass after the restore see live/present/absent: an nsDelete whose base
+	// covers B's rows, or edit-beats-delete if a peer changed the doc since.
+	const del = R("d1", "a.md", { state: "deleted", deletedSeq: 41 });
+	const duty = planWith(input({ remote: [del], synced: [S("d1", "a.md")] }), { restoreDuty: new Set([id("d1")]) });
+	assert.deepEqual(duty.ops, [{ op: "nsRestore", docId: "d1", path: "a.md", againstDeleteSeq: 41 }]);
+	const body = run({ remote: [del], synced: [S("d1", "a.md")], over: { docsWithPendingBody: new Set([id("d1")]) } });
+	assert.deepEqual(body.ops, [{ op: "nsRestore", docId: "d1", path: "a.md", againstDeleteSeq: 41 }]);
+	// an own ns op in flight: wait, S kept
+	const pend = planWith(input({ remote: [{ ...del, pendingLocal: true }], synced: [S("d1", "a.md")] }), { restoreDuty: new Set([id("d1")]) });
+	assert.deepEqual(pend.ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }]);
+	// the pass after the restore: live/present/absent, nothing changed remotely -> the delete goes out again
+	const after = planWith(input({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")] }), { bodyAppliedSeq: new Map([[id("d1"), 52]]) });
+	assert.deepEqual(after.ops, [{ op: "nsDelete", docId: "d1", baseBodySeq: 52 }, { op: "syncedDrop", docId: "d1" }]);
+});
+
 test("row deleted/present/absent, the file renamed here (observed) -> nsRestore at the new path; the source path's new doc is not paired", () => {
 	// Sim DEV5 F seed 157: offline, A edited and renamed n2 -> r6 while a peer deleted the doc and re-created n2.
 	// The doc was dropped and the observed rename then paired with the new n2 doc: A's text merged into its body.

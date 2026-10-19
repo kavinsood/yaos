@@ -444,7 +444,16 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		if (!l && !ctx.nsReady) return push(prefix);
 		const inf = l ? undefined : inferred.get(origId);
 		if (inf && !claimed.has(inf.to.pathKey)) return deletedRenamed(s, r, inf.to, prefix);
-		if (!l) return push([...prefix, drop(s.docId)]);
+		if (!l) {
+			// Own rows the delete did not cover (§c.7 duty) and the file deleted here too: dropped, S would leave the
+			// restore to the no-S branch below, which brings the doc back at its path. Kept, the pass after the
+			// restore sees live/present/absent: an nsDelete covering the own rows, or edit-beats-delete (sim blob seed 5).
+			if (hasRestoreDuty(s.docId)) {
+				if (r.pendingLocal) return push([...prefix, waitOp(s.docId, "pending-ns")]);
+				return push([...prefix, { op: "nsRestore", docId: s.docId, path: r.path, againstDeleteSeq: r.deletedSeq }]);
+			}
+			return push([...prefix, drop(s.docId)]);
+		}
 		if (!ctx.nsReady) return push(prefix);
 		const Lc = l.hash !== s.contentHash;
 		if (!Lc && !hasRestoreDuty(s.docId)) {
