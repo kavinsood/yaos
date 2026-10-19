@@ -159,7 +159,7 @@ restart the sync engine (:80), and the vault-creation and encryption commands (:
 | "Server not saving" | adfa7a7:src/status/statusBarController.ts:89-90 | MISSING | dropped: the server receipts a frame only after it commits it, so unsaved work shows as unsynced changes (DESIGN invariant I1) |
 | Daily-limit label | adfa7a7:src/status/statusBarController.ts:94-95 | src/host/ui/statusBar.ts:134-138 | ported |
 | "Recovery ..." suffix | adfa7a7:src/status/statusBarController.ts:97-98 | MISSING | dropped: recovery-job UI (the snapshot browser replaces it) |
-| Resource-pressure suffix | adfa7a7:src/status/statusBarController.ts:100-101 | MISSING | dropped: DESIGN §m.2 (runtime coordinators); per-class budgets replace residency pressure (src/core/limits.ts:256) |
+| Resource-pressure suffix | adfa7a7:src/status/statusBarController.ts:100-101 | MISSING | dropped: DESIGN §m.2 (runtime coordinators); per-class budgets replace residency pressure (src/core/limits.ts:251) |
 | Server receipt label | adfa7a7:src/status/statusBarController.ts:121-144 | src/host/ui/statusBar.ts:173 (queued and awaiting-receipt counts in the tooltip) | ported |
 | Tooltip | adfa7a7:src/status/statusBarController.ts:178 | src/host/ui/statusBar.ts:189, :292 | ported |
 
@@ -179,7 +179,7 @@ src/host/ui/settingsTab.ts:329).
 | Conflict-copy notice (30 s cooldown, suppressed count) | adfa7a7:src/runtime/reconciliationController.ts:2701-2714; adfa7a7:src/sync/blobSync.ts:1827-1830 | src/engine/reconcile/context.ts:247-254; src/core/plan/conflictName.ts:107 (one warning per pass with the count and the first copy) | implemented (2d6bac5) |
 | Daily-limit popup (20 s, once per window) | adfa7a7:src/main.ts:2886-2891; adfa7a7:src/sync/dailyLimit.ts:19 | src/host/pluginController.ts:58; src/engine/runtime/context.ts:233-236; src/engine/runtime/dailyLimit.ts:22, :28 | implemented (52d5ea0) |
 | Server persistence degraded / restored | adfa7a7:src/main.ts:2900-2909 | MISSING | dropped: no such state (see "Server not saving" in §3.1) |
-| Skipped file (too large, or a name other systems cannot store) | adfa7a7:src/sync/blobSync.ts:860, :1077 | src/engine/reconcile/skipNotice.ts:68, :76; src/engine/reconcile/reconciler.ts:229-231 | implemented (c5ca263) |
+| Skipped file (too large, or a name other systems cannot store) | adfa7a7:src/sync/blobSync.ts:860, :1077 | src/engine/reconcile/skipNotice.ts:68, :76; src/engine/reconcile/reconciler.ts:216-218 | implemented (c5ca263) |
 | Engine warnings (too large, no attachment storage, read failed, invalid canvas) | various | src/host/pluginController.ts:59 (every warn and error notice is shown); src/engine/reconcile/blobJobs.ts:154 (too large; there is no attachment-storage warning, see §8); src/engine/reconcile/scan.ts:129; src/engine/reconcile/canvasJob.ts:39 | ported |
 | "Yaos: Debug mode active — debug API unavailable" | adfa7a7:src/main.ts:3904 | MISSING | dropped: the QA harness and its debug API were deleted (f451274) |
 
@@ -190,7 +190,7 @@ Info-level engine notices stay in the status only, except the settings-reload pr
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
 | Confirm dialog | adfa7a7:src/ui/ConfirmModal.ts:6 | src/host/ui/confirmModal.ts:16, :48 | ported |
-| Pairing-code dialog ("Add my device") | adfa7a7:src/settings/PairDeviceModal.ts:14 | src/host/ui/pairModal.ts:223 | ported (details in §4) |
+| Pairing-code dialog ("Add my device") | adfa7a7:src/settings/PairDeviceModal.ts:14 | src/host/ui/pairModal.ts:215 | ported (details in §4) |
 | Device credentials dialog | adfa7a7:src/settings/DeviceCredentialsModal.ts:3 | MISSING (a masked "Device token" row, src/host/ui/settingsTab.ts:106) | dropped: DeviceCredentials modal (coordinator decision) |
 | Rename shared vault dialog | adfa7a7:src/settings/VaultNameModal.ts:3 | MISSING | dropped: governance moved to the server operator console (§18) |
 | Three-way conflict dialog | adfa7a7:src/ui/ThreeWayConflictModal.ts:10 | MISSING | dropped: DESIGN §m.2 (ThreeWayConflictModal, externalEditPolicy) |
@@ -204,8 +204,8 @@ settings-seed question (src/host/ui/settingsTab.ts:49-70).
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
 | Settings tab registered | adfa7a7:src/main.ts:819-820 | src/host/ui/registerUi.ts:165-178 | ported |
-| Inline setup form ("Join this folder", Server URL, Pairing code, Enroll) | adfa7a7:src/settings/settingsTab.ts:231-254 | src/host/ui/settingsTab.ts:109-113, opening src/host/ui/pairModal.ts:64 | ported (the inline form became a dialog) |
-| "Deploy your server" link | adfa7a7:src/settings/settingsTab.ts:256-260 (URL at :136) | src/host/ui/pairModal.ts:130 (in the pair dialog) | implemented (5a9b34c) |
+| Inline setup form ("Join this folder", Server URL, Pairing code, Enroll) | adfa7a7:src/settings/settingsTab.ts:231-254 | src/host/ui/settingsTab.ts:109-113, opening src/host/ui/pairModal.ts:65 | ported (the inline form became a dialog) |
+| "Deploy your server" link | adfa7a7:src/settings/settingsTab.ts:256-260 (URL at :136) | src/host/ui/pairModal.ts:131 (in the pair dialog) | implemented (5a9b34c) |
 | Status rows (Status, Server, Folder, Vault ID, This device) | adfa7a7:src/settings/settingsTab.ts:264-269 | src/host/ui/settingsTab.ts:105-108, :171-173; src/host/ui/settingsModel.ts:198, :256 | ported (there is no Folder row) |
 | "Add my device" | adfa7a7:src/settings/settingsTab.ts:270-274 | src/host/ui/settingsTab.ts:121-126 ("Pair another device") | ported |
 | "Invite person" | adfa7a7:src/settings/settingsTab.ts:275-280 | MISSING | dropped: governance moved to the server operator console (§18) |
@@ -232,11 +232,11 @@ src/host/ui/api.ts:66-75. The settings sync fields are in §1 and the exclude fi
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Server URL (`host`) | adfa7a7:src/settings/settingsStore.ts:112 | src/host/ui/api.ts:23 (`PairedIdentity`); entered in src/host/ui/pairModal.ts:64 | ported |
+| Server URL (`host`) | adfa7a7:src/settings/settingsStore.ts:112 | src/host/ui/api.ts:23 (`PairedIdentity`); entered in src/host/ui/pairModal.ts:65 | ported |
 | Device credentials (`deviceToken`, `vaultId`, `deviceId`, `vaultGeneration`) | adfa7a7:src/settings/settingsStore.ts:113-115, :125 | src/host/ui/api.ts:23, :145 (validated on load) | ported |
 | Person and authority fields (`principalId`, `principalDisplayName` "Your name", `principalColorSeed`, `vaultRole`, revisions, `capabilityDigest`, `authorityCapabilities`) | adfa7a7:src/settings/settingsStore.ts:116-124; adfa7a7:src/settings/settingsTab.ts:344-356 | MISSING | dropped: governance moved to the server operator console (§18) |
 | `originImportPending` (import local files after joining) | adfa7a7:src/settings/settingsStore.ts:126 | MISSING (bootstrap imports local files itself, DESIGN §j.5) | dropped: the first import is part of bootstrap |
-| Device name, renamed on the server when changed | adfa7a7:src/settings/settingsStore.ts:127; adfa7a7:src/settings/settingsTab.ts:357-367, :789-796 | src/host/ui/settingsTab.ts:193 ("Device label": local, used in conflict-copy names); src/host/ui/pairModal.ts:148 (the name is sent once, at pairing) | dropped: renaming a device after pairing moved to the server operator console (§18) |
+| Device name, renamed on the server when changed | adfa7a7:src/settings/settingsStore.ts:127; adfa7a7:src/settings/settingsTab.ts:357-367, :789-796 | src/host/ui/settingsTab.ts:193 ("Device label": local, used in conflict-copy names); src/host/ui/pairModal.ts:146 (the name is sent once, at pairing) | dropped: renaming a device after pairing moved to the server operator console (§18) |
 | `pendingEnrollment` (an unanswered enrollment kept across restarts) | adfa7a7:src/settings/settingsStore.ts:128; adfa7a7:src/runtime/setupLinkController.ts:60-62 | src/host/ui/api.ts:169; src/host/ui/pairFlow.ts:79, :114; src/host/plugin.ts:131 | implemented (8db4540) |
 | `debug` ("Record detailed sync events ...") | adfa7a7:src/settings/settingsStore.ts:129; adfa7a7:src/settings/settingsTab.ts:498-502 | MISSING (the 2000-event ring is always on, src/engine/runtime/context.ts:49) | dropped: DESIGN §m.2 (telemetry and observability) |
 | `frontmatterGuardEnabled` | adfa7a7:src/settings/settingsStore.ts:133; adfa7a7:src/settings/settingsTab.ts:493-497 | MISSING | dropped: DESIGN §m.2 (frontmatter family) |
@@ -258,26 +258,26 @@ storage" (:270), and "Show status in the status bar" (:329).
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Setup link `obsidian://yaos?action=setup&host=...&pairingCode=...` | adfa7a7:src/main.ts:684; adfa7a7:src/runtime/setupLinkController.ts:65-74 | src/host/ui/registerUi.ts:217-225; src/host/ui/pairing.ts:822 | ported (the link opens a pre-filled pair dialog and needs one click; legacy enrolled at once) |
+| Setup link `obsidian://yaos?action=setup&host=...&pairingCode=...` | adfa7a7:src/main.ts:684; adfa7a7:src/runtime/setupLinkController.ts:65-74 | src/host/ui/registerUi.ts:217-225; src/host/ui/pairing.ts:817 | ported (the link opens a pre-filled pair dialog and needs one click; legacy enrolled at once) |
 | Enroll with a server URL and a one-time code | adfa7a7:src/runtime/setupLinkController.ts:56; adfa7a7:src/onboarding/provisioningClient.ts:51 | src/host/ui/pairing.ts:344; src/host/ui/pairFlow.ts:33 | ported |
 | Enroll error text (expired, used, unknown code) | adfa7a7:src/runtime/setupLinkController.ts:336-341 | src/host/ui/pairing.ts:328-331 | ported |
-| "This device is enrolled. Starting sync..." | adfa7a7:src/runtime/setupLinkController.ts:284 | src/host/ui/pairModal.ts:182 | ported |
-| Confirm before pairing over an existing enrollment | adfa7a7:src/runtime/setupLinkController.ts:289 | src/host/ui/pairModal.ts:103-108 (warning), :159 ("Replace pairing") | ported |
-| Retire the old enrollment when pairing replaces it (wave 2) | adfa7a7:src/runtime/setupLinkController.ts:250-257: when the new enrollment differs from the current one in host, vault, device or generation (:246-249), it awaits `retireCurrentEnrollment`, and if that throws it shows the error and abandons the new enrollment. The retire step (adfa7a7:src/main.ts:3439-3473) clears the settings-sync local state; sends `DELETE {host}/vault/{vaultId}/auth/device` with the old device token, treating 200 and 401 as success and otherwise showing "Could not remove the old server membership. Remove it from the old server console." (9 s); then tears down sync and deletes the old local database. | src/host/ui/pairing.ts:493-516 (`retireDeviceEnrollment`: `DELETE {host}/vault/{vaultId}/auth/device` with the old Bearer token; 200 and 401 are done; any other status or a network error throws the same "Could not remove the old server membership ..." text, without the token); src/host/ui/pairModal.ts:192-196 (after the new identity is stored, when host, vault, device or token differ, src/host/ui/api.ts:215-218; best effort, the error is a 9 s notice); src/host/ui/pairModal.ts:106 (the replace warning says the old membership is removed) | implemented (ed567e3). Differences: the retire runs after the new pairing is stored and its failure does not undo it; the old identity's local state is not deleted here |
+| "This device is enrolled. Starting sync..." | adfa7a7:src/runtime/setupLinkController.ts:284 | src/host/ui/pairModal.ts:174 | ported |
+| Confirm before pairing over an existing enrollment | adfa7a7:src/runtime/setupLinkController.ts:289 | src/host/ui/pairModal.ts:104-109 (warning), :157 ("Replace pairing") | ported |
+| Retire the old enrollment when pairing replaces it (wave 2) | adfa7a7:src/runtime/setupLinkController.ts:250-257: when the new enrollment differs from the current one in host, vault, device or generation (:246-249), it awaits `retireCurrentEnrollment`, and if that throws it shows the error and abandons the new enrollment. The retire step (adfa7a7:src/main.ts:3439-3473) clears the settings-sync local state; sends `DELETE {host}/vault/{vaultId}/auth/device` with the old device token, treating 200 and 401 as success and otherwise showing "Could not remove the old server membership. Remove it from the old server console." (9 s); then tears down sync and deletes the old local database. | src/host/ui/pairing.ts:488-511 (`retireDeviceEnrollment`: `DELETE {host}/vault/{vaultId}/auth/device` with the old Bearer token; 200 and 401 are done; any other status or a network error throws the same "Could not remove the old server membership ..." text, without the token); src/host/ui/pairModal.ts:184-188 (after the new identity is stored, when host, vault, device or token differ, src/host/ui/api.ts:215-218; best effort, the error is a 9 s notice); src/host/ui/pairModal.ts:107 (the replace warning says the old membership is removed) | implemented (ed567e3). Differences: the retire runs after the new pairing is stored and its failure does not undo it; the old identity's local state is not deleted here |
 | Retire the old enrollment when an interrupted pairing finishes on the next load (wave 2) | adfa7a7:src/runtime/setupLinkController.ts:60-62, :76-80: on load a pending enrollment is resumed through `runPendingEnrollment` (:146-157) and `completePendingEnrollment` (:169-175), the same path as a fresh pairing, so the retire at :250-257 runs for it too | src/host/ui/pairFlow.ts:103-106, :114-120 (`resumePendingEnrollment` returns the identity it `replaced`); src/host/plugin.ts:33-34 (retired best effort, not awaited, so the engine start does not wait on the old server) | implemented (d907bf5) |
 | An unanswered enrollment is kept and retried on the next load | adfa7a7:src/runtime/setupLinkController.ts:60-62 | src/host/plugin.ts:131; src/host/ui/pairFlow.ts:79, :114; src/host/ui/api.ts:169 | implemented (8db4540) |
 | Unclaimed server: claim it in a browser first | adfa7a7:src/runtime/fatalSyncNotice.ts:19-21 | src/host/ui/pairing.ts:251, :268 (the refusal says to run "Create a new vault", which claims the server from the plugin, src/host/ui/createVault.ts:91-94) | ported |
-| Create a pairing code for another device ("Add my device") | adfa7a7:src/main.ts:3238 | src/host/ui/pairing.ts:457; src/host/ui/pairModal.ts:244 | ported |
-| Pairing dialog: copy the pairing page URL and the desktop deep link | adfa7a7:src/settings/PairDeviceModal.ts:69-74, :82-111 | src/host/ui/pairModal.ts:298-329 (server URL and pairing code, each with Copy, and "Copy setup link", whose link carries the vault key or `suite=0`; the server's mobile setup page is not offered, :8-11) | ported |
+| Create a pairing code for another device ("Add my device") | adfa7a7:src/main.ts:3238 | src/host/ui/pairing.ts:452; src/host/ui/pairModal.ts:236 | ported |
+| Pairing dialog: copy the pairing page URL and the desktop deep link | adfa7a7:src/settings/PairDeviceModal.ts:69-74, :82-111 | src/host/ui/pairModal.ts:290-321 (server URL and pairing code, each with Copy, and "Copy setup link", whose link carries the vault key or `suite=0`; the server's mobile setup page is not offered, :8-11) | ported |
 | "Open pairing page" button | adfa7a7:src/settings/PairDeviceModal.ts:75-77, :95-97 | MISSING (the dialog no longer offers the server's mobile setup page, src/host/ui/pairModal.ts:8-11) | dropped: a page the server draws can only carry a key-less join (32ba9558; a6d3385 had added the button) |
-| QR code of the mobile setup page in "Pair another device" (wave 2) | adfa7a7:src/settings/PairDeviceModal.ts:40-66: a "Generating pairing code..." placeholder, then `QRCode.toCanvas(canvas, mobileUrl, { width: 220, margin: 1, errorCorrectionLevel: "M" })` from the `qrcode` package. On success the canvas is shown with aria-label "Device linking code" ("Person invitation code" for an invite); on failure the placeholder reads "Could not generate a pairing code." and the canvas is removed. The intro text asks the user to scan the link on the other device (:33-38). | src/host/ui/qr.ts:10-33 (`toCanvas(canvas, text, { width: 260, margin: 1, errorCorrectionLevel: "M" })` from `qrcode`, src/host/ui/qr.ts:7; the canvas has role img and the caller's aria-label, "QR code to pair your other device"; on failure it is removed and "Could not draw the QR code." is shown); src/host/ui/pairModal.ts:276-296 (drawn only after a click on "Show pairing QR", from a setup link that carries this device's vault key or `suite=0`, src/host/ui/keyActions.ts:161-176; hidden again when the code expires or the dialog closes, src/host/ui/pairModal.ts:337-338, :359); src/host/ui/pairModal.ts:273-275 (the text says to scan it); scripts/check-deps.mjs:240 (host may import `qrcode`); package.json:57 | implemented (3003810); reworked in 32ba9558: the QR is of a setup link with the vault key, not of the server's mobile setup page |
-| Device-name hint in the pair dialog | adfa7a7:src/settings/settingsTab.ts:362-364 | src/host/ui/pairModal.ts:149 | implemented (a6d3385) |
+| QR code of the mobile setup page in "Pair another device" (wave 2) | adfa7a7:src/settings/PairDeviceModal.ts:40-66: a "Generating pairing code..." placeholder, then `QRCode.toCanvas(canvas, mobileUrl, { width: 220, margin: 1, errorCorrectionLevel: "M" })` from the `qrcode` package. On success the canvas is shown with aria-label "Device linking code" ("Person invitation code" for an invite); on failure the placeholder reads "Could not generate a pairing code." and the canvas is removed. The intro text asks the user to scan the link on the other device (:33-38). | src/host/ui/qr.ts:10-33 (`toCanvas(canvas, text, { width: 260, margin: 1, errorCorrectionLevel: "M" })` from `qrcode`, src/host/ui/qr.ts:7; the canvas has role img and the caller's aria-label, "QR code to pair your other device"; on failure it is removed and "Could not draw the QR code." is shown); src/host/ui/pairModal.ts:268-288 (drawn only after a click on "Show pairing QR", from a setup link that carries this device's vault key or `suite=0`, src/host/ui/keyActions.ts:161-176; hidden again when the code expires or the dialog closes, src/host/ui/pairModal.ts:329-330, :351); src/host/ui/pairModal.ts:265-267 (the text says to scan it); scripts/check-deps.mjs:240 (host may import `qrcode`); package.json:57 | implemented (3003810); reworked in 32ba9558: the QR is of a setup link with the vault key, not of the server's mobile setup page |
+| Device-name hint in the pair dialog | adfa7a7:src/settings/settingsTab.ts:362-364 | src/host/ui/pairModal.ts:147 | implemented (a6d3385) |
 | Default device name | adfa7a7:src/utils/defaultDeviceName.ts:12 | src/host/ui/deviceName.ts:17 | ported |
 | "Invite person" pairing (`kind: "person"`) | adfa7a7:src/settings/PairDeviceModal.ts:21, :31-36; adfa7a7:src/main.ts:3252 | MISSING | dropped: governance moved to the server operator console (§18) |
 | First join with existing local files (durable, resumable importer with a summary) | adfa7a7:src/onboarding/localVaultImport.ts:215, :244; adfa7a7:src/main.ts:920 | src/core/plan/planner.ts:638-645 (local-only files become creates on the first full pass, DESIGN §j.5) | ported (no separate importer) |
 | Operator-provisioned vault check before the first sync | adfa7a7:src/onboarding/provisioningClient.ts:51; adfa7a7:src/main.ts:940 | src/host/ui/pairing.ts:251 (capabilities are checked before enrolling) | ported |
 
-New only: the pairing code shows a live expiry countdown (src/host/ui/pairModal.ts:331-346).
+New only: the pairing code shows a live expiry countdown (src/host/ui/pairModal.ts:323-338).
 
 ## 5. Snapshots and restore UI
 
@@ -289,15 +289,15 @@ verify and restore them. The server never parses them.
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
 | Daily snapshot | adfa7a7:src/snapshots/snapshotService.ts:99; adfa7a7:src/main.ts:1514 | src/engine/snapshots/snapshotJob.ts:107; src/engine/compose/vaultRuntime.ts:432 | ported |
-| Manual snapshot | adfa7a7:src/snapshots/snapshotService.ts:113 | src/engine/snapshots/snapshotJob.ts:97; src/engine/compose/runtimeOps.ts:97 | ported (the command is in §2) |
+| Manual snapshot | adfa7a7:src/snapshots/snapshotService.ts:113 | src/engine/snapshots/snapshotJob.ts:97; src/engine/compose/runtimeOps.ts:96 | ported (the command is in §2) |
 | Snapshot reasons (initial, daily, manual, pre-bulk-operation) | adfa7a7:src/snapshots/recoveryClient.ts:44 | src/protocol/messages.ts:169 (daily, brake, epoch, idb, restore, manual) | implemented (687d5bc) (reasons shown in listings) |
 | Retention | adfa7a7:src/snapshots/recoveryClient.ts:887; adfa7a7:src/snapshots/snapshotService.ts:180 | src/engine/snapshots/snapshotJob.ts:276-286 (keep N dailies and 10 others; uploads: a per-device floor, src/engine/snapshots/remote.ts:62-64); src/host/ui/settingsTab.ts:258 | ported |
-| Snapshot list | adfa7a7:src/snapshots/recoveryModals.ts:13; adfa7a7:src/snapshots/snapshotService.ts:152 | src/host/ui/snapshotsModal.ts:38; src/engine/compose/runtimeOps.ts:101 | implemented (6ca0411) |
-| Browse a snapshot's files | adfa7a7:src/snapshots/recoveryModals.ts:55; adfa7a7:src/snapshots/snapshotService.ts:206 | src/host/ui/snapshotsModal.ts:159; src/engine/compose/runtimeOps.ts:108 | implemented (687d5bc, 6ca0411) |
+| Snapshot list | adfa7a7:src/snapshots/recoveryModals.ts:13; adfa7a7:src/snapshots/snapshotService.ts:152 | src/host/ui/snapshotsModal.ts:38; src/engine/compose/runtimeOps.ts:100 | implemented (6ca0411) |
+| Browse a snapshot's files | adfa7a7:src/snapshots/recoveryModals.ts:55; adfa7a7:src/snapshots/snapshotService.ts:206 | src/host/ui/snapshotsModal.ts:159; src/engine/compose/runtimeOps.ts:107 | implemented (687d5bc, 6ca0411) |
 | "Back up and restore all" | adfa7a7:src/snapshots/recoveryModals.ts:101 | src/host/ui/snapshotsModal.ts:92 ("Restore all...") | implemented (6ca0411) |
 | "Back up and restore this item" | adfa7a7:src/snapshots/recoveryModals.ts:148 | src/host/ui/snapshotsModal.ts:230 ("Restore selected...") | implemented (6ca0411) |
-| Restore result | adfa7a7:src/snapshots/snapshotService.ts:223 | src/engine/compose/runtimeOps.ts:117-121 (restored, unchanged, copies, failed) | implemented (687d5bc) |
-| Delete a recovery point | adfa7a7:src/snapshots/recoveryModals.ts:44; adfa7a7:src/snapshots/snapshotService.ts:490 | src/host/ui/snapshotsModal.ts:93; src/engine/compose/runtimeOps.ts:123 | implemented (687d5bc, 6ca0411) |
+| Restore result | adfa7a7:src/snapshots/snapshotService.ts:223 | src/engine/compose/runtimeOps.ts:116-120 (restored, unchanged, copies, failed) | implemented (687d5bc) |
+| Delete a recovery point | adfa7a7:src/snapshots/recoveryModals.ts:44; adfa7a7:src/snapshots/snapshotService.ts:490 | src/host/ui/snapshotsModal.ts:93; src/engine/compose/runtimeOps.ts:122 | implemented (687d5bc, 6ca0411) |
 | Back up current files before a restore replaces them | adfa7a7:src/snapshots/recoveryBackup.ts:33, :39 (`plugins/yaos/restore-backups`), :41 | src/engine/snapshots/snapshotJob.ts:144 (a "restore" snapshot first); src/engine/snapshots/restore.ts:51-61 (a conflict copy of each changed file) | ported |
 | Snapshot "complete with gaps" warning | adfa7a7:src/snapshots/recoveryModals.ts:80 | src/host/ui/snapshotsModal.ts:199-207 (files a snapshot skipped) | implemented (6ca0411) |
 | "Restore as a fresh file identity" | adfa7a7:src/snapshots/recoveryModals.ts:174 | src/engine/snapshots/restore.ts:66 (a restore is a plain disk write; sync imports it like any local file) | ported |
@@ -311,17 +311,17 @@ verify and restore them. The server never parses them.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Export a diagnostics file to the plugin folder | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:207; adfa7a7:src/telemetry/installTelemetryRuntime.ts:253 (needed debug mode on, :184) | src/host/ui/diagnostics.ts:112; src/host/plugin.ts:120 (`diagnostics/`); src/engine/compose/runtimeOps.ts:126-127 | ported (always available) |
+| Export a diagnostics file to the plugin folder | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:207; adfa7a7:src/telemetry/installTelemetryRuntime.ts:253 (needed debug mode on, :184) | src/host/ui/diagnostics.ts:110; src/host/plugin.ts:120 (`diagnostics/`); src/engine/compose/runtimeOps.ts:125-126 | ported (always available) |
 | Paths pseudonymized under a per-bundle salt | adfa7a7:src/telemetry/diagnostics/pathRedactor.ts:124, :277; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:203 | src/engine/compose/diagnosticsBundle.ts:35-40 | implemented (5d42e55) |
 | Export with file names (opt-in) | adfa7a7:src/telemetry/installTelemetryRuntime.ts:258 | src/engine/compose/diagnosticsBundle.ts:97-99; src/host/ui/commands.ts:71 | implemented (5d42e55) |
 | Recent events in the bundle | adfa7a7:src/telemetry/debug/flightRecorder.ts:79 | src/engine/runtime/context.ts:49 (the whole 2000-event ring) | implemented (5d42e55) |
-| Settings section without secrets | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:143; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:293 | src/host/ui/diagnostics.ts:19-21, :61 | implemented (5d42e55) |
+| Settings section without secrets | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:143; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:293 | src/host/ui/diagnostics.ts:19-21, :60 | implemented (5d42e55) |
 | Platform information | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:39 | src/protocol/status.ts:25 (device class in the status) | ported (device class, not the OS name) |
-| Copy to the clipboard and say where the file is | adfa7a7:src/telemetry/installTelemetryRuntime.ts:194 | src/host/ui/diagnostics.ts:146 | ported |
+| Copy to the clipboard and say where the file is | adfa7a7:src/telemetry/installTelemetryRuntime.ts:194 | src/host/ui/diagnostics.ts:144 | ported |
 | Vault-versus-CRDT comparison | adfa7a7:src/telemetry/diagnostics/diagnosticsService.ts:77; adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:314 | MISSING | dropped: disk-vs-state hash in diagnostics (coordinator decision) |
 | Leak check and content-fingerprint redaction | adfa7a7:src/telemetry/diagnostics/diagnosticsBundle.ts:352, :385 | MISSING | dropped: diagnostics leak check (pseudonymization replaces it) |
 
-The bundle's store sizes are always 0 bytes (src/engine/compose/runtimeOps.ts:180-182); only record counts are real.
+The bundle's store sizes are always 0 bytes (src/engine/compose/runtimeOps.ts:179-181); only record counts are real.
 
 ## 7. Frontmatter
 
@@ -350,7 +350,7 @@ attachment-storage info row is in §3.4.
 | Effective cap is the smaller of the user limit and the server's upload limit | adfa7a7:src/settings/settingsStore.ts:14-23; adfa7a7:src/sync/blobSync.ts:482 | src/engine/reconcile/localState.ts:82; src/engine/adapters/httpBlob.ts:327, :508-509 | ported (the field text is the wave-2 row in §3.5) |
 | Downloaded attachment verified against its hash | adfa7a7:src/sync/blobSync.ts:1494-1505 | src/engine/blobs/blobQueue.ts:584; src/engine/blobs/blobStore.ts:98-100 | ported |
 | Transfer concurrency from the "Parallel transfers" setting | adfa7a7:src/sync/blobSync.ts:481 | src/core/limits.ts `BUDGETS` (`blobBytesInFlight` per device class) | dropped: attachmentConcurrency setting (fixed limits in src/core/limits.ts) |
-| "R2 backend detected" notice, and a daily snapshot when storage appears | adfa7a7:src/runtime/capabilityUpdateService.ts:498-509 | MISSING (a store found on a later connect restarts the runtime silently, src/engine/compose/protocolEngine.ts:531-536) | dropped: user decision 2026-10-07: no capability polling or notices for server metadata; the session loop probes once per live session while no store is set (src/engine/runtime/sessionLoop.ts:160) |
+| "R2 backend detected" notice, and a daily snapshot when storage appears | adfa7a7:src/runtime/capabilityUpdateService.ts:498-509 | MISSING (a store found on a later connect restarts the runtime silently, src/engine/compose/protocolEngine.ts:527-532) | dropped: user decision 2026-10-07: no capability polling or notices for server metadata; the session loop probes once per live session while no store is set (src/engine/runtime/sessionLoop.ts:160) |
 
 Without a blob store the client fails closed: attachments are not synced and the log never carries blob bytes
 (src/engine/blobs/blobQueue.ts:220-221, src/engine/reconcile/localState.ts:87, DESIGN §j.1).
@@ -376,10 +376,10 @@ Without a blob store the client fails closed: attachments are not synced and the
 | Attachment conflict copy name `name (YAOS remote conflict <time>).ext` | adfa7a7:src/sync/blobSync.ts:274-291 | src/core/plan/planner.ts:391, :624 (the same `conflictName` pattern) | ported (DESIGN §f.7, "Blob keep-both uses the same pattern") |
 | Attachment conflict copy is local only (never uploaded) | adfa7a7:src/sync/blobSync.ts:1783-1790 | src/core/plan/planner.ts:393-394, :626-627 (the copy is created and pushed) | dropped: the copy is a normal synced file in the new client (DESIGN §f.7) |
 | Reuse an existing copy with identical content | adfa7a7:src/runtime/reconcile/markdownConflictArtifact.ts:52 | MISSING (identical content makes no copy, src/core/merge/merge.ts:26) | dropped: identical-content conflict copy reuse (coordinator decision) |
-| Conflict notice, throttled, with the suppressed count | adfa7a7:src/runtime/reconciliationController.ts:2701-2714; adfa7a7:src/sync/blobSync.ts:1827-1830 | src/engine/reconcile/context.ts:247-254; src/engine/reconcile/reconciler.ts:228 | implemented (2d6bac5) |
+| Conflict notice, throttled, with the suppressed count | adfa7a7:src/runtime/reconciliationController.ts:2701-2714; adfa7a7:src/sync/blobSync.ts:1827-1830 | src/engine/reconcile/context.ts:247-254; src/engine/reconcile/reconciler.ts:215 | implemented (2d6bac5) |
 | Count of conflict copies today | adfa7a7:src/runtime/reconciliationController.ts:2704 (only a per-notice suppressed count) | src/engine/compose/localDayCounter.ts:14; src/engine/compose/vaultRuntime.ts:649; src/protocol/status.ts:48 | implemented (0db3bb7) |
 
-New only: more than 200 conflict copies in one pass hold the changes for review (src/core/limits.ts:149,
+New only: more than 200 conflict copies in one pass hold the changes for review (src/core/limits.ts:148,
 DESIGN §f.5), and a multi-step copy is resumed after a crash from its intent record (DESIGN §f.7).
 
 ## 11. Trash and deletes
@@ -402,10 +402,10 @@ New only:
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| The config folder and `.trash/` never sync | adfa7a7:src/sync/exclude.ts:3-9, :23-25 | src/core/paths/validate.ts:56 (any segment starting with a dot is invalid, which covers both) | ported |
+| The config folder and `.trash/` never sync | adfa7a7:src/sync/exclude.ts:3-9, :23-25 | src/core/paths/validate.ts:57 (any segment starting with a dot is invalid, which covers both) | ported |
 | User exclude patterns | adfa7a7:src/sync/exclude.ts:21, :26-27 (path prefixes) | src/engine/reconcile/localState.ts:37-60 (`folder/` prefixes plus `*`, `?`, `**` globs), :85 | ported (wider syntax) |
 | Pattern format: one comma-separated line | adfa7a7:src/sync/exclude.ts:36-40; adfa7a7:src/settings/settingsTab.ts:373-376 | src/host/ui/settingsModel.ts:76 (one pattern per line); src/host/ui/settingsTab.ts:207 | implemented (0b9e3e9) (the setting text describes the glob syntax) |
-| Names other systems cannot store (reserved names, forbidden characters, length) are not synced | adfa7a7:src/sync/pathPolicy.ts:12; adfa7a7:src/sync/blobSync.ts:558-564 (invalid attachment paths quarantined) | src/core/paths/validate.ts:54-62; src/core/limits.ts:12-14, :40-46; src/engine/reconcile/localState.ts:84 | ported (the warning popup is implemented (c5ca263), §3.2) |
+| Names other systems cannot store (reserved names, forbidden characters, length) are not synced | adfa7a7:src/sync/pathPolicy.ts:12; adfa7a7:src/sync/blobSync.ts:558-564 (invalid attachment paths quarantined) | src/core/paths/validate.ts:55-63; src/core/limits.ts:12-14, :40-46; src/engine/reconcile/localState.ts:84 | ported (the warning popup is implemented (c5ca263), §3.2) |
 | Path canonicalization | adfa7a7:src/paths/canonicalPath.ts:39 | src/core/paths/validate.ts:1-5 (NFC, frozen fold rules); src/engine/reconcile/localState.ts:77 | ported |
 | Case and Unicode collisions between paths | adfa7a7:src/paths/pathCollision.ts:55 | src/core/paths/pathKey.ts:48, :54 (one fold key per path) | ported |
 | Sync category of a path (markdown, attachment, canvas) | adfa7a7:src/paths/pathCategory.ts:33; adfa7a7:src/types.ts:68-70, :78-85 (`.md` matched case-sensitively) | src/core/types.ts:99-105 (ASCII case-insensitive) | ported (an `.MD` file is markdown now; the legacy `.MD` upgrade is dropped: zero users) |
@@ -451,7 +451,7 @@ Nothing leaves the device in the new client: the diagnostics file (§6) is the o
 | Mobile in the background: optional work paused, documents released | adfa7a7:src/runtime/residencyAdmissionCoordinator.ts:241-243, :502, :533-535 | src/engine/compose/vaultRuntime.ts:97, :574-585 (phone and constrained close the socket after 30 s hidden) | implemented (4a14c02) (DESIGN §i.4) |
 | Visible again: reconnect and catch up | adfa7a7:src/runtime/connectionController.ts:303-312 | src/host/platform.ts:89, :92; src/engine/compose/vaultRuntime.ts:588-595 | implemented (4a14c02) |
 | Network online and offline events | adfa7a7:src/runtime/connectionController.ts:327-345 | src/host/platform.ts:93-94; src/engine/compose/vaultRuntime.ts:596-603 | implemented (4a14c02) |
-| Platform split (desktop or mobile) | adfa7a7:src/main.ts:1250-1254; adfa7a7:src/runtime/residencyAdmissionCoordinator.ts:4 | src/host/runtimeSupport.ts:20-24 (desktop, tablet, phone, constrained); src/core/limits.ts:256-281 (budgets per class) | ported (DESIGN §i.2) |
+| Platform split (desktop or mobile) | adfa7a7:src/main.ts:1250-1254; adfa7a7:src/runtime/residencyAdmissionCoordinator.ts:4 | src/host/runtimeSupport.ts:20-24 (desktop, tablet, phone, constrained); src/core/limits.ts:251-276 (budgets per class) | ported (DESIGN §i.2) |
 | Default device name from the platform (iPhone, iPad, Android, ...) | adfa7a7:src/utils/defaultDeviceName.ts:12-19 | src/host/ui/deviceName.ts:17-19; src/host/plugin.ts:86 | ported |
 
 The desktop-only plugin hold on mobile is a settings sync row in §1.
@@ -460,7 +460,7 @@ The desktop-only plugin hold on mobile is a settings sync row in §1.
 
 The legacy stylesheet (adfa7a7:styles.css, 163 lines) was deleted in f451274. The new UI uses Obsidian's own classes
 (`mod-cta`, `mod-warning`, `mod-clickable`, Setting rows). It still sets a few `yaos-*` class names
-(src/host/ui/statusBar.ts:224, :255; src/host/ui/pairModal.ts:99, :236; src/host/ui/qr.ts:11-12; src/host/ui/brakeModal.ts:26, :33),
+(src/host/ui/statusBar.ts:224, :255; src/host/ui/pairModal.ts:100, :228; src/host/ui/qr.ts:11-12; src/host/ui/brakeModal.ts:26, :33),
 but no stylesheet styles them.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
@@ -494,7 +494,7 @@ vault" and the person fields are rows in §3.4, §3.5 and §4.
 
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
-| Safety brake on mass destructive changes | adfa7a7:src/runtime/reconcile/safetyBrakePolicy.ts:22, :25, :68 (never called outside tests; adfa7a7:src/runtime/reconciliationController.ts:514 hard-codes `safetyBrakeTriggered: false`) | src/core/plan/brake.ts:37; src/core/limits.ts:146-151; src/host/ui/brake.ts:65; src/host/ui/brakeModal.ts:9; src/host/ui/registerUi.ts:227-234 | ported (live now, DESIGN §f.5) |
+| Safety brake on mass destructive changes | adfa7a7:src/runtime/reconcile/safetyBrakePolicy.ts:22, :25, :68 (never called outside tests; adfa7a7:src/runtime/reconciliationController.ts:514 hard-codes `safetyBrakeTriggered: false`) | src/core/plan/brake.ts:37; src/core/limits.ts:145-150; src/host/ui/brake.ts:65; src/host/ui/brakeModal.ts:9; src/host/ui/registerUi.ts:227-234 | ported (live now, DESIGN §f.5) |
 | Recovery-loop quarantines (amplification, fingerprint) | adfa7a7:src/runtime/reconcile/amplificationQuarantinePolicy.ts:29, :95; adfa7a7:src/runtime/reconcile/fingerprintQuarantinePolicy.ts:28, :104 | MISSING (bounded planner and the brake) | dropped: DESIGN §m.2 (`runtime/reconcile/*` policies) |
 | Live editor binding (legacy: y-codemirror over a main-thread Y.Doc) | adfa7a7:src/sync/editorBinding.ts:181 | src/host/binding.ts:95; src/host/collab.ts:60; src/host/bodyClient.ts:64 (CodeMirror ChangeSets against the worker replica, no CRDT on main) | ported (reworked onto the worker replica: DESIGN §d.2, §d.3) |
 | Bind-divergence decisions (adopt body or adopt editor) | adfa7a7:src/sync/editorBinding.ts:146 | MISSING (one `MergeFn` plus a conflict copy) | dropped: DESIGN §m.2 (merge and divergence policies) |

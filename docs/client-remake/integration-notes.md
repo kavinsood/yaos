@@ -244,7 +244,7 @@ only the pure adapters (`noopCrypto`, `webHash`, `webClock`, `webRandom`,
 - **Pass scheduling.** PassScheduler runs scoped passes on fold/observation
   events and full passes on a 5-15 min cadence (full passes also re-read
   settings). Unproductive passes back off; a blob retry timer is armed at the
-  earliest due transfer that is not running (+5 ms, `passScheduler.ts:181`,
+  earliest due transfer that is not running (+5 ms, `passScheduler.ts:158`,
   `blobQueue.ts:274-278`), and a settled transfer requests a pass over its
   docs (`vaultRuntime.ts:240`).
 - **S1 own fold.** Own ns frames move the synced tree forward only when they
@@ -415,7 +415,7 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   wait up to `NS_CORK_MAX_MS` (2 s, `sender.ts:44`, `:304-314`).
 - An engine restart turns un-folded live creates back into held ones: the
   start rebuilds `pendingCreates` from the outbox with `live: false`
-  (`engine/runtime/engine.ts:200-203`), so body frames built after the restart
+  (`engine/runtime/engine.ts:161-164`), so body frames built after the restart
   wait until the create folds (two commits to a peer instead of one).
 - `duplicate-docid` creates are not re-planned (DESIGN said so; nothing did):
   the fold ignores the create (`core/ns/fold.ts:120`), its frames are released
@@ -426,7 +426,7 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   digest) and, for a file stored as a blob, downloads it, then writes
   (`engine/settings/cfgSync.ts:208-226`). `ConfigDirPort.writeBytes` takes no
   precondition (`ports/vault.ts:89`), the engine's adapter sends `any`
-  (`engine/compose/hostLink.ts:169-171`), and the host writes without
+  (`engine/compose/hostLink.ts:165-167`), and the host writes without
   re-checking (`host/diskExecutor.ts:220-224`). A settings file that Obsidian
   or a plugin changes between the read and the write is overwritten: the
   change is not merged and no copy is kept.
@@ -436,9 +436,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   `MAX_BLOB_UPLOAD_BYTES` = 100,000,000 and advertises it as
   `maxBlobUploadBytes` (`server/src/router.ts:43`, `:286`). The client takes
   the advertised cap (`engine/adapters/httpBlob.ts:508-510`), or its own
-  `MAX_BLOB_UPLOAD_BYTES` (`core/limits.ts:188`) when capabilities can't be
+  `MAX_BLOB_UPLOAD_BYTES` (`core/limits.ts:185`) when capabilities can't be
   read (`httpBlob.ts:327`); under suite 1 the plaintext cap is what fits once
-  sealed, 98,566,143 (`maxSealedBlobPlaintext`, `core/codec/sealedBlob.ts:34-46`).
+  sealed, 98,566,143 (`maxSealedBlobPlaintext`, `core/codec/sealedBlob.ts:29-41`).
   On 2026-10-07 (UTC) the deployed Cloudflare worker accepted a full
   100,000,000-byte PUT (suite 0) and a 98,566,175-byte sealed PUT (suite 1),
   both verified on the peer
@@ -511,11 +511,11 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
   (cap 8 MiB per blob on that config). The `x:` carrier was later deleted:
   without a blob store, attachments are not synced.
 - Pairing a paired device again tries to revoke the replaced enrollment with
-  its own token, `DELETE /vault/:id/auth/device` (`host/ui/pairing.ts:503-516`,
-  called from `host/ui/pairModal.ts:195` and `host/plugin.ts:34`). The
+  its own token, `DELETE /vault/:id/auth/device` (`host/ui/pairing.ts:498-511`,
+  called from `host/ui/pairModal.ts:187` and `host/plugin.ts:34`). The
   rewritten server has no such route and answers 404 (`server/src/router.ts:588`),
   so every such pairing shows "Could not remove the old server membership.
-  Remove it from the old server console." (`host/ui/pairing.ts:493`), and the old
+  Remove it from the old server console." (`host/ui/pairing.ts:488`), and the old
   device stays enrolled until the operator revokes it in the console.
 
 **Host**
@@ -827,7 +827,7 @@ results below predate that.
    notes waited behind them in the same pass (`att/` sorts first). The read
    timeline showed it: single ~55 KB reads back to back from 1.7 s to 6.5 s,
    after catch-up had already put every `x:` stream in the local tail
-   (rank 4, `engine.ts:59` at ba01198) at 3.4 s. Fixes: blob jobs prefetch the next
+   (rank 4, `engine.ts:53` at ba01198) at 3.4 s. Fixes: blob jobs prefetch the next
    downloads while the current op runs (`BlobQueue.prefetch`, window
    `blobConcurrency - 1`, held bytes <= `maxDiskIoBytesInFlight`, leftovers
    dropped after the pass; 9a76b06), and `readBlobChunks` assembles from the

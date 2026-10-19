@@ -59,14 +59,14 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed), then unpad when suite ≠ 
 ```
 
 - **AAD** (UTF-8 prefix, then the outer header `u8 formatVersion ‖ u8 suite ‖ varuint keyEpoch`, then lib0
-  varstrings; `src/core/codec/envelope.ts:178-186`, e2ee-design §7.2):
+  varstrings; `src/core/codec/envelope.ts:174-182`, e2ee-design §7.2):
   - frames: `"yaos/f2" ‖ header ‖ vaultId ‖ stream ‖ deviceId ‖ clientFrameId`;
   - checkpoints: `"yaos/c2" ‖ header ‖ vaultId ‖ stream ‖ varuint coversSeq`.
 - **frameNo** must be ≥ 1 for nsOps/cfgOps and 0 for every other kind; anything else is malformed
-  (`checkFrameNo`, `src/core/codec/envelope.ts:101-103`, `:161`).
+  (`checkFrameNo`, `src/core/codec/envelope.ts:101-103`, `:157`).
 - **Padding.** Suite ≠ 0: Padmé (`data ‖ 0x80 ‖ 0x00*`) inside the AEAD, floor `PADME_FLOOR_BYTES` = 256 B
   (`src/core/codec/padme.ts:1-20`, `src/core/limits.ts:78`, e2ee-design §7.3). Bad padding under a valid tag is
-  `bad-padding` (`src/core/codec/envelope.ts:255-256`). Suite 0 never pads.
+  `bad-padding` (`src/core/codec/envelope.ts:251-252`). Suite 0 never pads.
 - **Binding checks** run even with suite 0, where the AAD is unused:
   - the kind must be in `ALLOWED_KINDS[streamClass]`;
   - for a checkpoint, the inner `CheckpointContent.coversSeq` MUST equal the relay's `coversSeq`, else quarantine.
@@ -331,7 +331,7 @@ For each committed ns row, in seq order:
 2. **Dedupe.** If `clientFrameId ∈ recentFrames[deviceId]`, emit one frame-level event `ignored/duplicate-frame`
    and stop. Otherwise append the id and trim the ring to `NS_DEDUPE_RING` (64), oldest out.
    - **Replay window** (ns and cfg, e2ee-design §8.2), checked after the ring hit test and before the append, for
-     frameNo `f` ≥ 1 only (`src/core/ns/fold.ts:277-286`, `src/core/cfg/fold.ts:215-224`). Per device: right edge R and
+     frameNo `f` ≥ 1 only (`src/core/ns/fold.ts:277-286`, `src/core/cfg/fold.ts:210-219`). Per device: right edge R and
      a `REPLAY_WINDOW` (64)-bit bitmap (`src/core/replayWindow.ts:30-35`). `f ≤ R − 64` → `ignored/replay-stale`;
      a set bit → `ignored/replay-duplicate`; either sets `coversSeq = seq` and changes neither ring nor window.
      An accepted frame updates both. frameNo 0 on an nsOps/cfgOps envelope is a decode failure (§b.1); a row that
@@ -868,7 +868,7 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   - every frame of the doc built before its create folds carries `dependsOn` = the ns create frame
     (`Ctx.pendingCreates`, docRuntime closeFrame).
 - **Live creates** (every pass after the reconciler's first full pass with ns ready and the local scan complete,
-  `Ctx.liveCreates`, reconciler.ts:212):
+  `Ctx.liveCreates`, reconciler.ts:199):
   - the frames are `pending`, not `held` (frames.ts `sendAfter`);
   - the pass corks the ns stream (`Sender.corkNs`, at most `NS_CORK_MAX_MS` = 2 s) from `submitNs` until the last
     `reconcileContent` of the docs it created (runner.ts), so the creates and their body frames reach the relay
@@ -882,7 +882,7 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   pass after every engine start): the frames are `held` and are released when the create folds `applied` /
   `suffixed`. Identical concurrent imports merge (§c.5), and holding keeps them at zero body rows. A restart also
   turns un-folded live creates back into held ones: `pendingCreates` is rebuilt from the outbox with `live: false`
-  (engine.ts:202), so frames built after the restart are held.
+  (engine.ts:163), so frames built after the restart are held.
 - **Create folds `merged`** (nsRuntime.reconcileHeld):
   - its held, pending and sent-but-unreceipted frames are deleted, and the doc is rebound to the winner (§c.13);
   - the winner already has the create's content (a merge needs the same create hash, place.ts). Edits made after
@@ -1170,7 +1170,7 @@ The planner does no destructive work until ns is caught up (§f.2).
 
 - **ns.**
   - Only candidate seqs (§b.5). The device keeps the `nsFoldV1` bytes of its newest candidate in memory.
-  - Duty: the author of the candidate row (`foldCheckpointDue`, checkpoints.ts:302).
+  - Duty: the author of the candidate row (`foldCheckpointDue`, checkpoints.ts:301).
     - Hot: ≥ `NS_CHECKPOINT_ROWS` (1000) ns rows or ≥ `NS_CHECKPOINT_BYTES` have accumulated since the last
       checkpoint. No idle gate.
     - Settle: `settleWanted`, and the stream has been idle for `REMOTE_CHECKPOINT_SETTLE_MS`. ns, cfg and snap rows
@@ -1191,7 +1191,7 @@ The planner does no destructive work until ns is caught up (§f.2).
       for a doc (2 for its first checkpoint). A put at `lastSeq` also drops the open segment at no extra row (H7).
     - A CAS conflict writes nothing, and the fallback refresh is a read.
   - A heavy desktop day:
-    - Frames: ≤ 20k (soft budget, limits.ts:261; frames are 4× slower beyond it, src/engine/runtime/context.ts:510-512) ×
+    - Frames: ≤ 20k (soft budget, limits.ts:256; frames are 4× slower beyond it, src/engine/runtime/context.ts:510-512) ×
       ≤ 2 rows = ≤ 40k.
     - Settle: 500 edit sessions × ≤ 4 = 2k. One put per session: a pause of 2 min or more ends one.
     - Hot: 20k / 256 × 4 ≈ 310.
@@ -1376,13 +1376,13 @@ All are in `src/core/types.ts`.
   - Both are SHA-256 hex, digested in the engine through `HashPort` (WebCrypto; `digestHex`,
     `src/core/hash/digest.ts:11`), like every other digest: blobs, canvas, config, snapshots, mirrors, brake ids.
     Core's pure-JS SHA-256 throws a `RangeError` above `SYNC_HASH_MAX_BYTES` (4096 B, `src/core/limits.ts:100`,
-    `src/core/hash/sha256.ts:22-23`), in production too. It takes only bounded inputs: the
+    `src/core/hash/sha256.ts:23-24`), in production too. It takes only bounded inputs: the
     empty-content hash (`src/core/plan/planner.ts:67`), cfg's `H_TRUE` (4 B, `src/engine/settings/cfgPlan.ts:98`)
     and the resident-text fallback below. The recovery key's checksum is a `hashRequest` (`rkChecksum`,
     `src/host/pluginController.ts:368`).
   - `streams.textHash` of a resident replica (the planner's remote hash for a caught-up markdown/canvas doc) is
     digested through `HashPort` before each pass reads the view (`warmTextHashes`,
-    `src/engine/compose/logPort.ts:114-130`, called at `src/engine/reconcile/reconciler.ts:165`). A replica that
+    `src/engine/compose/logPort.ts:114-130`, called at `src/engine/reconcile/reconciler.ts:152`). A replica that
     changed after the warm is hashed by the view only if its input fits `SYNC_HASH_MAX_BYTES`; otherwise the view
     has no `textHash` for it and the planner's remote hash is unknown (`logPort.ts:98-107`,
     `src/core/plan/planner.ts:201-207`).
@@ -1532,11 +1532,11 @@ All are in `src/core/types.ts`.
 - **Report.** The brake's identity is the sorted brake keys (`kind|docId|path|expect`) of its held ops, one per line
   (`brakeKey`, `brakeIdentity`, `src/core/plan/brake.ts:82-89`). `BrakeReport.id` is the identity's sha256 through
   `HashPort` (`brakeId`, `brake.ts:92-94`): the planner returns the identity, and the reconciler digests it and the
-  engine posts a `brake` event (`src/engine/reconcile/reconciler.ts:190-195`).
+  engine posts a `brake` event (`src/engine/reconcile/reconciler.ts:177-182`).
 - **Approval.** `approveBrake{id}` maps the id back to the identity of the report it names and sets `brakeApproval`
-  to that identity (`reconciler.ts:96-103`; an id no report of this runtime has is ignored). The next plan releases
+  to that identity (`reconciler.ts:83-90`; an id no report of this runtime has is ignored). The next plan releases
   the held set only if its held ops have the same identity (`brake.ts:126-127`). A recovery snapshot (reason
-  `brake`, with snapshots enabled, §j.4) is taken first (`src/engine/compose/runtimeOps.ts:80-83`). `rejectBrake`
+  `brake`, with snapshots enabled, §j.4) is taken first (`src/engine/compose/runtimeOps.ts:79-82`). `rejectBrake`
   converts held remote deletes into nothing (the files stay; `syncedDrop`) and held local deletes into re-creates.
 - Counting is per plan **and** per rolling 10-minute window, so slow drips also trip it.
 
@@ -2120,12 +2120,12 @@ ones get conflict copies.
     (`src/engine/blobs/touch.ts:170-171`).
   - A reader leaves a `bodyUpdateRef` row unresolved and arms no retry timer (§d.6).
   - There is no UI row, notice, banner or setting about server blob storage (no server-metadata UI); only a log line.
-- **A store found on a later connect.** `EnginePorts.probeBlob` (`src/ports/index.ts:51`) asks the relay again. The
+- **A store found on a later connect.** `EnginePorts.probeBlob` (`src/ports/index.ts:30`) asks the relay again. The
   session loop calls it once per session that reaches live, only while `ports.blob` is null
   (`src/engine/runtime/sessionLoop.ts:160`, `:430-443`). A store found → `EngineOptions.onBlobStore`
   (`src/engine/runtime/options.ts:160-164`) → `VaultRuntime` (`src/engine/compose/vaultRuntime.ts:64-65`, `:173`) →
   `ComposedEngine.onBlobStore` sets `ports.blob`, logs "blob store available -> restarting" and restarts the runtime
-  with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:531-536`). The restarted runtime's full
+  with `RestartReason` `"blob-store"` (`src/engine/compose/protocolEngine.ts:527-532`). The restarted runtime's full
   pass uploads what is pending through the normal path. No polling, no new timers.
 - **Production ports** (`src/engine/adapters/webEngine.ts:42-54`): `blob = startupBlob(…)`
   (`src/engine/adapters/httpBlob.ts:518-525`): `probeHttpBlob`'s answer, the HTTP store when the relay advertises
@@ -2608,7 +2608,7 @@ After healing (all faults off, all online, run until every queue is idle and no 
 7. **No blobs on the log** (`checkLogCarriesNoBlobs`, `src/sim/invariants.ts:124-132`, run by `src/sim/run.ts:251`):
    no foreign stream on the relay log, no ns / cfg / snap / k row over `MAX_NS_FRAME_BYTES`, no `b:`/`c:` stream for
    an attachment doc. Sim devices get the net's `SimBlobStore` (`SimNet.blobs`, `blobsAvailable`, `blobPort()`,
-   `src/sim/net.ts:58-85`) and its probe by default (`src/sim/device.ts:196-197`).
+   `src/sim/net.ts:59-86`) and its probe by default (`src/sim/device.ts:202-203`).
 
 ### l.4 10k-op fold fuzz (WP-A)
 
