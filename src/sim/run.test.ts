@@ -125,6 +125,16 @@ test("sim: deleting a conflict copy discards the values its own writes replaced 
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Suite-1 seeds 74 and 184 (2 devices, fault-heavy): a device re-keyed above an open revoke got K_2 from the revoke's
+// prevWrap, held but unverified; the Keyring opened again took it for an own key, the blocked roll 2 never decided,
+// and K_1, which every blob address needs, stayed out of reach: uploads and downloads retried for ever.
+test("sim: a device re-keyed above an open revoke reaches K_1 and moves its blobs (suite-1 seeds 74, 184)", async () => {
+	for (const seed of [74, 184]) {
+		const r = await runSim({ seed, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+		assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), [], `seed ${seed}`);
+	}
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */

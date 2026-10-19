@@ -5,7 +5,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { utf8Encode } from "../../core/codec/lib0";
-import { FORGED, K, RK_A, RK_B, device, genesis, holds, persistedEpochs, revoke, roll } from "./testkit/world";
+import { Keyring } from "./keyring";
+import { FORGED, K, RK_A, RK_B, VAULT, device, genesis, holds, persistedEpochs, revoke, roll } from "./testkit/world";
 
 describe("keyring: winners (§11.3)", () => {
 	it("RK path: unwraps the genesis, walks nextWrap forward, persists keys and records once, then seals", async () => {
@@ -164,5 +165,25 @@ describe("keyring: forged roll after a revoke (§11.3, §20.2)", () => {
 		await fresh.ingest([1, await genesis()], [2, await roll(2)], [10, forged], [11, rev]);
 		assert.equal(await fresh.kr.installQr(3, K(3)), "verified");
 		assert.ok(await holds(fresh, 3, K(3)));
+	});
+});
+
+describe("keyring: a key reached by prevWrap but not verified yet (suite-1 seeds 74, 184)", () => {
+	// Re-keyed by RK above an open revoke 3 whose roll 2 is still undecided (the revoke blocks it): the revoke's
+	// prevWrap installs K_2, held but unverified, so it is not stored. A Keyring opened again on the same adapter (the
+	// engine restarted) took the held K_2 for an own key, which never unblocks a roll: roll 2 stayed pending, K_1
+	// (behind its prevWrap) was never reached, and every blob address (K_1's subkey) failed for good.
+	it("a Keyring opened again re-derives K_2 from the revoke's prevWrap and walks down to K_1", async () => {
+		const [g, r2, r3] = [await genesis(), await roll(2), await revoke(3, RK_B)];
+		const d1 = await device({ records: [r3] });
+		assert.equal(await d1.kr.installRk(RK_B.slice()), "verified");
+		assert.ok(d1.kc.keyState(2).held && !d1.kc.keyState(2).verified, "K_2 held, not verified");
+		const records = d1.changes.at(-1)?.records ?? [r3];
+		d1.kr.dispose();
+		const kr = await Keyring.open({ mode: "suite1", vaultId: VAULT, kc: d1.kc, records, persist: async () => undefined, diag: () => undefined, onKeyringSeen: () => undefined });
+		await kr.ingest([{ seq: 1, bytes: g }, { seq: 5, bytes: r2 }, { seq: 9, bytes: r3 }]);
+		assert.ok(d1.kc.keyState(1).verified, "K_1 verified");
+		assert.ok(d1.kc.keyState(2).verified, "K_2 verified");
+		assert.equal(kr.keyMissing(), null);
 	});
 });
