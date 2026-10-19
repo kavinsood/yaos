@@ -73,6 +73,13 @@ test("sim: an RK whose revoke command was cut off by a crash still re-keys a dev
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Suite-1 seed 112 (3 devices): the last step forged suite-0 rows into a doc. The forge lands after an await, so
+// heal() in the same turn saw none and never started the keeper; nobody released the doc, frozen on every device.
+test("sim: rows forged by the last step are still released by the user after the heal (suite-1 seed 112)", async () => {
+	const r = await runSim({ seed: 112, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */

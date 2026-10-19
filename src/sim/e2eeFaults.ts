@@ -382,6 +382,9 @@ export class E2eeFaults {
 				}
 				this.net.relay.forge(frames);
 				this.stats.downgradeRows += frames.length;
+				// Forged after an await: when this was the last step, heal() already ran and saw no forged rows, so the
+				// user (the keeper's releaseForged) must be started here (suite-1 seed 112).
+				if (this.healing) this.startKeeper();
 			})());
 			parts.push(`suite-0 rows x${rows}`);
 		}
