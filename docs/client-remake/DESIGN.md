@@ -1406,7 +1406,7 @@ All are in `src/core/types.ts`.
 |---|---|---|---|
 | live | present | present | 1. If `Rm` and not `pendingLocal`: `diskRename(S.path → R.path, expect hash)` (remote move; plain rename; case-only via temp on case-insensitive FS; folder-casing-only differences tolerated there). 2. Content: neither changed → `syncedPut` if the stat moved; `Rc` only → `reconcileContent` (crdt-only write) / blob `fetchBlob`; `Lc` only → `reconcileContent` (disk-only, frames) / blob `pushBlob` + `nsSetBlob(baseRev = R.blob.rev)`; both → `reconcileContent` (3-way) / blob keep-both (`conflictCopy`, `fetchBlob`, `nsCreate` for the copy). |
 | live | present | absent | Inferred or observed rename to a leftover L entry → `nsRename` (+ content step at the new path). Else if `Rc` (remote edited since sync) → `diskMaterialize(R.path, expect absent)` (edit beats delete). Else → `nsDelete(baseBodySeq = streams.appliedSeq)` (brake: mass-delete-local). |
-| deleted | present | absent | `syncedDrop`. |
+| deleted | present | absent | Observed rename (not hash inference) to a leftover L entry → `nsRestore(path = L.path, againstDeleteSeq = R.deletedSeq)` (the unseen rename wins, as in E6) + `reconcileContent` if L hash ≠ S.contentHash, else `syncedPut` at L.path. Else → `syncedDrop` (kept while ns is not ready). |
 | deleted | present | present, ¬`Lc` | If the doc has own pending body frames and the restore condition holds → `nsRestore`. Else → `diskTrash(S.path, expect hash = S.contentHash)` + `syncedDrop` (brake: mass-delete-remote). |
 | deleted | present | present, `Lc` | Local edit beats remote delete: `nsRestore(path = S.path, againstDeleteSeq = R.deletedSeq)` + `reconcileContent`. |
 | merged → W | present | any | `rebind(S.docId → W)`, then plan as W. |

@@ -308,6 +308,30 @@ test("row deleted/present/absent -> syncedDrop", () => {
 	assert.deepEqual(p.ops, [{ op: "syncedDrop", docId: "d1" }]);
 });
 
+test("row deleted/present/absent, the file renamed here (observed) -> nsRestore at the new path; the source path's new doc is not paired", () => {
+	// Sim DEV5 F seed 157: offline, A edited and renamed n2 -> r6 while a peer deleted the doc and re-created n2.
+	// The doc was dropped and the observed rename then paired with the new n2 doc: A's text merged into its body.
+	const del = R("d1", "a.md", { state: "deleted", deletedSeq: 41 });
+	const recreated = R("d2", "a.md");
+	const gone: SyncedEntry = { ...S("d1", "a.md"), fileGone: true };
+	const renames = [{ from: "a.md", to: "b.md", atMs: 1 }];
+	const edited = run({ remote: [del, recreated], synced: [gone], local: [L("b.md", h("c1"))], over: { renames } });
+	assert.deepEqual(edited.ops.filter((o) => o.op !== "diskMaterialize"), [
+		{ op: "nsRestore", docId: "d1", path: "b.md", againstDeleteSeq: 41 },
+		{ op: "reconcileContent", docId: "d1", path: "b.md", kind: "markdown", hasBase: true },
+	]);
+	assert.deepEqual(find(edited, "diskMaterialize"), { op: "diskMaterialize", docId: "d2", path: "a.md", expect: { t: "absent" } });
+	// unedited: the rename alone still wins over the unseen delete (E6); the synced record follows the file
+	const { fileGone: _g, ...live } = gone;
+	const same = run({ remote: [del], synced: [gone], local: [L("b.md", h("c0"))], over: { renames } });
+	assert.deepEqual(same.ops, [
+		{ op: "nsRestore", docId: "d1", path: "b.md", againstDeleteSeq: 41 },
+		{ op: "syncedPut", entry: { ...live, path: "b.md", pathKey: "b.md" } },
+	]);
+	// before ns is ready (no inference) the record is kept, not dropped
+	assert.deepEqual(planWith(input({ remote: [del], synced: [gone], local: [L("b.md", h("c1"))], over: { renames } }), { nsReady: false }).ops, []);
+});
+
 test("row deleted/present/present unchanged -> diskTrash(expect S hash) + syncedDrop; restore duty -> nsRestore", () => {
 	const sc = { remote: [R("d1", "a.md", { state: "deleted" as const, deletedSeq: 41 })], synced: [S("d1", "a.md")], local: [L("a.md", h("c0"))] };
 	assert.deepEqual(run(sc).ops, [
