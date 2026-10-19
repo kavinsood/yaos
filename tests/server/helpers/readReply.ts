@@ -1,8 +1,10 @@
-// Decodes GET /streams/read replies (relay-wire §7.2) for the server suites.
+// Decodes GET /streams/read replies (relay-wire §7.2) for the server suites, with both the server codec and the
+// conformance suite's standalone one.
 import { strict as assert } from "node:assert";
 
 import { STREAM_READ_BINARY_TYPE, decodeReadReply } from "../../../server/src/streams/protocol";
 import type { StreamReadReplyPage } from "../../../server/src/streams/protocol";
+import { decodeReadReply as decodeReadReplyBySpec } from "../../../e2e/conformance/lib/codec.ts";
 
 export type ReadReply = { vaultEpoch: string; head: number; pages: StreamReadReplyPage[] };
 
@@ -10,7 +12,11 @@ export type ReadReply = { vaultEpoch: string; head: number; pages: StreamReadRep
 export async function readReply(response: Response): Promise<ReadReply> {
 	assert.equal(response.status, 200, "read status");
 	assert.equal(response.headers.get("content-type"), STREAM_READ_BINARY_TYPE);
-	return decodeReadReply(new Uint8Array(await response.arrayBuffer()));
+	const bytes = new Uint8Array(await response.arrayBuffer());
+	const reply = decodeReadReply(bytes);
+	// The server's codec decodes what it encoded; the conformance suite's standalone decoder must read the same reply.
+	assert.deepEqual(decodeReadReplyBySpec(bytes), reply, "the spec decoder reads the reply as the server's codec does");
+	return reply;
 }
 
 /** A single read: its one page, with the reply's vaultEpoch and head. */

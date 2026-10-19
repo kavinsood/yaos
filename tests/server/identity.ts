@@ -16,9 +16,9 @@ import {
 	newDevice,
 	newVaultId,
 	type DeviceSeed,
-	type FakeSocket,
 	type VaultObject,
 } from "./helpers/workerHarness.ts";
+import type { FakeSocket } from "./helpers/fakePorts.ts";
 import { readPage } from "./helpers/readReply.ts";
 
 const s = suite("identity");

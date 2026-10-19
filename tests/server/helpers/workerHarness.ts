@@ -11,87 +11,17 @@ import { randomBase64Url } from "../../../server/src/base64url";
 import { ConfigHost } from "../../../server/src/config/host";
 import type { RestoreAlarmPort, RestorePorts, RestoreVaultPort } from "../../../server/src/config/restore";
 import { sha256Hex } from "../../../server/src/hex";
-import type { SocketPort, SocketRegistryPort, TimerPort, UpgradeRejectPort } from "../../../server/src/ports";
+import type { StoragePort, VaultStoragePort } from "../../../server/src/ports";
 import { encodeAppendFrame } from "../../../server/src/streams/protocol";
 import { DEFAULT_STREAM_RELAY_CONFIG } from "../../../server/src/streams/relay";
 import type { DeviceRecord } from "../../../server/src/vault/devices";
 import { VaultHost } from "../../../server/src/vault/host";
+import type { VaultDO } from "../../../server/src/vault/vault";
 import type { WorkerEnv } from "../../../server/src/router";
 import { CfRowModel } from "./cfRowModel";
 import { FakePitr } from "./fakePitr";
+import { FakeRegistry, ManualTimers, RecordingUpgrades, type FakeSocket } from "./fakePorts";
 import { NodeSqliteStorage } from "./nodeSqliteStorage";
-
-export type Control = Record<string, unknown> & { type: string };
-
-export class FakeSocket implements SocketPort {
-	readonly binary: Uint8Array[] = [];
-	readonly controls: Control[] = [];
-	closed: { code?: number; reason?: string } | null = null;
-	attachment: unknown = null;
-	close(code?: number, reason?: string): void { this.closed ??= { code, reason }; }
-	deserializeAttachment(): unknown { return this.attachment; }
-	serializeAttachment(value: unknown): void { this.attachment = structuredClone(value); }
-	send(message: ArrayBuffer | ArrayBufferView | string): void {
-		if (this.closed) throw new Error("socket closed");
-		if (typeof message === "string") {
-			if (!message.startsWith("__YPS:")) throw new Error("control frames carry the __YPS: prefix");
-			this.controls.push(JSON.parse(message.slice(6)) as Control);
-		} else {
-			const view = message instanceof ArrayBuffer ? new Uint8Array(message)
-				: new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
-			this.binary.push(view.slice());
-		}
-	}
-	last(type: string): Control | undefined { return this.controls.filter((value) => value.type === type).at(-1); }
-}
-
-/** The DO's socket set. Node's Response cannot carry status 101, so the "upgrade" answers 200 and keeps the client. */
-export class FakeRegistry implements SocketRegistryPort {
-	readonly list: FakeSocket[] = [];
-	lastClient: FakeSocket | null = null;
-	sockets(): readonly SocketPort[] { return this.list.filter((socket) => !socket.closed); }
-	createPair() { const server = new FakeSocket(); return { client: server, server }; }
-	accept(socket: SocketPort): void { this.list.push(socket as FakeSocket); }
-	upgradeResponse(client: unknown): Response {
-		this.lastClient = client as FakeSocket;
-		return new Response(null, { status: 200, headers: { "X-Test-Upgrade": "accepted" } });
-	}
-}
-
-/** Records each refused upgrade; answers 200 with a marker header (no 101 on Node). */
-export class RecordingUpgrades implements UpgradeRejectPort {
-	readonly rejected: Array<{ frame: Control; code: number; reason: string }> = [];
-	reject(frame: string, code: number, reason: string): Response {
-		this.rejected.push({ frame: JSON.parse(frame.slice("__YPS:".length)) as Control, code, reason });
-		return new Response(null, { status: 200, headers: { "X-Test-Upgrade": "rejected" } });
-	}
-}
-
-/** Timers that fire only when the test advances them. */
-export class ManualTimers implements TimerPort {
-	now = 1_700_000_000_000;
-	private nextId = 0;
-	private readonly timers = new Map<number, { at: number; callback: () => void }>();
-	set(callback: () => void, ms: number): unknown {
-		const id = ++this.nextId;
-		this.timers.set(id, { at: this.now + ms, callback });
-		return id;
-	}
-	clear(handle: unknown): void { this.timers.delete(handle as number); }
-	/** Moves the clock forward by `ms`, firing every timer that falls due, in time order. */
-	advance(ms: number): void {
-		const until = this.now + ms;
-		for (;;) {
-			let next: [number, { at: number; callback: () => void }] | undefined;
-			for (const entry of this.timers) if (entry[1].at <= until && (!next || entry[1].at < next[1].at)) next = entry;
-			if (!next) break;
-			this.timers.delete(next[0]);
-			this.now = Math.max(this.now, next[1].at);
-			next[1].callback();
-		}
-		this.now = until;
-	}
-}
 
 export interface DeviceSeed {
 	deviceId: string;
@@ -117,7 +47,7 @@ export interface VaultObject {
 	readonly upgrades: RecordingUpgrades;
 	readonly timers: ManualTimers;
 	host: VaultHost;
-	/** A new runtime over the same storage and sockets (hibernation wake or eviction). */
+	/** A new runtime over the same storage and open sockets (hibernation wake or eviction); begun closes complete first. */
 	restart(): VaultHost;
 	/** SQL statements run against this object, in order. */
 	readonly statements: string[];
@@ -161,6 +91,15 @@ export function crash(): Promise<never> {
 	return new Promise<never>(() => {});
 }
 
+/** The vault DO's RPC methods (every public method but the runtime's own entry points). */
+type VaultRpcName = Exclude<keyof VaultDO, "__DURABLE_OBJECT_BRAND" | "fetch" | "alarm" | "webSocketMessage" | "webSocketClose" | "webSocketError">;
+/**
+ * A vault stub as the Worker sees it: `fetch` plus EVERY RPC of VaultDO, each answering a promise. A new RPC on
+ * VaultDO fails to compile here until the stub forwards it.
+ */
+type VaultStub = { fetch(request: Request): Promise<Response> }
+	& { [K in VaultRpcName]: VaultDO[K] extends (...args: infer A) => infer R ? (...args: A) => Promise<Awaited<R>> : never };
+
 /** Every vault DO a test touched, keyed by `idFromName` name, plus a fake `YAOS_VAULT` namespace over them. */
 export class VaultCluster {
 	readonly objects = new Map<string, VaultObject>();
@@ -184,7 +123,7 @@ export class VaultCluster {
 		const storage = NodeSqliteStorage.open(join(this.directory, "config.sqlite"));
 		const model = new CfRowModel(storage);
 		const statements: string[] = [];
-		const port = {
+		const port: StoragePort = {
 			sql: {
 				exec: (query: string, ...bindings: unknown[]) => {
 					statements.push(query);
@@ -240,7 +179,7 @@ export class VaultCluster {
 		const statements: string[] = [];
 		const transactions = { count: 0 };
 		let depth = 0;
-		const port = {
+		const port: VaultStoragePort = {
 			sql: {
 				exec: (query: string, ...bindings: unknown[]) => {
 					statements.push(query);
@@ -271,7 +210,8 @@ export class VaultCluster {
 		const timers = new ManualTimers();
 		// ctx.abort(): every socket of the object drops, and the next request runs a new runtime.
 		const pitr = this.withPitr ? new FakePitr(storage, () => {
-			for (const socket of registry.list) socket.close(1006, "durable object reset");
+			// The runtime drops every socket (the peer sees 1006); no server close() runs.
+			for (const socket of [...registry.list]) registry.drop(socket);
 			model.forgetSchema();
 			object.restart();
 		}) : null;
@@ -279,7 +219,8 @@ export class VaultCluster {
 			clock: { now: () => timers.now }, timers, ...(pitr ? { pitr } : {}) });
 		const object: VaultObject = {
 			name, storage, model, registry, upgrades, timers, statements, transactions, pitr, host: make(),
-			restart() { object.host = make(); return object.host; },
+			// A later runtime: the closes the old one began have completed by then.
+			restart() { registry.completeCloses(); object.host = make(); return object.host; },
 		};
 		this.objects.set(name, object);
 		return object;
@@ -307,7 +248,7 @@ export class VaultCluster {
 	}
 
 	/** One vault stub: `fetch` and every RPC of vault.ts, each on the object's current runtime. */
-	private stub(name: string) {
+	private stub(name: string): VaultStub {
 		const host = () => this.object(name).host;
 		return {
 			fetch: (request: Request) => {

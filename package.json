@@ -8,7 +8,7 @@
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
 		"build:server-release": "node build-server-release.mjs",
-		"typecheck:tests": "tsc -noEmit -p tsconfig.tests.json",
+		"typecheck:tests": "tsc -noEmit -p tsconfig.tests.json && tsc -noEmit -p e2e/conformance/tsconfig.json",
 		"test:server-update-local": "npm run build:server-release && node tests/run-typescript.mjs --test-aliases tests/contracts/server-update-local.ts",
 		"test:regressions": "npm run guard:no-src-js-artifacts && npm run guard:server-crdt-engine && node tests/run-suites.mjs",
 		"test:ci": "npm run test:regressions",

@@ -9,7 +9,7 @@ import { join } from "node:path";
 
 import { NodeSqliteStorage } from "./helpers/nodeSqliteStorage";
 import { DailyLimitLatch } from "../../server/src/dailyLimit";
-import type { SocketPort, SocketRegistryPort, StoragePort, TimerPort } from "../../server/src/ports";
+import type { StoragePort } from "../../server/src/ports";
 import {
 	MAX_STREAM_BINARY_MESSAGE_BYTES,
 	MAX_STREAM_PAYLOAD_BYTES,
@@ -34,6 +34,7 @@ import {
 import { STREAM_SEGMENT_SEAL_BYTES, StreamStore } from "../../server/src/streams/store";
 import { CfRowModel } from "./helpers/cfRowModel.ts";
 import { readPage, readReply } from "./helpers/readReply.ts";
+import { FakeRegistry, ManualTimers, type FakeSocket } from "./helpers/fakePorts.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("streams-relay");
@@ -47,89 +48,13 @@ const ownerA: StreamActor = { vaultId: VAULT_ID, vaultGeneration: GENERATION, pr
 const deviceB: StreamActor = { ...ownerA, deviceId: "device-b" };
 const deviceC: StreamActor = { ...ownerA, deviceId: "device-c" };
 
-type Control = Record<string, unknown> & { type: string };
-
-class FakeSocket implements SocketPort {
-	readonly binary: Uint8Array[] = [];
-	readonly controls: Control[] = [];
-	/** Every message in send order: a binary frame's kind (`skipped`, `committed`, ...) or a control's type. */
-	readonly timeline: string[] = [];
-	closed: { code?: number; reason?: string } | null = null;
-	attachment: unknown = null;
-	close(code?: number, reason?: string): void { this.closed ??= { code, reason }; }
-	deserializeAttachment(): unknown { return this.attachment; }
-	serializeAttachment(value: unknown): void { this.attachment = structuredClone(value); }
-	send(message: ArrayBuffer | ArrayBufferView | string): void {
-		if (this.closed) throw new Error("socket closed");
-		if (typeof message === "string") {
-			assert.ok(message.startsWith("__YPS:"), "control frames carry the __YPS: prefix");
-			this.controls.push(JSON.parse(message.slice(6)) as Control);
-			this.timeline.push(this.controls.at(-1)!.type);
-		} else {
-			const view = message instanceof ArrayBuffer ? new Uint8Array(message)
-				: new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
-			this.binary.push(view.slice());
-			this.timeline.push(decodeServerFrame(view).kind);
-		}
-	}
-	all(type: string): Control[] { return this.controls.filter((value) => value.type === type); }
-	last(type: string): Control | undefined { return this.all(type).at(-1); }
-	frames() { return this.binary.map((bytes) => decodeServerFrame(bytes)); }
-	/** Every seq this socket was told about, per stream, in arrival order (live frames and skipped runs). */
-	seqs(): Record<string, number[]> {
-		const out: Record<string, number[]> = {};
-		for (const frame of this.frames()) {
-			if (frame.kind === "skipped") for (const run of frame.runs) (out[run.stream] ??= []).push(...run.seqs);
-			else if (frame.kind !== "provisional") (out[frame.stream] ??= []).push(frame.seq);
-		}
-		return out;
-	}
-	receipts(): Array<{ stream: string; clientFrameId: string; seq: number; deduped: boolean }> {
-		return this.all("STREAM_RECEIPTS").flatMap((value) => value.receipts as never[]);
-	}
-}
-
-class FakeRegistry implements SocketRegistryPort {
-	readonly list: FakeSocket[] = [];
-	lastClient: FakeSocket | null = null;
-	sockets(): readonly SocketPort[] { return this.list.filter((socket) => !socket.closed); }
-	createPair() { const server = new FakeSocket(); return { client: server, server }; }
-	accept(socket: SocketPort): void { this.list.push(socket as FakeSocket); }
-	upgradeResponse(client: unknown): Response { this.lastClient = client as FakeSocket; return new Response(null, { status: 200 }); }
-}
-
-class VirtualTimers implements TimerPort {
-	now = 1_000_000;
-	private nextId = 0;
-	private readonly timers = new Map<number, { at: number; callback: () => void }>();
-	set(callback: () => void, ms: number): unknown {
-		const id = ++this.nextId;
-		this.timers.set(id, { at: this.now + ms, callback });
-		return id;
-	}
-	clear(handle: unknown): void { this.timers.delete(handle as number); }
-	pending(): number { return this.timers.size; }
-	advance(ms: number): void {
-		const end = this.now + ms;
-		for (;;) {
-			let due: [number, { at: number; callback: () => void }] | null = null;
-			for (const entry of this.timers) if (entry[1].at <= end && (!due || entry[1].at < due[1].at)) due = entry;
-			if (!due) break;
-			this.timers.delete(due[0]);
-			this.now = due[1].at;
-			due[1].callback();
-		}
-		this.now = end;
-	}
-}
-
 const DAILY_LIMIT_MESSAGE = "Exceeded allowed rows written in Durable Objects free tier.";
 
 interface Harness {
 	service: StreamRelayService;
 	store: StreamStore;
 	registry: FakeRegistry;
-	timers: VirtualTimers;
+	timers: ManualTimers;
 	model: CfRowModel;
 	latch: DailyLimitLatch;
 	revoked: Set<string>;
@@ -162,7 +87,7 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 		},
 		transactionSync: (closure) => sqlite.transactionSync(closure),
 	};
-	const timers = new VirtualTimers();
+	const timers = new ManualTimers(1_000_000);
 	const latch = new DailyLimitLatch(() => timers.now);
 	const registry = new FakeRegistry();
 	const revoked = new Set<string>();
@@ -375,7 +300,7 @@ s.test("group commit: leading edge commits an isolated frame after gcLeadMs; a b
 });
 
 s.test("dedupe: pending resend shares the receipt, reconnect resend is deduped from storage, conflicts are rejected", async () => {
-	await withStreams(({ connect, append, subscribe, timers, store, registry }) => {
+	await withStreams(({ connect, append, subscribe, timers, store, registry, service }) => {
 		const a = connect(ownerA);
 		const b = connect(deviceB);
 		subscribe(b, ["b:doc"]);
@@ -393,7 +318,9 @@ s.test("dedupe: pending resend shares the receipt, reconnect resend is deduped f
 		append(a, "ns", "f-2", "ns-payload");
 		timers.advance(300);
 		// Reconnect (receipts lost in flight): resend both.
-		a.close(1006);
+		// The connection drops: the runtime forgets the socket and reports the close.
+		registry.drop(a);
+		service.socketClosed(a);
 		const a2 = connect(ownerA);
 		const before = b.binary.length;
 		append(a2, "b:doc", "f-1", "one");

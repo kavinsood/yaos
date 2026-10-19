@@ -9,7 +9,8 @@ import { MAX_REWINDS_PER_RUN, RESTORE_WINDOW_MS, type RestoreVaultPort } from ".
 import { encodeAppendFrame } from "../../server/src/streams/protocol";
 import { blobKey } from "../../server/src/router";
 import { suite } from "../harness.ts";
-import { appendCommitted, crash, newDevice, type DeviceSeed, type FakeSocket, type VaultObject } from "./helpers/workerHarness.ts";
+import type { FakeSocket } from "./helpers/fakePorts.ts";
+import { appendCommitted, crash, newDevice, type DeviceSeed, type VaultObject } from "./helpers/workerHarness.ts";
 import { claim, deviceFeed, deviceFetch, enrollVia, json, ownerCode, resetRows, withWorld, type World } from "./helpers/operatorWorld.ts";
 import { readPage } from "./helpers/readReply.ts";
 

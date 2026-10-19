@@ -6,7 +6,6 @@ import assert from "node:assert/strict";
 import { Router, type WorkerEnv } from "../../../server/src/router";
 import {
 	FakeBucket,
-	RecordingUpgrades,
 	VaultCluster,
 	bearer,
 	recordingConfigNamespace,
@@ -14,6 +13,7 @@ import {
 	type DeviceSeed,
 	type VaultObject,
 } from "./workerHarness.ts";
+import { RecordingUpgrades } from "./fakePorts.ts";
 
 export const ORIGIN = "https://yaos.test";
 export const RECOVERY_KEY = `recovery-${"k".repeat(40)}`;

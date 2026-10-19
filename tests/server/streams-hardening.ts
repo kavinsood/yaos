@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { NodeSqliteStorage } from "./helpers/nodeSqliteStorage";
 import { CfRowModel } from "./helpers/cfRowModel.ts";
 import { readPage } from "./helpers/readReply.ts";
-import type { SocketPort, SocketRegistryPort, SqlCursor, StoragePort, TimerPort } from "../../server/src/ports";
+import type { SqlCursor, StoragePort } from "../../server/src/ports";
 import { MAX_STREAM_SOCKETS_PER_DEVICE, decodeAppendFrame, encodeAppendFrame, encodeRow } from "../../server/src/streams/protocol";
 import {
 	DEFAULT_STREAM_RELAY_CONFIG,
@@ -21,6 +21,7 @@ import {
 } from "../../server/src/streams/relay";
 import { DedupeBuild, STREAM_DEDUPE_READ_BYTES_PER_ROW, STREAM_DEDUPE_STEP_ROWS, STREAM_DEDUPE_WINDOW_BYTES, StreamDedupeIndex, frameKeyHash } from "../../server/src/streams/dedupe";
 import { StreamStore, type StreamAppendInput } from "../../server/src/streams/store";
+import { FakeRegistry, ManualTimers, type FakeSocket } from "./helpers/fakePorts.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("streams-hardening");
@@ -33,68 +34,6 @@ const ownerA: StreamActor = { vaultId: VAULT_ID, vaultGeneration: GENERATION, pr
 	membershipRevision: 1, deviceId: "device-a", deviceCredentialRevision: 1, role: "owner",
 	policyVersion: 1, capabilityDigest: "digest" };
 const deviceB: StreamActor = { ...ownerA, deviceId: "device-b" };
-
-type Control = Record<string, unknown> & { type: string };
-
-class FakeSocket implements SocketPort {
-	readonly binary: Uint8Array[] = [];
-	readonly controls: Control[] = [];
-	closed: { code?: number; reason?: string } | null = null;
-	attachment: unknown = null;
-	deserializations = 0;
-	close(code?: number, reason?: string): void { this.closed ??= { code, reason }; }
-	deserializeAttachment(): unknown { this.deserializations++; return this.attachment; }
-	serializeAttachment(value: unknown): void { this.attachment = structuredClone(value); }
-	send(message: ArrayBuffer | ArrayBufferView | string): void {
-		if (this.closed) throw new Error("socket closed");
-		if (typeof message === "string") this.controls.push(JSON.parse(message.slice(6)) as Control);
-		else {
-			const view = message instanceof ArrayBuffer ? new Uint8Array(message)
-				: new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
-			this.binary.push(view.slice());
-		}
-	}
-	all(type: string): Control[] { return this.controls.filter((value) => value.type === type); }
-	last(type: string): Control | undefined { return this.all(type).at(-1); }
-	receipts(): Array<{ stream: string; clientFrameId: string; seq: number; deduped: boolean }> {
-		return this.all("STREAM_RECEIPTS").flatMap((value) => value.receipts as never[]);
-	}
-}
-
-class FakeRegistry implements SocketRegistryPort {
-	readonly list: FakeSocket[] = [];
-	lastClient: FakeSocket | null = null;
-	walks = 0;
-	/** Like `ctx.getWebSockets()`, which may still return a socket after `close()`: closed sockets are listed too. */
-	sockets(): readonly SocketPort[] { this.walks++; return this.list; }
-	createPair() { const server = new FakeSocket(); return { client: server, server }; }
-	accept(socket: SocketPort): void { this.list.push(socket as FakeSocket); }
-	upgradeResponse(client: unknown): Response { this.lastClient = client as FakeSocket; return new Response(null, { status: 200 }); }
-}
-
-class VirtualTimers implements TimerPort {
-	now = 1_000_000;
-	private nextId = 0;
-	private readonly timers = new Map<number, { at: number; callback: () => void }>();
-	set(callback: () => void, ms: number): unknown {
-		const id = ++this.nextId;
-		this.timers.set(id, { at: this.now + ms, callback });
-		return id;
-	}
-	clear(handle: unknown): void { this.timers.delete(handle as number); }
-	advance(ms: number): void {
-		const end = this.now + ms;
-		for (;;) {
-			let due: [number, { at: number; callback: () => void }] | null = null;
-			for (const entry of this.timers) if (entry[1].at <= end && (!due || entry[1].at < due[1].at)) due = entry;
-			if (!due) break;
-			this.timers.delete(due[0]);
-			this.now = due[1].at;
-			due[1].callback();
-		}
-		this.now = end;
-	}
-}
 
 /** Rows returned per query text (the rows-read measure of these tests). */
 class ReadCounter {
@@ -129,7 +68,7 @@ interface Harness {
 	store: StreamStore;
 	storage: StoragePort;
 	registry: FakeRegistry;
-	timers: VirtualTimers;
+	timers: ManualTimers;
 	model: CfRowModel;
 	reads: ReadCounter;
 	revoked: Set<string>;
@@ -166,7 +105,7 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>,
 		},
 		transactionSync: (closure) => sqlite.transactionSync(closure),
 	};
-	const timers = new VirtualTimers();
+	const timers = new ManualTimers(1_000_000);
 	const registry = new FakeRegistry();
 	const revoked = new Set<string>();
 	const config = { ...DEFAULT_STREAM_RELAY_CONFIG, ...options.config };
