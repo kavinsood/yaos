@@ -10,7 +10,7 @@ import { NS_STREAM, streamClass, streamDocId, type ClientFrameId, type ContentHa
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
-import type { DiagnosticsEvent, EnginePhase, KeyMissingReason, StatusSnapshot } from "../../protocol/status";
+import { VAULT_UPGRADE_NOTICE, VAULT_UPGRADE_STOPPED, VAULT_UPGRADE_TEXT, type DiagnosticsEvent, type EnginePhase, type KeyMissingReason, type StatusSnapshot, type UpgradeFold } from "../../protocol/status";
 import { BlobTouch, committedBlobHashes } from "../blobs/touch";
 import { TransferLink } from "../blobs/transferLink";
 import { CheckpointState, type CheckpointDeps } from "../body/checkpoints";
@@ -147,6 +147,9 @@ export class EngineCtx {
 	private readonly ring: DiagnosticsEvent[] = [];
 	private statusTimer: TimerHandle | null = null;
 	readonly gate: () => KeyMissingReason | null;
+	/** Folds halted for a newer writer, as last noticed (noteHalts); popups shown, once per fold per engine. */
+	private upgradeHalted = new Set<UpgradeFold>();
+	private readonly upgradePopups = new Set<UpgradeFold>();
 
 	constructor(readonly opts: EngineOptions) {
 		this.ports = opts.ports;
@@ -156,7 +159,7 @@ export class EngineCtx {
 		const c = this;
 		// §14.3: held (reader-dependent) until the keyring is open.
 		const staleCheck = (e: number, seq: Seq | null) => (c.keyring ? c.keyring.staleCheck(e, seq) : "hold" as const);
-		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes, staleCheck };
+		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes, staleCheck, knownRules: this.tuning.knownRules };
 		// The one write gate (writeGate.ts): shut until the keyring is open, then whenever it reports key-missing.
 		const gate = (): KeyMissingReason | null => (c.keyring ? c.keyring.keyMissing() : "no-pin");
 		this.gate = gate;
@@ -223,7 +226,7 @@ export class EngineCtx {
 	}
 
 	notice(code: string): void {
-		const level = ERROR_NOTICES.has(code) ? "error" : INFO_NOTICES.has(code) ? "info" : "warn";
+		const level = ERROR_NOTICES.has(code) || code.startsWith(VAULT_UPGRADE_NOTICE) ? "error" : INFO_NOTICES.has(code) ? "info" : "warn";
 		const i = this.notices.findIndex((n) => n.code === code);
 		if (i >= 0) this.notices.splice(i, 1);
 		this.notices.push({ code, level, atMs: this.now() });
@@ -250,10 +253,49 @@ export class EngineCtx {
 		this.scheduleStatus();
 	}
 
-	/** The phase of a caught-up session: key-missing while the write gate is shut (e2ee-design §9.3). */
+	/**
+	 * The phase of a caught-up session: key-missing while the write gate is shut (e2ee-design §9.3), upgrade-required
+	 * while a fold is halted for a newer writer (§c.10; the session stays up, the other streams keep syncing).
+	 */
 	livePhase(): EnginePhase {
 		if (this.gate() !== null) return "key-missing";
+		if (this.upgradeHalted.size > 0) return "upgrade-required";
 		return this.dailyLimitUntilMono > this.mono() ? "daily-limit" : "live";
+	}
+
+	/**
+	 * A caught-up session's phase follows a change of the gate or the folds; other phases are left alone, and so is
+	 * the server's upgrade-required (no session: the relay refused this client, relayPolicy.ts).
+	 */
+	refreshLivePhase(): void {
+		const p = this.phase;
+		if (p === "live" || p === "daily-limit" || p === "key-missing" || (p === "upgrade-required" && this.session)) this.setPhase(this.livePhase());
+	}
+
+	/**
+	 * After a fold changed: a fold halted for a newer writer (FoldHalt.upgrade) raises its error notice
+	 * (VAULT_UPGRADE_NOTICE + fold) and, once per engine, a popup; a lifted halt clears it. The phase follows.
+	 */
+	noteHalts(): void {
+		const now = new Set<UpgradeFold>();
+		for (const { rt } of this.folds()) {
+			const h = rt.halted;
+			if (!h?.upgrade) continue;
+			const fold = streamClass(rt.stream) as UpgradeFold;
+			now.add(fold);
+			if (this.upgradeHalted.has(fold)) continue;
+			this.diag("upgrade-required", { cls: fold, seq: h.seq, reason: h.reason });
+			this.notice(VAULT_UPGRADE_NOTICE + fold);
+			if (!this.upgradePopups.has(fold)) {
+				this.upgradePopups.add(fold);
+				this.opts.onHostNotice?.("error", VAULT_UPGRADE_NOTICE + fold, `YAOS: ${VAULT_UPGRADE_TEXT} ${VAULT_UPGRADE_STOPPED[fold]}`);
+			}
+		}
+		const changed = now.size !== this.upgradeHalted.size || [...now].some((f) => !this.upgradeHalted.has(f));
+		for (const fold of this.upgradeHalted) if (!now.has(fold)) this.clearNotice(VAULT_UPGRADE_NOTICE + fold);
+		this.upgradeHalted = now;
+		this.refreshLivePhase();
+		if (changed) this.scheduleStatus();
 	}
 
 	/** Host write entry points: refuse up front while the gate is shut (the seal would refuse anyway). */
@@ -400,10 +442,11 @@ export class EngineCtx {
 	 * (quarantineRelease.ts), a refold of all and the outbox mirror; a new fold is added here.
 	 */
 	folds(): readonly Fold[] {
+		const then = (p: Promise<void>) => p.then(() => this.noteHalts());
 		return [
-			{ rt: this.ns, after: (reload) => this.afterNsChange(reload) },
-			{ rt: this.cfg, after: (reload) => this.afterCfgChange(reload) },
-			{ rt: this.snap, after: (reload) => this.afterSnapChange(reload) },
+			{ rt: this.ns, after: (reload) => then(this.afterNsChange(reload)) },
+			{ rt: this.cfg, after: (reload) => then(this.afterCfgChange(reload)) },
+			{ rt: this.snap, after: (reload) => then(this.afterSnapChange(reload)) },
 		];
 	}
 	foldOf(stream: StreamName): Fold | undefined {

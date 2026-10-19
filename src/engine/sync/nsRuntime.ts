@@ -16,10 +16,11 @@
  */
 
 import { CheckpointEncoding } from "../../core/envelope";
+import { FOLD_RULES_VERSION } from "../../core/limits";
 import { decodeNsFoldV1, encodeNsFoldV1 } from "../../core/codec/nsFoldV1";
 import { decodeNsOps } from "../../core/codec/nsOps";
 import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
-import { buildIndex, foldNsFrame, newNsFoldState, nsFoldHalted } from "../../core/ns/fold";
+import { DEFAULT_NS_FOLD_RULES, buildIndex, foldNsFrameWith, newNsFoldState, nsFoldHalted, type NsFoldRules } from "../../core/ns/fold";
 import { overlayPending, type NsOverlay, type PendingNsFrame } from "../../core/ns/overlay";
 import { pathKey } from "../../core/paths/pathKey";
 import {
@@ -51,8 +52,12 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	state: NsFoldState = newNsFoldState();
 	index: NsFoldIndex = buildIndex(this.state);
 
-	constructor(repo: Repo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS) {
+	/** knownRulesVersion: the highest fold rules this reader implements (tests raise it: an upgraded client). */
+	private readonly rules: NsFoldRules;
+
+	constructor(repo: Repo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS, knownRulesVersion = FOLD_RULES_VERSION) {
 		super(repo, self, NS_STREAM, candidateModulus);
+		this.rules = knownRulesVersion === DEFAULT_NS_FOLD_RULES.knownRulesVersion ? DEFAULT_NS_FOLD_RULES : { ...DEFAULT_NS_FOLD_RULES, knownRulesVersion };
 	}
 
 	get coversSeq(): Seq {
@@ -76,7 +81,7 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	}
 
 	protected foldFrame(row: TailRecord, ops: readonly NsOp[]): { events: readonly NsFoldEvent[]; halted: boolean } {
-		const events = foldNsFrame(this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, frameNo: row.frameNo ?? 0, ops });
+		const events = foldNsFrameWith(this.rules, this.state, this.index, { seq: row.seq, deviceId: row.deviceId, clientFrameId: row.clientFrameId, authorNsSeq: row.authorNsSeq, frameNo: row.frameNo ?? 0, ops });
 		return { events, halted: nsFoldHalted(events) };
 	}
 
@@ -112,7 +117,7 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	/** Committed fold + own pending frames (§f.1). */
 	overlay(outbox: OutboxCache): NsOverlay & { readonly pending: readonly PendingNsFrame[] } {
 		const pending = this.pendingFrames(outbox);
-		return { ...overlayPending(this.state, this.index, this.self, pending), pending };
+		return { ...overlayPending(this.state, this.index, this.self, pending, this.rules), pending };
 	}
 
 	/** Docs of the optimistic view; "pending" = not in the committed fold yet. */

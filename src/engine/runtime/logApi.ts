@@ -34,7 +34,7 @@ export interface NsView {
 	readonly coversSeq: Seq;
 	/** ns stream caught up (not stale) and the fold has every applied row. */
 	readonly caughtUp: boolean;
-	/** Committed fold halted (reader-dependent row or rules-version): phase upgrade-required. */
+	/** Committed fold halted (FoldHalt): phase upgrade-required when FoldHalt.upgrade, else it waits for keys. */
 	readonly halted: FoldHalt | null;
 	/** A pending own frame would halt the overlay. */
 	readonly overlayHalted: boolean;

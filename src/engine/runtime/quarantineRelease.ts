@@ -132,6 +132,8 @@ export function regateUnopened(c: EngineCtx): Promise<number> {
 }
 
 async function regateUnopenedOnce(c: EngineCtx): Promise<number> {
+	// The same change may open a checkpoint a read held for a key (catchUp.ts "held").
+	c.sess.releaseHeld();
 	let n = 0;
 	for (const { rt, after } of c.folds()) {
 		const rows = (await c.repo.getTail(rt.stream, rt.coversSeq)).filter((r) => r.flags & LOCAL_FLAG_UNOPENED);

@@ -6,7 +6,7 @@
 import { maxSealedBlobPlaintext } from "../../core/codec/sealedBlob";
 import { MAX_BLOB_UPLOAD_BYTES } from "../../core/limits";
 import type { TrashMode } from "../../ports/vault";
-import type { StatusSnapshot } from "../../protocol/status";
+import { VAULT_UPGRADE_STOPPED, VAULT_UPGRADE_TEXT, vaultUpgradeFolds, type StatusSnapshot } from "../../protocol/status";
 import {
 	MAX_ATTACHMENT_BYTES_LIMIT, MAX_DEVICE_LABEL_CHARS, MAX_EXCLUDE_PATTERN_CHARS, MAX_EXCLUDE_PATTERNS, MAX_KEEP_DAILY, MIB,
 	isTrashMode, sanitizeDeviceLabel,
@@ -257,6 +257,8 @@ export function engineRows(run: EngineRunState, status: StatusSnapshot | null, n
 	const rows: InfoRow[] = [{ name: "Engine", value: runStateLabel(run) }];
 	if (run.phase !== "running" || !status) return rows;
 	rows.push({ name: "Phase", value: phaseLabel(status.phase) });
+	const folds = vaultUpgradeFolds(status);
+	if (status.phase === "upgrade-required" && folds.length > 0) rows.push({ name: "Update required", value: [VAULT_UPGRADE_TEXT, ...folds.map((f) => VAULT_UPGRADE_STOPPED[f])].join(" ") });
 	const relay = status.relay;
 	let connection: string;
 	if (relay.connected) connection = relay.rttMs !== null ? `Connected (${Math.round(relay.rttMs)} ms round trip)` : "Connected";

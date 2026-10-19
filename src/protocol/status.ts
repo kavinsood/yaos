@@ -20,6 +20,30 @@ export type EnginePhase =
 	| "key-missing"
 	| "error";
 
+/**
+ * Notice code of a fold halted because this vault holds rules or a format only a newer YAOS reads (DESIGN §c.10,
+ * §d.6): `upgrade-required:ns`, `upgrade-required:cfg`, `upgrade-required:snap`. Phase `upgrade-required` with one
+ * of these is the vault's demand; without, the server's (`update_required`, §i.6).
+ */
+export const VAULT_UPGRADE_NOTICE = "upgrade-required:";
+export type UpgradeFold = "ns" | "cfg" | "snap";
+
+/** What the user reads for a vault-side upgrade (status bar tooltip, popup). */
+export const VAULT_UPGRADE_TEXT = "This vault was written by a newer YAOS. Update the plugin to keep syncing.";
+/** What stops until the update, per halted fold; the rest keeps syncing. */
+export const VAULT_UPGRADE_STOPPED: Readonly<Record<UpgradeFold, string>> = {
+	ns: "Until then, files created, renamed or deleted on other devices are not applied here.",
+	cfg: "Until then, settings sync is paused.",
+	snap: "Until then, vault snapshots are paused.",
+};
+
+/** The halted folds a status names (VAULT_UPGRADE_NOTICE codes), in ns, cfg, snap order. */
+export function vaultUpgradeFolds(s: Pick<StatusSnapshot, "notices">): UpgradeFold[] {
+	const out: UpgradeFold[] = [];
+	for (const f of ["ns", "cfg", "snap"] as const) if (s.notices.some((n) => n.code === VAULT_UPGRADE_NOTICE + f)) out.push(f);
+	return out;
+}
+
 export interface StatusSnapshot {
 	readonly phase: EnginePhase;
 	readonly deviceClass: DeviceClass;
