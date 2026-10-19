@@ -49,7 +49,7 @@ Never log tokens, pairing codes or recovery keys.
 ```
 
 The client requires `streams === 1`. `attachments` is `true` only when the R2 bucket is bound (§11.3). Other
-fields are legacy (§14).
+fields are not read by the client.
 
 ### 2.2 Claim (fresh server only)
 
@@ -175,6 +175,9 @@ error followed by close 1006:
   with `canWrite: false` the relay would answer appends with `STREAM_APPEND_REJECTED write_forbidden`
   (`server/src/streams/relay.ts:632`).
 - `limits.maxSubscriptions` bounds the socket's subscription set (§5.6).
+- The client requires `maxPayloadBytes`, `maxCheckpointBytes`, `rateBytesPerSec`, `burstBytes`,
+  `feedDefaultLimit`, `readDefaultBytes`, `readBatchMaxStreams` and `maxSubscriptions`, each positive. A
+  `VAULT_READY` missing one fails the connect as `update-required` (no client-side defaults).
 
 ---
 
@@ -258,7 +261,7 @@ Only after the transaction returns does the server send, in this order:
 
 The invariant is: **durable before receipt, and no seq is visible before its commit.**
 
-Measured append→receipt latency is about 300 ms plus the round trip inside a burst (§15), and about 20 ms plus
+Measured append→receipt latency is about 300 ms plus the round trip inside a burst (§14), and about 20 ms plus
 the round trip for an isolated append (leading edge).
 
 ### 5.2 Provisional broadcast (`b:*`, `c:*`)
@@ -421,8 +424,8 @@ Normative. Code: `server/src/streams/relay.ts` (`subscribe`, `wants`, `flush`), 
 
 `GET /vault/:vaultId/streams/read?maxBytes=<B>&r=<after>.<0|1>.<name>&r=...` (same auth). Each `r` entry is a
 stream cursor, the `checkpoint` flag and the stream name (URL-encoded; everything after the second `.` is the
-name). At most `readBatchMaxStreams` entries (`VAULT_READY.limits`, 128); a relay without that limit has no batch
-form.
+name). At most `readBatchMaxStreams` entries (`VAULT_READY.limits`, 128); the limit is required, and a
+request with one entry may use the single-stream read (§7) instead.
 
 `200` with the binary read reply (§7.2): `vaultEpoch`, `head` and one page per served entry.
 
@@ -735,36 +738,7 @@ The smoke stores the operator key in a 0600 file at
 `experiments/logs/client-e2e-context-<host>.json`. Results (no secrets) go to
 `experiments/logs/client-e2e-smoke-<label>-<ts>.json`.
 
-## 14. Legacy server behaviour still present but unused by the new client
-
-The new client must not call any of the following. It all stays in the Worker for now. Removing it is a separate
-change, and some of it is still exercised by the server tests, `tests/live` and the relay2 tools. The old client that
-used it is deleted (see `legacy-parity.md`).
-
-- **Semantic sockets.** `/vault/:id/ws/root`, `/ws/body/:bodyId` and `/ws/semantic/:docId` carry server-side Yjs
-  sync with root/body epochs. They come with tickets of purpose `root`/`body`/`semantic`, close code 4409 (epoch
-  reset), `BODY_CURRENTNESS_QUERY`, the legacy `VAULT_READY` with `documentEpoch`, and the `schemaVersion` /
-  `protocolVersion` socket params.
-- **Server-side CRDT HTTP.** The engine (ywasm) decodes and merges updates for these routes:
-  - body/semantic candidates and lifecycle: `body/:id/candidate`, `body/candidates`, `semantic/:id/candidate`,
-    `semantic/lifecycle`, `semantic/authority/promote|demote`;
-  - reads: `semantic/:id/head|state`, `body/:id`, `head/:id`, `catch-up`;
-  - lifecycle: `lifecycle/create-bulk|batch|publish`, `attachments/publish`;
-  - bootstrap: `bootstrap/start`, `bootstrap/:id/root|catalog|semantic-catalog|...`;
-  - `operations/:id/outcome`.
-  The server also keeps semantic compaction, the legacy vault sequence/journal, `bulkCreate` and snapshots
-  (`snapshots`).
-- **Relay v2 spike** (`YAOS_RELAY_BODIES`): relay body sockets, `body/:id/compaction-lease`,
-  `body/:id/semantic-reset`, `HEAD body/:id`, `debug/relay-table-counts`, `debug/relay-crash`.
-- **Recovery.** The recovery projection and recovery jobs (`RecoveryJob` DO, R2), plus the public recovery routes.
-- **Settings sync.** `settings-sync/*` (`settingsSync`).
-- **Debug/admin.** `debug/recent`, `debug/compact`, `debug/simulate-restart`, `debug/simulate-daily-limit`,
-  `debug/sql-rows`.
-- **Still used.** Identity and governance routes are shared, not legacy. The new client uses `auth/*`,
-  `/enroll`, `/claim` and the operator console. It may use `me`, `members`, `devices`, `invitations`,
-  `device-links`, `principals/*`, `ownership/*` and `governance` unchanged.
-
-## 15. Measured (e2e/relay/smoke.ts, 31/31 checks, 2026-10-05)
+## 14. Measured (e2e/relay/smoke.ts, 31/31 checks, 2026-10-05)
 
 | ms (p50) | local wrangler dev | deployed (`yaos-relay2-scratch-3`, Workers Free profile) |
 |---|---|---|
@@ -793,7 +767,7 @@ receipt 989, peer COMMIT_NOTICE 994, peer COMMITTED 374, ping 64, burst 1150, fe
 
 ---
 
-## 16. TypeScript types
+## 15. TypeScript types
 
 ```ts
 // ---- binary (lib0 varuint / varstring / varbytes) ----

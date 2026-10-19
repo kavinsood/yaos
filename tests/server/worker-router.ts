@@ -115,7 +115,7 @@ s.test("T-LEGACY-404: §5 row 14, /provision and other removed routes → 404, z
 			["DELETE", `${v}/devices/d`, token], ["POST", `${v}/ownership/transfers`, post], ["DELETE", `${v}/governance`, token],
 			["POST", `${v}/leave`, post], ["GET", `${v}/audit`, token], ["POST", `${v}/auth/device`, post],
 			["DELETE", `${v}/auth/device`, token],
-			// Semantic sockets, server CRDT HTTP, relay v2, recovery, debug/admin (relay-wire §14).
+			// Removed legacy routes: semantic sockets, server CRDT HTTP, relay v2, recovery, debug/admin.
 			["GET", `${v}/ws/root`, token], ["GET", `${v}/ws/body/b1`, token], ["GET", `${v}/ws/semantic/s1`, token],
 			["POST", `${v}/body/b1/candidate`, post], ["GET", `${v}/body/b1`, token], ["GET", `${v}/head/b1`, token],
 			["POST", `${v}/lifecycle/create-bulk`, post], ["POST", `${v}/attachments/publish`, post],
