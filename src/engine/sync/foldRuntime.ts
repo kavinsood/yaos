@@ -295,6 +295,11 @@ export abstract class FoldRuntime<Op, E> {
 		return max;
 	}
 
+	/** The own frame was receipted but its row is not folded yet (stale stream, halt). */
+	committedPending(cfid: ClientFrameId): boolean {
+		return this.committedOwn.some((f) => f.clientFrameId === cfid);
+	}
+
 	/** Own frames not in the committed fold, in order: receipted-unfolded first, then the outbox (poisoned excluded). */
 	pendingFrames(outbox: OutboxCache): OwnPendingFrame<Op>[] {
 		const out = [...this.committedOwn];
