@@ -71,13 +71,16 @@ export class FaultyStore implements BlobPort {
 const xor = (b: Uint8Array) => b.map((x) => x ^ 0x5a);
 /** Keyed-looking blob address (64 hex like the relay's blob routes require), not the plain sha256. */
 export const addressOf = (h: ContentHash) => sha256HexRef(new TextEncoder().encode(`addr:${h}`)) as BlobAddress;
-export const sealingCrypto = {
-	suite: 0, keyEpoch: 0,
+export const sealingCrypto: CryptoPort = {
+	suite: 0,
+	sealEpoch: () => 0,
+	keyState: () => ({ held: true, verified: true }),
 	seal: async () => { throw new Error("unused"); }, open: async () => { throw new Error("unused"); },
-	sealBlob: async (i: { plaintext: Uint8Array }) => [xor(i.plaintext)],
-	openBlob: async (i: { sealed: Uint8Array }) => ({ ok: true, plaintext: xor(i.sealed) }),
-	blobAddress: async (h: ContentHash) => addressOf(h),
-} as unknown as CryptoPort;
+	sealBlob: async (i) => [xor(i.plaintext)],
+	openBlob: async (i) => ({ ok: true, plaintext: xor(i.sealed) }),
+	blobAddress: async (h) => addressOf(h),
+	diagHash: async () => { throw new Error("unused"); },
+};
 
 export const DEV_A = "dev-A-0000000000000" as DeviceId;
 export const DEV_B = "dev-B-0000000000000" as DeviceId;

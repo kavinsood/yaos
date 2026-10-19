@@ -1,7 +1,8 @@
 /**
- * StoragePort conformance suite, run against both implementations:
+ * StoragePort conformance suite, run against every implementation:
  *  - createIdbStoragePort over a fresh fake-indexeddb IDBFactory per test;
- *  - MemStoragePort (src/sim/storage.ts).
+ *  - MemStoragePort (src/sim/storage.ts);
+ *  - FakeStorage (src/engine/reconcile/testkit/fakeStorage.ts), the engine unit tests' port.
  * Implementation-specific behaviour lives in idbStorage.test.ts and
  * memStorage.test.ts.
  */
@@ -19,6 +20,7 @@ import {
 } from "../store/schema";
 import { createIdbStoragePort } from "./idbStorage";
 import { MemStoragePort } from "../../sim/storage";
+import { FakeStorage } from "../reconcile/testkit/fakeStorage";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -106,6 +108,8 @@ interface Impl {
 const IMPLS: readonly Impl[] = [
 	{ name: "IdbStoragePort (fake-indexeddb)", make: () => createIdbStoragePort(new IDBFactory(), IDBKeyRange) },
 	{ name: "MemStoragePort", make: () => new MemStoragePort() },
+	// The engine unit tests' storage (reconcile/testkit): held to the same contract so it accepts nothing IDB refuses.
+	{ name: "FakeStorage (testkit)", make: () => new FakeStorage() },
 ];
 
 // ---------------------------------------------------------------------------

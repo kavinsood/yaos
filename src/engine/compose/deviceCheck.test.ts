@@ -6,12 +6,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
-import type { Seq } from "../../core/types";
+import type { Seq, VaultEpoch } from "../../core/types";
 import type { BlobPort, BlobProgress } from "../../ports/blob";
 import type { BlobAddress, SealedBlobParts } from "../../ports/crypto";
 import type { RelaySession } from "../../ports/relay";
 import { DEVICE_CHECK_QUICK_BYTES } from "../../protocol/messages";
 import type { DeviceCheckReport, DeviceEnv } from "../../protocol/status";
+import { DEFAULT_SIM_RELAY_LIMITS } from "../../sim/a-relay-util";
 import { VirtualClock } from "../../sim/clock";
 import { SimDevice } from "../../sim/device";
 import { SimNet } from "../../sim/net";
@@ -53,12 +54,15 @@ class FakeStore implements BlobPort {
 	async deleteIfUploadedBefore(): Promise<never> { throw new Error("unused"); }
 }
 
+/** The device check reads canWrite and calls ping / feed; every other member throws if it is ever reached. */
 function session(o: { ping?: () => Promise<{ headSeq: Seq }> } = {}): RelaySession {
+	const unused = (): never => { throw new Error("unused by the device check"); };
 	return {
-		canWrite: true,
+		vaultEpoch: "e" as VaultEpoch, headSeq: 7 as Seq, canWrite: true, limits: DEFAULT_SIM_RELAY_LIMITS,
 		ping: o.ping ?? (async () => ({ headSeq: 7 as Seq })),
 		feed: async () => ({ entries: [], throughSeq: 7 as Seq, headSeq: 7 as Seq, more: false }),
-	} as unknown as RelaySession;
+		append: unused, bufferedBytes: unused, subscribe: unused, read: unused, readBatch: unused, putCheckpoint: unused, onEvent: unused, close: unused,
+	};
 }
 
 function deps(o: { live?: Partial<DeviceCheckLive> | string; store?: BlobPort | null; over?: Partial<DeviceCheckDeps> } = {}): DeviceCheckDeps {

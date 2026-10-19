@@ -116,7 +116,7 @@ function keysOf(crypto: CryptoPort): ReaderKeys | null {
 }
 
 /** Suite 1: whether the adapter holds the newest stored winner's key, verified against its record (§12.4, §18.4). */
-async function keyed(ports: EnginePorts, o: GateKeys): Promise<boolean> {
+async function keyed(ports: Pick<EnginePorts, "crypto">, o: GateKeys): Promise<boolean> {
 	const kc = keyringCryptoOf(ports.crypto);
 	if (!kc) return false;
 	const kr = await Keyring.open({ mode: "suite1", vaultId: o.vaultId, kc, records: o.keyring.records, persist: o.keyring.persist, diag: o.diag });
@@ -140,7 +140,7 @@ export class PinGate {
 	}
 
 	/** After makePorts: the init keys are in the crypto port. */
-	static async open(crypto: EngineInitConfig["crypto"], ports: EnginePorts, o: GateKeys): Promise<PinGate> {
+	static async open(crypto: EngineInitConfig["crypto"], ports: Pick<EnginePorts, "crypto">, o: GateKeys): Promise<PinGate> {
 		const gate = new PinGate(crypto);
 		if (gate.suite === 1) gate.keyed = await keyed(ports, o);
 		return gate;
@@ -152,19 +152,19 @@ export class PinGate {
 	}
 
 	/** Suite 1 started without the key: decide again after the KeyReader's keyring stored one. true: open now. */
-	async recheck(ports: EnginePorts, o: GateKeys): Promise<boolean> {
+	async recheck(ports: Pick<EnginePorts, "crypto">, o: GateKeys): Promise<boolean> {
 		if (this.suite === 1 && !this.keyed) this.keyed = await keyed(ports, o);
 		return this.open;
 	}
 
 	/** The ports of a VaultRuntime. The only way to get them: throws while the gate is closed. */
-	writerPorts(ports: EnginePorts): EnginePorts {
+	writerPorts<P extends Pick<EnginePorts, "crypto">>(ports: P): P {
 		if (!this.open) throw new WriteRefused("vault runtime");
 		return ports;
 	}
 
 	/** The view a closed device runs on. */
-	readerPorts(ports: EnginePorts): ReaderPorts {
+	readerPorts(ports: Pick<EnginePorts, "relay" | "clock" | "random" | "crypto">): ReaderPorts {
 		return { relay: readOnlyRelay(ports.relay, this.creating), clock: ports.clock, random: ports.random, keys: keysOf(ports.crypto) };
 	}
 }

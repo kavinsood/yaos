@@ -37,17 +37,17 @@ function fakeLink(): { link: HostLink; changes: number[][] } {
 	return { link, changes };
 }
 
-async function suite1Ports(vaultId: string, keys: readonly { readonly e: number; readonly k: Uint8Array }[]): Promise<EnginePorts> {
+async function suite1Ports(vaultId: string, keys: readonly { readonly e: number; readonly k: Uint8Array }[]): Promise<Pick<EnginePorts, "crypto">> {
 	const crypto = await createWebCryptoSuite1({ vaultId, random: new SeededRandom(7), keys: keys.map((x) => ({ e: x.e, k: x.k.slice() })) });
-	return { relay: null, clock: null, random: null, crypto } as unknown as EnginePorts;
+	return { crypto };
 }
 
-async function gateFor(crypto: EngineInitConfig["crypto"], ports: EnginePorts, link = fakeLink().link): Promise<PinGate> {
+async function gateFor(crypto: EngineInitConfig["crypto"], ports: Pick<EnginePorts, "crypto">, link = fakeLink().link): Promise<PinGate> {
 	return PinGate.open(crypto, ports, { vaultId: VAULT, keyring: new HostKeyring(link, crypto) });
 }
 
 test("PinGate: suite 0 open; unpinned closed; suite 1 open only with the newest stored winner's key, verified", async () => {
-	const plainPorts = { relay: null, clock: null, random: null, crypto: createNoopCrypto(simHashPort()) } as unknown as EnginePorts;
+	const plainPorts = { crypto: createNoopCrypto(simHashPort()) };
 	const plain = await gateFor({ suite: 0 }, plainPorts);
 	assert.equal(plain.open, true);
 	assert.equal(plain.creating, false);
@@ -85,7 +85,7 @@ test("PinGate.readerPorts: the session reads but cannot append or put a checkpoi
 	const writer = await connectPeer(net.relay, clock, "dev-W");
 	writer.session.append(frame("ns", "w-1", "entry"));
 	await clock.advance(1_000);
-	const base = { relay: net.port("dev-R" as DeviceId), clock, random: new SeededRandom(1), crypto: createNoopCrypto(simHashPort()) } as unknown as EnginePorts;
+	const base = { relay: net.port("dev-R" as DeviceId), clock, random: new SeededRandom(1), crypto: createNoopCrypto(simHashPort()) };
 	const gate = await gateFor({ suite: null, creating: false }, base);
 	const reader = gate.readerPorts(base);
 	assert.equal(reader.keys, null, "a suite-0 adapter has no key operations");

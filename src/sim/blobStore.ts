@@ -36,7 +36,7 @@
  * `liveness` counts what the two did (run stats); `slowCut` (an idle end of a call no stall caught) must stay 0.
  */
 
-import { BLOB_DELETE_BATCH, BlobTooLargeError, type BlobDeleteResult, type BlobListItem, type BlobListPage, type BlobPort } from "../ports/blob";
+import { BLOB_DELETE_BATCH, BlobTooLargeError, type BlobDeleteResult, type BlobListItem, type BlobListPage, type BlobPort, type BlobProgress } from "../ports/blob";
 import type { BlobAddress, SealedBlobParts } from "../ports/crypto";
 import type { TimerHandle } from "../ports/clock";
 import { concatBytes } from "../core/codec/lib0";
@@ -271,21 +271,25 @@ export class SimBlobStore implements BlobPort {
 		return new Set(addresses.filter((a) => this.objects.has(a)));
 	}
 
-	async put(address: BlobAddress, parts: SealedBlobParts, signal?: AbortSignal): Promise<void> {
+	/** `progress` sees the sealed bytes sent so far once they moved (httpBlob: upload progress events, cumulative). */
+	async put(address: BlobAddress, parts: SealedBlobParts, signal?: AbortSignal, progress?: BlobProgress): Promise<void> {
 		this.enter("put", signal);
 		const bytes = concatBytes(parts);
 		// The edge answers 413 from the Content-Length, before the body moves.
 		if (bytes.byteLength > this.maxBlobBytes) throw new BlobTooLargeError(bytes.byteLength);
 		const moving = this.move("put", CALL_OVERHEAD_BYTES + bytes.byteLength, signal);
 		if (moving) await moving;
+		if (bytes.byteLength > 0) progress?.(bytes.byteLength);
 		this.objects.set(address, { bytes, uploadedAt: this.opts.now() });
 	}
 
-	async get(address: BlobAddress, signal?: AbortSignal): Promise<Uint8Array | null> {
+	/** `progress` sees the body as one chunk (httpBlob: the length of each chunk read). */
+	async get(address: BlobAddress, signal?: AbortSignal, progress?: BlobProgress): Promise<Uint8Array | null> {
 		this.enter("get", signal);
 		const o = this.objects.get(address);
 		const moving = this.move("get", CALL_OVERHEAD_BYTES + (o?.bytes.byteLength ?? 0), signal);
 		if (moving) await moving;
+		if (o && o.bytes.byteLength > 0) progress?.(o.bytes.byteLength);
 		return o?.bytes.slice() ?? null;
 	}
 
