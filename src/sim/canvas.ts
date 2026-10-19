@@ -267,6 +267,12 @@ const TRACKED_EDGE = new Set(["color", "label"]);
 /** Unknown-field keys the actions write (at the top level, on nodes and on edges). */
 export const EXTRA_KEYS = ["styleAttributes", "simMeta", "x-plugin", "tags"] as const;
 export const ROOT_KEYS = ["metadata", "simRoot", "x-version", "viewport"] as const;
+/**
+ * A root key every canvas the sim creates carries, never edited: the canvas's lineage. A root has no id, so this is
+ * what tells one canvas's root from another's; conflict copies and wiped-and-re-onboarded files keep it, a canvas
+ * re-created at the same path gets a new one. Unknown to Obsidian and YAOS like any other root key.
+ */
+export const LINEAGE_KEY = "simCanvas";
 
 export function isTracked(rec: string, field: string): boolean {
 	if (rec === "root") return true;
@@ -285,6 +291,8 @@ export interface FieldWrite {
 	readonly step: number;
 	readonly path: string;
 	readonly atMs: number;
+	/** Root fields: the canvas's lineage (LINEAGE_KEY) when written, null when it has none (an empty canvas's). */
+	readonly lineage?: string | null;
 }
 
 export interface RecordDelete {
@@ -353,6 +361,8 @@ export class CanvasOracle {
 	readonly discarded = new Set<string>();
 	/** Nodes / edges some external program sorted (no order intent holds for them afterwards). */
 	readonly sorted = new Set<string>();
+	/** IDB wipes that dropped the mirrors (device, time): the device's unsent ops are gone, deletes included. */
+	readonly wipes: { readonly dev: string; readonly atMs: number }[] = [];
 	readonly stats: CanvasStats = { actions: 0, skipped: 0, byType: {}, creates: 0, broken: 0, fixes: 0, abandoned: 0, rewrites: 0, linkUpdates: 0, bigNodes: 0 };
 
 	uniq(): number {
@@ -380,6 +390,10 @@ export class CanvasOracle {
 			const k = `${w.rec}|${w.field}`;
 			this.removals.set(k, [...(this.removals.get(k) ?? []), w]);
 		} else this.writes.set(`${w.rec}|${w.field}|${w.value}`, w);
+	}
+
+	wiped(dev: string, atMs: number): void {
+		this.wipes.push({ dev, atMs });
 	}
 
 	deleted(rec: string, d: RecordDelete): void {
@@ -417,10 +431,17 @@ interface PendingFix {
 	readonly path: string;
 	readonly broken: string;
 	readonly full: string;
+	/** The file before the broken write (what the app still shows while it cannot load the file). */
+	readonly before: string;
 	readonly by: Writer;
 	/** Records the intents of the completed save in the oracle. */
 	readonly commit: () => void;
 	timer: ReturnType<VirtualClock["setTimer"]> | null;
+}
+
+export function lineageOf(root: Readonly<Record<string, unknown>>): string | null {
+	const v = root[LINEAGE_KEY];
+	return typeof v === "string" ? v : null;
 }
 
 export function isConflictCopy(path: string): boolean {
@@ -610,9 +631,13 @@ export class CanvasWorld {
 			m.edges.push({ id: this.edgeIdOf(d, step, i), fromNode: from, fromSide: r.pick(SIDES), toNode: to, toSide: r.pick(SIDES) });
 		}
 		if (r.chance(0.3)) m.root[r.pick(ROOT_KEYS)] = { v: `r${this.oracle.uniq()}` };
+		const lineage = `L${this.oracle.uniq()}`;
+		m.root[LINEAGE_KEY] = lineage;
 		for (const n of m.nodes) this.registerNew(`n:${n.id as string}`, n, d, step, path);
 		for (const e of m.edges) this.registerNew(`e:${e.id as string}`, e, d, step, path);
-		for (const k of Object.keys(m.root)) this.oracle.write({ rec: "root", field: k, value: key(m.root[k]!), saw: ABSENT, dev: d.name, step, path, atMs: this.clock.now() });
+		for (const k of Object.keys(m.root)) {
+			if (k !== LINEAGE_KEY) this.oracle.write({ rec: "root", field: k, value: key(m.root[k]!), saw: ABSENT, dev: d.name, step, path, atMs: this.clock.now(), lineage });
+		}
 		d.vault.userWrite(path, obsidianText(m));
 		return `${tag} ${path} ${m.nodes.length} nodes ${m.edges.length} edges`;
 	}
@@ -620,7 +645,7 @@ export class CanvasWorld {
 	private big(d: SimDevice, a: Extract<CanvasAction, { t: "cBig" }>, step: number, tag: string): string {
 		const path = `canvas/big${a.name}.canvas`;
 		const cur = d.vault.textOf(path);
-		const m = cur === null ? { root: {}, nodes: [], edges: [] } : readModel(cur);
+		const m: CanvasModel | null = cur === null ? { root: { [LINEAGE_KEY]: `L${this.oracle.uniq()}` }, nodes: [], edges: [] } : readModel(cur);
 		if (!m) return `skip ${tag}: ${path} unreadable`;
 		if (m.nodes.length > 1_500) return `skip ${tag}: ${path} already big`;
 		const r = new SeededRandom(a.seed);
@@ -654,8 +679,12 @@ export class CanvasWorld {
 		const path = pickOf(canvasFiles(d), a.file);
 		const cur = path ? d.vault.textOf(path) : null;
 		if (!path || cur === null) return `skip ${tag}: no canvas`;
-		// The user deletes what they see: the file and what the engine had integrated (nsDelete's baseBodySeq).
-		const seen = [cur, engineCanvasText(d, path) ?? ""];
+		// The user deletes what they see: the file, what the engine had integrated (nsDelete's baseBodySeq) and, while
+		// a save is half-written, the canvas their app still shows: the one before the broken write, or their own save
+		// (fault-heavy seed 122, hot seed 163: a broken file deleted before its save completed; its records were
+		// never marked deleted).
+		const showing = [...this.fixes.values()].filter((f) => f.dev === a.dev && f.path === path).flatMap((f) => [f.before, f.full]);
+		const seen = [cur, engineCanvasText(d, path) ?? "", ...showing];
 		for (const text of seen) for (const t of tokensIn(text)) this.w.ledger.deleted(t);
 		const atMs = this.clock.now();
 		if (isConflictCopy(path)) {
@@ -684,6 +713,14 @@ export class CanvasWorld {
 				const m = readModel(text);
 				for (const n of m?.nodes ?? []) this.oracle.deleted(`n:${n.id as string}`, { dev: d.name, step, atMs, how: "file", saw: this.fieldsOf(n), doc: docIdOf(d, path) });
 				for (const e of m?.edges ?? []) this.oracle.deleted(`e:${e.id as string}`, { dev: d.name, step, atMs, how: "file", saw: this.fieldsOf(e), doc: docIdOf(d, path) });
+				// The root goes with the file: its values and the ones they replaced (hot seed 97: a canvas deleted and
+				// re-created at its path, the new one merged into the doc; the old root's writes have no holder).
+				for (const k of Object.keys(m?.root ?? {})) {
+					const v = key(m!.root[k]!);
+					this.oracle.discarded.add(`root|${k}|${v}`);
+					const w = this.oracle.writes.get(`root|${k}|${v}`);
+					if (w) for (const a of this.oracle.ancestors(w)) this.oracle.discarded.add(`root|${k}|${a}`);
+				}
 			}
 		}
 		d.vault.userDelete(path);
@@ -764,7 +801,7 @@ export class CanvasWorld {
 		}
 		this.oracle.stats.broken++;
 		this.write(d, path, brokenText, a.by);
-		const fix: PendingFix = { id: ++this.fixIds, dev: a.dev, path, broken: brokenText, full, by: a.by, commit: () => commit.forEach((c) => c()), timer: null };
+		const fix: PendingFix = { id: ++this.fixIds, dev: a.dev, path, broken: brokenText, full, before: cur!, by: a.by, commit: () => commit.forEach((c) => c()), timer: null };
 		this.fixes.set(fix.id, fix);
 		fix.timer = this.clock.setTimer(a.fixMs, () => this.complete(fix), "sim-canvas-fix");
 		return `${tag}(${a.by}) ${path} ${a.kind} (${brokenText.length} of ${full.length} chars), fixed in ${a.fixMs}ms`;
@@ -850,7 +887,7 @@ export class CanvasWorld {
 			const saw = obj[field] === undefined ? ABSENT : key(obj[field]!);
 			if (value === undefined) delete obj[field];
 			else obj[field] = value;
-			o.write({ rec, field, value: value === undefined ? ABSENT : key(value), saw, dev: d.name, step, path, atMs: this.clock.now() });
+			o.write({ rec, field, value: value === undefined ? ABSENT : key(value), saw, dev: d.name, step, path, atMs: this.clock.now(), ...(rec === "root" ? { lineage: lineageOf(m.root) } : {}) });
 		};
 		const node = (pick: number) => pickOf(m.nodes, this.recPick(pick));
 		let what: string;

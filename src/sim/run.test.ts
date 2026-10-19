@@ -5,8 +5,8 @@ import assert from "node:assert/strict";
 import { generatePlan, minimizePlan, runSim, type SimConfig, type SimReport, type Step } from "./run";
 import { BLOB_FAULTS, CANVAS_FAULTS, DEFAULT_FAULTS } from "./faults";
 import type { SimBlobLiveness } from "./blobStore";
-import { checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
-import { CANVAS_HOT_OPS } from "./canvas";
+import { checkCanvas, checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
+import { ABSENT, CANVAS_HOT_OPS, CanvasOracle, type FieldWrite } from "./canvas";
 import { runUserAction, TokenLedger } from "./actors";
 import { SimDevice } from "./device";
 import { SimNet } from "./net";
@@ -195,4 +195,74 @@ test("invariants: tokens must be contiguous; a crash-lost pending conflict copy 
 	assert.deepEqual(checkNothingDestroyed([a, b], ledger).map((v) => v.detail), ["[A.36] was on A:y.md (external) and is gone"]);
 	a.crashLost.push("other [A.36]\n");
 	assert.deepEqual(checkNothingDestroyed([a, b], ledger), []);
+});
+
+const board = (nodes: string, edges = "") => `{"nodes":[${nodes}],"edges":[${edges}]}`;
+const textNode = (id: string, x: number, extra = "") => `{"id":"${id}","type":"text","text":"t","x":${x},"y":0,"width":10,"height":10${extra}}`;
+
+test("invariants: canvases converge canonically (formatting may differ), not semantically", () => {
+	const { a, b } = twoDevices();
+	a.vault.userWrite("c.canvas", board(textNode("n1", 1)));
+	b.vault.userWrite("c.canvas", `\uFEFF{\r\n  "edges": [],\r\n  "nodes": [${textNode("n1", 1)}]\r\n}\r\n`);
+	a.vault.userWrite("e.canvas", "");
+	b.vault.userWrite("e.canvas", board(""));
+	const none = { docs: [], error: null };
+	const v = checkConvergence([a, b], none).map((x) => x.detail);
+	assert.ok(!v.some((d) => / differs/.test(d)), JSON.stringify(v));
+	b.vault.userWrite("c.canvas", board(textNode("n1", 2)));
+	assert.ok(checkConvergence([a, b], none).some((x) => x.detail.startsWith("c.canvas differs")));
+});
+
+test("invariants: canvas validity, lost records, lost field writes and discarded values", async () => {
+	let { a, b } = twoDevices();
+	const o = new CanvasOracle();
+	const w = (rec: string, field: string, value: string, saw: string | null, step: number): FieldWrite =>
+		({ rec, field, value, saw, dev: "A", step, path: "c.canvas", atMs: step });
+	// a garbage file left on disk, and a broken version the engine wrote once
+	a.vault.userWrite("bad.canvas", "{\"nodes\":[{\"id\":");
+	b.vault.userWrite("bad.canvas", "{\"nodes\":[{\"id\":");
+	await b.vault.write("x.canvas" as VaultPath, "{\"nodes\":[1]}", { t: "absent" });
+	b.vault.userDelete("x.canvas");
+	let v = checkCanvas([a, b], o).map((x) => x.detail);
+	assert.ok(v.some((d) => d.startsWith("A: bad.canvas is not a valid canvas")), JSON.stringify(v));
+	assert.ok(v.some((d) => d.startsWith("B: the engine wrote an invalid canvas to x.canvas")), JSON.stringify(v));
+	({ a, b } = twoDevices());
+	// n1 created and moved 1 -> 5; n2 created, never deleted
+	o.created("n:n1", "A", 1, "c.canvas");
+	o.created("n:n2", "A", 2, "c.canvas");
+	o.write(w("n:n1", "x", "1", null, 1));
+	o.write(w("n:n1", "x", "5", "1", 3));
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(textNode("n1", 1)));
+	v = checkCanvas([a, b], o).map((x) => x.detail);
+	assert.ok(v.includes("lost n:n2 (created on A at step 2 in c.canvas)"), JSON.stringify(v));
+	assert.ok(v.some((d) => d.startsWith("lost write n:n1.x=5 on A at step 3")), JSON.stringify(v));
+	// the newer value holds (and n2 deleted): clean
+	o.deleted("n:n2", { dev: "A", step: 4, atMs: 4, how: "record", saw: new Map(), doc: null });
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+	assert.deepEqual(checkCanvas([a, b], o), []);
+	// a removal undone
+	o.write(w("n:n1", "color", "\"1\"", ABSENT, 5));
+	o.write(w("n:n1", "color", ABSENT, "\"1\"", 6));
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(textNode("n1", 5, `,"color":"1"`)));
+	assert.ok(checkCanvas([a, b], o).some((x) => x.detail.startsWith("lost write n:n1.color=(removed)")));
+	// a format no projection writes, by the engine
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+	assert.deepEqual(checkCanvas([a, b], o), []);
+	// root fields belong to the canvas's lineage: a conflict copy keeping the replaced value does not undo a removal
+	const rooted = (extra: string) => `{"simCanvas":"L1"${extra},"nodes":[${textNode("n1", 5)}],"edges":[]}`;
+	o.write({ ...w("root", "viewport", "\"v1\"", ABSENT, 7), lineage: "L1" });
+	o.write({ ...w("root", "viewport", ABSENT, "\"v1\"", 8), lineage: "L1" });
+	for (const d of [a, b]) {
+		d.vault.userWrite("c.canvas", rooted(""));
+		d.vault.userWrite("c (conflict A 2026-01-01 0001).canvas", rooted(`,"viewport":"v1"`));
+	}
+	assert.deepEqual(checkCanvas([a, b], o), []);
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", rooted(`,"viewport":"v1"`));
+	assert.ok(checkCanvas([a, b], o).some((x) => x.detail.startsWith("lost write root.viewport=(removed)")));
+	for (const d of [a, b]) {
+		d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+		d.vault.userDelete("c (conflict A 2026-01-01 0001).canvas");
+	}
+	await a.vault.write("f.canvas" as VaultPath, ` ${board(textNode("n1", 5))}`, { t: "absent" });
+	assert.deepEqual(checkCanvas([a, b], o).map((x) => x.detail.slice(0, 81)), ["A: f.canvas holds bytes neither the projection's formatting nor written by a user"]);
 });

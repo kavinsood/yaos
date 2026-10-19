@@ -20,7 +20,7 @@ import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
 import { generateUserAction, runUserAction, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights } from "./faults";
-import { activity, checkBlobLiveness, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, settingsPrint, type Violation } from "./invariants";
+import { activity, checkBlobLiveness, checkCanvas, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, settingsPrint, type Violation } from "./invariants";
 import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
 import { SIM_SETTINGS, SimDevice } from "./device";
@@ -381,6 +381,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			if (cw.lateJoin && step.i >= cw.lateJoin.atStep && step.i < c.steps && faults.join(cw.lateJoin.dev)) trace.push(`${step.i} join ${devs[cw.lateJoin.dev]?.name}`);
 			const line = "user" in step ? await runUserAction(actorWorld, step.user, step.i) : "canvas" in step ? await canvasWorld.run(step.canvas, step.i) : faults.run(step.fault);
 			if (line.startsWith("skip")) skipped++;
+			else if ("fault" in step && step.fault.t === "idbWipe" && !step.fault.mirrors) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
 			trace.push(`${step.i} ${line}`);
 			faults.afterStep();
 			cfg.observe?.(String(step.i), devs, net);
@@ -435,7 +436,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const oracle = await net.oracle(120_000, c.suite1 ? oracleKeys(devs) : null);
 		if (c.suite1) violations.push(...checkE2eeLeaks(devs, net, ledger).violations, ...(faults.e2ee?.check() ?? []));
 		canvasWorld.finalize();
-		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net));
+		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net), ...checkCanvas(devs, canvasWorld.oracle));
 		violations.push(...(await checkQuiet(clock, devs, net)));
 
 		const snap = [...(devs[0]?.vault.snapshot() ?? new Map<string, string>())].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
