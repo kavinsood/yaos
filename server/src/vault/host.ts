@@ -404,7 +404,7 @@ export class VaultHost {
 			case "GET /streams/feed":
 				return this.relay.feed(url);
 			case "GET /streams/read":
-				return this.relay.read(url, request.headers.get("accept"));
+				return this.relay.read(url);
 			case "PUT /streams/checkpoint":
 				// D7: a revoke during the body read wins; the checkpoint is not written.
 				return await this.relay.putCheckpoint(request, url, () => this.admits(device.deviceId));

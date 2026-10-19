@@ -10,7 +10,7 @@ import { join } from "node:path";
 
 import { NodeSqliteStorage } from "./helpers/nodeSqliteStorage";
 import { CfRowModel } from "./helpers/cfRowModel.ts";
-import { base64ToBytes } from "../../server/src/base64url";
+import { readPage } from "./helpers/readReply.ts";
 import type { SocketPort, SocketRegistryPort, SqlCursor, StoragePort, TimerPort } from "../../server/src/ports";
 import { MAX_STREAM_SOCKETS_PER_DEVICE, decodeAppendFrame, encodeAppendFrame, encodeRow } from "../../server/src/streams/protocol";
 import {
@@ -584,9 +584,10 @@ s.test("H2 CPU fallback: store steps share one unit budget in queue order (read 
 // ---- H3 commit-failure typing ------------------------------------------------------------
 
 s.test("H3 T-COMMIT-DAILY-WB: a daily-limit commit error is typed at the source (no latch): cf_daily_limit, no retryAfterMs", async () => {
-	await withStreams(({ connect, append, timers, fail }) => {
+	await withStreams(({ connect, append, timers, fail, service }) => {
 		const a = connect();
 		const b = connect(deviceB);
+		service.message(b, `__YPS:${JSON.stringify({ type: "STREAM_SUBSCRIBE", streams: ["b:d"] })}`);
 		fail.mode = "daily";
 		append(a, "b:d", "d-1", "x");
 		append(a, "b:d", "d-2", "y");
@@ -681,6 +682,7 @@ s.test("H5 + D7: revokeDevice removes the device's sockets from the cache and de
 		const a1 = connect(ownerA);
 		const a2 = connect(ownerA);
 		const b = connect(deviceB);
+		service.message(b, `__YPS:${JSON.stringify({ type: "STREAM_SUBSCRIBE", streams: ["b:r"] })}`);
 		append(a1, "b:r", "r-1", new Uint8Array(1500).fill(1));
 		append(a1, "b:r", "r-2", new Uint8Array(400).fill(1));
 		assert.equal(b.binary.length, 2, "b holds two PROVISIONALs");
@@ -773,8 +775,7 @@ s.test("H7 T-RETIRED-GC / T-PARTIAL-GC: a checkpoint at lastSeq drops the open s
 			const response = await service.putCheckpoint(new Request(url, { method: "PUT", body }), new URL(url));
 			return { status: response.status, body: await response.json() as Record<string, unknown> };
 		};
-		const read = async (query: string) => await service.read(new URL(`https://do/streams/read?${query}`)).json() as {
-			checkpoint: { coversSeq: number; bytes: string } | null; rows: Array<{ seq: number }>; gcSeq: number; lastSeq: number };
+		const read = async (query: string) => await readPage(service.read(new URL(`https://do/streams/read?${query}`)));
 		const frame = (stream: string, index: number, size: number): StreamAppendInput => ({ stream, deviceId: "device-a",
 			clientFrameId: `${stream}-${index}`, payload: new Uint8Array(size).fill(index) });
 		// T-PARTIAL-GC: sealed [1..2], open [3]; a checkpoint below lastSeq keeps the open segment.
@@ -798,7 +799,7 @@ s.test("H7 T-RETIRED-GC / T-PARTIAL-GC: a checkpoint at lastSeq drops the open s
 		assert.equal(billed["stream_head:stream_head_last_seq"], undefined);
 		const cold = await read("stream=b:r&after=0");
 		assert.equal(cold.checkpoint?.coversSeq, 6);
-		assert.equal(text(base64ToBytes(cold.checkpoint!.bytes)), "final");
+		assert.equal(text(cold.checkpoint!.bytes), "final");
 		assert.deepEqual(cold.rows, [], "the checkpoint only");
 		assert.equal(cold.gcSeq, 6);
 		// The stream lives on: the next append is readable after the checkpoint; a resend of a retired row dedupes.

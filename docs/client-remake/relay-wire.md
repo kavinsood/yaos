@@ -155,7 +155,7 @@ error followed by close 1006:
   "runtimeEpoch": "<uuid of this DO runtime>",
   "head": 42,
   "liveness": { "version": 1, "idleMs": 60000, "timeoutMs": 15000 },
-  "capabilities": { "streams": 1, "subscriptions": 1 },
+  "capabilities": { "streams": 1 },
   "limits": {
     "maxStreamNameBytes": 256, "maxClientFrameIdBytes": 128, "maxPayloadBytes": 1048576,
     "maxBinaryMessageBytes": 1049600, "maxTextMessageBytes": 65536, "maxCheckpointBytes": 4194304,
@@ -174,8 +174,7 @@ error followed by close 1006:
 - `canWrite` is always `true`: there are no roles (DECISIONS H4; `server/src/vault/host.ts:667`). On a socket
   with `canWrite: false` the relay would answer appends with `STREAM_APPEND_REJECTED write_forbidden`
   (`server/src/streams/relay.ts:632`).
-- `capabilities.subscriptions: 1` and `limits.maxSubscriptions` announce per-stream subscriptions (§5.6). A relay
-  without them never filters: do not send `STREAM_SUBSCRIBE` to it, and treat `maxSubscriptions` as 0.
+- `limits.maxSubscriptions` bounds the socket's subscription set (§5.6).
 
 ---
 
@@ -338,19 +337,18 @@ For a socket admitted with `VAULT_READY.head = H`:
 
 Normative. Code: `server/src/streams/relay.ts` (`subscribe`, `wants`, `flush`), `protocol.ts` (`encodeSkipped`).
 
-- **Capability.** `VAULT_READY.capabilities.subscriptions: 1` and `limits.maxSubscriptions: 128`. Both directions
-  are additive: an old client never subscribes and is served exactly as before; a client must not subscribe on a
-  relay without the capability.
+- **Limit.** `VAULT_READY.limits.maxSubscriptions: 128`.
+- **Default.** Every socket starts with the empty set: until it subscribes it is pushed only vault-global streams
+  and its own device's rows; every other `b:`/`c:` row reaches it as a skipped seq.
 - **Set.** `STREAM_SUBSCRIBE {streams}` replaces the socket's whole set (idempotent, safe to resend). It is
   allowed on read-only sockets and charged to the device's rate bucket like any message.
   - `streams` must be an array of valid stream names (§11.1) with at most `maxSubscriptions` distinct entries;
     repeats count once. Otherwise `STREAM_SUBSCRIBE_REJECTED {code: "invalid" | "too_many", max}`, and the
-    previous set (or "all") stays.
+    previous set stays.
   - Names without a `b:`/`c:` prefix are stored and have no effect: those streams are always pushed.
   - It takes effect for frames admitted and commits flushed after the relay handles the message. There is no ack;
     a later `VAULT_PING` answered by `VAULT_PONG` proves it was handled.
 - **wants(socket, row)** is true when any of these holds:
-  - the socket has no set ("all");
   - the stream is not `b:`/`c:`;
   - the set contains the stream;
   - the row's `deviceId` is the socket's own device (the device's other sockets get its rows, so receipts lost
@@ -372,11 +370,12 @@ Normative. Code: `server/src/streams/relay.ts` (`subscribe`, `wants`, `flush`), 
   marks the stream stale: read it (§7) when it needs to be current. Subscribing does not make a stream current:
   rows committed before the relay handled the subscribe were skipped.
 - **Persistence.** The set lives in relay memory and, when the JSON encoding of its names is at most 1024 UTF-8
-  bytes (`SUBSCRIPTION_ATTACHMENT_BYTES`), in the socket attachment as `subs`. A larger set is persisted as
-  `subs: null, subsOverflow: true`. A new runtime that adopts the socket (hibernation wake, eviction) restores the
-  persisted set; an overflowed set falls back to "all". A runtime restart always comes with
+  bytes (`SUBSCRIPTION_ATTACHMENT_BYTES`), in the socket attachment as `subs`. A larger set is not persisted. A
+  new runtime that adopts the socket (hibernation wake, eviction) restores the persisted set; a socket without one
+  (never subscribed, or overflowed) restores as the empty set. A runtime restart always comes with
   `STREAM_RESEND {runtime_restarted}`, and the client resends its set on every `STREAM_RESEND` (cheap, and it
-  covers overflow). Falling back to "all" is always safe: it only moves rows from "pulled later" to "pushed now". There is no `STREAM_SUBSCRIPTION_RESET`.
+  covers overflow). Until then the rows it would have been pushed arrive as skips, which the client reads (§7)
+  like any stale stream. There is no `STREAM_SUBSCRIPTION_RESET`.
 - **Counters** (`diagnostics().counters`): `skippedRows`, `skipFrames`, `subscribes`, `subscribeRejects`.
 
 ---
@@ -404,18 +403,10 @@ Normative. Code: `server/src/streams/relay.ts` (`subscribe`, `wants`, `flush`), 
 
 `GET /vault/:vaultId/streams/read?stream=<name>&after=<S>&maxBytes=<B>[&checkpoint=1]` (Bearer)
 
-```json
-{
-  "vaultEpoch": "...", "head": 57, "stream": "b:x",
-  "lastSeq": 57, "checkpointSeq": 50, "gcSeq": 44,
-  "checkpoint": { "coversSeq": 50, "bytes": "<base64>" },
-  "rows": [ { "seq": 53, "deviceId": "...", "clientFrameId": "...", "payload": "<base64>" } ],
-  "nextAfter": 53
-}
-```
+`200` with the binary read reply (§7.2) holding one page: `vaultEpoch`, `head`, and for the stream `lastSeq`,
+`checkpointSeq`, `gcSeq`, `checkpoint` (`coversSeq` + raw bytes, or none), `rows` and `nextAfter`.
 
-- **Rows.** Returned oldest first, exactly as appended: unmerged, with standard base64 payloads (raw in the binary
-  reply, §7.2).
+- **Rows.** Returned oldest first, exactly as appended: unmerged, with raw payload bytes.
 - **Checkpoint inclusion.** `checkpoint` is included when `checkpointSeq > 0` and either:
   - `after < gcSeq` (the rows were collected, so the checkpoint is mandatory); or
   - `checkpoint=1` and `after < checkpointSeq` (you prefer the checkpoint to replaying rows).
@@ -433,12 +424,9 @@ stream cursor, the `checkpoint` flag and the stream name (URL-encoded; everythin
 name). At most `readBatchMaxStreams` entries (`VAULT_READY.limits`, 128); a relay without that limit has no batch
 form.
 
-```json
-{ "vaultEpoch": "...", "head": 57, "pages": [ { "stream": "b:x", "lastSeq": 57, "checkpointSeq": 0, "gcSeq": 0,
-  "checkpoint": null, "rows": [ ... ], "nextAfter": null }, ... ] }
-```
+`200` with the binary read reply (§7.2): `vaultEpoch`, `head` and one page per served entry.
 
-- **Pages.** One per entry, in request order; each is exactly the single-read body without `vaultEpoch`/`head`.
+- **Pages.** One per entry, in request order; each is exactly the page a single read of that entry returns.
 - **Budget.** `maxBytes` (default 1 MiB, max 4 MiB) is shared by the whole batch. The first entry always gets
   its page, as a single read would. A later page that would overrun what is left ends the batch: `pages` is a
   prefix of the entries, and the client re-requests the rest.
@@ -449,8 +437,8 @@ form.
 
 ### 7.2 Binary read reply
 
-A single or batched read sent with `Accept: application/vnd.yaos.streams-read.v1+binary` is answered `200` with
-that Content-Type and a lib0 binary body instead of JSON:
+Every successful single or batched read is answered `200` with `Content-Type:
+application/vnd.yaos.streams-read.v1+binary` and this lib0 binary body; no `Accept` header is needed:
 
 ```
 u8        1                               format version
@@ -466,15 +454,10 @@ page × pageCount:
   row × rowCount: varuint seq | varstring deviceId | varstring clientFrameId | varbytes payload
 ```
 
-- **Same pages.** Every field, the checkpoint rule, paging and the batch budget are those of §7 and §7.1. Only the
-  encoding differs: payloads and checkpoints are raw bytes. Base64 inside JSON costs 4/3 of them, and parsing the
-  JSON costs more again.
-- **Errors stay JSON.** Any non-`200` reply keeps the JSON error body and Content-Type.
-- **Negotiation.** There is no capability flag. A relay without the format ignores `Accept` and answers JSON. The
-  client always sends the header and picks its parser by the reply's Content-Type, so old and new relays and
-  clients mix freely.
-- **CORS.** `Accept` with this value is a CORS-safelisted request header and Content-Type is a safelisted response
-  header, so the browser preflight is unchanged.
+- **Fields.** The checkpoint rule, paging and the batch budget are those of §7 and §7.1. Payloads and checkpoints
+  are raw bytes.
+- **Errors are JSON.** Any non-`200` reply has a JSON error body and Content-Type.
+- **CORS.** Content-Type is a safelisted response header, so the browser preflight is unchanged.
 
 ## 8. Checkpoint (CAS put + GC)
 
@@ -509,8 +492,8 @@ cannot check this.
 
 1. `GET /api/capabilities`, then `streams === 1`.
 2. Get a ticket, connect, and wait for `VAULT_READY`. Note `vaultEpoch` and `head = H`. Buffer live frames from
-   here on. If `capabilities.subscriptions` is 1, send `STREAM_SUBSCRIBE` with the streams you need live (§5.6),
-   and resend it after every `STREAM_RESEND`.
+   here on. Send `STREAM_SUBSCRIBE` with the streams you need live (§5.6), and resend it after every
+   `STREAM_RESEND`.
 3. If `vaultEpoch` differs from the stored one, drop all cursors.
 4. Feed from the stored vault cursor `C` up to `nextAfter = null`. For every stream you track whose
    `lastSeq > its cursor`, page `read` from that stream's cursor. Always track `ns`.
@@ -552,7 +535,7 @@ cannot check this.
 | Text (control) message | 64 KiB |
 | Checkpoint | 4 MiB, stored in 1 MB rows |
 | Feed page | default 1000, max 5000 streams |
-| Read page | default 1 MiB, max 4 MiB payload (JSON base64 adds about 33%) |
+| Read page | default 1 MiB, max 4 MiB payload (raw bytes in the binary reply) |
 | Batched read | 128 streams per request (`readBatchMaxStreams`), one page budget for the batch |
 | Subscription set | 128 distinct streams per socket (`maxSubscriptions`); persisted across a wake up to 1024 bytes of names (§5.6) |
 | Streams sockets per vault | 1000 (`YAOS_STREAMS_MAX_SOCKETS`) |
@@ -839,7 +822,7 @@ export interface VaultReady {
   type: "VAULT_READY"; documentId: "streams"; socketSessionId: string;
   vaultId: string; vaultGeneration: string; vaultEpoch: string; runtimeEpoch: string; head: number;
   liveness: { version: 1; idleMs: number; timeoutMs: number };
-  capabilities: { streams: 1; subscriptions?: 1 }; limits: StreamLimits; canWrite: boolean;
+  capabilities: { streams: 1 }; limits: StreamLimits; canWrite: boolean;
   principalId: string; deviceId: string; role: "owner" | "member";
   membershipRevision: number; deviceCredentialRevision: number; policyVersion: number; capabilityDigest: string;
 }
@@ -871,13 +854,14 @@ export interface FeedResponse {
   changes: Array<{ stream: string; lastSeq: number }>;
   nextAfter: number | null;
 }
-export interface ReadResponse {
-  vaultEpoch: string; head: number; stream: string;
-  lastSeq: number; checkpointSeq: number; gcSeq: number;
-  checkpoint: { coversSeq: number; bytes: string /* base64 */ } | null;
-  rows: Array<{ seq: number; deviceId: string; clientFrameId: string; payload: string /* base64 */ }>;
+/** A decoded binary read reply (§7.2); a single read has exactly one page. */
+export interface ReadPage {
+  stream: string; lastSeq: number; checkpointSeq: number; gcSeq: number;
+  checkpoint: { coversSeq: number; bytes: Uint8Array } | null;
+  rows: Array<{ seq: number; deviceId: string; clientFrameId: string; payload: Uint8Array }>;
   nextAfter: number | null;
 }
+export interface ReadReply { vaultEpoch: string; head: number; pages: ReadPage[] }
 export type CheckpointResponse =
   | { stream: string; coversSeq: number; gcSeq: number; deletedSegments: number }            // 200
   | { error: "checkpoint_conflict"; current: { coversSeq: number } }                          // 409

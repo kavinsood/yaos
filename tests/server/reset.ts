@@ -19,6 +19,7 @@ import {
 	withWorld,
 	type World,
 } from "./helpers/operatorWorld.ts";
+import { readPage } from "./helpers/readReply.ts";
 
 const s = suite("reset");
 
@@ -108,14 +109,14 @@ s.test("T-RESET (WB): confirmation; ONE transaction of H+S+C+1 rows; devices, co
 		const feed = await deviceFeed(world, vaultId, laptop);
 		assert.equal(feed.status, 200, "the device stays enrolled");
 		assert.deepEqual(await json(feed), { vaultEpoch, head: 0, changes: [], nextAfter: null });
-		const read = await json(await deviceFetch(world, vaultId, laptop, "streams/read?stream=ns&after=0"));
+		const read = await readPage(await deviceFetch(world, vaultId, laptop, "streams/read?stream=ns&after=0"));
 		assert.deepEqual([read.lastSeq, read.checkpoint, read.rows], [0, null, []]);
 		const stale = await deviceFetch(world, vaultId, laptop, `streams/feed?epoch=${epoch}`);
 		assert.deepEqual([stale.status, await json(stale)], [409, { error: "vault_generation_mismatch", vaultEpoch }]);
 
 		appendCommitted(vault, laptop.deviceId, "ns", "frame-1", new Uint8Array([7]));
-		const after = await json(await deviceFetch(world, vaultId, laptop, "streams/read?stream=ns&after=0"));
-		assert.deepEqual((after.rows as Array<{ seq: number }>).map((row) => row.seq), [1], "seqs restart at 1");
+		const after = await readPage(await deviceFetch(world, vaultId, laptop, "streams/read?stream=ns&after=0"));
+		assert.deepEqual(after.rows.map((row) => row.seq), [1], "seqs restart at 1");
 
 		const ticket = await deviceFetch(world, vaultId, laptop, "auth/ticket",
 			{ method: "POST", body: JSON.stringify({ purpose: "streams" }), headers: { "Content-Type": "application/json" } });

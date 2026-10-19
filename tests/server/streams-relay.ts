@@ -8,16 +8,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { NodeSqliteStorage } from "./helpers/nodeSqliteStorage";
-import { base64ToBytes } from "../../server/src/base64url";
 import { DailyLimitLatch } from "../../server/src/dailyLimit";
 import type { SocketPort, SocketRegistryPort, StoragePort, TimerPort } from "../../server/src/ports";
 import {
 	MAX_STREAM_BINARY_MESSAGE_BYTES,
 	MAX_STREAM_PAYLOAD_BYTES,
 	MAX_STREAM_SUBSCRIPTIONS,
-	STREAM_READ_BINARY_TYPE,
 	decodeAppendFrame,
-	decodeReadReply,
 	decodeRows,
 	decodeServerFrame,
 	encodeAppendFrame,
@@ -36,6 +33,7 @@ import {
 } from "../../server/src/streams/relay";
 import { STREAM_SEGMENT_SEAL_BYTES, StreamStore } from "../../server/src/streams/store";
 import { CfRowModel } from "./helpers/cfRowModel.ts";
+import { readPage, readReply } from "./helpers/readReply.ts";
 import { suite } from "../harness.ts";
 
 const s = suite("streams-relay");
@@ -262,15 +260,16 @@ s.test("config: env overrides are clamped; the burst holds one maximum message",
 // ---- live path ------------------------------------------------------------------
 
 s.test("append: VAULT_READY, provisional b:, committed ns, contiguous seqs, receipts only after the commit", async () => {
-	await withStreams(({ connect, append, timers }) => {
+	await withStreams(({ connect, append, subscribe, timers }) => {
 		const a = connect(ownerA);
 		const b = connect(deviceB);
+		subscribe(b, ["b:doc-1"]);
 		const ready = a.last("VAULT_READY")!;
 		assert.equal(ready.documentId, "streams");
 		assert.equal(ready.vaultEpoch, GENERATION);
 		assert.equal(ready.head, 0);
 		assert.equal(ready.canWrite, true);
-		assert.deepEqual(ready.capabilities, { streams: 1, subscriptions: 1 });
+		assert.deepEqual(ready.capabilities, { streams: 1 });
 		assert.equal((ready.limits as Record<string, unknown>).maxSubscriptions, MAX_STREAM_SUBSCRIPTIONS);
 		assert.equal((ready.limits as Record<string, unknown>).maxPayloadBytes, MAX_STREAM_PAYLOAD_BYTES);
 		append(a, "ns", "a-1", "ns-one");
@@ -329,9 +328,10 @@ s.test("group commit: idle re-arms, max age caps a busy stream, 64 KiB flushes a
 });
 
 s.test("group commit: leading edge commits an isolated frame after gcLeadMs; a burst pays one extra commit at most", async () => {
-	await withStreams(({ connect, append, timers, service }) => {
+	await withStreams(({ connect, append, subscribe, timers, service }) => {
 		const a = connect(ownerA);
 		const b = connect(deviceB);
+		subscribe(b, ["b:doc-1"]);
 		append(a, "b:doc-1", "l-1", "one");
 		timers.advance(5);
 		append(a, "ns", "l-2", "ns");
@@ -375,9 +375,10 @@ s.test("group commit: leading edge commits an isolated frame after gcLeadMs; a b
 });
 
 s.test("dedupe: pending resend shares the receipt, reconnect resend is deduped from storage, conflicts are rejected", async () => {
-	await withStreams(({ connect, append, timers, store, registry }) => {
+	await withStreams(({ connect, append, subscribe, timers, store, registry }) => {
 		const a = connect(ownerA);
 		const b = connect(deviceB);
+		subscribe(b, ["b:doc"]);
 		append(a, "b:doc", "f-1", "one");
 		append(a, "b:doc", "f-1", "one");
 		append(a, "b:doc", "f-1", "different");
@@ -422,11 +423,13 @@ s.test("dedupe: pending resend shares the receipt, reconnect resend is deduped f
 });
 
 s.test("late joiner: a socket admitted after the provisional gets COMMITTED, earlier ones a notice", async () => {
-	await withStreams(({ connect, append, timers }) => {
+	await withStreams(({ connect, append, subscribe, timers }) => {
 		const a = connect(ownerA);
 		const b = connect(deviceB);
+		subscribe(b, ["c:canvas"]);
 		append(a, "c:canvas", "late-1", "canvas-update");
 		const c = connect(deviceC);
+		subscribe(c, ["c:canvas"]);
 		timers.advance(300);
 		assert.deepEqual(b.frames().map((frame) => frame.kind), ["provisional", "notice"]);
 		const [only] = c.frames();
@@ -451,6 +454,7 @@ s.test("subscriptions: filtered fanout; unsubscribed b:/c: rows become skip runs
 		const all = connect(deviceC);
 		const some = connect({ ...ownerA, deviceId: "device-d" });
 		subscribe(none, []);
+		subscribe(all, ["b:x", "b:y", "c:z"]);
 		subscribe(some, ["b:x", "ns"]);
 		append(a, "b:x", "f-1", "x1");
 		append(a, "b:y", "f-2", "y1");
@@ -460,7 +464,7 @@ s.test("subscriptions: filtered fanout; unsubscribed b:/c: rows become skip runs
 		append(a, "b:x", "f-6", "x2");
 		assert.deepEqual(none.frames(), [], "no PROVISIONAL for unsubscribed streams");
 		assert.deepEqual(some.frames().map((frame) => frame.kind === "provisional" && frame.clientFrameId), ["f-1", "f-6"]);
-		assert.equal(all.frames().length, 5, "an unsubscribed socket gets every PROVISIONAL");
+		assert.equal(all.frames().length, 5, "a socket subscribed to every stream gets every PROVISIONAL");
 		timers.advance(300);
 		assert.deepEqual(none.frames().map((frame) => frame.kind === "committed" ? ["committed", frame.seq] : frame), [
 			{ kind: "skipped", runs: [{ stream: "b:x", seqs: [1] }, { stream: "b:y", seqs: [2] }] },
@@ -474,7 +478,7 @@ s.test("subscriptions: filtered fanout; unsubscribed b:/c: rows become skip runs
 		assert.equal(a.receipts().length, 6);
 		const { skippedRows, skipFrames, subscribes, subscribeRejects } = service.counters;
 		assert.deepEqual({ skippedRows, skipFrames, subscribes, subscribeRejects },
-			{ skippedRows: 5 + 3, skipFrames: 2 + 2, subscribes: 2, subscribeRejects: 0 });
+			{ skippedRows: 5 + 3, skipFrames: 2 + 2, subscribes: 3, subscribeRejects: 0 });
 		assert.deepEqual(service.diagnostics().counters.skippedRows, 8, "surfaced in diagnostics");
 	});
 });
@@ -529,6 +533,7 @@ s.test("subscriptions: a set change between PROVISIONAL and commit: subscribe �
 		const late = connect(deviceB);
 		const leaving = connect(deviceC);
 		subscribe(late, []);
+		subscribe(leaving, ["b:x"]);
 		append(a, "b:x", "f-1", "one");
 		subscribe(late, ["b:x"]);
 		subscribe(leaving, []);
@@ -546,6 +551,7 @@ s.test("subscriptions: STREAM_PROVISIONAL_DROPPED goes only to PROVISIONAL recip
 		const skipper = connect(deviceB);
 		const holder = connect(deviceC);
 		subscribe(skipper, []);
+		subscribe(holder, ["b:x"]);
 		append(a, "b:x", "f-1", "one");
 		timers.advance(300);
 		append(a, "b:x", "f-1", "conflicting");
@@ -590,7 +596,7 @@ s.test("subscriptions: invalid and too_many are rejected and keep the set; dupli
 	});
 });
 
-s.test("subscriptions: persisted in the attachment and restored by a new runtime; an oversized set overflows to all", async () => {
+s.test("subscriptions: persisted in the attachment and restored by a new runtime; an oversized set restores as empty", async () => {
 	await withStreams((harness) => {
 		const { connect, append, subscribe, timers } = harness;
 		const a = connect(ownerA);
@@ -600,18 +606,21 @@ s.test("subscriptions: persisted in the attachment and restored by a new runtime
 		const names = Array.from({ length: MAX_STREAM_SUBSCRIPTIONS }, (_, index) => `b:${"n".repeat(20)}-${index}`);
 		subscribe(big, names);
 		const smallAttachment = small.attachment as Record<string, unknown>;
-		assert.deepEqual([smallAttachment.subs, smallAttachment.subsOverflow, smallAttachment.deviceId], [["b:x"], undefined, "device-b"]);
-		const bigAttachment = big.attachment as Record<string, unknown>;
-		assert.deepEqual([bigAttachment.subs, bigAttachment.subsOverflow], [null, true]);
+		assert.deepEqual([smallAttachment.subs, smallAttachment.deviceId], [["b:x"], "device-b"]);
+		assert.equal((big.attachment as Record<string, unknown>).subs, undefined, "too big to persist");
 		append(a, "b:y", "f-1", "one");
+		append(a, names[0]!, "f-2", "named");
 		timers.advance(300);
-		assert.equal(big.frames()[0]?.kind, "skipped", "in memory the oversized set still filters");
+		assert.deepEqual(big.frames().map((frame) => frame.kind), ["provisional", "skipped", "notice"],
+			"in memory the oversized set filters");
 		const service = harness.fresh("runtime-b");
-		append(a, "b:y", "f-2", "two");
+		append(a, names[0]!, "f-3", "named again");
+		append(a, "b:x", "f-4", "x");
 		timers.advance(300);
 		assert.equal(small.last("STREAM_RESEND")?.runtimeEpoch, "runtime-b");
-		assert.deepEqual(small.frames().map((frame) => frame.kind), ["skipped", "skipped"], "restored on adopt");
-		assert.deepEqual(big.frames().slice(1).map((frame) => frame.kind), ["provisional", "notice"], "overflow: all after a wake");
+		assert.deepEqual(small.frames().slice(1).map((frame) => frame.kind), ["provisional", "skipped", "notice"], "restored on adopt");
+		assert.deepEqual(big.frames().slice(3), [{ kind: "skipped", runs: [{ stream: names[0], seqs: [3] }, { stream: "b:x", seqs: [4] }] }],
+			"overflow: empty after a wake");
 		assert.deepEqual((small.attachment as Record<string, unknown>).subs, ["b:x"], "the runtime update keeps subs");
 		subscribe(small, []);
 		assert.deepEqual((small.attachment as Record<string, unknown>).subs, []);
@@ -619,18 +628,22 @@ s.test("subscriptions: persisted in the attachment and restored by a new runtime
 	});
 });
 
-s.test("subscriptions: a socket that never subscribes gets every PROVISIONAL, notice and COMMITTED and no skip", async () => {
+s.test("subscriptions: a socket that never subscribes has the empty set: vault-global and own-device rows pushed, the rest skipped", async () => {
 	await withStreams(({ connect, append, timers, service }) => {
 		const a = connect(ownerA);
 		const b = connect(deviceB);
+		const a2 = connect(ownerA);
 		append(a, "b:x", "f-1", "one");
 		append(a, "ns", "f-2", "two");
-		const c = connect(deviceC);
+		append(b, "c:y", "g-1", "mine");
 		append(a, "c:y", "f-3", "three");
 		timers.advance(300);
-		assert.deepEqual(b.timeline.slice(1), ["provisional", "provisional", "notice", "committed", "notice"]);
-		assert.deepEqual(c.timeline.slice(1), ["provisional", "committed", "committed", "notice"]);
-		assert.equal(service.counters.skipFrames, 0);
+		assert.deepEqual(b.frames().map((frame) => frame.kind === "skipped" ? frame : [frame.kind, "seq" in frame ? frame.seq : null]), [
+			{ kind: "skipped", runs: [{ stream: "b:x", seqs: [1] }] }, ["committed", 2],
+			{ kind: "skipped", runs: [{ stream: "c:y", seqs: [4] }] }]);
+		assert.deepEqual(a2.timeline.slice(1), ["provisional", "provisional", "notice", "committed", "skipped", "notice"],
+			"own device's rows pushed; another device's c: row skipped");
+		assert.equal(service.counters.provisionalBroadcasts, 2);
 		assert.equal((b.attachment as Record<string, unknown>).subs, undefined);
 	});
 });
@@ -666,9 +679,7 @@ s.test("read: rows after S oldest first, byte-bounded pages, at least one row, a
 		for (let index = 0; index < 10; index++) append(a, "b:paged", `r-${index}`, new Uint8Array(100).fill(index));
 		append(a, "ns", "other", "x");
 		timers.advance(300);
-		const read = async (query: string) => await service.read(new URL(`https://do/streams/read?${query}`)).json() as {
-			rows: Array<{ seq: number; deviceId: string; clientFrameId: string; payload: string }>; nextAfter: number | null;
-			lastSeq: number; checkpoint: unknown; head: number };
+		const read = async (query: string) => await readPage(service.read(new URL(`https://do/streams/read?${query}`)));
 		let after = 0;
 		const seen: number[] = [];
 		for (let pages = 0; pages < 10; pages++) {
@@ -676,7 +687,7 @@ s.test("read: rows after S oldest first, byte-bounded pages, at least one row, a
 			assert.ok(page.rows.length <= 2);
 			for (const row of page.rows) {
 				seen.push(row.seq);
-				assert.equal(base64ToBytes(row.payload)[0], row.seq - 1);
+				assert.equal(row.payload[0], row.seq - 1);
 				assert.equal(row.deviceId, "device-a");
 			}
 			if (page.nextAfter === null) break;
@@ -716,10 +727,11 @@ s.test("read batch: first pages of many streams in request order under one byte 
 		append(a, "b:n0", "n-0b", new Uint8Array(100).fill(9));
 		append(a, "b:odd.name.with.dots", "dots", "dotted");
 		timers.advance(300);
-		type Page = { stream: string; rows: Array<{ seq: number; payload: string }>; nextAfter: number | null; lastSeq: number; checkpoint: unknown };
 		const batch = async (query: string) => {
 			const response = service.read(new URL(`https://do/streams/read?${query}`));
-			return { status: response.status, body: await response.json() as { head: number; vaultEpoch: string; pages: Page[]; error?: string } };
+			type Body = { head?: number; vaultEpoch?: string; pages: Awaited<ReturnType<typeof readReply>>["pages"]; error?: string };
+			const body: Body = response.status === 200 ? await readReply(response) : { pages: [], ...await response.json() as { error: string } };
+			return { status: response.status, body };
 		};
 		const entries = (list: Array<[number, string]>) => list.map(([after, stream]) => `r=${after}.0.${encodeURIComponent(stream)}`).join("&");
 		const all = await batch(entries([[0, "b:n0"], [0, "b:n1"], [0, "b:odd.name.with.dots"], [0, "missing"], [0, "b:n2"]]));
@@ -728,7 +740,7 @@ s.test("read batch: first pages of many streams in request order under one byte 
 		assert.equal(all.body.vaultEpoch, GENERATION);
 		assert.deepEqual(all.body.pages.map((page) => page.stream), ["b:n0", "b:n1", "b:odd.name.with.dots", "missing", "b:n2"]);
 		assert.deepEqual(all.body.pages[0]!.rows.map((row) => row.seq), [1, 7]);
-		assert.equal(text(base64ToBytes(all.body.pages[2]!.rows[0]!.payload)), "dotted", "names are opaque (dots after the second separator)");
+		assert.equal(text(all.body.pages[2]!.rows[0]!.payload), "dotted", "names are opaque (dots after the second separator)");
 		assert.deepEqual([all.body.pages[3]!.rows, all.body.pages[3]!.lastSeq, all.body.pages[3]!.nextAfter], [[], 0, null]);
 		const after = await batch(entries([[1, "b:n0"], [2, "b:n1"]]));
 		assert.deepEqual(after.body.pages.map((page) => page.rows.map((row) => row.seq)), [[7], []], "per-entry cursors");
@@ -775,11 +787,10 @@ s.test("checkpoint: CAS ok, conflict, not advancing, ahead of stream; GC of seal
 		assert.equal((await put("stream=b:gc&coversSeq=99&expectedCoversSeq=4", bytes("ahead"))).body.error, "checkpoint_ahead_of_stream");
 		assert.equal((await put("stream=missing&coversSeq=1&expectedCoversSeq=0", bytes("x"))).status, 404);
 		assert.equal((await put("stream=b:gc&coversSeq=0&expectedCoversSeq=0", bytes("x"))).status, 400);
-		const read = async (query: string) => await service.read(new URL(`https://do/streams/read?${query}`)).json() as {
-			checkpoint: { coversSeq: number; bytes: string } | null; rows: Array<{ seq: number }>; gcSeq: number; checkpointSeq: number };
+		const read = async (query: string) => await readPage(service.read(new URL(`https://do/streams/read?${query}`)));
 		const cold = await read("stream=b:gc&after=0");
 		assert.equal(cold.checkpoint?.coversSeq, 4);
-		assert.equal(text(base64ToBytes(cold.checkpoint!.bytes)), "checkpoint-at-4");
+		assert.equal(text(cold.checkpoint!.bytes), "checkpoint-at-4");
 		assert.deepEqual(cold.rows.map((row) => row.seq), [5], "rows resume after the checkpoint");
 		const warm = await read("stream=b:gc&after=4");
 		assert.equal(warm.checkpoint, null, "a reader past gcSeq gets rows only");
@@ -798,7 +809,7 @@ s.test("checkpoint: CAS ok, conflict, not advancing, ahead of stream; GC of seal
 	});
 });
 
-s.test("binary read (relay-wire §7.2): Accept gets raw rows and checkpoints, same pages as JSON; errors stay JSON", async () => {
+s.test("binary read (relay-wire §7.2): raw rows and checkpoints in the binary body with no Accept; errors are JSON", async () => {
 	await withStreams(async ({ connect, append, timers, service }) => {
 		const a = connect();
 		append(a, "b:one", "o-1", new Uint8Array([0, 255, 7]));
@@ -808,31 +819,24 @@ s.test("binary read (relay-wire §7.2): Accept gets raw rows and checkpoints, sa
 		const ckpt = "stream=b:two&coversSeq=3&expectedCoversSeq=0";
 		assert.equal((await service.putCheckpoint(new Request(`https://do/streams/checkpoint?${ckpt}`, { method: "PUT", body: bytes("ck") }),
 			new URL(`https://do/streams/checkpoint?${ckpt}`))).status, 200);
-		const binary = async (query: string) => {
-			const response = service.read(new URL(`https://do/streams/read?${query}`), `${STREAM_READ_BINARY_TYPE}, application/json`);
-			assert.equal(response.headers.get("content-type"), STREAM_READ_BINARY_TYPE);
-			return decodeReadReply(new Uint8Array(await response.arrayBuffer()));
-		};
-		const asJson = async (query: string) => await service.read(new URL(`https://do/streams/read?${query}`)).json() as Record<string, unknown>;
-		const single = await binary("stream=b:one&after=0&maxBytes=1");
+		const single = await readReply(service.read(new URL("https://do/streams/read?stream=b:one&after=0&maxBytes=1")));
 		assert.equal(single.pages.length, 1);
 		assert.equal(single.head, 3);
+		assert.equal(single.vaultEpoch, GENERATION);
 		const page = single.pages[0]!;
-		const json = await asJson("stream=b:one&after=0&maxBytes=1");
-		assert.deepEqual([page.stream, page.lastSeq, page.checkpointSeq, page.gcSeq, page.nextAfter],
-			[json.stream, json.lastSeq, json.checkpointSeq, json.gcSeq, json.nextAfter]);
+		assert.deepEqual([page.stream, page.lastSeq, page.checkpointSeq, page.gcSeq, page.nextAfter], ["b:one", 2, 0, 0, 1]);
 		assert.deepEqual(page.rows.map((row) => [row.seq, [...row.payload]]), [[1, [0, 255, 7]]], "raw payload bytes, one row under maxBytes=1");
-		const batch = await binary("r=0.0.b:one&r=0.1.b:two&r=0.0.missing");
+		const batch = await readReply(service.read(new URL("https://do/streams/read?r=0.0.b:one&r=0.1.b:two&r=0.0.missing")));
 		assert.deepEqual(batch.pages.map((p) => p.stream), ["b:one", "b:two", "missing"]);
 		assert.deepEqual(batch.pages[0]!.rows.map((row) => text(row.payload)).slice(1), ["two"]);
 		assert.equal(batch.pages[0]!.nextAfter, null);
 		assert.equal(text(batch.pages[1]!.checkpoint!.bytes), "ck", "checkpoint bytes raw");
 		assert.equal(batch.pages[1]!.checkpoint!.coversSeq, 3);
 		assert.deepEqual(batch.pages[2]!.rows, []);
-		const error = service.read(new URL("https://do/streams/read?after=0"), STREAM_READ_BINARY_TYPE);
+		const error = service.read(new URL("https://do/streams/read?after=0"));
 		assert.equal(error.status, 400);
+		assert.match(error.headers.get("content-type") ?? "", /json/);
 		assert.deepEqual(await error.json(), { error: "invalid_stream" });
-		assert.match(service.read(new URL("https://do/streams/read?stream=b:one"), "application/json").headers.get("content-type") ?? "", /json/);
 	});
 });
 
@@ -858,10 +862,11 @@ s.test("authority: a socket whose device left the map gets authority_superseded 
 });
 
 s.test("D7 revokeDevice: one synchronous call drops the device's buffered frames, tells PROVISIONAL holders, closes 4403, never flushes", async () => {
-	await withStreams(({ connect, append, revoked, service, store, timers }) => {
+	await withStreams(({ connect, append, subscribe, revoked, service, store, timers }) => {
 		const a = connect(ownerA);
 		const a2 = connect(ownerA);
 		const b = connect(deviceB);
+		subscribe(b, ["b:doc"]);
 		append(a, "b:doc", "a-prov", "x");
 		append(a2, "ns", "a-ns", "y");
 		append(b, "ns", "b-ns", "z");
@@ -919,9 +924,10 @@ s.test("admission: rate overdraft sends VAULT_BACKPRESSURE and closes 1013; over
 });
 
 s.test("daily limit: a failed commit answers cf_daily_limit (cause durability_failed), drops provisionals, then rejects at once", async () => {
-	await withStreams(({ connect, append, timers, failWrites, latch, store }) => {
+	await withStreams(({ connect, append, subscribe, timers, failWrites, latch, store }) => {
 		const a = connect(ownerA);
 		const b = connect(deviceB);
+		subscribe(b, ["b:doc"]);
 		append(a, "b:doc", "d-1", "x");
 		append(a, "ns", "d-2", "y");
 		failWrites.on = true;

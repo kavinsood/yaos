@@ -42,8 +42,8 @@ export const MAX_STREAM_SOCKETS_PER_DEVICE = 4;
 export const MAX_STREAM_SUBSCRIPTIONS = 128;
 /**
  * A subscription set is persisted in the socket attachment (it survives a hibernation wake) only while its JSON
- * encoding is at most this many UTF-8 bytes; a larger set is kept in memory and persisted as overflow ("all" after a
- * wake, until the client resends). The attachment itself is capped at 2,048 bytes and carries about 450 already.
+ * encoding is at most this many UTF-8 bytes; a larger set is kept in memory only and restores as empty after a wake
+ * (until the client resends). The attachment itself is capped at 2,048 bytes and carries about 450 already.
  */
 export const SUBSCRIPTION_ATTACHMENT_BYTES = 1024;
 
@@ -279,10 +279,7 @@ export function decodeServerFrame(bytes: Uint8Array): ServerStreamFrame {
 
 // ---- binary catch-up reads (relay-wire §7.2) -----------------------------------
 
-/**
- * The read reply a client asks for with `Accept: STREAM_READ_BINARY_TYPE` (relay-wire §7.2). A relay without it
- * ignores the header and answers JSON, so the client picks its parser by the reply's Content-Type.
- */
+/** Content-Type of every read reply (relay-wire §7.2). */
 export const STREAM_READ_BINARY_TYPE = "application/vnd.yaos.streams-read.v1+binary";
 /** Byte 0 of a binary read reply. */
 export const STREAM_READ_BINARY_VERSION = 1;
@@ -301,7 +298,7 @@ export interface StreamReadReplyPage {
  * A single or batched read reply: `u8 1 | varstring vaultEpoch | varuint head | varuint pageCount`, then per page
  * `varstring stream | varuint lastSeq | varuint checkpointSeq | varuint gcSeq | varuint nextAfter+1 (0: none) |
  * u8 hasCheckpoint [varuint coversSeq | varbytes checkpoint] | varuint rowCount | row×rowCount` (rows as encodeRow).
- * Payloads and checkpoints travel as raw bytes (the JSON reply carries them as base64).
+ * Payloads and checkpoints travel as raw bytes.
  */
 export function encodeReadReply(vaultEpoch: string, head: number, pages: readonly StreamReadReplyPage[]): Uint8Array {
 	const encoder = encoding.createEncoder();

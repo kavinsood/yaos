@@ -2,8 +2,9 @@
 import type { TestDef } from "../lib/results.ts";
 import { vault } from "../lib/fixture.ts";
 import { brief, http } from "../lib/http.ts";
+import { readPage } from "../lib/streams.ts";
 import { StreamSocket } from "../lib/socket.ts";
-import { b64, bytesEqual, id, payloadOf, round } from "../lib/util.ts";
+import { bytesEqual, id, payloadOf, round } from "../lib/util.ts";
 
 export const tests: TestDef[] = [{
 	id: "T-HAPPY", group: "baseline", area: "baseline", expectedBefore: "PASS", timeoutMs: 120000,
@@ -22,6 +23,7 @@ export const tests: TestDef[] = [{
 		const nsPayload = payloadOf("ns-1", 300);
 		const bPayload = payloadOf("b-1", 2000);
 		sent.set("a-b-1", bPayload);
+		await b.subscribe([doc]);
 		let fromA = a.mark();
 		const fromB = b.mark();
 		const t0 = a.append("ns", "a-ns-1", nsPayload);
@@ -85,7 +87,7 @@ export const tests: TestDef[] = [{
 		let after = 0;
 		let pages = 0;
 		for (; pages < 50; ) {
-			const page = await http(ctx, "GET", `${v.path}/streams/read?stream=${encodeURIComponent(doc)}&after=${after}&maxBytes=20000`,
+			const page = await readPage(ctx, `${v.path}/streams/read?stream=${encodeURIComponent(doc)}&after=${after}&maxBytes=20000`,
 				{ token: B.token });
 			pages++;
 			if (page.status !== 200) { t.check("read page 200", false, brief(page)); break; }
@@ -95,7 +97,7 @@ export const tests: TestDef[] = [{
 		}
 		const expectedIds = ["a-b-1", ...bulkIds];
 		t.check("read paging returns every row once, ascending, unmerged", rows.length === expectedIds.length
-			&& rows.every((row, index) => row.clientFrameId === expectedIds[index] && bytesEqual(b64(row.payload), sent.get(row.clientFrameId)!)
+			&& rows.every((row, index) => row.clientFrameId === expectedIds[index] && bytesEqual(row.payload, sent.get(row.clientFrameId)!)
 				&& (index === 0 || row.seq > rows[index - 1].seq) && row.deviceId === A.deviceId),
 		{ rows: rows.length, expected: expectedIds.length });
 		t.check("read paginated by maxBytes (>= 4 pages)", pages >= 4, pages);
@@ -117,8 +119,8 @@ export const tests: TestDef[] = [{
 			&& ahead.value?.lastSeq === lastSeq, brief(ahead, { lastSeq: ahead.value?.lastSeq }));
 		const missing = await http(ctx, "PUT", q(`b:none-${id(6)}`, 1, 0), { token: A.token, body: ckpt });
 		t.check("404 stream_not_found", missing.status === 404 && missing.value?.error === "stream_not_found", brief(missing));
-		const withCkpt = await http(ctx, "GET", `${v.path}/streams/read?stream=${encodeURIComponent(doc)}&after=0&checkpoint=1`, { token: B.token });
+		const withCkpt = await readPage(ctx, `${v.path}/streams/read?stream=${encodeURIComponent(doc)}&after=0&checkpoint=1`, { token: B.token });
 		t.check("read checkpoint=1 returns the checkpoint bytes", withCkpt.value?.checkpoint?.coversSeq === lastSeq
-			&& bytesEqual(b64(withCkpt.value.checkpoint.bytes), ckpt), brief(withCkpt, { coversSeq: withCkpt.value?.checkpoint?.coversSeq }));
+			&& bytesEqual(withCkpt.value.checkpoint.bytes, ckpt), brief(withCkpt, { coversSeq: withCkpt.value?.checkpoint?.coversSeq }));
 	},
 }];

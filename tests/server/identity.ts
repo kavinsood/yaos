@@ -19,6 +19,7 @@ import {
 	type FakeSocket,
 	type VaultObject,
 } from "./helpers/workerHarness.ts";
+import { readPage } from "./helpers/readReply.ts";
 
 const s = suite("identity");
 
@@ -427,6 +428,7 @@ s.test("T-REVOKE-GATE/-BUFFER/-SILENCE/-4403/-401: revoke is one synchronous tur
 		const ownerSocket = await connect(object, owner);
 		const victimSockets = [await connect(object, victim), await connect(object, victim)];
 		const victimTicket = await ticketOf(object, victim);
+		object.host.webSocketMessage(ownerSocket, `__YPS:${JSON.stringify({ type: "STREAM_SUBSCRIBE", streams: ["b:doc"] })}`);
 		object.host.webSocketMessage(victimSockets[0]!, appendBytes("b:doc", "victim-provisional"));
 		object.host.webSocketMessage(victimSockets[1]!, appendBytes("ns", "victim-ns"));
 		object.host.webSocketMessage(ownerSocket, appendBytes("ns", "owner-ns"));
@@ -468,9 +470,9 @@ s.test("T-REVOKE-GATE/-BUFFER/-SILENCE/-4403/-401: revoke is one synchronous tur
 		for (const socket of victimSockets) assert.deepEqual(receipts(socket), [], "BUFFER: no receipt for a dropped frame");
 		assert.deepEqual(serverFrames(ownerSocket).map((frame) => frame.kind), ["provisional"],
 			"SILENCE: the owner never sees a COMMITTED of the victim's frames");
-		const rows = await json(await object.host.fetch(new Request(`${INTERNAL}/streams/read?stream=ns&after=0`,
+		const rows = await readPage(await object.host.fetch(new Request(`${INTERNAL}/streams/read?stream=ns&after=0`,
 			{ headers: bearer(owner) })));
-		assert.deepEqual((rows.rows as Array<{ deviceId: string }>).map((row) => row.deviceId), [owner.deviceId]);
+		assert.deepEqual(rows.rows.map((row) => row.deviceId), [owner.deviceId]);
 
 		// -401 on every device route; the unexpired ticket no longer opens a socket.
 		const routes: Array<[string, string, string?]> = [["GET", "streams/feed"], ["GET", "streams/read?stream=ns"],

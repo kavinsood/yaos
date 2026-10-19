@@ -114,6 +114,25 @@ export class StreamSocket {
 	control(value: unknown): number { this.ws.send(`__YPS:${JSON.stringify(value)}`); return now(); }
 	get isOpen() { return this.ws.readyState === WebSocket.OPEN; }
 
+	/**
+	 * STREAM_SUBSCRIBE (relay-wire §5.6), then a ping: the relay handles a socket's messages in order, so the set is
+	 * in effect once the PONG arrives (SUBSCRIBE itself has no ack). A socket that never subscribes is pushed only
+	 * vault-global streams and its own device's rows. Returns the mark after the PONG.
+	 */
+	async subscribe(streams: unknown): Promise<number> {
+		this.control({ type: "STREAM_SUBSCRIBE", streams });
+		return await this.processed();
+	}
+
+	/** Pings and waits for the PONG: every message sent before it has been handled. Returns the mark after it. */
+	async processed(): Promise<number> {
+		const probeId = `probe-${Math.random().toString(36).slice(2, 10)}`;
+		const from = this.mark();
+		this.control({ type: "VAULT_PING", probeId });
+		await this.waitFor((e) => e.control?.type === "VAULT_PONG" && e.control.probeId === probeId ? true : undefined, 10000, "PONG", from);
+		return this.mark();
+	}
+
 	async waitFor<T>(match: (event: SocketEvent) => T | undefined, timeoutMs: number, what: string, from = 0): Promise<{ value: T; at: number }> {
 		const deadline = now() + timeoutMs;
 		let index = from;

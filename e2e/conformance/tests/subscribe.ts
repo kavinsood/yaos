@@ -1,4 +1,4 @@
-/** Per-stream subscriptions (relay-wire §5.6): capability, filtered fanout, STREAM_SKIPPED ordering, rejects. */
+/** Per-stream subscriptions (relay-wire §5.6): the limit, filtered fanout, STREAM_SKIPPED ordering, rejects. */
 import type { Ctx } from "../lib/context.ts";
 import type { TestDef } from "../lib/results.ts";
 import { device, vault } from "../lib/fixture.ts";
@@ -7,26 +7,11 @@ import { id, payloadOf } from "../lib/util.ts";
 
 const MAX_SUBSCRIPTIONS = 128;
 
-/** The run's own vault for these tests: three devices, so a filtered reader and an unfiltered one are both peers. */
+/** The run's own vault for these tests: three devices, so a subscribed reader and a never-subscribed one are both peers. */
 const subsVault = (ctx: Ctx) => vault(ctx, "subs", ["A", "B", "C"]);
 
-/**
- * Sends STREAM_SUBSCRIBE and waits for the PONG of a ping sent after it: the relay handles a socket's messages in
- * order, so the set is in effect once the PONG arrives (SUBSCRIBE itself has no ack). Returns the PONG's index.
- */
-async function subscribe(socket: StreamSocket, streams: unknown): Promise<number> {
-	socket.control({ type: "STREAM_SUBSCRIBE", streams });
-	return await processed(socket);
-}
-
-/** Pings and waits for the PONG: every message sent on `socket` before it has been handled. Returns the mark after it. */
-async function processed(socket: StreamSocket): Promise<number> {
-	const probeId = `subs-${id(6)}`;
-	const from = socket.mark();
-	socket.control({ type: "VAULT_PING", probeId });
-	await socket.waitFor((e) => e.control?.type === "VAULT_PONG" && e.control.probeId === probeId ? true : undefined, 10000, "PONG", from);
-	return socket.mark();
-}
+const subscribe = (socket: StreamSocket, streams: unknown) => socket.subscribe(streams);
+const processed = (socket: StreamSocket) => socket.processed();
 
 /** Every seq the socket was told about after `from`, per stream, in arrival order (skips, COMMITTED and notices). */
 function seqsOf(socket: StreamSocket, from: number): Record<string, number[]> {
@@ -58,8 +43,7 @@ export const tests: TestDef[] = [
 		async run(ctx, t) {
 			const v = await subsVault(ctx);
 			const socket = await StreamSocket.connect(ctx, v.vaultId, device(v, "A"), "ready");
-			t.expect("capabilities.subscriptions == 1, limits.maxSubscriptions == 128");
-			t.check("capabilities.subscriptions == 1", socket.ready.capabilities?.subscriptions === 1, socket.ready.capabilities);
+			t.expect("limits.maxSubscriptions == 128");
 			t.check("limits.maxSubscriptions == 128", socket.ready.limits?.maxSubscriptions === MAX_SUBSCRIPTIONS,
 				{ maxSubscriptions: socket.ready.limits?.maxSubscriptions ?? null });
 			socket.close();
@@ -72,7 +56,7 @@ export const tests: TestDef[] = [
 			const writer = await StreamSocket.connect(ctx, v.vaultId, device(v, "A"), "A");
 			const own = await StreamSocket.connect(ctx, v.vaultId, device(v, "A"), "A-other");
 			const reader = await StreamSocket.connect(ctx, v.vaultId, device(v, "B"), "B");
-			const all = await StreamSocket.connect(ctx, v.vaultId, device(v, "C"), "C");
+			const never = await StreamSocket.connect(ctx, v.vaultId, device(v, "C"), "C");
 			const tag = id(6);
 			const wanted = `b:subs-in-${tag}`;
 			const unwanted = `b:subs-out-${tag}`;
@@ -80,7 +64,7 @@ export const tests: TestDef[] = [
 			const global = `t:subs-${tag}`;
 			const fromReader = await subscribe(reader, [wanted]);
 			const fromOwn = await subscribe(own, []);
-			const fromAll = all.mark();
+			const fromNever = never.mark();
 			const items = [
 				{ stream: unwanted, id: `f1-${tag}`, payload: payloadOf("subs-1", 300) },
 				{ stream: wanted, id: `f2-${tag}`, payload: payloadOf("subs-2", 300) },
@@ -92,7 +76,7 @@ export const tests: TestDef[] = [
 			const seqs: Record<string, number[]> = {};
 			for (const item of items) (seqs[item.stream] ??= []).push(receipts.get(item.id)!.seq);
 			const last = items.at(-1)!;
-			for (const socket of [reader, own, all]) await waitSeq(socket, last.stream, receipts.get(last.id)!.seq, 0);
+			for (const socket of [reader, own, never]) await waitSeq(socket, last.stream, receipts.get(last.id)!.seq, 0);
 			t.expect("reader: PROVISIONAL+NOTICE for its stream, COMMITTED for t:, the rest as STREAM_SKIPPED; every seq once, ascending");
 			const readerFrames = reader.frames(fromReader);
 			const provisionals = readerFrames.filter((f) => f.kind === "provisional").map((f) => f.stream);
@@ -108,11 +92,12 @@ export const tests: TestDef[] = [
 			t.check("own device's other socket (subscribed to nothing) gets its rows, not skips",
 				own.frames(fromOwn).every((f) => f.kind !== "skipped") && same(seqsOf(own, fromOwn), seqs),
 				{ timeline: own.timeline(fromOwn) });
-			const allFrames = all.frames(fromAll);
-			t.check("a socket that never subscribed gets every row with no skip (unchanged)",
-				allFrames.every((f) => f.kind !== "skipped") && allFrames.filter((f) => f.kind === "provisional").length === 4
-					&& same(seqsOf(all, fromAll), seqs), { timeline: all.timeline(fromAll) });
-			for (const socket of [writer, own, reader, all]) socket.close();
+			const neverFrames = never.frames(fromNever);
+			t.check("a socket that never subscribed has the empty set: COMMITTED for t:, every b:/c: row skipped, no PROVISIONAL",
+				neverFrames.every((f) => f.kind === "skipped" || (f.kind === "committed" && f.stream === global))
+					&& neverFrames.some((f) => f.kind === "committed") && same(seqsOf(never, fromNever), seqs),
+				{ timeline: never.timeline(fromNever) });
+			for (const socket of [writer, own, reader, never]) socket.close();
 		},
 	},
 	{
