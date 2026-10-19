@@ -102,6 +102,13 @@ test("sim: a canvas edit next to a conflicting record is merged, not left to the
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Hot canvas seed 208 with suite 1: B, offline after an IDB loss, saw c0 renamed to its own path; the path counted as
+// left by a rename, no pass merged c0 until ns was ready, and an edge delete never reached the CRDT.
+test("sim: a rename onto the same path does not hold a canvas's edits back (hot canvas, suite-1 seed 208)", async () => {
+	const r = await runSim({ seed: 208, devices: 2, faults: CANVAS_FAULTS, faultRate: 0.2, steps: 80, canvas: { rate: 3, ops: CANVAS_HOT_OPS, pool: 2, hot: true }, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */

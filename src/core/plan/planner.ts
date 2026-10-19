@@ -354,8 +354,9 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		const rest = freshLocal.filter((l) => !used.has(l.pathKey));
 		if (gone.length > 0) for (const rn of inferRenames(gone, rest, input.renames, false, pk)) inferred.set(rn.docId, rn);
 	}
-	// Observed renames off a re-occupied source path (header): observed-only inference over the rest.
-	const renamedFrom = new Set(input.renames.map((e) => pk(e.from)));
+	// Observed renames off a re-occupied source path (header): observed-only inference over the rest. A rename onto
+	// the same path key (case only) leaves nothing behind: the file there is the renamed file (hot canvas seed 208).
+	const renamedFrom = new Set(input.renames.filter((e) => pk(e.from) !== pk(e.to)).map((e) => pk(e.from)));
 	const movedAway = new Set<DocId>();
 	if (ctx.nsReady && renamedFrom.size > 0) {
 		const reoccupied: SyncedEntry[] = [];

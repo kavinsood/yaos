@@ -194,6 +194,19 @@ test("observed rename wins over a new file at the source path; the new file is c
 	assert.equal(find(next, "nsCreate").path, "a.md");
 });
 
+test("a rename onto the same path key (case only, or the same path) does not hold the doc's edits while ns is not ready", () => {
+	// Hot canvas seed 208 (suite 1): B, offline after an IDB loss, saw canvas/c0.canvas renamed to itself. The path
+	// counted as "left by a rename" (the file there may be new), so no pass merged the doc until ns was ready, and a
+	// record delete made meanwhile never reached the CRDT. The file at a same-key target is the renamed file itself.
+	const sc = { remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], local: [L("a.md", h("c9"))] };
+	for (const from of ["a.md", "A.md"]) {
+		const p = run({ ...sc, over: { renames: [{ from, to: "a.md", atMs: 1 }] } }, { nsReady: false });
+		assert.deepEqual(opsOf(p), ["reconcileContent"], from);
+	}
+	// a rename off the path to another key still holds it (the file at a.md may be new)
+	assert.deepEqual(run({ ...sc, over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } }, { nsReady: false }).ops, []);
+});
+
 test("a file at the remote-move target of a doc synced elsewhere is new: published, not orphaned", () => {
 	// Sim seed 285 (2 devices, no faults): B moved seed0 -> r5 while A renamed r1 -> r5. The file at r5.md counted
 	// as d1's (R key) though d1's file was still at seed0.md: d2's rename became an nsDelete, nothing ever planned
