@@ -96,8 +96,8 @@ inner (CryptoPort.open(suite, keyEpoch, aad, sealed), then unpad when suite ≠ 
   (`src/engine/sync/ingestRow.ts:50`, `src/engine/runtime/sessionLoop.ts:446`).
 - Every socket receives every vault-global stream (ns, cfg, snap, `k`). For `b:`/`c:` it receives payloads only for
   the streams it subscribed to, and for rows of its own device; any other `b:`/`c:` row arrives as a skipped
-  `(stream, seq)` and is read later (§d.7 "Subscriptions", relay-wire §19). A socket that never subscribed, or one
-  on a relay without the capability, receives every stream. The cost of a pushed row for a non-resident doc is
+  `(stream, seq)` and is read later (§d.7 "Subscriptions", relay-wire §5.6). A socket that has not subscribed yet
+  has the empty set. The cost of a pushed row for a non-resident doc is
   bounded at gate stage 1–2 plus one tail put (§d.6); a skipped row costs one stale mark.
 
 ### b.3 `nsOps` content
@@ -1062,12 +1062,12 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
    - **ns/cfg/snap:** stored and **not folded** until the stream is caught up. After that, rows arrive live in order (R2)
      and fold immediately.
 
-**Subscriptions** (`src/engine/runtime/subscriptions.ts`, relay-wire §19).
+**Subscriptions** (`src/engine/runtime/subscriptions.ts`, relay-wire §5.6).
 - The set: bound streams, then streams with own outbox records, then the 8 most recently unbound docs for 10 min,
-  capped at `limits.maxSubscriptions` (0 = the relay has none: nothing is sent). It is sent right after
+  capped at `limits.maxSubscriptions`. It is sent right after
   `VAULT_READY`, before the feed; later changes are debounced (250 ms) and sent only when the set changed, except
   that a bind is sent at once. The adapter resends the set on `STREAM_RESEND`; the relay keeps a set that fits the
-  socket attachment (≤ 1024 B) across a restart, and pushes every stream until the resend otherwise.
+  socket attachment (≤ 1024 B) across a restart; a larger one is empty until the resend (its rows are skipped).
 - Any set is correct. It only moves rows between "pushed now" and "skipped, read later"; nothing assumes
   "subscribed ⇒ current", and a freshly subscribed stream is read like any stale one.
 - **Deferred read.** A stream made stale by skips is read once no skip arrived for `skipSettleMs`, or `skipMaxDeferMs`

@@ -10,8 +10,8 @@
  *              periods; vault I/O failures; backgrounding; slow watchers (run.ts)
  *   relay      socket drops (1006/1001/1011) at random points of the frame
  *              flow; relay restart (STREAM_RESEND, unreceipted frames lost;
- *              with relaySubsLost every subscription falls back to "all"
- *              until its client resends it);
+ *              with relaySubsLost every subscription is empty until its
+ *              client resends it);
  *              graceful drain; HTTP failures; daily limit; vault epoch reset
  *   blob store stalls (the whole path, or PUT bodies only; no byte moves: the idle
  *              window or a link abort ends the call) and slow periods (12 KiB/s ..
@@ -52,7 +52,7 @@ export type FaultAction =
 	| { readonly t: "background"; readonly dev: number; readonly event: "hidden" | "pagehide" | "freeze"; readonly durationMs: number }
 	| { readonly t: "socketDrop"; readonly dev: number; readonly code: number }
 	| { readonly t: "relayRestart" }
-	/** Relay restart whose socket attachments kept no subscription (overflow): every socket "all" until resent. */
+	/** Relay restart whose socket attachments kept no subscription (overflow): every set empty until resent. */
 	| { readonly t: "relaySubsLost" }
 	| { readonly t: "relayDrain" }
 	| { readonly t: "httpFail"; readonly durationMs: number }

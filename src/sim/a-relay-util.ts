@@ -33,7 +33,7 @@ export const SIM_READ_BATCH_MAX_STREAMS = 128;
 export const SIM_MAX_SOCKETS = 1000;
 /** MAX_STREAM_SUBSCRIPTIONS: distinct names in one STREAM_SUBSCRIBE set. */
 export const SIM_MAX_SUBSCRIPTIONS = 128;
-/** SUBSCRIPTION_ATTACHMENT_BYTES: a set whose JSON is longer is not persisted ("all" after a restart until resent). */
+/** SUBSCRIPTION_ATTACHMENT_BYTES: a set whose JSON is longer is not persisted (empty after a restart until resent). */
 export const SIM_SUBSCRIPTION_ATTACHMENT_BYTES = 1024;
 
 export interface GroupCommitSpec {

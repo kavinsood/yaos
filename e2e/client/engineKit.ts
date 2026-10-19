@@ -119,8 +119,6 @@ export async function until(pred: () => boolean | Promise<boolean>, timeoutMs: n
 
 export interface DeviceStartOptions {
 	readonly deviceClass?: DeviceClass;
-	/** false: the engine never subscribes (every stream pushed: the behaviour before subscriptions). */
-	readonly subscribe?: boolean;
 	readonly WebSocketImpl?: WebSocketCtor;
 	readonly fetch?: typeof fetch;
 }
@@ -141,7 +139,7 @@ export class Device {
 	}
 
 	/**
-	 * `opts`: extra engine options (fanout.ts: a device class, subscribe false) and transport wrappers that see the
+	 * `opts`: extra engine options (fanout.ts: a device class) and transport wrappers that see the
 	 * production adapters' socket and HTTP traffic (measurement only).
 	 */
 	async start(host: string, vaultId: string, tuning: Partial<EngineTuning>, opts: DeviceStartOptions = {}): Promise<LogEngine> {
@@ -166,7 +164,6 @@ export class Device {
 			tuning,
 			e2ee: { suite: 0 },
 			...(opts.deviceClass ? { deviceClass: opts.deviceClass } : {}),
-			...(opts.subscribe === false ? { subscribe: false } : {}),
 			onBoundText: (id, changes, _length, origin) => {
 				const text = this.hosts.get(id);
 				if (text === undefined || origin === "editor") return; // "editor" = this device's own typing, already shown

@@ -1,6 +1,6 @@
 /**
  * Relay HTTP surface for the streams client (docs/client-remake/relay-wire.md
- * §2, §6–§8): socket tickets, feed, catch-up read (binary reply when the relay has it, §7.2) and checkpoint CAS.
+ * §2, §6–§8): socket tickets, feed, catch-up read (binary reply, §7.2) and checkpoint CAS.
  *
  * The credential (device token) is a secret. It is only ever placed in the
  * Authorization header; it never appears in URLs, error messages or logs.
@@ -16,7 +16,7 @@ import type { ClockPort } from "../../ports/clock";
 import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectResult, RelayRow } from "../../ports/relay";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
 import { bounded as boundedCall, relayHttpDeadlineMs, RELAY_REPLY_BYTES, untilAborted } from "../../core/deadline";
-import { decodeReadReply, READ_BINARY_TYPE, type WireReadPage } from "./relayFrames";
+import { decodeReadReply, type WireReadPage } from "./relayFrames";
 import { createWebClock } from "./webClock";
 
 export type ConnectFailureReason = Extract<RelayConnectResult, { ok: false }>["reason"];
@@ -68,11 +68,12 @@ export interface RelayHttp {
  * Wire bytes per page payload byte. A read page's payload is at most max(maxBytes, one item): maxBytes "bounds
  * payload bytes per page, checkpoint included", but "a page always carries at least one row or the checkpoint"
  * (relay-wire §7, §7.1; server/src/streams/store.ts read), and an item is at most RELAY_PAGE_ITEM_MAX_BYTES. The
- * payload travels as base64 (4/3) in a JSON reply, raw in a binary one (relay-wire §7.2), with per-row fields
- * (seq, deviceId, clientFrameId: at most ~300 B); 4× covers both for rows of 110 B or more. A page of smaller rows can exceed its bound; its deadline then assumes a faster
- * link, by that ratio.
+ * payload travels raw in the binary reply (relay-wire §7.2), with per-row fields (varuint seq, deviceId,
+ * clientFrameId and the payload length: at most ~300 B at the relay's name limits, ~50 B with this client's ids);
+ * 2× covers rows of 300 B or more at the limits, 50 B or more in practice. A page of smaller rows can exceed its
+ * bound; its deadline then assumes a faster link, by that ratio.
  */
-export const RELAY_PAGE_WIRE_FACTOR = 4;
+export const RELAY_PAGE_WIRE_FACTOR = 2;
 /** The largest single item of a read page: a checkpoint (relay-wire §8: 413 over 4 MiB); a frame is at most 1 MiB. */
 export const RELAY_PAGE_ITEM_MAX_BYTES = 4 * 1024 * 1024;
 /** The relay's read budget cap (relay-wire §7: "the max is 4 MiB"): the page budget when the call names none. */
@@ -112,22 +113,6 @@ export function parseRetryAfter(value: string | null, nowMs: number): number | n
 	return Number.isFinite(date) ? Math.max(0, date - nowMs) : null;
 }
 
-export function base64ToBytes(value: string): Uint8Array {
-	const binary = atob(value);
-	const out = new Uint8Array(binary.length);
-	for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-	return out;
-}
-
-export function bytesToBase64(bytes: Uint8Array): string {
-	let binary = "";
-	const chunk = 0x8000;
-	for (let i = 0; i < bytes.byteLength; i += chunk) {
-		binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-	}
-	return btoa(binary);
-}
-
 type Json = Readonly<Record<string, unknown>>;
 
 function isRecord(value: unknown): value is Json {
@@ -142,7 +127,7 @@ function seqField(o: Json, key: string): number | null {
 interface HttpReply {
 	readonly status: number;
 	readonly body: Json | null;
-	/** A 200 binary read reply (relay-wire §7.2); then body is null. */
+	/** The body of a 200 read reply (relay-wire §7.2); then body is null. */
 	readonly bytes: Uint8Array | null;
 	readonly code: string | null;
 	readonly retryAfterMs: number | null;
@@ -151,43 +136,10 @@ interface HttpReply {
 /** Query budget of one batched read URL (CDN URL limits are 8-16 KB); entries past it go in a later batch. */
 export const READ_BATCH_MAX_QUERY_CHARS = 6000;
 
-/** One read page (single read body / batched read entry); null when malformed. */
-function parsePage(body: Json, afterSeq: number): ReadPage | null {
-	const lastSeq = seqField(body, "lastSeq");
-	const checkpointSeq = seqField(body, "checkpointSeq") ?? 0;
-	const gcSeq = seqField(body, "gcSeq") ?? 0;
-	const rawRows = body["rows"];
-	const nextAfterRaw = body["nextAfter"];
-	const nextAfter = nextAfterRaw === null || nextAfterRaw === undefined ? null : seqField(body, "nextAfter");
-	if (lastSeq === null || !Array.isArray(rawRows) || (nextAfterRaw !== null && nextAfterRaw !== undefined && nextAfter === null)) return null;
-	try {
-		let checkpoint: { coversSeq: number; bytes: Uint8Array } | null = null;
-		const rawCheckpoint = body["checkpoint"];
-		if (isRecord(rawCheckpoint)) {
-			const coversSeq = seqField(rawCheckpoint, "coversSeq");
-			const bytes = rawCheckpoint["bytes"];
-			if (coversSeq === null || typeof bytes !== "string") return null;
-			checkpoint = { coversSeq, bytes: base64ToBytes(bytes) };
-		}
-		const rows: RelayRow[] = [];
-		for (const raw of rawRows) {
-			if (!isRecord(raw)) return null;
-			const seq = seqField(raw, "seq");
-			const deviceId = raw["deviceId"];
-			const clientFrameId = raw["clientFrameId"];
-			const payload = raw["payload"];
-			if (seq === null || typeof deviceId !== "string" || typeof clientFrameId !== "string" || typeof payload !== "string") return null;
-			rows.push({ seq, deviceId: deviceId as DeviceId, clientFrameId: clientFrameId as ClientFrameId, payload: base64ToBytes(payload) });
-		}
-		const lastRow = rows.length > 0 ? rows[rows.length - 1] : undefined;
-		const nextAfterSeq = nextAfter ?? lastRow?.seq ?? checkpoint?.coversSeq ?? afterSeq;
-		return { checkpoint, rows, lastSeq, checkpointSeq, gcSeq, nextAfterSeq, more: nextAfter !== null };
-	} catch {
-		return null; // invalid base64
-	}
-}
-
-/** One page of a binary read reply (relay-wire §7.2), with parsePage's cursor rule. */
+/**
+ * One page of a read reply (relay-wire §7.2). The next cursor is nextAfter when more rows remain, else the last row,
+ * else the checkpoint, else the request's cursor.
+ */
 function pageFromWire(page: WireReadPage, afterSeq: number): ReadPage {
 	const rows: RelayRow[] = page.rows.map((r) => ({ seq: r.seq, deviceId: r.deviceId as DeviceId, clientFrameId: r.clientFrameId as ClientFrameId, payload: r.payload }));
 	const lastRow = rows.length > 0 ? rows[rows.length - 1] : undefined;
@@ -205,17 +157,17 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	const vaultPath = (vaultId: string, rest: string): string => `${base}/vault/${encodeURIComponent(vaultId)}${rest}`;
 
 	/** null = network failure, or `signal` aborted before the whole reply arrived. Never rejects. */
-	async function call(url: string, init: { method: string; body?: BodyInit; contentType?: string; accept?: string }, signal?: AbortSignal): Promise<HttpReply | null> {
+	/** `binary`: a 200 reply is the binary read reply (relay-wire §7.2), returned as bytes; errors are JSON. */
+	async function call(url: string, init: { method: string; body?: BodyInit; contentType?: string; binary?: true }, signal?: AbortSignal): Promise<HttpReply | null> {
 		const headers: Record<string, string> = { Authorization: auth };
 		if (init.contentType) headers["Content-Type"] = init.contentType;
-		if (init.accept) headers["Accept"] = init.accept;
 		let res: Response;
 		try {
 			res = await untilAborted(doFetch(url, { method: init.method, headers, body: init.body, ...(signal ? { signal } : {}) }), signal);
 		} catch {
 			return null;
 		}
-		if (init.accept !== undefined && res.status === 200 && (res.headers.get("content-type") ?? "").startsWith(init.accept)) {
+		if (init.binary && res.status === 200) {
 			try {
 				return { status: res.status, body: null, bytes: new Uint8Array(await untilAborted(res.arrayBuffer(), signal)), code: null, retryAfterMs: null };
 			} catch {
@@ -312,16 +264,11 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			const q = `stream=${encodeURIComponent(stream)}&after=${afterSeq}`
 				+ (maxBytes !== null ? `&maxBytes=${maxBytes}` : "")
 				+ (preferCheckpoint ? "&checkpoint=1" : "");
-			const reply = await bounded("read", pageBound(maxBytes), signal, (s) => call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET", accept: READ_BINARY_TYPE }, s));
+			const reply = await bounded("read", pageBound(maxBytes), signal, (s) => call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET", binary: true }, s));
 			if (reply === null || reply.status !== 200) throw fail("read", reply);
-			if (reply.bytes !== null) {
-				const wire = decodeReadReply(reply.bytes);
-				if (wire === null || wire.pages.length !== 1 || wire.pages[0]!.stream !== stream) throw malformed("read", reply.status);
-				return pageFromWire(wire.pages[0]!, afterSeq);
-			}
-			const page = reply.body === null ? null : parsePage(reply.body, afterSeq);
-			if (page === null) throw malformed("read", reply.status);
-			return page;
+			const wire = reply.bytes === null ? null : decodeReadReply(reply.bytes);
+			if (wire === null || wire.pages.length !== 1 || wire.pages[0]!.stream !== stream) throw malformed("read", reply.status);
+			return pageFromWire(wire.pages[0]!, afterSeq);
 		},
 
 		async readBatch(vaultId, reqs, maxBytes, signal) {
@@ -335,26 +282,14 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			}
 			if (sent === 0) throw new RangeError("readBatch: no requests");
 			// One budget for the whole batch (relay-wire §7.1), so one page's bound.
-			const reply = await bounded("read", pageBound(maxBytes), signal, (s) => call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET", accept: READ_BINARY_TYPE }, s));
+			const reply = await bounded("read", pageBound(maxBytes), signal, (s) => call(vaultPath(vaultId, `/streams/read?${q}`), { method: "GET", binary: true }, s));
 			if (reply === null || reply.status !== 200) throw fail("read", reply);
-			if (reply.bytes !== null) {
-				const wire = decodeReadReply(reply.bytes);
-				if (wire === null || wire.pages.length === 0 || wire.pages.length > sent) throw malformed("read", reply.status);
-				return wire.pages.map((page, i) => {
-					if (page.stream !== reqs[i]!.stream) throw malformed("read", reply.status);
-					return pageFromWire(page, reqs[i]!.afterSeq);
-				});
-			}
-			const raw = reply.body?.["pages"];
-			if (!Array.isArray(raw) || raw.length === 0 || raw.length > sent) throw malformed("read", reply.status);
-			const pages: ReadPage[] = [];
-			for (let i = 0; i < raw.length; i++) {
-				const item: unknown = raw[i];
-				const page = isRecord(item) && item["stream"] === reqs[i]!.stream ? parsePage(item, reqs[i]!.afterSeq) : null;
-				if (page === null) throw malformed("read", reply.status);
-				pages.push(page);
-			}
-			return pages;
+			const wire = reply.bytes === null ? null : decodeReadReply(reply.bytes);
+			if (wire === null || wire.pages.length === 0 || wire.pages.length > sent) throw malformed("read", reply.status);
+			return wire.pages.map((page, i) => {
+				if (page.stream !== reqs[i]!.stream) throw malformed("read", reply.status);
+				return pageFromWire(page, reqs[i]!.afterSeq);
+			});
 		},
 
 		async putCheckpoint(vaultId, stream, coversSeq, expectedPrevCoversSeq, bytes, signal) {

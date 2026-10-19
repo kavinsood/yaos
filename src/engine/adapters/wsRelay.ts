@@ -16,9 +16,9 @@
  *   VAULT_PING is sent; with nothing received within timeoutMs the socket is
  *   closed with LIVENESS_CLOSE_CODE and "closed" is emitted. ping() sends one
  *   on demand (the device check's round trip) and resolves on its own pong.
- * - Subscriptions (relay-wire §19): subscribe() sends STREAM_SUBSCRIBE only when the relay has the capability
- *   (limits.maxSubscriptions > 0) and keeps the set; STREAM_RESEND (a relay runtime restart, which may have lost
- *   it) sends it again before the event is emitted. STREAM_SKIPPED decodes to "skipped".
+ * - Subscriptions (relay-wire §5.6): subscribe() sends STREAM_SUBSCRIBE and keeps the set; STREAM_RESEND (a relay
+ *   runtime restart, which may have lost it) sends it again before the event is emitted. STREAM_SKIPPED decodes
+ *   to "skipped".
  * - Exactly one "closed" event ends every session. close() emits it
  *   synchronously; later socket callbacks are ignored.
  *
@@ -100,7 +100,7 @@ export const DEFAULT_RELAY_LIMITS: RelayLimits = {
 	feedPageRows: 1000,
 	readPageBytes: 1024 * 1024,
 	readBatchStreams: 1,
-	maxSubscriptions: 0,
+	maxSubscriptions: 128,
 };
 
 export const DEFAULT_LIVENESS = { idleMs: 60_000, timeoutMs: 15_000 } as const;
@@ -113,8 +113,8 @@ export const LIVENESS_TIMEOUT_ERROR = "liveness_timeout";
 
 const WS_OPEN = 1;
 
-/** VAULT_READY limits -> RelayLimits. maxSubscriptions is 0 unless capabilities.subscriptions >= 1 names a limit. */
-export function mapLimits(wire: WireLimits, subscriptions: number | null = null): RelayLimits {
+/** VAULT_READY limits -> RelayLimits. */
+export function mapLimits(wire: WireLimits): RelayLimits {
 	return {
 		maxFrameBytes: wire.maxPayloadBytes ?? DEFAULT_RELAY_LIMITS.maxFrameBytes,
 		maxCheckpointBytes: wire.maxCheckpointBytes ?? DEFAULT_RELAY_LIMITS.maxCheckpointBytes,
@@ -123,7 +123,7 @@ export function mapLimits(wire: WireLimits, subscriptions: number | null = null)
 		feedPageRows: wire.feedDefaultLimit ?? DEFAULT_RELAY_LIMITS.feedPageRows,
 		readPageBytes: wire.readDefaultBytes ?? DEFAULT_RELAY_LIMITS.readPageBytes,
 		readBatchStreams: Math.max(1, Math.floor(wire.readBatchMaxStreams ?? DEFAULT_RELAY_LIMITS.readBatchStreams)),
-		maxSubscriptions: subscriptions !== null && subscriptions >= 1 && wire.maxSubscriptions !== null ? Math.floor(wire.maxSubscriptions) : 0,
+		maxSubscriptions: Math.floor(wire.maxSubscriptions ?? DEFAULT_RELAY_LIMITS.maxSubscriptions),
 	};
 }
 
@@ -278,7 +278,7 @@ class WsRelaySession implements RelaySession {
 		this.vaultEpoch = init.ready.vaultEpoch;
 		this.headSeq = init.ready.head;
 		this.canWrite = init.ready.canWrite;
-		this.limits = mapLimits(init.ready.limits, init.ready.subscriptions);
+		this.limits = mapLimits(init.ready.limits);
 		this.idleMs = init.liveness?.idleMs ?? init.ready.liveness?.idleMs ?? DEFAULT_LIVENESS.idleMs;
 		this.timeoutMs = init.liveness?.timeoutMs ?? init.ready.liveness?.timeoutMs ?? DEFAULT_LIVENESS.timeoutMs;
 		this.lastRx = this.clock.monotonic();
@@ -306,7 +306,6 @@ class WsRelaySession implements RelaySession {
 	}
 
 	subscribe(streams: readonly StreamName[]): void {
-		if (this.limits.maxSubscriptions <= 0) return;
 		if (streams.length > this.limits.maxSubscriptions) throw new RangeError(`relay subscribe: ${streams.length} streams exceed maxSubscriptions ${this.limits.maxSubscriptions}`);
 		this.subscription = [...streams];
 		this.sendSubscription();
@@ -491,7 +490,7 @@ class WsRelaySession implements RelaySession {
 				for (const r of control.receipts) {
 					// This socket may hold a PROVISIONAL of its own frame (own-device rows are pushed to every socket of
 					// the device); one that resent the frame while it was pending gets this receipt and no
-					// COMMIT_NOTICE (relay-wire §19), so the payload would never be joined.
+					// COMMIT_NOTICE (relay-wire §5.6), so the payload would never be joined.
 					this.join.delete(ProvisionalJoin.key(r.stream, this.deviceId, r.clientFrameId));
 					this.emit({
 						t: "receipt",

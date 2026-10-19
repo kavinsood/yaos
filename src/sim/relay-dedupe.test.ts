@@ -23,7 +23,7 @@ test("relay dedupe: pending buffer is vault-wide by (device, frame id) — same 
 	await clock.runUntilIdle();
 	assert.deepEqual(relay.rows(ns).map((r) => [r.seq, r.deviceId]), [[1, "A"], [2, "B"]]);
 	assert.deepEqual(trace(a.events), ["refused f1 frame-id-conflict", "committed f1@2", "receipt f1@1", "head 2"]);
-	// A duplicate waiter gets the deduped receipt only, not the broadcast of the frame it joined (relay-wire §19).
+	// A duplicate waiter gets the deduped receipt only, not the broadcast of the frame it joined (relay-wire §5.6).
 	assert.deepEqual(trace(a2.events), ["refused f1 frame-id-conflict", "committed f1@2", "receipt f1@1 dedup", "head 2"]);
 	assert.deepEqual(trace(b.events), ["committed f1@1", "receipt f1@2", "head 2"]);
 	const c = relay.counters();
@@ -34,10 +34,10 @@ test("relay dedupe: store hit — same bytes -> deduped receipt with the origina
 	const clock = new VirtualClock();
 	const relay = new SimRelay({ clock });
 	const a = await connectPeer(relay, clock, "A");
-	const b = await connectPeer(relay, clock, "B");
+	const b = await connectPeer(relay, clock, "B", ["b:d"]);
 	a.session.append(frame("b:d", "p1", "v1"));
 	await clock.runUntilIdle();
-	const c = await connectPeer(relay, clock, "C");
+	const c = await connectPeer(relay, clock, "C", ["b:d"]);
 	assert.equal(c.session.headSeq, 1);
 	a.session.append(frame("b:d", "p1", "v1")); // resend after the receipt was lost, say
 	await clock.runUntilIdle();

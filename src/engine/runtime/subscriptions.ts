@@ -4,8 +4,8 @@
  * The set: bound streams, then streams with own outbox records (own frames in flight, adoptables), then the
  * recentUnboundKeep most recently unbound docs for recentUnboundMs, capped at limits.maxSubscriptions. Each new
  * session gets it right after VAULT_READY (before the feed); later changes are debounced (subscribeDebounceMs)
- * and sent only when the set changed. The adapter resends it on STREAM_RESEND. Nothing is sent when the relay has
- * no subscriptions (maxSubscriptions 0), when the session has no subscribe(), or with EngineOptions.subscribe false.
+ * and sent only when the set changed. The adapter resends it on STREAM_RESEND. Until a session's first set is
+ * handled, the relay pushes it only vault-global streams and this device's rows (relay-wire §5.6).
  *
  * Deferral: a skipped row (another device's b:/c: row outside the set) makes its stream stale and records the
  * skip time (in memory: after a restart the stream is read under the normal rules). sessionLoop.scheduleCatchUp
@@ -43,7 +43,7 @@ export class Subscriptions {
 	private sent: string | null = null;
 	stats = { sends: 0, skippedRows: 0, deferredReads: 0 };
 
-	constructor(private readonly c: EngineCtx, private readonly defer: SkipDefer, private readonly enabled: boolean) {}
+	constructor(private readonly c: EngineCtx, private readonly defer: SkipDefer) {}
 
 	// ---- the set -------------------------------------------------------------------
 
@@ -104,7 +104,7 @@ export class Subscriptions {
 		if (changed) this.poke();
 	}
 
-	/** The set as it would be sent now (sorted), or null when this session takes none. */
+	/** The set as it would be sent now (sorted), or null without a session (or once stopped). */
 	desired(): StreamName[] | null {
 		const s = this.c.session;
 		if (!this.usable(s)) return null;
@@ -121,7 +121,7 @@ export class Subscriptions {
 	}
 
 	private usable(s: RelaySession | null): s is RelaySession {
-		return this.enabled && s !== null && s.subscribe !== undefined && s.limits.maxSubscriptions > 0 && !this.c.stopped;
+		return s !== null && !this.c.stopped;
 	}
 
 	private flush(): void {
@@ -133,7 +133,7 @@ export class Subscriptions {
 		this.sent = key;
 		this.stats.sends++;
 		try {
-			s.subscribe!(set);
+			s.subscribe(set);
 		} catch (e) {
 			this.sent = null;
 			this.c.diag("subscribe-failed", { error: String(e) });

@@ -106,7 +106,7 @@ test("a phone defers the read of a skipped note until it is quiet for 150 s (isI
 	assert.equal(b.vault.textOf("n.md"), "start burst more", "bound: read now");
 });
 
-test("a relay restart keeps a small set (attachment); one that loses it pushes everything until the client resends", async () => {
+test("a relay restart keeps a small set (attachment); one that loses it is empty until the client resends", async () => {
 	const { clock, net, a, b } = world();
 	a.vault.userWrite("n.md", "x");
 	await boot(clock, [a, b]);
@@ -122,7 +122,7 @@ test("a relay restart keeps a small set (attachment); one that loses it pushes e
 	assert.deepEqual(subs(), [[stream]]);
 
 	net.relay.restart(true);
-	assert.deepEqual(subs(), [null], "lost: every stream");
+	assert.deepEqual(subs(), [[]], "lost: empty");
 	await clock.advance(2_000);
 	assert.deepEqual(subs(), [[stream]], "resent on STREAM_RESEND");
 	assert.equal(b.vrt!.log.c.sess.stats.sessions, 1, "the same session throughout");

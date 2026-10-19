@@ -65,7 +65,7 @@ describe("relayFrames binary codec", () => {
 });
 
 describe("relayFrames STREAM_SKIPPED", () => {
-	it("has the relay-wire §19 layout and decodes into seq order across streams", () => {
+	it("has the relay-wire §5.6 layout and decodes into seq order across streams", () => {
 		const enc = encodeServerFrame({ kind: "skipped", rows: [{ stream: "b:x", seq: 5 }, { stream: "c:y", seq: 6 }, { stream: "b:x", seq: 9 }] });
 		// kind, 2 streams, "b:x" n=2 first=5 delta=4, "c:y" n=1 first=6
 		assert.deepEqual(Array.from(enc), [FRAME_SKIPPED, 2, 3, 98, 58, 120, 2, 5, 4, 3, 99, 58, 121, 1, 6]);
@@ -114,14 +114,13 @@ describe("relayFrames control", () => {
 		const full = parseControl(CONTROL_PREFIX + JSON.stringify({
 			type: "VAULT_READY", vaultEpoch: "E1", head: 42, canWrite: true, deviceId: "dev", runtimeEpoch: "R",
 			liveness: { version: 1, idleMs: 60000, timeoutMs: 15000 },
-			capabilities: { streams: 1, subscriptions: 1 },
+			capabilities: { streams: 1 },
 			limits: { maxPayloadBytes: 10, maxCheckpointBytes: 20, rateBytesPerSec: 30, burstBytes: 40, feedDefaultLimit: 50, readDefaultBytes: 60, readBatchMaxStreams: 70, maxSubscriptions: 128 },
 		}));
 		assert.deepEqual(full, {
 			type: "VAULT_READY", vaultEpoch: "E1", head: 42, canWrite: true, deviceId: "dev", runtimeEpoch: "R",
 			liveness: { idleMs: 60000, timeoutMs: 15000 },
 			limits: { maxPayloadBytes: 10, maxCheckpointBytes: 20, rateBytesPerSec: 30, burstBytes: 40, feedDefaultLimit: 50, readDefaultBytes: 60, readBatchMaxStreams: 70, maxSubscriptions: 128 },
-			subscriptions: 1,
 		});
 		const bare = parseControl(CONTROL_PREFIX + JSON.stringify({ type: "VAULT_READY", vaultEpoch: "E", head: 0, limits: { maxPayloadBytes: -1 } }));
 		assert.ok(bare && bare.type === "VAULT_READY");
@@ -129,7 +128,6 @@ describe("relayFrames control", () => {
 		assert.equal(bare.liveness, null);
 		assert.equal(bare.limits.maxPayloadBytes, null);
 		assert.equal(bare.limits.maxSubscriptions, null);
-		assert.equal(bare.subscriptions, null, "no capabilities: no subscriptions");
 		assert.equal(parseControl(CONTROL_PREFIX + JSON.stringify({ type: "VAULT_READY", head: 1 })), null, "vaultEpoch required");
 	});
 

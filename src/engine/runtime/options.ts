@@ -131,11 +131,6 @@ export interface EngineOptions {
 	readonly provisionalBroadcast?: boolean;
 	readonly tuning?: Partial<EngineTuning>;
 	readonly budgets?: Partial<Budgets>;
-	/**
-	 * Default true. false = never send a subscription: the relay pushes every stream (the behaviour before
-	 * subscriptions; e2e/client/fanout.ts compares the two).
-	 */
-	readonly subscribe?: boolean;
 	/** Default true. false = connect once; reconnect() only. */
 	readonly autoReconnect?: boolean;
 	/**

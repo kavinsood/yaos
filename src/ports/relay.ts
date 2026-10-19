@@ -18,12 +18,12 @@
  *     the engine recovers with feed + read (DESIGN §d.7).
  *  R3 Payloads are pushed for every vault-global stream (anything not b:/c:),
  *     for the b:/c: streams of the session's last subscribe() set, and for
- *     rows of this device's other sockets; a session that never subscribed
- *     (or a relay without the capability: limits.maxSubscriptions 0) gets
- *     every stream. The relay keeps the set across a runtime restart only when
- *     it is small; the adapter resends it on STREAM_RESEND, and until then the
- *     session may get every stream again. Any set is correct: it only moves
- *     rows between "pushed now" and "skipped, read later".
+ *     rows of this device's other sockets; every other b:/c: row is skipped.
+ *     A session that has not subscribed yet has the empty set. The relay keeps
+ *     the set across a runtime restart only when it is small; the adapter
+ *     resends it on STREAM_RESEND, and until then the session may have the
+ *     empty set again. Any set is correct: it only moves rows between "pushed
+ *     now" and "skipped, read later".
  *     Frames are committed in arrival order; a group commit fails or succeeds
  *     as a whole and does NOT fence later frames; a close or a relay restart
  *     ("resendUnreceipted") loses every unreceipted frame. The client never
@@ -66,10 +66,7 @@ export interface RelayLimits {
 	readonly readPageBytes: number;
 	/** Streams per readBatch() request (VAULT_READY readBatchMaxStreams); 1 = the relay has no batch form. */
 	readonly readBatchStreams: number;
-	/**
-	 * Streams per subscribe() set (VAULT_READY limits.maxSubscriptions, with capabilities.subscriptions 1); 0 = the
-	 * relay has no subscriptions: never subscribe, every stream is pushed (R3).
-	 */
+	/** Streams per subscribe() set (VAULT_READY limits.maxSubscriptions). */
 	readonly maxSubscriptions: number;
 }
 
@@ -193,9 +190,9 @@ export interface RelaySession {
 	/**
 	 * Replace the set of b:/c: streams whose rows are pushed live (R3); at most limits.maxSubscriptions names. No
 	 * reply: the set takes effect for commits after the relay processed it. The adapter keeps the last set and
-	 * sends it again on STREAM_RESEND. Absent (or maxSubscriptions 0): every stream is pushed.
+	 * sends it again on STREAM_RESEND. Until the first set: the empty set (R3).
 	 */
-	subscribe?(streams: readonly StreamName[]): void;
+	subscribe(streams: readonly StreamName[]): void;
 	feed(afterSeq: Seq): Promise<FeedPage>;
 	/** preferCheckpoint: also take a newer checkpoint when rows still exist (fresh docs). */
 	read(stream: StreamName, afterSeq: Seq, preferCheckpoint: boolean): Promise<ReadPage>;

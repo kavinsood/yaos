@@ -183,7 +183,7 @@ export class LiveIngest {
 		const onlyK = c.keyring.readsOnlyK();
 		for (const ev of batch) {
 			if (ev.t === "skipped") {
-				// Never an own row (relay-wire §19): another device wrote it, which hands the checkpoint duty on.
+				// Never an own row (relay-wire §5.6): another device wrote it, which hands the checkpoint duty on.
 				items.push({ t: "stale", stream: ev.stream, seq: ev.seq, foreign: true });
 				skipped.set(ev.stream, (skipped.get(ev.stream) ?? 0) + 1);
 				staleStreams.add(ev.stream);

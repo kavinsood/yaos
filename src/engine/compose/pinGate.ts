@@ -74,6 +74,7 @@ function readOnly(s: RelaySession, kOnly: boolean): RelaySession {
 			s.append(frame);
 		},
 		bufferedBytes: () => s.bufferedBytes(),
+		subscribe: (streams) => s.subscribe(streams),
 		feed: (afterSeq) => s.feed(afterSeq),
 		read: (stream, afterSeq, preferCheckpoint) => s.read(stream, afterSeq, preferCheckpoint),
 		readBatch: (reqs) => s.readBatch(reqs),

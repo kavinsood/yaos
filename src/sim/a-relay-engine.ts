@@ -2,7 +2,7 @@
  * SimRelay engine: per-socket raw admission (token bucket), APPEND parsing
  * and admission, the vault-wide pending buffer, group commit (idle / max /
  * bytes timers on the ClockPort), fan-out and failures, subscriptions
- * (relay-wire §19: STREAM_SUBSCRIBE, filtered fan-out with inline
+ * (relay-wire §5.6: STREAM_SUBSCRIBE, filtered fan-out with inline
  * STREAM_SKIPPED runs, the set persisted in the "attachment" when it fits).
  * Mirrors server/src/streams/relay.ts (StreamRelayService) message for message.
  */
@@ -201,7 +201,7 @@ export class RelayEngine {
 	/**
 	 * STREAM_SUBSCRIBE: replaces the socket's set (read-only sockets too). An invalid name or more than
 	 * SIM_MAX_SUBSCRIPTIONS distinct names is rejected and the previous set kept. Persisted in the attachment when its
-	 * JSON fits SIM_SUBSCRIPTION_ATTACHMENT_BYTES, else as overflow ("all" after a restart).
+	 * JSON fits SIM_SUBSCRIPTION_ATTACHMENT_BYTES, else not (empty after a restart).
 	 */
 	private subscribe(session: SimRelaySession, streams: readonly string[]): void {
 		const code = !streams.every(validStreamName) ? "invalid" : new Set(streams).size > SIM_MAX_SUBSCRIPTIONS ? "too_many" : null;
@@ -216,9 +216,12 @@ export class RelayEngine {
 		session.persistedSubs = utf8Length(JSON.stringify(subs)) <= SIM_SUBSCRIPTION_ATTACHMENT_BYTES ? subs : null;
 	}
 
-	/** The socket is pushed `frame`'s payload (else, once appended, it is sent the seq as skipped). */
+	/**
+	 * The socket is pushed `frame`'s payload (else, once appended, it is sent the seq as skipped): vault-global
+	 * streams, its own device's rows and the streams of its set (empty until it subscribes).
+	 */
 	private wants(peer: SimRelaySession, frame: { readonly stream: StreamName; readonly deviceId: DeviceId }): boolean {
-		return peer.subs === null || !isProvisionalStream(frame.stream) || peer.subs.has(frame.stream) || frame.deviceId === peer.deviceId;
+		return !isProvisionalStream(frame.stream) || frame.deviceId === peer.deviceId || peer.subs.has(frame.stream);
 	}
 
 	private tally(deviceId: DeviceId): SimDeviceFanout {
@@ -388,7 +391,7 @@ export class RelayEngine {
 	}
 
 	/**
-	 * Per frame and peer socket, in frame order (relay-wire §19): the origin and duplicate waiters get receipts only;
+	 * Per frame and peer socket, in frame order (relay-wire §5.6): the origin and duplicate waiters get receipts only;
 	 * a PROVISIONAL recipient gets the COMMIT_NOTICE; an appended row the socket wants goes as COMMITTED, one it does
 	 * not want joins the socket's pending skip run; a store-deduped row is neither (R7). A socket's run is flushed as
 	 * one STREAM_SKIPPED before its next live frame and after the loop, before the receipts.
@@ -493,7 +496,7 @@ export class RelayEngine {
 	 * Runtime restart (eviction / hibernation wake): the buffer is gone unacked,
 	 * rate gates and the latch are in-memory and reset, and every open socket
 	 * gets STREAM_RESEND with the head. Sockets themselves survive (hibernation),
-	 * their subscription restored from the attachment ("all" when it overflowed,
+	 * their subscription restored from the attachment (empty when it overflowed,
 	 * or with `loseSubscriptions`: every set as if it had).
 	 */
 	restart(loseSubscriptions = false): void {
@@ -503,7 +506,7 @@ export class RelayEngine {
 		for (const session of this.streamSockets()) {
 			session.gate = null;
 			if (loseSubscriptions) session.persistedSubs = null;
-			session.subs = session.persistedSubs === null ? null : new Set(session.persistedSubs);
+			session.subs = new Set(session.persistedSubs ?? []);
 			session.send({ k: "resend", head });
 			this.counters.wakeNotices++;
 		}

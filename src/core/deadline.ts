@@ -44,9 +44,9 @@ export function untilAborted<T>(p: Promise<T>, signal: AbortSignal | undefined):
 export const RELAY_HTTP_BASE_MS = 15_000;
 /**
  * The slowest link the deadlines allow for at their byte bound: 64 KiB/s (512 kbit/s, 3G-class). With the relay's
- * page bounds (relayHttp.ts), a default read (1 MiB budget, bound 16 MiB) gets 271 s: its real reply (at most
- * ~4 MiB of base64 and row fields for 1 MiB of payload) still arrives over a 16 KiB/s link, and a page carrying a
- * 4 MiB checkpoint (~5.3 MiB on the wire) over 20 KiB/s. A slower link is ended at the deadline and the call
+ * page bounds (relayHttp.ts), a default read (1 MiB budget, bound 8 MiB) gets 143 s: its real reply (at most
+ * ~2 MiB of raw payload and row fields for 1 MiB of payload) still arrives over a 15 KiB/s link, and a page
+ * carrying a 4 MiB checkpoint (raw on the wire) over 29 KiB/s. A slower link is ended at the deadline and the call
  * retries after its backoff (sessionLoop.ts readBackoffMs).
  */
 export const RELAY_HTTP_FLOOR_BYTES_PER_S = 64 * 1024;

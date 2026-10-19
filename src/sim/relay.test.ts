@@ -67,13 +67,13 @@ test("relay: b:/c: provisional to sockets open at admission; notice joins the he
 	const clock = new VirtualClock();
 	const relay = new SimRelay({ clock });
 	const a = await connectPeer(relay, clock, "A");
-	const b = await connectPeer(relay, clock, "B");
-	const d = await connectPeer(relay, clock, "D");
+	const b = await connectPeer(relay, clock, "B", ["b:doc"]);
+	const d = await connectPeer(relay, clock, "D", ["b:doc"]);
 	a.session.append(frame("b:doc", "p1", "hello"));
 	a.session.append(frame("ns", "n1", "ns-op")); // commit-only stream: no provisional
 	await clock.advance(100);
 	assert.deepEqual(trace(b.events), ["provisional p1"]);
-	const c = await connectPeer(relay, clock, "C"); // after admission: no provisional, gets the row
+	const c = await connectPeer(relay, clock, "C", ["b:doc"]); // after admission: no provisional, gets the row
 	relay.forgetHeldProvisionals("D" as DeviceId);
 	await clock.runUntilIdle();
 	assert.deepEqual(trace(b.events), ["provisional p1", "committed p1@1", "committed n1@2"]);
@@ -117,11 +117,13 @@ test("relay: R2 under random link delays and jitter — each session gets every 
 		const clock = new VirtualClock();
 		const rnd = new SeededRandom(seed);
 		const relay = new SimRelay({ clock, seed, link: { uplinkMs: 5, downlinkMs: 20, jitterMs: 40, connectMs: 30 } });
-		const peers = [await connectPeer(relay, clock, "A"), await connectPeer(relay, clock, "B")];
+		// Subscribed to every doc stream; rows committed before a set arrives come as skips, which R2 counts too.
+		const docs = ["b:x", "b:y", "c:z"];
+		const peers = [await connectPeer(relay, clock, "A", docs), await connectPeer(relay, clock, "B", docs)];
 		const sent: { peer: number; f: ReturnType<typeof frame> }[] = [];
 		for (let step = 0; step < 300; step++) {
 			const roll = rnd.float();
-			if (roll < 0.02 && peers.length < 5) peers.push(await connectPeer(relay, clock, rnd.pick(["A", "B", "C"])));
+			if (roll < 0.02 && peers.length < 5) peers.push(await connectPeer(relay, clock, rnd.pick(["A", "B", "C"]), docs));
 			const p = rnd.int(peers.length);
 			if (roll > 0.85 && sent.length > 0) {
 				const old = sent[rnd.int(sent.length)]!; // resend (same bytes) from the same device
@@ -139,6 +141,14 @@ test("relay: R2 under random link delays and jitter — each session gets every 
 		for (const peer of peers) {
 			const seen = new Set<number>();
 			for (const e of peer.events as RelayEvent[]) {
+				if (e.t === "skipped") {
+					for (const r of e.rows) {
+						assert.equal(byseq.get(r.seq)!.stream, r.stream, `seed ${seed}`);
+						assert.ok(!seen.has(r.seq) && r.seq > peer.session.headSeq, `seed ${seed}: a skipped seq once, above the head`);
+						seen.add(r.seq);
+					}
+					continue;
+				}
 				if (e.t !== "committed" && e.t !== "receipt") continue;
 				const seq = e.t === "committed" ? e.frame.seq : e.seq;
 				const row = byseq.get(seq)!;

@@ -296,8 +296,8 @@ export class SimRelay implements RelayPort {
 
 	/**
 	 * Runtime restart: buffer lost unacked, gates/latch reset, subscriptions back to what the attachments kept,
-	 * every open socket gets STREAM_RESEND. loseSubscriptions: every attachment overflowed (all sockets "all" until
-	 * their clients resend).
+	 * every open socket gets STREAM_RESEND. loseSubscriptions: every attachment overflowed (every set empty until
+	 * its client resends it).
 	 */
 	restart(loseSubscriptions = false): void {
 		this.engine.restart(loseSubscriptions);
@@ -309,9 +309,9 @@ export class SimRelay implements RelayPort {
 		return { pushedRows: t?.pushedRows ?? 0, skippedRows: t?.skippedRows ?? 0 };
 	}
 
-	/** The server's current subscription of each open socket of a device (null = "all"). */
-	subscriptionsOf(deviceId: DeviceId): (readonly string[] | null)[] {
-		return this.engine.streamSockets().filter((s) => s.deviceId === deviceId).map((s) => (s.subs === null ? null : [...s.subs].sort()));
+	/** The server's current subscription of each open socket of a device (empty until it subscribes). */
+	subscriptionsOf(deviceId: DeviceId): (readonly string[])[] {
+		return this.engine.streamSockets().filter((s) => s.deviceId === deviceId).map((s) => [...s.subs].sort());
 	}
 
 	/** Graceful drain (deploy/eviction): commit the buffer, then every socket closes 1001. */

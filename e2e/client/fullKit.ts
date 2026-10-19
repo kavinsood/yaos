@@ -83,6 +83,7 @@ class DroppableSession implements RelaySession {
 		this.inner.append(frame);
 	}
 	bufferedBytes(): number { return this.dead ? 0 : this.inner.bufferedBytes(); }
+	subscribe(streams: Parameters<RelaySession["subscribe"]>[0]): void { if (!this.dead) this.inner.subscribe(streams); }
 	feed(afterSeq: Parameters<RelaySession["feed"]>[0]) { return this.dead ? Promise.reject(netError("feed")) : this.inner.feed(afterSeq); }
 	read(...a: Parameters<RelaySession["read"]>) { return this.dead ? Promise.reject(netError("read")) : this.inner.read(...a); }
 	readBatch(...a: Parameters<RelaySession["readBatch"]>) { return this.dead ? Promise.reject(netError("read")) : this.inner.readBatch(...a); }

@@ -31,7 +31,7 @@ export type WireServerFrame =
 	| { readonly kind: "provisional"; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string; readonly payload: Uint8Array }
 	| { readonly kind: "committed"; readonly seq: number; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string; readonly payload: Uint8Array }
 	| { readonly kind: "notice"; readonly seq: number; readonly stream: string; readonly deviceId: string; readonly clientFrameId: string }
-	/** STREAM_SKIPPED (relay-wire §19): the rows of one frame merged into seq order. */
+	/** STREAM_SKIPPED (relay-wire §5.6): the rows of one frame merged into seq order. */
 	| { readonly kind: "skipped"; readonly rows: readonly WireSkippedRow[] };
 
 export interface WireSkippedRow {
@@ -209,8 +209,6 @@ export type WireControl =
 		readonly runtimeEpoch: string | null;
 		readonly liveness: { readonly idleMs: number; readonly timeoutMs: number } | null;
 		readonly limits: WireLimits;
-		/** VAULT_READY.capabilities.subscriptions (null: absent, the relay has no subscriptions). */
-		readonly subscriptions: number | null;
 	}
 	| { readonly type: "STREAM_RECEIPTS"; readonly head: number; readonly receipts: readonly WireReceipt[] }
 	| { readonly type: "STREAM_APPEND_REJECTED"; readonly stream: string; readonly clientFrameId: string; readonly code: string; readonly seq: number | null }
@@ -232,7 +230,7 @@ export function encodeControl(message: Readonly<Record<string, unknown>>): strin
 	return CONTROL_PREFIX + JSON.stringify(message);
 }
 
-/** STREAM_SUBSCRIBE (relay-wire §19): the full replacement set. */
+/** STREAM_SUBSCRIBE (relay-wire §5.6): the full replacement set. */
 export function encodeSubscribe(streams: readonly string[]): string {
 	return encodeControl({ type: "STREAM_SUBSCRIBE", streams });
 }
@@ -325,7 +323,6 @@ export function parseControl(text: string): WireControl | null {
 				runtimeEpoch: str(o, "runtimeEpoch"),
 				liveness,
 				limits: parseLimits(o["limits"]),
-				subscriptions: isRecord(o["capabilities"]) ? positive(o["capabilities"], "subscriptions") : null,
 			};
 		}
 		case "STREAM_RECEIPTS": {
@@ -387,7 +384,7 @@ export function parseControl(text: string): WireControl | null {
 
 // ---- binary catch-up reads (relay-wire §7.2) ----------------------------------
 
-/** Accept / Content-Type of the binary read reply; a relay without it answers JSON (the reply's Content-Type tells). */
+/** Content-Type of every 200 read reply (the client does not check it; tests and fakes set it). */
 export const READ_BINARY_TYPE = "application/vnd.yaos.streams-read.v1+binary";
 const READ_BINARY_VERSION = 1;
 

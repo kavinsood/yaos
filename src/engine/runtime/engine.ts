@@ -186,7 +186,7 @@ export class LogEngine {
 		});
 		c.live = new LiveIngest(c);
 		c.sess = new SessionLoop(c);
-		c.subs = new Subscriptions(c, resolveSkipDefer(c.deviceClass, c.tuning), opts.subscribe !== false);
+		c.subs = new Subscriptions(c, resolveSkipDefer(c.deviceClass, c.tuning));
 		c.mirror = new MirrorWriter(c, opts.sideFiles ?? null);
 		const eng = new LogEngine(c);
 		if (o.outcome.t === "fresh" && opts.sideFiles) {

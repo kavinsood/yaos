@@ -37,8 +37,8 @@ export class SimRelaySession implements RelaySession {
 	/** The server still treats the socket as open (fan-out target, accepts messages). */
 	srvOpen = true;
 	gate: RateGate | null = null;
-	/** The accepted STREAM_SUBSCRIBE set; null = "all" (never subscribed, or lost in a restart). */
-	subs: Set<string> | null = null;
+	/** The accepted STREAM_SUBSCRIBE set; empty until the socket subscribes (or after a restart that lost it). */
+	subs: Set<string> = new Set();
 	/** The set as persisted in the socket attachment (survives a restart); null = none, or it overflowed. */
 	persistedSubs: readonly string[] | null = null;
 
@@ -97,9 +97,9 @@ export class SimRelaySession implements RelaySession {
 		this.up.push(this.delay(this.link.uplinkMs), { k: "append", frame: copy, bytes }, rate > 0 ? (bytes * 1000) / rate : 0);
 	}
 
-	/** STREAM_SUBSCRIBE on the uplink (in order with appends). Only when the relay has the capability. */
+	/** STREAM_SUBSCRIBE on the uplink (in order with appends). */
 	subscribe(streams: readonly StreamName[]): void {
-		if (this.ended || this.limits.maxSubscriptions <= 0) return;
+		if (this.ended) return;
 		if (streams.length > this.limits.maxSubscriptions) throw new RangeError(`sim subscribe: ${streams.length} streams exceed maxSubscriptions`);
 		this.subscription = [...streams];
 		this.sendSubscription();

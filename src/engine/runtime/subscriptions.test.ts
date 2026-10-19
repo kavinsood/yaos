@@ -16,7 +16,7 @@ import { converged, drive, sleep, startTestEngine, until } from "./testHarness";
 
 const TUNING: Partial<EngineTuning> = { maintenanceMs: 250, subscribeDebounceMs: 250 };
 
-async function world(o: { b?: Partial<EngineTuning>; relayLimits?: { maxSubscriptions: number }; subscribeB?: boolean } = {}) {
+async function world(o: { b?: Partial<EngineTuning>; relayLimits?: { maxSubscriptions: number } } = {}) {
 	const clock = new VirtualClock(Date.UTC(2026, 9, 19, 12));
 	clock.onError = (e) => {
 		throw e;
@@ -24,7 +24,7 @@ async function world(o: { b?: Partial<EngineTuning>; relayLimits?: { maxSubscrip
 	const relay = new SimRelay({ clock, ...(o.relayLimits ? { limits: o.relayLimits } : {}) });
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", clock, tuning: TUNING });
 	const { engine: b } = await startTestEngine({
-		relay, deviceId: "dev-b", clock, tuning: { ...TUNING, ...o.b }, ...(o.subscribeB === false ? { extra: { subscribe: false } } : {}),
+		relay, deviceId: "dev-b", clock, tuning: { ...TUNING, ...o.b },
 	});
 	await until(() => a.status().phase === "live" && b.status().phase === "live", 10_000, "live", clock);
 	return { clock, relay, a, b };
@@ -105,23 +105,6 @@ test("subscriptions: the set is capped at maxSubscriptions, bound streams first"
 	} finally {
 		await drive(a.stop(), clock);
 		await drive(b.stop(), clock);
-	}
-});
-
-test("subscriptions: a relay without them, or subscribe false, gets nothing and pushes every row", async () => {
-	for (const o of [{ relayLimits: { maxSubscriptions: 0 } }, { subscribeB: false }]) {
-		const { clock, relay, a, b } = await world(o);
-		try {
-			const [id] = await docs(clock, a, 1);
-			await drive(a.editDoc(id!, (t) => t.insert(t.length, "more;")), clock);
-			await converged([a, b], 30_000, clock);
-			assert.deepEqual(subsOf(relay, b), [null], "b never subscribed: every stream");
-			assert.equal(relay.fanout("dev-b" as DeviceId).skippedRows, 0);
-			assert.equal(b.c.live.stats.skipped, 0);
-		} finally {
-			await drive(a.stop(), clock);
-			await drive(b.stop(), clock);
-		}
 	}
 });
 

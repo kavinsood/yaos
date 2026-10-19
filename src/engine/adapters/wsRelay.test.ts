@@ -11,8 +11,8 @@ import {
 	type WsRelayOptions,
 } from "./wsRelay";
 import { CONTROL_PREFIX } from "./relayFrames";
-import { bytesToBase64, RelayHttpError } from "./relayHttp";
-import { FakeSocket, fakeFetch, fakeSockets, jsonResponse, ManualClock, type FakeRequest } from "./relayTestFakes";
+import { RelayHttpError } from "./relayHttp";
+import { FakeSocket, fakeFetch, fakeSockets, jsonResponse, ManualClock, readResponse, type FakeRequest } from "./relayTestFakes";
 
 const TOKEN = "device-token-SECRET-xyz";
 const TICKET = "ticket.SECRET";
@@ -98,7 +98,7 @@ describe("wsRelay connect", () => {
 		assert.equal(session.canWrite, true);
 		assert.deepEqual(session.limits, {
 			maxFrameBytes: 1048576, maxCheckpointBytes: 4194304, appendBytesPerSec: 262144, burstBytes: 2097152,
-			feedPageRows: 1000, readPageBytes: 1048576, readBatchStreams: 1, maxSubscriptions: 0,
+			feedPageRows: 1000, readPageBytes: 1048576, readBatchStreams: 1, maxSubscriptions: 128,
 		});
 	});
 
@@ -413,26 +413,20 @@ describe("wsRelay session events", () => {
 });
 
 describe("wsRelay subscriptions", () => {
-	const SUBS_READY = { ...READY, capabilities: { streams: 1, subscriptions: 1 }, limits: { ...READY.limits, maxSubscriptions: 3 } };
+	const SUBS_READY = { ...READY, limits: { ...READY.limits, maxSubscriptions: 3 } };
 	const subscribes = (socket: FakeSocket) => socket.sent.filter((m): m is string => typeof m === "string" && m.includes("STREAM_SUBSCRIBE"))
 		.map((m) => JSON.parse(m.slice(CONTROL_PREFIX.length)) as unknown);
 
-	it("maxSubscriptions needs both the capability and the limit", async () => {
+	it("maxSubscriptions comes from VAULT_READY limits", async () => {
 		assert.equal((await open({}, SUBS_READY)).session.limits.maxSubscriptions, 3);
-		assert.equal((await open({}, { ...SUBS_READY, capabilities: { streams: 1 } })).session.limits.maxSubscriptions, 0, "no capability");
-		assert.equal((await open({}, { ...SUBS_READY, limits: READY.limits })).session.limits.maxSubscriptions, 0, "no limit");
 	});
 
-	it("subscribe sends the full set; a relay without subscriptions gets nothing", async () => {
+	it("subscribe sends the full set; more than maxSubscriptions throws", async () => {
 		const { socket, session } = await open({}, SUBS_READY);
-		session.subscribe!([S("b:x"), S("c:y")]);
-		session.subscribe!([]);
+		session.subscribe([S("b:x"), S("c:y")]);
+		session.subscribe([]);
 		assert.deepEqual(subscribes(socket), [{ type: "STREAM_SUBSCRIBE", streams: ["b:x", "c:y"] }, { type: "STREAM_SUBSCRIBE", streams: [] }]);
-		assert.throws(() => session.subscribe!([S("b:1"), S("b:2"), S("b:3"), S("b:4")]), RangeError, "over maxSubscriptions");
-
-		const old = await open();
-		old.session.subscribe!([S("b:x")]);
-		assert.deepEqual(subscribes(old.socket), [], "never sent without the capability");
+		assert.throws(() => session.subscribe([S("b:1"), S("b:2"), S("b:3"), S("b:4")]), RangeError, "over maxSubscriptions");
 	});
 
 	it("STREAM_RESEND resends the last set before resendUnreceipted; nothing when never subscribed", async () => {
@@ -440,7 +434,7 @@ describe("wsRelay subscriptions", () => {
 		const events = collect(session);
 		socket.control({ type: "STREAM_RESEND", reason: "runtime_restarted", runtimeEpoch: "R2", head: 50 });
 		assert.deepEqual(subscribes(socket), []);
-		session.subscribe!([S("b:x")]);
+		session.subscribe([S("b:x")]);
 		socket.control({ type: "STREAM_RESEND", reason: "runtime_restarted", runtimeEpoch: "R3", head: 51 });
 		assert.deepEqual(subscribes(socket), [{ type: "STREAM_SUBSCRIBE", streams: ["b:x"] }, { type: "STREAM_SUBSCRIBE", streams: ["b:x"] }]);
 		assert.deepEqual(events, [{ t: "resendUnreceipted", headSeq: 50 }, { t: "resendUnreceipted", headSeq: 51 }]);
@@ -471,7 +465,7 @@ describe("wsRelay subscriptions", () => {
 	it("subscribe after close sends nothing", async () => {
 		const { socket, session } = await open({}, SUBS_READY);
 		session.close(1000, "bye");
-		session.subscribe!([S("b:x")]);
+		session.subscribe([S("b:x")]);
 		assert.deepEqual(subscribes(socket), []);
 	});
 });
@@ -524,8 +518,8 @@ describe("wsRelay session sending", () => {
 			seen.push(req);
 			if (req.url.pathname.endsWith("/feed")) return jsonResponse({ vaultEpoch: "E1", head: 42, changes: [], nextAfter: null });
 			if (req.url.pathname.endsWith("/read")) {
-				return jsonResponse({ vaultEpoch: "E1", head: 42, stream: "ns", lastSeq: 1, checkpointSeq: 0, gcSeq: 0, checkpoint: null,
-					rows: [{ seq: 1, deviceId: "d", clientFrameId: "c", payload: bytesToBase64(bytes(5)) }], nextAfter: null });
+				return readResponse([{ stream: "ns", lastSeq: 1, checkpointSeq: 0, gcSeq: 0, checkpoint: null,
+					rows: [{ seq: 1, deviceId: "d", clientFrameId: "c", payload: bytes(5) }], nextAfter: null }]);
 			}
 			return jsonResponse({ stream: "ns", coversSeq: 1, gcSeq: 0, deletedSegments: 0 });
 		});
@@ -571,14 +565,14 @@ describe("wsRelay session HTTP liveness", () => {
 
 describe("wsRelay batched read", () => {
 	const page = (stream: string, seq: number) => ({ stream, lastSeq: seq, checkpointSeq: 0, gcSeq: 0, checkpoint: null,
-		rows: [{ seq, deviceId: "d", clientFrameId: `c${seq}`, payload: bytesToBase64(bytes(seq)) }], nextAfter: null });
+		rows: [{ seq, deviceId: "d", clientFrameId: `c${seq}`, payload: bytes(seq) }], nextAfter: null });
 	const reqs = (...names: string[]) => names.map((n, i) => ({ stream: S(n), afterSeq: i, preferCheckpoint: i === 0 }));
 
 	it("sends r= entries under the batch cap and maps the page prefix", async () => {
 		const seen: FakeRequest[] = [];
 		const { session } = await open({}, { ...READY, limits: { ...READY.limits, readBatchMaxStreams: 2 } }, (req) => {
 			seen.push(req);
-			return jsonResponse({ vaultEpoch: "E1", head: 42, pages: [page("b:a", 3)] });
+			return readResponse([page("b:a", 3)]);
 		});
 		assert.equal(session.limits.readBatchStreams, 2);
 		const pages = await session.readBatch(reqs("b:a", "b:x.y", "b:c"));
@@ -591,17 +585,17 @@ describe("wsRelay batched read", () => {
 	});
 
 	it("rejects a page for another stream or more pages than entries; a relay without the limit gets single reads", async () => {
-		let reply: unknown = { pages: [page("b:other", 1)] };
-		const { session } = await open({}, { ...READY, limits: { ...READY.limits, readBatchMaxStreams: 8 } }, () => jsonResponse(reply));
+		let reply = [page("b:other", 1)];
+		const { session } = await open({}, { ...READY, limits: { ...READY.limits, readBatchMaxStreams: 8 } }, () => readResponse(reply));
 		await assert.rejects(session.readBatch(reqs("b:a", "b:b")), /malformed_response/);
-		reply = { pages: [page("b:a", 1), page("b:b", 2), page("b:c", 3)] };
+		reply = [page("b:a", 1), page("b:b", 2), page("b:c", 3)];
 		await assert.rejects(session.readBatch(reqs("b:a", "b:b")), /malformed_response/);
-		reply = { pages: [] };
+		reply = [];
 		await assert.rejects(session.readBatch(reqs("b:a", "b:b")), /malformed_response/);
 		const seen: FakeRequest[] = [];
 		const old = await open({}, READY, (req) => {
 			seen.push(req);
-			return jsonResponse({ vaultEpoch: "E1", head: 42, ...page("b:a", 4) });
+			return readResponse([page("b:a", 4)]);
 		});
 		const single = await old.session.readBatch(reqs("b:a", "b:b"));
 		assert.deepEqual(single.map((p) => p.lastSeq), [4]);

@@ -1,4 +1,4 @@
-// SimRelay subscriptions (relay-wire §19, server/src/streams/relay.ts): STREAM_SUBSCRIBE, filtered fan-out with
+// SimRelay subscriptions (relay-wire §5.6, server/src/streams/relay.ts): STREAM_SUBSCRIBE, filtered fan-out with
 // inline STREAM_SKIPPED runs, PROVISIONAL only where wanted, own-device rows always pushed, the set across restarts.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -86,7 +86,7 @@ test("relay subscribe: a restart restores a set that fit the attachment; a large
 	r.session.subscribe(large);
 	await clock.runUntilIdle();
 	relay.restart();
-	assert.deepEqual(relay.subscriptionsOf(r.deviceId), [null], "overflowed: every stream");
+	assert.deepEqual(relay.subscriptionsOf(r.deviceId), [[]], "overflowed: empty");
 	w.session.append(frame("b:other", "f1", "x"));
 	await clock.runUntilIdle();
 	assert.equal(relay.subscriptionsOf(r.deviceId)[0]?.length, 60, "resent on STREAM_RESEND");
