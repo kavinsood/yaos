@@ -95,8 +95,11 @@ export class BootTrace {
 
 	wrapStorage(inner: StoragePort): StoragePort {
 		const trace = this;
+		// Explicit forwarding (no spread): a new StoragePort member fails to compile here.
 		return {
-			...inner,
+			deleteDatabase: (name) => inner.deleteDatabase(name),
+			listDatabases: () => inner.listDatabases(),
+			requestPersistence: () => inner.requestPersistence(),
 			async open<S extends SchemaShape>(name: string, version: number, stores: Parameters<StoragePort["open"]>[2]) {
 				const db = await inner.open<S>(name, version, stores as never);
 				const wrapped: StorageDb<S> = {

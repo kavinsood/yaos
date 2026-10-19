@@ -20,6 +20,7 @@
  *
  * Writes LOG_DIR/client-e2e-fanout-<label>-<stamp>.json (no secrets) and exits 1 on any failed check.
  */
+import { FRAME_COMMITTED, FRAME_COMMIT_NOTICE, FRAME_PROVISIONAL, FRAME_SKIPPED } from "../../src/engine/adapters/relayFrames";
 import type { DeviceClass } from "../../src/core/limits";
 import type { DocId, VaultPath } from "../../src/core/types";
 import type { WebSocketCtor, WebSocketLike } from "../../src/engine/adapters/wsRelay";
@@ -39,7 +40,7 @@ const READER_CLASS = arg("reader-class", "desktop") as DeviceClass;
 const OPERATOR_CONTEXT = arg("operator-context", "");
 const R = new Report();
 
-const FRAME_KINDS: Record<number, string> = { 0x10: "provisional", 0x11: "committed", 0x12: "notice", 0x13: "skipped" };
+const FRAME_KINDS: Record<number, string> = { [FRAME_PROVISIONAL]: "provisional", [FRAME_COMMITTED]: "committed", [FRAME_COMMIT_NOTICE]: "notice", [FRAME_SKIPPED]: "skipped" };
 
 /** What the reader's transport saw while `on`. */
 class Meter {

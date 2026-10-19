@@ -17,7 +17,9 @@ import { kindOfPath, type DocKind, type VaultPath } from "../../src/core/types";
 import type { SideFileName, SideFilePort } from "../../src/ports/vault";
 import type { DiskOp, DiskReadRequest, DiskReadResult, Lane } from "../../src/protocol/messages";
 import type { DiskGateway, ExecResult } from "../../src/engine/reconcile/deps";
-import { SnapshotJob } from "../../src/engine/snapshots/snapshotJob";
+import { SnapshotJob, type SnapshotDeps } from "../../src/engine/snapshots/snapshotJob";
+import { createWebClock } from "../../src/engine/adapters/webClock";
+import { createNoopCrypto } from "../../src/engine/adapters/noopCrypto";
 import { createWebHash } from "../../src/engine/adapters/webHash";
 
 const gc = (globalThis as { gc?: () => void }).gc;
@@ -84,10 +86,11 @@ const side: SideFilePort = {
 const files = [...vault.entries()].map(([path, b]) => ({ path: path as VaultPath, kind: kindOfPath(path as VaultPath) as DocKind, size: b.length }));
 const settings = { enabled: true, keepDaily: 7, uploadToBlobStore: false };
 let now = Date.UTC(2026, 9, 7);
-const deps = {
-	disk: gateway, side, clock: { now: () => now, monotonic: () => now }, files: () => files, settings: () => settings,
-	crypto: { blobAddress: async (h: string) => h }, hash: createWebHash(), remote: null, deviceLabel: "bench",
-} as unknown as ConstructorParameters<typeof SnapshotJob>[0];
+const hash = createWebHash();
+const deps: SnapshotDeps = {
+	disk: gateway, side, clock: { ...createWebClock(), now: () => now }, files: () => files, settings: () => settings,
+	crypto: createNoopCrypto(hash), hash, remote: null, deviceLabel: "bench",
+};
 const job = new SnapshotJob(deps);
 
 const rss0 = process.resourceUsage().maxRSS * 1024;
