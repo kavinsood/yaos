@@ -130,7 +130,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 				if (preferCheckpoint && !disputedRetry) {
 					disputedRetry = true;
 					preferCheckpoint = false;
-					await repo.tPatchStreams([{ stream, patch: (r) => { r.disputedCheckpointCoversSeq = ck.coversSeq; } }], deps.nowMs());
+					await repo.tPatchStreams([{ stream, patch: (r) => { r.disputedCheckpointCoversSeq = ck.coversSeq; } }]);
 					continue;
 				}
 				// Rows below the checkpoint are gone: nothing can complete this stream.
@@ -138,7 +138,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 					r.disputedCheckpointCoversSeq = ck.coversSeq;
 					r.frozen = 1;
 					r.frozenReason = "checkpoint-disputed";
-				} }], deps.nowMs());
+				} }]);
 				return result("disputed", detail);
 			}
 			const content = g.checkpoint;
@@ -185,7 +185,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 		const completeThrough = page.more ? null : Math.max(opts.headSeq, page.lastSeq);
 		const out = await repo.tReadPage({
 			stream, rows, quarantines, lateReceipts, settleAdoptables, freshSnapshot, completeThrough, lastSeq: page.lastSeq, checkpointSeq: page.checkpointSeq,
-		}, deps.nowMs());
+		});
 		removed.push(...out.removed);
 		updated.push(...out.updated);
 		renamed.push(...out.renamed);

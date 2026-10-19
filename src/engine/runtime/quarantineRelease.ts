@@ -55,7 +55,7 @@ async function regate(c: EngineCtx, stream: StreamName, rows: readonly Quarantin
 }
 
 async function release(c: EngineCtx, stream: StreamName, pass: readonly TailRecord[], dismiss: readonly QuarantineRecord[]): Promise<void> {
-	await c.repo.tReleaseQuarantine(stream, pass, dismiss, c.now());
+	await c.repo.tReleaseQuarantine(stream, pass, dismiss);
 	c.docs.clearCausal(stream);
 	for (const n of c.noticeList()) {
 		if (!n.code.startsWith("frozen:")) continue;
@@ -141,7 +141,7 @@ async function regateUnopenedOnce(c: EngineCtx): Promise<number> {
 			if (g.t === "row" && !(g.row.flags & LOCAL_FLAG_UNOPENED)) out.push(g.row);
 		}
 		if (out.length === 0) continue;
-		const replaced = await c.repo.tReplaceTail(rt.stream, out, c.now());
+		const replaced = await c.repo.tReplaceTail(rt.stream, out);
 		c.diag("unopened-regated", { stream: rt.stream, rows: replaced });
 		await rt.resume();
 		await after(false);

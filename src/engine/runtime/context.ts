@@ -493,7 +493,7 @@ export class EngineCtx {
 		await this.repo.tPatchStreams([{ stream, patch: (r) => {
 			r.frozen = 1;
 			r.frozenReason = reason;
-		} }], this.now());
+		} }]);
 		this.frozen(stream, reason, rec?.cls ?? null);
 	}
 

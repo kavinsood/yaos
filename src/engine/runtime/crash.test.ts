@@ -198,7 +198,7 @@ test("crash probe is not vacuous: a V jump past unread rows is reported", async 
 		await until(() => b.isIdle(), 3_000, "idle");
 		const storage = new MemStoragePort();
 		const o = await Repo.open(storage, IDENT, Date.now());
-		await o.repo!.tFeedPage([], relay.head(), relay.head(), Date.now()); // bug: V jumps, no stream marked stale
+		await o.repo!.tFeedPage([], relay.head(), relay.head()); // bug: V jumps, no stream marked stale
 		o.repo!.close();
 		await assert.rejects(probe(storage, relay), /passes unaccounted seq/);
 	} finally {

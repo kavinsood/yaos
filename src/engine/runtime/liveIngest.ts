@@ -172,7 +172,7 @@ export class LiveIngest {
 		const stale = items.filter((it) => it.t === "stale").length;
 		let res;
 		try {
-			res = await c.repo.tLive(items, c.now(), c.day());
+			res = await c.repo.tLive(items, c.day());
 		} catch (e) {
 			this.stats.failedBatches++;
 			c.diag("live-batch-failed", { rows: items.length, error: String(e) });

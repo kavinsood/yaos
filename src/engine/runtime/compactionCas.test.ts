@@ -161,7 +161,7 @@ test("checkpoint outcome table: not-advancing refresh, too-large hold, ahead-of-
 		const C = a!.c.repo.stream(stream)!.appliedSeq;
 		// Another device's checkpoint at C landed unseen: relay says not-advancing; the read refreshes it.
 		assert.equal((await writeBodyCheckpoint(a!.c.deps, new CheckpointState(), s, stream)).t, "ok");
-		await a!.c.repo.tPatchStreams([{ stream, patch: (r) => { r.remoteCheckpointCoversSeq = 0; r.rowsSinceRemoteCheckpoint = 7; } }], a!.c.now());
+		await a!.c.repo.tPatchStreams([{ stream, patch: (r) => { r.remoteCheckpointCoversSeq = 0; r.rowsSinceRemoteCheckpoint = 7; } }]);
 		const na = await writeBodyCheckpoint(a!.c.deps, st, forced(s, { t: "refused", reason: "not-advancing", retryAfterMs: null }), stream);
 		assert.deepEqual(na, { t: "not-advancing", refreshed: C });
 		assert.equal(a!.c.repo.stream(stream)!.remoteCheckpointCoversSeq, C);

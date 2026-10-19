@@ -146,7 +146,7 @@ export class DocRuntime {
 				const create = held === null && docId ? c.createDependency(docId) : null;
 				const dependsOn = held ?? create?.cfid ?? null;
 				const frames = await buildBodyFrames(c.deps, { stream: h.stream, content: taken.content, flags: taken.flags, authorNsSeq: c.ns.coversSeq, dependsOn, sendAfter: create?.live === true, nowMs: c.now() });
-				c.addOutbox(await c.repo.tEdit(frames, c.now()));
+				c.addOutbox(await c.repo.tEdit(frames));
 				c.ckpt.lastActivity.set(h.stream, c.mono());
 				this.stats.framesClosed++;
 				durable?.(true);
@@ -322,7 +322,7 @@ export class DocRuntime {
 				const now = c.now();
 				const f = await buildAdoptFrame(c.deps, ev.stream, g.inner.kind, g.inner.authorNsSeq, g.inner.flags, g.update,
 					{ deviceId: ev.deviceId, clientFrameId: ev.clientFrameId, receivedAtMs: now }, now);
-				c.addOutbox(await c.repo.tEdit([f], now, false));
+				c.addOutbox(await c.repo.tEdit([f], false));
 				this.stats.adopted++;
 				adopted = true;
 			});

@@ -296,7 +296,7 @@ test("quarantine: a release whose snapshot predates a later row keeps the doc fr
 		const snapshot = await b.c.repo.quarantineOf(stream);
 		await editDoc(a, id, (t) => t.insert(t.length, "k2;"));
 		await until(() => b.c.repo.stream(stream)?.quarantinedRows === 3, 3_000, "a third row quarantined");
-		const r = await b.c.repo.tReleaseQuarantine(stream, [], snapshot, Date.now());
+		const r = await b.c.repo.tReleaseQuarantine(stream, [], snapshot);
 		assert.equal(r.frozen, 1, "the later row still freezes the doc");
 		assert.equal(r.quarantinedRows, 1);
 		assert.equal((await b.c.repo.quarantineOf(stream)).filter((q) => !q.detail.startsWith("dismissed:")).length, 1);
@@ -321,12 +321,12 @@ test("quarantine: a reader-dependent row this reader opens by the time it is sto
 		const repo = b.c.repo;
 		const tLive = repo.tLive.bind(repo);
 		let raced = 0;
-		repo.tLive = (items, nowMs, day) => {
+		repo.tLive = (items, day) => {
 			if (fc.failOpen && items.some((it) => it.t === "quarantine")) {
 				fc.failOpen = false; // the key arrives after the gate failed, before the store
 				raced++;
 			}
-			return tLive(items, nowMs, day);
+			return tLive(items, day);
 		};
 		const sessions = b.c.sess.stats.sessions;
 		fc.failOpen = true;

@@ -177,7 +177,7 @@ export async function recoverFromMirror(c: EngineCtx, files: SideFilePort): Prom
 		});
 	}
 	if (records.length === 0) return 0;
-	await c.repo.tImportOutbox(records, now);
+	await c.repo.tImportOutbox(records);
 	c.diag("recovered-from-mirror", { frames: records.length, generation: picked.mirror.generation });
 	return records.length;
 }

@@ -193,7 +193,7 @@ export class SessionLoop {
 			const v = c.repo.cursor.vaultSeq;
 			const page = await s.feed(v);
 			if (gen !== c.gen) return;
-			const res = await c.repo.tFeedPage(page.entries, page.throughSeq, page.headSeq, c.now());
+			const res = await c.repo.tFeedPage(page.entries, page.throughSeq, page.headSeq);
 			this.stats.feedPages++;
 			if (page.headSeq > c.repo.cursor.headSeqSeen) c.repo.cursor.headSeqSeen = page.headSeq;
 			noProgress = res.vaultSeq > v ? 0 : noProgress + 1;

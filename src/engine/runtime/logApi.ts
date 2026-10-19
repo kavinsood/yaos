@@ -75,7 +75,7 @@ export async function submitNs(c: EngineCtx, ops: readonly NsOp[], extra?: Extra
 		const frames: NewOutboxFrame[] = [];
 		for (const part of parts) frames.push(await buildNsFrame(c.deps, NS_STREAM, part, c.ns.coversSeq, c.ns.allocFrameNo(c.outbox), c.now()));
 		const more = extra ? await extra(frames) : [];
-		c.addOutbox(await c.repo.tEdit([...frames, ...more], c.now()));
+		c.addOutbox(await c.repo.tEdit([...frames, ...more]));
 		frames.forEach((f, i) => {
 			for (const op of parts[i]!) if (op.t === "create") c.pendingCreates.set(op.docId, { cfid: f.clientFrameId, live });
 		});
@@ -89,7 +89,7 @@ export async function submitCfg(c: EngineCtx, ops: readonly CfgOp[]): Promise<Cl
 	return c.docs.chain(async () => {
 		const frames: NewOutboxFrame[] = [];
 		for (const part of parts) frames.push(await buildCfgFrame(c.deps, CFG_STREAM, part, c.ns.coversSeq, c.cfg.allocFrameNo(c.outbox), c.now()));
-		c.addOutbox(await c.repo.tEdit(frames, c.now()));
+		c.addOutbox(await c.repo.tEdit(frames));
 		return frames.map((f) => f.clientFrameId);
 	});
 }
@@ -102,7 +102,7 @@ export async function submitSnap(c: EngineCtx, ops: readonly SnapOp[]): Promise<
 	return c.docs.chain(async () => {
 		const frames: NewOutboxFrame[] = [];
 		for (const part of parts) frames.push(await buildSnapFrame(c.deps, SNAP_STREAM, part, c.ns.coversSeq, c.now()));
-		c.addOutbox(await c.repo.tEdit(frames, c.now()));
+		c.addOutbox(await c.repo.tEdit(frames));
 		return frames.map((f) => f.clientFrameId);
 	});
 }

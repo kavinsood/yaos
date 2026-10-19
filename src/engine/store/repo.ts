@@ -344,7 +344,7 @@ export class Repo {
 	// -------------------------------------------------------------------------
 
 	/** T_edit (touchStream=true) or T_adopt (touchStream=false). Commits BEFORE any append. */
-	tEdit(frames: readonly NewOutboxFrame[], nowMs: number, touchStream = true): Promise<OutboxRecord[]> {
+	tEdit(frames: readonly NewOutboxFrame[], touchStream = true): Promise<OutboxRecord[]> {
 		return this.serial("tEdit", async () => {
 			const touched = new Map<StreamName, StreamRecord>();
 			const out = await this.db.tx([STORE.outbox, STORE.meta, STORE.streams], "readwrite", async (tx) => {
@@ -375,7 +375,7 @@ export class Repo {
 	// T_ingest + T_receipt + T_stale (one tx per live batch, arrival order)
 	// -------------------------------------------------------------------------
 
-	tLive(items: readonly LiveItem[], nowMs: number, day: string): Promise<LiveResult> {
+	tLive(items: readonly LiveItem[], day: string): Promise<LiveResult> {
 		return this.serial("tLive", async () => {
 			const seqs = items.map((i) => (i.t === "row" ? i.row.seq : i.t === "quarantine" ? i.rec.seq : i.seq));
 			const vAfter = this.cursor.preview(seqs);
@@ -483,7 +483,7 @@ export class Repo {
 	// T_feed_page
 	// -------------------------------------------------------------------------
 
-	tFeedPage(entries: readonly { readonly stream: StreamName; readonly lastSeq: Seq }[], throughSeq: Seq, headSeq: Seq, nowMs: number): Promise<{ vaultSeq: Seq; changed: StreamRecord[] }> {
+	tFeedPage(entries: readonly { readonly stream: StreamName; readonly lastSeq: Seq }[], throughSeq: Seq, headSeq: Seq): Promise<{ vaultSeq: Seq; changed: StreamRecord[] }> {
 		return this.serial("tFeedPage", async () => {
 			const vAfter = this.cursor.preview([], throughSeq);
 			const changed: Mut<StreamRecord>[] = [];
@@ -514,7 +514,7 @@ export class Repo {
 	// T_read_page
 	// -------------------------------------------------------------------------
 
-	tReadPage(input: ReadPageInput, nowMs: number): Promise<{ stream: StreamRecord; removed: OutboxRecord[]; updated: OutboxRecord[]; renamed: OutboxRename[]; tailPut: TailRecord[] }> {
+	tReadPage(input: ReadPageInput): Promise<{ stream: StreamRecord; removed: OutboxRecord[]; updated: OutboxRecord[]; renamed: OutboxRename[]; tailPut: TailRecord[] }> {
 		return this.serial("tReadPage", async () => {
 			const self = this.deviceId;
 			const removed: OutboxRecord[] = [];
@@ -653,7 +653,7 @@ export class Repo {
 	// Stream patches (checkpoint results, freeze, access time, textHash)
 	// -------------------------------------------------------------------------
 
-	tPatchStreams(patches: readonly { readonly stream: StreamName; readonly patch: (r: Mut<StreamRecord>) => void }[], nowMs: number): Promise<StreamRecord[]> {
+	tPatchStreams(patches: readonly { readonly stream: StreamName; readonly patch: (r: Mut<StreamRecord>) => void }[]): Promise<StreamRecord[]> {
 		if (patches.length === 0) return Promise.resolve([]);
 		return this.serial("tPatchStreams", async () => {
 			const out = await this.db.tx([STORE.streams], "readwrite", async (tx) => {
@@ -678,7 +678,7 @@ export class Repo {
 	 * The caller re-gated a snapshot: a record stored since (neither passed nor dismissed here) still counts and
 	 * keeps the doc frozen.
 	 */
-	tReleaseQuarantine(stream: StreamName, pass: readonly TailRecord[], dismiss: readonly QuarantineRecord[], nowMs: number): Promise<StreamRecord> {
+	tReleaseQuarantine(stream: StreamName, pass: readonly TailRecord[], dismiss: readonly QuarantineRecord[]): Promise<StreamRecord> {
 		return this.serial("tReleaseQuarantine", async () => {
 			const out = await this.db.tx([STORE.quarantine, STORE.tail, STORE.streams], "readwrite", async (tx) => {
 				const r: Mut<StreamRecord> = { ...((await tx.get(STORE.streams, stream)) ?? newStreamRecord(stream)) };
@@ -712,7 +712,7 @@ export class Repo {
 	 * like T_edit: the imported synced records carry no localOrder, and nothing says the frames' text (editor
 	 * keystrokes never saved, merges whose write died) is on disk, so Rc must hold until a merge settles it.
 	 */
-	tImportOutbox(records: readonly OutboxRecord[], nowMs: number): Promise<void> {
+	tImportOutbox(records: readonly OutboxRecord[]): Promise<void> {
 		return this.serial("tImportOutbox", async () => {
 			const touched = new Map<StreamName, StreamRecord>();
 			const next = await this.db.tx([STORE.outbox, STORE.meta, STORE.streams], "readwrite", async (tx) => {
@@ -743,7 +743,7 @@ export class Repo {
 	 * Re-gated fold rows (ns, cfg, snap) replace the unopened rows they stand for (quarantineRelease.regateUnopened). A row
 	 * gone meanwhile (snapshot compaction) is skipped; byte accounting follows the new content.
 	 */
-	tReplaceTail(stream: StreamName, rows: readonly TailRecord[], nowMs: number): Promise<number> {
+	tReplaceTail(stream: StreamName, rows: readonly TailRecord[]): Promise<number> {
 		return this.serial("tReplaceTail", async () => {
 			let n = 0;
 			const out = await this.db.tx([STORE.tail, STORE.streams], "readwrite", async (tx) => {
