@@ -137,6 +137,10 @@ export class SimDevice {
 	/** crashApp until restartApp. */
 	private appDown = false;
 	engineStarts = 0;
+	/** LogEngine diagnostics of every engine this device ran, counted by `code` or `code:cls` (sim stats). */
+	readonly diagCounts: Record<string, number> = {};
+	/** Checkpoints the gate refused on this device (checkpoint-disputed), with their detail. */
+	readonly disputed: string[] = [];
 	/** Texts that existed only in host memory when the app crashed (pending conflict copies; known gap). */
 	readonly crashLost: string[] = [];
 	readonly deviceId: DeviceId;
@@ -187,6 +191,17 @@ export class SimDevice {
 			startRetryMs: 1_000,
 			tzOffsetMinutes: () => 0,
 			log: this.opts.log,
+			onDiag: (ev) => {
+				this.opts.log?.(`diag ${ev.code} ${JSON.stringify(ev.fields)}`);
+				const cls = ev.fields["cls"];
+				const k = typeof cls === "string" ? `${ev.code}:${cls}` : ev.code;
+				this.diagCounts[k] = (this.diagCounts[k] ?? 0) + 1;
+				const also = (code: string) => (this.diagCounts[`${code}:${String(cls)}`] = (this.diagCounts[`${code}:${String(cls)}`] ?? 0) + 1);
+				if (ev.code === "checkpoint-written" && Number(ev.fields["pendingOwn"]) > 0) also("checkpoint-written-pending");
+				// Not fresh: the device had state and its rows were collected meanwhile (offline, crashed, backgrounded).
+				if (ev.code === "checkpoint-adopted" && ev.fields["how"] !== "fresh") also("checkpoint-adopted-behind");
+				if (ev.code === "checkpoint-disputed" && this.disputed.length < 10) this.disputed.push(`${String(cls)}@${String(ev.fields["coversSeq"])} ${String(ev.fields["detail"])}`);
+			},
 			onRuntime: (rt) => {
 				if (this.handle === handle) this.vrt = rt;
 			},

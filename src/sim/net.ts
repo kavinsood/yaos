@@ -8,7 +8,7 @@
  * their texts), and an audit of every committed row (blobs never ride the log).
  */
 
-import { NS_STREAM, streamClass, streamDocId, type DeviceId, type DocId, type StreamName, type VaultId, type VaultPath } from "../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type DeviceId, type DocId, type StreamName, type VaultId, type VaultPath } from "../core/types";
 import type { BlobPort } from "../ports/blob";
 import type { RelayConnectResult, RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
@@ -31,6 +31,24 @@ export interface OracleDoc {
 	readonly kind: string;
 	/** Markdown text (null for other kinds). */
 	readonly text: string | null;
+}
+
+/** Fingerprints of a fold's canonical encoding (nsFoldV1 / cfgFoldV1 / snapFoldV1), by stream class. */
+export type FoldPrints = Readonly<Record<"ns" | "cfg" | "snap", string>>;
+
+/** What the relay oracle (a fresh device bootstrapped from the relay) folded. */
+export interface OracleResult {
+	readonly docs: OracleDoc[];
+	readonly error: string | null;
+	/** Its fold encodings once caught up (null: it did not catch up). */
+	readonly folds: FoldPrints | null;
+}
+
+/** FNV-1a fingerprint of bytes: `<length>:<hash>`. */
+export function bytesPrint(b: Uint8Array): string {
+	let h = 0x811c9dc5;
+	for (const x of b) h = Math.imul(h ^ x, 0x01000193) >>> 0;
+	return `${b.length}:${h.toString(16)}`;
 }
 
 /** A suite-1 oracle's keys and keyring records (a keyed device's SecretStorage contents; copied, never printed). */
@@ -61,6 +79,9 @@ export class SimNet {
 	blobsAvailable = true;
 	private readonly offline = new Set<DeviceId>();
 	private oracleRuns = 0;
+	/** Diagnostics of every oracle run, counted as SimDevice.diagCounts (checkpoint adoption on a fresh device). */
+	readonly oracleDiag: Record<string, number> = {};
+	readonly oracleDisputed: string[] = [];
 	private readonly audit = { foreign: new Set<StreamName>(), largestRecordRow: 0, docStreams: new Set<DocId>(), rows: 0, bytes: 0 };
 
 	constructor(readonly clock: VirtualClock, o: { readonly seed?: number; readonly linkMs?: number; readonly jitterMs?: number } = {}) {
@@ -137,7 +158,7 @@ export class SimNet {
 	 * Runs the clock (the caller must not be inside a clock step).
 	 * `suite1`: open a suite-1 vault with a keyed device's keys and records (DelayedCrypto, as the devices).
 	 */
-	async oracle(horizonMs = 120_000, suite1: OracleKeys | null = null): Promise<{ docs: OracleDoc[]; error: string | null }> {
+	async oracle(horizonMs = 120_000, suite1: OracleKeys | null = null): Promise<OracleResult> {
 		const n = ++this.oracleRuns;
 		const deviceId = `oracle-${n}` as DeviceId;
 		const random = new SeededRandom(hashLabel(deviceId));
@@ -151,15 +172,25 @@ export class SimNet {
 		const started = LogEngine.start({
 			ports: { relay: this.port(deviceId), storage, clock: this.clock, random, crypto, hash, blob: this.blobPort() },
 			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-oracle", sideFiles: null, autoReconnect: true, e2ee,
+			onDiag: (ev) => {
+				const cls = ev.fields["cls"];
+				const k = typeof cls === "string" ? `${ev.code}:${cls}` : ev.code;
+				this.oracleDiag[k] = (this.oracleDiag[k] ?? 0) + 1;
+				if (ev.code === "checkpoint-disputed" && this.oracleDisputed.length < 10) this.oracleDisputed.push(`${String(cls)}@${String(ev.fields["coversSeq"])} ${String(ev.fields["detail"])}`);
+			},
 		}).then((e) => (engine = e), (e) => (error = `oracle start: ${e instanceof Error ? e.message : String(e)}`));
 		await this.clock.runUntil(() => engine !== null || error !== null, horizonMs);
 		await started;
 		const eng = engine as LogEngine | null;
-		if (!eng) return { docs: [], error: error ?? "oracle start timed out" };
+		if (!eng) return { docs: [], error: error ?? "oracle start timed out", folds: null };
 		const head = this.streamHead(NS_STREAM);
-		const ok = await this.clock.runUntil(() => eng.isIdle() && eng.nsView().caughtUp && eng.nsView().coversSeq >= head, horizonMs);
+		const cfgHead = this.streamHead(CFG_STREAM);
+		const snapHead = this.streamHead(SNAP_STREAM);
+		const c = eng.c;
+		const ok = await this.clock.runUntil(() => eng.isIdle() && eng.nsView().caughtUp && eng.nsView().coversSeq >= head && c.cfg.coversSeq >= cfgHead && c.snap.coversSeq >= snapHead, horizonMs);
 		const docs: OracleDoc[] = [];
-		if (!ok) error = `oracle did not catch up (ns covers ${eng.nsView().coversSeq} of ${head})`;
+		if (!ok) error = `oracle did not catch up (ns covers ${eng.nsView().coversSeq} of ${head}, cfg ${c.cfg.coversSeq} of ${cfgHead}, snap ${c.snap.coversSeq} of ${snapHead})`;
+		const folds: FoldPrints | null = ok ? { ns: bytesPrint(c.ns.encodeState()), cfg: bytesPrint(c.cfg.encodeState()), snap: bytesPrint(c.snap.encodeState()) } : null;
 		for (const d of eng.listDocs()) {
 			if (d.state !== "live") continue;
 			let text: string | null = null;
@@ -176,6 +207,6 @@ export class SimNet {
 		let done = false;
 		void stopped.finally(() => (done = true));
 		await this.clock.runUntil(() => done && this.quiet(), 30_000);
-		return { docs, error };
+		return { docs, error, folds };
 	}
 }

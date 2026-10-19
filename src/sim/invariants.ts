@@ -5,8 +5,10 @@
  *                      the relay fold (a fresh observer bootstrapped from the
  *                      relay, net.oracle()) equals the disk: every live markdown
  *                      doc has its file with the same text, every markdown file
- *                      has a live doc; every device's NsFoldState encodes to the
- *                      same bytes; every resident body replica equals its file
+ *                      has a live doc; every device's ns, cfg and snap folds encode
+ *                      to the same bytes as the oracle's (a fresh device that adopted
+ *                      the relay's checkpoints, if any, plus the tail); every resident
+ *                      body replica equals its file
  *   2 tokens           every live (not user-deleted, not crash-unacknowledged) token
  *                      survives somewhere in the converged vault (conflict copies count),
  *                      contiguous: "[A.15]" exactly, so a token split by a concurrent
@@ -28,6 +30,11 @@
  *                      §j.1): every committed stream is ns / cfg / snap / k / b: / c:,
  *                      no ns / cfg / snap / k row exceeds MAX_NS_FRAME_BYTES, and no
  *                      live attachment doc has a b: / c: row
+ *   checkpoint         no checkpoint was disputed at the gate (devices and the oracle;
+ *                      every checkpoint on the sim relay is honest; a reader-dependent
+ *                      failure, a key or rules version not held yet, is no verdict), and no device has a
+ *                      stream frozen, stale or behind the relay's last seq (after GC a
+ *                      device that could not adopt the checkpoint stays behind)
  *   liveness           blob store calls after the heal (blobStore.ts): none still in
  *                      flight at quiescence (a stall's dead calls all ended, by their
  *                      idle window or a link abort), and the idle window never cut a
@@ -38,6 +45,8 @@
  */
 
 import { encodeNsFoldV1 } from "../core/codec/nsFoldV1";
+import { READER_DEPENDENT } from "../engine/runtime/quarantineRelease";
+import type { QuarantineRecord } from "../engine/store/schema";
 import { checkNsInvariants } from "../core/ns/verify";
 import { pathKey } from "../core/paths/pathKey";
 import { MAX_NS_FRAME_BYTES } from "../core/limits";
@@ -45,10 +54,10 @@ import { NS_STREAM, type VaultPath } from "../core/types";
 import { SETTING_FILES, tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
 import type { SimDevice } from "./device";
-import type { OracleDoc, SimNet } from "./net";
+import { bytesPrint, type FoldPrints, type OracleDoc, type SimNet } from "./net";
 
 export interface Violation {
-	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness";
+	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness" | "checkpoint";
 	readonly detail: string;
 }
 
@@ -64,13 +73,9 @@ function brief(s: string): string {
 	return JSON.stringify(s.length > 80 ? `${s.slice(0, 77)}...` : s);
 }
 
-function hex(b: Uint8Array): string {
-	let h = 0x811c9dc5;
-	for (const x of b) h = Math.imul(h ^ x, 0x01000193) >>> 0;
-	return `${b.length}:${h.toString(16)}`;
-}
+const hex = bytesPrint;
 
-export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly docs: readonly OracleDoc[]; readonly error: string | null }): Violation[] {
+export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly docs: readonly OracleDoc[]; readonly error: string | null; readonly folds?: FoldPrints | null }): Violation[] {
 	const out: Violation[] = [];
 	const first = devs[0];
 	if (!first) return out;
@@ -103,21 +108,30 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 		else if (doc.text !== null && f.text !== doc.text) out.push({ inv: "convergence", detail: `relay ${doc.path}=${brief(doc.text)} disk=${brief(f.text)}` });
 	}
 	for (const [k, f] of byKey) if ((f.path.endsWith(".md") || f.path.endsWith(".png")) && !docKeys.has(k)) out.push({ inv: "convergence", detail: `${f.path} never reached the relay` });
-	const folds = new Map<string, string[]>();
+	const folds = { ns: new Map<string, string[]>(), cfg: new Map<string, string[]>(), snap: new Map<string, string[]>() };
+	const add = (cls: keyof typeof folds, print: string, who: string) => folds[cls].set(print, [...(folds[cls].get(print) ?? []), who]);
+	// The relay oracle is a fresh device: it bootstrapped from the relay's checkpoints (when there are any) plus the
+	// tail, so its folds equal the devices' only if adopting a checkpoint gives the fold of the rows it covers.
+	if (oracle.folds) for (const cls of ["ns", "cfg", "snap"] as const) add(cls, oracle.folds[cls], "oracle");
 	for (const d of devs) {
-		const st = d.vrt?.log.c.ns.state;
-		if (!st) continue;
+		const c = d.vrt?.log.c;
+		const st = c?.ns.state;
+		if (!c || !st) continue;
 		const bad = checkNsInvariants(st);
 		if (bad) out.push({ inv: "convergence", detail: `${d.name}: ns invariant ${bad}` });
-		const h = hex(encodeNsFoldV1(st));
-		folds.set(h, [...(folds.get(h) ?? []), d.name]);
+		add("ns", hex(encodeNsFoldV1(st)), d.name);
+		add("cfg", hex(c.cfg.encodeState()), d.name);
+		add("snap", hex(c.snap.encodeState()), d.name);
 		for (const [path, text] of d.vault.snapshot()) {
 			if (!path.endsWith(".md")) continue;
 			const crdt = d.engineText(path);
 			if (crdt !== null && crdt !== text) out.push({ inv: "convergence", detail: `${d.name}: body replica of ${path}=${brief(crdt)} disk=${brief(text)}` });
 		}
 	}
-	if (folds.size > 1) out.push({ inv: "convergence", detail: `NsFoldState bytes differ: ${[...folds].map(([h, n]) => `${n.join("")}=${h}`).join(" ")}` });
+	for (const cls of ["ns", "cfg", "snap"] as const) {
+		const m = folds[cls];
+		if (m.size > 1) out.push({ inv: "convergence", detail: `${cls} fold bytes differ: ${[...m].map(([h, n]) => `${n.join(",")}=${h}`).join(" ")}` });
+	}
 	return out;
 }
 
@@ -256,6 +270,45 @@ export function checkClean(devs: readonly SimDevice[], net: SimNet, isDown: (i: 
 			if (v.buffer !== disk) bad(`${n}: view ${v.viewId} buffer ${brief(v.buffer)} != disk ${brief(disk)}`);
 		}
 	});
+	return out;
+}
+
+/**
+ * Invariant "checkpoint" (DESIGN §b.5, §d.7, §d.9): the sim's relay holds only honest checkpoints (no fault forges
+ * one), so the gate never disputes one on any device or on the oracle; and once quiescent no device still needs a
+ * row: no stream is frozen, stale, or behind the relay's last seq of the stream (GC'd rows are reachable only
+ * through the checkpoint, so a device that could not adopt one would be left here).
+ */
+export function checkCheckpoints(devs: readonly SimDevice[], net: SimNet): Violation[] {
+	const out: Violation[] = [];
+	const bad = (detail: string) => out.push({ inv: "checkpoint", detail });
+	// A reader-dependent failure (a key or rules version this reader does not have yet) is not a verdict on the
+	// checkpoint; the stream must still end caught up (below).
+	// "disputed before" repeats an earlier dispute of the same checkpoint, judged when it was first seen.
+	const verdict = (x: string) => {
+		const reason = x.split(" ")[1]?.replace(/:$/, "") ?? "";
+		return reason !== "disputed" && !READER_DEPENDENT.has(reason as QuarantineRecord["reason"]);
+	};
+	for (const d of devs) for (const x of d.disputed) if (verdict(x)) bad(`${d.name}: gate disputed a checkpoint: ${x}`);
+	for (const x of net.oracleDisputed) if (verdict(x)) bad(`oracle: gate disputed a checkpoint: ${x}`);
+	for (const d of devs) {
+		const repo = d.vrt?.log.c.repo;
+		if (!repo) continue;
+		const behind: string[] = [];
+		for (const r of repo.streams()) {
+			if (r.cls === "other") continue;
+			if (r.frozen) bad(`${d.name}: ${r.stream} frozen (${r.frozenReason ?? "?"})`);
+			// The newest row a reader must apply: forged rows (hostile relay) fail the gate and never count.
+			const rows = net.relay.store.rows(r.stream, true);
+			let last = 0;
+			for (let i = rows.length - 1; i >= 0; i--) if (!net.relay.forgedSeqs.has(rows[i]!.seq)) {
+				last = rows[i]!.seq;
+				break;
+			}
+			if (r.stale || r.appliedSeq < last) behind.push(`${r.stream} at ${r.appliedSeq} of ${last}${r.stale ? " stale" : ""} (gc ${net.relay.gcSeq(r.stream)})`);
+		}
+		if (behind.length > 0) bad(`${d.name}: ${behind.length} streams behind the relay: ${behind.slice(0, 4).join(", ")}`);
+	}
 	return out;
 }
 

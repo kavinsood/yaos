@@ -149,11 +149,13 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 				freshSnapshot = { stream, coversSeq: ck.coversSeq, encoding: content.encoding, bytes: content.state, createdAtMs: deps.nowMs() };
 				if (cls === "body" || cls === "canvas") checkpointState = content.state;
 				else replacedFold = true;
+				deps.diag("checkpoint-adopted", { cls, coversSeq: ck.coversSeq, how: "fresh" });
 			} else if (cls === "body" || cls === "canvas") {
 				const out = await unionBodyCheckpoint(deps, stream, ck.coversSeq, content.state);
 				if (!opts.stillValid()) return result("aborted");
 				if (!out || out.snapshotCoversSeq < ck.coversSeq) return result("retry", "union failed (CAS or unresolved ref)");
 				checkpointState = content.state;
+				deps.diag("checkpoint-adopted", { cls, coversSeq: ck.coversSeq, how: "union" });
 			} else if (cls === "ns" || cls === "cfg" || cls === "snap") {
 				const cur = repo.stream(stream)!;
 				const tail = await repo.getTail(stream, 0, ck.coversSeq);
@@ -165,6 +167,7 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 				if (!opts.stillValid()) return result("aborted");
 				if (!out) return result("retry", "fold snapshot CAS");
 				replacedFold = true;
+				deps.diag("checkpoint-adopted", { cls, coversSeq: ck.coversSeq, how: "replace" });
 			}
 		}
 		const items: LiveItem[] = [];

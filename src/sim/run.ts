@@ -20,12 +20,13 @@ import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
 import { generateUserAction, runUserAction, EXTRA_OPS, FULL_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights } from "./faults";
-import { activity, checkBlobLiveness, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, settingsPrint, type Violation } from "./invariants";
+import { activity, checkBlobLiveness, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, settingsPrint, type Violation } from "./invariants";
 import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
 import { SIM_SETTINGS, SimDevice } from "./device";
 import type { EngineSettings } from "../protocol/messages";
 import { SimNet } from "./net";
+import type { SimCheckpointStats } from "./relay";
 import type { CaseProfile } from "./vault";
 import { checkE2eeLeaks, oracleKeys, onboardSuite1, seededRk } from "./e2ee";
 import type { E2eeFaultStats } from "./e2eeFaults";
@@ -89,8 +90,45 @@ export interface SimReport {
 		readonly clobbers: number;
 		/** Suite-1 fault outcomes (e2eeFaults.ts), in a suite-1 run with faults. */
 		readonly e2ee?: E2eeFaultStats;
+		/** Checkpoint coverage: relay puts / GC / served pages, and adoptions / gate disputes on the devices and the oracle. */
+		readonly checkpoints: CheckpointStats;
 		/** Suite 1: the run's DelayedCrypto counters (strays must be 0: every crypto await went through RealWork). */
 		readonly realWork?: RealWork["stats"];
+	};
+}
+
+/** Checkpoint traffic of a run, by stream class (ns, cfg, snap, body, canvas). */
+export interface CheckpointStats extends SimCheckpointStats {
+	/** Checkpoints the devices adopted in catch-up reads (checkpoint-adopted). */
+	readonly adopted: Record<string, number>;
+	/** ... of which by a device that already had the stream (union / fold replace: rows below it were collected). */
+	readonly adoptedBehind: Record<string, number>;
+	/** ... and the oracle (a fresh device at the end of the run). */
+	readonly oracleAdopted: Record<string, number>;
+	/** Gate disputes (checkpoint-disputed), devices and oracle. */
+	readonly disputed: Record<string, number>;
+	/** CAS conflicts the writers saw (checkpoint-conflict). */
+	readonly conflicts: Record<string, number>;
+	/** Fold checkpoints written while the writer had own frames of the stream in its outbox. */
+	readonly writtenWithPending: Record<string, number>;
+}
+
+function byClass(counts: readonly Readonly<Record<string, number>>[], code: string): Record<string, number> {
+	const out: Record<string, number> = {};
+	for (const c of counts) for (const [k, n] of Object.entries(c)) if (k.startsWith(`${code}:`)) out[k.slice(code.length + 1)] = (out[k.slice(code.length + 1)] ?? 0) + n;
+	return out;
+}
+
+function checkpointStats(devs: readonly SimDevice[], net: SimNet): CheckpointStats {
+	const counts = devs.map((d) => d.diagCounts);
+	return {
+		...structuredClone(net.relay.ckpt),
+		adopted: byClass(counts, "checkpoint-adopted"),
+		adoptedBehind: byClass(counts, "checkpoint-adopted-behind"),
+		oracleAdopted: byClass([net.oracleDiag], "checkpoint-adopted"),
+		disputed: byClass([...counts, net.oracleDiag], "checkpoint-disputed"),
+		conflicts: byClass(counts, "checkpoint-conflict"),
+		writtenWithPending: byClass(counts, "checkpoint-written-pending"),
 	};
 }
 
@@ -248,7 +286,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		if (!(await faults.settle())) violations.push({ inv: "clean", detail: "crash inspections did not finish" });
 		const oracle = await net.oracle(120_000, c.suite1 ? oracleKeys(devs) : null);
 		if (c.suite1) violations.push(...checkE2eeLeaks(devs, net, ledger).violations, ...(faults.e2ee?.check() ?? []));
-		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net));
+		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net));
 		violations.push(...(await checkQuiet(clock, devs, net)));
 
 		const snap = [...(devs[0]?.vault.snapshot() ?? new Map<string, string>())].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
@@ -259,7 +297,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
+			stats: { steps: plan.length, skipped, tokens, files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), checkpoints: checkpointStats(devs, net), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
 		};
 	} finally {
 		seedEntropy(null);
