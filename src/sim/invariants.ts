@@ -73,7 +73,7 @@ import { SETTING_FILES, tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
 import type { SimDevice } from "./device";
 import { bytesPrint, type FoldPrints, type OracleDoc, type SimNet } from "./net";
-import { ABSENT, canvasCanonical, canvasFiles, canvasProblem, docIdOf, engineCanvasText, isConflictCopy, isTracked, lineageOf, readModel, type CanvasOracle } from "./canvas";
+import { ABSENT, canvasCanonical, canvasFiles, canvasProblem, docIdOf, engineCanvasText, isConflictCopy, isTracked, lineageOf, readModel, type CanvasOracle, type ReorderIntent } from "./canvas";
 import { canonicalJson, formatCanvasText, parseCanvasText, type JsonValue } from "../core/hash/canvasCanonical";
 
 export interface Violation {
@@ -405,7 +405,8 @@ export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[]
  *                fields at the top level, on nodes and on edges are tracked fields
  *   order        an uncontested reorder holds: "bring to front / send to back" of node n on device X still puts n
  *                above / below every node that was on the canvas then, unless another device reordered n or one of
- *                those nodes, X reordered them later, a program sorted them, or a conflict copy holds them
+ *                those nodes, X reordered them later, a program sorted them, or a conflict copy holds them. After
+ *                an IDB wipe without mirrors on X (orderLoss), the order may hold in another doc instead
  */
 export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): Violation[] {
 	const out: Violation[] = [];
@@ -443,13 +444,13 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 	// The converged canvases (device 0; convergence is checked separately): record -> [path, fields].
 	const holders = new Map<string, { path: string; doc: string | null; obj: Readonly<Record<string, unknown>> }[]>();
 	const roots: { path: string; doc: string | null; root: Readonly<Record<string, unknown>> }[] = [];
-	const order = new Map<string, { path: string; ids: string[] }>();
+	const order: OrderedCanvas[] = [];
 	for (const path of canvasFiles(first)) {
 		const m = readModel(first.vault.textOf(path) ?? "");
 		if (!m) continue;
 		const doc = docIdOf(first, path);
 		roots.push({ path, doc, root: m.root });
-		if (doc) order.set(doc, { path, ids: m.nodes.map((n) => String(n.id)) });
+		order.push({ path, doc, ids: m.nodes.map((n) => String(n.id)) });
 		for (const [kind, list] of [["n", m.nodes], ["e", m.edges]] as const) {
 			for (const o of list) {
 				const rec = `${kind}:${String(o.id)}`;
@@ -541,18 +542,9 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 		const group = new Set([r.node, ...r.siblings]);
 		if (oracle.reorders.some((x) => x.dev !== r.dev && group.has(x.node))) continue;
 		if (oracle.reorders.some((x) => x.dev === r.dev && x.node === r.node && x.atMs > r.atMs)) continue;
-		const where = r.doc !== null ? order.get(r.doc) : undefined;
-		if (where) {
-			const { path, ids } = where;
-			const at = ids.indexOf(r.node);
-			if (at < 0) continue;
-			for (const m of r.siblings) {
-				const mi = ids.indexOf(m);
-				if (mi < 0 || deletedNode(m) || oracle.sorted.has(m) || inCopy(m)) continue;
-				if (oracle.reorders.some((x) => x.dev === r.dev && x.node === m && x.atMs > r.atMs)) continue;
-				if (r.front ? at < mi : at > mi) bad(`reorder of ${r.node} to the ${r.front ? "front" : "back"} on ${r.dev} at step ${r.step} lost against ${m} in ${path}`);
-			}
-		}
+		const exempt = (m: string) => deletedNode(m) || oracle.sorted.has(m) || inCopy(m) || oracle.reorders.some((x) => x.dev === r.dev && x.node === m && x.atMs > r.atMs);
+		const loss = orderLoss(r, order, oracle.wipes, exempt);
+		if (loss) for (const m of loss.against) bad(`reorder of ${r.node} to the ${r.front ? "front" : "back"} on ${r.dev} at step ${r.step} lost against ${m} in ${loss.path}`);
 	}
 	return out;
 }
@@ -705,4 +697,45 @@ export function checkBounds(devs: readonly SimDevice[]): Violation[] {
 		}
 	}
 	return out;
+}
+
+/** A converged canvas's node order (device 0), with the doc its file is synced as. */
+export interface OrderedCanvas {
+	readonly path: string;
+	readonly doc: string | null;
+	readonly ids: readonly string[];
+}
+
+/**
+ * Where a reorder intent is lost: the canvas of its doc and the siblings it no longer sits above (front) / below
+ * (back), skipping siblings `exempt` excuses. null: it holds, or its doc / node is not on disk.
+ *
+ * An IDB wipe without mirrors on the reordering device after the reorder drops what it had not sent (DESIGN §i.5:
+ * recovery without mirrors is the fresh-device onboarding path of §j.5, L-only files become new docs). If the user
+ * renamed or moved the canvas meanwhile, nothing ties the file to its old doc: the file comes back as a new doc
+ * holding the reorder and the old doc returns at its old path without it (3 devices seed 15: B reordered offline,
+ * was wiped, renamed canvas/c2.canvas to boards/c4.canvas, then reconnected). The reorder is not lost if another
+ * doc's canvas (not a conflict copy, which `exempt` already covers) holds it.
+ */
+export function orderLoss(
+	r: ReorderIntent,
+	canvases: readonly OrderedCanvas[],
+	wipes: readonly { readonly dev: string; readonly atMs: number }[],
+	exempt: (id: string) => boolean,
+): { path: string; against: string[] } | null {
+	const lostIn = (ids: readonly string[]): string[] => {
+		const at = ids.indexOf(r.node);
+		if (at < 0) return [];
+		return r.siblings.filter((m) => {
+			const mi = ids.indexOf(m);
+			return mi >= 0 && !exempt(m) && (r.front ? at < mi : at > mi);
+		});
+	};
+	const where = r.doc !== null ? canvases.find((c) => c.doc === r.doc) : undefined;
+	if (!where) return null;
+	const against = lostIn(where.ids);
+	if (against.length === 0) return null;
+	const wiped = wipes.some((w) => w.dev === r.dev && w.atMs >= r.atMs);
+	const heldElsewhere = canvases.some((c) => c.doc !== r.doc && !isConflictCopy(c.path) && c.ids.includes(r.node) && lostIn(c.ids).length === 0);
+	return wiped && heldElsewhere ? null : { path: where.path, against };
 }

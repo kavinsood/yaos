@@ -4,8 +4,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generatePlan, minimizePlan, runSim, type SimConfig, type Step } from "./run";
 import { CANVAS_FAULTS, DEFAULT_FAULTS, E2EE_FAULTS } from "./faults";
-import { checkCanvas, checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
-import { ABSENT, CANVAS_HOT_OPS, CanvasOracle, suffixedDuplicates, type FieldWrite } from "./canvas";
+import { checkCanvas, checkConvergence, checkNothingDestroyed, checkTokens, orderLoss } from "./invariants";
+import { ABSENT, CANVAS_HOT_OPS, CanvasOracle, suffixedDuplicates, type FieldWrite, type ReorderIntent } from "./canvas";
 import { runUserAction, TokenLedger } from "./actors";
 import { SIM_TUNING, SimDevice } from "./device";
 import { DURABILITY_RETRY_MS } from "../engine/body/sender";
@@ -186,6 +186,14 @@ test("sim: a record deleted behind a stale replica goes with its canvas's delete
 // the winner: the path's doc in A's remote view, not the doc A's file is synced as.
 test("sim: an edit to a re-create loser is judged in the loser's doc (seed 48)", async () => {
 	const r = await runSim({ seed: 48, devices: 3, faults: DEFAULT_FAULTS });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Seed 15 (3 devices): B brought a node to the front while offline, its store was wiped without mirrors, and B
+// renamed the canvas before it reconnected. Onboarding imported the renamed file as a new doc (DESIGN §i.5, §j.5)
+// holding the reorder; the old doc came back at its old path without it. The oracle judged only the old doc.
+test("sim: a reorder a wipe left in the renamed file's new doc is not lost (seed 15)", async () => {
+	const r = await runSim({ seed: 15, devices: 3, faults: DEFAULT_FAULTS });
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
@@ -398,4 +406,24 @@ test("invariants: canvas validity, lost records, lost field writes and discarded
 	}
 	await a.vault.write("f.canvas" as VaultPath, ` ${board(textNode("n1", 5))}`, { t: "absent" });
 	assert.deepEqual(checkCanvas([a, b], o).map((x) => x.detail.slice(0, 81)), ["A: f.canvas holds bytes neither the projection's formatting nor written by a user"]);
+});
+
+test("invariants: a reorder holds in its doc, or after a wipe without mirrors in the doc its renamed file became", () => {
+	const r: ReorderIntent = { dev: "B", step: 137, atMs: 100, node: "n4", front: true, siblings: ["n1", "n2", "n3"], doc: "d1" };
+	const old: { path: string; doc: string; ids: string[] } = { path: "canvas/c2.canvas", doc: "d1", ids: ["n1", "n4", "n2", "n3"] };
+	const renamed = { path: "boards/c4.canvas", doc: "d2", ids: ["n1", "n2", "n3", "n4"] };
+	const none = () => false;
+	assert.deepEqual(orderLoss(r, [old], [], none), { path: "canvas/c2.canvas", against: ["n2", "n3"] });
+	assert.equal(orderLoss(r, [old], [], (m) => m === "n2" || m === "n3"), null, "exempt siblings are skipped");
+	assert.equal(orderLoss(r, [{ ...old, ids: ["n1", "n2", "n3", "n4"] }], [], none), null, "held in its doc");
+	assert.equal(orderLoss(r, [{ ...old, ids: ["n1", "n2", "n3"] }], [], none), null, "node not in its doc");
+	// Another doc holding the reorder excuses only a wipe on the reordering device after the reorder.
+	assert.deepEqual(orderLoss(r, [old, renamed], [], none)?.against, ["n2", "n3"], "no wipe");
+	assert.deepEqual(orderLoss(r, [old, renamed], [{ dev: "A", atMs: 200 }], none)?.against, ["n2", "n3"], "another device's wipe");
+	assert.deepEqual(orderLoss(r, [old, renamed], [{ dev: "B", atMs: 50 }], none)?.against, ["n2", "n3"], "a wipe before the reorder");
+	assert.equal(orderLoss(r, [old, renamed], [{ dev: "B", atMs: 200 }], none), null, "wiped after: held in the renamed file's doc");
+	// ... and only if that doc really holds it.
+	const wiped = [{ dev: "B", atMs: 200 }];
+	assert.deepEqual(orderLoss(r, [old, { ...renamed, ids: ["n4", "n1", "n2", "n3"] }], wiped, none)?.against, ["n2", "n3"], "the other doc lost it too");
+	assert.deepEqual(orderLoss(r, [old, { ...renamed, path: "canvas/c2 (conflict B 2026-01-01 0001).canvas" }], wiped, none)?.against, ["n2", "n3"], "a conflict copy is not the other doc");
 });
