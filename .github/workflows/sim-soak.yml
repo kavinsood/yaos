@@ -1,10 +1,13 @@
 name: Sim soak
 
-# Exploration (CI's sim job re-runs the same seeds): random seeds every night.
-#   soak    scripts/sim-soak.mjs, one process per core, each with its own master seed (swarm profiles: fault subsets,
-#           storms, randomized tuning, canvas, suspend). A failure is minimized and uploaded as sim-failures/*.json;
-#           replay it with `npm run sim:replay -- <file>`.
-#   sweep   the CI sim matrices (`npm run test:sim`) at a random first seed (YAOS_SIM_FIRST), so they see new seeds too.
+# Exploration (CI's sim job re-runs the same seeds): random seeds every night, when the code changed.
+#   changes  skips the night when nothing the sim exercises changed since the last successful run (WATCHED below);
+#            a manual run always runs. GitHub runs schedules from the default branch only, on its code.
+#   soak     scripts/sim-soak.mjs, one process per core, each with its own master seed (swarm profiles: fault subsets,
+#            storms, randomized tuning, canvas, suspend). A failure is minimized and uploaded as sim-failures/*.json;
+#            replay it with `npm run sim:replay -- <file>`.
+#   sweep    the CI sim matrices (`npm run test:sim`) at 1000 seeds from a random first seed (YAOS_SIM_FIRST), over
+#            4 shards (YAOS_SIM_SHARD); every shard uses the same first seed.
 # Promote a failure as a focused test of the mechanism plus, if it still fails without the fix, its minimized plan
 # (src/sim/regressions/README.md).
 
@@ -25,9 +28,59 @@ on:
         description: "First seed of the sweep (empty: random; the log prints it)"
         required: false
         default: ""
+      seeds:
+        description: "Sweep seeds per matrix (base; smaller matrices run a fraction)"
+        required: false
+        default: "1000"
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+      first_seed: ${{ steps.seed.outputs.first_seed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Did anything the sim exercises change since the last successful run?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The client and engine (src, sim included), the server the sim relay runs (server), the sim runners,
+          # dependencies and compiler settings, and this workflow.
+          WATCHED: src server scripts/sim-*.mjs package.json package-lock.json tsconfig*.json .github/workflows/sim-soak.yml
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "manual run: running"; echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          last="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow sim-soak.yml --branch "$GITHUB_REF_NAME" \
+            --status success --limit 1 --json headSha --jq '.[0].headSha // ""')"
+          if [ -z "$last" ] || ! git cat-file -e "${last}^{commit}" 2>/dev/null; then
+            echo "no earlier successful run here (or its commit is gone): running"; echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # shellcheck disable=SC2086
+          if git diff --quiet "$last" HEAD -- $WATCHED; then
+            echo "nothing watched changed since ${last:0:12}: skipping"; echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed since ${last:0:12}:"; git diff --stat "$last" HEAD -- $WATCHED | tail -20
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: First seed of the sweep
+        id: seed
+        env:
+          FIRST_SEED: ${{ inputs.first_seed || '' }}
+        run: echo "first_seed=${FIRST_SEED:-$(( 1000 + (RANDOM << 15 | RANDOM) % 2000000000 ))}" >> "$GITHUB_OUTPUT"
+
   soak:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -70,8 +123,14 @@ jobs:
           retention-days: 30
 
   sweep:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v5
 
@@ -82,11 +141,11 @@ jobs:
 
       - run: npm ci
 
-      - name: Sim matrices at a random first seed
+      - name: Sim matrices at a random first seed (shard ${{ matrix.shard }}/4)
         env:
-          FIRST_SEED: ${{ inputs.first_seed || '' }}
-          YAOS_SIM_SEEDS: "400"
+          YAOS_SIM_FIRST: ${{ needs.changes.outputs.first_seed }}
+          YAOS_SIM_SEEDS: ${{ inputs.seeds || '1000' }}
+          YAOS_SIM_SHARD: ${{ matrix.shard }}/4
         run: |
-          export YAOS_SIM_FIRST="${FIRST_SEED:-$(( 1000 + (RANDOM << 15 | RANDOM) % 2000000000 ))}"
-          echo "sweep: seeds ${YAOS_SIM_FIRST}..$(( YAOS_SIM_FIRST + YAOS_SIM_SEEDS - 1 )) (reproduce: YAOS_SIM_FIRST=${YAOS_SIM_FIRST} YAOS_SIM_SEEDS=${YAOS_SIM_SEEDS} npm run test:sim)"
+          echo "sweep: seeds ${YAOS_SIM_FIRST}..$(( YAOS_SIM_FIRST + YAOS_SIM_SEEDS - 1 )), shard ${YAOS_SIM_SHARD} (reproduce: YAOS_SIM_FIRST=${YAOS_SIM_FIRST} YAOS_SIM_SEEDS=${YAOS_SIM_SEEDS} npm run test:sim)"
           npm run test:sim
