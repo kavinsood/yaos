@@ -19,7 +19,7 @@ import { CursorTracker } from "../sync/cursor";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
-	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaKeyring, type MetaOutboxOrder, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
+	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaDocDeletes, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
 	type SnapshotRecord, type StreamRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
@@ -159,9 +159,10 @@ export type OutboxChange =
 	| { readonly t: "state"; readonly clientFrameId: ClientFrameId; readonly state: OutboxState }
 	/**
 	 * pending only, still sealed under `fromEpoch` with `fromLength` bytes: sealed again under the current epoch
-	 * (e2ee-design §14.2 step 4), under `next.clientFrameId` (its own for ns/cfg, a fresh one otherwise).
+	 * (e2ee-design §14.2 step 4), under `next.clientFrameId` (its own for ns/cfg, a fresh one otherwise). Also a
+	 * renumbered ns/cfg frame (`next.frameNo`, FoldRuntime.renumberBlind), still numbered `fromFrameNo`.
 	 */
-	| { readonly t: "reseal"; readonly clientFrameId: ClientFrameId; readonly fromEpoch: number; readonly fromLength: number; readonly next: { readonly clientFrameId: ClientFrameId; readonly sealed: Uint8Array; readonly keyEpoch: number } };
+	| { readonly t: "reseal"; readonly clientFrameId: ClientFrameId; readonly fromEpoch: number; readonly fromLength: number; readonly fromFrameNo: number | null; readonly next: { readonly clientFrameId: ClientFrameId; readonly sealed: Uint8Array; readonly keyEpoch: number; readonly frameNo?: number } };
 
 export class Repo {
 	readonly cursor: CursorTracker;
@@ -200,7 +201,13 @@ export class Repo {
 	 * Open (or create) the DB for this identity. `mismatch` closes nothing: the
 	 * caller deletes the DB and recovers (DESIGN §i.5).
 	 */
-	static async open(storage: StoragePort, id: RepoIdentity, nowMs: number, opts: { recoveredFromMirror?: boolean; frameNoFloor?: FrameNoFloor | null } = {}): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
+	static async open(
+		storage: StoragePort, id: RepoIdentity, nowMs: number,
+		opts: {
+			recoveredFromMirror?: boolean; frameNoFloor?: FrameNoFloor | null;
+			pathBases?: readonly MetaPathBase[] | null; docDeletes?: readonly MetaDocDeletes[] | null;
+		} = {},
+	): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
 		const db = await storage.open<YS>(dbName(id.vaultId, id.vaultEpoch, id.deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
 		const res = await db.tx([STORE.meta], "readwrite", async (tx) => {
 			const ident = await tx.get(STORE.meta, "identity") as MetaIdentity | undefined;
@@ -211,6 +218,8 @@ export class Repo {
 				const cursor = (await tx.get(STORE.meta, "cursor") as MetaCursor | undefined) ?? { key: "cursor", vaultSeq: 0, headSeqSeen: 0 };
 				const order = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
 				if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
+				if (opts.pathBases) await addPathBases(tx, opts.pathBases);
+				if (opts.docDeletes) await addPathBases(tx, opts.docDeletes);
 				return { outcome: { t: "existing", identity: ident } as OpenOutcome, ident, cursor, next: order.next };
 			}
 			const fresh: MetaIdentity = {
@@ -222,6 +231,8 @@ export class Repo {
 			tx.put(STORE.meta, cursor);
 			tx.put(STORE.meta, { key: "outboxOrder", next: 1 });
 			if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
+			if (opts.pathBases) await addPathBases(tx, opts.pathBases);
+			if (opts.docDeletes) await addPathBases(tx, opts.docDeletes);
 			return { outcome: { t: "fresh" } as OpenOutcome, ident: fresh, cursor, next: 1 };
 		});
 		if (res.outcome.t === "mismatch" || res.cursor === null) return { repo: null, outcome: res.outcome, db };
@@ -307,7 +318,7 @@ export class Repo {
 	async count(store: StoreKey): Promise<number> {
 		return this.db.tx([store], "readonly", (tx) => tx.count(store));
 	}
-	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "frameNoFloor" | "keyring">(key: K) {
+	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "frameNoFloor" | "keyring" | "keyringRecords">(key: K) {
 		return this.db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, key));
 	}
 	/** MetaKeyring (e2ee-design §18.3): keyring diagnostics and the lazy own-seal count. No key bytes. */
@@ -315,6 +326,37 @@ export class Repo {
 		return this.serial("putKeyringMeta", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
 			tx.put(STORE.meta, m);
 		}));
+	}
+
+	/** MetaKeyringRecords (e2ee-design §6.1): the keyring's records, not secret. */
+	putKeyringRecords(m: MetaKeyringRecords): Promise<void> {
+		return this.serial("putKeyringRecords", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
+			tx.put(STORE.meta, m);
+		}));
+	}
+
+	// -------------------------------------------------------------------------
+	// An old epoch's bases by path (MetaPathBase, DESIGN §c.12 step 3)
+	// -------------------------------------------------------------------------
+
+	/** Every stored path base. */
+	pathBases(): Promise<MetaPathBase[]> {
+		return this.db.tx([STORE.meta], "readonly", async (tx) => {
+			const all = await tx.getAll(STORE.meta, { lower: "pathBase:", upper: "pathBase;", upperOpen: true });
+			return all.filter((r): r is MetaPathBase => r.key.startsWith("pathBase:") && "deflated" in r);
+		});
+	}
+	dropPathBases(keys: readonly (MetaPathBase["key"] | MetaDocDeletes["key"])[]): Promise<void> {
+		return this.serial("dropPathBases", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
+			for (const k of keys) tx.delete(STORE.meta, k);
+		}));
+	}
+	/** Every stored old doc's deletes (MetaDocDeletes, DESIGN §c.12). Dropped with dropPathBases. */
+	docDeletes(): Promise<MetaDocDeletes[]> {
+		return this.db.tx([STORE.meta], "readonly", async (tx) => {
+			const all = await tx.getAll(STORE.meta, { lower: "docDeletes:", upper: "docDeletes;", upperOpen: true });
+			return all.filter((r): r is MetaDocDeletes => r.key.startsWith("docDeletes:") && "kind" in r);
+		});
 	}
 
 	// -------------------------------------------------------------------------
@@ -659,7 +701,7 @@ export class Repo {
 						tx.put(STORE.outbox, n);
 						updated.push(n);
 					} else if (c.t === "reseal") {
-						if (r.state !== "pending" || r.keyEpoch !== c.fromEpoch || r.sealed.length !== c.fromLength) continue;
+						if (r.state !== "pending" || r.keyEpoch !== c.fromEpoch || r.sealed.length !== c.fromLength || r.frameNo !== c.fromFrameNo) continue;
 						const n: OutboxRecord = { ...r, ...c.next };
 						await rename(tx, r, n, updated);
 						renamed.push({ old: r, next: n });
@@ -821,6 +863,14 @@ function stateOrderRange(state: OutboxState): KeyRange {
 }
 
 /** Merge a carried frameNo floor into meta (max per stream; e2ee-design §8.2). */
+/**
+ * The migration's path bases (MetaPathBase), each kept if one is already there: a migration repeated over an existing
+ * new-epoch DB (the old DB not retired yet) neither replaces nor revives anything but a missing base.
+ */
+async function addPathBases(tx: Tx, bases: readonly (MetaPathBase | MetaDocDeletes)[]): Promise<void> {
+	for (const b of bases) if (!(await tx.get(STORE.meta, b.key))) tx.put(STORE.meta, b);
+}
+
 async function raiseFrameNoFloor(tx: Tx, f: FrameNoFloor): Promise<void> {
 	const cur = await tx.get(STORE.meta, "frameNoFloor") as MetaFrameNoFloor | undefined;
 	tx.put(STORE.meta, { key: "frameNoFloor", ns: Math.max(cur?.ns ?? 0, f.ns), cfg: Math.max(cur?.cfg ?? 0, f.cfg) });

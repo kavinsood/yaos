@@ -56,7 +56,7 @@ export class Resealer {
 			c.diag("frame-reseal-epoch", { keyEpoch: s.keyEpoch });
 			return;
 		}
-		const res = await c.repo.tOutbox([{ t: "reseal", clientFrameId: rec.clientFrameId, fromEpoch: rec.keyEpoch, fromLength: rec.sealed.length, next: { clientFrameId, sealed: s.sealed, keyEpoch: s.keyEpoch } }]);
+		const res = await c.repo.tOutbox([{ t: "reseal", clientFrameId: rec.clientFrameId, fromEpoch: rec.keyEpoch, fromLength: rec.sealed.length, fromFrameNo: rec.frameNo, next: { clientFrameId, sealed: s.sealed, keyEpoch: s.keyEpoch } }]);
 		c.applyOutboxResult(res);
 		if (res.renamed.length > 0) c.diag("frame-resealed", { cls, fromEpoch: rec.keyEpoch, keyEpoch: s.keyEpoch, renamed: !keep });
 	}

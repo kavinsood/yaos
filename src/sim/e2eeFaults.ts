@@ -194,13 +194,16 @@ export class E2eeFaults {
 			return `skip fault revoke: ${b.name} cannot revoke now`;
 		}
 		const rk = seededRk(new SeededRandom(rkSeed));
+		// The user wrote the new RK down when the dialog showed it, before the record went out (§14.2 step 2, as §13.2).
+		// They keep it whatever the command answers: "pending" may still win, and so may a record whose command was
+		// aborted by an engine stop after it was sent (suite-1 seed 355). A record that lost leaves an RK that opens
+		// nothing, which rkInstall skips.
+		this.rks.unshift(() => seededRk(new SeededRandom(rkSeed)));
 		// The command hands the new RK to the engine: transferred (detached) or copied, and main's bytes zero-filled
 		// either way (engineHost.ts send, wipeSecrets).
-		// "pending" also answers ok: the record may still win, so the user keeps the new RK too.
 		void b.runtime.command({ t: "revokeRekey", rk }).then(
 			() => {
 				this.stats.revokes.won++;
-				this.rks.unshift(() => seededRk(new SeededRandom(rkSeed)));
 			},
 			(e: unknown) => void ((e as { error?: { code?: string } })?.error?.code === "refused" ? this.stats.revokes.lost++ : this.stats.revokes.failed++),
 		);
@@ -379,6 +382,9 @@ export class E2eeFaults {
 				}
 				this.net.relay.forge(frames);
 				this.stats.downgradeRows += frames.length;
+				// Forged after an await: when this was the last step, heal() already ran and saw no forged rows, so the
+				// user (the keeper's releaseForged) must be started here (suite-1 seed 112).
+				if (this.healing) this.startKeeper();
 			})());
 			parts.push(`suite-0 rows x${rows}`);
 		}

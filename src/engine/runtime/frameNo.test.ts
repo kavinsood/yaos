@@ -11,7 +11,8 @@ import { NS_DEDUPE_RING } from "../../core/limits";
 import { CFG_STREAM, NS_STREAM, type ConfigRelPath, type StreamName, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { startTestEngine, until, createDoc } from "./testHarness";
+import type { ReadRequest, RelayPort } from "../../ports/relay";
+import { startTestEngine, until, createDoc, sleep } from "./testHarness";
 
 const APP = "app.json" as ConfigRelPath;
 const R = NS_DEDUPE_RING;
@@ -79,6 +80,101 @@ test("frameNo: the epoch-migration floor raises allocation and is kept in meta (
 		assert.deepEqual(await ownFrameNos(a2, CFG_STREAM), [5 + R + 1, 2000 + R + 1]);
 	} finally {
 		await a.stop();
+		await a2?.stop();
+	}
+});
+
+// A store that lost IndexedDB knows nothing of its own committed frames until it reads ns: a frame allocated before
+// that read (offline) took R + 1, a number its earlier frames had already used, and every reader ignored it as
+// replay-duplicate: the create never folded (suite-1 seed 163). Before ns/cfg sends open, such frames are numbered
+// again above the committed edge (+ NS_DEDUPE_RING, as the first allocation).
+test("frameNo: frames allocated before a lost store read ns are renumbered above its committed frames", async () => {
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	let a2: LogEngine | null = null;
+	try {
+		await settle(a);
+		await createDoc(a, "one.md" as VaultPath, "1");
+		await createDoc(a, "two.md" as VaultPath, "2");
+		await cfg(a, "1");
+		await settle(a);
+		await a.stop();
+
+		relay.setConnectFailure("unavailable");
+		({ engine: a2 } = await startTestEngine({ relay, deviceId: "dev-a", extra: { vaultEpoch: relay.vaultEpoch() } })); // fresh storage: IndexedDB lost
+		await createDoc(a2, "three.md" as VaultPath, "3");
+		await cfg(a2, "2");
+		assert.deepEqual(await ownFrameNos(a2, NS_STREAM), [R + 1], "allocated before ns was read");
+		relay.setConnectFailure(null);
+		await settle(a2);
+		assert.deepEqual(await ownFrameNos(a2, NS_STREAM), [R + 1, R + 2, R + 2 + R + 1]);
+		assert.deepEqual(await ownFrameNos(a2, CFG_STREAM), [R + 1, R + 1 + R + 1]);
+		const live = (e: LogEngine, p: string) => e.listDocs().some((d) => d.path === p && d.state === "live");
+		await until(() => live(b, "three.md") && live(a2!, "three.md"), 3_000, "the create folded on both devices");
+		const k = (e: LogEngine) => e.c.cfg.state.json.get(`${APP}\u0000k`)?.value ?? null;
+		await until(() => k(b) === "2" && k(a2!) === "2", 3_000, "the cfg set folded on both devices");
+	} finally {
+		await a.stop();
+		await b.stop();
+		await a2?.stop();
+	}
+});
+
+/** `relay`, with every read of ns or cfg failing (network) while `failing.on`: the socket and the feed still work. */
+function failingNsReads(relay: SimRelay, failing: { on: boolean }): RelayPort {
+	const fails = (streams: readonly StreamName[]) => failing.on && streams.some((s) => s === NS_STREAM || s === CFG_STREAM);
+	return {
+		connect: async (p) => {
+			const r = await relay.connect(p);
+			if (!r.ok) return r;
+			const s = r.session;
+			const session = new Proxy(s, {
+				get(t, k) {
+					if (k === "read") return (st: StreamName, after: number, pc: boolean) => (fails([st]) ? Promise.reject(new Error("network_error")) : t.read(st, after, pc));
+					if (k === "readBatch") return (reqs: readonly ReadRequest[]) => (fails(reqs.map((q) => q.stream)) ? Promise.reject(new Error("network_error")) : t.readBatch(reqs));
+					const v: unknown = Reflect.get(t, k, t);
+					return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+				},
+			});
+			return { ok: true, session };
+		},
+	};
+}
+
+// Suite-1 seed 51: after an IDB wipe the session came up but every ns/cfg read failed. The engine still went live and
+// opened the ns sends: the planner took the empty ns view for "every synced file deleted remotely" and trashed them,
+// and the creates made meanwhile went out under frameNos the device had used, ignored as replay-stale. The phase stays
+// catching-up and ns/cfg frames wait until the reads complete; then the frames are renumbered.
+test("frameNo: a session whose ns/cfg reads fail stays catching-up with ns sends closed until a read completes", async () => {
+	const relay = new SimRelay();
+	const failing = { on: false };
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	let a2: LogEngine | null = null;
+	try {
+		await settle(a);
+		await createDoc(a, "one.md" as VaultPath, "1");
+		await createDoc(a, "two.md" as VaultPath, "2");
+		await settle(a);
+		await a.stop();
+
+		failing.on = true;
+		({ engine: a2 } = await startTestEngine({ relay: failingNsReads(relay, failing), deviceId: "dev-a" })); // IDB lost
+		await until(() => a2!.c.session !== null, 3_000, "session up");
+		await createDoc(a2, "three.md" as VaultPath, "3");
+		await sleep(300);
+		assert.equal(a2.status().phase, "catching-up", "ns not read: not live");
+		assert.equal(a2.c.sender.nsWindowOpen, false, "ns not read: ns sends closed");
+		assert.equal(relay.rows(NS_STREAM).filter((r) => r.deviceId === "dev-a").length, 2, "nothing sent under a blind frameNo");
+		failing.on = false;
+		await settle(a2);
+		assert.deepEqual(await ownFrameNos(a2, NS_STREAM), [R + 1, R + 2, R + 2 + R + 1]);
+		const live = (e: LogEngine, p: string) => e.listDocs().some((d) => d.path === p && d.state === "live");
+		await until(() => live(b, "three.md") && live(a2!, "three.md"), 3_000, "the create folded on both devices");
+	} finally {
+		await a.stop();
+		await b.stop();
 		await a2?.stop();
 	}
 });

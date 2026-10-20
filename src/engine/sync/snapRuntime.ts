@@ -9,7 +9,7 @@ import { decodeSnapFoldV1, encodeSnapFoldV1 } from "../../core/codec/snapFoldV1"
 import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
 import { SNAP_FOLD_RULES_VERSION, foldSnapFrame, newSnapFold, overlayPendingSnap, type SnapFoldEvent, type SnapFoldState } from "../../core/snap/fold";
 import { decodeSnapOps, type SnapOp } from "../../core/snap/record";
-import { SNAP_STREAM, type DeviceId, type Seq } from "../../core/types";
+import { SNAP_STREAM, type ClientFrameId, type DeviceId, type Seq } from "../../core/types";
 import type { Repo } from "../store/repo";
 import type { SnapshotRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
@@ -64,6 +64,10 @@ export class SnapRuntime extends FoldRuntime<SnapOp, SnapFoldEvent> {
 	/** snap frames carry frameNo 0: no replay window (e2ee-design §8.2). */
 	protected ownReplayEdge(): number {
 		return 0;
+	}
+
+	protected ownRecentFrames(): readonly ClientFrameId[] {
+		return [];
 	}
 
 	/** Committed index + own pending snap frames (outbox, receipted-unfolded). */

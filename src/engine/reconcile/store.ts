@@ -53,7 +53,8 @@ export async function hashBase(hash: HashPort, docId: DocId, text: string): Prom
 }
 
 /** Inflate + verify. null = corrupt or mismatched (treated as "no base"). */
-export async function readBase(rec: BaseTextRecord, hash: HashPort): Promise<string | null> {
+/** A stored base text (a baseText row, or an old epoch's base by path) if it reads back as written; else null. */
+export async function readBase(rec: Pick<BaseTextRecord, "contentHash" | "deflated" | "chars">, hash: HashPort): Promise<string | null> {
 	let text: string;
 	try {
 		text = utf8Decode(inflateSync(rec.deflated));

@@ -33,6 +33,7 @@ import type { DiskSchema } from "../reconcile/store";
 import { LogEngine } from "../runtime/engine";
 import type { EngineTuning } from "../runtime/options";
 import type { FrameNoFloor } from "../store/repo";
+import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
 import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
 import { listLocal, partName } from "../snapshots/localStore";
 import { SnapshotJob } from "../snapshots/snapshotJob";
@@ -44,6 +45,7 @@ import type { HostKeyring } from "./hostKeyring";
 import type { HostLink } from "./hostLink";
 import type { EngineE2ee } from "../keyring/keyringRuntime";
 import { localDay, LocalDayCounter } from "./localDayCounter";
+import { EpochBases } from "./epochBases";
 import { ComposedLog } from "./logPort";
 import { PassScheduler } from "./passScheduler";
 import { mergeStatus, type DiskSideStatus } from "./statusMerge";
@@ -81,10 +83,10 @@ export interface VaultRuntimeStart {
 	readonly log?: (line: string) => void;
 	/** The LogEngine's diagnostics events (test hook, CreateEngineOptions.onDiag). */
 	readonly onDiag?: (event: DiagnosticsEvent) => void;
-	/** Path-keyed bases carried over an epoch migration (§c.12 step 3). */
-	readonly pathBases?: ReadonlyMap<PathKey, string> | null;
-	/** Old epoch whose DB is deleted once the new one reaches live (§c.12 step 6). */
-	readonly retireEpoch?: VaultEpoch | null;
+	/** Path-keyed bases carried over an epoch migration (§c.12 step 3), stored in the new DB (epochBases.ts). */
+	readonly pathBases?: readonly MetaPathBase[] | null;
+	/** The old epoch's docs' deletes by docId (§c.12 "Deletes"), stored in the new DB (epochBases.ts). */
+	readonly docDeletes?: readonly MetaDocDeletes[] | null;
 	/** Highest own ns / cfg frameNo of the old epoch (§c.12 step 3, e2ee-design §8.2). */
 	readonly frameNoFloor?: FrameNoFloor | null;
 }
@@ -101,6 +103,8 @@ export const HIDDEN_CLOSE_MS = 30_000;
 export class VaultRuntime {
 	rec!: Reconciler;
 	blobs!: BlobQueue;
+	/** The old epoch's bases by path, until their paths settle (§c.12). */
+	bases!: EpochBases;
 	cfg: CfgSync | null = null;
 	snaps!: SnapshotJob;
 	mirror!: SyncedMirrorWriter;
@@ -159,7 +163,7 @@ export class VaultRuntime {
 		const { engine, config } = o;
 		const log = await LogEngine.start({
 			ports: o.ports, vaultId: config.vaultId, deviceId: config.deviceId, deviceClass: config.deviceClass,
-			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, frameNoFloor: o.frameNoFloor ?? null,
+			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, frameNoFloor: o.frameNoFloor ?? null, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,
 			onBoundText: (docId, changes, length, origin) => engine.bound.onText(docId, changes, length, origin),
 			onFrameTaken: (docId) => engine.bound.frameTaken(docId),
@@ -242,11 +246,14 @@ export class VaultRuntime {
 			admit: () => !this.stopped && !this.paused && !this.migrating && !this.background,
 			wake: (who) => this.sched.request({ t: "docs", docIds: who.map((w) => w.docId), pathKeys: who.map((w) => pathKey(w.path)) }),
 		});
+		const bases = (this.bases = await EpochBases.load(c.repo, ports.hash));
+		if (bases.keys.size > 0) this.diag(`epoch bases: ${bases.keys.size} path(s)`);
 		this.rec = await Reconciler.open({
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, hash: ports.hash, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
-			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into), pathBase: o.pathBases ? (k: PathKey) => o.pathBases!.get(k) ?? null : undefined,
-			pathBaseKeys: o.pathBases ? new Set(o.pathBases.keys()) : undefined,
+			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into),
+			pathBase: (k: PathKey) => bases.get(k), pathBaseKeys: bases.keys, pathDeleted: (k: PathKey) => bases.deleted(k),
+			docDeletes: (d) => bases.docDeletes(d), docDeletesApplied: (d) => bases.applied(d),
 			boundSavedText: (docId, text) => {
 				const b = o.engine.bound.get(docId);
 				return b !== undefined && (text === b.diskText || b.candidates.includes(text));
@@ -386,15 +393,20 @@ export class VaultRuntime {
 	}
 
 	onLogStatus(s: StatusSnapshot): void {
+		const was = this.lastLog?.phase;
 		this.lastLog = s;
 		if (this.stopped) return;
+		// Writes are back (a re-key settled the vault key): the passes that failed on the write gate meanwhile only
+		// retry on their backoff (up to a minute), so plan the vault now; local deletes and edits made while
+		// key-missing go out at once.
+		if (was === "key-missing" && s.phase !== "key-missing" && this.rec) this.sched.request({ t: "full" }, true);
 		// upgrade-required with a session: a fold is halted for a newer writer (§c.10) and the session caught up;
 		// the planner's nsReady and the cfg / snap readiness still see that fold's halt.
 		if ((s.phase === "live" || (s.phase === "upgrade-required" && s.relay.connected)) && !this.port.nsCaughtUp && this.rec) {
 			this.port.nsCaughtUp = true;
 			this.port.invalidate();
 			this.sched.request({ t: "full" });
-			if (this.o.retireEpoch) void ops.retireOldEpoch(this, this.o.retireEpoch);
+			void ops.retireOldEpochs(this);
 		}
 		if (s.phase === "epoch-migrating" && !this.migrating) {
 			this.migrating = true;
@@ -432,6 +444,8 @@ export class VaultRuntime {
 		if (this.syncedSignature() !== syncedBefore || r.ok > 0) this.mirror.markDirty();
 		if (scope.t === "full") {
 			this.lastFullAtMs = this.o.ports.clock.now();
+			const settled = await this.bases.settle(this.port.view(), this.rec.ctx.store.synced.values(), (k) => this.rec.ctx.local.has(k));
+			if (settled > 0) this.diag(`epoch bases: ${settled} path(s) settled, ${this.bases.keys.size} left`);
 			if (r.brake === null && this.listingComplete) await this.pruneBlobQueue();
 			this.requestCfg();
 			if (this.settings.snapshots.enabled) void this.snaps.maybeDaily().catch((e) => this.diag(`daily snapshot failed: ${String(e)}`));

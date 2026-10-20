@@ -165,6 +165,26 @@ async function fillKeys(b: KeyBook, x: EvalCtx): Promise<boolean> {
 			x.kc.drop(e);
 		}
 	}
+	// An undecided epoch right below a verified non-genesis winner: that winner's prevWrap holds its key, as
+	// prevOpens installs it. The "prev" label lives in this book only, so a Keyring opened again on the adapter (or
+	// after a restart) reaches the key from the records here rather than take a held key for an own one, which never
+	// unblocks a roll: the roll stayed pending and the keys below it, K_1 included, out of reach (suite-1 seeds 74, 184).
+	const undecided = new Set<number>();
+	for (const row of b.rows) if (row.state === "pending" && row.rec && !b.winners.has(row.rec.e)) undecided.add(row.rec.e);
+	for (const e of [...undecided].sort((p, q) => q - p)) {
+		if (AUTHORITATIVE.has(b.source.get(e))) continue;
+		const up = b.winners.get(e + 1)?.row.rec;
+		if (!up || up.kind === KeyRecordKind.genesis || b.source.get(e + 1) !== "verified") continue;
+		const had = srcOf(b, x, e);
+		let ok = await open(x, up, "prev", up.prevWrap);
+		if (!ok && had === "own") {
+			drop(b, x, e);
+			ok = await open(x, up, "prev", up.prevWrap);
+		}
+		if (!ok) continue;
+		b.source.set(e, "prev");
+		return true;
+	}
 	return false;
 }
 

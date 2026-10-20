@@ -314,9 +314,16 @@ export class StubLog implements LogPort {
 				if (b.unframed.length > 0) docsWithPendingBody.add(e.docId);
 			}
 		}
+		const pendingMoves = new Map<DocId, Set<PathKey>>();
+		for (const op of this.pending) {
+			if (op.t !== "rename" && op.t !== "restore") continue;
+			let keys = pendingMoves.get(op.docId);
+			if (!keys) pendingMoves.set(op.docId, (keys = new Set()));
+			keys.add(this.pathKey(op.path));
+		}
 		return {
 			remote, remoteByPathKey: byKey, nsCoversSeq: this.seq, nsReady: this.nsReady,
-			docsWithPendingBody, restoreDuty: new Set(), lostCreateBody: this.lostCreateBody, textHash, appliedSeq,
+			docsWithPendingBody, restoreDuty: new Set(), lostCreateBody: this.lostCreateBody, textHash, appliedSeq, pendingMoves,
 		};
 	}
 

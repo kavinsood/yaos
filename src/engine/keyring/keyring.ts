@@ -30,6 +30,12 @@ export interface KeyringChange {
 	readonly pending: number | null;
 }
 
+/** The records SecretStorage holds (§6.1), split: the winners, then the revokes held open (§11.5). Not secret. */
+export interface KeyringRecords {
+	readonly winners: readonly Uint8Array[];
+	readonly open: readonly Uint8Array[];
+}
+
 export interface KeyringOptions {
 	readonly mode: KeyringMode;
 	readonly vaultId: string;
@@ -37,6 +43,14 @@ export interface KeyringOptions {
 	readonly kc?: (KeyringCrypto & Pick<CryptoPort, "keyState" | "sealEpoch">) | null;
 	/** Winners decided before and revokes held open (SecretStorage `records`, §6.1, §11.5). */
 	readonly records?: readonly Uint8Array[];
+	/**
+	 * suite1: the copy of the records in this device's DB (MetaKeyringRecords). Taken only when `records` is empty:
+	 * SecretStorage was lost, and a reset or restore may have emptied `k` too; the RK then opens the newest genesis
+	 * or revoke among them (§13.3) and the device re-publishes them (§11.5).
+	 */
+	readonly mirror?: KeyringRecords | null;
+	/** suite1: the record set differs from the DB copy (`mirror`): write it. A failure is only reported. */
+	readonly onRecords?: (r: KeyringRecords) => Promise<void>;
 	readonly keyringSeen?: boolean;
 	/** Must resolve only once main has stored the change. */
 	readonly persist?: (c: KeyringChange) => Promise<void>;
@@ -58,6 +72,7 @@ export class Keyring {
 	private persistedVersion = 0;
 	private persistedOpen: readonly Uint8Array[] = [];
 	private persistedPending: number | null = null;
+	private mirrored: KeyringRecords | null = null;
 	private unsent: { readonly e: number; readonly k: Uint8Array }[] = [];
 	private readonly reported = new WeakSet<KRow>();
 	private queue: Promise<unknown> = Promise.resolve();
@@ -73,15 +88,25 @@ export class Keyring {
 	static async open(o: KeyringOptions): Promise<Keyring> {
 		const k = new Keyring(o);
 		await k.run(async () => {
-			// A stored revoke whose key is not held was stored open (a winner's key is stored with it, §18.4).
-			for (const b of o.mode === "suite1" ? (o.records ?? []) : []) {
-				const rec = decodeKeyRecord(b);
-				const open = rec?.kind === KeyRecordKind.revoke && !k.kc!.keyState(rec.e).held;
-				if (!(open ? k.book.addStoredOpen(b) : k.book.addStored(b))) k.diag("keyring/garbage", { stored: true });
+			const m = o.mode === "suite1" ? (o.mirror ?? null) : null;
+			if (m && (o.records ?? []).length === 0 && m.winners.length + m.open.length > 0) {
+				// SecretStorage lost its value: the DB copy says which records were winners and which were held open.
+				for (const b of m.winners) if (!k.book.addStored(b)) k.diag("keyring/garbage", { stored: true });
+				for (const b of m.open) if (!k.book.addStoredOpen(b)) k.diag("keyring/garbage", { stored: true });
+				k.diag("keyring/records-from-db", { winners: m.winners.length, open: m.open.length });
+			} else {
+				// A stored revoke whose key is not held was stored open (a winner's key is stored with it, §18.4).
+				for (const b of o.mode === "suite1" ? (o.records ?? []) : []) {
+					const rec = decodeKeyRecord(b);
+					const open = rec?.kind === KeyRecordKind.revoke && !k.kc!.keyState(rec.e).held;
+					if (!(open ? k.book.addStoredOpen(b) : k.book.addStored(b))) k.diag("keyring/garbage", { stored: true });
+				}
 			}
 			k.persistedVersion = k.book.version;
 			k.persistedOpen = k.book.openRecords();
+			k.mirrored = m;
 			await k.settleAll();
+			await k.mirror();
 		});
 		return k;
 	}
@@ -304,10 +329,26 @@ export class Keyring {
 			this.persistedVersion = version;
 			this.persistedOpen = open;
 			this.persistedPending = pending;
+			await this.mirror();
 		}
 		const hk = this.book.highestKeyed();
 		if (hk > kc.sealEpoch()) kc.setSealEpoch(hk);
 		return true;
+	}
+
+	/** The DB copy of the records (KeyringOptions.onRecords), rewritten when the set moved away from it. */
+	private async mirror(): Promise<void> {
+		if (this.o.mode !== "suite1" || !this.o.onRecords) return;
+		const cur: KeyringRecords = { winners: this.book.records(), open: this.book.openRecords() };
+		const m = this.mirrored;
+		const same = (a: readonly Uint8Array[], b: readonly Uint8Array[]) => a.length === b.length && a.every((x, i) => bytesEqual(x, b[i]!));
+		if (m && same(m.winners, cur.winners) && same(m.open, cur.open)) return;
+		try {
+			await this.o.onRecords(cur);
+			this.mirrored = cur;
+		} catch (err) {
+			this.diag("keyring/records-db-failed", { error: String(err) });
+		}
 	}
 
 	private takeRk(rk: Uint8Array): void {

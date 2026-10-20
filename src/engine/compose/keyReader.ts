@@ -363,6 +363,7 @@ export class KeyReader {
 			vaultId: o.vaultId,
 			kc: o.ports.keys,
 			records: o.keyring.records,
+			mirror: o.suite === 1 ? o.keyring.mirror : null,
 			keyringSeen: this.seen,
 			persist: o.keyring.persist,
 			diag: (code, fields) => this.log(`${code} ${JSON.stringify(fields)}`),

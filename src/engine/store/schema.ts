@@ -21,6 +21,9 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
  * (schemaVersion) and is deleted and rebuilt from relay + disk + side-file mirrors (DESIGN §i.5).
  * 2: dropped the unused streams byStalePriority / byAccess, synced byPathKey and blobQueue byActiveDue indexes
  * and the fields only they read; dropped the outbox "sent" state, attempts and lastSentAtMs (T_sent).
+ * Not bumped for a new meta key family whose absence reads as before (blobPut:, frameNoFloor, pathBase:,
+ * keyringRecords, docDeletes:): an older reader never looks the keys up, and a DB without them behaves as it did. A bump would
+ * delete and rebuild every DB.
  */
 export const DB_SCHEMA_VERSION = 2;
 export const DB_NAME_PREFIX = "yaos2";
@@ -101,7 +104,50 @@ export interface MetaBlobPut {
 	readonly key: `blobPut:${string}`;
 	readonly atMs: number;
 }
-export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut;
+/**
+ * An old epoch's base at a path (DESIGN §c.12 step 3), one record per path key: the old DB's base text of the doc
+ * synced there, as its `baseText` row held it (deflate-raw, chars, markdownContentHash; reconcile/store.ts readBase
+ * checks it). Written with the new DB's identity by Repo.open, so a crash before the merges keeps them; dropped
+ * once the path is settled in the new epoch (compose/epochBases.ts).
+ */
+export interface MetaPathBase {
+	readonly key: `pathBase:${string}`;
+	readonly contentHash: ContentHash;
+	readonly deflated: Uint8Array;
+	readonly chars: number;
+	/**
+	 * Canvas only: the record keys ("n:<id>" / "e:<id>") deleted in the old doc, so a new epoch whose canvas at the
+	 * path holds them again (a peer's re-create after a reset) has them deleted again (canvasMerge.withEpochDeletes).
+	 * Absent = none.
+	 */
+	readonly deleted?: readonly string[];
+}
+/**
+ * What an old epoch's doc deleted (DESIGN §c.12 "Deletes"), by its docId: a restore keeps doc and item ids, so the
+ * new epoch's doc of that id gets the deletes again before this device first merges or writes it, wherever it is
+ * now (a rename may have been dropped with the old outbox, or another device's rename restored). Canvas: the record
+ * keys; markdown: the delete set (a Yjs update with no structs). Stored with the new DB's identity; dropped once
+ * applied, once the doc has a synced record, or when the new epoch has no live doc of that id.
+ */
+export interface MetaDocDeletes {
+	readonly key: `docDeletes:${string}`;
+	readonly kind: "markdown" | "canvas";
+	readonly keys?: readonly string[];
+	readonly update?: Uint8Array;
+}
+/**
+ * The keyring's records as SecretStorage holds them (e2ee-design §6.1): the winners, then the revokes held open.
+ * Not secret: every byte of them is in `k`. Kept here too so that a device whose SecretStorage was lost still has
+ * them when a reset or restore emptied `k` before any device re-published (§11.5): the RK opens the newest genesis
+ * or revoke among them (§13.3), and the device re-publishes them. Every DB writes its own copy when its keyring
+ * opens (a key-missing device runs no VaultRuntime, so it never migrates; protocolEngine reads every epoch's DB).
+ */
+export interface MetaKeyringRecords {
+	readonly key: "keyringRecords";
+	readonly winners: readonly Uint8Array[];
+	readonly open: readonly Uint8Array[];
+}
+export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------

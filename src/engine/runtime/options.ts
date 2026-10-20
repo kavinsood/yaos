@@ -9,6 +9,7 @@ import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
 import type { SideFilePort } from "../../ports/vault";
 import type { FrameNoFloor } from "../store/repo";
+import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import { DEFAULT_CHECKPOINT_TUNING, type CheckpointTuning } from "../body/checkpoints";
 import type { TextChanges } from "../body/textChanges";
@@ -131,6 +132,10 @@ export interface EngineOptions {
 	readonly sideFiles?: SideFilePort | null;
 	/** Highest own ns / cfg frameNo of the abandoned epoch (DESIGN §c.12 step 3, e2ee-design §8.2); written to meta. */
 	readonly frameNoFloor?: FrameNoFloor | null;
+	/** The abandoned epoch's bases by path (DESIGN §c.12 step 3); written to meta with the DB's identity. */
+	readonly pathBases?: readonly MetaPathBase[] | null;
+	/** The abandoned epoch's docs' deletes by docId (DESIGN §c.12 "Deletes"); written to meta with the identity. */
+	readonly docDeletes?: readonly MetaDocDeletes[] | null;
 	/** Apply + adopt other devices' provisional frames on bound docs (DESIGN §d.5). Default true. */
 	readonly provisionalBroadcast?: boolean;
 	readonly tuning?: Partial<EngineTuning>;

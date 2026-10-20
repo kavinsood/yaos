@@ -324,3 +324,49 @@ test("canvas: remoteCreate seeds ranks in file order (testkit sanity)", () => {
 	assert.ok(r.ok);
 	assert.deepEqual(r.ranked.data.nodeOrder, ["a", "b", "c"]);
 });
+
+test("canvas: the user saves during the merge write -> the write is refused, S is rebased on the read, the save merges next pass", async () => {
+	const { w, id } = await withBoard();
+	remoteText(w, id, "a", " R");
+	w.vault.userWrite("board.canvas", canvas([textNode("a", "Alpha"), textNode("b", "Beta L1"), fileNode("c", "notes/c.md")], [edge("e1", "a", "b")]));
+	let fired = false;
+	w.gateway.beforeOp = (op) => {
+		if (!fired && op.t === "write" && op.path === "board.canvas") {
+			fired = true;
+			w.vault.userWrite("board.canvas", canvas([textNode("a", "Alpha"), textNode("b", "Beta L2"), fileNode("c", "notes/c.md"), textNode("d", "D")], [edge("e1", "a", "b")]));
+		}
+	};
+	await w.sync();
+	assert.ok(fired);
+	await w.sync();
+	const j = disk(w, "board.canvas");
+	assert.equal(nodeOf(j, "a")?.text, "Alpha R");
+	assert.equal(nodeOf(j, "b")?.text, "Beta L2");
+	assert.equal(nodeOf(j, "d")?.text, "D");
+	sameLogical(w, "board.canvas", id);
+	assert.deepEqual(w.conflictCopies(), [], "continued editing is not a conflict");
+});
+
+test("canvas: a merge that shrinks the file past the overwrite brake is held until approved", async () => {
+	const w = new World({ brake: { minCount: 0, ratio: 0, overwriteMinBytes: 10, overwriteShrinkRatio: 0.5 } });
+	await w.boot();
+	const long = "a fairly long line of text ".repeat(40);
+	const id = w.log.remoteCreate(P("big.canvas"), canvas([textNode("a", long), textNode("b", long), textNode("c", "C")]));
+	await w.sync();
+	w.log.remoteEditCanvas(id, (d) => {
+		d.getMap<unknown>("nodes").delete("a");
+		d.getMap<unknown>("nodes").delete("b");
+	});
+	w.vault.userWrite("big.canvas", canvas([textNode("a", long), textNode("b", long), textNode("c", "C local")]));
+	const before = w.vault.text("big.canvas");
+	await w.sync();
+	assert.equal(w.vault.text("big.canvas"), before, "held");
+	const report = w.brakes.at(-1)!;
+	assert.equal(report.reason, "mass-overwrite");
+	assert.deepEqual(report.samplePaths, ["big.canvas"]);
+	w.r.approveBrake(report.id);
+	await w.sync();
+	const j = disk(w, "big.canvas");
+	assert.deepEqual(j?.nodes.map((n) => [n.id, n.text]), [["c", "C local"]]);
+	sameLogical(w, "big.canvas", id);
+});

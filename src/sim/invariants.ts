@@ -55,9 +55,11 @@ import { SETTING_FILES, tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
 import type { SimDevice } from "./device";
 import { bytesPrint, type FoldPrints, type OracleDoc, type SimNet } from "./net";
+import { ABSENT, canvasCanonical, canvasFiles, canvasProblem, docIdOf, engineCanvasText, isConflictCopy, isTracked, lineageOf, readModel, type CanvasOracle } from "./canvas";
+import { canonicalJson, formatCanvasText, parseCanvasText, type JsonValue } from "../core/hash/canvasCanonical";
 
 export interface Violation {
-	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness" | "checkpoint";
+	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness" | "checkpoint" | "canvas";
 	readonly detail: string;
 }
 
@@ -86,7 +88,12 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 			const m = mine.get(k);
 			if (!m) out.push({ inv: "convergence", detail: `${f.path} on ${first.name}, missing on ${d.name}` });
 			else if (m.path.split("/").pop() !== f.path.split("/").pop()) out.push({ inv: "convergence", detail: `leaf display differs: ${f.path} vs ${m.path}` });
-			else if (m.text !== f.text) out.push({ inv: "convergence", detail: `${f.path} differs: ${first.name}=${brief(f.text)} ${d.name}=${brief(m.text)}` });
+			else if (f.path.endsWith(".canvas")) {
+				// Canvas files converge logically (DESIGN §j.2: a formatting-only difference is never rewritten).
+				const x = canvasCanonical(f.text);
+				const y = canvasCanonical(m.text);
+				if (x === null || y === null || x !== y) out.push({ inv: "convergence", detail: `${f.path} differs (canonical): ${first.name}=${brief(x ?? `invalid ${f.text}`)} ${d.name}=${brief(y ?? `invalid ${m.text}`)}` });
+			} else if (m.text !== f.text) out.push({ inv: "convergence", detail: `${f.path} differs: ${first.name}=${brief(f.text)} ${d.name}=${brief(m.text)}` });
 			else if (!f.path.endsWith(".md")) {
 				const x = first.vault.bytesOf(f.path);
 				const y = d.vault.bytesOf(m.path);
@@ -105,9 +112,13 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 		const f = byKey.get(k);
 		if (!f) out.push({ inv: "convergence", detail: `relay doc ${doc.path} has no file` });
 		else if (f.path !== doc.path) out.push({ inv: "convergence", detail: `relay path ${doc.path} vs disk ${f.path}` });
-		else if (doc.text !== null && f.text !== doc.text) out.push({ inv: "convergence", detail: `relay ${doc.path}=${brief(doc.text)} disk=${brief(f.text)}` });
+		else if (doc.kind === "canvas") {
+			// A fresh device's projection of the c: stream (checkpoint + tail) is the file's logical content.
+			if (doc.invalid) out.push({ inv: "convergence", detail: `relay canvas ${doc.path} does not project: ${doc.invalid}` });
+			else if (doc.text !== null && canvasCanonical(doc.text) !== canvasCanonical(f.text)) out.push({ inv: "convergence", detail: `relay canvas ${doc.path}=${brief(canvasCanonical(doc.text) ?? doc.text)} disk=${brief(canvasCanonical(f.text) ?? f.text)}` });
+		} else if (doc.text !== null && f.text !== doc.text) out.push({ inv: "convergence", detail: `relay ${doc.path}=${brief(doc.text)} disk=${brief(f.text)}` });
 	}
-	for (const [k, f] of byKey) if ((f.path.endsWith(".md") || f.path.endsWith(".png")) && !docKeys.has(k)) out.push({ inv: "convergence", detail: `${f.path} never reached the relay` });
+	for (const [k, f] of byKey) if ((f.path.endsWith(".md") || f.path.endsWith(".png") || f.path.endsWith(".canvas")) && !docKeys.has(k)) out.push({ inv: "convergence", detail: `${f.path} never reached the relay` });
 	const folds = { ns: new Map<string, string[]>(), cfg: new Map<string, string[]>(), snap: new Map<string, string[]>() };
 	const add = (cls: keyof typeof folds, print: string, who: string) => folds[cls].set(print, [...(folds[cls].get(print) ?? []), who]);
 	// The relay oracle is a fresh device: it bootstrapped from the relay's checkpoints (when there are any) plus the
@@ -123,6 +134,11 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 		add("cfg", hex(c.cfg.encodeState()), d.name);
 		add("snap", hex(c.snap.encodeState()), d.name);
 		for (const [path, text] of d.vault.snapshot()) {
+			if (path.endsWith(".canvas")) {
+				const crdt = engineCanvasText(d, path);
+				if (crdt !== null && canvasCanonical(crdt) !== canvasCanonical(text)) out.push({ inv: "convergence", detail: `${d.name}: canvas replica of ${path}=${brief(canvasCanonical(crdt) ?? crdt)} disk=${brief(canvasCanonical(text) ?? text)}` });
+				continue;
+			}
 			if (!path.endsWith(".md")) continue;
 			const crdt = d.engineText(path);
 			if (crdt !== null && crdt !== text) out.push({ inv: "convergence", detail: `${d.name}: body replica of ${path}=${brief(crdt)} disk=${brief(text)}` });
@@ -339,4 +355,186 @@ export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[]
 	await clock.advance(ms);
 	const after = activity(devs, net);
 	return before === after ? [] : [{ inv: "quiet", detail: `activity after quiescence: ${before} -> ${after}` }];
+}
+
+/**
+ * Invariant "canvas" (DESIGN §j.2 "Merge semantics"), after the heal:
+ *
+ *   validity     every canvas file on every device is a valid JSON Canvas (canvasProblem); every canvas version
+ *                the engine ever wrote (vault history, writer "sync": projections, materializations, conflict
+ *                copies) was valid, so a broken file never reached a peer; a file the engine wrote is exactly the
+ *                projection's formatting (formatCanvasText), any other bytes on disk were written by a user or
+ *                another program
+ *   records      every node and edge some user created and no user deleted exists in some canvas (conflict copies
+ *                count); exempt: an edge whose endpoint node a user deleted (dangling edges are dropped from the
+ *                projection and kept in the CRDT)
+ *   delete rule  a record a user deleted is not back in the canvas (doc) it was deleted from, unless another
+ *                device edited it without having seen the delete (a concurrent edit; the disk/CRDT merge keeps the
+ *                CRDT side and copies the disk file) or the deleting device wrote a conflict copy lacking it after
+ *                the delete (its merge had no base, or met a concurrent edit), or an IDB wipe without mirrors hit
+ *                the deleting device after the delete (its unsent delete is gone). A delete before an epoch
+ *                restore or made on an epoch the relay had left holds too: the migration carries the old doc's
+ *                deleted record keys (DESIGN §c.12 "Deletes"). Other docs holding it (conflict copies, a duplicate a
+ *                wipe or an epoch reset left under a suffixed name)
+ *                are copies, not the doc
+ *   text         canvas text-node edits carry ledger tokens: checkTokens / checkNothingDestroyed cover them (a
+ *                Y.Text char merge of concurrent edits keeps both)
+ *   writes       no lost update on a tracked field (canvas.ts oracle): a write that replaced value V (its
+ *                saw-chain passes through V) is never undone back to V in every canvas holding the record. Values
+ *                the user threw away with a conflict copy (with the copy writer's own earlier values in that file
+ *                it replaced, unless another canvas holds them), fields of deleted records, and fields of an edge left
+ *                dangling by a user's node delete (only conflict copies show it; the CRDT keeps it), are exempt. Unknown
+ *                fields at the top level, on nodes and on edges are tracked fields
+ *   order        an uncontested reorder holds: "bring to front / send to back" of node n on device X still puts n
+ *                above / below every node that was on the canvas then, unless another device reordered n or one of
+ *                those nodes, X reordered them later, a program sorted them, or a conflict copy holds them
+ */
+export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): Violation[] {
+	const out: Violation[] = [];
+	const bad = (detail: string) => {
+		if (out.length < 12) out.push({ inv: "canvas", detail });
+	};
+	for (const d of devs) {
+		for (const path of canvasFiles(d)) {
+			const text = d.vault.textOf(path) ?? "";
+			const why = canvasProblem(text);
+			if (why) {
+				bad(`${d.name}: ${path} is not a valid canvas after the heal (${why}): ${brief(text)}`);
+				continue;
+			}
+			const parsed = parseCanvasText(text);
+			if (parsed.kind !== "valid") {
+				bad(`${d.name}: ${path} valid JSON Canvas but the engine's parser says ${parsed.kind}`);
+				continue;
+			}
+			if (formatCanvasText(parsed.data) !== text && !d.vault.history.some((v) => v.by !== "sync" && v.text === text)) {
+				bad(`${d.name}: ${path} holds bytes neither the projection's formatting nor written by a user: ${brief(text)}`);
+			}
+		}
+		const seen = new Set<string>();
+		for (const v of d.vault.history) {
+			if (v.by !== "sync" || !v.path.endsWith(".canvas") || seen.has(v.text)) continue;
+			seen.add(v.text);
+			const why = canvasProblem(v.text);
+			if (why) bad(`${d.name}: the engine wrote an invalid canvas to ${v.path} (${why}): ${brief(v.text)}`);
+		}
+	}
+	const first = devs[0];
+	if (!first) return out;
+
+	// The converged canvases (device 0; convergence is checked separately): record -> [path, fields].
+	const holders = new Map<string, { path: string; doc: string | null; obj: Readonly<Record<string, unknown>> }[]>();
+	const roots: { path: string; doc: string | null; root: Readonly<Record<string, unknown>> }[] = [];
+	const order = new Map<string, { path: string; ids: string[] }>();
+	for (const path of canvasFiles(first)) {
+		const m = readModel(first.vault.textOf(path) ?? "");
+		if (!m) continue;
+		const doc = docIdOf(first, path);
+		roots.push({ path, doc, root: m.root });
+		if (doc) order.set(doc, { path, ids: m.nodes.map((n) => String(n.id)) });
+		for (const [kind, list] of [["n", m.nodes], ["e", m.edges]] as const) {
+			for (const o of list) {
+				const rec = `${kind}:${String(o.id)}`;
+				holders.set(rec, [...(holders.get(rec) ?? []), { path, doc, obj: o }]);
+			}
+		}
+	}
+	const valueOf = (obj: Readonly<Record<string, unknown>>, field: string): string => (obj[field] === undefined ? ABSENT : canonicalJson(obj[field] as JsonValue));
+	const deletedNode = (id: string) => oracle.record(`n:${id}`)?.deleted != null;
+
+	// records
+	for (const r of oracle.records.values()) {
+		if (r.deleted) continue;
+		if (r.key.startsWith("e:") && [...r.endpoints].some(deletedNode)) continue;
+		if (!holders.has(r.key)) bad(`lost ${r.key} (created on ${r.created.dev} at step ${r.created.step} in ${r.created.path})`);
+	}
+
+	// delete rule
+	const seenBy = (del: NonNullable<ReturnType<CanvasOracle["record"]>>["deleted"], rec: string, t: { field: string; value: string }): boolean => {
+		if (!del) return true;
+		if (t.field === "text") {
+			const text = del.saw.get("text") ?? "";
+			return t.value.startsWith("+") ? text.includes(t.value.slice(1)) : !text.includes(t.value.slice(1));
+		}
+		if (t.field === "rank") return false;
+		const saw = del.saw.get(t.field) ?? ABSENT;
+		if (saw === t.value) return true;
+		if (!isTracked(rec, t.field)) return false;
+		const w = oracle.writes.get(`${rec}|${t.field}|${saw}`);
+		return w ? oracle.ancestors(w).has(t.value) : false;
+	};
+	for (const r of oracle.records.values()) {
+		const del = r.deleted;
+		if (!del || del.how !== "record" || del.doc === null) continue;
+		// Back in the canvas (doc) it was deleted from; copies of that canvas (conflict copies, a duplicate a wipe or
+		// an epoch reset left under a suffixed name) are other docs.
+		const back = (holders.get(r.key) ?? []).filter((h) => h.doc === del.doc);
+		if (back.length === 0) continue;
+		const concurrent = r.touches.some((t) => t.dev !== del.dev && !seenBy(del, r.key, t));
+		const dev = devs.find((x) => x.name === del.dev);
+		const copied = dev?.vault.history.some((v) => v.by === "sync" && isConflictCopy(v.path) && v.path.endsWith(".canvas") && v.atMs >= del.atMs && !v.text.includes(`"${r.key.slice(2)}"`)) ?? false;
+		// The deleting device's store was wiped with its mirrors after the delete: an unsent delete is gone with it.
+		const wiped = oracle.wipes.some((x) => x.dev === del.dev && x.atMs >= del.atMs);
+		if (!concurrent && !copied && !wiped) bad(`${r.key} deleted on ${del.dev} at step ${del.step} is back in ${back.map((h) => h.path).join(", ")} with no concurrent edit and no conflict copy`);
+	}
+
+	// writes (lost updates)
+	const finalsOf = (rec: string, field: string, lineage: string | null | undefined, doc: string | null | undefined, removal: boolean): string[] | null => {
+		if (rec === "root") {
+			// A root has no id: its holders are the canvases of the written one's lineage (canvas.ts LINEAGE_KEY;
+			// conflict copies included, the field absent or not), and the canvas of the doc it was written in: another
+			// device's rewrite of the whole canvas, merged into that doc, replaces the lineage key there (suite-0 hot
+			// canvas seed 8). A lineage no canvas holds any more (the canvas was deleted, or merged into another doc
+			// whose root won) or none at all: every canvas holding the field, and a removal is not judged (a canvas
+			// without the field may or may not be the written one).
+			const known = roots.filter((x) => (lineage && lineageOf(x.root) === lineage) || (doc && x.doc === doc));
+			const hs = known.length > 0 ? known : removal ? [] : roots.filter((x) => x.root[field] !== undefined);
+			return hs.length > 0 ? hs.map((x) => valueOf(x.root, field)) : null;
+		}
+		const hs = holders.get(rec);
+		return hs ? hs.map((h) => valueOf(h.obj, field)) : null;
+	};
+	const lost = (w: { rec: string; field: string; value: string; dev: string; step: number }, anc: Set<string>, finals: readonly string[]): boolean => {
+		if (w.value === ABSENT) return finals.every((f) => f !== ABSENT && anc.has(f));
+		const removals = oracle.removals.get(`${w.rec}|${w.field}`) ?? [];
+		const removedAfter = removals.some((rm) => rm.saw === null || !anc.has(rm.saw));
+		return finals.every((f) => (f === ABSENT ? anc.has(ABSENT) && !removedAfter : anc.has(f)));
+	};
+	// An edge with an endpoint a user deleted that no canvas but a conflict copy holds is dangling in its doc: kept in
+	// the CRDT with its fields and dropped from the projection (DESIGN §j.2), so its writes are not on any disk.
+	const dangling = (rec: string): boolean => rec.startsWith("e:") && [...(oracle.record(rec)?.endpoints ?? [])].some(deletedNode)
+		&& !(holders.get(rec) ?? []).some((h) => !isConflictCopy(h.path));
+	const all = [...oracle.writes.values(), ...[...oracle.removals.values()].flat()];
+	for (const w of all) {
+		if (w.rec !== "root" && oracle.record(w.rec)?.deleted) continue;
+		if (dangling(w.rec)) continue;
+		if (oracle.discarded.has(`${w.rec}|${w.field}|${w.value}`)) continue;
+		const finals = finalsOf(w.rec, w.field, w.lineage, w.doc, w.value === ABSENT);
+		if (!finals) continue;
+		const anc = oracle.ancestors(w);
+		if (anc.size === 0) continue;
+		if (lost(w, anc, finals)) bad(`lost write ${w.rec}.${w.field}=${w.value === ABSENT ? "(removed)" : w.value} on ${w.dev} at step ${w.step} (${w.path}); final ${finals.map((f) => (f === ABSENT ? "(absent)" : f)).join(" | ")}`);
+	}
+
+	// order
+	const inCopy = (id: string) => (holders.get(`n:${id}`) ?? []).some((h) => isConflictCopy(h.path));
+	for (const r of oracle.reorders) {
+		if (deletedNode(r.node) || oracle.sorted.has(r.node) || inCopy(r.node)) continue;
+		const group = new Set([r.node, ...r.siblings]);
+		if (oracle.reorders.some((x) => x.dev !== r.dev && group.has(x.node))) continue;
+		if (oracle.reorders.some((x) => x.dev === r.dev && x.node === r.node && x.atMs > r.atMs)) continue;
+		const where = r.doc !== null ? order.get(r.doc) : undefined;
+		if (where) {
+			const { path, ids } = where;
+			const at = ids.indexOf(r.node);
+			if (at < 0) continue;
+			for (const m of r.siblings) {
+				const mi = ids.indexOf(m);
+				if (mi < 0 || deletedNode(m) || oracle.sorted.has(m) || inCopy(m)) continue;
+				if (oracle.reorders.some((x) => x.dev === r.dev && x.node === m && x.atMs > r.atMs)) continue;
+				if (r.front ? at < mi : at > mi) bad(`reorder of ${r.node} to the ${r.front ? "front" : "back"} on ${r.dev} at step ${r.step} lost against ${m} in ${path}`);
+			}
+		}
+	}
+	return out;
 }

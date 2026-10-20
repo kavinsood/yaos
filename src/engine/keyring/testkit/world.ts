@@ -7,7 +7,7 @@ import { SeededRandom } from "../../../sim/random";
 import type { Seq } from "../../../core/types";
 import { createWebCryptoSuite1, type Suite1Crypto } from "../../adapters/webCryptoSuite1";
 import { buildKeyRecord } from "../build";
-import { Keyring, type KeyringChange, type KeyringMode } from "../keyring";
+import { Keyring, type KeyringChange, type KeyringMode, type KeyringRecords } from "../keyring";
 import { KeyRecordKind } from "../record";
 
 export const VAULT = "AAAAAAAAAAAAAAAAAAAAAA";
@@ -43,6 +43,8 @@ export interface Device {
 	failPersist: boolean;
 	/** Seal epoch observed inside each persist call (persist-before-use). */
 	readonly sealAtPersist: number[];
+	/** Every write of the DB copy of the records (KeyringOptions.onRecords). */
+	readonly mirrored: KeyringRecords[];
 	ingest(...rows: readonly (readonly [Seq, Uint8Array])[]): Promise<void>;
 	codes(prefix?: string): string[];
 }
@@ -52,14 +54,19 @@ export async function device(o: {
 	readonly keys?: readonly { readonly e: number; readonly k: Uint8Array }[];
 	readonly records?: readonly Uint8Array[];
 	readonly keyringSeen?: boolean;
+	/** The DB copy of the records (KeyringOptions.mirror). */
+	readonly mirror?: KeyringRecords | null;
 } = {}): Promise<Device> {
 	const kc = await createWebCryptoSuite1({ vaultId: VAULT, random: random(), keys: (o.keys ?? []).map((x) => ({ e: x.e, k: x.k.slice() })) });
-	const d: Partial<Device> & { changes: KeyringChange[]; diags: Device["diags"]; sealAtPersist: number[]; seenCalls: number; failPersist: boolean } = {
-		kc, changes: [], diags: [], sealAtPersist: [], seenCalls: 0, failPersist: false,
+	const d: Partial<Device> & { changes: KeyringChange[]; diags: Device["diags"]; sealAtPersist: number[]; mirrored: KeyringRecords[]; seenCalls: number; failPersist: boolean } = {
+		kc, changes: [], diags: [], sealAtPersist: [], mirrored: [], seenCalls: 0, failPersist: false,
 	};
 	const mode = o.mode ?? "suite1";
 	const kr = await Keyring.open({
-		mode, vaultId: VAULT, kc: mode === "suite0" ? null : kc, records: o.records, keyringSeen: o.keyringSeen,
+		mode, vaultId: VAULT, kc: mode === "suite0" ? null : kc, records: o.records, keyringSeen: o.keyringSeen, mirror: o.mirror,
+		onRecords: async (r) => {
+			d.mirrored.push(r);
+		},
 		persist: async (c) => {
 			d.sealAtPersist.push(kc.sealEpoch());
 			if (d.failPersist) throw new Error("disk full");

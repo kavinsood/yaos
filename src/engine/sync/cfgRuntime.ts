@@ -10,7 +10,7 @@ import { decodeCfgFoldV1, encodeCfgFoldV1 } from "../../core/codec/cfgFoldV1";
 import { decodeCfgOps } from "../../core/codec/cfgOps";
 import { CFG_FOLD_RULES_VERSION, foldCfgFrame, newCfgFoldState, overlayPendingCfg, type CfgFoldEvent } from "../../core/cfg/fold";
 import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
-import { CFG_STREAM, type CfgFoldState, type CfgOp, type DeviceId, type Seq } from "../../core/types";
+import { CFG_STREAM, type CfgFoldState, type ClientFrameId, type CfgOp, type DeviceId, type Seq } from "../../core/types";
 import type { Repo } from "../store/repo";
 import type { SnapshotRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
@@ -57,6 +57,10 @@ export class CfgRuntime extends FoldRuntime<CfgOp, CfgFoldEvent> {
 
 	protected ownReplayEdge(): number {
 		return this.state.replay.get(this.self)?.r ?? 0;
+	}
+
+	protected ownRecentFrames(): readonly ClientFrameId[] {
+		return this.state.recentFrames.get(this.self) ?? [];
 	}
 
 	/** Committed cfg fold + own pending cfg frames (outbox, receipted-unfolded). */

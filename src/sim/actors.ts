@@ -186,6 +186,8 @@ export interface ActorWorld {
 	isDown(dev: number): boolean;
 	/** Hidden, pagehide or freeze (faults.ts "background"): the user cannot reach the app. */
 	isBackground(dev: number): boolean;
+	/** The user renamed a file through Obsidian (its link updater rewrites canvases pointing at it, canvas.ts). */
+	onUserRename?(dev: number, from: string, to: string, step: number): void;
 }
 
 function pickOf<T>(items: readonly T[], pick: number): T | undefined {
@@ -305,6 +307,7 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 			const path = pickOf(markdownFiles(d), a.file);
 			const to = `notes/r${a.name}.md`;
 			if (!path || !d.vault.userRename(path, to)) return `skip ${tag}`;
+			w.onUserRename?.(a.dev, path, to, step);
 			return `${tag} ${path} -> ${to}`;
 		}
 		case "delete": {
@@ -332,6 +335,7 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 			const path = pickOf(attachmentFiles(d), a.file);
 			const to = `att/b${a.name}.png`;
 			if (!path || !d.vault.userRename(path, to)) return `skip ${tag}`;
+			w.onUserRename?.(a.dev, path, to, step);
 			return `${tag} ${path} -> ${to}`;
 		}
 		case "attachDelete": {

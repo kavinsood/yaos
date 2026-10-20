@@ -432,6 +432,11 @@ export interface SyncedEntry {
 	 * ("pending-body"). The delete is decided: a file at `path` from now on is a new file, not this doc's.
 	 */
 	readonly fileGone?: true;
+	/**
+	 * With fileGone: the user's rename of the file, observed while inference was off (ns not ready). Observed renames
+	 * live in memory; this keeps the one that took the file away across an engine restart (the planner replays it).
+	 */
+	readonly renamedTo?: { readonly to: VaultPath; readonly atMs: number };
 }
 
 /** Vault event hint: a rename observed live; verified by the next reconcile. */
@@ -499,6 +504,11 @@ export type PlannerOp =
 		readonly op: "reconcileContent"; readonly docId: DocId; readonly path: VaultPath; readonly kind: "markdown" | "canvas"; readonly hasBase: boolean;
 		/** Merge against the old epoch's path-keyed base (§c.12), not the synced record's. */
 		readonly pathBase?: true;
+		/**
+		 * The synced record describes another file than this one (an observed rename moved the doc's earlier file off
+		 * a path the engine re-occupied with S's bytes): neither its base nor its contentHash is this file's base.
+		 */
+		readonly noBase?: true;
 	}
 	| { readonly op: "pushBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
 	| { readonly op: "fetchBlob"; readonly docId: DocId; readonly path: VaultPath; readonly hash: ContentHash; readonly size: number }
@@ -514,7 +524,8 @@ export type PlannerOp =
 	| { readonly op: "syncedPut"; readonly entry: SyncedEntry }
 	| { readonly op: "syncedDrop"; readonly docId: DocId }
 	| { readonly op: "needHash"; readonly path: VaultPath }
-	| { readonly op: "wait"; readonly docId: DocId; readonly reason: "body-not-caught-up" | "body-empty" | "blob-unavailable" | "frozen" | "pending-ns" | "pending-body" };
+	/** "text-hash": the runner loads the doc (resident), so the next plan has its textHash (planner collapse). */
+	| { readonly op: "wait"; readonly docId: DocId; readonly reason: "body-not-caught-up" | "body-empty" | "blob-unavailable" | "frozen" | "pending-ns" | "pending-body" | "text-hash" };
 
 /** Precondition the host checks before a destructive disk op. */
 export type DiskExpect =
