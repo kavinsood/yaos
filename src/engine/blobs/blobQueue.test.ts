@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { concatBytes } from "../../core/codec/lib0";
-import { sha256HexRef } from "../../core/hash/testkit/hashRef";
+import { refHashPort, sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { maxSealedBlobPlaintext } from "../../core/codec/sealedBlob";
 import type { ContentHash, DocId, VaultPath } from "../../core/types";
 import { BlobTooLargeError, type BlobPort } from "../../ports/blob";
@@ -12,7 +12,6 @@ import { FakeClock } from "../reconcile/testkit/fakes";
 import { FakeStorage } from "../reconcile/testkit/fakeStorage";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
-import { createWebHash } from "../adapters/webHash";
 import { BLOB_TRANSFER_MIN_COST } from "../../core/limits";
 import type { UploadSource } from "../reconcile/context";
 import { BLOB_RETRY_BASE_MS, BLOB_RETRY_MAX_MS, BlobQueue, CONFIRMED_TTL_MS, backoffMs } from "./blobQueue";
@@ -64,13 +63,13 @@ const MiB = 1024 * 1024;
 const src = (bytes: Uint8Array | null, onChanged: () => void = () => undefined): UploadSource => ({ read: async () => bytes, changed: onChanged });
 
 /**
- * Run the event loop until `cond` holds (WebCrypto digests settle on real turns, later under a loaded machine:
- * a bound in turns, not time, timed out in the full parallel suite).
+ * Run the event loop until `cond` holds, bounded in turns. The queue hashes with refHashPort and stores in
+ * FakeStorage, both settled in microtasks, so its progress is a fixed number of turns whatever the machine's load
+ * (with WebCrypto digests it hung on the thread pool, and a wall-clock bound timed out in a loaded parallel run).
  */
 async function until(cond: () => boolean, what = "condition"): Promise<void> {
-	const end = Date.now() + 10_000;
-	while (!cond() && Date.now() < end) await new Promise((r) => setImmediate(r));
-	assert.ok(cond(), `timed out waiting for ${what}`);
+	for (let turn = 0; turn < 1_000 && !cond(); turn++) await new Promise((r) => setImmediate(r));
+	assert.ok(cond(), `no ${what} within 1000 event-loop turns`);
 }
 
 /**
@@ -128,7 +127,7 @@ async function make(opts: { store?: BlobPort | null; budgetBytes?: number; admit
 	/** Every wake, as the docs it names. */
 	const woken: DocId[][] = [];
 	const open = async () => BlobQueue.open({
-		db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto: opts.crypto ?? crypto, hash: createWebHash(), store,
+		db: await storage.open<DiskSchema>("b", DB_SCHEMA_VERSION, STORE_SPECS), clock, crypto: opts.crypto ?? crypto, hash: refHashPort, store,
 		notice: (_l, c) => notices.push(c), touch: { reuse: async () => true, noted: async () => {} },
 		...(opts.budgetBytes !== undefined ? { budgetBytes: opts.budgetBytes } : {}), ...(opts.admit ? { admit: opts.admit } : {}),
 		wake: (who) => woken.push(who.map((w) => w.docId)),
@@ -305,7 +304,7 @@ test("liveHashes: queued records, running transfers and confirmed uploads, both 
 	const put = store!.put.bind(store);
 	store!.put = async (a, b) => { await gate; return put(a, b); };
 	const up = q.upload({ hash: rh, docId: D, path: P, bytes: running });
-	for (let i = 0; i < 20 && !q.liveHashes().has(rh); i++) await new Promise((r) => setTimeout(r, 1));
+	await until(() => q.liveHashes().has(rh), "the running upload");
 	assert.deepEqual([...q.liveHashes()].sort(), [qh, rh].sort(), "running upload, by hash without its direction prefix");
 	release();
 	assert.equal(await up, true);
