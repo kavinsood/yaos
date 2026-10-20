@@ -43,7 +43,9 @@ const mainOptions = {
 	logLevel: "info",
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
-	minify: prod,
+	// YAOS_KEEP_NAMES=1: a production build with readable function names, for device CPU profiles
+	// (e2e/client/phoneBench.ts --profile). Whitespace and syntax are still minified.
+	...(prod && process.env.YAOS_KEEP_NAMES === "1" ? { minifyWhitespace: true, minifySyntax: true } : { minify: prod }),
 	legalComments: "none",
 	metafile: prod,
 };
