@@ -2277,6 +2277,22 @@ ones get conflict copies.
     stored blob. Concurrency is a byte budget (`Budgets.blobBytesInFlight`, 64 MiB on a desktop; each transfer
     counts at least `BLOB_TRANSFER_MIN_COST`, 4 MiB; ready bytes count until taken): bytes held stay within
     max(budget, one blob), and a transfer larger than the budget runs alone once nothing else is in flight.
+  - **A download whose disk write fails** (ENOSPC, EIO, a folder or file in the way, an invalid name; not a CAS
+    miss, which the re-scan re-plans at once) loses its bytes: kept, they would pin their share of the byte budget
+    for as long as the disk stays broken. The job tells the queue (`blobWriteOk`, `src/engine/reconcile/diskJobs.ts`),
+    which then backs the re-download of that (doc, hash) off (`writeBackoffMs`, `src/engine/blobs/blobQueue.ts`): the
+    first failure retries at once (a transient error costs no latency), then 1 min doubling to a cap scaled by size
+    (`BLOB_WRITE_RETRY_BYTES_PER_HOUR`, 16 MiB/h, clamped to 10–60 min). Meanwhile the claim answers `write-backoff`
+    and the job holds (no pass retry); the queue's next due time arms the pass, so nothing wakes in between. A
+    100 MB attachment on a full disk: 7 GETs (700 MB) in the first hour, then one an hour (was one per 60 s pass
+    retry, ~6.5 GB an hour). Joining a running download or taking ready bytes of the hash is free and still allowed.
+    The backoff ends when the write succeeds, when the doc wants another hash or path, when a full pass no longer
+    plans it (`retain`), or on restart (in memory). A user delete or rename in the vault (`Scanner.onEvents` →
+    `diskFreed`: space freed, a blocking file moved) makes it due at once and wakes its doc, failure count kept, so
+    a signal that did not help costs one download. Other writes succeeding do not end it: small writes succeed on a
+    nearly full disk, and frequent edits would undo the backoff. From the second failure in a row it is listed in
+    `queued()` (`write-failed`, counted in `StatusSnapshot` pending blobs), with one `blob-write-failed` notice and a
+    diagnostics line per failure.
   - **Liveness.** Every store call carries a signal that the session loop aborts when it declares the relay link
     dead (close 1006 / 4000, pause, park, stop: `src/engine/blobs/transferLink.ts`,
     `src/engine/runtime/sessionLoop.ts` `abortTransfers`). The HTTP adapter ends a transfer that moves no byte for

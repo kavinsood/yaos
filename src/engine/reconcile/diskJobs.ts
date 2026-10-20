@@ -12,7 +12,7 @@ import type { ContentHash, DocId, NsBlobRef, NsOp, PlannerOp, VaultPath } from "
 import { markdownContentHash } from "../../core/hash/markdownLf";
 import { restartAtCreate } from "../../core/plan/planner";
 import type { VaultStat } from "../../ports/vault";
-import type { Ctx } from "./context";
+import type { BlobReq, BlobTransfer, Ctx } from "./context";
 import type { ExecResult, WrittenOk } from "./deps";
 import type { Scanner } from "./scan";
 import { applyOldDeletes } from "./oldDeletes";
@@ -39,6 +39,7 @@ export interface Env {
 /**
  * The blob store, or null without one (maxBlobBytes 0): attachments are not synced (fail closed). Jobs then
  * return "held", which arms no retry; a store found on a later connect restarts the runtime (EnginePorts.probeBlob).
+ * A download claim answering write-backoff holds too: the queue's next due time re-arms the pass.
  */
 export function blobStore(env: Env): NonNullable<Env["ctx"]["deps"]["blobs"]> | null {
 	const blobs = env.ctx.deps.blobs;
@@ -49,6 +50,19 @@ type Op<K extends PlannerOp["op"]> = Extract<PlannerOp, { op: K }>;
 
 export function writeOk(res: ExecResult): WrittenOk | null {
 	return res.t === "write" && res.outcome.ok ? res.outcome : null;
+}
+
+/**
+ * writeOk for the write of downloaded blob bytes, telling the queue how it went: a write that keeps failing backs
+ * off its re-downloads (blobQueue.ts header). A CAS miss is the file changing under the write, not the disk: the
+ * re-scan re-plans it at once, so it does not count.
+ */
+export function blobWriteOk(blobs: BlobTransfer, req: BlobReq, res: ExecResult): WrittenOk | null {
+	const out = writeOk(res);
+	if (out) blobs.written?.(req.docId, req.hash);
+	else if (res.t !== "write") blobs.writeFailed?.(req, res.t);
+	else if (res.outcome.ok === false && res.outcome.reason !== "precondition") blobs.writeFailed?.(req, `${res.outcome.reason}: ${res.outcome.message}`);
+	return out;
 }
 
 export function moveOk(res: ExecResult): VaultStat | null {
@@ -173,11 +187,13 @@ async function materializeBlob(env: Env, op: Op<"diskMaterialize">, blob: NsBlob
 	if (!blob) return "fail";
 	const blobs = blobStore(env);
 	if (!blobs) return "held";
-	const got = blobs.claimDownload({ hash: blob.hash, docId: op.docId, path: op.path, size: blob.size });
+	const req = { hash: blob.hash, docId: op.docId, path: op.path, size: blob.size };
+	const got = blobs.claimDownload(req);
 	if (got.t === "busy") return "inflight";
 	if (got.t === "unavailable") return "fail";
+	if (got.t === "write-backoff") return "held";
 	const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "bytes", bytes: got.bytes }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });
-	const out = writeOk(res);
+	const out = blobWriteOk(blobs, req, res);
 	if (!out) {
 		env.scan.markDirty(op.path, null);
 		return "fail";

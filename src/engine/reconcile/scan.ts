@@ -8,6 +8,8 @@
  * - events: hints only. An own echo is dropped; anything else marks the path
  *   dirty (hash = null) and scopes the next pass. Deletes are verified by a
  *   re-read: only a "missing" read removes the entry.
+ *   A delete or rename (not an echo) also tells the blob queue (diskFreed): a
+ *   download whose disk write kept failing may land now.
  */
 
 import type { LocalEntry, PathKey } from "../../core/types";
@@ -65,8 +67,10 @@ export class Scanner {
 	}
 
 	onEvents(events: readonly VaultEvent[]): void {
+		let freed = false;
 		for (const ev of events) {
 			if (this.ctx.echo.match(ev)) continue;
+			if (ev.t === "delete" || ev.t === "rename") freed = true;
 			switch (ev.t) {
 				case "create":
 				case "modify":
@@ -82,6 +86,8 @@ export class Scanner {
 					break;
 			}
 		}
+		// The disk may take a download whose write kept failing now (space freed, a blocking file moved away).
+		if (freed) this.ctx.deps.blobs?.diskFreed?.();
 	}
 
 	/** Mark a path as changed: stat known → pending entry; else the next read decides (missing removes it). */

@@ -185,6 +185,7 @@ simple invariant (every deferred job is re-checked within 30 s) for event-driven
 | Causal re-read | 60 s × 3, then freeze | `docRuntime.ts:275,302` | consistency | F4 |
 | Ref retry / blob queue / touch | 2 s → 10 min; 1 s → 60 s | `docRuntime.ts:237`, `passScheduler.ts:157`, `touch.ts:209` | latency | no jitter; F7 |
 | `passScheduler` debounce / retry | 30 ms / 1 s → 60 s | `passScheduler.ts:82,149` | latency | |
+| Blob write backoff (download whose disk write failed) | 0, then 1 min doubling to 10–60 min (scaled by size, ~16 MiB/h) | `blobQueue.ts` `writeBackoffMs` | cost | per (doc, hash), in memory; armed only through `nextDueInMs` while one waits; due at once on a user delete / rename |
 | `KEY_STORE_WAIT_MS` | 5 s | `secretStore.ts:188` | latency | one-shot at startup |
 | keyring `k` daily-limit retry / meta write | `retryAfterMs` or 60 s / 30 s | `keyringRuntime.ts:288,49` | latency | |
 | Engine start retry | 5 s flat, forever | `protocolEngine.ts:330` | housekeeping | F11 |

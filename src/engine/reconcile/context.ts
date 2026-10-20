@@ -48,8 +48,12 @@ export interface UploadSource {
  */
 export type UploadClaim = "stored" | "busy" | "unavailable" | "refused";
 
-/** A job's claim on a download: the verified bytes (single use), busy (as for uploads), or unavailable. */
-export type DownloadClaim = { readonly t: "bytes"; readonly bytes: Uint8Array } | { readonly t: "busy" } | { readonly t: "unavailable" };
+/**
+ * A job's claim on a download: the verified bytes (single use), busy (as for uploads), or unavailable.
+ * write-backoff = the disk write of this doc's bytes for this hash kept failing: not downloaded again before the
+ * queue's next due time, which re-arms the pass itself (the job holds: no pass retry).
+ */
+export type DownloadClaim = { readonly t: "bytes"; readonly bytes: Uint8Array } | { readonly t: "busy" } | { readonly t: "unavailable" } | { readonly t: "write-backoff" };
 
 /**
  * What the disk side needs from the blob store (src/engine/blobs/blobQueue.ts implements it). Plan jobs claim
@@ -61,6 +65,12 @@ export interface BlobTransfer {
 	readonly maxBlobBytes: number;
 	claimUpload(req: BlobReq, source: UploadSource): UploadClaim;
 	claimDownload(req: BlobReq): DownloadClaim;
+	/** The disk write of claimed download bytes failed (not a CAS miss): back the doc's re-download off (blobQueue.ts). */
+	writeFailed?(req: BlobReq, reason: string): void;
+	/** The disk write of claimed download bytes succeeded: its write backoff, if any, ends. */
+	written?(docId: DocId, hash: string): void;
+	/** A user delete or rename left the vault (space freed, a blocker moved): every write backoff is due now. */
+	diskFreed?(): void;
 	/** A pass begins; returns its token for endPass. */
 	beginPass?(): number;
 	/** The pass ended: downloads ready before it began for docs it covered, and taken by no job, are stale (dropped). */

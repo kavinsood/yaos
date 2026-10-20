@@ -14,7 +14,10 @@ import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
 import { BLOB_TRANSFER_MIN_COST } from "../../core/limits";
 import type { UploadSource } from "../reconcile/context";
-import { BLOB_RETRY_BASE_MS, BLOB_RETRY_MAX_MS, BlobQueue, CONFIRMED_TTL_MS, backoffMs } from "./blobQueue";
+import {
+	BLOB_RETRY_BASE_MS, BLOB_RETRY_MAX_MS, BLOB_WRITE_RETRY_BASE_MS, BLOB_WRITE_RETRY_MAX_MS, BLOB_WRITE_RETRY_MIN_CAP_MS, BlobQueue, CONFIRMED_TTL_MS,
+	backoffMs, writeBackoffMs,
+} from "./blobQueue";
 import { TransferLink } from "./transferLink";
 
 /** Suite-0-like crypto, but sealing XORs so a missing openBlob would be caught. */
@@ -608,6 +611,125 @@ test("a retry pending or running is not due: nextDueInMs skips it until it ends 
 	link.abort("close 1006");
 	await until(() => woken.length === 3, "the retry's wake");
 	assert.equal(q.nextDueInMs(), backoffMs(2), "the next backoff, counted from its end");
+});
+
+// ---- write backoff (downloads whose disk write failed) --------------------------------------
+
+/** A store whose cap admits a claim of `size` (the claim's size is the queue's accounting; the bytes stay small). */
+class BigStore extends FakeStore {
+	override readonly maxBlobBytes = 200 * 1000 * 1000;
+	gets = 0;
+	override async get(a: BlobAddress) { this.gets++; return super.get(a); }
+}
+
+test("writeBackoffMs: the first failed write retries at once; then 1 min doubling to a cap scaled by size (10 min small, 60 min at 100 MB)", () => {
+	assert.equal(writeBackoffMs(1, 100e6), 0);
+	assert.equal(writeBackoffMs(2, 100e6), BLOB_WRITE_RETRY_BASE_MS);
+	assert.equal(writeBackoffMs(3, 100e6), 2 * BLOB_WRITE_RETRY_BASE_MS);
+	assert.equal(writeBackoffMs(30, 100e6), BLOB_WRITE_RETRY_MAX_MS);
+	assert.equal(writeBackoffMs(30, 5_000), BLOB_WRITE_RETRY_MIN_CAP_MS);
+	const mid = writeBackoffMs(30, 8 * MiB);
+	assert.ok(mid > BLOB_WRITE_RETRY_MIN_CAP_MS && mid < BLOB_WRITE_RETRY_MAX_MS, `8 MiB cap ${mid / 60_000} min`);
+});
+
+test("write backoff: a 100 MB download whose disk write always fails is fetched 7 times in the first hour (700 MB; it was ~65, one per 60 s pass retry) and once an hour after", async () => {
+	const store = new BigStore();
+	const { q, clock, woken, notices } = await make({ store });
+	const bytes = rnd(2_000, 90);
+	const hash = sha256HexRef(bytes);
+	store.objects.set(`addr-${hash.slice(0, 16)}`, bytes.map((b) => b ^ 0x5a));
+	const req = { hash, docId: D, path: P, size: 100_000_000 };
+	/** One reconcile pass over the doc, as fetchBlob runs it: claim; the download's wake runs the write, which fails. */
+	const pass = async (): Promise<string> => {
+		const c = q.claimDownload(req);
+		if (c.t !== "busy") return c.t;
+		const n = woken.length;
+		await until(() => woken.length > n, "the download's wake");
+		const got = q.claimDownload(req);
+		assert.equal(got.t, "bytes");
+		q.writeFailed(req, "io: ENOSPC");
+		return "written-failed";
+	};
+	const hour = 3_600_000;
+	// The scheduler: a pass at once, then its 1 s retry (the first failure), then only when nextDueInMs comes due.
+	assert.equal(await pass(), "written-failed");
+	clock.advance(1_000);
+	assert.equal(await pass(), "written-failed");
+	const at = [0, 1_000];
+	for (let guard = 0; guard < 100; guard++) {
+		assert.equal(await pass(), "write-backoff", "a pass before the due time downloads nothing");
+		const due = q.nextDueInMs();
+		assert.ok(due !== null && due > 0, "a write backoff arms the next pass");
+		if (clock.mono + due > 2 * hour) {
+			assert.equal(due, BLOB_WRITE_RETRY_MAX_MS, "then one an hour (the cap at 100 MB)");
+			break;
+		}
+		clock.advance(due);
+		assert.equal(await pass(), "written-failed");
+		at.push(clock.mono);
+	}
+	assert.equal(store.gets, at.length);
+	assert.deepEqual(at.map((t) => t / 60_000), [0, 1 / 60, 1 + 1 / 60, 3 + 1 / 60, 7 + 1 / 60, 15 + 1 / 60, 31 + 1 / 60, 63 + 1 / 60], "GET times (min)");
+	assert.equal(at.filter((t) => t < hour).length, 7, "7 GETs (700 MB) in the first hour");
+	assert.equal(notices.filter((n) => n === "blob-write-failed").length, 1, "one notice");
+	assert.deepEqual(q.queued().map((t) => [t.state, t.attempts]), [["write-failed", 8]]);
+	assert.equal(q.bytesInFlight, 0, "nothing pinned while it waits");
+});
+
+test("write backoff: a write that succeeds ends it; another hash or path for the doc forgets it; joining a running download is free; diskFreed makes it due and wakes the doc", async () => {
+	const store = new GatedStore();
+	const { q, clock, woken } = await make({ store });
+	store.gated = false;
+	const bytes = rnd(900, 91), next = rnd(900, 92);
+	const hash = sha256HexRef(bytes), hash2 = sha256HexRef(next);
+	store.objects.set(`addr-${hash.slice(0, 16)}`, bytes.map((b) => b ^ 0x5a));
+	const req = { hash, docId: D, path: P, size: 900 };
+	q.writeFailed(req, "io");
+	assert.deepEqual(q.queued(), [], "one failure: retried at once, not listed");
+	assert.equal(q.nextDueInMs(), null, "arms nothing");
+	q.writeFailed(req, "io");
+	assert.deepEqual(q.claimDownload(req), { t: "write-backoff" });
+	assert.equal(q.nextDueInMs(), BLOB_WRITE_RETRY_BASE_MS);
+	assert.deepEqual(q.claimDownload({ ...req, docId: D2, path: P2 }), { t: "busy" }, "another doc of the hash is not held back");
+	assert.deepEqual(q.claimDownload(req), { t: "busy" }, "joining the running download costs nothing");
+	await until(() => woken.length === 1, "the wake");
+	assert.equal(q.claimDownload(req).t, "bytes");
+	q.written(D, hash);
+	assert.deepEqual(q.queued(), [], "written: gone");
+	assert.equal(q.nextDueInMs(), null);
+
+	q.writeFailed(req, "io");
+	q.writeFailed(req, "io");
+	q.diskFreed();
+	assert.deepEqual(woken[woken.length - 1], [D], "diskFreed wakes the doc");
+	assert.equal(q.nextDueInMs(), null, "due now: nothing more to arm");
+	assert.deepEqual(q.claimDownload(req), { t: "busy" }, "due: downloads again");
+	await until(() => woken.length === 3, "the wake");
+	q.endPass(q.beginPass(), () => true);
+	q.writeFailed(req, "io");
+	assert.equal(q.nextDueInMs(), 2 * BLOB_WRITE_RETRY_BASE_MS, "failures kept: the next wait doubles");
+	clock.advance(1_000);
+	assert.deepEqual(q.claimDownload({ ...req, path: "c/moved.png" as VaultPath }), { t: "busy" }, "another path: a fresh start");
+	assert.deepEqual(q.queued().map((t) => t.state), ["running"]);
+	await until(() => woken.length === 4, "the wake");
+	q.endPass(q.beginPass(), () => true);
+	q.writeFailed({ ...req, path: "c/moved.png" as VaultPath }, "io");
+	q.writeFailed({ ...req, path: "c/moved.png" as VaultPath }, "io");
+	assert.equal(q.nextDueInMs(), BLOB_WRITE_RETRY_BASE_MS, "counted from one again");
+	assert.deepEqual(q.claimDownload({ hash: hash2, docId: D, path: P, size: 900 }), { t: "busy" }, "the doc wants another hash");
+	assert.ok(!q.queued().some((t) => t.state === "write-failed"), "its old write backoff is forgotten");
+});
+
+test("write backoff: retain drops one the plan no longer wants", async () => {
+	const { q } = await make();
+	const req = { hash: "ab".repeat(32), docId: D, path: P, size: 900 };
+	q.writeFailed(req, "io");
+	q.writeFailed(req, "io");
+	assert.equal(await q.retain(() => true), 0);
+	assert.equal(q.queued().length, 1);
+	assert.equal(await q.retain(() => false), 1);
+	assert.deepEqual(q.queued(), []);
+	assert.equal(q.nextDueInMs(), null);
 });
 
 // ---- suite 1 (e2ee-design §10, WP-E6a) -------------------------------------------------------

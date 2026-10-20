@@ -84,6 +84,28 @@
  * until a restart or until retain() drops the transfer. The referencing ns
  * row itself cannot be quarantined (the ns fold must not stop on a blob), so
  * the quarantine is on the transfer.
+ *
+ * Write backoff. Downloaded bytes are single use: a disk write that fails
+ * (ENOSPC, EIO, a folder or file in the way, an invalid name) drops them, since
+ * kept they would pin their share of the byte budget for as long as the disk
+ * stays broken. The job reports it (writeFailed; a CAS miss does not count:
+ * the file changed, the re-scan re-plans at once), and the next claims of
+ * that (doc, hash) start no download until the backoff is over
+ * (writeBackoffMs: the first failure retries at once, then 1 min doubling to a
+ * cap scaled by size, BLOB_WRITE_RETRY_BYTES_PER_HOUR between 10 and 60 min,
+ * so a 100 MB attachment on a full disk costs ~700 MB in the first hour and
+ * 100 MB an hour after, not one download per pass retry). The claim answers
+ * "write-backoff" and the job holds: no pass retry, nextDueInMs() re-arms the
+ * pass at the due time, so nothing wakes in between. Claiming a running or
+ * downloaded transfer of the hash is free and still allowed. The backoff ends
+ * when a write of it succeeds (written), when the doc wants another hash or
+ * path (that claim forgets it), when retain() drops it, on restart (in
+ * memory), and is made due at once (failures kept, so a signal that did not
+ * help costs one download) when a user delete or rename leaves the vault
+ * (diskFreed: space freed, a blocker moved away). Not on other writes
+ * succeeding: small writes succeed on a nearly full disk, and frequent edits
+ * would undo the backoff. queued() lists it from the second failure on
+ * ("write-failed"; status pendingBlobs), with one notice "blob-write-failed".
  */
 
 import { bytesToHex } from "../../core/codec/lib0";
@@ -107,6 +129,20 @@ export const DEFAULT_BLOB_BYTES_IN_FLIGHT = 64 * 1024 * 1024;
 
 export function backoffMs(attempts: number): number {
 	return Math.min(BLOB_RETRY_MAX_MS, BLOB_RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1));
+}
+
+/** Write backoff (see the header): the wait after the second failed write in a row, doubling from there. */
+export const BLOB_WRITE_RETRY_BASE_MS = 60_000;
+export const BLOB_WRITE_RETRY_MIN_CAP_MS = 10 * 60_000;
+export const BLOB_WRITE_RETRY_MAX_MS = 60 * 60_000;
+/** A failing write's re-downloads at its cap: about this many bytes an hour (the cap clamped to the two above). */
+export const BLOB_WRITE_RETRY_BYTES_PER_HOUR = 16 * 1024 * 1024;
+
+/** How long a download of `size` bytes waits after its `failures`-th failed write in a row: 0 for the first. */
+export function writeBackoffMs(failures: number, size: number): number {
+	if (failures <= 1) return 0;
+	const cap = Math.min(BLOB_WRITE_RETRY_MAX_MS, Math.max(BLOB_WRITE_RETRY_MIN_CAP_MS, Math.ceil((size / BLOB_WRITE_RETRY_BYTES_PER_HOUR) * 3_600_000)));
+	return Math.min(cap, BLOB_WRITE_RETRY_BASE_MS * 2 ** Math.min(20, failures - 2));
 }
 
 /** A doc whose job claimed a transfer. */
@@ -147,8 +183,11 @@ export interface QueuedTransfer {
 	readonly size: number;
 	/** Failed attempts so far (its backoff record's). */
 	readonly attempts: number;
-	/** backoff = waiting for its retry; pending = waiting for the budget; ready = downloaded, no job took it yet. */
-	readonly state: "backoff" | "pending" | "running" | "ready";
+	/**
+	 * backoff = waiting for its retry; pending = waiting for the budget; ready = downloaded, no job took it yet;
+	 * write-failed = downloaded, but its disk write failed twice or more in a row (attempts = those failures).
+	 */
+	readonly state: "backoff" | "pending" | "running" | "ready" | "write-failed";
 }
 
 /** How a transfer ended. All but "stopped" wake its claimants. */
@@ -168,6 +207,17 @@ interface Transfer {
 	/** Upload only: where the bytes come from. */
 	readonly source: UploadSource | null;
 	running: Promise<void> | null;
+}
+
+/** A (doc, hash) whose downloaded bytes the disk refused (see the header). */
+interface WriteFailure {
+	readonly docId: DocId;
+	readonly hash: string;
+	readonly path: VaultPath;
+	readonly size: number;
+	readonly failures: number;
+	/** Monotonic: no download for it starts before. */
+	due: number;
 }
 
 interface Ready {
@@ -200,6 +250,8 @@ export class BlobQueue implements BlobTransfer {
 	private readonly quarantinedDown = new Set<string>();
 	/** Uploads the store refused by size, by hash (in memory; see the header). */
 	private readonly refusedUp = new Set<string>();
+	/** Downloads whose disk write failed, by docId + "|" + hash (in memory; see the header). */
+	private readonly writeFailures = new Map<string, WriteFailure>();
 
 	private constructor(private readonly deps: BlobQueueDeps) {}
 
@@ -248,6 +300,10 @@ export class BlobQueue implements BlobTransfer {
 			const [docId, path] = r.who.entries().next().value!;
 			out.push({ direction: "down", hash, docId, path, size: r.bytes.length, attempts: 0, state: "ready" });
 		}
+		for (const w of this.writeFailures.values()) {
+			if (w.failures < 2 || this.transfers.has(`down:${w.hash}`) || this.ready.has(w.hash)) continue;
+			out.push({ direction: "down", hash: w.hash, docId: w.docId, path: w.path, size: w.size, attempts: w.failures, state: "write-failed" });
+		}
 		return out;
 	}
 
@@ -257,6 +313,7 @@ export class BlobQueue implements BlobTransfer {
 		for (const r of this.records.values()) out.add(r.hash);
 		for (const t of this.transfers.values()) out.add(t.req.hash as ContentHash);
 		for (const h of this.ready.keys()) out.add(h as ContentHash);
+		for (const w of this.writeFailures.values()) out.add(w.hash as ContentHash);
 		const now = this.deps.clock.monotonic();
 		for (const [h, at] of this.confirmed) {
 			if (now - at < CONFIRMED_TTL_MS) out.add(h as ContentHash);
@@ -269,12 +326,15 @@ export class BlobQueue implements BlobTransfer {
 	 * Milliseconds until the earliest retry (0 = due now), or null when nothing is queued. A retry already pending or
 	 * running is not due: its past time stays until it ends (failed() sets the next one, settled() drops it), and a
 	 * pass started for it would only re-arm the retry timer at once (a full-pass hot loop for the whole transfer).
-	 * Its end wakes its docs, and the pass that follows arms whatever is due then.
+	 * Its end wakes its docs, and the pass that follows arms whatever is due then. A write backoff counts only while
+	 * it runs: once over, the next pass's claim downloads (or its doc moved on), so it arms nothing more.
 	 */
 	nextDueInMs(): number | null {
 		let next: number | null = null;
 		for (const [key, at] of this.due) if (!this.transfers.has(key) && (next === null || at < next)) next = at;
-		return next === null ? null : Math.max(0, next - this.deps.clock.monotonic());
+		const mono = this.deps.clock.monotonic();
+		for (const w of this.writeFailures.values()) if (w.due > mono && (next === null || w.due < next)) next = w.due;
+		return next === null ? null : Math.max(0, next - mono);
 	}
 
 	/**
@@ -334,9 +394,15 @@ export class BlobQueue implements BlobTransfer {
 			for (const docId of [...t.who.keys()]) if (!keep({ direction: t.direction, hash: t.req.hash as ContentHash, docId })) t.who.delete(docId);
 			if (t.who.size === 0 && t.waiters.length === 0) this.unqueue(t);
 		}
+		let dropped = 0;
+		for (const [key, w] of this.writeFailures) {
+			if (keep({ direction: "down", hash: w.hash as ContentHash, docId: w.docId })) continue;
+			this.writeFailures.delete(key);
+			dropped++;
+		}
 		const drop: string[] = [];
 		for (const [key, r] of this.records) if (!this.transfers.has(key) && !keep(r)) drop.push(key);
-		if (drop.length === 0) return 0;
+		if (drop.length === 0) return dropped;
 		const rows = new Map<string, BlobQueueRecord | null>();
 		for (const key of drop) {
 			const r = this.records.get(key)!;
@@ -351,7 +417,7 @@ export class BlobQueue implements BlobTransfer {
 		await this.deps.db.tx([STORE.blobQueue], "readwrite", async (tx) => {
 			for (const [hash, other] of rows) await (other ? tx.put(STORE.blobQueue, other) : tx.delete(STORE.blobQueue, hash as ContentHash));
 		});
-		return drop.length;
+		return dropped + drop.length;
 	}
 
 	// ---- claims (plan jobs) -----------------------------------------------------------------
@@ -385,8 +451,48 @@ export class BlobQueue implements BlobTransfer {
 			return { t: "busy" };
 		}
 		if (this.backingOff("down", req.hash)) return { t: "unavailable" };
+		if (this.writeBackingOff(req)) return { t: "write-backoff" };
 		this.enqueue(this.transfer("down", req, req.size, null), req);
 		return { t: "busy" };
+	}
+
+	// ---- write backoff (see the header) ------------------------------------------------------
+
+	writeFailed(req: BlobReq, reason: string): void {
+		const key = `${req.docId}|${req.hash}`;
+		const prev = this.writeFailures.get(key);
+		const failures = (prev && prev.path === req.path ? prev.failures : 0) + 1;
+		const wait = writeBackoffMs(failures, req.size);
+		this.writeFailures.set(key, { docId: req.docId, hash: req.hash, path: req.path, size: req.size, failures, due: this.deps.clock.monotonic() + wait });
+		this.deps.diag?.(`blob down ${req.path}: write failed (${reason}), ${failures} in a row; next download in ${Math.round(wait / 1000)} s`);
+		if (failures === 2) this.deps.notice?.("warn", "blob-write-failed", `could not save downloaded attachment ${req.path} (${reason}); retrying with backoff`);
+	}
+
+	written(docId: DocId, hash: string): void {
+		const key = `${docId}|${hash}`;
+		const w = this.writeFailures.get(key);
+		if (!w) return;
+		this.writeFailures.delete(key);
+		if (w.failures >= 2) this.deps.diag?.(`blob down ${w.path}: written after ${w.failures} failed writes`);
+	}
+
+	diskFreed(): void {
+		const mono = this.deps.clock.monotonic();
+		const who: BlobClaimant[] = [];
+		for (const w of this.writeFailures.values()) {
+			if (w.due <= mono) continue;
+			w.due = mono;
+			who.push({ docId: w.docId, path: w.path });
+		}
+		if (who.length > 0) this.deps.wake?.(who);
+	}
+
+	/** The doc's write of `req` failed recently and waits out its backoff. Its write failures for another hash or path are moot: forgotten. */
+	private writeBackingOff(req: BlobReq): boolean {
+		const key = `${req.docId}|${req.hash}`;
+		for (const [k, w] of this.writeFailures) if (w.docId === req.docId && (k !== key || w.path !== req.path)) this.writeFailures.delete(k);
+		const w = this.writeFailures.get(key);
+		return w !== undefined && w.due > this.deps.clock.monotonic();
 	}
 
 	beginPass(): number {

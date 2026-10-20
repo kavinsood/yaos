@@ -638,25 +638,80 @@ test("a rename of the open note that loses to a concurrent remote move: the view
 	assert.equal(view?.getText(), a.vault.textOf("r4.md"));
 });
 
-test("a downloaded attachment whose disk write keeps failing backs off: no re-download per base retry, and it lands once the disk heals", async () => {
-	// Each failed write throws its bytes away; the retry pass claims a fresh download and only starts it. That pass must
-	// not count as a success for the scheduler's backoff (before: ~1 GET per second, 601 in 10 min, forever).
-	const { clock, net, devs } = world({ settings: () => ATTACH });
-	const [a, b] = pair(devs);
+/** B's writes of `path` fail (EIO) while `broken()`; `heal()` ends it. */
+function brokenWrites(dev: SimDevice, path: string): { heal(): void } {
 	let broken = true;
-	const write = b.vault.write.bind(b.vault);
-	b.vault.write = async (path, data, pre) =>
-		broken && path === "img/p.png" ? { ok: false, reason: "io", current: null, message: "EIO (test)" } : write(path, data, pre);
-	const want = bytes(5_000, 1);
-	a.vault.externalWrite("img/p.png", want);
+	const write = dev.vault.write.bind(dev.vault);
+	dev.vault.write = async (p, data, pre) => (broken && p === path ? { ok: false, reason: "io", current: null, message: "EIO (test)" } : write(p, data, pre));
+	return { heal: () => void (broken = false) };
+}
+
+const BIG_ATTACH: EngineSettings = { ...SIM_SETTINGS, syncAttachments: true, maxAttachmentBytes: 16 * 1024 * 1024 };
+
+test("a downloaded attachment whose disk write always fails: re-downloads back off per (doc, hash), bounded by its size over an hour", async () => {
+	// Each failed write throws its bytes away (kept, they would pin the byte budget). Before: the pass retry's 60 s
+	// cap was the only bound, ~1 GET a minute forever (6 GB an hour for a 100 MB attachment).
+	const { clock, net, devs } = world({ settings: () => BIG_ATTACH });
+	const [a, b] = pair(devs);
+	brokenWrites(b, "img/p.png");
+	const size = 6_000_000;
+	a.vault.externalWrite("img/p.png", bytes(size, 1));
 	await boot(clock, devs);
 	await clock.advance(10_000);
 	assert.equal(b.vault.hasFile("img/p.png"), false);
 	const g0 = net.blobs.calls.get;
-	await clock.advance(10 * 60_000);
+	await clock.advance(60 * 60_000);
 	const gets = net.blobs.calls.get - g0;
-	assert.ok(gets >= 5 && gets <= 20, `GETs in 10 min of failing writes: ${gets} (the pass retry backs off to 60 s)`);
-	broken = false;
-	await clock.advance(2 * 60_000);
+	assert.ok(gets >= 3 && gets <= 8, `GETs in 1 h of failing writes: ${gets} (${((gets * size) / 1e6).toFixed(0)} MB)`);
+	const g1 = net.blobs.calls.get;
+	await clock.advance(60 * 60_000);
+	const steady = net.blobs.calls.get - g1;
+	assert.ok(steady <= 4, `GETs in the second hour: ${steady} (at the size-scaled cap)`);
+	const q = b.vrt?.blobs.queued() ?? [];
+	assert.deepEqual(q.map((t) => [t.direction, t.path, t.state]), [["down", "img/p.png", "write-failed"]], "the failing write stays visible as a pending blob");
+	assert.ok(b.ui.notices.some((n) => n.code === "blob-write-failed"), "one notice names the failing write");
+});
+
+test("a downloaded attachment whose write kept failing lands within seconds of a vault change once the disk heals (a delete frees space)", async () => {
+	const { clock, devs } = world({ settings: () => ATTACH });
+	const [a, b] = pair(devs);
+	const disk = brokenWrites(b, "img/p.png");
+	const want = bytes(5_000, 1);
+	a.vault.externalWrite("img/p.png", want);
+	a.vault.externalWrite("junk.md", "junk\n");
+	await boot(clock, devs);
+	await clock.advance(30 * 60_000);
+	assert.equal(b.vault.hasFile("img/p.png"), false);
+	disk.heal();
+	b.vault.userDelete("junk.md");
+	await clock.advance(5_000);
 	await same(a, b, "img/p.png", want);
+	assert.deepEqual(b.vrt?.blobs.queued() ?? [], [], "nothing left queued");
+});
+
+test("a downloaded attachment whose write kept failing lands within its backoff once the disk heals with no vault event", async () => {
+	const { clock, devs } = world({ settings: () => ATTACH });
+	const [a, b] = pair(devs);
+	const disk = brokenWrites(b, "img/p.png");
+	const want = bytes(5_000, 1);
+	a.vault.externalWrite("img/p.png", want);
+	await boot(clock, devs);
+	await clock.advance(30 * 60_000);
+	disk.heal();
+	await clock.advance(10 * 60_000 + 5_000);
+	await same(a, b, "img/p.png", want);
+});
+
+test("a transient write failure of a downloaded attachment retries at once (no added latency)", async () => {
+	const { clock, net, devs } = world({ settings: () => ATTACH });
+	const [a, b] = pair(devs);
+	let fails = 1;
+	const write = b.vault.write.bind(b.vault);
+	b.vault.write = async (p, data, pre) => (p === "img/p.png" && fails-- > 0 ? { ok: false, reason: "io", current: null, message: "EIO (test)" } : write(p, data, pre));
+	const want = bytes(5_000, 1);
+	a.vault.externalWrite("img/p.png", want);
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	await same(a, b, "img/p.png", want);
+	assert.equal(net.blobs.calls.get, 2, "the failed write's download, and one more");
 });

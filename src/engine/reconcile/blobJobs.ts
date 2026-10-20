@@ -19,7 +19,7 @@ import type { VaultStat, WritePrecondition } from "../../ports/vault";
 import type { IntentRecord } from "../store/schema";
 import type { UploadSource } from "./context";
 import { hashBytes } from "./localState";
-import { blobStore, writeOk, type Env, type JobOutcome } from "./diskJobs";
+import { blobStore, blobWriteOk, writeOk, type Env, type JobOutcome } from "./diskJobs";
 
 type Op<K extends PlannerOp["op"]> = Extract<PlannerOp, { op: K }>;
 
@@ -64,19 +64,23 @@ export async function conflictCopy(env: Env, op: Op<"conflictCopy">): Promise<Jo
  * Write the downloaded `hash` over `path` (CAS on `precondition`), then
  * T_synced for the doc + end of any keep-both intent. Used by fetchBlob and by
  * intent resume. "inflight" = downloading (the doc is planned again when it
- * settles); "fail" = unavailable now or the file changed; "held" = no blob store.
+ * settles); "fail" = unavailable now or the file changed; "held" = no blob store, or the write of these bytes kept
+ * failing and the re-download waits out its backoff (blobQueue.ts; its due time re-arms the pass).
  */
 export async function fetchAndWrite(env: Env, docId: DocId, path: VaultPath, hash: ContentHash, size: number, precondition: WritePrecondition): Promise<JobOutcome> {
 	const { ctx } = env;
 	const blobs = blobStore(env);
 	if (!blobs) return "held";
-	const got = blobs.claimDownload({ hash, docId, path, size });
+	const req = { hash, docId, path, size };
+	const got = blobs.claimDownload(req);
 	if (got.t === "busy") return "inflight";
 	if (got.t === "unavailable") return "fail";
+	if (got.t === "write-backoff") return "held";
 	const bytes = got.bytes;
 	const old = ctx.localAt(path);
 	const res = await ctx.exec({ t: "write", area: "vault", path: ctx.diskPathOf(path), data: { t: "bytes", bytes }, precondition, docId, purpose: "materialize" });
-	const out = writeOk(res);
+	// A failed write drops the bytes (kept, they would pin the byte budget); the queue backs the re-download off.
+	const out = blobWriteOk(blobs, req, res);
 	if (!out) {
 		env.scan.markDirty(ctx.diskPathOf(path), null);
 		return "fail";
