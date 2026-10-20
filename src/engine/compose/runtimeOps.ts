@@ -15,6 +15,7 @@ import type { FrameNoFloor } from "../store/repo";
 import { STORE, type MetaPathBase } from "../store/schema";
 import { parseDbName } from "./knownEpoch";
 import { readBase } from "../reconcile/store";
+import { encodeStateAsUpdate } from "../body/yjsCounters";
 import { pathBaseKey } from "./epochBases";
 import { KeyringRefusedError } from "../keyring/writeGate";
 import type { VaultRuntime } from "./vaultRuntime";
@@ -235,7 +236,8 @@ async function oldDeletes(rt: VaultRuntime, s: SyncedEntry): Promise<Pick<MetaPa
 	try {
 		if (s.kind === "markdown") {
 			if (Y.createDeleteSetFromStructStore(h.doc.store).clients.size === 0) return {};
-			return { textDeletes: { docId: s.docId, update: Y.encodeStateAsUpdate(h.doc, Y.encodeStateVector(h.doc)) } };
+			// Encoded against the doc's own state vector: no structs, the delete set only.
+			return { textDeletes: { docId: s.docId, update: encodeStateAsUpdate(h.doc, Y.encodeStateVector(h.doc)) } };
 		}
 		const deleted: string[] = [];
 		for (const [map, prefix] of [["nodes", "n:"], ["edges", "e:"]] as const) {
