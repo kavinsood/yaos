@@ -39,7 +39,8 @@ describe("reader-dependent quarantine of a large row (§d.6)", () => {
 			const text = await docText(x!.engine, id);
 			assert.equal(text, "seed;" + inline);
 			const head = relay.head();
-			await until(() => y!.engine.status().vaultSeq >= head, 10_000, "y read through head");
+			// vaultSeq covers the vault index only; the body stream is read by its own catch-up (stale until then).
+			await until(() => y!.engine.status().vaultSeq >= head && y!.engine.status().counts.staleStreams === 0, 10_000, "y read through head");
 			const held = (await Promise.all([...y!.engine.c.repo.streams()].map((r) => y!.engine.c.repo.quarantineOf(r.stream)))).flat();
 			const big = held.filter((q) => q.originalSize > QUARANTINE_ROW_BYTES);
 			assert.ok(big.some((q) => q.stream === x!.engine.streamOf(id)), "the inline body row is held");
