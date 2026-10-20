@@ -25,6 +25,9 @@ are trashed, and creates and settings changes are dropped. The fix is being desi
   device identity on the clone;
 - a per-store writer tag, so two stores under one deviceId never take each other's frames for their own.
 
+Proposed design: [identity-per-store](client-remake/identity-per-store.md) (an identity per IndexedDB store, a pairing
+grant in data.json).
+
 ### FRAMENO-IDB: frameNo collision after IndexedDB loss
 
 ns/cfg replay protection (e2ee-design §8.2) needs every frame number of a device to be new. A store lost with an
@@ -36,6 +39,8 @@ in ms (44748cb2), ignored when the clock reads past 2^45 ms (f47950cb) (`FoldRun
 `src/engine/sync/foldRuntime.ts`). It depends on the wall clock moving forward across the loss. It stays until the
 CLONED-ID design lands: a fresh store under a new writer identity (rotated device id or writer tag) never shares a
 replay window with the lost one.
+
+Proposed design: [identity-per-store](client-remake/identity-per-store.md).
 
 ## 2. Smaller open items
 

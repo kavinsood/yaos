@@ -29,6 +29,7 @@ The repository-root [README](../README.md) is the public product guide. Workstat
 - [legacy-parity](client-remake/legacy-parity.md): every feature of the deleted old client mapped to its new home
   or to the reason it was dropped.
 - [timer-audit](client-remake/timer-audit.md): every timer and time rule, traced to what it protects.
+- [identity-per-store](client-remake/identity-per-store.md): proposal: one device identity per local store (fixes CLONED-ID, FRAMENO-IDB).
 - Work-package notes, historical records of each package as delivered:
   [WP-A](client-remake/wp-a-notes.md) (fold, codecs, paths, sim log), [WP-B](client-remake/wp-b-notes.md)
   (planner, merge, disk side), [WP-C](client-remake/wp-c-notes.md) (log-side engine),
