@@ -154,7 +154,7 @@ error followed by close 1006:
   "vaultEpoch": "<epoch>",
   "runtimeEpoch": "<uuid of this DO runtime>",
   "head": 42,
-  "liveness": { "version": 1, "idleMs": 60000, "timeoutMs": 15000 },
+  "liveness": { "version": 1, "idleMs": 60000, "timeoutMs": 15000, "keepalive": true },
   "capabilities": { "streams": 1 },
   "limits": {
     "maxStreamNameBytes": 256, "maxClientFrameIdBytes": 128, "maxPayloadBytes": 1048576,
@@ -215,6 +215,7 @@ A close for a malformed APPEND is a client bug. Do not resend that frame.
 | Message | Effect |
 |---|---|
 | `{"type":"VAULT_PING","probeId":"<1–128 printable chars>"}` | Answered with VAULT_PONG. Send it after `liveness.idleMs` of silence. If no pong arrives within `timeoutMs`, reconnect. |
+| `__YPS:{"type":"VAULT_KEEPALIVE"}` (exactly this text) | Answered with exactly `__YPS:{"type":"VAULT_ALIVE"}`. Only when VAULT_READY has `liveness.keepalive: true`. The runtime answers it itself (`setWebSocketAutoResponse`, server/src/vault/vault.ts), so it does not wake a hibernated vault DO; the relay answers it in code too. The idle probe of choice: the client sends it after `liveness.idleMs` of silence instead of VAULT_PING, except every 10th idle probe, a VAULT_PING (its pong carries `head`, the idle gap check; src/engine/adapters/wsRelay.ts `KEEPALIVE_PING_EVERY`). An older relay never advertises it and gets VAULT_PING. |
 | `{"type":"STREAM_SUBSCRIBE","streams":["b:…","c:…",…]}` | Replaces this socket's subscription set (§5.6). No ack; `STREAM_SUBSCRIBE_REJECTED` on invalid input. |
 
 ### 4.3 Control messages, server → client
@@ -250,6 +251,10 @@ transaction** at the first of these:
   An isolated edit is therefore not held for the idle window. A burst pays at most one extra commit at its start
   (2 rows per stream that commit and the next both touch, §11.5), and there is at most one lead commit per
   quietMs. `minIntervalMs` still holds a lead commit.
+
+A frame whose stream's dedupe index is still building (after a wake) waits for the build, but never longer than
+**5 s** after it was admitted (`STREAM_HOLD_MAX_MS`): then it commits with the index built inline, so dedupe still
+holds. The env overrides of idle, max, lead and min interval are clamped to the same 5 s.
 
 It is also committed before authority fences and on graceful drain. The commit assigns contiguous seqs in arrival
 order.
@@ -557,7 +562,7 @@ cannot check this.
 Env overrides (Worker vars, integer strings):
 
 - `YAOS_STREAMS_GC_IDLE_MS`, `YAOS_STREAMS_GC_MAX_MS`, `YAOS_STREAMS_GC_MAX_BYTES`, `YAOS_STREAMS_GC_MIN_INTERVAL_MS`,
-  `YAOS_STREAMS_GC_LEAD_MS`, `YAOS_STREAMS_GC_QUIET_MS`;
+  `YAOS_STREAMS_GC_LEAD_MS`, `YAOS_STREAMS_GC_QUIET_MS` (the four time knobs except quiet are clamped to 5 s, §5.1);
 - `YAOS_STREAMS_RATE_BYTES_PER_SEC`, `YAOS_STREAMS_BURST_BYTES` (floored at the max binary message size);
 - `YAOS_STREAMS_MAX_SOCKETS`.
 
@@ -801,7 +806,7 @@ export interface StreamLimits {
 export interface VaultReady {
   type: "VAULT_READY"; documentId: "streams"; socketSessionId: string;
   vaultId: string; vaultGeneration: string; vaultEpoch: string; runtimeEpoch: string; head: number;
-  liveness: { version: 1; idleMs: number; timeoutMs: number };
+  liveness: { version: 1; idleMs: number; timeoutMs: number; keepalive?: true };
   capabilities: { streams: 1 }; limits: StreamLimits; canWrite: boolean;
   principalId: string; deviceId: string; role: "owner" | "member";
   membershipRevision: number; deviceCredentialRevision: number; policyVersion: number; capabilityDigest: string;
