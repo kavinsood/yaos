@@ -33,6 +33,20 @@ export default tseslint.config(
 		},
 	},
 	{
+		// node:test's describe/it/test/suite return promises the runner owns: awaiting them at top level is not needed.
+		files: ["**/*.ts"],
+		rules: {
+			"@typescript-eslint/no-floating-promises": ["error", {
+				allowForKnownSafeCalls: [
+					{ from: "package", package: "node:test", name: ["test", "it", "only", "skip", "todo"] },
+					// describe/suite sit in a namespace inside `declare module "node:test"`, which the package matcher does not
+					// walk through; match them by their declaration file instead.
+					{ from: "file", path: "node_modules/@types/node/test.d.ts", name: ["describe", "suite"] },
+				],
+			}],
+		},
+	},
+	{
 		files: ["package.json"],
 		rules: {
 			"depend/ban-dependencies": "off",

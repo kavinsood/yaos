@@ -1,6 +1,9 @@
 {
 	"extends": "./tsconfig.json",
 	"compilerOptions": {
+		// Keep node_modules paths as seen from this checkout (a worktree may symlink node_modules), so eslint.config.mts
+		// can match node:test's declarations by path.
+		"preserveSymlinks": true,
 		"types": [
 			"node",
 			"@cloudflare/workers-types"
