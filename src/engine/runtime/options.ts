@@ -80,6 +80,15 @@ export interface EngineTuning {
 	readonly skipMaxDeferMs: number | null;
 }
 
+/**
+ * DESIGN §d.6: the causal-hole re-read window (causalRetries x causalRetryMs) must be at least 2 x provisionalAdoptMs,
+ * because the missing structs may be a provisional adoption still in flight. Returns why a tuning breaks it, or null.
+ */
+export function causalWindowProblem(t: Pick<EngineTuning, "causalRetryMs" | "causalRetries" | "provisionalAdoptMs">): string | null {
+	const window = t.causalRetryMs * t.causalRetries;
+	return window >= 2 * t.provisionalAdoptMs ? null : `causal re-read window ${t.causalRetries} x ${t.causalRetryMs} ms < 2 x provisionalAdoptMs ${t.provisionalAdoptMs} ms (DESIGN §d.6)`;
+}
+
 export const DEFAULT_TUNING: EngineTuning = {
 	compactRows: LOCAL_COMPACT_ROWS,
 	compactBytes: LOCAL_COMPACT_BYTES,

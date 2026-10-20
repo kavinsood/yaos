@@ -184,10 +184,11 @@ export class Reconciler {
 			brake = { id, ...report };
 			this.lastHeld = { id, identity, ops: plan.held };
 			ctx.deps.onBrake?.(brake);
-		} else {
-			if (scope.t === "full") this.lastHeld = null;
-			ctx.brakeApproval = null;
-		}
+		} else if (scope.t === "full") this.lastHeld = null;
+		// The approval stays: it names exactly the held units and their expected hashes (brakeIdentity), so it can only
+		// ever release those same changes. Dropping it on the first unbraked pass (the one that released them) re-held
+		// an approved op that was still in flight (a blob fetch: its download was then stale for the braked pass and
+		// re-fetched), and the user had to approve the same report again, forever (sim storms seed 17).
 		this.env.heldOverwrites.length = 0;
 		const vacated: PathKey[] = [];
 		for (const o of plan.ops) {

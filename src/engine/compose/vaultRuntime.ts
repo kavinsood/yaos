@@ -455,7 +455,10 @@ export class VaultRuntime {
 		this.o.observe?.pass?.(this.rec.lastPlan, r);
 		this.port.invalidate();
 		this.stats.passes++;
-		if (r.brake === null && this.brake !== null) {
+		// Only a full pass clears the brake: a docs-scoped pass that planned none of the held units returns no brake
+		// either, and clearing on it made the user's approve / reject of the report shown a no-op (runtimeOps checks
+		// rt.brake.id) while the held ops waited for the next periodic full pass (sim storms, mass-overwrite).
+		if (r.brake === null && this.brake !== null && scope.t === "full") {
 			this.brake = null;
 			this.postStatus();
 		}
