@@ -1356,8 +1356,9 @@ The planner does no destructive work until ns is caught up (§f.2).
     e2ee-design §16.2). `TAIL_HARD_ROWS` stays the local hard cap.
   - *Why 256 (was 512):* take a pessimistic steady state of 32 docs, each just under the hot cap. 32 is the number
     of docs a heavy user (about 1 edit session a minute) leaves unsettled for the worst-case 22 min. At 255 rows per
-    doc a fresh device opens the 10k-doc vault in 279 ms (batches of 48) or 230 ms (8 lanes), within the 300 ms
-    budget (`scripts/bench-e2ee.mjs` scenario S, e2ee-design §16.2). At 511 it takes 429 ms or 300 ms (measured
+    doc the crypto of a fresh device's opens over the 10k-doc vault takes 279 ms (batches of 48) or 230 ms (8 lanes),
+    within the 300 ms crypto budget (`scripts/bench-e2ee.mjs` scenario S, Node on a laptop, crypto only: not the
+    bootstrap, which on a phone is dominated by local work, integration-notes §7.3; e2ee-design §16.2). At 511 it takes 429 ms or 300 ms (measured
     under load average 4.8, where S took 281 ms or 221 ms). 128 would buy about 70 ms more margin for about 310 more
     rows written a day.
 - **No refire.**

@@ -48,6 +48,37 @@ replay window with the lost one.
 
 Proposed design: [identity-per-store](client-remake/identity-per-store.md).
 
+### PERF-BOOT: fresh-device bootstrap takes ~50 s on a phone
+
+**A fresh Android phone needs ~50 s (median 49.6 s, n = 3) to bootstrap a 1022-file vault.** The Node harness does
+the same vault in ~2.7 s ([integration-notes](client-remake/integration-notes.md) §7.3, `e2e/client/phoneBench.ts`).
+
+**Where the time goes, profiled on the device:**
+- **The ~43 s steady phase is Obsidian's native file bridge.** A DataAdapter call is in flight 94% of the time,
+  back to back and mostly one at a time.
+  - About 5.4 bridge calls per file: Obsidian's `create` (`exists` + `write`), Obsidian's metadata `read`, and two
+    of YAOS's own: the `absent` precondition's `exists` (`src/host/obsidianVault.ts` `check`) and the engine reading
+    each file back after writing it (`src/host/diskExecutor.ts` `readVault`, `readBinary`).
+  - IndexedDB can account for at most ~6% of this phase.
+- **~7.2 s before the first file are spent in the worker and on the network, not yet attributed.**
+
+**Next, measured on the phone after each step:**
+1. **Write independent files concurrently.**
+   - The bridge serves 4 calls in flight 2-3x faster than one at a time.
+   - The plan runner materializes in order today (§f.2).
+2. **Drop YAOS's two bridge calls per created file:**
+   - the pre-create `exists`: `vault.create` already throws when the path exists, and the catch re-checks;
+   - the read-back after our own write: the engine knows the bytes it wrote.
+
+   Together these are ~21 s of the 55 s of summed bridge time.
+3. **Attribute the 7.2 s.**
+   - Export the engine's diagnostics phase timeline over DevTools at the end of a run.
+   - Get the worker hooks working (they recorded nothing in the profile run).
+4. **One transaction per catch-up batch** instead of three per file: hygiene, worth ≤ ~2.6 s here.
+
+**Found on the way:** `STARTUP_PING_TIMEOUT_MS` (5 s, `src/host/engineHost.ts`) is fatal and not retried. A phone
+that takes longer than 5 s to start the worker stops syncing until "Restart sync engine".
+
 ## 2. Smaller open items
 
 ### QUARANTINE-UI: quarantine release control in the UI

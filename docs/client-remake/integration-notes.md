@@ -905,6 +905,11 @@ Sweeps at 90c717e7:
 
 ## 7. End-to-end results
 
+**Every number in §7.0-§7.2 comes from the Node harness, not from a device.** The clients run in Node on a laptop
+with `fake-indexeddb` and a simulated vault, so local storage and disk work cost almost nothing. On a real phone
+(§7.3), a fresh device takes **~50 s** to bootstrap the 1022-file vault that the harness bootstraps in ~2.7 s, on the
+same relay at the same hour. Read the harness numbers as relay and protocol costs, not as what a user waits for.
+
 Harness: `e2e/client/fullClients.ts` (from the full-client e2e branch,
 f0b7c63 / 8939943). Each client is a complete `HostRuntime` over the
 simulated Obsidian vault/workspace/config dir/side files, with the real
@@ -1080,7 +1085,9 @@ read (folded before live) to 1.21 s, then 9 catch-up batches on 4 lanes and
 writes run 1.50-4.02 s, and all but 6 of the 1022 land after 2.9 s. The
 tail end is local work: ~3 storage tx per note (catch-up apply, reconcile read, synced/
 localTree commit; 3083 tx, 1.8 s of tx time on fake-indexeddb), the same
-cost that bounds the local run. Deployed is now within ~0.3 s of local.
+cost that bounds the local run. Deployed is now within ~0.3 s of local in the
+harness. That per-note local work is nearly free on fake-indexeddb and is not
+free on a device: on a phone the same vault takes ~50 s (§7.3).
 
 **Edit to peer.** The relay commits a group after 300 ms idle (1500 ms max),
 and a peer projects an edit of a note it does not have open to disk only on
@@ -1213,6 +1220,98 @@ land in one group commit. Onboarding keeps holding them until the fold.
   HTTP PUT before the ns op.
 
 Raw logs: `experiments/logs/client-e2e-full-{create-base,create-base2,create-base3,prof-base,create-new,create-new2,create-new3,prof-new}-20261007T*.json`.
+
+### 7.3 Fresh-device bootstrap on a real phone (2026-10-21)
+
+**Fresh-device bootstrap of a 1022-file vault takes ~50 s on a mid-range Android phone.** The harness takes ~2.7 s
+for the same vault. Probe: `e2e/client/phoneBench.ts`. It drives one Android phone over adb and bootstraps the
+vault that a `bootBench.ts` run seeded, against the same relay. Per run it stops Obsidian, revokes the previous run's
+device, wipes the bench vault folder, pushes the build, reopens Obsidian, mints a pairing code and opens the setup
+link. The only manual step is tapping Pair. Each pairing is a new device id, and the store is per device
+(`yaos2:<vault>:<epoch>:<device>`), so every run starts from an empty IndexedDB. Timing is taken on the laptop by
+polling the folder over adb, about every 115 ms: from Pair (data.json holds an identity) to the first file, then to
+every seeded file.
+
+```sh
+node --import jiti/register e2e/client/bootBench.ts --host URL --label phone-base --notes 1000 --attachments 20 --big 2 --repeat 3
+node --import jiti/register e2e/client/phoneBench.ts --host URL --label phone-base --runs 3
+```
+
+Setup:
+- Tree `client-remake-next` 1ef5e580; relay `yaos-relay2-client-e2e` redeployed from it (colo BLR).
+- One relay request from the laptop: ~70 ms.
+- Phone: Nothing A015 (CMF Phone 1), Android 16, Obsidian 1.14.4, WebView 155.0.8059.43, 8 cores, 5.3 GB.
+- The phone was on LTE (Wi-Fi off) and charging over USB at 14-15% battery, with battery saver off.
+- Vault: 1000 notes + 20 x 40 KB + 2 x 300 KB attachments.
+
+| ms, fresh device | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| Phone: every file on disk | 50528 | 47279 | 49552 | **49552** |
+| Phone: first file on disk | 7607 | 7782 | 7935 | 7782 |
+| Node harness (`bootBench`, desktop budget, fake-indexeddb): every file on disk | 2651 | 2358 | 5035 | 2651 |
+
+The phone runs are within ±3% of each other. Where the time goes, from the harness trace of the same vault and the
+phone's file-count timeline:
+- **Network is not the bulk.** In the harness every catch-up read is done by ~0.8 s: 9 batched `/streams/read`
+  requests, ~111 streams each, 975 KB.
+- **The phone spends ~7.8 s before writing its first file.** The harness finishes all of its downloading in 0.8 s.
+  Not yet split between LTE round trips, the worker's start and IndexedDB.
+- **Then files land at a flat ~24 per second, about 41 ms per file, until the end.** That steady rate is per-file
+  local work, not transfer.
+- **Local work per file in the harness:** 3052 storage transactions for 1022 files, three per file:
+  - `readwrite meta,outbox,quarantine,snapshots,streams,tail` x1001, the catch-up apply;
+  - `readonly outbox,snapshots,tail` x1000, the reconcile read;
+  - `readwrite baseText,intents,localTree,synced` x1022, the synced/localTree commit.
+
+  The harness also does one Obsidian vault write per file. On a phone, each of those crosses the WebView-to-native
+  file bridge.
+
+**Profile (`phoneBench.ts --profile`, `phoneProfile.ts`).** The profiler attaches to Obsidian's WebView over the
+DevTools protocol (adb forward), wraps Obsidian's vault and DataAdapter calls on main and IndexedDB and fetch in every
+worker, and records a CPU profile of every thread. One run, 50164 ms (first file at 7222 ms), with the same build
+built with `YAOS_KEEP_NAMES=1`. The instrumentation does not shift the total, which sits inside the baseline runs.
+
+- **The steady phase (first file -> every file, 42.9 s) is the native file bridge.**
+  - A DataAdapter call was in flight for 40.3 s of it (94%). Nothing was in flight for 2.6 s.
+  - The calls run back to back (median gap 0 ms) and mostly one at a time: depth 1 for 27.0 s, depth 2 for 12.1 s,
+    3-4 for 1.3 s.
+  - Main-thread CPU was busy 11.2 s of 56.4 s profiled. Main is waiting on native code, not computing.
+- **Bridge calls in that phase: 5372 for ~1000 files, 55.0 s summed.**
+
+  | Call | n | p50 ms | sum s | Issued by |
+  |---|---|---|---|---|
+  | `write` | 1040 | 16.2 | 18.2 | Obsidian's `vault.create` |
+  | `read` | 997 | 12.9 | 13.9 | Obsidian (its metadata cache reading each new note) |
+  | `readBinary` | 1001 | 10.8 | 11.8 | YAOS: `diskExecutor.readVault`, the engine reading each file back after writing it |
+  | `exists` | 2184 | 2.9 | 9.2 | YAOS's `absent` precondition (`obsidianVault.check`), plus Obsidian's own inside `create` |
+  | `mkdir` | 124 | 8.8 | 1.2 | `createFolder` |
+  | `writeBinary` | 26 | 24.6 | 0.7 | attachments |
+
+- **IndexedDB is not the bottleneck.** The worker hooks recorded no events (open gap below). But the steady phase
+  had only 2.6 s with no bridge call in flight, so the engine's transactions can hold the critical path for at most
+  about 6% of that phase. Cutting the 3 transactions per file to one per batch is still sound hygiene, but it buys at
+  most ~2.6 s of 50 s.
+- **Pre-first-file (7.2 s): main is nearly idle.**
+  - The only bridge calls: 0.15 s of them, at 2.5 s, 4.1 s and from 7.1 s.
+  - The time goes to the worker and the network: engine start, socket, feed, catch-up reads and apply, fold, plan.
+    None of it is attributed yet.
+- **The bridge takes concurrent calls.** Measured in the bench vault over DevTools, 240 calls per row, three runs:
+  - with 4 calls in flight instead of 1, `write` runs 1.8-2.0x faster, `readBinary` 2-2.3x and `exists` 2.6-2.9x;
+  - `write` levels off at ~20 ms per call beyond 4-8 in flight;
+  - absolute times standalone are noisier than inside the bootstrap: Obsidian works in the background.
+
+Open gaps in the probe:
+- **The engine worker's hooks stayed empty.** The worker was hooked while running, and its CPU profile was not
+  captured either.
+- **The obvious fix for that fails.** Attaching new workers paused, so the hooks go in before any code runs, stalled
+  the engine past `STARTUP_PING_TIMEOUT_MS` (5 s, `src/host/engineHost.ts:33`), and the plugin stopped with "the sync
+  engine did not answer within 5 s of starting". That failure is fatal and not retried, so a phone slow enough to
+  start the worker in over 5 s would stop syncing the same way.
+
+Raw logs: `experiments/logs/client-e2e-boot-phone-base-20261020T224337Z.json`,
+`client-e2e-phone-phone-base-20261020T225908Z.json` (the three runs), and
+`client-e2e-phone-phone-base-20261020T232527Z.json` with `client-e2e-phone-profile-phone-base-20261020T232637Z-run1-*`
+(the profile: events and .cpuprofile per thread).
 
 ## 8. Bundle
 
