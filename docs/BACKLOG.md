@@ -26,7 +26,13 @@ are trashed, and creates and settings changes are dropped. The fix is being desi
 - a per-store writer tag, so two stores under one deviceId never take each other's frames for their own.
 
 Proposed design: [identity-per-store](client-remake/identity-per-store.md) (an identity per IndexedDB store, a pairing
-grant in data.json).
+grant in data.json). Owner decisions recorded there (§12.1, 2026-10-21).
+
+- **Phase 1 landed (server only)** on `identity/phase1-server`: pairing grants, register / retire / self-retire /
+  leave, tombstones, per-grant limits, `last_seen_day`, grant pairing codes, "Revoke pairing" and the grouped console
+  (DECISIONS §10, G54–G64). Additive: the current client still enrolls the old way and is unaffected.
+- Next: phase 2 (client grant pairing and a per-store identity), then 3 (predecessor recovery), 4 (removal of the
+  wall floor and `renumberBlind`), 5 (inactivity retirement, grant rotation).
 
 ### FRAMENO-IDB: frameNo collision after IndexedDB loss
 

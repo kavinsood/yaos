@@ -1,6 +1,7 @@
 # One device identity per store (design)
 
-Status: proposal, 2026-10-21, branch `design/identity-per-store` off `sim-port` (eaf05881). Nothing here is built.
+Status: approved 2026-10-21 (owner decisions in §12.1). Phase 1 (server) is built on `identity/phase1-server`
+(DECISIONS §10); phases 2–5 are not. Written on branch `design/identity-per-store` off `sim-port` (eaf05881).
 Fixes BACKLOG [CLONED-ID](../BACKLOG.md) and [FRAMENO-IDB](../BACKLOG.md). Section letters (§x.y) are
 [DESIGN](DESIGN.md); "e2ee §n" is [e2ee-design](e2ee-design.md). **[U]** = not verified; **[inferred]** = follows
 from verified facts but was not tested directly.
@@ -23,11 +24,11 @@ from verified facts but was not tested directly.
    branches. Changed: pairing, data.json shape, engine start, `Repo.open`, mirrors (`state/<deviceId>/`), server
    (grants, register/retire routes, tombstones), console. About 1.5–2k lines changed across the client and server.
 7. One device per wipe, clone or epoch reset adds device rows. Retiring devices (self, successor, inactivity) keeps
-   the server list short. Fold replay windows stay forever (~40 B per device and stream). Their 64-id rings can be
-   compacted.
+   the server list short. Fold replay windows stay forever (~40 B per device and stream), and so do their 64-id
+   rings (decision 6: no compaction).
 8. No wire or format compatibility cost: the remade client has not shipped. Dev vaults re-pair once (§13).
-9. Five phases, each landable on its own (§12). The open questions are in §12.1. The main one: does the grant live in
-   data.json (clones join automatically) or install-local (nothing secret in the vault folder)?
+9. Five phases, each landable on its own (§12). The owner's decisions are in §12.1: the grant lives in data.json
+   (clones join automatically).
 
 ---
 
@@ -170,6 +171,8 @@ its token.
   `{host, vaultId, grantId, grantSecret, grantName}`.
 - Server rows: `grant(grant_id, secret_hash, name, created_at, revoked_at)`. `device` gains `grant_id`,
   `retire_hash` and `last_seen_day`. A new `retired_device(device_id)` table holds tombstones.
+  - *As built (phase 1):* the table is `pairing_grant` (`grant` is a SQL keyword) and also keeps the enroll request id
+    and the day counter of §3.3; `pairing_code` gains `used_grant_id` for the replay (DECISIONS §6.1).
 - Why per pairing: revoking one lost laptop's pairing leaves the other installs alone. The console can show a grant as
   the "device" users think of, with its stores nested (§6.3).
 
@@ -185,6 +188,23 @@ its token.
 | `POST /vault/:id/auth/pairing-code` | device bearer (as today, `host.ts:511-519`) | Unchanged |
 | operator: `GET …/grants`, `DELETE …/grants/:id`, `DELETE …/devices/:id` (exists) | operator | Console (§6.3) |
 
+- **As built (phase 1, DECISIONS §10).** Changes from the table above, each for a reason:
+  - The **client mints `grantSecret`** and sends it in the enroll body (`{pairingCode, enrollmentRequestId,
+    grantSecret, grantName}`); the server mints `grantId` and keeps only SHA-256(secret). The D3 replay must answer
+    the same 200 after a lost response, and a server that keeps only a hash cannot return a secret it minted (G56).
+  - Grant credentials ride `Authorization: Grant <secret>`, a scheme of their own, so a grant is never mistaken for a
+    device bearer (G57).
+  - `/enroll` does not also register the first device: the client registers right after (one more request, one code
+    path).
+  - Register needs `retireKeyHash` (64 lowercase hex). The device name is the grant name; a body `deviceName` is
+    ignored. Registering marks the store seen today.
+  - Retire by key of a device that is gone or unknown is `200 {retired: false}`; a wrong key `401` (G60).
+  - The operator listing is `GET …/devices` with a `grants` array added, not a separate `GET …/grants` (G61);
+    "Revoke pairing" is `DELETE …/grants/:grantId`.
+  - `POST /auth/pairing-code` takes the grant secret too (decision 3), beside the bearer.
+  - **Additive.** The old `/enroll` body (a device, no grant) still works, so the current client enrolls unchanged
+    until phase 2. Such a device has no grant: it cannot register stores (`403 grant_required`), but its bearer still
+    mints codes and self-retires.
 - **Tickets and sockets are unchanged.** They use the store's device token (`relayHttp.ts:279`, `host.ts:617-632`).
 - The register route runs on the existing enroll path's DO turn discipline: hash first, then one synchronous
   decide-and-write turn (`host.ts:536-581`).
@@ -195,8 +215,10 @@ its token.
   pairing codes, so they can already enroll any number of devices. The grant adds no capability. It does add
   visibility (devices are listed per grant) and a cut that does not need the victim's token (revoke the grant).
 - Limits, per grant:
-  - at most 20 registrations a day and 64 live devices. At the cap, the oldest device not seen for 7 days is retired.
-    **Owner to tune.**
+  - at most 20 registrations a UTC day and 50 live devices (decision 4). At the cap, registration answers `409
+    device_limit`; nothing is retired to make room (G59: the proposal's "retire the oldest not seen for 7 days" is
+    dropped, since inactivity retirement after 90 days is phase 5 and a refusal never retires a store with unsent
+    edits).
   - Wrong secrets count against the existing per-DO failure limiter, 20 a minute (`server/src/vault/pairing.ts:9-11`,
     `host.ts:528-529`).
 - **Tombstones.** A retired deviceId can never register again. Ids are random 128-bit values, so this is a guard for
@@ -210,7 +232,10 @@ its token.
   outcome, at the grant level.
 - **Remove device** (operator): one store is retired. If its install still holds a valid grant, it comes back as a new
   device on its next start (§4, row "revoked store"). The console must say so: to block an install, revoke its pairing.
-- **Rotate the grant secret** (optional, phase 5):
+- **Existing devices on revoke (as built):** revoking a pairing retires every live device of it in the same turn
+  (D7 per device: buffered frames dropped, sockets 4403, bearer 401) and tombstones them. Removing one device
+  leaves the grant and its other devices alone.
+- **Rotate the grant secret** (optional, phase 5; not in phase 1):
   - `POST …/grants/:id/rotate` (operator) issues a new secret.
   - Live stores fetch it with their device token (`GET /vault/:id/auth/grant`) and rewrite data.json.
   - A thief holding only an old data.json is cut off. Legitimate installs do not re-pair.
@@ -223,7 +248,8 @@ its token.
 - The device token stops appearing in data.json, settings (`settingsModel.ts:204`) and the pair modal. It lives only
   in the store and the worker.
 - Main needs it today for `requestPairingCode` (`pairing.ts:452-482`) and the retire call. Either route these through
-  the worker, or let the grant secret authenticate `POST /auth/pairing-code`. The second is simpler. Open question 3.
+  the worker, or let the grant secret authenticate `POST /auth/pairing-code`. The second is simpler; decided so
+  (decision 3) and built in phase 1.
 
 ### 3.6 E2EE
 
@@ -351,9 +377,10 @@ Retired rows are deleted and tombstoned. A tombstone is one indexed read at regi
 `DeviceMap`. Four ways a device is retired:
 - **Self:** the epoch migration's old id (§4), and an orderly replacement's old id.
 - **Successor:** the predecessor fence (§5.2).
-- **Inactivity:** a device not seen for 90 days (owner to tune) is retired lazily, at the next registration or list.
+- **Inactivity:** a device not seen for 90 days (decision 4; phase 5) is retired lazily, at the next registration or list.
   - "Seen" is `device.last_seen_day`, written at ticket issue at most once per UTC day: ≤ 1 row per device per day.
-  - This deviates from §6.1's "0 rows per bearer auth". The cost is negligible, but it needs the owner's OK.
+  - This deviates from §6.1's "0 rows per bearer auth". The owner accepted it (decision 4); DECISIONS §6.1, §6.2 and
+    D4 state it. Phase 1 records `last_seen_day`; the 90-day retirement itself is phase 5.
   - A retired store that comes back replaces itself (§4, revoked row).
 - **Operator:** "Remove device".
 
@@ -375,7 +402,7 @@ Retired rows are deleted and tombstoned. A tombstone is one indexed read at regi
 - The ring is up to 64 cfids per device, about 1.5 KB per device and stream. For devices whose last frame is more than
   K seqs old, the ring looks redundant for every ns/cfg frame: frameNo ≥ 1 is mandatory (§8.2), and the window alone
   rejects every re-commit. Compacting those rings to empty needs a `FOLD_RULES_VERSION` bump and a `verify` change
-  (`src/core/ns/verify.ts:136`, `src/core/cfg/verify.ts:41` require ring ≥ 1). Open question 6. Sized: 1,000 retired
+  (`src/core/ns/verify.ts:136`, `src/core/cfg/verify.ts:41` require ring ≥ 1). Not done (decision 6). Sized: 1,000 retired
   devices cost about 40 KB per checkpoint with compacted rings, 1.5 MB without.
 
 **Other client state:**
@@ -455,8 +482,8 @@ Can the relay now trust "one socket set per device"? For **accounting**, yes: th
 (`relay.ts:503-507`, `:651-655`) now meter one install. It may lower `MAX_STREAM_SOCKETS_PER_DEVICE` or treat a new
 socket as superseding older ones. For **security**, no: a duplicated app profile (Migration Assistant, a Time Machine
 restore onto a second Mac) still yields two live installs with one store, one appId and one token. Obsidian Sync has
-the same exposure. The relay cannot tell that from a reconnect overlap. This is accepted residual risk (open
-question 7).
+the same exposure. The relay cannot tell that from a reconnect overlap. This is accepted residual risk (decision
+7).
 
 ---
 
@@ -526,32 +553,33 @@ question 7).
 
 ---
 
-## 12. Open questions and plan
+## 12. Decisions and plan
 
-### 12.1 Open questions for the owner
+### 12.1 Decisions (owner, 2026-10-21)
 
-1. **Where the grant lives.**
-   - **data.json** (recommended; proposal as briefed): a clone joins without a prompt, and the folder holds a
-     credential, as it holds the token today.
-   - **Install-local** (`saveLocalStorage`): nothing secret in the vault folder, so git or iCloud leaks are harmless.
-     But a clone must be paired, and so must an install that lost localStorage.
-2. **Epoch change mints** (recommended: one rule, "new DB ⇒ new id", and `frameNoFloor` goes), or the identity is
-   carried across epochs (keeps the floor)?
-3. Who authenticates `POST /auth/pairing-code`: the grant secret (main keeps no device token) or the device bearer
-   (routed through the worker)?
-4. Limits: registrations a day per grant, live devices per grant, inactivity retirement after 90 days, and the
-   `last_seen_day` write (a §6.1 deviation).
-5. The install key: `saveLocalStorage` (documented) or `app.appId` (undocumented, used by Obsidian Sync)?
-6. Compact replay rings of idle devices (needs a `FOLD_RULES_VERSION` bump)? Never prune windows.
-7. Duplicated app profiles (Migration Assistant): accept, or add relay-side detection (two sockets of one deviceId
-   with different per-runtime nonces) that makes the newer runtime replace its store?
-8. Keep the d1f8a750 planner re-create (§7.1), or prove it unreachable?
+1. **The grant lives in data.json.** A clone joins without a prompt. The folder holds a credential, as it holds the
+   device token today, and the grant is no stronger (§3.3, §9).
+2. **An epoch change mints a new identity:** one rule, "new DB ⇒ new id". `frameNoFloor` goes in phase 4.
+3. **The grant secret authenticates `POST /auth/pairing-code`.** Main keeps no device token. Built in phase 1.
+4. **Limits:** 20 registrations a day per grant, 50 live devices per grant, inactivity retirement after 90 days
+   (phase 5). Phase 1 only records `last_seen_day`, and its one write per device per day is an accepted deviation
+   from the server's "0 rows per bearer auth" (DECISIONS §6.1).
+5. **Install key in `app.saveLocalStorage`** (documented API), not `app.appId`. Phase 2.
+6. **No replay-ring compaction.** Never prune windows. The ring cost (~1.5 KB per device and stream) is accepted.
+7. **Duplicated app profiles** (Migration Assistant, Time Machine onto a second Mac): accepted and documented
+   residual risk (§9); no detection.
+8. **Keep the d1f8a750 planner re-create** (§7.1) as a safety net.
 
 ### 12.2 Phases (each testable and landable alone)
 
 1. **Server grants.** Tables; `/enroll` → grant; register, retire, self-retire and leave routes; tombstones; limits;
    console. Server tests only. The client still enrolls devices the old way: keep the old `/enroll` body until phase 2,
    or switch both in one landing. Either works pre-ship.
+   - **Landed** on `identity/phase1-server` (DECISIONS §10, tests/server/grants.ts), additive: the old `/enroll` body
+     is kept, so the current client enrolls and syncs unchanged. Also built: retire by key (the successor fence's
+     route, used from phase 3), grant pairing codes, `last_seen_day`, "Revoke pairing", and a D8b restore that
+     carries grants and tombstones across the rewind. Not built: grant rotation and inactivity retirement (phase 5).
+     The schema migrates in place (identity v2, G54); old device rows are kept, since the current client uses them.
 2. **Per-store identity, no recovery yet.**
    - Client grant pairing; data.json shape; installKey and lineage record.
    - `yaos3:` DB names by installKey, identity in `meta.identity`, mint on create, `self` from the store.
@@ -576,7 +604,8 @@ No released client has the current format, so there is no in-place migration.
 3. On first start the new build deletes `yaos2:<vaultId>:*` DBs and the flat `state/outbox-*.bin` and
    `state/synced-*.bin` (identity-less legacy layout). Unsent edits there are on disk and are re-derived by the
    onboarding scan.
-4. In the console, remove the old device rows, or let the server's phase-1 migration drop device rows without a grant.
+4. In the console, remove the old device rows. The phase-1 migration keeps them (the current client still enrolls and
+   syncs through them); phase 2 may drop device rows without a grant when it removes the old `/enroll` body.
 
 Optional convenience, if re-pairing many dev installs is a burden: a one-shot `POST /vault/:id/auth/grant-from-device`
 (device bearer) that converts the old device row into a grant plus its first device.

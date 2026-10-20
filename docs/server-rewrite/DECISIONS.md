@@ -40,8 +40,9 @@ actor-authority TTL cache, vault lifecycle states, and the `YAOS_STREAMS` flag (
 
 ### 2.2 Route table
 
-Auth: `-` none, `C` operator session cookie, `B` device bearer, `T` streams ticket. Everything not listed → `404
-{"error":"not_found"}` with zero DO calls.
+Auth: `-` none, `C` operator session cookie, `B` device bearer, `G` pairing grant (`Authorization: Grant <secret>`),
+`T` streams ticket. Everything not listed → `404 {"error":"not_found"}` with zero DO calls. The grant routes and
+`DELETE …/grants/:grantId` are identity-per-store phase 1 (§10 below); `POST /enroll` also takes the grant body there.
 
 | Route | Auth | Worker work | DO(s) |
 |---|---|---|---|
@@ -56,10 +57,14 @@ Auth: `-` none, `C` operator session cookie, `B` device bearer, `T` streams tick
 | `DELETE /operator/vaults/:id` | C | `{"confirmVaultId"}`; R2 prefix purge; order in D5 | config, vault |
 | `GET /operator/vaults/:id/devices` | C | | config, vault |
 | `DELETE /operator/vaults/:id/devices/:deviceId` | C | | config, vault |
+| `DELETE /operator/vaults/:id/grants/:grantId` | C | grantId `^[A-Za-z0-9_-]{22}$` (else 404) | config, vault |
 | `POST /operator/vaults/:id/reset-streams` | C | | config, vault |
 | `POST /operator/vaults/:id/restore` | C | | config (session, journal, steps), vault |
 | `POST /enroll` | code | code regex; vaultId taken from the code | vault |
-| `POST /vault/:id/auth/pairing-code` | B | | vault |
+| `POST /vault/:id/auth/pairing-code` | B or G | | vault |
+| `POST /vault/:id/auth/device`, `DELETE /vault/:id/auth/device` | G or B; B | | vault |
+| `POST /vault/:id/auth/device/retire` | retire key | | vault |
+| `DELETE /vault/:id/auth/grant` | G | | vault |
 | `POST /vault/:id/auth/ticket` | B | | vault |
 | `GET /vault/:id/ws/streams` | T | `streamsVersion` check (1008 `update_required`) | vault |
 | `GET /vault/:id/streams/feed`, `/streams/read` | B | | vault |
@@ -137,8 +142,9 @@ pairing-code make zero config-DO calls, checked with a counting stub).
   The vault DO issues tickets and verifies them at upgrade, with the key and device map in memory.
 - Payload as today (vaultId, deviceId, D6 constants, aud, purpose, documentId, iat, exp, nonce), signed with the
   ticket key. Wire unchanged: aud `yaos-vault-ws`, purpose `streams`, TTL 5 min (`YAOS_TICKET_TTL_MS`).
-- Issuing costs 0 rows (the lastSeen "touch device" write is dropped). Upgrade rejections keep the §3.1 shape
-  (accept, `error` frame, close 1008); the DO now produces them.
+- Issuing costs 0 rows (the lastSeen "touch device" write is dropped), except the first ticket of a UTC day per
+  device, which writes `device.last_seen_day` (1 row; identity-per-store §6.2, accepted by the owner 2026-10-21,
+  §10 below). Upgrade rejections keep the §3.1 shape (accept, `error` frame, close 1008); the DO now produces them.
 - The §3.1 `unclaimed` frame is never sent: it would need a config read at upgrade. An unclaimed server has no
   vaults, so the DO answers `unauthorized`.
 - The ticket key only signs tickets. It is not the E2EE vault key K_e (e2ee-design.md §5.1), which never reaches
@@ -174,7 +180,9 @@ pairing-code make zero config-DO calls, checked with a counting stub).
   the authority model is gone. *Test:* T-READY-SHAPE.
 
 **D7 Device revoke.** `DELETE /operator/vaults/:id/devices/:deviceId`: operator-only, idempotent, `200 {ok,
-deviceId, revoked}`. The gate shuts with the transaction, not with the close handshake.
+deviceId, revoked}`. The gate shuts with the transaction, not with the close handshake. Since identity-per-store
+phase 1 the same turn also tombstones the deviceId (`retired_device`), so it never enrolls or registers again; every
+other retire (self, by retire key, grant revoke) is this revoke plus that tombstone (§10).
 - **Revoke turn** (one synchronous turn): DELETE the device row and its device-map entry; drop its frames from the
   pending group-commit buffer (they never commit, no receipt); remove its sockets from the fanout set; send each
   `__YPS:{"type":"error","code":"authority_superseded"}` and close 4403.
@@ -220,8 +228,9 @@ bound to the vaultId only. *Why:* an epoch means only "the stream space was repl
   seqs ≤ the stream cursor"): silent divergence. Only finish's new epoch heals it (§11 step 3 drops all cursors).
   The vault cannot detect its own rewind (the restored state is a genuine past state), so the intent lives in the
   config DO, with a config-DO alarm that resumes it.
-- **Crosses the rewind:** the device rows only. Not pairing codes (all deleted), the epoch (finish mints a new
-  random one, so no collision with a post-T epoch), the ticket key or the daily latch.
+- **Crosses the rewind:** the device rows only; since identity v2 also the grant rows and the tombstones (§10), so a
+  restore never brings back a revoked pairing or a retired deviceId. Not pairing codes (all deleted), the epoch
+  (finish mints a new random one, so no collision with a post-T epoch), the ticket key or the daily latch.
 
 The config DO runs the steps (the Worker forwards the request after the session check):
 
@@ -503,9 +512,32 @@ CREATE TABLE pairing_code (
 ) WITHOUT ROWID;
 ```
 
+Identity v2 (identity-per-store phase 1, §10): `device` gains `grant_id TEXT`, `retire_hash BLOB` (SHA-256 of the
+retire key) and `last_seen_day INTEGER` (UTC day); `pairing_code` gains `used_grant_id TEXT` (the D3 replay key of a
+grant enroll); and two tables:
+
+```sql
+CREATE TABLE pairing_grant (
+  grant_id TEXT PRIMARY KEY,           -- base64url(16 B), minted by the server
+  secret_hash BLOB NOT NULL,           -- SHA-256(grantSecret)
+  grant_name TEXT NOT NULL, enrollment_request_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+  revoked_at INTEGER,                  -- set once; the row is kept
+  registered_day INTEGER NOT NULL DEFAULT 0, registered_count INTEGER NOT NULL DEFAULT 0  -- 20 a UTC day
+) WITHOUT ROWID;
+CREATE TABLE retired_device (           -- tombstones, never deleted, never loaded into memory
+  device_id TEXT PRIMARY KEY, grant_id TEXT, retired_at INTEGER NOT NULL
+) WITHOUT ROWID;
+```
+
+Init runs the v1 DDL above and then the v2 migration, so a new vault and a migrated one are identical. A vault made
+before v2 migrates once, at the first load of a runtime (G54).
+
 Probing an unknown vault reads `vault_meta`; "no such table" means unknown, cached in memory (init runs in the same
-object, so the cache stays coherent). Rows read per runtime: meta 1 + devices N, then 0 per bearer auth. deviceId
-uniqueness is checked in code in the same synchronous turn. Minting a code prunes rows expired over 24 h.
+object, so the cache stays coherent). Rows read per runtime: meta 1 + grants G + devices N, then 0 per bearer auth.
+Rows written per bearer auth: 0, with one accepted deviation (owner decision 4, 2026-10-21): the first ticket of a
+UTC day per device writes its `last_seen_day`, so at most 1 row per device per day. deviceId uniqueness is checked
+in code in the same synchronous turn; tombstones cost one PK read at register and enroll. Minting a code prunes rows
+expired over 24 h.
 
 ### 6.2 Rows written per operation (cfRowModel rules)
 
@@ -514,12 +546,15 @@ uniqueness is checked in code in the same synchronous turn. Minting a code prune
 | Vault init | INSERT meta (DDL not billed by the model; one-time) | 1 |
 | Enroll | UPDATE pairing_code (used_*) + INSERT device | 2 |
 | Enroll replay (D3) | none | 0 |
+| Grant enroll (§10) | UPDATE pairing_code (used_*) + INSERT pairing_grant | 2 |
+| Register (§10) | INSERT device + UPDATE pairing_grant (day counter); an idempotent retry 0 | 2 |
 | Pairing / owner code | INSERT pairing_code (+1 per pruned row) | 1 |
-| Ticket | none (key and devices in memory) | 0 |
-| Revoke | DELETE device | 1 |
+| Ticket | none (key and devices in memory); the first of a UTC day per device: UPDATE device (`last_seen_day`) | 0 (1) |
+| Revoke, self-retire, retire by key | DELETE device + INSERT retired_device | 2 |
+| Revoke pairing, leave (§10) | UPDATE pairing_grant + D × (DELETE device + INSERT retired_device) | 1+2D |
 | Reset | DELETE H heads + S segments + C chunks; UPDATE meta | H+S+C+1 |
 | Restore prepare (D8b) | UPDATE meta (marker; the rewind erases it) | 1 |
-| Restore finish (D8b) | replace D device rows; DELETE P codes; UPDATE meta | ≈ D+P+1 |
+| Restore finish (D8b) | replace D device rows (+1 UPDATE per row differing only in `last_seen_day`), G' grant rows and R' missing tombstones; DELETE P codes; UPDATE meta | ≈ D+G'+R'+P+1 |
 | Commit | per touched stream: head UPDATE/INSERT (last_seq indexed) = 2; +1 per sealed segment | 2/stream + 1/seal |
 | Checkpoint | DELETE old chunks (k₀) + INSERT new chunks (k₁) + DELETE collected segments (g) + UPDATE head (SET has no `last_seq`) | k₀+k₁+g+1 |
 | Retired GC (H7) | same head UPDATE | +0 |
@@ -622,6 +657,15 @@ WB files in `tests/server/` (WB file names are suggestions).
 | T-MININTERVAL-READY | VAULT_READY minIntervalMs 1000 | BB | FAIL | socket.ts |
 | T-MININTERVAL-TIMING | back-to-back commits ≥ ~900 ms apart | BB | FAIL | socket.ts |
 | T-ROWS-WB | every §6.2 row count under cfRowModel | WB | n/a | rows.ts |
+| T-GRANT-ENROLL | grant enroll 200 shape, 2 rows, hash only, D3 replay / conflict / used_code, grant_exists, the old body still enrolls | WB | n/a (new) | grants.ts |
+| T-GRANT-REGISTER | distinct ids from one grant, idempotent retry 0 rows, device_exists, successor by bearer, grant_required, 401s | WB | n/a (new) | grants.ts |
+| T-GRANT-LIMITS | 20 registrations a UTC day (429 + Retry-After), 50 live (409), wrong secrets → D3 limiter | WB | n/a (new) | grants.ts |
+| T-TOMBSTONE | self-retire, retire by key, operator remove: 401 on auth, upgrade refused, append refused; never registers or enrolls again | WB | n/a (new) | grants.ts |
+| T-GRANT-REVOKE | revoke pairing and leave retire the grant's devices in one turn (4403, buffer dropped); `401 grant_revoked`; other grants untouched; frozen by D8b | WB | n/a (new) | grants.ts |
+| T-GRANT-CODE | `POST /auth/pairing-code` with the grant secret; schemes never mix | WB | n/a (new) | grants.ts |
+| T-LAST-SEEN | `last_seen_day` ≤ 1 write a device a UTC day; the listing has no secret material | WB | n/a (new) | grants.ts |
+| T-RESTORE-GRANTS | a restore keeps a revoked pairing revoked and a tombstone | WB | n/a (new) | grants.ts |
+| T-MIGRATE-V2 | a v1 vault migrates once at its first load, rows intact, 0 CF rows (G54) | WB | n/a (new) | vault-host.ts |
 
 ---
 
@@ -847,3 +891,52 @@ and T2 each 75 s after the writes they must keep and the vault's first snapshot 
 (`restore-manual-scratch3-20261006T125029Z.json`). Final suite at f9ce3a1 (version 249ab495):
 `conformance-scratch3-p5-final-20261006T125917Z.json`, 48 pass, 0 fail, the same 2 SKIP. P5 is done. CPU: O10,
 O12. Open: O13, O14, O16 (O12 resolved after P5).
+
+## 10. Identity per store, phase 1 (2026-10-21)
+
+The server half of [identity-per-store](../client-remake/identity-per-store.md) §12.2 phase 1 (owner decisions in
+its §12.1). It is additive: the old `/enroll` body and every device route keep working, so the current client
+enrolls and syncs unchanged until phase 2 switches it to grants. Routes in §2.2; schema in §6.1; rows in §6.2; wire
+in relay-wire §2.4–§2.5; tests in §7 (grants.ts).
+
+- **Grant.** `POST /enroll {pairingCode, enrollmentRequestId, grantSecret, grantName}` buys a pairing grant instead
+  of a device. The grant registers store identities (`POST /vault/:id/auth/device`), mints device pairing codes, and
+  leaves (`DELETE /vault/:id/auth/grant`). A live device of the grant may register too (the epoch migration's path).
+- **Retire.** Self (`DELETE /auth/device`), by retire key (`POST /auth/device/retire`), operator remove (D7) and
+  grant revoke all run D7's revoke turn plus a tombstone. A tombstoned deviceId is refused at register and at the old
+  enroll, forever; it already fails auth, upgrade and append because its row is gone.
+- **Limits** (owner decision 4): 20 registrations a UTC day and 50 live devices per grant; wrong grant secrets and
+  retire keys count against D3's 20 failures a minute. Inactivity retirement after 90 days is phase 5; phase 1 only
+  records `last_seen_day`.
+- **Operator.** `GET …/devices` adds `grants` and each device's `grantId` and `lastSeenDay` (absent for an old enroll,
+  so the old shape is a subset). `DELETE …/grants/:grantId` is "Revoke pairing", under D8b's freeze as revoke.
+
+Gap calls (accepted with phase 1; marked `DECISIONS-GAP` in code where they sit in one place):
+
+- G54 Identity v2 is the one DDL on a request path: a vault initialized before it runs the v2 migration (4 `ALTER`,
+  2 `CREATE`, one transaction) at its first load, detected by "no such table: pairing_grant" on the grant scan, which
+  every runtime does anyway (0 extra reads). An unknown vault never reaches it (T-PAIR-NOWRITE holds). The
+  `[[migrations]]` tags in `wrangler.toml` are class migrations and do not change: no class is added or removed.
+- G55 The table is `pairing_grant` (`grant` is a SQL keyword).
+- G56 The client mints the grant secret (the design had the server mint it): the D3 replay must answer the same 200
+  after a lost response, and the server keeps only a hash, exactly as for device tokens. `grantId` is server-minted.
+- G57 `Authorization: Grant <secret>` is its own scheme. A grant secret sent as `Bearer` is an unknown token and the
+  reverse, so no route can confuse a grant with a device.
+- G58 A device enrolled the old way has no grant: its bearer may not register (`403 grant_required`) but mints codes
+  and self-retires as before.
+- G59 At 50 live devices registration answers `409 device_limit`. The design's "retire the oldest device not seen for
+  7 days" is not built: the owner set inactivity retirement at 90 days for phase 5, and a refusal never retires a
+  store that may hold unsent edits.
+- G60 Retire by key of a device that is gone or unknown is `200 {retired: false}` ("already gone counts as done");
+  a wrong key is `401` and counts as a failure. This tells a caller whether a deviceId is live; deviceIds are not
+  secrets (every frame carries one).
+- G61 Grants are folded into `GET …/devices` rather than a separate `GET …/grants`: one RPC, one consistent listing.
+  Revoked grants are listed with `revokedAt` (the console counts them).
+- G62 The D8b snapshot (journal `devices` BLOB) is `{v: 2, devices, grants, retired}`; a pre-v2 bare array decodes
+  with grants and tombstones null, and finish then leaves those tables as rewound. Finish never deletes a tombstone.
+  Residual: a self-retire or leave that lands in the rewind window (between the abort and finish) is erased by the
+  re-rewind like D8b's enroll, so that store or grant comes back; operator revokes are frozen by the journal row.
+- G63 `last_seen_day` is bookkeeping: it is not an `identityWrites` write (a ticket in the rewind window must not
+  force a re-rewind), it is skipped while the daily limit is latched, and a failed write never refuses the ticket.
+- G64 T-LEGACY-404 no longer lists `POST` and `DELETE /vault/:id/auth/device`: they are the register and self-retire
+  routes now (other methods on the path stay 404).

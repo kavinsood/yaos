@@ -11,7 +11,7 @@ bucket:
 
 | Binding | Class / resource | Holds |
 |---|---|---|
-| `YAOS_VAULT` | `VaultDO`, one per vault (`idFromName(vaultId)`) | The vault's epoch and ticket key, its devices, pairing codes and every stream row and checkpoint (§6.1). |
+| `YAOS_VAULT` | `VaultDO`, one per vault (`idFromName(vaultId)`) | The vault's epoch and ticket key, its pairing grants, devices and device tombstones, pairing codes and every stream row and checkpoint (§6.1). |
 | `YAOS_CONFIG` | `ConfigDO`, one per server (`idFromName("config")`) | The operator key hash, operator sessions, the vault registry and the restore journal (§6.3). |
 | `YAOS_BUCKET` | R2 bucket (optional) | Attachments and other blobs, under `v/<vaultId>/<address>` (D9). |
 
@@ -41,6 +41,10 @@ locally (real workerd, local DO SQLite).
   deletions against the account's 500-namespace cap (error `10067`); an account at the cap deploys with `v3` alone
   first, then with `v4` (§9 P5);
 - the R2 binding `YAOS_BUCKET` to a bucket named `yaos` (see Attachments);
+- no tag for table changes: those are not class migrations. The vault DO migrates its own SQL schema. Identity v2
+  (pairing grants, tombstones, three device columns; DECISIONS §6.1, G54) runs once per existing vault, in one
+  transaction, on that vault's first request after the update; a new vault is created at v2. Nothing to run by hand,
+  and devices paired before it keep working;
 - `observability.logs` on;
 - a `Text` rule that bundles `qrcode-generator`'s browser build into the console page.
 
@@ -60,9 +64,20 @@ JSON routes require `Content-Type: application/json` and a same-origin `Origin`.
 - **Pair a device:** a one-use pairing code (55 characters, `<vaultId>.<secret>`), its QR code and an
   `obsidian://` link. A code expires after 15 minutes (D3). This is also the way back in when every device is lost;
   an encrypted vault then also needs its recovery key on the device.
-- **Devices:** the paired devices and **Revoke**. A revoke deletes the device in one turn: its unsent frames are
-  dropped, its sockets get `authority_superseded` and close 4403, and its bearer and tickets get `401` from then on
-  (D7). Revoking cannot erase files already on the device.
+- **Devices:** grouped by pairing ([identity-per-store](client-remake/identity-per-store.md) §6.3). A pairing (a
+  "grant": one paired install) shows its name, when it was paired, when it was last seen and its stores; each store
+  (one local database on that install, a device id of its own) shows when it registered and when it was last seen
+  (a UTC day, recorded at the store's first ticket of the day). Two actions:
+  - **Revoke pairing** blocks the install: the grant is revoked and every store of it is retired. Its stores stop at
+    once; the install can register no new store and must be paired again.
+  - **Remove device** tidies one store. It is retired, but if its install still holds a live pairing it comes back as
+    a new device on its next start. To block an install, revoke its pairing.
+
+  A device paired before grants existed (the current client pairs this way until phase 2) is listed on its own with
+  **Revoke**, as before. Every removal deletes the device in one turn: its unsent frames are dropped, its sockets get
+  `authority_superseded` and close 4403, its bearer and tickets get `401` from then on (D7), and its device id is
+  tombstoned so it never comes back. Revoked pairings are counted, not listed. Revoking cannot erase files already on
+  the device.
 - **Reset streams:** behind the typed vault ID. Deletes every stream row and mints a new epoch; devices stay paired
   and re-upload from their files; attachments are kept (D8a).
 - **Restore:** rewinds the vault's synced content to a point in the last 30 days with Durable Object
@@ -95,7 +110,11 @@ Attachments, oversized updates, large settings files and snapshot parts upload a
 - **Sockets.** At most 4 per device (a fifth closes the device's oldest with 1001 `device_socket_limit`) and 1000 per
   vault (`429 stream_socket_limit`) (H6).
 - **Requests.** A checkpoint is at most 4 MiB; 20 failed enrolls a minute per vault answer `429
-  too_many_attempts`.
+  too_many_attempts` (wrong grant secrets and retire keys count as failed enrolls).
+- **Pairings.** Per grant, at most 20 store registrations a UTC day (`429 registration_limit` with `Retry-After` to
+  00:00 UTC) and 50 live stores (`409 device_limit`; remove old stores in the console). Tickets write one row per
+  store per UTC day (`last_seen_day`); every other ticket writes nothing. Retiring stores after 90 days without a
+  ticket is planned (identity-per-store phase 5), not built.
 - **Variables** (`[vars]` in `wrangler.toml`; all optional):
   - `YAOS_TICKET_TTL_MS`: streams ticket lifetime (default 5 min, D4);
   - `YAOS_STREAMS_*` (`GC_IDLE_MS`, `GC_MAX_MS`, `GC_MAX_BYTES`, `GC_MIN_INTERVAL_MS`, `GC_LEAD_MS`, `GC_QUIET_MS`,
@@ -124,6 +143,25 @@ updater refuses such a release. Moving from a pre-rewrite server is therefore a 
 `v3` deletes the old classes with all their data, the new server starts unclaimed, and each device re-seeds the
 vault from its local files. Keep the vault's files on at least one trusted device before switching.
 
+## Device identity routes
+
+Identity-per-store phase 1 ([identity-per-store](client-remake/identity-per-store.md) §3, relay-wire §2.4–§2.5,
+DECISIONS §10). Server only and additive: the current client still enrolls with the old `/enroll` body and keeps
+working; phase 2 switches it to grants.
+
+| Route | Auth | Does |
+|---|---|---|
+| `POST /enroll {pairingCode, enrollmentRequestId, grantSecret, grantName}` | pairing code | Pairs an install: a grant, no device yet |
+| `POST /vault/:id/auth/device {deviceId, deviceToken, retireKeyHash}` | `Grant <secret>` or a live store's bearer | Registers a store (a new device id) |
+| `POST /vault/:id/auth/device/retire {deviceId, retireKey}` | retire key | Retires one store (the successor's fence) |
+| `DELETE /vault/:id/auth/device` | bearer | The store retires itself |
+| `DELETE /vault/:id/auth/grant` | `Grant <secret>` | Leaves: revokes the grant and its stores |
+| `POST /vault/:id/auth/pairing-code` | bearer or `Grant <secret>` | A device pairing code |
+| `DELETE /operator/vaults/:id/grants/:grantId` | operator | **Revoke pairing** |
+
+Rows: grant enroll 2, register 2, any retire 2, revoke pairing 1 + 2 per store (DECISIONS §6.2). A restore keeps
+pairings and tombstones as they are now, like devices (D8b).
+
 ## Cloudflare Access
 
 The plugin sends no Cloudflare Access headers (no service-token support), so an Access policy on the Worker's
@@ -146,6 +184,9 @@ syncing) are in the README's Troubleshooting section. Server-side:
 - **`503 restore_in_progress` / `restore_incomplete`:** a restore has not finished; see Restore above.
 - **`401` on every device route after a delete or revoke:** expected. An unknown vault also answers `401`, so the
   server is no oracle for which vaults exist.
+- **`401 grant_revoked`:** the install's pairing was revoked (console or leave); pair it again.
+- **`409 device_retired`:** that device id was removed or retired once and never comes back; the client mints a new
+  one.
 - **Logs:** Workers observability logs are on (`wrangler tail`, or the dashboard). A refused WebSocket upgrade logs a
   `scriptThrewException` in the vault DO; it is noise (DECISIONS O13).
 

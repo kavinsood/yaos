@@ -36,8 +36,9 @@ rate knobs live in `readStreamRelayConfig` (`server/src/streams/relay.ts`).
 
 ## 2. Endpoints, auth and onboarding
 
-All bodies are JSON unless noted. Device routes authenticate with `Authorization: Bearer <deviceToken>`.
-Never log tokens, pairing codes or recovery keys.
+All bodies are JSON unless noted. Device routes authenticate with `Authorization: Bearer <deviceToken>`; the
+pairing-grant routes of §2.4.1 with `Authorization: Grant <grantSecret>`. The two schemes never mix. Never log
+tokens, grant secrets, retire keys, pairing codes or recovery keys.
 
 ### 2.1 Discovery
 
@@ -85,11 +86,58 @@ fields are not read by the client.
   (`server/src/vault/host.ts:599-602`, DECISIONS D3).
 - The rewritten server never answers `202 authorization_fence_pending`; the client still retries one with the
   identical body (`src/host/ui/pairing.ts:340-343`).
+- A `deviceId` that was ever retired (§2.4.1) answers `409 device_retired`, under any code.
+
+**Grant enroll** ([identity-per-store](identity-per-store.md) §3.2; server phase 1, the client switches in phase 2):
+`POST /enroll {"pairingCode", "enrollmentRequestId", "grantSecret", "grantName"}`.
+
+- The client mints `grantSecret` (`[A-Za-z0-9_-]{43,256}`: at least 32 random bytes, base64url); the server stores
+  only its SHA-256. A body with both a `grantSecret` and a `deviceId`/`deviceToken` is `400 invalid enrollment
+  request`.
+- `200 {host, vaultId, grantId, grantSecret, grantName, vaultGeneration}`. `grantId` is minted by the server
+  (base64url of 16 bytes); `grantName` is `grantName` trimmed (50 chars, default `unnamed-device`), made unique
+  among the live grants and the devices without a grant ("Mac 2"). No device is registered: the client registers
+  its first store next (§2.4.1).
+- The D3 replay holds with the grant in the device's place: the same code, `enrollmentRequestId` and secret while
+  the grant is live → the same 200; another secret, or the old body, under that id → `409
+  enrollment_request_conflict`; the grant revoked → `409 used_code`. A secret already used by any grant → `409
+  grant_exists`.
+
+#### 2.4.1 Pairing grants and store identities (server phase 1)
+
+A grant is one paired install. Each local store (one IndexedDB) registers its own device under it; a deviceId is
+used by one store, ever ([identity-per-store](identity-per-store.md) §1.3). The device token stays the credential of
+§2.5–§8: tickets, sockets and every streams route are unchanged.
+
+| Request | Auth | Response |
+|---|---|---|
+| `POST /vault/:id/auth/device {"deviceId", "deviceToken", "retireKeyHash"}` | `Grant <secret>`, or the `Bearer` of a live device of the same grant | `200 {vaultId, deviceId, deviceName, grantId, vaultGeneration}` |
+| `POST /vault/:id/auth/device/retire {"deviceId", "retireKey"}` | the retire key | `200 {ok, deviceId, retired}` |
+| `DELETE /vault/:id/auth/device` | `Bearer` (any device, a grant's or not) | `200 {ok, deviceId, retired: true}` |
+| `DELETE /vault/:id/auth/grant` | `Grant <secret>` | `200 {ok, grantId, revoked, retiredDevices}` |
+
+- **Register.** `deviceId` and `deviceToken` follow §2.4's formats; `retireKeyHash` is the lowercase hex SHA-256 of a
+  client-minted retire key (32+ random bytes, base64url). The device takes the grant's name. The same deviceId,
+  token and retire key again → the same 200 (idempotent). Errors: `401 unauthorized` (unknown secret or bearer),
+  `401 grant_revoked`, `403 grant_required` (a bearer of a device enrolled without a grant), `400 invalid_request`,
+  `409 device_exists` (the id or the token is taken), `409 device_retired`, `429 registration_limit` (+
+  `Retry-After` to 00:00 UTC; 20 registrations a UTC day per grant), `409 device_limit` (50 live devices per grant),
+  `429 too_many_attempts` (wrong grant secrets and retire keys count against §11.1's 20 failed enrolls a minute).
+- **Retire** (the successor's fence, a self-retire or an operator "Remove device") is a D7 revoke plus a tombstone in
+  one server turn: the device row is deleted, its buffered frames are dropped, its sockets get
+  `authority_superseded` and close 4403, its bearer and tickets get `401`, and the deviceId can never register or
+  enroll again. Retire by key: a device that is already gone (or never existed) is `200 {retired: false}`; a wrong
+  key, or a device without one, is `401 unauthorized`. Self-retire twice: the second call is `401` (the token is
+  dead), which counts as done.
+- **Leave** revokes the grant and retires all its devices; a revoked grant answers `revoked: false`. The operator's
+  `DELETE /operator/vaults/:id/grants/:grantId` ("Revoke pairing") does the same.
+- `POST /enroll`'s old device body (§2.4) still enrolls a device without a grant until the client switches.
 
 ### 2.5 Pair another device
 
-`POST /vault/:vaultId/auth/pairing-code {"purpose":"device"}` (Bearer, from an enrolled device) → `200 {pairingCode, ...}`.
-The new device then calls `/enroll` (§2.4).
+`POST /vault/:vaultId/auth/pairing-code {"purpose":"device"}` (Bearer, from an enrolled device, or `Grant <secret>`
+from a live grant) → `200 {pairingCode, ...}`. A revoked grant gets `401 grant_revoked`. The new device then calls
+`/enroll` (§2.4).
 
 ### 2.6 Streams ticket
 
@@ -108,6 +156,9 @@ The new device then calls `/enroll` (§2.4).
 | Status | `error` | Client action |
 |---|---|---|
 | 401 | `unauthorized` | Token unknown or revoked. Stop syncing and re-pair. |
+| 401 | `grant_revoked` | The pairing is revoked (§2.4.1): the install is unpaired. Re-pair. |
+| 409 | `device_retired`, `device_exists`, `device_limit` | §2.4.1: mint another identity; at the device limit, retire old stores. |
+| 429 | `registration_limit` (+ `Retry-After`) | §2.4.1: 20 registrations a UTC day per grant. Wait. |
 | 404 | `unknown_vault`, `not_found` | Wrong vault. |
 | 409 | `vault_<state>`, `authority_superseded`, `vault_generation_mismatch` | Re-fetch identity. If the epoch changed, reset local cursors. |
 | 413 | `body_too_large` | The checkpoint is over 4 MiB. Split or shrink it. |
@@ -700,6 +751,9 @@ Billed writes:
   rows.
 - **Checkpoint put:** the old chunks deleted, plus the new chunks inserted, plus 1 per collected segment, plus 1
   head update.
+- **Identity** (DECISIONS §6.2): enroll and grant enroll 2 rows; register 2; any retire 2 (the device row and its
+  tombstone); revoking a pairing 1 + 2 per live device; a ticket 0, except the first of a UTC day per device, which
+  writes its `last_seen_day` (1 row).
 
 ---
 
