@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Runs the new client's tests: every src/**/*.test.ts under node:test, loaded through jiti.
+// Runs the new client's tests: every src/**/*.test.ts under node:test, loaded through jiti, except the slow
+// *.sim.test.ts sweeps and measured runs (`npm run test:sim`, scripts/sim-test.mjs).
 // Usage: node scripts/client-test.mjs [substring-filter ...]
 import { readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -13,7 +14,7 @@ const files = [];
 	for (const name of readdirSync(dir)) {
 		const p = join(dir, name);
 		if (statSync(p).isDirectory()) walk(p);
-		else if (name.endsWith(".test.ts")) files.push(relative(ROOT, p));
+		else if (name.endsWith(".test.ts") && !name.endsWith(".sim.test.ts")) files.push(relative(ROOT, p));
 	}
 })(join(ROOT, "src"));
 const selected = files.filter((f) => filters.length === 0 || filters.some((s) => f.includes(s))).sort();

@@ -1818,7 +1818,7 @@ Each test counts outcomes and asserts **all** of them; none samples a single cas
 - `SimConfig.crypto: "none" | "suite1"`. Suite 1 uses the real adapter on Node WebCrypto, wrapped in
   `DelayedCrypto` (§16.3).
 - **The existing fault matrix runs unchanged under suite 1**, with the same seed counts as suite 0
-  (`src/sim/run.test.ts:65-69`: 200, 200, 50 and 50 seeds, plus 20 for the blob stall/slow faults added with the
+  (`src/sim/testkit/sweep.ts` MATRICES: 200, 200, 50 and 50 seeds, plus 20 for the blob stall/slow faults added with the
   background transfer queue, 3fecf30c). The invariants (`src/sim/invariants.ts`) must hold.
 - **New faults:**
   - `keyStoreLoss {dev}`: SecretStorage wiped, so the device goes `key-missing`, then re-keys by a sim QR;
@@ -1998,8 +1998,8 @@ runs in the engine):
   - joins: 44 key-less, each refused at every step.
 - **§20.2, measured:**
   - `src/engine/adapters/suite1Tamper.test.ts` and `src/engine/keyring/forgery.test.ts` (2763f7d);
-  - `src/engine/sync/replay.measured.test.ts` and `src/engine/keyring/staleEpoch.measured.test.ts` (6337e46), over
-    1000 seeds:
+  - `src/engine/sync/replay.sim.test.ts` and `src/engine/keyring/staleEpoch.sim.test.ts` (6337e46; `npm run test:sim`),
+    over 1000 seeds:
     - replays: 45,191 injected, 45,191 ignored, 2000/2000 digests equal;
     - stale epoch: 19,669 injected past S_rot, all stale, 0 quarantined;
   - `src/engine/compose/downgrade.test.ts` (6f8fad3). After the E5 merge (d66c0bc), b–e were re-pointed at E5's

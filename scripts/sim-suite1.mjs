@@ -1,18 +1,18 @@
 #!/usr/bin/env node
-// Suite-1 sim matrix (e2ee-design §20.3, "E7 as built"): the src/sim/run.test.ts matrix unchanged under
+// Suite-1 sim matrix (e2ee-design §20.3, "E7 as built"): the src/sim/testkit/sweep.ts matrices unchanged under
 // crypto "suite1" at the same seed counts, plus the E2EE fault matrix (src/sim/e2eeFaults.ts), sharded over worker
 // processes so it does not add to `npm run test:client`.
 //
 // Usage: npm run test:sim-suite1 [-- <substring> ...]   (run only the matrices whose name contains a substring)
-// Env:   YAOS_SIM_SEEDS     seeds of the full-count matrices (default 200, as run.test.ts; the others scale with it)
-//        YAOS_SIM_CRYPTO    "none": the src/sim/run.test.ts matrices as they are (suite 0, no E2EE matrices), the
+// Env:   YAOS_SIM_SEEDS     seeds of the full-count matrices (default 200, as test:sim; the others scale with it)
+//        YAOS_SIM_CRYPTO    "none": the testkit/sweep.ts matrices as they are (suite 0, no E2EE matrices), the
 //                           parallel sweep of the default suite; default "suite1"
 //        YAOS_SIM_CHECKPOINTS "production": DESIGN's checkpoint thresholds, no late join, no snapshots (runSim's
 //                           `checkpoints`, for comparing with the sim before checkpoint coverage); default "scaled"
 //        YAOS_SIM_JOBS      worker processes (default: cores - 1)
-//        YAOS_SIM_MINIMIZE  1: ddmin the first failing seed of each matrix (as run.test.ts does; slow)
-// Exit 1 on any violation, crash, RealWork stray, a matrix whose actors did no real work, or a blob-fault matrix
-// whose stalls and slow periods hit no transfer (as run.test.ts blobHits). Counts only: no keys.
+//        YAOS_SIM_MINIMIZE  1: ddmin the first failing seed of each matrix (as test:sim does; slow)
+// Exit 1 on any violation, crash, RealWork stray, a matrix whose actors did no real work, a blob-fault matrix whose
+// stalls and slow periods hit no transfer (as testkit/sweep.ts blobHits), or an E2EE matrix whose faults hit nothing. Counts only: no keys.
 import { fork } from "node:child_process";
 import { availableParallelism } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -28,7 +28,7 @@ function matrices(seeds) {
 	const half = Math.max(1, Math.ceil(seeds / 2));
 	const tenth = Math.max(1, Math.ceil(seeds / 10));
 	const all = [
-		// src/sim/run.test.ts, unchanged but for the crypto.
+		// src/sim/testkit/sweep.ts, unchanged but for the crypto (not its subscription matrices).
 		{ name: "2 devices, no faults", base: { devices: 2, faults: null }, seeds },
 		{ name: "3 devices, seeded faults", base: { devices: 3, faults: "DEFAULT_FAULTS" }, seeds },
 		{ name: "5 devices, seeded faults", base: { devices: 5, faults: "DEFAULT_FAULTS" }, seeds: quarter },
@@ -162,7 +162,9 @@ async function main() {
 		const ckpt = rs.reduce((s, r) => (r.checkpoints ? addInto(s, r.checkpoints) : s), {});
 		const stalled = (blobs.stalled?.has ?? 0) + (blobs.stalled?.put ?? 0) + (blobs.stalled?.get ?? 0);
 		const blobsHit = !m.blobHits || (stalled > 0 && blobs.stalled.put > 0 && blobs.watchdog > 0 && blobs.aborted > 0 && blobs.slowDone > 0 && blobs.slowCut === 0);
-		const ok = failed.length === 0 && strays === 0 && tokens > m.seeds * 10 && blobsHit;
+		// The E2EE faults reached the keyring: a roll or revoke won, a device re-keyed, hostile rows were refused.
+		const e2eeHit = !m.name.includes("E2EE") || ((e2ee.rolls?.won ?? 0) + (e2ee.revokes?.won ?? 0) > 0 && (e2ee.rekeys ?? 0) + (e2ee.rkRekeys ?? 0) > 0 && (e2ee.replayed ?? 0) + (e2ee.downgradeRows ?? 0) > 0);
+		const ok = failed.length === 0 && strays === 0 && tokens > m.seeds * 10 && blobsHit && e2eeHit;
 		failedAny ||= !ok;
 		console.log(`${ok ? "ok" : "FAIL"} ${m.name}: ${m.seeds - failed.length}/${m.seeds} seeds clean, ${tokens} live tokens, run p50 ${(runMs[Math.floor(runMs.length / 2)] / 1000).toFixed(1)} s, max ${(runMs[runMs.length - 1] / 1000).toFixed(1)} s`);
 		console.log(`   faults ${JSON.stringify(sumFaults)}`);
@@ -171,6 +173,7 @@ async function main() {
 		console.log(`   checkpoints ${JSON.stringify(ckpt)}`);
 		if (m.blobHits) console.log(`   blobs ${JSON.stringify(blobs)}`);
 		if (!blobsHit) console.log("   the blob faults hit no transfer (stalled, stalled PUT, watchdog, aborted, slow done; slowCut 0)");
+		if (!e2eeHit) console.log("   the E2EE faults hit nothing (a won roll or revoke, a re-key, a refused hostile row)");
 		if (strays > 0) console.log(`   RealWork strays: ${strays} (a crypto await bypassed RealWork)`);
 		if (tokens <= m.seeds * 10) console.log(`   the actors did no real work (${tokens} live tokens)`);
 		for (const r of failed.slice(0, 5)) {

@@ -1,7 +1,7 @@
 // The sim under suite 1 (e2ee-design §20.3, WP-E7 open question (d)): real WebCrypto under the virtual clock still
 // gives "same seed, same trace" (delayedCrypto.ts RealWork), so a failing seed replays and ddmin still works. The
 // full suite-1 matrix runs out of band (`npm run test:sim-suite1`, scripts/sim-suite1.mjs); this file keeps the
-// tooling honest inside `npm run test:client` with a few seeds. Counts only: no key bytes.
+// tooling honest inside `npm run test:client` with two of its seeds. Counts only: no key bytes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { bytesToHex } from "../core/codec/lib0";
@@ -68,9 +68,10 @@ test("sim suite 1: ddmin reduces a plan, and the reduced plan replays to one dig
 	assert.equal(y.digest, x.digest);
 });
 
-test("sim suite 1: E2EE faults (key store loss, rolls, revokes, restores, hostile replay and downgrade), a few seeds", async () => {
+// Seeds 1..2 of sim-suite1.mjs's "3 devices, E2EE faults" matrix, which runs them all with the same hit check.
+test("sim suite 1: E2EE faults (key store loss, rolls, revokes, restores, hostile replay and downgrade), seeds 1..2", async () => {
 	const seen = { rolls: 0, revokes: 0, rekeys: 0, hostile: 0 };
-	for (const seed of [1, 2, 3, 4]) {
+	for (const seed of [1, 2]) {
 		const r = await runSim({ seed, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
 		clean(r);
 		const e = r.stats.e2ee!;

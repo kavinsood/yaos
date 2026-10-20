@@ -47,7 +47,7 @@
  * push a frame with a <= 63 out of the ring while its bit is still set, which gives replay-duplicate; it can also
  * keep a frame with a = 64 in the ring, which gives duplicate-frame.
  */
-import { describe, it } from "node:test";
+import { simTest } from "../../sim/testkit/simTest";
 import assert from "node:assert/strict";
 import type { CfgFoldEvent } from "../../core/cfg/fold";
 import { encodeCfgOps } from "../../core/codec/cfgOps";
@@ -316,182 +316,180 @@ const ringContiguous = (l: Lane) => l.ringF.length === NS_DEDUPE_RING && l.ringF
 
 // ---------------------------------------------------------------------------
 
-describe("replay (e2ee-design §20.2), measured over 1000 seeds", () => {
-	it("recorded genuine ns/cfg frames re-appended at ages 1, 63, 64, 65, 1000, 100000: same digest; every row ignored as replay-*/duplicate-frame", async () => {
-		const t0 = performance.now();
-		const prefix = await buildPrefix();
-		const tPrefix = performance.now() - t0;
+simTest("replay (e2ee-design §20.2), measured over 1000 seeds: recorded genuine ns/cfg frames re-appended at ages 1, 63, 64, 65, 1000, 100000: same digest; every row ignored as replay-*/duplicate-frame", 13, async () => {
+	const t0 = performance.now();
+	const prefix = await buildPrefix();
+	const tPrefix = performance.now() - t0;
 
-		const sealer: Suite1Crypto = await createWebCryptoSuite1({ vaultId: VAULT, random: new SeededRandom(0x5ea1), keys: [{ e: 1, k: K(1) }] });
-		sealer.markVerified(1);
-		sealer.setSealEpoch(1);
-		const reader: Suite1Crypto = await createWebCryptoSuite1({ vaultId: VAULT, random: new SeededRandom(0x4ead), keys: [{ e: 1, k: K(1) }] });
-		reader.markVerified(1);
-		const ctx: GateCtx = { crypto: reader, vaultId: VAULT as VaultId, maxCheckpointStateBytes: 1 << 20, staleCheck: () => null };
-		const hash = createWebHash();
-		const seal = async (l: Lane, f: Frame) =>
-			(await sealFrame(sealer, VAULT as VaultId, { stream: l.stream, deviceId: l.dev, clientFrameId: f.clientFrameId, kind: l.stream === NS_STREAM ? "nsOps" : "cfgOps", authorNsSeq: f.authorNsSeq, flags: 0, frameNo: f.frameNo, content: f.content })).sealed;
-		/** A prefix frame's payload as the relay recorded it (sealed once, on first use as a replay target). */
-		const prefixPayload = new Map<string, Promise<Uint8Array>>();
+	const sealer: Suite1Crypto = await createWebCryptoSuite1({ vaultId: VAULT, random: new SeededRandom(0x5ea1), keys: [{ e: 1, k: K(1) }] });
+	sealer.markVerified(1);
+	sealer.setSealEpoch(1);
+	const reader: Suite1Crypto = await createWebCryptoSuite1({ vaultId: VAULT, random: new SeededRandom(0x4ead), keys: [{ e: 1, k: K(1) }] });
+	reader.markVerified(1);
+	const ctx: GateCtx = { crypto: reader, vaultId: VAULT as VaultId, maxCheckpointStateBytes: 1 << 20, staleCheck: () => null };
+	const hash = createWebHash();
+	const seal = async (l: Lane, f: Frame) =>
+		(await sealFrame(sealer, VAULT as VaultId, { stream: l.stream, deviceId: l.dev, clientFrameId: f.clientFrameId, kind: l.stream === NS_STREAM ? "nsOps" : "cfgOps", authorNsSeq: f.authorNsSeq, flags: 0, frameNo: f.frameNo, content: f.content })).sealed;
+	/** A prefix frame's payload as the relay recorded it (sealed once, on first use as a replay target). */
+	const prefixPayload = new Map<string, Promise<Uint8Array>>();
 
-		const tally = new Map<string, number>();
-		const bump = (k: string, by = 1) => tally.set(k, (tally.get(k) ?? 0) + by);
-		let genuineRows = 0, injected = 0, ignoredEvents = 0, digestsEqual = 0, replaysAuthenticated = 0, prefixTargets = 0;
-		let crispChecked = 0, ringOverWindow = 0, windowDuplicate = 0, missed = 0, restarts = 0, seedsWithF = 0;
+	const tally = new Map<string, number>();
+	const bump = (k: string, by = 1) => tally.set(k, (tally.get(k) ?? 0) + by);
+	let genuineRows = 0, injected = 0, ignoredEvents = 0, digestsEqual = 0, replaysAuthenticated = 0, prefixTargets = 0;
+	let crispChecked = 0, ringOverWindow = 0, windowDuplicate = 0, missed = 0, restarts = 0, seedsWithF = 0;
 
-		for (let seed = 0; seed < SEEDS; seed++) {
-			const rnd = new SeededRandom(0x7e9a_0000 + seed);
-			const inOrder = seed % 2 === 0;
-			const classes: Cls[] = seed % 3 === 0 ? ["L1", "L2", "F"] : ["L1", "L2"];
-			if (classes.includes("F")) seedsWithF++;
-			const lanes = STREAMS.flatMap((stream) => classes.map((cls) => makeLane(rnd, seed, prefix, stream, cls)));
-			restarts += lanes.filter((l) => l.restartAt !== null).length;
-			const payload = new Map<Frame, Uint8Array>();
-			await Promise.all(lanes.flatMap((l) => l.frames.map(async (f) => void payload.set(f, await seal(l, f)))));
+	for (let seed = 0; seed < SEEDS; seed++) {
+		const rnd = new SeededRandom(0x7e9a_0000 + seed);
+		const inOrder = seed % 2 === 0;
+		const classes: Cls[] = seed % 3 === 0 ? ["L1", "L2", "F"] : ["L1", "L2"];
+		if (classes.includes("F")) seedsWithF++;
+		const lanes = STREAMS.flatMap((stream) => classes.map((cls) => makeLane(rnd, seed, prefix, stream, cls)));
+		restarts += lanes.filter((l) => l.restartAt !== null).length;
+		const payload = new Map<Frame, Uint8Array>();
+		await Promise.all(lanes.flatMap((l) => l.frames.map(async (f) => void payload.set(f, await seal(l, f)))));
 
-			// Commit schedule (relay order) with replays appended after genuine commits.
-			let seq = prefix.lastSeq;
-			const remaining = new Map<StreamName, number>(STREAMS.map((s) => [s, lanes.filter((l) => l.stream === s).reduce((n, l) => n + l.frames.length, 0)]));
-			const genuine: { readonly lane: Lane; readonly seq: Seq; readonly f: Frame }[] = [];
-			const replays: Replay[] = [];
-			for (;;) {
-				const live = lanes.filter((l) => l.uncommitted.length > 0);
-				if (live.length === 0) break;
-				const l = rnd.pick(live);
-				let pos = 0;
-				if (!inOrder) {
-					const u = l.frames[l.uncommitted[0]!]!.frameNo;
-					let w = 0;
-					while (w < l.uncommitted.length && l.frames[l.uncommitted[w]!]!.frameNo < u + NS_SEND_WINDOW) w++;
-					pos = rnd.int(w);
-				}
-				const f = l.frames[l.uncommitted.splice(pos, 1)[0]!]!;
-				if (rnd.chance(0.2)) seq += rnd.range(1, 5); // rows of other streams
-				genuine.push({ lane: l, seq: ++seq, f });
-				assert.equal(model(prefix, l, f.frameNo), "accept", "an honest first commit is never a replay (§8.2)");
-				l.r = Math.max(l.r, f.frameNo);
-				l.committed.add(f.frameNo);
-				l.ring.push(f.clientFrameId);
-				l.ringF.push(f.frameNo);
-				if (l.ring.length > NS_DEDUPE_RING) {
-					l.ring.shift();
-					l.ringF.shift();
-				}
-				l.commits++;
-				const left = remaining.get(l.stream)! - 1;
-				remaining.set(l.stream, left);
-				if (left === 0) continue; // the stream's last row stays genuine
-				for (const age of AGES_OF[l.cls]) {
-					const arms = l.arms.get(age)!;
-					if (arms.length === 0 || l.commits <= arms[0]!) continue;
-					const target = l.r - age;
-					if (!isCommitted(l, target)) continue;
-					arms.shift();
-					const expected = model(prefix, l, target);
-					assert.notEqual(expected, "accept");
-					replays.push({
-						lane: l, seq: ++seq, f: target, age, expected: expected as Reason, inOrder,
-						crisp: inOrder && ringContiguous(l), windowStale: target <= l.r - REPLAY_WINDOW,
-					});
-				}
+		// Commit schedule (relay order) with replays appended after genuine commits.
+		let seq = prefix.lastSeq;
+		const remaining = new Map<StreamName, number>(STREAMS.map((s) => [s, lanes.filter((l) => l.stream === s).reduce((n, l) => n + l.frames.length, 0)]));
+		const genuine: { readonly lane: Lane; readonly seq: Seq; readonly f: Frame }[] = [];
+		const replays: Replay[] = [];
+		for (;;) {
+			const live = lanes.filter((l) => l.uncommitted.length > 0);
+			if (live.length === 0) break;
+			const l = rnd.pick(live);
+			let pos = 0;
+			if (!inOrder) {
+				const u = l.frames[l.uncommitted[0]!]!.frameNo;
+				let w = 0;
+				while (w < l.uncommitted.length && l.frames[l.uncommitted[w]!]!.frameNo < u + NS_SEND_WINDOW) w++;
+				pos = rnd.int(w);
 			}
-			for (const l of lanes) for (const a of l.arms.values()) missed += a.length;
-
-			// Gate every row once (pure): genuine rows serve both runs.
-			const replayPayload = (r: Replay): Promise<Uint8Array> => {
-				const l = r.lane;
-				if (r.f > l.prefixMax) return Promise.resolve(payload.get(l.byFrameNo.get(r.f)!)!);
-				prefixTargets++;
-				const key = `${l.stream}:${l.cls}:${r.f}`;
-				let p = prefixPayload.get(key);
-				if (!p) prefixPayload.set(key, (p = seal(l, recorded(prefix, l, r.f))));
-				return p;
-			};
-			const gate = async (stream: StreamName, seq: Seq, l: Lane, f: Frame, bytes: Uint8Array): Promise<TailRecord> => {
-				const g = await gateRow(ctx, hash, { stream, seq, deviceId: l.dev, clientFrameId: f.clientFrameId, payload: bytes }, 0);
-				assert.equal(g.t, "row");
-				const row = (g as { readonly row: TailRecord }).row;
-				assert.ok(row.frameNo === f.frameNo && row.flags === 0 && row.authorNsSeq === f.authorNsSeq && bytesEqual(row.content, f.content), "opens to the recorded frame");
-				return row;
-			};
-			const gRows = await Promise.all(genuine.map((g) => gate(g.lane.stream, g.seq, g.lane, g.f, payload.get(g.f)!)));
-			const rRows = await Promise.all(replays.map(async (r) => gate(r.lane.stream, r.seq, r.lane, recorded(prefix, r.lane, r.f), await replayPayload(r))));
-			genuineRows += gRows.length;
-			replaysAuthenticated += rRows.length;
-			injected += replays.length;
-
-			for (const stream of STREAMS) {
-				const a = gRows.filter((r) => r.stream === stream);
-				const b = [...a, ...rRows.filter((r) => r.stream === stream)].sort((x, y) => x.seq - y.seq);
-				const runA = runtimeOf(stream, repoOf(stream, prefix.snap[stream], a));
-				const runB = runtimeOf(stream, repoOf(stream, prefix.snap[stream], b));
-				const foldedA = await runA.load();
-				const foldedB = await runB.load();
-				assert.equal(runA.halted, null);
-				assert.equal(runB.halted, null);
-				assert.equal(foldedA.length, a.length);
-				assert.equal(foldedB.length, b.length);
-				assert.equal(runA.coversSeq, a[a.length - 1]!.seq);
-				assert.ok(bytesEqual(runA.encodeState(), runB.encodeState()), `seed ${seed} ${stream}: fold digest differs with replays`);
-				digestsEqual++;
-
-				const evB = new Map<Seq, readonly (NsFoldEvent | CfgFoldEvent)[]>(foldedB.map((fr) => [fr.seq, fr.events as readonly (NsFoldEvent | CfgFoldEvent)[]]));
-				const aSeqs = new Set(a.map((r) => r.seq));
-				const genuineB = foldedB.filter((fr) => aSeqs.has(fr.seq));
-				assert.equal(JSON.stringify(foldedA.map((fr) => fr.events)), JSON.stringify(genuineB.map((fr) => fr.events)), `seed ${seed} ${stream}: genuine rows fold the same`);
-				let countA = 0, countB = 0;
-				for (const fr of foldedA) for (const e of fr.events as readonly (NsFoldEvent | CfgFoldEvent)[]) if (isReplayReason(reasonOf(e))) countA++;
-				for (const fr of foldedB) for (const e of fr.events as readonly (NsFoldEvent | CfgFoldEvent)[]) if (isReplayReason(reasonOf(e))) countB++;
-				const mine = replays.filter((r) => r.lane.stream === stream);
-				assert.equal(countA, 0, "no genuine row is ever ignored as a replay");
-				assert.equal(countB, mine.length, `seed ${seed} ${stream}: ignored replay-*/duplicate-frame events == injected rows`);
-				ignoredEvents += countB;
-				for (const r of mine) {
-					const evs = evB.get(r.seq)!;
-					assert.equal(evs.length, 1);
-					const e = evs[0]!;
-					assert.ok(e.index === -1 && e.deviceId === r.lane.dev && e.clientFrameId === recorded(prefix, r.lane, r.f).clientFrameId);
-					assert.equal(reasonOf(e), r.expected, `seed ${seed} ${stream} ${r.lane.cls} age ${r.age}: reason`);
-					bump(`${stream}|${r.lane.cls}|${r.age}|${r.expected}`);
-					bump(`${r.inOrder ? "inorder" : "reorder"}|${r.age}|${r.expected}`);
-					if (r.crisp) {
-						crispChecked++;
-						assert.equal(r.expected, r.age <= REPLAY_WINDOW - 1 ? "duplicate-frame" : "replay-stale", "in frameNo order, no gap: a <= 63 ring, a >= 64 stale");
-					}
-					if (r.windowStale && r.expected === "duplicate-frame") ringOverWindow++;
-					if (r.expected === "replay-duplicate") windowDuplicate++;
-				}
+			const f = l.frames[l.uncommitted.splice(pos, 1)[0]!]!;
+			if (rnd.chance(0.2)) seq += rnd.range(1, 5); // rows of other streams
+			genuine.push({ lane: l, seq: ++seq, f });
+			assert.equal(model(prefix, l, f.frameNo), "accept", "an honest first commit is never a replay (§8.2)");
+			l.r = Math.max(l.r, f.frameNo);
+			l.committed.add(f.frameNo);
+			l.ring.push(f.clientFrameId);
+			l.ringF.push(f.frameNo);
+			if (l.ring.length > NS_DEDUPE_RING) {
+				l.ring.shift();
+				l.ringF.shift();
+			}
+			l.commits++;
+			const left = remaining.get(l.stream)! - 1;
+			remaining.set(l.stream, left);
+			if (left === 0) continue; // the stream's last row stays genuine
+			for (const age of AGES_OF[l.cls]) {
+				const arms = l.arms.get(age)!;
+				if (arms.length === 0 || l.commits <= arms[0]!) continue;
+				const target = l.r - age;
+				if (!isCommitted(l, target)) continue;
+				arms.shift();
+				const expected = model(prefix, l, target);
+				assert.notEqual(expected, "accept");
+				replays.push({
+					lane: l, seq: ++seq, f: target, age, expected: expected as Reason, inOrder,
+					crisp: inOrder && ringContiguous(l), windowStale: target <= l.r - REPLAY_WINDOW,
+				});
 			}
 		}
-		const wall = performance.now() - t0;
+		for (const l of lanes) for (const a of l.arms.values()) missed += a.length;
 
-		// Totals: exact accounting, both precedence branches exercised.
-		assert.equal(ignoredEvents, injected);
-		assert.equal(replaysAuthenticated, injected);
-		assert.equal(digestsEqual, SEEDS * STREAMS.length);
-		const byAge = (age: Age, reason: Reason) => [...tally].filter(([k]) => k.startsWith("inorder|") || k.startsWith("reorder|")).filter(([k]) => k.endsWith(`|${age}|${reason}`)).reduce((n, [, v]) => n + v, 0);
-		for (const age of AGES) {
-			// Structure of the precedence: f > r − 64 is never replay-stale; f <= r − 64 is never replay-duplicate.
-			if (age < REPLAY_WINDOW) assert.equal(byAge(age, "replay-stale"), 0, `age ${age}`);
-			else assert.equal(byAge(age, "replay-duplicate"), 0, `age ${age}`);
-			// Ages far outside the ring's reach: only the window speaks.
-			if (age >= 1000) assert.equal(byAge(age, "duplicate-frame"), 0, `age ${age}`);
-		}
-		for (const stream of STREAMS) for (const cls of ["L1", "L2", "F"] as const) for (const age of AGES_OF[cls]) {
-			const n = REASONS.reduce((s, r) => s + (tally.get(`${stream}|${cls}|${age}|${r}`) ?? 0), 0);
-			assert.ok(n > 0, `${stream} ${cls} age ${age} covered`);
-		}
-		assert.ok(crispChecked > 0 && ringOverWindow > 0 && windowDuplicate > 0, "the ring-first and window-duplicate branches both occur");
+		// Gate every row once (pure): genuine rows serve both runs.
+		const replayPayload = (r: Replay): Promise<Uint8Array> => {
+			const l = r.lane;
+			if (r.f > l.prefixMax) return Promise.resolve(payload.get(l.byFrameNo.get(r.f)!)!);
+			prefixTargets++;
+			const key = `${l.stream}:${l.cls}:${r.f}`;
+			let p = prefixPayload.get(key);
+			if (!p) prefixPayload.set(key, (p = seal(l, recorded(prefix, l, r.f))));
+			return p;
+		};
+		const gate = async (stream: StreamName, seq: Seq, l: Lane, f: Frame, bytes: Uint8Array): Promise<TailRecord> => {
+			const g = await gateRow(ctx, hash, { stream, seq, deviceId: l.dev, clientFrameId: f.clientFrameId, payload: bytes }, 0);
+			assert.equal(g.t, "row");
+			const row = (g as { readonly row: TailRecord }).row;
+			assert.ok(row.frameNo === f.frameNo && row.flags === 0 && row.authorNsSeq === f.authorNsSeq && bytesEqual(row.content, f.content), "opens to the recorded frame");
+			return row;
+		};
+		const gRows = await Promise.all(genuine.map((g) => gate(g.lane.stream, g.seq, g.lane, g.f, payload.get(g.f)!)));
+		const rRows = await Promise.all(replays.map(async (r) => gate(r.lane.stream, r.seq, r.lane, recorded(prefix, r.lane, r.f), await replayPayload(r))));
+		genuineRows += gRows.length;
+		replaysAuthenticated += rRows.length;
+		injected += replays.length;
 
-		const lines = [
-			`replay measured: ${SEEDS} seeds (${seedsWithF} with fresh F), ${genuineRows} genuine rows, ${injected} injected replays (${prefixTargets} of prefix frames), ${missed} quota slots unreachable, ${restarts} lane restarts`,
-			`  digests equal ${digestsEqual}/${SEEDS * STREAMS.length}; ignored replay events ${ignoredEvents} == injected ${injected}; replays authenticated ${replaysAuthenticated}`,
-			`  crisp-rule rows ${crispChecked}; ring-over-window (duplicate-frame with f <= r-64) ${ringOverWindow}; replay-duplicate ${windowDuplicate}`,
-			`  wall ${(wall / 1000).toFixed(1)} s (prefix ${(tPrefix / 1000).toFixed(1)} s)`,
-		];
-		for (const mode of ["inorder", "reorder"]) for (const age of AGES) lines.push(`  ${mode} age ${age}: ${REASONS.map((r) => `${r} ${tally.get(`${mode}|${age}|${r}`) ?? 0}`).join(", ")}`);
-		for (const stream of STREAMS) for (const cls of ["L1", "L2", "F"] as const) for (const age of AGES_OF[cls])
-			lines.push(`  ${stream} ${cls} age ${age}: ${REASONS.map((r) => `${r} ${tally.get(`${stream}|${cls}|${age}|${r}`) ?? 0}`).join(", ")}`);
-		console.log(lines.join("\n"));
-	});
+		for (const stream of STREAMS) {
+			const a = gRows.filter((r) => r.stream === stream);
+			const b = [...a, ...rRows.filter((r) => r.stream === stream)].sort((x, y) => x.seq - y.seq);
+			const runA = runtimeOf(stream, repoOf(stream, prefix.snap[stream], a));
+			const runB = runtimeOf(stream, repoOf(stream, prefix.snap[stream], b));
+			const foldedA = await runA.load();
+			const foldedB = await runB.load();
+			assert.equal(runA.halted, null);
+			assert.equal(runB.halted, null);
+			assert.equal(foldedA.length, a.length);
+			assert.equal(foldedB.length, b.length);
+			assert.equal(runA.coversSeq, a[a.length - 1]!.seq);
+			assert.ok(bytesEqual(runA.encodeState(), runB.encodeState()), `seed ${seed} ${stream}: fold digest differs with replays`);
+			digestsEqual++;
+
+			const evB = new Map<Seq, readonly (NsFoldEvent | CfgFoldEvent)[]>(foldedB.map((fr) => [fr.seq, fr.events as readonly (NsFoldEvent | CfgFoldEvent)[]]));
+			const aSeqs = new Set(a.map((r) => r.seq));
+			const genuineB = foldedB.filter((fr) => aSeqs.has(fr.seq));
+			assert.equal(JSON.stringify(foldedA.map((fr) => fr.events)), JSON.stringify(genuineB.map((fr) => fr.events)), `seed ${seed} ${stream}: genuine rows fold the same`);
+			let countA = 0, countB = 0;
+			for (const fr of foldedA) for (const e of fr.events as readonly (NsFoldEvent | CfgFoldEvent)[]) if (isReplayReason(reasonOf(e))) countA++;
+			for (const fr of foldedB) for (const e of fr.events as readonly (NsFoldEvent | CfgFoldEvent)[]) if (isReplayReason(reasonOf(e))) countB++;
+			const mine = replays.filter((r) => r.lane.stream === stream);
+			assert.equal(countA, 0, "no genuine row is ever ignored as a replay");
+			assert.equal(countB, mine.length, `seed ${seed} ${stream}: ignored replay-*/duplicate-frame events == injected rows`);
+			ignoredEvents += countB;
+			for (const r of mine) {
+				const evs = evB.get(r.seq)!;
+				assert.equal(evs.length, 1);
+				const e = evs[0]!;
+				assert.ok(e.index === -1 && e.deviceId === r.lane.dev && e.clientFrameId === recorded(prefix, r.lane, r.f).clientFrameId);
+				assert.equal(reasonOf(e), r.expected, `seed ${seed} ${stream} ${r.lane.cls} age ${r.age}: reason`);
+				bump(`${stream}|${r.lane.cls}|${r.age}|${r.expected}`);
+				bump(`${r.inOrder ? "inorder" : "reorder"}|${r.age}|${r.expected}`);
+				if (r.crisp) {
+					crispChecked++;
+					assert.equal(r.expected, r.age <= REPLAY_WINDOW - 1 ? "duplicate-frame" : "replay-stale", "in frameNo order, no gap: a <= 63 ring, a >= 64 stale");
+				}
+				if (r.windowStale && r.expected === "duplicate-frame") ringOverWindow++;
+				if (r.expected === "replay-duplicate") windowDuplicate++;
+			}
+		}
+	}
+	const wall = performance.now() - t0;
+
+	// Totals: exact accounting, both precedence branches exercised.
+	assert.equal(ignoredEvents, injected);
+	assert.equal(replaysAuthenticated, injected);
+	assert.equal(digestsEqual, SEEDS * STREAMS.length);
+	const byAge = (age: Age, reason: Reason) => [...tally].filter(([k]) => k.startsWith("inorder|") || k.startsWith("reorder|")).filter(([k]) => k.endsWith(`|${age}|${reason}`)).reduce((n, [, v]) => n + v, 0);
+	for (const age of AGES) {
+		// Structure of the precedence: f > r − 64 is never replay-stale; f <= r − 64 is never replay-duplicate.
+		if (age < REPLAY_WINDOW) assert.equal(byAge(age, "replay-stale"), 0, `age ${age}`);
+		else assert.equal(byAge(age, "replay-duplicate"), 0, `age ${age}`);
+		// Ages far outside the ring's reach: only the window speaks.
+		if (age >= 1000) assert.equal(byAge(age, "duplicate-frame"), 0, `age ${age}`);
+	}
+	for (const stream of STREAMS) for (const cls of ["L1", "L2", "F"] as const) for (const age of AGES_OF[cls]) {
+		const n = REASONS.reduce((s, r) => s + (tally.get(`${stream}|${cls}|${age}|${r}`) ?? 0), 0);
+		assert.ok(n > 0, `${stream} ${cls} age ${age} covered`);
+	}
+	assert.ok(crispChecked > 0 && ringOverWindow > 0 && windowDuplicate > 0, "the ring-first and window-duplicate branches both occur");
+
+	const lines = [
+		`replay measured: ${SEEDS} seeds (${seedsWithF} with fresh F), ${genuineRows} genuine rows, ${injected} injected replays (${prefixTargets} of prefix frames), ${missed} quota slots unreachable, ${restarts} lane restarts`,
+		`  digests equal ${digestsEqual}/${SEEDS * STREAMS.length}; ignored replay events ${ignoredEvents} == injected ${injected}; replays authenticated ${replaysAuthenticated}`,
+		`  crisp-rule rows ${crispChecked}; ring-over-window (duplicate-frame with f <= r-64) ${ringOverWindow}; replay-duplicate ${windowDuplicate}`,
+		`  wall ${(wall / 1000).toFixed(1)} s (prefix ${(tPrefix / 1000).toFixed(1)} s)`,
+	];
+	for (const mode of ["inorder", "reorder"]) for (const age of AGES) lines.push(`  ${mode} age ${age}: ${REASONS.map((r) => `${r} ${tally.get(`${mode}|${age}|${r}`) ?? 0}`).join(", ")}`);
+	for (const stream of STREAMS) for (const cls of ["L1", "L2", "F"] as const) for (const age of AGES_OF[cls])
+		lines.push(`  ${stream} ${cls} age ${age}: ${REASONS.map((r) => `${r} ${tally.get(`${stream}|${cls}|${age}|${r}`) ?? 0}`).join(", ")}`);
+	console.log(lines.join("\n"));
 });
