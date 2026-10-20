@@ -217,7 +217,8 @@ export abstract class FoldRuntime<Op, E> {
 	 * Why the committed state may lack what the relay's rows say (blobs/gc.ts precondition), or null: the fold
 	 * halted; the stored snapshot did not decode (reset() started empty); a tail row up to appliedSeq did not open
 	 * (reader-dependent), failed the gate (stored empty), does not decode, is not folded yet, or holds an op this
-	 * reader ignores for being newer than it (rowGap). Folds the available rows first.
+	 * reader ignores for being newer than it (rowGap). A stale-epoch row is none of these. Folds the available rows
+	 * first.
 	 */
 	async gap(): Promise<{ readonly seq: Seq; readonly reason: string } | null> {
 		await this.advance();
@@ -229,6 +230,11 @@ export abstract class FoldRuntime<Op, E> {
 			const snap = await this.repo.getSnapshot(this.stream);
 			for (const row of await this.repo.getTail(this.stream, snap?.coversSeq ?? 0, rec.appliedSeq)) {
 				if (row.flags & LOCAL_FLAG_UNOPENED) return { seq: row.seq, reason: "row does not open" };
+				// Every reader ignores a stale-epoch row (§14.3): nothing of the state is missing.
+				if (row.flags & LOCAL_FLAG_STALE_EPOCH) {
+					if (row.seq > this.coversSeq) return { seq: row.seq, reason: "row not folded" };
+					continue;
+				}
 				if (row.content.length === 0) return { seq: row.seq, reason: "row failed the gate" };
 				const ops = this.decodeOps(row.content);
 				if (!ops) return { seq: row.seq, reason: "row does not decode" };

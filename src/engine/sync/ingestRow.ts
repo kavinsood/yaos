@@ -9,8 +9,8 @@
  *                                              QUARANTINE_ROW_BYTES; reader-dependent ones keep the whole payload
  *                                              (bounded by the relay's 1 MiB frame), so a re-gate on new keys or
  *                                              an upgrade can still open it (§d.6 "retried on upgrade or new keys")
- *  - ns/cfg stale-epoch (e2ee-design §14.3)  -> tail row flagged LOCAL_FLAG_STALE_EPOCH, empty content (folds as
- *                                              ignored/stale-epoch)
+ *  - ns/cfg/snap stale-epoch (e2ee-design §14.3) -> tail row flagged LOCAL_FLAG_STALE_EPOCH, empty content (folds
+ *                                              as ignored/stale-epoch, so the fold covers it)
  *  - body/canvas/x stale-epoch              -> accounted only: ignored, no quarantine, no freeze (§9.3)
  *  - k row                                  -> tail row "keyRecord", content = the raw record (no envelope;
  *                                              judged by the keyring, e2ee-design §11.3)
@@ -62,8 +62,8 @@ export async function gateRow(ctx: GateCtx, hash: HashPort, input: RowInput, now
 			case "ignored":
 				return { t: "account" };
 			case "stale":
-				if (cls !== "ns" && cls !== "cfg") return { t: "account" };
-				return { t: "row", row: { ...base, kind: cls === "ns" ? "nsOps" : "cfgOps", authorNsSeq: 0, flags: LOCAL_FLAG_STALE_EPOCH, frameNo: 0, content: new Uint8Array(0) } };
+				if (cls !== "ns" && cls !== "cfg" && cls !== "snap") return { t: "account" };
+				return { t: "row", row: { ...base, kind: cls === "ns" ? "nsOps" : cls === "cfg" ? "cfgOps" : "snapOps", authorNsSeq: 0, flags: LOCAL_FLAG_STALE_EPOCH, frameNo: 0, content: new Uint8Array(0) } };
 			case "ns":
 			case "cfg":
 			case "snap":
@@ -133,14 +133,14 @@ export function notApplied(items: readonly LiveItem[], into = new Set<Seq>()): S
  * An own frame committed at `seq` under an epoch the §14.3 rule makes stale, or may (k below `seq` not judged
  * yet): readers ignore it, so its author sends a copy sealed under the current epoch (e2ee-design §14.2 step 4).
  * The copy keeps the frameNo: should a hold settle as not stale, the copy is a replay duplicate (§8.2) or a Yjs
- * no-op. ns/cfg commits are stored as readers store them (stale: folds as ignored; hold: unopened, re-gated once
- * `k` is judged); others as the outbox has them (the local doc already holds the update).
+ * no-op. ns/cfg/snap commits are stored as readers store them (stale: folds as ignored; hold: unopened, re-gated
+ * once `k` is judged); others as the outbox has them (the local doc already holds the update).
  */
 export function ownCommitCopy(ctx: GateCtx, random: RandomPort, self: DeviceId, ob: OutboxRecord, seq: Seq): OwnCommitCopy | null {
 	const v = ctx.staleCheck(ob.keyEpoch, seq);
 	if (v === null) return null;
 	const cls = streamClass(ob.stream);
-	if (cls !== "ns" && cls !== "cfg") return { clientFrameId: newClientFrameId(random), row: null };
+	if (cls !== "ns" && cls !== "cfg" && cls !== "snap") return { clientFrameId: newClientFrameId(random), row: null };
 	const base = { stream: ob.stream, seq, deviceId: self, clientFrameId: ob.clientFrameId, kind: ob.kind, authorNsSeq: 0, frameNo: 0 };
 	const row: TailRecord = v === "stale" ? { ...base, flags: LOCAL_FLAG_STALE_EPOCH, content: new Uint8Array(0) } : { ...base, flags: LOCAL_FLAG_UNOPENED, content: ob.sealed };
 	return { clientFrameId: newClientFrameId(random), row };

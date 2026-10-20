@@ -1694,8 +1694,9 @@ The `x:` carrier was later deleted, so the §j.1 hunk below is superseded: blobs
 **Applied (E8):** every hunk below is now in DESIGN.md, as built. Differences from the hunks: the AAD header is
 `u8 formatVersion ‖ u8 suite ‖ varuint keyEpoch`; the replay window sits inside §c.3 step 2, after the ring hit test,
 and frameNo 0 never reaches it (decode rejects it; failed rows are stored with frameNo 0 and fold as empty); the `k`
-row says commit-only and no checkpoint (the hunk's "yes" was not a broadcast value); stale-epoch snap rows are
-accounted, not stored; the keyring read is §d.7 step 3a, after the feed, not step 0; the §j.1 `x:` hunk stays superseded.
+row says commit-only and no checkpoint (the hunk's "yes" was not a broadcast value); stale-epoch snap rows were
+first accounted, not stored, and are now stored flagged like ns/cfg (a trailing one left the snap fold below the
+head for good); the keyring read is §d.7 step 3a, after the feed, not step 0; the §j.1 `x:` hunk stays superseded.
 
 ```diff
  §b.1 Envelope

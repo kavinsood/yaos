@@ -1071,7 +1071,7 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 | Kind not allowed | Fold as empty | Quarantine, freeze |
 | `suite-downgrade`, `bad-padding`; `auth-failed` under a verified key (`CryptoPort.keyState(e).verified`) | Deterministic: as malformation | As malformation |
 | `auth-failed` under an unverified key | Reader-dependent: halt | Reader-dependent: quarantine |
-| Stale epoch (e2ee-design §14.3, decided from the header's keyEpoch before opening) | ns/cfg: stored flagged stale-epoch, fold as empty; snap: accounted, not stored | Accounted, not stored, not quarantined |
+| Stale epoch (e2ee-design §14.3, decided from the header's keyEpoch before opening) | ns/cfg/snap: stored flagged stale-epoch, fold as empty (the fold covers the row; an own frame that committed stale is stored so too) | Accounted, not stored, not quarantined |
 | Stale epoch not yet decidable (`hold`: `k` not judged) | Reader-dependent (`keyring-hold`) | Reader-dependent (`keyring-hold`) |
 
 - **Checkpoints** (§b.5, §d.7) are never quarantined:

@@ -94,6 +94,14 @@ test("sim: ns frames allocated before a lost store read ns are not ignored as re
 	}
 });
 
+// Suite-1 seed 174 (4 devices): a hostile replay of an old-epoch snap frame was the stream's last row. Every reader
+// judged it stale (§14.3) and, for snap alone, only accounted it: never stored, the snap fold's coversSeq stayed below
+// the head for good. Stale snap rows are stored flagged and fold as ignored, as for ns / cfg.
+test("sim: a stale snap row last in the stream is covered by every snap fold (suite-1 seed 174)", async () => {
+	const r = await runSim({ seed: 174, devices: 4, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 // Suite-1 seed 217 (3 devices): A moved node a-1n0 on disk while a-1n1, the next line of the merge text, changed on
 // both sides. The line diff3 joined the two lines into one conflicting hunk and kept the CRDT's a-1n0: the move lived
 // only in the conflict copy, which a user deleted. The canvas merge resolves record by record.

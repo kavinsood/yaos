@@ -142,7 +142,8 @@ async function regateUnopenedOnce(c: EngineCtx): Promise<number> {
 		for (const r of rows) {
 			const g = await gateRow(c.gateCtx, c.ports.hash, { stream: r.stream, seq: r.seq, deviceId: r.deviceId, clientFrameId: r.clientFrameId, payload: r.content }, c.now());
 			if (g.t === "row" && !(g.row.flags & LOCAL_FLAG_UNOPENED)) out.push(g.row);
-			// Accounted only now (a snap row judged stale-epoch, §14.3): never folded, so it must not hold the fold.
+			// Accounted only now (gateRow's "account"): never folded, so it must not hold the fold. A row judged
+			// stale-epoch (§14.3) is a row, flagged, and folds as ignored.
 			else if (g.t === "account") drop.push(r.seq);
 		}
 		if (out.length === 0 && drop.length === 0) continue;
