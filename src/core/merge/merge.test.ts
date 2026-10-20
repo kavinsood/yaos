@@ -237,7 +237,11 @@ test("minimalDiff: edits are whole tokens; punctuation between changed words is 
 	assert.deepEqual(minimalDiff("x=1;", "x=12;"), [{ start: 2, end: 3, text: "12" }]);
 	assert.deepEqual(minimalDiff("caf\u00e9 ok", "cafe\u0301 ok"), [{ start: 0, end: 4, text: "cafe\u0301" }], "combining marks belong to the word");
 	assert.deepEqual(minimalDiff("[A.2]\n", "[B.27] \n"), [{ start: 0, end: 5, text: "[B.27] " }], "sim seed 961: the leading [ is not reused (glue)");
-	assert.deepEqual(minimalDiff("[A.6] x\n", "[A.53] x\n"), [{ start: 3, end: 4, text: "53" }]);
+	assert.deepEqual(minimalDiff("[A.6] x\n", "[A.53] x\n"), [{ start: 0, end: 5, text: "[A.53]" }], "a changed bracket group is new text throughout");
+	assert.deepEqual(minimalDiff("seed 0 [Z.0]\n", "seed 0  [B.86.0]\n"), [{ start: 7, end: 12, text: " [B.86.0]" }], "3-device storm seed 449: not \"[Z\" -> \" [B.86\" keeping \".0]\"");
+	assert.deepEqual(minimalDiff("x\n[C.59]\n", "x [C.94]\n"), [{ start: 1, end: 8, text: " [C.94]" }], "storm seed 109: the old \"[C.\" is not reused");
+	assert.deepEqual(minimalDiff("foo(bar) x", "foo(baz) x"), [{ start: 3, end: 8, text: "(baz)" }]);
+	assert.deepEqual(minimalDiff("[[A]] [[B]]", "[[A]] [[C]]"), [{ start: 6, end: 11, text: "[[C]]" }], "the outermost group");
 	assert.deepEqual(minimalDiff("one\ntwo\n", "One\nTwo\n"), [{ start: 0, end: 3, text: "One" }, { start: 4, end: 7, text: "Two" }], "a kept \\n is never absorbed");
 	assert.deepEqual(minimalDiff("a.b", "x.y"), [{ start: 0, end: 3, text: "x.y" }]);
 	assert.deepEqual(minimalDiff("a, b", "x, y"), [{ start: 0, end: 2, text: "x," }, { start: 3, end: 4, text: "y" }], "glue takes the \",\" of the chunk; the space between edits stays");
@@ -263,6 +267,12 @@ test("minimalDiff + applyEditsTo: concurrent Y.Text edits never split a word, bo
 		{ base: "- a\n- b\n", disk: "- a\n- new\n- b\n", remote: (t) => t.delete(4, 4), want: "- a\n- new\n" },
 		{ base: "x [A.2]\n", disk: "x [B.1] [A.2]\n", remote: (t) => t.delete(2, 5), want: "x [B.1] \n" },
 		{ base: "x[C.2][B.14]\n", disk: "x[B.14]\n", remote: (t) => t.delete(1, 5), want: "x[B.14]\n" },
+		// The new group shares characters with old groups a remote deletes (3-device storm seeds 449, 237, 319, 109).
+		{ base: "seed 0 [Z.0]\n", disk: "seed 0  [B.86.0]\n", remote: (t) => t.delete(7, 5), want: "seed 0  [B.86.0]\n" },
+		{ base: "see[B.21]\nd 0[B.6]  [Z.0]\n", disk: "see[B.21] [B.95.1]\n", remote: (t) => t.delete(13, 5), want: "see[B.21] [B.95.1]\n" },
+		{ base: "seed[B.7]\n 1 [Z.1]\n", disk: "seed[B.7] [B.110.1]\n", remote: (t) => t.delete(13, 5), want: "seed[B.7] [B.110.1]\n" },
+		{ base: "x\n[C.59]\n", disk: "x [C.94]\n", remote: (t) => t.delete(2, 6), want: "x [C.94]\n" },
+		{ base: "[A.6] \n", disk: "[A.53] \n", remote: (t) => t.delete(0, 5), want: "[A.53] \n" },
 	];
 	for (const c of cases) {
 		for (const order of [0, 1]) {
@@ -282,6 +292,27 @@ test("minimalDiff + applyEditsTo: concurrent Y.Text edits never split a word, bo
 			assert.equal(merged, d2.getText("t").toString());
 			assert.equal(merged, c.want, `${JSON.stringify(c.base)} -> ${JSON.stringify(c.disk)} (order ${order})`);
 		}
+	}
+});
+
+test("minimalDiff + applyEditsTo: two devices rewrite the same bracket group, both new groups survive whole", () => {
+	// 3-device storm seed 294: two imports rewrote "[A.95.37]" concurrently; "95" -> "116" kept the "[A." the other
+	// device's rewrite deleted, and the merge was "[B.103116.37]".
+	const base = "imported 37 [A.95.37]\n";
+	for (const order of [0, 1]) {
+		const d1 = new Y.Doc();
+		d1.clientID = order === 0 ? 1 : 2;
+		const d2 = new Y.Doc();
+		d2.clientID = order === 0 ? 2 : 1;
+		d1.getText("t").insert(0, base);
+		Y.applyUpdate(d2, Y.encodeStateAsUpdate(d1));
+		d1.transact(() => applyEditsTo(d1.getText("t"), base, minimalDiff(base, "imported 37 [A.116.37]\n")));
+		d2.transact(() => applyEditsTo(d2.getText("t"), base, minimalDiff(base, "imported 37 [B.103.37]\n")));
+		Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
+		Y.applyUpdate(d2, Y.encodeStateAsUpdate(d1));
+		const merged = d1.getText("t").toJSON();
+		assert.equal(merged, d2.getText("t").toJSON());
+		assert.ok(merged.includes("[A.116.37]") && merged.includes("[B.103.37]"), `order ${order}: ${JSON.stringify(merged)}`);
 	}
 });
 

@@ -1,0 +1,132 @@
+{
+	"seed": 449,
+	"config": {
+		"devices": 3,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 1,
+			"idbLost": 1,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0
+		},
+		"steps": 80,
+		"storms": 0.04,
+		"seed": 449
+	},
+	"violations": [
+		{
+			"inv": "tokens",
+			"detail": "lost [B.86.0] (overwrite on B at step 86)"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[B.86.0] was on B:notes/seed0.md (external) and is gone"
+		}
+	],
+	"note": "minimalDiff kept \".0]\" of \"[Z.0]\" inside the rewrite \" [B.86.0]\"; C's concurrent delete of [Z.0] took it (fixed by core/merge/minimalDiff.ts wholeGroups)",
+	"minimizedPlan": [
+		{
+			"i": 0,
+			"gapMs": 930,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.008542404044419527,
+				"pos": 0.7236591295804828,
+				"nl": false
+			}
+		},
+		{
+			"i": 80,
+			"gapMs": 99,
+			"canvas": {
+				"t": "cDeleteNode",
+				"dev": 0,
+				"file": 0.13888646103441715,
+				"node": 0.5354833526071161
+			}
+		},
+		{
+			"i": 1,
+			"gapMs": 86,
+			"user": {
+				"t": "delete",
+				"dev": 2,
+				"file": 0.8443297662306577
+			}
+		},
+		{
+			"i": 2,
+			"gapMs": 1262,
+			"user": {
+				"t": "diskInsert",
+				"dev": 1,
+				"file": 0.3639019844122231,
+				"pos": 0.9899540434125811,
+				"by": "external"
+			}
+		},
+		{
+			"i": 7,
+			"gapMs": 143,
+			"fault": {
+				"t": "background",
+				"dev": 1,
+				"event": "freeze",
+				"durationMs": 28646
+			}
+		},
+		{
+			"i": 12,
+			"gapMs": 215,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 2,
+				"file": 0.12727584410458803,
+				"pick": 0.46122618135996163,
+				"by": "external"
+			}
+		},
+		{
+			"i": 86,
+			"gapMs": 0,
+			"user": {
+				"t": "massOverwrite",
+				"dev": 1,
+				"frac": 0.7638508823234588,
+				"salt": 467775991
+			}
+		},
+		{
+			"i": 19,
+			"gapMs": 1050,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 1,
+				"file": 0.36205784836784005,
+				"pick": 0.14476598985493183,
+				"by": "external"
+			}
+		}
+	]
+}

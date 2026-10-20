@@ -47,6 +47,12 @@
  * 4. A replacement takes short punctuation runs at its ends when that makes
  *    it cover whole whitespace-separated chunks (glue): "[Z.1]" -> "[A.15]"
  *    does not keep the old "[".
+ * 5. An edit ending strictly inside a whitespace-free bracket group of the
+ *    target ("[A.53]", "(baz)", "[[Note]]") widens to the whole group
+ *    (wholeGroups): "[A.6]" -> "[A.53]" is not "6" -> "53", "[Z.0]" ->
+ *    "[B.86.0]" does not keep ".0]". Words of the old group equal by chance
+ *    are not reused either, so a concurrent delete of the old group cannot
+ *    take part of the new one along.
  *
  * applyEditsTo puts a replacement inside the old run, see there.
  */
@@ -465,7 +471,7 @@ export function tokenAlign(from: string, to: string, edits: readonly TextEdit[])
 	}
 	for (let i = 0; i < out.length; i++) glue(from, to, out[i]!, out[i - 1]?.a1 ?? 0, out[i + 1]?.a0 ?? from.length);
 	const done: Span[] = [];
-	for (const s of out) {
+	for (const s of wholeGroups(to, out)) {
 		const prev = done[done.length - 1];
 		if (prev && s.a0 <= prev.a1) {
 			prev.a1 = s.a1;
@@ -478,13 +484,97 @@ export function tokenAlign(from: string, to: string, edits: readonly TextEdit[])
 const isPunctCp = (cp: number): boolean => !isWordCp(cp) && !isSpaceCp(cp);
 
 /**
+ * [open, end) of the whitespace-free bracket group of `s` that `p` lies strictly inside ("[B.86.0]", "(baz)",
+ * "[[Note]]"; the innermost one), or null. Scans at most SLIDE_MAX units each way.
+ */
+function groupAround(s: string, p: number): [number, number] | null {
+	if (p <= 0 || p >= s.length) return null;
+	let open = -1;
+	for (let j = p, depth = 0; j > 0 && p - j < SLIDE_MAX; ) {
+		const cp = cpBefore(s, j);
+		const w = cp > 0xffff ? 2 : 1;
+		if (cp <= 0xffff && isSpaceCp(cp)) return null;
+		if (isCloseCp(cp)) depth++;
+		else if (isOpenCp(cp)) {
+			if (depth === 0) {
+				open = j - w;
+				break;
+			}
+			depth--;
+		}
+		j -= w;
+	}
+	if (open < 0) return null;
+	for (let k = p, depth = 0; k < s.length && k - p < SLIDE_MAX; ) {
+		const cp = cpAt(s, k);
+		const w = cp > 0xffff ? 2 : 1;
+		if (cp <= 0xffff && isSpaceCp(cp)) return null;
+		if (isOpenCp(cp)) depth++;
+		else if (isCloseCp(cp)) {
+			if (depth === 0) return [open, k + w];
+			depth--;
+		}
+		k += w;
+	}
+	return null;
+}
+
+/**
+ * Step 5: an edit with an end strictly inside a whitespace-free bracket group of `to` widens to the outermost such
+ * group, so a changed group is new text throughout. Otherwise the new group reuses characters of the old text, and a
+ * concurrent delete of the old group takes them along: "[Z.0]" -> " [B.86.0]" kept ".0]" (3-device storm seed 449,
+ * "[B.86"), "[A.95.37]" -> "[A.116.37]" beside a remote "[B.103.37]" kept "[A." and ".37]" (seed 294,
+ * "[B.103116.37]"), "x\n[C.59]\n" -> "x [C.94]\n" kept "[C." and "]". The widening runs over text equal in both
+ * strings (edits it reaches are merged), so the script still turns `from` into `to`, and a group never spans a line
+ * break, so it stays inside the line hunk. Ascending spans in, ascending (possibly touching) spans out.
+ */
+function wholeGroups(to: string, spans: readonly Span[]): Span[] {
+	const res: Span[] = [];
+	for (let i = 0; i < spans.length; ) {
+		const cur = { ...spans[i++]! };
+		for (let changed = true; changed; ) {
+			changed = false;
+			const left = groupAround(to, cur.b0);
+			if (left) {
+				const prev = res[res.length - 1];
+				if (prev && left[0] < prev.b1) {
+					res.pop();
+					cur.a0 = prev.a0;
+					cur.b0 = prev.b0;
+				} else {
+					cur.a0 -= cur.b0 - left[0];
+					cur.b0 = left[0];
+				}
+				changed = true;
+			}
+			const right = groupAround(to, cur.b1);
+			if (right) {
+				const next = spans[i];
+				if (next && right[1] > next.b0) {
+					i++;
+					cur.a1 = next.a1;
+					cur.b1 = next.b1;
+				} else {
+					cur.a1 += right[1] - cur.b1;
+					cur.b1 = right[1];
+				}
+				changed = true;
+			}
+		}
+		res.push(cur);
+	}
+	return res;
+}
+
+/**
  * A replacement whose ends are short runs of punctuation away from
  * whitespace (or a text edge) in both texts takes those runs: it then
  * replaces whole whitespace-separated chunks. "seed [Z.1]" -> "seed [A.15] "
  * is "Z.1]" -> "A.15] " after alignment and keeps the old "[", which a
  * concurrent delete of "[Z.1]" takes along (sim seeds 961, 974); glued it is
- * "[Z.1]" -> "[A.15] ". "foo(bar)" -> "foo(baz)" stays "bar" -> "baz": the
- * chunk holds a word outside the edit. Each run is at most the larger side.
+ * "[Z.1]" -> "[A.15] ". "x=1;" -> "x=12;" stays "1" -> "12": the chunk holds
+ * a word outside the edit (bracket groups are widened later, wholeGroups).
+ * Each run is at most the larger side.
  */
 function glue(from: string, to: string, s: Span, lo: number, hi: number): void {
 	if (s.a0 === s.a1 || s.b0 === s.b1) return;
