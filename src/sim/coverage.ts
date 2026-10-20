@@ -41,7 +41,7 @@ const BRAKES: readonly string[] = ["mass-delete-local", "mass-delete-remote", "m
 /** Diagnostics codes that mark a semantic path (not every code the engine has). */
 const DIAGS: readonly string[] = [
 	"checkpoint-written", "checkpoint-conflict", "checkpoint-adopted", "checkpoint-adopted-behind", "checkpoint-retired", "checkpoint-held",
-	"checkpoint-refused", "checkpoint-failed", "doc-frozen", "frame-poisoned", "adopt-pending", "stream-resend", "causal-hole",
+	"checkpoint-refused", "checkpoint-failed", "doc-frozen", "frame-poisoned", "adopt-pending", "stream-resend", "causal-hole", "doc-thawed",
 	"live-overflow", "recovered-from-mirror", "epoch-mismatch", "gap-feed", "quarantine-retried", "blob-gc-swept", "frame-resealed",
 	"snap-fold",
 ];
