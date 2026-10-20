@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { VirtualClock } from "../../sim/clock";
 import { SimDevice } from "../../sim/device";
 import { SimNet } from "../../sim/net";
-import type { DocId, PathKey, RemoteBodyInfo, RemoteEntry, StreamName } from "../../core/types";
+import type { DocId, LocalEntry, PathKey, RemoteBodyInfo, RemoteEntry, StreamName } from "../../core/types";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
-import { bindTarget } from "./runtimeOps";
-import type { VaultRuntime } from "./vaultRuntime";
+import { bindTarget, type BindTargetRuntime } from "./runtimeOps";
+import type { SyncedRecord } from "../store/schema";
 
 function world(): { clock: VirtualClock; a: SimDevice; b: SimDevice } {
 	const clock = new VirtualClock();
@@ -72,7 +72,7 @@ test("bindTarget: a doc whose delete waits (fileGone) does not bind at its synce
 /**
  * bindTarget (DESIGN §d.2), create content: a view does not bind while the replica lacks the create's content.
  * `hasContent` also counts body rows the relay announced but this device has not applied, so it alone is not enough: sim seed 23
- * (src/sim/regressions/epoch-merged-alias-bind-empty.json) bound a view to a §c.5 merged alias whose synced record
+ * (BLOB_FAULTS, sim-pipeline) bound a view to a §c.5 merged alias whose synced record
  * restarts at the winner's create while the winner's frames were announced, not applied. The bind-time merge read
  * the empty replica against that base as a deletion, emptied the editor, and its save destroyed the note.
  */
@@ -87,10 +87,10 @@ function entry(body: Partial<RemoteBodyInfo>, createHash = "c".repeat(64)): Remo
 	};
 }
 
-function rt(e: RemoteEntry): VaultRuntime {
+function rt(e: RemoteEntry): BindTargetRuntime {
 	const view = { remote: new Map([[DOC, e]]), remoteByPathKey: new Map([[KEY, DOC]]) };
-	const ctx = { synced: () => undefined, local: new Map(), store: { synced: new Map() } };
-	return { port: { view: () => view }, rec: { ctx } } as unknown as VaultRuntime;
+	const ctx = { synced: () => undefined, local: new Map<PathKey, LocalEntry>(), store: { synced: new Map<DocId, SyncedRecord>() } };
+	return { port: { view: () => view }, rec: { ctx } };
 }
 
 const binds = (body: Partial<RemoteBodyInfo>, createHash?: string): boolean => bindTarget(rt(entry(body, createHash)), KEY) !== undefined;

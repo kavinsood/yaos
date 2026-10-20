@@ -19,6 +19,8 @@ import { encodeStateAsUpdate } from "../body/yjsCounters";
 import { docDeletesKey, pathBaseKey } from "./epochBases";
 import { KeyringRefusedError } from "../keyring/writeGate";
 import type { VaultRuntime } from "./vaultRuntime";
+import type { RemoteView } from "../reconcile/deps";
+import type { Ctx } from "../reconcile/context";
 
 export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number): Promise<EngineResultValue> {
 	const cls = rt.rec.ctx.classify(path, 0);
@@ -61,7 +63,13 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
  * Nor a doc whose delete is decided and waits on its own body records (`fileGone`), at its synced path: a file there
  * now is new, and the pass that creates its doc posts `bindable`. At the doc's remote path the file is its own.
  */
-export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefined {
+/** The part of the vault runtime bindTarget reads (bindTarget.test.ts builds one). */
+export interface BindTargetRuntime {
+	readonly port: { view(): Pick<RemoteView, "remote" | "remoteByPathKey"> };
+	readonly rec: { readonly ctx: Pick<Ctx, "synced" | "local"> & { readonly store: Pick<Ctx["store"], "synced"> } };
+}
+
+export function bindTarget(rt: BindTargetRuntime, key: PathKey): RemoteEntry | undefined {
 	const view = rt.port.view();
 	const id = view.remoteByPathKey.get(key);
 	const e = id ? view.remote.get(id) : undefined;
@@ -82,7 +90,7 @@ export function bindTarget(rt: VaultRuntime, key: PathKey): RemoteEntry | undefi
  * or checkpoint from another device was applied or this device produced a frame. Otherwise the bind-time merge would
  * see "" against a base at the create's content (a §c.5 merged alias restarts its synced record at the winner's
  * create) and empty the editor: sim seed 23, an epoch migration where concurrent re-creates merge before the
- * winner's frames arrive (src/sim/regressions/epoch-merged-alias-bind-empty.json).
+ * winner's frames arrive (bindTarget.test.ts).
  */
 function replicaHasCreate(b: NonNullable<RemoteEntry["body"]>): boolean {
 	if (!b.hasContent) return false;

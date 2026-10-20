@@ -62,7 +62,6 @@ import { checkNsInvariants } from "../core/ns/verify";
 import { pathKey } from "../core/paths/pathKey";
 import { MAX_NS_FRAME_BYTES, NS_DEDUPE_RING, TAIL_HARD_ROWS, TOMBSTONE_CAP } from "../core/limits";
 import { CFG_STREAM, NS_STREAM, SNAP_STREAM, type DeviceId, type StreamName, type VaultPath } from "../core/types";
-import type { Repo } from "../engine/store/repo";
 import type { SnapshotRecord, TailRecord } from "../engine/store/schema";
 import { gateRow } from "../engine/sync/ingestRow";
 import { NsRuntime } from "../engine/sync/nsRuntime";
@@ -571,8 +570,7 @@ type FoldRt = NsRuntime | CfgRuntime | SnapRuntime;
 const FOLD_STREAMS = [["ns", NS_STREAM], ["cfg", CFG_STREAM], ["snap", SNAP_STREAM]] as const;
 
 function newFold(cls: "ns" | "cfg" | "snap", repo: RowRepo, self: DeviceId): FoldRt {
-	const r = repo as unknown as Repo;
-	return cls === "ns" ? new NsRuntime(r, self) : cls === "cfg" ? new CfgRuntime(r, self) : new SnapRuntime(r, self);
+	return cls === "ns" ? new NsRuntime(repo, self) : cls === "cfg" ? new CfgRuntime(repo, self) : new SnapRuntime(repo, self);
 }
 
 /**
