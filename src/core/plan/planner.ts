@@ -597,6 +597,15 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		push(ops, "nsDelete", brakeKey("nsDelete", docId, s.path, s.contentHash), s.path);
 	};
 
+	/** A caught-up markdown / canvas body with content whose textHash is not known: not resident here. */
+	const unhashed = (r: RemoteEntry): boolean => r.kind !== "blob" && r.body !== null && r.body.caughtUp && r.body.hasContent && !ctx.remoteTextHash.has(r.docId);
+	/** Wait for `docId`'s text to be loaded and hashed (runner: wait "text-hash"); the winner is not planned meanwhile. */
+	const waitText = (docId: DocId, prefix: PlannerOp[], winner: DocId = docId): boolean => {
+		handled.add(winner);
+		push([...prefix, waitOp(docId, "text-hash")]);
+		return true;
+	};
+
 	const collapse = (s: SyncedEntry, r: RemoteEntry, l: LocalEntry, prefix: PlannerOp[]): boolean => {
 		const winner = input.remoteByPathKey.get(s.pathKey);
 		if (winner === undefined || winner === s.docId || input.synced.has(winner) || handled.has(winner)) return false;
@@ -607,17 +616,19 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		// §c.12: devices re-creating the vault after an epoch reset race on every path. A differing loser at a
 		// path with an old-epoch base merges into the winner (3-way against that base) instead of a loser rename.
 		const migrated = !identical && s.kind !== "blob" && ctx.pathBaseKeys.has(s.pathKey);
-		if (!identical && !migrated) return false;
+		// A caught-up text whose hash is unknown here is not resident (a restart since): load it and decide on the
+		// next pass, instead of a loser rename for want of it (a duplicate; sim suite-1 seed 65).
+		if (!identical && !migrated) return wh === null && unhashed(w) ? waitText(winner, prefix) : false;
 		// The loser must still hold just what this device synced: once another device wrote to it (it materialized
 		// the loser under its suffixed name and edited it there), its nsDelete would drop that edit with it. It is a
-		// doc of its own then, and keeps the loser rename, as it does when its text cannot be read here to tell
-		// (caught up but not resident: no textHash).
+		// doc of its own then, and keeps the loser rename.
 		if (r.body && !r.body.caughtUp) {
 			handled.add(winner);
 			push([...prefix, waitOp(s.docId, "body-not-caught-up")]);
 			return true;
 		}
 		const lh = remoteHash(r);
+		if (lh === null && unhashed(r)) return waitText(s.docId, prefix, winner);
 		if (lh === null || lh !== s.contentHash) return false;
 		handled.add(winner);
 		if (migrated && (!w.body?.caughtUp || (!w.body.hasContent && w.createHash !== EMPTY_CONTENT_HASH))) {

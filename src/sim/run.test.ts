@@ -102,6 +102,23 @@ test("sim: a stale snap row last in the stream is covered by every snap fold (su
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Suite-1 seed 65 (3 devices): A's own re-create of canvas/c0 lost the path race after an epoch reset. A crashed
+// before the collapse merged it into the winner: the old epoch's bases lived in memory only, and the restarted
+// planner did not have the loser's text hash (not resident), so the loser took a rename and stayed as
+// "c0 (2).canvas". The bases are stored in the new DB and the collapse loads a text it cannot hash yet.
+// (att/a1 (2).png is older: two different attachments created at one path before the reset.)
+test("sim: a migrated re-create still merges into the winner after a crash (suite-1 seed 65)", async () => {
+	let suffixed: string[] = [];
+	const r = await runSim({
+		seed: 65, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1",
+		observe: (label, devs) => {
+			if (label === "end") suffixed = devs.flatMap((d) => [...d.vault.snapshot().keys()].filter((p) => / \(\d+\)\.canvas$/.test(p)).map((p) => `${d.name}: ${p}`));
+		},
+	});
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+	assert.deepEqual(suffixed, []);
+});
+
 // Suite-1 seed 217 (3 devices): A moved node a-1n0 on disk while a-1n1, the next line of the merge text, changed on
 // both sides. The line diff3 joined the two lines into one conflicting hunk and kept the CRDT's a-1n0: the move lived
 // only in the conflict copy, which a user deleted. The canvas merge resolves record by record.

@@ -621,9 +621,12 @@ changes.
   - performs no disk op.
   - This removes the residual conflict copies of concurrent onboarding.
 - **Collapse conditions.** These apply to the identical-loser collapse and to the migrated loser (§c.12).
-  - The loser's remote text must still be what this device synced: caught up, and readable here (resident). A loser
+  - The loser's remote text must still be what this device synced: caught up, with its text hash known here. A loser
     another device has written to (it materialized the loser under its suffixed name and edited it) is a doc of its
     own: deleting it would drop that edit, so it keeps the loser rename. A loser that is not caught up waits.
+  - A caught-up text whose hash is not known (not resident, as after a restart), the loser's or the winner's when the
+    identical test needs it, is loaded first (`wait{text-hash}`: the runner acquires the replica and hashes it) and
+    the next pass decides. A loser rename for want of the hash would leave a duplicate.
   - The loser's own create frames must be acked. Otherwise the delete's base would sit below them, and the restore
     duty (§c.7) would bring the loser back under a suffixed name. The collapse waits, as a user delete does.
 - **Merged.** A `rebind(loser → winner)` follows. Held initial body frames of the loser are dropped (§e.2).

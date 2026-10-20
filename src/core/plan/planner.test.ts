@@ -727,8 +727,24 @@ test("§c.12 migrated-loser merge: a differing loser at a path with an old-epoch
 	// The loser must be caught up (its text is checked to be just what this device synced) ...
 	const behind = { ...sc, remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md", { body: { ...R("d4", "Inbox/x (2).md").body!, caughtUp: false } })] };
 	assert.deepEqual(planWith(input(behind), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) }).ops, [{ op: "wait", docId: "d4", reason: "body-not-caught-up" }]);
-	// ... and its text readable here (resident): otherwise the loser rename, which loses nothing.
-	assert.deepEqual(opsOf(planWith(input(sc), { remoteTextHash: new Map([[id("d3"), h("W")]]), pathBaseKeys: new Set([pk("Inbox/x.md")]) })), ["diskRename", "diskMaterialize", "syncedPut"]);
+	// ... and its text known here. Not resident (a restart since): load it first, not a loser rename that leaves a
+	// duplicate behind (sim suite-1 seed 65).
+	assert.deepEqual(planWith(input(sc), { remoteTextHash: new Map([[id("d3"), h("W")]]), pathBaseKeys: new Set([pk("Inbox/x.md")]) }).ops, [{ op: "wait", docId: "d4", reason: "text-hash" }]);
+});
+
+test("re-create collapse loads a winner whose text is not resident before it decides identical or not", () => {
+	// No path base: only an identical loser collapses, and that needs the winner's text hash.
+	const sc = {
+		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
+		synced: [S("d4", "Inbox/x.md", { contentHash: h("X"), nsTouchSeq: 0 })],
+		local: [L("Inbox/x.md", h("X"))],
+	};
+	assert.deepEqual(planWith(input(sc), { remoteTextHash: new Map([[id("d4"), h("X")]]) }).ops, [{ op: "wait", docId: "d3", reason: "text-hash" }]);
+	// Known and different: the loser rename.
+	assert.deepEqual(opsOf(planWith(input(sc), { remoteTextHash: new Map([[id("d3"), h("W")], [id("d4"), h("X")]]) })), ["diskRename", "diskMaterialize", "syncedPut"]);
+	// A winner with no content yet has its create hash: nothing to load.
+	const empty = { ...sc, remote: [R("d3", "Inbox/x.md", { body: { ...R("d3", "Inbox/x.md").body!, hasContent: false } }), R("d4", "Inbox/x (2).md")] };
+	assert.notDeepEqual(planWith(input(empty), { remoteTextHash: new Map([[id("d4"), h("X")]]) }).ops, [{ op: "wait", docId: "d3", reason: "text-hash" }]);
 });
 
 test("re-create collapse leaves a loser another device wrote to: its nsDelete would drop that edit (sim seed 581)", () => {

@@ -178,7 +178,8 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		}
 		const op = ops[i]!;
 		if (op.op === "wait") {
-			waits++;
+			if (op.reason === "text-hash" && !stopping()) note(op, await loadText(env, op.docId));
+			else waits++;
 			continue;
 		}
 		if (op.op === "needHash") {
@@ -197,6 +198,22 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 	env.deferred.clear();
 	await removeEmptied(env, vacated);
 	return report();
+}
+
+/**
+ * wait "text-hash": load the doc's replica (it stays resident after the release, until evicted) and take its textHash,
+ * so the next plan reads it (planner collapse). "ok" once the hash is known: the pass is productive and a follow-up
+ * pass runs; "fail" when it cannot be had (no body stream, a canvas that does not project).
+ */
+async function loadText(env: Env, docId: DocId): Promise<JobOutcome> {
+	const { ctx } = env;
+	const r = ctx.log.view().remote.get(docId);
+	if (!r || r.kind === "blob") return "fail";
+	const h = await ctx.log.acquireBody(docId, r.kind);
+	if (!h) return "fail";
+	h.release();
+	await ctx.log.warmTextHashes();
+	return ctx.log.view().textHash.has(docId) ? "ok" : "fail";
 }
 
 /** S for a markdown / canvas doc about to be created: the empty body, stat of the local file. */
