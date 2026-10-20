@@ -45,7 +45,7 @@ function holePair(): [Uint8Array, Uint8Array] {
 }
 
 async function frozenByHole(relay: SimRelay) {
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { causalRetryMs: 40, causalRetries: 2 } });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { causalRetryMs: 40, causalRetries: 2, provisionalAdoptMs: 40 } });
 	const x = await rawDevice(relay);
 	await until(() => a.status().phase === "live", 3_000, "live");
 	const id = await createDoc(a, "hole.md", "doc;");
