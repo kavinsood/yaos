@@ -9,6 +9,7 @@ import { concatBytes } from "../../core/codec/lib0";
 import type { Seq, VaultEpoch } from "../../core/types";
 import type { BlobPort, BlobProgress } from "../../ports/blob";
 import type { BlobAddress, SealedBlobParts } from "../../ports/crypto";
+import type { ClockPort } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
 import { DEVICE_CHECK_QUICK_BYTES } from "../../protocol/messages";
 import type { DeviceCheckReport, DeviceEnv } from "../../protocol/status";
@@ -175,7 +176,13 @@ test("relay socket: not connected and a pong that never comes all fail the step"
 	assert.equal(off.get("relay-http")!.status, "fail");
 	// The ping's deadline on a clock whose long timers fire at once.
 	const clock = createWebClock();
-	const fast = { ...clock, setTimer: (ms: number, fn: () => void) => clock.setTimer(ms >= 15_000 ? 0 : ms, fn) };
+	const fast: ClockPort = {
+		now: () => clock.now(),
+		monotonic: () => clock.monotonic(),
+		setTimer: (ms, fn) => clock.setTimer(ms >= 15_000 ? 0 : ms, fn),
+		clearTimer: (h) => clock.clearTimer(h),
+		yieldNow: () => clock.yieldNow(),
+	};
 	const silent = byId(await runDeviceCheck("quick", deps({ live: { session: () => session({ ping: () => new Promise(() => undefined) }) }, over: { clock: fast } })));
 	assert.equal(silent.get("relay-socket")!.status, "fail");
 	assert.equal(silent.get("relay-socket")!.detail, "no pong within 15 s");

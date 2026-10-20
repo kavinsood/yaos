@@ -19,6 +19,7 @@ import type { DiskOp, DiskReadRequest, DiskReadResult, Lane } from "../../src/pr
 import type { DiskGateway, ExecResult } from "../../src/engine/reconcile/deps";
 import { SnapshotJob, type SnapshotDeps } from "../../src/engine/snapshots/snapshotJob";
 import { createWebClock } from "../../src/engine/adapters/webClock";
+import type { ClockPort } from "../../src/ports/clock";
 import { createNoopCrypto } from "../../src/engine/adapters/noopCrypto";
 import { createWebHash } from "../../src/engine/adapters/webHash";
 
@@ -87,8 +88,10 @@ const files = [...vault.entries()].map(([path, b]) => ({ path: path as VaultPath
 const settings = { enabled: true, keepDaily: 7, uploadToBlobStore: false };
 let now = Date.UTC(2026, 9, 7);
 const hash = createWebHash();
+const web = createWebClock();
+const fixedNow: ClockPort = { now: () => now, monotonic: () => web.monotonic(), setTimer: (ms, fn) => web.setTimer(ms, fn), clearTimer: (h) => web.clearTimer(h), yieldNow: () => web.yieldNow() };
 const deps: SnapshotDeps = {
-	disk: gateway, side, clock: { ...createWebClock(), now: () => now }, files: () => files, settings: () => settings,
+	disk: gateway, side, clock: fixedNow, files: () => files, settings: () => settings,
 	crypto: createNoopCrypto(hash), hash, remote: null, deviceLabel: "bench",
 };
 const job = new SnapshotJob(deps);

@@ -18,7 +18,8 @@ import { decodeBodyUpdateRef } from "../../core/codec/contents";
 import { snapshotId, SnapOpTag, type SnapRecord } from "../../core/snap/record";
 import { KEYRING_STREAM, NS_STREAM, SNAP_STREAM, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsOp, type StreamName, type VaultId, type VaultPath } from "../../core/types";
 import type { ClockPort } from "../../ports/clock";
-import type { BlobAddress, CryptoPort } from "../../ports/crypto";
+import type { BlobAddress, CryptoPort, KeyringCrypto } from "../../ports/crypto";
+import { keyringCryptoOf } from "../keyring/writeGate";
 import type { RelaySession } from "../../ports/relay";
 import { SimBlobStore } from "../../sim/blobStore";
 import { SeededRandom } from "../../sim/random";
@@ -61,7 +62,13 @@ class World {
 		const storage = testStorage();
 		const base = createWebClock();
 		const offset = o.offset ?? { ms: 0 };
-		const clock: ClockPort = { ...base, now: () => base.now() + offset.ms };
+		const clock: ClockPort = {
+			now: () => base.now() + offset.ms,
+			monotonic: () => base.monotonic(),
+			setTimer: (ms, fn) => base.setTimer(ms, fn),
+			clearTimer: (h) => base.clearTimer(h),
+			yieldNow: () => base.yieldNow(),
+		};
 		const local = new Map<ContentHash, Uint8Array>();
 		this.local.set(deviceId, local);
 		const crypto = o.crypto ?? createNoopCrypto(createWebHash());
@@ -228,7 +235,27 @@ test("GC preconditions: each refusal deletes nothing", async (t) => {
 			// The keyring verifies K_1 against the genesis (the gate opens); the port then reports it unconfirmed.
 			const p = await w.suite1(5);
 			let confirmed = true;
-			const crypto: CryptoPort = { ...p.crypto, keyState: (e) => ({ held: p.crypto.keyState(e).held, verified: confirmed && p.crypto.keyState(e).verified }) };
+			const inner = keyringCryptoOf(p.crypto)!;
+			const crypto: CryptoPort & KeyringCrypto = {
+				suite: inner.suite,
+				sealEpoch: () => inner.sealEpoch(),
+				keyState: (e) => ({ held: inner.keyState(e).held, verified: confirmed && inner.keyState(e).verified }),
+				seal: (x) => inner.seal(x),
+				open: (x) => inner.open(x),
+				sealBlob: (x) => inner.sealBlob(x),
+				openBlob: (x) => inner.openBlob(x),
+				blobAddress: (h) => inner.blobAddress(h),
+				diagHash: (b) => inner.diagHash(b),
+				generate: (e) => inner.generate(e),
+				install: (e, raw) => inner.install(e, raw),
+				kcv: (e) => inner.kcv(e),
+				wrap: (role, e, aad, rk) => inner.wrap(role, e, aad, rk),
+				unwrap: (role, e, aad, wrapped, rk) => inner.unwrap(role, e, aad, wrapped, rk),
+				markVerified: (e) => inner.markVerified(e),
+				setSealEpoch: (e) => inner.setSealEpoch(e),
+				drop: (e) => inner.drop(e),
+				exportForHost: () => inner.exportForHost(),
+			};
 			const a = await w.device(A, { ...p, crypto });
 			confirmed = false;
 			garbageOnly(w);

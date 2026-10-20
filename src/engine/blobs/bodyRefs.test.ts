@@ -167,7 +167,17 @@ test("scanBodyRefs: a row this reader cannot open for reader-dependent reasons r
 	relay.stream(B1).rows[1] = { ...relay.stream(B1).rows[1]!, payload: new Uint8Array([9, 9, 9]) };
 	assert.deepEqual(await scanBodyRefs(relay.deps(), [B1]), { ok: false, stream: B1, seq: 2, reason: "unsupported-version" });
 
-	const locked: CryptoPort = { ...crypto, open: async () => ({ ok: false, reason: "unknown-key" }) };
+	const locked: CryptoPort = {
+		suite: crypto.suite,
+		sealEpoch: () => crypto.sealEpoch(),
+		keyState: (e) => crypto.keyState(e),
+		seal: (x) => crypto.seal(x),
+		open: async () => ({ ok: false, reason: "unknown-key" }),
+		sealBlob: (x) => crypto.sealBlob(x),
+		openBlob: (x) => crypto.openBlob(x),
+		blobAddress: (h) => crypto.blobAddress(h),
+		diagHash: (b) => crypto.diagHash(b),
+	};
 	const refused = await scanBodyRefs(relay.deps({ crypto: locked }), [B2, B1]);
 	assert.deepEqual(refused, { ok: false, stream: B1, seq: 1, reason: "unknown-key" });
 });
@@ -203,7 +213,11 @@ test("scanBodyRefs: the sweep's stop ends a read the relay never answers (the st
 	const ctrl = new AbortController();
 	let reads = 0;
 	const deps = relay.deps({ signal: ctrl.signal });
-	const hung: BodyRefScanDeps = { ...deps, session: { ...deps.session, readBatch: () => (reads++, new Promise<readonly ReadPage[]>(() => undefined)) } };
+	const session: BodyRefScanDeps["session"] = {
+		get limits() { return deps.session.limits; },
+		readBatch: () => (reads++, new Promise<readonly ReadPage[]>(() => undefined)),
+	};
+	const hung: BodyRefScanDeps = { ...deps, session };
 	let out: unknown = "pending";
 	scanBodyRefs(hung, [B1]).then((v) => (out = v), (e: unknown) => (out = e));
 	const settled = (): unknown => out;

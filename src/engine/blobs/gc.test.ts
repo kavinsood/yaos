@@ -412,7 +412,7 @@ test("HTTP adapter: list and delete retry 429 / 503 list_incomplete after Retry-
 	const store = createHttpBlob({
 		baseUrl: "https://r.example", vaultId: "v1", credential: "tok", fetch: f.fetch, xhr: routedXhr(route, f.requests), idleMs: NEVER,
 		clock: {
-			...clock, now: () => clock.now(), monotonic: () => 0, yieldNow: async () => undefined, clearTimer: () => undefined,
+			now: () => clock.now(), monotonic: () => 0, yieldNow: async () => undefined, clearTimer: () => undefined,
 			setTimer: (ms, fn) => {
 				if (ms === NEVER || ms >= RELAY_HTTP_BASE_MS) return 0;
 				waits.push(ms);

@@ -481,7 +481,13 @@ function controllerWorld(clock: VirtualClock, net: SimNet, initial: YaosPluginDa
 	let inner: ((c: UserCommand) => Promise<unknown>) | null = null;
 	const ctl = new YaosController(initial, {
 		makeRuntime: (identity, settings, ui, keys) => {
-			const sink: HostUiSink = { ...ui, onStatus: (s) => (statuses.push(s), ui.onStatus(s)) };
+			const sink: HostUiSink = {
+				onStatus: (s) => (statuses.push(s), ui.onStatus(s)),
+				onBrake: (r) => ui.onBrake(r),
+				onNotice: (level, code, message) => ui.onNotice(level, code, message),
+				onCarrier: (info) => ui.onCarrier(info),
+				onFatal: (e) => ui.onFatal(e),
+			};
 			const rt = dev.runtimeFor(identity, settings, sink, keys);
 			const raw = rt.command.bind(rt);
 			inner = raw;

@@ -19,7 +19,7 @@ import { EditorState, Transaction, type ChangeSpec } from "@codemirror/state";
 import * as Y from "yjs";
 import type { DocId, VaultPath } from "../../src/core/types";
 import { MAIN_UPDATE_COALESCE_MS } from "../../src/core/limits";
-import { BindingManager } from "../../src/host/binding";
+import { BindingManager, type BindingLink } from "../../src/host/binding";
 import type { ClockPort } from "../../src/ports/clock";
 import type { EditorBinding, EditorBindingSpec, EditorViewRef, WorkspacePort } from "../../src/ports/workspace";
 import { TEXT_CHUNK_UNITS, encodeUtf16 } from "../../src/protocol/utf16";
@@ -241,10 +241,13 @@ async function after(note: string) {
 	};
 	const clockT: ClockPort = { now: () => clock.now(), monotonic: () => clock.monotonic(), setTimer: (ms, fn) => clock.setTimer(ms, timed(fn)),
 		clearTimer: (h) => clock.clearTimer(h), yieldNow: () => clock.yieldNow() };
-	const link = { ...engine.link, post: (m: Parameters<typeof engine.link.post>[0]) => {
-		structuredClone(m);
-		engine.link.post(m);
-	} };
+	const link: BindingLink = {
+		post: (m) => {
+			structuredClone(m);
+			engine.link.post(m);
+		},
+		openDoc: (path, viewId) => engine.link.openDoc(path, viewId),
+	};
 	const view = new BenchView(EditorState.create({ doc: note }));
 	const ws: WorkspacePort = { listMarkdownViews: () => [view], onViewEvent: () => () => undefined };
 	const bm = new BindingManager({ workspace: ws, vault: { caseInsensitive: false }, clock: clockT, link, notice: () => undefined });
