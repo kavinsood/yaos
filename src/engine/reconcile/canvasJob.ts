@@ -33,6 +33,7 @@ import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writ
 import type { BodyHandle } from "./deps";
 import { writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
+import { applyOldDeletes } from "./oldDeletes";
 import { hashBase } from "./store";
 
 function invalid(env: Env, docId: DocId, path: VaultPath, reason: string, onceKey: string): JobOutcome {
@@ -167,6 +168,7 @@ export async function diskMaterializeCanvas(env: Env, op: MaterializeOp): Promis
 	const h = await env.ctx.log.acquireBody(op.docId, "canvas");
 	if (!h) return "fail";
 	try {
+		await applyOldDeletes(env, op.docId, h);
 		return await materializeCanvas(env, op, h);
 	} finally {
 		h.release();

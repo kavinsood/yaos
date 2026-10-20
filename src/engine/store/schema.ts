@@ -22,7 +22,7 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
  * 2: dropped the unused streams byStalePriority / byAccess, synced byPathKey and blobQueue byActiveDue indexes
  * and the fields only they read; dropped the outbox "sent" state, attempts and lastSentAtMs (T_sent).
  * Not bumped for a new meta key family whose absence reads as before (blobPut:, frameNoFloor, pathBase:,
- * keyringRecords): an older reader never looks the keys up, and a DB without them behaves as it did. A bump would
+ * keyringRecords, docDeletes:): an older reader never looks the keys up, and a DB without them behaves as it did. A bump would
  * delete and rebuild every DB.
  */
 export const DB_SCHEMA_VERSION = 2;
@@ -116,15 +116,24 @@ export interface MetaPathBase {
 	readonly deflated: Uint8Array;
 	readonly chars: number;
 	/**
-	 * Canvas only: the record keys ("n:<id>" / "e:<id>") deleted in the old doc, so a new epoch that holds them again
-	 * (a restore from before the delete) has them deleted again (canvasMerge.withEpochDeletes). Absent = none.
+	 * Canvas only: the record keys ("n:<id>" / "e:<id>") deleted in the old doc, so a new epoch whose canvas at the
+	 * path holds them again (a peer's re-create after a reset) has them deleted again (canvasMerge.withEpochDeletes).
+	 * Absent = none.
 	 */
 	readonly deleted?: readonly string[];
-	/**
-	 * Markdown only: the old doc's delete set (a Yjs update with no structs) and its docId, so a restore that brought
-	 * back text deleted after the restore point has it deleted again (contentSteps.withTextDeletes). Absent = none.
-	 */
-	readonly textDeletes?: { readonly docId: DocId; readonly update: Uint8Array };
+}
+/**
+ * What an old epoch's doc deleted (DESIGN §c.12 "Deletes"), by its docId: a restore keeps doc and item ids, so the
+ * new epoch's doc of that id gets the deletes again before this device first merges or writes it, wherever it is
+ * now (a rename may have been dropped with the old outbox, or another device's rename restored). Canvas: the record
+ * keys; markdown: the delete set (a Yjs update with no structs). Stored with the new DB's identity; dropped once
+ * applied, once the doc has a synced record, or when the new epoch has no live doc of that id.
+ */
+export interface MetaDocDeletes {
+	readonly key: `docDeletes:${string}`;
+	readonly kind: "markdown" | "canvas";
+	readonly keys?: readonly string[];
+	readonly update?: Uint8Array;
 }
 /**
  * The keyring's records as SecretStorage holds them (e2ee-design §6.1): the winners, then the revokes held open.
@@ -138,7 +147,7 @@ export interface MetaKeyringRecords {
 	readonly winners: readonly Uint8Array[];
 	readonly open: readonly Uint8Array[];
 }
-export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords;
+export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------

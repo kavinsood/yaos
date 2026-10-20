@@ -38,15 +38,18 @@ test("sim: a canvas re-created across an epoch migration merges into the winner,
 	assert.deepEqual(dups, []);
 });
 
-// Suite-1 seeds 103 (4 devices) and 19 (2 devices, fault-heavy): a node / edge deleted just before an epoch restore,
-// or on the epoch the relay had already left, came back after the migration: the restored state still held it and
-// the merge against the old epoch's base read it as added there. The migration now carries the old doc's deleted
-// record keys (DESIGN §c.12 "Deletes"), and the delete rule no longer exempts deletes an epoch restore overtook.
-test("sim: a canvas delete overtaken by an epoch restore stays deleted (suite-1 seeds 103, 19)", async () => {
+// Suite-1 seeds 103 (4 devices), 19 and 164 (2 devices, fault-heavy): a node / edge deleted just before an epoch
+// restore, or on the epoch the relay had already left, came back after the migration: the restored state still held
+// it and the merge against the old epoch's base read it as added there. In 164 the deleting device had also renamed
+// the canvas, and the restore brought it back at its old path. The migration now carries what each old doc deleted,
+// by doc and by path (DESIGN §c.12 "Deletes"), and the delete rule no longer exempts deletes a restore overtook.
+test("sim: a canvas delete overtaken by an epoch restore stays deleted (suite-1 seeds 103, 19, 164)", async () => {
 	const a = await runSim({ seed: 103, devices: 4, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
 	assert.deepEqual(a.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 	const b = await runSim({ seed: 19, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
 	assert.deepEqual(b.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+	const c = await runSim({ seed: 164, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+	assert.deepEqual(c.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
 // Seed 581 (3 devices): B's own re-create of c3 lost the race after an epoch reset and waited to merge into the winner;

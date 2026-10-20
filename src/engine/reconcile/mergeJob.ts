@@ -34,10 +34,11 @@ import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
 import { isShrinkingOverwrite } from "../../core/plan/brake";
 import type { IntentRecord } from "../store/schema";
 import { mergeCanvas } from "./canvasJob";
-import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, withTextDeletes, writeConflictCopy, type ReconcileOp } from "./contentSteps";
+import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writeConflictCopy, type ReconcileOp } from "./contentSteps";
 import type { BodyHandle } from "./deps";
 import { writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
+import { applyOldDeletes } from "./oldDeletes";
 import { makeBase } from "./store";
 
 export { MAX_CAS_ATTEMPTS } from "./contentSteps";
@@ -55,6 +56,7 @@ export async function reconcileContent(env: Env, op: ReconcileOp): Promise<JobOu
 	const h = await ctx.log.acquireBody(op.docId, op.kind);
 	if (!h) return "fail";
 	try {
+		await applyOldDeletes(env, op.docId, h);
 		return op.kind === "canvas" ? await mergeCanvas(env, op, h) : await mergeMarkdown(env, op, h);
 	} finally {
 		h.release();
@@ -83,8 +85,6 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	// §c.12: the old epoch's base at the path, only while the new epoch's text still contains it (trustedEpochBase):
 	// a base ahead of the new epoch would read as deletions.
 	const epochBase = epochBaseOf(env, op, s);
-	// A restore kept the old doc: its deletes since the restore point are carried (withTextDeletes).
-	const textDeletes = epochBase === null ? null : ctx.deps.pathTextDeletes?.(ctx.pk(op.path)) ?? null;
 	const storedBase = !op.pathBase && !op.noBase && op.hasBase && s?.hasBase ? await ctx.store.loadBase(docId) : null;
 	// The synced-side fallback below needs a record describing this doc's last sync (not a rebound loser's, nor
 	// another file's: op.noBase).
@@ -105,8 +105,7 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 		crdt0 = ytext.toString();
 		// No stored base (mirror recovery, too large to keep, a merged alias restarted at the winner's create): a side
 		// still at the synced content is the base, so a one-sided change applies as one instead of a no-base conflict copy.
-		const trusted = trustedEpochBase(epochBase, crdt0);
-		const base = savedByEditor ? D : storedBase ?? (trusted !== null && textDeletes?.docId === docId ? withTextDeletes(trusted, ytext, textDeletes.ds) : trusted)
+		const base = savedByEditor ? D : storedBase ?? trustedEpochBase(epochBase, crdt0)
 			?? (crdt0 === "" ? "" : !fallback ? null : diskHash === fallback.contentHash ? D : (await markdownContentHash(port, crdt0)) === fallback.contentHash ? crdt0 : null);
 		await ctx.deps.clock.yieldNow();
 		const res = merge({ base, disk: D, crdt: crdt0, limits: ctx.mergeLimits });

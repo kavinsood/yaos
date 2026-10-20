@@ -33,7 +33,7 @@ import type { DiskSchema } from "../reconcile/store";
 import { LogEngine } from "../runtime/engine";
 import type { EngineTuning } from "../runtime/options";
 import type { FrameNoFloor } from "../store/repo";
-import type { MetaPathBase } from "../store/schema";
+import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
 import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
 import { listLocal, partName } from "../snapshots/localStore";
 import { SnapshotJob } from "../snapshots/snapshotJob";
@@ -85,6 +85,8 @@ export interface VaultRuntimeStart {
 	readonly onDiag?: (event: DiagnosticsEvent) => void;
 	/** Path-keyed bases carried over an epoch migration (§c.12 step 3), stored in the new DB (epochBases.ts). */
 	readonly pathBases?: readonly MetaPathBase[] | null;
+	/** The old epoch's docs' deletes by docId (§c.12 "Deletes"), stored in the new DB (epochBases.ts). */
+	readonly docDeletes?: readonly MetaDocDeletes[] | null;
 	/** Highest own ns / cfg frameNo of the old epoch (§c.12 step 3, e2ee-design §8.2). */
 	readonly frameNoFloor?: FrameNoFloor | null;
 }
@@ -161,7 +163,7 @@ export class VaultRuntime {
 		const { engine, config } = o;
 		const log = await LogEngine.start({
 			ports: o.ports, vaultId: config.vaultId, deviceId: config.deviceId, deviceClass: config.deviceClass,
-			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, frameNoFloor: o.frameNoFloor ?? null, pathBases: o.pathBases ?? null,
+			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, frameNoFloor: o.frameNoFloor ?? null, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,
 			onBoundText: (docId, changes, length, origin) => engine.bound.onText(docId, changes, length, origin),
 			onFrameTaken: (docId) => engine.bound.frameTaken(docId),
@@ -250,7 +252,8 @@ export class VaultRuntime {
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, hash: ports.hash, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
 			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into),
-			pathBase: (k: PathKey) => bases.get(k), pathBaseKeys: bases.keys, pathDeleted: (k: PathKey) => bases.deleted(k), pathTextDeletes: (k: PathKey) => bases.textDeletes(k),
+			pathBase: (k: PathKey) => bases.get(k), pathBaseKeys: bases.keys, pathDeleted: (k: PathKey) => bases.deleted(k),
+			docDeletes: (d) => bases.docDeletes(d), docDeletesApplied: (d) => bases.applied(d),
 			boundSavedText: (docId, text) => {
 				const b = o.engine.bound.get(docId);
 				return b !== undefined && (text === b.diskText || b.candidates.includes(text));

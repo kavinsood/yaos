@@ -15,6 +15,7 @@ import type { VaultStat } from "../../ports/vault";
 import type { Ctx } from "./context";
 import type { ExecResult, WrittenOk } from "./deps";
 import type { Scanner } from "./scan";
+import { applyOldDeletes } from "./oldDeletes";
 import { makeBase } from "./store";
 
 /**
@@ -140,6 +141,7 @@ export async function diskMaterialize(env: Env, op: Op<"diskMaterialize">): Prom
 	const h = await ctx.log.acquireBody(op.docId, "markdown");
 	if (!h) return "fail";
 	try {
+		await applyOldDeletes(env, op.docId, h);
 		const text = h.doc.getText("text").toString();
 		const version = h.version();
 		// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.

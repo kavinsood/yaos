@@ -10,7 +10,7 @@ import type {
 import { DEFAULT_BRAKE, type BrakeWindow, type DestructiveKind } from "../../core/plan/brake";
 import { conflictCopyNotice } from "../../core/plan/conflictName";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
-import type { TextDeletes } from "./contentSteps";
+import type { OldDocDeletes } from "./oldDeletes";
 import { standInPathKey } from "../../core/plan/pathRules";
 import type { ClockPort } from "../../ports/clock";
 import type { HashPort } from "../../ports/crypto";
@@ -115,11 +115,12 @@ export interface ReconcilerDeps {
 	 */
 	readonly pathDeleted?: (key: PathKey) => ReadonlySet<string> | null;
 	/**
-	 * The delete set of the previous epoch's markdown doc at this path, with its docId (§c.12): when the new epoch
-	 * holds that same doc (a restore keeps doc and item ids), its items in the set are text deleted before the
-	 * restore, not added after it (contentSteps.withTextDeletes). null = none.
+	 * What the previous epoch's doc of this id deleted (§c.12): a restore keeps doc ids, and the restored state may
+	 * predate the deletes. contentSteps.applyOldDeletes makes them again before the doc's first merge or write here,
+	 * then calls `docDeletesApplied`. null = nothing (left).
 	 */
-	readonly pathTextDeletes?: (key: PathKey) => TextDeletes | null;
+	readonly docDeletes?: (docId: DocId) => OldDocDeletes | null;
+	readonly docDeletesApplied?: (docId: DocId) => Promise<void>;
 	/**
 	 * A bound doc's replica already holds `text` (canonical): a save of one of its editors read it, or it is the
 	 * last disk text the replica absorbed (boundDisk). Such a disk side is not an edit: the merge base is the text.

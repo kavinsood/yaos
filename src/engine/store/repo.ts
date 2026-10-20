@@ -19,7 +19,7 @@ import { CursorTracker } from "../sync/cursor";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
-	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
+	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaDocDeletes, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
 	type SnapshotRecord, type StreamRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
@@ -200,7 +200,10 @@ export class Repo {
 	 */
 	static async open(
 		storage: StoragePort, id: RepoIdentity, nowMs: number,
-		opts: { recoveredFromMirror?: boolean; frameNoFloor?: FrameNoFloor | null; pathBases?: readonly MetaPathBase[] | null } = {},
+		opts: {
+			recoveredFromMirror?: boolean; frameNoFloor?: FrameNoFloor | null;
+			pathBases?: readonly MetaPathBase[] | null; docDeletes?: readonly MetaDocDeletes[] | null;
+		} = {},
 	): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
 		const db = await storage.open<YS>(dbName(id.vaultId, id.vaultEpoch, id.deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
 		const res = await db.tx([STORE.meta], "readwrite", async (tx) => {
@@ -213,6 +216,7 @@ export class Repo {
 				const order = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
 				if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
 				if (opts.pathBases) await addPathBases(tx, opts.pathBases);
+				if (opts.docDeletes) await addPathBases(tx, opts.docDeletes);
 				return { outcome: { t: "existing", identity: ident } as OpenOutcome, ident, cursor, next: order.next };
 			}
 			const fresh: MetaIdentity = {
@@ -225,6 +229,7 @@ export class Repo {
 			tx.put(STORE.meta, { key: "outboxOrder", next: 1 });
 			if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
 			if (opts.pathBases) await addPathBases(tx, opts.pathBases);
+			if (opts.docDeletes) await addPathBases(tx, opts.docDeletes);
 			return { outcome: { t: "fresh" } as OpenOutcome, ident: fresh, cursor, next: 1 };
 		});
 		if (res.outcome.t === "mismatch" || res.cursor === null) return { repo: null, outcome: res.outcome, db };
@@ -338,10 +343,17 @@ export class Repo {
 			return all.filter((r): r is MetaPathBase => r.key.startsWith("pathBase:") && "deflated" in r);
 		});
 	}
-	dropPathBases(keys: readonly MetaPathBase["key"][]): Promise<void> {
+	dropPathBases(keys: readonly (MetaPathBase["key"] | MetaDocDeletes["key"])[]): Promise<void> {
 		return this.serial("dropPathBases", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
 			for (const k of keys) tx.delete(STORE.meta, k);
 		}));
+	}
+	/** Every stored old doc's deletes (MetaDocDeletes, DESIGN §c.12). Dropped with dropPathBases. */
+	docDeletes(): Promise<MetaDocDeletes[]> {
+		return this.db.tx([STORE.meta], "readonly", async (tx) => {
+			const all = await tx.getAll(STORE.meta, { lower: "docDeletes:", upper: "docDeletes;", upperOpen: true });
+			return all.filter((r): r is MetaDocDeletes => r.key.startsWith("docDeletes:") && "kind" in r);
+		});
 	}
 
 	// -------------------------------------------------------------------------
@@ -836,7 +848,7 @@ function stateOrderRange(state: OutboxState): KeyRange {
  * The migration's path bases (MetaPathBase), each kept if one is already there: a migration repeated over an existing
  * new-epoch DB (the old DB not retired yet) neither replaces nor revives anything but a missing base.
  */
-async function addPathBases(tx: Tx, bases: readonly MetaPathBase[]): Promise<void> {
+async function addPathBases(tx: Tx, bases: readonly (MetaPathBase | MetaDocDeletes)[]): Promise<void> {
 	for (const b of bases) if (!(await tx.get(STORE.meta, b.key))) tx.put(STORE.meta, b);
 }
 

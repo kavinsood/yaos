@@ -48,7 +48,7 @@ import { idleStatus } from "./statusMerge";
 import { ownFrameNoFloor, prepareEpochMigration } from "./runtimeOps";
 import { wipeSecrets } from "../../protocol/workerTransport";
 import type { FrameNoFloor } from "../store/repo";
-import type { MetaPathBase } from "../store/schema";
+import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
 import { VaultRuntime, type RestartReason } from "./vaultRuntime";
 
 export interface CreateEngineOptions {
@@ -117,7 +117,7 @@ export class ComposedEngine {
 	/** The device check running (one at a time); aborted by dispose. */
 	private deviceChecking: AbortController | null = null;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
-	private migration: { bases: MetaPathBase[]; frameNoFloor: FrameNoFloor } | null = null;
+	private migration: { bases: MetaPathBase[]; docDeletes: MetaDocDeletes[]; frameNoFloor: FrameNoFloor } | null = null;
 	private readonly offs: (() => void)[] = [];
 
 	constructor(readonly transport: EngineTransport, readonly options: CreateEngineOptions) {
@@ -258,7 +258,7 @@ export class ComposedEngine {
 					clientVersion: this.options.clientVersion ?? "dev", vaultEpoch: this.knownEpoch, reason,
 					tuning: this.options.tuning, budgets: this.options.budgets, paused: this.paused,
 					tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log, onDiag: this.options.onDiag,
-					pathBases: this.migration?.bases ?? null, frameNoFloor: this.migration?.frameNoFloor ?? null,
+					pathBases: this.migration?.bases ?? null, docDeletes: this.migration?.docDeletes ?? null, frameNoFloor: this.migration?.frameNoFloor ?? null,
 				});
 				if (this.disposed) {
 					await rt.stop();
@@ -355,11 +355,11 @@ export class ComposedEngine {
 		const old = this.rt;
 		if (reason === "epoch" && old) {
 			const frameNoFloor = ownFrameNoFloor(old);
-			const bases = await prepareEpochMigration(old).catch((e) => {
+			const carry = await prepareEpochMigration(old).catch((e) => {
 				this.log(`epoch prepare failed: ${String(e)}`);
-				return [];
+				return { bases: [], docDeletes: [] };
 			});
-			this.migration = { bases, frameNoFloor };
+			this.migration = { ...carry, frameNoFloor };
 		}
 		this.rt = null;
 		this.options.onRuntime?.(null);

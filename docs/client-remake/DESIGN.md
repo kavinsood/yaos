@@ -601,16 +601,21 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
      bump: a reader without the keys behaves as before (as for `blobPut:` and `frameNoFloor`).
    - **Deletes.** A restored relay state may predate a delete, step 5 drops an unsent delete, and a peer's file may
      never have received it, so the new epoch can hold content the old one deleted. The base alone cannot tell it
-     from content added in the new epoch, so step 3 also stores what the old doc deleted:
-     - *Canvas*: the record keys (`n:<id>`, `e:<id>`) whose Y.Map entry is deleted. Record ids are in the file, so
-       they name the record in a restored doc and in a peer's re-create alike. A record under such a key that both
-       the base and the disk lack joins the base with the CRDT's line, and the merge deletes it again
-       (`canvasMerge.withEpochDeletes`).
-     - *Markdown*: the old doc's delete set and its docId. When the new epoch holds the same doc (a restore keeps doc
-       and item ids), its characters in the set join the base, and the merge deletes them again
-       (`contentSteps.withTextDeletes`). After a reset this cannot be done: GC keeps only the deleted items' ids and
-       lengths, the re-created doc has new item ids, and the base holds only the text after the delete. Nothing then
-       tells deleted text a peer's file still had from text typed in the new epoch, so it comes back.
+     from content added in the new epoch, so step 3 also stores what each old doc deleted, by docId
+     (`docDeletes:<docId>`): a canvas's record keys (`n:<id>`, `e:<id>`) whose Y.Map entry is deleted, a note's
+     delete set.
+     - *By doc.* A restore keeps doc ids, record ids and Yjs item ids. Right after this device acquires a doc of such
+       an id for its first merge or materialize in the new epoch, it makes the deletes again as own edits: the
+       records under the keys, the characters whose items are in the set (`reconcile/oldDeletes.ts`). Wherever the
+       doc is now: a rename may have gone with the old outbox, or another device's rename been restored (sim suite-1
+       seeds 164, 139). Retired once applied, once the doc has a synced record, or when no live doc has the id.
+     - *By path* (canvas). After a reset the ids are new, but record ids are in the file: a peer's re-create holds
+       them. The path base keeps the keys too; a record under such a key that both the base and the disk lack joins
+       the base with the CRDT's line, and the merge deletes it again (`canvasMerge.withEpochDeletes`).
+     - *Not carried*: markdown text after a reset. GC keeps only the deleted items' ids and lengths, the re-created
+       doc has new item ids, and the base holds only the text after the delete. Nothing tells deleted text a peer's
+       file still had from text typed in the new epoch, so it comes back. Nor a delete in a doc this device adopts
+       without a job (its file already equal to the new epoch's text).
 5. Drops the old outbox. Its edits are on disk, so the scan re-derives them.
 6. Deletes the old DB once the new one reaches `live`: every DB of this vault and device under another epoch, so one
    that a crash left behind after the new DB was created goes too (a restart then opens the new DB without migrating;
