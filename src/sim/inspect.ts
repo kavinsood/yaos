@@ -2,13 +2,14 @@
  * Offline inspector: what a device's committed IndexedDB state holds.
  *
  * Opens a crash copy of a device's MemStoragePort with a real LogEngine that
- * can never connect (offline start from the known epoch) and reads the text of
+ * can never connect (offline start from the epoch in each database's name) and reads the text of
  * every live or pending markdown doc, plus every string stored by the disk
  * side (intents, bases). The token invariants use it to decide which tokens an
  * app crash may legitimately lose: a token in the committed state must survive.
  */
 
-import type { DeviceId } from "../core/types";
+import type { DeviceId, VaultEpoch } from "../core/types";
+import { parseDbName } from "../engine/compose/knownEpoch";
 import type { RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { LogEngine } from "../engine/runtime/engine";
@@ -60,27 +61,32 @@ export async function inspectStore(clock: VirtualClock, storage: MemStoragePort,
 			} else if (store === STORE.intents || store === STORE.synced || store === STORE.localTree) strings(rows, out);
 		}
 	}
-	if (names.length === 0) return out;
-	let eng: LogEngine;
-	try {
-		eng = await LogEngine.start({
-			ports: { relay: OFFLINE, storage, clock, random: new SeededRandom(hashLabel(`inspect:${deviceId}`)), crypto: createNoopCrypto(hash), hash, blob: null },
-			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-inspect", sideFiles: null, autoReconnect: false, e2ee: { suite: 0 },
-		});
-	} catch {
-		return out;
-	}
-	try {
-		for (const d of eng.listDocs()) {
-			if (d.kind !== "markdown" || (d.state !== "live" && d.state !== "pending")) continue;
-			try {
-				out.push(await docText(eng, d.docId));
-			} catch {
-				// unreadable doc: holds nothing recoverable
-			}
+	// One offline engine per database of this device, opened at the epoch in its name (knownEpoch.ts): without
+	// vaultEpoch LogEngine.start connects first, which OFFLINE refuses, and nothing in the doc logs was read.
+	for (const name of names) {
+		const id = parseDbName(name);
+		if (!id || id.vaultId !== SIM_VAULT_ID || id.deviceId !== deviceId || id.vaultEpoch.length === 0) continue;
+		let eng: LogEngine;
+		try {
+			eng = await LogEngine.start({
+				ports: { relay: OFFLINE, storage, clock, random: new SeededRandom(hashLabel(`inspect:${deviceId}`)), crypto: createNoopCrypto(hash), hash, blob: null },
+				vaultId: SIM_VAULT_ID, vaultEpoch: id.vaultEpoch as VaultEpoch, deviceId, clientVersion: "sim-inspect", sideFiles: null, autoReconnect: false, e2ee: { suite: 0 },
+			});
+		} catch {
+			continue;
 		}
-	} finally {
-		await eng.stop().catch(() => undefined);
+		try {
+			for (const d of eng.listDocs()) {
+				if (d.kind !== "markdown" || (d.state !== "live" && d.state !== "pending")) continue;
+				try {
+					out.push(await docText(eng, d.docId));
+				} catch {
+					// unreadable doc: holds nothing recoverable
+				}
+			}
+		} finally {
+			await eng.stop().catch(() => undefined);
+		}
 	}
 	return out;
 }

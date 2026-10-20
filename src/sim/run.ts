@@ -18,9 +18,9 @@
 
 import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
-import { generateUserAction, runUserAction, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
-import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights } from "./faults";
-import { activity, checkBlobLiveness, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, settingsPrint, type Violation } from "./invariants";
+import { generateUserAction, runUserAction, tokensIn, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
+import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
+import { activity, checkBlobLiveness, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
 import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
 import { SIM_SETTINGS, SimDevice } from "./device";
@@ -73,6 +73,24 @@ export interface SimConfig {
 	 * the device classes' real deferral of skipped streams (FAST_TUNING reads them at once).
 	 */
 	readonly tuning?: Partial<EngineTuning>;
+	/**
+	 * One forced suspend-kill per run (faults.ts SuspendKillAction) with this budget and save outcome: generatePlan
+	 * inserts it, from its own RNG stream ("suspend-kill"), right after (0..2.5 s after) a type / paste step of
+	 * the main plan, on that step's device. The main plan is unchanged, so every (budget, save) cell of a seed runs
+	 * the same plan (scripts/sim-suspend.mjs). Default: none.
+	 */
+	readonly suspend?: { readonly budget: number | null; readonly save: "landed" | "lost" };
+}
+
+/** A suspend-kill event's outcome at the end of the run (SimReport.stats.suspend). */
+export interface SuspendOutcome extends Omit<SuspendRecord, "atRisk" | "committedAtEvent"> {
+	readonly atRisk: number;
+	/** At-risk tokens in the device's committed storage at the event. */
+	readonly committedAtEvent: number;
+	/** At-risk tokens (not deleted by a later user action) missing from the converged vault. */
+	readonly lost: readonly string[];
+	/** Lost tokens that were in committed storage at the event, durable at the kill, or ever on a disk (a real violation). */
+	readonly genuine: readonly string[];
 }
 
 /** The checkpoint side of a run's world (DESIGN §b.5, §d.8, §d.9), a pure function of the seed. */
@@ -106,13 +124,23 @@ export function checkpointWorld(cfg: SimConfig): CheckpointWorld {
 	const c = full(cfg);
 	if (cfg.checkpoints === "production") return PRODUCTION_WORLD(c.devices);
 	const r = new SeededRandom(cfg.seed).fork("checkpoints");
+	const compactRows = r.range(3, 60);
+	const compactBytes = logRange(r, 2 * 1024, 256 * 1024);
+	const nsCandidateModulus = r.range(2, 40);
+	const rows = r.range(3, 40);
+	const bytes = logRange(r, 2 * 1024, 256 * 1024);
+	// Own stream: drawing the hard cap does not shift the draws above or below (recorded seeds still reproduce).
+	const hard = r.fork("hard");
 	const tuning: Partial<EngineTuning> = {
-		compactRows: r.range(3, 60),
-		compactBytes: logRange(r, 2 * 1024, 256 * 1024),
-		nsCandidateModulus: r.range(2, 40),
+		compactRows,
+		compactBytes,
+		nsCandidateModulus,
 		checkpoint: {
-			rows: r.range(3, 40),
-			bytes: logRange(r, 2 * 1024, 256 * 1024),
+			rows,
+			bytes,
+			// Hot puts mid-session, past the hard cap, while a stream is still written.
+			hardRows: rows * hard.range(2, 6),
+			hardBytes: bytes * hard.range(2, 6),
 			idleMs: r.range(100, 3_000),
 			settleMs: r.range(300, 8_000),
 			// A third of the seeds: the other devices take over almost at once and race the duty device.
@@ -163,6 +191,8 @@ export interface SimReport {
 		readonly subs: { readonly pushedRows: number; readonly skippedRows: number; readonly subscribes: number };
 		/** Suite-1 fault outcomes (e2eeFaults.ts), in a suite-1 run with faults. */
 		readonly e2ee?: E2eeFaultStats;
+		/** Every suspend-kill of the run (faults.ts SuspendKillAction) and what it lost. */
+		readonly suspend: readonly SuspendOutcome[];
 		/** Checkpoint coverage: relay puts / GC / served pages, and adoptions / gate disputes on the devices and the oracle. */
 		readonly checkpoints: CheckpointStats;
 		/** Suite 1: the run's DelayedCrypto counters (strays must be 0: every crypto await went through RealWork). */
@@ -243,6 +273,24 @@ export function generatePlan(cfg: SimConfig): Step[] {
 		if (c.extras > 0 && xr.chance(c.extras)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(xr, c.devices, EXTRA_OPS) });
 		// Manual snapshots, from their own stream (the main and extra plans of a seed do not depend on them).
 		if (snaps && sr.chance(0.04)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(sr, c.devices, SNAPSHOT_OPS) });
+	}
+	if (cfg.suspend) {
+		const k = new SeededRandom(cfg.seed).fork("suspend-kill");
+		const lo = Math.floor(c.steps * 0.2);
+		const hi = Math.floor(c.steps * 0.9);
+		const typed = plan.filter((s) => "user" in s && (s.user.t === "type" || s.user.t === "paste") && s.i >= lo && s.i < hi);
+		const at = typed.length > 0 ? typed[k.int(typed.length)] : plan[k.int(Math.max(1, plan.length))];
+		const dev = at && "user" in at ? at.user.dev : k.int(c.devices);
+		const f: SuspendKillAction = {
+			t: "suspendKill", dev, event: k.pick(["hidden", "pagehide", "freeze"] as const), budget: cfg.suspend.budget, save: cfg.suspend.save,
+			downMs: k.range(200, 10_000), durationMs: k.range(100, 30_000),
+		};
+		// A third right after the keystrokes (still in the binding's 16 ms buffer), a third within 400 ms (an open frame
+		// at production frame windows, 100 / 300 ms), a third later (sealed and committed; Obsidian's 2 s save may land).
+		const r = k.float();
+		const gapMs = r < 1 / 3 ? 0 : r < 2 / 3 ? k.range(1, 400) : k.range(401, 2_500);
+		const pos = at ? plan.indexOf(at) + 1 : plan.length;
+		plan.splice(pos, 0, { i: extra++, gapMs, fault: f });
 	}
 	return plan;
 }
@@ -386,6 +434,18 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net));
 		violations.push(...(await checkQuiet(clock, devs, net)));
 
+		const present = vaultTokens(devs);
+		for (const t of clobberedTokens(devs)) present.add(t);
+		// A lost token that was ever written to a disk (a save that landed, then was overwritten) is a real loss too.
+		const everOnDisk = new Set<string>();
+		for (const d of devs) for (const v of d.vault.history) for (const t of tokensIn(v.text)) everOnDisk.add(t);
+		const suspend: SuspendOutcome[] = faults.suspends.map((rec) => {
+			const lost = rec.atRisk.filter((t) => ledger.entries.get(t)?.state !== "deleted" && !present.has(t));
+			return {
+				...rec, atRisk: rec.atRisk.length, committedAtEvent: rec.committedAtEvent?.size ?? 0, commits: [...rec.commits], lost,
+				genuine: lost.filter((t) => (rec.committedAtEvent?.has(t) ?? false) || ledger.entries.get(t)?.state === "live" || everOnDisk.has(t)),
+			};
+		});
 		const snap = [...(devs[0]?.vault.snapshot() ?? new Map<string, string>())].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 		const tokens = { live: 0, deleted: 0, unacked: 0 };
 		for (const e of ledger.entries.values()) tokens[e.state]++;
@@ -394,7 +454,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), checkpoints: checkpointStats(devs, net), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
+			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, checkpoints: checkpointStats(devs, net), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}) },
 		};
 	} finally {
 		seedEntropy(null);
