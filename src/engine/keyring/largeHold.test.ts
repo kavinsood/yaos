@@ -8,7 +8,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { QUARANTINE_ROW_BYTES } from "../../core/limits";
-import { KEYRING_STREAM, type VaultPath } from "../../core/types";
+import { KEYRING_STREAM, type DeviceId, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import { converged, until, createDoc, docText, editDoc } from "../runtime/testHarness";
 import { keyMissing, live, rawAppend, start } from "./testkit/engines";
@@ -32,6 +32,8 @@ describe("reader-dependent quarantine of a large row (§d.6)", () => {
 			await live(y!);
 			assert.equal(await x!.engine.revokeRekey(RK_A.slice()), "won");
 			const k2 = x!.changes.flatMap((c) => c.keys).find((k) => k.e === 2)!.k;
+			// y's reads are slow (as under load): its cursor reaches the head through the skip well before the read.
+			relay.setLink("dev-y" as DeviceId, { httpMs: 250 });
 			const id = await createDoc(x!.engine, "big.md" as VaultPath, "seed;");
 			const inline = noiseText(QUARANTINE_ROW_BYTES + 300_000); // one bodyUpdate row, inline
 			await editDoc(x!.engine, id, (t) => t.insert(t.length, inline));
@@ -39,10 +41,15 @@ describe("reader-dependent quarantine of a large row (§d.6)", () => {
 			const text = await docText(x!.engine, id);
 			assert.equal(text, "seed;" + inline);
 			const head = relay.head();
-			await until(() => y!.engine.status().vaultSeq >= head, 10_000, "y read through head");
+			// y is not subscribed to big.md: the row reaches it as a skip, which accounts the seq at once, and is
+			// quarantined only once the catch-up read of the stream gated it. Wait for that read, not the cursor (a
+			// cursor wait raced the read of a 1.3 MB row under load).
+			const stream = x!.engine.streamOf(id);
+			await until(async () => y!.engine.status().vaultSeq >= head
+				&& (await y!.engine.c.repo.quarantineOf(stream)).some((q) => q.originalSize > QUARANTINE_ROW_BYTES), 10_000, "y read and held the row");
 			const held = (await Promise.all([...y!.engine.c.repo.streams()].map((r) => y!.engine.c.repo.quarantineOf(r.stream)))).flat();
 			const big = held.filter((q) => q.originalSize > QUARANTINE_ROW_BYTES);
-			assert.ok(big.some((q) => q.stream === x!.engine.streamOf(id)), "the inline body row is held");
+			assert.ok(big.some((q) => q.stream === stream), "the inline body row is held");
 			assert.ok(held.every((q) => q.reason === "crypto-unknown-key"), held.map((q) => q.reason).join(","));
 			assert.ok(held.every((q) => q.bytes.length === q.originalSize), "reader-dependent rows are kept whole");
 			assert.ok(y!.engine.status().counts.frozenDocs > 0);
