@@ -2315,6 +2315,12 @@ ones get conflict copies.
   - The CRDT apply is record-level: changed fields are set, and the `text` field gets a minimal `Y.Text` diff. Node
     maps are never replaced wholesale.
   - Canvas views are not bound. Every user edit reaches the CRDT through a disk save and merge.
+  - *Subscriptions* (§d.7): an unbound canvas is never in the set unless it has own outbox records, so other
+    devices' rows reach it as skips. A save to it while it is stale waits for the read (`body-not-caught-up`, which
+    calls `wantFresh`: no deferral), as for markdown; merges never run against a stale replica (I4). Until the read
+    lands the save lives only on disk: a file delete in that window deletes what the CRDT holds, and an unseen edit
+    restores that (§c.7), without the save. A save that conflicts because the replica was stale goes to a conflict
+    copy like any other.
 - **Merge semantics** (what the simulator's canvas invariant tests, `src/sim/invariants.ts` `checkCanvas`):
   - *Convergence is canonical, not byte-identical.* After the heal every device's file, its resident replica's
     projection and a fresh device's read of the stream (checkpoint plus tail) are equal as canonical JSON (keys
