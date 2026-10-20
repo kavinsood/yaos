@@ -25,6 +25,8 @@
 		"test:client": "node scripts/client-test.mjs",
 		"test:sim": "node scripts/sim-test.mjs",
 		"test:sim-suite1": "node scripts/sim-suite1.mjs",
+		"sim:soak": "node --import jiti/register scripts/sim-soak.mjs",
+		"sim:replay": "node --import jiti/register scripts/sim-replay.mjs",
 		"typecheck:client": "tsc -noEmit -p tsconfig.json && tsc -noEmit -p tsconfig.client-tests.json && tsc -noEmit -p e2e/client/tsconfig.json",
 		"check:deps": "node scripts/check-deps.mjs",
 		"bench:e2ee": "node --import jiti/register scripts/bench-e2ee.mjs",

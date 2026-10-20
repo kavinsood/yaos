@@ -58,3 +58,4 @@ notes/
 
 # relay-dev cf deploy projects (scripts/relay-dev/deploy.sh)
 server/.cf-deploy
+sim-failures/
