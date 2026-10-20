@@ -6,12 +6,11 @@ import { encodeOuter } from "../../core/codec/envelope";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import type { GateCtx } from "../ingest/gate";
-import type { Repo } from "../store/repo";
 import type { OutboxRecord, TailRecord } from "../store/schema";
 import { gateRow, ownCommitCopy } from "./ingestRow";
 import { SnapRuntime } from "./snapRuntime";
 import { SeededRandom } from "../../sim/random";
-import { LOCAL_FLAG_STALE_EPOCH, LOCAL_FLAG_UNOPENED } from "./foldRuntime";
+import { LOCAL_FLAG_STALE_EPOCH, LOCAL_FLAG_UNOPENED, type FoldRepo } from "./foldRuntime";
 
 const hash = createWebHash();
 const ctx: GateCtx = { crypto: createNoopCrypto(hash), vaultId: "v1" as VaultId, maxCheckpointStateBytes: 1 << 20, staleCheck: (e) => (e === 9 ? "hold" : e < 3 ? "stale" : null) };
@@ -39,14 +38,14 @@ test("gateRow: hold keeps ns rows unopened (raw payload, the fold halts) and qua
 });
 
 /** The snapshot plus the tail; nothing else of the Repo is used by FoldRuntime.load() and gap(). */
-function repoOf(rows: readonly TailRecord[]): Repo {
+function repoOf(rows: readonly TailRecord[]): FoldRepo {
 	const appliedSeq = rows[rows.length - 1]!.seq;
 	return {
 		stream: (s: StreamName) => (s === SNAP_STREAM ? { stream: s, appliedSeq } : undefined),
 		getSnapshot: async () => undefined,
 		getTail: async (s: StreamName, after: number = 0, through: number = Number.MAX_SAFE_INTEGER) =>
 			s === SNAP_STREAM ? rows.filter((r) => r.seq > after && r.seq <= through) : [],
-	} as unknown as Repo;
+	};
 }
 
 test("a stale snap row last in the stream: the snap fold covers it as ignored, and it is no gap (sim seed 174)", async () => {

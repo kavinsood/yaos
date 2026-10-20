@@ -60,7 +60,11 @@ test("S follows a pending own rename by its requested path, not by the overlay's
 		size: 1, mtimeMs: 1, bodyVersion: null, blobRev: 0, nsTouchSeq: 3, hasBase: true,
 	};
 	const puts: SyncedEntry[] = [];
-	const remote = new Map([[d1, { docId: d1, pendingLocal: true, path: P("r5 (2).md"), pathKey: "r5 (2).md" as PathKey } as unknown as RemoteEntry]]);
+	const entry: RemoteEntry = {
+		docId: d1, kind: "markdown", path: P("r5 (2).md"), pathKey: "r5 (2).md" as PathKey, state: "live", lastTouchSeq: 3, deletedSeq: 0,
+		deleteBaseBodySeq: 0, createHash: "h" as ContentHash, blob: null, aliasOf: null, pendingLocal: true, body: null,
+	};
+	const remote = new Map([[d1, entry]]);
 	const pending: NsOp = { t: "rename", docId: d1, path: P("r5.md") };
 	const ctx = {
 		synced: (id: DocId) => (id === d1 ? s : undefined),
