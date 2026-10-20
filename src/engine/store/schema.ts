@@ -114,6 +114,16 @@ export interface MetaPathBase {
 	readonly contentHash: ContentHash;
 	readonly deflated: Uint8Array;
 	readonly chars: number;
+	/**
+	 * Canvas only: the record keys ("n:<id>" / "e:<id>") deleted in the old doc, so a new epoch that holds them again
+	 * (a restore from before the delete) has them deleted again (canvasMerge.withEpochDeletes). Absent = none.
+	 */
+	readonly deleted?: readonly string[];
+	/**
+	 * Markdown only: the old doc's delete set (a Yjs update with no structs) and its docId, so a restore that brought
+	 * back text deleted after the restore point has it deleted again (contentSteps.withTextDeletes). Absent = none.
+	 */
+	readonly textDeletes?: { readonly docId: DocId; readonly update: Uint8Array };
 }
 export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase;
 export type MetaKey = MetaRecord["key"];

@@ -67,6 +67,37 @@ function union(primary: ReadonlyMap<string, string> | undefined, secondary: Read
 	return out;
 }
 
+/**
+ * §c.12 deletes carried across an epoch change: `deleted` holds the record keys ("n:<id>" / "e:<id>") deleted in
+ * the old epoch's doc at this path. A record the new epoch's CRDT has under such a key, and that neither the base
+ * nor the disk has, is the old epoch's deleted record come back (a restore from before the delete, or a peer that
+ * re-created the doc without having seen it). It is added to the base with the CRDT's line, so the merge reads the
+ * disk side as having deleted it and the CRDT side as unchanged: the delete is applied again.
+ */
+export function withEpochDeletes(base: CanvasRanked, crdt: CanvasRanked, disk: CanvasSemanticData, deleted: ReadonlySet<string>): CanvasRanked {
+	if (deleted.size === 0) return base;
+	const nodes = new Map(base.data.nodes);
+	const nodeRanks = new Map(base.nodeRanks);
+	const edges = new Map(base.data.edges);
+	const edgeRanks = new Map(base.edgeRanks);
+	let added = 0;
+	for (const [id, n] of crdt.data.nodes) {
+		if (!deleted.has(`n:${id}`) || nodes.has(id) || disk.nodes.has(id)) continue;
+		nodes.set(id, n);
+		const r = crdt.nodeRanks.get(id);
+		if (r !== undefined) nodeRanks.set(id, r);
+		added++;
+	}
+	for (const [id, e] of crdt.data.edges) {
+		if (!deleted.has(`e:${id}`) || edges.has(id) || disk.edges.has(id)) continue;
+		edges.set(id, e);
+		const r = crdt.edgeRanks.get(id);
+		if (r !== undefined) edgeRanks.set(id, r);
+		added++;
+	}
+	return added === 0 ? base : makeRanked(base.data.rootFields, nodes, nodeRanks, edges, edgeRanks);
+}
+
 /** Ranks for the disk canvas (file order), reusing base ranks first, then CRDT ranks. */
 export function rankDisk(disk: CanvasSemanticData, base: CanvasRanked | null, crdt: CanvasRanked): CanvasRanked {
 	const nodeRanks = reconcileCanvasRanks(disk.nodeOrder, union(base?.nodeRanks, crdt.nodeRanks)).ranks;

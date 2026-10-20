@@ -5,6 +5,7 @@
  * old-epoch base.
  */
 
+import * as Y from "yjs";
 import type { ContentHash, DocId, LocalEntry, PlannerOp, SyncedEntry, VaultPath } from "../../core/types";
 import { brakeKey, isShrinkingOverwrite } from "../../core/plan/brake";
 import { conflictName } from "../../core/plan/conflictName";
@@ -43,6 +44,44 @@ export function trustedEpochBase(base: string | null, crdt: string, unit: "char"
 	let i = 0;
 	for (let j = 0; i < b.length && j < c.length; j++) if (b[i] === c[j]) i++;
 	return i === b.length ? base : null;
+}
+
+/** A Yjs delete set (yjs does not export the class's type). */
+export type DeleteSet = ReturnType<typeof Y.createDeleteSet>;
+
+/** §c.12: the old epoch's markdown doc at a path, as a delete set over its items (ReconcilerDeps.pathTextDeletes). */
+export interface TextDeletes {
+	readonly docId: DocId;
+	readonly ds: DeleteSet;
+}
+
+/**
+ * §c.12 deletes carried across a restore: `base` (trusted: a subsequence of `text`) plus every character of `text`
+ * whose item the old epoch's doc had deleted. A restore keeps doc and item ids, so such a character is text this
+ * device deleted after the restore point, which the restored state brought back. In the base, the merge reads the
+ * disk side as having deleted it and the CRDT side as unchanged: the delete is applied again. The alignment takes a
+ * deleted character first, a base character next; when the base does not then align in full (a delete this device's
+ * disk had not taken yet keeps the character in the base) the base is returned unchanged.
+ */
+export function withTextDeletes(base: string, text: Y.Text, ds: DeleteSet): string {
+	let out = "";
+	let i = 0;
+	let added = 0;
+	for (let item = text._start; item !== null; item = item.right) {
+		if (item.deleted || !(item.content instanceof Y.ContentString)) continue;
+		const str = item.content.str;
+		for (let k = 0; k < str.length; k++) {
+			const c = str[k]!;
+			if (Y.isDeleted(ds, Y.createID(item.id.client, item.id.clock + k))) {
+				out += c;
+				added++;
+			} else if (i < base.length && base[i] === c) {
+				out += c;
+				i++;
+			}
+		}
+	}
+	return added > 0 && i === base.length ? out : base;
 }
 
 /**

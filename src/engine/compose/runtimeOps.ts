@@ -3,9 +3,10 @@
  * user commands, diagnostics and the epoch-migration steps (§c.12).
  */
 
+import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
-import { streamDocId, type PathKey, type RemoteEntry, type StreamName, type VaultPath } from "../../core/types";
+import { streamDocId, type PathKey, type RemoteEntry, type StreamName, type SyncedEntry, type VaultPath } from "../../core/types";
 import { ProtocolFailure } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
@@ -212,9 +213,38 @@ export async function prepareEpochMigration(rt: VaultRuntime): Promise<MetaPathB
 		const r = byDoc.get(s.docId);
 		if (!r || (await readBase(r, rt.o.ports.hash)) === null) continue;
 		const k = pathKey(s.path);
-		bases.set(k, { key: pathBaseKey(k), contentHash: r.contentHash, deflated: r.deflated, chars: r.chars });
+		bases.set(k, {
+			key: pathBaseKey(k), contentHash: r.contentHash, deflated: r.deflated, chars: r.chars,
+			...(await oldDeletes(rt, s)),
+		});
 	}
 	return [...bases.values()];
+}
+
+/**
+ * What the old doc deleted (DESIGN §c.12 "Deletes"), so the new epoch's merge can apply it again.
+ *  - Canvas: the record keys. A Y.Map key keeps its deleted item after GC (only the content goes), and record ids
+ *    are stable: they are in the file, so they name the record in a restored doc and in one a peer re-created alike.
+ *  - Markdown: the delete set, with the docId. GC keeps only the deleted items' ids and lengths, so it names
+ *    characters only in the same doc, which a restore keeps (and a reset does not).
+ */
+async function oldDeletes(rt: VaultRuntime, s: SyncedEntry): Promise<Pick<MetaPathBase, "deleted" | "textDeletes">> {
+	if (s.kind !== "canvas" && s.kind !== "markdown") return {};
+	const h = await rt.rec.ctx.log.acquireBody(s.docId, s.kind).catch(() => null);
+	if (!h) return {};
+	try {
+		if (s.kind === "markdown") {
+			if (Y.createDeleteSetFromStructStore(h.doc.store).clients.size === 0) return {};
+			return { textDeletes: { docId: s.docId, update: Y.encodeStateAsUpdate(h.doc, Y.encodeStateVector(h.doc)) } };
+		}
+		const deleted: string[] = [];
+		for (const [map, prefix] of [["nodes", "n:"], ["edges", "e:"]] as const) {
+			for (const [id, item] of h.doc.getMap(map)._map) if (item.deleted) deleted.push(prefix + id);
+		}
+		return deleted.length > 0 ? { deleted } : {};
+	} finally {
+		h.release();
+	}
 }
 
 /** §c.12 step 3 (e2ee-design §8.2): the highest own ns / cfg frameNo, carried into the new epoch's DB. */

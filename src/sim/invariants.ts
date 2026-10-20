@@ -372,11 +372,10 @@ export async function checkQuiet(clock: VirtualClock, devs: readonly SimDevice[]
  *                device edited it without having seen the delete (a concurrent edit; the disk/CRDT merge keeps the
  *                CRDT side and copies the disk file) or the deleting device wrote a conflict copy lacking it after
  *                the delete (its merge had no base, or met a concurrent edit), or an IDB wipe without mirrors hit
- *                the deleting device after the delete (its unsent delete is gone), or the delete precedes an epoch
- *                restore, or was made on an epoch the relay had already left (DESIGN §c.12: the restored relay
- *                state may predate the delete, the old outbox is dropped, and the old epoch's base cannot tell a
- *                record the new epoch still holds from one added there, for canvases as for markdown text). Other
- *                docs holding it (conflict copies, a duplicate a wipe or an epoch reset left under a suffixed name)
+ *                the deleting device after the delete (its unsent delete is gone). A delete before an epoch
+ *                restore or made on an epoch the relay had left holds too: the migration carries the old doc's
+ *                deleted record keys (DESIGN §c.12 "Deletes"). Other docs holding it (conflict copies, a duplicate a
+ *                wipe or an epoch reset left under a suffixed name)
  *                are copies, not the doc
  *   text         canvas text-node edits carry ledger tokens: checkTokens / checkNothingDestroyed cover them (a
  *                Y.Text char merge of concurrent edits keeps both)
@@ -476,11 +475,7 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 		const copied = dev?.vault.history.some((v) => v.by === "sync" && isConflictCopy(v.path) && v.path.endsWith(".canvas") && v.atMs >= del.atMs && !v.text.includes(`"${r.key.slice(2)}"`)) ?? false;
 		// The deleting device's store was wiped with its mirrors after the delete: an unsent delete is gone with it.
 		const wiped = oracle.wipes.some((x) => x.dev === del.dev && x.atMs >= del.atMs);
-		// A point-in-time restore after the delete (doc ids kept), or a delete made on the epoch the relay had left:
-		// the new epoch may hold the record, and the re-onboarding merge against the old epoch's base reads it as
-		// added there (DESIGN §c.12).
-		const restored = del.staleEpoch === true || oracle.restores.some((t) => t >= del.atMs);
-		if (!concurrent && !copied && !wiped && !restored) bad(`${r.key} deleted on ${del.dev} at step ${del.step} is back in ${back.map((h) => h.path).join(", ")} with no concurrent edit and no conflict copy`);
+		if (!concurrent && !copied && !wiped) bad(`${r.key} deleted on ${del.dev} at step ${del.step} is back in ${back.map((h) => h.path).join(", ")} with no concurrent edit and no conflict copy`);
 	}
 
 	// writes (lost updates)

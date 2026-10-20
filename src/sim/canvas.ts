@@ -305,11 +305,6 @@ export interface RecordDelete {
 	readonly saw: ReadonlyMap<string, string>;
 	/** The doc the file was synced as on the deleting device (null: not synced yet). */
 	readonly doc: string | null;
-	/**
-	 * Made while the device's runtime was on an epoch the relay had left (a restore or reset it had not migrated to
-	 * yet): the migration drops the old outbox (DESIGN §c.12), so the delete never reaches the new epoch.
-	 */
-	readonly staleEpoch?: boolean;
 }
 
 export interface RecordInfo {
@@ -368,8 +363,6 @@ export class CanvasOracle {
 	readonly sorted = new Set<string>();
 	/** IDB wipes that dropped the mirrors (device, time): the device's unsent ops are gone, deletes included. */
 	readonly wipes: { readonly dev: string; readonly atMs: number }[] = [];
-	/** Epoch restores (time): the relay went back to a point-in-time state; doc ids are kept. */
-	readonly restores: number[] = [];
 	readonly stats: CanvasStats = { actions: 0, skipped: 0, byType: {}, creates: 0, broken: 0, fixes: 0, abandoned: 0, rewrites: 0, linkUpdates: 0, bigNodes: 0 };
 
 	uniq(): number {
@@ -403,10 +396,6 @@ export class CanvasOracle {
 		this.wipes.push({ dev, atMs });
 	}
 
-	restored(atMs: number): void {
-		this.restores.push(atMs);
-	}
-
 	deleted(rec: string, d: RecordDelete): void {
 		const r = this.records.get(rec);
 		if (r && !r.deleted) r.deleted = d;
@@ -434,8 +423,6 @@ export interface CanvasActorWorld {
 	readonly ledger: TokenLedger;
 	isDown(dev: number): boolean;
 	isBackground(dev: number): boolean;
-	/** The relay's current vault epoch (RecordDelete.staleEpoch). */
-	relayEpoch?(): string;
 }
 
 interface PendingFix {
@@ -894,13 +881,12 @@ export class CanvasWorld {
 	}
 
 	private deleteRecords(d: SimDevice, step: number, atMs: number, nodes: readonly Obj[], edges: readonly Obj[], path: string): void {
-		const staleEpoch = this.w.relayEpoch !== undefined && d.vrt !== null && d.vrt.vaultEpoch !== this.w.relayEpoch();
 		for (const n of nodes) {
 			const rec = `n:${n.id as string}`;
 			for (const t of tokensIn(typeof n.text === "string" ? n.text : "")) this.w.ledger.deleted(t);
-			this.oracle.deleted(rec, { dev: d.name, step, atMs, how: "record", saw: this.fieldsOf(n), doc: docIdOf(d, path), staleEpoch });
+			this.oracle.deleted(rec, { dev: d.name, step, atMs, how: "record", saw: this.fieldsOf(n), doc: docIdOf(d, path) });
 		}
-		for (const e of edges) this.oracle.deleted(`e:${e.id as string}`, { dev: d.name, step, atMs, how: "record", saw: this.fieldsOf(e), doc: docIdOf(d, path), staleEpoch });
+		for (const e of edges) this.oracle.deleted(`e:${e.id as string}`, { dev: d.name, step, atMs, how: "record", saw: this.fieldsOf(e), doc: docIdOf(d, path) });
 	}
 
 	// --- link updates (Obsidian's rename of a note) ----------------------------

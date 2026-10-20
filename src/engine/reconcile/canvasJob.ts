@@ -28,7 +28,7 @@ import { canvasLogicalHash, canvasToMergeText, type CanvasRanked } from "../../c
 import { isShrinkingOverwrite } from "../../core/plan/brake";
 import type { IntentRecord } from "../store/schema";
 import { applyCanvas, emptyCanvas, projectCanvasBytes, projectionHash, readCanvas, visibleCanvas } from "./canvasDoc";
-import { isEmptyCanvas, mergeCanvasSides, parseDiskCanvas, parseMergeText, rankDisk, type CanvasMergeOutput } from "./canvasMerge";
+import { isEmptyCanvas, mergeCanvasSides, parseDiskCanvas, parseMergeText, rankDisk, withEpochDeletes, type CanvasMergeOutput } from "./canvasMerge";
 import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writeConflictCopy, type ReconcileOp } from "./contentSteps";
 import type { BodyHandle } from "./deps";
 import { writeOk, type Env, type JobOutcome } from "./diskJobs";
@@ -67,6 +67,7 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 	// §c.12: the old epoch's base at the path (its merge text), trusted while every record line of it is still in the
 	// new epoch's merge text (contentSteps.trustedEpochBase), as for markdown.
 	const epochBase = epochBaseOf(env, op, s);
+	const epochDeleted = epochBase === null ? null : ctx.deps.pathDeleted?.(ctx.pk(op.path)) ?? null;
 
 	let out: CanvasMergeOutput | null = null;
 	let outHash = diskHash; // out.projection's logical hash
@@ -78,7 +79,8 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 		const token = canvasToMergeText(crdt.ranked);
 		// No stored base: a side still at the synced content is the base (see mergeJob).
 		const trusted = trustedEpochBase(epochBase, token, "line");
-		const base = storedBase ?? (trusted !== null ? parseMergeText(trusted) : null)
+		const epochRanked = trusted === null ? null : parseMergeText(trusted);
+		const base = storedBase ?? (epochRanked && epochDeleted ? withEpochDeletes(epochRanked, crdt.ranked, disk.data, epochDeleted) : epochRanked)
 			?? (isEmptyCanvas(crdt.ranked) ? emptyCanvas() : !s || op.noBase || op.pathBase ? null : diskHash === s.contentHash ? rankDisk(disk.data, null, crdt.ranked) : (await projectionHash(port, crdt)) === s.contentHash ? crdt.ranked : null);
 		await ctx.deps.clock.yieldNow();
 		const m = mergeCanvasSides({ base, disk: disk.data, crdt, limits: ctx.mergeLimits });

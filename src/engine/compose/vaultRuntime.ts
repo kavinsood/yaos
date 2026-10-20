@@ -250,7 +250,7 @@ export class VaultRuntime {
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, hash: ports.hash, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
 			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into),
-			pathBase: (k: PathKey) => bases.get(k), pathBaseKeys: bases.keys,
+			pathBase: (k: PathKey) => bases.get(k), pathBaseKeys: bases.keys, pathDeleted: (k: PathKey) => bases.deleted(k), pathTextDeletes: (k: PathKey) => bases.textDeletes(k),
 			boundSavedText: (docId, text) => {
 				const b = o.engine.bound.get(docId);
 				return b !== undefined && (text === b.diskText || b.candidates.includes(text));

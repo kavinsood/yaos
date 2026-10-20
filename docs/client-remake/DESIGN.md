@@ -594,14 +594,23 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
    - **Trust.** A base is trusted only while the new epoch's text still contains it: as a character subsequence for
      markdown, and as a subsequence of whole record lines of the merge text for a canvas. A base ahead of the new
      epoch would read as deletions. Without trust, the no-base merge keeps the disk side as a conflict copy.
-   - **Stored.** The bases are written to the new DB's `meta` (`pathBase:<pathKey>`, the old `baseText` row's bytes)
-     in the transaction that creates its identity, so a crash or restart before the merges keeps them
-     (`src/engine/compose/epochBases.ts`). A base is dropped once its path is settled: the committed ns winner there
-     is the one doc synced at it, or nothing is left at the path. No `DB_SCHEMA_VERSION` bump: a reader without the
-     keys behaves as before (as for `blobPut:` and `frameNoFloor`).
-   - **Deletes.** A record or text deleted before the epoch change can come back: a restored relay state may predate
-     the delete, step 5 drops an unsent delete, and a peer's file may never have received it. The base cannot tell
-     such content from content added in the new epoch.
+   - **Stored.** The bases are written to the new DB's `meta` (`pathBase:<pathKey>`, the old `baseText` row's bytes,
+     with the old doc's deletes) in the transaction that creates its identity, so a crash or restart before the
+     merges keeps them (`src/engine/compose/epochBases.ts`). A base is dropped once its path is settled: the
+     committed ns winner there is the one doc synced at it, or nothing is left at the path. No `DB_SCHEMA_VERSION`
+     bump: a reader without the keys behaves as before (as for `blobPut:` and `frameNoFloor`).
+   - **Deletes.** A restored relay state may predate a delete, step 5 drops an unsent delete, and a peer's file may
+     never have received it, so the new epoch can hold content the old one deleted. The base alone cannot tell it
+     from content added in the new epoch, so step 3 also stores what the old doc deleted:
+     - *Canvas*: the record keys (`n:<id>`, `e:<id>`) whose Y.Map entry is deleted. Record ids are in the file, so
+       they name the record in a restored doc and in a peer's re-create alike. A record under such a key that both
+       the base and the disk lack joins the base with the CRDT's line, and the merge deletes it again
+       (`canvasMerge.withEpochDeletes`).
+     - *Markdown*: the old doc's delete set and its docId. When the new epoch holds the same doc (a restore keeps doc
+       and item ids), its characters in the set join the base, and the merge deletes them again
+       (`contentSteps.withTextDeletes`). After a reset this cannot be done: GC keeps only the deleted items' ids and
+       lengths, the re-created doc has new item ids, and the base holds only the text after the delete. Nothing then
+       tells deleted text a peer's file still had from text typed in the new epoch, so it comes back.
 5. Drops the old outbox. Its edits are on disk, so the scan re-derives them.
 6. Deletes the old DB once the new one reaches `live`: every DB of this vault and device under another epoch, so one
    that a crash left behind after the new DB was created goes too (a restart then opens the new DB without migrating;

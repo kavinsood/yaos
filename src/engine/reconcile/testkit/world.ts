@@ -11,6 +11,7 @@ import { refHashPort } from "../../../core/hash/testkit/hashRef";
 import type { VaultEvent } from "../../../ports/vault";
 import { DB_SCHEMA_VERSION, STORE_SPECS } from "../../store/schema";
 import type { ReconcileSettings } from "../context";
+import type { TextDeletes } from "../contentSteps";
 import type { OwnFoldEvent } from "../deps";
 import { Reconciler } from "../reconciler";
 import type { DiskSchema } from "../store";
@@ -30,6 +31,10 @@ export interface WorldOptions {
 	readonly deviceLabel?: string;
 	/** §c.12 path-keyed bases from the previous epoch (ReconcilerDeps.pathBase). */
 	readonly pathBases?: ReadonlyMap<string, string>;
+	/** §c.12 record keys the previous epoch's canvas CRDT held deleted, by path (ReconcilerDeps.pathDeleted). */
+	readonly pathDeleted?: ReadonlyMap<string, readonly string[]>;
+	/** §c.12 the previous epoch's markdown doc's delete set, by path (ReconcilerDeps.pathTextDeletes); read when asked. */
+	readonly pathTextDeletes?: ReadonlyMap<string, TextDeletes>;
 	/** Queue own fold events for the reconciler to take (ReconcilerDeps.takeOwnFold), as the vault runtime does. */
 	readonly deferOwnFold?: boolean;
 }
@@ -80,6 +85,8 @@ export class World {
 			onRebind: (from, into) => this.rebinds.push([from, into]),
 			pathBase: this.opts.pathBases ? (key) => this.opts.pathBases!.get(key) ?? null : undefined,
 			pathBaseKeys: this.opts.pathBases ? new Set([...this.opts.pathBases.keys()] as PathKey[]) : undefined,
+			...(this.opts.pathTextDeletes ? { pathTextDeletes: (key: PathKey) => this.opts.pathTextDeletes!.get(key) ?? null } : {}),
+			...(this.opts.pathDeleted ? { pathDeleted: (key: PathKey) => (this.opts.pathDeleted!.has(key) ? new Set(this.opts.pathDeleted!.get(key)) : null) } : {}),
 			...(this.opts.deferOwnFold ? { takeOwnFold: () => this.ownQueue.splice(0) } : {}),
 		});
 		this.log.onOwnFold = this.opts.deferOwnFold ? async (events) => void this.ownQueue.push(...events) : (events) => rec.applyOwnFold(events);

@@ -39,10 +39,10 @@ test("sim: a canvas re-created across an epoch migration merges into the winner,
 });
 
 // Suite-1 seeds 103 (4 devices) and 19 (2 devices, fault-heavy): a node / edge deleted just before an epoch restore,
-// or on the epoch the relay had already left, is back after the migration: the restored state still held it and the
-// merge against the old epoch's base reads it as added there (DESIGN §c.12; markdown text alike). The delete rule
-// exempts deletes an epoch restore overtook.
-test("sim: a canvas delete overtaken by an epoch restore is not a delete-rule violation (suite-1 seeds 103, 19)", async () => {
+// or on the epoch the relay had already left, came back after the migration: the restored state still held it and
+// the merge against the old epoch's base read it as added there. The migration now carries the old doc's deleted
+// record keys (DESIGN §c.12 "Deletes"), and the delete rule no longer exempts deletes an epoch restore overtook.
+test("sim: a canvas delete overtaken by an epoch restore stays deleted (suite-1 seeds 103, 19)", async () => {
 	const a = await runSim({ seed: 103, devices: 4, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
 	assert.deepEqual(a.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 	const b = await runSim({ seed: 19, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });

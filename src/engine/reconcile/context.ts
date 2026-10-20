@@ -10,6 +10,7 @@ import type {
 import { DEFAULT_BRAKE, type BrakeWindow, type DestructiveKind } from "../../core/plan/brake";
 import { conflictCopyNotice } from "../../core/plan/conflictName";
 import { DEFAULT_MERGE_LIMITS } from "../../core/merge/merge";
+import type { TextDeletes } from "./contentSteps";
 import { standInPathKey } from "../../core/plan/pathRules";
 import type { ClockPort } from "../../ports/clock";
 import type { HashPort } from "../../ports/crypto";
@@ -108,6 +109,17 @@ export interface ReconcilerDeps {
 	readonly pathBase?: (key: PathKey) => string | null;
 	/** The keys `pathBase` answers for (the planner's migrated-loser merge). */
 	readonly pathBaseKeys?: ReadonlySet<PathKey>;
+	/**
+	 * Record keys ("n:" / "e:" + id) the previous epoch's CRDT of the canvas at this path held deleted (§c.12): with
+	 * the path base, a record the new epoch holds that disk and base lack is one deleted, not one added. null = none.
+	 */
+	readonly pathDeleted?: (key: PathKey) => ReadonlySet<string> | null;
+	/**
+	 * The delete set of the previous epoch's markdown doc at this path, with its docId (§c.12): when the new epoch
+	 * holds that same doc (a restore keeps doc and item ids), its items in the set are text deleted before the
+	 * restore, not added after it (contentSteps.withTextDeletes). null = none.
+	 */
+	readonly pathTextDeletes?: (key: PathKey) => TextDeletes | null;
 	/**
 	 * A bound doc's replica already holds `text` (canonical): a save of one of its editors read it, or it is the
 	 * last disk text the replica absorbed (boundDisk). Such a disk side is not an edit: the merge base is the text.
