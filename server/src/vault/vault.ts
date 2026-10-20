@@ -4,11 +4,12 @@ import { DurableObject } from "cloudflare:workers";
 import { readStreamRelayConfig, type StreamsEnv } from "../streams/relay";
 import { SOCKET_KEEPALIVE_REQUEST, SOCKET_KEEPALIVE_RESPONSE } from "../shared/socketLiveness";
 import { CLOUDFLARE_UPGRADE_REJECT, CloudflareSocketRegistry } from "./cloudflare";
-import type { DeviceRecord } from "./devices";
+import type { IdentitySnapshot } from "./devices";
 import {
 	VaultHost,
 	type DeviceListing,
 	type FinishRestoreResult,
+	type GrantRevokeResult,
 	type MintedCode,
 	type PrepareRestoreResult,
 	type RewindResult,
@@ -78,6 +79,14 @@ export class VaultDO extends DurableObject<VaultEnv> {
 		return this.host.revokeDevice(deviceId);
 	}
 
+	/**
+	 * RPC: identity-per-store §3.4 "Revoke pairing": the grant and every device of it, in one synchronous turn (as
+	 * `revokeDevice`).
+	 */
+	revokeGrant(grantId: string): GrantRevokeResult {
+		return this.host.revokeGrant(grantId);
+	}
+
 	/** RPC: D5 vault delete, this object's part (sockets 1001, then `deleteAll()`). */
 	deleteVault(): Promise<{ deleted: true }> {
 		return this.host.deleteVault();
@@ -99,8 +108,8 @@ export class VaultDO extends DurableObject<VaultEnv> {
 	}
 
 	/** RPC: D8b step 3 (config DO only). */
-	finishRestore(restoreId: string, devices: DeviceRecord[]): FinishRestoreResult {
-		return this.host.finishRestore(restoreId, devices);
+	finishRestore(restoreId: string, snapshot: IdentitySnapshot): FinishRestoreResult {
+		return this.host.finishRestore(restoreId, snapshot);
 	}
 
 	webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {

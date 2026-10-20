@@ -14,7 +14,7 @@ import { sha256Hex } from "../../../server/src/hex";
 import type { StoragePort, VaultStoragePort } from "../../../server/src/ports";
 import { encodeAppendFrame } from "../../../server/src/streams/protocol";
 import { DEFAULT_STREAM_RELAY_CONFIG } from "../../../server/src/streams/relay";
-import type { DeviceRecord } from "../../../server/src/vault/devices";
+import type { IdentitySnapshot } from "../../../server/src/vault/devices";
 import { VaultHost } from "../../../server/src/vault/host";
 import type { VaultDO } from "../../../server/src/vault/vault";
 import type { WorkerEnv } from "../../../server/src/router";
@@ -167,7 +167,7 @@ export class VaultCluster {
 			prepareRestore: (restoreId, at, refreshOnly) =>
 				hooked("prepareRestore", () => stub().prepareRestore(restoreId, at, refreshOnly)),
 			rewind: (restoreId, bookmark) => hooked("rewind", () => stub().rewind(restoreId, bookmark)),
-			finishRestore: (restoreId, devices) => hooked("finishRestore", () => stub().finishRestore(restoreId, devices)),
+			finishRestore: (restoreId, snapshot) => hooked("finishRestore", () => stub().finishRestore(restoreId, snapshot)),
 		};
 	}
 
@@ -260,14 +260,15 @@ export class VaultCluster {
 				this.rpc(name, "mintOwnerCode", () => host().mintOwnerCode(purpose)),
 			listDevices: () => this.rpc(name, "listDevices", () => host().listDevices()),
 			revokeDevice: (deviceId: string) => this.rpc(name, "revokeDevice", () => host().revokeDevice(deviceId)),
+			revokeGrant: (grantId: string) => this.rpc(name, "revokeGrant", () => host().revokeGrant(grantId)),
 			deleteVault: () => this.rpc(name, "deleteVault", () => host().deleteVault()),
 			resetStreams: () => this.rpc(name, "resetStreams", () => host().resetStreams()),
 			prepareRestore: (restoreId: string, at: number, refreshOnly: boolean) =>
 				this.rpc(name, "prepareRestore", () => host().prepareRestore(restoreId, at, refreshOnly)),
 			rewind: (restoreId: string, bookmark: string) => this.rpc(name, "rewind", () => host().rewind(restoreId, bookmark)),
-			finishRestore: (restoreId: string, devices: DeviceRecord[]) =>
+			finishRestore: (restoreId: string, snapshot: IdentitySnapshot) =>
 				// RPC arguments are structured-cloned.
-				this.rpc(name, "finishRestore", () => host().finishRestore(restoreId, structuredClone(devices))),
+				this.rpc(name, "finishRestore", () => host().finishRestore(restoreId, structuredClone(snapshot))),
 		};
 	}
 

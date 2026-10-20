@@ -226,8 +226,12 @@ s.test("D3 replay: same code + request id + deviceId + token → the same 200, 0
 		assert.equal(object.model.totals.cf, 0);
 		assert.equal((await feed(object, laptop)).status, 401, "the replay did not restore the device");
 
-		// Re-enrolled under a new code: the old code's replay still refers to the revoked enrollment.
-		const back = await enroll(object, enrollBody(await mint(object), laptop, "enroll-request-again"));
+		// Identity-per-store §3.3: the revoked deviceId is tombstoned and never enrolls again, under any code.
+		const fresh = await mint(object);
+		const same = await enroll(object, enrollBody(fresh, laptop, "enroll-request-again"));
+		assert.deepEqual([same.status, await json(same)], [409, { error: "device_retired" }]);
+		// Re-enrolled under a new code with a new deviceId: the old code's replay still refers to the revoked enrollment.
+		const back = await enroll(object, enrollBody(fresh, { ...laptop, deviceId: "laptop-device-0002" }, "enroll-request-again"));
 		assert.equal(back.status, 200);
 		const stale = await enroll(object, request);
 		assert.equal(stale.status, 409);
@@ -387,7 +391,11 @@ s.test("D4 ticket: 0 rows; purpose streams only; the ticket opens a socket; bad,
 		const ready = object.registry.lastClient!.last("VAULT_READY")!;
 		assert.deepEqual([ready.vaultId, ready.deviceId, ready.principalId, ready.role], [vaultId, owner.deviceId,
 			`owner:${vaultId}`, "owner"]);
-		assert.equal(object.model.totals.cf, 0, "§6.2 ticket = 0 rows; the socket accept writes nothing");
+		assert.equal(object.model.totals.cf, 1, "§6.2 ticket: the day's first writes last_seen_day (1 row); the socket accept nothing");
+		assert.deepEqual([...object.model.totals.byTable], [["device", 1]]);
+		object.model.reset();
+		assert.equal((await post(object, "auth/ticket", owner, { purpose: "streams" })).status, 200);
+		assert.equal(object.model.totals.cf, 0, "§6.2 ticket = 0 rows for the rest of the UTC day");
 
 		const notUpgrade = await upgrade(object, ticket, {});
 		assert.equal(notUpgrade.status, 426, "DECISIONS-GAP: a valid ticket without the upgrade header");
@@ -446,8 +454,10 @@ s.test("T-REVOKE-GATE/-BUFFER/-SILENCE/-4403/-401: revoke is one synchronous tur
 		assert.deepEqual(result, { revoked: true, droppedFrames: 2, closedSockets: 2 });
 
 		// Everything below was already true when revokeDevice returned (no timer or microtask has run).
-		assert.equal(object.model.totals.cf, 1, "§6.2 revoke = 1 row");
-		assert.deepEqual(writes(object), ["DELETE FROM device WHERE device_id = ?"], "no flush: no stream row was written");
+		assert.equal(object.model.totals.cf, 2, "§6.2 revoke = 2 rows (the row and its tombstone)");
+		assert.deepEqual(writes(object), ["DELETE FROM device WHERE device_id = ?",
+			"INSERT OR IGNORE INTO retired_device (device_id, grant_id, retired_at) VALUES (?, ?, ?)"],
+			"no flush: no stream row was written");
 		assert.equal(object.host.admits(victim.deviceId), false, "GATE: the device map entry is gone");
 		for (const socket of victimSockets) {
 			assert.deepEqual(socket.last("error"),
@@ -511,7 +521,8 @@ s.test("D7 races: a revoke while a handler awaits crypto or a body wins; nothing
 		let victim = newDevice("victim-device-0001");
 		let enrolled = 0;
 		const reEnroll = async () => {
-			victim = newDevice("victim-device-0001");
+			// A revoked deviceId is tombstoned (identity-per-store §3.3): each round enrolls a new one.
+			victim = newDevice(`victim-device-${String(enrolled + 2).padStart(4, "0")}`);
 			const response = await enroll(object, enrollBody(await mint(object), victim, `enroll-request-${++enrolled}`.padEnd(16, "0")));
 			assert.equal(response.status, 200);
 		};
@@ -537,7 +548,7 @@ s.test("D7 races: a revoke while a handler awaits crypto or a body wins; nothing
 		object.model.reset();
 		const code = await duringCrypto("digest", 2, revoke, () => post(object, "auth/pairing-code", victim));
 		assert.equal(code.status, 401, "revoke during the code hash: no code is minted");
-		assert.deepEqual([...object.model.totals.byTable], [["device", 1]], "only the revoke wrote");
+		assert.deepEqual([...object.model.totals.byTable], [["device", 1], ["retired_device", 1]], "only the revoke wrote");
 
 		await reEnroll();
 		object.model.reset();
@@ -552,7 +563,7 @@ s.test("D7 races: a revoke while a handler awaits crypto or a body wins; nothing
 			`${INTERNAL}/streams/checkpoint?stream=ns&coversSeq=1&expectedCoversSeq=0`,
 			{ method: "PUT", headers: bearer(victim), body, duplex: "half" } as RequestInit));
 		assert.equal(checkpoint.status, 401, "revoke during the checkpoint body read");
-		assert.deepEqual([...object.model.totals.byTable], [["device", 1]], "no checkpoint row");
+		assert.deepEqual([...object.model.totals.byTable], [["device", 1], ["retired_device", 1]], "no checkpoint row");
 
 		// Vault delete while an enroll hashes: the enroll answers like an unknown vault and writes nothing.
 		const late = newDevice("late-device-00001");
@@ -605,7 +616,7 @@ s.test("D5 deleteVault: sockets close 1001, the buffer is dropped, deleteAll wip
 		const reEnroll = await enroll(object, enrollBody(code, newDevice("new-device-000001")));
 		assert.equal(reEnroll.status, 404);
 		assert.equal(await object.host.mintOwnerCode("owner-bootstrap"), null);
-		assert.deepEqual(object.host.listDevices(), { devices: [] });
+		assert.deepEqual(object.host.listDevices(), { devices: [], grants: [] });
 		assert.deepEqual(object.host.revokeDevice(owner.deviceId), { revoked: false, droppedFrames: 0, closedSockets: 0 });
 		object.restart();
 		assert.equal(object.host.load(), null, "a new runtime sees no vault");

@@ -3,6 +3,10 @@
 // epoch check, the blob bearer checks (D9, and the blob GC limit) and the streams relay. vault.ts wraps it in the Cloudflare Durable Object
 // class; tests run it on Node with SQLite and fake sockets.
 //
+// Pairing grants (identity-per-store §3, phase 1): a grant enroll, register, retire by key, self-retire, leave,
+// grant-authenticated pairing codes, the per-grant limits, tombstones, `last_seen_day`, and the operator's revoke
+// pairing. Every retire (self, by key, operator, grant revoke) is a D7 revoke plus a tombstone, in one turn.
+//
 // The Worker forwards a device route as `https://vault.internal/<rest>?<query>` (the path after /vault/:id, or
 // /enroll), after its own method, path and format checks, with the public origin in `X-YAOS-Origin`. This object
 // never calls the config DO (D8b too: the config DO calls prepareRestore, rewind and finishRestore).
@@ -13,7 +17,7 @@
 import { randomBase64Url } from "../base64url";
 import { DailyLimitLatch, dailyLimitResponse, instrumentStorageForDailyLimit } from "../dailyLimit";
 import { bytesToHex, hexToBytes } from "../hex";
-import { bearerToken, isWebSocketUpgrade, json, notFound, rejectSocket, releaseUnreadBody } from "../http";
+import { bearerToken, grantSecret, isWebSocketUpgrade, json, notFound, rejectSocket, releaseUnreadBody } from "../http";
 import { WindowLimiter, tooManyAttempts } from "../limiter";
 import {
 	SYSTEM_CLOCK,
@@ -31,19 +35,34 @@ import { buildMobileSetupUrl, buildObsidianPairingUrl } from "../setupQr";
 import { StreamRelayService, type StreamActor, type StreamRelayConfig } from "../streams/relay";
 import { StreamStore } from "../streams/store";
 import { isVaultId } from "../vaultId";
-import { DeviceMap, type DeviceRecord } from "./devices";
 import {
+	DeviceMap,
+	GrantMap,
+	type DeviceRecord,
+	type GrantRecord,
+	type IdentitySnapshot,
+	type RetiredRecord,
+} from "./devices";
+import {
+	DAY_MS,
 	ENROLL_FAILURE_LIMIT,
 	ENROLL_FAILURE_WINDOW_MS,
+	GRANT_LIVE_DEVICE_LIMIT,
+	GRANT_REGISTRATIONS_PER_DAY,
 	PAIRING_CODE_RETENTION_MS,
 	PAIRING_CODE_TTL_MS,
 	mintPairingSecret,
 	parseEnrollRequest,
+	parseRegisterRequest,
+	parseRetireRequest,
 	uniqueDeviceName,
+	utcDay,
+	utcDayString,
 	type EnrollRequest,
+	type GrantEnrollRequest,
 	type PairingPurpose,
 } from "./pairing";
-import { VAULT_SCHEMA } from "./schema";
+import { VAULT_SCHEMA, migrateIdentityV2 } from "./schema";
 import { TICKET_TTL_MS, importTicketKey, signTicket, verifyTicket } from "./ticket";
 
 /** D6: `capabilityDigestForRole("owner")` of the removed server/src/collaboration.ts:93-97, frozen as a literal. */
@@ -114,6 +133,7 @@ export interface VaultMeta {
 export interface VaultState {
 	meta: VaultMeta;
 	devices: DeviceMap;
+	grants: GrantMap;
 }
 
 export interface VaultInitResult {
@@ -129,13 +149,29 @@ export interface MintedCode {
 	purpose: PairingPurpose;
 }
 
+/**
+ * `GET /operator/vaults/:id/devices` (T-DEVICES-LIST: no token, secret or retire-key material). A device carries
+ * `grantId` and `lastSeenDay` (`YYYY-MM-DD`, UTC) only when it has them, so an old enroll lists as before. `grants`
+ * (identity-per-store §6.3) lists every grant, revoked ones too; `lastSeenDay` is the latest over its live devices.
+ */
 export interface DeviceListing {
-	devices: Array<{ deviceId: string; deviceName: string; enrolledAt: number }>;
+	devices: Array<{ deviceId: string; deviceName: string; enrolledAt: number; grantId?: string; lastSeenDay?: string }>;
+	grants: Array<{ grantId: string; name: string; createdAt: number; revokedAt: number | null; liveDevices: number;
+		lastSeenDay: string | null }>;
+}
+
+/** The operator's "Revoke pairing" (`DELETE /operator/vaults/:id/grants/:grantId`) and the device's leave. */
+export interface GrantRevokeResult {
+	/** false: unknown or already revoked (idempotent). */
+	revoked: boolean;
+	retiredDevices: number;
+	droppedFrames: number;
+	closedSockets: number;
 }
 
 /** D8b step 1. `skip`: a resume after the rewind (the marker is gone); the journal's snapshot stands. */
 export type PrepareRestoreResult =
-	| { kind: "prepared"; bookmark: string; devices: DeviceRecord[] }
+	| ({ kind: "prepared"; bookmark: string } & IdentitySnapshot)
 	| { kind: "skip" }
 	| { kind: "finished"; vaultEpoch: string }
 	| { kind: "unsupported" }
@@ -182,12 +218,41 @@ type MetaRow = {
 	vault_id: string; vault_generation: string; ticket_key: ArrayBuffer; created_at: number;
 	pending_restore_id: string | null; last_restore_id: string | null; last_restore_at: number | null;
 };
-type CodeRow = { expires_at: number; used_at: number | null; used_request_id: string | null; used_device_id: string | null };
+type CodeRow = {
+	expires_at: number; used_at: number | null; used_request_id: string | null; used_device_id: string | null;
+	used_grant_id: string | null;
+};
 
+/** The authority fields of a device row (`lastSeenDay` is bookkeeping: a restore updates it in place). */
 function sameDevice(a: DeviceRecord, b: DeviceRecord): boolean {
 	return a.tokenHash === b.tokenHash && a.deviceId === b.deviceId && a.deviceName === b.deviceName
-		&& a.enrollmentRequestId === b.enrollmentRequestId && a.enrolledAt === b.enrolledAt;
+		&& a.enrollmentRequestId === b.enrollmentRequestId && a.enrolledAt === b.enrolledAt
+		&& a.grantId === b.grantId && a.retireHash === b.retireHash;
 }
+
+function sameGrant(a: GrantRecord, b: GrantRecord): boolean {
+	return a.grantId === b.grantId && a.secretHash === b.secretHash && a.name === b.name
+		&& a.enrollmentRequestId === b.enrollmentRequestId && a.createdAt === b.createdAt && a.revokedAt === b.revokedAt
+		&& a.registeredDay === b.registeredDay && a.registeredCount === b.registeredCount;
+}
+
+const DEVICE_INSERT = "INSERT INTO device (token_hash, device_id, device_name, enrollment_request_id, enrolled_at,"
+	+ " grant_id, retire_hash, last_seen_day) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+const GRANT_INSERT = "INSERT INTO pairing_grant (grant_id, secret_hash, grant_name, enrollment_request_id, created_at,"
+	+ " revoked_at, registered_day, registered_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+
+function deviceRow(device: DeviceRecord): unknown[] {
+	return [hexToBytes(device.tokenHash).buffer, device.deviceId, device.deviceName, device.enrollmentRequestId,
+		device.enrolledAt, device.grantId, device.retireHash === null ? null : hexToBytes(device.retireHash).buffer,
+		device.lastSeenDay];
+}
+
+function grantRow(grant: GrantRecord): unknown[] {
+	return [grant.grantId, hexToBytes(grant.secretHash).buffer, grant.name, grant.enrollmentRequestId, grant.createdAt,
+		grant.revokedAt, grant.registeredDay, grant.registeredCount];
+}
+
+const unauthorized = () => json({ error: "unauthorized" }, 401);
 
 /** D8b `503 restore_in_progress` with `Retry-After` (the flag's remaining seconds, at least 1). */
 function restoreInProgress(retryAfterMs: number): Response {
@@ -302,16 +367,32 @@ export class VaultHost {
 		} catch (error) {
 			if (!isMissingTableError(error, "vault_meta")) throw error;
 		}
-		this.state = row
-			? {
-				meta: { vaultId: row.vault_id, vaultGeneration: row.vault_generation,
-					ticketKey: new Uint8Array(row.ticket_key), createdAt: row.created_at,
-					pendingRestoreId: row.pending_restore_id, lastRestoreId: row.last_restore_id,
-					lastRestoreAt: row.last_restore_at },
-				devices: DeviceMap.load(this.storage),
-			}
-			: null;
+		if (!row) {
+			this.state = null;
+			return null;
+		}
+		// Grants first: "no such table" here is a v1 vault, migrated before the device scan reads the v2 columns.
+		const grants = this.loadGrants();
+		this.state = {
+			meta: { vaultId: row.vault_id, vaultGeneration: row.vault_generation,
+				ticketKey: new Uint8Array(row.ticket_key), createdAt: row.created_at,
+				pendingRestoreId: row.pending_restore_id, lastRestoreId: row.last_restore_id,
+				lastRestoreAt: row.last_restore_at },
+			devices: DeviceMap.load(this.storage),
+			grants,
+		};
 		return this.state;
+	}
+
+	/** The grant scan, or the identity v2 migration of a v1 vault (schema.ts G54; not an `identityWrites` write). */
+	private loadGrants(): GrantMap {
+		try {
+			return GrantMap.load(this.storage);
+		} catch (error) {
+			if (!isMissingTableError(error, "pairing_grant")) throw error;
+		}
+		migrateIdentityV2(this.storage);
+		return new GrantMap();
 	}
 
 	/** The D7 gate: `deviceId` is enrolled in this vault right now (memory only after the first load). */
@@ -342,7 +423,7 @@ export class VaultHost {
 				meta.vaultId, meta.vaultGeneration, ticketKey.buffer, meta.createdAt,
 			);
 		});
-		this.state = { meta, devices: new DeviceMap() };
+		this.state = { meta, devices: new DeviceMap(), grants: new GrantMap() };
 		return { vaultId, vaultGeneration: meta.vaultGeneration, created: true };
 	}
 
@@ -375,11 +456,22 @@ export class VaultHost {
 			case "GET /ws/streams":
 				// §2.2: an unknown vault gets the `unauthorized` frame and 1008.
 				return state ? await this.upgrade(request, url, state) : rejectSocket(request, this.upgrades, "unauthorized");
+			// Identity-per-store §3.2. An unknown vault answers like a bad credential (§2.2), before any body read.
+			case "POST /auth/device":
+				return state ? await this.registerDevice(request) : unauthorized();
+			case "POST /auth/device/retire":
+				return state ? await this.retireByKey(request) : unauthorized();
+			case "DELETE /auth/grant":
+				return state ? await this.leaveGrant(request) : unauthorized();
+			case "POST /auth/pairing-code":
+				// A grant secret may mint a code too (owner decision 3); a bearer takes the device path below.
+				if (grantSecret(request) !== null) return state ? await this.grantPairingCode(request) : unauthorized();
+				break;
+			case "DELETE /auth/device":
 			case "GET /streams/feed":
 			case "GET /streams/read":
 			case "PUT /streams/checkpoint":
 			case "POST /auth/ticket":
-			case "POST /auth/pairing-code":
 			case "POST /blobs/auth":
 			case "POST /blobs/gc-auth":
 			case "POST /debug/simulate-daily-limit":
@@ -412,6 +504,8 @@ export class VaultHost {
 				return await this.issueTicket(request, device);
 			case "POST /auth/pairing-code":
 				return await this.devicePairingCode(request, device);
+			case "DELETE /auth/device":
+				return this.selfRetire(device);
 			case "POST /blobs/auth":
 				// D9: the Worker asks this before any R2 call; 204 = an enrolled device's bearer.
 				return new Response(null, { status: 204 });
@@ -508,11 +602,16 @@ export class VaultHost {
 	 * `POST /auth/pairing-code` (bearer): §5 row 2.5, purpose `device` only (absent = device; else `400
 	 * invalid_purpose`) → `{pairingCode, expiresAt, purpose, obsidianUrl, mobileSetupUrl}`.
 	 */
-	private async devicePairingCode(request: Request, device: DeviceRecord): Promise<Response> {
+	private devicePairingCode(request: Request, device: DeviceRecord): Promise<Response> {
+		return this.pairingCodeResponse(request, () => this.admits(device.deviceId));
+	}
+
+	/** The pairing-code body rule and answer; `stillAllowed` is the credential's check in the writing turn. */
+	private async pairingCodeResponse(request: Request, stillAllowed: () => boolean): Promise<Response> {
 		const body = await readSmallJson(request);
 		if (body.purpose !== undefined && body.purpose !== "device") return json({ error: "invalid_purpose" }, 400);
 		const host = publicOrigin(request);
-		const minted = await this.mintCode("device", () => this.admits(device.deviceId));
+		const minted = await this.mintCode("device", stillAllowed);
 		if (!minted) return json({ error: "unauthorized" }, 401);
 		return json({ pairingCode: minted.pairingCode, expiresAt: minted.expiresAt, purpose: minted.purpose,
 			obsidianUrl: buildObsidianPairingUrl(host, minted.pairingCode),
@@ -532,6 +631,7 @@ export class VaultHost {
 		if (parsed === "request") return json({ error: "invalid enrollment request" }, 400);
 		const host = publicOrigin(request);
 		if (parsed.vaultId !== state.meta.vaultId) return this.codeFailure(404, "invalid_code");
+		if ("grantSecret" in parsed) return await this.enrollGrant(parsed, host);
 		const [codeHash, tokenDigest] = await Promise.all([sha256(parsed.secret), sha256(parsed.deviceToken)]);
 		// Synchronous from here to the response: the code row, the device map and the write are one turn.
 		const current = this.load();
@@ -540,10 +640,7 @@ export class VaultHost {
 		const restoring = this.restoreBlocked();
 		if (restoring) return restoring;
 		const tokenHash = bytesToHex(tokenDigest);
-		const code = this.storage.sql.exec<CodeRow>(
-			"SELECT expires_at, used_at, used_request_id, used_device_id FROM pairing_code WHERE code_hash = ?",
-			codeHash.buffer,
-		).toArray()[0];
+		const code = this.codeRow(codeHash);
 		if (!code) return this.codeFailure(404, "invalid_code");
 		if (code.used_at !== null) {
 			// DECISIONS-GAP: a replay is answered after the code's expiry too (D3 keys it on the used code only); the
@@ -557,6 +654,9 @@ export class VaultHost {
 		if (current.devices.byId(parsed.deviceId) || current.devices.byTokenHash(tokenHash)) {
 			return json({ error: "device_exists" }, 409);
 		}
+		// Identity-per-store §3.3: a retired deviceId never comes back, through the old enroll either (it used to: the
+		// live-row check above sees only live rows). The current client mints a new deviceId per attempt.
+		if (this.isRetired(parsed.deviceId)) return json({ error: "device_retired" }, 409);
 		const names = new Set<string>();
 		for (const device of current.devices.list()) names.add(device.deviceName);
 		const record: DeviceRecord = {
@@ -565,6 +665,9 @@ export class VaultHost {
 			deviceName: uniqueDeviceName(parsed.deviceName, names),
 			enrollmentRequestId: parsed.enrollmentRequestId,
 			enrolledAt: this.clock.now(),
+			grantId: null,
+			retireHash: null,
+			lastSeenDay: null,
 		};
 		this.storage.transactionSync(() => {
 			this.storage.sql.exec(
@@ -607,6 +710,254 @@ export class VaultHost {
 		return json({ error }, status);
 	}
 
+	private codeRow(codeHash: Uint8Array): CodeRow | undefined {
+		return this.storage.sql.exec<CodeRow>(
+			"SELECT expires_at, used_at, used_request_id, used_device_id, used_grant_id FROM pairing_code WHERE code_hash = ?",
+			codeHash.buffer,
+		).toArray()[0];
+	}
+
+	/** One PK read of `retired_device` (tombstones are never loaded into memory, §6.2). */
+	private isRetired(deviceId: string): boolean {
+		return this.storage.sql.exec("SELECT device_id FROM retired_device WHERE device_id = ?", deviceId).toArray().length > 0;
+	}
+
+	// ---- identity-per-store §3: pairing grants --------------------------------------------------------------------
+
+	/**
+	 * `POST /enroll {pairingCode, enrollmentRequestId, grantSecret, grantName}` (§3.2): the code buys a grant. Rows: 2
+	 * (UPDATE pairing_code + INSERT pairing_grant); a replay 0. The D3 replay rule holds with the grant in the
+	 * device's place: the same code, request id and secret hash while the grant is live → the same 200; another
+	 * secret → `409 enrollment_request_conflict`; the grant revoked → `409 used_code`. The 200 echoes the secret the
+	 * client sent (as the old body echoes deviceToken) and names the grant; no device is registered here.
+	 */
+	private async enrollGrant(parsed: GrantEnrollRequest, host: string): Promise<Response> {
+		const [codeHash, secretDigest] = await Promise.all([sha256(parsed.secret), sha256(parsed.grantSecret)]);
+		const current = this.load();
+		if (!current) return json({ error: "invalid_code" }, 404);
+		const restoring = this.restoreBlocked();
+		if (restoring) return restoring;
+		const secretHash = bytesToHex(secretDigest);
+		const code = this.codeRow(codeHash);
+		if (!code) return this.codeFailure(404, "invalid_code");
+		if (code.used_at !== null) {
+			if (code.used_request_id !== parsed.enrollmentRequestId) return this.codeFailure(409, "used_code");
+			// The code was used by an old (device) enroll with this request id: another body under the same id.
+			if (code.used_grant_id === null) return json({ error: "enrollment_request_conflict" }, 409);
+			const grant = current.grants.byId(code.used_grant_id);
+			if (!grant || grant.revokedAt !== null) return this.codeFailure(409, "used_code");
+			if (grant.secretHash !== secretHash) return json({ error: "enrollment_request_conflict" }, 409);
+			return this.grantEnrolled(current, grant, parsed.grantSecret, host);
+		}
+		if (code.expires_at <= this.clock.now()) return this.codeFailure(410, "expired_code");
+		// One secret, one grant: a secret already in use (even a revoked grant's) is refused, never shared.
+		if (current.grants.bySecretHash(secretHash)) return json({ error: "grant_exists" }, 409);
+		const names = new Set<string>();
+		for (const grant of current.grants.list()) if (grant.revokedAt === null) names.add(grant.name);
+		for (const device of current.devices.list()) if (device.grantId === null) names.add(device.deviceName);
+		const now = this.clock.now();
+		const grant: GrantRecord = {
+			grantId: randomBase64Url(16),
+			secretHash,
+			name: uniqueDeviceName(parsed.grantName, names),
+			enrollmentRequestId: parsed.enrollmentRequestId,
+			createdAt: now,
+			revokedAt: null,
+			registeredDay: 0,
+			registeredCount: 0,
+		};
+		this.storage.transactionSync(() => {
+			this.storage.sql.exec(
+				"UPDATE pairing_code SET used_at = ?, used_request_id = ?, used_grant_id = ? WHERE code_hash = ?",
+				now, parsed.enrollmentRequestId, grant.grantId, codeHash.buffer,
+			);
+			this.storage.sql.exec(GRANT_INSERT, ...grantRow(grant));
+		});
+		this.identityWrites++;
+		current.grants.add(grant);
+		return this.grantEnrolled(current, grant, parsed.grantSecret, host);
+	}
+
+	/** The grant enroll 200: `{host, vaultId, grantId, grantSecret, grantName, vaultGeneration}`. */
+	private grantEnrolled(state: VaultState, grant: GrantRecord, secret: string, host: string): Response {
+		return json({ host, vaultId: state.meta.vaultId, grantId: grant.grantId, grantSecret: secret,
+			grantName: grant.name, vaultGeneration: state.meta.vaultGeneration });
+	}
+
+	/**
+	 * The grant named by `Authorization: Grant <secret>`, read after the hash (a revoke during it wins). `unknown`
+	 * counts against the D3 failure limiter (§3.3: wrong secrets are guesses); a revoked grant is a known credential.
+	 */
+	private async grantOf(request: Request): Promise<{ kind: "none" | "unknown" } | { kind: "grant"; grant: GrantRecord }> {
+		const secret = grantSecret(request);
+		if (secret === null) return { kind: "none" };
+		const secretHash = bytesToHex(await sha256(secret));
+		const grant = this.load()?.grants.bySecretHash(secretHash);
+		if (!grant) {
+			this.enrollFailures.record();
+			return { kind: "unknown" };
+		}
+		return { kind: "grant", grant };
+	}
+
+	/**
+	 * `POST /auth/device {deviceId, deviceToken, retireKeyHash}` (§3.2 register): a new store's identity under a
+	 * grant, authenticated by the grant secret or by the bearer of a live device of that grant (the epoch migration's
+	 * old store). Rows: 2 (INSERT device + UPDATE the grant's day counter); an idempotent retry 0. Order: limiter →
+	 * credential (401; `401 grant_revoked`; `403 grant_required` for a device enrolled without a grant) → restore →
+	 * body (400) → same deviceId and token under the same grant (200 again) → `409 device_exists` → tombstone (`409
+	 * device_retired`, one read) → `429 registration_limit` (20 a UTC day, Retry-After to midnight) → `409
+	 * device_limit` (50 live). The device takes the grant's name.
+	 */
+	private async registerDevice(request: Request): Promise<Response> {
+		const blocked = this.enrollFailures.retryAfterMs();
+		if (blocked > 0) return tooManyAttempts(blocked);
+		const token = grantSecret(request) === null ? bearerToken(request) : null;
+		if (grantSecret(request) === null && token === null) return unauthorized();
+		const [credential, bearer, body] = await Promise.all([this.grantOf(request),
+			token === null ? Promise.resolve(null) : this.authenticate(request), readSmallJson(request)]);
+		const parsed = parseRegisterRequest(body);
+		const tokenDigest = parsed ? await sha256(parsed.deviceToken) : null;
+		// Synchronous from here to the response: the grant, the device map and the write are one turn.
+		const current = this.load();
+		if (!current) return unauthorized();
+		let grant: GrantRecord | undefined;
+		if (credential.kind === "grant") grant = current.grants.byId(credential.grant.grantId);
+		else if (credential.kind === "unknown") return unauthorized();
+		else {
+			const device = bearer ? current.devices.byId(bearer.deviceId) : undefined;
+			if (!device) return unauthorized();
+			if (device.grantId === null) return json({ error: "grant_required" }, 403);
+			grant = current.grants.byId(device.grantId);
+		}
+		if (!grant) return unauthorized();
+		if (grant.revokedAt !== null) return json({ error: "grant_revoked" }, 401);
+		const restoring = this.restoreBlocked();
+		if (restoring) return restoring;
+		if (!parsed || !tokenDigest) return json({ error: "invalid_request" }, 400);
+		const tokenHash = bytesToHex(tokenDigest);
+		const existing = current.devices.byId(parsed.deviceId);
+		if (existing) {
+			if (existing.tokenHash === tokenHash && existing.grantId === grant.grantId && existing.retireHash === parsed.retireHash) {
+				return this.registered(current, existing);
+			}
+			return json({ error: "device_exists" }, 409);
+		}
+		if (current.devices.byTokenHash(tokenHash)) return json({ error: "device_exists" }, 409);
+		if (this.isRetired(parsed.deviceId)) return json({ error: "device_retired" }, 409);
+		const now = this.clock.now();
+		const today = utcDay(now);
+		const usedToday = grant.registeredDay === today ? grant.registeredCount : 0;
+		if (usedToday >= GRANT_REGISTRATIONS_PER_DAY) {
+			const response = json({ error: "registration_limit" }, 429);
+			response.headers.set("Retry-After", String(Math.max(1, Math.ceil(((today + 1) * DAY_MS - now) / 1000))));
+			return response;
+		}
+		// DECISIONS-GAP (G59): at the cap, refuse; nothing is retired to make room (inactivity retirement is phase 5).
+		if (current.devices.ofGrant(grant.grantId).length >= GRANT_LIVE_DEVICE_LIMIT) {
+			return json({ error: "device_limit" }, 409);
+		}
+		const record: DeviceRecord = {
+			tokenHash,
+			deviceId: parsed.deviceId,
+			deviceName: grant.name,
+			enrollmentRequestId: "",
+			enrolledAt: now,
+			grantId: grant.grantId,
+			retireHash: parsed.retireHash,
+			// Registering is being seen: the store's first ticket today writes nothing more.
+			lastSeenDay: today,
+		};
+		const grantId = grant.grantId;
+		this.storage.transactionSync(() => {
+			this.storage.sql.exec(DEVICE_INSERT, ...deviceRow(record));
+			this.storage.sql.exec("UPDATE pairing_grant SET registered_day = ?, registered_count = ? WHERE grant_id = ?",
+				today, usedToday + 1, grantId);
+		});
+		this.identityWrites++;
+		grant.registeredDay = today;
+		grant.registeredCount = usedToday + 1;
+		current.devices.add(record);
+		return this.registered(current, record);
+	}
+
+	/** The register 200: no token material (the client holds its token and retire key). */
+	private registered(state: VaultState, device: DeviceRecord): Response {
+		return json({ vaultId: state.meta.vaultId, deviceId: device.deviceId, deviceName: device.deviceName,
+			grantId: device.grantId, vaultGeneration: state.meta.vaultGeneration });
+	}
+
+	/**
+	 * `POST /auth/device/retire {deviceId, retireKey}` (§3.2, the successor fence of §5.2): the key's hash must be the
+	 * device's `retire_hash`. A device that is gone (retired, or never registered) is `200 {retired: false}`: "already
+	 * gone counts as done". A wrong key, or a device without a retire key (old enroll), is `401 unauthorized` and
+	 * counts against the D3 limiter. Rows: 2 (DELETE device + INSERT tombstone).
+	 */
+	private async retireByKey(request: Request): Promise<Response> {
+		const blocked = this.enrollFailures.retryAfterMs();
+		if (blocked > 0) return tooManyAttempts(blocked);
+		const parsed = parseRetireRequest(await readSmallJson(request));
+		if (!parsed) return json({ error: "invalid_request" }, 400);
+		const keyHash = bytesToHex(await sha256(parsed.retireKey));
+		const current = this.load();
+		if (!current) return unauthorized();
+		const device = current.devices.byId(parsed.deviceId);
+		// DECISIONS-GAP (G60): gone or never registered is done, not an error.
+		if (!device) return json({ ok: true, deviceId: parsed.deviceId, retired: false });
+		if (device.retireHash === null || device.retireHash !== keyHash) return this.codeFailure(401, "unauthorized");
+		const restoring = this.restoreBlocked();
+		if (restoring) return restoring;
+		this.retireDevices(current, [device]);
+		return json({ ok: true, deviceId: device.deviceId, retired: true });
+	}
+
+	/**
+	 * `DELETE /auth/device` (bearer, §3.2 self-retire): the bearer's own device is retired. `200 {ok, deviceId,
+	 * retired: true}`; a second call is 401 (the token is dead), which the client's `retireDeviceEnrollment` counts
+	 * as done. Works for a device of the old enroll too. Rows: 2.
+	 */
+	private selfRetire(device: DeviceRecord): Response {
+		const current = this.load();
+		const live = current?.devices.byId(device.deviceId);
+		if (!current || !live || live.tokenHash !== device.tokenHash) return unauthorized();
+		this.retireDevices(current, [live]);
+		return json({ ok: true, deviceId: live.deviceId, retired: true });
+	}
+
+	/**
+	 * `DELETE /auth/grant` (grant secret, §3.2 leave): the grant is revoked and its devices retired, as the
+	 * operator's "Revoke pairing". `200 {ok, grantId, revoked, retiredDevices}`; an already revoked grant is
+	 * `revoked: false`, so a retry after a lost response is a no-op.
+	 */
+	private async leaveGrant(request: Request): Promise<Response> {
+		const blocked = this.enrollFailures.retryAfterMs();
+		if (blocked > 0) return tooManyAttempts(blocked);
+		const credential = await this.grantOf(request);
+		if (credential.kind !== "grant") return unauthorized();
+		const restoring = this.restoreBlocked();
+		if (restoring) return restoring;
+		const result = this.revokeGrant(credential.grant.grantId);
+		return json({ ok: true, grantId: credential.grant.grantId, revoked: result.revoked,
+			retiredDevices: result.retiredDevices });
+	}
+
+	/**
+	 * `POST /auth/pairing-code` with `Authorization: Grant <secret>` (owner decision 3: main holds the grant, not a
+	 * device token). Same body, purpose rule and answer as the bearer route; `401 grant_revoked` for a revoked grant.
+	 */
+	private async grantPairingCode(request: Request): Promise<Response> {
+		const blocked = this.enrollFailures.retryAfterMs();
+		if (blocked > 0) return tooManyAttempts(blocked);
+		const credential = await this.grantOf(request);
+		if (credential.kind !== "grant") return unauthorized();
+		if (credential.grant.revokedAt !== null) return json({ error: "grant_revoked" }, 401);
+		const restoring = this.restoreBlocked();
+		if (restoring) return restoring;
+		const grantId = credential.grant.grantId;
+		return await this.pairingCodeResponse(request,
+			() => this.load()?.grants.byId(grantId)?.revokedAt === null);
+	}
+
 	// ---- D4 tickets and the streams socket ----------------------------------------------------------------------
 
 	private importedKey(state: VaultState): Promise<CryptoKey> {
@@ -626,8 +977,29 @@ export class VaultHost {
 		const issued = await signTicket(await this.importedKey(state), ownerActor(state.meta, device), this.clock.now(),
 			this.ticketTtlMs);
 		// A revoke during the signature wins: the ticket would not open a socket anyway (the upgrade re-checks).
-		if (!this.admits(device.deviceId)) return json({ error: "unauthorized" }, 401);
+		const live = this.load()?.devices.byId(device.deviceId);
+		if (!live) return json({ error: "unauthorized" }, 401);
+		this.noteSeen(live);
 		return json(issued);
+	}
+
+	/**
+	 * DECISIONS-GAP (G63). Identity-per-store §6.2 `last_seen_day`: the first ticket of a UTC day writes it, so ≤ 1 row per device per day
+	 * (owner decision 4 accepts this deviation from §6.1's "0 rows per bearer auth"). Bookkeeping only: skipped while
+	 * the daily limit is latched, and a failed write never refuses the ticket. Not an `identityWrites` write: a ticket
+	 * in the D8b rewind window must not force a re-rewind, and finish sets every row's value from the snapshot anyway.
+	 */
+	private noteSeen(device: DeviceRecord): void {
+		const today = utcDay(this.clock.now());
+		if (device.lastSeenDay === today || this.latch.active()) return;
+		try {
+			this.storage.sql.exec("UPDATE device SET last_seen_day = ? WHERE token_hash = ?", today,
+				hexToBytes(device.tokenHash).buffer);
+			device.lastSeenDay = today;
+		} catch (error) {
+			this.latch.note(error);
+			console.warn("[yaos-vault] last_seen_day write failed", describeError(error));
+		}
 	}
 
 	/**
@@ -669,33 +1041,91 @@ export class VaultHost {
 
 	// ---- operator RPCs: devices, D7 revoke, D5 delete --------------------------------------------------------------
 
-	/** `GET /operator/vaults/:id/devices`: no token material (T-DEVICES-LIST). 0 rows written. */
+	/** `GET /operator/vaults/:id/devices`: no token material (T-DEVICES-LIST). 0 rows written. DECISIONS-GAP (G61). */
 	listDevices(): DeviceListing {
 		const state = this.load();
 		const devices = state ? [...state.devices.list()] : [];
 		devices.sort((a, b) => a.enrolledAt - b.enrolledAt || a.deviceId.localeCompare(b.deviceId));
-		return { devices: devices.map((d) => ({ deviceId: d.deviceId, deviceName: d.deviceName, enrolledAt: d.enrolledAt })) };
+		const grants = state ? [...state.grants.list()] : [];
+		grants.sort((a, b) => a.createdAt - b.createdAt || a.grantId.localeCompare(b.grantId));
+		return {
+			devices: devices.map((d) => ({ deviceId: d.deviceId, deviceName: d.deviceName, enrolledAt: d.enrolledAt,
+				...(d.grantId !== null ? { grantId: d.grantId } : {}),
+				...(d.lastSeenDay !== null ? { lastSeenDay: utcDayString(d.lastSeenDay) } : {}) })),
+			grants: grants.map((g) => {
+				const live = devices.filter((d) => d.grantId === g.grantId);
+				const seen = Math.max(-1, ...live.map((d) => d.lastSeenDay ?? -1));
+				return { grantId: g.grantId, name: g.name, createdAt: g.createdAt, revokedAt: g.revokedAt,
+					liveDevices: live.length, lastSeenDay: seen < 0 ? null : utcDayString(seen) };
+			}),
+		};
 	}
 
 	/**
-	 * D7 revoke: ONE synchronous turn, no await. The device row is deleted (1 row; §6.1: no secondary index, the
-	 * DELETE scans the few device rows) and its device-map entry removed, so the gate shuts with the transaction;
-	 * then the relay drops the device's buffered frames (never committed, no receipt; no flush), tells peers that
-	 * held their PROVISIONALs, and sends each of the device's sockets `authority_superseded` + close 4403. The
-	 * caller's HTTP response leaves after this returns. Idempotent: an unknown device is `revoked: false`.
+	 * D7 revoke ("Remove device"): ONE synchronous turn, no await (`retireDevices`). Idempotent: an unknown device is
+	 * `revoked: false`. Identity-per-store §6.2: the removed deviceId is tombstoned, so it never comes back; an install
+	 * that still holds a live grant registers a new device on its next start (§3.4).
 	 */
 	revokeDevice(deviceId: string): { revoked: boolean; droppedFrames: number; closedSockets: number } {
 		const state = this.load();
 		const record = state?.devices.byId(deviceId);
 		if (state && record) {
-			this.storage.transactionSync(() => {
-				this.storage.sql.exec("DELETE FROM device WHERE device_id = ?", deviceId);
-			});
-			this.identityWrites++;
-			state.devices.remove(deviceId);
+			const { droppedFrames, closedSockets } = this.retireDevices(state, [record]);
+			return { revoked: true, droppedFrames, closedSockets };
 		}
 		const { droppedFrames, closedSockets } = this.relay.revokeDevice(deviceId);
-		return { revoked: record !== undefined, droppedFrames, closedSockets };
+		return { revoked: false, droppedFrames, closedSockets };
+	}
+
+	/**
+	 * Identity-per-store §3.4 "Revoke pairing" (operator) and leave (the grant's holder): ONE synchronous turn. The
+	 * grant gets `revoked_at` (it is kept, so its secret answers `401 grant_revoked` and is never reused) and every
+	 * live device of it is retired: 1 + 2·D rows. Idempotent: an unknown or already revoked grant is `revoked: false`.
+	 */
+	revokeGrant(grantId: string): GrantRevokeResult {
+		const state = this.load();
+		const grant = state?.grants.byId(grantId);
+		if (!state || !grant || grant.revokedAt !== null) {
+			return { revoked: false, retiredDevices: 0, droppedFrames: 0, closedSockets: 0 };
+		}
+		const now = this.clock.now();
+		const devices = state.devices.ofGrant(grantId);
+		const { droppedFrames, closedSockets } = this.retireDevices(state, devices, () => {
+			this.storage.sql.exec("UPDATE pairing_grant SET revoked_at = ? WHERE grant_id = ?", now, grantId);
+		});
+		grant.revokedAt = now;
+		return { revoked: true, retiredDevices: devices.length, droppedFrames, closedSockets };
+	}
+
+	/**
+	 * Every retire (D7 revoke, self, by key, grant revoke): ONE `transactionSync` deletes the device rows (1 row each;
+	 * §6.1: no secondary index, the DELETE scans the few device rows), inserts their tombstones (1 row each) and runs
+	 * `alsoWrite`; the device-map entries go with it, so the gate shuts with the transaction. Then, per device, the
+	 * relay drops its buffered frames (never committed, no receipt; no flush), tells peers that held their
+	 * PROVISIONALs, and sends each of its sockets `authority_superseded` + close 4403. The caller's response leaves
+	 * after this returns.
+	 */
+	private retireDevices(state: VaultState, devices: readonly DeviceRecord[], alsoWrite?: () => void):
+		{ droppedFrames: number; closedSockets: number } {
+		const now = this.clock.now();
+		this.storage.transactionSync(() => {
+			alsoWrite?.();
+			for (const device of devices) {
+				this.storage.sql.exec("DELETE FROM device WHERE device_id = ?", device.deviceId);
+				this.storage.sql.exec("INSERT OR IGNORE INTO retired_device (device_id, grant_id, retired_at) VALUES (?, ?, ?)",
+					device.deviceId, device.grantId, now);
+			}
+		});
+		this.identityWrites++;
+		for (const device of devices) state.devices.remove(device.deviceId);
+		let droppedFrames = 0;
+		let closedSockets = 0;
+		for (const device of devices) {
+			const revoked = this.relay.revokeDevice(device.deviceId);
+			droppedFrames += revoked.droppedFrames;
+			closedSockets += revoked.closedSockets;
+		}
+		return { droppedFrames, closedSockets };
 	}
 
 	/**
@@ -756,7 +1186,12 @@ export class VaultHost {
 		}
 		this.restoring = { restoreId, until: this.clock.now() + RESTORE_FLAG_TTL_MS };
 		this.relay.discardAll(1013, "restore_in_progress");
-		return { kind: "prepared", bookmark, devices: [...current.devices.list()].map((device) => ({ ...device })) };
+		// Identity v2: the grants and the tombstones cross the rewind with the devices (R rows read, cold path).
+		const retired = this.storage.sql.exec<{ device_id: string; grant_id: string | null; retired_at: number }>(
+			"SELECT device_id, grant_id, retired_at FROM retired_device").toArray()
+			.map((row): RetiredRecord => ({ deviceId: row.device_id, grantId: row.grant_id, retiredAt: row.retired_at }));
+		return { kind: "prepared", bookmark, devices: [...current.devices.list()].map((device) => ({ ...device })),
+			grants: [...current.grants.list()].map((grant) => ({ ...grant })), retired };
 	}
 
 	/**
@@ -781,11 +1216,16 @@ export class VaultHost {
 	/**
 	 * D8b step 3. Idempotent on `last_restore_id`. `rewind_needed` when the marker is still this restore's (no rewind
 	 * happened) or when this runtime wrote anything (a commit, checkpoint, enroll or code since the rewind), so content
-	 * is exactly T. Else ONE `transactionSync` (≈ D+P+1 rows): the device table becomes `devices` (rows that differ are
-	 * deleted and inserted), every pairing code is deleted, and meta gets a new epoch, `last_restore_id`,
-	 * `last_restore_at` and no marker. Then the flag clears and every streams socket closes 1001.
+	 * is exactly T. Else ONE `transactionSync` (≈ D+P+1 rows, + G' + R'): the device table becomes the snapshot's
+	 * (rows that differ in an authority field are deleted and inserted; a row that differs only in `last_seen_day`
+	 * gets one UPDATE),
+	 * likewise the grant table (G' differing rows), the snapshot's tombstones are inserted where missing (R'; a
+	 * tombstone is never deleted), every pairing code is deleted, and meta gets a new epoch, `last_restore_id`,
+	 * `last_restore_at` and no marker. Then the flag clears and every streams socket closes 1001. A snapshot without
+	 * grants or tombstones (a journal row from before identity v2) leaves those tables as the rewind left them.
 	 */
-	finishRestore(restoreId: string, devices: readonly DeviceRecord[]): FinishRestoreResult {
+	finishRestore(restoreId: string, snapshot: IdentitySnapshot): FinishRestoreResult {
+		const { devices, grants, retired } = snapshot;
 		const state = this.load();
 		if (!state) return { kind: "unknown_vault" };
 		if (state.meta.lastRestoreId === restoreId) return { kind: "finished", vaultEpoch: state.meta.vaultGeneration };
@@ -795,23 +1235,43 @@ export class VaultHost {
 		if (this.relay.writesThisRuntime + this.identityWrites > 0) return { kind: "rewind_needed" };
 		const wanted = new Map(devices.map((device) => [device.tokenHash, device]));
 		const present = new Map([...state.devices.list()].map((device) => [device.tokenHash, device]));
+		const wantedGrants = grants ? new Map(grants.map((grant) => [grant.grantId, grant])) : null;
+		const presentGrants = new Map([...state.grants.list()].map((grant) => [grant.grantId, grant]));
 		const vaultGeneration = randomBase64Url(16);
 		const now = this.clock.now();
 		this.storage.transactionSync(() => {
 			for (const [tokenHash, device] of present) {
 				const keep = wanted.get(tokenHash);
-				if (keep && sameDevice(keep, device)) continue;
+				if (keep && sameDevice(keep, device)) {
+					// Bookkeeping only: one UPDATE, not a DELETE + INSERT of the row.
+					if (keep.lastSeenDay !== device.lastSeenDay) {
+						this.storage.sql.exec("UPDATE device SET last_seen_day = ? WHERE token_hash = ?", keep.lastSeenDay,
+							hexToBytes(tokenHash).buffer);
+					}
+					continue;
+				}
 				this.storage.sql.exec("DELETE FROM device WHERE token_hash = ?", hexToBytes(tokenHash).buffer);
 			}
 			for (const [tokenHash, device] of wanted) {
 				const have = present.get(tokenHash);
 				if (have && sameDevice(have, device)) continue;
-				this.storage.sql.exec(
-					"INSERT INTO device (token_hash, device_id, device_name, enrollment_request_id, enrolled_at)"
-						+ " VALUES (?, ?, ?, ?, ?)",
-					hexToBytes(tokenHash).buffer, device.deviceId, device.deviceName, device.enrollmentRequestId,
-					device.enrolledAt,
-				);
+				this.storage.sql.exec(DEVICE_INSERT, ...deviceRow(device));
+			}
+			if (wantedGrants) {
+				for (const [grantId, grant] of presentGrants) {
+					const keep = wantedGrants.get(grantId);
+					if (keep && sameGrant(keep, grant)) continue;
+					this.storage.sql.exec("DELETE FROM pairing_grant WHERE grant_id = ?", grantId);
+				}
+				for (const [grantId, grant] of wantedGrants) {
+					const have = presentGrants.get(grantId);
+					if (have && sameGrant(have, grant)) continue;
+					this.storage.sql.exec(GRANT_INSERT, ...grantRow(grant));
+				}
+			}
+			for (const tombstone of retired ?? []) {
+				this.storage.sql.exec("INSERT OR IGNORE INTO retired_device (device_id, grant_id, retired_at) VALUES (?, ?, ?)",
+					tombstone.deviceId, tombstone.grantId, tombstone.retiredAt);
 			}
 			this.storage.sql.exec("DELETE FROM pairing_code");
 			this.storage.sql.exec(
@@ -824,6 +1284,11 @@ export class VaultHost {
 		const map = new DeviceMap();
 		for (const device of wanted.values()) map.add({ ...device });
 		state.devices = map;
+		if (wantedGrants) {
+			const grantMap = new GrantMap();
+			for (const grant of wantedGrants.values()) grantMap.add({ ...grant });
+			state.grants = grantMap;
+		}
 		state.meta.vaultGeneration = vaultGeneration;
 		state.meta.pendingRestoreId = null;
 		state.meta.lastRestoreId = restoreId;

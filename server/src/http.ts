@@ -49,6 +49,17 @@ export function bearerToken(request: Request): string | null {
 	return authorization.slice("Bearer ".length).trim() || null;
 }
 
+/**
+ * `Authorization: Grant <grantSecret>` (identity-per-store §3.2): a pairing grant, never a device bearer.
+ * DECISIONS-GAP (G57): a scheme of its own, so the two never mix: a grant secret sent as Bearer is just an unknown
+ * token, and the reverse.
+ */
+export function grantSecret(request: Request): string | null {
+	const authorization = request.headers.get("Authorization");
+	if (!authorization?.startsWith("Grant ")) return null;
+	return authorization.slice("Grant ".length).trim() || null;
+}
+
 export function isWebSocketUpgrade(request: Request): boolean {
 	return request.headers.get("Upgrade")?.toLowerCase() === "websocket";
 }

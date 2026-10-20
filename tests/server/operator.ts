@@ -215,7 +215,7 @@ s.test("D5 state, create vault, owner-code and devices: the console's shapes", a
 		assert.equal(devices.status, 200);
 		const text = await devices.text();
 		assert.deepEqual(JSON.parse(text), { devices: [{ deviceId: laptop.deviceId, deviceName: "Laptop",
-			enrolledAt: world.cluster.objects.get(vaultId)!.timers.now }] });
+			enrolledAt: world.cluster.objects.get(vaultId)!.timers.now }], grants: [] });
 		assert.ok(!text.includes(laptop.token), "no token material");
 		assert.equal((await world.fetch(`/operator/vaults/${vaultId}/devices`)).status, 401);
 		assert.equal((await world.fetch(`/operator/vaults/${vaultId}/devices/x`, { cookie })).status, 404, "unknown route");
@@ -238,11 +238,11 @@ s.test("D7 operator revoke: the victim is closed 4403 before the response; its b
 		assert.deepEqual(socket.last("error")?.code, "authority_superseded");
 		assert.deepEqual([response.status, await json(response)],
 			[200, { ok: true, deviceId: laptop.deviceId, revoked: true }]);
-		assert.deepEqual(rows(world, vault), { config: 0, vault: 1 }, "§6.2 revoke = 1 row; the config DO only reads");
+		assert.deepEqual(rows(world, vault), { config: 0, vault: 2 }, "§6.2 revoke = 2 rows (row + tombstone); the config DO only reads");
 		assert.equal((await deviceFeed(world, vaultId, laptop)).status, 401, "T-REVOKE-401 through the Worker");
 		const again = await world.fetch(`/operator/vaults/${vaultId}/devices/${laptop.deviceId}`, { method: "DELETE", cookie });
 		assert.deepEqual(await json(again), { ok: true, deviceId: laptop.deviceId, revoked: false });
-		assert.deepEqual(await json(await world.fetch(`/operator/vaults/${vaultId}/devices`, { cookie })), { devices: [] });
+		assert.deepEqual(await json(await world.fetch(`/operator/vaults/${vaultId}/devices`, { cookie })), { devices: [], grants: [] });
 		assert.equal((await world.fetch(`/operator/vaults/${vaultId}/devices/${laptop.deviceId}`, { method: "DELETE" })).status,
 			401);
 	});

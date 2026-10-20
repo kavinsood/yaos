@@ -8,7 +8,7 @@
 import { randomBase64Url } from "../base64url";
 import { isCloudflareDailyLimitError } from "../dailyLimit";
 import { describeError, isMissingTableError, type ClockPort, type StoragePort } from "../ports";
-import type { DeviceRecord } from "../vault/devices";
+import type { DeviceRecord, GrantRecord, IdentitySnapshot, RetiredRecord } from "../vault/devices";
 import type { FinishRestoreResult, PrepareRestoreResult, RewindResult } from "../vault/host";
 import type { ConfigFailure, ConfigResult } from "./host";
 
@@ -77,7 +77,7 @@ export function clearRestoreFailure(storage: StoragePort, vaultId: string): void
 export interface RestoreVaultPort {
 	prepareRestore(restoreId: string, at: number, refreshOnly: boolean): Promise<PrepareRestoreResult>;
 	rewind(restoreId: string, bookmark: string): Promise<RewindResult>;
-	finishRestore(restoreId: string, devices: DeviceRecord[]): Promise<FinishRestoreResult>;
+	finishRestore(restoreId: string, snapshot: IdentitySnapshot): Promise<FinishRestoreResult>;
 }
 
 export interface RestoreAlarmPort {
@@ -121,27 +121,86 @@ export function isObjectResetError(error: unknown): boolean {
 	return error instanceof Error && (error as Error & { durableObjectReset?: unknown }).durableObjectReset === true;
 }
 
-function encodeDevices(devices: readonly DeviceRecord[]): ArrayBuffer {
-	const bytes = new TextEncoder().encode(JSON.stringify(devices.map((device) => ({
-		tokenHash: device.tokenHash, deviceId: device.deviceId, deviceName: device.deviceName,
-		enrollmentRequestId: device.enrollmentRequestId, enrolledAt: device.enrolledAt,
-	}))));
+/**
+ * DECISIONS-GAP (G62). The journal's `devices` BLOB: JSON of the identity snapshot, `{v: 2, devices, grants,
+ * retired}` (token, secret and retire-key hashes only). A row written before identity v2 holds a bare device array:
+ * it decodes with `grants` and `retired` null, so finish leaves those tables alone.
+ */
+function encodeSnapshot(snapshot: IdentitySnapshot): ArrayBuffer {
+	const bytes = new TextEncoder().encode(JSON.stringify({
+		v: 2,
+		devices: snapshot.devices.map((device) => ({
+			tokenHash: device.tokenHash, deviceId: device.deviceId, deviceName: device.deviceName,
+			enrollmentRequestId: device.enrollmentRequestId, enrolledAt: device.enrolledAt, grantId: device.grantId,
+			retireHash: device.retireHash, lastSeenDay: device.lastSeenDay,
+		})),
+		grants: snapshot.grants?.map((grant) => ({
+			grantId: grant.grantId, secretHash: grant.secretHash, name: grant.name,
+			enrollmentRequestId: grant.enrollmentRequestId, createdAt: grant.createdAt, revokedAt: grant.revokedAt,
+			registeredDay: grant.registeredDay, registeredCount: grant.registeredCount,
+		})) ?? null,
+		retired: snapshot.retired?.map((tombstone) => ({
+			deviceId: tombstone.deviceId, grantId: tombstone.grantId, retiredAt: tombstone.retiredAt,
+		})) ?? null,
+	}));
 	const buffer = new ArrayBuffer(bytes.byteLength);
 	new Uint8Array(buffer).set(bytes);
 	return buffer;
 }
 
-function decodeDevices(blob: ArrayBuffer): DeviceRecord[] {
+const isText = (value: unknown): value is string => typeof value === "string";
+const isNumber = (value: unknown): value is number => typeof value === "number";
+const isTextOrNull = (value: unknown): value is string | null => value === null || typeof value === "string";
+const isNumberOrNull = (value: unknown): value is number | null => value === null || typeof value === "number";
+
+function decodeDevice(entry: Record<string, unknown>): DeviceRecord {
+	if (!isText(entry?.tokenHash) || !isText(entry.deviceId) || !isText(entry.deviceName)
+		|| !isText(entry.enrollmentRequestId) || !isNumber(entry.enrolledAt)) {
+		throw new Error("restore journal: malformed device");
+	}
+	// A pre-v2 entry has none of the three v2 fields: an old enroll.
+	const grantId = entry.grantId ?? null;
+	const retireHash = entry.retireHash ?? null;
+	const lastSeenDay = entry.lastSeenDay ?? null;
+	if (!isTextOrNull(grantId) || !isTextOrNull(retireHash) || !isNumberOrNull(lastSeenDay)) {
+		throw new Error("restore journal: malformed device");
+	}
+	return { tokenHash: entry.tokenHash, deviceId: entry.deviceId, deviceName: entry.deviceName,
+		enrollmentRequestId: entry.enrollmentRequestId, enrolledAt: entry.enrolledAt, grantId, retireHash, lastSeenDay };
+}
+
+function decodeGrant(entry: Record<string, unknown>): GrantRecord {
+	if (!isText(entry?.grantId) || !isText(entry.secretHash) || !isText(entry.name) || !isText(entry.enrollmentRequestId)
+		|| !isNumber(entry.createdAt) || !isNumberOrNull(entry.revokedAt) || !isNumber(entry.registeredDay)
+		|| !isNumber(entry.registeredCount)) {
+		throw new Error("restore journal: malformed grant");
+	}
+	return { grantId: entry.grantId, secretHash: entry.secretHash, name: entry.name,
+		enrollmentRequestId: entry.enrollmentRequestId, createdAt: entry.createdAt, revokedAt: entry.revokedAt,
+		registeredDay: entry.registeredDay, registeredCount: entry.registeredCount };
+}
+
+function decodeRetired(entry: Record<string, unknown>): RetiredRecord {
+	if (!isText(entry?.deviceId) || !isTextOrNull(entry.grantId) || !isNumber(entry.retiredAt)) {
+		throw new Error("restore journal: malformed tombstone");
+	}
+	return { deviceId: entry.deviceId, grantId: entry.grantId, retiredAt: entry.retiredAt };
+}
+
+function decodeSnapshot(blob: ArrayBuffer): IdentitySnapshot {
 	const value: unknown = JSON.parse(new TextDecoder().decode(new Uint8Array(blob)));
-	if (!Array.isArray(value)) throw new Error("restore journal: devices is not an array");
-	return value.map((entry: Record<string, unknown>) => {
-		if (typeof entry?.tokenHash !== "string" || typeof entry.deviceId !== "string" || typeof entry.deviceName !== "string"
-			|| typeof entry.enrollmentRequestId !== "string" || typeof entry.enrolledAt !== "number") {
-			throw new Error("restore journal: malformed device");
-		}
-		return { tokenHash: entry.tokenHash, deviceId: entry.deviceId, deviceName: entry.deviceName,
-			enrollmentRequestId: entry.enrollmentRequestId, enrolledAt: entry.enrolledAt };
-	});
+	if (Array.isArray(value)) return { devices: value.map(decodeDevice), grants: null, retired: null };
+	const record = value && typeof value === "object" ? value as Record<string, unknown> : null;
+	if (!record || record.v !== 2 || !Array.isArray(record.devices)
+		|| !(record.grants === null || Array.isArray(record.grants))
+		|| !(record.retired === null || Array.isArray(record.retired))) {
+		throw new Error("restore journal: malformed identity snapshot");
+	}
+	return {
+		devices: record.devices.map(decodeDevice),
+		grants: Array.isArray(record.grants) ? record.grants.map(decodeGrant) : null,
+		retired: Array.isArray(record.retired) ? record.retired.map(decodeRetired) : null,
+	};
 }
 
 export class RestoreRunner {
@@ -282,7 +341,7 @@ export class RestoreRunner {
 	private async run(row: JournalRow): Promise<RestoreResult> {
 		try {
 			let bookmark = row.bookmark;
-			let devices = row.devices ? decodeDevices(row.devices) : null;
+			let snapshot = row.devices ? decodeSnapshot(row.devices) : null;
 			if (!this.current(row)) return fail(404, "unknown_vault");
 			const prepared = await this.ports.vault(row.vault_id).prepareRestore(row.restore_id, row.at, bookmark !== null);
 			switch (prepared.kind) {
@@ -300,16 +359,16 @@ export class RestoreRunner {
 				case "prepared":
 					if (!this.current(row)) return fail(404, "unknown_vault");
 					bookmark = prepared.bookmark;
-					devices = prepared.devices;
+					snapshot = { devices: prepared.devices, grants: prepared.grants, retired: prepared.retired };
 					this.storage.sql.exec(
 						"UPDATE restore_journal SET bookmark = ?, devices = ? WHERE vault_id = ? AND restore_id = ?",
-						bookmark, encodeDevices(devices), row.vault_id, row.restore_id,
+						bookmark, encodeSnapshot(snapshot), row.vault_id, row.restore_id,
 					);
 					break;
 				case "skip":
 					break;
 			}
-			if (bookmark === null || devices === null) throw new Error("restore journal: no snapshot after step 1");
+			if (bookmark === null || snapshot === null) throw new Error("restore journal: no snapshot after step 1");
 			for (let attempt = 0; attempt < MAX_REWINDS_PER_RUN; attempt++) {
 				if (!this.current(row)) return fail(404, "unknown_vault");
 				const rewound = await this.rewind(row, bookmark);
@@ -323,7 +382,7 @@ export class RestoreRunner {
 					return fail(501, "restore_unsupported");
 				}
 				if (!this.current(row)) return fail(404, "unknown_vault");
-				const finished = await this.ports.vault(row.vault_id).finishRestore(row.restore_id, devices);
+				const finished = await this.ports.vault(row.vault_id).finishRestore(row.restore_id, snapshot);
 				if (finished.kind === "finished") return this.complete(row, finished.vaultEpoch);
 				if (finished.kind === "unknown_vault") {
 					this.drop(row);

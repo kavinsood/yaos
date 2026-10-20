@@ -1,5 +1,7 @@
-// The vault's enrolled devices, in memory (DECISIONS §6.1: rows read per runtime = meta 1 + devices N, then 0 per
-// bearer auth). Keyed by hex(SHA-256(deviceToken)) for bearer auth and by deviceId for the D7 gate.
+// The vault's enrolled devices and pairing grants, in memory (DECISIONS §6.1: rows read per runtime = meta 1 + grants G
+// + devices N, then 0 per bearer auth). Devices are keyed by hex(SHA-256(deviceToken)) for bearer auth and by deviceId
+// for the D7 gate; grants by grantId and by hex(SHA-256(grantSecret)) for `Authorization: Grant` (identity-per-store
+// §3). Tombstones (`retired_device`) are never loaded: one indexed read at register and enroll.
 import { bytesToHex } from "../hex";
 import type { StoragePort } from "../ports";
 
@@ -7,8 +9,15 @@ export interface DeviceRecord {
 	tokenHash: string;
 	deviceId: string;
 	deviceName: string;
+	/** The D3 enroll request that created the row; "" for a device registered under a grant (no code involved). */
 	enrollmentRequestId: string;
 	enrolledAt: number;
+	/** The pairing grant the device was registered under; null for a device enrolled with a deviceId (old /enroll). */
+	grantId: string | null;
+	/** hex(SHA-256(retireKey)) of a registered device; null for an old enroll. */
+	retireHash: string | null;
+	/** UTC day number (ms / 86 400 000) of the device's last ticket; null before the first. */
+	lastSeenDay: number | null;
 }
 
 type DeviceRow = {
@@ -17,6 +26,9 @@ type DeviceRow = {
 	device_name: string;
 	enrollment_request_id: string;
 	enrolled_at: number;
+	grant_id: string | null;
+	retire_hash: ArrayBuffer | null;
+	last_seen_day: number | null;
 };
 
 export class DeviceMap {
@@ -27,7 +39,8 @@ export class DeviceMap {
 	static load(storage: StoragePort): DeviceMap {
 		const map = new DeviceMap();
 		const rows = storage.sql.exec<DeviceRow>(
-			"SELECT token_hash, device_id, device_name, enrollment_request_id, enrolled_at FROM device",
+			"SELECT token_hash, device_id, device_name, enrollment_request_id, enrolled_at, grant_id, retire_hash,"
+				+ " last_seen_day FROM device",
 		);
 		for (const row of rows) {
 			map.add({
@@ -36,6 +49,9 @@ export class DeviceMap {
 				deviceName: row.device_name,
 				enrollmentRequestId: row.enrollment_request_id,
 				enrolledAt: row.enrolled_at,
+				grantId: row.grant_id,
+				retireHash: row.retire_hash ? bytesToHex(new Uint8Array(row.retire_hash)) : null,
+				lastSeenDay: row.last_seen_day,
 			});
 		}
 		return map;
@@ -48,6 +64,11 @@ export class DeviceMap {
 	/** Every enrolled device (the operator's device list, name uniqueness at enroll). */
 	list(): IterableIterator<DeviceRecord> {
 		return this.byDeviceId.values();
+	}
+
+	/** The live devices of one grant (a scan of the few device rows in memory). */
+	ofGrant(grantId: string): DeviceRecord[] {
+		return [...this.byDeviceId.values()].filter((device) => device.grantId === grantId);
 	}
 
 	byTokenHash(tokenHash: string): DeviceRecord | undefined {
@@ -81,4 +102,94 @@ export class DeviceMap {
 		this.byToken.delete(record.tokenHash);
 		return record;
 	}
+}
+
+/** One pairing grant (identity-per-store §3.1): minted by a grant enroll, revoked by leave or "Revoke pairing". */
+export interface GrantRecord {
+	grantId: string;
+	/** hex(SHA-256(grantSecret)). */
+	secretHash: string;
+	/** The name every device of the grant carries (§6.3: no "Mac 7" after a few wipes). */
+	name: string;
+	enrollmentRequestId: string;
+	createdAt: number;
+	/** Set once, never cleared: a revoked grant answers `401 grant_revoked`. */
+	revokedAt: number | null;
+	/** The per-grant daily registration counter (§3.3): the UTC day it counts and the count on that day. */
+	registeredDay: number;
+	registeredCount: number;
+}
+
+type GrantRow = {
+	grant_id: string;
+	secret_hash: ArrayBuffer;
+	grant_name: string;
+	enrollment_request_id: string;
+	created_at: number;
+	revoked_at: number | null;
+	registered_day: number;
+	registered_count: number;
+};
+
+export class GrantMap {
+	private readonly byGrantId = new Map<string, GrantRecord>();
+	private readonly bySecret = new Map<string, GrantRecord>();
+
+	/** One scan of `pairing_grant` (G rows read). Throws "no such table" on a v1 vault (schema.ts migrates it). */
+	static load(storage: StoragePort): GrantMap {
+		const map = new GrantMap();
+		const rows = storage.sql.exec<GrantRow>(
+			"SELECT grant_id, secret_hash, grant_name, enrollment_request_id, created_at, revoked_at, registered_day,"
+				+ " registered_count FROM pairing_grant",
+		);
+		for (const row of rows) {
+			map.add({
+				grantId: row.grant_id,
+				secretHash: bytesToHex(new Uint8Array(row.secret_hash)),
+				name: row.grant_name,
+				enrollmentRequestId: row.enrollment_request_id,
+				createdAt: row.created_at,
+				revokedAt: row.revoked_at,
+				registeredDay: row.registered_day,
+				registeredCount: row.registered_count,
+			});
+		}
+		return map;
+	}
+
+	list(): IterableIterator<GrantRecord> {
+		return this.byGrantId.values();
+	}
+
+	byId(grantId: string): GrantRecord | undefined {
+		return this.byGrantId.get(grantId);
+	}
+
+	bySecretHash(secretHash: string): GrantRecord | undefined {
+		return this.bySecret.get(secretHash);
+	}
+
+	add(record: GrantRecord): void {
+		this.byGrantId.set(record.grantId, record);
+		this.bySecret.set(record.secretHash, record);
+	}
+}
+
+/** A `retired_device` row: the tombstone of a deviceId that may never come back. */
+export interface RetiredRecord {
+	deviceId: string;
+	grantId: string | null;
+	retiredAt: number;
+}
+
+/**
+ * The authority a D8b restore carries across the rewind: the device table, and (identity v2) the grants and the
+ * tombstones, so a restore never brings back a revoked pairing or a retired deviceId ("a restore rewinds content,
+ * never authority"). `grants` and `retired` are null in a journal row written before v2: finish then leaves those
+ * tables as the rewind left them.
+ */
+export interface IdentitySnapshot {
+	devices: DeviceRecord[];
+	grants: GrantRecord[] | null;
+	retired: RetiredRecord[] | null;
 }

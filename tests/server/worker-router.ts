@@ -113,8 +113,9 @@ s.test("T-LEGACY-404: §5 row 14, /provision and other removed routes → 404, z
 			["GET", `${v}/me`, token], ["GET", `${v}/devices`, token], ["POST", `${v}/invitations`, post],
 			["DELETE", `${v}/invitations/x`, token], ["GET", `${v}/principals/p/devices`, token], ["PATCH", `${v}/principals/p`, post],
 			["DELETE", `${v}/devices/d`, token], ["POST", `${v}/ownership/transfers`, post], ["DELETE", `${v}/governance`, token],
-			["POST", `${v}/leave`, post], ["GET", `${v}/audit`, token], ["POST", `${v}/auth/device`, post],
-			["DELETE", `${v}/auth/device`, token],
+			// `POST`/`DELETE …/auth/device` are identity-per-store routes again (register, self-retire; grants.ts).
+			["POST", `${v}/leave`, post], ["GET", `${v}/audit`, token], ["GET", `${v}/auth/device`, token],
+			["PUT", `${v}/auth/device`, post],
 			// Removed legacy routes: semantic sockets, server CRDT HTTP, relay v2, recovery, debug/admin.
 			["GET", `${v}/ws/root`, token], ["GET", `${v}/ws/body/b1`, token], ["GET", `${v}/ws/semantic/s1`, token],
 			["POST", `${v}/body/b1/candidate`, post], ["GET", `${v}/body/b1`, token], ["GET", `${v}/head/b1`, token],

@@ -22,7 +22,7 @@ import { BoundedBodyError, declaredBodyLength, readBoundedBytes } from "./readBo
 import { buildMobileSetupUrl, buildObsidianPairingUrl } from "./setupQr";
 import { MAX_STREAM_CHECKPOINT_BYTES, STREAMS_CAPABILITY_VERSION } from "./streams/protocol";
 import { ORIGIN_HEADER } from "./vault/host";
-import { isPairingPurpose, type PairingPurpose } from "./vault/pairing";
+import { GRANT_ID_PATTERN, isPairingPurpose, type PairingPurpose } from "./vault/pairing";
 import type { VaultDO, VaultEnv } from "./vault/vault";
 import { isVaultId } from "./vaultId";
 import { SERVER_VERSION } from "./version";
@@ -403,25 +403,28 @@ export class Router {
 	// ---- /operator/vaults/:id/... ---------------------------------------------------------------------------
 
 	/**
-	 * `/operator/vaults/:id/...` (§2.2): owner code, devices, D7 revoke, D8a reset-streams, D8b restore, D5 delete. Every
-	 * route asks the config DO for the session and the registry first; revoke, owner-code and reset-streams also pass
-	 * D8b's authority freeze there.
+	 * `/operator/vaults/:id/...` (§2.2): owner code, devices, D7 revoke, D8a reset-streams, D8b restore, D5 delete, and
+	 * identity-per-store §3.4 "Revoke pairing" (`DELETE grants/:grantId`). Every route asks the config DO for the
+	 * session and the registry first; revoke (device or pairing), owner-code and reset-streams also pass D8b's authority
+	 * freeze there.
 	 */
 	private async operatorVault(request: Request, env: WorkerEnv, url: URL, vaultId: string, rest: string[]):
 		Promise<Response> {
 		const route = `${request.method} ${rest.join("/")}`;
 		const revokeTarget = request.method === "DELETE" && rest.length === 2 && rest[0] === "devices"
 			&& DEVICE_ID_PATTERN.test(rest[1]!) ? rest[1]! : null;
+		const grantTarget = request.method === "DELETE" && rest.length === 2 && rest[0] === "grants"
+			&& GRANT_ID_PATTERN.test(rest[1]!) ? rest[1]! : null;
 		const known = route === "DELETE " || route === "POST owner-code" || route === "GET devices"
-			|| route === "POST reset-streams" || route === "POST restore" || revokeTarget !== null;
+			|| route === "POST reset-streams" || route === "POST restore" || revokeTarget !== null || grantTarget !== null;
 		if (!known) return withCors(notFound());
 		if (request.method !== "GET") {
-			const rejected = crossSiteRejection(request, url, revokeTarget === null);
+			const rejected = crossSiteRejection(request, url, revokeTarget === null && grantTarget === null);
 			if (rejected) return rejected;
 		}
 		const token = sessionToken(request);
 		if (!token) return unauthorized();
-		const action: FrozenAction | undefined = revokeTarget !== null ? "revoke"
+		const action: FrozenAction | undefined = revokeTarget !== null || grantTarget !== null ? "revoke"
 			: route === "POST owner-code" ? "owner-code"
 			: route === "POST reset-streams" ? "reset" : undefined;
 		const config = this.config(env);
@@ -434,9 +437,14 @@ export class Router {
 			const { revoked } = await vault.revokeDevice(revokeTarget);
 			return json({ ok: true, deviceId: revokeTarget, revoked });
 		}
+		if (grantTarget !== null) {
+			// The grant and its devices in one synchronous turn, as D7. Idempotent: unknown or revoked → revoked:false.
+			const { revoked, retiredDevices } = await vault.revokeGrant(grantTarget);
+			return json({ ok: true, grantId: grantTarget, revoked, retiredDevices });
+		}
 		if (route === "GET devices") {
-			const { devices } = await vault.listDevices();
-			return json({ devices });
+			const { devices, grants } = await vault.listDevices();
+			return json({ devices, grants });
 		}
 		if (route === "POST owner-code") return await this.ownerCode(request, url, vault);
 		if (route === "POST reset-streams") return await this.resetStreams(request, vault, vaultId);
@@ -552,9 +560,15 @@ export class Router {
 		request: Request, env: WorkerEnv, url: URL, vaultId: string, rest: string[],
 	): Promise<Response> {
 		const route = `${request.method} ${rest.join("/")}`;
+		// Identity-per-store §3.2 adds register, retire by key, self-retire and leave to the forwarded auth routes; the
+		// vault DO reads their small JSON bodies itself (64 KiB, as pairing-code and ticket).
 		switch (route) {
 			case "POST auth/pairing-code":
 			case "POST auth/ticket":
+			case "POST auth/device":
+			case "POST auth/device/retire":
+			case "DELETE auth/device":
+			case "DELETE auth/grant":
 			case "GET streams/feed":
 			case "GET streams/read":
 				return withCors(await this.forward(request, env, url, vaultId, rest));

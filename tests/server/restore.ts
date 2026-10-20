@@ -644,13 +644,17 @@ s.test("T-ROWS-WB restore: prepare 1, finish D+P+1, config 3 (journal INSERT, UP
 		const delta = (step: string) => marks.get(`${step}:after`)!.vault - marks.get(`${step}:before`)!.vault;
 		assert.equal(delta("prepareRestore"), 1, "prepare: the marker (1 row)");
 		assert.equal(delta("rewind"), 0, "the rewind writes no row");
-		// T's device table (laptop, tablet) becomes the pre-restore one (laptop, phone): 1 DELETE + 1 INSERT.
-		const devices = 2;
-		assert.equal(delta("finishRestore"), devices + sc.codesAtT + 1, "finish: D + P + 1");
+		// T's device table (laptop, tablet) becomes the pre-restore one (laptop, phone): 1 DELETE + 1 INSERT, and 1 UPDATE
+		// of the laptop's last_seen_day (its ticket after T). Identity v2: the tablet's tombstone (revoked after T) is
+		// inserted again (R' = 1); no grant differs.
+		const devices = 3;
+		const tombstones = 1;
+		assert.equal(delta("finishRestore"), devices + tombstones + sc.codesAtT + 1, "finish: D + R' + P + 1");
 		const before = marks.get("finishRestore:before")!.byTable;
 		const after = marks.get("finishRestore:after")!.byTable;
 		const table = (name: string) => (after.get(name) ?? 0) - (before.get(name) ?? 0);
-		assert.deepEqual([table("device"), table("pairing_code"), table("vault_meta")], [devices, sc.codesAtT, 1]);
+		assert.deepEqual([table("device"), table("retired_device"), table("pairing_code"), table("vault_meta")],
+			[devices, tombstones, sc.codesAtT, 1]);
 		assert.equal(world.config.model.totals.cf, 3, "config: journal INSERT + UPDATE + DELETE");
 		assert.deepEqual([...world.config.model.totals.byTable], [["restore_journal", 3]]);
 	}, PITR);
