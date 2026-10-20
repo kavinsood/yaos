@@ -79,7 +79,7 @@ export class LogEngine {
 		const c = new EngineCtx(opts);
 		const { storage } = opts.ports;
 		const ident = { vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion };
-		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null };
+		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null, pathBases: opts.pathBases ?? null };
 		const openedAt = c.mono();
 		let o = await Repo.open(storage, ident, c.now(), openOpts);
 		if (!o.repo) {

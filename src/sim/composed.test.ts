@@ -432,6 +432,38 @@ test("relay epoch reset (§c.12): both devices migrate, re-upload, and keep sync
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]).sort(), want, "the new epoch holds the whole vault");
 });
 
+test("epoch reset, app crash after the migration and before its merges: the old epoch's base survives the restart", async () => {
+	// Sim suite-1 seed 65. The bases a migration carries (the old DB's synced text by path) lived in memory only: A
+	// crashed after opening the new epoch's DB and before merging x.md with B's re-create, came back with no base,
+	// and its unchanged file read as a conflicting side of B's edit: a conflict copy (for a canvas re-create that lost
+	// the path race: a suffixed duplicate) instead of B's text.
+	const { clock, net, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "one\n");
+
+	a.setOnline(false);
+	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
+	await clock.advance(20_000); // B migrated and re-created x.md
+	b.vault.userWrite("x.md", "one\nfrom B\n");
+	await clock.advance(5_000);
+	a.setOnline(true);
+	for (let i = 0; i < 30_000 && a.vrt?.vaultEpoch !== "sim-epoch-2"; i++) await clock.advance(1);
+	assert.equal(a.vrt?.vaultEpoch, "sim-epoch-2", "A migrated");
+	assert.equal(a.vrt?.rec.ctx.store.synced.size, 0, "nothing merged in the new epoch yet");
+	a.crashApp();
+	await clock.advance(1_000);
+	void a.restartApp();
+	await clock.advance(30_000);
+
+	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "one\nfrom B\n"]], `${d.name}`);
+	assert.equal(a.vrt?.bases.keys.size, 0, "the base is retired once x.md is settled");
+	const o = await net.oracle();
+	assert.deepEqual(o.docs.map((x) => [x.path, x.text]), [["x.md", "one\nfrom B\n"]]);
+});
+
 test("IndexedDB evicted after an own edit reached the relay but not the disk: recovery writes it to disk", async () => {
 	// Sim seed 690 F DEV3. Every row of x.md is A's own, so reading the stream back after the wipe does not move
 	// bodyVersion.remoteSeq. A mirror-imported sync point that kept remoteSeq read as "remote unchanged" (Rc false),

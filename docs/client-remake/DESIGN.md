@@ -582,8 +582,8 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
 
 1. Enters phase `epoch-migrating`, saves bound views (`saveViews`) and takes a local snapshot (§j.4).
 2. Writes `intent{epoch-migration}`.
-3. Reads the old DB's `synced` and `baseText` into memory as **path-keyed bases**: the base text of every markdown doc
-   and canvas with one (a canvas's is its merge text, §j.2). Blobs have none. Old docIds are meaningless in the new epoch.
+3. Reads the old DB's `synced` and `baseText` as **path-keyed bases**: the base text of every markdown doc and canvas
+   with one (a canvas's is its merge text, §j.2). Blobs have none. Old docIds are meaningless in the new epoch.
 4. Creates the new DB `yaos2:<vaultId>:<newEpoch>:<deviceId>` and onboards against the new epoch as in §j.5. Path-keyed
    bases turn the "no-base" merges into 3-way merges where the paths match, for markdown and canvases alike:
    - **No synced record.** A doc with no synced record merges against the base at its path.
@@ -594,8 +594,11 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
    - **Trust.** A base is trusted only while the new epoch's text still contains it: as a character subsequence for
      markdown, and as a subsequence of whole record lines of the merge text for a canvas. A base ahead of the new
      epoch would read as deletions. Without trust, the no-base merge keeps the disk side as a conflict copy.
-   - **Memory only.** A runtime restart before the merges run loses the bases, and the device's re-creates fall
-     back to loser renames.
+   - **Stored.** The bases are written to the new DB's `meta` (`pathBase:<pathKey>`, the old `baseText` row's bytes)
+     in the transaction that creates its identity, so a crash or restart before the merges keeps them
+     (`src/engine/compose/epochBases.ts`). A base is dropped once its path is settled: the committed ns winner there
+     is the one doc synced at it, or nothing is left at the path. No `DB_SCHEMA_VERSION` bump: a reader without the
+     keys behaves as before (as for `blobPut:` and `frameNoFloor`).
    - **Deletes.** A record or text deleted before the epoch change can come back: a restored relay state may predate
      the delete, step 5 drops an unsent delete, and a peer's file may never have received it. The base cannot tell
      such content from content added in the new epoch.

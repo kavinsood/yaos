@@ -11,8 +11,9 @@ import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
 import type { FrameNoFloor } from "../store/repo";
-import { dbName, STORE } from "../store/schema";
+import { dbName, STORE, type MetaPathBase } from "../store/schema";
 import { readBase } from "../reconcile/store";
+import { pathBaseKey } from "./epochBases";
 import { KeyringRefusedError } from "../keyring/writeGate";
 import type { VaultRuntime } from "./vaultRuntime";
 
@@ -187,10 +188,11 @@ async function diagnostics(rt: VaultRuntime, includePaths: boolean): Promise<Dia
 }
 
 /**
- * §c.12 steps 1 and 3 on the old runtime: save bound views, snapshot, and read
- * the synced bases into a path-keyed map for the new epoch's merges.
+ * §c.12 steps 1 and 3 on the old runtime: save bound views, snapshot, and read the synced bases by path for the new
+ * epoch's merges: the old `baseText` rows that read back as written, as MetaPathBase records (stored with the new
+ * DB's identity, epochBases.ts).
  */
-export async function prepareEpochMigration(rt: VaultRuntime): Promise<Map<PathKey, string>> {
+export async function prepareEpochMigration(rt: VaultRuntime): Promise<MetaPathBase[]> {
 	const bound = [...rt.engine.bound.byId.keys()];
 	if (bound.length > 0) {
 		await rt.engine.link.request({ t: "saveViews", docIds: bound }).catch(() => undefined);
@@ -201,16 +203,17 @@ export async function prepareEpochMigration(rt: VaultRuntime): Promise<Map<PathK
 		}));
 	}
 	await rt.takeSnapshot("epoch");
-	const bases = new Map<PathKey, string>();
+	const bases = new Map<PathKey, MetaPathBase>();
 	const rows = await rt.db.tx([STORE.baseText], "readonly", (tx) => tx.getAll(STORE.baseText)).catch(() => []);
 	const byDoc = new Map(rows.map((r) => [r.docId, r]));
 	for (const s of rt.rec.ctx.store.synced.values()) {
 		if (s.kind === "blob" || !s.hasBase) continue; // markdown text or canvas merge text
 		const r = byDoc.get(s.docId);
-		const text = r ? await readBase(r, rt.o.ports.hash) : null;
-		if (text !== null) bases.set(pathKey(s.path), text);
+		if (!r || (await readBase(r, rt.o.ports.hash)) === null) continue;
+		const k = pathKey(s.path);
+		bases.set(k, { key: pathBaseKey(k), contentHash: r.contentHash, deflated: r.deflated, chars: r.chars });
 	}
-	return bases;
+	return [...bases.values()];
 }
 
 /** §c.12 step 3 (e2ee-design §8.2): the highest own ns / cfg frameNo, carried into the new epoch's DB. */

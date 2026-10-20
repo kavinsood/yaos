@@ -21,7 +21,7 @@
  * re-checks and the runtime starts in this process; an unpinned device waits for main to pin and restart it.
  */
 
-import type { PathKey, VaultEpoch } from "../../core/types";
+import type { VaultEpoch } from "../../core/types";
 import { BUDGETS } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
@@ -48,6 +48,7 @@ import { idleStatus } from "./statusMerge";
 import { ownFrameNoFloor, prepareEpochMigration } from "./runtimeOps";
 import { wipeSecrets } from "../../protocol/workerTransport";
 import type { FrameNoFloor } from "../store/repo";
+import type { MetaPathBase } from "../store/schema";
 import { VaultRuntime, type RestartReason } from "./vaultRuntime";
 
 export interface CreateEngineOptions {
@@ -116,7 +117,7 @@ export class ComposedEngine {
 	/** The device check running (one at a time); aborted by dispose. */
 	private deviceChecking: AbortController | null = null;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
-	private migration: { bases: Map<PathKey, string>; oldEpoch: VaultEpoch; frameNoFloor: FrameNoFloor } | null = null;
+	private migration: { bases: MetaPathBase[]; oldEpoch: VaultEpoch; frameNoFloor: FrameNoFloor } | null = null;
 	private readonly offs: (() => void)[] = [];
 
 	constructor(readonly transport: EngineTransport, readonly options: CreateEngineOptions) {
@@ -350,7 +351,7 @@ export class ComposedEngine {
 			const frameNoFloor = ownFrameNoFloor(old);
 			const bases = await prepareEpochMigration(old).catch((e) => {
 				this.log(`epoch prepare failed: ${String(e)}`);
-				return new Map<PathKey, string>();
+				return [];
 			});
 			this.migration = { bases, oldEpoch: old.vaultEpoch, frameNoFloor };
 		}

@@ -19,7 +19,7 @@ import { CursorTracker } from "../sync/cursor";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
-	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaKeyring, type MetaOutboxOrder, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
+	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaKeyring, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
 	type SnapshotRecord, type StreamRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
@@ -198,7 +198,10 @@ export class Repo {
 	 * Open (or create) the DB for this identity. `mismatch` closes nothing: the
 	 * caller deletes the DB and recovers (DESIGN §i.5).
 	 */
-	static async open(storage: StoragePort, id: RepoIdentity, nowMs: number, opts: { recoveredFromMirror?: boolean; frameNoFloor?: FrameNoFloor | null } = {}): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
+	static async open(
+		storage: StoragePort, id: RepoIdentity, nowMs: number,
+		opts: { recoveredFromMirror?: boolean; frameNoFloor?: FrameNoFloor | null; pathBases?: readonly MetaPathBase[] | null } = {},
+	): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
 		const db = await storage.open<YS>(dbName(id.vaultId, id.vaultEpoch, id.deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
 		const res = await db.tx([STORE.meta], "readwrite", async (tx) => {
 			const ident = await tx.get(STORE.meta, "identity") as MetaIdentity | undefined;
@@ -209,6 +212,7 @@ export class Repo {
 				const cursor = (await tx.get(STORE.meta, "cursor") as MetaCursor | undefined) ?? { key: "cursor", vaultSeq: 0, headSeqSeen: 0 };
 				const order = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
 				if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
+				if (opts.pathBases) await addPathBases(tx, opts.pathBases);
 				return { outcome: { t: "existing", identity: ident } as OpenOutcome, ident, cursor, next: order.next };
 			}
 			const fresh: MetaIdentity = {
@@ -220,6 +224,7 @@ export class Repo {
 			tx.put(STORE.meta, cursor);
 			tx.put(STORE.meta, { key: "outboxOrder", next: 1 });
 			if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
+			if (opts.pathBases) await addPathBases(tx, opts.pathBases);
 			return { outcome: { t: "fresh" } as OpenOutcome, ident: fresh, cursor, next: 1 };
 		});
 		if (res.outcome.t === "mismatch" || res.cursor === null) return { repo: null, outcome: res.outcome, db };
@@ -312,6 +317,23 @@ export class Repo {
 	putKeyringMeta(m: MetaKeyring): Promise<void> {
 		return this.serial("putKeyringMeta", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
 			tx.put(STORE.meta, m);
+		}));
+	}
+
+	// -------------------------------------------------------------------------
+	// An old epoch's bases by path (MetaPathBase, DESIGN §c.12 step 3)
+	// -------------------------------------------------------------------------
+
+	/** Every stored path base. */
+	pathBases(): Promise<MetaPathBase[]> {
+		return this.db.tx([STORE.meta], "readonly", async (tx) => {
+			const all = await tx.getAll(STORE.meta, { lower: "pathBase:", upper: "pathBase;", upperOpen: true });
+			return all.filter((r): r is MetaPathBase => r.key.startsWith("pathBase:") && "deflated" in r);
+		});
+	}
+	dropPathBases(keys: readonly MetaPathBase["key"][]): Promise<void> {
+		return this.serial("dropPathBases", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
+			for (const k of keys) tx.delete(STORE.meta, k);
 		}));
 	}
 
@@ -803,6 +825,14 @@ function stateOrderRange(state: OutboxState): KeyRange {
 }
 
 /** Merge a carried frameNo floor into meta (max per stream; e2ee-design §8.2). */
+/**
+ * The migration's path bases (MetaPathBase), each kept if one is already there: a migration repeated over an existing
+ * new-epoch DB (the old DB not retired yet) neither replaces nor revives anything but a missing base.
+ */
+async function addPathBases(tx: Tx, bases: readonly MetaPathBase[]): Promise<void> {
+	for (const b of bases) if (!(await tx.get(STORE.meta, b.key))) tx.put(STORE.meta, b);
+}
+
 async function raiseFrameNoFloor(tx: Tx, f: FrameNoFloor): Promise<void> {
 	const cur = await tx.get(STORE.meta, "frameNoFloor") as MetaFrameNoFloor | undefined;
 	tx.put(STORE.meta, { key: "frameNoFloor", ns: Math.max(cur?.ns ?? 0, f.ns), cfg: Math.max(cur?.cfg ?? 0, f.cfg) });

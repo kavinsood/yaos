@@ -21,6 +21,8 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
  * (schemaVersion) and is deleted and rebuilt from relay + disk + side-file mirrors (DESIGN §i.5).
  * 2: dropped the unused streams byStalePriority / byAccess, synced byPathKey and blobQueue byActiveDue indexes
  * and the fields only they read; dropped the outbox "sent" state, attempts and lastSentAtMs (T_sent).
+ * Not bumped for a new meta key family whose absence reads as before (blobPut:, frameNoFloor, pathBase:): an older
+ * reader never looks the keys up, and a DB without them behaves as it did. A bump would delete and rebuild every DB.
  */
 export const DB_SCHEMA_VERSION = 2;
 export const DB_NAME_PREFIX = "yaos2";
@@ -101,7 +103,19 @@ export interface MetaBlobPut {
 	readonly key: `blobPut:${string}`;
 	readonly atMs: number;
 }
-export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut;
+/**
+ * An old epoch's base at a path (DESIGN §c.12 step 3), one record per path key: the old DB's base text of the doc
+ * synced there, as its `baseText` row held it (deflate-raw, chars, markdownContentHash; reconcile/store.ts readBase
+ * checks it). Written with the new DB's identity by Repo.open, so a crash before the merges keeps them; dropped
+ * once the path is settled in the new epoch (compose/epochBases.ts).
+ */
+export interface MetaPathBase {
+	readonly key: `pathBase:${string}`;
+	readonly contentHash: ContentHash;
+	readonly deflated: Uint8Array;
+	readonly chars: number;
+}
+export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------
