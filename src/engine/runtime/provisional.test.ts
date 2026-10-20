@@ -169,7 +169,7 @@ test("provisional: a read that adopts a checkpoint covering the shadowed frame s
 	const CKPT = { rows: 3, bytes: 1e9, idleMs: 10, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
 	const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { checkpoint: CKPT } });
-	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", tuning: { checkpoint: NO_CKPT, provisionalAdoptMs: 60_000 } });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", tuning: { checkpoint: NO_CKPT, ...adoptTuning(60_000) } });
 	try {
 		await until(() => a.status().phase === "live" && b.status().phase === "live", 3_000, "live");
 		const id = await createDoc(a, "c.md", "base;");

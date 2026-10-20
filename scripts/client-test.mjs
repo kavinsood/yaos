@@ -26,6 +26,9 @@ if (selected.length === 0) {
 const t0 = Date.now();
 const r = spawnSync(process.execPath, [
 	"--import", "jiti/register", "--test",
+	// A test that leaves an engine running (e.g. it threw after starting one) must not hang the run: exit once a
+	// file's tests are done, and fail any single test still running after 5 minutes.
+	"--test-force-exit", "--test-timeout=300000",
 	"--test-reporter=dot", "--test-reporter-destination=stdout",
 	"--test-reporter=./scripts/test-failures-reporter.mjs", "--test-reporter-destination=stderr",
 	...selected,
