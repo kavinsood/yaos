@@ -564,6 +564,38 @@ test("row pruned: absent -> syncedDrop; unchanged -> diskTrash + syncedDrop; cha
 	assert.deepEqual(run({ synced: [S("d1", "a.md")] }, { nsReady: false }).ops, []);
 });
 
+test("row pruned: an own create the fold never committed (nsTouchSeq 0) is created anew, never trashed", () => {
+	// Sim seed 222 (frameNo fix reverted): the own nsCreate folded as replay-duplicate. Absent, it read as pruned and
+	// the unchanged file went to the trash. A prune removes only an entry the fold held; this device never saw one.
+	const blob = run({ synced: [S("d1", "a.png", { nsTouchSeq: 0, blobRev: 0 })], local: [L("a.png", h("b0"), { size: 3188 })] });
+	assert.deepEqual(blob.ops, [
+		{ op: "nsCreate", docId: "fresh1", kind: "blob", path: "a.png", contentHash: h("b0"), size: 3188 },
+		{ op: "pushBlob", docId: "fresh1", path: "a.png", hash: h("b0"), size: 3188 },
+		{ op: "syncedDrop", docId: "d1" },
+	]);
+	assert.equal(blob.brake, null);
+	const md = run({ synced: [S("d1", "a.md", { nsTouchSeq: 0 })], local: [L("a.md", h("c0"))] });
+	assert.deepEqual(opsOf(md), ["nsCreate", "reconcileContent", "syncedDrop"]);
+	// seen committed (nsTouchSeq > 0): a real prune, the trash stands
+	assert.deepEqual(opsOf(run({ synced: [S("d1", "a.png")], local: [L("a.png", h("b0"))] })), ["diskTrash", "syncedDrop"]);
+});
+
+test("row pruned: the file is a live doc's (its S at the path, or its bytes) -> syncedDrop only, no trash, no create", () => {
+	// Sim seed 222: the create from before the IDB wipe did fold (d2, synced here through S1) at the same path, with
+	// the same bytes. Trashing the file for d1 made d2's row read it as deleted by the user: nsDelete everywhere.
+	const twin = { remote: [R("d2", "a.png", { blob: { hash: h("b0"), size: 3188, rev: 8 }, createHash: h("b0") })] };
+	const drop = [{ op: "syncedDrop", docId: "d1" }];
+	const both = run({ ...twin, synced: [S("d1", "a.png", { nsTouchSeq: 0, blobRev: 0 }), S("d2", "a.png", { blobRev: 8, nsTouchSeq: 8, fingerprint: fp("b0") })], local: [L("a.png", h("b0"))] });
+	assert.deepEqual(both.ops, drop);
+	// also for a doc seen committed (a real prune): the file still belongs to the live doc at its path
+	assert.deepEqual(run({ ...twin, synced: [S("d1", "a.png"), S("d2", "a.png", { blobRev: 8, nsTouchSeq: 8, fingerprint: fp("b0") })], local: [L("a.png", h("b0"))] }).ops, drop);
+	// d2 not synced here: its bytes are the file's, d2 adopts it next pass
+	assert.deepEqual(run({ ...twin, synced: [S("d1", "a.png", { nsTouchSeq: 0, blobRev: 0 })], local: [L("a.png", h("b0"))] }).ops, drop);
+	// synced at the path with other bytes on disk: still d2's file (its own row pushes the edit)
+	const edited = run({ ...twin, synced: [S("d1", "a.png", { contentHash: h("b7") }), S("d2", "a.png", { blobRev: 8, nsTouchSeq: 8, fingerprint: fp("b0") })], local: [L("a.png", h("b7"))] });
+	assert.ok(!opsOf(edited).includes("diskTrash") && !edited.ops.some((o) => o.op === "nsCreate" && o.path === "a.png"), JSON.stringify(edited.ops));
+});
+
 test("row pruned before ns is ready keeps S: an observed rename still moves the doc once ns is read", () => {
 	// Sim seed 179: IDB wiped (mirrors kept), the user renamed a.md -> b.md, the ns was not read yet. S was
 	// dropped as "pruned", so b.md became a new doc and the old doc came back at a.md on every device.

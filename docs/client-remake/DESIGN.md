@@ -508,7 +508,8 @@ path (example E8).
 - One frame-level event `pruned{docIds}` is emitted.
 - Later ops on pruned docIds are `unknown-docid`.
 - Devices with checkpoint duty put `retired` checkpoints for the pruned docs' `b:`/`c:` streams (§d.9).
-- A long-offline device that still holds a pruned doc is handled by the planner row "absent/pruned" (§f.2).
+- A long-offline device that still holds a pruned doc is handled by the planner row "absent/pruned" (§f.2). An
+  absent doc this device never saw committed (`S.nsTouchSeq = 0`) is not taken for pruned (§f.2).
 - Alternative: age-based pruning. Rejected: it needs wall clocks, which the fold never reads.
 
 ### c.10 Rules versioning (`upgradeRules`)
@@ -736,7 +737,8 @@ changes.
     event `pruned{…}` is emitted.
   - A later `rename` of a pruned id is `unknown-docid`.
   - An offline device with `synced` for a pruned doc: L unchanged → `diskTrash` (braked); L changed → `nsCreate` of a
-    fresh doc and `syncedDrop` of the old.
+    fresh doc and `syncedDrop` of the old. Not when L is a live doc's file (`syncedDrop` only), and an S that never
+    saw the doc committed (`nsTouchSeq = 0`) re-creates instead of trashing (§f.2).
 - **E12, upgradeRules halt.** A v1 device folds seq 9100 `upgradeRules{2}`.
   - The ns fold halts with `coversSeq 9099` and phase `upgrade-required`, notice `upgrade-required:ns`. Rows ≥ 9100
     stay in `tail` until the client is upgraded; the upgraded client refolds them on its next start.
@@ -1609,13 +1611,26 @@ All are in `src/core/types.ts`.
 | deleted | present | present, ¬`Lc` | If the doc has own pending body frames and the restore condition holds → `nsRestore`. Else → `diskTrash(S.path, expect hash = S.contentHash)` + `syncedDrop` (brake: mass-delete-remote). |
 | deleted | present | present, `Lc` | Local edit beats remote delete: `nsRestore(path = S.path, againstDeleteSeq = R.deletedSeq)` + `reconcileContent`. |
 | merged → W | present | any | `rebind(S.docId → W)`, then plan as W. |
-| absent (pruned) | present | ¬`Lc` / absent | `diskTrash` (braked) + `syncedDrop` / `syncedDrop`. |
-| absent (pruned) | present | `Lc` | `nsCreate` (fresh docId) + `reconcileContent`; `syncedDrop(old)`. |
+| absent (pruned) | present | present, owned by a live doc | The live doc at S.path has its own S there, or its create / blob bytes equal L: `syncedDrop` only. No trash (the owner's row would read the file as a user delete: `nsDelete`), no create (a duplicate). An unsynced owner adopts the file next pass. |
+| absent (pruned) | present | ¬`Lc`, `S.nsTouchSeq > 0` / absent | `diskTrash` (braked) + `syncedDrop` / `syncedDrop`. |
+| absent (pruned) | present | `Lc`, or `S.nsTouchSeq = 0` | `nsCreate` (fresh docId) + `reconcileContent` / `pushBlob`; `syncedDrop(old)`. `nsTouchSeq = 0`: this device never saw the doc committed (S1 stamps an own create's fold seq), so the absence is an own create the fold ignored (`replay-duplicate`, ...), not a prune (below). |
 | live | absent | absent | `diskMaterialize(R.path, expect absent)` once `body.caughtUp && (hasContent ∨ createSize = 0)`, else `wait(body-empty / body-not-caught-up)`. Blob: `fetchBlob`. |
 | live | absent | present | L hash = remote hash (`streams.textHash` / `blob.hash` / `createHash` at initial version) → `syncedPut` (adopt, no I/O). Else `reconcileContent(hasBase: false)`, which gives a no-base conflict copy unless identical. Path-keyed bases from recovery or epoch migration supply a base when present. |
 | absent | absent | present | Portable and not excluded → `nsCreate(freshDocId, path, hash, size)` + initial `reconcileContent` / `pushBlob`. Not portable (§c.2 validity) → notice, skip. |
 | frozen body | any | any | `wait(frozen)`. No disk write and no frames from disk. |
 
+- **Absent is not always pruned.** A prune (§c.9) removes only an entry the fold held: created, then deleted or
+  merged, then past the tombstone cap. A device holding S for it saw it committed: S1 stamped its own create's seq
+  into `nsTouchSeq`, and every S written from the remote tree carries `lastTouchSeq` (> 0). An S with `nsTouchSeq = 0`
+  whose doc is absent and not `pendingLocal` is an own create whose frame committed and folded as ignored
+  (`replay-duplicate` after an IDB loss reused a frameNo, `duplicate-docid`): it never existed in any fold, so no
+  device holds it and it can never fold later. Its file is created anew rather than trashed. The worst case of the
+  rule is the reverse mistake (an own create that folded, was deleted elsewhere and pruned before S1 ran here): a
+  resurrection, never a loss. Independently, a file owned by a live doc at the same path (its S there, or its bytes)
+  is never trashed for an absent doc: in sim seed 222 (frameNo floor reverted) the create from before the wipe folded
+  as d2 at the same path, S1 gave d2 an S, and trashing the file for the ignored d1 made d2's row read it as a user
+  delete. Both rules keep the bytes and converge; a re-create at a path whose live doc holds the same bytes folds as
+  `merged` (§c.5) or collapses (§c.13).
 - **Precondition ops** (`nsDelete`, `nsRestore`, `nsSetBlob`) are emitted only if the doc has no pending own ns op
   (§c.13). Otherwise the result is `wait(pending-ns)`.
 - **Plan order:**

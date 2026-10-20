@@ -467,7 +467,20 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		// the doc identity an observed rename of this file still needs.
 		if (!ctx.nsReady) return push(prefix);
 		if (!l) return push([...prefix, drop(s.docId)]);
-		if (l.hash === s.contentHash) {
+		// The file is a live doc's: that doc's synced record sits at the path, or the doc there holds these bytes. A
+		// trash would delete it (its planner row reads the file as gone: nsDelete), and a re-create would duplicate
+		// it. Drop S only; the live doc keeps (or, next pass, adopts) the file (sim seed 222: the own create, folded
+		// as replay-duplicate, had a twin create of the same file from before an IDB wipe that did fold).
+		const holder = input.remoteByPathKey.get(s.pathKey);
+		if (holder !== undefined && holder !== s.docId && (input.synced.get(holder)?.pathKey === s.pathKey || mergesIntoOwner(l))) {
+			return push([...prefix, drop(s.docId)]);
+		}
+		// A prune removes only an entry the fold held (created, then deleted or merged): nsTouchSeq 0 says this
+		// device never saw the doc committed (an own create still waits for S1 to stamp the fold's seq). Its absence
+		// is then an own create the fold ignored (replay-duplicate, duplicate-docid, ...), not a prune: the file is
+		// created anew instead of trashed, as a changed file is below. The worst case of the rule is a resurrection
+		// (an own create that did fold, was deleted elsewhere and pruned before S1 ran), never a loss.
+		if (l.hash === s.contentHash && s.nsTouchSeq > 0) {
 			return push([...prefix, { op: "diskTrash", docId: s.docId, path: l.path, expect: { t: "hash", hash: s.contentHash } }, drop(s.docId)],
 				"diskTrash", brakeKey("diskTrash", s.docId, l.path, s.contentHash), l.path);
 		}

@@ -466,7 +466,7 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
     in ms) + 1` (`FoldRuntime.skip`). A store that lost IndexedDB knows only its committed frames, the same edge the
     runtime it replaced allocated from, and that runtime skipped too, so a skip from the edge alone repeats its numbers
     for a frame it still had in flight: whichever of the two committed second was ignored as `replay-duplicate`, and a
-    create in it never folded (sim seed 222: the planner then took the synced doc for pruned and trashed the file).
+    create in it never folded (sim seed 222: the planner then took the synced doc for pruned and trashed the file; it no longer does, DESIGN §f.2).
     The clock floor puts the new runtime above every number the lost one used, as long as that one allocated fewer
     frames than ms passed between the two starts. A lost frame committing before the new ones then leaves them
     accepted; one committing after them is stale (the boundary below). The clock is a floor only: a clock behind the
