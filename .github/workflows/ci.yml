@@ -25,3 +25,47 @@ jobs:
       - run: npm run guard:no-tracked-generated-artifacts
       - run: npm run test:ci
       - run: npm --prefix server run typecheck
+
+  client:
+    # The new client's commit gate: typecheck, dependency rules, the no-real-time guard (src/core, src/engine,
+    # src/protocol use the ClockPort / RandomPort only) and every non-sim test, including the first seeds of each sim
+    # matrix (src/sim/smoke.test.ts) and the committed regression plans (src/sim/regressions/).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck:client
+      - run: npm run check:deps
+      - run: npm run guard:no-real-time
+      - run: npm run test:client
+
+  sim:
+    # Every seed of the sim matrices and the measured sim runs (*.sim.test.ts, 200 seeds at the CI count), dealt to
+    # three shards by cost (scripts/sim-test.mjs YAOS_SIM_SHARD); each shard runs its units over one process per core.
+    # The same seeds on every run: new seeds are the nightly soak's (.github/workflows/sim-soak.yml).
+    name: sim (shard ${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run test:sim
+        env:
+          YAOS_SIM_SHARD: ${{ matrix.shard }}/3

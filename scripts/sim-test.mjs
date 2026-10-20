@@ -2,9 +2,12 @@
 // The slow sim runs `npm run test:client` skips: every src/**/*.sim.test.ts (the sim seed sweeps and the measured
 // e2ee runs). Each file registers its units with simTest (src/sim/testkit/simTest.ts); every unit runs in its own
 // node --test process, costliest first, over a pool of processes.
-// Usage: npm run test:sim [-- <substring> ...]   (only units whose file or name contains a substring)
+// Usage: npm run test:sim [-- <substring> ...]   (only units whose file or name contains a substring; --list: print the
+//        units this run would take, in order, and exit)
 // Env:   YAOS_SIM_SEEDS  seeds of the full-count sim matrices (default 200; the others scale with it)
 //        YAOS_SIM_JOBS   processes (default: cores - 1)
+//        YAOS_SIM_FIRST  first seed of the sweeps (default 1)
+//        YAOS_SIM_SHARD  i/n: run only shard i (1-based) of n, units spread over the shards by cost (CI matrix)
 import { readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
@@ -13,7 +16,8 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const PREFIX = "sim-unit ";
-const filters = process.argv.slice(2);
+const listOnly = process.argv.includes("--list");
+const filters = process.argv.slice(2).filter((a) => a !== "--list");
 const files = [];
 (function walk(dir) {
 	for (const name of readdirSync(dir)) {
@@ -40,7 +44,31 @@ if (selected.length === 0) {
 	console.log("sim-test: no units matched");
 	process.exit(0);
 }
-selected.sort((a, b) => b.cost - a.cost);
+selected.sort((a, b) => b.cost - a.cost || a.file.localeCompare(b.file) || a.i - b.i);
+const shardArg = process.env.YAOS_SIM_SHARD;
+if (shardArg) {
+	const [k, n] = shardArg.split("/").map(Number);
+	if (!(n >= 1 && k >= 1 && k <= n)) {
+		console.error(`sim-test: YAOS_SIM_SHARD must be i/n with 1 <= i <= n, got ${shardArg}`);
+		process.exit(2);
+	}
+	// Longest first onto the least-loaded shard: every shard computes the same split.
+	const load = Array.from({ length: n }, () => 0);
+	const mine = [];
+	for (const u of selected) {
+		const s = load.indexOf(Math.min(...load));
+		load[s] += u.cost;
+		if (s === k - 1) mine.push(u);
+	}
+	selected.length = 0;
+	selected.push(...mine);
+	console.log(`sim-test: shard ${k}/${n}: ${mine.length} units, ~${Math.round(load[k - 1])} s of one core`);
+	if (mine.length === 0) process.exit(0);
+}
+if (listOnly) {
+	for (const u of selected) console.log(`${u.cost.toFixed(1).padStart(7)}  ${u.file} #${u.i}  ${u.name}`);
+	process.exit(0);
+}
 const jobs = Math.max(1, Number(process.env.YAOS_SIM_JOBS ?? 0) || Math.max(1, availableParallelism() - 1));
 console.log(`sim-test: ${selected.length} units from ${files.length} files over ${jobs} processes`);
 

@@ -2,7 +2,9 @@
 // matrices run in sweeps.sim.test.ts (`npm run test:sim`), a few seeds each in smoke.test.ts (`npm run test:client`).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { generatePlan, minimizePlan, runSim, type SimConfig, type Step } from "./run";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { generatePlan, minimizePlan, runSim, type SimConfig, type SimReport, type Step } from "./run";
 import { CANVAS_FAULTS, DEFAULT_FAULTS, E2EE_FAULTS } from "./faults";
 import { checkCanvas, checkConvergence, checkNothingDestroyed, checkTokens, orderLoss } from "./invariants";
 import { ABSENT, CANVAS_HOT_OPS, CanvasOracle, suffixedDuplicates, type FieldWrite, type ReorderIntent } from "./canvas";
@@ -426,4 +428,36 @@ test("invariants: a reorder holds in its doc, or after a wipe without mirrors in
 	const wiped = [{ dev: "B", atMs: 200 }];
 	assert.deepEqual(orderLoss(r, [old, { ...renamed, ids: ["n4", "n1", "n2", "n3"] }], wiped, none)?.against, ["n2", "n3"], "the other doc lost it too");
 	assert.deepEqual(orderLoss(r, [old, { ...renamed, path: "canvas/c2 (conflict B 2026-01-01 0001).canvas" }], wiped, none)?.against, ["n2", "n3"], "a conflict copy is not the other doc");
+});
+
+test("sim: a fresh process reproduces this process's digests and traces (no module state leaks into a run)", async () => {
+	// In this process the seeds run after whatever the file ran before; in the child they run first, in a clean module graph.
+	const cfgs: SimConfig[] = [
+		{ seed: 4242, devices: 3, faults: DEFAULT_FAULTS, steps: 80 },
+		{ seed: 9, devices: 2, faults: null, steps: 80 },
+		{ seed: 31, devices: 2, faults: DEFAULT_FAULTS, faultRate: 0.35, steps: 60, crypto: "suite1" },
+	];
+	const summary = (r: SimReport) => ({ seed: r.seed, digest: r.digest, trace: createHash("sha256").update(JSON.stringify(r.trace)).digest("hex"), violations: r.violations.length });
+	const here: unknown[] = [];
+	for (const cfg of cfgs) here.push(summary(await runSim(cfg)));
+	const script = `
+		const load = async (p) => { const m = await import(p); return m.default && typeof m.default === "object" ? { ...m.default, ...m } : m; };
+		const { runSim } = await load(${JSON.stringify(new URL("./run.ts", import.meta.url).href)});
+		const { DEFAULT_FAULTS } = await load(${JSON.stringify(new URL("./faults.ts", import.meta.url).href)});
+		const { createHash } = await import("node:crypto");
+		const cfgs = JSON.parse(process.env.CFGS).map((c) => ({ ...c, faults: c.faults ? DEFAULT_FAULTS : null }));
+		const out = [];
+		for (const cfg of cfgs) { const r = await runSim(cfg); out.push({ seed: r.seed, digest: r.digest, trace: createHash("sha256").update(JSON.stringify(r.trace)).digest("hex"), violations: r.violations.length }); }
+		process.stdout.write(JSON.stringify(out));
+	`;
+	const child = spawnSync(process.execPath, ["--import", "jiti/register", "--input-type=module", "-e", script], {
+		encoding: "utf8",
+		env: { ...process.env, CFGS: JSON.stringify(cfgs.map((c) => ({ ...c, faults: c.faults ? "DEFAULT_FAULTS" : null }))) },
+		maxBuffer: 1 << 26,
+	});
+	assert.equal(child.status, 0, child.stderr);
+	assert.deepEqual(JSON.parse(child.stdout), here);
+	const again: unknown[] = [];
+	for (const cfg of cfgs) again.push(summary(await runSim(cfg)));
+	assert.deepEqual(again, here, "the same seeds rerun in this process");
 });

@@ -1,16 +1,28 @@
 name: Sim soak
 
+# Exploration (CI's sim job re-runs the same seeds): random seeds every night.
+#   soak    scripts/sim-soak.mjs, one process per core, each with its own master seed (swarm profiles: fault subsets,
+#           storms, randomized tuning, canvas, suspend). A failure is minimized and uploaded as sim-failures/*.json;
+#           replay it with `npm run sim:replay -- <file>`.
+#   sweep   the CI sim matrices (`npm run test:sim`) at a random first seed (YAOS_SIM_FIRST), so they see new seeds too.
+# Promote a failure as a focused test of the mechanism plus, if it still fails without the fix, its minimized plan
+# (src/sim/regressions/README.md).
+
 on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       minutes:
-        description: "Soak time budget (minutes)"
+        description: "Soak time budget per process (minutes)"
         required: false
         default: "60"
       master_seed:
-        description: "Master seed (empty: random; the log prints it)"
+        description: "Master seed of process 1 (process i uses seed + i - 1; empty: random; the log prints them)"
+        required: false
+        default: ""
+      first_seed:
+        description: "First seed of the sweep (empty: random; the log prints it)"
         required: false
         default: ""
 
@@ -30,9 +42,23 @@ jobs:
 
       - name: Soak
         env:
-          YAOS_SOAK_MINUTES: ${{ inputs.minutes || '60' }}
-          YAOS_SOAK_MASTER_SEED: ${{ inputs.master_seed || '' }}
-        run: npm run sim:soak -- --out sim-failures
+          MINUTES: ${{ inputs.minutes || '60' }}
+          MASTER_SEED: ${{ inputs.master_seed || '' }}
+        run: |
+          base="${MASTER_SEED:-$(( (RANDOM << 15 | RANDOM) % 2147483000 ))}"
+          procs="$(nproc)"
+          echo "soak: ${procs} processes, master seeds ${base}..$(( base + procs - 1 ))"
+          pids=()
+          for i in $(seq 0 $(( procs - 1 ))); do
+            npm run -s sim:soak -- --minutes "$MINUTES" --master-seed $(( base + i )) --out sim-failures > "soak-$i.log" 2>&1 &
+            pids+=($!)
+          done
+          status=0
+          for i in "${!pids[@]}"; do
+            wait "${pids[$i]}" || status=1
+            echo "::group::soak process $i (master seed $(( base + i )))"; cat "soak-$i.log"; echo "::endgroup::"
+          done
+          exit $status
 
       - name: Upload failures
         if: failure()
@@ -42,3 +68,25 @@ jobs:
           path: sim-failures/
           if-no-files-found: ignore
           retention-days: 30
+
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Sim matrices at a random first seed
+        env:
+          FIRST_SEED: ${{ inputs.first_seed || '' }}
+          YAOS_SIM_SEEDS: "400"
+        run: |
+          export YAOS_SIM_FIRST="${FIRST_SEED:-$(( 1000 + (RANDOM << 15 | RANDOM) % 2000000000 ))}"
+          echo "sweep: seeds ${YAOS_SIM_FIRST}..$(( YAOS_SIM_FIRST + YAOS_SIM_SEEDS - 1 )) (reproduce: YAOS_SIM_FIRST=${YAOS_SIM_FIRST} YAOS_SIM_SEEDS=${YAOS_SIM_SEEDS} npm run test:sim)"
+          npm run test:sim

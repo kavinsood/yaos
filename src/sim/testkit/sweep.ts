@@ -11,6 +11,8 @@ import { CANVAS_HOT_OPS } from "../canvas";
 import type { SimBlobLiveness } from "../blobStore";
 
 export const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
+/** First seed of the sweeps (YAOS_SIM_FIRST, default 1): a nightly run at a random offset explores new seeds. */
+export const FIRST = Math.max(1, Math.floor(Number(process.env.YAOS_SIM_FIRST ?? 1)) || 1);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */
 export type Hits = (name: string, stats: readonly SimReport["stats"][]) => void;
