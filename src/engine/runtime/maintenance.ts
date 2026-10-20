@@ -4,6 +4,12 @@
  * checkpoint duty (§d.9), daily-limit release, residency budget, expiry of
  * recently unbound subscriptions, catch-up scheduling (which also starts the
  * reads whose skip deferral ran out, §d.7).
+ *
+ * Idle backoff: while nothing is pending (busy() false) and a tick did no work,
+ * the interval doubles up to maintenanceIdleMaxMs; activity (ctx.onActivity:
+ * every scheduleStatus outside the tick, i.e. phase, notice, outbox, ingest
+ * and keyring changes) or a busy state snaps it back to maintenanceMs. An idle
+ * engine then wakes about twice a minute instead of every second.
  */
 
 import { TAIL_HARD_ROWS } from "../../core/limits";
@@ -22,9 +28,13 @@ export class Maintenance {
 	private timer: TimerHandle | null = null;
 	private running: Promise<void> | null = null;
 	private readonly compactSkip = new Map<StreamName, number>();
+	/** Idle ticks in a row (no pending work, no work done): the next interval is maintenanceMs * 2^idle, capped. */
+	private idle = 0;
 	stats = { ticks: 0, gapFeeds: 0, compactions: 0, checkpoints: 0, checkpointOutcomes: {} as Record<string, number> };
 
-	constructor(private readonly c: EngineCtx) {}
+	constructor(private readonly c: EngineCtx) {
+		c.onActivity = () => this.kick();
+	}
 
 	start(): void {
 		this.arm();
@@ -36,10 +46,35 @@ export class Maintenance {
 
 	private arm(): void {
 		if (this.c.stopped || this.timer !== null) return;
-		this.timer = this.c.ports.clock.setTimer(this.c.tuning.maintenanceMs, () => {
+		const t = this.c.tuning;
+		const delay = Math.min(t.maintenanceMs * 2 ** Math.min(this.idle, 20), Math.max(t.maintenanceMs, t.maintenanceIdleMaxMs));
+		this.timer = this.c.ports.clock.setTimer(delay, () => {
 			this.timer = null;
 			void this.tick().finally(() => this.arm());
 		});
+	}
+
+	/** Activity: back to maintenanceMs (re-armed at once when a longer idle wait is pending). */
+	kick(): void {
+		if (this.idle === 0) return;
+		this.idle = 0;
+		if (this.timer === null) return; // a tick is running: it re-arms with the base interval
+		this.c.ports.clock.clearTimer(this.timer);
+		this.timer = null;
+		this.arm();
+	}
+
+	/** Work a 1 s tick exists for is pending: a frame open, an edit or read or feed in flight, rows to catch up. */
+	private busy(): boolean {
+		const c = this.c;
+		if (!c.docs.editIdle || c.sess.readsInFlight > 0 || c.sess.isFeeding) return true;
+		for (const h of c.handles.all()) if (!h.builder.empty) return true;
+		if (!c.session) return false;
+		const cur = c.repo.cursor;
+		if (cur.headSeqSeen > cur.vaultSeq || cur.pendingAbove() > 0) return true;
+		const onlyK = c.keyring.readsOnlyK();
+		for (const r of c.repo.streams()) if (r.stale && !r.frozen && r.cls !== "other" && (!onlyK || r.cls === "keyring") && !c.sess.isHeld(r.stream)) return true;
+		return false;
 	}
 
 	/** One pass (tests call it directly). */
@@ -56,6 +91,7 @@ export class Maintenance {
 		const c = this.c;
 		if (c.stopped) return;
 		this.stats.ticks++;
+		const work0 = this.stats.gapFeeds + this.stats.compactions + this.stats.checkpoints;
 		const steps: [string, () => Promise<void> | void][] = [
 			["gap", () => this.gap()],
 			["compact", () => this.compact()],
@@ -74,7 +110,9 @@ export class Maintenance {
 		c.handles.enforceBudget();
 		c.subs.tick();
 		c.sess.scheduleCatchUp();
-		c.scheduleStatus();
+		c.scheduleStatus(false);
+		const worked = this.stats.gapFeeds + this.stats.compactions + this.stats.checkpoints !== work0;
+		this.idle = worked || this.busy() ? 0 : this.idle + 1;
 	}
 
 	/** Missing V+1 for gapMs, or a head hint above V with nothing queued for gapMs: feed (DESIGN §d.7). */

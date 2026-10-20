@@ -567,7 +567,12 @@ export class EngineCtx {
 		this.daily.frames += n;
 	}
 
-	scheduleStatus(): void {
+	/** Something changed that maintenance may have to act on (Maintenance sets it; called from scheduleStatus). */
+	onActivity: (() => void) | null = null;
+
+	/** `activity` false: the maintenance tick's own refresh, which must not wake maintenance again. */
+	scheduleStatus(activity = true): void {
+		if (activity) this.onActivity?.();
 		if (!this.opts.onStatus || this.statusTimer !== null || this.stopped) return;
 		this.statusTimer = this.ports.clock.setTimer(this.tuning.statusIntervalMs, () => {
 			this.statusTimer = null;

@@ -6,12 +6,12 @@ import type { EngineInitConfig, EngineToMain, MainToEngine } from "../protocol/m
 import { PROTOCOL_VERSION } from "../protocol/messages";
 import type { ProtocolError, ProtocolErrorCode } from "../protocol/errors";
 import type { HostTransport } from "../protocol/transport";
-import { PING_INTERVAL_MS, PING_TIMEOUT_MS } from "../protocol/transport";
+import { PING_IDLE_MAX_MS, PING_INTERVAL_MS, PING_TIMEOUT_MS } from "../protocol/transport";
 import { createWorkerHostTransport, type WorkerLike } from "../protocol/workerTransport";
 import { VirtualClock } from "../sim/clock";
 import { EngineHost, HostRequestError, STARTUP_PING_TIMEOUT_MS, type EngineCarrier, type EngineEventMessage } from "./engineHost";
 
-type Mode = "ok" | "silent" | { initError: ProtocolErrorCode } | "no-pong-after-init";
+type Mode = "ok" | "silent" | { initError: ProtocolErrorCode } | "no-pong-after-init" | "drop-first-pong-after-init";
 
 interface FakeEngineHandle {
 	readonly received: MainToEngine[];
@@ -50,6 +50,7 @@ function respond(h: FakeEngineHandle, mode: Mode, m: MainToEngine, post: (m: Eng
 	switch (m.t) {
 		case "ping":
 			if (mode === "no-pong-after-init" && h.received.some((x) => x.t === "init")) return;
+			if (mode === "drop-first-pong-after-init" && h.received.some((x) => x.t === "init") && h.received.filter((x) => x.t === "ping").length === 2) return;
 			post({ t: "result", re: rid, value: { t: "pong" } });
 			return;
 		case "init":
@@ -159,26 +160,26 @@ interface Harness {
 function harness(make: Make, opts: { ping?: boolean } = {}): Harness {
 	const clock = new VirtualClock();
 	const engines: FakeEngineHandle[] = [];
-	const h: Harness = { clock, host: null as unknown as EngineHost, engines, constructions: 0, readies: [], fatals: [], events: [], inits: 0 };
-	h.host = new EngineHost({
+	const st: Omit<Harness, "host"> = { clock, engines, constructions: 0, readies: [], fatals: [], events: [], inits: 0 };
+	const host = new EngineHost({
 		clock,
 		pingEnabled: opts.ping ?? true,
 		createCarrier: () => {
-			h.constructions++;
+			st.constructions++;
 			return make(clock, engines);
 		},
 		initConfig: async () => {
-			h.inits++;
+			st.inits++;
 			return config();
 		},
 		handlers: {
-			onEvent: (m) => h.events.push(m),
+			onEvent: (m) => st.events.push(m),
 			onRequest: async () => ({ t: "sideFileWritten" }),
-			onReady: (info) => h.readies.push(info.carrier),
-			onFatal: (e) => h.fatals.push(e),
+			onReady: (info) => st.readies.push(info.carrier),
+			onFatal: (e) => st.fatals.push(e),
 		},
 	});
-	return h;
+	return Object.assign(st, { host });
 }
 
 async function startAndSettle(h: Harness, ms = 1_000): Promise<void> {
@@ -321,17 +322,51 @@ test("terminal: the carrier's transport fails", async () => {
 	await assertTerminal(h, { pending, message: /^the sync engine failed: engine crashed$/, code: "internal", constructions: 1 });
 });
 
-test("terminal: the worker misses a liveness pong", async () => {
+test("terminal: the worker misses two liveness pongs in a row", async () => {
 	const h = harness(worker("no-pong-after-init"));
 	await startAndSettle(h);
 	assert.equal(h.host.isReady, true);
 	const pending = [pendingOpenDoc(h)];
-	// Ready at t=0: the first ping goes out at PING_INTERVAL_MS, its pong is due PING_TIMEOUT_MS later.
-	await h.clock.advance(PING_INTERVAL_MS + PING_TIMEOUT_MS - 1_000 - 100); // t = 24.9 s
-	assert.deepEqual(h.fatals, [], "the pong is not late yet");
-	await h.clock.advance(200); // t = 25.1 s
+	// Ready at t=0: the first ping goes out at PING_INTERVAL_MS, its pong is due PING_TIMEOUT_MS later; a second
+	// ping follows at once and is due PING_TIMEOUT_MS after that.
+	await h.clock.advance(PING_INTERVAL_MS + 2 * PING_TIMEOUT_MS - 1_000 - 100); // t = 39.9 s
+	assert.deepEqual(h.fatals, [], "one miss is not fatal; the second pong is not late yet");
+	assert.equal(h.engines[0]?.received.filter((m) => m.t === "ping").length, 3, "startup ping + two liveness pings");
+	await h.clock.advance(200); // t = 40.1 s
 	assert.equal(h.engines[0]?.worker?.terminated, true, "hung worker terminated");
-	await assertTerminal(h, { pending, message: /^the sync engine stopped answering \(no pong within 15 s\)$/, code: "internal", constructions: 1 });
+	await assertTerminal(h, { pending, message: /^the sync engine stopped answering \(no pong to 2 pings, 15 s each\)$/, code: "internal", constructions: 1 });
+});
+
+test("liveness: one missed pong (an engine frozen with the app) is retried at once, not fatal", async () => {
+	const h = harness(worker("drop-first-pong-after-init"));
+	await startAndSettle(h);
+	await h.clock.advance(PING_INTERVAL_MS + PING_TIMEOUT_MS + 100); // first liveness ping timed out, second answered
+	assert.equal(h.engines[0]?.received.filter((m) => m.t === "ping").length, 3);
+	await h.clock.advance(5 * PING_INTERVAL_MS);
+	assert.deepEqual(h.fatals, []);
+	assert.equal(h.host.isReady, true);
+	assert.ok(h.engines[0]!.received.filter((m) => m.t === "ping").length >= 4, "pings resumed");
+});
+
+test("liveness idle backoff: answered pings with no traffic double the interval up to PING_IDLE_MAX_MS; anything main sends returns it to PING_INTERVAL_MS", async () => {
+	const h = harness(worker("ok"));
+	await startAndSettle(h);
+	const pings = () => h.engines[0]!.received.filter((m) => m.t === "ping").length - 1; // less the startup ping
+	// Ready at t=0 (startAndSettle leaves the clock at 1 s): pings at 10, 30 (+20), 70 (+40), 130 (+60, capped), 190 (+60) s.
+	assert.equal(pings(), 0);
+	for (const [t, n] of [[10, 1], [30, 2], [70, 3], [130, 4], [190, 5]] as const) {
+		await h.clock.advance(t * 1_000 - h.clock.monotonic() - 100);
+		assert.equal(pings(), n - 1, `before ${t} s`);
+		await h.clock.advance(200);
+		assert.equal(pings(), n, `at ${t} s`);
+	}
+	assert.equal(PING_IDLE_MAX_MS, 60_000);
+	// Main uses the engine: the next ping is PING_INTERVAL_MS away, not 60 s.
+	await h.clock.advance(5_000);
+	assert.equal(h.host.post({ t: "docCredit", bytes: 1 }), true);
+	await h.clock.advance(PING_INTERVAL_MS + 100);
+	assert.equal(pings(), 6, "back to the base interval after activity");
+	assert.deepEqual(h.fatals, []);
 });
 
 test("terminal: init answers storage-lost (OR-1)", async () => {

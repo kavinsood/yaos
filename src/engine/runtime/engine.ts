@@ -428,6 +428,7 @@ export class LogEngine {
 		const c = this.c;
 		if (c.background === on) return;
 		c.background = on;
+		c.onActivity?.(); // background work waits or resumes: maintenance back to its base interval
 		if (!on) c.sess.scheduleCatchUp();
 	}
 	/** Deliberate background close: no offline phase, no backoff; wake() reconnects. */
@@ -439,6 +440,11 @@ export class LogEngine {
 	}
 	setNetwork(online: boolean): Promise<void> {
 		return this.c.sess.setNetwork(online);
+	}
+	/** The network came back: unresolved body refs and held frames' blob re-PUTs retry now (backoff counts kept). */
+	retryBlobsNow(): void {
+		this.c.docs.retryRefsNow();
+		this.c.touch.retryNow();
 	}
 
 	async stop(): Promise<void> {

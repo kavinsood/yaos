@@ -9,7 +9,9 @@
  *    next one runs at once, up to `maxChained`, widened by the paths it vacated;
  *  - backoff: actionable ops with nothing succeeding retry after a growing
  *    delay; queued blob transfers retry at the blob queue's next due time;
- *  - periodic: a full pass every `fullIntervalMs`.
+ *  - periodic: a full pass every `fullIntervalMs`, doubling (up to
+ *    `fullIdleMaxMs`) while full passes find nothing to do; a docs request
+ *    or a full pass with work resets it.
  */
 
 import type { DocId, PathKey, PlanScope } from "../../core/types";
@@ -23,6 +25,8 @@ export interface PassSchedulerDeps {
 	/** Milliseconds until the blob queue's next retry is due (null = nothing queued). */
 	nextBlobDueInMs(): number | null;
 	readonly fullIntervalMs: number;
+	/** Cap of the periodic pass's idle backoff (default: no backoff). */
+	readonly fullIdleMaxMs?: number;
 	readonly debounceMs?: number;
 	readonly maxChained?: number;
 	onReport?(report: PassReport, scope: PlanScope): void;
@@ -39,6 +43,8 @@ export class PassScheduler {
 	private retry: TimerHandle | null = null;
 	private periodic: TimerHandle | null = null;
 	private failures = 0;
+	/** Full passes in a row with nothing actionable (the periodic backoff). */
+	private periodicIdle = 0;
 	private stopped = false;
 	stats = { passes: 0, fullPasses: 0, errors: 0, lastFullAtMs: null as number | null };
 	last: PassReport | null = null;
@@ -52,6 +58,10 @@ export class PassScheduler {
 		else {
 			for (const d of scope.docIds) w.docIds.add(d);
 			for (const k of scope.pathKeys) w.pathKeys.add(k);
+			if (this.periodicIdle > 0) {
+				this.periodicIdle = 0;
+				if (this.periodic !== null) this.armPeriodic();
+			}
 		}
 		this.kick(now ? 0 : this.deps.debounceMs ?? 30);
 	}
@@ -120,6 +130,7 @@ export class PassScheduler {
 			if (scope.t === "full") {
 				this.stats.fullPasses++;
 				this.stats.lastFullAtMs = this.deps.clock.now();
+				this.periodicIdle = report.actionable === 0 ? this.periodicIdle + 1 : 0;
 				this.armPeriodic();
 			}
 			this.last = report;
@@ -165,7 +176,10 @@ export class PassScheduler {
 	private armPeriodic(): void {
 		if (this.stopped) return;
 		if (this.periodic !== null) this.deps.clock.clearTimer(this.periodic);
-		this.periodic = this.deps.clock.setTimer(this.deps.fullIntervalMs, () => {
+		const base = this.deps.fullIntervalMs;
+		const max = Math.max(base, this.deps.fullIdleMaxMs ?? base);
+		const delay = Math.min(base * 2 ** Math.min(this.periodicIdle, 10), max);
+		this.periodic = this.deps.clock.setTimer(delay, () => {
 			this.periodic = null;
 			this.request({ t: "full" });
 		});

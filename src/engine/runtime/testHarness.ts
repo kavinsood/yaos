@@ -46,6 +46,7 @@ import { retryReaderQuarantine } from "./quarantineRelease";
 export const FAST_TUNING: Partial<EngineTuning> = {
 	frameStretch: 0.02,
 	maintenanceMs: 25,
+	maintenanceIdleMaxMs: 100,
 	gapMs: 150,
 	statusIntervalMs: 50,
 	mirrorDebounceMs: 10,

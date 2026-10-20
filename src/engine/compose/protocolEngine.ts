@@ -57,7 +57,10 @@ export interface CreateEngineOptions {
 	readonly clientVersion?: string;
 	readonly tuning?: Partial<EngineTuning>;
 	readonly budgets?: Partial<Budgets>;
-	/** Retry delay after a failed runtime start (offline fresh device, relay down). */
+	/**
+	 * First retry delay after a failed runtime start (offline fresh device, relay down); doubles per failure up to
+	 * START_RETRY_MAX_MS, back to it after a start or on `online` / `visible` / `resume`.
+	 */
 	readonly startRetryMs?: number;
 	/** Test hook: called with each new runtime (null when it stops). */
 	readonly onRuntime?: (rt: VaultRuntime | null) => void;
@@ -84,6 +87,8 @@ export function createEngine(transport: EngineTransport, options: CreateEngineOp
 }
 
 const MAX_REPLAY_EVENTS = 20_000;
+/** Cap of the runtime start retry backoff (startRetryMs doubling): a vault that cannot start costs ~12 tries an hour. */
+export const START_RETRY_MAX_MS = 5 * 60_000;
 
 export class ComposedEngine {
 	readonly link: HostLink;
@@ -108,6 +113,8 @@ export class ComposedEngine {
 	private partialListing: LocalObservation[] = [];
 	private eventsSince: VaultEvent[] = [];
 	private retryTimer: number | null = null;
+	/** Runtime starts failed in a row (the retry backoff). */
+	private startFailures = 0;
 	private lastStartError: string | null = null;
 	private knownEpoch: VaultEpoch | undefined;
 	/** The engine clock when init answered ready, and the last runtime start's duration (the device check reports them). */
@@ -258,6 +265,7 @@ export class ComposedEngine {
 					return null;
 				}
 				this.rt = rt;
+				this.startFailures = 0;
 				this.runtimeStartMs = ports.clock.monotonic() - startedAt;
 				this.knownEpoch = rt.vaultEpoch;
 				this.migration = null;
@@ -327,11 +335,23 @@ export class ComposedEngine {
 	private scheduleRetry(): void {
 		const ports = this.ports;
 		if (!ports || this.disposed || this.retryTimer !== null) return;
-		this.retryTimer = ports.clock.setTimer(this.options.startRetryMs ?? 5_000, () => {
+		const base = this.options.startRetryMs ?? 5_000;
+		const delay = Math.min(base * 2 ** Math.min(this.startFailures, 20), Math.max(base, START_RETRY_MAX_MS));
+		this.startFailures++;
+		this.retryTimer = ports.clock.setTimer(delay, () => {
 			this.retryTimer = null;
 			if (this.disposed || this.rt || this.starting) return;
 			void this.startRuntime("retry");
 		});
+	}
+
+	/** The network or the app came back while no runtime runs: drop the backoff and retry at once. */
+	private retryStartNow(): void {
+		if (this.retryTimer === null || !this.ports) return;
+		this.ports.clock.clearTimer(this.retryTimer);
+		this.retryTimer = null;
+		this.startFailures = 0;
+		if (!this.disposed && !this.rt && !this.starting) void this.startRuntime("retry");
 	}
 
 	private async replayInto(rt: VaultRuntime): Promise<void> {
@@ -412,6 +432,7 @@ export class ComposedEngine {
 			case "lifecycle":
 				rt?.lifecycle(m.event);
 				this.reader?.lifecycle(m.event);
+				if (!rt && (m.event === "online" || m.event === "visible" || m.event === "resume")) this.retryStartNow();
 				return;
 			case "observations":
 				this.recordListing(m.chunk, m.complete);

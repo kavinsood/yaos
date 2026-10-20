@@ -15,7 +15,7 @@
 
 import type { BrakeReport, ContentHash, DocId, DocKind, PathKey, PlanScope, VaultEpoch, VaultPath } from "../../core/types";
 import { bytesToHex } from "../../core/codec/lib0";
-import type { Budgets } from "../../core/limits";
+import { FULL_RECONCILE_IDLE_MAX_MS, type Budgets } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
@@ -97,6 +97,8 @@ type Notice = DiskSideStatus["notices"][number];
 
 /** Phone / constrained close the socket after this long hidden (DESIGN §i.4). */
 export const HIDDEN_CLOSE_MS = 30_000;
+/** `online` and the relay session that follows it count as one network-back wake (networkBack). */
+export const NETWORK_BACK_MIN_GAP_MS = 5_000;
 
 export class VaultRuntime {
 	rec!: Reconciler;
@@ -116,6 +118,8 @@ export class VaultRuntime {
 	/** Backgrounded (DESIGN §i.4): reconcile passes wait until visible / resume. */
 	background = false;
 	private hiddenTimer: TimerHandle | null = null;
+	/** Monotonic time of the last networkBack wake. */
+	private networkBackAtMono: number | null = null;
 	private idbSnapshotDue = false;
 	private ownQueue: OwnFoldEvent[] = [];
 	private readonly notices: Notice[] = [];
@@ -138,6 +142,7 @@ export class VaultRuntime {
 			ready: () => !this.stopped && !this.paused && !this.migrating && !this.background && this.listingComplete && this.rec !== undefined,
 			nextBlobDueInMs: () => this.blobs?.nextDueInMs() ?? null,
 			fullIntervalMs: b.fullReconcileIntervalMs,
+			fullIdleMaxMs: FULL_RECONCILE_IDLE_MAX_MS,
 			onError: (e) => this.diag(`pass failed: ${e instanceof Error ? e.message : String(e)}`),
 		});
 	}
@@ -151,7 +156,7 @@ export class VaultRuntime {
 	}
 
 	get db(): StorageDb<DiskSchema> {
-		return this.log.c.repo.db as unknown as StorageDb<DiskSchema>;
+		return this.log.c.repo.db;
 	}
 
 	static async start(o: VaultRuntimeStart): Promise<VaultRuntime> {
@@ -386,8 +391,10 @@ export class VaultRuntime {
 	}
 
 	onLogStatus(s: StatusSnapshot): void {
+		const wasConnected = this.lastLog?.relay.connected ?? false;
 		this.lastLog = s;
 		if (this.stopped) return;
+		if (s.relay.connected && !wasConnected) this.networkBack();
 		// upgrade-required with a session: a fold is halted for a newer writer (§c.10) and the session caught up;
 		// the planner's nsReady and the cfg / snap readiness still see that fold's halt.
 		if ((s.phase === "live" || (s.phase === "upgrade-required" && s.relay.connected)) && !this.port.nsCaughtUp && this.rec) {
@@ -603,10 +610,25 @@ export class VaultRuntime {
 				return;
 			case "online":
 				void this.log.setNetwork(true).catch(() => undefined);
+				this.networkBack();
 				this.blobs?.pump();
 				this.sched.request({ t: "full" });
 				return;
 		}
+	}
+
+	/**
+	 * The network came back (lifecycle `online`, or a relay session after none): blob transfers, unresolved body refs
+	 * and held frames' blob re-PUTs that are waiting out a backoff retry now, not up to BLOB_RETRY_MAX_MS later.
+	 * Attempt counts are kept, so a failure that persists keeps backing off. `online` and the session that follows
+	 * it arrive together: one wake per NETWORK_BACK_MIN_GAP_MS.
+	 */
+	private networkBack(): void {
+		const mono = this.o.ports.clock.monotonic();
+		if (this.networkBackAtMono !== null && mono - this.networkBackAtMono < NETWORK_BACK_MIN_GAP_MS) return;
+		this.networkBackAtMono = mono;
+		this.log.retryBlobsNow();
+		if ((this.blobs?.retryNow() ?? 0) > 0) this.sched.request({ t: "full" });
 	}
 
 	private setBackground(on: boolean): void {

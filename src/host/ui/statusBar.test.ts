@@ -134,6 +134,7 @@ class FakeElement implements StatusBarElement {
 	attrs = new Map<string, string>();
 	classes = new Set<string>();
 	listeners = new Set<() => void>();
+	hovers = new Set<() => void>();
 	style = { display: "" };
 	writes = 0;
 	readonly classList = {
@@ -144,9 +145,10 @@ class FakeElement implements StatusBarElement {
 		if (name === "aria-label") this.writes++;
 		this.attrs.set(name, value);
 	}
-	addEventListener(_t: "click", l: () => void): void { this.listeners.add(l); }
-	removeEventListener(_t: "click", l: () => void): void { this.listeners.delete(l); }
+	addEventListener(t: "click" | "mouseenter", l: () => void): void { (t === "click" ? this.listeners : this.hovers).add(l); }
+	removeEventListener(t: "click" | "mouseenter", l: () => void): void { (t === "click" ? this.listeners : this.hovers).delete(l); }
 	click(): void { for (const l of this.listeners) l(); }
+	hover(): void { for (const l of this.hovers) l(); }
 }
 
 class FakeTimers implements StatusBarTimers {
@@ -222,7 +224,19 @@ test("controller renders immediately, then throttles to at most one render per 2
 	c.dispose();
 	assert.equal(h.listeners.size, 0);
 	assert.equal(el.listeners.size, 0);
+	assert.equal(el.hovers.size, 0);
 	assert.equal(timers.queue.size, 0);
+});
+
+test("controller: hovering refreshes the relative times (the engine posts status only when it changes)", () => {
+	const el = new FakeElement();
+	const timers = new FakeTimers();
+	const h = makeHost(snap("live", { lastSyncedAtMs: 1_000 }));
+	new StatusBarController(el, h.host, { openBrake() {}, openSettings() {}, openKeyMissing() {}, timers });
+	timers.advance(3 * 60_000);
+	assert.doesNotMatch(el.attrs.get("aria-label") ?? "", /3 min ago/, "no status since: the tooltip is stale");
+	el.hover();
+	assert.match(el.attrs.get("aria-label") ?? "", /Last synced 3 min ago/);
 });
 
 test("controller skips identical renders", () => {
