@@ -53,7 +53,7 @@
  */
 
 import type {
-	ContentHash, DiskFingerprint, DocId, DocKind, LocalEntry, ObservedRename, PathKey, PathKeyFn, Plan, PlanFn, PlannerInput, PlannerOp, RemoteEntry, Seq,
+	ContentHash, DiskFingerprint, DocId, LocalEntry, ObservedRename, PathKey, PathKeyFn, Plan, PlanFn, PlannerInput, PlannerOp, RemoteEntry, Seq,
 	SyncedEntry, VaultPath, BodyVersion,
 } from "../types";
 import { sha256Hex } from "../hash/sha256";
@@ -807,7 +807,7 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		if (mergesIntoOwner(l)) return;
 		const id = takeFresh();
 		if (id === null) return;
-		push([{ op: "nsCreate", docId: id, kind: l.kind as DocKind, path: l.path, contentHash: l.hash, size: l.size }, ...initialContent(id, l)]);
+		push([{ op: "nsCreate", docId: id, kind: l.kind, path: l.path, contentHash: l.hash, size: l.size }, ...initialContent(id, l)]);
 	};
 
 	// ---- run ---------------------------------------------------------------------

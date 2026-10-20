@@ -171,7 +171,7 @@ describe("§20.2 keyring forgery: garbage rows are never adopted (measured)", ()
 		const out: Record<string, string> = {};
 		for (const kind of ["pinned", "unpinned", "nokey"] as const) {
 			const d = await make(kind);
-			await d.ingest(...rows.map((b, i) => [(i + 1) as Seq, b] as const));
+			await d.ingest(...rows.map((b, i) => [(i + 1), b] as const));
 			assert.equal(d.kr.rowCount, N);
 			out[kind] = await observe(d);
 			if (kind !== "pinned") out[`${kind} + RK`] = await observe(d, `rk:${await d.kr.installRk(RK_A.slice())}`);
@@ -347,7 +347,7 @@ describe("§20.2 keyring forgery: garbage rows are never adopted (measured)", ()
 		const out: Tally = {};
 		await inBatches(forged.flatMap((f) => [[f, "revoke first"], [f, "forged first"]] as const), async ([f, order]) => {
 			const d = await device({ keys: [{ e: 1, k: K(1) }, { e: 2, k: K(2) }], records: [g, r2] });
-			await d.ingest(...(order === "revoke first" ? [[SEQ, rev], [(SEQ + 1) as Seq, f]] as const : [[SEQ, f], [(SEQ + 1) as Seq, rev]] as const));
+			await d.ingest(...(order === "revoke first" ? [[SEQ, rev], [(SEQ + 1), f]] as const : [[SEQ, f], [(SEQ + 1), rev]] as const));
 			const before = `km:${d.kr.keyMissing()} seal:${d.kc.sealEpoch()} held3:${d.kc.keyState(3).held} adopted:${d.codes().includes("keyring/adopted")}`;
 			const qr = await d.kr.installQr(3, K(3).slice());
 			bump(out, order, `${before} => qr:${qr} seal:${d.kc.sealEpoch()} k3:${await holds(d, 3, K(3))} km:${d.kr.keyMissing()}`);
@@ -362,7 +362,7 @@ describe("§20.2 keyring forgery: garbage rows are never adopted (measured)", ()
 		const r2 = await roll(2);
 		const others = await Promise.all(range(0, 32).map(() => roll(2, K(1), rng.bytes(32))));
 		const d = await device({ keys: [{ e: 1, k: K(1) }], records: [await honestGenesis()] });
-		await d.ingest([SEQ, r2], ...others.map((b, i) => [(SEQ + 1 + i) as Seq, b] as const));
+		await d.ingest([SEQ, r2], ...others.map((b, i) => [(SEQ + 1 + i), b] as const));
 		assert.deepEqual(d.codes(), ["keyring/adopted", ...others.map(() => "keyring/duplicate")]);
 		assert.ok(await holds(d, 2, K(2)));
 		assert.deepEqual(d.kr.summary().epochs.map((x) => [x.e, x.firstSeq]), [[1, null], [2, SEQ]]);

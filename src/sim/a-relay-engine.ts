@@ -498,7 +498,7 @@ export class RelayEngine {
 		for (const frame of frames) {
 			for (const waiter of [frame.origin, ...frame.duplicates]) {
 				let streams = byOrigin.get(waiter);
-				if (streams === undefined) byOrigin.set(waiter, (streams = new Map()));
+				if (streams === undefined) byOrigin.set(waiter, (streams = new Map<StreamName, ClientFrameId[]>()));
 				const ids = streams.get(frame.stream);
 				if (ids === undefined) streams.set(frame.stream, [frame.clientFrameId]);
 				else ids.push(frame.clientFrameId);

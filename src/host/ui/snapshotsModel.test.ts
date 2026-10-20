@@ -9,7 +9,7 @@ import {
 
 const REASONS: SnapshotReason[] = ["daily", "brake", "epoch", "idb", "restore", "manual"];
 const at = (y: number, mo: number, d: number, h: number, mi: number): number => new Date(y, mo - 1, d, h, mi).getTime();
-const p = (s: string): VaultPath => s as VaultPath;
+const p = (s: string): VaultPath => s;
 const file = (path: string, size = 10): SnapshotFileEntry => ({ path: p(path), kind: "markdown", size });
 
 function summary(over: Partial<SnapshotSummary> = {}): SnapshotSummary {

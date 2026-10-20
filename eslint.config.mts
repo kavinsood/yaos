@@ -47,6 +47,29 @@ export default tseslint.config(
 		},
 	},
 	{
+		// Rejecting with an `unknown` is propagating a value that was caught or handed over (a body's rejection, an
+		// AbortSignal's reason), not minting a non-Error: forcing a wrap there would change what callers catch.
+		// Rejections with a known non-Error type stay errors.
+		files: ["**/*.ts"],
+		rules: {
+			"@typescript-eslint/prefer-promise-reject-errors": ["error", { allowThrowingUnknown: true }],
+		},
+	},
+	{
+		// Test files print their own reports (bench timings, fuzz seed counts) to the runner. Obsidian's console rule is
+		// about a shipped plugin's logging; keep its no-new-func half, drop no-console here.
+		files: ["src/**/*.test.ts"],
+		rules: {
+			"obsidianmd/rule-custom-message": ["error", {
+				"no-new-func": {
+					messages: {
+						"The Function constructor is eval": "Using the `Function` constructor is dangerous because it executes arbitrary code, similar to `eval()`",
+					},
+				},
+			}],
+		},
+	},
+	{
 		files: ["package.json"],
 		rules: {
 			"depend/ban-dependencies": "off",
@@ -75,6 +98,9 @@ export default tseslint.config(
 		"server/dist",
 		"server/.wrangler",
 		"tests",
+		// Node-run end-to-end harnesses, like tests/: typechecked by typecheck:client (e2e/client) and typecheck:tests
+		// (e2e/conformance), but in no typed-lint project, so typed rules would abort the whole run on them.
+		"e2e",
 		// The Obsidian preset targets plugin runtime code. Build tooling and
 		// Worker maintenance scripts execute in Node and must not inherit
 		// browser/mobile plugin rules.

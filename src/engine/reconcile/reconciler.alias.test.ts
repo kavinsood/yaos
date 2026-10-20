@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { PathKey, VaultPath } from "../../core/types";
 import { World } from "./testkit/world";
 
-const P = (s: string): VaultPath => s as VaultPath;
+const P = (s: string): VaultPath => s;
 
 /**
  * §c.5 / §c.13 merged alias: our create of n.md is still pending when another

@@ -69,7 +69,7 @@ function rec(stream: StreamName, kind: OutboxRecord["kind"], content: Uint8Array
 	};
 }
 const nsCreate = (hash: ContentHash) => rec(NS_STREAM, "nsOps", encodeNsOps([
-	{ t: "create", docId: `d${String(n).padStart(21, "0")}` as DocId, kind: "blob", path: `a/${n}.png` as VaultPath, contentHash: hash, size: 1 },
+	{ t: "create", docId: `d${String(n).padStart(21, "0")}` as DocId, kind: "blob", path: `a/${n}.png`, contentHash: hash, size: 1 },
 ]));
 /** Waits (real time, bounded) until the async evaluation has finished: the sender poked, or a failure diag. */
 async function settle(ev: { ready: number; diag: string[] } | null): Promise<void> {

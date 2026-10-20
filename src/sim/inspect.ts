@@ -8,7 +8,7 @@
  * app crash may legitimately lose: a token in the committed state must survive.
  */
 
-import type { DeviceId, VaultEpoch } from "../core/types";
+import type { DeviceId } from "../core/types";
 import { parseDbName } from "../engine/compose/knownEpoch";
 import type { RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
@@ -70,7 +70,7 @@ export async function inspectStore(clock: VirtualClock, storage: MemStoragePort,
 		try {
 			eng = await LogEngine.start({
 				ports: { relay: OFFLINE, storage, clock, random: new SeededRandom(hashLabel(`inspect:${deviceId}`)), crypto: createNoopCrypto(hash), hash, blob: null },
-				vaultId: SIM_VAULT_ID, vaultEpoch: id.vaultEpoch as VaultEpoch, deviceId, clientVersion: "sim-inspect", sideFiles: null, autoReconnect: false, e2ee: { suite: 0 },
+				vaultId: SIM_VAULT_ID, vaultEpoch: id.vaultEpoch, deviceId, clientVersion: "sim-inspect", sideFiles: null, autoReconnect: false, e2ee: { suite: 0 },
 			});
 		} catch {
 			continue;

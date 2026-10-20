@@ -38,7 +38,7 @@ import type { EnvelopeKind } from "../../core/envelope";
 import { NS_DEDUPE_RING } from "../../core/limits";
 import {
 	CFG_STREAM, NS_STREAM, bodyStream, canvasStream, streamClass,
-	type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsFoldEvent, type NsOp, type Seq, type StreamName, type VaultId, type VaultPath,
+	type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsFoldEvent, type NsOp, type Seq, type StreamName, type VaultId,
 } from "../../core/types";
 import { SeededRandom } from "../../sim/random";
 import { createWebCryptoSuite1, type Suite1Crypto } from "../adapters/webCryptoSuite1";
@@ -126,8 +126,8 @@ function timeline(seed: number): { readonly rows: Row[]; readonly sRot: Seq } {
 		if (docs.length < 2 || rnd.chance(0.35)) {
 			const docId = id22(`d${tag}${(n++).toString(36)}`) as DocId;
 			docs.push(docId);
-			ops.push({ t: "create", docId, kind: "markdown", path: `${hostile ? "evil" : dev === H1 ? "h" : "g"}${rnd.int(12)}.md` as VaultPath, contentHash: hex(rnd.int(1 << 20)) as ContentHash, size: rnd.int(50) });
-		} else ops.push({ t: "rename", docId: rnd.pick(docs), path: `${hostile ? "evil" : "r"}${rnd.int(12)}.md` as VaultPath });
+			ops.push({ t: "create", docId, kind: "markdown", path: `${hostile ? "evil" : dev === H1 ? "h" : "g"}${rnd.int(12)}.md`, contentHash: hex(rnd.int(1 << 20)) as ContentHash, size: rnd.int(50) });
+		} else ops.push({ t: "rename", docId: rnd.pick(docs), path: `${hostile ? "evil" : "r"}${rnd.int(12)}.md` });
 		return encodeNsOps(ops);
 	};
 	const cfgContent = (hostile: boolean): Uint8Array => {

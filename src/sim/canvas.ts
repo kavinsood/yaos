@@ -30,7 +30,7 @@
 
 import { canonicalJson, type JsonValue } from "../core/hash/canvasCanonical";
 import { projectCanvasBytes } from "../engine/reconcile/canvasDoc";
-import type { DocId, VaultPath } from "../core/types";
+import type { DocId } from "../core/types";
 import { pathKey } from "../core/paths/pathKey";
 import { safePosition, tokenSpans, tokensIn, type TokenLedger, type Writer } from "./actors";
 import type { VirtualClock } from "./clock";
@@ -38,6 +38,14 @@ import type { SimDevice } from "./device";
 import { SeededRandom } from "./random";
 
 type Obj = { [key: string]: JsonValue };
+
+/**
+ * A canvas field as text: String() of a scalar. A valid canvas's id/type/text/endpoints/color are strings and x a
+ * number, so the object branch (JSON, not "[object Object]") is only for a field the sim did not expect.
+ */
+export function fieldText(v: JsonValue | undefined): string {
+	return typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
+}
 
 export interface CanvasModel {
 	root: Obj;
@@ -145,7 +153,7 @@ function ordered(o: Obj, order: readonly string[]): Obj {
 
 /** Obsidian's save: its key order, unknown fields kept after its own, tab indentation, no trailing newline. */
 export function obsidianText(m: CanvasModel): string {
-	const nodes = m.nodes.map((n) => ordered(n, NODE_KEY_ORDER[String(n.type)] ?? NODE_KEY_ORDER.text!));
+	const nodes = m.nodes.map((n) => ordered(n, NODE_KEY_ORDER[fieldText(n.type)] ?? NODE_KEY_ORDER.text!));
 	const edges = m.edges.map((e) => ordered(e, EDGE_KEY_ORDER));
 	return JSON.stringify({ nodes, edges, ...m.root }, null, "\t");
 }
@@ -497,7 +505,7 @@ function pickOf<T>(items: readonly T[], pick: number): T | undefined {
  * reorder went into its loser, which other devices had edited and so kept as "c0 (2).canvas").
  */
 export function docIdOf(d: SimDevice, path: string): string | null {
-	const key = pathKey(path as VaultPath);
+	const key = pathKey(path);
 	for (const s of d.vrt?.rec?.ctx.store.synced.values() ?? []) if (s.pathKey === key && !s.fileGone) return s.docId;
 	return d.vrt?.port.view().remoteByPathKey.get(key) ?? null;
 }
@@ -506,7 +514,7 @@ export function docIdOf(d: SimDevice, path: string): string | null {
 export function engineCanvasText(d: SimDevice, path: string): string | null {
 	const rt = d.vrt;
 	if (!rt) return null;
-	const id = rt.port.view().remoteByPathKey.get(pathKey(path as VaultPath));
+	const id = rt.port.view().remoteByPathKey.get(pathKey(path));
 	if (!id) return null;
 	const h = rt.log.c.handles.peek(rt.log.streamOf(id));
 	if (!h) return null;
@@ -617,7 +625,7 @@ export class CanvasWorld {
 		for (const f of Object.keys(o)) {
 			if (f === "id") continue;
 			if (f === "text") {
-				for (const t of tokensIn(String(o.text))) {
+				for (const t of tokensIn(fieldText(o.text))) {
 					info.tokens.add(t);
 					this.w.ledger.add(t, d.name, step, "canvas-text");
 				}
@@ -626,8 +634,8 @@ export class CanvasWorld {
 			this.oracle.write({ rec, field: f, value: key(o[f]!), saw: null, dev: d.name, step, path, atMs: this.clock.now() });
 		}
 		if (rec.startsWith("e:")) {
-			info.endpoints.add(String(o.fromNode));
-			info.endpoints.add(String(o.toNode));
+			info.endpoints.add(fieldText(o.fromNode));
+			info.endpoints.add(fieldText(o.toNode));
 		}
 	}
 
@@ -702,7 +710,7 @@ export class CanvasWorld {
 
 	private fieldsOf(o: Obj): Map<string, string> {
 		const out = new Map<string, string>();
-		for (const k of Object.keys(o)) if (k !== "id") out.set(k, k === "text" ? String(o.text) : key(o[k]!));
+		for (const k of Object.keys(o)) if (k !== "id") out.set(k, k === "text" ? fieldText(o.text) : key(o[k]!));
 		return out;
 	}
 
@@ -828,7 +836,7 @@ export class CanvasWorld {
 			const rec = `n:${target.id as string}`;
 			for (const field of ["x", "y"] as const) {
 				const v = field === "x" ? this.oracle.uniq() : -this.oracle.uniq();
-				const saw = target[field] === undefined ? ABSENT : key(target[field]!);
+				const saw = target[field] === undefined ? ABSENT : key(target[field]);
 				target[field] = v;
 				intents.push(() => this.oracle.write({ rec, field, value: key(v), saw, dev: d.name, step, path, atMs: this.clock.now() }));
 			}
@@ -879,7 +887,7 @@ export class CanvasWorld {
 				break;
 			}
 			case "badNumber": {
-				const shown: CanvasModel = { root: m.root, nodes: m.nodes.map((n, i) => (i === 0 ? { ...n, x: String(n.x) } : n)), edges: m.edges };
+				const shown: CanvasModel = { root: m.root, nodes: m.nodes.map((n, i) => (i === 0 ? { ...n, x: fieldText(n.x) } : n)), edges: m.edges };
 				brokenText = m.nodes.length > 0 ? obsidianText(shown) : "{\"nodes\": [{\"id\": \"q\", \"type\": \"text\", \"text\": \"\", \"x\": \"1\", \"y\": 0, \"width\": 1, \"height\": 1}]}";
 				break;
 			}
@@ -969,7 +977,7 @@ export class CanvasWorld {
 		if (!m) return `skip ${tag}: ${path} does not load`;
 		const o = this.oracle;
 		const set = (rec: string, obj: Obj, field: string, value: JsonValue | undefined) => {
-			const saw = obj[field] === undefined ? ABSENT : key(obj[field]!);
+			const saw = obj[field] === undefined ? ABSENT : key(obj[field]);
 			if (value === undefined) delete obj[field];
 			else obj[field] = value;
 			o.write({ rec, field, value: value === undefined ? ABSENT : key(value), saw, dev: d.name, step, path, atMs: this.clock.now(), ...(rec === "root" ? { lineage: lineageOf(m.root), doc: docIdOf(d, path) } : {}) });
@@ -1007,7 +1015,7 @@ export class CanvasWorld {
 				if (!n) return `skip ${tag}: no node`;
 				if (a.clear && n.color === undefined) return `skip ${tag}: no color`;
 				set(`n:${n.id as string}`, n, "color", a.clear ? undefined : `#${o.uniq().toString(16).padStart(6, "0")}`);
-				what = `${n.id as string} ${a.clear ? "cleared" : String(n.color)}`;
+				what = `${n.id as string} ${a.clear ? "cleared" : fieldText(n.color)}`;
 				break;
 			}
 			case "cText": {
@@ -1015,7 +1023,7 @@ export class CanvasWorld {
 				const n = pickOf(texts, this.recPick(a.node));
 				if (!n) return `skip ${tag}: no text node`;
 				const rec = `n:${n.id as string}`;
-				const t = String(n.text);
+				const t = fieldText(n.text);
 				if (a.del) {
 					const s = pickOf(tokenSpans(t), a.pos);
 					if (!s) return `skip ${tag}: no token in ${n.id as string}`;
@@ -1043,7 +1051,7 @@ export class CanvasWorld {
 				else if (n.type === "link") set(rec, n, "url", `https://example.com/${u}`);
 				else if (n.type === "file") set(rec, n, "subpath", `#h${u}`);
 				else set(rec, n, "color", String((u % 6) + 1) + `-${u}`);
-				what = `${n.id as string} ${String(n.type)}`;
+				what = `${n.id as string} ${fieldText(n.type)}`;
 				break;
 			}
 			case "cDeleteNode": {
@@ -1089,8 +1097,8 @@ export class CanvasWorld {
 					set(rec, e, end, to.id as string);
 					o.record(rec)?.endpoints.add(to.id as string);
 				} else if (a.what === "sides") {
-					set(rec, e, "fromSide", SIDES[Math.floor(a.pick * 4) % 4]!);
-					set(rec, e, "toSide", SIDES[Math.floor(a.pick * 16) % 4]!);
+					set(rec, e, "fromSide", SIDES[Math.floor(a.pick * 4) % 4]);
+					set(rec, e, "toSide", SIDES[Math.floor(a.pick * 16) % 4]);
 				} else if (a.what === "label") set(rec, e, "label", `E${o.uniq()}`);
 				else set(rec, e, "color", `#${o.uniq().toString(16).padStart(6, "0")}`);
 				what = `${e.id as string} ${a.what}`;

@@ -36,7 +36,7 @@ const V: Record<string, Vector> = {
 };
 const content = (name: string) => new TextEncoder().encode(`golden ${name}`);
 const binding = (v: Vector): EnvelopeBinding => v.coversSeq !== undefined
-	? { t: "checkpoint", stream: v.stream as StreamName, coversSeq: v.coversSeq as Seq }
+	? { t: "checkpoint", stream: v.stream as StreamName, coversSeq: v.coversSeq }
 	: { t: "frame", stream: v.stream as StreamName, deviceId: DEV, clientFrameId: CF };
 
 // ---- independent reference (node:crypto) -------------------------------------------
@@ -102,7 +102,7 @@ describe("suite 1 envelope golden vectors (one per kind)", () => {
 		const { c, random } = await adapter();
 		for (const [name, v] of Object.entries(V)) {
 			random.push(nonce(v.nonce));
-			const inner = { kind: v.kind, authorNsSeq: v.authorNsSeq as Seq, flags: v.flags, frameNo: v.frameNo, content: content(name) };
+			const inner = { kind: v.kind, authorNsSeq: v.authorNsSeq, flags: v.flags, frameNo: v.frameNo, content: content(name) };
 			const s = await sealEnvelope(c, { vaultId: VAULT, binding: binding(v), inner });
 			assert.equal(bytesToHex(s.sealed), GOLDEN[name], name);
 			assert.equal(s.sealed.length, 3 + 28 + padmeLen(refInner(name, v).length + 1), `${name}: Padmé-bucketed length`);

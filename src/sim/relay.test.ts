@@ -1,7 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { DeviceId, StreamName } from "../core/types";
-import type { RelayEvent } from "../ports/relay";
 import { VirtualClock } from "./clock";
 import { SIM_IDLE_ONLY_GROUP_COMMIT, SimRelay, type SimCommitInfo, type SimRelaySession } from "./relay";
 import { attach, connectPeer, connectRaw, frame, trace } from "./a-relay-testkit";
@@ -142,7 +141,7 @@ test("relay: R2 under random link delays and jitter — each session gets every 
 		assert.equal(byseq.size, relay.head(), "R1: contiguous");
 		for (const peer of peers) {
 			const seen = new Set<number>();
-			for (const e of peer.events as RelayEvent[]) {
+			for (const e of peer.events) {
 				if (e.t === "skipped") {
 					for (const r of e.rows) {
 						assert.equal(byseq.get(r.seq)!.stream, r.stream, `seed ${seed}`);

@@ -159,7 +159,7 @@ test("fold: frameNo replay window after the ring; a rejected frame changes neith
 	assert.equal(s.plugins.get("p")!.value, false);
 	assert.deepEqual(s.replay.get(A), decodeCfgFoldV1(before)!.replay.get(A));
 	// The ring answers first: a replayed clientFrameId is duplicate-frame, not replay-*.
-	assert.deepEqual(reasons(fold(s, 5, A, set(true), s.recentFrames.get(A)![0]!, 100)), ["-1:duplicate-frame"]);
+	assert.deepEqual(reasons(fold(s, 5, A, set(true), s.recentFrames.get(A)![0], 100)), ["-1:duplicate-frame"]);
 	// Windows are per device; frameNo 0 (a gate-failed row) skips the window.
 	assert.equal(fold(s, 6, B, set(true), F(), 1)[0]!.outcome.t, "applied");
 	assert.deepEqual(fold(s, 7, A, [], F(), 0), []);

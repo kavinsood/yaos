@@ -126,7 +126,7 @@ export async function planCfg(input: CfgPlanInput): Promise<CfgPlan> {
 		if (cut < 0) continue;
 		const file = k.slice(0, cut);
 		let m = jsonByFile.get(file);
-		if (!m) jsonByFile.set(file, (m = new Map()));
+		if (!m) jsonByFile.set(file, (m = new Map<string, CfgRegister<string>>()));
 		m.set(k.slice(cut + 1), reg);
 	}
 	const files = new Set<ConfigRelPath>([...input.local.files.keys(), ...input.local.held.keys(), ...input.base.keys(), ...input.view.files.keys(), ...jsonByFile.keys()]);
@@ -213,7 +213,7 @@ async function finish(ctx: FileCtx, ops: CfgOp[], next: Uint8Array | null, keyHa
 
 async function planJson(ctx: FileCtx, regs: ReadonlyMap<string, CfgRegister<string>>): Promise<CfgFileAction | null> {
 	const missing = ctx.local === undefined;
-	const parsed = missing ? {} : parseJson(ctx.local!.bytes);
+	const parsed = missing ? {} : parseJson(ctx.local.bytes);
 	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
 		ctx.skipped.push({ file: ctx.file, key: null, reason: "unparseable" });
 		return null;
@@ -251,12 +251,12 @@ async function planJson(ctx: FileCtx, regs: ReadonlyMap<string, CfgRegister<stri
 
 async function planPlugins(ctx: FileCtx, view: CfgFoldState, local: CfgLocalSnapshot, mobile: boolean): Promise<CfgFileAction | null> {
 	const missing = ctx.local === undefined;
-	const parsed = missing ? [] : parseJson(ctx.local!.bytes);
+	const parsed = missing ? [] : parseJson(ctx.local.bytes);
 	if (!Array.isArray(parsed) || !parsed.every((x) => typeof x === "string")) {
 		ctx.skipped.push({ file: ctx.file, key: null, reason: "unparseable" });
 		return null;
 	}
-	const list = [...(parsed as string[])];
+	const list = [...(parsed)];
 	const enabled = new Set(list);
 	const ids = new Set([...enabled, ...Object.keys(ctx.base?.keyHashes ?? {}), ...view.plugins.keys()]);
 	const ops: CfgOp[] = [];

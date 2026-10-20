@@ -4,7 +4,7 @@ import type { VaultPath } from "../../core/types";
 import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { World } from "./testkit/world";
 
-const P = (s: string): VaultPath => s as VaultPath;
+const P = (s: string): VaultPath => s;
 const bytes = (...b: number[]): Uint8Array => new Uint8Array(b);
 
 test("planner brake: mass remote delete is held until approved", async () => {
@@ -157,7 +157,7 @@ test("blob keep-both: concurrent edits keep the remote bytes at the path and the
 	assert.deepEqual(w.vault.bytesOf(copies[0]!), mine);
 	const copyId = w.log.liveByPath(P(copies[0]!));
 	assert.ok(copyId && copyId !== id);
-	assert.equal(w.log.entry(copyId!)!.blob!.hash, sha256HexRef(mine));
+	assert.equal(w.log.entry(copyId)!.blob!.hash, sha256HexRef(mine));
 	assert.ok(w.blobs!.server.has(sha256HexRef(mine)));
 	assert.equal(w.intents(), 0);
 	await w.sync();

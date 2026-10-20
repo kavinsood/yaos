@@ -509,13 +509,13 @@ describe("httpBlob", () => {
 
 	it("has() batches by 50 and only reports requested addresses", async () => {
 		const { port, requests } = blob((req) => {
-			const hashes: string[] = JSON.parse(String(req.body)).hashes;
+			const { hashes } = JSON.parse(String(req.body)) as { hashes: string[] };
 			return jsonResponse({ present: [...hashes.filter((_h, i) => i % 2 === 0), addr(9999)] });
 		});
 		const wanted = Array.from({ length: 120 }, (_v, i) => addr(i));
 		const present = await port.has(wanted);
 		assert.equal(requests.length, 3);
-		assert.equal(JSON.parse(String(requests[0]!.body)).hashes.length, BLOB_EXISTS_BATCH);
+		assert.equal((JSON.parse(String(requests[0]!.body)) as { hashes: string[] }).hashes.length, BLOB_EXISTS_BATCH);
 		assert.equal(requests[0]!.url.pathname, "/vault/v1/blobs/exists");
 		assert.equal(present.size, 60);
 		assert.ok(present.has(addr(0)) && !present.has(addr(1)) && !present.has(addr(9999)));
@@ -580,7 +580,7 @@ describe("httpBlob", () => {
 		const lines: string[] = [];
 		const requests: string[] = [];
 		const fetchImpl: typeof fetch = async (input, init) => {
-			requests.push(`${init?.method ?? "GET"} ${new URL(String(input)).pathname}`);
+			requests.push(`${init?.method ?? "GET"} ${new URL(input instanceof Request ? input.url : String(input)).pathname}`);
 			return new Promise<Response>(() => undefined);
 		};
 		const p = startupBlob({ baseUrl: "https://r.example", vaultId: "v1", credential: TOKEN, fetch: fetchImpl, clock }, (l) => lines.push(l));

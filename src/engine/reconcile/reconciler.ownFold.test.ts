@@ -4,7 +4,7 @@ import type { ContentHash, DocId, NsOp, PathKey, RemoteEntry, SyncedEntry, Vault
 import { applyOwnFold } from "./ownFold";
 import { World } from "./testkit/world";
 
-const P = (s: string): VaultPath => s as VaultPath;
+const P = (s: string): VaultPath => s;
 
 /**
  * S1 timing (§c.13). The vault runtime queues own fold events, and an own op can fold while a pass awaits

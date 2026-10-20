@@ -170,7 +170,7 @@ test("at rest: vault keys and recovery keys appear nowhere but the vault's Secre
 	await clock.advance(5_000);
 	assert.deepEqual(ctl.data().e2ee, { suite: 1 });
 	assert.equal(dev.engine?.config?.crypto.suite, 1);
-	await settle(dev.engine!.link.keyringChanged({ keys: [{ e: 1, k: fakeEpochKey(0x11) }, { e: 2, k: k2 }], records: [fakeGenesisRecord()], pending: null }));
+	await settle(dev.engine.link.keyringChanged({ keys: [{ e: 1, k: fakeEpochKey(0x11) }, { e: 2, k: k2 }], records: [fakeGenesisRecord()], pending: null }));
 	// Every key command, accepted by main or refused on either side.
 	await settle(ctl.command({ t: "installKey", source: "qr", e: 3, k: k3 }));
 	await settle(ctl.command({ t: "installKey", source: "rk", rk: rk1 }));

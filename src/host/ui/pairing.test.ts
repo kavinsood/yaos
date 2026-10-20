@@ -617,7 +617,7 @@ function manualTimers(): { readonly clock: NonNullable<PairingDeps["clock"]>; ad
 	return {
 		clock: {
 			setTimer: (ms, fn) => (due.set(next, { at: now + ms, fn }), next++),
-			clearTimer: (h) => void due.delete(h as number),
+			clearTimer: (h) => void due.delete(h),
 		},
 		advance(ms) {
 			now += ms;

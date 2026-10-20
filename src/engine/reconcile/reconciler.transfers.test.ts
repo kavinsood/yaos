@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { NsOp, VaultPath } from "../../core/types";
 import { World } from "./testkit/world";
 
-const P = (s: string): VaultPath => s as VaultPath;
+const P = (s: string): VaultPath => s;
 const bytesOf = (n: number, seed: number): Uint8Array => Uint8Array.from({ length: n }, (_, i) => (i * 31 + seed) & 0xff);
 
 async function booted(): Promise<World> {

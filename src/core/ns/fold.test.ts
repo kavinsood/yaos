@@ -365,7 +365,7 @@ test("replay window (e2ee-design §8.2): pre-scan, ring, window, ops; a rejected
 	const after = decodeNsFoldV1(encodeNsFoldV1(w.state))!;
 	assert.deepEqual([after.replay, after.recentFrames, after.entries.size], [decodeNsFoldV1(snap)!.replay, decodeNsFoldV1(snap)!.recentFrames, 2]);
 	// Ring first: a replayed clientFrameId reports duplicate-frame whatever its frameNo.
-	assert.deepEqual(out(w.fold(6, A, 1, [], w.state.recentFrames.get(A)![0]!, 18)), ignored("duplicate-frame"));
+	assert.deepEqual(out(w.fold(6, A, 1, [], w.state.recentFrames.get(A)![0], 18)), ignored("duplicate-frame"));
 	// Inside the window, out of order, accepted once.
 	assert.equal(out(w.fold(7, A, 1, [create(d3, "c.md")], F(), 18)).kind, "applied");
 	assert.deepEqual(out(w.fold(8, A, 1, [create(d4, "d.md")], F(), 18)), ignored("replay-duplicate"));

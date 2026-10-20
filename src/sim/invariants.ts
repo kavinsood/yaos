@@ -61,7 +61,7 @@ import type { QuarantineRecord } from "../engine/store/schema";
 import { checkNsInvariants } from "../core/ns/verify";
 import { pathKey } from "../core/paths/pathKey";
 import { MAX_NS_FRAME_BYTES, NS_DEDUPE_RING, TAIL_HARD_ROWS, TOMBSTONE_CAP } from "../core/limits";
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, type DeviceId, type StreamName, type VaultPath } from "../core/types";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, type DeviceId, type StreamName } from "../core/types";
 import type { SnapshotRecord, TailRecord } from "../engine/store/schema";
 import { gateRow } from "../engine/sync/ingestRow";
 import { NsRuntime } from "../engine/sync/nsRuntime";
@@ -72,7 +72,7 @@ import { SETTING_FILES, tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
 import type { SimDevice } from "./device";
 import { bytesPrint, type FoldPrints, type OracleDoc, type SimNet } from "./net";
-import { ABSENT, canvasCanonical, canvasFiles, canvasProblem, docIdOf, engineCanvasText, isConflictCopy, isTracked, lineageOf, readModel, type CanvasOracle, type ReorderIntent } from "./canvas";
+import { ABSENT, canvasCanonical, canvasFiles, canvasProblem, docIdOf, engineCanvasText, fieldText, isConflictCopy, isTracked, lineageOf, readModel, type CanvasOracle, type ReorderIntent } from "./canvas";
 import { canonicalJson, formatCanvasText, parseCanvasText, type JsonValue } from "../core/hash/canvasCanonical";
 
 export interface Violation {
@@ -80,7 +80,7 @@ export interface Violation {
 	readonly detail: string;
 }
 
-const relayKey = (p: string) => pathKey(p as VaultPath) as string;
+const relayKey = (p: string) => pathKey(p) as string;
 
 function files(d: SimDevice): Map<string, { path: string; text: string }> {
 	const out = new Map<string, { path: string; text: string }>();
@@ -449,10 +449,10 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 		if (!m) continue;
 		const doc = docIdOf(first, path);
 		roots.push({ path, doc, root: m.root });
-		order.push({ path, doc, ids: m.nodes.map((n) => String(n.id)) });
+		order.push({ path, doc, ids: m.nodes.map((n) => fieldText(n.id)) });
 		for (const [kind, list] of [["n", m.nodes], ["e", m.edges]] as const) {
 			for (const o of list) {
-				const rec = `${kind}:${String(o.id)}`;
+				const rec = `${kind}:${fieldText(o.id)}`;
 				holders.set(rec, [...(holders.get(rec) ?? []), { path, doc, obj: o }]);
 			}
 		}

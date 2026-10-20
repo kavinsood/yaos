@@ -56,7 +56,7 @@ test("snapOps codec: round trip, canonical", () => {
 	const bytes = encodeSnapOps(ops);
 	const back = decodeSnapOps(bytes);
 	assert.deepEqual(back, ops);
-	assert.ok(bytesEqual(encodeSnapOps(back!), bytes));
+	assert.ok(bytesEqual(encodeSnapOps(back), bytes));
 	assert.deepEqual(decodeSnapRecord(encodeSnapRecord(rec(T0))), rec(T0));
 });
 
@@ -93,7 +93,7 @@ test("snapOps codec: bounds and schema violations are malformed", () => {
 	const v9 = decodeSnapOps(new Writer().varuint(1).u8(SnapOpTag.put).varbytes(new Uint8Array([9, 1, 2, 3])).finish());
 	assert.deepEqual(v9, [{ t: "putUnknown", version: 9 }]);
 	const s = newSnapFold();
-	const ev = foldSnapFrame(s, { seq: 1, deviceId: A, ops: v9! });
+	const ev = foldSnapFrame(s, { seq: 1, deviceId: A, ops: v9 });
 	assert.deepEqual(ev[0]!.outcome, { t: "ignored", reason: "unknown-version" });
 	assert.equal(s.records.size, 0);
 });

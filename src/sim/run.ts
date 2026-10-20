@@ -461,7 +461,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				name, clock, net, profile,
 				settings: cw.snapshots[di] ? () => SNAPSHOT_SETTINGS : () => RUN_SETTINGS,
 				tuning: { ...cw.tuning, ...(tw?.[di]?.tuning ?? {}), ...cfg.tuning },
-				...(tw?.[di] ? { budgets: tw[di]!.budgets } : {}),
+				...(tw?.[di] ? { budgets: tw[di].budgets } : {}),
 				mobile: dr.chance(0.3),
 				log: cfg.log ? (line) => cfg.log!(name, `${clock.monotonic()} ${line}`) : undefined,
 				watcherDelayMs: c.faults ? () => watch.range(0, 400) : undefined,

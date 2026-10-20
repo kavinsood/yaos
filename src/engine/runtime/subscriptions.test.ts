@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { DeviceId, DocId, StreamName, VaultPath } from "../../core/types";
+import type { DocId, StreamName } from "../../core/types";
 import { VirtualClock } from "../../sim/clock";
 import { SimRelay } from "../../sim/relay";
 import { bodyCheckpointDue, CheckpointState, DEFAULT_CHECKPOINT_TUNING } from "../body/checkpoints";
@@ -32,11 +32,11 @@ async function world(o: { b?: Partial<EngineTuning>; relayLimits?: { maxSubscrip
 
 async function docs(clock: VirtualClock, a: LogEngine, n: number): Promise<DocId[]> {
 	const ids: DocId[] = [];
-	for (let i = 0; i < n; i++) ids.push(await drive(createDoc(a, `d${i}.md` as VaultPath, `doc ${i};`), clock));
+	for (let i = 0; i < n; i++) ids.push(await drive(createDoc(a, `d${i}.md`, `doc ${i};`), clock));
 	return ids;
 }
 
-const subsOf = (relay: SimRelay, d: LogEngine) => relay.subscriptionsOf(d.c.self as DeviceId);
+const subsOf = (relay: SimRelay, d: LogEngine) => relay.subscriptionsOf(d.c.self);
 
 test("subscriptions: sent on every session before the feed; bound, own outbox and the 8 newest unbound for 10 min; only on change", async () => {
 	const { clock, relay, a, b } = await world();

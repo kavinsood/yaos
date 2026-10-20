@@ -4,6 +4,10 @@
 		// Keep node_modules paths as seen from this checkout (a worktree may symlink node_modules), so eslint.config.mts
 		// can match node:test's declarations by path.
 		"preserveSymlinks": true,
+		// Match tsconfig.client-tests.json, the program src/ tests actually typecheck under: with tsconfig.json's
+		// ES2020 lib, test-only ES2022 calls (Array.prototype.at) resolve to error types and every typed rule
+		// downstream reports them as unsafe. Product code's ES2020 floor is still enforced by `npm run build`.
+		"lib": ["DOM", "ES2022"],
 		"types": [
 			"node",
 			"@cloudflare/workers-types"

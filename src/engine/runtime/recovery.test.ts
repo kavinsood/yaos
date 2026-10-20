@@ -5,7 +5,6 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ClientFrameId } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import type { SideFilePort } from "../../ports/vault";
@@ -42,7 +41,7 @@ for (const committed of [false, true]) {
 			const made = await createDoc(a, "new.md", "made offline-ish;");
 			await renameDoc(a, id, "m-renamed.md");
 			await until(() => a.c.sender.inflightCount >= 3, 2_000, "sent");
-			const frames = [...a.c.outbox.values()].map((r) => r.clientFrameId as ClientFrameId);
+			const frames = [...a.c.outbox.values()].map((r) => r.clientFrameId);
 			assert.ok(frames.length >= 4);
 			await sleep(60); // mirror debounce
 			const w = side.writes;

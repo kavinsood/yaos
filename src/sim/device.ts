@@ -11,7 +11,7 @@
  * settings (restartEngine) brings up the next one.
  */
 
-import type { DeviceId, DocId, VaultPath } from "../core/types";
+import type { DeviceId, DocId } from "../core/types";
 import { pathKey } from "../core/paths/pathKey";
 import type { Unsubscribe } from "../ports/common";
 import type { EnginePorts } from "../ports";
@@ -408,7 +408,7 @@ export class SimDevice {
 		const rt = this.vrt;
 		if (!rt) return null;
 		const view = rt.port.view();
-		const id = view.remoteByPathKey.get(pathKey(path as VaultPath));
+		const id = view.remoteByPathKey.get(pathKey(path));
 		return id ? residentText(rt, id) : null;
 	}
 

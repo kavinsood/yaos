@@ -196,9 +196,9 @@ test("brake unit: approval id, rejectHeld", async () => {
 	const base = { config: DEFAULT_BRAKE, syncedCount: 100, liveLocalCount: null, window: EMPTY_WINDOW, approval: null };
 	const out = applyBrake(units, base);
 	assert.equal(out.report?.identity, brakeIdentity([...units].reverse()));
-	assert.equal(await brakeId(refHashPort, out.report!.identity), sha256HexRef(utf8Encode(out.report!.identity)));
+	assert.equal(await brakeId(refHashPort, out.report.identity), sha256HexRef(utf8Encode(out.report.identity)));
 	assert.equal(out.report?.samplePaths.length, 10);
-	assert.equal(applyBrake(units, { ...base, approval: out.report!.identity }).held.length, 0);
+	assert.equal(applyBrake(units, { ...base, approval: out.report.identity }).held.length, 0);
 	assert.deepEqual(
 		rejectHeld([{ op: "nsDelete", docId: id("a"), baseBodySeq: 1 }, { op: "diskTrash", docId: id("b"), path: "b.md", expect: { t: "any" } }, { op: "syncedDrop", docId: id("b") }], (d) => (d === "a" ? "a.md" : null)),
 		[{ op: "diskMaterialize", docId: "a", path: "a.md", expect: { t: "absent" } }, { op: "syncedDrop", docId: "b" }],

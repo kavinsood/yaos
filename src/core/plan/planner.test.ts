@@ -632,7 +632,7 @@ test("row live/absent/present: md -> reconcileContent(no base); blob equal -> ad
 	]);
 	const adopt = run({ remote: [R("d9", "i.png")], local: [L("i.png", h("b0"))] });
 	assert.deepEqual(opsOf(adopt), ["syncedPut"]);
-	assert.equal(adopt.ops[0]!.op === "syncedPut" && adopt.ops[0]!.entry.blobRev, 50);
+	assert.equal(adopt.ops[0]!.op === "syncedPut" && adopt.ops[0].entry.blobRev, 50);
 	const keep = run({ remote: [R("d9", "i.png")], local: [L("i.png", h("b8"))] });
 	assert.deepEqual(opsOf(keep), ["nsCreate", "conflictCopy", "fetchBlob", "pushBlob"]);
 	assert.equal(find(keep, "conflictCopy").reason, "no-base");
@@ -1077,9 +1077,9 @@ test("planner is deterministic, shuffle-invariant and does not mutate its input 
 		const rnd = prng(seed * 7919);
 		const renames = rnd() < 0.3 && sc.local!.length > 0 && sc.synced!.length > 0 ? [{ from: sc.synced![0]!.path, to: sc.local![0]!.path, atMs: 1 }] : [];
 		const inp = input({ ...sc, over: { renames } });
-		const snapshot = JSON.stringify(inp, (_k, v) => (v instanceof Map ? [...v.entries()] : v instanceof Set ? [...v] : v));
+		const snapshot = JSON.stringify(inp, (_k, v: unknown) => (v instanceof Map ? [...(v as Map<unknown, unknown>).entries()] : v instanceof Set ? [...(v as Set<unknown>)] : v));
 		const p1 = plan(inp);
-		assert.equal(JSON.stringify(inp, (_k, v) => (v instanceof Map ? [...v.entries()] : v instanceof Set ? [...v] : v)), snapshot, `mutated input seed ${seed}`);
+		assert.equal(JSON.stringify(inp, (_k, v: unknown) => (v instanceof Map ? [...(v as Map<unknown, unknown>).entries()] : v instanceof Set ? [...(v as Set<unknown>)] : v)), snapshot, `mutated input seed ${seed}`);
 		const p2 = plan(input({ remote: shuffled(sc.remote!, rnd), synced: shuffled(sc.synced!, rnd), local: shuffled(sc.local!, rnd), over: { renames } }));
 		assert.deepEqual(p2, p1, `seed ${seed}`);
 		// invariants: every destructive disk op carries a precondition; no op for an excluded file

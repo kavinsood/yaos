@@ -64,7 +64,7 @@ export function maxEntryBytes(kind: DocKind): number {
 /** Zip-level bound per entry name (unknown names may be at most 0 bytes; the entry check then rejects them). */
 export function maxZipEntryBytes(name: string): number {
 	if (name === SNAP_MANIFEST) return SNAP_MAX_MANIFEST_BYTES;
-	return name.startsWith(SNAP_ENTRY_PREFIX) ? maxEntryBytes(kindOfPath(name.slice(SNAP_ENTRY_PREFIX.length) as VaultPath)) : 0;
+	return name.startsWith(SNAP_ENTRY_PREFIX) ? maxEntryBytes(kindOfPath(name.slice(SNAP_ENTRY_PREFIX.length))) : 0;
 }
 
 export async function bundleDigest(
@@ -97,7 +97,7 @@ export function entryPath(name: string): VaultPath {
 	const path = name.slice(SNAP_ENTRY_PREFIX.length);
 	const why = pathInvalidReason(path);
 	if (why) throw new SnapCorrupt("path-invalid", `${why}: ${JSON.stringify(path.slice(0, 80))}`);
-	return path as VaultPath;
+	return path;
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -120,7 +120,7 @@ export function parseManifest(bytes: Uint8Array): SnapManifest {
 	for (const f of raw.files as unknown[]) {
 		if (!isObj(f) || typeof f.path !== "string" || !KINDS.includes(f.kind as DocKind) || typeof f.hash !== "string" || !HEX64.test(f.hash)
 			|| !Number.isSafeInteger(f.size) || (f.size as number) < 0) throw fail("file entry");
-		files.push({ path: f.path as VaultPath, kind: f.kind as DocKind, hash: f.hash as ContentHash, size: f.size as number });
+		files.push({ path: f.path, kind: f.kind as DocKind, hash: f.hash as ContentHash, size: f.size as number });
 	}
 	const skipped: { path: string; reason: SnapSkipReason }[] = [];
 	for (const s of raw.skipped as unknown[]) {

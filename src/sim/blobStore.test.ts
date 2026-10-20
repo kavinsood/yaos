@@ -71,8 +71,8 @@ function counted(ctl: AbortController): { signal: AbortSignal; listeners: () => 
 }
 
 /** The promise's outcome so far: "pending", "ok", or the rejection. */
-function watch<T>(p: Promise<T>): () => "pending" | "ok" | unknown {
-	let out: "pending" | "ok" | unknown = "pending";
+function watch<T>(p: Promise<T>): () => unknown {
+	let out: unknown = "pending";
 	p.then(() => (out = "ok"), (e: unknown) => (out = e));
 	return () => out;
 }

@@ -17,7 +17,7 @@
  *   version = varuint seq, varuint index, varstring deviceId
  */
 
-import type { CfgFileContent, CfgFoldState, CfgRegister, CfgVersion, ConfigRelPath, DeviceId } from "../types";
+import type { CfgFileContent, CfgFoldState, CfgRegister, CfgVersion, DeviceId } from "../types";
 import { CodecError, Reader, Writer } from "./lib0";
 import { readReplay, readRings, sortedKeys, writeReplay, writeRings } from "./nsFoldV1";
 import { readCfgFileContent, writeCfgFileContent } from "./cfgOps";
@@ -86,7 +86,7 @@ export function decodeCfgFoldV1Strict(bytes: Uint8Array): CfgFoldState {
 		const content = readCfgFileContent(r);
 		const pv = r.varstring();
 		return { content, pluginVersion: pv === "" ? null : pv };
-	}) as Map<ConfigRelPath, CfgRegister<FileValue>>;
+	});
 	const plugins = readSection(r, (r) => {
 		const b = r.u8();
 		if (b > 1) throw new CodecError("enabled byte must be 0 or 1");

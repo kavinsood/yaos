@@ -326,7 +326,7 @@ test("worker_threads: a real thread round-trips through the worker carrier with 
 	const shim: WorkerLike = {
 		postMessage: (m, t) => w.postMessage(m, t as never),
 		addEventListener: ((type: string, l: (ev: unknown) => void) => {
-			if (type === "message") w.on("message", (data) => l({ data }));
+			if (type === "message") w.on("message", (data: unknown) => l({ data }));
 			else w.on("error", (e) => l(e));
 		}) as WorkerLike["addEventListener"],
 		terminate: () => void w.terminate(),

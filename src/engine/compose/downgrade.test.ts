@@ -77,7 +77,7 @@ import { encodeCfgOps } from "../../core/codec/cfgOps";
 import { encodeSnapOps } from "../../core/snap/record";
 import {
 	CFG_STREAM, KEYRING_STREAM, NS_STREAM, SNAP_STREAM, bodyStream, canvasStream,
-	type ClientFrameId, type DeviceId, type Seq, type StreamName, type VaultPath,
+	type ClientFrameId, type DeviceId, type Seq, type StreamName,
 } from "../../core/types";
 import type { CryptoPort } from "../../ports/crypto";
 import type { EnvelopeKind } from "../../core/envelope";
@@ -118,7 +118,7 @@ const enc = new TextEncoder();
 /** Stable JSON of fold state: Maps as sorted entry lists, bytes as hex. */
 function fp(v: unknown): string {
 	return JSON.stringify(v, (_k, x: unknown) => {
-		if (x instanceof Map) return [...x.entries()].map(([k, y]) => [String(k), y]).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+		if (x instanceof Map) return [...(x as Map<unknown, unknown>).entries()].map(([k, y]): [string, unknown] => [String(k), y]).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 		if (x instanceof Set) return [...x].map(String).sort();
 		if (x instanceof Uint8Array) return `hex:${bytesToHex(x)}`;
 		if (typeof x === "bigint") return x.toString();
@@ -182,14 +182,14 @@ async function foldView(clock: VirtualClock, d: SimDevice): Promise<{ disk: stri
 /** Wraps the device's crypto port open (the ingest gate's, context.ts gateCtx) and tallies suite-0 opens by payload. */
 function tapOpens(d: SimDevice): Map<string, Map<string, number>> {
 	const byPayload = new Map<string, Map<string, number>>();
-	const port = d.vrt!.log.c.gateCtx.crypto as CryptoPort;
+	const port = d.vrt!.log.c.gateCtx.crypto;
 	const inner = port.open.bind(port);
 	(port as { open: CryptoPort["open"] }).open = async (input) => {
 		const r = await inner(input);
 		if (input.suite === CryptoSuite.none) {
 			const key = bytesToHex(input.sealed);
 			let t = byPayload.get(key);
-			if (!t) byPayload.set(key, (t = new Map()));
+			if (!t) byPayload.set(key, (t = new Map<string, number>()));
 			count(t, r.ok ? "opened" : r.reason);
 		}
 		return r;
@@ -237,8 +237,8 @@ test("a. suite-0 rows forged into a suite-1 vault: every open is suite-downgrade
 	const hash = bytesToHash(new Uint8Array(32).fill(7));
 	for (const a of authors) {
 		const fresh = newDocId(rnd);
-		await add("ns-create", NS_STREAM, "nsOps", encodeNsOps([{ t: "create", docId: fresh, kind: "markdown", path: `notes/${MARK}-${a}.md` as VaultPath, contentHash: hash, size: 3 }]), a, true, frameNo++);
-		await add("ns-rename", NS_STREAM, "nsOps", encodeNsOps([{ t: "rename", docId: live[0]!, path: `notes/${MARK}-ren-${a}.md` as VaultPath }]), a, true, frameNo++);
+		await add("ns-create", NS_STREAM, "nsOps", encodeNsOps([{ t: "create", docId: fresh, kind: "markdown", path: `notes/${MARK}-${a}.md`, contentHash: hash, size: 3 }]), a, true, frameNo++);
+		await add("ns-rename", NS_STREAM, "nsOps", encodeNsOps([{ t: "rename", docId: live[0]!, path: `notes/${MARK}-ren-${a}.md` }]), a, true, frameNo++);
 		await add("ns-delete", NS_STREAM, "nsOps", encodeNsOps([{ t: "delete", docId: live[1]!, baseBodySeq: 1_000_000 as Seq }]), a, true, frameNo++);
 		await add("cfg-plugin", CFG_STREAM, "cfgOps", encodeCfgOps([{ t: "pluginSet", pluginId: `forged-${MARK}`, enabled: true }]), a, true, frameNo++);
 		await add("snap-floor", SNAP_STREAM, "snapOps", encodeSnapOps([{ t: "floor", createdAtMs: 9_000_000_000_000 }]), a, true);
@@ -1494,7 +1494,7 @@ interface SealTally {
 function tapSeals(d: SimDevice, t: SealTally, tapped: WeakSet<object>): void {
 	const c = d.vrt?.log.c;
 	if (!c) return;
-	const port = c.gateCtx.crypto as CryptoPort;
+	const port = c.gateCtx.crypto;
 	if (tapped.has(port)) return;
 	tapped.add(port);
 	const note = (): void => {

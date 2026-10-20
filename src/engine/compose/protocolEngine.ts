@@ -74,7 +74,7 @@ export interface CreateEngineOptions {
 	/** Local time zone offset in minutes (conflict-copy names); the engine core never reads Date. */
 	readonly tzOffsetMinutes?: () => number;
 	/** Epoch of an existing local DB for this vault/device (offline start); undefined = connect first. */
-	findKnownEpoch?(config: EngineInitConfig, ports: EnginePorts): Promise<VaultEpoch | undefined>;
+	readonly findKnownEpoch?: (config: EngineInitConfig, ports: EnginePorts) => Promise<VaultEpoch | undefined>;
 	/** What the engine's own scope exposes, for the device check (webEngine.ts: adapters/webDeviceEnv.ts). Absent = not probed. */
 	readonly deviceEnv?: () => DeviceEnv;
 }

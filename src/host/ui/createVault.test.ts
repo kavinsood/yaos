@@ -172,7 +172,7 @@ test("a code for another vault, a failed enroll or an enroll into another vault 
 		assert.deepEqual(host.data().identity, prior, name);
 		assert.deepEqual(host.data().e2ee, { suite: 1 }, name);
 		if (name === "code for another vault") assert.ok(!log.includes("POST /enroll"));
-		assertNoSecrets([err!.message, ...r.deps.progress]);
+		assertNoSecrets([err.message, ...r.deps.progress]);
 	}
 });
 

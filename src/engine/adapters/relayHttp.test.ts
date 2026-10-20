@@ -394,7 +394,7 @@ describe("relayHttp liveness (feed, read, readBatch watched; putCheckpoint bound
 		}
 		s.push(reply.subarray(6));
 		s.end();
-		const page = await p as Awaited<ReturnType<typeof readCall>>;
+		const page = await p;
 		assert.deepEqual([page.rows.length, page.lastSeq, clock.pendingTimers], [1, 3, 0]);
 	});
 

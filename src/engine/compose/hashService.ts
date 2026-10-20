@@ -22,7 +22,7 @@ import { canvasContentHash } from "../../core/hash/canvasCanonical";
 import { digestHex } from "../../core/hash/digest";
 import { canonicalizeMarkdown, exactFingerprint } from "../../core/hash/markdownLf";
 import { utf8Decode, utf8Encode } from "../../core/codec/lib0";
-import { kindOfPath, type DiskFingerprint, type VaultPath } from "../../core/types";
+import { kindOfPath, type DiskFingerprint } from "../../core/types";
 import type { ClockPort } from "../../ports/clock";
 import type { HashPort } from "../../ports/crypto";
 import { ProtocolFailure } from "../../protocol/errors";
@@ -81,7 +81,7 @@ export function utf16LengthOfUtf8(bytes: Uint8Array): number {
 /** One item: the hash asked for + textLength. */
 export async function hashOne(item: HashRequestItem, hash: HashPort): Promise<HashValue> {
 	const { bytes } = item;
-	const kind = kindOfPath(item.path as VaultPath);
+	const kind = kindOfPath(item.path);
 	if (item.want === "contentHash" && kind === "markdown") {
 		const text = utf8Decode(bytes); // keeps a BOM: canonicalizeMarkdown strips exactly one
 		return { hash: await digestHex(hash, utf8Encode(canonicalizeMarkdown(text))), textLength: text.length };

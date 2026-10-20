@@ -5,7 +5,7 @@ import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { assertConverged, crashPoints, label, runCrashed } from "./testkit/crash";
 import { World } from "./testkit/world";
 
-const P = (s: string): VaultPath => s as VaultPath;
+const P = (s: string): VaultPath => s;
 const visible = (w: World): Record<string, string> => w.vault.snapshot();
 
 async function everyCrashPoint(make: () => Promise<World>, check: (w: World, where: string) => Promise<void> | void): Promise<number> {

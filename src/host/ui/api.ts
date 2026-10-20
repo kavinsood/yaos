@@ -76,6 +76,7 @@ export const DEFAULT_ENGINE_SETTINGS: EngineSettings = Object.freeze({
 
 /** Trim, collapse whitespace, bound length; falls back to `fallback` (then "Device") when empty. */
 export function sanitizeDeviceLabel(value: unknown, fallback: string): string {
+	// eslint-disable-next-line no-control-regex -- matching C0 controls and DEL is the point of this pattern
 	const clean = (v: string): string => v.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, MAX_DEVICE_LABEL_CHARS).trim();
 	const label = typeof value === "string" ? clean(value) : "";
 	if (label) return label;

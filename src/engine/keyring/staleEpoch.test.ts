@@ -15,7 +15,7 @@ import { keyMissing, live, oldEpochFrame, rawAppend, start, type Dev } from "./t
 import { K, RK_A, genesis } from "./testkit/world";
 
 let ids = 0;
-const create = (path: string) => encodeNsOps([{ t: "create", docId: `doc${++ids}`.padEnd(22, "B") as DocId, kind: "markdown", path: path as VaultPath, contentHash: "0".repeat(64) as ContentHash, size: 0 }]);
+const create = (path: string) => encodeNsOps([{ t: "create", docId: `doc${++ids}`.padEnd(22, "B") as DocId, kind: "markdown", path: path, contentHash: "0".repeat(64) as ContentHash, size: 0 }]);
 const paths = (d: Dev) => d.engine.listDocs().map((x) => x.path).sort();
 const evilUpdate = () => {
 	const d = new Y.Doc();

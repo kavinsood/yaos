@@ -20,7 +20,7 @@ const A = "dev-a-0123456789abcdef";
 function hung<T>(signal: AbortSignal | undefined): Promise<T> {
 	return new Promise((_resolve, reject) => {
 		if (!signal) return; // never answers: the test would time out
-		signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+		signal.addEventListener("abort", () => reject(signal.reason as unknown), { once: true });
 	});
 }
 

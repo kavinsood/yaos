@@ -40,65 +40,64 @@ export class FakeObsidianVault implements VaultApi {
 	readonly adapter: AdapterApi;
 
 	constructor(readonly insensitive = false) {
-		const self = this;
 		const rawKey = (p: string) => this.k(p);
 		const adapter: AdapterApi & { insensitive: boolean } = {
 			insensitive,
-			async exists(p) {
-				return self.files.has(rawKey(p)) || self.folders.has(rawKey(p)) || self.raw.has(rawKey(p)) || [...self.raw.keys()].some((r) => r.startsWith(rawKey(p) + "/"));
+			exists: async (p) => {
+				return this.files.has(rawKey(p)) || this.folders.has(rawKey(p)) || this.raw.has(rawKey(p)) || [...this.raw.keys()].some((r) => r.startsWith(rawKey(p) + "/"));
 			},
-			async stat(p): Promise<AdapterStatLike | null> {
-				const b = self.raw.get(rawKey(p));
+			stat: async (p): Promise<AdapterStatLike | null> => {
+				const b = this.raw.get(rawKey(p));
 				if (b) return { type: "file", size: b.length, mtime: 1, ctime: 1 };
-				return [...self.raw.keys()].some((r) => r.startsWith(rawKey(p) + "/")) ? { type: "folder", size: 0, mtime: 0, ctime: 0 } : null;
+				return [...this.raw.keys()].some((r) => r.startsWith(rawKey(p) + "/")) ? { type: "folder", size: 0, mtime: 0, ctime: 0 } : null;
 			},
-			async read(p) {
-				const b = self.raw.get(rawKey(p));
+			read: async (p) => {
+				const b = this.raw.get(rawKey(p));
 				if (!b) throw new Error(`ENOENT ${p}`);
 				return dec.decode(b);
 			},
-			async readBinary(p) {
-				const b = self.raw.get(rawKey(p));
+			readBinary: async (p) => {
+				const b = this.raw.get(rawKey(p));
 				if (b) return b.slice().buffer;
-				const f = self.files.get(rawKey(p));
+				const f = this.files.get(rawKey(p));
 				if (!f) throw new Error(`ENOENT ${p}`);
 				const out = f.bytes.slice().buffer;
-				self.afterReadBinary?.(f.path);
+				this.afterReadBinary?.(f.path);
 				return out;
 			},
-			async write(p, data) {
-				self.calls.push(`adapter.write ${p}`);
-				self.raw.set(rawKey(p), enc.encode(data));
+			write: async (p, data) => {
+				this.calls.push(`adapter.write ${p}`);
+				this.raw.set(rawKey(p), enc.encode(data));
 			},
-			async writeBinary(p, data) {
-				self.calls.push(`adapter.writeBinary ${p}`);
-				self.raw.set(rawKey(p), new Uint8Array(data.slice(0)));
+			writeBinary: async (p, data) => {
+				this.calls.push(`adapter.writeBinary ${p}`);
+				this.raw.set(rawKey(p), new Uint8Array(data.slice(0)));
 			},
-			async list(p) {
+			list: async (p) => {
 				const prefix = rawKey(p) + "/";
 				const files: string[] = [];
 				const folders = new Set<string>();
-				for (const r of self.raw.keys()) {
+				for (const r of this.raw.keys()) {
 					if (!r.startsWith(prefix)) continue;
 					const rest = r.slice(prefix.length);
 					const i = rest.indexOf("/");
 					if (i < 0) files.push(r);
 					else folders.add(prefix + rest.slice(0, i));
 				}
-				for (const f of self.files.keys()) if (f.startsWith(prefix) && !f.slice(prefix.length).includes("/")) files.push(f);
+				for (const f of this.files.keys()) if (f.startsWith(prefix) && !f.slice(prefix.length).includes("/")) files.push(f);
 				return { files, folders: [...folders] };
 			},
-			async mkdir() {},
-			async remove(p) {
-				self.calls.push(`adapter.remove ${p}`);
-				self.raw.delete(rawKey(p));
+			mkdir: async () => {},
+			remove: async (p) => {
+				this.calls.push(`adapter.remove ${p}`);
+				this.raw.delete(rawKey(p));
 			},
-			async rename(a, b) {
-				self.calls.push(`adapter.rename ${a} ${b}`);
-				const v = self.raw.get(rawKey(a));
+			rename: async (a, b) => {
+				this.calls.push(`adapter.rename ${a} ${b}`);
+				const v = this.raw.get(rawKey(a));
 				if (!v) throw new Error("ENOENT");
-				self.raw.delete(rawKey(a));
-				self.raw.set(rawKey(b), v);
+				this.raw.delete(rawKey(a));
+				this.raw.set(rawKey(b), v);
 			},
 		};
 		this.adapter = adapter;

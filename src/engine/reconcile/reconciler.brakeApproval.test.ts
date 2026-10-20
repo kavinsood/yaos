@@ -4,7 +4,7 @@ import type { DocId, VaultPath } from "../../core/types";
 import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { World } from "./testkit/world";
 
-const P = (s: string): VaultPath => s as VaultPath;
+const P = (s: string): VaultPath => s;
 const fill = (n: number, v: number): Uint8Array => new Uint8Array(n).fill(v);
 
 /**
@@ -39,7 +39,7 @@ test("brake approval: approved blob fetches still in flight are not re-held; a n
 	assert.equal(braked.brake?.reason, "mass-overwrite");
 	assert.equal(braked.brake?.heldCount, 3);
 	assert.equal(w.blobs!.downloads.length, fetched, "held: nothing fetched");
-	const report = braked.brake!;
+	const report = braked.brake;
 	const brakesBefore = w.brakes.length;
 
 	w.r.approveBrake(report.id);

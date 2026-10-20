@@ -171,7 +171,7 @@ test("engine: a quiescent vault ends with no tail; the typed-in doc is not check
 		const single = await drive(createDoc(a, "single.md" as VaultPath, "one row"), clock);
 		const typing = await drive(createDoc(a, "typing.md" as VaultPath, "draft"), clock);
 		const ids: DocId[] = [];
-		for (let i = 0; i < 8; i++) ids.push(await drive(createDoc(a, `d${i}.md` as VaultPath, `seed ${i};`), clock));
+		for (let i = 0; i < 8; i++) ids.push(await drive(createDoc(a, `d${i}.md`, `seed ${i};`), clock));
 		await converged(es, 30_000, clock);
 		// Below the hot threshold: 2..9 edits per doc; odd docs end on b, every third doc is edited by both.
 		for (let i = 0; i < ids.length; i++) {
@@ -239,7 +239,7 @@ test("engine: the duty device goes away before S; the other device checkpoints a
 		await until(() => a.status().phase === "live" && b.status().phase === "live", 10_000, "live", clock);
 		const ids: DocId[] = [];
 		for (let i = 0; i < 4; i++) {
-			ids.push(await drive(createDoc(a, `g${i}.md` as VaultPath, `seed ${i};`), clock));
+			ids.push(await drive(createDoc(a, `g${i}.md`, `seed ${i};`), clock));
 			for (let k = 0; k < 3; k++) await drive(editDoc(a, ids[i]!, (t) => t.insert(t.length, `e${k};`)), clock);
 		}
 		await converged([a, b], 30_000, clock);

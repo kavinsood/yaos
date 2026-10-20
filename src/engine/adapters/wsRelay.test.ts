@@ -551,7 +551,7 @@ describe("wsRelay session sending", () => {
 describe("wsRelay session HTTP liveness", () => {
 	/** Serves the ticket; every other request never answers and ignores its signal. */
 	const deaf: typeof fetch = async (input) =>
-		String(input).endsWith("/auth/ticket") ? jsonResponse({ ticket: TICKET, expiresAt: 0, ttlMs: 300000 }) : new Promise<Response>(() => undefined);
+		(input instanceof Request ? input.url : String(input)).endsWith("/auth/ticket") ? jsonResponse({ ticket: TICKET, expiresAt: 0, ttlMs: 300000 }) : new Promise<Response>(() => undefined);
 
 	for (const [how, close] of [
 		["the relay closes the socket (lost link)", (x: { socket: FakeSocket; session: RelaySession }) => x.socket.serverClose(1006, false)],

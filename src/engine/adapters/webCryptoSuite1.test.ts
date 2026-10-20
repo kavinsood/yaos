@@ -113,7 +113,7 @@ describe("webCryptoSuite1: blobs (§10)", () => {
 		const subtle = new Proxy(real, {
 			get(target, prop) {
 				const v: unknown = Reflect.get(target, prop, target);
-				if (prop !== "encrypt" && prop !== "decrypt") return typeof v === "function" ? v.bind(target) : v;
+				if (prop !== "encrypt" && prop !== "decrypt") return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
 				return async (alg: AesGcmParams, key: CryptoKey, data: Uint8Array) => {
 					const out = await (v as SubtleCrypto["encrypt"]).call(target, alg, key, data);
 					seen.push({ op: prop, data, out });

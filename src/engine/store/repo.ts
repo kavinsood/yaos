@@ -30,7 +30,7 @@ export type Mut<T> = { -readonly [K in keyof T]: T[K] };
  */
 export type YS = { readonly [K in keyof YaosSchema]: YaosSchema[K] };
 type Tx = StorageTx<YS>;
-type StoreKey = keyof YS & string;
+type StoreKey = keyof YS;
 
 const MAXK = Number.MAX_SAFE_INTEGER;
 

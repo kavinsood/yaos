@@ -56,7 +56,7 @@ import { encodeNsOps } from "../../core/codec/nsOps";
 import { NS_DEDUPE_RING, NS_SEND_WINDOW, REPLAY_WINDOW } from "../../core/limits";
 import {
 	CFG_STREAM, NS_STREAM,
-	type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsFoldEvent, type NsOp, type Seq, type StreamName, type VaultId, type VaultPath,
+	type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsFoldEvent, type NsOp, type Seq, type StreamName, type VaultId,
 } from "../../core/types";
 import { SeededRandom } from "../../sim/random";
 import { createWebCryptoSuite1, type Suite1Crypto } from "../adapters/webCryptoSuite1";
@@ -90,8 +90,8 @@ const cfid = (tag: string, stream: StreamName, f: number) => id22(`${tag}${strea
 const MD = Array.from({ length: 8 }, (_, i) => id22(`md${i}`) as DocId);
 const BL = Array.from({ length: 8 }, (_, i) => id22(`bl${i}`) as DocId);
 const hex = (n: number) => n.toString(16).padStart(64, "0") as ContentHash;
-const mdPath = (n: number) => `m${n % 24}.md` as VaultPath;
-const blPath = (n: number) => `b${n % 24}.png` as VaultPath;
+const mdPath = (n: number) => `m${n % 24}.md`;
+const blPath = (n: number) => `b${n % 24}.png`;
 
 /** A genuine frame as its author sealed it. */
 interface Frame {

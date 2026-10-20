@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { unzipSync, strFromU8 } from "fflate";
-import type { ContentHash, DocKind, VaultPath } from "../types";
+import type { ContentHash, DocKind } from "../types";
 import { kindOfPath } from "../types";
 import { utf8Encode } from "../codec/lib0";
 import { refHashPort, sha256HexRef } from "../hash/testkit/hashRef";
@@ -35,7 +35,7 @@ const FILES: [string, Uint8Array][] = [
 async function build(files: readonly [string, Uint8Array][] = FILES, partSize = 16 * 1024) {
 	const parts: Uint8Array[] = [];
 	const b = new BundleBuilder(refHashPort, ID, T0, "manual", partSize, async (p) => { assert.equal(p.index, parts.length); parts.push(p.bytes); });
-	for (const [path, data] of files) await b.addFile(path as VaultPath, kindOfPath(path as VaultPath), data);
+	for (const [path, data] of files) await b.addFile(path, kindOfPath(path), data);
 	b.skip("huge.bin", "too-large");
 	const built = await b.finish();
 	const record = bundleRecord(built, "laptop", built.parts.map((p) => p.sha256));
@@ -91,7 +91,8 @@ test("bundle: parts of exactly partSize, standard unzip reads it, verify returns
 	const std = unzipSync(zip);
 	assert.deepEqual(Object.keys(std), [...FILES.map(([p]) => `files/${p}`), "manifest.json"]);
 	FILES.forEach(([p, d]) => assert.deepEqual(std[`files/${p}`], d));
-	assert.equal(JSON.parse(strFromU8(std["manifest.json"]!)).skipped[0].reason, "too-large");
+	const manifest = JSON.parse(strFromU8(std["manifest.json"]!)) as { skipped: { reason: string }[] };
+	assert.equal(manifest.skipped[0]?.reason, "too-large");
 	const { m, got } = await verify(record, parts);
 	assert.equal(m.files.length, FILES.length);
 	assert.deepEqual(got.map((e) => [e.path, e.data]), FILES);
@@ -159,7 +160,7 @@ test("verify: manifest mismatch (entry not listed, sizes or hashes differ)", asy
 	const m = built.manifest;
 	const lie = { ...m, files: m.files.map((f, i) => (i === 0 ? { ...f, hash: "00".repeat(32) as ContentHash } : f)) };
 	const mb = encodeManifest(lie);
-	const zip = await rawZip([...FILES.map(([p, d]): [string, Uint8Array, boolean] => [`files/${p}`, d, kindOfPath(p as VaultPath) !== "blob"]), ["manifest.json", mb, true]]);
+	const zip = await rawZip([...FILES.map(([p, d]): [string, Uint8Array, boolean] => [`files/${p}`, d, kindOfPath(p) !== "blob"]), ["manifest.json", mb, true]]);
 	const t = await consistentRecord(zip, 16 * 1024, record, mb);
 	await expectCorrupt("manifest-mismatch", t.record, t.parts);
 	// Manifest that disagrees with the index record (fileCount).
@@ -224,7 +225,7 @@ test("verify: second pass checks entries against the verified manifest", async (
 });
 
 test("kinds are taken from the path, not the manifest", async () => {
-	const kinds: DocKind[] = FILES.map(([p]) => kindOfPath(p as VaultPath));
+	const kinds: DocKind[] = FILES.map(([p]) => kindOfPath(p));
 	const { built } = await build();
 	assert.deepEqual(built.manifest.files.map((f) => f.kind), kinds);
 });

@@ -50,7 +50,7 @@ export function openPluginSettings(app: App, pluginId: string): boolean {
 	const setting = "setting" in host ? host.setting : undefined;
 	if (!setting || (typeof setting !== "object" && typeof setting !== "function")) return false;
 	if (!("open" in setting) || typeof setting.open !== "function") return false;
-	setting.open();
-	if ("openTabById" in setting && typeof setting.openTabById === "function") setting.openTabById(pluginId);
+	(setting as { open(): void }).open();
+	if ("openTabById" in setting && typeof setting.openTabById === "function") (setting as { openTabById(id: string): void }).openTabById(pluginId);
 	return true;
 }

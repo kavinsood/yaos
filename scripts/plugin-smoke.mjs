@@ -144,7 +144,8 @@ async function smokePlugin(mainJs, manifest, carrier) {
 		}
 		if (g.document.listeners("visibilitychange") === 0 || g.window.listeners("pagehide") === 0) fail("lifecycle listeners not attached");
 		const scripts = workerScripts.slice(scriptsBefore);
-		await plugin.onunload();
+		plugin.onunload();
+		await plugin.unloaded;
 		for (const d of plugin.disposers.reverse()) d();
 		if (ctl.runState().phase !== "stopped") fail(`after unload: ${JSON.stringify(ctl.runState())}`);
 		if (logged.join("\n").includes(TOKEN) || saved.notices.join("\n").includes(TOKEN)) fail("device token leaked to logs/notices");

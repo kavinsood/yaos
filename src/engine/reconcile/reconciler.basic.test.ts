@@ -4,7 +4,7 @@ import type { DocId, VaultPath } from "../../core/types";
 import { World } from "./testkit/world";
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
-const P = (s: string): VaultPath => s as VaultPath;
+const P = (s: string): VaultPath => s;
 
 async function booted(opts?: ConstructorParameters<typeof World>[0]): Promise<World> {
 	const w = new World(opts);
@@ -85,7 +85,7 @@ test("same-line conflict: CRDT keeps remote, disk keeps a copy with the original
 	assert.ok(w.log.text(id).includes("remote version"));
 	const copyId = w.log.liveByPath(P(copy));
 	assert.ok(copyId, "conflict copy imported as a doc");
-	assert.equal(w.log.text(copyId!), "title\nlocal version\nend\n");
+	assert.equal(w.log.text(copyId), "title\nlocal version\nend\n");
 	assert.equal(w.intents(), 0);
 	await w.sync();
 	assert.equal(w.conflictCopies().length, 1);
@@ -176,7 +176,7 @@ test("bound doc: disk edit merges into the CRDT, the disk file is never written"
 	const w = await booted();
 	const id = w.log.remoteCreate(P("b.md"), "x\n");
 	await w.sync();
-	w.log.setBound(id as DocId, true);
+	w.log.setBound(id, true);
 	w.vault.userWrite("b.md", "x\ny\n");
 	const writes = w.gateway.executed.filter((o) => o.t === "write").length;
 	await w.sync();
@@ -191,7 +191,7 @@ test("bound doc: disk edit merges into the CRDT, the disk file is never written"
  */
 async function boundMergedAwaitingSave(): Promise<{ w: World; id: DocId }> {
 	const w = await booted();
-	const id = w.log.remoteCreate(P("b.md"), "a\nb\nc\n") as DocId;
+	const id = w.log.remoteCreate(P("b.md"), "a\nb\nc\n");
 	await w.sync();
 	w.log.setBound(id, true);
 	w.log.remoteEdit(id, (t) => t.insert(0, "A"));
@@ -228,7 +228,7 @@ test("bound doc merged, then the app crashed before the editor saved: reboot wri
  */
 test("bound doc: keystrokes landing in the merge's frame are not claimed by S; the next unbound pass writes them", async () => {
 	const w = await booted();
-	const id = w.log.remoteCreate(P("b.md"), "x\n") as DocId;
+	const id = w.log.remoteCreate(P("b.md"), "x\n");
 	await w.sync();
 	w.log.setBound(id, true);
 	w.vault.userWrite("b.md", "x\ny\n");

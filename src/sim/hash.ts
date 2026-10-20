@@ -30,5 +30,5 @@ export function simHashOracle(): HashOracle {
 
 function moved(bytes: Uint8Array): Uint8Array {
 	const ownsBuffer = bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
-	return ownsBuffer ? structuredClone(bytes, { transfer: [bytes.buffer as ArrayBuffer] }) : bytes.slice();
+	return ownsBuffer ? structuredClone(bytes, { transfer: [bytes.buffer] }) : bytes.slice();
 }

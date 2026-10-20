@@ -101,7 +101,7 @@ test("ns: submitNs splits into frames, nsView shows them pending, onNsFold repor
 		relay.pauseCommits();
 		const d = await createDoc(a, "r/start.md" as VaultPath, "hello");
 		const n = MAX_NS_OPS_PER_FRAME + 88;
-		const ops: NsOp[] = Array.from({ length: n }, (_, i) => ({ t: "rename", docId: d, path: `r/n${i}.md` as VaultPath }));
+		const ops: NsOp[] = Array.from({ length: n }, (_, i) => ({ t: "rename", docId: d, path: `r/n${i}.md` }));
 		const ids = await a.submitNs(ops);
 		assert.equal(ids.length, 2, "two frames");
 		const v = a.nsView();

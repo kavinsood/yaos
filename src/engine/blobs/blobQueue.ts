@@ -415,7 +415,10 @@ export class BlobQueue implements BlobTransfer {
 			}
 		}
 		await this.deps.db.tx([STORE.blobQueue], "readwrite", async (tx) => {
-			for (const [hash, other] of rows) await (other ? tx.put(STORE.blobQueue, other) : tx.delete(STORE.blobQueue, hash as ContentHash));
+			for (const [hash, other] of rows) {
+				if (other) tx.put(STORE.blobQueue, other);
+				else tx.delete(STORE.blobQueue, hash as ContentHash);
+			}
 		});
 		return dropped + drop.length;
 	}

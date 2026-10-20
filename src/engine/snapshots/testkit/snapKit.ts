@@ -84,7 +84,7 @@ export const sealingCrypto: CryptoPort = {
 
 export const DEV_A = "dev-A-0000000000000" as DeviceId;
 export const DEV_B = "dev-B-0000000000000" as DeviceId;
-export const P = (s: string): VaultPath => s as VaultPath;
+export const P = (s: string): VaultPath => s;
 export const DAY = 24 * 60 * 60 * 1000;
 
 export interface DevOptions {

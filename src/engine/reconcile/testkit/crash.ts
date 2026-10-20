@@ -8,7 +8,6 @@
 
 import { canvasHashRef, sha256HexRef } from "../../../core/hash/testkit/hashRef";
 import { canvasDocHashInput } from "../canvasDoc";
-import type { VaultPath } from "../../../core/types";
 import { CrashError } from "./fakeGateway";
 import type { World } from "./world";
 
@@ -95,7 +94,7 @@ export async function assertConverged(w: World, where: string): Promise<void> {
 		ok(s, `${where}: no synced record for ${r.path}`);
 		eq(s.path, r.path, `${where}: synced path`);
 	}
-	for (const p of Object.keys(w.vault.snapshot())) ok(w.log.liveByPath(p as VaultPath), `${where}: ${p} on disk but not a live doc`);
+	for (const p of Object.keys(w.vault.snapshot())) ok(w.log.liveByPath(p), `${where}: ${p} on disk but not a live doc`);
 	eq(w.intents(), 0, `${where}: open intents`);
 	const m = w.gateway.mutations;
 	const n = w.log.submitted.length;

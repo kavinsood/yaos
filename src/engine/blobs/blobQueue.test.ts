@@ -102,7 +102,7 @@ class GatedStore extends FakeStore {
 	}
 	private hold(kind: "put" | "get", address: string, size: number, signal: AbortSignal | undefined): Promise<void> {
 		if (!this.gated) return Promise.resolve();
-		if (signal?.aborted) return Promise.reject(signal.reason);
+		if (signal?.aborted) return Promise.reject(signal.reason as unknown);
 		return new Promise((resolve, reject) => {
 			const end = (): void => {
 				this.calls.splice(this.calls.indexOf(call), 1);
@@ -110,7 +110,7 @@ class GatedStore extends FakeStore {
 				this.held--;
 				this.bytesHeld -= size;
 			};
-			const onAbort = (): void => (end(), reject(signal!.reason));
+			const onAbort = (): void => (end(), reject(signal!.reason as unknown));
 			const call = { kind, address, size, open: () => (end(), resolve()) };
 			signal?.addEventListener("abort", onAbort, { once: true });
 			this.calls.push(call);

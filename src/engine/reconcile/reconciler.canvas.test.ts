@@ -10,7 +10,7 @@ import { assertConverged, crashPoints, label, runCrashed } from "./testkit/crash
 import { World } from "./testkit/world";
 
 type Obj = Record<string, unknown>;
-const P = (s: string): VaultPath => s as VaultPath;
+const P = (s: string): VaultPath => s;
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
 const textNode = (id: string, text: string, x = 0): Obj => ({ id, type: "text", text, x, y: 0, width: 100, height: 50 });
 const fileNode = (id: string, file: string, x = 0): Obj => ({ id, type: "file", file, x, y: 0, width: 100, height: 50 });
@@ -24,12 +24,14 @@ async function booted(): Promise<World> {
 	return w;
 }
 
+type CanvasJson = { nodes: Obj[]; edges: Obj[] };
+const parseCanvas = (text: string): CanvasJson => JSON.parse(text) as CanvasJson;
 /** Parsed disk file (null = missing / invalid JSON). */
-function disk(w: World, path: string): { nodes: Obj[]; edges: Obj[] } | null {
+function disk(w: World, path: string): CanvasJson | null {
 	const t = w.vault.text(path);
 	if (t === null) return null;
 	try {
-		return JSON.parse(t) as { nodes: Obj[]; edges: Obj[] };
+		return parseCanvas(t);
 	} catch {
 		return null;
 	}
@@ -151,7 +153,7 @@ test("canvas: same-node conflict keeps the CRDT side, copies the exact disk byte
 	const copyId = w.log.liveByPath(P(copies[0]!));
 	assert.ok(copyId);
 	assert.equal(w.log.entry(copyId)!.kind, "canvas");
-	assert.equal(nodeOf(JSON.parse(w.log.canvasText(copyId)!), "a")?.text, "Alpha local");
+	assert.equal(nodeOf(parseCanvas(w.log.canvasText(copyId)!), "a")?.text, "Alpha local");
 	assert.equal(w.intents(), 0);
 	assert.ok(w.r.ctx.window().conflict >= 1);
 	await assertConverged(w, "conflict");
@@ -169,7 +171,7 @@ test("canvas: a disk edit of a text node is a minimal (token) diff on the same Y
 	assert.equal(nodeMap(w.log.canvasDoc(id), "a").get("text"), t, "same Y.Text instance");
 	assert.equal(t.toString(), "Alpha and omega");
 	assert.equal(JSON.stringify(deltas), JSON.stringify([[{ retain: 5 }, { insert: " and omega" }]]));
-	assert.equal(nodeOf(JSON.parse(w.log.canvasText(id)!), "a")?.text, "Alpha and omega");
+	assert.equal(nodeOf(parseCanvas(w.log.canvasText(id)!), "a")?.text, "Alpha and omega");
 });
 
 test("canvas: node deletes in both directions", async () => {
@@ -201,7 +203,7 @@ test("canvas: invalid disk canvas -> canvas-invalid notice, no write, CRDT uncha
 	assert.deepEqual(w.conflictCopies(), []);
 	w.vault.userWrite("board.canvas", canvas([textNode("a", "Alpha fixed"), textNode("b", "Beta"), fileNode("c", "notes/c.md")], [edge("e1", "a", "b")]));
 	await w.sync();
-	assert.equal(nodeOf(JSON.parse(w.log.canvasText(id)!), "a")?.text, "Alpha fixed");
+	assert.equal(nodeOf(parseCanvas(w.log.canvasText(id)!), "a")?.text, "Alpha fixed");
 	await assertConverged(w, "fixed");
 });
 
@@ -281,7 +283,7 @@ test("canvas: remote-only body waits until caught up, then materializes; local-o
 	const n = writes(w);
 	await w.sync();
 	assert.equal(writes(w), n);
-	assert.equal(nodeOf(JSON.parse(w.log.canvasText(id)!), "b")?.text, "Beta 2");
+	assert.equal(nodeOf(parseCanvas(w.log.canvasText(id)!), "b")?.text, "Beta 2");
 	await assertConverged(w, "remote-only");
 });
 

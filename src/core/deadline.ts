@@ -17,6 +17,9 @@
 
 import type { ClockPort } from "../ports/clock";
 
+/** lib.dom types AbortSignal.reason as `any`; it is whatever abort() was given (a DOMException by default). */
+const abortReason = (signal: AbortSignal): unknown => signal.reason;
+
 /**
  * `p`, or a rejection (the signal's reason) as soon as `signal` aborts. A deadline then holds even when the fetch
  * behind `p` ignores its signal: a request nobody answers is never awaited past it.
@@ -25,10 +28,10 @@ export function untilAborted<T>(p: Promise<T>, signal: AbortSignal | undefined):
 	if (!signal) return p;
 	if (signal.aborted) {
 		p.catch(() => undefined);
-		return Promise.reject(signal.reason);
+		return Promise.reject(abortReason(signal));
 	}
 	return new Promise<T>((resolve, reject) => {
-		const onAbort = (): void => reject(signal.reason);
+		const onAbort = (): void => reject(abortReason(signal));
 		signal.addEventListener("abort", onAbort, { once: true });
 		p.then(
 			(v) => {

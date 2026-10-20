@@ -35,7 +35,7 @@
  * as the clock runs; settle() waits for every inspection before the checks).
  */
 
-import type { DeviceId, VaultEpoch } from "../core/types";
+import type { DeviceId } from "../core/types";
 import type { LifecycleEvent } from "../ports/platform";
 import type { TimerHandle } from "../ports/clock";
 import type { SimStallScope } from "./blobStore";
@@ -317,7 +317,7 @@ export class FaultState {
 				this.later(f.durationMs, () => this.net.blobs.setSlow(null));
 				return `fault blobSlow ${f.durationMs}ms ${f.bytesPerSec}B/s`;
 			case "epochReset": {
-				const epoch = `sim-epoch-reset-${++this.epochs}` as VaultEpoch;
+				const epoch = `sim-epoch-reset-${++this.epochs}`;
 				this.net.relay.resetEpoch(epoch);
 				this.counts.epochReset++;
 				return `fault epochReset ${epoch}`;
@@ -394,7 +394,7 @@ export class FaultState {
 				this.counts.background++;
 				return `${tag} ${f.event} ${f.durationMs}ms`;
 			case "socketDrop":
-				this.net.relay.dropSession(d.deviceId as DeviceId, f.code);
+				this.net.relay.dropSession(d.deviceId, f.code);
 				this.counts.socketDrop++;
 				return `${tag} ${f.code}`;
 			case "clockSkew":
@@ -428,7 +428,7 @@ export class FaultState {
 		this.suspends.push(rec);
 		if (atRisk.length > 0) {
 			this.inspecting++;
-			this.inspections.push(inspectStore(this.clock, d.storage.copy(), d.deviceId as DeviceId).then((texts) => {
+			this.inspections.push(inspectStore(this.clock, d.storage.copy(), d.deviceId).then((texts) => {
 				const kept = new Set<string>();
 				for (const t of texts) for (const tok of tokensIn(t)) kept.add(tok);
 				rec.committedAtEvent = new Set(atRisk.filter((t) => kept.has(t)));
@@ -508,7 +508,7 @@ export class FaultState {
 		this.down.add(i);
 		this.backgrounded.delete(i);
 		this.later(downMs, () => this.restart(i));
-		if (candidates.length > 0) this.inspect(copy, d.deviceId as DeviceId, candidates);
+		if (candidates.length > 0) this.inspect(copy, d.deviceId, candidates);
 	}
 
 	private inspect(copy: MemStoragePort, deviceId: DeviceId, candidates: readonly string[]): void {

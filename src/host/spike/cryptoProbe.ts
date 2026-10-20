@@ -85,7 +85,7 @@ const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
 const sameBytes = (a: Uint8Array, b: Uint8Array): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
 
 /** Error name of a rejected call, or "accepted" when it resolved (a failed security check). */
-async function rejection(run: () => Promise<unknown> | unknown): Promise<string> {
+async function rejection(run: () => unknown): Promise<string> {
 	try {
 		await run();
 		return "accepted";

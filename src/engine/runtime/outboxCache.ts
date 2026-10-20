@@ -59,7 +59,7 @@ export class OutboxCache {
 		this.delete(rec.clientFrameId);
 		this.byId.set(rec.clientFrameId, rec);
 		let m = this.byStream.get(rec.stream);
-		if (!m) this.byStream.set(rec.stream, (m = new Map()));
+		if (!m) this.byStream.set(rec.stream, (m = new Map<ClientFrameId, OutboxRecord>()));
 		m.set(rec.clientFrameId, rec);
 		this.bytes += rec.sealed.length;
 	}

@@ -29,7 +29,7 @@
 import * as Y from "yjs";
 import { newClientFrameId } from "../core/codec/ids";
 import { bytesToHex } from "../core/codec/lib0";
-import { KEYRING_STREAM, type DeviceId, type StreamName, type VaultEpoch } from "../core/types";
+import { KEYRING_STREAM, type DeviceId, type StreamName } from "../core/types";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { sealFrame } from "../engine/ingest/envelope";
 import type { KeyringRuntime } from "../engine/keyring/keyringRuntime";
@@ -328,7 +328,7 @@ export class E2eeFaults {
 		if (this.snaps.length === 0) return "skip fault epochRestore: no snapshot";
 		const idx = Math.max(0, this.snaps.length - back);
 		const snap = this.snaps[idx]!;
-		const epoch = `sim-epoch-restore-${++this.restores}` as VaultEpoch;
+		const epoch = `sim-epoch-restore-${++this.restores}`;
 		this.net.relay.restoreEpoch(snap, epoch);
 		this.snaps.length = 0; // later restores rewind within the new epoch only
 		this.stats.restores++;

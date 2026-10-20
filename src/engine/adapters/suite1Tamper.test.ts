@@ -194,7 +194,7 @@ function assertRun(label: string, run: { readonly x01: FlipRun; readonly rand: F
 
 const frameBinding = (stream: string, deviceId: string = DEV, clientFrameId: string = CF): EnvelopeBinding =>
 	({ t: "frame", stream: stream as StreamName, deviceId: deviceId as DeviceId, clientFrameId: clientFrameId as ClientFrameId });
-const ckptBinding = (stream: string, coversSeq: number): EnvelopeBinding => ({ t: "checkpoint", stream: stream as StreamName, coversSeq: coversSeq as Seq });
+const ckptBinding = (stream: string, coversSeq: number): EnvelopeBinding => ({ t: "checkpoint", stream: stream as StreamName, coversSeq: coversSeq });
 const openFrame = async (c: Suite1Crypto, b: EnvelopeBinding, bytes: Uint8Array, vaultId: string = VAULT): Promise<string> => {
 	const r = await openEnvelope(c, vaultId as VaultId, b, bytes);
 	return r.ok ? "ok" : r.reason;
@@ -558,7 +558,7 @@ describe("§20.2 cross-type confusion (measured)", () => {
 		});
 		const ckpts = await inBatches(range(0, N), async (i) => {
 			const s = streams[i % streams.length]!;
-			return { s, cs: 10 + i, bytes: await sealCheckpoint(c, V, s as StreamName, (10 + i) as Seq, rng.bytes(1 + i * 41), 3 as Seq) };
+			return { s, cs: 10 + i, bytes: await sealCheckpoint(c, V, s as StreamName, (10 + i), rng.bytes(1 + i * 41), 3 as Seq) };
 		});
 		const blobs = await inBatches(range(0, N), async (i) => concatBytes(await c.sealBlob({ address, plaintext: rng.bytes(i * 43) })));
 		const records = [await genesis(), await roll(2), await revoke(2), await roll(3), await revoke(3)];

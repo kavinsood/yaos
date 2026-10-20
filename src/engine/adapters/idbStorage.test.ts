@@ -45,7 +45,7 @@ function rawOpen(factory: IDBFactory, name: string, version?: number): Promise<I
 	return new Promise((resolve, reject) => {
 		const req = version === undefined ? factory.open(name) : factory.open(name, version);
 		req.onsuccess = () => resolve(req.result);
-		req.onerror = () => reject(req.error);
+		req.onerror = () => reject(req.error ?? new Error("open failed without an error"));
 	});
 }
 
@@ -125,7 +125,9 @@ describe("createIdbStoragePort (fake-indexeddb)", () => {
 			["SomethingNew", "unknown"],
 		];
 		const proto: IDBObjectStore = IDBObjectStore.prototype;
-		const original = proto.put;
+		// The descriptor, not `proto.put`: restoring needs the original function itself, never called detached.
+		const original = Object.getOwnPropertyDescriptor(proto, "put")!;
+		const realPut = original.value as IDBObjectStore["put"];
 		try {
 			for (const [name, failure] of cases) {
 				const { open } = setup();
@@ -134,7 +136,7 @@ describe("createIdbStoragePort (fake-indexeddb)", () => {
 				proto.put = function patched(this: IDBObjectStore, ...args: Parameters<IDBObjectStore["put"]>) {
 					const rec: unknown = args[0];
 					if (typeof rec === "object" && rec !== null && "k" in rec && rec.k === "boom") throw new DOMException(`simulated ${name}`, name);
-					return original.apply(this, args);
+					return realPut.apply(this, args);
 				};
 				const err = await rejectsWith(
 					db.tx(["kv"], "readwrite", async (tx) => {
@@ -148,14 +150,14 @@ describe("createIdbStoragePort (fake-indexeddb)", () => {
 					}),
 					failure,
 				);
-				proto.put = original;
+				Object.defineProperty(proto, "put", original);
 				assert.equal(err, thrown, `${name}: tx() rejects with the thrown error`);
 				assert.equal((err as { cause?: { name?: string } }).cause?.name, name);
 				assert.equal(await count(db), 0, `${name}: nothing committed`);
 				db.close();
 			}
 		} finally {
-			proto.put = original;
+			Object.defineProperty(proto, "put", original);
 		}
 	});
 

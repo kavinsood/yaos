@@ -188,7 +188,7 @@ test("runWorkerProbe: silent worker -> no pong within timeout, error events capt
 	};
 	setTimeout(() => {
 		const fire: unknown = errorListener;
-		if (typeof fire === "function") fire({ message: "Uncaught SyntaxError", filename: "blob:x", lineno: 1, colno: 2 });
+		if (typeof fire === "function") (fire as (ev: unknown) => void)({ message: "Uncaught SyntaxError", filename: "blob:x", lineno: 1, colno: 2 });
 	}, 10);
 	const r = await runWorkerProbe({ source: "x", makeUrl: () => "blob:4", makeWorker: () => worker, revokeUrl: () => undefined, timeouts: { firstPongMs: 60, graceMs: 20 } });
 	assert.equal(r.ok, false);

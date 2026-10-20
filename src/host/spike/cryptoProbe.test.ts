@@ -118,7 +118,9 @@ test("runCryptoProbe: an exportable 'non-extractable' key fails importNonExtract
 test("runCryptoProbe: an IDB that stores the key as a plain object fails the IDB step", async () => {
 	// Models a WebView whose structured clone does not keep CryptoKey: the stored value comes back as {}.
 	const proto = FakeObjectStore.prototype;
-	const origPut = proto.put;
+	// The descriptor, not `proto.put`: restoring needs the original function itself, never called detached.
+	const original = Object.getOwnPropertyDescriptor(proto, "put")!;
+	const origPut = original.value as typeof proto.put;
 	proto.put = function (this: IDBObjectStore, value: unknown, key?: IDBValidKey) {
 		return origPut.call(this, { ...(value as object), key: {} }, key);
 	} as typeof proto.put;
@@ -129,7 +131,7 @@ test("runCryptoProbe: an IDB that stores the key as a plain object fails the IDB
 		assert.equal(r.aesGcm.ok, true);
 		assert.equal(r.ok, false);
 	} finally {
-		proto.put = origPut;
+		Object.defineProperty(proto, "put", original);
 	}
 });
 

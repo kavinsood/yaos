@@ -36,7 +36,7 @@ export async function listLocal(side: SideFilePort, onBad?: (name: string) => vo
 			onBad?.(name);
 			continue;
 		}
-		out.push({ id: m[1]!, record });
+		out.push({ id: m[1], record });
 	}
 	return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }

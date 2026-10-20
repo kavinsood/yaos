@@ -6,7 +6,6 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { Seq } from "../../core/types";
 import type { EngineInitConfig } from "../../protocol/messages";
 import { VirtualClock } from "../../sim/clock";
 import { SimDevice } from "../../sim/device";
@@ -41,7 +40,7 @@ const failingLink: Pick<HostLink, "keyringChanged"> = { keyringChanged: async ()
 const suite1 = (keys: readonly { readonly e: number; readonly k: Uint8Array }[]): Promise<Suite1Crypto> =>
 	createWebCryptoSuite1({ vaultId: VAULT, random: new SeededRandom(7), keys: keys.map((x) => ({ e: x.e, k: x.k.slice() })) });
 
-const rows = (...r: (readonly [number, Uint8Array])[]) => r.map(([seq, bytes]) => ({ seq: seq as Seq, bytes }));
+const rows = (...r: (readonly [number, Uint8Array])[]) => r.map(([seq, bytes]) => ({ seq: seq, bytes }));
 
 test("main stores keyringChanged before the engine answered init, in arrival order: keys are unioned and an empty record set keeps the stored one", async () => {
 	const clock = new VirtualClock();

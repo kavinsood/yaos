@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ClientFrameId, DeviceId, StreamName, VaultId } from "../../core/types";
+import type { ClientFrameId, DeviceId, VaultId } from "../../core/types";
 import { Repo } from "../store/repo";
 import { VirtualClock } from "../../sim/clock";
 import { MemStoragePort, type CommitDecision } from "../../sim/storage";
@@ -160,7 +160,7 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 		a2 = (await startTestEngine({ relay, deviceId: "dev-a", storage: restartStore, tuning: TUNING, clock })).engine;
 		await converged([a2, b], 10_000, clock);
 		const mine = new Map<string, number>();
-		for (const s of relay.streams()) for (const r of relay.rows(s as StreamName, { includeGc: true })) if (r.deviceId === "dev-a") mine.set(r.clientFrameId, (mine.get(r.clientFrameId) ?? 0) + 1);
+		for (const s of relay.streams()) for (const r of relay.rows(s, { includeGc: true })) if (r.deviceId === "dev-a") mine.set(r.clientFrameId, (mine.get(r.clientFrameId) ?? 0) + 1);
 		totals.durableChecked += durable.size;
 		for (const id of durable) assert.equal(mine.get(id), 1, `durable frame ${id} committed exactly once (crash ${decision} #${k} ${(crashed as RunResult["crashed"])?.label})`);
 		assert.equal(a2.c.outbox.size, 0, "outbox drained");

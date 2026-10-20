@@ -52,9 +52,9 @@ test("upload: every part sealed under its blob address, then one index record; a
 	assert.equal(store.calls.put, 3 + record.parts.length - 2, "the two stored parts were not sent again");
 	for (const p of record.parts) {
 		assert.equal(p.address, addressOf(p.sha256), "address = CryptoPort.blobAddress(sha256)");
-		const sealed = store.objects.get(p.address as BlobAddress)!;
+		const sealed = store.objects.get(p.address)!;
 		assert.notEqual(sha256HexRef(sealed), p.sha256);
-		const opened = await sealingCrypto.openBlob({ address: p.address as BlobAddress, sealed });
+		const opened = await sealingCrypto.openBlob({ address: p.address, sealed });
 		assert.ok(opened.ok);
 		assert.equal(sha256HexRef(opened.plaintext), p.sha256, "stored sealed (sealBlob); opens to the part");
 	}
@@ -175,7 +175,7 @@ test("suite 1: parts sealed at blobAddress(sha256), every stored object within m
 	for (const p of record.parts) {
 		assert.equal(p.address, await writer.blobAddress(p.sha256));
 		assert.notEqual(p.address, p.sha256);
-		const sealed = store.objects.get(p.address as BlobAddress)!;
+		const sealed = store.objects.get(p.address)!;
 		assert.deepEqual([...sealed.subarray(0, 3)], [1, 1, 2], "blobFormat 1, suite 1, keyEpoch 2");
 		assert.equal(sealed.length, sealedBlobBytes(p.size, 2));
 		assert.ok(sealed.length <= store.maxBlobBytes, `${sealed.length} <= ${store.maxBlobBytes}`);

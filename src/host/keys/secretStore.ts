@@ -169,7 +169,7 @@ export class VaultKeyStore {
 
 	private waitLoaded(): Promise<boolean> {
 		if (this.loadedNow()) return Promise.resolve(true);
-		const on = this.store.on;
+		const on = this.store.on?.bind(this.store);
 		if (typeof on !== "function") return Promise.resolve(false);
 		return new Promise<boolean>((resolve) => {
 			let done = false;
@@ -186,7 +186,7 @@ export class VaultKeyStore {
 				resolve(loaded);
 			};
 			const timer = this.clock.setTimer(this.waitMs, () => finish(this.loadedNow()));
-			ref = on.call(this.store, "changed", () => finish(true));
+			ref = on("changed", () => finish(true));
 		});
 	}
 

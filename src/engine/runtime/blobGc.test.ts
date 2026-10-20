@@ -16,7 +16,7 @@ import { sha256HexRef } from "../../core/hash/testkit/hashRef";
 import { MAX_INLINE_UPDATE_BYTES } from "../../core/limits";
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
 import { snapshotId, SnapOpTag, type SnapRecord } from "../../core/snap/record";
-import { KEYRING_STREAM, NS_STREAM, SNAP_STREAM, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsOp, type StreamName, type VaultId, type VaultPath } from "../../core/types";
+import { KEYRING_STREAM, NS_STREAM, SNAP_STREAM, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsOp, type StreamName, type VaultId } from "../../core/types";
 import type { ClockPort } from "../../ports/clock";
 import type { BlobAddress, CryptoPort, KeyringCrypto } from "../../ports/crypto";
 import { keyringCryptoOf } from "../keyring/writeGate";
@@ -48,7 +48,7 @@ const bytesOf = (i: number): Uint8Array => Uint8Array.from({ length: 48 }, (_, j
 const H = (b: Uint8Array) => sha256HexRef(b) as ContentHash;
 let docN = 0;
 const newDoc = () => `gcdoc${String(++docN).padStart(17, "0")}` as DocId;
-const createBlob = (docId: DocId, hash: ContentHash): NsOp => ({ t: "create", docId, kind: "blob", path: `att/${docId}.png` as VaultPath, contentHash: hash, size: 48 });
+const createBlob = (docId: DocId, hash: ContentHash): NsOp => ({ t: "create", docId, kind: "blob", path: `att/${docId}.png`, contentHash: hash, size: 48 });
 
 class World {
 	readonly relay = new SimRelay();

@@ -93,7 +93,8 @@ export default class YaosSpikePlugin extends Plugin {
 			this.running = false;
 			const json = formatReport(report);
 			this.last = { report, json };
-			console.log("[yaos-spike] report\n" + json);
+			// Also in ResultsModal; the console copy is at debug level (Obsidian's plugin logging guideline).
+			console.debug("[yaos-spike] report\n" + json);
 			this.show();
 		}
 	}

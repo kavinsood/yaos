@@ -6,7 +6,7 @@ import { SkipNoticeGate, sizeText, skipNotice, unexpectedSkips, type Skipped } f
 import { World } from "./testkit/world";
 
 const skip = (path: string, why: Skipped["why"] = "too-large"): Skipped => ({
-	path: path as VaultPath, pathKey: path.toLowerCase() as Skipped["pathKey"], why, detail: why === "name" ? "the name is too long" : "larger than the 8 MiB limit",
+	path: path, pathKey: path.toLowerCase() as Skipped["pathKey"], why, detail: why === "name" ? "the name is too long" : "larger than the 8 MiB limit",
 });
 const skipNotices = (w: World): string[] => w.notices.filter((n) => n.code === "scan-skipped").map((n) => `${n.level}:${n.message}`);
 

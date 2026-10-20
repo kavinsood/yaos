@@ -57,7 +57,7 @@ test("storage: microtask-only chains and Promise.all of own reads never trip the
 		for (let i = 0; i < 200; i++) {
 			tx.put("a", { id: i, tag: i % 2 ? "odd" : "even" });
 			await Promise.all([tx.count("a"), tx.get("a", i), Promise.resolve(1)]);
-			await null;
+			await Promise.resolve();
 		}
 		return tx.countByIndex("a", "byTag", { lower: "odd", upper: "odd" });
 	});

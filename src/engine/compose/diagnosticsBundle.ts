@@ -70,14 +70,14 @@ export async function buildDiagnosticsBundle(
 		}
 		const fields = { ...ev.fields };
 		if (typeof stream === "string") fields.stream = await ofStream(stream);
-		if (typeof path === "string") fields.path = await ofPath(path as VaultPath);
+		if (typeof path === "string") fields.path = await ofPath(path);
 		recentEvents.push({ ...ev, fields });
 	}
 
 	let status = input.status;
 	if (status.brake) {
 		const samplePaths: VaultPath[] = [];
-		for (const p of status.brake.samplePaths) samplePaths.push((await ofPath(p)) as VaultPath);
+		for (const p of status.brake.samplePaths) samplePaths.push((await ofPath(p)));
 		status = { ...status, brake: { ...status.brake, samplePaths } };
 	}
 

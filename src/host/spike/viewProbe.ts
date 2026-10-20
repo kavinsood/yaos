@@ -237,7 +237,8 @@ export async function runViewProbe(app: App, opts: ViewProbeOptions = {}): Promi
 		// 1. per-instance setViewData wrapper
 		const ownBefore = hasOwn(v, "setViewData");
 		setup.setViewDataOwnBefore = ownBefore;
-		const orig: unknown = v.setViewData;
+		// Read dynamically: the probe wraps whatever the view holds and re-invokes it with the view as receiver.
+		const orig: unknown = Reflect.get(v, "setViewData");
 		if (typeof orig !== "function") throw new Error(`view.setViewData is ${typeof orig}`);
 		const wrapper = function (this: unknown, ...args: unknown[]): void {
 			const data = args[0];
@@ -324,7 +325,10 @@ export async function runViewProbe(app: App, opts: ViewProbeOptions = {}): Promi
 		const ownDesc = Object.getOwnPropertyDescriptor(v, "data");
 		const owner = ownDesc ? null : findProtoOwner(v, "data");
 		const baseDesc = ownDesc ?? (owner ? Object.getOwnPropertyDescriptor(owner, "data") : undefined);
+		// Accessor functions taken off the descriptor and only ever invoked via Reflect.apply with the view as receiver.
+		// eslint-disable-next-line @typescript-eslint/unbound-method -- see above
 		const baseGet = baseDesc?.get;
+		// eslint-disable-next-line @typescript-eslint/unbound-method -- see above
 		const baseSet = baseDesc?.set;
 		let dataValue: unknown = v.data;
 		let dataInstalled = false;

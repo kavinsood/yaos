@@ -115,8 +115,8 @@ test("canvas merge text round-trips and is one record per line", () => {
 	assert.equal(text.split("\n").length, 1 + 3 + 1 + 1);
 	const back = canvasFromMergeText(text);
 	assert.ok(back);
-	assert.equal(canvasToMergeText(back!), text);
-	assert.deepEqual(canonicalCanvasBytes(back!.data), canonicalCanvasBytes(parsed.data));
+	assert.equal(canvasToMergeText(back), text);
+	assert.deepEqual(canonicalCanvasBytes(back.data), canonicalCanvasBytes(parsed.data));
 	assert.equal(canvasFromMergeText(text.replace('"node"', '"nod"')), null);
 	assert.equal(canvasFromMergeText(text + text.split("\n")[1] + "\n"), null, "duplicate node id");
 	const lines = text.split("\n");

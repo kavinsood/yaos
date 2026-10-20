@@ -78,7 +78,7 @@ class ObsidianViewRef implements EditorViewRef {
 	) {}
 
 	get path(): VaultPath | null {
-		return (this.view.file?.path ?? null) as VaultPath | null;
+		return (this.view.file?.path ?? null);
 	}
 
 	hasEditor(): boolean {
@@ -157,6 +157,10 @@ class ObsidianViewRef implements EditorViewRef {
 		const setViewData = keep("setViewData") as MarkdownViewLike["setViewData"];
 		const getViewData = keep("getViewData") as MarkdownViewLike["getViewData"];
 		const onInternalDataChange = keep("onInternalDataChange") as MarkdownViewLike["onInternalDataChange"];
+		// The wrappers below need two receivers: Obsidian calls them as view methods (dynamic `this` = the view, which
+		// the originals must be re-invoked on), and they act on this workspace binding. Arrow functions would lose the
+		// former, so the binding is captured by name.
+		// eslint-disable-next-line @typescript-eslint/no-this-alias -- two receivers (view and binding), see above
 		const self = this;
 		v.setViewData = function (this: MarkdownViewLike, data: string, clear: boolean): void {
 			if (clear) {
@@ -278,7 +282,7 @@ export class ObsidianWorkspace implements WorkspacePort {
 				this.known.set(id, { ref, path, mode });
 				events.push({ t: "opened", view: ref });
 			} else if (k.path !== path || k.mode !== mode) {
-				const previousPath = k.path as VaultPath | null;
+				const previousPath = k.path;
 				k.path = path;
 				k.mode = mode;
 				events.push({ t: "file-changed", view: k.ref, previousPath });

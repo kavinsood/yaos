@@ -12,6 +12,7 @@ import { applyCanvas, canvasDocHashInput, emptyCanvas, projectCanvasBytes, proje
 import { canvasMergeStats, mergeCanvasSides, parseDiskCanvas, parseMergeText } from "./canvasMerge";
 
 type Obj = Record<string, unknown>;
+const parseCanvas = (text: string): { nodes: Obj[]; edges: Obj[] } => JSON.parse(text) as { nodes: Obj[]; edges: Obj[] };
 const textNode = (id: string, text: string, x = 0): Obj => ({ id, type: "text", text, x, y: 0, width: 100, height: 50 });
 const fileNode = (id: string, file: string, x = 0): Obj => ({ id, type: "file", file, x, y: 0, width: 100, height: 50 });
 const edge = (id: string, fromNode: string, toNode: string): Obj => ({ id, fromNode, toNode });
@@ -60,7 +61,7 @@ test("canvasDoc: apply onto an empty doc, read back, project = formatted file in
 test("canvasDoc: empty doc projects the empty canvas with the empty-content hash", async () => {
 	const p = project(new Y.Doc());
 	assert.equal(await projectionHash(H, p), canvasHashRef(new Uint8Array(0)));
-	assert.equal(JSON.parse(p.text).nodes.length, 0);
+	assert.equal(parseCanvas(p.text).nodes.length, 0);
 });
 
 test("canvasDoc: field edit sets one key on the same record map; text edit is a minimal Y.Text diff on the same instance", () => {
@@ -102,7 +103,7 @@ test("canvasDoc: dangling edges stay in the CRDT, are dropped from the projectio
 	assert.equal(r.ranked.data.edges.size, 1, "the CRDT keeps the edge");
 	const p = project(d);
 	assert.equal(p.ranked.data.edges.size, 0);
-	assert.equal(JSON.parse(p.text).edges.length, 0);
+	assert.equal(parseCanvas(p.text).edges.length, 0);
 	applyCanvas(d, null, p.ranked);
 	assert.equal(d.getMap("edges").has("e"), true, "an apply of the visible canvas keeps the dangling edge");
 	// The node comes back: the edge is visible again.
@@ -153,9 +154,9 @@ test("canvasMerge: edits to different nodes merge cleanly", () => {
 	const { d, out } = sides(BASE, disk, (doc) => nodeMap(doc, "c").set("x", 99));
 	assert.equal(out.kind, "clean");
 	applyCanvas(d, null, out.target);
-	const j = JSON.parse(project(d).text);
-	assert.equal(j.nodes[0].text, "A disk");
-	assert.equal(j.nodes[2].x, 99);
+	const j = parseCanvas(project(d).text);
+	assert.equal(j.nodes[0]?.text, "A disk");
+	assert.equal(j.nodes[2]?.x, 99);
 });
 
 test("canvasMerge: concurrent adds of different nodes and a disk edge merge", () => {
@@ -181,7 +182,7 @@ test("canvasMerge: edits to the same node conflict; target = CRDT side of that n
 	assert.equal(out.reason, "both-edited");
 	const nodes = out.target.data.nodes;
 	assert.equal(JSON.stringify(nodes.get("a")!.payload), JSON.stringify({ type: "text" }));
-	const txt = (id: string): unknown => JSON.parse(out.projection.text).nodes.find((n: Obj) => n.id === id)?.text;
+	const txt = (id: string): unknown => parseCanvas(out.projection.text).nodes.find((n) => n.id === id)?.text;
 	assert.equal(txt("a"), "A crdt");
 	assert.equal(txt("c"), "C disk", "the clean disk hunk is kept");
 });

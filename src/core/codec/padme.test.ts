@@ -45,7 +45,8 @@ describe("Padmé (§7.3)", () => {
 		// upload cap (D9), 48 x 2 MiB does not: the largest suite-1 blob plaintext there is 47 x 2 MiB - 1 (marker).
 		assert.equal(padmeLen(47 * 2_097_152), 47 * 2_097_152);
 		assert.equal(padmeLen(47 * 2_097_152 + 1), 48 * 2_097_152);
-		assert.ok(47 * 2_097_152 + 10 + 28 <= 100_000_000 && 48 * 2_097_152 > 100_000_000);
+		assert.ok(47 * 2_097_152 + 10 + 28 <= 100_000_000);
+		assert.ok(48 * 2_097_152 > 100_000_000);
 	});
 
 	it("rejects bad lengths", () => {

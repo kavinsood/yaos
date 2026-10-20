@@ -264,7 +264,7 @@ export function canvasNodeJson(node: CanvasNode): JsonObject {
 		if (payload.subpath !== undefined) result.subpath = payload.subpath;
 	} else if (payload.type === "link" && "url" in payload) result.url = payload.url;
 	else if (payload.type === "group") {
-		const group = payload as CanvasGroupPayload;
+		const group = payload;
 		if (group.label !== undefined) result.label = group.label;
 		if (group.background !== undefined) result.background = group.background;
 		if (group.backgroundStyle !== undefined) result.backgroundStyle = group.backgroundStyle;

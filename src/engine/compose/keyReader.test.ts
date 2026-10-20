@@ -85,7 +85,7 @@ type Cleaned = Extract<EngineResultValue, { t: "attachmentsCleaned" }>;
 async function cleanUp(clock: VirtualClock, d: SimDevice): Promise<Cleaned> {
 	const r = await settleWith(clock, d.runtime.command({ t: "cleanUpAttachments" }));
 	assert.equal(r.t, "attachmentsCleaned");
-	return r as Cleaned;
+	return r;
 }
 
 test("pinSuite0 {link} is refused once k shows a record, and enableE2ee / pinSuite0 {create} off the creation path", async () => {

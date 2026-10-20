@@ -2,14 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fingerprintRef, markdownHashRef } from "../core/hash/testkit/hashRef";
 import { utf8Encode } from "../core/codec/lib0";
-import type { DiskFingerprint, VaultPath } from "../core/types";
 import type { VaultEvent } from "../ports/vault";
 import { simHashOracle } from "../sim/hash";
 import { FakeObsidianVault } from "../sim/fakeObsidian";
 import type { HashOracle } from "./hashOracle";
 import { followObsidianSystemTrash, ObsidianVault } from "./obsidianVault";
 
-const P = (p: string) => p as VaultPath;
+const P = (p: string) => p;
 const utf8 = utf8Encode;
 /** Test-side reference hashing (core, in-process); the vault itself only asks its HashOracle. */
 const fp = (t: string) => fingerprintRef(utf8(t));
@@ -27,10 +26,10 @@ test("write honours absent / fingerprint / hash / any and never writes on a fail
 	assert.ok(fake.calls.includes("createFolder n"));
 	const again = await vault.write(P("n/a.md"), "two", { t: "absent" });
 	assert.equal(again.ok === false && again.reason, "precondition");
-	const stale = await vault.write(P("n/a.md"), "two", { t: "fingerprint", fingerprint: (await fp("nope")) as DiskFingerprint });
+	const stale = await vault.write(P("n/a.md"), "two", { t: "fingerprint", fingerprint: fp("nope") });
 	assert.equal(stale.ok === false && stale.reason, "precondition");
 	assert.equal(fake.text("n/a.md"), "one");
-	const good = await vault.write(P("n/a.md"), "two", { t: "fingerprint", fingerprint: await fp("one") });
+	const good = await vault.write(P("n/a.md"), "two", { t: "fingerprint", fingerprint: fp("one") });
 	assert.equal(good.ok, true);
 	assert.equal(fake.text("n/a.md"), "two");
 	fake.put("n/a.md", "\uFEFFtwo\r\n");
@@ -39,7 +38,7 @@ test("write honours absent / fingerprint / hash / any and never writes on a fail
 	assert.equal(viaHash.ok, true, "logical hash ignores BOM and CRLF");
 	assert.equal((await vault.write(P("n/a.md"), "four", { t: "any" })).ok, true);
 	assert.equal(fake.text("n/a.md"), "four");
-	const missing = await vault.write(P("n/b.md"), "x", { t: "fingerprint", fingerprint: await fp("") });
+	const missing = await vault.write(P("n/b.md"), "x", { t: "fingerprint", fingerprint: fp("") });
 	assert.equal(missing.ok === false && missing.reason, "precondition");
 	assert.equal(fake.text("n/b.md"), null);
 });
@@ -51,7 +50,7 @@ test("text CAS aborts when the file changes between the check and the commit", a
 		fake.afterReadBinary = null;
 		fake.put(p, "user typed meanwhile");
 	};
-	const r = await vault.write(P("a.md"), "sync", { t: "fingerprint", fingerprint: await fp("base") });
+	const r = await vault.write(P("a.md"), "sync", { t: "fingerprint", fingerprint: fp("base") });
 	assert.equal(r.ok === false && r.reason, "precondition");
 	assert.equal(fake.text("a.md"), "user typed meanwhile");
 });
@@ -163,9 +162,9 @@ test("rename goes through vault.rename only, checks target and precondition; cas
 	fake.put("b.md", "B");
 	const taken = await vault.rename("a.md", P("B.md"), { t: "any" });
 	assert.equal(taken.ok === false && taken.reason, "target-exists");
-	const stale = await vault.rename("a.md", P("c/d.md"), { t: "fingerprint", fingerprint: await fp("not A") });
+	const stale = await vault.rename("a.md", P("c/d.md"), { t: "fingerprint", fingerprint: fp("not A") });
 	assert.equal(stale.ok === false && stale.reason, "precondition");
-	const ok = await vault.rename("a.md", P("c/d.md"), { t: "fingerprint", fingerprint: await fp("A") });
+	const ok = await vault.rename("a.md", P("c/d.md"), { t: "fingerprint", fingerprint: fp("A") });
 	assert.equal(ok.ok && ok.stat.path, "c/d.md");
 	const caseOnly = await vault.rename("b.md", P("B.md"), { t: "any" });
 	assert.equal(caseOnly.ok && caseOnly.stat.path, "B.md");
@@ -180,11 +179,11 @@ test("trash only, with precondition; removeEmptyFolder only removes empty folder
 	const { fake, vault } = setup();
 	fake.put("t/a.md", "A");
 	await fake.createFolder("t");
-	const stale = await vault.trash("t/a.md", "obsidian-trash", { t: "fingerprint", fingerprint: await fp("other") });
+	const stale = await vault.trash("t/a.md", "obsidian-trash", { t: "fingerprint", fingerprint: fp("other") });
 	assert.equal(stale.ok === false && stale.reason, "precondition");
 	await vault.removeEmptyFolder(P("t"));
 	assert.ok(fake.folders.has("t"), "non-empty folder kept");
-	const ok = await vault.trash("t/a.md", "system-trash", { t: "fingerprint", fingerprint: await fp("A") });
+	const ok = await vault.trash("t/a.md", "system-trash", { t: "fingerprint", fingerprint: fp("A") });
 	assert.equal(ok.ok, true);
 	assert.deepEqual(fake.trashed, [{ path: "t/a.md", system: true }]);
 	await vault.removeEmptyFolder(P("t"));

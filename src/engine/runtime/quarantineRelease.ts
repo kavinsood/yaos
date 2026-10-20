@@ -78,7 +78,7 @@ export async function releaseQuarantine(c: EngineCtx, stream: StreamName): Promi
 const flights = new WeakMap<EngineCtx, Map<string, { again: boolean; p: Promise<number> }>>();
 function oneAtATime(c: EngineCtx, job: string, run: () => Promise<number>): Promise<number> {
 	let m = flights.get(c);
-	if (!m) flights.set(c, (m = new Map()));
+	if (!m) flights.set(c, (m = new Map<string, { again: boolean; p: Promise<number> }>()));
 	const cur = m.get(job);
 	if (cur) {
 		cur.again = true;

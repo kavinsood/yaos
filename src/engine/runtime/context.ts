@@ -161,36 +161,37 @@ export class EngineCtx {
 		this.deviceClass = opts.deviceClass ?? "desktop";
 		this.tuning = resolveTuning(opts.tuning);
 		this.budgets = resolveBudgets(this.deviceClass, opts.budgets);
-		const c = this;
+		// The deps getter below reads the live repo through this arrow: a getter's own `this` is the deps object.
+		const liveRepo = () => this.repo;
 		// §14.3: held (reader-dependent) until the keyring is open.
-		const staleCheck = (e: number, seq: Seq | null) => (c.keyring ? c.keyring.staleCheck(e, seq) : "hold" as const);
+		const staleCheck = (e: number, seq: Seq | null) => (this.keyring ? this.keyring.staleCheck(e, seq) : "hold" as const);
 		this.gateCtx = { crypto: opts.ports.crypto, vaultId: opts.vaultId, maxCheckpointStateBytes: this.tuning.maxCheckpointStateBytes, staleCheck, knownRules: this.tuning.knownRules };
 		// The one write gate (writeGate.ts): shut until the keyring is open, then whenever it reports key-missing.
-		const gate = (): KeyMissingReason | null => (c.keyring ? c.keyring.keyMissing() : "no-pin");
+		const gate = (): KeyMissingReason | null => (this.keyring ? this.keyring.keyMissing() : "no-pin");
 		this.gate = gate;
 		// Every blob write (upload, refresh PUT, GC delete) and every seal goes through the gate; every transfer is
 		// tied to the link.
 		const blob = this.blobLink.wrap(gatedBlob(opts.ports.blob, gate));
-		const crypto = gatedCrypto(opts.ports.crypto, gate, () => c.keyring?.noteSeal());
+		const crypto = gatedCrypto(opts.ports.crypto, gate, () => this.keyring?.noteSeal());
 		this.touch = new BlobTouch({
 			store: blob,
 			crypto,
 			hash: opts.ports.hash,
 			clock: opts.ports.clock,
 			graceMs: this.tuning.blobGcGraceMs,
-			times: () => c.repo,
-			committed: () => c.committedBlobs(),
+			times: () => this.repo,
+			committed: () => this.committedBlobs(),
 			blobBytes: (h) => opts.blobBytes?.(h) ?? Promise.resolve(null),
-			onReady: () => c.sender?.poke(),
-			diag: (code, fields) => c.diag(code, fields),
+			onReady: () => this.sender?.poke(),
+			diag: (code, fields) => this.diag(code, fields),
 		});
 		this.deps = {
 			get repo() {
-				return c.repo;
+				return liveRepo();
 			},
 			outbox: this.outbox,
-			resolveRef: (row) => resolveRefRow(c.deps, row),
-			nowMs: () => c.now(),
+			resolveRef: (row) => resolveRefRow(this.deps, row),
+			nowMs: () => this.now(),
 			gateCtx: this.gateCtx,
 			hash: opts.ports.hash,
 			crypto,
@@ -199,11 +200,11 @@ export class EngineCtx {
 			touch: this.touch,
 			self: opts.deviceId,
 			vaultId: opts.vaultId,
-			adoptFor: (d, f) => c.adoptFor(d, f),
-			diag: (code, fields) => c.diag(code, fields),
-			monotonic: () => c.mono(),
-			authorNsSeq: () => c.ns.coversSeq,
-			onForbidden: () => c.onForbidden(),
+			adoptFor: (d, f) => this.adoptFor(d, f),
+			diag: (code, fields) => this.diag(code, fields),
+			monotonic: () => this.mono(),
+			authorNsSeq: () => this.ns.coversSeq,
+			onForbidden: () => this.onForbidden(),
 		};
 	}
 

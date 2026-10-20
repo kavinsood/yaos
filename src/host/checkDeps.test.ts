@@ -1,10 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-// @ts-expect-error untyped .mjs script
 import { checkSource, scanImports, checkTree, mainReach } from "../../scripts/check-deps.mjs";
 
-type Result = { errors: string[]; warnings: string[] };
-const check = (file: string, text: string): Result => checkSource(file, text) as Result;
+const check = checkSource;
 
 test("scanImports: type-only detection and import forms", () => {
 	const r = scanImports(`
@@ -16,7 +14,7 @@ test("scanImports: type-only detection and import forms", () => {
 		import "./side";
 		const m = await import("./dyn");
 		// import { H } from "./commented";
-	`) as { spec: string; typeOnly: boolean }[];
+	`);
 	assert.deepEqual(
 		r.map((x) => [x.spec, x.typeOnly]),
 		[["../core/types", true], ["../core/types", true], ["./x", false], ["./y", true], ["./z", false], ["./side", false], ["./dyn", false]],
@@ -60,7 +58,7 @@ test("§k.2 rules", () => {
 });
 
 test("the tree passes", () => {
-	const r = checkTree() as { files: number; errors: string[]; warnings: string[] };
+	const r = checkTree();
 	assert.deepEqual(r.errors, []);
 	assert.deepEqual(r.warnings, []);
 	assert.ok(r.files > 10);
@@ -73,7 +71,7 @@ test("no CRDT on the main thread: host/** never imports yjs, y-codemirror.next, 
 		assert.equal(check("host/binding.test.ts", `import * as M from "${spec}";`).errors.length, 1, `${spec} in a host test`);
 		assert.equal(check("engine/body/a.ts", `import * as M from "${spec}";`).errors.length, spec.startsWith("y-") ? 1 : 0, `engine ${spec}`);
 	}
-	const reach = (files: Record<string, string>) => mainReach(new Map(Object.entries(files))) as string[];
+	const reach = (files: Record<string, string>) => mainReach(new Map(Object.entries(files)));
 	const viaCore = reach({
 		"host/a.ts": `import { f } from "../core/b";`,
 		"core/b.ts": `import { g } from "./c";`,
@@ -98,7 +96,7 @@ test("no hashing on the main thread: product host/** never imports or reaches co
 	assert.equal(check("host/keys/secretStore.ts", `import { sha256Hex } from "../../core/hash/sha256";`).errors.length, 1);
 	assert.equal(check("host/keys/secretStore.ts", `import { bytesToHex } from "../../core/codec/lib0";`).errors.length, 0, "hex is not hashing");
 	assert.equal(check("engine/body/a.ts", `import { sha256 } from "../../core/hash/sha256";`).errors.length, 0, "the engine hashes");
-	const reach = (files: Record<string, string>) => mainReach(new Map(Object.entries(files))) as string[];
+	const reach = (files: Record<string, string>) => mainReach(new Map(Object.entries(files)));
 	const viaCore = reach({
 		"host/a.ts": `import { f } from "../core/b";`,
 		"core/b.ts": `import { g } from "./hash/sha256";`,
@@ -124,7 +122,7 @@ test("no engine on the main thread: the plugin's one carrier is the worker", () 
 	assert.equal(check("sim/device.ts", `import { createInlinePair } from "../protocol/inlineTransport";`).errors.length, 0, "the sim");
 	assert.equal(check("protocol/transports.test.ts", `import { createInlinePair } from "./inlineTransport";`).errors.length, 0);
 	// Transitive: through core/ports/protocol (or another host module) is as bad as direct.
-	const reach = (files: Record<string, string>) => mainReach(new Map(Object.entries(files))) as string[];
+	const reach = (files: Record<string, string>) => mainReach(new Map(Object.entries(files)));
 	const viaProtocol = reach({
 		"host/engineHost.ts": `import { createWorkerHostTransport } from "../protocol/workerTransport";`,
 		"protocol/workerTransport.ts": `import { Inbox } from "./inlineTransport";`,

@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { DeviceId, StreamName } from "../core/types";
+import type { StreamName } from "../core/types";
 import { VirtualClock } from "./clock";
 import { SimDevice, type SimDeviceOptions } from "./device";
 import { SimNet } from "./net";
@@ -44,7 +44,7 @@ async function typeIn(clock: VirtualClock, d: SimDevice, path: string, text: str
 }
 
 function fanout(net: SimNet, d: SimDevice): { pushedRows: number; skippedRows: number } {
-	return net.relay.fanout(d.deviceId as DeviceId);
+	return net.relay.fanout(d.deviceId);
 }
 
 test("a note the peer has not open reaches it as skips, is read and lands on its disk; once open it is pushed", async () => {
@@ -56,8 +56,8 @@ test("a note the peer has not open reaches it as skips, is read and lands on its
 
 	assert.ok(a.workspace.openFile("n.md"));
 	await clock.advance(2_000);
-	assert.ok(net.relay.subscriptionsOf(a.deviceId as DeviceId).every((s) => s?.includes(stream)), "A subscribed to its open note");
-	assert.ok(net.relay.subscriptionsOf(b.deviceId as DeviceId).every((s) => s !== null && !s.includes(stream)), "B subscribed, not to it");
+	assert.ok(net.relay.subscriptionsOf(a.deviceId).every((s) => s?.includes(stream)), "A subscribed to its open note");
+	assert.ok(net.relay.subscriptionsOf(b.deviceId).every((s) => s !== null && !s.includes(stream)), "B subscribed, not to it");
 	const before = fanout(net, b);
 	await typeIn(clock, a, "n.md", "typed while B has it closed");
 	await clock.advance(15_000);
@@ -113,7 +113,7 @@ test("a relay restart keeps a small set (attachment); one that loses it is empty
 	assert.ok(b.workspace.openFile("n.md"));
 	await clock.advance(2_000);
 	const stream = streamOf(b, "n.md");
-	const subs = () => net.relay.subscriptionsOf(b.deviceId as DeviceId);
+	const subs = () => net.relay.subscriptionsOf(b.deviceId);
 	assert.deepEqual(subs(), [[stream]]);
 
 	net.relay.restart();

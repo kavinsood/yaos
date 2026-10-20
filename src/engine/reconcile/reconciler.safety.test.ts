@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { VaultPath } from "../../core/types";
 import { World } from "./testkit/world";
 
-const P = (s: string): VaultPath => s as VaultPath;
+const P = (s: string): VaultPath => s;
 
 async function withDoc(path: string, text: string): Promise<{ w: World; id: ReturnType<World["log"]["remoteCreate"]> }> {
 	const w = new World();
@@ -88,7 +88,7 @@ test("remote delete of a locally edited file is not trashed (edit wins: restore)
 	assert.equal(w.vault.trashed.length, 0);
 	const live = w.log.liveByPath(P("keep.md"));
 	assert.ok(live, "the file is live in the namespace again");
-	assert.equal(w.log.text(live!), "v1\nmine\n");
+	assert.equal(w.log.text(live), "v1\nmine\n");
 });
 
 test("local delete -> nsDelete; local rename -> nsRename (no disk ops)", async () => {

@@ -142,6 +142,7 @@ function invalidPath(path: string): string | null {
 	for (const seg of path.split("/")) {
 		if (seg === "" || seg === "." || seg === "..") return `bad segment "${seg}"`;
 	}
+	// eslint-disable-next-line no-control-regex -- matching C0 controls and DEL is the point of this pattern
 	if (/[\u0000-\u001f\u007f]/.test(path)) return "control character";
 	return null;
 }

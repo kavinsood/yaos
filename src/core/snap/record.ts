@@ -136,7 +136,8 @@ export function snapRecordProblem(r: SnapRecord): string | null {
 	if (!isCount(r.fileCount, SNAP_MAX_FILES)) return "fileCount";
 	if (!isCount(r.totalBytes, SNAP_MAX_TOTAL_BYTES)) return "totalBytes";
 	if (!HEX64_RE.test(r.bundleDigest)) return "bundleDigest";
-	if (!Array.isArray(r.parts) || r.parts.length < 1 || r.parts.length > SNAP_MAX_PARTS) return "partCount";
+	// Checked through `unknown`: Array.isArray narrows a readonly array to any[], untyping the loop below.
+	if (!Array.isArray(r.parts as unknown) || r.parts.length < 1 || r.parts.length > SNAP_MAX_PARTS) return "partCount";
 	let sum = 0;
 	for (const p of r.parts) {
 		if (!HEX64_RE.test(p.address) || !HEX64_RE.test(p.sha256)) return "part address/sha256";

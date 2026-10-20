@@ -225,7 +225,7 @@ test("blob store stall, no link loss: the idle window ends the call at BLOB_TRAN
 	assert.ok(await clock.runUntil(() => net.blobs.transfers().length > 0, 20_000));
 	const [call] = net.blobs.transfers();
 	assert.equal(call?.route, "has", "the upload asks exists first");
-	const t0 = call!.startedAt;
+	const t0 = call.startedAt;
 	await clock.advance(t0 + BLOB_TRANSFER_IDLE_MS - 1 - clock.monotonic());
 	assert.equal(net.blobs.liveness.watchdog, 0, "nothing ended at idle - 1 ms");
 	assert.equal(net.blobs.transfers().length, 1);

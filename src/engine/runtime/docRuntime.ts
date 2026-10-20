@@ -96,10 +96,10 @@ export class DocRuntime {
 		if (h.cls === "body") {
 			const ytext = h.doc.getText("text");
 			ytext.observe((ev, tr) => {
-				const hook = this.c.opts.onBoundText;
-				if (h.bound === 0 || !hook) return;
+				const opts = this.c.opts;
+				if (h.bound === 0 || !opts.onBoundText) return;
 				// ev.delta walks the text's items (yjs 13.6.29 src/types/YText.js:655-839): worker-side cost, main gets O(change) JSON.
-				hook(h.docId, deltaToChanges(ev.delta, ytext.length), ytext.length, boundOrigin(tr.origin));
+				opts.onBoundText(h.docId, deltaToChanges(ev.delta, ytext.length), ytext.length, boundOrigin(tr.origin));
 			});
 		}
 		h.doc.on("update", (u: Uint8Array, origin: unknown) => {

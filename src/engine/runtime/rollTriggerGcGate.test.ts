@@ -13,7 +13,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { sha256HexRef } from "../../core/hash/testkit/hashRef";
-import { KEYRING_STREAM, NS_STREAM, type ContentHash, type DocId, type NsOp, type VaultPath } from "../../core/types";
+import { KEYRING_STREAM, NS_STREAM, type ContentHash, type DocId, type NsOp } from "../../core/types";
 import type { BlobAddress } from "../../ports/crypto";
 import type { RelayPort, RelaySession } from "../../ports/relay";
 import { SimBlobStore } from "../../sim/blobStore";
@@ -35,7 +35,7 @@ const H = (b: Uint8Array) => sha256HexRef(b) as ContentHash;
 const bytesOf = (i: number): Uint8Array => Uint8Array.from({ length: 48 }, (_, j) => (j === 0 ? i >> 8 : j === 1 ? i : i * 7 + j) & 0xff);
 let docN = 0;
 const newDoc = () => `rtgdoc${String(++docN).padStart(16, "0")}` as DocId;
-const createBlob = (docId: DocId, hash: ContentHash): NsOp => ({ t: "create", docId, kind: "blob", path: `att/${docId}.png` as VaultPath, contentHash: hash, size: 48 });
+const createBlob = (docId: DocId, hash: ContentHash): NsOp => ({ t: "create", docId, kind: "blob", path: `att/${docId}.png`, contentHash: hash, size: 48 });
 
 /** Session `feed` calls wait while `held` (the first step of a session start, before its `k` read). */
 class FeedHold implements RelayPort {
@@ -46,12 +46,11 @@ class FeedHold implements RelayPort {
 		const r = await this.inner.connect(params);
 		if (!r.ok) return r;
 		const s = r.session;
-		const self = this;
 		const session = new Proxy(s, {
-			get(t, p) {
+			get: (t, p) => {
 				if (p === "feed") {
 					return async (after: Parameters<RelaySession["feed"]>[0]) => {
-						while (self.held) await new Promise<void>((res) => self.waiting.push(res));
+						while (this.held) await new Promise<void>((res) => this.waiting.push(res));
 						return t.feed(after);
 					};
 				}

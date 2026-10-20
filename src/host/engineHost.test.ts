@@ -345,7 +345,7 @@ test("liveness: one missed pong (an engine frozen with the app) is retried at on
 	await h.clock.advance(5 * PING_INTERVAL_MS);
 	assert.deepEqual(h.fatals, []);
 	assert.equal(h.host.isReady, true);
-	assert.ok(h.engines[0]!.received.filter((m) => m.t === "ping").length >= 4, "pings resumed");
+	assert.ok(h.engines[0].received.filter((m) => m.t === "ping").length >= 4, "pings resumed");
 });
 
 test("liveness idle backoff: answered pings with no traffic double the interval up to PING_IDLE_MAX_MS; anything main sends returns it to PING_INTERVAL_MS", async () => {

@@ -303,7 +303,7 @@ test("stop: the sweep's signal reaches the probe upload; a store call that honou
 		deleteIfUploadedBefore: (a, t, s) => sim.deleteIfUploadedBefore(a, t, s),
 		put: (_a, _parts, signal) => new Promise<void>((_resolve, reject) => {
 			probeSignal = signal;
-			signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+			signal?.addEventListener("abort", () => reject(signal.reason as unknown), { once: true });
 		}),
 	};
 	let out: Awaited<ReturnType<typeof sweepBlobs>> | "pending" = "pending";

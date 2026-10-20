@@ -136,9 +136,15 @@ export default class YaosPlugin extends Plugin {
 		});
 	}
 
-	async onunload(): Promise<void> {
+	/**
+	 * Settles once the engine stopped after onunload. Obsidian calls onunload without awaiting it (Plugin.onunload is
+	 * void), so the stop runs on; the build's plugin smoke (scripts/plugin-smoke.mjs) awaits this to check it.
+	 */
+	unloaded: Promise<void> = Promise.resolve();
+
+	onunload(): void {
 		const c = this.controller;
 		this.controller = null;
-		await c?.stop();
+		if (c) this.unloaded = c.stop();
 	}
 }

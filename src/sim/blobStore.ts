@@ -218,7 +218,7 @@ export class SimBlobStore implements BlobPort {
 				c.tick = c.idle = null;
 				signal?.removeEventListener("abort", onAbort);
 				if (error === null) resolve();
-				else reject(error);
+				else reject(error as unknown); // `!== null` narrowed it to {}; it is still whatever the caller handed over
 			};
 			const onAbort = (): void => {
 				this.liveness.aborted++;

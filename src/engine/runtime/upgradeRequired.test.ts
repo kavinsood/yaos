@@ -68,7 +68,7 @@ async function writer(relay: SimRelay): Promise<Writer> {
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a-0123456789abcdef", tuning: TUNING });
 	const docs: string[] = [];
 	for (let i = 0; i < 6; i++) {
-		const path = `Notes/n${i}.md` as VaultPath;
+		const path = `Notes/n${i}.md`;
 		await createDoc(a, path, `body ${i}`);
 		docs.push(path);
 	}

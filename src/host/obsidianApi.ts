@@ -85,7 +85,7 @@ export interface VaultApi {
 
 export function tightBuffer(bytes: Uint8Array): ArrayBuffer {
 	if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength && bytes.buffer instanceof ArrayBuffer) return bytes.buffer;
-	return bytes.slice().buffer as ArrayBuffer;
+	return bytes.slice().buffer;
 }
 
 export function parentsOf(path: string): string[] {

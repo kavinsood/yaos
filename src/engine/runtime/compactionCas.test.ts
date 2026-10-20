@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as Y from "yjs";
-import type { StreamName } from "../../core/types";
 import type { PutCheckpointResult, RelaySession } from "../../ports/relay";
 import { CheckpointState, writeBodyCheckpoint } from "../body/checkpoints";
 import { compactBody } from "../body/compaction";
@@ -49,7 +48,7 @@ test("compaction exactness: snapshot = fold of (old snapshot + every tail row <=
 			await editDoc(b!, id, (t) => t.insert(0, `b${i};`));
 		}
 		await converged([a!, b!]);
-		const stream = a!.streamOf(id) as StreamName;
+		const stream = a!.streamOf(id);
 		for (const e of [a!, b!]) {
 			const rec = e.c.repo.stream(stream)!;
 			const { snapshot, tail } = await e.c.repo.loadStream(stream);

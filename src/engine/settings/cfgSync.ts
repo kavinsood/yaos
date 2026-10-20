@@ -234,8 +234,8 @@ export class CfgSync {
 	private async commitBases(actions: readonly CfgFileAction[]): Promise<void> {
 		await this.deps.db.tx([STORE.cfgBase], "readwrite", async (tx) => {
 			for (const a of actions) {
-				if (a.base) await tx.put(STORE.cfgBase, a.base satisfies CfgBaseRecord);
-				else await tx.delete(STORE.cfgBase, a.file);
+				if (a.base) tx.put(STORE.cfgBase, a.base satisfies CfgBaseRecord);
+				else tx.delete(STORE.cfgBase, a.file);
 			}
 		});
 	}

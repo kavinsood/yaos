@@ -221,7 +221,7 @@ function tokenDiffRange(
 	return hunks.map((h) => ({
 		start: ta.offsets[h.aStart]!,
 		end: ta.offsets[h.aEnd]!,
-		text: to.slice(tb.offsets[h.bStart]!, tb.offsets[h.bEnd]!),
+		text: to.slice(tb.offsets[h.bStart], tb.offsets[h.bEnd]),
 	}));
 }
 

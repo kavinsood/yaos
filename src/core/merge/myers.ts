@@ -280,7 +280,7 @@ export function lineDiff(a: string, b: string, budget: MyersBudget = LINE_BUDGET
 		edits: hunks.map((h) => ({
 			start: la.offsets[h.aStart]!,
 			end: la.offsets[h.aEnd]!,
-			text: b.slice(lb.offsets[h.bStart]!, lb.offsets[h.bEnd]!),
+			text: b.slice(lb.offsets[h.bStart], lb.offsets[h.bEnd]),
 		})),
 	};
 }

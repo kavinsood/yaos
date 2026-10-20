@@ -71,7 +71,7 @@ test("putSealed: one object at blobAddress(sha256) (never the hash), deduped by 
 	assert.equal(store.puts, 1);
 	const [key] = [...store.objects.keys()];
 	assert.equal(key, await w.blobAddress(hash));
-	assert.ok(!key!.includes(hash), "the plaintext hash never appears in the key");
+	assert.ok(!key.includes(hash), "the plaintext hash never appears in the key");
 	assert.equal(storePlaintextCap(w, store), maxSealedBlobPlaintext(10 * MIB));
 	assert.equal(storePlaintextCap(w, store), 10_223_615, "39 x 256 KiB - 1");
 	assert.equal(storePlaintextCap(createNoopCrypto(createWebHash()), store), 10 * MIB, "suite 0: the transport cap");

@@ -35,7 +35,8 @@ export function realMacrotask(): () => Promise<void> {
 	const g: object = globalThis;
 	const si = "setImmediate" in g ? g.setImmediate : undefined;
 	if (typeof si === "function") {
-		return () => new Promise<void>((resolve) => void si(resolve));
+		const setImmediate = si as (cb: () => void) => unknown;
+		return () => new Promise<void>((resolve) => void setImmediate(resolve));
 	}
 	if (typeof MessageChannel === "function") {
 		const MC = MessageChannel;
