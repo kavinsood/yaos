@@ -8,7 +8,9 @@
  *  - follow-up: while a pass was productive (actionable > 0 and ok > 0) the
  *    next one runs at once, up to `maxChained`, widened by the paths it vacated;
  *  - backoff: actionable ops with nothing succeeding retry after a growing
- *    delay; queued blob transfers retry at the blob queue's next due time;
+ *    delay (a pass that only started blob transfers does not reset it: the
+ *    write the transfer's wake runs may fail again); queued blob transfers
+ *    retry at the blob queue's next due time;
  *  - periodic: a full pass every `fullIntervalMs`, doubling (up to
  *    `fullIdleMaxMs`) while full passes find nothing to do; a docs request
  *    or a full pass with work resets it.
@@ -138,7 +140,10 @@ export class PassScheduler {
 			const productive = report.actionable > 0 && report.ok > 0;
 			// Unread files (disk read failed) are only re-planned by a later pass: retry with backoff.
 			if ((report.actionable > 0 && report.ok === 0 && report.held < report.actionable) || report.unread > 0) this.scheduleRetry();
-			else if (report.actionable === 0 || productive) this.failures = 0;
+			// A pass that only started (or joined) blob transfers proved nothing: its writes are decided by the pass the
+			// transfer's end wakes. Resetting here would let a write that fails after every download retry at the base
+			// delay, i.e. re-download the blob about once a second forever.
+			else if (productive || (report.actionable === 0 && report.transferring === 0)) this.failures = 0;
 			this.armBlobRetry();
 			if (productive && ++chained < max) {
 				// Follow-up pass over everything the last one touched (cheap enough: plans are linear).
@@ -156,17 +161,19 @@ export class PassScheduler {
 	private scheduleRetry(): void {
 		if (this.stopped || this.retry !== null) return;
 		this.failures++;
-		const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.min(10, this.failures - 1));
-		this.retry = this.deps.clock.setTimer(delay, () => {
-			this.retry = null;
-			this.request({ t: "full" }, true);
-		});
+		// A blob transfer due sooner is what the pass waits on (its own backoff): no later than that.
+		const due = this.deps.nextBlobDueInMs();
+		const backoff = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.min(10, this.failures - 1));
+		this.armRetry(due === null ? backoff : Math.min(backoff, due + 5));
 	}
 
 	private armBlobRetry(): void {
 		const due = this.deps.nextBlobDueInMs();
 		if (due === null || this.retry !== null || this.stopped) return;
-		const delay = due + 5;
+		this.armRetry(due + 5);
+	}
+
+	private armRetry(delay: number): void {
 		this.retry = this.deps.clock.setTimer(delay, () => {
 			this.retry = null;
 			this.request({ t: "full" }, true);

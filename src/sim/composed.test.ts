@@ -637,3 +637,26 @@ test("a rename of the open note that loses to a concurrent remote move: the view
 	assert.ok(view?.isBound(), "the view is bound again");
 	assert.equal(view?.getText(), a.vault.textOf("r4.md"));
 });
+
+test("a downloaded attachment whose disk write keeps failing backs off: no re-download per base retry, and it lands once the disk heals", async () => {
+	// Each failed write throws its bytes away; the retry pass claims a fresh download and only starts it. That pass must
+	// not count as a success for the scheduler's backoff (before: ~1 GET per second, 601 in 10 min, forever).
+	const { clock, net, devs } = world({ settings: () => ATTACH });
+	const [a, b] = pair(devs);
+	let broken = true;
+	const write = b.vault.write.bind(b.vault);
+	b.vault.write = async (path, data, pre) =>
+		broken && path === "img/p.png" ? { ok: false, reason: "io", current: null, message: "EIO (test)" } : write(path, data, pre);
+	const want = bytes(5_000, 1);
+	a.vault.externalWrite("img/p.png", want);
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.hasFile("img/p.png"), false);
+	const g0 = net.blobs.calls.get;
+	await clock.advance(10 * 60_000);
+	const gets = net.blobs.calls.get - g0;
+	assert.ok(gets >= 5 && gets <= 20, `GETs in 10 min of failing writes: ${gets} (the pass retry backs off to 60 s)`);
+	broken = false;
+	await clock.advance(2 * 60_000);
+	await same(a, b, "img/p.png", want);
+});

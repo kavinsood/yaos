@@ -111,3 +111,51 @@ test("passScheduler: without fullIdleMaxMs the periodic pass keeps its interval"
 	}
 	h.s.stop();
 });
+
+test("passScheduler: a pass that only starts blob transfers keeps the failure backoff (a write failing after each download backs off)", async () => {
+	// fail (write after the download) -> retry -> re-claims the download (transferring only) -> its end's wake -> fail ...
+	const fail = () => report({ actionable: 1, ok: 0, failed: 1 });
+	const fetching = () => report({ actionable: 0, transferring: 1 });
+	const h = harness([fail(), fetching(), fail(), fetching(), fail()]);
+	const wake = async (): Promise<void> => {
+		h.s.request({ t: "docs", docIds: ["d1" as never], pathKeys: [] });
+		await h.step(10);
+	};
+	await wake();
+	assert.equal(h.scopes.length, 1);
+	const retryAfter = async (ms: number): Promise<void> => {
+		const n = h.scopes.length;
+		await h.step(ms - 1);
+		await h.step(0); // a retry timer that fired only kicks the pass (a 0 ms timer)
+		assert.equal(h.scopes.length, n, `no retry before ${ms} ms`);
+		await h.step(1);
+		await h.step(0);
+		assert.equal(h.scopes.length, n + 1, `retry at ${ms} ms`);
+	};
+	await retryAfter(1_000); // the retry pass re-claims the download
+	await wake(); // the download's end: its write fails again
+	assert.equal(h.scopes.length, 3, "the wake runs at once (no added latency)");
+	await retryAfter(2_000);
+	await wake();
+	assert.equal(h.scopes.length, 5);
+	await retryAfter(4_000);
+	h.s.stop();
+});
+
+test("passScheduler: a quiet pass (nothing actionable, nothing transferring) resets the failure backoff", async () => {
+	const h = harness([report({ actionable: 1, ok: 0 }), report(), report({ actionable: 1, ok: 0 })]);
+	h.s.request();
+	await h.step(10);
+	await h.step(1_000);
+	await h.step(0);
+	assert.equal(h.scopes.length, 2, "retry at 1 s; that pass is quiet");
+	h.s.request({ t: "docs", docIds: ["d1" as never], pathKeys: [] });
+	await h.step(10);
+	assert.equal(h.scopes.length, 3);
+	await h.step(999);
+	assert.equal(h.scopes.length, 3);
+	await h.step(1);
+	await h.step(0);
+	assert.equal(h.scopes.length, 4, "back at the 1 s base");
+	h.s.stop();
+});
