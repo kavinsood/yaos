@@ -115,6 +115,37 @@ export function restartAtCreate(s: SyncedEntry, createHash: ContentHash): Synced
 	return { ...s, contentHash: createHash, bodyVersion: null, hasBase: s.hasBase && s.contentHash === createHash };
 }
 
+/**
+ * A file at a synced record's path that no planner row takes a fresh docId for: the record's bytes, not a decided
+ * delete (fileGone), and a doc either present in the tree or seen committed (nsTouchSeq > 0). Every row that takes
+ * one runs on a file this is false for, or one with no record: the pruned row's re-create (absent, nsTouchSeq 0: an
+ * own create the fold ignored, sim seed 222), the both-changed and no-base conflict copies, a new file (also one at a
+ * fileGone path). The pruned row decides by it (absent: remotePresent false) and freshIdBudget counts by it, so the
+ * planner and the reconciler's budget cannot drift.
+ */
+export function takesNoFreshId(s: Pick<SyncedEntry, "contentHash" | "nsTouchSeq" | "fileGone">, fileHash: ContentHash | null, remotePresent: boolean): boolean {
+	return fileHash === s.contentHash && s.fileGone !== true && (s.nsTouchSeq > 0 || remotePresent);
+}
+
+/**
+ * Upper bound of the fresh docIds a plan over these trees can consume (PlannerInput.freshDocIds): one per non-excluded
+ * local file that not every synced record at its path covers (takesNoFreshId), a file with no record included. A
+ * path holding several records (an ignored own create next to its folded twin) counts if any of them does not. A
+ * merged doc counts as absent (its winner may be). Kept tight: every id is a random draw, and seeded runs replay them.
+ */
+export function freshIdBudget(synced: ReadonlyMap<DocId, SyncedEntry>, local: ReadonlyMap<PathKey, LocalEntry>, remote: ReadonlyMap<DocId, RemoteEntry>): number {
+	const covered = new Map<PathKey, boolean>();
+	for (const s of synced.values()) {
+		const l = local.get(s.pathKey);
+		const r = remote.get(s.docId);
+		const ok = l !== undefined && takesNoFreshId(s, l.hash, r !== undefined && r.state !== "merged");
+		covered.set(s.pathKey, (covered.get(s.pathKey) ?? true) && ok);
+	}
+	let n = 0;
+	for (const l of local.values()) if (!l.excluded && covered.get(l.pathKey) !== true) n++;
+	return n;
+}
+
 export const plan: PlanFn = (input) => planWith(input);
 
 /**
@@ -480,7 +511,7 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		// is then an own create the fold ignored (replay-duplicate, duplicate-docid, ...), not a prune: the file is
 		// created anew instead of trashed, as a changed file is below. The worst case of the rule is a resurrection
 		// (an own create that did fold, was deleted elsewhere and pruned before S1 ran), never a loss.
-		if (l.hash === s.contentHash && s.nsTouchSeq > 0) {
+		if (takesNoFreshId(s, l.hash, false)) {
 			return push([...prefix, { op: "diskTrash", docId: s.docId, path: l.path, expect: { t: "hash", hash: s.contentHash } }, drop(s.docId)],
 				"diskTrash", brakeKey("diskTrash", s.docId, l.path, s.contentHash), l.path);
 		}

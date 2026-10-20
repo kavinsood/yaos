@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { DocId, LocalEntry, Plan, PlannerInput, PlannerOp, RemoteEntry, SyncedEntry } from "../types";
-import { EMPTY_CONTENT_HASH, plan, planWith } from "./planner";
+import { EMPTY_CONTENT_HASH, freshIdBudget, plan, planWith } from "./planner";
 import { brakeId, DEFAULT_BRAKE } from "./brake";
 import { refHashPort } from "../hash/testkit/hashRef";
 import { L, R, S, V, fp, h, id, input, pk, type Scenario } from "./testkit/planFixtures";
@@ -13,7 +13,17 @@ const find = <K extends PlannerOp["op"]>(p: Plan, k: K): Extract<PlannerOp, { op
 	assert.ok(op, `expected op ${k} in ${JSON.stringify(opsOf(p))}`);
 	return op as Extract<PlannerOp, { op: K }>;
 };
-const run = (sc: Scenario, ctx = {}): Plan => planWith(input(sc), ctx);
+/**
+ * Every plan here also checks the reconciler's fresh-docId budget: a row taking more ids than freshIdBudget counts is
+ * starved in the engine (takeFresh returns null), however many ids the fixture hands it (d1f8a750's pruned re-create).
+ */
+const run = (sc: Scenario, ctx = {}): Plan => {
+	const inp = input(sc);
+	const p = planWith(inp, ctx);
+	const budget = freshIdBudget(inp.synced, inp.local, inp.remote);
+	assert.ok(p.consumedDocIds <= budget, `plan took ${p.consumedDocIds} fresh docIds, freshIdBudget allows ${budget}: ${JSON.stringify(p.ops)}`);
+	return p;
+};
 
 // ---------------------------------------------------------------------------
 // Row: live | present | present
@@ -351,6 +361,16 @@ test("a file another doc's observed rename brought onto a fileGone path is that 
 	// next pass, d2's record at r6: still not d1's file
 	const next = planWith(input({ remote: [edited, R("d2", "r6.md")], synced: [gone1, S("d2", "r6.md", { contentHash: h("c5") })], local: [L("r6.md", h("c5"))] }));
 	assert.ok(!next.ops.some((o) => "docId" in o && o.docId === "d1" && o.op !== "wait"), JSON.stringify(next.ops));
+});
+
+test("a file renamed onto a fileGone path with the gone doc's bytes is a new file, and the fresh-id budget counts it", () => {
+	// The file is new (goneHere -> planNewLocal takes a fresh docId) although it matches the synced record at its path
+	// by hash. A budget that counted only files differing from their record by hash handed this plan no id: the file
+	// was never created and never synced (the guard in run() checks consumedDocIds <= freshIdBudget).
+	const gone = { ...S("d1", "a.md"), fileGone: true as const };
+	const p = run({ remote: [R("d1", "a.md", { state: "deleted", deletedSeq: 9 })], synced: [gone], local: [L("a.md", h("c0"))], over: { renames: [{ from: "b.md", to: "a.md", atMs: 5 }] } });
+	assert.deepEqual(opsOf(p), ["nsCreate", "reconcileContent", "syncedDrop"]);
+	assert.equal(find(p, "nsCreate").path, "a.md");
 });
 
 test("row live/present/absent: a delete that waits marks fileGone; a file re-created at the path is new, not a save", () => {

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { VirtualClock } from "./clock";
 import { SimDevice, type SimDeviceOptions } from "./device";
 import { SimNet } from "./net";
+import { newDocId } from "../core/codec/ids";
+import { hashBytes } from "../engine/reconcile/localState";
 
 function world(opts: Partial<SimDeviceOptions> = {}, names = ["A", "B"]): { clock: VirtualClock; net: SimNet; devs: SimDevice[] } {
 	const clock = new VirtualClock();
@@ -200,4 +202,34 @@ test("same path created on both devices while offline: one keeps the doc, the ot
 	const all = [...a.vault.snapshot().values(), ...b.vault.snapshot().values()].join("|");
 	assert.ok(all.includes("from A") && all.includes("from B"), "no text lost");
 	assert.deepEqual([...a.vault.snapshot().keys()].sort(), [...b.vault.snapshot().keys()].sort());
+});
+
+test("an own create the fold ignored (synced, nsTouchSeq 0, absent remotely) is created anew and reaches B (sim seed 222)", async () => {
+	// The planner's pruned row re-creates the unchanged file under a fresh docId (d1f8a750). The reconciler budgets
+	// fresh docIds per pass; a budget that misses this file starves the row: nothing trashed, nothing created, and the
+	// file stays on A forever. The real reconcile loop runs here, not the planner with hand-fed ids.
+	const { clock, devs } = world();
+	const a = dev(devs, 0);
+	const b = dev(devs, 1);
+	a.vault.userWrite("seed.md", "seed\n");
+	await boot(clock, devs);
+	await clock.advance(2_000);
+	assert.equal(b.vault.textOf("seed.md"), "seed\n");
+	const rec = a.vrt?.rec;
+	assert.ok(rec);
+	const text = "b1 body\n";
+	const h = await hashBytes(rec.ctx.deps.hash, "markdown", new TextEncoder().encode(text));
+	const docId = newDocId(rec.ctx.deps.random);
+	// The S an own nsCreate leaves before S1 (nsTouchSeq 0), for a create that folded as ignored (replay-duplicate):
+	// absent from the tree, never pending, never to fold. Put with the file in one turn: no pass sees one without the other.
+	rec.ctx.store.synced.set(docId, rec.ctx.record({
+		docId, path: "b1.md", pathKey: rec.ctx.pk("b1.md"), kind: "markdown", contentHash: h.hash, fingerprint: h.fingerprint,
+		size: text.length, mtimeMs: clock.now(), bodyVersion: null, blobRev: 0, nsTouchSeq: 0, hasBase: false,
+	}));
+	a.vault.userWrite("b1.md", text);
+	await clock.advance(10_000);
+	assert.equal(a.vault.textOf("b1.md"), text, "never trashed on A");
+	assert.equal(b.vault.textOf("b1.md"), text, "re-created and synced to B");
+	assert.equal(rec.ctx.store.synced.has(docId), false, "the ignored create's S is dropped");
+	assert.equal(a.vault.trashed.length + b.vault.trashed.length, 0);
 });

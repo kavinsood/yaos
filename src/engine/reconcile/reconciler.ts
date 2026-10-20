@@ -15,7 +15,7 @@
 import { newDocId } from "../../core/codec/ids";
 import type { BrakeReport, DocId, PathKey, PlanScope, PlannerInput, PlannerOp } from "../../core/types";
 import { brakeId, brakeIdentity, rejectHeld } from "../../core/plan/brake";
-import { EMPTY_CONTENT_HASH, planWith } from "../../core/plan/planner";
+import { EMPTY_CONTENT_HASH, freshIdBudget, planWith } from "../../core/plan/planner";
 import type { VaultEvent } from "../../ports/vault";
 import type { LocalObservation } from "../../protocol/messages";
 import { Ctx, type ReconcilerDeps } from "./context";
@@ -118,15 +118,6 @@ export class Reconciler {
 		return out;
 	}
 
-	/** Upper bound of fresh docIds a plan can consume: local files not matching their synced state. */
-	private freshNeed(): number {
-		const syncedByKey = new Map<PathKey, string>();
-		for (const s of this.ctx.store.synced.values()) syncedByKey.set(s.pathKey, s.contentHash);
-		let n = 0;
-		for (const l of this.ctx.local.values()) if (!l.excluded && syncedByKey.get(l.pathKey) !== l.hash) n++;
-		return n;
-	}
-
 	/** One reconcile round: intents, hashes, plan, run. */
 	async pass(scope: PlanScope = { t: "full" }): Promise<PassReport> {
 		const blobs = this.ctx.deps.blobs;
@@ -158,7 +149,7 @@ export class Reconciler {
 		this.scan.dirty.clear();
 		ctx.echo.sweep();
 		const view = ctx.log.view();
-		const freshDocIds = this.freshIds(this.freshNeed());
+		const freshDocIds = this.freshIds(freshIdBudget(ctx.store.synced, ctx.local, view.remote));
 		// A snapshot: renames observed while this plan runs (its awaits) are for the next plan, not dropped with these.
 		const renames = [...ctx.renames];
 		const input: PlannerInput = {
