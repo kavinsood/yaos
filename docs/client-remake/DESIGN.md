@@ -603,7 +603,9 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
      the delete, step 5 drops an unsent delete, and a peer's file may never have received it. The base cannot tell
      such content from content added in the new epoch.
 5. Drops the old outbox. Its edits are on disk, so the scan re-derives them.
-6. Deletes the old DB once the new one reaches `live`.
+6. Deletes the old DB once the new one reaches `live`: every DB of this vault and device under another epoch, so one
+   that a crash left behind after the new DB was created goes too (a restart then opens the new DB without migrating;
+   two DBs would block every offline start, §e.1).
 
 ### c.13 Fold outcomes → planner duties
 

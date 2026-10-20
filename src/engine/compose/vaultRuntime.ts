@@ -85,8 +85,6 @@ export interface VaultRuntimeStart {
 	readonly onDiag?: (event: DiagnosticsEvent) => void;
 	/** Path-keyed bases carried over an epoch migration (§c.12 step 3), stored in the new DB (epochBases.ts). */
 	readonly pathBases?: readonly MetaPathBase[] | null;
-	/** Old epoch whose DB is deleted once the new one reaches live (§c.12 step 6). */
-	readonly retireEpoch?: VaultEpoch | null;
 	/** Highest own ns / cfg frameNo of the old epoch (§c.12 step 3, e2ee-design §8.2). */
 	readonly frameNoFloor?: FrameNoFloor | null;
 }
@@ -405,7 +403,7 @@ export class VaultRuntime {
 			this.port.nsCaughtUp = true;
 			this.port.invalidate();
 			this.sched.request({ t: "full" });
-			if (this.o.retireEpoch) void ops.retireOldEpoch(this, this.o.retireEpoch);
+			void ops.retireOldEpochs(this);
 		}
 		if (s.phase === "epoch-migrating" && !this.migrating) {
 			this.migrating = true;

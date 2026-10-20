@@ -460,6 +460,9 @@ test("epoch reset, app crash after the migration and before its merges: the old 
 
 	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "one\nfrom B\n"]], `${d.name}`);
 	assert.equal(a.vrt?.bases.keys.size, 0, "the base is retired once x.md is settled");
+	// The crash also came before the old DB's retirement. Two DBs make every later start wait for the relay to name
+	// the epoch (knownEpoch.ts: no offline start), and the old one was never deleted: it is, once the new one is live.
+	assert.deepEqual((await a.storage.listDatabases()).map((n) => n.split(":")[2]), ["sim-epoch-2"]);
 	const o = await net.oracle();
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]), [["x.md", "one\nfrom B\n"]]);
 });

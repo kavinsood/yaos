@@ -117,7 +117,7 @@ export class ComposedEngine {
 	/** The device check running (one at a time); aborted by dispose. */
 	private deviceChecking: AbortController | null = null;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
-	private migration: { bases: MetaPathBase[]; oldEpoch: VaultEpoch; frameNoFloor: FrameNoFloor } | null = null;
+	private migration: { bases: MetaPathBase[]; frameNoFloor: FrameNoFloor } | null = null;
 	private readonly offs: (() => void)[] = [];
 
 	constructor(readonly transport: EngineTransport, readonly options: CreateEngineOptions) {
@@ -252,7 +252,7 @@ export class ComposedEngine {
 					clientVersion: this.options.clientVersion ?? "dev", vaultEpoch: this.knownEpoch, reason,
 					tuning: this.options.tuning, budgets: this.options.budgets, paused: this.paused,
 					tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log, onDiag: this.options.onDiag,
-					pathBases: this.migration?.bases ?? null, retireEpoch: this.migration?.oldEpoch ?? null, frameNoFloor: this.migration?.frameNoFloor ?? null,
+					pathBases: this.migration?.bases ?? null, frameNoFloor: this.migration?.frameNoFloor ?? null,
 				});
 				if (this.disposed) {
 					await rt.stop();
@@ -353,7 +353,7 @@ export class ComposedEngine {
 				this.log(`epoch prepare failed: ${String(e)}`);
 				return [];
 			});
-			this.migration = { bases, oldEpoch: old.vaultEpoch, frameNoFloor };
+			this.migration = { bases, frameNoFloor };
 		}
 		this.rt = null;
 		this.options.onRuntime?.(null);

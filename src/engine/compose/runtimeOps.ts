@@ -5,13 +5,14 @@
 
 import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
-import { streamDocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import { streamDocId, type PathKey, type RemoteEntry, type StreamName, type VaultPath } from "../../core/types";
 import { ProtocolFailure } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
 import type { FrameNoFloor } from "../store/repo";
-import { dbName, STORE, type MetaPathBase } from "../store/schema";
+import { STORE, type MetaPathBase } from "../store/schema";
+import { parseDbName } from "./knownEpoch";
 import { readBase } from "../reconcile/store";
 import { pathBaseKey } from "./epochBases";
 import { KeyringRefusedError } from "../keyring/writeGate";
@@ -222,14 +223,30 @@ export function ownFrameNoFloor(rt: VaultRuntime): FrameNoFloor {
 	return { ns: c.ns.maxOwnFrameNo(c.outbox), cfg: c.cfg.maxOwnFrameNo(c.outbox) };
 }
 
-/** §c.12 step 6: the new epoch reached live; delete the old DB. */
-export async function retireOldEpoch(rt: VaultRuntime, old: VaultEpoch): Promise<void> {
-	if (old === rt.vaultEpoch) return;
-	const name = dbName(rt.o.config.vaultId, old, rt.o.config.deviceId);
+/**
+ * §c.12 step 6: the new epoch reached live; delete every other epoch's DB of this vault and device. Not only the one
+ * the migration left: a crash between the migration and this step leaves two DBs, the restart connects first
+ * (knownEpoch.ts) and opens the current one without migrating, and the old one would stay for good, every later
+ * start waiting for the relay to name the epoch. Once the new DB exists the old one holds nothing it needs: the
+ * bases were stored with the new DB's identity.
+ */
+export async function retireOldEpochs(rt: VaultRuntime): Promise<void> {
+	const { vaultId, deviceId } = rt.o.config;
+	let names: readonly string[];
 	try {
-		await rt.o.ports.storage.deleteDatabase(name);
-		rt.diag(`old epoch DB deleted`);
+		names = await rt.o.ports.storage.listDatabases();
 	} catch (e) {
-		rt.diag(`old epoch DB delete failed: ${String(e)}`);
+		rt.diag(`old epoch DB listing failed: ${String(e)}`);
+		return;
+	}
+	for (const name of names) {
+		const p = parseDbName(name);
+		if (!p || p.vaultId !== vaultId || p.deviceId !== deviceId || p.vaultEpoch === rt.vaultEpoch) continue;
+		try {
+			await rt.o.ports.storage.deleteDatabase(name);
+			rt.diag(`old epoch DB deleted`);
+		} catch (e) {
+			rt.diag(`old epoch DB delete failed: ${String(e)}`);
+		}
 	}
 }
