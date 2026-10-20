@@ -168,7 +168,8 @@ test("row live/present/absent: edit-beats-delete waits for rename inference (ns 
 	const edited = { remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] };
 	const renamed = { ...edited, local: [L("b.md", h("c0"))], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
 	const gone: PlannerOp = { op: "syncedPut", entry: { ...S("d1", "a.md"), fileGone: true } };
-	assert.deepEqual(run(renamed, { nsReady: false }).ops, [gone]); // the file left a.md either way
+	// the file left a.md either way; the mark keeps the observed rename (test below)
+	assert.deepEqual(run(renamed, { nsReady: false }).ops, [{ op: "syncedPut", entry: { ...S("d1", "a.md"), fileGone: true, renamedTo: { to: "b.md", atMs: 1 } } }]);
 	assert.deepEqual(run({ ...edited, over: { localComplete: false } }).ops, []);
 	assert.deepEqual(run({ ...edited, local: [L("z.md", null)] }).ops, [gone, { op: "needHash", path: "z.md" }]);
 	// once ns is ready the observed rename wins: nsRename + reconcile at the new path
@@ -191,6 +192,19 @@ test("observed rename wins over a new file at the source path; the new file is c
 	const next = run({ remote: [R("d1", "b.md")], synced: [S("d1", "b.md")], local: [L("a.md", h("c7")), L("b.md", h("c0"))] });
 	assert.deepEqual(opsOf(next), ["nsCreate", "reconcileContent"]);
 	assert.equal(find(next, "nsCreate").path, "a.md");
+});
+
+test("a rename onto the same path key (case only, or the same path) does not hold the doc's edits while ns is not ready", () => {
+	// Hot canvas seed 208 (suite 1): B, offline after an IDB loss, saw canvas/c0.canvas renamed to itself. The path
+	// counted as "left by a rename" (the file there may be new), so no pass merged the doc until ns was ready, and a
+	// record delete made meanwhile never reached the CRDT. The file at a same-key target is the renamed file itself.
+	const sc = { remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], local: [L("a.md", h("c9"))] };
+	for (const from of ["a.md", "A.md"]) {
+		const p = run({ ...sc, over: { renames: [{ from, to: "a.md", atMs: 1 }] } }, { nsReady: false });
+		assert.deepEqual(opsOf(p), ["reconcileContent"], from);
+	}
+	// a rename off the path to another key still holds it (the file at a.md may be new)
+	assert.deepEqual(run({ ...sc, over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } }, { nsReady: false }).ops, []);
 });
 
 test("a file at the remote-move target of a doc synced elsewhere is new: published, not orphaned", () => {
@@ -249,6 +263,25 @@ test("observed rename off a re-occupied source path wins over a concurrent remot
 	assert.ok(!opsOf(byHash).includes("nsRename"));
 });
 
+test("observed rename off a source path re-occupied by S's own bytes: the moved file merges with no base", () => {
+	// Sim hot canvas seed 0: A's user renamed boards/c2 -> boards/c1 while the engine recovered from an IDB wipe.
+	// The engine found boards/c2 gone before the rename event arrived and re-materialized the doc there (S = the
+	// projection, base included). The late event then moved S onto boards/c1, whose older bytes merged against the
+	// projection as the base: every record a peer had added since read as a local delete (B's node and its
+	// later edits were lost). S describes the file at the source, not the moved one.
+	const sc = { remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], over: { renames: [{ from: "a.md", to: "b.md", atMs: 1 }] } };
+	const p = run({ ...sc, local: [L("a.md", h("c0")), L("b.md", h("c3"))] });
+	assert.deepEqual(find(p, "nsRename"), { op: "nsRename", docId: "d1", path: "b.md" });
+	assert.deepEqual(find(p, "reconcileContent"), { op: "reconcileContent", docId: "d1", path: "b.md", kind: "markdown", hasBase: false, noBase: true });
+	// a new file of other bytes at the source: S still describes the moved file, its base stands
+	const other = run({ ...sc, local: [L("a.md", h("c7")), L("b.md", h("c3"))] });
+	assert.deepEqual(find(other, "reconcileContent"), { op: "reconcileContent", docId: "d1", path: "b.md", kind: "markdown", hasBase: true });
+	// canvas alike
+	const cv = { remote: [R("d1", "a.canvas")], synced: [S("d1", "a.canvas")], over: { renames: [{ from: "a.canvas", to: "b.canvas", atMs: 1 }] } };
+	const pc = run({ ...cv, local: [L("a.canvas", h("c0")), L("b.canvas", h("c3"))] });
+	assert.equal(find(pc, "reconcileContent").noBase, true);
+});
+
 test("row live/present/absent: remote edited -> diskMaterialize (edit beats delete); else nsDelete + syncedDrop", () => {
 	const edited = run({ remote: [R("d1", "a.md", { body: { ...R("d1", "a.md").body!, version: V(11) } })], synced: [S("d1", "a.md")] });
 	assert.deepEqual(edited.ops, [{ op: "diskMaterialize", docId: "d1", path: "a.md", expect: { t: "absent" } }]);
@@ -270,6 +303,54 @@ test("row live/present/absent: remote edited -> diskMaterialize (edit beats dele
 	// an unhashed new local file might be the renamed doc: no delete yet
 	const unhashed = run({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")], local: [L("z.md", null)] });
 	assert.deepEqual(unhashed.ops, [gone, { op: "needHash", path: "z.md" }]);
+});
+
+test("row live/present/absent: an observed rename that waits on ns survives an engine restart in the fileGone mark", () => {
+	// Sim hot canvas seed 705: B, offline after a crash (ns not ready), renamed c0 -> boards/c2, edited it and created
+	// a new c0. The pass marked the doc's file gone; the observed rename lived only in memory and a second crash
+	// dropped it. Online, the doc's file was gone and its path held a new file: edit beats delete merged the new
+	// canvas into the doc, deleting every record of the old one (A's concurrent text edit went with its node), and
+	// boards/c2 became a new doc.
+	const base = { remote: [R("d1", "a.canvas")], synced: [S("d1", "a.canvas")] };
+	const renames = [{ from: "a.canvas", to: "b.canvas", atMs: 7 }];
+	const waiting = run({ ...base, local: [L("b.canvas", h("c3"))], over: { renames } }, { nsReady: false });
+	const gone = { ...S("d1", "a.canvas"), fileGone: true as const, renamedTo: { to: "b.canvas", atMs: 7 } };
+	assert.deepEqual(waiting.ops, [{ op: "syncedPut", entry: gone }]);
+	// restarted (no observed renames), ns ready, a peer edited the doc, a new file at its old path
+	const edited = R("d1", "a.canvas", { body: { ...R("d1", "a.canvas").body!, version: V(11) } });
+	const after = run({ remote: [edited], synced: [gone], local: [L("a.canvas", h("c7")), L("b.canvas", h("c3"))] });
+	assert.deepEqual(find(after, "nsRename"), { op: "nsRename", docId: "d1", path: "b.canvas" });
+	assert.deepEqual(opsOf(after), ["nsRename", "reconcileContent"]);
+	assert.equal(find(after, "reconcileContent").path, "b.canvas");
+	// the new file at the old path is created once the doc's record has left it
+	const next = run({ remote: [R("d1", "b.canvas")], synced: [S("d1", "b.canvas", { contentHash: h("c3") })], local: [L("a.canvas", h("c7")), L("b.canvas", h("c3"))] });
+	assert.equal(find(next, "nsCreate").path, "a.canvas");
+	// the doc's record at the new path carries neither mark
+	const moved = run({ remote: [R("d1", "a.canvas")], synced: [gone], local: [L("b.canvas", h("c0"))] });
+	const put = find(moved, "syncedPut").entry;
+	assert.equal(put.path, "b.canvas");
+	assert.equal(put.fileGone, undefined);
+	assert.equal(put.renamedTo, undefined);
+});
+
+test("a file another doc's observed rename brought onto a fileGone path is that doc's, not a save of the gone doc", () => {
+	// Sim seed 703 F DEV3: offline, A renamed seed0 -> r6 and deleted r6 (the delete waited: fileGone), then renamed
+	// seed2 -> r6; a peer deleted seed2's doc and edited seed0's. The kept rename could not pair seed2's doc with r6
+	// (r6 was the gone doc's synced path), so seed2's doc was restored at seed2 and r6 merged into seed0's doc as
+	// edit beats delete: a conflict copy every pass, and the disk never converged.
+	const edited = R("d1", "r6.md", { body: { ...R("d1", "r6.md").body!, version: V(11) } });
+	const del = R("d2", "seed2.md", { state: "deleted", deletedSeq: 57 });
+	const gone1 = { ...S("d1", "r6.md"), fileGone: true as const };
+	const gone2 = { ...S("d2", "seed2.md", { contentHash: h("c2") }), fileGone: true as const, renamedTo: { to: "r6.md", atMs: 9 } };
+	const sc = { remote: [edited, del], synced: [gone1, gone2], local: [L("r6.md", h("c5"))] };
+	const p = planWith(input(sc), { restoreDuty: new Set([id("d2")]) });
+	assert.deepEqual(find(p, "nsRestore"), { op: "nsRestore", docId: "d2", path: "r6.md", againstDeleteSeq: 57 });
+	assert.equal(find(p, "reconcileContent").docId, "d2");
+	// the gone doc does not take the file (no merge-after-all put, no materialize into the occupied path)
+	assert.ok(!p.ops.some((o) => "docId" in o && o.docId === "d1" && o.op !== "wait"), JSON.stringify(p.ops));
+	// next pass, d2's record at r6: still not d1's file
+	const next = planWith(input({ remote: [edited, R("d2", "r6.md")], synced: [gone1, S("d2", "r6.md", { contentHash: h("c5") })], local: [L("r6.md", h("c5"))] }));
+	assert.ok(!next.ops.some((o) => "docId" in o && o.docId === "d1" && o.op !== "wait"), JSON.stringify(next.ops));
 });
 
 test("row live/present/absent: a delete that waits marks fileGone; a file re-created at the path is new, not a save", () => {
@@ -327,6 +408,24 @@ test("row live/present/absent: a delete that waits marks fileGone; a file re-cre
 test("row deleted/present/absent -> syncedDrop", () => {
 	const p = run({ remote: [R("d1", "a.md", { state: "deleted", deletedSeq: 41 })], synced: [S("d1", "a.md")] });
 	assert.deepEqual(p.ops, [{ op: "syncedDrop", docId: "d1" }]);
+});
+
+test("row deleted/present/absent with restore duty -> nsRestore keeping S (the local delete then covers the own rows)", () => {
+	// Sim blob seed 5: C deleted the doc while B, offline, edited it and then deleted the file. B dropped S, and
+	// the next pass (deleted, no S, restore duty for B's uncovered row) restored the doc at its path: both users'
+	// deletes undone. Kept, S makes the pass after the restore see live/present/absent: an nsDelete whose base
+	// covers B's rows, or edit-beats-delete if a peer changed the doc since.
+	const del = R("d1", "a.md", { state: "deleted", deletedSeq: 41 });
+	const duty = planWith(input({ remote: [del], synced: [S("d1", "a.md")] }), { restoreDuty: new Set([id("d1")]) });
+	assert.deepEqual(duty.ops, [{ op: "nsRestore", docId: "d1", path: "a.md", againstDeleteSeq: 41 }]);
+	const body = run({ remote: [del], synced: [S("d1", "a.md")], over: { docsWithPendingBody: new Set([id("d1")]) } });
+	assert.deepEqual(body.ops, [{ op: "nsRestore", docId: "d1", path: "a.md", againstDeleteSeq: 41 }]);
+	// an own ns op in flight: wait, S kept
+	const pend = planWith(input({ remote: [{ ...del, pendingLocal: true }], synced: [S("d1", "a.md")] }), { restoreDuty: new Set([id("d1")]) });
+	assert.deepEqual(pend.ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }]);
+	// the pass after the restore: live/present/absent, nothing changed remotely -> the delete goes out again
+	const after = planWith(input({ remote: [R("d1", "a.md")], synced: [S("d1", "a.md")] }), { bodyAppliedSeq: new Map([[id("d1"), 52]]) });
+	assert.deepEqual(after.ops, [{ op: "nsDelete", docId: "d1", baseBodySeq: 52 }, { op: "syncedDrop", docId: "d1" }]);
 });
 
 test("row deleted/present/absent, the file renamed here (observed) -> nsRestore at the new path; the source path's new doc is not paired", () => {
@@ -592,7 +691,7 @@ test("S1 identical-loser collapse: rebind to the winner + nsDelete(loser), no di
 		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
 		synced: [S("d4", "Inbox/x.md", { contentHash: h("X"), nsTouchSeq: 0 })],
 		local: [L("Inbox/x.md", h("X"))],
-	}), { remoteTextHash: new Map([[id("d3"), h("X")]]) });
+	}), { remoteTextHash: new Map([[id("d3"), h("X")], [id("d4"), h("X")]]) });
 	assert.deepEqual(p.ops, [
 		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "Inbox/x.md" },
 		{ op: "nsDelete", docId: "d4", baseBodySeq: 10 },
@@ -612,7 +711,7 @@ test("§c.12 migrated-loser merge: a differing loser at a path with an old-epoch
 		synced: [S("d4", "Inbox/x.md", { contentHash: h("L"), nsTouchSeq: 0 })],
 		local: [L("Inbox/x.md", h("L"))],
 	};
-	const ctx = { remoteTextHash: new Map([[id("d3"), h("W")]]) };
+	const ctx = { remoteTextHash: new Map([[id("d3"), h("W")], [id("d4"), h("L")]]) };
 	// No path base: a plain loser rename.
 	assert.deepEqual(opsOf(planWith(input(sc), ctx)), ["diskRename", "diskMaterialize", "syncedPut"]);
 	const p = planWith(input(sc), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) });
@@ -625,6 +724,71 @@ test("§c.12 migrated-loser merge: a differing loser at a path with an old-epoch
 	// The winner's body must be readable first.
 	const empty = { ...sc, remote: [R("d3", "Inbox/x.md", { body: { ...R("d3", "Inbox/x.md").body!, hasContent: false } }), R("d4", "Inbox/x (2).md")] };
 	assert.deepEqual(planWith(input(empty), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) }).ops, [{ op: "wait", docId: "d4", reason: "body-empty" }]);
+	// The loser must be caught up (its text is checked to be just what this device synced) ...
+	const behind = { ...sc, remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md", { body: { ...R("d4", "Inbox/x (2).md").body!, caughtUp: false } })] };
+	assert.deepEqual(planWith(input(behind), { ...ctx, pathBaseKeys: new Set([pk("Inbox/x.md")]) }).ops, [{ op: "wait", docId: "d4", reason: "body-not-caught-up" }]);
+	// ... and its text known here. Not resident (a restart since): load it first, not a loser rename that leaves a
+	// duplicate behind (sim suite-1 seed 65).
+	assert.deepEqual(planWith(input(sc), { remoteTextHash: new Map([[id("d3"), h("W")]]), pathBaseKeys: new Set([pk("Inbox/x.md")]) }).ops, [{ op: "wait", docId: "d4", reason: "text-hash" }]);
+});
+
+test("re-create collapse loads a winner whose text is not resident before it decides identical or not", () => {
+	// No path base: only an identical loser collapses, and that needs the winner's text hash.
+	const sc = {
+		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
+		synced: [S("d4", "Inbox/x.md", { contentHash: h("X"), nsTouchSeq: 0 })],
+		local: [L("Inbox/x.md", h("X"))],
+	};
+	assert.deepEqual(planWith(input(sc), { remoteTextHash: new Map([[id("d4"), h("X")]]) }).ops, [{ op: "wait", docId: "d3", reason: "text-hash" }]);
+	// Known and different: the loser rename.
+	assert.deepEqual(opsOf(planWith(input(sc), { remoteTextHash: new Map([[id("d3"), h("W")], [id("d4"), h("X")]]) })), ["diskRename", "diskMaterialize", "syncedPut"]);
+	// A winner with no content yet has its create hash: nothing to load.
+	const empty = { ...sc, remote: [R("d3", "Inbox/x.md", { body: { ...R("d3", "Inbox/x.md").body!, hasContent: false } }), R("d4", "Inbox/x (2).md")] };
+	assert.notDeepEqual(planWith(input(empty), { remoteTextHash: new Map([[id("d4"), h("X")]]) }).ops, [{ op: "wait", docId: "d3", reason: "text-hash" }]);
+});
+
+test("re-create collapse leaves a loser another device wrote to: its nsDelete would drop that edit (sim seed 581)", () => {
+	// Another device materialized the loser as "x (2)" and edited it there: the loser's text is no longer the
+	// synced one. It keeps the loser rename, migrated or identical.
+	const edited = (local: string) => ({
+		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
+		synced: [S("d4", "Inbox/x.md", { contentHash: h(local), nsTouchSeq: 0 })],
+		local: [L("Inbox/x.md", h(local))],
+	});
+	const other = (winner: string) => ({ remoteTextHash: new Map([[id("d3"), h(winner)], [id("d4"), h("E")]]) });
+	assert.deepEqual(opsOf(planWith(input(edited("L")), { ...other("W"), pathBaseKeys: new Set([pk("Inbox/x.md")]) })), ["diskRename", "diskMaterialize", "syncedPut"]);
+	assert.deepEqual(opsOf(planWith(input(edited("X")), other("X"))), ["diskRename", "diskMaterialize", "syncedPut"]);
+});
+
+test("§c.12 migrated-loser merge applies to canvases too", () => {
+	const sc = {
+		remote: [R("d3", "b/x.canvas", { kind: "canvas" }), R("d4", "b/x (2).canvas", { kind: "canvas" })],
+		synced: [S("d4", "b/x.canvas", { kind: "canvas", contentHash: h("L"), nsTouchSeq: 0 })],
+		local: [L("b/x.canvas", h("L"), { kind: "canvas" })],
+	};
+	const ctx = { remoteTextHash: new Map([[id("d3"), h("W")], [id("d4"), h("L")]]) };
+	assert.deepEqual(planWith(input(sc), { ...ctx, pathBaseKeys: new Set([pk("b/x.canvas")]) }).ops, [
+		{ op: "rebind", fromDocId: "d4", toDocId: "d3", path: "b/x.canvas", adopt: true },
+		{ op: "nsDelete", docId: "d4", baseBodySeq: 10 },
+		{ op: "reconcileContent", docId: "d3", path: "b/x.canvas", kind: "canvas", hasBase: false, pathBase: true },
+	]);
+});
+
+test("re-create collapse waits for the loser's own create frames: an nsDelete below them is a restore duty (§c.7)", () => {
+	const pending = { docsWithPendingBody: new Set([id("d4")]) };
+	// Migrated (differing) loser and identical loser alike: the delete waits as a user delete does.
+	const migrated = run({
+		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
+		synced: [S("d4", "Inbox/x.md", { contentHash: h("L"), nsTouchSeq: 0 })],
+		local: [L("Inbox/x.md", h("L"))], over: pending,
+	}, { remoteTextHash: new Map([[id("d3"), h("W")], [id("d4"), h("L")]]), pathBaseKeys: new Set([pk("Inbox/x.md")]) });
+	assert.deepEqual(migrated.ops, [{ op: "wait", docId: "d4", reason: "pending-body" }]);
+	const identical = run({
+		remote: [R("d3", "Inbox/x.md"), R("d4", "Inbox/x (2).md")],
+		synced: [S("d4", "Inbox/x.md", { contentHash: h("X"), nsTouchSeq: 0 })],
+		local: [L("Inbox/x.md", h("X"))], over: pending,
+	}, { remoteTextHash: new Map([[id("d3"), h("X")], [id("d4"), h("X")]]) });
+	assert.deepEqual(identical.ops, [{ op: "wait", docId: "d4", reason: "pending-body" }]);
 });
 
 test("remote-move target already on disk (crash after rename): adopt the path, no disk op", () => {

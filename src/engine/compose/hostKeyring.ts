@@ -4,14 +4,18 @@
  * answered keyringStored (persist-before-use), then zero-fills the keys it was handed. `records` is the winning set
  * main holds now, so a runtime started after a change (the gate opening, an epoch or settings restart) begins
  * from it rather than from init's copy.
+ *
+ * `mirror` is the copy of the records in this device's DB (MetaKeyringRecords), set at init when main holds none
+ * (SecretStorage lost): the keyring takes it only while main's set is empty (Keyring.open).
  */
 
 import type { EngineInitConfig } from "../../protocol/messages";
-import type { KeyringChange } from "../keyring/keyring";
+import type { KeyringChange, KeyringRecords } from "../keyring/keyring";
 import type { HostLink } from "./hostLink";
 
 export class HostKeyring {
 	private stored: readonly Uint8Array[];
+	mirror: KeyringRecords | null = null;
 
 	constructor(private readonly link: HostLink, crypto: EngineInitConfig["crypto"]) {
 		this.stored = crypto.suite === 1 ? crypto.records.map((b) => b.slice()) : [];

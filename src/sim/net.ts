@@ -14,6 +14,7 @@ import type { RelayConnectResult, RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { LogEngine } from "../engine/runtime/engine";
 import { docText } from "../engine/runtime/testHarness";
+import { projectCanvasBytes } from "../engine/reconcile/canvasDoc";
 import type { EngineE2ee } from "../engine/keyring/keyringRuntime";
 import { SimBlobStore } from "./blobStore";
 import type { VirtualClock } from "./clock";
@@ -29,8 +30,10 @@ export interface OracleDoc {
 	readonly docId: DocId;
 	readonly path: VaultPath;
 	readonly kind: string;
-	/** Markdown text (null for other kinds). */
+	/** Markdown text, or a canvas doc's disk projection (DESIGN §j.2); null for blobs or a canvas that does not project. */
 	readonly text: string | null;
+	/** Canvas: why the CRDT does not project (null when it does). */
+	readonly invalid?: string | null;
 }
 
 /** Fingerprints of a fold's canonical encoding (nsFoldV1 / cfgFoldV1 / snapFoldV1), by stream class. */
@@ -194,14 +197,25 @@ export class SimNet {
 		for (const d of eng.listDocs()) {
 			if (d.state !== "live") continue;
 			let text: string | null = null;
+			let invalid: string | null = null;
 			if (d.kind === "markdown") {
 				const p = docText(eng, d.docId);
 				let out: string | null = null;
 				void p.then((t) => (out = t), () => (out = null));
 				await this.clock.runUntil(() => out !== null, 30_000);
 				text = out;
+			} else if (d.kind === "canvas") {
+				// The relay's canvas state as a fresh device builds it (checkpoint + tail), projected as a merge job would.
+				let done = false;
+				void eng.c.handles.load(eng.streamOf(d.docId)).then((h) => {
+					const p = projectCanvasBytes(h.doc);
+					if (p.ok) text = p.text;
+					else invalid = p.reason;
+				}, (e) => (invalid = `load failed: ${e instanceof Error ? e.message : String(e)}`)).finally(() => (done = true));
+				await this.clock.runUntil(() => done, 30_000);
+				if (!done) invalid = "load timed out";
 			}
-			docs.push({ docId: d.docId, path: d.path, kind: d.kind, text });
+			docs.push({ docId: d.docId, path: d.path, kind: d.kind, text, ...(d.kind === "canvas" ? { invalid } : {}) });
 		}
 		const stopped = eng.stop();
 		let done = false;

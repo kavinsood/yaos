@@ -6,7 +6,8 @@
  */
 import assert from "node:assert/strict";
 import { minimizePlan, runSim, type SimConfig, type SimReport } from "../run";
-import { BLOB_FAULTS, DEFAULT_FAULTS, SUBS_FAULTS } from "../faults";
+import { BLOB_FAULTS, CANVAS_FAULTS, DEFAULT_FAULTS, SUBS_FAULTS } from "../faults";
+import { CANVAS_HOT_OPS } from "../canvas";
 import type { SimBlobLiveness } from "../blobStore";
 
 export const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
@@ -36,7 +37,7 @@ export async function sweep(name: string, base: Omit<SimConfig, "seed">, seeds: 
 	assert.fail(
 		`${name}: ${failed.length}/${seeds} seeds failed: ${failed.map((r) => r.seed).join(",")}\n` +
 			`seed ${r0.seed}:\n  ${r0.violations.slice(0, 6).map((v) => `${v.inv}: ${v.detail}`).join("\n  ")}\n` +
-			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults === SUBS_FAULTS ? "SUBS_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
+			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults === SUBS_FAULTS ? "SUBS_FAULTS" : cfg.faults === CANVAS_FAULTS ? "CANVAS_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
 	);
 }
 
@@ -61,6 +62,17 @@ export const subsHits: Hits = (name, stats) => {
 	assert.ok(got.skipped > 0 && got.pushed > 0 && got.subscribes > 0 && got.subsLost > 0 && got.restarts > 0, `${name}: subscriptions at work ${JSON.stringify(got)}`);
 };
 
+/** The hot canvas matrix reached the merge paths it exists for: real 3-way merges, conflicts, broken saves, checkpoints. */
+export const canvasHits: Hits = (name, stats) => {
+	const sum = (f: (s: SimReport["stats"]) => number) => stats.reduce((n, s) => n + f(s), 0);
+	const got = {
+		actions: sum((s) => s.canvas.actions), divergent: sum((s) => s.canvas.merges.divergent), conflict: sum((s) => s.canvas.merges.conflict),
+		invalid: sum((s) => s.canvas.invalidNotices), written: sum((s) => s.checkpoints.put.canvas?.ok ?? 0), adopted: sum((s) => s.checkpoints.adopted.canvas ?? 0),
+	};
+	const ok = got.actions > stats.length * 50 && got.divergent > 0 && got.conflict > 0 && got.invalid > 0 && got.written > 0 && got.adopted > 0;
+	assert.ok(ok, `${name}: the canvas actions hit the merge paths ${JSON.stringify(got)}`);
+};
+
 export interface Matrix {
 	readonly name: string;
 	readonly base: Omit<SimConfig, "seed">;
@@ -74,6 +86,8 @@ export interface Matrix {
 }
 
 const part = (d: number): number => Math.max(1, Math.ceil(SEEDS / d));
+/** Most actions are concurrent offline edits of the same two canvases, biased to the same records. */
+const HOT_CANVAS = { rate: 3, ops: CANVAS_HOT_OPS, pool: 2, hot: true };
 
 export const MATRICES: readonly Matrix[] = [
 	{ name: "2 devices, no faults", base: { devices: 2, faults: null }, seeds: SEEDS, smoke: 2, cost: 1.4 },
@@ -84,4 +98,5 @@ export const MATRICES: readonly Matrix[] = [
 	// The device classes' own deferral of skipped streams (desktop 5 s / 30 s, phone 150 s / 10 min): quiescence waits it out.
 	{ name: "3 devices, real skip deferral", base: { devices: 3, faults: SUBS_FAULTS, faultRate: 0.2, tuning: { skipSettleMs: null, skipMaxDeferMs: null } }, seeds: part(20), smoke: 1, cost: 3.4, hits: subsHits },
 	{ name: "3 devices, blob stall/slow faults", base: { devices: 3, faults: BLOB_FAULTS, faultRate: 0.3 }, seeds: part(10), smoke: 1, cost: 6.6, hits: blobHits },
+	{ name: "2 devices, concurrent offline canvas edits", base: { devices: 2, faults: CANVAS_FAULTS, faultRate: 0.2, steps: 80, canvas: HOT_CANVAS }, seeds: part(8), smoke: 1, cost: 5.2, hits: canvasHits },
 ];

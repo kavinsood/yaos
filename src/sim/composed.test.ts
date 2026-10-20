@@ -432,6 +432,66 @@ test("relay epoch reset (§c.12): both devices migrate, re-upload, and keep sync
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]).sort(), want, "the new epoch holds the whole vault");
 });
 
+test("epoch reset, app crash after the migration and before its merges: the old epoch's base survives the restart", async () => {
+	// Sim suite-1 seed 65. The bases a migration carries (the old DB's synced text by path) lived in memory only: A
+	// crashed after opening the new epoch's DB and before merging x.md with B's re-create, came back with no base,
+	// and its unchanged file read as a conflicting side of B's edit: a conflict copy (for a canvas re-create that lost
+	// the path race: a suffixed duplicate) instead of B's text.
+	const { clock, net, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "one\n");
+
+	a.setOnline(false);
+	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
+	await clock.advance(20_000); // B migrated and re-created x.md
+	b.vault.userWrite("x.md", "one\nfrom B\n");
+	await clock.advance(5_000);
+	a.setOnline(true);
+	for (let i = 0; i < 30_000 && a.vrt?.vaultEpoch !== "sim-epoch-2"; i++) await clock.advance(1);
+	assert.equal(a.vrt?.vaultEpoch, "sim-epoch-2", "A migrated");
+	assert.equal(a.vrt?.rec.ctx.store.synced.size, 0, "nothing merged in the new epoch yet");
+	a.crashApp();
+	await clock.advance(1_000);
+	void a.restartApp();
+	await clock.advance(30_000);
+
+	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "one\nfrom B\n"]], `${d.name}`);
+	assert.equal(a.vrt?.bases.keys.size, 0, "the base is retired once x.md is settled");
+	// The crash also came before the old DB's retirement. Two DBs make every later start wait for the relay to name
+	// the epoch (knownEpoch.ts: no offline start), and the old one was never deleted: it is, once the new one is live.
+	assert.deepEqual((await a.storage.listDatabases()).map((n) => n.split(":")[2]), ["sim-epoch-2"]);
+	const o = await net.oracle();
+	assert.deepEqual(o.docs.map((x) => [x.path, x.text]), [["x.md", "one\nfrom B\n"]]);
+});
+
+test("epoch restore to a point before a text delete: the migration deletes the restored text again", async () => {
+	// DESIGN §c.12 "Deletes". The restored relay state predates the delete of " two", the devices' bases and files
+	// lack it, so the merge against the old epoch's base read the restored text as added in the new epoch and put
+	// it back. A restore keeps the doc and its item ids: the old doc's delete set names the characters.
+	const { clock, net, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "a\none two three\nb\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "a\none two three\nb\n");
+	const snap = net.relay.snapshot();
+	a.vault.userWrite("x.md", "a\none three\nb\n");
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "a\none three\nb\n");
+
+	net.relay.restoreEpoch(snap, "sim-epoch-2" as VaultEpoch);
+	await clock.advance(60_000);
+	for (const d of [a, b]) {
+		assert.equal(d.vrt?.vaultEpoch, "sim-epoch-2", `${d.name} migrated`);
+		assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "a\none three\nb\n"]], `${d.name}`);
+	}
+	const o = await net.oracle();
+	assert.deepEqual(o.docs.map((x) => [x.path, x.text]), [["x.md", "a\none three\nb\n"]]);
+});
+
 test("IndexedDB evicted after an own edit reached the relay but not the disk: recovery writes it to disk", async () => {
 	// Sim seed 690 F DEV3. Every row of x.md is A's own, so reading the stream back after the wipe does not move
 	// bodyVersion.remoteSeq. A mirror-imported sync point that kept remoteSeq read as "remote unchanged" (Rc false),

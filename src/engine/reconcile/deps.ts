@@ -50,6 +50,8 @@ export interface RemoteView {
 	readonly textHash: ReadonlyMap<DocId, ContentHash>;
 	/** streams.appliedSeq per doc (nsDelete.baseBodySeq). */
 	readonly appliedSeq: ReadonlyMap<DocId, Seq>;
+	/** Requested path keys of own pending rename / restore ops, per doc (S1 "moved on", ownFold.ts). */
+	readonly pendingMoves: ReadonlyMap<DocId, ReadonlySet<PathKey>>;
 }
 
 /**

@@ -42,8 +42,9 @@ export async function applyOwnFold(ctx: Ctx, events: readonly OwnFoldEvent[]): P
 	const movedOn = (i: number, docId: SyncedEntry["docId"], requested: VaultPath, final: VaultPath, s: SyncedEntry): boolean => {
 		if (s.pathKey === ctx.pk(final) && s.pathKey !== ctx.pk(requested)) return true;
 		if (events.slice(i + 1).some((e) => (e.op.t === "rename" || e.op.t === "restore") && e.op.docId === docId)) return true;
-		const r = view.remote.get(docId);
-		return r !== undefined && r.pendingLocal && r.pathKey === s.pathKey && s.pathKey !== ctx.pk(requested);
+		// A later own rename / restore of the doc still pending, requested at S's path: judged by the op's requested
+		// path, not the overlay's projection of it, which may suffix it (hot canvas seed 503).
+		return s.pathKey !== ctx.pk(requested) && (view.pendingMoves.get(docId)?.has(s.pathKey) ?? false);
 	};
 	for (const [i, ev] of events.entries()) {
 		const { op, seq, outcome } = ev;

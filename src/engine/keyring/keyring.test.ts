@@ -5,7 +5,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { utf8Encode } from "../../core/codec/lib0";
-import { FORGED, K, RK_A, RK_B, device, genesis, holds, persistedEpochs, revoke, roll } from "./testkit/world";
+import { Keyring } from "./keyring";
+import { FORGED, K, RK_A, RK_B, VAULT, device, genesis, holds, persistedEpochs, revoke, roll } from "./testkit/world";
 
 describe("keyring: winners (§11.3)", () => {
 	it("RK path: unwraps the genesis, walks nextWrap forward, persists keys and records once, then seals", async () => {
@@ -164,5 +165,68 @@ describe("keyring: forged roll after a revoke (§11.3, §20.2)", () => {
 		await fresh.ingest([1, await genesis()], [2, await roll(2)], [10, forged], [11, rev]);
 		assert.equal(await fresh.kr.installQr(3, K(3)), "verified");
 		assert.ok(await holds(fresh, 3, K(3)));
+	});
+});
+
+describe("keyring: a key reached by prevWrap but not verified yet (suite-1 seeds 74, 184)", () => {
+	// Re-keyed by RK above an open revoke 3 whose roll 2 is still undecided (the revoke blocks it): the revoke's
+	// prevWrap installs K_2, held but unverified, so it is not stored. A Keyring opened again on the same adapter (the
+	// engine restarted) took the held K_2 for an own key, which never unblocks a roll: roll 2 stayed pending, K_1
+	// (behind its prevWrap) was never reached, and every blob address (K_1's subkey) failed for good.
+	it("a Keyring opened again re-derives K_2 from the revoke's prevWrap and walks down to K_1", async () => {
+		const [g, r2, r3] = [await genesis(), await roll(2), await revoke(3, RK_B)];
+		const d1 = await device({ records: [r3] });
+		assert.equal(await d1.kr.installRk(RK_B.slice()), "verified");
+		assert.ok(d1.kc.keyState(2).held && !d1.kc.keyState(2).verified, "K_2 held, not verified");
+		const records = d1.changes.at(-1)?.records ?? [r3];
+		d1.kr.dispose();
+		const kr = await Keyring.open({ mode: "suite1", vaultId: VAULT, kc: d1.kc, records, persist: async () => undefined, diag: () => undefined, onKeyringSeen: () => undefined });
+		await kr.ingest([{ seq: 1, bytes: g }, { seq: 5, bytes: r2 }, { seq: 9, bytes: r3 }]);
+		assert.ok(d1.kc.keyState(1).verified, "K_1 verified");
+		assert.ok(d1.kc.keyState(2).verified, "K_2 verified");
+		assert.equal(kr.keyMissing(), null);
+	});
+});
+
+describe("keyring: the DB copy of the records (§6.1, §11.5, §13.3)", () => {
+	it("SecretStorage lost after a reset emptied k: the RK opens the genesis the DB kept, and the records are re-publishable", async () => {
+		// Suite-1 seeds 115, 148, 149, 167: both devices lost their SecretStorage, and a reset or restore emptied k
+		// before either re-published. With nothing in k and no stored record, the RK had nothing to open.
+		const [g, r2] = [await genesis(), await roll(2)];
+		const bare = await device({ records: [] });
+		assert.equal(await bare.kr.installRk(RK_A.slice()), "pending");
+		assert.equal(bare.kr.keyMissing(), "no-key");
+
+		const d = await device({ records: [], mirror: { winners: [g, r2], open: [] } });
+		assert.deepEqual(d.codes(), ["keyring/records-from-db"]);
+		assert.equal(d.kr.keyMissing(), "no-key");
+		assert.deepEqual(d.mirrored, [], "the copy is not rewritten unchanged");
+		assert.equal(await d.kr.installRk(RK_A.slice()), "verified");
+		assert.deepEqual(persistedEpochs(d), [1, 2]);
+		assert.deepEqual(d.changes.at(-1)!.records, [g, r2], "main gets the records back with the keys");
+		assert.equal(d.kr.keyMissing(), null);
+		assert.deepEqual(d.kr.republishable(), [g, r2]);
+	});
+
+	it("a copy whose newest winner is a revoke: the RK opens it and walks back to the genesis", async () => {
+		const [g, v2] = [await genesis(), await revoke(2)];
+		const d = await device({ records: [], mirror: { winners: [g, v2], open: [] } });
+		assert.equal(d.kr.keyMissing(), "revoked-epoch");
+		assert.equal(await d.kr.installRk(RK_A.slice()), "verified");
+		assert.deepEqual(persistedEpochs(d).sort(), [1, 2]);
+		assert.equal(d.kr.keyMissing(), null);
+		assert.deepEqual(d.kr.republishable(), [g, v2]);
+	});
+
+	it("main's records win over the copy; the copy follows every change of the record set", async () => {
+		const [g, r2] = [await genesis(), await roll(2)];
+		const d = await device({ keys: [{ e: 1, k: K(1) }], records: [g], mirror: { winners: [g, r2], open: [] } });
+		assert.deepEqual(d.kr.summary().epochs.map((x) => x.e), [1], "the copy is not read while main holds records");
+		assert.deepEqual(d.mirrored, [{ winners: [g], open: [] }], "and is rewritten to main's set");
+		const fresh = await device({ keys: [{ e: 1, k: K(1) }], records: [g] });
+		assert.deepEqual(fresh.mirrored, [{ winners: [g], open: [] }], "a device without a copy writes one at open");
+		await fresh.ingest([1, g], [7, r2]);
+		assert.deepEqual(fresh.mirrored.at(-1), { winners: [g, r2], open: [] });
+		assert.equal(fresh.mirrored.length, 2);
 	});
 });

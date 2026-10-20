@@ -3,16 +3,20 @@
  * user commands, diagnostics and the epoch-migration steps (§c.12).
  */
 
+import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
-import { streamDocId, type PathKey, type RemoteEntry, type StreamName, type VaultEpoch, type VaultPath } from "../../core/types";
+import { streamDocId, type PathKey, type RemoteEntry, type StreamName, type SyncedEntry, type VaultPath } from "../../core/types";
 import { ProtocolFailure } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
 import type { FrameNoFloor } from "../store/repo";
-import { dbName, STORE } from "../store/schema";
+import { STORE, type MetaDocDeletes, type MetaPathBase } from "../store/schema";
+import { parseDbName } from "./knownEpoch";
 import { readBase } from "../reconcile/store";
+import { encodeStateAsUpdate } from "../body/yjsCounters";
+import { docDeletesKey, pathBaseKey } from "./epochBases";
 import { KeyringRefusedError } from "../keyring/writeGate";
 import type { VaultRuntime } from "./vaultRuntime";
 
@@ -187,10 +191,11 @@ async function diagnostics(rt: VaultRuntime, includePaths: boolean): Promise<Dia
 }
 
 /**
- * §c.12 steps 1 and 3 on the old runtime: save bound views, snapshot, and read
- * the synced bases into a path-keyed map for the new epoch's merges.
+ * §c.12 steps 1 and 3 on the old runtime: save bound views, snapshot, and read for the new epoch's merges the synced
+ * bases by path (the old `baseText` rows that read back as written) and what each old doc deleted (oldDeletes).
+ * Both are stored with the new DB's identity (epochBases.ts).
  */
-export async function prepareEpochMigration(rt: VaultRuntime): Promise<Map<PathKey, string>> {
+export async function prepareEpochMigration(rt: VaultRuntime): Promise<{ bases: MetaPathBase[]; docDeletes: MetaDocDeletes[] }> {
 	const bound = [...rt.engine.bound.byId.keys()];
 	if (bound.length > 0) {
 		await rt.engine.link.request({ t: "saveViews", docIds: bound }).catch(() => undefined);
@@ -201,16 +206,51 @@ export async function prepareEpochMigration(rt: VaultRuntime): Promise<Map<PathK
 		}));
 	}
 	await rt.takeSnapshot("epoch");
-	const bases = new Map<PathKey, string>();
+	const bases = new Map<PathKey, MetaPathBase>();
+	const docDeletes: MetaDocDeletes[] = [];
 	const rows = await rt.db.tx([STORE.baseText], "readonly", (tx) => tx.getAll(STORE.baseText)).catch(() => []);
 	const byDoc = new Map(rows.map((r) => [r.docId, r]));
 	for (const s of rt.rec.ctx.store.synced.values()) {
-		if (s.kind !== "markdown" || !s.hasBase) continue;
-		const r = byDoc.get(s.docId);
-		const text = r ? await readBase(r, rt.o.ports.hash) : null;
-		if (text !== null) bases.set(pathKey(s.path), text);
+		if (s.kind === "blob") continue;
+		const del = await oldDeletes(rt, s);
+		if (del) docDeletes.push(del);
+		const r = s.hasBase ? byDoc.get(s.docId) : undefined; // markdown text or canvas merge text
+		if (!r || (await readBase(r, rt.o.ports.hash)) === null) continue;
+		const k = pathKey(s.path);
+		bases.set(k, {
+			key: pathBaseKey(k), contentHash: r.contentHash, deflated: r.deflated, chars: r.chars,
+			...(del?.keys ? { deleted: del.keys } : {}),
+		});
 	}
-	return bases;
+	return { bases: [...bases.values()], docDeletes };
+}
+
+/**
+ * What the old doc deleted (DESIGN §c.12 "Deletes"), so the new epoch can delete it again; null: nothing.
+ *  - Canvas: the record keys. A Y.Map key keeps its deleted item after GC (only the content goes), and record ids
+ *    are stable: they are in the file, so they name the record in a restored doc and in one a peer re-created alike.
+ *  - Markdown: the delete set. GC keeps only the deleted items' ids and lengths, so it names characters only in the
+ *    same doc, which a restore keeps (and a reset does not).
+ */
+async function oldDeletes(rt: VaultRuntime, s: SyncedEntry): Promise<MetaDocDeletes | null> {
+	if (s.kind !== "canvas" && s.kind !== "markdown") return null;
+	const h = await rt.rec.ctx.log.acquireBody(s.docId, s.kind).catch(() => null);
+	if (!h) return null;
+	try {
+		const key = docDeletesKey(s.docId);
+		if (s.kind === "markdown") {
+			if (Y.createDeleteSetFromStructStore(h.doc.store).clients.size === 0) return null;
+			// Encoded against the doc's own state vector: no structs, the delete set only.
+			return { key, kind: "markdown", update: encodeStateAsUpdate(h.doc, Y.encodeStateVector(h.doc)) };
+		}
+		const keys: string[] = [];
+		for (const [map, prefix] of [["nodes", "n:"], ["edges", "e:"]] as const) {
+			for (const [id, item] of h.doc.getMap(map)._map) if (item.deleted) keys.push(prefix + id);
+		}
+		return keys.length > 0 ? { key, kind: "canvas", keys } : null;
+	} finally {
+		h.release();
+	}
 }
 
 /** §c.12 step 3 (e2ee-design §8.2): the highest own ns / cfg frameNo, carried into the new epoch's DB. */
@@ -219,14 +259,30 @@ export function ownFrameNoFloor(rt: VaultRuntime): FrameNoFloor {
 	return { ns: c.ns.maxOwnFrameNo(c.outbox), cfg: c.cfg.maxOwnFrameNo(c.outbox) };
 }
 
-/** §c.12 step 6: the new epoch reached live; delete the old DB. */
-export async function retireOldEpoch(rt: VaultRuntime, old: VaultEpoch): Promise<void> {
-	if (old === rt.vaultEpoch) return;
-	const name = dbName(rt.o.config.vaultId, old, rt.o.config.deviceId);
+/**
+ * §c.12 step 6: the new epoch reached live; delete every other epoch's DB of this vault and device. Not only the one
+ * the migration left: a crash between the migration and this step leaves two DBs, the restart connects first
+ * (knownEpoch.ts) and opens the current one without migrating, and the old one would stay for good, every later
+ * start waiting for the relay to name the epoch. Once the new DB exists the old one holds nothing it needs: the
+ * bases were stored with the new DB's identity.
+ */
+export async function retireOldEpochs(rt: VaultRuntime): Promise<void> {
+	const { vaultId, deviceId } = rt.o.config;
+	let names: readonly string[];
 	try {
-		await rt.o.ports.storage.deleteDatabase(name);
-		rt.diag(`old epoch DB deleted`);
+		names = await rt.o.ports.storage.listDatabases();
 	} catch (e) {
-		rt.diag(`old epoch DB delete failed: ${String(e)}`);
+		rt.diag(`old epoch DB listing failed: ${String(e)}`);
+		return;
+	}
+	for (const name of names) {
+		const p = parseDbName(name);
+		if (!p || p.vaultId !== vaultId || p.deviceId !== deviceId || p.vaultEpoch === rt.vaultEpoch) continue;
+		try {
+			await rt.o.ports.storage.deleteDatabase(name);
+			rt.diag(`old epoch DB deleted`);
+		} catch (e) {
+			rt.diag(`old epoch DB delete failed: ${String(e)}`);
+		}
 	}
 }

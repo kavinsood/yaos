@@ -3,13 +3,199 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generatePlan, minimizePlan, runSim, type SimConfig, type Step } from "./run";
-import { DEFAULT_FAULTS } from "./faults";
-import { checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
+import { CANVAS_FAULTS, DEFAULT_FAULTS, E2EE_FAULTS } from "./faults";
+import { checkCanvas, checkConvergence, checkNothingDestroyed, checkTokens } from "./invariants";
+import { ABSENT, CANVAS_HOT_OPS, CanvasOracle, suffixedDuplicates, type FieldWrite } from "./canvas";
 import { runUserAction, TokenLedger } from "./actors";
-import { SimDevice } from "./device";
+import { SIM_TUNING, SimDevice } from "./device";
+import { DURABILITY_RETRY_MS } from "../engine/body/sender";
 import { SimNet } from "./net";
 import { VirtualClock } from "./clock";
 import type { DocId, VaultPath } from "../core/types";
+
+// Seed 520 (3 devices): C's frame refused at a daily-limit latch that lifted before its next frame, which committed,
+// left A a causal hole for ~750 ms until the 1 s retry. Sim tuning re-read 3 times over 180 ms and froze the doc for good.
+test("sim tuning: the causal-hole re-read window outlasts an own frame's retry (DESIGN §d.6)", () => {
+	const t = SIM_TUNING;
+	const window = t.causalRetryMs! * (t.causalRetries! + 1);
+	assert.ok(window >= 2 * t.provisionalAdoptMs!, `window ${window} ms < 2 x provisionalAdoptMs`);
+	// sender.ts: durability retry and the daily-limit floor are both DURABILITY_RETRY_MS (untuned); then a group commit.
+	assert.ok(window >= 2 * DURABILITY_RETRY_MS, `window ${window} ms < 2 x the own-frame retry`);
+});
+
+// Suite-1 seed 24: after an epoch migration the devices re-create the vault and race on every path. A device's own
+// re-create of canvas c1, changed locally, lost the race and was kept as "c1 (2).canvas" beside the winner: the
+// old-epoch path-keyed bases and the migrated-loser merge (DESIGN §c.12) were markdown-only. It merges into the
+// winner now, against the old epoch's base. Pinned with E2EE.
+test("sim: a canvas re-created across an epoch migration merges into the winner, no suffixed duplicate (suite-1 seed 24)", async () => {
+	let dups: string[] = [];
+	const r = await runSim({
+		seed: 24, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1",
+		observe: (label, devs) => { if (label === "end") dups = devs.flatMap((d) => suffixedDuplicates(d).map((x) => `${d.name}: ${x}`)); },
+	});
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+	assert.deepEqual(dups, []);
+});
+
+// Suite-1 seeds 103 (4 devices), 19 and 164 (2 devices, fault-heavy): a node / edge deleted just before an epoch
+// restore, or on the epoch the relay had already left, came back after the migration: the restored state still held
+// it and the merge against the old epoch's base read it as added there. In 164 the deleting device had also renamed
+// the canvas, and the restore brought it back at its old path. The migration now carries what each old doc deleted,
+// by doc and by path (DESIGN §c.12 "Deletes"), and the delete rule no longer exempts deletes a restore overtook.
+test("sim: a canvas delete overtaken by an epoch restore stays deleted (suite-1 seeds 103, 19, 164)", async () => {
+	const a = await runSim({ seed: 103, devices: 4, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(a.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+	const b = await runSim({ seed: 19, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+	assert.deepEqual(b.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+	const c = await runSim({ seed: 164, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+	assert.deepEqual(c.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Seed 581 (3 devices): B's own re-create of c3 lost the race after an epoch reset and waited to merge into the winner;
+// meanwhile C materialized the loser as "c3 (3).canvas" and added a node to it. B's collapse deleted the loser, C's
+// node with it. A loser another device wrote to keeps the loser rename.
+test("sim: a re-create loser another device edited is not collapsed (seed 581)", async () => {
+	const r = await runSim({ seed: 581, devices: 3, faults: DEFAULT_FAULTS });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Suite-1 seed 23: C, revoked, deleted an attachment while key-missing; its passes failed on the write gate and
+// backed off. Re-keyed, it planned nothing until the backoff ran out (past the heal), so the delete never left.
+test("sim: a delete made while key-missing goes out once the device is re-keyed (suite-1 seed 23)", async () => {
+	const r = await runSim({ seed: 23, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Suite-1 seed 355 (3 devices): B revoked and re-keyed; C, backgrounded, then crashed with its keychain lost, so the
+// engine stopped and the revokeRekey command rejected although its record had gone out and won. The keeper noted the
+// new RK only on success, so nobody could re-key C from it and C stayed key-missing. The user wrote the RK down when
+// the dialog showed it: the keeper keeps it whatever the command answers.
+test("sim: an RK whose revoke command was cut off by a crash still re-keys a device (suite-1 seed 355)", async () => {
+	const r = await runSim({ seed: 355, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Suite-1 seed 115 (2 devices, fault-heavy; 148, 149, 167 alike): B and then A lost their keychains, and an epoch
+// reset emptied `k` before either was re-keyed. The records lived only in SecretStorage, so the RK had nothing to
+// open and both devices stayed key-missing for good. Each DB now keeps a copy of the records (e2ee-design §6.1).
+test("sim: a device whose keychain was lost after a reset emptied k is re-keyed by the RK (suite-1 seed 115)", async () => {
+	const r = await runSim({ seed: 115, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Suite-1 seed 112 (3 devices): the last step forged suite-0 rows into a doc. The forge lands after an await, so
+// heal() in the same turn saw none and never started the keeper; nobody released the doc, frozen on every device.
+test("sim: rows forged by the last step are still released by the user after the heal (suite-1 seed 112)", async () => {
+	const r = await runSim({ seed: 112, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Suite-1 seed 163 (2 devices, fault-heavy): A's IndexedDB was wiped and its ns read stayed held (a checkpoint under
+// a key it lacked). It created docs meanwhile with ns frameNos 65.., numbers its earlier frames had used, and the
+// ns sends were open although the read had not completed: every reader ignored the frame as replay-duplicate, the
+// creates never folded and their bodies were held for ever (e2ee-design §8.2).
+// Seed 51 (same matrix): A's IndexedDB was wiped and its ns/cfg reads failed (HTTP down) while the socket was up. It
+// went live anyway: the planner trashed its synced files against the empty ns view, and its new creates went out as
+// replay-stale frames, lost. The phase stays catching-up and the ns sends closed until the reads complete.
+test("sim: ns frames allocated before a lost store read ns are not ignored as replays (suite-1 seeds 163, 51)", async () => {
+	for (const seed of [163, 51]) {
+		const r = await runSim({ seed, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+		assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), [], `seed ${seed}`);
+	}
+});
+
+// Suite-1 seed 174 (4 devices): a hostile replay of an old-epoch snap frame was the stream's last row. Every reader
+// judged it stale (§14.3) and, for snap alone, only accounted it: never stored, the snap fold's coversSeq stayed below
+// the head for good. Stale snap rows are stored flagged and fold as ignored, as for ns / cfg.
+test("sim: a stale snap row last in the stream is covered by every snap fold (suite-1 seed 174)", async () => {
+	const r = await runSim({ seed: 174, devices: 4, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Suite-1 seed 65 (3 devices): A's own re-create of canvas/c0 lost the path race after an epoch reset. A crashed
+// before the collapse merged it into the winner: the old epoch's bases lived in memory only, and the restarted
+// planner did not have the loser's text hash (not resident), so the loser took a rename and stayed as
+// "c0 (2).canvas". The bases are stored in the new DB and the collapse loads a text it cannot hash yet.
+// (att/a1 (2).png is older: two different attachments created at one path before the reset.)
+test("sim: a migrated re-create still merges into the winner after a crash (suite-1 seed 65)", async () => {
+	let suffixed: string[] = [];
+	const r = await runSim({
+		seed: 65, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1",
+		observe: (label, devs) => {
+			if (label === "end") suffixed = devs.flatMap((d) => [...d.vault.snapshot().keys()].filter((p) => / \(\d+\)\.canvas$/.test(p)).map((p) => `${d.name}: ${p}`));
+		},
+	});
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+	assert.deepEqual(suffixed, []);
+});
+
+// Suite-1 seed 217 (3 devices): A moved node a-1n0 on disk while a-1n1, the next line of the merge text, changed on
+// both sides. The line diff3 joined the two lines into one conflicting hunk and kept the CRDT's a-1n0: the move lived
+// only in the conflict copy, which a user deleted. The canvas merge resolves record by record.
+test("sim: a canvas edit next to a conflicting record is merged, not left to the conflict copy (suite-1 seed 217)", async () => {
+	const r = await runSim({ seed: 217, devices: 3, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Hot canvas seed 208 with suite 1: B, offline after an IDB loss, saw c0 renamed to its own path; the path counted as
+// left by a rename, no pass merged c0 until ns was ready, and an edge delete never reached the CRDT.
+test("sim: a rename onto the same path does not hold a canvas's edits back (hot canvas, suite-1 seed 208)", async () => {
+	const r = await runSim({ seed: 208, devices: 2, faults: CANVAS_FAULTS, faultRate: 0.2, steps: 80, canvas: { rate: 3, ops: CANVAS_HOT_OPS, pool: 2, hot: true }, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Hot canvas seed 503 with suite 1: the late fold of an own rename came back suffixed while a later own rename of the
+// doc was pending; S1 judged "moved on" by the overlay's projection of that rename, which suffixed it, and put S back.
+// The next pass merged another doc's file into the note and B's edits were lost.
+test("sim: S follows a pending own rename by its requested path (hot canvas, suite-1 seed 503)", async () => {
+	const r = await runSim({ seed: 503, devices: 2, faults: CANVAS_FAULTS, faultRate: 0.2, steps: 80, canvas: { rate: 3, ops: CANVAS_HOT_OPS, pool: 2, hot: true }, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Hot canvas seed 570 with suite 1 (sim only): after an IDB wipe without mirrors A set a colour twice on disk; the
+// no-base merge put the file into a conflict copy, which the user deleted. The oracle discarded only the copy's
+// value, so A's first colour, replaced by its own second one, counted as a lost write.
+test("sim: deleting a conflict copy discards the values its own writes replaced (hot canvas, suite-1 seed 570)", async () => {
+	const r = await runSim({ seed: 570, devices: 2, faults: CANVAS_FAULTS, faultRate: 0.2, steps: 80, canvas: { rate: 3, ops: CANVAS_HOT_OPS, pool: 2, hot: true }, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Suite-1 seeds 74 and 184 (2 devices, fault-heavy): a device re-keyed above an open revoke got K_2 from the revoke's
+// prevWrap, held but unverified; the Keyring opened again took it for an own key, the blocked roll 2 never decided,
+// and K_1, which every blob address needs, stayed out of reach: uploads and downloads retried for ever.
+test("sim: a device re-keyed above an open revoke reaches K_1 and moves its blobs (suite-1 seeds 74, 184)", async () => {
+	for (const seed of [74, 184]) {
+		const r = await runSim({ seed, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+		assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), [], `seed ${seed}`);
+	}
+});
+
+// Per-stream subscriptions (binary-reads) meet the canvas oracle: a device is behind on every canvas nobody pushes it,
+// so its saves meet stale replicas far more often than when every row was pushed. Three oracle gaps, one seed each.
+
+// Seed 21 (3 devices): A deleted an edge on disk while its reads failed (the merge waits for the read, DESIGN I4),
+// then deleted the canvas. An unseen edit restored the canvas as A's CRDT held it, the edge with it: the record
+// delete never reached the CRDT and went with the file.
+test("sim: a record deleted behind a stale replica goes with its canvas's delete (seed 21)", async () => {
+	const r = await runSim({ seed: 21, devices: 3, faults: DEFAULT_FAULTS });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Seed 48 (3 devices): after an epoch reset A's stale copy of c0 lost the path race. Others edited the loser, so it
+// kept its loser rename, and A's offline reorder went into it ("c0 (2).canvas"). The oracle attributed the reorder to
+// the winner: the path's doc in A's remote view, not the doc A's file is synced as.
+test("sim: an edit to a re-create loser is judged in the loser's doc (seed 48)", async () => {
+	const r = await runSim({ seed: 48, devices: 3, faults: DEFAULT_FAULTS });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
+// Suite-1 seed 15 (4 devices): D cleared a colour on a canvas it had not read yet; the node had moved meanwhile, the
+// merge conflicted (same record) and put D's bytes in a conflict copy, which B deleted. The oracle discarded the
+// copy's values but never a removal.
+test("sim: a removal kept only in a deleted conflict copy is discarded with it (suite-1 seed 15)", async () => {
+	const r = await runSim({ seed: 15, devices: 4, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
 
 test("sim: same seed, same plan, same trace and same converged bytes (seeded Yjs clientIDs)", async () => {
 	const cfg: SimConfig = { seed: 4242, devices: 3, faults: DEFAULT_FAULTS };
@@ -124,4 +310,92 @@ test("invariants: tokens must be contiguous; a crash-lost pending conflict copy 
 	assert.deepEqual(checkNothingDestroyed([a, b], ledger).map((v) => v.detail), ["[A.36] was on A:y.md (external) and is gone"]);
 	a.crashLost.push("other [A.36]\n");
 	assert.deepEqual(checkNothingDestroyed([a, b], ledger), []);
+});
+
+const board = (nodes: string, edges = "") => `{"nodes":[${nodes}],"edges":[${edges}]}`;
+const textNode = (id: string, x: number, extra = "") => `{"id":"${id}","type":"text","text":"t","x":${x},"y":0,"width":10,"height":10${extra}}`;
+
+test("invariants: canvases converge canonically (formatting may differ), not semantically", () => {
+	const { a, b } = twoDevices();
+	a.vault.userWrite("c.canvas", board(textNode("n1", 1)));
+	b.vault.userWrite("c.canvas", `\uFEFF{\r\n  "edges": [],\r\n  "nodes": [${textNode("n1", 1)}]\r\n}\r\n`);
+	a.vault.userWrite("e.canvas", "");
+	b.vault.userWrite("e.canvas", board(""));
+	const none = { docs: [], error: null };
+	const v = checkConvergence([a, b], none).map((x) => x.detail);
+	assert.ok(!v.some((d) => / differs/.test(d)), JSON.stringify(v));
+	b.vault.userWrite("c.canvas", board(textNode("n1", 2)));
+	assert.ok(checkConvergence([a, b], none).some((x) => x.detail.startsWith("c.canvas differs")));
+});
+
+test("invariants: canvas validity, lost records, lost field writes and discarded values", async () => {
+	let { a, b } = twoDevices();
+	const o = new CanvasOracle();
+	const w = (rec: string, field: string, value: string, saw: string | null, step: number): FieldWrite =>
+		({ rec, field, value, saw, dev: "A", step, path: "c.canvas", atMs: step });
+	// a garbage file left on disk, and a broken version the engine wrote once
+	a.vault.userWrite("bad.canvas", "{\"nodes\":[{\"id\":");
+	b.vault.userWrite("bad.canvas", "{\"nodes\":[{\"id\":");
+	await b.vault.write("x.canvas" as VaultPath, "{\"nodes\":[1]}", { t: "absent" });
+	b.vault.userDelete("x.canvas");
+	let v = checkCanvas([a, b], o).map((x) => x.detail);
+	assert.ok(v.some((d) => d.startsWith("A: bad.canvas is not a valid canvas")), JSON.stringify(v));
+	assert.ok(v.some((d) => d.startsWith("B: the engine wrote an invalid canvas to x.canvas")), JSON.stringify(v));
+	({ a, b } = twoDevices());
+	// n1 created and moved 1 -> 5; n2 created, never deleted
+	o.created("n:n1", "A", 1, "c.canvas");
+	o.created("n:n2", "A", 2, "c.canvas");
+	o.write(w("n:n1", "x", "1", null, 1));
+	o.write(w("n:n1", "x", "5", "1", 3));
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(textNode("n1", 1)));
+	v = checkCanvas([a, b], o).map((x) => x.detail);
+	assert.ok(v.includes("lost n:n2 (created on A at step 2 in c.canvas)"), JSON.stringify(v));
+	assert.ok(v.some((d) => d.startsWith("lost write n:n1.x=5 on A at step 3")), JSON.stringify(v));
+	// the newer value holds (and n2 deleted): clean
+	o.deleted("n:n2", { dev: "A", step: 4, atMs: 4, how: "record", saw: new Map(), doc: null });
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+	assert.deepEqual(checkCanvas([a, b], o), []);
+	// a removal undone
+	o.write(w("n:n1", "color", "\"1\"", ABSENT, 5));
+	o.write(w("n:n1", "color", ABSENT, "\"1\"", 6));
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(textNode("n1", 5, `,"color":"1"`)));
+	assert.ok(checkCanvas([a, b], o).some((x) => x.detail.startsWith("lost write n:n1.color=(removed)")));
+	// a format no projection writes, by the engine
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+	assert.deepEqual(checkCanvas([a, b], o), []);
+	// root fields belong to the canvas's lineage: a conflict copy keeping the replaced value does not undo a removal
+	const rooted = (extra: string) => `{"simCanvas":"L1"${extra},"nodes":[${textNode("n1", 5)}],"edges":[]}`;
+	o.write({ ...w("root", "viewport", "\"v1\"", ABSENT, 7), lineage: "L1" });
+	o.write({ ...w("root", "viewport", ABSENT, "\"v1\"", 8), lineage: "L1" });
+	for (const d of [a, b]) {
+		d.vault.userWrite("c.canvas", rooted(""));
+		d.vault.userWrite("c (conflict A 2026-01-01 0001).canvas", rooted(`,"viewport":"v1"`));
+	}
+	assert.deepEqual(checkCanvas([a, b], o), []);
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", rooted(`,"viewport":"v1"`));
+	assert.ok(checkCanvas([a, b], o).some((x) => x.detail.startsWith("lost write root.viewport=(removed)")));
+	for (const d of [a, b]) {
+		d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+		d.vault.userDelete("c (conflict A 2026-01-01 0001).canvas");
+	}
+	// An edge a user rewired and labelled while another deleted its new endpoint: the CRDT keeps it dangling, so no
+	// canvas shows it but a conflict copy from before the label (suite-1 seed 167). Visible with the old label: lost.
+	const e1 = (label: string) => `{"id":"e1","fromNode":"n1","toNode":"n3"${label}}`;
+	o.created("n:n3", "B", 9, "c.canvas");
+	o.created("e:e1", "A", 9, "c.canvas").endpoints.add("n1").add("n3");
+	o.write(w("e:e1", "label", "\"E1\"", ABSENT, 10));
+	o.deleted("n:n3", { dev: "B", step: 11, atMs: 11, how: "record", saw: new Map(), doc: null });
+	for (const d of [a, b]) {
+		d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+		d.vault.userWrite("c (conflict A 2026-01-01 0002).canvas", board(`${textNode("n1", 5)},${textNode("n3", 1)}`, e1("")));
+	}
+	assert.deepEqual(checkCanvas([a, b], o), []);
+	for (const d of [a, b]) d.vault.userWrite("c.canvas", board(`${textNode("n1", 5)},${textNode("n3", 1)}`, e1("")));
+	assert.ok(checkCanvas([a, b], o).some((x) => x.detail.startsWith("lost write e:e1.label=\"E1\"")));
+	for (const d of [a, b]) {
+		d.vault.userWrite("c.canvas", board(textNode("n1", 5)));
+		d.vault.userDelete("c (conflict A 2026-01-01 0002).canvas");
+	}
+	await a.vault.write("f.canvas" as VaultPath, ` ${board(textNode("n1", 5))}`, { t: "absent" });
+	assert.deepEqual(checkCanvas([a, b], o).map((x) => x.detail.slice(0, 81)), ["A: f.canvas holds bytes neither the projection's formatting nor written by a user"]);
 });

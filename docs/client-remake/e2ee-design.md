@@ -267,6 +267,13 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
     (`parseSetupLink` rejects one), so neither the server nor the link can name another vault's secret.
   - Value: JSON `{ "v": 1, "vaultId", "suite": 1, "keys": [{ "e", "k": b64url(K_e) }], "records": [b64url(k record)] }`.
   - The records are kept so they can be re-published after a reset or restore (§11.5). They are not secret.
+  - **A copy of the records** also lives in each epoch's IndexedDB (meta `keyringRecords`: the winners and the
+    revokes held open, rewritten whenever the set changes; `src/engine/keyring/keyring.ts` `onRecords`). A keychain
+    reset takes the SecretStorage value but not the DB. When init brings no records for a suite-1 pin, the engine
+    reads the copy from this vault's and device's DBs (`storedKeyringRecords`, `src/engine/compose/knownEpoch.ts`)
+    and the keyring takes it in place of main's empty set. Without it, a reset or restore that emptied `k` before
+    any device re-published, followed by the loss of every device's keychain, left nothing the RK could open (§13.3):
+    every device stayed key-missing for good (sim suite-1 seeds 115, 148, 149, 167).
   - Value size limits **[U]** (WP-E0, §23.3).
 - **NEVER persist a key in IndexedDB.** Chromium writes stored CryptoKeys' raw bytes in plaintext **[M]**. WebKit
   adds keychain IPC, lock-state failures and an index bug (§3).
@@ -459,6 +466,18 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
     that a frame may have used while it was in flight when IndexedDB was lost.
   - Allocation and the outbox write share the engine's edit chain (`src/engine/runtime/logApi.ts`), so frameNo
     order is outbox order.
+  - **A store that lost IndexedDB** knows its own committed frames only once it has read the stream, so a frame it
+    allocates before that (offline, or while the read is held for a key or failing) can take a number its earlier
+    frames already used; every reader would ignore it as a replay and its ops would be lost. So ns/cfg sends open
+    only once both streams are read in the session (a held or failed read keeps them closed, and the phase
+    catching-up, until a later read completes). First, when an own unsent frame sits at or below the committed edge
+    (fold R, own rows above the fold, the floor) and its clientFrameId is not in the fold's ring, every own frame of
+    the stream not in the ring is numbered again, in outbox order from above every own number known +
+    NS_DEDUPE_RING, and sealed again under its own id (`FoldRuntime.renumberBlind`, `renumberBlindFrames`,
+    `SessionLoop.afterStartReads`). A frame allocated with the edge known is above it. A frame in the ring did
+    commit (one recovered from the outbox mirror whose row a checkpoint covers gets no late receipt): it keeps its
+    bytes and its resend is deduped. Later allocations skip NS_DEDUPE_RING again once the fold shows an own frame
+    above every allocation of the runtime.
   - No new persistent counter: the fold state (in IDB and in checkpoints), own tail rows and the outbox already
     hold it.
   - Epoch migration (DESIGN §c.12 step 3) carries the device's highest own frameNo per stream into the new DB as
@@ -572,7 +591,8 @@ A device with no suite pin never reaches this table: it opens nothing (§12.4).
 
   The device is read-only: it seals nothing, uploads no blob, and its outbox is held. An unpinned device does not
   even run the reconcile, so it has no outbox. The status names the remedy: "Scan a re-key code from another
-  device, or enter the recovery key".
+  device, or enter the recovery key". When the phase leaves `key-missing` the engine plans the vault at once
+  (a full pass), so edits and deletes made while read-only go out without waiting for the failed passes' backoff.
 
 ## 10. Blobs
 
@@ -934,8 +954,9 @@ Rows already sealed under e−1 stay valid. Outbox frames are not re-sealed: a r
 - The bytes are verbatim, so the records validate exactly as before. Concurrent re-publishes from two devices
   produce byte-identical duplicates, which are harmless.
 - Every device keeps all records (§6.1), so any device can re-publish. A device restoring from RK alone needs the
-  genesis or a revoke record to be present. After a reset where no device survives, the vault holds nothing
-  readable anyway.
+  genesis or a revoke record to be present: in `k`, or in the DB copy of a device whose keychain was lost (§6.1),
+  which the RK opens and which the device re-publishes once re-keyed. After a reset where no device keeps its
+  records, the vault holds nothing readable anyway.
 - **An open revoke is stored too.** A revoke the device holds open (pending, no winner for its epoch: the device is
   `revoked-epoch`) is stored after the winners, at most `STORED_OPEN_REVOKES` (4, `src/engine/keyring/book.ts:51`).
   After a reset or restore that drops it from `k`, the device stays `revoked-epoch` (it writes and rolls nothing)
@@ -1594,6 +1615,7 @@ export interface KeyringCrypto {
 | `TailRecord` | + `frameNo: number` (0 outside ns/cfg and for rows that failed the gate; WP-E2). Own rows carry the allocator's max across restarts (§8.2) |
 | `MetaRecord` | + `MetaKeyring {key: "keyring"; sealEpoch; epochs: {e, firstSeq, kind, verified}[]; revokeEpoch: number \| null; sRot: Seq \| null; ownSeals: number}`. **No key bytes** (§6.1) |
 | `MetaRecord` | + `MetaFrameNoFloor {key: "frameNoFloor"; ns: number; cfg: number}`, written by epoch migration (§8.2) |
+| `MetaRecord` | + `MetaKeyringRecords {key: "keyringRecords"; winners: Uint8Array[]; open: Uint8Array[]}`: the copy of the records (§6.1). Public bytes only |
 | ns and cfg fold state records | Carry `replay` (V2 encoding) |
 | `StreamRecord.cls` | Accepts `"keyring"` |
 | `tail` for `k` | Holds `k` records like any stream. There is no snapshot, since `k` has no checkpoints |
@@ -1681,8 +1703,9 @@ The `x:` carrier was later deleted, so the §j.1 hunk below is superseded: blobs
 **Applied (E8):** every hunk below is now in DESIGN.md, as built. Differences from the hunks: the AAD header is
 `u8 formatVersion ‖ u8 suite ‖ varuint keyEpoch`; the replay window sits inside §c.3 step 2, after the ring hit test,
 and frameNo 0 never reaches it (decode rejects it; failed rows are stored with frameNo 0 and fold as empty); the `k`
-row says commit-only and no checkpoint (the hunk's "yes" was not a broadcast value); stale-epoch snap rows are
-accounted, not stored; the keyring read is §d.7 step 3a, after the feed, not step 0; the §j.1 `x:` hunk stays superseded.
+row says commit-only and no checkpoint (the hunk's "yes" was not a broadcast value); stale-epoch snap rows were
+first accounted, not stored, and are now stored flagged like ns/cfg (a trailing one left the snap fold below the
+head for good); the keyring read is §d.7 step 3a, after the feed, not step 0; the §j.1 `x:` hunk stays superseded.
 
 ```diff
  §b.1 Envelope

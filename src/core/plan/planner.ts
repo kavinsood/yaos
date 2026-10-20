@@ -53,7 +53,7 @@
  */
 
 import type {
-	ContentHash, DiskFingerprint, DocId, DocKind, LocalEntry, PathKey, PathKeyFn, Plan, PlanFn, PlannerInput, PlannerOp, RemoteEntry, Seq,
+	ContentHash, DiskFingerprint, DocId, DocKind, LocalEntry, ObservedRename, PathKey, PathKeyFn, Plan, PlanFn, PlannerInput, PlannerOp, RemoteEntry, Seq,
 	SyncedEntry, VaultPath, BodyVersion,
 } from "../types";
 import { sha256Hex } from "../hash/sha256";
@@ -117,9 +117,36 @@ export function restartAtCreate(s: SyncedEntry, createHash: ContentHash): Synced
 
 export const plan: PlanFn = (input) => planWith(input);
 
-export function planWith(input: PlannerInput, options: Partial<PlannerContext> = {}): Plan {
+/**
+ * The observed renames, plus the one each fileGone record kept (`renamedTo`): observed before ns was ready, it is
+ * gone from memory after an engine restart, and without it the file is lost track of (sim hot canvas seed 705).
+ */
+function withKeptRenames(input: PlannerInput, pk: PathKeyFn): PlannerInput {
+	const kept: ObservedRename[] = [];
+	for (const s of input.synced.values()) {
+		if (!s.fileGone || !s.renamedTo) continue;
+		const e = { from: s.path, to: s.renamedTo.to, atMs: s.renamedTo.atMs };
+		if (!input.renames.some((x) => pk(x.from) === pk(e.from) && pk(x.to) === pk(e.to))) kept.push(e);
+	}
+	return kept.length === 0 ? input : { ...input, renames: [...input.renames, ...kept] };
+}
+
+/** The end of the observed rename chain starting at `key` (its last event), if any. */
+function renamedAway(renames: readonly ObservedRename[], key: PathKey, pk: PathKeyFn): { to: VaultPath; atMs: number } | null {
+	let at = key;
+	let last: ObservedRename | null = null;
+	for (const e of [...renames].sort((x, y) => x.atMs - y.atMs)) {
+		if (pk(e.from) !== at) continue;
+		at = pk(e.to);
+		last = e;
+	}
+	return last && at !== key ? { to: last.to, atMs: last.atMs } : null;
+}
+
+export function planWith(input0: PlannerInput, options: Partial<PlannerContext> = {}): Plan {
 	const ctx: PlannerContext = { ...DEFAULT_PLANNER_CONTEXT, ...options };
 	const pk = ctx.pathKey;
+	const input = withKeptRenames(input0, pk);
 	const units: PlanUnit[] = [];
 	const handled = new Set<DocId>();
 	const claimed = new Set<PathKey>();
@@ -291,7 +318,16 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 	};
 
 	// ---- rename inference ------------------------------------------------------
-	const freshLocal = inScopeLocal.filter((l) => !l.excluded && !syncedByKey.has(l.pathKey) && !remoteOwns(l.pathKey));
+	/**
+	 * The file at `key` is new although a synced doc sits there: that doc's file is gone (decided delete, fileGone)
+	 * and the user renamed another file there (sim seed 703 F DEV3). It takes part in inference as a new file.
+	 */
+	const goneHere = (key: PathKey): boolean => {
+		const id = syncedByKey.get(key);
+		const s = id === undefined ? undefined : input.synced.get(id);
+		return s?.fileGone === true && arrivedElsewhere(key, s);
+	};
+	const freshLocal = inScopeLocal.filter((l) => !l.excluded && (goneHere(l.pathKey) || (!syncedByKey.has(l.pathKey) && !remoteOwns(l.pathKey))));
 	const unhashedFresh = freshLocal.some((l) => l.hash === null);
 	const missing: SyncedEntry[] = [];
 	for (const id of docIds) {
@@ -318,8 +354,9 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		const rest = freshLocal.filter((l) => !used.has(l.pathKey));
 		if (gone.length > 0) for (const rn of inferRenames(gone, rest, input.renames, false, pk)) inferred.set(rn.docId, rn);
 	}
-	// Observed renames off a re-occupied source path (header): observed-only inference over the rest.
-	const renamedFrom = new Set(input.renames.map((e) => pk(e.from)));
+	// Observed renames off a re-occupied source path (header): observed-only inference over the rest. A rename onto
+	// the same path key (case only) leaves nothing behind: the file there is the renamed file (hot canvas seed 208).
+	const renamedFrom = new Set(input.renames.filter((e) => pk(e.from) !== pk(e.to)).map((e) => pk(e.from)));
 	const movedAway = new Set<DocId>();
 	if (ctx.nsReady && renamedFrom.size > 0) {
 		const reoccupied: SyncedEntry[] = [];
@@ -444,7 +481,16 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		if (!l && !ctx.nsReady) return push(prefix);
 		const inf = l ? undefined : inferred.get(origId);
 		if (inf && !claimed.has(inf.to.pathKey)) return deletedRenamed(s, r, inf.to, prefix);
-		if (!l) return push([...prefix, drop(s.docId)]);
+		if (!l) {
+			// Own rows the delete did not cover (§c.7 duty) and the file deleted here too: dropped, S would leave the
+			// restore to the no-S branch below, which brings the doc back at its path. Kept, the pass after the
+			// restore sees live/present/absent: an nsDelete covering the own rows, or edit-beats-delete (sim blob seed 5).
+			if (hasRestoreDuty(s.docId)) {
+				if (r.pendingLocal) return push([...prefix, waitOp(s.docId, "pending-ns")]);
+				return push([...prefix, { op: "nsRestore", docId: s.docId, path: r.path, againstDeleteSeq: r.deletedSeq }]);
+			}
+			return push([...prefix, drop(s.docId)]);
+		}
 		if (!ctx.nsReady) return push(prefix);
 		const Lc = l.hash !== s.contentHash;
 		if (!Lc && !hasRestoreDuty(s.docId)) {
@@ -472,7 +518,7 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 	 * path, with the file's content (`reconcileContent` records the synced path; otherwise a `syncedPut` does).
 	 */
 	const deletedRenamed = (s0: SyncedEntry, r: RemoteEntry, l2: LocalEntry, prefix: PlannerOp[]): void => {
-		const { fileGone: _gone, ...s } = s0;
+		const { fileGone: _gone, renamedTo: _to, ...s } = s0;
 		claimed.add(l2.pathKey);
 		if (l2.hash === null) return push([...prefix, { op: "needHash", path: l2.path }]);
 		if (r.pendingLocal) return push([...prefix, waitOp(s.docId, "pending-ns")]);
@@ -491,14 +537,20 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 	};
 
 	const liveMissing = (s0: SyncedEntry, origId: DocId, r: RemoteEntry, prefix: PlannerOp[]): void => {
-		const { fileGone, ...s } = s0;
+		const { fileGone, renamedTo: _to, ...s } = s0;
 		const docId = s.docId;
 		const inf = inferred.get(origId);
 		if (inf && !claimed.has(inf.to.pathKey)) {
 			const l2 = inf.to;
 			claimed.add(l2.pathKey);
 			if (l2.hash === null) return push([...prefix, { op: "needHash", path: l2.path }]);
-			const step = contentStep(s, r, l2, l2.path, l2.path, true);
+			// The source path holds S's own bytes again (the engine re-materialized the doc there before the rename
+			// event arrived): S is that file's record, and the moved file's base is unknown (sim hot canvas seed 0).
+			const stale = movedAway.has(docId) && input.local.get(s.pathKey)?.hash === s.contentHash;
+			const step0 = contentStep(s, r, l2, l2.path, l2.path, true);
+			const step = !stale ? step0 : {
+				...step0, ops: step0.ops.map((o): PlannerOp => (o.op === "reconcileContent" ? { ...o, hasBase: false, noBase: true } : o)),
+			};
 			const hasContentOp = step.ops.some((o) => o.op !== "syncedPut" && o.op !== "wait");
 			const renameOps: PlannerOp[] = [{ op: "nsRename", docId, path: l2.path }];
 			// The content job writes the synced path itself; otherwise record the move now.
@@ -514,7 +566,9 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		const hold = (...ops: PlannerOp[]): void => {
 			push([...prefix, ...ops]);
 			if (!fileGone && input.localComplete) {
-				push([{ op: "syncedPut", entry: { ...s, fileGone: true } }], "nsDelete", brakeKey("nsDelete", docId, s.path, s.contentHash), s.path);
+				const away = renamedAway(input.renames, s.pathKey, pk);
+				const entry: SyncedEntry = { ...s, fileGone: true, ...(away ? { renamedTo: away } : {}) };
+				push([{ op: "syncedPut", entry }], "nsDelete", brakeKey("nsDelete", docId, s.path, s.contentHash), s.path);
 			}
 		};
 		if (s.kind !== "blob" && (!r.body || !r.body.caughtUp)) return hold(waitOp(docId, "body-not-caught-up"));
@@ -525,7 +579,13 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		if (Rc) {
 			// Edit beats delete. A decided delete whose path holds a new file by now: the file merges into the doc
 			// after all (the next pass sees it as the doc's), there is no free path to restore the doc at.
-			if (fileGone && r.pathKey === s.pathKey && input.local.has(s.pathKey)) return push([...prefix, { op: "syncedPut", entry: s }]);
+			// Unless the file there is another doc's: renamed there by the user from elsewhere, or synced as another
+			// doc's (sim seed 703 F DEV3). The doc then waits for its path.
+			if (fileGone && r.pathKey === s.pathKey && input.local.has(s.pathKey)) {
+				const other = arrivedElsewhere(s.pathKey, s) || claimed.has(s.pathKey)
+					|| [...input.synced.values()].some((o) => o.docId !== docId && o.pathKey === s.pathKey && !o.fileGone);
+				return push(other ? prefix : [...prefix, { op: "syncedPut", entry: s }]);
+			}
 			return push([...prefix, { op: "diskMaterialize", docId, path: r.path, expect: { t: "absent" } }]);
 		}
 		if (r.pendingLocal) return hold(waitOp(docId, "pending-ns"));
@@ -537,6 +597,15 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		push(ops, "nsDelete", brakeKey("nsDelete", docId, s.path, s.contentHash), s.path);
 	};
 
+	/** A caught-up markdown / canvas body with content whose textHash is not known: not resident here. */
+	const unhashed = (r: RemoteEntry): boolean => r.kind !== "blob" && r.body !== null && r.body.caughtUp && r.body.hasContent && !ctx.remoteTextHash.has(r.docId);
+	/** Wait for `docId`'s text to be loaded and hashed (runner: wait "text-hash"); the winner is not planned meanwhile. */
+	const waitText = (docId: DocId, prefix: PlannerOp[], winner: DocId = docId): boolean => {
+		handled.add(winner);
+		push([...prefix, waitOp(docId, "text-hash")]);
+		return true;
+	};
+
 	const collapse = (s: SyncedEntry, r: RemoteEntry, l: LocalEntry, prefix: PlannerOp[]): boolean => {
 		const winner = input.remoteByPathKey.get(s.pathKey);
 		if (winner === undefined || winner === s.docId || input.synced.has(winner) || handled.has(winner)) return false;
@@ -546,18 +615,38 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		const identical = wh !== null && wh === l.hash;
 		// §c.12: devices re-creating the vault after an epoch reset race on every path. A differing loser at a
 		// path with an old-epoch base merges into the winner (3-way against that base) instead of a loser rename.
-		const migrated = !identical && s.kind === "markdown" && ctx.pathBaseKeys.has(s.pathKey);
-		if (!identical && !migrated) return false;
+		const migrated = !identical && s.kind !== "blob" && ctx.pathBaseKeys.has(s.pathKey);
+		// A caught-up text whose hash is unknown here is not resident (a restart since): load it and decide on the
+		// next pass, instead of a loser rename for want of it (a duplicate; sim suite-1 seed 65).
+		if (!identical && !migrated) return wh === null && unhashed(w) ? waitText(winner, prefix) : false;
+		// The loser must still hold just what this device synced: once another device wrote to it (it materialized
+		// the loser under its suffixed name and edited it there), its nsDelete would drop that edit with it. It is a
+		// doc of its own then, and keeps the loser rename.
+		if (r.body && !r.body.caughtUp) {
+			handled.add(winner);
+			push([...prefix, waitOp(s.docId, "body-not-caught-up")]);
+			return true;
+		}
+		const lh = remoteHash(r);
+		if (lh === null && unhashed(r)) return waitText(s.docId, prefix, winner);
+		if (lh === null || lh !== s.contentHash) return false;
 		handled.add(winner);
 		if (migrated && (!w.body?.caughtUp || (!w.body.hasContent && w.createHash !== EMPTY_CONTENT_HASH))) {
 			push([...prefix, waitOp(s.docId, w.body?.caughtUp ? "body-empty" : "body-not-caught-up")]);
+			return true;
+		}
+		// The loser's own create frames still unsequenced: its nsDelete would carry a base below them and hand every
+		// device a restore duty (§c.7), bringing the loser back under a suffixed name. Collapse once they are acked,
+		// as a user delete waits.
+		if (input.docsWithPendingBody.has(s.docId)) {
+			push([...prefix, waitOp(s.docId, "pending-body")]);
 			return true;
 		}
 		const ops: PlannerOp[] = [
 			...prefix, { op: "rebind", fromDocId: s.docId, toDocId: winner, path: w.path, ...(migrated ? { adopt: true as const } : {}) },
 			{ op: "nsDelete", docId: s.docId, baseBodySeq: baseBodySeq(r) },
 		];
-		if (migrated) ops.push({ op: "reconcileContent", docId: winner, path: l.path, kind: "markdown", hasBase: false, pathBase: true });
+		if (migrated) ops.push({ op: "reconcileContent", docId: winner, path: l.path, kind: s.kind, hasBase: false, pathBase: true });
 		push(ops);
 		return true;
 	};
@@ -620,7 +709,7 @@ export function planWith(input: PlannerInput, options: Partial<PlannerContext> =
 		}
 		const found = movedAway.has(s.docId) ? { l: undefined, atRemote: false } : localFor(s, r);
 		if (found.atRemote && s.fileGone) {
-			const { fileGone: _gone, ...live } = s; // the doc's file is at its remote path: not gone, and the put records it there
+			const { fileGone: _gone, renamedTo: _to, ...live } = s; // the doc's file is at its remote path: not gone, and the put records it there
 			s = live;
 		}
 		const l = found.l;

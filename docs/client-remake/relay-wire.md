@@ -288,7 +288,8 @@ For a socket admitted with `VAULT_READY.head = H`:
   on the socket:
   - `STREAM_RECEIPTS` entry with `deduped:false` if the socket is the origin;
   - `COMMIT_NOTICE` if it holds the PROVISIONAL;
-  - a seq in a `STREAM_SKIPPED` run if it has subscribed and does not want the stream (§5.6);
+  - a seq in a `STREAM_SKIPPED` run if it does not want the stream (§5.6; until it subscribes it wants no other
+    device's `b:`/`c:` rows);
   - `COMMITTED` otherwise.
   Seqs are contiguous, so **any gap means a bug or a lost socket**. Recover with feed + read (§9).
   - `deduped:true` receipts are extra acknowledgements. Example: a second socket of the same device re-sends a
@@ -304,8 +305,8 @@ For a socket admitted with `VAULT_READY.head = H`:
 - **No echo.** The origin socket never receives its own frames back. Other sockets of the same device do, so
   filter on `deviceId` if needed.
 - **No re-delivery.** A deduplicated resend of a commit-only frame is not re-delivered to peers.
-- **Filtering only by subscription.** A socket that never sent `STREAM_SUBSCRIBE` receives every stream. A
-  subscribed socket receives payloads as §5.6 says, and every other seq as skipped.
+- **Filtering only by subscription.** A socket receives payloads as §5.6 says (one that never sent
+  `STREAM_SUBSCRIBE` has the empty set), and every other seq as skipped.
 
 ### 5.4 Idempotency, resend and conflicts
 

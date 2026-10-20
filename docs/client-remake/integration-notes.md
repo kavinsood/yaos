@@ -332,6 +332,37 @@ devices).
 | 47 | A fold row stored unopened (reader-dependent gate failure) whose re-gate came out "accounted only" (a snap row `k` judged stale-epoch, e2ee-design §9.3) was skipped by `regateUnopened`: it stayed unopened and the snap fold stayed halted behind it for good. | sim heavy E2EE seed 42 (suite 1) | facea307: such a row leaves the tail (`tReplaceTail` `drop`), as a reader that gated it so at first never stored it; the fold resumes. |
 | 48 | After an IDB wipe, S for B's attachment came back from a mirror older than the fold's suffix move (a2 -> "a2 (2)"); C's attachment had taken a2. The planner took C's file as the doc's, trashed B's own file at the remote path as a stray copy (bug 38's rule) and pushed C's bytes as an edit of B's attachment. | sim seed 630 F DEV3 (production checkpoint thresholds) | e3b46533: when the file at S's path holds other bytes and the file at the remote path holds S's bytes, still the doc's remote bytes, the doc's file is the one at the remote path (D18). |
 | 49 | A crashed after its ns frame committed and before the receipt; a peer's ns checkpoint at lastSeq retired the stream (H7). A restarted, adopted the checkpoint (covering the frame) and resent the frame, which the relay deduped at its old seq. The receipt put the frame back in the overlay as committed-not-folded, but its row lay under the snapshot: one pending ns frame for good. The sim's dedupe window lost retired rows (the resend was appended again), which hid it. | sim heavy seed 27 (the "pending ns frames" failures) | 58eca457: receipts carry their commit seq to `noteCommitted`; a frame whose seq the fold already covers is not pending. |
+| 50 | C deleted a canvas while B, offline, edited it and then deleted the file too. B's planner saw deleted/present/absent and dropped S; the next pass, with no S but B's restore duty (its rows after the delete's base), restored the doc and undid both deletes. | sim blob stall/slow seed 5 F DEV3 (canvas round) | db8096f6: with restore duty the row restores keeping S (a pending own ns op waits); the next pass sees live/present/absent and deletes with B's rows covered, or edit-beats-delete. DESIGN §f.2. |
+| 51 | During IDB-wipe recovery the engine re-materialized boards/c2 before the user's late rename event c2 -> c1 arrived, writing S and the base from the projection. The rename moved S onto c1, which held A's older bytes; the merge used the projection as base, so every record B had added read as deleted by A, and B's node was lost. Markdown takes the same path. | sim hot canvas seed 0 | 265b876a: an observed rename off a re-occupied source whose file holds exactly S's bytes reconciles the moved file with `noBase`; the md and canvas jobs skip the stored base and the S-hash fallback (CRDT kept, disk differences to a conflict copy). DESIGN §f.6. |
+| 52 | Offline with ns not ready, B renamed canvas c0 -> boards/c2, kept editing and created a new c0. The pass marked the doc fileGone; the observed rename lived only in memory and a crash dropped it. Online, edit-beats-delete merged the new c0 into the doc (deleting every old record, a peer's text edit with them) and boards/c2 became a new doc. | sim hot canvas seed 705 | af93fcba: the fileGone mark keeps the end of the observed rename chain (`SyncedEntry.renamedTo`), replayed as an observed rename while the mark stands; cleared with fileGone. DESIGN §f.6. |
+| 53 | A doc with fileGone kept claiming its path key; when another doc's observed rename moved its file onto that path, the gone doc took the bytes as its own save and put S back. Two docs owned notes/r6.md and the devices diverged. | sim seed 703 F DEV3 (canvas round sweep) | 97478c9e: a file brought onto a gone doc's path by another doc's rename (`arrivedElsewhere`), or held by another live record, is that doc's: fresh local for it, and the gone doc's row does not re-adopt it. |
+| 54 | Sim only: C's frame was refused at a daily-limit latch that lifted before C's next frame, which committed. A held a causal hole for ~750 ms until C's 1 s retry, but the sim's FAST_TUNING re-read 3 x 60 ms and froze the note for good; its rename never applied on A and five tokens were lost. DESIGN §d.6 requires a window of at least 2 x PROVISIONAL_ADOPT_MS (production: 4 x 60 s against the 1 s retry). | sim seed 520 F DEV3 (canvas round sweep) | 513f6e1a: sim devices run `SIM_TUNING` (1 s re-read interval); a test pins the window against the own-frame retry. No client change. |
+| 55 | Sim only: A rewired an edge to a new node and labelled it while C deleted that node. The CRDT kept the edge (label included) and the projection dropped it as dangling, as DESIGN §j.2 says; only an older conflict copy showed the edge, so the lost-write check flagged the label. | suite-1 seed 167 F DEV3 | f430b91d: fields of an edge whose endpoint a user deleted are exempt while only conflict copies hold it (record survival already was). Self-test. |
+| 56 | Sim only: revoked B brought a node to the front; an epoch restore made B re-onboard and its canvas survived as the suffixed duplicate "c5 (2).canvas" with B's order, but the order check counted only conflict copies as copies. | suite-1 seed 34 E2EE DEV3 | 31bf71de: a canvas of another doc holding the node counts as a copy (as for the delete rule). Seed pinned. Reverted in 90c717e7: the duplicate was a client bug (58). |
+| 57 | A revoked C, which deleted an attachment while key-missing. Every pass planned the nsDelete and failed on the write gate, so the scheduler backed off (32 s and more). Re-keyed, C had no pass due until the backoff ran out, after the heal: the delete never left. | suite-1 seed 23 E2EE DEV3 | 3ed8afec: VaultRuntime requests a full pass at once when the phase leaves key-missing. Seed pinned. |
+| 58 | After an epoch migration a locally changed canvas came back as a suffixed duplicate ("c1 (2).canvas") instead of being 3-way merged. The §c.12 mechanism was markdown-only: prepareEpochMigration kept only markdown bases, the planner's migrated-loser collapse fired only for markdown, and the canvas job never looked up a path base. So a canvas's own re-create that lost the path race took a loser rename. | suite-1 seed 24 E2EE DEV3 (seed 34 before 3ed8afec) | c26726a6: bases for every text kind (a canvas's is its merge text); the collapse fires for canvases; the trust rule and path-base lookup move to contentSteps.ts, shared, with the rule matching whole record lines for a canvas. Unit tests; seed pinned (90c717e7). |
+| 59 | The re-create collapse (identical or migrated loser) sent the loser's nsDelete while the loser's own create frames were still unsequenced. Its base sat below them, every device got the §c.7 restore duty, and the loser came back as "x (2)". Markdown and canvas alike. | suite-1 seeds 89, 171 E2EE DEV3 | 6a9184b5: the collapse waits on pending-body, as a user delete does. Planner test. |
+| 60 | The re-create collapse deleted a loser another device had already edited (it had materialized the loser as "c3 (3).canvas" and added a node). The nsDelete covered that edit, so the node and its token were lost. This was latent for markdown and showed up once canvases took the migrated collapse, which waits for the winner's body. | seed 581 F DEV3 (also 37, 244) | 6a9184b5: collapse only while the loser's remote text is still what this device synced; otherwise, or when it can't be read here, the loser keeps its rename. Planner test; seed pinned. |
+| 61 | Sim only: with the canvas epoch base, a record deleted just before an epoch restore (or while the device was still on the epoch the relay had left) comes back without a conflict copy, so the delete rule flagged it. Before the fix it also came back, but beside a conflict copy that the rule accepted. The restored state holds the record and the base cannot tell it from an addition: DESIGN §c.12, markdown text alike. | suite-1 seeds 103 E2EE DEV4, 19 E2EE DEV2 heavy | 90c717e7: the oracle records restores and stale-epoch deletes; the delete rule exempts them. Seeds pinned. |
+| 62 | Sim only: the keeper recorded a revoke's new RK only when revokeRekey resolved. The revoking device crashed with its keychain lost after the record went out and won; the command rejected, nobody could re-key the other device from that RK, and it stayed key-missing. | suite-1 seed 355 E2EE DEV3 | 2783dfeb: the keeper records the RK at issue (the user writes it down when shown); an RK whose record lost opens nothing. Seed pinned. |
+| 63 | Sim only: hostileDowngrade forged its rows after an await; as the last step, heal() ran first, saw no forged rows and never started the keeper, so no device released the frozen doc. | suite-1 seed 112 E2EE DEV3 | 611d3761: the forge starts the keeper itself once healing. Seed pinned. |
+| 64 | A store that lost IndexedDB opened ns sends and went live before its ns/cfg reads completed. With the read held (a checkpoint under a missing key) new creates reused frameNos its earlier frames had used and were ignored as replay duplicates; with the read failed, the phase said live and the planner trashed synced files against an empty ns view. | suite-1 seeds 163, 51 E2EE DEV2 heavy | ba83a1e0: the ns window and the live phase wait for ns and cfg to be read in the session; own unsent frames at or below the committed edge and not in the dedupe ring are renumbered above every own number and resealed. Engine tests; seeds pinned. |
+| 65 | Stale-epoch snap rows (e2ee-design §14.3) were only accounted, never stored (unlike ns and cfg). When one was the stream's last row (a hostile replay of an old-epoch snap frame) the snap fold's coversSeq stayed below the head for good; an own snap frame that committed stale was folded as sent, which no reader does. Exposed by 64. | suite-1 seed 174 E2EE DEV2 heavy | 6fdb2500: stale snap rows are stored flagged LOCAL_FLAG_STALE_EPOCH and fold as ignored; FoldRuntime.gap() skips them. Unit tests; seed pinned. |
+| 66 | The canvas disk/CRDT merge ran a line diff3 over the merge text; adjacent changed lines form one hunk, so a conflict on one record swallowed the disk's edit of its neighbour, which then lived only in a conflict copy. | suite-1 seed 217 E2EE DEV3 | 146b6c26: when all three texts differ the merge resolves record by record. Unit tests; seed pinned. |
+| 67 | An observed rename onto the same path key (case only) counted as leaving the path, so the doc was held until ns was ready; an offline device never merged its canvas and an edge delete was lost. | hot canvas suite-1 seed 208 | 8b6e8992: same-key renames no longer count. Planner test; seed pinned. |
+| 68 | S1's "moved on" check used the overlay's projected path of a pending own rename; the overlay suffixes a target another doc holds, so a late fold of an earlier rename put S back on the old path and the next pass merged another doc's file into the note. | hot canvas suite-1 seed 503 | eb49ba2e: RemoteView carries the requested path keys of own pending rename/restore ops; S is checked against those. Unit test; seed pinned. |
+| 69 | Sim only: deleting a conflict copy discarded only its current value, so a value the same writer's later write in that file had replaced still counted as a lost write. | hot canvas suite-1 seed 570 | df52b4a9: the discard follows the writer's own replaced values. Seed pinned. |
+| 70 | A key a device installed from a revoke's prevWrap was labelled "prev" in the book only; a Keyring opened again on the adapter took it for an own key, which never unblocks a roll, so K_1 stayed out of reach and every blob transfer failed for ever. | suite-1 seeds 74, 184 E2EE DEV2 heavy | 75a36681: fillKeys reaches an undecided epoch's key from the verified winner's prevWrap on every evaluation. Keyring test; seeds pinned. |
+| 71 | The old epoch's path bases were memory only: a crash after the migration and before its merges lost them, and B's re-create came back as a conflict copy (a canvas: a suffixed duplicate). A crash before the old DB's retirement also left it for good. | suite-1 seed 65 E2EE DEV3 | 68750e06: bases stored in the new DB's meta (`pathBase:`) with its identity, retired as paths settle; 53d463d1: the re-create collapse loads a text it cannot hash yet (wait `text-hash`) instead of renaming the loser; 76026264: every other epoch's DB of the vault and device is deleted on first live. No schema bump. Composed test; seed pinned. |
+| 72 | A record or text deleted before an epoch restore (or on the epoch the relay had left) came back: the restored state held it and the merge against the old base read it as added. The sim exempted it (61). | suite-1 seeds 103 E2EE DEV4, 19 E2EE DEV2 heavy | 3f42a04d: the migration stores what the old doc deleted with each base: a canvas's deleted record keys, a markdown doc's delete set with its docId (used only when the new epoch holds the same doc). Exemption removed. Gap: after a reset a markdown delete a peer's file never received still comes back (nothing names the text; DESIGN §c.12). |
+| 73 | Every device lost its keychain after a reset or restore emptied `k` and before any re-published: the records lived only in SecretStorage, so the RK had nothing to open and the vault stayed unreadable on every device. | suite-1 seeds 115, 148, 149, 167 E2EE DEV2 heavy | 67caeff4: each DB keeps a copy of the records (meta `keyringRecords`); an init without records reads it and the RK opens it; the runtime re-publishes as before. Gap: a device that loses both its keychain and its IndexedDB has nothing left, as before. Keyring tests; seed pinned. |
+| 74 | `npm run check:client` could exit 1 naming no test: node:test exits 1 without its summary on SIGTERM/SIGINT (a `pkill -f` from another shell matched the runner's file list) and the script turned a SIGKILL's null status into 1 too. | check:client | 86213b56 (glob, TAP side log, 128+n exits), superseded when merged into client-remake-next by 0f3664dd: `scripts/test-failures-reporter.mjs` names every failing test on stderr as it fails and at the end, and the runner reports how it ended (signal or exit code). |
+| 75 | Sim only: a root write's holders were the canvases of its lineage key only. B, holding no canvas, created one at A's path; its file merged into A's doc as an edit and the doc's root took B's lineage key, so A's later root writes, present in the converged canvas, were judged against an old conflict copy and reported lost. | suite-0 hot canvas seed 8 (after 146b6c26 changed the run) | the oracle also counts the canvas of the doc the write was made in (FieldWrite.doc). |
+| 76 | The deletes carried by 72 were keyed by path: a doc the old epoch had renamed (the rename gone with the old outbox, or another device's rename restored) sat at another path in the new epoch, so its merge or materialize never saw them and the deleted record came back. | suite-1 seeds 164 E2EE DEV2 heavy, 139 E2EE DEV3 | the migration stores each old doc's deletes by docId (meta `docDeletes:<docId>`); `applyOldDeletes` makes them again as own edits right after the doc is acquired for its first merge or materialize in the new epoch, wherever it is. Canvas keys also stay on the path base for a reset. Retired when applied, when the doc has a synced record, or when no live doc has the id. Gap: a doc adopted without a job (file equal to the new text) retires them unapplied. |
+| 77 | Sim only, after binary-reads merged with the canvas oracle: a device is now behind on every canvas nobody pushes it. A deleted an edge on disk while its reads failed (httpFail; the merge waits for the read, DESIGN I4), then deleted the canvas. An unseen edit by C restored the canvas as A's CRDT held it, the edge with it, and the delete rule flagged it. The record delete never reached the CRDT and goes with the file, as the markdown oracle already treats text typed into a deleted file. | seed 21 F DEV3 | Oracle: a file delete on a device whose replica of the doc is not caught up turns that device's own record deletes the replica still holds into deletes with the file. Seed pinned. |
+| 78 | Sim only: the canvas oracle attributed an edit to the doc the engine's remote view maps the path to. After an epoch reset A's stale copy of c0 lost the path race; B and C edited the loser, so it kept its loser rename, and A's offline reorder went into it ("c0 (2).canvas"). The oracle judged the reorder in the winner. Stale copies at a reset are common under subscriptions, so the loser path is too. | seed 48 F DEV3 | Oracle: `docIdOf` takes the device's synced record at the path first. Seed pinned. |
+| 79 | Sim only: deleting a conflict copy discarded its values but never a removal. D cleared a colour on a canvas it had not read yet; the node had moved meanwhile, the merge conflicted (same record) and put D's bytes in a copy, which B deleted. | suite-1 seed 15 E2EE DEV4 | Oracle: the copy's maker's removals of a field the copy's record lacks, made before the copy, are discarded with it (by write, not by value). Seed pinned. |
+| 80 | Test only: largeHold.test.ts waited for y's cursor to reach the head, then read the quarantine. Under subscriptions the big row reaches y as a skip, which accounts the seq at once; the quarantine exists only after the catch-up read gates the row. Under load the read lost the race ("the inline body row is held", once in a full run). | `src/engine/keyring/largeHold.test.ts` | The test waits for the held row itself; y's reads get 250 ms of link latency, so the old wait fails every run. |
 
 Sim-only fixes found on the way (no client change): epoch names reused across
 resets, one global clock skew instead of per-device, ledger coverage of
@@ -341,7 +372,12 @@ waiting on the blob queue. From the checkpoint coverage round (89c5accd,
 H7; the retired rows stay in its dedupe window, as H2 keeps their keys), sim
 device ids were shorter than the relay's 16 characters (every snap
 row was ignored), and quiescence ignored blob store calls outside the blob
-queue and a running snapshot job.
+queue and a running snapshot job. From the canvas round (§6.2): the canvas oracle attributes
+root fields to a canvas's lineage (a `simCanvas` marker), not its doc id,
+which conflict copies, IDB wipes and epoch resets do not keep; a broken save
+followed by a delete marks the records of both the broken and the last good
+text deleted; a delete the device lost to an IDB wipe without mirrors is
+exempt.
 
 ## 4. Deviations from DESIGN
 
@@ -404,6 +440,14 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - D17 keeps one merge case: a waiting delete, a remote edit of the doc, and a
   new file at the doc's remote path merge that file into the doc (edit beats
   delete). It is rare enough to accept; no sweep hit it.
+- The §c.12 path-keyed bases live in memory only. A runtime restart (app or
+  commit crash) between the migration and the merges loses them, and the
+  device's re-creates fall back to loser renames ("x (2)" duplicates; nothing
+  lost; suite-1 seed 65).
+- After an epoch change, a deletion is re-derived only against the old
+  epoch's base. A record or text the new epoch still holds (a restored state
+  from before the delete, a dropped unsent delete, a peer's file that never
+  got it) comes back, for markdown and canvases alike (DESIGN §c.12).
 - The bind-time merge (openDoc) does not use the §c.12 path-keyed epoch base
   that the merge job uses (`trustedEpochBase`): a note edited offline while
   open across an epoch reset gets two conflict copies where a 3-way merge was
@@ -732,7 +776,7 @@ crashed or wiped across a checkpoint and its GC). 447 ns, 9 cfg and 9 snap
 checkpoints were written with own frames of the stream pending. No
 checkpoint was refused at the gate in suite 0. Wall time: 318 s before, 274
 s after on the same machine (p50 per run unchanged within noise). Canvas
-has no coverage: the actors never create a canvas.
+had no coverage then: the actors never created a canvas (see §6.2).
 
 The round found bugs 45-49 (§3) and the sim-only fixes listed under the
 table there. Bug 49 is the "pending ns frames" failure seen before the
@@ -749,6 +793,114 @@ With such failures returning `retry` instead (an experiment, not committed)
 all 21 runs pass. That branch is being reworked separately
 (newer fold rules), so it is left as it is here.
 
+
+### 6.2 Canvas coverage (branch client-remake-audit-canvas)
+
+Since e6c40b87 every matrix edits `.canvas` files the way Obsidian, other
+programs and broken saves do (`src/sim/canvas.ts`). The edits are creates,
+node add / move / resize / color / text, edge add / rewire / relabel /
+delete, node delete with its edges, front/back reorders, unknown root, node
+and edge fields, link-updater rewrites, big boards (150-1200 nodes), renames,
+deletes, external reformatting and half-written saves that complete later.
+Canvas steps draw from their own seeded fork. A new matrix, "2 devices,
+concurrent offline canvas edits" (CANVAS_FAULTS, offline weight 16, fault
+rate 0.2, 3 canvas actions per step on a pool of 2 canvases), makes both
+devices edit the same records offline. `checkCanvas` (bf4f2c73) checks the
+semantics stated in DESIGN §j.2 "Merge semantics": canonical convergence
+with the replica and a fresh relay read (checkpoint parity), validity of
+every file and every engine write, projection-exact engine bytes, no lost
+records, no resurrected deletes, no field write undone (saw-chains over
+unique values, unknown fields included), and uncontested reorders kept.
+Text-node edits carry ledger tokens.
+
+Counts per matrix, `YAOS_SIM_CRYPTO=none YAOS_SIM_SEEDS=750 node
+scripts/sim-suite1.mjs` (2045 runs). The hot row is the hot matrix alone at
+750 seeds (`YAOS_SIM_SEEDS=6000 ... "canvas edits"`).
+
+| Matrix | Seeds | Canvas actions | Creates | Broken saves | Merges | 3-way (divergent) | clean / conflict / rejected | Conflict copies | Invalid notices | c: checkpoints ok / GC puts / adopted / oracle |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2 devices, no faults | 750 | 21047 | 1713 | 605 | 35388 | 263 | 170 / 159 / 3 | 151 | 462 | 9570 / 9472 / 377 / 1558 |
+| 3 devices, default faults | 750 | 19252 | 1704 | 576 | 36559 | 219 | 116 / 447 / 3 | 436 | 514 | 6884 / 6830 / 2450 / 1462 |
+| 5 devices, default faults | 188 | 5253 | 441 | 139 | 17153 | 72 | 43 / 135 / 2 | 132 | 126 | 2138 / 2119 / 917 / 419 |
+| 2 devices, heavy faults | 188 | 3607 | 403 | 96 | 4056 | 13 | 5 / 126 / 0 | 126 | 90 | 730 / 727 / 271 / 278 |
+| 3 devices, blob stall/slow | 75 | 1764 | 172 | 58 | 3292 | 15 | 9 / 74 / 0 | 73 | 48 | 583 / 582 / 268 / 146 |
+| concurrent offline canvas (hot) | 94 | 14724 | 228 | 325 | 14698 | 161 | 86 / 130 / 3 | 124 | 260 | 1056 / 1043 / 276 / 217 |
+| hot, alone | 750 | 115652 | 1837 | 2476 | 116135 | 1241 | 704 / 949 / 23 | 880 | 2062 | 9042 / 8953 / 2175 / 1663 |
+
+The suite's hit check fails the hot matrix unless it has real 3-way merges,
+conflicts, invalid-file notices and canvas checkpoints written and adopted.
+
+Coverage of the canvas files (node test coverage through an esbuild loader
+with source maps; jiti's maps misplace lines). Run over canvasDoc.test,
+reconciler.canvas.test, hash.test, run.test (16 seeds) and 25 hot + 20
+seeds of each default matrix:
+
+| File | Lines | Branches | Functions |
+|---|---|---|---|
+| core/hash/canvasCanonical.ts | 100% of code (96.8% incl. the header) | 87.0% (240/276) | 100% |
+| core/hash/canvasOrdering.ts | 100% (96.1%) | 95.7% (66/69) | 100% |
+| engine/reconcile/canvasDoc.ts | 100% (90.8%) | 93.8% (106/113) | 100% |
+| engine/reconcile/canvasJob.ts | 100% (88.1%) | 84.5% (60/71) | 100% |
+| engine/reconcile/canvasMerge.ts | 100% (84.4%) | 96.8% (61/63) | 100% |
+| sim/canvas.ts | 100% (97.3%) | 93.8% (530/565) | 100% |
+
+The uncovered "lines" are each file's header (doc comment and imports,
+which the transform drops). Before the round the sweeps never reached the
+parser limits, the rejected-merge fallback in a unit test, a canvas merge
+write refused by the fingerprint precondition (rebaseOnDisk), the
+shrinking-overwrite brake on a canvas, hostile CRDT records, a rank
+rebalance (ten sends to the back exhaust the gap below the first record),
+or `formatCanvasBytes` (used by e2e only). Tests now cover each of them
+(commit "canvas: cover the paths..."). `CanvasActor.pendingFixes` was dead
+and is deleted. The branches still unreached are defensive:
+- parser rejection reasons the sim's broken saves do not draw: over-deep
+  JSON, invalid UTF-8, nodes or edges not arrays, per-text, per-field and
+  aggregate size limits, non-string optional fields, and malformed
+  merge-text lines;
+- race guards in canvasJob: the doc row gone or not a canvas mid-job, the
+  CAS miss limit, the conflict-copy write failing, and an invalid CRDT met
+  at materialize;
+- `??` fallbacks in canvasMerge and canvasOrdering for records without a
+  rank, which the engine never writes.
+
+Runtime, this machine, base 1d60535e against the final commit:
+- `npm run test:client`: 11:53 (one blobQueue "byte budget" flake) against 15:28 (1466 tests, none failing);
+- `npm run test:sim-suite1` (crypto suite1, 200 seeds): 228.0 s against 303.5 s;
+- the default suite at 750 seeds: 279.1 s for 1951 runs against 433.5 s for 2045 runs (run p50 1.0 to 1.5 s
+  with 2 devices);
+- the hot matrix alone at 750 seeds: 144.1 s.
+Canvas steps, checkCanvas and the new matrix account for the difference.
+
+The round found bugs 50-57 (§3). Five are client bugs: four in the planner,
+which markdown hits on the same paths, and the key-missing re-plan. Three
+are sim bugs (the tuning, and two oracle exemptions that the suite-1
+E2EE runs exposed).
+
+Resolved (bugs 58-61): after an epoch migration a locally changed canvas is
+3-way merged like markdown, not left as a suffixed duplicate, and the order
+check no longer counts such a duplicate as a copy. These were the epoch
+migration's markdown-only paths:
+- `prepareEpochMigration` read only markdown bases;
+- the planner's migrated-loser collapse (`migrated`) required markdown and
+  emitted `kind: "markdown"`;
+- `mergeCanvas` never looked up the path base (`epochBaseOf`) and had no
+  trust rule (`trustedEpochBase` was a character check in mergeJob.ts).
+Two places stay markdown-only because canvases have no bound editor: the
+`saveViews` step and the bind-time merge (§5).
+
+Sweeps at 90c717e7:
+- `YAOS_SIM_CRYPTO=none YAOS_SIM_SEEDS=750` (2045 runs) is all clean, and so
+  is the hot matrix alone at 750 seeds.
+- With crypto suite1 at 750 seeds (2796 runs) every non-E2EE matrix is clean.
+- The E2EE matrices fail 11 seeds:
+  - 3 devices: 112, 217, 355;
+  - fault-heavy: 51, 74, 115, 148, 149, 163, 167, 184.
+
+  All 11 fail the same way on the parent of c26726a6, which also failed 139
+  and 164 (fixed here). They are frozen docs and quiescence timeouts, a lost
+  canvas write with no epoch change (217) and a lost attachment token (51).
+- The hot matrix alone with crypto suite1 at 750 seeds fails 208, 503 and
+  570, also unchanged from before.
 
 ## 7. End-to-end results
 

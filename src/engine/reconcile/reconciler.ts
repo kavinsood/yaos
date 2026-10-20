@@ -213,7 +213,8 @@ export class Reconciler {
 			ctx.deps.onBrake?.(report);
 			brake ??= report;
 		}
-		const actionable = plan.ops.filter((o) => o.op !== "wait" && o.op !== "needHash").length - run.deferred - run.transferring;
+		// A text-hash wait is work (the runner loads the doc): counted, so a pass that loaded one is followed up.
+		const actionable = plan.ops.filter((o) => (o.op !== "wait" || o.reason === "text-hash") && o.op !== "needHash").length - run.deferred - run.transferring;
 		// Out-of-scope read failures count too: nothing else would re-plan them before the periodic full pass.
 		const unread = Math.max(this.scan.lastUnread, plan.ops.filter((o) => o.op === "needHash").length);
 		ctx.flushConflictCopies();
