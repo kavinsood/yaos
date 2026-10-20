@@ -339,6 +339,24 @@ test("binding: flushPath (case-insensitive), flushAll and saveViews push and sav
 	assert.equal(vault.textOf("R.md"), "r12");
 });
 
+test("binding: saveViews saves only the view with the newest edit: a stale dirty view of the file cannot overwrite it", async () => {
+	const s = setup();
+	const { clock, ws, bm, vault } = s;
+	const docId = file(s, "m.md", "base");
+	bm.start();
+	const v1 = ws.openFile("m.md");
+	const v2 = ws.openFile("m.md");
+	assert.ok(v1 && v2 && v1 !== v2);
+	await clock.advance(5);
+	v2.edit(4, 0, " old");
+	await clock.advance(50); // reaches v1 (Obsidian's 10 ms cross-view debounce); v2 stays dirty, its save is 2 s off
+	v1.edit(0, 0, "new ");
+	// Hidden right after the keystroke: v2 has not received it yet.
+	assert.equal(v2.getText(), "base old");
+	assert.deepEqual(await bm.saveViews([docId]), [docId]);
+	assert.equal(vault.textOf("m.md"), "new base old", "the newest view's text, not v2's older one");
+});
+
 test("binding: a view waiting on a path re-opens at the new path when the file is renamed", async () => {
 	const s = setup();
 	const { clock, ws, engine, bm, vault } = s;

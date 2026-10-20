@@ -212,6 +212,38 @@ test("causal hole filled before the retries run out: no freeze", async () => {
 	}
 });
 
+test("causal hole while offline: retries without a session do not count, no freeze; back online it re-reads then freezes", async () => {
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const x = await rawDevice(relay);
+	try {
+		await live(a);
+		const id = await createDoc(a, "off.md", "doc;");
+		await until(() => a.isIdle(), 3_000, "idle");
+		await docText(a, id);
+		const stream = a.streamOf(id);
+		const src = new Y.Doc();
+		const ups: Uint8Array[] = [];
+		src.on("update", (u: Uint8Array) => ups.push(u));
+		src.getText("text").insert(0, "ab");
+		src.getText("text").insert(2, "c");
+		const h0 = relay.head();
+		await x.send(stream, ups[1]!);
+		await until(() => relay.head() > h0 && a.c.repo.cursor.vaultSeq === relay.head(), 3_000, "hole ingested");
+		a.disconnect();
+		const reads0 = a.c.docs.stats.causalReads;
+		await sleep(600); // ten causalRetryMs (60 ms) periods, causalRetries = 2
+		assert.equal(a.c.repo.stream(stream)!.frozen, 0, "offline: no freeze");
+		assert.equal(a.c.docs.stats.causalReads, reads0, "offline: no read counted");
+		await a.reconnect();
+		await until(() => a.c.repo.stream(stream)?.frozen === 1, 3_000, "frozen after reads online");
+		assert.equal(a.c.docs.stats.causalReads - reads0, 2);
+	} finally {
+		x.close();
+		await a.stop();
+	}
+});
+
 test("oversize-remote: valid rows pushing the text past MAX_DOC_TEXT_CHARS freeze the doc (rows stay in tail, not quarantine)", async () => {
 	const relay = new SimRelay();
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });

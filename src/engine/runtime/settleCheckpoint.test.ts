@@ -6,13 +6,12 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { REMOTE_CHECKPOINT_IDLE_MS, REMOTE_CHECKPOINT_ROWS, REMOTE_CHECKPOINT_SETTLE_DAILY, REMOTE_CHECKPOINT_SETTLE_MS } from "../../core/limits";
+import { FOLD_RULES_VERSION, REMOTE_CHECKPOINT_HARD_BYTES, REMOTE_CHECKPOINT_HARD_ROWS, REMOTE_CHECKPOINT_IDLE_MS, REMOTE_CHECKPOINT_ROWS, REMOTE_CHECKPOINT_SETTLE_DAILY, REMOTE_CHECKPOINT_SETTLE_MS } from "../../core/limits";
 import { NS_STREAM, type DocId, type StreamName, type VaultPath } from "../../core/types";
 import { VirtualClock } from "../../sim/clock";
 import { SimRelay } from "../../sim/relay";
 import { bodyCheckpointDue, CHECKPOINT_FALLBACK_MS, CheckpointState, DEFAULT_CHECKPOINT_TUNING, foldCheckpointDue, settleWanted } from "../body/checkpoints";
 import type { StreamRecord } from "../store/schema";
-import type { FoldRuntime } from "../sync/foldRuntime";
 import type { LogEngine } from "./engine";
 import { converged, drive, sleep, startTestEngine, until, createDoc, editDoc } from "./testHarness";
 
@@ -64,6 +63,30 @@ test("bodyCheckpointDue settle: duty after S idle, typing keeps it closed and re
 	assert.equal(bodyCheckpointDue(rec({ rowsSinceRemoteCheckpoint: REMOTE_CHECKPOINT_ROWS - 1 }), true, ht, T, 1_000_000 + REMOTE_CHECKPOINT_IDLE_MS, 0), false, "below hot: settle window");
 });
 
+test("bodyCheckpointDue hard cap: a stream written every 10 s never idles, yet is due past the hard cap; fallback too", () => {
+	const t0 = 1_000_000;
+	const writtenAt = (t: number, st: CheckpointState) => st.lastActivity.set(stream, t - 10_000); // a row 10 s ago, always
+	const below = rec({ rowsSinceRemoteCheckpoint: REMOTE_CHECKPOINT_HARD_ROWS - 1 });
+	const st = new CheckpointState();
+	for (let t = t0; t < t0 + 60 * 60_000; t += 60_000) {
+		writtenAt(t, st);
+		assert.equal(bodyCheckpointDue(below, true, st, T, t, 0), false, "hot but never idle: the gate holds below the cap");
+	}
+	writtenAt(t0, st);
+	assert.equal(bodyCheckpointDue(rec({ rowsSinceRemoteCheckpoint: REMOTE_CHECKPOINT_HARD_ROWS }), true, st, T, t0, 0), true, "rows cap");
+	assert.equal(bodyCheckpointDue(rec({ rowsSinceRemoteCheckpoint: 3, bytesSinceRemoteCheckpoint: REMOTE_CHECKPOINT_HARD_BYTES }), true, st, T, t0, 0), true, "bytes cap");
+	// Non-duty: activity no longer restarts the fallback clock past the cap.
+	const j = 1_234;
+	const nd = new CheckpointState();
+	const over = rec({ rowsSinceRemoteCheckpoint: REMOTE_CHECKPOINT_HARD_ROWS });
+	writtenAt(t0, nd);
+	assert.equal(bodyCheckpointDue(over, false, nd, T, t0, j), false);
+	writtenAt(t0 + F + j - 1, nd);
+	assert.equal(bodyCheckpointDue(over, false, nd, T, t0 + F + j - 1, j), false);
+	writtenAt(t0 + F + j, nd);
+	assert.equal(bodyCheckpointDue(over, false, nd, T, t0 + F + j, j), true, "fallback after F + jitter of the cap holding");
+});
+
 test("idle gate after a restart: a stream with no activity seen counts as active when the run went live", () => {
 	const r = rec({ remoteCheckpointCoversSeq: 4, rowsSinceRemoteCheckpoint: 3 });
 	const t0 = 5 * S;
@@ -112,7 +135,7 @@ test("settle cap: at most REMOTE_CHECKPOINT_SETTLE_DAILY puts per device per 24 
 });
 
 test("foldCheckpointDue: hot without idle gate; settle after S idle; at most up to the newest candidate", () => {
-	const fold = (seq: number, self: boolean) => ({ stream: NS_STREAM, halted: false, candidate: { seq, bytes: new Uint8Array(1), authoredBySelf: self } }) as unknown as FoldRuntime<unknown, unknown>;
+	const fold = (seq: number, self: boolean): Parameters<typeof foldCheckpointDue>[1] => ({ stream: NS_STREAM, halted: null, candidate: { seq, bytes: new Uint8Array(1), authoredBySelf: self, rulesVersion: FOLD_RULES_VERSION } });
 	const ns = (o: Partial<StreamRecord>) => rec({ stream: NS_STREAM, cls: "ns", ...o });
 	const st = new CheckpointState();
 	st.lastActivity.set(NS_STREAM, 0);

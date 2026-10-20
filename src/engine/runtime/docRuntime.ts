@@ -6,7 +6,8 @@
  *
  * Unresolved bodyUpdateRef rows (blob store unavailable or missing the
  * object, e2ee-design §10.2) are retried on a per-stream backoff timer
- * (refRetryMs doubling to refRetryMaxMs, reset once every ref resolved). Each attempt's
+ * (refRetryMs doubling to refRetryMaxMs, reset once every ref resolved; the
+ * network coming back runs it at once, retryRefsNow). Each attempt's
  * outcome feeds a per-row BlobFailureStreaks: once the initial attempt and 3
  * retries all failed deterministically (refs.ts) over >= blobQuarantineMinMs,
  * the doc is frozen "blob-corrupt" (§9.3: deterministic body failures freeze
@@ -15,7 +16,7 @@
  */
 
 import * as Y from "yjs";
-import { BLOB_QUARANTINE_RETRIES, MAX_DOC_TEXT_CHARS } from "../../core/limits";
+import { BLOB_QUARANTINE_RETRIES, FRAME_MAX_UPDATES, MAX_DOC_TEXT_CHARS } from "../../core/limits";
 import { streamClass, streamDocId, type ClientFrameId, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelayEvent } from "../../ports/relay";
@@ -124,12 +125,17 @@ export class DocRuntime {
 
 	/**
 	 * Close the open frame: take it now (order), seal + T_edit on the chain. While the write gate is shut
-	 * (e2ee-design §9.3) the edits stay in the builder; keyringRuntime closes the frame when the gate opens.
+	 * (e2ee-design §9.3) the edits stay in the builder; keyringRuntime closes the frame when the gate opens. Their
+	 * durable copy meanwhile is the vault file (Obsidian keeps saving it). Every FRAME_MAX_UPDATES held updates are
+	 * merged, so a long shut costs the bytes typed, not one buffer per keystroke.
 	 */
 	closeFrame(h: Handle): Promise<void> {
 		if (h.timer !== null) this.c.ports.clock.clearTimer(h.timer);
 		h.timer = null;
-		if (this.c.gate() !== null) return this.chain(async () => undefined);
+		if (this.c.gate() !== null) {
+			if (h.builder.count >= FRAME_MAX_UPDATES) h.builder.coalesce();
+			return this.chain(async () => undefined);
+		}
 		const taken = h.builder.take();
 		if (!taken) return this.chain(async () => undefined);
 		h.pins++;
@@ -236,6 +242,17 @@ export class DocRuntime {
 		this.refRetry.set(h.stream, next);
 		next.timer = this.c.ports.clock.setTimer(delayMs, () => void this.refRetryFire(h.stream, next));
 	}
+	/**
+	 * The network came back: every armed ref retry runs now instead of at its backoff time. The delay is kept, so a
+	 * retry that fails again re-arms at the next doubling (checkRefs), not from the base.
+	 */
+	retryRefsNow(): void {
+		for (const [stream, st] of [...this.refRetry]) {
+			if (st.timer === null) continue; // running now
+			this.c.ports.clock.clearTimer(st.timer);
+			void this.refRetryFire(stream, st);
+		}
+	}
 	private clearRefRetry(stream: StreamName): void {
 		const st = this.refRetry.get(stream);
 		if (!st) return;
@@ -291,6 +308,11 @@ export class DocRuntime {
 			this.clearCausal(stream);
 			return;
 		}
+		const again = (): void => {
+			if (this.causal.get(stream) === st) st.timer = this.c.ports.clock.setTimer(this.c.tuning.causalRetryMs, () => void this.causalRetry(stream));
+		};
+		// No session: no read can run, so the attempt does not count (offline must not use up the retries).
+		if (!this.c.session) return again();
 		if (st.attempts >= this.c.tuning.causalRetries) {
 			this.clearCausal(stream);
 			await this.c.freeze(stream, "causal-hole");
@@ -299,7 +321,7 @@ export class DocRuntime {
 		st.attempts++;
 		this.stats.causalReads++;
 		await this.c.sess.runRead(stream, rec.snapshotCoversSeq);
-		if (this.causal.get(stream) === st) st.timer = this.c.ports.clock.setTimer(this.c.tuning.causalRetryMs, () => void this.causalRetry(stream));
+		again();
 	}
 
 	/** Another device's provisional on a bound doc: apply, then T_adopt (DESIGN §d.5). */

@@ -63,6 +63,8 @@ interface ViewSlot {
 	attachId: number;
 	attachPosted: boolean;
 	timer: TimerHandle | null;
+	/** Monotonic time of this view's latest local edit; -1: none. */
+	lastLocalMono: number;
 	/** Reload counter; the latest intercepted text not yet `reloaded` (sent again after a re-bind); post order. */
 	reload: number;
 	reloadText: string | null;
@@ -262,16 +264,33 @@ export class BindingManager {
 		this.retryUnbound(path);
 	}
 
-	/** Engine request (viewSaved): save the views of `docIds` now; the engine checks the disk after its vault events. */
+	/**
+	 * Engine request (viewSaved) and app hide: save each doc of `docIds` now; the engine checks the disk after its vault
+	 * events. One view per doc, the one with the newest local edit: Obsidian copies an edit to the file's other views
+	 * only after a 10 ms debounce (onInternalDataChange), so right after a keystroke another dirty view still holds
+	 * older text, and its save, landing after, would overwrite the keystroke on disk (sim seed 141, suspendKill). The
+	 * newest view holds every edit older than that debounce; the others reload from its write.
+	 */
 	async saveViews(docIds: readonly DocId[]): Promise<DocId[]> {
 		const saved: DocId[] = [];
-		for (const docId of docIds) {
-			const doc = this.docs.get(docId);
-			if (!doc) continue;
-			for (const slot of [...doc.slots]) await slot.view.save().catch(() => undefined);
+		for (const { docId, view } of this.viewsToSave(docIds)) {
+			await view.save().catch(() => undefined);
 			saved.push(docId);
 		}
 		return saved;
+	}
+
+	/** The view saveViews saves for each known doc of `docIds`: the one with the newest local edit. */
+	viewsToSave(docIds: readonly DocId[]): { readonly docId: DocId; readonly view: EditorViewRef }[] {
+		const out: { docId: DocId; view: EditorViewRef }[] = [];
+		for (const docId of docIds) {
+			const doc = this.docs.get(docId);
+			if (!doc) continue;
+			let newest: ViewSlot | null = null;
+			for (const slot of doc.slots) if (!newest || slot.lastLocalMono > newest.lastLocalMono) newest = slot;
+			if (newest) out.push({ docId, view: newest.view });
+		}
+		return out;
 	}
 
 	/** Raw vault events (the host forwards every event here before batching). */
@@ -301,7 +320,7 @@ export class BindingManager {
 	private newSlot(view: EditorViewRef): ViewSlot {
 		return {
 			viewId: view.viewId, view, seq: 0, state: "idle", doc: null, binding: null, client: null, unintercept: null,
-			attachDoc: null, attachId: 0, attachPosted: false, timer: null, reload: 0, reloadText: null, reloadChain: Promise.resolve(),
+			attachDoc: null, attachId: 0, attachPosted: false, timer: null, lastLocalMono: -1, reload: 0, reloadText: null, reloadChain: Promise.resolve(),
 		};
 	}
 
@@ -456,6 +475,7 @@ export class BindingManager {
 	private onLocal(slot: ViewSlot, changes: ChangeSet): void {
 		const client = slot.client;
 		if (!client) return;
+		slot.lastLocalMono = this.deps.clock.monotonic();
 		client.local(changes);
 		if (slot.state === "bound" && slot.timer === null) {
 			slot.timer = this.deps.clock.setTimer(MAIN_UPDATE_COALESCE_MS, () => {
