@@ -190,6 +190,14 @@ test("sim: an edit to a re-create loser is judged in the loser's doc (seed 48)",
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Suite-1 seed 15 (4 devices): D cleared a colour on a canvas it had not read yet; the node had moved meanwhile, the
+// merge conflicted (same record) and put D's bytes in a conflict copy, which B deleted. The oracle discarded the
+// copy's values but never a removal.
+test("sim: a removal kept only in a deleted conflict copy is discarded with it (suite-1 seed 15)", async () => {
+	const r = await runSim({ seed: 15, devices: 4, faults: E2EE_FAULTS, faultRate: 0.3, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */

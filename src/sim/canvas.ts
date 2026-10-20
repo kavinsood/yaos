@@ -364,6 +364,12 @@ export class CanvasOracle {
 	readonly reorders: ReorderIntent[] = [];
 	/** Field values the user threw away with a conflict copy they deleted (rec|field|value). */
 	readonly discarded = new Set<string>();
+	/**
+	 * Removals the user threw away with a conflict copy they deleted: the copy's maker's removals of a field the copy's
+	 * record lacks, made before the copy. By write, not rec|field|value: another device's removal of the field is not
+	 * the copy's.
+	 */
+	readonly discardedRemovals = new Set<FieldWrite>();
 	/** Nodes / edges some external program sorted (no order intent holds for them afterwards). */
 	readonly sorted = new Set<string>();
 	/** IDB wipes that dropped the mirrors (device, time): the device's unsent ops are gone, deletes included. */
@@ -700,6 +706,16 @@ export class CanvasWorld {
 		return out;
 	}
 
+	/** The device a conflict copy was first written on (its maker) and when, from the vaults' histories. */
+	private copyBorn(path: string): { readonly dev: string; readonly atMs: number } | null {
+		let born: { dev: string; atMs: number } | null = null;
+		for (const dv of this.w.devs) {
+			const v = dv.vault.history.find((x) => x.path === path);
+			if (v && (!born || v.atMs < born.atMs)) born = { dev: dv.name, atMs: v.atMs };
+		}
+		return born;
+	}
+
 	private deleteFile(d: SimDevice, a: Extract<CanvasAction, { t: "cDelete" }>, step: number, tag: string): string {
 		const path = pickOf(canvasFiles(d), a.file);
 		const cur = path ? d.vault.textOf(path) : null;
@@ -742,6 +758,17 @@ export class CanvasWorld {
 					cur = prev;
 				}
 			};
+			// The copy holds its maker's disk bytes when it was made: a tracked field its record lacks is the maker's
+			// removal, thrown away with it (suite-1 seed 15, 4 devices: D cleared a colour on a canvas it had not read
+			// yet, the record moved meanwhile, the merge conflicted and kept the colour, B deleted the copy).
+			const born = this.copyBorn(path);
+			const discardRemovals = (rec: string, o: Obj): void => {
+				if (!born) return;
+				for (const [k, list] of this.oracle.removals) {
+					if (!k.startsWith(`${rec}|`) || o[k.slice(rec.length + 1)] !== undefined) continue;
+					for (const r of list) if (r.dev === born.dev && r.atMs <= born.atMs) this.oracle.discardedRemovals.add(r);
+				}
+			};
 			for (const text of seen) {
 				const m = readModel(text);
 				if (!m) continue;
@@ -749,6 +776,7 @@ export class CanvasWorld {
 					for (const o of list) {
 						const rec = `${kind}:${o.id as string}`;
 						for (const [f, v] of this.fieldsOf(o)) discard(rec, f, v);
+						discardRemovals(rec, o);
 						if (!others.has(rec)) this.oracle.deleted(rec, { dev: d.name, step, atMs, how: "file", saw: this.fieldsOf(o), doc: docIdOf(d, path) });
 					}
 				}

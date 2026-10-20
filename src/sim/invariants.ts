@@ -508,7 +508,7 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 	for (const w of all) {
 		if (w.rec !== "root" && oracle.record(w.rec)?.deleted) continue;
 		if (dangling(w.rec)) continue;
-		if (oracle.discarded.has(`${w.rec}|${w.field}|${w.value}`)) continue;
+		if (oracle.discarded.has(`${w.rec}|${w.field}|${w.value}`) || oracle.discardedRemovals.has(w)) continue;
 		const finals = finalsOf(w.rec, w.field, w.lineage, w.doc, w.value === ABSENT);
 		if (!finals) continue;
 		const anc = oracle.ancestors(w);
