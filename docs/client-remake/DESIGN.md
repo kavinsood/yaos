@@ -268,11 +268,18 @@ canonical re-encode must be byte-identical; `foldRulesVersion` ≤ the reader's 
 = 1; above: a newer writer), and the inner coversSeq equals the relay's.
 There is no separate invariant checker: the strict decoder is the snap index's V2.
 
-**`retired`.** An empty state that tells the relay it may GC every row ≤ coversSeq. It is written only for:
+**`retired`** (designed, not implemented). An empty state that tells the relay it may GC every row ≤ coversSeq. It
+would be written only for:
 - `b:`/`c:` streams of docIds the fold has pruned, or that are merged aliases with rows.
 
 A reader that receives `retired` for a stream the fold still references treats it as a checkpoint with no state:
 the union adds nothing, and rows > coversSeq still apply.
+
+**Not built.** No engine code writes a `retired` checkpoint. Only the codec (`CheckpointEncoding.retired`,
+`src/core/envelope.ts`), the ingest gate (which passes one through, `src/engine/ingest/gate.ts`) and catch-up know
+the encoding, and catch-up does not adopt one: it counts `diag checkpoint-retired` and moves on
+(`src/engine/sync/catchUp.ts` "gap: retirement handling"). So the relay never reclaims the rows of pruned docs or
+merged aliases. Tracked as [BACKLOG](../BACKLOG.md) RETIRE (relay row reclamation).
 
 ### b.6 Size rules and splitting
 
@@ -507,7 +514,8 @@ path (example E8).
   never dangle.
 - One frame-level event `pruned{docIds}` is emitted.
 - Later ops on pruned docIds are `unknown-docid`.
-- Devices with checkpoint duty put `retired` checkpoints for the pruned docs' `b:`/`c:` streams (§d.9).
+- Designed, not implemented: devices with checkpoint duty would put `retired` checkpoints for the pruned docs'
+  `b:`/`c:` streams (§b.5, §d.9). Nothing writes them today, so a pruned doc's relay rows stay (BACKLOG RETIRE).
 - A long-offline device that still holds a pruned doc is handled by the planner row "absent/pruned" (§f.2). An
   absent doc this device never saw committed (`S.nsTouchSeq = 0`) is not taken for pruned (§f.2).
 - Alternative: age-based pruning. Rejected: it needs wall clocks, which the fold never reads.
@@ -659,7 +667,7 @@ changes.
   three trees, and nothing destructive follows from the ignored op. A `rev-mismatch` keeps both (§c.8).
 - **Precondition ops** (delete, restore, setBlob) are emitted only when the doc has no pending own ns op, so a device
   never makes its own delete stale. Creates and renames pipeline freely.
-- **Pruned**: the doc's streams are retired. **Restore duty**: see §c.7.
+- **Pruned**: the doc's streams would be retired (§b.5; not implemented, BACKLOG RETIRE). **Restore duty**: see §c.7.
 
 ### c.14 Worked examples
 
@@ -1154,6 +1162,12 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 - **`releaseQuarantine{stream}`** re-runs the gate on the quarantined rows. Rows that pass are applied. The rest are
   marked dismissed and stay in the store for diagnostics. The doc is unfrozen, and from then on disk edits merge
   normally.
+  - **No user control yet.** The command is in the protocol (`UserCommand`, `src/protocol/messages.ts`) and the
+    engine handles it (`src/engine/compose/runtimeOps.ts`), but nothing in `src/host` sends it: there is no command
+    or button. Only the sim sends it (`src/sim/e2eeFaults.ts`). In the product a quarantined or `blob-corrupt` doc
+    is released only by the automatic retry at session start for reader-dependent rows
+    (`retryReaderQuarantine`, `src/engine/runtime/quarantineRelease.ts`) or by **Rebuild local cache**. Tracked as
+    [BACKLOG](../BACKLOG.md) QUARANTINE-UI.
 - **Own poisoned frames.**
   - After a close 1008 (malformed APPEND) or 1009 (oversize), the sender **probes**: it resends unreceipted frames one
     at a time. A frame that triggers the close again becomes `poisoned` and is never resent.
@@ -1379,7 +1393,7 @@ The planner does no destructive work until ns is caught up (§f.2).
   - A settle checkpoint covers the newest candidate. The rows after it stay: fewer than one candidate interval (1000
     vault seqs). There is at most one settle put per candidate.
   - cfg and snap use the same candidate rule.
-- **`retired`.**
+- **`retired`** (designed, not implemented: no duty runs and nothing puts one; §b.5, BACKLOG RETIRE).
   - For streams of docIds in a fold `pruned` event, or merged aliases that have rows.
   - Duty: the device whose frame caused the prune or merge. Fallback: 10 min.
   - `coversSeq` = the stream's `lastSeq` from `read(stream, 0, false)`.
@@ -1417,7 +1431,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | Store | Key path | Indexes | Value | Bound |
 |---|---|---|---|---|
 | `meta` | `key` | — | Singletons `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty`, `frameNoFloor`, `keyring`, `keyringRecords` (e2ee-design §6.1); one `blobPut:<address>` per blob address this device PUT (e2ee-design §10.4); one `pathBase:<pathKey>` per old-epoch base (§c.12) | 8 singletons + `pathBase:*` (dropped as paths settle) + `blobPut:*`, which is **unbounded** between prunes: each blob GC pass drops entries older than `blobGcGraceMs / 2` (`src/engine/runtime/blobGc.ts:95`) |
-| `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; never deleted (retired streams are a gap, `src/engine/sync/catchUp.ts:177`) |
+| `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; never deleted (retired streams are a gap: `src/engine/sync/catchUp.ts` "gap: retirement handling", §d.9) |
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | No size limit is enforced (a soft limit with stretching and a notice was planned, not built). **Never dropped** |
@@ -1479,8 +1493,9 @@ Rules:
 - Quarantine is bounded with oldest-first eviction.
 - The outbox is never evicted; it is bounded only by user activity while offline. No soft limit is enforced (the
   planned notice plus frame stretching was not built).
-- `streams` / `snapshots` / `tail` of pruned docs are **not** deleted yet: a `retired` checkpoint is skipped
-  (`src/engine/sync/catchUp.ts:177`, gap) and no transaction drops a stream.
+- `streams` / `snapshots` / `tail` of pruned docs are **not** deleted yet: no device writes a `retired` checkpoint,
+  catch-up skips one it reads (`src/engine/sync/catchUp.ts` "gap: retirement handling") and no transaction drops a
+  stream (BACKLOG RETIRE).
 - **Quota error:**
   1. evict `quarantine` bytes;
   2. compact everything eligible;

@@ -131,7 +131,7 @@ it to the clipboard). Pairing steps for desktop, Android and iOS: §9.0.
    DiskExecutor       engine disk ops: lanes, slices,        CfgSync        (settings/)
                       write preconditions                    SnapshotJob    (snapshots/)
    vault feed         scan + create/modify/rename/delete     SyncedMirror   A/B side file
-   side files,        .yaos/ mirrors, config dir             PassScheduler  drives passes
+   side files,        state/ mirrors, config dir             PassScheduler  drives passes
    config dir                                                HostLink       disk/config/side-file
  host/ui              status bar, settings tab, modals                      requests back to main
             \______________ src/protocol (messages, transports, ids) ______________/
@@ -141,6 +141,10 @@ The host never touches the network, Yjs, hashing or compaction: it holds
 CodeMirror state and does raw disk I/O (DESIGN §d.2; check-deps enforces it,
 §2.2). The engine never touches a file: every disk read and write is a
 rid-correlated request to the host's DiskExecutor (HostLink, §g.2).
+
+Side files (the outbox and synced-tree mirrors and the local recovery
+snapshots) live in `<configDir>/plugins/yaos/state/` (`SideFileName`,
+`src/ports/vault.ts`; `<configDir>` is usually `.obsidian`), not in the vault.
 
 ### 2.1 Flows
 
@@ -388,7 +392,7 @@ exempt.
 | D2 | §k.1, §k.2 | There is no separate worker build or "bundled worker source string". `main.js` is one bundle wrapped in a named function (`__yaosBundle`); the worker's Blob script is that function's source (`Function.prototype.toString`, ECMA-262 §20.2.3.5) called with the worker scope, and `host/entry.ts` (the only host file allowed to import `engine/workerMain`) lazily starts either the engine (worker) or the plugin (main). | The engine is in `main.js` once, and the worker starts without `eval` / `new Function` on main and without reading files. The worker needs only what it needed before: a `blob:` worker. This saves 424 KiB raw (see §8). |
 | D3 | §g.2 | `init` answers `ready` when the ports exist, before the vault runtime has started; the runtime retries in the background. Only an unusable store fails init (`storage-lost`). | A fresh device offline must still get a protocol-ready engine; only storage failure should stop the host (OR-1). |
 | D4 | §j.1 | When the relay's capabilities can't be read at startup (offline), the engine assumes the HTTP blob store exists and lets the blob queue retry. | An offline start must not run store-less: that device would not sync attachments and would freeze an oversized update `oversize-local` (`src/engine/runtime/docRuntime.ts:153-159`). (The original reason, one attachment sent as a blob ref by one device and as `x:` chunks by another, went away with the `x:` carrier.) |
-| D5 | §c.12 | `intent{epoch-migration}` is not written. A crash in the middle of a migration restarts on the newest DB (the new epoch): the path bases are gone (no-base handling) and the old DB is not deleted. | Epoch resets are rare operator actions; the snapshot taken before migration (step 1) keeps every file version. |
+| D5 | §c.12 | `intent{epoch-migration}` is not written. A crash in the middle of a migration restarts on the newest DB (the new epoch). That DB holds the path bases, which are written in the transaction that creates its identity (68750e06, bug 71), and reaching live deletes every other epoch's DB of the vault and device (76026264). Before those commits a crash here lost the bases and leaked the old DB. | Epoch resets are rare operator actions; the snapshot taken before migration (step 1) keeps every file version. With the bases stored, the intent would add nothing a restart needs. |
 | D6 | §j.3 | A JSON settings file whose fold has no keys is not created on peers (a local `{}` and a missing file are the same state). | JSON files are per-key registers; an empty register set has no file identity to project. The sim's settings invariant compares them as equal. |
 | D7 | §l.3 | Sim invariant #6 (resource bounds) is not checked by the sim runner as an invariant. #4 (fold determinism) is, since the checkpoint coverage round (§6.1): every device's ns, cfg and snap fold encodings must equal each other's and the oracle's, which folds from whatever checkpoints the relay holds. | #6 is covered by WP-C's runtime tests and benchmarks. Before §6.1 the note here said every checkpoint a sim device adopts passes V1 + V2; the sim adopted almost none. |
 | D8 | §f.2 / §j.1 | The blob queue drops transfers the plan no longer wants after every full unbraked pass (keeps settings blobs and docs with open intents). | Not in DESIGN; without it a superseded transfer stayed due forever (bug 14). |
@@ -423,9 +427,9 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - Collapse noise: a third device can materialize a suffixed loser
   (`x (2).md`) before the winner device collapses it, so that device's trash
   gets a copy of the loser. Nothing is lost; the trash holds extra entries.
-- The epoch-migration merge (bug 10) is markdown only; a differing canvas or
-  attachment re-create still becomes a suffixed loser. Path bases live in
-  memory only (D5).
+- The epoch-migration merge (bug 10) covers markdown and canvases (bug 58);
+  a differing attachment re-create still becomes a suffixed loser (blobs have
+  no base). Path bases are stored in the new DB's meta (D5, bug 71).
 - With neither a stored base nor synced-side text (rare after mirror
   recovery), the merge is still a no-base conflict copy.
 - The ns/cfg reader halt is not retried on its own; quarantine release runs
@@ -441,10 +445,6 @@ Things that are not done, or done more narrowly than DESIGN, as of this commit.
 - D17 keeps one merge case: a waiting delete, a remote edit of the doc, and a
   new file at the doc's remote path merge that file into the doc (edit beats
   delete). It is rare enough to accept; no sweep hit it.
-- The §c.12 path-keyed bases live in memory only. A runtime restart (app or
-  commit crash) between the migration and the merges loses them, and the
-  device's re-creates fall back to loser renames ("x (2)" duplicates; nothing
-  lost; suite-1 seed 65).
 - After an epoch change, a deletion is re-derived only against the old
   epoch's base. A record or text the new epoch still holds (a restored state
   from before the delete, a dropped unsent delete, a peer's file that never
@@ -1403,7 +1403,7 @@ installs one device.
     anything B did meanwhile.
 12. **IDB loss.** In devtools on A, delete the `yaos2:<vaultId>:...`
     IndexedDB databases (`store/schema.ts:22`) and reload the plugin. Expect
-    recovery from the `.yaos` mirrors with no
+    recovery from the `state/` mirrors with no
     mass conflict copies and no re-upload of the whole vault.
 13. **Relay restart / outage.** Restart the relay (or block it for a few
     minutes) while both type. Expect status `offline` -> reconnect with

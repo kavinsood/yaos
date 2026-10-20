@@ -2,6 +2,11 @@
 
 Branch `client-remake-wp-d`. Scope: DESIGN §k.3 WP-D. Status of the acceptance criteria:
 
+> **Historical record.** This file records WP-D as delivered and the integration fixes after it. The stand-in
+> engine, the stand-in hub, the inline (UI-thread) carrier fallback and the two-bundle build it describes are gone
+> (integration, `client-remake-noinline`, integration-notes D2). Where a statement no longer holds it says "as
+> delivered" or carries a "today" note. "Gaps and known issues" and the CI paragraph are kept current.
+
 | # | Criterion | Status |
 |---|---|---|
 | 1 | Worker and inline transport parity on recorded traces; transfer ownership asserted | done (`src/protocol/transports.test.ts`) |
@@ -71,12 +76,14 @@ Branch `client-remake-wp-d`. Scope: DESIGN §k.3 WP-D. Status of the acceptance 
   - browser globals only in adapters and stand-ins;
   - no WASM and nothing outside `src/` (the old-client rule went with the old client);
   - `sim/**` only from tests.
-  - Stand-in imports are warnings. Today there is one: `host/plugin.ts` imports `engine/__standins__/engine`.
+  - Stand-in imports were warnings. As delivered there was one (`host/plugin.ts` imported
+    `engine/__standins__/engine`). The stand-ins are deleted, and check-deps raises no warnings today.
 - **Sim** (`src/sim/**`):
   - `SimVault`: case profiles, CAS, Obsidian-like events, per-child folder renames, clobber records.
   - `SimWorkspace`: a y-codemirror stand-in (now a CodeMirror `Text` per view with a ChangeSet undo stack, bound
     as in DESIGN §d.3), a 2 s save debounce, `setViewData` reloads.
-  - `SimDevice`: engine, host, vault, workspace and store over the stand-in hub.
+  - `SimDevice`: engine, host, vault, workspace and store. As delivered it ran over the stand-in hub; today it runs
+    the real engine over WP-A's `SimRelay` and `MemStoragePort` (`src/sim/device.ts`).
   - Actors, faults, invariants, and a seeded runner with ddmin (`run.ts`).
 
 ## Tests
@@ -113,9 +120,9 @@ The default 200-seed run takes about 18 s. `YAOS_SIM_SEEDS=1000`: see the run lo
 
 On failure, the test prints the seed, the violations and a ddmin-minimized plan. Replay it with `runSim(cfg, plan)`.
 
-Other gates that pass:
+Other gates that passed at delivery:
 - `npm run typecheck:client`
-- `node scripts/check-deps.mjs` (0 errors, 1 stand-in warning)
+- `node scripts/check-deps.mjs` (0 errors, 1 stand-in warning; no warnings today)
 - `node esbuild.config.mjs production` (bundle smoke)
 
 ## Packaging and installing
@@ -128,7 +135,8 @@ Install steps. Use a test vault only.
 1. Copy the `yaos/` folder to `<vault>/.obsidian/plugins/yaos/`. Use the unzipped `yaos.zip` or `dist/yaos-client/yaos/`.
 2. Settings → Community plugins → enable "YAOS".
 3. Settings → YAOS, engine section: "Running in a background worker" (as delivered, the status bar showed the carrier: worker, or inline with a reason; there is no inline carrier now, and a worker that cannot start shows "Failed: …" with a "YAOS stopped: …" notice).
-4. Until integration, the engine is the stand-in. It works locally only and has no relay.
+4. As delivered, the engine was the stand-in: it worked locally only and had no relay. Today the plugin runs the
+   real engine against a paired relay.
 
 **Day-1 spike (OR-1 / OR-2).** Build it with `node scripts/build-spike.mjs`. This writes `dist/yaos-client/spike/yaos-spike.zip`, whose top level is `yaos-spike/`. Run it only in a throwaway vault, never a real one.
 
@@ -184,7 +192,7 @@ If B shows that `adapter.write` bypasses the wrapper, those writes reach YAOS on
 
 - `tsconfig.json`: `"skipLibCheck": true` (commit b4f74f7). `obsidian.d.ts` does not typecheck against the DOM lib, and the legacy build also used `-skipLibCheck`. No other frozen file was touched.
 
-## Stand-ins (all replaced at integration)
+## Stand-ins (as delivered; all deleted at integration)
 
 - `src/engine/__standins__/`:
   - `engine.ts`, `engineMessages.ts`, `diskSync.ts`, `docs.ts`: a protocol-complete engine. Docs are keyed by path; it syncs through the hub, has a credit window and does projection. It uses a conservative merge with conflict copies and has no deletes or renames.
@@ -194,7 +202,7 @@ If B shows that `adapter.write` bypasses the wrapper, those writes reach YAOS on
 - `src/sim/__standins__/`:
   - `clock.ts` and `random.ts`: WP-A's merged `sim/clock.ts` and `sim/random.ts` produce the same sequences. Switch the imports.
   - `sha256.ts`: WP-B's `core/hash`.
-  - `seededEntropy.ts`: stays.
+  - `seededEntropy.ts`: stayed; it is `src/sim/seededEntropy.ts` today.
 
 **INTEGRATION: `createEngine` contract for WP-C.** Two places call it:
 - `host/plugin.ts`, for inline: `createEngine(pair.engine, { carrier: "inline", makePorts })` (deleted with the
@@ -215,9 +223,8 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
 
 - **A pending conflict copy dies with an app crash.** It happens when a copy hits a disk error, Obsidian's 2 s autosave replaces the disk side, and the app crashes before a retry lands. Then the external side is gone. It is a triple fault (conflict, I/O error, crash within the retry window). The sim records these texts (`SimDevice.crashLost`) and exempts exactly them from "destroyed".
 - **Binary CAS is not atomic.** It is check-then-`modifyBinary`, narrowed by a stat recheck. Obsidian has no binary `process`.
-- `editor:undo` from Obsidian's menu or command can undo remote edits. It is not routed through the Yjs undo manager.
-- **Config dir:** there is no listing message and no config rename or trash.
-- ESLint does not cover `src/host/**`.
+- **Config dir:** there is no config rename or trash. Listing and removal exist (`HostIoOp` `configList` /
+  `configRemove`, `src/protocol/messages.ts`).
 - `obsidianWorkspace`, the CodeMirror attach (`collab.ts`) and `plugin.ts` are tested against fakes, not against real CodeMirror 6 or Obsidian. The phone and desktop spike runs are the real check.
 - **Sim coverage (§l).** In the matrices now:
   - relay restart / STREAM_RESEND and restarts that lose every subscription (`faults.ts` relayRestart /
@@ -255,9 +262,22 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
     `diag.checkpoint-retired/held`, `gap-feed`, `blob-gc-swept`, `frame-resealed`.
 
   The sim types only into bound views.
+- **Fixed since delivery** (removed from this list):
+  - `editor:undo` could undo remote edits. Since the main-thread rework undo is CodeMirror's own history, and the
+    binding's remote dispatches carry `addToHistory = false` (`src/host/collab.ts`, DESIGN §d.3), so an undo
+    reverts only local transactions.
+  - ESLint did not cover `src/host/**`. `eslint.config.mjs` lints `src/**/*.ts` and `npm run lint` runs; see
+    BACKLOG for the remaining error and warnings.
+  - The config dir had no listing message (see above).
+  - A doc frozen `causal-hole` stayed frozen until a user `releaseQuarantine`, even after the missing row
+    arrived. It now thaws once an apply leaves the doc with no pending structs (3a569113, DESIGN §d.6;
+    `doc-thawed` is counted in `stats.coverage`).
 - **CI:** `ci.yml` runs `test:client` (unit tests plus the first seeds of every matrix, `smoke.test.ts`) and
-  `test:sim` (every matrix at 200 seeds, 3 shards, `YAOS_SIM_SHARD`). `sim-soak.yml` runs nightly: a soak process
-  per core (`scripts/sim-soak.mjs`, swarm profiles) and the matrices at 400 seeds from a random `YAOS_SIM_FIRST`.
+  `test:sim` (every matrix at 200 seeds, 3 shards, `YAOS_SIM_SHARD`). `sim-soak.yml` runs nightly, and skips the
+  night when nothing it watches (`src`, `server`, `scripts/sim-*.mjs`, package and tsconfig files, the workflow)
+  changed since its last successful run; a manual run always runs. It runs a soak process per core
+  (`scripts/sim-soak.mjs`, swarm profiles) and the matrices at 1000 seeds from a random `YAOS_SIM_FIRST`, over 4
+  shards that share the first seed.
 
 ## Run log
 

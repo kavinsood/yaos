@@ -1,10 +1,10 @@
 # Backlog
 
 Status: the open work as of 2026-10-21, on `sim-port`. The list is the project owner's (2026-10-21); the context
-under each item is checked against the code and the notes it names. Done work is not kept here: it is in git history
-and in the notes ([integration-notes.md](client-remake/integration-notes.md) §3, the sim regression plans). Smaller
-known gaps that nobody is working on are in [sync-contract.md](sync-contract.md) §13, integration-notes §5 and
-[wp-d-notes.md](client-remake/wp-d-notes.md) "Gaps and known issues".
+under each item is checked against the code and the notes it names. Done work is not kept here once merged (the last
+section lists what landed on `sim-port` since 33bdf49b): it is in git history and in the notes
+([integration-notes.md](client-remake/integration-notes.md) §3, the sim regression plans). Smaller known gaps that
+nobody is working on are in [sync-contract.md](sync-contract.md) §13, integration-notes §5 and [wp-d-notes.md](client-remake/wp-d-notes.md) "Gaps and known issues".
 
 Section letters (§x.y) refer to [DESIGN](client-remake/DESIGN.md).
 
@@ -12,66 +12,48 @@ Section letters (§x.y) refer to [DESIGN](client-remake/DESIGN.md).
 
 ## 1. Being fixed now
 
-### BLOB-RETRY: re-download backoff after a failed attachment write
+### CLONED-ID: a cloned vault folder shares one device identity
 
-A materialize write that keeps failing after its download (I/O error, disk full, precondition mismatch) used to
-re-claim the download on every retry pass: one 5 KB attachment was fetched 601 times in 10 simulated minutes.
-31987119 (on this branch) stops `PassScheduler` resetting its failure count on a pass whose only work went in flight,
-so the retry grows 1 s → 60 s (13 GETs in the same 10 minutes) and a blob retry is never delayed past its own due
-time (`src/engine/compose/passScheduler.ts`). The owner lists the item as still in progress.
+The device identity (`vaultId`, `deviceId`, device token) is plugin data, so it lives in the vault's
+`<configDir>/plugins/yaos/data.json` (`src/host/pluginController.ts`). A vault folder copied to a second machine, or
+synced there by iCloud, Syncthing or Dropbox, carries that file: both machines then run as the same device. Nothing
+detects it. Each takes the other's ns frames for its own (`deviceId === self`, `src/engine/sync/ingestRow.ts`,
+`src/engine/sync/foldRuntime.ts`), as confirmations of local work rather than remote changes: renames revert, files
+are trashed, and creates and settings changes are dropped. The fix is being designed:
 
-### PLAN-PRUNED: a rejected own create must not be trashed as pruned
-
-When an own create folds as ignored (sim seed 222: a `replay-duplicate` after IndexedDB loss), the doc has a synced
-record but no ns entry, which the planner reads as row "absent (pruned)" and answers with `diskTrash` (§f.2; braked,
-but trashed when under the brake's threshold). The planner needs a safety net that tells "never existed in the
-fold" from "pruned" before it trashes a file. Related: FRAMENO-IDB below, which removes the known trigger.
-
-### CAUSAL-FREEZE: a causal-hole freeze never lifts
-
-After `causalRetries` re-reads a doc is frozen `causal-hole` (`src/engine/runtime/docRuntime.ts`, §d.6). Nothing
-unfreezes it: the automatic retry at session start (`retryReaderQuarantine`, `src/engine/runtime/quarantineRelease.ts`)
-only releases streams whose quarantined rows are all reader-dependent, and a causal-hole freeze has no quarantined
-rows; the user action §d.6 describes (`releaseQuarantine`) is in the protocol (`src/protocol/messages.ts`) but no
-command or button sends it. The note stays frozen until **Rebuild local cache**.
-
-### ADOPT-CKPT: adoptable provisional frames linger after a checkpoint
-
-An adoptable record (§d.5) is settled when its commit is observed, live or in a read page. Settling matches rows
-only (`settleAdoptable`, `src/engine/store/repo.ts`), so a read that answers with a checkpoint covering the commit
-settles nothing: the adoptable lingers in the outbox until its `PROVISIONAL_ADOPT_MS` timer turns it pending and
-re-appends it, and the outbox is not clean meanwhile (§l.3 5).
-
-### SIM-TUNING: `FAST_TUNING` vs DESIGN §d.6
-
-§d.6 requires the causal re-read window (`causalRetries × causalRetryMs`) to be at least 2 × `provisionalAdoptMs`;
-`causalWindowProblem` (`src/engine/runtime/options.ts`) checks it. The test harness's `FAST_TUNING`
-(`src/engine/runtime/testHarness.ts`) breaks it: 2 × 60 ms against a 3000 ms adoption timer. The sim overrides it
-(`SIM_TUNING`, `src/sim/device.ts`: 3 × 2 s), but other harness users run with the short window and can freeze docs a
-real device would not.
-
-### LINT: old lint errors
-
-`npm run lint` has not passed for the new client (integration-notes §1 recorded the state at 9b618d5). CI runs
-`typecheck`, `check:deps`, `guard:no-any` and `guard:no-real-time`, not ESLint.
-
-### DEPS: remove the unused `y-partyserver`
-
-`package.json` still lists `y-partyserver` 2.1.2 under dependencies. Nothing in `src/`, `server/src`, `tests/`,
-`e2e/` or `scripts/` imports it.
-
-## 2. Pending decision
+- an install marker that tells a cloned `data.json` from the install that wrote it, then a re-pair or a rotated
+  device identity on the clone;
+- a per-store writer tag, so two stores under one deviceId never take each other's frames for their own.
 
 ### FRAMENO-IDB: frameNo collision after IndexedDB loss
 
 ns/cfg replay protection (e2ee-design §8.2) needs every frame number of a device to be new. A store lost with an
 uncommitted frame in flight, and no outbox mirror, restarts numbering from the committed edge, so the lost runtime's
-frame and the new one can share a number: whichever commits second folds as `replay-duplicate` (sim seed 222, which
-then trashed an attachment through PLAN-PRUNED). The current guard is a stopgap: a runtime's first number is at least
-the wall clock in ms (44748cb2), ignored when the clock reads past 2^45 ms (f47950cb) (`FoldRuntime.skip`,
-`src/engine/sync/foldRuntime.ts`). It depends on the wall clock moving forward across the loss. Being investigated:
-a new writer identity (device id) after IndexedDB loss, so a fresh store never shares a replay window with the lost
-one.
+frame and the new one can share a number: whichever commits second folds as `replay-duplicate` (sim seed 222). The
+planner no longer trashes the file when that happens (d1f8a750: an own create that folded as ignored is re-created),
+but the collision itself stands. The current guard is a stopgap: a runtime's first number is at least the wall clock
+in ms (44748cb2), ignored when the clock reads past 2^45 ms (f47950cb) (`FoldRuntime.skip`,
+`src/engine/sync/foldRuntime.ts`). It depends on the wall clock moving forward across the loss. It stays until the
+CLONED-ID design lands: a fresh store under a new writer identity (rotated device id or writer tag) never shares a
+replay window with the lost one.
+
+## 2. Smaller open items
+
+### QUARANTINE-UI: quarantine release control in the UI
+
+§d.6 describes `releaseQuarantine{stream}` as a user action: re-gate a frozen doc's quarantined rows, apply what
+passes, unfreeze. The command is in the protocol (`UserCommand`, `src/protocol/messages.ts`) and the engine handles
+it (`src/engine/compose/runtimeOps.ts`, `src/engine/runtime/quarantineRelease.ts`), but nothing in `src/host` sends
+it; only the sim does (`src/sim/e2eeFaults.ts`). A doc frozen by quarantine (malformed or disallowed peer rows,
+`blob-corrupt`) is released only by the automatic retry at session start, which covers reader-dependent rows only,
+or by **Rebuild local cache**. Needs a command or a button on the frozen-doc notice. (Causal-hole freezes no longer
+need it: they thaw on their own, 3a569113.)
+
+### LINT: the remaining error and the warnings
+
+`npm run lint` runs (0ef758fa cleared the `src/` errors, 465 → 1). Left: one `obsidianmd/platform` error in
+`src/host/spike/main.ts:214`, where the throwaway spike plugin records `navigator.userAgent` on purpose (the rule may
+not be disabled), and about 590 warnings. CI does not run ESLint (`.github/workflows/ci.yml`).
 
 ## 3. Bigger work
 
@@ -123,3 +105,23 @@ From [DECISIONS](server-rewrite/DECISIONS.md) §8, still open:
   a Workers Enterprise account, where that limit is not enforced.
 - **PITR after delete** (e2ee-design §15.2, §23.3). Whether Cloudflare can restore a vault's rows after `deleteAll()`
   is unknown, so deleted plaintext may linger up to 30 days.
+
+## Landed on `sim-port` since 33bdf49b
+
+Kept here until `sim-port` merges; then git history holds them.
+
+- **BLOB-RETRY** (473cd500, after 31987119): a downloaded attachment whose disk write keeps failing backs its
+  re-downloads off per (doc, hash), 1 min doubling to a cap scaled by size (10–60 min), and is listed
+  `write-failed` with one notice (§j.1).
+- **PLAN-PRUNED** (d1f8a750): the planner's "absent (pruned)" row tells a prune from an own create that folded as
+  ignored; such a file is re-created, never trashed, and a file owned by a live doc at the path is never touched
+  (§f.2).
+- **CAUSAL-FREEZE** (3a569113, 0c151628): a `causal-hole` freeze with no quarantined rows thaws once an apply leaves
+  the doc without pending structs; triggered by new rows, the reconnect's catch-up and re-reads on session starts
+  1, 2, 4, 8, … (§d.6; diag `doc-thawed`).
+- **ADOPT-CKPT** (00cf3441): a read page that adopts a body/canvas checkpoint settles every adoptable whose content
+  the checkpoint already holds (§d.5).
+- **SIM-TUNING** (49ef12a5, 8037e333, f273232b): `FAST_TUNING` meets §d.6 (100 × 60 ms re-read window against the
+  3 s adoption timer) and `startTestEngine` refuses tuning that does not.
+- **LINT** (0ef758fa): the `src/` error backlog cleared and `npm run lint` runs; what is left is under LINT above.
+- **DEPS** (d26e533c): `y-partyserver` removed.

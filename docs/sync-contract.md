@@ -210,11 +210,16 @@ From [wp-d-notes.md](client-remake/wp-d-notes.md) "Gaps and known issues",
   diff reused can go with it (wp-d-notes "Remaining: fault-heavy 825"; 53ed8089 replaces changed bracket groups
   whole).
 - **Frozen notes can stay frozen.** A note with a quarantined row, or with a causal hole that three re-reads did not
-  fill, stops syncing; its file is left alone and status shows "Needs attention" (§d.6). Rows quarantined for a
-  reader-dependent reason (missing key, newer writer) are retried at every session start. Nothing else lifts a
-  freeze: the `releaseQuarantine` command DESIGN §d.6 describes exists in the protocol, but no command or button
-  sends it, and a causal-hole freeze has no quarantined rows to retry (BACKLOG). **Rebuild local cache** starts the
-  store over from the relay.
+  fill, stops syncing; its file is left alone and status shows "Needs attention" (§d.6). A causal-hole freeze lifts
+  by itself once the missing row arrives and the hole closes (3a569113); a hole that never fills stays frozen. Rows
+  quarantined for a reader-dependent reason (missing key, newer writer) are retried at every session start. Nothing
+  else lifts a quarantine: the `releaseQuarantine` command DESIGN §d.6 describes exists in the protocol, but no
+  command or button sends it (BACKLOG QUARANTINE-UI). **Rebuild local cache** starts the store over from the relay.
+- **Do not copy a paired vault folder to another machine.** The device identity is in the vault's
+  `<configDir>/plugins/yaos/data.json`, so a copy, or a vault also synced by iCloud, Syncthing or Dropbox, runs as
+  the same device. Nothing detects it yet, and the two machines take each other's namespace changes for their own:
+  renames can revert, files can be trashed, creates and settings changes can be lost. Pair each machine on its own
+  (BACKLOG CLONED-ID).
 - **frameNo collision after IndexedDB loss.** A store lost with an unsent namespace frame in flight and no mirror can
   reuse a frame number; the current guard is a wall-clock floor on the first number of a runtime (e2ee-design §8.2;
   commits 44748cb2, f47950cb). See BACKLOG.
