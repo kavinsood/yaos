@@ -19,7 +19,7 @@ import { CursorTracker } from "../sync/cursor";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
-	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaKeyring, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
+	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
 	type SnapshotRecord, type StreamRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
@@ -310,12 +310,19 @@ export class Repo {
 	async count(store: StoreKey): Promise<number> {
 		return this.db.tx([store], "readonly", (tx) => tx.count(store));
 	}
-	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "frameNoFloor" | "keyring">(key: K) {
+	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "frameNoFloor" | "keyring" | "keyringRecords">(key: K) {
 		return this.db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, key));
 	}
 	/** MetaKeyring (e2ee-design §18.3): keyring diagnostics and the lazy own-seal count. No key bytes. */
 	putKeyringMeta(m: MetaKeyring): Promise<void> {
 		return this.serial("putKeyringMeta", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
+			tx.put(STORE.meta, m);
+		}));
+	}
+
+	/** MetaKeyringRecords (e2ee-design §6.1): the keyring's records, not secret. */
+	putKeyringRecords(m: MetaKeyringRecords): Promise<void> {
+		return this.serial("putKeyringRecords", () => this.db.tx([STORE.meta], "readwrite", async (tx) => {
 			tx.put(STORE.meta, m);
 		}));
 	}

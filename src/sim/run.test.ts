@@ -73,6 +73,14 @@ test("sim: an RK whose revoke command was cut off by a crash still re-keys a dev
 	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
 });
 
+// Suite-1 seed 115 (2 devices, fault-heavy; 148, 149, 167 alike): B and then A lost their keychains, and an epoch
+// reset emptied `k` before either was re-keyed. The records lived only in SecretStorage, so the RK had nothing to
+// open and both devices stayed key-missing for good. Each DB now keeps a copy of the records (e2ee-design §6.1).
+test("sim: a device whose keychain was lost after a reset emptied k is re-keyed by the RK (suite-1 seed 115)", async () => {
+	const r = await runSim({ seed: 115, devices: 2, faults: E2EE_FAULTS, faultRate: 0.45, crypto: "suite1" });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 // Suite-1 seed 112 (3 devices): the last step forged suite-0 rows into a doc. The forge lands after an await, so
 // heal() in the same turn saw none and never started the keeper; nobody released the doc, frozen on every device.
 test("sim: rows forged by the last step are still released by the user after the heal (suite-1 seed 112)", async () => {

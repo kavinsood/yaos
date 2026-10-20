@@ -1332,7 +1332,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 
 | Store | Key path | Indexes | Value | Bound |
 |---|---|---|---|---|
-| `meta` | `key` | — | Singletons `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty`, `frameNoFloor`, `keyring`; one `blobPut:<address>` per blob address this device PUT (e2ee-design §10.4) | 7 singletons + `blobPut:*`, which is **unbounded** between prunes: each blob GC pass drops entries older than `blobGcGraceMs / 2` (`src/engine/runtime/blobGc.ts:95`) |
+| `meta` | `key` | — | Singletons `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty`, `frameNoFloor`, `keyring`, `keyringRecords` (e2ee-design §6.1); one `blobPut:<address>` per blob address this device PUT (e2ee-design §10.4); one `pathBase:<pathKey>` per old-epoch base (§c.12) | 8 singletons + `pathBase:*` (dropped as paths settle) + `blobPut:*`, which is **unbounded** between prunes: each blob GC pass drops entries older than `blobGcGraceMs / 2` (`src/engine/runtime/blobGc.ts:95`) |
 | `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; never deleted (retired streams are a gap, `src/engine/sync/catchUp.ts:177`) |
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |

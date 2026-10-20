@@ -26,7 +26,7 @@ import { BUDGETS } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
-import { findKnownEpoch } from "./knownEpoch";
+import { findKnownEpoch, storedKeyringRecords } from "./knownEpoch";
 import { isStorageError } from "../../ports/storage";
 import type { VaultEvent } from "../../ports/vault";
 import { ProtocolFailure, type ProtocolError } from "../../protocol/errors";
@@ -213,6 +213,12 @@ export class ComposedEngine {
 		this.config = config;
 		this.settings = config.settings;
 		this.keyring = new HostKeyring(this.link, config.crypto);
+		// SecretStorage lost its value: the records this device's DB kept (e2ee-design §6.1) let the RK re-key it
+		// even after a reset or restore emptied `k` (§11.5, §13.3).
+		if (config.crypto.suite === 1 && config.crypto.records.length === 0) {
+			this.keyring.mirror = await storedKeyringRecords(this.ports.storage, config.vaultId, config.deviceId).catch(() => null);
+			if (this.keyring.mirror) this.log(`keyring records from the DB: ${this.keyring.mirror.winners.length} winner(s), ${this.keyring.mirror.open.length} open`);
+		}
 		try {
 			this.gate = await PinGate.open(config.crypto, this.ports, this.gateKeys());
 		} finally {

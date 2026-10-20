@@ -267,6 +267,13 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
     (`parseSetupLink` rejects one), so neither the server nor the link can name another vault's secret.
   - Value: JSON `{ "v": 1, "vaultId", "suite": 1, "keys": [{ "e", "k": b64url(K_e) }], "records": [b64url(k record)] }`.
   - The records are kept so they can be re-published after a reset or restore (§11.5). They are not secret.
+  - **A copy of the records** also lives in each epoch's IndexedDB (meta `keyringRecords`: the winners and the
+    revokes held open, rewritten whenever the set changes; `src/engine/keyring/keyring.ts` `onRecords`). A keychain
+    reset takes the SecretStorage value but not the DB. When init brings no records for a suite-1 pin, the engine
+    reads the copy from this vault's and device's DBs (`storedKeyringRecords`, `src/engine/compose/knownEpoch.ts`)
+    and the keyring takes it in place of main's empty set. Without it, a reset or restore that emptied `k` before
+    any device re-published, followed by the loss of every device's keychain, left nothing the RK could open (§13.3):
+    every device stayed key-missing for good (sim suite-1 seeds 115, 148, 149, 167).
   - Value size limits **[U]** (WP-E0, §23.3).
 - **NEVER persist a key in IndexedDB.** Chromium writes stored CryptoKeys' raw bytes in plaintext **[M]**. WebKit
   adds keychain IPC, lock-state failures and an index bug (§3).
@@ -947,8 +954,9 @@ Rows already sealed under e−1 stay valid. Outbox frames are not re-sealed: a r
 - The bytes are verbatim, so the records validate exactly as before. Concurrent re-publishes from two devices
   produce byte-identical duplicates, which are harmless.
 - Every device keeps all records (§6.1), so any device can re-publish. A device restoring from RK alone needs the
-  genesis or a revoke record to be present. After a reset where no device survives, the vault holds nothing
-  readable anyway.
+  genesis or a revoke record to be present: in `k`, or in the DB copy of a device whose keychain was lost (§6.1),
+  which the RK opens and which the device re-publishes once re-keyed. After a reset where no device keeps its
+  records, the vault holds nothing readable anyway.
 - **An open revoke is stored too.** A revoke the device holds open (pending, no winner for its epoch: the device is
   `revoked-epoch`) is stored after the winners, at most `STORED_OPEN_REVOKES` (4, `src/engine/keyring/book.ts:51`).
   After a reset or restore that drops it from `k`, the device stays `revoked-epoch` (it writes and rolls nothing)
@@ -1607,6 +1615,7 @@ export interface KeyringCrypto {
 | `TailRecord` | + `frameNo: number` (0 outside ns/cfg and for rows that failed the gate; WP-E2). Own rows carry the allocator's max across restarts (§8.2) |
 | `MetaRecord` | + `MetaKeyring {key: "keyring"; sealEpoch; epochs: {e, firstSeq, kind, verified}[]; revokeEpoch: number \| null; sRot: Seq \| null; ownSeals: number}`. **No key bytes** (§6.1) |
 | `MetaRecord` | + `MetaFrameNoFloor {key: "frameNoFloor"; ns: number; cfg: number}`, written by epoch migration (§8.2) |
+| `MetaRecord` | + `MetaKeyringRecords {key: "keyringRecords"; winners: Uint8Array[]; open: Uint8Array[]}`: the copy of the records (§6.1). Public bytes only |
 | ns and cfg fold state records | Carry `replay` (V2 encoding) |
 | `StreamRecord.cls` | Accepts `"keyring"` |
 | `tail` for `k` | Holds `k` records like any stream. There is no snapshot, since `k` has no checkpoints |

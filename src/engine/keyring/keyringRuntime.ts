@@ -71,11 +71,14 @@ export class KeyringRuntime {
 		const kc = keyringCryptoOf(crypto);
 		if (e2ee.suite === 0 && crypto.suite !== 0) throw new Error("e2ee: a suite-0 pin needs the suite-0 crypto port");
 		if (e2ee.suite === 1 && (crypto.suite !== 1 || !kc)) throw new Error("e2ee: a suite-1 pin needs the suite-1 crypto port");
+		const mirror = e2ee.suite === 1 ? await c.repo.getMeta("keyringRecords") : undefined;
 		const kr = await Keyring.open({
 			mode: e2ee.suite === 0 ? "suite0" : "suite1",
 			vaultId: c.opts.vaultId,
 			kc: e2ee.suite === 0 ? null : kc,
 			records: e2ee.suite === 1 ? e2ee.records : [],
+			mirror: mirror?.key === "keyringRecords" ? mirror : null,
+			onRecords: e2ee.suite === 0 ? undefined : (r) => c.repo.putKeyringRecords({ key: "keyringRecords", winners: r.winners, open: r.open }),
 			persist: e2ee.suite === 0 ? undefined : (ch: KeyringChange) => e2ee.persist(ch),
 			diag: (code, f) => c.diag(code, f),
 		});

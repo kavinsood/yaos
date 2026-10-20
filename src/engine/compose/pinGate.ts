@@ -117,7 +117,7 @@ function keysOf(crypto: CryptoPort): ReaderKeys | null {
 async function keyed(ports: EnginePorts, o: GateKeys): Promise<boolean> {
 	const kc = keyringCryptoOf(ports.crypto);
 	if (!kc) return false;
-	const kr = await Keyring.open({ mode: "suite1", vaultId: o.vaultId, kc, records: o.keyring.records, persist: o.keyring.persist, diag: o.diag });
+	const kr = await Keyring.open({ mode: "suite1", vaultId: o.vaultId, kc, records: o.keyring.records, mirror: o.keyring.mirror, persist: o.keyring.persist, diag: o.diag });
 	try {
 		return kr.keyMissing() === null;
 	} finally {
