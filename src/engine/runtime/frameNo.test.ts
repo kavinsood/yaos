@@ -232,3 +232,25 @@ test("frameNo: a store that lost IndexedDB does not reuse the number of a frame 
 		await a2?.stop();
 	}
 });
+
+test("frameNo: the skip takes a plausible wall clock as its floor and ignores a wild one", async () => {
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	try {
+		const now = Date.UTC(2026, 9, 20);
+		a.c.ns.wallMs = () => now;
+		b.c.ns.wallMs = () => Number.MAX_SAFE_INTEGER - 10; // a later increment would leave the codec's range
+		await settle(a);
+		await settle(b);
+		await createDoc(a, "a.md" as VaultPath, "a");
+		await createDoc(b, "b.md" as VaultPath, "b");
+		await settle(a);
+		await settle(b);
+		assert.deepEqual(await ownFrameNos(a, NS_STREAM), [now + 1]);
+		assert.deepEqual(await ownFrameNos(b, NS_STREAM), [R + 1], "a wild clock falls back to the NS_DEDUPE_RING skip");
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});

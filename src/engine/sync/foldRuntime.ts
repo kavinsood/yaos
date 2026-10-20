@@ -37,6 +37,9 @@ export interface FoldRepo {
 	getTail(stream: StreamName, afterSeq?: Seq, throughSeq?: Seq): Promise<TailRecord[]>;
 }
 
+/** The highest wall clock (ms) FoldRuntime.skip takes as a frameNo floor: 2^45 ms, about the year 3084. */
+const WALL_FLOOR_MAX = 2 ** 45;
+
 /** Local-only tail flag (never on the wire): the row failed a reader-dependent gate check; content = raw payload. */
 export const LOCAL_FLAG_UNOPENED = 1 << 20;
 
@@ -319,11 +322,12 @@ export abstract class FoldRuntime<Op, E> {
 	 * the same edge the runtime it replaced allocated from, so a skip from the edge alone repeats that runtime's
 	 * numbers for a frame still in flight; whichever committed second was ignored as a replay. The clock puts the new
 	 * runtime's numbers above the old one's (which allocated fewer frames than ms passed), so an old frame committing
-	 * first leaves the new ones accepted, and one committing after them is stale (the §8.2 boundary).
+	 * first leaves the new ones accepted, and one committing after them is stale (the §8.2 boundary). A clock past
+	 * WALL_FLOOR_MAX is ignored: a wild one would pin every later number near 2^53, where the codec refuses them.
 	 */
 	private skip(max: number): number {
 		const wall = Math.floor(this.wallMs());
-		return Number.isSafeInteger(wall) ? Math.max(max + NS_DEDUPE_RING, wall) : max + NS_DEDUPE_RING;
+		return Number.isSafeInteger(wall) && wall <= WALL_FLOOR_MAX ? Math.max(max + NS_DEDUPE_RING, wall) : max + NS_DEDUPE_RING;
 	}
 
 	/** Highest own frameNo committed or receipted: fold R, own frames above the fold, the migration floor (§8.2). */
