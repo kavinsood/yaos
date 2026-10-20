@@ -1047,6 +1047,13 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
 - **Settling an adoptable:**
   - **commit observed** (`committed` with matching `(deviceId, clientFrameId)`, live or in a read page): store the
     row in `tail` and delete the adoptable without re-applying (same transaction);
+  - **checkpoint holds it** (a read page adopts a `b:`/`c:` checkpoint, fresh or union, §d.7): every adoptable of
+    the stream whose content the checkpoint state already holds (applying it to a scratch doc of the checkpoint
+    changes neither the state vector nor the delete set, and leaves nothing pending) is deleted in that page's
+    `T_read_page`. Checkpoints fold committed rows only (§d.9), so the content is on the relay, whoever committed
+    it. This covers a commit the device never sees as a row: the live batch carrying it was lost to a crash and
+    the relay GC'd the rows under the checkpoint the next read starts from. Without it the adoptable waited out
+    `PROVISIONAL_ADOPT_MS` and re-appended a redundant row. Partly held content keeps the adoptable;
   - **`provisionalDropped`, or `PROVISIONAL_ADOPT_MS` (60 s) passes without a commit:** the adoptable becomes
     `pending`, is re-appended, and its receipt settles it like an own frame.
   - A duplicate (the original also commits later) is harmless (CRDT).

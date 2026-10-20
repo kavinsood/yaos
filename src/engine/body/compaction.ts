@@ -91,6 +91,27 @@ export async function compactBody(deps: CompactDeps, stream: StreamName): Promis
 }
 
 /**
+ * True when applying `update` to `state` changes nothing: every struct it inserts and every deletion it carries is
+ * already in `state`, and nothing is left pending (DESIGN §d.5: a checkpoint holding a provisional's content settles
+ * its adoptable). A scratch doc per call: an update that is not covered must not leak into the next check.
+ */
+export function updateCoveredBy(state: Uint8Array, update: Uint8Array): boolean {
+	const scratch = new Y.Doc({ gc: true });
+	try {
+		if (state.length > 0) Y.applyUpdate(scratch, state, ORIGIN.LOAD);
+		if (scratch.store.pendingStructs !== null || scratch.store.pendingDs !== null) return false;
+		const before = Y.snapshot(scratch);
+		Y.applyUpdate(scratch, update, ORIGIN.LOAD);
+		if (scratch.store.pendingStructs !== null || scratch.store.pendingDs !== null) return false;
+		return Y.equalSnapshots(before, Y.snapshot(scratch));
+	} catch {
+		return false; // undecodable: not proven covered, the timer path stays
+	} finally {
+		scratch.destroy();
+	}
+}
+
+/**
  * Checkpoint union (DESIGN §d.7): scratch = local snapshot + every local tail
  * row <= coversSeq + the checkpoint state -> T_snapshot(fromRemote). Returns the
  * new stream record, or null when the CAS failed / a ref is unresolved.

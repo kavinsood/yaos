@@ -425,9 +425,10 @@ function digestOf(parts: readonly string[]): string {
 /**
  * Adoptable outbox records (DESIGN §d.5): another device's provisional frames this one shadows until their commit is
  * seen, else sends after provisionalAdoptMs (60 s in production, drawn up to that by tuningWorld). LogEngine.isIdle
- * does not count them, but invariant 5 wants none: when the commit is never seen as a row (the live batch holding it
- * was lost to a crash and the read that followed started from a checkpoint over it, randomized-tuning seed 90) only
- * the timer ends them, so the heal waits for it.
+ * does not count them, but invariant 5 wants none, so the heal waits for them to settle. A commit never seen as a row
+ * because the read started from a checkpoint over it (randomized-tuning seed 90) now settles through the checkpoint
+ * (catchUp.ts); a frame that never commits under its own id and is not under a checkpoint (dropped with the notice
+ * missed, refused) still ends only on the timer.
  */
 function adoptables(d: SimDevice): number {
 	let n = 0;

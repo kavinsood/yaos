@@ -5,7 +5,8 @@
  * === 0), gates every page BEFORE its transaction and commits it with
  * T_read_page. Rows are classified as live ones are (classifyRow, ingestRow.ts): a late receipt (committed
  * stale: renamed to a copy), else gated (tail / quarantine / accounted); another device's row matching an
- * adoptable settles it (stored, not re-applied).
+ * adoptable settles it (stored, not re-applied), and so does a body/canvas checkpoint adopted on the page that
+ * already holds the adoptable's content (its commit lies under the checkpoint, the row may be GC'd).
  *
  * Checkpoint with coversSeq > snapshotCoversSeq (after the gate):
  *  - fresh stream (no snapshot, no tail): stored as the snapshot in the page tx;
@@ -38,7 +39,7 @@ import { NS_STREAM, streamClass, type ClientFrameId, type DeviceId, type Seq, ty
 import type { HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
 import type { ReadPage, RelaySession } from "../../ports/relay";
-import { unionBodyCheckpoint, type CompactDeps } from "../body/compaction";
+import { unionBodyCheckpoint, updateCoveredBy, type CompactDeps } from "../body/compaction";
 import { gate, type GateCtx } from "../ingest/gate";
 import type { LiveItem, OutboxRename, OwnCommitCopy } from "../store/repo";
 import type { OutboxRecord, QuarantineRecord, SnapshotRecord, StreamRecord, TailRecord } from "../store/schema";
@@ -132,6 +133,8 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 		if (!opts.stillValid()) return result("aborted");
 		pages++;
 		let freshSnapshot: SnapshotRecord | null = null;
+		/** body/canvas checkpoint state adopted on this page. */
+		let pageCheckpoint: Uint8Array | null = null;
 		const ck = cls === "keyring" ? null : page.checkpoint;
 		const rec = repo.stream(stream);
 		if (ck && ck.coversSeq > (rec?.snapshotCoversSeq ?? 0)) {
@@ -179,14 +182,14 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 				deps.diag("checkpoint-retired", { cls, coversSeq: ck.coversSeq });
 			} else if (isFresh(rec)) {
 				freshSnapshot = { stream, coversSeq: ck.coversSeq, encoding: content.encoding, bytes: content.state, createdAtMs: deps.nowMs() };
-				if (cls === "body" || cls === "canvas") checkpointState = content.state;
+				if (cls === "body" || cls === "canvas") checkpointState = pageCheckpoint = content.state;
 				else replacedFold = true;
 				deps.diag("checkpoint-adopted", { cls, coversSeq: ck.coversSeq, how: "fresh" });
 			} else if (cls === "body" || cls === "canvas") {
 				const out = await unionBodyCheckpoint(deps, stream, ck.coversSeq, content.state);
 				if (!opts.stillValid()) return result("aborted");
 				if (!out || out.snapshotCoversSeq < ck.coversSeq) return result("retry", "union failed (CAS or unresolved ref)");
-				checkpointState = content.state;
+				checkpointState = pageCheckpoint = content.state;
 				deps.diag("checkpoint-adopted", { cls, coversSeq: ck.coversSeq, how: "union" });
 			} else if (cls === "ns" || cls === "cfg" || cls === "snap") {
 				const cur = repo.stream(stream)!;
@@ -215,6 +218,13 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 			else if (it.t === "quarantine") quarantines.push(it.rec);
 			// "stale" needs a payload not held: a read page holds every one.
 			if (it.t !== "receipt" && it.t !== "stale" && it.settleAdoptable) settleAdoptables.push(it.settleAdoptable);
+		}
+		// A checkpoint over rows this read will never see (GC'd) may hold the commit an adoptable shadows: settle it
+		// when the checkpoint already holds its content, rather than re-send it after provisionalAdoptMs (DESIGN §d.5).
+		if (pageCheckpoint) {
+			for (const r of deps.outbox.ofStream(stream)) {
+				if (r.state === "adoptable" && !settleAdoptables.includes(r.clientFrameId) && updateCoveredBy(pageCheckpoint, r.content)) settleAdoptables.push(r.clientFrameId);
+			}
 		}
 		if (!opts.stillValid()) return result("aborted");
 		const completeThrough = page.more ? null : Math.max(opts.headSeq, page.lastSeq);

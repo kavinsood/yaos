@@ -162,6 +162,47 @@ test("provisional: an adoptable holds nothing: own frames typed on top are pendi
 	}
 });
 
+test("provisional: a read that adopts a checkpoint covering the shadowed frame settles its adoptable (no 60 s re-send)", async () => {
+	// b adopts a's provisional, then goes offline before the commit reaches it; the relay checkpoints past that
+	// commit and GCs the rows, so b's catch-up starts from the checkpoint and never sees the commit as a row.
+	const relay = new SimRelay({ sealBytes: 64 }); // small segments so a checkpoint can GC sealed ones
+	const CKPT = { rows: 3, bytes: 1e9, idleMs: 10, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
+	const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { checkpoint: CKPT } });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", tuning: { checkpoint: NO_CKPT, provisionalAdoptMs: 60_000 } });
+	try {
+		await until(() => a.status().phase === "live" && b.status().phase === "live", 3_000, "live");
+		const id = await createDoc(a, "c.md", "base;");
+		await converged([a, b]);
+		const stream = bodyStream(id);
+		const va = new View(a, id);
+		await va.open();
+		const vb = new View(b, id);
+		await vb.open();
+		relay.pauseCommits();
+		va.type("P;");
+		await until(() => adoptableOf(b, id) !== null, 3_000, "b adopted a's provisional");
+		const adopted = adoptableOf(b, id)!.clientFrameId;
+		b.disconnect();
+		await until(() => b.status().phase !== "live", 2_000, "b offline");
+		relay.resumeCommits();
+		const applied = b.c.repo.stream(stream)!.appliedSeq;
+		for (let i = 0; i < 6; i++) await editDoc(a, id, (t) => t.insert(t.length, `a${i};`));
+		await until(() => relay.gcSeq(stream) > applied + 1, 4_000, "gc past the provisional's commit");
+		await b.reconnect();
+		await converged([a, b]);
+		assert.equal(await docText(b, id), await docText(a, id));
+		assert.equal(adoptableOf(b, id), null, "the checkpoint settled the adoptable");
+		assert.equal(b.c.adoptMap.size, 0);
+		assert.equal(b.c.adoptTimers.size, 0, "no adopt timer left");
+		assert.equal(b.c.docs.stats.adoptToPending, 0);
+		assert.ok(!relay.rows(stream).some((r) => r.clientFrameId === adopted), "the adopted copy was never appended");
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});
+
 test("resend: relay restart loses unreceipted frames; STREAM_RESEND resends them", async () => {
 	const relay = new SimRelay();
 	const { a, b } = await pair(relay);
