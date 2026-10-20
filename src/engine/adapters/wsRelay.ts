@@ -13,8 +13,11 @@
  *   (stream, deviceId, clientFrameId) so a COMMIT_NOTICE can be emitted as
  *   "committed" with the payload; evicted entries yield payload:null.
  * - Liveness: after VAULT_READY.liveness.idleMs without any received frame a
- *   VAULT_PING is sent; with nothing received within timeoutMs the socket is
- *   closed with LIVENESS_CLOSE_CODE and "closed" is emitted. ping() sends one
+ *   probe is sent; with nothing received within timeoutMs the socket is
+ *   closed with LIVENESS_CLOSE_CODE and "closed" is emitted. When the relay
+ *   advertises liveness.keepalive the probe is VAULT_KEEPALIVE (answered
+ *   without waking the relay's DO), except every KEEPALIVE_PING_EVERY-th, a
+ *   VAULT_PING whose pong also carries the head (the idle gap check). ping() sends one
  *   on demand (the device check's round trip) and resolves on its own pong.
  * - Subscriptions (relay-wire §5.6): subscribe() sends STREAM_SUBSCRIBE and keeps the set; STREAM_RESEND (a relay
  *   runtime restart, which may have lost it) sends it again before the event is emitted. STREAM_SKIPPED decodes
@@ -48,6 +51,7 @@ import {
 	decodeServerFrame,
 	encodeAppend,
 	encodePing,
+	KEEPALIVE_REQUEST,
 	encodeSubscribe,
 	parseControl,
 	STREAMS_VERSION,
@@ -93,6 +97,8 @@ export interface WsRelayOptions {
 }
 
 export const DEFAULT_LIVENESS = { idleMs: 60_000, timeoutMs: 15_000 } as const;
+/** In keepalive mode, every this many idle probes one is a VAULT_PING (head check every ~10 min at the default idleMs). */
+export const KEEPALIVE_PING_EVERY = 10;
 export const DEFAULT_READY_TIMEOUT_MS = 15_000;
 export const DEFAULT_PROVISIONAL_CACHE_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_PROVISIONAL_CACHE_ENTRIES = 4096;
@@ -236,6 +242,9 @@ class WsRelaySession implements RelaySession {
 	private readonly onListenerError: (error: unknown) => void;
 	private readonly idleMs: number;
 	private readonly timeoutMs: number;
+	private readonly keepalive: boolean;
+	/** Idle probes sent since the last VAULT_PING (keepalive mode). */
+	private keepalives = 0;
 
 	private readonly listeners = new Set<(event: RelayEvent) => void>();
 	private pending: RelayEvent[] | null = [];
@@ -272,6 +281,7 @@ class WsRelaySession implements RelaySession {
 		this.limits = mapLimits(init.limits);
 		this.idleMs = init.liveness?.idleMs ?? init.ready.liveness?.idleMs ?? DEFAULT_LIVENESS.idleMs;
 		this.timeoutMs = init.liveness?.timeoutMs ?? init.ready.liveness?.timeoutMs ?? DEFAULT_LIVENESS.timeoutMs;
+		this.keepalive = init.ready.liveness?.keepalive === true;
 		this.lastRx = this.clock.monotonic();
 
 		this.ws.onmessage = (ev) => this.onMessage(ev.data);
@@ -415,8 +425,10 @@ class WsRelaySession implements RelaySession {
 	}
 
 	private livenessPing(): void {
+		const keepalive = this.keepalive && this.keepalives < KEEPALIVE_PING_EVERY - 1;
+		this.keepalives = keepalive ? this.keepalives + 1 : 0;
 		try {
-			this.ws.send(encodePing(this.nextProbeId()));
+			this.ws.send(keepalive ? KEEPALIVE_REQUEST : encodePing(this.nextProbeId()));
 		} catch {
 			// The timeout below closes the socket if it is dead.
 		}

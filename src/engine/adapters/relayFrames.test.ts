@@ -119,7 +119,7 @@ describe("relayFrames control", () => {
 		}));
 		assert.deepEqual(full, {
 			type: "VAULT_READY", vaultEpoch: "E1", head: 42, canWrite: true, deviceId: "dev", runtimeEpoch: "R",
-			liveness: { idleMs: 60000, timeoutMs: 15000 },
+			liveness: { idleMs: 60000, timeoutMs: 15000, keepalive: false },
 			limits: { maxPayloadBytes: 10, maxCheckpointBytes: 20, rateBytesPerSec: 30, burstBytes: 40, feedDefaultLimit: 50, readDefaultBytes: 60, readBatchMaxStreams: 70, maxSubscriptions: 128 },
 		});
 		const bare = parseControl(CONTROL_PREFIX + JSON.stringify({ type: "VAULT_READY", vaultEpoch: "E", head: 0, limits: { maxPayloadBytes: -1 } }));

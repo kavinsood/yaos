@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 
 import { RESTORE_FLAG_TTL_MS } from "../../server/src/vault/host";
-import { MAX_REWINDS_PER_RUN, RESTORE_WINDOW_MS, type RestoreVaultPort } from "../../server/src/config/restore";
+import { MAX_REWINDS_PER_RUN, RESTORE_ALARM_MAX_DELAY_MS, RESTORE_GIVE_UP_MS, RESTORE_WINDOW_MS, type RestoreVaultPort } from "../../server/src/config/restore";
 import { encodeAppendFrame } from "../../server/src/streams/protocol";
 import { blobKey } from "../../server/src/router";
 import { suite } from "../harness.ts";
@@ -366,6 +366,71 @@ s.test("D8b alarm backoff (G37): the newest journal row's age, clamped to 30 s..
 		await world.config.fireAlarm();
 		await assertRestored(world, sc);
 		assert.equal(world.config.alarms.scheduled, null, "done: not re-armed");
+	}, PITR);
+});
+
+s.test("D8b give-up: after RESTORE_GIVE_UP_MS the alarm marks the row failed and stops; state shows it; a press resumes it", async () => {
+	await withWorld(async (world) => {
+		const sc = await scenario(world);
+		world.cluster.restoreHook = (step, phase) => {
+			if (step === "prepareRestore" && phase === "before") throw new Error("transient");
+		};
+		const pressedAt = world.config.clock.now;
+		assert.equal((await press(world, sc.cookie, sc.vaultId, sc.atIso)).status, 503);
+		let fired = 0;
+		while (world.config.alarms.scheduled !== null) {
+			assert.ok(fired++ < 100, "the alarm stops");
+			advance(world, world.config.alarms.scheduled - world.config.clock.now);
+			await world.config.fireAlarm();
+		}
+		const stoppedAt = world.config.clock.now;
+		assert.ok(stoppedAt - pressedAt >= RESTORE_GIVE_UP_MS, "not before the cap");
+		assert.ok(stoppedAt - pressedAt < RESTORE_GIVE_UP_MS + RESTORE_ALARM_MAX_DELAY_MS, "at the first alarm past the cap");
+		assert.ok(fired >= 25 && fired <= 35, `about 31 alarms (${fired})`);
+		assert.equal(journalRows(world), 1, "the journal row (and its device snapshot) stays");
+		assert.deepEqual(await pendingRestores(world, sc.cookie),
+			[{ vaultId: sc.vaultId, at: sc.at, failedAt: stoppedAt, reason: "error: Error: transient" }]);
+		// Terminal: a restart and later alarms do nothing; the vault is not blocked once the last flag expires.
+		world.config.restart();
+		await world.config.fireAlarm();
+		assert.equal(world.config.alarms.scheduled, null, "a failed row is not re-armed");
+		advance(world, 2 * 60_000);
+		assert.equal((await deviceFeed(world, sc.vaultId, sc.laptop)).status, 200, "device routes work");
+		// The operator actions stay frozen (the snapshot would undo them) until a press resumes the restore.
+		const frozen = await world.fetch(`/operator/vaults/${sc.vaultId}/devices/${sc.phone.deviceId}`, { method: "DELETE", cookie: sc.cookie });
+		assert.equal(frozen.status, 409);
+		world.cluster.restoreHook = null;
+		const again = await press(world, sc.cookie, sc.vaultId, sc.atIso);
+		assert.equal(again.status, 200);
+		assert.equal((await json(again)).resumed, true);
+		await assertRestored(world, sc);
+		assert.deepEqual(await pendingRestores(world, sc.cookie), []);
+		assert.equal(world.config.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM restore_failure").one().n, 0);
+	}, PITR);
+});
+
+s.test("D8b give-up: a resumed press gets a fresh cap; the alarm retries again and a vault delete clears the failure", async () => {
+	await withWorld(async (world) => {
+		const sc = await scenario(world);
+		world.cluster.restoreHook = (step, phase) => {
+			if (step === "prepareRestore" && phase === "before") throw new Error("transient");
+		};
+		assert.equal((await press(world, sc.cookie, sc.vaultId, sc.atIso)).status, 503);
+		while (world.config.alarms.scheduled !== null) {
+			advance(world, world.config.alarms.scheduled - world.config.clock.now);
+			await world.config.fireAlarm();
+		}
+		assert.ok(((await pendingRestores(world, sc.cookie)) as Array<{ failedAt?: number }>)[0]!.failedAt !== undefined);
+		const resumedAt = world.config.clock.now;
+		assert.equal((await press(world, sc.cookie, sc.vaultId, sc.atIso)).status, 503);
+		assert.equal(world.config.alarms.scheduled, resumedAt + 30_000, "the press re-arms the alarm from the start");
+		assert.deepEqual(await pendingRestores(world, sc.cookie), [{ vaultId: sc.vaultId, at: sc.at }], "live again");
+		const deleted = await world.fetch(`/operator/vaults/${sc.vaultId}`,
+			{ method: "DELETE", cookie: sc.cookie, json: { confirmVaultId: sc.vaultId } });
+		assert.equal(deleted.status, 200);
+		assert.equal(journalRows(world), 0);
+		await world.config.fireAlarm();
+		assert.equal(world.config.alarms.scheduled, null);
 	}, PITR);
 });
 

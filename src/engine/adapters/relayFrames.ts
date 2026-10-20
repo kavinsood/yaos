@@ -207,7 +207,8 @@ export type WireControl =
 		readonly canWrite: boolean;
 		readonly deviceId: string | null;
 		readonly runtimeEpoch: string | null;
-		readonly liveness: { readonly idleMs: number; readonly timeoutMs: number } | null;
+		/** keepalive: the relay answers VAULT_KEEPALIVE (encodeKeepalive), which does not wake it. */
+		readonly liveness: { readonly idleMs: number; readonly timeoutMs: number; readonly keepalive: boolean } | null;
 		/** null when any required limit is absent or not positive: the connect fails closed. */
 		readonly limits: WireLimits | null;
 	}
@@ -239,6 +240,12 @@ export function encodeSubscribe(streams: readonly string[]): string {
 export function encodePing(probeId: string): string {
 	return encodeControl({ type: "VAULT_PING", probeId });
 }
+
+/**
+ * Idle keepalive (relay-wire §4): a fixed text the relay's runtime answers with `VAULT_ALIVE` without waking the
+ * Durable Object. Exactly the server's SOCKET_KEEPALIVE_REQUEST (server/src/shared/socketLiveness.ts).
+ */
+export const KEEPALIVE_REQUEST = `__YPS:{"type":"VAULT_KEEPALIVE"}`;
 
 type Json = Readonly<Record<string, unknown>>;
 
@@ -312,11 +319,11 @@ export function parseControl(text: string): WireControl | null {
 			const head = seqOf(o, "head");
 			if (vaultEpoch === null || head === null) return null;
 			const live = o["liveness"];
-			let liveness: { idleMs: number; timeoutMs: number } | null = null;
+			let liveness: { idleMs: number; timeoutMs: number; keepalive: boolean } | null = null;
 			if (isRecord(live)) {
 				const idleMs = positive(live, "idleMs");
 				const timeoutMs = positive(live, "timeoutMs");
-				if (idleMs !== null && timeoutMs !== null) liveness = { idleMs, timeoutMs };
+				if (idleMs !== null && timeoutMs !== null) liveness = { idleMs, timeoutMs, keepalive: live["keepalive"] === true };
 			}
 			return {
 				type: "VAULT_READY",

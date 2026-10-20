@@ -7,10 +7,20 @@ export const SOCKET_LIVENESS_TIMEOUT_MS = 15_000;
 
 const MAX_PROBE_ID_LENGTH = 128;
 
+/**
+ * Idle keepalive (relay-wire §4): fixed texts, so the runtime answers the request without waking a hibernated DO
+ * (`setWebSocketAutoResponse`, vault/vault.ts). VAULT_PING carries a probeId and its pong the head, so it cannot be
+ * auto-answered. The relay also answers the request in code (DOs without the auto-response, tests).
+ */
+export const SOCKET_KEEPALIVE_REQUEST = `__YPS:{"type":"VAULT_KEEPALIVE"}`;
+export const SOCKET_KEEPALIVE_RESPONSE = `__YPS:{"type":"VAULT_ALIVE"}`;
+
 export interface SocketLivenessDescriptor {
 	version: typeof SOCKET_LIVENESS_VERSION;
 	idleMs: number;
 	timeoutMs: number;
+	/** The relay answers SOCKET_KEEPALIVE_REQUEST; clients that see it may probe an idle socket with it. */
+	keepalive: true;
 }
 
 export interface VaultPingFrame {
@@ -22,6 +32,7 @@ export const SOCKET_LIVENESS_DESCRIPTOR: Readonly<SocketLivenessDescriptor> = Ob
 	version: SOCKET_LIVENESS_VERSION,
 	idleMs: SOCKET_LIVENESS_IDLE_MS,
 	timeoutMs: SOCKET_LIVENESS_TIMEOUT_MS,
+	keepalive: true,
 });
 
 function isProbeId(value: unknown): value is string {
