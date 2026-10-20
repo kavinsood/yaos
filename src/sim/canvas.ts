@@ -484,9 +484,16 @@ function pickOf<T>(items: readonly T[], pick: number): T | undefined {
 	return items.length === 0 ? undefined : items[Math.min(items.length - 1, Math.floor(pick * items.length))];
 }
 
-/** The doc a file is synced as on a device (its engine's view of the path), null if none. */
+/**
+ * The doc a file is synced as on a device, null if none: its synced record at the path, else the engine's remote view
+ * of the path. The synced record first: a re-create that lost the path race after an epoch reset is still the file's
+ * doc while its loser rename waits, though the view maps the path to the winner (3 devices seed 48: A's offline
+ * reorder went into its loser, which other devices had edited and so kept as "c0 (2).canvas").
+ */
 export function docIdOf(d: SimDevice, path: string): string | null {
-	return d.vrt?.port.view().remoteByPathKey.get(pathKey(path as VaultPath)) ?? null;
+	const key = pathKey(path as VaultPath);
+	for (const s of d.vrt?.rec?.ctx.store.synced.values() ?? []) if (s.pathKey === key && !s.fileGone) return s.docId;
+	return d.vrt?.port.view().remoteByPathKey.get(key) ?? null;
 }
 
 /** Text of the engine's resident canvas replica at `path` as it would project (null: not resident / invalid). */

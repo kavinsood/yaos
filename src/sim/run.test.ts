@@ -171,6 +171,17 @@ test("sim: a device re-keyed above an open revoke reaches K_1 and moves its blob
 	}
 });
 
+// Per-stream subscriptions (binary-reads) meet the canvas oracle: a device is behind on every canvas nobody pushes it,
+// so its saves meet stale replicas far more often than when every row was pushed. Three oracle gaps, one seed each.
+
+// Seed 48 (3 devices): after an epoch reset A's stale copy of c0 lost the path race. Others edited the loser, so it
+// kept its loser rename, and A's offline reorder went into it ("c0 (2).canvas"). The oracle attributed the reorder to
+// the winner: the path's doc in A's remote view, not the doc A's file is synced as.
+test("sim: an edit to a re-create loser is judged in the loser's doc (seed 48)", async () => {
+	const r = await runSim({ seed: 48, devices: 3, faults: DEFAULT_FAULTS });
+	assert.deepEqual(r.violations.map((v) => `${v.inv}: ${v.detail}`), []);
+});
+
 const SEEDS = Math.max(1, Number(process.env.YAOS_SIM_SEEDS ?? 200) || 200);
 
 /** Asserts the matrix's faults hit what they target, over its clean runs' stats. */
