@@ -454,7 +454,9 @@ for (const impl of IMPLS) {
 			assert.equal(all[0]?.content[0], 1);
 			(all[0] as { flags: number }).flags = 6;
 			const viaKeys = await db.tx([STORE.tail], "readonly", (tx) => tx.getAllKeys(STORE.tail));
-			(viaKeys[0] as unknown as unknown[])[1] = 1000;
+			const key0: unknown = viaKeys[0];
+			assert.ok(Array.isArray(key0));
+			key0[1] = 1000;
 			assert.deepEqual(await db.tx([STORE.tail], "readonly", (tx) => tx.getAllKeys(STORE.tail)), [["b:a", 1]]);
 			assert.equal((await db.tx([STORE.tail], "readonly", (tx) => tx.get(STORE.tail, [S("b:a"), 1])))?.flags, 0);
 		});
@@ -466,7 +468,9 @@ for (const impl of IMPLS) {
 			await rejectsWith(
 				db.tx([STORE.meta, STORE.tail], "readwrite", async (tx) => {
 					tx.put(STORE.tail, tail("b:a", 1));
-					throwsWith(() => tx.put(STORE.meta, { vaultSeq: 1 } as unknown as MetaRecord), "unknown");
+					// A meta record with no key at the keyPath, on purpose: the store must reject it.
+					// @ts-expect-error not a MetaRecord (no `key`)
+					throwsWith(() => tx.put(STORE.meta, { vaultSeq: 1 }), "unknown");
 					return "swallowed";
 				}),
 				"unknown",
@@ -492,7 +496,9 @@ for (const impl of IMPLS) {
 			await rejectsWith(db.tx([STORE.outbox], "readonly", (tx) => tx.getAllByIndex(STORE.outbox, "noSuchIndex" as never)), "unknown");
 			// invalid key / limit in reads reject without killing the body
 			const v = await db.tx([STORE.meta], "readonly", async (tx) => {
-				await rejectsWith(tx.get(STORE.meta, null as unknown as "cursor"), "unknown");
+				// A null key, on purpose: an invalid key must reject the read without killing the body.
+				// @ts-expect-error null is not a meta key
+				await rejectsWith(tx.get(STORE.meta, null), "unknown");
 				await rejectsWith(tx.getAll(STORE.meta, undefined, -1), "unknown");
 				return "ok";
 			});
@@ -502,12 +508,14 @@ for (const impl of IMPLS) {
 		it("ops on a tx after its body settled fail tx-inactive", async () => {
 			const db = await openYaos(impl.make());
 			type Tx = Parameters<Parameters<StorageDb<YaosSchema>["tx"]>[2]>[0];
-			let leaked: Tx | null = null;
+			// A box, not a `let`: control flow would narrow a local assigned only inside the body to `null`.
+			const leaked: { tx: Tx | null } = { tx: null };
 			await db.tx([STORE.meta], "readwrite", async (tx) => {
-				leaked = tx;
+				leaked.tx = tx;
 				tx.put(STORE.meta, { key: "outboxOrder", next: 1 });
 			});
-			const tx = leaked as unknown as Tx;
+			const tx = leaked.tx;
+			assert.ok(tx);
 			await rejectsWith(tx.get(STORE.meta, "outboxOrder"), "tx-inactive");
 			await rejectsWith(tx.getAll(STORE.meta), "tx-inactive");
 			throwsWith(() => tx.put(STORE.meta, { key: "outboxOrder", next: 2 }), "tx-inactive");

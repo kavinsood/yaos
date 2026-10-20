@@ -35,7 +35,7 @@ import type { RenameOutcome, TrashMode, VaultEvent, VaultPort, VaultStat, WriteO
 import type { HashOracle } from "./hashOracle";
 import {
 	invalidVaultPath, isFile, isFolder, parentsOf, tightBuffer,
-	type AbstractFileLike, type FileLike, type VaultApi,
+	type AbstractFileRef, type FileLike, type VaultApi,
 } from "./obsidianApi";
 
 class CasAbort extends Error {}
@@ -278,16 +278,16 @@ export class ObsidianVault implements VaultPort {
 	onEvent(listener: (event: VaultEvent) => void): Unsubscribe {
 		const v = this.vault;
 		const refs = [
-			v.on("create", (f: AbstractFileLike) => {
+			v.on("create", (f: AbstractFileRef) => {
 				if (isFile(f)) listener({ t: "create", path: f.path, stat: statOf(f) });
 			}),
-			v.on("modify", (f: AbstractFileLike) => {
+			v.on("modify", (f: AbstractFileRef) => {
 				if (isFile(f)) listener({ t: "modify", path: f.path, stat: statOf(f) });
 			}),
-			v.on("delete", (f: AbstractFileLike) => {
+			v.on("delete", (f: AbstractFileRef) => {
 				if (isFile(f)) listener({ t: "delete", path: f.path });
 			}),
-			v.on("rename", (f: AbstractFileLike, oldPath: string) => {
+			v.on("rename", (f: AbstractFileRef, oldPath: string) => {
 				if (isFile(f)) listener({ t: "rename", from: oldPath, to: f.path, stat: statOf(f) });
 			}),
 		];

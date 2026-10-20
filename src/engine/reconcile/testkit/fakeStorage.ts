@@ -119,7 +119,7 @@ export class FakeStorage implements StoragePort {
 			this.dbs.set(name, st);
 		}
 		const db = new FakeDb<S>(name, st, this);
-		this.handles.add(db as unknown as FakeDb<SchemaShape>);
+		this.handles.add(db);
 		return db;
 	}
 

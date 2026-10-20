@@ -27,12 +27,19 @@ import { decodeOuter } from "../../core/codec/envelope";
 import { NS_DEDUPE_RING } from "../../core/limits";
 import { NS_CANDIDATE_INTERVAL, isCandidateSeq } from "../../core/ns/candidate";
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../../core/types";
-import type { Repo } from "../store/repo";
-import type { OutboxRecord, SnapshotRecord, TailRecord } from "../store/schema";
+import type { OutboxRecord, SnapshotRecord, StreamRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
+
+/** The part of the Repo (store/repo.ts) a fold reads: its stream's applied seq, the snapshot and the tail. */
+export interface FoldRepo {
+	stream(stream: StreamName): Pick<StreamRecord, "appliedSeq"> | undefined;
+	getSnapshot(stream: StreamName): Promise<SnapshotRecord | undefined>;
+	getTail(stream: StreamName, afterSeq?: Seq, throughSeq?: Seq): Promise<TailRecord[]>;
+}
 
 /** Local-only tail flag (never on the wire): the row failed a reader-dependent gate check; content = raw payload. */
 export const LOCAL_FLAG_UNOPENED = 1 << 20;
+
 /** Local-only tail flag: a stale-epoch frame (e2ee-design §14.3); content is empty. */
 export const LOCAL_FLAG_STALE_EPOCH = 1 << 21;
 
@@ -102,7 +109,7 @@ export abstract class FoldRuntime<Op, E> {
 	private unusableSnapshot: Seq | null = null;
 
 	constructor(
-		protected readonly repo: Repo,
+		protected readonly repo: FoldRepo,
 		protected readonly self: DeviceId,
 		readonly stream: StreamName,
 		private readonly candidateInterval = NS_CANDIDATE_INTERVAL,

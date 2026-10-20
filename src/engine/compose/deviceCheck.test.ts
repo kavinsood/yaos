@@ -54,11 +54,23 @@ class FakeStore implements BlobPort {
 }
 
 function session(o: { ping?: () => Promise<{ headSeq: Seq }> } = {}): RelaySession {
+	const unused = (): never => { throw new Error("unused"); };
 	return {
+		vaultEpoch: "e1",
+		headSeq: 7 as Seq,
 		canWrite: true,
+		limits: { maxFrameBytes: 1 << 20, maxCheckpointBytes: 1 << 20, appendBytesPerSec: 256 * 1024, burstBytes: 2 << 20, feedPageRows: 100, readPageBytes: 1 << 20, readBatchStreams: 1, maxSubscriptions: 128 },
+		append: unused,
+		bufferedBytes: unused,
+		subscribe: unused,
 		ping: o.ping ?? (async () => ({ headSeq: 7 as Seq })),
 		feed: async () => ({ entries: [], throughSeq: 7 as Seq, headSeq: 7 as Seq, more: false }),
-	} as unknown as RelaySession;
+		read: unused,
+		readBatch: unused,
+		putCheckpoint: unused,
+		onEvent: unused,
+		close: unused,
+	};
 }
 
 function deps(o: { live?: Partial<DeviceCheckLive> | string; store?: BlobPort | null; over?: Partial<DeviceCheckDeps> } = {}): DeviceCheckDeps {

@@ -17,9 +17,9 @@ interface NodeHash {
 	digest(): Uint8Array;
 	digest(encoding: "hex"): string;
 }
-const nodeCrypto = (
-	globalThis as unknown as { process: { getBuiltinModule(id: "node:crypto"): { createHash(algorithm: "sha256"): NodeHash } } }
-).process.getBuiltinModule("node:crypto");
+/** Node's global `process`, declared module-locally with only the member used here (no node types, see above). */
+declare const process: { getBuiltinModule(id: "node:crypto"): { createHash(algorithm: "sha256"): NodeHash } };
+const nodeCrypto = process.getBuiltinModule("node:crypto");
 
 export function sha256Ref(bytes: Uint8Array): Uint8Array {
 	return new Uint8Array(nodeCrypto.createHash("sha256").update(bytes).digest());

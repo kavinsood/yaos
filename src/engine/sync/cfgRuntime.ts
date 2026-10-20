@@ -11,10 +11,9 @@ import { decodeCfgOps } from "../../core/codec/cfgOps";
 import { CFG_FOLD_RULES_VERSION, foldCfgFrame, newCfgFoldState, overlayPendingCfg, type CfgFoldEvent } from "../../core/cfg/fold";
 import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
 import { CFG_STREAM, type CfgFoldState, type CfgOp, type DeviceId, type Seq } from "../../core/types";
-import type { Repo } from "../store/repo";
 import type { SnapshotRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
-import { FoldRuntime, type FoldedFrame } from "./foldRuntime";
+import { FoldRuntime, type FoldedFrame, type FoldRepo } from "./foldRuntime";
 
 export type FoldedCfgFrame = FoldedFrame<CfgOp, CfgFoldEvent>;
 
@@ -23,7 +22,7 @@ export class CfgRuntime extends FoldRuntime<CfgOp, CfgFoldEvent> {
 	readonly rulesVersion = CFG_FOLD_RULES_VERSION;
 	state: CfgFoldState = newCfgFoldState();
 
-	constructor(repo: Repo, self: DeviceId, candidateModulus = NS_CANDIDATE_INTERVAL) {
+	constructor(repo: FoldRepo, self: DeviceId, candidateModulus = NS_CANDIDATE_INTERVAL) {
 		super(repo, self, CFG_STREAM, candidateModulus);
 	}
 

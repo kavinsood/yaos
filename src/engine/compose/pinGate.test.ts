@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { KEYRING_STREAM, type DeviceId, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
+import { enginePortsWith } from "./testkit/enginePorts";
 import type { BlobPort } from "../../ports/blob";
 import type { EngineInitConfig } from "../../protocol/messages";
 import { createNoopCrypto } from "../adapters/noopCrypto";
@@ -26,20 +27,20 @@ import { PinGate, WriteRefused } from "./pinGate";
 // --- the gate itself -----------------------------------------------------------------------------------------
 
 /** Main's side of keyringChanged: stores (here: counts) and answers. */
-function fakeLink(): { link: HostLink; changes: number[][] } {
+function fakeLink(): { link: Pick<HostLink, "keyringChanged">; changes: number[][] } {
 	const changes: number[][] = [];
-	const link = {
+	const link: Pick<HostLink, "keyringChanged"> = {
 		keyringChanged: async (c: { readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[] }) => {
 			changes.push(c.keys.map((x) => x.e));
 			for (const x of c.keys) x.k.fill(0);
 		},
-	} as unknown as HostLink;
+	};
 	return { link, changes };
 }
 
 async function suite1Ports(vaultId: string, keys: readonly { readonly e: number; readonly k: Uint8Array }[]): Promise<EnginePorts> {
 	const crypto = await createWebCryptoSuite1({ vaultId, random: new SeededRandom(7), keys: keys.map((x) => ({ e: x.e, k: x.k.slice() })) });
-	return { relay: null, clock: null, random: null, crypto } as unknown as EnginePorts;
+	return enginePortsWith(crypto);
 }
 
 async function gateFor(crypto: EngineInitConfig["crypto"], ports: EnginePorts, link = fakeLink().link): Promise<PinGate> {
@@ -47,7 +48,7 @@ async function gateFor(crypto: EngineInitConfig["crypto"], ports: EnginePorts, l
 }
 
 test("PinGate: suite 0 open; unpinned closed; suite 1 open only with the newest stored winner's key, verified", async () => {
-	const plainPorts = { relay: null, clock: null, random: null, crypto: createNoopCrypto(simHashPort()) } as unknown as EnginePorts;
+	const plainPorts = enginePortsWith(createNoopCrypto(simHashPort()));
 	const plain = await gateFor({ suite: 0 }, plainPorts);
 	assert.equal(plain.open, true);
 	assert.equal(plain.creating, false);
@@ -72,7 +73,7 @@ test("PinGate: suite 0 open; unpinned closed; suite 1 open only with the newest 
 	const older = await gateFor({ suite: 1, keys: [], records: [g, await roll(2)] }, await suite1Ports(VAULT, [{ e: 1, k: K(1) }]), main.link);
 	assert.equal(older.open, true, "K_2 is reached through the roll's nextWrap");
 	assert.deepEqual(main.changes, [[2]], "and stored by main before the gate opens (persist-before-use)");
-	const failing = { keyringChanged: async () => Promise.reject(new Error("store failed")) } as unknown as HostLink;
+	const failing: Pick<HostLink, "keyringChanged"> = { keyringChanged: async () => Promise.reject(new Error("store failed")) };
 	const unstored = await gateFor({ suite: 1, keys: [], records: [g, await roll(2)] }, await suite1Ports(VAULT, [{ e: 1, k: K(1) }]), failing);
 	assert.equal(unstored.open, false, "a key main could not store is not used");
 	const stale = await gateFor({ suite: 1, keys: [], records: [g, await revoke(2)] }, await suite1Ports(VAULT, [{ e: 1, k: K(1) }]));
@@ -85,7 +86,7 @@ test("PinGate.readerPorts: the session reads but cannot append or put a checkpoi
 	const writer = await connectPeer(net.relay, clock, "dev-W");
 	writer.session.append(frame("ns", "w-1", "entry"));
 	await clock.advance(1_000);
-	const base = { relay: net.port("dev-R" as DeviceId), clock, random: new SeededRandom(1), crypto: createNoopCrypto(simHashPort()) } as unknown as EnginePorts;
+	const base = enginePortsWith(createNoopCrypto(simHashPort()), { relay: net.port("dev-R" as DeviceId), clock, random: new SeededRandom(1) });
 	const gate = await gateFor({ suite: null, creating: false }, base);
 	const reader = gate.readerPorts(base);
 	assert.equal(reader.keys, null, "a suite-0 adapter has no key operations");

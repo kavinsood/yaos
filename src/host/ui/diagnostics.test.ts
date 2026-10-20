@@ -52,12 +52,12 @@ test("formatDiagnostics: adds no identity data and redacts secret-looking keys a
 	assert.deepEqual(Object.keys(JSON.parse(out) as object).sort(), ["bundle", "format"]);
 
 	// A hostile/buggy engine smuggling secrets into the bundle still cannot get them into the file.
-	const smuggled = {
-		...bundle(),
-		deviceToken: IDENTITY_SECRETS[0],
-		recentEvents: [{ atMs: 1, code: "x", fields: { pairing_code: IDENTITY_SECRETS[1], Authorization: "Bearer abc", ok: 1 } }],
-		stores: { nested: { records: 1, bytes: 1, recoveryKey: "rk-very-secret", wsTicket: "tkt-secret" } },
-	} as unknown as DiagnosticsBundle;
+	// Object.assign and a non-literal store entry carry the extra keys past the bundle's type, as a buggy engine would.
+	const nested = { records: 1, bytes: 1, recoveryKey: "rk-very-secret", wsTicket: "tkt-secret" };
+	const smuggled: DiagnosticsBundle = Object.assign(bundle({
+		recentEvents: [{ atMs: 1, code: "x", fields: { pairing_code: IDENTITY_SECRETS[1]!, Authorization: "Bearer abc", ok: 1 } }],
+		stores: { nested },
+	}), { deviceToken: IDENTITY_SECRETS[0] });
 	const red = formatDiagnostics(smuggled);
 	for (const s of [IDENTITY_SECRETS[0], IDENTITY_SECRETS[1], "Bearer abc", "rk-very-secret", "tkt-secret"]) assert.ok(!red.includes(s!), `leaked ${s}`);
 	assert.match(red, /"deviceToken": "\[redacted\]"/);
@@ -70,7 +70,7 @@ test("isSecretKey", () => {
 });
 
 test("formatDiagnostics: non-finite numbers and binary are safe", () => {
-	const b = { ...bundle(), stores: { x: { records: Number.NaN, bytes: Infinity } }, blob: new Uint8Array(4) } as unknown as DiagnosticsBundle;
+	const b: DiagnosticsBundle = Object.assign(bundle({ stores: { x: { records: Number.NaN, bytes: Infinity } } }), { blob: new Uint8Array(4) });
 	const parsed = JSON.parse(formatDiagnostics(b)) as { bundle: { stores: { x: { records: unknown } }; blob: unknown } };
 	assert.equal(parsed.bundle.stores.x.records, null);
 	assert.equal(parsed.bundle.blob, "[4 bytes]");

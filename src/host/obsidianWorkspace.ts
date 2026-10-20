@@ -193,7 +193,7 @@ class ObsidianViewRef implements EditorViewRef {
 	}
 
 	private unwrap(): void {
-		const v = this.view as unknown as Record<Wrapped, unknown>;
+		const v: Partial<Record<Wrapped, unknown>> = this.view;
 		for (const [k, o] of this.orig) {
 			if (o.own) v[k] = o.fn;
 			else delete v[k];

@@ -23,6 +23,14 @@ export interface FolderLike {
 
 export type AbstractFileLike = FileLike | FolderLike;
 
+/**
+ * Obsidian's TAbstractFile base class: what the vault hands out and takes back when it does not promise a file or a
+ * folder. Narrow with isFile / isFolder.
+ */
+export interface AbstractFileRef {
+	readonly path: string;
+}
+
 export function isFile(f: unknown): f is FileLike {
 	return !!f && typeof f === "object" && "stat" in f && "extension" in f && !("children" in f);
 }
@@ -59,7 +67,7 @@ export interface VaultApi {
 	readonly configDir: string;
 	readonly adapter: AdapterApi;
 	getFiles(): FileLike[];
-	getAbstractFileByPath(path: string): AbstractFileLike | null;
+	getAbstractFileByPath(path: string): AbstractFileRef | null;
 	read(file: FileLike): Promise<string>;
 	readBinary(file: FileLike): Promise<ArrayBuffer>;
 	create(path: string, data: string): Promise<FileLike>;
@@ -67,11 +75,11 @@ export interface VaultApi {
 	modifyBinary(file: FileLike, data: ArrayBuffer): Promise<void>;
 	process(file: FileLike, fn: (data: string) => string): Promise<string>;
 	createFolder(path: string): Promise<unknown>;
-	rename(file: AbstractFileLike, newPath: string): Promise<void>;
-	trash(file: AbstractFileLike, system: boolean): Promise<void>;
-	delete(file: AbstractFileLike, force?: boolean): Promise<void>;
-	on(name: "create" | "modify" | "delete", callback: (file: AbstractFileLike) => unknown): EventRefLike;
-	on(name: "rename", callback: (file: AbstractFileLike, oldPath: string) => unknown): EventRefLike;
+	rename(file: AbstractFileRef, newPath: string): Promise<void>;
+	trash(file: AbstractFileRef, system: boolean): Promise<void>;
+	delete(file: AbstractFileRef, force?: boolean): Promise<void>;
+	on(name: "create" | "modify" | "delete", callback: (file: AbstractFileRef) => unknown): EventRefLike;
+	on(name: "rename", callback: (file: AbstractFileRef, oldPath: string) => unknown): EventRefLike;
 	offref(ref: EventRefLike): void;
 }
 

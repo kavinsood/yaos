@@ -197,11 +197,25 @@ export function nextUtcMidnight(now: number): number {
 /** Real-time ClockPort (non-simulated use of SimRelay, e.g. manual tests). */
 export function realClock(): ClockPort {
 	const start = Date.now();
+	// Numbered handles: setTimeout returns a number in browsers but an object under node.
+	const timers = new Map<TimerHandle, ReturnType<typeof setTimeout>>();
+	let next = 1;
 	return {
 		now: () => Date.now(),
 		monotonic: () => (typeof performance !== "undefined" ? performance.now() : Date.now() - start),
-		setTimer: (delayMs, fn) => setTimeout(fn, Math.max(0, delayMs)) as unknown as TimerHandle,
-		clearTimer: (handle) => clearTimeout(handle),
+		setTimer: (delayMs, fn) => {
+			const id = next++;
+			timers.set(id, setTimeout(() => {
+				timers.delete(id);
+				fn();
+			}, Math.max(0, delayMs)));
+			return id;
+		},
+		clearTimer: (handle) => {
+			const t = timers.get(handle);
+			if (t !== undefined) clearTimeout(t);
+			timers.delete(handle);
+		},
 		yieldNow: () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
 	};
 }

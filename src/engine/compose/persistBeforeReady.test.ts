@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Seq } from "../../core/types";
-import type { EnginePorts } from "../../ports";
+import { enginePortsWith } from "./testkit/enginePorts";
 import type { EngineInitConfig } from "../../protocol/messages";
 import { VirtualClock } from "../../sim/clock";
 import { SimDevice } from "../../sim/device";
@@ -27,17 +27,17 @@ import type { HostLink } from "./hostLink";
 import { PinGate } from "./pinGate";
 
 /** Main's side of keyringChanged: records the epochs it stored and zero-fills its copies. */
-function storingLink(): { link: HostLink; stored: number[][] } {
+function storingLink(): { link: Pick<HostLink, "keyringChanged">; stored: number[][] } {
 	const stored: number[][] = [];
-	const link = {
+	const link: Pick<HostLink, "keyringChanged"> = {
 		keyringChanged: async (c: KeyringChange) => {
 			stored.push(c.keys.map((x) => x.e));
 			for (const x of c.keys) x.k.fill(0);
 		},
-	} as unknown as HostLink;
+	};
 	return { link, stored };
 }
-const failingLink = { keyringChanged: async () => Promise.reject(new Error("store failed")) } as unknown as HostLink;
+const failingLink: Pick<HostLink, "keyringChanged"> = { keyringChanged: async () => Promise.reject(new Error("store failed")) };
 
 const suite1 = (keys: readonly { readonly e: number; readonly k: Uint8Array }[]): Promise<Suite1Crypto> =>
 	createWebCryptoSuite1({ vaultId: VAULT, random: new SeededRandom(7), keys: keys.map((x) => ({ e: x.e, k: x.k.slice() })) });
@@ -71,7 +71,7 @@ test("a key the gate's store failed to persist is not sealed under when the gate
 	const r2 = await roll(2);
 	const crypto: EngineInitConfig["crypto"] = { suite: 1, keys: [], records: [g, r2] };
 	const kc = await suite1([{ e: 1, k: K(1) }]);
-	const ports = { relay: null, clock: null, random: null, crypto: kc } as unknown as EnginePorts;
+	const ports = enginePortsWith(kc);
 	const gate = await PinGate.open(crypto, ports, { vaultId: VAULT, keyring: new HostKeyring(failingLink, crypto) });
 	assert.equal(gate.open, false, "K_2 (from the roll's nextWrap) was not stored: closed");
 	const main = storingLink();

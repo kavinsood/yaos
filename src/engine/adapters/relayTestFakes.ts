@@ -6,6 +6,7 @@
 
 import type { ClockPort, TimerHandle } from "../../ports/clock";
 import type { WebSocketCtor, WebSocketLike } from "./wsRelay";
+import type { XhrConstructor } from "./httpBlob";
 import { CONTROL_PREFIX, decodeAppend, encodeReadReply, encodeServerFrame, READ_BINARY_TYPE, type WireAppend, type WireReadPage, type WireServerFrame } from "./relayFrames";
 
 export class ManualClock implements ClockPort {
@@ -220,7 +221,7 @@ export class FakeXhr {
 	}
 }
 
-export function fakeXhrs(onSend?: (x: FakeXhr) => void): { xhrs: FakeXhr[]; Ctor: typeof XMLHttpRequest } {
+export function fakeXhrs(onSend?: (x: FakeXhr) => void): { xhrs: FakeXhr[]; Ctor: XhrConstructor } {
 	const xhrs: FakeXhr[] = [];
 	class Registered extends FakeXhr {
 		constructor() {
@@ -232,11 +233,11 @@ export function fakeXhrs(onSend?: (x: FakeXhr) => void): { xhrs: FakeXhr[]; Ctor
 			onSend?.(this);
 		}
 	}
-	return { xhrs, Ctor: Registered as unknown as typeof XMLHttpRequest };
+	return { xhrs, Ctor: Registered };
 }
 
 /** An XMLHttpRequest answered by a fakeFetch route (status and text body), its requests logged with the fetches. */
-export function routedXhr(route: (req: FakeRequest) => Response | "network", requests: FakeRequest[]): typeof XMLHttpRequest {
+export function routedXhr(route: (req: FakeRequest) => Response | "network", requests: FakeRequest[]): XhrConstructor {
 	return fakeXhrs((x) => void (async () => {
 		const req: FakeRequest = { method: x.method, url: new URL(x.url), headers: x.headers, body: new Uint8Array(await x.body!.arrayBuffer()) };
 		requests.push(req);

@@ -17,10 +17,12 @@ export async function advanceUntil(clock: VirtualClock, done: () => boolean, hor
 
 /** Settles a promise driven by the virtual clock and real WebCrypto. */
 export async function settleWith<T>(clock: VirtualClock, p: Promise<T>, horizonMs = 30_000): Promise<T> {
-	let r: { ok: true; value: T } | { ok: false; error: unknown } | null = null;
-	void p.then((value) => (r = { ok: true, value }), (error: unknown) => (r = { ok: false, error }));
-	if (!(await advanceUntil(clock, () => r !== null, horizonMs))) throw new Error("settleWith: not settled within the horizon");
-	const out = r as unknown as { ok: true; value: T } | { ok: false; error: unknown };
+	// A box, not a `let`: control flow would narrow a local assigned only inside the callbacks to `null` for good.
+	const box: { r: { ok: true; value: T } | { ok: false; error: unknown } | null } = { r: null };
+	void p.then((value) => (box.r = { ok: true, value }), (error: unknown) => (box.r = { ok: false, error }));
+	if (!(await advanceUntil(clock, () => box.r !== null, horizonMs))) throw new Error("settleWith: not settled within the horizon");
+	const out = box.r;
+	if (out === null) throw new Error("settleWith: not settled within the horizon");
 	if (!out.ok) throw out.error;
 	return out.value;
 }

@@ -6,7 +6,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { IDBFactory, IDBKeyRange, IDBObjectStore, forceCloseDatabase } from "fake-indexeddb";
+import { IDBDatabase as FakeIDBDatabase, IDBFactory, IDBKeyRange, IDBObjectStore, forceCloseDatabase } from "fake-indexeddb";
 import type { StorageDb, StorageError, StorageFailure, StorageKey } from "../../ports/storage";
 import { isStorageError } from "../../ports/storage";
 import { createIdbStoragePort } from "./idbStorage";
@@ -35,7 +35,10 @@ function setup(): { factory: IDBFactory; port: ReturnType<typeof createIdbStorag
 
 /** White-box: the raw IDBDatabase behind an IdbDb handle (for forceCloseDatabase). */
 function rawOf(db: StorageDb<KvSchema>): IDBDatabase {
-	return (db as unknown as { raw: IDBDatabase }).raw;
+	assert.ok("raw" in db, "an IdbDb handle");
+	const raw = db.raw;
+	assert.ok(raw instanceof FakeIDBDatabase, "its raw is a fake-indexeddb database");
+	return raw;
 }
 
 function rawOpen(factory: IDBFactory, name: string, version?: number): Promise<IDBDatabase> {
@@ -121,16 +124,16 @@ describe("createIdbStoragePort (fake-indexeddb)", () => {
 			["DataCloneError", "unknown"],
 			["SomethingNew", "unknown"],
 		];
-		const proto = IDBObjectStore.prototype as unknown as { put: (...args: unknown[]) => unknown };
+		const proto: IDBObjectStore = IDBObjectStore.prototype;
 		const original = proto.put;
 		try {
 			for (const [name, failure] of cases) {
 				const { open } = setup();
 				const db = await open();
 				let thrown: unknown = null;
-				proto.put = function patched(this: unknown, ...args: unknown[]) {
-					const rec = args[0] as { k?: unknown };
-					if (rec.k === "boom") throw new DOMException(`simulated ${name}`, name);
+				proto.put = function patched(this: IDBObjectStore, ...args: Parameters<IDBObjectStore["put"]>) {
+					const rec: unknown = args[0];
+					if (typeof rec === "object" && rec !== null && "k" in rec && rec.k === "boom") throw new DOMException(`simulated ${name}`, name);
 					return original.apply(this, args);
 				};
 				const err = await rejectsWith(
@@ -163,8 +166,10 @@ describe("createIdbStoragePort (fake-indexeddb)", () => {
 		const unsubscribe = db.onLost((f) => lost.push(f));
 		const removed: StorageFailure[] = [];
 		db.onLost((f) => removed.push(f))();
-		// fake-indexeddb types the parameter oddly (the FDBDatabase constructor type).
-		forceCloseDatabase(rawOf(db) as unknown as Parameters<typeof forceCloseDatabase>[0]);
+		// fake-indexeddb's types.d.ts declares the parameter as `typeof FDBDatabase` (the constructor), but the
+		// function takes a database instance: the call is right and the library's declaration is wrong.
+		// @ts-expect-error an IDBDatabase instance where the mistyped declaration wants its constructor
+		forceCloseDatabase(rawOf(db));
 		await sleep(5);
 		assert.deepEqual(lost, ["connection-lost"]);
 		assert.deepEqual(removed, []);

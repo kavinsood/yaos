@@ -178,10 +178,10 @@ export function macrotaskSchedule(): Schedule {
 			if (fn) fn();
 		};
 		// Node: an open MessagePort keeps the process alive. unref when available.
-		const port = channel.port1 as unknown as { unref?: () => void };
-		const port2 = channel.port2 as unknown as { unref?: () => void };
-		if (typeof port.unref === "function") port.unref();
-		if (typeof port2.unref === "function") port2.unref();
+		const port: object = channel.port1;
+		const port2: object = channel.port2;
+		if ("unref" in port && typeof port.unref === "function") port.unref();
+		if ("unref" in port2 && typeof port2.unref === "function") port2.unref();
 		return (fn) => {
 			queue.push(fn);
 			channel.port2.postMessage(0);

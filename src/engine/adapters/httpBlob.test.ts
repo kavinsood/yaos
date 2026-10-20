@@ -8,7 +8,7 @@ import type { BlobAddress } from "../../ports/crypto";
 import { RELAY_HTTP_BASE_MS, relayHttpDeadlineMs } from "../../core/deadline";
 import {
 	BLOB_DELETE_CALL_BYTES, BLOB_EXISTS_BATCH, BLOB_LIST_REPLY_BYTES, CAPABILITIES_TIMEOUT_MS, createHttpBlob, GC_RETRY_ATTEMPTS, probeHttpBlob,
-	startupBlob,
+	startupBlob, type XhrConstructor,
 } from "./httpBlob";
 import { RelayHttpError } from "./relayHttp";
 import { fakeFetch, fakeXhrs, jsonResponse, ManualClock, routedXhr, type FakeRequest, type FakeXhr } from "./relayTestFakes";
@@ -93,7 +93,15 @@ function hangingFetch(): typeof fetch {
 	});
 }
 
-function xhrPort(Ctor: typeof XMLHttpRequest, clock: ClockPort) {
+/** A real Response whose body (and json / text) never settle and ignore cancel / abort. */
+function deafResponse(status: number, headers: Record<string, string>, body: object | null): Response {
+	const never = <T>(): Promise<T> => new Promise<T>(() => undefined);
+	const res = new Response(null, { status, headers });
+	Object.defineProperties(res, { body: { value: body }, json: { value: () => never() }, text: { value: () => never() } });
+	return res;
+}
+
+function xhrPort(Ctor: XhrConstructor, clock: ClockPort) {
 	return createHttpBlob({ baseUrl: "https://r.example/", vaultId: "v1", credential: TOKEN, xhr: Ctor, clock, idleMs: IDLE });
 }
 
@@ -415,7 +423,7 @@ describe("httpBlob", () => {
 		// A reply whose body neither ends nor honours cancel / abort.
 		const deafBody = { getReader: () => ({ read: () => never(), cancel: async () => undefined }) };
 		const deafReply = (headers: Record<string, string>) =>
-			({ status: 200, headers: new Headers(headers), body: deafBody, json: () => never(), text: () => never() }) as unknown as Response;
+			deafResponse(200, headers, deafBody);
 		const cases: [string, typeof fetch, (port: ReturnType<typeof getPort>, signal?: AbortSignal) => Promise<unknown>][] = [
 			["get, headers", () => never(), (port, s) => port.get(addr(1), s)],
 			["get, body", async () => deafReply({ "Content-Length": "10" }), (port, s) => port.get(addr(1), s)],
@@ -442,7 +450,7 @@ describe("httpBlob", () => {
 	it("an error reply's body is read within the transfer: a 404 whose body stalls is stalled, never \"absent\"", async () => {
 		const clock = new ManualClock();
 		const never = <T>(): Promise<T> => new Promise<T>(() => undefined);
-		const deafError = (status: number) => async () => ({ status, headers: new Headers(), body: null, json: () => never() }) as unknown as Response;
+		const deafError = (status: number) => async () => deafResponse(status, {}, null);
 		const cases: [string, typeof fetch, (port: ReturnType<typeof getPort>) => Promise<unknown>][] = [
 			["get 404", deafError(404), (port) => port.get(addr(1))],
 			["get 500", deafError(500), (port) => port.get(addr(1))],
@@ -472,7 +480,7 @@ describe("httpBlob", () => {
 		assert.equal(relayHttpDeadlineMs(BLOB_DELETE_CALL_BYTES), 15_454);
 		const clock = new ManualClock();
 		const never = <T>(): Promise<T> => new Promise<T>(() => undefined);
-		const deafBody = async () => ({ status: 200, headers: new Headers(), body: null, json: () => never() }) as unknown as Response;
+		const deafBody = async () => deafResponse(200, {}, null);
 		const gcPort = (f: typeof fetch) => createHttpBlob({ baseUrl: "https://r.example/", vaultId: "v1", credential: TOKEN, fetch: f, clock });
 		const cases: [string, typeof fetch, number, (port: ReturnType<typeof gcPort>, signal?: AbortSignal) => Promise<unknown>][] = [
 			["list, headers", () => never(), relayHttpDeadlineMs(BLOB_LIST_REPLY_BYTES), (port, s) => port.list(null, s)],

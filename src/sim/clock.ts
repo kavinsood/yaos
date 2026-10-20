@@ -29,20 +29,16 @@ interface Timer {
 	readonly label: string;
 }
 
-type ImmediateFn = (fn: () => void) => unknown;
-
 /** A real macrotask (used to let microtask chains settle). Never use for logic timing. */
 export function realMacrotask(): () => Promise<void> {
-	const g = globalThis as unknown as {
-		setImmediate?: ImmediateFn;
-		MessageChannel?: new () => { port1: { onmessage: (() => void) | null; close(): void }; port2: { postMessage(v: unknown): void; close(): void } };
-	};
-	if (typeof g.setImmediate === "function") {
-		const si = g.setImmediate;
+	// setImmediate is node-only, so it is not in the source tree's (lib.dom) globals: probe for it.
+	const g: object = globalThis;
+	const si = "setImmediate" in g ? g.setImmediate : undefined;
+	if (typeof si === "function") {
 		return () => new Promise<void>((resolve) => void si(resolve));
 	}
-	if (typeof g.MessageChannel === "function") {
-		const MC = g.MessageChannel;
+	if (typeof MessageChannel === "function") {
+		const MC = MessageChannel;
 		return () =>
 			new Promise<void>((resolve) => {
 				const ch = new MC();

@@ -30,6 +30,8 @@ export class FakeObsidianVault implements VaultApi {
 	readonly trashed: { path: string; system: boolean }[] = [];
 	readonly raw = new Map<string, Uint8Array>(); // adapter-only files (config dir, dot-folders)
 	private readonly listeners = new Map<Ev, Set<(f: AbstractFileLike, old?: string) => unknown>>();
+	/** What each EventRefLike handed out by on() unsubscribes. */
+	private readonly refs = new WeakMap<EventRefLike, { name: Ev; cb: (f: AbstractFileLike, old?: string) => unknown }>();
 	private clock = 1_000;
 	/** Runs inside readBinary after the bytes were taken (simulates a concurrent edit during a CAS check). */
 	afterReadBinary: ((path: string) => void) | null = null;
@@ -222,11 +224,13 @@ export class FakeObsidianVault implements VaultApi {
 		const cb = callback as (f: AbstractFileLike, old?: string) => unknown;
 		set.add(cb);
 		this.listeners.set(name, set);
-		return { name, cb } as unknown as EventRefLike;
+		const ref: EventRefLike = {};
+		this.refs.set(ref, { name, cb });
+		return ref;
 	}
 
 	offref(ref: EventRefLike): void {
-		const r = ref as unknown as { name: Ev; cb: (f: AbstractFileLike, old?: string) => unknown };
-		this.listeners.get(r.name)?.delete(r.cb);
+		const r = this.refs.get(ref);
+		if (r) this.listeners.get(r.name)?.delete(r.cb);
 	}
 }

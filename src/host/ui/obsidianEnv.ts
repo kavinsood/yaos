@@ -44,16 +44,13 @@ export async function copyText(text: string): Promise<void> {
 	await navigator.clipboard.writeText(text);
 }
 
-interface AppSettingApi {
-	open(): void;
-	openTabById(id: string): unknown;
-}
-
 /** Opens Settings at this plugin's tab. Uses Obsidian's private `app.setting`; returns false if absent. */
 export function openPluginSettings(app: App, pluginId: string): boolean {
-	const setting = (app as unknown as { setting?: Partial<AppSettingApi> }).setting;
-	if (!setting || typeof setting.open !== "function") return false;
+	const host: object = app;
+	const setting = "setting" in host ? host.setting : undefined;
+	if (!setting || (typeof setting !== "object" && typeof setting !== "function")) return false;
+	if (!("open" in setting) || typeof setting.open !== "function") return false;
 	setting.open();
-	if (typeof setting.openTabById === "function") setting.openTabById(pluginId);
+	if ("openTabById" in setting && typeof setting.openTabById === "function") setting.openTabById(pluginId);
 	return true;
 }

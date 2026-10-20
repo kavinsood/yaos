@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { canvasHashRef, fingerprintRef, markdownHashRef } from "../../core/hash/testkit/hashRef";
-import type { HashWant } from "../../protocol/messages";
+import type { DiskOp, DiskOpResult, HashWant } from "../../protocol/messages";
+import type { ClockPort } from "../../ports/clock";
 import { ProtocolFailure } from "../../protocol/errors";
 import { answerHashRequest, fingerprintWrites, hashItems, utf16LengthOfUtf8, withFingerprints, YIELD_EVERY_BYTES } from "./hashService";
 
@@ -73,7 +74,9 @@ test("hashItems answers in order and yields between large items", async () => {
 
 test("answerHashRequest: not-ready before init, hashes after", async () => {
 	await assert.rejects(answerHashRequest([], null), (e) => e instanceof ProtocolFailure && e.error.code === "not-ready");
-	const ports = { hash, clock: { yieldNow: () => Promise.resolve() } } as unknown as Parameters<typeof answerHashRequest>[1];
+	const unused = (): never => { throw new Error("unused"); };
+	const clock: ClockPort = { now: unused, monotonic: unused, setTimer: unused, clearTimer: unused, yieldNow: () => Promise.resolve() };
+	const ports = { hash, clock };
 	assert.deepEqual(await answerHashRequest([{ path: "a.md", want: "fingerprint", bytes: enc("hi") }], ports), { t: "hashes", values: [{ hash: fingerprintRef(enc("hi")), textLength: 2 }] });
 });
 
@@ -83,7 +86,7 @@ test("write fingerprints are computed before posting and attached to ok write ou
 		{ t: "write", opId: 7, area: "vault", path: "a.md", data: { t: "text", text: "x\uD800" }, precondition: { t: "any" }, docId: null, purpose: "settings" },
 		{ t: "write", opId: 8, area: "vault", path: "b.bin", data: { t: "bytes", bytes }, precondition: { t: "any" }, docId: null, purpose: "settings" },
 		{ t: "removeEmptyFolder", opId: 9, path: "f" },
-	] as unknown as Parameters<typeof fingerprintWrites>[1];
+	] satisfies DiskOp[];
 	const fps = await fingerprintWrites(hash, ops);
 	assert.deepEqual(fps, [fingerprintRef(enc("x\uFFFD")), fingerprintRef(bytes), null]);
 	structuredClone(bytes, { transfer: [bytes.buffer] }); // posted: detached, the fingerprint survives
@@ -92,7 +95,7 @@ test("write fingerprints are computed before posting and attached to ok write ou
 		{ opId: 7, t: "write", outcome: { ok: true, stat } },
 		{ opId: 8, t: "write", outcome: { ok: false, reason: "precondition", current: null, message: "m" } },
 		{ opId: 9, t: "removeEmptyFolder", ok: true },
-	] as unknown as Parameters<typeof withFingerprints>[2];
+	] satisfies DiskOpResult[];
 	const out = withFingerprints(ops, fps, results);
 	assert.deepEqual(out[0], { opId: 7, t: "write", outcome: { ok: true, stat, fingerprint: fps[0] } });
 	assert.deepEqual(out.slice(1), results.slice(1));
