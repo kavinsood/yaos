@@ -101,8 +101,10 @@ export abstract class FoldRuntime<Op, E> {
 	private committedOwn: OwnPendingFrame<Op>[] = [];
 	/** Highest own frameNo seen outside the fold state and the outbox (tail above the fold, receipts, allocations). */
 	private ownFrameNoSeen = 0;
-	/** The first allocation of this runtime skips NS_DEDUPE_RING numbers (e2ee-design §8.2). */
+	/** The first allocation of this runtime skips NS_DEDUPE_RING numbers and starts at least at wallMs() (e2ee-design §8.2). */
 	private allocated = false;
+	/** Wall clock (ms) for the skip's floor; the engine sets ClockPort.now. 0: no floor. */
+	wallMs: () => number = () => 0;
 	/** Highest frameNo this runtime allocated (or renumbered to). */
 	private allocatedMax = 0;
 	/** Floor carried by epoch migration (meta frameNoFloor). */
@@ -292,22 +294,36 @@ export abstract class FoldRuntime<Op, E> {
 	 * Next own frameNo of this stream (e2ee-design §8.2): 1 + the highest own
 	 * frameNo known (fold R, own tail rows and receipts above the fold, the
 	 * outbox incl. poisoned, the epoch-migration floor, earlier allocations).
-	 * The first allocation of a runtime adds NS_DEDUPE_RING, skipping numbers
-	 * an in-flight frame may have used when IndexedDB was lost, and so does the
-	 * first one after the fold showed an own frame above every allocation of
-	 * this runtime (they were made blind). Gaps are fine.
+	 * The first allocation of a runtime skips (skip()): NS_DEDUPE_RING and at
+	 * least up to the wall clock, past numbers an in-flight frame may have used
+	 * when IndexedDB was lost; so does the first one after the fold showed an
+	 * own frame above every allocation of this runtime (they were made blind).
+	 * Gaps are fine.
 	 */
 	allocFrameNo(outbox: OutboxCache): number {
 		let max = this.maxOwnFrameNo(outbox);
 		// The skip again once the fold shows an own frame above all this runtime allocated: the earlier allocations
 		// were made without this store's committed frames (IndexedDB lost, the stream not read yet).
 		if (!this.allocated || this.committedOwnMax() > this.allocatedMax) {
-			max += NS_DEDUPE_RING;
+			max = this.skip(max);
 			this.allocated = true;
 		}
 		this.ownFrameNoSeen = max + 1;
 		this.allocatedMax = max + 1;
 		return max + 1;
+	}
+
+	/**
+	 * The skip of a runtime's first allocation above `max`, the highest own number known (e2ee-design §8.2):
+	 * NS_DEDUPE_RING, and at least the wall clock in ms. A store that lost IndexedDB knows only its committed frames,
+	 * the same edge the runtime it replaced allocated from, so a skip from the edge alone repeats that runtime's
+	 * numbers for a frame still in flight; whichever committed second was ignored as a replay. The clock puts the new
+	 * runtime's numbers above the old one's (which allocated fewer frames than ms passed), so an old frame committing
+	 * first leaves the new ones accepted, and one committing after them is stale (the §8.2 boundary).
+	 */
+	private skip(max: number): number {
+		const wall = Math.floor(this.wallMs());
+		return Number.isSafeInteger(wall) ? Math.max(max + NS_DEDUPE_RING, wall) : max + NS_DEDUPE_RING;
 	}
 
 	/** Highest own frameNo committed or receipted: fold R, own frames above the fold, the migration floor (§8.2). */
@@ -335,7 +351,7 @@ export abstract class FoldRuntime<Op, E> {
 		const recs = outbox.ofStream(this.stream);
 		const unsent = recs.filter((r) => r.state !== "poisoned" && !ring.has(r.clientFrameId));
 		if (!unsent.some((r) => (r.frameNo ?? 0) <= edge)) return [];
-		let next = edge + NS_DEDUPE_RING;
+		let next = this.skip(edge);
 		for (const r of recs) if (!unsent.includes(r)) next = Math.max(next, r.frameNo ?? 0);
 		const out = unsent.map((rec) => ({ rec, frameNo: ++next }));
 		this.seeFrameNo(next);

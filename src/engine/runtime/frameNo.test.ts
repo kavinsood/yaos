@@ -26,12 +26,18 @@ async function settle(e: LogEngine): Promise<void> {
 	await until(() => e.status().phase === "live" && e.isIdle() && e.c.outbox.size === 0, 3_000, "idle");
 }
 const cfg = (e: LogEngine, v: string) => e.submitCfg([{ t: "jsonSet", file: APP, key: "k", valueJson: v }]);
+/** The tests above the in-flight one pin the skip's NS_DEDUPE_RING part: no wall-clock floor. */
+function noClockFloor(e: LogEngine): LogEngine {
+	e.c.ns.wallMs = e.c.cfg.wallMs = () => 0;
+	return e;
+}
 
 test("frameNo: first allocation skips NS_DEDUPE_RING, then consecutive; the max survives restart via own rows", async () => {
 	const relay = new SimRelay();
 	const { engine: a, storage } = await startTestEngine({ relay, deviceId: "dev-a" });
 	let a2: LogEngine | null = null;
 	try {
+		noClockFloor(a);
 		await settle(a);
 		relay.pauseCommits();
 		await createDoc(a, "one.md" as VaultPath, "1");
@@ -47,6 +53,7 @@ test("frameNo: first allocation skips NS_DEDUPE_RING, then consecutive; the max 
 		await a.stop();
 
 		({ engine: a2 } = await startTestEngine({ relay, deviceId: "dev-a", storage }));
+		noClockFloor(a2);
 		await settle(a2);
 		await createDoc(a2, "three.md" as VaultPath, "3");
 		await createDoc(a2, "four.md" as VaultPath, "4");
@@ -63,6 +70,7 @@ test("frameNo: the epoch-migration floor raises allocation and is kept in meta (
 	const { engine: a, storage } = await startTestEngine({ relay, deviceId: "dev-a", extra: { frameNoFloor: { ns: 1000, cfg: 5 } } });
 	let a2: LogEngine | null = null;
 	try {
+		noClockFloor(a);
 		await settle(a);
 		assert.deepEqual(a.c.repo.frameNoFloor, { ns: 1000, cfg: 5 });
 		await createDoc(a, "one.md" as VaultPath, "1");
@@ -73,6 +81,7 @@ test("frameNo: the epoch-migration floor raises allocation and is kept in meta (
 		await a.stop();
 
 		({ engine: a2 } = await startTestEngine({ relay, deviceId: "dev-a", storage, extra: { frameNoFloor: { ns: 10, cfg: 2000 } } }));
+		noClockFloor(a2);
 		await settle(a2);
 		assert.deepEqual(a2.c.repo.frameNoFloor, { ns: 1000, cfg: 2000 }, "max-merged, never lowered");
 		await cfg(a2, "2");
@@ -94,6 +103,7 @@ test("frameNo: frames allocated before a lost store read ns are renumbered above
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
 	let a2: LogEngine | null = null;
 	try {
+		noClockFloor(a);
 		await settle(a);
 		await createDoc(a, "one.md" as VaultPath, "1");
 		await createDoc(a, "two.md" as VaultPath, "2");
@@ -103,6 +113,7 @@ test("frameNo: frames allocated before a lost store read ns are renumbered above
 
 		relay.setConnectFailure("unavailable");
 		({ engine: a2 } = await startTestEngine({ relay, deviceId: "dev-a", extra: { vaultEpoch: relay.vaultEpoch() } })); // fresh storage: IndexedDB lost
+		noClockFloor(a2);
 		await createDoc(a2, "three.md" as VaultPath, "3");
 		await cfg(a2, "2");
 		assert.deepEqual(await ownFrameNos(a2, NS_STREAM), [R + 1], "allocated before ns was read");
@@ -153,6 +164,7 @@ test("frameNo: a session whose ns/cfg reads fail stays catching-up with ns sends
 	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
 	let a2: LogEngine | null = null;
 	try {
+		noClockFloor(a);
 		await settle(a);
 		await createDoc(a, "one.md" as VaultPath, "1");
 		await createDoc(a, "two.md" as VaultPath, "2");
@@ -161,6 +173,7 @@ test("frameNo: a session whose ns/cfg reads fail stays catching-up with ns sends
 
 		failing.on = true;
 		({ engine: a2 } = await startTestEngine({ relay: failingNsReads(relay, failing), deviceId: "dev-a" })); // IDB lost
+		noClockFloor(a2);
 		await until(() => a2!.c.session !== null, 3_000, "session up");
 		await createDoc(a2, "three.md" as VaultPath, "3");
 		await sleep(300);
@@ -175,6 +188,47 @@ test("frameNo: a session whose ns/cfg reads fail stays catching-up with ns sends
 	} finally {
 		await a.stop();
 		await b.stop();
+		await a2?.stop();
+	}
+});
+
+// Sim seed 222 (2 devices, fault-heavy): A crashed, restarted and sent a create under R + R + 1 (its runtime's first
+// allocation, the skip above its fold edge R). The relay had not committed it when A's IndexedDB was wiped. The new
+// store read ns at the same edge R and its first allocation took the same number; the old frame committed first and
+// every reader ignored the new one as replay-duplicate. The new create never folded, the planner took the synced
+// doc for pruned and trashed the attachment. A skip from the same known edge repeats the lost runtime's number, so
+// the first allocation of a runtime also starts at least at the wall clock in ms (e2ee-design §8.2).
+test("frameNo: a store that lost IndexedDB does not reuse the number of a frame still in flight from before", async () => {
+	const relay = new SimRelay();
+	const { engine: a, storage } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	let a1: LogEngine | null = null;
+	let a2: LogEngine | null = null;
+	try {
+		await settle(a);
+		await createDoc(a, "one.md" as VaultPath, "1");
+		await settle(a);
+		await a.stop();
+
+		({ engine: a1 } = await startTestEngine({ relay, deviceId: "dev-a", storage }));
+		await settle(a1);
+		relay.pauseCommits();
+		await createDoc(a1, "two.md" as VaultPath, "2");
+		await until(() => relay.pendingCount() > 0, 3_000, "two.md in flight");
+		await a1.stop(); // the old socket's frame stays with the relay
+
+		({ engine: a2 } = await startTestEngine({ relay, deviceId: "dev-a", extra: { vaultEpoch: relay.vaultEpoch() } })); // fresh storage: IndexedDB lost
+		await until(() => a2!.status().phase === "live", 3_000, "a2 live");
+		await createDoc(a2, "three.md" as VaultPath, "3");
+		await until(() => relay.pendingCount() > 1, 3_000, "three.md in flight");
+		relay.resumeCommits();
+		await settle(a2);
+		const live = (e: LogEngine, p: string) => e.listDocs().some((d) => d.path === p && d.state === "live");
+		await until(() => live(b, "two.md") && live(b, "three.md") && live(a2!, "three.md"), 3_000, "both creates folded");
+	} finally {
+		await a.stop();
+		await b.stop();
+		await a1?.stop();
 		await a2?.stop();
 	}
 });

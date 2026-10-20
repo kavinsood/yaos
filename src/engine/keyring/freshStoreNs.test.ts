@@ -50,6 +50,7 @@ describe("fresh store, ns not read yet (suite 1)", () => {
 		const a = await start(relay, "dev-a", pin);
 		try {
 			await live(a);
+			a.engine.c.ns.wallMs = () => 0; // the skip's NS_DEDUPE_RING part only (no wall-clock floor, e2ee-design §8.2)
 			relay.pauseCommits();
 			const d = await createDoc(a.engine, "three.md" as VaultPath, "body");
 			const stream = docStream("markdown", d)!;

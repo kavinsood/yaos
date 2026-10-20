@@ -104,6 +104,7 @@ export class LogEngine {
 		c.cfg = new CfgRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.ns.frameNoFloor = repo.frameNoFloor.ns;
 		c.cfg.frameNoFloor = repo.frameNoFloor.cfg;
+		c.ns.wallMs = c.cfg.wallMs = () => c.now();
 		c.snap = new SnapRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.docs = new DocRuntime(c);
 		c.handles = new HandleManager(repo, c.budgets, c.docs.hooks());

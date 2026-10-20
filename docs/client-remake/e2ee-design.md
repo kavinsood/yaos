@@ -303,7 +303,7 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 
 | Loss | Keys | Effect |
 |---|---|---|
-| IndexedDB (cleared, evicted, corrupted) | Survive in SecretStorage | Normal re-bootstrap from the relay. frameNo restarts above the folded right edge (§8.2). The outbox mirror re-opens with the keys. |
+| IndexedDB (cleared, evicted, corrupted) | Survive in SecretStorage | Normal re-bootstrap from the relay. frameNo restarts above the folded right edge and the wall clock (§8.2). The outbox mirror re-opens with the keys. |
 | SecretStorage (app reinstall, localStorage cleared) | Lost on this device | `key-missing`, read-only. Re-key by QR from another device or by RK. |
 | `data.json` | Survive, but are orphaned | The pin is lost too. Re-enroll (new device token and deviceId): a key-less join, so the device is blocked until a QR or the RK (or, for a suite-0 vault, a suite-0 pairing link) settles it (§12.4). |
 | Every device | Gone | RK path (§13.3). Without the RK the data is unrecoverable, by design. |
@@ -462,8 +462,15 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
     not yet folded), the outbox for the stream (poisoned included), the epoch-migration floor, earlier
     allocations of this runtime)` (`FoldRuntime.allocFrameNo`, `src/engine/sync/foldRuntime.ts`). The receipt
     writes the own tail row with its frameNo, so the max survives a restart before the row is folded.
-  - The **first allocation of every runtime** (engine start) adds **NS_DEDUPE_RING** (64). This skips any number
-    that a frame may have used while it was in flight when IndexedDB was lost.
+  - The **first allocation of every runtime** (engine start) skips: `max(known + NS_DEDUPE_RING (64), wall clock
+    in ms) + 1` (`FoldRuntime.skip`). A store that lost IndexedDB knows only its committed frames, the same edge the
+    runtime it replaced allocated from, and that runtime skipped too, so a skip from the edge alone repeats its numbers
+    for a frame it still had in flight: whichever of the two committed second was ignored as `replay-duplicate`, and a
+    create in it never folded (sim seed 222: the planner then took the synced doc for pruned and trashed the file).
+    The clock floor puts the new runtime above every number the lost one used, as long as that one allocated fewer
+    frames than ms passed between the two starts. A lost frame committing before the new ones then leaves them
+    accepted; one committing after them is stale (the boundary below). The clock is a floor only: a clock behind the
+    known edge leaves the 64 skip, as before. ns/cfg frameNos are thus about 2^41 (6 varuint bytes).
   - Allocation and the outbox write share the engine's edit chain (`src/engine/runtime/logApi.ts`), so frameNo
     order is outbox order.
   - **A store that lost IndexedDB** knows its own committed frames only once it has read the stream, so a frame it
@@ -472,8 +479,8 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
     only once both streams are read in the session (a held or failed read keeps them closed, and the phase
     catching-up, until a later read completes). First, when an own unsent frame sits at or below the committed edge
     (fold R, own rows above the fold, the floor) and its clientFrameId is not in the fold's ring, every own frame of
-    the stream not in the ring is numbered again, in outbox order from above every own number known +
-    NS_DEDUPE_RING, and sealed again under its own id (`FoldRuntime.renumberBlind`, `renumberBlindFrames`,
+    the stream not in the ring is numbered again, in outbox order from the first allocation's skip above every own
+    number known, and sealed again under its own id (`FoldRuntime.renumberBlind`, `renumberBlindFrames`,
     `SessionLoop.afterStartReads`). A frame allocated with the edge known is above it. A frame in the ring did
     commit (one recovered from the outbox mirror whose row a checkpoint covers gets no late receipt): it keeps its
     bytes and its resend is deduped. Later allocations skip NS_DEDUPE_RING again once the fold shows an own frame
@@ -509,8 +516,9 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
   (`src/core/ns/replayExactness.test.ts`, 150 seeds × 1500 steps), which also shows that without the send window
   some honest frame goes stale.
 - **Boundary (open).** If IndexedDB is lost while an old socket still holds frames that the relay commits *after*
-  the new runtime's first frames, those old frames can land at or below `R − 64` and are rejected as stale. The
-  +64 skip prevents collisions, not this. Their content came from a local state that no longer exists; disk stays
+  the new runtime's first frames, those old frames land at or below `R − 64` and are rejected as stale. The
+  first allocation's clock floor prevents collisions (and keeps the new frames accepted when the old ones commit
+  first), not this. Their content came from a local state that no longer exists; disk stays
   the truth (DESIGN §c.12).
 - The clientFrameId ring stays. frameNo covers replays older than the ring's 64 ids.
 - The `nsFoldV1` and `cfgFoldV1` checkpoint encodings gain `(deviceId → R, bitmap)` and become V2 (§18.2). Suite 0
