@@ -24,6 +24,7 @@ import {
 	type ControlKey, type SettingsSeed,
 } from "./settingsModel";
 import type { UserCommand } from "../../protocol/messages";
+import { DraftDebounce } from "./draftDebounce";
 
 export interface SettingsTabActions {
 	openPair(): void;
@@ -41,6 +42,8 @@ export interface SettingsTabActions {
 }
 
 const TEXT_DEBOUNCE_MS = 600;
+/** A draft is saved at most this long after its first unsaved keystroke, even while the user keeps typing. */
+const TEXT_MAX_WAIT_MS = 3_000;
 const LIVE_MIN_INTERVAL_MS = 250;
 const SYNC_SETTINGS_NAME = "Sync Obsidian settings";
 const SYNC_SETTINGS_DESC = "Sync app options, appearance, hotkeys, core plugin options (graph, bookmarks, daily notes, templates, saved workspaces), core and community plugin lists, plugin settings, snippets and themes. Plugin code and the open-pane layout are never synced.";
@@ -80,7 +83,14 @@ function linesFragment(lines: readonly string[]): DocumentFragment {
 
 export class YaosSettingTab extends PluginSettingTab {
 	private readonly pendingText = new Map<ControlKey, string>();
-	private textTimer: number | null = null;
+	private readonly textDraft = new DraftDebounce(
+		{ set: (ms, fn) => window.setTimeout(fn, ms), clear: (h) => window.clearTimeout(h), now: () => Date.now() },
+		TEXT_DEBOUNCE_MS, TEXT_MAX_WAIT_MS, () => void this.flushText(),
+	);
+	/** The app goes to the background with the tab open (mobile may kill it there): save the draft now. */
+	private readonly onBackground = (e: Event): void => {
+		if (e.type === "pagehide" || document.visibilityState === "hidden") this.textDraft.flushNow();
+	};
 	private readonly live = new Set<() => void>();
 	private liveTimer: number | null = null;
 	private lastLiveAt = 0;
@@ -91,6 +101,8 @@ export class YaosSettingTab extends PluginSettingTab {
 		super(app, plugin);
 		this.icon = "refresh-cw";
 		this.unsubscribe = host.onChange(() => this.scheduleLive());
+		document.addEventListener("visibilitychange", this.onBackground);
+		window.addEventListener("pagehide", this.onBackground);
 	}
 
 	// -------------------------------------------------------------------------
@@ -388,16 +400,14 @@ export class YaosSettingTab extends PluginSettingTab {
 		if (TEXT_CONTROL_KEYS.has(key)) {
 			if (typeof value !== "string") return;
 			this.pendingText.set(key, value);
-			if (this.textTimer !== null) window.clearTimeout(this.textTimer);
-			this.textTimer = window.setTimeout(() => { void this.flushText(); }, TEXT_DEBOUNCE_MS);
+			this.textDraft.touch();
 			return;
 		}
 		await this.persist(key, value);
 	}
 
 	private async flushText(): Promise<void> {
-		if (this.textTimer !== null) window.clearTimeout(this.textTimer);
-		this.textTimer = null;
+		this.textDraft.cancel();
 		const entries = [...this.pendingText.entries()];
 		this.pendingText.clear();
 		for (const [key, value] of entries) {
@@ -544,6 +554,8 @@ export class YaosSettingTab extends PluginSettingTab {
 
 	dispose(): void {
 		void this.flushText();
+		document.removeEventListener("visibilitychange", this.onBackground);
+		window.removeEventListener("pagehide", this.onBackground);
 		if (this.liveTimer !== null) window.clearTimeout(this.liveTimer);
 		this.liveTimer = null;
 		this.unsubscribe?.();

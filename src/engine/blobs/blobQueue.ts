@@ -67,7 +67,8 @@
  * A failure persists a BlobQueueRecord with exponential backoff; until it is
  * due, the transfer is not retried (claims answer "unavailable", upload() /
  * download() false / null at once), and nextDueInMs() tells the scheduler when
- * to run the next reconcile pass. Success deletes the record.
+ * to run the next reconcile pass. Success deletes the record. When the network
+ * comes back, retryNow() makes every waiting retry due at once (attempts kept).
  *
  * Backoff runs on the monotonic clock: a wall clock that jumps back (NTP, the
  * user, a skewed device) must not park a transfer for hours. The persisted
@@ -274,6 +275,23 @@ export class BlobQueue implements BlobTransfer {
 		let next: number | null = null;
 		for (const [key, at] of this.due) if (!this.transfers.has(key) && (next === null || at < next)) next = at;
 		return next === null ? null : Math.max(0, next - this.deps.clock.monotonic());
+	}
+
+	/**
+	 * The network came back (lifecycle `online`, a relay session after none): every retry still waiting for its
+	 * backoff is due now. Attempts are kept, so a failure that persists past the reconnect keeps backing off.
+	 * Pending, running and quarantined transfers are left alone. Returns how many came due; the caller asks for one
+	 * pass (nextDueInMs() is 0 now), which claims them.
+	 */
+	retryNow(): number {
+		const mono = this.deps.clock.monotonic();
+		let n = 0;
+		for (const [key, at] of this.due) {
+			if (at <= mono || this.transfers.has(key)) continue;
+			this.due.set(key, mono);
+			n++;
+		}
+		return n;
 	}
 
 	private backingOff(direction: Direction, hash: string): boolean {

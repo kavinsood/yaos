@@ -280,3 +280,34 @@ test("suite 1: an absent blob is retried with backoff and never quarantined; it 
 		await b.stop();
 	}
 });
+
+test("network back: retryBlobsNow runs an unresolved ref at once instead of at its backoff; one attempt per wake; resolves once present", async () => {
+	const relay = new SimRelay();
+	const store = new SharedBlobs();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", extra: { budgets: BUDGETS, ports: storePorts(relay, store) } });
+	// A long backoff: only the wake can retry within the test.
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", tuning: { refRetryMs: 60_000, refRetryMaxMs: 600_000 }, extra: { budgets: BUDGETS, ports: storePorts(relay, store) } });
+	try {
+		await live(a, b);
+		const id = await createDoc(a, "big.md", "seed;");
+		await converged([a, b]);
+		await b.bind(id);
+		store.mode = "absent";
+		const big = "n".repeat(MAX_INLINE_UPDATE_BYTES + 100_000);
+		await editDoc(a, id, (t) => t.insert(t.length, big));
+		await until(() => store.gets >= 1, 10_000, "first attempt");
+		await sleep(200);
+		const first = store.gets;
+		b.retryBlobsNow();
+		await until(() => store.gets > first, 5_000, "the wake retries");
+		await sleep(200);
+		assert.equal(store.gets, first + 1, "one attempt per wake, no loop; the next waits out the (doubled) backoff");
+		assert.equal(await docText(b, id), "seed;");
+		store.mode = "ok";
+		b.retryBlobsNow();
+		await until(async () => (await docText(b, id)) === "seed;" + big, 5_000, "resolved on the wake, not the 2 min backoff");
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});
