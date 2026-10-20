@@ -165,6 +165,11 @@ export interface StreamSocketAttachment {
 	admittedAt: number;
 	/** The last accepted STREAM_SUBSCRIBE set, when it fits SUBSCRIPTION_ATTACHMENT_BYTES; absent: the empty set. */
 	subs?: string[];
+	/**
+	 * Set when the relay closes the socket. getWebSockets() keeps listing it until the close completes, possibly
+	 * past this runtime: a later runtime must not fan out to it, close it again or count it in a revoke.
+	 */
+	closing?: true;
 }
 
 /** The persisted subscription of an attachment: empty when it has none, it overflowed, or it is not a valid set. */
@@ -358,7 +363,14 @@ export class StreamRelayService {
 		let attachment: StreamSocketAttachment | null = null;
 		try { attachment = parseStreamSocketAttachment(socket.deserializeAttachment()); } catch { /* closed */ }
 		this.attachments.set(socket, attachment);
+		if (attachment?.closing) this.closing.add(socket);
 		return attachment;
+	}
+
+	/** The relay closed `socket`, in this runtime or an earlier one (the close may not have completed). */
+	private isClosing(socket: SocketPort): boolean {
+		this.attachmentOf(socket);
+		return this.closing.has(socket);
 	}
 
 	/** Whether `socket` is a streams socket (the runtime routes its messages here). */
@@ -416,6 +428,13 @@ export class StreamRelayService {
 	/** Closes a socket this relay refuses: it leaves the fanout set in this turn and its later messages are dropped. */
 	private closeSocket(socket: SocketPort, code: number, reason: string): void {
 		this.closing.add(socket);
+		const attachment = this.attachmentOf(socket);
+		if (attachment && !attachment.closing) {
+			// No subscription: a closing socket gets nothing, and the marker must fit wherever the attachment did.
+			const marked: StreamSocketAttachment = { ...attachment, closing: true };
+			delete marked.subs;
+			try { socket.serializeAttachment(marked); this.attachments.set(socket, marked); } catch { /* closed */ }
+		}
 		this.cacheRemove(socket);
 		try { socket.close(code, reason); } catch { /* closed */ }
 	}
@@ -529,7 +548,7 @@ export class StreamRelayService {
 		let head: number | null = null;
 		const kept: Array<{ socket: SocketPort; attachment: StreamSocketAttachment }> = [];
 		for (const socket of this.options.sockets.sockets()) {
-			if (this.closing.has(socket)) continue;
+			if (this.isClosing(socket)) continue;
 			let attachment = this.attachmentOf(socket);
 			if (!attachment) continue;
 			if (!this.options.validateActor(actorOf(attachment))) { this.supersede(socket); continue; }
@@ -558,7 +577,7 @@ export class StreamRelayService {
 		let entry = this.cache!.get(socket);
 		if (!entry) {
 			// The rebuild may have just superseded it.
-			if (this.closing.has(socket)) { this.counters.rawDrops++; return; }
+			if (this.isClosing(socket)) { this.counters.rawDrops++; return; }
 			const attachment = this.attachmentOf(socket);
 			if (!attachment) { this.closeSocket(socket, 1008, "not a streams socket"); return; }
 			// An open streams socket the cache lost track of: admitted → back into the set, its subscription as
@@ -950,7 +969,7 @@ export class StreamRelayService {
 		// Cold path: walks getWebSockets() so a socket is found even before this runtime built its cache.
 		let closedSockets = 0;
 		for (const socket of this.options.sockets.sockets()) {
-			if (this.closing.has(socket) || this.attachmentOf(socket)?.deviceId !== deviceId) continue;
+			if (this.isClosing(socket) || this.attachmentOf(socket)?.deviceId !== deviceId) continue;
 			this.supersede(socket);
 			closedSockets++;
 		}
@@ -1011,7 +1030,7 @@ export class StreamRelayService {
 		this.dropPending();
 		this.options.store().reset();
 		for (const socket of this.options.sockets.sockets()) {
-			if (this.closing.has(socket) || !this.attachmentOf(socket)) continue;
+			if (this.isClosing(socket) || !this.attachmentOf(socket)) continue;
 			this.closeSocket(socket, closeCode, reason);
 		}
 		this.cache = new Map();

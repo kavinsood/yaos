@@ -825,6 +825,28 @@ s.test("D7 revokeDevice: one synchronous call drops the device's buffered frames
 	});
 });
 
+s.test("D7 revokeDevice: a socket whose close has not completed is not closed or counted again, by this runtime or the next", async () => {
+	await withStreams(({ connect, revoked, registry, fresh }) => {
+		const a = connect(ownerA);
+		const a2 = connect(ownerA);
+		const b = connect(deviceB);
+		revoked.add("device-a");
+		const service = fresh("runtime-b");
+		// The wake built no cache: revoke finds the device's sockets through getWebSockets().
+		assert.deepEqual(service.revokeDevice("device-a"), { droppedFrames: 0, closedSockets: 2 });
+		assert.deepEqual(registry.sockets(), [a, a2, b], "the closes have not completed: both sockets are still listed");
+		const errors = (socket: FakeSocket) => socket.controls.filter((control) => control.type === "error").length;
+		assert.deepEqual([errors(a), errors(a2)], [1, 1]);
+		assert.deepEqual(service.revokeDevice("device-a"), { droppedFrames: 0, closedSockets: 0 }, "same runtime, closes pending");
+		const next = fresh("runtime-c");
+		assert.deepEqual(next.revokeDevice("device-a"), { droppedFrames: 0, closedSockets: 0 }, "next runtime, closes pending");
+		assert.deepEqual([errors(a), errors(a2)], [1, 1], "no second authority_superseded");
+		assert.equal(b.closed, null);
+		registry.completeCloses();
+		assert.deepEqual(registry.sockets(), [b]);
+	});
+});
+
 s.test("admission: rate overdraft sends VAULT_BACKPRESSURE and closes 1013; oversize closes 1009; malformed 1008", async () => {
 	await withStreams(({ connect, append, service }) => {
 		const a = connect();
