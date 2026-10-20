@@ -227,6 +227,14 @@ export async function prepareEpochMigration(rt: VaultRuntime): Promise<{ bases: 
 			return b ? rt.engine.boundDisk.checkSaved(b) : undefined;
 		}));
 	}
+	// Step 5 drops the outbox: own edits only the replica holds go to the files first (mergeStrandedEdits). Passes
+	// stopped with `migrating`; the one running finishes before.
+	await rt.sched.drain();
+	const merged = await rt.rec.mergeStrandedEdits().catch((e) => {
+		rt.diag(`epoch stranded-edit merge failed: ${String(e)}`);
+		return 0;
+	});
+	if (merged > 0) rt.diag(`epoch: ${merged} doc(s) with own unsent edits merged to disk`);
 	await rt.takeSnapshot("epoch");
 	const bases = new Map<PathKey, MetaPathBase>();
 	const docDeletes: MetaDocDeletes[] = [];

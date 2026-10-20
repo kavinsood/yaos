@@ -15,7 +15,7 @@
 import { newDocId } from "../../core/codec/ids";
 import type { BrakeReport, DocId, PathKey, PlanScope, PlannerInput, PlannerOp } from "../../core/types";
 import { brakeId, brakeIdentity, rejectHeld } from "../../core/plan/brake";
-import { planWith } from "../../core/plan/planner";
+import { EMPTY_CONTENT_HASH, planWith } from "../../core/plan/planner";
 import type { VaultEvent } from "../../ports/vault";
 import type { LocalObservation } from "../../protocol/messages";
 import { Ctx, type ReconcilerDeps } from "./context";
@@ -224,6 +224,33 @@ export class Reconciler {
 			if (text !== null) ctx.notice("warn", "scan-skipped", text);
 		}
 		return { ...run, planned: plan.ops.length, actionable, unread, brake, openIntents, vacated };
+	}
+
+	/**
+	 * §c.12 step 5 drops the old epoch's outbox because "its edits are on disk". A doc whose own edits only the replica
+	 * holds breaks that: typed into an editor whose buffer died with the app before its save, while the planner held
+	 * the doc for a body read (`body-not-caught-up`: a skipped row left the stream stale, then the device went
+	 * offline). The old epoch's stream can never be read now, so that wait cannot end: merge every doc with own
+	 * pending body records into its file against the replica as it is (the last state of the old epoch this device
+	 * will see), as the caught-up pass would have. The new epoch then re-derives the edits from the disk. Returns the
+	 * merges that ran ok.
+	 */
+	async mergeStrandedEdits(): Promise<number> {
+		const { ctx } = this;
+		const view = ctx.log.view();
+		const ops: PlannerOp[] = [];
+		for (const docId of view.docsWithPendingBody) {
+			const s = ctx.store.synced.get(docId);
+			const r = view.remote.get(docId);
+			if (!s || s.fileGone || s.kind === "blob" || !r || r.state !== "live" || !r.body || r.body.frozen) continue;
+			// The planner's body-empty guard: a create's frames not here yet would merge as a deletion.
+			if (!r.body.hasContent && r.createHash !== EMPTY_CONTENT_HASH && s.contentHash !== EMPTY_CONTENT_HASH) continue;
+			const l = ctx.local.get(s.pathKey);
+			if (!l || l.excluded) continue;
+			ops.push({ op: "reconcileContent", docId, path: l.path, kind: s.kind, hasBase: s.hasBase });
+		}
+		if (ops.length === 0) return 0;
+		return (await runPlan(this.env, ops)).ok;
 	}
 
 	/** Passes until a plan has nothing actionable left or nothing succeeds (bounded). */

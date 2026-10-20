@@ -619,7 +619,12 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
        doc has new item ids, and the base holds only the text after the delete. Nothing tells deleted text a peer's
        file still had from text typed in the new epoch, so it comes back. Nor a delete in a doc this device adopts
        without a job (its file already equal to the new epoch's text).
-5. Drops the old outbox. Its edits are on disk, so the scan re-derives them.
+5. Drops the old outbox. Its edits are on disk, so the scan re-derives them. Before step 3 reads the bases, every doc
+   with own outbox body records is merged into its file against the replica as it is
+   (`Reconciler.mergeStrandedEdits`): an edit typed into an editor that died before its save is in the replica only,
+   and the planner may hold that doc for a body read (`body-not-caught-up`, e.g. a skipped row deferred, then
+   offline) that the old epoch can no longer serve. The old replica is final, so the caught-up rule (I4) has nothing
+   left to wait for (sim seed 383, randomized tuning).
 6. Deletes the old DB once the new one reaches `live`: every DB of this vault and device under another epoch, so one
    that a crash left behind after the new DB was created goes too (a restart then opens the new DB without migrating;
    two DBs would block every offline start, §e.1).

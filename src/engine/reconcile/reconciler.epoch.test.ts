@@ -209,3 +209,23 @@ test("migrated loser whose merge is retried: the next pass still merges against 
 	assert.equal(w.log.text(win), "top\na\nb\nmine\n");
 	assert.deepEqual(w.conflictCopies(), []);
 });
+
+test("epoch migration: own edits only the replica holds, on a stream held for a read, are merged to disk first", async () => {
+	// Sim seed 383 (randomized tuning): a skipped row left the stream stale, the device went offline, the user typed in
+	// the editor and the app died before the save. The planner holds the doc (body-not-caught-up) and the old epoch's
+	// stream can never be read; §c.12 step 5 then drops the outbox on the premise that its edits are on disk.
+	const w = new World();
+	const id = w.log.remoteCreate(P("n.md"), "one\ntwo\n");
+	await w.boot();
+	await w.sync();
+	assert.equal(w.vault.text("n.md"), "one\ntwo\n");
+	w.log.setBound(id, true);
+	w.log.editorType(id, (t) => t.insert(4, "mine\n"));
+	w.log.setBound(id, false); // the editor died unsaved
+	w.log.setCaughtUp(id, false);
+	await w.sync();
+	assert.equal(w.vault.text("n.md"), "one\ntwo\n", "held for the read");
+	assert.equal(await w.r.mergeStrandedEdits(), 1);
+	assert.equal(w.vault.text("n.md"), "one\nmine\ntwo\n");
+	assert.deepEqual(w.conflictCopies(), []);
+});

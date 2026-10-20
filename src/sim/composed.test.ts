@@ -544,6 +544,43 @@ test("epoch reset with the note open: the view re-binds once the re-create holds
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]), [["x.md", "one typed\n"]]);
 });
 
+test("epoch reset after an offline edit on a stale stream whose editor died unsaved: the edit survives the migration", async () => {
+	// Sim seed 383 (randomized tuning). A's edit reached B as a skip (B had x.md unsubscribed) and B deferred the read;
+	// B went offline, typed into x.md and the app died before the editor's save. The edit was in B's storage only, and
+	// the planner held x.md for the read (body-not-caught-up). The relay's epoch reset then made the read impossible,
+	// and the migration dropped the outbox on the premise that its edits were on disk (§c.12 step 5): gone.
+	const { clock, net } = world({}, []);
+	const a = new SimDevice({ name: "A", clock, net });
+	const b = new SimDevice({ name: "B", clock, net, tuning: { skipSettleMs: 60_000, skipMaxDeferMs: 60_000 } });
+	a.vault.userWrite("x.md", "one\ntwo\n");
+	await boot(clock, [a, b]);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "one\ntwo\n");
+	a.vault.userWrite("x.md", "zero\none\ntwo\n");
+	await clock.advance(3_000); // B: a skip of x.md, the read deferred
+	assert.equal(b.vault.textOf("x.md"), "one\ntwo\n");
+	b.setOnline(false);
+	const v = b.workspace.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(1_000);
+	assert.ok(v.isBound(), "bound offline");
+	v.edit(4, 0, "typed\n");
+	await clock.advance(500); // committed to storage; the editor's 2 s save has not run
+	assert.equal(b.vault.textOf("x.md"), "one\ntwo\n");
+	b.crashApp();
+	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
+	await clock.advance(1_000);
+	void b.restartApp();
+	await clock.advance(5_000); // offline: x.md still waits for its read
+	b.setOnline(true);
+	await clock.advance(60_000);
+	assert.equal(b.vrt?.vaultEpoch, "sim-epoch-2", "B migrated");
+	for (const d of [a, b]) {
+		const texts = [...d.vault.snapshot().values()].join("");
+		assert.ok(texts.includes("typed"), `${d.name} keeps B's edit: ${JSON.stringify([...d.vault.snapshot()])}`);
+	}
+});
+
 test("offline delete, then a new note at the same path: a new doc, not a save over the old one", async () => {
 	// Sim heavy seed 92. A's delete waited (own frames unacked, offline), and the new file at the path merged into
 	// the old doc as a save: it followed the peer's rename of the old note, and the peer's edits to the old text
