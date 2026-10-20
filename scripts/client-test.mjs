@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Runs the new client's tests: every src/**/*.test.ts under node:test, loaded through jiti, except the slow
 // *.sim.test.ts sweeps and measured runs (`npm run test:sim`, scripts/sim-test.mjs).
+// Dots on stdout; every failing test is named on stderr as it fails and again at the end.
 // Usage: node scripts/client-test.mjs [substring-filter ...]
 import { readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -22,9 +23,17 @@ if (selected.length === 0) {
 	console.log("client-test: no test files matched");
 	process.exit(0);
 }
-const r = spawnSync(process.execPath, ["--import", "jiti/register", "--test", "--test-reporter=dot", ...selected], {
+const t0 = Date.now();
+const r = spawnSync(process.execPath, [
+	"--import", "jiti/register", "--test",
+	"--test-reporter=dot", "--test-reporter-destination=stdout",
+	"--test-reporter=./scripts/test-failures-reporter.mjs", "--test-reporter-destination=stderr",
+	...selected,
+], {
 	cwd: ROOT,
 	stdio: "inherit",
 	env: { ...process.env, YAOS_CLIENT_TEST: "1" },
 });
+const how = r.signal ? `killed by ${r.signal}` : `exit ${r.status}`;
+console.log(`client-test: ${selected.length} files, ${how}, wall ${((Date.now() - t0) / 1000).toFixed(1)} s`);
 process.exit(r.status ?? 1);
