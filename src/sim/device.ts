@@ -34,7 +34,8 @@ import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { createEngine, type ComposedEngine, type EngineHandle } from "../engine/compose/protocolEngine";
 import type { VaultRuntime } from "../engine/compose/vaultRuntime";
 import { FAST_TUNING } from "../engine/runtime/testHarness";
-import type { EngineTuning } from "../engine/runtime/options";
+import { causalWindowProblem, DEFAULT_TUNING, type EngineTuning } from "../engine/runtime/options";
+import type { Budgets } from "../core/limits";
 import type { ClockPort } from "../ports/clock";
 import type { VirtualClock } from "./clock";
 import { createDelayedSuite1, delayedHash, realWorkFor } from "./delayedCrypto";
@@ -76,9 +77,13 @@ export class SimPlatform implements PlatformPort {
 	}
 }
 
+/**
+ * provisionalBroadcast is on, as in production (host/ui/api.ts default): devices apply other devices' PROVISIONALs
+ * on bound docs and adopt them (DESIGN §d.5); the sim relay broadcasts them for b:/c: frames as the server does.
+ */
 export const SIM_SETTINGS: EngineSettings = {
 	excludePatterns: [], syncAttachments: false, maxAttachmentBytes: 0, syncSettings: false,
-	trashMode: "obsidian-trash", provisionalBroadcast: false, snapshots: { enabled: false, keepDaily: 0, uploadToBlobStore: false },
+	trashMode: "obsidian-trash", provisionalBroadcast: true, snapshots: { enabled: false, keepDaily: 0, uploadToBlobStore: false },
 };
 
 export interface SimDeviceOptions {
@@ -103,14 +108,20 @@ export interface SimDeviceOptions {
 	readonly blob?: () => BlobPort | null;
 	/** Over SIM_TUNING (a roll trigger, the GC grace). */
 	readonly tuning?: Partial<EngineTuning>;
+	/** Over the device class's budgets (run.ts tuningWorld: residency small enough to evict, catch-up width, ...). */
+	readonly budgets?: Partial<Budgets>;
 }
 
 /**
  * FAST_TUNING, with DESIGN §d.6's causal re-read window kept at its production proportions: ≥ 2 × provisionalAdoptMs
- * and well past an own frame's untuned 1 s retry (sender.ts: durability, the daily-limit floor). A frame refused
- * while a later one of the same author commits leaves peers a hole for that long; FAST_TUNING's 3 × 60 ms froze it.
+ * (the missing structs may be a provisional adoption still in flight: FAST_TUNING's 2 × 60 ms froze `causal-hole` on
+ * holes the adopted copy would have filled) and well past an own frame's untuned 1 s retry (sender.ts: durability,
+ * the daily-limit floor; a frame refused while a later one of the same author commits leaves peers a hole for that
+ * long). 3 × 2 s against FAST_TUNING's 3 s adoption timer, which is above the sim relay's group commit plus the link
+ * (production's 60 s is far above the server's), so adoptions time out only where production's do: relay restarts,
+ * failed commits. SimDevice refuses a tuning that breaks §d.6 (causalWindowProblem).
  */
-export const SIM_TUNING: Partial<EngineTuning> = { ...FAST_TUNING, causalRetryMs: 2_000 };
+export const SIM_TUNING: Partial<EngineTuning> = { ...FAST_TUNING, causalRetryMs: 2_000, causalRetries: 3 };
 
 export interface SimUiLog {
 	statuses: StatusSnapshot[];
@@ -154,7 +165,7 @@ export class SimDevice {
 	/** Engine-side semantic counters over every engine this device ran (coverage.ts). */
 	readonly coverage = new CoverageSink();
 	/** Stats objects of every runtime / engine this device ran (hostStats sums them). */
-	private readonly statSources = new Set<{ readonly adoptToPending: number }>();
+	private readonly statSources = new Set<{ readonly adopted: number; readonly adoptToPending: number }>();
 	private readonly boundDisks = new Set<{ readonly conflictCopies: number }>();
 	readonly deviceId: DeviceId;
 	/** The device's persistent SecretStorage contents (survives app restarts and IndexedDB wipes, like the OS keychain). */
@@ -193,10 +204,14 @@ export class SimDevice {
 	/** host.* coverage counters, summed over every runtime and engine of this device. */
 	hostStats(): Record<string, number> {
 		let adoptToPending = 0;
+		let provisionalAdopted = 0;
 		let boundConflictCopies = 0;
-		for (const s of this.statSources) adoptToPending += s.adoptToPending;
+		for (const s of this.statSources) {
+			adoptToPending += s.adoptToPending;
+			provisionalAdopted += s.adopted;
+		}
 		for (const s of this.boundDisks) boundConflictCopies += s.conflictCopies;
-		return { adoptToPending, boundConflictCopies };
+		return { adoptToPending, provisionalAdopted, boundConflictCopies };
 	}
 
 	get name(): string {
@@ -207,11 +222,16 @@ export class SimDevice {
 		if (this.opts.workerMode === "unavailable") throw new Error("Worker is not available (sim)");
 		const pair = createInlinePair({ schedule: this.opts.clock.schedule });
 		const storageFails = this.opts.workerMode === "storage-fails";
+		const tuning: Partial<EngineTuning> = { ...SIM_TUNING, ...(this.opts.tuning ?? {}) };
+		// A sim world whose tuning breaks a DESIGN constraint finds harness bugs, not engine bugs: refuse it.
+		const bad = causalWindowProblem({ ...DEFAULT_TUNING, ...tuning });
+		if (bad !== null) throw new Error(`SimDevice ${this.opts.name}: ${bad}`);
 		const n = ++this.engineStarts;
 		const handle = createEngine(pair.engine, {
 			carrier: "worker",
 			clientVersion: "sim",
-			tuning: { ...SIM_TUNING, ...(this.opts.tuning ?? {}) },
+			tuning,
+			...(this.opts.budgets ? { budgets: this.opts.budgets } : {}),
 			startRetryMs: 1_000,
 			tzOffsetMinutes: () => 0,
 			log: this.opts.log,

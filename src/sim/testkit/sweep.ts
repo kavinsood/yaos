@@ -99,4 +99,10 @@ export const MATRICES: readonly Matrix[] = [
 	{ name: "3 devices, real skip deferral", base: { devices: 3, faults: SUBS_FAULTS, faultRate: 0.2, tuning: { skipSettleMs: null, skipMaxDeferMs: null } }, seeds: part(20), smoke: 1, cost: 3.4, hits: subsHits },
 	{ name: "3 devices, blob stall/slow faults", base: { devices: 3, faults: BLOB_FAULTS, faultRate: 0.3 }, seeds: part(10), smoke: 1, cost: 6.6, hits: blobHits },
 	{ name: "2 devices, concurrent offline canvas edits", base: { devices: 2, faults: CANVAS_FAULTS, faultRate: 0.2, steps: 80, canvas: HOT_CANVAS }, seeds: part(8), smoke: 1, cost: 5.2, hits: canvasHits },
+	// Storms (actors.ts STORM_OPS) cost hundreds of files on every device; brakes they trip are answered by the simulated
+	// user (brakeUser.ts). The nightly soak (scripts/sim-soak.mjs) draws more and denser ones; coverage.sim.test.ts
+	// asserts every mass brake trips and the user answers both ways.
+	{ name: "3 devices, storms + brake user", base: { devices: 3, faults: DEFAULT_FAULTS, steps: 80, storms: 0.04 }, seeds: part(8), smoke: 1, cost: 4 },
+	// Per-device engine tuning and budgets drawn per seed (run.ts tuningWorld); every other matrix keeps SIM_TUNING.
+	{ name: "3 devices, seeded faults, randomized tuning", base: { devices: 3, faults: DEFAULT_FAULTS, randomTuning: true }, seeds: part(4), smoke: 1, cost: 2 },
 ];

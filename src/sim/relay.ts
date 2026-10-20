@@ -442,10 +442,18 @@ export class SimRelay implements RelayPort {
 		}
 	}
 
-	/** Device revoked: supersede its sockets; later connects are "unauthorized" until unrevoke. */
+	/**
+	 * Device revoked (server relay.ts revokeDevice): its sockets get authority_superseded + 4403, its buffered frames
+	 * are dropped (PROVISIONAL holders get STREAM_PROVISIONAL_DROPPED), nothing is flushed; later connects are
+	 * "unauthorized" until unrevoke.
+	 */
 	revoke(deviceId: DeviceId): void {
 		this.revoked.add(deviceId);
-		this.supersede(deviceId);
+		for (const session of this.targets(deviceId)) {
+			this.engine.counters.authorityCloses++;
+			this.engine.serverClose(session, 4403, "authority_superseded", true);
+		}
+		this.engine.dropDevice(deviceId);
 	}
 
 	unrevoke(deviceId: DeviceId): void {

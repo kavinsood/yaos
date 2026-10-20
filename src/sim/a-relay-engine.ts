@@ -511,6 +511,21 @@ export class RelayEngine {
 		}
 	}
 
+	/**
+	 * D7 revoke (server relay.ts revokeDevice): the device's buffered frames are dropped (no commit, no receipt) and
+	 * peers that got their PROVISIONAL get STREAM_PROVISIONAL_DROPPED; other devices' frames stay buffered.
+	 */
+	dropDevice(deviceId: DeviceId): number {
+		const dropped = this.pending.filter((f) => f.deviceId === deviceId);
+		if (dropped.length === 0) return 0;
+		this.pending = this.pending.filter((f) => f.deviceId !== deviceId);
+		this.pendingBytes = this.pending.reduce((n, f) => n + f.payload.byteLength, 0);
+		for (const f of dropped) this.pendingByKey.delete(f.key);
+		if (this.pending.length === 0) this.clearTimers();
+		for (const f of dropped) if (f.provisional) this.dropProvisional(f, "commit_failed");
+		return dropped.length;
+	}
+
 	/** Drops the buffer unacked. Returns the dropped frame count. */
 	dropPending(): number {
 		const dropped = this.pending.length;

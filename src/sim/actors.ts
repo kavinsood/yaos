@@ -104,13 +104,25 @@ export type UserAction =
 	| { readonly t: "attachDelete"; readonly dev: number; readonly file: number }
 	| { readonly t: "setting"; readonly dev: number; readonly file: number; readonly key: number; readonly del: boolean }
 	// The user's "Create snapshot" command (DESIGN §j.4): uploaded at once when the device uploads snapshots (snap rows).
-	| { readonly t: "snapshot"; readonly dev: number };
+	| { readonly t: "snapshot"; readonly dev: number }
+	// Storms (STORM_OPS, drawn from their own stream): bulk changes past the safety brake's thresholds (DESIGN §f.5).
+	/** An external tool (file sync, unzip, Importer plugin) writes `count` notes into import/b<batch>/; `big` of them >= 6 KiB. */
+	| { readonly t: "importStorm"; readonly dev: number; readonly batch: number; readonly count: number; readonly big: number }
+	/** The user selects many notes and deletes them: each md file with sel(path) < frac. */
+	| { readonly t: "massDelete"; readonly dev: number; readonly frac: number; readonly salt: number }
+	/** The user renames a top-level folder (one rename event per contained file). */
+	| { readonly t: "folderMove"; readonly dev: number; readonly folder: number; readonly name: number }
+	/** The user renames many notes one by one (a "rename with prefix" plugin): each md file with sel(path) < frac. */
+	| { readonly t: "massRename"; readonly dev: number; readonly frac: number; readonly salt: number }
+	/** An external tool rewrites many notes (formatter, find/replace, a bad sync): each md file with sel(path) < frac, shrunk. */
+	| { readonly t: "massOverwrite"; readonly dev: number; readonly frac: number; readonly salt: number };
 
 export type OpWeights = Readonly<Record<UserAction["t"], number>>;
 
 const NO_EXTRAS = { attach: 0, attachRename: 0, attachDelete: 0, setting: 0, snapshot: 0 } as const;
+const NO_STORMS = { importStorm: 0, massDelete: 0, folderMove: 0, massRename: 0, massOverwrite: 0 } as const;
 /** Edits only (no deletes/renames). */
-export const EDIT_OPS: OpWeights = { type: 30, paste: 2, deleteToken: 6, open: 8, close: 4, switch: 3, mode: 2, create: 6, diskInsert: 8, diskDeleteToken: 3, rename: 0, delete: 0, ...NO_EXTRAS };
+export const EDIT_OPS: OpWeights = { type: 30, paste: 2, deleteToken: 6, open: 8, close: 4, switch: 3, mode: 2, create: 6, diskInsert: 8, diskDeleteToken: 3, rename: 0, delete: 0, ...NO_EXTRAS, ...NO_STORMS };
 /** The full mix (the default). */
 export const FULL_OPS: OpWeights = { ...EDIT_OPS, rename: 3, delete: 2 };
 /**
@@ -119,8 +131,15 @@ export const FULL_OPS: OpWeights = { ...EDIT_OPS, rename: 3, delete: 2 };
  */
 export const EXTRA_OPS: OpWeights = {
 	type: 0, paste: 0, deleteToken: 0, open: 0, close: 0, switch: 0, mode: 0, create: 0, diskInsert: 0, diskDeleteToken: 0, rename: 0, delete: 0,
-	attach: 6, attachRename: 1, attachDelete: 1, setting: 4, snapshot: 0,
+	attach: 6, attachRename: 1, attachDelete: 1, setting: 4, snapshot: 0, ...NO_STORMS,
 };
+
+/**
+ * Storms (run.ts draws them from their own stream when SimConfig.storms > 0, so the main plan of a seed does not
+ * depend on them). Imports come first and most often: the deletes / overwrites need a vault large enough to cross the
+ * brake's MIN 50 and 20 % (core/limits BRAKE_*).
+ */
+export const STORM_OPS: OpWeights = { ...EXTRA_OPS, attach: 0, attachRename: 0, attachDelete: 0, setting: 0, importStorm: 4, massDelete: 3, folderMove: 2, massRename: 1, massOverwrite: 2 };
 
 /** Manual snapshots only (run.ts draws them from their own stream, in the seeds that upload snapshots). */
 export const SNAPSHOT_OPS: OpWeights = { ...EXTRA_OPS, attach: 0, attachRename: 0, attachDelete: 0, setting: 0, snapshot: 1 };
@@ -164,7 +183,37 @@ export function generateUserAction(rng: SeededRandom, devices: number, weights: 
 		case "attachDelete": return { t: "attachDelete", dev, file: f() };
 		case "setting": return { t: "setting", dev, file: rng.int(SETTING_FILES.length), key: rng.int(4), del: rng.chance(0.2) };
 		case "snapshot": return { t: "snapshot", dev };
+		// A batch pool of 3: two devices may import the same folder (offline, different versions: conflicts).
+		case "importStorm": { const count = rng.range(40, 120); return { t: "importStorm", dev, batch: rng.int(3), count, big: Math.floor(count * rng.float()) }; }
+		// 0.25 .. 0.95: below half mostly mass-delete-local, above half listing-shrank first (brake.ts priority).
+		case "massDelete": return { t: "massDelete", dev, frac: 0.25 + 0.7 * rng.float(), salt: rng.int(0x7fffffff) };
+		case "folderMove": return { t: "folderMove", dev, folder: f(), name: rng.int(NAME_POOL) };
+		case "massRename": return { t: "massRename", dev, frac: 0.2 + 0.6 * rng.float(), salt: rng.int(0x7fffffff) };
+		case "massOverwrite": return { t: "massOverwrite", dev, frac: 0.3 + 0.7 * rng.float(), salt: rng.int(0x7fffffff) };
 	}
+}
+
+/** Storm selection: a stable per-(path, salt) draw in [0,1) (the same files whatever else the vault holds). */
+export function stormSelects(path: string, salt: number, frac: number): boolean {
+	let h = (salt ^ 0x9e3779b9) >>> 0;
+	for (let i = 0; i < path.length; i++) h = Math.imul(h ^ path.charCodeAt(i), 0x01000193) >>> 0;
+	h = Math.imul(h ^ (h >>> 16), 0x85ebca6b) >>> 0;
+	return (h ^ (h >>> 13)) / 2 ** 32 < frac;
+}
+
+/** Filler lines for big imported notes (no tokens): enough to make a later shrink count as an overwrite (>= 4 KiB). */
+function filler(bytes: number, seed: number): string {
+	const words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"];
+	const out: string[] = [];
+	let n = 0;
+	let x = seed >>> 0 || 1;
+	while (n < bytes) {
+		x = Math.imul(x ^ (x >>> 15), 0x2c1b3c6d) >>> 0;
+		const line = `${words[x % 10]} ${words[(x >>> 4) % 10]} ${words[(x >>> 8) % 10]} ${x % 997}.`;
+		out.push(line);
+		n += line.length + 1;
+	}
+	return `${out.join("\n")}\n`;
 }
 
 /** Attachment bytes: the token in ASCII, then filler that is not valid UTF-8. */
@@ -214,7 +263,7 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 	if (w.isDown(a.dev)) return `skip ${tag}: app down`;
 	// Nobody types into, or acts through, a hidden or frozen app; other programs still write its files.
 	// The engine pauses passes then (DESIGN §i.4), so those writes reach it as one change on resume.
-	const external = (a.t === "diskInsert" || a.t === "diskDeleteToken") && a.by === "external";
+	const external = ((a.t === "diskInsert" || a.t === "diskDeleteToken") && a.by === "external") || a.t === "importStorm" || a.t === "massOverwrite";
 	if (!external && w.isBackground(a.dev)) return `skip ${tag}: app in background`;
 	const token = `[${d.name}.${step}]`;
 	const ws = d.workspace;
@@ -345,6 +394,74 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 			for (const t of tokensIn(cur)) w.ledger.deleted(t);
 			d.vault.userDelete(path);
 			return `${tag} ${path}`;
+		}
+		case "importStorm": {
+			let made = 0;
+			for (let k = 0; k < a.count; k++) {
+				const path = `import/b${a.batch}/f${k}.md`;
+				const t = `[${d.name}.${step}.${k}]`;
+				const cur = d.vault.textOf(path);
+				// A re-import replaces what was there: the user (through the tool) dropped the old version.
+				if (cur !== null) for (const old of tokensIn(cur)) w.ledger.deleted(old);
+				w.ledger.add(t, d.name, step, "import");
+				d.vault.externalWrite(path, `imported ${k} ${t}\n${k < a.big ? filler(6_000 + ((k * 977) % 4_000), step * 1009 + k) : ""}`);
+				made++;
+			}
+			return `${tag} import/b${a.batch} ${made} files (${Math.min(a.big, a.count)} big)`;
+		}
+		case "massDelete": {
+			const paths = markdownFiles(d).filter((p) => stormSelects(p, a.salt, a.frac));
+			if (paths.length === 0) return `skip ${tag}: nothing selected`;
+			for (const path of paths) {
+				const cur = d.vault.textOf(path);
+				if (cur === null) continue;
+				const seen = [cur, d.engineText(path) ?? "", ...d.workspace.views_().filter((v) => v.path === path).map((v) => v.buffer ?? "")];
+				for (const text of seen) for (const t of tokensIn(text)) w.ledger.deleted(t);
+				d.vault.userDelete(path);
+			}
+			return `${tag} ${paths.length} of ${markdownFiles(d).length + paths.length} notes`;
+		}
+		case "folderMove": {
+			const tops = [...new Set(markdownFiles(d).map((p) => p.split("/")[0]!).filter((x) => !x.endsWith(".md")))].sort();
+			const from = pickOf(tops, a.folder);
+			if (!from) return `skip ${tag}: no folder`;
+			const to = `moved${a.name}`;
+			const n = markdownFiles(d).filter((p) => p.startsWith(`${from}/`)).length;
+			const moved = [...d.vault.snapshot().keys()].filter((p) => p.startsWith(`${from}/`));
+			if (!d.vault.userRenameFolder(from, to)) return `skip ${tag}: ${from} -> ${to} refused`;
+			// Obsidian updates canvas links to every file the move renamed, as for a single rename.
+			for (const p of moved) w.onUserRename?.(a.dev, p, `${to}${p.slice(from.length)}`, step);
+			return `${tag} ${from} -> ${to} (${n} notes)`;
+		}
+		case "massRename": {
+			const paths = markdownFiles(d).filter((p) => stormSelects(p, a.salt, a.frac) && !p.split("/").pop()!.startsWith("x-"));
+			let n = 0;
+			for (const path of paths) {
+				const i = path.lastIndexOf("/");
+				const to = `${path.slice(0, i + 1)}x-${path.slice(i + 1)}`;
+				if (!d.vault.userRename(path, to)) continue;
+				w.onUserRename?.(a.dev, path, to, step);
+				n++;
+			}
+			return n === 0 ? `skip ${tag}: nothing renamed` : `${tag} ${n} notes`;
+		}
+		case "massOverwrite": {
+			const paths = markdownFiles(d).filter((p) => stormSelects(p, a.salt, a.frac));
+			let n = 0;
+			for (const [k, path] of paths.entries()) {
+				const cur = d.vault.textOf(path);
+				if (cur === null) continue;
+				// The tool keeps the first line and drops the rest: what it dropped is deleted by it, i.e. by the user.
+				const nl = cur.indexOf("\n");
+				const head = nl < 0 ? cur : cur.slice(0, nl);
+				const kept = new Set(tokensIn(head));
+				for (const t of tokensIn(cur)) if (!kept.has(t)) w.ledger.deleted(t);
+				const t = `[${d.name}.${step}.${k}]`;
+				w.ledger.add(t, d.name, step, "overwrite");
+				d.vault.externalWrite(path, `${head} ${t}\n`);
+				n++;
+			}
+			return n === 0 ? `skip ${tag}: nothing selected` : `${tag} ${n} notes`;
 		}
 		case "snapshot":
 			// A user command: its export and upload run on the engine's own time (the step does not wait).

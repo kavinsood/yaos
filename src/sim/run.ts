@@ -18,9 +18,11 @@
 
 import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
-import { generateUserAction, runUserAction, tokensIn, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
+import { generateUserAction, runUserAction, tokensIn, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, STORM_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
 import { activity, checkBlobLiveness, checkCanvas, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, checkBounds, checkFoldDeterminism, checkOutboxAndCursor, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
+import { BrakeUser, type BrakeUserStats } from "./brakeUser";
+import type { Budgets } from "../core/limits";
 import { collectCoverage } from "./coverage";
 import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
@@ -89,6 +91,17 @@ export interface SimConfig {
 	 * the same plan (scripts/sim-suspend.mjs). Default: none.
 	 */
 	readonly suspend?: { readonly budget: number | null; readonly save: "landed" | "lost" };
+	/**
+	 * Chance per main step of a storm (STORM_OPS: bulk import, mass delete / rename / overwrite, folder move), drawn
+	 * from its own stream (the main plan of a seed does not depend on it). Default 0. Brakes they trip are answered
+	 * by the simulated user (brakeUser.ts) in every run.
+	 */
+	readonly storms?: number;
+	/**
+	 * Draw every device's engine tuning and budgets per seed (tuningWorld) over the checkpoint world's; `tuning`
+	 * still overrides. Default false (the fixed FAST_TUNING matrices).
+	 */
+	readonly randomTuning?: boolean;
 }
 
 export interface CanvasConfig {
@@ -107,6 +120,62 @@ export interface SuspendOutcome extends Omit<SuspendRecord, "atRisk" | "committe
 	readonly lost: readonly string[];
 	/** Lost tokens that were in committed storage at the event, durable at the kill, or ever on a disk (a real violation). */
 	readonly genuine: readonly string[];
+}
+
+/** One device's drawn tuning (tuningWorld). */
+export interface DeviceTuning {
+	readonly tuning: Partial<EngineTuning>;
+	readonly budgets: Partial<Budgets>;
+}
+
+/**
+ * Engine tuning and budgets drawn per seed and device (SimConfig.randomTuning), from a "tuning" fork of the seed so
+ * no other draw shifts. Ranges stay sane (DESIGN §i: timers between the sim's FAST_TUNING scale and a few seconds,
+ * queues from tiny to production) but reach the corners the fixed matrices never do: residency budgets of a few
+ * docs (eviction on every switch), one-stream catch-up, live queues that overflow, frames closing at once or late,
+ * slow maintenance, full passes every few seconds.
+ */
+export function tuningWorld(cfg: SimConfig, devices: number): readonly DeviceTuning[] | null {
+	if (!cfg.randomTuning) return null;
+	const root = new SeededRandom(cfg.seed).fork("tuning");
+	return Array.from({ length: devices }, (_, i) => {
+		const r = root.fork(`dev-${i}`);
+		const skipSettleMs = r.chance(0.6) ? 0 : r.range(0, 2_000);
+		// Above the sim relay's group commit (1.5 s max) plus the link, like production's 60 s (see device.ts SIM_TUNING).
+		const provisionalAdoptMs = logRange(r, 2_500, 60_000);
+		const causalRetries = r.range(1, 3);
+		const tuning: Partial<EngineTuning> = {
+			frameStretch: +(0.005 * 40 ** r.float()).toFixed(4),
+			maintenanceMs: logRange(r, 10, 1_000),
+			statusIntervalMs: logRange(r, 20, 500),
+			mirrorDebounceMs: logRange(r, 2, 300),
+			gapMs: logRange(r, 50, 3_000),
+			provisionalAdoptMs,
+			// DESIGN §d.6: the re-read window covers 2 x provisionalAdoptMs (causalWindowProblem; SimDevice refuses less).
+			causalRetryMs: Math.max(logRange(r, 300, 30_000), Math.ceil((2 * provisionalAdoptMs) / causalRetries)),
+			causalRetries,
+			readBackoffMs: logRange(r, 20, 2_000),
+			readBatchStreams: r.chance(0.25) ? 1 : logRange(r, 2, 128),
+			liveBatchRows: logRange(r, 1, 256),
+			liveQueueMaxRows: logRange(r, 4, 1_000),
+			liveQueueMaxBytes: logRange(r, 4 * 1024, 4 * 1024 * 1024),
+			subscribeDebounceMs: logRange(r, 5, 500),
+			recentUnboundKeep: r.range(0, 16),
+			recentUnboundMs: logRange(r, 1, 60_000),
+			reconnectBaseMs: logRange(r, 10, 500),
+			skipSettleMs,
+			skipMaxDeferMs: skipSettleMs + (r.chance(0.5) ? 0 : r.range(0, 5_000)),
+		};
+		const budgets: Partial<Budgets> = {
+			maxResidentDocs: r.chance(0.5) ? r.range(2, 8) : logRange(r, 8, 400),
+			maxResidentBytes: logRange(r, 64 * 1024, 64 * 1024 * 1024),
+			catchUpConcurrency: r.range(1, 8),
+			maxInflightAppendBytes: logRange(r, 16 * 1024, 1024 * 1024),
+			blobBytesInFlight: logRange(r, 256 * 1024, 64 * 1024 * 1024),
+			fullReconcileIntervalMs: logRange(r, 3_000, 10 * 60_000),
+		};
+		return { tuning, budgets };
+	});
 }
 
 /** The checkpoint side of a run's world (DESIGN §b.5, §d.8, §d.9), a pure function of the seed. */
@@ -206,6 +275,8 @@ export interface SimReport {
 		 * STREAM_SUBSCRIBE sets it accepted.
 		 */
 		readonly subs: { readonly pushedRows: number; readonly skippedRows: number; readonly subscribes: number };
+		/** Brakes the simulated user answered (brakeUser.ts): reports seen by reason, approved, rejected. */
+		readonly brakes: BrakeUserStats;
 		/** Suite-1 fault outcomes (e2eeFaults.ts), in a suite-1 run with faults. */
 		readonly e2ee?: E2eeFaultStats;
 		/** Every suspend-kill of the run (faults.ts SuspendKillAction) and what it lost. */
@@ -302,6 +373,8 @@ export function generatePlan(cfg: SimConfig): Step[] {
 	const sr = new SeededRandom(cfg.seed).fork("snapshot-ops");
 	const cr = new SeededRandom(cfg.seed).fork("canvas-ops");
 	const snaps = checkpointWorld(cfg).snapshots.some((x) => x);
+	const stormRng = new SeededRandom(cfg.seed).fork("storms");
+	const storms = cfg.storms ?? 0;
 	const plan: Step[] = [];
 	let extra = c.steps;
 	for (let i = 0; i < c.steps; i++) {
@@ -311,6 +384,7 @@ export function generatePlan(cfg: SimConfig): Step[] {
 		if (c.extras > 0 && xr.chance(c.extras)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(xr, c.devices, EXTRA_OPS) });
 		// Manual snapshots, from their own stream (the main and extra plans of a seed do not depend on them).
 		if (snaps && sr.chance(0.04)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(sr, c.devices, SNAPSHOT_OPS) });
+		if (storms > 0 && stormRng.chance(storms)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(stormRng, c.devices, STORM_OPS) });
 		// Canvas actions, from their own stream too: floor(rate) per main step, one more with the fraction's chance.
 		if (c.canvas) {
 			const n = Math.floor(c.canvas.rate) + (cr.chance(c.canvas.rate % 1) ? 1 : 0);
@@ -364,6 +438,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		};
 		const nr = world.fork("net");
 		const cw = checkpointWorld(cfg);
+		const tw = tuningWorld(cfg, c.devices);
 		const net = new SimNet(clock, { seed: nr.int(0x7fffffff), linkMs: nr.range(5, 60), jitterMs: nr.range(0, 90), ...(cw.sealBytes !== null ? { sealBytes: cw.sealBytes } : {}) });
 		const devs = NAMES.slice(0, c.devices).map((name, di) => {
 			const dr = world.fork(`dev-${name}`);
@@ -371,7 +446,8 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			return new SimDevice({
 				name, clock, net, profile,
 				settings: cw.snapshots[di] ? () => SNAPSHOT_SETTINGS : () => RUN_SETTINGS,
-				tuning: { ...cw.tuning, ...cfg.tuning },
+				tuning: { ...cw.tuning, ...(tw?.[di]?.tuning ?? {}), ...cfg.tuning },
+				...(tw?.[di] ? { budgets: tw[di]!.budgets } : {}),
 				mobile: dr.chance(0.3),
 				log: cfg.log ? (line) => cfg.log!(name, `${clock.monotonic()} ${line}`) : undefined,
 				watcherDelayMs: c.faults ? () => watch.range(0, 400) : undefined,
@@ -386,6 +462,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			const t = cw.tuning;
 			trace.push(`checkpoints ${JSON.stringify({ ...t.checkpoint, compactRows: t.compactRows, candidate: t.nsCandidateModulus, seal: cw.sealBytes, join: cw.lateJoin, snapshots: cw.snapshots.map((x) => (x ? 1 : 0)).join("") })}`);
 		}
+		tw?.forEach((x, i) => trace.push(`tuning ${devs[i]?.name} ${JSON.stringify({ ...x.tuning, ...x.budgets })}`));
 
 		// Onboarding: files on A; some also on B (identical, or a different version).
 		const init = world.fork("init");
@@ -444,6 +521,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				if (d && c.canvas) canvasWorld.onUserRename(d, from, to, step);
 			},
 		};
+		const brakeUser = new BrakeUser(clock, devs, new SeededRandom(cfg.seed).fork("brake-user"), (i) => faults.isDown(i), (line) => trace.push(line));
 		let skipped = 0;
 		for (const step of plan) {
 			await clock.advance(step.gapMs);
@@ -454,6 +532,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			else if ("fault" in step && step.fault.t === "idbWipe" && !step.fault.mirrors) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
 			trace.push(`${step.i} ${line}`);
 			faults.afterStep();
+			brakeUser.poll();
 			sampleBounds();
 			cfg.observe?.(String(step.i), devs, net);
 		}
@@ -470,9 +549,10 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const print = () => `${activity(devs, net)}|${devs.map((d) => `${[...d.vault.snapshot()].join(";")}#${settingsPrint(d)}`).join("|")}`;
 		for (let t = 0; t < c.healHorizonMs && stable < 5; t += 1_000) {
 			await clock.advance(1_000);
+			brakeUser.poll();
 			sampleBounds();
 			// Blob store calls outside the blob queue (a snapshot upload's) count too: a stalled one ends by its idle window.
-			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty()));
+			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending();
 			const fp = print();
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
@@ -500,6 +580,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				else if ((d.vrt?.blobs.queued().length ?? 0) > 0) why.push(`${d.name} blob queue ${d.vrt?.blobs.queued().map((q) => `${q.direction}:${q.path}#${q.attempts}`).join(" ")}`);
 				if (d.vault.pendingEvents() > 0) why.push(`${d.name} vault events`);
 				if (d.workspace.views_().some((v) => v.isDirty())) why.push(`${d.name} dirty view`);
+				if (d.vrt?.brake) why.push(`${d.name} brake ${d.vrt.brake.reason} unanswered`);
 			});
 			if (print() !== last) why.push(`activity ${activity(devs, net)}`);
 			violations.push({ inv: "clean", detail: `no quiescence within ${c.healHorizonMs}ms: ${why.join(", ") || "flapping"}` });
@@ -537,7 +618,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
+			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, brakes: brakeUser.stats, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
 		};
 	} finally {
 		seedEntropy(null);

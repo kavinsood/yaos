@@ -46,9 +46,12 @@ function gitSha() {
 const logf = (r, lo, hi) => lo * (hi / lo) ** r.float();
 
 /** One run's profile, drawn from the master stream. Only real SimConfig knobs; JSON-serializable. */
-function drawConfig(r, F) {
+function drawConfig(r, F, C) {
 	const seed = r.range(1, 2 ** 31 - 1);
-	const bases = [["none", null, 2], ["DEFAULT_FAULTS", F.DEFAULT_FAULTS, 4], ["BLOB_FAULTS", F.BLOB_FAULTS, 2], ["SUBS_FAULTS", F.SUBS_FAULTS, 2], ["E2EE_FAULTS", F.E2EE_FAULTS, 1]];
+	const bases = [
+		["none", null, 2], ["DEFAULT_FAULTS", F.DEFAULT_FAULTS, 4], ["BLOB_FAULTS", F.BLOB_FAULTS, 2], ["SUBS_FAULTS", F.SUBS_FAULTS, 2],
+		["E2EE_FAULTS", F.E2EE_FAULTS, 1], ["CANVAS_FAULTS", F.CANVAS_FAULTS, 1], ["SUSPEND_FAULTS", F.SUSPEND_FAULTS, 1],
+	];
 	let x = r.float() * bases.reduce((s, b) => s + b[2], 0);
 	let base = bases[0];
 	for (const b of bases) { x -= b[2]; if (x < 0) { base = b; break; } }
@@ -69,13 +72,23 @@ function drawConfig(r, F) {
 		cfg.faultRate = +(long ? logf(r, 0.05, 0.25) : logf(r, 0.15, 0.45)).toFixed(3);
 		swarm = kept;
 	} else cfg.faults = null;
-	return { cfg, label: `${baseName}${swarm ? `[${swarm.length}]` : ""} ${long ? "long" : "short"} d${cfg.devices} s${cfg.steps}${cfg.crypto ? " suite1" : ""}` };
+	// Drawn after everything above, so the earlier draws of a master seed keep their values.
+	// Randomized engine tuning / budgets per device (run.ts tuningWorld) in half the runs.
+	if (r.chance(0.5)) cfg.randomTuning = true;
+	// Storms (bulk import, mass delete / rename / overwrite, folder move; brakes answered by the sim user) in a
+	// quarter of the runs, short ones only (hundreds of files on every device).
+	if (!long && r.chance(0.25)) cfg.storms = +logf(r, 0.02, 0.08).toFixed(3);
+	// CANVAS_FAULTS (long offline periods): mostly concurrent edits of the same two canvases, as testkit/sweep.ts's hot
+	// canvas matrix (every other run keeps run.ts's default canvas rate).
+	if (baseName === "CANVAS_FAULTS") cfg.canvas = { rate: +logf(r, 1, 4).toFixed(2), ops: C.CANVAS_HOT_OPS, pool: 2, hot: true };
+	return { cfg, label: `${baseName}${swarm ? `[${swarm.length}]` : ""} ${long ? "long" : "short"} d${cfg.devices} s${cfg.steps}${cfg.crypto ? " suite1" : ""}${cfg.randomTuning ? " tuned" : ""}${cfg.storms ? ` storms${cfg.storms}` : ""}${cfg.canvas ? " hot-canvas" : ""}` };
 }
 
 async function main() {
 	const o = args(process.argv.slice(2));
 	const { runSim, minimizePlan } = await load("../src/sim/run.ts");
 	const F = await load("../src/sim/faults.ts");
+	const C = await load("../src/sim/canvas.ts");
 	const { SeededRandom } = await load("../src/sim/random.ts");
 	const sha = gitSha();
 	const out = resolve(ROOT, o.out);
@@ -88,7 +101,7 @@ async function main() {
 	const failures = [];
 	const t0 = Date.now();
 	while (Date.now() < deadline && runs < o.maxRuns) {
-		const { cfg, label } = drawConfig(master, F);
+		const { cfg, label } = drawConfig(master, F, C);
 		runs++;
 		let r;
 		try {

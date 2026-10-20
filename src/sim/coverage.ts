@@ -9,7 +9,8 @@
  *                          plan.rebind.adopt, plan.wait.<reason>
  *   brake.<reason>         distinct brake reports (by id) per device
  *   diag.<code>            LogEngine diagnostics of every device engine (SimDevice.diagCounts, class suffix folded)
- *   host.<counter>         host-side engine stats (bound conflict copies, adopt-to-pending)
+ *   host.<counter>         engine stats over every runtime of a device (bound conflict copies, provisionals
+ *                          adopted, adopt-to-pending)
  *
  * Every key of COVERAGE_KEYS is present (0 when it never fired), so a soak's aggregate shows the gaps.
  */
@@ -50,7 +51,7 @@ export const COVERAGE_KEYS: readonly string[] = [
 	...PLAN_OPS.map((k) => `plan.${k}`), ...CONFLICT_REASONS.map((k) => `plan.conflictCopy.${k}`),
 	"plan.reconcileContent.base", "plan.reconcileContent.noBase", "plan.reconcileContent.pathBase", "plan.rebind.adopt",
 	...WAIT_REASONS.map((k) => `plan.wait.${k}`), ...BRAKES.map((k) => `brake.${k}`), ...DIAGS.map((k) => `diag.${k}`),
-	"host.boundConflictCopies", "host.adoptToPending",
+	"host.boundConflictCopies", "host.provisionalAdopted", "host.adoptToPending",
 ];
 
 export function emptyCoverage(): Record<string, number> {
