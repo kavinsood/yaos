@@ -39,7 +39,7 @@ import { MemStoragePort } from "../../sim/storage";
 import { simHashPort } from "../../sim/hash";
 import { LogEngine } from "./engine";
 import { submitNs } from "./logApi";
-import type { EngineOptions, EngineTuning } from "./options";
+import { causalWindowProblem, DEFAULT_TUNING, type EngineOptions, type EngineTuning } from "./options";
 import { retryReaderQuarantine } from "./quarantineRelease";
 
 /** Timers shrunk so multi-engine tests settle in well under a second. */
@@ -52,8 +52,11 @@ export const FAST_TUNING: Partial<EngineTuning> = {
 	mirrorDebounceMs: 10,
 	// Above the relay's worst commit latency (maxMs 1500 held by minIntervalMs 1000): an adoptable settles on its commit.
 	provisionalAdoptMs: 3000,
+	// DESIGN §d.6: the causal re-read window (retries x interval) covers 2 x provisionalAdoptMs, since the missing
+	// structs may be an adoption still in flight. A short interval keeps a transient hole's recovery quick; the
+	// retry count supplies the window (100 x 60 ms = 6 s). Tests that freeze a hole on purpose shrink all three.
 	causalRetryMs: 60,
-	causalRetries: 2,
+	causalRetries: 100,
 	readBackoffMs: 50,
 	reconnectBaseMs: 20,
 	refRetryMs: 50,
@@ -63,6 +66,15 @@ export const FAST_TUNING: Partial<EngineTuning> = {
 	skipSettleMs: 0,
 	skipMaxDeferMs: 0,
 };
+
+/**
+ * An adoption timer of `ms` with the causal re-read window stretched to cover it (DESIGN §d.6: causalRetries x
+ * causalRetryMs >= 2 x provisionalAdoptMs), at FAST_TUNING's re-read interval.
+ */
+export function adoptTuning(ms: number): Partial<EngineTuning> {
+	const every = FAST_TUNING.causalRetryMs ?? DEFAULT_TUNING.causalRetryMs;
+	return { provisionalAdoptMs: ms, causalRetries: Math.ceil((2 * ms) / every) };
+}
 
 export interface FaultyCrypto extends CryptoPort {
 	/** While true, open() of frames sealed by `faultyFor` (or every frame) fails "unknown-key". */
@@ -133,6 +145,10 @@ export function testStorage(clock?: VirtualClock): MemStoragePort {
 const starts = new WeakMap<VirtualClock, number>();
 
 export async function startTestEngine(o: TestEngineOpts): Promise<{ engine: LogEngine; storage: StoragePort }> {
+	const tuning: Partial<EngineTuning> = { ...FAST_TUNING, ...(o.tuning ?? {}) };
+	// A test whose tuning breaks a DESIGN constraint tests the harness, not the engine: refuse it (as SimDevice does).
+	const bad = causalWindowProblem({ ...DEFAULT_TUNING, ...tuning });
+	if (bad !== null) throw new Error(`startTestEngine ${o.deviceId}: ${bad}`);
 	const storage = o.storage ?? testStorage(o.clock);
 	let seed = 1;
 	if (o.clock) {
@@ -146,7 +162,7 @@ export async function startTestEngine(o: TestEngineOpts): Promise<{ engine: LogE
 		deviceId: o.deviceId as DeviceId,
 		clientVersion: "test",
 		sideFiles: o.sideFiles ?? null,
-		tuning: { ...FAST_TUNING, ...(o.tuning ?? {}) },
+		tuning,
 		e2ee: o.e2ee ?? { suite: 0 },
 		...(o.extra ?? {}),
 	}), o.clock);

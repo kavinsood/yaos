@@ -19,6 +19,11 @@ import { converged, faultyCrypto, sleep, startTestEngine, until, createDoc, docT
 
 const VAULT = "vault-test" as VaultId;
 const noop = createNoopCrypto(createWebHash());
+/**
+ * A hole that freezes fast: 2 re-reads 60 ms apart. No provisionals run in these tests (rawDevice appends committed
+ * rows), so the adoption timer shrinks with the window and DESIGN §d.6 (window >= 2 x provisionalAdoptMs) holds.
+ */
+const QUICK_FREEZE = { causalRetryMs: 60, causalRetries: 2, provisionalAdoptMs: 60 };
 
 async function live(...es: LogEngine[]): Promise<void> {
 	await until(() => es.every((e) => e.status().phase === "live"), 3_000, "live");
@@ -140,7 +145,7 @@ test("quarantine: disallowed Yjs type from a peer freezes every reader; release 
 
 test("causal hole: missing structs -> re-read causalRetries times -> freeze causal-hole; the missing row thaws it, no release", async () => {
 	const relay = new SimRelay();
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: QUICK_FREEZE });
 	const x = await rawDevice(relay);
 	try {
 		await live(a);
@@ -184,7 +189,7 @@ test("causal hole: missing structs -> re-read causalRetries times -> freeze caus
 
 test("causal hole filled before the retries run out: no freeze", async () => {
 	const relay = new SimRelay();
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { causalRetryMs: 150, causalRetries: 3 } });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { causalRetryMs: 150, causalRetries: 3, provisionalAdoptMs: 225 } });
 	const x = await rawDevice(relay);
 	try {
 		await live(a);
@@ -212,7 +217,7 @@ test("causal hole filled before the retries run out: no freeze", async () => {
 
 test("causal hole while offline: retries without a session do not count, no freeze; back online it re-reads then freezes", async () => {
 	const relay = new SimRelay();
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: QUICK_FREEZE });
 	const x = await rawDevice(relay);
 	try {
 		await live(a);

@@ -8,7 +8,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until, createDoc, editDoc } from "../runtime/testHarness";
+import { adoptTuning, converged, until, createDoc, editDoc } from "../runtime/testHarness";
 import { live, rawAppend, start, type Dev } from "./testkit/engines";
 import { K, genesis } from "./testkit/world";
 
@@ -19,7 +19,7 @@ async function adopted(relay: SimRelay): Promise<{ x: Dev; y: Dev; stream: Retur
 	const pin = { keys: [{ e: 1, k: K(1) }], records: [g] };
 	const x = await start(relay, "dev-x", pin);
 	// The 60 s fallback stays out of the test's window: only a settle can remove the adoptable.
-	const y = await start(relay, "dev-y", pin, { tuning: { provisionalAdoptMs: 60_000 } });
+	const y = await start(relay, "dev-y", pin, { tuning: adoptTuning(60_000) });
 	await live(x);
 	await live(y);
 	const id = await createDoc(x.engine, "a.md" as VaultPath, "base;");

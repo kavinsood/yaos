@@ -5,7 +5,7 @@ import { SimRelay } from "../../sim/relay";
 import { applyChanges, type TextChanges } from "../body/textChanges";
 import type { LogEngine } from "./engine";
 import type { EngineTuning } from "./options";
-import { converged, sleep, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
+import { adoptTuning, converged, sleep, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
 
 /** A bound editor as main keeps it: bind() + boundText, onBoundText changes from others, typing via applyEditorChanges. */
 class View {
@@ -132,7 +132,7 @@ test("provisional: no commit within provisionalAdoptMs -> pending; commits once 
 test("provisional: an adoptable holds nothing: own frames typed on top are pending and go out before the adopted frame's commit", async () => {
 	const relay = new SimRelay();
 	// A long adopt timeout: the adoptable stays adoptable for the whole test.
-	const { a, b, view } = await pair(relay, { provisionalAdoptMs: 60_000 });
+	const { a, b, view } = await pair(relay, adoptTuning(60_000));
 	try {
 		const id = await createDoc(a, "h.md", "");
 		await converged([a, b]);

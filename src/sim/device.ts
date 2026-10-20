@@ -113,9 +113,9 @@ export interface SimDeviceOptions {
 }
 
 /**
- * FAST_TUNING, with DESIGN §d.6's causal re-read window kept at its production proportions: ≥ 2 × provisionalAdoptMs
- * (the missing structs may be a provisional adoption still in flight: FAST_TUNING's 2 × 60 ms froze `causal-hole` on
- * holes the adopted copy would have filled) and well past an own frame's untuned 1 s retry (sender.ts: durability,
+ * FAST_TUNING, with DESIGN §d.6's causal re-read window kept at its production proportions (a few spaced re-reads,
+ * not FAST_TUNING's 100 at 60 ms): ≥ 2 × provisionalAdoptMs (the missing structs may be a provisional adoption still
+ * in flight: FAST_TUNING's former 2 × 60 ms froze `causal-hole` on holes the adopted copy would have filled) and well past an own frame's untuned 1 s retry (sender.ts: durability,
  * the daily-limit floor; a frame refused while a later one of the same author commits leaves peers a hole for that
  * long). 3 × 2 s against FAST_TUNING's 3 s adoption timer, which is above the sim relay's group commit plus the link
  * (production's 60 s is far above the server's), so adoptions time out only where production's do: relay restarts,

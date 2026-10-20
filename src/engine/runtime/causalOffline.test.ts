@@ -19,7 +19,7 @@ const noop = createNoopCrypto(createWebHash());
 
 test("causal hole while offline: retries without a session do not count; the reconnect's catch-up fills it, no freeze", async () => {
 	const relay = new SimRelay();
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { causalRetryMs: 40, causalRetries: 2 } });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", tuning: { causalRetryMs: 40, causalRetries: 2, provisionalAdoptMs: 40 } });
 	const r = await relay.connect({ vaultId: VAULT, deviceId: "dev-x" as DeviceId });
 	assert.ok(r.ok);
 	const x: RelaySession = r.session;
