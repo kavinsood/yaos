@@ -34,6 +34,7 @@ import { conflictCopy, fetchBlob, pushBlob } from "./blobJobs";
 import { diskMaterializeCanvas } from "./canvasJob";
 import { diskMaterialize, diskRename, diskTrash, rebind, syncedDrop, syncedPut, type Env, type JobOutcome } from "./diskJobs";
 import { reconcileContent } from "./mergeJob";
+import type { LogPort } from "./deps";
 
 export interface RunReport {
 	readonly ok: number;
@@ -178,7 +179,7 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		}
 		const op = ops[i]!;
 		if (op.op === "wait") {
-			if (op.reason === "text-hash" && !stopping()) note(op, await loadText(env, op.docId));
+			if (op.reason === "text-hash" && !stopping()) note(op, await loadTextHash(ctx.log, op.docId));
 			else waits++;
 			continue;
 		}
@@ -201,19 +202,25 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 }
 
 /**
- * wait "text-hash": load the doc's replica (it stays resident after the release, until evicted) and take its textHash,
- * so the next plan reads it (planner collapse). "ok" once the hash is known: the pass is productive and a follow-up
- * pass runs; "fail" when it cannot be had (no body stream, a canvas that does not project).
+ * wait "text-hash": load the doc's replica and take its textHash while the handle is pinned, so the next plan reads
+ * it (planner collapse). The hash is digested before the release: with the residency budget full of handles that
+ * cannot be evicted (bound, pinned, unframed), the release evicts the replica at once, and a warm after it found
+ * nothing to hash, so every pass waited on the same "text-hash" and never decided (sim randomized-tuning seeds 86,
+ * 163). view() keeps the hash after the eviction while the body version is the one hashed (ComposedLog.knownHash).
+ * "ok" once the hash is known: the pass is productive and a follow-up pass runs; "fail" when it cannot be had (no
+ * body stream, a canvas that does not project).
  */
-async function loadText(env: Env, docId: DocId): Promise<JobOutcome> {
-	const { ctx } = env;
-	const r = ctx.log.view().remote.get(docId);
+export async function loadTextHash(log: LogPort, docId: DocId): Promise<JobOutcome> {
+	const r = log.view().remote.get(docId);
 	if (!r || r.kind === "blob") return "fail";
-	const h = await ctx.log.acquireBody(docId, r.kind);
+	const h = await log.acquireBody(docId, r.kind);
 	if (!h) return "fail";
-	h.release();
-	await ctx.log.warmTextHashes();
-	return ctx.log.view().textHash.has(docId) ? "ok" : "fail";
+	try {
+		await log.warmTextHashes();
+	} finally {
+		h.release();
+	}
+	return log.view().textHash.has(docId) ? "ok" : "fail";
 }
 
 /** S for a markdown / canvas doc about to be created: the empty body, stat of the local file. */

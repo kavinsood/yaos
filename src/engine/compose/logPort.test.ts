@@ -8,6 +8,7 @@ import { markdownHashRef } from "../../core/hash/testkit/hashRef";
 import { SimRelay } from "../../sim/relay";
 import { startTestEngine, until, createDoc, editDoc } from "../runtime/testHarness";
 import { ComposedLog } from "./logPort";
+import { loadTextHash } from "../reconcile/runner";
 
 const NOT_EMPTY = "ab".repeat(32) as ContentHash;
 
@@ -67,5 +68,46 @@ test("textHash: warmTextHashes digests resident replicas through HashPort; view(
 		assert.equal(la.view().textHash.get(big), markdownHashRef(`x${bigText}`));
 	} finally {
 		await a.stop();
+	}
+});
+
+/**
+ * Sim randomized-tuning seeds 86, 163: the planner's collapse waited on "text-hash" for a peer's doc on a device whose
+ * residency budget was full of bound docs. loadTextHash loaded the doc, released it (the release evicted it at once:
+ * the only clean handle) and warmed after that, so no pass ever had the hash and the loser rename never ran.
+ */
+test("textHash: a doc loaded for its hash keeps it when the full residency budget evicts it at its release", async () => {
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", extra: { budgets: { maxResidentDocs: 1 } } });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	try {
+		const open = await createDoc(a, "open.md" as VaultPath, "open here\n");
+		await a.bind(open);
+		const text = "a peer's note\n";
+		const peer = await createDoc(b, "peer.md" as VaultPath, text);
+		await until(() => b.isIdle() && b.c.outbox.size === 0, 2_000, "b receipted");
+		await until(() => a.isIdle() && a.c.outbox.size === 0 && a.bodyInfo(peer)?.caughtUp === true && a.bodyInfo(peer)?.hasContent === true, 2_000, "a caught up");
+		const la = new ComposedLog(a);
+		la.nsCaughtUp = true;
+		assert.equal(a.c.handles.isResident(a.streamOf(peer)), false, "not resident");
+		assert.equal(la.view().textHash.has(peer), false, "no hash before the load");
+
+		assert.equal(await loadTextHash(la, peer), "ok");
+		assert.equal(a.c.handles.isResident(a.streamOf(peer)), false, "evicted at its release (the bound doc fills the budget)");
+		await la.warmTextHashes();
+		assert.equal(la.view().textHash.get(peer), markdownHashRef(text), "the next pass still reads the hash");
+
+		// A new row moves the body version: the hash of the old text is never paired with the new one.
+		const before = a.bodyInfo(peer)?.version.remoteSeq ?? 0;
+		await editDoc(b, peer, (t) => t.insert(0, "x"));
+		await until(() => b.isIdle() && b.c.outbox.size === 0, 2_000, "b receipted the edit");
+		await until(() => a.isIdle() && a.bodyInfo(peer)?.caughtUp === true && (a.bodyInfo(peer)?.version.remoteSeq ?? 0) > before, 2_000, "a caught up on the edit");
+		la.invalidate();
+		assert.equal(la.view().textHash.has(peer), false, "stale once the version moved");
+		assert.equal(await loadTextHash(la, peer), "ok");
+		assert.equal(la.view().textHash.get(peer), markdownHashRef(`x${text}`));
+	} finally {
+		await a.stop();
+		await b.stop();
 	}
 });

@@ -1555,10 +1555,14 @@ All are in `src/core/types.ts`.
     `src/host/pluginController.ts:368`).
   - `streams.textHash` of a resident replica (the planner's remote hash for a caught-up markdown/canvas doc) is
     digested through `HashPort` before each pass reads the view (`warmTextHashes`,
-    `src/engine/compose/logPort.ts:114-130`, called at `src/engine/reconcile/reconciler.ts:152`). A replica that
+    `src/engine/compose/logPort.ts:128-144`, called at `src/engine/reconcile/reconciler.ts:152`). A replica that
     changed after the warm is hashed by the view only if its input fits `SYNC_HASH_MAX_BYTES`; otherwise the view
-    has no `textHash` for it and the planner's remote hash is unknown (`logPort.ts:98-107`,
-    `src/core/plan/planner.ts:201-207`).
+    has no `textHash` for it and the planner's remote hash is unknown (`logPort.ts:102-124`,
+    `src/core/plan/planner.ts:201-207`). A replica evicted after its hash was taken keeps it while its body version
+    is the one hashed. The planner's `wait "text-hash"` loads the doc and hashes it while the handle is still pinned
+    (`loadTextHash`, `src/engine/reconcile/runner.ts:213`): with the residency budget full of handles that cannot be
+    evicted, the release evicts the replica at once, and a hash taken after it was never there (sim seeds 86, 163 of
+    the randomized-tuning matrix: the collapse waited forever).
 
 ### f.2 Planner
 

@@ -422,6 +422,19 @@ function digestOf(parts: readonly string[]): string {
 	return fnv(s, 0x811c9dc5).toString(16).padStart(8, "0") + fnv(s, 0x01000193).toString(16).padStart(8, "0");
 }
 
+/**
+ * Adoptable outbox records (DESIGN §d.5): another device's provisional frames this one shadows until their commit is
+ * seen, else sends after provisionalAdoptMs (60 s in production, drawn up to that by tuningWorld). LogEngine.isIdle
+ * does not count them, but invariant 5 wants none: when the commit is never seen as a row (the live batch holding it
+ * was lost to a crash and the read that followed started from a checkpoint over it, randomized-tuning seed 90) only
+ * the timer ends them, so the heal waits for it.
+ */
+function adoptables(d: SimDevice): number {
+	let n = 0;
+	for (const r of d.vrt?.log.c.outbox.values() ?? []) if (r.state === "adoptable") n++;
+	return n;
+}
+
 export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Promise<SimReport> {
 	const c = full(cfg);
 	const plan = explicitPlan ?? generatePlan(cfg);
@@ -552,7 +565,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			brakeUser.poll();
 			sampleBounds();
 			// Blob store calls outside the blob queue (a snapshot upload's) count too: a stalled one ends by its idle window.
-			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending();
+			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending();
 			const fp = print();
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
@@ -576,6 +589,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				if (faults.isDown(i)) why.push(`${d.name} down`);
 				else if (!d.runtime.engine.isReady) why.push(`${d.name} not ready`);
 				else if (!(d.vrt?.log.isIdle() ?? false)) why.push(`${d.name} log busy`);
+				else if (adoptables(d) > 0) why.push(`${d.name} ${adoptables(d)} adoptable`);
 				else if (!(d.vrt?.snaps.idle ?? true)) why.push(`${d.name} snapshot job busy`);
 				else if ((d.vrt?.blobs.queued().length ?? 0) > 0) why.push(`${d.name} blob queue ${d.vrt?.blobs.queued().map((q) => `${q.direction}:${q.path}#${q.attempts}`).join(" ")}`);
 				if (d.vault.pendingEvents() > 0) why.push(`${d.name} vault events`);

@@ -77,7 +77,7 @@ export class ComposedLog implements LogPort {
 			if (this.nsCaughtUp && e.state === "live" && e.createdBy === c.self && body.caughtUp && !body.hasContent
 				&& e.createHash !== EMPTY_CONTENT_HASH && !pending.has(e.docId)) lostCreateBody.add(e.docId);
 			if (body.caughtUp && e.state === "live") {
-				const h = this.residentHash(e.docId, e.kind as "markdown" | "canvas", body.stream, body.version);
+				const h = this.knownHash(e.docId, e.kind as "markdown" | "canvas", body.stream, body.version);
 				if (h) textHash.set(e.docId, h);
 			}
 		}
@@ -100,16 +100,20 @@ export class ComposedLog implements LogPort {
 	}
 
 	/**
-	 * streams.textHash for a resident, framed replica: what warmTextHashes took for its body version. Never loads
-	 * a doc and never blocks on a digest: a replica that changed since (a remote row or a keystroke after the warm)
-	 * is hashed here only when its text is at most SYNC_HASH_MAX_BYTES, else it has no textHash in this view (as a
-	 * doc that is not resident; the next pass warms it).
+	 * streams.textHash for a caught-up replica: what warmTextHashes took for its body version. Never loads a doc and
+	 * never blocks on a digest: a resident replica that changed since (a remote row or a keystroke after the warm) is
+	 * hashed here only when its text is at most SYNC_HASH_MAX_BYTES, else it has no textHash in this view (the next
+	 * pass warms it). A replica evicted since it was hashed keeps the hash while its body version is the one hashed:
+	 * the memo already pairs a hash with a version for resident replicas, as the planner's Rc pairs S with one, and
+	 * an evicted replica had no open frame (eviction is clean-only) and gets no keystroke. Without it, a doc loaded for
+	 * its hash (runner loadTextHash) that the residency budget evicts again at once never has one.
 	 */
-	private residentHash(docId: DocId, kind: "markdown" | "canvas", stream: StreamName, v: BodyVersion): ContentHash | null {
+	private knownHash(docId: DocId, kind: "markdown" | "canvas", stream: StreamName, v: BodyVersion): ContentHash | null {
 		const h = this.log.c.handles.peek(stream);
-		if (!hashable(h)) return null;
 		const key = versionKey(v);
 		const m = this.hashMemo.get(docId);
+		if (h === undefined) return m && m.key === key ? m.hash : null;
+		if (!hashable(h)) return null;
 		if (m && m.key === key) return m.hash;
 		const input = textHashInput(kind, h.doc, SYNC_HASH_MAX_BYTES);
 		if (input === null || input.length > SYNC_HASH_MAX_BYTES) return null;
