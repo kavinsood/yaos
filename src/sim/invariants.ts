@@ -424,13 +424,13 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 
 	// The converged canvases (device 0; convergence is checked separately): record -> [path, fields].
 	const holders = new Map<string, { path: string; doc: string | null; obj: Readonly<Record<string, unknown>> }[]>();
-	const roots: { path: string; root: Readonly<Record<string, unknown>> }[] = [];
+	const roots: { path: string; doc: string | null; root: Readonly<Record<string, unknown>> }[] = [];
 	const order = new Map<string, { path: string; ids: string[] }>();
 	for (const path of canvasFiles(first)) {
 		const m = readModel(first.vault.textOf(path) ?? "");
 		if (!m) continue;
 		const doc = docIdOf(first, path);
-		roots.push({ path, root: m.root });
+		roots.push({ path, doc, root: m.root });
 		if (doc) order.set(doc, { path, ids: m.nodes.map((n) => String(n.id)) });
 		for (const [kind, list] of [["n", m.nodes], ["e", m.edges]] as const) {
 			for (const o of list) {
@@ -479,13 +479,15 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 	}
 
 	// writes (lost updates)
-	const finalsOf = (rec: string, field: string, lineage: string | null | undefined, removal: boolean): string[] | null => {
+	const finalsOf = (rec: string, field: string, lineage: string | null | undefined, doc: string | null | undefined, removal: boolean): string[] | null => {
 		if (rec === "root") {
 			// A root has no id: its holders are the canvases of the written one's lineage (canvas.ts LINEAGE_KEY;
-			// conflict copies included, the field absent or not). A lineage no canvas holds any more (the canvas was
-			// deleted, or merged into another doc whose root won) or none at all: every canvas holding the field, and a
-			// removal is not judged (a canvas without the field may or may not be the written one).
-			const known = lineage ? roots.filter((x) => lineageOf(x.root) === lineage) : [];
+			// conflict copies included, the field absent or not), and the canvas of the doc it was written in: another
+			// device's rewrite of the whole canvas, merged into that doc, replaces the lineage key there (suite-0 hot
+			// canvas seed 8). A lineage no canvas holds any more (the canvas was deleted, or merged into another doc
+			// whose root won) or none at all: every canvas holding the field, and a removal is not judged (a canvas
+			// without the field may or may not be the written one).
+			const known = roots.filter((x) => (lineage && lineageOf(x.root) === lineage) || (doc && x.doc === doc));
 			const hs = known.length > 0 ? known : removal ? [] : roots.filter((x) => x.root[field] !== undefined);
 			return hs.length > 0 ? hs.map((x) => valueOf(x.root, field)) : null;
 		}
@@ -507,7 +509,7 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 		if (w.rec !== "root" && oracle.record(w.rec)?.deleted) continue;
 		if (dangling(w.rec)) continue;
 		if (oracle.discarded.has(`${w.rec}|${w.field}|${w.value}`)) continue;
-		const finals = finalsOf(w.rec, w.field, w.lineage, w.value === ABSENT);
+		const finals = finalsOf(w.rec, w.field, w.lineage, w.doc, w.value === ABSENT);
 		if (!finals) continue;
 		const anc = oracle.ancestors(w);
 		if (anc.size === 0) continue;

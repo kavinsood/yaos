@@ -293,6 +293,11 @@ export interface FieldWrite {
 	readonly atMs: number;
 	/** Root fields: the canvas's lineage (LINEAGE_KEY) when written, null when it has none (an empty canvas's). */
 	readonly lineage?: string | null;
+	/**
+	 * Root fields: the doc the file was synced as when written (docIdOf; null: not synced yet). Another device's
+	 * rewrite of the whole canvas merged into the same doc replaces its lineage, and the write is still in that doc.
+	 */
+	readonly doc?: string | null;
 }
 
 export interface RecordDelete {
@@ -921,7 +926,7 @@ export class CanvasWorld {
 			const saw = obj[field] === undefined ? ABSENT : key(obj[field]!);
 			if (value === undefined) delete obj[field];
 			else obj[field] = value;
-			o.write({ rec, field, value: value === undefined ? ABSENT : key(value), saw, dev: d.name, step, path, atMs: this.clock.now(), ...(rec === "root" ? { lineage: lineageOf(m.root) } : {}) });
+			o.write({ rec, field, value: value === undefined ? ABSENT : key(value), saw, dev: d.name, step, path, atMs: this.clock.now(), ...(rec === "root" ? { lineage: lineageOf(m.root), doc: docIdOf(d, path) } : {}) });
 		};
 		const node = (pick: number) => pickOf(m.nodes, this.recPick(pick));
 		let what: string;
