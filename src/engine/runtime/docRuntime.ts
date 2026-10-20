@@ -38,6 +38,9 @@ function boundOrigin(origin: unknown): BoundTextOrigin {
 	return "remote";
 }
 
+/** Freeze reason of a causal hole that outlived its re-reads (§d.6); lifted by checkDoc once the hole is gone. */
+const CAUSAL_HOLE = "causal-hole";
+
 type Provisional = Extract<RelayEvent, { t: "provisional" }>;
 type Dropped = Extract<RelayEvent, { t: "provisionalDropped" }>;
 
@@ -45,6 +48,8 @@ export class DocRuntime {
 	private chainP: Promise<void> = Promise.resolve();
 	private chained = 0;
 	private readonly causal = new Map<StreamName, { attempts: number; timer: TimerHandle | null }>();
+	/** Session-start re-reads of streams frozen `causal-hole` (rereadFrozenHoles): starts seen, next start to read on. */
+	private readonly holeRereads = new Map<StreamName, { starts: number; next: number }>();
 	private readonly refRetry = new Map<StreamName, { delayMs: number; timer: TimerHandle | null }>();
 	/** §10.2 deterministic-failure streaks of ref rows, by stream then seq; dropped when the doc freezes. */
 	private readonly refStreaks = new Map<StreamName, BlobFailureStreaks>();
@@ -271,10 +276,17 @@ export class DocRuntime {
 		if (h.unresolvedRows.length === 0) this.clearRefRetry(stream);
 	}
 
-	/** Stage 3 (DESIGN §d.6): oversize -> freeze; causal hole on a caught-up stream -> re-read timer. */
+	/**
+	 * Stage 3 (DESIGN §d.6): oversize -> freeze; causal hole on a caught-up stream -> re-read timer. A doc frozen
+	 * `causal-hole` whose hole is gone (the missing row came: a resend, a catch-up, a re-read) thaws.
+	 */
 	checkDoc(h: Handle): void {
 		const rec = this.c.repo.stream(h.stream);
-		if (!rec || rec.frozen) return;
+		if (!rec) return;
+		if (rec.frozen) {
+			if (rec.frozenReason === CAUSAL_HOLE && rec.quarantinedRows === 0 && !hasCausalHole(h.doc)) void this.thaw(h);
+			return;
+		}
 		if (docTextLength(h) > MAX_DOC_TEXT_CHARS) {
 			void this.c.freeze(h.stream, "oversize-remote");
 			return;
@@ -315,13 +327,49 @@ export class DocRuntime {
 		if (!this.c.session) return again();
 		if (st.attempts >= this.c.tuning.causalRetries) {
 			this.clearCausal(stream);
-			await this.c.freeze(stream, "causal-hole");
+			await this.c.freeze(stream, CAUSAL_HOLE);
 			return;
 		}
 		st.attempts++;
 		this.stats.causalReads++;
 		await this.c.sess.runRead(stream, rec.snapshotCoversSeq);
 		again();
+	}
+
+	private async thaw(h: Handle): Promise<void> {
+		if (!(await this.c.thaw(h.stream, CAUSAL_HOLE))) return;
+		this.holeRereads.delete(h.stream);
+		this.checkDoc(h); // the other stage-3 checks were skipped while it was frozen
+	}
+
+	/**
+	 * A cold doc frozen `causal-hole` that just got rows (or a re-read): load it so checkDoc can see whether the hole
+	 * is gone. Only these docs are loaded; the budget evicts the handle again once it is clean.
+	 */
+	needsHoleCheck(stream: StreamName): boolean {
+		const rec = this.c.repo.stream(stream);
+		return rec?.frozen === 1 && rec.frozenReason === CAUSAL_HOLE && rec.quarantinedRows === 0;
+	}
+
+	/**
+	 * Session start (DESIGN §d.6): re-read each stream frozen `causal-hole` from its snapshot, as the pre-freeze
+	 * re-reads did, on session starts 1, 2, 4, 8, ... since this engine first saw it frozen. Event-driven, no timer:
+	 * a row this device holds no copy of comes back here, and afterStored's checkDoc thaws the doc if the hole is gone.
+	 */
+	rereadFrozenHoles(): void {
+		const live = new Set<StreamName>();
+		for (const r of this.c.repo.streams()) {
+			if (!this.needsHoleCheck(r.stream)) continue;
+			live.add(r.stream);
+			const st = this.holeRereads.get(r.stream) ?? { starts: 0, next: 1 };
+			this.holeRereads.set(r.stream, st);
+			st.starts++;
+			if (st.starts < st.next) continue;
+			st.next *= 2;
+			this.stats.causalReads++;
+			void this.c.sess.runRead(r.stream, r.snapshotCoversSeq).catch((e: unknown) => this.c.diag("causal-reread-failed", { error: String(e) }));
+		}
+		for (const s of [...this.holeRereads.keys()]) if (!live.has(s)) this.holeRereads.delete(s);
 	}
 
 	/** Another device's provisional on a bound doc: apply, then T_adopt (DESIGN §d.5). */

@@ -193,6 +193,8 @@ export class SessionLoop {
 			// Reader-dependent quarantine is retried on every session start (new keys / version, §d.6).
 			await retryReaderQuarantine(c).catch((e) => c.diag("quarantine-retry-failed", { error: String(e) }));
 			if (gen !== c.gen) return;
+			// Docs frozen by a causal hole are re-read (with backoff over session starts) and thaw once it fills (§d.6).
+			c.docs.rereadFrozenHoles();
 			this.scheduleCatchUp();
 		} catch (e) {
 			c.diag("session-start-failed", { error: String(e) });

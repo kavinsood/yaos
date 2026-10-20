@@ -1091,6 +1091,20 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
      an adoption in flight), then freeze `causal-hole`. A retry that finds no session re-arms without counting
      (`causalRetry`, src/engine/runtime/docRuntime.ts): no read can run offline, so time offline never uses up the
      re-reads.
+     - **The freeze lifts by itself once the hole is gone.** A hole is not quarantine: every row stays in `tail` and
+       keeps being applied to the replica while frozen, and pending Yjs structs integrate as soon as their
+       dependency arrives. So `checkDoc` thaws a doc frozen `causal-hole` (with no quarantined rows) whenever an
+       apply leaves it without pending structs (`EngineCtx.thaw`; diag `doc-thawed`, the notice clears, the planner
+       projects and a waiting view re-binds). Triggers, all events, no timer: a new row on the stream (the author's
+       resend, a late commit), the reconnect's catch-up, and one re-read from `snapshotCoversSeq` per frozen stream
+       on session starts 1, 2, 4, 8, … since the engine saw it frozen (`rereadFrozenHoles`, for a row this device
+       holds no copy of). A cold frozen doc that gets rows is loaded for the check (`afterStored`).
+     - **Alternative:** freeze until `releaseQuarantine`, the earlier rule. Rejected: an honest hole (a dropped
+       frame that is resent, a commit that lands after the re-read window) left the doc frozen for good although
+       nothing was wrong with it. Lifting the freeze only when the hole is closed protects as much: a frame whose
+       dependency never comes (a malformed or malicious one) keeps the doc frozen, and a closed hole means the
+       replica is exactly the fold of its rows. Quarantine, `oversize-remote`, `canvas-invalid`, `blob-corrupt` and
+       `checkpoint-disputed` freezes are unchanged.
    - **Size:** a post-apply text length > `MAX_DOC_TEXT_CHARS` freezes the doc as `oversize-remote`. This is not
      quarantine: the row is valid and stays in tail. The doc just stops projecting.
    - **Canvas:** the projection validates the JSON canvas (§j.2). Invalid → freeze `canvas-invalid`.

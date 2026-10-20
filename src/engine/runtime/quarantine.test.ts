@@ -138,7 +138,7 @@ test("quarantine: disallowed Yjs type from a peer freezes every reader; release 
 	}
 });
 
-test("causal hole: missing structs -> re-read causalRetries times -> freeze causal-hole; the missing row + release resolves it", async () => {
+test("causal hole: missing structs -> re-read causalRetries times -> freeze causal-hole; the missing row thaws it, no release", async () => {
 	const relay = new SimRelay();
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	const x = await rawDevice(relay);
@@ -170,9 +170,7 @@ test("causal hole: missing structs -> re-read causalRetries times -> freeze caus
 		await x.send(stream, u1[0]!);
 		// The relay group-commits: wait for the row to commit, then for a to ingest it.
 		await until(() => relay.head() > h0 && a.c.repo.cursor.vaultSeq === relay.head() && a.c.live.idle, 3_000, "u1 ingested");
-		await sleep(30);
-		assert.deepEqual(await a.releaseQuarantine(stream), { passed: 0, dismissed: 0 });
-		assert.equal(a.c.repo.stream(stream)!.frozen, 0);
+		await until(() => a.c.repo.stream(stream)?.frozen === 0, 3_000, "thawed by the missing row");
 		assert.ok(!a.status().notices.some((n) => n.code === "frozen:causal-hole"));
 		const text = await docText(a, id);
 		assert.ok(text.includes("abc") && text.includes("doc;"), text);

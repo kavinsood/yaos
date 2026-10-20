@@ -439,6 +439,8 @@ export class EngineCtx {
 				const loading = this.handles.loadingOf(stream);
 				if (loading) h = await loading.catch(() => undefined);
 			}
+			// A cold doc frozen by a causal hole: load it, the rows may have filled the hole (§d.6 thaw).
+			if (!h && this.docs.needsHoleCheck(stream)) h = await this.handles.load(stream).catch(() => undefined);
 			if (!h) continue;
 			const ck = read?.stream === stream ? read.checkpointState : null;
 			if (ck || rows.length > 0) await this.docs.applyToHandle(h, rows, ck);
@@ -557,6 +559,28 @@ export class EngineCtx {
 			r.frozenReason = reason;
 		} }]);
 		this.frozen(stream, reason, rec?.cls ?? null);
+	}
+
+	/**
+	 * Lift a freeze of `reason` that nothing else holds (no quarantined rows): the counterpart of freeze() for the
+	 * freezes the engine can see end by itself (a filled causal hole, §d.6). true = this call unfroze it.
+	 */
+	async thaw(stream: StreamName, reason: string): Promise<boolean> {
+		const rec = this.repo.stream(stream);
+		if (!rec?.frozen || rec.frozenReason !== reason || rec.quarantinedRows > 0) return false;
+		let thawed = false;
+		await this.repo.tPatchStreams([{ stream, patch: (r) => {
+			if (r.frozen !== 1 || r.frozenReason !== reason || r.quarantinedRows > 0) return;
+			r.frozen = 0;
+			r.frozenReason = null;
+			thawed = true;
+		} }]);
+		if (!thawed) return false;
+		this.diag("doc-thawed", { reason, cls: rec.cls });
+		if (![...this.repo.streams()].some((r) => r.frozen === 1 && r.frozenReason === reason)) this.clearNotice(`frozen:${reason}`);
+		// The planner projects the doc again and a view waiting on the frozen bind re-binds (checkBindable).
+		this.noteBodyChange([stream]);
+		return true;
 	}
 
 	/** A stream just froze (freeze, or a quarantine record put by an ingest): notice, and the host retargets its views. */
