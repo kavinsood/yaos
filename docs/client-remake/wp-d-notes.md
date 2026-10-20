@@ -219,19 +219,45 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
 - **Config dir:** there is no listing message and no config rename or trash.
 - ESLint does not cover `src/host/**`.
 - `obsidianWorkspace`, the CodeMirror attach (`collab.ts`) and `plugin.ts` are tested against fakes, not against real CodeMirror 6 or Obsidian. The phone and desktop spike runs are the real check.
-- **Sim coverage (§l), integration pending:**
-  - relay faults (socket close points, relay restart/STREAM_RESEND, dedupe expiry);
-  - storage crash points;
-  - IDB wipe;
-  - storms;
-  - epoch change;
-  - malicious frames;
-  - invariant 4 (fold determinism);
-  - the outbox/cursor/intent part of 5;
-  - invariant 6 (resource bounds).
+- **Sim coverage (§l).** In the matrices now:
+  - relay restart / STREAM_RESEND and restarts that lose every subscription (`faults.ts` relayRestart /
+    relaySubsLost), socket drops at random points, relay drain;
+  - commit crashes before and after the k-th storage commit (commitCrash), engine / app crashes, suspend kills
+    (`sim-suspend`);
+  - IndexedDB wipe with and without mirrors (idbWipe) and lost connections (idbLost);
+  - vault epoch reset (epochReset), clock skew, daily limit, HTTP failure, blob stalls / slow periods;
+  - suite 1 adds key loss / roll, revoke, epoch restore and hostile replay / downgrade (forged rows);
+  - canvas edits (every matrix) and concurrent offline canvas edits;
+  - storms (`storms`: folder moves, mass renames / deletes / overwrites, imports) with a brake user who approves or
+    rejects (`brakeUser.ts`), and randomized `EngineTuning` per device within DESIGN §d.6 (`randomTuning`);
+  - provisional broadcast is on, as in production.
 
-  The sim types only into bound views. The stand-in has no deletes or renames, so `STANDIN_OPS` sets them to weight 0 and `FULL_OPS` enables them at integration.
-- **ci.yml** (not WP-D's file) does not run `npm run test:client`. The 200-seed suite runs from that command.
+  Invariants 4 (`checkFoldDeterminism`: the relay's rows, collected ones included, refolded at once, in seeded pages
+  and from a snapshot at a seeded cut, equal every device's ns / cfg / snap bytes; encode(decode) identity), 5's
+  outbox / cursor part (`checkOutboxAndCursor`) and 6 (`checkBounds`, sampled after every step and heal tick) run on
+  every seed. `stats.coverage` (`src/sim/coverage.ts`) counts what the engines did through the observational
+  `RuntimeObserver` hook; `coverage.sim.test.ts` asserts the core keys, the brakes (storms) and live overflow /
+  provisional adoption (random tuning) fire. Keys still at 0 over 6 seeds of every matrix (2026-10-20):
+  - socket close at *targeted* points (before append, after commit before receipt, between provisional and
+    notice): drops land at random times only; `diag.adopt-pending` / `host.adoptToPending` stay 0 although
+    provisionals are adopted;
+  - dedupe window expiry before a resend: only `relay-dedupe.test.ts`; `ns.ignored.duplicate-frame` / `replay-*`
+    stay 0;
+  - malicious peer frames (malformed, disallowed Yjs types, oversize, bad checkpoint) from suite 0: none
+    (`diag.doc-frozen`, `frame-poisoned`, `causal-hole`, `quarantine-retried`, `checkpoint-refused` stay 0);
+  - long offline past ns pruning (> 20k tombstones): `ns.pruned` stays 0 (the prune cap is not tunable);
+  - `brake.conflict-flood` (the other brakes fire under storms; `reconciler.brakes.test.ts` covers all);
+  - residency: the budgets are never approached at sim scale, so invariant 6's residency part holds trivially;
+  - other zero keys: `ns.create.revived`, `ns.restore.applied/suffixed`, the ignored reasons `duplicate-docid`,
+    `unknown-docid`, `invalid-path`, `kind-mismatch`, `already-deleted`, `restore-not-current`, `stale-revive`,
+    `not-blob`, `noop`, `rules-version` (`stale-epoch` is suite 1), conflict copies `both-edited`, `too-large`,
+    `path-taken`, `recovered`, `reconcileContent.pathBase`, `rebind.adopt`, waits `blob-unavailable` / `frozen`,
+    `diag.checkpoint-retired/held`, `gap-feed`, `blob-gc-swept`, `frame-resealed`.
+
+  The sim types only into bound views.
+- **CI:** `ci.yml` runs `test:client` (unit tests plus the first seeds of every matrix, `smoke.test.ts`) and
+  `test:sim` (every matrix at 200 seeds, 3 shards, `YAOS_SIM_SHARD`). `sim-soak.yml` runs nightly: a soak process
+  per core (`scripts/sim-soak.mjs`, swarm profiles) and the matrices at 400 seeds from a random `YAOS_SIM_FIRST`.
 
 ## Run log
 
