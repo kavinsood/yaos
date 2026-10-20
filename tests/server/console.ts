@@ -27,6 +27,8 @@ const ROUTES = [
 	"GET /api/capabilities", "POST /operator/login", "POST /operator/logout", "GET /operator/state",
 	"POST /operator/vaults/:id/owner-code", "DELETE /operator/vaults/:id",
 	"GET /operator/vaults/:id/devices", "DELETE /operator/vaults/:id/devices/:id", "POST /operator/vaults/:id/reset-streams",
+	// Identity-per-store §6.3 "Revoke pairing".
+	"DELETE /operator/vaults/:id/grants/:id",
 	"POST /operator/vaults/:id/restore",
 ];
 /** Error codes the operator routes the console calls document: §2.2, D3 (limiter), D5, D8a, D8b, G8. */
@@ -315,6 +317,53 @@ s.test("vault: owner code + QR, devices + revoke (D7), and the pending-restore b
 	await page.press(page.card().button("Devices"));
 	assert.deepEqual([page.visible(), page.msg], ["login", `Devices: ${CONSOLE_MESSAGES.unauthorized}`]);
 	page.assertClean([CODE]);
+});
+
+s.test("identity-per-store §6.3: devices grouped by pairing; Revoke pairing and Remove device; old enrolls alone", async () => {
+	const page = await consoleWith(true, STATE);
+	const base = `/operator/vaults/${VAULT_ID}`;
+	const GRANT = "GrantGrantGrantGrant01";
+	const STORE = "store-0001-abcdefgh";
+	page.reply(`GET ${base}/devices`, 200, {
+		devices: [
+			{ deviceId: DEVICE_ID, deviceName: "Old phone", enrolledAt: 1_790_000_000_000 },
+			{ deviceId: STORE, deviceName: "Mac", enrolledAt: 1_790_000_000_000, grantId: GRANT, lastSeenDay: "2026-10-21" },
+		],
+		grants: [
+			{ grantId: GRANT, name: "Mac", createdAt: 1_790_000_000_000, revokedAt: null, liveDevices: 1, lastSeenDay: "2026-10-21" },
+			{ grantId: "RevokedRevokedRevoked1", name: "Lost laptop", createdAt: 1_790_000_000_000, revokedAt: 1_790_000_100_000,
+				liveDevices: 0, lastSeenDay: null },
+		],
+	});
+	await page.press(page.card().button("Devices"));
+	const text = page.card().textContent;
+	assert.match(text, /Mac.*paired .* UTC, last seen 2026-10-21, 1 store/);
+	assert.match(text, /Store store-00, registered .* UTC, last seen 2026-10-21/);
+	assert.match(text, /Old phone \(device-0001-abcdef\), paired/, "a device without a grant is listed as before");
+	assert.match(text, /1 revoked pairing is not shown\./);
+	assert.ok(!text.includes("Lost laptop"), "revoked grants are not listed");
+
+	page.reply(`DELETE ${base}/grants/${GRANT}`, 409, { error: "restore_in_progress" });
+	await page.press(page.card().button("Revoke pairing"));
+	assert.equal(page.msg, `Revoke pairing: ${CONSOLE_MESSAGES.restore_in_progress}`);
+	page.reply(`DELETE ${base}/grants/${GRANT}`, 200, { ok: true, grantId: GRANT, revoked: true, retiredDevices: 1 });
+	await page.press(page.card().button("Revoke pairing"));
+	const revoke = page.calls.filter((c) => c.method === "DELETE").at(-1)!;
+	assert.deepEqual([revoke.path, revoke.body], [`${base}/grants/${GRANT}`, {}]);
+	assert.match(page.confirms.at(-1)!, /Every store of it stops syncing at once, and that install has to be paired again/);
+	assert.deepEqual([page.msg, page.last().path], ["Mac is unpaired.", `${base}/devices`]);
+
+	page.reply(`DELETE ${base}/devices/${STORE}`, 200, { ok: true, deviceId: STORE, revoked: true });
+	await page.press(page.card().button("Remove device"));
+	const remove = page.calls.filter((c) => c.method === "DELETE").at(-1)!;
+	assert.deepEqual([remove.path, remove.body], [`${base}/devices/${STORE}`, {}]);
+	assert.match(page.confirms.at(-1)!, /comes back as a new device on its next start; to block it, use Revoke pairing/);
+	assert.equal(page.msg, "The store of Mac is removed.");
+
+	page.reply(`GET ${base}/devices`, 200, { devices: [], grants: [] });
+	await page.press(page.card().button("Devices"));
+	assert.match(page.card().textContent, /No paired devices\./);
+	page.assertClean([]);
 });
 
 s.test("vault: reset (D8a) and delete (D5) need the typed vaultId and send {confirmVaultId}", async () => {

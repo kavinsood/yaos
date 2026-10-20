@@ -7,7 +7,11 @@
 // - `GET /operator/state` → `{vaults: [{vaultId, name, createdAt?}], pendingRestores: [{vaultId, at, failedAt?, reason?}]}`; the
 //   banner comes from `pendingRestores` (§2.2 table: "also lists pending restore journal rows"); `failedAt` marks a
 //   restore the server stopped retrying (config/restore.ts RESTORE_GIVE_UP_MS).
-// - `GET …/devices` → `{devices: [{deviceId, deviceName, enrolledAt?}]}`.
+// - `GET …/devices` → `{devices: [{deviceId, deviceName, enrolledAt?, grantId?, lastSeenDay?}], grants?: [{grantId, name,
+//   createdAt, revokedAt, liveDevices, lastSeenDay}]}` (identity-per-store §6.3). Devices are grouped under their live
+//   pairing grant; a device without a grant (paired before grants) is listed alone with "Revoke", as before; revoked
+//   grants are counted, not listed. "Revoke pairing" (`DELETE …/grants/:grantId`) blocks the install; "Remove device"
+//   (`DELETE …/devices/:deviceId`) tidies one store, which comes back as a new device while its install is paired.
 // - The setup link and the setup QR's URL are built from `location.origin`, not from a response
 //   `host`/`obsidianUrl`/`mobileSetupUrl`, so they always name the server that served the console.
 // - Every non-GET sends `Content-Type: application/json` and a JSON body (`{}` for logout and revoke); GETs send none.
@@ -71,6 +75,7 @@ input, button { font: inherit; padding: 6px 10px; }
 .warn { border-left: 4px solid #d80; padding-left: 10px; }
 .err { color: #d33; } .ok { color: #2a7; } .muted { opacity: .7; font-size: 13px; }
 img.qr { width: 240px; height: 240px; background: #fff; }
+.grant { border-top: 1px solid #8884; padding-top: 4px; } .store { margin-left: 24px; }
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -110,6 +115,7 @@ function h(tag, props, ...kids) {
   return el;
 }
 function say(text, kind) { $("msg").textContent = text; $("msg").className = kind || ""; }
+function day(value) { return typeof value === "string" && value ? value : "not yet"; }
 function when(value) {
   const date = new Date(value);
   return value == null || isNaN(date.getTime()) ? "an unknown time" : date.toISOString().slice(0, 19).replace("T", " ") + " UTC";
@@ -186,7 +192,37 @@ function vaultCard(v, pending) {
     const r = await api("GET", base + "/devices");
     if (r.status !== 200) return say(failure("Devices", r), "err");
     const list = Array.isArray(r.data.devices) ? r.data.devices : [];
-    devices.replaceChildren(...(list.length ? list.map(deviceRow) : [h("p", { textContent: "No paired devices." })]));
+    const grants = Array.isArray(r.data.grants) ? r.data.grants : [];
+    const live = grants.filter((g) => g.revokedAt == null);
+    const rows = [...live.map((g) => grantGroup(g, list.filter((d) => d.grantId === g.grantId))), ...list.filter((d) => !d.grantId).map(deviceRow)];
+    if (!rows.length) rows.push(h("p", { textContent: "No paired devices." }));
+    const revoked = grants.length - live.length;
+    if (revoked) rows.push(h("p", { className: "muted", textContent: revoked + (revoked === 1 ? " revoked pairing is" : " revoked pairings are") + " not shown." }));
+    devices.replaceChildren(...rows);
+  }
+  /** A pairing grant (one paired install) and its stores (identity-per-store §6.3). */
+  function grantGroup(g, stores) {
+    const name = g.name || "Unnamed device";
+    return h("div", { className: "grant" },
+      h("div", { className: "row" },
+        h("strong", { textContent: name }),
+        h("span", { className: "muted", textContent: "paired " + when(g.createdAt) + ", last seen " + day(g.lastSeenDay) + ", " + stores.length + (stores.length === 1 ? " store" : " stores") }),
+        act("Revoke pairing", async () => {
+          if (!confirm("Revoke the pairing of " + name + "? Every store of it stops syncing at once, and that install has to be paired again.")) return;
+          const r = await api("DELETE", base + "/grants/" + enc(g.grantId), {});
+          if (r.status !== 200) return say(failure("Revoke pairing", r), "err");
+          say(r.data.revoked === false ? name + " was already unpaired." : name + " is unpaired.", "ok");
+          listDevices();
+        })),
+      ...stores.map((d) => h("div", { className: "row store" },
+        h("span", { textContent: "Store " + String(d.deviceId).slice(0, 8) + ", registered " + when(d.enrolledAt) + ", last seen " + day(d.lastSeenDay) }),
+        act("Remove device", async () => {
+          if (!confirm("Remove this store of " + name + "? It stops syncing at once. While " + name + " is still paired it comes back as a new device on its next start; to block it, use Revoke pairing.")) return;
+          const r = await api("DELETE", base + "/devices/" + enc(d.deviceId), {});
+          if (r.status !== 200) return say(failure("Remove device", r), "err");
+          say(r.data.revoked === false ? "That store of " + name + " was already removed." : "The store of " + name + " is removed.", "ok");
+          listDevices();
+        }))));
   }
   function deviceRow(d) {
     const name = d.deviceName || "Unnamed device";
