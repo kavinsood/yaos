@@ -1,159 +1,175 @@
-# Current architecture
+# Architecture
 
-## Runtime boundaries
+Status: overview for a new contributor, as of `sim-port` (2026-10-21). It names the parts and how data moves
+between them, and links to the normative documents for detail:
 
-The shipped Obsidian plugin is built from `src/` into `main.js` (an engine worker is embedded in it). Its design is [client-remake/DESIGN.md](client-remake/DESIGN.md). A release contains `main.js` and `manifest.json`, packaged as `dist/yaos-client/yaos.zip` by `node esbuild.config.mjs production`. There is no stylesheet, no QA product bundle and no public plugin API (DESIGN §m.2). Where the sections below describe client behaviour (filesystem reconciliation, settings apply, restore), they describe the old client; the new client's behaviour is specified in DESIGN.
+- [client-remake/DESIGN.md](client-remake/DESIGN.md) ("DESIGN"): the plugin in `src/`. Section letters (§x.y)
+  below refer to it.
+- [client-remake/e2ee-design.md](client-remake/e2ee-design.md) ("e2ee-design"): crypto suite 1.
+- [client-remake/relay-wire.md](client-remake/relay-wire.md): the client ↔ relay wire contract.
+- [server-rewrite/DECISIONS.md](server-rewrite/DECISIONS.md): the server, its route table and storage.
+- [client-remake/integration-notes.md](client-remake/integration-notes.md): how the parts were put together, bugs,
+  deviations from DESIGN (§4) and honest gaps (§5).
+- [sync-contract.md](sync-contract.md): what a user can rely on. [BACKLOG.md](BACKLOG.md): open work.
 
-The old client (`VaultSync`, `FlightTraceController`, `ObsidianHostAdapter`, `plugin.api`) is deleted; [client-remake/legacy-parity.md](client-remake/legacy-parity.md) records where each of its features went. The headless client under `packages/cli` imported that old client and no longer builds.
+Where this page and those documents disagree, they win.
 
-The Cloudflare Worker classes are thin platform wrappers around portable `ControlPlaneRuntime`, `VaultRuntime`, and `RecoveryJobRuntime` compositions. `packages/server-node` supplies Node-specific SQLite/KV, actor, WebSocket, alarm, and filesystem-object mechanisms to those same domain owners; it does not implement a second sync policy.
+---
 
-## Identity and provisioning
+## 1. The shape in one paragraph
 
-A claimed Worker is one operator-owned control plane. The server hashes the operator recovery key and uses short-lived, revocable browser sessions for console operations. The global registry owns vault records, stable vault-scoped principals, owner/member memberships, separately revocable device credentials, purpose-bound one-use codes, ownership transfers, authorization-change obligations, security audit events, pending deletion obligations, and the socket-ticket signing key. The operator provisions and repairs infrastructure but is not implicitly a vault content actor.
+YAOS has two programs. The **server** (`server/`) is one Cloudflare Worker with two Durable Object classes and an
+optional R2 bucket. It is an opaque relay: an authenticated, ordered, durable mailbox that sequences and stores
+bytes it never decodes. The **client** (`src/`) is the Obsidian plugin. It owns all meaning: the namespace,
+merging, validation, checkpoints, settings and snapshots. The client is split across two threads. The Obsidian main
+thread (`src/host`) holds only CodeMirror state and raw disk I/O. A Web Worker runs the **engine**
+(`src/engine`), which holds every Yjs document, the IndexedDB store and the network. Pure logic (`src/core`) is
+shared by both and by the deterministic simulator (`src/sim`).
 
-One operator can create multiple vaults. Every active vault has exactly one owner; every other active principal is a full member. Owner and member have the same complete-vault content authority, while only the owner governs people, recovery, audit, policy, metadata, ownership transfer, and destruction. There are no viewer, delegated-admin, folder-ACL, or permission-toggle modes.
+## 2. Layers
 
-A physical installation may enroll different folders in different vaults, but each device identity and bearer belongs to one principal in exactly one vault. **Invite person** creates a member principal and its first device. **Add my device** creates another independently revocable credential for the current principal. These code purposes are not interchangeable, and credentials are never copied between enrolled folders.
+| Layer | Where | Owns | Never |
+|---|---|---|---|
+| core | `src/core` | Pure, total functions: envelope and op codecs, path rules and `pathKey`, the namespace fold (`ns/`), the settings fold (`cfg/`), the snapshot index and bundle format (`snap/`), the three-tree planner and brake (`plan/`), the one merge engine and minimal diff (`merge/`), canonical Markdown/Canvas hashes (`hash/`), limits (`limits.ts`), shared types (`types.ts`) | I/O, timers, `Date`, `Math.random`, Yjs, DOM (DESIGN §k.1, §k.2) |
+| ports | `src/ports` | The interfaces between the engine and the world: `RelayPort` (contract R1–R7 in its header), `StoragePort`, `BlobPort`, `CryptoPort`, `HashPort`, `ClockPort`, `RandomPort`, `VaultPort`, `WorkspacePort`, `PlatformPort`, side files. Normative, with their doc comments (DESIGN §h) | Implementation |
+| protocol | `src/protocol` | Main ↔ worker messages, status shape, errors, and two carriers: `workerTransport` (the product) and `inlineTransport` (tests, sim, harnesses only) (DESIGN §g) | Logic |
+| engine | `src/engine` | Runs in the worker. `store/` (IDB schema and every transaction), `ingest/` (the one gate), `body/` (replicas, frame builder, sender, compaction, checkpoints), `sync/` (catch-up, cursor, fold runtimes), `runtime/` (session loop, live ingest, maintenance tick, mirrors, relay policy), `reconcile/` (scan, planner runs, merge jobs, intents), `blobs/`, `settings/`, `snapshots/`, `keyring/` (E2EE), `compose/` (wires it all: `ProtocolEngine`, `VaultRuntime`, `PassScheduler`, bound docs), `adapters/` (IDB, WebSocket + HTTP relay, HTTP blob, WebCrypto) | `obsidian`, `host/**`; browser globals outside `adapters/` |
+| host | `src/host` | Obsidian main thread: `plugin.ts`, `PluginController`, `HostRuntime`, `EngineHost` (starts and watches the worker), `BindingManager` + `bodyClient`/`collab` (editors as clients of the worker replica), `DiskExecutor` (disk ops with preconditions), Obsidian vault/workspace/config-dir/side-file adapters, `keys/` (suite pin, SecretStorage), `ui/` | Yjs, `lib0`, `y-protocols`, hashing (`core/hash`), the in-process carrier, any `engine/**` module except `host/entry.ts` → `engine/workerMain` |
+| sim | `src/sim` | In-memory relay, storage, vault, workspace, network and blob store on a virtual clock and seeded randomness; devices, actors, faults, invariants, the seeded runner and minimizer (DESIGN §l) | Being bundled or imported by product code |
+| server | `server/src` | `router.ts` (route table), `vault/` (Vault DO: devices, pairing codes, bearer and ticket auth, revoke, reset, restore steps), `streams/` (store, relay, dedupe: sequencing, group commit, checkpoint CAS and row GC), `config/` (Config DO: operator credential, sessions, vault registry, restore journal), `console/` (operator console and mobile setup pages) | Decoding payloads, checkpoints, stream names or blob contents |
 
-Vault creation is a recoverable provisioning saga:
+The import rules are enforced by `scripts/check-deps.mjs` in CI (`npm run check:deps`), including the transitive
+`mainReach` check and the allow-list of whole-document reads on main (DESIGN §k.2).
+`scripts/guard-no-real-time.mjs` keeps `src/core`, `src/engine` and `src/protocol` on `ClockPort` / `RandomPort`,
+which is what makes the simulator deterministic.
 
-1. The registry reserves a unique `vaultId` and `vaultGeneration` in `provisioning` state.
-2. The vault Durable Object idempotently creates schema-8 metadata and an empty root in SQLite.
-3. The registry moves the matching generation to `awaiting_owner` and, for claim, publishes the one-use owner-bootstrap code.
-4. Owner enrollment installs the first complete principal/device authority fence and then activates the vault.
-5. A failure remains recorded as retryable provisioning or authorization-change state; it is not exposed as an active partial vault.
+**One bundle, one carrier.** `main.js` is a single esbuild bundle of `src/host/entry.ts`. The worker's script is the
+bundle's own wrapper function source, started from a Blob URL; in the worker `entry.ts` starts only the engine
+(DESIGN §g.1, integration-notes D2). There is no UI-thread fallback: if the worker cannot start, or IndexedDB cannot
+open inside it, the runtime stops and says so (DESIGN §g.4, §g.5). A release is `main.js` + `manifest.json`.
 
-`vaultGeneration` identifies one storage incarnation of a vault and scopes every R2 key and asynchronous job. `runtimeEpoch` identifies one live Durable Object runtime and prevents receipts or capabilities from being mistaken for evidence from another runtime.
+## 3. Data model
 
-## Schema-8 vault authority
+- **Streams** (DESIGN §b.2). The relay holds per-vault streams of opaque rows, totally ordered by a contiguous
+  vault-wide `seq`:
+  - `ns`: the namespace. Ops `create`, `rename`, `delete`, `restore`, `setBlob`. Every device folds it the same
+    way into `NsFoldState` (DESIGN §c). Paths, case folding and collisions are decided by the fold, never by a
+    writer being rejected.
+  - `b:<docId>` / `c:<docId>`: one Yjs document per note / canvas. The relay broadcasts these provisionally.
+  - `cfg`: settings, LWW registers (DESIGN §c.11, §j.3). `snap`: the uploaded-snapshot index (§j.4). `k`: the E2EE
+    keyring (e2ee-design §11).
+  - No stream carries attachment bytes. Attachments, oversized updates and snapshot parts go to the blob store; the
+    log carries only their hash and size (DESIGN §j.1).
+- **Envelope** (DESIGN §b.1). Every payload is one envelope: a plaintext header (format, crypto suite, key epoch)
+  and a sealed inner part (kind, `authorNsSeq`, flags, `frameNo`, content). Suite 0 is identity; suite 1 is
+  AES-256-GCM with Padmé padding and an AAD binding vault, stream, device and frame id (e2ee-design §7).
+- **Checkpoints** (DESIGN §b.5, §d.9) are client-written state covering a stream up to `coversSeq`, put by CAS. They
+  let the relay garbage-collect rows. Body checkpoints are unioned into local state; ns/cfg/snap checkpoints are
+  verified (canonical re-encode plus structural invariants) before they replace a fold.
+- **vaultEpoch** is the relay's vault generation. Seqs mean nothing across epochs. Operator reset and restore mint
+  a new one; the client then migrates (DESIGN §c.12).
 
-Schema 8 is a greenfield root/Markdown/semantic-Canvas design with human collaboration authority, binary Yjs storage, and semantic epoch resets:
+## 4. Data flow
 
-- the root Yjs document carries `pathToId`, attachment references and metadata, attachment tombstones, and schema metadata;
-- every Markdown file has a stable file/body identity and its own Yjs document whose text key is `body`;
-- SQL catalog events bind body identity, canonical path, lifecycle, durable generation, content hash, and size at a vault sequence;
-- folders are derived from paths; empty folders have no synchronized identity.
-- a generation-scoped SQL mirror carries current principal membership and device credential revisions;
-- durable content mutations record the admitted principal and device without claiming character-level authorship.
+### 4.1 An edit in an open note
 
-The root is a server-published structural view: client root sockets may negotiate and receive updates but cannot mutate it. Structural changes become authoritative only after the server durably commits lifecycle records and returns receipts; the corresponding root mutation is then published. Markdown content becomes authoritative only through a device-scoped candidate identified by device ID, candidate ID, and SHA-256 digest. Candidate retries are idempotent, candidate-ID reuse with different bytes is rejected, and a fresh create cannot publish a root path before its exact body candidate is durable.
+1. Each CodeMirror transaction's `ChangeSet` goes to the view's client on main (`host/bodyClient.ts`) and leaves,
+   coalesced ≤ 16 ms, as `bodyPush` (changed ranges and inserted text only) (DESIGN §d.3).
+2. The worker applies a push that fits as one Yjs transaction on the **only** replica of that note
+   (`compose/boundBody.ts`), and sends the resulting entry to every other view of the doc.
+3. The frame builder batches updates (100 ms idle / 300 ms max) and `T_edit` commits an **outbox** record to
+   IndexedDB *before* the frame is sent (DESIGN §d.4, §e.2). Until then the edit is durable through Obsidian's own
+   save of the file, which the engine never writes for a bound note.
+4. The sender sends by rank (bound bodies first) under a token bucket and in-flight budget (DESIGN §i.1, §i.6). The
+   relay group-commits (relay-wire §5.1), broadcasts, then returns a receipt; `T_receipt` moves the record from the
+   outbox to the local tail.
+5. On a peer, the row passes the **ingest gate** (verify → decode in scratch → check → apply, or quarantine;
+   DESIGN §d.6). If the note is open it reaches the editor as an entry, rebased over unconfirmed local changes and
+   applied outside undo history; otherwise the doc is marked dirty and the planner writes it to disk.
 
-Renames and folder moves can commit as structural batches before one root transaction is published. Deletes tombstone catalog identity and reject later stale body candidates. This preserves cross-file structural atomicity without keeping all Markdown bodies resident in one Yjs document.
+### 4.2 A file event (external edit, create, rename, delete)
 
-The exact product pins are:
+1. The host's vault feed turns Obsidian events into `vaultEvents` hints; a startup or periodic scan sends the full
+   listing as `observations` (DESIGN §f.6). Events only mark paths dirty (invariant I6).
+2. The engine hashes what changed (the host never hashes) and runs the pure planner over three trees: **R**emote
+   (the committed fold plus own pending ops), **L**ocal (the disk, a stat cache confirmed by hash) and **S**ynced
+   (the last state known equal on both, the merge base) (DESIGN §f.1, §f.2).
+3. The plan is checked by the **safety brake** (DESIGN §f.5), then run: ns ops become `nsOps` frames; content
+   changes run the one merge engine (diff3 over texts, applied to Yjs as a minimal diff under a CAS; DESIGN §f.3);
+   disk ops go to the host as `diskOps` batches, each with a write precondition (DESIGN §f.2).
+4. Writes, renames and trashes the engine asked for are recorded for echo suppression (DESIGN §f.4); a periodic
+   full reconcile (5–15 min by device class, backing off while idle) catches anything the watcher missed.
 
-| Boundary | Version |
-|---|---:|
-| Document schema | 8 |
-| Durable SQL storage format | 4 |
-| Socket protocol | 5 |
-| Recovery snapshot format | 3 |
-| Settings sync format | 2 |
-| Control-plane identity format | 3 |
+Remote namespace changes take the reverse path: the fold's outcome changes R, the next pass plans
+`diskRename` / `diskMaterialize` / `diskTrash`, and own ops that lost a race (suffixed, merged, `rev-mismatch`)
+become loser renames, rebinds or keep-both copies (DESIGN §c.13).
 
-Missing or mismatched schema or protocol declarations fail admission with `update_required`. Mixed writers are unsupported.
+### 4.3 Attachments and settings
 
-## Store and runtime ownership
+- **Attachments** (DESIGN §j.1): upload the sealed bytes to R2 first, then commit the `create` / `setBlob` that names
+  their hash. Transfers run in a background queue under a byte budget, with persisted backoff. Without an R2 binding
+  attachments are not synced at all (fail closed).
+- **Settings** (DESIGN §j.3): allow-listed files under the config dir sync through `cfg`, JSON per top-level key,
+  other files whole, picked up on full passes and focus.
 
-The vault Durable Object contains separate durable and live owners:
+## 5. Local storage
 
-- `VaultStore` composes the SQLite document, catalog, bootstrap, recovery-authority, receipt, pin, and deletion stores. SQLite is the durable source for root/body generations, vault sequence, lifecycle, and recovery authority.
-- `VaultDocumentCache` owns persistent authoritative and private validation Yjs documents for loaded Markdown and Canvas bodies plus ordered pending updates. It enforces body-count, encoded-state proxy, and transient/pending budgets and may evict only clean bodies with no open socket or pending update. Durable history pins retain SQL reconstruction boundaries; they deliberately do not pin every corresponding `Y.Doc` in RAM. Exact wire bytes gate SQLite-row admission; canonical Markdown/Canvas bytes gate content; encoded-state sampling schedules compaction but is never treated as a hard post-state proof. Validation mirrors take that exact census after 500 tiny updates or 256 KiB of ingress, whichever comes first; intervening values are explicitly operational proxies.
-- `VaultSocketService` owns root and body WebSocket sessions. The root socket is structural; a body socket is admitted only for an active body.
-- `VaultLifecycleService` owns durable create, rename, delete, and revive ordering plus root publication checks.
-- `VaultCandidateService` owns device-scoped body candidate admission, idempotency, and durable receipts.
-- The collaboration control plane owns principal profiles, memberships, devices, invitations, device links, transfer offers, authorization-change sagas, and audit. The vault-side authority mirror validates every forwarded actor tuple and installs revocation/transfer fences in the same serialized mutation domain as content work.
-- `SettingsSyncStore` owns bounded principal-scoped settings environments in tables inside the same vault Durable Object. The storage key is `principalId + configDirKey`; its monotonic environment revision orders file rows, plugin/theme intents, tombstones, and version-gated plugin data. Settings never enter root/body Yjs documents or R2 and one principal cannot read another principal's environment.
+- **IndexedDB**, one database per `(vaultId, vaultEpoch, deviceId)`, opened in the worker (DESIGN §e). Stores:
+  `meta`, `streams`, `snapshots` + `tail` (committed rows, compacted locally, DESIGN §d.8), `outbox` (never
+  evicted), `quarantine`, `synced` + `baseText` (the S tree and merge bases), `localTree` (the L stat cache),
+  `intents` (multi-step disk ops), `cfgBase`, `blobQueue`. IDB is a rebuildable cache, not the source of truth.
+- **Side files** in `<configDir>/plugins/yaos/state/` (DESIGN §e.4): A/B **outbox mirror** (keeps frame identity
+  across IDB loss), A/B **synced mirror** (tells "unchanged since sync" from "edited offline" after IDB loss), and
+  local snapshot parts. IDB loss recovery imports them (DESIGN §i.5).
+- **Keys** (suite 1) live in Obsidian SecretStorage, never in IndexedDB or `data.json` (e2ee-design §6).
+- **Snapshots** (DESIGN §j.4): zip bundles of the vault's files kept on the device (daily, and before brake approval,
+  epoch migration, IDB recovery and restore), optionally uploaded as blobs and indexed in `snap`.
 
-On the client, `VaultSync` owns the root, transport, durable candidate queue, and lifecycle submission. `BodyManager` loads and persists bodies independently and evicts only clean, settled, unpinned bodies. `DiskMirror`, `ReconciliationController`, and `EditorBindingManager` retain filesystem/editor preservation responsibilities. `BlobSyncManager` owns the optional non-Markdown plane.
+## 6. The relay
 
-The client `SettingsSyncEngine` is a separate serialized lifecycle. It gates on active authority, `vault.settings.personal.sync`, exact server capability, and settings format; scopes one environment by the current principal plus the sanitized basename of the active Obsidian configuration directory; watches only the allowlist; and owns LWW reconciliation. A pre-existing remote environment requires an explicit user decision. Before the first mutation, the client persists the complete ordered plan in IndexedDB under the exact host, vault generation, folder, principal, membership revision, device credential revision, and configuration key. Only successful seed/take/replace commits acceptance. A stale authority tuple can neither resume nor authorize the queue.
+- Routes (DECISIONS §2.2): claim and operator console (Config DO); enroll by one-time pairing code; a device bearer
+  for HTTP routes; a short-lived ticket for the streams WebSocket (`GET /vault/:id/ws/streams`); feed, read and
+  checkpoint over HTTP; blobs over HTTP to R2.
+- Semantics (relay-wire §5): appends from every socket are group-committed in one transaction (300 ms idle,
+  1.5 s max, 64 KiB, a leading-edge commit for an isolated edit, at most about one commit per second per vault),
+  receipts go out only after the commit, `(deviceId, clientFrameId)` appends are idempotent within a dedupe
+  window, `b:`/`c:` appends are broadcast provisionally, and subscriptions decide which body rows are pushed and
+  which arrive as skips to read later (§5.6).
+- Operator actions (DECISIONS D7, D8a, D8b): revoke a device, reset streams, point-in-time restore, delete a vault.
+  Reset and restore change the vaultEpoch.
+- Budget: designed for the Workers Free plan (100k rows written a day); the client meters its own writes (daily soft
+  budget, checkpoint settle caps) and holds on the relay's daily-limit latch (DESIGN §i.6, §d.9).
 
-## SQL bootstrap and steady-state sync
+## 7. E2EE at a glance
 
-A new or reset client bootstraps without R2:
+Suite 1 is chosen once, on the "Create a new vault" path, and never changes for that vault (e2ee-design §15). Each
+key epoch has a random 32-byte key; HKDF derives per-purpose subkeys. The keyring stream `k` carries wrapped keys
+(backward chain for new devices, forward chain for automatic rolls). New devices get the key from a plugin-drawn QR
+or link (the server-visible pairing code carries no key) or from the 56-character recovery key. Revoking a device is
+an operator action followed by a re-key on a kept device; frames sealed under an older epoch that commit after the
+revoke are ignored. Blob addresses are `HMAC(kAddr, sha256)`. ns/cfg replay is rejected by a sealed per-device
+`frameNo` with a 64-wide window (e2ee-design §8.2). The threat model and what the server can still do are in
+e2ee-design §2.
 
-1. The server flushes loaded documents and creates a time-bounded SQL history pin at one vault sequence.
-2. The client verifies the schema-8 root checkpoint and root epoch.
-3. It pages the SQL catalog and fetches each referenced body at the pinned boundary.
-4. Each body is identity-, generation-, size-, hash-, and path-checked before disk settlement.
-5. The client catches up from the ordered SQL feed, rechecks current heads before mutation, and records unresolved bodies for retry.
-6. The bootstrap is completed and its history pin is released.
+## 8. Tests
 
-Bootstrap never treats an unreadable local path as permission to overwrite or delete it. Rename races, disappearing heads, feed-floor reset, and changed generations are settled against current SQL heads. IndexedDB is scoped by vault generation and local folder; it is a retry/cache boundary and pending-work journal, not a conflict authority.
+| Command | What runs | Where |
+|---|---|---|
+| `npm run test:client` | Every `src/**/*.test.ts` except `*.sim.test.ts`, under `node:test` through jiti: unit tests, composed-engine tests, the first seeds of every sim matrix (`src/sim/smoke.test.ts`) and the committed regression plans (`src/sim/regressions/`) | CI job `client`, with `typecheck:client`, `check:deps`, `guard:no-real-time` |
+| `npm run test:sim` | Every `*.sim.test.ts`: the sim matrices (`src/sim/testkit/sweep.ts`, 200 seeds at the base count) and measured runs, one process per unit, costliest first. `YAOS_SIM_SEEDS`, `YAOS_SIM_FIRST`, `YAOS_SIM_SHARD`, `YAOS_SIM_JOBS` | CI job `sim`, 3 shards |
+| `npm run test:ci` | Repo guards plus every suite under `tests/server/` and `tests/contracts/` (`tests/run-suites.mjs`): the relay, auth, console, blobs, reset/restore | CI job `build`, with `build`, `typecheck:tests`, `guard:no-any` and the server typecheck |
+| nightly `sim-soak.yml` | `sim:soak` (one process per core, swarm profiles: random fault subsets, storms, randomized tuning, canvas, suspend) and the CI matrices at 1000 seeds from a random first seed over 4 shards; skipped when nothing the sim exercises changed | GitHub schedule |
 
-After bootstrap, the root socket carries structural changes and body sockets are opened only for active consumers. Body candidates are persisted in IndexedDB before submission. The server returns a durable receipt containing the candidate identity, body generation, vault sequence, `vaultGeneration`, and `runtimeEpoch`; only an exact receipt clears that candidate.
-
-## Filesystem reconciliation
-
-Local watcher events are coalesced. Markdown changes use text diffs rather than replace-all updates. Server-origin changes enter a body document before `DiskMirror` materializes them.
-
-Writes are serialized per path and carry an expected content fingerprint. A watcher event is suppressed only when observed content matches the expected write; elapsed time alone is not evidence of authorship. Disk/editor/CRDT disagreement follows preservation-before-convergence rules in the [sync contract](sync-contract.md).
-
-## Settings sync
-
-Settings sync is enabled by default after enrollment and belongs to the current principal. The shared scope is `vaultId + principalId + configDirKey`, where the last component is the named, sanitized configuration-folder key. Different principals never share settings, and ownership transfer does not reveal or confiscate either person's environment. Different keys such as `.obsidian` and `.obsidian-mobile` remain independent within one principal. An existing remote environment is not applied without this device's explicit seed/take/replace decision; a take first persists its exact-authority queue, then commits acceptance only after apply succeeds, while defer withholds the decision. The synchronized file set remains closed to selected root JSON, `snippets/*.css`, and community-plugin `data.json`; device-local and excluded state remains local.
-
-The vault SQL sidecar stores settings format 2. Every accepted mutation advances one safe integer environment revision, and each changed row receives that revision. Clients use the last acknowledged hash and revision to distinguish newer server state, dirty local state, first-seen files, and acknowledged deletion. Seed is create-once; replace atomically publishes a complete local snapshot and tombstones omitted live plugins and themes.
-
-Plugins and themes synchronize as repository/version intents, enabled state, and explicit tombstones. A plugin tombstone removes its live intent and plugin data. Plugin `data.json` can move in either direction only when the local manifest version, shared intent pin, and data-row version are identical and the plugin is not tombstoned. Binaries are never stored by YAOS: installation resolves Obsidian's published catalogs and GitHub repositories, requires explicit auto-install consent, and pauses at install steps while the app is backgrounded.
-
-Inbound JSON must decode, hash correctly, and parse before replacement; invalid JSON is quarantined while the local file and remaining apply steps are preserved. Official Obsidian Sync, Remotely Save, LiveSync, or System3 Relay pauses this subsystem as a clash. Missing capability, a format mismatch, the local off switch, deferral, or a clash does not stop note sync.
-
-## Attachments
-
-Non-Markdown files, including Excalidraw, Base, images, PDFs, and Canvas files
-not explicitly promoted to semantic authority, use whole-file content-addressed
-R2 objects. Promoted JSON Canvas uses a separately validated semantic Yjs
-document and SQL catalog. Promotion/demotion atomically switch the root between
-those authorities while retaining rollback content. Root sockets never accept
-direct attachment or semantic-catalog writes.
-
-Without `YAOS_BUCKET`, attachment sync is unavailable while root/body Markdown sync, SQL persistence, and SQL bootstrap continue normally.
-
-## Recovery-v2
-
-Recovery is optional and requires both R2 and the `RecoveryJob` Durable Object binding. It is not on the request path for ordinary Markdown sync.
-
-The vault object remains the authority for fixed-boundary plans, history pins, recovery leases, catalogs, restore authority, and GC marks. It also owns recovery projection. Deterministically named `RecoveryJob` objects own alarm-driven execution and durable job progress for capture, restore, garbage collection, and purge.
-
-Projection runs in the vault object on its debounced wake alarm (about 60 s after a change). One watermark row records progress. A pass collects the document ids changed after the watermark from primary-key range seeks over the catalog, journal, semantic catalog, and relay tail. For each id it resolves the head, skips content already in `recovery_content_index`, and writes the body's stored CRDT bytes (checkpoint fragments, journal rows, tail records) to R2 unchanged, as one opaque state object (snapshot format 4, `recovery-v2/state/sha256/<h2>/<contentHash>.ystate`, content-addressed by the plaintext hash). The vault never decodes these bytes. Clients decode a state object on download or restore, then verify its plaintext size and sha256. A pass is bounded to 64 puts, 24 MiB, 2,000 source rows, and 10 s, with sequential puts. An idle pass writes no rows and arms no alarm. `VaultRuntime.projectRecoveryStateInline` is a best-effort inline variant for bulk create. A capture pins one SQL sequence, pages active bodies, deleted identities, and attachments, verifies materialization coverage, builds bounded content-addressed manifest trees, and publishes an immutable `yaos-recovery-v2` root. Jobs are resumable, capability-scoped, bounded per alarm, and may report `complete_with_gaps` when a manifest explicitly records unavailable content. When a capture finds content not yet projected, it asks the vault to build that state object at the capture boundary (`materializeCaptureContent`). The job itself never reads recipes or CRDT bytes. Each RecoveryJob also enforces a standalone 64 MiB transient-memory budget: object size is preflighted before reads, and manifest/inventory work is pagewise and concurrency-bounded.
-
-Browsing follows only the requested manifest branch. Restore is asynchronous and selection-scoped. Before replacement, the client backs up affected local paths and rechecks disk state; it then submits body candidates and lifecycle operations through normal durable paths, settles disk, and reports per-item outcomes. Recovery never replaces the live SQL root/body authority with an R2 snapshot.
-
-GC marks retained recovery and blob roots, acquires bounded sweep leases, and deletes only unmarked generation-scoped objects. R2 unavailability can delay recovery work without making Markdown sync unavailable.
-
-## Authentication, authority, and admission
-
-`POST /claim` initializes the operator control plane and provisions the first vault. `POST /enroll` consumes one purpose-bound code and returns the principal ID, owner/member role, membership revision, device ID, device credential revision, fixed capabilities, bearer, selected vault generation, and origin/joining authority. The client persists its generated request ID and credentials before enrollment; a lost response retries the same hashes and receives the same bounded replay record without storing the plaintext bearer server-side.
-
-Vault HTTP routes require the device bearer and selected vault ID. The public route resolves the current principal, membership, device credential, role, policy version, capability digest, and active generation, then replaces any caller-supplied actor headers with this trusted context before forwarding. The vault runtime verifies the context against its durable authority mirror and checks the fixed capability for the route. Settings routes additionally bind the environment to the admitted principal and require exactly one `settingsFormatVersion=2`.
-
-A short-lived protocol-5 ticket is deployment-, vault-generation-, principal-, membership-, device-, credential-, purpose-, document-, and semantic-epoch-bound; long-lived credentials never appear in socket URLs. Root, Markdown, and Canvas handshakes require exact `schemaVersion=8` and `protocolVersion=5`. Current control-plane authority is checked before runtime admission and the vault mirror checks it again. Protocol liveness still requires exact per-socket acknowledgements; browser `OPEN` alone is not responsive evidence.
-
-Revocation or ownership transfer first prevents new admission, then installs one idempotent authority change in the vault mutation order and closes affected sockets. A mutation ordered before the fence remains committed; one ordered after it fails as `authority_superseded`. Exact operation-outcome lookup can recover a bounded receipt for work that committed before a response was lost, but cannot create new work. The client preserves stale-authority work as unpublished rather than replaying it under new authority.
-
-Leaving revokes a member principal and all of their devices, retires only its exact settings queue and acceptance, clears the folder's schema-8 enrollment cache, and leaves ordinary files and configuration on disk. Revoking a last member device has the same membership result. An owner cannot leave or lose the last device through ordinary self-service; owner loss uses an audited operator-issued recovery code. Recovery restores content only and never rewinds principals, devices, invitations, authority changes, or audit.
-
-## Purge-first vault deletion
-
-Destroy is a fenced saga, not a best-effort room reset:
-
-1. The registry removes the vault, memberships, and pairing capabilities from admission and records the exact deletion obligation.
-2. The vault runtime flushes, fences new work, closes sockets, and cancels active capture/restore jobs.
-3. If R2 exists, a generation-scoped purge job empties only that generation's `recovery-v2/` and `blobs/` prefixes.
-4. Only after purge completes does the operator path delete the vault object's SQLite state.
-5. Failure or retry remains visible under the original deletion and purge identities; the vault ID is not reused while cleanup is pending.
-
-When R2 is absent, the R2 phase is already complete and SQL deletion can proceed. This ordering prevents lost SQL authority from making generation-owned objects unaccountable.
-
-## Safety boundaries and deferred evidence
-
-Persistence corruption, invalid identity, wrong generation, stale candidate, and incompatible versions fail closed. Diagnostics fail open. Uncertain filesystem deletion preserves data. Settings JSON and hashes are quarantined before apply, and incompatible settings capability or clashes isolate the settings subsystem. Recovery jobs expose retries and terminal gaps rather than reporting false completeness.
-
-Long-duration deployed-Cloudflare eviction/outage evidence, broader real desktop
-settings/recovery flows, and all real mobile settings/recovery evidence remain
-deferred. The Docker image packages the
-conformant Node host without changing the shared domain runtimes. Evidenced open
-risks are tracked in [BACKLOG.md](BACKLOG.md).
+- **The simulator** (DESIGN §l, `src/sim/run.ts`). Each device is the real composed engine over the inline carrier,
+  with a simulated vault, workspace and storage, all on one virtual clock with seeded randomness (Yjs client ids
+  included), so a seed reproduces exactly. `SimRelay` mirrors `server/src/streams` message for message. Actors type,
+  edit files, rename, delete, import, paste, use attachments and settings; faults drop sockets, restart the relay,
+  crash commits and apps, wipe IndexedDB, reset the epoch, skew clocks and stall blobs. After healing the run checks
+  the quiescence invariants (DESIGN §l.3: convergence, no lost edit, nothing destroyed without a copy, fold
+  determinism, clean state, bounds, no blobs on the log). A failure is minimized by ddmin; `npm run sim:replay`
+  replays a saved plan. `src/sim/coverage.ts` counts which engine paths a run exercised; the keys still at zero are
+  listed in [wp-d-notes.md](client-remake/wp-d-notes.md) "Gaps and known issues".
+- **Other runners.** `npm run test:sim-suite1` (the matrices under suite 1 plus the E2EE fault matrix),
+  `scripts/sim-suspend.mjs` (the background flush budget), `npm run bench:e2ee`, and the end-to-end harnesses under
+  `e2e/` (full clients against a local or deployed relay; integration-notes §7). Real-device runs are manual
+  (integration-notes §9).
