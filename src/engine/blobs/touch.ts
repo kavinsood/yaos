@@ -10,7 +10,8 @@
  *    filePut of a blob, snap put, bodyUpdateRef through the store), each hash must pass the same test; else it
  *    is PUT again from local bytes (the frame's own content for a bodyUpdateRef, the vault file or own snapshot
  *    part otherwise), or, without local bytes, its stored object is re-PUT verbatim. A store error holds the
- *    frame (and later frames of its stream) and retries with backoff.
+ *    frame (and later frames of its stream) and retries with backoff; a new session or the network coming back
+ *    makes the retry due at once (attempts kept).
  *
  * A put time in the future (the clock moved back) or missing counts as stale. Without a blob store a
  * bodyUpdateRef is held (its bytes may never have reached a store; a store found later restarts the runtime)
@@ -143,9 +144,27 @@ export class BlobTouch implements PutPolicy {
 		await this.deps.times().noteBlobPut(address, now);
 	}
 
-	/** New session: re-check every frame before it is sent again. */
+	/** New session: re-check every frame before it is sent again; store-error backoffs are due now (attach pumps). */
 	reset(): void {
 		this.cleared.clear();
+		this.dueNow();
+	}
+
+	/** The network came back: every held frame's store-error backoff is due now (attempts kept), one pump. */
+	retryNow(): void {
+		if (this.dueNow() > 0) this.deps.onReady();
+	}
+
+	private dueNow(): number {
+		const mono = this.deps.clock.monotonic();
+		let n = 0;
+		for (const r of this.retry.values()) {
+			if (r.atMono <= mono) continue;
+			this.deps.clock.clearTimer(r.timer);
+			r.atMono = mono;
+			n++;
+		}
+		return n;
 	}
 
 	/** The record left the sender. */

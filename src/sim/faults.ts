@@ -18,6 +18,13 @@
  *              1 MiB/s), blobStore.ts;
  *              drawn only by BLOB_FAULTS
  *   world      wall-clock jumps (monotonic intact)
+ *   suspend    suspend-kill with a budget: hidden / pagehide / freeze, then the OS
+ *              kills the app after B storage commits (0: at the event, before
+ *              any posted work runs; null: never), with the host's saveViews
+ *              landed or lost; restart from the crash copy. Drawn only by
+ *              SUSPEND_FAULTS (or forced by run.ts SimConfig.suspend); every
+ *              event's at-risk tokens and how far the flush got are recorded
+ *              (SuspendRecord) so the runner can measure loss per budget
  *   suite 1    key-store loss, forced and concurrent rolls, revoke + re-key,
  *              point-in-time restore, hostile replay and downgrade
  *              (e2eeFaults.ts; drawn only by E2EE_FAULTS in a suite-1 run)
@@ -61,7 +68,53 @@ export type FaultAction =
 	| { readonly t: "clockSkew"; readonly dev: number; readonly deltaMs: number }
 	| E2eeFaultAction
 	| { readonly t: "blobStall"; readonly durationMs: number; readonly scope: SimStallScope }
-	| { readonly t: "blobSlow"; readonly durationMs: number; readonly bytesPerSec: number };
+	| { readonly t: "blobSlow"; readonly durationMs: number; readonly bytesPerSec: number }
+	| SuspendKillAction;
+
+/**
+ * Backgrounding the OS ends with a kill: `event` fires (the host's synchronous flush runs), then the app dies after
+ * `budget` storage commits on the device (0: right after the event's synchronous part, before any posted message,
+ * timer or commit runs; null: never killed, foreground after `durationMs`), or at SUSPEND_DEADLINE_MS of virtual time
+ * if the budget is not used up by then. `save`: whether the host's saveViews (Obsidian's view save) landed on disk
+ * before death ("landed": the views saveViews picks, one per bound doc, are saved synchronously at the event) or died with the process
+ * ("lost": no view saves anything until the kill; with budget null only the event's own saveViews is dropped).
+ */
+export interface SuspendKillAction {
+	readonly t: "suspendKill";
+	readonly dev: number;
+	readonly event: "hidden" | "pagehide" | "freeze";
+	readonly budget: number | null;
+	readonly save: "landed" | "lost";
+	readonly downMs: number;
+	readonly durationMs: number;
+}
+
+/** A suspend-kill whose budget was not used up dies here (the OS kills a suspended app eventually). */
+export const SUSPEND_DEADLINE_MS = 5_000;
+/** Budgets the random matrix draws (null: never killed). */
+export const SUSPEND_BUDGETS: readonly (number | null)[] = [0, 1, 2, 3, 5, null];
+
+/** One suspend-kill event as it ran (stats; run.ts resolves `lost` at the end of the run). */
+export interface SuspendRecord {
+	readonly dev: string;
+	readonly event: SuspendKillAction["event"];
+	readonly budget: number | null;
+	readonly save: SuspendKillAction["save"];
+	/** Live tokens typed on the device and on no disk at the event (only these may be lost legitimately). */
+	readonly atRisk: readonly string[];
+	/** ... of which in the device's committed storage at the event (inspection; filled asynchronously). */
+	committedAtEvent: Set<string> | null;
+	/** Open frames (non-empty builders) in the engine at the event and at the kill. */
+	readonly openFramesAtEvent: number;
+	openFramesAtKill: number | null;
+	/** Stores of each storage commit after the event, until the kill (or the deadline when never killed). */
+	readonly commits: string[];
+	/** Side-file (mirror) writes after the event, until the kill / deadline. */
+	sideWrites: number;
+	/** Views saved to disk after the event, until the kill / deadline. */
+	saves: number;
+	killedBy: "budget" | "deadline" | "heal" | "never" | null;
+}
 
 export type FaultWeights = Readonly<Record<FaultAction["t"], number>>;
 
@@ -74,7 +127,12 @@ export const DEFAULT_FAULTS: FaultWeights = {
 	blobStall: 0, blobSlow: 0,
 	// Subscriptions (SUBS_FAULTS): last and weight 0 here, so the default plans draw as before.
 	relaySubsLost: 0,
+	// Suspend-kill (SUSPEND_FAULTS): last and weight 0 here, so the default plans draw as before.
+	suspendKill: 0,
 };
+
+/** The default matrix plus suspend-kill with a budget (opt-in, like BLOB_FAULTS). */
+export const SUSPEND_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, suspendKill: 4 };
 
 /**
  * Subscription churn: relay restarts (sets restored from the attachments, then resent), restarts that lose every
@@ -138,6 +196,7 @@ export function generateFault(rng: SeededRandom, devices: number, weights: Fault
 		case "hostileDowngrade": return { t: "hostileDowngrade", pick: rng.int(0x7fffffff), rows: rng.range(1, 3), join: rng.chance(0.3) };
 		case "blobStall": return { t: "blobStall", durationMs: rng.range(2_000, 90_000), scope: rng.chance(0.5) ? "path" : "put" };
 		case "blobSlow": return { t: "blobSlow", durationMs: rng.range(5_000, 150_000), bytesPerSec: Math.round(SLOW_MIN_BPS * (SLOW_MAX_BPS / SLOW_MIN_BPS) ** rng.float()) };
+		case "suspendKill": return { t: "suspendKill", dev, event: rng.pick(["hidden", "pagehide", "freeze"] as const), budget: rng.pick(SUSPEND_BUDGETS), save: rng.chance(0.5) ? "landed" : "lost", downMs: rng.range(200, 10_000), durationMs: rng.range(100, 30_000) };
 	}
 }
 
@@ -149,6 +208,13 @@ export function diskTokens(devs: readonly SimDevice[]): Set<string> {
 		for (const r of x.vault.trashed) for (const t of tokensIn(r.text)) out.add(t);
 	}
 	return out;
+}
+
+/** Open frames (edits in a non-empty builder) in the device's engine. */
+function openFrames(d: SimDevice): number {
+	let n = 0;
+	for (const h of d.vrt?.log.c.handles.all() ?? []) if (!h.builder.empty) n++;
+	return n;
 }
 
 export class FaultState {
@@ -170,8 +236,12 @@ export class FaultState {
 		engineCrash: 0, appCrash: 0, commitCrash: 0, idbWipe: 0, idbLost: 0, offline: 0, ioFail: 0, background: 0,
 		socketDrop: 0, relayRestart: 0, relayDrain: 0, httpFail: 0, dailyLimit: 0, epochReset: 0, clockSkew: 0,
 		keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
-		blobStall: 0, blobSlow: 0, relaySubsLost: 0,
+		blobStall: 0, blobSlow: 0, relaySubsLost: 0, suspendKill: 0,
 	};
+	/** Every suspend-kill that ran, in order. */
+	readonly suspends: SuspendRecord[] = [];
+	/** Suspend-kills not killed yet (heal kills them). */
+	private readonly pendingKills = new Map<number, () => void>();
 	/** Suite-1 faults (null in a suite-0 run: they are skipped). */
 	readonly e2ee: E2eeFaults | null;
 
@@ -338,9 +408,93 @@ export class FaultState {
 				this.e2ee.scheduleRekey(f.dev, f.downMs + f.rekeyMs);
 				this.counts.keyStoreLoss++;
 				return `${tag} down ${f.downMs}ms rekey +${f.rekeyMs}ms`;
+			case "suspendKill":
+				return this.suspendKill(f, d, tag);
 		}
 		this.counts[f.t]++;
 		return tag;
+	}
+
+	private suspendKill(f: SuspendKillAction, d: SimDevice, tag: string): string {
+		if (this.armed.has(f.dev)) return `skip ${tag}: already armed`;
+		if (this.backgrounded.has(f.dev)) return `skip ${tag}: already backgrounded`;
+		const i = f.dev;
+		const onDisk = diskTokens(this.devs);
+		const atRisk = this.ledger.live().filter((e) => e.dev === d.name && !onDisk.has(e.token)).map((e) => e.token);
+		const rec: SuspendRecord = {
+			dev: d.name, event: f.event, budget: f.budget, save: f.save, atRisk, committedAtEvent: null,
+			openFramesAtEvent: openFrames(d), openFramesAtKill: null, commits: [], sideWrites: 0, saves: 0, killedBy: null,
+		};
+		this.suspends.push(rec);
+		if (atRisk.length > 0) {
+			this.inspecting++;
+			this.inspections.push(inspectStore(this.clock, d.storage.copy(), d.deviceId as DeviceId).then((texts) => {
+				const kept = new Set<string>();
+				for (const t of texts) for (const tok of tokensIn(t)) kept.add(tok);
+				rec.committedAtEvent = new Set(atRisk.filter((t) => kept.has(t)));
+			}).finally(() => this.inspecting--));
+		}
+		const storage = d.storage;
+		const ws = d.workspace;
+		const side0 = d.sideFiles.writes;
+		const saves0 = () => ws.views_().reduce((n, v) => n + v.counters.saves, 0);
+		const savesAt = saves0();
+		this.counts.suspendKill++;
+		const label = `${tag} ${f.event} budget ${f.budget ?? "never"} save ${f.save}`;
+		// Commits after the event (until the kill; with no kill, until the deadline: how long the whole flush takes).
+		let n = 0;
+		const finish = () => {
+			storage.setCommitHook(null);
+			this.armed.delete(i);
+			this.pendingKills.delete(i);
+			rec.sideWrites = d.sideFiles.writes - side0;
+			rec.saves = saves0() - savesAt;
+			rec.openFramesAtKill = openFrames(d);
+		};
+		const kill = (by: "budget" | "deadline" | "heal") => {
+			if (rec.killedBy !== null) return;
+			rec.killedBy = by;
+			finish();
+			if (this.down.has(i) || d.storage !== storage) return;
+			this.crash(i, f.downMs, {});
+		};
+		if (f.save === "lost") ws.savesBlocked = true;
+		this.backgrounded.set(i, f.event);
+		d.platform.emit(f.event);
+		// The host's own saveViews (hostRuntime onLifecycle), landed in full before death.
+		if (f.save === "landed") {
+			const bm = d.runtime.bindings;
+			for (const { view } of bm.viewsToSave(bm.boundDocs())) if (view.isDirty()) void view.save();
+		}
+		if (f.budget === 0) {
+			kill("budget");
+			return label;
+		}
+		this.armed.add(i);
+		storage.setCommitHook((info) => {
+			n++;
+			rec.commits.push(info.stores.join("+"));
+			if (f.budget === null || n < f.budget) return "commit";
+			storage.setCommitHook(null);
+			queueMicrotask(() => kill("budget"));
+			return "crash-after";
+		});
+		if (f.budget === null) {
+			// Only the event's own saveViews is dropped: every save it starts runs before the next timer.
+			if (f.save === "lost") this.later(0, () => (ws.savesBlocked = false));
+			const done = () => {
+				if (rec.killedBy !== null) return;
+				rec.killedBy = "never";
+				finish();
+			};
+			this.pendingKills.set(i, done);
+			this.later(SUSPEND_DEADLINE_MS, done);
+			this.later(f.durationMs, () => this.foreground(i));
+			return label;
+		}
+		this.pendingKills.set(i, () => kill("heal"));
+		this.later(SUSPEND_DEADLINE_MS, () => kill("deadline"));
+		return label;
 	}
 
 	/** App crash of device i (optionally with an IDB wipe); restart after downMs. */
@@ -423,6 +577,9 @@ export class FaultState {
 
 	/** All faults off: cancel pending fault timers, reconnect, restart, foreground, no I/O failures, blob store well. */
 	heal(): void {
+		// A suspend-kill still waiting for its budget dies now (restarted below); a never-killed one stops counting.
+		for (const end of [...this.pendingKills.values()]) end();
+		this.pendingKills.clear();
 		for (const h of this.timers) this.clock.clearTimer(h);
 		this.timers.clear();
 		for (const i of [...this.offline]) this.reconnect(i);

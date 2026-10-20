@@ -16,11 +16,11 @@ async function flush(): Promise<void> {
 	for (let i = 0; i < 20; i++) await Promise.resolve();
 }
 
-function harness(reports: PassReport[]) {
+function harness(reports: PassReport[], fullIdleMaxMs?: number) {
 	const clock = new FakeClock();
 	const scopes: PlanScope[] = [];
 	const s = new PassScheduler({
-		clock, ready: () => true, nextBlobDueInMs: () => null, fullIntervalMs: 600_000, debounceMs: 10,
+		clock, ready: () => true, nextBlobDueInMs: () => null, fullIntervalMs: 600_000, debounceMs: 10, fullIdleMaxMs,
 		run: async (scope) => {
 			scopes.push(scope);
 			return reports.shift() ?? report();
@@ -74,5 +74,40 @@ test("passScheduler: a productive docs pass's follow-up covers the paths it vaca
 	await h.step(0);
 	assert.equal(h.scopes.length, 2);
 	assert.deepEqual(h.scopes[1], { t: "docs", docIds: ["d1"], pathKeys: ["y.md", "x.md"] });
+	h.s.stop();
+});
+
+test("passScheduler: the periodic full pass backs off while it finds nothing, and a docs request resets it", async () => {
+	const MIN = 60_000;
+	const h = harness([], 40 * MIN);
+	const fulls = (): number => h.scopes.filter((x) => x.t === "full").length;
+	h.s.request();
+	await h.step(10);
+	assert.equal(fulls(), 1);
+	// Idle passes: next ones after 20, 40, 40 min (base 10 min doubling, capped at 40).
+	for (const [wait, n] of [[20, 2], [40, 3], [40, 4]] as const) {
+		await h.step(wait * MIN - 1);
+		assert.equal(fulls(), n - 1, `not before ${wait} min`);
+		await h.step(1);
+		await h.step(10);
+		assert.equal(fulls(), n, `after ${wait} min`);
+	}
+	h.s.request({ t: "docs", docIds: [], pathKeys: ["k" as never] });
+	await h.step(10);
+	await h.step(10 * MIN);
+	await h.step(10);
+	assert.equal(fulls(), 5, "back to the 10 min base after activity");
+	h.s.stop();
+});
+
+test("passScheduler: without fullIdleMaxMs the periodic pass keeps its interval", async () => {
+	const h = harness([]);
+	h.s.request();
+	await h.step(10);
+	for (let i = 2; i <= 4; i++) {
+		await h.step(600_000);
+		await h.step(10);
+		assert.equal(h.scopes.length, i);
+	}
 	h.s.stop();
 });

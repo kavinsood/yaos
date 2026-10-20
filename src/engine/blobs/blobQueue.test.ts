@@ -257,6 +257,57 @@ test("store: missing blob on download backs off exponentially", async () => {
 	assert.equal(backoffMs(100), 10 * 60_000);
 });
 
+test("retryNow (network back): every backoff is due at once, attempts kept; a failure after it backs off longer; a running transfer is left alone", async () => {
+	const { q, store, clock } = await make();
+	const up = rnd(64, 3);
+	const upHash = sha256HexRef(up);
+	const downHash = sha256HexRef(rnd(10, 4));
+	store!.down = true;
+	for (let i = 0; i < 6; i++) {
+		assert.equal(await q.upload({ hash: upHash, docId: D, path: P, bytes: up }), false);
+		clock.advance(backoffMs(i + 1));
+	}
+	assert.equal(await q.upload({ hash: upHash, docId: D, path: P, bytes: up }), false);
+	assert.equal(await q.download({ hash: downHash, docId: D2, path: P2, size: 10 }), null);
+	assert.equal(q.nextDueInMs(), backoffMs(1), "the download's first backoff is the earliest");
+	clock.advance(backoffMs(1));
+	assert.equal(q.nextDueInMs(), 0);
+	assert.equal(await q.download({ hash: downHash, docId: D2, path: P2, size: 10 }), null, "still down: second failure");
+	assert.ok(q.nextDueInMs()! > 0);
+	// Back online, the store still failing: one wake, both due now, counts kept.
+	assert.equal(q.retryNow(), 2);
+	assert.equal(q.nextDueInMs(), 0);
+	assert.equal(q.retryNow(), 0, "a second wake finds nothing waiting");
+	assert.deepEqual(q.queued().map((t) => [t.direction, t.attempts]).sort(), [["down", 2], ["up", 7]]);
+	assert.equal(await q.download({ hash: downHash, docId: D2, path: P2, size: 10 }), null);
+	assert.equal(q.queued().find((t) => t.direction === "down")!.attempts, 3);
+	assert.equal(await q.upload({ hash: upHash, docId: D, path: P, bytes: up }), false, "a persistent failure keeps backing off");
+	assert.equal(q.queued().find((t) => t.direction === "up")!.attempts, 8);
+	assert.equal(q.nextDueInMs(), backoffMs(3), "the next backoff follows the kept count");
+	// Store back: the pulled-forward retry succeeds without waiting out up to BLOB_RETRY_MAX_MS.
+	store!.down = false;
+	assert.equal(q.retryNow(), 2);
+	assert.equal(await q.upload({ hash: upHash, docId: D, path: P, bytes: up }), true);
+	assert.equal(q.queued().length, 1);
+});
+
+test("retryNow skips a transfer pending or running (its end sets the next due time)", async () => {
+	const store = new GatedStore();
+	const { q, clock } = await make({ store });
+	const bytes = rnd(64, 5);
+	const hash = sha256HexRef(bytes);
+	store.down = true;
+	assert.equal(await q.upload({ hash, docId: D, path: P, bytes }), false);
+	store.down = false;
+	clock.advance(BLOB_RETRY_BASE_MS);
+	store.gated = true;
+	const done = q.upload({ hash, docId: D, path: P, bytes });
+	await until(() => store.held === 1, "the put held");
+	assert.equal(q.retryNow(), 0);
+	store.calls[0]!.open();
+	assert.equal(await done, true);
+});
+
 test("store: oversize upload is refused with a notice", async () => {
 	const { q, notices } = await make();
 	const bytes = new Uint8Array(10 * 1024 * 1024 + 1);
@@ -409,8 +460,9 @@ test("byte budget: transfers start in claim order while running and ready bytes 
 	for (let i = 0; i < 4; i++) assert.equal(claim(i), "busy", `claim ${i}`), watch();
 	await until(() => store.held === 2, "two puts");
 	assert.deepEqual([state().get(s1), state().get(s2), state().get(big), state().get(s3)], ["running", "running", "pending", "pending"]);
+	// s1 and s2 read and seal concurrently: either put can reach the store first. Release whichever did.
 	store.release(0);
-	await until(() => state().get(s1) === undefined, "s1 stored");
+	await until(() => state().get(s1) === undefined || state().get(s2) === undefined, "one small put stored");
 	watch();
 	assert.equal(state().get(big), "pending", "the large one waits for an idle queue");
 	assert.equal(state().get(s3), "pending", "and the small one behind it does not jump it (FIFO)");

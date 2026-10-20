@@ -5,7 +5,7 @@ import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
 
-const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
+const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
 const DOCS = 30;
 
 /** DOCS notes; with `long`, every third note also gets 6 more rows of ~150 bytes (several pages under a small budget). */

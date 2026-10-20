@@ -64,10 +64,9 @@ import { createWebHash } from "../adapters/webHash";
 import { sealFrame } from "../ingest/envelope";
 import type { GateCtx } from "../ingest/gate";
 import { K, VAULT } from "../keyring/testkit/world";
-import type { Repo } from "../store/repo";
 import type { SnapshotRecord, TailRecord } from "../store/schema";
 import { CfgRuntime } from "./cfgRuntime";
-import type { FoldRuntime } from "./foldRuntime";
+import type { FoldRepo, FoldRuntime } from "./foldRuntime";
 import { gateRow } from "./ingestRow";
 import { NsRuntime } from "./nsRuntime";
 
@@ -110,18 +109,18 @@ const reasonOf = (e: NsFoldEvent | CfgFoldEvent): string | null => {
 const isReplayReason = (r: string | null): r is Reason => r === "replay-stale" || r === "replay-duplicate" || r === "duplicate-frame";
 
 /** The snapshot plus the tail; nothing else of the Repo is used by FoldRuntime.load(). */
-function repoOf(stream: StreamName, snap: SnapshotRecord | undefined, rows: readonly TailRecord[]): Repo {
+function repoOf(stream: StreamName, snap: SnapshotRecord | undefined, rows: readonly TailRecord[]): FoldRepo {
 	const appliedSeq = rows.length > 0 ? rows[rows.length - 1]!.seq : snap?.coversSeq ?? 0;
 	return {
-		stream: (s: StreamName) => (s === stream ? { stream, appliedSeq } : undefined),
+		stream: (s: StreamName) => (s === stream ? { appliedSeq } : undefined),
 		getSnapshot: async (s: StreamName) => (s === stream ? snap : undefined),
 		getTail: async (s: StreamName, after: Seq = 0, through: Seq = Number.MAX_SAFE_INTEGER) =>
 			s === stream ? rows.filter((r) => r.seq > after && r.seq <= through) : [],
-	} as unknown as Repo;
+	};
 }
 
 type AnyRuntime = FoldRuntime<NsOp, NsFoldEvent> | FoldRuntime<CfgOp, CfgFoldEvent>;
-const runtimeOf = (stream: StreamName, repo: Repo): AnyRuntime => (stream === NS_STREAM ? new NsRuntime(repo, READER) : new CfgRuntime(repo, READER));
+const runtimeOf = (stream: StreamName, repo: FoldRepo): AnyRuntime => (stream === NS_STREAM ? new NsRuntime(repo, READER) : new CfgRuntime(repo, READER));
 
 const tailOf = (stream: StreamName, seq: Seq, deviceId: DeviceId, f: Frame): TailRecord => ({
 	stream, seq, deviceId, clientFrameId: f.clientFrameId, kind: stream === NS_STREAM ? "nsOps" : "cfgOps", authorNsSeq: f.authorNsSeq, flags: 0, frameNo: f.frameNo, content: f.content,

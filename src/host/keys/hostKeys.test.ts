@@ -69,14 +69,15 @@ test("crypto(): suite 1 waits for the store, then loads fresh key buffers", asyn
 	new VaultKeyStore(new FakeSecretStorage(backing), testVaultId("v"), clock).merge({ keys: [key(1, 1)], records: [record(1)] });
 	const fake = new FakeSecretStorage(backing, { loaded: false });
 	const hk = createHostKeys({ store: new VaultKeyStore(fake, testVaultId("v"), clock), pin: () => ({ suite: 1 }), creating: () => false });
-	let got: Awaited<ReturnType<typeof hk.crypto>> | null = null;
-	void hk.crypto().then((c) => (got = c));
+	// A box, not a `let`: control flow would narrow a local assigned only inside the callback to `null`.
+	const box: { got: Awaited<ReturnType<typeof hk.crypto>> | null } = { got: null };
+	void hk.crypto().then((c) => (box.got = c));
 	await clock.advance(100);
-	assert.equal(got, null);
+	assert.equal(box.got === null, true, "still waiting for the store");
 	fake.load();
 	await clock.settleMicrotasks();
-	const c = got as unknown as { suite: 1; keys: EpochKey[]; records: Uint8Array[] };
-	assert.equal(c.suite, 1);
+	const c = box.got;
+	assert.ok(c !== null && c.suite === 1, "suite 1 key material");
 	assert.ok(sameKeys(c.keys, [key(1, 1)]));
 	assert.equal(c.records.length, 1);
 });

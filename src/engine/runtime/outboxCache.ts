@@ -1,7 +1,8 @@
 /**
  * In-memory mirror of the outbox store (every state). Updated only from
  * committed transaction results (tEdit / tLive / tReadPage / tOutbox), so it
- * equals the DB between transactions. Bounded by OUTBOX_SOFT_BYTES in practice.
+ * equals the DB between transactions. Bounded by what is typed while offline
+ * (no size limit is enforced).
  */
 
 import type { ClientFrameId, StreamName } from "../../core/types";

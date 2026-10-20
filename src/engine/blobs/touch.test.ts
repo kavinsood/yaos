@@ -167,6 +167,39 @@ test("R3 gate: without local bytes the stored object is re-PUT verbatim; neither
 	assert.equal(touch.ready(r2), true);
 });
 
+test("R3 gate: network back (retryNow) or a new session (reset) makes a backoff due at once; the count is kept, so a failure after it waits longer", async () => {
+	const pic = bytes(64, 9);
+	const h = H(pic);
+	const { touch, store, ev, clock } = setup({ local: new Map([[h, pic]]) });
+	store.down = true;
+	const r = nsCreate(h);
+	for (let i = 0; i < 3; i++) {
+		assert.equal(touch.ready(r), false);
+		await settle(ev);
+		clock.advance(1_000 * 2 ** i);
+	}
+	assert.equal(touch.ready(r), false, "fourth attempt");
+	await settle(ev);
+	assert.equal(ev.ready, 3, "three retry timers fired");
+	assert.equal(touch.ready(r), false, "backing off 8 s");
+	touch.retryNow();
+	assert.equal(ev.ready, 4, "one poke");
+	touch.retryNow();
+	assert.equal(ev.ready, 4, "nothing left waiting: no second poke");
+	clock.advance(8_000);
+	assert.equal(ev.ready, 4, "the old timer was cleared");
+	assert.equal(touch.ready(r), false, "a fifth attempt runs now, still down");
+	await settle(ev);
+	clock.advance(15_999);
+	assert.equal(touch.ready(r), false, "backoff doubled past the kept count (16 s)");
+	touch.reset();
+	store.down = false;
+	assert.equal(touch.ready(r), false, "a new session: re-checked at once");
+	await settle(ev);
+	assert.equal(touch.ready(r), true);
+	assert.equal(store.puts.length, 1);
+});
+
 test("R3 gate: a bodyUpdateRef re-PUTs its own content; without a store it is held (its bytes may be in no store)", async () => {
 	const update = bytes(2000, 5);
 	const h = H(update);

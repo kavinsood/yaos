@@ -7,12 +7,13 @@ const s = suite("read-bounded-bytes-fast-path");
 
 function fakeRequest(declared: string | null, bytes: Uint8Array, reads: { reader: number; arrayBuffer: number }): Request {
 	const headers = new Headers(declared === null ? {} : { "Content-Length": declared });
-	const stream = new Request("https://example.test/", { method: "POST", body: bytes }).body!;
-	return {
-		headers,
-		body: { getReader: () => { reads.reader++; return stream.getReader(); } },
-		arrayBuffer: async () => { reads.arrayBuffer++; return bytes.slice().buffer; },
-	} as unknown as Request;
+	const request = new Request("https://example.test/", { method: "POST", body: bytes, headers });
+	// Spy on the two ways to read the body: the stream's chunk reader and the native arrayBuffer().
+	const stream = request.body!;
+	const getReader = stream.getReader.bind(stream);
+	Object.defineProperty(stream, "getReader", { value: () => { reads.reader++; return getReader(); } });
+	Object.defineProperty(request, "arrayBuffer", { value: async () => { reads.arrayBuffer++; return bytes.slice().buffer; } });
+	return request;
 }
 
 async function kindOf(promise: Promise<unknown>): Promise<string> {

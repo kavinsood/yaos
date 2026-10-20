@@ -64,6 +64,19 @@ export const MAX_NS_FRAME_BYTES = 256 * 1024;
 /** Body update larger than this goes through the blob store as BODY_UPDATE_REF (or freezes the doc without one). */
 export const MAX_INLINE_UPDATE_BYTES = MAX_FRAME_CONTENT_BYTES;
 /** Open-doc frame builder: close after idle / max age. */
+/**
+ * Maintenance tick (engine/runtime/maintenance.ts): every maintenanceMs (1 s) while anything is pending; while
+ * nothing is, the interval doubles up to this. Its deadline work (settle checkpoints at 2 min, the 10-20 min
+ * fallback, unbind expiry at 10 min, the daily-limit release) runs at most this much later. Activity snaps it back.
+ */
+export const MAINTENANCE_IDLE_MAX_MS = 30_000;
+/**
+ * Periodic full reconcile (host scan: hostRuntime.ts; engine full pass: passScheduler.ts). It catches disk changes the
+ * watcher missed. Each one that finds nothing (an unchanged listing; a pass with nothing to do) doubles the interval
+ * from the device class's fullReconcileIntervalMs up to this; a vault event, or one that found something, resets it.
+ * `visible` / `resume` scan at once anyway.
+ */
+export const FULL_RECONCILE_IDLE_MAX_MS = 60 * 60_000;
 export const OPEN_FRAME_IDLE_MS = 100;
 export const OPEN_FRAME_MAX_MS = 300;
 /** Background-doc (merge-produced) frames close immediately after the producing job. */
@@ -117,6 +130,14 @@ export const REMOTE_CHECKPOINT_ROWS = 256;
 export const REMOTE_CHECKPOINT_BYTES = 1024 * 1024;
 export const REMOTE_CHECKPOINT_IDLE_MS = 30_000;
 /**
+ * Hard cap of the hot rule: this many rows (or bytes) behind the remote checkpoint, the stream is due without the idle
+ * gate. A stream written at least every 30 s (a plugin rewriting a note, two devices taking turns) never idles; without
+ * the cap its tail, and a fresh device's bootstrap, grow without bound. 4x the hot threshold: about 5 min of non-stop
+ * typing (one frame per 300 ms) before a put lands mid-session.
+ */
+export const REMOTE_CHECKPOINT_HARD_ROWS = 4 * REMOTE_CHECKPOINT_ROWS;
+export const REMOTE_CHECKPOINT_HARD_BYTES = 4 * REMOTE_CHECKPOINT_BYTES;
+/**
  * Settle rule (DESIGN §d.9): a stream that would cost a fresh device more than one open (any row behind its remote
  * checkpoint, or two rows and no checkpoint) is checkpointed once it has been idle this long, so a quiescent vault
  * has no tail. At most one put per edit session (a pause >= 2 min ends one); ns / cfg / snap use it too.
@@ -153,10 +174,8 @@ export const BRAKE_OVERWRITE_SHRINK_RATIO = 0.5;
 
 export const QUARANTINE_MAX_RECORDS = 500;
 export const QUARANTINE_ROW_BYTES = 256 * 1024;
-export const OUTBOX_SOFT_BYTES = 16 * 1024 * 1024;
 export const OUTBOX_MIRROR_MAX_BYTES = 32 * 1024 * 1024;
 export const OUTBOX_MIRROR_DEBOUNCE_MS = 1_000;
-export const SYNCED_MIRROR_DEBOUNCE_MS = 30_000;
 
 // --- Settings sync (DESIGN §j.3; legacy settingsSync/types.ts) ---------------
 
@@ -219,6 +238,17 @@ export const RELAY_CLOSE = {
 export const APPEND_BYTES_PER_SEC = 192 * 1024;
 export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 5 * 60_000;
+/**
+ * A session that stayed up this long resets the reconnect backoff when it closes; a shorter one keeps counting, so
+ * a relay that accepts and then drops the socket over and over backs off instead of retrying at 0-1 s each time.
+ */
+export const SESSION_STABLE_MS = 60_000;
+/**
+ * visible / resume with a session still open (sessionLoop.wake): one VAULT_PING, and no pong within this means the
+ * socket died while suspended (iOS drops it without a close): reconnect at once instead of waiting for the
+ * adapter's idle liveness check.
+ */
+export const RESUME_PROBE_TIMEOUT_MS = 5_000;
 export const SUPERSEDED_RETRY_MS = 60_000;
 
 // --- Stream subscriptions (DESIGN §d.7) ---------------------------------------

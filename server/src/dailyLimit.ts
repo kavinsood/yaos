@@ -171,6 +171,11 @@ interface SqlLike {
 	exec(query: string, ...bindings: unknown[]): unknown;
 }
 
+/** A thenable storage result (DO storage hands back real Promises), so its rejection can be observed. */
+function isPromise(value: unknown): value is Promise<unknown> {
+	return !!value && (typeof value === "object" || typeof value === "function") && "then" in value && typeof value.then === "function";
+}
+
 /**
  * Wraps a Durable Object storage object so that
  * - every thrown daily-limit error is noted on `latch` (then rethrown),
@@ -190,8 +195,8 @@ export function instrumentStorageForDailyLimit<T extends object>(
 	const observe = <R>(run: () => R): R => {
 		try {
 			const result = run();
-			if (result && typeof (result as { then?: unknown }).then === "function") {
-				return (result as unknown as Promise<unknown>).catch((error: unknown) => {
+			if (isPromise(result)) {
+				return result.catch((error: unknown) => {
 					latch.note(error);
 					throw error;
 				}) as R;

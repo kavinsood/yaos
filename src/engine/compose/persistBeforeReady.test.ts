@@ -26,17 +26,17 @@ import type { HostLink } from "./hostLink";
 import { PinGate } from "./pinGate";
 
 /** Main's side of keyringChanged: records the epochs it stored and zero-fills its copies. */
-function storingLink(): { link: HostLink; stored: number[][] } {
+function storingLink(): { link: Pick<HostLink, "keyringChanged">; stored: number[][] } {
 	const stored: number[][] = [];
-	const link = {
+	const link: Pick<HostLink, "keyringChanged"> = {
 		keyringChanged: async (c: KeyringChange) => {
 			stored.push(c.keys.map((x) => x.e));
 			for (const x of c.keys) x.k.fill(0);
 		},
-	} as unknown as HostLink;
+	};
 	return { link, stored };
 }
-const failingLink = { keyringChanged: async () => Promise.reject(new Error("store failed")) } as unknown as HostLink;
+const failingLink: Pick<HostLink, "keyringChanged"> = { keyringChanged: async () => Promise.reject(new Error("store failed")) };
 
 const suite1 = (keys: readonly { readonly e: number; readonly k: Uint8Array }[]): Promise<Suite1Crypto> =>
 	createWebCryptoSuite1({ vaultId: VAULT, random: new SeededRandom(7), keys: keys.map((x) => ({ e: x.e, k: x.k.slice() })) });

@@ -7,7 +7,7 @@
  */
 
 import { Notice, Platform, Plugin } from "obsidian";
-import { createWorkerHostTransport, type WorkerLike } from "../protocol/workerTransport";
+import { createWorkerHostTransport } from "../protocol/workerTransport";
 import { workerScript } from "./bundleSource";
 import { codeMirrorEditors, collabExtension } from "./collab";
 import { ObsidianConfigDir } from "./configDir";
@@ -16,7 +16,7 @@ import { engineHashOracle } from "./hashOracle";
 import { HostRuntime } from "./hostRuntime";
 import type { VaultApi } from "./obsidianApi";
 import { ObsidianVault } from "./obsidianVault";
-import { ObsidianWorkspace, type WorkspaceLike } from "./obsidianWorkspace";
+import { ObsidianWorkspace } from "./obsidianWorkspace";
 import { BrowserPlatform, browserClock, platformInfoFrom } from "./platform";
 import { YaosController } from "./pluginController";
 import { ObsidianSideFiles } from "./sideFiles";
@@ -45,7 +45,7 @@ function workerCarrier(): EngineCarrier {
 	try {
 		url = URL.createObjectURL(new Blob([script], { type: "text/javascript" }));
 		const worker = new Worker(url, { name: "yaos-engine" });
-		const transport = createWorkerHostTransport(worker as unknown as WorkerLike);
+		const transport = createWorkerHostTransport(worker);
 		const u = url;
 		return {
 			kind: "worker",
@@ -66,20 +66,21 @@ export default class YaosPlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		const app = this.app;
-		const vaultApi = app.vault as unknown as VaultApi;
+		const vaultApi: VaultApi = app.vault;
 		const pluginDir = this.manifest.dir ?? `${app.vault.configDir}/plugins/${this.manifest.id}`;
 		const clock = browserClock();
 		// Main never hashes (DESIGN §d.2, §f.2): vault preconditions are hashed by the running engine. The vault
 		// outlives runtimes (the controller makes a new one per start), so it asks whichever is live.
 		let live: HostRuntime | null = null;
 		const hashes = engineHashOracle((body) => (live ? live.engine.request(body) : Promise.reject(new Error("sync engine not running"))));
-		const insensitive = (app.vault.adapter as unknown as { insensitive?: unknown }).insensitive;
+		const adapter: object = app.vault.adapter;
+		const insensitive = "insensitive" in adapter ? adapter.insensitive : undefined;
 		const caseInsensitive = typeof insensitive === "boolean" ? insensitive : Platform.isMacOS || Platform.isWin || Platform.isIosApp;
 		const vault = new ObsidianVault(vaultApi, hashes, caseInsensitive);
 		const configDir = new ObsidianConfigDir(vaultApi.adapter, app.vault.configDir);
 		const sideFiles = new ObsidianSideFiles(vaultApi.adapter, pluginDir);
 		const platform = new BrowserPlatform(platformInfoFrom(Platform, navigator as never, typeof Worker !== "undefined"), document, window, navigator);
-		const workspace = new ObsidianWorkspace(app.workspace as unknown as WorkspaceLike, codeMirrorEditors);
+		const workspace = new ObsidianWorkspace(app.workspace, codeMirrorEditors);
 		this.registerEditorExtension(collabExtension());
 		this.register(() => workspace.dispose());
 

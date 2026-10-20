@@ -18,14 +18,13 @@ import { SeededRandom } from "./random";
 type Fill = <T extends ArrayBufferView | null>(array: T) => T;
 
 // In Node >= 19 globalThis.crypto IS node:crypto's webcrypto (what lib0 binds).
-const webcrypto = (globalThis as unknown as { crypto: object }).crypto;
-const target = webcrypto as unknown as { getRandomValues: Fill; __yaosSeeded?: boolean };
-const original: Fill = target.getRandomValues.bind(webcrypto) as Fill;
+const webcrypto: Crypto = globalThis.crypto;
+const original: Fill = webcrypto.getRandomValues.bind(webcrypto);
 let source: SeededRandom | null = null;
 
-if (!target.__yaosSeeded) {
-	target.__yaosSeeded = true;
-	target.getRandomValues = (<T extends ArrayBufferView | null>(array: T): T => {
+if (!("__yaosSeeded" in webcrypto && webcrypto.__yaosSeeded)) {
+	Object.assign(webcrypto, { __yaosSeeded: true });
+	webcrypto.getRandomValues = (<T extends ArrayBufferView | null>(array: T): T => {
 		if (!source || !array) return original(array);
 		const u8 = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
 		u8.set(source.bytes(u8.length));

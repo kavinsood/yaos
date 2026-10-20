@@ -22,7 +22,7 @@ import { K, RK_A, VAULT, genesis } from "./testkit/world";
 
 const DEV_A = "dev-a" as DeviceId;
 
-const NS_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 10, settleMs: 1e9, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
+const NS_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 10, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
 
 const LOST_DOC = "lostTimelineDocAAAAAAA" as DocId;
 

@@ -10,10 +10,9 @@ import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
 import { SNAP_FOLD_RULES_VERSION, foldSnapFrame, newSnapFold, overlayPendingSnap, type SnapFoldEvent, type SnapFoldState } from "../../core/snap/fold";
 import { decodeSnapOps, type SnapOp } from "../../core/snap/record";
 import { SNAP_STREAM, type ClientFrameId, type DeviceId, type Seq } from "../../core/types";
-import type { Repo } from "../store/repo";
 import type { SnapshotRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
-import { FoldRuntime } from "./foldRuntime";
+import { FoldRuntime, type FoldRepo } from "./foldRuntime";
 
 export class SnapRuntime extends FoldRuntime<SnapOp, SnapFoldEvent> {
 	readonly encoding = CheckpointEncoding.snapFoldV1;
@@ -22,7 +21,7 @@ export class SnapRuntime extends FoldRuntime<SnapOp, SnapFoldEvent> {
 	/** Ops ignored because of an unknown record version (diagnostics; the fold skips them). */
 	unknownVersions = 0;
 
-	constructor(repo: Repo, self: DeviceId, candidateModulus = NS_CANDIDATE_INTERVAL) {
+	constructor(repo: FoldRepo, self: DeviceId, candidateModulus = NS_CANDIDATE_INTERVAL) {
 		super(repo, self, SNAP_STREAM, candidateModulus);
 	}
 

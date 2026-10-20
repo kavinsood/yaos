@@ -15,7 +15,9 @@ import type { SqlCursor, StoragePort } from "../../server/src/ports";
 import { MAX_STREAM_SOCKETS_PER_DEVICE, decodeAppendFrame, encodeAppendFrame, encodeRow } from "../../server/src/streams/protocol";
 import {
 	DEFAULT_STREAM_RELAY_CONFIG,
+	STREAM_HOLD_MAX_MS,
 	StreamRelayService,
+	readStreamRelayConfig,
 	type StreamActor,
 	type StreamRelayConfig,
 } from "../../server/src/streams/relay";
@@ -484,6 +486,68 @@ s.test("H2 CPU fallback T-DEDUPE-CHUNK-WB: a large cold build is stepped per mes
 		assert.deepEqual(cold().dedupeStats(), { streams: 3, entries: 40 + 3, building: 0 });
 		assert.equal(service.pendingFrames(), 0);
 	}, { dedupeStepRows: 10, config: { burstBytes: 8 * 1024 * 1024 } });
+});
+
+s.test("F10 hold cap: a frame held behind a slow cold build commits by STREAM_HOLD_MAX_MS, deduped via an inline build", async () => {
+	await withStreams((harness) => {
+		const { store, fresh, registry, timers } = harness;
+		// 40 stored rows, 1 row unit per step: the build needs ~40 timer flushes (≈ 12 s at 300 ms) with no messages.
+		const payload = (index: number) => new Uint8Array(7 * 1024).fill(index % 251);
+		for (let batch = 0; batch < 4; batch++) {
+			store.commit(Array.from({ length: 10 }, (_, offset) => ({ stream: "b:big", deviceId: "device-a",
+				clientFrameId: `big-${batch * 10 + offset}`, payload: payload(batch * 10 + offset) })));
+		}
+		const service = fresh("runtime-b");
+		assert.equal(service.accept(ownerA, true).status, 200);
+		const a = registry.lastClient!;
+		// ns:other first: its (empty) build finishes in its own message turn, so it is not queued behind b:big.
+		harness.append(a, "ns:other", "other-1", "o");
+		harness.append(a, "b:big", "big-5", payload(5));
+		timers.advance(STREAM_HOLD_MAX_MS - 1);
+		assert.deepEqual(a.receipts().map((receipt) => receipt.clientFrameId), ["other-1"], "ready stream commits; b:big held");
+		assert.ok(service.counters.dedupeHeld > 1, "held across several flushes (each re-armed the timers)");
+		assert.ok(!harness.store.dedupeReady("b:big"), "the stepped build is still running");
+		assert.equal(service.counters.holdCapFlushes, 0);
+		timers.advance(1);
+		assert.deepEqual(a.receipts().slice(1), [{ stream: "b:big", clientFrameId: "big-5", seq: 6, deduped: true }],
+			"committed at the cap, still deduped against the stored row");
+		assert.equal(service.counters.holdCapFlushes, 1);
+		assert.ok(harness.store.dedupeReady("b:big"), "the commit built the index inline");
+		assert.equal(service.pendingFrames(), 0);
+		assert.equal(harness.store.head(), 41, "no duplicate row");
+	// Steps pace at the idle window (held frames never take the lead edge), so the build alone would take ≈ 12 s.
+	}, { dedupeStepRows: 1, config: { burstBytes: 8 * 1024 * 1024 } });
+});
+
+s.test("H2 hold pacing: a frame held behind a build re-arms at the idle window, never the 20 ms leading edge", async () => {
+	await withStreams((harness) => {
+		const { store, fresh, registry, timers } = harness;
+		const payload = (index: number) => new Uint8Array(7 * 1024).fill(index % 251);
+		for (let batch = 0; batch < 4; batch++) {
+			store.commit(Array.from({ length: 10 }, (_, offset) => ({ stream: "b:big", deviceId: "device-a",
+				clientFrameId: `big-${batch * 10 + offset}`, payload: payload(batch * 10 + offset) })));
+		}
+		const service = fresh("runtime-b");
+		assert.equal(service.accept(ownerA, true).status, 200);
+		const a = registry.lastClient!;
+		// After a quiet spell: the frame opens an empty buffer, so its first flush is the lead one.
+		harness.append(a, "b:big", "big-5", payload(5));
+		const flushes = () => service.counters.flushLead + service.counters.flushIdle + service.counters.flushMax;
+		timers.advance(4_000);
+		assert.ok(!harness.store.dedupeReady("b:big"), "the stepped build is still running");
+		assert.equal(service.counters.flushLead, 1, "only the opening flush took the leading edge");
+		// 4 s at one flush per 300 ms idle window (+ the lead flush): ≤ 15, not the ~200 a 20 ms re-arm makes.
+		assert.ok(flushes() <= 15, `flushes during the build: ${flushes()}`);
+		assert.equal(service.pendingFrames(), 1);
+	}, { dedupeStepRows: 1, config: { burstBytes: 8 * 1024 * 1024 } });
+});
+
+s.test("F10 hold cap: env hold knobs are clamped to STREAM_HOLD_MAX_MS", () => {
+	const config = readStreamRelayConfig({ YAOS_STREAMS_GC_IDLE_MS: "60000", YAOS_STREAMS_GC_MAX_MS: "60000",
+		YAOS_STREAMS_GC_LEAD_MS: "60000", YAOS_STREAMS_GC_MIN_INTERVAL_MS: "60000" });
+	assert.deepEqual([config.gcIdleMs, config.gcMaxMs, config.gcLeadMs, config.gcMinIntervalMs],
+		[STREAM_HOLD_MAX_MS, STREAM_HOLD_MAX_MS, STREAM_HOLD_MAX_MS, STREAM_HOLD_MAX_MS]);
+	assert.ok(DEFAULT_STREAM_RELAY_CONFIG.gcMaxMs <= STREAM_HOLD_MAX_MS, "defaults sit under the cap");
 });
 
 s.test("H2 CPU fallback: store steps share one unit budget in queue order (read charged by bytes); ungated commits build inline", async () => {

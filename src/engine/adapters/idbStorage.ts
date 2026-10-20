@@ -441,7 +441,7 @@ class IdbDb<S extends SchemaShape> implements StorageDb<S> {
 		if (this.userClosed || this.lost) {
 			return Promise.reject(storageError("connection-lost", `database "${this.name}" connection is closed`));
 		}
-		return runTx(this as unknown as IdbDb<SchemaShape>, stores, mode, body as unknown as (tx: LooseTx) => Promise<T>);
+		return runTx(this, stores, mode, body as (tx: LooseTx) => Promise<T>);
 	}
 
 	close(): void {

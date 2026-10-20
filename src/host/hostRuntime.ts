@@ -7,7 +7,7 @@
  * events go out through `ui` callbacks.
  */
 
-import { BUDGETS, type DeviceClass } from "../core/limits";
+import { BUDGETS, FULL_RECONCILE_IDLE_MAX_MS, type DeviceClass } from "../core/limits";
 import type { BrakeReport } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { LifecycleEvent, PlatformPort } from "../ports/platform";
@@ -60,6 +60,11 @@ export class HostRuntime {
 	private scanning: Promise<void> | null = null;
 	private rescanWanted = false;
 	private reconcileTimer: TimerHandle | null = null;
+	/** Periodic scans in a row that found the listing unchanged (the idle backoff). */
+	private reconcileIdle = 0;
+	/** The last scan's listing (path, size, mtime), to tell an unchanged vault. */
+	private lastListing: string | null = null;
+	private listingChanged = true;
 	private stopped = false;
 	/** Counters for tests/diagnostics. */
 	readonly stats = { scans: 0, observationsSent: 0, vaultEventBatches: 0, lifecycleFlushes: 0 };
@@ -124,6 +129,7 @@ export class HostRuntime {
 		this.offs.push(this.deps.vault.onEvent((e) => {
 			this.bindings.onVaultEvent(e);
 			if (this.engine.isReady) this.batcher.push(e);
+			this.reconcileActive();
 		}));
 		this.offs.push(this.deps.platform.onLifecycle((e) => this.onLifecycle(e)));
 		await this.engine.start();
@@ -169,6 +175,9 @@ export class HostRuntime {
 		if (!this.engine.isReady) return;
 		this.stats.scans++;
 		const stats = await this.deps.vault.list();
+		const listing = stats.map((s) => `${s.path}\u0000${s.size}\u0000${s.mtimeMs}`).sort().join("\u0001");
+		if (listing !== this.lastListing) this.listingChanged = true;
+		this.lastListing = listing;
 		const chunks = observationChunks(stats);
 		for (let i = 0; i < chunks.length; i++) {
 			const chunk = chunks[i] ?? [];
@@ -188,14 +197,31 @@ export class HostRuntime {
 		this.scheduleReconcile();
 	}
 
+	/**
+	 * The periodic full scan: every fullReconcileIntervalMs, doubling while scans find the listing unchanged, up to
+	 * FULL_RECONCILE_IDLE_MAX_MS; a vault event resets it (reconcileActive).
+	 */
 	private scheduleReconcile(): void {
 		if (this.reconcileTimer !== null) this.deps.clock.clearTimer(this.reconcileTimer);
-		this.reconcileTimer = this.deps.clock.setTimer(BUDGETS[this.deviceClass].fullReconcileIntervalMs, () => {
+		const base = BUDGETS[this.deviceClass].fullReconcileIntervalMs;
+		const delay = Math.min(base * 2 ** Math.min(this.reconcileIdle, 10), Math.max(base, FULL_RECONCILE_IDLE_MAX_MS));
+		this.reconcileTimer = this.deps.clock.setTimer(delay, () => {
 			this.reconcileTimer = null;
 			if (this.stopped) return;
-			void this.scan();
-			this.scheduleReconcile();
+			this.listingChanged = false;
+			void this.scan().finally(() => {
+				if (this.stopped) return;
+				this.reconcileIdle = this.listingChanged ? 0 : this.reconcileIdle + 1;
+				if (this.reconcileTimer === null) this.scheduleReconcile();
+			});
 		});
+	}
+
+	/** Vault activity: the periodic scan back to its base interval. */
+	private reconcileActive(): void {
+		if (this.reconcileIdle === 0) return;
+		this.reconcileIdle = 0;
+		if (this.reconcileTimer !== null) this.scheduleReconcile(); // else a scan is running: it re-arms
 	}
 
 	private reportCarrier(): void {

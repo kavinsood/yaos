@@ -5,8 +5,8 @@ import {
 	sanitizePluginData, type PairedIdentity,
 } from "./api";
 import type { BrakeReport } from "../../core/types";
-import type { StatusSnapshot } from "../../protocol/status";
 import { BAD_VAULT_IDS, testVaultId } from "../keys/testkit/vaultIds";
+import { snapshot } from "./testkit/fakeUiHost";
 
 const IDENTITY: PairedIdentity = {
 	host: "https://sync.example.com",
@@ -111,7 +111,7 @@ test("sameIdentity / sameEngineSettings", () => {
 test("pendingBrake prefers host.brake() then status().brake", () => {
 	const a: BrakeReport = { id: "a", reason: "mass-delete-local", heldCount: 1, syncedCount: 2, samplePaths: [] };
 	const b: BrakeReport = { ...a, id: "b" };
-	const status = { brake: b } as unknown as StatusSnapshot;
+	const status = snapshot("live", {}, { brake: b });
 	assert.equal(pendingBrake({ brake: () => a, status: () => status }), a);
 	assert.equal(pendingBrake({ brake: () => null, status: () => status }), b);
 	assert.equal(pendingBrake({ brake: () => null, status: () => null }), null);

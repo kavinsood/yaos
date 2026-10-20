@@ -25,7 +25,7 @@ const IDENT = { vaultId: "vault-test" as VaultId, vaultEpoch: "sim-epoch-1", dev
 
 const repoOf = new Map<unknown, Repo>();
 const origOpen = Repo.open.bind(Repo);
-(Repo as unknown as { open: typeof Repo.open }).open = async (storage, id, now, o) => {
+Repo.open = async (storage, id, now, o) => {
 	const r = await origOpen(storage, id, now, o);
 	if (r.repo) repoOf.set(storage, r.repo);
 	return r;

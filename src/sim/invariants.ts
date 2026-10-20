@@ -209,7 +209,7 @@ export function clobberedTokens(devs: readonly SimDevice[]): Set<string> {
 }
 
 /** Contiguous tokens in the converged vault (device 0; convergence is checked separately). */
-function vaultTokens(devs: readonly SimDevice[]): Set<string> {
+export function vaultTokens(devs: readonly SimDevice[]): Set<string> {
 	const out = new Set<string>();
 	for (const text of devs[0]?.vault.snapshot().values() ?? []) for (const t of tokensIn(text)) out.add(t);
 	return out;

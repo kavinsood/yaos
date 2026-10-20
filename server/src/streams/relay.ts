@@ -23,7 +23,7 @@ import { dailyLimitControl, dailyLimitKind, dailyLimitResponse, isCloudflareDail
 import { SYSTEM_CLOCK, SYSTEM_TIMERS, type ClockPort, type SocketPort, type SocketRegistryPort, type TimerPort } from "../ports";
 import { BoundedBodyError, readBoundedBytes } from "../readBoundedBytes";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../shared/socketCloseCodes";
-import { SOCKET_LIVENESS_DESCRIPTOR, parseVaultPingFrame } from "../shared/socketLiveness";
+import { SOCKET_KEEPALIVE_REQUEST, SOCKET_KEEPALIVE_RESPONSE, SOCKET_LIVENESS_DESCRIPTOR, parseVaultPingFrame } from "../shared/socketLiveness";
 import {
 	MAX_CLIENT_FRAME_ID_BYTES,
 	MAX_STREAM_BINARY_MESSAGE_BYTES,
@@ -94,6 +94,19 @@ export const DEFAULT_STREAM_RELAY_CONFIG: Readonly<StreamRelayConfig> = Object.f
 	maxSockets: MAX_STREAM_SOCKETS,
 });
 
+/**
+ * F10: the longest a frame accepted into DO memory may stay uncommitted, from its admission. It bounds both the
+ * env-tunable hold knobs (idle, max, lead, min interval are clamped to it) and an H2 dedupe build: a frame held
+ * behind a still-building index past this age is committed anyway, its stream's index built inline inside the
+ * commit (StreamStore.indexFor, as for a forced flush), so dedupe is never skipped. Frames in DO memory are lost on
+ * an eviction (the origin resends; no receipt was sent) and the origin waits for its receipt meanwhile, so the cap
+ * stays small: 5 s is about 3x the 1.5 s default group-commit max, room to tune the window without letting
+ * configuration or a slow build hold edits unwritten for tens of seconds. The inline build is one bounded window
+ * (the same work a forced flush does); were it to exceed the CPU limit, the transaction never commits and the
+ * origins resend, so the cap costs CPU, not correctness.
+ */
+export const STREAM_HOLD_MAX_MS = 5_000;
+
 export interface StreamsEnv {
 	YAOS_STREAMS_GC_IDLE_MS?: string;
 	YAOS_STREAMS_GC_MAX_MS?: string;
@@ -115,11 +128,12 @@ function readInteger(raw: string | undefined, fallback: number, min: number, max
 export function readStreamRelayConfig(env: StreamsEnv | null | undefined): StreamRelayConfig {
 	const d = DEFAULT_STREAM_RELAY_CONFIG;
 	return {
-		gcIdleMs: readInteger(env?.YAOS_STREAMS_GC_IDLE_MS, d.gcIdleMs, 0, 60_000),
-		gcMaxMs: readInteger(env?.YAOS_STREAMS_GC_MAX_MS, d.gcMaxMs, 0, 60_000),
+		// F10: every knob that delays a commit is clamped to STREAM_HOLD_MAX_MS (frames wait in DO memory).
+		gcIdleMs: readInteger(env?.YAOS_STREAMS_GC_IDLE_MS, d.gcIdleMs, 0, STREAM_HOLD_MAX_MS),
+		gcMaxMs: readInteger(env?.YAOS_STREAMS_GC_MAX_MS, d.gcMaxMs, 0, STREAM_HOLD_MAX_MS),
 		gcMaxBytes: readInteger(env?.YAOS_STREAMS_GC_MAX_BYTES, d.gcMaxBytes, 1, 8 * 1024 * 1024),
-		gcMinIntervalMs: readInteger(env?.YAOS_STREAMS_GC_MIN_INTERVAL_MS, d.gcMinIntervalMs, 0, 60_000),
-		gcLeadMs: readInteger(env?.YAOS_STREAMS_GC_LEAD_MS, d.gcLeadMs, 0, 60_000),
+		gcMinIntervalMs: readInteger(env?.YAOS_STREAMS_GC_MIN_INTERVAL_MS, d.gcMinIntervalMs, 0, STREAM_HOLD_MAX_MS),
+		gcLeadMs: readInteger(env?.YAOS_STREAMS_GC_LEAD_MS, d.gcLeadMs, 0, STREAM_HOLD_MAX_MS),
 		gcQuietMs: readInteger(env?.YAOS_STREAMS_GC_QUIET_MS, d.gcQuietMs, 0, 3_600_000),
 		rateBytesPerSec: readInteger(env?.YAOS_STREAMS_RATE_BYTES_PER_SEC, d.rateBytesPerSec, 1024, 1 << 30),
 		// The bucket must hold one maximum-size message, or such a message is refused forever.
@@ -180,9 +194,13 @@ function persistedSubscription(attachment: StreamSocketAttachment): Set<string> 
 }
 
 export function parseStreamSocketAttachment(value: unknown): StreamSocketAttachment | null {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return isStreamSocketAttachment(value) ? value : null;
+}
+
+function isStreamSocketAttachment(value: unknown): value is StreamSocketAttachment {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const record = value as Record<string, unknown>;
-	if (record.kind !== "streams") return null;
+	if (record.kind !== "streams") return false;
 	return typeof record.vaultId === "string" && typeof record.vaultGeneration === "string"
 		&& typeof record.runtimeEpoch === "string" && typeof record.socketId === "string"
 		&& typeof record.principalId === "string" && Number.isSafeInteger(record.membershipRevision)
@@ -190,8 +208,7 @@ export function parseStreamSocketAttachment(value: unknown): StreamSocketAttachm
 		&& (record.role === "owner" || record.role === "member") && Number.isSafeInteger(record.policyVersion)
 		&& typeof record.capabilityDigest === "string" && typeof record.canWrite === "boolean"
 		&& Number.isSafeInteger(record.admittedAt)
-		&& (record.deviceName === undefined || typeof record.deviceName === "string")
-		? record as unknown as StreamSocketAttachment : null;
+		&& (record.deviceName === undefined || typeof record.deviceName === "string");
 }
 
 function actorOf(attachment: StreamSocketAttachment): StreamActor {
@@ -255,6 +272,8 @@ interface PendingFrame {
 	provisionalTo: Set<SocketPort>;
 	/** H2: a flush held it back while its stream's index builds; its bytes no longer count toward the bytes trigger. */
 	held: boolean;
+	/** Admission time: F10's STREAM_HOLD_MAX_MS counts from here. */
+	acceptedAt: number;
 }
 
 export type StreamFlushReason = "lead" | "idle" | "max" | "bytes" | "forced";
@@ -284,6 +303,8 @@ export interface StreamRelayCounters {
 	wakeNotices: number;
 	/** H2: frames a flush held back because their stream's index was still building (once per flush). */
 	dedupeHeld: number;
+	/** F10: flushes that committed frames past STREAM_HOLD_MAX_MS with their stream's index built inline. */
+	holdCapFlushes: number;
 	/** Subscriptions: appended rows sent as a STREAM_SKIPPED seq instead of a payload, and the frames carrying them. */
 	skippedRows: number;
 	skipFrames: number;
@@ -311,7 +332,7 @@ export class StreamRelayService {
 		appendFrames: 0, commits: 0, committedRows: 0, storeDedupes: 0, pendingDedupes: 0, conflicts: 0,
 		commitFailures: 0, flushLead: 0, flushIdle: 0, flushMax: 0, flushBytes: 0, flushForced: 0, provisionalBroadcasts: 0,
 		committedBroadcasts: 0, notices: 0, rateCloses: 0, oversizeCloses: 0, deviceSocketEvictions: 0, rawDrops: 0,
-		authorityCloses: 0, dailyLimitRejects: 0, wakeNotices: 0, dedupeHeld: 0, skippedRows: 0, skipFrames: 0,
+		authorityCloses: 0, dailyLimitRejects: 0, wakeNotices: 0, dedupeHeld: 0, holdCapFlushes: 0, skippedRows: 0, skipFrames: 0,
 		subscribes: 0, subscribeRejects: 0,
 	};
 	private readonly clock: ClockPort;
@@ -653,6 +674,11 @@ export class StreamRelayService {
 
 	private control(socket: SocketPort, attachment: StreamSocketAttachment, message: string): void {
 		if (!message.startsWith("__YPS:")) return;
+		if (message === SOCKET_KEEPALIVE_REQUEST) {
+			// Normally answered by the runtime's auto-response before it reaches the DO (vault/vault.ts).
+			try { socket.send(SOCKET_KEEPALIVE_RESPONSE); } catch { /* closed */ }
+			return;
+		}
 		let value: unknown;
 		try { value = JSON.parse(message.slice(6)); } catch { return; }
 		if (value !== null && typeof value === "object" && (value as { type?: unknown }).type === "STREAM_SUBSCRIBE") {
@@ -735,7 +761,7 @@ export class StreamRelayService {
 		const provisional = isProvisionalStream(frame.stream);
 		const entry: PendingFrame = { key, stream: frame.stream, deviceId: attachment.deviceId,
 			clientFrameId: frame.clientFrameId, payload: frame.payload, origin: waiter, duplicates: [],
-			provisional, provisionalTo: new Set(), held: false };
+			provisional, provisionalTo: new Set(), held: false, acceptedAt: this.now() };
 		if (provisional) {
 			const message = encodeProvisional({ stream: frame.stream, deviceId: attachment.deviceId,
 				clientFrameId: frame.clientFrameId, payload: frame.payload });
@@ -757,10 +783,16 @@ export class StreamRelayService {
 
 	private schedule(): void {
 		if (this.pendingBytes >= this.config.gcMaxBytes) { this.flush("bytes"); return; }
-		if (this.maxTimer === null) this.maxTimer = this.timers.set(() => { this.maxTimer = null; this.flush("max"); }, this.config.gcMaxMs);
 		const now = this.now();
+		// F10: held frames re-arm the max timer after each flush; it never fires later than the oldest frame's cap.
+		const capIn = Math.max(0, this.pending[0]!.acceptedAt + STREAM_HOLD_MAX_MS - now);
+		if (this.maxTimer === null) {
+			this.maxTimer = this.timers.set(() => { this.maxTimer = null; this.flush("max"); }, Math.min(this.config.gcMaxMs, capIn));
+		}
 		const quiet = this.config.gcQuietMs > 0 && now - this.lastCommitAt >= this.config.gcQuietMs;
-		if (this.pending.length === 1 && quiet) this.leadAt = now + this.config.gcLeadMs;
+		// The leading edge is for a frame that opened an empty buffer. A frame put back by an H2 hold is not one: on
+		// the lead path every re-arm would wait gcLeadMs, so a build would flush (and step) ~50 times a second.
+		if (this.pending.length === 1 && !this.pending[0]!.held && quiet) this.leadAt = now + this.config.gcLeadMs;
 		if (this.idleTimer !== null) this.timers.clear(this.idleTimer);
 		const floor = this.lastCommitAt + this.config.gcMinIntervalMs - now;
 		const lead = this.leadAt !== null;
@@ -784,7 +816,9 @@ export class StreamRelayService {
 	 * Commits the buffered frames in one transaction, then sends broadcasts and receipts. H2 fallback: frames of a
 	 * stream whose index is still building are held back, in order, for a later flush (re-armed here); a timer flush
 	 * first advances the builds one step (a bytes flush runs in a message turn, which already stepped). A forced
-	 * flush holds nothing back (the commit builds inline). A failed flush fails every frame it took.
+	 * flush holds nothing back (the commit builds inline). F10: neither is a stream with a frame pending for
+	 * STREAM_HOLD_MAX_MS or longer: all its frames commit and its index builds inline. A failed flush fails every
+	 * frame it took.
 	 *
 	 * DECISIONS-GAP: H2 does not say what drives the steps. They run once per incoming message and once per timer
 	 * flush. A message resets the DO's CPU budget and a timer does not, so with no messages arriving the timer steps
@@ -811,8 +845,12 @@ export class StreamRelayService {
 			if (reason !== "forced") {
 				for (const frame of taken) store.queueDedupe(frame.stream);
 				if (reason !== "bytes") store.stepDedupe();
+				const overdueAt = this.now() - STREAM_HOLD_MAX_MS;
+				const overdue = new Set<string>();
+				for (const frame of taken) if (frame.acceptedAt <= overdueAt && !store.dedupeReady(frame.stream)) overdue.add(frame.stream);
+				if (overdue.size > 0) this.counters.holdCapFlushes++;
 				frames = [];
-				for (const frame of taken) (store.dedupeReady(frame.stream) ? frames : held).push(frame);
+				for (const frame of taken) (store.dedupeReady(frame.stream) || overdue.has(frame.stream) ? frames : held).push(frame);
 			}
 			if (frames.length > 0) outcomes = store.commit(frames).outcomes;
 		} catch (error) {

@@ -64,6 +64,26 @@ test("FrameBuilder: closes at FRAME_MAX_UPDATES and FRAME_MAX_BYTES; take merges
 	assert.equal(single.take()!.content, u, "one update: no merge, bytes as given");
 });
 
+test("FrameBuilder.coalesce: merges the held updates into one, keeps the frame open (age, flags)", () => {
+	const src = new Y.Doc();
+	const ups: Uint8Array[] = [];
+	src.on("update", (u: Uint8Array) => ups.push(u));
+	for (let i = 0; i < 10; i++) src.getText("text").insert(i, "y");
+	const fb = new FrameBuilder();
+	fb.coalesce();
+	assert.equal(fb.empty, true, "nothing held: no-op");
+	fb.push(ups[0]!, 5, 2);
+	for (let i = 1; i < 10; i++) fb.push(ups[i]!, 5 + i);
+	fb.coalesce();
+	assert.equal(fb.count, 1);
+	assert.equal(fb.dueAt(), Math.min(14 + OPEN_FRAME_IDLE_MS, 5 + OPEN_FRAME_MAX_MS), "opened / last push kept");
+	const out = fb.take()!;
+	assert.equal(out.flags, 2);
+	const d = new Y.Doc();
+	Y.applyUpdate(d, out.content);
+	assert.equal(d.getText("text").toString(), "y".repeat(10));
+});
+
 test("FrameBuilder.dueAt: idle after the last push, capped by max age from the first; stretch scales both", () => {
 	const fb = new FrameBuilder();
 	assert.equal(fb.dueAt(), null);
@@ -130,8 +150,8 @@ test("buildBodyFrames: inline frame pending (or held on a dependency); content i
 /** In-memory BlobPort; `fail` makes every call throw (store outage). */
 function memStore(maxBlobBytes = 64 * 1024 * 1024) {
 	const objects = new Map<BlobAddress, Uint8Array>();
-	const st = { objects, puts: 0, fail: false, blob: null as unknown as BlobPort };
-	st.blob = {
+	const st = { objects, puts: 0, fail: false };
+	const blob: BlobPort = {
 		maxBlobBytes,
 		async has(as) { if (st.fail) throw new Error("offline"); return new Set(as.filter((a) => objects.has(a))); },
 		async put(a, parts) { if (st.fail) throw new Error("offline"); st.puts++; objects.set(a, concatBytes(parts)); },
@@ -139,7 +159,7 @@ function memStore(maxBlobBytes = 64 * 1024 * 1024) {
 		list: async () => { throw new Error("unused"); },
 		deleteIfUploadedBefore: async () => { throw new Error("unused"); },
 	};
-	return st;
+	return Object.assign(st, { blob });
 }
 
 test("buildBodyFrames: > MAX_INLINE_UPDATE_BYTES without a blob store -> FrameTooLargeError (the doc freezes oversize-local), nothing for the log", async () => {

@@ -17,7 +17,7 @@ export class HostKeyring {
 	private stored: readonly Uint8Array[];
 	mirror: KeyringRecords | null = null;
 
-	constructor(private readonly link: HostLink, crypto: EngineInitConfig["crypto"]) {
+	constructor(private readonly link: Pick<HostLink, "keyringChanged">, crypto: EngineInitConfig["crypto"]) {
 		this.stored = crypto.suite === 1 ? crypto.records.map((b) => b.slice()) : [];
 	}
 

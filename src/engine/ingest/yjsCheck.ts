@@ -51,7 +51,7 @@ export function checkYjsUpdate(update: Uint8Array, cls: DocClass, limits: { read
 		} else if (cls === "canvas" && c instanceof Y.ContentAny) {
 			for (const v of c.arr) chars += anyChars(v);
 		} else if (cls === "canvas" && c instanceof Y.ContentType) {
-			const t = c.type as unknown as { constructor: unknown };
+			const t: object = c.type;
 			if (t.constructor !== Y.Map && t.constructor !== Y.Text) return { ok: false, reason: "disallowed-type", detail: "nested type" };
 		} else {
 			return { ok: false, reason: "disallowed-type", detail: (c as object).constructor.name };

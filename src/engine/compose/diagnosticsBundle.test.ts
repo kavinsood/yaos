@@ -7,6 +7,7 @@ import { SeededRandom } from "../../sim/random";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { ScriptedRandom } from "../adapters/testkit/scriptedRandom";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
+import { idleStatus } from "./statusMerge";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX, PSEUDONYM_HEX_CHARS, type DiagnosticsInput } from "./diagnosticsBundle";
 
 const SECRET_PATH = "Clients/Acme merger/plan.md" as VaultPath;
@@ -15,10 +16,11 @@ const DOC = "AAAAAAAAAAAAAAAAAAAAAA" as DocId;
 const UNKNOWN_DOC = "BBBBBBBBBBBBBBBBBBBBBB";
 
 function input(): DiagnosticsInput {
-	const status = {
-		phase: "braked", counts: { frozenDocs: 1 }, notices: [],
+	const idle = idleStatus({ deviceClass: "desktop", transport: "worker", vaultEpoch: null, phase: "braked", nowMs: 0 });
+	const status: StatusSnapshot = {
+		...idle, counts: { ...idle.counts, frozenDocs: 1 },
 		brake: { id: "k", reason: "mass-delete-local", heldCount: 2, syncedCount: 9, samplePaths: [SECRET_PATH, OTHER_PATH] },
-	} as unknown as StatusSnapshot;
+	};
 	return {
 		generatedAtMs: 5, clientVersion: "2.0.0", status,
 		events: [

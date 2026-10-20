@@ -4,8 +4,9 @@
 // pairing panel. Neither is logged, sent in a request URL or written to web storage; the session cookie is HttpOnly.
 //
 // DECISIONS-GAP (response shapes §2.2/D5 leave open; the console reads only these fields and tolerates their absence):
-// - `GET /operator/state` → `{vaults: [{vaultId, name, createdAt?}], pendingRestores: [{vaultId, at}]}`; the banner
-//   comes from `pendingRestores` (§2.2 table: "also lists pending restore journal rows").
+// - `GET /operator/state` → `{vaults: [{vaultId, name, createdAt?}], pendingRestores: [{vaultId, at, failedAt?, reason?}]}`; the
+//   banner comes from `pendingRestores` (§2.2 table: "also lists pending restore journal rows"); `failedAt` marks a
+//   restore the server stopped retrying (config/restore.ts RESTORE_GIVE_UP_MS).
 // - `GET …/devices` → `{devices: [{deviceId, deviceName, enrolledAt?}]}`.
 // - The setup link and the setup QR's URL are built from `location.origin`, not from a response
 //   `host`/`obsidianUrl`/`mobileSetupUrl`, so they always name the server that served the console.
@@ -214,7 +215,9 @@ function vaultCard(v, pending) {
   return h("section", {},
     h("h3", { textContent: label }),
     h("p", { className: "muted", textContent: "Vault ID " + id + (v.createdAt ? ", created " + when(v.createdAt) : "") }),
-    pending ? h("p", { className: "warn", textContent: "Restore incomplete: the restore to " + when(pending.at) + " has not finished. " + MESSAGES.restore_incomplete }) : "",
+    pending ? h("p", { className: "warn", textContent: pending.failedAt != null
+      ? "Restore stopped: the restore to " + when(pending.at) + " did not finish, and the server stopped retrying it at " + when(pending.failedAt) + " (" + String(pending.reason || "unknown reason") + "). Pairing, revoking and resetting wait for it. Press Restore to try it again, or delete the vault."
+      : "Restore incomplete: the restore to " + when(pending.at) + " has not finished. " + MESSAGES.restore_incomplete }) : "",
     h("div", { className: "row" },
       act("Pair a device", async () => {
         const r = await api("POST", base + "/owner-code", { purpose: "owner-bootstrap" });

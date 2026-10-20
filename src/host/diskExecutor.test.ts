@@ -7,7 +7,7 @@ import { DiskExecutor } from "./diskExecutor";
 import type { HashOracle } from "./hashOracle";
 import { ObsidianVault } from "./obsidianVault";
 import { FakeObsidianVault } from "../sim/fakeObsidian";
-import { fingerprintRef, markdownHashRef } from "../core/hash/testkit/hashRef";
+import { fingerprintRef, markdownHashRef, sha256HexRef } from "../core/hash/testkit/hashRef";
 import { utf8Encode as utf8 } from "../core/codec/lib0";
 import { VirtualClock } from "../sim/clock";
 import { simHashOracle } from "../sim/hash";
@@ -213,7 +213,7 @@ test("diskExecutor: I/O exceptions map to io outcomes; config area writes are re
 	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), "{}");
 	assert.equal(vault.hasFile("hotkeys.json"), false, "config writes never land in the vault");
 	// The engine hashes the current config bytes: a matching fingerprint/hash passes.
-	const ok = await exec.run(LANE.background, [cw("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }), cw("hotkeys.json", "[1]", { t: "hash", hash: fingerprintRef(utf8("[]")) as unknown as ContentHash })]);
+	const ok = await exec.run(LANE.background, [cw("app.json", '{"a":2}', { t: "fingerprint", fingerprint: fp }), cw("hotkeys.json", "[1]", { t: "hash", hash: sha256HexRef(utf8("[]")) as ContentHash })]);
 	assert.deepEqual(ok.map(outcomeOk), [true, true]);
 	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), '{"a":2}');
 	// Text config payloads are refused: encoding them would be O(N) string work on main.

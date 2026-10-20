@@ -76,6 +76,28 @@ export const BLOB_DELETE_CALL_BYTES = RELAY_REPLY_BYTES + 2 * BLOB_DELETE_BATCH 
 export const CAPABILITIES_TIMEOUT_MS = 10_000;
 const ADDRESS = /^[0-9a-f]{64}$/;
 
+/** The subset of XMLHttpRequest that putBody uses; the real constructor satisfies it, and so does a test fake. */
+export interface XhrLike {
+	readonly status: number;
+	readonly responseText: string;
+	onreadystatechange: ((ev: Event) => void) | null;
+	onprogress: ((ev: ProgressEvent) => void) | null;
+	onload: ((ev: ProgressEvent) => void) | null;
+	onerror: ((ev: ProgressEvent) => void) | null;
+	ontimeout: ((ev: ProgressEvent) => void) | null;
+	onabort: ((ev: ProgressEvent) => void) | null;
+	readonly upload: {
+		onprogress: ((ev: ProgressEvent) => void) | null;
+		onload: ((ev: ProgressEvent) => void) | null;
+	};
+	open(method: string, url: string): void;
+	setRequestHeader(name: string, value: string): void;
+	send(body: Blob): void;
+	abort(): void;
+}
+
+export type XhrConstructor = new () => XhrLike;
+
 export interface HttpBlobOptions {
 	readonly baseUrl: string;
 	readonly vaultId: string;
@@ -83,7 +105,7 @@ export interface HttpBlobOptions {
 	readonly credential: string;
 	readonly fetch?: typeof fetch;
 	/** The PUT transport (see the header); default globalThis.XMLHttpRequest. Without one every put rejects "unsupported". */
-	readonly xhr?: typeof XMLHttpRequest;
+	readonly xhr?: XhrConstructor;
 	readonly maxBlobBytes?: number;
 	/** Retry-After waits, the HTTP-date form's "now" and the idle window's timer; default a web clock. */
 	readonly clock?: ClockPort;
@@ -275,7 +297,7 @@ function textErrorCode(text: string): string | null {
 
 export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 	const doFetch: typeof fetch = opts.fetch ?? ((input, init) => fetch(input, init));
-	const Xhr = opts.xhr ?? (globalThis as { XMLHttpRequest?: typeof XMLHttpRequest }).XMLHttpRequest;
+	const Xhr: XhrConstructor | undefined = opts.xhr ?? (globalThis as { XMLHttpRequest?: typeof XMLHttpRequest }).XMLHttpRequest;
 	const root = `${normalizeBaseUrl(opts.baseUrl)}/vault/${encodeURIComponent(opts.vaultId)}/blobs`;
 	const auth = { Authorization: `Bearer ${opts.credential}` };
 	const clock = opts.clock ?? createWebClock();

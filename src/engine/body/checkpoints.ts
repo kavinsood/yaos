@@ -9,7 +9,7 @@
  * is small; one tuning pair for both folds).
  *
  * Two triggers. Hot: rows / bytes behind the remote checkpoint reach the
- * threshold, then a short idle. Settle: anything a fresh device would open
+ * threshold, then a short idle, or the hard cap with no idle. Settle: anything a fresh device would open
  * beyond one envelope (settleWanted), then a long idle, so a quiescent vault
  * has no tail. The duty device writes; any other device falls back after
  * fallbackMs + jitter and first re-reads the remote checkpoint seq (refreshFirst),
@@ -18,7 +18,8 @@
 
 import { CheckpointEncoding } from "../../core/envelope";
 import {
-	FOLD_RULES_VERSION, NS_CHECKPOINT_BYTES, NS_CHECKPOINT_ROWS, REMOTE_CHECKPOINT_BYTES, REMOTE_CHECKPOINT_IDLE_MS, REMOTE_CHECKPOINT_ROWS,
+	FOLD_RULES_VERSION, NS_CHECKPOINT_BYTES, NS_CHECKPOINT_ROWS, REMOTE_CHECKPOINT_BYTES, REMOTE_CHECKPOINT_HARD_BYTES, REMOTE_CHECKPOINT_HARD_ROWS,
+	REMOTE_CHECKPOINT_IDLE_MS, REMOTE_CHECKPOINT_ROWS,
 	REMOTE_CHECKPOINT_SETTLE_DAILY, REMOTE_CHECKPOINT_SETTLE_MS,
 } from "../../core/limits";
 import { streamClass, type Seq, type StreamName, type VaultId } from "../../core/types";
@@ -41,6 +42,9 @@ export interface CheckpointTuning {
 	readonly rows: number;
 	readonly bytes: number;
 	readonly idleMs: number;
+	/** Hot rule hard cap: this far behind, no idle gate (a stream that never idles still gets checkpoints). */
+	readonly hardRows: number;
+	readonly hardBytes: number;
 	/** Settle rule (every class): any excess open (settleWanted), then max(idleMs, settleMs) idle. */
 	readonly settleMs: number;
 	/** Non-duty devices wait this long (plus a per-stream jitter in [0, fallbackMs)) once the condition holds. */
@@ -51,7 +55,8 @@ export interface CheckpointTuning {
 }
 
 export const DEFAULT_CHECKPOINT_TUNING: CheckpointTuning = {
-	rows: REMOTE_CHECKPOINT_ROWS, bytes: REMOTE_CHECKPOINT_BYTES, idleMs: REMOTE_CHECKPOINT_IDLE_MS, settleMs: REMOTE_CHECKPOINT_SETTLE_MS,
+	rows: REMOTE_CHECKPOINT_ROWS, bytes: REMOTE_CHECKPOINT_BYTES, idleMs: REMOTE_CHECKPOINT_IDLE_MS,
+	hardRows: REMOTE_CHECKPOINT_HARD_ROWS, hardBytes: REMOTE_CHECKPOINT_HARD_BYTES, settleMs: REMOTE_CHECKPOINT_SETTLE_MS,
 	fallbackMs: CHECKPOINT_FALLBACK_MS, nsRows: NS_CHECKPOINT_ROWS, nsBytes: NS_CHECKPOINT_BYTES,
 };
 
@@ -144,7 +149,7 @@ function dutyOrFallback(st: CheckpointState, stream: StreamName, hasDuty: boolea
 	return nowMono - st.condSince.get(stream)! >= tuning.fallbackMs + jitterMs;
 }
 
-/** Duty test for a body/canvas stream (DESIGN §d.9): hot after idleMs, settle after settleMs. */
+/** Duty test for a body/canvas stream (DESIGN §d.9): hot after idleMs (at once past the hard cap), settle after settleMs. */
 export function bodyCheckpointDue(rec: StreamRecord, hasDuty: boolean, st: CheckpointState, tuning: CheckpointTuning, nowMono: number, jitterMs: number): boolean {
 	// A stale stream (rows skipped or not read yet) has rows this device has not seen: the fallback clock starts
 	// over once it is caught up, so a reader that sees a busy stream only through late reads never falls back early.
@@ -160,7 +165,9 @@ export function bodyCheckpointDue(rec: StreamRecord, hasDuty: boolean, st: Check
 	}
 	if (nowMono < st.holdUntilMono) return false;
 	if ((st.backoffUntil.get(rec.stream) ?? 0) > nowMono) return false;
-	if (!idleFor(st, rec.stream, nowMono, hot ? tuning.idleMs : Math.max(tuning.idleMs, tuning.settleMs))) return false;
+	// Past the hard cap activity no longer defers the put, nor restarts the fallback clock.
+	const hard = hot && (rec.rowsSinceRemoteCheckpoint >= tuning.hardRows || rec.bytesSinceRemoteCheckpoint >= tuning.hardBytes);
+	if (!hard && !idleFor(st, rec.stream, nowMono, hot ? tuning.idleMs : Math.max(tuning.idleMs, tuning.settleMs))) return false;
 	return dutyOrFallback(st, rec.stream, hasDuty, tuning, nowMono, jitterMs);
 }
 
@@ -304,7 +311,7 @@ export async function writeBodyCheckpoint(deps: CheckpointDeps, st: CheckpointSt
  * (hot, no idle gate) or the stream wants settling and has been idle for max(idleMs, settleMs). Duty: the
  * candidate's author.
  */
-export function foldCheckpointDue(rec: StreamRecord | undefined, fold: FoldRuntime<unknown, unknown>, st: CheckpointState, tuning: CheckpointTuning, nowMono: number, jitterMs: number): boolean {
+export function foldCheckpointDue(rec: StreamRecord | undefined, fold: Pick<FoldRuntime<unknown, unknown>, "candidate" | "stream" | "halted">, st: CheckpointState, tuning: CheckpointTuning, nowMono: number, jitterMs: number): boolean {
 	const cand = fold.candidate;
 	const stream = fold.stream;
 	if (rec?.stale) st.condSince.delete(stream);

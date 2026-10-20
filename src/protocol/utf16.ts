@@ -22,6 +22,10 @@ export function decodeUtf16(bytes: Uint8Array): string {
 	const n = bytes.byteLength >> 1;
 	const units = bytes.byteOffset % 2 === 0 ? new Uint16Array(bytes.buffer, bytes.byteOffset, n) : new Uint16Array(bytes.slice(0, n * 2).buffer);
 	const parts: string[] = [];
-	for (let i = 0; i < n; i += DECODE_STEP) parts.push(String.fromCharCode.apply(null, units.subarray(i, Math.min(n, i + DECODE_STEP)) as unknown as number[]));
+	for (let i = 0; i < n; i += DECODE_STEP) {
+		// Reflect.apply takes the typed array as an array-like argument list, as Function.prototype.apply does.
+		const part: string = Reflect.apply(String.fromCharCode, null, units.subarray(i, Math.min(n, i + DECODE_STEP)));
+		parts.push(part);
+	}
 	return parts.join("");
 }

@@ -43,7 +43,7 @@ import type { EngineOptions, EngineTuning } from "./options";
 const VAULT = "vault-test" as VaultId;
 const APP = "app.json" as ConfigRelPath;
 const FOLDS = [NS_STREAM, CFG_STREAM, SNAP_STREAM] as const;
-const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
+const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
 const TUNING: Partial<EngineTuning> = { checkpoint: NO_CKPT };
 /** The plugin after the update: it implements the rules one above this build's (EngineTuning.knownRules). */
 const UPGRADED: Partial<EngineTuning> = { ...TUNING, knownRules: { ns: FOLD_RULES_VERSION + 1, cfg: CFG_FOLD_RULES_VERSION + 1, snap: SNAP_FOLD_RULES_VERSION + 1 } };

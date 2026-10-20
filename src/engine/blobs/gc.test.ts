@@ -52,7 +52,7 @@ function rig(o: { pageSize?: number; crypto?: CryptoPort; store?: BlobPort } = {
 	const crypto = o.crypto ?? noop;
 	const clock = new FakeClock();
 	const r: Rig = {
-		store: null as unknown as SimBlobStore,
+		store: new SimBlobStore({ now: () => r.storeNow, pageSize: o.pageSize }),
 		clock,
 		storeNow: clock.now(),
 		live: new Set(),
@@ -79,7 +79,6 @@ function rig(o: { pageSize?: number; crypto?: CryptoPort; store?: BlobPort } = {
 			return { hash, address };
 		},
 	};
-	(r as { store: SimBlobStore }).store = new SimBlobStore({ now: () => r.storeNow, pageSize: o.pageSize });
 	return r;
 }
 

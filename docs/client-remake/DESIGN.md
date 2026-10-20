@@ -948,7 +948,11 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
     `FRAME_MAX_UPDATES` / `FRAME_MAX_BYTES`.
   - **Merge jobs:** close immediately when the job ends.
   - On `hidden`, `pagehide` or `freeze`: close all builders at once (§i.4).
-  - When the daily soft budget is exceeded, the timers stretch up to 10× (§i.6).
+  - When the daily soft budget is exceeded, the timers stretch 4× (`frameStretch`, src/engine/runtime/context.ts:559, §i.6).
+  - While the write gate is shut (e2ee-design §9.3) a builder cannot close: its updates stay in memory until the gate
+    opens (keyringRuntime closes every builder then). Every `FRAME_MAX_UPDATES` held updates are merged into one
+    (`FrameBuilder.coalesce`, src/engine/runtime/docRuntime.ts `closeFrame`), so a long shut costs the bytes typed,
+    not one buffer per keystroke. Their durable copy meanwhile is the bound file, as in the window below.
 - **Building a frame:**
   1. `content = n === 1 ? u[0] : Y.mergeUpdates(u)`. This is O(batch), never O(doc). Large state never goes through
      `mergeUpdates`.
@@ -959,7 +963,8 @@ editor ─CM tx─▶ onLocal(ChangeSet) ─▶ view client buffer ─≤16 ms�
   4. `T_edit`: put the outbox record (`pending`, or `held` with `dependsOn`) and bump `outboxOrder`.
   5. Hand the record to the sender.
 - **Durability window.** From keystroke to `T_edit` commit is ≤ 16 + 300 ms plus IDB commit time.
-  - During that window the edit is durable only through Obsidian's save of the bound file.
+  - During that window the edit is durable only through Obsidian's save of the bound file. The window is ≤ 16 + 1200 ms
+    when stretched, and lasts as long as the write gate stays shut (above).
   - After a crash, startup bind or reconcile finds disk ≠ CRDT and merges the disk text in with base = synced (§f.3).
   - Alternative: one `T_edit` per `bodyPush`. Rejected: about 60 IDB transactions per second while typing.
 - **Initial content of a new markdown/canvas doc** (planner `nsCreate` + `reconcileContent`, or the first bind):
@@ -1078,7 +1083,9 @@ provisional)`: live commits, read rows, checkpoints, provisionals and resolved r
 3. **Check** (resident docs, at apply time):
    - **Causal hole:** after apply, `doc.store.pendingStructs` or `pendingDs` is non-null while the stream is caught up.
      Re-read the stream up to 3 times over ≥ 3 min (≥ 2 × `PROVISIONAL_ADOPT_MS`, because the missing structs may be
-     an adoption in flight), then freeze `causal-hole`.
+     an adoption in flight), then freeze `causal-hole`. A retry that finds no session re-arms without counting
+     (`causalRetry`, src/engine/runtime/docRuntime.ts): no read can run offline, so time offline never uses up the
+     re-reads.
    - **Size:** a post-apply text length > `MAX_DOC_TEXT_CHARS` freezes the doc as `oversize-remote`. This is not
      quarantine: the row is valid and stays in tail. The doc just stops projecting.
    - **Canvas:** the projection validates the JSON canvas (§j.2). Invalid → freeze `canvas-invalid`.
@@ -1235,6 +1242,14 @@ The planner does no destructive work until ns is caught up (§f.2).
 
 ### d.8 Local compaction
 
+- **The maintenance tick** (`src/engine/runtime/maintenance.ts`) runs the gap feed, compaction, checkpoint duty, the
+  daily-limit release, the keyring tick, the residency budget, unbind expiry and catch-up scheduling. It ticks every
+  `maintenanceMs` (1 s) while work is pending: an open frame, an edit, read or feed in flight, rows above V or a stale
+  stream to read. While nothing is pending and a tick did no work, the interval doubles up to
+  `MAINTENANCE_IDLE_MAX_MS` (30 s). Activity snaps it back: every `scheduleStatus` outside the tick (phase, notice,
+  outbox, ingest and keyring changes) and a background change. Its deadline work (settle at 2 min, the fallback,
+  unbind expiry, the daily-limit release) runs at most 30 s late. An idle device wakes for it twice a minute
+  instead of every second (src/sim/idleCost.test.ts).
 - **Trigger:** `tailRows > LOCAL_COMPACT_ROWS` or `tailBytes > LOCAL_COMPACT_BYTES`, run by the maintenance tick. It
   is background work and waits while the app is backgrounded (§i.4), except at `tailRows > TAIL_HARD_ROWS`
   (`src/engine/runtime/maintenance.ts`).
@@ -1263,15 +1278,18 @@ The planner does no destructive work until ns is caught up (§f.2).
   - *Hot:* `rowsSinceRemoteCheckpoint ≥ REMOTE_CHECKPOINT_ROWS` (256) or `bytesSinceRemoteCheckpoint ≥
     REMOTE_CHECKPOINT_BYTES` (1 MiB), and the stream has been idle for `REMOTE_CHECKPOINT_IDLE_MS` (30 s)
     (src/core/limits.ts:116-118).
+  - *Hard cap:* `REMOTE_CHECKPOINT_HARD_ROWS` (4 × 256) or `REMOTE_CHECKPOINT_HARD_BYTES` (4 MiB) behind, the hot rule
+    is due without the idle gate, and activity no longer restarts the fallback clock. A stream written at least every
+    30 s (a plugin rewriting a note, two devices taking turns) never idles; without the cap it never checkpoints.
   - *Settle:* a fresh device would open more than one envelope for the stream (`settleWanted`, checkpoints.ts:129: a
     row above the remote checkpoint, or ≥ 2 rows and no checkpoint), and the stream has been idle for
     `REMOTE_CHECKPOINT_SETTLE_MS` (2 min, limits.ts:124). A stream whose only row is its first frame is left alone:
     a checkpoint would replace one open with one open (an import of 10k notes costs no checkpoints).
   - *Idle* means no live row and no own frame on the stream for that long (`lastActivity`, set in
     src/engine/runtime/docRuntime.ts:148 and context.ts:420). Activity also restarts the fallback clock
-    (checkpoints.ts:134), so neither rule writes while a note is being typed in, on any device. Activity before
-    this engine run is unknown (a restart can come in the middle of an edit session), so a stream with no activity
-    seen counts as active at the run's first live maintenance tick (`markLive`, checkpoints.ts:104, called at
+    (checkpoints.ts:134), so below the hard cap neither rule writes while a note is being typed in, on any device.
+    Activity before this engine run is unknown (a restart can come in the middle of an edit session), so a stream with
+    no activity seen counts as active at the run's first live maintenance tick (`markLive`, checkpoints.ts:104, called at
     maintenance.ts:147). After a restart no settle put comes before S, and no hot put before 30 s.
   - A device that sees a stream through skips (§d.7) sees its rows late. Skipped and stale seqs and read pages count
     as activity too, and a stale stream is never due and restarts its fallback clock, so a reader never falls back
@@ -1289,8 +1307,9 @@ The planner does no destructive work until ns is caught up (§f.2).
   - Settle puts are capped at `REMOTE_CHECKPOINT_SETTLE_DAILY` (1000) per device per 24 h, every put counting
     (limits.ts:131, `CheckpointState.settleOpen` checkpoints.ts:114). The hot rule is not capped.
   - *Bound.* With its duty device in the foreground, a doc idle for 30 s carries fewer than 256 rows. A doc still
-    being typed in carries the rows since its last 30 s pause: that is the idle gate. In a quiescent vault every
-    stream costs a fresh device one open (its checkpoint, or its single first frame), S = 2 min after the last edit.
+    being typed in carries the rows since its last 30 s pause (the idle gate), at most `REMOTE_CHECKPOINT_HARD_ROWS`
+    (the hard cap: about 5 min of non-stop typing). In a quiescent vault every stream costs a fresh device one open
+    (its checkpoint, or its single first frame), S = 2 min after the last edit.
     Without the duty device both rules wait for the fallback: at worst S + 10 + 10 min ≈ 22 min (bootstrap numbers:
     e2ee-design §16.2). `TAIL_HARD_ROWS` stays the local hard cap.
   - *Why 256 (was 512):* take a pessimistic steady state of 32 docs, each just under the hot cap. 32 is the number
@@ -1304,7 +1323,7 @@ The planner does no destructive work until ns is caught up (§f.2).
     to 0, or to 1 when rows were applied above the covered seq meanwhile, which keeps the stream settle-due.
   - `not-advancing-local` clears stale counters (checkpoints.ts:190).
   - A `too-large` stream is not due again until a new row arrives (`tooLarge.seq`, checkpoints.ts:82).
-  - Skipped outcomes back off 60 s (maintenance.ts:18). At most 2 body checkpoints run per 1 s maintenance tick
+  - Skipped outcomes back off 60 s (maintenance.ts:18). At most 2 body checkpoints run per maintenance tick
     (maintenance.ts:16).
 - **Preconditions:** the local compaction preconditions, plus a fresh local compaction so that `snapshotCoversSeq =
   appliedSeq = C`, and a sealed size ≤ `limits.maxCheckpointBytes`.
@@ -1373,7 +1392,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; never deleted (retired streams are a gap, `src/engine/sync/catchUp.ts:177`) |
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
-| `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | Soft `OUTBOX_SOFT_BYTES` (16 MiB): builders stretch, notice. **Never dropped** |
+| `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | No size limit is enforced (a soft limit with stretching and a notice was planned, not built). **Never dropped** |
 | `quarantine` | `[stream, seq]` | `byAt atMs` | `QuarantineRecord` (bytes + hash: ≤ 256 KiB for a deterministic failure, whole for a reader-dependent one so it can be re-gated) | `QUARANTINE_MAX_RECORDS` (500), by count only (no byte bound); oldest evicted (the doc stays frozen) |
 | `synced` | `docId` | — | `SyncedRecord` | 1 per synced doc |
 | `baseText` | `docId` | — | `BaseTextRecord` (deflated, ≤ `MAX_BASE_TEXT_CHARS`) | markdown/canvas synced docs |
@@ -1430,8 +1449,8 @@ Rules:
 - Tail is bounded by compaction (§d.8). If compaction is blocked by unreceipted frames for long (offline), the tail
   stays bounded by what this device received.
 - Quarantine is bounded with oldest-first eviction.
-- The outbox is never evicted; it is bounded only by user activity while offline, and the soft limit triggers a notice
-  plus frame stretching.
+- The outbox is never evicted; it is bounded only by user activity while offline. No soft limit is enforced (the
+  planned notice plus frame stretching was not built).
 - `streams` / `snapshots` / `tail` of pruned docs are **not** deleted yet: a `retired` checkpoint is skipped
   (`src/engine/sync/catchUp.ts:177`, gap) and no transaction drops a stream.
 - **Quota error:**
@@ -1476,7 +1495,8 @@ frameCount × {
   - body frames would converge anyway.
 - **Reader.** Takes the valid file (magic, checksum, identity match) with the highest generation.
 
-**Synced mirror** (`synced-a.bin` / `synced-b.bin`, debounce `SYNCED_MIRROR_DEBOUNCE_MS`):
+**Synced mirror** (`synced-a.bin` / `synced-b.bin`, written `SYNCED_MIRROR_DEBOUNCE_MS` (2 s,
+src/engine/compose/syncedMirror.ts:29) after the first change; a fixed delay, not reset by later changes):
 
 ```
 8B magic "YAOSSYN1", u8 version, varstring vaultId, varstring vaultEpoch, varstring deviceId,
@@ -1545,7 +1565,10 @@ All are in `src/core/types.ts`.
 `PlanFn(PlannerInput) → Plan` is pure (WP-B, `src/core/plan/planner.ts`).
 
 - **Scope:** `docs` (hint-driven: the docIds and pathKeys touched) or `full` (periodic every
-  `fullReconcileIntervalMs`, on resume, after catch-up and after recovery).
+  `fullReconcileIntervalMs`, on resume, after catch-up and after recovery). The periodic one backs off while idle:
+  each full pass with nothing actionable (engine) or scan that finds the listing unchanged (host: path, size, mtime)
+  doubles the interval up to `FULL_RECONCILE_IDLE_MAX_MS` (60 min); a docs request or vault event resets it. Resume
+  and `visible` still scan at once, so the backoff only stretches the watcher-miss safety net while nothing happens.
 - **Gates:**
   - no ns ops until ns has been caught up once in this session, and none while ns is halted;
   - destructive local decisions (local delete, rename inference) need `localComplete`;
@@ -1775,7 +1798,7 @@ transferred buffers.
 | `init{config}` | yes | Identity, device class, settings, relay URL + credential (secret), side files `[T]` | `ready{protocolVersion, vaultEpoch, recovered}` / `error(version-mismatch)` |
 | `shutdown` | yes | Flush builders, `T_edit`, mirror, close relay and IDB | `ok` |
 | `lifecycle{event}` | — | visible / hidden / pagehide / freeze / resume / online / offline / memory-pressure (declared, never raised; §i.4) | — |
-| `ping` | yes | Liveness every 10 s | `pong` (no pong within `PING_TIMEOUT_MS` → the engine stopped, §g.4) |
+| `ping` | yes | Liveness every `PING_INTERVAL_MS` (10 s); each pong in a quiet link doubles the gap up to `PING_IDLE_MAX_MS` (60 s), any other main → worker message resets it, and engine traffic counts as a pong (a ping is sent only after `PING_INTERVAL_MS` with nothing received) | `pong` (no pong within `PING_TIMEOUT_MS` → one more ping at once; `PING_MISSES_FATAL` (2) misses in a row → the engine stopped, §g.4) |
 | `observations{chunk, complete}` | yes | Listing chunks (≤ 2000 stats) | `ok` (the host sends the next chunk after it) |
 | `vaultEvents{events}` | — | Hints, batched ≤ 50 ms / 256 | — |
 | `openDoc{path, viewId}` | yes | Bind request | `bind{docId, kind, frozen}` / `notBindable{reason}` |
@@ -1801,7 +1824,7 @@ transferred buffers.
 | `diskOps{lane, ops}` | yes | Ordered ops with preconditions. A failed op does not stop independent later ones; dependents report `skipped` | `diskOps{DiskOpResult[]}` |
 | `saveViews{docIds}` | yes | Force Obsidian saves (before hidden, before rebuild) | `viewSaved{saved}` |
 | `sideFileWrite{name, bytes [T]}` / `sideFileRead{name}` | yes | Mirrors and snapshots | `sideFileWritten` / `sideFile{bytes [T]}` |
-| `status{StatusSnapshot}` | — | Throttled to ≤ 4/s and sent on phase change | — |
+| `status{StatusSnapshot}` | — | Throttled to ≤ 4/s and sent on phase change; a snapshot equal to the last one sent is dropped (`HostLink.post`), so an idle engine sends none. The status bar recomputes its relative times on hover | — |
 | `brake{BrakeReport}` | — | User approval needed | Host shows UI → `command` |
 | `notice{level, code, message}` | — | User-facing notice | — |
 | `result` / `error` `{re}` | — | Answers to main requests | — |
@@ -1844,7 +1867,9 @@ transferred buffers.
   - the worker cannot be constructed (no `Worker` or Blob URLs, `main.js` is not the bundle, the constructor throws);
   - no startup `pong` within `STARTUP_PING_TIMEOUT_MS`;
   - a worker `error` / `messageerror` event, or any other transport failure;
-  - no liveness `pong` within `PING_TIMEOUT_MS`;
+  - no liveness `pong` to `PING_MISSES_FATAL` (2) pings in a row, `PING_TIMEOUT_MS` (15 s) each. One miss only sends
+    the next ping at once: after the app was frozen in the background, the overdue timeout can fire before the engine
+    has run, and that next ping is answered (src/host/engineHost.ts `schedulePing`);
   - `init` answers an error (`storage-lost` included, OR-1).
   - The host terminates the worker, rejects every pending request (`aborted`) and reports one fatal: the runtime
     stops, its views unbind (their edits stay in the editors, §d.2), and the UI shows "YAOS stopped: …" and a
@@ -2110,7 +2135,7 @@ Budgets (`BUDGETS` in `limits.ts`).
 | Catch-up concurrency / blob bytes in flight (`blobBytesInFlight`, §j.1) | 8 / 64 MiB | 4 / 32 MiB | 3 / 16 MiB | 2 / 8 MiB |
 | In-flight append bytes | 1 MiB | 512 KiB | 512 KiB | 256 KiB |
 | Disk I/O in flight / ops per batch | 8 MiB / 32 | 4 MiB / 16 | 2 MiB / 16 | 1 MiB / 8 |
-| Full reconcile interval | 5 min | 10 min | 10 min | 15 min |
+| Full reconcile interval (idle: doubling to 60 min) | 5 min | 10 min | 10 min | 15 min |
 | Daily frame soft budget | 20 000 | 10 000 | 6 000 | 4 000 |
 | Body event credit window (`docUpdateWindowBytes`) | 512 KiB | 256 KiB | 256 KiB | 128 KiB |
 
@@ -2136,8 +2161,8 @@ Further caps:
 | Event | Action |
 |---|---|
 | `hidden` | Close all frame builders (`T_edit`); `saveViews` for bound docs; write the outbox and synced mirrors. Desktop and tablet stop there: they keep the socket and background work, because an occluded or minimized desktop window also reports `hidden` and must keep writing remote edits to disk; tablets get the same treatment. Phone and constrained devices pause background work at once (hard-cap compaction still runs; no new blob transfer starts, `src/engine/compose/vaultRuntime.ts:239`) and close the socket (1000) after 30 s hidden, which also ends the blob transfers in flight (§j.1). A background close shows no offline or error phase and arms no backoff. |
-| `pagehide` / `freeze` | Same flush, started synchronously (IDB transactions start in the event turn), then pause background work and close the socket on every device class (ending the blob transfers in flight). Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. |
-| `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. This tries once even after `offline`, so a missed `online` cannot strand the device; while offline a failure arms no backoff. The user's pause wins over this and over `online`. Check the IDB connection: `onLost` → §i.5. |
+| `pagehide` / `freeze` | Same flush, then pause background work and close the socket on every device class (ending the blob transfers in flight). Expect to be killed: nothing is held in memory only, beyond the ≤ 316 ms builder window that disk covers. The flush is not synchronous and nothing awaits it: main posts `lifecycle` to the worker, and each builder is sealed (async crypto) before its `T_edit` starts, so the IDB transactions begin several async hops after the event returns. Whether they finish before the OS suspends or kills the app is unmeasured (docs/client-remake/timer-audit.md F5). |
+| `resume` / `visible` | Reconnect at once (reset backoff), feed, full reconcile. With a session still open: one `VAULT_PING`, and no pong within `RESUME_PROBE_TIMEOUT_MS` (5 s) closes it as dead (4000) and reconnects at once (a suspended app's socket can die without a close). This tries once even after `offline`, so a missed `online` cannot strand the device; while offline a failure arms no backoff. The user's pause wins over this and over `online`. Check the IDB connection: `onLost` → §i.5. |
 | `online` / `offline` | Connect at once / stop reconnect attempts (an open socket stays until it fails). The outbox keeps accumulating. |
 | `memory-pressure` | None. Declared in `LifecycleEvent` (`src/ports/platform.ts:26`) but never raised by the host; nothing handles it (§d.1). |
 
@@ -2189,8 +2214,8 @@ ones get conflict copies.
 | `refused frame-id-conflict` | Poison it. Body: rebuild from disk. ns/cfg: re-plan the ops under a fresh frame id. Diagnostics. |
 | `refused forbidden` / `canWrite = false` | Read-only: no appends or checkpoints. Outbox kept. Notice. |
 | `resendUnreceipted` (STREAM_RESEND) | §d.5. |
-| 1001 / 1006 / network | Reconnect with full-jitter exponential backoff `RECONNECT_BASE_MS` → `RECONNECT_MAX_MS`. Immediate on `online` / `visible`. |
-| A relay HTTP call ends from this side (§j.1 Liveness): feed / read / readBatch as `timeout` without response headers in 15 s or past their backstop (79 s for the largest read page), as `stalled` after 10 s without a body chunk; checkpoint as `timeout` at 15 s plus its body at 64 KiB/s; any of them as `aborted` when its session closes | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:357-360`, `:382-387`); a failed session-start feed closes the session and reconnects with backoff (`:185-193`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:161-164`). |
+| 1001 / 1006 / network | Reconnect with full-jitter exponential backoff `RECONNECT_BASE_MS` → `RECONNECT_MAX_MS`. Immediate on `online` / `visible`. The attempt count resets when a session that was live for `SESSION_STABLE_MS` (60 s) closes, not on reaching live, so a relay that drops each socket soon after accepting it is retried with growing delays. |
+| A relay HTTP call ends from this side (§j.1 Liveness): feed / read / readBatch as `timeout` without response headers in 15 s or past their backstop (79 s for the largest read page), as `stalled` after 10 s without a body chunk; checkpoint as `timeout` at 15 s plus its body at 64 KiB/s; any of them as `aborted` when its session closes | A failure like any network error: a failed read backs its streams off `readBackoffMs` (5 s, `src/engine/runtime/sessionLoop.ts:379-382`, `:404-409`); a failed session-start feed closes the session and reconnects with backoff (`:197-205`); a failed checkpoint put backs that stream off 60 s (`src/engine/runtime/maintenance.ts:191-195`, `:213-216`). |
 | Ticket TTL 5 min | The adapter fetches a fresh ticket for every connect. |
 
 ---

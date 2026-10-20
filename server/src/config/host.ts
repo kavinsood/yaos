@@ -7,7 +7,7 @@
 import { randomBase64Url } from "../base64url";
 import { WindowLimiter } from "../limiter";
 import { SYSTEM_CLOCK, isMissingTableError, type ClockPort, type StoragePort } from "../ports";
-import { RestoreRunner, type RestorePorts, type RestoreResult } from "./restore";
+import { RestoreRunner, clearRestoreFailure, readRestoreFailures, type RestorePorts, type RestoreResult } from "./restore";
 
 /** DECISIONS §6.3, verbatim. */
 export const CONFIG_SCHEMA = `
@@ -42,8 +42,11 @@ export interface VaultEntry {
 
 export interface OperatorState {
 	vaults: VaultEntry[];
-	/** D8b: one entry per restore journal row (the console's "Restore in progress" banner); `at` in Unix ms. */
-	pendingRestores: Array<{ vaultId: string; at: number }>;
+	/**
+	 * D8b: one entry per restore journal row (the console's "Restore in progress" banner); `at` in Unix ms. A row the
+	 * alarm gave up on (RESTORE_GIVE_UP_MS) also carries `failedAt` (Unix ms) and `reason`; a press resumes it.
+	 */
+	pendingRestores: Array<{ vaultId: string; at: number; failedAt?: number; reason?: string }>;
 }
 
 /** Operator actions D8b freezes while a restore journal row exists for the vault. */
@@ -157,9 +160,15 @@ export class ConfigHost {
 		const vaults = this.storage.sql.exec<{ vault_id: string; name: string; created_at: number }>(
 			"SELECT vault_id, name, created_at FROM vault ORDER BY created_at, vault_id",
 		).toArray().map((row) => ({ vaultId: row.vault_id, name: row.name, createdAt: row.created_at }));
-		const pendingRestores = this.storage.sql.exec<{ vault_id: string; at: number }>(
-			"SELECT vault_id, at FROM restore_journal ORDER BY created_at, vault_id",
-		).toArray().map((row) => ({ vaultId: row.vault_id, at: row.at }));
+		const failures = readRestoreFailures(this.storage);
+		const pendingRestores = this.storage.sql.exec<{ vault_id: string; restore_id: string; at: number }>(
+			"SELECT vault_id, restore_id, at FROM restore_journal ORDER BY created_at, vault_id",
+		).toArray().map((row) => {
+			const failure = failures.get(row.vault_id);
+			return failure?.restoreId === row.restore_id
+				? { vaultId: row.vault_id, at: row.at, failedAt: failure.failedAt, reason: failure.reason }
+				: { vaultId: row.vault_id, at: row.at };
+		});
 		return { ok: true, vaults, pendingRestores };
 	}
 
@@ -185,7 +194,9 @@ export class ConfigHost {
 
 	/** D8b: "Vault delete wins: it deletes the journal row first" (0 rows when there is none). */
 	beginDeleteVault(vaultId: string): { ok: true } {
-		if (this.isClaimed()) this.storage.sql.exec("DELETE FROM restore_journal WHERE vault_id = ?", vaultId);
+		if (!this.isClaimed()) return { ok: true };
+		clearRestoreFailure(this.storage, vaultId);
+		this.storage.sql.exec("DELETE FROM restore_journal WHERE vault_id = ?", vaultId);
 		return { ok: true };
 	}
 

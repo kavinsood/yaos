@@ -5,6 +5,13 @@ import { defaultPluginData, type EngineRunState, type PairedIdentity, type YaosP
 import type { StatusSnapshot } from "../../protocol/status";
 import type { BrakeReport } from "../../core/types";
 import { testVaultId } from "../keys/testkit/vaultIds";
+import { snapshot } from "./testkit/fakeUiHost";
+
+/** A status in `phase` carrying exactly this e2ee state (none when undefined). */
+function statusWith(phase: StatusSnapshot["phase"], e2ee: StatusSnapshot["e2ee"]): StatusSnapshot {
+	const { e2ee: _none, ...base } = snapshot(phase);
+	return e2ee === undefined ? base : { ...base, e2ee };
+}
 
 const IDENTITY: PairedIdentity = { host: "https://h.example", vaultId: testVaultId("v"), deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "t".repeat(43), deviceName: "Mac", vaultGeneration: null };
 
@@ -13,12 +20,12 @@ function host(opts: { run?: EngineRunState["phase"]; phase?: StatusSnapshot["pha
 	return {
 		data: () => data,
 		runState: (): EngineRunState => ({ phase: opts.run ?? "running", lastError: null }),
-		status: () => (opts.phase ? ({ phase: opts.phase, brake: null } as unknown as StatusSnapshot) : null),
+		status: () => (opts.phase ? statusWith(opts.phase, undefined) : null),
 		brake: () => opts.brake ?? null,
 	};
 }
 
-const available = (h: ReturnType<typeof host>) => UI_COMMANDS.filter((c) => c.available(h)).map((c) => c.id).sort();
+const available = (h: Parameters<(typeof UI_COMMANDS)[number]["available"]>[0]) => UI_COMMANDS.filter((c) => c.available(h)).map((c) => c.id).sort();
 
 test("command ids match the contract", () => {
 	assert.deepEqual(UI_COMMANDS.map((c) => c.id).sort(), [
@@ -47,7 +54,7 @@ test("\"Create a new vault\" is offered unpaired, or paired with the vault's pin
 		({ suite: null, sealEpoch: 0, keyMissing: "no-pin", keyringSeen: false, creatable: false, ...over });
 	const make = (data: Partial<YaosPluginData>, status: StatusSnapshot["e2ee"] | "none") => {
 		const d: YaosPluginData = { ...defaultPluginData("Mac"), identity: IDENTITY, ...data };
-		return { data: () => d, status: () => (status === "none" ? null : ({ phase: "live", brake: null, e2ee: status } as unknown as StatusSnapshot)) };
+		return { data: () => d, status: () => (status === "none" ? null : statusWith("live", status)) };
 	};
 	const cases: [string, ReturnType<typeof make>, boolean][] = [
 		["unpaired", { data: () => ({ ...defaultPluginData("Mac"), identity: null }), status: () => null }, true],
@@ -77,12 +84,12 @@ test("encryption commands: finish creating only on the creation path, unlock onl
 		return {
 			data: () => d,
 			runState: (): EngineRunState => ({ phase: "running", lastError: null }),
-			status: () => ({ phase: "live", brake: null, e2ee: status } as unknown as StatusSnapshot),
+			status: () => statusWith("live", status),
 			brake: () => null,
 		};
 	};
 	const enc = (h: ReturnType<typeof make>) =>
-		available(h as unknown as ReturnType<typeof host>).filter((id) => ["yaos-finish-creating-vault", "yaos-unlock", "yaos-show-rekey-qr", "yaos-rekey-after-revoke"].includes(id));
+		available(h).filter((id) => ["yaos-finish-creating-vault", "yaos-unlock", "yaos-show-rekey-qr", "yaos-rekey-after-revoke"].includes(id));
 	assert.deepEqual(enc(make({}, e2ee({}))), ["yaos-unlock"]);
 	assert.deepEqual(enc(make({ creating: { vaultId: IDENTITY.vaultId } }, e2ee({ creatable: true }))), ["yaos-finish-creating-vault", "yaos-unlock"]);
 	// A marker for another vault, or one under a pin, is not resumable.

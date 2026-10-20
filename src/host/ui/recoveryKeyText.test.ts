@@ -75,14 +75,16 @@ test("recoveryKeyText: readRecoveryKey checks the engine's checksum and zero-fil
 
 test("recoveryKeyText: newRecoveryKey matches core makeRecoveryKey and wipes the random secret", async () => {
 	const fixed = new Uint8Array(32).map((_, i) => i * 3);
-	let handed: Uint8Array | null = null;
+	const handed: Uint8Array[] = [];
 	const out = await newRecoveryKey((n) => {
-		handed = new Uint8Array(fixed.subarray(0, n));
-		return handed;
+		const bytes = new Uint8Array(fixed.subarray(0, n));
+		handed.push(bytes);
+		return bytes;
 	}, checksum);
 	assert.deepEqual(out.rk, makeRecoveryKey(fixed));
 	assert.equal(out.text, encodeRecoveryKey(out.rk));
-	assert.ok((handed as unknown as Uint8Array).every((b) => b === 0));
+	assert.equal(handed.length, 1);
+	assert.ok(handed[0]!.every((b) => b === 0));
 });
 
 test("recoveryKeyText: confirm groups are two distinct in-range indices, and retyping tolerates case and look-alikes", () => {

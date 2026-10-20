@@ -26,14 +26,14 @@ import { PinGate, WriteRefused } from "./pinGate";
 // --- the gate itself -----------------------------------------------------------------------------------------
 
 /** Main's side of keyringChanged: stores (here: counts) and answers. */
-function fakeLink(): { link: HostLink; changes: number[][] } {
+function fakeLink(): { link: Pick<HostLink, "keyringChanged">; changes: number[][] } {
 	const changes: number[][] = [];
-	const link = {
+	const link: Pick<HostLink, "keyringChanged"> = {
 		keyringChanged: async (c: { readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[] }) => {
 			changes.push(c.keys.map((x) => x.e));
 			for (const x of c.keys) x.k.fill(0);
 		},
-	} as unknown as HostLink;
+	};
 	return { link, changes };
 }
 
@@ -72,7 +72,7 @@ test("PinGate: suite 0 open; unpinned closed; suite 1 open only with the newest 
 	const older = await gateFor({ suite: 1, keys: [], records: [g, await roll(2)] }, await suite1Ports(VAULT, [{ e: 1, k: K(1) }]), main.link);
 	assert.equal(older.open, true, "K_2 is reached through the roll's nextWrap");
 	assert.deepEqual(main.changes, [[2]], "and stored by main before the gate opens (persist-before-use)");
-	const failing = { keyringChanged: async () => Promise.reject(new Error("store failed")) } as unknown as HostLink;
+	const failing: Pick<HostLink, "keyringChanged"> = { keyringChanged: async () => Promise.reject(new Error("store failed")) };
 	const unstored = await gateFor({ suite: 1, keys: [], records: [g, await roll(2)] }, await suite1Ports(VAULT, [{ e: 1, k: K(1) }]), failing);
 	assert.equal(unstored.open, false, "a key main could not store is not used");
 	const stale = await gateFor({ suite: 1, keys: [], records: [g, await revoke(2)] }, await suite1Ports(VAULT, [{ e: 1, k: K(1) }]));

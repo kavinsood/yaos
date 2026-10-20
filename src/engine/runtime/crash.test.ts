@@ -22,14 +22,14 @@ import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, drive, sleep, startTestEngine, testStorage, until, createDoc, deleteDoc, docText, editDoc, renameDoc } from "./testHarness";
 
-const TUNING = { compactRows: 4, checkpoint: { rows: 3, bytes: 1e9, idleMs: 10, settleMs: 1e9, fallbackMs: 40, nsRows: 3, nsBytes: 1e9 } };
+const TUNING = { compactRows: 4, checkpoint: { rows: 3, bytes: 1e9, idleMs: 10, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 40, nsRows: 3, nsBytes: 1e9 } };
 const SAMPLE = Math.max(1, Number(process.env.YAOS_CRASH_SAMPLE ?? "1"));
 const PAR = 6;
 
 // Label each commit with the Repo transaction running on the crashing port.
 const repoOf = new Map<unknown, Repo>();
 const origOpen = Repo.open.bind(Repo);
-(Repo as unknown as { open: typeof Repo.open }).open = async (storage, id, now, o) => {
+Repo.open = async (storage, id, now, o) => {
 	const r = await origOpen(storage, id, now, o);
 	if (r.repo) repoOf.set(storage, r.repo);
 	return r;

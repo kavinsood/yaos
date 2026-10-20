@@ -7,7 +7,7 @@
 // finishRestore (devices, no codes, new epoch; or back to 2); 4 DELETE the journal row → 200 {vaultEpoch}.
 import { randomBase64Url } from "../base64url";
 import { isCloudflareDailyLimitError } from "../dailyLimit";
-import { describeError, type ClockPort, type StoragePort } from "../ports";
+import { describeError, isMissingTableError, type ClockPort, type StoragePort } from "../ports";
 import type { DeviceRecord } from "../vault/devices";
 import type { FinishRestoreResult, PrepareRestoreResult, RewindResult } from "../vault/host";
 import type { ConfigFailure, ConfigResult } from "./host";
@@ -28,6 +28,50 @@ export const RESTORE_ALARM_MAX_DELAY_MS = 60 * 60 * 1000;
  * then answers `503 restore_incomplete` (the alarm continues).
  */
 export const MAX_REWINDS_PER_RUN = 3;
+/**
+ * DECISIONS-GAP: D8b retries a restore without an end. Each retry is a config DO wake and write, vault RPCs that set
+ * the 60 s `restoring` flag and close every streams socket 1013 (and maybe a PITR rewind), so a restore that cannot
+ * finish would kick every device off the vault once an hour for as long as PITR keeps the point (30 days). The alarm
+ * gives up on a journal row once it is this old (since its INSERT, or since the press that resumed it): one Cloudflare
+ * daily-limit reset (00:00 UTC, at most 24 h away) plus one RESTORE_ALARM_MAX_DELAY_MS interval and an hour of slack,
+ * so a free-plan restore that hit the daily row limit still gets an attempt after the reset. About 31 attempts.
+ * Giving up does not drop the row (its device snapshot may be the only copy of the pre-restore device table once
+ * the vault was rewound): it is marked failed (`restore_failure`), the alarm stops, the operator state reports
+ * `failedAt` and `reason`, and the operator actions stay frozen until a press resumes it or the vault is deleted.
+ */
+export const RESTORE_GIVE_UP_MS = 26 * 60 * 60 * 1000;
+/**
+ * DECISIONS-GAP: not in §6.3's schema; created on the first give-up (CREATE IF NOT EXISTS), so config DOs created
+ * before it need no migration. A missing table reads as no failures. One row per journal row the alarm gave up on.
+ */
+export const RESTORE_FAILURE_SCHEMA = `CREATE TABLE IF NOT EXISTS restore_failure (vault_id TEXT PRIMARY KEY,
+	restore_id TEXT NOT NULL, failed_at INTEGER NOT NULL, reason TEXT NOT NULL) WITHOUT ROWID`;
+
+/** A journal row the alarm gave up on (`restore_failure`, joined to the journal by restore id). */
+export interface RestoreFailure {
+	vaultId: string;
+	restoreId: string;
+	failedAt: number;
+	reason: string;
+}
+
+/** The `restore_failure` rows by vault id; empty when the table was never created. */
+export function readRestoreFailures(storage: StoragePort): Map<string, RestoreFailure> {
+	try {
+		return new Map(storage.sql.exec<{ vault_id: string; restore_id: string; failed_at: number; reason: string }>(
+			"SELECT vault_id, restore_id, failed_at, reason FROM restore_failure",
+		).toArray().map((row) => [row.vault_id,
+			{ vaultId: row.vault_id, restoreId: row.restore_id, failedAt: row.failed_at, reason: row.reason }]));
+	} catch (error) {
+		if (isMissingTableError(error, "restore_failure")) return new Map();
+		throw error;
+	}
+}
+
+/** Deletes the vault's `restore_failure` row, when there is one (no statement otherwise, and no table needed). */
+export function clearRestoreFailure(storage: StoragePort, vaultId: string): void {
+	if (readRestoreFailures(storage).has(vaultId)) storage.sql.exec("DELETE FROM restore_failure WHERE vault_id = ?", vaultId);
+}
 
 /** The vault RPCs the runner calls; `RestorePorts.vault` returns a fresh stub per call. */
 export interface RestoreVaultPort {
@@ -49,7 +93,11 @@ export interface RestorePorts {
 
 export type RestoreResult = ConfigResult<{ vaultEpoch: string; resumed?: true; at?: string }>;
 
-type JournalRow = { vault_id: string; restore_id: string; at: number; bookmark: string | null; devices: ArrayBuffer | null };
+type JournalRow = {
+	vault_id: string; restore_id: string; at: number; bookmark: string | null; devices: ArrayBuffer | null; created_at: number;
+};
+
+const JOURNAL_COLUMNS = "vault_id, restore_id, at, bookmark, devices, created_at";
 
 const fail = (status: number, error: string): ConfigFailure => ({ ok: false, status, error });
 
@@ -99,6 +147,8 @@ function decodeDevices(blob: ArrayBuffer): DeviceRecord[] {
 export class RestoreRunner {
 	/** One run per vault at a time: a second press and the alarm join it. */
 	private readonly inFlight = new Map<string, Promise<RestoreResult>>();
+	/** Why each vault's last run left its journal row (the reason recorded on give-up). */
+	private readonly lastFailure = new Map<string, string>();
 
 	constructor(
 		private readonly storage: StoragePort,
@@ -118,12 +168,21 @@ export class RestoreRunner {
 		if (at === null) return fail(400, "invalid_restore_point");
 		const pending = this.journal(vaultId);
 		if (pending) {
+			// A restore the alarm gave up on: this press resumes it with a new RESTORE_GIVE_UP_MS of alarm retries.
+			if (!this.inFlight.has(vaultId) && readRestoreFailures(this.storage).has(vaultId)) {
+				pending.created_at = this.clock.now();
+				this.storage.transactionSync(() => {
+					clearRestoreFailure(this.storage, vaultId);
+					this.storage.sql.exec("UPDATE restore_journal SET created_at = ? WHERE vault_id = ? AND restore_id = ?",
+						pending.created_at, vaultId, pending.restore_id);
+				});
+			}
 			const result = await (this.inFlight.get(vaultId) ?? this.track(vaultId, () => this.run(pending)));
 			if (!result.ok) return await this.keepAlarm(result);
 			return { ...result, resumed: true, at: new Date(pending.at).toISOString() };
 		}
-		const row: JournalRow = { vault_id: vaultId, restore_id: randomBase64Url(16), at, bookmark: null, devices: null };
 		const now = this.clock.now();
+		const row: JournalRow = { vault_id: vaultId, restore_id: randomBase64Url(16), at, bookmark: null, devices: null, created_at: now };
 		this.storage.sql.exec("INSERT INTO restore_journal (vault_id, restore_id, at, created_at) VALUES (?, ?, ?, ?)",
 			vaultId, row.restore_id, at, now);
 		const result = await this.track(vaultId, async () => {
@@ -133,25 +192,46 @@ export class RestoreRunner {
 		return result.ok ? result : await this.keepAlarm(result);
 	}
 
-	/** The config DO alarm: resumes every journal row, then re-arms while any is left. */
+	/**
+	 * The config DO alarm: resumes every journal row not given up on, marks failed each one still left that is
+	 * RESTORE_GIVE_UP_MS old, then re-arms while any live row is left (the backoff follows the newest live row).
+	 */
 	async alarm(): Promise<void> {
+		const failed = readRestoreFailures(this.storage);
 		const rows = this.storage.sql.exec<JournalRow>(
-			"SELECT vault_id, restore_id, at, bookmark, devices FROM restore_journal ORDER BY created_at, vault_id",
-		).toArray();
+			`SELECT ${JOURNAL_COLUMNS} FROM restore_journal ORDER BY created_at, vault_id`,
+		).toArray().filter((row) => failed.get(row.vault_id)?.restoreId !== row.restore_id);
+		let newest: number | null = null;
 		for (const row of rows) {
 			try {
 				await (this.inFlight.get(row.vault_id) ?? this.track(row.vault_id, () => this.run(row)));
 			} catch (error) {
 				console.error("[yaos-config] restore alarm: run failed", describeError(error));
+				this.lastFailure.set(row.vault_id, isCloudflareDailyLimitError(error) ? "cf_daily_limit" : `error: ${describeError(error)}`);
 			}
+			const left = this.journal(row.vault_id);
+			if (left?.restore_id !== row.restore_id) continue;
+			const now = this.clock.now();
+			if (now - left.created_at >= RESTORE_GIVE_UP_MS) {
+				this.giveUp(left, now);
+				continue;
+			}
+			newest = Math.max(newest ?? left.created_at, left.created_at);
 		}
-		const newest = this.storage.sql.exec<{ created_at: number | null }>(
-			"SELECT MAX(created_at) AS created_at FROM restore_journal",
-		).one().created_at;
 		if (newest === null) return;
 		const now = this.clock.now();
 		const delay = Math.min(Math.max(now - newest, RESTORE_ALARM_DELAY_MS), RESTORE_ALARM_MAX_DELAY_MS);
 		await this.ports.alarms.setAlarm(now + delay);
+	}
+
+	/** RESTORE_GIVE_UP_MS: the row stays (frozen actions, device snapshot) and is marked failed; no more alarms for it. */
+	private giveUp(row: JournalRow, now: number): void {
+		const reason = this.lastFailure.get(row.vault_id) ?? "restore_incomplete";
+		this.storage.sql.exec(RESTORE_FAILURE_SCHEMA);
+		this.storage.sql.exec("INSERT OR REPLACE INTO restore_failure (vault_id, restore_id, failed_at, reason) VALUES (?, ?, ?, ?)",
+			row.vault_id, row.restore_id, now, reason);
+		console.error(`[yaos-config] restore: gave up on vault ${row.vault_id} (restore to ${new Date(row.at).toISOString()})`
+			+ ` after ${Math.round((now - row.created_at) / 3_600_000)} h of retries: ${reason}; a press resumes it`);
 	}
 
 	private track(vaultId: string, start: () => Promise<RestoreResult>): Promise<RestoreResult> {
@@ -172,7 +252,7 @@ export class RestoreRunner {
 
 	private journal(vaultId: string): JournalRow | undefined {
 		return this.storage.sql.exec<JournalRow>(
-			"SELECT vault_id, restore_id, at, bookmark, devices FROM restore_journal WHERE vault_id = ?", vaultId,
+			`SELECT ${JOURNAL_COLUMNS} FROM restore_journal WHERE vault_id = ?`, vaultId,
 		).toArray()[0];
 	}
 
@@ -182,6 +262,7 @@ export class RestoreRunner {
 	}
 
 	private drop(row: JournalRow): void {
+		clearRestoreFailure(this.storage, row.vault_id);
 		this.storage.sql.exec("DELETE FROM restore_journal WHERE vault_id = ? AND restore_id = ?", row.vault_id, row.restore_id);
 	}
 
@@ -250,10 +331,12 @@ export class RestoreRunner {
 				}
 			}
 			console.warn("[yaos-config] restore: the vault was written after every rewind; the alarm retries");
+			this.lastFailure.set(row.vault_id, "rewind_contended");
 			return fail(503, "restore_incomplete");
 		} catch (error) {
 			if (isCloudflareDailyLimitError(error)) throw error;
 			console.error("[yaos-config] restore step failed", describeError(error));
+			this.lastFailure.set(row.vault_id, `error: ${describeError(error)}`);
 			return fail(503, "restore_incomplete");
 		}
 	}

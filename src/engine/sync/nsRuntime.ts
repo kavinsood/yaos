@@ -30,10 +30,10 @@ import {
 	NS_STREAM, streamClass, streamDocId,
 	type ClientFrameId, type DeviceId, type DocId, type DocKind, type NsEntry, type NsFoldEvent, type NsFoldIndex, type NsFoldState, type NsOp, type Seq, type VaultPath,
 } from "../../core/types";
-import type { OutboxChange, Repo } from "../store/repo";
+import type { OutboxChange } from "../store/repo";
 import type { SnapshotRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
-import { FoldRuntime, type FoldCandidate, type FoldedFrame } from "./foldRuntime";
+import { FoldRuntime, type FoldCandidate, type FoldedFrame, type FoldRepo } from "./foldRuntime";
 
 export { LOCAL_FLAG_STALE_EPOCH, LOCAL_FLAG_UNOPENED } from "./foldRuntime";
 /** An ns row s is a checkpoint candidate iff floor(s / M) > floor(prev / M) (core/ns/candidate, §d.9). */
@@ -58,7 +58,7 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	/** knownRulesVersion: the highest fold rules this reader implements (tests raise it: an upgraded client). */
 	private readonly rules: NsFoldRules;
 
-	constructor(repo: Repo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS, knownRulesVersion = FOLD_RULES_VERSION) {
+	constructor(repo: FoldRepo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS, knownRulesVersion = FOLD_RULES_VERSION) {
 		super(repo, self, NS_STREAM, candidateModulus);
 		this.rules = knownRulesVersion === DEFAULT_NS_FOLD_RULES.knownRulesVersion ? DEFAULT_NS_FOLD_RULES : { ...DEFAULT_NS_FOLD_RULES, knownRulesVersion };
 	}

@@ -18,7 +18,8 @@
  * Reconnect timing is relayPolicy's; this module only owns the timer.
  */
 
-import { RELAY_CLOSE } from "../../core/limits";
+import { bounded } from "../../core/deadline";
+import { RELAY_CLOSE, RESUME_PROBE_TIMEOUT_MS, SESSION_STABLE_MS } from "../../core/limits";
 import { CFG_STREAM, KEYRING_STREAM, NS_STREAM, SNAP_STREAM, streamClass, type Seq, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import type { ReadPage, ReadRequest, RelayConnectResult, RelayEvent, RelaySession } from "../../ports/relay";
@@ -43,6 +44,10 @@ export class SessionLoop {
 	/** The platform reported offline: no automatic reconnect attempts until online (or a session opens). */
 	private netDown = false;
 	private backpressureFlag = false;
+	/** When the current session reached live (mono ms); null = not live. See SESSION_STABLE_MS. */
+	private liveAtMono: number | null = null;
+	/** The resume probe of the current session is in flight (wake). */
+	private probing = false;
 	private unsub: (() => void) | null = null;
 	private feeding: Promise<void> | null = null;
 	private readonly reads = new Map<StreamName, Promise<void>>();
@@ -183,7 +188,7 @@ export class SessionLoop {
 			await this.afterStartReads(gen);
 			if (gen !== c.gen) return;
 			c.setPhase(c.livePhase());
-			this.st = newReconnectState();
+			this.liveAtMono = c.mono(); // the backoff resets when it closes after SESSION_STABLE_MS (handleClosed)
 			this.probeBlobStore();
 			// Reader-dependent quarantine is retried on every session start (new keys / version, §d.6).
 			await retryReaderQuarantine(c).catch((e) => c.diag("quarantine-retry-failed", { error: String(e) }));
@@ -293,6 +298,8 @@ export class SessionLoop {
 		c.subs.onClosed();
 		c.lastCloseCode = ev.code;
 		c.diag("session-closed", { code: ev.code, errorCode: ev.errorCode, wasClean: ev.wasClean });
+		if (this.liveAtMono !== null && c.mono() - this.liveAtMono >= SESSION_STABLE_MS) this.st = newReconnectState();
+		this.liveAtMono = null;
 		// The link is dead (lost, failed its liveness check) or the device leaves it (pause, park, stop): blob
 		// transfers over it end now. A close the relay sent leaves them to their idle watchdogs.
 		if (c.stopped || this.manual || this.parked || ev.code === RELAY_CLOSE.abnormal || ev.code === RELAY_CLOSE.liveness) this.abortTransfers(`close ${ev.code}`);
@@ -624,7 +631,42 @@ export class SessionLoop {
 	 */
 	wake(): Promise<void> {
 		this.parked = false;
+		if (this.c.session) {
+			this.probeSession();
+			return Promise.resolve();
+		}
 		return this.connectNow(true);
+	}
+
+	/**
+	 * One ping on the open session (resume): a socket that died while the app was suspended gets no close, so
+	 * without this the device waits for the adapter's idle liveness check (DESIGN §i.6). No pong within
+	 * RESUME_PROBE_TIMEOUT_MS: close it as dead and connect at once.
+	 */
+	private probeSession(): void {
+		const c = this.c;
+		const s = c.session;
+		if (!s || this.probing) return;
+		const gen = c.gen;
+		this.probing = true;
+		bounded(RESUME_PROBE_TIMEOUT_MS, undefined, c.ports.clock, () => s.ping(), (why) => new Error(why))
+			.then(
+				() => undefined,
+				(e: unknown) => {
+					if (gen !== c.gen || c.session !== s || c.stopped) return; // closed meanwhile: that close reconnects
+					c.diag("resume-probe-failed", { error: String(e) });
+					try {
+						s.close(RELAY_CLOSE.liveness, "resume-probe");
+					} catch {
+						/* already closed */
+					}
+					this.handleClosed(gen, { t: "closed", code: RELAY_CLOSE.liveness, errorCode: null, wasClean: false });
+					void this.connectNow(true);
+				},
+			)
+			.finally(() => {
+				this.probing = false;
+			});
 	}
 
 	/** offline: stop reconnect attempts (an open socket stays until it fails); online: connect at once. */

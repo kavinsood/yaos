@@ -145,6 +145,8 @@ export class SimEditorView implements EditorViewRef {
 	}
 
 	async save(): Promise<void> {
+		// The process is being killed (faults.ts suspendKill, save "lost"): this save never runs.
+		if (this.ws.savesBlocked) return;
 		this.clearTimer("save");
 		this.dirty = false;
 		if (this.closed || this.path === null) return;
@@ -364,6 +366,8 @@ export class SimWorkspace implements WorkspacePort {
 	readonly clock: ClockPort;
 	readonly vault: SimVault;
 	readonly saveDebounceMs: number;
+	/** While set, every view's save() returns without saving (faults.ts suspendKill with the save lost). */
+	savesBlocked = false;
 	/** The view whose onInternalDataChange is running (its quick preview reaches the others synchronously). */
 	previewFrom: number | null = null;
 	private readonly views = new Map<number, SimEditorView>();

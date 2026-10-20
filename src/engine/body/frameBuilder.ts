@@ -40,6 +40,17 @@ export class FrameBuilder {
 		return Math.min(this.lastPushAt + OPEN_FRAME_IDLE_MS * stretch, this.openedAt + OPEN_FRAME_MAX_MS * stretch);
 	}
 
+	/**
+	 * Merge the held updates into one, keeping the frame open (openedAt, flags). For a frame that cannot close (the
+	 * write gate is shut): memory then follows the bytes typed, not one buffer per keystroke.
+	 */
+	coalesce(): void {
+		if (this.updates.length < 2) return;
+		const merged = mergeSmallBatch(this.updates);
+		this.updates = [merged];
+		this.bytes = merged.length;
+	}
+
 	/** Close: content = u[0] or mergeUpdates(small batch). */
 	take(): { content: Uint8Array; flags: number; updates: number } | null {
 		if (this.updates.length === 0) return null;

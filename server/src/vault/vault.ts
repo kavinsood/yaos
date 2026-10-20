@@ -2,6 +2,7 @@
 // the ports; this class binds it to `ctx.storage` and the hibernatable WebSocket API.
 import { DurableObject } from "cloudflare:workers";
 import { readStreamRelayConfig, type StreamsEnv } from "../streams/relay";
+import { SOCKET_KEEPALIVE_REQUEST, SOCKET_KEEPALIVE_RESPONSE } from "../shared/socketLiveness";
 import { CLOUDFLARE_UPGRADE_REJECT, CloudflareSocketRegistry } from "./cloudflare";
 import type { DeviceRecord } from "./devices";
 import {
@@ -28,6 +29,9 @@ export class VaultDO extends DurableObject<VaultEnv> {
 
 	constructor(ctx: DurableObjectState, env: VaultEnv) {
 		super(ctx, env);
+		// Idle keepalives are answered by the runtime, without waking the DO from hibernation. Set on every
+		// construction (a wake from hibernation constructs the object again).
+		ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(SOCKET_KEEPALIVE_REQUEST, SOCKET_KEEPALIVE_RESPONSE));
 		this.host = new VaultHost({
 			storage: ctx.storage,
 			sockets: new CloudflareSocketRegistry(ctx),

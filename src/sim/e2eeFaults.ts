@@ -32,7 +32,6 @@ import { bytesToHex } from "../core/codec/lib0";
 import { KEYRING_STREAM, type DeviceId, type StreamName, type VaultEpoch } from "../core/types";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { sealFrame } from "../engine/ingest/envelope";
-import type { OwnOutcome } from "../engine/keyring/keyring";
 import type { KeyringRuntime } from "../engine/keyring/keyringRuntime";
 import { KeyRecordKind } from "../engine/keyring/record";
 import type { EngineCtx } from "../engine/runtime/context";
@@ -79,8 +78,6 @@ export interface E2eeFaultStats {
 	released: number;
 	joins: { started: number; noPin: number; encryptedVault: number; suite0LinkRefused: number };
 }
-
-type RuntimeInternals = { flow: unknown; runOwn(kind: KeyRecordKind, rk?: Uint8Array): Promise<OwnOutcome> };
 
 export class E2eeFaults {
 	private readonly snaps: StoreSnapshot[] = [];
@@ -167,9 +164,9 @@ export class E2eeFaults {
 		const c = this.ctxOf(i);
 		const kr = c?.keyring;
 		if (!kr || !c || kr.suite !== 1) return false;
-		const inner = kr as unknown as RuntimeInternals;
-		if (inner.flow || !c.session?.canWrite || c.phase !== "live" || kr.keyMissing() !== null) return false;
-		void inner.runOwn(KeyRecordKind.roll).then((o) => void this.stats.rolls[o]++, () => void this.stats.rolls.failed++);
+		// Element access reaches KeyringRuntime's private flow / runOwn while keeping their types.
+		if (kr["flow"] || !c.session?.canWrite || c.phase !== "live" || kr.keyMissing() !== null) return false;
+		void kr["runOwn"](KeyRecordKind.roll).then((o) => void this.stats.rolls[o]++, () => void this.stats.rolls.failed++);
 		return true;
 	}
 
@@ -189,7 +186,7 @@ export class E2eeFaults {
 		const lost = this.devs[dev];
 		if (!b || !lost || by === dev) return "skip fault revoke: no device";
 		const kr = this.runtimeOf(by);
-		if (!kr || kr.suite !== 1 || !isLive(b) || (kr as unknown as RuntimeInternals).flow) {
+		if (!kr || kr.suite !== 1 || !isLive(b) || kr["flow"]) {
 			this.stats.revokes.skipped++;
 			return `skip fault revoke: ${b.name} cannot revoke now`;
 		}

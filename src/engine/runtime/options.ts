@@ -3,7 +3,7 @@
  * defaults are the DESIGN values.
  */
 
-import { BLOB_QUARANTINE_MIN_MS, BUDGETS, LOCAL_COMPACT_BYTES, RECENT_UNBOUND_KEEP, RECENT_UNBOUND_MS, SKIP_DEFER, SUBSCRIBE_DEBOUNCE_MS, type SkipDefer, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
+import { BLOB_QUARANTINE_MIN_MS, BUDGETS, MAINTENANCE_IDLE_MAX_MS, LOCAL_COMPACT_BYTES, RECENT_UNBOUND_KEEP, RECENT_UNBOUND_MS, SKIP_DEFER, SUBSCRIBE_DEBOUNCE_MS, type SkipDefer, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
 import type { ContentHash, DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
@@ -39,6 +39,8 @@ export interface EngineTuning {
 	readonly statusIntervalMs: number;
 	readonly mirrorDebounceMs: number;
 	readonly maintenanceMs: number;
+	/** Idle maintenance: the tick interval doubles while nothing is pending, up to this (maintenance.ts). */
+	readonly maintenanceIdleMaxMs: number;
 	/** Backoff after a failed / aborted stream read. */
 	readonly readBackoffMs: number;
 	/** Streams per batched catch-up read (also capped by the relay's readBatchStreams); 1 = single reads only. */
@@ -92,6 +94,7 @@ export const DEFAULT_TUNING: EngineTuning = {
 	statusIntervalMs: 250,
 	mirrorDebounceMs: OUTBOX_MIRROR_DEBOUNCE_MS,
 	maintenanceMs: 1_000,
+	maintenanceIdleMaxMs: MAINTENANCE_IDLE_MAX_MS,
 	readBackoffMs: 5_000,
 	readBatchStreams: 128,
 	reconnectBaseMs: RECONNECT_BASE_MS,

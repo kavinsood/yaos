@@ -870,6 +870,8 @@ s.test("admission: rate overdraft sends VAULT_BACKPRESSURE and closes 1013; over
 		service.message(c, `__YPS:${JSON.stringify({ type: "VAULT_PING", probeId: "probe-1" })}`);
 		assert.deepEqual(c.last("VAULT_PONG"), { type: "VAULT_PONG", probeId: "probe-1", documentId: "streams",
 			vaultGeneration: GENERATION, runtimeEpoch: "runtime-a", head: 0 });
+		service.message(c, `__YPS:{"type":"VAULT_KEEPALIVE"}`);
+		assert.deepEqual(c.last("VAULT_ALIVE"), { type: "VAULT_ALIVE" }, "keepalive answered in code (the auto-response's fallback)");
 		service.message(c, "not a control frame");
 		assert.equal(c.closed, null, "unknown text is ignored");
 	});

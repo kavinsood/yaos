@@ -207,8 +207,8 @@ export interface StatusBarTimers {
 export interface StatusBarElement {
 	textContent: string | null;
 	setAttribute(name: string, value: string): void;
-	addEventListener(type: "click", listener: () => void): void;
-	removeEventListener(type: "click", listener: () => void): void;
+	addEventListener(type: "click" | "mouseenter", listener: () => void): void;
+	removeEventListener(type: "click" | "mouseenter", listener: () => void): void;
 	readonly classList: { add(...tokens: string[]): void; remove(...tokens: string[]): void };
 	readonly style: { display: string };
 }
@@ -243,6 +243,10 @@ export class StatusBarController {
 	private unsubscribe: (() => void) | null = null;
 	private last: RenderedStatus | null = null;
 	private disposed = false;
+	private readonly onHover = (): void => {
+		this.renderNow();
+	};
+
 	private readonly onClick = (): void => {
 		if (pendingBrake(this.host)) this.opts.openBrake();
 		else if (this.host.status()?.phase === "key-missing" || isKeyMissing(this.host)) this.opts.openKeyMissing();
@@ -258,6 +262,9 @@ export class StatusBarController {
 		this.minIntervalMs = opts.minIntervalMs ?? 250;
 		el.classList.add("mod-clickable", "yaos-status");
 		el.addEventListener("click", this.onClick);
+		// The engine posts status only when it changes, so refresh the relative times ("last synced 3 min ago")
+		// when the tooltip is about to show.
+		el.addEventListener("mouseenter", this.onHover);
 		this.unsubscribe = host.onChange(() => this.schedule());
 		this.renderNow();
 	}
@@ -307,5 +314,6 @@ export class StatusBarController {
 		this.unsubscribe?.();
 		this.unsubscribe = null;
 		this.el.removeEventListener("click", this.onClick);
+		this.el.removeEventListener("mouseenter", this.onHover);
 	}
 }

@@ -706,12 +706,12 @@ class MemDb<S extends SchemaShape> implements StorageDb<S> {
 	}
 
 	tx<T>(stores: readonly StoreName<S>[], mode: "readonly" | "readwrite", body: (tx: StorageTx<S>) => Promise<T>): Promise<T> {
-		return this.port.runTx(this as unknown as MemDb<SchemaShape>, stores, mode, body as unknown as (tx: LooseTx) => Promise<T>);
+		return this.port.runTx(this, stores, mode, body as (tx: LooseTx) => Promise<T>);
 	}
 
 	close(): void {
 		this.closed = true;
-		this.state.handles.delete(this as unknown as MemDb<SchemaShape>);
+		this.state.handles.delete(this);
 	}
 
 	onLost(listener: (failure: StorageFailure) => void): Unsubscribe {
@@ -726,7 +726,7 @@ class MemDb<S extends SchemaShape> implements StorageDb<S> {
 		if (this.closed) return;
 		this.closed = true;
 		if (abnormal) this.broken = true;
-		this.state.handles.delete(this as unknown as MemDb<SchemaShape>);
+		this.state.handles.delete(this);
 		for (const listener of Array.from(this.listeners)) {
 			try {
 				listener("connection-lost");
@@ -781,6 +781,13 @@ export class MemStoragePort implements StoragePort {
 	/** Kills this port; returns a new live port with a deep copy of every database's committed state. */
 	crash(): MemStoragePort {
 		this.deadFlag = true;
+		const next = new MemStoragePort(this.options);
+		for (const [name, st] of this.dbs) next.dbs.set(name, { data: structuredClone(st.data), handles: new Set(), queue: [] });
+		return next;
+	}
+
+	/** A new live port with a deep copy of every database's committed state; this port stays alive (inspection). */
+	copy(): MemStoragePort {
 		const next = new MemStoragePort(this.options);
 		for (const [name, st] of this.dbs) next.dbs.set(name, { data: structuredClone(st.data), handles: new Set(), queue: [] });
 		return next;
@@ -846,7 +853,7 @@ export class MemStoragePort implements StoragePort {
 				}
 			}
 			const handle = new MemDb<S>(this, st);
-			st.handles.add(handle as unknown as MemDb<SchemaShape>);
+			st.handles.add(handle);
 			return handle;
 		});
 	}

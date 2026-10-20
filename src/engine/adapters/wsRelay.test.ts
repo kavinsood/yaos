@@ -4,6 +4,7 @@ import type { RelayConnectResult, RelayEvent, RelaySession } from "../../ports/r
 import type { ClientFrameId, DeviceId, StreamName, VaultId } from "../../core/types";
 import {
 	createWsRelayPort,
+	KEEPALIVE_PING_EVERY,
 	LIVENESS_CLOSE_CODE,
 	ProvisionalJoin,
 	streamsSocketUrl,
@@ -635,6 +636,29 @@ describe("wsRelay liveness", () => {
 		assert.deepEqual(events, [{ t: "head", headSeq: 42 }]);
 		clock.advance(60_000);
 		assert.equal(pings(socket).length, 2, "next ping after another idle window");
+	});
+
+	it("keepalive mode (VAULT_READY.liveness.keepalive): idle probes are VAULT_KEEPALIVE, VAULT_ALIVE keeps the session, every 10th is a VAULT_PING", async () => {
+		const { socket, session, clock } = await open({}, { ...READY, liveness: { version: 1, idleMs: 60000, timeoutMs: 15000, keepalive: true } });
+		const events = collect(session);
+		const keepalives = () => socket.sentControls().filter((c) => c["type"] === "VAULT_KEEPALIVE").length;
+		for (let i = 1; i <= KEEPALIVE_PING_EVERY - 1; i++) {
+			clock.advance(60_000);
+			assert.equal(keepalives(), i);
+			assert.equal(pings(socket).length, 0);
+			socket.control({ type: "VAULT_ALIVE" }); // what the relay's runtime auto-response sends
+			clock.advance(14_000);
+		}
+		assert.deepEqual(events, [], "alive answers are not events; the session stays open");
+		clock.advance(60_000);
+		assert.equal(pings(socket).length, 1, "the 10th idle probe checks the head");
+		assert.equal(keepalives(), KEEPALIVE_PING_EVERY - 1);
+		socket.control({ type: "VAULT_PONG", probeId: String(pings(socket)[0]!["probeId"]), head: 7 });
+		assert.deepEqual(events, [{ t: "head", headSeq: 7 }]);
+		clock.advance(60_000);
+		assert.equal(keepalives(), KEEPALIVE_PING_EVERY, "keepalives again");
+		clock.advance(15_000); // no answer
+		assert.deepEqual(events.at(-1), { t: "closed", code: LIVENESS_CLOSE_CODE, errorCode: "liveness_timeout", wasClean: false });
 	});
 
 	it("ping() resolves on its own pong with the head; another probe's pong does not; a close rejects it", async () => {

@@ -45,10 +45,9 @@ import { createWebCryptoSuite1, type Suite1Crypto } from "../adapters/webCryptoS
 import { createWebHash } from "../adapters/webHash";
 import { sealCheckpoint, sealFrame } from "../ingest/envelope";
 import { gate, type GateCtx } from "../ingest/gate";
-import type { Repo } from "../store/repo";
 import type { TailRecord } from "../store/schema";
 import { CfgRuntime } from "../sync/cfgRuntime";
-import { LOCAL_FLAG_STALE_EPOCH } from "../sync/foldRuntime";
+import { LOCAL_FLAG_STALE_EPOCH, type FoldRepo } from "../sync/foldRuntime";
 import { gateRow } from "../sync/ingestRow";
 import { NsRuntime } from "../sync/nsRuntime";
 import { K, VAULT, device, genesis, revoke } from "./testkit/world";
@@ -88,14 +87,14 @@ const reasonOf = (e: NsFoldEvent | CfgFoldEvent): string | null => {
 };
 const FRAME_LEVEL = new Set(["duplicate-frame", "replay-stale", "replay-duplicate", "stale-epoch", "rules-version"]);
 
-function repoOf(stream: StreamName, rows: readonly TailRecord[]): Repo {
+function repoOf(stream: StreamName, rows: readonly TailRecord[]): FoldRepo {
 	const appliedSeq = rows.length > 0 ? rows[rows.length - 1]!.seq : 0;
 	return {
-		stream: (s: StreamName) => (s === stream ? { stream, appliedSeq } : undefined),
+		stream: (s: StreamName) => (s === stream ? { appliedSeq } : undefined),
 		getSnapshot: async () => undefined,
 		getTail: async (s: StreamName, after: Seq = 0, through: Seq = Number.MAX_SAFE_INTEGER) =>
 			s === stream ? rows.filter((r) => r.seq > after && r.seq <= through) : [],
-	} as unknown as Repo;
+	};
 }
 async function fold(stream: StreamName, rows: readonly TailRecord[]): Promise<{ readonly rt: NsRuntime | CfgRuntime; readonly events: Map<Seq, readonly (NsFoldEvent | CfgFoldEvent)[]> }> {
 	const rt = stream === NS_STREAM ? new NsRuntime(repoOf(stream, rows), READER) : new CfgRuntime(repoOf(stream, rows), READER);

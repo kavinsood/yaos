@@ -31,6 +31,8 @@ export class HostLink {
 	private nextRid = 1;
 	private readonly pending = new Map<number, { resolve(v: MainResultValue): void; reject(e: Error): void }>();
 	private closed = false;
+	/** The last status snapshot posted (JSON), to drop identical re-posts. */
+	private lastStatus: string | null = null;
 	/** Mirror bytes the host read before init (DESIGN §e.4), served once instead of a round trip. */
 	private readonly seeded = new Map<SideFileName, Uint8Array | null>();
 
@@ -40,6 +42,12 @@ export class HostLink {
 	post(message: EngineToMain): void {
 		try {
 			if (this.closed) return;
+			if (message.t === "status") {
+				// Only a changed snapshot crosses to main: an idle engine re-posts the same one on every maintenance tick.
+				const json = JSON.stringify(message.status);
+				if (json === this.lastStatus) return;
+				this.lastStatus = json;
+			}
 			try {
 				postOwned(this.transport, message);
 			} catch (e) {

@@ -4,8 +4,13 @@
  * - One carrier per host, from `createCarrier`: the Blob-URL worker in the
  *   plugin (plugin.ts), an in-process pair in tests and harnesses. Startup:
  *   ping (pong within STARTUP_PING_TIMEOUT_MS), then init.
- * - Liveness: ping every PING_INTERVAL_MS; no pong within PING_TIMEOUT_MS =>
- *   the engine is dead.
+ * - Liveness: ping after PING_INTERVAL_MS without any message from the engine
+ *   (every message counts as a pong). While idle (pongs only, nothing sent by
+ *   main) the interval doubles up to PING_IDLE_MAX_MS; anything main sends
+ *   brings it back. A ping with no pong within PING_TIMEOUT_MS is followed at
+ *   once by another; PING_MISSES_FATAL misses in a row => the engine is dead. One miss is not enough: after the app was
+ *   frozen (backgrounded) the overdue timeout can fire before the engine has
+ *   run, and the next ping is answered at once.
  * - Every carrier failure is terminal (§g.4): the carrier cannot be built,
  *   misses the startup pong, errors or its transport fails, misses a liveness
  *   pong, or init fails (storage-lost included); so is a protocol-version
@@ -22,7 +27,7 @@ import type { ProtocolError } from "../protocol/errors";
 import type { EngineInitConfig, EngineResultValue, EngineToMain, MainResultValue, MainToEngine } from "../protocol/messages";
 import { PROTOCOL_VERSION } from "../protocol/messages";
 import type { HostTransport } from "../protocol/transport";
-import { PING_INTERVAL_MS, PING_TIMEOUT_MS } from "../protocol/transport";
+import { PING_IDLE_MAX_MS, PING_INTERVAL_MS, PING_MISSES_FATAL, PING_TIMEOUT_MS } from "../protocol/transport";
 import { transferablesOf, TransferOwnershipError, wipeSecrets } from "../protocol/workerTransport";
 
 export const STARTUP_PING_TIMEOUT_MS = 5_000;
@@ -86,6 +91,12 @@ interface Live {
 	ready: boolean;
 	offs: (() => void)[];
 	pingTimer: TimerHandle | null;
+	/** Liveness pings in a row with no pong. */
+	pingMisses: number;
+	/** Pings answered in a row with no other traffic (the idle backoff); 0 after activity. */
+	pingIdle: number;
+	/** Monotonic time of the last message from the engine. */
+	lastRx: number;
 }
 
 function protocolError(code: ProtocolError["code"], message: string, retryable = true): ProtocolError {
@@ -202,7 +213,7 @@ export class EngineHost {
 	}
 
 	private attach(carrier: EngineCarrier): Live {
-		const live: Live = { carrier, pending: new Map(), nextRid: 1, ready: false, offs: [], pingTimer: null };
+		const live: Live = { carrier, pending: new Map(), nextRid: 1, ready: false, offs: [], pingTimer: null, pingMisses: 0, pingIdle: 0, lastRx: this.deps.clock.monotonic() };
 		this.live = live;
 		live.offs.push(carrier.transport.onMessage((m) => this.onMessage(live, m)));
 		live.offs.push(carrier.transport.onFailure((reason) => this.onCarrierFailure(live, `the sync engine failed: ${reason}`)));
@@ -239,6 +250,7 @@ export class EngineHost {
 				transfer = undefined; // structured clone copies
 			}
 			live.carrier.transport.post(message, transfer);
+			if (message.t !== "ping") this.pingActive(live);
 		} finally {
 			// Both carriers clone at post time: a copied SECRET buffer is zero-filled here, so main keeps no key
 			// bytes after handing them to the engine (e2ee-design §6.3).
@@ -274,20 +286,36 @@ export class EngineHost {
 		return true;
 	}
 
-	private schedulePing(live: Live): void {
+	/** Main is using the engine: liveness back to PING_INTERVAL_MS (re-armed when a longer idle wait is pending). */
+	private pingActive(live: Live): void {
+		if (live.pingIdle === 0) return;
+		live.pingIdle = 0;
+		if (live.pingTimer === null) return; // a ping is in flight: its answer re-arms with the base interval
+		this.deps.clock.clearTimer(live.pingTimer);
+		live.pingTimer = null;
+		this.schedulePing(live);
+	}
+
+	private schedulePing(live: Live, delayMs = Math.min(PING_INTERVAL_MS * 2 ** Math.min(live.pingIdle, 10), PING_IDLE_MAX_MS)): void {
 		if (!this.deps.pingEnabled) return;
-		live.pingTimer = this.deps.clock.setTimer(PING_INTERVAL_MS, () => {
+		live.pingTimer = this.deps.clock.setTimer(delayMs, () => {
 			live.pingTimer = null;
 			if (this.live !== live || this.down) return;
+			// The engine spoke recently: that was its pong.
+			const quiet = this.deps.clock.monotonic() - live.lastRx;
+			if (live.pingMisses === 0 && quiet < PING_INTERVAL_MS) return this.schedulePing(live, PING_INTERVAL_MS - quiet);
 			this.requestOn(live, { t: "ping" }, PING_TIMEOUT_MS).then(
 				() => {
+					live.pingMisses = 0;
+					live.pingIdle++;
 					if (this.live === live) this.schedulePing(live);
 				},
 				(error: unknown) => {
 					if (this.live !== live || this.down) return;
 					const code = error instanceof HostRequestError ? error.error.code : "internal";
-					if (code === "timeout") this.onCarrierFailure(live, `the sync engine stopped answering (no pong within ${PING_TIMEOUT_MS / 1000} s)`);
-					else this.schedulePing(live);
+					if (code !== "timeout") return this.schedulePing(live);
+					if (++live.pingMisses < PING_MISSES_FATAL) return this.schedulePing(live, 0);
+					this.onCarrierFailure(live, `the sync engine stopped answering (no pong to ${PING_MISSES_FATAL} pings, ${PING_TIMEOUT_MS / 1000} s each)`);
 				},
 			);
 		});
@@ -310,6 +338,7 @@ export class EngineHost {
 
 	private onMessage(live: Live, m: EngineToMain): void {
 		if (this.live !== live) return; // torn down
+		live.lastRx = this.deps.clock.monotonic();
 		switch (m.t) {
 			case "result":
 			case "error": {
