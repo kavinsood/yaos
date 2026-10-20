@@ -675,6 +675,24 @@ test("E2: collision suffix -> loser diskRename before the winner materializes", 
 	assert.deepEqual(p.ops[1], { op: "diskMaterialize", docId: "d1", path: "Notes/a.md", expect: { t: "absent" } });
 });
 
+test("E2: the loser's move pinned by its own pending ns op -> the winner waits for the path (no doomed materialize)", () => {
+	// Sim real skip deferral seed 20: the loser rename was this device's own op, not folded yet, so the loser's file
+	// stayed at the path. The winner's materialize (expect absent) failed against it every pass, each failure threw
+	// the downloaded bytes away, and both blobs were re-downloaded and re-planned at once, forever.
+	const blob = (hash: string, rev: number) => ({ kind: "blob" as const, blob: { hash: h(hash), size: 3, rev }, body: null });
+	const sc = {
+		remote: [R("d1", "att/b.png", blob("w", 67)), R("d2", "att/b (2).png", { ...blob("n", 50), pendingLocal: true })],
+		synced: [S("d2", "att/b.png", { kind: "blob", contentHash: h("o"), bodyVersion: null, blobRev: 26 })],
+		local: [L("att/b.png", h("o"), { kind: "blob" })],
+	};
+	const p = run(sc);
+	assert.ok(!opsOf(p).includes("diskMaterialize"), JSON.stringify(p.ops));
+	assert.deepEqual(p.ops, [{ op: "fetchBlob", docId: "d2", path: "att/b.png", hash: h("n"), size: 3 }]);
+	// Folded: the loser moves away, and the winner materializes behind it in the same plan.
+	const folded = run({ ...sc, remote: [sc.remote[0]!, { ...sc.remote[1]!, pendingLocal: false }] });
+	assert.deepEqual(opsOf(folded).slice(0, 2), ["diskRename", "diskMaterialize"]);
+});
+
 test("E4: ancestor is a file -> rename out of the folder, then materialize the blob at the folder path", () => {
 	const p = run({
 		remote: [R("d5", "Projects", { kind: "blob", blob: { hash: h("p"), size: 3, rev: 9 }, body: null }), R("d6", "Projects (2)/plan.md")],

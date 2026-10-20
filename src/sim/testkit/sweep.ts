@@ -2,7 +2,8 @@
  * The sim's seed matrices (DESIGN §l) over the composed engine and SimRelay, shared by sweeps.sim.test.ts (every
  * seed, `npm run test:sim`) and smoke.test.ts (the first seeds of each, `npm run test:client`). Seeds:
  * YAOS_SIM_SEEDS (default 200, the CI count). A failure prints the seed, its violations and a ddmin-minimized plan
- * to replay with runSim(cfg, plan).
+ * to replay with runSim(cfg, plan); a seed whose run throws (a livelock past the clock's step cap) is reported by seed
+ * and error after the rest of the sweep ran (not minimized: each such run burns the whole step cap).
  */
 import assert from "node:assert/strict";
 import { minimizePlan, runSim, type SimConfig, type SimReport } from "../run";
@@ -20,12 +21,28 @@ export type Hits = (name: string, stats: readonly SimReport["stats"][]) => void;
 export async function sweep(name: string, base: Omit<SimConfig, "seed">, seeds: number, first = 1, hits?: Hits): Promise<void> {
 	const failed: SimReport[] = [];
 	const stats: SimReport["stats"][] = [];
+	/** Seeds whose run threw (a livelock past the clock's step cap, a sim crash): no report, so no plan to minimize. */
+	const thrown: { seed: number; error: string }[] = [];
 	let tokens = 0;
 	for (let seed = first; seed < first + seeds; seed++) {
-		const r = await runSim({ ...base, seed });
+		let r: SimReport;
+		try {
+			r = await runSim({ ...base, seed });
+		} catch (e) {
+			thrown.push({ seed, error: e instanceof Error ? (e.stack ?? e.message) : String(e) });
+			continue;
+		}
 		tokens += r.stats.tokens.live;
 		stats.push(r.stats);
 		if (r.violations.length > 0) failed.push(r);
+	}
+	if (thrown.length > 0) {
+		const t0 = thrown[0]!;
+		const more = failed.length > 0 ? `\n(and ${failed.length} seed(s) with violations: ${failed.map((r) => r.seed).join(",")})` : "";
+		assert.fail(
+			`${name}: ${thrown.length}/${seeds} seeds threw: ${thrown.map((t) => t.seed).join(",")}${more}\n` +
+				`seed ${t0.seed} (replay: runSim({ ...base, seed: ${t0.seed} })):\n  ${t0.error.split("\n").slice(0, 8).join("\n  ")}`,
+		);
 	}
 	if (failed.length === 0) {
 		assert.ok(tokens > seeds * 10, `${name}: the actors did real work (${tokens} live tokens)`);

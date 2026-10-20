@@ -63,6 +63,25 @@ export function realMacrotaskCallback(): (fn: () => void) => void {
 
 export const DEFAULT_WALL_START_MS = Date.UTC(2026, 0, 1);
 
+const f64 = new Float64Array(1);
+const u64 = new BigUint64Array(f64.buffer);
+
+/**
+ * When a timer set at `mono` for `d` ms fires. `mono + d` absorbs a delay below half an ulp of `mono` (3.6e-12 ms
+ * at 40 s): the timer fired with no time elapsed, and a caller re-arming for "the rest" (`interval - elapsed`)
+ * re-armed at the same instant forever (engineHost's ping, sim random tuning seed 238). A positive delay moves time
+ * by at least one ulp; a real host's timer never fires before its delay. Only absorbed delays change: every other
+ * timer keeps `mono + d`, so seeds replay as before.
+ */
+export function dueAt(mono: number, d: number): number {
+	const at = mono + d;
+	if (d <= 0 || at > mono) return at;
+	// Non-negative finite doubles order as their bit patterns: the next one up is the pattern plus one.
+	f64[0] = mono;
+	u64[0] = (u64[0] as bigint) + 1n;
+	return f64[0];
+}
+
 export class VirtualClock implements ClockPort {
 	private mono = 0;
 	private readonly wallBase: number;
@@ -102,7 +121,7 @@ export class VirtualClock implements ClockPort {
 	setTimer(delayMs: number, fn: () => void, label = "timer"): TimerHandle {
 		const id = this.nextId++;
 		const d = Number.isFinite(delayMs) ? Math.max(0, delayMs) : 0;
-		const t: Timer = { id, at: this.mono + d, seq: this.seq++, fn, label };
+		const t: Timer = { id, at: dueAt(this.mono, d), seq: this.seq++, fn, label };
 		this.timers.set(id, t);
 		this.push(t);
 		return id;

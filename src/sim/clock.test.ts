@@ -105,3 +105,30 @@ test("clock: heap stays consistent under heavy set/clear churn (randomized)", as
 	await c.runUntilIdle();
 	assert.deepEqual(fired, expected.map((t) => t.seq));
 });
+
+test("clock: a positive delay below half an ulp of monotonic still moves time (no re-arm spin at one instant)", async () => {
+	// Sim random tuning seed 238: engineHost's ping re-armed for `interval - quiet` = 3.6e-12 ms at t = 39774.76 ms;
+	// mono + d rounded back to mono, the timer fired with no time elapsed and re-armed for the same rest, forever.
+	const c = new VirtualClock();
+	await c.advance(39774.76213320243);
+	const start = c.monotonic();
+	const rest = 3.637978807091713e-12;
+	assert.equal(start + rest, start, "the delay is absorbed by mono + d");
+	let arms = 0;
+	// Re-arm for whatever is left of `rest` since start, as a "rest of the interval" timer does.
+	const arm = (): void => {
+		arms++;
+		const elapsed = c.monotonic() - start;
+		if (elapsed < rest) c.setTimer(rest - elapsed, arm);
+	};
+	arm();
+	await c.advance(1, 1_000);
+	assert.equal(arms, 2);
+	assert.ok(c.monotonic() > start);
+	// Exact delays are untouched.
+	const d = new VirtualClock();
+	let at = -1;
+	d.setTimer(0.1, () => (at = d.monotonic()));
+	await d.runUntilIdle();
+	assert.equal(at, 0.1);
+});

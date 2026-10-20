@@ -726,6 +726,10 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		livePresent(s, r, l, found.atRemote, prefix);
 	};
 
+	/** A file is at `key` and no diskRename planned so far (every synced doc is planned before remote-only ones) moves it away. */
+	const occupiedThroughPlan = (key: PathKey): boolean =>
+		input.local.has(key) && !units.some((u) => u.ops.some((o) => o.op === "diskRename" && pk(o.from) === key));
+
 	const planRemoteOnly = (r: RemoteEntry): void => {
 		const docId = r.docId;
 		const key = r.pathKey;
@@ -735,6 +739,11 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		if (r.body?.frozen) return push([waitOp(docId, "frozen")]);
 		// The file at the path is a renamed doc's (observed rename above): materialize once it has moved away.
 		if (observedOnto.has(key)) return;
+		// Another doc's file holds the path and no rename this plan moves it away (renames run before materializes,
+		// trashes after): a materialize could only fail its absent precondition, and the failed write throws its
+		// downloaded bytes away. Materialize once the path is free (sim real skip deferral seed 20: the occupant's
+		// move was pinned by its own pending ns op, and the materialize re-downloaded both blobs in a hot loop).
+		if (!l && blocked && occupiedThroughPlan(key)) return;
 		if (!l) {
 			// Live only through an own op not yet folded (a restore with no synced record here): its path is the
 			// overlay's guess, and S1 puts S on the requested path at fold. Materialize the committed placement.
