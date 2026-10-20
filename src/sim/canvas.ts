@@ -30,7 +30,7 @@
 
 import { canonicalJson, type JsonValue } from "../core/hash/canvasCanonical";
 import { projectCanvasBytes } from "../engine/reconcile/canvasDoc";
-import type { VaultPath } from "../core/types";
+import type { DocId, VaultPath } from "../core/types";
 import { pathKey } from "../core/paths/pathKey";
 import { safePosition, tokenSpans, tokensIn, type TokenLedger, type Writer } from "./actors";
 import type { VirtualClock } from "./clock";
@@ -755,6 +755,17 @@ export class CanvasWorld {
 				for (const k of Object.keys(m.root)) this.oracle.discarded.add(`root|${k}|${key(m.root[k]!)}`);
 			}
 		} else {
+			// A record this device deleted on disk while it was behind on the canvas's stream (skipped rows not read
+			// yet) is not in its CRDT: the merge waits for the read (DESIGN I4, §f.3). Deleting the file before the read
+			// deletes what the engine holds; an unseen edit then restores that, the record with it (3 devices seed 21:
+			// A deleted an edge, then the canvas, while its reads failed). The record delete goes with the file.
+			const doc = docIdOf(d, path);
+			const body = doc === null ? null : d.vrt?.port.view().remote.get(doc as DocId)?.body ?? null;
+			const held = body?.caughtUp === false ? readModel(engineCanvasText(d, path) ?? "") : null;
+			for (const o of held ? [...held.nodes.map((n) => `n:${n.id as string}`), ...held.edges.map((e) => `e:${e.id as string}`)] : []) {
+				const r = this.oracle.record(o);
+				if (r?.deleted?.how === "record" && r.deleted.dev === d.name && r.deleted.doc === doc) r.deleted = { ...r.deleted, how: "file" };
+			}
 			for (const text of seen) {
 				const m = readModel(text);
 				for (const n of m?.nodes ?? []) this.oracle.deleted(`n:${n.id as string}`, { dev: d.name, step, atMs, how: "file", saw: this.fieldsOf(n), doc: docIdOf(d, path) });
