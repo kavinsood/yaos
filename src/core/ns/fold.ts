@@ -220,8 +220,8 @@ function foldOp(ctx: Ctx, op: NsOp): { docId: DocId | null; outcome: NsOpOutcome
 	}
 }
 
-/** §c.9. Returns the pruned docIds in removal order. */
-function prune(state: NsFoldState, index: NsFoldIndex, rules: NsFoldRules): DocId[] {
+/** §c.9. Returns the pruned entries (as they were) in removal order. */
+function prune(state: NsFoldState, index: NsFoldIndex, rules: NsFoldRules): NsEntry[] {
 	if (index.tombstones <= rules.tombstoneCap) return [];
 	const goal = rules.tombstoneCap - rules.pruneHysteresis;
 	const dead: NsEntry[] = [];
@@ -238,11 +238,11 @@ function prune(state: NsFoldState, index: NsFoldIndex, rules: NsFoldRules): DocI
 		}
 	}
 	dead.sort((a, b) => a.lastTouchSeq - b.lastTouchSeq || (a.docId < b.docId ? -1 : a.docId > b.docId ? 1 : 0));
-	const removed: DocId[] = [];
+	const removed: NsEntry[] = [];
 	const drop = (id: DocId) => {
+		removed.push(state.entries.get(id)!);
 		state.entries.delete(id);
 		index.tombstones--;
-		removed.push(id);
 	};
 	for (const e of dead) {
 		if (index.tombstones <= goal) break;
@@ -295,7 +295,7 @@ export function foldNsFrameWith(rules: NsFoldRules, state: NsFoldState, index: N
 	}
 	// §c.3.4 prune.
 	const pruned = prune(state, index, rules);
-	if (pruned.length > 0) events.push(ev(-1, null, { kind: "pruned", docIds: pruned }));
+	if (pruned.length > 0) events.push(ev(-1, null, { kind: "pruned", docIds: pruned.map((e) => e.docId), entries: pruned }));
 	state.coversSeq = frame.seq;
 	return events;
 }

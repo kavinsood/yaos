@@ -327,6 +327,21 @@ test("E11b prune removes aliases of a deleted entry first", () => {
 	assert.deepEqual(prunedIds(ev2.find((e) => e.outcome.kind === "pruned")), [d2, d5, d6]);
 });
 
+test("E11c the pruned event carries each removed entry as it was (the delete's base for the restore duty, §c.9)", () => {
+	// Goal 0: the delete is pruned in the frame that made it, before any restore can commit.
+	const w = world({ ...DEFAULT_NS_FOLD_RULES, tombstoneCap: 0, pruneHysteresis: 0 });
+	w.fold(1, A, 0, [create(d1, "a.md", H(1)), create(d2, "b.md", H(2))]);
+	w.fold(2, B, 0, [create(d3, "a.md", H(1))]); // alias of d1, pruned at once
+	assert.equal(w.state.entries.has(d3), false);
+	const ev = w.fold(3, C, 2, [del(d1, 17), del(d2, 4)]);
+	const p = ev.find((e) => e.outcome.kind === "pruned")!;
+	assert.ok(p.outcome.kind === "pruned");
+	assert.deepEqual(p.outcome.docIds, [d1, d2]);
+	assert.deepEqual(p.outcome.entries.map((e) => e.docId), p.outcome.docIds);
+	assert.deepEqual(p.outcome.entries.map((e) => [e.state, e.deletedSeq, e.deleteBaseBodySeq, e.path]), [["deleted", 3, 17, "a.md"], ["deleted", 3, 4, "b.md"]]);
+	assert.equal(w.state.entries.size, 0);
+});
+
 test("E12 upgradeRules halt: frame folds whole or not at all", () => {
 	const w = world();
 	w.fold(9099, A, 0, [create(d1, "a.md")]);

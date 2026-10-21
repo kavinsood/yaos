@@ -20,7 +20,7 @@ test("foldEffects: a bound doc the fold pruned is retargeted by path (into null)
 	const bound = new Set([d("p"), d("m"), d("pending")]);
 	const fx = foldEffects({
 		frames: [frame([
-			{ index: -1, docId: null, outcome: { kind: "pruned", docIds: [d("p"), d("q")] } },
+			{ index: -1, docId: null, outcome: { kind: "pruned", docIds: [d("p"), d("q")], entries: [] } },
 			{ index: -1, docId: d("m"), outcome: { kind: "merged", into: d("w") } },
 			// a bound doc with no entry that no prune named (an own create not folded yet) stays bound
 			{ index: -1, docId: d("pending"), outcome: { kind: "ignored", reason: "duplicate-frame" } },

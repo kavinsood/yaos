@@ -278,7 +278,11 @@ export type NsOpOutcome =
 	| { readonly kind: "merged"; readonly into: DocId }
 	| { readonly kind: "revived"; readonly finalPath: VaultPath }
 	| { readonly kind: "deleted" }
-	| { readonly kind: "pruned"; readonly docIds: readonly DocId[] }
+	/**
+	 * §c.9. `entries[i]` is the entry `docIds[i]` had when it was removed: a device that folds the prune keeps a
+	 * deleted entry's `deleteBaseBodySeq` for its restore duty (§c.7, "Pruned docs").
+	 */
+	| { readonly kind: "pruned"; readonly docIds: readonly DocId[]; readonly entries: readonly NsEntry[] }
 	| { readonly kind: "ignored"; readonly reason: NsIgnoreReason };
 
 /** One event per op (plus prune events). Used by planners to detect "I lost" and by diagnostics. */
