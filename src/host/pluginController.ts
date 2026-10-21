@@ -93,6 +93,11 @@ function safeMessage(e: unknown): string {
 	return e instanceof Error ? e.message : typeof e === "string" ? e : "unknown error";
 }
 
+/** The same pairing grant of the same vault and relay, whatever its secret (identity-per-store §3.4 rotation). */
+function sameGrant(a: PairedIdentity, b: PairedIdentity): boolean {
+	return a.host === b.host && a.vaultId === b.vaultId && a.grantId === b.grantId;
+}
+
 /** Same vault on the same relay: the pin and the stored keys still apply. */
 function sameVault(a: PairedIdentity | null, b: PairedIdentity | null): boolean {
 	return a !== null && b !== null && a.host === b.host && a.vaultId === b.vaultId;
@@ -254,6 +259,13 @@ export class YaosController {
 				if (fresh) void this.cloneNotice(deviceId);
 				fresh = false;
 				this.changed();
+			},
+			// §3.4: the grant was rotated and the engine holds the new secret; data.json follows, without a restart.
+			onGrantSecret: (grantSecret) => {
+				const cur = this.current.identity;
+				if (this.runtime !== rt || !cur || !sameGrant(cur, identity) || cur.grantSecret === grantSecret) return;
+				void this.persist({ ...this.current, identity: { ...cur, grantSecret } })
+					.then(() => this.changed(), (e: unknown) => this.env.log?.(`saving the rotated pairing secret failed: ${safeMessage(e)}`));
 			},
 		};
 		const install = loadInstallRecord(this.installStorage, identity.vaultId, this.env.randomBytes ?? defaultRandomBytes);

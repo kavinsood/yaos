@@ -36,6 +36,11 @@ export interface HostUiSink {
 	 * restart). Main records it as the install's lineage `current` (installRecord.ts). SECRET: retireKey.
 	 */
 	onStoreIdentity?(deviceId: string, retireKey: string): void;
+	/**
+	 * identity-per-store §3.4: the pairing secret was rotated on the server and the engine fetched the new one with its
+	 * store's token. Main rewrites data.json's grant (no restart: the engine uses it already). SECRET.
+	 */
+	onGrantSecret?(grantSecret: string): void;
 }
 
 export interface HostRuntimeDeps {
@@ -265,6 +270,9 @@ export class HostRuntime {
 				return;
 			case "storeIdentity":
 				this.deps.ui.onStoreIdentity?.(m.deviceId, m.retireKey);
+				return;
+			case "grantSecret":
+				this.deps.ui.onGrantSecret?.(m.grantSecret);
 				return;
 			case "brake":
 				this.deps.ui.onBrake(m.report);

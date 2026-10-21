@@ -21,7 +21,7 @@
 import type { ClockPort } from "../../ports/clock";
 import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectResult, RelayRow } from "../../ports/relay";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
-import type { DeviceState, RegisterOutcome, RetireOutcome } from "../../ports/identity";
+import type { DeviceState, GrantFetchOutcome, RegisterOutcome, RetireOutcome } from "../../ports/identity";
 import { bounded as boundedCall, relayHttpDeadlineMs, RELAY_HTTP_BASE_MS, RELAY_HTTP_IDLE_MS, RELAY_REPLY_BYTES, untilAborted, watched } from "../../core/deadline";
 import { decodeReadReply, type WireReadPage } from "./relayFrames";
 import { createWebClock } from "./webClock";
@@ -77,6 +77,11 @@ export interface RelayHttp {
 	 * abandoned-creator rule, DESIGN §i.5). null: no usable answer. Never throws.
 	 */
 	deviceStatus(vaultId: string, deviceIds: readonly string[]): Promise<ReadonlyMap<string, DeviceState> | null>;
+	/**
+	 * `GET /vault/:id/auth/grant` with this device's bearer (identity-per-store §3.4): the pairing grant's secret after a
+	 * rotation. Never throws; bounded at the small-reply deadline.
+	 */
+	fetchGrant(vaultId: string): Promise<GrantFetchOutcome>;
 	/** POST /vault/:id/auth/ticket {purpose:"streams"}. Never throws; "unavailable" once `signal` aborts (connect's deadline). */
 	ticket(vaultId: string, signal?: AbortSignal): Promise<TicketResult>;
 	feed(vaultId: string, afterSeq: number, limit: number | null, signal?: AbortSignal): Promise<FeedPage>;
@@ -321,6 +326,11 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			return deviceStatusOf(reply);
 		},
 
+		async fetchGrant(vaultId) {
+			const reply = await bounded("auth/grant", RELAY_REPLY_BYTES, undefined, (s) => call(vaultPath(vaultId, "/auth/grant"), { method: "GET" }, s)).catch(() => null);
+			return grantFetchOutcome(reply);
+		},
+
 		async ticket(vaultId, signal) {
 			const reply = await call(vaultPath(vaultId, "/auth/ticket"), {
 				method: "POST",
@@ -438,6 +448,19 @@ export function retireOutcome(reply: { readonly status: number; readonly body: J
 	if (reply.status === 429 || reply.status === 503) return { ok: false, reason: "rate-limited" };
 	return { ok: false, reason: "network" };
 }
+
+/** A grant fetch reply (`{grantId, grantName, grantSecret}`) as the engine reads it; null = no reply. */
+export function grantFetchOutcome(reply: { readonly status: number; readonly body: Json | null } | null): GrantFetchOutcome {
+	if (reply === null) return { ok: false, reason: "network" };
+	const secret = reply.body?.["grantSecret"];
+	if (reply.status === 200) return typeof secret === "string" && GRANT_SECRET_SHAPE.test(secret) ? { ok: true, grantSecret: secret } : { ok: false, reason: "network" };
+	if (reply.status === 404) return { ok: false, reason: "unavailable" };
+	if (reply.status === 401 || reply.status === 403) return { ok: false, reason: "refused" };
+	return { ok: false, reason: "network" };
+}
+
+/** A grant secret's shape (server pairing.ts GRANT_SECRET_PATTERN): base64url, 43 to 256 characters. */
+const GRANT_SECRET_SHAPE = /^[A-Za-z0-9_-]{43,256}$/;
 
 /** A device status reply (`{devices: [{deviceId, state}]}`); null for anything else. */
 export function deviceStatusOf(reply: { readonly status: number; readonly body: Json | null } | null): ReadonlyMap<string, DeviceState> | null {

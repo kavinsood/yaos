@@ -62,7 +62,8 @@ export function createWebEngine(transport: EngineTransport, o: WebEngineOptions 
 			// Suite-1 keys are zero-filled once imported (webCryptoSuite1.ts); the port outlives runtime restarts.
 			const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
 			const http = createRelayHttp({ baseUrl: config.relay.url, credential, clock });
-			const grantSecret = config.relay.grantSecret;
+			// SECRET: the install's pairing grant; a rotation's secret replaces it (useGrant, identity-per-store §3.4).
+			let grantSecret = config.relay.grantSecret;
 			const identity: IdentityPort = {
 				register: (body) => (grantSecret ? http.registerDevice(config.vaultId, grantSecret, body) : Promise.resolve({ ok: false, reason: "no-grant", retryAfterMs: null })),
 				use: (deviceToken) => {
@@ -70,6 +71,10 @@ export function createWebEngine(transport: EngineTransport, o: WebEngineOptions 
 				},
 				retire: (body) => http.retireDevice(config.vaultId, body),
 				status: async (ids) => (token ? ((await http.deviceStatus(config.vaultId, ids)) as ReadonlyMap<DeviceId, DeviceState> | null) : null),
+				fetchGrant: () => (token ? http.fetchGrant(config.vaultId) : Promise.resolve({ ok: false, reason: "no-store" })),
+				useGrant: (secret) => {
+					grantSecret = secret;
+				},
 			};
 			return { relay, storage, clock, random, crypto, hash, blob, probeBlob: () => probeHttpBlob(blobOpts), identity };
 		},

@@ -22,9 +22,9 @@ import { errorMessage } from "./format";
 import { plainInput, StatusLine } from "./modalParts";
 import { pairingLink, pairingLinkE2ee } from "./keyActions";
 import { copyText, obsidianRequest } from "./obsidianEnv";
-import { applyPairedIdentity, formatCountdown, PairingSession, setPendingEnrollment, withoutPendingEnrollment } from "./pairFlow";
+import { applyPairedIdentity, formatCountdown, PairingSession, requestPairingCodeRotating, setPendingEnrollment, withoutPendingEnrollment } from "./pairFlow";
 import {
-	normalizeHost, pairingCodeVaultId, requestPairingCode, leaveGrant, type LinkE2ee, type PairingCodeGrant, type RequestFn,
+	normalizeHost, pairingCodeVaultId, leaveGrant, type LinkE2ee, type PairingCodeGrant, type RequestFn,
 } from "./pairing";
 import { drawQr } from "./qr";
 
@@ -233,7 +233,7 @@ export class PairingCodeModal extends Modal {
 			return;
 		}
 		const loading = contentEl.createEl("p", { text: "Creating a pairing code…" });
-		requestPairingCode(identity, { request: this.request }).then(
+		requestPairingCodeRotating(this.host, { request: this.request }).then(
 			(grant) => {
 				if (this.closed) return;
 				loading.remove();

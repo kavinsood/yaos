@@ -52,6 +52,15 @@ export type RetireOutcome =
 	/** 401 (a wrong key, or a device without one), 429 / 503, or no answer: the fence did not happen. */
 	| { readonly ok: false; readonly reason: "unauthorized" | "rate-limited" | "network" };
 
+/** `GET /vault/:id/auth/grant` as the store's device (identity-per-store §3.4): the grant's current secret. */
+export type GrantFetchOutcome =
+	| { readonly ok: true; readonly grantSecret: string }
+	/**
+	 * no-store: no device token in use yet; unavailable: never rotated (`404`, the client's own secret is current);
+	 * refused: `401` / `403` (a retired store, a revoked pairing, an old enroll); network: no answer, 429 or 5xx.
+	 */
+	| { readonly ok: false; readonly reason: "no-store" | "unavailable" | "refused" | "network" };
+
 /** A device's state as the server knows it (`POST /auth/device/status`, the abandoned-creator rule). */
 export type DeviceState = "live" | "retired" | "unknown";
 
@@ -70,6 +79,13 @@ export interface IdentityPort {
 	 * live, retired (tombstoned) or does not know. null: no answer. Never throws. Absent: never known retired.
 	 */
 	status?(deviceIds: readonly DeviceId[]): Promise<ReadonlyMap<DeviceId, DeviceState> | null>;
+	/**
+	 * `GET /vault/:id/auth/grant` as this store's device (identity-per-store §3.4): the grant's secret after a rotation.
+	 * Never throws. Absent: no rotation support (a rotated grant then needs a re-pair).
+	 */
+	fetchGrant?(): Promise<GrantFetchOutcome>;
+	/** SECRET: from now on registration authenticates with this grant secret (a rotation's, fetched by fetchGrant). */
+	useGrant?(grantSecret: string): void;
 	/**
 	 * Sim and tests: the credentials of the next store (deterministic, readable ids). Absent: the engine draws them
 	 * from its RandomPort (identity-per-store §4: 16, 32 and 32 random bytes).

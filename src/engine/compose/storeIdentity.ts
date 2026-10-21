@@ -89,7 +89,8 @@ export async function readStoreIdentity(storage: StoragePort, name: string): Pro
 	}
 }
 
-async function readPending(storage: StoragePort, name: string): Promise<MetaPendingIdentity | null> {
+/** The pending identity a `yaos3-pending:` DB holds, or null (no such DB, or none in it). */
+export async function readPending(storage: StoragePort, name: string): Promise<MetaPendingIdentity | null> {
 	if (!(await storage.listDatabases()).includes(name)) return null;
 	const db = await storage.open<YS>(name, DB_SCHEMA_VERSION, STORE_SPECS);
 	try {
@@ -138,6 +139,12 @@ export interface ResolveDeps {
 	readonly vaultId: VaultId;
 	readonly installKey: string;
 	readonly log?: (line: string) => void;
+	/**
+	 * identity-per-store §3.4: the grant secret answered `401 unauthorized` (rotated on the server); fetch the current
+	 * one with the device token in use and switch to it. True: a new secret is in use (registration is tried again
+	 * once). Absent, or false: the refusal stands.
+	 */
+	readonly refreshGrant?: () => Promise<boolean>;
 }
 
 /** Mints before giving up on device_exists / device_retired answers in one start. */
@@ -184,6 +191,7 @@ export async function resolveStoreIdentity(d: ResolveDeps): Promise<ResolvedIden
 export async function registerPending(d: ResolveDeps): Promise<StoreCredentials> {
 	const name = pendingDbName(d.vaultId, d.installKey);
 	let pending = await readPending(d.storage, name);
+	let refreshed = false;
 	for (let mints = 0; ; ) {
 		if (!pending) {
 			if (mints >= MAX_MINTS) throw new IdentityRefused("device-exists", null);
@@ -200,6 +208,14 @@ export async function registerPending(d: ResolveDeps): Promise<StoreCredentials>
 			await writePending(d.storage, name, pending);
 			d.log?.("store identity registered");
 			break;
+		}
+		// A rotated grant secret (identity-per-store §3.4): a live store fetches the new one and registers with it.
+		if (r.reason === "unauthorized" && !refreshed && d.refreshGrant) {
+			refreshed = true;
+			if (await d.refreshGrant()) {
+				d.log?.("pairing secret rotated: registering with the new one");
+				continue;
+			}
 		}
 		if (r.reason !== "device-exists" && r.reason !== "device-retired") throw new IdentityRefused(r.reason, r.retryAfterMs);
 		d.log?.(`store identity refused (${r.reason}): minting another`);

@@ -473,3 +473,29 @@ test("clone notice (§8): nothing for old or own dirs, an install with lineage, 
 		assert.equal(w.localRec().cloneNoticeShown, undefined, name);
 	}
 });
+
+test("grant rotation: the engine's fetched secret is written to data.json without a restart; a stale runtime's or another grant's is ignored", async () => {
+	const { clock, dev, ctl, saved, sinks } = await started(PAIRED);
+	assert.equal(dev.engineStarts, 1);
+	const sink = sinks.at(-1)!;
+	const rotated = "R".repeat(43);
+	sink.onGrantSecret?.(rotated);
+	await clock.advance(100);
+	assert.equal(saved.at(-1)?.identity?.grantSecret, rotated);
+	assert.equal(ctl.data().identity?.grantSecret, rotated);
+	assert.equal(ctl.data().identity?.grantId, ID.grantId, "the same grant");
+	assert.equal(dev.engineStarts, 1, "no restart: the engine already uses it");
+	const writes = saved.length;
+	sink.onGrantSecret?.(rotated);
+	await clock.advance(100);
+	assert.equal(saved.length, writes, "the same secret again writes nothing");
+	// Re-paired to another grant: the old runtime's late secret must not land on the new pairing.
+	const repair = ctl.updateData((d) => ({ ...d, identity: { ...ID, grantId: "grant_BBBBBBBBBBBBBBBB", grantSecret: "B".repeat(43) } }));
+	await clock.advance(5_000);
+	await repair;
+	const after = saved.length;
+	sink.onGrantSecret?.("X".repeat(43));
+	await clock.advance(100);
+	assert.equal(saved.length, after);
+	assert.equal(ctl.data().identity?.grantSecret, "B".repeat(43));
+});

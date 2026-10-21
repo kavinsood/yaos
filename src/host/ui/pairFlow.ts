@@ -11,8 +11,8 @@
 
 import { sameIdentity, sanitizeDeviceLabel, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "./api";
 import {
-	attemptMatches, pairDevice, prepareEnrollment, PairingError, runEnrollment,
-	type EnrollInput, type EnrollmentAttempt, type PairingDeps,
+	attemptMatches, pairDevice, prepareEnrollment, PairingError, requestPairingCode, runEnrollment,
+	type EnrollInput, type EnrollmentAttempt, type PairingCodeGrant, type PairingDeps,
 } from "./pairing";
 
 export interface PairingSessionDeps extends PairingDeps {
@@ -132,4 +132,26 @@ export function formatCountdown(remainingMs: number): string {
 	const minutes = Math.floor(total / 60);
 	const seconds = total % 60;
 	return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+/**
+ * "Pair another device" with the install's grant (owner decision 3). A plain `401 unauthorized` may mean the pairing
+ * secret was rotated on the server (identity-per-store §3.4): the engine fetches the new one with its store's token
+ * (`refreshGrant`, which rewrites data.json first), and the request is tried once more with it. A revoked pairing,
+ * or no new secret, keeps the first error.
+ */
+export async function requestPairingCodeRotating(
+	host: Pick<YaosUiHost, "data" | "command">, deps: PairingDeps & { readonly nowMs?: () => number },
+): Promise<PairingCodeGrant> {
+	const identity = host.data().identity;
+	if (!identity) throw new PairingError("Pair this device first.", "unpaired");
+	try {
+		return await requestPairingCode(identity, deps);
+	} catch (err) {
+		if (!(err instanceof PairingError) || err.status !== 401 || err.code !== "unauthorized") throw err;
+		await host.command({ t: "refreshGrant" }).catch(() => undefined);
+		const fresh = host.data().identity;
+		if (!fresh || fresh.grantSecret === identity.grantSecret || fresh.grantId !== identity.grantId) throw err;
+		return await requestPairingCode(fresh, deps);
+	}
 }

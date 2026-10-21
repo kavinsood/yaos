@@ -231,7 +231,13 @@ export type UserCommand =
 	| { readonly t: "deleteSnapshot"; readonly snapshotId: string }
 	/** -> `diagnostics`. includePaths: the user opted in to file names (DiagnosticsBundle.paths). */
 	| { readonly t: "exportDiagnostics"; readonly includePaths: boolean }
+	/** -> `ok`. A store reset (identity-per-store §4): a new store under a new identity inherits the current one's unsent edits. */
 	| { readonly t: "rebuildLocalCache" }
+	/**
+	 * -> `ok`. Fetch the pairing grant's secret with the store's device token (identity-per-store §3.4, after a rotation);
+	 * a new one comes back as a `grantSecret` message first. Sent by main when a grant call answered 401.
+	 */
+	| { readonly t: "refreshGrant" }
 	| { readonly t: "updateSettings"; readonly settings: EngineSettings }
 	| { readonly t: "releaseQuarantine"; readonly stream: string }
 	// e2ee-design §18.4 (all SECRET payloads, transferred):
@@ -362,6 +368,11 @@ export type EngineToMain =
 	 * the lineage's `current`). SECRET (retireKey): main keeps it in local storage only, never logs it.
 	 */
 	| { readonly t: "storeIdentity"; readonly deviceId: DeviceId; readonly retireKey: string }
+	/**
+	 * identity-per-store §3.4: the pairing grant's secret was rotated on the server and the store fetched the new one
+	 * with its device token; main rewrites data.json's grant. SECRET: never logged.
+	 */
+	| { readonly t: "grantSecret"; readonly grantSecret: string }
 	| { readonly t: "brake"; readonly report: BrakeReport }
 	| { readonly t: "notice"; readonly level: "info" | "warn" | "error"; readonly code: string; readonly message: string };
 

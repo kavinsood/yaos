@@ -27,7 +27,7 @@ import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
 import { findKnownEpoch, storeDbs, storedKeyringRecords } from "./knownEpoch";
-import { deleteLegacyDbs, deleteStoreDbs, IdentityRefused, needsRepair, readStoreIdentity, registerPending, resolveStoreIdentity, type ResolvedIdentity } from "./storeIdentity";
+import { deleteLegacyDbs, deleteStoreDbs, IdentityRefused, needsRepair, readStoreIdentity, registerPending, resolveStoreIdentity, type ResolveDeps, type ResolvedIdentity } from "./storeIdentity";
 import type { IdentityPort, RegisterRefusal, StoreCredentials } from "../../ports/identity";
 import { isStorageError } from "../../ports/storage";
 import type { VaultEvent } from "../../ports/vault";
@@ -143,6 +143,8 @@ export class ComposedEngine {
 	private readonly lineage: StoreCredentials[] = [];
 	/** The key reader is waiting for its identity (startReader). */
 	private readerStarting = false;
+	/** A runtime of this init swept the lineage's leftover dirs (claimLineageSweep). */
+	private lineageSwept = false;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
 	private migration: { bases: MetaPathBase[]; docDeletes: MetaDocDeletes[] } | null = null;
 	/**
@@ -358,7 +360,7 @@ export class ComposedEngine {
 		const config = this.config!;
 		const port = ports.identity;
 		if (!port) throw new IdentityRefused("no-grant", null);
-		const deps = { storage: ports.storage, random: ports.random, hash: ports.hash, identity: port, vaultId: config.vaultId, installKey: config.installKey, log: (l: string) => this.log(l) };
+		const deps = this.resolveDeps(port);
 		// A new epoch's store: a new identity, registered with the grant (§4 "vaultEpoch change"); the old epoch's
 		// store stays until the new one is live, which then retires it (runtimeOps.retireOldEpochs). Once that store
 		// exists (a start that created it failed later), it is found like any store.
@@ -397,6 +399,46 @@ export class ComposedEngine {
 		this.refused = null;
 		this.options.onIdentity?.(id.creds.deviceId, id.source);
 		return resolved;
+	}
+
+	private resolveDeps(port: IdentityPort): ResolveDeps {
+		const ports = this.ports!;
+		const config = this.config!;
+		return {
+			storage: ports.storage, random: ports.random, hash: ports.hash, identity: port, vaultId: config.vaultId, installKey: config.installKey,
+			log: (l: string) => this.log(l), refreshGrant: () => this.refreshGrant(),
+		};
+	}
+
+	/**
+	 * identity-per-store §3.4: the pairing secret was rotated on the server (a grant call answered 401). The store's
+	 * device token fetches the current one (`GET /auth/grant`); a new secret is used from now on and main rewrites
+	 * data.json with it (`grantSecret`). True when the secret changed. A retired store, a revoked pairing or a grant
+	 * never rotated changes nothing: the caller's refusal stands (re-pair, or the secret in hand is current).
+	 */
+	async refreshGrant(): Promise<boolean> {
+		const port = this.ports?.identity;
+		const config = this.config;
+		if (!port?.fetchGrant || !port.useGrant || !config || this.disposed) return false;
+		const r = await port.fetchGrant();
+		if (!r.ok) {
+			this.log(`pairing secret fetch: ${r.reason}`);
+			return false;
+		}
+		if (r.grantSecret === this.config?.relay.grantSecret || this.disposed) return false;
+		port.useGrant(r.grantSecret);
+		const current = this.config ?? config;
+		this.config = { ...current, relay: { ...current.relay, grantSecret: r.grantSecret } };
+		this.link.post({ t: "grantSecret", grantSecret: r.grantSecret });
+		this.log("pairing secret rotated on the server: fetched the new one");
+		return true;
+	}
+
+	/** The once-per-init sweep of lineage dirs a crash left behind (VaultRuntime.dropLineageDirs): true the first time. */
+	claimLineageSweep(): boolean {
+		if (this.lineageSwept) return false;
+		this.lineageSwept = true;
+		return true;
 	}
 
 	/**
@@ -727,9 +769,12 @@ export class ComposedEngine {
 			}
 			case "rebuildLocalCache": {
 				if (!rt) return { t: "ok" };
-				await this.restart("rebuild", async () => undefined);
+				await this.resetStore();
 				return { t: "ok" };
 			}
+			case "refreshGrant":
+				await this.refreshGrant();
+				return { t: "ok" };
 			case "createSnapshot":
 			case "listSnapshots":
 			case "snapshotFiles":
@@ -791,14 +836,11 @@ export class ComposedEngine {
 
 	private async replaceRevoked(): Promise<void> {
 		const ports = this.ports;
-		const config = this.config;
 		const port = ports?.identity;
-		if (!ports || !config || !port) return;
-		const old = this.identity?.creds.deviceId ?? null;
+		if (!ports || !this.config || !port) return;
 		this.log("store revoked by the server: registering a successor");
-		try {
-			await registerPending({ storage: ports.storage, random: ports.random, hash: ports.hash, identity: port, vaultId: config.vaultId, installKey: config.installKey, log: (l) => this.log(l) });
-		} catch (e) {
+		const e = await this.replaceStore("revoked", port);
+		if (e !== null) {
 			const refused = e instanceof IdentityRefused ? e : null;
 			this.log(`successor registration failed: ${refused ? refused.reason : String(e)}`);
 			if (refused && this.refused?.reason !== refused.reason) {
@@ -811,14 +853,55 @@ export class ComposedEngine {
 				this.replaceTimer = null;
 				if (this.rt?.status().phase === "revoked") this.onStoreRevoked();
 			});
-			return;
 		}
-		if (this.disposed || this.identity?.creds.deviceId !== old) return;
-		await this.restart("revoked", async () => {
+	}
+
+	/**
+	 * Replace the running store with a new one (identity-per-store §4: a revoked store, `rebuildLocalCache`): the
+	 * successor is registered with the grant first, so a refusal leaves the store as it was (returned, nothing else
+	 * done). Then the runtime stops (its outbox goes to its mirror), this install's stores are deleted and a new runtime
+	 * starts on the registered identity: it fences the old store by its retire key (§5.2 step 1, the old identity is in
+	 * this engine's lineage) and inherits its unsent edits from its mirror, as after any store loss.
+	 */
+	private async replaceStore(reason: "revoked" | "rebuild", port: IdentityPort): Promise<unknown> {
+		const ports = this.ports!;
+		const config = this.config!;
+		const old = this.identity?.creds.deviceId ?? null;
+		try {
+			await registerPending(this.resolveDeps(port));
+		} catch (e) {
+			return e;
+		}
+		if (this.disposed || this.identity?.creds.deviceId !== old) return null;
+		await this.restart(reason, async () => {
 			const n = await deleteStoreDbs(ports.storage, config.vaultId, config.installKey);
 			this.knownEpoch = undefined;
-			this.log(`revoked store replaced: ${n} store(s) deleted`);
+			this.log(`${reason === "revoked" ? "revoked" : "rebuilt"} store replaced: ${n} store(s) deleted`);
 		});
+		return null;
+	}
+
+	/**
+	 * `rebuildLocalCache` (identity-per-store §4): a store reset, not a restart on the same store. A new store under a
+	 * new identity replaces the current one and inherits whatever it had not sent (replaceStore). Refused (offline, a
+	 * revoked pairing, the daily limit): the current store keeps running and the command fails with the reason.
+	 */
+	private async resetStore(): Promise<void> {
+		const port = this.ports?.identity;
+		if (!port) throw new ProtocolFailure({ code: "not-ready", message: "this device has no pairing to register a new local store with", retryable: false });
+		if (this.replacing) throw new ProtocolFailure({ code: "not-ready", message: "the local store is being replaced already", retryable: true });
+		this.replacing = true;
+		try {
+			this.log("rebuild: registering a new local store");
+			const e = await this.replaceStore("rebuild", port);
+			if (e === null) return;
+			// The notice texts end "Retrying." for the start's own retry; a refused rebuild is not retried.
+			const reason = e instanceof IdentityRefused ? REFUSAL_NOTICE[e.reason].text.replace(/ Retrying\.$/, "") : e instanceof Error ? e.message : String(e);
+			this.log(`rebuild refused: ${e instanceof IdentityRefused ? e.reason : reason}`);
+			throw new ProtocolFailure({ code: "not-ready", message: `the local cache was not rebuilt: ${reason}`, retryable: !(e instanceof IdentityRefused && needsRepair(e.reason)) });
+		} finally {
+			this.replacing = false;
+		}
 	}
 
 	/** Started without a blob store and a later connect found one (sessionLoop probeBlobStore): restart on it. */

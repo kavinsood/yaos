@@ -46,7 +46,7 @@ export interface EngineCarrier {
 }
 
 export type EngineRequestMessage = Extract<EngineToMain, { t: "readRequest" | "diskOps" | "saveViews" | "sideFileWrite" | "sideFileRead" | "hostIo" | "keyringChanged" }>;
-export type EngineEventMessage = Extract<EngineToMain, { t: "body" | "docRetarget" | "bindable" | "status" | "storeIdentity" | "brake" | "notice" }>;
+export type EngineEventMessage = Extract<EngineToMain, { t: "body" | "docRetarget" | "bindable" | "status" | "storeIdentity" | "grantSecret" | "brake" | "notice" }>;
 type HostRequest = Extract<MainToEngine, { rid: number }>;
 type HostRequestBody = HostRequest extends infer M ? (M extends { rid: number } ? Omit<M, "rid"> : never) : never;
 type HostEvent = Exclude<MainToEngine, { rid: number }>;

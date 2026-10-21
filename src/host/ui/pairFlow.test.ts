@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	applyPairedIdentity, clearIdentity, enrollmentFailureIsFinal, formatCountdown, PairingSession, resumePendingEnrollment,
-	setPendingEnrollment, withoutPendingEnrollment,
+	requestPairingCodeRotating, setPendingEnrollment, withoutPendingEnrollment,
 } from "./pairFlow";
 import { PairingError, prepareEnrollment, type HttpRequest, type HttpResponse, type PairingDeps } from "./pairing";
 import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "./api";
@@ -179,4 +179,57 @@ test("enrollmentFailureIsFinal; pairing and unpairing drop the pending attempt",
 	assert.equal(applyPairedIdentity(d, { ...identity, grantSecret: "b".repeat(43) }).pendingEnrollment, p, "another pairing's attempt stays");
 	assert.equal(clearIdentity(d).pendingEnrollment, undefined);
 	assert.equal(withoutPendingEnrollment(d, "other-request-id"), d);
+});
+
+test("requestPairingCodeRotating: a 401 unauthorized fetches the rotated secret (refreshGrant) and tries once more with it", async () => {
+	const vaultId = testVaultId("v");
+	const code = `${vaultId}.pcSecretPcSecretPcSecret01`;
+	const first: PairedIdentity = { host: "https://h.example", vaultId, grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: "o".repeat(43), grantName: "Mac", vaultGeneration: null };
+	const rotated = "n".repeat(43);
+	const make = (answer: (data: { identity: PairedIdentity | null }) => void) => {
+		const data: { identity: PairedIdentity | null } = { identity: first };
+		const commands: string[] = [];
+		const host = {
+			data: () => ({ ...defaultPluginData("Mac"), identity: data.identity }),
+			command: async (c: { readonly t: string }) => {
+				commands.push(c.t);
+				answer(data);
+				return { t: "ok" as const };
+			},
+		};
+		return { host, commands };
+	};
+	const auth = (calls: HttpRequest[]) => calls.map((c) => c.headers?.Authorization);
+
+	// Rotated: main rewrote data.json with the fetched secret; the retry uses it.
+	{
+		const { host, commands } = make((d) => (d.identity = { ...first, grantSecret: rotated }));
+		const { calls, deps } = scripted([{ status: 401, json: { error: "unauthorized" } }, { status: 200, json: { pairingCode: code } }]);
+		const grant = await requestPairingCodeRotating(host, { ...deps, nowMs: () => 1 });
+		assert.equal(grant.pairingCode, code);
+		assert.deepEqual(commands, ["refreshGrant"]);
+		assert.deepEqual(auth(calls), [`Grant ${"o".repeat(43)}`, `Grant ${rotated}`]);
+	}
+	// Nothing new to fetch (a clone without a live store, a never-rotated grant): the first error, one request.
+	{
+		const { host, commands } = make(() => undefined);
+		const { calls, deps } = scripted([{ status: 401, json: { error: "unauthorized" } }]);
+		await assert.rejects(requestPairingCodeRotating(host, deps), (e: unknown) => e instanceof PairingError && e.code === "unauthorized" && /Pair it again/.test(e.message));
+		assert.deepEqual(commands, ["refreshGrant"]);
+		assert.equal(calls.length, 1);
+	}
+	// A revoked pairing is final: no fetch.
+	{
+		const { host, commands } = make(() => undefined);
+		const { deps } = scripted([{ status: 401, json: { error: "grant_revoked" } }]);
+		await assert.rejects(requestPairingCodeRotating(host, deps), (e: unknown) => e instanceof PairingError && e.code === "grant_revoked");
+		assert.deepEqual(commands, []);
+	}
+	// Re-paired meanwhile to another grant: not retried with it.
+	{
+		const { host } = make((d) => (d.identity = { ...first, grantId: "grant_BBBBBBBBBBBBBBBB", grantSecret: rotated }));
+		const { calls, deps } = scripted([{ status: 401, json: { error: "unauthorized" } }]);
+		await assert.rejects(requestPairingCodeRotating(host, deps));
+		assert.equal(calls.length, 1);
+	}
 });
