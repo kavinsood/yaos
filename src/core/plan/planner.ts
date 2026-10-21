@@ -782,7 +782,8 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 			if (input.synced.has(r0.aliasOf)) return push([drop(s0.docId)]);
 			prefix.push({ op: "rebind", fromDocId: s0.docId, toDocId: r0.aliasOf, path: s0.path });
 			r = input.remote.get(r0.aliasOf);
-			s = { ...(r ? restartAtCreate(s0, r.createHash) : s0), docId: r0.aliasOf };
+			// Seen committed as the winner (the rebind job records its touch seq): never an own unfolded create (collapse).
+			s = { ...(r ? restartAtCreate(s0, r.createHash) : s0), docId: r0.aliasOf, ...(r && !r.pendingLocal ? { nsTouchSeq: Math.max(s0.nsTouchSeq, r.lastTouchSeq) } : {}) };
 			handled.add(r0.aliasOf);
 		}
 		const found = movedAway.has(s.docId) ? { l: undefined, atRemote: false } : localFor(s, r);
