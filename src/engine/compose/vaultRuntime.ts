@@ -71,6 +71,11 @@ export interface RuntimeOwner {
 	onStoreRevoked(): void;
 	/** Started without a blob store, and a later connect found one (EngineOptions.onBlobStore): restart on it. */
 	onBlobStore(store: BlobPort): void;
+	/**
+	 * The first runtime of an init that asks gets true: it also removes lineage dirs when its store did not inherit
+	 * (dirs a crash left behind before the store that inherited from them wrote its mirrors). Absent: never.
+	 */
+	claimLineageSweep?(): boolean;
 }
 
 export interface VaultRuntimeStart {
@@ -332,12 +337,17 @@ export class VaultRuntime {
 	 * predecessors' (recovery reads the newest dir with a mirror, and this store's mirror holds whatever it inherited),
 	 * so their dirs go: the mirror files and the local snapshots (copied into this store's dir at recovery). Only this
 	 * install's earlier stores (the lineage), never a foreign dir. Once, in the runtime of a store this start created
-	 * with a lineage (a dir a crash leaves behind goes with the next recovery's), best effort.
+	 * with a lineage; and once per init in any runtime (claimLineageSweep, phase 5's orphan sweep): a dir a crash left
+	 * behind after the import but before this store's first mirror write. Safe then too: a running store has finished
+	 * any import it was created with (LogEngine.start runs it, and MetaIdentity.inherit is cleared in the import's
+	 * transaction), and its own mirrors, just written, hold everything it inherited. Best effort.
 	 */
 	private lineageDropped = false;
 	private async dropLineageDirs(): Promise<void> {
-		const lineage = this.o.identity.inherit ? [...(this.o.identity.lineage ?? [])] : [];
-		if (this.lineageDropped || this.stopped || lineage.length === 0) return;
+		if (this.lineageDropped || this.stopped) return;
+		const sweep = this.o.identity.inherit ? true : this.engine.claimLineageSweep?.() ?? false;
+		const lineage = sweep ? [...(this.o.identity.lineage ?? [])] : [];
+		if (lineage.length === 0) return;
 		this.lineageDropped = true;
 		const link = this.engine.link;
 		let n = 0;
@@ -481,7 +491,8 @@ export class VaultRuntime {
 			this.port.nsCaughtUp = true;
 			this.port.invalidate();
 			this.sched.request({ t: "full" });
-			void ops.retireOldEpochs(this);
+			// Once per runtime, in order: this install's other-epoch stores, then the orphan stores of lost install keys.
+			void ops.retireOldEpochs(this).then(() => ops.sweepOrphanStores(this));
 		}
 		if (s.phase === "epoch-migrating" && !this.migrating) {
 			this.migrating = true;
