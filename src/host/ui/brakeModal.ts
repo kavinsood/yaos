@@ -36,7 +36,7 @@ export class BrakeModal extends Modal {
 		}
 		contentEl.createEl("p", { text: copy.approveHint });
 		contentEl.createEl("p", { text: copy.rejectHint });
-		contentEl.createEl("p", { text: "Later keeps everything on hold. Sync of other changes continues; you can review this again from the status bar or the \"Review held changes\" command." });
+		contentEl.createEl("p", { text: "Later keeps everything on hold. Sync of other changes continues; you can review this again from the status bar or the \"review held changes\" command." });
 
 		this.buttons = [];
 		new Setting(contentEl)
