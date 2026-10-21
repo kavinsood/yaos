@@ -268,18 +268,20 @@ canonical re-encode must be byte-identical; `foldRulesVersion` ≤ the reader's 
 = 1; above: a newer writer), and the inner coversSeq equals the relay's.
 There is no separate invariant checker: the strict decoder is the snap index's V2.
 
-**`retired`** (designed, not implemented). An empty state that tells the relay it may GC every row ≤ coversSeq. It
-would be written only for:
-- `b:`/`c:` streams of docIds the fold has pruned, or that are merged aliases with rows.
+**`retired`**. An empty state at coversSeq = the stream's `lastSeq`: a checkpoint at `lastSeq` retires the relay
+stream (server H7: every segment and the open rows go, gcSeq = lastSeq; the head row and the small checkpoint stay).
+It is written only for the `b:`/`c:` stream of a **dead** doc (`src/engine/body/retire.ts:55` `deadReason`):
+- **merged**: the committed entry is a merged alias (final; ops on it are redirected);
+- **pruned**: no committed entry, and the fold provably saw every ns row up to the stream's last row: the ns stream
+  is caught up and not frozen, the fold has no gap (`FoldRuntime.gap`), the vault cursor accounts for every seq up
+  to that row, and no own create of the doc is pending. A live create's body rows never precede the create (§e.1),
+  so a doc that still has a create would be folded by then.
 
-A reader that receives `retired` for a stream the fold still references treats it as a checkpoint with no state:
-the union adds nothing, and rows > coversSeq still apply.
-
-**Not built.** No engine code writes a `retired` checkpoint. Only the codec (`CheckpointEncoding.retired`,
-`src/core/envelope.ts`), the ingest gate (which passes one through, `src/engine/ingest/gate.ts`) and catch-up know
-the encoding, and catch-up does not adopt one: it counts `diag checkpoint-retired` and moves on
-(`src/engine/sync/catchUp.ts` "gap: retirement handling"). So the relay never reclaims the rows of pruned docs or
-merged aliases. Tracked as [BACKLOG](../BACKLOG.md) RETIRE (relay row reclamation).
+A deleted doc is not dead: its body stays for a restore (§c.7) and its stream is checkpointed like any other.
+The ingest gate takes a `retired` checkpoint only on `b:`/`c:` and only with an empty state (`kind-not-allowed` /
+`decode-failed` otherwise, `src/engine/ingest/gate.ts:220`). Catch-up adopts nothing from one: the reader's replica
+stays as it is, rows above coversSeq (a late writer's) still apply, and it counts `diag checkpoint-retired`
+(`src/engine/sync/catchUp.ts:181`). Writer, duty and local drop: §d.9.
 
 ### b.6 Size rules and splitting
 
@@ -514,8 +516,11 @@ path (example E8).
   never dangle.
 - One frame-level event `pruned{docIds}` is emitted.
 - Later ops on pruned docIds are `unknown-docid`.
-- Designed, not implemented: devices with checkpoint duty would put `retired` checkpoints for the pruned docs'
-  `b:`/`c:` streams (§b.5, §d.9). Nothing writes them today, so a pruned doc's relay rows stay (BACKLOG RETIRE).
+- The pruned docs' `b:`/`c:` streams are retired (§b.5, §d.9): the device whose frame pruned them puts the `retired`
+  checkpoint, every device then drops their local records.
+- `TOMBSTONE_CAP` and `TOMBSTONE_PRUNE_HYSTERESIS` are fold rules: every device folds with the same values.
+  `EngineTuning.nsPrune` (`src/engine/runtime/options.ts:57`) carries them for the sim only (one draw per run for
+  every device and the oracle, `src/sim/run.ts` `pruneWorld`); production never passes engine tuning.
 - A long-offline device that still holds a pruned doc is handled by the planner row "absent/pruned" (§f.2). An
   absent doc this device never saw committed (`S.nsTouchSeq = 0`) is not taken for pruned (§f.2).
 - Alternative: age-based pruning. Rejected: it needs wall clocks, which the fold never reads.
@@ -676,7 +681,9 @@ changes.
   three trees, and nothing destructive follows from the ignored op. A `rev-mismatch` keeps both (§c.8).
 - **Precondition ops** (delete, restore, setBlob) are emitted only when the doc has no pending own ns op, so a device
   never makes its own delete stale. Creates and renames pipeline freely.
-- **Pruned**: the doc's streams would be retired (§b.5; not implemented, BACKLOG RETIRE). **Restore duty**: see §c.7.
+- **Pruned**: the doc's streams are retired (§b.5, §d.9). A bound doc the fold pruned is retargeted by path
+  (`docRetarget{renamed}`, `src/engine/compose/foldBridge.ts`): its views re-bind to whatever doc owns the path, so
+  its replica can be dropped. **Restore duty**: see §c.7.
 
 ### c.14 Worked examples
 
@@ -1403,11 +1410,26 @@ The planner does no destructive work until ns is caught up (§f.2).
   - A settle checkpoint covers the newest candidate. The rows after it stay: fewer than one candidate interval (1000
     vault seqs). There is at most one settle put per candidate.
   - cfg and snap use the same candidate rule.
-- **`retired`** (designed, not implemented: no duty runs and nothing puts one; §b.5, BACKLOG RETIRE).
-  - For streams of docIds in a fold `pruned` event, or merged aliases that have rows.
-  - Duty: the device whose frame caused the prune or merge. Fallback: 10 min.
-  - `coversSeq` = the stream's `lastSeq` from `read(stream, 0, false)`.
-  - After `ok`, the local stream records are deleted.
+- **`retired`** (§b.5; the maintenance step `retire`, `src/engine/runtime/maintenance.ts:263`, after checkpoint duty).
+  - For the caught-up `b:`/`c:` streams of dead docs (merged aliases, pruned docs; `deadStreams`, maintenance.ts:230)
+    that hold rows beyond the relay's checkpoint (`remoteCheckpointCoversSeq < remoteHeadSeq`).
+  - `coversSeq` = the caught-up record's `remoteHeadSeq` (its `lastSeq`); CAS on the known checkpoint seq
+    (`writeRetired`, retire.ts:102). Outcomes follow the checkpoint table (`applyOutcome`), but a retire does not
+    count against the settle cap.
+  - Duty: the device whose own ns frame pruned the doc or folded its create as merged (`RetireState.noteFold`, in
+    memory), or the author of the stream's newest row (a merged loser's junk rows, a long-offline device's late edit
+    of a pruned doc). Everyone else after `fallbackMs` plus jitter, with a refresh read of the checkpoint seq first
+    (a non-advancing refresh means someone else retired it). Duty lost to a restart is covered by the fallback.
+  - At most `RETIRES_PER_TICK` (4) puts per tick; not while the session cannot write, in background, behind the
+    write gate or a checkpoint hold.
+  - A row committed after the retirement (a late writer) leaves the stream above its checkpoint again: the next
+    pass retires it again (server: a put at the new lastSeq with CAS on the old one).
+  - **Local drop**: once nothing lies beyond the relay checkpoint, up to `DROPS_PER_TICK` (16) dead streams per tick
+    leave the store in one transaction, `T_drop_stream` (§e.2). Not while a read of it runs, the outbox holds an own
+    frame of it, or its replica is pinned, bound, loading or has an open frame; the transaction itself refuses if the
+    record moved, the outbox holds a record, or a synced record or an intent still names the doc.
+  - A stream already covered at lastSeq by a `yjsStateV1` settle checkpoint keeps that checkpoint's bytes: a retired
+    put there would be non-advancing. Its rows are reclaimed all the same (H7), and the local drop runs.
 - **Budget** (Free plan: 100k rows written a day).
   - Relay cost (docs/server-rewrite/DECISIONS.md §6.2; server/src/streams/store.ts:12-15, :534):
     - A commit writes 2 rows per touched stream, plus 1 per sealed segment.
@@ -1456,7 +1478,7 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
 | Store | Key path | Indexes | Value | Bound |
 |---|---|---|---|---|
 | `meta` | `key` | — | Singletons `identity`, `cursor`, `outboxOrder`, `daily`, `ckptDuty`, `keyring`, `keyringRecords` (e2ee-design §6.1); one `blobPut:<address>` per blob address this device PUT (e2ee-design §10.4); one `pathBase:<pathKey>` per old-epoch base (§c.12) | 7 singletons + `pathBase:*` (dropped as paths settle) + `blobPut:*`, which is **unbounded** between prunes: each blob GC pass drops entries older than `blobGcGraceMs / 2` (`src/engine/runtime/blobGc.ts:95`) |
-| `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; never deleted (retired streams are a gap: `src/engine/sync/catchUp.ts` "gap: retirement handling", §d.9) |
+| `streams` | `stream` | — | `StreamRecord` | 1 per live doc / retained tombstone with rows, + ns, cfg, snap, keyring; dead docs' (pruned, merged aliases) dropped by `T_drop_stream` once their relay stream is retired (§d.9) |
 | `snapshots` | `stream` | — | `SnapshotRecord` (EXACT: committed rows ≤ coversSeq) | 1 per stream; ≤ about 3 × doc text |
 | `tail` | `[stream, seq]` | — | `TailRecord` (opened inner content) | Compaction keeps ≤ 200 rows / 256 KiB typical, hard 2000 rows per stream |
 | `outbox` | `clientFrameId` | `byOrder order` (unique), `byStreamOrder [stream, order]` (unique), `byStateOrder [state, order]` (unique) | `OutboxRecord` | No size limit is enforced (a soft limit with stretching and a notice was planned, not built). **Never dropped** |
@@ -1501,6 +1523,7 @@ Rules:
 | `T_feed_page` | streams, meta | Stream heads, stale; cursor = `throughSeq` | Before commit: the page is re-fetched. |
 | `T_read_page` | tail, quarantine, outbox, streams, snapshots | Rows; late receipts; fresh-stream checkpoint snapshot + exact-key deletes of tail ≤ coversSeq; `appliedSeq` / `stale` when complete | Idempotent puts. The page is re-read from `appliedSeq`. |
 | `T_snapshot` (checkpoint union) / `T_compact` | snapshots, tail, streams | CAS on `snapshotCoversSeq`; snapshot put; exact-key tail deletes | Old snapshot + tail and new snapshot + less tail reconstruct the same state. |
+| `T_drop_stream` (retire, §d.9) | streams, snapshots, tail, quarantine, outbox, meta, synced, intents | Refuses (no write) if the record's `remoteHeadSeq` / `remoteCheckpointCoversSeq` moved, the outbox holds a record of the stream, or a synced record or an intent names its doc; else deletes the stream record, its snapshot, tail and quarantine rows, and its `ckptDuty` entry (`src/engine/store/repo.ts:881`). The cursor is untouched | Before commit: nothing changed, the next tick drops it. After: the doc loads as an empty replica; a later row of the stream (a late writer) re-creates the record and the stream is retired again. |
 | `T_adopt` | outbox, meta | Adoptable record | Before commit: the provisional was applied to the bound replica only. The edit reaches disk through the editor and is re-merged. The commit or the author's resend brings it anyway. |
 | `T_intent_begin` / `T_intent_end` | intents | Put / delete the intent | §f.7: startup completes or rolls back each intent from disk state. |
 | `T_synced` (after a disk-op batch) | synced, baseText, localTree, intents | Synced put/drop, base put, stat cache, intent end | Before commit: the next reconcile sees L = R ≠ S, which is the "identical" path. Only S advances. |
@@ -1518,9 +1541,8 @@ Rules:
 - Quarantine is bounded with oldest-first eviction.
 - The outbox is never evicted; it is bounded only by user activity while offline. No soft limit is enforced (the
   planned notice plus frame stretching was not built).
-- `streams` / `snapshots` / `tail` of pruned docs are **not** deleted yet: no device writes a `retired` checkpoint,
-  catch-up skips one it reads (`src/engine/sync/catchUp.ts` "gap: retirement handling") and no transaction drops a
-  stream (BACKLOG RETIRE).
+- `streams` / `snapshots` / `tail` / `quarantine` of dead docs (pruned, merged aliases) leave in `T_drop_stream`
+  once their relay stream holds nothing beyond its checkpoint (§d.9). A deleted doc keeps them (restore, §c.7).
 - **Quota error:**
   1. evict `quarantine` bytes;
   2. compact everything eligible;
