@@ -84,7 +84,8 @@ test("retire: the pruning device retires the dead stream at once; every device d
 			return retiredOnRelay(relay, stream);
 		}, 5_000, "retired on the relay");
 		assert.equal(await encodingOf(a, relay, stream), CheckpointEncoding.retired);
-		assert.ok(a.c.retire.stats.written >= 1, "the duty device (its frame pruned the doc) wrote it");
+		// The relay holds the put before its response reaches the writer.
+		await until(() => a.c.retire.stats.written >= 1, 5_000, "the duty device (its frame pruned the doc) wrote it");
 		await until(async () => (await holds(a, stream)).length === 0 && (await holds(b, stream)).length === 0, 15_000, "dropped everywhere");
 		assert.equal(b.c.retire.stats.written, 0, "the other device found it retired (fallback refresh), no second put");
 		assert.ok(b.c.retire.stats.refreshed >= 1);
@@ -203,7 +204,9 @@ test("retire: a merged alias's junk rows are retired by their author and dropped
 		await until(() => relay.rows(stream, { includeGc: true }).length > 0, 5_000, "junk rows");
 		await until(() => retiredOnRelay(relay, stream), 5_000, "the loser's rows retired");
 		// The loser has the duty (author of the rows, its create merged); a's 300 ms fallback may win under load.
-		assert.ok(b.c.retire.stats.written + a.c.retire.stats.written >= 1);
+		// The relay holds the put before its response reaches the writer: wait for the writer's own count.
+		await until(() => b.c.retire.stats.written + a.c.retire.stats.written >= 1, 5_000, "the writer counted its put");
+		assert.equal(await encodingOf(b, relay, stream), CheckpointEncoding.retired);
 		await until(async () => (await holds(a, stream)).length === 0 && (await holds(b, stream)).length === 0, 5_000, "dropped");
 		assert.ok((await holds(a, md(winner))).includes("stream"), "the winner keeps its stream");
 		await converged(es);
