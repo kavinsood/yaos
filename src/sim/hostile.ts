@@ -104,8 +104,6 @@ export class HostileDevice {
 	private keeper = false;
 	private loop: Promise<void> | null = null;
 	private loopEnded = false;
-	private healed = false;
-	private readonly wakers = new Set<() => void>();
 	private stopped = false;
 
 	constructor(
@@ -175,7 +173,9 @@ export class HostileDevice {
 					doc.destroy();
 					const stream = `b:${body!.docId}` as StreamName;
 					await this.appendSealed(s, stream, "bodyUpdate", second, 0, 0, true);
-					await this.delay(Math.round(1_000 * 200 ** this.random.float()));
+					// Held back across the heal too (the run is not quiescent while it is: busy()), so a hole can outlive the
+					// readers' re-read window and freeze the doc before the missing row thaws it.
+					await this.clock.sleep(Math.round(1_000 * 200 ** this.random.float()), "sim-hostile-order");
 					// Sealed now, under the newest epoch it holds by then (a revoke meanwhile makes older ones stale).
 					const now = this.reference();
 					if (now) this.refreshKeys(now);
@@ -354,26 +354,6 @@ export class HostileDevice {
 			// The very same frame again (a resend that forgot its receipt): deduped by the relay inside its window.
 			this.append(s, NS_STREAM, old.payload, old.cfid);
 		}
-	}
-
-	/** Sleeps `ms` of virtual time, or until heal() (all faults off: the buggy device sends what it held back). */
-	private delay(ms: number): Promise<void> {
-		if (this.healed) return Promise.resolve();
-		return new Promise<void>((resolve) => {
-			const done = () => {
-				this.wakers.delete(done);
-				this.clock.clearTimer(h);
-				resolve();
-			};
-			const h = this.clock.setTimer(ms, done, "sim-hostile-delay");
-			this.wakers.add(done);
-		});
-	}
-
-	/** FaultState.heal: no new hostile frames are held back (held-back halves go now). */
-	heal(): void {
-		this.healed = true;
-		for (const w of [...this.wakers]) w();
 	}
 
 	// ------------------------------------------------------------------ the user releases frozen docs

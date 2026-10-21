@@ -843,7 +843,6 @@ export class FaultState {
 		for (const d of this.devs) d.vault.failNextOps = 0;
 		this.synced?.end();
 		this.e2ee?.heal();
-		this.hostile?.heal();
 		this.removeAbandoned();
 	}
 }
