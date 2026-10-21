@@ -819,6 +819,17 @@ export class CanvasWorld {
 					const w = this.oracle.writes.get(`root|${k}|${v}`);
 					if (w) for (const a of this.oracle.ancestors(w)) this.oracle.discarded.add(`root|${k}|${a}`);
 				}
+				// And the root fields the file lacks because a user removed them in it: the removals go with the file too
+				// (hot canvas seed 89: A removed a root field, renamed and deleted the canvas; B's own copy of the vault,
+				// never synced before, came back as a new doc of the same lineage still holding the field).
+				if (m) {
+					const lin = lineageOf(m.root);
+					const doc = docIdOf(d, path);
+					for (const [k, list] of this.oracle.removals) {
+						if (!k.startsWith("root|") || m.root[k.slice(5)] !== undefined) continue;
+						for (const r of list) if (r.atMs <= atMs && ((lin !== null && r.lineage === lin) || (doc !== null && r.doc === doc))) this.oracle.discardedRemovals.add(r);
+					}
+				}
 			}
 		}
 		d.vault.userDelete(path);
