@@ -9,8 +9,8 @@
 import type { ClientFrameId, DeviceId, Seq, StreamName, VaultEpoch } from "../core/types";
 import type { ClockPort } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
-import type { AppendFrame, FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayEvent, RelayLimits, RelaySession } from "../ports/relay";
-import { decodeServerFrame, encodeAppend, encodePing, encodeServerFrame, encodeSubscribe } from "../engine/adapters/relayFrames";
+import type { AppendFrame, FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RekeySignal, RelayEvent, RelayLimits, RelaySession } from "../ports/relay";
+import { decodeServerFrame, encodeAppend, encodePing, encodeRekeyed, encodeServerFrame, encodeSubscribe } from "../engine/adapters/relayFrames";
 import { READ_BATCH_MAX_QUERY_CHARS } from "../engine/adapters/relayHttp";
 import { TimedQueue } from "./a-relay-link";
 import { heldKey, type DownMsg, type LinkSpec, type UpMsg } from "./a-relay-util";
@@ -75,6 +75,8 @@ export class SimRelaySession implements RelaySession {
 		readonly canWrite: boolean,
 		readonly limits: RelayLimits,
 		public link: LinkSpec,
+		/** VAULT_READY.rekey. */
+		readonly rekey: RekeySignal,
 	) {
 		this.up = new TimedQueue(host.clock, (msg) => {
 			if (msg.k === "append") this.inFlightBytes -= msg.bytes;
@@ -195,6 +197,12 @@ export class SimRelaySession implements RelaySession {
 			this.probes.set(probeId, { resolve: (headSeq) => resolve({ headSeq }), reject });
 			this.up.push(this.delay(this.link.uplinkMs), { k: "ping", probeId, bytes: encodePing(probeId).length });
 		});
+	}
+
+	/** VAULT_REKEYED on the uplink (fire and forget, as wsRelay). */
+	ackRekey(removals: number): void {
+		if (this.ended) return;
+		this.up.push(this.delay(this.link.uplinkMs), { k: "rekeyed", removals, bytes: encodeRekeyed(removals).length });
 	}
 
 	private failProbes(): void {
@@ -322,6 +330,9 @@ export class SimRelaySession implements RelaySession {
 			}
 			case "error":
 				this.errorCode = msg.code;
+				return;
+			case "rekey":
+				this.emit({ t: "rekey", rekey: { removals: msg.removals, rekeyed: msg.rekeyed } });
 				return;
 			case "close":
 				this.ended = true;

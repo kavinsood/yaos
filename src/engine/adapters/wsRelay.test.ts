@@ -35,6 +35,7 @@ const READY = {
 		readBatchMaxStreams: 64, maxSubscriptions: 128,
 		groupCommit: { idleMs: 300, maxMs: 1500, maxBytes: 65536, minIntervalMs: 0 },
 	},
+	rekey: { removals: 0, rekeyed: 0 },
 	canWrite: true, principalId: "p", deviceId: "devA", role: "owner",
 };
 
@@ -101,7 +102,20 @@ describe("wsRelay connect", () => {
 			maxFrameBytes: 1048576, maxCheckpointBytes: 4194304, appendBytesPerSec: 262144, burstBytes: 2097152,
 			feedPageRows: 1000, readPageBytes: 1048576, readBatchStreams: 64, maxSubscriptions: 128,
 		});
+		assert.deepEqual(session.rekey, { removals: 0, rekeyed: 0 });
 	});
+
+	for (const [label, rekey] of [["absent", undefined], ["rekeyed above removals", { removals: 1, rekeyed: 2 }]] as const) {
+		it(`fails the connect closed (update-required) when the VAULT_READY key-roll signal is ${label}`, async () => {
+			const h = harness();
+			const pending = h.connect();
+			await flush();
+			const socket = h.sockets[0]!;
+			socket.accept();
+			socket.control({ ...READY, rekey });
+			assert.deepEqual(await pending, { ok: false, reason: "update-required", retryAfterMs: null });
+		});
+	}
 
 	for (const [label, limits] of [
 		["absent", undefined],
@@ -275,6 +289,19 @@ describe("wsRelay session events", () => {
 		off();
 		socket.control({ type: "VAULT_BACKPRESSURE" });
 		assert.deepEqual(events, []);
+	});
+
+	it("VAULT_REKEY maps to a rekey event; ackRekey sends VAULT_REKEYED, and nothing once closed", async () => {
+		const { socket, session } = await open();
+		const events = collect(session);
+		socket.control({ type: "VAULT_REKEY", removals: 1, rekeyed: 0 });
+		socket.control({ type: "VAULT_REKEY", removals: 1, rekeyed: 2 });
+		assert.deepEqual(events, [{ t: "rekey", rekey: { removals: 1, rekeyed: 0 } }], "a malformed signal is ignored");
+		session.ackRekey(1);
+		assert.deepEqual(socket.sentControls().filter((c) => c["type"] === "VAULT_REKEYED"), [{ type: "VAULT_REKEYED", removals: 1 }]);
+		session.close(1000, "done");
+		session.ackRekey(1);
+		assert.equal(socket.sentControls().filter((c) => c["type"] === "VAULT_REKEYED").length, 1);
 	});
 
 	it("committed frames map to committed events", async () => {

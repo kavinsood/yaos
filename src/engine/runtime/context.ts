@@ -38,6 +38,7 @@ import { OutboxCache } from "./outboxCache";
 import type { SessionLoop } from "./sessionLoop";
 import type { Subscriptions } from "./subscriptions";
 import { buildStatus } from "./status";
+import { RekeySignalState } from "./rekeySignal";
 
 export type EngineDeps = CatchUpDeps & CheckpointDeps & RefDeps & FrameCtx;
 type Fields = Record<string, string | number | boolean | null>;
@@ -109,6 +110,8 @@ export class EngineCtx {
 	readonly touch: BlobTouch;
 	/** Aborts the blob store calls in flight when the session loop declares the link dead (blobs/transferLink.ts). */
 	readonly blobLink = new TransferLink();
+	/** The relay's key-roll signal and this engine's VAULT_REKEYED debt (e2ee-design §14.5). */
+	readonly rekey = new RekeySignalState(() => this.session, () => this.scheduleStatus());
 	private committedCache: { readonly key: readonly unknown[]; readonly hashes: ReadonlySet<ContentHash> } | null = null;
 	repo!: Repo;
 	ns!: NsRuntime;

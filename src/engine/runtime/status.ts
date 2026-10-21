@@ -52,5 +52,6 @@ export function buildStatus(c: EngineCtx): StatusSnapshot {
 		maxBlobBytes: null,
 		notices: c.noticeList(),
 		e2ee: c.keyring.status(),
+		rekey: c.rekey.signal,
 	};
 }

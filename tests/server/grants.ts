@@ -411,13 +411,15 @@ s.test("§3.4 revocation: leave and Revoke pairing retire the grant's devices at
 		vault.host.webSocketMessage(socket, appendBytes("ns", "buffered-thief-frame"));
 		assert.equal(vault.host.relay.pendingFrames(), 1);
 
-		// Operator "Revoke pairing" through the Worker: one turn, 1 + 2·D rows, sockets closed before the answer.
+		// Operator "Revoke pairing" through the Worker: one turn, 2 + 2·D rows (the grant, the key-roll count in
+		// vault_meta, each device and its tombstone), sockets closed before the answer.
 		resetRows(world);
 		const response = await world.fetch(`/operator/vaults/${vaultId}/grants/${lostId}`, { method: "DELETE", cookie });
 		assert.deepEqual([response.status, await json(response)],
 			[200, { ok: true, grantId: lostId, revoked: true, retiredDevices: 2 }]);
-		assert.equal(vault.model.totals.cf, 1 + 2 * 2);
-		assert.deepEqual([...vault.model.totals.byTable], [["pairing_grant", 1], ["device", 2], ["retired_device", 2]]);
+		assert.equal(vault.model.totals.cf, 2 + 2 * 2);
+		assert.deepEqual([...vault.model.totals.byTable],
+			[["pairing_grant", 1], ["vault_meta", 1], ["device", 2], ["retired_device", 2]]);
 		assert.equal(socket.closed?.code, 4403);
 		assert.equal(vault.host.relay.pendingFrames(), 0, "its buffered frames are dropped, never committed");
 		for (const store of thief) assert.equal((await deviceFeed(world, vaultId, store)).status, 401, store.deviceId);

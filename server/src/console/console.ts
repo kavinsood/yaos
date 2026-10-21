@@ -12,6 +12,8 @@
 //   pairing grant; a device without a grant (paired before grants) is listed alone with "Revoke", as before; revoked
 //   grants are counted, not listed. "Revoke pairing" (`DELETE …/grants/:grantId`) blocks the install; "Remove device"
 //   (`DELETE …/devices/:deviceId`) tidies one store, which comes back as a new device while its install is paired.
+//   A blocking removal (Revoke pairing, or Revoke of a device without a grant) makes the other devices' plugins prompt
+//   for a new vault key (e2ee-design §14.5); the confirm says so (REKEY_NOTE). The console shows no key state.
 //   "Rotate secret" (`POST …/grants/:grantId/rotate` → `{rotated}`) replaces the pairing secret: the install's live
 //   stores fetch the new one, a copy of the old data.json alone no longer registers (identity-per-store §3.4).
 //   Devices not seen for 90 days are retired by the server itself (§6.2) and drop off the list.
@@ -54,6 +56,12 @@ export const CONSOLE_MESSAGES: Readonly<Record<string, string>> = {
 	internal_error: "The server hit an unexpected error. Try again.",
 	not_implemented: "This server build does not support that action yet.",
 };
+
+/**
+ * Said when a removal blocks a device (e2ee-design §14.5): the vault's other devices then prompt for a new vault key
+ * themselves. "Remove device" of a store under a live pairing does not, since that install keeps syncing.
+ */
+export const REKEY_NOTE = "If the vault is end-to-end encrypted, your other devices then ask you to make a new vault key, so this device cannot read notes written after it.";
 
 /** The console page, served by router.ts for `GET /`. */
 export function consolePage(): Response {
@@ -110,6 +118,7 @@ ${QRCODE_SCRIPT}</script>
 <script nonce="${nonce}">
 "use strict";
 const MESSAGES = ${inlineJson(CONSOLE_MESSAGES)};
+const REKEY_NOTE = ${inlineJson(REKEY_NOTE)};
 const $ = (id) => document.getElementById(id);
 const enc = encodeURIComponent;
 function h(tag, props, ...kids) {
@@ -218,7 +227,7 @@ function vaultCard(v, pending) {
           listDevices();
         }),
         act("Revoke pairing", async () => {
-          if (!confirm("Revoke the pairing of " + name + "? Every store of it stops syncing at once, and that install has to be paired again.")) return;
+          if (!confirm("Revoke the pairing of " + name + "? Every store of it stops syncing at once, and that install has to be paired again. " + REKEY_NOTE)) return;
           const r = await api("DELETE", base + "/grants/" + enc(g.grantId), {});
           if (r.status !== 200) return say(failure("Revoke pairing", r), "err");
           say(r.data.revoked === false ? name + " was already unpaired." : name + " is unpaired.", "ok");
@@ -239,7 +248,7 @@ function vaultCard(v, pending) {
     return h("div", { className: "row" },
       h("span", { textContent: name + " (" + d.deviceId + ")" + (d.enrolledAt ? ", paired " + when(d.enrolledAt) : "") }),
       act("Revoke", async () => {
-        if (!confirm("Revoke " + name + "? It stops syncing at once and has to be paired again.")) return;
+        if (!confirm("Revoke " + name + "? It stops syncing at once and has to be paired again. " + REKEY_NOTE)) return;
         const r = await api("DELETE", base + "/devices/" + enc(d.deviceId), {});
         if (r.status !== 200) return say(failure("Revoke", r), "err");
         say(r.data.revoked === false ? name + " was already revoked." : name + " is revoked.", "ok");

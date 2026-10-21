@@ -66,8 +66,21 @@ export const IDENTITY_V3_MIGRATION = [
 	"ALTER TABLE pairing_grant ADD COLUMN secret_wrap BLOB",
 ] as const;
 
+/**
+ * Identity v4 (the key-roll signal, e2ee-design §14.5): `vault_meta.removals` counts the operator's removals that
+ * block a device ("Revoke pairing", and "Revoke" of a device enrolled without a grant); `vault_meta.rekeyed` is the
+ * highest such count a device has since covered with a new vault key (`VAULT_REKEYED`, relay-wire §4.2). A vault is
+ * due a key roll while `removals > rekeyed`. Authority, not content: a D8b restore carries both across the rewind.
+ */
+export const IDENTITY_V4_MIGRATION = [
+	"ALTER TABLE vault_meta ADD COLUMN removals INTEGER NOT NULL DEFAULT 0",
+	"ALTER TABLE vault_meta ADD COLUMN rekeyed INTEGER NOT NULL DEFAULT 0",
+] as const;
+
 /** Every vault DO table, in creation order: init runs v1 and then the migrations, so every vault ends identical. */
-export const VAULT_SCHEMA = [STREAM_SCHEMA, VAULT_IDENTITY_SCHEMA, ...IDENTITY_V2_MIGRATION, ...IDENTITY_V3_MIGRATION] as const;
+export const VAULT_SCHEMA = [
+	STREAM_SCHEMA, VAULT_IDENTITY_SCHEMA, ...IDENTITY_V2_MIGRATION, ...IDENTITY_V3_MIGRATION, ...IDENTITY_V4_MIGRATION,
+] as const;
 
 /**
  * DECISIONS-GAP (G54): identity v2 on a vault initialized before it. `VaultHost.load` reads `pairing_grant` first; "no
@@ -89,5 +102,15 @@ export function migrateIdentityV2(storage: StoragePort): void {
 export function migrateIdentityV3(storage: StoragePort): void {
 	storage.transactionSync(() => {
 		for (const ddl of IDENTITY_V3_MIGRATION) storage.sql.exec(ddl);
+	});
+}
+
+/**
+ * Identity v4 on a vault made before it, the same way as G54/G65: the meta read names `removals`, "no such column"
+ * means a vault before v4, and this adds both columns (two `ALTER`s, one transaction) before the read runs again.
+ */
+export function migrateIdentityV4(storage: StoragePort): void {
+	storage.transactionSync(() => {
+		for (const ddl of IDENTITY_V4_MIGRATION) storage.sql.exec(ddl);
 	});
 }

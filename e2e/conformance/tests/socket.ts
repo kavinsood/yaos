@@ -24,6 +24,7 @@ function readyFieldErrors(ready: any, v: Vault, d: Device): string[] {
 		].map((k) => [`limits.${k}`, isPos] as [string, (x: unknown) => boolean]),
 		["limits.groupCommit.idleMs", isPos], ["limits.groupCommit.maxMs", isPos], ["limits.groupCommit.maxBytes", isPos],
 		["limits.groupCommit.minIntervalMs", isUint],
+		["rekey.removals", isUint], ["rekey.rekeyed", isUint],
 		["canWrite", (x) => x === true], ["principalId", isStr], ["deviceId", (x) => x === d.deviceId], ["role", (x) => x === "owner"],
 		["membershipRevision", isUint], ["deviceCredentialRevision", isUint], ["policyVersion", isUint], ["capabilityDigest", isStr],
 	];

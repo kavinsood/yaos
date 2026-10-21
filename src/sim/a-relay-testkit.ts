@@ -97,6 +97,7 @@ export function trace(events: readonly RelayEvent[]): string[] {
 			case "skipped": return `skipped ${e.rows.map((r) => `${r.stream}@${r.seq}`).join(",")}`;
 			case "backpressure": return "backpressure";
 			case "head": return `head ${e.headSeq}`;
+			case "rekey": return `rekey ${e.rekey.removals}/${e.rekey.rekeyed}`;
 			case "closed": return `closed ${e.code}${e.errorCode !== null ? ` ${e.errorCode}` : ""}${e.wasClean ? "" : " unclean"}`;
 		}
 	});

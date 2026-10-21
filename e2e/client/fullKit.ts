@@ -81,6 +81,7 @@ class DroppableSession implements RelaySession {
 	get headSeq() { return this.inner.headSeq; }
 	get canWrite() { return this.inner.canWrite; }
 	get limits() { return this.inner.limits; }
+	get rekey() { return this.inner.rekey; }
 	append(frame: AppendFrame): void {
 		if (this.dead) return;
 		this.tap?.append(frame);
@@ -101,6 +102,7 @@ class DroppableSession implements RelaySession {
 	}
 	putCheckpoint(...a: Parameters<RelaySession["putCheckpoint"]>) { return this.dead ? Promise.reject(netError("checkpoint")) : this.inner.putCheckpoint(...a); }
 	ping() { return this.dead ? Promise.reject(netError("ping")) : this.inner.ping(); }
+	ackRekey(removals: number): void { if (!this.dead) this.inner.ackRekey(removals); }
 	onEvent(listener: (e: RelayEvent) => void): Unsubscribe {
 		this.listeners.add(listener);
 		// Subscribe lazily so the inner session's pre-subscription buffering still applies.

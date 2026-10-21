@@ -144,6 +144,8 @@ export type DownMsg =
 	/** probeId: the VAULT_PING answered, null for an unsolicited pong. */
 	| { readonly k: "pong"; readonly head: Seq; readonly probeId: string | null }
 	| { readonly k: "error"; readonly code: string }
+	/** VAULT_REKEY: the key-roll signal changed (server relay.ts broadcastRekey). */
+	| { readonly k: "rekey"; readonly removals: number; readonly rekeyed: number }
 	| { readonly k: "close"; readonly code: number; readonly wasClean: boolean }
 	/** inject(): an arbitrary port event, delivered in order. */
 	| { readonly k: "event"; readonly event: RelayEvent };
@@ -156,6 +158,8 @@ export type UpMsg =
 	| { readonly k: "subscribe"; readonly streams: readonly string[]; readonly bytes: number }
 	/** VAULT_PING with a probe id (text frame, not rate-charged). */
 	| { readonly k: "ping"; readonly probeId: string; readonly bytes: number }
+	/** VAULT_REKEYED (text frame): this device rolled the vault key after seeing `removals` removals. */
+	| { readonly k: "rekeyed"; readonly removals: number; readonly bytes: number }
 	| { readonly k: "close"; readonly code: number };
 
 export function frameKey(deviceId: string, clientFrameId: string): string {

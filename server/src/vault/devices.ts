@@ -210,4 +210,9 @@ export interface IdentitySnapshot {
 	devices: DeviceRecord[];
 	grants: GrantRecord[] | null;
 	retired: RetiredRecord[] | null;
+	/**
+	 * The key-roll signal (identity v4, e2ee-design §14.5): a restore must not forget a removal nobody has covered with
+	 * a new vault key yet. null in a journal row written before v4: finish leaves the rewound counts.
+	 */
+	rekey: { removals: number; rekeyed: number } | null;
 }

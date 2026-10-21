@@ -43,6 +43,7 @@ import type {
 	RelayLimits,
 	RelayPort,
 	RelaySession,
+	RekeySignal,
 } from "../../ports/relay";
 import type { Unsubscribe } from "../../ports/common";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
@@ -51,6 +52,7 @@ import {
 	decodeServerFrame,
 	encodeAppend,
 	encodePing,
+	encodeRekeyed,
 	KEEPALIVE_REQUEST,
 	encodeSubscribe,
 	parseControl,
@@ -222,6 +224,8 @@ interface SessionInit {
 	readonly ready: Extract<WireControl, { type: "VAULT_READY" }>;
 	/** ready.limits, already checked present. */
 	readonly limits: WireLimits;
+	/** ready.rekey, already checked present. */
+	readonly rekey: RekeySignal;
 	readonly join: ProvisionalJoin;
 	readonly onListenerError: (error: unknown) => void;
 	readonly liveness: { readonly idleMs?: number; readonly timeoutMs?: number } | undefined;
@@ -232,6 +236,7 @@ class WsRelaySession implements RelaySession {
 	readonly headSeq: number;
 	readonly canWrite: boolean;
 	readonly limits: RelayLimits;
+	readonly rekey: RekeySignal;
 
 	private readonly ws: WebSocketLike;
 	private readonly http: RelayHttp;
@@ -280,6 +285,7 @@ class WsRelaySession implements RelaySession {
 		this.headSeq = init.ready.head;
 		this.canWrite = init.ready.canWrite;
 		this.limits = mapLimits(init.limits);
+		this.rekey = init.rekey;
 		this.idleMs = init.liveness?.idleMs ?? init.ready.liveness?.idleMs ?? DEFAULT_LIVENESS.idleMs;
 		this.timeoutMs = init.liveness?.timeoutMs ?? init.ready.liveness?.timeoutMs ?? DEFAULT_LIVENESS.timeoutMs;
 		this.keepalive = init.ready.liveness?.keepalive === true;
@@ -370,6 +376,15 @@ class WsRelaySession implements RelaySession {
 				// The close event follows and rejects it.
 			}
 		});
+	}
+
+	ackRekey(removals: number): void {
+		if (this.closed || this.ws.readyState !== WS_OPEN) return;
+		try {
+			this.ws.send(encodeRekeyed(removals));
+		} catch {
+			// The close event follows; the engine acks again on its next session.
+		}
 	}
 
 	// ---- internals -----------------------------------------------------------
@@ -548,6 +563,9 @@ class WsRelaySession implements RelaySession {
 			case "VAULT_BACKPRESSURE":
 				this.emit({ t: "backpressure" });
 				return;
+			case "VAULT_REKEY":
+				this.emit({ t: "rekey", rekey: { removals: control.removals, rekeyed: control.rekeyed } });
+				return;
 			case "VAULT_ERROR": {
 				const reason = control.code === "durability_failed" ? "durability"
 					: control.code === "cf_daily_limit" ? "daily-limit" : null;
@@ -658,8 +676,9 @@ export function createWsRelayPort(opts: WsRelayOptions): RelayPort {
 					return;
 				}
 				if (control.type !== "VAULT_READY") return;
-				// A relay that omits or zeroes a required limit speaks a protocol this client does not: fail closed.
-				if (control.limits === null) {
+				// A relay that omits or zeroes a required limit, or the key-roll signal, speaks a protocol this client does
+				// not: fail closed.
+				if (control.limits === null || control.rekey === null) {
 					fail("update-required");
 					return;
 				}
@@ -672,6 +691,7 @@ export function createWsRelayPort(opts: WsRelayOptions): RelayPort {
 					nextProbeId,
 					ready: control,
 					limits: control.limits,
+					rekey: control.rekey,
 					join: new ProvisionalJoin(cacheBytes, cacheEntries),
 					onListenerError,
 					liveness: opts.liveness,

@@ -155,6 +155,7 @@ export class SessionLoop {
 		this.stats.sessions++;
 		this.backpressureFlag = false;
 		this.unsub = session.onEvent((ev) => this.onEvent(gen, ev));
+		c.rekey.note(session.rekey); // e2ee-design §14.5: an ack this engine still owes goes out now
 		// Right after VAULT_READY, before the feed: rows committed from here on are pushed or skipped by this set.
 		c.subs.onSession();
 		c.gateCtx.maxCheckpointStateBytes = Math.max(c.tuning.maxCheckpointStateBytes, session.limits.maxCheckpointBytes * 8);
@@ -280,6 +281,9 @@ export class SessionLoop {
 				return;
 			case "head":
 				if (ev.headSeq > cur.headSeqSeen) cur.headSeqSeen = ev.headSeq;
+				return;
+			case "rekey":
+				c.rekey.note(ev.rekey);
 				return;
 			case "closed":
 				this.handleClosed(gen, ev);

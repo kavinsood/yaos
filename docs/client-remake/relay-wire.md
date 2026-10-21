@@ -226,6 +226,7 @@ error followed by close 1006:
     "readBatchMaxStreams": 128, "maxSubscriptions": 128, "rateBytesPerSec": 262144, "burstBytes": 2097152,
     "groupCommit": { "idleMs": 300, "maxMs": 1500, "maxBytes": 65536, "minIntervalMs": 1000, "leadMs": 20, "quietMs": 1500 }
   },
+  "rekey": { "removals": 1, "rekeyed": 0 },
   "canWrite": true,
   "principalId": "...", "deviceId": "...", "role": "owner",
   "membershipRevision": 1, "deviceCredentialRevision": 1, "policyVersion": 1, "capabilityDigest": "..."
@@ -241,6 +242,13 @@ error followed by close 1006:
 - The client requires `maxPayloadBytes`, `maxCheckpointBytes`, `rateBytesPerSec`, `burstBytes`,
   `feedDefaultLimit`, `readDefaultBytes`, `readBatchMaxStreams` and `maxSubscriptions`, each positive. A
   `VAULT_READY` missing one fails the connect as `update-required` (no client-side defaults).
+- `rekey` is the vault's **key-roll signal** (e2ee-design §14.5): `removals` counts the operator's blocking device
+  removals ("Revoke pairing", and "Revoke" of a device enrolled without a grant; "Remove device" of a store under a
+  live grant, a leave and a self-retire do not count), `rekeyed` is the highest such count a device has covered with
+  a new vault key (`VAULT_REKEYED`, §4.2). A roll is due while `removals > rekeyed`. Both are integers ≥ 0 with
+  `rekeyed ≤ removals`; they never go back, and a reset or restore keeps them (authority, not content). A device that
+  was offline at a removal learns it here, at its next connect. The client requires the field: without it, or
+  malformed, the connect fails as `update-required`.
 
 ---
 
@@ -280,6 +288,7 @@ A close for a malformed APPEND is a client bug. Do not resend that frame.
 | `{"type":"VAULT_PING","probeId":"<1–128 printable chars>"}` | Answered with VAULT_PONG. Send it after `liveness.idleMs` of silence. If no pong arrives within `timeoutMs`, reconnect. |
 | `__YPS:{"type":"VAULT_KEEPALIVE"}` (exactly this text) | Answered with exactly `__YPS:{"type":"VAULT_ALIVE"}`. Only when VAULT_READY has `liveness.keepalive: true`. The runtime answers it itself (`setWebSocketAutoResponse`, server/src/vault/vault.ts), so it does not wake a hibernated vault DO; the relay answers it in code too. The idle probe of choice: the client sends it after `liveness.idleMs` of silence instead of VAULT_PING, except every 10th idle probe, a VAULT_PING (its pong carries `head`, the idle gap check; src/engine/adapters/wsRelay.ts `KEEPALIVE_PING_EVERY`). An older relay never advertises it and gets VAULT_PING. |
 | `{"type":"STREAM_SUBSCRIBE","streams":["b:…","c:…",…]}` | Replaces this socket's subscription set (§5.6). No ack; `STREAM_SUBSCRIBE_REJECTED` on invalid input. |
+| `{"type":"VAULT_REKEYED","removals":<n>}` | This device's revoke record won (e2ee-design §14.2) after it had seen `n` blocking removals (§3.2 `rekey`). The relay takes `n` only when `rekeyed < n ≤ removals` (1 row, `vault_meta.rekeyed`) and then sends every socket `VAULT_REKEY`; anything else is ignored silently (a late or repeated ack, a count the vault never had, not a positive integer). The socket's device is checked first (D7), so a removed device cannot ack. The client resends it on each new session until a `rekey` shows it taken. |
 
 ### 4.3 Control messages, server → client
 
@@ -293,6 +302,7 @@ A close for a malformed APPEND is a client bug. Do not resend that frame.
 | `STREAM_SUBSCRIBE_REJECTED {code, max}` | The last `STREAM_SUBSCRIBE` was refused and the previous set still applies. `code`: `invalid` (not an array, or a name that is not a valid stream name) or `too_many` (more than `max` = `maxSubscriptions` distinct names). |
 | `VAULT_PONG {probeId, documentId:"streams", vaultGeneration, runtimeEpoch, head}` | Liveness reply. `head` doubles as a cheap gap probe. |
 | `VAULT_BACKPRESSURE {reason:"relay_rate_limit"}` | Sent just before a **1013** close. |
+| `VAULT_REKEY {removals, rekeyed}` | The key-roll signal changed (§3.2 `rekey`): to every streams socket of the vault, at a blocking removal (after the removed device's sockets closed 4403) and when a `VAULT_REKEYED` was taken. Event-driven: never sent while the pair stays the same. The client puts it in its status; main prompts for a new vault key while `removals > rekeyed` (e2ee-design §14.5). |
 | `VAULT_ERROR {code:"durability_failed", message, stream, clientFrameIds}` | These appends were not committed (a storage error). Resend later. |
 | `VAULT_ERROR {code:"cf_daily_limit", cause:"durability_failed", kind, resetAt, message, stream, clientFrameIds}` | Free-plan daily row limit. Nothing was committed. Hold the queue until `resetAt` (Unix ms, next 00:00 UTC). |
 | `error {code:"authority_superseded", reason}` | Sent just before a **4403** close. |
@@ -874,14 +884,17 @@ export interface VaultReady {
   type: "VAULT_READY"; documentId: "streams"; socketSessionId: string;
   vaultId: string; vaultGeneration: string; vaultEpoch: string; runtimeEpoch: string; head: number;
   liveness: { version: 1; idleMs: number; timeoutMs: number; keepalive?: true };
-  capabilities: { streams: 1 }; limits: StreamLimits; canWrite: boolean;
+  capabilities: { streams: 1 }; limits: StreamLimits; rekey: RekeySignal; canWrite: boolean;
   principalId: string; deviceId: string; role: "owner" | "member";
   membershipRevision: number; deviceCredentialRevision: number; policyVersion: number; capabilityDigest: string;
 }
+/** e2ee-design §14.5: blocking removals, and the highest count a new vault key covers. Due while removals > rekeyed. */
+export interface RekeySignal { removals: number; rekeyed: number }
 export interface StreamReceipt { stream: string; clientFrameId: string; seq: number; deduped: boolean }
 export type ClientControl =
   | { type: "VAULT_PING"; probeId: string }
-  | { type: "STREAM_SUBSCRIBE"; streams: string[] };
+  | { type: "STREAM_SUBSCRIBE"; streams: string[] }
+  | { type: "VAULT_REKEYED"; removals: number };
 export type ServerControl =
   | VaultReady
   | { type: "STREAM_RECEIPTS"; head: number; receipts: StreamReceipt[] }
@@ -893,6 +906,7 @@ export type ServerControl =
   | { type: "STREAM_RESEND"; reason: "runtime_restarted"; runtimeEpoch: string; head: number }
   | { type: "VAULT_PONG"; probeId: string; documentId: "streams"; vaultGeneration: string; runtimeEpoch: string; head: number }
   | { type: "VAULT_BACKPRESSURE"; reason: "relay_rate_limit" }
+  | ({ type: "VAULT_REKEY" } & RekeySignal)
   | { type: "VAULT_ERROR"; code: "durability_failed"; message: string; stream: string; clientFrameIds: string[] }
   | { type: "VAULT_ERROR"; code: "cf_daily_limit"; cause?: string; kind: "rows-written" | "rows-read" | "unknown";
       resetAt: number; message: string; stream?: string; clientFrameIds?: string[] }

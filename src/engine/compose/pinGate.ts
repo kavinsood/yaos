@@ -69,6 +69,9 @@ function readOnly(s: RelaySession, kOnly: boolean): RelaySession {
 		get limits() {
 			return s.limits;
 		},
+		get rekey() {
+			return s.rekey;
+		},
 		append(frame: AppendFrame): void {
 			if (!kOnly || frame.stream !== KEYRING_STREAM) throw new WriteRefused("frame");
 			s.append(frame);
@@ -83,6 +86,10 @@ function readOnly(s: RelaySession, kOnly: boolean): RelaySession {
 		},
 		onEvent: (listener) => s.onEvent(listener),
 		ping: () => s.ping(),
+		// Only a device that won a revoke record acks (e2ee-design §14.5); this one cannot have.
+		ackRekey(): void {
+			throw new WriteRefused("key-roll ack");
+		},
 		close: (code, reason) => s.close(code, reason),
 	};
 }

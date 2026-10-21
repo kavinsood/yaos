@@ -1,6 +1,7 @@
 /**
  * Wires the host UI into the plugin: settings tab, status bar, commands, the obsidian://yaos setup
- * and re-key link handler, the encryption modals and the safety brake prompt. Returns a disposer; the plugin also cleans up the
+ * and re-key link handler, the encryption modals, the safety brake prompt and the key-roll prompt after a device
+ * removal (rekeyPrompt.ts). Returns a disposer; the plugin also cleans up the
  * commands, tab, status bar item and protocol handler itself on unload.
  *
  * Usage in plugin.ts (onload): `this.register(registerUi(this, host));`
@@ -15,7 +16,7 @@ import { cleanUpAttachments } from "./attachmentsCleanup";
 import { BrakeTracker } from "./brake";
 import { BrakeModal } from "./brakeModal";
 import { UI_COMMANDS, type UiCommandId } from "./commands";
-import { confirmAction } from "./confirmModal";
+import { ConfirmModal, confirmAction } from "./confirmModal";
 import { largeCheckConfirm, runDeviceCheck } from "./deviceCheck";
 import { DeviceCheckModal } from "./deviceCheckModal";
 import { DIAGNOSTICS_WITH_PATHS_CONFIRM, exportDiagnostics } from "./diagnostics";
@@ -27,6 +28,7 @@ import { applyLinkE2ee, PendingQrKeys, routeSetupLink } from "./keyActions";
 import { EnterRecoveryKeyModal, KeyMissingModal, RekeyAfterRevokeModal, RekeyQrModal } from "./keyModals";
 import { PairingCodeModal, PairModal, type PairPrefill } from "./pairModal";
 import { parseSetupLink, type LinkE2ee, type RequestFn } from "./pairing";
+import { REKEY_PROMPT_CONFIRM, REKEY_PROMPT_LATER, REKEY_PROMPT_TEXT, REKEY_PROMPT_TITLE, RekeyPromptTracker, rekeyDue } from "./rekeyPrompt";
 import { SnapshotsModal } from "./snapshotsModal";
 import { YaosSettingTab } from "./settingsTab";
 import { StatusBarController } from "./statusBar";
@@ -261,14 +263,40 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 	const unsubscribeBrake = host.onChange(checkBrake);
 	app.workspace.onLayoutReady(checkBrake);
 
+	// Key-roll prompt (e2ee-design §14.5): once per removal count per plugin start while a blocking removal is not
+	// covered by a new vault key; it closes by itself once any device covered it.
+	const rekeyTracker = new RekeyPromptTracker();
+	let rekeyPrompt: ConfirmModal | null = null;
+	const checkRekey = (): void => {
+		if (disposed) return;
+		if (rekeyPrompt && rekeyDue(host) === null) rekeyPrompt.close();
+		if (!rekeyTracker.shouldOpen(host)) return;
+		rekeyPrompt?.close();
+		const modal: ConfirmModal = new ConfirmModal(app, {
+			title: REKEY_PROMPT_TITLE,
+			message: REKEY_PROMPT_TEXT,
+			confirmText: REKEY_PROMPT_CONFIRM,
+			cancelText: REKEY_PROMPT_LATER,
+			destructive: false,
+			onConfirm: () => { if (rekeyPrompt === modal) rekeyPrompt = null; openRevokeRekey(); },
+			onCancel: () => { if (rekeyPrompt === modal) rekeyPrompt = null; },
+		});
+		rekeyPrompt = modal;
+		track(modal);
+	};
+	const unsubscribeRekey = host.onChange(checkRekey);
+	app.workspace.onLayoutReady(checkRekey);
+
 	return () => {
 		if (disposed) return;
 		disposed = true;
 		unsubscribeBrake();
+		unsubscribeRekey();
 		statusBar.dispose();
 		tab.dispose();
 		for (const modal of [...modals]) modal.close();
 		modals.clear();
 		brakeModal = null;
+		rekeyPrompt = null;
 	};
 }

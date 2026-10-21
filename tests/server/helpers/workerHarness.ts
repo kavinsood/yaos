@@ -264,7 +264,7 @@ export class VaultCluster {
 				this.rpc(name, "mintOwnerCode", () => host().mintOwnerCode(purpose)),
 			listDevices: () => this.rpc(name, "listDevices", () => host().listDevices()),
 			revokeDevice: (deviceId: string) => this.rpc(name, "revokeDevice", () => host().revokeDevice(deviceId)),
-			revokeGrant: (grantId: string) => this.rpc(name, "revokeGrant", () => host().revokeGrant(grantId)),
+			revokeGrant: (grantId: string) => this.rpc(name, "revokeGrant", () => host().revokeGrant(grantId, "operator")),
 			rotateGrant: (grantId: string) => this.rpc(name, "rotateGrant", () => host().rotateGrant(grantId)),
 			deleteVault: () => this.rpc(name, "deleteVault", () => host().deleteVault()),
 			resetStreams: () => this.rpc(name, "resetStreams", () => host().resetStreams()),

@@ -59,10 +59,10 @@ class FakeStore implements BlobPort {
 function session(o: { ping?: () => Promise<{ headSeq: Seq }> } = {}): RelaySession {
 	const unused = (): never => { throw new Error("unused by the device check"); };
 	return {
-		vaultEpoch: "e" as VaultEpoch, headSeq: 7 as Seq, canWrite: true, limits: DEFAULT_SIM_RELAY_LIMITS,
+		vaultEpoch: "e" as VaultEpoch, headSeq: 7 as Seq, canWrite: true, limits: DEFAULT_SIM_RELAY_LIMITS, rekey: { removals: 0, rekeyed: 0 },
 		ping: o.ping ?? (async () => ({ headSeq: 7 as Seq })),
 		feed: async () => ({ entries: [], throughSeq: 7 as Seq, headSeq: 7 as Seq, more: false }),
-		append: unused, bufferedBytes: unused, subscribe: unused, read: unused, readBatch: unused, putCheckpoint: unused, onEvent: unused, close: unused,
+		append: unused, bufferedBytes: unused, subscribe: unused, read: unused, readBatch: unused, putCheckpoint: unused, onEvent: unused, ackRekey: unused, close: unused,
 	};
 }
 

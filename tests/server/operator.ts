@@ -238,7 +238,8 @@ s.test("D7 operator revoke: the victim is closed 4403 before the response; its b
 		assert.deepEqual(socket.last("error")?.code, "authority_superseded");
 		assert.deepEqual([response.status, await json(response)],
 			[200, { ok: true, deviceId: laptop.deviceId, revoked: true }]);
-		assert.deepEqual(rows(world, vault), { config: 0, vault: 2 }, "§6.2 revoke = 2 rows (row + tombstone); the config DO only reads");
+		assert.deepEqual(rows(world, vault), { config: 0, vault: 3 },
+			"§6.2 revoke = 3 rows (row + tombstone + the key-roll count); the config DO only reads");
 		assert.equal((await deviceFeed(world, vaultId, laptop)).status, 401, "T-REVOKE-401 through the Worker");
 		const again = await world.fetch(`/operator/vaults/${vaultId}/devices/${laptop.deviceId}`, { method: "DELETE", cookie });
 		assert.deepEqual(await json(again), { ok: true, deviceId: laptop.deviceId, revoked: false });

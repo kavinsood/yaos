@@ -172,7 +172,7 @@ export class YaosSettingTab extends PluginSettingTab {
 			},
 			{
 				name: "Re-key after revoking a device",
-				desc: "After you removed a device in the server console: make a new vault key that it never gets.",
+				desc: "After you revoked a device in the server console (YAOS asks you then): make a new vault key that it never gets.",
 				visible: () => canRekey(this.host),
 				action: () => this.actions.openRevokeRekey(),
 			},

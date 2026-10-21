@@ -67,7 +67,7 @@ import {
 	type PairingPurpose,
 } from "./pairing";
 import { unwrapGrantSecret, wrapGrantSecret } from "./grantWrap";
-import { VAULT_SCHEMA, migrateIdentityV2, migrateIdentityV3 } from "./schema";
+import { VAULT_SCHEMA, migrateIdentityV2, migrateIdentityV3, migrateIdentityV4 } from "./schema";
 import { TICKET_TTL_MS, importTicketKey, signTicket, verifyTicket } from "./ticket";
 
 /** D6: `capabilityDigestForRole("owner")` of the removed server/src/collaboration.ts:93-97, frozen as a literal. */
@@ -133,6 +133,10 @@ export interface VaultMeta {
 	/** D8b: the last finished restore (rewind skip, finish idempotency). */
 	lastRestoreId: string | null;
 	lastRestoreAt: number | null;
+	/** Identity v4, the key-roll signal (e2ee-design §14.5): blocking removals by the operator. */
+	removals: number;
+	/** Identity v4: the highest `removals` a device has covered with a new vault key (never above `removals`). */
+	rekeyed: number;
 }
 
 export interface VaultState {
@@ -230,7 +234,11 @@ export interface VaultHostOptions {
 type MetaRow = {
 	vault_id: string; vault_generation: string; ticket_key: ArrayBuffer; created_at: number;
 	pending_restore_id: string | null; last_restore_id: string | null; last_restore_at: number | null;
+	removals: number; rekeyed: number;
 };
+
+const META_SELECT = "SELECT vault_id, vault_generation, ticket_key, created_at, pending_restore_id, last_restore_id,"
+	+ " last_restore_at, removals, rekeyed FROM vault_meta WHERE id = 1";
 type CodeRow = {
 	expires_at: number; used_at: number | null; used_request_id: string | null; used_device_id: string | null;
 	used_grant_id: string | null;
@@ -368,6 +376,8 @@ export class VaultHost {
 			noteCommitError: (error) => { this.latch.note(error); },
 			vaultId: () => this.state?.meta.vaultId ?? "",
 			vaultGeneration: () => this.state?.meta.vaultGeneration ?? "",
+			rekey: () => ({ removals: this.state?.meta.removals ?? 0, rekeyed: this.state?.meta.rekeyed ?? 0 }),
+			onRekeyed: (removals) => { this.noteRekeyed(removals); },
 			runtimeEpoch: this.runtimeEpoch,
 			clock: this.clock,
 			...(options.timers ? { timers: options.timers } : {}),
@@ -379,10 +389,7 @@ export class VaultHost {
 		if (this.state !== undefined) return this.state;
 		let row: MetaRow | undefined;
 		try {
-			row = this.storage.sql.exec<MetaRow>(
-				"SELECT vault_id, vault_generation, ticket_key, created_at, pending_restore_id, last_restore_id,"
-					+ " last_restore_at FROM vault_meta WHERE id = 1",
-			).toArray()[0];
+			row = this.readMeta();
 		} catch (error) {
 			if (!isMissingTableError(error, "vault_meta")) throw error;
 		}
@@ -396,11 +403,22 @@ export class VaultHost {
 			meta: { vaultId: row.vault_id, vaultGeneration: row.vault_generation,
 				ticketKey: new Uint8Array(row.ticket_key), createdAt: row.created_at,
 				pendingRestoreId: row.pending_restore_id, lastRestoreId: row.last_restore_id,
-				lastRestoreAt: row.last_restore_at },
+				lastRestoreAt: row.last_restore_at, removals: row.removals, rekeyed: row.rekeyed },
 			devices: DeviceMap.load(this.storage),
 			grants,
 		};
 		return this.state;
+	}
+
+	/** The meta row, or the identity v4 migration of a vault before it (schema.ts) and the read again. */
+	private readMeta(): MetaRow | undefined {
+		try {
+			return this.storage.sql.exec<MetaRow>(META_SELECT).toArray()[0];
+		} catch (error) {
+			if (!isMissingColumnError(error, "removals")) throw error;
+		}
+		migrateIdentityV4(this.storage);
+		return this.storage.sql.exec<MetaRow>(META_SELECT).toArray()[0];
 	}
 
 	/**
@@ -440,7 +458,7 @@ export class VaultHost {
 		const ticketKey = crypto.getRandomValues(new Uint8Array(32));
 		const vaultGeneration = randomBase64Url(16);
 		const meta: VaultMeta = { vaultId, vaultGeneration, ticketKey, createdAt: this.clock.now(),
-			pendingRestoreId: null, lastRestoreId: null, lastRestoreAt: null };
+			pendingRestoreId: null, lastRestoreId: null, lastRestoreAt: null, removals: 0, rekeyed: 0 };
 		this.storage.transactionSync(() => {
 			for (const ddl of VAULT_SCHEMA) this.storage.sql.exec(ddl);
 			this.storage.sql.exec(
@@ -992,7 +1010,7 @@ export class VaultHost {
 		if (credential.kind !== "grant") return unauthorized();
 		const restoring = this.restoreBlocked();
 		if (restoring) return restoring;
-		const result = this.revokeGrant(credential.grant.grantId);
+		const result = this.revokeGrant(credential.grant.grantId, "holder");
 		return json({ ok: true, grantId: credential.grant.grantId, revoked: result.revoked,
 			retiredDevices: result.retiredDevices });
 	}
@@ -1221,12 +1239,18 @@ export class VaultHost {
 	 * D7 revoke ("Remove device"): ONE synchronous turn, no await (`retireDevices`). Idempotent: an unknown device is
 	 * `revoked: false`. Identity-per-store §6.2: the removed deviceId is tombstoned, so it never comes back; an install
 	 * that still holds a live grant registers a new device on its next start (§3.4).
+	 *
+	 * Key-roll signal (e2ee-design §14.5): a device enrolled without a grant cannot come back, so its removal blocks it
+	 * and counts as a removal; a store under a live grant is only tidied (its install keeps syncing) and does not.
 	 */
 	revokeDevice(deviceId: string): { revoked: boolean; droppedFrames: number; closedSockets: number } {
 		const state = this.load();
 		const record = state?.devices.byId(deviceId);
 		if (state && record) {
-			const { droppedFrames, closedSockets } = this.retireDevices(state, [record]);
+			const blocks = record.grantId === null;
+			const { droppedFrames, closedSockets } = this.retireDevices(state, [record],
+				blocks ? () => { this.countRemoval(); } : undefined);
+			if (blocks) this.removalCounted(state);
 			return { revoked: true, droppedFrames, closedSockets };
 		}
 		const { droppedFrames, closedSockets } = this.relay.revokeDevice(deviceId);
@@ -1237,8 +1261,9 @@ export class VaultHost {
 	 * Identity-per-store §3.4 "Revoke pairing" (operator) and leave (the grant's holder): ONE synchronous turn. The
 	 * grant gets `revoked_at` (it is kept, so its secret answers `401 grant_revoked` and is never reused) and every
 	 * live device of it is retired: 1 + 2·D rows. Idempotent: an unknown or already revoked grant is `revoked: false`.
+	 * The operator's revoke is a blocking removal (e2ee-design §14.5: + 1 row, `vault_meta.removals`); a leave is not.
 	 */
-	revokeGrant(grantId: string): GrantRevokeResult {
+	revokeGrant(grantId: string, by: "operator" | "holder"): GrantRevokeResult {
 		const state = this.load();
 		const grant = state?.grants.byId(grantId);
 		if (!state || !grant || grant.revokedAt !== null) {
@@ -1248,8 +1273,10 @@ export class VaultHost {
 		const devices = state.devices.ofGrant(grantId);
 		const { droppedFrames, closedSockets } = this.retireDevices(state, devices, () => {
 			this.storage.sql.exec("UPDATE pairing_grant SET revoked_at = ? WHERE grant_id = ?", now, grantId);
+			if (by === "operator") this.countRemoval();
 		});
 		grant.revokedAt = now;
+		if (by === "operator") this.removalCounted(state);
 		return { revoked: true, retiredDevices: devices.length, droppedFrames, closedSockets };
 	}
 
@@ -1282,6 +1309,41 @@ export class VaultHost {
 			closedSockets += revoked.closedSockets;
 		}
 		return { droppedFrames, closedSockets };
+	}
+
+	// ---- the key-roll signal (e2ee-design §14.5) ------------------------------------------------------------------
+
+	/** Inside a retire's transaction: + 1 blocking removal (the memory copy follows in `removalCounted`). */
+	private countRemoval(): void {
+		this.storage.sql.exec("UPDATE vault_meta SET removals = removals + 1 WHERE id = 1");
+	}
+
+	/** After the retire's transaction committed: the memory copy, then every remaining socket hears of it. */
+	private removalCounted(state: VaultState): void {
+		state.meta.removals++;
+		this.relay.broadcastRekey();
+	}
+
+	/**
+	 * A device's `VAULT_REKEYED {removals}` (relay-wire §4.2): it rolled the vault key (a revoke record, e2ee-design
+	 * §14.2) after it had seen `removals`. Only a count above `rekeyed` and at most `removals` is taken (1 row), and
+	 * every socket hears the new state; anything else is ignored (a late or repeated ack, or a count the vault never
+	 * had). The relay admitted the socket's device just before (D7), so a removed device cannot ack. A failed write
+	 * (the daily limit) is dropped: the device acks again on its next session.
+	 */
+	private noteRekeyed(removals: number): void {
+		const state = this.load();
+		if (!state || removals <= state.meta.rekeyed || removals > state.meta.removals) return;
+		try {
+			this.storage.sql.exec("UPDATE vault_meta SET rekeyed = ? WHERE id = 1", removals);
+		} catch (error) {
+			this.latch.note(error);
+			console.warn("[yaos-vault] rekeyed write failed", describeError(error));
+			return;
+		}
+		this.identityWrites++;
+		state.meta.rekeyed = removals;
+		this.relay.broadcastRekey();
 	}
 
 	/**
@@ -1347,7 +1409,8 @@ export class VaultHost {
 			"SELECT device_id, grant_id, retired_at FROM retired_device").toArray()
 			.map((row): RetiredRecord => ({ deviceId: row.device_id, grantId: row.grant_id, retiredAt: row.retired_at }));
 		return { kind: "prepared", bookmark, devices: [...current.devices.list()].map((device) => ({ ...device })),
-			grants: [...current.grants.list()].map((grant) => ({ ...grant })), retired };
+			grants: [...current.grants.list()].map((grant) => ({ ...grant })), retired,
+			rekey: { removals: current.meta.removals, rekeyed: current.meta.rekeyed } };
 	}
 
 	/**
@@ -1381,7 +1444,7 @@ export class VaultHost {
 	 * grants or tombstones (a journal row from before identity v2) leaves those tables as the rewind left them.
 	 */
 	finishRestore(restoreId: string, snapshot: IdentitySnapshot): FinishRestoreResult {
-		const { devices, grants, retired } = snapshot;
+		const { devices, grants, retired, rekey } = snapshot;
 		const state = this.load();
 		if (!state) return { kind: "unknown_vault" };
 		if (state.meta.lastRestoreId === restoreId) return { kind: "finished", vaultEpoch: state.meta.vaultGeneration };
@@ -1430,10 +1493,11 @@ export class VaultHost {
 					tombstone.deviceId, tombstone.grantId, tombstone.retiredAt);
 			}
 			this.storage.sql.exec("DELETE FROM pairing_code");
+			// The key-roll signal crosses the rewind in the same meta row write (a snapshot without it keeps T's).
 			this.storage.sql.exec(
 				"UPDATE vault_meta SET vault_generation = ?, pending_restore_id = NULL, last_restore_id = ?,"
-					+ " last_restore_at = ? WHERE id = 1",
-				vaultGeneration, restoreId, now,
+					+ " last_restore_at = ?, removals = ?, rekeyed = ? WHERE id = 1",
+				vaultGeneration, restoreId, now, rekey?.removals ?? state.meta.removals, rekey?.rekeyed ?? state.meta.rekeyed,
 			);
 		});
 		this.identityWrites++;
@@ -1449,6 +1513,10 @@ export class VaultHost {
 		state.meta.pendingRestoreId = null;
 		state.meta.lastRestoreId = restoreId;
 		state.meta.lastRestoreAt = now;
+		if (rekey) {
+			state.meta.removals = rekey.removals;
+			state.meta.rekeyed = rekey.rekeyed;
+		}
 		this.restoring = null;
 		this.relay.discardAll(1001, "vault restored");
 		return { kind: "finished", vaultEpoch: vaultGeneration };

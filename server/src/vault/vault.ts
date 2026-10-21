@@ -88,7 +88,7 @@ export class VaultDO extends DurableObject<VaultEnv> {
 	 * `revokeDevice`).
 	 */
 	revokeGrant(grantId: string): GrantRevokeResult {
-		return this.host.revokeGrant(grantId);
+		return this.host.revokeGrant(grantId, "operator");
 	}
 
 	/** RPC: identity-per-store §3.4 "Rotate secret": a new grant secret, the old one dead from this turn on. */

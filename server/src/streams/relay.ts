@@ -228,6 +228,15 @@ function actorOf(attachment: StreamSocketAttachment): StreamActor {
 
 // ---- service ------------------------------------------------------------------
 
+/**
+ * The key-roll signal (e2ee-design §14.5, relay-wire §4.3): `removals` counts the operator's blocking removals,
+ * `rekeyed` the highest count a device has covered with a new vault key. Due while `removals > rekeyed`.
+ */
+export interface RekeySignal {
+	removals: number;
+	rekeyed: number;
+}
+
 export interface StreamRelayOptions {
 	config: StreamRelayConfig;
 	/** Getter: the runtime replaces storage-bound objects on vault delete. */
@@ -243,6 +252,10 @@ export interface StreamRelayOptions {
 	noteCommitError: (error: unknown) => void;
 	vaultId: () => string;
 	vaultGeneration: () => string;
+	/** The key-roll signal (e2ee-design §14.5) VAULT_READY and VAULT_REKEY carry. */
+	rekey: () => RekeySignal;
+	/** A device's `VAULT_REKEYED {removals}`: it rolled the vault key after seeing `removals` (the host checks it). */
+	onRekeyed: (removals: number) => void;
 	runtimeEpoch: string;
 	clock?: ClockPort;
 	timers?: TimerPort;
@@ -544,6 +557,7 @@ export class StreamRelayService {
 			liveness: SOCKET_LIVENESS_DESCRIPTOR,
 			capabilities: { streams: STREAMS_CAPABILITY_VERSION },
 			limits: this.limits(),
+			rekey: this.options.rekey(),
 			canWrite,
 			principalId: actor.principalId,
 			deviceId: actor.deviceId,
@@ -683,6 +697,11 @@ export class StreamRelayService {
 		try { value = JSON.parse(message.slice(6)); } catch { return; }
 		if (value !== null && typeof value === "object" && (value as { type?: unknown }).type === "STREAM_SUBSCRIBE") {
 			this.subscribe(socket, attachment, (value as { streams?: unknown }).streams);
+			return;
+		}
+		if (value !== null && typeof value === "object" && (value as { type?: unknown }).type === "VAULT_REKEYED") {
+			const removals = (value as { removals?: unknown }).removals;
+			if (typeof removals === "number" && Number.isSafeInteger(removals) && removals > 0) this.options.onRekeyed(removals);
 			return;
 		}
 		const ping = parseVaultPingFrame(value);
@@ -1041,6 +1060,17 @@ export class StreamRelayService {
 			for (const frame of dropped) if (frame.provisional) this.dropProvisional(peers, frame, "commit_failed");
 		}
 		return { droppedFrames: dropped.length, closedSockets };
+	}
+
+	/**
+	 * The key-roll signal changed (a blocking removal, or a device's VAULT_REKEYED): every streams socket of the vault
+	 * gets `VAULT_REKEY {removals, rekeyed}` (relay-wire §4.3). Event-driven: nothing is sent while it stays the same.
+	 */
+	broadcastRekey(): void {
+		const signal = this.options.rekey();
+		for (const { socket } of this.streamSockets()) {
+			this.options.sendControl(socket, { type: "VAULT_REKEY", removals: signal.removals, rekeyed: signal.rekeyed });
+		}
 	}
 
 	private supersede(socket: SocketPort): void {
