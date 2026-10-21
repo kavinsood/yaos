@@ -302,10 +302,10 @@ export class SimNet {
 	readonly oracleDisputed: string[] = [];
 	private readonly audit = { foreign: new Set<StreamName>(), largestRecordRow: 0, docStreams: new Set<DocId>(), rows: 0, bytes: 0 };
 
-	constructor(readonly clock: VirtualClock, o: { readonly seed?: number; readonly linkMs?: number; readonly jitterMs?: number; readonly sealBytes?: number } = {}) {
+	constructor(readonly clock: VirtualClock, o: { readonly seed?: number; readonly linkMs?: number; readonly jitterMs?: number; readonly sealBytes?: number; readonly dedupeWindowBytes?: number } = {}) {
 		this.httpMs = o.linkMs ?? 20;
 		const link = { uplinkMs: o.linkMs ?? 20, downlinkMs: o.linkMs ?? 20, jitterMs: o.jitterMs ?? 0, httpMs: o.linkMs ?? 20, connectMs: o.linkMs ?? 20 };
-		this.relay = new SimRelay({ clock, seed: o.seed ?? 1, link, ...(o.sealBytes !== undefined ? { sealBytes: o.sealBytes } : {}) });
+		this.relay = new SimRelay({ clock, seed: o.seed ?? 1, link, ...(o.sealBytes !== undefined ? { sealBytes: o.sealBytes } : {}), ...(o.dedupeWindowBytes !== undefined ? { dedupeWindowBytes: o.dedupeWindowBytes } : {}) });
 		this.blobs = new SimBlobStore({ now: () => clock.now(), timers: clock });
 		this.identities = new SimIdentityRegistry(() => clock.now());
 		this.relay.onCommit((info) => {

@@ -5,8 +5,8 @@
  *
  * The session also plays the wsRelay adapter (wire -> RelayEvent). Real
  * group commit (300 ms idle / 1500 ms max / 64 KiB), contiguous vault seqs,
- * vault-wide pending dedupe, segment dedupe window (open + newest sealed
- * while open < 64 rows), provisional / notice / dropped, per-socket token
+ * vault-wide pending dedupe, the H2 byte dedupe window (newest 4 MiB of
+ * stored rows per stream, memory only), provisional / notice / dropped, per-socket token
  * bucket (1009 / 1013), daily-limit latch, STREAM_RESEND on restart, feed and
  * read paging, checkpoint CAS + segment GC, per-socket link delays and fault
  * hooks. See docs/client-remake/wp-a-notes.md for the decisions.
@@ -18,11 +18,11 @@ import type { ClockPort } from "../ports/clock";
 import type { Unsubscribe } from "../ports/common";
 import type { RandomPort } from "../ports/random";
 import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectParams, RelayConnectResult, RelayEvent, RelayLimits, RelayPort } from "../ports/relay";
-import { RelayEngine, type CommitFault, type CommitHook, type SimCommitInfo, type SimRelayCounters } from "./a-relay-engine";
+import { RelayEngine, type ArmedCommitFault, type CommitFault, type CommitHook, type DropPoint, type SimCommitInfo, type SimRelayCounters } from "./a-relay-engine";
 import { SimRelaySession, type SessionHost } from "./a-relay-session";
 import { RelayStore, type SegmentInfo, type StoreFrame, type StoreSnapshot } from "./a-relay-store";
 import {
-	DEFAULT_SIM_DEDUPE_WINDOW,
+	DEFAULT_SIM_DEDUPE_WINDOW_BYTES,
 	DEFAULT_SIM_GROUP_COMMIT,
 	DEFAULT_SIM_RELAY_LIMITS,
 	SIM_FEED_MAX_LIMIT,
@@ -46,7 +46,7 @@ import {
 import { SeededRandom } from "./random";
 
 export {
-	DEFAULT_SIM_DEDUPE_WINDOW,
+	DEFAULT_SIM_DEDUPE_WINDOW_BYTES,
 	DEFAULT_SIM_GROUP_COMMIT,
 	DEFAULT_SIM_RELAY_LIMITS,
 	SIM_SEGMENT_MAX_BYTES,
@@ -65,7 +65,7 @@ export interface SimCheckpointStats {
 	readonly served: Record<string, number>;
 }
 
-export type { SimDeviceFanout } from "./a-relay-engine";
+export type { ArmedCommitFault, DropPoint, SimDeviceFanout } from "./a-relay-engine";
 export type { CommitFault, CommitHook, LinkSpec, SegmentInfo, SimCommitInfo, SimConnectFailureReason, SimRelayCounters, SimRelayOptions, SimRow, SimSessionInfo, StoreFrame, StoreSnapshot };
 
 /** A device's sessions, or one session by id. */
@@ -124,7 +124,7 @@ export class SimRelay implements RelayPort {
 		this.store = new RelayStore({
 			sealBytes: options.sealBytes ?? SIM_SEGMENT_SEAL_BYTES,
 			maxSegmentBytes: options.maxSegmentBytes ?? SIM_SEGMENT_MAX_BYTES,
-			tailRows: options.dedupeWindow ?? DEFAULT_SIM_DEDUPE_WINDOW,
+			dedupeWindowBytes: options.dedupeWindowBytes ?? DEFAULT_SIM_DEDUPE_WINDOW_BYTES,
 			gcOnCheckpoint: options.gcOnCheckpoint ?? true,
 		});
 		this.engine = new RelayEngine(this.clock, this.store, {
@@ -401,6 +401,38 @@ export class SimRelay implements RelayPort {
 	/** The next non-empty group commit gets `fault`. daily-limit latches until now + retryAfterMs, else the next 00:00 UTC. */
 	failNextCommit(fault: Exclude<CommitFault, "commit">, retryAfterMs: number | null = null): void {
 		this.engine.faults.push({ fault, retryAfterMs });
+	}
+
+	/** Arms a one-shot targeted drop of `deviceId`'s socket at `point` of the frame flow (DropPoint); `then` runs after it. */
+	armDrop(deviceId: DeviceId, point: DropPoint, then: (() => void) | null = null): void {
+		let set = this.engine.dropTaps.get(deviceId);
+		if (!set) this.engine.dropTaps.set(deviceId, (set = new Map()));
+		set.set(point, then);
+	}
+
+	/**
+	 * The next `count` live messages (COMMITTED / COMMIT_NOTICE) to `deviceId` are lost while its socket stays open: a
+	 * send the server's fan-out swallowed (server relay.ts fan-out: `catch` assumes "closed") on a socket that was not closed.
+	 */
+	loseSends(deviceId: DeviceId, count: number): void {
+		this.engine.lose.set(deviceId, (this.engine.lose.get(deviceId) ?? 0) + count);
+	}
+
+	/** The next group commit matching `match` gets `fault` (after any failNextCommit). */
+	armCommitFault(fault: ArmedCommitFault["fault"], match: ArmedCommitFault["match"]): void {
+		this.engine.armedCommits.push({ fault, match });
+	}
+
+	/** Every armed drop, lost send and armed commit fault is cancelled (the run's heal). */
+	disarm(): void {
+		this.engine.dropTaps.clear();
+		this.engine.lose.clear();
+		this.engine.armedCommits.length = 0;
+	}
+
+	/** Taps that fired (SimRelay sim faults). */
+	taps(): RelayEngine["taps"] {
+		return { ...this.engine.taps };
 	}
 
 	/** Consulted for every non-empty group commit without a queued failNextCommit. */

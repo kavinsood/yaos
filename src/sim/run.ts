@@ -184,13 +184,19 @@ export interface CheckpointWorld {
 	readonly tuning: Partial<EngineTuning>;
 	/** The relay's segment seal threshold (server: 64 KiB); null = the default. */
 	readonly sealBytes: number | null;
+	/**
+	 * The relay's H2 dedupe window in bytes (server: 4 MiB, a row must be resent within W bytes of later rows of its
+	 * stream to be deduped); null = the default. Scaled down in some seeds as the seal is, so a resend after a long
+	 * offline period or a lost receipt outlives its original's window and is appended again (R4).
+	 */
+	readonly dedupeWindowBytes: number | null;
 	/** Device index that joins late (its app starts at plan step `atStep`), suite 0 only. */
 	readonly lateJoin: { readonly dev: number; readonly atStep: number } | null;
 	/** Per device: recovery snapshots on and uploaded (snap rows), else off. */
 	readonly snapshots: readonly boolean[];
 }
 
-const PRODUCTION_WORLD = (devices: number): CheckpointWorld => ({ tuning: {}, sealBytes: null, lateJoin: null, snapshots: Array.from({ length: devices }, () => false) });
+const PRODUCTION_WORLD = (devices: number): CheckpointWorld => ({ tuning: {}, sealBytes: null, dedupeWindowBytes: null, lateJoin: null, snapshots: Array.from({ length: devices }, () => false) });
 
 /** Log-uniform integer in [lo, hi]. */
 function logRange(r: SeededRandom, lo: number, hi: number): number {
@@ -240,7 +246,10 @@ export function checkpointWorld(cfg: SimConfig): CheckpointWorld {
 	const sr = r.fork("snapshots");
 	const on = sr.chance(0.4);
 	const snapshots = Array.from({ length: c.devices }, (_, i) => on && (i === 0 || sr.chance(0.7)));
-	return { tuning, sealBytes, lateJoin, snapshots };
+	// Own stream (the draws above keep their values): a third of the seeds run a window of 256 B .. 64 KiB.
+	const dd = r.fork("dedupe");
+	const dedupeWindowBytes = dd.chance(0.35) ? logRange(dd, 256, 64 * 1024) : null;
+	return { tuning, sealBytes, dedupeWindowBytes, lateJoin, snapshots };
 }
 
 export type Step =
@@ -297,6 +306,8 @@ export interface SimReport {
 		 * clone), and the relay registry's answers to registrations (ok, or the refusal).
 		 */
 		readonly identity: { readonly stores: number; readonly registrations: Readonly<Record<string, number>> };
+		/** Targeted relay faults that fired (faults.ts targetedDrop / lostSend / commitFail). */
+		readonly relayTaps: Readonly<Record<string, number>>;
 	};
 }
 
@@ -458,7 +469,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const nr = world.fork("net");
 		const cw = checkpointWorld(cfg);
 		const tw = tuningWorld(cfg, c.devices);
-		const net = new SimNet(clock, { seed: nr.int(0x7fffffff), linkMs: nr.range(5, 60), jitterMs: nr.range(0, 90), ...(cw.sealBytes !== null ? { sealBytes: cw.sealBytes } : {}) });
+		const net = new SimNet(clock, { seed: nr.int(0x7fffffff), linkMs: nr.range(5, 60), jitterMs: nr.range(0, 90), ...(cw.sealBytes !== null ? { sealBytes: cw.sealBytes } : {}), ...(cw.dedupeWindowBytes !== null ? { dedupeWindowBytes: cw.dedupeWindowBytes } : {}) });
 		const devs = NAMES.slice(0, c.devices).map((name, di) => {
 			const dr = world.fork(`dev-${name}`);
 			const watch = dr.fork("watch");
@@ -479,7 +490,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const trace: string[] = [`world ${profile} ${devs.map((d) => `${d.name}:${d.platform.info.os}`).join(" ")}`];
 		if (cfg.checkpoints !== "production") {
 			const t = cw.tuning;
-			trace.push(`checkpoints ${JSON.stringify({ ...t.checkpoint, compactRows: t.compactRows, candidate: t.nsCandidateModulus, seal: cw.sealBytes, join: cw.lateJoin, snapshots: cw.snapshots.map((x) => (x ? 1 : 0)).join("") })}`);
+			trace.push(`checkpoints ${JSON.stringify({ ...t.checkpoint, compactRows: t.compactRows, candidate: t.nsCandidateModulus, seal: cw.sealBytes, dedupe: cw.dedupeWindowBytes, join: cw.lateJoin, snapshots: cw.snapshots.map((x) => (x ? 1 : 0)).join("") })}`);
 		}
 		tw?.forEach((x, i) => trace.push(`tuning ${devs[i]?.name} ${JSON.stringify({ ...x.tuning, ...x.budgets })}`));
 
@@ -642,7 +653,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, brakes: brakeUser.stats, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), identity: { stores: devs.reduce((n, d) => n + d.identities.length, 0), registrations: { ...net.identities.counts } }, ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
+			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, brakes: brakeUser.stats, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), identity: { stores: devs.reduce((n, d) => n + d.identities.length, 0), registrations: { ...net.identities.counts } }, relayTaps: net.relay.taps(), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
 		};
 	} finally {
 		seedEntropy(null);

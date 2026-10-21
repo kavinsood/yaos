@@ -21,8 +21,11 @@ export const DEFAULT_SIM_RELAY_LIMITS: RelayLimits = Object.freeze({
 	maxSubscriptions: 128,
 });
 
-/** STREAM_DEDUPE_TAIL_ROWS: the newest sealed segment is searched while the open segment has fewer rows. */
-export const DEFAULT_SIM_DEDUPE_WINDOW = 64;
+/**
+ * STREAM_DEDUPE_WINDOW_BYTES (server/src/streams/dedupe.ts, H2): a resend is deduplicated exactly when its original is
+ * among the newest W stored-row bytes of its stream.
+ */
+export const DEFAULT_SIM_DEDUPE_WINDOW_BYTES = 4 * 1024 * 1024;
 export const SIM_SEGMENT_SEAL_BYTES = 64 * 1024;
 export const SIM_SEGMENT_MAX_BYTES = 1_500_000;
 /** Raw binary message cap = maxFrameBytes + this (MAX_STREAM_BINARY_MESSAGE_BYTES). */
@@ -81,8 +84,11 @@ export interface SimRelayOptions {
 	readonly limits?: Partial<RelayLimits>;
 	/** Extra cap on rows per read() page (tests: force paging). Default unlimited. */
 	readonly readPageRows?: number;
-	/** Dedupe tail rows (server STREAM_DEDUPE_TAIL_ROWS). Default 64. */
-	readonly dedupeWindow?: number;
+	/**
+	 * H2 dedupe window in stored-row bytes per stream (server STREAM_DEDUPE_WINDOW_BYTES). Default 4 MiB; small values
+	 * make a slow resend outlive its original's window (appended again, R4).
+	 */
+	readonly dedupeWindowBytes?: number;
 	/** Open segment seal threshold. Default 64 KiB; small values make window expiry and GC testable. */
 	readonly sealBytes?: number;
 	readonly maxSegmentBytes?: number;

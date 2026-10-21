@@ -59,32 +59,46 @@ test("relay dedupe: store hit — same bytes -> deduped receipt with the origina
 	assert.deepEqual([k.storeDedupes, k.committedRows, k.provisionalDrops], [2, 2, 2]);
 });
 
-test("relay dedupe: window = open segment + newest sealed while open has < tail rows; outside it a resend is appended again (R4)", async () => {
+test("relay dedupe: H2 window = the newest W stored-row bytes of the stream, whatever the segments; outside it a resend is appended again (R4)", async () => {
 	const clock = new VirtualClock();
-	// rows here are 27 bytes: segments seal after 4 one-row commits; tail rule after 2 open rows
-	const relay = new SimRelay({ clock, sealBytes: 100, dedupeWindow: 2 });
+	// rows here are 27 bytes: segments seal after 4 one-row commits; W = 60 keeps the newest rows holding >= 60 bytes (3)
+	const relay = new SimRelay({ clock, sealBytes: 100, dedupeWindowBytes: 60 });
 	const a = await connectPeer(relay, clock, "A");
 	const send = async (id: string): Promise<void> => {
 		a.session.append(frame("ns", id, 20));
 		await clock.runUntilIdle();
 	};
-	for (const id of ["f1", "f2", "f3", "f4"]) await send(id);
+	for (const id of ["f1", "f2", "f3"]) await send(id);
+	assert.ok(relay.store.inDedupeWindow(ns, "A" as DeviceId, "f1" as ClientFrameId), "81 bytes, dropping f1 would leave 54 < 60");
+	await send("f1");
+	assert.deepEqual(trace(a.events).slice(-2), ["receipt f1@1 dedup", "head 3"]);
+	await send("f4");
 	assert.deepEqual(relay.store.segments(ns), { sealed: [{ firstSeq: 1, lastSeq: 4, rows: 4, bytes: 108 }], open: null });
-	await send("f1"); // open empty -> newest sealed searched -> deduped
-	assert.deepEqual(trace(a.events).slice(-2), ["receipt f1@1 dedup", "head 4"]);
-	await send("f5");
-	assert.ok(relay.store.inDedupeWindow(ns, "A" as DeviceId, "f2" as ClientFrameId));
-	await send("f6");
-	assert.ok(!relay.store.inDedupeWindow(ns, "A" as DeviceId, "f2" as ClientFrameId), "open holds 2 rows: sealed tail no longer searched");
-	assert.ok(relay.store.inDedupeWindow(ns, "A" as DeviceId, "f6" as ClientFrameId));
-	await send("f2");
-	assert.deepEqual(trace(a.events).slice(-2), ["receipt f2@7", "head 7"]);
-	assert.deepEqual(relay.rows(ns).map((r) => r.clientFrameId), ["f1", "f2", "f3", "f4", "f5", "f6", "f2"]);
-	assert.deepEqual(relay.store.segments(ns), { sealed: [{ firstSeq: 1, lastSeq: 4, rows: 4, bytes: 108 }], open: { firstSeq: 5, lastSeq: 7, rows: 3, bytes: 81 } });
+	assert.ok(!relay.store.inDedupeWindow(ns, "A" as DeviceId, "f1" as ClientFrameId), "f2..f4 hold 81 >= 60 bytes: f1 left the window");
+	assert.ok(relay.store.inDedupeWindow(ns, "A" as DeviceId, "f2" as ClientFrameId), "a sealed segment is no boundary");
+	await send("f1");
+	assert.deepEqual(trace(a.events).slice(-2), ["receipt f1@5", "head 5"]);
+	assert.deepEqual(relay.rows(ns).map((r) => r.clientFrameId), ["f1", "f2", "f3", "f4", "f1"]);
+});
+
+test("relay dedupe: the window is memory only; after a relay restart it is rebuilt from the rows still in segments (collected ones are out)", async () => {
+	const clock = new VirtualClock();
+	const relay = new SimRelay({ clock, sealBytes: 50, dedupeWindowBytes: 1_000 });
+	const a = await connectPeer(relay, clock, "A");
+	const send = async (id: string): Promise<void> => {
+		a.session.append(frame("ns", id, 20));
+		await clock.runUntilIdle();
+	};
+	for (const id of ["f1", "f2", "f3"]) await send(id);
+	assert.deepEqual(relay.store.putCheckpoint(ns, 2, 0, bytes("ck")), { ok: true, gcSeq: 2, deletedSegments: 1 });
+	assert.ok(relay.store.inDedupeWindow(ns, "A" as DeviceId, "f1" as ClientFrameId), "warm: the collected original's key is kept");
+	relay.restart();
+	assert.ok(!relay.store.inDedupeWindow(ns, "A" as DeviceId, "f1" as ClientFrameId), "cold rebuild: f1's segment was collected");
+	assert.ok(relay.store.inDedupeWindow(ns, "A" as DeviceId, "f3" as ClientFrameId));
 });
 
 test("relay store: batch-level dedupe is vault-wide; pre-seal before maxSegmentBytes; seal after >= sealBytes", () => {
-	const store = new RelayStore({ sealBytes: 1000, maxSegmentBytes: 60, tailRows: 64, gcOnCheckpoint: true });
+	const store = new RelayStore({ sealBytes: 1000, maxSegmentBytes: 60, dedupeWindowBytes: 4 << 20, gcOnCheckpoint: true });
 	const f = (stream: string, id: string, payload: string) => ({ stream: stream as StreamName, deviceId: "A" as DeviceId, clientFrameId: id as ClientFrameId, payload: bytes(payload) });
 	const r = store.commit([f("ns", "k", "x"), f("ns", "k", "x"), f("cfg", "k", "x"), f("ns", "k", "y"), f("ns", "j", "x".repeat(40)), f("ns", "i", "x".repeat(40))]);
 	assert.deepEqual(r.outcomes, [
@@ -100,12 +114,12 @@ test("relay store: batch-level dedupe is vault-wide; pre-seal before maxSegmentB
 test("relay store: rows a checkpoint at lastSeq retired (H7) stay in the dedupe window; a resend is deduped at its seq, even with other bytes", () => {
 	// Without this a device that crashed before its receipt resent a frame the retire had collected and it was
 	// committed twice (crash.test.ts "durable frame committed exactly once"); the server's H2 index keeps the key.
-	const store = new RelayStore({ sealBytes: 1000, maxSegmentBytes: 1000, tailRows: 2, gcOnCheckpoint: true });
+	const store = new RelayStore({ sealBytes: 1000, maxSegmentBytes: 1000, dedupeWindowBytes: 15, gcOnCheckpoint: true });
 	const f = (id: string, payload: string) => ({ stream: ns, deviceId: "A" as DeviceId, clientFrameId: id as ClientFrameId, payload: bytes(payload) });
 	store.commit([f("a", "x"), f("b", "x")]);
 	assert.deepEqual(store.putCheckpoint(ns, 2, 0, bytes("ck")), { ok: true, gcSeq: 2, deletedSegments: 0 });
 	assert.equal(store.segments(ns).open, null);
 	assert.deepEqual(store.commit([f("b", "x"), f("a", "zz")]).outcomes, [{ kind: "deduped", seq: 2 }, { kind: "deduped", seq: 1 }]);
 	store.commit([f("c", "x"), f("d", "x")]);
-	assert.ok(!store.inDedupeWindow(ns, "A" as DeviceId, "a" as ClientFrameId), "open holds tailRows rows: the retired rows leave the window");
+	assert.ok(!store.inDedupeWindow(ns, "A" as DeviceId, "a" as ClientFrameId), "c and d hold >= 15 bytes: the retired rows leave the window");
 });

@@ -3,16 +3,19 @@
  *
  * Per stream: sealed segments (oldest first) plus the open segment. A commit
  * assigns the next vault seqs in arrival order; dedupe looks at frames earlier
- * in the batch (vault-wide key), then the stream's open segment, plus the
- * newest sealed segment while the open segment holds < tailRows rows (both as
- * of before the commit). Rows are pre-sealed before the open segment would
+ * in the batch (vault-wide key), then the stream's H2 window (server
+ * streams/dedupe.ts): the newest dedupeWindowBytes of stored-row bytes, as of
+ * before the commit. The window is memory only, as the server's index:
+ * forgetDedupe() (a relay restart) drops it and the next lookup rebuilds it
+ * from the rows still in segments, so collected rows are out of it then. Rows
+ * are pre-sealed before the open segment would
  * pass maxSegmentBytes and sealed after the commit once >= sealBytes.
  * putCheckpoint is a CAS; it deletes sealed segments wholly <= coversSeq and
  * gcSeq becomes the highest deleted seq. The open segment is the retain window,
  * except that a checkpoint at lastSeq retires the stream (server H7,
- * store.ts putCheckpoint): the open segment goes too and gcSeq = lastSeq. Its
- * rows stay in the dedupe window as the open segment's (server H2 keeps their
- * keys); a resend of one is deduped at the original seq.
+ * store.ts putCheckpoint): the open segment goes too and gcSeq = lastSeq. A
+ * warm window keeps the keys of collected rows; a resend of one (seq <= gcSeq)
+ * is deduped at the original seq without a byte compare (server H2 lookup).
  */
 
 import type { ClientFrameId, DeviceId, Seq, StreamName } from "../core/types";
@@ -76,16 +79,17 @@ interface StreamState {
 	/** Every committed row (introspection only). */
 	readonly history: SimRow[];
 	/**
-	 * The rows of the open segment a checkpoint at lastSeq retired (H7), for dedupe only: they stay in the window
-	 * the open segment was (the server's H2 index keeps their keys; an original at or below gcSeq counts as deduped).
+	 * The H2 window (server StreamDedupeIndex): (key, seq, rowBytes) oldest first, trimmed to the newest
+	 * dedupeWindowBytes; null = cold (rebuilt from the segment rows at the next lookup).
 	 */
-	retired: SimRow[];
+	window: { readonly key: string; readonly seq: Seq; readonly bytes: number }[] | null;
+	windowBytes: number;
 }
 
 export interface StoreConfig {
 	readonly sealBytes: number;
 	readonly maxSegmentBytes: number;
-	readonly tailRows: number;
+	readonly dedupeWindowBytes: number;
 	readonly gcOnCheckpoint: boolean;
 }
 
@@ -98,17 +102,11 @@ export interface StoreSnapshot {
 function copyState(st: StreamState): StreamState {
 	return {
 		name: st.name, sealed: st.sealed.map((g) => ({ rows: g.rows.slice(), bytes: g.bytes })), open: { rows: st.open.rows.slice(), bytes: st.open.bytes },
-		lastSeq: st.lastSeq, checkpoint: st.checkpoint, gcSeq: st.gcSeq, history: st.history.slice(), retired: st.retired.slice(),
+		// A snapshot / restore (server D8b) forgets every cached fact, the dedupe index included.
+		lastSeq: st.lastSeq, checkpoint: st.checkpoint, gcSeq: st.gcSeq, history: st.history.slice(), window: null, windowBytes: 0,
 	};
 }
 
-function findKey(rows: readonly SimRow[], key: string): SimRow | undefined {
-	for (let i = rows.length - 1; i >= 0; i--) {
-		const row = rows[i]!;
-		if (frameKey(row.deviceId, row.clientFrameId) === key) return row;
-	}
-	return undefined;
-}
 
 export class RelayStore {
 	private headSeq: Seq = 0;
@@ -153,12 +151,45 @@ export class RelayStore {
 		return rows;
 	}
 
+	/** Server H2 lookup: the newest windowed row of `key` (its seq; the row itself from history), or undefined. */
 	private lookup(state: StreamState | undefined, key: string): SimRow | undefined {
 		if (state === undefined) return undefined;
-		const open = findKey(state.open.rows, key);
-		if (open !== undefined || state.open.rows.length >= this.config.tailRows) return open;
-		if (state.sealed.length === 0) return findKey(state.retired, key);
-		return findKey(state.sealed[state.sealed.length - 1]!.rows, key);
+		const window = this.warm(state);
+		for (let i = window.length - 1; i >= 0; i--) {
+			const w = window[i]!;
+			if (w.key !== key) continue;
+			return state.history.find((r) => r.seq === w.seq);
+		}
+		return undefined;
+	}
+
+	/** The stream's window, rebuilt (cold scan) from the rows still in segments when it was forgotten. */
+	private warm(state: StreamState): NonNullable<StreamState["window"]> {
+		if (state.window !== null) return state.window;
+		state.window = [];
+		state.windowBytes = 0;
+		for (const row of [...state.sealed.flatMap((g) => g.rows), ...state.open.rows]) this.windowAdd(state, row);
+		return state.window;
+	}
+
+	/** Server StreamDedupeIndex.add: append the newest row, then drop the oldest while the rest still hold >= W bytes. */
+	private windowAdd(state: StreamState, row: SimRow): void {
+		const window = state.window;
+		if (window === null) return;
+		const bytes = rowBytes(row);
+		window.push({ key: frameKey(row.deviceId, row.clientFrameId), seq: row.seq, bytes });
+		state.windowBytes += bytes;
+		let drop = 0;
+		while (window.length - drop > 1 && state.windowBytes - window[drop]!.bytes >= this.config.dedupeWindowBytes) state.windowBytes -= window[drop++]!.bytes;
+		if (drop > 0) window.splice(0, drop);
+	}
+
+	/** Relay restart: every stream's H2 window is forgotten (memory only). */
+	forgetDedupe(): void {
+		for (const state of this.streamMap.values()) {
+			state.window = null;
+			state.windowBytes = 0;
+		}
 	}
 
 	/** One transaction: outcomes in frame order; seqs of appended rows are contiguous. */
@@ -200,7 +231,7 @@ export class RelayStore {
 	private writeStream(stream: StreamName, rows: readonly SimRow[]): void {
 		let state = this.streamMap.get(stream);
 		if (state === undefined) {
-			state = { name: stream, sealed: [], open: { rows: [], bytes: 0 }, lastSeq: 0, checkpoint: null, gcSeq: 0, history: [], retired: [] };
+			state = { name: stream, sealed: [], open: { rows: [], bytes: 0 }, lastSeq: 0, checkpoint: null, gcSeq: 0, history: [], window: [], windowBytes: 0 };
 			this.streamMap.set(stream, state);
 		}
 		for (const row of rows) {
@@ -210,6 +241,8 @@ export class RelayStore {
 			state.open.bytes += size;
 			state.lastSeq = row.seq;
 			state.history.push(row);
+			// Rows join the index once durable (server commit()); a cold window picks them up when it is rebuilt.
+			this.windowAdd(state, row);
 		}
 		if (state.open.bytes >= this.config.sealBytes) this.seal(state);
 	}
@@ -287,7 +320,6 @@ export class RelayStore {
 			}
 			// H7: a checkpoint at lastSeq retires the stream; the open segment is dropped with the same head update.
 			if (coversSeq === state.lastSeq) {
-				if (state.open.rows.length > 0) state.retired = state.open.rows;
 				state.open = { rows: [], bytes: 0 };
 				state.gcSeq = state.lastSeq;
 			}

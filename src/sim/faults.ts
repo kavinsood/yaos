@@ -9,7 +9,13 @@
  *              mirrors); IndexedDB connection lost while running; offline
  *              periods; vault I/O failures; backgrounding; slow watchers (run.ts)
  *   relay      socket drops (1006/1001/1011) at random points of the frame
- *              flow; relay restart (STREAM_RESEND, unreceipted frames lost;
+ *              flow, and targeted ones (targetedDrop: right after an APPEND
+ *              was admitted, right before a held PROVISIONAL's COMMIT_NOTICE,
+ *              right before STREAM_RECEIPTS); live messages lost on an open
+ *              socket (lostSend: a send the server swallowed, the client's gap
+ *              feed recovers); a failed group commit (commitFail: durability,
+ *              PROVISIONAL holders dropped; or the runtime lost after the write,
+ *              before fan-out); drawn only by RELAY_FAULTS; relay restart (STREAM_RESEND, unreceipted frames lost;
  *              with relaySubsLost every subscription is empty until its
  *              client resends it);
  *              graceful drain; HTTP failures; daily limit; vault epoch reset
@@ -44,6 +50,7 @@ import type { DeviceId } from "../core/types";
 import type { LifecycleEvent } from "../ports/platform";
 import type { TimerHandle } from "../ports/clock";
 import type { SimStallScope } from "./blobStore";
+import type { DropPoint } from "./relay";
 import { tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
 import { E2eeFaults, type E2eeFaultAction } from "./e2eeFaults";
@@ -63,6 +70,15 @@ export type FaultAction =
 	| { readonly t: "ioFail"; readonly dev: number; readonly ops: number }
 	| { readonly t: "background"; readonly dev: number; readonly event: "hidden" | "pagehide" | "freeze"; readonly durationMs: number }
 	| { readonly t: "socketDrop"; readonly dev: number; readonly code: number }
+	/**
+	 * Device `dev`'s socket is lost at the next `at` point of its frame flow (a-relay-engine DropPoint); with offlineMs
+	 * the network stays down that long (a tunnel, a dead Wi-Fi): its resend comes late, maybe past the dedupe window.
+	 */
+	| { readonly t: "targetedDrop"; readonly dev: number; readonly at: DropPoint; readonly offlineMs: number }
+	/** The next `count` live messages to `dev` are lost while its socket stays open. */
+	| { readonly t: "lostSend"; readonly dev: number; readonly count: number }
+	/** The next group commit (holding a PROVISIONAL some socket was sent, with `provisional`) fails. */
+	| { readonly t: "commitFail"; readonly fault: "durability" | "restart-after"; readonly provisional: boolean }
 	| { readonly t: "relayRestart" }
 	/** Relay restart whose socket attachments kept no subscription (overflow): every set empty until resent. */
 	| { readonly t: "relaySubsLost" }
@@ -142,7 +158,17 @@ export const DEFAULT_FAULTS: FaultWeights = {
 	suspendKill: 0,
 	// Identity per store (CLONE_FAULTS): last and weight 0 here, so the default plans draw as before.
 	clone: 0, syncedConfig: 0,
+	// Targeted relay faults (RELAY_FAULTS): last and weight 0 here, so the default plans draw as before.
+	targetedDrop: 0, lostSend: 0, commitFail: 0,
 };
+
+/**
+ * The default matrix plus the relay faults at targeted points of the frame flow: socket drops right after an APPEND,
+ * before a held PROVISIONAL's notice and before the receipts; live messages lost on an open socket (gap feed); failed
+ * group commits (durability: PROVISIONAL holders dropped; runtime lost after the write). Paired with the checkpoint
+ * world's small dedupe windows (run.ts), a resend after a lost receipt can outlive its original's window.
+ */
+export const RELAY_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, socketDrop: 2, targetedDrop: 6, lostSend: 2, commitFail: 2, offline: 5 };
 
 /**
  * The default matrix plus a copied vault folder run as a second device (clone) and a sync tool carrying the plugin's
@@ -217,6 +243,9 @@ export function generateFault(rng: SeededRandom, devices: number, weights: Fault
 		case "blobSlow": return { t: "blobSlow", durationMs: rng.range(5_000, 150_000), bytesPerSec: Math.round(SLOW_MIN_BPS * (SLOW_MAX_BPS / SLOW_MIN_BPS) ** rng.float()) };
 		case "clone": return { t: "clone", dev, src: (dev + 1 + rng.int(Math.max(1, devices - 1))) % devices, downMs: rng.range(200, 10_000) };
 		case "syncedConfig": return { t: "syncedConfig", dev, peer: (dev + 1 + rng.int(Math.max(1, devices - 1))) % devices, durationMs: rng.range(5_000, 120_000) };
+		case "targetedDrop": return { t: "targetedDrop", dev, at: rng.pick(["append", "notice", "notice", "receipt", "receipt"] as const), offlineMs: rng.chance(0.5) ? 0 : rng.range(1_000, 60_000) };
+		case "lostSend": return { t: "lostSend", dev, count: rng.range(1, 4) };
+		case "commitFail": return { t: "commitFail", fault: rng.chance(0.6) ? "durability" : "restart-after", provisional: rng.chance(0.7) };
 		case "suspendKill": return { t: "suspendKill", dev, event: rng.pick(["hidden", "pagehide", "freeze"] as const), budget: rng.pick(SUSPEND_BUDGETS), save: rng.chance(0.5) ? "landed" : "lost", downMs: rng.range(200, 10_000), durationMs: rng.range(100, 30_000) };
 	}
 }
@@ -263,6 +292,7 @@ export class FaultState {
 		socketDrop: 0, relayRestart: 0, relayDrain: 0, httpFail: 0, dailyLimit: 0, epochReset: 0, clockSkew: 0,
 		keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
 		blobStall: 0, blobSlow: 0, relaySubsLost: 0, suspendKill: 0, clone: 0, syncedConfig: 0,
+		targetedDrop: 0, lostSend: 0, commitFail: 0,
 	};
 	/** The device pair a sync tool links now (syncedConfig), and how to end it. */
 	private synced: { readonly a: number; readonly b: number; readonly end: () => void } | null = null;
@@ -346,6 +376,10 @@ export class FaultState {
 				this.counts.blobSlow++;
 				this.later(f.durationMs, () => this.net.blobs.setSlow(null));
 				return `fault blobSlow ${f.durationMs}ms ${f.bytesPerSec}B/s`;
+			case "commitFail":
+				this.net.relay.armCommitFault(f.fault, f.provisional ? "provisional" : "any");
+				this.counts.commitFail++;
+				return `fault commitFail ${f.fault}${f.provisional ? " (provisional)" : ""}`;
 			case "epochReset": {
 				const epoch = `sim-epoch-reset-${++this.epochs}`;
 				this.net.relay.resetEpoch(epoch);
@@ -427,6 +461,23 @@ export class FaultState {
 				this.net.relay.dropSession(d.deviceId, f.code);
 				this.counts.socketDrop++;
 				return `${tag} ${f.code}`;
+			case "targetedDrop": {
+				const i = f.dev;
+				// Fired by the relay later: the network is lost then (unless the device is down or offline already).
+				const then = f.offlineMs > 0 ? () => {
+					if (this.down.has(i) || this.offline.has(i) || this.devs[i] !== d) return;
+					this.offline.add(i);
+					d.setOnline(false);
+					this.later(f.offlineMs, () => this.reconnect(i));
+				} : null;
+				this.net.relay.armDrop(d.deviceId, f.at, then);
+				this.counts.targetedDrop++;
+				return `${tag} at ${f.at}${f.offlineMs > 0 ? `, offline ${f.offlineMs}ms` : ""}`;
+			}
+			case "lostSend":
+				this.net.relay.loseSends(d.deviceId, f.count);
+				this.counts.lostSend++;
+				return `${tag} x${f.count}`;
 			case "clockSkew":
 				d.wallSkewMs += f.deltaMs;
 				this.counts.clockSkew++;
@@ -695,6 +746,7 @@ export class FaultState {
 		this.armed.clear();
 		this.healHttp();
 		this.healLimit();
+		this.net.relay.disarm();
 		// Calls a stall caught stay dead (blobStore.ts header): their idle windows or link aborts end them.
 		this.net.blobs.setStall(null);
 		this.net.blobs.setSlow(null);
