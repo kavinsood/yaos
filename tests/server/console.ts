@@ -27,8 +27,8 @@ const ROUTES = [
 	"GET /api/capabilities", "POST /operator/login", "POST /operator/logout", "GET /operator/state",
 	"POST /operator/vaults/:id/owner-code", "DELETE /operator/vaults/:id",
 	"GET /operator/vaults/:id/devices", "DELETE /operator/vaults/:id/devices/:id", "POST /operator/vaults/:id/reset-streams",
-	// Identity-per-store §6.3 "Revoke pairing".
-	"DELETE /operator/vaults/:id/grants/:id",
+	// Identity-per-store §6.3 "Revoke pairing", §3.4 "Rotate secret".
+	"DELETE /operator/vaults/:id/grants/:id", "POST /operator/vaults/:id/grants/:id/rotate",
 	"POST /operator/vaults/:id/restore",
 ];
 /** Error codes the operator routes the console calls document: §2.2, D3 (limiter), D5, D8a, D8b, G8. */
@@ -342,6 +342,14 @@ s.test("identity-per-store §6.3: devices grouped by pairing; Revoke pairing and
 	assert.match(text, /Old phone \(device-0001-abcdef\), paired/, "a device without a grant is listed as before");
 	assert.match(text, /1 revoked pairing is not shown\./);
 	assert.ok(!text.includes("Lost laptop"), "revoked grants are not listed");
+
+	// §3.4 "Rotate secret": a POST with {}; the new secret is never shown.
+	page.reply(`POST ${base}/grants/${GRANT}/rotate`, 200, { ok: true, grantId: GRANT, rotated: true });
+	await page.press(page.card().button("Rotate secret"));
+	const rotate = page.calls.filter((c) => c.method === "POST").at(-1)!;
+	assert.deepEqual([rotate.path, rotate.body], [`${base}/grants/${GRANT}/rotate`, {}]);
+	assert.match(page.confirms.at(-1)!, /Its stores keep syncing and pick up the new secret themselves/);
+	assert.deepEqual([page.msg, page.last().path], ["The pairing secret of Mac is rotated.", `${base}/devices`]);
 
 	page.reply(`DELETE ${base}/grants/${GRANT}`, 409, { error: "restore_in_progress" });
 	await page.press(page.card().button("Revoke pairing"));

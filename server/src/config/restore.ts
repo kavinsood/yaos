@@ -137,7 +137,7 @@ function encodeSnapshot(snapshot: IdentitySnapshot): ArrayBuffer {
 		grants: snapshot.grants?.map((grant) => ({
 			grantId: grant.grantId, secretHash: grant.secretHash, name: grant.name,
 			enrollmentRequestId: grant.enrollmentRequestId, createdAt: grant.createdAt, revokedAt: grant.revokedAt,
-			registeredDay: grant.registeredDay, registeredCount: grant.registeredCount,
+			registeredDay: grant.registeredDay, registeredCount: grant.registeredCount, secretWrap: grant.secretWrap,
 		})) ?? null,
 		retired: snapshot.retired?.map((tombstone) => ({
 			deviceId: tombstone.deviceId, grantId: tombstone.grantId, retiredAt: tombstone.retiredAt,
@@ -172,12 +172,13 @@ function decodeDevice(entry: Record<string, unknown>): DeviceRecord {
 function decodeGrant(entry: Record<string, unknown>): GrantRecord {
 	if (!isText(entry?.grantId) || !isText(entry.secretHash) || !isText(entry.name) || !isText(entry.enrollmentRequestId)
 		|| !isNumber(entry.createdAt) || !isNumberOrNull(entry.revokedAt) || !isNumber(entry.registeredDay)
-		|| !isNumber(entry.registeredCount)) {
+		|| !isNumber(entry.registeredCount) || !(entry.secretWrap === undefined || isTextOrNull(entry.secretWrap))) {
 		throw new Error("restore journal: malformed grant");
 	}
+	// Identity v3 (§3.4): a grant rotated before the prepare carries its wrapped secret; absent in an older journal row.
 	return { grantId: entry.grantId, secretHash: entry.secretHash, name: entry.name,
 		enrollmentRequestId: entry.enrollmentRequestId, createdAt: entry.createdAt, revokedAt: entry.revokedAt,
-		registeredDay: entry.registeredDay, registeredCount: entry.registeredCount };
+		registeredDay: entry.registeredDay, registeredCount: entry.registeredCount, secretWrap: entry.secretWrap ?? null };
 }
 
 function decodeRetired(entry: Record<string, unknown>): RetiredRecord {

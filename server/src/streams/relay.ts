@@ -996,6 +996,20 @@ export class StreamRelayService {
 	// ---- authority ------------------------------------------------------------
 
 	/**
+	 * The deviceIds with an open streams socket (identity-per-store §6.2: the inactivity sweep never retires a connected
+	 * device). Cold path, once a day at most: walks getWebSockets() like revokeDevice.
+	 */
+	connectedDevices(): Set<string> {
+		const out = new Set<string>();
+		for (const socket of this.options.sockets.sockets()) {
+			if (this.isClosing(socket)) continue;
+			const deviceId = this.attachmentOf(socket)?.deviceId;
+			if (deviceId) out.add(deviceId);
+		}
+		return out;
+	}
+
+	/**
 	 * D7 revoke, synchronous (the host calls it in the same turn that deleted the
 	 * device row and its device-map entry). Every socket of the device gets
 	 * authority_superseded, closes 4403 and leaves the H5 fanout set; its H6 bucket

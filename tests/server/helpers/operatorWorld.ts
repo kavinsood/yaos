@@ -35,10 +35,13 @@ export interface WorldOptions {
 	/** Bind `YAOS_BUCKET` (default true). */
 	bucket?: boolean;
 	debugRoutes?: boolean;
+	/** The vault hosts' inactivity retirement threshold in days (default the server's 90). */
+	inactivityRetireDays?: number;
 }
 
 export async function withWorld(check: (world: World) => Promise<void>, options: WorldOptions = {}): Promise<void> {
-	const cluster = new VaultCluster({ pitr: options.pitr === true });
+	const cluster = new VaultCluster({ pitr: options.pitr === true,
+		...(options.inactivityRetireDays !== undefined ? { inactivityRetireDays: options.inactivityRetireDays } : {}) });
 	try {
 		const config = cluster.config();
 		const recording = recordingConfigNamespace(config);

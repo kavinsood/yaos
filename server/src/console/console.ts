@@ -12,6 +12,9 @@
 //   pairing grant; a device without a grant (paired before grants) is listed alone with "Revoke", as before; revoked
 //   grants are counted, not listed. "Revoke pairing" (`DELETE …/grants/:grantId`) blocks the install; "Remove device"
 //   (`DELETE …/devices/:deviceId`) tidies one store, which comes back as a new device while its install is paired.
+//   "Rotate secret" (`POST …/grants/:grantId/rotate` → `{rotated}`) replaces the pairing secret: the install's live
+//   stores fetch the new one, a copy of the old data.json alone no longer registers (identity-per-store §3.4).
+//   Devices not seen for 90 days are retired by the server itself (§6.2) and drop off the list.
 // - The setup link and the setup QR's URL are built from `location.origin`, not from a response
 //   `host`/`obsidianUrl`/`mobileSetupUrl`, so they always name the server that served the console.
 // - Every non-GET sends `Content-Type: application/json` and a JSON body (`{}` for logout and revoke); GETs send none.
@@ -207,6 +210,13 @@ function vaultCard(v, pending) {
       h("div", { className: "row" },
         h("strong", { textContent: name }),
         h("span", { className: "muted", textContent: "paired " + when(g.createdAt) + ", last seen " + day(g.lastSeenDay) + ", " + stores.length + (stores.length === 1 ? " store" : " stores") }),
+        act("Rotate secret", async () => {
+          if (!confirm("Rotate the pairing secret of " + name + "? Its stores keep syncing and pick up the new secret themselves. A copy of the old secret (an old data.json) can no longer add devices. A store someone else already registered with it is not cut off: remove it below, or revoke the pairing.")) return;
+          const r = await api("POST", base + "/grants/" + enc(g.grantId) + "/rotate", {});
+          if (r.status !== 200) return say(failure("Rotate secret", r), "err");
+          say(r.data.rotated === false ? name + " is no longer paired." : "The pairing secret of " + name + " is rotated.", "ok");
+          listDevices();
+        }),
         act("Revoke pairing", async () => {
           if (!confirm("Revoke the pairing of " + name + "? Every store of it stops syncing at once, and that install has to be paired again.")) return;
           const r = await api("DELETE", base + "/grants/" + enc(g.grantId), {});

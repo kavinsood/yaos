@@ -404,7 +404,8 @@ export class Router {
 
 	/**
 	 * `/operator/vaults/:id/...` (§2.2): owner code, devices, D7 revoke, D8a reset-streams, D8b restore, D5 delete, and
-	 * identity-per-store §3.4 "Revoke pairing" (`DELETE grants/:grantId`). Every route asks the config DO for the
+	 * identity-per-store §3.4 "Revoke pairing" (`DELETE grants/:grantId`) and "Rotate secret" (`POST
+	 * grants/:grantId/rotate`). Every route asks the config DO for the
 	 * session and the registry first; revoke (device or pairing), owner-code and reset-streams also pass D8b's authority
 	 * freeze there.
 	 */
@@ -415,16 +416,21 @@ export class Router {
 			&& DEVICE_ID_PATTERN.test(rest[1]!) ? rest[1]! : null;
 		const grantTarget = request.method === "DELETE" && rest.length === 2 && rest[0] === "grants"
 			&& GRANT_ID_PATTERN.test(rest[1]!) ? rest[1]! : null;
+		// Identity-per-store §3.4 "Rotate secret": POST grants/:grantId/rotate (no body, like the revokes).
+		const rotateTarget = request.method === "POST" && rest.length === 3 && rest[0] === "grants" && rest[2] === "rotate"
+			&& GRANT_ID_PATTERN.test(rest[1]!) ? rest[1]! : null;
+		const authority = revokeTarget !== null || grantTarget !== null || rotateTarget !== null;
 		const known = route === "DELETE " || route === "POST owner-code" || route === "GET devices"
-			|| route === "POST reset-streams" || route === "POST restore" || revokeTarget !== null || grantTarget !== null;
+			|| route === "POST reset-streams" || route === "POST restore" || authority;
 		if (!known) return withCors(notFound());
 		if (request.method !== "GET") {
-			const rejected = crossSiteRejection(request, url, revokeTarget === null && grantTarget === null);
+			const rejected = crossSiteRejection(request, url, !authority);
 			if (rejected) return rejected;
 		}
 		const token = sessionToken(request);
 		if (!token) return unauthorized();
-		const action: FrozenAction | undefined = revokeTarget !== null || grantTarget !== null ? "revoke"
+		// A rotation is an authority change like a revoke: D8b's freeze holds it too.
+		const action: FrozenAction | undefined = authority ? "revoke"
 			: route === "POST owner-code" ? "owner-code"
 			: route === "POST reset-streams" ? "reset" : undefined;
 		const config = this.config(env);
@@ -441,6 +447,11 @@ export class Router {
 			// The grant and its devices in one synchronous turn, as D7. Idempotent: unknown or revoked → revoked:false.
 			const { revoked, retiredDevices } = await vault.revokeGrant(grantTarget);
 			return json({ ok: true, grantId: grantTarget, revoked, retiredDevices });
+		}
+		if (rotateTarget !== null) {
+			// The new secret is never returned: the grant's live devices fetch it (GET /vault/:id/auth/grant).
+			const { rotated } = await vault.rotateGrant(rotateTarget);
+			return json({ ok: true, grantId: rotateTarget, rotated });
 		}
 		if (route === "GET devices") {
 			const { devices, grants } = await vault.listDevices();
@@ -568,6 +579,7 @@ export class Router {
 			case "POST auth/device":
 			case "POST auth/device/retire":
 			case "POST auth/device/status":
+			case "GET auth/grant":
 			case "DELETE auth/device":
 			case "DELETE auth/grant":
 			case "GET streams/feed":
