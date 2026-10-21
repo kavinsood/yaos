@@ -229,6 +229,38 @@ test("engine: a quiescent vault ends with no tail; the typed-in doc is not check
 	}
 });
 
+test("engine: a non-duty device learns of many checkpoints in batched reads, not one read per stream", async () => {
+	// Conflict-flood soak: after a wave of writes to thousands of streams every other device re-read each stream's
+	// checkpoint seq on its own, two per maintenance tick, and the vault stayed busy far past the heal horizon.
+	const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
+	const relay = new SimRelay({ clock });
+	const a = (await startTestEngine({ relay, deviceId: "dev-a", clock, tuning: TUNING })).engine;
+	const b = (await startTestEngine({ relay, deviceId: "dev-b", clock, tuning: TUNING })).engine;
+	try {
+		await until(() => a.status().phase === "live" && b.status().phase === "live", 10_000, "live", clock);
+		const n = 24;
+		const ids: DocId[] = [];
+		for (let i = 0; i < n; i++) {
+			ids.push(await drive(createDoc(a, `m${i}.md`, `seed ${i};`), clock));
+			await drive(editDoc(a, ids[i]!, (t) => t.insert(t.length, "e;")), clock);
+		}
+		await converged([a, b], 30_000, clock);
+		const reads0 = relay.readRequests;
+		await sleep(S + 2 * F + 60_000, clock);
+		const streams = ids.map((id) => a.streamOf(id));
+		for (const s of streams) assert.equal(behind(relay, s), 0, `${s} checkpointed`);
+		assert.equal(a.c.ckpt.written, n, "the duty device put each one");
+		assert.equal(b.c.ckpt.written, 0, "no second put");
+		assert.equal(b.c.ckpt.results.refreshed, n, JSON.stringify(b.c.ckpt.results));
+		for (const s of streams) assert.equal(b.c.repo.stream(s)!.rowsSinceRemoteCheckpoint, 0, `${s}: not due again on b`);
+		const reads = relay.readRequests - reads0;
+		assert.ok(b.maint.stats.refreshBatches >= 1 && reads <= 4, `batched: ${reads} read requests, ${b.maint.stats.refreshBatches} batches for ${n} streams`);
+	} finally {
+		await drive(a.stop(), clock);
+		await drive(b.stop(), clock);
+	}
+});
+
 test("engine: the duty device goes away before S; the other device checkpoints after S + fallback + jitter", async () => {
 	const clock = new VirtualClock(Date.UTC(2026, 0, 1, 12, 0));
 	const relay = new SimRelay({ clock });

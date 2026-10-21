@@ -156,20 +156,23 @@ tombstones `pruneWorld` keeps. Until fixed, the nightly soak can fail on these.
 different epochs, wide divergence; the `retired` violations follow from A never catching up. Fails the same on
 `generators`; a second soak seed (1042558905, 3 devices, no generator ops) fails the same on base.
 
-### SIM-FLOOD-FLAP: the conflict-flood profile never settles
-
-`flood-flapping-1557069770.json` (FLOOD_FAULTS, 5 devices, storms, delete / restore races, clean-ups; 256 steps, not
-minimized: a run takes minutes): no quiescence, "flapping". Fails the same on `generators`.
-
-### SIM-SOAK-OOM: a soak process ran out of memory
-
-Soak master seed 4 reached ~4 GB and was killed at ~580 s (Node's default heap). Not minimized: find the run (its
-config is drawn from the master seed) and whether a run or the soak's coverage / failure bookkeeping grows.
-
 ## Landed on `sim-port` since 33bdf49b
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-FLOOD-FLAP** (`fix-integrity`): not a flap. After a wave of writes to thousands of streams (a mass restore
+  at heal) every non-duty device re-read each stream's remote checkpoint seq before standing in (relay checkpoints
+  are not broadcast), one `read` per stream and two per maintenance tick: the relay kept serving those reads for
+  longer than the 600 s heal horizon, so the run never had 5 quiet seconds. Fallback refreshes now share one
+  `readBatch` per tick from `fallbackMs` on (DESIGN §d.9). The flood plan settles at heal + ~90 s. Focused test in
+  `settleCheckpoint.test.ts`; the 256-step plan (5 min a replay) is not promoted.
+- **SIM-SOAK-OOM** (`fix-integrity`): no leak; a run of the conflict-flood profile (5 devices, ~5000 files each,
+  ~55k vault versions) and three costs per size. Engine: every synced write read its doc's ns touch seq through
+  `view()`, which `commitEdits` invalidates, so each write refolded every own pending ns frame and built bodyInfo
+  for every entry: O(N x entries) per pass, >50% of CPU and most garbage. The ns overlay is memoized and jobs read
+  one entry (`peekRemote`). Sim: the heal loop printed every file's text on every device each virtual second
+  (two ~150 MB strings live), and path listings decoded every file; it now uses a vault content generation and
+  `visiblePaths()`. Between runs the soak's heap returns to ~27 MB (no cross-run growth).
 - **SIM-CANVAS-REORDER** (`fix-integrity`): a reorder re-ranks whichever records the order reconciliation moves
   (the longest ordered run keeps its ranks), often not the one the user moved; a concurrent edit of such a record made
   its line differ on both sides, and the record conflict kept the CRDT's line with its old rank. `mergeRecordLines`

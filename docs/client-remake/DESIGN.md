@@ -1359,7 +1359,10 @@ The planner does no destructive work until ns is caught up (§f.2).
   - A fallback device first re-reads the stream's checkpoint seq with `read(stream, appliedSeq, false)`
     (`refreshRemote`, checkpoints.ts:175; maintenance.ts:157). Relay checkpoints are not broadcast, and the duty
     device has usually written one. If it covers `appliedSeq`, the counters reset and nothing is compacted, sealed
-    or written.
+    or written. Streams past `fallbackMs` (jitter not counted: it spreads puts, not reads) share one `readBatch`
+    per tick, as wide as catch-up batches (`refreshRemoteBatch`, `Maintenance.refreshFallbacks`); a stream it
+    served is then put at its jittered time without a second read for 60 s (the put is a CAS anyway). After a wave
+    of writes to N streams a device learns of the duty device's checkpoints in about N / width requests, not N.
   - Only streams this device has caught up on (`stale = 0`) and that are not frozen. Catch-up is eager, so every
     device can stand in for every stream. The doc does not have to be open (compaction reads the store).
   - Settle puts are capped at `REMOTE_CHECKPOINT_SETTLE_DAILY` (1000) per device per 24 h, every put counting
