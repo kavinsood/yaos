@@ -1250,7 +1250,10 @@ vault. Any local copy of the files on disk can seed a new vault.
        idempotent, so a duplicate is harmless.
    - A suite-1 sender is write-blocked until the session's `k` read, so an offline device learns r before it sends
      anything sealed under an older epoch.
-   - Unsealed copies are not mirrored (`selectMirrorFrames`): a mirror recovery re-derives them from disk.
+   - Unsealed copies are not mirrored (`selectMirrorFrames`): a mirror recovery re-derives them from disk. The
+     outbox mirror lists their docs (`unmirrored`, DESIGN §e.4), and recovery imports those docs' synced records
+     with no trusted content hash: otherwise the disk text the copy carried reads as already synced and the remote
+     text is written over it (sim suite 1 seed 197: revoke, an outside edit, an IndexedDB wipe before the re-key).
    - `refused frame-id-conflict` for ns and cfg still poisons, as in DESIGN §i.6.
 5. **Checkpoints.** Nothing is forced. New checkpoints are sealed under r at the normal cadence (DESIGN §d.9
    checkpoint policy). Old checkpoints with coversSeq ≤ S_rot stay valid.

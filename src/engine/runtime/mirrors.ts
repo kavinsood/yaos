@@ -20,8 +20,9 @@
  *    rejects is an environment fault, not a bad file, and propagates.
  */
 
-import { streamClass } from "../../core/types";
-import type { StreamName } from "../../core/types";
+import { NS_STREAM, streamClass, streamDocId } from "../../core/types";
+import type { ContentHash, DocId, StreamName } from "../../core/types";
+import { decodeNsOps } from "../../core/codec/nsOps";
 import type { HashPort } from "../../ports/crypto";
 import { CodecError, utf8Encode } from "../../core/codec/lib0";
 import * as codec from "../../core/codec/mirrors";
@@ -240,4 +241,45 @@ export function selectMirrorFrames(records: readonly OutboxRecord[], maxBytes: n
 		kept.add(it);
 	}
 	return items.filter((it) => kept.has(it)).map((it) => it.frame);
+}
+
+// ---------------------------------------------------------------------------
+// Sync points the mirrors cannot back
+// ---------------------------------------------------------------------------
+
+/**
+ * Docs with an own outbox record `frames` (selectMirrorFrames' output) leaves out: an unsealed copy of an own stale
+ * commit (e2ee-design §14.2 step 4) or a frame over the size limit. Sorted. Body / canvas records name their doc,
+ * ns records every doc their ops touch; cfg, keyring and snap records name none (no synced record rests on them).
+ *
+ * Such a record holds edits this device already took into its synced tree: a merge that absorbed the disk text
+ * into the replica records the disk as synced (S.contentHash = the disk's hash) once the frame is in the outbox.
+ * Lose the store, and the frame with it, and a synced mirror entry still saying so reads the disk as already in
+ * the replica: the next pass takes the disk as the merge base and writes the remote text over the edit (sim suite 1
+ * seed 197: an outside edit lost to a revoke, then an IndexedDB wipe before the re-key). Recovery re-derives these
+ * edits from disk only if it does not trust those entries (untrustedSyncPoint), so the outbox mirror lists them.
+ */
+export function unmirroredDocs(records: readonly OutboxRecord[], frames: readonly OutboxMirrorFrame[]): DocId[] {
+	const kept = new Set<string>(frames.map((f) => f.clientFrameId));
+	const out = new Set<DocId>();
+	for (const r of records) {
+		if (kept.has(r.clientFrameId)) continue;
+		const doc = streamDocId(r.stream);
+		if (doc !== null) out.add(doc);
+		else if (r.stream === NS_STREAM) for (const op of decodeNsOps(r.content) ?? []) if ("docId" in op) out.add(op.docId);
+	}
+	return [...out].sort();
+}
+
+/**
+ * A content hash no text has (sha256 is never all zeros in practice): the synced record of a doc whose sync point
+ * recovery cannot trust (unmirroredDocs). The planner then reads its file as changed since sync, and the content
+ * job, finding neither side at the synced content, merges with no base: the replica's text stays and the disk text
+ * is kept whole as a conflict copy (core/merge/merge.ts). Never the remote text over a disk edit the replica lost.
+ */
+export const UNTRUSTED_CONTENT_HASH = "0".repeat(64) as ContentHash;
+
+/** A recovered synced record (`contentHash` from the mirror), with the hash dropped when `untrusted` names its doc. */
+export function untrustedSyncPoint<T extends { readonly docId: DocId; readonly contentHash: ContentHash }>(rec: T, untrusted: ReadonlySet<DocId>): T {
+	return untrusted.has(rec.docId) ? { ...rec, contentHash: UNTRUSTED_CONTENT_HASH } : rec;
 }

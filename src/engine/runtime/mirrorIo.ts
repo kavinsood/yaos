@@ -15,7 +15,7 @@ import { resolveRefContent } from "../body/refs";
 import { openEnvelope } from "../ingest/envelope";
 import type { OutboxMirrorFrame, OutboxRecord } from "../store/schema";
 import type { EngineCtx } from "./context";
-import { decodeOutboxMirror, encodeOutboxMirror, nextMirrorSlot, pickOutboxMirror, selectMirrorFrames, type MirrorIdentity } from "./mirrors";
+import { decodeOutboxMirror, encodeOutboxMirror, nextMirrorSlot, pickOutboxMirror, selectMirrorFrames, unmirroredDocs, type MirrorIdentity } from "./mirrors";
 
 const FILES: readonly [SideFileName, SideFileName] = ["outbox-a.bin", "outbox-b.bin"];
 
@@ -25,8 +25,8 @@ function identityOf(c: EngineCtx): MirrorIdentity {
 
 export class MirrorWriter {
 	private gens: [number | null, number | null] = [null, null];
-	/** Frame ids of the newest on-disk mirror for this identity (readGenerations); null: none. */
-	private onDisk: ReadonlySet<string> | null = null;
+	/** Frame ids and unmirrored docs of the newest on-disk mirror for this identity (readGenerations); null: none. */
+	private onDisk: { readonly frames: ReadonlySet<string>; readonly unmirrored: readonly string[] } | null = null;
 	private timer: number | null = null;
 	private dirty = false;
 	private writing: Promise<void> | null = null;
@@ -53,7 +53,7 @@ export class MirrorWriter {
 					g = m.generation;
 					if (g > newest) {
 						newest = g;
-						this.onDisk = new Set(m.frames.map((f) => f.clientFrameId));
+						this.onDisk = { frames: new Set(m.frames.map((f) => f.clientFrameId)), unmirrored: m.unmirrored ?? [] };
 					}
 				}
 			} catch {
@@ -74,8 +74,13 @@ export class MirrorWriter {
 	scheduleIfBehind(records: readonly OutboxRecord[]): void {
 		if (!this.files) return;
 		const want = selectMirrorFrames(records, OUTBOX_MIRROR_MAX_BYTES);
+		const wantDocs = unmirroredDocs(records, want);
 		const have = this.onDisk;
-		if (have === null ? want.length === 0 : have.size === want.length && want.every((f) => have.has(f.clientFrameId))) return;
+		const same = have === null
+			? want.length === 0 && wantDocs.length === 0
+			: have.frames.size === want.length && want.every((f) => have.frames.has(f.clientFrameId))
+				&& have.unmirrored.length === wantDocs.length && wantDocs.every((d, i) => have.unmirrored[i] === d);
+		if (same) return;
 		this.schedule();
 	}
 
@@ -117,11 +122,14 @@ export class MirrorWriter {
 		const files = this.files!;
 		while (this.dirty) {
 			this.dirty = false;
-			const frames = selectMirrorFrames(this.c.outbox.all(), OUTBOX_MIRROR_MAX_BYTES);
+			const records = this.c.outbox.all();
+			const frames = selectMirrorFrames(records, OUTBOX_MIRROR_MAX_BYTES);
+			// The docs whose own records stay out (unsealed copies, the size limit): recovery distrusts their sync points.
+			const unmirrored = unmirroredDocs(records, frames);
 			const { slot, generation } = nextMirrorSlot(this.gens);
 			try {
 				const id = identityOf(this.c);
-				const bytes = await encodeOutboxMirror({ ...id, generation, writtenAtMs: this.c.now(), frames }, this.c.ports.hash);
+				const bytes = await encodeOutboxMirror({ ...id, generation, writtenAtMs: this.c.now(), frames, ...(unmirrored.length > 0 ? { unmirrored } : {}) }, this.c.ports.hash);
 				await files.write(FILES[slot], bytes);
 				this.gens[slot] = generation;
 				this.stats.writes++;

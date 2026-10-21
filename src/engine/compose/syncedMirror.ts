@@ -8,6 +8,10 @@
  * an empty fingerprint, so the first pass refreshes them with a syncedPut
  * after hashing the file (the content hash is what decides).
  *
+ * A doc the outbox mirror lists as unmirrored (own records it could not carry, runtime/mirrors.ts unmirroredDocs)
+ * is imported with no trusted content hash (untrustedSyncPoint): the edits its sync point rests on died with the
+ * store, so the disk text is merged with no base (kept as a conflict copy), never overwritten as already synced.
+ *
  * Nor a CRDT sync point: imported records get bodyVersion null (§i.5 step 3),
  * so the planner sees the remote side as changed and the merge compares
  * content against the synced side. `bodyRemoteSeq` cannot stand in for it: the
@@ -22,10 +26,11 @@ import type { HashPort } from "../../ports/crypto";
 import type { StorageDb } from "../../ports/storage";
 import type { SideFileName, SideFilePort } from "../../ports/vault";
 import type { DiskSchema } from "../reconcile/store";
-import { decodeSyncedMirror, encodeSyncedMirror, nextMirrorSlot, pickSyncedMirror, type MirrorIdentity } from "../runtime/mirrors";
+import { decodeSyncedMirror, encodeSyncedMirror, nextMirrorSlot, pickOutboxMirror, pickSyncedMirror, untrustedSyncPoint, type MirrorIdentity } from "../runtime/mirrors";
 import { STORE, type SyncedMirrorEntry, type SyncedRecord } from "../store/schema";
 
 export const SYNCED_FILES: readonly [SideFileName, SideFileName] = ["synced-a.bin", "synced-b.bin"];
+const OUTBOX_FILES: readonly SideFileName[] = ["outbox-a.bin", "outbox-b.bin"];
 export const SYNCED_MIRROR_DEBOUNCE_MS = 2_000;
 
 export function toMirrorEntry(s: SyncedRecord): SyncedMirrorEntry {
@@ -43,9 +48,9 @@ export function fromMirrorEntry(e: SyncedMirrorEntry, pk: PathKeyFn, nowMs: numb
 	};
 }
 
-async function readSlots(side: SideFilePort): Promise<(Uint8Array | null)[]> {
+async function readSlots(side: SideFilePort, files: readonly SideFileName[] = SYNCED_FILES): Promise<(Uint8Array | null)[]> {
 	const out: (Uint8Array | null)[] = [];
-	for (const f of SYNCED_FILES) {
+	for (const f of files) {
 		try {
 			out.push(await side.read(f));
 		} catch {
@@ -65,7 +70,9 @@ export async function importSyncedMirror(o: {
 }): Promise<number> {
 	const picked = await pickSyncedMirror(await readSlots(o.side), o.identity, o.hash);
 	if (!picked || picked.mirror.entries.length === 0) return 0;
-	const recs = picked.mirror.entries.map((e) => fromMirrorEntry(e, o.pathKey, o.nowMs));
+	const outbox = await pickOutboxMirror(await readSlots(o.side, OUTBOX_FILES), o.identity, o.hash);
+	const untrusted = new Set(outbox?.mirror.unmirrored ?? []);
+	const recs = picked.mirror.entries.map((e) => untrustedSyncPoint(fromMirrorEntry(e, o.pathKey, o.nowMs), untrusted));
 	return o.db.tx([STORE.synced], "readwrite", async (tx) => {
 		const existing = await tx.getAll(STORE.synced);
 		if (existing.length > 0) return 0;
