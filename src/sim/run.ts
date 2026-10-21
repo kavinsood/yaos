@@ -627,7 +627,9 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		let stable = 0;
 		let last = "";
 		let kicked = false;
-		const print = () => `${activity(devs, net)}|${devs.map((d) => `${[...d.vault.snapshot()].join(";")}#${settingsPrint(d)}`).join("|")}`;
+		// A device's files are stable when its vault's contentGen does not move (bytes, paths); printing every file's
+		// text each virtual second held ~2 copies of every vault (the conflict-flood soak: thousands of files).
+		const print = () => `${activity(devs, net)}|${devs.map((d) => `${d.vault.contentGen}#${settingsPrint(d)}`).join("|")}`;
 		for (let t = 0; t < c.healHorizonMs && stable < 5; t += 1_000) {
 			await clock.advance(1_000);
 			brakeUser.poll();

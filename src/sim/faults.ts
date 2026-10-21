@@ -547,7 +547,7 @@ export class FaultState {
 				return `${tag} down ${f.downMs}ms`;
 			}
 			case "floodRewrite": {
-				const notes = [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".md")).length;
+				const notes = d.vault.visiblePaths().filter((p) => p.endsWith(".md")).length;
 				if (notes <= BRAKE_MAX_CONFLICT_COPIES) return `skip ${tag}: ${notes} notes (no flood)`;
 				this.crash(f.dev, f.downMs, { wipe: true, dropMirrors: true });
 				// The tool appends a line to every note (tokens kept: nothing for the ledger).

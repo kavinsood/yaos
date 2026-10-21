@@ -158,6 +158,11 @@ export class SimVault implements VaultPort {
 	private lastEventDue = 0;
 	private eventsInFlight = 0;
 	readonly history: VersionRecord[] = [];
+	/**
+	 * Moves whenever a visible file appears, goes, moves or changes bytes (a rewrite of the same bytes does not move
+	 * it): the heal loop's settle fingerprint, instead of a print of every file's text each virtual second.
+	 */
+	contentGen = 0;
 	readonly trashed: TrashRecord[] = [];
 	readonly clobbered: ClobberRecord[] = [];
 	/** Counts of port calls (acceptance: rename via rename(), deletes via trash()). */
@@ -364,6 +369,7 @@ export class SimVault implements VaultPort {
 		for (const f of [...this.files.values()]) {
 			if (src.files.has(this.key(f.path))) continue;
 			this.files.delete(this.key(f.path));
+			this.touched(f.path);
 			this.emit({ t: "delete", path: f.path }, "external");
 		}
 		for (const f of src.files.values()) {
@@ -380,6 +386,13 @@ export class SimVault implements VaultPort {
 	snapshot(): Map<string, string> {
 		const out = new Map<string, string>();
 		for (const f of this.files.values()) if (!this.hidden(f.path)) out.set(f.path, fromUtf8(f.bytes));
+		return out;
+	}
+
+	/** Visible files' display paths (snapshot() without decoding every file). */
+	visiblePaths(): string[] {
+		const out: string[] = [];
+		for (const f of this.files.values()) if (!this.hidden(f.path)) out.push(f.path);
 		return out;
 	}
 
@@ -448,6 +461,7 @@ export class SimVault implements VaultPort {
 		const cur = this.files.get(k);
 		this.ensureFolders(path);
 		let f: SimFile;
+		if (!cur || !bytesEqual(cur.bytes, bytes)) this.touched(path);
 		if (cur) {
 			cur.bytes = bytes;
 			cur.mtimeMs = Math.max(now, cur.mtimeMs + 1);
@@ -477,6 +491,8 @@ export class SimVault implements VaultPort {
 		const f = this.files.get(this.key(fromDisplay));
 		if (!f) throw new Error(`move: missing ${fromDisplay}`);
 		this.files.delete(this.key(fromDisplay));
+		this.touched(fromDisplay);
+		this.touched(to);
 		this.ensureFolders(to);
 		const old = f.path;
 		f.path = to;
@@ -486,8 +502,13 @@ export class SimVault implements VaultPort {
 		return f;
 	}
 
+	private touched(path: string): void {
+		if (!this.hidden(path)) this.contentGen++;
+	}
+
 	private removeFile(f: SimFile, mode: TrashMode | "user"): void {
 		this.files.delete(this.key(f.path));
+		this.touched(f.path);
 		this.trashed.push({ path: f.path, text: fromUtf8(f.bytes), mode, atMs: this.opts.clock.now() });
 		this.emit({ t: "delete", path: f.path }, mode === "user" ? "user" : "sync");
 	}

@@ -491,7 +491,7 @@ export function isConflictCopy(path: string): boolean {
 }
 
 export function canvasFiles(d: SimDevice): string[] {
-	return [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".canvas")).sort();
+	return d.vault.visiblePaths().filter((p) => p.endsWith(".canvas")).sort();
 }
 
 /** Canvases the user edits: not conflict copies (their records share ids with the canvas they copy). */
@@ -645,7 +645,7 @@ export class CanvasWorld {
 	}
 
 	private notes(d: SimDevice): string[] {
-		return [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".md") || p.endsWith(".png")).sort();
+		return d.vault.visiblePaths().filter((p) => p.endsWith(".md") || p.endsWith(".png")).sort();
 	}
 
 	private write(d: SimDevice, path: string, text: string, by: Writer): void {
