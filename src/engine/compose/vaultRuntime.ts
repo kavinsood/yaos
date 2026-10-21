@@ -486,8 +486,12 @@ export class VaultRuntime {
 		if (s.relay.connected && !wasConnected) this.networkBack();
 		if (s.phase === "revoked" && was !== "revoked") this.engine.onStoreRevoked();
 		// upgrade-required with a session: a fold is halted for a newer writer (§c.10) and the session caught up;
-		// the planner's nsReady and the cfg / snap readiness still see that fold's halt.
-		if ((s.phase === "live" || (s.phase === "upgrade-required" && s.relay.connected)) && !this.port.nsCaughtUp && this.rec) {
+		// the planner's nsReady and the cfg / snap readiness still see that fold's halt. daily-limit with a session: the
+		// session caught up under the relay's daily hold (the engine never leaves catching-up for it before the start
+		// reads end); local edits keep filling the outbox (DESIGN §i.6), so the planner runs as when live. Without
+		// it a store that catches up during the hold plans nothing until it lifts (soak 1622834076 run 157).
+		const caughtUp = s.phase === "live" || ((s.phase === "upgrade-required" || s.phase === "daily-limit") && s.relay.connected);
+		if (caughtUp && !this.port.nsCaughtUp && this.rec) {
 			this.port.nsCaughtUp = true;
 			this.port.invalidate();
 			this.sched.request({ t: "full" });

@@ -152,7 +152,11 @@ export class LogEngine {
 			reseal: (rec) => resealer.request(rec),
 			onDailyLimit: (ms, retryAfterMs) => {
 				c.dailyLimitUntilMono = c.mono() + ms;
-				c.setPhase("daily-limit");
+				// Only a caught-up session turns daily-limit here. A refusal during catch-up (body frames go out right
+				// after VAULT_READY, DESIGN §d.7 "Reconnect order") keeps it catching-up; the end of the start reads
+				// takes livePhase(), which reads the hold. The host takes daily-limit with a session, as it takes live,
+				// for ns caught up (vaultRuntime onLogStatus).
+				if (c.phase === "live") c.setPhase("daily-limit");
 				c.notice("daily-limit");
 				c.dailyLimitPopup(retryAfterMs);
 			},

@@ -1,0 +1,243 @@
+{
+	"seed": 1622834076,
+	"config": {
+		"seed": 1622834076,
+		"devices": 2,
+		"steps": 115,
+		"faults": {
+			"engineCrash": 0,
+			"appCrash": 3.752,
+			"commitCrash": 0,
+			"idbWipe": 0.729,
+			"idbLost": 1.452,
+			"offline": 0,
+			"ioFail": 3.208,
+			"background": 2.727,
+			"socketDrop": 1.167,
+			"relayRestart": 1.288,
+			"relayDrain": 0,
+			"httpFail": 0.735,
+			"dailyLimit": 0.35,
+			"epochReset": 0,
+			"clockSkew": 0.468,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 2.021,
+			"clone": 0,
+			"syncedConfig": 0
+		},
+		"faultRate": 0.344
+	},
+	"violations": [
+		{
+			"inv": "convergence",
+			"detail": "canvas/c1.canvas on A, missing on B"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/r0.md on A, missing on B"
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a2.png differs: A=\"PNG [A.162]\\n\u0190\ufffd\ufffd\ufffd\ufffd\ufffd\u07b7\u0089\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u023c\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u04a9\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0332\ufffd\u0728\ufffd\u07b3\u045f\ufffd\udaa7\udece\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd...\" B=\"PNG [B.163]\\n\ufffd\ufffd\ufffd\ufffd\ufffd\u02cd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u075c\ufffd\ub7c7\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u550b\u022f\ufffd\ufffd\ufffd\u041e\ufffd\ufffd\ufffd\ufffd\ufffd\u03b2\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u00c9\u0314\ufffd\ufffd\ufffd\ufca6\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u04f8\ufffd...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/r7.md on B, missing on A"
+		},
+		{
+			"inv": "convergence",
+			"detail": "canvas/c4.canvas on B, missing on A"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [B.156] (canvas-text on B at step 156)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [B.163] (attach on B at step 163)"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[B.156] was on B:canvas/c1.canvas (user) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[B.163] was on B:att/a2.png (external) and is gone"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost n:b9cn0 (created on B at step 156 in canvas/c1.canvas)"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost write n:a86n1.x=17 on B at step 142 (canvas/c1.canvas); final 6"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost write n:a86n1.y=-18 on B at step 142 (canvas/c1.canvas); final -7"
+		},
+		{
+			"inv": "quiet",
+			"detail": "activity after quiescence: 30,75,0,4,0,0,0,0,0,32,5,0,0,0,1,0,21,0,0,0 -> 35,80,0,7,1,0,0,0,0,33,9,1,0,0,1,0,25,0,0,0"
+		}
+	],
+	"note": "soak master seed 778 run 157 (1622834076). B restarts while the relay's daily limit holds: its session catches up into phase daily-limit, never live, and the host only took live for ns caught up, so B planned nothing (a new attachment, a canvas rename) until the hold lifted, after the sim's quiescence. Fixed: daily-limit with a session counts as caught up; the engine no longer turns daily-limit during catch-up.",
+	"minimizedPlan": [
+		{
+			"i": 88,
+			"gapMs": 1361,
+			"fault": {
+				"t": "httpFail",
+				"durationMs": 29805
+			}
+		},
+		{
+			"i": 153,
+			"gapMs": 441,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 1,
+				"file": 0.2762359594926238,
+				"kind": "file",
+				"seed": 212269084
+			}
+		},
+		{
+			"i": 99,
+			"gapMs": 410,
+			"user": {
+				"t": "diskInsert",
+				"dev": 1,
+				"file": 0.029423993080854416,
+				"pos": 0.4238784702029079,
+				"by": "external"
+			}
+		},
+		{
+			"i": 158,
+			"gapMs": 0,
+			"user": {
+				"t": "attachRename",
+				"dev": 1,
+				"file": 0.7006664250511676,
+				"name": 1
+			}
+		},
+		{
+			"i": 100,
+			"gapMs": 306,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.8160243511665612,
+				"pos": 0.823064751457423,
+				"nl": false
+			}
+		},
+		{
+			"i": 101,
+			"gapMs": 218,
+			"fault": {
+				"t": "appCrash",
+				"dev": 1,
+				"downMs": 6149
+			}
+		},
+		{
+			"i": 105,
+			"gapMs": 1286,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.955613330937922,
+				"pos": 0.18846380338072777,
+				"nl": true
+			}
+		},
+		{
+			"i": 106,
+			"gapMs": 1304,
+			"fault": {
+				"t": "dailyLimit",
+				"durationMs": 36233
+			}
+		},
+		{
+			"i": 107,
+			"gapMs": 807,
+			"user": {
+				"t": "paste",
+				"dev": 1,
+				"view": 0.8056415582541376,
+				"pos": 0.42329918779432774,
+				"lines": 31
+			}
+		},
+		{
+			"i": 161,
+			"gapMs": 12,
+			"canvas": {
+				"t": "cText",
+				"dev": 0,
+				"file": 0.12483504833653569,
+				"node": 0.9350274112075567,
+				"pos": 0.6180523366201669,
+				"del": false
+			}
+		},
+		{
+			"i": 108,
+			"gapMs": 1139,
+			"fault": {
+				"t": "relayRestart"
+			}
+		},
+		{
+			"i": 111,
+			"gapMs": 1391,
+			"user": {
+				"t": "open",
+				"dev": 1,
+				"file": 0.14064204692840576
+			}
+		},
+		{
+			"i": 112,
+			"gapMs": 571,
+			"fault": {
+				"t": "appCrash",
+				"dev": 0,
+				"downMs": 3979
+			}
+		},
+		{
+			"i": 163,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 1,
+				"name": 2,
+				"size": 1034
+			}
+		},
+		{
+			"i": 165,
+			"gapMs": 322,
+			"canvas": {
+				"t": "cRename",
+				"dev": 1,
+				"file": 0.5152324803639203,
+				"name": 4,
+				"folder": false
+			}
+		}
+	]
+}

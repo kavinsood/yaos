@@ -233,3 +233,45 @@ test("an own create the fold ignored (synced, nsTouchSeq 0, absent remotely) is 
 	assert.equal(rec.ctx.store.synced.has(docId), false, "the ignored create's S is dropped");
 	assert.equal(a.vault.trashed.length + b.vault.trashed.length, 0);
 });
+
+test("a store that catches up under the relay's daily-limit hold still plans: new files go to the outbox (soak 1622834076 run 157)", async () => {
+	// The restarted engine resends A's held body frame right after VAULT_READY; the relay refuses it (daily limit)
+	// while the start reads still run (a slow HTTP link keeps them running). The phase stays catching-up until they end, then reads daily-limit, which the
+	// host takes for ns caught up as it takes live: the planner creates the new file (its frames wait in the outbox
+	// for the hold) instead of planning nothing until the hold lifts.
+	const { clock, net, devs } = world();
+	const a = dev(devs, 0);
+	const b = dev(devs, 1);
+	a.vault.userWrite("seed.md", "seed\n");
+	await boot(clock, devs);
+	await clock.advance(2_000);
+	assert.equal(b.vault.textOf("seed.md"), "seed\n");
+	net.relay.setDailyLimit(true, 10 * 60_000);
+	a.vault.externalWrite("seed.md", "seed\nheld edit\n");
+	await clock.advance(3_000);
+	assert.equal(a.vrt?.log.c.phase, "daily-limit", "the edit's frames were refused");
+	const self = a.vrt?.log.c.self;
+	assert.ok(self);
+	a.crashApp();
+	await clock.advance(1_000);
+	net.relay.setLink(self, { httpMs: 1_500 });
+	const phases: { phase: string; readsPending: boolean }[] = [];
+	void a.restartApp();
+	for (let t = 0; t < 20_000; t += 10) {
+		await clock.advance(10);
+		const c = a.vrt?.log.c;
+		if (c && phases.at(-1)?.phase !== c.phase) phases.push({ phase: c.phase, readsPending: c.startReadsPending });
+	}
+	assert.equal(a.vrt?.log.c.phase, "daily-limit", phases.map((p) => p.phase).join(" > "));
+	assert.ok(phases.every((p) => p.phase !== "daily-limit" || !p.readsPending), `daily-limit only once the start reads ended: ${JSON.stringify(phases)}`);
+	net.relay.setLink(self, {});
+	a.vault.userWrite("during-hold.md", "made during the hold\n");
+	await clock.advance(5_000);
+	const view = a.vrt?.port.view();
+	assert.equal(view?.nsReady, true, "ns caught up under the hold");
+	assert.ok(view?.remoteByPathKey.has(a.vrt!.rec.ctx.pk("during-hold.md")), "the new file is created (pending in the outbox)");
+	net.relay.setDailyLimit(false);
+	await clock.advance(15 * 60_000);
+	assert.equal(b.vault.textOf("during-hold.md"), "made during the hold\n");
+	assert.equal(b.vault.textOf("seed.md"), "seed\nheld edit\n");
+});
