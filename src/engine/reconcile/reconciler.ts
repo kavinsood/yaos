@@ -13,7 +13,7 @@
  */
 
 import { newDocId } from "../../core/codec/ids";
-import type { BrakeReport, DocId, PathKey, PlanScope, PlannerInput, PlannerOp } from "../../core/types";
+import type { BrakeReport, DocId, ObservedRename, PathKey, PlanScope, PlannerInput, PlannerOp } from "../../core/types";
 import { brakeId, brakeIdentity, rejectHeld } from "../../core/plan/brake";
 import { EMPTY_CONTENT_HASH, freshIdBudget, planWith } from "../../core/plan/planner";
 import type { VaultEvent } from "../../ports/vault";
@@ -42,6 +42,30 @@ export interface PassReport extends RunReport {
 	 * follow-up otherwise: a fileGone doc's delete frees its path for the new file there (nsCreate next pass).
 	 */
 	readonly vacated?: readonly PathKey[];
+}
+
+/**
+ * The observed renames of the snapshot whose chain ends at a file not hashed yet (the planner's needHash: a rename's
+ * event came after this pass's reads). Inference could not use them: the target's content is unknown, so the move
+ * was not planned. They stay for the pass that reads the target; dropped, that pass saw the source gone and the
+ * target as a new file and deleted the doc (sim canvas seed 20701862: a concurrent edit then restored it with the
+ * records the user had deleted before the rename, which went into the new doc).
+ */
+function unhashedChains(renames: readonly ObservedRename[], ctx: Ctx): Set<ObservedRename> {
+	const keep = new Set<ObservedRename>();
+	const sorted = [...renames].sort((x, y) => x.atMs - y.atMs);
+	for (let i = 0; i < sorted.length; i++) {
+		const chain = [sorted[i]!];
+		let at = ctx.pk(sorted[i]!.to);
+		for (let j = i + 1; j < sorted.length; j++) {
+			if (ctx.pk(sorted[j]!.from) !== at) continue;
+			chain.push(sorted[j]!);
+			at = ctx.pk(sorted[j]!.to);
+		}
+		const end = ctx.local.get(at);
+		if (end && !end.excluded && end.hash === null) for (const r of chain) keep.add(r);
+	}
+	return keep;
 }
 
 export class Reconciler {
@@ -190,7 +214,8 @@ export class Reconciler {
 		// Observed renames stay until inference could use them (it is off while ns is not ready).
 		if (ctx.localComplete && view.nsReady) {
 			const used = new Set(renames);
-			ctx.renames = ctx.renames.filter((r) => !used.has(r));
+			const unread = unhashedChains(renames, ctx);
+			ctx.renames = ctx.renames.filter((r) => !used.has(r) || unread.has(r));
 			// Onboarding / the first pass after start has planned its creates with the hold: later creates are live.
 			if (scope.t === "full") ctx.liveCreates = true;
 		}

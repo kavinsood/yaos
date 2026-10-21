@@ -25,6 +25,15 @@ export class Scanner {
 	/** pathKeys touched by hints since the last pass (scope of the next scoped pass). */
 	readonly dirty = new Set<PathKey>();
 	private seen: Set<PathKey> | null = null;
+	/**
+	 * Per pathKey, bumped by every hint (markDirty). A read result is stale for a path hinted while the read was in
+	 * flight (§f.6): the host answers a read after the events it saw first (hostRuntime flushes its batch), so a
+	 * rename's event can land between the read and its result; writing the result would undo the hint (a renamed
+	 * file read as still there, or its source's "missing" taken without the rename that explains it).
+	 */
+	private readonly hintGen = new Map<PathKey, number>();
+	private hintClock = 0;
+	private readsInFlight = 0;
 
 	constructor(private readonly ctx: Ctx) {}
 
@@ -94,6 +103,8 @@ export class Scanner {
 	markDirty(diskPath: string, stat: VaultStat | null): void {
 		const c = this.ctx.classify(diskPath, stat?.size ?? 0);
 		this.dirty.add(c.pathKey);
+		this.hintClock++;
+		if (this.readsInFlight > 0) this.hintGen.set(c.pathKey, this.hintClock);
 		const e = this.ctx.local.get(c.pathKey);
 		if (stat) this.ctx.local.set(c.pathKey, this.pendingEntry(stat, e));
 		else if (e) this.ctx.local.set(c.pathKey, { ...e, hash: null, fingerprint: null, hashedAtMs: 0, diskPath, path: c.path, excluded: c.excluded });
@@ -122,30 +133,44 @@ export class Scanner {
 			const toRead = batch.filter((e) => !e.excluded);
 			for (const e of batch) if (e.excluded) put.push(e);
 			const reqs = toRead.map((e) => ({ area: "vault" as const, path: e.diskPath, maxBytes: this.ctx.classify(e.diskPath, 0).maxBytes }));
-			const results = reqs.length > 0 ? await this.ctx.deps.disk.read(reqs) : [];
-			for (let j = 0; j < toRead.length; j++) {
-				const e = toRead[j]!;
-				const r = results[j];
-				if (!r) continue;
-				if (!r.ok) {
-					if (r.reason === "missing") drop.push(e.pathKey);
-					else if (r.reason === "too-large") put.push({ ...e, excluded: true, size: r.stat?.size ?? e.size });
-					else {
-						unread++;
-						this.ctx.notice("warn", "read-failed", `could not read ${e.path}`);
+			const issuedAt = this.hintClock;
+			const hintedSince = (k: PathKey): boolean => (this.hintGen.get(k) ?? 0) > issuedAt;
+			this.readsInFlight++;
+			try {
+				const results = reqs.length > 0 ? await this.ctx.deps.disk.read(reqs) : [];
+				for (let j = 0; j < toRead.length; j++) {
+					const e = toRead[j]!;
+					const r = results[j];
+					if (!r) continue;
+					if (!r.ok) {
+						if (r.reason === "missing") drop.push(e.pathKey);
+						else if (r.reason === "too-large") put.push({ ...e, excluded: true, size: r.stat?.size ?? e.size });
+						else {
+							unread++;
+							this.ctx.notice("warn", "read-failed", `could not read ${e.path}`);
+						}
+						continue;
 					}
-					continue;
+					const c = this.ctx.classify(r.stat.path, r.stat.size);
+					if (c.excluded) {
+						put.push({ ...e, excluded: true, size: r.stat.size, mtimeMs: r.stat.mtimeMs });
+						continue;
+					}
+					const h = await hashBytes(this.ctx.deps.hash, c.kind, r.bytes);
+					put.push({ ...e, diskPath: r.stat.path, path: c.path, kind: c.kind, size: r.stat.size, mtimeMs: r.stat.mtimeMs, hash: h.hash, fingerprint: h.fingerprint, hashedAtMs: this.ctx.now(), excluded: false });
+					done++;
 				}
-				const c = this.ctx.classify(r.stat.path, r.stat.size);
-				if (c.excluded) {
-					put.push({ ...e, excluded: true, size: r.stat.size, mtimeMs: r.stat.mtimeMs });
-					continue;
-				}
-				const h = await hashBytes(this.ctx.deps.hash, c.kind, r.bytes);
-				put.push({ ...e, diskPath: r.stat.path, path: c.path, kind: c.kind, size: r.stat.size, mtimeMs: r.stat.mtimeMs, hash: h.hash, fingerprint: h.fingerprint, hashedAtMs: this.ctx.now(), excluded: false });
-				done++;
+				// A path hinted since the read went out keeps the entry the hint left (hash null) for the next read.
+				const fresh = (k: PathKey): boolean => !hintedSince(k);
+				const committing = new Map<PathKey, number>(toRead.map((e) => [e.pathKey, this.hintGen.get(e.pathKey) ?? 0]));
+				const putNow = put.filter((e) => fresh(e.pathKey) && !drop.includes(e.pathKey));
+				const dropNow = drop.filter(fresh);
+				await this.ctx.commit({}, putNow, dropNow);
+				// Hinted while the commit ran: it wrote the stale result over the hint; the next read decides.
+				for (const e of toRead) if ((this.hintGen.get(e.pathKey) ?? 0) > (committing.get(e.pathKey) ?? 0)) this.markDirty(e.diskPath, null);
+			} finally {
+				if (--this.readsInFlight === 0) this.hintGen.clear();
 			}
-			await this.ctx.commit({}, put.filter((e) => !drop.includes(e.pathKey)), drop);
 		}
 		this.lastUnread = unread;
 		return done;

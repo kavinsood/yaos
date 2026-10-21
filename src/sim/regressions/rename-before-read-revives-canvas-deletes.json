@@ -163,5 +163,6 @@
  ],
  "gitSha": "3a83659fc28b9619c7cd52aebe2f5380bc010740",
  "masterSeed": 12,
- "label": "CANVAS_FAULTS[9] short d2 s119 storms0.071 hot-canvas"
+ "label": "CANVAS_FAULTS[9] short d2 s119 storms0.071 hot-canvas",
+ "note": "canvas seed 20701862 (SIM-CANVAS-FOLDER-REVIVE). A saves a canvas (fixing a dangling edge: two edges deleted) and renames it into a new folder before the pass that hashes the save reads it. The host held the rename's event in its 50 ms batch while the read of the source came back missing, and the observed rename was dropped after a pass that could only ask for the target's hash: A deleted the doc and created a new one for the target, and B's concurrent text edit restored the old doc with the deleted edges. Fixed: the host flushes its event batch before answering reads and disk ops, the scanner ignores a read result for a path hinted while the read was in flight, and an observed rename whose target is not hashed yet survives the pass."
 }

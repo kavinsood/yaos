@@ -140,11 +140,6 @@ on A is lost. Possibly the same as test:sim-suite1 "4 devices, E2EE faults" seed
 at step 52)`, identical on base; its plan has an epoch reset and commit crashes too, `s1-e2ee4-seed1.json`). The
 known suite-1 failure: `npm run test:sim-suite1` exits 1 on it.
 
-### SIM-CANVAS-FOLDER-REVIVE: a folder rename revives deleted canvas edges
-
-`20701862-41-min.json` (7 steps, base): A fixes a dangling edge (`cBroken`), then renames the canvas's folder; the
-edges A deleted come back with no concurrent edit and no conflict copy.
-
 ### SIM-BLOB-STALE-DISK: blob faults leave A's disk stale
 
 `1370759151-13-min.json` (blob faults, 2 devices, delete / restore races): no convergence; A's body replica and the
@@ -190,6 +185,13 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-CANVAS-FOLDER-REVIVE** (`fix-integrity`): a save, then a rename before the pass that hashes the save reads
+  the file. The host held the rename's event in its 50 ms batch (§g.3) while the read of the source came back
+  "missing", and an observed rename was dropped after a pass that could only ask for the target's hash, so the doc
+  was deleted and a new one created at the target; a peer's concurrent edit then restored the old doc with records
+  the user had deleted (canvas edges back). The host now flushes its batch before it answers reads and disk ops, the
+  scanner drops a read result for a path hinted while the read was in flight, and an observed rename whose target is
+  not hashed yet survives the pass. Regression `rename-before-read-revives-canvas-deletes.json`.
 - **CLONED-ID, FRAMENO-IDB** (identity-per-store phases 1–4, `client-remake-next`): a deviceId is used by exactly one
   store, ever. The identity lives in the store (`meta.identity`), data.json holds a pairing grant, a clone or a new
   IndexedDB registers a new device, an IndexedDB loss fences its predecessor and re-issues its mirrored frames, a
