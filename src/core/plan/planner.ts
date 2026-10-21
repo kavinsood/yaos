@@ -11,7 +11,8 @@
  *   - tzOffsetMinutes: local time for conflict names (core may not read Date)
  *   - remoteTextHash: streams.textHash of caught-up md/canvas docs
  *   - bodyAppliedSeq: streams.appliedSeq (nsDelete.baseBodySeq)
- *   - restoreDuty: docs whose restore condition + own duty hold (§c.7)
+ *   - restoreDuty: docs whose restore condition + own duty hold (§c.7), pruned docs with rows past the pruned
+ *     delete's base included (§c.9 "Pruned docs")
  *   - lostCreateBody: live docs whose initial body never reached the relay and never will: created by
  *     this install's lineage and no longer pending here (store lost), or by a retired store (abandoned)
  *
@@ -138,14 +139,15 @@ export function takesNoFreshId(s: Pick<SyncedEntry, "contentHash" | "nsTouchSeq"
  * merged doc counts as absent (its winner may be). Kept tight: every id is a random draw, and seeded runs replay them.
  */
 export function freshIdBudget(
-	synced: ReadonlyMap<DocId, SyncedEntry>, local: ReadonlyMap<PathKey, LocalEntry>, remote: ReadonlyMap<DocId, RemoteEntry>, pendingBody: ReadonlySet<DocId> = new Set(),
+	synced: ReadonlyMap<DocId, SyncedEntry>, local: ReadonlyMap<PathKey, LocalEntry>, remote: ReadonlyMap<DocId, RemoteEntry>, restoring: (docId: DocId) => boolean = () => false,
 ): number {
 	const covered = new Map<PathKey, boolean>();
 	for (const s of synced.values()) {
 		const l = local.get(s.pathKey);
 		const r = remote.get(s.docId);
-		// An absent doc with own body frames still to send re-creates (the pruned row), as a changed file does.
-		const ok = l !== undefined && takesNoFreshId(s, l.hash, r !== undefined && r.state !== "merged") && (r !== undefined || !pendingBody.has(s.docId));
+		// An absent doc with a restore duty (own body frames still to send, rows its pruned delete did not cover)
+		// re-creates (the pruned row), as a changed file does.
+		const ok = l !== undefined && takesNoFreshId(s, l.hash, r !== undefined && r.state !== "merged") && (r !== undefined || !restoring(s.docId));
 		covered.set(s.pathKey, (covered.get(s.pathKey) ?? true) && ok);
 	}
 	let n = 0;
@@ -527,10 +529,12 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		// is then an own create the fold ignored (replay-duplicate, duplicate-docid, ...), not a prune: the file is
 		// created anew instead of trashed, as a changed file is below. The worst case of the rule is a resurrection
 		// (an own create that did fold, was deleted elsewhere and pruned before S1 ran), never a loss.
-		// Own body frames of the doc still wait in the outbox: no delete covered them (edit beats delete, §c.7), but the
-		// restore can no longer name the pruned id. The file (S tracks a bound doc's local edits, so it reads
-		// unchanged) is created anew with them instead of trashed (sim smallPrune seed 104: offline edits trashed).
-		if (takesNoFreshId(s, l.hash, false) && !input.docsWithPendingBody.has(s.docId)) {
+		// Restore duty of a pruned doc (§c.9 "Pruned docs"): body rows the pruned delete did not cover (committed past
+		// its base, or own frames still in the outbox) beat the delete (§c.7), but the restore can no longer name the
+		// pruned id. The file (S tracks the edits this device sent, so it reads unchanged) is created anew with them
+		// instead of trashed (sim smallPrune seed 104: offline edits trashed; open-repro prune-storm-mass-delete:
+		// sent edits trashed when the delete and its prune folded in one batch).
+		if (takesNoFreshId(s, l.hash, false) && !hasRestoreDuty(s.docId)) {
 			return push([...prefix, { op: "diskTrash", docId: s.docId, path: l.path, expect: { t: "hash", hash: s.contentHash } }, drop(s.docId)],
 				"diskTrash", brakeKey("diskTrash", s.docId, l.path, s.contentHash), l.path);
 		}

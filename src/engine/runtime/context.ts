@@ -6,7 +6,7 @@
  */
 
 import type { Budgets, DeviceClass } from "../../core/limits";
-import { NS_STREAM, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
+import { NS_STREAM, docStream, streamClass, streamDocId, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type Seq, type StreamName } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { TimerHandle } from "../../ports/clock";
 import type { RelaySession } from "../../ports/relay";
@@ -22,7 +22,7 @@ import { resolveRefRow, type RefDeps } from "../body/refs";
 import type { Sender } from "../body/sender";
 import type { GateCtx } from "../ingest/gate";
 import type { Mut, OutboxRename, Repo } from "../store/repo";
-import type { OutboxRecord, TailRecord } from "../store/schema";
+import type { OutboxRecord, StreamRecord, TailRecord } from "../store/schema";
 import type { CatchUpDeps } from "../sync/catchUp";
 import type { CfgRuntime } from "../sync/cfgRuntime";
 import type { FoldRuntime } from "../sync/foldRuntime";
@@ -524,9 +524,27 @@ export class EngineCtx {
 	private async afterNsChange(reload: boolean): Promise<void> {
 		const folded = reload ? await this.ns.load() : await this.ns.advance();
 		this.retire.noteFold(folded, this.self);
+		await this.keepRemovedDeletes();
 		const changes = this.ns.reconcileHeld(this.outbox);
 		if (changes.length > 0) this.applyOutboxResult(await this.repo.tOutbox(changes));
 		if (folded.length > 0 || reload) this.emit("onNsFold", () => this.opts.onNsFold?.(folded, reload));
+	}
+
+	/**
+	 * §c.9 "Pruned docs": the delete base of every deleted entry the fold removed goes onto the doc's `b:`/`c:` stream
+	 * record (made if this device has none yet: an inherited synced record of a doc whose body is not read yet), which
+	 * tDropStream keeps while a synced record names the doc. Until the write lands the base is in
+	 * NsRuntime.removedDeletes, set with the removal. Queued ahead of any later snapshot of the fold: a crash in
+	 * between refolds the rows and keeps it again.
+	 */
+	private async keepRemovedDeletes(): Promise<void> {
+		const gone = [...this.ns.removedDeletes.values()];
+		const patches = gone.flatMap((e) => {
+			const stream = docStream(e.kind, e.docId);
+			return stream ? [{ stream, patch: (r: Mut<StreamRecord>) => { r.prunedDeleteBase = e.deleteBaseBodySeq; } }] : [];
+		});
+		if (patches.length > 0) await this.repo.tPatchStreams(patches);
+		for (const e of gone) if (this.ns.removedDeletes.get(e.docId) === e) this.ns.removedDeletes.delete(e.docId);
 	}
 
 	/** Fold newly available cfg rows (reload: snapshot replaced) and report them. */

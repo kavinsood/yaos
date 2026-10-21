@@ -238,6 +238,13 @@ export interface StreamRecord {
 	readonly disputedCheckpointCoversSeq: Seq;
 	/** Logical hash of the doc text at bodyVersion, if computed. */
 	readonly textHash: ContentHash | null;
+	/**
+	 * `b:`/`c:` only: the `deleteBaseBodySeq` of the doc's delete, written when this device's fold removed the
+	 * deleted entry (prune, or an ns checkpoint adopted past it; DESIGN §c.9 "Pruned docs"). The restore duty of the
+	 * pruned doc is judged against it (lastOwnSeq > it); absent, the base is taken as 0. Lives as long as the record,
+	 * which tDropStream keeps while a synced record names the doc. Optional: records from before it lack it.
+	 */
+	readonly prunedDeleteBase?: Seq;
 }
 
 // ---------------------------------------------------------------------------

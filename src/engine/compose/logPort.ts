@@ -16,6 +16,7 @@ import { pathKey } from "../../core/paths/pathKey";
 import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
 import type * as Y from "yjs";
 import type { Handle } from "../body/handles";
+import { prunedRestoreDuty } from "../../core/ns/pruned";
 import { canvasDocHashInput } from "../reconcile/canvasDoc";
 import type {
 	BodyVersion, CfgFoldState, CfgOp, ContentHash, DeviceId, DocId, NsOp, PathKey, RemoteEntry, Seq, StreamName,
@@ -86,6 +87,13 @@ export class ComposedLog implements LogPort {
 				const h = this.knownHash(e.docId, e.kind as "markdown" | "canvas", body.stream, body.version);
 				if (h) textHash.set(e.docId, h);
 			}
+		}
+		// Pruned docs (§c.9): a doc the view no longer holds keeps its restore duty while this device's stream record of
+		// it does (tDropStream keeps it while a synced record names the doc): rows past the removed delete's base.
+		for (const rec of c.repo.streams()) {
+			if ((rec.cls !== "body" && rec.cls !== "canvas") || !rec.docId || ns.state.entries.has(rec.docId)) continue;
+			const base = c.ns.removedDeletes.get(rec.docId)?.deleteBaseBodySeq ?? rec.prunedDeleteBase;
+			if (prunedRestoreDuty(rec, base, c.ns.state.entries.get(rec.docId))) restoreDuty.add(rec.docId);
 		}
 		this.creators?.seen(ask);
 		for (const [key, id] of ns.index.byPathKey) remoteByPathKey.set(key, id);
