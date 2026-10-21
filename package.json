@@ -13,7 +13,7 @@
 		"test:regressions": "npm run guard:no-src-js-artifacts && npm run guard:server-crdt-engine && node tests/run-suites.mjs",
 		"test:ci": "npm run test:regressions",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
-		"lint": "eslint .",
+		"lint": "eslint --max-warnings 0 .",
 		"lint:changed": "node scripts/lint-changed.mjs",
 		"lint:staged": "node scripts/lint-changed.mjs --staged",
 		"lint:worktree": "node scripts/lint-changed.mjs --worktree",
@@ -31,7 +31,7 @@
 		"typecheck:client": "tsc -noEmit -p tsconfig.json && tsc -noEmit -p tsconfig.client-tests.json && tsc -noEmit -p e2e/client/tsconfig.json",
 		"check:deps": "node scripts/check-deps.mjs",
 		"bench:e2ee": "node --import jiti/register scripts/bench-e2ee.mjs",
-		"check:client": "npm run typecheck:client && npm run check:deps && npm run guard:no-real-time && npm run test:client"
+		"check:client": "npm run typecheck:client && npm run lint && npm run check:deps && npm run guard:no-real-time && npm run test:client"
 	},
 	"license": "0-BSD",
 	"engines": {
