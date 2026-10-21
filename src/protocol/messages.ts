@@ -238,6 +238,12 @@ export type UserCommand =
 	 * a new one comes back as a `grantSecret` message first. Sent by main when a grant call answered 401.
 	 */
 	| { readonly t: "refreshGrant" }
+	/**
+	 * Main pinned suite 0 after a pinSuite0 `ok` and saved it (e2ee-design §12.4 (ii), (iii)): an unpinned engine opens
+	 * its gate in place (KeyReader -> VaultRuntime) instead of main restarting it. Refused when the engine cannot
+	 * (not unpinned, no reader, no repin hook): main restarts it then.
+	 */
+	| { readonly t: "applyPin"; readonly suite: 0 }
 	| { readonly t: "updateSettings"; readonly settings: EngineSettings }
 	| { readonly t: "releaseQuarantine"; readonly stream: string }
 	// e2ee-design §18.4 (all SECRET payloads, transferred):

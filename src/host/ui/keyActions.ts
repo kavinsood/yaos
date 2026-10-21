@@ -14,7 +14,7 @@ import type { UserCommand } from "../../protocol/messages";
 import type { StatusSnapshot } from "../../protocol/status";
 import type { YaosPluginData, YaosUiHost } from "./api";
 import { keyCommandMessage } from "./e2eeText";
-import { waitFor, type WaitOptions } from "./hostWait";
+import { nextChange, waitFor, type WaitOptions } from "./hostWait";
 import { buildRekeyLink, buildSetupLink, pairingCodeVaultId, type LinkE2ee, type LinkKey, type SetupLinkParse } from "./pairing";
 import { readRecoveryKey } from "./recoveryKeyText";
 
@@ -75,10 +75,17 @@ function transient(err: unknown): boolean {
 	return m === "YAOS is not running." || m.startsWith("not-ready:") || m.startsWith("timeout:") || m.startsWith("refused: k is not read to head yet");
 }
 
-/** Sends `make()` (a fresh command per attempt: its bytes are transferred) until it answers or is refused for good. */
+/** The longest wait between two attempts when nothing changes on the host (offline, a slow `k` read). */
+const RETRY_CAP_MS = 1000;
+
+/**
+ * Sends `make()` (a fresh command per attempt: its bytes are transferred) until it answers or is refused for good.
+ * A transient refusal (the engine not running yet, mostly: pinSuite0 itself waits for `k`, keyReader.ts) is retried on
+ * the next host change, when the engine came up, or after RETRY_CAP_MS.
+ */
 async function sendRetrying(host: KeyHost, make: () => UserCommand, opts: RetryOptions, timeoutMs: number): Promise<void> {
 	const now = opts.now ?? Date.now;
-	const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+	const pause = opts.sleep ?? ((ms: number) => nextChange(host, ms, opts));
 	const deadline = now() + (opts.timeoutMs ?? timeoutMs);
 	for (;;) {
 		try {
@@ -86,7 +93,7 @@ async function sendRetrying(host: KeyHost, make: () => UserCommand, opts: RetryO
 			return;
 		} catch (err) {
 			if (!transient(err) || now() >= deadline) throw new Error(keyCommandMessage(err));
-			await sleep(1000);
+			await pause(RETRY_CAP_MS);
 		}
 	}
 }

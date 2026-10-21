@@ -112,6 +112,8 @@ export interface SimDeviceOptions {
 	readonly tuning?: Partial<EngineTuning>;
 	/** Over the device class's budgets (run.ts tuningWorld: residency small enough to evict, catch-up width, ...). */
 	readonly budgets?: Partial<Budgets>;
+	/** The engine applies a suite-0 pin in place (webEngine.ts `repin`, the default); false: main restarts it instead. */
+	readonly pinInPlace?: boolean;
 }
 
 /**
@@ -271,6 +273,8 @@ export class SimDevice {
 			...(this.opts.budgets ? { budgets: this.opts.budgets } : {}),
 			startRetryMs: 1_000,
 			tzOffsetMinutes: () => 0,
+			// As webEngine.ts: suite 0 seals nothing.
+			...(this.opts.pinInPlace === false ? {} : { repin: (config, ports) => (config.crypto.suite === 0 ? { ...ports, crypto: createNoopCrypto(ports.hash) } : ports) }),
 			log: this.opts.log,
 			onDiag: (ev) => {
 				this.opts.log?.(`diag ${ev.code} ${JSON.stringify(ev.fields)}`);

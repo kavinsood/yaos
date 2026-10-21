@@ -39,3 +39,15 @@ export function waitFor<T>(host: Pick<YaosUiHost, "onChange">, probe: () => T | 
 		check();
 	});
 }
+
+/** Resolves on the next host change (the engine came up, its status moved), or after `maxMs` when nothing changes. */
+export async function nextChange(host: Pick<YaosUiHost, "onChange">, maxMs: number, opts: WaitOptions = {}): Promise<void> {
+	let first = true;
+	await waitFor(host, () => {
+		if (first) {
+			first = false; // waitFor probes once at once: only a change after this call counts
+			return null;
+		}
+		return true;
+	}, maxMs, { ...opts, timeoutMs: maxMs });
+}

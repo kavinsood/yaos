@@ -10,7 +10,9 @@
  *   only a verified key goes to main (keyringChanged), which then pins suite 1 and restarts the engine (§12.4 (i)).
  * - Suite 1 without the newest winner's key ("no-key", "revoked-epoch"): installKey works the same way; once the
  *   keyring holds the key and main stored it, `onKeyed` re-checks the gate and the engine starts its VaultRuntime.
- * - pinSuite0 {link}: unpinned, no record ever seen, `k` read to head on this session and empty. {create} and
+ * - pinSuite0 {link}: unpinned, no record ever seen, `k` read to head on this session and empty; it waits for the
+ *   read to head (up to PIN_HEAD_WAIT_MS) rather than refusing, so a setup link applied as the engine starts is
+ *   answered once, as soon as it can be. {create} and
  *   enableE2ee: `creatable` (started with `creating`, `k` read to head on this session with VAULT_READY.head 0 and
  *   no row). The engine never pins: main does, after `ok`.
  */
@@ -31,6 +33,9 @@ import { backoffMs, connectFailure, newReconnectState, sessionClosed, type Recon
 import type { HostKeyring } from "./hostKeyring";
 import type { ReaderPorts } from "./pinGate";
 import { idleStatus } from "./statusMerge";
+
+/** How long pinSuite0 {link} waits for `k` to be read to head before refusing (main's request times out at 60 s). */
+export const PIN_HEAD_WAIT_MS = 20_000;
 
 export type KeyCommand = Extract<UserCommand, { t: "enableE2ee" | "installKey" | "pinSuite0" | "revokeRekey" }>;
 /** The commands a closed device answers: the key commands, and the ones it refuses outright (no store, no blob port). */
@@ -100,6 +105,8 @@ export class KeyReader {
 	private readAgain = false;
 	private flow: OwnFlow | null = null;
 	private keyed = false;
+	/** Waiting for `k` to be read to head on this session (pinSuite0 {link}); woken by every finished read and by stop. */
+	private headWaiters: (() => void)[] = [];
 
 	constructor(private readonly o: KeyReaderOptions) {
 		this.paused = o.paused;
@@ -117,6 +124,7 @@ export class KeyReader {
 		if (this.retryTimer !== null) this.o.ports.clock.clearTimer(this.retryTimer);
 		this.retryTimer = null;
 		this.failFlow("the engine stopped");
+		for (const w of this.headWaiters.splice(0)) w();
 		this.drop("stopped");
 		void this.krReady.then((kr) => kr?.dispose());
 	}
@@ -199,6 +207,7 @@ export class KeyReader {
 				return { t: "ok" };
 			}
 			case "pinSuite0":
+				if (c.source === "link") await this.untilReadToHead();
 				this.mayPinSuite0(c.source);
 				return { t: "ok" };
 			case "enableE2ee":
@@ -217,6 +226,26 @@ export class KeyReader {
 			throw refused("this device cannot hold a vault key");
 		}
 		return kr;
+	}
+
+	/**
+	 * Until `k` is read to head on this session, or PIN_HEAD_WAIT_MS (offline, paused: then mayPinSuite0 refuses with
+	 * "not read to head yet", which main retries). A setup link's pinSuite0 arrives as the engine starts, before its
+	 * first read: answering it at once made main retry on a timer.
+	 */
+	private async untilReadToHead(): Promise<void> {
+		if (this.readToHead() || this.stopped) return;
+		await new Promise<void>((resolve) => {
+			let timer: TimerHandle | null = null;
+			const done = (): void => {
+				if (timer !== null) this.o.ports.clock.clearTimer(timer);
+				this.headWaiters = this.headWaiters.filter((w) => w !== done);
+				resolve();
+			};
+			this.headWaiters.push(done);
+			timer = this.o.ports.clock.setTimer(PIN_HEAD_WAIT_MS, done);
+		});
+		if (this.stopped) throw refused("the engine stopped");
 	}
 
 	/** §12.4 (ii), (iii): whether main may pin suite 0. */
@@ -480,6 +509,7 @@ export class KeyReader {
 			if (gen !== this.gen) return;
 			this.readGen = gen;
 			this.readHead = session.headSeq;
+			for (const w of this.headWaiters.splice(0)) w();
 			this.st = newReconnectState();
 			await this.afterRead(kr);
 			this.changed();

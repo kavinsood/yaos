@@ -326,7 +326,7 @@ export class YaosController {
 				this.pendingBrake = null;
 				this.changed();
 			}
-			if (value.t === "ok" && this.runtime === rt && sameVault(vault, this.current.identity)) await this.pinAfter(command);
+			if (value.t === "ok" && this.runtime === rt && sameVault(vault, this.current.identity)) await this.pinAfter(command, rt);
 			return value;
 		} catch (e) {
 			throw new Error(safeMessage(e));
@@ -352,11 +352,23 @@ export class YaosController {
 		}
 	}
 
-	/** §12.4 (ii) / (iii): a successful pinSuite0 or enableE2ee pins; the engine restarts with the pinned config. */
-	private async pinAfter(command: UserCommand): Promise<void> {
+	/**
+	 * §12.4 (ii) / (iii): a successful pinSuite0 or enableE2ee pins. Suite 0: the running engine opens its gate in place
+	 * (applyPin); an engine that cannot, and suite 1 (whose keys reach an engine only through init), restart with the
+	 * pinned config.
+	 */
+	private async pinAfter(command: UserCommand, rt: HostRuntime): Promise<void> {
 		const next = command.t === "pinSuite0" ? pinnedSuite0(this.current) : command.t === "enableE2ee" ? pinnedSuite1(this.current) : this.current;
 		if (next === this.current) return;
 		await this.savePin(next);
+		if (command.t === "pinSuite0" && this.runtime === rt) {
+			try {
+				await rt.command({ t: "applyPin", suite: 0 });
+				return;
+			} catch {
+				// refused or failed: the restart below starts it pinned
+			}
+		}
 		this.requestRestart();
 	}
 
