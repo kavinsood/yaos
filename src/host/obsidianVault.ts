@@ -1,7 +1,7 @@
 /**
  * VaultPort over Obsidian's Vault (DESIGN §f, §h).
- *  - write: CAS without hashing on main (DESIGN §d.2, §f.2). "absent" goes through vault.create (throws if
- *    it exists: atomic). fingerprint/hash: read the raw bytes, the engine hashes them (HashOracle),
+ *  - write: CAS without hashing on main (DESIGN §d.2, §f.2). "absent" checks the index, then goes through
+ *    vault.create (which checks the disk and throws if the file exists). fingerprint/hash: read the raw bytes, the engine hashes them (HashOracle),
  *    compare, then write behind O(1) guards; see "Precondition window" below.
  *  - rename: vault.rename only (never fileManager.renameFile: no link rewrites).
  *  - trash: vault.trash only. No permanent file delete exists in this adapter. "follow-obsidian"
@@ -68,6 +68,8 @@ export class ObsidianVault implements VaultPort {
 	readonly configDir: string;
 	readonly caseInsensitive: boolean;
 	private tmpSeq = 0;
+	/** createFolder calls in flight, by key(path). */
+	private readonly creatingFolders = new Map<string, Promise<void>>();
 
 	constructor(
 		private readonly vault: VaultApi,
@@ -115,7 +117,11 @@ export class ObsidianVault implements VaultPort {
 			case "any":
 				return { pass: true, textLength: null };
 			case "absent":
-				return { pass: f === null && !(await this.vault.adapter.exists(path)), textLength: null };
+				// The index only: vault.create / createBinary check adapter.exists themselves and throw "File already
+				// exists." (obsidian.asar 1.14.4 app.js@1422277, @1422665), and write()'s catch maps that to a failed
+				// precondition. A second exists here was one more native bridge call per created file (~4.5 ms each on an
+				// Android phone, integration-notes §7.3).
+				return { pass: f === null, textLength: null };
 			case "fingerprint":
 			case "hash": {
 				if (!f) return { pass: false, textLength: null };
@@ -148,11 +154,18 @@ export class ObsidianVault implements VaultPort {
 			const a = this.vault.getAbstractFileByPath(p);
 			if (isFile(a)) return p;
 			if (a === null) {
-				try {
-					await this.vault.createFolder(p);
-				} catch {
-					// created concurrently (or exists unindexed): fine
+				// Concurrent writes into one new folder (DiskExecutor runs ops of different batches at once) share
+				// its createFolder instead of each paying exists + mkdir on the bridge.
+				const k = this.key(p);
+				let pending = this.creatingFolders.get(k);
+				if (!pending) {
+					pending = this.vault.createFolder(p).then(
+						() => undefined,
+						() => undefined, // created concurrently (or exists unindexed): fine
+					).finally(() => this.creatingFolders.delete(k));
+					this.creatingFolders.set(k, pending);
 				}
+				await pending;
 			}
 		}
 		return null;

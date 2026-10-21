@@ -37,6 +37,8 @@ export interface WorldOptions {
 	readonly docDeletes?: Map<string, OldDocDeletes>;
 	/** Queue own fold events for the reconciler to take (ReconcilerDeps.takeOwnFold), as the vault runtime does. */
 	readonly deferOwnFold?: boolean;
+	/** ReconcilerDeps.diskConcurrency; default 4, the product's on every class but constrained. */
+	readonly diskConcurrency?: number;
 }
 
 export const DB = "yaos2-test";
@@ -91,6 +93,7 @@ export class World {
 			} : {}),
 			...(this.opts.pathDeleted ? { pathDeleted: (key: PathKey) => (this.opts.pathDeleted!.has(key) ? new Set(this.opts.pathDeleted!.get(key)) : null) } : {}),
 			...(this.opts.deferOwnFold ? { takeOwnFold: () => this.ownQueue.splice(0) } : {}),
+			diskConcurrency: this.opts.diskConcurrency ?? 4,
 		});
 		this.log.onOwnFold = this.opts.deferOwnFold ? async (events) => void this.ownQueue.push(...events) : (events) => rec.applyOwnFold(events);
 		this.rec = rec;

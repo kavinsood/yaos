@@ -1838,7 +1838,10 @@ e2ee-design §18.4).
   `src/host/bundleSource.ts:24-27`), so the engine is in `main.js` once, and in the worker `host/entry.ts` starts
   only the engine (`src/host/entry.ts:22-29`; integration-notes §4 D2). The host starts it with
   `new Worker(URL.createObjectURL(new Blob([script], {type: "text/javascript"})))` (`src/host/plugin.ts:46-47`).
-  - Startup: construct the worker, `ping`, and expect a `pong` within `STARTUP_PING_TIMEOUT_MS` (5 s); then `init`.
+  - Startup: construct the worker, `ping`, and expect a `pong` within `STARTUP_PING_TIMEOUT_MS` (5 s); a miss sends
+    another ping with twice the deadline, `STARTUP_PING_ATTEMPTS` (4) pings in all (5 + 10 + 20 + 40 s); then `init`.
+    A worker that throws while loading is a transport failure, reported at once; a silent one is still loading (a
+    phone parsing `main.js`, a debugger attached).
   - IDB is opened inside the worker. If it is unavailable there (risk OR-1), init answers `storage-lost` and the
     engine stops (§g.4).
   - `PlatformInfo.workerSupported` is the platform fact (`Worker` and Blob URLs exist). Nothing probes or overrides it.
@@ -1926,7 +1929,7 @@ transferred buffers.
   never retryable.
 - **Worker failure is terminal** (host/engineHost.ts). Each of these stops the engine for that runtime:
   - the worker cannot be constructed (no `Worker` or Blob URLs, `main.js` is not the bundle, the constructor throws);
-  - no startup `pong` within `STARTUP_PING_TIMEOUT_MS`;
+  - no answer to any of the `STARTUP_PING_ATTEMPTS` startup pings (75 s in all);
   - a worker `error` / `messageerror` event, or any other transport failure;
   - no liveness `pong` to `PING_MISSES_FATAL` (2) pings in a row, `PING_TIMEOUT_MS` (15 s) each. One miss only sends
     the next ping at once: after the app was frozen in the background, the overdue timeout can fire before the engine

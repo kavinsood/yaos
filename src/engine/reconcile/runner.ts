@@ -13,9 +13,13 @@
  *     S ≠ L, so the next pass re-runs the merge instead of waiting forever on
  *     "body-empty" (the planner cannot tell an own unwritten body from another
  *     device's in-flight one);
- *   - disk / content / bookkeeping ops run one by one (per-op gateway exec); blob
- *     jobs only claim their transfer, which runs in the background (BlobTransfer,
- *     bounded by its byte budget), so no attachment holds up the other docs;
+ *   - disk / content / bookkeeping ops run one by one (per-op gateway exec), except
+ *     consecutive diskMaterialize jobs: up to ReconcilerDeps.diskConcurrency of them
+ *     run at once when their docs and paths differ (a fresh device's bootstrap is
+ *     mostly these, and the host runs their writes concurrently; integration-notes
+ *     §7.3); any other job waits for the running ones to end. Blob jobs only claim
+ *     their transfer, which runs in the background (BlobTransfer, bounded by its
+ *     byte budget), so no attachment holds up the other docs;
  *   - when an op of a doc fails (or is held) the doc's later ops are skipped;
  *   - an "inflight" job (its transfer runs) skips the doc's later ops too, and
  *     neither counts as actionable (RunReport.transferring): the transfer's end
@@ -172,28 +176,63 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		ok += ns.length;
 	}
 
-	for (; i < ops.length; i++) {
-		if (uncork && i > lastLive) {
-			uncork();
-			uncork = null;
+	// Running diskMaterialize jobs and the doc / path keys each holds. A job's exception is rethrown once the
+	// others have ended.
+	const width = Math.max(1, ctx.deps.diskConcurrency ?? 1);
+	const running = new Map<Promise<void>, readonly string[]>();
+	let thrown: { error: unknown } | null = null;
+	const settle = async (room: number): Promise<void> => {
+		while (running.size > room) await Promise.race(running.keys());
+		if (thrown) throw thrown.error;
+	};
+	const holds = (keys: readonly string[]): boolean => [...running.values()].some((ks) => ks.some((k) => keys.includes(k)));
+	try {
+		for (; i < ops.length; i++) {
+			if (uncork && i > lastLive) {
+				uncork();
+				uncork = null;
+			}
+			const op = ops[i]!;
+			if (op.op === "needHash") {
+				needHash++;
+				continue;
+			}
+			if (op.op === "wait" && op.reason !== "text-hash") {
+				waits++;
+				continue;
+			}
+			if (op.op === "diskMaterialize" && width > 1) {
+				const keys = [`d:${op.docId}`, `p:${ctx.pk(op.path)}`];
+				await settle(holds(keys) ? 0 : width - 1);
+				if (blocked(op)) continue;
+				if (stopping()) break;
+				const job: Promise<void> = runOne(env, op).then(
+					(res) => note(op, res),
+					(error: unknown) => {
+						thrown ??= { error };
+					},
+				).finally(() => running.delete(job));
+				running.set(job, keys);
+				continue;
+			}
+			await settle(0);
+			if (op.op === "wait") {
+				if (!stopping()) note(op, await loadTextHash(ctx.log, op.docId));
+				else waits++;
+				continue;
+			}
+			if (blocked(op)) continue;
+			if (toNsOp(op) !== null) throw new Error(`ns op out of order: ${op.op}`);
+			if (stopping()) break;
+			const res = await runOne(env, op);
+			note(op, res);
+			if (res === "ok" && op.op === "diskRename") vacated.push(op.from);
+			if (res === "ok" && op.op === "diskTrash") vacated.push(op.path);
 		}
-		const op = ops[i]!;
-		if (op.op === "wait") {
-			if (op.reason === "text-hash" && !stopping()) note(op, await loadTextHash(ctx.log, op.docId));
-			else waits++;
-			continue;
-		}
-		if (op.op === "needHash") {
-			needHash++;
-			continue;
-		}
-		if (blocked(op)) continue;
-		if (toNsOp(op) !== null) throw new Error(`ns op out of order: ${op.op}`);
-		if (stopping()) break;
-		const res = await runOne(env, op);
-		note(op, res);
-		if (res === "ok" && op.op === "diskRename") vacated.push(op.from);
-		if (res === "ok" && op.op === "diskTrash") vacated.push(op.path);
+		await settle(0);
+	} finally {
+		// An exception elsewhere still waits for the running jobs: none outlives the run.
+		while (running.size > 0) await Promise.race(running.keys());
 	}
 	uncork?.();
 	env.deferred.clear();

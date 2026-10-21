@@ -274,6 +274,7 @@ export class VaultRuntime {
 			},
 			takeOwnFold: () => this.takeOwnFold(),
 			stopping: () => this.stopped,
+			diskConcurrency: c.budgets.diskOpConcurrency,
 		});
 		await this.rec.start();
 		if (this.settings.syncSettings) {

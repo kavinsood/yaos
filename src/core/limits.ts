@@ -291,6 +291,12 @@ export interface Budgets {
 	/** Outstanding main-thread read/write payload bytes. */
 	readonly maxDiskIoBytesInFlight: number;
 	readonly diskOpsPerBatch: number;
+	/**
+	 * Disk ops in flight at once: the main-thread executor (host/diskExecutor.ts) and the plan runner's materialize
+	 * window (engine/reconcile/runner.ts). Obsidian's mobile file bridge serves 4 concurrent calls 2-3x faster than
+	 * one at a time and gains little past 4-8 (integration-notes §7.3).
+	 */
+	readonly diskOpConcurrency: number;
 	/** Main-thread executor slice. */
 	readonly mainSliceMs: number;
 	readonly fullReconcileIntervalMs: number;
@@ -310,25 +316,25 @@ export const BUDGETS: Readonly<Record<DeviceClass, Budgets>> = {
 	desktop: {
 		maxResidentDocs: 400, maxResidentBytes: 256 * 1024 * 1024,
 		catchUpConcurrency: 8, blobBytesInFlight: 64 * 1024 * 1024, maxInflightAppendBytes: 1024 * 1024,
-		maxDiskIoBytesInFlight: 8 * 1024 * 1024, diskOpsPerBatch: 32, mainSliceMs: 8,
+		maxDiskIoBytesInFlight: 8 * 1024 * 1024, diskOpsPerBatch: 32, diskOpConcurrency: 4, mainSliceMs: 8,
 		fullReconcileIntervalMs: 5 * 60_000, dailyFrameSoftBudget: 20_000, docUpdateWindowBytes: 512 * 1024,
 	},
 	tablet: {
 		maxResidentDocs: 120, maxResidentBytes: 96 * 1024 * 1024,
 		catchUpConcurrency: 4, blobBytesInFlight: 32 * 1024 * 1024, maxInflightAppendBytes: 512 * 1024,
-		maxDiskIoBytesInFlight: 4 * 1024 * 1024, diskOpsPerBatch: 16, mainSliceMs: 6,
+		maxDiskIoBytesInFlight: 4 * 1024 * 1024, diskOpsPerBatch: 16, diskOpConcurrency: 4, mainSliceMs: 6,
 		fullReconcileIntervalMs: 10 * 60_000, dailyFrameSoftBudget: 10_000, docUpdateWindowBytes: 256 * 1024,
 	},
 	phone: {
 		maxResidentDocs: 60, maxResidentBytes: 48 * 1024 * 1024,
 		catchUpConcurrency: 3, blobBytesInFlight: 16 * 1024 * 1024, maxInflightAppendBytes: 512 * 1024,
-		maxDiskIoBytesInFlight: 2 * 1024 * 1024, diskOpsPerBatch: 16, mainSliceMs: 5,
+		maxDiskIoBytesInFlight: 2 * 1024 * 1024, diskOpsPerBatch: 16, diskOpConcurrency: 4, mainSliceMs: 5,
 		fullReconcileIntervalMs: 10 * 60_000, dailyFrameSoftBudget: 6_000, docUpdateWindowBytes: 256 * 1024,
 	},
 	constrained: {
 		maxResidentDocs: 24, maxResidentBytes: 24 * 1024 * 1024,
 		catchUpConcurrency: 2, blobBytesInFlight: 8 * 1024 * 1024, maxInflightAppendBytes: 256 * 1024,
-		maxDiskIoBytesInFlight: 1024 * 1024, diskOpsPerBatch: 8, mainSliceMs: 4,
+		maxDiskIoBytesInFlight: 1024 * 1024, diskOpsPerBatch: 8, diskOpConcurrency: 2, mainSliceMs: 4,
 		fullReconcileIntervalMs: 15 * 60_000, dailyFrameSoftBudget: 4_000, docUpdateWindowBytes: 128 * 1024,
 	},
 };

@@ -294,3 +294,41 @@ test("live creates (DESIGN §d.4): the first full pass after boot holds its crea
 	const d = w.log.liveByPath(P("d.md"))!;
 	assert.deepEqual(w.log.trace, ["ns held", `frame ${d}`], "the first pass after a restart holds again");
 });
+
+test("bootstrap materializes run diskConcurrency at a time; the rest of the plan waits for them", async () => {
+	for (const width of [1, 3]) {
+		const w = new World({ diskConcurrency: width });
+		await w.boot();
+		for (let i = 0; i < 10; i++) w.log.remoteCreate(P(`f/n${i}.md`), `note ${i}\n`);
+		let running = 0;
+		let peak = 0;
+		w.gateway.beforeOp = async (op) => {
+			if (op.t !== "write") return;
+			running++;
+			peak = Math.max(peak, running);
+			for (let k = 0; k < 5; k++) await Promise.resolve();
+			running--;
+		};
+		const res = await w.sync();
+		assert.equal(res.quiet, true);
+		assert.equal(peak, width, `width ${width}`);
+		for (let i = 0; i < 10; i++) assert.equal(w.vault.text(`f/n${i}.md`), `note ${i}\n`);
+		assert.equal(w.r.scan.dirty.size, 0, "own writes are echoes");
+	}
+});
+
+test("a materialize that fails inside a concurrent window fails only its doc; the others land", async () => {
+	const w = await booted({ diskConcurrency: 4 });
+	const ids = Array.from({ length: 6 }, (_, i) => w.log.remoteCreate(P(`n${i}.md`), `note ${i}\n`));
+	w.vault.userWrite("n2.md", "local text\n"); // appears before the pass: the absent precondition fails
+	w.pending.length = 0; // undelivered: the plan still thinks n2.md is absent
+	let hit = false;
+	w.gateway.beforeOp = (op) => {
+		if (op.t === "write" && op.path === "n2.md") hit = true;
+	};
+	await w.r.runUntilQuiet(1);
+	assert.equal(hit, true);
+	assert.equal(w.vault.text("n2.md"), "local text\n", "never overwritten");
+	for (const i of [0, 1, 3, 4, 5]) assert.equal(w.synced(ids[i] as DocId)?.path, `n${i}.md`);
+	assert.equal(w.synced(ids[2] as DocId), undefined);
+});

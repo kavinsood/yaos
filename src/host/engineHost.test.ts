@@ -9,7 +9,7 @@ import type { HostTransport } from "../protocol/transport";
 import { PING_IDLE_MAX_MS, PING_INTERVAL_MS, PING_TIMEOUT_MS } from "../protocol/transport";
 import { createWorkerHostTransport, type WorkerLike } from "../protocol/workerTransport";
 import { VirtualClock } from "../sim/clock";
-import { EngineHost, HostRequestError, STARTUP_PING_TIMEOUT_MS, type EngineCarrier, type EngineEventMessage } from "./engineHost";
+import { EngineHost, HostRequestError, STARTUP_PING_ATTEMPTS, STARTUP_PING_TIMEOUT_MS, STARTUP_PING_TOTAL_MS, type EngineCarrier, type EngineEventMessage } from "./engineHost";
 
 type Mode = "ok" | "silent" | { initError: ProtocolErrorCode } | "no-pong-after-init" | "drop-first-pong-after-init";
 
@@ -283,10 +283,30 @@ test("terminal: the worker misses the startup pong", async () => {
 	assert.equal(await early, "not-ready");
 	assert.deepEqual(h.fatals, [], "still waiting for the pong");
 	await h.clock.advance(STARTUP_PING_TIMEOUT_MS);
+	assert.deepEqual(h.fatals, [], "a missed first pong pings again");
+	await h.clock.advance(STARTUP_PING_TOTAL_MS - STARTUP_PING_TIMEOUT_MS - 200);
+	assert.deepEqual(h.fatals, [], "still inside the ladder");
+	assert.equal(h.engines[0]?.received.filter((m) => m.t === "ping").length, STARTUP_PING_ATTEMPTS);
+	await h.clock.advance(200);
 	assert.equal(h.engines[0]?.worker?.terminated, true, "silent worker terminated");
-	await assertTerminal(h, { pending: [], message: /^the sync engine did not answer within 5 s of starting$/, code: "timeout", constructions: 1 });
+	await assertTerminal(h, { pending: [], message: /^the sync engine did not answer within 75 s of starting$/, code: "timeout", constructions: 1 });
 	assert.equal(h.inits, 0, "init config never built");
 	assert.deepEqual(h.readies, []);
+});
+
+test("a worker slow to load answers a later startup ping: ready, no fatal", async () => {
+	const h = harness(worker("ok"));
+	void h.host.start();
+	h.engines[0]!.hang = true; // still parsing the bundle: the first two pings go unanswered
+	await h.clock.advance(STARTUP_PING_TIMEOUT_MS * 3 - 500);
+	assert.deepEqual(h.fatals, []);
+	assert.equal(h.engines[0]!.received.filter((m) => m.t === "ping").length, 2);
+	h.engines[0]!.hang = false;
+	await h.clock.advance(1_000); // the third ping, sent 15 s in, is answered
+	await h.clock.advance(100);
+	assert.deepEqual(h.fatals, []);
+	assert.deepEqual(h.readies, ["worker"]);
+	assert.equal(h.host.isReady, true);
 });
 
 test("terminal: the worker errors (uncaught exception in the worker)", async () => {
@@ -440,7 +460,7 @@ test("stop() while the carrier is still starting disposes it and never reports r
 	void h.host.start();
 	await h.clock.advance(100); // startup ping outstanding
 	const p = h.host.stop();
-	await h.clock.advance(STARTUP_PING_TIMEOUT_MS + 1_000);
+	await h.clock.advance(STARTUP_PING_TOTAL_MS + 1_000);
 	await p;
 	assert.equal(h.constructions, 1);
 	assert.equal(h.engines[0]?.disposed, true);

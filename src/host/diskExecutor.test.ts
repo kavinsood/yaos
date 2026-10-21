@@ -13,12 +13,12 @@ import { VirtualClock } from "../sim/clock";
 import { simHashOracle } from "../sim/hash";
 import { SimConfigDir, SimVault, type CaseProfile } from "../sim/vault";
 
-function setup(profile: CaseProfile = "case-insensitive", bound: Set<string> = new Set()) {
+function setup(profile: CaseProfile = "case-insensitive", bound: Set<string> = new Set(), diskOpConcurrency = 4) {
 	const clock = new VirtualClock();
 	const hashes = simHashOracle();
 	const vault = new SimVault({ clock, hashes, profile });
 	const configDir = new SimConfigDir(clock);
-	const exec = new DiskExecutor({ vault, configDir, clock, hashes, isBoundPath: (p) => bound.has(p), budgets: () => ({ mainSliceMs: 8 }) });
+	const exec = new DiskExecutor({ vault, configDir, clock, hashes, isBoundPath: (p) => bound.has(p), budgets: () => ({ mainSliceMs: 8, diskOpConcurrency }) });
 	return { clock, vault, configDir, exec, bound };
 }
 
@@ -163,7 +163,7 @@ test("diskExecutor: trash of a bound note with unsent editor edits posts them an
 	const unsent = new Set(["open.md"]);
 	const flushed: string[] = [];
 	const exec = new DiskExecutor({
-		vault, configDir: new SimConfigDir(clock), clock, hashes, isBoundPath: () => true, budgets: () => ({ mainSliceMs: 8 }),
+		vault, configDir: new SimConfigDir(clock), clock, hashes, isBoundPath: () => true, budgets: () => ({ mainSliceMs: 8, diskOpConcurrency: 4 }),
 		flushBoundPath: (p) => { flushed.push(p); return unsent.delete(p); },
 	});
 	vault.userWrite("open.md", "typed");
@@ -177,7 +177,7 @@ test("diskExecutor: trash of a bound note with unsent editor edits posts them an
 });
 
 test("diskExecutor: lanes execute open-note first; order within a batch is preserved", async () => {
-	const { vault, exec } = setup();
+	const { vault, exec } = setup("case-insensitive", new Set(), 1);
 	const order: string[] = [];
 	vault.onEvent(() => {});
 	const origWrite = vault.write.bind(vault);
@@ -191,6 +191,93 @@ test("diskExecutor: lanes execute open-note first; order within a batch is prese
 	const open = batch(LANE.openNote, "open", 2);
 	await Promise.all([bg1, bg2, open]);
 	assert.deepEqual(order, ["bg0.md", "open0.md", "open1.md", "bg1.md", "bg2.md", "bg3.md", "late0.md", "late1.md"], "FIFO between background batches");
+});
+
+/** vault.write held until released: records start order and the most writes running at once. */
+function gatedWrites(vault: SimVault) {
+	const started: string[] = [];
+	const gates: (() => void)[] = [];
+	let running = 0;
+	let peak = 0;
+	const orig = vault.write.bind(vault);
+	vault.write = async (path, data, pre) => {
+		started.push(path);
+		running++;
+		peak = Math.max(peak, running);
+		await new Promise<void>((r) => gates.push(r));
+		running--;
+		return orig(path, data, pre);
+	};
+	const flush = async () => {
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+	};
+	/** Release every held write until nothing is left to start. */
+	const releaseAll = async (done: Promise<unknown>) => {
+		let settled = false;
+		void done.then(() => { settled = true; });
+		while (!settled) {
+			await flush();
+			for (const g of gates.splice(0)) g();
+			await flush();
+		}
+	};
+	return { started, peak: () => peak, gates, flush, releaseAll };
+}
+
+test("diskExecutor: ops of different batches run concurrently up to diskOpConcurrency; one batch stays in order", async () => {
+	const { vault, exec } = setup("case-insensitive", new Set(), 3);
+	const g = gatedWrites(vault);
+	const runs = Array.from({ length: 5 }, (_, i) => exec.run(LANE.background, [w(`f${i}/a.md`, "x", ABSENT), w(`f${i}/b.md`, "y", ABSENT)]));
+	await g.flush();
+	assert.deepEqual(g.started, ["f0/a.md", "f1/a.md", "f2/a.md"], "three batches start, each with its first op");
+	const all = Promise.all(runs);
+	await g.releaseAll(all);
+	assert.equal(g.peak(), 3);
+	for (let i = 0; i < 5; i++) assert.ok(g.started.indexOf(`f${i}/a.md`) < g.started.indexOf(`f${i}/b.md`), "order within a batch");
+	for (const res of await all) for (const r of res) assert.equal(outcomeOk(r), true);
+	assert.equal(exec.executed, 10);
+});
+
+test("diskExecutor: ops sharing a path, an ancestor folder or a docId never overlap and keep batch order", async () => {
+	const { vault, exec } = setup("case-insensitive", new Set(), 4);
+	const g = gatedWrites(vault);
+	const d = "d1" as DocId;
+	const runs = [
+		exec.run(LANE.background, [w("a/x.md", "1", ANY)]),
+		exec.run(LANE.background, [w("A/X.md", "2", ANY)]), // same path, case-folded
+		exec.run(LANE.background, [w("b.md", "3", ANY, { docId: d })]),
+		exec.run(LANE.background, [w("c.md", "4", ANY, { docId: d })]), // same doc
+		exec.run(LANE.background, [w("e.md", "5", ANY)]),
+	];
+	await g.flush();
+	assert.deepEqual(g.started, ["a/x.md", "b.md", "e.md"]);
+	const all = Promise.all(runs);
+	await g.releaseAll(all);
+	assert.ok(g.started.indexOf("A/X.md") > g.started.indexOf("a/x.md") && g.started.indexOf("c.md") > g.started.indexOf("b.md"));
+	assert.equal(vault.textOf("a/x.md"), "2", "the later batch's write lands last");
+	const { vault: v2, exec: e2 } = setup("case-insensitive", new Set(), 4);
+	v2.userWrite("dir/old.md", "o");
+	const g2 = gatedWrites(v2);
+	const r2 = [
+		e2.run(LANE.background, [w("dir/new.md", "n", ANY)]),
+		e2.run(LANE.background, [{ t: "removeEmptyFolder", opId: opId++, path: "dir" }]), // ancestor of a running write
+		e2.run(LANE.background, [w("other.md", "z", ANY)]),
+	];
+	await g2.flush();
+	assert.deepEqual(g2.started, ["dir/new.md", "other.md"], "the folder op waits for the write inside it");
+	await g2.releaseAll(Promise.all(r2));
+});
+
+test("diskExecutor: with room for one more op, an open-note batch starts before older background batches", async () => {
+	const { vault, exec } = setup("case-insensitive", new Set(), 2);
+	const g = gatedWrites(vault);
+	const runs = [exec.run(LANE.background, [w("bg0.md", "x", ANY)]), exec.run(LANE.background, [w("bg1.md", "x", ANY)]), exec.run(LANE.background, [w("bg2.md", "x", ANY)])];
+	await g.flush();
+	runs.push(exec.run(LANE.openNote, [w("open.md", "x", ANY)]));
+	g.gates.shift()?.();
+	await g.flush();
+	assert.deepEqual(g.started, ["bg0.md", "bg1.md", "open.md"]);
+	await g.releaseAll(Promise.all(runs));
 });
 
 test("diskExecutor: I/O exceptions map to io outcomes; config area writes are read-compare-write", async () => {
@@ -249,7 +336,7 @@ test("diskExecutor over ObsidianVault: precondition races (i) stat-visible, (ii)
 	let afterHash: (() => void) | null = null;
 	const inner = simHashOracle();
 	const hashes: HashOracle = { hash: async (items) => { const v = await inner.hash(items); afterHash?.(); afterHash = null; return v; } };
-	const exec = new DiskExecutor({ vault: new ObsidianVault(fake, hashes, false), configDir: new SimConfigDir(clock), clock, hashes, isBoundPath: () => false, budgets: () => ({ mainSliceMs: 8 }) });
+	const exec = new DiskExecutor({ vault: new ObsidianVault(fake, hashes, false), configDir: new SimConfigDir(clock), clock, hashes, isBoundPath: () => false, budgets: () => ({ mainSliceMs: 8, diskOpConcurrency: 4 }) });
 	const reason = (r: DiskOpResult | undefined) => (r?.t === "write" && !r.outcome.ok ? r.outcome.reason : r?.t === "write" ? "ok" : r?.t);
 	// (i) a stat-visible same-length change after the engine answered: precondition, nothing written.
 	fake.put("a.md", "base");
@@ -275,7 +362,7 @@ test("diskExecutor config CAS: a change between the read and writeBytes is not d
 	await configDir.writeBytes("app.json", utf8("{}"));
 	const inner = simHashOracle();
 	const hashes: HashOracle = { hash: async (items) => { const v = await inner.hash(items); await configDir.writeBytes("app.json", utf8('{"user":1}')); return v; } };
-	const exec = new DiskExecutor({ vault: new SimVault({ clock, hashes, profile: "case-insensitive" }), configDir, clock, hashes, isBoundPath: () => false, budgets: () => ({ mainSliceMs: 8 }) });
+	const exec = new DiskExecutor({ vault: new SimVault({ clock, hashes, profile: "case-insensitive" }), configDir, clock, hashes, isBoundPath: () => false, budgets: () => ({ mainSliceMs: 8, diskOpConcurrency: 4 }) });
 	const r = await exec.run(LANE.background, [cw("app.json", '{"a":1}', { t: "fingerprint", fingerprint: fpOf("{}") })]);
 	assert.equal(outcomeOk(r[0]), true);
 	assert.equal(new TextDecoder().decode(configDir.files.get("app.json")), '{"a":1}');

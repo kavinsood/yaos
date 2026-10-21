@@ -3,7 +3,11 @@
  *
  * - One carrier per host, from `createCarrier`: the Blob-URL worker in the
  *   plugin (plugin.ts), an in-process pair in tests and harnesses. Startup:
- *   ping (pong within STARTUP_PING_TIMEOUT_MS), then init.
+ *   ping, then init. The ping's deadline is STARTUP_PING_TIMEOUT_MS; a miss sends
+ *   another ping with twice the deadline, STARTUP_PING_ATTEMPTS pings in all
+ *   (5 + 10 + 20 + 40 s): a worker that throws while it loads is reported at
+ *   once (transport failure), so a silent one is still loading (a slow phone
+ *   parsing the bundle, a debugger attached), not dead.
  * - Liveness: ping after PING_INTERVAL_MS without any message from the engine
  *   (every message counts as a pong). While idle (pongs only, nothing sent by
  *   main) the interval doubles up to PING_IDLE_MAX_MS; anything main sends
@@ -12,7 +16,7 @@
  *   frozen (backgrounded) the overdue timeout can fire before the engine has
  *   run, and the next ping is answered at once.
  * - Every carrier failure is terminal (§g.4): the carrier cannot be built,
- *   misses the startup pong, errors or its transport fails, misses a liveness
+ *   misses every startup pong, errors or its transport fails, misses a liveness
  *   pong, or init fails (storage-lost included); so is a protocol-version
  *   mismatch. The host stops: pending requests
  *   are rejected with "aborted", onFatal reports why, once, and no second
@@ -31,6 +35,9 @@ import { PING_IDLE_MAX_MS, PING_INTERVAL_MS, PING_MISSES_FATAL, PING_TIMEOUT_MS 
 import { transferablesOf, TransferOwnershipError, wipeSecrets } from "../protocol/workerTransport";
 
 export const STARTUP_PING_TIMEOUT_MS = 5_000;
+export const STARTUP_PING_ATTEMPTS = 4;
+/** The whole startup ping ladder: 5 + 10 + 20 + 40 s. */
+export const STARTUP_PING_TOTAL_MS = STARTUP_PING_TIMEOUT_MS * (2 ** STARTUP_PING_ATTEMPTS - 1);
 export const INIT_TIMEOUT_MS = 120_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const SHUTDOWN_TIMEOUT_MS = 3_000;
@@ -187,7 +194,17 @@ export class EngineHost {
 		const live = this.attach(carrier);
 		let stage = "startup-ping";
 		try {
-			await this.requestOn(live, { t: "ping" }, STARTUP_PING_TIMEOUT_MS);
+			for (let attempt = 1; ; attempt++) {
+				try {
+					await this.requestOn(live, { t: "ping" }, STARTUP_PING_TIMEOUT_MS * 2 ** (attempt - 1));
+					break;
+				} catch (error) {
+					if (!(error instanceof HostRequestError && error.error.code === "timeout") || attempt >= STARTUP_PING_ATTEMPTS) throw error;
+					if (this.abandon(live)) return;
+					// A late answer to the missed ping finds no pending request and is dropped; the next ping's answer counts.
+					this.log(`the sync engine has not answered ${(STARTUP_PING_TIMEOUT_MS * (2 ** attempt - 1)) / 1000} s after starting; pinging again`);
+				}
+			}
 			if (this.abandon(live)) return;
 			stage = "init";
 			const config = await this.deps.initConfig();
@@ -206,7 +223,7 @@ export class EngineHost {
 			if (this.live !== live || this.down) return; // stopped meanwhile, or the carrier's failure already ended the host
 			const perr = error instanceof HostRequestError ? error.error : protocolError("internal", messageOf(error));
 			const message = stage === "startup-ping" && perr.code === "timeout"
-				? `the sync engine did not answer within ${STARTUP_PING_TIMEOUT_MS / 1000} s of starting`
+				? `the sync engine did not answer within ${STARTUP_PING_TOTAL_MS / 1000} s of starting`
 				: `the sync engine could not start: ${perr.message}`;
 			this.fatal({ code: perr.code, message, retryable: false });
 		}
