@@ -736,8 +736,9 @@ export class CanvasWorld {
 		// The user deletes what they see: the file, what the engine had integrated (nsDelete's baseBodySeq) and, while
 		// a save is half-written, the canvas their app still shows: the one before the broken write, or their own save
 		// (fault-heavy seed 122, hot seed 163: a broken file deleted before its save completed; its records were
-		// never marked deleted).
-		const showing = [...this.fixes.values()].filter((f) => f.dev === a.dev && f.path === path).flatMap((f) => [f.before, f.full]);
+		// never marked deleted). The save follows the broken bytes (complete()): a rename since moves it with them
+		// (suite-1 seed 1542948623: broken, renamed, deleted; the records were counted as lost).
+		const showing = [...this.fixes.values()].filter((f) => f.dev === a.dev && (f.path === path || noBom(f.broken) === cur)).flatMap((f) => [f.before, f.full]);
 		const seen = [cur, engineCanvasText(d, path) ?? "", ...showing];
 		for (const text of seen) for (const t of tokensIn(text)) this.w.ledger.deleted(t);
 		const atMs = this.clock.now();
