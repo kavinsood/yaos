@@ -10,10 +10,16 @@
  * A blocked roll can still win through an authoritative key (oob or prev): that is how a device re-keyed above a
  * revoke walks the backward chain through the rolls before it. An own key never unblocks a roll.
  *
- * A pending row does not hold back later rows of its epoch (a device with the RK or an authoritative key passes over
- * a record it cannot open, §11.3 garbage), except a genesis: one creator writes it (§15.1), and a genesis this device
- * cannot judge may be the first valid one, so no later genesis wins past it. Otherwise a second creator would adopt
- * its own K_1 and fork the vault.
+ * A pending genesis or revoke holds back the later rows of its epoch: it may be the first valid record, so nothing
+ * later wins past it. A genesis has one creator (§15.1), and a second one would otherwise adopt its own K_1 and fork
+ * the vault. A revoke can have several (kept devices re-keying at once, §14.2), each under a recovery key of its own
+ * when it generated a new one: a device holding another RK cannot open the earlier record, cannot tell it from
+ * garbage, and adopted its own later record or one its RK opens, while every other device followed the first (suite-1
+ * seed 89423454: devices sealing under two different K_2, each side's rows failing auth on the other). The device
+ * waits instead (key-missing, revoked-epoch) until an out-of-band key judges the row (§11.3: a hostile server's
+ * garbage record is denial of service only; a QR key marks it invalid). Only an authoritative key passes over a
+ * record, and it never finds one pending: it judges every record of its epoch. A pending roll holds nothing back
+ * (revoke outranks roll; a roll for e is blocked while a revoke for e or above exists).
  */
 
 import { bytesEqual } from "../../core/codec/lib0";
@@ -48,7 +54,8 @@ async function step(b: KeyBook, x: EvalCtx): Promise<boolean> {
 		for (const row of open.filter((r) => r.rec!.e === e)) {
 			const v = await tryRow(b, x, row.rec!);
 			if (v === "pending") {
-				if (row.rec!.kind === KeyRecordKind.genesis) break;
+				// A stored open revoke (no `k` seq this vaultEpoch, book.ts addStoredOpen) only keeps the gate shut.
+				if (row.rec!.kind !== KeyRecordKind.roll && row.seq !== null) break;
 				continue;
 			}
 			if (v === "valid") {
