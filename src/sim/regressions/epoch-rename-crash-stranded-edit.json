@@ -251,5 +251,10 @@
 			}
 		}
 	],
-	"violations": []
+	"violations": [
+		{
+			"inv": "tokens",
+			"detail": "lost [A.36] (typed on A at step 36)"
+		}
+	]
 }

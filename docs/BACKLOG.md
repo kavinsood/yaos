@@ -133,13 +133,6 @@ rekeys: the disk edit is lost (`tokens` + `destroyed`). `s1-197-clean.json` (5 s
 `s1-197-nohostile.json`. `1482901505-47-min.json` (hostile device, suite 1, clean-ups, revokes, 5 devices: a token
 typed on D lost) is likely the same.
 
-### SIM-EPOCH-COMMIT-CRASH: an epoch reset, a commit crash and offline lose a typed token
-
-`relay-134.json` (targeted relay faults seed 134, base): epoch reset, a commit crash ("after"), offline: a token typed
-on A is lost. Possibly the same as test:sim-suite1 "4 devices, E2EE faults" seed 1 (`tokens: lost [C.52] (typed on C
-at step 52)`, identical on base; its plan has an epoch reset and commit crashes too, `s1-e2ee4-seed1.json`). The
-known suite-1 failure: `npm run test:sim-suite1` exits 1 on it.
-
 ### SIM-CANVAS-FOLDER-REVIVE: a folder rename revives deleted canvas edges
 
 `20701862-41-min.json` (7 steps, base): A fixes a dangling edge (`cBroken`), then renames the canvas's folder; the
@@ -190,6 +183,14 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-EPOCH-COMMIT-CRASH** (`fix-epoch`): two losses of an edit typed into an open note whose editor died
+  unsaved, so the store held its only copy. (1) The note renamed first (relay seed 134): the restart's first pass
+  (ns not ready) marked the doc's file gone, and the epoch migration's stranded-edit merge (§c.12 step 5) looked at
+  the synced path only before dropping the old outbox; it now finds the file by rename inference as the planner does.
+  (2) The doc an own create still held after an epoch reset (suite-1 "4 devices, E2EE faults" seed 1): the create
+  folded merged and `reconcileHeld` deleted the merged doc's frames (I1); they now stay until the loser's stream drops
+  (`T_drop_stream`, after the rebind), and the planner writes a loser's replica to its file before rebinding (§c.5).
+  Plans `src/sim/regressions/epoch-rename-crash-stranded-edit.json`, `merged-create-held-edit-lost.json`.
 - **CLONED-ID, FRAMENO-IDB** (identity-per-store phases 1–4, `client-remake-next`): a deviceId is used by exactly one
   store, ever. The identity lives in the store (`meta.identity`), data.json holds a pairing grant, a clone or a new
   IndexedDB registers a new device, an IndexedDB loss fences its predecessor and re-issues its mirrored frames, a
