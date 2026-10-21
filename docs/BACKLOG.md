@@ -156,11 +156,6 @@ tombstones `pruneWorld` keeps. Until fixed, the nightly soak can fail on these.
 different epochs, wide divergence; the `retired` violations follow from A never catching up. Fails the same on
 `generators`; a second soak seed (1042558905, 3 devices, no generator ops) fails the same on base.
 
-### SIM-CANVAS-REORDER: a canvas reorder to the front lost
-
-`canvas-reorder-lost-1025898366.json` (E2EE faults, 2 devices, suite 1, delete / restore races; 251 steps): B's
-reorder of a node to the front loses against three nodes. Fails the same on `generators`.
-
 ### SIM-FLOOD-FLAP: the conflict-flood profile never settles
 
 `flood-flapping-1557069770.json` (FLOOD_FAULTS, 5 devices, storms, delete / restore races, clean-ups; 256 steps, not
@@ -175,6 +170,11 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-CANVAS-REORDER** (`fix-integrity`): a reorder re-ranks whichever records the order reconciliation moves
+  (the longest ordered run keeps its ranks), often not the one the user moved; a concurrent edit of such a record made
+  its line differ on both sides, and the record conflict kept the CRDT's line with its old rank. `mergeRecordLines`
+  merges a record's rank apart from its fields (DESIGN §j.2 updated). Regression
+  `canvas-reorder-rerank-lost-in-record-conflict.json`.
 - **SIM-CLONE-BODYLESS-WAIT** (`fix-integrity`): a view() while a creator-status request was in flight queued the
   same creator again; its second "live" answer counted as a recheck and doubled the backoff (10 min instead of 5), so
   docs of a creator removed meanwhile waited past the heal horizon. A creator being asked is neither queued again nor

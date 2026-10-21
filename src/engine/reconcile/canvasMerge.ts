@@ -32,8 +32,8 @@
 
 import type { ConflictReason, MergeLimits, MergeResult } from "../../core/types";
 import {
-	canvasFromMergeText, canvasToMergeText, parseCanvasBytes,
-	type CanvasEdge, type CanvasNode, type CanvasRanked, type CanvasSemanticData,
+	canonicalJson, canvasFromMergeText, canvasToMergeText, parseCanvasBytes,
+	type CanvasEdge, type CanvasNode, type CanvasRanked, type CanvasSemanticData, type JsonValue,
 } from "../../core/hash/canvasCanonical";
 import { reconcileCanvasRanks } from "../../core/hash/canvasOrdering";
 import { merge } from "../../core/merge/merge";
@@ -234,11 +234,41 @@ function recordLines(text: string): Map<string, string> | null {
 	return out;
 }
 
+/** A record line split into its record (canonical JSON without the rank) and its rank. */
+interface SplitLine {
+	readonly body: string;
+	readonly rank: string;
+	readonly obj: Record<string, JsonValue>;
+}
+
+function splitLine(line: string): SplitLine | null {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(line);
+	} catch {
+		return null;
+	}
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+	const { rank, ...rest } = raw as Record<string, JsonValue>;
+	return { body: canonicalJson(rest), rank: JSON.stringify(rank ?? null), obj: rest };
+}
+
+/** 3-way pick of one value: a side that kept the base takes the other's; null when both changed it differently. */
+function pick3<T>(b: T | undefined, d: T, c: T): T | null {
+	if (d === c || d === b) return c;
+	if (c === b) return d;
+	return null;
+}
+
 /**
  * The both-edited step for canvases (header): a 3-way merge per record line, keyed by record id (a line holds the
  * record and its rank). A record one side changed (or deleted, or added) and the other kept takes that side; one
- * both sides changed differently conflicts and keeps the CRDT's line. Lines come out nodes, edges, root (the parse
- * orders by rank). Unparseable text keeps the CRDT, as a conflict.
+ * both sides changed differently conflicts and keeps the CRDT's record. The rank merges on its own: a reorder is a
+ * re-rank of whichever records the order reconciliation moved (the longest kept subsequence), often not the record
+ * the user moved, and kept with a conflicting edit of such a record it was lost (soak seed 1025898366: B brought
+ * a-1n0 to the front by re-ranking a-1n1, whose text A had edited; the conflict kept A's line and a-1n0 stayed
+ * behind). Lines come out nodes, edges, root (the parse orders by rank). Unparseable text keeps the CRDT, as a
+ * conflict.
  */
 export function mergeRecordLines(base: string, disk: string, crdt: string): MergeResult {
 	const b = recordLines(base);
@@ -254,7 +284,18 @@ export function mergeRecordLines(base: string, disk: string, crdt: string): Merg
 		let line: string | undefined;
 		if (ld === lc || ld === lb) line = lc;
 		else if (lc === lb) line = ld;
-		else {
+		else if (ld !== undefined && lc !== undefined && k !== "doc") {
+			// Both sides hold the record and changed it: its fields and its rank merge separately.
+			const sb = lb === undefined ? undefined : splitLine(lb);
+			const sd = splitLine(ld);
+			const sc = splitLine(lc);
+			if (sb === null || !sd || !sc) return { kind: "conflict", text: crdt, conflictCopy: disk, reason: "both-edited" };
+			const body = pick3(sb?.body, sd.body, sc.body);
+			const rank = pick3(sb?.rank, sd.rank, sc.rank);
+			if (body === null || rank === null) conflict = true;
+			const obj = body === sd.body && body !== sc.body ? sd.obj : sc.obj;
+			line = canonicalJson({ ...obj, rank: JSON.parse(rank ?? sc.rank) as JsonValue });
+		} else {
 			conflict = true;
 			line = lc;
 		}

@@ -2578,7 +2578,10 @@ is touched (`sweepOrphanStores`, no timer).
     concurrent reorders of the same node keep one.
   - *Disk against CRDT on one device* (the line merge): different records merge. The same record changed on both
     sides, or changed on one and deleted on the other, conflicts: the CRDT keeps its side and the exact disk bytes go
-    to a conflict copy. Without a base (store lost, or the synced record describes another file) a differing disk
+    to a conflict copy. A record's rank merges on its own: a reorder re-ranks whichever records the order
+    reconciliation moves (the longest already-ordered run keeps its ranks), often not the one the user moved, so a
+    record whose rank changed on one side and whose fields changed on the other takes both, and a record conflict
+    keeps the side's rank that changed it (soak seed 1025898366). Without a base (store lost, or the synced record describes another file) a differing disk
     file is a conflict copy too. A user's deletion of a record is never undone except by a concurrent unseen edit, a
     conflict copy, or a store wipe that lost the unsent delete.
   - *No silent loss:* a field write is never undone back to a value it replaced, a created record survives unless a
