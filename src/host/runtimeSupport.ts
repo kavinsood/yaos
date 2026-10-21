@@ -4,13 +4,12 @@
  */
 
 import type { DeviceClass } from "../core/limits";
-import type { DeviceId, VaultId } from "../core/types";
+import type { VaultId } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { PlatformInfo } from "../ports/platform";
-import type { SideFileName, SideFilePort, VaultEvent, VaultStat } from "../ports/vault";
+import type { VaultEvent, VaultStat } from "../ports/vault";
 import type { EngineInitConfig, EngineSettings, LocalObservation } from "../protocol/messages";
 import { PROTOCOL_VERSION } from "../protocol/messages";
-import { owned } from "../protocol/workerTransport";
 
 export const OBSERVATION_CHUNK = 2_000;
 export const VAULT_EVENT_BATCH_MS = 50;
@@ -25,54 +24,42 @@ export function deviceClassFor(info: PlatformInfo): DeviceClass {
 
 export interface HostIdentity {
 	readonly vaultId: VaultId;
-	readonly deviceId: DeviceId;
 	readonly deviceLabel: string;
-	/** SECRET credential inside: never log this object. */
-	readonly relay: { readonly url: string; readonly credential: string };
+	/**
+	 * The relay and the install's pairing grant (identity-per-store §3). SECRET (grantSecret): never log this object.
+	 * The device identity is the store's (the engine finds or mints it, §4).
+	 */
+	readonly relay: { readonly url: string; readonly grantSecret: string };
+	/** This install's key (identity-per-store §2.4; installRecord.ts). */
+	readonly installKey: string;
+	/** The install record's earlier stores (installRecord.ts lineageOf): EngineInitConfig.lineage. */
+	readonly lineage?: readonly string[];
+	/** The install record's `current` store, with its retire key (the successor fence): EngineInitConfig.predecessor. SECRET. */
+	readonly predecessor?: { readonly deviceId: string; readonly retireKey: string } | null;
 }
 
-const SIDE_A_B: { outbox: [SideFileName, SideFileName]; synced: [SideFileName, SideFileName] } = {
-	outbox: ["outbox-a.bin", "outbox-b.bin"],
-	synced: ["synced-a.bin", "synced-b.bin"],
-};
-
-async function readSide(side: SideFilePort, name: SideFileName): Promise<Uint8Array | null> {
-	try {
-		const b = await side.read(name);
-		return b ? owned(b.slice()) : null;
-	} catch {
-		return null;
-	}
-}
-
-export async function buildInitConfig(input: {
+export function buildInitConfig(input: {
 	readonly identity: HostIdentity;
 	readonly platform: PlatformInfo;
 	readonly configDir: string;
 	readonly caseInsensitiveFs: boolean;
 	readonly settings: EngineSettings;
-	readonly side: SideFilePort;
 	/** SECRET when suite 1: moved into the config as is (transferred by the carrier, §6.3). */
 	readonly crypto: EngineInitConfig["crypto"];
-}): Promise<EngineInitConfig> {
-	const [oa, ob, sa, sb] = await Promise.all([
-		readSide(input.side, SIDE_A_B.outbox[0]),
-		readSide(input.side, SIDE_A_B.outbox[1]),
-		readSide(input.side, SIDE_A_B.synced[0]),
-		readSide(input.side, SIDE_A_B.synced[1]),
-	]);
+}): EngineInitConfig {
 	return {
 		protocolVersion: PROTOCOL_VERSION,
 		vaultId: input.identity.vaultId,
-		deviceId: input.identity.deviceId,
 		deviceLabel: input.identity.deviceLabel,
 		deviceClass: deviceClassFor(input.platform),
 		platform: input.platform,
 		configDir: input.configDir,
 		caseInsensitiveFs: input.caseInsensitiveFs,
-		relay: { url: input.identity.relay.url, credential: input.identity.relay.credential },
+		relay: { url: input.identity.relay.url, grantSecret: input.identity.relay.grantSecret },
+		installKey: input.identity.installKey,
+		lineage: input.identity.lineage ?? [],
+		predecessor: input.identity.predecessor ?? null,
 		settings: input.settings,
-		sideState: { outboxMirror: [oa, ob], syncedMirror: [sa, sb] },
 		crypto: input.crypto,
 	};
 }

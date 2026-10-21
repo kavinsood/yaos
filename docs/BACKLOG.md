@@ -31,8 +31,27 @@ grant in data.json). Owner decisions recorded there (§12.1, 2026-10-21).
 - **Phase 1 landed (server only)** on `identity/phase1-server`: pairing grants, register / retire / self-retire /
   leave, tombstones, per-grant limits, `last_seen_day`, grant pairing codes, "Revoke pairing" and the grouped console
   (DECISIONS §10, G54–G64). Additive: the current client still enrolls the old way and is unaffected.
-- Next: phase 2 (client grant pairing and a per-store identity), then 3 (predecessor recovery), 4 (removal of the
-  wall floor and `renumberBlind`), 5 (inactivity retirement, grant rotation).
+- **Phase 2 landed (client)** on `identity/phase2-client`: grant pairing (the client mints the grant secret,
+  data.json holds only the grant), the install record in `App.saveLocalStorage`, `yaos3:<vaultId>:<epoch>:<installKey>`
+  stores with their identity in `meta.identity` (minted and registered on store create), mirrors under
+  `state/<deviceId>/`, registration refusal statuses, legacy `yaos2:` DB and flat mirror cleanup. A clone is a new
+  device (sim `clone` and `syncedConfig` faults, matrix "3 devices, clone + synced config faults"). IDB loss takes the
+  "without mirrors" path until phase 3 (conflict copies where mirrors used to merge; two composed tests are `todo`).
+- **Phase 3 landed (client + one server route)** on `identity/phase3-recovery`: the successor fence (retire by key
+  before the first connect), predecessor recovery from the lineage's mirror dirs (re-issue under the new identity,
+  commit check by origin, synced mirror import, snapshot move and lineage-aware retention, then cleanup), outbox
+  mirror format 2 (origins), and a revoked store's successor. The sim oracle is mirror-aware again; the composed
+  mirror-recovery tests run.
+- **Abandoned creator: fixed in phase 3** (found by the clone fault, sim seed 6 of the clone matrix). A doc whose
+  create committed and whose initial body did not, created by a store that is then abandoned, waited (`body-empty`)
+  for a body nobody would send. Rule (DESIGN §i.5 "Abandoned creates"): a creator the server reports retired
+  (`POST /auth/device/status`) never sends again, so after a 30 s grace its body-less docs are `lostCreateBody` on
+  every device; the empty doc is deleted and whoever holds the file creates it again as a new doc. The clone fault no
+  longer skips these windows (`strandedCreate` is gone); it removes the abandoned store in the console 60 s later.
+  Residual: until the abandoned store is retired (console "Remove device" now; phase 5 inactivity retirement
+  automatically) such a doc still waits.
+- Next: 4 (removal of the wall floor and `renumberBlind`, epoch-change minting), 5 (inactivity retirement, grant
+  rotation).
 
 ### FRAMENO-IDB: frameNo collision after IndexedDB loss
 
@@ -46,7 +65,9 @@ in ms (44748cb2), ignored when the clock reads past 2^45 ms (f47950cb) (`FoldRun
 CLONED-ID design lands: a fresh store under a new writer identity (rotated device id or writer tag) never shares a
 replay window with the lost one.
 
-Proposed design: [identity-per-store](client-remake/identity-per-store.md).
+Proposed design: [identity-per-store](client-remake/identity-per-store.md). Since phase 2 an IndexedDB loss starts a
+store with a new deviceId (a fresh replay window), so the collision no longer arises: seed 222's plan stays green with
+the wall-clock floor and the phase-3 fence both disabled. The floor is removed in phase 4.
 
 ### PERF-BOOT: fresh-device bootstrap takes ~50 s on a phone
 

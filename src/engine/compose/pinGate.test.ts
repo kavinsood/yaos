@@ -209,7 +209,8 @@ test("unpinned device: connects and reads, writes nothing anywhere (frames, chec
 	assert.equal(rowsBy(net, u.deviceId), 0, "no row from U on any stream");
 	assert.equal(blob.puts, 0, "no blob put");
 	assert.equal(blob.calls, 0, "the blob store is never touched");
-	assert.deepEqual(await u.storage.listDatabases(), [], "no IndexedDB database");
+	// Only the pending store identity (identity-per-store §4: one registration, not one per start); no store.
+	assert.deepEqual((await u.storage.listDatabases()).map((n) => n.split(":")[0]), ["yaos3-pending"], "no IndexedDB store");
 	assert.equal(u.sideFiles.writes, 0, "no side-file write (outbox / synced mirrors, snapshots)");
 	assert.equal(u.vault.hasFile("notes/b.md"), false, "nothing materialized from the relay");
 	assert.deepEqual([...u.vault.snapshot()], [...diskBefore, ["mine2.md", "typed while blocked\n"]], "disk holds only the user's own writes");
@@ -222,7 +223,7 @@ test("unpinned device: connects and reads, writes nothing anywhere (frames, chec
 	assert.equal(relayState(net).appendFrames, before.appendFrames + 1, "only Z's genesis");
 	assert.equal(rowsBy(net, u.deviceId), 0);
 	assert.equal(blob.puts, 0);
-	assert.deepEqual(await u.storage.listDatabases(), []);
+	assert.deepEqual((await u.storage.listDatabases()).map((n) => n.split(":")[0]), ["yaos3-pending"], "no store");
 	assert.equal(u.sideFiles.writes, 0);
 });
 

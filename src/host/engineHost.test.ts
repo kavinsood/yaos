@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { DeviceId, VaultId } from "../core/types";
+import type { VaultId } from "../core/types";
 import { createInlinePair, type InlinePair } from "../protocol/inlineTransport";
 import type { EngineInitConfig, EngineToMain, MainToEngine } from "../protocol/messages";
 import { PROTOCOL_VERSION } from "../protocol/messages";
@@ -28,15 +28,14 @@ function config(): EngineInitConfig {
 	return {
 		protocolVersion: PROTOCOL_VERSION,
 		vaultId: "v" as VaultId,
-		deviceId: "dev" as DeviceId,
 		deviceLabel: "test",
 		deviceClass: "desktop",
 		platform: { os: "macos", isMobile: false, isTablet: false, hardwareConcurrency: 8, deviceMemoryGiB: null, workerSupported: true },
 		configDir: ".obsidian",
 		caseInsensitiveFs: false,
-		relay: { url: "wss://example.invalid", credential: "x" },
+		relay: { url: "wss://example.invalid", grantSecret: "x" },
+		installKey: "install-key-0000000000",
 		settings: { excludePatterns: [], syncAttachments: true, maxAttachmentBytes: 1, syncSettings: false, trashMode: "obsidian-trash", provisionalBroadcast: false, snapshots: { enabled: false, keepDaily: 0, uploadToBlobStore: false } },
-		sideState: { outboxMirror: [], syncedMirror: [] },
 		crypto: { suite: 0 },
 	};
 }
@@ -413,7 +412,7 @@ test("engine requests are answered on the same carrier", async () => {
 	e.pair.engine.onMessage((m) => {
 		if (m.t === "result" || m.t === "error") answers.push(m);
 	});
-	e.pair.engine.post({ t: "sideFileRead", rid: 7, name: "outbox-a.bin" });
+	e.pair.engine.post({ t: "sideFileRead", rid: 7, name: "dev-0000000000000000/outbox-a.bin" });
 	await h.clock.advance(10);
 	assert.deepEqual(answers, [{ t: "result", re: 7, value: { t: "sideFileWritten" } }]);
 	await stopHost(h);

@@ -43,10 +43,15 @@ test("no implicit migration: a stored pairing without e2ee is unpinned", () => {
 });
 
 test("data.json load: a pre-E2EE pairing loads unpinned; a pin needs the identity it belongs to", () => {
-	const identity = { host: "https://sync.example.com", vaultId: V, deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", deviceName: "Mac", vaultGeneration: null };
+	const identity = { host: "https://sync.example.com", vaultId: V, grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: "gs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", grantName: "Mac", vaultGeneration: null };
 	const legacy = sanitizePluginData({ version: 1, identity, deviceLabel: "Mac" }, "Mac");
 	assert.ok(legacy.identity);
 	assert.equal(legacy.e2ee, undefined, "no e2ee field: unpinned, nothing inferred from the pairing");
+	// The device-enrollment identity before identity-per-store (deviceId + token, no grant) loads unpaired (§13): its pin goes with it.
+	const deviceEnrolled = { host: identity.host, vaultId: V, deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", deviceName: "Mac", vaultGeneration: null };
+	const old = sanitizePluginData({ identity: deviceEnrolled, e2ee: { suite: 0 } }, "Mac");
+	assert.equal(old.identity, null);
+	assert.equal(old.e2ee, undefined);
 	assert.deepEqual(sanitizePluginData({ identity, e2ee: { suite: 0 } }, "Mac").e2ee, { suite: 0 });
 	assert.deepEqual(sanitizePluginData({ identity, e2ee: { suite: null, keyringSeen: true } }, "Mac").e2ee, { suite: null, keyringSeen: true });
 	assert.equal(sanitizePluginData({ identity, e2ee: { suite: "0" } }, "Mac").e2ee, undefined, "garbage is unpinned");

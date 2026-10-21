@@ -27,7 +27,7 @@ import type { DeviceCheckMode, DeviceCheckReport, StatusSnapshot } from "../../s
 import { Report } from "./engineKit";
 import { waitFor } from "./fullCheck";
 import { FullClient } from "./fullKit";
-import { DEFAULT_LOG_DIR, onboardVault, type OnboardedVault } from "./onboard";
+import { DEFAULT_LOG_DIR, onboardVault, pairedIdentityOf, type OnboardedVault } from "./onboard";
 
 function arg(name: string, fallback: string): string {
 	const i = process.argv.indexOf(`--${name}`);
@@ -75,7 +75,7 @@ async function runVault(R: Report, kind: VaultKind, modes: readonly DeviceCheckM
 	vaults.push(vault);
 	const d = vault.devices[0]!;
 	const a = new FullClient({ name: "a", host: HOST, vaultId: vault.vaultId, device: d, watcherDelayMs: 100, carrier: "worker" });
-	const ctl = controllerFor(a, { host: HOST, vaultId: vault.vaultId, deviceId: d.deviceId, deviceToken: d.deviceToken, deviceName: "a", vaultGeneration: vault.vaultGeneration });
+	const ctl = controllerFor(a, pairedIdentityOf(HOST, vault, d, "a"));
 	const x: Record<string, unknown> = {};
 	R.extra[kind] = x;
 	try {

@@ -14,7 +14,7 @@ const CAPS: HttpResponse = { status: 200, json: { claimed: true, streams: 1 } };
 
 function okEnroll(req: HttpRequest): HttpResponse {
 	const b = JSON.parse(req.body ?? "{}") as Record<string, string>;
-	return { status: 200, json: { host: "https://sync.example.com", deviceToken: b.deviceToken, vaultId: VAULT, deviceId: b.deviceId, deviceName: b.deviceName ?? "", vaultGeneration: "g1" } };
+	return { status: 200, json: { host: "https://sync.example.com", vaultId: VAULT, grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: b.grantSecret, grantName: b.grantName ?? "", vaultGeneration: "g1" } };
 }
 
 function scripted(responses: (HttpResponse | Error | ((r: HttpRequest) => HttpResponse))[]) {
@@ -46,8 +46,8 @@ test("PairingSession reuses the attempt for a retry of the same input, and drops
 	const [first, second] = enrollBodies(s.calls);
 	assert.ok(first && second);
 	assert.equal(first.enrollmentRequestId, second.enrollmentRequestId);
-	assert.equal(first.deviceToken, second.deviceToken);
-	assert.equal(identity.deviceToken, second.deviceToken);
+	assert.equal(first.grantSecret, second.grantSecret);
+	assert.equal(identity.grantSecret, second.grantSecret);
 	assert.equal(identity.vaultId, VAULT);
 });
 
@@ -83,12 +83,12 @@ test("PairingSession is single-flight and rejects bad input before any request",
 });
 
 test("applyPairedIdentity / clearIdentity", () => {
-	const identity: PairedIdentity = { host: "https://h.example", vaultId: testVaultId("v"), deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "t".repeat(43), deviceName: "Work laptop", vaultGeneration: null };
+	const identity: PairedIdentity = { host: "https://h.example", vaultId: testVaultId("v"), grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: "t".repeat(43), grantName: "Work laptop", vaultGeneration: null };
 	const d = defaultPluginData("Mac");
 	const paired = applyPairedIdentity(d, identity);
 	assert.equal(paired.identity, identity);
 	assert.equal(paired.deviceLabel, "Work laptop");
-	assert.equal(applyPairedIdentity(d, { ...identity, deviceName: "" }).deviceLabel, "Mac");
+	assert.equal(applyPairedIdentity(d, { ...identity, grantName: "" }).deviceLabel, "Mac");
 	assert.equal(clearIdentity(paired).identity, null);
 	assert.equal(clearIdentity(paired).deviceLabel, "Work laptop");
 	assert.equal(clearIdentity(d), d);
@@ -120,7 +120,7 @@ test("PairingSession stores the attempt before /enroll, keeps it when the server
 	assert.ok(kept);
 	assert.equal(kept.enrollmentRequestId, enrollBodies(s.calls)[0]?.enrollmentRequestId);
 	assert.deepEqual(sanitizePluginData(JSON.parse(JSON.stringify(h.data())), "Mac").pendingEnrollment, kept, "survives save + load");
-	assert.equal(sanitizePluginData({ pendingEnrollment: { ...kept, deviceToken: "short" } }, "Mac").pendingEnrollment, undefined, "malformed: dropped on load");
+	assert.equal(sanitizePluginData({ pendingEnrollment: { ...kept, grantSecret: "short" } }, "Mac").pendingEnrollment, undefined, "malformed: dropped on load");
 	await assert.rejects(session.submit(input), (e: unknown) => e instanceof PairingError && e.status === 409);
 	assert.equal(h.data().pendingEnrollment, undefined);
 });
@@ -134,14 +134,14 @@ test("resumePendingEnrollment sends the stored attempt once with the identical i
 	assert.equal(r?.ok, true);
 	assert.deepEqual(s.calls.map((c) => c.url), ["https://sync.example.com/enroll"]);
 	const body = enrollBodies(s.calls)[0];
-	assert.deepEqual([body?.enrollmentRequestId, body?.deviceId, body?.deviceToken], [attempt.enrollmentRequestId, attempt.deviceId, attempt.deviceToken]);
-	assert.equal(h.data().identity?.deviceToken, attempt.deviceToken);
+	assert.deepEqual([body?.enrollmentRequestId, body?.grantSecret], [attempt.enrollmentRequestId, attempt.grantSecret]);
+	assert.equal(h.data().identity?.grantSecret, attempt.grantSecret);
 	assert.equal(h.data().pendingEnrollment, undefined);
 	assert.equal(r?.ok && r.replaced, null, "nothing was paired before");
 });
 
 test("resumePendingEnrollment reports the identity it replaced, for the caller to revoke", async () => {
-	const old: PairedIdentity = { host: "https://old.example", vaultId: testVaultId("v0"), deviceId: "dev_OLDOLDOLDOLDOLDO", deviceToken: "o".repeat(43), deviceName: "Mac", vaultGeneration: null };
+	const old: PairedIdentity = { host: "https://old.example", vaultId: testVaultId("v0"), grantId: "grant_OLDOLDOLDOLDOLDO", grantSecret: "o".repeat(43), grantName: "Mac", vaultGeneration: null };
 	const h = memHost({ ...pendingData(), identity: old });
 	const r = await resumePendingEnrollment(h, scripted([okEnroll]).deps);
 	assert.ok(r?.ok);
@@ -172,9 +172,9 @@ test("enrollmentFailureIsFinal; pairing and unpairing drop the pending attempt",
 	const d = pendingData();
 	const p = d.pendingEnrollment;
 	assert.ok(p);
-	const identity: PairedIdentity = { host: p.host, vaultId: testVaultId("v"), deviceId: p.deviceId, deviceToken: p.deviceToken, deviceName: "Mac", vaultGeneration: null };
+	const identity: PairedIdentity = { host: p.host, vaultId: testVaultId("v"), grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: p.grantSecret, grantName: "Mac", vaultGeneration: null };
 	assert.equal(applyPairedIdentity(d, identity).pendingEnrollment, undefined);
-	assert.equal(applyPairedIdentity(d, { ...identity, deviceId: "dev_BBBBBBBBBBBBBBBB" }).pendingEnrollment, p, "another device's attempt stays");
+	assert.equal(applyPairedIdentity(d, { ...identity, grantSecret: "b".repeat(43) }).pendingEnrollment, p, "another pairing's attempt stays");
 	assert.equal(clearIdentity(d).pendingEnrollment, undefined);
 	assert.equal(withoutPendingEnrollment(d, "other-request-id"), d);
 });

@@ -12,7 +12,7 @@
  */
 import { SnapCorrupt, snapPartBytes, type SnapManifest } from "../../core/snap/bundle";
 import { snapLive } from "../../core/snap/fold";
-import { parseRemoteSnapshotId, parseSnapshotId, remoteSnapshotId, snapKey, snapshotId, type SnapReason, type SnapRecord } from "../../core/snap/record";
+import { parseRemoteSnapshotId, parseSnapshotId, remoteSnapshotId, snapKey, snapshotId, type SnapOp, type SnapReason, type SnapRecord } from "../../core/snap/record";
 import { verifyBundle } from "../../core/snap/verify";
 import { standInPathKey } from "../../core/plan/pathRules";
 import type { DeviceId, DocKind, PathKeyFn, VaultPath } from "../../core/types";
@@ -27,7 +27,7 @@ import { exportSnapshot } from "./exporter";
 import { dlName, listLocal, partName, readLocal, removeDownload, removeLocal, sweep, type LocalSnapshot } from "./localStore";
 import { keepPart, remotePart, uploadSnapshot, type RemoteDeps, type UploadOutcome } from "./remote";
 import { Restorer, type RestoreResult } from "./restore";
-import type { SnapIndexPort } from "./snapIndex";
+import { ownAuthors, type SnapIndexPort } from "./snapIndex";
 
 export type { RestoreResult } from "./restore";
 /** Event snapshots (brake, epoch, idb, restore, manual) kept locally besides `keepDaily` dailies. */
@@ -128,14 +128,15 @@ export class SnapshotJob {
 	async list(): Promise<SnapshotInfo[]> {
 		const local = await this.local();
 		const live = this.rd ? snapLive(this.rd.index.view().state) : [];
-		const self = this.rd?.index.self;
-		const own = new Set(live.filter((e) => e.deviceId === self).map((e) => e.record.snapshotId));
+		// This store's uploads and its lineage's (their local copies moved here, identity-per-store §5.2 step 6).
+		const mine = new Set(this.rd ? ownAuthors(this.rd.index) : []);
+		const own = new Set(live.filter((e) => mine.has(e.deviceId)).map((e) => e.record.snapshotId));
 		const info = (id: string, r: SnapRecord, where: SnapshotInfo["where"], device: string | null): SnapshotInfo =>
 			({ id, createdAtMs: r.createdAtMs, reason: r.reason, files: r.fileCount, bytes: r.totalBytes, where, device });
 		const out = local.map((s) => info(s.id, s.record, own.has(s.id) ? "both" : "local", null));
 		const localIds = new Set(local.map((s) => s.id));
 		for (const e of live) {
-			if (e.deviceId === self && localIds.has(e.record.snapshotId)) continue;
+			if (mine.has(e.deviceId) && localIds.has(e.record.snapshotId)) continue;
 			out.push(info(remoteSnapshotId(e.deviceId, e.record.snapshotId), e.record, "remote", e.record.deviceLabel));
 		}
 		return out.sort((a, b) => a.createdAtMs - b.createdAtMs || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -175,7 +176,9 @@ export class SnapshotJob {
 				this.locals = null;
 				await removeLocal(this.deps.side, src.id, src.record.parts.length);
 				const index = this.rd?.index;
-				if (index && index.view().state.records.has(snapKey(index.self, src.id))) await index.submit([{ t: "del", deviceId: index.self, snapshotId: src.id }]);
+				const records = index?.view().state.records;
+				const dels: SnapOp[] = index && records ? ownAuthors(index).filter((a) => records.has(snapKey(a, src.id))).map((a) => ({ t: "del", deviceId: a, snapshotId: src.id })) : [];
+				if (index && dels.length > 0) await index.submit(dels);
 			} else await this.rd!.index.submit([{ t: "del", deviceId: src.deviceId, snapshotId: src.record.snapshotId }]);
 		});
 	}
@@ -241,8 +244,10 @@ export class SnapshotJob {
 		if (!parseSnapshotId(id)) throw badRequest("not a snapshot id");
 		const record = await readLocal(this.deps.side, id);
 		if (record) return { t: "local", id, record };
-		const own = index?.view().state.records.get(snapKey(index.self, id));
-		if (own) return { t: "remote", id, key: snapKey(index!.self, id), deviceId: index!.self, record: own.record };
+		for (const a of index ? ownAuthors(index) : []) {
+			const own = index!.view().state.records.get(snapKey(a, id));
+			if (own) return { t: "remote", id, key: snapKey(a, id), deviceId: a, record: own.record };
+		}
 		throw notFound(id);
 	}
 

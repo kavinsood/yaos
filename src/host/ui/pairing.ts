@@ -9,7 +9,7 @@
  * (code "network": an enrollment retries it, a pending one is kept for the next load). Obsidian's requestUrl takes
  * no signal and no timeout, so the wait is raced (core/deadline.ts) and the request itself left to finish unread.
  *
- * SECRETS: deviceToken, pairing codes, the operator recovery key, the operator session cookie and the vault key of a
+ * SECRETS: the grant secret, pairing codes, the operator recovery key, the operator session cookie and the vault key of a
  * setup or re-key link never appear in thrown messages or progress text.
  */
 
@@ -90,6 +90,10 @@ export class PairingError extends Error {
 export const DEVICE_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
 export const DEVICE_TOKEN_RE = /^[A-Za-z0-9_-]{32,256}$/;
 export const ENROLLMENT_REQUEST_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
+/** relay-wire §2.4 grant enroll: at least 32 random bytes, base64url. */
+export const GRANT_SECRET_RE = /^[A-Za-z0-9_-]{43,256}$/;
+/** The server mints grantId: base64url of 16 bytes (relay-wire §2.4). */
+export const GRANT_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
 /** Server rule: trimmed pairing code is 8..512 chars. We also require printable ASCII without spaces. */
 const PAIRING_CODE_RE = /^[\x21-\x7e]{8,512}$/;
 const MAX_DEVICE_NAME_CHARS = 50;
@@ -127,6 +131,11 @@ export function generateDeviceToken(random: RandomBytesFn = defaultRandomBytes):
 
 export function generateEnrollmentRequestId(random: RandomBytesFn = defaultRandomBytes): string {
 	return base64Url(random(16));
+}
+
+/** 32 random bytes -> 43 chars: the pairing grant's secret (identity-per-store §3.2 as built: the client mints it). */
+export function generateGrantSecret(random: RandomBytesFn = defaultRandomBytes): string {
+	return base64Url(random(32));
 }
 
 // ---------------------------------------------------------------------------
@@ -185,10 +194,13 @@ function errorCodeOf(json: unknown): string {
 	return typeof e === "string" && /^[A-Za-z0-9_ .-]{1,64}$/.test(e) ? e : "";
 }
 
-function jsonHeaders(token?: string): Record<string, string> {
-	const headers: Record<string, string> = { "Content-Type": "application/json" };
-	if (token !== undefined) headers.Authorization = `Bearer ${token}`;
-	return headers;
+function jsonHeaders(): Record<string, string> {
+	return { "Content-Type": "application/json" };
+}
+
+/** relay-wire §1: grant routes authenticate with `Authorization: Grant <secret>`, never as a Bearer. */
+function grantHeaders(grantSecret: string): Record<string, string> {
+	return { "Content-Type": "application/json", Authorization: `Grant ${grantSecret}` };
 }
 
 /** Replace every occurrence of a secret with a placeholder (defense in depth for error text). */
@@ -281,17 +293,17 @@ export interface EnrollInput {
 }
 
 /**
- * One enrollment attempt with its client-generated ids. Re-running the same attempt is idempotent
- * on the server (same enrollmentRequestId), so the UI keeps it across retries of the same code.
- * Contains SECRETS (pairingCode, deviceToken): keep in memory only.
+ * One grant enrollment attempt with its client-generated values (relay-wire §2.4 grant enroll). Re-running the same
+ * attempt is idempotent on the server (same enrollmentRequestId and grant secret), so the UI keeps it across retries
+ * of the same code. Contains SECRETS (pairingCode, grantSecret): keep in memory only.
  */
 export interface EnrollmentAttempt {
 	readonly host: string;
 	readonly pairingCode: string;
+	/** Sent as the grant's name (the server makes it unique: "Mac 2"). */
 	readonly deviceName: string;
 	readonly enrollmentRequestId: string;
-	readonly deviceId: string;
-	readonly deviceToken: string;
+	readonly grantSecret: string;
 }
 
 export function prepareEnrollment(input: EnrollInput, random: RandomBytesFn = defaultRandomBytes): EnrollmentAttempt {
@@ -300,8 +312,7 @@ export function prepareEnrollment(input: EnrollInput, random: RandomBytesFn = de
 		pairingCode: normalizePairingCode(input.pairingCode),
 		deviceName: normalizeDeviceName(input.deviceName),
 		enrollmentRequestId: generateEnrollmentRequestId(random),
-		deviceId: generateDeviceId(random),
-		deviceToken: generateDeviceToken(random),
+		grantSecret: generateGrantSecret(random),
 	};
 }
 
@@ -338,17 +349,18 @@ function enrollHttpError(status: number, json: unknown): PairingError {
 }
 
 /**
- * POST /enroll with the attempt's ids. 202 authorization_fence_pending is retried with the identical
- * body (backoff FENCE_RETRY_DELAYS_MS). Returns the identity to store in plugin data.
+ * POST /enroll {pairingCode, enrollmentRequestId, grantSecret, grantName} (relay-wire §2.4 grant enroll): the code
+ * buys a pairing grant, not a device (identity-per-store §3). 202 authorization_fence_pending is retried with the
+ * identical body (backoff FENCE_RETRY_DELAYS_MS). Returns the grant to store in plugin data; the engine registers this
+ * install's store under it at its first start (§4).
  */
 export async function runEnrollment(attempt: EnrollmentAttempt, deps: PairingDeps): Promise<PairedIdentity> {
 	const sleep = deps.sleep ?? defaultSleep;
 	const body = JSON.stringify({
 		pairingCode: attempt.pairingCode,
 		enrollmentRequestId: attempt.enrollmentRequestId,
-		deviceId: attempt.deviceId,
-		deviceToken: attempt.deviceToken,
-		...(attempt.deviceName ? { deviceName: attempt.deviceName } : {}),
+		grantSecret: attempt.grantSecret,
+		...(attempt.deviceName ? { grantName: attempt.deviceName } : {}),
 	});
 	const req: HttpRequest = { url: `${attempt.host}/enroll`, method: "POST", headers: jsonHeaders(), body };
 	let fenceRetries = 0;
@@ -358,7 +370,7 @@ export async function runEnrollment(attempt: EnrollmentAttempt, deps: PairingDep
 	for (;;) {
 		let res: HttpResponse;
 		try {
-			res = await send(deps, req, [attempt.pairingCode, attempt.deviceToken]);
+			res = await send(deps, req, [attempt.pairingCode, attempt.grantSecret]);
 		} catch (err) {
 			const delay = NETWORK_RETRY_DELAYS_MS[networkRetries];
 			if (delay === undefined) throw err;
@@ -400,9 +412,9 @@ function readEnrollment(attempt: EnrollmentAttempt, json: unknown): PairedIdenti
 	const incomplete = (): PairingError => new PairingError("The server returned incomplete pairing details.", "enroll_response_invalid", 200);
 	// Exactly a vaultId (22-char canonical base64url, server DECISIONS §2.1); the server's word is not enough.
 	if (typeof r.vaultId !== "string" || !isVaultId(r.vaultId)) throw incomplete();
-	if (r.deviceId !== undefined && r.deviceId !== attempt.deviceId) throw incomplete();
-	// The server echoes the token it hashed; a different value means a broken or hostile response.
-	if (r.deviceToken !== undefined && r.deviceToken !== attempt.deviceToken) throw incomplete();
+	if (typeof r.grantId !== "string" || !GRANT_ID_RE.test(r.grantId)) throw incomplete();
+	// The server echoes the secret it hashed; a different value means a broken or hostile response.
+	if (r.grantSecret !== undefined && r.grantSecret !== attempt.grantSecret) throw incomplete();
 	if (typeof r.host === "string" && r.host.trim()) {
 		let returned: string;
 		try {
@@ -412,14 +424,14 @@ function readEnrollment(attempt: EnrollmentAttempt, json: unknown): PairedIdenti
 		}
 		if (returned !== attempt.host) throw new PairingError("The server returned pairing details for a different address.", "host_mismatch", 200);
 	}
-	const deviceName = typeof r.deviceName === "string" && r.deviceName.trim() ? normalizeDeviceName(r.deviceName) : attempt.deviceName;
+	const grantName = typeof r.grantName === "string" && r.grantName.trim() ? normalizeDeviceName(r.grantName) : attempt.deviceName;
 	const vaultGeneration = typeof r.vaultGeneration === "string" && r.vaultGeneration.trim() ? r.vaultGeneration : null;
 	return {
 		host: attempt.host,
 		vaultId: r.vaultId,
-		deviceId: attempt.deviceId,
-		deviceToken: attempt.deviceToken,
-		deviceName,
+		grantId: r.grantId,
+		grantSecret: attempt.grantSecret,
+		grantName,
 		vaultGeneration,
 	};
 }
@@ -449,6 +461,7 @@ export interface PairingCodeGrant {
 /** Fallback when the server omits expiresAt (relay-wire §11.1: pairing code TTL 15 min). */
 export const PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
 
+/** `POST /vault/:id/auth/pairing-code` with the install's grant (`Authorization: Grant`, owner decision 3). */
 export async function requestPairingCode(
 	identity: PairedIdentity,
 	deps: PairingDeps & { readonly nowMs?: () => number },
@@ -457,11 +470,12 @@ export async function requestPairingCode(
 	const res = await send(deps, {
 		url: `${host}/vault/${encodeURIComponent(identity.vaultId)}/auth/pairing-code`,
 		method: "POST",
-		headers: jsonHeaders(identity.deviceToken),
+		headers: grantHeaders(identity.grantSecret),
 		body: JSON.stringify({ purpose: "device" }),
-	}, [identity.deviceToken]);
+	}, [identity.grantSecret]);
 	if (res.status !== 200) {
 		const code = errorCodeOf(res.json);
+		if (res.status === 401 && code === "grant_revoked") throw new PairingError("This device's pairing was revoked on the server. Pair it again.", code, 401);
 		if (res.status === 401) throw new PairingError("This device is no longer authorized on the server. Pair it again.", code || "unauthorized", 401);
 		if (res.status === 403) throw new PairingError("Your vault role is not allowed to pair devices.", code || "forbidden", 403);
 		if (res.status === 404) throw new PairingError("The server does not know this vault. Check the connection settings.", code || "not_found", 404);
@@ -482,26 +496,24 @@ export async function requestPairingCode(
 }
 
 // ---------------------------------------------------------------------------
-// Retiring a replaced enrollment (DELETE /vault/:id/auth/device)
+// Leaving a replaced pairing (DELETE /vault/:id/auth/grant)
 // ---------------------------------------------------------------------------
 
-export const RETIRE_FAILED_MESSAGE = "Could not remove the old server membership. Remove it from the old server console.";
+export const RETIRE_FAILED_MESSAGE = "Could not remove the old pairing from its server. Revoke it in the old server console.";
 
 /**
- * Revokes an enrollment that a new pairing has replaced, authenticated by that enrollment's own token: the
- * legacy server revoked the token's device (adfa7a7:server/src/routes/enroll.ts:391-399); the relay in server/
- * has no such route (404, server/src/router.ts:588). Same request and outcome rule as the old client
- * (adfa7a7:src/main.ts:3439-3473): 200 (revoked) and 401 (the token is already dead) count as done. Anything
- * else, including 202 authorization_fence_pending, and network errors throw PairingError(RETIRE_FAILED_MESSAGE);
- * the token never appears in it.
+ * Leaves a pairing a new one has replaced (identity-per-store §4 "Re-pair to another vault"): `DELETE
+ * /vault/:id/auth/grant` with that pairing's grant revokes the grant and retires every store registered under it
+ * (relay-wire §2.4.1). 200 (left, or already revoked) and 401 (the server no longer knows the grant) count as done.
+ * Anything else, and network errors, throw PairingError(RETIRE_FAILED_MESSAGE); the secret never appears in it.
  */
-export async function retireDeviceEnrollment(identity: PairedIdentity, deps: Pick<PairingDeps, "request" | "clock">): Promise<void> {
+export async function leaveGrant(identity: PairedIdentity, deps: Pick<PairingDeps, "request" | "clock">): Promise<void> {
 	let res: HttpResponse;
 	try {
 		res = await call(deps, {
-			url: `${normalizeHost(identity.host)}/vault/${encodeURIComponent(identity.vaultId)}/auth/device`,
+			url: `${normalizeHost(identity.host)}/vault/${encodeURIComponent(identity.vaultId)}/auth/grant`,
 			method: "DELETE",
-			headers: { Authorization: `Bearer ${identity.deviceToken}` },
+			headers: { Authorization: `Grant ${identity.grantSecret}` },
 		});
 	} catch (err) {
 		throw new PairingError(RETIRE_FAILED_MESSAGE, err instanceof PairingError ? err.code : "network");

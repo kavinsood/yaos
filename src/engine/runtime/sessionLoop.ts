@@ -26,7 +26,7 @@ import type { ReadPage, ReadRequest, RelayConnectResult, RelayEvent, RelaySessio
 import { readStream, staleOrder, type ReadResult } from "../sync/catchUp";
 import type { EngineCtx } from "./context";
 import { connectFailure, newReconnectState, sessionClosed, type ReconnectDecision } from "./relayPolicy";
-import { renumberBlindFrames } from "./logApi";
+import { checkInherited, renumberBlindFrames } from "./logApi";
 import { regateUnopened, retryReaderQuarantine } from "./quarantineRelease";
 
 type Closed = Extract<RelayEvent, { t: "closed" }>;
@@ -492,6 +492,8 @@ export class SessionLoop {
 
 	/** Session whose start reached the ns/cfg reads: from then on a completed read of either may finish the start. */
 	private nsGen = -1;
+	/** The unfenced commit check's wait (EngineCtx.inheritCheckAtMono). */
+	private inheritTimer: number | null = null;
 
 	/**
 	 * The end of a session start, once ns and cfg are read in this session (a read held for a key or failed waits for
@@ -509,6 +511,20 @@ export class SessionLoop {
 		const read = (s: StreamName) => !c.repo.stream(s)?.stale || (this.isHeld(s) && this.held.get(s)!.upgrade);
 		if (!read(NS_STREAM) || !read(CFG_STREAM)) return;
 		if (!c.sender.nsWindowOpen) {
+			// Predecessor recovery without the fence (identity-per-store §5.2): a frame of the dead store still in the
+			// relay's buffer commits within its hold cap; check the inherited frames once that has passed.
+			const wait = c.inheritCheckAtMono - c.mono();
+			if (wait > 0) {
+				if (this.inheritTimer === null) {
+					this.inheritTimer = c.ports.clock.setTimer(wait, () => {
+						this.inheritTimer = null;
+						void this.afterStartReads(this.c.gen);
+					});
+				}
+				return;
+			}
+			await checkInherited(c);
+			if (gen !== c.gen || c.stopped) return;
 			await renumberBlindFrames(c);
 			if (gen !== c.gen || c.stopped) return;
 			c.sender.openNs();

@@ -1,5 +1,5 @@
 /**
- * IndexedDB schema: one database per (vault, vaultEpoch, device).
+ * IndexedDB schema: one database per (vault, vaultEpoch, install): the store (identity-per-store §2.4).
  * DESIGN §e. IndexedDB is a rebuildable cache: every record here can be
  * reconstructed from the relay + disk, except the outbox, which is mirrored
  * to side files (OUTBOX_MIRROR_*).
@@ -26,27 +26,69 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
  * delete and rebuild every DB.
  */
 export const DB_SCHEMA_VERSION = 2;
-export const DB_NAME_PREFIX = "yaos2";
+/**
+ * `yaos3`: the store is named by the install key, and its device identity lives in it (identity-per-store §2.4).
+ * The `yaos2:<vaultId>:<epoch>:<deviceId>` layout (identity in data.json) is deleted on start (§13).
+ */
+export const DB_NAME_PREFIX = "yaos3";
+export const LEGACY_DB_NAME_PREFIX = "yaos2";
+/** `yaos3-pending:<vaultId>:<installKey>`: an identity minted for this install's next store (storeIdentity.ts). */
+export const PENDING_DB_NAME_PREFIX = "yaos3-pending";
 
-/** `yaos2:<vaultId>:<vaultEpoch>:<deviceId>`, each part URI-component encoded (the epoch is an opaque string). */
-export function dbName(vaultId: VaultId, vaultEpoch: VaultEpoch, deviceId: DeviceId): string {
-	return `${DB_NAME_PREFIX}:${encodeURIComponent(vaultId)}:${encodeURIComponent(vaultEpoch)}:${encodeURIComponent(deviceId)}`;
+/**
+ * `yaos3:<vaultId>:<vaultEpoch>:<storeKey>`, each part URI-component encoded (the epoch is an opaque string).
+ * `storeKey` is the install key (identity-per-store §2.4); engine tests without one use the deviceId.
+ */
+export function dbName(vaultId: VaultId, vaultEpoch: VaultEpoch, storeKey: string): string {
+	return `${DB_NAME_PREFIX}:${encodeURIComponent(vaultId)}:${encodeURIComponent(vaultEpoch)}:${encodeURIComponent(storeKey)}`;
 }
 
 // ---------------------------------------------------------------------------
 // meta — singleton records keyed by `key`
 // ---------------------------------------------------------------------------
 
+/**
+ * The store's identity (identity-per-store §2.4): written in the transaction that creates the DB, so the device
+ * identity and the store are created and lost together. A deviceId is used by exactly one store (§1.3).
+ */
 export interface MetaIdentity {
 	readonly key: "identity";
 	readonly vaultId: VaultId;
 	readonly vaultEpoch: VaultEpoch;
 	readonly deviceId: DeviceId;
+	/** SECRET: the device token (relay tickets, reads, blobs). Absent only in engine tests that run without a grant. */
+	readonly deviceToken?: string;
+	/** SECRET: the key whose SHA-256 the server keeps as the device's retire hash (the successor fence, §5.2). */
+	readonly retireKey?: string;
 	readonly schemaVersion: number;
 	readonly clientVersion: string;
 	readonly createdAtMs: number;
 	/** Set when this DB was rebuilt from side-file mirrors after loss. */
 	readonly recoveredFromMirror: boolean;
+	/**
+	 * Predecessor recovery still to run (identity-per-store §5.2): written with the identity when a new store of an
+	 * install with a lineage is created, cleared in the transaction that imports the predecessor's mirrors
+	 * (Repo.tInherit). A crash between the two runs the import at the next start; a store created without it never
+	 * imports anything (a late import would replay old intents over newer changes).
+	 */
+	readonly inherit?: MetaInherit | null;
+}
+
+/** The lineage stores to recover from, newest first (identity-per-store §5.2), and whether the newest was fenced. */
+export interface MetaInherit {
+	readonly dirs: readonly DeviceId[];
+	readonly fenced: boolean;
+}
+
+/**
+ * An inherited frame's identity in a predecessor store (identity-per-store §5.2 steps 3-4): the commit check drops
+ * the re-issued frame when any of its origins committed (in that device's ring or covered by its replay window).
+ */
+export interface FrameOrigin {
+	readonly deviceId: DeviceId;
+	readonly clientFrameId: ClientFrameId;
+	/** ns / cfg frameNo there; 0 for none. */
+	readonly frameNo: number;
 }
 export interface MetaCursor {
 	readonly key: "cursor";
@@ -147,7 +189,23 @@ export interface MetaKeyringRecords {
 	readonly winners: readonly Uint8Array[];
 	readonly open: readonly Uint8Array[];
 }
-export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes;
+/**
+ * An identity minted and registered for this install's next store, before that store exists (the epoch it is
+ * named by is learnt by connecting, which needs the identity). Only in the `yaos3-pending:` DB; consumed (the DB
+ * deleted) before the store is created, so it serves at most one store (storeIdentity.ts).
+ */
+export interface MetaPendingIdentity {
+	readonly key: "pendingIdentity";
+	readonly deviceId: DeviceId;
+	/** SECRET. */
+	readonly deviceToken: string;
+	/** SECRET. */
+	readonly retireKey: string;
+	/** The server answered the registration 200. */
+	readonly registered: boolean;
+}
+
+export type MetaRecord = MetaPendingIdentity | MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------
@@ -267,6 +325,11 @@ export interface OutboxRecord {
 	/** adoptable only: identity of the provisional frame being shadowed. */
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly receivedAtMs: number } | null;
 	readonly createdAtMs: number;
+	/**
+	 * ns / cfg frames re-issued from a lost predecessor store (identity-per-store §5.2): the identities the frame had
+	 * there, newest first. Absent or empty: this store's own frame.
+	 */
+	readonly origins?: readonly FrameOrigin[];
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +530,7 @@ export function tailRange(stream: StreamName, afterSeq: Seq = 0, throughSeq: Seq
 // ---------------------------------------------------------------------------
 
 /** Byte format: core/codec/mirrors.ts (the shapes below are assignable to its OutboxMirrorData / SyncedMirrorData). */
-export { MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_MAGIC, SYNCED_MIRROR_MAGIC } from "../../core/codec/mirrors";
+export { MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_MAGIC, SYNCED_MIRROR_MAGIC } from "../../core/codec/mirrors";
 
 export interface OutboxMirrorFrame {
 	readonly clientFrameId: ClientFrameId;
@@ -479,6 +542,8 @@ export interface OutboxMirrorFrame {
 	readonly dependsOn: ClientFrameId | null;
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId } | null;
 	readonly sealed: Uint8Array;
+	/** OutboxRecord.origins (outbox mirror format 2). */
+	readonly origins?: readonly FrameOrigin[];
 }
 
 export interface OutboxMirror {

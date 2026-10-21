@@ -14,7 +14,7 @@ import { advanceUntil, settleWith } from "../engine/keyring/testkit/simWait";
 import { hostNotice, PinRefusedError, YaosController } from "./pluginController";
 import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "./ui/api";
 
-const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), deviceId: "dev-A", deviceToken: "secret-token", deviceName: "A", vaultGeneration: null };
+const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: "gs_SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS", grantName: "A", vaultGeneration: null };
 
 function setup(initial: YaosPluginData = defaultPluginData("A"), o: { readonly secretsAvailable?: boolean } = {}) {
 	const clock = new VirtualClock();
@@ -174,7 +174,9 @@ test("a stored pairing without e2ee is unpinned and blocked: key-missing, zero f
 	assert.equal(w.dev.engine?.config?.crypto.suite, null);
 	assert.equal(w.net.relay.counters().appendFrames, 0, "no frame on any stream");
 	assert.equal(w.net.relay.head(), 0);
-	assert.deepEqual(await w.dev.storage.listDatabases(), [], "no IndexedDB store opened");
+	// Only the pending store identity (identity-per-store §4): the key reader registered one device, and no store exists.
+	const dbs = await w.dev.storage.listDatabases();
+	assert.deepEqual(dbs.map((n) => n.split(":")[0]), ["yaos3-pending"], "no IndexedDB store opened");
 	assert.equal(w.saved.length, 0, "nothing inferred, nothing saved");
 	assert.equal(w.ctl.data().e2ee, undefined);
 });

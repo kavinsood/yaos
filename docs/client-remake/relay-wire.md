@@ -113,6 +113,7 @@ used by one store, ever ([identity-per-store](identity-per-store.md) §1.3). The
 |---|---|---|
 | `POST /vault/:id/auth/device {"deviceId", "deviceToken", "retireKeyHash"}` | `Grant <secret>`, or the `Bearer` of a live device of the same grant | `200 {vaultId, deviceId, deviceName, grantId, vaultGeneration}` |
 | `POST /vault/:id/auth/device/retire {"deviceId", "retireKey"}` | the retire key | `200 {ok, deviceId, retired}` |
+| `POST /vault/:id/auth/device/status {"deviceIds"}` | `Bearer` | `200 {ok, devices: [{deviceId, state}]}` |
 | `DELETE /vault/:id/auth/device` | `Bearer` (any device, a grant's or not) | `200 {ok, deviceId, retired: true}` |
 | `DELETE /vault/:id/auth/grant` | `Grant <secret>` | `200 {ok, grantId, revoked, retiredDevices}` |
 
@@ -129,6 +130,9 @@ used by one store, ever ([identity-per-store](identity-per-store.md) §1.3). The
   enroll again. Retire by key: a device that is already gone (or never existed) is `200 {retired: false}`; a wrong
   key, or a device without one, is `401 unauthorized`. Self-retire twice: the second call is `401` (the token is
   dead), which counts as done.
+- **Status** (identity-per-store phase 3; DESIGN §i.5 "Abandoned creates"): 1..32 well-formed deviceIds (duplicates
+  answered once, in request order); `state` is `live` (registered), `retired` (tombstoned) or `unknown`. Reads only.
+  `400 invalid_request` for an empty, oversized or malformed list.
 - **Leave** revokes the grant and retires all its devices; a revoked grant answers `revoked: false`. The operator's
   `DELETE /operator/vaults/:id/grants/:grantId` ("Revoke pairing") does the same.
 - `POST /enroll`'s old device body (§2.4) still enrolls a device without a grant until the client switches.

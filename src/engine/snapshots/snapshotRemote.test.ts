@@ -16,7 +16,7 @@ import { ProtocolFailure } from "../../protocol/errors";
 import { SeededRandom } from "../../sim/random";
 import { createWebCryptoSuite1 } from "../adapters/webCryptoSuite1";
 import { SnapshotPartUnavailable } from "./remote";
-import { DAY, DEV_A, DEV_B, FaultyStore, MemIndex, addressOf, device, noise, sealingCrypto } from "./testkit/snapKit";
+import { DAY, DEV_A, DEV_A2, DEV_B, FaultyStore, MemIndex, addressOf, device, noise, sealingCrypto } from "./testkit/snapKit";
 
 function pair(o: { partBytes?: number; keepDaily?: number } = {}) {
 	const store = new FaultyStore();
@@ -92,6 +92,27 @@ test("list merges local and remote; delete removes the local copy and appends a 
 	await b.job.remove(`${s2.id}@${DEV_A}`);
 	assert.deepEqual((await a.job.list()).map((s) => [s.id, s.where]), [[s2.id, "local"]], "the local copy stays");
 	assert.equal((await a.job.take("manual"))!.upload, "uploaded", "a new snapshot still uploads");
+});
+
+test("successor store: the lineage's moved snapshots are its own (listed both, not uploaded again, removable); retention dels them", async () => {
+	// identity-per-store §5.2 step 6: DEV_A's store was lost; DEV_A2 recovered and moved state/A/snapshots/ into its dir.
+	const { store, index, a } = pair({ keepDaily: 2 });
+	const s1 = (await a.job.take("manual"))!;
+	a.w.clock.advance(DAY);
+	const s2 = (await a.job.take("manual"))!;
+	const s = device({ label: "laptop", self: DEV_A2, lineage: [DEV_A], index, store, partBytes: 4096, keepDaily: 2 });
+	for (const [k, v] of a.side.files) s.side.files.set(k, v.slice());
+	s.w.clock.advance(a.w.clock.now() - s.w.clock.now() + DAY);
+	for (const p of a.w.vault.paths()) s.w.vault.userWrite(p, a.w.vault.bytesOf(p)!);
+	assert.deepEqual((await s.job.list()).map((x) => [x.id, x.where]), [[s1.id, "both"], [s2.id, "both"]]);
+	const puts = index.puts();
+	await s.job.maybeDaily(); // takes a daily (24 h since s2) and uploads the newest
+	const s3 = (await s.job.list()).at(-1)!;
+	assert.equal(index.puts(), puts + 1, "only the new snapshot is uploaded");
+	assert.deepEqual(snapLive(index.state).map((e) => [e.deviceId, e.record.snapshotId]).sort(), [[DEV_A, s2.id], [DEV_A2, s3.id]].sort(),
+		"retention counts the lineage's uploads: the oldest is del'd");
+	await s.job.remove(s2.id);
+	assert.equal(index.state.records.has(snapKey(DEV_A, s2.id)), false, "removing the moved copy dels the lineage's upload");
 });
 
 test("cross-device restore: a fresh device lists, verifies (download cache), restores; files match; cache removed", async () => {

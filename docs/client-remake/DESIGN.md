@@ -596,7 +596,8 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
 2. Writes `intent{epoch-migration}`.
 3. Reads the old DB's `synced` and `baseText` as **path-keyed bases**: the base text of every markdown doc and canvas
    with one (a canvas's is its merge text, §j.2). Blobs have none. Old docIds are meaningless in the new epoch.
-4. Creates the new DB `yaos2:<vaultId>:<newEpoch>:<deviceId>` and onboards against the new epoch as in §j.5. Path-keyed
+4. Creates the new DB `yaos3:<vaultId>:<newEpoch>:<installKey>` (same store identity until phase 4 of
+   identity-per-store mints one per epoch) and onboards against the new epoch as in §j.5. Path-keyed
    bases turn the "no-base" merges into 3-way merges where the paths match, for markdown and canvases alike:
    - **No synced record.** A doc with no synced record merges against the base at its path.
    - **Migrated loser.** Every device re-creates its files, so a device's own create can lose the path race (§c.13
@@ -1421,7 +1422,22 @@ The planner does no destructive work until ns is caught up (§f.2).
 
 ## e. IndexedDB schema and transactions
 
-One database per `(vaultId, vaultEpoch, deviceId)`: `dbName()` gives `yaos2:<vaultId>:<vaultEpoch>:<deviceId>`.
+One database per `(vaultId, vaultEpoch, installKey)`: `dbName()` gives `yaos3:<vaultId>:<vaultEpoch>:<installKey>`
+(identity-per-store §2). The install key is per vault registration (the install record in `App.saveLocalStorage`,
+`src/host/installRecord.ts`), so two vaults of one machine, which share one IndexedDB origin, never share a store.
+
+**Store identity** (identity-per-store §2, §4: one deviceId per store, ever). `meta.identity` holds the store's
+`deviceId`, its device token and its retire key (SECRET). The engine's `self` is the store's id, never data.json's:
+data.json holds only the pairing grant (`relay.grantSecret`). With no store, the composed engine mints the next
+store's identity (16-byte id, 32-byte token and retire key), registers it under the grant (`POST /vault/:id/auth/device`,
+`Authorization: Grant`; relay-wire §2.4.1) and keeps it in a pending DB `yaos3-pending:<vaultId>:<installKey>` until
+the store exists: LogEngine deletes the pending DB right before it creates the store, so a pending identity serves at
+most one store (`src/engine/compose/storeIdentity.ts`). Refusals: `device_exists` / `device_retired` mint again (3 a
+start); `grant_revoked`, unknown grant, `grant_required` and no grant stop the start (phase `revoked`, re-pair); the
+20-a-day limit waits out its Retry-After (00:00 UTC); the 50-device limit is phase `error` with a notice and retries.
+The install record keeps the lineage (the current store, with its retire key, and up to 8 before it), which the engine
+uses for predecessor recovery and `lostCreateBody` (§i.5). On start the client deletes the identity-less `yaos2:<vaultId>:*` DBs (§13 of
+identity-per-store).
 
 IDB is a **rebuildable cache**: everything can be rebuilt from relay + disk + side files (§i.5). The engine opens it
 through `StoragePort`. The same semantics hold for the in-memory simulation implementation, including "a crash keeps
@@ -1506,14 +1522,17 @@ Rules:
 
 ### e.4 Side files
 
-Side files live in `<configDir>/plugins/yaos/state/` (`SideFilePort`). The host reads them at startup and passes them
-in `EngineInitConfig.sideState`. The engine asks for writes with `sideFileWrite`.
+Side files live in `<configDir>/plugins/yaos/state/<deviceId>/` (`SideFilePort`), one dir per store identity: a
+copied or synced vault folder carries other installs' dirs, and a store only ever reads, writes or removes its own
+(the adapter refuses other shapes and never lists or deletes a dir as a whole). The flat files of the old layout
+(`state/outbox-*.bin`, `state/synced-*.bin`) are deleted on start. The host reads the store's dir at startup and passes
+it in `EngineInitConfig.sideState`. The engine asks for writes with `sideFileWrite`.
 
 **Outbox mirror** (`outbox-a.bin` / `outbox-b.bin`, A/B by generation):
 
 ```
 8B  magic "YAOSOBX1"
-u8  formatVersion (1)
+u8  formatVersion (2; version 1, without the origins field, still decodes)
 varstring vaultId, varstring vaultEpoch, varstring deviceId
 varuint generation, varuint writtenAtMs
 varuint frameCount
@@ -1523,6 +1542,7 @@ frameCount × {
   varuint authorNsSeq,
   u8 hasDep [varstring dependsOn],
   u8 hasAdopt [varstring deviceId, varstring clientFrameId],
+  varuint originCount, originCount × { varstring deviceId, varstring clientFrameId, varuint frameNo },   (v2)
   varbytes sealed
 }
 32B sha256(all preceding bytes)
@@ -1538,6 +1558,11 @@ frameCount × {
   - a resent ns frame is deduped by the relay window or the fold ring instead of creating duplicate docs;
   - body frames would converge anyway.
 - **Reader.** Takes the valid file (magic, checksum, identity match) with the highest generation.
+- **Origins** (v2): an ns / cfg frame a store re-issued from a lost predecessor's mirror (§i.5 "Predecessor
+  recovery") keeps the identities it had there, newest first: the commit check needs them if this store is lost in
+  turn before the frame is acked.
+- **Predecessors' dirs.** A store reads another dir only to recover from its own install's lineage (§i.5), and removes
+  the lineage dirs' mirror and snapshot files once its own outbox and synced mirrors are written.
 
 **Synced mirror** (`synced-a.bin` / `synced-b.bin`, written `SYNCED_MIRROR_DEBOUNCE_MS` (2 s,
 src/engine/compose/syncedMirror.ts:29) after the first change; a fixed delay, not reset by later changes):
@@ -2253,6 +2278,57 @@ Further caps:
 **Without mirrors**, recovery is the fresh-device onboarding path (§j.5): identical files are adopted and differing
 ones get conflict copies.
 
+**Predecessor recovery (identity-per-store §5.2).** A lost store is gone with its identity: the next store mints a new
+one. If the install record names earlier stores of this install (its lineage), the new store recovers from their
+dirs `state/<predecessor>/` instead of taking the "without mirrors" path:
+1. **Fence.** Before its first connect, the new store retires its predecessors by retire key (`POST
+   /auth/device/retire`; the install record keeps the newest one's key). From that server turn on no frame of the
+   predecessor can commit: its sessions close and its buffered frames are dropped. Already gone counts as done.
+2. **Inherit**, in one transaction with the store's creation marker `meta.identity.inherit` (a crash re-runs it):
+   - the newest lineage dir with a valid outbox mirror is the source (a store mirrors the frames it inherited before it
+     sends any, and removes its predecessors' dirs only after that, so a newer dir supersedes the older ones). Its
+     frames are opened as the predecessor's (the AAD binds its deviceId) and re-issued as this store's: a new
+     `clientFrameId`, a new ns / cfg frameNo from this store's allocator, sealed under this store, in the same order,
+     `dependsOn` mapped. ns / cfg frames keep their old identities (`origins`). Snap-index and keyring frames are not
+     inherited (the snapshot job uploads again; the keyring flow restarts from `k`);
+   - the newest valid synced mirror is imported as in step 3 above (`hasBase = false`, `bodyVersion = null`);
+   - local snapshots are copied into this store's dir.
+3. **Commit check**, at every session start while inherited frames wait, after both streams are read and before ns /
+   cfg sends open: an inherited frame whose origin committed (its `clientFrameId` in the origin's recent-frames ring,
+   its frameNo covered by the origin's replay window, or its row in the tail above the fold) is dropped, never sent
+   twice. Body and canvas frames go out whatever their state (Yjs updates are idempotent). **Without the fence** (no
+   retire key, a wrong one, no answer) the check waits `inheritUnfencedWaitMs` (10 s) after the start, past the relay's
+   hold cap (`STREAM_HOLD_MAX_MS`, 5 s) for a frame still in its buffer.
+4. **Snapshots.** The lineage's uploads count as this store's: an upload of a moved snapshot is "present", retention
+   counts them with its own and prunes them with `del`.
+5. **Cleanup.** The lineage dirs' mirror and snapshot files are removed once this store's outbox and synced mirrors are
+   written. Nothing is destroyed before its replacement exists.
+
+Without a lineage (both web storages evicted, a clone opened as a new vault) the store takes the "without mirrors"
+path. A live doc whose initial body was lost with an earlier store of this install (`createdBy` in the lineage, no
+row, nothing pending) is `lostCreateBody` (below).
+
+**Store revoked by the server** (removed in the console, retired; phase `revoked` from a 401). With a valid grant the
+install registers a successor first; then the runtime stops (its outbox goes to its mirror), the store is deleted and
+the successor starts and recovers from the old store's dir as above (the fence finds it gone). A refusal keeps the
+store: a revoked grant needs a re-pair (phase `revoked`, its notice), a passing one (network, daily limit) is
+retried after a minute or the server's Retry-After.
+
+**Abandoned creates.** A live doc whose create committed and whose initial body never did waits for its creator
+(planner `body-empty`). Two creators never supply it: a store of this install's lineage (lost with its store) and a
+store the server reports **retired**: a retired store never sends again (its sessions are closed and its buffered
+frames dropped; it cannot register or connect). A device asks `POST /auth/device/status` (bearer, at most 32 ids)
+about the creators of the body-less docs it waits on, at most every `creatorStatusRecheckMs` (5 min) per live
+creator. A creator that reads retired for `abandonedCreateGraceMs` (30 s) makes its body-less docs `lostCreateBody`
+too; the grace lets a successor's re-issued body (an inherited frame) land first. "unknown" is never abandoned. For a
+`lostCreateBody` doc the planner deletes the empty doc (`baseBodySeq` 0); a device that holds a file at the path keeps
+it (claimed, not braked) and creates it again as a new doc once the delete folds. Never a push into the empty doc:
+several devices may hold the file, and each push would insert the text again. Holders' re-creates race as concurrent
+creates (identical texts merge, others take a suffix or a conflict copy). With no file there the delete is braked like
+a local delete. A successor store offline from right after its fence until past the grace sends its re-issued body
+into a deleted doc: it restores the doc (restore duty), and it sits next to the holders' re-creates (a duplicate,
+nothing lost).
+
 **`rebuildLocalCache`:** flush the outbox to the mirror, close and delete the DB, then run the same procedure.
 
 **`StorageFailure: quota`:** §e.3.
@@ -2668,8 +2744,10 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 
 ### j.5 Onboarding and import
 
-- **Pairing** (UI out of scope; port the legacy provisioning client) yields `vaultId`, `deviceId` and a credential
-  (secret, kept in plugin data).
+- **Pairing** yields `vaultId`, the host and a pairing grant (identity-per-store §3): the client mints the grant secret,
+  sends it with the pairing code (`POST /enroll {pairingCode, enrollmentRequestId, grantSecret, grantName}`) and keeps
+  it in data.json. No device identity comes from pairing: each store mints and registers its own (§e). Pairing codes
+  for another device are minted with `Authorization: Grant <secret>`.
 - **First engine start against a vault:**
   1. ns catch-up (§j.6);
   2. full scan;

@@ -352,6 +352,24 @@ s.test("§3.3 tombstones: a self-retired, key-retired or operator-removed id is 
 		assert.deepEqual([malformed.status, await json(malformed)], [400, { error: "invalid_request" }]);
 		assert.equal((await deviceFeed(world, vaultId, fenced)).status, 401);
 
+		// Device status (bearer; the abandoned-creator rule): live, retired (tombstoned), unknown; reads only.
+		resetRows(world);
+		const statusOf = (device: typeof peer, body: unknown) => deviceFetch(world, vaultId, device, "auth/device/status",
+			{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+		const status = await statusOf(peer, { deviceIds: [peer.deviceId, fenced.deviceId, self.deviceId, "never-registered-01", peer.deviceId] });
+		assert.deepEqual([status.status, await json(status)], [200, { ok: true, devices: [
+			{ deviceId: peer.deviceId, state: "live" }, { deviceId: fenced.deviceId, state: "retired" },
+			{ deviceId: self.deviceId, state: "retired" }, { deviceId: "never-registered-01", state: "unknown" },
+		] }]);
+		assert.equal(vault.model.totals.cf, 0, "no write");
+		for (const deviceIds of [[], Array.from({ length: 33 }, (_, i) => `status-device-${String(i).padStart(4, "0")}`), ["bad id"], "x"]) {
+			const bad = await statusOf(peer, { deviceIds });
+			assert.deepEqual([bad.status, await json(bad)], [400, { error: "invalid_request" }], JSON.stringify(deviceIds).slice(0, 40));
+		}
+		const noBearer = await vaultFetch(world, vaultId, "auth/device/status", { method: "POST", json: { deviceIds: [peer.deviceId] } });
+		assert.equal(noBearer.status, 401);
+		assert.equal((await statusOf(fenced, { deviceIds: [peer.deviceId] })).status, 401, "a retired bearer");
+
 		// Operator "Remove device": tombstoned too; the install's grant registers a new store (§3.4).
 		const remove = await world.fetch(`/operator/vaults/${vaultId}/devices/${removed.deviceId}`, { method: "DELETE", cookie });
 		assert.deepEqual(await json(remove), { ok: true, deviceId: removed.deviceId, revoked: true });

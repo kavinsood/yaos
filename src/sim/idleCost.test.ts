@@ -70,12 +70,12 @@ test("idle cost: a runtime that cannot start (fresh device, offline) retries wit
 		if (line.includes("runtime start failed")) failures++;
 	};
 	const d = new SimDevice({ name: "fresh", clock, net, tuning: productionTuning(), log });
-	net.setOnline(d.deviceId, false);
+	net.setOnline(d.machineKey, false);
 	void d.start();
 	await clock.advance(HOUR);
 	// startRetryMs 1 s (SimDevice) doubling to 5 min: ~9 tries in the first ~8.5 min, then one per 5 min.
 	assert.ok(failures >= 5 && failures <= 25, `start attempts in an hour: ${failures} (without the backoff: 3600)`);
-	net.setOnline(d.deviceId, true);
+	net.setOnline(d.machineKey, true);
 	d.platform.online = true;
 	d.platform.emit("online");
 	await clock.advance(5_000);

@@ -120,6 +120,24 @@ export function renumberBlindFrames(c: EngineCtx): Promise<void> {
 	});
 }
 
+/**
+ * The commit check of inherited frames (identity-per-store §5.2 step 3), before ns/cfg sends open, once both streams
+ * are read (sessionLoop): an ns / cfg frame re-issued from a predecessor store whose identity there committed is
+ * dropped; the rest go out as this store's. Runs at every session start while such frames are in the outbox (the
+ * answer cannot change once the predecessor is fenced). On the edit chain, before renumberBlindFrames.
+ */
+export function checkInherited(c: EngineCtx): Promise<void> {
+	return c.docs.chain(async () => {
+		const recs = [...c.outbox.values()].filter((r) => (r.origins?.length ?? 0) > 0 && r.state !== "poisoned" && (r.stream === NS_STREAM || r.stream === CFG_STREAM));
+		if (recs.length === 0) return;
+		const tests = { ns: await c.ns.committedTest(), cfg: await c.cfg.committedTest() };
+		const drop = recs.filter((r) => r.origins!.some(r.stream === NS_STREAM ? tests.ns : tests.cfg));
+		if (c.stopped) return;
+		await c.dropInherited(drop);
+		c.diag("inherited-checked", { dropped: drop.length, kept: recs.length - drop.length });
+	});
+}
+
 /** Own snap-index ops (DESIGN §j.4) -> frames of <= SNAP_MAX_OPS ops; resolves once committed (in snapView()). */
 export async function submitSnap(c: EngineCtx, ops: readonly SnapOp[]): Promise<ClientFrameId[]> {
 	if (ops.length === 0) return [];

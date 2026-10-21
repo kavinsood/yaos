@@ -26,7 +26,8 @@ import type { CheckpointEncoding } from "../../core/envelope";
 import { decodeOuter } from "../../core/codec/envelope";
 import { NS_DEDUPE_RING } from "../../core/limits";
 import { NS_CANDIDATE_INTERVAL, isCandidateSeq } from "../../core/ns/candidate";
-import type { ClientFrameId, DeviceId, Seq, StreamName } from "../../core/types";
+import type { ClientFrameId, DeviceId, ReplayWindow, Seq, StreamName } from "../../core/types";
+import { replayCheck } from "../../core/replayWindow";
 import type { OutboxRecord, SnapshotRecord, StreamRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
 
@@ -143,6 +144,27 @@ export abstract class FoldRuntime<Op, E> {
 	protected abstract ownReplayEdge(): number;
 	/** This device's clientFrameIds in the committed fold's duplicate-frame ring (the newest 64). */
 	protected abstract ownRecentFrames(): readonly ClientFrameId[];
+	/** Any device's replay window and ring in the committed fold (ns / cfg; none for the other folds). */
+	protected windowOf(_deviceId: DeviceId): ReplayWindow | undefined {
+		return undefined;
+	}
+	protected ringOf(_deviceId: DeviceId): readonly ClientFrameId[] {
+		return [];
+	}
+
+	/**
+	 * The commit check of inherited frames (identity-per-store §5.2 step 3): whether the frame `o` (another store's
+	 * deviceId, clientFrameId and frameNo) committed. It did iff its id is in that device's ring, its frameNo is taken
+	 * or below that device's replay window (an honest store's frames in flight stay within 32 of its edge, §8.2), or
+	 * its row is stored above the fold (a halted or stale fold). The returned test reads the tail once.
+	 */
+	async committedTest(): Promise<(o: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly frameNo: number }) => boolean> {
+		const above = new Set<string>();
+		for (const r of await this.repo.getTail(this.stream, this.coversSeq)) above.add(`${r.deviceId} ${r.clientFrameId}`);
+		return (o) => this.ringOf(o.deviceId).includes(o.clientFrameId)
+			|| (o.frameNo >= 1 && replayCheck(this.windowOf(o.deviceId), o.frameNo) !== "accept")
+			|| above.has(`${o.deviceId} ${o.clientFrameId}`);
+	}
 
 	/** Why the fold stopped (a row halt first), or null. */
 	get halted(): FoldHalt | null {

@@ -90,6 +90,8 @@ export interface SyncedMirrorDeps {
 	 * outbox mirror makes recovery take the disk as base without those frames.
 	 */
 	readonly before?: () => Promise<boolean>;
+	/** After each write that landed (identity-per-store §5.2 step 7: the predecessors' dirs may go then). */
+	readonly onWritten?: () => void;
 }
 
 export class SyncedMirrorWriter {
@@ -160,5 +162,6 @@ export class SyncedMirrorWriter {
 		this.gens[slot] = generation;
 		this.stats.writes++;
 		this.stats.lastEntries = entries.length;
+		this.deps.onWritten?.();
 	}
 }

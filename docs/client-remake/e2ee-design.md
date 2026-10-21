@@ -281,7 +281,8 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
   the config dir.
 - **NEVER put keys or RK in** logs, `StatusSnapshot`, `DiagnosticsBundle`, `Error` messages, notices or the URL bar.
   Protocol fields that carry keys are marked SECRET, like `relay.credential` (`src/protocol/messages.ts:61-62`).
-- **The suite pin** (`e2ee: { suite: 0 | 1 }`, not secret) lives in `data.json` next to the device token.
+- **The suite pin** (`e2ee: { suite: 0 | 1 }`, not secret) lives in `data.json` next to the pairing grant (since
+  identity-per-store phase 2 the device token is per store, in IndexedDB `meta.identity`).
   - If the pin says 1 and the secret is missing, the device enters phase `key-missing`: re-key by QR or RK.
   - **No pin** (just enrolled by a key-less code, or `data.json` lost) means the device writes nothing until a pin
     arrives from an authenticated source (§12.4). Nothing the server says sets or lowers a pin.
@@ -303,9 +304,9 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 
 | Loss | Keys | Effect |
 |---|---|---|
-| IndexedDB (cleared, evicted, corrupted) | Survive in SecretStorage | Normal re-bootstrap from the relay. frameNo restarts above the folded right edge and the wall clock (§8.2). The outbox mirror re-opens with the keys. |
+| IndexedDB (cleared, evicted, corrupted) | Survive in SecretStorage | Normal re-bootstrap from the relay as a new store with a new deviceId (identity-per-store phase 2), so its frameNos start a new replay window; the lost store's outbox mirror is not imported before phase 3. The keyring records copy in `meta.keyringRecords` goes with the store. |
 | SecretStorage (app reinstall, localStorage cleared) | Lost on this device | `key-missing`, read-only. Re-key by QR from another device or by RK. |
-| `data.json` | Survive, but are orphaned | The pin is lost too. Re-enroll (new device token and deviceId): a key-less join, so the device is blocked until a QR or the RK (or, for a suite-0 vault, a suite-0 pairing link) settles it (§12.4). |
+| `data.json` | Survive, but are orphaned | The pin and the pairing grant are lost too. Re-pair (a new grant; the store keeps its identity when the vault is the same): a key-less join, so the device is blocked until a QR or the RK (or, for a suite-0 vault, a suite-0 pairing link) settles it (§12.4). |
 | Every device | Gone | RK path (§13.3). Without the RK the data is unrecoverable, by design. |
 
 ### 6.3 Worker hand-off

@@ -109,6 +109,7 @@ import { canCreateVault, UI_COMMANDS } from "../../host/ui/commands";
 import { createAndEnroll, CreateVaultError, enableEncryption, optOutOfEncryption } from "../../host/ui/createVault";
 import { applyLinkE2ee, revokeRekey, routeSetupLink } from "../../host/ui/keyActions";
 import { FakeUiHost, snapshot } from "../../host/ui/testkit/fakeUiHost";
+import { PENDING_DB_NAME_PREFIX } from "../store/schema";
 
 // --- shared helpers ------------------------------------------------------------------------------------------
 
@@ -336,7 +337,7 @@ const JOIN_SEEDS = [1, 2, 3] as const;
 
 /** Fields a hostile server adds to its capabilities and /enroll answers: none may reach the pin (readEnrollment). */
 const HOSTILE_FIELDS = { suite: 0, e2ee: { suite: 0 }, pin: { suite: 0 }, creating: { vaultId: SIM_VAULT_ID }, creatable: true, keyringSeen: false, encryption: "off" };
-const IDENTITY_KEYS = ["deviceId", "deviceName", "deviceToken", "host", "vaultGeneration", "vaultId"];
+const IDENTITY_KEYS = ["grantId", "grantName", "grantSecret", "host", "vaultGeneration", "vaultId"];
 
 /** A BlobPort that counts every call (pinGate.test.ts countingBlob). */
 function countingBlob(): { port: BlobPort; calls: Map<string, number> } {
@@ -363,8 +364,8 @@ function hostileServer(requests: Map<string, number>): RequestFn {
 		count(requests, `${req.method} ${path}`);
 		if (req.method === "GET" && path === "/api/capabilities") return { status: 200, json: { claimed: true, streams: 1, attachments: true, serverVersion: "sim", ...HOSTILE_FIELDS } };
 		if (req.method === "POST" && path === "/enroll") {
-			const b = JSON.parse(req.body ?? "{}") as { deviceId?: string; deviceToken?: string };
-			return { status: 200, json: { vaultId: SIM_VAULT_ID, deviceId: b.deviceId, deviceToken: b.deviceToken, host: HOST, deviceName: "Joiner", vaultGeneration: null, ...HOSTILE_FIELDS } };
+			const b = JSON.parse(req.body ?? "{}") as { grantSecret?: string };
+			return { status: 200, json: { vaultId: SIM_VAULT_ID, grantId: "grant_JoinerJoinerJo", grantSecret: b.grantSecret, host: HOST, grantName: "Joiner", vaultGeneration: null, ...HOSTILE_FIELDS } };
 		}
 		return { status: 404, json: null };
 	};
@@ -556,8 +557,8 @@ function willingCreationServer(requests: Map<string, number>, code: string): Req
 		}
 		if (req.method === "POST" && path === "/operator/logout") return { status: 200, json: { ok: true } };
 		if (req.method === "POST" && path === "/enroll") {
-			const b = JSON.parse(req.body ?? "{}") as { deviceId?: string; deviceToken?: string };
-			return { status: 200, json: { vaultId: SIM_VAULT_ID, deviceId: b.deviceId, deviceToken: b.deviceToken, host: HOST, deviceName: "Joiner", vaultGeneration: null } };
+			const b = JSON.parse(req.body ?? "{}") as { grantSecret?: string };
+			return { status: 200, json: { vaultId: SIM_VAULT_ID, grantId: "grant_JoinerJoinerJo", grantSecret: b.grantSecret, host: HOST, grantName: "Joiner", vaultGeneration: null } };
 		}
 		return { status: 404, json: null };
 	};
@@ -593,11 +594,12 @@ async function keylessJoin(form: JoinForm, state: VaultState, seed: number, t: J
 	const initial = form === "resume" ? { ...defaultPluginData("Joiner"), pendingEnrollment: prepareEnrollment(input, randomBytes) } : defaultPluginData("Joiner");
 	const w = controllerWorld(clock, net, initial);
 	const { dev, ctl } = w;
-	// The relay knows the device by its enrolled deviceId (the engine's connect params, net.ts:98): hide k from that id
-	// from the moment the attempt exists, before any engine connects.
+	// The relay knows the device by its store's deviceId (the engine's connect params, net.ts): the engine mints it on
+	// its first start (identity-per-store §4), the sim's first mint being the machine key. Hide k from that id before
+	// any engine connects.
 	const hiddenFrom = new Set<string>();
 	const hideFrom = (deviceId: string) => hideK && (hiddenFrom.add(deviceId), net.relay.hideFrom(deviceId as DeviceId, KEYRING_STREAM));
-	if (initial.pendingEnrollment) hideFrom(initial.pendingEnrollment.deviceId);
+	hideFrom(dev.machineKey);
 	dev.vault.userWrite("mine.md", "local only\n");
 	const before = relayState(net);
 	const appendsBefore = net.relay.counters().appendFrames;
@@ -611,15 +613,15 @@ async function keylessJoin(form: JoinForm, state: VaultState, seed: number, t: J
 		await settleOn(clock, ctl.start());
 	} else {
 		await settleOn(clock, ctl.start());
-		const session = new PairingSession({ request, randomBytes, persist: (a) => (a && hideFrom(a.deviceId), ctl.updateData((d) => (a ? setPendingEnrollment(d, a) : withoutPendingEnrollment(d)))) });
+		const session = new PairingSession({ request, randomBytes, persist: (a) => ctl.updateData((d) => (a ? setPendingEnrollment(d, a) : withoutPendingEnrollment(d))) });
 		const id = await settleOn(clock, session.submit(input));
 		assert.ok(id.ok, `pair ${form} ${state}`);
 		await settleOn(clock, ctl.updateData((d) => applyPairedIdentity(d, id.value)));
 	}
-	const joiner = ctl.data().identity?.deviceId as DeviceId;
-	assert.ok(joiner && (!hideK || hiddenFrom.has(joiner)), "k hidden from the enrolled device");
 	const blocked = () => ctl.runState().phase === "running" && ctl.status()?.phase === "key-missing" && ctl.status()?.e2ee?.keyMissing === "no-pin" && ctl.status()?.relay.connected === true;
 	assert.ok(await clock.runUntil(blocked, 60_000), `${form} ${state}: blocked, connected`);
+	const joiner = dev.deviceId;
+	assert.ok(joiner === dev.machineKey && (!hideK || hiddenFrom.has(joiner)), "k hidden from the store's device");
 	await clock.advance(3_000);
 
 	// Activity that would make a writer write: local edits, a foreground event.
@@ -698,7 +700,7 @@ async function keylessJoin(form: JoinForm, state: VaultState, seed: number, t: J
 		headDelta: after.head - before.head,
 		checkpointsChanged: after.checkpoints === before.checkpoints ? 0 : 1,
 		blobCalls: [...w.blob.calls.values()].reduce((a, b) => a + b, 0),
-		indexedDbStores: (await dev.storage.listDatabases()).length,
+		indexedDbStores: await storeDbCount(dev.storage),
 		sideFileWrites: dev.sideFiles.writes,
 		secretWrites: dev.secrets.writes,
 		secretsHeld: [...dev.secretBacking.values()].filter((v) => v !== "").length,
@@ -925,7 +927,7 @@ test("c. a suite=0 link never pins a device that holds a pin or has seen a genes
 	for (const seed of SEEDS) for (const [name, pin] of PINS) {
 		const clock = newClock();
 		const net = new SimNet(clock, { seed: seed * 53 + name.length, linkMs: 10 });
-		const w = controllerWorld(clock, net, pairedData(J_ID, { e2ee: pin }));
+		const w = controllerWorld(clock, net, pairedData({ e2ee: pin }));
 		const { ctl } = w;
 		void ctl.start();
 		assert.ok(await clock.runUntil(() => ctl.runState().phase === "running" && ctl.status()?.relay.connected === true && ctl.status()?.e2ee !== undefined, 60_000), `${name}: running`);
@@ -970,13 +972,15 @@ test("c. a suite=0 link never pins a device that holds a pin or has seen a genes
 
 // --- shared: a paired, unpinned controller device ------------------------------------------------------------
 
-const J_ID = "dev-J" as DeviceId;
+/** Device J's first store identity (SimDevice.mint: the machine key). */
+const J_ID = "dev-J-0000000000000" as DeviceId;
+/** J's pairing grant secret (a fixed test value; never printed). */
+const J_GRANT = "gs_J".padEnd(43, "J");
 const OTHER_VAULT = "otherVaultBBBBBBBBBBBA"; // canonical: 22 chars, last one carries no stray bits
 const SEEDS = [1, 2, 3] as const;
 
-function pairedData(deviceId: string = J_ID, extra: Partial<YaosPluginData> = {}): YaosPluginData {
-	// The token is a fixed test value; it is never printed.
-	return { ...defaultPluginData("J"), identity: { host: HOST, vaultId: SIM_VAULT_ID, deviceId, deviceToken: "test-token-J", deviceName: "J", vaultGeneration: null }, ...extra };
+function pairedData(extra: Partial<YaosPluginData> = {}): YaosPluginData {
+	return { ...defaultPluginData("J"), identity: { host: HOST, vaultId: SIM_VAULT_ID, grantId: "grant_JJJJJJJJJJJJJJJJ", grantSecret: J_GRANT, grantName: "J", vaultGeneration: null }, ...extra };
 }
 
 const blockedOn = (ctl: YaosController, reason: string) => (): boolean => {
@@ -1000,7 +1004,7 @@ async function writesOf(net: SimNet, w: ControllerWorld, deviceIds: readonly str
 		headDelta: now.head - since.head,
 		checkpointsChanged: now.checkpoints === since.checkpoints ? 0 : 1,
 		blobCalls: [...w.blob.calls.values()].reduce((a, b) => a + b, 0),
-		indexedDbStores: (await w.dev.storage.listDatabases()).length,
+		indexedDbStores: await storeDbCount(w.dev.storage),
 		secretWrites: w.dev.secrets.writes,
 		secretsHeld: [...w.dev.secretBacking.values()].filter((v) => v !== "").length,
 	};
@@ -1008,6 +1012,15 @@ async function writesOf(net: SimNet, w: ControllerWorld, deviceIds: readonly str
 
 function sumInto(t: Map<string, number>, r: Record<string, number>): void {
 	for (const [k, n] of Object.entries(r)) t.set(k, (t.get(k) ?? 0) + n);
+}
+
+/**
+ * IndexedDB databases that hold vault state: every one but the pending store identity (identity-per-store §4,
+ * storeIdentity.ts), which a blocked device keeps so it registers one device, not one per start. It holds no vault
+ * data, and it is not a store.
+ */
+async function storeDbCount(storage: { listDatabases(): Promise<readonly string[]> }): Promise<number> {
+	return (await storage.listDatabases()).filter((n) => !n.startsWith(`${PENDING_DB_NAME_PREFIX}:`)).length;
 }
 
 const ZERO_WRITES = { rows: 0, appends: 0, headDelta: 0, checkpointsChanged: 0, blobCalls: 0, indexedDbStores: 0, secretWrites: 0, secretsHeld: 0 };
@@ -1090,17 +1103,17 @@ test("d. suite-0 link after a genesis: keyringSeen is sticky, the link is refuse
 		await settleOn(clock, ctl.updateData((d) => ({ ...d, e2ee: { suite: 0 } })));
 		count(t.pins, `after UI writes=${fp(ctl.data().e2ee)}`);
 
-		// Re-pair by a key-less link into the same vault (fresh deviceId): keyringSeen survives (same vault).
+		// Re-pair by a key-less link into the same vault (a new grant; the store, and so its deviceId, stays: identity-per-store
+		// §4 "App start, existing store"): keyringSeen survives (same vault).
 		const requests = new Map<string, number>();
 		const session = new PairingSession({
 			request: hostileServer(requests), randomBytes: (n) => rng.bytes(n),
-			persist: (a) => (a && net.relay.hideFrom(a.deviceId as DeviceId, KEYRING_STREAM), ctl.updateData((d) => (a ? setPendingEnrollment(d, a) : withoutPendingEnrollment(d)))),
+			persist: (a) => ctl.updateData((d) => (a ? setPendingEnrollment(d, a) : withoutPendingEnrollment(d))),
 		});
 		const repaired = await settleOn(clock, session.submit(joinInput("console-link", code)));
 		assert.ok(repaired.ok, "re-paired");
 		await settleOn(clock, ctl.updateData((d) => applyPairedIdentity(d, repaired.value)));
-		const newId = ctl.data().identity!.deviceId;
-		assert.notEqual(newId, J_ID);
+		const newId = w.dev.deviceId;
 		assert.ok(await clock.runUntil(() => ctl.status()?.relay.connected === true && ctl.status()?.phase === "key-missing" && ctl.runState().phase === "running", 60_000), "re-paired, blocked");
 		await clock.advance(2_000);
 		count(t.pins, `after re-pair=${fp(ctl.data().e2ee)}`);
@@ -1187,7 +1200,7 @@ test("e. creation path: a non-empty vault never becomes creatable; a marker for 
 			const clock = newClock();
 			const net = new SimNet(clock, { seed: seed * 31 + NOT_EMPTY.indexOf(state), linkMs: 10 });
 			await notEmptyVault(clock, net, state);
-			const w = controllerWorld(clock, net, pairedData(J_ID, { creating: { vaultId: SIM_VAULT_ID } }));
+			const w = controllerWorld(clock, net, pairedData({ creating: { vaultId: SIM_VAULT_ID } }));
 			w.dev.vault.userWrite("mine.md", "local\n");
 			const since = { ...relayState(net), appends: net.relay.counters().appendFrames };
 			void w.ctl.start();
@@ -1206,7 +1219,7 @@ test("e. creation path: a non-empty vault never becomes creatable; a marker for 
 			const clock = newClock();
 			const net = new SimNet(clock, { seed: seed * 37 + how.length, linkMs: 10 });
 			const other = { creating: { vaultId: OTHER_VAULT } };
-			const w = controllerWorld(clock, net, how === "in data.json before pairing" ? { ...defaultPluginData("J"), ...other } : pairedData(J_ID, how === "in data.json while paired" ? other : {}));
+			const w = controllerWorld(clock, net, how === "in data.json before pairing" ? { ...defaultPluginData("J"), ...other } : pairedData(how === "in data.json while paired" ? other : {}));
 			const since = { ...relayState(net), appends: net.relay.counters().appendFrames };
 			await settleOn(clock, w.ctl.start());
 			if (how === "in data.json before pairing") {
@@ -1226,7 +1239,7 @@ test("e. creation path: a non-empty vault never becomes creatable; a marker for 
 			count(t.flags, `other-vault marker: kept=${w.ctl.data().creating?.vaultId === OTHER_VAULT}`);
 			await probe("other-vault marker", clock, w);
 			count(t.pins, `other-vault marker: ${fp(w.ctl.data().e2ee ?? null)}`);
-			const ids = [J_ID, w.ctl.data().identity!.deviceId];
+			const ids = [J_ID, w.dev.deviceId];
 			sumInto(t.writes, await writesOf(net, w, ids, since));
 			await settleOn(clock, w.ctl.stop());
 		}
@@ -1252,7 +1265,7 @@ test("e. creation path: a non-empty vault never becomes creatable; a marker for 
 		{
 			const clock = newClock();
 			const net = new SimNet(clock, { seed: seed * 43, linkMs: 10 });
-			const w = controllerWorld(clock, net, pairedData(J_ID, { creating: { vaultId: SIM_VAULT_ID } }));
+			const w = controllerWorld(clock, net, pairedData({ creating: { vaultId: SIM_VAULT_ID } }));
 			await settleOn(clock, w.ctl.start());
 			assert.ok(await clock.runUntil(() => w.ctl.status()?.e2ee?.creatable === true, 60_000), "control: creatable");
 			count(t.flags, "control: creatable");
@@ -1304,7 +1317,7 @@ test("e. creation path: a non-empty vault never becomes creatable; a marker for 
 		"route differs from §12.4": 0,
 		"data changed by routing": 0,
 		// Pair routes (25): what PairingSession sends and persists, even handed the whole route.
-		"pair: identity=ok enroll body=deviceId,deviceName,deviceToken,enrollmentRequestId,pairingCode attempt=deviceId,deviceName,deviceToken,enrollmentRequestId,host,pairingCode key or suite on the wire=false": 25,
+		"pair: identity=ok enroll body=enrollmentRequestId,grantName,grantSecret,pairingCode attempt=deviceName,enrollmentRequestId,grantSecret,host,pairingCode key or suite on the wire=false": 25,
 		// Apply routes (15): applyLinkE2ee on the device's own vault.
 		"apply suite=0: sent=pinSuite0:link outcome=suite0 other host calls=none": 4,
 		"apply key: sent=installKey:qr outcome=pending other host calls=none": 3,
@@ -1324,12 +1337,12 @@ function linkDeviceStates(): [string, YaosPluginData, StatusSnapshot | null, boo
 		["unpaired", defaultPluginData("J"), null, false],
 		["unpaired, marker", { ...defaultPluginData("J"), creating: { vaultId: SIM_VAULT_ID } }, null, false],
 		["same vault, key-missing", paired, snapshot("key-missing"), true],
-		["same vault, revoked", pairedData(J_ID, { e2ee: { suite: 1 } }), snapshot("revoked", { suite: 1, sealEpoch: 1, keyMissing: null }), false],
+		["same vault, revoked", pairedData({ e2ee: { suite: 1 } }), snapshot("revoked", { suite: 1, sealEpoch: 1, keyMissing: null }), false],
 		["other vault", { ...paired, identity: { ...id, vaultId: OTHER_VAULT } }, snapshot("key-missing"), false],
 		["other host", { ...paired, identity: { ...id, host: "https://other.example" } }, snapshot("key-missing"), false],
-		["creating marker", pairedData(J_ID, { creating: { vaultId: SIM_VAULT_ID } }), snapshot("key-missing", { creatable: true }), true],
-		["keyringSeen", pairedData(J_ID, { e2ee: { suite: null, keyringSeen: true } }), snapshot("key-missing", { keyMissing: "encrypted-vault", keyringSeen: true }), true],
-		["suite 1", pairedData(J_ID, { e2ee: { suite: 1 } }), snapshot("live", { suite: 1, sealEpoch: 1, keyMissing: null }), true],
+		["creating marker", pairedData({ creating: { vaultId: SIM_VAULT_ID } }), snapshot("key-missing", { creatable: true }), true],
+		["keyringSeen", pairedData({ e2ee: { suite: null, keyringSeen: true } }), snapshot("key-missing", { keyMissing: "encrypted-vault", keyringSeen: true }), true],
+		["suite 1", pairedData({ e2ee: { suite: 1 } }), snapshot("live", { suite: 1, sealEpoch: 1, keyMissing: null }), true],
 	];
 }
 

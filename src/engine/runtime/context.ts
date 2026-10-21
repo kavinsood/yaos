@@ -50,6 +50,7 @@ export interface PendingCreate {
 const DIAG_RING = 2_000;
 const ERROR_NOTICES = new Set(["device-revoked", "upgrade-required", "epoch-changed", "vault-unclaimed", "vault-not-found"]);
 const INFO_NOTICES = new Set(["recovered-from-mirror"]);
+const NO_LINEAGE: ReadonlySet<DeviceId> = new Set();
 
 /** A fold runtime and its after-change hook (EngineCtx.folds). */
 export interface Fold {
@@ -134,6 +135,11 @@ export class EngineCtx {
 	/** How long this engine's Repo.open took (IndexedDB open and identity check; the device check reports it). */
 	repoOpenMs: number | null = null;
 	dailyLimitUntilMono = 0;
+	/**
+	 * Predecessor recovery without the fence (identity-per-store §5.2): the inherited frames' commit check, and so the
+	 * ns / cfg sends, wait until this monotonic time. 0: no wait.
+	 */
+	inheritCheckAtMono = 0;
 	private readonly dailyLimitNotices = new DailyLimitNoticeGate();
 	/** Own frames receipted on `day` (daily soft budget, DESIGN §i.6). Starts from meta daily at boot. */
 	daily = { day: "", frames: 0 };
@@ -210,6 +216,10 @@ export class EngineCtx {
 
 	get self(): DeviceId {
 		return this.opts.deviceId;
+	}
+	/** EngineOptions.lineage: this install's earlier stores (never `self`). */
+	get lineage(): ReadonlySet<DeviceId> {
+		return this.opts.lineage ?? NO_LINEAGE;
 	}
 	now(): number {
 		return this.ports.clock.now();
@@ -474,6 +484,27 @@ export class EngineCtx {
 	foldOf(stream: StreamName): Fold | undefined {
 		return this.folds().find((f) => f.rt.stream === stream);
 	}
+	/**
+	 * Inherited frames the commit check found committed in a predecessor store (identity-per-store §5.2 step 3): out
+	 * of the outbox like a receipt, but folded as that store's frames, never as own (no noteCommitted). Then the held
+	 * frames behind a dropped create are released as for a folded create (DESIGN §e.1).
+	 */
+	async dropInherited(recs: readonly OutboxRecord[]): Promise<void> {
+		if (recs.length === 0) return;
+		const res = await this.repo.tOutbox(recs.map((r) => ({ t: "delete" as const, clientFrameId: r.clientFrameId })));
+		for (const r of res.removed) {
+			this.outbox.delete(r.clientFrameId);
+			this.sender.remove(r.clientFrameId);
+			this.unregisterAdopt(r.clientFrameId);
+		}
+		if (res.removed.length > 0) {
+			this.mirror.schedule();
+			this.scheduleStatus();
+		}
+		const changes = this.ns.reconcileHeld(this.outbox);
+		if (changes.length > 0) this.applyOutboxResult(await this.repo.tOutbox(changes));
+	}
+
 	/** Every fold folds what is available (engine start: reload from the snapshots; session start: rows read). */
 	async refold(reload: boolean): Promise<void> {
 		for (const f of this.folds()) await f.after(reload);

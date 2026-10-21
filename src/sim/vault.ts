@@ -39,9 +39,10 @@
 import type { Unsubscribe } from "../ports/common";
 import type { ClockPort } from "../ports/clock";
 import type {
-	ConfigDirPort, RenameOutcome, SideFileName, SideFilePort, TrashMode, VaultEvent, VaultPort, VaultStat, WriteOutcome, WritePrecondition,
+	ConfigDirPort, HostSideFilePort, RenameOutcome, SideFilePath, SideFilePrefix, TrashMode, VaultEvent, VaultPort, VaultStat, WriteOutcome, WritePrecondition,
 } from "../ports/vault";
 import type { VaultPath } from "../core/types";
+import { bytesEqual } from "../core/codec/lib0";
 import type { HashOracle } from "../host/hashOracle";
 
 // The simulated filesystem's own text encoding (Obsidian's job in the real host, not hashing).
@@ -351,6 +352,25 @@ export class SimVault implements VaultPort {
 		this.ensureFolders(path + "/x");
 	}
 
+	/**
+	 * The user copies `src`'s vault folder over this one (the clone fault, identity-per-store §4 "Clone"), with the app
+	 * closed: a file only here is gone (no trash: the copy replaced the folder), every file of `src` is written as an
+	 * external tool writes it. The trash folder is kept.
+	 */
+	copyFrom(src: SimVault): void {
+		for (const f of [...this.files.values()]) {
+			if (src.files.has(this.key(f.path))) continue;
+			this.files.delete(this.key(f.path));
+			this.emit({ t: "delete", path: f.path }, "external");
+		}
+		for (const f of src.files.values()) {
+			const cur = this.files.get(this.key(f.path));
+			if (cur && cur.path === f.path && bytesEqual(cur.bytes, f.bytes)) continue;
+			if (cur && cur.path !== f.path) this.files.delete(this.key(cur.path));
+			this.actorWrite(f.path, f.bytes.slice(), "external");
+		}
+	}
+
 	// --- inspection -----------------------------------------------------------
 
 	/** Visible files: display path -> text. */
@@ -532,26 +552,51 @@ export class SimConfigDir implements ConfigDirPort {
 	}
 }
 
-/** Plugin state side files; survive an IDB wipe (they live next to the vault). */
-export class SimSideFiles implements SideFilePort {
+/**
+ * The device's `<configDir>/plugins/yaos/state/` (identity-per-store §5.2: one dir per store, `<deviceId>/...`).
+ * A copied or synced folder carries other installs' dirs (the clone and syncedConfig faults): `removed` records every
+ * delete this device's engines made, so the invariants can check that none touched a dir it does not own.
+ */
+export class SimSideFiles implements HostSideFilePort {
 	readonly files = new Map<string, Uint8Array>();
 	writes = 0;
+	/** Paths this device's engines removed, in order. */
+	readonly removed: string[] = [];
+	/** Store dirs this device's engines read or listed (identity-per-store §5.2: only its own, in phase 2). */
+	readonly readDirs = new Set<string>();
+	/** Store dirs this device's engines wrote. */
+	readonly writtenDirs = new Set<string>();
+	/** syncedConfig fault: every write (bytes) and remove (null) this device made, for the sync tool to carry. */
+	onChange: ((path: string, bytes: Uint8Array | null) => void) | null = null;
 
-	async read(name: SideFileName): Promise<Uint8Array | null> {
+	async read(name: SideFilePath): Promise<Uint8Array | null> {
+		this.readDirs.add(name.slice(0, name.indexOf("/")));
 		const b = this.files.get(name);
 		return b ? b.slice() : null;
 	}
 
-	async write(name: SideFileName, bytes: Uint8Array): Promise<void> {
+	async write(name: SideFilePath, bytes: Uint8Array): Promise<void> {
 		this.writes++;
+		this.writtenDirs.add(name.slice(0, name.indexOf("/")));
 		this.files.set(name, bytes.slice());
+		this.onChange?.(name, bytes.slice());
 	}
 
-	async remove(name: SideFileName): Promise<void> {
+	async remove(name: SideFilePath): Promise<void> {
+		this.removed.push(name);
 		this.files.delete(name);
+		this.onChange?.(name, null);
 	}
 
-	async list(prefix: "snapshots/"): Promise<readonly SideFileName[]> {
-		return [...this.files.keys()].filter((k) => k.startsWith(prefix)) as SideFileName[];
+	async list(prefix: SideFilePrefix): Promise<readonly SideFilePath[]> {
+		this.readDirs.add(prefix.slice(0, prefix.indexOf("/")));
+		return [...this.files.keys()].filter((k) => k.startsWith(prefix)) as SideFilePath[];
+	}
+
+	/** The store dirs present (`<deviceId>` of every file). */
+	dirs(): Set<string> {
+		const out = new Set<string>();
+		for (const k of this.files.keys()) out.add(k.slice(0, k.indexOf("/")));
+		return out;
 	}
 }

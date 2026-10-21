@@ -8,6 +8,8 @@ import { markdownHashRef } from "../../core/hash/testkit/hashRef";
 import { SimRelay } from "../../sim/relay";
 import { startTestEngine, until, createDoc, editDoc } from "../runtime/testHarness";
 import { ComposedLog } from "./logPort";
+import { CreatorStatus } from "./creatorStatus";
+import type { DeviceState } from "../../ports/identity";
 import { loadTextHash } from "../reconcile/runner";
 
 const NOT_EMPTY = "ab".repeat(32) as ContentHash;
@@ -37,6 +39,68 @@ test("lostCreateBody: own live create with no rows and nothing pending; not a pe
 		const lb = new ComposedLog(b);
 		lb.nsCaughtUp = true;
 		assert.equal(lb.view().lostCreateBody.size, 0, "a peer waits for the creator");
+	} finally {
+		await a.stop();
+		await b.stop();
+	}
+});
+
+test("lostCreateBody: a peer's body-less create once the server reports its creator retired for the grace", async () => {
+	// DESIGN §i.5 "Abandoned creates": a retired store never sends its initial body; whoever holds the file re-creates it.
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	try {
+		const lost = "lostDoc000000000000000" as DocId;
+		await a.submitNs([{ t: "create", docId: lost, kind: "markdown", path: "lost.md" as VaultPath, contentHash: NOT_EMPTY, size: 9 }]);
+		await until(() => a.isIdle() && a.c.outbox.size === 0, 2_000, "a receipted");
+		await until(() => b.nsView().state.entries.has(lost), 2_000, "b folded");
+		let now = 0;
+		const asked: string[][] = [];
+		let state: DeviceState = "live";
+		const timers: (() => void)[] = [];
+		let abandoned = 0;
+		const creators = new CreatorStatus({
+			status: (ids) => {
+				asked.push([...ids]);
+				return Promise.resolve(new Map(ids.map((id) => [id, state])));
+			},
+			mono: () => now, setTimer: (_ms, fn) => timers.push(fn), clearTimer: () => undefined,
+			graceMs: 30_000, recheckMs: 300_000, onAbandoned: () => abandoned++, onRecheck: () => undefined,
+		});
+		const lb = new ComposedLog(b, () => undefined, creators);
+		lb.nsCaughtUp = true;
+		assert.equal(lb.view().lostCreateBody.size, 0, "live creator: wait for it");
+		await Promise.resolve();
+		assert.deepEqual(asked, [["dev-a"]]);
+		lb.invalidate();
+		lb.view();
+		assert.equal(asked.length, 1, "a live creator is not asked again before the recheck");
+		now += 300_000;
+		state = "retired";
+		lb.invalidate();
+		lb.view();
+		await Promise.resolve();
+		assert.equal(asked.length, 2);
+		lb.invalidate();
+		assert.equal(lb.view().lostCreateBody.size, 0, "retired: not before the grace");
+		now += 30_000;
+		timers.forEach((fn) => fn());
+		assert.equal(abandoned, 1, "the grace's end re-plans");
+		lb.invalidate();
+		assert.deepEqual([...lb.view().lostCreateBody], [lost]);
+		assert.equal(asked.length, 2, "a retired creator is never asked again");
+
+		const unknown = new CreatorStatus({
+			status: (ids) => Promise.resolve(new Map(ids.map((id) => [id, "unknown" as const]))),
+			mono: () => now, setTimer: () => 0, clearTimer: () => undefined, graceMs: 0, recheckMs: 1, onAbandoned: () => undefined, onRecheck: () => undefined,
+		});
+		const lu = new ComposedLog(b, () => undefined, unknown);
+		lu.nsCaughtUp = true;
+		lu.view();
+		await Promise.resolve();
+		lu.invalidate();
+		assert.equal(lu.view().lostCreateBody.size, 0, "an id the server does not know is never abandoned");
 	} finally {
 		await a.stop();
 		await b.stop();

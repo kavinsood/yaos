@@ -24,15 +24,30 @@ test("config dir: config-relative paths, atomic replace, missing -> null", async
 	assert.deepEqual(await cfg.list("nope"), []);
 });
 
-test("side files live under <pluginDir>/state and list snapshots", async () => {
+test("side files live under <pluginDir>/state/<deviceId> and list snapshots", async () => {
 	const fake = new FakeObsidianVault();
 	const side = new ObsidianSideFiles(fake.adapter, ".obsidian/plugins/yaos");
-	assert.equal(await side.read("outbox-a.bin"), null);
-	await side.write("outbox-a.bin", new Uint8Array([1, 2]));
-	await side.write("snapshots/2026-01-01.snap", new Uint8Array([3]));
-	assert.ok(fake.raw.has(".obsidian/plugins/yaos/state/outbox-a.bin"));
-	assert.deepEqual([...((await side.read("outbox-a.bin")) ?? [])], [1, 2]);
-	assert.deepEqual(await side.list("snapshots/"), ["snapshots/2026-01-01.snap"]);
-	await side.remove("outbox-a.bin");
-	assert.equal(await side.read("outbox-a.bin"), null);
+	const D = "dev-A-0000000000000";
+	assert.equal(await side.read(`${D}/outbox-a.bin`), null);
+	await side.write(`${D}/outbox-a.bin`, new Uint8Array([1, 2]));
+	await side.write(`${D}/snapshots/2026-01-01.snap`, new Uint8Array([3]));
+	assert.ok(fake.raw.has(`.obsidian/plugins/yaos/state/${D}/outbox-a.bin`));
+	assert.deepEqual([...((await side.read(`${D}/outbox-a.bin`)) ?? [])], [1, 2]);
+	assert.deepEqual(await side.list(`${D}/snapshots/`), [`${D}/snapshots/2026-01-01.snap`]);
+	await side.remove(`${D}/outbox-a.bin`);
+	assert.equal(await side.read(`${D}/outbox-a.bin`), null);
+});
+
+test("side files refuse a path outside a store dir; removeLegacy drops only the flat identity-less mirrors", async () => {
+	const fake = new FakeObsidianVault();
+	const side = new ObsidianSideFiles(fake.adapter, ".obsidian/plugins/yaos");
+	const bad = ["outbox-a.bin", "x/outbox-a.bin", "../../../../etc/outbox-a.bin", "dev-A-0000000000000/../outbox-a.bin"];
+	for (const p of bad) await assert.rejects(side.write(p as `${string}/outbox-a.bin`, new Uint8Array([1])), /outside a store dir/, p);
+	await fake.adapter.writeBinary(".obsidian/plugins/yaos/state/outbox-a.bin", new Uint8Array([1]).buffer);
+	await fake.adapter.writeBinary(".obsidian/plugins/yaos/state/synced-b.bin", new Uint8Array([1]).buffer);
+	await side.write("dev-B-0000000000000/outbox-a.bin", new Uint8Array([2]));
+	assert.equal(await side.removeLegacy(), 2);
+	assert.ok(!fake.raw.has(".obsidian/plugins/yaos/state/outbox-a.bin"));
+	assert.ok(!fake.raw.has(".obsidian/plugins/yaos/state/synced-b.bin"));
+	assert.ok(fake.raw.has(".obsidian/plugins/yaos/state/dev-B-0000000000000/outbox-a.bin"), "another store's dir is never touched");
 });

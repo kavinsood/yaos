@@ -21,12 +21,14 @@
  * re-checks and the runtime starts in this process; an unpinned device waits for main to pin and restart it.
  */
 
-import type { VaultEpoch } from "../../core/types";
+import type { DeviceId, VaultEpoch } from "../../core/types";
 import { BUDGETS } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
 import { findKnownEpoch, storedKeyringRecords } from "./knownEpoch";
+import { deleteLegacyDbs, deleteStoreDbs, IdentityRefused, needsRepair, registerPending, resolveStoreIdentity, type ResolvedIdentity } from "./storeIdentity";
+import type { IdentityPort, RegisterRefusal, StoreCredentials } from "../../ports/identity";
 import { isStorageError } from "../../ports/storage";
 import type { VaultEvent } from "../../ports/vault";
 import { ProtocolFailure, type ProtocolError } from "../../protocol/errors";
@@ -51,6 +53,9 @@ import type { FrameNoFloor } from "../store/repo";
 import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
 import { VaultRuntime, type RestartReason, type RuntimeObserver } from "./vaultRuntime";
 
+/** A device id's shape (relay-wire §2.4): a lineage entry of any other shape is ignored. */
+const DEVICE_ID_SHAPE = /^[A-Za-z0-9_-]{16,128}$/;
+
 export interface CreateEngineOptions {
 	readonly carrier: "worker" | "inline";
 	/** Engine ports for one init. Throwing (store cannot open) answers init with `storage-lost`. */
@@ -73,8 +78,8 @@ export interface CreateEngineOptions {
 	readonly observe?: RuntimeObserver;
 	/** Local time zone offset in minutes (conflict-copy names); the engine core never reads Date. */
 	readonly tzOffsetMinutes?: () => number;
-	/** Epoch of an existing local DB for this vault/device (offline start); undefined = connect first. */
-	readonly findKnownEpoch?: (config: EngineInitConfig, ports: EnginePorts) => Promise<VaultEpoch | undefined>;
+	/** Test hook (sim): the store identity each start resolved (identity-per-store §4). Never secrets. */
+	readonly onIdentity?: (deviceId: string, source: "store" | "pending") => void;
 	/** What the engine's own scope exposes, for the device check (webEngine.ts: adapters/webDeviceEnv.ts). Absent = not probed. */
 	readonly deviceEnv?: () => DeviceEnv;
 }
@@ -92,6 +97,8 @@ export function createEngine(transport: EngineTransport, options: CreateEngineOp
 const MAX_REPLAY_EVENTS = 20_000;
 /** Cap of the runtime start retry backoff (startRetryMs doubling): a vault that cannot start costs ~12 tries an hour. */
 export const START_RETRY_MAX_MS = 5 * 60_000;
+/** A revoked store's successor registration refused for a passing reason: tried again no sooner than this. */
+const REVOKED_RETRY_MS = 60_000;
 
 export class ComposedEngine {
 	readonly link: HostLink;
@@ -116,6 +123,9 @@ export class ComposedEngine {
 	private partialListing: LocalObservation[] = [];
 	private eventsSince: VaultEvent[] = [];
 	private retryTimer: number | null = null;
+	/** A revoked store's successor registration failed on a passing refusal: retried (onStoreRevoked). */
+	private replaceTimer: number | null = null;
+	private replacing = false;
 	/** Runtime starts failed in a row (the retry backoff). */
 	private startFailures = 0;
 	private lastStartError: string | null = null;
@@ -125,6 +135,14 @@ export class ComposedEngine {
 	private runtimeStartMs: number | null = null;
 	/** The device check running (one at a time); aborted by dispose. */
 	private deviceChecking: AbortController | null = null;
+	/** The store identity the running runtime or reader authenticates as (identity-per-store §4); null before one. */
+	identity: ResolvedIdentity | null = null;
+	/** The last registration refusal (cleared by a start that resolves an identity): status and the retry wait. */
+	private refused: IdentityRefused | null = null;
+	/** Stores this worker ran on before the current one (a store reset), newest first: added to the host's lineage. */
+	private readonly lineage: StoreCredentials[] = [];
+	/** The key reader is waiting for its identity (startReader). */
+	private readerStarting = false;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
 	private migration: { bases: MetaPathBase[]; docDeletes: MetaDocDeletes[]; frameNoFloor: FrameNoFloor } | null = null;
 	private readonly offs: (() => void)[] = [];
@@ -155,6 +173,7 @@ export class ComposedEngine {
 		this.deviceChecking?.abort();
 		for (const off of this.offs) off();
 		if (this.retryTimer !== null && this.ports) this.ports.clock.clearTimer(this.retryTimer);
+		if (this.replaceTimer !== null && this.ports) this.ports.clock.clearTimer(this.replaceTimer);
 		const rt = this.rt;
 		this.rt = null;
 		if (rt) void rt.stop(crash).catch(() => undefined);
@@ -225,7 +244,7 @@ export class ComposedEngine {
 		// SecretStorage lost its value: the records this device's DB kept (e2ee-design §6.1) let the RK re-key it
 		// even after a reset or restore emptied `k` (§11.5, §13.3).
 		if (config.crypto.suite === 1 && config.crypto.records.length === 0) {
-			this.keyring.mirror = await storedKeyringRecords(this.ports.storage, config.vaultId, config.deviceId).catch(() => null);
+			this.keyring.mirror = await storedKeyringRecords(this.ports.storage, config.vaultId, config.installKey).catch(() => null);
 			if (this.keyring.mirror) this.log(`keyring records from the DB: ${this.keyring.mirror.winners.length} winner(s), ${this.keyring.mirror.open.length} open`);
 		}
 		try {
@@ -234,11 +253,10 @@ export class ComposedEngine {
 			// makePorts imported the keys (the suite-1 adapter zero-fills them); no copy stays in the config.
 			if (config.crypto.suite === 1) for (const x of config.crypto.keys) x.k.fill(0);
 		}
-		this.link.seedSideFiles(config.sideState.outboxMirror, config.sideState.syncedMirror);
-		if (this.gate.open) {
-			const find = this.options.findKnownEpoch ?? ((c: EngineInitConfig, p: EnginePorts) => findKnownEpoch(p.storage, c.vaultId, c.deviceId));
-			this.knownEpoch = await find(config, this.ports).catch(() => undefined);
-		}
+		// identity-per-store §13: the identity-less layout's stores go (their unsent edits are on disk).
+		const legacy = await deleteLegacyDbs(this.ports.storage, config.vaultId).catch(() => 0);
+		if (legacy > 0) this.log(`deleted ${legacy} legacy store(s)`);
+		if (this.gate.open) this.knownEpoch = await findKnownEpoch(this.ports.storage, config.vaultId, config.installKey).catch(() => undefined);
 		const storageError = await this.startRuntime(null);
 		if (storageError) {
 			this.config = null;
@@ -262,8 +280,9 @@ export class ComposedEngine {
 			const ports = this.gate!.writerPorts(this.ports!);
 			const startedAt = ports.clock.monotonic();
 			try {
+				const identity = await this.resolveIdentity();
 				const rt = await VaultRuntime.start({
-					engine: this, config, settings: this.settings!, ports, carrier: this.options.carrier,
+					engine: this, config, identity, settings: this.settings!, ports, carrier: this.options.carrier,
 					clientVersion: this.options.clientVersion ?? "dev", vaultEpoch: this.knownEpoch, reason,
 					tuning: this.options.tuning, budgets: this.options.budgets, paused: this.paused,
 					tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log, onDiag: this.options.onDiag, observe: this.options.observe,
@@ -275,6 +294,8 @@ export class ComposedEngine {
 				}
 				this.rt = rt;
 				this.startFailures = 0;
+				// §2.4 point 4: main records the store as its install's lineage `current`.
+				this.link.post({ t: "storeIdentity", deviceId: identity.creds.deviceId, retireKey: identity.creds.retireKey });
 				this.runtimeStartMs = ports.clock.monotonic() - startedAt;
 				this.knownEpoch = rt.vaultEpoch;
 				this.migration = null;
@@ -288,7 +309,7 @@ export class ComposedEngine {
 				this.lastStartError = message;
 				this.log(`runtime start failed: ${message}`);
 				if (isStorageError(e) && reason === null) return message;
-				this.scheduleRetry();
+				if (!this.identityFailed(e)) this.scheduleRetry();
 				this.postStatus();
 				return null;
 			}
@@ -305,13 +326,100 @@ export class ComposedEngine {
 		return { vaultId: this.config!.vaultId, keyring: this.keyring!, diag: (code, fields) => this.log(`${code} ${JSON.stringify(fields)}`) };
 	}
 
-	/** Gate closed: read `k` (keyReader.ts). Never fails init. */
+	/**
+	 * This install's store identity for the next start (storeIdentity.ts), and the relay, blob and side-file
+	 * adapters switched to it. Throws IdentityRefused (registration refused) or a storage error.
+	 */
+	private async resolveIdentity(): Promise<ResolvedIdentity> {
+		const ports = this.ports!;
+		const config = this.config!;
+		const port = ports.identity;
+		if (!port) throw new IdentityRefused("no-grant", null);
+		const id = await resolveStoreIdentity({
+			storage: ports.storage, random: ports.random, hash: ports.hash, identity: port,
+			vaultId: config.vaultId, installKey: config.installKey, log: (l) => this.log(l),
+		});
+		port.use(id.creds.deviceToken);
+		this.link.sideDir = id.creds.deviceId;
+		// The install's earlier stores: every store this worker ran on before (a store reset or loss mints without a
+		// host round trip), then the host's lineage. Never the store itself.
+		const prev = this.identity?.creds;
+		if (prev && prev.deviceId !== id.creds.deviceId && !this.lineage.some((c) => c.deviceId === prev.deviceId)) this.lineage.unshift(prev);
+		const order: DeviceId[] = [];
+		for (const d of [...this.lineage.map((c) => c.deviceId), ...(config.lineage ?? [])]) {
+			if (d !== id.creds.deviceId && DEVICE_ID_SHAPE.test(d) && !order.includes(d as DeviceId)) order.push(d as DeviceId);
+		}
+		const lineage = new Set(order);
+		// identity-per-store §5.2: a store this start creates fences its predecessor, then recovers from its mirrors.
+		const inherit = id.source === "pending" && order.length > 0 ? { dirs: order, fenced: await this.fence(port, order[0]!) } : null;
+		const resolved: ResolvedIdentity = { ...id, lineage, inherit };
+		this.identity = resolved;
+		this.refused = null;
+		this.options.onIdentity?.(id.creds.deviceId, id.source);
+		return resolved;
+	}
+
+	/**
+	 * The successor fence (identity-per-store §5.2 step 1): retire the newest predecessor store `deviceId` by its retire
+	 * key, and any other this engine holds a key for, before this store's first connect. From the server's revoke
+	 * turn on no frame of it can commit (its buffered frames are dropped). Gone already counts as done. True when
+	 * `deviceId` is fenced; false without its key or an answer (the commit check then waits, §5.2 "without the fence").
+	 */
+	private async fence(port: IdentityPort, deviceId: DeviceId): Promise<boolean> {
+		const keys = new Map<string, string>();
+		for (const c of this.lineage) keys.set(c.deviceId, c.retireKey);
+		const p = this.config!.predecessor;
+		if (p && DEVICE_ID_SHAPE.test(p.deviceId) && !keys.has(p.deviceId)) keys.set(p.deviceId, p.retireKey);
+		if (!port.retire) return false;
+		let fenced = false;
+		for (const [id, retireKey] of keys) {
+			const r = await port.retire({ deviceId: id as DeviceId, retireKey });
+			if (id === deviceId) fenced = r.ok;
+			this.log(`predecessor ${id === deviceId ? "fence" : "retire"}: ${r.ok ? (r.retired ? "retired" : "already gone") : r.reason}`);
+		}
+		return fenced;
+	}
+
+	/**
+	 * A start failed on a registration refusal (identity-per-store §3.2): say so once, and either stop (only a re-pair
+	 * helps: status `revoked`) or retry no sooner than the server asked. False: not a refusal.
+	 */
+	private identityFailed(e: unknown): boolean {
+		if (!(e instanceof IdentityRefused)) return false;
+		const first = this.refused?.reason !== e.reason;
+		this.refused = e;
+		if (first) {
+			const n = REFUSAL_NOTICE[e.reason];
+			this.link.post({ t: "notice", level: n.level, code: n.code, message: n.text });
+		}
+		if (!needsRepair(e.reason)) this.scheduleRetry(e.retryAfterMs ?? 0);
+		return true;
+	}
+
+	/** Gate closed: read `k` (keyReader.ts), as this install's store identity (or its pending one). Never fails init. */
 	private startReader(): null {
-		if (this.reader || this.disposed) return null;
+		if (this.reader || this.disposed || this.readerStarting) return null;
+		this.readerStarting = true;
+		void this.resolveIdentity().then((id) => {
+			this.readerStarting = false;
+			if (this.reader || this.disposed || this.gate!.open) return;
+			this.runReader(id);
+		}, (e: unknown) => {
+			this.readerStarting = false;
+			const message = e instanceof Error ? e.message : String(e);
+			this.lastStartError = message;
+			this.log(`key reader start failed: ${message}`);
+			if (!this.identityFailed(e)) this.scheduleRetry();
+			this.postStatus();
+		});
+		return null;
+	}
+
+	private runReader(id: ResolvedIdentity): void {
 		const config = this.config!;
 		const gate = this.gate!;
 		const reader: KeyReader = new KeyReader({
-			ports: gate.readerPorts(this.ports!), vaultId: config.vaultId, deviceId: config.deviceId,
+			ports: gate.readerPorts(this.ports!), vaultId: config.vaultId, deviceId: id.creds.deviceId,
 			suite: gate.suite === 1 ? 1 : null, creating: gate.creating, paused: this.paused, keyring: this.keyring!,
 			reconnectBaseMs: this.options.tuning?.reconnectBaseMs,
 			onChange: () => this.postStatus(),
@@ -319,8 +427,9 @@ export class ComposedEngine {
 			log: this.options.log,
 		});
 		this.reader = reader;
+		this.lastStartError = null;
 		void reader.start().catch((e) => this.log(`key reader start failed: ${e instanceof Error ? e.message : String(e)}`));
-		return null;
+		this.postStatus();
 	}
 
 	/**
@@ -334,18 +443,18 @@ export class ComposedEngine {
 		this.log("gate open: starting the vault runtime");
 		reader.stop();
 		this.reader = null;
-		const find = this.options.findKnownEpoch ?? ((c: EngineInitConfig, p: EnginePorts) => findKnownEpoch(p.storage, c.vaultId, c.deviceId));
-		this.knownEpoch = await find(this.config!, this.ports!).catch(() => undefined);
+		this.knownEpoch = await findKnownEpoch(this.ports!.storage, this.config!.vaultId, this.config!.installKey).catch(() => undefined);
 		await this.startRuntime("retry");
 		this.postStatus();
 		return true;
 	}
 
-	private scheduleRetry(): void {
+	/** `atLeastMs`: the server's Retry-After (a registration refused for the day). */
+	private scheduleRetry(atLeastMs = 0): void {
 		const ports = this.ports;
 		if (!ports || this.disposed || this.retryTimer !== null) return;
 		const base = this.options.startRetryMs ?? 5_000;
-		const delay = Math.min(base * 2 ** Math.min(this.startFailures, 20), Math.max(base, START_RETRY_MAX_MS));
+		const delay = Math.max(atLeastMs, Math.min(base * 2 ** Math.min(this.startFailures, 20), Math.max(base, START_RETRY_MAX_MS)));
 		this.startFailures++;
 		this.retryTimer = ports.clock.setTimer(delay, () => {
 			this.retryTimer = null;
@@ -357,6 +466,8 @@ export class ComposedEngine {
 	/** The network or the app came back while no runtime runs: drop the backoff and retry at once. */
 	private retryStartNow(): void {
 		if (this.retryTimer === null || !this.ports) return;
+		// The server set the wait (Retry-After to 00:00 UTC): coming back online does not end it.
+		if (this.refused?.reason === "registration-limit") return;
 		this.ports.clock.clearTimer(this.retryTimer);
 		this.retryTimer = null;
 		this.startFailures = 0;
@@ -401,11 +512,19 @@ export class ComposedEngine {
 	postStatus(): void {
 		if (this.disposed) return;
 		const deviceClass = this.config?.deviceClass ?? "desktop";
-		const status: StatusSnapshot = this.rt?.status() ?? this.reader?.status(deviceClass, this.options.carrier) ?? idleStatus({
-			deviceClass: this.config?.deviceClass ?? "desktop", transport: this.options.carrier, vaultEpoch: this.vaultEpoch,
-			phase: this.paused ? "paused" : this.lastStartError ? "offline" : "starting", nowMs: this.ports?.clock.now() ?? 0,
-		});
+		const status: StatusSnapshot = this.rt?.status() ?? this.reader?.status(deviceClass, this.options.carrier) ?? this.idle();
 		this.link.post({ t: "status", status });
+	}
+
+	/** No runtime and no reader: starting, offline, or a registration refusal (its notice says which). */
+	private idle(): StatusSnapshot {
+		const nowMs = this.ports?.clock.now() ?? 0;
+		const refused = this.refused;
+		const phase = refused ? REFUSAL_NOTICE[refused.reason].phase : this.paused ? "paused" : this.lastStartError ? "offline" : "starting";
+		const s = idleStatus({ deviceClass: this.config?.deviceClass ?? "desktop", transport: this.options.carrier, vaultEpoch: this.vaultEpoch, phase, nowMs });
+		if (!refused) return s;
+		const n = REFUSAL_NOTICE[refused.reason];
+		return { ...s, notices: [{ code: n.code, level: n.level, atMs: nowMs }] };
 	}
 
 	private recordListing(chunk: readonly LocalObservation[], complete: boolean): void {
@@ -617,6 +736,53 @@ export class ComposedEngine {
 		void this.restart("storage-lost").then(() => undefined, (e) => this.log(`storage restart failed: ${String(e)}`));
 	}
 
+	/**
+	 * The server refused this store (identity-per-store §4, "Store revoked by the server": removed in the console,
+	 * retired). The install's grant registers a successor first; only then is the runtime stopped (its outbox goes to
+	 * its mirror), its store deleted and a new runtime started, which recovers from the old store's dir as from any
+	 * lost store (§5.2; the fence finds it gone). A refusal keeps the store and the phase: a revoked grant needs a
+	 * re-pair (its notice says so); a passing one (network, daily limit) is retried.
+	 */
+	onStoreRevoked(): void {
+		if (this.replacing || this.disposed || !this.rt) return;
+		this.replacing = true;
+		void this.replaceRevoked().then(() => undefined, (e: unknown) => this.log(`successor start failed: ${String(e)}`)).finally(() => {
+			this.replacing = false;
+		});
+	}
+
+	private async replaceRevoked(): Promise<void> {
+		const ports = this.ports;
+		const config = this.config;
+		const port = ports?.identity;
+		if (!ports || !config || !port) return;
+		const old = this.identity?.creds.deviceId ?? null;
+		this.log("store revoked by the server: registering a successor");
+		try {
+			await registerPending({ storage: ports.storage, random: ports.random, hash: ports.hash, identity: port, vaultId: config.vaultId, installKey: config.installKey, log: (l) => this.log(l) });
+		} catch (e) {
+			const refused = e instanceof IdentityRefused ? e : null;
+			this.log(`successor registration failed: ${refused ? refused.reason : String(e)}`);
+			if (refused && this.refused?.reason !== refused.reason) {
+				this.refused = refused;
+				const n = REFUSAL_NOTICE[refused.reason];
+				this.link.post({ t: "notice", level: n.level, code: n.code, message: n.text });
+			}
+			if (refused && needsRepair(refused.reason)) return;
+			this.replaceTimer = ports.clock.setTimer(Math.max(refused?.retryAfterMs ?? 0, REVOKED_RETRY_MS), () => {
+				this.replaceTimer = null;
+				if (this.rt?.status().phase === "revoked") this.onStoreRevoked();
+			});
+			return;
+		}
+		if (this.disposed || this.identity?.creds.deviceId !== old) return;
+		await this.restart("revoked", async () => {
+			const n = await deleteStoreDbs(ports.storage, config.vaultId, config.installKey);
+			this.knownEpoch = undefined;
+			this.log(`revoked store replaced: ${n} store(s) deleted`);
+		});
+	}
+
 	/** Started without a blob store and a later connect found one (sessionLoop probeBlobStore): restart on it. */
 	onBlobStore(store: BlobPort): void {
 		if (!this.ports || this.ports.blob || this.disposed) return;
@@ -636,3 +802,20 @@ export function needsRestart(a: EngineSettings, b: EngineSettings): boolean {
 		|| a.trashMode !== b.trashMode || a.syncSettings !== b.syncSettings || a.snapshots.uploadToBlobStore !== b.snapshots.uploadToBlobStore
 		|| a.excludePatterns.length !== b.excludePatterns.length || a.excludePatterns.some((p, i) => p !== b.excludePatterns[i]);
 }
+
+/**
+ * How a registration refusal reads (identity-per-store §3.2; relay-wire §2.4.1). The codes are the status notices
+ * the host's status bar explains (statusBar.ts identityLine); `phase` is the idle status while no runtime runs.
+ */
+export const REFUSAL_NOTICE: Readonly<Record<RegisterRefusal, { readonly code: string; readonly level: "warn" | "error"; readonly phase: StatusSnapshot["phase"]; readonly text: string }>> = {
+	"network": { code: "registration-unreachable", level: "warn", phase: "offline", text: "YAOS could not reach the server to register this device's local store. Retrying." },
+	"unauthorized": { code: "pairing-unknown", level: "error", phase: "revoked", text: "The server does not know this device's pairing. Pair this device again in settings." },
+	"grant-revoked": { code: "pairing-revoked", level: "error", phase: "revoked", text: "This device's pairing was revoked on the server. Pair this device again in settings." },
+	"grant-required": { code: "pairing-required", level: "error", phase: "revoked", text: "This device was paired by an older YAOS. Pair this device again in settings." },
+	"no-grant": { code: "pairing-required", level: "error", phase: "revoked", text: "This device has no pairing. Pair this device in settings." },
+	"device-exists": { code: "registration-conflict", level: "warn", phase: "offline", text: "The server refused this device's new identity several times. Retrying." },
+	"device-retired": { code: "registration-conflict", level: "warn", phase: "offline", text: "The server refused this device's new identity several times. Retrying." },
+	"device-limit": { code: "device-limit", level: "error", phase: "error", text: "This pairing has 50 devices on the server. Remove old devices of this pairing in the server console; YAOS keeps retrying." },
+	"registration-limit": { code: "registration-limit", level: "warn", phase: "offline", text: "This pairing registered 20 new local stores today, the server's daily limit. Sync starts again after 00:00 UTC." },
+	"rate-limited": { code: "registration-busy", level: "warn", phase: "offline", text: "The server asked YAOS to wait before registering this device's local store. Retrying." },
+};

@@ -143,6 +143,21 @@ export function parseRegisterRequest(body: unknown): RegisterRequest | null {
 }
 
 /** The retire-by-key body; null when malformed (`400 invalid_request`). The key has a device token's format. */
+/** `POST /auth/device/status`: at most this many ids per request. */
+export const DEVICE_STATUS_MAX_IDS = 32;
+
+/** `POST /auth/device/status {deviceIds}`: 1..32 distinct well-formed ids, or null. */
+export function parseDeviceStatusRequest(body: unknown): string[] | null {
+	const { deviceIds } = asRecord(body);
+	if (!Array.isArray(deviceIds) || deviceIds.length === 0 || deviceIds.length > DEVICE_STATUS_MAX_IDS) return null;
+	const out: string[] = [];
+	for (const id of deviceIds) {
+		if (typeof id !== "string" || !REQUEST_ID_PATTERN.test(id)) return null;
+		if (!out.includes(id)) out.push(id);
+	}
+	return out;
+}
+
 export function parseRetireRequest(body: unknown): RetireRequest | null {
 	const { deviceId, retireKey } = asRecord(body);
 	if (typeof deviceId !== "string" || !REQUEST_ID_PATTERN.test(deviceId)

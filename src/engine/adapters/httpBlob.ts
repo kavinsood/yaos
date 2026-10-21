@@ -102,7 +102,8 @@ export interface HttpBlobOptions {
 	readonly baseUrl: string;
 	readonly vaultId: string;
 	/** Device token. Secret: Authorization header only. */
-	readonly credential: string;
+	/** SECRET: the device token, or a getter (the composed engine's store identity, read per call). */
+	readonly credential: string | (() => string);
 	readonly fetch?: typeof fetch;
 	/** The PUT transport (see the header); default globalThis.XMLHttpRequest. Without one every put rejects "unsupported". */
 	readonly xhr?: XhrConstructor;
@@ -299,7 +300,9 @@ export function createHttpBlob(opts: HttpBlobOptions): BlobPort {
 	const doFetch: typeof fetch = opts.fetch ?? ((input, init) => fetch(input, init));
 	const Xhr: XhrConstructor | undefined = opts.xhr ?? (globalThis as { XMLHttpRequest?: typeof XMLHttpRequest }).XMLHttpRequest;
 	const root = `${normalizeBaseUrl(opts.baseUrl)}/vault/${encodeURIComponent(opts.vaultId)}/blobs`;
-	const auth = { Authorization: `Bearer ${opts.credential}` };
+	const cred = opts.credential;
+	// Read per call: the store identity (and so the token) is known only after the store is found or minted.
+	const auth = { get Authorization(): string { return `Bearer ${typeof cred === "function" ? cred() : cred}`; } };
 	const clock = opts.clock ?? createWebClock();
 	const idleMs = opts.idleMs ?? BLOB_TRANSFER_IDLE_MS;
 

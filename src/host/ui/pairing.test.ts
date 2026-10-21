@@ -4,7 +4,7 @@ import {
 	base64Url, buildSetupLink, DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, fetchCapabilities,
 	FENCE_RETRY_DELAYS_MS, generateDeviceId, generateDeviceToken, generateEnrollmentRequestId, normalizeHost,
 	normalizePairingCode, PairingError, parseSetupLink, prepareEnrollment, requestPairingCode, runEnrollment,
-	attemptMatches, pairDevice, retireDeviceEnrollment, RETIRE_FAILED_MESSAGE, scrubSecrets,
+	attemptMatches, generateGrantSecret, GRANT_SECRET_RE, leaveGrant, pairDevice, RETIRE_FAILED_MESSAGE, scrubSecrets,
 	buildRekeyLink, claimServer, decodeKeyParam, encodeKeyParam, generateOperatorKey, normalizeOperatorKey, operatorCreateVault,
 	operatorLogin, operatorLogout, PAIRING_CALL_DEADLINE_MS, pairingCodeVaultId,
 	type EnrollInput, type HttpRequest, type HttpResponse, type LinkKey, type PairingDeps,
@@ -65,9 +65,8 @@ function okEnroll(req: HttpRequest): HttpResponse {
 	return {
 		status: 200,
 		json: {
-			host: "https://sync.example.com", deviceToken: b.deviceToken, vaultId: VAULT, deviceId: b.deviceId,
-			deviceName: b.deviceName ?? "Unnamed", vaultGeneration: "gen-7", originImport: false, principalId: "p1",
-			role: "owner", membershipRevision: 1, deviceCredentialRevision: 1, capabilities: [],
+			host: "https://sync.example.com", vaultId: VAULT, grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: b.grantSecret,
+			grantName: b.grantName ?? "Unnamed", vaultGeneration: "gen-7",
 		},
 	};
 }
@@ -94,6 +93,12 @@ test("generated ids satisfy relay-wire §2.4 formats (real crypto)", () => {
 		assert.match(rid, ENROLLMENT_REQUEST_ID_RE);
 	}
 	assert.notEqual(generateDeviceToken(), generateDeviceToken());
+	for (let i = 0; i < 50; i++) {
+		const g = generateGrantSecret();
+		assert.match(g, GRANT_SECRET_RE);
+		assert.equal(g.length, 43);
+	}
+	assert.notEqual(generateGrantSecret(), generateGrantSecret());
 });
 
 test("normalizeHost", () => {
@@ -115,7 +120,7 @@ test("normalizePairingCode", () => {
 	assert.throws(() => normalizePairingCode(""), PairingError);
 });
 
-test("enroll: 200 posts the §2.4 body without auth and returns the identity", async () => {
+test("enroll: 200 posts the grant body (identity-per-store §3.2) without auth and returns the grant", async () => {
 	const f = fake([okEnroll]);
 	const id = await enroll({ host: "sync.example.com/", pairingCode: ` ${CODE} `, deviceName: "  My   Mac " }, f.deps);
 	assert.equal(f.calls.length, 1);
@@ -125,16 +130,16 @@ test("enroll: 200 posts the §2.4 body without auth and returns the identity", a
 	assert.equal(call.headers?.["Content-Type"], "application/json");
 	assert.equal(call.headers?.Authorization, undefined, "enroll must not send a bearer token");
 	const body = JSON.parse(call.body ?? "") as Record<string, unknown>;
-	assert.deepEqual(Object.keys(body).sort(), ["deviceId", "deviceName", "deviceToken", "enrollmentRequestId", "pairingCode"]);
+	// No device identity: every store of this install mints and registers its own under the grant (§4).
+	assert.deepEqual(Object.keys(body).sort(), ["enrollmentRequestId", "grantName", "grantSecret", "pairingCode"]);
 	assert.equal(body.pairingCode, CODE);
-	assert.equal(body.deviceName, "My Mac");
-	assert.match(String(body.deviceId), DEVICE_ID_RE);
-	assert.match(String(body.deviceToken), DEVICE_TOKEN_RE);
+	assert.equal(body.grantName, "My Mac");
+	assert.match(String(body.grantSecret), GRANT_SECRET_RE);
 	assert.match(String(body.enrollmentRequestId), ENROLLMENT_REQUEST_ID_RE);
-	assert.notEqual(body.deviceId, body.enrollmentRequestId);
+	assert.notEqual(body.grantSecret, body.enrollmentRequestId);
 	assert.deepEqual(id, {
-		host: "https://sync.example.com", vaultId: VAULT, deviceId: body.deviceId, deviceToken: body.deviceToken,
-		deviceName: "My Mac", vaultGeneration: "gen-7",
+		host: "https://sync.example.com", vaultId: VAULT, grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: body.grantSecret,
+		grantName: "My Mac", vaultGeneration: "gen-7",
 	});
 });
 
@@ -142,7 +147,7 @@ test("enroll: empty device name is omitted from the body", async () => {
 	const f = fake([okEnroll]);
 	await enroll({ host: "https://sync.example.com", pairingCode: CODE, deviceName: "   " }, f.deps);
 	const body = JSON.parse(f.calls[0]!.body ?? "") as Record<string, unknown>;
-	assert.equal("deviceName" in body, false);
+	assert.equal("grantName" in body, false);
 });
 
 test("enroll: 202 authorization_fence_pending retries the identical request with backoff", async () => {
@@ -178,18 +183,18 @@ test("enroll: re-running the same attempt reuses the ids (server-side idempotenc
 	assert.equal(attemptMatches(null, input), false);
 	const id = await runEnrollment(attempt, g.deps);
 	assert.equal(g.calls[0]!.body, f.calls[0]!.body);
-	assert.equal(id.deviceToken, attempt.deviceToken);
+	assert.equal(id.grantSecret, attempt.grantSecret, "the same grant secret: the server's enroll is idempotent on it");
 });
 
 test("enroll: network errors retry twice, then fail with a scrubbed message", async () => {
 	const input = { host: "https://sync.example.com", pairingCode: CODE, deviceName: "Mac" };
 	const attempt = prepareEnrollment(input, counterBytes());
-	const leaky = new Error(`socket hang up while sending ${attempt.deviceToken} / ${attempt.pairingCode}`);
+	const leaky = new Error(`socket hang up while sending ${attempt.grantSecret} / ${attempt.pairingCode}`);
 	const f = fake([leaky]);
 	await assert.rejects(runEnrollment(attempt, f.deps), (e: unknown) => {
 		assert.ok(e instanceof PairingError);
 		assert.equal(e.code, "network");
-		assert.equal(e.message.includes(attempt.deviceToken), false);
+		assert.equal(e.message.includes(attempt.grantSecret), false);
 		assert.equal(e.message.includes(attempt.pairingCode), false);
 		assert.ok(e.message.includes("[redacted]"));
 		return true;
@@ -238,8 +243,9 @@ test("enroll: 503 vault_draining is retried", async () => {
 test("enroll: rejects mismatched or incomplete 200 responses", async () => {
 	const bad: ((req: HttpRequest) => HttpResponse)[] = [
 		(req) => ({ ...okEnroll(req), json: { ...(okEnroll(req).json as object), vaultId: "" } }),
-		(req) => ({ ...okEnroll(req), json: { ...(okEnroll(req).json as object), deviceId: "someone-elses-device" } }),
-		(req) => ({ ...okEnroll(req), json: { ...(okEnroll(req).json as object), deviceToken: "x".repeat(43) } }),
+		(req) => ({ ...okEnroll(req), json: { ...(okEnroll(req).json as object), grantId: "x" } }),
+		(req) => ({ ...okEnroll(req), json: { ...(okEnroll(req).json as object), grantId: undefined } }),
+		(req) => ({ ...okEnroll(req), json: { ...(okEnroll(req).json as object), grantSecret: "x".repeat(43) } }),
 		(req) => ({ ...okEnroll(req), json: { ...(okEnroll(req).json as object), host: "https://evil.example.com" } }),
 		() => ({ status: 200, json: null }),
 	];
@@ -304,19 +310,19 @@ test("pairDevice checks capabilities before enrolling", async () => {
 const IDENTITY: PairedIdentity = {
 	host: "https://sync.example.com",
 	vaultId: VAULT,
-	deviceId: "dev_AAAAAAAAAAAAAAAA",
-	deviceToken: "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-	deviceName: "Mac",
+	grantId: "grant_AAAAAAAAAAAAAAAA",
+	grantSecret: "gs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+	grantName: "Mac",
 	vaultGeneration: "gen-7",
 };
 
-test("requestPairingCode sends Bearer + purpose device; the grant is the code and its expiry only (no server-drawn page)", async () => {
+test("requestPairingCode sends the Grant header + purpose device; the grant is the code and its expiry only (no server-drawn page)", async () => {
 	const f = fake([{ status: 200, json: { codeId: "c1", pairingCode: VCODE, expiresAt: 1_700_000_900_000, purpose: "device-link", mobileSetupUrl: `https://sync.example.com/mobile-setup#x` } }]);
 	const grant = await requestPairingCode(IDENTITY, f.deps);
 	const call = f.calls[0]!;
 	assert.equal(call.url, `https://sync.example.com/vault/${VAULT}/auth/pairing-code`);
 	assert.equal(call.method, "POST");
-	assert.equal(call.headers?.Authorization, `Bearer ${IDENTITY.deviceToken}`);
+	assert.equal(call.headers?.Authorization, `Grant ${IDENTITY.grantSecret}`);
 	assert.deepEqual(JSON.parse(call.body ?? ""), { purpose: "device" });
 	// §12.1: the server's mobileSetupUrl is dropped; the plugin draws its own QR with the key.
 	assert.deepEqual(grant, { pairingCode: VCODE, expiresAt: 1_700_000_900_000 });
@@ -340,12 +346,13 @@ test("requestPairingCode: a code that names another vault, or none, is refused (
 });
 
 test("requestPairingCode: error mapping never echoes the token", async () => {
-	for (const [status, code] of [[401, "unauthorized"], [403, "capability_denied"], [404, "unknown_vault"], [409, "vault_destroyed"], [500, "x"]] as const) {
+	for (const [status, code] of [[401, "unauthorized"], [401, "grant_revoked"], [403, "capability_denied"], [404, "unknown_vault"], [409, "vault_destroyed"], [500, "x"]] as const) {
 		const f = fake([{ status, json: { error: code } }]);
 		await assert.rejects(requestPairingCode(IDENTITY, f.deps), (e: unknown) => {
 			assert.ok(e instanceof PairingError);
 			assert.equal(e.status, status);
-			assert.equal(e.message.includes(IDENTITY.deviceToken), false);
+			assert.equal(e.message.includes(IDENTITY.grantSecret), false);
+			if (code === "grant_revoked") assert.match(e.message, /revoked/i);
 			return true;
 		});
 	}
@@ -353,39 +360,39 @@ test("requestPairingCode: error mapping never echoes the token", async () => {
 	await assert.rejects(requestPairingCode(IDENTITY, f.deps), (e: unknown) => e instanceof PairingError && e.code === "code_response_invalid");
 });
 
-test("retireDeviceEnrollment: DELETE auth/device with the old Bearer token; 200 and 401 are done", async () => {
+test("leaveGrant: DELETE auth/grant with the Grant header; 200 and 401 are done", async () => {
 	for (const status of [200, 401]) {
-		const f = fake([{ status, json: status === 200 ? { ok: true, pending: false } : { error: "unauthorized" } }]);
-		await retireDeviceEnrollment(IDENTITY, f.deps);
+		const f = fake([{ status, json: status === 200 ? { ok: true } : { error: "grant_revoked" } }]);
+		await leaveGrant(IDENTITY, f.deps);
 		assert.equal(f.calls.length, 1);
 		const call = f.calls[0]!;
-		assert.equal(call.url, `https://sync.example.com/vault/${VAULT}/auth/device`);
+		assert.equal(call.url, `https://sync.example.com/vault/${VAULT}/auth/grant`);
 		assert.equal(call.method, "DELETE");
-		assert.deepEqual(call.headers, { Authorization: `Bearer ${IDENTITY.deviceToken}` });
+		assert.deepEqual(call.headers, { Authorization: `Grant ${IDENTITY.grantSecret}` });
 		assert.equal(call.body, undefined);
 	}
 });
 
-test("retireDeviceEnrollment: other statuses and network errors give the console hint and never echo the token", async () => {
+test("leaveGrant: other statuses and network errors give the console hint and never echo the token", async () => {
 	const cases: [HttpResponse | Error, string, number | null][] = [
 		[{ status: 500, json: { error: "internal" } }, "internal", 500],
 		[{ status: 202, json: { error: "authorization_fence_pending", pending: true } }, "authorization_fence_pending", 202],
 		[{ status: 404, json: null }, "http_error", 404],
-		[new Error(`connect ECONNREFUSED (Bearer ${IDENTITY.deviceToken})`), "network", null],
+		[new Error(`connect ECONNREFUSED (Grant ${IDENTITY.grantSecret})`), "network", null],
 	];
 	for (const [response, code, status] of cases) {
 		const f = fake([response]);
-		await assert.rejects(retireDeviceEnrollment(IDENTITY, f.deps), (e: unknown) => {
+		await assert.rejects(leaveGrant(IDENTITY, f.deps), (e: unknown) => {
 			assert.ok(e instanceof PairingError);
 			assert.equal(e.message, RETIRE_FAILED_MESSAGE);
 			assert.equal(e.code, code);
 			assert.equal(e.status, status);
-			assert.equal(`${e.message} ${e.code} ${String(e.stack)}`.includes(IDENTITY.deviceToken), false);
+			assert.equal(`${e.message} ${e.code} ${String(e.stack)}`.includes(IDENTITY.grantSecret), false);
 			return true;
 		});
 	}
 	const bad = fake([{ status: 200, json: null }]);
-	await assert.rejects(retireDeviceEnrollment({ ...IDENTITY, host: "http://example.com" }, bad.deps), (e: unknown) => e instanceof PairingError && e.code === "bad_host");
+	await assert.rejects(leaveGrant({ ...IDENTITY, host: "http://example.com" }, bad.deps), (e: unknown) => e instanceof PairingError && e.code === "bad_host");
 	assert.equal(bad.calls.length, 0, "no request to a non-https host");
 });
 
@@ -509,7 +516,7 @@ test("enroll from a link with a key: the /enroll body carries only the code, nev
 	const call = f.calls[0]!;
 	assert.equal(call.url, "https://sync.example.com/enroll");
 	const body = JSON.parse(call.body ?? "{}") as Record<string, unknown>;
-	assert.deepEqual(Object.keys(body).sort(), ["deviceId", "deviceName", "deviceToken", "enrollmentRequestId", "pairingCode"]);
+	assert.deepEqual(Object.keys(body).sort(), ["enrollmentRequestId", "grantName", "grantSecret", "pairingCode"]);
 	assert.equal(body.pairingCode, VCODE);
 	const wire = `${call.url} ${call.body} ${JSON.stringify(call.headers ?? {})}`;
 	for (const leak of [GOLDEN_KEY_PARAM, "key=", "suite", Buffer.from(GOLDEN_K).toString("hex"), Buffer.from(GOLDEN_K).toString("base64")]) assert.ok(!wire.includes(leak), leak);
@@ -677,7 +684,7 @@ test("every pairing and operator call ends at PAIRING_CALL_DEADLINE_MS: a server
 	assert.equal(failed.message, "Could not reach the server: no answer within 15 s.");
 
 	// Retiring the old membership: the console hint; logging out: quietly done.
-	const retire = track(retireDeviceEnrollment(IDENTITY, { request: deps.request, clock: t.clock }));
+	const retire = track(leaveGrant(IDENTITY, { request: deps.request, clock: t.clock }));
 	const logout = track(operatorLogout({ host: OP_HOST, token: SESSION_TOKEN }, { request: deps.request, clock: t.clock }));
 	await turns();
 	t.advance(PAIRING_CALL_DEADLINE_MS);

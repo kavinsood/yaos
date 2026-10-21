@@ -40,6 +40,11 @@
  *                      idle window or a link abort), and the idle window never cut a
  *                      call that kept moving (a slow one)
  *
+ *   identity           one deviceId per store (identity-per-store §1.3, §5.2): no two devices ever ran as the
+ *                      same deviceId (a clone gets its own), and every state dir a device's engines read, listed,
+ *                      wrote or removed is one of its own stores' (a copied or synced folder's foreign dirs are
+ *                      never touched)
+ *
  *   4 fold             the relay's committed ns / cfg / snap rows (collected ones included),
  *                      gated as a reader gates them, fold to the devices' bytes whether
  *                      delivered at once, in seeded random pages, or as a snapshot at a
@@ -76,7 +81,7 @@ import { ABSENT, canvasCanonical, canvasFiles, canvasProblem, docIdOf, engineCan
 import { canonicalJson, formatCanvasText, parseCanvasText, type JsonValue } from "../core/hash/canvasCanonical";
 
 export interface Violation {
-	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness" | "checkpoint" | "canvas" | "fold" | "bounds";
+	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness" | "checkpoint" | "canvas" | "fold" | "bounds" | "identity";
 	readonly detail: string;
 }
 
@@ -237,6 +242,27 @@ export function checkTokens(devs: readonly SimDevice[], ledger: TokenLedger): Vi
 	const clobbered = clobberedTokens(devs);
 	const lost = ledger.live().filter((e) => !present.has(e.token) && !clobbered.has(e.token));
 	return lost.slice(0, 10).map((e) => ({ inv: "tokens" as const, detail: `lost ${e.token} (${e.via} on ${e.dev} at step ${e.step})${lost.length > 10 ? ` (+${lost.length - 10} more)` : ""}` }));
+}
+
+/** The identity invariant (header): distinct deviceIds across devices; state dirs touched only by their store's device. */
+export function checkIdentity(devs: readonly SimDevice[]): Violation[] {
+	const out: Violation[] = [];
+	const owner = new Map<string, string>();
+	for (const d of devs) {
+		for (const id of d.identities) {
+			const other = owner.get(id);
+			if (other !== undefined && other !== d.name) out.push({ inv: "identity", detail: `${d.name} and ${other} both ran as ${id}` });
+			owner.set(id, d.name);
+		}
+	}
+	for (const d of devs) {
+		const own = new Set<string>(d.identities);
+		const side = d.sideFiles;
+		for (const [what, dirs] of [["read", side.readDirs], ["wrote", side.writtenDirs], ["removed", new Set(side.removed.map((p) => p.slice(0, p.indexOf("/"))))]] as const) {
+			for (const dir of dirs) if (!own.has(dir)) out.push({ inv: "identity", detail: `${d.name} ${what} state/${dir}/, not a store of its own (${[...own].join(",")})` });
+		}
+	}
+	return out.slice(0, 10);
 }
 
 export function checkNothingDestroyed(devs: readonly SimDevice[], ledger: TokenLedger): Violation[] {
@@ -462,7 +488,7 @@ export function checkCanvas(devs: readonly SimDevice[], oracle: CanvasOracle): V
 
 	// records
 	for (const r of oracle.records.values()) {
-		if (r.deleted) continue;
+		if (r.deleted || oracle.copiedAway.has(r.key)) continue;
 		if (r.key.startsWith("e:") && [...r.endpoints].some(deletedNode)) continue;
 		if (!holders.has(r.key)) bad(`lost ${r.key} (created on ${r.created.dev} at step ${r.created.step} in ${r.created.path})`);
 	}

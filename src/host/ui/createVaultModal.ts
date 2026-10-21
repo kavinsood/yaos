@@ -30,7 +30,7 @@ import { errorMessage } from "./format";
 import { plainInput, StatusLine } from "./modalParts";
 import { askNewRecoveryKey } from "./keyModals";
 import { copyText, obsidianRequest } from "./obsidianEnv";
-import { generateOperatorKey, MAX_VAULT_NAME_CHARS, retireDeviceEnrollment, type RequestFn } from "./pairing";
+import { generateOperatorKey, MAX_VAULT_NAME_CHARS, leaveGrant, type RequestFn } from "./pairing";
 
 export interface CreateVaultModalOptions {
 	/** Open at the check step for the vault this device was creating (crash recovery, §15.1). */
@@ -200,7 +200,7 @@ export class CreateVaultModal extends Modal {
 			);
 			this.operatorKey = "";
 			if (result.replaced) {
-				retireDeviceEnrollment(result.replaced, { request: this.request }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
+				leaveGrant(result.replaced, { request: this.request }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
 			}
 			if (this.open_) void this.check(result.vaultId);
 			else new Notice("YAOS: the new vault exists. Open YAOS settings and choose \"Finish creating this vault\".", 10000);

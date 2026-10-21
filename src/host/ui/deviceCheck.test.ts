@@ -28,16 +28,18 @@ function report(over: Partial<DeviceCheckReport> = {}): DeviceCheckReport {
 }
 
 test("the saved report is redacted JSON: no device token from the identity, any secret-looking key redacted at any depth", () => {
-	const host = new FakeUiHost({ identity: { ...identityFor(testVaultId("v")), deviceToken: TOKEN } });
+	const host = new FakeUiHost({ identity: { ...identityFor(testVaultId("v")), grantSecret: `${TOKEN}abcde` } });
 	const leaky = report({ steps: [{ id: "x", name: "X", status: "pass", ms: 1, detail: "d", error: null, data: { deviceToken: TOKEN, relayCredential: TOKEN, ticket: "t1", rttMs: 12 } }] });
 	const text = formatDeviceCheck(leaky, diagnosticsSettings(host, false));
 	assert.ok(!text.includes(TOKEN), "no token");
+	assert.ok(!text.includes(`${TOKEN}abcde`), "no pairing secret");
 	assert.ok(!text.includes("t1"), "no ticket");
 	const parsed = JSON.parse(text) as { format: string; report: DeviceCheckReport; settings: Record<string, unknown> };
 	assert.equal(parsed.format, DEVICE_CHECK_FORMAT);
 	assert.deepEqual(parsed.report.steps[0]!.data, { deviceToken: "[redacted]", relayCredential: "[redacted]", rttMs: 12, ticket: "[redacted]" });
 	assert.equal(parsed.settings.vaultId, testVaultId("v"));
 	assert.equal(parsed.settings.deviceToken, undefined);
+	assert.equal(parsed.settings.grantSecret, undefined);
 });
 
 test("runDeviceCheck asks the host's engine for the mode and names the file by mode and time", async () => {
@@ -48,7 +50,7 @@ test("runDeviceCheck asks the host's engine for the mode and names the file by m
 	const large = await runDeviceCheck(host, "large");
 	assert.equal(large.fileName, "yaos-large-attachment-check-2026-10-08T12-00-00-000Z.json");
 	assert.deepEqual(host.calls, ["deviceCheck:quick", "deviceCheck:large"]);
-	assert.ok(!large.text.includes(identityFor(testVaultId("v")).deviceToken));
+	assert.ok(!large.text.includes(identityFor(testVaultId("v")).grantSecret));
 	host.deviceCheckHandler = async () => { throw new Error("YAOS is not running."); };
 	await assert.rejects(runDeviceCheck(host, "quick"), /YAOS is not running/);
 	assert.equal(deviceCheckFileName(Number.NaN, "quick"), "yaos-device-check-1970-01-01T00-00-00-000Z.json");

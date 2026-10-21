@@ -154,6 +154,7 @@ working; phase 2 switches it to grants.
 | `POST /enroll {pairingCode, enrollmentRequestId, grantSecret, grantName}` | pairing code | Pairs an install: a grant, no device yet |
 | `POST /vault/:id/auth/device {deviceId, deviceToken, retireKeyHash}` | `Grant <secret>` or a live store's bearer | Registers a store (a new device id) |
 | `POST /vault/:id/auth/device/retire {deviceId, retireKey}` | retire key | Retires one store (the successor's fence) |
+| `POST /vault/:id/auth/device/status {deviceIds}` | device token | live / retired / unknown for up to 32 deviceIds (abandoned creates) |
 | `DELETE /vault/:id/auth/device` | bearer | The store retires itself |
 | `DELETE /vault/:id/auth/grant` | `Grant <secret>` | Leaves: revokes the grant and its stores |
 | `POST /vault/:id/auth/pairing-code` | bearer or `Grant <secret>` | A device pairing code |

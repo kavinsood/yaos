@@ -36,8 +36,11 @@ export function snapshot(phase: EnginePhase, e2ee: Partial<E2eeStatus> = {}, ove
 	};
 }
 
+/** SECRET-shaped: the pairing grant secret of identityFor (tests check it never reaches a report). */
+export const GRANT_SECRET_FOR_TEST = "gs_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefgh";
+
 export function identityFor(vaultId: string, host = "https://sync.example.com"): PairedIdentity {
-	return { host, vaultId, deviceId: "dev_ABCDEFGHIJKLMNOP", deviceToken: "tok_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", deviceName: "Mac", vaultGeneration: null };
+	return { host, vaultId, grantId: "grant_ABCDEFGHIJKLM", grantSecret: GRANT_SECRET_FOR_TEST, grantName: "Mac", vaultGeneration: null };
 }
 
 export type CommandHandler = (command: UserCommand, host: FakeUiHost) => Promise<EngineResultValue> | EngineResultValue;
@@ -74,6 +77,10 @@ export class FakeUiHost implements YaosUiHost {
 		this.current = pinAcross(prev, raw, same, raw.identity?.vaultId ?? null);
 		this.emit();
 	}
+
+	/** The store's device identity as main knows it (the install record's lineage); a test sets it. */
+	storeDeviceId: string | null = null;
+	deviceId(): string | null { return this.storeDeviceId; }
 
 	status(): StatusSnapshot | null { return this.snap; }
 	runState(): EngineRunState { return this.run; }

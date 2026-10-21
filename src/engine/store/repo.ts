@@ -19,8 +19,8 @@ import { CursorTracker } from "../sync/cursor";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
-	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaDocDeletes, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type OutboxRecord, type OutboxState, type QuarantineRecord,
-	type SnapshotRecord, type StreamRecord, type TailRecord, type YaosSchema,
+	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaDocDeletes, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type MetaInherit, type OutboxRecord, type OutboxState, type QuarantineRecord,
+	type SnapshotRecord, type StreamRecord, type SyncedRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
 export type Mut<T> = { -readonly [K in keyof T]: T[K] };
@@ -45,6 +45,11 @@ export interface RepoIdentity {
 	readonly vaultEpoch: VaultEpoch;
 	readonly deviceId: DeviceId;
 	readonly clientVersion: string;
+	/** The install key the DB is named by (identity-per-store §2.4); absent = the deviceId (engine tests). */
+	readonly storeKey?: string;
+	/** SECRET: the device token and retire key a fresh DB records in meta.identity (§2.4). */
+	readonly deviceToken?: string;
+	readonly retireKey?: string;
 }
 
 export type OpenOutcome =
@@ -206,9 +211,11 @@ export class Repo {
 		opts: {
 			recoveredFromMirror?: boolean; frameNoFloor?: FrameNoFloor | null;
 			pathBases?: readonly MetaPathBase[] | null; docDeletes?: readonly MetaDocDeletes[] | null;
+			/** A new store's predecessor recovery (MetaIdentity.inherit): recorded only when the DB is created. */
+			inherit?: MetaInherit | null;
 		} = {},
 	): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
-		const db = await storage.open<YS>(dbName(id.vaultId, id.vaultEpoch, id.deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
+		const db = await storage.open<YS>(dbName(id.vaultId, id.vaultEpoch, id.storeKey ?? id.deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
 		const res = await db.tx([STORE.meta], "readwrite", async (tx) => {
 			const ident = await tx.get(STORE.meta, "identity") as MetaIdentity | undefined;
 			if (ident) {
@@ -223,8 +230,12 @@ export class Repo {
 				return { outcome: { t: "existing", identity: ident } as OpenOutcome, ident, cursor, next: order.next };
 			}
 			const fresh: MetaIdentity = {
-				key: "identity", vaultId: id.vaultId, vaultEpoch: id.vaultEpoch, deviceId: id.deviceId, schemaVersion: DB_SCHEMA_VERSION,
+				key: "identity", vaultId: id.vaultId, vaultEpoch: id.vaultEpoch, deviceId: id.deviceId,
+				...(id.deviceToken !== undefined ? { deviceToken: id.deviceToken } : {}),
+				...(id.retireKey !== undefined ? { retireKey: id.retireKey } : {}),
+				schemaVersion: DB_SCHEMA_VERSION,
 				clientVersion: id.clientVersion, createdAtMs: nowMs, recoveredFromMirror: opts.recoveredFromMirror ?? false,
+				...(opts.inherit && opts.inherit.dirs.length > 0 ? { inherit: opts.inherit } : {}),
 			};
 			const cursor: MetaCursor = { key: "cursor", vaultSeq: 0, headSeqSeen: 0 };
 			tx.put(STORE.meta, fresh);
@@ -782,29 +793,53 @@ export class Repo {
 	 */
 	tImportOutbox(records: readonly OutboxRecord[]): Promise<void> {
 		return this.serial("tImportOutbox", async () => {
-			const touched = new Map<StreamName, StreamRecord>();
-			const next = await this.db.tx([STORE.outbox, STORE.meta, STORE.streams], "readwrite", async (tx) => {
-				let max = 0;
-				for (const r of records) {
-					tx.put(STORE.outbox, r);
-					max = Math.max(max, r.order);
-					const cls = streamClass(r.stream);
-					if (cls !== "body" && cls !== "canvas") continue;
-					const st = touched.get(r.stream) ?? (await tx.get(STORE.streams, r.stream)) ?? newStreamRecord(r.stream);
-					if (r.order <= st.bodyVersion.localOrder) continue;
-					touched.set(r.stream, { ...st, bodyVersion: { remoteSeq: st.bodyVersion.remoteSeq, localOrder: r.order } });
-				}
-				for (const st of touched.values()) tx.put(STORE.streams, st);
-				const meta = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
-				const next = Math.max(meta.next, max + 1);
-				tx.put(STORE.meta, { key: "outboxOrder", next });
-				const ident = await tx.get(STORE.meta, "identity") as MetaIdentity | undefined;
-				if (ident) tx.put(STORE.meta, { ...ident, recoveredFromMirror: true });
-				return next;
-			});
-			this.outboxNext = next;
-			for (const st of touched.values()) this.cache.set(st.stream, st);
+			await this.importTx(records, null, false);
 		});
+	}
+
+	/**
+	 * Predecessor recovery (identity-per-store §5.2 steps 2, 4, 5) in one transaction: the re-issued outbox records (as
+	 * tImportOutbox), the predecessor's synced records into an empty synced store, and MetaIdentity.inherit cleared, so
+	 * a crash before it commits runs the whole import again and one after it never does. Returns the synced records
+	 * stored (0 when the store had some).
+	 */
+	tInherit(records: readonly OutboxRecord[], synced: readonly SyncedRecord[]): Promise<number> {
+		return this.serial("tInherit", () => this.importTx(records, synced, true));
+	}
+
+	private async importTx(records: readonly OutboxRecord[], synced: readonly SyncedRecord[] | null, inherit: boolean): Promise<number> {
+		const touched = new Map<StreamName, StreamRecord>();
+		const stores = synced ? [STORE.outbox, STORE.meta, STORE.streams, STORE.synced] as const : [STORE.outbox, STORE.meta, STORE.streams] as const;
+		const out = await this.db.tx([...stores], "readwrite", async (tx) => {
+			let max = 0;
+			for (const r of records) {
+				tx.put(STORE.outbox, r);
+				max = Math.max(max, r.order);
+				const cls = streamClass(r.stream);
+				if (cls !== "body" && cls !== "canvas") continue;
+				const st = touched.get(r.stream) ?? (await tx.get(STORE.streams, r.stream)) ?? newStreamRecord(r.stream);
+				if (r.order <= st.bodyVersion.localOrder) continue;
+				touched.set(r.stream, { ...st, bodyVersion: { remoteSeq: st.bodyVersion.remoteSeq, localOrder: r.order } });
+			}
+			for (const st of touched.values()) tx.put(STORE.streams, st);
+			const meta = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
+			const next = Math.max(meta.next, max + 1);
+			tx.put(STORE.meta, { key: "outboxOrder", next });
+			let syncedN = 0;
+			if (synced && synced.length > 0 && (await tx.getAll(STORE.synced)).length === 0) {
+				for (const r of synced) tx.put(STORE.synced, r);
+				syncedN = synced.length;
+			}
+			const ident = await tx.get(STORE.meta, "identity") as MetaIdentity | undefined;
+			if (ident) {
+				const recovered = ident.recoveredFromMirror || records.length > 0 || syncedN > 0;
+				tx.put(STORE.meta, { ...ident, recoveredFromMirror: recovered, ...(inherit ? { inherit: null } : {}) });
+			}
+			return { next, syncedN };
+		});
+		this.outboxNext = out.next;
+		for (const st of touched.values()) this.cache.set(st.stream, st);
+		return out.syncedN;
 	}
 
 	/**

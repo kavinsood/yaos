@@ -64,9 +64,6 @@ export function transferablesOf(message: MainToEngine | EngineToMain): ArrayBuff
 	const seen = new Set<ArrayBuffer>();
 	switch (message.t) {
 		case "init": {
-			const s = message.config.sideState;
-			s.outboxMirror.forEach((b, i) => b && add(out, seen, b, `init.sideState.outboxMirror[${i}]`));
-			s.syncedMirror.forEach((b, i) => b && add(out, seen, b, `init.sideState.syncedMirror[${i}]`));
 			const c = message.config.crypto;
 			if (c.suite === 1) {
 				c.keys.forEach((key, i) => add(out, seen, key.k, `init.crypto.keys[${i}].k`));

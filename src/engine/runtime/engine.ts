@@ -36,6 +36,7 @@ import { DocRuntime } from "./docRuntime";
 import { LiveIngest } from "./liveIngest";
 import { Maintenance } from "./maintenance";
 import { MirrorWriter, recoverFromMirror } from "./mirrorIo";
+import { inheritFromLineage } from "./inherit";
 import { Resealer } from "./reseal";
 import { resolveSkipDefer, type EngineOptions } from "./options";
 import { Subscriptions } from "./subscriptions";
@@ -46,6 +47,16 @@ import type { OwnOutcome, QrResult } from "../keyring/keyring";
 export class EngineStartError extends Error {
 	constructor(readonly reason: string) {
 		super(`engine start failed: ${reason}`);
+	}
+}
+
+/**
+ * The store's DB did not match its identity (another schema, vault or device) and was deleted: a new DB is a new
+ * store, so the next start mints a new identity (identity-per-store §1.3, §4 "Repo.open mismatch").
+ */
+export class StoreResetError extends EngineStartError {
+	constructor() {
+		super("store-reset");
 	}
 }
 
@@ -79,13 +90,21 @@ export class LogEngine {
 	private static async boot(opts: EngineOptions, epoch: VaultEpoch, first: RelaySession | null): Promise<LogEngine> {
 		const c = new EngineCtx(opts);
 		const { storage } = opts.ports;
-		const ident = { vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion };
-		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null, pathBases: opts.pathBases ?? null, docDeletes: opts.docDeletes ?? null };
+		const store = opts.store;
+		const ident = {
+			vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion,
+			...(store ? { storeKey: store.installKey, deviceToken: store.deviceToken, retireKey: store.retireKey } : {}),
+		};
+		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null, pathBases: opts.pathBases ?? null, docDeletes: opts.docDeletes ?? null, inherit: opts.inherit ?? null };
 		const openedAt = c.mono();
+		// A pending identity is consumed before its store exists, so it can serve no second store (storeIdentity.ts).
+		if (store?.beforeCreate) await store.beforeCreate();
 		let o = await Repo.open(storage, ident, c.now(), openOpts);
 		if (!o.repo) {
 			o.db.close();
 			await storage.deleteDatabase(o.db.name);
+			// Identity-per-store: the deleted DB was a store; the next one gets a new identity (the caller re-mints).
+			if (store) throw new StoreResetError();
 			o = await Repo.open(storage, ident, c.now(), openOpts);
 			if (!o.repo) throw new EngineStartError("db-identity");
 		}
@@ -136,7 +155,21 @@ export class LogEngine {
 		c.subs = new Subscriptions(c, resolveSkipDefer(c.deviceClass, c.tuning));
 		c.mirror = new MirrorWriter(c, opts.sideFiles ?? null);
 		const eng = new LogEngine(c);
-		if (o.outcome.t === "fresh" && opts.sideFiles) {
+		// identity-per-store §5.2: a new store of an install with a lineage adopts its predecessor's mirrors. Recorded at
+		// the store's creation and cleared by the import's own transaction, so a crash in between runs it again.
+		const inherit = repo.identity.inherit ?? null;
+		let inherited = 0;
+		if (inherit && opts.lineageSideFiles) {
+			const r = await inheritFromLineage(c, inherit, opts.lineageSideFiles);
+			inherited = r.frames;
+			if (r.frames > 0 || r.synced > 0) {
+				c.setPhase("recovering");
+				c.notice("recovered-from-mirror");
+			}
+			// Without the fence a frame of the dead store may still be in the relay's buffer: the commit check waits.
+			if (!inherit.fenced && r.frames > 0) c.inheritCheckAtMono = c.mono() + c.tuning.inheritUnfencedWaitMs;
+		} else if (o.outcome.t === "fresh" && opts.sideFiles && !inherit) {
+			// A store under the same deviceId (engine tests without a store identity): its own mirror (DESIGN §i.5).
 			const n = await recoverFromMirror(c, opts.sideFiles);
 			if (n > 0) {
 				c.setPhase("recovering");
@@ -154,6 +187,11 @@ export class LogEngine {
 			}
 		}
 		c.mirror.scheduleIfBehind(c.outbox.all());
+		// The inherited frames are on this store's mirror before any of them is sent (inherit.ts header step 5).
+		if (inherited > 0) {
+			c.mirror.schedule();
+			if (!(await c.mirror.flushed())) c.diag("inherit-mirror-unwritten", { frames: inherited });
+		}
 		await c.refold(true);
 		eng.maint.start();
 		if (first) void c.sess.onSession(first);

@@ -587,8 +587,50 @@ the same exposure. The relay cannot tell that from a reconnect overlap. This is 
    - IDB loss falls back to "without mirrors" onboarding.
    - Lands with the clone engine tests and the sim `clone` fault green. The floor and `renumberBlind` are still present
      but inert.
+   - **Landed** on `identity/phase2-client`. Deviations:
+     - The minted identity waits in a pending DB `yaos3-pending:<vaultId>:<installKey>` until its store is created
+       (the store's name needs the epoch, which only a connect as that identity learns); LogEngine drops it right
+       before creating the store, so it serves at most one store. A restart before then reuses it.
+     - Lineage-aware `lostCreateBody` (a phase-3 item) landed here: without it a doc created by an earlier store of the
+       install, whose body was lost with that store, stayed stuck (fault-heavy sim seed 17, `idbWipe` without mirrors).
+     - The other phase-3 recovery (fence, mirror import) is not built: every IDB loss is "without mirrors". The sim
+       oracle counts every `idbWipe` / `idbLost` as one (the composed mirror-recovery tests are `todo` with phase-2
+       variants asserting the conflict copy).
+     - Not built: epoch-change minting (phase 4: an epoch migration keeps the store identity), the revoked store's
+       successor (built in phase 3), the §8 per-install data.json split (phase 4). A re-pair to the same vault keeps the store.
+     - Found: the "abandoned creator" gap (BACKLOG CLONED-ID).
 3. **Predecessor recovery.** Fence, inherited records, commit check, re-issue, synced mirror import, snapshot move,
    lineage-aware `lostCreateBody`. Seed 222's plan and the `idbWipe` sim with mirrors green.
+   - **Landed** on `identity/phase3-recovery` (DESIGN §i.5 "Predecessor recovery", "Store revoked by the server",
+     "Abandoned creates"). The sim oracle is mirror-aware again (only `idbWipe` without mirrors loses the store's
+     unsent ops); the two composed mirror-recovery tests run again, and the phase-2 variants now drop the mirrors too.
+     As built:
+     - The fence runs in the composed engine's identity resolution, right after the pending identity registers and
+       before the store's first connect, for every predecessor it holds a key for (the worker's earlier stores and the
+       install record's `current`, passed as `EngineInitConfig.predecessor`). Its outcome is recorded with the
+       inheritance marker `meta.identity.inherit {dirs, fenced}`, written when the store is created; the import
+       (`Repo.tInherit`) clears it in the same transaction, so a crash in between re-runs it.
+     - Source: the newest lineage dir with a valid outbox mirror (not only the newest predecessor): a store that died
+       before its first mirror leaves its predecessor's dir in place, and a store mirrors what it inherited before it
+       sends any of it. The outbox mirror format is 2: re-issued ns / cfg frames carry their `origins`, so a chain of
+       losses still finds the identity that may have committed.
+     - Commit check: `FoldRuntime.committedTest` (ring, replay window, tail above the fold) per origin, at every session
+       start while inherited frames wait (`logApi.checkInherited`), before `renumberBlindFrames`. Without the fence it
+       waits `inheritUnfencedWaitMs` (10 s) after the start.
+     - Snap-index and keyring frames are not inherited (the snapshot job uploads again; the keyring flow restarts from
+       `k`). Local snapshots are copied, and the predecessor's copies removed with its mirrors once this store's
+       outbox and synced mirrors are written (`VaultRuntime.dropLineageDirs`): the side-file port deletes files, never
+       a dir. Retention and "already uploaded" count the lineage's uploads (`SnapIndexPort.lineage`).
+     - A revoked store (phase `revoked`) registers a successor first and only then stops, deletes its store and
+       restarts; a refused registration keeps the store (`ProtocolEngine.onStoreRevoked`).
+     - Abandoned creator (BACKLOG): a new server route `POST /vault/:id/auth/device/status {deviceIds}` (bearer, ≤ 32
+       ids: `live` / `retired` / `unknown`). A body-less doc whose creator reads retired for 30 s is `lostCreateBody`
+       on every device. `lostCreateBody` now deletes the empty doc in every case and a holder re-creates its file as a
+       new doc (it no longer pushes the file into the empty doc: several holders would each insert the text). The sim
+       clone fault no longer skips such windows; it removes the abandoned store's registration 60 s after the clone
+       (or at heal), as the console's "Remove device" or phase 5's inactivity retirement would.
+     - Seed 222's plan is green, and also with the fence and the wall-clock floor both disabled (a new store has a new
+       deviceId and so a fresh replay window), so it is not committed as a regression.
 4. **Removal.** Delete the wall floor, the skip, `renumberBlind`, `frameNoFloor` and the earlier-store branches.
    Epoch migration mints and self-retires. Soak. Update DESIGN and e2ee docs. Close CLONED-ID and FRAMENO-IDB. Add the
    optional clone notice and the §8 per-install split of data.json fields.

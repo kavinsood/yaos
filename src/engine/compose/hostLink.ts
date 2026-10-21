@@ -7,7 +7,7 @@
  */
 
 import type { HashPort } from "../../ports/crypto";
-import type { ConfigDirPort, SideFileName, SideFilePort } from "../../ports/vault";
+import type { ConfigDirPort, SideFileName, SideFilePath, SideFilePort } from "../../ports/vault";
 import type { ProtocolError } from "../../protocol/errors";
 import { LANE, type DiskOp, type DiskReadRequest, type DiskReadResult, type EngineToMain, type HostIoOp, type HostIoResult, type Lane, type MainResultValue } from "../../protocol/messages";
 import type { EngineTransport } from "../../protocol/transport";
@@ -33,8 +33,11 @@ export class HostLink {
 	private closed = false;
 	/** The last status snapshot posted (JSON), to drop identical re-posts. */
 	private lastStatus: string | null = null;
-	/** Mirror bytes the host read before init (DESIGN §e.4), served once instead of a round trip. */
-	private readonly seeded = new Map<SideFileName, Uint8Array | null>();
+	/**
+	 * The store dir every side-file call addresses, `state/<deviceId>/` (identity-per-store §5.2): set by the composed
+	 * engine once it knows the store's identity, before a runtime starts. null: no store yet (calls fail).
+	 */
+	sideDir: string | null = null;
 
 	/** `hash`: the engine ports' HashPort (null before init: no disk op runs then). */
 	constructor(private readonly transport: EngineTransport, private readonly hash: () => HashPort | null) {}
@@ -95,10 +98,11 @@ export class HostLink {
 		for (const p of all) p.reject(new HostRequestFailed({ code: "aborted", message: "engine closed", retryable: true }));
 	}
 
-	seedSideFiles(outbox: readonly (Uint8Array | null)[], synced: readonly (Uint8Array | null)[]): void {
-		const names: SideFileName[] = ["outbox-a.bin", "outbox-b.bin"];
-		names.forEach((n, i) => this.seeded.set(n, outbox[i] ?? null));
-		(["synced-a.bin", "synced-b.bin"] as SideFileName[]).forEach((n, i) => this.seeded.set(n, synced[i] ?? null));
+	/** The current store's dir, or a not-ready failure (no store identity yet). */
+	private currentDir(): string {
+		const dir = this.sideDir;
+		if (dir === null) throw new HostRequestFailed({ code: "not-ready", message: "no store identity yet", retryable: true });
+		return dir;
 	}
 
 	private async hostIo(op: HostIoOp): Promise<HostIoResult> {
@@ -129,32 +133,45 @@ export class HostLink {
 		},
 	};
 
-	readonly sideFiles: SideFilePort = {
-		read: async (name) => {
-			if (this.seeded.has(name)) {
-				const b = this.seeded.get(name) ?? null;
-				this.seeded.delete(name);
-				return b;
-			}
-			const r = await this.request({ t: "sideFileRead", name });
-			if (r.t !== "sideFile") throw new Error(`unexpected sideFileRead answer ${r.t}`);
-			return r.bytes;
-		},
-		write: async (name, bytes) => {
-			this.seeded.delete(name);
-			// The message transfers its bytes: hand over a private copy.
-			const r = await this.request({ t: "sideFileWrite", name, bytes: bytes.slice() });
-			if (r.t !== "sideFileWritten") throw new Error(`unexpected sideFileWrite answer ${r.t}`);
-		},
-		remove: async (name) => {
-			this.seeded.delete(name);
-			await this.hostIo({ t: "sideFileRemove", name });
-		},
-		list: async (prefix) => {
-			const r = await this.hostIo({ t: "sideFileList", prefix });
-			return r.t === "sideFiles" ? r.names : [];
-		},
-	};
+	/** The side files of one store dir, `state/<dir>/` (`dir` read per call). */
+	private sideFilesIn(dirOf: () => string): SideFilePort {
+		return {
+			read: async (name) => {
+				const r = await this.request({ t: "sideFileRead", name: `${dirOf()}/${name}` as SideFilePath });
+				if (r.t !== "sideFile") throw new Error(`unexpected sideFileRead answer ${r.t}`);
+				return r.bytes;
+			},
+			write: async (name, bytes) => {
+				// The message transfers its bytes: hand over a private copy.
+				const r = await this.request({ t: "sideFileWrite", name: `${dirOf()}/${name}` as SideFilePath, bytes: bytes.slice() });
+				if (r.t !== "sideFileWritten") throw new Error(`unexpected sideFileWrite answer ${r.t}`);
+			},
+			remove: async (name) => {
+				await this.hostIo({ t: "sideFileRemove", name: `${dirOf()}/${name}` as SideFilePath });
+			},
+			list: async (prefix) => {
+				const dir = dirOf();
+				const r = await this.hostIo({ t: "sideFileList", prefix: `${dir}/${prefix}` });
+				if (r.t !== "sideFiles") return [];
+				// Back to the store's own names (the host lists only that dir).
+				const out: SideFileName[] = [];
+				for (const p of r.names) if (p.startsWith(`${dir}/`)) out.push(p.slice(dir.length + 1) as SideFileName);
+				return out;
+			},
+		};
+	}
+
+	/** The current store's side files (identity-per-store §5.2: a store reads and writes its own dir). */
+	readonly sideFiles: SideFilePort = this.sideFilesIn(() => this.currentDir());
+
+	/**
+	 * A lineage predecessor's dir, `state/<deviceId>/` (identity-per-store §5.2: read during recovery, removed once this
+	 * store's mirrors replace it). The engine names only this install's earlier stores; never a foreign dir.
+	 */
+	sideFilesOf(deviceId: string): SideFilePort {
+		if (!/^[A-Za-z0-9_-]{16,128}$/.test(deviceId)) throw new Error("not a store dir");
+		return this.sideFilesIn(() => deviceId);
+	}
 
 	readonly configDir: ConfigDirPort = {
 		list: async (dir) => {

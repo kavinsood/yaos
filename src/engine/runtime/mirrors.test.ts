@@ -5,7 +5,7 @@ import type { ClientFrameId, ContentHash, DeviceId, DocId, DocKind, StreamName, 
 import { OUTBOX_MIRROR_MAX_BYTES } from "../../core/limits";
 import type { HashPort } from "../../ports/crypto";
 import {
-	MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_MAGIC, SYNCED_MIRROR_MAGIC,
+	MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_MAGIC, SYNCED_MIRROR_MAGIC,
 	type OutboxMirror, type OutboxMirrorFrame, type OutboxRecord, type OutboxState, type SyncedMirror, type SyncedMirrorEntry,
 } from "../store/schema";
 import { CodecError, Writer, concatBytes, hexToBytes } from "../../core/codec/lib0";
@@ -68,6 +68,10 @@ const FULL_OUTBOX: OutboxMirror = {
 			adoptOf: { deviceId: "dev-B" as DeviceId, clientFrameId: F("their-frame") },
 		}),
 		frame("f-poison", 130, { state: "poisoned", stream: S("cfg"), sealed: new Uint8Array(0) }),
+		frame("f-inherited", 132, {
+			stream: S("ns"),
+			origins: [{ deviceId: "dev-P" as DeviceId, clientFrameId: F("p-ns"), frameNo: 2 ** 35 }, { deviceId: "dev-Q" as DeviceId, clientFrameId: F("q-ns"), frameNo: 0 }],
+		}),
 		frame("f-both", 131, {
 			state: "held", stream: S("b:docZ"), dependsOn: F("f-adopt"),
 			adoptOf: { deviceId: "dev-C" as DeviceId, clientFrameId: F("f-c") },
@@ -109,7 +113,8 @@ interface Forge {
 
 function outboxBody(m: OutboxMirror, forge: Forge = {}): Uint8Array {
 	const w = new Writer();
-	w.raw(forge.magic ?? OUTBOX_MIRROR_MAGIC).u8(forge.version ?? MIRROR_FORMAT_VERSION);
+	const version = forge.version ?? OUTBOX_MIRROR_FORMAT_VERSION;
+	w.raw(forge.magic ?? OUTBOX_MIRROR_MAGIC).u8(version);
 	w.varstring(m.vaultId).varstring(m.vaultEpoch).varstring(m.deviceId).varuint(m.generation).varuint(m.writtenAtMs);
 	w.varuint(m.frames.length + (forge.countDelta ?? 0));
 	m.frames.forEach((f, i) => {
@@ -120,6 +125,10 @@ function outboxBody(m: OutboxMirror, forge: Forge = {}): Uint8Array {
 		else w.u8(1).varstring(f.dependsOn);
 		if (f.adoptOf === null) w.u8(0);
 		else w.u8(1).varstring(f.adoptOf.deviceId).varstring(f.adoptOf.clientFrameId);
+		if (version >= 2) {
+			w.varuint(f.origins?.length ?? 0);
+			for (const o of f.origins ?? []) w.varstring(o.deviceId).varstring(o.clientFrameId).varuint(o.frameNo);
+		}
 		w.varbytes(f.sealed);
 	});
 	if (forge.trailing) w.raw(forge.trailing);
@@ -174,7 +183,12 @@ describe("outbox mirror codec", () => {
 		const body = outboxBody(FULL_OUTBOX);
 		assert.deepEqual(bytes, withChecksum(body));
 		assert.deepEqual(bytes.subarray(0, 8), new TextEncoder().encode("YAOSOBX1"));
-		assert.equal(bytes[8], 1);
+		assert.equal(bytes[8], 2);
+	});
+
+	it("decodes a format-1 file (no origins field)", async () => {
+		const v1 = { ...FULL_OUTBOX, frames: FULL_OUTBOX.frames.map(({ origins: _o, ...f }) => f) };
+		assert.deepEqual(await decodeOutboxMirror(withChecksum(outboxBody(v1, { version: 1 })), sha), v1);
 	});
 
 	it("decoded sealed bytes do not alias the input buffer", async () => {
@@ -197,7 +211,7 @@ describe("outbox mirror codec", () => {
 	});
 
 	it("rejects an unsupported format version even with a valid checksum", async () => {
-		for (const version of [0, 2, 255]) {
+		for (const version of [0, 3, 255]) {
 			assert.equal(await decodeOutboxMirror(withChecksum(outboxBody(FULL_OUTBOX, { version })), sha), null, `version ${version}`);
 		}
 	});

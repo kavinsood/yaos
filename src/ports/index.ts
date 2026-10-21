@@ -9,6 +9,7 @@ import type { CryptoPort, HashPort } from "./crypto";
 import type { BlobPort } from "./blob";
 import type { RelayPort } from "./relay";
 import type { StoragePort } from "./storage";
+import type { IdentityPort } from "./identity";
 
 /** Ports the engine (in the worker; in-process in tests and the sim) is constructed with. No vault access: that goes over the protocol. */
 export interface EnginePorts {
@@ -28,5 +29,10 @@ export interface EnginePorts {
 	 * session that reaches live; a store found restarts the runtime with it. Absent = never re-asked.
 	 */
 	readonly probeBlob?: () => Promise<BlobPort | null>;
+	/**
+	 * Store identities (identity-per-store §4): registration under the install's grant and the credential the relay
+	 * and blob adapters use. The composed engine needs it; LogEngine-level tests and harnesses run without it.
+	 */
+	readonly identity?: IdentityPort;
 }
 

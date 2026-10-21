@@ -57,7 +57,7 @@ import {
 	type LargePost, type LoopStats, loopStats,
 } from "./fullKit";
 import { installPlugin } from "./fullScenarios2";
-import { DEFAULT_LOG_DIR, onboardVault, type OnboardDevice, type OnboardedVault } from "./onboard";
+import { DEFAULT_LOG_DIR, onboardVault, pairedIdentityOf, type OnboardDevice, type OnboardedVault } from "./onboard";
 
 function arg(name: string, fallback: string): string {
 	const i = process.argv.indexOf(`--${name}`);
@@ -323,7 +323,7 @@ async function peerMain(): Promise<void> {
 					return out;
 				};
 				if (m.e2ee) {
-					ctl = controllerFor(c, { host: m.host, vaultId: m.vaultId, deviceId: m.device.deviceId, deviceToken: m.device.deviceToken, deviceName: "b", vaultGeneration: m.vaultGeneration }, false);
+					ctl = controllerFor(c, pairedIdentityOf(m.host, m, m.device, "b"), false);
 					await c.thread?.ready;
 					await ctl.start();
 					await waitFor(() => lastStatus(c)?.phase === "key-missing" && lastStatus(c)?.e2ee?.keyMissing === "encrypted-vault", "b sees an encrypted vault", 60_000, performance.now(), 50);
@@ -665,7 +665,7 @@ async function runVault(R: Report, kind: VaultKind, meter: MainMeter, vaults: On
 	try {
 		// ---- setup: both devices live on the vault's suite
 		if (kind === "e2ee") {
-			const c = controllerFor(a, { host: HOST, vaultId: vault.vaultId, deviceId: dA.deviceId, deviceToken: dA.deviceToken, deviceName: "a", vaultGeneration: vault.vaultGeneration }, true);
+			const c = controllerFor(a, pairedIdentityOf(HOST, vault, dA, "a"), true);
 			ctl = c;
 			await thread.ready;
 			await c.start();

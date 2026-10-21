@@ -9,7 +9,7 @@ import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
 import type { SideFilePort } from "../../ports/vault";
 import type { FrameNoFloor } from "../store/repo";
-import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
+import type { MetaDocDeletes, MetaInherit, MetaPathBase } from "../store/schema";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import { DEFAULT_CHECKPOINT_TUNING, type CheckpointTuning } from "../body/checkpoints";
 import type { TextChanges } from "../body/textChanges";
@@ -78,6 +78,21 @@ export interface EngineTuning {
 	 */
 	readonly skipSettleMs: number | null;
 	readonly skipMaxDeferMs: number | null;
+	/**
+	 * Predecessor recovery without the fence (identity-per-store §5.2 "Without the fence"): the commit check of the
+	 * inherited ns / cfg frames waits this long after the runtime started, past the relay's hold cap
+	 * (STREAM_HOLD_MAX_MS, 5 s) for a frame of the dead store still in its buffer.
+	 */
+	readonly inheritUnfencedWaitMs: number;
+	/**
+	 * Abandoned creates (DESIGN §i.5): a live doc with no body whose creator the server reports retired is dropped
+	 * (and its file, where one is held, re-created) once the creator has read retired this long. A successor store
+	 * that fenced its predecessor re-issues the predecessor's mirrored frames as soon as it connects, so a body on
+	 * its way still lands first.
+	 */
+	readonly abandonedCreateGraceMs: number;
+	/** How long a creator that read live (or unknown) is not asked about again. */
+	readonly creatorStatusRecheckMs: number;
 }
 
 /**
@@ -116,6 +131,9 @@ export const DEFAULT_TUNING: EngineTuning = {
 	rollSeqSpan: ROLL_SEQ_SPAN,
 	rollOwnSeals: ROLL_OWN_SEALS,
 	blobGcGraceMs: 7 * 24 * 60 * 60_000,
+	inheritUnfencedWaitMs: 10_000,
+	abandonedCreateGraceMs: 30_000,
+	creatorStatusRecheckMs: 5 * 60_000,
 	knownRules: KNOWN_RULES,
 	subscribeDebounceMs: SUBSCRIBE_DEBOUNCE_MS,
 	recentUnboundKeep: RECENT_UNBOUND_KEEP,
@@ -133,6 +151,35 @@ export interface EngineOptions {
 	readonly deviceId: DeviceId;
 	readonly deviceClass?: DeviceClass;
 	readonly clientVersion: string;
+	/**
+	 * The store (identity-per-store §2.4): the install key the DB is named by and the identity secrets a fresh DB
+	 * records in meta.identity. `beforeCreate` runs right before a fresh DB is created (the composed engine consumes
+	 * the pending identity there, storeIdentity.ts). Absent (engine tests): the DB is named by the deviceId.
+	 */
+	readonly store?: {
+		readonly installKey: string;
+		/** SECRET. */
+		readonly deviceToken: string;
+		/** SECRET. */
+		readonly retireKey: string;
+		readonly beforeCreate?: () => Promise<void>;
+	};
+	/**
+	 * This install's earlier stores (identity-per-store §2.4 lineage, §5.2 `lostCreateBody`): a live doc one of them
+	 * created whose initial body never reached the relay is this store's to upload, as its own create's would be. The
+	 * earlier store is gone from this install (its DB was lost or reset), and nobody else has the file. Never a
+	 * clone's twin: a clone has its own install record. Absent: none.
+	 */
+	readonly lineage?: ReadonlySet<DeviceId>;
+	/**
+	 * Predecessor recovery (identity-per-store §5.2), for a store this start creates: the lineage stores, newest first,
+	 * whose mirrors the new store adopts (the newest dir with a valid outbox mirror), and whether the newest was fenced.
+	 * Recorded with the new store's identity (MetaIdentity.inherit) and run at boot (again after a crash before the
+	 * import committed); ignored for a store that already exists.
+	 */
+	readonly inherit?: MetaInherit | null;
+	/** A lineage store's side files, `state/<deviceId>/` (recovery reads them; VaultRuntime removes them once replaced). */
+	readonly lineageSideFiles?: (deviceId: DeviceId) => SideFilePort;
 	/**
 	 * The suite pin and keyring inputs (e2ee-design §12.4, §18.4). Required, with no default. Only a pinned device
 	 * whose gate opened runs a LogEngine (compose/pinGate.ts); an unpinned one runs the KeyReader and has none.

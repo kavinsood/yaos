@@ -123,6 +123,11 @@ engine rebuilds it from the relay, the files on disk and the side-file mirrors i
   a file changed on both sides becomes a no-base conflict copy;
 - without mirrors, recovery is a fresh-device onboarding: identical files adopted, differing ones conflict-copied.
 
+Since identity-per-store phase 2, a lost store is replaced by a store with a new device identity, and the mirrors of
+the lost one (under `state/<old deviceId>/`) are not imported yet (phase 3). Every IndexedDB loss therefore takes the
+"without mirrors" path: a file edited offline gets a conflict copy instead of a merge, and deletes, renames and canvas
+reorders that were not sent yet are lost with the store. Text is never lost (it is on disk).
+
 Nothing is destroyed. Limits: base texts are not mirrored, so recovered files merge without a base when both sides
 changed; a delete still waiting to be sent is remembered in the store only (`fileGone`), so a file re-created at
 that path meanwhile merges into the old note as a save (integration-notes §5, D17). The frameNo collision IndexedDB
@@ -215,11 +220,13 @@ From [wp-d-notes.md](client-remake/wp-d-notes.md) "Gaps and known issues",
   quarantined for a reader-dependent reason (missing key, newer writer) are retried at every session start. Nothing
   else lifts a quarantine: the `releaseQuarantine` command DESIGN §d.6 describes exists in the protocol, but no
   command or button sends it (BACKLOG QUARANTINE-UI). **Rebuild local cache** starts the store over from the relay.
-- **Do not copy a paired vault folder to another machine.** The device identity is in the vault's
-  `<configDir>/plugins/yaos/data.json`, so a copy, or a vault also synced by iCloud, Syncthing or Dropbox, runs as
-  the same device. Nothing detects it yet, and the two machines take each other's namespace changes for their own:
-  renames can revert, files can be trashed, creates and settings changes can be lost. Pair each machine on its own
-  (BACKLOG CLONED-ID).
+- **A copied or synced vault folder is a new device.** data.json holds only the pairing grant; each IndexedDB store
+  mints and registers its own device identity (identity-per-store §2-4). A copy of the vault folder on another
+  machine, or opened as another vault on the same one, has its own store and identity, joins without a prompt, and
+  syncs as a separate device; it never reads or writes the other store's mirror dir. It counts against the pairing's
+  limits (20 new stores a day, 50 live devices). Copying a vault over another one while that device still had a
+  create in flight can leave the note waiting for an initial body nobody can send (BACKLOG CLONED-ID, "abandoned
+  creator"). A grant copied with the folder is a credential: revoking the pairing revokes every copy.
 - **frameNo collision after IndexedDB loss.** A store lost with an unsent namespace frame in flight and no mirror can
   reuse a frame number; the current guard is a wall-clock floor on the first number of a runtime (e2ee-design §8.2;
   commits 44748cb2, f47950cb). See BACKLOG.

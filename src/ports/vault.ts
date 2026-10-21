@@ -91,7 +91,7 @@ export interface ConfigDirPort {
 }
 
 /**
- * Plugin-private state files next to the vault (<configDir>/plugins/yaos/state/).
+ * Plugin-private state files next to the vault (<configDir>/plugins/yaos/state/<deviceId>/).
  * Holds the outbox mirror, the synced-tree mirror and local recovery snapshots.
  * Survives IndexedDB eviction (DESIGN §e.4, §i.5).
  */
@@ -104,10 +104,34 @@ export type SideFileName =
 	| `snapshots/${string}.part`
 	| `snapshots/${string}.snap`;
 
+/** One store's side files (the engine's view: its own dir, identity-per-store §5.2). */
 export interface SideFilePort {
 	read(name: SideFileName): Promise<Uint8Array | null>;
 	/** Not required to be atomic: readers use A/B generations + checksums. */
 	write(name: SideFileName, bytes: Uint8Array): Promise<void>;
 	remove(name: SideFileName): Promise<void>;
 	list(prefix: "snapshots/"): Promise<readonly SideFileName[]>;
+}
+
+/**
+ * `<deviceId>/<SideFileName>`: a file in one store's dir, `state/<deviceId>/` (identity-per-store §5.2). A store reads
+ * and writes only its own dir; nothing deletes a dir it does not own (a synced or copied folder carries other
+ * installs' dirs, and deleting one would delete a live twin's mirror on the twin's machine).
+ */
+export type SideFilePath = `${string}/${SideFileName}`;
+export type SideFilePrefix = `${string}/snapshots/`;
+
+/** The host's side-file store, `<configDir>/plugins/yaos/state/`, addressed by store dir (the engine names it). */
+export interface HostSideFilePort {
+	read(path: SideFilePath): Promise<Uint8Array | null>;
+	write(path: SideFilePath, bytes: Uint8Array): Promise<void>;
+	remove(path: SideFilePath): Promise<void>;
+	list(prefix: SideFilePrefix): Promise<readonly SideFilePath[]>;
+}
+
+/** The store dir of a side-file path, if it is a well-formed device id (16..128 of [A-Za-z0-9_-]); else null. */
+export function sideFileDir(path: string): string | null {
+	const slash = path.indexOf("/");
+	const dir = slash > 0 ? path.slice(0, slash) : "";
+	return /^[A-Za-z0-9_-]{16,128}$/.test(dir) ? dir : null;
 }

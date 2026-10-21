@@ -88,10 +88,10 @@ export function withoutPendingEnrollment(data: YaosPluginData, requestId?: strin
 	return rest;
 }
 
-/** Stores a fresh identity, adopts its device name as the local label and drops its pending attempt. */
+/** Stores a fresh grant, adopts its name as the local label and drops its pending attempt. */
 export function applyPairedIdentity(data: YaosPluginData, identity: PairedIdentity): YaosPluginData {
-	const rest = data.pendingEnrollment?.deviceId === identity.deviceId ? withoutPendingEnrollment(data) : data;
-	return { ...rest, identity, deviceLabel: sanitizeDeviceLabel(identity.deviceName, data.deviceLabel) };
+	const rest = data.pendingEnrollment?.grantSecret === identity.grantSecret ? withoutPendingEnrollment(data) : data;
+	return { ...rest, identity, deviceLabel: sanitizeDeviceLabel(identity.grantName, data.deviceLabel) };
 }
 
 /** Removes the identity (unpair) and any pending enrollment. Engine settings and the label are kept. */
@@ -109,7 +109,7 @@ export type ResumedEnrollment =
  * On load: one more try of the enrollment a previous session sent without seeing the answer.
  * Success stores the identity; a definitive refusal drops the attempt; anything else keeps it for
  * the next load. Returns null when nothing was pending. The caller revokes `replaced` on its server
- * (retireDeviceEnrollment), as PairModal does when a pairing replaces another.
+ * (leaveGrant), as PairModal does when a pairing replaces another.
  */
 export async function resumePendingEnrollment(host: Pick<YaosUiHost, "data" | "updateData">, deps: PairingDeps): Promise<ResumedEnrollment | null> {
 	const { pendingEnrollment: pending, identity: previous } = host.data();

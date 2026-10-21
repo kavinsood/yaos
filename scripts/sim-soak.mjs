@@ -51,6 +51,8 @@ function drawConfig(r, F, C) {
 	const bases = [
 		["none", null, 2], ["DEFAULT_FAULTS", F.DEFAULT_FAULTS, 4], ["BLOB_FAULTS", F.BLOB_FAULTS, 2], ["SUBS_FAULTS", F.SUBS_FAULTS, 2],
 		["E2EE_FAULTS", F.E2EE_FAULTS, 1], ["CANVAS_FAULTS", F.CANVAS_FAULTS, 1], ["SUSPEND_FAULTS", F.SUSPEND_FAULTS, 1],
+		// identity-per-store: copied vault folders (clone) and a synced plugin folder (syncedConfig).
+		["CLONE_FAULTS", F.CLONE_FAULTS, 1],
 	];
 	let x = r.float() * bases.reduce((s, b) => s + b[2], 0);
 	let base = bases[0];
