@@ -90,6 +90,8 @@ export const SIM_SETTINGS: EngineSettings = {
 
 export interface SimDeviceOptions {
 	readonly name: string;
+	/** The device label the user gave it (conflict copy names); default `name`. */
+	readonly label?: string;
 	readonly clock: VirtualClock;
 	readonly net: SimNet;
 	readonly profile?: CaseProfile;
@@ -160,6 +162,8 @@ export class SimDevice {
 	engineStarts = 0;
 	/** LogEngine diagnostics of every engine this device ran, counted by `code` or `code:cls` (sim stats). */
 	readonly diagCounts: Record<string, number> = {};
+	/** Tuning of a newer build the app was updated to (applies from the next engine start; upgradeHalt.test.ts). */
+	updatedTuning: Partial<EngineTuning> | null = null;
 	/** Checkpoints the gate refused on this device (checkpoint-disputed), with their detail. */
 	readonly disputed: string[] = [];
 	/** Texts that existed only in host memory when the app crashed (pending conflict copies; known gap). */
@@ -259,7 +263,7 @@ export class SimDevice {
 		if (this.opts.workerMode === "unavailable") throw new Error("Worker is not available (sim)");
 		const pair = createInlinePair({ schedule: this.opts.clock.schedule });
 		const storageFails = this.opts.workerMode === "storage-fails";
-		const tuning: Partial<EngineTuning> = { ...SIM_TUNING, ...(this.opts.tuning ?? {}) };
+		const tuning: Partial<EngineTuning> = { ...SIM_TUNING, ...(this.opts.tuning ?? {}), ...(this.updatedTuning ?? {}) };
 		// A sim world whose tuning breaks a DESIGN constraint finds harness bugs, not engine bugs: refuse it.
 		const bad = causalWindowProblem({ ...DEFAULT_TUNING, ...tuning });
 		if (bad !== null) throw new Error(`SimDevice ${this.opts.name}: ${bad}`);
@@ -286,6 +290,7 @@ export class SimDevice {
 			observe: {
 				nsFold: (frames) => this.coverage.nsFold(frames),
 				pass: (ops, report) => this.coverage.pass(ops, report),
+				conflict: (reason) => this.coverage.conflict(reason),
 			},
 			onIdentity: (id) => {
 				if (this.handle !== handle && this.handle !== null) return;
@@ -335,7 +340,7 @@ export class SimDevice {
 	/** What the plugin controller builds from data.json and the install record (pluginController.ts startNow). */
 	hostIdentity(vaultId = SIM_VAULT_ID): HostIdentity {
 		const rec = loadInstallRecord(this.installStorage, vaultId, (n) => new SeededRandom(hashLabel(`install:${this.machineKey}#${++this.installs}`)).bytes(n));
-		return { vaultId, deviceLabel: this.opts.name, relay: { url: "sim://relay", grantSecret: this.grantSecret ?? "" }, installKey: rec.installKey, lineage: lineageOf(rec), predecessor: rec.current };
+		return { vaultId, deviceLabel: this.opts.label ?? this.opts.name, relay: { url: "sim://relay", grantSecret: this.grantSecret ?? "" }, installKey: rec.installKey, lineage: lineageOf(rec), predecessor: rec.current };
 	}
 
 	/** This device's install record (lineage), as main keeps it. */

@@ -18,8 +18,8 @@
 
 import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
-import { generateUserAction, runUserAction, tokensIn, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, STORM_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
-import { FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
+import { generateUserAction, runUserAction, tokensIn, CLEANUP_OPS, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, STORM_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
+import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
 import { activity, checkBlobLiveness, checkCanvas, checkIdentity, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, checkBounds, checkFoldDeterminism, checkOutboxAndCursor, checkRetired, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
 import { BrakeUser, type BrakeUserStats } from "./brakeUser";
 import type { Budgets } from "../core/limits";
@@ -34,6 +34,7 @@ import type { SimCheckpointStats } from "./relay";
 import type { CaseProfile } from "./vault";
 import { checkE2eeLeaks, oracleKeys, onboardSuite1, seededRk } from "./e2ee";
 import type { E2eeFaultStats } from "./e2eeFaults";
+import type { HostileStats } from "./hostile";
 import { realWorkFor, type RealWork } from "./delayedCrypto";
 import type { SimBlobLiveness } from "./blobStore";
 import { CANVAS_NAME_POOL, CANVAS_OPS, CanvasWorld, generateCanvasAction, type CanvasAction, type CanvasStats, type CanvasWeights } from "./canvas";
@@ -51,6 +52,11 @@ export interface SimConfig {
 	readonly ops?: OpWeights;
 	/** Chance per main step of an extra attachment/settings action (own RNG stream). 0 disables. Default 0.15. */
 	readonly extras?: number;
+	/**
+	 * Chance per main step of the user's "Clean up unused server attachments" on a random device (own RNG stream).
+	 * Default 0. Pair with a tuning.blobGcGraceMs the run outlives (production's 7 days never pass in a run).
+	 */
+	readonly cleanups?: number;
 	/** Default: chosen by the seed. */
 	readonly profile?: CaseProfile;
 	readonly initialFiles?: number;
@@ -97,6 +103,11 @@ export interface SimConfig {
 	 * by the simulated user (brakeUser.ts) in every run.
 	 */
 	readonly storms?: number;
+	/**
+	 * Every device carries the same label (two phones both called "iPhone"): conflict copies made on two devices in
+	 * the same minute want the same name. Default false (each device's label is its name).
+	 */
+	readonly sameLabels?: boolean;
 	/**
 	 * Draw every device's engine tuning and budgets per seed (tuningWorld) over the checkpoint world's; `tuning`
 	 * still overrides. Default false (the fixed FAST_TUNING matrices).
@@ -205,13 +216,19 @@ export interface CheckpointWorld {
 	readonly tuning: Partial<EngineTuning>;
 	/** The relay's segment seal threshold (server: 64 KiB); null = the default. */
 	readonly sealBytes: number | null;
+	/**
+	 * The relay's H2 dedupe window in bytes (server: 4 MiB, a row must be resent within W bytes of later rows of its
+	 * stream to be deduped); null = the default. Scaled down in some seeds as the seal is, so a resend after a long
+	 * offline period or a lost receipt outlives its original's window and is appended again (R4).
+	 */
+	readonly dedupeWindowBytes: number | null;
 	/** Device index that joins late (its app starts at plan step `atStep`), suite 0 only. */
 	readonly lateJoin: { readonly dev: number; readonly atStep: number } | null;
 	/** Per device: recovery snapshots on and uploaded (snap rows), else off. */
 	readonly snapshots: readonly boolean[];
 }
 
-const PRODUCTION_WORLD = (devices: number): CheckpointWorld => ({ tuning: {}, sealBytes: null, lateJoin: null, snapshots: Array.from({ length: devices }, () => false) });
+const PRODUCTION_WORLD = (devices: number): CheckpointWorld => ({ tuning: {}, sealBytes: null, dedupeWindowBytes: null, lateJoin: null, snapshots: Array.from({ length: devices }, () => false) });
 
 /** Log-uniform integer in [lo, hi]. */
 function logRange(r: SeededRandom, lo: number, hi: number): number {
@@ -261,7 +278,10 @@ export function checkpointWorld(cfg: SimConfig): CheckpointWorld {
 	const sr = r.fork("snapshots");
 	const on = sr.chance(0.4);
 	const snapshots = Array.from({ length: c.devices }, (_, i) => on && (i === 0 || sr.chance(0.7)));
-	return { tuning, sealBytes, lateJoin, snapshots };
+	// Own stream (the draws above keep their values): a third of the seeds run a window of 256 B .. 64 KiB.
+	const dd = r.fork("dedupe");
+	const dedupeWindowBytes = dd.chance(0.35) ? logRange(dd, 256, 64 * 1024) : null;
+	return { tuning, sealBytes, dedupeWindowBytes, lateJoin, snapshots };
 }
 
 export type Step =
@@ -300,6 +320,8 @@ export interface SimReport {
 		readonly brakes: BrakeUserStats;
 		/** Suite-1 fault outcomes (e2eeFaults.ts), in a suite-1 run with faults. */
 		readonly e2ee?: E2eeFaultStats;
+		/** Hostile member device outcomes (hostile.ts), in a run that drew the hostile fault. */
+		readonly hostile?: HostileStats;
 		/** Every suspend-kill of the run (faults.ts SuspendKillAction) and what it lost. */
 		readonly suspend: readonly SuspendOutcome[];
 		/** Checkpoint coverage: relay puts / GC / served pages, and adoptions / gate disputes on the devices and the oracle. */
@@ -318,6 +340,8 @@ export interface SimReport {
 		 * clone), and the relay registry's answers to registrations (ok, or the refusal).
 		 */
 		readonly identity: { readonly stores: number; readonly registrations: Readonly<Record<string, number>> };
+		/** Targeted relay faults that fired (faults.ts targetedDrop / lostSend / commitFail). */
+		readonly relayTaps: Readonly<Record<string, number>>;
 	};
 }
 
@@ -396,6 +420,7 @@ export function generatePlan(cfg: SimConfig): Step[] {
 	const c = full(cfg);
 	const rng = new SeededRandom(cfg.seed).fork("plan");
 	const xr = new SeededRandom(cfg.seed).fork("extra");
+	const gc = new SeededRandom(cfg.seed).fork("cleanup");
 	const sr = new SeededRandom(cfg.seed).fork("snapshot-ops");
 	const cr = new SeededRandom(cfg.seed).fork("canvas-ops");
 	const snaps = checkpointWorld(cfg).snapshots.some((x) => x);
@@ -410,6 +435,7 @@ export function generatePlan(cfg: SimConfig): Step[] {
 		if (c.extras > 0 && xr.chance(c.extras)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(xr, c.devices, EXTRA_OPS) });
 		// Manual snapshots, from their own stream (the main and extra plans of a seed do not depend on them).
 		if (snaps && sr.chance(0.04)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(sr, c.devices, SNAPSHOT_OPS) });
+		if ((cfg.cleanups ?? 0) > 0 && gc.chance(cfg.cleanups!)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(gc, c.devices, CLEANUP_OPS) });
 		if (storms > 0 && stormRng.chance(storms)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(stormRng, c.devices, STORM_OPS) });
 		// Canvas actions, from their own stream too: floor(rate) per main step, one more with the fraction's chance.
 		if (c.canvas) {
@@ -466,6 +492,14 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 	const c = full(cfg);
 	const plan = explicitPlan ?? generatePlan(cfg);
 	seedEntropy(cfg.seed);
+	// A promise whose failure engine code drops (a worker only logs it; Node would end the process): a violation of
+	// this run, minimizable like any other.
+	const unhandled: Violation[] = [];
+	const onUnhandled = (e: unknown): void => {
+		if (unhandled.length < 5) unhandled.push({ inv: "clean", detail: `unhandled rejection: ${e instanceof Error ? (e.stack ?? e.message).split("\n").slice(0, 4).join(" | ") : String(e)}` });
+	};
+	const proc = (globalThis as { process?: { on(ev: "unhandledRejection", f: (e: unknown) => void): void; off(ev: "unhandledRejection", f: (e: unknown) => void): void } }).process;
+	proc?.on("unhandledRejection", onUnhandled);
 	try {
 		const seeded = entropyIsSeeded(() => new Y.Doc().clientID);
 		seedEntropy(cfg.seed);
@@ -480,12 +514,13 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const cw = checkpointWorld(cfg);
 		const tw = tuningWorld(cfg, c.devices);
 		const pw = pruneWorld(cfg);
-		const net = new SimNet(clock, { seed: nr.int(0x7fffffff), linkMs: nr.range(5, 60), jitterMs: nr.range(0, 90), ...(cw.sealBytes !== null ? { sealBytes: cw.sealBytes } : {}), nsPrune: pw });
+		const net = new SimNet(clock, { seed: nr.int(0x7fffffff), linkMs: nr.range(5, 60), jitterMs: nr.range(0, 90), ...(cw.sealBytes !== null ? { sealBytes: cw.sealBytes } : {}), ...(cw.dedupeWindowBytes !== null ? { dedupeWindowBytes: cw.dedupeWindowBytes } : {}), nsPrune: pw });
 		const devs = NAMES.slice(0, c.devices).map((name, di) => {
 			const dr = world.fork(`dev-${name}`);
 			const watch = dr.fork("watch");
 			return new SimDevice({
 				name, clock, net, profile,
+				...(cfg.sameLabels ? { label: "iPhone" } : {}),
 				settings: cw.snapshots[di] ? () => SNAPSHOT_SETTINGS : () => RUN_SETTINGS,
 				// The prune rules last: the same on every device whatever else is drawn per device (FOLD).
 				tuning: { ...cw.tuning, ...(tw?.[di]?.tuning ?? {}), ...cfg.tuning, ...(pw ? { nsPrune: pw } : {}) },
@@ -498,11 +533,11 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		});
 		const ledger = new TokenLedger();
 		const merges0 = { ...canvasMergeStats };
-		const faults = new FaultState(clock, devs, net, ledger, { suite1: c.suite1, weights: c.faults, initialRk: () => seededRk(world.fork("e2ee").fork("rk")) });
+		const faults = new FaultState(clock, devs, net, ledger, { suite1: c.suite1, weights: c.faults, initialRk: () => seededRk(world.fork("e2ee").fork("rk")), seed: cfg.seed });
 		const trace: string[] = [`world ${profile} ${devs.map((d) => `${d.name}:${d.platform.info.os}`).join(" ")}`];
 		if (cfg.checkpoints !== "production") {
 			const t = cw.tuning;
-			trace.push(`checkpoints ${JSON.stringify({ ...t.checkpoint, compactRows: t.compactRows, candidate: t.nsCandidateModulus, seal: cw.sealBytes, join: cw.lateJoin, snapshots: cw.snapshots.map((x) => (x ? 1 : 0)).join("") })}`);
+			trace.push(`checkpoints ${JSON.stringify({ ...t.checkpoint, compactRows: t.compactRows, candidate: t.nsCandidateModulus, seal: cw.sealBytes, dedupe: cw.dedupeWindowBytes, join: cw.lateJoin, snapshots: cw.snapshots.map((x) => (x ? 1 : 0)).join("") })}`);
 		}
 		tw?.forEach((x, i) => trace.push(`tuning ${devs[i]?.name} ${JSON.stringify({ ...x.tuning, ...x.budgets })}`));
 		if (pw) trace.push(`prune ${JSON.stringify(pw)}`);
@@ -575,7 +610,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			if (line.startsWith("skip")) skipped++;
 			// A lost store's unsent ops go with it unless its mirrors survive: the successor store re-issues them
 			// (identity-per-store §5.2 predecessor recovery). idbLost keeps the mirrors (OS eviction of IndexedDB only).
-			else if ("fault" in step && step.fault.t === "idbWipe" && !step.fault.mirrors) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
+			else if ("fault" in step && ((step.fault.t === "idbWipe" && !step.fault.mirrors) || step.fault.t === "floodRewrite")) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
 			trace.push(`${step.i} ${line}`);
 			faults.afterStep();
 			brakeUser.poll();
@@ -598,7 +633,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			brakeUser.poll();
 			sampleBounds();
 			// Blob store calls outside the blob queue (a snapshot upload's) count too: a stalled one ends by its idle window.
-			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && !(d.vrt?.creators.busy() ?? false) && (d.vrt?.log.c.retire.pending ?? 0) === 0 && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending();
+			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && !(d.vrt?.creators.busy() ?? false) && (d.vrt?.log.c.retire.pending ?? 0) === 0 && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending() && !(faults.hostile?.busy() ?? false);
 			const fp = print();
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
@@ -618,6 +653,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			if (!net.relay.quiescent()) why.push("relay busy");
 			if (net.relay.pendingCount() > 0) why.push(`relay pending ${net.relay.pendingCount()}`);
 			if (net.blobs.transfers().length > 0) why.push(`blob calls in flight ${net.blobs.transfers().length}`);
+			if (faults.hostile?.busy()) why.push("hostile device busy");
 			devs.forEach((d, i) => {
 				if (faults.isDown(i)) why.push(`${d.name} down`);
 				else if (!d.runtime.engine.isReady) why.push(`${d.name} not ready`);
@@ -642,6 +678,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		violations.push(...(retired ?? [{ inv: "retired" as const, detail: "check did not finish" }]));
 		const oracle = await net.oracle(120_000, c.suite1 ? oracleKeys(devs) : null);
 		if (c.suite1) violations.push(...checkE2eeLeaks(devs, net, ledger).violations, ...(faults.e2ee?.check() ?? []));
+		violations.push(...(faults.hostile?.check() ?? []));
 		canvasWorld.finalize();
 		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkIdentity(devs), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net), ...checkCanvas(devs, canvasWorld.oracle), ...checkOutboxAndCursor(devs, net), ...bounds.values());
 		violations.push(...(await checkQuiet(clock, devs, net)));
@@ -669,13 +706,15 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const canvasStats = canvasRunStats(canvasWorld, devs, merges0);
 		for (const d of devs) d.runtime.stop().catch(() => undefined);
 		await clock.advance(5_000);
+		violations.push(...unhandled);
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, brakes: brakeUser.stats, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), identity: { stores: devs.reduce((n, d) => n + d.identities.length, 0), registrations: { ...net.identities.counts } }, ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
+			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, brakes: brakeUser.stats, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), identity: { stores: devs.reduce((n, d) => n + d.identities.length, 0), registrations: { ...net.identities.counts } }, relayTaps: net.relay.taps(), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(faults.hostile ? { hostile: faults.hostile.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
 		};
 	} finally {
 		seedEntropy(null);
+		proc?.off("unhandledRejection", onUnhandled);
 	}
 }
 

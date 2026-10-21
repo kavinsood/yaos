@@ -5,5 +5,6 @@ import { MATRICES, sweep } from "./testkit/sweep";
 
 for (const m of MATRICES) {
 	const n = Math.min(m.smoke, m.seeds);
+	if (n === 0) continue; // test:sim only
 	test(`sim smoke: ${m.name}, seeds 1..${n}`, () => sweep(m.name, m.base, n, 1));
 }

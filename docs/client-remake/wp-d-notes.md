@@ -244,24 +244,40 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
   outbox / cursor part (`checkOutboxAndCursor`) and 6 (`checkBounds`, sampled after every step and heal tick) run on
   every seed. `stats.coverage` (`src/sim/coverage.ts`) counts what the engines did through the observational
   `RuntimeObserver` hook; `coverage.sim.test.ts` asserts the core keys, the brakes (storms) and live overflow /
-  provisional adoption (random tuning) fire. Keys still at 0 over 6 seeds of every matrix (2026-10-20):
-  - socket close at *targeted* points (before append, after commit before receipt, between provisional and
-    notice): drops land at random times only; `diag.adopt-pending` / `host.adoptToPending` stay 0 although
-    provisionals are adopted;
-  - dedupe window expiry before a resend: only `relay-dedupe.test.ts`; `ns.ignored.duplicate-frame` / `replay-*`
-    stay 0;
-  - malicious peer frames (malformed, disallowed Yjs types, oversize, bad checkpoint) from suite 0: none
-    (`diag.doc-frozen`, `frame-poisoned`, `causal-hole`, `quarantine-retried`, `checkpoint-refused` stay 0);
-  - long offline past ns pruning (> 20k tombstones): `ns.pruned` stays 0 in the production-cap matrices; the "small
-    tombstone cap" matrix (cap 3..8) prunes, retires and drops dead streams (`diag.retire-written`,
-    `checkpoint-retired`, `retire-dropped`; coverage.sim.test.ts);
-  - `brake.conflict-flood` (the other brakes fire under storms; `reconciler.brakes.test.ts` covers all);
-  - residency: the budgets are never approached at sim scale, so invariant 6's residency part holds trivially;
-  - other zero keys: `ns.create.revived`, `ns.restore.applied/suffixed`, the ignored reasons `duplicate-docid`,
-    `unknown-docid`, `invalid-path`, `kind-mismatch`, `already-deleted`, `restore-not-current`, `stale-revive`,
-    `not-blob`, `noop`, `rules-version` (`stale-epoch` is suite 1), conflict copies `both-edited`, `too-large`,
-    `path-taken`, `recovered`, `reconcileContent.pathBase`, `rebind.adopt`, waits `blob-unavailable` / `frozen`,
-    `diag.checkpoint-retired/held`, `gap-feed`, `blob-gc-swept`, `frame-resealed`.
+  provisional adoption (random tuning) fire.
+
+  Coverage generators (2026-10-21), each a matrix in `testkit/sweep.ts` (its keys asserted over its sweep,
+  `GENERATOR_KEYS`) and a soak profile:
+  - targeted relay faults (`RELAY_FAULTS`): socket drops right after an APPEND, before a held PROVISIONAL's notice and
+    before the receipts, live messages lost on an open socket, failed group commits; the sim relay keeps the server's
+    H2 byte dedupe window (`dedupeWindowBytes`, small in some seeds): `diag.gap-feed`, `diag.adopt-pending`,
+    `ns.ignored.duplicate-frame`;
+  - delete / restore races (`RACE_OPS`): restores from the trash and delete-then-recreate while other devices act;
+  - a hostile / buggy member device (`HOSTILE_FAULTS`, suite 0 and 1, `hostile.ts`) through the relay, and the user
+    who releases what its rows froze: every structural ns ignore reason, `replay-*`, `stale-epoch` (suite 1),
+    `diag.doc-frozen` / `causal-hole` / `doc-thawed`;
+  - conflict shapes (`CONFLICT_FAULTS` + `BIG_OPS`, `sameLabels`): `conflict.too-large`, `conflict.recovered`; the
+    conflict-flood brake (`FLOOD_FAULTS`, soak only);
+  - the user's attachment clean-up mid-sync (`cleanups`, a short `blobGcGraceMs`): `diag.blob-gc-swept`;
+  - the outdated client (`upgradeHalt.test.ts`): a newer build's upgradeRules halts the fold, `diag.upgrade-required`.
+
+  Keys still rare or at 0, and why:
+  - pruning at the production cap (> 20k tombstones) stays 0; the "small tombstone cap" matrix (cap 3..8, run.ts
+    pruneWorld) and the soak's small-cap draw prune, retire and drop dead streams (`ns.pruned`,
+    `diag.retire-written`, `checkpoint-retired`, `retire-dropped`; coverage.sim.test.ts);
+  - `conflict.path-taken`: the name must be taken between the pick and the write by a writer other than this
+    device's reconciler (which checks local and remote names first): only a third-party writer racing a name with
+    this device's label and minute;
+  - `diag.frame-poisoned` (own frames the relay refuses for good), `checkpoint-held`,
+    `quarantine-retried`: not targeted yet;
+  - `reconcileContent.pathBase`, `rebind.adopt`, `plan.wait.frozen`: rare;
+  - residency: the budgets are never approached at sim scale, so invariant 6's residency part holds trivially.
+
+  No code path produces these (`coverage.ts` DEAD_COVERAGE): `ns.create.revived`, `ns.restore.applied/suffixed`
+  (a restore always revives; `restore.revived-suffixed` counts a moved one), `plan.wait.blob-unavailable`,
+  `plan.conflictCopy.{both-edited,too-large,path-taken,recovered}` (merge outcomes, counted as `conflict.*`),
+  `diag.recovered-from-mirror` (production inherits: `diag.inherited`), `ns.ignored.rules-version` (a halted frame
+  never folds: `diag.upgrade-required`). `stale-epoch` has no suite-0 path.
 
   The sim types only into bound views.
 - **Fixed since delivery** (removed from this list):
@@ -279,7 +295,9 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
   night when nothing it watches (`src`, `server`, `scripts/sim-*.mjs`, package and tsconfig files, the workflow)
   changed since its last successful run; a manual run always runs. It runs a soak process per core
   (`scripts/sim-soak.mjs`, swarm profiles) and the matrices at 1000 seeds from a random `YAOS_SIM_FIRST`, over 4
-  shards that share the first seed.
+  shards that share the first seed. Summed over the soak processes, every coverage key outside `sim-soak.mjs`
+  `COVERAGE_OPTIONAL` (pruning, retired streams, `conflict.path-taken`, `frame-poisoned`, `upgrade-required`) must
+  fire (`--coverage-out` / `--check-coverage`, enforced for runs of 30 minutes and longer).
 
 ## Run log
 

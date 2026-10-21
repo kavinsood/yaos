@@ -13,7 +13,7 @@
  * and after IndexedDB recovery (before the first pass of the new DB).
  */
 
-import type { BrakeReport, ContentHash, DocId, DocKind, PathKey, PlanScope, PlannerOp, VaultEpoch, VaultPath } from "../../core/types";
+import type { BrakeReport, ConflictReason, ContentHash, DocId, DocKind, PathKey, PlanScope, PlannerOp, VaultEpoch, VaultPath } from "../../core/types";
 import { bytesToHex } from "../../core/codec/lib0";
 import { FULL_RECONCILE_IDLE_MAX_MS, type Budgets } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
@@ -109,7 +109,17 @@ export interface RuntimeObserver {
 	nsFold?(frames: readonly FoldedNsFrame[], reloaded: boolean): void;
 	/** A reconcile pass ran `ops` (its executable plan) and reported `report`. */
 	pass?(ops: readonly PlannerOp[], report: PassReport): void;
+	/**
+	 * A conflict copy event: written by a merge (`reason` the merge's: both-edited / too-large / no-base) in a
+	 * reconcile job ("merge", "canvas") or a bound reload ("bound"); "path-taken": the copy's name was taken by another
+	 * writer between the pick and the write (the absent precondition failed); "recovered": an intent resume found the
+	 * copy safe and finished the job ("intent"): a markdown / canvas copy a crash left open, or a blob keep-both whose
+	 * download had not finished.
+	 */
+	conflict?(reason: ConflictReason, where: ConflictWhere): void;
 }
+
+export type ConflictWhere = "merge" | "canvas" | "bound" | "intent";
 
 export function reconcileSettings(s: EngineSettings): ReconcileSettings {
 	return { excludePatterns: s.excludePatterns, syncAttachments: s.syncAttachments, maxAttachmentBytes: s.maxAttachmentBytes, trashMode: s.trashMode };
@@ -297,7 +307,7 @@ export class VaultRuntime {
 		this.rec = await Reconciler.open({
 			db, log: this.port, disk: link.disk, clock: ports.clock, random: ports.random, hash: ports.hash, blobs: this.blobs,
 			settings: reconcileSettings(this.settings), deviceLabel: config.deviceLabel, pathKey, tzOffsetMinutes: tz,
-			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), onRebind: (from, into) => this.retarget(from, into),
+			notice: this.notice, onBrake: (r) => this.onBrake(r), onConflictCopy: () => this.conflictCopies.add(), observeConflict: o.observe?.conflict ? (r, w) => o.observe?.conflict?.(r, w) : undefined, onRebind: (from, into) => this.retarget(from, into),
 			pathBase: (k: PathKey) => bases.get(k), pathBaseKeys: bases.keys, pathDeleted: (k: PathKey) => bases.deleted(k),
 			docDeletes: (d) => bases.docDeletes(d), docDeletesApplied: (d) => bases.applied(d),
 			boundSavedText: (docId, text) => {

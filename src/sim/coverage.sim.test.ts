@@ -1,5 +1,7 @@
 // Coverage counters (SimReport.stats.coverage): the core fold / planner / checkpoint paths fire over a seed sweep
-// (`npm run test:sim`). The invariant-4/5/6 self-checks are in coverage.test.ts.
+// (`npm run test:sim`). The invariant-4/5/6 self-checks are in coverage.test.ts. The coverage generators' keys
+// (targeted relay faults, the hostile device, conflict shapes, attachment clean-ups: testkit/sweep.ts GENERATOR_KEYS)
+// are asserted over their own matrices' sweeps, so they cost no extra runs.
 import { simTest } from "./testkit/simTest";
 import assert from "node:assert/strict";
 import { runSim } from "./run";

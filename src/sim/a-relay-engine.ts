@@ -66,6 +66,22 @@ export interface SimCommitInfo {
 
 export type CommitHook = (info: { readonly index: number; readonly reason: FlushReason; readonly frames: number }) => CommitFault;
 
+/**
+ * Targeted socket drops (sim faults, faults.ts targetedDrop): the device's socket is lost (1006, in-flight messages
+ * both ways gone) at one point of the frame flow, once. append: right after the relay admitted one of its APPENDs (the
+ * frame still commits, its receipt is lost); notice: right before the relay sends it the COMMIT_NOTICE of a
+ * PROVISIONAL it holds (it saw the frame, not its commit); receipt: right before its STREAM_RECEIPTS (rows committed
+ * and fanned out, the author never learns).
+ */
+export type DropPoint = "append" | "notice" | "receipt";
+
+/** A commit fault armed for the next group commit that matches (sim faults, faults.ts commitFail). */
+export interface ArmedCommitFault {
+	readonly fault: Exclude<CommitFault, "commit">;
+	/** provisional: only a commit holding a PROVISIONAL some socket was sent (its holders must settle it). */
+	readonly match: "any" | "provisional";
+}
+
 export interface SimRelayCounters {
 	appendFrames: number;
 	pendingDedupes: number;
@@ -134,6 +150,14 @@ export class RelayEngine {
 	commitHook: CommitHook | null = null;
 	readonly faults: { readonly fault: CommitFault; readonly retryAfterMs: number | null }[] = [];
 	readonly commitListeners = new Set<(info: SimCommitInfo) => void>();
+	/** Targeted drops armed per device (one-shot each). */
+	readonly dropTaps = new Map<DeviceId, Map<DropPoint, (() => void) | null>>();
+	/** Live messages (COMMITTED / COMMIT_NOTICE) still to lose per device on an open socket (lostSend). */
+	readonly lose = new Map<DeviceId, number>();
+	/** Commit faults armed for the next matching group commit, oldest first. */
+	readonly armedCommits: ArmedCommitFault[] = [];
+	/** Taps that fired: drops by point, lost live messages, armed commit faults applied. */
+	readonly taps = { append: 0, notice: 0, receipt: 0, lost: 0, commitFaults: 0 };
 	/** Hostile relay (SimRelay.hideFrom): rows of a hidden stream are never pushed to that device. */
 	hiddenFor: (deviceId: DeviceId, stream: StreamName) => boolean = () => false;
 	/** Cloudflare-side daily row limit exhausted until this wall time (0 = not). */
@@ -185,6 +209,29 @@ export class RelayEngine {
 	serverClose(session: SimRelaySession, code: number, errorCode: string | null, wasClean: boolean): void {
 		session.serverClose(code, errorCode, wasClean);
 		session.gate = null;
+	}
+
+	/** One armed drop of `session`'s device at `point`: the socket is lost (abrupt 1006). */
+	private tap(session: SimRelaySession, point: DropPoint): boolean {
+		const set = this.dropTaps.get(session.deviceId);
+		if (!set?.has(point) || !session.srvOpen) return false;
+		const then = set.get(point) ?? null;
+		set.delete(point);
+		if (set.size === 0) this.dropTaps.delete(session.deviceId);
+		this.taps[point]++;
+		this.serverClose(session, 1006, null, false);
+		then?.();
+		return true;
+	}
+
+	/** A live message to `peer` the server's send swallowed while the socket stayed open (lostSend). */
+	private lost(peer: SimRelaySession): boolean {
+		const n = this.lose.get(peer.deviceId) ?? 0;
+		if (n <= 0) return false;
+		if (n === 1) this.lose.delete(peer.deviceId);
+		else this.lose.set(peer.deviceId, n - 1);
+		this.taps.lost++;
+		return true;
 	}
 
 	// ---- messages ---------------------------------------------------------------
@@ -297,6 +344,7 @@ export class RelayEngine {
 		this.pendingByKey.set(key, entry);
 		this.pendingBytes += frame.payload.byteLength;
 		this.schedule();
+		this.tap(session, "append");
 	}
 
 	/** Arms the group-commit timers (or commits now on the bytes threshold). */
@@ -349,7 +397,10 @@ export class RelayEngine {
 		this.counters[key]++;
 		const index = this.commitIndex++;
 		const queued = this.faults.shift();
-		let fault: CommitFault = queued?.fault ?? this.commitHook?.({ index, reason, frames: frames.length }) ?? "commit";
+		const armed = queued ? -1 : this.armedCommits.findIndex((a) => a.match === "any" || frames.some((f) => f.provisionalTo.size > 0));
+		const arm = armed >= 0 ? this.armedCommits.splice(armed, 1)[0] : undefined;
+		if (arm) this.taps.commitFaults++;
+		let fault: CommitFault = queued?.fault ?? arm?.fault ?? this.commitHook?.({ index, reason, frames: frames.length }) ?? "commit";
 		if (fault === "commit" && this.envDailyActive()) fault = "daily-limit";
 		const ids = frames.map((f) => ({ stream: f.stream, deviceId: f.deviceId, clientFrameId: f.clientFrameId }));
 		const report = (outcomes: readonly StoreOutcome[], rows: readonly SimRow[]): void => {
@@ -459,12 +510,15 @@ export class RelayEngine {
 				if (peer === frame.origin || frame.duplicates.includes(peer) || this.hiddenFor(peer.deviceId, frame.stream)) continue;
 				const doc = isProvisionalStream(frame.stream);
 				if (frame.provisionalTo.has(peer)) {
+					if (this.tap(peer, "notice") || !peer.srvOpen) continue;
 					flushSkips(peer);
+					if (this.lost(peer)) continue;
 					peer.send({ k: "notice", stream: frame.stream, seq: outcome.seq, deviceId: frame.deviceId, clientFrameId: frame.clientFrameId });
 					this.counters.notices++;
 					if (doc) this.tally(peer.deviceId).pushedRows++;
 				} else if (outcome.kind === "appended" && this.wants(peer, frame)) {
 					flushSkips(peer);
+					if (this.lost(peer)) continue;
 					peer.send({ k: "committed", stream: frame.stream, seq: outcome.seq, deviceId: frame.deviceId, clientFrameId: frame.clientFrameId, payload: frame.payload });
 					this.counters.committedBroadcasts++;
 					if (doc) this.tally(peer.deviceId).pushedRows++;
@@ -482,7 +536,10 @@ export class RelayEngine {
 		}
 		for (const peer of [...skips.keys()]) flushSkips(peer);
 		const head = this.store.head();
-		for (const [session, list] of receipts) session.send({ k: "receipts", head, receipts: list });
+		for (const [session, list] of receipts) {
+			if (this.tap(session, "receipt")) continue;
+			session.send({ k: "receipts", head, receipts: list });
+		}
 	}
 
 	/** Sim only: buffered frames matching `which` are lost uncommitted (no receipt; PROVISIONAL holders drop). */
@@ -559,6 +616,8 @@ export class RelayEngine {
 	 */
 	restart(loseSubscriptions = false): void {
 		this.dropPending();
+		// The H2 index is memory only: the next commit of each stream rebuilds it from the stored segments.
+		this.store.forgetDedupe();
 		this.latchUntil = 0;
 		this.buckets.clear();
 		const head = this.store.head();

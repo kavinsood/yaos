@@ -97,6 +97,7 @@ async function resumeConflictCopy(env: Env, i: IntentRecord, docId: DocId, from:
 			{ syncedPut: [s], basePut: base ? [base] : [], baseDrop: base ? [] : [docId], intentDrop: [i.id] },
 			[ctx.localEntry(from, stat, "markdown", hash, fingerprint), ctx.localEntry(to, copy.stat, "markdown", copy.hash, copy.fingerprint)],
 		);
+		ctx.deps.observeConflict?.("recovered", "intent");
 		return true;
 	} finally {
 		h.release();
@@ -147,6 +148,7 @@ async function resumeCanvasCopy(env: Env, i: IntentRecord, docId: DocId, from: V
 			{ syncedPut: [s], basePut: base ? [base] : [], baseDrop: base ? [] : [docId], intentDrop: [i.id] },
 			[ctx.localEntry(from, stat, "canvas", hash, fingerprint), ctx.localEntry(to, copy.stat, "canvas", copy.hash, copy.fingerprint)],
 		);
+		ctx.deps.observeConflict?.("recovered", "intent");
 		return true;
 	} finally {
 		h.release();
@@ -166,6 +168,7 @@ async function resumeKeepBoth(env: Env, i: IntentRecord, docId: DocId, from: Vau
 		return true;
 	}
 	const res = await fetchAndWrite(env, docId, from, r.blob.hash, r.blob.size, { t: "hash", hash: subject });
+	if (res === "ok") env.ctx.deps.observeConflict?.("recovered", "intent");
 	return res === "ok";
 }
 
