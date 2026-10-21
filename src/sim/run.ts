@@ -574,7 +574,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			brakeUser.poll();
 			sampleBounds();
 			// Blob store calls outside the blob queue (a snapshot upload's) count too: a stalled one ends by its idle window.
-			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending();
+			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && !(d.vrt?.creators.busy() ?? false) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending();
 			const fp = print();
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
@@ -600,6 +600,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				else if (!(d.vrt?.log.isIdle() ?? false)) why.push(`${d.name} log busy`);
 				else if (adoptables(d) > 0) why.push(`${d.name} ${adoptables(d)} adoptable`);
 				else if (!(d.vrt?.snaps.idle ?? true)) why.push(`${d.name} snapshot job busy`);
+				else if (d.vrt?.creators.busy()) why.push(`${d.name} waits on a body-less doc's creator`);
 				else if ((d.vrt?.blobs.queued().length ?? 0) > 0) why.push(`${d.name} blob queue ${d.vrt?.blobs.queued().map((q) => `${q.direction}:${q.path}#${q.attempts}`).join(" ")}`);
 				if (d.vault.pendingEvents() > 0) why.push(`${d.name} vault events`);
 				if (d.workspace.views_().some((v) => v.isDirty())) why.push(`${d.name} dirty view`);

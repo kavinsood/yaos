@@ -84,6 +84,15 @@ export interface EngineTuning {
 	 * (STREAM_HOLD_MAX_MS, 5 s) for a frame of the dead store still in its buffer.
 	 */
 	readonly inheritUnfencedWaitMs: number;
+	/**
+	 * Abandoned creates (DESIGN §i.5): a live doc with no body whose creator the server reports retired is dropped
+	 * (and its file, where one is held, re-created) once the creator has read retired this long. A successor store
+	 * that fenced its predecessor re-issues the predecessor's mirrored frames as soon as it connects, so a body on
+	 * its way still lands first.
+	 */
+	readonly abandonedCreateGraceMs: number;
+	/** How long a creator that read live (or unknown) is not asked about again. */
+	readonly creatorStatusRecheckMs: number;
 }
 
 /**
@@ -123,6 +132,8 @@ export const DEFAULT_TUNING: EngineTuning = {
 	rollOwnSeals: ROLL_OWN_SEALS,
 	blobGcGraceMs: 7 * 24 * 60 * 60_000,
 	inheritUnfencedWaitMs: 10_000,
+	abandonedCreateGraceMs: 30_000,
+	creatorStatusRecheckMs: 5 * 60_000,
 	knownRules: KNOWN_RULES,
 	subscribeDebounceMs: SUBSCRIBE_DEBOUNCE_MS,
 	recentUnboundKeep: RECENT_UNBOUND_KEEP,

@@ -18,10 +18,11 @@ import type * as Y from "yjs";
 import type { Handle } from "../body/handles";
 import { canvasDocHashInput } from "../reconcile/canvasDoc";
 import type {
-	BodyVersion, CfgFoldState, CfgOp, ContentHash, DocId, NsOp, PathKey, RemoteEntry, Seq, StreamName,
+	BodyVersion, CfgFoldState, CfgOp, ContentHash, DeviceId, DocId, NsOp, PathKey, RemoteEntry, Seq, StreamName,
 } from "../../core/types";
 import type { BodyHandle, LogPort, RemoteView, SubmitNsOptions } from "../reconcile/deps";
 import type { LogEngine } from "../runtime/engine";
+import type { CreatorStatus } from "./creatorStatus";
 import type { CfgLogPort } from "../settings/cfgSync";
 import type { SnapIndexPort } from "../snapshots/snapIndex";
 import type { SnapOp } from "../../core/snap/record";
@@ -33,7 +34,7 @@ export class ComposedLog implements LogPort {
 	private readonly hashMemo = new Map<DocId, { key: string; hash: ContentHash }>();
 	stats = { views: 0, viewMemoHits: 0, acquires: 0 };
 
-	constructor(readonly log: LogEngine, private readonly onSubmit: () => void = () => undefined) {}
+	constructor(readonly log: LogEngine, private readonly onSubmit: () => void = () => undefined, private readonly creators: CreatorStatus | null = null) {}
 
 	invalidate(): void {
 		this.memo = null;
@@ -56,6 +57,7 @@ export class ComposedLog implements LogPort {
 		const appliedSeq = new Map<DocId, Seq>();
 		const restoreDuty = new Set<DocId>();
 		const lostCreateBody = new Set<DocId>();
+		const ask = new Set<DeviceId>();
 		const pending = log.docsWithPendingBody();
 		for (const h of c.handles.all()) if (!h.builder.empty) pending.add(h.docId);
 		for (const e of ns.state.entries.values()) {
@@ -72,16 +74,20 @@ export class ComposedLog implements LogPort {
 			// Fallback duty, here without the 30 s grace (integration-notes deviation): rows exist
 			// past the delete base, so some edit was not seen by the deleter whoever authored it.
 			if (e.state === "deleted" && rec && (rec.lastOwnSeq > e.deleteBaseBodySeq || rec.remoteHeadSeq > e.deleteBaseBodySeq)) restoreDuty.add(e.docId);
-			// Own create (this store's, or an earlier store's of this install: identity-per-store §5.2), ns and stream
-			// heads read in this session, no row anywhere and no own frame left: the initial body was lost with the
-			// store (wipe, mirror lag). Nobody else can supply it.
-			if (this.nsCaughtUp && e.state === "live" && (e.createdBy === c.self || c.lineage.has(e.createdBy)) && body.caughtUp && !body.hasContent
-				&& e.createHash !== EMPTY_CONTENT_HASH && !pending.has(e.docId)) lostCreateBody.add(e.docId);
+			// A create whose initial body never reached the relay (ns and stream heads read in this session, no row
+			// anywhere, no own frame left) and never will: an own create (this store's, or an earlier store's of this
+			// install: identity-per-store §5.2) lost with the store (wipe, mirror lag), or a create of a store the
+			// server reports retired (DESIGN §i.5 "Abandoned creates"; asked about here, decided by CreatorStatus).
+			if (this.nsCaughtUp && e.state === "live" && body.caughtUp && !body.hasContent && e.createHash !== EMPTY_CONTENT_HASH && !pending.has(e.docId)) {
+				if (e.createdBy === c.self || c.lineage.has(e.createdBy) || this.creators?.abandoned(e.createdBy)) lostCreateBody.add(e.docId);
+				else ask.add(e.createdBy);
+			}
 			if (body.caughtUp && e.state === "live") {
 				const h = this.knownHash(e.docId, e.kind as "markdown" | "canvas", body.stream, body.version);
 				if (h) textHash.set(e.docId, h);
 			}
 		}
+		this.creators?.seen(ask);
 		for (const [key, id] of ns.index.byPathKey) remoteByPathKey.set(key, id);
 		const pendingMoves = new Map<DocId, Set<PathKey>>();
 		for (const f of ns.pending) {

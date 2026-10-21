@@ -47,6 +47,7 @@ import type { EngineE2ee } from "../keyring/keyringRuntime";
 import { localDay, LocalDayCounter } from "./localDayCounter";
 import { EpochBases } from "./epochBases";
 import { ComposedLog } from "./logPort";
+import { CreatorStatus } from "./creatorStatus";
 import { PassScheduler } from "./passScheduler";
 import { mergeStatus, type DiskSideStatus } from "./statusMerge";
 import { importSyncedMirror, SyncedMirrorWriter } from "./syncedMirror";
@@ -150,12 +151,27 @@ export class VaultRuntime {
 	private cfgRunning: Promise<void> | null = null;
 	private cfgAgain = false;
 	private readonly offs: (() => void)[] = [];
+	/** Retired creators of body-less docs (DESIGN §i.5 "Abandoned creates"). */
+	readonly creators: CreatorStatus;
 	readonly stats = { passes: 0, ownFoldEvents: 0, retargets: 0, bindable: 0, cfgPasses: 0, snapshots: 0, bodyChanges: 0 };
 
 	private constructor(readonly o: VaultRuntimeStart, readonly log: LogEngine) {
 		this.settings = o.settings;
 		this.paused = o.paused;
-		this.port = new ComposedLog(log, () => this.checkBindable());
+		const status = o.ports.identity?.status?.bind(o.ports.identity) ?? null;
+		this.creators = new CreatorStatus({
+			status, mono: () => log.c.mono(), setTimer: (ms, fn) => o.ports.clock.setTimer(ms, fn), clearTimer: (h) => o.ports.clock.clearTimer(h),
+			graceMs: log.c.tuning.abandonedCreateGraceMs, recheckMs: log.c.tuning.creatorStatusRecheckMs,
+			onAbandoned: () => {
+				this.port.invalidate();
+				this.sched.request({ t: "full" });
+			},
+			onRecheck: () => {
+				if (!this.stopped && this.port.nsCaughtUp) this.port.view();
+			},
+			diag: (line) => this.diag(line),
+		});
+		this.port = new ComposedLog(log, () => this.checkBindable(), this.creators);
 		const b = log.c.budgets;
 		this.sched = new PassScheduler({
 			clock: o.ports.clock,
@@ -763,6 +779,7 @@ export class VaultRuntime {
 		if (this.stopped) return;
 		this.stopped = true;
 		this.clearHiddenTimer();
+		this.creators.stop();
 		if (crash) this.log.disconnect();
 		this.sched.stop();
 		// Transfers end at once (aborted; no pass job awaits one); the pass in flight starts no further job.

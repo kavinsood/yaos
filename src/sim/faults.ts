@@ -40,7 +40,6 @@
  * as the clock runs; settle() waits for every inspection before the checks).
  */
 
-import { EMPTY_CONTENT_HASH } from "../core/plan/planner";
 import type { DeviceId } from "../core/types";
 import type { LifecycleEvent } from "../ports/platform";
 import type { TimerHandle } from "../ports/clock";
@@ -101,6 +100,8 @@ export interface SuspendKillAction {
 
 /** A suspend-kill whose budget was not used up dies here (the OS kills a suspended app eventually). */
 export const SUSPEND_DEADLINE_MS = 5_000;
+/** After a clone, the user removes the abandoned store's registration in the console this much later. */
+export const CLONE_REMOVE_MS = 60_000;
 /** Budgets the random matrix draws (null: never killed). */
 export const SUSPEND_BUDGETS: readonly (number | null)[] = [0, 1, 2, 3, 5, null];
 
@@ -269,6 +270,8 @@ export class FaultState {
 	readonly suspends: SuspendRecord[] = [];
 	/** Suspend-kills not killed yet (heal kills them). */
 	private readonly pendingKills = new Map<number, () => void>();
+	/** Stores a clone abandoned, not yet removed in the console (CLONE_REMOVE_MS): removed at heal. */
+	private readonly abandoned = new Set<DeviceId>();
 	/** Suite-1 faults (null in a suite-0 run: they are skipped). */
 	readonly e2ee: E2eeFaults | null;
 
@@ -541,8 +544,7 @@ export class FaultState {
 		if (this.synced && [f.dev, f.src].some((i) => i === this.synced?.a || i === this.synced?.b)) return `skip ${tag}: config synced`;
 		const midSave = this.canvasClone?.blocked(f.src) ?? null;
 		if (midSave) return `skip ${tag}: ${midSave}`;
-		const stranded = this.strandedCreate(d);
-		if (stranded) return `skip ${tag}: ${stranded} created on ${d.name} has no body on the relay (abandoned-creator gap)`;
+		const old = [...d.identities];
 		this.crash(f.dev, f.downMs, {});
 		const others = diskTokens(this.devs.filter((x) => x !== d));
 		const mine = new Set<string>();
@@ -552,31 +554,18 @@ export class FaultState {
 		for (const t of mine) if (!others.has(t)) this.ledger.deleted(t);
 		this.canvasClone?.copiedOver(d, this.devs.filter((x) => x !== d));
 		d.cloneFrom(src);
+		// The user removes the old registration in the console later (or inactivity retirement does): a create of the
+		// abandoned store whose body never reached the relay is then dropped, and re-created by whoever holds the file
+		// (DESIGN §i.5 "Abandoned creates").
+		for (const id of old) this.abandoned.add(id);
+		this.later(CLONE_REMOVE_MS, () => this.removeAbandoned());
 		this.counts.clone++;
 		return `${tag} of ${src.name}, down ${f.downMs}ms`;
 	}
 
-	/**
-	 * A doc `d`'s stores created whose initial body is not on the relay yet (a pending create included), or null.
-	 * Abandoning the install then strands the doc for everyone: only the creator (its store, or a later store of its
-	 * lineage, identity-per-store §5.2 `lostCreateBody`) uploads an initial body, and a clone is no store of that
-	 * lineage. The others wait for that body (planner `body-empty`) and their edits of the file never sync. A known
-	 * gap (BACKLOG "abandoned creator"; before stores had identities, a device thrown away mid-create left it too),
-	 * so the clone fault waits for such a window to close instead of tripping convergence on it.
-	 */
-	private strandedCreate(d: SimDevice): string | null {
-		const mine = new Set<string>(d.identities);
-		const bodies = this.net.logAudit().docStreams;
-		for (const x of this.devs) {
-			const lg = x.vrt?.log;
-			if (!lg) continue;
-			if (x === d) for (const doc of lg.listDocs()) if (doc.state === "pending" && doc.kind !== "blob" && !bodies.has(doc.docId)) return doc.path;
-			for (const e of lg.c.ns.state.entries.values()) {
-				if (e.state !== "live" || e.kind === "blob" || !mine.has(e.createdBy) || e.createHash === EMPTY_CONTENT_HASH || bodies.has(e.docId)) continue;
-				return e.path;
-			}
-		}
-		return null;
+	private removeAbandoned(): void {
+		for (const id of this.abandoned) this.net.removeDevice(id);
+		this.abandoned.clear();
 	}
 
 	/**
@@ -712,5 +701,6 @@ export class FaultState {
 		for (const d of this.devs) d.vault.failNextOps = 0;
 		this.synced?.end();
 		this.e2ee?.heal();
+		this.removeAbandoned();
 	}
 }
