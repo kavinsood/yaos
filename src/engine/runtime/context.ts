@@ -14,6 +14,7 @@ import { VAULT_UPGRADE_NOTICE, VAULT_UPGRADE_STOPPED, VAULT_UPGRADE_TEXT, type D
 import { BlobTouch, committedBlobHashes } from "../blobs/touch";
 import { TransferLink } from "../blobs/transferLink";
 import { CheckpointState, type CheckpointDeps } from "../body/checkpoints";
+import { RetireState } from "../body/retire";
 import { DailyLimitNoticeGate } from "./dailyLimit";
 import type { FrameCtx } from "../body/frames";
 import type { HandleManager } from "../body/handles";
@@ -100,6 +101,8 @@ export class EngineCtx {
 	readonly deviceClass: DeviceClass;
 	readonly outbox = new OutboxCache();
 	readonly ckpt = new CheckpointState();
+	/** Retired streams of dead docs (body/retire.ts): duty, fallback clocks, counters. */
+	readonly retire = new RetireState();
 	readonly gateCtx: Mut<GateCtx>;
 	readonly deps: EngineDeps;
 	/** R2 put policy and R3 send gate (e2ee-design §10.4). */
@@ -516,6 +519,7 @@ export class EngineCtx {
 	 */
 	private async afterNsChange(reload: boolean): Promise<void> {
 		const folded = reload ? await this.ns.load() : await this.ns.advance();
+		this.retire.noteFold(folded, this.self);
 		const changes = this.ns.reconcileHeld(this.outbox);
 		if (changes.length > 0) this.applyOutboxResult(await this.repo.tOutbox(changes));
 		if (folded.length > 0 || reload) this.emit("onNsFold", () => this.opts.onNsFold?.(folded, reload));

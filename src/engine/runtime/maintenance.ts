@@ -1,7 +1,7 @@
 /**
  * Periodic engine work (one tick every maintenanceMs, never overlapping):
  * gap feed (DESIGN §d.7), local compaction (§d.8), remote
- * checkpoint duty (§d.9), daily-limit release, residency budget, expiry of
+ * checkpoint duty (§d.9), retired streams of dead docs (§b.5, body/retire.ts), daily-limit release, residency budget, expiry of
  * recently unbound subscriptions, catch-up scheduling (which also starts the
  * reads whose skip deferral ran out, §d.7).
  *
@@ -13,10 +13,12 @@
  */
 
 import { TAIL_HARD_ROWS } from "../../core/limits";
-import { NS_STREAM, SNAP_STREAM, type StreamName } from "../../core/types";
+import { NS_STREAM, SNAP_STREAM, type DocId, type StreamName } from "../../core/types";
 import type { TimerHandle } from "../../ports/clock";
 import { bodyCheckpointDue, foldCheckpointDue, writeBodyCheckpoint, writeFoldCheckpoint } from "../body/checkpoints";
 import { compactBody, compactFold, needsCompaction } from "../body/compaction";
+import { deadReason, writeRetired, DROPS_PER_TICK, RETIRES_PER_TICK, type DeadReason, type FoldCompleteness } from "../body/retire";
+import type { StreamRecord } from "../store/schema";
 import type { EngineCtx } from "./context";
 
 const COMPACTIONS_PER_TICK = 4;
@@ -30,7 +32,7 @@ export class Maintenance {
 	private readonly compactSkip = new Map<StreamName, number>();
 	/** Idle ticks in a row (no pending work, no work done): the next interval is maintenanceMs * 2^idle, capped. */
 	private idle = 0;
-	stats = { ticks: 0, gapFeeds: 0, compactions: 0, checkpoints: 0, checkpointOutcomes: {} as Record<string, number> };
+	stats = { ticks: 0, gapFeeds: 0, compactions: 0, checkpoints: 0, retires: 0, drops: 0, checkpointOutcomes: {} as Record<string, number> };
 
 	constructor(private readonly c: EngineCtx) {
 		c.onActivity = () => this.kick();
@@ -91,11 +93,13 @@ export class Maintenance {
 		const c = this.c;
 		if (c.stopped) return;
 		this.stats.ticks++;
-		const work0 = this.stats.gapFeeds + this.stats.compactions + this.stats.checkpoints;
+		const work = () => this.stats.gapFeeds + this.stats.compactions + this.stats.checkpoints + this.stats.retires + this.stats.drops;
+		const work0 = work();
 		const steps: [string, () => Promise<void> | void][] = [
 			["gap", () => this.gap()],
 			["compact", () => this.compact()],
 			["checkpoint", () => this.checkpoints()],
+			["retire", () => this.retire()],
 			["daily", () => this.daily()],
 			["keyring", () => c.keyring.tick()],
 		];
@@ -111,7 +115,7 @@ export class Maintenance {
 		c.subs.tick();
 		c.sess.scheduleCatchUp();
 		c.scheduleStatus(false);
-		const worked = this.stats.gapFeeds + this.stats.compactions + this.stats.checkpoints !== work0;
+		const worked = work() !== work0;
 		this.idle = worked || this.busy() ? 0 : this.idle + 1;
 	}
 
@@ -215,6 +219,105 @@ export class Maintenance {
 				this.count(`${cls}-error`);
 				c.ckpt.backoffUntil.set(stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
 				c.diag("checkpoint-failed", { cls, error: String(e) });
+			}
+		}
+	}
+
+	/**
+	 * The b: / c: streams whose doc is dead (body/retire.ts deadReason), with why. The ns fold's completeness is
+	 * checked (FoldRuntime.gap reads the ns tail) only when some stream's doc has no committed entry.
+	 */
+	async deadStreams(): Promise<{ readonly rec: StreamRecord; readonly why: DeadReason }[]> {
+		const c = this.c;
+		const cands: StreamRecord[] = [];
+		let absent = false;
+		for (const r of c.repo.streams()) {
+			if ((r.cls !== "body" && r.cls !== "canvas") || !r.docId) continue;
+			const e = c.ns.entry(r.docId);
+			if (e && e.state !== "merged") continue;
+			if (!e) absent = true;
+			cands.push(r);
+		}
+		if (cands.length === 0) return [];
+		let fold: FoldCompleteness = { complete: false, vaultSeq: c.repo.cursor.vaultSeq };
+		if (absent) {
+			const nsRec = c.repo.stream(NS_STREAM);
+			const ok = nsRec !== undefined && !nsRec.stale && !nsRec.frozen && (await c.ns.gap()) === null;
+			fold = { complete: ok, vaultSeq: c.repo.cursor.vaultSeq };
+		}
+		const pending = (d: DocId) => c.createDependency(d) !== null;
+		const out: { rec: StreamRecord; why: DeadReason }[] = [];
+		for (const r of cands) {
+			const rec = c.repo.stream(r.stream);
+			if (!rec) continue;
+			const why = deadReason(rec, c.ns.entry(r.docId!), fold, pending);
+			if (why) out.push({ rec, why });
+		}
+		return out;
+	}
+
+	/**
+	 * Dead streams (DESIGN §b.5 "retired"): a retired checkpoint where the relay still holds rows beyond its
+	 * checkpoint (duty now, others after the fallback), then the local records once nothing lies beyond it.
+	 */
+	private async retire(): Promise<void> {
+		const c = this.c;
+		const dead = await this.deadStreams();
+		const st = c.retire;
+		// Not pending: a stream frozen on a disputed checkpoint (never read again, nothing here can finish it), and one
+		// with nothing left to retire whose replica the host holds (a view still bound to it: dropped once released).
+		st.pending = dead.filter(({ rec }) => {
+			if (rec.frozen && rec.frozenReason === "checkpoint-disputed") return false;
+			const h = c.handles.peek(rec.stream);
+			return !(rec.remoteCheckpointCoversSeq >= rec.remoteHeadSeq && h && !c.handles.isClean(h));
+		}).length;
+		if (dead.length === 0) return;
+		const s = c.session;
+		const now = c.mono();
+		const canWrite = s !== null && s.canWrite && !c.readOnly && c.phase === "live" && !c.background && c.gate() === null && now >= c.ckpt.holdUntilMono;
+		let puts = RETIRES_PER_TICK;
+		let drops = DROPS_PER_TICK;
+		for (const { rec, why } of dead) {
+			if (c.stopped || (puts <= 0 && drops <= 0)) return;
+			const stream = rec.stream;
+			// Own frames on their way (a late edit of a pruned doc): their rows come first, then the stream is retired.
+			if (c.sess.isReading(stream) || rec.stale || c.outbox.ofStream(stream).length > 0) continue;
+			if (rec.remoteCheckpointCoversSeq >= rec.remoteHeadSeq) {
+				if (drops <= 0) continue;
+				const h = c.handles.peek(stream);
+				if ((h && !c.handles.isClean(h)) || c.handles.loadingOf(stream)) continue;
+				drops--;
+				if (!(await c.repo.tDropStream(stream, rec))) continue;
+				c.handles.drop(stream);
+				for (const m of [c.ckpt.condSince, c.ckpt.jitter, c.ckpt.lastActivity, c.ckpt.backoffUntil, c.ckpt.tooLarge]) m.delete(stream);
+				st.forget(stream, rec.docId);
+				st.stats.dropped++;
+				st.pending = Math.max(0, st.pending - 1);
+				this.stats.drops++;
+				c.diag("retire-dropped", { cls: rec.cls, why, seq: rec.remoteHeadSeq });
+				continue;
+			}
+			if (!canWrite || puts <= 0 || !s || c.session !== s) continue;
+			if ((st.backoffUntil.get(stream) ?? 0) > now) continue;
+			const duty = (rec.docId !== null && st.duty.has(rec.docId)) || rec.lastOwnSeq >= rec.remoteHeadSeq;
+			if (!st.since.has(stream)) st.since.set(stream, now);
+			if (!duty && now - st.since.get(stream)! < c.tuning.checkpoint.fallbackMs + this.jitter(stream)) continue;
+			puts--;
+			try {
+				const o = await writeRetired(c.deps, c.ckpt, s, stream, { refreshFirst: !duty });
+				this.count(`retire-${o.t}`);
+				if (o.t === "ok") {
+					st.stats.written++;
+					this.stats.retires++;
+					c.diag("retire-written", { cls: rec.cls, why, coversSeq: o.coversSeq, duty });
+				} else if (o.t === "not-advancing") st.stats.refreshed++;
+				else if (o.t === "conflict") st.stats.conflicts++;
+				// A refresh that found rows this device has not read: catch-up reads them, the next tick retires.
+				else if (o.t === "refused" || (o.t === "skipped" && o.reason !== "not-caught-up")) st.backoffUntil.set(stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
+			} catch (e) {
+				this.count("retire-error");
+				st.backoffUntil.set(stream, now + CHECKPOINT_ERROR_BACKOFF_MS);
+				c.diag("checkpoint-failed", { cls: rec.cls, error: String(e) });
 			}
 		}
 	}

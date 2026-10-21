@@ -9,6 +9,7 @@
  * already holds the adoptable's content (its commit lies under the checkpoint, the row may be GC'd).
  *
  * Checkpoint with coversSeq > snapshotCoversSeq (after the gate):
+ *  - retired (a dead doc's b: / c: stream, DESIGN §b.5): nothing adopted, counted `checkpoint-retired`;
  *  - fresh stream (no snapshot, no tail): stored as the snapshot in the page tx;
  *  - body/canvas otherwise: union job (scratch doc = snapshot + tail <= C +
  *    checkpoint) -> T_snapshot(fromRemote);
@@ -178,7 +179,10 @@ export async function readStream(deps: CatchUpDeps, session: RelaySession, strea
 			}
 			const content = g.checkpoint;
 			if (content.encoding === CheckpointEncoding.retired) {
-				// Retired streams (e.g. pruned bodies) are not adopted locally (gap: retirement handling).
+				// A dead doc's stream (pruned, or a merged alias; body/retire.ts): a checkpoint with no state. Nothing is
+				// adopted (the union adds nothing), rows above it still apply, and the page completes the stream as any
+				// other. The maintenance tick drops the stream's records once the fold says the doc is dead and nothing
+				// lies above the checkpoint (Repo.tDropStream); a reader whose fold still has the doc keeps them.
 				deps.diag("checkpoint-retired", { cls, coversSeq: ck.coversSeq });
 			} else if (isFresh(rec)) {
 				freshSnapshot = { stream, coversSeq: ck.coversSeq, encoding: content.encoding, bytes: content.state, createdAtMs: deps.nowMs() };

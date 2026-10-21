@@ -867,6 +867,49 @@ export class Repo {
 		});
 	}
 
+	/**
+	 * T_drop_stream (DESIGN §b.5 "retired", §e.3): a dead doc's stream (pruned, or a merged alias) leaves the store in
+	 * one transaction: its stream record, snapshot, tail rows, quarantine records and checkpoint duty. Refused (false)
+	 * when the record changed since the caller decided (`expect`: a row or a checkpoint arrived meanwhile), the
+	 * outbox still holds a record of the stream (an own frame on its way: its receipt would need the record), or the
+	 * disk side still tracks the doc (a synced record or an open intent names it): a job it planned may still load the
+	 * replica, and a dropped stream loads as an empty doc, which a merge would read as "the remote side removed
+	 * everything". The planner's absent / merged rows end with syncedDrop / rebind, and the drop follows. The
+	 * vault cursor is untouched: every seq of the stream stays accounted, and a later row recreates the record
+	 * (tLive / tFeedPage) as for any new stream.
+	 */
+	tDropStream(stream: StreamName, expect: Pick<StreamRecord, "remoteHeadSeq" | "remoteCheckpointCoversSeq">): Promise<boolean> {
+		return this.serial("tDropStream", async () => {
+			let dropDuty = false;
+			const docId = streamDocId(stream);
+			const ok = await this.db.tx([STORE.streams, STORE.snapshots, STORE.tail, STORE.quarantine, STORE.outbox, STORE.meta, STORE.synced, STORE.intents], "readwrite", async (tx) => {
+				const r = await tx.get(STORE.streams, stream);
+				if (r && (r.remoteHeadSeq !== expect.remoteHeadSeq || r.remoteCheckpointCoversSeq !== expect.remoteCheckpointCoversSeq)) return false;
+				if (await tx.countByIndex(STORE.outbox, INDEX.outboxByStream, streamOrderRange(stream)) > 0) return false;
+				if (docId && (await tx.get(STORE.synced, docId) || (await tx.getAll(STORE.intents)).some((i) => i.docId === docId))) return false;
+				tx.delete(STORE.streams, stream);
+				tx.delete(STORE.snapshots, stream);
+				tx.deleteRange(STORE.tail, tailRange(stream));
+				tx.deleteRange(STORE.quarantine, tailRange(stream));
+				if (this.ckptDuty.has(stream)) {
+					dropDuty = true;
+					const duty = new Set(this.ckptDuty);
+					duty.delete(stream);
+					tx.put(STORE.meta, { key: "ckptDuty", streams: [...duty] });
+				}
+				return true;
+			});
+			if (!ok) return false;
+			this.cache.delete(stream);
+			if (dropDuty) {
+				const duty = new Set(this.ckptDuty);
+				duty.delete(stream);
+				this.ckptDuty = duty;
+			}
+			return true;
+		});
+	}
+
 	/** Wait for every queued write. */
 	drain(): Promise<void> {
 		return this.serial("drain", async () => undefined);
