@@ -1504,8 +1504,8 @@ exactly the committed transactions". Types are in `src/engine/store/schema.ts`.
   store written before that rule can still have frames held behind an adopted record; `reconcileHeld` treats
   those as dependency-gone.
 - **`pending` with `dependsOn`** is a live create's body frame (§d.4). It is sent only after that create: while the
-  create is in the outbox, the frame goes only once the create is inflight on the same session. It is deleted when
-  the create folds `merged`. When the create's record is replaced under a new `clientFrameId` (own stale-epoch copy,
+  create is in the outbox, the frame goes only once the create is inflight on the same session. When the create
+  folds `merged` it stays to its receipt (I1): it commits as a junk row on the loser's stream (§c.5). When the create's record is replaced under a new `clientFrameId` (own stale-epoch copy,
   repo.ts `rename`), the frame is re-pointed like a held one.
 - **IDB booleans.** `stale` and `frozen` are stored as `0 | 1` (IDB cannot index booleans); no index uses them.
 - **Schema version.** `DB_SCHEMA_VERSION` (`src/engine/store/schema.ts`) changes with any store, index or record

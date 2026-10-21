@@ -257,12 +257,12 @@ test("a merged create's held frames stay in the outbox until its stream is dropp
 		assert.equal(await a.c.repo.tDropStream(stream, rec0), false, "held frames not named: refused");
 		// The disk side still tracks the loser (its synced record: the planner writes its text to the file first).
 		const tracked = { docId: loser, path: "same.md", pathKey: "same.md", kind: "markdown", contentHash: "0".repeat(64), fingerprint: "0".repeat(64), size: 5, mtimeMs: 0, bodyVersion: null, blobRev: 0, nsTouchSeq: 0, hasBase: false };
-		await a.c.repo.db.tx([STORE.synced], "readwrite", (tx) => tx.put(STORE.synced, tracked as never));
+		await a.c.repo.db.tx([STORE.synced], "readwrite", async (tx) => { tx.put(STORE.synced, tracked as never); });
 		await a.reconnect();
 		await until(() => a.c.ns.entry(loser)?.state === "merged", 5_000, "merged");
 		await sleep(1_000); // maintenance ticks: the retire finds the dead stream and may not drop it
 		assert.deepEqual(a.c.outbox.ofStream(stream).map((r) => r.clientFrameId), held.map((r) => r.clientFrameId), "kept at the merge");
-		await a.c.repo.db.tx([STORE.synced], "readwrite", (tx) => tx.delete(STORE.synced, loser));
+		await a.c.repo.db.tx([STORE.synced], "readwrite", async (tx) => { tx.delete(STORE.synced, loser); });
 		await until(() => a.c.outbox.size === 0, 10_000, "dropped");
 		assert.equal(a.c.outbox.size, 0, "dropped with the loser's stream once nothing tracks it");
 		assert.equal((await a.c.repo.outboxAll()).length, 0);

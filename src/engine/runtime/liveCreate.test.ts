@@ -77,7 +77,7 @@ void test("non-live create (onboarding, first pass after start): body frames hel
 	}
 });
 
-void test("live create merged away (§c.5 identical duplicate) with frames sent: the loser's frames never reach a doc, a's outbox drains", async () => {
+void test("live create merged away (§c.5 identical duplicate) with frames sent: the loser's frames never reach a doc, a's outbox drains by receipts", async () => {
 	const relay = new SimRelay();
 	const commits: SimCommitInfo[] = [];
 	relay.onCommit((c) => commits.push(c));
@@ -98,7 +98,7 @@ void test("live create merged away (§c.5 identical duplicate) with frames sent:
 		relay.setConnectFailure(null);
 		await until(() => a.c.ns.state.entries.get(l1.docId)?.state === "merged" && a.c.outbox.size === 0, 8_000, "l1 folded merged, outbox drained");
 
-		// 2. The create commits while a is away; its body frame (written offline) is dropped once a sees the merge.
+		// 2. The create commits while a is away; its body frame (written offline) stays to its receipt (I1): junk too.
 		relay.pauseCommits();
 		const l2 = create(a, "same.md", hash);
 		const [c2] = await a.submitNs([l2], { liveCreates: true });
@@ -111,8 +111,8 @@ void test("live create merged away (§c.5 identical duplicate) with frames sent:
 		relay.setConnectFailure(null);
 		await until(() => a.c.ns.state.entries.get(l2.docId)?.state === "merged" && a.c.outbox.size === 0, 8_000, "l2 folded merged, outbox drained");
 
-		// 3. The create commits alone; the body frame goes before a sees the receipt and is dropped, unreceipted, at
-		// the merge. The relay still commits it later: junk, and a late receipt for a record a no longer has.
+		// 3. The create commits alone; the body frame goes before a sees the receipt. The merge keeps it (I1: an outbox
+		// record leaves only by its receipt); the relay commits it later, junk on the loser's stream.
 		relay.setLink("dev-a" as DeviceId, { downlinkMs: 300 });
 		relay.pauseCommits();
 		const l3 = create(a, "same.md", hash);
@@ -123,9 +123,11 @@ void test("live create merged away (§c.5 identical duplicate) with frames sent:
 		const b3 = a.c.outbox.ofStream(docStream("markdown", l3.docId)!)[0]!;
 		assert.equal(b3.dependsOn, c3);
 		await until(() => a.c.sender.isInflight(b3.clientFrameId), 3_000, "body sent before the receipt");
-		await until(() => a.c.ns.state.entries.get(l3.docId)?.state === "merged" && a.c.outbox.size === 0, 8_000, "sent body dropped at the merge");
+		await until(() => a.c.ns.state.entries.get(l3.docId)?.state === "merged", 8_000, "l3 folded merged");
+		assert.ok(a.c.outbox.get(b3.clientFrameId), "the sent body is kept at the merge");
 		relay.resumeCommits();
 		await relay.flush();
+		await until(() => a.c.outbox.size === 0, 8_000, "l3's body receipted, outbox drained");
 		relay.setLink("dev-a" as DeviceId, {});
 
 		await converged([a, b]);
@@ -133,7 +135,7 @@ void test("live create merged away (§c.5 identical duplicate) with frames sent:
 		const s1 = docStream("markdown", l1.docId)!;
 		const s2 = docStream("markdown", l2.docId)!;
 		assert.ok(commits.some((c) => c.frames.some((f) => f.stream === NS_STREAM && f.deviceId === "dev-a") && c.frames.some((f) => f.stream === s1)), "l1's body committed with its create: junk on the loser's stream");
-		assert.ok(!commits.some((c) => c.frames.some((f) => f.stream === s2)), "l2's unsent body frame was dropped");
+		assert.ok(commits.some((c) => c.frames.some((f) => f.stream === s2)), "l2's body frame committed after the merge: junk on the loser's stream");
 		for (const e of [a, b]) {
 			const live = e.listDocs().filter((d) => d.state === "live");
 			assert.deepEqual(live.map((d) => d.docId), [w], "only the winner is live");
