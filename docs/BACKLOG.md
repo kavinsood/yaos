@@ -194,7 +194,12 @@ Kept here until `sim-port` merges; then git history holds them.
   the doc's stream record (also for an ns checkpoint adopted past the prune), and the pruned row re-creates a file
   with own rows past that base instead of trashing it. The soak's storm failures were the same: a mass delete, or an
   epoch reset's migrated-loser collapse, pruned in the frame that made it. The sim's small cap now draws 0..8, pruned
-  to 0..cap (goal 0: every delete pruned at once); plans in `src/sim/regressions/prune-*.json`.
+  to 0..cap (goal 0: every delete pruned at once); plans in `src/sim/regressions/prune-*.json`. Found by the
+  small-cap sweeps and fixed on the same branch: the re-create merges a replica ahead of the file (an unsaved bound
+  edit) into it first; a reload (adopted ns checkpoint) retargets bound docs the new state lacks (a view pinned a
+  dead stream); and `bindTarget` follows observed renames (a view bound a live doc to another doc's renamed file and
+  the bind-time merge destroyed its content: storm seed 86, not prune-related,
+  `src/sim/regressions/bind-renamed-file-onto-moved-doc-path.json`).
 - **PLAN-PRUNED** (d1f8a750): the planner's "absent (pruned)" row tells a prune from an own create that folded as
   ignored; such a file is re-created, never trashed, and a file owned by a live doc at the path is never touched
   (§f.2).
