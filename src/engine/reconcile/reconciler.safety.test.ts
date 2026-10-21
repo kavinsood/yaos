@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { VaultPath } from "../../core/types";
 import { World } from "./testkit/world";
+import { KeyMissingError } from "../keyring/writeGate";
 
 const P = (s: string): VaultPath => s;
 
@@ -228,4 +229,24 @@ test("transient read error outside the pass scope still reports unread", async (
 	w.flushEvents();
 	const r = await w.r.pass({ t: "docs", docIds: [], pathKeys: [] });
 	assert.equal(r.unread, 1);
+});
+
+test("write gate shut (key-missing): a merge job fails before it edits the replica, so no unframed edit pins it resident; the pass after the gate opens merges", async () => {
+	// Soak seed 2006566456: merges while revoked-epoch left their edits in the frame builders (commitEdits refused on
+	// the gate), each replica unevictable (DESIGN §d.1), so C held 5 docs on a residency budget of 3.
+	const CANVAS0 = '{"nodes":[],"edges":[]}';
+	const CANVAS1 = '{"nodes":[{"id":"n1","type":"text","text":"t","x":0,"y":0,"width":10,"height":10}],"edges":[]}';
+	for (const [path, before, after] of [["m.md", "one\n", "one\ntwo\n"], ["c.canvas", CANVAS0, CANVAS1]] as const) {
+		const { w, id } = await withDoc(path, before);
+		w.log.writeGate = "revoked-epoch";
+		w.vault.userWrite(path, after);
+		await assert.rejects(w.sync(3), KeyMissingError, `${path}: the pass fails on the gate`);
+		assert.equal(w.log.view().docsWithPendingBody.has(id), false, `${path}: nothing applied to the replica`);
+		assert.equal(w.vault.text(path), after, `${path}: the file keeps the edit`);
+		w.log.writeGate = null;
+		await w.sync();
+		assert.equal(w.log.view().docsWithPendingBody.size, 0, `${path}: merged and framed once writes are back`);
+		assert.equal(w.vault.text(path), after);
+		if (path === "m.md") assert.equal(w.log.text(id), after);
+	}
 });

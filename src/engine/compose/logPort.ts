@@ -189,6 +189,7 @@ export class ComposedLog implements LogPort {
 			get bound() {
 				return h.bound;
 			},
+			assertWritable: () => h.assertWritable(),
 			commitEdits: async () => {
 				try {
 					return await h.commitEdits();

@@ -820,6 +820,10 @@ cold ──load──▶ resident ──bind──▶ bound
 - **Budgets.** `maxResidentDocs` and `maxResidentBytes` per device class (§i.2).
   - A load never waits: it first evicts clean handles, LRU first, and goes over budget when none is clean
     (`HandleCache.enforceBudget`, `src/engine/body/handles.ts`).
+  - While the write gate is shut (e2ee-design §9.3) a merge job edits nothing: `BodyHandle.assertWritable` throws
+    before the first edit (the commit would be refused anyway, and the file still holds the change for the pass after
+    the gate opens). Otherwise every file merged while key-missing would leave an unframed edit in its builder and
+    its replica unevictable, past the budget.
   - `memory-pressure` is declared (`src/ports/platform.ts:26`) but no host source raises it, and
     `HandleCache.evictAllClean` (`src/engine/body/handles.ts:196-197`) is called only by tests. Nothing runs.
 

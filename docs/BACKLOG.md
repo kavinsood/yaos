@@ -177,6 +177,13 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-GATED-RESIDENCY** (`fix-refold`, soak seed 2006566456, invariant 6 "5 resident docs, budget 3"): an engine
+  bound violation, not a tolerance issue. While C waited revoked-epoch for its QR, each pass's merge jobs applied the
+  disk diff to the replica and then failed in `commitEdits` on the write gate; the edit stayed in the frame builder,
+  the replica was no longer clean and could not be evicted (DESIGN §d.1), so every file merged while key-missing
+  stayed resident (a phone left key-missing under a sync tool would hold one Y.Doc per changed file). Merge jobs
+  (markdown, canvas, the epoch's old deletes) now call `BodyHandle.assertWritable` before their first edit. Plan
+  `src/sim/regressions/gated-merge-pins-replicas.json`, test in `src/engine/reconcile/reconciler.safety.test.ts`.
 - **SIM-LOST-SEND-IDLE** (`fix-refold`, soak seed 935329097, relay faults: D behind the relay at quiescence): the
   relay lost D's last live rows before a quiet period (lostSend) and nothing later showed the gap. Two halves. (1) Sim
   fidelity: the sim session (the wsRelay role) ran no idle liveness, so no VAULT_PING ever brought the head; it now

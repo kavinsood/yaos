@@ -67,6 +67,14 @@ export interface BodyHandle {
 	/** A main replica is attached (open note): the projection never writes the file (§d.2). */
 	readonly bound: boolean;
 	/**
+	 * Throws (KeyMissingError) when edits could not be committed now: the write gate is shut (e2ee-design §9.3). Call
+	 * it before applying anything with `mergeOrigin`. An edit that cannot be framed stays in the frame builder and
+	 * pins the replica resident until the gate opens (DESIGN §d.1 evicts clean handles only), so a pass that merged
+	 * many files while key-missing held every one in memory past the residency budget (soak seed 2006566456); its
+	 * commitEdits failed on the gate anyway, and the file it merged from still holds the edit for the pass after.
+	 */
+	assertWritable(): void;
+	/**
 	 * T_edit for everything applied with `mergeOrigin` since acquire / the last
 	 * call: the frame builder closes the frame(s) into the outbox (§d.4). The
 	 * returned version is the body version after those frames.

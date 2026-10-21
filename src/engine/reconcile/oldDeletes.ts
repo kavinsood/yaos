@@ -30,16 +30,18 @@ export async function applyOldDeletes(env: Env, docId: DocId, h: BodyHandle): Pr
 	if (!od) return;
 	let n = 0;
 	if (od.kind === "canvas") {
-		h.doc.transact(() => {
-			for (const [map, prefix] of [["nodes", "n:"], ["edges", "e:"]] as const) {
-				const m = h.doc.getMap<unknown>(map);
-				for (const id of [...m.keys()]) {
-					if (!od.keys.has(prefix + id)) continue;
-					m.delete(id);
-					n++;
-				}
-			}
-		}, h.mergeOrigin);
+		const doomed: [Y.Map<unknown>, string][] = [];
+		for (const [map, prefix] of [["nodes", "n:"], ["edges", "e:"]] as const) {
+			const m = h.doc.getMap<unknown>(map);
+			for (const id of m.keys()) if (od.keys.has(prefix + id)) doomed.push([m, id]);
+		}
+		if (doomed.length > 0) {
+			h.assertWritable();
+			h.doc.transact(() => {
+				for (const [m, id] of doomed) m.delete(id);
+			}, h.mergeOrigin);
+			n = doomed.length;
+		}
 	} else {
 		const text = h.doc.getText("text");
 		const ranges: [number, number][] = []; // [index, length], ascending
@@ -57,6 +59,7 @@ export async function applyOldDeletes(env: Env, docId: DocId, h: BodyHandle): Pr
 			pos += item.length;
 		}
 		if (ranges.length > 0) {
+			h.assertWritable();
 			h.doc.transact(() => {
 				for (let r = ranges.length - 1; r >= 0; r--) text.delete(ranges[r]![0], ranges[r]![1]);
 			}, h.mergeOrigin);

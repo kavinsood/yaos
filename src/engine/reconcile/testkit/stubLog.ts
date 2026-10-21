@@ -27,6 +27,8 @@ import { utf8Encode, utf8ByteLength } from "../../../core/codec/lib0";
 import { joinPath, leafOf, parentOf, splitExt, standInPathKey } from "../../../core/plan/pathRules";
 import { applyCanvas, canvasDocHashInput, projectCanvasBytes } from "../canvasDoc";
 import type { BodyHandle, LogPort, OwnFoldEvent, RemoteView, SubmitNsOptions } from "../deps";
+import { KeyMissingError } from "../../keyring/writeGate";
+import type { KeyMissingReason } from "../../../protocol/status";
 
 export const REMOTE = Symbol("REMOTE");
 export const MERGE = Symbol("MERGE");
@@ -93,6 +95,8 @@ export class StubLog implements LogPort {
 	onAcquire: ((docId: DocId) => void) | null = null;
 	/** Called as commitEdits starts, before the frame closes (inject editor keystrokes racing a merge). */
 	onCommitEdits: ((docId: DocId) => void) | null = null;
+	/** Non-null: the engine's write gate is shut (e2ee-design §9.3): assertWritable and commitEdits throw KeyMissingError. */
+	writeGate: KeyMissingReason | null = null;
 	/** "cork", "uncork", "ns live|held" (submitNs), "frame <docId>" (commitEdits), in order. */
 	readonly trace: string[] = [];
 	private nextClient = 1000;
@@ -351,7 +355,11 @@ export class StubLog implements LogPort {
 			doc: replica,
 			mergeOrigin: MERGE,
 			bound: b.bound,
+			assertWritable: () => {
+				if (this.writeGate !== null) throw new KeyMissingError(this.writeGate);
+			},
 			commitEdits: async () => {
+				if (this.writeGate !== null) throw new KeyMissingError(this.writeGate);
 				this.onCommitEdits?.(docId);
 				if (b.unframed.length > 0) {
 					b.localOrder = ++this.order;

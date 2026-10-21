@@ -299,6 +299,7 @@ export class LogEngine {
 			get bound() {
 				return h.bound > 0;
 			},
+			assertWritable: () => c.assertWritable(),
 			commitEdits: async () => {
 				c.assertWritable();
 				await c.docs.closeFrame(h);
