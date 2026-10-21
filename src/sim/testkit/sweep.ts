@@ -133,7 +133,7 @@ export const GENERATOR_KEYS = {
 
 /** The targeted relay faults fired at every point of the frame flow (a-relay-engine taps). */
 export const relayHits: Hits = (name, stats) => {
-	const sum = (k: keyof SimReport["stats"]["relayTaps"]) => stats.reduce((n, s) => n + s.relayTaps[k], 0);
+	const sum = (k: keyof SimReport["stats"]["relayTaps"]) => stats.reduce((n, s) => n + (s.relayTaps[k] ?? 0), 0);
 	const got = { append: sum("append"), notice: sum("notice"), receipt: sum("receipt"), lost: sum("lost"), commitFaults: sum("commitFaults") };
 	assert.ok(Object.values(got).every((n) => n > 0), `${name}: the relay faults fired at every point ${JSON.stringify(got)}`);
 };
