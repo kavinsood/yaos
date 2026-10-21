@@ -115,23 +115,36 @@ export type UserAction =
 	/** The user renames many notes one by one (a "rename with prefix" plugin): each md file with sel(path) < frac. */
 	| { readonly t: "massRename"; readonly dev: number; readonly frac: number; readonly salt: number }
 	/** An external tool rewrites many notes (formatter, find/replace, a bad sync): each md file with sel(path) < frac, shrunk. */
-	| { readonly t: "massOverwrite"; readonly dev: number; readonly frac: number; readonly salt: number };
+	| { readonly t: "massOverwrite"; readonly dev: number; readonly frac: number; readonly salt: number }
+	// Delete / restore races (RACE_OPS): the user undoes deletes and starts notes over while other devices act on them.
+	/** The user restores a note from the trash (Obsidian's .trash, the OS trash "Put back"): it reappears at its path, if free. */
+	| { readonly t: "restoreTrash"; readonly dev: number; readonly pick: number }
+	/** The user deletes a note and at once creates a new one under the same name (new text). */
+	| { readonly t: "recreate"; readonly dev: number; readonly file: number };
 
 export type OpWeights = Readonly<Record<UserAction["t"], number>>;
 
 const NO_EXTRAS = { attach: 0, attachRename: 0, attachDelete: 0, setting: 0, snapshot: 0 } as const;
 const NO_STORMS = { importStorm: 0, massDelete: 0, folderMove: 0, massRename: 0, massOverwrite: 0 } as const;
+const NO_RACES = { restoreTrash: 0, recreate: 0 } as const;
 /** Edits only (no deletes/renames). */
-export const EDIT_OPS: OpWeights = { type: 30, paste: 2, deleteToken: 6, open: 8, close: 4, switch: 3, mode: 2, create: 6, diskInsert: 8, diskDeleteToken: 3, rename: 0, delete: 0, ...NO_EXTRAS, ...NO_STORMS };
+export const EDIT_OPS: OpWeights = { type: 30, paste: 2, deleteToken: 6, open: 8, close: 4, switch: 3, mode: 2, create: 6, diskInsert: 8, diskDeleteToken: 3, rename: 0, delete: 0, ...NO_EXTRAS, ...NO_STORMS, ...NO_RACES };
 /** The full mix (the default). */
 export const FULL_OPS: OpWeights = { ...EDIT_OPS, rename: 3, delete: 2 };
+/**
+ * Delete / restore races: the full mix with deletes, renames, restores from the trash and delete-then-recreate of the
+ * same name several times as frequent, over the default eight note names, so devices often act on a note another one
+ * just deleted, restored or renamed (edit beats delete, restores against a delete since superseded, re-created paths
+ * an older restore lands on).
+ */
+export const RACE_OPS: OpWeights = { ...FULL_OPS, rename: 5, delete: 6, restoreTrash: 6, recreate: 4, diskInsert: 10 };
 /**
  * Attachment and settings actions. The runner draws them from their own RNG
  * stream between main steps, so the main plan of a seed does not depend on them.
  */
 export const EXTRA_OPS: OpWeights = {
 	type: 0, paste: 0, deleteToken: 0, open: 0, close: 0, switch: 0, mode: 0, create: 0, diskInsert: 0, diskDeleteToken: 0, rename: 0, delete: 0,
-	attach: 6, attachRename: 1, attachDelete: 1, setting: 4, snapshot: 0, ...NO_STORMS,
+	attach: 6, attachRename: 1, attachDelete: 1, setting: 4, snapshot: 0, ...NO_STORMS, ...NO_RACES,
 };
 
 /**
@@ -190,6 +203,8 @@ export function generateUserAction(rng: SeededRandom, devices: number, weights: 
 		case "folderMove": return { t: "folderMove", dev, folder: f(), name: rng.int(NAME_POOL) };
 		case "massRename": return { t: "massRename", dev, frac: 0.2 + 0.6 * rng.float(), salt: rng.int(0x7fffffff) };
 		case "massOverwrite": return { t: "massOverwrite", dev, frac: 0.3 + 0.7 * rng.float(), salt: rng.int(0x7fffffff) };
+		case "restoreTrash": return { t: "restoreTrash", dev, pick: f() };
+		case "recreate": return { t: "recreate", dev, file: f() };
 	}
 }
 
@@ -462,6 +477,30 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 				n++;
 			}
 			return n === 0 ? `skip ${tag}: nothing selected` : `${tag} ${n} notes`;
+		}
+		case "restoreTrash": {
+			// The newest trashed notes first (what the user just lost); only to a free path, as a fresh file.
+			const recs = d.vault.trashed.filter((r) => r.path.endsWith(".md")).slice(-6).reverse();
+			const rec = pickOf(recs, a.pick);
+			if (!rec) return `skip ${tag}: trash empty`;
+			if (d.vault.textOf(rec.path) !== null) return `skip ${tag}: ${rec.path} taken`;
+			// Its tokens stay deleted in the ledger: the restored text is old content, not a new write. A concurrent edit
+			// that removed one of them, or a concurrent delete no new content beats, legitimately wins over it (the merge
+			// takes the edit, the delete covers the doc); what the restore brings back is checked by convergence and by
+			// "destroyed" (it is on a disk or in a trash).
+			d.vault.userWrite(rec.path, rec.text);
+			return `${tag} ${rec.path} (trashed ${rec.mode} at ${rec.atMs})`;
+		}
+		case "recreate": {
+			const path = pickOf(markdownFiles(d), a.file);
+			const cur = path ? d.vault.textOf(path) : null;
+			if (!path || cur === null) return `skip ${tag}: no file`;
+			const seen = [cur, d.engineText(path) ?? "", ...d.workspace.views_().filter((v) => v.path === path).map((v) => v.buffer ?? "")];
+			for (const text of seen) for (const t of tokensIn(text)) w.ledger.deleted(t);
+			d.vault.userDelete(path);
+			w.ledger.add(token, d.name, step, "recreate");
+			d.vault.userWrite(path, `${token}\n`);
+			return `${tag} ${path} ${token}`;
 		}
 		case "snapshot":
 			// A user command: its export and upload run on the engine's own time (the step does not wait).
