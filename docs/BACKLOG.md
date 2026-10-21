@@ -65,12 +65,6 @@ it; only the sim does (`src/sim/e2eeFaults.ts`). A doc frozen by quarantine (mal
 or by **Rebuild local cache**. Needs a command or a button on the frozen-doc notice. (Causal-hole freezes no longer
 need it: they thaw on their own, 3a569113.)
 
-### LINT: the remaining error and the warnings
-
-`npm run lint` runs (0ef758fa cleared the `src/` errors, 465 → 1). Left: one `obsidianmd/platform` error in
-`src/host/spike/main.ts:214`, where the throwaway spike plugin records `navigator.userAgent` on purpose (the rule may
-not be disabled), and about 590 warnings. CI does not run ESLint (`.github/workflows/ci.yml`).
-
 ## 3. Bigger work
 
 ### RETIRE: relay row reclamation for deleted and pruned docs
@@ -154,5 +148,6 @@ Kept here until `sim-port` merges; then git history holds them.
   the checkpoint already holds (§d.5).
 - **SIM-TUNING** (49ef12a5, 8037e333, f273232b): `FAST_TUNING` meets §d.6 (100 × 60 ms re-read window against the
   3 s adoption timer) and `startTestEngine` refuses tuning that does not.
-- **LINT** (0ef758fa): the `src/` error backlog cleared and `npm run lint` runs; what is left is under LINT above.
+- **LINT** (0ef758fa, chore/lint-warnings): `npm run lint` is clean (0 errors, `--max-warnings 0`) and gates CI's
+  `client` job and `check:client`. Rule scoping by runtime (Node-only, worker, server) is in `eslint.config.mts`.
 - **DEPS** (d26e533c): `y-partyserver` removed.

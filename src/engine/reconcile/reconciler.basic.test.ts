@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import type { DocId, VaultPath } from "../../core/types";
 import { World } from "./testkit/world";
 
-const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
 const P = (s: string): VaultPath => s;
 
 async function booted(opts?: ConstructorParameters<typeof World>[0]): Promise<World> {

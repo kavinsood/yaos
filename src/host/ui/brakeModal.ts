@@ -36,13 +36,13 @@ export class BrakeModal extends Modal {
 		}
 		contentEl.createEl("p", { text: copy.approveHint });
 		contentEl.createEl("p", { text: copy.rejectHint });
-		contentEl.createEl("p", { text: "Later keeps everything on hold. Sync of other changes continues; you can review this again from the status bar or the \"Review held changes\" command." });
+		contentEl.createEl("p", { text: "Later keeps everything on hold. Sync of other changes continues; you can review this again from the status bar or the \"review held changes\" command." });
 
 		this.buttons = [];
 		new Setting(contentEl)
 			.addButton((b) => { this.buttons.push(b); b.setButtonText("Later").onClick(() => this.close()); })
 			.addButton((b) => { this.buttons.push(b); b.setButtonText("Reject").setCta().onClick(() => { void this.decide("rejectBrake"); }); })
-			.addButton((b) => { this.buttons.push(b); b.setButtonText("Approve").setWarning().onClick(() => { void this.decide("approveBrake"); }); });
+			.addButton((b) => { this.buttons.push(b); b.setButtonText("Approve").setDestructive().onClick(() => { void this.decide("approveBrake"); }); });
 
 		// Close by itself if the brake is resolved elsewhere (another window, a command).
 		this.unsubscribe = this.host.onChange(() => {

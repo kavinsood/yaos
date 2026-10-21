@@ -73,9 +73,9 @@ class SettingsSeedModal extends Modal {
 }
 
 function linesFragment(lines: readonly string[]): DocumentFragment {
-	const frag = document.createDocumentFragment();
+	const frag = createFragment();
 	lines.forEach((line, i) => {
-		if (i > 0) frag.appendChild(document.createElement("br"));
+		if (i > 0) frag.createEl("br");
 		frag.appendChild(document.createTextNode(line));
 	});
 	return frag;

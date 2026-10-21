@@ -24,7 +24,7 @@ import {
 	isCreating, markedCreating, pinAcross, pinnedSuite0, pinnedSuite1, pinsFromKeyring, refuseEnableE2ee, refuseKeyCommand,
 	refusePinSuite0, sawKeyring, withoutCreating, PIN_REFUSAL_TEXT, type PinRefusal,
 } from "./keys/pin";
-import { plaintextNoticeOnce, type PlaintextNoticeEnv } from "./keys/plaintextNotice";
+import { plaintextNoticeOnce } from "./keys/plaintextNotice";
 import { VaultKeyStore, type EpochKey, type SecretStorageLike } from "./keys/secretStore";
 import type { HostIdentity } from "./runtimeSupport";
 import { sameEngineSettings, sameIdentity, storedPart, type EngineRunState, type PairedIdentity, type StoredPluginData, type YaosPluginData } from "./ui/api";

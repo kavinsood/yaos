@@ -108,7 +108,7 @@ export class PairModal extends Modal {
 			});
 		}
 		contentEl.createEl("p", {
-			text: "Enter the server URL and a one-time pairing code. Create a code on a device that is already paired (YAOS settings, \"Pair another device\") or in your server's console.",
+			text: "Enter the server URL and a one-time pairing code. Create a code on a device that is already paired (YAOS settings, \"pair another device\") or in your server's console.",
 		});
 		if (this.prefill.fromLink) {
 			const e2ee = this.linkE2ee;
@@ -155,7 +155,7 @@ export class PairModal extends Modal {
 			.addButton((b) => {
 				this.pairButton = b;
 				b.setButtonText(current ? "Replace pairing" : "Pair").onClick(() => { void this.submit(); });
-				if (current) b.setWarning();
+				if (current) b.setDestructive();
 				else b.setCta();
 			});
 	}
@@ -263,7 +263,7 @@ export class PairingCodeModal extends Modal {
 	private renderGrant(serverUrl: string, grant: PairingCodeGrant): void {
 		const { contentEl } = this;
 		contentEl.createEl("p", {
-			text: "On the other device, scan the pairing QR with its camera, or open YAOS settings there, choose \"Pair this device\" and enter the server URL and this code. Anyone with this code can join your vault until it is used or expires, so share it only with your own device.",
+			text: "On the other device, scan the pairing QR with its camera, or open YAOS settings there, choose \"pair this device\" and enter the server URL and this code. Anyone with this code can join your vault until it is used or expires, so share it only with your own device.",
 		});
 		const qrSlot = contentEl.createDiv();
 		const buttons: ButtonComponent[] = [];

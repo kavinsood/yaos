@@ -179,7 +179,7 @@ export async function runWorkerProbe(deps: WorkerProbeDeps): Promise<WorkerProbe
 			if (first.kind === "error") report.events.push({ type: "pingPostFailed", atMs: at(), message: `${first.error.name}: ${first.error.message}` });
 			if (first.kind === "ok") report.events.push({ type: "pingBadReply", atMs: at(), detail: first.value });
 			// Give late error events a moment to arrive before tearing down.
-			await new Promise((r) => setTimeout(r, T.graceMs));
+			await new Promise((r) => window.setTimeout(r, T.graceMs));
 		}
 
 		if (report.firstPong.received) {

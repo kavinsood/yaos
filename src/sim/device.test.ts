@@ -269,7 +269,7 @@ test("a store that catches up under the relay's daily-limit hold still plans: ne
 	await clock.advance(5_000);
 	const view = a.vrt?.port.view();
 	assert.equal(view?.nsReady, true, "ns caught up under the hold");
-	assert.ok(view?.remoteByPathKey.has(a.vrt!.rec.ctx.pk("during-hold.md")), "the new file is created (pending in the outbox)");
+	assert.ok(view?.remoteByPathKey.has(a.vrt.rec.ctx.pk("during-hold.md")), "the new file is created (pending in the outbox)");
 	net.relay.setDailyLimit(false);
 	await clock.advance(15 * 60_000);
 	assert.equal(b.vault.textOf("during-hold.md"), "made during the hold\n");

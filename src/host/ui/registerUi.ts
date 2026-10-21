@@ -57,7 +57,7 @@ export function registerUi(plugin: Plugin, host: YaosUiHost, options: RegisterUi
 	};
 
 	const openSettings = (): void => {
-		if (!openPluginSettings(app, plugin.manifest.id)) new Notice("Open Settings, then YAOS.");
+		if (!openPluginSettings(app, plugin.manifest.id)) new Notice("Open settings, then YAOS.");
 	};
 
 	const openBrakeFor = (report: BrakeReport): void => {

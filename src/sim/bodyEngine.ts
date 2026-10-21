@@ -7,7 +7,7 @@
  */
 
 import { ChangeSet, Text } from "@codemirror/state";
-import type { DocId, VaultPath } from "../core/types";
+import type { DocId } from "../core/types";
 import { DEFAULT_MERGE_LIMITS, merge } from "../core/merge/merge";
 import { minimalDiff } from "../core/merge/minimalDiff";
 import { editsToChanges } from "../engine/body/textChanges";

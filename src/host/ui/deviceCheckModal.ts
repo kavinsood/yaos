@@ -29,7 +29,7 @@ export class DeviceCheckModal extends Modal {
 		const list = contentEl.createEl("ul");
 		for (const s of report.steps) {
 			const li = list.createEl("li", { text: stepLine(s), cls: s.status === "fail" ? "mod-warning" : undefined });
-			if (s.error !== null && s.error !== s.detail) li.createEl("div", { cls: "setting-item-description", text: s.error });
+			if (s.error !== null && s.error !== s.detail) li.createDiv({ cls: "setting-item-description", text: s.error });
 		}
 		for (const note of report.notes) contentEl.createEl("p", { cls: "setting-item-description", text: note });
 		const savedEl = contentEl.createEl("p", { cls: "setting-item-description" });

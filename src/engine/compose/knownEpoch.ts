@@ -29,7 +29,7 @@ export async function storeDbs(storage: StoragePort, vaultId: VaultId, storeKey:
 	const out: { name: string; vaultEpoch: VaultEpoch }[] = [];
 	for (const n of await storage.listDatabases()) {
 		const p = parseDbName(n);
-		if (p && p.vaultId === vaultId && p.storeKey === storeKey && p.vaultEpoch.length > 0) out.push({ name: n, vaultEpoch: p.vaultEpoch as VaultEpoch });
+		if (p && p.vaultId === vaultId && p.storeKey === storeKey && p.vaultEpoch.length > 0) out.push({ name: n, vaultEpoch: p.vaultEpoch });
 	}
 	return out;
 }

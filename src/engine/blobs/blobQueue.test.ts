@@ -460,7 +460,10 @@ test("byte budget: transfers start in claim order while running and ready bytes 
 	const state = () => new Map(q.queued().map((t) => [t.hash, t.state]));
 	let peak = 0;
 	const watch = () => (peak = Math.max(peak, q.bytesInFlight));
-	for (let i = 0; i < 4; i++) assert.equal(claim(i), "busy", `claim ${i}`), watch();
+	for (let i = 0; i < 4; i++) {
+		assert.equal(claim(i), "busy", `claim ${i}`);
+		watch();
+	}
 	await until(() => store.held === 2, "two puts");
 	assert.deepEqual([state().get(s1), state().get(s2), state().get(big), state().get(s3)], ["running", "running", "pending", "pending"]);
 	// s1 and s2 read and seal concurrently: either put can reach the store first. Release whichever did.

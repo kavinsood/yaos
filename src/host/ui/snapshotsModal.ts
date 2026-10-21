@@ -90,7 +90,7 @@ export class SnapshotsModal extends Modal {
 				.setDesc(row.detail)
 				.addButton((b) => this.rowButton(b, "Browse files…", () => this.browse(row)))
 				.addButton((b) => this.rowButton(b, "Restore all…", () => this.restoreAll(row)))
-				.addButton((b) => this.rowButton(b.setWarning(), "Delete…", () => this.remove(row)));
+				.addButton((b) => this.rowButton(b.setDestructive(), "Delete…", () => this.remove(row)));
 		}
 	}
 

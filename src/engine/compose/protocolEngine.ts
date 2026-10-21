@@ -872,8 +872,9 @@ export class ComposedEngine {
 		const port = ports?.identity;
 		if (!ports || !this.config || !port) return;
 		this.log("store revoked by the server: registering a successor");
-		const e = await this.replaceStore("revoked", port);
-		if (e !== null) {
+		const failed = await this.replaceStore("revoked", port);
+		if (failed !== null) {
+			const e = failed.error;
 			const refused = e instanceof IdentityRefused ? e : null;
 			this.log(`successor registration failed: ${refused ? refused.reason : String(e)}`);
 			if (refused && this.refused?.reason !== refused.reason) {
@@ -896,14 +897,14 @@ export class ComposedEngine {
 	 * starts on the registered identity: it fences the old store by its retire key (§5.2 step 1, the old identity is in
 	 * this engine's lineage) and inherits its unsent edits from its mirror, as after any store loss.
 	 */
-	private async replaceStore(reason: "revoked" | "rebuild", port: IdentityPort): Promise<unknown> {
+	private async replaceStore(reason: "revoked" | "rebuild", port: IdentityPort): Promise<{ readonly error: unknown } | null> {
 		const ports = this.ports!;
 		const config = this.config!;
 		const old = this.identity?.creds.deviceId ?? null;
 		try {
 			await registerPending(this.resolveDeps(port));
-		} catch (e) {
-			return e;
+		} catch (error) {
+			return { error };
 		}
 		if (this.disposed || this.identity?.creds.deviceId !== old) return null;
 		await this.restart(reason, async () => {
@@ -926,8 +927,9 @@ export class ComposedEngine {
 		this.replacing = true;
 		try {
 			this.log("rebuild: registering a new local store");
-			const e = await this.replaceStore("rebuild", port);
-			if (e === null) return;
+			const failed = await this.replaceStore("rebuild", port);
+			if (failed === null) return;
+			const e = failed.error;
 			// The notice texts end "Retrying." for the start's own retry; a refused rebuild is not retried.
 			const reason = e instanceof IdentityRefused ? REFUSAL_NOTICE[e.reason].text.replace(/ Retrying\.$/, "") : e instanceof Error ? e.message : String(e);
 			this.log(`rebuild refused: ${e instanceof IdentityRefused ? e.reason : reason}`);

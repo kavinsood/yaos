@@ -7,7 +7,7 @@
  */
 
 import type { HashPort } from "../../ports/crypto";
-import type { ConfigDirPort, SideFileName, SideFilePath, SideFilePort } from "../../ports/vault";
+import type { ConfigDirPort, SideFileName, SideFilePort } from "../../ports/vault";
 import type { ProtocolError } from "../../protocol/errors";
 import { LANE, type DiskOp, type DiskReadRequest, type DiskReadResult, type EngineToMain, type HostIoOp, type HostIoResult, type Lane, type MainResultValue } from "../../protocol/messages";
 import type { EngineTransport } from "../../protocol/transport";
@@ -137,17 +137,17 @@ export class HostLink {
 	private sideFilesIn(dirOf: () => string): SideFilePort {
 		return {
 			read: async (name) => {
-				const r = await this.request({ t: "sideFileRead", name: `${dirOf()}/${name}` as SideFilePath });
+				const r = await this.request({ t: "sideFileRead", name: `${dirOf()}/${name}` });
 				if (r.t !== "sideFile") throw new Error(`unexpected sideFileRead answer ${r.t}`);
 				return r.bytes;
 			},
 			write: async (name, bytes) => {
 				// The message transfers its bytes: hand over a private copy.
-				const r = await this.request({ t: "sideFileWrite", name: `${dirOf()}/${name}` as SideFilePath, bytes: bytes.slice() });
+				const r = await this.request({ t: "sideFileWrite", name: `${dirOf()}/${name}`, bytes: bytes.slice() });
 				if (r.t !== "sideFileWritten") throw new Error(`unexpected sideFileWrite answer ${r.t}`);
 			},
 			remove: async (name) => {
-				await this.hostIo({ t: "sideFileRemove", name: `${dirOf()}/${name}` as SideFilePath });
+				await this.hostIo({ t: "sideFileRemove", name: `${dirOf()}/${name}` });
 			},
 			list: async (prefix) => {
 				const dir = dirOf();

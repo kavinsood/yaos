@@ -592,10 +592,10 @@ export async function runViewProbe(app: App, opts: ViewProbeOptions = {}): Promi
 		const l = leaf;
 		if (l) report.cleanup.leafDetached = toStep(await settle(() => l.detach(), 3000, now));
 		const f = app.vault.getAbstractFileByPath(path);
-		if (f instanceof TFile) report.cleanup.fileTrashed = toStep(await settle(() => app.vault.trash(f, false), 5000, now));
+		if (f instanceof TFile) report.cleanup.fileTrashed = toStep(await settle(() => app.fileManager.trashFile(f), 5000, now));
 		const fo = app.vault.getAbstractFileByPath(folder);
 		if (fo instanceof TFolder) {
-			if (fo.children.length === 0) report.cleanup.folderTrashed = toStep(await settle(() => app.vault.trash(fo, false), 5000, now));
+			if (fo.children.length === 0) report.cleanup.folderTrashed = toStep(await settle(() => app.fileManager.trashFile(fo), 5000, now));
 			else report.cleanup.folderKeptReason = `${fo.children.length} item(s) still inside`;
 		}
 		report.texts = names.all();

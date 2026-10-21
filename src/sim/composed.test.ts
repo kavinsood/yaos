@@ -490,7 +490,7 @@ test("epoch reset with local snapshots on: the new epoch's store (a new device) 
 	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
 	await clock.advance(30_000);
 	assert.equal(a.vrt?.vaultEpoch, "sim-epoch-2");
-	assert.notEqual(a.vrt!.log.c.self, old);
+	assert.notEqual(a.vrt.log.c.self, old);
 	let listed: EngineResultValue | null = null;
 	void a.runtime.command({ t: "listSnapshots" }).then((v) => (listed = v));
 	for (let i = 0; i < 200 && listed === null; i++) await clock.advance(50);

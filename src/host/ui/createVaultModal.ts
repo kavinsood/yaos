@@ -89,7 +89,7 @@ export class CreateVaultModal extends Modal {
 	private showServer(): void {
 		const el = this.reset();
 		el.createEl("p", {
-			text: "Creates an empty vault on your server and pairs this device with it. This folder's notes become the new vault's first notes. To join a vault that already exists, use \"Pair this device\" instead.",
+			text: "Creates an empty vault on your server and pairs this device with it. This folder's notes become the new vault's first notes. To join a vault that already exists, use \"pair this device\" instead.",
 		});
 		if (this.host.data().identity) {
 			el.createEl("p", {
@@ -203,7 +203,7 @@ export class CreateVaultModal extends Modal {
 				leaveGrant(result.replaced, { request: this.request }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
 			}
 			if (this.open_) void this.check(result.vaultId);
-			else new Notice("YAOS: the new vault exists. Open YAOS settings and choose \"Finish creating this vault\".", 10000);
+			else new Notice("YAOS: the new vault exists. Open YAOS settings and choose \"finish creating this vault\".", 10000);
 		} catch (err) {
 			this.statusLine.set(errorMessage(err), true);
 			if (!this.open_) new Notice(`YAOS: ${errorMessage(err)}`, 9000);
@@ -250,7 +250,7 @@ export class CreateVaultModal extends Modal {
 			input.addEventListener("change", () => { if (input.checked) encrypt = value; });
 			const text = row.createDiv();
 			text.createEl("strong", { text: label });
-			text.createEl("div", { cls: "setting-item-description", text: desc });
+			text.createDiv({ cls: "setting-item-description", text: desc });
 		};
 		option(true, "End-to-end encryption: On (recommended)", "Notes and attachments are encrypted on your devices. Your server stores them but cannot read them. You get a recovery key to save.");
 		option(false, "End-to-end encryption: Off", "Your server can read this vault's notes and attachments.");

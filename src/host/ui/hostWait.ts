@@ -17,8 +17,8 @@ export interface WaitOptions {
  * timeout. Always unsubscribes and clears its timer.
  */
 export function waitFor<T>(host: Pick<YaosUiHost, "onChange">, probe: () => T | null, defaultTimeoutMs: number, opts: WaitOptions = {}): Promise<T | null> {
-	const setTimer = opts.setTimer ?? ((ms, fn) => setTimeout(fn, ms));
-	const clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+	const setTimer = opts.setTimer ?? ((ms, fn) => window.setTimeout(fn, ms));
+	const clearTimer = opts.clearTimer ?? ((h) => window.clearTimeout(h as number));
 	return new Promise((resolve) => {
 		let done = false;
 		let timer: unknown = null;
