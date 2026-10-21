@@ -27,7 +27,7 @@ import { rawAppend } from "../keyring/testkit/engines";
 import { K, VAULT, genesis, roll } from "../keyring/testkit/world";
 import type { LogEngine } from "./engine";
 import type { EngineTuning } from "./options";
-import { startTestEngine, testPorts, testStorage, until } from "./testHarness";
+import { maintenanceTicks, startTestEngine, testPorts, testStorage, until } from "./testHarness";
 
 const GRACE = 60 * 60_000;
 const T0 = Date.UTC(2026, 9, 1);
@@ -114,7 +114,7 @@ test("roll trigger (§4.2): blob seals count as own seals; blob uploads alone pa
 		const x = await w.device("dev-x-0123456789abcdef", { tuning: { rollOwnSeals: 4 } });
 		const seal = (i: number) => putSealed(w.store, x.c.deps.crypto, H(bytesOf(i)), bytesOf(i), x.c.touch);
 		for (let i = 0; i < 3; i++) await seal(i);
-		await new Promise((r) => setTimeout(r, 300)); // a dozen maintenance ticks (FAST_TUNING maintenanceMs 25)
+		await maintenanceTicks(x, 3); // the roll trigger is judged on a maintenance tick
 		assert.equal(x.status().e2ee?.sealEpoch, 1, "3 blob seals: below the trigger");
 		await seal(3);
 		await until(() => x.status().e2ee?.sealEpoch === 2, 8_000, "rolled to epoch 2");

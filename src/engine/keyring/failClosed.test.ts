@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { KEYRING_STREAM, type VaultPath } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
-import { converged, until, createDoc, editDoc } from "../runtime/testHarness";
+import { converged, maintenanceTicks, until, createDoc, editDoc } from "../runtime/testHarness";
 import { keyMissing, ownRows, parked, rawAppend, start } from "./testkit/engines";
 import { genesis } from "./testkit/world";
 import { KeyMissingError } from "./writeGate";
@@ -24,7 +24,7 @@ describe("fail closed (§12.4)", () => {
 		try {
 			await parked(a, "encrypted-vault");
 			await assert.rejects(editDoc(a.engine, id, (t) => t.insert(0, "more ")), KeyMissingError);
-			await new Promise((r) => setTimeout(r, 300));
+			await maintenanceTicks(a.engine, 3);
 			assert.equal(ownRows(relay, "dev-a"), before, "no frame after the genesis");
 			assert.equal(a.engine.status().e2ee?.sealEpoch, 0);
 		} finally {

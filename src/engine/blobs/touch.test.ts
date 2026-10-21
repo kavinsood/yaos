@@ -15,6 +15,7 @@ import type { BlobAddress, SealedBlobParts } from "../../ports/crypto";
 import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import { FakeClock } from "../reconcile/testkit/fakes";
+import { until } from "../runtime/testHarness";
 import type { OutboxRecord } from "../store/schema";
 import { BlobTouch, frameBlobHashes, type PutTimes } from "./touch";
 
@@ -71,15 +72,11 @@ function rec(stream: StreamName, kind: OutboxRecord["kind"], content: Uint8Array
 const nsCreate = (hash: ContentHash) => rec(NS_STREAM, "nsOps", encodeNsOps([
 	{ t: "create", docId: `d${String(n).padStart(21, "0")}` as DocId, kind: "blob", path: `a/${n}.png`, contentHash: hash, size: 1 },
 ]));
-/** Waits (real time, bounded) until the async evaluation has finished: the sender poked, or a failure diag. */
-async function settle(ev: { ready: number; diag: string[] } | null): Promise<void> {
-	const fails = () => ev!.diag.filter((c) => c === "blob-refresh-failed").length;
-	const mark = ev ? [ev.ready, fails()] : [];
-	for (let i = 0; i < (ev ? 500 : 20); i++) {
-		await new Promise((r) => setTimeout(r, 1));
-		if (ev && (ev.ready > mark[0]! || fails() > mark[1]!)) return;
-	}
-	if (ev) throw new Error("evaluation did not finish");
+/** Waits until the async evaluation has finished: the sender poked, or a failure diag. */
+async function settle(ev: { ready: number; diag: string[] }): Promise<void> {
+	const fails = () => ev.diag.filter((c) => c === "blob-refresh-failed").length;
+	const [ready, failed] = [ev.ready, fails()];
+	await until(() => ev.ready > ready || fails() > failed, 5_000, "evaluation finished");
 }
 
 test("R2 reuse: committed, or own PUT less than grace/2 ago (persisted); older, future or unknown PUT times re-upload", async () => {
@@ -213,7 +210,7 @@ test("R3 gate: a bodyUpdateRef re-PUTs its own content; without a store it is he
 	const none = setup({ store: null });
 	const r2 = rec("b:doc" as StreamName, "bodyUpdateRef", bytes(2000, 6));
 	assert.equal(none.touch.ready(r2), false, "no store: held");
-	await settle(null);
+	assert.equal(none.touch.evaluations, 0, "nothing running");
 	assert.equal(none.touch.ready(r2), false, "still held: no retry, no timer");
 	assert.equal(none.ev.ready, 0);
 	assert.deepEqual(none.ev.diag, []);
@@ -251,7 +248,7 @@ test("R3 gate: a store error holds the frame with backoff; the timer pokes; forg
 	store.down = true;
 	assert.equal(touch.ready(r2), false);
 	touch.forget(r2.clientFrameId);
-	await settle(null);
+	await until(() => touch.evaluations === 0, 5_000, "the forgotten frame's check ended");
 	clock.advance(60_000);
 	assert.equal(ev.ready, 4, "a forgotten frame schedules no retry");
 	assert.equal(setup({ store: null }).touch.ready(nsCreate(h)), true, "no store: an ns ref passes (reconcile emits it only after its upload succeeded)");

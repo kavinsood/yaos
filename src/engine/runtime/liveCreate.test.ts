@@ -8,9 +8,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { newDocId } from "../../core/codec/ids";
 import { NS_STREAM, docStream, type ContentHash, type DeviceId, type DocId, type NsOp } from "../../core/types";
+import { VirtualClock } from "../../sim/clock";
 import { SimRelay, type SimCommitInfo } from "../../sim/relay";
+import { NS_CORK_MAX_MS } from "../body/sender";
 import type { LogEngine } from "./engine";
-import { converged, startTestEngine, until, createDoc, docText } from "./testHarness";
+import { converged, drive, sleep, startTestEngine, until, createDoc, docText } from "./testHarness";
 
 async function stopAll(...es: LogEngine[]): Promise<void> {
 	for (const e of es) await e.stop();
@@ -28,31 +30,36 @@ async function write(a: LogEngine, docId: DocId, text: string): Promise<void> {
 }
 
 void test("live create: body frames pending behind the create, sent right after it, one group commit, peer reads the text", async () => {
-	const relay = new SimRelay();
+	const clock = new VirtualClock();
+	const run = <T>(p: Promise<T>): Promise<T> => drive(p, clock);
+	const relay = new SimRelay({ clock });
 	const commits: SimCommitInfo[] = [];
 	relay.onCommit((c) => commits.push(c));
-	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
-	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a", clock });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b", clock });
 	try {
+		await until(() => a.status().phase === "live" && b.status().phase === "live", 5_000, "live", clock);
 		const op = create(a, "live.md");
 		const stream = docStream("markdown", op.docId)!;
+		const appends = a.c.sender.stats.appends;
 		const uncork = a.corkNs();
-		const [createCfid] = await a.submitNs([op], { liveCreates: true });
-		await write(a, op.docId, "first ");
-		await write(a, op.docId, "second ");
+		const [createCfid] = await run(a.submitNs([op], { liveCreates: true }));
+		await run(write(a, op.docId, "first "));
+		await run(write(a, op.docId, "second "));
 		const recs = a.c.outbox.ofStream(stream);
 		assert.equal(recs.length, 2);
 		assert.ok(recs.every((r) => r.state === "pending" && r.dependsOn === createCfid), "pending, after the create");
-		await new Promise((r) => setTimeout(r, 20));
-		assert.equal(commits.length, 0, "corked: nothing sent yet");
+		await sleep(NS_CORK_MAX_MS - 100, clock); // every pump the writes armed has run; the cork has not expired
+		assert.equal(a.c.sender.stats.appends, appends, "corked: nothing sent yet");
+		assert.equal(commits.length, 0);
 		uncork();
-		await converged([a, b]);
-		assert.equal(await docText(b, op.docId), "second first ");
+		await converged([a, b], 8_000, clock);
+		assert.equal(await run(docText(b, op.docId)), "second first ");
 		const withCreate = commits.find((c) => c.frames.some((f) => f.clientFrameId === createCfid))!;
 		assert.deepEqual(withCreate.frames.map((f) => f.stream), [NS_STREAM, stream, stream], "one commit: the create, then its body frames");
 		assert.equal(a.c.outbox.size, 0);
 	} finally {
-		await stopAll(a, b);
+		await run(stopAll(a, b));
 	}
 });
 

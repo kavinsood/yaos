@@ -107,6 +107,11 @@ export class BlobTouch implements PutPolicy {
 
 	constructor(private readonly deps: BlobTouchDeps) {}
 
+	/** Frames whose check is running now. */
+	get evaluations(): number {
+		return this.evaluating.size;
+	}
+
 	private get half(): number {
 		return this.deps.graceMs / 2;
 	}

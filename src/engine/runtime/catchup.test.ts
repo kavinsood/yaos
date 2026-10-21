@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
-import { converged, sleep, startTestEngine, until, createDoc, docText, editDoc, renameDoc } from "./testHarness";
+import { converged, startTestEngine, until, createDoc, docText, editDoc, renameDoc } from "./testHarness";
 
 const CKPT = { rows: 3, bytes: 1e9, idleMs: 10, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 50, nsRows: 3, nsBytes: 1e9 };
 const NO_CKPT = { rows: 1e9, bytes: 1e12, idleMs: 1e9, hardRows: 1e9, hardBytes: 1e15, settleMs: 1e9, fallbackMs: 1e9, nsRows: 1e9, nsBytes: 1e12 };
@@ -29,7 +29,9 @@ test("disconnect/reconnect: offline edits on both sides (body + ns) converge", a
 		await editDoc(b, id, (t) => t.insert(t.length, "[b]"));
 		const onB = await createDoc(b, "online-b.md", "made by b");
 		await renameDoc(b, id, "shared-renamed.md");
-		await sleep(100);
+		// a built its offline frames (they wait in its outbox) and has no session to send them on.
+		await until(() => [...a.c.outbox.values()].some((r) => r.stream === a.streamOf(offA)), 3_000, "a's offline frames built");
+		assert.equal(a.c.session, null);
 		assert.equal(relay.rows(a.streamOf(offA)).length, 0, "nothing from a while offline");
 		await a.reconnect();
 		await converged([a, b]);

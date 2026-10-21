@@ -176,7 +176,22 @@ function tBuffers(m: MainToEngine | EngineToMain): Uint8Array[] {
 	return out;
 }
 
-const tick = () => new Promise<void>((r) => setTimeout(r, 5));
+/** One event-loop turn: both carriers (and a worker thread's port) deliver on a macrotask. */
+const turn = () => new Promise<void>((r) => setImmediate(r));
+
+/** Turns until `pred` holds. The 60 s cap only bounds a failing test: a loaded machine delays delivery, never loses it. */
+async function waitFor(pred: () => boolean, what: string): Promise<void> {
+	const end = Date.now() + 60_000;
+	while (!pred()) {
+		if (Date.now() > end) throw new Error(`not delivered: ${what}`);
+		await turn();
+	}
+}
+
+/** For what must not arrive: enough turns that a delivery already queued has run (a late one could only hide a bug). */
+async function settle(): Promise<void> {
+	for (let i = 0; i < 10; i++) await turn();
+}
 
 async function runTrace(make: () => Carrier) {
 	const c = make();
@@ -204,7 +219,7 @@ async function runTrace(make: () => Carrier) {
 			for (const b of bufs) detached.push(b.byteLength === 0);
 		}
 	}
-	for (let i = 0; i < 20 && (atEngine.length < mains.length || atHost.length < engines.length); i++) await tick();
+	await waitFor(() => atEngine.length >= mains.length && atHost.length >= engines.length, "the whole trace");
 	c.dispose();
 	return { atEngine, atHost, detached };
 }
@@ -266,13 +281,12 @@ for (const [i, make] of CARRIERS.entries()) {
 		const c = make();
 		const got: number[] = [];
 		for (let i = 1; i <= 3; i++) c.host.post({ t: "ping", rid: i });
-		await tick();
+		await settle();
 		c.engine.onMessage((m) => {
 			if (m.t === "ping") got.push(m.rid);
 		});
 		c.host.post({ t: "ping", rid: 4 });
-		await tick();
-		await tick();
+		await waitFor(() => got.length >= 4, "pings 1-4");
 		assert.deepEqual(got, [1, 2, 3, 4]);
 		// Delivery is never synchronous and never before queued microtasks.
 		const order: string[] = [];
@@ -280,7 +294,7 @@ for (const [i, make] of CARRIERS.entries()) {
 		c.host.post({ t: "ping", rid: 5 });
 		order.push("sync");
 		void Promise.resolve().then(() => order.push("microtask"));
-		await tick();
+		await waitFor(() => order.includes("delivered"), "ping 5");
 		assert.deepEqual(order.slice(0, 3), ["sync", "microtask", "delivered"]);
 		c.dispose();
 	});
@@ -293,10 +307,11 @@ for (const [i, make] of CARRIERS.entries()) {
 		c.engine.onMessage((m) => got.push(m));
 		c.crash();
 		c.crash();
-		await tick();
+		await waitFor(() => reasons.length > 0, "onFailure");
+		await settle();
 		assert.equal(reasons.length, 1);
 		c.host.post({ t: "ping", rid: 1 });
-		await tick();
+		await settle();
 		assert.equal(got.length, 0);
 		c.dispose();
 	});
@@ -337,7 +352,7 @@ test("worker_threads: a real thread round-trips through the worker carrier with 
 	postOwned(host, { t: "textChunk", uploadId: 8, bytes: update, last: true });
 	assert.equal(update.byteLength, 0, "transferred to the thread");
 	host.post({ t: "ping", rid: 9 });
-	for (let i = 0; i < 400 && got.length < 2; i++) await tick();
+	await waitFor(() => got.length >= 2, "both replies from the thread");
 	host.close();
 	assert.deepEqual(got, [
 		{ t: "result", re: 8, value: { t: "reads", results: [{ path: "a.md", ok: true, stat: null, bytes: bytes(1, 2, 3, 4) }] } },

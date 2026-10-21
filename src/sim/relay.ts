@@ -94,6 +94,7 @@ export class SimRelay implements RelayPort {
 	private connectFailure: Failure | null = null;
 	private readonly connectFailures: Failure[] = [];
 	private httpFailure = false;
+	private readDelay: ((deviceId: DeviceId, streams: readonly StreamName[]) => number) | null = null;
 	private httpInFlight = 0;
 	private connectsInFlight = 0;
 	private tracked: SimRelaySession[] = [];
@@ -137,8 +138,8 @@ export class SimRelay implements RelayPort {
 			clock: this.clock,
 			arrive: (session, msg) => this.engine.arrive(session, msg),
 			feed: (session, afterSeq) => this.http(session, () => this.feedPage(afterSeq, session.deviceId)),
-			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.viaWire([{ stream, afterSeq, preferCheckpoint: prefer }], [this.readPage(stream, afterSeq, prefer, undefined, session.deviceId)])[0]!),
-			readBatch: (session, reqs) => this.readRequest(session, () => this.viaWire(reqs, this.readBatchPages(reqs, session.deviceId))),
+			read: (session, stream, afterSeq, prefer) => this.readRequest(session, [stream], () => this.viaWire([{ stream, afterSeq, preferCheckpoint: prefer }], [this.readPage(stream, afterSeq, prefer, undefined, session.deviceId)])[0]!),
+			readBatch: (session, reqs) => this.readRequest(session, reqs.map((r) => r.stream), () => this.viaWire(reqs, this.readBatchPages(reqs, session.deviceId))),
 			putCheckpoint: (session, stream, coversSeq, expected, bytes) => this.http(session, () => this.checkpointPut(session, stream, coversSeq, expected, bytes)),
 			jitter: (session) => this.jitter(session.link),
 			listenerError: (error) => this.onListenerError(error),
@@ -176,13 +177,14 @@ export class SimRelay implements RelayPort {
 	// ---- HTTP ---------------------------------------------------------------------
 
 	/** Request travels httpMs (+jitter), is answered from the state at arrival, the response travels back. */
-	private readRequest<T>(session: SimRelaySession, compute: () => T): Promise<T> {
+	private readRequest<T>(session: SimRelaySession, streams: readonly StreamName[], compute: () => T): Promise<T> {
 		this.readRequests++;
 		this.maxReadsOnWire = Math.max(this.maxReadsOnWire, ++this.readsOnWire);
-		return this.http(session, compute).finally(() => this.readsOnWire--);
+		return this.http(session, compute, this.readDelay?.(session.deviceId, streams) ?? 0).finally(() => this.readsOnWire--);
 	}
 
-	private http<T>(session: SimRelaySession, compute: () => T): Promise<T> {
+	/** `extraMs`: added to the response's travel (setReadDelay). */
+	private http<T>(session: SimRelaySession, compute: () => T, extraMs = 0): Promise<T> {
 		this.httpInFlight++;
 		return new Promise<T>((resolve, reject) => {
 			this.clock.setTimer(session.delay(session.link.httpMs), () => {
@@ -193,7 +195,7 @@ export class SimRelay implements RelayPort {
 				} catch (error) {
 					outcome = { ok: false, error };
 				}
-				this.clock.setTimer(session.delay(session.link.httpMs), () => {
+				this.clock.setTimer(session.delay(session.link.httpMs) + extraMs, () => {
 					this.httpInFlight--;
 					if (outcome.ok) resolve(outcome.value);
 					else reject(outcome.error);
@@ -492,6 +494,14 @@ export class SimRelay implements RelayPort {
 	/** While on, feed/read/putCheckpoint reject with SimRelayError("network_error"). */
 	setHttpFailure(on: boolean): void {
 		this.httpFailure = on;
+	}
+
+	/**
+	 * Extra latency on the responses of catch-up reads (single or batched), by reader and streams read; null: none.
+	 * Stands for slow work on one read's result (a device still judging `k` while a body read lands).
+	 */
+	setReadDelay(fn: ((deviceId: DeviceId, streams: readonly StreamName[]) => number) | null): void {
+		this.readDelay = fn;
 	}
 
 	/** Link of a device (open sockets and later ones), or the default link with null. */

@@ -5,7 +5,7 @@ import { SimRelay } from "../../sim/relay";
 import { applyChanges, type TextChanges } from "../body/textChanges";
 import type { LogEngine } from "./engine";
 import type { EngineTuning } from "./options";
-import { adoptTuning, converged, sleep, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
+import { adoptTuning, converged, startTestEngine, until, createDoc, docText, editDoc } from "./testHarness";
 
 /** A bound editor as main keeps it: bind() + boundText, onBoundText changes from others, typing via applyEditorChanges. */
 class View {
@@ -232,9 +232,9 @@ test("send window: many frames stay within maxInflightAppendBytes and all commit
 		const id = await createDoc(a, "w.md", "");
 		relay.pauseCommits();
 		for (let i = 0; i < 20; i++) await editDoc(a, id, (t) => t.insert(t.length, `line ${i} ${"z".repeat(300)}\n`));
-		await sleep(50);
+		// The window is full: frames wait behind it. The byte cap holds at every moment, so check it once they do.
+		await until(() => a.c.sender.queued > 0, 3_000, "window held frames back");
 		assert.ok(a.c.sender.inflightByteCount <= 2_000 + 400, `inflight bytes ${a.c.sender.inflightByteCount}`);
-		assert.ok(a.c.sender.queued > 0, "window held frames back");
 		relay.resumeCommits();
 		await converged([a, b]);
 		assert.equal((await docText(b, id)).split("\n").length, 21);
