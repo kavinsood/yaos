@@ -312,9 +312,9 @@ export async function retireOldEpochs(rt: VaultRuntime): Promise<void> {
 		if (!p || p.vaultId !== vaultId || p.storeKey !== installKey || p.vaultEpoch === rt.vaultEpoch) continue;
 		try {
 			const old = await readStoreIdentity(storage, name).catch(() => null);
-			const retire = rt.o.ports.identity?.retire;
-			if (old && old.deviceId !== self && old.retireKey !== undefined && retire) {
-				const r = await retire({ deviceId: old.deviceId, retireKey: old.retireKey });
+			const identity = rt.o.ports.identity;
+			if (old && old.deviceId !== self && old.retireKey !== undefined && identity?.retire) {
+				const r = await identity.retire({ deviceId: old.deviceId, retireKey: old.retireKey });
 				if (!r.ok) {
 					rt.diag(`old epoch store retire failed (${r.reason}): kept until the next live`);
 					continue;
