@@ -117,7 +117,10 @@ function drawConfig(r, F, C, A) {
 	// CANVAS_FAULTS (long offline periods): mostly concurrent edits of the same two canvases, as testkit/sweep.ts's hot
 	// canvas matrix (every other run keeps run.ts's default canvas rate).
 	if (baseName === "CANVAS_FAULTS") cfg.canvas = { rate: +logf(r, 1, 4).toFixed(2), ops: C.CANVAS_HOT_OPS, pool: 2, hot: true };
-	return { cfg, label: `${baseName}${swarm ? `[${swarm.length}]` : ""} ${long ? "long" : "short"} d${cfg.devices} s${cfg.steps}${cfg.crypto ? " suite1" : ""}${cfg.randomTuning ? " tuned" : ""}${cfg.storms ? ` storms${cfg.storms}` : ""}${cfg.canvas ? " hot-canvas" : ""}${cfg.ops === A.RACE_OPS ? " races" : cfg.ops === A.BIG_OPS ? " big" : ""}${cfg.sameLabels ? " same-labels" : ""}${cfg.cleanups ? ` cleanups${cfg.cleanups}` : ""}` };
+	// A small tombstone cap (run.ts pruneWorld: 3..8, one draw per run from its seed, the same on every device) in a
+	// fifth of the runs: ns pruning, retired checkpoints of dead streams and their local drop.
+	if (r.chance(0.2)) cfg.smallPrune = true;
+	return { cfg, label: `${baseName}${swarm ? `[${swarm.length}]` : ""} ${long ? "long" : "short"} d${cfg.devices} s${cfg.steps}${cfg.crypto ? " suite1" : ""}${cfg.randomTuning ? " tuned" : ""}${cfg.storms ? ` storms${cfg.storms}` : ""}${cfg.canvas ? " hot-canvas" : ""}${cfg.ops === A.RACE_OPS ? " races" : cfg.ops === A.BIG_OPS ? " big" : ""}${cfg.sameLabels ? " same-labels" : ""}${cfg.cleanups ? ` cleanups${cfg.cleanups}` : ""}${cfg.smallPrune ? " small-cap" : ""}` };
 }
 
 /** Keys that summed to 0 and are not optional. */

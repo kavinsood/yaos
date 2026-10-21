@@ -241,8 +241,12 @@ export abstract class FoldRuntime<Op, E> {
 	 * (reader-dependent), failed the gate (stored empty), does not decode, is not folded yet, or holds an op this
 	 * reader ignores for being newer than it (rowGap). A stale-epoch row is none of these. Folds the available rows
 	 * first.
+	 *
+	 * `rejectedComplete`: a row that failed the gate for every reader (not reader-dependent: malformed, the wrong
+	 * envelope kind, a disallowed type; stored empty, and no build folds it) is no gap. Retirement's "provably no
+	 * create" (body/retire.ts FoldCompleteness) reads it so; blob GC keeps the stricter default.
 	 */
-	async gap(): Promise<{ readonly seq: Seq; readonly reason: string } | null> {
+	async gap(o: { readonly rejectedComplete?: boolean } = {}): Promise<{ readonly seq: Seq; readonly reason: string } | null> {
 		await this.advance();
 		const run = async () => {
 			if (this.halted) return { seq: this.halted.seq, reason: `halted (${this.halted.reason})` };
@@ -257,7 +261,10 @@ export abstract class FoldRuntime<Op, E> {
 					if (row.seq > this.coversSeq) return { seq: row.seq, reason: "row not folded" };
 					continue;
 				}
-				if (row.content.length === 0) return { seq: row.seq, reason: "row failed the gate" };
+				if (row.content.length === 0) {
+					if (o.rejectedComplete && row.seq <= this.coversSeq) continue;
+					return { seq: row.seq, reason: "row failed the gate" };
+				}
 				const ops = this.decodeOps(row.content);
 				if (!ops) return { seq: row.seq, reason: "row does not decode" };
 				const why = this.rowGap(ops);

@@ -242,7 +242,8 @@ export class Maintenance {
 		let fold: FoldCompleteness = { complete: false, vaultSeq: c.repo.cursor.vaultSeq };
 		if (absent) {
 			const nsRec = c.repo.stream(NS_STREAM);
-			const ok = nsRec !== undefined && !nsRec.stale && !nsRec.frozen && (await c.ns.gap()) === null;
+			// A row every reader's gate refused (a hostile or buggy member's) hides no create: not a gap here.
+			const ok = nsRec !== undefined && !nsRec.stale && !nsRec.frozen && (await c.ns.gap({ rejectedComplete: true })) === null;
 			fold = { complete: ok, vaultSeq: c.repo.cursor.vaultSeq };
 		}
 		const pending = (d: DocId) => c.createDependency(d) !== null;

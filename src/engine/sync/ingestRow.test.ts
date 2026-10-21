@@ -7,6 +7,7 @@ import { createNoopCrypto } from "../adapters/noopCrypto";
 import { createWebHash } from "../adapters/webHash";
 import type { GateCtx } from "../ingest/gate";
 import type { OutboxRecord, TailRecord } from "../store/schema";
+import { sealFrame } from "../ingest/envelope";
 import { gateRow, ownCommitCopy } from "./ingestRow";
 import { SnapRuntime } from "./snapRuntime";
 import { SeededRandom } from "../../sim/random";
@@ -58,6 +59,21 @@ test("a stale snap row last in the stream: the snap fold covers it as ignored, a
 	assert.equal(rt.coversSeq, 11);
 	assert.equal(folded[0]?.events[0]?.outcome.t, "ignored");
 	assert.equal(await rt.gap(), null, "every reader ignores a stale-epoch row: nothing of the index is missing");
+});
+
+test("a row every reader's gate refused is a gap for blob GC, and no gap for retirement (sim HOSTILE_FAULTS seed 20)", async () => {
+	// A hostile member's garbage on a fold stream fails the gate for every reader (not reader-dependent): stored empty.
+	// Retirement's "no create can be hidden" (body/retire.ts FoldCompleteness) holds over it; blob GC stays strict.
+	const binding = { stream: SNAP_STREAM, deviceId: "dev-x" as DeviceId, clientFrameId: "cf" as ClientFrameId };
+	// A body update on a fold stream (hostile.ts wrongKind).
+	const sealed = await sealFrame(ctx.crypto, ctx.vaultId, { ...binding, kind: "bodyUpdate", authorNsSeq: 0, flags: 0, frameNo: 0, content: new Uint8Array([1, 2, 3]) });
+	const r = await gateRow(ctx, hash, { ...binding, seq: 11, payload: sealed.sealed }, 0);
+	assert.ok(r.t === "row" && r.row.flags === 0 && r.row.content.length === 0);
+	const rt = new SnapRuntime(repoOf([r.row]), "dev-r" as DeviceId);
+	await rt.load();
+	assert.equal(rt.coversSeq, 11, "the fold covers it");
+	assert.deepEqual(await rt.gap(), { seq: 11, reason: "row failed the gate" });
+	assert.equal(await rt.gap({ rejectedComplete: true }), null);
 });
 
 test("ownCommitCopy: an own snap frame committed stale is stored as readers store it, not folded as sent", () => {
