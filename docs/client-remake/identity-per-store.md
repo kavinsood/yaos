@@ -700,7 +700,8 @@ the same exposure. The relay cannot tell that from a reconnect overlap. This is 
        leftover of a crash between an epoch mint (or a rebuild's) registration and the store's creation is a
        registered identity nobody holds: it is retired the same way. Sim: an abandoned create whose creator store was
        lost with its lineage (no fence) stays body-less while the creator is live, and resolves once the sweep a
-       status query runs retires it (`identityHygiene.sim.test.ts`, a slow unit, a virtual day).
+       status query runs retires it (`identityHygiene.sim.test.ts`, a slow unit over a few virtual hours across a UTC
+       midnight, with the sim registry's threshold at 0 days).
      - **Rotation** (`POST /operator/vaults/:id/grants/:grantId/rotate`, console "Rotate secret"). The server mints
        the secret (32 random bytes, base64url) and replaces `secret_hash` in one UPDATE; the old secret is unknown
        from that moment (401 `unauthorized` on registration, pairing codes, leave). It also stores `secret_wrap`

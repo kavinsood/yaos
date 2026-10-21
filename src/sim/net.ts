@@ -125,7 +125,10 @@ export class SimIdentityRegistry {
 	private sweptDay = -1;
 	/** Registrations the server accepted, and refused (by reason): sim stats. */
 	readonly counts: Record<string, number> = {};
-	/** The server's inactivity threshold in UTC days (YAOS_INACTIVITY_RETIRE_DAYS); tests shorten it. */
+	/**
+	 * The server's inactivity threshold in UTC days (YAOS_INACTIVITY_RETIRE_DAYS, 1–3650 there). Tests shorten it; 0
+	 * (sim only) makes a device stale from the UTC day after it was last seen.
+	 */
 	inactivityDays = SIM_INACTIVITY_RETIRE_DAYS;
 
 	constructor(private readonly now: () => number) {}

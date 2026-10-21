@@ -3,7 +3,9 @@
 // Obsidian's localStorage all gone) fences nothing, so its registration stays live; a create of it whose body never
 // reached the relay waits on it (DESIGN §i.5 "Abandoned creates": a live creator is rechecked, never given up on). Once
 // it has not connected for longer than the server's threshold, the lazy sweep a status query runs retires it; every
-// device then drops the empty doc and the holder of the file re-creates it. A slow unit (about a virtual day).
+// device then drops the empty doc and the holder of the file re-creates it. The threshold is 0 days here (the sim
+// registry's test override: stale from the next UTC day), so the unit runs a few virtual hours across one midnight;
+// the server's day arithmetic and its 1–3650 clamp are covered in tests/server/identity-hygiene.ts.
 import assert from "node:assert/strict";
 import { simTest } from "./testkit/simTest";
 import { VirtualClock, DEFAULT_WALL_START_MS } from "./clock";
@@ -13,15 +15,14 @@ import { SimNet } from "./net";
 const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
 
-simTest("abandoned create: a store lost with its lineage leaves a body-less doc; inactivity retirement resolves it with no console action", 200, async () => {
-	// Five minutes before 00:00 UTC: the lost store is last seen on day D; with a one-day threshold it is stale from
-	// day D+2, a virtual day later.
-	const clock = new VirtualClock(DEFAULT_WALL_START_MS - 5 * 60_000);
+simTest("abandoned create: a store lost with its lineage leaves a body-less doc; inactivity retirement resolves it with no console action", 60, async () => {
+	// Three hours before 00:00 UTC: the lost store is last seen on day D and is stale from day D+1.
+	const clock = new VirtualClock(DEFAULT_WALL_START_MS - 3 * HOUR_MS);
 	clock.onError = (e) => {
 		throw e;
 	};
 	const net = new SimNet(clock);
-	net.identities.inactivityDays = 1;
+	net.identities.inactivityDays = 0;
 	const lines: string[] = [];
 	const a = new SimDevice({ name: "A", clock, net, log: (l) => lines.push(`A ${l}`) });
 	const b = new SimDevice({ name: "B", clock, net, log: (l) => lines.push(`B ${l}`) });
@@ -54,8 +55,9 @@ simTest("abandoned create: a store lost with its lineage leaves a body-less doc;
 	assert.equal(a.vault.textOf("new.md"), "only on A\n", "A still holds the file");
 	assert.equal(net.identities.counts["inactive"] ?? 0, 0);
 
-	// Day D+2: the holders' creator recheck (a status query) runs the server's sweep, which retires the lost store.
-	const until = (Math.floor(clock.now() / DAY_MS) + 2) * DAY_MS + 2 * HOUR_MS;
+	assert.equal(net.identities.state(lost), "live", "the same day: not stale yet, so the create keeps waiting");
+	// Day D+1: the holders' creator recheck (a status query) runs the server's sweep, which retires the lost store.
+	const until = (Math.floor(clock.now() / DAY_MS) + 1) * DAY_MS + 2 * HOUR_MS;
 	while (clock.now() < until) await clock.advance(HOUR_MS);
 	assert.equal(net.identities.state(lost), "retired", "the sweep retired the abandoned store");
 	assert.equal(net.identities.counts["inactive"], 1, "only it: the connected stores are kept");
