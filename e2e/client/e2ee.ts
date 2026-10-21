@@ -53,7 +53,7 @@ import { Report } from "./engineKit";
 import { bytesOf, converge, randomBytes, sameBytes, sleep, waitFor } from "./fullCheck";
 import { FullClient } from "./fullKit";
 import {
-	DEFAULT_LOG_DIR, loadOperatorKey, pairDevice, recordVault, redact, revokeDevice, saveOperatorKey, type OnboardDevice, type OnboardedVault,
+	DEFAULT_LOG_DIR, loadOperatorKey, pairDevice, pairedIdentityOf, recordVault, redact, revokeDevice, saveOperatorKey, type OnboardDevice, type OnboardedVault,
 } from "./onboard";
 
 function arg(name: string, fallback: string): string {
@@ -99,9 +99,7 @@ function device(name: string, od: OnboardDevice | null): Device {
 	const saved: YaosPluginData[] = [];
 	const notices: string[] = [];
 	const logs: string[] = [];
-	const identity = od
-		? { host: HOST, vaultId: vault!.vaultId, deviceId: od.deviceId, deviceToken: od.deviceToken, deviceName: name, vaultGeneration: vault!.vaultGeneration }
-		: null;
+	const identity = od ? pairedIdentityOf(HOST, vault!, od, name) : null;
 	const data: YaosPluginData = { ...defaultPluginData(name), identity };
 	const ctl = new YaosController(data, {
 		makeRuntime: (id, settings, ui, keys) => client.runtimeFor(id, settings, ui, keys),
@@ -325,7 +323,8 @@ async function main(): Promise<void> {
 	const aId = a.ctl.data().identity;
 	if (!aId || aId.vaultId !== created.vaultId || !aId.vaultGeneration) throw new Error("a is not enrolled in the vault it created");
 	const v: OnboardedVault = { baseUrl: HOST, vaultId: aId.vaultId, vaultGeneration: aId.vaultGeneration, via: server.claimed ? "operator" : "claim",
-		devices: [{ name: "a", deviceId: aId.deviceId, deviceToken: aId.deviceToken }] };
+		// a's store identity (the engine minted it under a's grant) and its grant: what later steps revoke and pair by.
+		devices: [{ name: "a", deviceId: a.client.storeDeviceId ?? "", deviceToken: "", grantSecret: aId.grantSecret, grantId: aId.grantId }] };
 	vault = v;
 	recordVault(HOST, `e2ee-${LABEL}`, v);
 	const expected = server.claimed
@@ -389,7 +388,8 @@ async function main(): Promise<void> {
 
 	R.step("revoke: console revokes c; a revokes and re-keys (K_2, new RK); b's gate shuts until it installs K_2 by QR");
 	const before = await storedAddresses(a);
-	await revokeDevice(v, c.client.o.device.deviceId);
+	// The console revokes c's store (the identity its engine minted under c's grant).
+	await revokeDevice(v, c.client.storeDeviceId ?? "");
 	const rkB = newRk();
 	await cmd(a, { t: "revokeRekey", rk: rkB }, "ok");
 	await waitLive(a, 2, "a live under K_2");

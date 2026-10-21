@@ -116,12 +116,15 @@ export class WireTap {
 	private readonly reads = new Map<string, ReadRec[]>();
 	private readonly writes = new Map<string, number[]>();
 
-	/** The session hooks for one client (NetSwitch). */
-	forClient(client: string, deviceId: string): SessionTap {
+	/**
+	 * The session hooks for one client (NetSwitch). `deviceId`: the client's store identity as it is now (the engine
+	 * mints it on the first start, identity-per-store §4), read at each frame.
+	 */
+	forClient(client: string, storeDeviceId: () => string): SessionTap {
 		return {
 			append: (f) => {
 				const t = performance.now();
-				const key = keyOf(deviceId, f.stream, f.clientFrameId);
+				const key = keyOf(storeDeviceId(), f.stream, f.clientFrameId);
 				const s: Sent = { key, stream: f.stream, t, receiptAt: null, seq: null };
 				let list = this.sent.get(client);
 				if (!list) this.sent.set(client, (list = []));
@@ -133,7 +136,7 @@ export class WireTap {
 				const t = performance.now();
 				switch (e.t) {
 					case "receipt": {
-						const key = keyOf(deviceId, e.stream, e.clientFrameId);
+						const key = keyOf(storeDeviceId(), e.stream, e.clientFrameId);
 						const s = this.byKey.get(key);
 						if (s && s.receiptAt === null) {
 							s.receiptAt = t;
@@ -144,7 +147,7 @@ export class WireTap {
 						break;
 					}
 					case "refused":
-						this.unreceipted.delete(keyOf(deviceId, e.stream, e.clientFrameId));
+						this.unreceipted.delete(keyOf(storeDeviceId(), e.stream, e.clientFrameId));
 						break;
 					case "committed":
 						// A payload-less COMMIT_NOTICE leaves the stream stale: the frame reaches the engine through a read.

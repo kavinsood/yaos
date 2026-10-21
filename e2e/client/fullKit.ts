@@ -23,6 +23,7 @@
  */
 import type { IntervalHistogram } from "node:perf_hooks";
 import { MessageChannel, Worker, type MessagePort } from "node:worker_threads";
+import { randomBytes as nodeRandomBytes } from "node:crypto";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import type { Unsubscribe } from "../../src/ports/common";
 import type { EnginePorts } from "../../src/ports";
@@ -51,7 +52,9 @@ import { probeHttpBlob, startupBlob } from "../../src/engine/adapters/httpBlob";
 import { createIdbStoragePort } from "../../src/engine/adapters/idbStorage";
 import { createNoopCrypto } from "../../src/engine/adapters/noopCrypto";
 import { createWebCryptoSuite1 } from "../../src/engine/adapters/webCryptoSuite1";
-import { RelayHttpError } from "../../src/engine/adapters/relayHttp";
+import { createRelayHttp, RelayHttpError } from "../../src/engine/adapters/relayHttp";
+import type { IdentityPort } from "../../src/ports/identity";
+import { lineageOf, loadInstallRecord, saveStoreIdentity, type InstallStorage } from "../../src/host/installRecord";
 import { createWebClock } from "../../src/engine/adapters/webClock";
 import { createWebHash } from "../../src/engine/adapters/webHash";
 import { createWebRandom } from "../../src/engine/adapters/webRandom";
@@ -241,9 +244,20 @@ export async function fullEnginePorts(config: EngineInitConfig, d: EnginePortDep
 	const random = createWebRandom();
 	const tr = d.trace;
 	const tap = d.tap;
-	const relay = d.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random,
+	// SECRET: the store's device token, set once the engine found or minted the store (as webEngine.ts).
+	let token = "";
+	const credential = (): string => token;
+	const relay = d.net.wrap(createWsRelayPort({ baseUrl: config.relay.url, credential, clock, random,
 		...(tr ? { fetch: tr.fetch, WebSocketImpl: tr.WebSocket } : {}), ...(tap ? { WebSocketImpl: tap.webSocket(tr?.WebSocket) } : {}) }));
-	const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock, xhr: nodeXhr };
+	const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential, clock, xhr: nodeXhr };
+	const http = createRelayHttp({ baseUrl: config.relay.url, credential, clock, ...(tr ? { fetch: tr.fetch } : {}) });
+	const grantSecret = config.relay.grantSecret;
+	const identity: IdentityPort = {
+		register: (body) => (grantSecret ? http.registerDevice(config.vaultId, grantSecret, body) : Promise.resolve({ ok: false, reason: "no-grant", retryAfterMs: null })),
+		use: (deviceToken) => {
+			token = deviceToken;
+		},
+	};
 	// As webEngine.ts: probed at start, and again on a later connect while there is none.
 	const blob = await startupBlob(blobOpts, d.log);
 	d.onBlobKind(blob ? "http" : "none");
@@ -256,7 +270,7 @@ export async function fullEnginePorts(config: EngineInitConfig, d: EnginePortDep
 	const c = config.crypto;
 	// As webEngine.ts: suite-1 keys are zero-filled once imported; unpinned gets the adapter with no key.
 	const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
-	return { relay, storage: tr ? tr.wrapStorage(storage) : storage, clock, random, crypto, hash, blob: d.net.wrapBlob(blob), probeBlob };
+	return { relay, storage: tr ? tr.wrapStorage(storage) : storage, clock, random, crypto, hash, blob: d.net.wrapBlob(blob), probeBlob, identity };
 }
 
 // ---- engine thread (carrier "worker") ----------------------------------------------
@@ -546,6 +560,14 @@ export class FullClient {
 	/** carrier "worker": the engine's thread (null on the inline carrier). */
 	readonly thread: EngineThread | null;
 	private handle: EngineHandle | null = null;
+	/** Obsidian's per-vault-registration localStorage: the install record (identity-per-store §2.4). */
+	readonly localStorage = new Map<string, unknown>();
+	private readonly installStorage: InstallStorage = {
+		load: (key) => this.localStorage.get(key),
+		save: (key, value) => void this.localStorage.set(key, value),
+	};
+	/** The store's device identity (the relay's deviceId of this client's frames), once the engine reported it. */
+	storeDeviceId: string | null = null;
 
 	constructor(readonly o: FullClientOptions) {
 		const tap = o.tap;
@@ -567,7 +589,7 @@ export class FullClient {
 				await write(p, b);
 				tap.disk(o.name, `${this.vault.configDir}/${p}`);
 			};
-			this.net.tap = tap.forClient(o.name, o.device.deviceId);
+			this.net.tap = tap.forClient(o.name, () => this.storeDeviceId ?? "");
 		}
 		this.workspace = this.newWorkspace();
 		this.runtime = this.makeRuntime();
@@ -603,6 +625,9 @@ export class FullClient {
 			...(this.o.tuning ? { tuning: this.o.tuning } : {}),
 			tzOffsetMinutes: () => 0,
 			log,
+			onIdentity: (id) => {
+				if (this.handle === handle) this.storeDeviceId = id;
+			},
 			onRuntime: (rt) => {
 				if (this.handle !== handle) return;
 				this.vrt = rt;
@@ -626,11 +651,18 @@ export class FullClient {
 	private makeRuntime(): HostRuntime {
 		const { o } = this;
 		return this.hostRuntime(
-			{ vaultId: o.vaultId as VaultId, deviceId: o.device.deviceId as DeviceId, deviceLabel: o.name, relay: { url: o.host, credential: o.device.deviceToken } },
+			this.hostIdentity(),
 			() => ({ ...DEFAULT_ENGINE_SETTINGS, syncSettings: true, ...o.settings }),
 			createHostKeys({ store: new VaultKeyStore(this.secrets, o.vaultId, this.clock), pin: () => this.pin, creating: () => false }),
 			null,
 		);
+	}
+
+	/** What the plugin controller builds from data.json (the device's grant) and the install record. */
+	hostIdentity(): HostIdentity {
+		const { o } = this;
+		const rec = loadInstallRecord(this.installStorage, o.vaultId, (n) => nodeRandomBytes(n));
+		return { vaultId: o.vaultId as VaultId, deviceLabel: o.name, relay: { url: o.host, grantSecret: o.device.grantSecret ?? "" }, installKey: rec.installKey, lineage: lineageOf(rec) };
 	}
 
 	/**
@@ -661,6 +693,11 @@ export class FullClient {
 				onNotice: (level, code, message) => { this.ui.notices.push({ level, code, message }); also?.onNotice(level, code, message); },
 				onCarrier: (c) => { this.ui.carriers.push({ carrier: c.carrier, ready: c.ready }); also?.onCarrier(c); },
 				onFatal: (e) => { this.ui.fatals.push(e); also?.onFatal(e); },
+				onStoreIdentity: (deviceId, retireKey) => {
+					this.storeDeviceId = deviceId;
+					saveStoreIdentity(this.installStorage, identity.vaultId, identity.installKey, deviceId, retireKey);
+					also?.onStoreIdentity?.(deviceId, retireKey);
+				},
 			},
 		});
 	}

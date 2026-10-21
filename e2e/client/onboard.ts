@@ -22,9 +22,22 @@ export const DEFAULT_LOG_DIR = process.env.YAOS_E2E_LOG_DIR ?? "/Users/kavin/per
 
 export interface OnboardDevice {
 	readonly name: string;
+	/** An enrolled device (the old /enroll body, kept by the server): the engine-level harnesses connect as it. */
 	readonly deviceId: string;
 	/** SECRET. */
 	readonly deviceToken: string;
+	/**
+	 * SECRET: this device's own pairing grant (identity-per-store §3), for the full-client harnesses: their composed
+	 * engine mints and registers its store's identity under it. Absent: a throwaway device that never enrolled.
+	 */
+	readonly grantSecret?: string;
+	readonly grantId?: string;
+}
+
+/** data.json's identity for `device` (its grant) in `vault`: what the pair flow stores (src/host/ui/api.ts PairedIdentity). */
+export function pairedIdentityOf(host: string, vault: Pick<OnboardedVault, "vaultId" | "vaultGeneration">, device: OnboardDevice, name: string) {
+	if (!device.grantSecret || !device.grantId) throw new Error(`${device.name} has no pairing grant`);
+	return { host, vaultId: vault.vaultId, grantId: device.grantId, grantSecret: device.grantSecret, grantName: name, vaultGeneration: vault.vaultGeneration };
 }
 
 export interface OnboardedVault {
@@ -45,7 +58,7 @@ export interface OnboardOptions {
 	readonly operatorContextFile?: string;
 }
 
-const SECRET_KEYS = new Set(["deviceToken", "operatorRecoveryKey", "ticket", "cookie", "pairingCode", "authorization", "credential"]);
+const SECRET_KEYS = new Set(["deviceToken", "grantSecret", "operatorRecoveryKey", "ticket", "cookie", "pairingCode", "authorization", "credential"]);
 
 /** Deep copy with secret-named fields replaced by "<redacted>". */
 export function redact(value: unknown): unknown {
@@ -86,10 +99,11 @@ function obj(value: unknown): JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value) ? { ...value } : {};
 }
 
-async function http(baseUrl: string, method: string, path: string, options: { token?: string; cookie?: string; json?: unknown } = {}):
+async function http(baseUrl: string, method: string, path: string, options: { token?: string; grant?: string; cookie?: string; json?: unknown } = {}):
 	Promise<{ status: number; value: JsonObject; headers: Headers }> {
 	const headers: Record<string, string> = {};
 	if (options.token) headers.Authorization = `Bearer ${options.token}`;
+	else if (options.grant) headers.Authorization = `Grant ${options.grant}`;
 	if (options.cookie) headers.Cookie = options.cookie;
 	// Operator routes and /claim require a same-origin Origin (relay D5, what a browser sends); harmless elsewhere.
 	if (path === "/claim" || path.startsWith("/operator/")) headers.Origin = new URL(baseUrl).origin;
@@ -130,6 +144,40 @@ export async function enrollDevice(baseUrl: string, pairingCode: string, name: s
 		return { device, vaultId, vaultGeneration };
 	}
 	throw new Error(`enroll ${name}: authorization fence still pending`);
+}
+
+/** POST /enroll with the grant body (identity-per-store §3.2): a pairing grant whose secret this side drew. */
+export async function enrollGrant(baseUrl: string, pairingCode: string, name: string): Promise<{ grantSecret: string; grantId: string; vaultId: string }> {
+	const grantSecret = id(32);
+	const body = { pairingCode, enrollmentRequestId: id(16), grantSecret, grantName: `client-e2e-${name}` };
+	for (let attempt = 0; attempt < 10; attempt++) {
+		const response = await http(baseUrl, "POST", "/enroll", { json: body });
+		if (response.status === 202) {
+			await sleep(1000);
+			continue;
+		}
+		const { vaultId, grantId } = response.value;
+		if (response.status !== 200 || typeof grantId !== "string" || typeof vaultId !== "string") throw new Error(`grant enroll ${name} failed ${response.status} ${errorOf(response.value)}`);
+		return { grantSecret, grantId, vaultId };
+	}
+	throw new Error(`grant enroll ${name}: authorization fence still pending`);
+}
+
+/** `device` with a pairing grant of its own (a code minted by `minter`). */
+async function withGrant(baseUrl: string, vaultId: string, minter: OnboardDevice, device: OnboardDevice): Promise<OnboardDevice> {
+	const code = await mintCode(baseUrl, vaultId, minter);
+	const g = await enrollGrant(baseUrl, code, device.name);
+	if (g.vaultId !== vaultId) throw new Error(`grant of ${device.name} names a different vault`);
+	return { ...device, grantSecret: g.grantSecret, grantId: g.grantId };
+}
+
+/** A device pairing code minted by `minter`: its device token, else its grant (identity-per-store §12.1 decision 3). */
+async function mintCode(baseUrl: string, vaultId: string, minter: OnboardDevice): Promise<string> {
+	if (minter.deviceToken) return devicePairingCode(baseUrl, vaultId, minter.deviceToken);
+	if (!minter.grantSecret) throw new Error(`${minter.name} can mint no pairing code`);
+	const pairing = await http(baseUrl, "POST", `/vault/${encodeURIComponent(vaultId)}/auth/pairing-code`, { grant: minter.grantSecret, json: { purpose: "device" } });
+	if (typeof pairing.value.pairingCode !== "string") throw new Error(`pairing code failed ${pairing.status} ${errorOf(pairing.value)}`);
+	return pairing.value.pairingCode;
 }
 
 /** A device pairing code minted by an enrolled device. */
@@ -229,12 +277,12 @@ export async function onboardVault(baseUrlRaw: string, opts: OnboardOptions = {}
 	}
 
 	const owner = await enrollDevice(baseUrl, ownerCode, "D0");
-	const devices: OnboardDevice[] = [owner.device];
+	const devices: OnboardDevice[] = [await withGrant(baseUrl, owner.vaultId, owner.device, owner.device)];
 	for (let i = 1; i < count; i++) {
 		const code = await devicePairingCode(baseUrl, owner.vaultId, owner.device.deviceToken);
 		const next = await enrollDevice(baseUrl, code, `D${i}`);
 		if (next.vaultId !== owner.vaultId || next.vaultGeneration !== owner.vaultGeneration) throw new Error(`device D${i} joined a different vault`);
-		devices.push(next.device);
+		devices.push(await withGrant(baseUrl, owner.vaultId, owner.device, next.device));
 	}
 	const vault: OnboardedVault = { baseUrl, vaultId: owner.vaultId, vaultGeneration: owner.vaultGeneration, via, devices };
 	recordVaultAt(path, logDir, label, vault);
@@ -254,10 +302,11 @@ export async function revokeDevice(vault: OnboardedVault, deviceId: string, logD
 export async function pairDevice(vault: OnboardedVault, name: string, logDir = DEFAULT_LOG_DIR): Promise<OnboardDevice> {
 	const owner = vault.devices[0];
 	if (!owner) throw new Error("vault has no devices");
-	const code = await devicePairingCode(vault.baseUrl, vault.vaultId, owner.deviceToken);
+	const code = await mintCode(vault.baseUrl, vault.vaultId, owner);
 	const next = await enrollDevice(vault.baseUrl, code, name);
 	if (next.vaultId !== vault.vaultId) throw new Error(`device ${name} joined a different vault`);
-	vault.devices.push(next.device);
-	recordVaultAt(contextPath(vault.baseUrl, logDir), logDir, `${name}-added`, { ...vault, devices: [next.device] });
-	return next.device;
+	const device = await withGrant(vault.baseUrl, vault.vaultId, owner, next.device);
+	vault.devices.push(device);
+	recordVaultAt(contextPath(vault.baseUrl, logDir), logDir, `${name}-added`, { ...vault, devices: [device] });
+	return device;
 }
