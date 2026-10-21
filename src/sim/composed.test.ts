@@ -670,6 +670,37 @@ test("epoch reset after an offline edit on a stale stream whose editor died unsa
 	}
 });
 
+test("epoch reset after an offline edit and rename of the open note, the app dead before the save: the edit survives the migration", async () => {
+	// Sim relay seed 134. B typed into x.md offline and renamed it; the app died before the editor's save, so the edit
+	// was in B's storage only, and the observed rename in its memory. The restart's first pass (ns not ready: no
+	// rename inference) marked x.md's file gone. The migration merged the docs with own unsent edits into their
+	// files at their synced paths only (§c.12 step 5), found none for x.md, and dropped the outbox: gone.
+	const { clock, net, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\ntwo\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("x.md"), "one\ntwo\n");
+	b.setOnline(false);
+	const v = b.workspace.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(1_000);
+	assert.ok(v.isBound(), "bound offline");
+	v.edit(4, 0, "typed\n");
+	await clock.advance(500); // committed to storage; the editor's 2 s save has not run
+	assert.ok(b.vault.userRename("x.md", "y.md"));
+	assert.equal(b.vault.textOf("y.md"), "one\ntwo\n");
+	b.crashApp(); // before a pass recorded the rename
+	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
+	await clock.advance(1_000);
+	void b.restartApp();
+	await clock.advance(5_000);
+	b.setOnline(true);
+	await clock.advance(60_000);
+	assert.equal(b.vrt?.vaultEpoch, "sim-epoch-2", "B migrated");
+	for (const d of [a, b]) assert.equal(d.vault.textOf("y.md"), "one\ntyped\ntwo\n", `${d.name} keeps B's edit at the renamed path`);
+});
+
 test("offline delete, then a new note at the same path: a new doc, not a save over the old one", async () => {
 	// Sim heavy seed 92. A's delete waited (own frames unacked, offline), and the new file at the path merged into
 	// the old doc as a save: it followed the peer's rename of the old note, and the peer's edits to the old text

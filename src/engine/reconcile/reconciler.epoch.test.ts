@@ -229,3 +229,27 @@ test("epoch migration: own edits only the replica holds, on a stream held for a 
 	assert.equal(w.vault.text("n.md"), "one\nmine\ntwo\n");
 	assert.deepEqual(w.conflictCopies(), []);
 });
+
+test("epoch migration: own edits only the replica holds, of a note renamed before the app died, are merged into the renamed file", async () => {
+	// Sim relay seed 134: the observed rename died with the app, and the pass after the restart (ns not ready: no
+	// inference) marked the doc's file gone. The stranded-edit merge looked at the synced path only and found no file.
+	const w = new World();
+	const id = w.log.remoteCreate(P("n.md"), "one\ntwo\n");
+	await w.boot();
+	await w.sync();
+	w.log.setBound(id, true);
+	w.log.editorType(id, (t) => t.insert(4, "mine\n"));
+	w.log.setBound(id, false); // the editor died unsaved
+	w.log.nsReady = false; // offline
+	w.vault.userRename("n.md", "r.md");
+	w.flushEvents();
+	w.r.ctx.renames.length = 0; // the observed rename went with the app
+	await w.sync();
+	assert.equal(w.synced(id)?.fileGone, true, "the doc's file is gone from its synced path");
+	assert.equal(w.synced(id)?.renamedTo, undefined, "no rename kept");
+	assert.equal(await w.r.mergeStrandedEdits(), 1);
+	assert.equal(w.vault.text("r.md"), "one\nmine\ntwo\n");
+	assert.equal(w.vault.text("n.md"), null);
+	assert.equal(w.synced(id)?.path, "r.md");
+	assert.deepEqual(w.conflictCopies(), []);
+});

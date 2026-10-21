@@ -16,6 +16,7 @@ import { newDocId } from "../../core/codec/ids";
 import type { BrakeReport, DocId, PathKey, PlanScope, PlannerInput, PlannerOp } from "../../core/types";
 import { brakeId, brakeIdentity, rejectHeld } from "../../core/plan/brake";
 import { EMPTY_CONTENT_HASH, freshIdBudget, planWith } from "../../core/plan/planner";
+import { inferRenames } from "../../core/plan/renames";
 import type { VaultEvent } from "../../ports/vault";
 import type { LocalObservation } from "../../protocol/messages";
 import { Ctx, type ReconcilerDeps } from "./context";
@@ -225,18 +226,38 @@ export class Reconciler {
 	 * pending body records into its file against the replica as it is (the last state of the old epoch this device
 	 * will see), as the caught-up pass would have. The new epoch then re-derives the edits from the disk. Returns the
 	 * merges that ran ok.
+	 *
+	 * The doc's file is where the planner would find it: at its synced path, or where the user moved it. A rename the
+	 * old epoch never published is lost from memory with an app crash, and the pass after the restart, with ns not
+	 * ready (inference off), marks the doc's file gone (fileGone): the doc is found by rename inference as the planner
+	 * would once ns is ready (observed renames, the one a fileGone record kept, then (kind, hash) on a complete
+	 * listing; sim relay seed 134: an edit, a rename, a commit crash, then the epoch reset).
 	 */
 	async mergeStrandedEdits(): Promise<number> {
 		const { ctx } = this;
 		const view = ctx.log.view();
+		const synced = [...ctx.store.synced.values()];
+		const tracked = new Set<PathKey>();
+		for (const s of synced) if (!s.fileGone) tracked.add(s.pathKey);
+		const missing = synced.filter((s) => s.kind !== "blob" && (s.fileGone === true || !ctx.local.has(s.pathKey)));
+		const missingIds = new Set(missing.map((s) => s.docId));
+		const fresh = [...ctx.local.values()].filter((l) => {
+			if (l.excluded || l.hash === null || tracked.has(l.pathKey)) return false;
+			const owner = view.remoteByPathKey.get(l.pathKey);
+			return owner === undefined || missingIds.has(owner);
+		});
+		const renames = [...ctx.renames];
+		for (const s of synced) if (s.fileGone && s.renamedTo) renames.push({ from: s.path, to: s.renamedTo.to, atMs: s.renamedTo.atMs });
+		const moved = new Map(inferRenames(missing, fresh, renames, ctx.localComplete, ctx.pk).map((rn) => [rn.docId, rn.to]));
 		const ops: PlannerOp[] = [];
 		for (const docId of view.docsWithPendingBody) {
 			const s = ctx.store.synced.get(docId);
 			const r = view.remote.get(docId);
-			if (!s || s.fileGone || s.kind === "blob" || !r || r.state !== "live" || !r.body || r.body.frozen) continue;
+			// A merged alias's own frames are kept (nsRuntime.reconcileHeld) and its replica is its own: the same merge.
+			if (!s || s.kind === "blob" || !r || (r.state !== "live" && r.state !== "merged") || !r.body || r.body.frozen) continue;
 			// The planner's body-empty guard: a create's frames not here yet would merge as a deletion.
 			if (!r.body.hasContent && r.createHash !== EMPTY_CONTENT_HASH && s.contentHash !== EMPTY_CONTENT_HASH) continue;
-			const l = ctx.local.get(s.pathKey);
+			const l = (s.fileGone ? undefined : ctx.local.get(s.pathKey)) ?? moved.get(docId);
 			if (!l || l.excluded) continue;
 			ops.push({ op: "reconcileContent", docId, path: l.path, kind: s.kind, hasBase: s.hasBase });
 		}

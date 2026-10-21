@@ -644,7 +644,11 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
    (`Reconciler.mergeStrandedEdits`): an edit typed into an editor that died before its save is in the replica only,
    and the planner may hold that doc for a body read (`body-not-caught-up`, e.g. a skipped row deferred, then
    offline) that the old epoch can no longer serve. The old replica is final, so the caught-up rule (I4) has nothing
-   left to wait for (sim seed 383, randomized tuning).
+   left to wait for (sim seed 383, randomized tuning). The doc's file is where the planner would find it: at its
+   synced path, or where the user moved it, by rename inference (§f.6) over the observed renames, the one a `fileGone`
+   record kept, then (kind, hash) on a complete listing. An unpublished rename observed before an app crash is gone
+   from memory, and the restart's first pass (ns not ready, inference off) marks the doc's file gone (sim relay seed
+   134). A merged alias's own frames count too (its replica is its own).
 6. Retires and deletes the old DB once the new one reaches `live`: every DB of this vault and install under another
    epoch, so one that a crash left behind after the new DB was created goes too (a restart then opens the newest DB
    without migrating; two DBs would block every offline start, §e.1). Each is first retired by its retire key (the
