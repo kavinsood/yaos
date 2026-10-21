@@ -2325,6 +2325,13 @@ the successor starts and recovers from the old store's dir as above (the fence f
 store: a revoked grant needs a re-pair (phase `revoked`, its notice), a passing one (network, daily limit) is
 retried after a minute or the server's Retry-After.
 
+**Key roll after a removal** (e2ee-design §14.5). The other devices learn about an operator's blocking removal
+from the relay (`VAULT_READY.rekey`, `VAULT_REKEY`; relay-wire §3.2, §4.3), which the engine puts in
+`StatusSnapshot.rekey`. An encrypted device holding the current key asks once per removal count per plugin start to
+make a new vault key (`src/host/ui/rekeyPrompt.ts`, opened from `registerUi.ts`); the button opens "Re-key after
+revoking a device". A won revoke record acks the count (`VAULT_REKEYED`), and the relay's broadcast quiets the
+prompt on every device. Nothing is stored locally.
+
 **Abandoned creates.** A live doc whose create committed and whose initial body never did waits for its creator
 (planner `body-empty`). Two creators never supply it: a store of this install's lineage (lost with its store) and a
 store the server reports **retired**: a retired store never sends again (its sessions are closed and its buffered
@@ -2815,7 +2822,8 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 - **`StatusSnapshot`** (`src/protocol/status.ts`): phase, transport, epoch, seqs, relay connection, counts (stale
   streams, outbox, unreceipted, resident, pending disk ops and blobs, quarantined rows, frozen docs, conflict copies
   today), bootstrap progress, brake, last reconcile and sync times, daily frames, the blob store's attachment limit
-  (`maxBlobBytes`, null until a vault is open, 0 without a blob store), notices.
+  (`maxBlobBytes`, null until a vault is open, 0 without a blob store), the relay's key-roll signal (`rekey`,
+  `{removals, rekeyed}`; never a status row: main prompts from it, below), notices.
   - Posted on phase change, and otherwise at most 4/s.
   - The status bar shows phase + unsynced count.
   - Phase `upgrade-required`: the tooltip (and the settings tab's "Update required" row) is the vault's message when

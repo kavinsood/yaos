@@ -1212,7 +1212,7 @@ vault. Any local copy of the files on disk can seed a new vault.
 | Trigger | Record kind | Who acts | Other devices |
 |---|---|---|---|
 | Nonce budget (§4.2) | roll | Any device, automatically | Adopt automatically (`nextWrap`) |
-| Revoke a device | revoke | The user, on a kept device, with the RK | Re-key by QR or RK (`key-missing` until then) |
+| Revoke a device | revoke | The user, on a kept device, with the RK; the plugin asks after a blocking removal (§14.5) | Re-key by QR or RK (`key-missing` until then) |
 | Change the RK (lost or leaked) | revoke, with a new RK | The user | Same as revoke |
 | Suspected key leak | revoke | The user | Same as revoke |
 
@@ -1221,7 +1221,8 @@ vault. Any local copy of the files on disk can seed a new vault.
 1. **Revoke the device in the operator console** (DECISIONS D7: `DELETE /operator/vaults/:id/devices/:deviceId`,
    operator-only). The gate shuts in the revoke turn: no frame of that device commits afterwards, and its bearer
    gets 401 on every device route. The client cannot revoke; there is no device route for it (D7).
-2. **On a kept device, run "Re-key after revoking a device"** (command and settings button).
+2. **On a kept device, run "Re-key after revoking a device"** (command and settings button). After step 1 the
+   plugin asks for it on every kept device that holds the current key (§14.5); the prompt opens this flow.
    - The user enters the RK, or chooses "Generate a new recovery key" (shown and confirmed as in §13.2).
    - The device builds a revoke record for `r = highest epoch + 1`: kcv, `prevWrap` and `recoveryWrap`, and no
      `nextWrap`.
@@ -1296,6 +1297,38 @@ answer is `"stale"`, `"hold"` or null (always null under suite 0):
   later.
 - Alternative: re-seal all history under r on revoke. Rejected: the revoked device already holds the plaintext,
   so it gains nothing. It costs a full rewrite of the vault, i.e. rows and day budget.
+
+### 14.5 Key roll after a device removal
+
+Device governance stays in the server's operator console (legacy-parity §18, owner decision 2026-10-21). The
+plugin closes the gap after a removal: a removed device holds K_{e}, so it could read later rows if it ever got
+them, until a kept device makes a revoke record (§14.2 step 2).
+
+- **The signal (relay-wire §3.2, §4.2, §4.3).** The vault keeps two counters in `vault_meta`, authority like the
+  identity rows (a reset keeps them; the D8b restore snapshot carries them): `removals`, the operator's blocking
+  removals, and `rekeyed`, the highest count a device has covered with a new key. A roll is due while
+  `removals > rekeyed`. Every connect gets the pair in `VAULT_READY.rekey` (so a device that was offline learns it
+  then); every change goes to every live socket as `VAULT_REKEY` (event-driven: no polling, no status row).
+- **What counts.** "Revoke pairing" (the grant and its store go) and "Revoke" of a device enrolled without a grant:
+  the install can no longer sync. Not counted: "Remove device" of a store under a live grant (the install
+  re-enrolls and keeps syncing, so it is a tidy-up, not an exclusion), a leave, a self-retire, an inactivity
+  retirement.
+- **The ack.** When a device's revoke record **wins** (§11.3), the engine sends `VAULT_REKEYED {removals}` with the
+  count it had seen when the command started (a removal after that is not covered and asks again). The relay takes
+  it only when `rekeyed < n ≤ removals`, after the D7 gate, so a removed device cannot quiet the prompt. The engine
+  resends it on each new session until a signal shows it taken (`src/engine/runtime/rekeySignal.ts`).
+- **The prompt (`src/host/ui/rekeyPrompt.ts`).** A device asks when it is pinned to suite 1, holds the current key,
+  and its engine's status shows a due roll. It asks once per removal count per plugin start ("Make a new vault
+  key" opens step 2; "Not now" dismisses until the next start or the next removal) and closes the modal by itself
+  once another device covered the removal. Nothing is stored on the device: the relay's counters are the durable
+  state, so the prompt survives restarts and stops everywhere after one roll. Suite-0 vaults never ask (there is
+  no key to roll); `key-missing` devices never ask (they could not roll; they wait for the QR).
+- **Why not automatic.** A roll record (kind 2) is wrapped under K_{e−1}, which the removed device holds, so it
+  would follow. Only a revoke record excludes it, and that needs `recoveryWrap` under the RK (§11.1), which no
+  device stores. So the user rolls, with the RK or a new one; there is no switch to turn the prompt off.
+- **Trust.** The signal comes from the server, which could suppress it (a hidden removal is a server lie the
+  plugin cannot see). This is no worse than before: the user can always run step 2 by hand, and the operator
+  console shows the removal to whoever made it.
 
 ## 15. Enable, migrate, disable
 

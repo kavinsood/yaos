@@ -33,8 +33,8 @@ There are 236 rows in total.
 |---|---|
 | `ported` | 82 |
 | `implemented (<commit>)` | 52 |
-| `dropped: ...` | 101 |
-| `missing: ...` | 1 |
+| `dropped: ...` | 102 |
+| `missing: ...` | 0 |
 | Total | 236 |
 
 Rows per section:
@@ -58,12 +58,11 @@ Rows per section:
 | 15. Telemetry | 0 | 0 | 5 | 0 |
 | 16. Mobile | 2 | 4 | 0 | 0 |
 | 17. styles.css | 0 | 0 | 5 | 0 |
-| 18. Governance | 0 | 0 | 9 | 1 |
+| 18. Governance | 0 | 0 | 10 | 0 |
 | 19. Other | 3 | 0 | 5 | 0 |
 
-Still missing:
-
-- §18 In-plugin governance as a whole. Large.
+Still missing: nothing. The last gap, §18 in-plugin governance, was dropped by decision (owner, 2026-10-21): device
+governance stays in the server operator console, and the plugin prompts the vault key roll after a removal there.
 
 Wave-2 rows, all implemented:
 
@@ -477,6 +476,14 @@ The legacy plugin let owners and members govern the shared vault from Obsidian. 
 Device removal, rename and vault destruction are in the server's operator console. "Invite person", "Leave this
 vault" and the person fields are rows in §3.4, §3.5 and §4.
 
+Decided (owner, 2026-10-21): device governance stays in the operator console. What the plugin does is close the gap
+a removal leaves on an end-to-end encrypted vault (the removed device still holds the vault key, e2ee-design §14.4):
+when the operator blocks a device ("Revoke pairing", or "Revoke" of a device enrolled without a grant), the relay
+tells the vault's other devices (VAULT_REKEY, and VAULT_READY.rekey at their next connect; relay-wire §4.3), and each
+encrypted device that holds the current key asks once per removal per start to make a new vault key
+(src/host/ui/rekeyPrompt.ts; e2ee-design §14.5). The first device whose revoke record wins tells the relay
+(VAULT_REKEYED), and every device stops asking. There is no roster, status row or polling in the plugin.
+
 | Feature | Legacy (file:line) | New (file:line) or MISSING | Decision |
 |---|---|---|---|
 | "People and devices" roster (role, device count, online, last seen, "Refresh roster") | adfa7a7:src/settings/settingsTab.ts:890-972; adfa7a7:src/main.ts:3509 | MISSING (server operator console) | dropped: governance moved to the server operator console |
@@ -488,7 +495,7 @@ vault" and the person fields are rows in §3.4, §3.5 and §4.
 | "Request vault destruction" | adfa7a7:src/settings/settingsTab.ts:1006-1009, :1022; adfa7a7:src/main.ts:3289 | MISSING (server operator console) | dropped: governance moved to the server operator console |
 | "Security audit" history | adfa7a7:src/settings/settingsTab.ts:975-991; adfa7a7:src/main.ts:3575 | MISSING | dropped: governance moved to the server operator console |
 | Rename this person ("Your name") | adfa7a7:src/settings/settingsTab.ts:351-353; adfa7a7:src/main.ts:3349 | MISSING | dropped: governance moved to the server operator console |
-| In-plugin governance as a whole (roster, revoke, rename, invite person, transfer, leave) | the rows above and in §3.4 | MISSING | missing: large; the coordinator lists it as the remaining gap if governance is wanted inside Obsidian |
+| In-plugin governance as a whole (roster, revoke, rename, invite person, transfer, leave) | the rows above and in §3.4 | MISSING (server operator console); after a blocking removal there, the key-roll prompt: src/host/ui/rekeyPrompt.ts, src/host/ui/registerUi.ts (`checkRekey`), server/src/vault/host.ts (`countRemoval`, `noteRekeyed`) | dropped by decision (owner, 2026-10-21): device governance in the operator console; plugin prompts the key roll after a removal |
 
 ## 19. Other
 

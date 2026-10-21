@@ -536,8 +536,12 @@ CREATE TABLE retired_device (           -- tombstones, never deleted, never load
 Identity v3 (phase 5, §10.1): `pairing_grant` gains `secret_wrap BLOB` (null until the grant's first rotation: IV ||
 AES-GCM of the rotated secret under an HKDF key of `ticket_key`, AAD vaultId and grantId).
 
-Init runs the v1 DDL above and then the v2 and v3 migrations, so a new vault and a migrated one are identical. A vault
-made before v2 migrates once, at the first load of a runtime (G54); one made before v3 likewise (G65).
+Identity v4 (key-roll signal, §10.2): `vault_meta` gains `removals INTEGER NOT NULL DEFAULT 0` and
+`rekeyed INTEGER NOT NULL DEFAULT 0`.
+
+Init runs the v1 DDL above and then the v2, v3 and v4 migrations, so a new vault and a migrated one are identical. A
+vault made before v2 migrates once, at the first load of a runtime (G54); one made before v3 or v4 likewise (G65,
+G67).
 
 Probing an unknown vault reads `vault_meta`; "no such table" means unknown, cached in memory (init runs in the same
 object, so the cache stays coherent). Rows read per runtime: meta 1 + grants G + devices N, then 0 per bearer auth.
@@ -557,14 +561,16 @@ expired over 24 h.
 | Register (§10) | INSERT device + UPDATE pairing_grant (day counter); an idempotent retry 0 | 2 |
 | Pairing / owner code | INSERT pairing_code (+1 per pruned row) | 1 |
 | Ticket | none (key and devices in memory); the first of a UTC day per device: UPDATE device (`last_seen_day`) | 0 (1) |
-| Revoke, self-retire, retire by key | DELETE device + INSERT retired_device | 2 |
-| Revoke pairing, leave (§10) | UPDATE pairing_grant + D × (DELETE device + INSERT retired_device) | 1+2D |
+| Revoke, self-retire, retire by key | DELETE device + INSERT retired_device; an operator revoke of a grantless device also UPDATE meta (`removals`, §10.2) | 2 (3) |
+| Revoke pairing (§10) | UPDATE pairing_grant + D × (DELETE device + INSERT retired_device) + UPDATE meta (`removals`, §10.2) | 2+2D |
+| Leave (§10) | UPDATE pairing_grant + D × (DELETE device + INSERT retired_device) | 1+2D |
+| Key-roll ack (§10.2) | UPDATE meta (`rekeyed`); a late, repeated or out-of-range ack none | 1 (0) |
 | Rotate secret (§10.1) | UPDATE pairing_grant (`secret_hash`, `secret_wrap`); unknown or revoked grant 0 | 1 |
 | Grant fetch (§10.1) | none (grants in memory) | 0 |
 | Inactivity retirement (§10.1), inside register / device status / listing | per stale device: DELETE device + INSERT retired_device (≤ 50 a call); a stale device with an open socket: UPDATE device (`last_seen_day`); no stale device, or already swept today: none | 2 each (1) |
 | Reset | DELETE H heads + S segments + C chunks; UPDATE meta | H+S+C+1 |
 | Restore prepare (D8b) | UPDATE meta (marker; the rewind erases it) | 1 |
-| Restore finish (D8b) | replace D device rows (+1 UPDATE per row differing only in `last_seen_day`), G' grant rows and R' missing tombstones; DELETE P codes; UPDATE meta | ≈ D+G'+R'+P+1 |
+| Restore finish (D8b) | replace D device rows (+1 UPDATE per row differing only in `last_seen_day`), G' grant rows and R' missing tombstones; DELETE P codes; UPDATE meta (incl. `removals`, `rekeyed`) | ≈ D+G'+R'+P+1 |
 | Commit | per touched stream: head UPDATE/INSERT (last_seq indexed) = 2; +1 per sealed segment | 2/stream + 1/seal |
 | Checkpoint | DELETE old chunks (k₀) + INSERT new chunks (k₁) + DELETE collected segments (g) + UPDATE head (SET has no `last_seq`) | k₀+k₁+g+1 |
 | Retired GC (H7) | same head UPDATE | +0 |
@@ -679,6 +685,8 @@ WB files in `tests/server/` (WB file names are suggestions).
 | T-INACTIVE | not seen > 90 UTC days → retired with a tombstone at the next register / device status / listing; exactly 90 kept; an open socket kept and marked seen; an unused registration retired; once a UTC day; ≤ 50 a call; skipped while latched; threshold override | WB | n/a (new) | identity-hygiene.ts |
 | T-ROTATE | rotate: old secret 401 at once, a live store fetches the new one, 1 row; unknown / revoked 0 rows; 404 before any rotation; 403 old enroll; 401 revoked; survives a D8b restore; zero config-DO calls on the fetch | WB | n/a (new) | identity-hygiene.ts |
 | T-MIGRATE-V3 | a v2 vault gains `secret_wrap` at its next load; its grants keep working (G65) | WB | n/a (new) | identity-hygiene.ts |
+| T-REKEY-SIGNAL | VAULT_READY.rekey on every connect; revoke pairing and a grantless revoke count and broadcast VAULT_REKEY; remove-under-grant, leave and self-retire do not; VAULT_REKEYED taken only in (rekeyed, removals], then broadcast; a removed device cannot ack; a restore keeps both counts | WB | n/a (new) | rekey-signal.ts |
+| T-MIGRATE-V4 | a v3 vault gains `removals` and `rekeyed` (0, 0) at its next load (G67) | WB | n/a (new) | rekey-signal.ts |
 
 ---
 
@@ -983,3 +991,28 @@ Gap calls (phase 5):
 - G56 amended: the server keeps a rotated secret wrapped (not only hashed) so that a live store can fetch it; the key
   is derived from `ticket_key` and never leaves the DO. A paired secret (client-minted) is still hash-only. The D8b
   journal (config DO) holds the wrap but not the key.
+
+## 10.2 Key-roll signal (2026-10-21)
+
+Device governance stays in the operator console (owner decision, client legacy-parity §18). After an operator
+removal that blocks an install, the other devices' plugins ask the user to make a new vault key (client e2ee-design
+§14.5); the server only counts and tells.
+
+- `vault_meta.removals` counts blocking operator removals: "Revoke pairing" (`revokeGrant(grantId, "operator")`)
+  and "Revoke" of a device with no grant (`revokeDevice`, `grantId === null`). Not counted: "Remove device" of a
+  store under a live grant (the install re-registers), a leave (`revokeGrant(…, "holder")`), a self-retire, retire by
+  key, an inactivity retirement. The UPDATE runs in the retire transaction.
+- `vault_meta.rekeyed` is the highest count a device covered with a won revoke record. `VAULT_REKEYED {removals: n}`
+  (relay-wire §4.2) is taken only when `rekeyed < n ≤ removals`; anything else is dropped silently. The socket's
+  device passes the D7 gate first, so a removed device cannot ack.
+- Every streams connect gets `{removals, rekeyed}` in `VAULT_READY.rekey`; every change is sent to every streams
+  socket of the vault as `VAULT_REKEY` (relay-wire §4.3). No route, no polling.
+
+Gap calls:
+
+- G67 Identity v4 (`ALTER TABLE vault_meta ADD COLUMN removals …`, `… rekeyed …`) migrates like G54 and G65:
+  detected by "no such column: removals" on the meta read every runtime does anyway, run once at the first load.
+- G68 Both counters are authority (`identityWrites`): a count or an ack in a D8b rewind window forces the re-rewind.
+  The D8b snapshot carries `rekey: {removals, rekeyed}`; an older snapshot without it restores the counters as they
+  are now. A reset keeps them (authority, not content). An ack refused by the daily write limit is dropped; the
+  client resends it at its next session.
