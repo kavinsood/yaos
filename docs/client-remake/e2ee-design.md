@@ -913,7 +913,12 @@ record: the first valid one, with these rules.
   - roll: it holds K_{e−1} (the winner's key);
   - genesis and revoke: it holds K_e directly (QR), or RK is in hand.
 
-  A record the device cannot evaluate is **pending**, not invalid.
+  A record the device cannot evaluate is **pending**, not invalid. A pending record does not hold back later
+  records of its epoch, except that a pending genesis holds back every later genesis (§15.1), and a pending revoke
+  in `k` holds back this device's own revoke for its epoch: two devices revoking at once each hold only their own
+  new RK and key, so neither can judge the other's record, and the one whose record came second adopting its own
+  K_r would fork the vault (sim suite 1 seed 264, `src/engine/keyring/evaluate.ts`). It stays `revoked-epoch` until
+  a QR or RK re-key decides the earlier record.
 - **Revoke outranks roll for the same epoch, whatever the seq order.** A roll for epoch e is not adopted while any
   record of kind revoke for an epoch ≥ e exists, pending or valid.
   - This stops a revoked device colluding with the server. It holds K_{r−1}, and could otherwise forge a roll for
@@ -1243,11 +1248,16 @@ vault. Any local copy of the files on disk can seed a new vault.
      stale after all, readers fold the copy as `replay-duplicate`, so ns and cfg ops apply once.
    - **Unsent or uncommitted outbox records** with `keyEpoch < r`, and the copies, are re-sealed under the
      current epoch before sending (`OutboxChange {t: "reseal"}`):
-     - ns and cfg, and copies, keep their clientFrameId. The sender opens ns and cfg only after the session's
-       late-receipt reads, so one still in the outbox then never committed;
-     - every other record takes a fresh clientFrameId (a rename at the same outbox order; held dependents are
-       re-pointed), since its old id may have committed with other bytes (R4 `frame-id-conflict`). Yjs updates are
+     - copies keep their clientFrameId (fresh, never sent);
+     - every other record, ns and cfg included, takes a fresh clientFrameId (a rename at the same outbox order; held
+       dependents are re-pointed), since its old id may have committed with other bytes (R4 `frame-id-conflict`).
+       The session's late-receipt reads do not rule that out for ns and cfg: a frame of a dropped session can sit
+       in the relay's hold buffer and commit after the new session read past it. The refusal poisoned an ns create
+       whose body, pipelined behind it, then committed before the create (sim suite 1 seed 264). The frameNo stays
+       (§8.2), so should the old bytes commit and fold, the new frame is a `replay-duplicate`. Yjs updates are
        idempotent, so a duplicate is harmless.
+     - an own receipt read back with its row is judged by the committed bytes' keyEpoch, as readers judge it, not
+       by the record's (which a re-seal may have raised since the bytes went out).
    - A suite-1 sender is write-blocked until the session's `k` read, so an offline device learns r before it sends
      anything sealed under an older epoch.
    - Unsealed copies are not mirrored (`selectMirrorFrames`): a mirror recovery re-derives them from disk. The

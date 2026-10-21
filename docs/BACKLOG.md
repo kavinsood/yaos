@@ -126,13 +126,6 @@ Each has a minimized plan in `src/sim/open-repros/` (README there: replay with `
 replayed by the regressions test). All checked still failing on `integrate-3` (2026-10-21); "base" = also failing on
 `client-remake-next` 6a1fb3e5 before the reclaim / generators / governance merges.
 
-### SIM-S1-REKEY-WIPE: an outside edit lost across revokes and a wipe before the rekey (suite 1)
-
-Key roll, a revoke, an outside (disk) edit on B, a second revoke, then B's IndexedDB and mirrors wiped before B
-rekeys: the disk edit is lost (`tokens` + `destroyed`). `s1-197-clean.json` (5 steps, base), `s1-197.json`,
-`s1-197-nohostile.json`. `1482901505-47-min.json` (hostile device, suite 1, clean-ups, revokes, 5 devices: a token
-typed on D lost) is likely the same.
-
 ### SIM-EPOCH-COMMIT-CRASH: an epoch reset, a commit crash and offline lose a typed token
 
 `relay-134.json` (targeted relay faults seed 134, base): epoch reset, a commit crash ("after"), offline: a token typed
@@ -190,6 +183,23 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-S1-REKEY-WIPE** (`fix-s1edit`, fdce877c): an outside edit absorbed into the replica, whose frame then came
+  back stale after a revoke (an unsealed copy, never mirrored), was written over after an IndexedDB + mirror wipe: the
+  synced mirror still called the disk synced, so the merge took it as the base. The outbox mirror (format 3) lists
+  the docs whose own records it leaves out (unsealed copies, the size limit) and recovery imports their synced
+  records with no trusted content hash: no-base merge, the disk text kept as a conflict copy (DESIGN §e.4, §i.5).
+  Regressions `s1-revoke-wipe-outside-edit{,-hostile}.json`.
+- **SIM-S1-FREEZE-UNSAVED** (`fix-s1edit`, 56cc7a4e; was filed under SIM-S1-REKEY-WIPE as `1482901505-47-min.json`, a
+  different cause): a doc frozen right after a keystroke dropped the coalesced push (the engine had already dropped
+  the binding), leaving the keystroke only in the unbound editor; an outside write inside Obsidian's 2 s save window
+  reloaded over it. A freeze now saves the dirty view at once. Regression `s1-freeze-unsaved-keystrokes-reload.json`.
+- **SIM-S1-MUTUAL-REVOKE** (`fix-s1edit`, c6f9f382, b186fd7f; found in the wipe/revoke/roll sweep, suite 1 seed
+  264): two devices revoking each other at once forked the vault (the second adopted its own K_r past the first
+  revoke, which it could not judge), and a sent ns create re-sealed under its old clientFrameId was refused
+  frame-id-conflict and poisoned, its canvas body committed first and was dropped as pruned: a canvas created on B
+  lost. An own revoke now waits behind an earlier pending revoke in `k` (e2ee-design §11.3); re-sealed ns / cfg
+  records take a fresh id, and own receipts are judged by the committed bytes' keyEpoch (§14.2 step 4). Regression
+  `s1-mutual-revoke-canvas-create.json`.
 - **CLONED-ID, FRAMENO-IDB** (identity-per-store phases 1–4, `client-remake-next`): a deviceId is used by exactly one
   store, ever. The identity lives in the store (`meta.identity`), data.json holds a pairing grant, a clone or a new
   IndexedDB registers a new device, an IndexedDB loss fences its predecessor and re-issues its mirrored frames, a

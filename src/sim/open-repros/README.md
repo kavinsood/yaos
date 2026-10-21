@@ -15,10 +15,6 @@ Status as of integrate-3 (2026-10-21): every file below still fails. "base": als
 
 | File | Reproduces | BACKLOG |
 | --- | --- | --- |
-| `s1-197-clean.json` | suite 1: key roll, revoke, an outside (disk) edit on B, a second revoke, B's IndexedDB and mirrors wiped before it rekeys: the disk edit `[B.16]` is lost (tokens + destroyed). The cleanest of the three seed-197 plans; base | SIM-S1-REKEY-WIPE |
-| `s1-197.json` | the same seed with the hostile device's wrongKind / deflateBomb steps in the plan (same loss) | SIM-S1-REKEY-WIPE |
-| `s1-197-nohostile.json` | the same seed, another minimization (same loss) | SIM-S1-REKEY-WIPE |
-| `1482901505-47-min.json` | hostile device, suite 1, attachment clean-ups and revokes, 5 devices: token `[D.54]` typed on D is lost. Likely the same as SIM-S1-REKEY-WIPE | SIM-S1-REKEY-WIPE |
 | `20701862-41-min.json` | canvas: a folder rename (`cRename folder`) after a user's dangling-edge fix revives the edges A deleted (no concurrent edit, no conflict copy); base | SIM-CANVAS-FOLDER-REVIVE |
 | `1370759151-13-min.json` | blob faults, 2 devices, delete / restore races: no convergence, A's disk keeps a stale `notes/r5.md` while its body replica and the relay have the newer text | SIM-BLOB-STALE-DISK |
 | `relay-134.json` | targeted relay faults, seed 134: epoch reset, then a commit crash (after) and offline: token `[A.36]` typed on A is lost. Possibly the same as suite 1 "4 devices, E2EE faults" seed 1 (epoch reset + commit crash); base | SIM-EPOCH-COMMIT-CRASH |
