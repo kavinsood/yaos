@@ -8,7 +8,9 @@
  *                          plan.conflictCopy.<reason>, plan.reconcileContent.{base,noBase,pathBase},
  *                          plan.rebind.adopt, plan.wait.<reason>
  *   brake.<reason>         distinct brake reports (by id) per device
- *   diag.<code>            LogEngine diagnostics of every device engine (SimDevice.diagCounts, class suffix folded)
+ *   diag.<code>            LogEngine diagnostics of every device engine (SimDevice.diagCounts, class suffix folded);
+ *                          the retired-stream path (DESIGN §b.5): diag.retire-written (a retired checkpoint put),
+ *                          diag.checkpoint-retired (one read), diag.retire-dropped (a dead stream's records dropped)
  *   host.<counter>         engine stats over every runtime of a device (bound conflict copies, provisionals
  *                          adopted, adopt-to-pending)
  *
@@ -43,7 +45,7 @@ const DIAGS: readonly string[] = [
 	"checkpoint-written", "checkpoint-conflict", "checkpoint-adopted", "checkpoint-adopted-behind", "checkpoint-retired", "checkpoint-held",
 	"checkpoint-refused", "checkpoint-failed", "doc-frozen", "frame-poisoned", "adopt-pending", "stream-resend", "causal-hole", "doc-thawed",
 	"live-overflow", "recovered-from-mirror", "epoch-mismatch", "gap-feed", "quarantine-retried", "blob-gc-swept", "frame-resealed",
-	"snap-fold",
+	"snap-fold", "retire-written", "retire-dropped",
 ];
 
 export const COVERAGE_KEYS: readonly string[] = [

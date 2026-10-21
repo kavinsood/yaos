@@ -810,6 +810,17 @@ s.test("H7 T-RETIRED-GC / T-PARTIAL-GC: a checkpoint at lastSeq drops the open s
 			[{ kind: "appended", seq: 7 }, { kind: "deduped", seq: 6 }]);
 		assert.deepEqual((await read("stream=b:r&after=0")).rows.map((row) => row.seq), [7]);
 		assert.deepEqual((await read("stream=b:r&after=6")).rows.map((row) => row.seq), [7]);
+		// Re-retire after a late writer (the client's retire pass, src/engine/body/retire.ts): a stale CAS loses with the
+		// current seq, the put at the new lastSeq, CAS on 6, retires the stream again.
+		const stale = await put("b:r", 7, 0, bytes("late"));
+		assert.equal(stale.status, 409);
+		const again = await put("b:r", 7, 6, bytes("again"));
+		assert.equal(again.body.gcSeq, 7);
+		assert.equal(again.body.coversSeq, 7);
+		const reRetired = await read("stream=b:r&after=0");
+		assert.deepEqual(reRetired.rows, [], "the late row is reclaimed too");
+		assert.equal(reRetired.gcSeq, 7);
+		assert.equal(text(reRetired.checkpoint!.bytes), "again");
 	});
 });
 
