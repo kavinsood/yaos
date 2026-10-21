@@ -141,6 +141,7 @@ async function mergeMarkdown(env: Env, op: ReconcileOp, h: BodyHandle): Promise<
 	if (result.kind === "conflict") {
 		const cc = await writeConflictCopy(env, op, rd.bytes, diskHash, "markdown");
 		if (!cc) return "fail";
+		ctx.deps.observeConflict?.(result.reason, "merge");
 		intent = cc.intent;
 		local.push(cc.local);
 	}

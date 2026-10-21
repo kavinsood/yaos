@@ -5,7 +5,7 @@
  */
 
 import type {
-	BrakeConfig, BrakeReport, DocId, DocKind, LocalEntry, MergeLimits, ObservedRename, PathKey, PathKeyFn, Seq, SyncedEntry, VaultPath,
+	BrakeConfig, BrakeReport, ConflictReason, DocId, DocKind, LocalEntry, MergeLimits, ObservedRename, PathKey, PathKeyFn, Seq, SyncedEntry, VaultPath,
 } from "../../core/types";
 import { DEFAULT_BRAKE, type BrakeWindow, type DestructiveKind } from "../../core/plan/brake";
 import { conflictCopyNotice } from "../../core/plan/conflictName";
@@ -109,6 +109,8 @@ export interface ReconcilerDeps {
 	readonly onBrake?: (report: BrakeReport) => void;
 	/** Sync completed a conflict copy `to` of `from` (status `conflictCopiesToday`). */
 	readonly onConflictCopy?: (from: VaultPath, to: VaultPath) => void;
+	/** Observational test hook (RuntimeObserver.conflict, sim coverage): a conflict copy event and where it happened. */
+	readonly observeConflict?: (reason: ConflictReason, where: "merge" | "canvas" | "intent") => void;
 	/**
 	 * A rebind moved the synced record of `from` to `into` (§c.13 merged alias, identical-loser collapse,
 	 * §c.12 migrated loser): an editor bound to `from` must re-open as `into`, or its typing keeps going

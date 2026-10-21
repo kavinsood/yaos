@@ -286,6 +286,7 @@ export class SimDevice {
 			observe: {
 				nsFold: (frames) => this.coverage.nsFold(frames),
 				pass: (ops, report) => this.coverage.pass(ops, report),
+				conflict: (reason) => this.coverage.conflict(reason),
 			},
 			onIdentity: (id) => {
 				if (this.handle !== handle && this.handle !== null) return;

@@ -105,6 +105,7 @@ export async function mergeCanvas(env: Env, op: ReconcileOp, h: BodyHandle): Pro
 	if (out.kind === "conflict") {
 		const cc = await writeConflictCopy(env, op, rd.bytes, diskHash, "canvas");
 		if (!cc) return "fail";
+		ctx.deps.observeConflict?.(out.reason ?? "both-edited", "canvas");
 		intent = cc.intent;
 		local.push(cc.local);
 	}

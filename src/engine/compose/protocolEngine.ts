@@ -165,6 +165,7 @@ export class ComposedEngine {
 		this.boundDisk = new BoundDisk({
 			bound: this.bound, post: (m) => this.link.post(m), runtime: () => this.rt,
 			clock: () => this.ports?.clock ?? null, disposed: () => this.disposed,
+			observeConflict: options.observe?.conflict ? (r, w) => options.observe?.conflict?.(r, w) : undefined,
 		});
 		this.boundBody = new BoundBody({ bound: this.bound, disk: this.boundDisk, runtime: () => this.rt, diag: (m) => this.log(m) });
 		this.offs.push(transport.onMessage((m) => this.onMessage(m)));

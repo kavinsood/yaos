@@ -88,6 +88,8 @@ export async function writeConflictCopy(
 	const res = await ctx.exec({ t: "write", area: "vault", path: copyPath, data: { t: "bytes", bytes: bytes.slice() }, precondition: { t: "absent" }, docId, purpose: "conflict-copy" });
 	const out = writeOk(res);
 	if (!out) {
+		// Another writer took the name between the pick and the write: the next pass picks another one.
+		if (res.t === "write" && !res.outcome.ok && res.outcome.reason === "precondition") ctx.deps.observeConflict?.("path-taken", kind === "canvas" ? "canvas" : "merge");
 		await ctx.commit({ intentDrop: [intent.id] });
 		env.scan.markDirty(copyPath, null);
 		return null;

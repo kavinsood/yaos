@@ -12,7 +12,7 @@ import { utf8Decode } from "../../core/codec/lib0";
 import { DEFAULT_MERGE_LIMITS, merge } from "../../core/merge/merge";
 import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
 import { conflictCopyNotice, conflictName } from "../../core/plan/conflictName";
-import type { DocId, PathKey, VaultPath } from "../../core/types";
+import type { ConflictReason, DocId, PathKey, VaultPath } from "../../core/types";
 import { LANE, type EngineToMain } from "../../protocol/messages";
 import type { ClockPort } from "../../ports/clock";
 import type { VaultEvent, VaultStat } from "../../ports/vault";
@@ -32,6 +32,8 @@ export interface BoundDiskDeps {
 	runtime(): VaultRuntime | null;
 	clock(): ClockPort | null;
 	disposed(): boolean;
+	/** Observational test hook (RuntimeObserver.conflict, sim coverage). */
+	observeConflict?(reason: ConflictReason, where: "bound"): void;
 }
 
 export class BoundDisk {
@@ -85,7 +87,7 @@ export class BoundDisk {
 			}
 			b.diskText = incoming; // absorbed: merged into the replica, or kept by the conflict copy below
 			save = target !== incoming;
-			if (r.kind === "conflict") void this.writeConflictCopy(b.path, docId, r.conflictCopy);
+			if (r.kind === "conflict") void this.writeConflictCopy(b.path, docId, r.conflictCopy, r.reason);
 		}
 		this.deps.bound.queue(b, { t: "reloaded", viewId, reload, save });
 	}
@@ -146,13 +148,13 @@ export class BoundDisk {
 	 * retried (backoff, capped) while the engine runs. Gives up on a non-transient refusal or when every
 	 * candidate name is taken.
 	 */
-	async writeConflictCopy(path: VaultPath, docId: DocId, text: string): Promise<boolean> {
+	async writeConflictCopy(path: VaultPath, docId: DocId, text: string, reason: ConflictReason = "both-edited"): Promise<boolean> {
 		let attempt = 0;
 		const pending = { path, text };
 		try {
 			for (;;) {
 				const rt = this.deps.runtime();
-				const r = rt ? await this.tryConflictCopy(rt, path, docId, text) : "io";
+				const r = rt ? await this.tryConflictCopy(rt, path, docId, text, reason) : "io";
 				if (r === "ok") return true;
 				if (r === "give-up") break;
 				if (attempt === 0) {
@@ -174,7 +176,7 @@ export class BoundDisk {
 	}
 
 	/** Names come from core conflictName (DESIGN §f.7); a name another writer took meanwhile is skipped. */
-	private async tryConflictCopy(rt: VaultRuntime, path: VaultPath, docId: DocId, text: string): Promise<"ok" | "io" | "give-up"> {
+	private async tryConflictCopy(rt: VaultRuntime, path: VaultPath, docId: DocId, text: string, reason: ConflictReason): Promise<"ok" | "io" | "give-up"> {
 		const ctx = rt.rec.ctx;
 		const view = ctx.log.view();
 		const nowMs = ctx.now();
@@ -189,11 +191,13 @@ export class BoundDisk {
 			const out = res.outcome;
 			if (out.ok) {
 				this.stats.conflictCopies++;
+				this.deps.observeConflict?.(reason, "bound");
 				this.notice("warn", "conflict-copy", conflictCopyNotice({ from: path, to: target }, 1));
 				return "ok";
 			}
 			if (out.reason === "io") return "io";
 			if (out.reason !== "precondition") return "give-up"; // invalid path / parent is a file: not transient
+			this.deps.observeConflict?.("path-taken", "bound");
 			taken.add(ctx.pk(target));
 		}
 		return "give-up";

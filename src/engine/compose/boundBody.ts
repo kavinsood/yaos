@@ -8,7 +8,7 @@
 
 import { DEFAULT_MERGE_LIMITS, merge } from "../../core/merge/merge";
 import { applyEditsTo, minimalDiff } from "../../core/merge/minimalDiff";
-import type { DocId } from "../../core/types";
+import type { ConflictReason, DocId } from "../../core/types";
 import type { BodyChanges, MainToEngine } from "../../protocol/messages";
 import { decodeUtf16 } from "../../protocol/utf16";
 import { editsToChanges, type TextChanges } from "../body/textChanges";
@@ -103,13 +103,13 @@ export class BoundBody {
 		this.stats.attaches++;
 		const text = rt.log.boundText(m.docId);
 		let target = text;
-		let copy: string | null = null;
+		let copy: { readonly text: string; readonly reason: ConflictReason } | null = null;
 		if (editor !== text) {
 			// Disk text the replica already holds (a second view loading a save of the first): not an edit.
 			const absorbed = editor === b.diskText || b.candidates.includes(editor);
 			const r = merge({ base: absorbed ? editor : base, disk: editor, crdt: text, limits: DEFAULT_MERGE_LIMITS });
 			if (r.kind !== "identical") target = r.text;
-			if (r.kind === "conflict") copy = r.conflictCopy;
+			if (r.kind === "conflict") copy = { text: r.conflictCopy, reason: r.reason };
 			if (target !== text) {
 				this.stats.attachMerges++;
 				void rt.log.editBound(m.docId, (y) => applyEditsTo(y, text, minimalDiff(text, target))).catch((e) => this.deps.diag(`attach merge: ${String(e)}`));
@@ -124,7 +124,7 @@ export class BoundBody {
 			b.durable = b.version;
 			this.deps.bound.queue(b, { t: "durable", version: b.version });
 		}
-		if (copy !== null) void this.deps.disk.writeConflictCopy(b.path, m.docId, copy);
+		if (copy !== null) void this.deps.disk.writeConflictCopy(b.path, m.docId, copy.text, copy.reason);
 	}
 
 	/** Editor changes (against version `base`, or chained after the view's push `after`): one MAIN transaction (an entry tagged with the push), or rejected. */
