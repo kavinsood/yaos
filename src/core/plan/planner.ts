@@ -447,6 +447,15 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		if (s.kind !== "blob") {
 			const body = r.body;
 			const Rc = body === null || !versionEq(body.version, s.bodyVersion);
+			// A lost create body (header) that this device holds a synced record for, with the file just what S says:
+			// the merge that would have pushed the text has nothing to do (an own create's file was edited back to
+			// S, e.g. a born-empty S and a file now empty, or a broken canvas save fixed to the empty canvas; or S
+			// came back from the mirror after its store was lost). No frame ever fills the doc, and every other device
+			// waits on "body-empty" for good. Drop the empty doc as when no S is here; the file is a new local file
+			// once the delete folds, created with what it holds. A path change moves the doc first.
+			if (!Lc && !Rc && !pathChanged && body?.caughtUp && !body.hasContent && r.createHash !== EMPTY_CONTENT_HASH && ctx.lostCreateBody.has(docId) && ctx.nsReady && !r.pendingLocal) {
+				return { ...none, ops: [{ op: "nsDelete", docId, baseBodySeq: 0 }, drop(docId)] };
+			}
 			if (!Lc && !Rc) return { ...none, ops: statMoved || pathChanged ? [putFull()] : [] };
 			if (body === null || !body.caughtUp) return { ...none, ops: [waitOp(docId, "body-not-caught-up"), ...putPath()] };
 			// The create's initial frames are still in flight: merging against the empty text would read it as a
