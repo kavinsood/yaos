@@ -66,7 +66,7 @@ test("lostCreateBody: a peer's body-less create once the server reports its crea
 				return Promise.resolve(new Map(ids.map((id) => [id, state])));
 			},
 			mono: () => now, setTimer: (_ms, fn) => timers.push(fn), clearTimer: () => undefined,
-			graceMs: 30_000, recheckMs: 300_000, onAbandoned: () => abandoned++, onRecheck: () => undefined,
+			graceMs: 30_000, recheckMs: 300_000, recheckMaxMs: 3_600_000, onAbandoned: () => abandoned++,
 		});
 		const lb = new ComposedLog(b, () => undefined, creators);
 		lb.nsCaughtUp = true;
@@ -93,7 +93,7 @@ test("lostCreateBody: a peer's body-less create once the server reports its crea
 
 		const unknown = new CreatorStatus({
 			status: (ids) => Promise.resolve(new Map(ids.map((id) => [id, "unknown" as const]))),
-			mono: () => now, setTimer: () => 0, clearTimer: () => undefined, graceMs: 0, recheckMs: 1, onAbandoned: () => undefined, onRecheck: () => undefined,
+			mono: () => now, setTimer: () => 0, clearTimer: () => undefined, graceMs: 0, recheckMs: 1, recheckMaxMs: 1, onAbandoned: () => undefined,
 		});
 		const lu = new ComposedLog(b, () => undefined, unknown);
 		lu.nsCaughtUp = true;

@@ -90,8 +90,10 @@ export interface EngineTuning {
 	 * its way still lands first.
 	 */
 	readonly abandonedCreateGraceMs: number;
-	/** How long a creator that read live (or unknown) is not asked about again. */
+	/** How long a creator that read live is not asked about again (doubling per live answer, compose/creatorStatus.ts). */
 	readonly creatorStatusRecheckMs: number;
+	/** The cap of that doubling. */
+	readonly creatorStatusRecheckMaxMs: number;
 }
 
 /**
@@ -133,6 +135,7 @@ export const DEFAULT_TUNING: EngineTuning = {
 	inheritUnfencedWaitMs: 10_000,
 	abandonedCreateGraceMs: 30_000,
 	creatorStatusRecheckMs: 5 * 60_000,
+	creatorStatusRecheckMaxMs: 60 * 60_000,
 	knownRules: KNOWN_RULES,
 	subscribeDebounceMs: SUBSCRIBE_DEBOUNCE_MS,
 	recentUnboundKeep: RECENT_UNBOUND_KEEP,

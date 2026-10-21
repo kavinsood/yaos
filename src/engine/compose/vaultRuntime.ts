@@ -158,13 +158,10 @@ export class VaultRuntime {
 		const status = o.ports.identity?.status?.bind(o.ports.identity) ?? null;
 		this.creators = new CreatorStatus({
 			status, mono: () => log.c.mono(), setTimer: (ms, fn) => o.ports.clock.setTimer(ms, fn), clearTimer: (h) => o.ports.clock.clearTimer(h),
-			graceMs: log.c.tuning.abandonedCreateGraceMs, recheckMs: log.c.tuning.creatorStatusRecheckMs,
+			graceMs: log.c.tuning.abandonedCreateGraceMs, recheckMs: log.c.tuning.creatorStatusRecheckMs, recheckMaxMs: log.c.tuning.creatorStatusRecheckMaxMs,
 			onAbandoned: () => {
 				this.port.invalidate();
 				this.sched.request({ t: "full" });
-			},
-			onRecheck: () => {
-				if (!this.stopped && this.port.nsCaughtUp) this.port.view();
 			},
 			diag: (line) => this.diag(line),
 		});
