@@ -4,6 +4,8 @@
  *
  *  - storage: IndexedDB (an open failure answers init `storage-lost`: the host
  *    stops and reports it, OR-1);
+ *  - identity (identity-per-store §4): registration with the install's grant (relayHttp.ts registerDevice), and the
+ *    store's device token, which the relay and blob adapters read per call once the engine found or minted it;
  *  - relay: WebSocket streams + HTTP tickets; blobs: HTTP blob store when the
  *    relay advertises attachments, else none (attachments are not synced; a
  *    later connect probes again, probeBlob). Capabilities unreachable (offline
@@ -29,6 +31,9 @@ import { webDeviceEnv } from "./webDeviceEnv";
 import { createWebHash } from "./webHash";
 import { createWebRandom } from "./webRandom";
 import { createWsRelayPort } from "./wsRelay";
+import { createRelayHttp } from "./relayHttp";
+import type { DeviceState, IdentityPort } from "../../ports/identity";
+import type { DeviceId } from "../../core/types";
 
 export interface WebEngineOptions {
 	readonly clientVersion?: string;
@@ -47,13 +52,31 @@ export function createWebEngine(transport: EngineTransport, o: WebEngineOptions 
 			const hash = createWebHash();
 			const random = createWebRandom();
 			const storage = createIdbStoragePort();
-			const relay = createWsRelayPort({ baseUrl: config.relay.url, credential: config.relay.credential, clock, random });
-			const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential: config.relay.credential, clock };
+			// SECRET: the store's device token, set once the engine found or minted the store (identity-per-store §4).
+			let token = "";
+			const credential = (): string => token;
+			const relay = createWsRelayPort({ baseUrl: config.relay.url, credential, clock, random });
+			const blobOpts = { baseUrl: config.relay.url, vaultId: config.vaultId, credential, clock };
 			const blob = await startupBlob(blobOpts, o.log);
 			const c = config.crypto;
 			// Suite-1 keys are zero-filled once imported (webCryptoSuite1.ts); the port outlives runtime restarts.
 			const crypto = c.suite === 0 ? createNoopCrypto(hash) : await createWebCryptoSuite1({ vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] });
-			return { relay, storage, clock, random, crypto, hash, blob, probeBlob: () => probeHttpBlob(blobOpts) };
+			const http = createRelayHttp({ baseUrl: config.relay.url, credential, clock });
+			// SECRET: the install's pairing grant; a rotation's secret replaces it (useGrant, identity-per-store §3.4).
+			let grantSecret = config.relay.grantSecret;
+			const identity: IdentityPort = {
+				register: (body) => (grantSecret ? http.registerDevice(config.vaultId, grantSecret, body) : Promise.resolve({ ok: false, reason: "no-grant", retryAfterMs: null })),
+				use: (deviceToken) => {
+					token = deviceToken;
+				},
+				retire: (body) => http.retireDevice(config.vaultId, body),
+				status: async (ids) => (token ? ((await http.deviceStatus(config.vaultId, ids)) as ReadonlyMap<DeviceId, DeviceState> | null) : null),
+				fetchGrant: () => (token ? http.fetchGrant(config.vaultId) : Promise.resolve({ ok: false, reason: "no-store" })),
+				useGrant: (secret) => {
+					grantSecret = secret;
+				},
+			};
+			return { relay, storage, clock, random, crypto, hash, blob, probeBlob: () => probeHttpBlob(blobOpts), identity };
 		},
 	});
 }

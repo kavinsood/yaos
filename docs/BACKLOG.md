@@ -1,6 +1,6 @@
 # Backlog
 
-Status: the open work as of 2026-10-21, on `sim-port`. The list is the project owner's (2026-10-21); the context
+Status: the open work as of 2026-10-21, on `sim-port` (identity-per-store through phase 4 on `client-remake-next`, phase 5 on `identity/phase5-hygiene`). The list is the project owner's (2026-10-21); the context
 under each item is checked against the code and the notes it names. Done work is not kept here once merged (the last
 section lists what landed on `sim-port` since 33bdf49b): it is in git history and in the notes
 ([integration-notes.md](client-remake/integration-notes.md) §3, the sim regression plans). Smaller known gaps that
@@ -11,42 +11,6 @@ Section letters (§x.y) refer to [DESIGN](client-remake/DESIGN.md).
 ---
 
 ## 1. Being fixed now
-
-### CLONED-ID: a cloned vault folder shares one device identity
-
-The device identity (`vaultId`, `deviceId`, device token) is plugin data, so it lives in the vault's
-`<configDir>/plugins/yaos/data.json` (`src/host/pluginController.ts`). A vault folder copied to a second machine, or
-synced there by iCloud, Syncthing or Dropbox, carries that file: both machines then run as the same device. Nothing
-detects it. Each takes the other's ns frames for its own (`deviceId === self`, `src/engine/sync/ingestRow.ts`,
-`src/engine/sync/foldRuntime.ts`), as confirmations of local work rather than remote changes: renames revert, files
-are trashed, and creates and settings changes are dropped. The fix is being designed:
-
-- an install marker that tells a cloned `data.json` from the install that wrote it, then a re-pair or a rotated
-  device identity on the clone;
-- a per-store writer tag, so two stores under one deviceId never take each other's frames for their own.
-
-Proposed design: [identity-per-store](client-remake/identity-per-store.md) (an identity per IndexedDB store, a pairing
-grant in data.json). Owner decisions recorded there (§12.1, 2026-10-21).
-
-- **Phase 1 landed (server only)** on `identity/phase1-server`: pairing grants, register / retire / self-retire /
-  leave, tombstones, per-grant limits, `last_seen_day`, grant pairing codes, "Revoke pairing" and the grouped console
-  (DECISIONS §10, G54–G64). Additive: the current client still enrolls the old way and is unaffected.
-- Next: phase 2 (client grant pairing and a per-store identity), then 3 (predecessor recovery), 4 (removal of the
-  wall floor and `renumberBlind`), 5 (inactivity retirement, grant rotation).
-
-### FRAMENO-IDB: frameNo collision after IndexedDB loss
-
-ns/cfg replay protection (e2ee-design §8.2) needs every frame number of a device to be new. A store lost with an
-uncommitted frame in flight, and no outbox mirror, restarts numbering from the committed edge, so the lost runtime's
-frame and the new one can share a number: whichever commits second folds as `replay-duplicate` (sim seed 222). The
-planner no longer trashes the file when that happens (d1f8a750: an own create that folded as ignored is re-created),
-but the collision itself stands. The current guard is a stopgap: a runtime's first number is at least the wall clock
-in ms (44748cb2), ignored when the clock reads past 2^45 ms (f47950cb) (`FoldRuntime.skip`,
-`src/engine/sync/foldRuntime.ts`). It depends on the wall clock moving forward across the loss. It stays until the
-CLONED-ID design lands: a fresh store under a new writer identity (rotated device id or writer tag) never shares a
-replay window with the lost one.
-
-Proposed design: [identity-per-store](client-remake/identity-per-store.md).
 
 ### PERF-BOOT: fresh-device bootstrap takes ~32 s on a phone
 
@@ -81,6 +45,14 @@ Node harness does the same vault in ~2.7 s ([integration-notes](client-remake/in
 4. **One transaction per catch-up batch** instead of three per file: hygiene; IndexedDB is not on the critical path.
 
 ## 2. Smaller open items
+
+### DATAJSON-REFETCH: rewrite a lost data.json from the store (declined for now)
+
+identity-per-store §4 "data.json lost, store intact" optionally has the store re-fetch its grant with its device token
+and rewrite data.json. Not built with phase 5: data.json is the only place the pairing's host and vaultId live (the
+install record and the store DB name hold the vaultId but not the host), so a store has nothing to call. The
+install pairs again, as before. The route it would use exists (`GET /vault/:id/auth/grant`, phase 5) but returns a
+secret only after a rotation.
 
 ### QUARANTINE-UI: quarantine release control in the UI
 
@@ -152,6 +124,21 @@ From [DECISIONS](server-rewrite/DECISIONS.md) §8, still open:
 ## Landed on `sim-port` since 33bdf49b
 
 Kept here until `sim-port` merges; then git history holds them.
+
+- **CLONED-ID, FRAMENO-IDB** (identity-per-store phases 1–4, `client-remake-next`): a deviceId is used by exactly one
+  store, ever. The identity lives in the store (`meta.identity`), data.json holds a pairing grant, a clone or a new
+  IndexedDB registers a new device, an IndexedDB loss fences its predecessor and re-issues its mirrored frames, a
+  vaultEpoch change mints too (the old epoch's store retires itself once the new one is live), and the per-install
+  data.json fields moved to `App.saveLocalStorage` (§8; a one-time notice when another tool syncs the folder). With
+  that, frameNo allocation is exact (e2ee-design §8.2): the wall-clock floor (44748cb2, f47950cb), the 64 skip,
+  `renumberBlind` and the epoch `frameNoFloor` are gone. Residual: a duplicated app profile (Migration Assistant, a
+  Time Machine restore onto a second Mac) still runs two installs as one store (decision 7, accepted).
+- **IDENTITY-HYGIENE** (identity-per-store phase 5, `identity/phase5-hygiene`): stores not seen for 90 days are
+  retired lazily by the server (so an abandoned store's body-less creates resolve without a console action); the
+  operator can rotate a pairing's secret and live stores fetch the new one with their token; at live, a device deletes
+  the store DBs of this vault under a lost install key once the server reads them retired; **Rebuild local cache** is
+  a store reset (a new identity that fences and inherits from the old store). Declined: replay-ring compaction
+  (decision 6: rings are kept, ~1.5 KB per device and stream) and DATAJSON-REFETCH above.
 
 - **BLOB-RETRY** (473cd500, after 31987119): a downloaded attachment whose disk write keeps failing backs its
   re-downloads off per (doc, hash), 1 min doubling to a cap scaled by size (10–60 min), and is listed

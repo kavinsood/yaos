@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { VaultEpoch } from "../core/types";
 import { BLOB_TRANSFER_IDLE_MS } from "../core/limits";
-import type { EngineSettings } from "../protocol/messages";
+import type { EngineResultValue, EngineSettings } from "../protocol/messages";
 import { VirtualClock } from "./clock";
 import { SIM_SETTINGS, SimDevice, type SimDeviceOptions } from "./device";
 import { SimNet } from "./net";
@@ -138,9 +138,9 @@ test("a blob store found on a later connect: the runtime restarts with it, pendi
 
 	// The operator binds R2 and redeploys: every socket drops, the next connect's probe finds the store.
 	net.blobsAvailable = true;
-	for (const d of devs) net.setOnline(d.deviceId, false);
+	for (const d of devs) net.setOnline(d.machineKey, false);
 	await clock.advance(1_000);
-	for (const d of devs) net.setOnline(d.deviceId, true);
+	for (const d of devs) net.setOnline(d.machineKey, true);
 	await clock.advance(30_000);
 	await same(a, b, "img/p.png", pic);
 	assert.equal(net.blobs.objects.size, 1);
@@ -361,8 +361,35 @@ test("settings sync first contact, seed \"device\": the joining device's values 
 	assert.deepEqual(await firstContact("device"), { a: '{"vimMode":false}', p: '{"vimMode":false}', pPlugins: '["dv"]', aPlugins: '["draw","dv"]' });
 });
 
-test("IndexedDB evicted while the app is down: restart recovers from the mirror, no duplicates, offline edits on both sides survive", async () => {
+// identity-per-store: a store lost with IndexedDB takes its identity with it; the next store (a new deviceId) recovers
+// from the old one's mirrors (state/<old>/, §5.2 predecessor recovery). Without the mirrors the restart is DESIGN §i.5
+// "without mirrors".
+
+test("IndexedDB and mirrors lost while the app is down: a new identity, the offline edits survive as a conflict copy", async () => {
 	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\n");
+	a.vault.userWrite("y.md", "why\n");
+	await boot(clock, devs);
+	await clock.advance(10_000); // synced, mirrors written
+	const before = a.deviceId;
+	a.crashApp({ wipe: true, dropMirrors: true });
+	a.vault.externalWrite("x.md", "one\nA offline\n");
+	b.vault.userWrite("z.md", "zed\n");
+	await clock.advance(5_000);
+	void a.restartApp();
+	await clock.advance(20_000);
+	assert.notEqual(a.deviceId, before, "the new store has a new identity");
+	assert.deepEqual(a.identities, [before, a.deviceId]);
+	const copy = "x (conflict A 2026-01-01 0000).md";
+	for (const d of [a, b]) {
+		assert.deepEqual([...d.vault.snapshot().entries()].sort(), [["x.md", "one\n"], [copy, "one\nA offline\n"], ["y.md", "why\n"], ["z.md", "zed\n"]].sort(), `${d.name}`);
+		assert.equal(d.vault.trashed.length, 0, `${d.name}: nothing trashed`);
+	}
+});
+
+test("IndexedDB evicted while the app is down: restart recovers from the mirror, no duplicates, offline edits on both sides survive", async () => {
+	const { clock, net, devs } = world();
 	const [a, b] = pair(devs);
 	a.vault.userWrite("x.md", "one\n");
 	a.vault.userWrite("y.md", "why\n");
@@ -370,6 +397,7 @@ test("IndexedDB evicted while the app is down: restart recovers from the mirror,
 	await clock.advance(5_000);
 	assert.equal(b.vault.textOf("x.md"), "one\n");
 	await clock.advance(5_000); // mirrors written
+	const before = a.deviceId;
 
 	a.crashApp({ wipe: true });
 	a.vault.externalWrite("x.md", "one\nA offline\n");
@@ -386,6 +414,12 @@ test("IndexedDB evicted while the app is down: restart recovers from the mirror,
 		assert.deepEqual([...d.vault.snapshot().keys()].sort(), ["x.md", "y.md", "z.md"], `${d.name}: no conflict copies or duplicates`);
 		assert.equal(d.vault.trashed.length, 0, `${d.name}: nothing trashed`);
 	}
+	assert.notEqual(a.deviceId, before, "the successor store has a new identity");
+	assert.deepEqual(a.identities, [before, a.deviceId]);
+	// The predecessor was fenced (retired by key) and its dir removed once the successor's mirrors were written.
+	assert.equal(net.identities.state(before), "retired");
+	assert.ok(![...a.sideFiles.files.keys()].some((k) => k.startsWith(`${before}/outbox`) || k.startsWith(`${before}/synced`)), "the predecessor's mirrors are gone");
+	assert.ok([...a.sideFiles.files.keys()].some((k) => k.startsWith(`${a.deviceId}/outbox`)), "the successor's mirror is written");
 });
 
 test("IndexedDB and mirrors both lost: the device re-bootstraps; same-content files merge without copies", async () => {
@@ -414,6 +448,7 @@ test("relay epoch reset (§c.12): both devices migrate, re-upload, and keep sync
 	await boot(clock, devs);
 	await clock.advance(10_000);
 	assert.equal(a.vault.textOf("y.md"), "two\n");
+	const before = devs.map((d) => d.vrt!.log.c.self);
 
 	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
 	a.vault.externalWrite("x.md", "one\nduring reset\n");
@@ -423,13 +458,46 @@ test("relay epoch reset (§c.12): both devices migrate, re-upload, and keep sync
 
 	const want = [["w.md", "after\n"], ["x.md", "one\nduring reset\n"], ["y.md", "two\n"]];
 	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()].sort(), want, `${d.name}`);
-	// A's re-create of x.md lost the race to B's and merged into it (3-way against the old epoch's base) instead of
-	// a loser rename. B may have materialized the loser before A deleted it: that transient copy is in B's trash.
-	assert.deepEqual(a.vault.trashed, []);
-	for (const t of b.vault.trashed) assert.deepEqual([t.path, t.text], ["x (2).md", "one\nduring reset\n"]);
+	// One device's re-create of x.md lost the race to the other's and merged into it (3-way against the old epoch's
+	// base) instead of a loser rename. Either may have materialized the loser before it was deleted: that transient
+	// copy (the old base, or A's edit) is in its trash, and nothing else is.
+	for (const d of [a, b]) for (const t of d.vault.trashed) assert.ok(t.path === "x (2).md" && (t.text === "one\n" || t.text === "one\nduring reset\n"), `${d.name} trashed ${t.path}`);
 	const o = await net.oracle();
 	assert.equal(o.error, null);
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]).sort(), want, "the new epoch holds the whole vault");
+	// identity-per-store §4 (decision 2): the new epoch's store is a new device, and the old one retired itself once
+	// the new one was live (its DB deleted with it).
+	devs.forEach((d, i) => {
+		const now = d.vrt!.log.c.self;
+		assert.notEqual(now, before[i], `${d.name}: a new identity for the new epoch`);
+		assert.equal(net.identities.state(now), "live");
+		assert.equal(net.identities.state(before[i]!), "retired", `${d.name}: the old epoch's store retired`);
+		assert.deepEqual(d.vrt!.log.c.repo.identity.supersedes, [before[i]], `${d.name}: the new store names the one it replaces`);
+	});
+	for (const d of devs) assert.deepEqual((await d.storage.listDatabases()).filter((n) => n.startsWith("yaos3:")).map((n) => n.split(":")[2]), ["sim-epoch-2"], `${d.name}: only the new epoch's store`);
+});
+
+test("epoch reset with local snapshots on: the new epoch's store (a new device) lists the migration's snapshot", async () => {
+	// The "epoch" snapshot is taken by the old store, in its dir; the new store takes the old dir's local snapshots over
+	// (identity-per-store §5.2 step 6) and removes the old dir's files once its own mirrors are written.
+	const settings = { ...SIM_SETTINGS, snapshots: { enabled: true, keepDaily: 7, uploadToBlobStore: false } };
+	const { clock, net, devs } = world({ settings: () => settings }, ["A"]);
+	const a = devs[0]!;
+	a.vault.userWrite("x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	const old = a.vrt!.log.c.self;
+	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
+	await clock.advance(30_000);
+	assert.equal(a.vrt?.vaultEpoch, "sim-epoch-2");
+	assert.notEqual(a.vrt!.log.c.self, old);
+	let listed: EngineResultValue | null = null;
+	void a.runtime.command({ t: "listSnapshots" }).then((v) => (listed = v));
+	for (let i = 0; i < 200 && listed === null; i++) await clock.advance(50);
+	const got = listed as EngineResultValue | null;
+	assert.equal(got?.t, "snapshots");
+	const snaps = got?.t === "snapshots" ? got.snapshots : [];
+	assert.ok(snaps.some((x) => x.reason === "epoch"), `the epoch snapshot is listed: ${JSON.stringify(snaps.map((x) => x.reason))}`);
 });
 
 test("epoch reset, app crash after the migration and before its merges: the old epoch's base survives the restart", async () => {
@@ -490,6 +558,27 @@ test("epoch restore to a point before a text delete: the migration deletes the r
 	}
 	const o = await net.oracle();
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]), [["x.md", "a\none three\nb\n"]]);
+});
+
+test("IndexedDB and mirrors lost after an own edit reached the relay but not the disk: both texts survive", async () => {
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	const v = a.workspace.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(1_000);
+	v.edit(3, 0, " typed");
+	await clock.advance(1_000); // frame acked; the editor's 2 s save has not run
+	a.crashApp({ wipe: true, dropMirrors: true });
+	await clock.advance(1_000);
+	void a.restartApp();
+	await clock.advance(30_000);
+	for (const d of [a, b]) {
+		assert.deepEqual([...d.vault.snapshot().entries()].sort(), [["x (conflict A 2026-01-01 0000).md", "one\n"], ["x.md", "one typed\n"]], `${d.name}`);
+		assert.equal(d.vault.trashed.length, 0);
+	}
 });
 
 test("IndexedDB evicted after an own edit reached the relay but not the disk: recovery writes it to disk", async () => {

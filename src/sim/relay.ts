@@ -325,6 +325,14 @@ export class SimRelay implements RelayPort {
 		this.engine.schedule();
 	}
 
+	/**
+	 * Buffered frames of `deviceId` on streams matching `stream` are lost uncommitted, with no answer to the sender (it
+	 * is gone): the abandoned-create fault (a store dies after its ns create reached the relay, before its body did).
+	 */
+	discardPending(deviceId: DeviceId, stream: (name: StreamName) => boolean): number {
+		return this.engine.discardPending((f) => f.deviceId === deviceId && stream(f.stream));
+	}
+
 	/** Commits the pending buffer now, synchronously (forced flush). */
 	commitNow(): void {
 		this.engine.flush("forced");

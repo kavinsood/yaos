@@ -20,13 +20,13 @@ import { SIM_SETTINGS, SimDevice } from "../../sim/device";
 import { SIM_VAULT_ID, SimNet } from "../../sim/net";
 import type { StatusSnapshot } from "../../protocol/status";
 import { YaosController } from "../pluginController";
-import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "../ui/api";
+import { defaultPluginData, type PairedIdentity, type StoredPluginData } from "../ui/api";
 import { formatDiagnostics } from "../ui/diagnostics";
 import { VaultKeyStore, secretIdFor } from "./secretStore";
 import { fakeEpochKey, fakeGenesisRecord } from "./testkit/kRecords";
 import { testVaultId } from "./testkit/vaultIds";
 
-const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), deviceId: "dev-A", deviceToken: "device-credential", deviceName: "A", vaultGeneration: null };
+const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: "gs_SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS", grantName: "A", vaultGeneration: null };
 
 function base64(bytes: Uint8Array): string {
 	let s = "";
@@ -130,7 +130,7 @@ test("at rest: vault keys and recovery keys appear nowhere but the vault's Secre
 	const peer = new SimDevice({ name: "B", clock, net }); // suite 0 (fixture): fills the relay with real traffic
 	peer.vault.userWrite("notes/b.md", "hello from b\n");
 	void peer.start();
-	const saved: YaosPluginData[] = [];
+	const saved: StoredPluginData[] = [];
 	const notices: string[] = [];
 	const local = new Map<string, unknown>();
 	const statuses: StatusSnapshot[] = [];

@@ -19,11 +19,11 @@ import type {
 } from "../core/types";
 import type { DeviceClass } from "../core/limits";
 import type { PlatformInfo, LifecycleEvent } from "../ports/platform";
-import type { VaultEvent, VaultStat, WritePrecondition, WriteOutcome, RenameOutcome, TrashMode, SideFileName } from "../ports/vault";
+import type { VaultEvent, VaultStat, WritePrecondition, WriteOutcome, RenameOutcome, TrashMode, SideFilePath, SideFilePrefix } from "../ports/vault";
 import type { ProtocolError } from "./errors";
 import type { StatusSnapshot, DiagnosticsBundle, DeviceCheckMode, DeviceCheckReport } from "./status";
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 export type RequestId = number;
 
@@ -51,21 +51,36 @@ export interface EngineSettings {
 export interface EngineInitConfig {
 	readonly protocolVersion: number;
 	readonly vaultId: VaultId;
-	readonly deviceId: DeviceId;
 	/** Human label for conflict copy names (sanitized by the engine). */
 	readonly deviceLabel: string;
 	readonly deviceClass: DeviceClass;
 	readonly platform: PlatformInfo;
 	readonly configDir: string;
 	readonly caseInsensitiveFs: boolean;
-	/** Relay endpoint + credential. SECRET: never logged, never echoed in status/diagnostics. */
-	readonly relay: { readonly url: string; readonly credential: string };
+	/**
+	 * The relay endpoint and the install's pairing grant (identity-per-store §3). The device identity is not here: it
+	 * lives in the store (meta.identity), and the engine mints and registers one (with the grant) when this install
+	 * has no store (§4). SECRET (grantSecret): never logged, never echoed in status/diagnostics.
+	 */
+	readonly relay: { readonly url: string; readonly grantSecret: string };
+	/**
+	 * This install's key (identity-per-store §2.4): the store is `yaos3:<vaultId>:<epoch>:<installKey>`. Main keeps it
+	 * in App.saveLocalStorage, which Obsidian scopes to the vault registration, so a copied folder gets its own.
+	 */
+	readonly installKey: string;
+	/**
+	 * This install's earlier stores (the install record's lineage: `current` and its predecessors, identity-per-store
+	 * §2.4). A create of one of them whose initial body never reached the relay is the next store's to upload (§5.2
+	 * `lostCreateBody`): nobody else has that file. A clone has none. Optional: an older host sends none.
+	 */
+	readonly lineage?: readonly string[];
+	/**
+	 * The install record's `current` store and its retire key (identity-per-store §2.4 point 3). When the engine mints
+	 * a new store it retires this one by key before anything else (the successor fence, §5.2 step 1), so no late frame
+	 * of it can commit, then recovers from its mirrors. SECRET (retireKey): never logged. Optional: none or unknown.
+	 */
+	readonly predecessor?: { readonly deviceId: string; readonly retireKey: string } | null;
 	readonly settings: EngineSettings;
-	/** Side files read by the host at startup (DESIGN §e.4). [T] */
-	readonly sideState: {
-		readonly outboxMirror: readonly (Uint8Array | null)[];
-		readonly syncedMirror: readonly (Uint8Array | null)[];
-	};
 	/** SECRET (keys): never logged or echoed. Buffers are transferred, and main keeps no copy (e2ee-design §6.3). */
 	readonly crypto:
 		| { readonly suite: null; readonly creating: boolean } // unpinned (§12.4): reads `k` only, writes nothing
@@ -149,12 +164,12 @@ export type HashWant = "fingerprint" | "contentHash";
 export type HostIoOp =
 	| { readonly t: "configList"; readonly dir: string }
 	| { readonly t: "configRemove"; readonly path: string }
-	| { readonly t: "sideFileList"; readonly prefix: "snapshots/" }
-	| { readonly t: "sideFileRemove"; readonly name: SideFileName };
+	| { readonly t: "sideFileList"; readonly prefix: SideFilePrefix }
+	| { readonly t: "sideFileRemove"; readonly name: SideFilePath };
 
 export type HostIoResult =
 	| { readonly t: "configListing"; readonly entries: readonly { readonly path: string; readonly size: number; readonly mtimeMs: number; readonly isFolder: boolean }[] }
-	| { readonly t: "sideFiles"; readonly names: readonly SideFileName[] }
+	| { readonly t: "sideFiles"; readonly names: readonly SideFilePath[] }
 	| { readonly t: "done" };
 
 /** openDoc answer. The host then uploads the editor text and sends bodyAttach (DESIGN §d.3). */
@@ -216,7 +231,13 @@ export type UserCommand =
 	| { readonly t: "deleteSnapshot"; readonly snapshotId: string }
 	/** -> `diagnostics`. includePaths: the user opted in to file names (DiagnosticsBundle.paths). */
 	| { readonly t: "exportDiagnostics"; readonly includePaths: boolean }
+	/** -> `ok`. A store reset (identity-per-store §4): a new store under a new identity inherits the current one's unsent edits. */
 	| { readonly t: "rebuildLocalCache" }
+	/**
+	 * -> `ok`. Fetch the pairing grant's secret with the store's device token (identity-per-store §3.4, after a rotation);
+	 * a new one comes back as a `grantSecret` message first. Sent by main when a grant call answered 401.
+	 */
+	| { readonly t: "refreshGrant" }
 	| { readonly t: "updateSettings"; readonly settings: EngineSettings }
 	| { readonly t: "releaseQuarantine"; readonly stream: string }
 	// e2ee-design §18.4 (all SECRET payloads, transferred):
@@ -331,8 +352,9 @@ export type EngineToMain =
 	| { readonly t: "diskOps"; readonly rid: RequestId; readonly lane: Lane; readonly ops: readonly DiskOp[] }
 	/** Ask the host to save bound views now (after remote updates, before hidden). */
 	| { readonly t: "saveViews"; readonly rid: RequestId; readonly docIds: readonly DocId[] }
-	| { readonly t: "sideFileWrite"; readonly rid: RequestId; readonly name: SideFileName; readonly bytes: Uint8Array /* [T] */ }
-	| { readonly t: "sideFileRead"; readonly rid: RequestId; readonly name: SideFileName }
+	/** `name` is in the engine's own store dir, `<deviceId>/...` (identity-per-store §5.2); main refuses any other shape. */
+	| { readonly t: "sideFileWrite"; readonly rid: RequestId; readonly name: SideFilePath; readonly bytes: Uint8Array /* [T] */ }
+	| { readonly t: "sideFileRead"; readonly rid: RequestId; readonly name: SideFilePath }
 	| { readonly t: "hostIo"; readonly rid: RequestId; readonly op: HostIoOp }
 	/**
 	 * e2ee-design §18.4: the keys and winning records main must store (SECRET); main persists before replying
@@ -341,6 +363,16 @@ export type EngineToMain =
 	| { readonly t: "keyringChanged"; readonly rid: RequestId; readonly keys: readonly { readonly e: number; readonly k: Uint8Array }[]; // SECRET
 		readonly records: readonly Uint8Array[]; readonly pending: number | null }
 	| { readonly t: "status"; readonly status: StatusSnapshot }
+	/**
+	 * identity-per-store §2.4 point 4: the store a runtime started on (posted at every runtime start; main records it as
+	 * the lineage's `current`). SECRET (retireKey): main keeps it in local storage only, never logs it.
+	 */
+	| { readonly t: "storeIdentity"; readonly deviceId: DeviceId; readonly retireKey: string }
+	/**
+	 * identity-per-store §3.4: the pairing grant's secret was rotated on the server and the store fetched the new one
+	 * with its device token; main rewrites data.json's grant. SECRET: never logged.
+	 */
+	| { readonly t: "grantSecret"; readonly grantSecret: string }
 	| { readonly t: "brake"; readonly report: BrakeReport }
 	| { readonly t: "notice"; readonly level: "info" | "warn" | "error"; readonly code: string; readonly message: string };
 

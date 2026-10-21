@@ -4,19 +4,20 @@
  * f < (lowest unreceipted own frameNo) + NS_SEND_WINDOW never has a frame
  * rejected as replay-*, whatever order the relay commits in, however late
  * receipts arrive, across reconnects with copies lingering on old sockets and
- * across runtime restarts (IndexedDB intact; the first allocation skips
- * NS_DEDUPE_RING). Every later commit of an already committed frame is
- * rejected. The relay is assumed not to dedupe at all (worst case).
+ * across runtime restarts (IndexedDB intact: allocation continues from the
+ * persisted max, outbox and receipted rows, with no skip). Every later commit
+ * of an already committed frame is rejected. The relay is assumed not to
+ * dedupe at all (worst case).
  *
  * Argument: if f is uncommitted then u <= f, so every sent frame is
  * < f + NS_SEND_WINDOW, so R < f + 32 and f > R - REPLAY_WINDOW: never stale;
  * frameNos are distinct, so f's bit is clear: never a duplicate.
- * Not covered (open, see the design doc): IndexedDB lost while an old socket
- * still holds frames that commit after the new runtime's frames.
+ * IndexedDB loss is no case of its own: the new store is a new deviceId with a
+ * replay window of its own (identity-per-store §1.3).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { NS_DEDUPE_RING, NS_SEND_WINDOW, REPLAY_WINDOW } from "../limits";
+import { NS_SEND_WINDOW, REPLAY_WINDOW } from "../limits";
 import type { ClientFrameId, DeviceId, NsFoldEvent } from "../types";
 import { foldNsFrame } from "./fold";
 import { newNsFoldIndex, newNsFoldState } from "./index";
@@ -38,14 +39,12 @@ class Writer {
 	/** Persisted max: outbox and receipted rows (the receipt writes the own tail row). */
 	private receiptedMax = 0;
 	private seen = 0;
-	private allocated = false;
 	private onSocket = new Set<ClientFrameId>();
 	private n = 0;
 	constructor(readonly deviceId: DeviceId, private readonly window: number) {}
 
 	create(): void {
-		let max = Math.max(this.seen, this.receiptedMax, ...[...this.outbox.values()].map((f) => f.frameNo));
-		if (!this.allocated) { max += NS_DEDUPE_RING; this.allocated = true; }
+		const max = Math.max(this.seen, this.receiptedMax, ...[...this.outbox.values()].map((f) => f.frameNo));
 		this.seen = max + 1;
 		const clientFrameId = `${this.deviceId}-${this.n++}`.padEnd(22, "x") as ClientFrameId;
 		this.outbox.set(clientFrameId, { deviceId: this.deviceId, clientFrameId, frameNo: max + 1 });
@@ -67,7 +66,7 @@ class Writer {
 		this.receiptedMax = Math.max(this.receiptedMax, f.frameNo);
 	}
 	reconnect(): void { this.onSocket = new Set(); }
-	restart(): void { this.reconnect(); this.seen = 0; this.allocated = false; }
+	restart(): void { this.reconnect(); this.seen = 0; }
 }
 
 /** Runs one schedule; returns the number of honest first commits rejected (0 = exact). */

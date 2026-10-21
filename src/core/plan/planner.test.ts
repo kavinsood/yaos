@@ -662,16 +662,21 @@ test("row live/absent/present: md -> reconcileContent(no base); blob equal -> ad
 	assert.deepEqual(opsOf(run({ remote: [R("d1", "a.md", { body: { ...body, hasContent: false } })], local: [L("a.md", h("c3"))] })), ["wait"]);
 });
 
-test("lost create body (own create, no rows, nothing pending, no synced record): push the file, or drop the empty doc", () => {
+test("lost create body (no rows, nothing pending, no synced record): drop the empty doc; a file there is re-created after", () => {
 	// Sim heavy seeds 17, 90, 194: the creator's store (and mirrors) went before its initial frames were acked;
 	// every device then waited "body-empty" forever, with the text only on the creator's disk.
 	const empty = { ...R("d1", "a.md").body!, hasContent: false, version: V(0) };
 	const lost = { lostCreateBody: new Set([id("d1")]) };
 	const present = { remote: [R("d1", "a.md", { body: empty })], local: [L("a.md", h("c3"))] };
 	assert.deepEqual(run(present).ops, [{ op: "wait", docId: "d1", reason: "body-empty" }]);
-	const push = run(present, lost);
-	assert.deepEqual(push.ops, [{ op: "reconcileContent", docId: "d1", path: "a.md", kind: "markdown", hasBase: false }]);
-	assert.equal(push.brake, null);
+	// The file stays (claimed: no create at its path while the empty doc holds it) and is not braked: nothing of the user's goes.
+	const drop = run(present, lost);
+	assert.deepEqual(drop.ops, [{ op: "nsDelete", docId: "d1", baseBodySeq: 0 }]);
+	assert.equal(drop.brake, null);
+	assert.deepEqual(run(present, { ...lost, nsReady: false }).ops, []);
+	assert.deepEqual(run({ ...present, remote: [R("d1", "a.md", { body: empty, pendingLocal: true })] }, lost).ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }]);
+	// Once the delete folded, the file is a new local file: a new doc with its text.
+	assert.deepEqual(opsOf(run({ remote: [R("d1", "a.md", { body: empty, state: "deleted" })], local: [L("a.md", h("c3"))] }, lost)), ["nsCreate", "reconcileContent"]);
 	// The file is gone too (moved or deleted while the store was down): the empty doc is deleted.
 	const absent = { remote: [R("d1", "a.md", { body: empty })] };
 	assert.deepEqual(run(absent).ops, [{ op: "wait", docId: "d1", reason: "body-empty" }]);
@@ -681,6 +686,31 @@ test("lost create body (own create, no rows, nothing pending, no synced record):
 	assert.deepEqual(run({ remote: [R("d1", "a.md", { body: empty, pendingLocal: true })] }, lost).ops, [{ op: "wait", docId: "d1", reason: "pending-ns" }]);
 	// A moved file is a new doc next to the delete.
 	assert.deepEqual(opsOf(run({ ...absent, local: [L("b.md", h("c3"))] }, lost)), ["nsDelete", "nsCreate", "reconcileContent"]);
+});
+
+test("lost create body with a synced record and the file just what S says: drop the empty doc and S (soak 1313609040 run 108)", () => {
+	// The creator's born-empty S (runner) and a file that is empty again by the time the initial merge would run: a
+	// canvas created from a broken save (createHash of those bytes), then fixed to the empty canvas. L = S, so no merge
+	// ever frames anything, and the other devices waited on "body-empty" for good, their creator live.
+	const empty = { ...R("d1", "c.canvas").body!, hasContent: false, version: V(0) };
+	const lost = { lostCreateBody: new Set([id("d1")]) };
+	const bornEmpty = S("d1", "c.canvas", { contentHash: EMPTY_CONTENT_HASH, bodyVersion: V(0), hasBase: false });
+	const sc = { remote: [R("d1", "c.canvas", { body: empty })], synced: [bornEmpty], local: [L("c.canvas", EMPTY_CONTENT_HASH, { fingerprint: fp("c0") })] };
+	assert.deepEqual(run(sc).ops, [], "not lost (a foreign creator, or own frames still to come): nothing to do");
+	const p = run(sc, lost);
+	assert.deepEqual(p.ops, [{ op: "nsDelete", docId: "d1", baseBodySeq: 0 }, { op: "syncedDrop", docId: "d1" }]);
+	assert.equal(p.brake, null, "nothing of the user's goes: the file stays");
+	// Once the delete folded, the file is a new local file: a new doc with what it holds.
+	assert.deepEqual(opsOf(run({ remote: [R("d1", "c.canvas", { body: empty, state: "deleted" })], local: [L("c.canvas", EMPTY_CONTENT_HASH)] }, lost)), ["nsCreate", "reconcileContent"]);
+	// S with text (a mirror restored it after the store went, frames never acked) and the same file: dropped too.
+	const withText = { ...sc, synced: [S("d1", "c.canvas", { bodyVersion: V(0) })], local: [L("c.canvas", h("c0"))] };
+	assert.deepEqual(opsOf(run(withText, lost)), ["nsDelete", "syncedDrop"]);
+	// Not yet: ns not ready, the doc's own ns op pending, or a remote move to apply first.
+	assert.deepEqual(run(sc, { ...lost, nsReady: false }).ops, []);
+	assert.equal(opsOf(run({ ...sc, remote: [R("d1", "c.canvas", { body: empty, pendingLocal: true })] }, lost)).includes("nsDelete"), false);
+	assert.deepEqual(opsOf(run({ ...sc, remote: [R("d1", "d.canvas", { body: empty })] }, lost)), ["diskRename", "syncedPut"]);
+	// The file changed: the merge pushes its text into the doc (the runner's re-push of an own create), as before.
+	assert.deepEqual(opsOf(run({ ...sc, local: [L("c.canvas", h("c5"))] }, lost)), ["reconcileContent"]);
 });
 
 // ---------------------------------------------------------------------------

@@ -79,7 +79,8 @@ function checkEngineOnce(mainJs) {
 async function smokePlugin(mainJs, manifest, carrier) {
 	const saved = {
 		notices: [],
-		data: { identity: { host: "https://relay.example", vaultId: "smokeVaultAAAAAAAAAAAA", deviceId: "smoke-device-0001", deviceToken: TOKEN, deviceName: "smoke", vaultGeneration: null } },
+		// A paired install (identity-per-store §3): data.json holds the pairing grant; the store mints its own device.
+		data: { identity: { host: "https://relay.example", vaultId: "smokeVaultAAAAAAAAAAAA", grantId: "smoke-grant-000000001", grantSecret: TOKEN, grantName: "smoke", vaultGeneration: null } },
 	};
 	const stub = obsidianStub(saved, fail);
 	const requested = [];
@@ -102,7 +103,9 @@ async function smokePlugin(mainJs, manifest, carrier) {
 	const vault = new FakeObsidianVault(false);
 	vault.put("hello.md", "hello from the smoke vault");
 	const workspace = { getLeavesOfType: () => [], on: () => ({}), offref() {}, onLayoutReady: (cb) => cb() };
-	const app = { vault, workspace };
+	// App.loadLocalStorage / saveLocalStorage: the vault registration's storage (the install record).
+	const local = new Map();
+	const app = { vault, workspace, loadLocalStorage: (k) => local.get(k) ?? null, saveLocalStorage: (k, v) => void local.set(k, v) };
 	const g = globalThis;
 	const prev = { document: g.document, window: g.window, indexedDB: g.indexedDB, IDBKeyRange: g.IDBKeyRange, Worker: g.Worker };
 	// Obsidian always has IndexedDB; node does not (the engine's store is real IndexedDB code).
@@ -148,7 +151,7 @@ async function smokePlugin(mainJs, manifest, carrier) {
 		await plugin.unloaded;
 		for (const d of plugin.disposers.reverse()) d();
 		if (ctl.runState().phase !== "stopped") fail(`after unload: ${JSON.stringify(ctl.runState())}`);
-		if (logged.join("\n").includes(TOKEN) || saved.notices.join("\n").includes(TOKEN)) fail("device token leaked to logs/notices");
+		if (logged.join("\n").includes(TOKEN) || saved.notices.join("\n").includes(TOKEN)) fail("grant secret leaked to logs/notices");
 		if (vault.trashed.length !== 0 || vault.text("hello.md") !== "hello from the smoke vault") fail("smoke run modified the vault");
 		return { commands: plugin.commands.map((c) => c.name), scripts };
 	} finally {

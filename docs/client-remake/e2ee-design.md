@@ -281,7 +281,8 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
   the config dir.
 - **NEVER put keys or RK in** logs, `StatusSnapshot`, `DiagnosticsBundle`, `Error` messages, notices or the URL bar.
   Protocol fields that carry keys are marked SECRET, like `relay.credential` (`src/protocol/messages.ts:61-62`).
-- **The suite pin** (`e2ee: { suite: 0 | 1 }`, not secret) lives in `data.json` next to the device token.
+- **The suite pin** (`e2ee: { suite: 0 | 1 }`, not secret) lives in `data.json` next to the pairing grant (since
+  identity-per-store phase 2 the device token is per store, in IndexedDB `meta.identity`).
   - If the pin says 1 and the secret is missing, the device enters phase `key-missing`: re-key by QR or RK.
   - **No pin** (just enrolled by a key-less code, or `data.json` lost) means the device writes nothing until a pin
     arrives from an authenticated source (§12.4). Nothing the server says sets or lowers a pin.
@@ -303,9 +304,9 @@ I(purpose, e) = utf8("yaos/v1/" + purpose) ‖ 0x00 ‖ utf8(vaultId) ‖ 0x00 �
 
 | Loss | Keys | Effect |
 |---|---|---|
-| IndexedDB (cleared, evicted, corrupted) | Survive in SecretStorage | Normal re-bootstrap from the relay. frameNo restarts above the folded right edge and the wall clock (§8.2). The outbox mirror re-opens with the keys. |
+| IndexedDB (cleared, evicted, corrupted) | Survive in SecretStorage | Normal re-bootstrap from the relay as a new store with a new deviceId (identity-per-store phase 2), so its frameNos start a new replay window; the lost store's outbox mirror is not imported before phase 3. The keyring records copy in `meta.keyringRecords` goes with the store. |
 | SecretStorage (app reinstall, localStorage cleared) | Lost on this device | `key-missing`, read-only. Re-key by QR from another device or by RK. |
-| `data.json` | Survive, but are orphaned | The pin is lost too. Re-enroll (new device token and deviceId): a key-less join, so the device is blocked until a QR or the RK (or, for a suite-0 vault, a suite-0 pairing link) settles it (§12.4). |
+| `data.json` | Survive, but are orphaned | The pin and the pairing grant are lost too. Re-pair (a new grant; the store keeps its identity when the vault is the same): a key-less join, so the device is blocked until a QR or the RK (or, for a suite-0 vault, a suite-0 pairing link) settles it (§12.4). |
 | Every device | Gone | RK path (§13.3). Without the RK the data is unrecoverable, by design. |
 
 ### 6.3 Worker hand-off
@@ -459,36 +460,33 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
   - frameNo is a counter per (deviceId, stream), for `ns` and `cfg` only. It is strictly increasing across that
     device's frames on the stream, and gaps are allowed.
   - `next = 1 + max(own right edge R in the fold state, own frameNos above the fold (own tail rows and receipts
-    not yet folded), the outbox for the stream (poisoned included), the epoch-migration floor, earlier
-    allocations of this runtime)` (`FoldRuntime.allocFrameNo`, `src/engine/sync/foldRuntime.ts`). The receipt
-    writes the own tail row with its frameNo, so the max survives a restart before the row is folded.
-  - The **first allocation of every runtime** (engine start) skips: `max(known + NS_DEDUPE_RING (64), wall clock
-    in ms) + 1` (`FoldRuntime.skip`). A store that lost IndexedDB knows only its committed frames, the same edge the
-    runtime it replaced allocated from, and that runtime skipped too, so a skip from the edge alone repeats its numbers
-    for a frame it still had in flight: whichever of the two committed second was ignored as `replay-duplicate`, and a
-    create in it never folded (sim seed 222: the planner then took the synced doc for pruned and trashed the file; it no longer does, DESIGN §f.2).
-    The clock floor puts the new runtime above every number the lost one used, as long as that one allocated fewer
-    frames than ms passed between the two starts. A lost frame committing before the new ones then leaves them
-    accepted; one committing after them is stale (the boundary below). The clock is a floor only: a clock behind the
-    known edge leaves the 64 skip, as before. ns/cfg frameNos are thus about 2^41 (6 varuint bytes).
-  - Allocation and the outbox write share the engine's edit chain (`src/engine/runtime/logApi.ts`), so frameNo
-    order is outbox order.
-  - **A store that lost IndexedDB** knows its own committed frames only once it has read the stream, so a frame it
-    allocates before that (offline, or while the read is held for a key or failing) can take a number its earlier
-    frames already used; every reader would ignore it as a replay and its ops would be lost. So ns/cfg sends open
-    only once both streams are read in the session (a held or failed read keeps them closed, and the phase
-    catching-up, until a later read completes). First, when an own unsent frame sits at or below the committed edge
-    (fold R, own rows above the fold, the floor) and its clientFrameId is not in the fold's ring, every own frame of
-    the stream not in the ring is numbered again, in outbox order from the first allocation's skip above every own
-    number known, and sealed again under its own id (`FoldRuntime.renumberBlind`, `renumberBlindFrames`,
-    `SessionLoop.afterStartReads`). A frame allocated with the edge known is above it. A frame in the ring did
-    commit (one recovered from the outbox mirror whose row a checkpoint covers gets no late receipt): it keeps its
-    bytes and its resend is deduped. Later allocations skip NS_DEDUPE_RING again once the fold shows an own frame
-    above every allocation of the runtime.
+    not yet folded), the outbox for the stream (poisoned included), earlier allocations of this runtime)`
+    (`FoldRuntime.allocFrameNo`, `src/engine/sync/foldRuntime.ts`). No skip and no floor: a fresh store's first
+    frameNo is 1.
+  - **Why this is exact: one deviceId, one store.** A deviceId is used by exactly one store (one IndexedDB), ever
+    (identity-per-store §1.3): a new DB, for any reason (IndexedDB loss, a clone, a store reset, a vaultEpoch change),
+    gets a new deviceId. So every number a deviceId ever sent was allocated by this store, and the store still knows
+    it:
+    - allocation and the outbox write share the engine's edit chain (`src/engine/runtime/logApi.ts`): a number is
+      sent only from the outbox, and the outbox record is written in the same chain step that allocated it, so
+      frameNo order is outbox order and a number that never reached the outbox was never sent;
+    - an outbox record leaves the outbox only through its receipt, which writes the own tail row with its frameNo in
+      the same transaction; a row that a checkpoint later covers is under the fold's R;
+    - a re-read of an own row that does not open never replaces the stored row (`putTail`, `src/engine/store/repo.ts`),
+      so its frameNo stays known.
+    Hence `next` is above every number this deviceId used, across restarts and crashes. (Before identities per store,
+    a store that lost IndexedDB reused its deviceId and knew none of its predecessor's frames in flight: a skip of 64,
+    a wall-clock floor, renumbering of frames allocated before the start reads, and an epoch-migration floor papered
+    over it. All four are gone.)
+  - A predecessor's unsent frames are re-issued by its successor under the successor's own identity, with new
+    numbers from the successor's allocator (identity-per-store §5.2); a frame of the predecessor still in flight
+    commits under the predecessor's id and window.
+  - ns/cfg sends open only once both streams are read in the session (a held or failed read keeps them closed, and
+    the phase catching-up, until a later read completes): the late-receipt reads (DESIGN §d.7) settle a resend of a
+    frame that committed, stale-epoch frames are resealed first (§14.2 step 4), and inherited frames pass their
+    commit check (identity-per-store §5.2 step 3).
   - No new persistent counter: the fold state (in IDB and in checkpoints), own tail rows and the outbox already
     hold it.
-  - Epoch migration (DESIGN §c.12 step 3) carries the device's highest own frameNo per stream into the new DB as
-    meta `frameNoFloor` (max-merged, never lowered), so new frames never reuse numbers from the abandoned timeline.
 - **Send window, restated over frameNo** (DESIGN §c.3). Own frame `f` may be sent only when every own frame with
   frameNo ≤ `f − NS_SEND_WINDOW` (32) is receipted. Equivalently (`Sender.window`, `src/engine/body/sender.ts`):
   `f < u + NS_SEND_WINDOW`, where `u` is the lowest frameNo among the stream's unreceipted own frames. Poisoned
@@ -515,11 +513,9 @@ open:  strip trailing 0x00, then require one 0x80; anything else is bad-padding
   copies lingering on old sockets, and across restarts with IndexedDB intact. It is a property test
   (`src/core/ns/replayExactness.test.ts`, 150 seeds × 1500 steps), which also shows that without the send window
   some honest frame goes stale.
-- **Boundary (open).** If IndexedDB is lost while an old socket still holds frames that the relay commits *after*
-  the new runtime's first frames, those old frames land at or below `R − 64` and are rejected as stale. The
-  first allocation's clock floor prevents collisions (and keeps the new frames accepted when the old ones commit
-  first), not this. Their content came from a local state that no longer exists; disk stays
-  the truth (DESIGN §c.12).
+- **No boundary case.** A frame that a lost store had in flight commits under that store's deviceId and folds in that
+  device's own window: a real edit, never stale against the new store's numbers, because the two never share a window
+  (identity-per-store §5.1). The successor's fence (§5.2 step 1) drops it from the relay's buffer when it runs first.
 - The clientFrameId ring stays. frameNo covers replays older than the ring's 64 ids.
 - The `nsFoldV1` and `cfgFoldV1` checkpoint encodings gain `(deviceId → R, bitmap)` and become V2 (§18.2). Suite 0
   uses the same code: one path, so the sim covers it.
@@ -536,7 +532,8 @@ A restore or reset starts a fresh fold, so the reader state restarts too. A serv
 pre-restore frames from the abandoned timeline into the new epoch. This is accepted (§2.3), for three reasons:
 - the restore is visible to the user as an epoch migration;
 - disk is the truth (DESIGN §c.12);
-- the carried-over frameNo (§8.2) keeps new frames from colliding with spliced ones.
+- the new epoch's stores are new devices (identity-per-store §4, decision 2), so new frames sit in replay windows
+  of their own, which no spliced frame of the abandoned timeline shares.
 
 ## 9. What is sealed, and open failures
 
@@ -1622,7 +1619,6 @@ export interface KeyringCrypto {
 | `OutboxRecord` (:190) | + `frameNo: number \| null` (ns/cfg; WP-E2). + `keyEpoch: number` (the epoch inside `sealed`, for the revoke re-seal, §14.2 step 4; WP-E3). An empty `sealed` is an unsealed copy of an own stale commit, sealed before sending |
 | `TailRecord` | + `frameNo: number` (0 outside ns/cfg and for rows that failed the gate; WP-E2). Own rows carry the allocator's max across restarts (§8.2) |
 | `MetaRecord` | + `MetaKeyring {key: "keyring"; sealEpoch; epochs: {e, firstSeq, kind, verified}[]; revokeEpoch: number \| null; sRot: Seq \| null; ownSeals: number}`. **No key bytes** (§6.1) |
-| `MetaRecord` | + `MetaFrameNoFloor {key: "frameNoFloor"; ns: number; cfg: number}`, written by epoch migration (§8.2) |
 | `MetaRecord` | + `MetaKeyringRecords {key: "keyringRecords"; winners: Uint8Array[]; open: Uint8Array[]}`: the copy of the records (§6.1). Public bytes only |
 | ns and cfg fold state records | Carry `replay` (V2 encoding) |
 | `StreamRecord.cls` | Accepts `"keyring"` |

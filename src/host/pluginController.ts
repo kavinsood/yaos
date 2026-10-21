@@ -12,7 +12,7 @@
 
 import { isVaultId } from "../core/codec/ids";
 import { hexToBytes } from "../core/codec/lib0";
-import type { BrakeReport, DeviceId, VaultId } from "../core/types";
+import type { BrakeReport, VaultId } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { EngineResultValue, EngineSettings, UserCommand } from "../protocol/messages";
 import type { DeviceCheckMode, DeviceCheckReport, StatusSnapshot } from "../protocol/status";
@@ -27,20 +27,35 @@ import {
 import { plaintextNoticeOnce, type PlaintextNoticeEnv } from "./keys/plaintextNotice";
 import { VaultKeyStore, type EpochKey, type SecretStorageLike } from "./keys/secretStore";
 import type { HostIdentity } from "./runtimeSupport";
-import { sameEngineSettings, sameIdentity, type EngineRunState, type PairedIdentity, type YaosPluginData } from "./ui/api";
+import { sameEngineSettings, sameIdentity, storedPart, type EngineRunState, type PairedIdentity, type StoredPluginData, type YaosPluginData } from "./ui/api";
 import { deviceCheckDeadlineMs } from "./ui/deviceCheck";
+import { installRecordKey, lineageOf, loadInstallRecord, sanitizeInstallRecord, saveStoreIdentity, type InstallStorage } from "./installRecord";
+import { cloneNoticeDue, cloneNoticeText, type StoreDirActivity } from "./cloneNotice";
+import { LOCAL_SETTINGS_KEY, localPart, markCloneNoticeShown, sameLocalFields, sanitizeLocalSettings, saveLocalFields } from "./localSettings";
 
 export interface ControllerEnv {
 	makeRuntime(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink, keys: HostKeys): HostRuntime;
-	saveData(data: YaosPluginData): Promise<void>;
+	/** data.json: only the fields a twin may share (identity-per-store §8); the rest go to the local settings record. */
+	saveData(data: StoredPluginData): Promise<void>;
 	notice(level: "info" | "warn" | "error", message: string, timeoutMs?: number): void;
 	log?(line: string): void;
 	/** Main-thread clock: the SecretStorage startup wait and the deferred restart after a pin change. */
 	readonly clock: ClockPort;
 	/** Obsidian's SecretStorage (App.secretStorage, obsidian.d.ts :458). Absent: this device can hold no key. */
 	readonly secrets?: SecretStorageLike | null;
-	/** Vault-local storage (App.loadLocalStorage / saveLocalStorage, d.ts :472 / :480) for the one-time notice flag. */
-	readonly localStorage?: Pick<PlaintextNoticeEnv, "load" | "save">;
+	/**
+	 * Vault-local storage (App.loadLocalStorage / saveLocalStorage, d.ts :472 / :480): the one-time notice flag, the
+	 * install record (installRecord.ts, identity-per-store §2.4) and the local settings record (localSettings.ts, §8).
+	 * Absent (tests): an in-memory one.
+	 */
+	readonly localStorage?: { load(key: string): unknown; save(key: string, value: unknown): void };
+	/** Randomness for a new install key; default crypto.getRandomValues. */
+	readonly randomBytes?: (n: number) => Uint8Array;
+	/**
+	 * The store dirs under `<pluginDir>/state/` (sideFiles.ts storeDirs), for the clone notice (identity-per-store §8,
+	 * cloneNotice.ts). Absent: no notice.
+	 */
+	readonly stateDirs?: { readonly pluginDir: string; storeDirs(): Promise<readonly StoreDirActivity[]> };
 }
 
 export interface HostNotice {
@@ -60,13 +75,27 @@ export function hostNotice(level: "info" | "warn" | "error", code: string, messa
 	return { text: message };
 }
 
-export function hostIdentityOf(id: PairedIdentity, deviceLabel: string): HostIdentity {
-	// SECRET: relay.credential is the device token. Never log the result.
-	return { vaultId: id.vaultId as VaultId, deviceId: id.deviceId as DeviceId, deviceLabel, relay: { url: id.host, credential: id.deviceToken } };
+export function hostIdentityOf(
+	id: PairedIdentity, deviceLabel: string, installKey: string, lineage: readonly string[] = [],
+	predecessor: { readonly deviceId: string; readonly retireKey: string } | null = null,
+): HostIdentity {
+	// SECRET: relay.grantSecret is the pairing grant, predecessor.retireKey a retire key. Never log the result.
+	return { vaultId: id.vaultId as VaultId, deviceLabel, relay: { url: id.host, grantSecret: id.grantSecret }, installKey, lineage, predecessor };
+}
+
+function defaultRandomBytes(n: number): Uint8Array {
+	const b = new Uint8Array(n);
+	crypto.getRandomValues(b);
+	return b;
 }
 
 function safeMessage(e: unknown): string {
 	return e instanceof Error ? e.message : typeof e === "string" ? e : "unknown error";
+}
+
+/** The same pairing grant of the same vault and relay, whatever its secret (identity-per-store §3.4 rotation). */
+function sameGrant(a: PairedIdentity, b: PairedIdentity): boolean {
+	return a.host === b.host && a.vaultId === b.vaultId && a.grantId === b.grantId;
 }
 
 /** Same vault on the same relay: the pin and the stored keys still apply. */
@@ -95,12 +124,18 @@ export class YaosController {
 	private inflight = 0;
 	private restartWanted = false;
 	private restartTimer: TimerHandle | null = null;
+	/** Install records (identity-per-store §2.4) and the local settings record (§8) in vault-local storage. */
+	private readonly installStorage: InstallStorage;
 
 	constructor(
 		private current: YaosPluginData,
 		private readonly env: ControllerEnv,
 	) {
 		this.run = { phase: current.identity ? "stopped" : "unpaired", lastError: null };
+		const memory = new Map<string, unknown>();
+		this.installStorage = env.localStorage
+			? { load: (k) => env.localStorage?.load(k) ?? null, save: (k, v) => env.localStorage?.save(k, v) }
+			: { load: (k) => memory.get(k) ?? null, save: (k, v) => void memory.set(k, v) };
 		this.plaintextNotice = plaintextNoticeOnce({
 			load: (k) => env.localStorage?.load(k) ?? null,
 			save: (k, v) => env.localStorage?.save(k, v),
@@ -118,6 +153,13 @@ export class YaosController {
 
 	data(): YaosPluginData {
 		return this.current;
+	}
+
+	/** This install's current store (the install record's lineage `current`), or null before one started. */
+	deviceId(): string | null {
+		const id = this.current.identity;
+		if (!id) return null;
+		return sanitizeInstallRecord(this.installStorage.load(installRecordKey(id.vaultId)))?.current?.deviceId ?? null;
 	}
 	status(): StatusSnapshot | null {
 		return this.snapshot;
@@ -211,7 +253,24 @@ export class YaosController {
 				this.setRun({ phase: "failed", lastError: `${e.code}: ${e.message}` });
 				this.env.notice("error", `YAOS stopped: ${e.message}`);
 			},
+			// §2.4 point 4: the lineage follows the store each runtime started on (the install key it was told).
+			onStoreIdentity: (deviceId, retireKey) => {
+				saveStoreIdentity(this.installStorage, identity.vaultId, install.installKey, deviceId, retireKey);
+				if (fresh) void this.cloneNotice(deviceId);
+				fresh = false;
+				this.changed();
+			},
+			// §3.4: the grant was rotated and the engine holds the new secret; data.json follows, without a restart.
+			onGrantSecret: (grantSecret) => {
+				const cur = this.current.identity;
+				if (this.runtime !== rt || !cur || !sameGrant(cur, identity) || cur.grantSecret === grantSecret) return;
+				void this.persist({ ...this.current, identity: { ...cur, grantSecret } })
+					.then(() => this.changed(), (e: unknown) => this.env.log?.(`saving the rotated pairing secret failed: ${safeMessage(e)}`));
+			},
 		};
+		const install = loadInstallRecord(this.installStorage, identity.vaultId, this.env.randomBytes ?? defaultRandomBytes);
+		// §8: this registration never had a store for the vault (no lineage): its first store may look for a twin's.
+		let fresh = install.current === null && install.predecessors.length === 0;
 		const keys = createHostKeys({
 			store: this.keyStoreFor(identity.vaultId),
 			// The pin of this runtime's vault only: after the user left it, nothing applies (the restart follows).
@@ -220,7 +279,7 @@ export class YaosController {
 			stored: (info) => this.keyringStored(rt, identity, info),
 			plaintext: this.plaintextNotice,
 		});
-		const rt = this.env.makeRuntime(hostIdentityOf(identity, this.current.deviceLabel), () => this.current.engine, ui, keys);
+		const rt = this.env.makeRuntime(hostIdentityOf(identity, this.current.deviceLabel, install.installKey, lineageOf(install), install.current), () => this.current.engine, ui, keys);
 		this.runtime = rt;
 		this.pendingBrake = null;
 		this.setRun({ phase: "starting", lastError: null });
@@ -314,9 +373,46 @@ export class YaosController {
 
 	private async savePin(next: YaosPluginData): Promise<void> {
 		if (next === this.current) return;
-		this.current = next;
-		await this.env.saveData(next);
+		await this.persist(next);
 		this.changed();
+	}
+
+	/**
+	 * Adopt `next` and save what changed (identity-per-store §8): the per-install fields to the local settings record,
+	 * the shared ones to data.json. A label, a status bar toggle, a pending enrollment or a creation marker never
+	 * writes data.json.
+	 */
+	private async persist(next: YaosPluginData): Promise<void> {
+		const prev = this.current;
+		this.current = next;
+		if (!sameLocalFields(prev, next)) saveLocalFields(this.installStorage, localPart(next));
+		const stored = storedPart(next);
+		if (JSON.stringify(stored) !== JSON.stringify(storedPart(prev))) await this.env.saveData(stored);
+	}
+
+	/** §8: rewrite data.json without the per-install fields an older one carried (once, at load; plugin.ts). */
+	async rewriteStoredData(): Promise<void> {
+		try {
+			await this.env.saveData(storedPart(this.current));
+		} catch (e) {
+			this.env.log?.(`rewriting data.json failed: ${safeMessage(e)}`);
+		}
+	}
+
+	/**
+	 * §8 clone notice: the first store of a fresh install found another store's mirrors written in the last day. Once
+	 * per install (the local settings record keeps the flag). Best effort: a scan failure shows nothing.
+	 */
+	private async cloneNotice(ownDeviceId: string): Promise<void> {
+		const scan = this.env.stateDirs;
+		if (!scan) return;
+		try {
+			if (sanitizeLocalSettings(this.installStorage.load(LOCAL_SETTINGS_KEY), this.current.deviceLabel).cloneNoticeShown) return;
+			if (!cloneNoticeDue(ownDeviceId, await scan.storeDirs(), this.env.clock.now())) return;
+			if (markCloneNoticeShown(this.installStorage, this.current.deviceLabel)) this.env.notice("warn", cloneNoticeText(scan.pluginDir), 20_000);
+		} catch (e) {
+			this.env.log?.(`clone check failed: ${safeMessage(e)}`);
+		}
 	}
 
 	/** Restart with the pinned config once no user command is in flight, a macrotask after the pinning answer. */
@@ -426,8 +522,7 @@ export class YaosController {
 		// The pin fields are the controller's: kept in the same vault, dropped on another one (never set here).
 		const same = sameVault(prev.identity, raw.identity);
 		const next = pinAcross(prev, raw, same, raw.identity?.vaultId ?? null);
-		this.current = next;
-		await this.env.saveData(next);
+		await this.persist(next);
 		if (!sameIdentity(prev.identity, next.identity) || prev.deviceLabel !== next.deviceLabel) {
 			await this.restartEngine();
 			// §6.1 Forget keys: leaving a vault (unpair, another vault or relay) blanks its secret, once the old

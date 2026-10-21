@@ -5,7 +5,8 @@ import {
 	refuseKeyCommand, refusePinSuite0, sanitizeCreating, sanitizePin, sawKeyring, withoutCreating, PIN_REFUSAL_TEXT,
 	type PinFields,
 } from "./pin";
-import { sanitizePluginData } from "../ui/api";
+import { sanitizeStoredData } from "../ui/api";
+import { sanitizeLocalSettings } from "../localSettings";
 import { BAD_VAULT_IDS, testVaultId } from "./testkit/vaultIds";
 
 const V = testVaultId("v"), W = testVaultId("w"), NEW = testVaultId("new"), OLD = testVaultId("old"), X = testVaultId("x"), OTHER = testVaultId("other");
@@ -30,7 +31,7 @@ test("sanitizePin: exactly four states; anything else is absent (unpinned), neve
 test("sanitizeCreating: the marker names exactly a vaultId (22-char canonical base64url), nothing else", () => {
 	for (const bad of BAD_VAULT_IDS) assert.equal(sanitizeCreating({ vaultId: bad }), undefined, JSON.stringify(bad));
 	assert.equal(sanitizeCreating({ vaultId: 1 }), undefined);
-	assert.equal(sanitizePluginData({ creating: { vaultId: "AAECAwQFBgcICQoLDA0ODwA" } }, "Mac").creating, undefined);
+	assert.equal(sanitizeLocalSettings({ creating: { vaultId: "AAECAwQFBgcICQoLDA0ODwA" } }, "Mac").creating, undefined);
 });
 
 test("no implicit migration: a stored pairing without e2ee is unpinned", () => {
@@ -43,15 +44,21 @@ test("no implicit migration: a stored pairing without e2ee is unpinned", () => {
 });
 
 test("data.json load: a pre-E2EE pairing loads unpinned; a pin needs the identity it belongs to", () => {
-	const identity = { host: "https://sync.example.com", vaultId: V, deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", deviceName: "Mac", vaultGeneration: null };
-	const legacy = sanitizePluginData({ version: 1, identity, deviceLabel: "Mac" }, "Mac");
+	const identity = { host: "https://sync.example.com", vaultId: V, grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: "gs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", grantName: "Mac", vaultGeneration: null };
+	const legacy = sanitizeStoredData({ version: 1, identity, deviceLabel: "Mac" });
 	assert.ok(legacy.identity);
 	assert.equal(legacy.e2ee, undefined, "no e2ee field: unpinned, nothing inferred from the pairing");
-	assert.deepEqual(sanitizePluginData({ identity, e2ee: { suite: 0 } }, "Mac").e2ee, { suite: 0 });
-	assert.deepEqual(sanitizePluginData({ identity, e2ee: { suite: null, keyringSeen: true } }, "Mac").e2ee, { suite: null, keyringSeen: true });
-	assert.equal(sanitizePluginData({ identity, e2ee: { suite: "0" } }, "Mac").e2ee, undefined, "garbage is unpinned");
-	assert.equal(sanitizePluginData({ e2ee: { suite: 1 } }, "Mac").e2ee, undefined, "no identity, no pin");
-	assert.deepEqual(sanitizePluginData({ creating: { vaultId: NEW } }, "Mac").creating, { vaultId: NEW }, "the marker precedes the enroll");
+	// The device-enrollment identity before identity-per-store (deviceId + token, no grant) loads unpaired (§13): its pin goes with it.
+	const deviceEnrolled = { host: identity.host, vaultId: V, deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", deviceName: "Mac", vaultGeneration: null };
+	const old = sanitizeStoredData({ identity: deviceEnrolled, e2ee: { suite: 0 } });
+	assert.equal(old.identity, null);
+	assert.equal(old.e2ee, undefined);
+	assert.deepEqual(sanitizeStoredData({ identity, e2ee: { suite: 0 } }).e2ee, { suite: 0 });
+	assert.deepEqual(sanitizeStoredData({ identity, e2ee: { suite: null, keyringSeen: true } }).e2ee, { suite: null, keyringSeen: true });
+	assert.equal(sanitizeStoredData({ identity, e2ee: { suite: "0" } }).e2ee, undefined, "garbage is unpinned");
+	assert.equal(sanitizeStoredData({ e2ee: { suite: 1 } }).e2ee, undefined, "no identity, no pin");
+	assert.deepEqual(sanitizeLocalSettings({ creating: { vaultId: NEW } }, "Mac").creating, { vaultId: NEW }, "the marker precedes the enroll (local record)");
+	assert.equal("creating" in sanitizeStoredData({ creating: { vaultId: NEW } }), false, "never read from data.json (identity-per-store §8)");
 });
 
 test("pinSuite0 link: allowed only unpinned and before a k genesis was seen", () => {

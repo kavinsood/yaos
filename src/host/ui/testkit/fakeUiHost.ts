@@ -7,7 +7,14 @@
 import type { UserCommand, EngineResultValue } from "../../../protocol/messages";
 import type { DeviceCheckMode, DeviceCheckReport, E2eeStatus, EnginePhase, StatusSnapshot } from "../../../protocol/status";
 import { markedCreating, pinAcross, withoutCreating } from "../../keys/pin";
-import { defaultPluginData, type EngineRunState, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "../api";
+import { localPart, sanitizeLocalSettings, withLocal } from "../../localSettings";
+import { defaultPluginData, sanitizeStoredData, storedPart, type EngineRunState, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "../api";
+
+/** `d` after a save and a load: data.json's part and the local settings record's (identity-per-store §8), as JSON. */
+export function roundTripPluginData(d: YaosPluginData, fallbackLabel = "Mac"): YaosPluginData {
+	const json = (v: unknown): unknown => JSON.parse(JSON.stringify(v));
+	return withLocal(sanitizeStoredData(json(storedPart(d))), sanitizeLocalSettings(json(localPart(d)), fallbackLabel));
+}
 
 export const RUNNING: EngineRunState = { phase: "running", lastError: null };
 
@@ -36,8 +43,11 @@ export function snapshot(phase: EnginePhase, e2ee: Partial<E2eeStatus> = {}, ove
 	};
 }
 
+/** SECRET-shaped: the pairing grant secret of identityFor (tests check it never reaches a report). */
+export const GRANT_SECRET_FOR_TEST = "gs_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefgh";
+
 export function identityFor(vaultId: string, host = "https://sync.example.com"): PairedIdentity {
-	return { host, vaultId, deviceId: "dev_ABCDEFGHIJKLMNOP", deviceToken: "tok_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", deviceName: "Mac", vaultGeneration: null };
+	return { host, vaultId, grantId: "grant_ABCDEFGHIJKLM", grantSecret: GRANT_SECRET_FOR_TEST, grantName: "Mac", vaultGeneration: null };
 }
 
 export type CommandHandler = (command: UserCommand, host: FakeUiHost) => Promise<EngineResultValue> | EngineResultValue;
@@ -74,6 +84,10 @@ export class FakeUiHost implements YaosUiHost {
 		this.current = pinAcross(prev, raw, same, raw.identity?.vaultId ?? null);
 		this.emit();
 	}
+
+	/** The store's device identity as main knows it (the install record's lineage); a test sets it. */
+	storeDeviceId: string | null = null;
+	deviceId(): string | null { return this.storeDeviceId; }
 
 	status(): StatusSnapshot | null { return this.snap; }
 	runState(): EngineRunState { return this.run; }

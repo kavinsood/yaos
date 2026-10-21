@@ -42,7 +42,7 @@ import type { Report } from "./engineKit";
 import { bytesOf, converge, enc, randomBytes, sameBytes, waitFor } from "./fullCheck";
 import { FullClient } from "./fullKit";
 import { installPlugin } from "./fullScenarios2";
-import { onboardVault, type OnboardDevice, type OnboardedVault } from "./onboard";
+import { onboardVault, pairedIdentityOf, type OnboardDevice, type OnboardedVault } from "./onboard";
 import { recordSample, WireTap } from "./wireTap";
 
 /** Slack on top of quietMs: the relay saw its last commit before any client did, so this only adds idle time. */
@@ -101,7 +101,7 @@ async function e2eeTrio(o: LoneOptions): Promise<Trio> {
 	const device = (name: string, od: OnboardDevice, creating: boolean) => {
 		const client = new FullClient({ name, host: o.host, vaultId: vault.vaultId, device: od, watcherDelayMs: o.watcherMs, tap });
 		installPlugin(client);
-		const identity = { host: o.host, vaultId: vault.vaultId, deviceId: od.deviceId, deviceToken: od.deviceToken, deviceName: name, vaultGeneration: vault.vaultGeneration };
+		const identity = pairedIdentityOf(o.host, vault, od, name);
 		const data: YaosPluginData = { ...defaultPluginData(name), identity, engine: { ...DEFAULT_ENGINE_SETTINGS, syncSettings: true },
 			...(creating ? { creating: { vaultId: vault.vaultId } } : {}) };
 		const ctl = new YaosController(data, {

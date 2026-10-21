@@ -3,15 +3,16 @@
  * the same input (idempotent on the server), single-flight submits, and applying the result to
  * plugin data. No obsidian runtime import.
  *
- * SECRETS: the attempt holds the pairing code and the new device token. clear() drops the
- * in-memory copy; deps.persist stores it in plugin data while /enroll is unanswered (so a later
- * load can retry it once) and removes it on a definitive refusal. Nothing here logs it.
+ * SECRETS: the attempt holds the pairing code and the new grant secret. clear() drops the
+ * in-memory copy; deps.persist stores it while /enroll is unanswered (so a later load can retry
+ * it once; in the local settings record, never data.json: identity-per-store §8) and removes it
+ * on a definitive refusal. Nothing here logs it.
  */
 
 import { sameIdentity, sanitizeDeviceLabel, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "./api";
 import {
-	attemptMatches, pairDevice, prepareEnrollment, PairingError, runEnrollment,
-	type EnrollInput, type EnrollmentAttempt, type PairingDeps,
+	attemptMatches, pairDevice, prepareEnrollment, PairingError, requestPairingCode, runEnrollment,
+	type EnrollInput, type EnrollmentAttempt, type PairingCodeGrant, type PairingDeps,
 } from "./pairing";
 
 export interface PairingSessionDeps extends PairingDeps {
@@ -88,10 +89,10 @@ export function withoutPendingEnrollment(data: YaosPluginData, requestId?: strin
 	return rest;
 }
 
-/** Stores a fresh identity, adopts its device name as the local label and drops its pending attempt. */
+/** Stores a fresh grant, adopts its name as the local label and drops its pending attempt. */
 export function applyPairedIdentity(data: YaosPluginData, identity: PairedIdentity): YaosPluginData {
-	const rest = data.pendingEnrollment?.deviceId === identity.deviceId ? withoutPendingEnrollment(data) : data;
-	return { ...rest, identity, deviceLabel: sanitizeDeviceLabel(identity.deviceName, data.deviceLabel) };
+	const rest = data.pendingEnrollment?.grantSecret === identity.grantSecret ? withoutPendingEnrollment(data) : data;
+	return { ...rest, identity, deviceLabel: sanitizeDeviceLabel(identity.grantName, data.deviceLabel) };
 }
 
 /** Removes the identity (unpair) and any pending enrollment. Engine settings and the label are kept. */
@@ -109,7 +110,7 @@ export type ResumedEnrollment =
  * On load: one more try of the enrollment a previous session sent without seeing the answer.
  * Success stores the identity; a definitive refusal drops the attempt; anything else keeps it for
  * the next load. Returns null when nothing was pending. The caller revokes `replaced` on its server
- * (retireDeviceEnrollment), as PairModal does when a pairing replaces another.
+ * (leaveGrant), as PairModal does when a pairing replaces another.
  */
 export async function resumePendingEnrollment(host: Pick<YaosUiHost, "data" | "updateData">, deps: PairingDeps): Promise<ResumedEnrollment | null> {
 	const { pendingEnrollment: pending, identity: previous } = host.data();
@@ -131,4 +132,26 @@ export function formatCountdown(remainingMs: number): string {
 	const minutes = Math.floor(total / 60);
 	const seconds = total % 60;
 	return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+/**
+ * "Pair another device" with the install's grant (owner decision 3). A plain `401 unauthorized` may mean the pairing
+ * secret was rotated on the server (identity-per-store §3.4): the engine fetches the new one with its store's token
+ * (`refreshGrant`, which rewrites data.json first), and the request is tried once more with it. A revoked pairing,
+ * or no new secret, keeps the first error.
+ */
+export async function requestPairingCodeRotating(
+	host: Pick<YaosUiHost, "data" | "command">, deps: PairingDeps & { readonly nowMs?: () => number },
+): Promise<PairingCodeGrant> {
+	const identity = host.data().identity;
+	if (!identity) throw new PairingError("Pair this device first.", "unpaired");
+	try {
+		return await requestPairingCode(identity, deps);
+	} catch (err) {
+		if (!(err instanceof PairingError) || err.status !== 401 || err.code !== "unauthorized") throw err;
+		await host.command({ t: "refreshGrant" }).catch(() => undefined);
+		const fresh = host.data().identity;
+		if (!fresh || fresh.grantSecret === identity.grantSecret || fresh.grantId !== identity.grantId) throw err;
+		return await requestPairingCode(fresh, deps);
+	}
 }

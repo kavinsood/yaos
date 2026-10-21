@@ -4,16 +4,17 @@ import {
 	applyControl, ATTACHMENT_SIZE_DESC, attachmentLimitMb, attachmentSizeDesc, CONTROL_KEYS, connectionRows, enableSettingsSync, engineAcceptsCommands,
 	engineRows, isControlKey, isPaused, parseExcludePatterns, phaseLabel, readControl, runStateLabel, serverConsoleUrl, TRASH_MODE_OPTIONS, validateControl,
 } from "./settingsModel";
-import { defaultPluginData, MAX_ATTACHMENT_BYTES_LIMIT, MIB, sanitizePluginData, TRASH_MODES, type PairedIdentity } from "./api";
+import { defaultPluginData, MAX_ATTACHMENT_BYTES_LIMIT, MIB, sanitizeStoredData, TRASH_MODES, type PairedIdentity } from "./api";
+import { roundTripPluginData } from "./testkit/fakeUiHost";
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
 import { testVaultId } from "../keys/testkit/vaultIds";
 
-const TOKEN = "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const TOKEN = "gs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const IDENTITY: PairedIdentity = {
-	host: "https://sync.example.com", vaultId: testVaultId("vaultOne"), deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: TOKEN, deviceName: "Mac", vaultGeneration: null,
+	host: "https://sync.example.com", vaultId: testVaultId("vaultOne"), grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: TOKEN, grantName: "Mac", vaultGeneration: null,
 };
 
-test("every control key reads back what it writes, through the sanitizer", () => {
+test("every control key reads back what it writes, through the sanitizers (data.json and the local record)", () => {
 	const base = defaultPluginData("Mac");
 	const values: Record<(typeof CONTROL_KEYS)[number], unknown> = {
 		deviceLabel: "Work laptop",
@@ -30,7 +31,7 @@ test("every control key reads back what it writes, through the sanitizer", () =>
 	};
 	let data = base;
 	for (const key of CONTROL_KEYS) data = applyControl(data, key, values[key]);
-	const round = sanitizePluginData(JSON.parse(JSON.stringify(data)), "Mac");
+	const round = roundTripPluginData(data);
 	assert.deepEqual(round, data);
 	assert.equal(readControl(round, "excludePatterns"), "private/**\n*.tmp");
 	assert.equal(round.engine.maxAttachmentBytes, 200 * MIB);
@@ -95,7 +96,7 @@ test("trashMode: follow-obsidian is the default and listed first; every mode val
 		assert.equal(validateControl("trashMode", mode), null, mode);
 		const d = applyControl(defaultPluginData("Mac"), "trashMode", mode);
 		assert.equal(readControl(d, "trashMode"), mode);
-		assert.equal(sanitizePluginData(JSON.parse(JSON.stringify(d)), "Mac").engine.trashMode, mode);
+		assert.equal(roundTripPluginData(d).engine.trashMode, mode);
 	}
 });
 
@@ -106,10 +107,10 @@ test("enableSettingsSync turns settings sync on with the seed answer, which surv
 		const on = enableSettingsSync(base, seed);
 		assert.equal(on.engine.syncSettings, true);
 		assert.equal(on.engine.syncSettingsSeed, seed);
-		assert.deepEqual(sanitizePluginData(JSON.parse(JSON.stringify(on)), "Mac"), on);
+		assert.deepEqual(roundTripPluginData(on), on);
 		assert.equal(applyControl(on, "syncSettings", false).engine.syncSettings, false);
 	}
-	const junk = sanitizePluginData({ ...base, engine: { ...base.engine, syncSettingsSeed: "mine" } }, "Mac");
+	const junk = sanitizeStoredData({ ...base, engine: { ...base.engine, syncSettingsSeed: "mine" } });
 	assert.equal(junk.engine.syncSettingsSeed, undefined);
 	assert.deepEqual(base, defaultPluginData("Mac"));
 });
@@ -120,13 +121,15 @@ test("isControlKey and parseExcludePatterns", () => {
 	assert.deepEqual(parseExcludePatterns("a\r\nb\n a \n\n"), ["a", "b"]);
 });
 
-test("connectionRows mask the device token and never show it", () => {
-	const rows = connectionRows(IDENTITY);
+test("connectionRows mask the pairing secret, never show it, and name the store's device id", () => {
+	const rows = connectionRows(IDENTITY, "dev-store-AAAAAAAAAAAA");
 	const text = JSON.stringify(rows);
 	assert.ok(!text.includes(TOKEN));
 	assert.ok(!text.includes(TOKEN.slice(-4)));
-	assert.deepEqual(rows.map((r) => r.name), ["Server", "Vault ID", "Device name", "Device token"]);
-	assert.equal(rows[3]?.value, "••••••••••••");
+	assert.deepEqual(rows.map((r) => r.name), ["Server", "Vault ID", "Device name", "Device ID", "Pairing secret"]);
+	assert.equal(rows[3]?.value, "dev-store-AAAAAAAAAAAA");
+	assert.equal(rows[4]?.value, "••••••••••••");
+	assert.equal(connectionRows(IDENTITY)[3]?.value, "(registered at the next sync start)");
 	assert.equal(connectionRows(null).length, 1);
 });
 

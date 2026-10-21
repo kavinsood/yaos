@@ -39,5 +39,6 @@ test("IndexedDB lost with an unsaved editor buffer: own edits the relay has reac
 	void a.restartApp();
 	await clock.advance(20_000);
 	for (const d of [a, b]) assert.equal(d.vault.textOf("x.md"), "one typed\n", d.name);
+	// The successor store imports the lost store's synced mirror (identity-per-store §5.2 step 5): no conflict copy.
 	assert.deepEqual([...a.vault.snapshot().keys()], ["x.md"]);
 });

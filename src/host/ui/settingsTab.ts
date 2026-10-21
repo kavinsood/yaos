@@ -115,8 +115,8 @@ export class YaosSettingTab extends PluginSettingTab {
 
 		const connectionItems: SettingGroupItem[] = [
 			this.liveRow("Status", () => connectionRows(null)[0]?.value ?? "", { visible: () => !paired() }),
-			...(["Server", "Vault ID", "Device name", "Device token"] as const).map((name) =>
-				this.liveRow(name, () => connectionRows(this.host.data().identity).find((r) => r.name === name)?.value ?? "", { visible: paired }),
+			...(["Server", "Vault ID", "Device name", "Device ID", "Pairing secret"] as const).map((name) =>
+				this.liveRow(name, () => connectionRows(this.host.data().identity, this.host.deviceId()).find((r) => r.name === name)?.value ?? "", { visible: paired }),
 			),
 			{
 				name: "Pair this device",
@@ -474,7 +474,7 @@ export class YaosSettingTab extends PluginSettingTab {
 		if (!identity) return;
 		const ok = await confirmAction(this.app, {
 			title: "Unpair this device?",
-			message: `This device stops syncing with ${identity.host} and forgets its credentials. Notes on disk stay where they are.\n\nThe server still lists this device; remove it in your server console if you will not use it again. To sync again you need a new pairing code.`,
+			message: `This device stops syncing with ${identity.host} and forgets its credentials. Notes on disk stay where they are.\n\nThe server still lists this device's pairing; revoke it in your server console if you will not use it again. To sync again you need a new pairing code.`,
 			confirmText: "Unpair",
 		});
 		if (!ok) return;

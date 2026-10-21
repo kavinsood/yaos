@@ -1,7 +1,7 @@
 # One device identity per store (design)
 
-Status: approved 2026-10-21 (owner decisions in §12.1). Phase 1 (server) is built on `identity/phase1-server`
-(DECISIONS §10); phases 2–5 are not. Written on branch `design/identity-per-store` off `sim-port` (eaf05881).
+Status: approved 2026-10-21 (owner decisions in §12.1). Phases 1–5 are built (§12.2 "Landed" notes; phase 5 on
+`identity/phase5-hygiene`, without ring compaction, decision 6). Written on branch `design/identity-per-store` off `sim-port` (eaf05881).
 Fixes BACKLOG [CLONED-ID](../BACKLOG.md) and [FRAMENO-IDB](../BACKLOG.md). Section letters (§x.y) are
 [DESIGN](DESIGN.md); "e2ee §n" is [e2ee-design](e2ee-design.md). **[U]** = not verified; **[inferred]** = follows
 from verified facts but was not tested directly.
@@ -235,7 +235,7 @@ its token.
 - **Existing devices on revoke (as built):** revoking a pairing retires every live device of it in the same turn
   (D7 per device: buffered frames dropped, sockets 4403, bearer 401) and tombstones them. Removing one device
   leaves the grant and its other devices alone.
-- **Rotate the grant secret** (optional, phase 5; not in phase 1):
+- **Rotate the grant secret** (phase 5; §12.2 has the as-built details):
   - `POST …/grants/:id/rotate` (operator) issues a new secret.
   - Live stores fetch it with their device token (`GET /vault/:id/auth/grant`) and rewrite data.json.
   - A thief holding only an old data.json is cut off. Legitimate installs do not re-pair.
@@ -377,7 +377,8 @@ Retired rows are deleted and tombstoned. A tombstone is one indexed read at regi
 `DeviceMap`. Four ways a device is retired:
 - **Self:** the epoch migration's old id (§4), and an orderly replacement's old id.
 - **Successor:** the predecessor fence (§5.2).
-- **Inactivity:** a device not seen for 90 days (decision 4; phase 5) is retired lazily, at the next registration or list.
+- **Inactivity:** a device not seen for 90 days (decision 4; phase 5) is retired lazily, at the next registration, device
+  status query or listing (built in phase 5, §12.2).
   - "Seen" is `device.last_seen_day`, written at ticket issue at most once per UTC day: ≤ 1 row per device per day.
   - This deviates from §6.1's "0 rows per bearer auth". The owner accepted it (decision 4); DECISIONS §6.1, §6.2 and
     D4 state it. Phase 1 records `last_seen_day`; the 90-day retirement itself is phase 5.
@@ -409,8 +410,9 @@ Retired rows are deleted and tombstoned. A tombstone is one indexed read at regi
 - Snapshot floors (`snapFoldV1`, one entry per author): small. Dead devices' uploads are pruned by their lineage
   successor (§5.2), else they stay until a user deletes them. Today's dead devices behave the same.
 - **Orphan DBs** (localStorage lost, IDB kept): enumerate `yaos3:<vaultId>:*`. Delete those whose `meta.identity`
-  deviceId the server reports retired or unknown (one call per orphan: `GET /auth/device/:id` with the grant).
-  Never delete on age alone: on a shared desktop origin, another registration of the same vault owns DBs too.
+  deviceId the server reports retired (as built in phase 5: one `POST /auth/device/status` for all of them; "unknown"
+  is kept, §12.2). Never delete on age alone: on a shared desktop origin, another registration of the same vault owns
+  DBs too.
 
 ---
 
@@ -587,13 +589,158 @@ the same exposure. The relay cannot tell that from a reconnect overlap. This is 
    - IDB loss falls back to "without mirrors" onboarding.
    - Lands with the clone engine tests and the sim `clone` fault green. The floor and `renumberBlind` are still present
      but inert.
+   - **Landed** on `identity/phase2-client`. Deviations:
+     - The minted identity waits in a pending DB `yaos3-pending:<vaultId>:<installKey>` until its store is created
+       (the store's name needs the epoch, which only a connect as that identity learns); LogEngine drops it right
+       before creating the store, so it serves at most one store. A restart before then reuses it.
+     - Lineage-aware `lostCreateBody` (a phase-3 item) landed here: without it a doc created by an earlier store of the
+       install, whose body was lost with that store, stayed stuck (fault-heavy sim seed 17, `idbWipe` without mirrors).
+     - The other phase-3 recovery (fence, mirror import) is not built: every IDB loss is "without mirrors". The sim
+       oracle counts every `idbWipe` / `idbLost` as one (the composed mirror-recovery tests are `todo` with phase-2
+       variants asserting the conflict copy).
+     - Not built: epoch-change minting (phase 4: an epoch migration keeps the store identity), the revoked store's
+       successor (built in phase 3), the §8 per-install data.json split (phase 4). A re-pair to the same vault keeps the store.
+     - Found: the "abandoned creator" gap (BACKLOG CLONED-ID).
 3. **Predecessor recovery.** Fence, inherited records, commit check, re-issue, synced mirror import, snapshot move,
    lineage-aware `lostCreateBody`. Seed 222's plan and the `idbWipe` sim with mirrors green.
+   - **Landed** on `identity/phase3-recovery` (DESIGN §i.5 "Predecessor recovery", "Store revoked by the server",
+     "Abandoned creates"). The sim oracle is mirror-aware again (only `idbWipe` without mirrors loses the store's
+     unsent ops); the two composed mirror-recovery tests run again, and the phase-2 variants now drop the mirrors too.
+     As built:
+     - The fence runs in the composed engine's identity resolution, right after the pending identity registers and
+       before the store's first connect, for every predecessor it holds a key for (the worker's earlier stores and the
+       install record's `current`, passed as `EngineInitConfig.predecessor`). Its outcome is recorded with the
+       inheritance marker `meta.identity.inherit {dirs, fenced}`, written when the store is created; the import
+       (`Repo.tInherit`) clears it in the same transaction, so a crash in between re-runs it.
+     - Source: the newest lineage dir with a valid outbox mirror (not only the newest predecessor): a store that died
+       before its first mirror leaves its predecessor's dir in place, and a store mirrors what it inherited before it
+       sends any of it. The outbox mirror format is 2: re-issued ns / cfg frames carry their `origins`, so a chain of
+       losses still finds the identity that may have committed.
+     - Commit check: `FoldRuntime.committedTest` (ring, replay window, tail above the fold) per origin, at every session
+       start while inherited frames wait (`logApi.checkInherited`), before `renumberBlindFrames`. Without the fence it
+       waits `inheritUnfencedWaitMs` (10 s) after the start.
+     - Snap-index and keyring frames are not inherited (the snapshot job uploads again; the keyring flow restarts from
+       `k`). Local snapshots are copied, and the predecessor's copies removed with its mirrors once this store's
+       outbox and synced mirrors are written (`VaultRuntime.dropLineageDirs`): the side-file port deletes files, never
+       a dir. Retention and "already uploaded" count the lineage's uploads (`SnapIndexPort.lineage`).
+     - A revoked store (phase `revoked`) registers a successor first and only then stops, deletes its store and
+       restarts; a refused registration keeps the store (`ProtocolEngine.onStoreRevoked`).
+     - Abandoned creator (BACKLOG): a new server route `POST /vault/:id/auth/device/status {deviceIds}` (bearer, ≤ 32
+       ids: `live` / `retired` / `unknown`). A body-less doc whose creator reads retired for 30 s is `lostCreateBody`
+       on every device. `lostCreateBody` now deletes the empty doc in every case and a holder re-creates its file as a
+       new doc (it no longer pushes the file into the empty doc: several holders would each insert the text). The sim
+       clone fault no longer skips such windows; it removes the abandoned store's registration 60 s after the clone
+       (or at heal), as the console's "Remove device" or phase 5's inactivity retirement would.
+     - Seed 222's plan is green, and also with the fence and the wall-clock floor both disabled (a new store has a new
+       deviceId and so a fresh replay window), so it is not committed as a regression.
 4. **Removal.** Delete the wall floor, the skip, `renumberBlind`, `frameNoFloor` and the earlier-store branches.
    Epoch migration mints and self-retires. Soak. Update DESIGN and e2ee docs. Close CLONED-ID and FRAMENO-IDB. Add the
    optional clone notice and the §8 per-install split of data.json fields.
+   - **Landed** on `identity/phase4-removal`. As built:
+     - **Removed:** the wall-clock floor (`FoldRuntime.skip`, `WALL_FLOOR_MAX`, `wallMs`; ClockPort's rule is back to
+       "never for ordering or fold decisions"), the NS_DEDUPE_RING skip of a runtime's first allocation and its
+       re-skip, `renumberBlind` / `renumberBlindFrames` and the `frame-renumbered` diag, the epoch `frameNoFloor`
+       (`MetaFrameNoFloor`, the carry through `EngineOptions` / `VaultRuntimeStart` / `ComposedEngine.migration`,
+       `ownFrameNoFloor`), and the "earlier store" clauses (`seq > lastOwnSeq` in `tLive`, `tReadPage`,
+       `tReleaseQuarantine`; the context comment): an own row without its outbox record is one this store settled.
+       `allocFrameNo` is `1 + max(R, own rows above the fold, receipts, the outbox)`: a fresh store starts at 1.
+       e2ee-design §8.2 states why that is exact.
+     - **The skip was checked, not assumed:** every number is sent only from the outbox written in the allocating
+       chain step, and leaves it only through a receipt that writes the own tail row. One hole was found and closed
+       instead of keeping the skip: a re-read of an own row that does not open (a reader-dependent gate failure)
+       replaced the receipt's row with an unopened one (frameNo 0), hiding the number. `putTail` now never replaces an
+       opened row with an unopened copy of the same frame.
+     - **Kept:** the gate that opens ns/cfg sends only after the start reads (late receipts §d.7, stale-epoch reseal,
+       the inherited commit check); the d1f8a750 planner re-create (decision 8; DESIGN §f.2 now names it a safety net);
+       `recoverFromMirror` (own mirror under the same deviceId) for engine tests that start without a store identity:
+       production never reaches it (a new store's own dir is empty).
+     - **Epoch migration mints** (decision 2). The old store's identity opens only its own DB: a start whose connect
+       names an epoch the found store has no DB for ends with `StoreEpochError`, and the composed engine registers a
+       pending identity with the grant (no extra connect: the error carries the epoch) and starts again. No fence and
+       no frame inheritance (the old outbox goes with §c.12 step 5; its mirrors are of the old epoch and never match),
+       but the old dir is the new store's lineage, so its local snapshots (the migration's "epoch" one) move over and
+       its files are removed after. At live, `retireOldEpochs` retires each other-epoch DB's identity by its retire key
+       (the self-retire) and deletes the DB; a retire without an answer keeps the DB until the next live. Sim test:
+       both devices of an epoch reset run as new devices, the old ids read retired, one `yaos3:` DB each.
+     - **Two stores at once** (the old epoch's until the new one is live and retires it, or a crash between the
+       retire and the delete): the new store's identity names the ones it replaces (`MetaIdentity.supersedes`, written
+       when the DB is created), and `resolveStoreIdentity` never picks a superseded store. It used to take the newest
+       `createdAtMs`, a wall-clock value: the 1000-seed sweep found a device whose new store was created under a -42 h
+       clock skew pick the old, already retired store and fail every start `unauthorized` (seed 602; plan in
+       `src/sim/regressions/epoch-mint-skewed-store-pick.json`). `createdAtMs` is now only a last resort among stores
+       with no link.
+     - **§8 split:** `deviceLabel`, `showStatusBar`, `pendingEnrollment` and `creating` live in a per-install record
+       (`App.saveLocalStorage("yaos-local")`, `src/host/localSettings.ts`); data.json holds `version`, the grant, the
+       engine settings and the suite pin. The label and status bar flag move once from an older data.json; an older
+       `creating` / `pendingEnrollment` is dropped (it could be a twin's), and that data.json is rewritten once
+       without them. A label or status bar change never writes data.json.
+     - **Clone notice:** the first store of an install with no lineage looks at `state/*/` and says once (flag in the
+       per-install record) when another store's mirror was written within a day (`src/host/cloneNotice.ts`).
+     - **Abandoned-creator timer:** one timer for every recheck and grace, none while no doc waits on a foreign
+       creator; a live creator's recheck doubles from 5 min to 60 min and is asked by the timer itself (the phase-3
+       recheck only re-read a cached view); "unknown" is not asked again. timer-audit.md has the row.
+     - Not done: `rebuildLocalCache` still restarts on the same store (§4 wants a store reset; BACKLOG
+       IDENTITY-HYGIENE). Done in phase 5.
 5. **Hygiene (optional).** Inactivity retirement; grant rotation and re-fetch with the device token; orphan DB sweep;
-   ring compaction.
+   ring compaction; `rebuildLocalCache` as a store reset.
+   - **Landed** on `identity/phase5-hygiene` (DECISIONS §10.1 G65–G66, operations.md "Device identity routes",
+     DESIGN §i.5, tests/server/identity-hygiene.ts, src/sim/identityHygiene*.test.ts). As built:
+     - **Inactivity retirement** (`VaultHost.retireInactive`, `server/src/vault/host.ts`). A device whose
+       `last_seen_day` (or, for a pre-phase-1 enroll, its enroll day) is more than `INACTIVITY_RETIRE_DAYS` (90)
+       UTC days before today is retired through the console's path (`retireDevices`: D7, tombstone). No alarm and no
+       timer: the scan runs inside `POST /auth/device` (after the restore check and body validation, before the
+       limits, so the 50-store cap counts the freed slots), `POST /auth/device/status` (the abandoned-creator query:
+       holders ask every 5–60 min while a create waits, so an abandoned create resolves without anyone opening the
+       console) and the operator's device list. Cost: the devices are in memory, so 0 row reads; at most one full scan
+       per UTC day per runtime (`inactivitySweptDay`, set only once nothing stale is left); writes only for a
+       retirement (2 rows each, at most `INACTIVITY_RETIRE_BATCH` = 50 per call, the rest at the next trigger); skipped
+       while the daily write limit is latched or a restore runs. A stale device with an open socket (a session older
+       than 90 days, the ticket never re-issued) is kept and gets `last_seen_day` today instead (1 row). The threshold
+       is `YAOS_INACTIVITY_RETIRE_DAYS` (1–3650, `readInactivityRetireDays`); tests set `inactivityRetireDays`. The
+       leftover of a crash between an epoch mint (or a rebuild's) registration and the store's creation is a
+       registered identity nobody holds: it is retired the same way. Sim: an abandoned create whose creator store was
+       lost with its lineage (no fence) stays body-less while the creator is live, and resolves once the sweep a
+       status query runs retires it (`identityHygiene.sim.test.ts`, a slow unit over a few virtual hours across a UTC
+       midnight, with the sim registry's threshold at 0 days).
+     - **Rotation** (`POST /operator/vaults/:id/grants/:grantId/rotate`, console "Rotate secret"). The server mints
+       the secret (32 random bytes, base64url) and replaces `secret_hash` in one UPDATE; the old secret is unknown
+       from that moment (401 `unauthorized` on registration, pairing codes, leave). It also stores `secret_wrap`
+       (identity v3, G65): AES-GCM under an HKDF key derived from the vault's ticket key, AAD vaultId and grantId
+       (`server/src/vault/grantWrap.ts`), so `GET /vault/:id/auth/grant` (device bearer) can return it to any live
+       store of the grant. A grant never rotated has no wrap: `404 grant_secret_unavailable`, and the client keeps its
+       secret. Revoked: `401 grant_revoked`; a pre-grant enroll: `403 grant_required`. The client fetches lazily, when
+       the old secret is refused: `registerPending` retries once after `ProtocolEngine.refreshGrant` (fetch, then
+       `IdentityPort.useGrant`), and main's pairing-code request sends the `refreshGrant` command and retries once
+       (`requestPairingCodeRotating`). The engine posts `grantSecret` to main, which rewrites data.json when the host,
+       vault and grantId are still the paired ones (no restart). Clones: a clone that runs a live store of its own is
+       an install like any other and fetches it; a copy with no live store (never started, its store removed or lost)
+       has no token, registration reads `unauthorized`, and it asks for a re-pair (`pairing-unknown`). "Leave" with a
+       stale secret reads 401, already counted as done.
+     - **Deviation (G56):** the server held only secret hashes. A rotated secret is also held wrapped, readable by
+       the vault DO only (the key never leaves it). A paired secret, which the client minted, is still only hashed.
+       A thief who already registered a store from a leaked data.json fetches the rotated secret too: the operator
+       removes that store, or revokes the pairing.
+     - **Orphan DB sweep** (`sweepOrphanStores`, `src/engine/compose/runtimeOps.ts`). On going live, after
+       `retireOldEpochs`: the `yaos3:<vaultId>:*:<key>` and `yaos3-pending:<vaultId>:<key>` DBs of this vault under
+       another install key (at most 32), their identities read, one `POST /auth/device/status`, and only the ones that
+       read **retired** are deleted. Live and unknown are kept and asked again at a later live (an unknown one may be
+       a pending identity another registration of the vault is registering right now on a shared desktop origin, or
+       one a restore forgot). No dir is touched: this install's own lineage dirs go with `VaultRuntime.dropLineageDirs`
+       (now also for a store that inherited nothing, once its mirrors are written: the predecessor's unsent frames
+       are either inherited or the store had none), and another install's `state/<id>/` is never this install's to
+       delete. No timer; with no orphan, one `listDatabases` per live and no request.
+     - **`rebuildLocalCache` is a store reset** (`ProtocolEngine.resetStore`). It registers a pending identity under
+       the grant first; refused (offline, a revoked pairing, the daily limit, a rotated secret it cannot fetch), the
+       store keeps running and the command fails with the reason. Then, like a revoked store's replacement
+       (`replaceStore`, shared): stop the runtime (the outbox goes to its mirror), delete this install's store DBs,
+       start on the registered identity, which fences the old store by its retire key and inherits its unsent frames
+       from its mirror; the old dir goes once the new store's mirrors are written. A crash after the registration
+       leaves a registered pending identity (consumed at the next start) or, without it, a registered identity nobody
+       holds, which inactivity retirement retires. Sim: unsent edits survive the reset, an offline reset changes
+       nothing.
+     - **Not done:** ring compaction (decision 6), and a lost data.json re-fetched from the store (§4 "data.json
+       lost"): data.json is the only place the host and vaultId of the pairing live, so a store has nothing to fetch
+       with; that install pairs again (BACKLOG).
 
 ## 13. Migration note for dev vaults
 

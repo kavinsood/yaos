@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import { minimizePlan, runSim, type SimConfig, type SimReport } from "../run";
-import { BLOB_FAULTS, CANVAS_FAULTS, DEFAULT_FAULTS, SUBS_FAULTS } from "../faults";
+import { BLOB_FAULTS, CANVAS_FAULTS, CLONE_FAULTS, DEFAULT_FAULTS, SUBS_FAULTS } from "../faults";
 import { CANVAS_HOT_OPS } from "../canvas";
 import type { SimBlobLiveness } from "../blobStore";
 
@@ -56,7 +56,7 @@ export async function sweep(name: string, base: Omit<SimConfig, "seed">, seeds: 
 	assert.fail(
 		`${name}: ${failed.length}/${seeds} seeds failed: ${failed.map((r) => r.seed).join(",")}\n` +
 			`seed ${r0.seed}:\n  ${r0.violations.slice(0, 6).map((v) => `${v.inv}: ${v.detail}`).join("\n  ")}\n` +
-			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults === SUBS_FAULTS ? "SUBS_FAULTS" : cfg.faults === CANVAS_FAULTS ? "CANVAS_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
+			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults === SUBS_FAULTS ? "SUBS_FAULTS" : cfg.faults === CANVAS_FAULTS ? "CANVAS_FAULTS" : cfg.faults === CLONE_FAULTS ? "CLONE_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
 	);
 }
 
@@ -92,6 +92,13 @@ export const canvasHits: Hits = (name, stats) => {
 	assert.ok(ok, `${name}: the canvas actions hit the merge paths ${JSON.stringify(got)}`);
 };
 
+/** The clone matrix ran its faults: clones and synced config dirs, and stores beyond one per device (new identities). */
+export const cloneHits: Hits = (name, stats) => {
+	const sum = (f: (s: SimReport["stats"]) => number) => stats.reduce((n, s) => n + f(s), 0);
+	const got = { clones: sum((s) => s.faults.clone ?? 0), synced: sum((s) => s.faults.syncedConfig ?? 0), stores: sum((s) => s.identity.stores), devices: stats.length * 3 };
+	assert.ok(got.clones > 0 && got.synced > 0 && got.stores > got.devices, `${name}: the clone faults made stores of their own ${JSON.stringify(got)}`);
+};
+
 export interface Matrix {
 	readonly name: string;
 	readonly base: Omit<SimConfig, "seed">;
@@ -122,6 +129,9 @@ export const MATRICES: readonly Matrix[] = [
 	// user (brakeUser.ts). The nightly soak (scripts/sim-soak.mjs) draws more and denser ones; coverage.sim.test.ts
 	// asserts every mass brake trips and the user answers both ways.
 	{ name: "3 devices, storms + brake user", base: { devices: 3, faults: DEFAULT_FAULTS, steps: 80, storms: 0.04 }, seeds: part(8), smoke: 1, cost: 4 },
+	// identity-per-store §4: a copied vault folder runs as a further device (a new store and identity, the copied mirrors
+	// foreign), and a sync tool carries the plugin's folder between devices; checkIdentity holds throughout.
+	{ name: "3 devices, clone + synced config faults", base: { devices: 3, faults: CLONE_FAULTS, faultRate: 0.25 }, seeds: part(10), smoke: 1, cost: 2.2, hits: cloneHits },
 	// Per-device engine tuning and budgets drawn per seed (run.ts tuningWorld); every other matrix keeps SIM_TUNING.
 	{ name: "3 devices, seeded faults, randomized tuning", base: { devices: 3, faults: DEFAULT_FAULTS, randomTuning: true }, seeds: part(4), smoke: 1, cost: 2 },
 ];

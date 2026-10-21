@@ -47,6 +47,36 @@ describe("relayHttp helpers", () => {
 	});
 });
 
+describe("relayHttp fetchGrant (identity-per-store §3.4)", () => {
+	it("GETs /auth/grant with the bearer token and returns a well-formed secret", async () => {
+		const secret = "S".repeat(43);
+		const { http, requests } = client(() => jsonResponse({ grantId: "grant_AAAAAAAAAAAAAAAA", grantName: "Mac", grantSecret: secret }));
+		assert.deepEqual(await http.fetchGrant("v/1"), { ok: true, grantSecret: secret });
+		const req = requests[0]!;
+		assert.equal(req.method, "GET");
+		assert.equal(req.url.href, "https://relay.example/vault/v%2F1/auth/grant");
+		assert.equal(req.headers.get("authorization"), `Bearer ${TOKEN}`);
+	});
+
+	it("maps the refusals: 404 nothing to fetch, 401/403 refused, the rest (and a malformed secret) retry later", async () => {
+		const cases: [Response | "network", string][] = [
+			[jsonResponse({ error: "grant_secret_unavailable" }, 404), "unavailable"],
+			[jsonResponse({ error: "grant_revoked" }, 401), "refused"],
+			[jsonResponse({ error: "unauthorized" }, 401), "refused"],
+			[jsonResponse({ error: "grant_required" }, 403), "refused"],
+			[jsonResponse({ error: "grant_rotating" }, 409), "network"],
+			[jsonResponse({ error: "boom" }, 500), "network"],
+			[jsonResponse({ grantSecret: "short" }), "network"],
+			[jsonResponse({ grantSecret: 7 }), "network"],
+			["network", "network"],
+		];
+		for (const [response, reason] of cases) {
+			const { http } = client(() => response);
+			assert.deepEqual(await http.fetchGrant("v"), { ok: false, reason }, String(reason));
+		}
+	});
+});
+
 describe("relayHttp ticket", () => {
 	it("POSTs {purpose:streams} with the bearer token", async () => {
 		const { http, requests } = client(() => jsonResponse({ ticket: "T1", expiresAt: 1, ttlMs: 300000 }));

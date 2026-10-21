@@ -57,7 +57,7 @@ export interface DiagnosticsSettings {
 	readonly engine: Omit<EngineSettings, "excludePatterns"> & { readonly excludePatternCount: number; readonly excludePatterns?: readonly string[] };
 }
 
-export function diagnosticsSettings(host: Pick<YaosUiHost, "data" | "pluginVersion">, includePaths: boolean): DiagnosticsSettings {
+export function diagnosticsSettings(host: Pick<YaosUiHost, "data" | "pluginVersion"> & Partial<Pick<YaosUiHost, "deviceId">>, includePaths: boolean): DiagnosticsSettings {
 	const data = host.data();
 	const id = data.identity;
 	const { excludePatterns, ...engine } = data.engine;
@@ -65,7 +65,8 @@ export function diagnosticsSettings(host: Pick<YaosUiHost, "data" | "pluginVersi
 		pluginVersion: host.pluginVersion,
 		host: id?.host ?? null,
 		vaultId: id?.vaultId ?? null,
-		deviceId: id?.deviceId ?? null,
+		// The store's (identity-per-store §2.4), from this install's lineage; data.json holds only the grant.
+		deviceId: id ? (host.deviceId?.() ?? null) : null,
 		deviceLabel: data.deviceLabel,
 		engine: { ...engine, excludePatternCount: excludePatterns.length, ...(includePaths ? { excludePatterns: [...excludePatterns] } : {}) },
 	};

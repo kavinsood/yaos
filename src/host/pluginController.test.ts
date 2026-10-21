@@ -12,19 +12,31 @@ import { withSuite0PinForTest } from "./keys/testkit/pinFixture";
 import { BAD_VAULT_IDS, testVaultId } from "./keys/testkit/vaultIds";
 import { advanceUntil, settleWith } from "../engine/keyring/testkit/simWait";
 import { hostNotice, PinRefusedError, YaosController } from "./pluginController";
-import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "./ui/api";
+import { defaultPluginData, type PairedIdentity, type StoredPluginData, type YaosPluginData } from "./ui/api";
+import type { StoreDirActivity } from "./cloneNotice";
+import { LOCAL_SETTINGS_KEY, sanitizeLocalSettings, type LocalSettings } from "./localSettings";
+import { prepareEnrollment } from "./ui/pairing";
 
-const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), deviceId: "dev-A", deviceToken: "secret-token", deviceName: "A", vaultGeneration: null };
+const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: "gs_SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS", grantName: "A", vaultGeneration: null };
 
-function setup(initial: YaosPluginData = defaultPluginData("A"), o: { readonly secretsAvailable?: boolean } = {}) {
+interface SetupOptions {
+	readonly secretsAvailable?: boolean;
+	/** The state dirs the clone check finds (absent: no scan wired). */
+	readonly stateDirs?: () => Promise<readonly StoreDirActivity[]>;
+	readonly local?: Map<string, unknown>;
+}
+
+function setup(initial: YaosPluginData = defaultPluginData("A"), o: SetupOptions = {}) {
 	const clock = new VirtualClock();
 	const net = new SimNet(clock, { linkMs: 10 });
 	const dev = new SimDevice({ name: "A", clock, net });
 	dev.secrets.available = o.secretsAvailable ?? true;
-	const saved: YaosPluginData[] = [];
+	const saved: StoredPluginData[] = [];
 	const notices: string[] = [];
 	const logs: string[] = [];
 	const sinks: HostUiSink[] = [];
+	const local = o.local ?? new Map<string, unknown>();
+	const stateDirs = o.stateDirs;
 	const ctl = new YaosController(initial, {
 		makeRuntime: (identity, settings, ui, keys) => {
 			sinks.push(ui);
@@ -37,15 +49,19 @@ function setup(initial: YaosPluginData = defaultPluginData("A"), o: { readonly s
 		log: (l) => logs.push(l),
 		clock,
 		secrets: dev.secrets,
+		localStorage: { load: (k) => local.get(k) ?? null, save: (k, v) => void local.set(k, structuredClone(v)) },
+		...(stateDirs ? { stateDirs: { pluginDir: ".config/plugins/yaos", storeDirs: stateDirs } } : {}),
 	});
 	let changes = 0;
 	ctl.onChange(() => changes++);
-	return { clock, net, dev, ctl, saved, notices, logs, sinks, changes: () => changes };
+	/** The local settings record (identity-per-store §8) as stored. */
+	const localRec = (): LocalSettings => sanitizeLocalSettings(local.get(LOCAL_SETTINGS_KEY), "?");
+	return { clock, net, dev, ctl, saved, notices, logs, sinks, local, localRec, changes: () => changes };
 }
 
 const PAIRED: YaosPluginData = { ...defaultPluginData("A"), identity: ID };
 
-async function started(initial: YaosPluginData, o: { readonly secretsAvailable?: boolean } = {}) {
+async function started(initial: YaosPluginData, o: SetupOptions = {}) {
 	const w = setup(initial, o);
 	const s = w.ctl.start();
 	await w.clock.advance(1_000);
@@ -174,7 +190,9 @@ test("a stored pairing without e2ee is unpinned and blocked: key-missing, zero f
 	assert.equal(w.dev.engine?.config?.crypto.suite, null);
 	assert.equal(w.net.relay.counters().appendFrames, 0, "no frame on any stream");
 	assert.equal(w.net.relay.head(), 0);
-	assert.deepEqual(await w.dev.storage.listDatabases(), [], "no IndexedDB store opened");
+	// Only the pending store identity (identity-per-store §4): the key reader registered one device, and no store exists.
+	const dbs = await w.dev.storage.listDatabases();
+	assert.deepEqual(dbs.map((n) => n.split(":")[0]), ["yaos3-pending"], "no IndexedDB store opened");
 	assert.equal(w.saved.length, 0, "nothing inferred, nothing saved");
 	assert.equal(w.ctl.data().e2ee, undefined);
 });
@@ -297,10 +315,13 @@ test("creation marker (§15.1): written before enroll, kept across it; creatable
 	await w.ctl.start();
 	for (const bad of BAD_VAULT_IDS) await assert.rejects(w.ctl.markCreating(bad), TypeError, JSON.stringify(bad));
 	assert.equal(w.saved.length, 0, "a non-vaultId never reaches data.json");
+	assert.equal(w.localRec().creating, undefined, "nor the local record");
 	await w.ctl.markCreating(ID.vaultId);
-	assert.deepEqual(w.saved.at(-1)?.creating, { vaultId: ID.vaultId });
+	assert.deepEqual(w.localRec().creating, { vaultId: ID.vaultId }, "per install: the local record (identity-per-store §8)");
+	assert.equal(w.saved.length, 0, "data.json is not written for the marker");
 	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: ID })), 5_000);
-	assert.deepEqual(w.saved.at(-1)?.creating, { vaultId: ID.vaultId }, "the enroll keeps the marker");
+	assert.deepEqual(w.localRec().creating, { vaultId: ID.vaultId }, "the enroll keeps the marker");
+	assert.ok(w.saved.length > 0 && w.saved.every((d) => !("creating" in d)), "never in data.json");
 	assert.equal(w.dev.engine?.config?.crypto.suite, null);
 	assert.equal(w.ctl.status()?.e2ee?.creatable, true, "empty relay, empty k");
 	// Main lets the creation choices through; the engine's KeyReader decides (keyReader.ts). enableE2ee: the genesis.
@@ -309,6 +330,7 @@ test("creation marker (§15.1): written before enroll, kept across it; creatable
 	assert.ok(noBytes(rk), "the recovery key left main");
 	assert.deepEqual(w.ctl.data().e2ee, { suite: 1 }, "pinned after ok");
 	assert.equal(w.ctl.data().creating, undefined, "the marker goes with the pin");
+	assert.equal(w.localRec().creating, undefined, "and from the local record");
 	assert.equal(w.net.relay.rows(KEYRING_STREAM).length, 1, "the genesis");
 	assert.equal(w.net.relay.head(), 1, "and nothing else");
 	assert.equal(new VaultKeyStore(w.dev.secrets, ID.vaultId, w.clock).load()?.keys.length, 1, "K_1 stored before the pin");
@@ -325,7 +347,8 @@ test("creation marker (§15.1): written before enroll, kept across it; creatable
 	assert.equal(c.net.relay.rows(KEYRING_STREAM).length, 0);
 	// Enrolling in another vault drops the marker.
 	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, identity: { ...ID, vaultId: testVaultId("v2") } })), 5_000);
-	assert.equal(w.saved.at(-1)?.creating, undefined);
+	assert.equal(w.ctl.data().creating, undefined);
+	assert.equal(w.localRec().creating, undefined);
 });
 
 test("abandonCreating (§15.1 abort): the marker goes, no pin, the engine restarts off the creation path", async () => {
@@ -339,7 +362,7 @@ test("abandonCreating (§15.1 abort): the marker goes, no pin, the engine restar
 	assert.deepEqual(w.ctl.data().creating, { vaultId: ID.vaultId }, "another vault's abort leaves this marker");
 	await w.ctl.abandonCreating(ID.vaultId);
 	assert.equal(w.ctl.data().creating, undefined);
-	assert.equal(w.saved.at(-1)?.creating, undefined, "saved");
+	assert.equal(w.localRec().creating, undefined, "saved");
 	assert.equal(w.ctl.data().e2ee, undefined, "no pin: unpinned and blocked");
 	assert.ok(await advanceUntil(w.clock, () => w.dev.engineStarts === starts + 1 && w.ctl.runState().phase === "running" && w.ctl.status() !== null, 30_000), "restarted");
 	assert.equal(w.ctl.status()?.e2ee?.creatable, false);
@@ -382,4 +405,97 @@ test("vaultKeyForQr: the stored key of the seal epoch, as a copy; null unless su
 	assert.deepEqual(key.k, stored?.keys[0]?.k);
 	key.k.fill(0);
 	assert.ok(!noBytes(w.ctl.vaultKeyForQr()!.k), "zero-filling the copy leaves the store alone");
+});
+
+// --- per-install fields and the clone notice (identity-per-store §8) -------------------------------------------
+
+test("per-install fields go to the local settings record, never to data.json", async () => {
+	const w = await started(withSuite0PinForTest(PAIRED));
+	const before = w.saved.length;
+	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, deviceLabel: "Laptop", showStatusBar: false })), 5_000);
+	assert.equal(w.saved.length, before, "a label or a status bar toggle does not write data.json");
+	assert.equal(w.localRec().deviceLabel, "Laptop");
+	assert.equal(w.localRec().showStatusBar, false);
+	assert.equal(w.dev.engine?.config?.deviceLabel, "Laptop", "the label still restarts the engine with it");
+	const attempt = prepareEnrollment({ host: ID.host, pairingCode: "pc_ABCDEFGHIJKLMNOPQRSTUVWX", deviceName: "Laptop" });
+	await w.ctl.updateData((d) => ({ ...d, pendingEnrollment: attempt }));
+	assert.deepEqual(w.localRec().pendingEnrollment, attempt, "SECRET: in vault-local storage, not in the vault folder");
+	assert.equal(w.saved.length, before, "a pending enrollment never writes data.json");
+	await w.ctl.updateData((d) => { const { pendingEnrollment: _p, ...rest } = d; return rest; });
+	assert.equal(w.localRec().pendingEnrollment, undefined, "dropped from the record");
+	await settle(w.clock, w.ctl.updateData((d) => ({ ...d, engine: { ...d.engine, excludePatterns: ["x/**"] } })), 100);
+	assert.equal(w.saved.length, before + 1, "a shared field does");
+	assert.deepEqual(Object.keys(w.saved.at(-1) ?? {}).sort(), ["e2ee", "engine", "identity", "version"]);
+	assert.equal(w.localRec().deviceLabel, "Laptop", "the record is kept across a data.json save");
+	// The load-time rewrite of an older data.json (plugin.ts) writes the shared fields only.
+	await w.ctl.rewriteStoredData();
+	assert.deepEqual(Object.keys(w.saved.at(-1) ?? {}).sort(), ["e2ee", "engine", "identity", "version"]);
+});
+
+const STORE_B = "dev-B000000000000000";
+const recent = (clock: VirtualClock, ageMs: number): StoreDirActivity => ({ deviceId: STORE_B, newestMirrorMs: clock.now() - ageMs });
+
+test("clone notice (§8): a fresh install that finds another store's recent mirrors says so once", async () => {
+	let scans = 0;
+	const local = new Map<string, unknown>();
+	const w = setup(withSuite0PinForTest(PAIRED), { local, stateDirs: async () => (scans++, [recent(w.clock, 60_000)]) });
+	void w.ctl.start();
+	assert.ok(await advanceUntil(w.clock, () => w.ctl.deviceId() !== null, 30_000), "the store identity arrived");
+	await w.clock.advance(100);
+	const shown = w.notices.filter((n) => n.includes("synced by another tool"));
+	assert.equal(shown.length, 1);
+	assert.equal(shown[0], "warn:YAOS: this vault folder looks synced by another tool as well. YAOS works, but two sync tools on one folder produce conflicting copies; exclude `.config/plugins/yaos/` from the other tool.@20000");
+	assert.equal(w.localRec().cloneNoticeShown, true, "the flag is per install");
+	// A restart has lineage: no scan.
+	await settle(w.clock, w.ctl.restartEngine(), 5_000);
+	assert.equal(scans, 1, "only the fresh install's first store looks");
+	// A re-pair to another vault is a fresh install record again, but the flag holds.
+	const again = setup(withSuite0PinForTest(PAIRED), { local: new Map([[LOCAL_SETTINGS_KEY, local.get(LOCAL_SETTINGS_KEY)]]), stateDirs: async () => (scans++, [recent(again.clock, 0)]) });
+	void again.ctl.start();
+	assert.ok(await advanceUntil(again.clock, () => again.ctl.deviceId() !== null, 30_000));
+	await again.clock.advance(100);
+	assert.equal(again.notices.filter((n) => n.includes("synced by another tool")).length, 0, "once per install");
+});
+
+test("clone notice (§8): nothing for old or own dirs, an install with lineage, or a failing scan", async () => {
+	const cases: [string, (c: VirtualClock, own: () => string | null) => Promise<readonly StoreDirActivity[]>][] = [
+		["older than a day", async (c) => [recent(c, 25 * 3_600_000)]],
+		["no mirror", async () => [{ deviceId: STORE_B, newestMirrorMs: null }]],
+		["own dir only", async (c, own) => [{ deviceId: own() ?? "", newestMirrorMs: c.now() }]],
+		["scan fails", async () => { throw new Error("EACCES"); }],
+	];
+	for (const [name, scan] of cases) {
+		const w = setup(withSuite0PinForTest(PAIRED), { stateDirs: () => scan(w.clock, () => w.ctl.deviceId()) });
+		void w.ctl.start();
+		assert.ok(await advanceUntil(w.clock, () => w.ctl.deviceId() !== null, 30_000), name);
+		await w.clock.advance(100);
+		assert.equal(w.notices.filter((n) => n.includes("synced by another tool")).length, 0, name);
+		assert.equal(w.localRec().cloneNoticeShown, undefined, name);
+	}
+});
+
+test("grant rotation: the engine's fetched secret is written to data.json without a restart; a stale runtime's or another grant's is ignored", async () => {
+	const { clock, dev, ctl, saved, sinks } = await started(PAIRED);
+	assert.equal(dev.engineStarts, 1);
+	const sink = sinks.at(-1)!;
+	const rotated = "R".repeat(43);
+	sink.onGrantSecret?.(rotated);
+	await clock.advance(100);
+	assert.equal(saved.at(-1)?.identity?.grantSecret, rotated);
+	assert.equal(ctl.data().identity?.grantSecret, rotated);
+	assert.equal(ctl.data().identity?.grantId, ID.grantId, "the same grant");
+	assert.equal(dev.engineStarts, 1, "no restart: the engine already uses it");
+	const writes = saved.length;
+	sink.onGrantSecret?.(rotated);
+	await clock.advance(100);
+	assert.equal(saved.length, writes, "the same secret again writes nothing");
+	// Re-paired to another grant: the old runtime's late secret must not land on the new pairing.
+	const repair = ctl.updateData((d) => ({ ...d, identity: { ...ID, grantId: "grant_BBBBBBBBBBBBBBBB", grantSecret: "B".repeat(43) } }));
+	await clock.advance(5_000);
+	await repair;
+	const after = saved.length;
+	sink.onGrantSecret?.("X".repeat(43));
+	await clock.advance(100);
+	assert.equal(saved.length, after);
+	assert.equal(ctl.data().identity?.grantSecret, "B".repeat(43));
 });

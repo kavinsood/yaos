@@ -382,6 +382,11 @@ export class CanvasOracle {
 	readonly sorted = new Set<string>();
 	/** IDB wipes that dropped the mirrors (device, time): the device's unsent ops are gone, deletes included. */
 	readonly wipes: { readonly dev: string; readonly atMs: number }[] = [];
+	/**
+	 * Records the user's copy of another device's vault over this one destroyed (clone fault): only the overwritten
+	 * device held them, on disk and in its store, and its store goes with the copy (identity-per-store §4 "Clone").
+	 */
+	readonly copiedAway = new Set<string>();
 	readonly stats: CanvasStats = { actions: 0, skipped: 0, byType: {}, creates: 0, broken: 0, fixes: 0, abandoned: 0, rewrites: 0, linkUpdates: 0, bigNodes: 0 };
 
 	uniq(): number {
@@ -951,6 +956,51 @@ export class CanvasWorld {
 	// --- link updates (Obsidian's rename of a note) ----------------------------
 
 	/** Obsidian renamed `from` to `to` on `d` (fileManager.renameFile): file nodes pointing at it follow. */
+	/**
+	 * Why device `i`'s vault cannot be copied now (clone fault), or null: a broken save still in progress there would
+	 * be copied half-written, and only the source's writer completes it (the copy would stay invalid).
+	 */
+	midSave(i: number): string | null {
+		const fix = [...this.fixes.values()].find((f) => f.dev === i);
+		return fix ? `${fix.path} half-written on the source` : null;
+	}
+
+	/**
+	 * The user copies another device's vault over `dst` (clone fault, before the copy): what only dst held, on disk or
+	 * in its engine, goes with its disk and its store. Records no other device holds are copied away, dst's field
+	 * writes and removals no other device shows are discarded, and its unsent deletes and reorders go as with a wipe.
+	 */
+	copiedOver(dst: SimDevice, others: readonly SimDevice[]): void {
+		const recs = new Set<string>();
+		const held = new Set<string>();
+		for (const o of others) {
+			for (const path of canvasFiles(o)) {
+				for (const text of [o.vault.textOf(path) ?? "", engineCanvasText(o, path) ?? ""]) {
+					const m = readModel(text);
+					if (!m) continue;
+					for (const k of Object.keys(m.root)) held.add(`root|${k}|${key(m.root[k]!)}`);
+					for (const [kind, list] of [["n", m.nodes], ["e", m.edges]] as const) {
+						for (const x of list) {
+							const rec = `${kind}:${x.id as string}`;
+							recs.add(rec);
+							for (const [f, v] of this.fieldsOf(x)) held.add(`${rec}|${f}|${v}`);
+							for (const [k, list2] of this.oracle.removals) {
+								if (!k.startsWith(`${rec}|`) || x[k.slice(rec.length + 1)] !== undefined) continue;
+								for (const r of list2) held.add(`removal|${k}|${r.atMs}|${r.dev}`);
+							}
+						}
+					}
+				}
+			}
+		}
+		for (const r of this.oracle.records.values()) if (!r.deleted && !recs.has(r.key)) this.oracle.copiedAway.add(r.key);
+		for (const [k, w] of this.oracle.writes) if (w.dev === dst.name && !held.has(k)) this.oracle.discarded.add(k);
+		for (const [k, list] of this.oracle.removals) {
+			for (const r of list) if (r.dev === dst.name && !held.has(`removal|${k}|${r.atMs}|${r.dev}`)) this.oracle.discardedRemovals.add(r);
+		}
+		this.oracle.wiped(dst.name, this.clock.now());
+	}
+
 	onUserRename(d: SimDevice, from: string, to: string, step: number): void {
 		for (const path of editableCanvases(d)) {
 			const cur = d.vault.textOf(path);

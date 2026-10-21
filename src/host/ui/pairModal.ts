@@ -22,9 +22,9 @@ import { errorMessage } from "./format";
 import { plainInput, StatusLine } from "./modalParts";
 import { pairingLink, pairingLinkE2ee } from "./keyActions";
 import { copyText, obsidianRequest } from "./obsidianEnv";
-import { applyPairedIdentity, formatCountdown, PairingSession, setPendingEnrollment, withoutPendingEnrollment } from "./pairFlow";
+import { applyPairedIdentity, formatCountdown, PairingSession, requestPairingCodeRotating, setPendingEnrollment, withoutPendingEnrollment } from "./pairFlow";
 import {
-	normalizeHost, pairingCodeVaultId, requestPairingCode, retireDeviceEnrollment, type LinkE2ee, type PairingCodeGrant, type RequestFn,
+	normalizeHost, pairingCodeVaultId, leaveGrant, type LinkE2ee, type PairingCodeGrant, type RequestFn,
 } from "./pairing";
 import { drawQr } from "./qr";
 
@@ -104,7 +104,7 @@ export class PairModal extends Modal {
 		if (current) {
 			contentEl.createEl("p", {
 				cls: "mod-warning",
-				text: `This device is already paired with ${current.host}. Pairing again replaces this device's credentials and syncs this folder with the vault of the new code. Once the new pairing succeeds, YAOS asks the old server to remove this device's old membership. Notes on disk are not deleted.`,
+				text: `This device is already paired with ${current.host}. Pairing again replaces this device's credentials and syncs this folder with the vault of the new code. Once the new pairing succeeds, YAOS asks the old server to revoke this device's old pairing. Notes on disk are not deleted.`,
 			});
 		}
 		contentEl.createEl("p", {
@@ -184,7 +184,7 @@ export class PairModal extends Modal {
 			// Best effort, only after the new identity is stored: revoke the replaced enrollment
 			// with its own token (adfa7a7:src/runtime/setupLinkController.ts:243-256).
 			if (previous && !sameIdentity(previous, identity)) {
-				retireDeviceEnrollment(previous, { request: this.request }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
+				leaveGrant(previous, { request: this.request }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
 			}
 		} catch (err) {
 			this.statusLine.set(errorMessage(err), true);
@@ -233,7 +233,7 @@ export class PairingCodeModal extends Modal {
 			return;
 		}
 		const loading = contentEl.createEl("p", { text: "Creating a pairing code…" });
-		requestPairingCode(identity, { request: this.request }).then(
+		requestPairingCodeRotating(this.host, { request: this.request }).then(
 			(grant) => {
 				if (this.closed) return;
 				loading.remove();

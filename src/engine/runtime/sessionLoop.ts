@@ -26,7 +26,7 @@ import type { ReadPage, ReadRequest, RelayConnectResult, RelayEvent, RelaySessio
 import { readStream, staleOrder, type ReadResult } from "../sync/catchUp";
 import type { EngineCtx } from "./context";
 import { connectFailure, newReconnectState, sessionClosed, type ReconnectDecision } from "./relayPolicy";
-import { renumberBlindFrames } from "./logApi";
+import { checkInherited } from "./logApi";
 import { regateUnopened, retryReaderQuarantine } from "./quarantineRelease";
 
 type Closed = Extract<RelayEvent, { t: "closed" }>;
@@ -492,12 +492,15 @@ export class SessionLoop {
 
 	/** Session whose start reached the ns/cfg reads: from then on a completed read of either may finish the start. */
 	private nsGen = -1;
+	/** The unfenced commit check's wait (EngineCtx.inheritCheckAtMono). */
+	private inheritTimer: number | null = null;
 
 	/**
 	 * The end of a session start, once ns and cfg are read in this session (a read held for a key or failed waits for
 	 * a later read that completes; postRead calls this again):
-	 *  - ns/cfg sends open: the late-receipt reads ran (DESIGN §d.7) and the own committed frames are known
-	 *    (e2ee-design §8.2), so own frames allocated before that are renumbered first (renumberBlindFrames);
+	 *  - ns/cfg sends open: the late-receipt reads ran (DESIGN §d.7), so a resend of a frame that committed is
+	 *    settled instead of sent again, and stale-epoch frames are resealed first (e2ee-design §14.2 step 4); inherited
+	 *    frames pass their commit check first (identity-per-store §5.2 step 3, checkInherited);
 	 *  - the phase may go live (EngineCtx.livePhase: catching-up until then, key-missing / upgrade-required first):
 	 *    the planner takes a live phase for ns caught up, and an empty ns view after IDB loss reads as "every
 	 *    synced file deleted remotely".
@@ -509,7 +512,19 @@ export class SessionLoop {
 		const read = (s: StreamName) => !c.repo.stream(s)?.stale || (this.isHeld(s) && this.held.get(s)!.upgrade);
 		if (!read(NS_STREAM) || !read(CFG_STREAM)) return;
 		if (!c.sender.nsWindowOpen) {
-			await renumberBlindFrames(c);
+			// Predecessor recovery without the fence (identity-per-store §5.2): a frame of the dead store still in the
+			// relay's buffer commits within its hold cap; check the inherited frames once that has passed.
+			const wait = c.inheritCheckAtMono - c.mono();
+			if (wait > 0) {
+				if (this.inheritTimer === null) {
+					this.inheritTimer = c.ports.clock.setTimer(wait, () => {
+						this.inheritTimer = null;
+						void this.afterStartReads(this.c.gen);
+					});
+				}
+				return;
+			}
+			await checkInherited(c);
 			if (gen !== c.gen || c.stopped) return;
 			c.sender.openNs();
 		}

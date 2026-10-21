@@ -11,9 +11,10 @@ import { ProtocolFailure } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsBundle } from "../../protocol/status";
 import { buildDiagnosticsBundle, DIAGNOSTICS_QUARANTINE_MAX } from "./diagnosticsBundle";
-import type { FrameNoFloor } from "../store/repo";
-import { STORE, type MetaDocDeletes, type MetaPathBase } from "../store/schema";
+import { PENDING_DB_NAME_PREFIX, STORE, type MetaDocDeletes, type MetaPathBase } from "../store/schema";
+import type { DeviceId } from "../../core/types";
 import { parseDbName } from "./knownEpoch";
+import { readPending, readStoreIdentity } from "./storeIdentity";
 import { readBase } from "../reconcile/store";
 import { encodeStateAsUpdate } from "../body/yjsCounters";
 import { docDeletesKey, pathBaseKey } from "./epochBases";
@@ -283,36 +284,121 @@ async function oldDeletes(rt: VaultRuntime, s: SyncedEntry): Promise<MetaDocDele
 	}
 }
 
-/** §c.12 step 3 (e2ee-design §8.2): the highest own ns / cfg frameNo, carried into the new epoch's DB. */
-export function ownFrameNoFloor(rt: VaultRuntime): FrameNoFloor {
-	const c = rt.log.c;
-	return { ns: c.ns.maxOwnFrameNo(c.outbox), cfg: c.cfg.maxOwnFrameNo(c.outbox) };
-}
-
 /**
- * §c.12 step 6: the new epoch reached live; delete every other epoch's DB of this vault and device. Not only the one
- * the migration left: a crash between the migration and this step leaves two DBs, the restart connects first
- * (knownEpoch.ts) and opens the current one without migrating, and the old one would stay for good, every later
- * start waiting for the relay to name the epoch. Once the new DB exists the old one holds nothing it needs: the
- * bases were stored with the new DB's identity.
+ * §c.12 step 6: the new epoch reached live; retire and delete every other epoch's DB of this vault and install. Not
+ * only the one the migration left: a crash between the migration and this step leaves two DBs, the restart connects
+ * first (knownEpoch.ts) and opens the current one without migrating, and the old one would stay for good, every later
+ * start waiting for the relay to name the epoch. Once the new DB exists the old one holds nothing it needs: the bases
+ * were stored with the new DB's identity.
+ *
+ * Each old DB is a store with its own identity (identity-per-store §4 "vaultEpoch change", decision 2): it is retired
+ * by its retire key first (the self-retire; already gone counts), so the server's device list does not keep it. A
+ * retire that gets no answer keeps the DB, and the next time this store goes live tries again. A DB under this store's
+ * own deviceId (none since identities per store) is only deleted.
  */
 export async function retireOldEpochs(rt: VaultRuntime): Promise<void> {
-	const { vaultId, deviceId } = rt.o.config;
+	const { vaultId, installKey } = rt.o.config;
+	const self = rt.log.c.self;
+	const storage = rt.o.ports.storage;
 	let names: readonly string[];
 	try {
-		names = await rt.o.ports.storage.listDatabases();
+		names = await storage.listDatabases();
 	} catch (e) {
 		rt.diag(`old epoch DB listing failed: ${String(e)}`);
 		return;
 	}
 	for (const name of names) {
 		const p = parseDbName(name);
-		if (!p || p.vaultId !== vaultId || p.deviceId !== deviceId || p.vaultEpoch === rt.vaultEpoch) continue;
+		if (!p || p.vaultId !== vaultId || p.storeKey !== installKey || p.vaultEpoch === rt.vaultEpoch) continue;
 		try {
-			await rt.o.ports.storage.deleteDatabase(name);
+			const old = await readStoreIdentity(storage, name).catch(() => null);
+			const retire = rt.o.ports.identity?.retire;
+			if (old && old.deviceId !== self && old.retireKey !== undefined && retire) {
+				const r = await retire({ deviceId: old.deviceId, retireKey: old.retireKey });
+				if (!r.ok) {
+					rt.diag(`old epoch store retire failed (${r.reason}): kept until the next live`);
+					continue;
+				}
+				rt.diag(`old epoch store ${r.retired ? "retired" : "already gone"}`);
+			}
+			if (rt.stopped) return;
+			await storage.deleteDatabase(name);
 			rt.diag(`old epoch DB deleted`);
 		} catch (e) {
 			rt.diag(`old epoch DB delete failed: ${String(e)}`);
 		}
 	}
+}
+
+/** At most this many orphan stores are looked at per sweep: the device status route takes 32 ids. */
+export const ORPHAN_SWEEP_MAX = 32;
+
+/**
+ * identity-per-store §6.4 orphan sweep (phase 5), once per runtime when it goes live, after retireOldEpochs: the
+ * stores of this vault on this origin under another install key (`yaos3:<vaultId>:*:<key>` and
+ * `yaos3-pending:<vaultId>:<key>`). Such a store is this registration's after its install key was lost (local storage
+ * cleared, IndexedDB kept) or, on a shared desktop origin, another registration's of the same vault: the two cannot be
+ * told apart here, so nothing is deleted on age or on name. The server decides: a store whose identity it reports
+ * `retired` (tombstoned: it never authenticates again, so the store can never send; its own install, if one still
+ * exists, replaces it from its mirrors, which this sweep never touches; inactivity retirement gets an abandoned one
+ * there after 90 days) is deleted. `live` and `unknown` are kept and asked again at a later live: an unknown identity
+ * may be a pending one another registration is registering right now, or one a server restore forgot whose install
+ * has not started since.
+ *
+ * Never touched: this install's own stores (retireOldEpochs owns the other epochs), and any side-file dir (an orphan's
+ * `state/<deviceId>/` may be another install's, synced into this folder; a lineage dir goes only with
+ * VaultRuntime.dropLineageDirs). No timer: one listDatabases per live, and one status call only while orphans exist.
+ */
+export async function sweepOrphanStores(rt: VaultRuntime): Promise<void> {
+	const { vaultId, installKey } = rt.o.config;
+	const status = rt.o.ports.identity?.status?.bind(rt.o.ports.identity);
+	const storage = rt.o.ports.storage;
+	const self = rt.log.c.self;
+	if (!status || rt.stopped) return;
+	const pendingPrefix = `${PENDING_DB_NAME_PREFIX}:${encodeURIComponent(vaultId)}:`;
+	const ownPending = `${pendingPrefix}${encodeURIComponent(installKey)}`;
+	let names: readonly string[];
+	try {
+		names = await storage.listDatabases();
+	} catch (e) {
+		rt.diag(`orphan sweep: listing failed: ${String(e)}`);
+		return;
+	}
+	const found: { name: string; deviceId: DeviceId }[] = [];
+	for (const name of names) {
+		if (found.length >= ORPHAN_SWEEP_MAX || rt.stopped) break;
+		const p = parseDbName(name);
+		const store = p !== null && p.vaultId === vaultId && p.storeKey !== installKey;
+		const pending = !store && name.startsWith(pendingPrefix) && name !== ownPending;
+		if (!store && !pending) continue;
+		try {
+			if (store) {
+				const id = await readStoreIdentity(storage, name);
+				if (id && id.deviceId !== self) found.push({ name, deviceId: id.deviceId });
+			} else {
+				const id = await readPending(storage, name);
+				if (id && id.deviceId !== self) found.push({ name, deviceId: id.deviceId });
+			}
+		} catch (e) {
+			rt.diag(`orphan sweep: unreadable store skipped: ${String(e)}`);
+		}
+	}
+	if (found.length === 0 || rt.stopped) return;
+	const states = await status([...new Set(found.map((f) => f.deviceId))]);
+	if (!states) {
+		rt.diag("orphan sweep: no device status answer; kept until a later live");
+		return;
+	}
+	let deleted = 0;
+	for (const f of found) {
+		if (states.get(f.deviceId) !== "retired") continue;
+		if (rt.stopped) return;
+		try {
+			await storage.deleteDatabase(f.name);
+			deleted++;
+		} catch (e) {
+			rt.diag(`orphan sweep: delete failed: ${String(e)}`);
+		}
+	}
+	rt.diag(`orphan sweep: ${found.length} orphan store(s), ${deleted} deleted`);
 }

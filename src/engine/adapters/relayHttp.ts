@@ -21,6 +21,7 @@
 import type { ClockPort } from "../../ports/clock";
 import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectResult, RelayRow } from "../../ports/relay";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
+import type { DeviceState, GrantFetchOutcome, RegisterOutcome, RetireOutcome } from "../../ports/identity";
 import { bounded as boundedCall, relayHttpDeadlineMs, RELAY_HTTP_BASE_MS, RELAY_HTTP_IDLE_MS, RELAY_REPLY_BYTES, untilAborted, watched } from "../../core/deadline";
 import { decodeReadReply, type WireReadPage } from "./relayFrames";
 import { createWebClock } from "./webClock";
@@ -48,7 +49,8 @@ export type TicketResult =
 
 export interface RelayHttpOptions {
 	readonly baseUrl: string;
-	readonly credential: string;
+	/** SECRET: the device token, or a getter read per call (the composed engine's store identity). */
+	readonly credential: string | (() => string);
 	readonly fetch?: typeof fetch;
 	/** Wall clock for Retry-After dates and resetAt, and the deadlines' timers; a web clock when absent. */
 	readonly clock?: Pick<ClockPort, "now" | "setTimer" | "clearTimer">;
@@ -60,6 +62,26 @@ export interface RelayHttpOptions {
  * putCheckpoint with "timeout" at its deadline. Each rejects "aborted" as soon as `signal` aborts (the session closed).
  */
 export interface RelayHttp {
+	/**
+	 * `POST /vault/:id/auth/device` with `Authorization: Grant <secret>` (identity-per-store §3.2, relay-wire §2.4.1):
+	 * register a new store's identity under the install's grant. Never throws; bounded at the small-reply deadline.
+	 */
+	registerDevice(vaultId: string, grantSecret: string, body: { readonly deviceId: string; readonly deviceToken: string; readonly retireKeyHash: string }): Promise<RegisterOutcome>;
+	/**
+	 * `POST /vault/:id/auth/device/retire {deviceId, retireKey}` (identity-per-store §5.2 step 1, the successor fence):
+	 * the retire key is the credential. Never throws; bounded at the small-reply deadline.
+	 */
+	retireDevice(vaultId: string, body: { readonly deviceId: string; readonly retireKey: string }): Promise<RetireOutcome>;
+	/**
+	 * `POST /vault/:id/auth/device/status {deviceIds}` with this device's bearer: the server's state of each id (the
+	 * abandoned-creator rule, DESIGN §i.5). null: no usable answer. Never throws.
+	 */
+	deviceStatus(vaultId: string, deviceIds: readonly string[]): Promise<ReadonlyMap<string, DeviceState> | null>;
+	/**
+	 * `GET /vault/:id/auth/grant` with this device's bearer (identity-per-store §3.4): the pairing grant's secret after a
+	 * rotation. Never throws; bounded at the small-reply deadline.
+	 */
+	fetchGrant(vaultId: string): Promise<GrantFetchOutcome>;
 	/** POST /vault/:id/auth/ticket {purpose:"streams"}. Never throws; "unavailable" once `signal` aborts (connect's deadline). */
 	ticket(vaultId: string, signal?: AbortSignal): Promise<TicketResult>;
 	feed(vaultId: string, afterSeq: number, limit: number | null, signal?: AbortSignal): Promise<FeedPage>;
@@ -171,7 +193,8 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	const doFetch: typeof fetch = opts.fetch ?? ((input, init) => fetch(input, init));
 	const clock = opts.clock ?? createWebClock();
 	const now = (): number => clock.now();
-	const auth = `Bearer ${opts.credential}`;
+	const cred = opts.credential;
+	const bearer = (): string => `Bearer ${typeof cred === "function" ? cred() : cred}`;
 
 	const vaultPath = (vaultId: string, rest: string): string => `${base}/vault/${encodeURIComponent(vaultId)}${rest}`;
 
@@ -213,9 +236,9 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	 * on every body chunk.
 	 */
 	async function call(
-		url: string, init: { method: string; body?: BodyInit; contentType?: string; binary?: true }, signal?: AbortSignal, progress: () => void = () => undefined,
+		url: string, init: { method: string; body?: BodyInit; contentType?: string; binary?: true; authorization?: string }, signal?: AbortSignal, progress: () => void = () => undefined,
 	): Promise<HttpReply | null> {
-		const headers: Record<string, string> = { Authorization: auth };
+		const headers: Record<string, string> = { Authorization: init.authorization ?? bearer() };
 		if (init.contentType) headers["Content-Type"] = init.contentType;
 		let res: Response;
 		try {
@@ -275,6 +298,39 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	}
 
 	return {
+		async registerDevice(vaultId, grantSecret, body) {
+			const reply = await bounded("auth/device", RELAY_REPLY_BYTES, undefined, (s) => call(vaultPath(vaultId, "/auth/device"), {
+				method: "POST",
+				body: JSON.stringify({ deviceId: body.deviceId, deviceToken: body.deviceToken, retireKeyHash: body.retireKeyHash }),
+				contentType: "application/json",
+				authorization: `Grant ${grantSecret}`,
+			}, s)).catch(() => null);
+			return registerOutcome(reply);
+		},
+
+		async retireDevice(vaultId, body) {
+			const reply = await bounded("auth/device/retire", RELAY_REPLY_BYTES, undefined, (s) => call(vaultPath(vaultId, "/auth/device/retire"), {
+				method: "POST",
+				body: JSON.stringify({ deviceId: body.deviceId, retireKey: body.retireKey }),
+				contentType: "application/json",
+			}, s)).catch(() => null);
+			return retireOutcome(reply);
+		},
+
+		async deviceStatus(vaultId, deviceIds) {
+			const reply = await bounded("auth/device/status", RELAY_REPLY_BYTES, undefined, (s) => call(vaultPath(vaultId, "/auth/device/status"), {
+				method: "POST",
+				body: JSON.stringify({ deviceIds }),
+				contentType: "application/json",
+			}, s)).catch(() => null);
+			return deviceStatusOf(reply);
+		},
+
+		async fetchGrant(vaultId) {
+			const reply = await bounded("auth/grant", RELAY_REPLY_BYTES, undefined, (s) => call(vaultPath(vaultId, "/auth/grant"), { method: "GET" }, s)).catch(() => null);
+			return grantFetchOutcome(reply);
+		},
+
 		async ticket(vaultId, signal) {
 			const reply = await call(vaultPath(vaultId, "/auth/ticket"), {
 				method: "POST",
@@ -382,4 +438,55 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			throw fail("checkpoint", reply);
 		},
 	};
+}
+
+/** A retire-by-key reply as the engine reads it (relay-wire §2.4.1); null = no reply. */
+export function retireOutcome(reply: { readonly status: number; readonly body: Json | null } | null): RetireOutcome {
+	if (reply === null) return { ok: false, reason: "network" };
+	if (reply.status === 200) return { ok: true, retired: reply.body !== null && reply.body["retired"] === true };
+	if (reply.status === 401) return { ok: false, reason: "unauthorized" };
+	if (reply.status === 429 || reply.status === 503) return { ok: false, reason: "rate-limited" };
+	return { ok: false, reason: "network" };
+}
+
+/** A grant fetch reply (`{grantId, grantName, grantSecret}`) as the engine reads it; null = no reply. */
+export function grantFetchOutcome(reply: { readonly status: number; readonly body: Json | null } | null): GrantFetchOutcome {
+	if (reply === null) return { ok: false, reason: "network" };
+	const secret = reply.body?.["grantSecret"];
+	if (reply.status === 200) return typeof secret === "string" && GRANT_SECRET_SHAPE.test(secret) ? { ok: true, grantSecret: secret } : { ok: false, reason: "network" };
+	if (reply.status === 404) return { ok: false, reason: "unavailable" };
+	if (reply.status === 401 || reply.status === 403) return { ok: false, reason: "refused" };
+	return { ok: false, reason: "network" };
+}
+
+/** A grant secret's shape (server pairing.ts GRANT_SECRET_PATTERN): base64url, 43 to 256 characters. */
+const GRANT_SECRET_SHAPE = /^[A-Za-z0-9_-]{43,256}$/;
+
+/** A device status reply (`{devices: [{deviceId, state}]}`); null for anything else. */
+export function deviceStatusOf(reply: { readonly status: number; readonly body: Json | null } | null): ReadonlyMap<string, DeviceState> | null {
+	if (reply === null || reply.status !== 200 || reply.body === null) return null;
+	const list = reply.body["devices"];
+	if (!Array.isArray(list)) return null;
+	const out = new Map<string, DeviceState>();
+	for (const d of list) {
+		if (!isRecord(d) || typeof d["deviceId"] !== "string") continue;
+		const st = d["state"];
+		if (st === "live" || st === "retired" || st === "unknown") out.set(d["deviceId"], st);
+	}
+	return out;
+}
+
+/** A register reply as the engine reads it (relay-wire §2.4.1 errors); null = no reply (network, deadline). */
+export function registerOutcome(reply: { readonly status: number; readonly code: string | null; readonly retryAfterMs: number | null } | null): RegisterOutcome {
+	if (reply === null) return { ok: false, reason: "network", retryAfterMs: null };
+	const { status, code, retryAfterMs } = reply;
+	if (status === 200) return { ok: true };
+	if (status === 401) return { ok: false, reason: code === "grant_revoked" ? "grant-revoked" : "unauthorized", retryAfterMs: null };
+	if (status === 403 && code === "grant_required") return { ok: false, reason: "grant-required", retryAfterMs: null };
+	if (status === 409 && code === "device_exists") return { ok: false, reason: "device-exists", retryAfterMs: null };
+	if (status === 409 && code === "device_retired") return { ok: false, reason: "device-retired", retryAfterMs: null };
+	if (status === 409 && code === "device_limit") return { ok: false, reason: "device-limit", retryAfterMs: null };
+	if (status === 429 && code === "registration_limit") return { ok: false, reason: "registration-limit", retryAfterMs };
+	if (status === 429 || (status === 503 && code !== null && code !== "server_error")) return { ok: false, reason: "rate-limited", retryAfterMs };
+	return { ok: false, reason: "network", retryAfterMs };
 }

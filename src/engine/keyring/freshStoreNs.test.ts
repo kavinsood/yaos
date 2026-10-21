@@ -5,6 +5,9 @@
  * allocation took R = 0 (e2ee-design §8.2), so the onboarding create reused a frameNo <= R - 64 and folded as
  * ignored/replay-stale. Its receipt took it out of the outbox, its docs never entered the fold, and the body
  * frames held on it (DESIGN §e.1) waited forever.
+ *
+ * Since a deviceId serves one store (identity-per-store §1.3) a lost store's frames can no longer outnumber a new
+ * store's; the first test keeps the held-frame rule for any create the fold ignores, forging such a frame.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -50,14 +53,13 @@ describe("fresh store, ns not read yet (suite 1)", () => {
 		const a = await start(relay, "dev-a", pin);
 		try {
 			await live(a);
-			a.engine.c.ns.wallMs = () => 0; // the skip's NS_DEDUPE_RING part only (no wall-clock floor, e2ee-design §8.2)
 			relay.pauseCommits();
 			const d = await createDoc(a.engine, "three.md" as VaultPath, "body");
 			const stream = docStream("markdown", d)!;
 			const create = a.engine.c.outbox.ofStream(NS_STREAM)[0]!;
-			assert.equal(create.frameNo, NS_DEDUPE_RING + 1, "R = 0: the vault has no ns frame of dev-a yet");
+			assert.equal(create.frameNo, 1, "a fresh store's first frameNo (e2ee-design §8.2)");
 			assert.equal(a.engine.c.outbox.ofStream(stream)[0]?.state, "held");
-			// A frame of dev-a's lost timeline lands first, far above: the create folds as replay-stale.
+			// A forged frame of dev-a lands first, far above: the create folds as replay-stale.
 			relay.forge([await lostTimelineFrame((create.frameNo ?? 0) + NS_DEDUPE_RING)]);
 			relay.resumeCommits();
 			await until(() => !a.engine.c.outbox.has(create.clientFrameId), 5_000, "create receipted");

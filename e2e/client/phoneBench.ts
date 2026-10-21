@@ -1,12 +1,13 @@
 /**
  * Phone bootstrap bench: one Android phone over adb, against the vault a bootBench run seeded (same relay, same
  * shape), so the phone's numbers sit next to bootBench's fresh Node devices. Per run, on the phone's bench vault
- * folder: stop Obsidian, revoke the previous run's device, wipe the folder (everything but .obsidian, plus the
+ * folder: stop Obsidian, revoke the previous run's pairing, wipe the folder (everything but .obsidian, plus the
  * plugin's data.json), push the current build, reopen Obsidian on the vault, mint a pairing code and open the setup
  * link, then press its Pair button over DevTools (a tap on the phone if that fails). The only manual step is
- * unlocking the phone if it is locked: the bench wakes the screen and keeps it on while on USB until it exits. Timed on the laptop, by polling the folder over adb: Pair (data.json
- * holds an identity) -> first file -> every seeded file. A new pairing is a new device id and the store is per device
- * (store/schema.ts: yaos2:<vault>:<epoch>:<device>), so every run bootstraps from an empty IndexedDB.
+ * unlocking the phone if it is locked: the bench wakes the screen and keeps it on while on USB until it exits. Timed
+ * on the laptop, by polling the folder over adb: Pair (data.json holds an identity) -> first file -> every seeded
+ * file. A new pairing is a new grant and a new store (identity-per-store; a device id per store before it), so every
+ * run bootstraps from an empty IndexedDB.
  *
  * One-time on the phone: USB debugging on, an empty Obsidian vault named --vault, community plugins on. The first
  * run refuses a folder holding anything outside .obsidian, then marks it (.obsidian/plugins/yaos/.bench) as wipeable.
@@ -68,15 +69,30 @@ const shOk = (cmd: string) => sh(`${cmd} >/dev/null 2>&1 && echo y || echo n`) =
 const countFiles = () => Number(sh(`find ${q(DIR)} -type f ! -path ${q(`${DIR}/.obsidian/*`)} | wc -l`)) || 0;
 
 /** The plugin's data.json identity, parsed here; the token never leaves this function's caller. */
-function phoneIdentity(): { deviceId: string } | null {
+/**
+ * The identity the pair flow stored in data.json: a pairing grant (identity-per-store, current client) or an enrolled
+ * device (builds before it, so an older build can still be benched). SECRET: grantSecret; never logged.
+ */
+type PhoneIdentity = { readonly t: "grant"; readonly host: string; readonly vaultId: string; readonly grantSecret: string } | { readonly t: "device"; readonly deviceId: string };
+
+function phoneIdentity(): PhoneIdentity | null {
 	const text = sh(`cat ${q(`${PLUGIN_DIR}/data.json`)} 2>/dev/null`);
 	if (!text) return null;
 	try {
-		const id = (JSON.parse(text) as { identity?: { deviceId?: unknown; vaultId?: unknown } | null }).identity;
-		return id && typeof id.deviceId === "string" ? { deviceId: id.deviceId } : null;
+		const id = (JSON.parse(text) as { identity?: Record<string, unknown> | null }).identity;
+		if (!id) return null;
+		if (typeof id.grantSecret === "string" && typeof id.host === "string" && typeof id.vaultId === "string") return { t: "grant", host: id.host, vaultId: id.vaultId, grantSecret: id.grantSecret };
+		return typeof id.deviceId === "string" ? { t: "device", deviceId: id.deviceId } : null;
 	} catch {
 		return null; // mid-write
 	}
+}
+
+/** Revokes a run's pairing on the server: a grant leaves with its own secret (pairing.ts leaveGrant), a device is revoked by the owner. */
+async function revokeIdentity(vault: OnboardedVault, id: PhoneIdentity): Promise<void> {
+	if (id.t === "device") return revokeDevice(vault, id.deviceId);
+	const res = await fetch(`${id.host.replace(/\/+$/, "")}/vault/${encodeURIComponent(id.vaultId)}/auth/grant`, { method: "DELETE", headers: { Authorization: `Grant ${id.grantSecret}` } });
+	if (res.status !== 200 && res.status !== 401) throw new Error(`grant leave failed ${res.status}`);
 }
 
 function deviceInfo(): Record<string, string> {
@@ -141,7 +157,7 @@ async function laptopRtt(): Promise<{ capabilitiesMs: number; cfRay: string | nu
 async function reset(vault: OnboardedVault): Promise<void> {
 	sh(`am force-stop ${PKG}`);
 	const prev = phoneIdentity();
-	if (prev) await revokeDevice(vault, prev.deviceId).catch((e: unknown) => console.log(`revoke of the previous device failed: ${String(e)}`));
+	if (prev) await revokeIdentity(vault, prev).catch((e: unknown) => console.log(`revoke of the previous pairing failed: ${String(e)}`));
 	sh(`cd ${q(DIR)} && find . -mindepth 1 -maxdepth 1 ! -name .obsidian -exec rm -rf {} + ; rm -f ${q(`${PLUGIN_DIR}/data.json`)}`);
 	if (countFiles() !== 0) throw new Error(`${DIR} still holds files after the wipe`);
 }
@@ -331,7 +347,7 @@ try {
 	}
 	sh(`am force-stop ${PKG}`);
 	const last = phoneIdentity();
-	if (last) await revokeDevice(vault, last.deviceId).catch((e: unknown) => console.log(`final revoke failed: ${String(e)}`));
+	if (last) await revokeIdentity(vault, last).catch((e: unknown) => console.log(`final revoke failed: ${String(e)}`));
 
 	const ms = runs.map((r) => r.filesMs).filter((v): v is number => v !== null);
 	console.log(`\nphone, files on disk (ms): ${ms.join(" / ") || "-"}`);

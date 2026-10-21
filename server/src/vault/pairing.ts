@@ -41,11 +41,31 @@ export function uniqueDeviceName(desired: string, existing: ReadonlySet<string>)
 
 /**
  * Identity-per-store §3.3 limits, per pairing grant (owner decision 4, 2026-10-21): at most 20 registrations a UTC day
- * and 50 live devices. Inactivity retirement (90 days) is phase 5; phase 1 only records `last_seen_day`.
+ * and 50 live devices.
  */
 export const GRANT_REGISTRATIONS_PER_DAY = 20;
 export const GRANT_LIVE_DEVICE_LIMIT = 50;
 export const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Identity-per-store §6.2 inactivity retirement (owner decision 4; phase 5): a device whose `last_seen_day` is more
+ * than this many UTC days before today is retired (D7 + tombstone) by the lazy sweep (host.ts retireInactive).
+ * `YAOS_INACTIVITY_RETIRE_DAYS` overrides it (readInactivityRetireDays).
+ */
+export const INACTIVITY_RETIRE_DAYS = 90;
+const MIN_INACTIVITY_RETIRE_DAYS = 1;
+const MAX_INACTIVITY_RETIRE_DAYS = 3650;
+/** At most this many devices are retired by one sweep (2 rows each, one transaction); the next trigger goes on. */
+export const INACTIVITY_RETIRE_BATCH = 50;
+
+/** `YAOS_INACTIVITY_RETIRE_DAYS`: unset, empty or non-numeric → 90; else clamped to [1, 3650] whole days. */
+export function readInactivityRetireDays(raw: string | undefined): number {
+	if (!raw) return INACTIVITY_RETIRE_DAYS;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed)
+		? Math.min(MAX_INACTIVITY_RETIRE_DAYS, Math.max(MIN_INACTIVITY_RETIRE_DAYS, Math.floor(parsed)))
+		: INACTIVITY_RETIRE_DAYS;
+}
 
 /** The UTC day number of `ms` (the `last_seen_day` and registration-counter unit). */
 export function utcDay(ms: number): number {
@@ -143,6 +163,21 @@ export function parseRegisterRequest(body: unknown): RegisterRequest | null {
 }
 
 /** The retire-by-key body; null when malformed (`400 invalid_request`). The key has a device token's format. */
+/** `POST /auth/device/status`: at most this many ids per request. */
+export const DEVICE_STATUS_MAX_IDS = 32;
+
+/** `POST /auth/device/status {deviceIds}`: 1..32 distinct well-formed ids, or null. */
+export function parseDeviceStatusRequest(body: unknown): string[] | null {
+	const { deviceIds } = asRecord(body);
+	if (!Array.isArray(deviceIds) || deviceIds.length === 0 || deviceIds.length > DEVICE_STATUS_MAX_IDS) return null;
+	const out: string[] = [];
+	for (const id of deviceIds) {
+		if (typeof id !== "string" || !REQUEST_ID_PATTERN.test(id)) return null;
+		if (!out.includes(id)) out.push(id);
+	}
+	return out;
+}
+
 export function parseRetireRequest(body: unknown): RetireRequest | null {
 	const { deviceId, retireKey } = asRecord(body);
 	if (typeof deviceId !== "string" || !REQUEST_ID_PATTERN.test(deviceId)

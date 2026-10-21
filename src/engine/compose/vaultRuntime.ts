@@ -21,7 +21,7 @@ import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
 import type { TimerHandle } from "../../ports/clock";
 import type { StorageDb } from "../../ports/storage";
-import type { VaultEvent, VaultStat } from "../../ports/vault";
+import type { SideFileName, VaultEvent, VaultStat } from "../../ports/vault";
 import type { EngineInitConfig, EngineResultValue, EngineSettings, LocalObservation, UserCommand } from "../../protocol/messages";
 import type { DiagnosticsEvent, StatusSnapshot } from "../../protocol/status";
 import type { LifecycleEvent } from "../../ports/platform";
@@ -32,7 +32,6 @@ import type { ReconcileSettings } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
 import { LogEngine } from "../runtime/engine";
 import type { EngineTuning } from "../runtime/options";
-import type { FrameNoFloor } from "../store/repo";
 import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
 import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
 import { listLocal, partName } from "../snapshots/localStore";
@@ -47,12 +46,17 @@ import type { EngineE2ee } from "../keyring/keyringRuntime";
 import { localDay, LocalDayCounter } from "./localDayCounter";
 import { EpochBases } from "./epochBases";
 import { ComposedLog } from "./logPort";
+import { CreatorStatus } from "./creatorStatus";
 import { PassScheduler } from "./passScheduler";
 import { mergeStatus, type DiskSideStatus } from "./statusMerge";
 import { importSyncedMirror, SyncedMirrorWriter } from "./syncedMirror";
+import { dropPending, type ResolvedIdentity } from "./storeIdentity";
 import * as ops from "./runtimeOps";
 
-export type RestartReason = "retry" | "epoch" | "storage-lost" | "rebuild" | "settings" | "blob-store";
+/** A store's mirror files (DESIGN §e.4). */
+const MIRROR_FILES: readonly SideFileName[] = ["outbox-a.bin", "outbox-b.bin", "synced-a.bin", "synced-b.bin"];
+
+export type RestartReason = "retry" | "epoch" | "storage-lost" | "rebuild" | "settings" | "blob-store" | "revoked";
 
 /** What a runtime needs from the protocol engine that owns it. */
 export interface RuntimeOwner {
@@ -63,13 +67,22 @@ export interface RuntimeOwner {
 	readonly boundDisk: Pick<BoundDisk, "checkSaved" | "pendingConflictCopies">;
 	onEpochChanged(epoch: VaultEpoch | null): void;
 	onStorageLost(): void;
+	/** The server refused this store (phase revoked: retired or removed): replace it if the grant still holds. */
+	onStoreRevoked(): void;
 	/** Started without a blob store, and a later connect found one (EngineOptions.onBlobStore): restart on it. */
 	onBlobStore(store: BlobPort): void;
+	/**
+	 * The first runtime of an init that asks gets true: it also removes lineage dirs when its store did not inherit
+	 * (dirs a crash left behind before the store that inherited from them wrote its mirrors). Absent: never.
+	 */
+	claimLineageSweep?(): boolean;
 }
 
 export interface VaultRuntimeStart {
 	readonly engine: RuntimeOwner;
 	readonly config: EngineInitConfig;
+	/** The store this runtime runs on (identity-per-store §4): `self`, and the secrets a fresh DB records. */
+	readonly identity: ResolvedIdentity;
 	readonly settings: EngineSettings;
 	readonly ports: EnginePorts;
 	readonly carrier: "worker" | "inline";
@@ -89,8 +102,6 @@ export interface VaultRuntimeStart {
 	readonly pathBases?: readonly MetaPathBase[] | null;
 	/** The old epoch's docs' deletes by docId (§c.12 "Deletes"), stored in the new DB (epochBases.ts). */
 	readonly docDeletes?: readonly MetaDocDeletes[] | null;
-	/** Highest own ns / cfg frameNo of the old epoch (§c.12 step 3, e2ee-design §8.2). */
-	readonly frameNoFloor?: FrameNoFloor | null;
 }
 
 /** Observational test hook: called after the engine acted; it must not change anything (production: absent). */
@@ -142,12 +153,24 @@ export class VaultRuntime {
 	private cfgRunning: Promise<void> | null = null;
 	private cfgAgain = false;
 	private readonly offs: (() => void)[] = [];
+	/** Retired creators of body-less docs (DESIGN §i.5 "Abandoned creates"). */
+	readonly creators: CreatorStatus;
 	readonly stats = { passes: 0, ownFoldEvents: 0, retargets: 0, bindable: 0, cfgPasses: 0, snapshots: 0, bodyChanges: 0 };
 
 	private constructor(readonly o: VaultRuntimeStart, readonly log: LogEngine) {
 		this.settings = o.settings;
 		this.paused = o.paused;
-		this.port = new ComposedLog(log, () => this.checkBindable());
+		const status = o.ports.identity?.status?.bind(o.ports.identity) ?? null;
+		this.creators = new CreatorStatus({
+			status, mono: () => log.c.mono(), setTimer: (ms, fn) => o.ports.clock.setTimer(ms, fn), clearTimer: (h) => o.ports.clock.clearTimer(h),
+			graceMs: log.c.tuning.abandonedCreateGraceMs, recheckMs: log.c.tuning.creatorStatusRecheckMs, recheckMaxMs: log.c.tuning.creatorStatusRecheckMaxMs,
+			onAbandoned: () => {
+				this.port.invalidate();
+				this.sched.request({ t: "full" });
+			},
+			diag: (line) => this.diag(line),
+		});
+		this.port = new ComposedLog(log, () => this.checkBindable(), this.creators);
 		const b = log.c.budgets;
 		this.sched = new PassScheduler({
 			clock: o.ports.clock,
@@ -176,8 +199,17 @@ export class VaultRuntime {
 		const holder: { rt: VaultRuntime | null } = { rt: null };
 		const { engine, config } = o;
 		const log = await LogEngine.start({
-			ports: o.ports, vaultId: config.vaultId, deviceId: config.deviceId, deviceClass: config.deviceClass,
-			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, frameNoFloor: o.frameNoFloor ?? null, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null,
+			ports: o.ports, vaultId: config.vaultId, deviceId: o.identity.creds.deviceId, deviceClass: config.deviceClass,
+			store: {
+				installKey: config.installKey, deviceToken: o.identity.creds.deviceToken, retireKey: o.identity.creds.retireKey,
+				// A pending identity is consumed right before its store is created (storeIdentity.ts).
+				...(o.identity.source === "pending" ? { beforeCreate: () => dropPending(o.ports.storage, config.vaultId, config.installKey) } : {}),
+			},
+			...(o.identity.lineage ? { lineage: o.identity.lineage } : {}),
+			inherit: o.identity.inherit ?? null,
+			supersedes: o.identity.supersedes ?? null,
+			lineageSideFiles: (deviceId) => engine.link.sideFilesOf(deviceId),
+			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,
 			onBoundText: (docId, changes, length, origin) => engine.bound.onText(docId, changes, length, origin),
 			onFrameTaken: (docId) => engine.bound.frameTaken(docId),
@@ -244,7 +276,7 @@ export class VaultRuntime {
 		const link = this.engine.link;
 		const c = log.c;
 		const db = this.db;
-		const identity = { vaultId: config.vaultId, vaultEpoch: this.vaultEpoch, deviceId: config.deviceId };
+		const identity = { vaultId: config.vaultId, vaultEpoch: this.vaultEpoch, deviceId: o.identity.creds.deviceId };
 		const imported = await importSyncedMirror({ db, side: link.sideFiles, hash: ports.hash, identity, pathKey, nowMs: ports.clock.now() });
 		this.recovered = imported > 0 || c.noticeList().some((n) => n.code === "recovered-from-mirror");
 		this.idbSnapshotDue = this.recovered || o.reason === "storage-lost";
@@ -290,6 +322,7 @@ export class VaultRuntime {
 			entries: () => this.rec.ctx.store.synced.values(), nsCoversSeq: () => c.ns.coversSeq,
 			onError: (e) => this.diag(`synced mirror write failed: ${String(e)}`),
 			before: () => c.mirror.flushed(),
+			onWritten: () => void this.dropLineageDirs(),
 		});
 		this.offs.push(c.repo.db.onLost((failure) => {
 			if (this.stopped) return;
@@ -298,6 +331,40 @@ export class VaultRuntime {
 		}));
 		if (this.lastLog?.phase === "live" || this.lastLog?.phase === "upgrade-required") this.onLogStatus(this.lastLog);
 		this.sched.request({ t: "full" });
+	}
+
+	/**
+	 * identity-per-store §5.2 step 7: once this store's outbox and synced mirrors are on disk they replace its lineage
+	 * predecessors' (recovery reads the newest dir with a mirror, and this store's mirror holds whatever it inherited),
+	 * so their dirs go: the mirror files and the local snapshots (copied into this store's dir at recovery). Only this
+	 * install's earlier stores (the lineage), never a foreign dir. Once, in the runtime of a store this start created
+	 * with a lineage; and once per init in any runtime (claimLineageSweep, phase 5's orphan sweep): a dir a crash left
+	 * behind after the import but before this store's first mirror write. Safe then too: a running store has finished
+	 * any import it was created with (LogEngine.start runs it, and MetaIdentity.inherit is cleared in the import's
+	 * transaction), and its own mirrors, just written, hold everything it inherited. Best effort.
+	 */
+	private lineageDropped = false;
+	private async dropLineageDirs(): Promise<void> {
+		if (this.lineageDropped || this.stopped) return;
+		const sweep = this.o.identity.inherit ? true : this.engine.claimLineageSweep?.() ?? false;
+		const lineage = sweep ? [...(this.o.identity.lineage ?? [])] : [];
+		if (lineage.length === 0) return;
+		this.lineageDropped = true;
+		const link = this.engine.link;
+		let n = 0;
+		for (const dir of lineage) {
+			try {
+				const side = link.sideFilesOf(dir);
+				const names: SideFileName[] = [...MIRROR_FILES, ...(await side.list("snapshots/"))];
+				for (const name of names) {
+					await side.remove(name);
+					n++;
+				}
+			} catch (e) {
+				this.diag(`lineage dir ${dir.slice(0, 8)}: ${String(e)}`);
+			}
+		}
+		if (n > 0) this.diag(`lineage dirs: removed ${n} file(s)`);
 	}
 
 	/**
@@ -347,7 +414,7 @@ export class VaultRuntime {
 		this.port.invalidate();
 		const c = this.log.c;
 		const bound = this.engine.bound;
-		const fx = foldEffects({ frames, self: this.o.config.deviceId, committed: (d) => c.ns.state.entries.get(d), isBound: (d) => bound.isBound(d), pathKey });
+		const fx = foldEffects({ frames, self: this.o.identity.creds.deviceId, committed: (d) => c.ns.state.entries.get(d), isBound: (d) => bound.isBound(d), pathKey });
 		if (fx.own.length > 0) {
 			this.ownQueue.push(...fx.own);
 			this.stats.ownFoldEvents += fx.own.length;
@@ -418,13 +485,19 @@ export class VaultRuntime {
 		// key-missing go out at once.
 		if (was === "key-missing" && s.phase !== "key-missing" && this.rec) this.sched.request({ t: "full" }, true);
 		if (s.relay.connected && !wasConnected) this.networkBack();
+		if (s.phase === "revoked" && was !== "revoked") this.engine.onStoreRevoked();
 		// upgrade-required with a session: a fold is halted for a newer writer (§c.10) and the session caught up;
-		// the planner's nsReady and the cfg / snap readiness still see that fold's halt.
-		if ((s.phase === "live" || (s.phase === "upgrade-required" && s.relay.connected)) && !this.port.nsCaughtUp && this.rec) {
+		// the planner's nsReady and the cfg / snap readiness still see that fold's halt. daily-limit with a session: the
+		// session caught up under the relay's daily hold (the engine never leaves catching-up for it before the start
+		// reads end); local edits keep filling the outbox (DESIGN §i.6), so the planner runs as when live. Without
+		// it a store that catches up during the hold plans nothing until it lifts (soak 1622834076 run 157).
+		const caughtUp = s.phase === "live" || ((s.phase === "upgrade-required" || s.phase === "daily-limit") && s.relay.connected);
+		if (caughtUp && !this.port.nsCaughtUp && this.rec) {
 			this.port.nsCaughtUp = true;
 			this.port.invalidate();
 			this.sched.request({ t: "full" });
-			void ops.retireOldEpochs(this);
+			// Once per runtime, in order: this install's other-epoch stores, then the orphan stores of lost install keys.
+			void ops.retireOldEpochs(this).then(() => ops.sweepOrphanStores(this));
 		}
 		if (s.phase === "epoch-migrating" && !this.migrating) {
 			this.migrating = true;
@@ -717,6 +790,7 @@ export class VaultRuntime {
 		if (this.stopped) return;
 		this.stopped = true;
 		this.clearHiddenTimer();
+		this.creators.stop();
 		if (crash) this.log.disconnect();
 		this.sched.stop();
 		// Transfers end at once (aborted; no pass job awaits one); the pass in flight starts no further job.

@@ -118,6 +118,11 @@ export interface GrantRecord {
 	/** The per-grant daily registration counter (§3.3): the UTC day it counts and the count on that day. */
 	registeredDay: number;
 	registeredCount: number;
+	/**
+	 * hex(IV || AES-GCM(secret)) of a secret a rotation minted (§3.4, grantWrap.ts): a live device of the grant fetches
+	 * it. null: never rotated (the server holds only the hash of the secret the client minted, G56).
+	 */
+	secretWrap: string | null;
 }
 
 type GrantRow = {
@@ -129,18 +134,22 @@ type GrantRow = {
 	revoked_at: number | null;
 	registered_day: number;
 	registered_count: number;
+	secret_wrap: ArrayBuffer | null;
 };
 
 export class GrantMap {
 	private readonly byGrantId = new Map<string, GrantRecord>();
 	private readonly bySecret = new Map<string, GrantRecord>();
 
-	/** One scan of `pairing_grant` (G rows read). Throws "no such table" on a v1 vault (schema.ts migrates it). */
+	/**
+	 * One scan of `pairing_grant` (G rows read). Throws "no such table" on a v1 vault and "no such column: secret_wrap"
+	 * on a v2 vault (schema.ts migrates both).
+	 */
 	static load(storage: StoragePort): GrantMap {
 		const map = new GrantMap();
 		const rows = storage.sql.exec<GrantRow>(
 			"SELECT grant_id, secret_hash, grant_name, enrollment_request_id, created_at, revoked_at, registered_day,"
-				+ " registered_count FROM pairing_grant",
+				+ " registered_count, secret_wrap FROM pairing_grant",
 		);
 		for (const row of rows) {
 			map.add({
@@ -152,6 +161,7 @@ export class GrantMap {
 				revokedAt: row.revoked_at,
 				registeredDay: row.registered_day,
 				registeredCount: row.registered_count,
+				secretWrap: row.secret_wrap ? bytesToHex(new Uint8Array(row.secret_wrap)) : null,
 			});
 		}
 		return map;
@@ -172,6 +182,14 @@ export class GrantMap {
 	add(record: GrantRecord): void {
 		this.byGrantId.set(record.grantId, record);
 		this.bySecret.set(record.secretHash, record);
+	}
+
+	/** Mirrors a rotation's UPDATE (§3.4): the old secret stops naming the grant at once. */
+	rekey(record: GrantRecord, secretHash: string, secretWrap: string): void {
+		this.bySecret.delete(record.secretHash);
+		record.secretHash = secretHash;
+		record.secretWrap = secretWrap;
+		this.bySecret.set(secretHash, record);
 	}
 }
 

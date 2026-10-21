@@ -10,7 +10,7 @@ import { ConfigHost, CONFIG_SCHEMA } from "../../server/src/config/host";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
 import { encodeAppendFrame } from "../../server/src/streams/protocol";
 import { OWNER_CAPABILITY_DIGEST } from "../../server/src/vault/host";
-import { IDENTITY_V2_MIGRATION, VAULT_IDENTITY_SCHEMA } from "../../server/src/vault/schema";
+import { IDENTITY_V2_MIGRATION, IDENTITY_V3_MIGRATION, VAULT_IDENTITY_SCHEMA } from "../../server/src/vault/schema";
 import { STREAM_SCHEMA } from "../../server/src/streams/store";
 import { sha256Hex } from "../../server/src/hex";
 import { suite } from "../harness.ts";
@@ -83,7 +83,9 @@ const VAULT_TABLES = {
 		"expires_at INTEGER NOT NULL", "used_at INTEGER", "used_request_id TEXT", "used_device_id TEXT", "used_grant_id TEXT"] },
 	pairing_grant: { withoutRowid: true, columns: ["grant_id TEXT NOT NULL PK1", "secret_hash BLOB NOT NULL",
 		"grant_name TEXT NOT NULL", "enrollment_request_id TEXT NOT NULL", "created_at INTEGER NOT NULL", "revoked_at INTEGER",
-		"registered_day INTEGER NOT NULL", "registered_count INTEGER NOT NULL"] },
+		"registered_day INTEGER NOT NULL", "registered_count INTEGER NOT NULL",
+		// Identity v3 (identity-per-store §3.4, phase 5).
+		"secret_wrap BLOB"] },
 	retired_device: { withoutRowid: true, columns: ["device_id TEXT NOT NULL PK1", "grant_id TEXT", "retired_at INTEGER NOT NULL"] },
 };
 
@@ -206,8 +208,9 @@ s.test("G54: a vault initialized before identity v2 migrates once, at its first 
 		object.model.reset();
 		object.statements.length = 0;
 		assert.equal((await feed(object, bearer(owner))).status, 200, "the v1 device authenticates after the migration");
-		assert.deepEqual(schemaOf(object.storage), VAULT_TABLES, "migrated == a fresh v2 init");
-		assert.equal(object.statements.filter((sql) => /^\s*(ALTER|CREATE)\b/i.test(sql)).length, IDENTITY_V2_MIGRATION.length);
+		assert.deepEqual(schemaOf(object.storage), VAULT_TABLES, "migrated == a fresh v3 init");
+		assert.equal(object.statements.filter((sql) => /^\s*(ALTER|CREATE)\b/i.test(sql)).length,
+			IDENTITY_V2_MIGRATION.length + IDENTITY_V3_MIGRATION.length, "v2 and v3 together");
 		assert.equal(object.model.totals.cf, 0, "DDL only: no row written");
 		const device = object.host.load()!.devices.byId(owner.deviceId)!;
 		assert.deepEqual([device.grantId, device.retireHash, device.lastSeenDay], [null, null, null], "an old enroll");
@@ -239,7 +242,7 @@ s.test("§6.1: bearer auth reads meta 1 + devices N once per runtime, then 0 row
 			"SELECT vault_id, vault_generation, ticket_key, created_at, pending_restore_id, last_restore_id,"
 				+ " last_restore_at FROM vault_meta WHERE id = 1",
 			"SELECT grant_id, secret_hash, grant_name, enrollment_request_id, created_at, revoked_at, registered_day,"
-				+ " registered_count FROM pairing_grant",
+				+ " registered_count, secret_wrap FROM pairing_grant",
 			"SELECT token_hash, device_id, device_name, enrollment_request_id, enrolled_at, grant_id, retire_hash,"
 				+ " last_seen_day FROM device",
 		]);

@@ -56,8 +56,18 @@ export const IDENTITY_V2_MIGRATION = [
 	) WITHOUT ROWID`,
 ] as const;
 
-/** Every vault DO table, in creation order: init runs v1 and then the v2 migration, so every vault ends identical. */
-export const VAULT_SCHEMA = [STREAM_SCHEMA, VAULT_IDENTITY_SCHEMA, ...IDENTITY_V2_MIGRATION] as const;
+/**
+ * Identity v3 (identity-per-store §3.4, phase 5): `pairing_grant.secret_wrap`, the grant secret a rotation minted,
+ * AES-GCM-wrapped under a key derived from the vault's ticket key (grantWrap.ts), so a live device of the grant can
+ * fetch it (`GET /vault/:id/auth/grant`). NULL for a grant never rotated: the server keeps only the hash of a secret
+ * the client minted (G56).
+ */
+export const IDENTITY_V3_MIGRATION = [
+	"ALTER TABLE pairing_grant ADD COLUMN secret_wrap BLOB",
+] as const;
+
+/** Every vault DO table, in creation order: init runs v1 and then the migrations, so every vault ends identical. */
+export const VAULT_SCHEMA = [STREAM_SCHEMA, VAULT_IDENTITY_SCHEMA, ...IDENTITY_V2_MIGRATION, ...IDENTITY_V3_MIGRATION] as const;
 
 /**
  * DECISIONS-GAP (G54): identity v2 on a vault initialized before it. `VaultHost.load` reads `pairing_grant` first; "no
@@ -67,6 +77,17 @@ export const VAULT_SCHEMA = [STREAM_SCHEMA, VAULT_IDENTITY_SCHEMA, ...IDENTITY_V
  */
 export function migrateIdentityV2(storage: StoragePort): void {
 	storage.transactionSync(() => {
-		for (const ddl of IDENTITY_V2_MIGRATION) storage.sql.exec(ddl);
+		for (const ddl of [...IDENTITY_V2_MIGRATION, ...IDENTITY_V3_MIGRATION]) storage.sql.exec(ddl);
+	});
+}
+
+/**
+ * DECISIONS-GAP (G65): identity v3 on a vault migrated to v2 before it, the same way as G54: the grant scan names
+ * `secret_wrap`, "no such column" means a v2 vault, and this adds the column (one `ALTER`) before the scan runs again.
+ * Once per vault, at the first load of a runtime; a v1 vault gets v2 and v3 together (migrateIdentityV2).
+ */
+export function migrateIdentityV3(storage: StoragePort): void {
+	storage.transactionSync(() => {
+		for (const ddl of IDENTITY_V3_MIGRATION) storage.sql.exec(ddl);
 	});
 }

@@ -10,12 +10,13 @@ import {
 	type DeviceListing,
 	type FinishRestoreResult,
 	type GrantRevokeResult,
+	type GrantRotateResult,
 	type MintedCode,
 	type PrepareRestoreResult,
 	type RewindResult,
 	type VaultInitResult,
 } from "./host";
-import type { PairingPurpose } from "./pairing";
+import { readInactivityRetireDays, type PairingPurpose } from "./pairing";
 import { readTicketTtlMs } from "./ticket";
 
 export interface VaultEnv extends StreamsEnv {
@@ -23,6 +24,8 @@ export interface VaultEnv extends StreamsEnv {
 	YAOS_DEBUG_ROUTES?: string;
 	/** D4 ticket TTL in ms (default 300000, clamped to [1000, 86400000]). */
 	YAOS_TICKET_TTL_MS?: string;
+	/** Identity-per-store §6.2 inactivity retirement, in UTC days (default 90, clamped to [1, 3650]). */
+	YAOS_INACTIVITY_RETIRE_DAYS?: string;
 }
 
 export class VaultDO extends DurableObject<VaultEnv> {
@@ -39,6 +42,7 @@ export class VaultDO extends DurableObject<VaultEnv> {
 			upgrades: CLOUDFLARE_UPGRADE_REJECT,
 			relayConfig: readStreamRelayConfig(env),
 			ticketTtlMs: readTicketTtlMs(env.YAOS_TICKET_TTL_MS),
+			inactivityRetireDays: readInactivityRetireDays(env.YAOS_INACTIVITY_RETIRE_DAYS),
 			// D8b: Durable Object point-in-time recovery. Local workerd rejects getBookmarkForTime (→ 501).
 			pitr: {
 				getBookmarkForTime: (at) => ctx.storage.getBookmarkForTime(at),
@@ -85,6 +89,11 @@ export class VaultDO extends DurableObject<VaultEnv> {
 	 */
 	revokeGrant(grantId: string): GrantRevokeResult {
 		return this.host.revokeGrant(grantId);
+	}
+
+	/** RPC: identity-per-store §3.4 "Rotate secret": a new grant secret, the old one dead from this turn on. */
+	rotateGrant(grantId: string): Promise<GrantRotateResult> {
+		return this.host.rotateGrant(grantId);
 	}
 
 	/** RPC: D5 vault delete, this object's part (sockets 1001, then `deleteAll()`). */

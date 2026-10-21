@@ -12,8 +12,8 @@
  *   - remoteTextHash: streams.textHash of caught-up md/canvas docs
  *   - bodyAppliedSeq: streams.appliedSeq (nsDelete.baseBodySeq)
  *   - restoreDuty: docs whose restore condition + own duty hold (§c.7)
- *   - lostCreateBody: live docs this device created whose initial body never reached the relay
- *     and is no longer pending here (store lost)
+ *   - lostCreateBody: live docs whose initial body never reached the relay and never will: created by
+ *     this install's lineage and no longer pending here (store lost), or by a retired store (abandoned)
  *
  * Decisions (also in docs/client-remake/wp-b-notes.md):
  *   - createSize is not in RemoteEntry: "createSize = 0" is tested as
@@ -47,9 +47,13 @@
  *     are not counted (they are usually clean).
  *   - Identical-loser collapse nsDeletes are not counted as destructive.
  *   - A lost create body (own create, no rows, nothing pending, e.g. the store was wiped with its
- *     mirrors) is not waited on as "body-empty": nobody else can supply it. A file at the path is
- *     the content (reconcileContent; the empty CRDT is the base, so the disk text is pushed). With no
- *     file there the empty doc is deleted (braked like a local delete).
+ *     mirrors; or a retired creator's: DESIGN §i.5 "Abandoned creates") is not waited on as
+ *     "body-empty": its creator never supplies it. The empty doc is deleted (baseBodySeq 0). A file at
+ *     the path is kept and claimed; once the delete folds it is a new local file, created as a new doc
+ *     with its text (planNewLocal). Never a push into the empty doc: several devices may hold the file,
+ *     and their pushes would each insert the text. Two holders' re-creates race as concurrent creates
+ *     (identical texts merge, others take a suffix). With no file there the delete is braked like a
+ *     local delete; with one it deletes nothing of the user's.
  */
 
 import type {
@@ -443,6 +447,15 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		if (s.kind !== "blob") {
 			const body = r.body;
 			const Rc = body === null || !versionEq(body.version, s.bodyVersion);
+			// A lost create body (header) that this device holds a synced record for, with the file just what S says:
+			// the merge that would have pushed the text has nothing to do (an own create's file was edited back to
+			// S, e.g. a born-empty S and a file now empty, or a broken canvas save fixed to the empty canvas; or S
+			// came back from the mirror after its store was lost). No frame ever fills the doc, and every other device
+			// waits on "body-empty" for good. Drop the empty doc as when no S is here; the file is a new local file
+			// once the delete folds, created with what it holds. A path change moves the doc first.
+			if (!Lc && !Rc && !pathChanged && body?.caughtUp && !body.hasContent && r.createHash !== EMPTY_CONTENT_HASH && ctx.lostCreateBody.has(docId) && ctx.nsReady && !r.pendingLocal) {
+				return { ...none, ops: [{ op: "nsDelete", docId, baseBodySeq: 0 }, drop(docId)] };
+			}
 			if (!Lc && !Rc) return { ...none, ops: statMoved || pathChanged ? [putFull()] : [] };
 			if (body === null || !body.caughtUp) return { ...none, ops: [waitOp(docId, "body-not-caught-up"), ...putPath()] };
 			// The create's initial frames are still in flight: merging against the empty text would read it as a
@@ -824,8 +837,14 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 			], "conflict", brakeKey("conflict", docId, l.path, `${l.hash}|${rb.hash}`), l.path);
 		}
 		if (!r.body || !r.body.caughtUp) return push([waitOp(docId, "body-not-caught-up")]);
-		if (!r.body.hasContent && r.createHash !== EMPTY_CONTENT_HASH && !ctx.lostCreateBody.has(docId)) return push([waitOp(docId, "body-empty")]);
-		const rh = ctx.lostCreateBody.has(docId) ? EMPTY_CONTENT_HASH : remoteHash(r); // a lost create body merges as disk-only
+		if (!r.body.hasContent && r.createHash !== EMPTY_CONTENT_HASH) {
+			if (!ctx.lostCreateBody.has(docId)) return push([waitOp(docId, "body-empty")]);
+			// Lost create body with the file here (header): drop the empty doc; the file is a new create once it folds.
+			if (!ctx.nsReady) return;
+			if (r.pendingLocal) return push([waitOp(docId, "pending-ns")]);
+			return push([{ op: "nsDelete", docId, baseBodySeq: 0 }]);
+		}
+		const rh = remoteHash(r);
 		const certainConflict = rh !== null && rh !== l.hash && rh !== EMPTY_CONTENT_HASH;
 		push([{ op: "reconcileContent", docId, path: l.path, kind: r.kind as ContentKind, hasBase: false }],
 			certainConflict ? "conflict" : null, certainConflict ? brakeKey("conflict", docId, l.path, `${l.hash}|${rh}`) : "", l.path);

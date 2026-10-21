@@ -28,7 +28,7 @@ import { overlayPending, type NsOverlay, type PendingNsFrame } from "../../core/
 import { pathKey } from "../../core/paths/pathKey";
 import {
 	NS_STREAM, streamClass, streamDocId,
-	type ClientFrameId, type DeviceId, type DocId, type DocKind, type NsEntry, type NsFoldEvent, type NsFoldIndex, type NsFoldState, type NsOp, type Seq, type VaultPath,
+	type ClientFrameId, type DeviceId, type DocId, type DocKind, type NsEntry, type NsFoldEvent, type NsFoldIndex, type NsFoldState, type NsOp, type ReplayWindow, type Seq, type VaultPath,
 } from "../../core/types";
 import type { OutboxChange } from "../store/repo";
 import type { SnapshotRecord, TailRecord } from "../store/schema";
@@ -106,6 +106,14 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 		return this.state.recentFrames.get(this.self) ?? [];
 	}
 
+	protected windowOf(deviceId: DeviceId): ReplayWindow | undefined {
+		return this.state.replay.get(deviceId);
+	}
+
+	protected ringOf(deviceId: DeviceId): readonly ClientFrameId[] {
+		return this.state.recentFrames.get(deviceId) ?? [];
+	}
+
 	entry(docId: DocId): NsEntry | undefined {
 		return this.state.entries.get(docId);
 	}
@@ -157,8 +165,8 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 			}
 			const e = this.state.entries.get(docId);
 			if (!e) {
-				// Create not folded yet (or still stale): wait. Folded without the doc (the fold ignored the frame, e.g.
-				// replay-stale after a lost store reused its frameNo): the doc never exists, so its frames are junk.
+				// Create not folded yet (or still stale): wait. Folded without the doc (the fold ignored or refused the
+				// frame): the doc never exists, so its frames are junk.
 				if (!dep && !this.committedPending(r.dependsOn) && !this.halted) changes.push({ t: "delete", clientFrameId: r.clientFrameId });
 				continue;
 			}

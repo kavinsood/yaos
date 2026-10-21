@@ -113,8 +113,10 @@ used by one store, ever ([identity-per-store](identity-per-store.md) §1.3). The
 |---|---|---|
 | `POST /vault/:id/auth/device {"deviceId", "deviceToken", "retireKeyHash"}` | `Grant <secret>`, or the `Bearer` of a live device of the same grant | `200 {vaultId, deviceId, deviceName, grantId, vaultGeneration}` |
 | `POST /vault/:id/auth/device/retire {"deviceId", "retireKey"}` | the retire key | `200 {ok, deviceId, retired}` |
+| `POST /vault/:id/auth/device/status {"deviceIds"}` | `Bearer` | `200 {ok, devices: [{deviceId, state}]}` |
 | `DELETE /vault/:id/auth/device` | `Bearer` (any device, a grant's or not) | `200 {ok, deviceId, retired: true}` |
 | `DELETE /vault/:id/auth/grant` | `Grant <secret>` | `200 {ok, grantId, revoked, retiredDevices}` |
+| `GET /vault/:id/auth/grant` | `Bearer` | `200 {grantId, grantName, grantSecret}` |
 
 - **Register.** `deviceId` and `deviceToken` follow §2.4's formats; `retireKeyHash` is the lowercase hex SHA-256 of a
   client-minted retire key (32+ random bytes, base64url). The device takes the grant's name. The same deviceId,
@@ -129,6 +131,16 @@ used by one store, ever ([identity-per-store](identity-per-store.md) §1.3). The
   enroll again. Retire by key: a device that is already gone (or never existed) is `200 {retired: false}`; a wrong
   key, or a device without one, is `401 unauthorized`. Self-retire twice: the second call is `401` (the token is
   dead), which counts as done.
+- **Status** (identity-per-store phase 3; DESIGN §i.5 "Abandoned creates"): 1..32 well-formed deviceIds (duplicates
+  answered once, in request order); `state` is `live` (registered), `retired` (tombstoned) or `unknown`. It reads
+  the registry only, but like registration it first runs the server's lazy inactivity retirement (phase 5: devices
+  without a ticket for more than 90 UTC days are retired as by "Remove device", at most one full scan a UTC day), so
+  an answer may already reflect it. `400 invalid_request` for an empty, oversized or malformed list.
+- **Grant fetch** (phase 5, identity-per-store §3.4): after the operator rotated the grant's secret (`POST
+  /operator/vaults/:id/grants/:grantId/rotate`; the old secret is `401 unauthorized` from then on), a live device of
+  the grant reads the new one here and its install rewrites data.json. `404 grant_secret_unavailable` (never
+  rotated: keep the secret you have), `401 grant_revoked`, `401 unauthorized` (bad bearer), `403 grant_required` (a
+  device enrolled without a grant), `409 grant_rotating` (a rotation landed meanwhile: ask again).
 - **Leave** revokes the grant and retires all its devices; a revoked grant answers `revoked: false`. The operator's
   `DELETE /operator/vaults/:id/grants/:grantId` ("Revoke pairing") does the same.
 - `POST /enroll`'s old device body (§2.4) still enrolls a device without a grant until the client switches.

@@ -112,9 +112,12 @@ export class VaultCluster {
 	private readonly directory = mkdtempSync(join(tmpdir(), "yaos-worker-"));
 	private configObject: ConfigObject | null = null;
 	private readonly withPitr: boolean;
+	private readonly inactivityRetireDays: number | undefined;
 
-	constructor(options: { pitr?: boolean } = {}) {
+	/** `inactivityRetireDays`: the vault hosts' inactivity threshold (VaultHostOptions; default the server's 90). */
+	constructor(options: { pitr?: boolean; inactivityRetireDays?: number } = {}) {
 		this.withPitr = options.pitr === true;
+		this.inactivityRetireDays = options.inactivityRetireDays;
 	}
 
 	/** The config DO (one per cluster), on the clock `now` of the returned object. */
@@ -216,7 +219,8 @@ export class VaultCluster {
 			object.restart();
 		}) : null;
 		const make = () => new VaultHost({ storage: port, sockets: registry, upgrades, relayConfig: DEFAULT_STREAM_RELAY_CONFIG,
-			clock: { now: () => timers.now }, timers, ...(pitr ? { pitr } : {}) });
+			clock: { now: () => timers.now }, timers, ...(pitr ? { pitr } : {}),
+			...(this.inactivityRetireDays !== undefined ? { inactivityRetireDays: this.inactivityRetireDays } : {}) });
 		const object: VaultObject = {
 			name, storage, model, registry, upgrades, timers, statements, transactions, pitr, host: make(),
 			// A later runtime: the closes the old one began have completed by then.
@@ -261,6 +265,7 @@ export class VaultCluster {
 			listDevices: () => this.rpc(name, "listDevices", () => host().listDevices()),
 			revokeDevice: (deviceId: string) => this.rpc(name, "revokeDevice", () => host().revokeDevice(deviceId)),
 			revokeGrant: (grantId: string) => this.rpc(name, "revokeGrant", () => host().revokeGrant(grantId)),
+			rotateGrant: (grantId: string) => this.rpc(name, "rotateGrant", () => host().rotateGrant(grantId)),
 			deleteVault: () => this.rpc(name, "deleteVault", () => host().deleteVault()),
 			resetStreams: () => this.rpc(name, "resetStreams", () => host().resetStreams()),
 			prepareRestore: (restoreId: string, at: number, refreshOnly: boolean) =>

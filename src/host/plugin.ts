@@ -20,18 +20,19 @@ import { ObsidianWorkspace } from "./obsidianWorkspace";
 import { BrowserPlatform, browserClock, platformInfoFrom } from "./platform";
 import { YaosController } from "./pluginController";
 import { ObsidianSideFiles } from "./sideFiles";
-import { defaultDeviceName, sanitizePluginData, type YaosUiHost } from "./ui/api";
+import { hasLegacyLocalFields, loadLocalSettings, withLocal } from "./localSettings";
+import { defaultDeviceName, sanitizeStoredData, type YaosUiHost } from "./ui/api";
 import { errorMessage } from "./ui/format";
 import { obsidianRequest } from "./ui/obsidianEnv";
 import { resumePendingEnrollment, type ResumedEnrollment } from "./ui/pairFlow";
-import { retireDeviceEnrollment } from "./ui/pairing";
+import { leaveGrant } from "./ui/pairing";
 import { registerUi } from "./ui/registerUi";
 
 function resumedEnrollmentNotice(r: ResumedEnrollment | null): void {
 	if (r?.ok) new Notice(`YAOS: this device is now paired with ${r.identity.host}.`);
 	else if (r && r.final) new Notice(`YAOS: an interrupted pairing could not finish: ${errorMessage(r.error)}`, 8000);
 	// Best effort and not awaited, so the engine start does not wait on the old server.
-	if (r?.ok && r.replaced) retireDeviceEnrollment(r.replaced, { request: obsidianRequest }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
+	if (r?.ok && r.replaced) leaveGrant(r.replaced, { request: obsidianRequest }).catch((err: unknown) => new Notice(`YAOS: ${errorMessage(err)}`, 9000));
 }
 
 /** The engine's carrier. Throws, with the reason, when the worker cannot be built (terminal: EngineHost). */
@@ -84,7 +85,12 @@ export default class YaosPlugin extends Plugin {
 		this.registerEditorExtension(collabExtension());
 		this.register(() => workspace.dispose());
 
-		const data = sanitizePluginData(await this.loadData(), defaultDeviceName(Platform));
+		// identity-per-store §8: data.json holds what a twin may share; the per-install fields are in vault-local storage
+		// (localSettings.ts), migrated once from an older data.json, which is then rewritten without them.
+		const localStorage = { load: (k: string) => app.loadLocalStorage(k) as unknown, save: (k: string, v: unknown) => app.saveLocalStorage(k, v) };
+		const raw: unknown = await this.loadData();
+		const stored = sanitizeStoredData(raw);
+		const data = withLocal(stored, loadLocalSettings(localStorage, raw, defaultDeviceName(Platform)));
 		const controller = new YaosController(data, {
 			makeRuntime: (identity, settings, ui, keys) =>
 				(live = new HostRuntime({
@@ -98,14 +104,17 @@ export default class YaosPlugin extends Plugin {
 			clock,
 			// obsidian.d.ts :458 (@since 1.11.4); undefined on an older app, which then holds no key (fail closed).
 			secrets: (app as { secretStorage?: typeof app.secretStorage }).secretStorage ?? null,
-			localStorage: { load: (k) => app.loadLocalStorage(k) as unknown, save: (k, v) => app.saveLocalStorage(k, v) },
+			localStorage,
+			stateDirs: { pluginDir, storeDirs: () => sideFiles.storeDirs() },
 		});
 		this.controller = controller;
+		if (hasLegacyLocalFields(raw)) await controller.rewriteStoredData();
 
 		const host: YaosUiHost = {
 			app,
 			pluginVersion: this.manifest.version,
 			data: () => controller.data(),
+			deviceId: () => controller.deviceId(),
 			updateData: (mutate) => controller.updateData(mutate),
 			status: () => controller.status(),
 			runState: () => controller.runState(),
@@ -130,6 +139,9 @@ export default class YaosPlugin extends Plugin {
 		// Start after the vault index is complete (no flood of initial "create" events), and after one
 		// retry of an enrollment the last session sent without seeing the answer (none: no request).
 		app.workspace.onLayoutReady(() => {
+			// identity-per-store §13: the identity-less layout's flat mirrors (state/outbox-*.bin, state/synced-*.bin) go;
+			// their unsent edits are on disk, and the onboarding scan re-derives them. The engine deletes the yaos2: DBs.
+			void sideFiles.removeLegacy().then((n) => n > 0 && console.debug(`[yaos] removed ${n} legacy mirror file(s)`), () => undefined);
 			void resumePendingEnrollment(host, { request: obsidianRequest })
 				.then(resumedEnrollmentNotice, () => undefined)
 				.then(() => controller.start());

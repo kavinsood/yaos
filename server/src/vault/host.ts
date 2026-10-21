@@ -5,7 +5,8 @@
 //
 // Pairing grants (identity-per-store §3, phase 1): a grant enroll, register, retire by key, self-retire, leave,
 // grant-authenticated pairing codes, the per-grant limits, tombstones, `last_seen_day`, and the operator's revoke
-// pairing. Every retire (self, by key, operator, grant revoke) is a D7 revoke plus a tombstone, in one turn.
+// pairing. Every retire (self, by key, operator, grant revoke, inactivity) is a D7 revoke plus a tombstone, in one turn.
+// Phase 5: the lazy inactivity sweep (retireInactive), grant rotation (rotateGrant) and the device's grant fetch.
 //
 // The Worker forwards a device route as `https://vault.internal/<rest>?<query>` (the path after /vault/:id, or
 // /enroll), after its own method, path and format checks, with the public origin in `X-YAOS-Origin`. This object
@@ -22,6 +23,7 @@ import { WindowLimiter, tooManyAttempts } from "../limiter";
 import {
 	SYSTEM_CLOCK,
 	describeError,
+	isMissingColumnError,
 	isMissingTableError,
 	type ClockPort,
 	type SocketPort,
@@ -49,12 +51,14 @@ import {
 	ENROLL_FAILURE_WINDOW_MS,
 	GRANT_LIVE_DEVICE_LIMIT,
 	GRANT_REGISTRATIONS_PER_DAY,
+	INACTIVITY_RETIRE_BATCH,
+	INACTIVITY_RETIRE_DAYS,
 	PAIRING_CODE_RETENTION_MS,
 	PAIRING_CODE_TTL_MS,
 	mintPairingSecret,
 	parseEnrollRequest,
 	parseRegisterRequest,
-	parseRetireRequest,
+	parseDeviceStatusRequest, parseRetireRequest,
 	uniqueDeviceName,
 	utcDay,
 	utcDayString,
@@ -62,7 +66,8 @@ import {
 	type GrantEnrollRequest,
 	type PairingPurpose,
 } from "./pairing";
-import { VAULT_SCHEMA, migrateIdentityV2 } from "./schema";
+import { unwrapGrantSecret, wrapGrantSecret } from "./grantWrap";
+import { VAULT_SCHEMA, migrateIdentityV2, migrateIdentityV3 } from "./schema";
 import { TICKET_TTL_MS, importTicketKey, signTicket, verifyTicket } from "./ticket";
 
 /** D6: `capabilityDigestForRole("owner")` of the removed server/src/collaboration.ts:93-97, frozen as a literal. */
@@ -160,6 +165,12 @@ export interface DeviceListing {
 		lastSeenDay: string | null }>;
 }
 
+/** `POST /operator/vaults/:id/grants/:grantId/rotate` (§3.4). `rotated: false`: unknown or revoked (nothing written). */
+export interface GrantRotateResult {
+	rotated: boolean;
+	grantId: string;
+}
+
 /** The operator's "Revoke pairing" (`DELETE /operator/vaults/:id/grants/:grantId`) and the device's leave. */
 export interface GrantRevokeResult {
 	/** false: unknown or already revoked (idempotent). */
@@ -212,6 +223,8 @@ export interface VaultHostOptions {
 	runtimeEpoch?: string;
 	/** D8b PITR; absent (or local workerd) → `restore_unsupported`. */
 	pitr?: PitrPort;
+	/** Inactivity retirement threshold in UTC days (`readInactivityRetireDays(env.YAOS_INACTIVITY_RETIRE_DAYS)`); default 90. */
+	inactivityRetireDays?: number;
 }
 
 type MetaRow = {
@@ -233,13 +246,13 @@ function sameDevice(a: DeviceRecord, b: DeviceRecord): boolean {
 function sameGrant(a: GrantRecord, b: GrantRecord): boolean {
 	return a.grantId === b.grantId && a.secretHash === b.secretHash && a.name === b.name
 		&& a.enrollmentRequestId === b.enrollmentRequestId && a.createdAt === b.createdAt && a.revokedAt === b.revokedAt
-		&& a.registeredDay === b.registeredDay && a.registeredCount === b.registeredCount;
+		&& a.registeredDay === b.registeredDay && a.registeredCount === b.registeredCount && a.secretWrap === b.secretWrap;
 }
 
 const DEVICE_INSERT = "INSERT INTO device (token_hash, device_id, device_name, enrollment_request_id, enrolled_at,"
 	+ " grant_id, retire_hash, last_seen_day) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 const GRANT_INSERT = "INSERT INTO pairing_grant (grant_id, secret_hash, grant_name, enrollment_request_id, created_at,"
-	+ " revoked_at, registered_day, registered_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+	+ " revoked_at, registered_day, registered_count, secret_wrap) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 function deviceRow(device: DeviceRecord): unknown[] {
 	return [hexToBytes(device.tokenHash).buffer, device.deviceId, device.deviceName, device.enrollmentRequestId,
@@ -249,7 +262,8 @@ function deviceRow(device: DeviceRecord): unknown[] {
 
 function grantRow(grant: GrantRecord): unknown[] {
 	return [grant.grantId, hexToBytes(grant.secretHash).buffer, grant.name, grant.enrollmentRequestId, grant.createdAt,
-		grant.revokedAt, grant.registeredDay, grant.registeredCount];
+		grant.revokedAt, grant.registeredDay, grant.registeredCount,
+		grant.secretWrap === null ? null : hexToBytes(grant.secretWrap).buffer];
 }
 
 const unauthorized = () => json({ error: "unauthorized" }, 401);
@@ -322,6 +336,10 @@ export class VaultHost {
 	private identityWrites = 0;
 	/** D8b step 2 armed a bookmark and is about to abort this runtime. */
 	private rewinding = false;
+	/** Inactivity retirement threshold, UTC days (§6.2, owner decision 4). */
+	private readonly inactivityRetireDays: number;
+	/** The UTC day the inactivity sweep last finished in this runtime (-1: not yet): at most one full sweep a day. */
+	private inactivitySweptDay = -1;
 
 	constructor(options: VaultHostOptions) {
 		this.clock = options.clock ?? SYSTEM_CLOCK;
@@ -329,6 +347,7 @@ export class VaultHost {
 		this.upgrades = options.upgrades;
 		this.pitr = options.pitr ?? null;
 		this.ticketTtlMs = options.ticketTtlMs ?? TICKET_TTL_MS;
+		this.inactivityRetireDays = options.inactivityRetireDays ?? INACTIVITY_RETIRE_DAYS;
 		this.enrollFailures = new WindowLimiter(ENROLL_FAILURE_LIMIT, ENROLL_FAILURE_WINDOW_MS, this.clock);
 		this.blobGcRequests = new WindowLimiter(BLOB_GC_REQUEST_LIMIT, BLOB_GC_WINDOW_MS, this.clock);
 		this.latch = new DailyLimitLatch(() => this.clock.now());
@@ -384,11 +403,18 @@ export class VaultHost {
 		return this.state;
 	}
 
-	/** The grant scan, or the identity v2 migration of a v1 vault (schema.ts G54; not an `identityWrites` write). */
+	/**
+	 * The grant scan, or the identity v2 + v3 migration of a v1 vault (schema.ts G54), or the v3 migration of a v2 vault
+	 * (G65) and the scan again. Neither is an `identityWrites` write.
+	 */
 	private loadGrants(): GrantMap {
 		try {
 			return GrantMap.load(this.storage);
 		} catch (error) {
+			if (isMissingColumnError(error, "secret_wrap")) {
+				migrateIdentityV3(this.storage);
+				return GrantMap.load(this.storage);
+			}
 			if (!isMissingTableError(error, "pairing_grant")) throw error;
 		}
 		migrateIdentityV2(this.storage);
@@ -468,6 +494,8 @@ export class VaultHost {
 				if (grantSecret(request) !== null) return state ? await this.grantPairingCode(request) : unauthorized();
 				break;
 			case "DELETE /auth/device":
+			case "POST /auth/device/status":
+			case "GET /auth/grant":
 			case "GET /streams/feed":
 			case "GET /streams/read":
 			case "PUT /streams/checkpoint":
@@ -506,6 +534,10 @@ export class VaultHost {
 				return await this.devicePairingCode(request, device);
 			case "DELETE /auth/device":
 				return this.selfRetire(device);
+			case "POST /auth/device/status":
+				return await this.deviceStatus(request);
+			case "GET /auth/grant":
+				return await this.fetchGrant(device);
 			case "POST /blobs/auth":
 				// D9: the Worker asks this before any R2 call; 204 = an enrolled device's bearer.
 				return new Response(null, { status: 204 });
@@ -765,6 +797,7 @@ export class VaultHost {
 			revokedAt: null,
 			registeredDay: 0,
 			registeredCount: 0,
+			secretWrap: null,
 		};
 		this.storage.transactionSync(() => {
 			this.storage.sql.exec(
@@ -835,6 +868,8 @@ export class VaultHost {
 		const restoring = this.restoreBlocked();
 		if (restoring) return restoring;
 		if (!parsed || !tokenDigest) return json({ error: "invalid_request" }, 400);
+		// §6.2: a registration is one of the lazy sweep's triggers; it runs before the 50-live cap is counted.
+		this.retireInactive();
 		const tokenHash = bytesToHex(tokenDigest);
 		const existing = current.devices.byId(parsed.deviceId);
 		if (existing) {
@@ -853,7 +888,8 @@ export class VaultHost {
 			response.headers.set("Retry-After", String(Math.max(1, Math.ceil(((today + 1) * DAY_MS - now) / 1000))));
 			return response;
 		}
-		// DECISIONS-GAP (G59): at the cap, refuse; nothing is retired to make room (inactivity retirement is phase 5).
+		// DECISIONS-GAP (G59): at the cap, refuse; nothing is retired to make room beyond what the inactivity sweep
+		// above retired (devices not seen for 90 days).
 		if (current.devices.ofGrant(grant.grantId).length >= GRANT_LIVE_DEVICE_LIMIT) {
 			return json({ error: "device_limit" }, 409);
 		}
@@ -912,6 +948,26 @@ export class VaultHost {
 	}
 
 	/**
+	 * `POST /auth/device/status {deviceIds}` (bearer; at most 32 ids): each id's state, `live` (registered),
+	 * `retired` (tombstoned) or `unknown`. A client asks it about the creators of docs whose initial body never
+	 * arrived (DESIGN §i.5 "Abandoned creates"): a retired store never sends again. Rows read: one PK read of
+	 * `retired_device` per id that is not live; no write, except the inactivity sweep this request triggers (§6.2): a
+	 * creator not seen for 90 days reads `retired` here, so its body-less creates resolve without the console.
+	 */
+	private async deviceStatus(request: Request): Promise<Response> {
+		const ids = parseDeviceStatusRequest(await readSmallJson(request));
+		if (!ids) return json({ error: "invalid_request" }, 400);
+		const current = this.load();
+		if (!current) return unauthorized();
+		this.retireInactive();
+		const devices = ids.map((deviceId) => ({
+			deviceId,
+			state: current.devices.byId(deviceId) ? "live" : this.isRetired(deviceId) ? "retired" : "unknown",
+		}));
+		return json({ ok: true, devices });
+	}
+
+	/**
 	 * `DELETE /auth/device` (bearer, §3.2 self-retire): the bearer's own device is retired. `200 {ok, deviceId,
 	 * retired: true}`; a second call is 401 (the token is dead), which the client's `retireDeviceEnrollment` counts
 	 * as done. Works for a device of the old enroll too. Rows: 2.
@@ -958,6 +1014,101 @@ export class VaultHost {
 			() => this.load()?.grants.byId(grantId)?.revokedAt === null);
 	}
 
+	/**
+	 * `GET /auth/grant` (bearer, §3.4): the device's grant secret after a rotation, so the install rewrites data.json
+	 * without a re-pair: `200 {grantId, grantName, grantSecret}`. `403 grant_required` for a device of the old enroll,
+	 * `401 grant_revoked`, `404 grant_secret_unavailable` for a grant never rotated (the server holds only the hash of
+	 * the secret the client minted, G56; the client keeps the one it has). 0 rows.
+	 */
+	private async fetchGrant(device: DeviceRecord): Promise<Response> {
+		const state = this.load();
+		if (!state) return unauthorized();
+		if (device.grantId === null) return json({ error: "grant_required" }, 403);
+		const grant = state.grants.byId(device.grantId);
+		if (!grant) return unauthorized();
+		if (grant.revokedAt !== null) return json({ error: "grant_revoked" }, 401);
+		if (grant.secretWrap === null) return json({ error: "grant_secret_unavailable" }, 404);
+		const wrap = grant.secretWrap;
+		const secret = await unwrapGrantSecret(state.meta.ticketKey, state.meta.vaultId, grant.grantId, hexToBytes(wrap));
+		// The await yields: a revoke or another rotation that ran meanwhile wins (answer what is current, or nothing).
+		const current = this.load()?.grants.byId(grant.grantId);
+		if (!this.admits(device.deviceId) || !current) return unauthorized();
+		if (current.revokedAt !== null) return json({ error: "grant_revoked" }, 401);
+		if (current.secretWrap !== wrap) return json({ error: "grant_rotating" }, 409);
+		if (secret === null) {
+			console.error("[yaos-vault] a grant's wrapped secret does not open");
+			return json({ error: "grant_secret_unavailable" }, 404);
+		}
+		return json({ grantId: grant.grantId, grantName: grant.name, grantSecret: secret });
+	}
+
+	/**
+	 * Identity-per-store §3.4 "Rotate secret" (operator RPC, `POST /operator/vaults/:id/grants/:grantId/rotate`): a new
+	 * grant secret (32 random bytes, base64url) replaces the old one in ONE UPDATE (1 row). From that turn on the old
+	 * secret is unknown (`401 unauthorized` on every grant route, counted by the D3 failure limiter); the grant's live
+	 * devices keep working (they authenticate by their own tokens) and fetch the new secret with `GET /auth/grant`. The
+	 * secret is not returned: no one but a live device of the grant needs it. Unknown or revoked: `rotated: false`.
+	 */
+	async rotateGrant(grantId: string): Promise<GrantRotateResult> {
+		const state = this.load();
+		const grant = state?.grants.byId(grantId);
+		if (!state || !grant || grant.revokedAt !== null) return { rotated: false, grantId };
+		const secret = randomBase64Url(32);
+		const [digest, wrap] = await Promise.all([sha256(secret),
+			wrapGrantSecret(state.meta.ticketKey, state.meta.vaultId, grantId, secret)]);
+		// Synchronous from here: a revoke that ran during the crypto wins.
+		const current = this.load();
+		const live = current?.grants.byId(grantId);
+		if (!current || !live || live.revokedAt !== null) return { rotated: false, grantId };
+		this.storage.sql.exec("UPDATE pairing_grant SET secret_hash = ?, secret_wrap = ? WHERE grant_id = ?",
+			digest.buffer, wrap.buffer, grantId);
+		this.identityWrites++;
+		current.grants.rekey(live, bytesToHex(digest), bytesToHex(wrap));
+		return { rotated: true, grantId };
+	}
+
+	/**
+	 * Identity-per-store §6.2 inactivity retirement (owner decision 4; phase 5), lazy: run by the requests that need an
+	 * accurate list (registration, device status, the operator listing), never by a timer or alarm. A device whose
+	 * `last_seen_day` (the UTC day of its last ticket; for an old enroll never ticketed, its enroll day) is more than
+	 * `inactivityRetireDays` before today is retired like every other retire path (`retireDevices`: D7 + tombstone).
+	 *
+	 * Cost: the scan is over the in-memory device map (0 rows read); a full sweep runs at most once a UTC day per
+	 * runtime (the eligibility changes only at a day boundary). Writes only when it retires: 2 rows per device, at most
+	 * INACTIVITY_RETIRE_BATCH devices per sweep in one transaction (a later trigger goes on). A stale device with an
+	 * open streams socket is not retired: it is seen now, and gets the day's `last_seen_day` write (noteSeen). Skipped
+	 * while a restore runs or the daily limit is latched; a failure never fails the request that triggered it.
+	 * DECISIONS-GAP (G66): its retirements are `identityWrites` (authority), so one that lands in a D8b rewind window
+	 * makes finish rewind again, like an enroll there (G62).
+	 */
+	private retireInactive(): void {
+		const state = this.load();
+		if (!state) return;
+		const today = utcDay(this.clock.now());
+		if (this.inactivitySweptDay === today || this.restoringRemainingMs() > 0 || this.latch.active()) return;
+		const cutoff = today - this.inactivityRetireDays;
+		const stale = [...state.devices.list()].filter((device) => (device.lastSeenDay ?? utcDay(device.enrolledAt)) < cutoff);
+		try {
+			const gone: DeviceRecord[] = [];
+			if (stale.length > 0) {
+				const connected = this.relay.connectedDevices();
+				for (const device of stale) {
+					if (connected.has(device.deviceId)) this.noteSeen(device);
+					else gone.push(device);
+				}
+			}
+			const batch = gone.slice(0, INACTIVITY_RETIRE_BATCH);
+			if (batch.length > 0) {
+				this.retireDevices(state, batch);
+				console.log(`[yaos-vault] inactivity retirement: ${batch.length} device(s) not seen for over ${this.inactivityRetireDays} days`);
+			}
+			if (gone.length <= batch.length) this.inactivitySweptDay = today;
+		} catch (error) {
+			this.latch.note(error);
+			console.warn("[yaos-vault] inactivity retirement failed", describeError(error));
+		}
+	}
+
 	// ---- D4 tickets and the streams socket ----------------------------------------------------------------------
 
 	private importedKey(state: VaultState): Promise<CryptoKey> {
@@ -984,7 +1135,8 @@ export class VaultHost {
 	}
 
 	/**
-	 * DECISIONS-GAP (G63). Identity-per-store §6.2 `last_seen_day`: the first ticket of a UTC day writes it, so ≤ 1 row per device per day
+	 * DECISIONS-GAP (G63). Identity-per-store §6.2 `last_seen_day`: the first ticket of a UTC day writes it (and the
+	 * inactivity sweep, for a stale device with an open socket), so ≤ 1 row per device per day
 	 * (owner decision 4 accepts this deviation from §6.1's "0 rows per bearer auth"). Bookkeeping only: skipped while
 	 * the daily limit is latched, and a failed write never refuses the ticket. Not an `identityWrites` write: a ticket
 	 * in the D8b rewind window must not force a re-rewind, and finish sets every row's value from the snapshot anyway.
@@ -1041,8 +1193,12 @@ export class VaultHost {
 
 	// ---- operator RPCs: devices, D7 revoke, D5 delete --------------------------------------------------------------
 
-	/** `GET /operator/vaults/:id/devices`: no token material (T-DEVICES-LIST). 0 rows written. DECISIONS-GAP (G61). */
+	/**
+	 * `GET /operator/vaults/:id/devices`: no token material (T-DEVICES-LIST). 0 rows written, except the inactivity sweep
+	 * it triggers (§6.2: a stale device is retired before it is listed). DECISIONS-GAP (G61).
+	 */
 	listDevices(): DeviceListing {
+		this.retireInactive();
 		const state = this.load();
 		const devices = state ? [...state.devices.list()] : [];
 		devices.sort((a, b) => a.enrolledAt - b.enrolledAt || a.deviceId.localeCompare(b.deviceId));
@@ -1098,7 +1254,7 @@ export class VaultHost {
 	}
 
 	/**
-	 * Every retire (D7 revoke, self, by key, grant revoke): ONE `transactionSync` deletes the device rows (1 row each;
+	 * Every retire (D7 revoke, self, by key, grant revoke, inactivity): ONE `transactionSync` deletes the device rows (1 row each;
 	 * §6.1: no secondary index, the DELETE scans the few device rows), inserts their tombstones (1 row each) and runs
 	 * `alsoWrite`; the device-map entries go with it, so the gate shuts with the transaction. Then, per device, the
 	 * relay drops its buffered frames (never committed, no receipt; no flush), tells peers that held their
