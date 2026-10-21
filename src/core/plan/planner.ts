@@ -768,9 +768,10 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 			// bound to the loser, the save lost with the app; sim suite-1 seed 1). Its frames are the only copy (they
 			// stay in the outbox until the loser's stream is dropped, after this rebind): write them to the file
 			// first, and the rebind of the next pass merges them into the winner off the disk.
-			if (s0.kind !== "blob" && r0.body && !r0.body.frozen && r0.body.hasContent && !versionEq(r0.body.version, s0.bodyVersion) && !s0.fileGone) {
-				const l0 = input.local.get(s0.pathKey);
-				if (l0 && !l0.excluded) {
+			if (s0.kind !== "blob" && r0.body && !r0.body.frozen && r0.body.hasContent && !versionEq(r0.body.version, s0.bodyVersion)) {
+				// Its file: at its path, or where the user moved it (rename inference, as for any synced doc).
+				const l0 = (s0.fileGone ? undefined : input.local.get(s0.pathKey)) ?? inferred.get(s0.docId)?.to;
+				if (l0 && !l0.excluded && !claimed.has(l0.pathKey)) {
 					claimed.add(l0.pathKey);
 					// Not planned as a remote-only doc meanwhile (a materialize onto the loser's file).
 					if (!input.synced.has(r0.aliasOf)) handled.add(r0.aliasOf);

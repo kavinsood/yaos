@@ -569,6 +569,10 @@ test("row merged, loser replica past its sync point: its text goes to its file f
 	// Once the file holds the replica (S at its version), the rebind as before.
 	assert.deepEqual(opsOf(run(sc({ bodyVersion: V(12) }))), ["rebind", "reconcileContent"]);
 	assert.equal(find(run(sc({ bodyVersion: V(12) })), "reconcileContent").docId, "d3");
+	// Renamed before the app died (the file moved, S still at x.md or already fileGone): its text goes to the moved file.
+	const moved = (over: Partial<SyncedEntry>) => run(sc(over, L("y.md", h("X")))).ops.find((o) => o.op === "reconcileContent");
+	assert.deepEqual(moved({}), { op: "reconcileContent", docId: "d4", path: "y.md", kind: "markdown", hasBase: true });
+	assert.deepEqual(moved({ fileGone: true }), { op: "reconcileContent", docId: "d4", path: "y.md", kind: "markdown", hasBase: true });
 });
 
 test("row live/present/present: body without content, create not empty = wait body-empty unless S is born empty", () => {
