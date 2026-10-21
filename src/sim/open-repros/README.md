@@ -28,3 +28,4 @@ Status as of integrate-3 (2026-10-21): every file below still fails. "base": als
 | `prune-storm-mass-delete.json` | small tombstone cap (soak): mass deletes and import storms: imported notes on B lost. Passes without `smallPrune` | PRUNE-STORM |
 | `e2ee-log-busy-89423454.json` | E2EE faults, 5 devices, suite 1 (soak): A's log never idles, devices on different epochs, wide divergence; fails the same on `generators` | SIM-E2EE-LOG-BUSY |
 | `canvas-reorder-lost-1025898366.json` | E2EE faults, 2 devices, suite 1, races (soak): B's reorder of a node to the front is lost; fails the same on `generators` | SIM-CANVAS-REORDER |
+| `flood-flapping-1557069770.json` | FLOOD_FAULTS, 5 devices, storms, races, clean-ups (soak): no quiescence, "flapping". Unminimized (256 steps; a replay takes ~5 min); fails the same on `generators` | SIM-FLOOD-FLAP |

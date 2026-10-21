@@ -176,6 +176,11 @@ different epochs, wide divergence; the `retired` violations follow from A never 
 `canvas-reorder-lost-1025898366.json` (E2EE faults, 2 devices, suite 1, delete / restore races; 251 steps): B's
 reorder of a node to the front loses against three nodes. Fails the same on `generators`.
 
+### SIM-FLOOD-FLAP: the conflict-flood profile never settles
+
+`flood-flapping-1557069770.json` (FLOOD_FAULTS, 5 devices, storms, delete / restore races, clean-ups; 256 steps, not
+minimized: a run takes minutes): no quiescence, "flapping". Fails the same on `generators`.
+
 ### SIM-SOAK-OOM: a soak process ran out of memory
 
 Soak master seed 4 reached ~4 GB and was killed at ~580 s (Node's default heap). Not minimized: find the run (its
