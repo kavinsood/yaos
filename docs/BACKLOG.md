@@ -158,12 +158,6 @@ re-creates after the reset): A's overwrite of 10 notes is lost. In production an
 mass deletes and import storms): imported notes lost, likely PRUNE-RESTORE with more deletes than the 2+ newest
 tombstones `pruneWorld` keeps. Until fixed, the nightly soak can fail on these.
 
-### SIM-E2EE-LOG-BUSY: a suite-1 device's log never goes idle; devices end on different epochs
-
-`e2ee-log-busy-89423454.json` (E2EE faults, 5 devices, suite 1): no quiescence ("A log busy"), devices seal under
-different epochs, wide divergence; the `retired` violations follow from A never catching up. Fails the same on
-`generators`; a second soak seed (1042558905, 3 devices, no generator ops) fails the same on base.
-
 ### SIM-CANVAS-REORDER: a canvas reorder to the front lost
 
 `canvas-reorder-lost-1025898366.json` (E2EE faults, 2 devices, suite 1, delete / restore races; 251 steps): B's
@@ -191,6 +185,12 @@ Kept here until `sim-port` merges; then git history holds them.
   folded merged and `reconcileHeld` deleted the merged doc's frames (I1); they now stay until the loser's stream drops
   (`T_drop_stream`, after the rebind), and the planner writes a loser's replica to its file before rebinding (§c.5).
   Plans `src/sim/regressions/epoch-rename-crash-stranded-edit.json`, `merged-create-held-edit-lost.json`.
+- **SIM-E2EE-LOG-BUSY** (`fix-epoch`): two kept devices re-keyed after a revoke at once, each under a new RK of its
+  own; the second could not open the first's record (another RK), passed over it as garbage and adopted its own: the
+  vault forked on K_2 (rows failing auth across the fork, A's ns frozen checkpoint-disputed, its log never idle,
+  devices sealing under different epochs, edits lost). A pending revoke in `k` now holds back its epoch's later
+  records as a pending genesis did (e2ee-design §11.3): the device waits revoked-epoch for a QR. Plan
+  `src/sim/regressions/concurrent-revoke-keyring-fork.json`, test `src/engine/keyring/concurrentRevoke.test.ts`.
 - **CLONED-ID, FRAMENO-IDB** (identity-per-store phases 1–4, `client-remake-next`): a deviceId is used by exactly one
   store, ever. The identity lives in the store (`meta.identity`), data.json holds a pairing grant, a clone or a new
   IndexedDB registers a new device, an IndexedDB loss fences its predecessor and re-issues its mirrored frames, a
