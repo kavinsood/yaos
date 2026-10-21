@@ -424,13 +424,17 @@ export class VaultRuntime {
 		else if (fx.docIds.size > 0 || fx.own.length > 0) this.sched.request({ t: "docs", docIds: [...fx.docIds], pathKeys: [...fx.pathKeys] });
 	}
 
-	/** A bound doc's identity moved to `into` (merged alias fold, planner rebind): the host re-opens its views. */
-	private retarget(docId: DocId, into: DocId): void {
-		if (!this.engine.bound.isBound(docId)) return;
+	/**
+	 * A bound doc's identity moved to `into` (merged alias fold, planner rebind), or the fold pruned it (null: the
+	 * doc is dead, sim smallPrune seed 169): the host re-opens its views by path.
+	 */
+	private retarget(docId: DocId, into: DocId | null): void {
+		const b = this.engine.bound.get(docId);
+		if (!b) return;
 		this.engine.bound.drop(docId);
 		this.log.unbind(docId);
 		this.stats.retargets++;
-		this.engine.link.post({ t: "docRetarget", docId, change: { t: "merged", into } });
+		this.engine.link.post({ t: "docRetarget", docId, change: into ? { t: "merged", into } : { t: "renamed", path: b.path } });
 	}
 
 	/** Remote body rows / checkpoints / provisionals changed docs: project them (§f.2 docs scope). */

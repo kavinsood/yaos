@@ -252,7 +252,9 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
     stay 0;
   - malicious peer frames (malformed, disallowed Yjs types, oversize, bad checkpoint) from suite 0: none
     (`diag.doc-frozen`, `frame-poisoned`, `causal-hole`, `quarantine-retried`, `checkpoint-refused` stay 0);
-  - long offline past ns pruning (> 20k tombstones): `ns.pruned` stays 0 (the prune cap is not tunable);
+  - long offline past ns pruning (> 20k tombstones): `ns.pruned` stays 0 in the production-cap matrices; the "small
+    tombstone cap" matrix (cap 3..8) prunes, retires and drops dead streams (`diag.retire-written`,
+    `checkpoint-retired`, `retire-dropped`; coverage.sim.test.ts);
   - `brake.conflict-flood` (the other brakes fire under storms; `reconciler.brakes.test.ts` covers all);
   - residency: the budgets are never approached at sim scale, so invariant 6's residency part holds trivially;
   - other zero keys: `ns.create.revived`, `ns.restore.applied/suffixed`, the ignored reasons `duplicate-docid`,

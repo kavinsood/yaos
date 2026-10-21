@@ -128,6 +128,20 @@ test("gate: checkpoints (binding, encoding, size, structure)", async () => {
 	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: BODY, coversSeq: 7, payload: await ck(7, CheckpointEncoding.yjsStateV1, bad) })), "disallowed-type");
 });
 
+test("gate: retired checkpoints (DESIGN §b.5): empty state, body / canvas streams only", async () => {
+	const ck = (stream: StreamName, st: Uint8Array) =>
+		sealCheckpoint(crypto, ctx.vaultId, stream, 7, encodeCheckpointContent({ encoding: CheckpointEncoding.retired, coversSeq: 7, foldRulesVersion: FOLD_RULES_VERSION, state: st }), 0);
+	for (const stream of [BODY, CANVAS]) {
+		const ok = await gate(ctx, { t: "checkpoint", stream, coversSeq: 7, payload: await ck(stream, new Uint8Array(0)) });
+		assert.ok(ok.ok && ok.t === "checkpoint" && ok.checkpoint.encoding === CheckpointEncoding.retired, stream);
+	}
+	assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream: BODY, coversSeq: 7, payload: await ck(BODY, new Uint8Array([1])) })), "decode-failed", "a retired checkpoint carries no state");
+	// A retired fold stream would let the relay collect rows no checkpoint rebuilds: bad bytes, never adopted.
+	for (const stream of [NS_STREAM, CFG_STREAM, SNAP_STREAM]) {
+		assert.equal(failReason(await gate(ctx, { t: "checkpoint", stream, coversSeq: 7, payload: await ck(stream, new Uint8Array(0)) })), "kind-not-allowed", stream);
+	}
+});
+
 test("gate: suite-1 failures map to quarantine reasons; only key-dependent ones are reader-dependent (e2ee-design §9.2)", async () => {
 	const vaultId = "AAAAAAAAAAAAAAAAAAAAAA" as VaultId;
 	const random = new ScriptedRandom();

@@ -20,7 +20,7 @@ const find = <K extends PlannerOp["op"]>(p: Plan, k: K): Extract<PlannerOp, { op
 const run = (sc: Scenario, ctx = {}): Plan => {
 	const inp = input(sc);
 	const p = planWith(inp, ctx);
-	const budget = freshIdBudget(inp.synced, inp.local, inp.remote);
+	const budget = freshIdBudget(inp.synced, inp.local, inp.remote, inp.docsWithPendingBody);
 	assert.ok(p.consumedDocIds <= budget, `plan took ${p.consumedDocIds} fresh docIds, freshIdBudget allows ${budget}: ${JSON.stringify(p.ops)}`);
 	return p;
 };
@@ -598,6 +598,26 @@ test("row pruned: an own create the fold never committed (nsTouchSeq 0) is creat
 	assert.deepEqual(opsOf(md), ["nsCreate", "reconcileContent", "syncedDrop"]);
 	// seen committed (nsTouchSeq > 0): a real prune, the trash stands
 	assert.deepEqual(opsOf(run({ synced: [S("d1", "a.png")], local: [L("a.png", h("b0"))] })), ["diskTrash", "syncedDrop"]);
+});
+
+test("row pruned: own body frames still in the outbox -> the file is created anew with them, never trashed", () => {
+	// Sim smallPrune seed 104: A edited the bound note offline (S tracks the bound doc's edits: L reads unchanged), C
+	// deleted it, later deletes pruned it. Back online, A's pass ran before its outbox flushed and trashed the file
+	// with the edits no delete covered (edit beats delete, §c.7), which a restore could no longer name.
+	const pending = { synced: [S("d1", "a.md")], local: [L("a.md", h("c0"), { size: 9 })], over: { docsWithPendingBody: new Set([id("d1")]) } };
+	const p = run(pending);
+	assert.deepEqual(p.ops, [
+		{ op: "nsCreate", docId: "fresh1", kind: "markdown", path: "a.md", contentHash: h("c0"), size: 9 },
+		{ op: "reconcileContent", docId: "fresh1", path: "a.md", kind: "markdown", hasBase: false },
+		{ op: "syncedDrop", docId: "d1" },
+	]);
+	assert.equal(p.brake, null);
+	const inp = input(pending);
+	assert.equal(freshIdBudget(inp.synced, inp.local, inp.remote, inp.docsWithPendingBody), 1);
+	assert.equal(freshIdBudget(inp.synced, inp.local, inp.remote), 0);
+	// a live doc with pending body is not counted (its own row waits on the frames)
+	const live = input({ ...pending, remote: [R("d1", "a.md")] });
+	assert.equal(freshIdBudget(live.synced, live.local, live.remote, live.docsWithPendingBody), 0);
 });
 
 test("row pruned: the file is a live doc's (its S at the path, or its bytes) -> syncedDrop only, no trash, no create", () => {

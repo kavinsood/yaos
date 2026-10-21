@@ -8,6 +8,7 @@
  * their texts), and an audit of every committed row (blobs never ride the log).
  */
 
+import type { NsPruneRules } from "../engine/runtime/options";
 import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type DeviceId, type DocId, type StreamName, type VaultId, type VaultPath } from "../core/types";
 import type { BlobPort } from "../ports/blob";
 import type { DeviceState, GrantFetchOutcome, RegisterOutcome, RetireOutcome } from "../ports/identity";
@@ -302,7 +303,11 @@ export class SimNet {
 	readonly oracleDisputed: string[] = [];
 	private readonly audit = { foreign: new Set<StreamName>(), largestRecordRow: 0, docStreams: new Set<DocId>(), rows: 0, bytes: 0 };
 
-	constructor(readonly clock: VirtualClock, o: { readonly seed?: number; readonly linkMs?: number; readonly jitterMs?: number; readonly sealBytes?: number } = {}) {
+	/** The run's ns prune rules (run.ts pruneWorld; FOLD: the oracle folds with the devices' cap), null = production. */
+	readonly nsPrune: NsPruneRules | null;
+
+	constructor(readonly clock: VirtualClock, o: { readonly seed?: number; readonly linkMs?: number; readonly jitterMs?: number; readonly sealBytes?: number; readonly nsPrune?: NsPruneRules | null } = {}) {
+		this.nsPrune = o.nsPrune ?? null;
 		this.httpMs = o.linkMs ?? 20;
 		const link = { uplinkMs: o.linkMs ?? 20, downlinkMs: o.linkMs ?? 20, jitterMs: o.jitterMs ?? 0, httpMs: o.linkMs ?? 20, connectMs: o.linkMs ?? 20 };
 		this.relay = new SimRelay({ clock, seed: o.seed ?? 1, link, ...(o.sealBytes !== undefined ? { sealBytes: o.sealBytes } : {}) });
@@ -463,6 +468,7 @@ export class SimNet {
 		const started = LogEngine.start({
 			ports: { relay: this.port(deviceId), storage, clock: this.clock, random, crypto, hash, blob: this.blobPort() },
 			vaultId: SIM_VAULT_ID, deviceId, clientVersion: "sim-oracle", sideFiles: null, autoReconnect: true, e2ee,
+			...(this.nsPrune ? { tuning: { nsPrune: this.nsPrune } } : {}),
 			onDiag: (ev) => {
 				const cls = ev.fields["cls"];
 				const k = typeof cls === "string" ? `${ev.code}:${cls}` : ev.code;

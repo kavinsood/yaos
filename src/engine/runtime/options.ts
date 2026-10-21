@@ -3,7 +3,7 @@
  * defaults are the DESIGN values.
  */
 
-import { BLOB_QUARANTINE_MIN_MS, BUDGETS, MAINTENANCE_IDLE_MAX_MS, LOCAL_COMPACT_BYTES, RECENT_UNBOUND_KEEP, RECENT_UNBOUND_MS, SKIP_DEFER, SUBSCRIBE_DEBOUNCE_MS, type SkipDefer, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
+import { BLOB_QUARANTINE_MIN_MS, BUDGETS, TOMBSTONE_CAP, TOMBSTONE_PRUNE_HYSTERESIS, MAINTENANCE_IDLE_MAX_MS, LOCAL_COMPACT_BYTES, RECENT_UNBOUND_KEEP, RECENT_UNBOUND_MS, SKIP_DEFER, SUBSCRIBE_DEBOUNCE_MS, type SkipDefer, LOCAL_COMPACT_ROWS, OUTBOX_MIRROR_DEBOUNCE_MS, PROVISIONAL_ADOPT_MS, RECONNECT_BASE_MS, ROLL_OWN_SEALS, ROLL_SEQ_SPAN, type Budgets, type DeviceClass } from "../../core/limits";
 import type { ContentHash, DeviceId, DocId, VaultEpoch, VaultId } from "../../core/types";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
@@ -48,6 +48,13 @@ export interface EngineTuning {
 	/** Multiplier on the open-frame idle / max timers (tests shrink it). */
 	readonly frameStretch: number;
 	readonly nsCandidateModulus: number;
+	/**
+	 * FOLD: the ns tombstone cap and prune hysteresis (DESIGN §c.9). Every device of a vault must fold with the same
+	 * values, or their folds diverge at the first prune. Production never passes engine tuning (adapters/webEngine.ts
+	 * builds the engine without it), so every device runs TOMBSTONE_CAP / TOMBSTONE_PRUNE_HYSTERESIS; the sim sets a
+	 * small cap uniformly per run (run.ts pruneWorld: every device and the oracle), never per device.
+	 */
+	readonly nsPrune: NsPruneRules;
 	/** Gate bound on checkpoint state bytes (the relay cap is on the sealed checkpoint). */
 	readonly maxCheckpointStateBytes: number;
 	/** Unresolved bodyUpdateRef rows: retried after refRetryMs, doubling up to refRetryMaxMs (e2ee-design §10.2). */
@@ -96,6 +103,14 @@ export interface EngineTuning {
 	readonly creatorStatusRecheckMaxMs: number;
 }
 
+/** FOLD tunables of the ns prune (core/ns/fold NsFoldRules). */
+export interface NsPruneRules {
+	readonly tombstoneCap: number;
+	readonly pruneHysteresis: number;
+}
+
+export const DEFAULT_NS_PRUNE: NsPruneRules = { tombstoneCap: TOMBSTONE_CAP, pruneHysteresis: TOMBSTONE_PRUNE_HYSTERESIS };
+
 /**
  * DESIGN §d.6: the causal-hole re-read window (causalRetries x causalRetryMs) must be at least 2 x provisionalAdoptMs,
  * because the missing structs may be a provisional adoption still in flight. Returns why a tuning breaks it, or null.
@@ -125,6 +140,7 @@ export const DEFAULT_TUNING: EngineTuning = {
 	reconnectBaseMs: RECONNECT_BASE_MS,
 	frameStretch: 1,
 	nsCandidateModulus: NS_CANDIDATE_MODULUS,
+	nsPrune: DEFAULT_NS_PRUNE,
 	maxCheckpointStateBytes: 32 * 1024 * 1024,
 	refRetryMs: BLOB_RETRY_BASE_MS,
 	refRetryMaxMs: BLOB_RETRY_MAX_MS,

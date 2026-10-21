@@ -6,7 +6,9 @@
  *  - Every doc an event touched is put in the next pass scope (with its old
  *    and new path keys) so the planner projects remote changes quickly.
  *  - Bound docs whose identity changed get `docRetarget`: `merged` when the
- *    entry became an alias. Renames and deletes are not retargeted at fold
+ *    entry became an alias; re-open by path when the fold pruned the entry
+ *    (into: null; the doc is dead, maintenance retires and drops its stream,
+ *    retire.ts, and its views re-bind to whatever doc owns the path). Renames and deletes are not retargeted at fold
  *    time: the editor view follows the vault.rename / trash the projection
  *    does (and a bound doc with pending edits keeps its restore duty).
  */
@@ -19,7 +21,7 @@ export interface FoldEffects {
 	readonly own: OwnFoldEvent[];
 	readonly docIds: Set<DocId>;
 	readonly pathKeys: Set<PathKey>;
-	readonly retarget: { readonly docId: DocId; readonly into: DocId }[];
+	readonly retarget: { readonly docId: DocId; readonly into: DocId | null }[];
 }
 
 export function committedRemoteEntry(e: NsEntry | undefined): RemoteEntry | null {
@@ -46,13 +48,17 @@ export function foldEffects(o: {
 	const own: OwnFoldEvent[] = [];
 	const docIds = new Set<DocId>();
 	const pathKeys = new Set<PathKey>();
-	const retarget: { docId: DocId; into: DocId }[] = [];
+	const retarget: { docId: DocId; into: DocId | null }[] = [];
+	const pruned = new Set<DocId>();
 	const seen = new Set<DocId>();
 	for (const f of o.frames) {
 		const mine = f.deviceId === o.self;
 		for (const ev of f.events) {
 			if (ev.docId) docIds.add(ev.docId);
-			if (ev.outcome.kind === "pruned") for (const d of ev.outcome.docIds) docIds.add(d);
+			if (ev.outcome.kind === "pruned") for (const d of ev.outcome.docIds) {
+				docIds.add(d);
+				pruned.add(d);
+			}
 			if (ev.outcome.kind === "merged") docIds.add(ev.outcome.into);
 			if (ev.index < 0) continue;
 			const op = f.ops[ev.index];
@@ -70,6 +76,7 @@ export function foldEffects(o: {
 		if (seen.has(d) || !o.isBound(d)) continue;
 		seen.add(d);
 		if (e && e.state === "merged" && e.aliasOf) retarget.push({ docId: d, into: e.aliasOf });
+		else if (!e && pruned.has(d)) retarget.push({ docId: d, into: null });
 	}
 	return { own, docIds, pathKeys, retarget };
 }

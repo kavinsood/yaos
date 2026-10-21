@@ -1,0 +1,30 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import type { ClientFrameId, DeviceId, DocId, NsEntry, NsFoldEvent, PathKey, Seq } from "../../core/types";
+import { foldEffects } from "./foldBridge";
+import type { FoldedNsFrame } from "../sync/nsRuntime";
+
+const d = (s: string): DocId => s as DocId;
+const frame = (events: Omit<NsFoldEvent, "seq" | "deviceId" | "clientFrameId">[]): FoldedNsFrame => ({
+	seq: 9 as Seq, deviceId: "X" as DeviceId, clientFrameId: "f" as ClientFrameId, ops: [],
+	events: events.map((e) => ({ ...e, seq: 9 as Seq, deviceId: "X" as DeviceId, clientFrameId: "f" as ClientFrameId })),
+});
+
+test("foldEffects: a bound doc the fold pruned is retargeted by path (into null); merged aliases into their winner", () => {
+	const entries = new Map<DocId, NsEntry>([[d("m"), { state: "merged", aliasOf: d("w"), pathKey: "a.md" as PathKey } as unknown as NsEntry]]);
+	const bound = new Set([d("p"), d("m"), d("pending")]);
+	const fx = foldEffects({
+		frames: [frame([
+			{ index: -1, docId: null, outcome: { kind: "pruned", docIds: [d("p"), d("q")] } } as Omit<NsFoldEvent, "seq" | "deviceId" | "clientFrameId">,
+			{ index: -1, docId: d("m"), outcome: { kind: "merged", into: d("w") } } as unknown as Omit<NsFoldEvent, "seq" | "deviceId" | "clientFrameId">,
+			// a bound doc with no entry that no prune named (an own create not folded yet) stays bound
+			{ index: -1, docId: d("pending"), outcome: { kind: "duplicate-frame" } } as unknown as Omit<NsFoldEvent, "seq" | "deviceId" | "clientFrameId">,
+		])],
+		self: "Y" as DeviceId,
+		committed: (id) => entries.get(id),
+		isBound: (id) => bound.has(id),
+		pathKey: (p) => p as unknown as PathKey,
+	});
+	assert.deepEqual(fx.retarget, [{ docId: d("p"), into: null }, { docId: d("m"), into: d("w") }]);
+	assert.ok(fx.docIds.has(d("q")) && fx.docIds.has(d("p")));
+});

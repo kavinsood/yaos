@@ -71,3 +71,12 @@ simTest("coverage: randomized tuning reaches the live-queue overflow path (3 dev
 	const zero = ["diag.live-overflow", "host.provisionalAdopted"].filter((k) => !(agg[k]! > 0));
 	assert.deepEqual(zero, [], `never fired: ${zero.join(", ")}`);
 });
+
+simTest("coverage: a small tombstone cap prunes, and dead streams are retired, read retired and dropped (3 devices, smallPrune)", 20 * 2.5, async () => {
+	// Seeds 21..40: seed 35 retires a pruned canvas that a device then reads retired (checkpoint-retired). Most dead
+	// streams need no put: a settle checkpoint at lastSeq already covered them, or they never had a row.
+	const { agg, bad } = await sweepCoverage({ devices: 3, faults: DEFAULT_FAULTS, smallPrune: true }, 21, 20);
+	assert.deepEqual(bad, []);
+	const zero = ["ns.pruned", "diag.retire-written", "diag.checkpoint-retired", "diag.retire-dropped"].filter((k) => !(agg[k]! > 0));
+	assert.deepEqual(zero, [], `never fired: ${zero.join(", ")}\n${JSON.stringify(agg)}`);
+});

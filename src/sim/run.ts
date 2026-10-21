@@ -20,7 +20,7 @@ import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
 import { generateUserAction, runUserAction, tokensIn, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, STORM_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
-import { activity, checkBlobLiveness, checkCanvas, checkIdentity, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, checkBounds, checkFoldDeterminism, checkOutboxAndCursor, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
+import { activity, checkBlobLiveness, checkCanvas, checkIdentity, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, checkBounds, checkFoldDeterminism, checkOutboxAndCursor, checkRetired, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
 import { BrakeUser, type BrakeUserStats } from "./brakeUser";
 import type { Budgets } from "../core/limits";
 import { collectCoverage } from "./coverage";
@@ -28,7 +28,7 @@ import { VirtualClock } from "./clock";
 import { SeededRandom } from "./random";
 import { SIM_SETTINGS, SimDevice } from "./device";
 import type { EngineSettings } from "../protocol/messages";
-import type { EngineTuning } from "../engine/runtime/options";
+import type { EngineTuning, NsPruneRules } from "../engine/runtime/options";
 import { SimNet } from "./net";
 import type { SimCheckpointStats } from "./relay";
 import type { CaseProfile } from "./vault";
@@ -102,6 +102,12 @@ export interface SimConfig {
 	 * still overrides. Default false (the fixed FAST_TUNING matrices).
 	 */
 	readonly randomTuning?: boolean;
+	/**
+	 * A small ns tombstone cap and prune hysteresis drawn per seed (pruneWorld), set on every device and the oracle
+	 * alike (FOLD: devices with different caps would fold differently), so runs prune often and the retired-stream
+	 * path (DESIGN §b.5) runs end to end. Default false: production's TOMBSTONE_CAP, which no run reaches.
+	 */
+	readonly smallPrune?: boolean;
 }
 
 export interface CanvasConfig {
@@ -176,6 +182,21 @@ export function tuningWorld(cfg: SimConfig, devices: number): readonly DeviceTun
 		};
 		return { tuning, budgets };
 	});
+}
+
+/**
+ * The run's ns prune rules (SimConfig.smallPrune), a pure function of the seed: a cap of 3..8 tombstones, pruned by
+ * 1..cap-2, so the newest 2+ tombstones always stay (a 120-step run deletes or merges a dozen or so docs). As in
+ * production (19000 kept), the newest deletes outlive the restore window: a delete pruned before an editor's
+ * edit-beats-delete restore commits trashes that edit (planner "absent (pruned)", BACKLOG PRUNE-RESTORE; a cap that
+ * prunes down to 0 loses tokens, seeds 10 and 20). One draw per run, never per device: the cap is a FOLD rule
+ * (EngineTuning.nsPrune).
+ */
+export function pruneWorld(cfg: SimConfig): NsPruneRules | null {
+	if (!cfg.smallPrune) return null;
+	const r = new SeededRandom(cfg.seed).fork("prune");
+	const tombstoneCap = r.range(3, 8);
+	return { tombstoneCap, pruneHysteresis: r.range(1, tombstoneCap - 2) };
 }
 
 /** The checkpoint side of a run's world (DESIGN §b.5, §d.8, §d.9), a pure function of the seed. */
@@ -458,14 +479,16 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const nr = world.fork("net");
 		const cw = checkpointWorld(cfg);
 		const tw = tuningWorld(cfg, c.devices);
-		const net = new SimNet(clock, { seed: nr.int(0x7fffffff), linkMs: nr.range(5, 60), jitterMs: nr.range(0, 90), ...(cw.sealBytes !== null ? { sealBytes: cw.sealBytes } : {}) });
+		const pw = pruneWorld(cfg);
+		const net = new SimNet(clock, { seed: nr.int(0x7fffffff), linkMs: nr.range(5, 60), jitterMs: nr.range(0, 90), ...(cw.sealBytes !== null ? { sealBytes: cw.sealBytes } : {}), nsPrune: pw });
 		const devs = NAMES.slice(0, c.devices).map((name, di) => {
 			const dr = world.fork(`dev-${name}`);
 			const watch = dr.fork("watch");
 			return new SimDevice({
 				name, clock, net, profile,
 				settings: cw.snapshots[di] ? () => SNAPSHOT_SETTINGS : () => RUN_SETTINGS,
-				tuning: { ...cw.tuning, ...(tw?.[di]?.tuning ?? {}), ...cfg.tuning },
+				// The prune rules last: the same on every device whatever else is drawn per device (FOLD).
+				tuning: { ...cw.tuning, ...(tw?.[di]?.tuning ?? {}), ...cfg.tuning, ...(pw ? { nsPrune: pw } : {}) },
 				...(tw?.[di] ? { budgets: tw[di].budgets } : {}),
 				mobile: dr.chance(0.3),
 				log: cfg.log ? (line) => cfg.log!(name, `${clock.monotonic()} ${line}`) : undefined,
@@ -482,6 +505,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			trace.push(`checkpoints ${JSON.stringify({ ...t.checkpoint, compactRows: t.compactRows, candidate: t.nsCandidateModulus, seal: cw.sealBytes, join: cw.lateJoin, snapshots: cw.snapshots.map((x) => (x ? 1 : 0)).join("") })}`);
 		}
 		tw?.forEach((x, i) => trace.push(`tuning ${devs[i]?.name} ${JSON.stringify({ ...x.tuning, ...x.budgets })}`));
+		if (pw) trace.push(`prune ${JSON.stringify(pw)}`);
 
 		// Onboarding: files on A; some also on B (identical, or a different version).
 		const init = world.fork("init");
@@ -574,7 +598,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			brakeUser.poll();
 			sampleBounds();
 			// Blob store calls outside the blob queue (a snapshot upload's) count too: a stalled one ends by its idle window.
-			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && !(d.vrt?.creators.busy() ?? false) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending();
+			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && !(d.vrt?.creators.busy() ?? false) && (d.vrt?.log.c.retire.pending ?? 0) === 0 && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending();
 			const fp = print();
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
@@ -601,6 +625,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 				else if (adoptables(d) > 0) why.push(`${d.name} ${adoptables(d)} adoptable`);
 				else if (!(d.vrt?.snaps.idle ?? true)) why.push(`${d.name} snapshot job busy`);
 				else if (d.vrt?.creators.busy()) why.push(`${d.name} waits on a body-less doc's creator`);
+				else if ((d.vrt?.log.c.retire.pending ?? 0) > 0) why.push(`${d.name} ${d.vrt?.log.c.retire.pending} dead streams to retire / drop`);
 				else if ((d.vrt?.blobs.queued().length ?? 0) > 0) why.push(`${d.name} blob queue ${d.vrt?.blobs.queued().map((q) => `${q.direction}:${q.path}#${q.attempts}`).join(" ")}`);
 				if (d.vault.pendingEvents() > 0) why.push(`${d.name} vault events`);
 				if (d.workspace.views_().some((v) => v.isDirty())) why.push(`${d.name} dirty view`);
@@ -610,6 +635,11 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			violations.push({ inv: "clean", detail: `no quiescence within ${c.healHorizonMs}ms: ${why.join(", ") || "flapping"}` });
 		}
 		if (!(await faults.settle())) violations.push({ inv: "clean", detail: "crash inspections did not finish" });
+		// Before the oracle (a further device on the relay) runs: the devices' own work only.
+		let retired: Violation[] | null = null;
+		void checkRetired(devs, net, (i) => faults.isDown(i)).then((v) => (retired = v), (e) => (retired = [{ inv: "retired", detail: `check threw: ${String(e)}` }]));
+		await clock.runUntil(() => retired !== null, 60_000);
+		violations.push(...(retired ?? [{ inv: "retired" as const, detail: "check did not finish" }]));
 		const oracle = await net.oracle(120_000, c.suite1 ? oracleKeys(devs) : null);
 		if (c.suite1) violations.push(...checkE2eeLeaks(devs, net, ledger).violations, ...(faults.e2ee?.check() ?? []));
 		canvasWorld.finalize();

@@ -236,9 +236,10 @@ From [wp-d-notes.md](client-remake/wp-d-notes.md) "Gaps and known issues",
   store, and each takes the other's changes for its own. Nothing detects it (identity-per-store decision 7, accepted;
   Obsidian Sync has the same exposure). Removing that device in the console makes each install register a store of its
   own (identity-per-store §4, "Store revoked by the server").
-- **Pruned and deleted docs keep their rows.** No device writes the `retired` checkpoints DESIGN §b.5 / §d.9
-  describe, and the client does not adopt them (`src/engine/sync/catchUp.ts` "gap: retirement handling"), so relay
-  rows and local stream records of deleted notes are never reclaimed.
+- **Deleted docs keep their body until pruned.** A deleted note's body (relay checkpoint and rows, each store's
+  records) stays so a restore can bring it back (DESIGN §c.7). Once the namespace prunes it (past 20000 tombstones,
+  §c.9), or for a merged alias, a device writes a `retired` checkpoint and the relay and every store reclaim it (§b.5,
+  §d.9).
 - **Epoch reset gaps** (§8): Markdown text deleted in the old epoch can return; the bind-time merge of a note open
   across the reset does not use the path base (two conflict copies where a 3-way merge was possible; nothing lost).
 - **Fold digests are not compared.** A checkpoint that passes verification but is not the fold of its rows (a buggy

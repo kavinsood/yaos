@@ -228,8 +228,11 @@ export async function converged(engines: readonly LogEngine[], timeoutMs = 8_000
 
 // ---------------------------------------------------------------- authoring
 
-/** A create and its initial body frames, committed in one T_edit. */
-export async function createDoc(e: LogEngine, path: VaultPath, text: string, kind: DocKind = kindOfPath(path)): Promise<DocId> {
+/**
+ * A create and its initial body frames, committed in one T_edit. `live`: a live create (DESIGN §e.1): the body frames
+ * are pending, sent right after the create, instead of held until it folds.
+ */
+export async function createDoc(e: LogEngine, path: VaultPath, text: string, kind: DocKind = kindOfPath(path), live = false): Promise<DocId> {
 	const c = e.c;
 	if (kind === "blob") throw new Error("blob docs are not handled by the log engine");
 	c.assertWritable();
@@ -244,11 +247,11 @@ export async function createDoc(e: LogEngine, path: VaultPath, text: string, kin
 			const frames = [];
 			if (kind === "markdown" && text.length > 0) {
 				for (const u of initialTextUpdates(h.doc, text)) {
-					frames.push(...await buildBodyFrames(c.deps, { stream, content: u, flags: EnvelopeFlag.initial, authorNsSeq: c.ns.coversSeq, dependsOn: nsFrame!.clientFrameId, nowMs: c.now() }));
+					frames.push(...await buildBodyFrames(c.deps, { stream, content: u, flags: EnvelopeFlag.initial, authorNsSeq: c.ns.coversSeq, dependsOn: nsFrame!.clientFrameId, sendAfter: live, nowMs: c.now() }));
 				}
 			}
 			return frames;
-		});
+		}, live);
 	} catch (err) {
 		c.handles.unpin(h);
 		c.handles.drop(stream);

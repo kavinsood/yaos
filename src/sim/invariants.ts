@@ -40,6 +40,10 @@
  *                      idle window or a link abort), and the idle window never cut a
  *                      call that kept moving (a slow one)
  *
+ *   retired            every dead doc's b: / c: stream with rows (no committed ns entry: pruned or never
+ *                      created; or a merged alias) is retired on the relay (gcSeq = lastSeq: nothing beyond
+ *                      its checkpoint) and no running device holds a record of it (stream, snapshot, tail,
+ *                      quarantine; DESIGN §b.5 "retired", checkRetired)
  *   identity           one deviceId per store (identity-per-store §1.3, §5.2): no two devices ever ran as the
  *                      same deviceId (a clone gets its own), and every state dir a device's engines read, listed,
  *                      wrote or removed is one of its own stores' (a copied or synced folder's foreign dirs are
@@ -55,7 +59,7 @@
  *                      is in "clean" and "checkpoint")
  *   6 bounds           sampled after every step and heal tick: resident docs <= budget + 1,
  *                      resident bytes <= budget + one doc, local tail <= TAIL_HARD_ROWS per
- *                      stream, ns dedupe rings <= NS_DEDUPE_RING, tombstones <= TOMBSTONE_CAP
+ *                      stream, ns dedupe rings <= NS_DEDUPE_RING, tombstones <= the run's tombstone cap
  *                      (checkBounds). At sim scale the residency budgets (24..400 docs) are
  *                      not approached; the keystroke-path encode counter is keystrokeBench's.
  */
@@ -65,11 +69,12 @@ import { READER_DEPENDENT } from "../engine/runtime/quarantineRelease";
 import type { QuarantineRecord } from "../engine/store/schema";
 import { checkNsInvariants } from "../core/ns/verify";
 import { pathKey } from "../core/paths/pathKey";
-import { MAX_NS_FRAME_BYTES, NS_DEDUPE_RING, TAIL_HARD_ROWS, TOMBSTONE_CAP } from "../core/limits";
-import { CFG_STREAM, NS_STREAM, SNAP_STREAM, type DeviceId, type StreamName } from "../core/types";
+import { MAX_NS_FRAME_BYTES, NS_DEDUPE_RING, TAIL_HARD_ROWS } from "../core/limits";
+import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type DeviceId, type StreamName } from "../core/types";
 import type { SnapshotRecord, TailRecord } from "../engine/store/schema";
 import { gateRow } from "../engine/sync/ingestRow";
 import { NsRuntime } from "../engine/sync/nsRuntime";
+import type { NsFoldRules } from "../core/ns/fold";
 import { CfgRuntime } from "../engine/sync/cfgRuntime";
 import { SnapRuntime } from "../engine/sync/snapRuntime";
 import type { SeededRandom } from "./random";
@@ -81,7 +86,7 @@ import { ABSENT, canvasCanonical, canvasFiles, canvasProblem, docIdOf, engineCan
 import { canonicalJson, formatCanvasText, parseCanvasText, type JsonValue } from "../core/hash/canvasCanonical";
 
 export interface Violation {
-	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness" | "checkpoint" | "canvas" | "fold" | "bounds" | "identity";
+	readonly inv: "convergence" | "tokens" | "destroyed" | "clean" | "quiet" | "e2ee" | "log" | "liveness" | "checkpoint" | "canvas" | "fold" | "bounds" | "identity" | "retired";
 	readonly detail: string;
 }
 
@@ -150,7 +155,7 @@ export function checkConvergence(devs: readonly SimDevice[], oracle: { readonly 
 		const c = d.vrt?.log.c;
 		const st = c?.ns.state;
 		if (!c || !st) continue;
-		const bad = checkNsInvariants(st);
+		const bad = checkNsInvariants(st, undefined, { tombstoneCap: c.ns.rules.tombstoneCap });
 		if (bad) out.push({ inv: "convergence", detail: `${d.name}: ns invariant ${bad}` });
 		add("ns", hex(encodeNsFoldV1(st)), d.name);
 		add("cfg", hex(c.cfg.encodeState()), d.name);
@@ -367,6 +372,49 @@ export function checkCheckpoints(devs: readonly SimDevice[], net: SimNet): Viola
 			if (r.stale || r.appliedSeq < last) behind.push(`${r.stream} at ${r.appliedSeq} of ${last}${r.stale ? " stale" : ""} (gc ${net.relay.gcSeq(r.stream)})`);
 		}
 		if (behind.length > 0) bad(`${d.name}: ${behind.length} streams behind the relay: ${behind.slice(0, 4).join(", ")}`);
+	}
+	return out;
+}
+
+/**
+ * Invariant "retired" (DESIGN §b.5 "retired", §c.9; body/retire.ts), at quiescence: every b: / c: stream with rows
+ * whose doc is dead in the devices' ns fold (no committed entry: pruned, or never created; or a merged alias) is
+ * retired on the relay (gcSeq = lastSeq: nothing beyond its checkpoint, any encoding), and no running device holds
+ * a record of it (stream record, snapshot, tail rows, quarantine records). `isDown`: devices not running now.
+ */
+export async function checkRetired(devs: readonly SimDevice[], net: SimNet, isDown: (i: number) => boolean): Promise<Violation[]> {
+	const out: Violation[] = [];
+	const bad = (detail: string) => out.push({ inv: "retired", detail });
+	const ref = devs.find((d, i) => !isDown(i) && d.vrt);
+	const ns = ref?.vrt?.log.c.ns;
+	if (!ns) return out;
+	const dead: StreamName[] = [];
+	for (const stream of net.relay.streams()) {
+		const cls = streamClass(stream);
+		const docId = cls === "body" || cls === "canvas" ? streamDocId(stream) : null;
+		if (!docId) continue;
+		const e = ns.entry(docId);
+		if (e && e.state !== "merged") continue;
+		const rows = net.relay.rows(stream, { includeGc: true });
+		const last = rows[rows.length - 1]?.seq ?? 0;
+		if (last === 0) continue;
+		dead.push(stream);
+		const gc = net.relay.gcSeq(stream);
+		if (gc !== last) bad(`${stream} (${e ? "merged" : "pruned"}) not retired on the relay: gcSeq ${gc}, lastSeq ${last}, checkpoint ${net.relay.checkpoint(stream)?.coversSeq ?? 0}`);
+	}
+	for (const [i, d] of devs.entries()) {
+		const repo = d.vrt?.log.c.repo;
+		if (isDown(i) || !repo) continue;
+		const held: string[] = [];
+		for (const stream of dead) {
+			const what: string[] = [];
+			if (repo.stream(stream)) what.push("stream");
+			if (await repo.getSnapshot(stream)) what.push("snapshot");
+			if ((await repo.getTail(stream)).length > 0) what.push("tail");
+			if ((await repo.quarantineOf(stream)).length > 0) what.push("quarantine");
+			if (what.length > 0) held.push(`${stream} (${what.join("+")})`);
+		}
+		if (held.length > 0) bad(`${d.name} holds ${held.length} dead streams: ${held.slice(0, 4).join(", ")}`);
 	}
 	return out;
 }
@@ -595,8 +643,9 @@ class RowRepo {
 type FoldRt = NsRuntime | CfgRuntime | SnapRuntime;
 const FOLD_STREAMS = [["ns", NS_STREAM], ["cfg", CFG_STREAM], ["snap", SNAP_STREAM]] as const;
 
-function newFold(cls: "ns" | "cfg" | "snap", repo: RowRepo, self: DeviceId): FoldRt {
-	return cls === "ns" ? new NsRuntime(repo, self) : cls === "cfg" ? new CfgRuntime(repo, self) : new SnapRuntime(repo, self);
+/** `nsRules`: the devices' ns fold rules (the run's tombstone cap, run.ts pruneWorld). */
+function newFold(cls: "ns" | "cfg" | "snap", repo: RowRepo, self: DeviceId, nsRules: NsFoldRules): FoldRt {
+	return cls === "ns" ? new NsRuntime(repo, self, undefined, nsRules.knownRulesVersion, nsRules) : cls === "cfg" ? new CfgRuntime(repo, self) : new SnapRuntime(repo, self);
 }
 
 /**
@@ -632,12 +681,12 @@ export async function checkFoldDeterminism(devs: readonly SimDevice[], net: SimN
 		// All at once.
 		const whole = new RowRepo(rows);
 		whole.applied = last;
-		const full = newFold(cls, whole, ref.deviceId);
+		const full = newFold(cls, whole, ref.deviceId, c.ns.rules);
 		await full.load();
 		await check("full refold", full);
 		// Paged, with a snapshot at a cut point.
 		const paged = new RowRepo(rows);
-		const p = newFold(cls, paged, ref.deviceId);
+		const p = newFold(cls, paged, ref.deviceId, c.ns.rules);
 		await p.load();
 		const cut = rows.length > 0 ? rows[rng.int(rows.length)]!.seq : 0;
 		let snap: SnapshotRecord | undefined;
@@ -650,7 +699,7 @@ export async function checkFoldDeterminism(devs: readonly SimDevice[], net: SimN
 		await check("paged refold", p);
 		const tail = new RowRepo(rows, snap);
 		tail.applied = last;
-		const fromCut = newFold(cls, tail, ref.deviceId);
+		const fromCut = newFold(cls, tail, ref.deviceId, c.ns.rules);
 		await fromCut.load();
 		await check(`snapshot@${snap?.coversSeq ?? 0} + tail`, fromCut);
 		// encode -> decode -> encode.
@@ -659,7 +708,7 @@ export async function checkFoldDeterminism(devs: readonly SimDevice[], net: SimN
 			if (!dc) continue;
 			const own = cls === "ns" ? dc.ns : cls === "cfg" ? dc.cfg : dc.snap;
 			const bytes = own.encodeState();
-			const rt = newFold(cls, new RowRepo([], { stream, coversSeq: own.coversSeq, encoding: own.encoding, bytes, createdAtMs: 0 }), d.deviceId);
+			const rt = newFold(cls, new RowRepo([], { stream, coversSeq: own.coversSeq, encoding: own.encoding, bytes, createdAtMs: 0 }), d.deviceId, dc.ns.rules);
 			await rt.load();
 			if (hex(rt.encodeState()) !== hex(bytes)) bad(`${cls} ${d.name}: encode(decode(state)) ${hex(rt.encodeState())} != ${hex(bytes)}`);
 		}
@@ -717,7 +766,8 @@ export function checkBounds(devs: readonly SimDevice[]): Violation[] {
 		if (st) {
 			for (const [dev, ring] of st.recentFrames) if (ring.length > NS_DEDUPE_RING) bad(`${d.name}: ns ring of ${dev} holds ${ring.length} > ${NS_DEDUPE_RING}`);
 			const tomb = c.ns.index.tombstones;
-			if (tomb > TOMBSTONE_CAP) bad(`${d.name}: ${tomb} ns tombstones > ${TOMBSTONE_CAP}`);
+			const cap = c.ns.rules.tombstoneCap;
+			if (tomb > cap) bad(`${d.name}: ${tomb} ns tombstones > ${cap}`);
 		}
 	}
 	return out;

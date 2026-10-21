@@ -55,12 +55,20 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 	state: NsFoldState = newNsFoldState();
 	index: NsFoldIndex = buildIndex(this.state);
 
-	/** knownRulesVersion: the highest fold rules this reader implements (tests raise it: an upgraded client). */
-	private readonly rules: NsFoldRules;
+	/**
+	 * The fold's tunables. knownRulesVersion: the highest fold rules this reader implements (tests raise it: an
+	 * upgraded client); prune: the tombstone cap and hysteresis (EngineTuning.nsPrune; FOLD, the same on every device).
+	 */
+	readonly rules: NsFoldRules;
 
-	constructor(repo: FoldRepo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS, knownRulesVersion = FOLD_RULES_VERSION) {
+	constructor(
+		repo: FoldRepo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS, knownRulesVersion = FOLD_RULES_VERSION,
+		prune: Pick<NsFoldRules, "tombstoneCap" | "pruneHysteresis"> = DEFAULT_NS_FOLD_RULES,
+	) {
 		super(repo, self, NS_STREAM, candidateModulus);
-		this.rules = knownRulesVersion === DEFAULT_NS_FOLD_RULES.knownRulesVersion ? DEFAULT_NS_FOLD_RULES : { ...DEFAULT_NS_FOLD_RULES, knownRulesVersion };
+		const d = DEFAULT_NS_FOLD_RULES;
+		const same = knownRulesVersion === d.knownRulesVersion && prune.tombstoneCap === d.tombstoneCap && prune.pruneHysteresis === d.pruneHysteresis;
+		this.rules = same ? d : { ...d, knownRulesVersion, tombstoneCap: prune.tombstoneCap, pruneHysteresis: prune.pruneHysteresis };
 	}
 
 	get coversSeq(): Seq {

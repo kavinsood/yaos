@@ -149,7 +149,7 @@ export class Reconciler {
 		this.scan.dirty.clear();
 		ctx.echo.sweep();
 		const view = ctx.log.view();
-		const freshDocIds = this.freshIds(freshIdBudget(ctx.store.synced, ctx.local, view.remote));
+		const freshDocIds = this.freshIds(freshIdBudget(ctx.store.synced, ctx.local, view.remote, view.docsWithPendingBody));
 		// A snapshot: renames observed while this plan runs (its awaits) are for the next plan, not dropped with these.
 		const renames = [...ctx.renames];
 		const input: PlannerInput = {

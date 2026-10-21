@@ -212,15 +212,18 @@ export interface WriteCheckpointOpts {
 	readonly refreshFirst?: boolean;
 }
 
-/** Apply the outcome table to the stream record / holds. */
-async function applyOutcome(
-	deps: CheckpointDeps, st: CheckpointState, session: RelaySession, stream: StreamName, c: Seq, snapshotBytes: number, res: PutCheckpointResult,
+/**
+ * Apply the outcome table to the stream record / holds. `settle`: an ok counts towards the daily settle cap
+ * (CheckpointState.settleOpen); a retired checkpoint (retire.ts) does not.
+ */
+export async function applyOutcome(
+	deps: CheckpointDeps, st: CheckpointState, session: RelaySession, stream: StreamName, c: Seq, snapshotBytes: number, res: PutCheckpointResult, settle = true,
 ): Promise<CheckpointOutcome> {
 	const repo = deps.repo;
 	st.count(res.t === "refused" ? res.reason : res.t);
 	switch (res.t) {
 		case "ok":
-			st.written++;
+			if (settle) st.written++;
 			st.condSince.delete(stream);
 			await repo.tPatchStreams([{ stream, patch: (r) => {
 				r.remoteCheckpointCoversSeq = Math.max(r.remoteCheckpointCoversSeq, c);

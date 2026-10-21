@@ -65,22 +65,25 @@ need it: they thaw on their own, 3a569113.)
 
 ## 3. Bigger work
 
-### RETIRE: relay row reclamation for deleted and pruned docs
+### PRUNE-RESTORE: a delete pruned before the editor's restore commits trashes the edit
 
-§b.5, §c.9 and §d.9 describe `retired` checkpoints for the `b:`/`c:` streams of pruned docs and merged aliases, so
-the relay can garbage-collect their rows. No engine code writes one (only the gate and catch-up know the encoding),
-and catch-up does not adopt one it reads (`src/engine/sync/catchUp.ts` "gap: retirement handling"). Local `streams`,
-`snapshots` and `tail` records of such docs are never deleted either (§e.1, §e.3). Rows of deleted notes, and junk
-rows left by live creates that folded `merged` (integration-notes §5), cost relay storage and fresh-device reads
-forever.
+An edit the delete did not cover beats the delete (§c.7): the editor's device restores the doc. If the delete is
+pruned (§c.9) before that restore commits, the restore names an unknown docId and the editor's planner takes the
+"absent (pruned)" row: an unchanged file (S tracks the edits it already sent) goes to the trash, braked, with the
+edit. Own frames still in the outbox are covered (the file is created anew, sim smallPrune seed 104); sent ones are
+not. Production needs 19000 newer tombstones inside the restore window (minutes), so the race is theoretical there;
+the sim's small-cap matrix keeps the newest 2+ tombstones for that reason (`src/sim/run.ts` `pruneWorld`), and a cap
+that prunes down to 0 reproduces it (seeds 10, 20 with cap 1..5, hysteresis 0..cap). A fix would keep, per pruned
+doc, what the planner needs to tell an uncovered own edit (the delete's base seq) past the prune, or hold a prune of
+a delete younger than some ns-seq horizon.
 
 ### SIM-COVERAGE: generators for coverage keys that never fire
 
 `src/sim/coverage.ts` counts what the engines did; the keys still at 0 over 6 seeds of every matrix (2026-10-20) are
 listed in wp-d-notes "Sim coverage". The largest gaps: socket closes at targeted points (before append, after commit
 before receipt, between provisional and notice), dedupe-window expiry before a resend, malicious peer frames under
-suite 0 (malformed, disallowed Yjs types, oversize, bad checkpoint), long offline past ns pruning (the prune cap is not
-tunable), `brake.conflict-flood`, residency pressure, and the rarer fold outcomes and conflict-copy kinds. Each needs
+suite 0 (malformed, disallowed Yjs types, oversize, bad checkpoint), long offline past ns pruning (production cap; the
+small-cap matrix covers pruning itself), `brake.conflict-flood`, residency pressure, and the rarer fold outcomes and conflict-copy kinds. Each needs
 an actor or fault that reaches it, then an assertion in `coverage.sim.test.ts`.
 
 ### IOS-SPIKE: real-device runs
@@ -136,6 +139,11 @@ Kept here until `sim-port` merges; then git history holds them.
 - **BLOB-RETRY** (473cd500, after 31987119): a downloaded attachment whose disk write keeps failing backs its
   re-downloads off per (doc, hash), 1 min doubling to a cap scaled by size (10–60 min), and is listed
   `write-failed` with one notice (§j.1).
+- **RETIRE** (`reclaim`): dead docs' streams (pruned, merged aliases) get a `retired` checkpoint at lastSeq, so the
+  relay drops their rows (H7), and every device then drops their local records in one transaction (§b.5, §d.9,
+  `src/engine/body/retire.ts`). A bound doc the fold pruned re-binds its views by path. The prune cap is a fold rule the
+  sim can set (`EngineTuning.nsPrune`, matrix "small tombstone cap", invariant `retired`). Found on the way: the
+  planner's pruned row trashed a file whose own edits were still in the outbox (now re-created; PRUNE-RESTORE).
 - **PLAN-PRUNED** (d1f8a750): the planner's "absent (pruned)" row tells a prune from an own create that folded as
   ignored; such a file is re-created, never trashed, and a file owned by a live doc at the path is never touched
   (§f.2).

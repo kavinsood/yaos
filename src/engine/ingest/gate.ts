@@ -217,7 +217,13 @@ async function gateCheckpoint(ctx: GateCtx, cls: "ns" | "cfg" | "snap" | "body" 
 	}
 	if (ck.coversSeq !== coversSeq) return fail("checkpoint-mismatch", `inner ${ck.coversSeq} != relay ${coversSeq}`);
 	if (ck.state.length > ctx.maxCheckpointStateBytes) return fail("oversize", `checkpoint state ${ck.state.length}`);
-	if (ck.encoding === CheckpointEncoding.retired) return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: null };
+	if (ck.encoding === CheckpointEncoding.retired) {
+		// Only a dead doc's b: / c: stream is retired (DESIGN §b.5), and its state is empty: a retired fold stream (the
+		// relay would GC rows nobody can rebuild) or a retired checkpoint with bytes is bad bytes from its writer.
+		if (cls !== "body" && cls !== "canvas") return fail("kind-not-allowed", `retired checkpoint on ${cls}`);
+		if (ck.state.length > 0) return fail("decode-failed", `retired checkpoint with ${ck.state.length} state bytes`);
+		return { ok: true, t: "checkpoint", inner, checkpoint: ck, nsState: null, cfgState: null };
+	}
 	if (ck.encoding !== ENCODING_OF[cls]) return fail("kind-not-allowed", `encoding ${ck.encoding}`);
 	const known = ctx.knownRules ?? KNOWN_RULES;
 	if (cls === "ns" || cls === "cfg" || cls === "snap") {
