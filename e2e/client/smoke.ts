@@ -314,7 +314,7 @@ async function main(): Promise<OnboardedVault> {
 	let lastThrough = 0;
 	let monotonic = true;
 	for (;;) {
-		const page = await httpB.feed(vaultId, after, 2);
+		const page = await httpB.feed(vaultId, b.session.vaultEpoch, after, 2);
 		pages++;
 		for (const entry of page.entries) entries.set(entry.stream, entry.lastSeq);
 		if (page.entries.length > 2 || page.throughSeq <= lastThrough) monotonic = false;
@@ -340,7 +340,7 @@ async function main(): Promise<OnboardedVault> {
 	let readAfter = 0;
 	let readPages = 0;
 	for (;;) {
-		const page = await httpB.read(vaultId, doc, readAfter, false, 1000);
+		const page = await httpB.read(vaultId, b.session.vaultEpoch, doc, readAfter, false, 1000);
 		readPages++;
 		rows.push(...page.rows);
 		if (!page.more) {
@@ -385,7 +385,7 @@ async function main(): Promise<OnboardedVault> {
 		&& withCkpt.rows.length === 2 && withCkpt.rows.every((row) => row.seq > cover) && withCkpt.nextAfterSeq === lastSeqOf.get(doc),
 	{ coversSeq: withCkpt.checkpoint?.coversSeq, rows: withCkpt.rows.map((r) => r.seq), checkpointSeq: withCkpt.checkpointSeq,
 		nextAfterSeq: withCkpt.nextAfterSeq });
-	const noPrefer = await httpB.read(vaultId, doc, 0, false, null);
+	const noPrefer = await httpB.read(vaultId, b.session.vaultEpoch, doc, 0, false, null);
 	check("read without checkpoint=1 (rows not GC'd): rows from the start, checkpointSeq reported", noPrefer.checkpointSeq === cover
 		&& (noPrefer.checkpoint === null ? noPrefer.rows.length === expected.length : noPrefer.rows.every((row) => row.seq > cover)),
 	{ checkpoint: noPrefer.checkpoint?.coversSeq ?? null, rows: noPrefer.rows.length, checkpointSeq: noPrefer.checkpointSeq });
@@ -395,7 +395,7 @@ async function main(): Promise<OnboardedVault> {
 	const advance = await a.session.putCheckpoint(asStream(doc), lastSeqOf.get(doc)!, cover, payloadOf("checkpoint 2", 512));
 	check("advancing CAS ok", advance.t === "ok", advance);
 	try {
-		await createRelayHttp({ baseUrl: HOST, credential: "bogus-token", clock }).feed(vaultId, 0, null);
+		await createRelayHttp({ baseUrl: HOST, credential: "bogus-token", clock }).feed(vaultId, b.session.vaultEpoch, 0, null);
 		check("HTTP with a bad token throws RelayHttpError", false, "no throw");
 	} catch (error) {
 		check("HTTP with a bad token throws RelayHttpError (401, no secret in message)", error instanceof RelayHttpError && error.status === 401
