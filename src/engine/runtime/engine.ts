@@ -132,7 +132,7 @@ export class LogEngine {
 		c.repo = repo;
 		c.daily = { ...repo.dailyAtOpen }; // the daily soft budget (§i.6) counts across restarts
 		c.keyring = await KeyringRuntime.open(c, opts.e2ee);
-		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus, c.tuning.knownRules.ns);
+		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus, c.tuning.knownRules.ns, c.tuning.nsPrune);
 		c.cfg = new CfgRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.snap = new SnapRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.docs = new DocRuntime(c);
