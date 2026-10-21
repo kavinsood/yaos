@@ -201,14 +201,17 @@ export function tuningWorld(cfg: SimConfig, devices: number): readonly DeviceTun
  * to 0..cap (hysteresis 0..cap). A goal of 0 prunes every delete and merged alias in the frame that made it (cap 0:
  * at once), before any edit-beats-delete restore can commit: the restore duty of a pruned doc (DESIGN §c.9 "Pruned
  * docs") then re-creates the editor's file instead of trashing it (BACKLOG PRUNE-RESTORE, small-cap seeds 10 and 20
- * of the old 3..8 draw with goal 0). One draw per run, never per device: the cap is a FOLD rule (EngineTuning.nsPrune).
+ * of the old 3..8 draw with goal 0). The pruned-entry stubs are capped at 0..16 (production 100k): a reader that
+ * adopts an ns checkpoint past a prune whose stub aged out knows nothing of the doc and re-creates its file. One draw
+ * per run, never per device: the caps are FOLD rules (EngineTuning.nsPrune).
  */
 export function pruneWorld(cfg: SimConfig): NsPruneRules | null {
 	if (!cfg.smallPrune) return null;
 	if (typeof cfg.smallPrune === "object") return cfg.smallPrune;
 	const r = new SeededRandom(cfg.seed).fork("prune");
 	const tombstoneCap = r.range(0, 8);
-	return { tombstoneCap, pruneHysteresis: r.range(0, tombstoneCap) };
+	const pruneHysteresis = r.range(0, tombstoneCap);
+	return { tombstoneCap, pruneHysteresis, prunedCap: r.range(0, 16) };
 }
 
 /** The checkpoint side of a run's world (DESIGN §b.5, §d.8, §d.9), a pure function of the seed. */
