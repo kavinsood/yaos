@@ -13,7 +13,13 @@
  * A pending row does not hold back later rows of its epoch (a device with the RK or an authoritative key passes over
  * a record it cannot open, §11.3 garbage), except a genesis: one creator writes it (§15.1), and a genesis this device
  * cannot judge may be the first valid one, so no later genesis wins past it. Otherwise a second creator would adopt
- * its own K_1 and fork the vault.
+ * its own K_1 and fork the vault. Nor does a genesis or revoke row that only this device's own key opens: two devices
+ * revoking at once (each the other, sim suite 1 seed 264) each append a revoke for r under a key of their own and a
+ * new RK, so neither can judge the other's record (the RK each holds while its record settles opens only its own).
+ * The first in `k` won for every device that can; the device whose record came second adopting its own K_r anyway
+ * forked the vault (its later frames failed authentication everywhere else, and the others' under K_r everywhere for
+ * it). It stays key-missing (`revoked-epoch`) until a QR or RK re-key decides the earlier row; a garbage row before
+ * its own is then denial of service only (§11.3).
  */
 
 import { bytesEqual } from "../../core/codec/lib0";
@@ -28,6 +34,8 @@ export interface EvalCtx {
 	readonly vaultId: string;
 	/** The RK, while the user's entry is in hand (§13.2). */
 	readonly rk: Uint8Array | null;
+	/** This device's own record in flight (keyring.ts propose), if any: it never wins past an earlier pending row. */
+	readonly own?: Uint8Array | null;
 	readonly diag: (code: string, fields: Fields) => void;
 }
 
@@ -45,10 +53,17 @@ export async function evaluate(b: KeyBook, x: EvalCtx): Promise<boolean> {
 async function step(b: KeyBook, x: EvalCtx): Promise<boolean> {
 	const open = b.rows.filter((r) => r.state === "pending" && !b.winners.has(r.rec!.e));
 	for (const e of [...new Set(open.map((r) => r.rec!.e))].sort((p, q) => p - q)) {
+		let pendingBefore = false;
 		for (const row of open.filter((r) => r.rec!.e === e)) {
+			// This device's own record (its bytes in flight, or a row only its own key opens) never wins past an earlier
+			// row of its epoch this device cannot judge (header).
+			if (pendingBefore && row.rec!.kind !== KeyRecordKind.roll && ((x.own != null && bytesEqual(row.bytes, x.own)) || srcOf(b, x, e) === "own")) continue;
 			const v = await tryRow(b, x, row.rec!);
 			if (v === "pending") {
 				if (row.rec!.kind === KeyRecordKind.genesis) break;
+				// Only a revoke in `k` this vaultEpoch: a roll pends behind the own revoke itself (§11.3, a revoke wins
+				// whatever the seq order), and a stored open revoke from before a reset is not in this `k` (§11.5).
+				if (row.rec!.kind === KeyRecordKind.revoke && row.seq !== null) pendingBefore = true;
 				continue;
 			}
 			if (v === "valid") {

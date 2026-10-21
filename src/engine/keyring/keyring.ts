@@ -293,7 +293,7 @@ export class Keyring {
 
 	private async settleAll(): Promise<void> {
 		if (this.kc && this.o.mode !== "suite0") {
-			await evaluate(this.book, { kc: this.kc, vaultId: this.o.vaultId, rk: this.rk, diag: (c, f) => this.diag(c, f) });
+			await evaluate(this.book, { kc: this.kc, vaultId: this.o.vaultId, rk: this.rk, own: this.own?.bytes ?? null, diag: (c, f) => this.diag(c, f) });
 		}
 		for (const r of this.book.rows) {
 			if (this.reported.has(r) || (r.state !== "duplicate" && r.state !== "garbage")) continue;
