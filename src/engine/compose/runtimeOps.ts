@@ -5,7 +5,7 @@
 
 import * as Y from "yjs";
 import { pathKey } from "../../core/paths/pathKey";
-import { EMPTY_CONTENT_HASH } from "../../core/plan/planner";
+import { EMPTY_CONTENT_HASH, syncedFileKey } from "../../core/plan/planner";
 import { streamDocId, type PathKey, type RemoteEntry, type StreamName, type SyncedEntry, type VaultPath } from "../../core/types";
 import { ProtocolFailure } from "../../protocol/errors";
 import type { EngineResultValue, UserCommand } from "../../protocol/messages";
@@ -52,7 +52,8 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
  * there is another doc's (the planner's L lookup, §f.2): a doc synced at the path whose file is still there (the
  * remote moved it away or put another doc at its path, and the planner has not moved it yet), or the remote doc
  * synced elsewhere with its file still there (the remote moved it onto a file this device has and the mover never
- * saw). Binding then merges one doc's file into another's CRDT. The view waits: `bindable` follows the pass that
+ * saw). "Where its file is" follows the user's observed renames (planner syncedFileKey): a file renamed onto the path
+ * is the renamed doc's, and a doc whose file was renamed away has it there. Binding then merges one doc's file into another's CRDT. The view waits: `bindable` follows the pass that
  * settles the path, or the host asks again at the path the file moves to.
  *
  * Nor while the create's initial content is still missing from the replica (another device's frames in flight, or
@@ -67,7 +68,7 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
 /** The part of the vault runtime bindTarget reads (bindTarget.test.ts builds one). */
 export interface BindTargetRuntime {
 	readonly port: { view(): Pick<RemoteView, "remote" | "remoteByPathKey"> };
-	readonly rec: { readonly ctx: Pick<Ctx, "synced" | "local"> & { readonly store: Pick<Ctx["store"], "synced"> } };
+	readonly rec: { readonly ctx: Pick<Ctx, "synced" | "local" | "renames" | "pk"> & { readonly store: Pick<Ctx["store"], "synced"> } };
 }
 
 export function bindTarget(rt: BindTargetRuntime, key: PathKey): RemoteEntry | undefined {
@@ -79,9 +80,16 @@ export function bindTarget(rt: BindTargetRuntime, key: PathKey): RemoteEntry | u
 	const ctx = rt.rec.ctx;
 	const s = ctx.synced(e.docId);
 	if (s?.fileGone && s.pathKey === key) return undefined;
-	if (s && !s.fileGone && s.pathKey !== key && ctx.local.has(s.pathKey)) return undefined;
+	// The doc's file is elsewhere: at its synced path, or where an observed rename took it (§f.2 L lookup).
+	const own = s ? syncedFileKey(s, ctx.renames, ctx.pk) : null;
+	if (own !== null && own !== key && ctx.local.has(own)) return undefined;
 	if (!ctx.local.has(key)) return e;
-	for (const o of ctx.store.synced.values()) if (o.pathKey === key && o.docId !== e.docId) return undefined;
+	// The file at the path is another doc's: synced there, or renamed there by the user (sim storm seed 86: B renamed
+	// a deleted doc's file offline onto the path the remote then moved a live doc to; the bind merged the deleted
+	// doc's text into the live doc and destroyed its content).
+	for (const o of ctx.store.synced.values()) {
+		if (o.docId !== e.docId && (o.pathKey === key || syncedFileKey(o, ctx.renames, ctx.pk) === key)) return undefined;
+	}
 	return e;
 }
 

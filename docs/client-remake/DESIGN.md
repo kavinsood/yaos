@@ -878,7 +878,9 @@ cold ──load──▶ resident ──bind──▶ bound
 - **Opening a note.**
   - The host sends `openDoc{path, viewId}` and the engine answers `bind{docId, kind, frozen}`. Resolution is as
     before (`remoteByPathKey`, optimistic remote). The engine answers `notBindable` for excluded, untracked and
-    non-markdown paths, and a later `bindable{path}` makes the host retry. No answer carries text or CRDT state.
+    non-markdown paths, and while the file at the path is another doc's, or the doc's own file is elsewhere (the
+    planner's L lookup, following the user's observed renames: `bindTarget`); a later `bindable{path}` makes the
+    host retry. No answer carries text or CRDT state.
   - Main uploads the editor text as `textChunk{uploadId, bytes, last}`:
     - UTF-16 slices of `TEXT_CHUNK_UNITS` (65 536) units, each buffer transferred;
     - one macrotask per chunk, with a `setTimer(0)` yield between chunks.

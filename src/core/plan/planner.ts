@@ -174,6 +174,16 @@ function withKeptRenames(input: PlannerInput, pk: PathKeyFn): PlannerInput {
 	return kept.length === 0 ? input : { ...input, renames: [...input.renames, ...kept] };
 }
 
+/**
+ * Where the file of synced record `s` is now: the end of the observed rename chain from its synced path (the
+ * observed renames and the one the record kept), else its synced path, or null for a file gone with no rename.
+ */
+export function syncedFileKey(s: SyncedEntry, renames: readonly ObservedRename[], pk: PathKeyFn): PathKey | null {
+	const all = s.renamedTo ? [...renames, { from: s.path, to: s.renamedTo.to, atMs: s.renamedTo.atMs }] : renames;
+	const away = renamedAway(all, s.pathKey, pk);
+	return away ? pk(away.to) : s.fileGone ? null : s.pathKey;
+}
+
 /** The end of the observed rename chain starting at `key` (its last event), if any. */
 function renamedAway(renames: readonly ObservedRename[], key: PathKey, pk: PathKeyFn): { to: VaultPath; atMs: number } | null {
 	let at = key;
