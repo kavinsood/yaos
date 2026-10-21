@@ -164,7 +164,7 @@ type MaterializeOp = Extract<PlannerOp, { op: "diskMaterialize" }>;
 
 /** diskMaterialize of a canvas doc (the runner routes canvas docs here): write the projection (precondition absent), S + base. */
 export async function diskMaterializeCanvas(env: Env, op: MaterializeOp): Promise<JobOutcome> {
-	const r = env.ctx.log.view().remote.get(op.docId);
+	const r = env.ctx.remote(op.docId);
 	if (!r || r.state !== "live" || r.kind !== "canvas") return "fail";
 	const h = await env.ctx.log.acquireBody(op.docId, "canvas");
 	if (!h) return "fail";

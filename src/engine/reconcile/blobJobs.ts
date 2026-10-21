@@ -87,7 +87,7 @@ export async function fetchAndWrite(env: Env, docId: DocId, path: VaultPath, has
 	}
 	ctx.echo.expectWrite(ctx.pk(path), out.stat.size, out.stat.mtimeMs);
 	if (old && isShrinkingOverwrite(ctx.brake, old.size, out.stat.size)) ctx.noteDestructive("overwrite");
-	const r = ctx.log.view().remote.get(docId);
+	const r = ctx.remote(docId);
 	const s = ctx.synced(docId);
 	const blobRev = r?.blob && r.blob.hash === hash ? r.blob.rev : (s?.blobRev ?? 0);
 	const entry = ctx.record({

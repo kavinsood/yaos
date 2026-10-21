@@ -5,7 +5,7 @@
  */
 
 import type {
-	BrakeConfig, BrakeReport, ConflictReason, DocId, DocKind, LocalEntry, MergeLimits, ObservedRename, PathKey, PathKeyFn, Seq, SyncedEntry, VaultPath,
+	BrakeConfig, BrakeReport, ConflictReason, DocId, DocKind, LocalEntry, MergeLimits, ObservedRename, PathKey, PathKeyFn, RemoteEntry, Seq, SyncedEntry, VaultPath,
 } from "../../core/types";
 import { DEFAULT_BRAKE, type BrakeWindow, type DestructiveKind } from "../../core/plan/brake";
 import { conflictCopyNotice } from "../../core/plan/conflictName";
@@ -253,9 +253,19 @@ export class Ctx {
 
 	/** nsTouchSeq for a synced write: the view's lastTouchSeq unless own ns ops are pending (S1 sets it on fold). */
 	touchSeq(docId: DocId): Seq {
-		const r = this.log.nsTouch ? this.log.nsTouch(docId) : this.log.view().remote.get(docId);
+		const r = this.remote(docId);
 		if (!r || r.pendingLocal) return this.synced(docId)?.nsTouchSeq ?? 0;
 		return r.lastTouchSeq;
+	}
+
+	/** view().remote.get(docId), without rebuilding the whole view after a commitEdits / submitNs. */
+	remote(docId: DocId): RemoteEntry | undefined {
+		return this.log.peekRemote ? this.log.peekRemote(docId) : this.log.view().remote.get(docId);
+	}
+
+	/** A remote (optimistic ns) entry holds the path key. */
+	remotePathTaken(key: PathKey): boolean {
+		return this.log.nsPathTaken ? this.log.nsPathTaken(key) : this.log.view().remoteByPathKey.has(key);
 	}
 
 	noteDestructive(kind: DestructiveKind): void {
