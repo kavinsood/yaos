@@ -560,13 +560,14 @@ export class Router {
 		request: Request, env: WorkerEnv, url: URL, vaultId: string, rest: string[],
 	): Promise<Response> {
 		const route = `${request.method} ${rest.join("/")}`;
-		// Identity-per-store §3.2 adds register, retire by key, self-retire and leave to the forwarded auth routes; the
+		// Identity-per-store §3.2 adds register, retire by key, device status, self-retire and leave to the forwarded auth routes; the
 		// vault DO reads their small JSON bodies itself (64 KiB, as pairing-code and ticket).
 		switch (route) {
 			case "POST auth/pairing-code":
 			case "POST auth/ticket":
 			case "POST auth/device":
 			case "POST auth/device/retire":
+			case "POST auth/device/status":
 			case "DELETE auth/device":
 			case "DELETE auth/grant":
 			case "GET streams/feed":

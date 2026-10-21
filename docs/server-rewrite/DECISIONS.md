@@ -64,6 +64,7 @@ Auth: `-` none, `C` operator session cookie, `B` device bearer, `G` pairing gran
 | `POST /vault/:id/auth/pairing-code` | B or G | | vault |
 | `POST /vault/:id/auth/device`, `DELETE /vault/:id/auth/device` | G or B; B | | vault |
 | `POST /vault/:id/auth/device/retire` | retire key | | vault |
+| `POST /vault/:id/auth/device/status` | B | | vault |
 | `DELETE /vault/:id/auth/grant` | G | | vault |
 | `POST /vault/:id/auth/ticket` | B | | vault |
 | `GET /vault/:id/ws/streams` | T | `streamsVersion` check (1008 `update_required`) | vault |

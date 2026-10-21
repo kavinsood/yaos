@@ -54,7 +54,7 @@ import {
 	mintPairingSecret,
 	parseEnrollRequest,
 	parseRegisterRequest,
-	parseRetireRequest,
+	parseDeviceStatusRequest, parseRetireRequest,
 	uniqueDeviceName,
 	utcDay,
 	utcDayString,
@@ -468,6 +468,7 @@ export class VaultHost {
 				if (grantSecret(request) !== null) return state ? await this.grantPairingCode(request) : unauthorized();
 				break;
 			case "DELETE /auth/device":
+			case "POST /auth/device/status":
 			case "GET /streams/feed":
 			case "GET /streams/read":
 			case "PUT /streams/checkpoint":
@@ -506,6 +507,8 @@ export class VaultHost {
 				return await this.devicePairingCode(request, device);
 			case "DELETE /auth/device":
 				return this.selfRetire(device);
+			case "POST /auth/device/status":
+				return await this.deviceStatus(request);
 			case "POST /blobs/auth":
 				// D9: the Worker asks this before any R2 call; 204 = an enrolled device's bearer.
 				return new Response(null, { status: 204 });
@@ -909,6 +912,24 @@ export class VaultHost {
 		if (restoring) return restoring;
 		this.retireDevices(current, [device]);
 		return json({ ok: true, deviceId: device.deviceId, retired: true });
+	}
+
+	/**
+	 * `POST /auth/device/status {deviceIds}` (bearer; at most 32 ids): each id's state, `live` (registered),
+	 * `retired` (tombstoned) or `unknown`. A client asks it about the creators of docs whose initial body never
+	 * arrived (DESIGN §i.5 "Abandoned creates"): a retired store never sends again. Rows read: one PK read of
+	 * `retired_device` per id that is not live; no write.
+	 */
+	private async deviceStatus(request: Request): Promise<Response> {
+		const ids = parseDeviceStatusRequest(await readSmallJson(request));
+		if (!ids) return json({ error: "invalid_request" }, 400);
+		const current = this.load();
+		if (!current) return unauthorized();
+		const devices = ids.map((deviceId) => ({
+			deviceId,
+			state: current.devices.byId(deviceId) ? "live" : this.isRetired(deviceId) ? "retired" : "unknown",
+		}));
+		return json({ ok: true, devices });
 	}
 
 	/**
