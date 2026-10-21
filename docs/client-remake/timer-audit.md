@@ -209,6 +209,7 @@ simple invariant (every deferred job is re-checked within 30 s) for event-driven
 | Full reconcile | 5 / 10 / 10 / 15 min, idle doubling to 60 min | `passScheduler.ts` `armPeriodic`, `hostRuntime.ts` `scheduleReconcile` | — | fixed: idle backoff |
 | Daily snapshot | 24 h, piggybacks on full pass | `snapshotJob.ts:118-126` | yes | |
 | Blob GC grace | 7 d; GC only as a user command | `options.ts:105`, `engine.ts:370` | **no automatic sweep** | unreferenced blobs stay on the relay until clean-up |
+| Orphan store sweep | once per runtime, at live, after the other-epoch self-retire | `runtimeOps.ts` `sweepOrphanStores` (identity-per-store phase 5) | yes (≤ 32 stores, one status call) | **No timer**: event-driven. One `listDatabases` per live; a request only while another install key's store of this vault exists; a live or unknown one is asked again at the next live, not on a timer |
 
 ### Host UI and liveness
 
@@ -233,6 +234,7 @@ simple invariant (every deferred job is re-checked within 30 s) for event-driven
 | Socket liveness descriptor | 60 s / 15 s | `socketLiveness.ts:5-6` | F8 (DO wakes) |
 | Ticket / pairing code / session TTL | 5 min / 15 min (rows kept 24 h) / 7 d | `ticket.ts:13`, `pairing.ts:6-8`, `config/host.ts:24` | old rows pruned only on next mint / login |
 | Login / enroll / blob-GC limiters | 20 / 20 / 60 per min, memory | `limiter.ts` | reset when the DO is evicted |
+| Inactivity retirement | 90 UTC days without a ticket (`YAOS_INACTIVITY_RETIRE_DAYS`); one full scan per UTC day per runtime | `vault/host.ts` `retireInactive` (identity-per-store phase 5) | **No alarm, no timer**: runs inside a store registration, a device status query or the operator's device list. In memory (0 row reads), ≤ 50 retirements a call, skipped while the daily limit is latched or a restore is pending. An idle vault with no such request never wakes for it |
 
 ## Next
 

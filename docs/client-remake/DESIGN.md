@@ -2328,7 +2328,10 @@ retried after a minute or the server's Retry-After.
 **Abandoned creates.** A live doc whose create committed and whose initial body never did waits for its creator
 (planner `body-empty`). Two creators never supply it: a store of this install's lineage (lost with its store) and a
 store the server reports **retired**: a retired store never sends again (its sessions are closed and its buffered
-frames dropped; it cannot register or connect). A device asks `POST /auth/device/status` (bearer, at most 32 ids a
+frames dropped; it cannot register or connect). A store nobody will start again (a deleted clone, a profile lost
+with its lineage, so nothing fenced it) turns retired by the console's "Remove device" or, unattended, by the
+server's inactivity retirement after 90 days without a ticket, which these status queries themselves trigger
+(identity-per-store §12.2 phase 5). A device asks `POST /auth/device/status` (bearer, at most 32 ids a
 request, one in flight; one entry per creator, whatever the number of docs) about the creators of the body-less docs
 it waits on. A creator that read live is asked again after `creatorStatusRecheckMs` (5 min), doubling per live answer
 up to `creatorStatusRecheckMaxMs` (60 min); one timer serves every recheck and grace, and none is armed while no doc
@@ -2344,9 +2347,17 @@ a local delete. A successor store offline from right after its fence until past 
 into a deleted doc: it restores the doc (restore duty), and it sits next to the holders' re-creates (a duplicate,
 nothing lost).
 
-**`rebuildLocalCache`:** flush the outbox to the mirror, close and delete the DB, then run the same procedure under a
-new identity (identity-per-store §4). *As built:* the command restarts the runtime on the same store (BACKLOG
-IDENTITY-HYGIENE).
+**`rebuildLocalCache`:** a store reset (identity-per-store §4, §12.2 phase 5). A new identity is registered under the
+pairing grant first; if that is refused (offline, a revoked pairing, the daily limit), the store keeps running and the
+command fails with the reason. Then the runtime stops (its outbox goes to its mirror), this install's store DBs are
+deleted and a new runtime starts on the new identity: it fences the old store by its retire key and inherits its unsent
+frames from its mirror (Predecessor recovery above), so nothing unsent is lost. The same path replaces a store the
+server revoked (`ProtocolEngine.replaceStore`).
+
+**Orphan stores** (identity-per-store §6.4, phase 5): at live, after the other-epoch self-retire, the store DBs of this
+vault under another install key (an install key lost with Obsidian's local storage while IndexedDB stayed) are
+deleted once `POST /auth/device/status` reads their identity retired; live and unknown ones are kept. No side-file dir
+is touched (`sweepOrphanStores`, no timer).
 
 **`StorageFailure: quota`:** §e.3.
 

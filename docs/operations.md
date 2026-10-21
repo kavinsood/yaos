@@ -113,10 +113,19 @@ Attachments, oversized updates, large settings files and snapshot parts upload a
   too_many_attempts` (wrong grant secrets and retire keys count as failed enrolls).
 - **Pairings.** Per grant, at most 20 store registrations a UTC day (`429 registration_limit` with `Retry-After` to
   00:00 UTC) and 50 live stores (`409 device_limit`; remove old stores in the console). Tickets write one row per
-  store per UTC day (`last_seen_day`); every other ticket writes nothing. Retiring stores after 90 days without a
-  ticket is planned (identity-per-store phase 5), not built.
+  store per UTC day (`last_seen_day`); every other ticket writes nothing.
+- **Inactivity retirement.** A store with no ticket for more than 90 UTC days (`last_seen_day`; a store from before
+  phase 1 counts from its enroll day) is retired and tombstoned like a console "Remove device", so an abandoned store
+  (a deleted clone, a wiped profile) stops holding back its body-less creates and its pairing's 50-store limit. No
+  alarm: the check runs lazily inside a store registration, a device status query and the console's device list, at
+  most once a UTC day per vault runtime, from memory (no row reads), at most 50 retirements per call (the rest at the
+  next trigger), skipped while the daily write limit is latched or a restore runs. A store with an open socket is kept
+  (and marked seen). Its install, if it still exists, registers a new store at its next start, as after "Remove
+  device".
 - **Variables** (`[vars]` in `wrangler.toml`; all optional):
   - `YAOS_TICKET_TTL_MS`: streams ticket lifetime (default 5 min, D4);
+  - `YAOS_INACTIVITY_RETIRE_DAYS`: the inactivity retirement threshold in whole UTC days (default 90, clamped to
+    1–3650; `readInactivityRetireDays`, `server/src/vault/pairing.ts`);
   - `YAOS_STREAMS_*` (`GC_IDLE_MS`, `GC_MAX_MS`, `GC_MAX_BYTES`, `GC_MIN_INTERVAL_MS`, `GC_LEAD_MS`, `GC_QUIET_MS`,
     `RATE_BYTES_PER_SEC`, `BURST_BYTES`, `MAX_SOCKETS`): the relay's group commit, per-device rate and socket cap
     (`readStreamRelayConfig`, `server/src/streams/relay.ts`). Every knob that delays a commit is clamped to 5 s;
@@ -158,10 +167,23 @@ working; phase 2 switches it to grants.
 | `DELETE /vault/:id/auth/device` | bearer | The store retires itself |
 | `DELETE /vault/:id/auth/grant` | `Grant <secret>` | Leaves: revokes the grant and its stores |
 | `POST /vault/:id/auth/pairing-code` | bearer or `Grant <secret>` | A device pairing code |
+| `GET /vault/:id/auth/grant` | device token | The store's grant `{grantId, grantName, grantSecret}` after a rotation (`404 grant_secret_unavailable` before any) |
 | `DELETE /operator/vaults/:id/grants/:grantId` | operator | **Revoke pairing** |
+| `POST /operator/vaults/:id/grants/:grantId/rotate` | operator | **Rotate secret**: a new grant secret; the old one stops working at once |
 
-Rows: grant enroll 2, register 2, any retire 2, revoke pairing 1 + 2 per store (DECISIONS §6.2). A restore keeps
-pairings and tombstones as they are now, like devices (D8b).
+Rows: grant enroll 2, register 2, any retire 2, revoke pairing 1 + 2 per store, rotate 1, inactivity retirement 2
+per store (DECISIONS §6.2). A restore keeps pairings, rotations and tombstones as they are now, like devices (D8b).
+
+**Rotate secret** (identity-per-store §3.4) is for a leaked data.json (a vault folder pushed to a public repository,
+shared, backed up somewhere untrusted). The server mints the new secret and keeps it hashed and, unlike a paired
+secret, also wrapped under a key derived from the vault's ticket key, so that a store of the pairing can fetch it with
+its own device token. Every live store of the pairing keeps syncing (stores authenticate with their tokens, not the
+secret). An install picks the new secret up the first time it needs it, when the old one is refused: registering a
+new store while its store is live (an epoch change, **Rebuild local cache**) or requesting a pairing code; it then
+rewrites data.json. An install with no live store (its store removed in the console or lost with IndexedDB, a copy of
+the folder that never started) cannot fetch it and has to pair again; that includes the thief holding only the old
+data.json. A thief who already registered a store from the leaked data.json holds a live token
+and fetches the new secret too: remove that store in the console and rotate again, or revoke the pairing.
 
 ## Cloudflare Access
 

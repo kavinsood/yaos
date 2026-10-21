@@ -43,6 +43,7 @@ actor-authority TTL cache, vault lifecycle states, and the `YAOS_STREAMS` flag (
 Auth: `-` none, `C` operator session cookie, `B` device bearer, `G` pairing grant (`Authorization: Grant <secret>`),
 `T` streams ticket. Everything not listed → `404 {"error":"not_found"}` with zero DO calls. The grant routes and
 `DELETE …/grants/:grantId` are identity-per-store phase 1 (§10 below); `POST /enroll` also takes the grant body there.
+`POST …/grants/:grantId/rotate` and `GET /vault/:id/auth/grant` are phase 5 (§10.1).
 
 | Route | Auth | Worker work | DO(s) |
 |---|---|---|---|
@@ -58,6 +59,7 @@ Auth: `-` none, `C` operator session cookie, `B` device bearer, `G` pairing gran
 | `GET /operator/vaults/:id/devices` | C | | config, vault |
 | `DELETE /operator/vaults/:id/devices/:deviceId` | C | | config, vault |
 | `DELETE /operator/vaults/:id/grants/:grantId` | C | grantId `^[A-Za-z0-9_-]{22}$` (else 404) | config, vault |
+| `POST /operator/vaults/:id/grants/:grantId/rotate` | C | grantId as above; no body; D8b freeze as revoke | config, vault |
 | `POST /operator/vaults/:id/reset-streams` | C | | config, vault |
 | `POST /operator/vaults/:id/restore` | C | | config (session, journal, steps), vault |
 | `POST /enroll` | code | code regex; vaultId taken from the code | vault |
@@ -66,6 +68,7 @@ Auth: `-` none, `C` operator session cookie, `B` device bearer, `G` pairing gran
 | `POST /vault/:id/auth/device/retire` | retire key | | vault |
 | `POST /vault/:id/auth/device/status` | B | | vault |
 | `DELETE /vault/:id/auth/grant` | G | | vault |
+| `GET /vault/:id/auth/grant` | B | | vault |
 | `POST /vault/:id/auth/ticket` | B | | vault |
 | `GET /vault/:id/ws/streams` | T | `streamsVersion` check (1008 `update_required`) | vault |
 | `GET /vault/:id/streams/feed`, `/streams/read` | B | | vault |
@@ -530,8 +533,11 @@ CREATE TABLE retired_device (           -- tombstones, never deleted, never load
 ) WITHOUT ROWID;
 ```
 
-Init runs the v1 DDL above and then the v2 migration, so a new vault and a migrated one are identical. A vault made
-before v2 migrates once, at the first load of a runtime (G54).
+Identity v3 (phase 5, §10.1): `pairing_grant` gains `secret_wrap BLOB` (null until the grant's first rotation: IV ||
+AES-GCM of the rotated secret under an HKDF key of `ticket_key`, AAD vaultId and grantId).
+
+Init runs the v1 DDL above and then the v2 and v3 migrations, so a new vault and a migrated one are identical. A vault
+made before v2 migrates once, at the first load of a runtime (G54); one made before v3 likewise (G65).
 
 Probing an unknown vault reads `vault_meta`; "no such table" means unknown, cached in memory (init runs in the same
 object, so the cache stays coherent). Rows read per runtime: meta 1 + grants G + devices N, then 0 per bearer auth.
@@ -553,6 +559,9 @@ expired over 24 h.
 | Ticket | none (key and devices in memory); the first of a UTC day per device: UPDATE device (`last_seen_day`) | 0 (1) |
 | Revoke, self-retire, retire by key | DELETE device + INSERT retired_device | 2 |
 | Revoke pairing, leave (§10) | UPDATE pairing_grant + D × (DELETE device + INSERT retired_device) | 1+2D |
+| Rotate secret (§10.1) | UPDATE pairing_grant (`secret_hash`, `secret_wrap`); unknown or revoked grant 0 | 1 |
+| Grant fetch (§10.1) | none (grants in memory) | 0 |
+| Inactivity retirement (§10.1), inside register / device status / listing | per stale device: DELETE device + INSERT retired_device (≤ 50 a call); a stale device with an open socket: UPDATE device (`last_seen_day`); no stale device, or already swept today: none | 2 each (1) |
 | Reset | DELETE H heads + S segments + C chunks; UPDATE meta | H+S+C+1 |
 | Restore prepare (D8b) | UPDATE meta (marker; the rewind erases it) | 1 |
 | Restore finish (D8b) | replace D device rows (+1 UPDATE per row differing only in `last_seen_day`), G' grant rows and R' missing tombstones; DELETE P codes; UPDATE meta | ≈ D+G'+R'+P+1 |
@@ -667,6 +676,9 @@ WB files in `tests/server/` (WB file names are suggestions).
 | T-LAST-SEEN | `last_seen_day` ≤ 1 write a device a UTC day; the listing has no secret material | WB | n/a (new) | grants.ts |
 | T-RESTORE-GRANTS | a restore keeps a revoked pairing revoked and a tombstone | WB | n/a (new) | grants.ts |
 | T-MIGRATE-V2 | a v1 vault migrates once at its first load, rows intact, 0 CF rows (G54) | WB | n/a (new) | vault-host.ts |
+| T-INACTIVE | not seen > 90 UTC days → retired with a tombstone at the next register / device status / listing; exactly 90 kept; an open socket kept and marked seen; an unused registration retired; once a UTC day; ≤ 50 a call; skipped while latched; threshold override | WB | n/a (new) | identity-hygiene.ts |
+| T-ROTATE | rotate: old secret 401 at once, a live store fetches the new one, 1 row; unknown / revoked 0 rows; 404 before any rotation; 403 old enroll; 401 revoked; survives a D8b restore; zero config-DO calls on the fetch | WB | n/a (new) | identity-hygiene.ts |
+| T-MIGRATE-V3 | a v2 vault gains `secret_wrap` at its next load; its grants keep working (G65) | WB | n/a (new) | identity-hygiene.ts |
 
 ---
 
@@ -941,3 +953,33 @@ Gap calls (accepted with phase 1; marked `DECISIONS-GAP` in code where they sit 
   force a re-rewind), it is skipped while the daily limit is latched, and a failed write never refuses the ticket.
 - G64 T-LEGACY-404 no longer lists `POST` and `DELETE /vault/:id/auth/device`: they are the register and self-retire
   routes now (other methods on the path stay 404).
+
+## 10.1 Identity per store, phase 5 (hygiene)
+
+The server half of identity-per-store §12.2 phase 5. Routes in §2.2; schema in §6.1; rows in §6.2; tests in §7
+(identity-hygiene.ts); operations.md "Device identity routes" and "Limits".
+
+- **Inactivity retirement** (owner decision 4). A device whose `last_seen_day` (an old enroll: its enroll day) is
+  more than 90 UTC days old (`INACTIVITY_RETIRE_DAYS`; `YAOS_INACTIVITY_RETIRE_DAYS`, 1–3650) is retired through D7's
+  revoke turn plus a tombstone, like "Remove device". No alarm: the scan is lazy, inside `POST /auth/device`, `POST
+  /auth/device/status` and `GET …/devices`, from the in-memory map (0 row reads), at most one full scan per UTC day
+  per runtime, at most 50 retirements a call, skipped while the daily limit is latched or a restore is pending. A
+  stale device with an open socket is kept and marked seen. The device status route is the trigger that resolves an
+  abandoned create unattended: holders of a body-less doc ask about its creator every 5–60 min.
+- **Rotate secret** (identity-per-store §3.4). `POST …/grants/:grantId/rotate` mints a new secret (32 random bytes)
+  and replaces `secret_hash` and `secret_wrap` in one UPDATE: the old secret is unknown at once, the grant's devices
+  stay live. `GET /vault/:id/auth/grant` (device bearer) answers `{grantId, grantName, grantSecret}` from the wrap;
+  `404 grant_secret_unavailable` before any rotation, `401 grant_revoked`, `403 grant_required` for an old enroll,
+  `409 grant_rotating` if a rotation landed while it was unwrapping. Console: "Rotate secret" per pairing.
+
+Gap calls (phase 5):
+
+- G65 Identity v3 (`ALTER TABLE pairing_grant ADD COLUMN secret_wrap BLOB`) migrates like G54: detected by "no such
+  column: secret_wrap" on the grant scan every runtime does anyway, run in one transaction at the first load; a vault
+  older than v2 runs both. Not an `identityWrites` write.
+- G66 Inactivity retirements and rotations are `identityWrites` writes (authority): one that lands in a D8b rewind
+  window forces the re-rewind, as an operator revoke would. The rotation is also under D8b's freeze (FrozenAction
+  "revoke"). The journal carries `secretWrap` with each grant, so a restore keeps a rotation as it is now.
+- G56 amended: the server keeps a rotated secret wrapped (not only hashed) so that a live store can fetch it; the key
+  is derived from `ticket_key` and never leaves the DO. A paired secret (client-minted) is still hash-only. The D8b
+  journal (config DO) holds the wrap but not the key.

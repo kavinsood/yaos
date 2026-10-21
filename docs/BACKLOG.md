@@ -1,6 +1,6 @@
 # Backlog
 
-Status: the open work as of 2026-10-21, on `sim-port` (identity-per-store through phase 4 on `client-remake-next`). The list is the project owner's (2026-10-21); the context
+Status: the open work as of 2026-10-21, on `sim-port` (identity-per-store through phase 4 on `client-remake-next`, phase 5 on `identity/phase5-hygiene`). The list is the project owner's (2026-10-21); the context
 under each item is checked against the code and the notes it names. Done work is not kept here once merged (the last
 section lists what landed on `sim-port` since 33bdf49b): it is in git history and in the notes
 ([integration-notes.md](client-remake/integration-notes.md) §3, the sim regression plans). Smaller known gaps that
@@ -45,20 +45,13 @@ that takes longer than 5 s to start the worker stops syncing until "Restart sync
 
 ## 2. Smaller open items
 
-### IDENTITY-HYGIENE: identity-per-store phase 5 (optional)
+### DATAJSON-REFETCH: rewrite a lost data.json from the store (declined for now)
 
-CLONED-ID and FRAMENO-IDB are closed (below, "Landed"). What [identity-per-store](client-remake/identity-per-store.md)
-§12.2 leaves for phase 5, none of it needed for correctness:
-- **Inactivity retirement** (decision 4: 90 days, lazily at the next registration or listing; `last_seen_day` is
-  recorded since phase 1). Until then an abandoned store (a clone deleted, a profile wiped without its successor
-  fencing it) stays live on the server: its body-less creates wait (DESIGN §i.5 "Abandoned creates") until the console's
-  "Remove device".
-- **Grant rotation** and re-fetch with the device token (§3.4), and rewriting a lost data.json from the store (§4
-  "data.json lost").
-- **Orphan DB sweep** (§6.4): `yaos3:<vaultId>:*` DBs whose install key is lost, deleted once the server reports their
-  identity retired or unknown.
-- **`rebuildLocalCache` as a store reset** (§4): the command restarts the runtime on the same store today; it should
-  flush the mirror, delete the DB, mint and recover with the old store as the predecessor, like a `Repo.open` mismatch.
+identity-per-store §4 "data.json lost, store intact" optionally has the store re-fetch its grant with its device token
+and rewrite data.json. Not built with phase 5: data.json is the only place the pairing's host and vaultId live (the
+install record and the store DB name hold the vaultId but not the host), so a store has nothing to call. The
+install pairs again, as before. The route it would use exists (`GET /vault/:id/auth/grant`, phase 5) but returns a
+secret only after a rotation.
 
 ### QUARANTINE-UI: quarantine release control in the UI
 
@@ -138,7 +131,13 @@ Kept here until `sim-port` merges; then git history holds them.
   data.json fields moved to `App.saveLocalStorage` (§8; a one-time notice when another tool syncs the folder). With
   that, frameNo allocation is exact (e2ee-design §8.2): the wall-clock floor (44748cb2, f47950cb), the 64 skip,
   `renumberBlind` and the epoch `frameNoFloor` are gone. Residual: a duplicated app profile (Migration Assistant, a
-  Time Machine restore onto a second Mac) still runs two installs as one store (decision 7, accepted); phase 5 above.
+  Time Machine restore onto a second Mac) still runs two installs as one store (decision 7, accepted).
+- **IDENTITY-HYGIENE** (identity-per-store phase 5, `identity/phase5-hygiene`): stores not seen for 90 days are
+  retired lazily by the server (so an abandoned store's body-less creates resolve without a console action); the
+  operator can rotate a pairing's secret and live stores fetch the new one with their token; at live, a device deletes
+  the store DBs of this vault under a lost install key once the server reads them retired; **Rebuild local cache** is
+  a store reset (a new identity that fences and inherits from the old store). Declined: replay-ring compaction
+  (decision 6: rings are kept, ~1.5 KB per device and stream) and DATAJSON-REFETCH above.
 
 - **BLOB-RETRY** (473cd500, after 31987119): a downloaded attachment whose disk write keeps failing backs its
   re-downloads off per (doc, hash), 1 min doubling to a cap scaled by size (10–60 min), and is listed
