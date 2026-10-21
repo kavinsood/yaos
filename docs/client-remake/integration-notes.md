@@ -1281,9 +1281,14 @@ built with `YAOS_KEEP_NAMES=1`. The instrumentation does not shift the total, wh
   | Call | n | p50 ms | sum s | Issued by |
   |---|---|---|---|---|
   | `write` | 1040 | 16.2 | 18.2 | Obsidian's `vault.create` |
-  | `read` | 997 | 12.9 | 13.9 | Obsidian (its metadata cache reading each new note) |
-  | `readBinary` | 1001 | 10.8 | 11.8 | YAOS: `diskExecutor.readVault`, the engine reading each file back after writing it |
-  | `exists` | 2184 | 2.9 | 9.2 | YAOS's `absent` precondition (`obsidianVault.check`), plus Obsidian's own inside `create` |
+  | `read` | 997 | 12.9 | 13.9 | Obsidian's File recovery core plugin (`vault.read` of each created file) |
+  | `readBinary` | 1001 | 10.8 | 11.8 | Obsidian's metadata cache (`vault.readBinary` + hash of each new note) |
+  | `exists` | 2184 | 2.9 | 9.2 | ~1000 YAOS's `absent` precondition (`obsidianVault.check`), ~1000 Obsidian's own inside `create`, the rest on `mkdir` paths |
+
+  Corrected 2026-10-21 (from obsidian.asar 1.14.4 app.js): the first version of this table gave `readBinary` to
+  YAOS's read-back and `read` to the metadata cache. YAOS issues only the `absent` precondition's `exists` (~4.5 s
+  summed), removed in perf-boot (1cc63f58). The other ~4 calls per file are Obsidian's, so only concurrency can cut
+  them.
   | `mkdir` | 124 | 8.8 | 1.2 | `createFolder` |
   | `writeBinary` | 26 | 24.6 | 0.7 | attachments |
 

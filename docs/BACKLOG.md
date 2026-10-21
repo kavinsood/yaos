@@ -56,28 +56,27 @@ the same vault in ~2.7 s ([integration-notes](client-remake/integration-notes.md
 **Where the time goes, profiled on the device:**
 - **The ~43 s steady phase is Obsidian's native file bridge.** A DataAdapter call is in flight 94% of the time,
   back to back and mostly one at a time.
-  - About 5.4 bridge calls per file: Obsidian's `create` (`exists` + `write`), Obsidian's metadata `read`, and two
-    of YAOS's own: the `absent` precondition's `exists` (`src/host/obsidianVault.ts` `check`) and the engine reading
-    each file back after writing it (`src/host/diskExecutor.ts` `readVault`, `readBinary`).
+  - About 5.4 bridge calls per file: Obsidian's `create` (`exists` + `write`), Obsidian's metadata cache
+    (`readBinary`), Obsidian's File recovery plugin (`read`), and one of YAOS's own: the `absent` precondition's
+    `exists` (`src/host/obsidianVault.ts` `check`).
   - IndexedDB can account for at most ~6% of this phase.
 - **~7.2 s before the first file are spent in the worker and on the network, not yet attributed.**
 
-**Next, measured on the phone after each step:**
-1. **Write independent files concurrently.**
-   - The bridge serves 4 calls in flight 2-3x faster than one at a time.
-   - The plan runner materializes in order today (§f.2).
-2. **Drop YAOS's two bridge calls per created file:**
-   - the pre-create `exists`: `vault.create` already throws when the path exists, and the catch re-checks;
-   - the read-back after our own write: the engine knows the bytes it wrote.
+**In `perf-boot` (1cc63f58), phone numbers pending:**
+1. **Independent files are written concurrently:** `Budgets.diskOpConcurrency` (4, constrained 2) in the host's
+   DiskExecutor and the plan runner's materialize window. The bridge serves 4 calls in flight 2-3x faster than one.
+2. **YAOS's `exists` before each create is gone** (~4.5 s summed): `vault.create` checks the disk itself. The other
+   ~4 calls per file are Obsidian's and stay; only concurrency shortens them.
 
-   Together these are ~21 s of the 55 s of summed bridge time.
-3. **Attribute the 7.2 s.**
-   - Export the engine's diagnostics phase timeline over DevTools at the end of a run.
-   - Get the worker hooks working (they recorded nothing in the profile run).
-4. **One transaction per catch-up batch** instead of three per file: hygiene, worth ≤ ~2.6 s here.
+**Next:**
+1. **Measure 1-2 on the phone** (`phoneBench.ts`, 3 runs against the baseline).
+2. **Attribute the 7.2 s.** The old profile shows main and Obsidian's worker idle in it, so it is the engine worker
+   or the network; its capture was empty. `phoneProfile.ts` now holds new workers until hooked, records the
+   host <-> engine messages, the relay socket and IndexedDB, and drains every second.
+3. **One transaction per catch-up batch** instead of three per file: hygiene, worth ≤ ~2.6 s here.
 
-**Found on the way:** `STARTUP_PING_TIMEOUT_MS` (5 s, `src/host/engineHost.ts`) is fatal and not retried. A phone
-that takes longer than 5 s to start the worker stops syncing until "Restart sync engine".
+**Found on the way, fixed in `perf-boot`:** the startup ping (`src/host/engineHost.ts`) was fatal after 5 s. A miss
+now pings again with twice the deadline, 4 pings (75 s) before the fatal; worker errors still end it at once.
 
 ## 2. Smaller open items
 

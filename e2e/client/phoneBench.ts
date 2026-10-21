@@ -3,7 +3,8 @@
  * shape), so the phone's numbers sit next to bootBench's fresh Node devices. Per run, on the phone's bench vault
  * folder: stop Obsidian, revoke the previous run's device, wipe the folder (everything but .obsidian, plus the
  * plugin's data.json), push the current build, reopen Obsidian on the vault, mint a pairing code and open the setup
- * link. The only manual step is the Pair tap. Timed on the laptop, by polling the folder over adb: Pair (data.json
+ * link. The only manual steps are the Pair tap and, if the phone is locked, unlocking it: the bench wakes the screen
+ * and keeps it on while on USB until it exits. Timed on the laptop, by polling the folder over adb: Pair (data.json
  * holds an identity) -> first file -> every seeded file. A new pairing is a new device id and the store is per device
  * (store/schema.ts: yaos2:<vault>:<epoch>:<device>), so every run bootstraps from an empty IndexedDB.
  *
@@ -21,7 +22,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Report, sleep } from "./engineKit";
 import { contextPath, DEFAULT_LOG_DIR, devicePairingCode, revokeDevice, type OnboardDevice, type OnboardedVault } from "./onboard";
-import { attribute, cpuSummary, PhoneProfile } from "./phoneProfile";
+import { attribute, cpuInWindow, PhoneProfile, timeline } from "./phoneProfile";
 
 function arg(name: string, fallback: string): string {
 	const i = process.argv.indexOf(`--${name}`);
@@ -38,6 +39,8 @@ const DIR = arg("dir", `/sdcard/Documents/${VAULT_NAME}`);
 const PLUGIN = arg("plugin", new URL("../../dist/yaos-client/yaos", import.meta.url).pathname);
 const OPEN_WAIT_MS = Number(arg("open-wait-s", "10")) * 1000;
 const PAIR_TIMEOUT_MS = 5 * 60_000;
+/** How long a run waits for the phone to be unlocked before it opens Obsidian. */
+const UNLOCK_TIMEOUT_MS = 30 * 60_000;
 const FILES_TIMEOUT_MS = 20 * 60_000;
 const PKG = "md.obsidian";
 const PLUGIN_DIR = `${DIR}/.obsidian/plugins/yaos`;
@@ -167,7 +170,34 @@ async function devtoolsPage(): Promise<string> {
 	return page.webSocketDebuggerUrl;
 }
 
+/** The screen stays on while the phone is on USB for the bench (restored at exit): a dozing phone shows no pair modal. */
+let stayOn: string | null = null;
+function keepAwake(): void {
+	if (stayOn === null) stayOn = sh("settings get global stay_on_while_plugged_in") || "0";
+	sh("svc power stayon usb");
+	sh("input keyevent KEYCODE_WAKEUP");
+}
+function restoreAwake(): void {
+	if (stayOn !== null) sh(`settings put global stay_on_while_plugged_in ${q(stayOn)}`);
+}
+const locked = () => /isKeyguardShowing=true|mDreamingLockscreen=true/.test(sh("dumpsys window | grep -E 'isKeyguardShowing|mDreamingLockscreen'"));
+
+/** Wakes the screen and waits (asking once) until the keyguard is gone. */
+async function unlocked(): Promise<void> {
+	keepAwake();
+	if (!locked()) return;
+	console.log("the phone is locked: unlock it (the screen stays on while the bench runs)");
+	const t = performance.now();
+	while (locked()) {
+		if (performance.now() - t > UNLOCK_TIMEOUT_MS) throw new Error("the phone stayed locked for 30 min");
+		await sleep(1000);
+		sh("input keyevent KEYCODE_WAKEUP");
+	}
+	console.log("unlocked");
+}
+
 async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<Run> {
+	await unlocked();
 	await reset(vault);
 	installPlugin();
 	sh(`am start -a android.intent.action.VIEW -d ${q(`obsidian://open?vault=${encodeURIComponent(VAULT_NAME)}`)}`);
@@ -219,29 +249,31 @@ async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<
 async function profileOf(prof: PhoneProfile, wall0: number, run: Run, k: number): Promise<unknown> {
 	const offset = await prof.clockOffsetMs();
 	await sleep(1000);
-	const threads = await prof.finish();
+	const threads = await prof.finish(offset);
 	const at = (ms: number) => wall0 + offset + ms;
 	const first = run.firstFileMs ?? 0;
 	const end = run.filesMs ?? first;
-	const windows = {
-		toFirstFile: attribute(threads, [at(0), at(first)]),
-		firstToAll: attribute(threads, [at(first), at(end)]),
-		all: attribute(threads, [at(0), at(end)]),
-	};
+	const wins = { toFirstFile: [at(0), at(first)], firstToAll: [at(first), at(end)], all: [at(0), at(end)] } as const;
+	const windows = Object.fromEntries(Object.entries(wins).map(([w, win]) => [w, attribute(threads, [win[0], win[1]])]));
 	const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
 	const base = join(DEFAULT_LOG_DIR, `client-e2e-phone-profile-${LABEL.replace(/[^a-z0-9.-]/gi, "_")}-${stamp}-run${k + 1}`);
-	const cpu: Record<string, unknown> = {};
+	const cpu: Record<string, Record<string, unknown>> = {};
 	for (const t of threads) {
-		if (t.profile) {
-			writeFileSync(`${base}-${t.thread}.cpuprofile`, JSON.stringify(t.profile));
-			cpu[t.thread] = cpuSummary(t.profile);
-		}
+		if (t.chunks.length === 0) continue;
+		writeFileSync(`${base}-${t.thread}.cpuchunks.json`, JSON.stringify(t.chunks));
+		cpu[t.thread] = Object.fromEntries(Object.entries(wins).map(([w, win]) => [w, cpuInWindow(t.chunks, [win[0], win[1]])]));
 	}
-	writeFileSync(`${base}-events.json`, JSON.stringify({ wall0, offset, run, threads: threads.map((t) => ({ thread: t.thread, url: t.url, hook: t.hook, events: t.events })) }));
-	const threadInfo = threads.map((t) => ({ thread: t.thread, url: t.url.slice(0, 80), hook: t.hook, events: t.events.length }));
-	console.log(JSON.stringify({ threads: threadInfo, windows: Object.fromEntries(Object.entries(windows).map(([w, a]) => [w, { windowMs: a.windowMs, split: a.split, busyMs: a.busyMs }])) }, null, 1));
+	// The startup stall: everything from 1 s before the pair was seen (the poll lags it) to the first file.
+	const startup = timeline(threads, [at(-1000), at(first)]);
+	writeFileSync(`${base}-events.json`, JSON.stringify({ wall0, offset, run, threads: threads.map((t) => ({ thread: t.thread, url: t.url, hook: t.hook, goneAtMs: t.goneAtMs, events: t.events })) }));
+	writeFileSync(`${base}-startup.txt`, startup.join("\n") + "\n");
+	const threadInfo = threads.map((t) => ({ thread: t.thread, url: t.url.slice(0, 80), hook: t.hook, events: t.events.length, chunks: t.chunks.length, gone: t.goneAtMs === null ? null : r1(t.goneAtMs - at(0)) }));
+	const busy = Object.fromEntries(Object.entries(cpu).map(([t, w]) => [t, Object.fromEntries(Object.entries(w).map(([n, c]) => [n, (c as { busyMs: number }).busyMs]))]));
+	console.log(JSON.stringify({ threads: threadInfo, cpuBusyMs: busy, windows: Object.fromEntries(Object.entries(windows).map(([w, a]) => [w, { windowMs: a.windowMs, split: a.split, busyMs: a.busyMs }])) }, null, 1));
+	console.log(`startup timeline (ms from pair seen, ${startup.length} lines):`);
+	for (const l of startup.slice(0, 120)) console.log(`  ${l}`);
 	console.log(`profile files: ${base}-*`);
-	return { offsetMs: r1(offset), threads: threadInfo, windows, cpu };
+	return { offsetMs: r1(offset), threads: threadInfo, windows, cpu, startup };
 }
 
 // ---- main ------------------------------------------------------------------------------------------------------
@@ -290,5 +322,6 @@ try {
 	fatal = e instanceof Error ? (e.stack ?? e.message) : String(e);
 	R.check("run completed", false, fatal);
 }
+restoreAwake();
 const [, failed] = R.write(DEFAULT_LOG_DIR, "client-e2e-phone", LABEL, HOST, vault, fatal);
 process.exit(failed === 0 ? 0 : 1);
