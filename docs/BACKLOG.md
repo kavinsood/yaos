@@ -65,21 +65,6 @@ need it: they thaw on their own, 3a569113.)
 
 ## 3. Bigger work
 
-### PRUNE-RESTORE: a delete pruned before the editor's restore commits trashes the edit
-
-An edit the delete did not cover beats the delete (§c.7): the editor's device restores the doc. If the delete is
-pruned (§c.9) before that restore commits, the restore names an unknown docId and the editor's planner takes the
-"absent (pruned)" row: an unchanged file (S tracks the edits it already sent) goes to the trash, braked, with the
-edit. Own frames still in the outbox are covered (the file is created anew, sim smallPrune seed 104); sent ones are
-not. Production needs 19000 newer tombstones inside the restore window (minutes), so the race is theoretical there;
-the sim's small-cap matrix keeps the newest 2+ tombstones for that reason (`src/sim/run.ts` `pruneWorld`), and a cap
-that prunes down to 0 reproduces it (seeds 10, 20 with cap 1..5, hysteresis 0..cap). A fix would keep, per pruned
-doc, what the planner needs to tell an uncovered own edit (the delete's base seq) past the prune, or hold a prune of
-a delete younger than some ns-seq horizon.
-
-The soak's small-cap draws reach it under storms too (PRUNE-STORM, §5), where a mass delete outnumbers the newest
-tombstones `pruneWorld` keeps, and a related shape with no delete at all: merged aliases pruned after an epoch reset.
-
 ### SIM-COVERAGE: generators for coverage keys that never fire
 
 The generators (`generators`: targeted relay faults, delete / restore races, a hostile member device, conflict shapes,
@@ -155,16 +140,6 @@ relay hold the newer text of `notes/r5.md`, A's disk the old one.
 `532933571-114.json` (clone faults, 4 devices; found on 70c67349, base): no quiescence, D waits on the creator of a
 body-less doc whose body never comes.
 
-### PRUNE-STORM: pruning under storms loses edits (soak small-cap draws)
-
-The soak's small tombstone cap met storms (FLOOD_FAULTS) twice in 602 runs, both a token loss that passes without
-`smallPrune` and on `generators` alone. `prune-epoch-merged-overwrite.json` (10 steps: an import storm, C's IndexedDB
-lost, an epoch reset, two mass overwrites; no file is deleted, so every pruned entry is a merged alias of the
-re-creates after the reset): A's overwrite of 10 notes is lost. In production an epoch reset of a large vault makes
-(devices − 1) × notes merged aliases at once, enough to pass the 19000 cap. `prune-storm-mass-delete.json` (58 steps,
-mass deletes and import storms): imported notes lost, likely PRUNE-RESTORE with more deletes than the 2+ newest
-tombstones `pruneWorld` keeps. Until fixed, the nightly soak can fail on these.
-
 ### SIM-E2EE-LOG-BUSY: a suite-1 device's log never goes idle; devices end on different epochs
 
 `e2ee-log-busy-89423454.json` (E2EE faults, 5 devices, suite 1): no quiescence ("A log busy"), devices seal under
@@ -212,7 +187,14 @@ Kept here until `sim-port` merges; then git history holds them.
   relay drops their rows (H7), and every device then drops their local records in one transaction (§b.5, §d.9,
   `src/engine/body/retire.ts`). A bound doc the fold pruned re-binds its views by path. The prune cap is a fold rule the
   sim can set (`EngineTuning.nsPrune`, matrix "small tombstone cap", invariant `retired`). Found on the way: the
-  planner's pruned row trashed a file whose own edits were still in the outbox (now re-created; PRUNE-RESTORE).
+  planner's pruned row trashed a file whose own edits were still in the outbox (now re-created).
+- **PRUNE-RESTORE, PRUNE-STORM** (`fix-prune`): a delete pruned before its edit-beats-delete restore committed
+  trashed the editor's sent edits (the restore names a docId the fold no longer has). Pruned docs keep their restore
+  duty on the device (§c.9 "Pruned docs"): the `pruned` event carries the removed entries, the delete's base goes onto
+  the doc's stream record (also for an ns checkpoint adopted past the prune), and the pruned row re-creates a file
+  with own rows past that base instead of trashing it. The soak's storm failures were the same: a mass delete, or an
+  epoch reset's migrated-loser collapse, pruned in the frame that made it. The sim's small cap now draws 0..8, pruned
+  to 0..cap (goal 0: every delete pruned at once); plans in `src/sim/regressions/prune-*.json`.
 - **PLAN-PRUNED** (d1f8a750): the planner's "absent (pruned)" row tells a prune from an own create that folded as
   ignored; such a file is re-created, never trashed, and a file owned by a live doc at the path is never touched
   (§f.2).

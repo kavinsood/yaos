@@ -1,0 +1,134 @@
+{
+	"seed": 10,
+	"config": {
+		"devices": 3,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 1,
+			"idbLost": 1,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"smallPrune": {
+			"tombstoneCap": 1,
+			"pruneHysteresis": 1
+		},
+		"seed": 10
+	},
+	"violations": [
+		{
+			"inv": "tokens",
+			"detail": "lost [A.32] (disk-external on A at step 32)"
+		}
+	],
+	"minimizedPlan": [
+		{
+			"i": 3,
+			"gapMs": 1284,
+			"fault": {
+				"t": "relayDrain"
+			}
+		},
+		{
+			"i": 5,
+			"gapMs": 169,
+			"fault": {
+				"t": "background",
+				"dev": 0,
+				"event": "freeze",
+				"durationMs": 24938
+			}
+		},
+		{
+			"i": 15,
+			"gapMs": 485,
+			"user": {
+				"t": "delete",
+				"dev": 1,
+				"file": 0.3736605625599623
+			}
+		},
+		{
+			"i": 142,
+			"gapMs": 359,
+			"canvas": {
+				"t": "cColor",
+				"dev": 1,
+				"file": 0.46214781585149467,
+				"node": 0.023821293376386166,
+				"clear": true
+			}
+		},
+		{
+			"i": 32,
+			"gapMs": 581,
+			"user": {
+				"t": "diskInsert",
+				"dev": 0,
+				"file": 0.42244352702982724,
+				"pos": 0.11466998187825084,
+				"by": "external"
+			}
+		},
+		{
+			"i": 33,
+			"gapMs": 191,
+			"fault": {
+				"t": "offline",
+				"dev": 1,
+				"durationMs": 102466
+			}
+		},
+		{
+			"i": 143,
+			"gapMs": 353,
+			"canvas": {
+				"t": "cAddEdge",
+				"dev": 0,
+				"file": 0.9985298202373087,
+				"from": 0.2157683833502233,
+				"to": 0.13464945484884083,
+				"seed": 1001775354
+			}
+		},
+		{
+			"i": 35,
+			"gapMs": 383,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.8276228425092995,
+				"pos": 0.5507891376037151,
+				"nl": false
+			}
+		}
+	]
+}

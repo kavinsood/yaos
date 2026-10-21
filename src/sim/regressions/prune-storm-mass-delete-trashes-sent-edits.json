@@ -72,7 +72,10 @@
 			"bigReformat": 0,
 			"bigEdit": 0
 		},
-		"smallPrune": true
+		"smallPrune": {
+			"tombstoneCap": 8,
+			"pruneHysteresis": 3
+		}
 	},
 	"violations": [
 		{
