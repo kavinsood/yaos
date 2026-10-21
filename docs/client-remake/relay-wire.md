@@ -587,7 +587,9 @@ a dead log). A put without `vaultEpoch` (older clients) is not checked.
 2. Get a ticket, connect, and wait for `VAULT_READY`. Note `vaultEpoch` and `head = H`. Buffer live frames from
    here on. Send `STREAM_SUBSCRIBE` with the streams you need live (§5.6), and resend it after every
    `STREAM_RESEND`.
-3. If `vaultEpoch` differs from the stored one, drop all cursors.
+3. If `vaultEpoch` differs from the stored one, drop all cursors. Every later feed / read reply carries `vaultEpoch`
+   too: discard one that differs from the session's (the vault was reset or restored while it was in flight; its seqs
+   and rows are another epoch's), and name the session's epoch in every checkpoint put (§8).
 4. Feed from the stored vault cursor `C` up to `nextAfter = null`. For every stream you track whose
    `lastSeq > its cursor`, page `read` from that stream's cursor. Always track `ns`.
 5. Apply the buffered live frames, skipping seqs ≤ the stream cursor you already hold. Then set `C = max(H, feed head)`.

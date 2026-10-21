@@ -169,6 +169,21 @@ test("relay checkpoint: a put in flight across a reset or restore is refused epo
 	assert.deepEqual(await pump(clock, reset), { t: "refused", reason: "epoch-mismatch", retryAfterMs: null });
 });
 
+test("relay http: a feed / read answered in another epoch than the session's rejects epoch_mismatch (relayHttp checks the reply's vaultEpoch)", async () => {
+	const { clock, relay, a } = await setup({ link: { httpMs: 30 } });
+	await commitEach(clock, a, [["ns", "c1", 10]]);
+	const feed = a.session.feed(0);
+	const read = a.session.read(ns, 0, false);
+	const batch = a.session.readBatch([{ stream: ns, afterSeq: 0, preferCheckpoint: false }, { stream: "b:x" as StreamName, afterSeq: 0, preferCheckpoint: false }]);
+	await clock.advance(10);
+	relay.resetEpoch("epoch-reset" as Parameters<SimRelay["resetEpoch"]>[0]);
+	await assert.rejects(pump(clock, feed), rejectsWith("epoch_mismatch"));
+	await assert.rejects(pump(clock, read), rejectsWith("epoch_mismatch"));
+	await assert.rejects(pump(clock, batch), rejectsWith("epoch_mismatch"));
+	const b = await connectPeer(relay, clock, "B");
+	assert.equal((await pump(clock, b.session.feed(0))).headSeq, 0, "a session of the new epoch reads it");
+});
+
 test("relay http: answered from state at request arrival (httpMs each way); does not flush the buffer; setHttpFailure -> network_error", async () => {
 	// Opt-out: the frame must stay buffered across the 60 ms round trip (a leading-edge commit lands at 20 ms).
 	const { clock, relay, a } = await setup({ link: { httpMs: 30 }, groupCommit: SIM_IDLE_ONLY_GROUP_COMMIT });

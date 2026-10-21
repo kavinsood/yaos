@@ -184,7 +184,9 @@ Kept here until `sim-port` merges; then git history holds them.
   put now carries `vaultEpoch` (relayHttp, from the session's VAULT_READY) and the server refuses another epoch
   `409 epoch_mismatch` in the writing turn (relay-wire §8); the sim relay does the same; the engine records nothing
   and backs off. Plan `src/sim/regressions/checkpoint-put-across-epoch-restore.json`, tests in
-  `src/sim/relay-http.test.ts`, `src/engine/adapters/relayHttp.test.ts`, `tests/server/streams-relay.ts`.
+  `src/sim/relay-http.test.ts`, `src/engine/adapters/relayHttp.test.ts`, `tests/server/streams-relay.ts`. The same
+  hole on the read side: a feed / read reply computed after a reset or restore was applied to the old epoch's store
+  (relayHttp never compared the reply's `vaultEpoch`); it now rejects `epoch_mismatch` (the read ends "aborted").
 - **SIM-EPOCH-COMMIT-CRASH** (`fix-epoch`): two losses of an edit typed into an open note whose editor died
   unsaved, so the store held its only copy. (1) The note renamed first (relay seed 134): the restart's first pass
   (ns not ready) marked the doc's file gone, and the epoch migration's stranded-edit merge (§c.12 step 5) looked at

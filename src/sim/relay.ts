@@ -137,9 +137,9 @@ export class SimRelay implements RelayPort {
 		this.host = {
 			clock: this.clock,
 			arrive: (session, msg) => this.engine.arrive(session, msg),
-			feed: (session, afterSeq) => this.http(session, () => this.feedPage(afterSeq, session.deviceId)),
-			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.viaWire([{ stream, afterSeq, preferCheckpoint: prefer }], [this.readPage(stream, afterSeq, prefer, undefined, session.deviceId)])[0]!),
-			readBatch: (session, reqs) => this.readRequest(session, () => this.viaWire(reqs, this.readBatchPages(reqs, session.deviceId))),
+			feed: (session, afterSeq) => this.http(session, () => this.sameEpoch(session, () => this.feedPage(afterSeq, session.deviceId))),
+			read: (session, stream, afterSeq, prefer) => this.readRequest(session, () => this.sameEpoch(session, () => this.viaWire([{ stream, afterSeq, preferCheckpoint: prefer }], [this.readPage(stream, afterSeq, prefer, undefined, session.deviceId)])[0]!)),
+			readBatch: (session, reqs) => this.readRequest(session, () => this.sameEpoch(session, () => this.viaWire(reqs, this.readBatchPages(reqs, session.deviceId)))),
 			putCheckpoint: (session, stream, coversSeq, expected, bytes) => this.http(session, () => this.checkpointPut(session, stream, coversSeq, expected, bytes)),
 			jitter: (session) => this.jitter(session.link),
 			listenerError: (error) => this.onListenerError(error),
@@ -177,6 +177,16 @@ export class SimRelay implements RelayPort {
 	// ---- HTTP ---------------------------------------------------------------------
 
 	/** Request travels httpMs (+jitter), is answered from the state at arrival, the response travels back. */
+	/**
+	 * A feed / read reply carries the relay's epoch; the client adapter (relayHttp) rejects one of another epoch than
+	 * its session's (code "epoch_mismatch"), so a reply computed after a reset or restore never reaches the old epoch's store.
+	 */
+	private sameEpoch<T>(session: SimRelaySession, compute: () => T): T {
+		const value = compute();
+		if (session.vaultEpoch !== this.epoch) throw new SimRelayError("epoch_mismatch");
+		return value;
+	}
+
 	private readRequest<T>(session: SimRelaySession, compute: () => T): Promise<T> {
 		this.readRequests++;
 		this.maxReadsOnWire = Math.max(this.maxReadsOnWire, ++this.readsOnWire);

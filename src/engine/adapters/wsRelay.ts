@@ -329,18 +329,18 @@ class WsRelaySession implements RelaySession {
 	}
 
 	feed(afterSeq: number) {
-		return this.http.feed(this.vaultId, afterSeq, this.limits.feedPageRows, this.gone.signal);
+		return this.http.feed(this.vaultId, this.vaultEpoch, afterSeq, this.limits.feedPageRows, this.gone.signal);
 	}
 
 	read(stream: StreamName, afterSeq: number, preferCheckpoint: boolean) {
-		return this.http.read(this.vaultId, stream, afterSeq, preferCheckpoint, this.limits.readPageBytes, this.gone.signal);
+		return this.http.read(this.vaultId, this.vaultEpoch, stream, afterSeq, preferCheckpoint, this.limits.readPageBytes, this.gone.signal);
 	}
 
 	async readBatch(reqs: readonly ReadRequest[]): Promise<readonly ReadPage[]> {
 		const first = reqs[0];
 		if (first === undefined) throw new RangeError("readBatch: no requests");
 		if (reqs.length === 1) return [await this.read(first.stream, first.afterSeq, first.preferCheckpoint)];
-		return this.http.readBatch(this.vaultId, reqs.slice(0, this.limits.readBatchStreams), this.limits.readPageBytes, this.gone.signal);
+		return this.http.readBatch(this.vaultId, this.vaultEpoch, reqs.slice(0, this.limits.readBatchStreams), this.limits.readPageBytes, this.gone.signal);
 	}
 
 	putCheckpoint(stream: StreamName, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array) {
