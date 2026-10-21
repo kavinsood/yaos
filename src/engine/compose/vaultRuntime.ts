@@ -165,6 +165,8 @@ export class VaultRuntime {
 	private readonly offs: (() => void)[] = [];
 	/** Retired creators of body-less docs (DESIGN §i.5 "Abandoned creates"). */
 	readonly creators: CreatorStatus;
+	/** Bound docs whose views showed another file than the doc's at the last pass end (retargetStrayViews). */
+	private strayViews = new Map<DocId, string>();
 	readonly stats = { passes: 0, ownFoldEvents: 0, retargets: 0, bindable: 0, cfgPasses: 0, snapshots: 0, bodyChanges: 0 };
 
 	private constructor(readonly o: VaultRuntimeStart, readonly log: LogEngine) {
@@ -559,6 +561,7 @@ export class VaultRuntime {
 			if (this.settings.snapshots.enabled) void this.snaps.maybeDaily().catch((e) => this.diag(`daily snapshot failed: ${String(e)}`));
 		}
 		this.retargetCreatedUnderViews();
+		this.retargetStrayViews();
 		this.checkBindable();
 		this.postStatus();
 		return r;
@@ -583,6 +586,36 @@ export class VaultRuntime {
 				this.sched.request({ t: "docs", docIds: [b.docId], pathKeys: [] });
 			}
 		}
+	}
+
+	/**
+	 * Every pass end: a bound doc whose views show another file than the doc's synced one re-opens them by path. Its
+	 * merges are never written while bound (§d.2), and an editor save only ever reaches the views' file, so the doc's
+	 * own file would wait for good, and an edit in the views would land in another doc's file. Views on a file another
+	 * doc is synced at re-open at once. Otherwise the pair counts only when the previous pass end saw it too: a user
+	 * rename of an open note moves the views before the pass that moves the doc.
+	 */
+	private retargetStrayViews(): void {
+		const bound = this.engine.bound;
+		const seen = new Map<DocId, string>();
+		let owners: Map<PathKey, DocId> | null = null;
+		for (const b of [...bound.byId.values()]) {
+			const s = this.rec.ctx.synced(b.docId);
+			if (!s || s.fileGone) continue;
+			const viewKey = pathKey(b.path);
+			if (viewKey === s.pathKey) continue;
+			owners ??= new Map([...this.rec.ctx.store.synced.values()].map((e) => [e.pathKey, e.docId]));
+			const owner = owners.get(viewKey);
+			const pair = `${viewKey}\u0000${s.pathKey}`;
+			if ((owner === undefined || owner === b.docId) && this.strayViews.get(b.docId) !== pair) {
+				seen.set(b.docId, pair);
+				continue;
+			}
+			this.diag(`bound doc ${b.docId}: views on ${b.path}, synced at ${s.path}: re-opening the views`);
+			this.retarget(b.docId, null);
+			this.sched.request({ t: "docs", docIds: [b.docId], pathKeys: [viewKey, s.pathKey] });
+		}
+		this.strayViews = seen;
 	}
 
 	/** Cheap change detector for the synced tree (size + summed touch seqs). */

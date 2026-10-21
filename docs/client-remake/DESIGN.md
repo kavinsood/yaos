@@ -896,6 +896,11 @@ cold ──load──▶ resident ──bind──▶ bound
   - For `renamed`, `merged` and `frozen`, the host re-opens the doc. `frozen` binds read-only.
   - For `resync`, every view of the doc re-binds: upload, then `bodyAttach` with the mirror's durable text as the
     base.
+  - Every pass end, a bound doc whose views show another file than its synced path gets `renamed`
+    (`retargetStrayViews`, `vaultRuntime.ts`). A bound doc's merge never writes its file, and a save only reaches the
+    views' file, so the doc's own file would wait for good. Views on a file another doc is synced at re-open at once.
+    Otherwise it waits for the next pass end, because a user rename of an open note moves the views one pass before
+    the doc.
 - **Engine death** (§g.4): the runtime stops, and `stop` flushes and unbinds every view; the edits stay in the
   editors. The user's restart is a new runtime, which binds every view as at a first open. Text the dead engine took
   but never committed is still in the editor: the bind merge brings it back, or keeps the editor side as a conflict
