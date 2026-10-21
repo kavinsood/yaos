@@ -38,7 +38,8 @@ export function toMirrorEntry(s: SyncedRecord): SyncedMirrorEntry {
 export function fromMirrorEntry(e: SyncedMirrorEntry, pk: PathKeyFn, nowMs: number): SyncedRecord {
 	return {
 		docId: e.docId, path: e.path, pathKey: pk(e.path), kind: e.kind, contentHash: e.contentHash, fingerprint: "" as DiskFingerprint,
-		size: -1, mtimeMs: 0, bodyVersion: null, blobRev: e.blobRev,
+		// blobRev 0: unknown, as bodyVersion null (inherit.ts syncedRecordOf): a missing file is never a user delete.
+		size: -1, mtimeMs: 0, bodyVersion: null, blobRev: 0,
 		nsTouchSeq: e.nsTouchSeq, hasBase: false, syncedAtMs: nowMs,
 	};
 }

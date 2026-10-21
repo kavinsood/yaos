@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { Report, sleep } from "./engineKit";
 import { contextPath, DEFAULT_LOG_DIR, devicePairingCode, revokeDevice, type OnboardDevice, type OnboardedVault } from "./onboard";
 import { attribute, cpuInWindow, pageEvaluate, PhoneProfile, timeline } from "./phoneProfile";
+import { installRecordKey } from "../../src/host/installRecord";
 import { LOCAL_SETTINGS_KEY } from "../../src/host/localSettings";
 
 function arg(name: string, fallback: string): string {
@@ -233,11 +234,12 @@ async function pressPair(): Promise<boolean> {
 
 /**
  * Makes the phone a fresh install of the bench vault, as a new phone would be: deletes this vault's YAOS stores
- * (IndexedDB `yaos3:<vaultId>:…`, `yaos3-pending:<vaultId>:…`) and the per-install record in Obsidian's localStorage
- * (localSettings.ts, its install key), with the plugin unloaded so nothing holds them open. The folder wipe leaves
- * both: the next pairing then reopened the previous run's store, whose device the bench had just revoked (an unpinned
- * engine does not replace a revoked store). Scoped to the bench vault's id: other vaults' stores on the phone (one
- * WebView origin) are not touched.
+ * (IndexedDB `yaos3:<vaultId>:…`, `yaos3-pending:<vaultId>:…`) and, in Obsidian's localStorage, the install record
+ * (installRecord.ts: install key and store lineage) and the local settings (localSettings.ts), with the plugin
+ * unloaded so nothing holds them open. The folder wipe leaves all of them: the next pairing then reopened the previous
+ * run's store, whose device the bench had just revoked (an unpinned engine does not replace a revoked store), or a new
+ * store recovered from the lineage's mirror dir against the wiped folder (integration-notes §7.4). Scoped to the bench
+ * vault's id: other vaults' stores on the phone (one WebView origin) are not touched.
  */
 async function freshInstall(vaultId: string): Promise<void> {
 	const expr = `(async () => {
@@ -247,6 +249,7 @@ async function freshInstall(vaultId: string): Promise<void> {
 		const names = (await indexedDB.databases()).map((d) => d.name).filter(ours);
 		for (const n of names) await new Promise((res, rej) => { const r = indexedDB.deleteDatabase(n); r.onsuccess = res; r.onerror = () => rej(r.error); r.onblocked = () => rej(new Error("blocked: " + n)); });
 		app.saveLocalStorage(${JSON.stringify(LOCAL_SETTINGS_KEY)}, null);
+		app.saveLocalStorage(${JSON.stringify(installRecordKey(vaultId))}, null);
 		await app.plugins.enablePlugin("yaos");
 		return names.length;
 	})()`;
@@ -261,7 +264,7 @@ async function freshInstall(vaultId: string): Promise<void> {
 		}
 	}
 	if (typeof last !== "number") throw new Error(`fresh install failed: ${String(last)}`);
-	console.log(`  fresh install: ${last} store DB(s) of the bench vault deleted, install record cleared`);
+	console.log(`  fresh install: ${last} store DB(s) of the bench vault deleted, install record and local settings cleared`);
 }
 
 async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<Run> {

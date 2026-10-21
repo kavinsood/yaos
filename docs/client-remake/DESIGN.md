@@ -2276,8 +2276,11 @@ Further caps:
 1. Open a fresh DB under the same name. On a WebKit connection loss, try reopening first.
 2. Import the outbox mirror: same `clientFrameId`s, `order`s and states (a legacy `sent` → pending), and `outboxOrder.next =
    max + 1`.
-3. Import the synced mirror as `SyncedEntry` with `hasBase = false` and `bodyVersion = null`. With `bodyVersion =
-   null` the planner compares content instead: `Rc := streams.textHash ≠ S.contentHash`.
+3. Import the synced mirror as `SyncedEntry` with `hasBase = false`, `bodyVersion = null` and `blobRev = 0`. With
+   `bodyVersion = null` the planner compares content instead: `Rc := streams.textHash ≠ S.contentHash`. `blobRev = 0` is
+   the same for an attachment (rev unknown; committed revs are ≥ 1): the store never saw these files on its own disk,
+   so a missing one is re-materialized, never read as a user delete (an imported rev matched the relay's and sent
+   `nsDelete` for every device: a wiped folder recovered against an old mirror lost 8 attachments, 2026-10-21).
 4. `identity.recoveredFromMirror = true` and cursor 0.
 5. Full catch-up: feed from 0, ns first, then reads with `preferCheckpoint`.
 6. Full scan, with every file hashed.
@@ -2324,7 +2327,9 @@ row, nothing pending) is `lostCreateBody` (below).
 
 **Store revoked by the server** (removed in the console, retired; phase `revoked` from a 401). With a valid grant the
 install registers a successor first; then the runtime stops (its outbox goes to its mirror), the store is deleted and
-the successor starts and recovers from the old store's dir as above (the fence finds it gone). A refusal keeps the
+the successor starts and recovers from the old store's dir as above (the fence finds it gone). An unpinned device
+(gate closed: only the key reader runs, §12.4) whose store is refused is replaced the same way, then reads `k` as the
+successor. A refusal keeps the
 store: a revoked grant needs a re-pair (phase `revoked`, its notice), a passing one (network, daily limit) is
 retried after a minute or the server's Retry-After.
 

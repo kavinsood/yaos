@@ -511,6 +511,7 @@ export class ComposedEngine {
 			reconnectBaseMs: this.options.tuning?.reconnectBaseMs,
 			onChange: () => this.postStatus(),
 			onKeyed: (): Promise<boolean> => this.onKeyed(reader),
+			onRevoked: () => this.onStoreRevoked(),
 			log: this.options.log,
 		});
 		this.reader = reader;
@@ -857,10 +858,11 @@ export class ComposedEngine {
 	 * retired). The install's grant registers a successor first; only then is the runtime stopped (its outbox goes to
 	 * its mirror), its store deleted and a new runtime started, which recovers from the old store's dir as from any
 	 * lost store (§5.2; the fence finds it gone). A refusal keeps the store and the phase: a revoked grant needs a
-	 * re-pair (its notice says so); a passing one (network, daily limit) is retried.
+	 * re-pair (its notice says so); a passing one (network, daily limit) is retried. A key reader (gate closed, no
+	 * runtime) whose store was refused is replaced the same way: a new reader starts on the successor's identity.
 	 */
 	onStoreRevoked(): void {
-		if (this.replacing || this.disposed || !this.rt) return;
+		if (this.replacing || this.disposed || (!this.rt && !this.reader)) return;
 		this.replacing = true;
 		void this.replaceRevoked().then(() => undefined, (e: unknown) => this.log(`successor start failed: ${String(e)}`)).finally(() => {
 			this.replacing = false;
@@ -885,7 +887,7 @@ export class ComposedEngine {
 			if (refused && needsRepair(refused.reason)) return;
 			this.replaceTimer = ports.clock.setTimer(Math.max(refused?.retryAfterMs ?? 0, REVOKED_RETRY_MS), () => {
 				this.replaceTimer = null;
-				if (this.rt?.status().phase === "revoked") this.onStoreRevoked();
+				if ((this.rt ? this.rt.status().phase : this.reader?.phase()) === "revoked") this.onStoreRevoked();
 			});
 		}
 	}
@@ -907,12 +909,23 @@ export class ComposedEngine {
 			return { error };
 		}
 		if (this.disposed || this.identity?.creds.deviceId !== old) return null;
-		await this.restart(reason, async () => {
+		const deleteStores = async (): Promise<void> => {
 			const n = await deleteStoreDbs(ports.storage, config.vaultId, config.installKey);
 			this.knownEpoch = undefined;
 			this.log(`${reason === "revoked" ? "revoked" : "rebuilt"} store replaced: ${n} store(s) deleted`);
-		});
+		};
+		if (this.reader) await this.restartReader(deleteStores);
+		else await this.restart(reason, deleteStores);
 		return null;
+	}
+
+	/** replaceStore for a key reader (gate closed, no runtime, no store open): a new reader on the successor identity. */
+	private async restartReader(beforeStart: () => Promise<void>): Promise<void> {
+		this.reader?.stop();
+		this.reader = null;
+		await beforeStart();
+		if (!this.disposed) await this.startRuntime("revoked");
+		this.postStatus();
 	}
 
 	/**

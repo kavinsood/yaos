@@ -54,6 +54,11 @@ export interface KeyReaderOptions {
 	readonly onChange: () => void;
 	/** Suite 1: the keyring holds the newest winner's key and main stored it. Resolves false if the gate stays shut. */
 	readonly onKeyed: () => Promise<boolean>;
+	/**
+	 * The relay refused this store (`device-revoked`, terminal): the engine replaces it as it replaces a runtime's
+	 * (identity-per-store §4 "Store revoked by the server"; ProtocolEngine.onStoreRevoked).
+	 */
+	readonly onRevoked?: () => void;
 	/** Diagnostics (never payload or key bytes). */
 	readonly log?: (line: string) => void;
 }
@@ -410,6 +415,7 @@ export class KeyReader {
 			this.schedule(d.retryMs);
 		}
 		this.o.onChange();
+		if (d.phase === "revoked") this.o.onRevoked?.();
 	}
 
 	private schedule(ms: number): void {

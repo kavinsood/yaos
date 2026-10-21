@@ -1368,9 +1368,14 @@ the startup this changes.
 **Bench hygiene found on the way:** the folder wipe left the plugin's stores (IndexedDB), its install record
 (localStorage) and the stores' mirror dirs (`.obsidian/plugins/yaos/state`), so the next pairing reopened the previous
 run's store, whose grant the bench had just revoked (an unpinned engine stays `revoked`: `onStoreRevoked` needs a
-VaultRuntime), or inherited from its mirror. phoneBench now deletes all three for the bench vault before each pairing.
-The vault those runs used lost 8 attachments on the relay (a fresh Node device gets 1014 of 1022 files), cause not yet
-known; the runs above are on a newly seeded vault.
+VaultRuntime), or inherited from its mirror. phoneBench now deletes all of it for the bench vault (the stores, the
+install record `yaos-install-<vaultId hex>`, the local settings) before each pairing. The runs above are on a newly
+seeded vault: the old one lost 8 attachments on the relay, and that was a client bug. One ns frame (seq 1026, the
+author's frameNo 1, authorNsSeq 1025) deleted them, sent by the run whose new store inherited the previous store's
+synced mirror against the wiped folder: recovery imported each attachment's `blobRev` as it was, so "synced, now
+missing" read as a user delete, while notes (`bodyVersion = null`) were re-materialized. Fixed: recovery imports
+`blobRev = 0` (DESIGN §i.5 step 3), and a key reader whose store is revoked registers a successor like a runtime
+(§i.5 "Store revoked by the server"); sim tests in `src/sim/identity.test.ts`.
 
 Not a second engine: earlier profile runs showed a second `yaos-engine` worker "at the last file". It was the same
 pin restart at +1.3 s, recorded late: the bench's blocking poll loop kept the DevTools socket from being read until
