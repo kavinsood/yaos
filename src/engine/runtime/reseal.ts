@@ -2,11 +2,14 @@
  * The sender's re-seal (e2ee-design §14.2 step 4). An outbox record sealed under an epoch below the newest winning
  * revoke, or not sealed at all (the copy of an own stale commit, sync/ingestRow.ts ownCommitCopy), is sealed again
  * under the current epoch before it is sent:
- *  - ns/cfg keep their id: the sender opens them only after the session's late-receipt reads, so one still in the
- *    outbox then never committed (and its frameNo stays, §8.2);
  *  - a copy keeps its id (fresh, never sent);
- *  - every other record takes a fresh id: its old one may have committed with other bytes, and a resend under it
- *    would be refused frame-id-conflict (R4). Yjs updates are idempotent, so a duplicate is harmless.
+ *  - every other record takes a fresh id, ns and cfg included: its old bytes may have committed, and a resend of other
+ *    bytes under that id is refused frame-id-conflict (R4). The session's late-receipt reads do not rule that out for
+ *    ns / cfg: a frame of a dropped session can sit in the relay's hold buffer and commit after the new session read
+ *    past it (STREAM_HOLD_MAX_MS). The refusal poisoned the ns create, and the create's body, pipelined behind it,
+ *    committed before the create's copy: retire.ts then took the doc for pruned and the relay dropped its body (sim
+ *    suite 1 seed 264). The frameNo stays (§8.2): should the old bytes commit and fold, the new frame is a replay
+ *    duplicate, as for a copy; committed stale they fold as ignored and take no frameNo. Yjs updates are idempotent.
  * Runs only while the write gate is open (the gated crypto port refuses otherwise). The sender asks on every pump
  * until the record is replaced; requests for a record already being sealed are dropped.
  */
@@ -35,7 +38,7 @@ export class Resealer {
 	private async run(rec: OutboxRecord): Promise<void> {
 		const c = this.c;
 		const cls = streamClass(rec.stream);
-		const keep = rec.sealed.length === 0 || cls === "ns" || cls === "cfg";
+		const keep = rec.sealed.length === 0;
 		const clientFrameId = keep ? rec.clientFrameId : newClientFrameId(c.ports.random);
 		let content = rec.content;
 		if (rec.kind === "bodyUpdateRef") {

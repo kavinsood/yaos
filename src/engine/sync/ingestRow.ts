@@ -31,6 +31,7 @@ import { streamClass, type ClientFrameId, type ContentHash, type DeviceId, type 
 import type { HashPort } from "../../ports/crypto";
 import type { RandomPort } from "../../ports/random";
 import { newClientFrameId } from "../../core/codec/ids";
+import { decodeOuter } from "../../core/codec/envelope";
 import { gate, type GateCtx } from "../ingest/gate";
 import type { LiveItem, OwnCommitCopy } from "../store/repo";
 import type { OutboxRecord, QuarantineRecord, TailRecord } from "../store/schema";
@@ -104,7 +105,7 @@ export interface ClassifyDeps {
 export async function classifyRow(deps: ClassifyDeps, input: Omit<RowInput, "payload"> & { readonly payload: Uint8Array | null }): Promise<LiveItem> {
 	if (input.deviceId === deps.self) {
 		const ob = deps.outbox.get(input.clientFrameId);
-		if (ob && ob.stream === input.stream) return receiptItem(deps, input.stream, input.clientFrameId, input.seq, ob);
+		if (ob && ob.stream === input.stream) return receiptItem(deps, input.stream, input.clientFrameId, input.seq, ob, input.payload);
 	}
 	if (input.payload === null) return { t: "stale", stream: input.stream, seq: input.seq };
 	const g = await gateRow(deps.gateCtx, deps.hash, { ...input, payload: input.payload }, deps.nowMs());
@@ -114,9 +115,12 @@ export async function classifyRow(deps: ClassifyDeps, input: Omit<RowInput, "pay
 	return { t: "account", seq: input.seq, settleAdoptable };
 }
 
-/** An own frame's receipt; an outbox record of this stream that committed stale is renamed to its copy (ownCommitCopy). */
-export function receiptItem(deps: ClassifyDeps, stream: StreamName, clientFrameId: ClientFrameId, seq: Seq, ob = deps.outbox.get(clientFrameId)): LiveItem {
-	const copy = ob && ob.stream === stream ? ownCommitCopy(deps.gateCtx, deps.random, deps.self, ob, seq) : null;
+/**
+ * An own frame's receipt; an outbox record of this stream that committed stale is renamed to its copy (ownCommitCopy).
+ * `committed`: the committed row's payload when the receipt is a row read back (a read page), else null.
+ */
+export function receiptItem(deps: ClassifyDeps, stream: StreamName, clientFrameId: ClientFrameId, seq: Seq, ob = deps.outbox.get(clientFrameId), committed: Uint8Array | null = null): LiveItem {
+	const copy = ob && ob.stream === stream ? ownCommitCopy(deps.gateCtx, deps.random, deps.self, ob, seq, committed) : null;
 	return copy ? { t: "receipt", stream, clientFrameId, seq, copy } : { t: "receipt", stream, clientFrameId, seq };
 }
 
@@ -136,13 +140,18 @@ export function notApplied(items: readonly LiveItem[], into = new Set<Seq>()): S
  * no-op. ns/cfg/snap commits are stored as readers store them (stale: folds as ignored; hold: unopened, re-gated
  * once `k` is judged); others as the outbox has them (the local doc already holds the update).
  */
-export function ownCommitCopy(ctx: GateCtx, random: RandomPort, self: DeviceId, ob: OutboxRecord, seq: Seq): OwnCommitCopy | null {
-	const v = ctx.staleCheck(ob.keyEpoch, seq);
+export function ownCommitCopy(ctx: GateCtx, random: RandomPort, self: DeviceId, ob: OutboxRecord, seq: Seq, committed: Uint8Array | null = null): OwnCommitCopy | null {
+	// The committed bytes decide, as for every reader (gate.ts staleVerdict), whenever the receipt carries them: judged
+	// by a record re-sealed since those bytes went out, a stale commit would read as a good one, the record would go
+	// and readers would ignore the row (sim suite 1 seed 264, before reseal.ts renamed sent ns / cfg records).
+	const outer = committed !== null ? decodeOuter(committed) : null;
+	const keyEpoch = outer?.ok ? outer.header.keyEpoch : ob.keyEpoch;
+	const v = ctx.staleCheck(keyEpoch, seq);
 	if (v === null) return null;
 	const cls = streamClass(ob.stream);
 	if (cls !== "ns" && cls !== "cfg" && cls !== "snap") return { clientFrameId: newClientFrameId(random), row: null };
 	const base = { stream: ob.stream, seq, deviceId: self, clientFrameId: ob.clientFrameId, kind: ob.kind, authorNsSeq: 0, frameNo: 0 };
-	const row: TailRecord = v === "stale" ? { ...base, flags: LOCAL_FLAG_STALE_EPOCH, content: new Uint8Array(0) } : { ...base, flags: LOCAL_FLAG_UNOPENED, content: ob.sealed };
+	const row: TailRecord = v === "stale" ? { ...base, flags: LOCAL_FLAG_STALE_EPOCH, content: new Uint8Array(0) } : { ...base, flags: LOCAL_FLAG_UNOPENED, content: committed ?? ob.sealed };
 	return { clientFrameId: newClientFrameId(random), row };
 }
 
