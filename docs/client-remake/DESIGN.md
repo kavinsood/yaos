@@ -2561,6 +2561,11 @@ is touched (`sweepOrphanStores`, no timer).
   lines into one hunk, so one record's conflict would swallow the disk's edit of the record on the next line.
   - The CRDT apply is record-level: changed fields are set, and the `text` field gets a minimal `Y.Text` diff. Node
     maps are never replaced wholesale.
+  - A record new to the replica is a new map, so two devices that merge the same file into a doc lacking its records
+    (an epoch reset onto a peer's empty create, a copied vault) create competing maps and one survives whole. A merge
+    therefore drops from its base every field whose key has no item at all in the record's live map (a map keeps a
+    deleted item per key, so a peer's removal still shows): the loser's fields are then its disk's changes and are set
+    in the surviving map, per field (`baseSeenBy`, sim seed 971197958).
   - Canvas views are not bound. Every user edit reaches the CRDT through a disk save and merge.
   - *Subscriptions* (§d.7): an unbound canvas is never in the set unless it has own outbox records, so other
     devices' rows reach it as skips. A save to it while it is stale waits for the read (`body-not-caught-up`, which

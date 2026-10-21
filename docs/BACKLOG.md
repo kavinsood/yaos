@@ -160,6 +160,18 @@ different epochs, wide divergence; the `retired` violations follow from A never 
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **Canvas concurrent record create** (`fix-integrity`, fix-epoch soak `971197958-35`): after an epoch reset C
+  re-created a canvas empty, and A and D each merged their file into it before seeing the other's rows. A record
+  new to a replica is a new Y.Map, so the two maps competed and A's survived whole; D's synced base kept D's colour
+  (an unsent old-epoch edit), and D's next merge read its absence as A removing it. A merge now drops base fields
+  the record's live map never had (`baseSeenBy`, DESIGN §j.2). Regression `canvas-concurrent-record-create-loses-field.json`.
+- **Canvas broken, renamed, deleted** (`fix-integrity`, fix-epoch soak `1542948623-23`): sim oracle. A file deleted
+  while a broken save is pending deletes what the app shows, but the oracle matched the pending save by its old
+  path, so after a rename it counted the canvas's records as lost. It now follows the broken bytes, as the save
+  does. Regression `canvas-broken-renamed-deleted-records-go.json`.
+- **Hot canvas seeds 89, 211** (`fix-integrity`, sim oracle): a deleted canvas file's root removals go with it like
+  its root values; a deleted conflict copy takes its maker's superseded removals too. Regressions
+  `canvas-deleted-vault-root-removal-revived-lineage.json`, `canvas-deleted-copy-takes-superseded-removal.json`.
 - **SIM-FLOOD-FLAP** (`fix-integrity`): not a flap. After a wave of writes to thousands of streams (a mass restore
   at heal) every non-duty device re-read each stream's remote checkpoint seq before standing in (relay checkpoints
   are not broadcast), one `read` per stream and two per maintenance tick: the relay kept serving those reads for

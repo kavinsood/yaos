@@ -67,6 +67,60 @@ export function makeRanked(
 	};
 }
 
+/**
+ * The base as this replica's records can have seen it (DESIGN §j.2). A record's Y.Map keeps an item for every key ever
+ * set in it, deleted ones included (GC drops only the content), so a base field whose key has no item at all in the
+ * record's live map was never in that map: the map that held it lost a concurrent create of the same record id
+ * (Y.Map set is last-writer-wins per key, and a new record is a new map). That happens when several devices merge
+ * the same file into a doc that lacks its records: after an epoch reset, onto a peer's empty create (sim seed
+ * 971197958: D's colour went with D's map, its synced base kept the colour, and the next merge read the CRDT's lack of
+ * it as a removal). Such a field is dropped from the base, so the disk's value is a change of this side and is
+ * set in the surviving map, as a per-field write. A record whose map has every based key is unchanged.
+ */
+export function baseSeenBy(base: CanvasRanked, doc: Y.Doc): CanvasRanked {
+	const nodes = doc.getMap<unknown>("nodes");
+	const edges = doc.getMap<unknown>("edges");
+	let changed = false;
+	const nodeRanks = new Map(base.nodeRanks);
+	const edgeRanks = new Map(base.edgeRanks);
+	const unseen = (m: Y.Map<unknown>, key: string): boolean => !m._map.has(key);
+	const prune = <T>(
+		map: Y.Map<unknown>, recs: ReadonlyMap<string, T>, ranks: Map<string, string>, json: (r: T) => Record<string, JsonValue>,
+		parse: (raw: Record<string, unknown>) => T | null,
+	): Map<string, T> => {
+		const out = new Map<string, T>();
+		for (const [id, rec] of recs) {
+			const m = map.get(id);
+			if (!(m instanceof Y.Map)) {
+				out.set(id, rec);
+				continue;
+			}
+			const j = json(rec);
+			let drop = false;
+			for (const key of Object.keys(j)) {
+				if (key === "id" || !unseen(m, key)) continue;
+				const copy = { ...j };
+				delete copy[key];
+				// Required fields (type, geometry, endpoints) are in every map that holds a valid record.
+				if (parse(copy) === null) continue;
+				delete j[key];
+				drop = true;
+			}
+			if (ranks.has(id) && unseen(m, CANVAS_RANK_FIELD)) {
+				ranks.delete(id);
+				changed = true;
+			}
+			const r = drop ? parse(j) : null;
+			if (r !== null) changed = true;
+			out.set(id, r ?? rec);
+		}
+		return out;
+	};
+	const n = prune(nodes, base.data.nodes, nodeRanks, (r) => ({ ...canvasNodeJson(r) }) as Record<string, JsonValue>, parseCanvasNode);
+	const e = prune(edges, base.data.edges, edgeRanks, (r) => ({ ...canvasEdgeJson(r) }) as Record<string, JsonValue>, parseCanvasEdge);
+	return changed ? makeRanked(Object.assign(Object.create(null) as Record<string, JsonValue>, base.data.rootFields), n, nodeRanks, e, edgeRanks) : base;
+}
+
 export function emptyCanvas(): CanvasRanked {
 	return makeRanked(Object.create(null) as Record<string, JsonValue>, new Map(), new Map(), new Map(), new Map());
 }
