@@ -20,7 +20,7 @@ import { SIM_SETTINGS, SimDevice } from "../../sim/device";
 import { SIM_VAULT_ID, SimNet } from "../../sim/net";
 import type { StatusSnapshot } from "../../protocol/status";
 import { YaosController } from "../pluginController";
-import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "../ui/api";
+import { defaultPluginData, type PairedIdentity, type StoredPluginData } from "../ui/api";
 import { formatDiagnostics } from "../ui/diagnostics";
 import { VaultKeyStore, secretIdFor } from "./secretStore";
 import { fakeEpochKey, fakeGenesisRecord } from "./testkit/kRecords";
@@ -130,7 +130,7 @@ test("at rest: vault keys and recovery keys appear nowhere but the vault's Secre
 	const peer = new SimDevice({ name: "B", clock, net }); // suite 0 (fixture): fills the relay with real traffic
 	peer.vault.userWrite("notes/b.md", "hello from b\n");
 	void peer.start();
-	const saved: YaosPluginData[] = [];
+	const saved: StoredPluginData[] = [];
 	const notices: string[] = [];
 	const local = new Map<string, unknown>();
 	const statuses: StatusSnapshot[] = [];

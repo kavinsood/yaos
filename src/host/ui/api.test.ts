@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	DEFAULT_ENGINE_SETTINGS, defaultDeviceName, defaultPluginData, MIB, pendingBrake, sameEngineSettings, sameIdentity,
-	sanitizePluginData, type PairedIdentity,
+	sanitizeStoredData, storedPart, type PairedIdentity, type StoredPluginData,
 } from "./api";
 import type { BrakeReport } from "../../core/types";
 import { BAD_VAULT_IDS, testVaultId } from "../keys/testkit/vaultIds";
@@ -33,32 +33,37 @@ test("defaultPluginData", () => {
 	assert.equal(defaultPluginData("   ").deviceLabel, "Device");
 });
 
-test("sanitizePluginData: garbage in, defaults out, never throws", () => {
+test("sanitizeStoredData: garbage in, defaults out, never throws", () => {
 	const hostile = new Proxy({}, { get() { throw new Error("boom"); }, ownKeys() { throw new Error("boom"); } });
 	for (const raw of [null, undefined, 0, "x", [], [1, 2], true, hostile, { version: 99 }]) {
-		assert.deepEqual(sanitizePluginData(raw, "Mac"), defaultPluginData("Mac"));
+		assert.deepEqual(sanitizeStoredData(raw), storedPart(defaultPluginData("Mac")));
 	}
 });
 
-test("sanitizePluginData: round-trips valid data", () => {
-	const data = {
+test("sanitizeStoredData: round-trips valid data", () => {
+	const data: StoredPluginData = {
 		version: 1 as const,
 		identity: IDENTITY,
-		deviceLabel: "Work laptop",
 		engine: {
 			excludePatterns: ["private/**", "*.tmp"], syncAttachments: false, maxAttachmentBytes: 5 * MIB, syncSettings: true,
 			trashMode: "system-trash" as const, provisionalBroadcast: false,
 			snapshots: { enabled: false, keepDaily: 30, uploadToBlobStore: true },
 		},
-		showStatusBar: false,
+		e2ee: { suite: 1 },
 	};
-	assert.deepEqual(sanitizePluginData(JSON.parse(JSON.stringify(data)), "Mac"), data);
+	assert.deepEqual(sanitizeStoredData(JSON.parse(JSON.stringify(data))), data);
 });
 
-test("sanitizePluginData: partial and invalid fields fall back per field", () => {
-	const out = sanitizePluginData({
+test("data.json carries no per-install field (identity-per-store §8): not read, not written", () => {
+	const legacy = { identity: IDENTITY, deviceLabel: "Old", showStatusBar: false, creating: { vaultId: IDENTITY.vaultId }, pendingEnrollment: { host: IDENTITY.host } };
+	assert.deepEqual(Object.keys(sanitizeStoredData(legacy)).sort(), ["engine", "identity", "version"]);
+	const view = { ...defaultPluginData("Mac"), identity: IDENTITY, creating: { vaultId: IDENTITY.vaultId } };
+	assert.deepEqual(Object.keys(storedPart(view)).sort(), ["engine", "identity", "version"]);
+});
+
+test("sanitizeStoredData: partial and invalid fields fall back per field", () => {
+	const out = sanitizeStoredData({
 		identity: { ...IDENTITY, host: "sync.example.com/", vaultGeneration: "" },
-		deviceLabel: "  \u0000  ",
 		engine: {
 			excludePatterns: [" a ", "a", "", 3, "b", "x".repeat(600)],
 			syncAttachments: "yes",
@@ -66,21 +71,18 @@ test("sanitizePluginData: partial and invalid fields fall back per field", () =>
 			trashMode: "rm -rf",
 			snapshots: { keepDaily: 1000, enabled: false },
 		},
-		showStatusBar: "no",
-	}, "Phone");
+	});
 	assert.equal(out.identity?.host, "https://sync.example.com");
 	assert.equal(out.identity?.vaultGeneration, null);
-	assert.equal(out.deviceLabel, "Phone");
 	assert.deepEqual(out.engine.excludePatterns, ["a", "b"]);
 	assert.equal(out.engine.syncAttachments, true);
 	assert.equal(out.engine.maxAttachmentBytes, 1024 * MIB);
 	assert.equal(out.engine.trashMode, "follow-obsidian");
 	assert.equal(out.engine.snapshots.keepDaily, 7);
 	assert.equal(out.engine.snapshots.enabled, false);
-	assert.equal(out.showStatusBar, true);
 });
 
-test("sanitizePluginData: an identity with any invalid credential field is dropped", () => {
+test("sanitizeStoredData: an identity with any invalid credential field is dropped", () => {
 	const broken: Record<string, unknown>[] = [
 		{ ...IDENTITY, grantSecret: "short" },
 		{ ...IDENTITY, grantSecret: "has spaces in it which are not allowed at all!!" },
@@ -90,13 +92,13 @@ test("sanitizePluginData: an identity with any invalid credential field is dropp
 		{ ...IDENTITY, host: "http://sync.example.com" },
 		{ ...IDENTITY, host: 5 },
 	];
-	for (const identity of broken) assert.equal(sanitizePluginData({ identity }, "Mac").identity, null);
+	for (const identity of broken) assert.equal(sanitizeStoredData({ identity }).identity, null);
 });
 
-test("sanitizePluginData: the vaultId is exactly 22-char canonical base64url (server DECISIONS §2.1), never trimmed or repaired", () => {
-	assert.equal(sanitizePluginData({ identity: IDENTITY }, "Mac").identity?.vaultId, IDENTITY.vaultId);
-	for (const vaultId of BAD_VAULT_IDS) assert.equal(sanitizePluginData({ identity: { ...IDENTITY, vaultId } }, "Mac").identity, null, JSON.stringify(vaultId));
-	assert.equal(sanitizePluginData({ identity: { ...IDENTITY, vaultId: 7 } }, "Mac").identity, null);
+test("sanitizeStoredData: the vaultId is exactly 22-char canonical base64url (server DECISIONS §2.1), never trimmed or repaired", () => {
+	assert.equal(sanitizeStoredData({ identity: IDENTITY }).identity?.vaultId, IDENTITY.vaultId);
+	for (const vaultId of BAD_VAULT_IDS) assert.equal(sanitizeStoredData({ identity: { ...IDENTITY, vaultId } }).identity, null, JSON.stringify(vaultId));
+	assert.equal(sanitizeStoredData({ identity: { ...IDENTITY, vaultId: 7 } }).identity, null);
 });
 
 test("sameIdentity / sameEngineSettings", () => {

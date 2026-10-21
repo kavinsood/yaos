@@ -38,7 +38,8 @@ import { join } from "node:path";
 import { makeRecoveryKey } from "../../src/core/codec/testkit/recoveryKey";
 import { YaosController } from "../../src/host/pluginController";
 import { VaultKeyStore, secretIdFor } from "../../src/host/keys/secretStore";
-import { defaultPluginData, type YaosPluginData } from "../../src/host/ui/api";
+import { defaultPluginData, storedPart, type LocalPluginFields, type StoredPluginData, type YaosPluginData } from "../../src/host/ui/api";
+import { LOCAL_SETTINGS_KEY, localPart, withLocal } from "../../src/host/localSettings";
 import {
 	confirmEmptyVault, createAndEnroll, CreateVaultError, enableEncryption, NOT_EMPTY_MESSAGE, optOutOfEncryption, probeServer,
 	type CreateVaultHost,
@@ -101,10 +102,24 @@ function device(name: string, od: OnboardDevice | null): Device {
 	const logs: string[] = [];
 	const identity = od ? pairedIdentityOf(HOST, vault!, od, name) : null;
 	const data: YaosPluginData = { ...defaultPluginData(name), identity };
+	// `saved`: each write of data.json or of the per-install record (identity-per-store §8), as the whole data.
+	let stored: StoredPluginData = storedPart(data);
+	let local: LocalPluginFields = localPart(data);
+	const store = new Map<string, unknown>();
 	const ctl = new YaosController(data, {
 		makeRuntime: (id, settings, ui, keys) => client.runtimeFor(id, settings, ui, keys),
 		saveData: async (d) => {
-			saved.push(structuredClone(d));
+			stored = structuredClone(d);
+			saved.push(withLocal(stored, local));
+		},
+		localStorage: {
+			load: (k) => store.get(k),
+			save: (k, v) => {
+				store.set(k, structuredClone(v));
+				if (k !== LOCAL_SETTINGS_KEY) return;
+				local = localPart(v as LocalPluginFields);
+				saved.push(withLocal(stored, local));
+			},
 		},
 		notice: (level, m) => notices.push(`${level}:${m}`),
 		log: (l) => logs.push(l),

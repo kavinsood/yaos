@@ -7,7 +7,14 @@
 import type { UserCommand, EngineResultValue } from "../../../protocol/messages";
 import type { DeviceCheckMode, DeviceCheckReport, E2eeStatus, EnginePhase, StatusSnapshot } from "../../../protocol/status";
 import { markedCreating, pinAcross, withoutCreating } from "../../keys/pin";
-import { defaultPluginData, type EngineRunState, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "../api";
+import { localPart, sanitizeLocalSettings, withLocal } from "../../localSettings";
+import { defaultPluginData, sanitizeStoredData, storedPart, type EngineRunState, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "../api";
+
+/** `d` after a save and a load: data.json's part and the local settings record's (identity-per-store §8), as JSON. */
+export function roundTripPluginData(d: YaosPluginData, fallbackLabel = "Mac"): YaosPluginData {
+	const json = (v: unknown): unknown => JSON.parse(JSON.stringify(v));
+	return withLocal(sanitizeStoredData(json(storedPart(d))), sanitizeLocalSettings(json(localPart(d)), fallbackLabel));
+}
 
 export const RUNNING: EngineRunState = { phase: "running", lastError: null };
 

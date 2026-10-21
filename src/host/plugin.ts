@@ -20,7 +20,8 @@ import { ObsidianWorkspace } from "./obsidianWorkspace";
 import { BrowserPlatform, browserClock, platformInfoFrom } from "./platform";
 import { YaosController } from "./pluginController";
 import { ObsidianSideFiles } from "./sideFiles";
-import { defaultDeviceName, sanitizePluginData, type YaosUiHost } from "./ui/api";
+import { hasLegacyLocalFields, loadLocalSettings, withLocal } from "./localSettings";
+import { defaultDeviceName, sanitizeStoredData, type YaosUiHost } from "./ui/api";
 import { errorMessage } from "./ui/format";
 import { obsidianRequest } from "./ui/obsidianEnv";
 import { resumePendingEnrollment, type ResumedEnrollment } from "./ui/pairFlow";
@@ -84,7 +85,12 @@ export default class YaosPlugin extends Plugin {
 		this.registerEditorExtension(collabExtension());
 		this.register(() => workspace.dispose());
 
-		const data = sanitizePluginData(await this.loadData(), defaultDeviceName(Platform));
+		// identity-per-store §8: data.json holds what a twin may share; the per-install fields are in vault-local storage
+		// (localSettings.ts), migrated once from an older data.json, which is then rewritten without them.
+		const localStorage = { load: (k: string) => app.loadLocalStorage(k) as unknown, save: (k: string, v: unknown) => app.saveLocalStorage(k, v) };
+		const raw: unknown = await this.loadData();
+		const stored = sanitizeStoredData(raw);
+		const data = withLocal(stored, loadLocalSettings(localStorage, raw, defaultDeviceName(Platform)));
 		const controller = new YaosController(data, {
 			makeRuntime: (identity, settings, ui, keys) =>
 				(live = new HostRuntime({
@@ -98,9 +104,11 @@ export default class YaosPlugin extends Plugin {
 			clock,
 			// obsidian.d.ts :458 (@since 1.11.4); undefined on an older app, which then holds no key (fail closed).
 			secrets: (app as { secretStorage?: typeof app.secretStorage }).secretStorage ?? null,
-			localStorage: { load: (k) => app.loadLocalStorage(k) as unknown, save: (k, v) => app.saveLocalStorage(k, v) },
+			localStorage,
+			stateDirs: { pluginDir, storeDirs: () => sideFiles.storeDirs() },
 		});
 		this.controller = controller;
+		if (hasLegacyLocalFields(raw)) await controller.rewriteStoredData();
 
 		const host: YaosUiHost = {
 			app,

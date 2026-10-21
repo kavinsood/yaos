@@ -10,7 +10,7 @@ import type { DeviceCheckMode, DeviceCheckReport, StatusSnapshot } from "../../p
 import type { BrakeReport } from "../../core/types";
 import type { TrashMode } from "../../ports/vault";
 import { isVaultId } from "../../core/codec/ids";
-import { sanitizeCreating, sanitizePin, type CreatingMarker, type E2eePin } from "../keys/pin";
+import { sanitizePin, type CreatingMarker, type E2eePin } from "../keys/pin";
 import {
 	ENROLLMENT_REQUEST_ID_RE, GRANT_ID_RE, GRANT_SECRET_RE, normalizeDeviceName, normalizeHost, normalizePairingCode,
 	type EnrollmentAttempt,
@@ -35,11 +35,27 @@ export interface PairedIdentity {
 	readonly vaultGeneration: string | null;
 }
 
-export interface YaosPluginData {
+/**
+ * data.json (Plugin.loadData / saveData, in the vault folder): the fields a copied or synced twin may share
+ * (identity-per-store §8). The per-install fields are in the local settings record (src/host/localSettings.ts).
+ */
+export interface StoredPluginData {
 	readonly version: 1;
 	readonly identity: PairedIdentity | null;
-	readonly deviceLabel: string; // human label for conflict copy names
 	readonly engine: EngineSettings;
+	/**
+	 * The suite pin (e2ee-design §6.1, §12.4; not secret). Absent = unpinned: the device writes nothing until main
+	 * pins it from an authenticated source (src/host/keys/pin.ts). Only the controller writes it.
+	 */
+	readonly e2ee?: E2eePin;
+}
+
+/**
+ * The per-install fields (identity-per-store §8): kept in vault-local storage (src/host/localSettings.ts), never in
+ * data.json, which other tools copy and sync between machines.
+ */
+export interface LocalPluginFields {
+	readonly deviceLabel: string; // human label for conflict copy names
 	readonly showStatusBar: boolean;
 	/**
 	 * SECRET (pairing code + the new grant secret): an /enroll sent but not yet answered, kept until
@@ -47,14 +63,15 @@ export interface YaosPluginData {
 	 * identical request). Never logged or exported.
 	 */
 	readonly pendingEnrollment?: EnrollmentAttempt;
-	/**
-	 * The suite pin (e2ee-design §6.1, §12.4; not secret). Absent = unpinned: the device writes nothing until main
-	 * pins it from an authenticated source (src/host/keys/pin.ts). Only the controller writes it.
-	 */
-	readonly e2ee?: E2eePin;
 	/** §15.1 crash-recovery marker: this device created that vault and may still choose its encryption. */
 	readonly creating?: CreatingMarker;
 }
+
+/**
+ * What the host and the UI read and write: data.json's shared fields plus this install's local ones. Assembled at load
+ * (localSettings.ts withLocal) and split again on every save (pluginController.ts).
+ */
+export interface YaosPluginData extends StoredPluginData, LocalPluginFields {}
 
 export const MIB = 1024 * 1024;
 export const MAX_ATTACHMENT_BYTES_LIMIT = 1024 * MIB;
@@ -196,29 +213,26 @@ export function sanitizePendingEnrollment(raw: unknown): EnrollmentAttempt | nul
 	}
 }
 
-/** Tolerant loader for whatever loadData() returned (null, garbage, partial). Never throws. */
-export function sanitizePluginData(raw: unknown, fallbackLabel: string): YaosPluginData {
+/**
+ * Tolerant loader for whatever loadData() returned (null, garbage, partial). Never throws. The per-install fields an
+ * older data.json carried are not read here (localSettings.ts migrates the label and the status bar flag).
+ */
+export function sanitizeStoredData(raw: unknown): StoredPluginData {
 	try {
 		const r = asRecord(raw);
-		if (!r) return defaultPluginData(fallbackLabel);
-		const pending = sanitizePendingEnrollment(r.pendingEnrollment);
+		if (!r) return { version: 1, identity: null, engine: DEFAULT_ENGINE_SETTINGS };
 		const identity = sanitizeIdentity(r.identity);
 		// A pin belongs to the vault the device is enrolled in: without one it is dropped (never inferred, §12.4).
 		const pin = identity ? sanitizePin(r.e2ee) : undefined;
-		const creating = sanitizeCreating(r.creating);
-		return {
-			version: 1,
-			identity,
-			deviceLabel: sanitizeDeviceLabel(r.deviceLabel, fallbackLabel),
-			engine: sanitizeEngineSettings(r.engine),
-			showStatusBar: bool(r.showStatusBar, true),
-			...(pending ? { pendingEnrollment: pending } : {}),
-			...(pin ? { e2ee: pin } : {}),
-			...(creating ? { creating } : {}),
-		};
+		return { version: 1, identity, engine: sanitizeEngineSettings(r.engine), ...(pin ? { e2ee: pin } : {}) };
 	} catch {
-		return defaultPluginData(fallbackLabel);
+		return { version: 1, identity: null, engine: DEFAULT_ENGINE_SETTINGS };
 	}
+}
+
+/** The data.json part of `d` (identity-per-store §8): never a per-install field. */
+export function storedPart(d: StoredPluginData): StoredPluginData {
+	return { version: 1, identity: d.identity, engine: d.engine, ...(d.e2ee ? { e2ee: d.e2ee } : {}) };
 }
 
 /** True when both name the same pairing on the same relay (a change requires an engine restart). */

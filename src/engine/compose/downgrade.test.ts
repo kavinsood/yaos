@@ -495,7 +495,8 @@ function controllerWorld(clock: VirtualClock, net: SimNet, initial: YaosPluginDa
 			rt.command = (c) => (count(engineCommands, c.t === "pinSuite0" ? `pinSuite0:${c.source}` : c.t === "installKey" ? `installKey:${c.source}` : c.t), raw(c));
 			return rt;
 		},
-		saveData: async (d) => void saved.push(JSON.parse(JSON.stringify({ ...d, pendingEnrollment: d.pendingEnrollment ? "set" : undefined })) as YaosPluginData),
+		// data.json only (identity-per-store §8: the per-install fields never reach it).
+		saveData: async (d) => void saved.push(JSON.parse(JSON.stringify(d)) as YaosPluginData),
 		notice: () => undefined,
 		clock,
 		secrets: dev.secrets,

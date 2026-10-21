@@ -5,7 +5,9 @@ import {
 	setPendingEnrollment, withoutPendingEnrollment,
 } from "./pairFlow";
 import { PairingError, prepareEnrollment, type HttpRequest, type HttpResponse, type PairingDeps } from "./pairing";
-import { defaultPluginData, sanitizePluginData, type PairedIdentity, type YaosPluginData } from "./api";
+import { defaultPluginData, type PairedIdentity, type YaosPluginData } from "./api";
+import { sanitizeLocalSettings } from "../localSettings";
+import { roundTripPluginData } from "./testkit/fakeUiHost";
 import { testVaultId } from "../keys/testkit/vaultIds";
 
 const CODE = "pc_ABCDEFGHIJKLMNOPQRSTUVWX";
@@ -119,8 +121,8 @@ test("PairingSession stores the attempt before /enroll, keeps it when the server
 	const kept = h.data().pendingEnrollment;
 	assert.ok(kept);
 	assert.equal(kept.enrollmentRequestId, enrollBodies(s.calls)[0]?.enrollmentRequestId);
-	assert.deepEqual(sanitizePluginData(JSON.parse(JSON.stringify(h.data())), "Mac").pendingEnrollment, kept, "survives save + load");
-	assert.equal(sanitizePluginData({ pendingEnrollment: { ...kept, grantSecret: "short" } }, "Mac").pendingEnrollment, undefined, "malformed: dropped on load");
+	assert.deepEqual(roundTripPluginData(h.data()).pendingEnrollment, kept, "survives save + load (the local record, identity-per-store §8)");
+	assert.equal(sanitizeLocalSettings({ pendingEnrollment: { ...kept, grantSecret: "short" } }, "Mac").pendingEnrollment, undefined, "malformed: dropped on load");
 	await assert.rejects(session.submit(input), (e: unknown) => e instanceof PairingError && e.status === 409);
 	assert.equal(h.data().pendingEnrollment, undefined);
 });

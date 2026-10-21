@@ -13,6 +13,8 @@
  *
  * `creating: { vaultId }` (§15.1) marks a vault this device just created on the server; it is dropped once a pin is
  * set, and only it allows enableE2ee and pinSuite0 "create".
+ * It is per install (identity-per-store §8): it lives in the local settings record (src/host/localSettings.ts), not in
+ * data.json, so a twin that copied the folder never takes it.
  */
 
 import { isVaultId } from "../../core/codec/ids";
@@ -26,7 +28,7 @@ export interface CreatingMarker {
 	readonly vaultId: string;
 }
 
-/** The data.json fields this module owns (YaosPluginData has them too). */
+/** The fields this module owns (YaosPluginData has them too): e2ee in data.json, creating in the local record. */
 export interface PinFields {
 	readonly e2ee?: E2eePin;
 	readonly creating?: CreatingMarker;

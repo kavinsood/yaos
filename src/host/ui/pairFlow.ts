@@ -3,9 +3,10 @@
  * the same input (idempotent on the server), single-flight submits, and applying the result to
  * plugin data. No obsidian runtime import.
  *
- * SECRETS: the attempt holds the pairing code and the new device token. clear() drops the
- * in-memory copy; deps.persist stores it in plugin data while /enroll is unanswered (so a later
- * load can retry it once) and removes it on a definitive refusal. Nothing here logs it.
+ * SECRETS: the attempt holds the pairing code and the new grant secret. clear() drops the
+ * in-memory copy; deps.persist stores it while /enroll is unanswered (so a later load can retry
+ * it once; in the local settings record, never data.json: identity-per-store §8) and removes it
+ * on a definitive refusal. Nothing here logs it.
  */
 
 import { sameIdentity, sanitizeDeviceLabel, type PairedIdentity, type YaosPluginData, type YaosUiHost } from "./api";
