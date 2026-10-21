@@ -440,7 +440,11 @@ Results:
 
 **Identical duplicate creates** are the onboarding case: two devices import the same vault concurrently. Each
 identical file merges, so there are no conflict copies, no extra body rows (held initial body frames of merged docs
-are dropped, §d.4: onboarding creates hold their frames, live ones do not) and no disk ops. Only files that really
+are never sent, §d.4: onboarding creates hold their frames, live ones do not) and no disk ops. The merged doc's own
+frames stay in the outbox (I1): an edit typed into the loser after its create is held with them, and when the
+editor's save died with the app they are its only copy. The planner first merges a loser whose replica moved past
+its sync point into its file (`reconcileContent` of the loser), then rebinds; the frames leave with the loser's stream
+(`T_drop_stream`, §d.9), which waits until no synced record or intent names the doc (sim suite-1 seed 1). Only files that really
 differ are suffixed. When W was edited after its create, the loser may still match W's *current* body; the planner's
 identical-loser collapse handles that (§c.13).
 
@@ -707,8 +711,8 @@ changes.
     - Renames run before materializes, so a case-insensitive disk never collides.
 - **E3, identical onboarding.** A seq 10 `create d3 md "Inbox/x.md" hX`; B seq 11 `create d4 md "Inbox/x.md" hX`.
   - Result: d4 is `merged{into d3}`; `d4 {merged, aliasOf d3}`.
-  - B drops d4's held body frame, rebinds `synced` d4 → d3, and runs `syncedPut(d3)` once d3's body is caught up and
-    hashes to hX.
+  - B rebinds `synced` d4 → d3 and runs `syncedPut(d3)` once d3's body is caught up and hashes to hX; d4's held body
+    frame is never sent and leaves with d4's stream (`T_drop_stream`).
   - Zero disk ops and zero conflict copies.
   - With 5000 identical files there are 5000 merges, still zero copies.
   - If B's file had `hY ≠ hX`: `suffixed "Inbox/x (2).md"`, B renames its file, and A materializes `x (2).md`.
@@ -1430,8 +1434,9 @@ The planner does no destructive work until ns is caught up (§f.2).
     pass retires it again (server: a put at the new lastSeq with CAS on the old one).
   - **Local drop**: once nothing lies beyond the relay checkpoint, up to `DROPS_PER_TICK` (16) dead streams per tick
     leave the store in one transaction, `T_drop_stream` (§e.2). Not while a read of it runs, the outbox holds an own
-    frame of it, or its replica is pinned, bound, loading or has an open frame; the transaction itself refuses if the
-    record moved, the outbox holds a record, or a synced record or an intent still names the doc.
+    frame of it (a merged alias's held frames, never sent, go with the drop instead: they may be the only copy of an
+    edit, I1, §c.5), or its replica is pinned, bound, loading or has an open frame; the transaction itself refuses if
+    the record moved, the outbox holds another record, or a synced record or an intent still names the doc.
   - A stream already covered at lastSeq by a `yjsStateV1` settle checkpoint keeps that checkpoint's bytes: a retired
     put there would be non-advancing. Its rows are reclaimed all the same (H7), and the local drop runs.
 - **Budget** (Free plan: 100k rows written a day).
@@ -1527,7 +1532,7 @@ Rules:
 | `T_feed_page` | streams, meta | Stream heads, stale; cursor = `throughSeq` | Before commit: the page is re-fetched. |
 | `T_read_page` | tail, quarantine, outbox, streams, snapshots | Rows; late receipts; fresh-stream checkpoint snapshot + exact-key deletes of tail ≤ coversSeq; `appliedSeq` / `stale` when complete | Idempotent puts. The page is re-read from `appliedSeq`. |
 | `T_snapshot` (checkpoint union) / `T_compact` | snapshots, tail, streams | CAS on `snapshotCoversSeq`; snapshot put; exact-key tail deletes | Old snapshot + tail and new snapshot + less tail reconstruct the same state. |
-| `T_drop_stream` (retire, §d.9) | streams, snapshots, tail, quarantine, outbox, meta, synced, intents | Refuses (no write) if the record's `remoteHeadSeq` / `remoteCheckpointCoversSeq` moved, the outbox holds a record of the stream, or a synced record or an intent names its doc; else deletes the stream record, its snapshot, tail and quarantine rows, and its `ckptDuty` entry (`src/engine/store/repo.ts:881`). The cursor is untouched | Before commit: nothing changed, the next tick drops it. After: the doc loads as an empty replica; a later row of the stream (a late writer) re-creates the record and the stream is retired again. |
+| `T_drop_stream` (retire, §d.9) | streams, snapshots, tail, quarantine, outbox, meta, synced, intents | Refuses (no write) if the record's `remoteHeadSeq` / `remoteCheckpointCoversSeq` moved, the outbox holds a record of the stream other than a merged alias's held frames named by the caller, or a synced record or an intent names its doc; else deletes the stream record, its snapshot, tail and quarantine rows, those held frames, and its `ckptDuty` entry (`src/engine/store/repo.ts`). The cursor is untouched | Before commit: nothing changed, the next tick drops it. After: the doc loads as an empty replica; a later row of the stream (a late writer) re-creates the record and the stream is retired again. |
 | `T_adopt` | outbox, meta | Adoptable record | Before commit: the provisional was applied to the bound replica only. The edit reaches disk through the editor and is re-merged. The commit or the author's resend brings it anyway. |
 | `T_intent_begin` / `T_intent_end` | intents | Put / delete the intent | §f.7: startup completes or rolls back each intent from disk state. |
 | `T_synced` (after a disk-op batch) | synced, baseText, localTree, intents | Synced put/drop, base put, stat cache, intent end | Before commit: the next reconcile sees L = R ≠ S, which is the "identical" path. Only S advances. |

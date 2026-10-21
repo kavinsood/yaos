@@ -7,15 +7,15 @@
  *
  * reconcileHeld() is state-based so it is crash-safe: a held record whose
  * dependency record is gone is released when the fold has its doc (live /
- * deleted), deleted when the doc was merged away, and waits while the doc is
- * absent and the create is not folded yet (in the outbox, or receipted with
- * its row not folded), and is deleted when the create folded without its doc
- * (the fold ignored the frame: replay-stale, duplicate-frame, stale-epoch).
- * A live create's body frames (pending / sent, dependsOn = the create,
- * DESIGN §e.1) are deleted once their create folded
- * merged away; the ones the relay already committed are junk rows on the
- * loser's stream, which nobody materializes (§d.4). Otherwise they stay
- * pending, like released held frames.
+ * deleted), and waits while the doc is absent and the create is not folded yet
+ * (in the outbox, or receipted with its row not folded), and is deleted when
+ * the create folded without its doc (the fold ignored the frame: replay-stale,
+ * duplicate-frame, stale-epoch). The frames of a doc merged away (held, or a
+ * live create's pending body frames, dependsOn = the create, DESIGN §e.1) stay
+ * as they are: they may hold own edits past the create no file holds (I1). The
+ * held ones are never sent; the pending ones commit as junk rows on the loser's
+ * stream, which nobody materializes (§d.4). They leave with the loser's stream
+ * (retire drop, maintenance.ts), after the planner moved the disk side off it.
  */
 
 import { CheckpointEncoding } from "../../core/envelope";
@@ -178,10 +178,11 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 				if (!dep && !this.committedPending(r.dependsOn) && !this.halted) changes.push({ t: "delete", clientFrameId: r.clientFrameId });
 				continue;
 			}
-			if (e.state === "merged") {
-				changes.push({ t: "delete", clientFrameId: r.clientFrameId });
-				continue;
-			}
+			// Merged away: kept as they are (held ones never sent). They can carry own edits past the create that only
+			// they hold (I1: typed into an editor bound to the loser, its save lost with the app). The planner writes
+			// the loser's text to its file before the rebind, and the retire drop of the loser's stream deletes them
+			// (maintenance.ts), once the disk side no longer tracks the doc.
+			if (e.state === "merged") continue;
 			if (!held) continue; // a live create's body frame (DESIGN §e.1): already pending
 			changes.push({ t: "release", clientFrameId: r.clientFrameId });
 		}

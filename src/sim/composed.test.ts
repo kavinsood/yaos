@@ -701,6 +701,39 @@ test("epoch reset after an offline edit and rename of the open note, the app dea
 	for (const d of [a, b]) assert.equal(d.vault.textOf("y.md"), "one\ntyped\ntwo\n", `${d.name} keeps B's edit at the renamed path`);
 });
 
+test("an identical duplicate create merged away while its note was typed into and the app died before the save: the edit survives", async () => {
+	// Sim suite-1 seed 1 (after an epoch reset every device re-creates its files: identical creates merge, §c.5). B's
+	// create of x.md held its body frames (onboarding) and B typed into the open note; the app died before the
+	// editor's save. The create then folded merged into A's, and the held frames of a merged doc were deleted: the
+	// rebind moved B's record to A's doc at its create, the disk still held the create text, and the edit was gone
+	// with its only copy (I1).
+	const { clock, net, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "one\ntwo\n");
+	b.vault.userWrite("x.md", "one\ntwo\n");
+	net.relay.pauseCommits(); // both creates in flight: A's commits first, B's folds merged into it
+	await boot(clock, [a]);
+	await clock.advance(2_000);
+	await boot(clock, [b]);
+	await clock.advance(5_000);
+	const v = b.workspace.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(1_000);
+	assert.ok(v.isBound(), "bound");
+	v.edit(4, 0, "typed\n");
+	await clock.advance(300); // committed to storage (held behind the create); the editor's 2 s save has not run
+	assert.equal(b.vault.textOf("x.md"), "one\ntwo\n");
+	assert.ok(b.vrt!.log.c.outbox.all().some((r) => r.state === "held"), "the edit is held behind B's create");
+	net.relay.resumeCommits();
+	await clock.advance(1_000); // both creates folded, B's merged
+	b.crashApp();
+	await clock.advance(1_000);
+	void b.restartApp();
+	await clock.advance(60_000);
+	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()], [["x.md", "one\ntyped\ntwo\n"]], `${d.name}`);
+	for (const d of [a, b]) assert.equal(d.vrt?.log.c.outbox.size, 0, `${d.name}: the merged doc's frames went with its stream`);
+});
+
 test("offline delete, then a new note at the same path: a new doc, not a save over the old one", async () => {
 	// Sim heavy seed 92. A's delete waited (own frames unacked, offline), and the new file at the path merged into
 	// the old doc as a save: it followed the peer's rename of the old note, and the peer's edits to the old text

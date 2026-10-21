@@ -555,6 +555,22 @@ test("row merged, loser edited after its create: the dropped edit is local, no b
 	]);
 });
 
+test("row merged, loser replica past its sync point: its text goes to its file first, the rebind follows (I1)", () => {
+	// Sim suite-1 seed 1: own edits typed into the loser after its create, the editor's save lost with the app. Its
+	// kept frames are the only copy; a rebind now restarts S at the winner's create and the disk never gets them.
+	const sc = (over: Partial<SyncedEntry>, local = L("x.md", h("X"))): Scenario => ({
+		remote: [R("d4", "x.md", { state: "merged", aliasOf: id("d3"), body: { ...R("d4", "x.md").body!, version: V(12) } }), R("d3", "x.md", { createHash: h("X") })],
+		synced: [S("d4", "x.md", { contentHash: h("X"), bodyVersion: V(10), ...over })],
+		local: [local],
+	});
+	assert.deepEqual(run(sc({})).ops, [{ op: "reconcileContent", docId: "d4", path: "x.md", kind: "markdown", hasBase: true }]);
+	// Unhashed file: hash it first, still no rebind.
+	assert.deepEqual(run(sc({}, L("x.md", null))).ops, [{ op: "needHash", path: "x.md" }]);
+	// Once the file holds the replica (S at its version), the rebind as before.
+	assert.deepEqual(opsOf(run(sc({ bodyVersion: V(12) }))), ["rebind", "reconcileContent"]);
+	assert.equal(find(run(sc({ bodyVersion: V(12) })), "reconcileContent").docId, "d3");
+});
+
 test("row live/present/present: body without content, create not empty = wait body-empty unless S is born empty", () => {
 	const empty = { ...R("d1", "a.md").body!, hasContent: false, version: V(0) };
 	const p = run({ remote: [R("d1", "a.md", { body: empty })], synced: [S("d1", "a.md", { bodyVersion: V(3) })], local: [L("a.md", h("c0"))] });

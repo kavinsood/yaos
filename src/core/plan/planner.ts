@@ -764,6 +764,20 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		let r = r0;
 		const prefix: PlannerOp[] = [];
 		if (r0 && r0.state === "merged" && r0.aliasOf !== null) {
+			// The loser's replica moved past its sync point: own edits its file does not hold (typed into an editor
+			// bound to the loser, the save lost with the app; sim suite-1 seed 1). Its frames are the only copy (they
+			// stay in the outbox until the loser's stream is dropped, after this rebind): write them to the file
+			// first, and the rebind of the next pass merges them into the winner off the disk.
+			if (s0.kind !== "blob" && r0.body && !r0.body.frozen && r0.body.hasContent && !versionEq(r0.body.version, s0.bodyVersion) && !s0.fileGone) {
+				const l0 = input.local.get(s0.pathKey);
+				if (l0 && !l0.excluded) {
+					claimed.add(l0.pathKey);
+					// Not planned as a remote-only doc meanwhile (a materialize onto the loser's file).
+					if (!input.synced.has(r0.aliasOf)) handled.add(r0.aliasOf);
+					if (l0.hash === null) return push([{ op: "needHash", path: l0.path }]);
+					return push([{ op: "reconcileContent", docId: s0.docId, path: l0.path, kind: s0.kind, hasBase: s0.hasBase }]);
+				}
+			}
 			if (input.synced.has(r0.aliasOf)) return push([drop(s0.docId)]);
 			prefix.push({ op: "rebind", fromDocId: s0.docId, toDocId: r0.aliasOf, path: s0.path });
 			r = input.remote.get(r0.aliasOf);

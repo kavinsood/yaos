@@ -1,7 +1,8 @@
 /**
  * Live creates (DESIGN §d.4, §e.1) crashed at every §e.2 transaction boundary, in the style of crash.test.ts:
  * live creates with body frames in one commit, a create merged away with its frames committed (junk) or sent
- * and dropped unreceipted, a live create across a relay restart. After each crash A restarts on the committed
+ * before the merge (kept: they may be the only copy of an edit, I1; committed as junk, and the loser's stream dropped
+ * by the retire), a live create across a relay restart. After each crash A restarts on the committed
  * state; it must converge with B, drain its outbox (no orphaned held or gated record) and commit every durable
  * frame exactly once, except a merged-away create's body frames: at most once (junk rows on the loser stream).
  *
@@ -122,7 +123,7 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 			await run(write(A(), op.docId, "LOSER2;"));
 			await idle("a idle 2");
 		});
-		// 3. Merged away, the create committed alone, the body frame sent before the receipt and dropped at the merge.
+		// 3. Merged away, the create committed alone, the body frame sent before the receipt and kept at the merge.
 		await step(async () => {
 			relay.setLink("dev-a" as DeviceId, { downlinkMs: 300 });
 			relay.pauseCommits();
@@ -183,7 +184,7 @@ async function scenario(k: number | null, decision: CommitDecision): Promise<Run
 		const at = `(crash ${decision} #${k} ${(crashed as RunResult["crashed"])?.label})`;
 		for (const [id, stream] of durable) {
 			const n = mine.get(id) ?? 0;
-			// A merged-away create's body frames: committed with it (junk) or dropped unreceipted at the merge.
+			// A merged-away create's body frames: junk rows on the loser's stream, committed at most once.
 			if (losers.has(stream)) assert.ok(n <= 1, `loser frame ${id} committed ${n} times ${at}`);
 			else assert.equal(n, 1, `durable frame ${id} committed exactly once ${at}`);
 		}
@@ -206,7 +207,7 @@ void test("live create crash sweep: baseline converges and runs the live-create 
 	const r = await scenario(null, "commit");
 	baseline = r.labels;
 	const kinds = new Set(baseline);
-	for (const t of ["open", "tEdit", "tLive", "tOutbox"]) assert.ok(kinds.has(t), `scenario runs ${t} (got ${[...kinds].join(",")})`);
+	for (const t of ["open", "tEdit", "tLive", "tDropStream"]) assert.ok(kinds.has(t), `scenario runs ${t} (got ${[...kinds].join(",")})`);
 });
 
 for (const decision of ["crash-before", "crash-after"] as const) {
@@ -219,6 +220,6 @@ for (const decision of ["crash-before", "crash-after"] as const) {
 			const rs = await Promise.all(ks.slice(i, i + PAR).map((k) => scenario(k, decision)));
 			for (const r of rs) if (r.crashed) covered.set(r.crashed.label, (covered.get(r.crashed.label) ?? 0) + 1);
 		}
-		if (SAMPLE === 1) for (const t of ["tEdit", "tLive", "tOutbox"]) assert.ok(covered.has(t), `${decision} covered ${t}`);
+		if (SAMPLE === 1) for (const t of ["tEdit", "tLive", "tDropStream"]) assert.ok(covered.has(t), `${decision} covered ${t}`);
 	});
 }
