@@ -116,9 +116,10 @@ export interface SimConfig {
 	/**
 	 * A small ns tombstone cap and prune hysteresis drawn per seed (pruneWorld), set on every device and the oracle
 	 * alike (FOLD: devices with different caps would fold differently), so runs prune often and the retired-stream
-	 * path (DESIGN §b.5) runs end to end. Default false: production's TOMBSTONE_CAP, which no run reaches.
+	 * path (DESIGN §b.5) runs end to end. Default false: production's TOMBSTONE_CAP, which no run reaches. Explicit
+	 * rules pin the cap instead of drawing it (a committed plan keeps its world when the draw changes).
 	 */
-	readonly smallPrune?: boolean;
+	readonly smallPrune?: boolean | NsPruneRules;
 }
 
 export interface CanvasConfig {
@@ -196,18 +197,18 @@ export function tuningWorld(cfg: SimConfig, devices: number): readonly DeviceTun
 }
 
 /**
- * The run's ns prune rules (SimConfig.smallPrune), a pure function of the seed: a cap of 3..8 tombstones, pruned by
- * 1..cap-2, so the newest 2+ tombstones always stay (a 120-step run deletes or merges a dozen or so docs). As in
- * production (19000 kept), the newest deletes outlive the restore window: a delete pruned before an editor's
- * edit-beats-delete restore commits trashes that edit (planner "absent (pruned)", BACKLOG PRUNE-RESTORE; a cap that
- * prunes down to 0 loses tokens, seeds 10 and 20). One draw per run, never per device: the cap is a FOLD rule
- * (EngineTuning.nsPrune).
+ * The run's ns prune rules (SimConfig.smallPrune), a pure function of the seed: a cap of 0..8 tombstones, pruned down
+ * to 0..cap (hysteresis 0..cap). A goal of 0 prunes every delete and merged alias in the frame that made it (cap 0:
+ * at once), before any edit-beats-delete restore can commit: the restore duty of a pruned doc (DESIGN §c.9 "Pruned
+ * docs") then re-creates the editor's file instead of trashing it (BACKLOG PRUNE-RESTORE, small-cap seeds 10 and 20
+ * of the old 3..8 draw with goal 0). One draw per run, never per device: the cap is a FOLD rule (EngineTuning.nsPrune).
  */
 export function pruneWorld(cfg: SimConfig): NsPruneRules | null {
 	if (!cfg.smallPrune) return null;
+	if (typeof cfg.smallPrune === "object") return cfg.smallPrune;
 	const r = new SeededRandom(cfg.seed).fork("prune");
-	const tombstoneCap = r.range(3, 8);
-	return { tombstoneCap, pruneHysteresis: r.range(1, tombstoneCap - 2) };
+	const tombstoneCap = r.range(0, 8);
+	return { tombstoneCap, pruneHysteresis: r.range(0, tombstoneCap) };
 }
 
 /** The checkpoint side of a run's world (DESIGN §b.5, §d.8, §d.9), a pure function of the seed. */

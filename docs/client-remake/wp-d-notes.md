@@ -262,7 +262,7 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
   - the outdated client (`upgradeHalt.test.ts`): a newer build's upgradeRules halts the fold, `diag.upgrade-required`.
 
   Keys still rare or at 0, and why:
-  - pruning at the production cap (> 20k tombstones) stays 0; the "small tombstone cap" matrix (cap 3..8, run.ts
+  - pruning at the production cap (> 20k tombstones) stays 0; the "small tombstone cap" matrix (cap 0..8 pruned to 0..cap, run.ts
     pruneWorld) and the soak's small-cap draw prune, retire and drop dead streams (`ns.pruned`,
     `diag.retire-written`, `checkpoint-retired`, `retire-dropped`; coverage.sim.test.ts);
   - `conflict.path-taken`: the name must be taken between the pick and the write by a writer other than this

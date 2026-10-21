@@ -5,7 +5,8 @@
 // sequence of (seed, config) pairs; how many of them run depends on the time budget.
 //
 // Usage: npm run sim:soak -- [--minutes N] [--master-seed S] [--out DIR] [--require-coverage] [--max-runs N]
-//                             [--coverage-out FILE]
+//                             [--coverage-out FILE] [--small-prune]
+//        --small-prune: the small tombstone cap in every run (run.ts pruneWorld), not a fifth of them
 //        npm run sim:soak -- --check-coverage FILE...   (sum --coverage-out files of parallel soaks; exit 1 if a key
 //                             outside COVERAGE_OPTIONAL summed to 0)
 // Env:   YAOS_SOAK_MINUTES, YAOS_SOAK_MASTER_SEED (same as the flags)
@@ -29,7 +30,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const COVERAGE_OPTIONAL = new Set(["conflict.path-taken", "diag.frame-poisoned", "diag.upgrade-required"]);
 
 function args(argv) {
-	const o = { minutes: Number(process.env.YAOS_SOAK_MINUTES ?? 2), masterSeed: process.env.YAOS_SOAK_MASTER_SEED, out: "sim-failures", requireCoverage: false, maxRuns: Infinity, coverageOut: null, checkCoverage: null };
+	const o = { minutes: Number(process.env.YAOS_SOAK_MINUTES ?? 2), masterSeed: process.env.YAOS_SOAK_MASTER_SEED, out: "sim-failures", requireCoverage: false, maxRuns: Infinity, coverageOut: null, checkCoverage: null, smallPrune: false };
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
 		if (a === "--minutes") o.minutes = Number(argv[++i]);
@@ -37,6 +38,7 @@ function args(argv) {
 		else if (a === "--out") o.out = argv[++i];
 		else if (a === "--max-runs") o.maxRuns = Number(argv[++i]);
 		else if (a === "--require-coverage") o.requireCoverage = true;
+		else if (a === "--small-prune") o.smallPrune = true;
 		else if (a === "--coverage-out") o.coverageOut = argv[++i];
 		else if (a === "--check-coverage") o.checkCoverage = argv.slice(i + 1);
 		else throw new Error(`sim-soak: unknown argument ${a}`);
@@ -118,8 +120,8 @@ function drawConfig(r, F, C, A) {
 	// CANVAS_FAULTS (long offline periods): mostly concurrent edits of the same two canvases, as testkit/sweep.ts's hot
 	// canvas matrix (every other run keeps run.ts's default canvas rate).
 	if (baseName === "CANVAS_FAULTS") cfg.canvas = { rate: +logf(r, 1, 4).toFixed(2), ops: C.CANVAS_HOT_OPS, pool: 2, hot: true };
-	// A small tombstone cap (run.ts pruneWorld: 3..8, one draw per run from its seed, the same on every device) in a
-	// fifth of the runs: ns pruning, retired checkpoints of dead streams and their local drop.
+	// A small tombstone cap (run.ts pruneWorld: 0..8, pruned to 0..cap, one draw per run from its seed, the same on every
+	// device) in a fifth of the runs: ns pruning, retired checkpoints of dead streams and their local drop.
 	if (r.chance(0.2)) cfg.smallPrune = true;
 	return { cfg, label: `${baseName}${swarm ? `[${swarm.length}]` : ""} ${long ? "long" : "short"} d${cfg.devices} s${cfg.steps}${cfg.crypto ? " suite1" : ""}${cfg.randomTuning ? " tuned" : ""}${cfg.storms ? ` storms${cfg.storms}` : ""}${cfg.canvas ? " hot-canvas" : ""}${cfg.ops === A.RACE_OPS ? " races" : cfg.ops === A.BIG_OPS ? " big" : ""}${cfg.sameLabels ? " same-labels" : ""}${cfg.cleanups ? ` cleanups${cfg.cleanups}` : ""}${cfg.smallPrune ? " small-cap" : ""}` };
 }
@@ -163,7 +165,11 @@ async function main() {
 	const failures = [];
 	const t0 = Date.now();
 	while (Date.now() < deadline && runs < o.maxRuns) {
-		const { cfg, label } = drawConfig(master, F, C, A);
+		const drawn = drawConfig(master, F, C, A);
+		const { cfg } = drawn;
+		// After the draw: the master stream, and so every other knob of the run, stays the same.
+		if (o.smallPrune && !cfg.smallPrune) cfg.smallPrune = true;
+		const label = o.smallPrune && !drawn.label.endsWith(" small-cap") ? `${drawn.label} small-cap` : drawn.label;
 		runs++;
 		let r;
 		try {

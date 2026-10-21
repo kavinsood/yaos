@@ -32,7 +32,10 @@
 			"clone": 0,
 			"syncedConfig": 0
 		},
-		"smallPrune": true
+		"smallPrune": {
+			"tombstoneCap": 3,
+			"pruneHysteresis": 1
+		}
 	},
 	"violations": [
 		{
