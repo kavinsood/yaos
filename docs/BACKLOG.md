@@ -177,6 +177,19 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-LOST-SEND-IDLE** (`fix-refold`, soak seed 935329097, relay faults: D behind the relay at quiescence): the
+  relay lost D's last live rows before a quiet period (lostSend) and nothing later showed the gap. Two halves. (1) Sim
+  fidelity: the sim session (the wsRelay role) ran no idle liveness, so no VAULT_PING ever brought the head; it now
+  runs wsRelay's probes against the production descriptor (60 s, keepalive mode, 15 s timeout; the relay answers
+  VAULT_KEEPALIVE with VAULT_ALIVE uncharged), and the heal waits while a device behind the head still has an idle
+  head check to come. (2) Client: in keepalive mode only every 10th idle probe was a VAULT_PING, so such a device
+  stayed behind ~10 min; the first idle probe after stream data no pong has covered is now a VAULT_PING
+  (`IdleProbes`, relay-wire §4), bounding it to ~idleMs at one extra ping per quiet period after traffic (a vault
+  with no traffic still pings every 10th probe). Residual, by design: a relay that loses every message of a burst
+  while still answering keepalives leaves the device behind until the 10th probe; production sends cannot be lost
+  selectively on a healthy socket (a failed send means a closed one, which the liveness timeout catches). Plan
+  `src/sim/regressions/lost-send-idle-head-check.json`, tests in `src/engine/adapters/wsRelay.test.ts`,
+  `src/sim/relay-faults.test.ts`, `src/sim/composed.test.ts`.
 - **SIM-CKPT-EPOCH** (`fix-refold`, soak seed 1221634030, invariant 4 "ns refold mismatch"): a real fork, not an
   oracle bug. An ns checkpoint built in a reset epoch was still in flight (HTTP) when the relay was restored to a
   pre-reset snapshot; `PUT /streams/checkpoint` named no epoch, so the restored epoch took it, and both devices adopted

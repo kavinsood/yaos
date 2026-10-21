@@ -18,7 +18,9 @@ async function idleWorld(): Promise<{ clock: VirtualClock; net: SimNet; devs: Si
 	clock.onError = (e) => {
 		throw e;
 	};
-	const net = new SimNet(clock);
+	// The engine's own wakeups: without the sockets' idle liveness (one probe per idle minute per socket, wsRelay,
+	// plus the sim link's delivery timers for it and its answer), which is the adapter's, not the engine's.
+	const net = new SimNet(clock, { liveness: false });
 	const tuning = productionTuning();
 	const devs = [new SimDevice({ name: "desk", clock, net, tuning }), new SimDevice({ name: "phone", clock, net, tuning, mobile: true })];
 	devs[0]!.vault.userWrite("notes/a.md", "hello\n");

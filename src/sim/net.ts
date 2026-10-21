@@ -15,6 +15,7 @@ import type { DeviceState, GrantFetchOutcome, RegisterOutcome, RetireOutcome } f
 import { retireKeyHash } from "../engine/compose/storeIdentity";
 import type { RelayConnectResult, RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
+import { DEFAULT_LIVENESS } from "../engine/adapters/wsRelay";
 import { LogEngine } from "../engine/runtime/engine";
 import { docText } from "../engine/runtime/testHarness";
 import { projectCanvasBytes } from "../engine/reconcile/canvasDoc";
@@ -306,11 +307,16 @@ export class SimNet {
 	/** The run's ns prune rules (run.ts pruneWorld; FOLD: the oracle folds with the devices' cap), null = production. */
 	readonly nsPrune: NsPruneRules | null;
 
-	constructor(readonly clock: VirtualClock, o: { readonly seed?: number; readonly linkMs?: number; readonly jitterMs?: number; readonly sealBytes?: number; readonly dedupeWindowBytes?: number; readonly nsPrune?: NsPruneRules | null } = {}) {
+	/**
+	 * `liveness` (default on): every socket's adapter runs wsRelay's idle liveness against the production descriptor
+	 * (SOCKET_LIVENESS_DESCRIPTOR: idle probe after 60 s, keepalive mode, 15 s answer timeout).
+	 */
+	constructor(readonly clock: VirtualClock, o: { readonly seed?: number; readonly linkMs?: number; readonly jitterMs?: number; readonly sealBytes?: number; readonly dedupeWindowBytes?: number; readonly nsPrune?: NsPruneRules | null; readonly liveness?: boolean } = {}) {
 		this.nsPrune = o.nsPrune ?? null;
 		this.httpMs = o.linkMs ?? 20;
 		const link = { uplinkMs: o.linkMs ?? 20, downlinkMs: o.linkMs ?? 20, jitterMs: o.jitterMs ?? 0, httpMs: o.linkMs ?? 20, connectMs: o.linkMs ?? 20 };
-		this.relay = new SimRelay({ clock, seed: o.seed ?? 1, link, ...(o.sealBytes !== undefined ? { sealBytes: o.sealBytes } : {}), ...(o.dedupeWindowBytes !== undefined ? { dedupeWindowBytes: o.dedupeWindowBytes } : {}) });
+		const liveness = o.liveness === false ? {} : { liveness: { ...DEFAULT_LIVENESS, keepalive: true } };
+		this.relay = new SimRelay({ clock, seed: o.seed ?? 1, link, ...liveness, ...(o.sealBytes !== undefined ? { sealBytes: o.sealBytes } : {}), ...(o.dedupeWindowBytes !== undefined ? { dedupeWindowBytes: o.dedupeWindowBytes } : {}) });
 		this.blobs = new SimBlobStore({ now: () => clock.now(), timers: clock });
 		this.identities = new SimIdentityRegistry(() => clock.now());
 		this.relay.onCommit((info) => {

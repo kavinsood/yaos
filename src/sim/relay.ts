@@ -39,6 +39,7 @@ import {
 	validStreamName,
 	type LinkSpec,
 	type SimConnectFailureReason,
+	type SimLiveness,
 	type SimRelayOptions,
 	type SimRow,
 	type SimSessionInfo,
@@ -101,6 +102,7 @@ export class SimRelay implements RelayPort {
 	private nextSessionId = 1;
 	private readonly readPageRows: number;
 	private readonly maxSockets: number;
+	private readonly liveness: SimLiveness | null;
 	/** Catch-up read requests (single and batched): total, on the wire now, most on the wire at once. */
 	readRequests = 0;
 	/** Checkpoint puts, GCs and checkpoint-carrying read pages (sim coverage stats). */
@@ -119,6 +121,7 @@ export class SimRelay implements RelayPort {
 		this.limits = Object.freeze({ ...DEFAULT_SIM_RELAY_LIMITS, ...options.limits });
 		this.readPageRows = options.readPageRows ?? Number.POSITIVE_INFINITY;
 		this.maxSockets = options.maxSockets ?? SIM_MAX_SOCKETS;
+		this.liveness = options.liveness ?? null;
 		this.readOnly = new Set(options.readOnlyDevices ?? []);
 		this.defaultLink = { ...options.link };
 		this.store = new RelayStore({
@@ -164,7 +167,7 @@ export class SimRelay implements RelayPort {
 				if (this.engine.streamSockets().length >= this.maxSockets) return resolve({ ok: false, reason: "unavailable", retryAfterMs: 1000 });
 				const session = new SimRelaySession(
 					this.host, this.nextSessionId++, this.engine.nextOrdinal(), params.deviceId, this.epoch,
-					this.store.head(), !this.readOnly.has(params.deviceId), this.limits, link, { ...this.rekey },
+					this.store.head(), !this.readOnly.has(params.deviceId), this.limits, link, { ...this.rekey }, this.liveness,
 				);
 				this.engine.accept(session);
 				this.tracked.push(session);
@@ -373,6 +376,19 @@ export class SimRelay implements RelayPort {
 			};
 			this.clock.setTimer(0, check);
 		});
+	}
+
+	/**
+	 * An open socket of `deviceId` got stream data that no pong has covered yet: its adapter's next idle probe is a
+	 * VAULT_PING (wsRelay IdleProbes), which shows the head if the relay lost a live message to it (lostSend).
+	 */
+	headCheckOwed(deviceId: DeviceId): boolean {
+		return this.tracked.some((s) => s.deviceId === deviceId && s.headCheckOwed);
+	}
+
+	/** An open socket of `deviceId` runs the idle liveness: a VAULT_PING, and with it the head, will come. */
+	headCheckComing(deviceId: DeviceId): boolean {
+		return this.tracked.some((s) => s.deviceId === deviceId && s.headCheckComing);
 	}
 
 	quiescent(): boolean {

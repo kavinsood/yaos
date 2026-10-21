@@ -249,6 +249,8 @@ export class RelayEngine {
 			if (session.gate?.refused === true) this.counters.rawDrops++;
 			return;
 		}
+		// The runtime's auto-response (server vault.ts setWebSocketAutoResponse): answered without the DO, uncharged.
+		if (msg.k === "keepalive") return session.send({ k: "alive" });
 		// Every message is charged before parsing, text (subscribe, ping) in UTF-16 units (server message()).
 		if (!this.charge(session, msg.bytes, msg.k !== "append")) return;
 		if (msg.k === "ping") session.send({ k: "pong", head: this.store.head(), probeId: msg.probeId });

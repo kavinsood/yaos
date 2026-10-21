@@ -868,3 +868,35 @@ test("a transient write failure of a downloaded attachment retries at once (no a
 	await same(a, b, "img/p.png", want);
 	assert.equal(net.blobs.calls.get, 2, "the failed write's download, and one more");
 });
+
+test("a live row lost on an open socket (nothing follows it): the first idle probe is a VAULT_PING and the gap feed reads the row within ~idleMs + gapMs", async () => {
+	// Soak seed 935329097. Keepalive mode checks the head every 10th idle probe (~10 min); the first probe after
+	// stream data is a VAULT_PING (wsRelay IdleProbes). Production maintenance and gap timers.
+	const { clock, net, devs } = world({ tuning: { maintenanceMs: 1_000, maintenanceIdleMaxMs: 30_000, gapMs: 5_000 } });
+	const [a, b] = pair(devs);
+	a.vault.userWrite("notes/x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(20_000);
+	assert.equal(b.vault.textOf("notes/x.md"), "one\n");
+	await clock.advance(5 * 60_000); // idle: maintenance backed off, keepalives only
+	const cursor = () => b.vrt?.log.c.repo.cursor.vaultSeq ?? -1;
+	const commit = async (what: () => void, label: string) => {
+		const head0 = net.relay.head();
+		what();
+		assert.ok(await clock.runUntil(() => net.relay.head() > head0 && (a.vrt?.log.isIdle() ?? false), 60_000), label);
+	};
+	// ns rows only: COMMITTED to B, no PROVISIONAL that would settle by other means.
+	await commit(() => a.vault.userRename("notes/x.md", "notes/y.md"), "A's first rename committed");
+	assert.ok(await clock.runUntil(() => cursor() >= net.relay.head(), 10_000), "B read it live");
+	net.relay.loseSends(b.deviceId, 1_000); // every later COMMITTED / COMMIT_NOTICE to B
+	await commit(() => a.vault.userRename("notes/y.md", "notes/z.md"), "A's second rename committed");
+	const t0 = clock.monotonic();
+	await clock.advance(5_000);
+	assert.ok(cursor() < net.relay.head(), `B's cursor ${cursor()} behind head ${net.relay.head()}: nothing showed the lost row`);
+	assert.equal(net.relay.headCheckOwed(b.deviceId), true, "a row arrived since the last pong: the next idle probe is a VAULT_PING");
+	await clock.runUntil(() => cursor() >= net.relay.head(), 15 * 60_000);
+	const took = clock.monotonic() - t0;
+	assert.equal(cursor(), net.relay.head(), "B caught up");
+	assert.ok(await clock.runUntil(() => b.vault.textOf("notes/z.md") === "one\n", 10_000), "B renamed the file");
+	assert.ok(took <= 60_000 + 5_000 + 5_000, `caught up ${took} ms after A's last row (idle probe 60 s after B's last message, gap 5 s)`);
+});

@@ -152,3 +152,30 @@ test("relay daily limit (env): setDailyLimit fails commits even after a restart 
 	assert.ok(!relay.dailyLimitActive());
 	assert.deepEqual(await pump(clock, a.session.putCheckpoint(ns, 1, 0, new Uint8Array(3))), { t: "ok" });
 });
+
+test("relay liveness (wsRelay's idle probes, keepalive mode): a live message lost on an open socket shows through the first idle VAULT_PING's head", async () => {
+	// Soak seed 935329097: D lost the last rows before a quiet period and never learned the head.
+	const clock = new VirtualClock();
+	const relay = new SimRelay({ clock, liveness: { idleMs: 60_000, timeoutMs: 15_000, keepalive: true } });
+	const a = await connectPeer(relay, clock, "A");
+	const b = await connectPeer(relay, clock, "B");
+	await clock.advance(60_500);
+	assert.deepEqual(trace(b.events), [], "no data yet: a VAULT_KEEPALIVE, answered VAULT_ALIVE (no event)");
+	assert.equal(relay.headCheckOwed(b.session.deviceId), false);
+	a.session.append(frame("ns", "n1", "op"));
+	await clock.advance(1_000);
+	relay.loseSends(b.session.deviceId, 1);
+	a.session.append(frame("ns", "n2", "op"));
+	await clock.advance(1_000);
+	assert.deepEqual(trace(b.events), ["committed n1@1"], "n2's COMMITTED was lost; nothing later shows the gap");
+	assert.equal(relay.headCheckOwed(b.session.deviceId), true, "data since the last pong: the next probe is a VAULT_PING");
+	await clock.advance(60_000);
+	assert.deepEqual(trace(b.events), ["committed n1@1", "head 2"], "the idle VAULT_PING's pong carries head 2");
+	assert.equal(relay.headCheckOwed(b.session.deviceId), false);
+	await clock.advance(5 * 60_000);
+	assert.deepEqual(trace(b.events).slice(2), [], "keepalives again; the session stays open");
+	assert.equal(b.session.closed, false);
+	b.session.close(1000, "done");
+	a.session.close(1000, "done");
+	await clock.runUntilIdle();
+});
