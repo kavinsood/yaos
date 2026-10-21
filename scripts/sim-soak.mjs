@@ -46,21 +46,26 @@ function gitSha() {
 const logf = (r, lo, hi) => lo * (hi / lo) ** r.float();
 
 /** One run's profile, drawn from the master stream. Only real SimConfig knobs; JSON-serializable. */
-function drawConfig(r, F, C) {
+function drawConfig(r, F, C, A) {
 	const seed = r.range(1, 2 ** 31 - 1);
 	const bases = [
 		["none", null, 2], ["DEFAULT_FAULTS", F.DEFAULT_FAULTS, 4], ["BLOB_FAULTS", F.BLOB_FAULTS, 2], ["SUBS_FAULTS", F.SUBS_FAULTS, 2],
 		["E2EE_FAULTS", F.E2EE_FAULTS, 1], ["CANVAS_FAULTS", F.CANVAS_FAULTS, 1], ["SUSPEND_FAULTS", F.SUSPEND_FAULTS, 1],
 		// identity-per-store: copied vault folders (clone) and a synced plugin folder (syncedConfig).
 		["CLONE_FAULTS", F.CLONE_FAULTS, 1],
+		// Targeted relay faults (drops between PROVISIONAL / COMMIT_NOTICE / receipts, lost live messages, failed group
+		// commits); a hostile / buggy member device (suite 0 or 1); conflict copies (huge notes, a crash mid copy); the
+		// conflict-flood brake (a store lost under a vault-wide rewrite, storms for a vault of hundreds of notes).
+		["RELAY_FAULTS", F.RELAY_FAULTS, 1.5], ["HOSTILE_FAULTS", F.HOSTILE_FAULTS, 1.5], ["CONFLICT_FAULTS", F.CONFLICT_FAULTS, 1],
+		["FLOOD_FAULTS", F.FLOOD_FAULTS, 0.4],
 	];
 	let x = r.float() * bases.reduce((s, b) => s + b[2], 0);
 	let base = bases[0];
 	for (const b of bases) { x -= b[2]; if (x < 0) { base = b; break; } }
 	const [baseName, baseWeights] = base;
 	const cfg = { seed, devices: r.range(2, 5) };
-	if (baseName === "E2EE_FAULTS") cfg.crypto = "suite1";
-	const long = r.chance(0.35);
+	if (baseName === "E2EE_FAULTS" || (baseName === "HOSTILE_FAULTS" && r.chance(0.5))) cfg.crypto = "suite1";
+	const long = baseName !== "FLOOD_FAULTS" && r.chance(0.35);
 	cfg.steps = long ? r.range(200, 400) : r.range(30, 120);
 	let swarm = null;
 	if (baseWeights) {
@@ -80,10 +85,25 @@ function drawConfig(r, F, C) {
 	// Storms (bulk import, mass delete / rename / overwrite, folder move; brakes answered by the sim user) in a
 	// quarter of the runs, short ones only (hundreds of files on every device).
 	if (!long && r.chance(0.25)) cfg.storms = +logf(r, 0.02, 0.08).toFixed(3);
+	// The flood needs a vault over BRAKE_MAX_CONFLICT_COPIES notes: heavy storms, enough steps to import them.
+	if (baseName === "FLOOD_FAULTS") {
+		cfg.storms = +logf(r, 0.1, 0.2).toFixed(3);
+		cfg.steps = r.range(120, 200);
+	}
+	// Huge notes and same-labelled devices with the conflict faults; delete / restore races in a share of all runs;
+	// the user's attachment clean-up mid-sync (a grace the run outlives) in another.
+	if (baseName === "CONFLICT_FAULTS") {
+		cfg.ops = A.BIG_OPS;
+		if (r.chance(0.5)) cfg.sameLabels = true;
+	} else if (r.chance(0.15)) cfg.ops = A.RACE_OPS;
+	if (r.chance(0.15)) {
+		cfg.cleanups = +logf(r, 0.02, 0.1).toFixed(3);
+		cfg.tuning = { blobGcGraceMs: r.range(10_000, 120_000) };
+	}
 	// CANVAS_FAULTS (long offline periods): mostly concurrent edits of the same two canvases, as testkit/sweep.ts's hot
 	// canvas matrix (every other run keeps run.ts's default canvas rate).
 	if (baseName === "CANVAS_FAULTS") cfg.canvas = { rate: +logf(r, 1, 4).toFixed(2), ops: C.CANVAS_HOT_OPS, pool: 2, hot: true };
-	return { cfg, label: `${baseName}${swarm ? `[${swarm.length}]` : ""} ${long ? "long" : "short"} d${cfg.devices} s${cfg.steps}${cfg.crypto ? " suite1" : ""}${cfg.randomTuning ? " tuned" : ""}${cfg.storms ? ` storms${cfg.storms}` : ""}${cfg.canvas ? " hot-canvas" : ""}` };
+	return { cfg, label: `${baseName}${swarm ? `[${swarm.length}]` : ""} ${long ? "long" : "short"} d${cfg.devices} s${cfg.steps}${cfg.crypto ? " suite1" : ""}${cfg.randomTuning ? " tuned" : ""}${cfg.storms ? ` storms${cfg.storms}` : ""}${cfg.canvas ? " hot-canvas" : ""}${cfg.ops === A.RACE_OPS ? " races" : cfg.ops === A.BIG_OPS ? " big" : ""}${cfg.sameLabels ? " same-labels" : ""}${cfg.cleanups ? ` cleanups${cfg.cleanups}` : ""}` };
 }
 
 async function main() {
@@ -91,6 +111,7 @@ async function main() {
 	const { runSim, minimizePlan } = await load("../src/sim/run.ts");
 	const F = await load("../src/sim/faults.ts");
 	const C = await load("../src/sim/canvas.ts");
+	const A = await load("../src/sim/actors.ts");
 	const { SeededRandom } = await load("../src/sim/random.ts");
 	const sha = gitSha();
 	const out = resolve(ROOT, o.out);
@@ -103,7 +124,7 @@ async function main() {
 	const failures = [];
 	const t0 = Date.now();
 	while (Date.now() < deadline && runs < o.maxRuns) {
-		const { cfg, label } = drawConfig(master, F, C);
+		const { cfg, label } = drawConfig(master, F, C, A);
 		runs++;
 		let r;
 		try {

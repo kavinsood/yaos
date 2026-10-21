@@ -7,7 +7,8 @@
  */
 import assert from "node:assert/strict";
 import { minimizePlan, runSim, type SimConfig, type SimReport } from "../run";
-import { BLOB_FAULTS, CANVAS_FAULTS, CLONE_FAULTS, DEFAULT_FAULTS, SUBS_FAULTS } from "../faults";
+import { BLOB_FAULTS, CANVAS_FAULTS, CLONE_FAULTS, CONFLICT_FAULTS, DEFAULT_FAULTS, HOSTILE_FAULTS, RELAY_FAULTS, SUBS_FAULTS } from "../faults";
+import { BIG_OPS, RACE_OPS } from "../actors";
 import { CANVAS_HOT_OPS } from "../canvas";
 import type { SimBlobLiveness } from "../blobStore";
 
@@ -56,8 +57,14 @@ export async function sweep(name: string, base: Omit<SimConfig, "seed">, seeds: 
 	assert.fail(
 		`${name}: ${failed.length}/${seeds} seeds failed: ${failed.map((r) => r.seed).join(",")}\n` +
 			`seed ${r0.seed}:\n  ${r0.violations.slice(0, 6).map((v) => `${v.inv}: ${v.detail}`).join("\n  ")}\n` +
-			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: cfg.faults === BLOB_FAULTS ? "BLOB_FAULTS" : cfg.faults === SUBS_FAULTS ? "SUBS_FAULTS" : cfg.faults === CANVAS_FAULTS ? "CANVAS_FAULTS" : cfg.faults === CLONE_FAULTS ? "CLONE_FAULTS" : cfg.faults ? "DEFAULT_FAULTS" : null })}):\n${JSON.stringify(m.plan)}`,
+			`minimized (${m.plan.length} steps, cfg ${JSON.stringify({ ...cfg, faults: faultsName(cfg.faults), ...(cfg.ops ? { ops: cfg.ops === RACE_OPS ? "RACE_OPS" : cfg.ops === BIG_OPS ? "BIG_OPS" : cfg.ops } : {}) })}):\n${JSON.stringify(m.plan)}`,
 	);
+}
+
+const FAULT_SETS = { BLOB_FAULTS, SUBS_FAULTS, CANVAS_FAULTS, CLONE_FAULTS, RELAY_FAULTS, HOSTILE_FAULTS, CONFLICT_FAULTS, DEFAULT_FAULTS };
+function faultsName(f: SimConfig["faults"]): string | null {
+	if (!f) return null;
+	return Object.entries(FAULT_SETS).find(([, w]) => w === f)?.[0] ?? "custom";
 }
 
 /** The blob store faults reached real transfers: stalls caught calls, both ends fired, slow calls completed. */
@@ -99,6 +106,55 @@ export const cloneHits: Hits = (name, stats) => {
 	assert.ok(got.clones > 0 && got.synced > 0 && got.stores > got.devices, `${name}: the clone faults made stores of their own ${JSON.stringify(got)}`);
 };
 
+/** Coverage keys (SimReport.stats.coverage) that fire over a whole sweep of the matrix. */
+const coverageHits = (keys: readonly string[]): Hits => (name, stats) => {
+	const zero = keys.filter((k) => !stats.some((s) => (s.coverage[k] ?? 0) > 0));
+	assert.deepEqual(zero, [], `${name}: coverage keys never fired: ${zero.join(", ")}`);
+};
+const both = (a: Hits, b: Hits): Hits => (name, stats) => {
+	a(name, stats);
+	b(name, stats);
+};
+
+/**
+ * Keys each coverage generator exists for, asserted over its matrix's sweep (no extra runs). coverage.sim.test.ts
+ * asserts the main matrix's; the rarer ones (replay-*, duplicate-frame, doc-thawed, stale-epoch, conflict-flood,
+ * path-taken) are left to the nightly soak.
+ */
+export const GENERATOR_KEYS = {
+	relay: ["diag.gap-feed", "diag.adopt-pending"],
+	hostile: [
+		"ns.ignored.invalid-path", "ns.ignored.kind-mismatch", "ns.ignored.not-blob", "ns.ignored.duplicate-docid", "ns.ignored.unknown-docid",
+		"ns.ignored.restore-not-current", "ns.ignored.stale-revive", "diag.doc-frozen",
+	],
+	conflict: ["conflict.too-large", "conflict.recovered", "conflict.both-edited", "conflict.no-base"],
+	cleanup: ["diag.blob-gc-swept"],
+} as const;
+
+/** The targeted relay faults fired at every point of the frame flow (a-relay-engine taps). */
+export const relayHits: Hits = (name, stats) => {
+	const sum = (k: keyof SimReport["stats"]["relayTaps"]) => stats.reduce((n, s) => n + s.relayTaps[k], 0);
+	const got = { append: sum("append"), notice: sum("notice"), receipt: sum("receipt"), lost: sum("lost"), commitFaults: sum("commitFaults") };
+	assert.ok(Object.values(got).every((n) => n > 0), `${name}: the relay faults fired at every point ${JSON.stringify(got)}`);
+};
+
+/** The hostile device sent rows, its rows froze docs, and the user released them. */
+export const hostileHits: Hits = (name, stats) => {
+	const got = { frames: 0, released: 0, runs: 0 };
+	for (const s of stats) if (s.hostile) {
+		got.runs++;
+		got.frames += s.hostile.frames;
+		got.released += s.hostile.released;
+	}
+	assert.ok(got.frames > 0 && got.released > 0, `${name}: the hostile device sent rows and the user released what they froze ${JSON.stringify(got)}`);
+};
+
+/** A conflict copy's write was cut by a crash (conflictCrash fired). */
+export const conflictHits: Hits = (name, stats) => {
+	const crashes = stats.reduce((n, s) => n + (s.faults.conflictCrash ?? 0), 0);
+	assert.ok(crashes > 0, `${name}: a crash cut a conflict copy (${crashes})`);
+};
+
 export interface Matrix {
 	readonly name: string;
 	readonly base: Omit<SimConfig, "seed">;
@@ -134,4 +190,17 @@ export const MATRICES: readonly Matrix[] = [
 	{ name: "3 devices, clone + synced config faults", base: { devices: 3, faults: CLONE_FAULTS, faultRate: 0.25 }, seeds: part(10), smoke: 1, cost: 2.2, hits: cloneHits },
 	// Per-device engine tuning and budgets drawn per seed (run.ts tuningWorld); every other matrix keeps SIM_TUNING.
 	{ name: "3 devices, seeded faults, randomized tuning", base: { devices: 3, faults: DEFAULT_FAULTS, randomTuning: true }, seeds: part(4), smoke: 1, cost: 2 },
+	// Coverage generators (the soak draws them too, with more weight variety). Socket drops between APPEND, the
+	// COMMIT_NOTICE and the receipts, lost live messages (gap feed), failed group commits; small dedupe windows in some
+	// seeds (run.ts checkpoint world).
+	{ name: "3 devices, targeted relay faults", base: { devices: 3, faults: RELAY_FAULTS, faultRate: 0.3 }, seeds: part(10), smoke: 1, cost: 1.5, hits: both(relayHits, coverageHits(GENERATOR_KEYS.relay)) },
+	// Restores from the trash and delete-then-recreate while other devices delete and rename the same notes.
+	{ name: "3 devices, delete / restore races", base: { devices: 3, faults: DEFAULT_FAULTS, ops: RACE_OPS }, seeds: part(10), smoke: 1, cost: 1.3 },
+	// A hostile / buggy member device through the relay (hostile.ts); the user releases what its rows froze.
+	{ name: "3 devices, hostile member device", base: { devices: 3, faults: HOSTILE_FAULTS }, seeds: part(10), smoke: 1, cost: 1.4, hits: both(hostileHits, coverageHits(GENERATOR_KEYS.hostile)) },
+	{ name: "3 devices, hostile member device, suite 1", base: { devices: 3, faults: HOSTILE_FAULTS, crypto: "suite1" }, seeds: part(40), smoke: 0, cost: 6, hits: hostileHits },
+	// Huge notes reformatted while edited (too-large), a crash mid conflict copy (recovered), same-labelled devices.
+	{ name: "3 devices, conflict copies (huge notes, crash mid copy)", base: { devices: 3, faults: CONFLICT_FAULTS, ops: BIG_OPS, sameLabels: true }, seeds: part(10), smoke: 1, cost: 2, hits: both(conflictHits, coverageHits(GENERATOR_KEYS.conflict)) },
+	// The user's "Clean up unused server attachments" mid-sync, with a grace the run outlives.
+	{ name: "3 devices, attachment clean-ups", base: { devices: 3, faults: DEFAULT_FAULTS, extras: 0.3, cleanups: 0.08, tuning: { blobGcGraceMs: 60_000 } }, seeds: part(10), smoke: 1, cost: 1.3, hits: coverageHits(GENERATOR_KEYS.cleanup) },
 ];
