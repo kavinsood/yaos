@@ -5,19 +5,30 @@
 // sequence of (seed, config) pairs; how many of them run depends on the time budget.
 //
 // Usage: npm run sim:soak -- [--minutes N] [--master-seed S] [--out DIR] [--require-coverage] [--max-runs N]
+//                             [--coverage-out FILE]
+//        npm run sim:soak -- --check-coverage FILE...   (sum --coverage-out files of parallel soaks; exit 1 if a key
+//                             outside COVERAGE_OPTIONAL summed to 0)
 // Env:   YAOS_SOAK_MINUTES, YAOS_SOAK_MASTER_SEED (same as the flags)
 // On a violation: ddmin-minimizes the plan and writes DIR/<seed>-<n>.json {seed, config, violations, minimizedPlan,
 // plan, gitSha, masterSeed}; replay with `npm run sim:replay -- DIR/<file>.json`. Exit 1 if any run failed (or, with
-// --require-coverage, if any stats.coverage counter summed to 0 over the soak).
-import { mkdirSync, writeFileSync } from "node:fs";
+// --require-coverage, if a stats.coverage counter outside COVERAGE_OPTIONAL summed to 0 over the soak).
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
+/**
+ * Coverage keys a soak may leave at 0 (--require-coverage, --check-coverage): ns pruning and retired-stream reclamation
+ * (long offline past the tombstone cap: their own work), a conflict-copy name taken between pick and write (only a
+ * third-party writer racing the device's label and minute), own frames the relay refuses for good, and the upgrade
+ * halt (a newer build's upgradeRules: upgradeHalt.test.ts, it stops the run's quiescence by design).
+ */
+const COVERAGE_OPTIONAL = new Set(["ns.pruned", "diag.checkpoint-retired", "conflict.path-taken", "diag.frame-poisoned", "diag.upgrade-required"]);
+
 function args(argv) {
-	const o = { minutes: Number(process.env.YAOS_SOAK_MINUTES ?? 2), masterSeed: process.env.YAOS_SOAK_MASTER_SEED, out: "sim-failures", requireCoverage: false, maxRuns: Infinity };
+	const o = { minutes: Number(process.env.YAOS_SOAK_MINUTES ?? 2), masterSeed: process.env.YAOS_SOAK_MASTER_SEED, out: "sim-failures", requireCoverage: false, maxRuns: Infinity, coverageOut: null, checkCoverage: null };
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
 		if (a === "--minutes") o.minutes = Number(argv[++i]);
@@ -25,7 +36,10 @@ function args(argv) {
 		else if (a === "--out") o.out = argv[++i];
 		else if (a === "--max-runs") o.maxRuns = Number(argv[++i]);
 		else if (a === "--require-coverage") o.requireCoverage = true;
+		else if (a === "--coverage-out") o.coverageOut = argv[++i];
+		else if (a === "--check-coverage") o.checkCoverage = argv.slice(i + 1);
 		else throw new Error(`sim-soak: unknown argument ${a}`);
+		if (o.checkCoverage) break;
 	}
 	if (!(o.minutes > 0)) throw new Error("sim-soak: --minutes must be > 0");
 	o.masterSeed = o.masterSeed === undefined || o.masterSeed === "" ? Math.floor(Math.random() * 2 ** 31) : Number(o.masterSeed);
@@ -56,8 +70,8 @@ function drawConfig(r, F, C, A) {
 		// Targeted relay faults (drops between PROVISIONAL / COMMIT_NOTICE / receipts, lost live messages, failed group
 		// commits); a hostile / buggy member device (suite 0 or 1); conflict copies (huge notes, a crash mid copy); the
 		// conflict-flood brake (a store lost under a vault-wide rewrite, storms for a vault of hundreds of notes).
-		["RELAY_FAULTS", F.RELAY_FAULTS, 1.5], ["HOSTILE_FAULTS", F.HOSTILE_FAULTS, 1.5], ["CONFLICT_FAULTS", F.CONFLICT_FAULTS, 1],
-		["FLOOD_FAULTS", F.FLOOD_FAULTS, 0.4],
+		["RELAY_FAULTS", F.RELAY_FAULTS, 1.5], ["HOSTILE_FAULTS", F.HOSTILE_FAULTS, 1.5], ["CONFLICT_FAULTS", F.CONFLICT_FAULTS, 1.5],
+		["FLOOD_FAULTS", F.FLOOD_FAULTS, 0.8],
 	];
 	let x = r.float() * bases.reduce((s, b) => s + b[2], 0);
 	let base = bases[0];
@@ -106,8 +120,29 @@ function drawConfig(r, F, C, A) {
 	return { cfg, label: `${baseName}${swarm ? `[${swarm.length}]` : ""} ${long ? "long" : "short"} d${cfg.devices} s${cfg.steps}${cfg.crypto ? " suite1" : ""}${cfg.randomTuning ? " tuned" : ""}${cfg.storms ? ` storms${cfg.storms}` : ""}${cfg.canvas ? " hot-canvas" : ""}${cfg.ops === A.RACE_OPS ? " races" : cfg.ops === A.BIG_OPS ? " big" : ""}${cfg.sameLabels ? " same-labels" : ""}${cfg.cleanups ? ` cleanups${cfg.cleanups}` : ""}` };
 }
 
+/** Keys that summed to 0 and are not optional. */
+function missing(coverage) {
+	return [...coverage.keys()].sort().filter((k) => coverage.get(k) === 0 && !COVERAGE_OPTIONAL.has(k));
+}
+
+function checkCoverage(files) {
+	const sum = new Map();
+	let runs = 0;
+	for (const f of files) {
+		const c = JSON.parse(readFileSync(f, "utf8"));
+		runs += c.runs;
+		for (const [k, v] of Object.entries(c.coverage)) sum.set(k, (sum.get(k) ?? 0) + v);
+	}
+	const zero = missing(sum);
+	console.log(`sim-soak coverage: ${files.length} soaks, ${runs} runs, ${sum.size} keys`);
+	for (const k of [...sum.keys()].sort()) console.log(`  ${k}: ${sum.get(k)}${COVERAGE_OPTIONAL.has(k) ? " (optional)" : ""}`);
+	if (zero.length > 0) console.log(`coverage keys never hit: ${zero.join(", ")}`);
+	process.exit(sum.size === 0 || zero.length > 0 ? 1 : 0);
+}
+
 async function main() {
 	const o = args(process.argv.slice(2));
+	if (o.checkCoverage) return checkCoverage(o.checkCoverage);
 	const { runSim, minimizePlan } = await load("../src/sim/run.ts");
 	const F = await load("../src/sim/faults.ts");
 	const C = await load("../src/sim/canvas.ts");
@@ -165,12 +200,11 @@ async function main() {
 		console.log(`coverage (summed over ${withCoverage}/${runs} runs):`);
 		for (const k of keys) console.log(`  ${k}: ${coverage.get(k)}`);
 		const zero = keys.filter((k) => coverage.get(k) === 0);
-		if (zero.length > 0) {
-			console.log(`coverage keys never hit: ${zero.join(", ")}`);
-			coverageBad = o.requireCoverage;
-		}
+		if (zero.length > 0) console.log(`coverage keys never hit: ${zero.join(", ")}`);
+		if (missing(coverage).length > 0) coverageBad = o.requireCoverage;
 	}
 	if (o.requireCoverage && withCoverage === 0) coverageBad = true;
+	if (o.coverageOut) writeFileSync(resolve(ROOT, o.coverageOut), JSON.stringify({ masterSeed: o.masterSeed, runs: withCoverage, coverage: Object.fromEntries(coverage) }) + "\n");
 	process.exit(failures.length > 0 || coverageBad ? 1 : 0);
 }
 

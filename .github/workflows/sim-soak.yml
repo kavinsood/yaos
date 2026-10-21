@@ -4,8 +4,10 @@ name: Sim soak
 #   changes  skips the night when nothing the sim exercises changed since the last successful run (WATCHED below);
 #            a manual run always runs. GitHub runs schedules from the default branch only, on its code.
 #   soak     scripts/sim-soak.mjs, one process per core, each with its own master seed (swarm profiles: fault subsets,
-#            storms, randomized tuning, canvas, suspend). A failure is minimized and uploaded as sim-failures/*.json;
-#            replay it with `npm run sim:replay -- <file>`.
+#            storms, randomized tuning, canvas, suspend, targeted relay faults, a hostile device, conflict shapes,
+#            delete / restore races, attachment clean-ups). A failure is minimized and uploaded as sim-failures/*.json;
+#            replay it with `npm run sim:replay -- <file>`. Summed over the processes, every coverage key outside
+#            COVERAGE_OPTIONAL must fire (60-minute runs and longer).
 #   sweep    the CI sim matrices (`npm run test:sim`) at 1000 seeds from a random first seed (YAOS_SIM_FIRST), over
 #            4 shards (YAOS_SIM_SHARD); every shard uses the same first seed.
 # Promote a failure as a focused test of the mechanism plus, if it still fails without the fix, its minimized plan
@@ -103,7 +105,7 @@ jobs:
           echo "soak: ${procs} processes, master seeds ${base}..$(( base + procs - 1 ))"
           pids=()
           for i in $(seq 0 $(( procs - 1 ))); do
-            npm run -s sim:soak -- --minutes "$MINUTES" --master-seed $(( base + i )) --out sim-failures > "soak-$i.log" 2>&1 &
+            npm run -s sim:soak -- --minutes "$MINUTES" --master-seed $(( base + i )) --out sim-failures --coverage-out "coverage-$i.json" > "soak-$i.log" 2>&1 &
             pids+=($!)
           done
           status=0
@@ -111,6 +113,13 @@ jobs:
             wait "${pids[$i]}" || status=1
             echo "::group::soak process $i (master seed $(( base + i )))"; cat "soak-$i.log"; echo "::endgroup::"
           done
+          # Every coverage key outside sim-soak.mjs COVERAGE_OPTIONAL fires somewhere over the processes (a full
+          # night's budget; a short manual run only reports).
+          if [ "$MINUTES" -ge 30 ]; then
+            npm run -s sim:soak -- --check-coverage coverage-*.json || status=1
+          else
+            npm run -s sim:soak -- --check-coverage coverage-*.json || echo "coverage: short run, not enforced"
+          fi
           exit $status
 
       - name: Upload failures

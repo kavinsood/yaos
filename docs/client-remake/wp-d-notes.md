@@ -293,7 +293,9 @@ The sim's `SimDevice.carrier()` switches the same way, over WP-A's `SimRelay` an
   night when nothing it watches (`src`, `server`, `scripts/sim-*.mjs`, package and tsconfig files, the workflow)
   changed since its last successful run; a manual run always runs. It runs a soak process per core
   (`scripts/sim-soak.mjs`, swarm profiles) and the matrices at 1000 seeds from a random `YAOS_SIM_FIRST`, over 4
-  shards that share the first seed.
+  shards that share the first seed. Summed over the soak processes, every coverage key outside `sim-soak.mjs`
+  `COVERAGE_OPTIONAL` (pruning, retired streams, `conflict.path-taken`, `frame-poisoned`, `upgrade-required`) must
+  fire (`--coverage-out` / `--check-coverage`, enforced for runs of 30 minutes and longer).
 
 ## Run log
 
