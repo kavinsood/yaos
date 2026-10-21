@@ -88,8 +88,13 @@ export interface RelayHttp {
 	read(vaultId: string, stream: string, afterSeq: number, preferCheckpoint: boolean, maxBytes: number | null, signal?: AbortSignal): Promise<ReadPage>;
 	/** Batched read (relay-wire §7.1): pages for a non-empty prefix of `reqs` (the URL is capped at READ_BATCH_MAX_QUERY_CHARS). */
 	readBatch(vaultId: string, reqs: readonly ReadRequest[], maxBytes: number | null, signal?: AbortSignal): Promise<ReadPage[]>;
+	/**
+	 * `vaultEpoch`: the epoch whose rows the bytes merge (the session's VAULT_READY): the relay refuses the put once its
+	 * epoch is another (409 epoch_mismatch -> refused "epoch-mismatch", relay-wire §8), so a put in flight across a
+	 * reset or restore never lands in the new epoch.
+	 */
 	putCheckpoint(
-		vaultId: string, stream: string, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array, signal?: AbortSignal,
+		vaultId: string, vaultEpoch: string, stream: string, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array, signal?: AbortSignal,
 	): Promise<PutCheckpointResult>;
 }
 
@@ -413,8 +418,9 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			});
 		},
 
-		async putCheckpoint(vaultId, stream, coversSeq, expectedPrevCoversSeq, bytes, signal) {
-			const q = `stream=${encodeURIComponent(stream)}&coversSeq=${coversSeq}&expectedCoversSeq=${expectedPrevCoversSeq}`;
+		async putCheckpoint(vaultId, vaultEpoch, stream, coversSeq, expectedPrevCoversSeq, bytes, signal) {
+			const q = `stream=${encodeURIComponent(stream)}&coversSeq=${coversSeq}&expectedCoversSeq=${expectedPrevCoversSeq}`
+				+ `&vaultEpoch=${encodeURIComponent(vaultEpoch)}`;
 			const reply = await bounded("checkpoint", RELAY_REPLY_BYTES + bytes.byteLength, signal, (s) => call(vaultPath(vaultId, `/streams/checkpoint?${q}`), {
 				method: "PUT",
 				body: bytes.slice(),
@@ -429,6 +435,7 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 				if (currentCoversSeq === null) throw malformed("checkpoint", status);
 				return { t: "conflict", currentCoversSeq };
 			}
+			if (status === 409 && code === "epoch_mismatch") return { t: "refused", reason: "epoch-mismatch", retryAfterMs: null };
 			if (status === 409 && code === "checkpoint_ahead_of_stream") return { t: "refused", reason: "ahead-of-stream", retryAfterMs: null };
 			if (status === 400 && code === "checkpoint_not_advancing") return { t: "refused", reason: "not-advancing", retryAfterMs: null };
 			if (status === 404) return { t: "refused", reason: "stream-not-found", retryAfterMs: null };

@@ -33,7 +33,7 @@ import { encodeCheckpointContent } from "../../core/codec/contents";
 import { compactBody, type CompactDeps } from "./compaction";
 
 export const CHECKPOINT_FALLBACK_MS = 10 * 60_000;
-/** Backoff after "ahead-of-stream" / "stream-not-found" (both should not happen; avoid a tight loop). */
+/** Backoff after "ahead-of-stream" / "stream-not-found" (both should not happen; avoid a tight loop) or "epoch-mismatch". */
 export const CHECKPOINT_SKIP_BACKOFF_MS = 10 * 60_000;
 const DAY_MS = 24 * 60 * 60_000;
 
@@ -263,6 +263,12 @@ export async function applyOutcome(
 					return { t: "refused", reason: res.reason };
 				case "forbidden":
 					deps.onForbidden();
+					return { t: "refused", reason: res.reason };
+				case "epoch-mismatch":
+					// The relay moved to another epoch (reset / restore) while the put was in flight: nothing was written
+					// and this store's epoch is over (its socket closes 1001). Nothing to record; no retry on this session.
+					deps.diag("checkpoint-refused", { reason: res.reason, coversSeq: c });
+					st.backoffUntil.set(stream, deps.monotonic() + CHECKPOINT_SKIP_BACKOFF_MS);
 					return { t: "refused", reason: res.reason };
 			}
 	}

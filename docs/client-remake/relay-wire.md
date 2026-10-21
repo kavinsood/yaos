@@ -544,10 +544,15 @@ page × pageCount:
 
 ## 8. Checkpoint (CAS put + GC)
 
-`PUT /vault/:vaultId/streams/checkpoint?stream=<name>&coversSeq=<N>&expectedCoversSeq=<M>` (Bearer). The body is raw `application/octet-stream`, 0 – 4 MiB.
+`PUT /vault/:vaultId/streams/checkpoint?stream=<name>&coversSeq=<N>&expectedCoversSeq=<M>&vaultEpoch=<E>` (Bearer). The body is raw `application/octet-stream`, 0 – 4 MiB.
 
-**The client's promise.** The bytes represent the merge of every row of `stream` with `seq ≤ N`. The server
-cannot check this.
+**The client's promise.** The bytes represent the merge of every row of `stream` with `seq ≤ N` in epoch `E` (the
+session's `VAULT_READY.vaultEpoch`). The server cannot check the merge, but it checks the epoch.
+
+**Epoch rule.** In the writing turn (after the body read and the device check), an `E` other than the vault's current
+epoch is refused `409 epoch_mismatch` `{vaultEpoch}` and nothing is written: a put in flight across a reset or a
+restore (D8b) must not land in the new epoch, whose rows its bytes do not merge (every reader would adopt it and fold
+a dead log). A put without `vaultEpoch` (older clients) is not checked.
 
 **CAS rule.** The put succeeds iff the current `checkpointSeq == M`, `N > M`, and `N ≤ lastSeq`.
 
@@ -555,6 +560,7 @@ cannot check this.
 |---|---|
 | `200` | `{stream, coversSeq, gcSeq, deletedSegments}` |
 | `409 checkpoint_conflict` | `{current:{coversSeq}}`. Another device won. Re-read and rebuild, or keep theirs. |
+| `409 epoch_mismatch` | `{vaultEpoch}`. The vault is in another epoch; the session is over (its socket closes 1001). |
 | `400 checkpoint_not_advancing` | `N ≤ M` |
 | `409 checkpoint_ahead_of_stream` | `{lastSeq}` |
 | `404 stream_not_found` | The stream has no rows. |

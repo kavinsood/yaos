@@ -281,6 +281,9 @@ export class SimRelay implements RelayPort {
 		if (!Number.isSafeInteger(coversSeq) || coversSeq < 1) throw new SimRelayError("invalid_covers_seq");
 		if (!validSeq(expected)) throw new SimRelayError("invalid_expected_covers_seq");
 		if (bytes.byteLength > this.limits.maxCheckpointBytes) return { t: "refused", reason: "too-large", retryAfterMs: null };
+		// Server putCheckpoint: the client names its session's epoch (relayHttp vaultEpoch=); a put that was in flight
+		// across a reset or restore is refused in the writing turn (409 epoch_mismatch), nothing written.
+		if (session.vaultEpoch !== this.epoch) return { t: "refused", reason: "epoch-mismatch", retryAfterMs: null };
 		// The server has no up-front latch check here: its store write fails (503 cf_daily_limit) while the Cloudflare
 		// limit holds. A latched sim (failNextCommit daily-limit) stands for that limit, so the latch refuses too.
 		if (!this.engine.dailyActive() && this.engine.envDailyActive()) this.engine.latchDaily(null);

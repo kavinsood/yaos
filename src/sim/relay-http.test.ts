@@ -151,6 +151,24 @@ test("relay checkpoint: gcOnCheckpoint false keeps segments; a checkpoint consum
 	assert.deepEqual([next.checkpoint, next.rows.map((r) => r.seq), next.more], [null, [3, 4], false]);
 });
 
+test("relay checkpoint: a put in flight across a reset or restore is refused epoch-mismatch, nothing written (server vaultEpoch=)", async () => {
+	// Soak seed 1221634030: a checkpoint built in the reset epoch landed after a restore and every device adopted it.
+	const { clock, relay, a } = await setup({ link: { httpMs: 30 } });
+	await commitEach(clock, a, [1, 2, 3].map((i) => ["ns", `c${i}`, 10] as [string, string, number]));
+	const target = relay.snapshot();
+	const put = a.session.putCheckpoint(ns, 2, 0, bytes("built-in-epoch-0"));
+	await clock.advance(10); // in flight: the request reaches the relay at +30
+	relay.restoreEpoch(target, "epoch-restored" as Parameters<SimRelay["restoreEpoch"]>[1]);
+	assert.deepEqual(await pump(clock, put), { t: "refused", reason: "epoch-mismatch", retryAfterMs: null });
+	assert.equal(relay.checkpoint(ns), null, "the restored epoch has no checkpoint");
+	assert.equal(relay.gcSeq(ns), 0);
+	const b = await connectPeer(relay, clock, "B");
+	assert.deepEqual(await pump(clock, b.session.putCheckpoint(ns, 2, 0, bytes("built-in-the-new-epoch"))), { t: "ok" }, "a session of the new epoch puts");
+	const reset = a.session.putCheckpoint(ns, 3, 2, bytes("stale"));
+	relay.resetEpoch("epoch-reset" as Parameters<SimRelay["resetEpoch"]>[0]);
+	assert.deepEqual(await pump(clock, reset), { t: "refused", reason: "epoch-mismatch", retryAfterMs: null });
+});
+
 test("relay http: answered from state at request arrival (httpMs each way); does not flush the buffer; setHttpFailure -> network_error", async () => {
 	// Opt-out: the frame must stay buffered across the 60 ms round trip (a leading-edge commit lands at 20 ms).
 	const { clock, relay, a } = await setup({ link: { httpMs: 30 }, groupCommit: SIM_IDLE_ONLY_GROUP_COMMIT });

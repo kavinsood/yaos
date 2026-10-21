@@ -177,6 +177,14 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-CKPT-EPOCH** (`fix-refold`, soak seed 1221634030, invariant 4 "ns refold mismatch"): a real fork, not an
+  oracle bug. An ns checkpoint built in a reset epoch was still in flight (HTTP) when the relay was restored to a
+  pre-reset snapshot; `PUT /streams/checkpoint` named no epoch, so the restored epoch took it, and both devices adopted
+  a fold of rows that epoch never had (deleted / merged entries of the dead log) while a refold of its rows differs. The
+  put now carries `vaultEpoch` (relayHttp, from the session's VAULT_READY) and the server refuses another epoch
+  `409 epoch_mismatch` in the writing turn (relay-wire §8); the sim relay does the same; the engine records nothing
+  and backs off. Plan `src/sim/regressions/checkpoint-put-across-epoch-restore.json`, tests in
+  `src/sim/relay-http.test.ts`, `src/engine/adapters/relayHttp.test.ts`, `tests/server/streams-relay.ts`.
 - **SIM-EPOCH-COMMIT-CRASH** (`fix-epoch`): two losses of an edit typed into an open note whose editor died
   unsaved, so the store held its only copy. (1) The note renamed first (relay seed 134): the restart's first pass
   (ns not ready) marked the doc's file gone, and the epoch migration's stranded-edit merge (§c.12 step 5) looked at

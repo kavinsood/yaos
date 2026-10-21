@@ -1,0 +1,134 @@
+{
+	"seed": 1221634030,
+	"config": {
+		"seed": 1221634030,
+		"devices": 2,
+		"steps": 104,
+		"faults": {
+			"engineCrash": 1.441,
+			"appCrash": 2.285,
+			"commitCrash": 4.726,
+			"idbWipe": 0,
+			"idbLost": 1.123,
+			"offline": 2.163,
+			"ioFail": 0,
+			"background": 5.735,
+			"socketDrop": 0,
+			"relayRestart": 1.306,
+			"relayDrain": 0.773,
+			"httpFail": 0,
+			"dailyLimit": 0.257,
+			"epochReset": 1.782,
+			"clockSkew": 1.154,
+			"keyStoreLoss": 0,
+			"keyRoll": 1.714,
+			"revoke": 0.66,
+			"epochRestore": 0.573,
+			"hostileReplay": 3.256,
+			"hostileDowngrade": 0.692,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"faultRate": 0.224,
+		"crypto": "suite1",
+		"randomTuning": true,
+		"storms": 0.03
+	},
+	"minimizedPlan": [
+		{
+			"i": 124,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 0,
+				"name": 1,
+				"size": 1995
+			}
+		},
+		{
+			"i": 125,
+			"gapMs": 94,
+			"canvas": {
+				"t": "cAddEdge",
+				"dev": 1,
+				"file": 0.3308051126077771,
+				"from": 0.1547118672169745,
+				"to": 0.3280798797495663,
+				"seed": 193332230
+			}
+		},
+		{
+			"i": 30,
+			"gapMs": 40,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 1,
+				"file": 0.4833378402981907,
+				"pick": 0.4431606277357787,
+				"by": "external"
+			}
+		},
+		{
+			"i": 31,
+			"gapMs": 771,
+			"fault": {
+				"t": "epochReset"
+			}
+		},
+		{
+			"i": 32,
+			"gapMs": 1138,
+			"fault": {
+				"t": "background",
+				"dev": 1,
+				"event": "freeze",
+				"durationMs": 17550
+			}
+		},
+		{
+			"i": 33,
+			"gapMs": 429,
+			"user": {
+				"t": "create",
+				"dev": 0,
+				"name": 1
+			}
+		},
+		{
+			"i": 34,
+			"gapMs": 714,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 1,
+				"file": 0.11804460361599922,
+				"pick": 0.3975883829407394,
+				"by": "user"
+			}
+		},
+		{
+			"i": 35,
+			"gapMs": 11,
+			"fault": {
+				"t": "epochRestore",
+				"back": 5
+			}
+		}
+	],
+	"violations": [
+		{
+			"inv": "fold",
+			"detail": "ns full refold: 1699:61d07b3e != A's 2453:7139eae2 (6 rows to 17)"
+		}
+	],
+	"label": "soak seed 1221634030, suite 1, 2 devices: an ns checkpoint put in the reset epoch landed after an epoch restore; every device adopted it (ns fold of a dead log)"
+}

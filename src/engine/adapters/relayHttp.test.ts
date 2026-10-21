@@ -241,13 +241,13 @@ describe("relayHttp read (binary reply, relay-wire §7.2)", () => {
 });
 
 describe("relayHttp putCheckpoint", () => {
-	it("PUTs raw bytes with the CAS query", async () => {
+	it("PUTs raw bytes with the CAS query and the session's epoch", async () => {
 		const { http, requests } = client(() => jsonResponse({ stream: "b:x", coversSeq: 9, gcSeq: 0, deletedSegments: 0 }));
-		assert.deepEqual(await http.putCheckpoint("v1", "b:x", 9, 4, new Uint8Array([5, 6])), { t: "ok" });
+		assert.deepEqual(await http.putCheckpoint("v1", "E 1", "b:x", 9, 4, new Uint8Array([5, 6])), { t: "ok" });
 		const req = requests[0]!;
 		assert.equal(req.method, "PUT");
 		assert.equal(req.url.pathname, "/vault/v1/streams/checkpoint");
-		assert.equal(req.url.search, "?stream=b%3Ax&coversSeq=9&expectedCoversSeq=4");
+		assert.equal(req.url.search, "?stream=b%3Ax&coversSeq=9&expectedCoversSeq=4&vaultEpoch=E%201");
 		assert.equal(req.headers.get("content-type"), "application/octet-stream");
 		assert.deepEqual(req.body, new Uint8Array([5, 6]));
 	});
@@ -261,20 +261,21 @@ describe("relayHttp putCheckpoint", () => {
 			[jsonResponse({ error: "body_too_large" }, 413), { t: "refused", reason: "too-large", retryAfterMs: null }],
 			[jsonResponse({ error: "cf_daily_limit", kind: "rows-written", resetAt: 0 }, 503, { "retry-after": "60" }), { t: "refused", reason: "daily-limit", retryAfterMs: 60_000 }],
 			[jsonResponse({ error: "forbidden" }, 403), { t: "refused", reason: "forbidden", retryAfterMs: null }],
+			[jsonResponse({ error: "epoch_mismatch", vaultEpoch: "E2" }, 409), { t: "refused", reason: "epoch-mismatch", retryAfterMs: null }],
 		];
 		for (const [response, expected] of cases) {
-			assert.deepEqual(await client(() => response).http.putCheckpoint("v1", "s", 2, 1, new Uint8Array(1)), expected);
+			assert.deepEqual(await client(() => response).http.putCheckpoint("v1", "E", "s", 2, 1, new Uint8Array(1)), expected);
 		}
 	});
 
 	it("throws for other errors", async () => {
-		let e = await rejection(client(() => jsonResponse({ error: "invalid_covers_seq" }, 400)).http.putCheckpoint("v1", "s", 0, 0, new Uint8Array(0)));
+		let e = await rejection(client(() => jsonResponse({ error: "invalid_covers_seq" }, 400)).http.putCheckpoint("v1", "E", "s", 0, 0, new Uint8Array(0)));
 		assert.deepEqual([e.status, e.code], [400, "invalid_covers_seq"]);
-		e = await rejection(client(() => jsonResponse({ error: "boom" }, 500)).http.putCheckpoint("v1", "s", 2, 1, new Uint8Array(0)));
+		e = await rejection(client(() => jsonResponse({ error: "boom" }, 500)).http.putCheckpoint("v1", "E", "s", 2, 1, new Uint8Array(0)));
 		assert.equal(e.status, 500);
-		e = await rejection(client(() => "network").http.putCheckpoint("v1", "s", 2, 1, new Uint8Array(0)));
+		e = await rejection(client(() => "network").http.putCheckpoint("v1", "E", "s", 2, 1, new Uint8Array(0)));
 		assert.equal(e.code, "network_error");
-		e = await rejection(client(() => jsonResponse({ error: "checkpoint_conflict" }, 409)).http.putCheckpoint("v1", "s", 2, 1, new Uint8Array(0)));
+		e = await rejection(client(() => jsonResponse({ error: "checkpoint_conflict" }, 409)).http.putCheckpoint("v1", "E", "s", 2, 1, new Uint8Array(0)));
 		assert.equal(e.code, "malformed_response");
 	});
 });
@@ -305,7 +306,7 @@ describe("relayHttp liveness (feed, read, readBatch watched; putCheckpoint bound
 	];
 	const allCalls: [string, (h: ReturnType<typeof createRelayHttp>, signal?: AbortSignal) => Promise<unknown>][] = [
 		...watchedCalls,
-		["putCheckpoint", (h, s) => h.putCheckpoint("v1", "ns", 2, 0, new Uint8Array(MiB), s)],
+		["putCheckpoint", (h, s) => h.putCheckpoint("v1", "E", "ns", 2, 0, new Uint8Array(MiB), s)],
 	];
 
 	it("backstops: base + byte bound at the floor; every read page is bounded by one 4 MiB checkpoint (79 s, was 143 s)", () => {
@@ -345,7 +346,7 @@ describe("relayHttp liveness (feed, read, readBatch watched; putCheckpoint bound
 	it("putCheckpoint (no upload progress): ends \"timeout\" at its size-proportional deadline", async () => {
 		const clock = new ManualClock();
 		const f = deaf();
-		const p = createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: f.fetch, clock }).putCheckpoint("v1", "ns", 2, 0, new Uint8Array(MiB));
+		const p = createRelayHttp({ baseUrl: BASE, credential: TOKEN, fetch: f.fetch, clock }).putCheckpoint("v1", "E", "ns", 2, 0, new Uint8Array(MiB));
 		let settled = false;
 		p.then(() => (settled = true), () => (settled = true));
 		await tick();

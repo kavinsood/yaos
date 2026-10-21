@@ -344,7 +344,7 @@ class WsRelaySession implements RelaySession {
 	}
 
 	putCheckpoint(stream: StreamName, coversSeq: number, expectedPrevCoversSeq: number, bytes: Uint8Array) {
-		return this.http.putCheckpoint(this.vaultId, stream, coversSeq, expectedPrevCoversSeq, bytes, this.gone.signal);
+		return this.http.putCheckpoint(this.vaultId, this.vaultEpoch, stream, coversSeq, expectedPrevCoversSeq, bytes, this.gone.signal);
 	}
 
 	onEvent(listener: (event: RelayEvent) => void): Unsubscribe {
