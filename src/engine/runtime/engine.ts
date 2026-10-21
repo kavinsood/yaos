@@ -144,7 +144,7 @@ export class LogEngine {
 			maxInflightBytes: () => c.budgets.maxInflightAppendBytes,
 			onPoison: (rec, why) => {
 				c.diag("frame-poisoned", { why });
-				void c.repo.tOutbox([{ t: "state", clientFrameId: rec.clientFrameId, state: "poisoned" }]).then((r) => c.applyOutboxResult(r));
+				void c.repo.tOutbox([{ t: "state", clientFrameId: rec.clientFrameId, state: "poisoned" }]).then((r) => c.applyOutboxResult(r), (e: unknown) => c.diag("frame-poison-failed", { error: String(e) }));
 			},
 			onForbidden: () => c.onForbidden(),
 			writeBlocked: () => c.gate() !== null || !c.keyring.sendReady(),

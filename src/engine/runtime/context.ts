@@ -401,7 +401,8 @@ export class EngineCtx {
 		const wait = Math.max(0, r.adoptOf.receivedAtMs + this.tuning.provisionalAdoptMs - this.now());
 		this.adoptTimers.set(r.clientFrameId, this.ports.clock.setTimer(wait, () => {
 			this.adoptTimers.delete(r.clientFrameId);
-			void this.docs.adoptToPending(r.clientFrameId, "timeout");
+			// A timer callback: nothing awaits it, so a failed commit (the store died meanwhile) is diagnosed here.
+			void this.docs.adoptToPending(r.clientFrameId, "timeout").catch((e: unknown) => this.diag("adopt-pending-failed", { error: String(e) }));
 		}));
 	}
 	unregisterAdopt(cfid: ClientFrameId): void {

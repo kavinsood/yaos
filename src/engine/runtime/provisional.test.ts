@@ -243,3 +243,32 @@ test("send window: many frames stay within maxInflightAppendBytes and all commit
 		await b.stop();
 	}
 });
+
+test("provisional: a storage failure when the adopt timeout fires is diagnosed, not an unhandled rejection", async () => {
+	// Soak master seed 13 run 45 (SUSPEND_FAULTS + RACE_OPS): the adopt timer's adoptToPending hit a store that had just
+	// died (a simulated crash after a commit), and nothing caught the rejected tOutbox.
+	const relay = new SimRelay();
+	const { a, b, view } = await pair(relay);
+	const unhandled: unknown[] = [];
+	const onUnhandled = (e: unknown) => void unhandled.push(e);
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		const id = await createDoc(a, "t.md", "");
+		await converged([a, b]);
+		const va = await view("a", a, id);
+		await view("b", b, id);
+		relay.pauseCommits();
+		va.type("slow");
+		await until(() => adoptableOf(b, id) !== null, 3_000, "adopted");
+		const repo = b.c.repo;
+		repo.tOutbox = () => Promise.reject(new Error("storage port is dead (test)"));
+		await sleep(b.c.tuning.provisionalAdoptMs + 200);
+		await sleep(50);
+		assert.deepEqual(unhandled.map(String), [], "no unhandled rejection");
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+		relay.resumeCommits();
+		await a.stop();
+		await b.stop().catch(() => undefined);
+	}
+});

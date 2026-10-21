@@ -471,6 +471,14 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 	const c = full(cfg);
 	const plan = explicitPlan ?? generatePlan(cfg);
 	seedEntropy(cfg.seed);
+	// A promise whose failure engine code drops (a worker only logs it; Node would end the process): a violation of
+	// this run, minimizable like any other.
+	const unhandled: Violation[] = [];
+	const onUnhandled = (e: unknown): void => {
+		if (unhandled.length < 5) unhandled.push({ inv: "clean", detail: `unhandled rejection: ${e instanceof Error ? (e.stack ?? e.message).split("\n").slice(0, 4).join(" | ") : String(e)}` });
+	};
+	const proc = (globalThis as { process?: { on(ev: "unhandledRejection", f: (e: unknown) => void): void; off(ev: "unhandledRejection", f: (e: unknown) => void): void } }).process;
+	proc?.on("unhandledRejection", onUnhandled);
 	try {
 		const seeded = entropyIsSeeded(() => new Y.Doc().clientID);
 		seedEntropy(cfg.seed);
@@ -668,6 +676,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const canvasStats = canvasRunStats(canvasWorld, devs, merges0);
 		for (const d of devs) d.runtime.stop().catch(() => undefined);
 		await clock.advance(5_000);
+		violations.push(...unhandled);
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
@@ -675,6 +684,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		};
 	} finally {
 		seedEntropy(null);
+		proc?.off("unhandledRejection", onUnhandled);
 	}
 }
 
