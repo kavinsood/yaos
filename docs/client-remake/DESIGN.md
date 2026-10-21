@@ -1622,7 +1622,7 @@ All are in `src/core/types.ts`.
 - **Hashes.**
   - `ContentHash` is the logical hash: markdown-lf-v1 canonical bytes for markdown, canonical JSON for canvas, raw
     bytes for blobs.
-  - `DiskFingerprint` is the exact-bytes hash, used only for echo suppression and CAS.
+  - `DiskFingerprint` is the exact-bytes hash: the "fingerprint" write precondition (CAS) and refreshing a synced record whose bytes changed but whose content did not. Echo suppression goes by size and mtime (`echo.ts`).
   - Both are SHA-256 hex, digested in the engine through `HashPort` (WebCrypto; `digestHex`,
     `src/core/hash/digest.ts:11`), like every other digest: blobs, canvas, config, snapshots, mirrors, brake ids.
     Core's pure-JS SHA-256 throws a `RangeError` above `SYNC_HASH_MAX_BYTES` (4096 B, `src/core/limits.ts:100`,

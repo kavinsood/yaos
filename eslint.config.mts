@@ -238,6 +238,8 @@ export default tseslint.config(
 		"dist",
 		"server/dist",
 		"server/.wrangler",
+		// Generated deploy configs (e2e relays), gitignored; not in a typed-lint project.
+		"server/.cf-deploy",
 		"tests",
 		// Node-run end-to-end harnesses, like tests/: typechecked by typecheck:client (e2e/client) and typecheck:tests
 		// (e2e/conformance), but in no typed-lint project, so typed rules would abort the whole run on them.

@@ -27,7 +27,7 @@ export type DeviceId = Brand<string, "DeviceId">;
 export type VaultId = Brand<string, "VaultId">;
 /** Lowercase hex SHA-256 (64 chars). Logical content hash (markdown-lf-v1 canonical bytes for markdown). */
 export type ContentHash = Brand<string, "ContentHash">;
-/** Lowercase hex SHA-256 of the exact on-disk bytes. Echo suppression only. */
+/** Lowercase hex SHA-256 of the exact on-disk bytes: the "fingerprint" write precondition and the stat refresh (echo suppression uses size + mtime). */
 export type DiskFingerprint = Brand<string, "DiskFingerprint">;
 /**
  * NFC(caseFold(NFC(path))) with a FROZEN Unicode 15.1 full case-folding table
