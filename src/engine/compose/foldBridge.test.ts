@@ -33,3 +33,22 @@ test("foldEffects: a bound doc the fold pruned is retargeted by path (into null)
 	assert.deepEqual(fx.retarget, [{ docId: d("p"), into: null }, { docId: d("m"), into: d("w") }]);
 	assert.ok(fx.docIds.has(d("q")) && fx.docIds.has(d("p")));
 });
+
+test("foldEffects: on a reload every bound doc the new state lacks is retargeted by path; merged into the winner", () => {
+	// Sim smallPrune storm seed 61: B bound a doc, then adopted an ns checkpoint inside which the doc was deleted and
+	// pruned. No pruned event names it: the view stayed bound to the dead doc and pinned its stream for good.
+	const live: NsEntry = {
+		docId: d("l"), kind: "markdown", path: "b.md", pathKey: "b.md" as PathKey, state: "live", createdSeq: 1 as Seq, createdBy: "X" as DeviceId,
+		lastTouchSeq: 5 as Seq, deletedSeq: 0 as Seq, deleteBaseBodySeq: 0 as Seq, createHash: "h" as ContentHash, createSize: 1, blob: null, aliasOf: null,
+	};
+	const merged: NsEntry = { ...live, docId: d("m"), path: "a.md", pathKey: "a.md" as PathKey, state: "merged", aliasOf: d("w") };
+	const entries = new Map<DocId, NsEntry>([[d("l"), live], [d("m"), merged]]);
+	const bound = new Set([d("gone"), d("l"), d("m")]);
+	const fx = foldEffects({
+		frames: [], self: "Y" as DeviceId, committed: (id) => entries.get(id), isBound: (id) => bound.has(id), pathKey: (p) => p as PathKey,
+		reloadedBound: bound,
+	});
+	assert.deepEqual(fx.retarget, [{ docId: d("gone"), into: null }, { docId: d("m"), into: d("w") }]);
+	// not a reload: nothing named them, nothing moves
+	assert.deepEqual(foldEffects({ frames: [], self: "Y" as DeviceId, committed: (id) => entries.get(id), isBound: (id) => bound.has(id), pathKey: (p) => p as PathKey }).retarget, []);
+});

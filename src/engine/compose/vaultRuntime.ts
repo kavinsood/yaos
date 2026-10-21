@@ -423,7 +423,11 @@ export class VaultRuntime {
 		this.port.invalidate();
 		const c = this.log.c;
 		const bound = this.engine.bound;
-		const fx = foldEffects({ frames, self: this.o.identity.creds.deviceId, committed: (d) => c.ns.state.entries.get(d), isBound: (d) => bound.isBound(d), pathKey });
+		const fx = foldEffects({
+			frames, self: this.o.identity.creds.deviceId, committed: (d) => c.ns.state.entries.get(d), isBound: (d) => bound.isBound(d), pathKey,
+			// an own create still in the outbox has no committed entry yet: it stays bound
+			reloadedBound: reloaded ? [...bound.byId.keys()].filter((d) => c.createDependency(d) === null) : undefined,
+		});
 		if (fx.own.length > 0) {
 			this.ownQueue.push(...fx.own);
 			this.stats.ownFoldEvents += fx.own.length;

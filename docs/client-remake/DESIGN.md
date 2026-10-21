@@ -723,7 +723,9 @@ changes.
   never makes its own delete stale. Creates and renames pipeline freely.
 - **Pruned**: the doc's streams are retired (§b.5, §d.9). A bound doc the fold pruned is retargeted by path
   (`docRetarget{renamed}`, `src/engine/compose/foldBridge.ts`): its views re-bind to whatever doc owns the path, so
-  its replica can be dropped. **Restore duty**: see §c.7.
+  its replica can be dropped. A reload (an adopted ns checkpoint, a refold) names no pruned docs: every bound doc
+  the new committed state lacks (other than an own create still in the outbox) is retargeted the same way, and a
+  merged one into its winner. **Restore duty**: see §c.7.
 
 ### c.14 Worked examples
 

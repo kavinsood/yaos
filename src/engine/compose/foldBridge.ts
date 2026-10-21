@@ -8,7 +8,10 @@
  *  - Bound docs whose identity changed get `docRetarget`: `merged` when the
  *    entry became an alias; re-open by path when the fold pruned the entry
  *    (into: null; the doc is dead, maintenance retires and drops its stream,
- *    retire.ts, and its views re-bind to whatever doc owns the path). Renames and deletes are not retargeted at fold
+ *    retire.ts, and its views re-bind to whatever doc owns the path). A reload (an ns checkpoint adopted, a refold)
+ *    carries no events: every bound doc is checked against the new state, as a doc deleted and pruned (or merged)
+ *    inside the adopted checkpoint is gone the same way (sim smallPrune storm seed 61: the view stayed bound to the
+ *    dead doc, pinning its replica and stream records). Renames and deletes are not retargeted at fold
  *    time: the editor view follows the vault.rename / trash the projection
  *    does (and a bound doc with pending edits keeps its restore duty).
  */
@@ -44,6 +47,11 @@ export function foldEffects(o: {
 	readonly committed: (docId: DocId) => NsEntry | undefined;
 	readonly isBound: (docId: DocId) => boolean;
 	readonly pathKey: (path: NsEntry["path"]) => PathKey;
+	/**
+	 * On a reload (the committed state was replaced, not stepped by `frames`): the bound docs that are not own creates
+	 * still to fold. Each with no committed entry is retargeted as pruned.
+	 */
+	readonly reloadedBound?: Iterable<DocId>;
 }): FoldEffects {
 	const own: OwnFoldEvent[] = [];
 	const docIds = new Set<DocId>();
@@ -69,6 +77,10 @@ export function foldEffects(o: {
 			if (ev.outcome.kind === "suffixed" || ev.outcome.kind === "revived") pathKeys.add(o.pathKey(ev.outcome.finalPath));
 			if (mine) own.push({ op, seq: f.seq, outcome: ev.outcome, entry: committedRemoteEntry(o.committed(ev.docId ?? target ?? ("" as DocId))) });
 		}
+	}
+	for (const d of o.reloadedBound ?? []) {
+		docIds.add(d);
+		pruned.add(d);
 	}
 	for (const d of docIds) {
 		const e = o.committed(d);
