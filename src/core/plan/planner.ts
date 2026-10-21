@@ -137,12 +137,15 @@ export function takesNoFreshId(s: Pick<SyncedEntry, "contentHash" | "nsTouchSeq"
  * path holding several records (an ignored own create next to its folded twin) counts if any of them does not. A
  * merged doc counts as absent (its winner may be). Kept tight: every id is a random draw, and seeded runs replay them.
  */
-export function freshIdBudget(synced: ReadonlyMap<DocId, SyncedEntry>, local: ReadonlyMap<PathKey, LocalEntry>, remote: ReadonlyMap<DocId, RemoteEntry>): number {
+export function freshIdBudget(
+	synced: ReadonlyMap<DocId, SyncedEntry>, local: ReadonlyMap<PathKey, LocalEntry>, remote: ReadonlyMap<DocId, RemoteEntry>, pendingBody: ReadonlySet<DocId> = new Set(),
+): number {
 	const covered = new Map<PathKey, boolean>();
 	for (const s of synced.values()) {
 		const l = local.get(s.pathKey);
 		const r = remote.get(s.docId);
-		const ok = l !== undefined && takesNoFreshId(s, l.hash, r !== undefined && r.state !== "merged");
+		// An absent doc with own body frames still to send re-creates (the pruned row), as a changed file does.
+		const ok = l !== undefined && takesNoFreshId(s, l.hash, r !== undefined && r.state !== "merged") && (r !== undefined || !pendingBody.has(s.docId));
 		covered.set(s.pathKey, (covered.get(s.pathKey) ?? true) && ok);
 	}
 	let n = 0;
@@ -524,7 +527,10 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		// is then an own create the fold ignored (replay-duplicate, duplicate-docid, ...), not a prune: the file is
 		// created anew instead of trashed, as a changed file is below. The worst case of the rule is a resurrection
 		// (an own create that did fold, was deleted elsewhere and pruned before S1 ran), never a loss.
-		if (takesNoFreshId(s, l.hash, false)) {
+		// Own body frames of the doc still wait in the outbox: no delete covered them (edit beats delete, §c.7), but the
+		// restore can no longer name the pruned id. The file (S tracks a bound doc's local edits, so it reads
+		// unchanged) is created anew with them instead of trashed (sim smallPrune seed 104: offline edits trashed).
+		if (takesNoFreshId(s, l.hash, false) && !input.docsWithPendingBody.has(s.docId)) {
 			return push([...prefix, { op: "diskTrash", docId: s.docId, path: l.path, expect: { t: "hash", hash: s.contentHash } }, drop(s.docId)],
 				"diskTrash", brakeKey("diskTrash", s.docId, l.path, s.contentHash), l.path);
 		}
