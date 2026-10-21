@@ -361,12 +361,11 @@ test("settings sync first contact, seed \"device\": the joining device's values 
 	assert.deepEqual(await firstContact("device"), { a: '{"vimMode":false}', p: '{"vimMode":false}', pPlugins: '["dv"]', aPlugins: '["draw","dv"]' });
 });
 
-// identity-per-store phase 2: a store lost with IndexedDB takes its identity with it, and the next store (a new deviceId)
-// does not read the old one's mirrors (state/<old>/): predecessor recovery is phase 3 (§5.2). Until then the restart
-// is DESIGN §i.5 "without mirrors" (the PHASE-2 tests below); these mirror outcomes come back with phase 3.
-const PHASE3 = { todo: "identity-per-store phase 3: predecessor recovery (mirrors of the lost store)" };
+// identity-per-store: a store lost with IndexedDB takes its identity with it; the next store (a new deviceId) recovers
+// from the old one's mirrors (state/<old>/, §5.2 predecessor recovery). Without the mirrors the restart is DESIGN §i.5
+// "without mirrors".
 
-test("IndexedDB evicted while the app is down (phase 2, without mirrors): a new identity, the offline edits survive as a conflict copy", async () => {
+test("IndexedDB and mirrors lost while the app is down: a new identity, the offline edits survive as a conflict copy", async () => {
 	const { clock, devs } = world();
 	const [a, b] = pair(devs);
 	a.vault.userWrite("x.md", "one\n");
@@ -374,7 +373,7 @@ test("IndexedDB evicted while the app is down (phase 2, without mirrors): a new 
 	await boot(clock, devs);
 	await clock.advance(10_000); // synced, mirrors written
 	const before = a.deviceId;
-	a.crashApp({ wipe: true });
+	a.crashApp({ wipe: true, dropMirrors: true });
 	a.vault.externalWrite("x.md", "one\nA offline\n");
 	b.vault.userWrite("z.md", "zed\n");
 	await clock.advance(5_000);
@@ -387,12 +386,10 @@ test("IndexedDB evicted while the app is down (phase 2, without mirrors): a new 
 		assert.deepEqual([...d.vault.snapshot().entries()].sort(), [["x.md", "one\n"], [copy, "one\nA offline\n"], ["y.md", "why\n"], ["z.md", "zed\n"]].sort(), `${d.name}`);
 		assert.equal(d.vault.trashed.length, 0, `${d.name}: nothing trashed`);
 	}
-	// The old store's mirror dir is left alone (phase 3 recovers from it, then deletes it).
-	assert.ok([...a.sideFiles.files.keys()].some((k) => k.startsWith(`${before}/`)));
 });
 
-test("IndexedDB evicted while the app is down: restart recovers from the mirror, no duplicates, offline edits on both sides survive", PHASE3, async () => {
-	const { clock, devs } = world();
+test("IndexedDB evicted while the app is down: restart recovers from the mirror, no duplicates, offline edits on both sides survive", async () => {
+	const { clock, net, devs } = world();
 	const [a, b] = pair(devs);
 	a.vault.userWrite("x.md", "one\n");
 	a.vault.userWrite("y.md", "why\n");
@@ -400,6 +397,7 @@ test("IndexedDB evicted while the app is down: restart recovers from the mirror,
 	await clock.advance(5_000);
 	assert.equal(b.vault.textOf("x.md"), "one\n");
 	await clock.advance(5_000); // mirrors written
+	const before = a.deviceId;
 
 	a.crashApp({ wipe: true });
 	a.vault.externalWrite("x.md", "one\nA offline\n");
@@ -416,6 +414,12 @@ test("IndexedDB evicted while the app is down: restart recovers from the mirror,
 		assert.deepEqual([...d.vault.snapshot().keys()].sort(), ["x.md", "y.md", "z.md"], `${d.name}: no conflict copies or duplicates`);
 		assert.equal(d.vault.trashed.length, 0, `${d.name}: nothing trashed`);
 	}
+	assert.notEqual(a.deviceId, before, "the successor store has a new identity");
+	assert.deepEqual(a.identities, [before, a.deviceId]);
+	// The predecessor was fenced (retired by key) and its dir removed once the successor's mirrors were written.
+	assert.equal(net.identities.state(before), "retired");
+	assert.ok(![...a.sideFiles.files.keys()].some((k) => k.startsWith(`${before}/outbox`) || k.startsWith(`${before}/synced`)), "the predecessor's mirrors are gone");
+	assert.ok([...a.sideFiles.files.keys()].some((k) => k.startsWith(`${a.deviceId}/outbox`)), "the successor's mirror is written");
 });
 
 test("IndexedDB and mirrors both lost: the device re-bootstraps; same-content files merge without copies", async () => {
@@ -522,7 +526,7 @@ test("epoch restore to a point before a text delete: the migration deletes the r
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]), [["x.md", "a\none three\nb\n"]]);
 });
 
-test("IndexedDB evicted after an own edit reached the relay but not the disk (phase 2, without mirrors): both texts survive", async () => {
+test("IndexedDB and mirrors lost after an own edit reached the relay but not the disk: both texts survive", async () => {
 	const { clock, devs } = world();
 	const [a, b] = pair(devs);
 	a.vault.userWrite("x.md", "one\n");
@@ -533,7 +537,7 @@ test("IndexedDB evicted after an own edit reached the relay but not the disk (ph
 	await clock.advance(1_000);
 	v.edit(3, 0, " typed");
 	await clock.advance(1_000); // frame acked; the editor's 2 s save has not run
-	a.crashApp({ wipe: true });
+	a.crashApp({ wipe: true, dropMirrors: true });
 	await clock.advance(1_000);
 	void a.restartApp();
 	await clock.advance(30_000);
@@ -543,7 +547,7 @@ test("IndexedDB evicted after an own edit reached the relay but not the disk (ph
 	}
 });
 
-test("IndexedDB evicted after an own edit reached the relay but not the disk: recovery writes it to disk", PHASE3, async () => {
+test("IndexedDB evicted after an own edit reached the relay but not the disk: recovery writes it to disk", async () => {
 	// Sim seed 690 F DEV3. Every row of x.md is A's own, so reading the stream back after the wipe does not move
 	// bodyVersion.remoteSeq. A mirror-imported sync point that kept remoteSeq read as "remote unchanged" (Rc false),
 	// and the disk, equal to S, never got the typed text the relay and B hold (§i.5: import with bodyVersion null).

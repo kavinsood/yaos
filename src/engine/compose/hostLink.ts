@@ -98,11 +98,11 @@ export class HostLink {
 		for (const p of all) p.reject(new HostRequestFailed({ code: "aborted", message: "engine closed", retryable: true }));
 	}
 
-	/** `name` in the current store's dir. */
-	private sidePath(name: SideFileName): SideFilePath {
+	/** The current store's dir, or a not-ready failure (no store identity yet). */
+	private currentDir(): string {
 		const dir = this.sideDir;
 		if (dir === null) throw new HostRequestFailed({ code: "not-ready", message: "no store identity yet", retryable: true });
-		return `${dir}/${name}`;
+		return dir;
 	}
 
 	private async hostIo(op: HostIoOp): Promise<HostIoResult> {
@@ -133,31 +133,45 @@ export class HostLink {
 		},
 	};
 
-	readonly sideFiles: SideFilePort = {
-		read: async (name) => {
-			const r = await this.request({ t: "sideFileRead", name: this.sidePath(name) });
-			if (r.t !== "sideFile") throw new Error(`unexpected sideFileRead answer ${r.t}`);
-			return r.bytes;
-		},
-		write: async (name, bytes) => {
-			// The message transfers its bytes: hand over a private copy.
-			const r = await this.request({ t: "sideFileWrite", name: this.sidePath(name), bytes: bytes.slice() });
-			if (r.t !== "sideFileWritten") throw new Error(`unexpected sideFileWrite answer ${r.t}`);
-		},
-		remove: async (name) => {
-			await this.hostIo({ t: "sideFileRemove", name: this.sidePath(name) });
-		},
-		list: async (prefix) => {
-			const dir = this.sideDir;
-			if (dir === null) throw new HostRequestFailed({ code: "not-ready", message: "no store identity yet", retryable: true });
-			const r = await this.hostIo({ t: "sideFileList", prefix: `${dir}/${prefix}` });
-			if (r.t !== "sideFiles") return [];
-			// Back to the store's own names (the host lists only that dir).
-			const out: SideFileName[] = [];
-			for (const p of r.names) if (p.startsWith(`${dir}/`)) out.push(p.slice(dir.length + 1) as SideFileName);
-			return out;
-		},
-	};
+	/** The side files of one store dir, `state/<dir>/` (`dir` read per call). */
+	private sideFilesIn(dirOf: () => string): SideFilePort {
+		return {
+			read: async (name) => {
+				const r = await this.request({ t: "sideFileRead", name: `${dirOf()}/${name}` as SideFilePath });
+				if (r.t !== "sideFile") throw new Error(`unexpected sideFileRead answer ${r.t}`);
+				return r.bytes;
+			},
+			write: async (name, bytes) => {
+				// The message transfers its bytes: hand over a private copy.
+				const r = await this.request({ t: "sideFileWrite", name: `${dirOf()}/${name}` as SideFilePath, bytes: bytes.slice() });
+				if (r.t !== "sideFileWritten") throw new Error(`unexpected sideFileWrite answer ${r.t}`);
+			},
+			remove: async (name) => {
+				await this.hostIo({ t: "sideFileRemove", name: `${dirOf()}/${name}` as SideFilePath });
+			},
+			list: async (prefix) => {
+				const dir = dirOf();
+				const r = await this.hostIo({ t: "sideFileList", prefix: `${dir}/${prefix}` });
+				if (r.t !== "sideFiles") return [];
+				// Back to the store's own names (the host lists only that dir).
+				const out: SideFileName[] = [];
+				for (const p of r.names) if (p.startsWith(`${dir}/`)) out.push(p.slice(dir.length + 1) as SideFileName);
+				return out;
+			},
+		};
+	}
+
+	/** The current store's side files (identity-per-store §5.2: a store reads and writes its own dir). */
+	readonly sideFiles: SideFilePort = this.sideFilesIn(() => this.currentDir());
+
+	/**
+	 * A lineage predecessor's dir, `state/<deviceId>/` (identity-per-store §5.2: read during recovery, removed once this
+	 * store's mirrors replace it). The engine names only this install's earlier stores; never a foreign dir.
+	 */
+	sideFilesOf(deviceId: string): SideFilePort {
+		if (!/^[A-Za-z0-9_-]{16,128}$/.test(deviceId)) throw new Error("not a store dir");
+		return this.sideFilesIn(() => deviceId);
+	}
 
 	readonly configDir: ConfigDirPort = {
 		list: async (dir) => {

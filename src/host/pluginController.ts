@@ -66,9 +66,12 @@ export function hostNotice(level: "info" | "warn" | "error", code: string, messa
 	return { text: message };
 }
 
-export function hostIdentityOf(id: PairedIdentity, deviceLabel: string, installKey: string, lineage: readonly string[] = []): HostIdentity {
-	// SECRET: relay.grantSecret is the pairing grant. Never log the result.
-	return { vaultId: id.vaultId as VaultId, deviceLabel, relay: { url: id.host, grantSecret: id.grantSecret }, installKey, lineage };
+export function hostIdentityOf(
+	id: PairedIdentity, deviceLabel: string, installKey: string, lineage: readonly string[] = [],
+	predecessor: { readonly deviceId: string; readonly retireKey: string } | null = null,
+): HostIdentity {
+	// SECRET: relay.grantSecret is the pairing grant, predecessor.retireKey a retire key. Never log the result.
+	return { vaultId: id.vaultId as VaultId, deviceLabel, relay: { url: id.host, grantSecret: id.grantSecret }, installKey, lineage, predecessor };
 }
 
 function defaultRandomBytes(n: number): Uint8Array {
@@ -251,7 +254,7 @@ export class YaosController {
 			stored: (info) => this.keyringStored(rt, identity, info),
 			plaintext: this.plaintextNotice,
 		});
-		const rt = this.env.makeRuntime(hostIdentityOf(identity, this.current.deviceLabel, install.installKey, lineageOf(install)), () => this.current.engine, ui, keys);
+		const rt = this.env.makeRuntime(hostIdentityOf(identity, this.current.deviceLabel, install.installKey, lineageOf(install), install.current), () => this.current.engine, ui, keys);
 		this.runtime = rt;
 		this.pendingBrake = null;
 		this.setRun({ phase: "starting", lastError: null });

@@ -29,9 +29,10 @@ export class MemIndex {
 	readonly state = newSnapFold();
 	ready = true;
 	readonly submitted: { readonly self: DeviceId; readonly ops: readonly SnapOp[] }[] = [];
-	port(self: DeviceId) {
+	port(self: DeviceId, lineage: ReadonlySet<DeviceId> = new Set()) {
 		return {
 			self,
+			lineage,
 			view: () => ({ state: this.state, ready: this.ready }),
 			submit: async (ops: readonly SnapOp[]) => {
 				this.submitted.push({ self, ops });
@@ -84,12 +85,16 @@ export const sealingCrypto: CryptoPort = {
 
 export const DEV_A = "dev-A-0000000000000" as DeviceId;
 export const DEV_B = "dev-B-0000000000000" as DeviceId;
+/** DEV_A's successor store (identity-per-store §5.2). */
+export const DEV_A2 = "dev-A-0000000000001" as DeviceId;
 export const P = (s: string): VaultPath => s;
 export const DAY = 24 * 60 * 60 * 1000;
 
 export interface DevOptions {
 	readonly label?: string;
 	readonly self?: DeviceId;
+	/** This install's earlier stores (identity-per-store §5.2 step 6). */
+	readonly lineage?: readonly DeviceId[];
 	readonly index?: MemIndex | null;
 	readonly store?: BlobPort | null;
 	readonly keepDaily?: number;
@@ -112,7 +117,7 @@ export function device(o: DevOptions = {}) {
 	const notices: { level: string; code: string; message: string }[] = [];
 	const diags: string[] = [];
 	const settings = { enabled: o.enabled ?? true, keepDaily: o.keepDaily ?? 7, uploadToBlobStore: o.upload ?? true };
-	const remote = o.store && o.index ? { store: o.store, index: o.index.port(o.self ?? DEV_A), touch: o.touch ?? REUSE_ALL } : null;
+	const remote = o.store && o.index ? { store: o.store, index: o.index.port(o.self ?? DEV_A, new Set(o.lineage ?? [])), touch: o.touch ?? REUSE_ALL } : null;
 	const job = new SnapshotJob({
 		disk: w.gateway, side, clock: w.clock, crypto: o.crypto ?? sealingCrypto, hash: refHashPort, settings: () => settings, remote, deviceLabel: o.label ?? "laptop",
 		files: o.files ?? (() => w.vault.paths().filter((p) => !p.startsWith(".")).map((p) => ({ path: P(p), kind: kindOfPath(P(p)), size: w.vault.bytesOf(p)!.length }))),

@@ -1,10 +1,13 @@
 /**
- * identity-per-store phase 2 on the composed sim client (host + protocol + engine + SimRelay + the sim's grant
- * registry): one deviceId per store, ever.
+ * identity-per-store (phases 2 and 3) on the composed sim client (host + protocol + engine + SimRelay + the sim's
+ * grant registry): one deviceId per store, ever.
  *  - the first start mints the store's identity, registers it under the pairing grant and creates
  *    `yaos3:<vaultId>:<epoch>:<installKey>` with it in meta.identity; the install record names it;
- *  - an IndexedDB loss is a new store: a new identity, the old one in the install record's lineage, the old store's
- *    mirror dir left alone (no predecessor recovery before phase 3);
+ *  - an IndexedDB loss is a new store: a new identity, the old one in the install record's lineage; the new store
+ *    fences the old one, recovers from its mirror dir (the commit check drops what committed there; without the
+ *    fence it waits out the relay's hold) and then removes the dir;
+ *  - a store removed in the console is replaced by a successor under the same grant (recovering from its mirror);
+ *    with the pairing revoked the store stays and the device asks for a re-pair;
  *  - a vault folder copied to another device (the clone of identity-per-store §4) runs as its own identity, never
  *    touches the source's mirror dir, and both converge with a third device;
  *  - the registration refusals read as statuses: a revoked pairing stops (revoked), the 20-a-day limit waits for
@@ -97,7 +100,7 @@ test("first start: the store's identity is minted, registered under the grant, k
 	assert.equal(a.identities.length, 1);
 });
 
-test("IndexedDB loss: the next store has a new identity; the old one joins the lineage and its mirror dir is left alone", async () => {
+test("IndexedDB loss: the next store has a new identity; it fences the old one, recovers from its dir, then removes it", async () => {
 	const { clock, net, devs } = world(["A", "B"]);
 	const [a, b] = devs as [SimDevice, SimDevice];
 	a.vault.userWrite("note.md", "hello\n");
@@ -114,7 +117,9 @@ test("IndexedDB loss: the next store has a new identity; the old one joins the l
 	assert.equal(rec.current?.deviceId, a.deviceId);
 	assert.deepEqual(rec.predecessors, [first], "the old store is the lineage");
 	assert.deepEqual(new Set(net.identities.registered()), new Set([first, a.deviceId, b.deviceId]));
-	assert.ok(stateDirs(a).has(first), "the old store's dir stays (phase 3 adopts and deletes it)");
+	assert.equal(net.identities.state(first), "retired", "the successor fenced the old store (retire by key)");
+	assert.equal(net.identities.counts["retire"], 1);
+	assert.ok(!stateDirs(a).has(first), "the old store's dir is removed once the new store's mirrors are written");
 	assert.ok(stateDirs(a).has(a.deviceId), "the new store mirrors to its own dir");
 	assert.equal(files(a), files(b), "converged");
 	assert.ok(b.vault.hasFile("offline.md"));
@@ -174,6 +179,124 @@ test("clone: the source creates a note and goes offline before its body commits;
 	for (const d of [b, c]) assert.equal(d.vault.textOf("new.md"), "important text\n", `${d.name} has A's note once`);
 	assert.equal(files(a), files(b));
 	assert.equal(files(a), files(c));
+});
+
+test("IndexedDB loss with an ns frame committed but not acked: the commit check drops the inherited copy, nothing twice", async () => {
+	// identity-per-store §5.2 step 3: the mirror still lists the create as pending; its identity in the old store's
+	// ring says it committed, so the successor does not send it again under its own.
+	const clock = new VirtualClock();
+	clock.onError = (e) => {
+		throw e;
+	};
+	const net = new SimNet(clock);
+	const lines: string[] = [];
+	const a = new SimDevice({ name: "A", clock, net, log: (l) => lines.push(l) });
+	const b = new SimDevice({ name: "B", clock, net });
+	a.vault.userWrite("note.md", "hello\n");
+	for (const d of [a, b]) void d.start();
+	await clock.advance(15_000);
+	const first = a.deviceId;
+	a.vault.userWrite("new.md", "created\n");
+	for (let i = 0; i < 20_000 && net.relay.pendingCount() === 0; i++) await clock.advance(1);
+	assert.ok(net.relay.pendingCount() > 0, "A's frames are in the relay's buffer");
+	a.setOnline(false); // the acks never reach A
+	await clock.advance(10_000); // the relay commits them
+	assert.equal(net.relay.pendingCount(), 0);
+	a.crashApp({ wipe: true });
+	await clock.advance(1_000);
+	void a.restartApp();
+	a.setOnline(true);
+	await clock.advance(30_000);
+	assert.notEqual(a.deviceId, first);
+	const checked = lines.filter((l) => l.startsWith("diag inherited-checked"));
+	assert.ok(checked.some((l) => /"dropped":[1-9]/.test(l)), checked.join("\n") || "no commit check ran");
+	for (const d of [a, b]) {
+		assert.deepEqual([...d.vault.snapshot().entries()].sort(), [["new.md", "created\n"], ["note.md", "hello\n"]], d.name);
+		assert.equal(d.vault.trashed.length, 0, d.name);
+	}
+	const o = await net.oracle();
+	assert.deepEqual(o.docs.map((x) => [x.path, x.text]).sort(), [["new.md", "created\n"], ["note.md", "hello\n"]]);
+});
+
+test("IndexedDB loss without the fence (the retire key is wrong): the commit check waits out the relay's hold, then recovers", async () => {
+	// identity-per-store §5.2 "Without the fence": the predecessor stays registered; its inherited ns / cfg frames are
+	// checked only inheritUnfencedWaitMs after the start, past the relay's hold cap for a frame still in its buffer.
+	const clock = new VirtualClock();
+	clock.onError = (e) => {
+		throw e;
+	};
+	const net = new SimNet(clock);
+	const lines: string[] = [];
+	const a = new SimDevice({ name: "A", clock, net, log: (l) => lines.push(`${clock.monotonic()} ${l}`) });
+	const b = new SimDevice({ name: "B", clock, net });
+	a.vault.userWrite("note.md", "hello\n");
+	for (const d of [a, b]) void d.start();
+	await clock.advance(15_000);
+	const first = a.deviceId;
+	a.setOnline(false);
+	a.vault.userWrite("new.md", "made offline\n");
+	await clock.advance(10_000);
+	a.crashApp({ wipe: true });
+	for (const [k, v] of a.localStorage) {
+		const r = v as { current: { deviceId: string; retireKey: string } | null };
+		if (r.current) a.localStorage.set(k, { ...r, current: { ...r.current, retireKey: "x".repeat(43) } });
+	}
+	await clock.advance(1_000);
+	a.setOnline(true);
+	void a.restartApp();
+	await clock.advance(60_000);
+	assert.notEqual(a.deviceId, first);
+	assert.equal(net.identities.state(first), "live", "not fenced: the predecessor is still registered");
+	const inherited = lines.find((l) => l.includes("diag inherited "));
+	const checked = lines.find((l) => l.includes("diag inherited-checked"));
+	assert.ok(inherited?.includes('"fenced":false'), inherited);
+	assert.ok(inherited && checked, checked);
+	assert.ok(Number(checked.split(" ")[0]) - Number(inherited.split(" ")[0]) >= 10_000, `${inherited}\n${checked}`);
+	for (const d of [a, b]) assert.deepEqual([...d.vault.snapshot().entries()].sort(), [["new.md", "made offline\n"], ["note.md", "hello\n"]], d.name);
+});
+
+test("store removed in the console: the install registers a successor, which recovers the unsent edits from the old store's mirror", async () => {
+	// identity-per-store §4 "Store revoked by the server" with a valid grant: an orderly replacement, nothing lost.
+	const { clock, net, devs } = world(["A", "B"]);
+	const [a, b] = devs as [SimDevice, SimDevice];
+	a.vault.userWrite("note.md", "hello\n");
+	for (const d of devs) void d.start();
+	await clock.advance(15_000);
+	const first = a.deviceId;
+	a.setOnline(false);
+	a.vault.userWrite("note.md", "hello\nwritten offline\n");
+	a.vault.userWrite("new.md", "made offline\n");
+	await clock.advance(10_000); // planned, in the outbox and its mirror
+	net.removeDevice(first);
+	a.setOnline(true);
+	await clock.advance(60_000);
+	assert.notEqual(a.deviceId, first, "a successor store");
+	assert.deepEqual(a.identities, [first, a.deviceId]);
+	assert.equal(net.identities.state(first), "retired");
+	assert.equal(net.identities.state(a.deviceId), "live");
+	assert.equal(a.ui.statuses.at(-1)?.phase, "live");
+	assert.deepEqual(record(a).predecessors, [first]);
+	for (const d of devs) {
+		assert.deepEqual([...d.vault.snapshot().entries()].sort(), [["new.md", "made offline\n"], ["note.md", "hello\nwritten offline\n"]], d.name);
+		assert.equal(d.vault.trashed.length, 0, d.name);
+	}
+	assert.equal((await a.storage.listDatabases()).filter((n) => parseDbName(n)?.vaultEpoch).length, 1, "the revoked store's DB is gone");
+	assert.ok(!stateDirs(a).has(first), "and its dir, once the successor's mirrors were written");
+});
+
+test("store removed in the console with its pairing revoked: no successor; the store stays and the device asks for a re-pair", async () => {
+	const { clock, net, devs } = world(["A"]);
+	const [a] = devs as [SimDevice];
+	void a.start();
+	await clock.advance(15_000);
+	const first = a.deviceId;
+	net.identities.revokeGrant(a.grantSecret!);
+	net.removeDevice(first);
+	await clock.advance(60_000);
+	assert.equal(a.deviceId, first);
+	assert.equal(a.ui.statuses.at(-1)?.phase, "revoked");
+	assert.ok(a.ui.notices.some((n) => n.code === "pairing-revoked"), JSON.stringify(a.ui.notices));
+	assert.equal((await a.storage.listDatabases()).filter((n) => parseDbName(n)?.vaultEpoch).length, 1, "the store is kept");
 });
 
 test("registration refused: a revoked pairing stops the start (revoked, pairing-revoked); a re-paired grant starts it", async () => {

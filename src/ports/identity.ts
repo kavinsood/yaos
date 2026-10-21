@@ -45,11 +45,31 @@ export type RegisterOutcome =
 	| { readonly ok: true }
 	| { readonly ok: false; readonly reason: RegisterRefusal; readonly retryAfterMs: number | null };
 
+/** `POST /auth/device/retire` (the successor fence, identity-per-store §5.2 step 1), as the engine reads it. */
+export type RetireOutcome =
+	/** 200: retired now (`retired: true`), or already gone (`false`: retired before, or never registered). */
+	| { readonly ok: true; readonly retired: boolean }
+	/** 401 (a wrong key, or a device without one), 429 / 503, or no answer: the fence did not happen. */
+	| { readonly ok: false; readonly reason: "unauthorized" | "rate-limited" | "network" };
+
+/** A device's state as the server knows it (`POST /auth/device/status`, the abandoned-creator rule). */
+export type DeviceState = "live" | "retired" | "unknown";
+
 export interface IdentityPort {
 	/** `POST /vault/:id/auth/device {deviceId, deviceToken, retireKeyHash}` with the grant. Never throws. */
 	register(c: { readonly deviceId: DeviceId; readonly deviceToken: string; readonly retireKeyHash: string }): Promise<RegisterOutcome>;
 	/** SECRET: from now on the relay and blob adapters authenticate as this store's device token. */
 	use(deviceToken: string): void;
+	/**
+	 * `POST /vault/:id/auth/device/retire {deviceId, retireKey}`: retire a predecessor store by its retire key (the
+	 * successor fence, identity-per-store §5.2 step 1). Never throws. Absent: no fence (§5.2 "without the fence").
+	 */
+	retire?(c: { readonly deviceId: DeviceId; readonly retireKey: string }): Promise<RetireOutcome>;
+	/**
+	 * `POST /vault/:id/auth/device/status {deviceIds}` as this store's device: which of these devices the server holds
+	 * live, retired (tombstoned) or does not know. null: no answer. Never throws. Absent: never known retired.
+	 */
+	status?(deviceIds: readonly DeviceId[]): Promise<ReadonlyMap<DeviceId, DeviceState> | null>;
 	/**
 	 * Sim and tests: the credentials of the next store (deterministic, readable ids). Absent: the engine draws them
 	 * from its RandomPort (identity-per-store §4: 16, 32 and 32 random bytes).

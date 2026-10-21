@@ -32,7 +32,8 @@ import { createWebHash } from "./webHash";
 import { createWebRandom } from "./webRandom";
 import { createWsRelayPort } from "./wsRelay";
 import { createRelayHttp } from "./relayHttp";
-import type { IdentityPort } from "../../ports/identity";
+import type { DeviceState, IdentityPort } from "../../ports/identity";
+import type { DeviceId } from "../../core/types";
 
 export interface WebEngineOptions {
 	readonly clientVersion?: string;
@@ -67,6 +68,8 @@ export function createWebEngine(transport: EngineTransport, o: WebEngineOptions 
 				use: (deviceToken) => {
 					token = deviceToken;
 				},
+				retire: (body) => http.retireDevice(config.vaultId, body),
+				status: async (ids) => (token ? ((await http.deviceStatus(config.vaultId, ids)) as ReadonlyMap<DeviceId, DeviceState> | null) : null),
 			};
 			return { relay, storage, clock, random, crypto, hash, blob, probeBlob: () => probeHttpBlob(blobOpts), identity };
 		},

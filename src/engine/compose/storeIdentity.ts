@@ -26,7 +26,7 @@ import type { IdentityPort, RegisterRefusal, StoreCredentials } from "../../port
 import type { RandomPort } from "../../ports/random";
 import type { StoragePort } from "../../ports/storage";
 import type { YS } from "../store/repo";
-import { DB_SCHEMA_VERSION, LEGACY_DB_NAME_PREFIX, PENDING_DB_NAME_PREFIX, STORE, STORE_SPECS, type MetaIdentity, type MetaPendingIdentity } from "../store/schema";
+import { DB_SCHEMA_VERSION, LEGACY_DB_NAME_PREFIX, PENDING_DB_NAME_PREFIX, STORE, STORE_SPECS, type MetaIdentity, type MetaInherit, type MetaPendingIdentity } from "../store/schema";
 import { storeDbs } from "./knownEpoch";
 
 /** A registration refusal that ends this start (identity-per-store §3.2). */
@@ -50,6 +50,11 @@ export interface ResolvedIdentity {
 	readonly epoch: VaultEpoch | undefined;
 	/** This install's earlier stores, never `creds.deviceId` (EngineOptions.lineage; set by the composed engine). */
 	readonly lineage?: ReadonlySet<DeviceId>;
+	/**
+	 * A pending identity's predecessor recovery (identity-per-store §5.2; EngineOptions.inherit): the lineage dirs,
+	 * newest first, and whether the newest store was fenced. null: a store already exists, or the install has none.
+	 */
+	readonly inherit?: MetaInherit | null;
 }
 
 /** `yaos3-pending:<vaultId>:<installKey>`. */
@@ -160,6 +165,15 @@ export async function resolveStoreIdentity(d: ResolveDeps): Promise<ResolvedIden
 	}
 	// A store without a usable identity (none written, or not by a grant install) is no store of this install.
 	for (const db of dbs) await d.storage.deleteDatabase(db.name);
+	return { creds: await registerPending(d), source: "pending", epoch: undefined };
+}
+
+/**
+ * The install's pending identity, minted (or the one a crash left) and registered with the grant; the stores are not
+ * touched. A revoked store's successor is registered this way before the store is deleted (identity-per-store §4,
+ * "Store revoked by the server"): a refusal leaves the store as it was. Throws IdentityRefused or a storage error.
+ */
+export async function registerPending(d: ResolveDeps): Promise<StoreCredentials> {
 	const name = pendingDbName(d.vaultId, d.installKey);
 	let pending = await readPending(d.storage, name);
 	for (let mints = 0; ; ) {
@@ -184,5 +198,12 @@ export async function resolveStoreIdentity(d: ResolveDeps): Promise<ResolvedIden
 		await d.storage.deleteDatabase(name);
 		pending = null;
 	}
-	return { creds: { deviceId: pending.deviceId, deviceToken: pending.deviceToken, retireKey: pending.retireKey }, source: "pending", epoch: undefined };
+	return { deviceId: pending.deviceId, deviceToken: pending.deviceToken, retireKey: pending.retireKey };
+}
+
+/** Deletes this install's stores (every epoch). A revoked store goes once its successor is registered. */
+export async function deleteStoreDbs(storage: StoragePort, vaultId: VaultId, installKey: string): Promise<number> {
+	const dbs = await storeDbs(storage, vaultId, installKey);
+	for (const db of dbs) await storage.deleteDatabase(db.name);
+	return dbs.length;
 }

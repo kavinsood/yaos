@@ -74,6 +74,12 @@ export interface EngineInitConfig {
 	 * `lostCreateBody`): nobody else has that file. A clone has none. Optional: an older host sends none.
 	 */
 	readonly lineage?: readonly string[];
+	/**
+	 * The install record's `current` store and its retire key (identity-per-store §2.4 point 3). When the engine mints
+	 * a new store it retires this one by key before anything else (the successor fence, §5.2 step 1), so no late frame
+	 * of it can commit, then recovers from its mirrors. SECRET (retireKey): never logged. Optional: none or unknown.
+	 */
+	readonly predecessor?: { readonly deviceId: string; readonly retireKey: string } | null;
 	readonly settings: EngineSettings;
 	/** SECRET (keys): never logged or echoed. Buffers are transferred, and main keeps no copy (e2ee-design §6.3). */
 	readonly crypto:

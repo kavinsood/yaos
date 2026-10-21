@@ -3,7 +3,7 @@
  * lineage, in `App.saveLocalStorage("yaos-install-" + hex(vaultId))`. Obsidian scopes that storage to the vault
  * registration (the appId), so a copied or synced vault folder opened elsewhere has no record: a new install key, a
  * new store, a new device identity (§4 "Clone"). The record is not an identity: it names only the store this install
- * had last (`current`, with its retire key for the successor fence of §5.2, phase 3) and up to 8 before it.
+ * had last (`current`, with its retire key for the successor fence of §5.2) and up to 8 before it.
  *
  * Main writes it; the worker owns the store and reports `storeIdentity` after each runtime start. A crash that loses
  * that write leaves the lineage one store behind (§2.4 point 4). Pure: the storage is injected.

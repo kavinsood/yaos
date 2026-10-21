@@ -21,7 +21,7 @@
 import type { ClockPort } from "../../ports/clock";
 import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectResult, RelayRow } from "../../ports/relay";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
-import type { RegisterOutcome } from "../../ports/identity";
+import type { DeviceState, RegisterOutcome, RetireOutcome } from "../../ports/identity";
 import { bounded as boundedCall, relayHttpDeadlineMs, RELAY_HTTP_BASE_MS, RELAY_HTTP_IDLE_MS, RELAY_REPLY_BYTES, untilAborted, watched } from "../../core/deadline";
 import { decodeReadReply, type WireReadPage } from "./relayFrames";
 import { createWebClock } from "./webClock";
@@ -67,6 +67,16 @@ export interface RelayHttp {
 	 * register a new store's identity under the install's grant. Never throws; bounded at the small-reply deadline.
 	 */
 	registerDevice(vaultId: string, grantSecret: string, body: { readonly deviceId: string; readonly deviceToken: string; readonly retireKeyHash: string }): Promise<RegisterOutcome>;
+	/**
+	 * `POST /vault/:id/auth/device/retire {deviceId, retireKey}` (identity-per-store §5.2 step 1, the successor fence):
+	 * the retire key is the credential. Never throws; bounded at the small-reply deadline.
+	 */
+	retireDevice(vaultId: string, body: { readonly deviceId: string; readonly retireKey: string }): Promise<RetireOutcome>;
+	/**
+	 * `POST /vault/:id/auth/device/status {deviceIds}` with this device's bearer: the server's state of each id (the
+	 * abandoned-creator rule, DESIGN §i.5). null: no usable answer. Never throws.
+	 */
+	deviceStatus(vaultId: string, deviceIds: readonly string[]): Promise<ReadonlyMap<string, DeviceState> | null>;
 	/** POST /vault/:id/auth/ticket {purpose:"streams"}. Never throws; "unavailable" once `signal` aborts (connect's deadline). */
 	ticket(vaultId: string, signal?: AbortSignal): Promise<TicketResult>;
 	feed(vaultId: string, afterSeq: number, limit: number | null, signal?: AbortSignal): Promise<FeedPage>;
@@ -293,6 +303,24 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			return registerOutcome(reply);
 		},
 
+		async retireDevice(vaultId, body) {
+			const reply = await bounded("auth/device/retire", RELAY_REPLY_BYTES, undefined, (s) => call(vaultPath(vaultId, "/auth/device/retire"), {
+				method: "POST",
+				body: JSON.stringify({ deviceId: body.deviceId, retireKey: body.retireKey }),
+				contentType: "application/json",
+			}, s)).catch(() => null);
+			return retireOutcome(reply);
+		},
+
+		async deviceStatus(vaultId, deviceIds) {
+			const reply = await bounded("auth/device/status", RELAY_REPLY_BYTES, undefined, (s) => call(vaultPath(vaultId, "/auth/device/status"), {
+				method: "POST",
+				body: JSON.stringify({ deviceIds }),
+				contentType: "application/json",
+			}, s)).catch(() => null);
+			return deviceStatusOf(reply);
+		},
+
 		async ticket(vaultId, signal) {
 			const reply = await call(vaultPath(vaultId, "/auth/ticket"), {
 				method: "POST",
@@ -400,6 +428,29 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			throw fail("checkpoint", reply);
 		},
 	};
+}
+
+/** A retire-by-key reply as the engine reads it (relay-wire §2.4.1); null = no reply. */
+export function retireOutcome(reply: { readonly status: number; readonly body: Json | null } | null): RetireOutcome {
+	if (reply === null) return { ok: false, reason: "network" };
+	if (reply.status === 200) return { ok: true, retired: reply.body !== null && reply.body["retired"] === true };
+	if (reply.status === 401) return { ok: false, reason: "unauthorized" };
+	if (reply.status === 429 || reply.status === 503) return { ok: false, reason: "rate-limited" };
+	return { ok: false, reason: "network" };
+}
+
+/** A device status reply (`{devices: [{deviceId, state}]}`); null for anything else. */
+export function deviceStatusOf(reply: { readonly status: number; readonly body: Json | null } | null): ReadonlyMap<string, DeviceState> | null {
+	if (reply === null || reply.status !== 200 || reply.body === null) return null;
+	const list = reply.body["devices"];
+	if (!Array.isArray(list)) return null;
+	const out = new Map<string, DeviceState>();
+	for (const d of list) {
+		if (!isRecord(d) || typeof d["deviceId"] !== "string") continue;
+		const st = d["state"];
+		if (st === "live" || st === "retired" || st === "unknown") out.set(d["deviceId"], st);
+	}
+	return out;
 }
 
 /** A register reply as the engine reads it (relay-wire §2.4.1 errors); null = no reply (network, deadline). */

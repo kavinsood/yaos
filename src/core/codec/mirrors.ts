@@ -18,6 +18,20 @@ export const OUTBOX_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x4f,
 /** "YAOSSYN1" */
 export const SYNCED_MIRROR_MAGIC = new Uint8Array([0x59, 0x41, 0x4f, 0x53, 0x53, 0x59, 0x4e, 0x31]);
 export const MIRROR_FORMAT_VERSION = 1;
+/**
+ * The outbox mirror's format: 2 adds each frame's origins (identity-per-store §5.2: a frame inherited from a lost
+ * predecessor store and re-issued under this one keeps the identity it had there, for the commit check). Version 1
+ * (no origins) still decodes.
+ */
+export const OUTBOX_MIRROR_FORMAT_VERSION = 2;
+
+/** A predecessor store's identity of a re-issued frame (identity-per-store §5.2 step 3): its deviceId, id and frameNo. */
+export interface MirrorFrameOrigin {
+	readonly deviceId: DeviceId;
+	readonly clientFrameId: ClientFrameId;
+	/** ns / cfg frameNo (e2ee-design §8.2); 0 for none. */
+	readonly frameNo: number;
+}
 
 /** "sent" (code 3) is no longer written (DB schema 2) but still decoded: older mirrors carry it; recovery imports it as pending. */
 export type MirrorOutboxState = "held" | "pending" | "sent" | "poisoned" | "adoptable";
@@ -32,6 +46,8 @@ export interface MirrorOutboxFrame {
 	readonly dependsOn: ClientFrameId | null;
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId } | null;
 	readonly sealed: Uint8Array;
+	/** Inherited ns / cfg frames only (format 2): the identities it had in the predecessor stores, newest first. */
+	readonly origins?: readonly MirrorFrameOrigin[];
 }
 
 export interface MirrorIdentity {
@@ -79,16 +95,17 @@ async function seal(w: Writer, hash: Sha): Promise<Uint8Array> {
 	return out;
 }
 
-async function open<T>(bytes: Uint8Array, magic: Uint8Array, hash: Sha, body: (r: Reader) => T): Promise<MirrorDecodeResult<T>> {
+async function open<T>(bytes: Uint8Array, magic: Uint8Array, hash: Sha, body: (r: Reader, version: number) => T, versions: readonly number[] = [MIRROR_FORMAT_VERSION]): Promise<MirrorDecodeResult<T>> {
 	if (bytes.length < magic.length + 1 + 32 || !bytesEqual(bytes.subarray(0, magic.length), magic)) return { ok: false, reason: "bad-magic" };
 	const payload = bytes.subarray(0, bytes.length - 32);
 	const digest = await hash.sha256(payload);
 	if (!bytesEqual(digest, bytes.subarray(bytes.length - 32))) return { ok: false, reason: "bad-checksum" };
 	const r = new Reader(payload);
 	r.raw(magic.length);
-	if (r.u8() !== MIRROR_FORMAT_VERSION) return { ok: false, reason: "unsupported-version" };
+	const version = r.u8();
+	if (!versions.includes(version)) return { ok: false, reason: "unsupported-version" };
 	try {
-		const mirror = body(r);
+		const mirror = body(r, version);
 		r.end();
 		return { ok: true, mirror };
 	} catch (e) {
@@ -110,7 +127,7 @@ function readIdentity(r: Reader): MirrorIdentity & { generation: number; written
 
 export function encodeOutboxMirror(m: OutboxMirrorData, hash: Sha): Promise<Uint8Array> {
 	const w = new Writer(1024);
-	w.raw(OUTBOX_MIRROR_MAGIC).u8(MIRROR_FORMAT_VERSION);
+	w.raw(OUTBOX_MIRROR_MAGIC).u8(OUTBOX_MIRROR_FORMAT_VERSION);
 	writeIdentity(w, m);
 	w.varuint(m.frames.length);
 	for (const f of m.frames) {
@@ -121,6 +138,9 @@ export function encodeOutboxMirror(m: OutboxMirrorData, hash: Sha): Promise<Uint
 		else w.u8(0);
 		if (f.adoptOf !== null) w.u8(1).varstring(f.adoptOf.deviceId).varstring(f.adoptOf.clientFrameId);
 		else w.u8(0);
+		const origins = f.origins ?? [];
+		w.varuint(origins.length);
+		for (const o of origins) w.varstring(o.deviceId).varstring(o.clientFrameId).varuint(o.frameNo);
 		w.varbytes(f.sealed);
 	}
 	return seal(w, hash);
@@ -133,7 +153,7 @@ function readFlag(r: Reader): boolean {
 }
 
 export function decodeOutboxMirror(bytes: Uint8Array, hash: Sha): Promise<MirrorDecodeResult<OutboxMirrorData>> {
-	return open(bytes, OUTBOX_MIRROR_MAGIC, hash, (r) => {
+	return open(bytes, OUTBOX_MIRROR_MAGIC, hash, (r, version) => {
 		const id = readIdentity(r);
 		const n = r.varuint();
 		const frames: MirrorOutboxFrame[] = [];
@@ -150,10 +170,17 @@ export function decodeOutboxMirror(bytes: Uint8Array, hash: Sha): Promise<Mirror
 				const deviceId = r.varstring() as DeviceId;
 				adoptOf = { deviceId, clientFrameId: r.varstring() as ClientFrameId };
 			}
-			frames.push({ clientFrameId, stream, order, state, authorNsSeq, dependsOn, adoptOf, sealed: r.varbytes() });
+			const origins: MirrorFrameOrigin[] = [];
+			const no = version >= 2 ? r.varuint() : 0;
+			for (let j = 0; j < no; j++) {
+				const deviceId = r.varstring() as DeviceId;
+				const clientFrameId = r.varstring() as ClientFrameId;
+				origins.push({ deviceId, clientFrameId, frameNo: r.varuint() });
+			}
+			frames.push({ clientFrameId, stream, order, state, authorNsSeq, dependsOn, adoptOf, sealed: r.varbytes(), ...(origins.length > 0 ? { origins } : {}) });
 		}
 		return { ...id, frames };
-	});
+	}, [1, OUTBOX_MIRROR_FORMAT_VERSION]);
 }
 
 export function encodeSyncedMirror(m: SyncedMirrorData, hash: Sha): Promise<Uint8Array> {

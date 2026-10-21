@@ -10,7 +10,7 @@ import { decodeCfgFoldV1, encodeCfgFoldV1 } from "../../core/codec/cfgFoldV1";
 import { decodeCfgOps } from "../../core/codec/cfgOps";
 import { CFG_FOLD_RULES_VERSION, foldCfgFrame, newCfgFoldState, overlayPendingCfg, type CfgFoldEvent } from "../../core/cfg/fold";
 import { NS_CANDIDATE_INTERVAL } from "../../core/ns/candidate";
-import { CFG_STREAM, type CfgFoldState, type ClientFrameId, type CfgOp, type DeviceId, type Seq } from "../../core/types";
+import { CFG_STREAM, type CfgFoldState, type ClientFrameId, type CfgOp, type DeviceId, type ReplayWindow, type Seq } from "../../core/types";
 import type { SnapshotRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
 import { FoldRuntime, type FoldedFrame, type FoldRepo } from "./foldRuntime";
@@ -60,6 +60,14 @@ export class CfgRuntime extends FoldRuntime<CfgOp, CfgFoldEvent> {
 
 	protected ownRecentFrames(): readonly ClientFrameId[] {
 		return this.state.recentFrames.get(this.self) ?? [];
+	}
+
+	protected windowOf(deviceId: DeviceId): ReplayWindow | undefined {
+		return this.state.replay.get(deviceId);
+	}
+
+	protected ringOf(deviceId: DeviceId): readonly ClientFrameId[] {
+		return this.state.recentFrames.get(deviceId) ?? [];
 	}
 
 	/** Committed cfg fold + own pending cfg frames (outbox, receipted-unfolded). */

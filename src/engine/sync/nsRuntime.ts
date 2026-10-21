@@ -28,7 +28,7 @@ import { overlayPending, type NsOverlay, type PendingNsFrame } from "../../core/
 import { pathKey } from "../../core/paths/pathKey";
 import {
 	NS_STREAM, streamClass, streamDocId,
-	type ClientFrameId, type DeviceId, type DocId, type DocKind, type NsEntry, type NsFoldEvent, type NsFoldIndex, type NsFoldState, type NsOp, type Seq, type VaultPath,
+	type ClientFrameId, type DeviceId, type DocId, type DocKind, type NsEntry, type NsFoldEvent, type NsFoldIndex, type NsFoldState, type NsOp, type ReplayWindow, type Seq, type VaultPath,
 } from "../../core/types";
 import type { OutboxChange } from "../store/repo";
 import type { SnapshotRecord, TailRecord } from "../store/schema";
@@ -104,6 +104,14 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 
 	protected ownRecentFrames(): readonly ClientFrameId[] {
 		return this.state.recentFrames.get(this.self) ?? [];
+	}
+
+	protected windowOf(deviceId: DeviceId): ReplayWindow | undefined {
+		return this.state.replay.get(deviceId);
+	}
+
+	protected ringOf(deviceId: DeviceId): readonly ClientFrameId[] {
+		return this.state.recentFrames.get(deviceId) ?? [];
 	}
 
 	entry(docId: DocId): NsEntry | undefined {

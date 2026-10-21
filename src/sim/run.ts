@@ -549,9 +549,9 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			if (cw.lateJoin && step.i >= cw.lateJoin.atStep && step.i < c.steps && faults.join(cw.lateJoin.dev)) trace.push(`${step.i} join ${devs[cw.lateJoin.dev]?.name}`);
 			const line = "user" in step ? await runUserAction(actorWorld, step.user, step.i) : "canvas" in step ? await canvasWorld.run(step.canvas, step.i) : faults.run(step.fault);
 			if (line.startsWith("skip")) skipped++;
-			// A lost store's unsent ops go with it. Its mirrors would carry them, but a new store has a new identity and
-			// adopts no mirror before phase 3 (identity-per-store §5.2 predecessor recovery): every loss is "without mirrors".
-			else if ("fault" in step && (step.fault.t === "idbWipe" || step.fault.t === "idbLost")) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
+			// A lost store's unsent ops go with it unless its mirrors survive: the successor store re-issues them
+			// (identity-per-store §5.2 predecessor recovery). idbLost keeps the mirrors (OS eviction of IndexedDB only).
+			else if ("fault" in step && step.fault.t === "idbWipe" && !step.fault.mirrors) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
 			trace.push(`${step.i} ${line}`);
 			faults.afterStep();
 			brakeUser.poll();

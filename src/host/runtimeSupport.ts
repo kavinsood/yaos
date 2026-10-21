@@ -34,6 +34,8 @@ export interface HostIdentity {
 	readonly installKey: string;
 	/** The install record's earlier stores (installRecord.ts lineageOf): EngineInitConfig.lineage. */
 	readonly lineage?: readonly string[];
+	/** The install record's `current` store, with its retire key (the successor fence): EngineInitConfig.predecessor. SECRET. */
+	readonly predecessor?: { readonly deviceId: string; readonly retireKey: string } | null;
 }
 
 export function buildInitConfig(input: {
@@ -56,6 +58,7 @@ export function buildInitConfig(input: {
 		relay: { url: input.identity.relay.url, grantSecret: input.identity.relay.grantSecret },
 		installKey: input.identity.installKey,
 		lineage: input.identity.lineage ?? [],
+		predecessor: input.identity.predecessor ?? null,
 		settings: input.settings,
 		crypto: input.crypto,
 	};

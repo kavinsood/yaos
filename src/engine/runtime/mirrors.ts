@@ -166,6 +166,7 @@ export function toMirrorFrame(r: OutboxRecord): OutboxMirrorFrame {
 		dependsOn: r.dependsOn,
 		adoptOf: r.adoptOf === null ? null : { deviceId: r.adoptOf.deviceId, clientFrameId: r.adoptOf.clientFrameId },
 		sealed: r.sealed,
+		...(r.origins && r.origins.length > 0 ? { origins: r.origins } : {}),
 	};
 }
 
@@ -190,6 +191,9 @@ export function mirrorFrameSize(f: OutboxMirrorFrame): number {
 	let n = varstringSize(f.clientFrameId) + varstringSize(f.stream) + varuintSize(f.order) + 1 + varuintSize(f.authorNsSeq);
 	n += 1 + (f.dependsOn === null ? 0 : varstringSize(f.dependsOn));
 	n += 1 + (f.adoptOf === null ? 0 : varstringSize(f.adoptOf.deviceId) + varstringSize(f.adoptOf.clientFrameId));
+	const origins = f.origins ?? [];
+	n += varuintSize(origins.length);
+	for (const o of origins) n += varstringSize(o.deviceId) + varstringSize(o.clientFrameId) + varuintSize(o.frameNo);
 	return n + varbytesSize(f.sealed.length);
 }
 

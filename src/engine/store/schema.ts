@@ -65,6 +65,30 @@ export interface MetaIdentity {
 	readonly createdAtMs: number;
 	/** Set when this DB was rebuilt from side-file mirrors after loss. */
 	readonly recoveredFromMirror: boolean;
+	/**
+	 * Predecessor recovery still to run (identity-per-store §5.2): written with the identity when a new store of an
+	 * install with a lineage is created, cleared in the transaction that imports the predecessor's mirrors
+	 * (Repo.tInherit). A crash between the two runs the import at the next start; a store created without it never
+	 * imports anything (a late import would replay old intents over newer changes).
+	 */
+	readonly inherit?: MetaInherit | null;
+}
+
+/** The lineage stores to recover from, newest first (identity-per-store §5.2), and whether the newest was fenced. */
+export interface MetaInherit {
+	readonly dirs: readonly DeviceId[];
+	readonly fenced: boolean;
+}
+
+/**
+ * An inherited frame's identity in a predecessor store (identity-per-store §5.2 steps 3-4): the commit check drops
+ * the re-issued frame when any of its origins committed (in that device's ring or covered by its replay window).
+ */
+export interface FrameOrigin {
+	readonly deviceId: DeviceId;
+	readonly clientFrameId: ClientFrameId;
+	/** ns / cfg frameNo there; 0 for none. */
+	readonly frameNo: number;
 }
 export interface MetaCursor {
 	readonly key: "cursor";
@@ -301,6 +325,11 @@ export interface OutboxRecord {
 	/** adoptable only: identity of the provisional frame being shadowed. */
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId; readonly receivedAtMs: number } | null;
 	readonly createdAtMs: number;
+	/**
+	 * ns / cfg frames re-issued from a lost predecessor store (identity-per-store §5.2): the identities the frame had
+	 * there, newest first. Absent or empty: this store's own frame.
+	 */
+	readonly origins?: readonly FrameOrigin[];
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +530,7 @@ export function tailRange(stream: StreamName, afterSeq: Seq = 0, throughSeq: Seq
 // ---------------------------------------------------------------------------
 
 /** Byte format: core/codec/mirrors.ts (the shapes below are assignable to its OutboxMirrorData / SyncedMirrorData). */
-export { MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_MAGIC, SYNCED_MIRROR_MAGIC } from "../../core/codec/mirrors";
+export { MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_FORMAT_VERSION, OUTBOX_MIRROR_MAGIC, SYNCED_MIRROR_MAGIC } from "../../core/codec/mirrors";
 
 export interface OutboxMirrorFrame {
 	readonly clientFrameId: ClientFrameId;
@@ -513,6 +542,8 @@ export interface OutboxMirrorFrame {
 	readonly dependsOn: ClientFrameId | null;
 	readonly adoptOf: { readonly deviceId: DeviceId; readonly clientFrameId: ClientFrameId } | null;
 	readonly sealed: Uint8Array;
+	/** OutboxRecord.origins (outbox mirror format 2). */
+	readonly origins?: readonly FrameOrigin[];
 }
 
 export interface OutboxMirror {

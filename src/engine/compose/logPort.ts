@@ -212,6 +212,9 @@ function snapIndexPort(log: () => LogEngine, liveOnce: () => boolean): SnapIndex
 		get self() {
 			return log().c.self;
 		},
+		get lineage() {
+			return log().c.lineage;
+		},
 		view: () => {
 			const v = log().snapView();
 			return { state: v.state, ready: liveOnce() && v.caughtUp };

@@ -27,8 +27,8 @@ import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
 import { findKnownEpoch, storedKeyringRecords } from "./knownEpoch";
-import { deleteLegacyDbs, IdentityRefused, needsRepair, resolveStoreIdentity, type ResolvedIdentity } from "./storeIdentity";
-import type { RegisterRefusal } from "../../ports/identity";
+import { deleteLegacyDbs, deleteStoreDbs, IdentityRefused, needsRepair, registerPending, resolveStoreIdentity, type ResolvedIdentity } from "./storeIdentity";
+import type { IdentityPort, RegisterRefusal, StoreCredentials } from "../../ports/identity";
 import { isStorageError } from "../../ports/storage";
 import type { VaultEvent } from "../../ports/vault";
 import { ProtocolFailure, type ProtocolError } from "../../protocol/errors";
@@ -97,6 +97,8 @@ export function createEngine(transport: EngineTransport, options: CreateEngineOp
 const MAX_REPLAY_EVENTS = 20_000;
 /** Cap of the runtime start retry backoff (startRetryMs doubling): a vault that cannot start costs ~12 tries an hour. */
 export const START_RETRY_MAX_MS = 5 * 60_000;
+/** A revoked store's successor registration refused for a passing reason: tried again no sooner than this. */
+const REVOKED_RETRY_MS = 60_000;
 
 export class ComposedEngine {
 	readonly link: HostLink;
@@ -121,6 +123,9 @@ export class ComposedEngine {
 	private partialListing: LocalObservation[] = [];
 	private eventsSince: VaultEvent[] = [];
 	private retryTimer: number | null = null;
+	/** A revoked store's successor registration failed on a passing refusal: retried (onStoreRevoked). */
+	private replaceTimer: number | null = null;
+	private replacing = false;
 	/** Runtime starts failed in a row (the retry backoff). */
 	private startFailures = 0;
 	private lastStartError: string | null = null;
@@ -134,8 +139,8 @@ export class ComposedEngine {
 	identity: ResolvedIdentity | null = null;
 	/** The last registration refusal (cleared by a start that resolves an identity): status and the retry wait. */
 	private refused: IdentityRefused | null = null;
-	/** Stores this worker ran on before the current one (a store reset): added to the host's lineage. */
-	private readonly lineage = new Set<string>();
+	/** Stores this worker ran on before the current one (a store reset), newest first: added to the host's lineage. */
+	private readonly lineage: StoreCredentials[] = [];
 	/** The key reader is waiting for its identity (startReader). */
 	private readerStarting = false;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
@@ -168,6 +173,7 @@ export class ComposedEngine {
 		this.deviceChecking?.abort();
 		for (const off of this.offs) off();
 		if (this.retryTimer !== null && this.ports) this.ports.clock.clearTimer(this.retryTimer);
+		if (this.replaceTimer !== null && this.ports) this.ports.clock.clearTimer(this.replaceTimer);
 		const rt = this.rt;
 		this.rt = null;
 		if (rt) void rt.stop(crash).catch(() => undefined);
@@ -335,15 +341,43 @@ export class ComposedEngine {
 		});
 		port.use(id.creds.deviceToken);
 		this.link.sideDir = id.creds.deviceId;
-		// The install's earlier stores: the host's lineage, plus every store this worker ran on before (a store reset
-		// mints without a host round trip). Never the store itself.
-		if (this.identity && this.identity.creds.deviceId !== id.creds.deviceId) this.lineage.add(this.identity.creds.deviceId);
-		const lineage = new Set([...(config.lineage ?? []), ...this.lineage].filter((d) => d !== id.creds.deviceId && DEVICE_ID_SHAPE.test(d)) as DeviceId[]);
-		const resolved: ResolvedIdentity = { ...id, lineage };
+		// The install's earlier stores: every store this worker ran on before (a store reset or loss mints without a
+		// host round trip), then the host's lineage. Never the store itself.
+		const prev = this.identity?.creds;
+		if (prev && prev.deviceId !== id.creds.deviceId && !this.lineage.some((c) => c.deviceId === prev.deviceId)) this.lineage.unshift(prev);
+		const order: DeviceId[] = [];
+		for (const d of [...this.lineage.map((c) => c.deviceId), ...(config.lineage ?? [])]) {
+			if (d !== id.creds.deviceId && DEVICE_ID_SHAPE.test(d) && !order.includes(d as DeviceId)) order.push(d as DeviceId);
+		}
+		const lineage = new Set(order);
+		// identity-per-store §5.2: a store this start creates fences its predecessor, then recovers from its mirrors.
+		const inherit = id.source === "pending" && order.length > 0 ? { dirs: order, fenced: await this.fence(port, order[0]!) } : null;
+		const resolved: ResolvedIdentity = { ...id, lineage, inherit };
 		this.identity = resolved;
 		this.refused = null;
 		this.options.onIdentity?.(id.creds.deviceId, id.source);
 		return resolved;
+	}
+
+	/**
+	 * The successor fence (identity-per-store §5.2 step 1): retire the newest predecessor store `deviceId` by its retire
+	 * key, and any other this engine holds a key for, before this store's first connect. From the server's revoke
+	 * turn on no frame of it can commit (its buffered frames are dropped). Gone already counts as done. True when
+	 * `deviceId` is fenced; false without its key or an answer (the commit check then waits, §5.2 "without the fence").
+	 */
+	private async fence(port: IdentityPort, deviceId: DeviceId): Promise<boolean> {
+		const keys = new Map<string, string>();
+		for (const c of this.lineage) keys.set(c.deviceId, c.retireKey);
+		const p = this.config!.predecessor;
+		if (p && DEVICE_ID_SHAPE.test(p.deviceId) && !keys.has(p.deviceId)) keys.set(p.deviceId, p.retireKey);
+		if (!port.retire) return false;
+		let fenced = false;
+		for (const [id, retireKey] of keys) {
+			const r = await port.retire({ deviceId: id as DeviceId, retireKey });
+			if (id === deviceId) fenced = r.ok;
+			this.log(`predecessor ${id === deviceId ? "fence" : "retire"}: ${r.ok ? (r.retired ? "retired" : "already gone") : r.reason}`);
+		}
+		return fenced;
 	}
 
 	/**
@@ -700,6 +734,53 @@ export class ComposedEngine {
 	/** The store connection died (§i.5): restart; the new runtime recovers from the mirrors. */
 	onStorageLost(): void {
 		void this.restart("storage-lost").then(() => undefined, (e) => this.log(`storage restart failed: ${String(e)}`));
+	}
+
+	/**
+	 * The server refused this store (identity-per-store §4, "Store revoked by the server": removed in the console,
+	 * retired). The install's grant registers a successor first; only then is the runtime stopped (its outbox goes to
+	 * its mirror), its store deleted and a new runtime started, which recovers from the old store's dir as from any
+	 * lost store (§5.2; the fence finds it gone). A refusal keeps the store and the phase: a revoked grant needs a
+	 * re-pair (its notice says so); a passing one (network, daily limit) is retried.
+	 */
+	onStoreRevoked(): void {
+		if (this.replacing || this.disposed || !this.rt) return;
+		this.replacing = true;
+		void this.replaceRevoked().then(() => undefined, (e: unknown) => this.log(`successor start failed: ${String(e)}`)).finally(() => {
+			this.replacing = false;
+		});
+	}
+
+	private async replaceRevoked(): Promise<void> {
+		const ports = this.ports;
+		const config = this.config;
+		const port = ports?.identity;
+		if (!ports || !config || !port) return;
+		const old = this.identity?.creds.deviceId ?? null;
+		this.log("store revoked by the server: registering a successor");
+		try {
+			await registerPending({ storage: ports.storage, random: ports.random, hash: ports.hash, identity: port, vaultId: config.vaultId, installKey: config.installKey, log: (l) => this.log(l) });
+		} catch (e) {
+			const refused = e instanceof IdentityRefused ? e : null;
+			this.log(`successor registration failed: ${refused ? refused.reason : String(e)}`);
+			if (refused && this.refused?.reason !== refused.reason) {
+				this.refused = refused;
+				const n = REFUSAL_NOTICE[refused.reason];
+				this.link.post({ t: "notice", level: n.level, code: n.code, message: n.text });
+			}
+			if (refused && needsRepair(refused.reason)) return;
+			this.replaceTimer = ports.clock.setTimer(Math.max(refused?.retryAfterMs ?? 0, REVOKED_RETRY_MS), () => {
+				this.replaceTimer = null;
+				if (this.rt?.status().phase === "revoked") this.onStoreRevoked();
+			});
+			return;
+		}
+		if (this.disposed || this.identity?.creds.deviceId !== old) return;
+		await this.restart("revoked", async () => {
+			const n = await deleteStoreDbs(ports.storage, config.vaultId, config.installKey);
+			this.knownEpoch = undefined;
+			this.log(`revoked store replaced: ${n} store(s) deleted`);
+		});
 	}
 
 	/** Started without a blob store and a later connect found one (sessionLoop probeBlobStore): restart on it. */

@@ -14,7 +14,7 @@ import type { BlobAddress, CryptoPort, HashPort } from "../../ports/crypto";
 import type { SideFilePort } from "../../ports/vault";
 import { getOpened, putAt, storePlaintextCap, type PutPolicy } from "../blobs/blobStore";
 import { dlName, partName } from "./localStore";
-import type { SnapIndexPort } from "./snapIndex";
+import { ownAuthors, type SnapIndexPort } from "./snapIndex";
 
 export interface RemoteDeps {
 	readonly store: BlobPort;
@@ -37,8 +37,10 @@ export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: 
 	const before = index.view();
 	if (!before.ready) return "not-ready";
 	const key = snapKey(index.self, record.snapshotId);
-	if (before.state.records.has(key)) return "present";
-	if (before.state.dels.has(key) || record.createdAtMs < (before.state.floors.get(index.self) ?? 0)) return "deleted";
+	// A snapshot moved from a lineage store (identity-per-store §5.2 step 6) is that store's upload when it made one.
+	const authors = ownAuthors(index);
+	if (authors.some((a) => before.state.records.has(snapKey(a, record.snapshotId)))) return "present";
+	if (authors.some((a) => before.state.dels.has(snapKey(a, record.snapshotId)) || record.createdAtMs < (before.state.floors.get(a) ?? 0))) return "deleted";
 	const cap = storePlaintextCap(crypto, store);
 	for (const p of record.parts) {
 		if (p.size > cap) throw new SnapshotUploadError(`part of ${p.size} bytes exceeds the store limit ${cap}`);
@@ -59,9 +61,13 @@ export async function uploadSnapshot(r: RemoteDeps, side: SideFilePort, record: 
 	const view = index.view();
 	if (view.state.records.has(key)) return "present";
 	const ops: SnapOp[] = [{ t: "put", record: put }];
-	const own = snapLive(view.state, Number.MAX_SAFE_INTEGER).filter((e) => e.deviceId === index.self).map((e) => e.record.createdAtMs);
-	const floor = retentionFloor([...own, put.createdAtMs], keep);
+	// Retention counts this store's uploads with its lineage's: the floor prunes its own, a `del` each lineage one
+	// below it (a floor is per author; any device may del, record.ts).
+	const mine = new Set(authors);
+	const own = snapLive(view.state, Number.MAX_SAFE_INTEGER).filter((e) => mine.has(e.deviceId));
+	const floor = retentionFloor([...own.map((e) => e.record.createdAtMs), put.createdAtMs], keep);
 	if (floor !== null && floor > (view.state.floors.get(index.self) ?? 0)) ops.push({ t: "floor", createdAtMs: floor });
+	if (floor !== null) for (const e of own) if (e.deviceId !== index.self && e.record.createdAtMs < floor) ops.push({ t: "del", deviceId: e.deviceId, snapshotId: e.record.snapshotId });
 	await index.submit(ops);
 	return "uploaded";
 }

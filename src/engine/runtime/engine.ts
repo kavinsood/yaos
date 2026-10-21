@@ -36,6 +36,7 @@ import { DocRuntime } from "./docRuntime";
 import { LiveIngest } from "./liveIngest";
 import { Maintenance } from "./maintenance";
 import { MirrorWriter, recoverFromMirror } from "./mirrorIo";
+import { inheritFromLineage } from "./inherit";
 import { Resealer } from "./reseal";
 import { resolveSkipDefer, type EngineOptions } from "./options";
 import { Subscriptions } from "./subscriptions";
@@ -94,7 +95,7 @@ export class LogEngine {
 			vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion,
 			...(store ? { storeKey: store.installKey, deviceToken: store.deviceToken, retireKey: store.retireKey } : {}),
 		};
-		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null, pathBases: opts.pathBases ?? null, docDeletes: opts.docDeletes ?? null };
+		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null, pathBases: opts.pathBases ?? null, docDeletes: opts.docDeletes ?? null, inherit: opts.inherit ?? null };
 		const openedAt = c.mono();
 		// A pending identity is consumed before its store exists, so it can serve no second store (storeIdentity.ts).
 		if (store?.beforeCreate) await store.beforeCreate();
@@ -154,7 +155,21 @@ export class LogEngine {
 		c.subs = new Subscriptions(c, resolveSkipDefer(c.deviceClass, c.tuning));
 		c.mirror = new MirrorWriter(c, opts.sideFiles ?? null);
 		const eng = new LogEngine(c);
-		if (o.outcome.t === "fresh" && opts.sideFiles) {
+		// identity-per-store §5.2: a new store of an install with a lineage adopts its predecessor's mirrors. Recorded at
+		// the store's creation and cleared by the import's own transaction, so a crash in between runs it again.
+		const inherit = repo.identity.inherit ?? null;
+		let inherited = 0;
+		if (inherit && opts.lineageSideFiles) {
+			const r = await inheritFromLineage(c, inherit, opts.lineageSideFiles);
+			inherited = r.frames;
+			if (r.frames > 0 || r.synced > 0) {
+				c.setPhase("recovering");
+				c.notice("recovered-from-mirror");
+			}
+			// Without the fence a frame of the dead store may still be in the relay's buffer: the commit check waits.
+			if (!inherit.fenced && r.frames > 0) c.inheritCheckAtMono = c.mono() + c.tuning.inheritUnfencedWaitMs;
+		} else if (o.outcome.t === "fresh" && opts.sideFiles && !inherit) {
+			// A store under the same deviceId (engine tests without a store identity): its own mirror (DESIGN §i.5).
 			const n = await recoverFromMirror(c, opts.sideFiles);
 			if (n > 0) {
 				c.setPhase("recovering");
@@ -172,6 +187,11 @@ export class LogEngine {
 			}
 		}
 		c.mirror.scheduleIfBehind(c.outbox.all());
+		// The inherited frames are on this store's mirror before any of them is sent (inherit.ts header step 5).
+		if (inherited > 0) {
+			c.mirror.schedule();
+			if (!(await c.mirror.flushed())) c.diag("inherit-mirror-unwritten", { frames: inherited });
+		}
 		await c.refold(true);
 		eng.maint.start();
 		if (first) void c.sess.onSession(first);

@@ -10,7 +10,8 @@
 
 import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type DeviceId, type DocId, type StreamName, type VaultId, type VaultPath } from "../core/types";
 import type { BlobPort } from "../ports/blob";
-import type { RegisterOutcome } from "../ports/identity";
+import type { DeviceState, RegisterOutcome, RetireOutcome } from "../ports/identity";
+import { retireKeyHash } from "../engine/compose/storeIdentity";
 import type { RelayConnectResult, RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { LogEngine } from "../engine/runtime/engine";
@@ -163,6 +164,25 @@ export class SimIdentityRegistry {
 		if (d) d.retired = true;
 	}
 
+	/**
+	 * `POST /auth/device/retire` (server retireByKey): `retireKeyHash` must be the device's. Gone or unknown is done
+	 * (`retired: false`); a wrong key `unauthorized`. The caller revokes the relay's sessions and buffer (D7).
+	 */
+	retireByKey(deviceId: DeviceId, retireKeyHash: string): RetireOutcome {
+		const d = this.devices.get(deviceId);
+		const out: RetireOutcome = !d || d.retired ? { ok: true, retired: false } : d.retireKeyHash !== retireKeyHash ? { ok: false, reason: "unauthorized" } : { ok: true, retired: true };
+		if (out.ok && out.retired && d) d.retired = true;
+		const k = out.ok ? (out.retired ? "retire" : "retire-gone") : `retire-${out.reason}`;
+		this.counts[k] = (this.counts[k] ?? 0) + 1;
+		return out;
+	}
+
+	/** `POST /auth/device/status`: live, retired (tombstoned) or unknown. */
+	state(deviceId: DeviceId): DeviceState {
+		const d = this.devices.get(deviceId);
+		return !d ? "unknown" : d.retired ? "retired" : "live";
+	}
+
 	/** A connect as `deviceId` with `token` authenticates: registered, live, the token it registered, grant not revoked. */
 	authenticates(deviceId: DeviceId, token: string): boolean {
 		const d = this.devices.get(deviceId);
@@ -253,6 +273,35 @@ export class SimNet {
 		await new Promise<void>((resolve) => this.clock.setTimer(this.httpMs, resolve));
 		if (this.offline.has(machine)) return { ok: false, reason: "network", retryAfterMs: null };
 		return this.identities.register(grantSecret, c);
+	}
+
+	/**
+	 * `POST /auth/device/retire` from `machine` (the successor fence, identity-per-store §5.2): one link round trip;
+	 * a retired device's sessions close and its buffered frames are dropped (relay revoke, D7).
+	 */
+	async retire(machine: string, c: { readonly deviceId: DeviceId; readonly retireKey: string }): Promise<RetireOutcome> {
+		if (this.offline.has(machine)) return { ok: false, reason: "network" };
+		const hash = await retireKeyHash(simHashPort(), c.retireKey);
+		await new Promise<void>((resolve) => this.clock.setTimer(this.httpMs, resolve));
+		if (this.offline.has(machine)) return { ok: false, reason: "network" };
+		const out = this.identities.retireByKey(c.deviceId, hash);
+		if (out.ok && out.retired) this.relay.revoke(c.deviceId);
+		return out;
+	}
+
+	/** The operator's "Remove device" (console): tombstoned, sessions closed, buffered frames dropped. */
+	removeDevice(deviceId: DeviceId): void {
+		this.identities.retire(deviceId);
+		this.relay.revoke(deviceId);
+	}
+
+	/** `POST /auth/device/status` from `machine` as an authenticated store (one round trip); null while offline. */
+	async status(machine: string, ids: readonly DeviceId[]): Promise<ReadonlyMap<DeviceId, DeviceState> | null> {
+		if (this.offline.has(machine)) return null;
+		await new Promise<void>((resolve) => this.clock.setTimer(this.httpMs, resolve));
+		if (this.offline.has(machine)) return null;
+		this.identities.counts["status"] = (this.identities.counts["status"] ?? 0) + 1;
+		return new Map(ids.map((id) => [id, this.identities.state(id)]));
 	}
 
 	isOnline(machine: string): boolean {
