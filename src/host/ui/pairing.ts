@@ -63,7 +63,7 @@ export const defaultRandomBytes: RandomBytesFn = (length) => {
 	return bytes;
 };
 
-const defaultSleep: SleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const defaultSleep: SleepFn = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------
 // Errors

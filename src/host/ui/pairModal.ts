@@ -155,7 +155,7 @@ export class PairModal extends Modal {
 			.addButton((b) => {
 				this.pairButton = b;
 				b.setButtonText(current ? "Replace pairing" : "Pair").onClick(() => { void this.submit(); });
-				if (current) b.setWarning();
+				if (current) b.setDestructive();
 				else b.setCta();
 			});
 	}

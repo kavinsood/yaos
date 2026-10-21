@@ -78,7 +78,7 @@ function transient(err: unknown): boolean {
 /** Sends `make()` (a fresh command per attempt: its bytes are transferred) until it answers or is refused for good. */
 async function sendRetrying(host: KeyHost, make: () => UserCommand, opts: RetryOptions, timeoutMs: number): Promise<void> {
 	const now = opts.now ?? Date.now;
-	const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+	const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => window.setTimeout(r, ms)));
 	const deadline = now() + (opts.timeoutMs ?? timeoutMs);
 	for (;;) {
 		try {

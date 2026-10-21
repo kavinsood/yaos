@@ -250,7 +250,7 @@ export class CreateVaultModal extends Modal {
 			input.addEventListener("change", () => { if (input.checked) encrypt = value; });
 			const text = row.createDiv();
 			text.createEl("strong", { text: label });
-			text.createEl("div", { cls: "setting-item-description", text: desc });
+			text.createDiv({ cls: "setting-item-description", text: desc });
 		};
 		option(true, "End-to-end encryption: On (recommended)", "Notes and attachments are encrypted on your devices. Your server stores them but cannot read them. You get a recovery key to save.");
 		option(false, "End-to-end encryption: Off", "Your server can read this vault's notes and attachments.");

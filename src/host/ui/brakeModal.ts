@@ -42,7 +42,7 @@ export class BrakeModal extends Modal {
 		new Setting(contentEl)
 			.addButton((b) => { this.buttons.push(b); b.setButtonText("Later").onClick(() => this.close()); })
 			.addButton((b) => { this.buttons.push(b); b.setButtonText("Reject").setCta().onClick(() => { void this.decide("rejectBrake"); }); })
-			.addButton((b) => { this.buttons.push(b); b.setButtonText("Approve").setWarning().onClick(() => { void this.decide("approveBrake"); }); });
+			.addButton((b) => { this.buttons.push(b); b.setButtonText("Approve").setDestructive().onClick(() => { void this.decide("approveBrake"); }); });
 
 		// Close by itself if the brake is resolved elsewhere (another window, a command).
 		this.unsubscribe = this.host.onChange(() => {
