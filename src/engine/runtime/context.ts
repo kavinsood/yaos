@@ -457,7 +457,7 @@ export class EngineCtx {
 			if (ck || rows.length > 0) await this.docs.applyToHandle(h, rows, ck);
 			this.docs.checkDoc(h);
 		}
-		// Own receipts are the only rows that change nothing here (own plain rows are an earlier store's, §d.7).
+		// Own receipts are the only rows that change nothing here (§d.7).
 		const changed = s.tailPut.filter((r) => r.deviceId !== this.self || !s.skip.has(r.seq)).map((r) => r.stream);
 		if (read && (read.done || read.checkpointState)) changed.push(read.stream);
 		this.noteBodyChange(changed);

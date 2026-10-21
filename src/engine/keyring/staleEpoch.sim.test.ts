@@ -35,7 +35,6 @@ import { encodeCheckpointContent } from "../../core/codec/contents";
 import { bytesEqual } from "../../core/codec/lib0";
 import { encodeNsOps } from "../../core/codec/nsOps";
 import type { EnvelopeKind } from "../../core/envelope";
-import { NS_DEDUPE_RING } from "../../core/limits";
 import {
 	CFG_STREAM, NS_STREAM, bodyStream, canvasStream, streamClass,
 	type CfgOp, type ClientFrameId, type ContentHash, type DeviceId, type DocId, type NsFoldEvent, type NsOp, type Seq, type StreamName, type VaultId,
@@ -117,7 +116,7 @@ function timeline(seed: number): { readonly rows: Row[]; readonly sRot: Seq } {
 	const bodyDocs = [id22(`b${tag}x`) as DocId, id22(`b${tag}y`) as DocId];
 	const nextFrameNo = (dev: DeviceId, stream: StreamName) => {
 		const k = `${dev}|${stream}`;
-		const f = (frameNo.get(k) ?? NS_DEDUPE_RING) + 1; // fresh runtimes start at 65 (foldRuntime.ts:279-287)
+		const f = (frameNo.get(k) ?? 0) + 1; // a fresh store starts at 1 (FoldRuntime.allocFrameNo)
 		frameNo.set(k, f);
 		return f;
 	};

@@ -165,8 +165,8 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 			}
 			const e = this.state.entries.get(docId);
 			if (!e) {
-				// Create not folded yet (or still stale): wait. Folded without the doc (the fold ignored the frame, e.g.
-				// replay-stale after a lost store reused its frameNo): the doc never exists, so its frames are junk.
+				// Create not folded yet (or still stale): wait. Folded without the doc (the fold ignored or refused the
+				// frame): the doc never exists, so its frames are junk.
 				if (!dep && !this.committedPending(r.dependsOn) && !this.halted) changes.push({ t: "delete", clientFrameId: r.clientFrameId });
 				continue;
 			}

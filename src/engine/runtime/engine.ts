@@ -22,6 +22,7 @@ import { applyChanges, changesBaseLength, type TextChanges } from "../body/textC
 import { Sender, sendRank } from "../body/sender";
 import { ORIGIN } from "../body/yjsCounters";
 import { defaultPriority, Repo } from "../store/repo";
+import { dbName } from "../store/schema";
 import { recheckStored, releaseQuarantine } from "./quarantineRelease";
 import type { BodyHandle } from "../reconcile/deps";
 import { decodeNsOps } from "../../core/codec/nsOps";
@@ -60,6 +61,16 @@ export class StoreResetError extends EngineStartError {
 	}
 }
 
+/**
+ * The relay named an epoch this store has no DB for (identity-per-store §4 "vaultEpoch change"): the new epoch's DB is
+ * a new store, so it gets a new identity, never this one (§1.3). The composed engine mints and starts again on `epoch`.
+ */
+export class StoreEpochError extends EngineStartError {
+	constructor(readonly epoch: VaultEpoch) {
+		super("store-epoch");
+	}
+}
+
 export class LogEngine {
 	readonly maint: Maintenance;
 	private readonly gc: BlobGc;
@@ -95,10 +106,12 @@ export class LogEngine {
 			vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion,
 			...(store ? { storeKey: store.installKey, deviceToken: store.deviceToken, retireKey: store.retireKey } : {}),
 		};
-		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null, pathBases: opts.pathBases ?? null, docDeletes: opts.docDeletes ?? null, inherit: opts.inherit ?? null };
+		const openOpts = { pathBases: opts.pathBases ?? null, docDeletes: opts.docDeletes ?? null, inherit: opts.inherit ?? null };
 		const openedAt = c.mono();
 		// A pending identity is consumed before its store exists, so it can serve no second store (storeIdentity.ts).
 		if (store?.beforeCreate) await store.beforeCreate();
+		// A store's identity opens only that store: no new DB (another epoch's) under it (identity-per-store §1.3).
+		else if (store && !(await storage.listDatabases()).includes(dbName(opts.vaultId, epoch, store.installKey))) throw new StoreEpochError(epoch);
 		let o = await Repo.open(storage, ident, c.now(), openOpts);
 		if (!o.repo) {
 			o.db.close();
@@ -121,9 +134,6 @@ export class LogEngine {
 		c.keyring = await KeyringRuntime.open(c, opts.e2ee);
 		c.ns = new NsRuntime(repo, c.self, c.tuning.nsCandidateModulus, c.tuning.knownRules.ns);
 		c.cfg = new CfgRuntime(repo, c.self, c.tuning.nsCandidateModulus);
-		c.ns.frameNoFloor = repo.frameNoFloor.ns;
-		c.cfg.frameNoFloor = repo.frameNoFloor.cfg;
-		c.ns.wallMs = c.cfg.wallMs = () => c.now();
 		c.snap = new SnapRuntime(repo, c.self, c.tuning.nsCandidateModulus);
 		c.docs = new DocRuntime(c);
 		c.handles = new HandleManager(repo, c.budgets, c.docs.hooks());

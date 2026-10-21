@@ -185,8 +185,11 @@ test("mirror recovery: a restart over stored frames the mirror lacks rewrites it
 	}
 });
 
-/** Sim heavy seed 150: keystrokes receipted before the IDB loss, never saved to disk, read back as "own". */
-test("IDB lost without a mirror: this device's earlier rows read back are remote (remoteSeq moves)", async () => {
+/**
+ * Sim heavy seed 150: keystrokes receipted before the IDB loss, never saved to disk, read back as "own". The store
+ * that replaces a lost one is a new device (identity-per-store §1.3): the lost store's rows are another device's.
+ */
+test("IDB lost without a mirror: the new store (a new device) reads the lost store's rows as remote (remoteSeq moves)", async () => {
 	const relay = new SimRelay();
 	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
 	let a2: LogEngine | null = null;
@@ -197,7 +200,7 @@ test("IDB lost without a mirror: this device's earlier rows read back are remote
 		await until(() => a.c.outbox.size === 0, 2_000, "receipted");
 		assert.equal(a.bodyInfo(id)?.version.remoteSeq, 0, "own receipted rows are local in their store");
 		await a.stop();
-		a2 = (await startTestEngine({ relay, deviceId: "dev-a" })).engine; // fresh DB, no side files
+		a2 = (await startTestEngine({ relay, deviceId: "dev-a2" })).engine; // IDB lost, no side files: a new store
 		await live(a2);
 		// "live" is set before the body catch-up reads o.md's stream (sessionLoop.onSession): wait for the read-back.
 		await until(async () => (await docText(a2!, id)) === "a1;a2;", 2_000, "own rows read back");

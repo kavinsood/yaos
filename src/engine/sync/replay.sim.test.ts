@@ -14,9 +14,9 @@
  * frameNo and content, and the fold still ignores it.
  *
  * Honest sequences only (e2ee-design §8.2; see also core/ns/replayExactness.test.ts):
- *  - frameNos per (device, stream) follow FoldRuntime.allocFrameNo (foldRuntime.ts:279-287): 1 + the highest own
- *    frameNo, plus NS_DEDUPE_RING on a runtime's first allocation. A fresh device therefore starts at 65, and a
- *    restart (a quarter of the lanes) leaves a gap of 64.
+ *  - frameNos per (device, stream) follow FoldRuntime.allocFrameNo: 1 + the highest own frameNo, so a fresh device
+ *    starts at 1. The rule allows gaps (frameNos need only increase: a number whose edit never committed, frames
+ *    poisoned before they were sent), so a quarter of the lanes leave one gap of 64.
  *  - All of a seed's frames are authored (and sealed) before its first commit, so authorNsSeq and setBlob baseRev
  *    are what the authors had seen.
  *  - The relay commits a device's frame f only while f < (lowest uncommitted own frameNo) + NS_SEND_WINDOW, which
@@ -26,7 +26,7 @@
  *
  * Long ages: an age of 100000 needs r > 100064, i.e. 100000 committed own frames. Folding that many frames per seed
  * is too slow, so one honest prefix is built once instead. L1 commits 100200 frames per stream (frameNo
- * 65..100264) and L2 1100 (65..1164), interleaved and in order. The prefix fold is the snapshot every seed starts
+ * 1..100200) and L2 1100 (1..1100), interleaved and in order. The prefix fold is the snapshot every seed starts
  * from, as for a reader that holds a checkpoint at that seq. Prefix rows enter the fold as tail records, because
  * gating is pure. A prefix frame that is a replay target is sealed on first use, and its gated row must equal the
  * prefix row byte for byte, so the snapshot is the fold of exactly the frames the relay replays. As a result every
@@ -43,7 +43,7 @@
  *      (core/replayWindow.ts:30-35, called at core/ns/fold.ts:277-286 and core/cfg/fold.ts:209-218). A rejected
  *      frame changes neither the ring nor the window, only coversSeq.
  * So, in frameNo order with no gap among the ring's frames, a <= 63 gives duplicate-frame and a >= 64 gives
- * replay-stale. A restart gap keeps older frames in the ring, which gives duplicate-frame at a >= 64. Reordering can
+ * replay-stale. A gap keeps older frames in the ring, which gives duplicate-frame at a >= 64. Reordering can
  * push a frame with a <= 63 out of the ring while its bit is still set, which gives replay-duplicate; it can also
  * keep a frame with a = 64 in the ring, which gives duplicate-frame.
  */
@@ -79,8 +79,8 @@ const DEV: Record<Cls, DeviceId> = { L1: "dev-L1" as DeviceId, L2: "dev-L2" as D
 const READER = "dev-reader" as DeviceId;
 const AGES_OF: Record<Cls, readonly Age[]> = { L1: AGES, L2: [1, 63, 64, 65, 1000], F: [1, 63, 64, 65] };
 const PREFIX_FRAMES = { L1: 100_200, L2: 1_100 } as const;
-/** First frameNo of a fresh runtime (foldRuntime.ts:279-287). */
-const FIRST = NS_DEDUPE_RING + 1;
+/** First frameNo of a fresh store (FoldRuntime.allocFrameNo). */
+const FIRST = 1;
 const STREAMS = [NS_STREAM, CFG_STREAM] as const;
 type Reason = "replay-stale" | "replay-duplicate" | "duplicate-frame";
 const REASONS: readonly Reason[] = ["duplicate-frame", "replay-stale", "replay-duplicate"];
@@ -216,7 +216,7 @@ interface Lane {
 	/** Indices into frames not committed yet, ascending (= ascending frameNo). */
 	readonly uncommitted: number[];
 	readonly committed: Set<number>;
-	readonly restartAt: number | null;
+	readonly gapAt: number | null;
 	/** Model of the reader's fold for this author: right edge and the ring (accept order). */
 	r: number;
 	readonly ring: ClientFrameId[];
@@ -281,19 +281,15 @@ function suffixOps(rnd: SeededRandom, stream: StreamName, blobRev: ReadonlyMap<D
 function makeLane(rnd: SeededRandom, seed: number, prefix: Prefix, stream: StreamName, cls: Cls): Lane {
 	const prefixMax = cls === "F" ? 0 : FIRST + PREFIX_FRAMES[cls] - 1;
 	const n = cls === "F" ? rnd.range(70, 100) : rnd.range(24, 40);
-	const restartAt = rnd.chance(0.25) ? rnd.int(n) : null;
+	const gapAt = rnd.chance(0.25) ? rnd.int(n) : null;
 	const frames: Frame[] = [];
 	const byFrameNo = new Map<number, Frame>();
-	// allocFrameNo (foldRuntime.ts:279-287): L1/L2 continue the prefix runtime; F is fresh; a restart skips NS_DEDUPE_RING.
+	// allocFrameNo: L1/L2 continue the prefix; F is fresh (FIRST); a gap lane skips NS_DEDUPE_RING numbers once.
 	let max = prefixMax;
-	let allocated = cls !== "F";
 	let docs = 0;
 	const tag = `s${seed.toString(36)}${cls}`;
 	for (let j = 0; j < n; j++) {
-		if (!allocated || j === restartAt) {
-			max += NS_DEDUPE_RING;
-			allocated = true;
-		}
+		if (j === gapAt) max += NS_DEDUPE_RING;
 		const frameNo = ++max;
 		const fr: Frame = {
 			frameNo, clientFrameId: cfid(tag, stream, frameNo), authorNsSeq: prefix.nsSeq,
@@ -306,7 +302,7 @@ function makeLane(rnd: SeededRandom, seed: number, prefix: Prefix, stream: Strea
 	const arms = new Map<Age, number[]>();
 	for (const a of AGES_OF[cls]) arms.set(a, Array.from({ length: QUOTA }, () => rnd.int(n)).sort((x, y) => x - y));
 	return {
-		stream, cls, dev: DEV[cls], prefixMax, frames, byFrameNo, uncommitted: frames.map((_, i) => i), committed: new Set(), restartAt,
+		stream, cls, dev: DEV[cls], prefixMax, frames, byFrameNo, uncommitted: frames.map((_, i) => i), committed: new Set(), gapAt,
 		r: prefixMax, ring: pf.map((f) => f.clientFrameId), ringF: pf.map((f) => f.frameNo), commits: 0, arms,
 	};
 }
@@ -335,7 +331,7 @@ simTest("replay (e2ee-design §20.2), measured over 1000 seeds: recorded genuine
 	const tally = new Map<string, number>();
 	const bump = (k: string, by = 1) => tally.set(k, (tally.get(k) ?? 0) + by);
 	let genuineRows = 0, injected = 0, ignoredEvents = 0, digestsEqual = 0, replaysAuthenticated = 0, prefixTargets = 0;
-	let crispChecked = 0, ringOverWindow = 0, windowDuplicate = 0, missed = 0, restarts = 0, seedsWithF = 0;
+	let crispChecked = 0, ringOverWindow = 0, windowDuplicate = 0, missed = 0, gaps = 0, seedsWithF = 0;
 
 	for (let seed = 0; seed < SEEDS; seed++) {
 		const rnd = new SeededRandom(0x7e9a_0000 + seed);
@@ -343,7 +339,7 @@ simTest("replay (e2ee-design §20.2), measured over 1000 seeds: recorded genuine
 		const classes: Cls[] = seed % 3 === 0 ? ["L1", "L2", "F"] : ["L1", "L2"];
 		if (classes.includes("F")) seedsWithF++;
 		const lanes = STREAMS.flatMap((stream) => classes.map((cls) => makeLane(rnd, seed, prefix, stream, cls)));
-		restarts += lanes.filter((l) => l.restartAt !== null).length;
+		gaps += lanes.filter((l) => l.gapAt !== null).length;
 		const payload = new Map<Frame, Uint8Array>();
 		await Promise.all(lanes.flatMap((l) => l.frames.map(async (f) => void payload.set(f, await seal(l, f)))));
 
@@ -482,7 +478,7 @@ simTest("replay (e2ee-design §20.2), measured over 1000 seeds: recorded genuine
 	assert.ok(crispChecked > 0 && ringOverWindow > 0 && windowDuplicate > 0, "the ring-first and window-duplicate branches both occur");
 
 	const lines = [
-		`replay measured: ${SEEDS} seeds (${seedsWithF} with fresh F), ${genuineRows} genuine rows, ${injected} injected replays (${prefixTargets} of prefix frames), ${missed} quota slots unreachable, ${restarts} lane restarts`,
+		`replay measured: ${SEEDS} seeds (${seedsWithF} with fresh F), ${genuineRows} genuine rows, ${injected} injected replays (${prefixTargets} of prefix frames), ${missed} quota slots unreachable, ${gaps} lanes with a gap`,
 		`  digests equal ${digestsEqual}/${SEEDS * STREAMS.length}; ignored replay events ${ignoredEvents} == injected ${injected}; replays authenticated ${replaysAuthenticated}`,
 		`  crisp-rule rows ${crispChecked}; ring-over-window (duplicate-frame with f <= r-64) ${ringOverWindow}; replay-duplicate ${windowDuplicate}`,
 		`  wall ${(wall / 1000).toFixed(1)} s (prefix ${(tPrefix / 1000).toFixed(1)} s)`,

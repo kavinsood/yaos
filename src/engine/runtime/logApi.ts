@@ -21,7 +21,6 @@ import {
 	type CfgFoldState, type CfgOp, type ClientFrameId, type DocId, type DocKind, type NsFoldIndex, type NsFoldState, type NsOp, type RemoteBodyInfo, type Seq,
 } from "../../core/types";
 import { buildCfgFrame, buildNsFrame, buildSnapFrame } from "../body/frames";
-import { sealFrame } from "../ingest/envelope";
 import type { NewOutboxFrame } from "../store/repo";
 import type { FoldHalt } from "../sync/foldRuntime";
 import type { EngineCtx } from "./context";
@@ -96,35 +95,10 @@ export async function submitCfg(c: EngineCtx, ops: readonly CfgOp[]): Promise<Cl
 }
 
 /**
- * Before ns/cfg sends open, once both streams are read (sessionLoop): own frames allocated before this store knew its
- * committed frames are numbered again and sealed again under their own ids (FoldRuntime.renumberBlind, e2ee-design
- * §8.2). On the edit chain, so no allocation runs meanwhile and frameNo order stays outbox order.
- */
-export function renumberBlindFrames(c: EngineCtx): Promise<void> {
-	return c.docs.chain(async () => {
-		for (const rt of [c.ns, c.cfg]) {
-			const plan = await rt.renumberBlind(c.outbox);
-			if (plan.length === 0) continue;
-			const changes = [];
-			for (const { rec, frameNo } of plan) {
-				const s = await sealFrame(c.deps.crypto, c.opts.vaultId, {
-					stream: rec.stream, deviceId: c.self, clientFrameId: rec.clientFrameId, kind: rec.kind, authorNsSeq: rec.authorNsSeq, flags: rec.flags, frameNo, content: rec.content,
-				});
-				changes.push({ t: "reseal" as const, clientFrameId: rec.clientFrameId, fromEpoch: rec.keyEpoch, fromLength: rec.sealed.length, fromFrameNo: rec.frameNo, next: { clientFrameId: rec.clientFrameId, sealed: s.sealed, keyEpoch: s.keyEpoch, frameNo } });
-			}
-			if (c.stopped) return;
-			const res = await c.repo.tOutbox(changes);
-			c.applyOutboxResult(res);
-			c.diag("frame-renumbered", { stream: rt.stream, frames: res.renamed.length, from: plan[0]!.rec.frameNo, to: plan[0]!.frameNo });
-		}
-	});
-}
-
-/**
  * The commit check of inherited frames (identity-per-store §5.2 step 3), before ns/cfg sends open, once both streams
  * are read (sessionLoop): an ns / cfg frame re-issued from a predecessor store whose identity there committed is
  * dropped; the rest go out as this store's. Runs at every session start while such frames are in the outbox (the
- * answer cannot change once the predecessor is fenced). On the edit chain, before renumberBlindFrames.
+ * answer cannot change once the predecessor is fenced). On the edit chain.
  */
 export function checkInherited(c: EngineCtx): Promise<void> {
 	return c.docs.chain(async () => {

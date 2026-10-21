@@ -32,7 +32,6 @@ import type { ReconcileSettings } from "../reconcile/context";
 import type { DiskSchema } from "../reconcile/store";
 import { LogEngine } from "../runtime/engine";
 import type { EngineTuning } from "../runtime/options";
-import type { FrameNoFloor } from "../store/repo";
 import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
 import { CFG_BLOB_DOC, CfgSync } from "../settings/cfgSync";
 import { listLocal, partName } from "../snapshots/localStore";
@@ -98,8 +97,6 @@ export interface VaultRuntimeStart {
 	readonly pathBases?: readonly MetaPathBase[] | null;
 	/** The old epoch's docs' deletes by docId (§c.12 "Deletes"), stored in the new DB (epochBases.ts). */
 	readonly docDeletes?: readonly MetaDocDeletes[] | null;
-	/** Highest own ns / cfg frameNo of the old epoch (§c.12 step 3, e2ee-design §8.2). */
-	readonly frameNoFloor?: FrameNoFloor | null;
 }
 
 /** Observational test hook: called after the engine acted; it must not change anything (production: absent). */
@@ -209,7 +206,7 @@ export class VaultRuntime {
 			...(o.identity.lineage ? { lineage: o.identity.lineage } : {}),
 			inherit: o.identity.inherit ?? null,
 			lineageSideFiles: (deviceId) => engine.link.sideFilesOf(deviceId),
-			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, frameNoFloor: o.frameNoFloor ?? null, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null,
+			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,
 			onBoundText: (docId, changes, length, origin) => engine.bound.onText(docId, changes, length, origin),
 			onFrameTaken: (docId) => engine.bound.frameTaken(docId),

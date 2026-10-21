@@ -24,7 +24,6 @@
 
 import type { CheckpointEncoding } from "../../core/envelope";
 import { decodeOuter } from "../../core/codec/envelope";
-import { NS_DEDUPE_RING } from "../../core/limits";
 import { NS_CANDIDATE_INTERVAL, isCandidateSeq } from "../../core/ns/candidate";
 import type { ClientFrameId, DeviceId, ReplayWindow, Seq, StreamName } from "../../core/types";
 import { replayCheck } from "../../core/replayWindow";
@@ -37,9 +36,6 @@ export interface FoldRepo {
 	getSnapshot(stream: StreamName): Promise<SnapshotRecord | undefined>;
 	getTail(stream: StreamName, afterSeq?: Seq, throughSeq?: Seq): Promise<TailRecord[]>;
 }
-
-/** The highest wall clock (ms) FoldRuntime.skip takes as a frameNo floor: 2^45 ms, about the year 3084. */
-const WALL_FLOOR_MAX = 2 ** 45;
 
 /** Local-only tail flag (never on the wire): the row failed a reader-dependent gate check; content = raw payload. */
 export const LOCAL_FLAG_UNOPENED = 1 << 20;
@@ -105,14 +101,6 @@ export abstract class FoldRuntime<Op, E> {
 	private committedOwn: OwnPendingFrame<Op>[] = [];
 	/** Highest own frameNo seen outside the fold state and the outbox (tail above the fold, receipts, allocations). */
 	private ownFrameNoSeen = 0;
-	/** The first allocation of this runtime skips NS_DEDUPE_RING numbers and starts at least at wallMs() (e2ee-design §8.2). */
-	private allocated = false;
-	/** Wall clock (ms) for the skip's floor; the engine sets ClockPort.now. 0: no floor. */
-	wallMs: () => number = () => 0;
-	/** Highest frameNo this runtime allocated (or renumbered to). */
-	private allocatedMax = 0;
-	/** Floor carried by epoch migration (meta frameNoFloor). */
-	frameNoFloor = 0;
 	/** coversSeq of a stored snapshot reset() could not use (the state started empty), else null. */
 	private unusableSnapshot: Seq | null = null;
 
@@ -316,79 +304,21 @@ export abstract class FoldRuntime<Op, E> {
 	}
 
 	/**
-	 * Next own frameNo of this stream (e2ee-design §8.2): 1 + the highest own
-	 * frameNo known (fold R, own tail rows and receipts above the fold, the
-	 * outbox incl. poisoned, the epoch-migration floor, earlier allocations).
-	 * The first allocation of a runtime skips (skip()): NS_DEDUPE_RING and at
-	 * least up to the wall clock, past numbers an in-flight frame may have used
-	 * when IndexedDB was lost; so does the first one after the fold showed an
-	 * own frame above every allocation of this runtime (they were made blind).
-	 * Gaps are fine.
+	 * Next own frameNo of this stream (e2ee-design §8.2): 1 + the highest own frameNo this store knows. A deviceId
+	 * serves exactly one store (identity-per-store §1.3), and a number is only ever sent from the outbox, written in
+	 * the same edit-chain step that allocated it (logApi.submitNs), so every number this deviceId ever sent is in the
+	 * outbox (poisoned included), an own tail row above the fold (written with its receipt), a receipt seen in this
+	 * runtime, or under the fold's replay edge R. The answer is exact: no skip, no floor. Gaps are fine.
 	 */
 	allocFrameNo(outbox: OutboxCache): number {
-		let max = this.maxOwnFrameNo(outbox);
-		// The skip again once the fold shows an own frame above all this runtime allocated: the earlier allocations
-		// were made without this store's committed frames (IndexedDB lost, the stream not read yet).
-		if (!this.allocated || this.committedOwnMax() > this.allocatedMax) {
-			max = this.skip(max);
-			this.allocated = true;
-		}
-		this.ownFrameNoSeen = max + 1;
-		this.allocatedMax = max + 1;
-		return max + 1;
+		const next = this.maxOwnFrameNo(outbox) + 1;
+		this.ownFrameNoSeen = next;
+		return next;
 	}
 
-	/**
-	 * The skip of a runtime's first allocation above `max`, the highest own number known (e2ee-design §8.2):
-	 * NS_DEDUPE_RING, and at least the wall clock in ms. A store that lost IndexedDB knows only its committed frames,
-	 * the same edge the runtime it replaced allocated from, so a skip from the edge alone repeats that runtime's
-	 * numbers for a frame still in flight; whichever committed second was ignored as a replay. The clock puts the new
-	 * runtime's numbers above the old one's (which allocated fewer frames than ms passed), so an old frame committing
-	 * first leaves the new ones accepted, and one committing after them is stale (the §8.2 boundary). A clock past
-	 * WALL_FLOOR_MAX is ignored: a wild one would pin every later number near 2^53, where the codec refuses them.
-	 */
-	private skip(max: number): number {
-		const wall = Math.floor(this.wallMs());
-		return Number.isSafeInteger(wall) && wall <= WALL_FLOOR_MAX ? Math.max(max + NS_DEDUPE_RING, wall) : max + NS_DEDUPE_RING;
-	}
-
-	/** Highest own frameNo committed or receipted: fold R, own frames above the fold, the migration floor (§8.2). */
-	committedOwnMax(): number {
-		let max = Math.max(this.ownReplayEdge(), this.frameNoFloor);
-		for (const f of this.committedOwn) max = Math.max(max, f.frameNo);
-		return max;
-	}
-
-	/**
-	 * Own outbox frames to number again before ns/cfg sends open (e2ee-design §8.2): a store that lost IndexedDB
-	 * allocates from what it knows, so a frame allocated before it read the stream can take a number its committed
-	 * frames already used, and every reader would ignore it as a replay. Once the stream is read, a frame at or below
-	 * the committed edge whose id is not in the fold's ring is such a frame: one allocated with the edge known is
-	 * above it, and one that did commit (a frame recovered from the outbox mirror whose row a checkpoint covers, so no
-	 * late receipt came) is in the ring and keeps its bytes, its resend deduped. Then every own frame of the stream
-	 * not in the ring (all allocated as blindly) takes a new number in outbox order from above every own number
-	 * known + NS_DEDUPE_RING, as a first allocation would; [] when none collides.
-	 */
-	async renumberBlind(outbox: OutboxCache): Promise<{ readonly rec: OutboxRecord; readonly frameNo: number }[]> {
-		let edge = this.committedOwnMax();
-		// Own rows stored above the fold (a halted fold has not reached them) are committed too.
-		for (const r of await this.repo.getTail(this.stream, this.coversSeq)) if (r.deviceId === this.self) edge = Math.max(edge, r.frameNo ?? 0);
-		const ring = new Set(this.ownRecentFrames());
-		const recs = outbox.ofStream(this.stream);
-		const unsent = recs.filter((r) => r.state !== "poisoned" && !ring.has(r.clientFrameId));
-		if (!unsent.some((r) => (r.frameNo ?? 0) <= edge)) return [];
-		let next = this.skip(edge);
-		for (const r of recs) if (!unsent.includes(r)) next = Math.max(next, r.frameNo ?? 0);
-		const out = unsent.map((rec) => ({ rec, frameNo: ++next }));
-		this.seeFrameNo(next);
-		this.allocated = true;
-		this.allocatedMax = next;
-		return out;
-	}
-
-	/** Highest own frameNo this runtime knows of (epoch migration carries it, §8.2). */
+	/** Highest own frameNo this store knows (allocFrameNo). */
 	maxOwnFrameNo(outbox: OutboxCache): number {
-		let max = Math.max(this.ownReplayEdge(), this.ownFrameNoSeen, this.frameNoFloor);
+		let max = Math.max(this.ownReplayEdge(), this.ownFrameNoSeen);
 		for (const r of outbox.ofStream(this.stream)) max = Math.max(max, r.frameNo ?? 0);
 		return max;
 	}

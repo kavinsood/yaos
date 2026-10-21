@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { VaultEpoch } from "../core/types";
 import { BLOB_TRANSFER_IDLE_MS } from "../core/limits";
-import type { EngineSettings } from "../protocol/messages";
+import type { EngineResultValue, EngineSettings } from "../protocol/messages";
 import { VirtualClock } from "./clock";
 import { SIM_SETTINGS, SimDevice, type SimDeviceOptions } from "./device";
 import { SimNet } from "./net";
@@ -448,6 +448,7 @@ test("relay epoch reset (§c.12): both devices migrate, re-upload, and keep sync
 	await boot(clock, devs);
 	await clock.advance(10_000);
 	assert.equal(a.vault.textOf("y.md"), "two\n");
+	const before = devs.map((d) => d.vrt!.log.c.self);
 
 	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
 	a.vault.externalWrite("x.md", "one\nduring reset\n");
@@ -464,6 +465,38 @@ test("relay epoch reset (§c.12): both devices migrate, re-upload, and keep sync
 	const o = await net.oracle();
 	assert.equal(o.error, null);
 	assert.deepEqual(o.docs.map((x) => [x.path, x.text]).sort(), want, "the new epoch holds the whole vault");
+	// identity-per-store §4 (decision 2): the new epoch's store is a new device, and the old one retired itself once
+	// the new one was live (its DB deleted with it).
+	devs.forEach((d, i) => {
+		const now = d.vrt!.log.c.self;
+		assert.notEqual(now, before[i], `${d.name}: a new identity for the new epoch`);
+		assert.equal(net.identities.state(now), "live");
+		assert.equal(net.identities.state(before[i]!), "retired", `${d.name}: the old epoch's store retired`);
+	});
+	for (const d of devs) assert.deepEqual((await d.storage.listDatabases()).filter((n) => n.startsWith("yaos3:")).map((n) => n.split(":")[2]), ["sim-epoch-2"], `${d.name}: only the new epoch's store`);
+});
+
+test("epoch reset with local snapshots on: the new epoch's store (a new device) lists the migration's snapshot", async () => {
+	// The "epoch" snapshot is taken by the old store, in its dir; the new store takes the old dir's local snapshots over
+	// (identity-per-store §5.2 step 6) and removes the old dir's files once its own mirrors are written.
+	const settings = { ...SIM_SETTINGS, snapshots: { enabled: true, keepDaily: 7, uploadToBlobStore: false } };
+	const { clock, net, devs } = world({ settings: () => settings }, ["A"]);
+	const a = devs[0]!;
+	a.vault.userWrite("x.md", "one\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	const old = a.vrt!.log.c.self;
+	net.relay.resetEpoch("sim-epoch-2" as VaultEpoch);
+	await clock.advance(30_000);
+	assert.equal(a.vrt?.vaultEpoch, "sim-epoch-2");
+	assert.notEqual(a.vrt!.log.c.self, old);
+	let listed: EngineResultValue | null = null;
+	void a.runtime.command({ t: "listSnapshots" }).then((v) => (listed = v));
+	for (let i = 0; i < 200 && listed === null; i++) await clock.advance(50);
+	const got = listed as EngineResultValue | null;
+	assert.equal(got?.t, "snapshots");
+	const snaps = got?.t === "snapshots" ? got.snapshots : [];
+	assert.ok(snaps.some((x) => x.reason === "epoch"), `the epoch snapshot is listed: ${JSON.stringify(snaps.map((x) => x.reason))}`);
 });
 
 test("epoch reset, app crash after the migration and before its merges: the old epoch's base survives the restart", async () => {

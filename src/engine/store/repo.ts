@@ -19,7 +19,7 @@ import { CursorTracker } from "../sync/cursor";
 import { LOCAL_FLAG_UNOPENED } from "../sync/foldRuntime";
 import {
 	DB_SCHEMA_VERSION, INDEX, STORE, STORE_SPECS, dbName, tailRange,
-	type MetaCursor, type MetaFrameNoFloor, type MetaIdentity, type MetaDocDeletes, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type MetaInherit, type OutboxRecord, type OutboxState, type QuarantineRecord,
+	type MetaCursor, type MetaIdentity, type MetaDocDeletes, type MetaKeyring, type MetaKeyringRecords, type MetaOutboxOrder, type MetaPathBase, type MetaDaily, type MetaInherit, type OutboxRecord, type OutboxState, type QuarantineRecord,
 	type SnapshotRecord, type StreamRecord, type SyncedRecord, type TailRecord, type YaosSchema,
 } from "./schema";
 
@@ -33,12 +33,6 @@ type Tx = StorageTx<YS>;
 type StoreKey = keyof YS;
 
 const MAXK = Number.MAX_SAFE_INTEGER;
-
-/** Highest own ns / cfg frameNo of an abandoned epoch timeline (MetaFrameNoFloor). */
-export interface FrameNoFloor {
-	readonly ns: number;
-	readonly cfg: number;
-}
 
 export interface RepoIdentity {
 	readonly vaultId: VaultId;
@@ -164,8 +158,8 @@ export type OutboxChange =
 	| { readonly t: "state"; readonly clientFrameId: ClientFrameId; readonly state: OutboxState }
 	/**
 	 * pending only, still sealed under `fromEpoch` with `fromLength` bytes: sealed again under the current epoch
-	 * (e2ee-design §14.2 step 4), under `next.clientFrameId` (its own for ns/cfg, a fresh one otherwise). Also a
-	 * renumbered ns/cfg frame (`next.frameNo`, FoldRuntime.renumberBlind), still numbered `fromFrameNo`.
+	 * (e2ee-design §14.2 step 4), under `next.clientFrameId` (its own for ns/cfg, a fresh one otherwise), and still
+	 * numbered `fromFrameNo`.
 	 */
 	| { readonly t: "reseal"; readonly clientFrameId: ClientFrameId; readonly fromEpoch: number; readonly fromLength: number; readonly fromFrameNo: number | null; readonly next: { readonly clientFrameId: ClientFrameId; readonly sealed: Uint8Array; readonly keyEpoch: number; readonly frameNo?: number } };
 
@@ -174,8 +168,6 @@ export class Repo {
 	private readonly cache = new Map<StreamName, StreamRecord>();
 	private queue: Promise<unknown> = Promise.resolve();
 	private ckptDuty = new Set<StreamName>();
-	/** meta frameNoFloor (epoch migration, e2ee-design §8.2); read at open. */
-	frameNoFloor: FrameNoFloor = { ns: 0, cfg: 0 };
 	/** meta daily as read at open (the engine's live counter starts from it; T_live keeps the record). */
 	dailyAtOpen: { readonly day: string; readonly frames: number } = { day: "", frames: 0 };
 	/** Catch-up order of stale streams (sessionLoop, catchUp.ts staleOrder; DESIGN §j.6). Computed, never stored. */
@@ -209,7 +201,7 @@ export class Repo {
 	static async open(
 		storage: StoragePort, id: RepoIdentity, nowMs: number,
 		opts: {
-			recoveredFromMirror?: boolean; frameNoFloor?: FrameNoFloor | null;
+			recoveredFromMirror?: boolean;
 			pathBases?: readonly MetaPathBase[] | null; docDeletes?: readonly MetaDocDeletes[] | null;
 			/** A new store's predecessor recovery (MetaIdentity.inherit): recorded only when the DB is created. */
 			inherit?: MetaInherit | null;
@@ -224,7 +216,6 @@ export class Repo {
 				}
 				const cursor = (await tx.get(STORE.meta, "cursor") as MetaCursor | undefined) ?? { key: "cursor", vaultSeq: 0, headSeqSeen: 0 };
 				const order = (await tx.get(STORE.meta, "outboxOrder") as MetaOutboxOrder | undefined) ?? { key: "outboxOrder", next: 1 };
-				if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
 				if (opts.pathBases) await addPathBases(tx, opts.pathBases);
 				if (opts.docDeletes) await addPathBases(tx, opts.docDeletes);
 				return { outcome: { t: "existing", identity: ident } as OpenOutcome, ident, cursor, next: order.next };
@@ -241,7 +232,6 @@ export class Repo {
 			tx.put(STORE.meta, fresh);
 			tx.put(STORE.meta, cursor);
 			tx.put(STORE.meta, { key: "outboxOrder", next: 1 });
-			if (opts.frameNoFloor) await raiseFrameNoFloor(tx, opts.frameNoFloor);
 			if (opts.pathBases) await addPathBases(tx, opts.pathBases);
 			if (opts.docDeletes) await addPathBases(tx, opts.docDeletes);
 			return { outcome: { t: "fresh" } as OpenOutcome, ident: fresh, cursor, next: 1 };
@@ -253,19 +243,17 @@ export class Repo {
 	}
 
 	private async loadCache(): Promise<void> {
-		const { streams, duty, floor, daily } = await this.db.tx([STORE.streams, STORE.meta], "readonly", async (tx) => {
+		const { streams, duty, daily } = await this.db.tx([STORE.streams, STORE.meta], "readonly", async (tx) => {
 			const streams = await tx.getAll(STORE.streams);
 			const d = await tx.get(STORE.meta, "ckptDuty");
-			const f = await tx.get(STORE.meta, "frameNoFloor");
 			const y = await tx.get(STORE.meta, "daily");
 			return {
-				streams, duty: d && d.key === "ckptDuty" ? d.streams : [], floor: f && f.key === "frameNoFloor" ? { ns: f.ns, cfg: f.cfg } : { ns: 0, cfg: 0 },
+				streams, duty: d && d.key === "ckptDuty" ? d.streams : [],
 				daily: y && y.key === "daily" ? { day: y.day, frames: y.framesSent } : { day: "", frames: 0 },
 			};
 		});
 		for (const s of streams) this.cache.set(s.stream, s);
 		this.ckptDuty = new Set(duty);
-		this.frameNoFloor = floor;
 		this.dailyAtOpen = daily;
 	}
 
@@ -329,7 +317,7 @@ export class Repo {
 	async count(store: StoreKey): Promise<number> {
 		return this.db.tx([store], "readonly", (tx) => tx.count(store));
 	}
-	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "frameNoFloor" | "keyring" | "keyringRecords">(key: K) {
+	async getMeta<K extends "cursor" | "outboxOrder" | "daily" | "identity" | "ckptDuty" | "keyring" | "keyringRecords">(key: K) {
 		return this.db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, key));
 	}
 	/** MetaKeyring (e2ee-design §18.3): keyring diagnostics and the lazy own-seal count. No key bytes. */
@@ -511,9 +499,9 @@ export class Repo {
 						held.push(it.rec);
 						if (await putQuarantine(tx, r, it.rec)) froze.add(stream);
 					}
-					// An own row this store never receipted (an earlier store, lost with IDB) is remote here: its text
-					// is not known to be on disk.
-					if (deviceId !== self || seq > r.lastOwnSeq) {
+					// Another device's row is remote here. An own row without its outbox record is one this store sent
+					// and already settled (a deviceId serves one store, identity-per-store §1.3): nothing new.
+					if (deviceId !== self) {
 						r.bodyVersion = { remoteSeq: Math.max(r.bodyVersion.remoteSeq, seq), localOrder: r.bodyVersion.localOrder };
 					}
 					if (deviceId !== self && seq > r.lastOwnSeq && duty.delete(stream)) dutyChanged = true;
@@ -610,8 +598,8 @@ export class Repo {
 				}
 				for (const row of input.rows) {
 					if (await putTail(tx, r, row)) tailPut.push(row);
-					// Own rows reach a page only without an outbox record; past lastOwnSeq they are an earlier store's (tLive).
-					if (row.deviceId !== self || row.seq > r.lastOwnSeq) r.bodyVersion = { remoteSeq: Math.max(r.bodyVersion.remoteSeq, row.seq), localOrder: r.bodyVersion.localOrder };
+					// Own rows reach a page only without an outbox record: already settled here (tLive).
+					if (row.deviceId !== self) r.bodyVersion = { remoteSeq: Math.max(r.bodyVersion.remoteSeq, row.seq), localOrder: r.bodyVersion.localOrder };
 					if (row.seq > r.remoteCheckpointCoversSeq && row.seq > r.appliedSeq) {
 						r.rowsSinceRemoteCheckpoint++;
 						r.bytesSinceRemoteCheckpoint += row.content.length;
@@ -766,7 +754,7 @@ export class Repo {
 					await putTail(tx, r, row);
 					// Applied now: a remote change, as T_read_page counts its rows (it does not count a row it quarantines;
 					// T_live does). Without this the planner saw no change and the disk kept the old text (E7 sim seed 88).
-					if (row.deviceId !== this.deviceId || row.seq > r.lastOwnSeq) {
+					if (row.deviceId !== this.deviceId) {
 						r.bodyVersion = { remoteSeq: Math.max(r.bodyVersion.remoteSeq, row.seq), localOrder: r.bodyVersion.localOrder };
 					}
 				}
@@ -897,18 +885,12 @@ function stateOrderRange(state: OutboxState): KeyRange {
 	return { lower: [state, 0], upper: [state, MAXK] };
 }
 
-/** Merge a carried frameNo floor into meta (max per stream; e2ee-design §8.2). */
 /**
  * The migration's path bases (MetaPathBase), each kept if one is already there: a migration repeated over an existing
  * new-epoch DB (the old DB not retired yet) neither replaces nor revives anything but a missing base.
  */
 async function addPathBases(tx: Tx, bases: readonly (MetaPathBase | MetaDocDeletes)[]): Promise<void> {
 	for (const b of bases) if (!(await tx.get(STORE.meta, b.key))) tx.put(STORE.meta, b);
-}
-
-async function raiseFrameNoFloor(tx: Tx, f: FrameNoFloor): Promise<void> {
-	const cur = await tx.get(STORE.meta, "frameNoFloor") as MetaFrameNoFloor | undefined;
-	tx.put(STORE.meta, { key: "frameNoFloor", ns: Math.max(cur?.ns ?? 0, f.ns), cfg: Math.max(cur?.cfg ?? 0, f.cfg) });
 }
 
 /** Own frame -> tail row. A bodyUpdateRef record keeps the resolved update as content (local cache). */
@@ -947,12 +929,17 @@ async function rename(tx: Tx, old: OutboxRecord, next: OutboxRecord, updated: Ou
 	}
 }
 
-/** Idempotent tail put; rows already covered by the snapshot are skipped. Returns true if written. */
+/**
+ * Idempotent tail put; rows already covered by the snapshot are skipped. Returns true if written. A stored row that
+ * opened is never replaced by a re-read of the same frame that did not (LOCAL_FLAG_UNOPENED): it adds nothing, and for
+ * an own row stored with its receipt it would hide the frame's frameNo from the allocator (FoldRuntime.allocFrameNo).
+ */
 async function putTail(tx: Tx, r: Mut<StreamRecord>, row: TailRecord): Promise<boolean> {
 	if (row.seq <= r.snapshotCoversSeq) return false;
-	const existing = await tx.count(STORE.tail, { lower: [row.stream, row.seq], upper: [row.stream, row.seq] });
+	const existing = await tx.get(STORE.tail, [row.stream, row.seq]);
+	if (existing && row.flags & LOCAL_FLAG_UNOPENED && !(existing.flags & LOCAL_FLAG_UNOPENED) && existing.clientFrameId === row.clientFrameId && existing.deviceId === row.deviceId) return false;
 	tx.put(STORE.tail, row);
-	if (existing === 0) {
+	if (existing === undefined) {
 		r.tailRows++;
 		r.tailBytes += row.content.length;
 	}

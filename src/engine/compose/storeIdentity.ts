@@ -77,7 +77,7 @@ export async function retireKeyHash(hash: HashPort, retireKey: string): Promise<
 }
 
 /** meta.identity of `name`, or null when it has none. Throws when the DB cannot be read (the start retries). */
-async function readStoreIdentity(storage: StoragePort, name: string): Promise<MetaIdentity | null> {
+export async function readStoreIdentity(storage: StoragePort, name: string): Promise<MetaIdentity | null> {
 	const db = await storage.open<YS>(name, DB_SCHEMA_VERSION, STORE_SPECS);
 	try {
 		const m = await db.tx([STORE.meta], "readonly", (tx) => tx.get(STORE.meta, "identity"));

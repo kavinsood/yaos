@@ -21,7 +21,7 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
  * (schemaVersion) and is deleted and rebuilt from relay + disk + side-file mirrors (DESIGN §i.5).
  * 2: dropped the unused streams byStalePriority / byAccess, synced byPathKey and blobQueue byActiveDue indexes
  * and the fields only they read; dropped the outbox "sent" state, attempts and lastSentAtMs (T_sent).
- * Not bumped for a new meta key family whose absence reads as before (blobPut:, frameNoFloor, pathBase:,
+ * Not bumped for a new meta key family whose absence reads as before (blobPut:, pathBase:,
  * keyringRecords, docDeletes:): an older reader never looks the keys up, and a DB without them behaves as it did. A bump would
  * delete and rebuild every DB.
  */
@@ -110,16 +110,6 @@ export interface MetaDaily {
 	readonly day: string;
 	readonly framesSent: number;
 }
-/**
- * Highest own ns / cfg frameNo of the abandoned timeline, carried by epoch
- * migration (DESIGN §c.12 step 3, e2ee-design §8.2) so new frames never reuse
- * its numbers. Absent = 0.
- */
-export interface MetaFrameNoFloor {
-	readonly key: "frameNoFloor";
-	readonly ns: number;
-	readonly cfg: number;
-}
 export interface MetaRelayCheckpointDuty {
 	readonly key: "ckptDuty";
 	/** Streams this device authored the latest row of (candidate writer duty). */
@@ -205,7 +195,7 @@ export interface MetaPendingIdentity {
 	readonly registered: boolean;
 }
 
-export type MetaRecord = MetaPendingIdentity | MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes;
+export type MetaRecord = MetaPendingIdentity | MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------

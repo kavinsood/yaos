@@ -26,7 +26,7 @@ import { BUDGETS } from "../../core/limits";
 import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
-import { findKnownEpoch, storedKeyringRecords } from "./knownEpoch";
+import { findKnownEpoch, storeDbs, storedKeyringRecords } from "./knownEpoch";
 import { deleteLegacyDbs, deleteStoreDbs, IdentityRefused, needsRepair, registerPending, resolveStoreIdentity, type ResolvedIdentity } from "./storeIdentity";
 import type { IdentityPort, RegisterRefusal, StoreCredentials } from "../../ports/identity";
 import { isStorageError } from "../../ports/storage";
@@ -47,9 +47,9 @@ import { HostLink } from "./hostLink";
 import { KeyReader, type KeyCommand } from "./keyReader";
 import { PinGate, type GateKeys } from "./pinGate";
 import { idleStatus } from "./statusMerge";
-import { ownFrameNoFloor, prepareEpochMigration } from "./runtimeOps";
+import { prepareEpochMigration } from "./runtimeOps";
 import { wipeSecrets } from "../../protocol/workerTransport";
-import type { FrameNoFloor } from "../store/repo";
+import { StoreEpochError } from "../runtime/engine";
 import type { MetaDocDeletes, MetaPathBase } from "../store/schema";
 import { VaultRuntime, type RestartReason, type RuntimeObserver } from "./vaultRuntime";
 
@@ -144,7 +144,13 @@ export class ComposedEngine {
 	/** The key reader is waiting for its identity (startReader). */
 	private readerStarting = false;
 	/** Carried into the next runtime after an epoch migration (§c.12). */
-	private migration: { bases: MetaPathBase[]; docDeletes: MetaDocDeletes[]; frameNoFloor: FrameNoFloor } | null = null;
+	private migration: { bases: MetaPathBase[]; docDeletes: MetaDocDeletes[] } | null = null;
+	/**
+	 * The relay named an epoch the found store has no DB for (StoreEpochError): the next start mints a new identity
+	 * for the new epoch's store (identity-per-store §4, decision 2) instead of reading the store's. Cleared once a
+	 * runtime started.
+	 */
+	private mintForEpoch = false;
 	private readonly offs: (() => void)[] = [];
 
 	constructor(readonly transport: EngineTransport, readonly options: CreateEngineOptions) {
@@ -280,14 +286,30 @@ export class ComposedEngine {
 			const ports = this.gate!.writerPorts(this.ports!);
 			const startedAt = ports.clock.monotonic();
 			try {
-				const identity = await this.resolveIdentity();
-				const rt = await VaultRuntime.start({
-					engine: this, config, identity, settings: this.settings!, ports, carrier: this.options.carrier,
-					clientVersion: this.options.clientVersion ?? "dev", vaultEpoch: this.knownEpoch, reason,
-					tuning: this.options.tuning, budgets: this.options.budgets, paused: this.paused,
-					tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log, onDiag: this.options.onDiag, observe: this.options.observe,
-					pathBases: this.migration?.bases ?? null, docDeletes: this.migration?.docDeletes ?? null, frameNoFloor: this.migration?.frameNoFloor ?? null,
-				});
+				const start = async () => {
+					const identity = await this.resolveIdentity();
+					const rt = await VaultRuntime.start({
+						engine: this, config, identity, settings: this.settings!, ports, carrier: this.options.carrier,
+						clientVersion: this.options.clientVersion ?? "dev", vaultEpoch: this.knownEpoch, reason,
+						tuning: this.options.tuning, budgets: this.options.budgets, paused: this.paused,
+						tzOffsetMinutes: this.options.tzOffsetMinutes, log: this.options.log, onDiag: this.options.onDiag, observe: this.options.observe,
+						pathBases: this.migration?.bases ?? null, docDeletes: this.migration?.docDeletes ?? null,
+					});
+					return { identity, rt };
+				};
+				let started: Awaited<ReturnType<typeof start>>;
+				try {
+					started = await start();
+				} catch (e) {
+					// A new epoch (§c.12): its DB is a new store under a new identity. The connect named the epoch, so the
+					// second start opens the new store without connecting first.
+					if (!(e instanceof StoreEpochError) || this.mintForEpoch) throw e;
+					this.log("new vault epoch: minting the new store's identity");
+					this.mintForEpoch = true;
+					this.knownEpoch = e.epoch;
+					started = await start();
+				}
+				const { identity, rt } = started;
 				if (this.disposed) {
 					await rt.stop();
 					return null;
@@ -299,6 +321,7 @@ export class ComposedEngine {
 				this.runtimeStartMs = ports.clock.monotonic() - startedAt;
 				this.knownEpoch = rt.vaultEpoch;
 				this.migration = null;
+				this.mintForEpoch = false;
 				this.lastStartError = null;
 				this.options.onRuntime?.(rt);
 				await this.replayInto(rt);
@@ -335,10 +358,15 @@ export class ComposedEngine {
 		const config = this.config!;
 		const port = ports.identity;
 		if (!port) throw new IdentityRefused("no-grant", null);
-		const id = await resolveStoreIdentity({
-			storage: ports.storage, random: ports.random, hash: ports.hash, identity: port,
-			vaultId: config.vaultId, installKey: config.installKey, log: (l) => this.log(l),
-		});
+		const deps = { storage: ports.storage, random: ports.random, hash: ports.hash, identity: port, vaultId: config.vaultId, installKey: config.installKey, log: (l: string) => this.log(l) };
+		// A new epoch's store: a new identity, registered with the grant (§4 "vaultEpoch change"); the old epoch's
+		// store stays until the new one is live, which then retires it (runtimeOps.retireOldEpochs). Once that store
+		// exists (a start that created it failed later), it is found like any store.
+		const epoch = this.knownEpoch;
+		const epochMint = this.mintForEpoch && !(await storeDbs(ports.storage, config.vaultId, config.installKey)).some((d) => d.vaultEpoch === epoch);
+		const id: ResolvedIdentity = epochMint
+			? { creds: await registerPending(deps), source: "pending", epoch: undefined }
+			: await resolveStoreIdentity(deps);
 		port.use(id.creds.deviceToken);
 		this.link.sideDir = id.creds.deviceId;
 		// The install's earlier stores: every store this worker ran on before (a store reset or loss mints without a
@@ -351,7 +379,11 @@ export class ComposedEngine {
 		}
 		const lineage = new Set(order);
 		// identity-per-store §5.2: a store this start creates fences its predecessor, then recovers from its mirrors.
-		const inherit = id.source === "pending" && order.length > 0 ? { dirs: order, fenced: await this.fence(port, order[0]!) } : null;
+		// After an epoch change nothing is fenced (the old store is retired once the new one is live) and its mirrors,
+		// of the old epoch, never match the new store: only its local snapshots move (the "epoch" one among them).
+		const inherit = id.source !== "pending" || order.length === 0 ? null
+			: epochMint ? { dirs: order, fenced: false }
+			: { dirs: order, fenced: await this.fence(port, order[0]!) };
 		const resolved: ResolvedIdentity = { ...id, lineage, inherit };
 		this.identity = resolved;
 		this.refused = null;
@@ -487,12 +519,10 @@ export class ComposedEngine {
 		if (this.starting) await this.starting;
 		const old = this.rt;
 		if (reason === "epoch" && old) {
-			const frameNoFloor = ownFrameNoFloor(old);
-			const carry = await prepareEpochMigration(old).catch((e) => {
+			this.migration = await prepareEpochMigration(old).catch((e) => {
 				this.log(`epoch prepare failed: ${String(e)}`);
 				return { bases: [], docDeletes: [] };
 			});
-			this.migration = { ...carry, frameNoFloor };
 		}
 		this.rt = null;
 		this.options.onRuntime?.(null);
