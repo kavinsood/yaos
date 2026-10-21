@@ -34,11 +34,19 @@ export class Scanner {
 	private readonly hintGen = new Map<PathKey, number>();
 	private hintClock = 0;
 	private readsInFlight = 0;
+	/**
+	 * The last observed rename's stamp. Renames are ordered by `atMs` (chains a -> b -> c, the planner's
+	 * renamedAway, inference): it must follow event order, which the wall clock does not (a clock set back, sim
+	 * blob seed 1370759151: n5 -> r1 after seed1 -> r1 -> r5 sorted first and chained n5 into r5). Strictly
+	 * increasing, from the wall clock and floored by the stamps kept across restarts (fileGone `renamedTo`).
+	 */
+	private lastRenameAt = 0;
 
 	constructor(private readonly ctx: Ctx) {}
 
 	/** Rebuild the in-memory tree from the store (classification is recomputed). */
 	load(): void {
+		for (const s of this.ctx.store.synced.values()) if (s.renamedTo) this.lastRenameAt = Math.max(this.lastRenameAt, s.renamedTo.atMs);
 		for (const r of this.ctx.store.localTree.values()) {
 			const c = this.ctx.classify(r.diskPath, r.size);
 			this.ctx.local.set(r.pathKey, fromRecord(r, c.excluded));
@@ -89,7 +97,8 @@ export class Scanner {
 					this.markDirty(ev.path, null);
 					break;
 				case "rename":
-					this.ctx.renames.push({ from: ev.from.normalize("NFC"), to: ev.to.normalize("NFC"), atMs: this.ctx.now() });
+					this.lastRenameAt = Math.max(this.ctx.now(), this.lastRenameAt + 1);
+					this.ctx.renames.push({ from: ev.from.normalize("NFC"), to: ev.to.normalize("NFC"), atMs: this.lastRenameAt });
 					this.markDirty(ev.from, null);
 					this.markDirty(ev.to, ev.stat);
 					break;

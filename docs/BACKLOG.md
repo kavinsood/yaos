@@ -140,11 +140,6 @@ on A is lost. Possibly the same as test:sim-suite1 "4 devices, E2EE faults" seed
 at step 52)`, identical on base; its plan has an epoch reset and commit crashes too, `s1-e2ee4-seed1.json`). The
 known suite-1 failure: `npm run test:sim-suite1` exits 1 on it.
 
-### SIM-BLOB-STALE-DISK: blob faults leave A's disk stale
-
-`1370759151-13-min.json` (blob faults, 2 devices, delete / restore races): no convergence; A's body replica and the
-relay hold the newer text of `notes/r5.md`, A's disk the old one.
-
 ### SIM-CLONE-BODYLESS-WAIT: a clone waits on a creator that never sends the body
 
 `532933571-114.json` (clone faults, 4 devices; found on 70c67349, base): no quiescence, D waits on the creator of a
@@ -185,6 +180,10 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-BLOB-STALE-DISK** (`fix-integrity`): observed renames were ordered by wall-clock stamps; a clock set back
+  between seed1 -> r1 -> r5 and n5 -> r1 chained n5 into r5 (both docs claimed r5.md, the editor bound to n5's doc
+  sat at r1.md, its content job deferred for good, A's disk stale). Rename stamps are now strictly increasing in event
+  order, floored by the `renamedTo` stamps kept across restarts. Regression `clock-set-back-misorders-rename-chain.json`.
 - **SIM-CANVAS-FOLDER-REVIVE** (`fix-integrity`): a save, then a rename before the pass that hashes the save reads
   the file. The host held the rename's event in its 50 ms batch (§g.3) while the read of the source came back
   "missing", and an observed rename was dropped after a pass that could only ask for the target's hash, so the doc

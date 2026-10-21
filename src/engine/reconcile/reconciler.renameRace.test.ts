@@ -64,3 +64,28 @@ test("a read result is stale for a path hinted while the read was in flight", as
 	assert.equal(w.log.text(d), "two\n");
 	assert.deepEqual(w.vault.paths().sort(), ["b.md"]);
 });
+
+/**
+ * Sim blob seed 1370759151: renames are chained by their stamps, and the stamps came from the wall clock. Set
+ * back between seed1 -> r1 -> r5 and n5 -> r1, the last rename sorted first and chained n5 -> r1 -> r5: both docs
+ * claimed r5.md, the editor bound to n5's doc followed the file to r1.md, and A's disk stayed stale for good.
+ */
+test("rename stamps follow event order when the wall clock is set back", async () => {
+	const w = new World();
+	await w.boot();
+	const d1 = w.log.remoteCreate(P("seed1.md"), "one\n");
+	const d2 = w.log.remoteCreate(P("n5.md"), "five\n");
+	await w.sync();
+	w.vault.userRename("seed1.md", "r1.md");
+	w.vault.userRename("r1.md", "r5.md");
+	w.clock.wall -= 200_000_000;
+	w.vault.userRename("n5.md", "r1.md");
+	await w.sync();
+	await w.sync();
+	assert.equal(w.synced(d1)?.path, "r5.md");
+	assert.equal(w.synced(d2)?.path, "r1.md");
+	assert.equal(w.log.text(d1), "one\n");
+	assert.equal(w.log.text(d2), "five\n");
+	assert.deepEqual(w.vault.paths().sort(), ["r1.md", "r5.md"]);
+	assert.deepEqual(w.log.submitted.filter((o) => o.t !== "create" || (o.docId !== d1 && o.docId !== d2)).map((o) => o.t), ["rename", "rename"]);
+});
