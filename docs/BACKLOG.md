@@ -191,6 +191,13 @@ Kept here until `sim-port` merges; then git history holds them.
   devices sealing under different epochs, edits lost). A pending revoke in `k` now holds back its epoch's later
   records as a pending genesis did (e2ee-design §11.3): the device waits revoked-epoch for a QR. Plan
   `src/sim/regressions/concurrent-revoke-keyring-fork.json`, test `src/engine/keyring/concurrentRevoke.test.ts`.
+- **SIM-REBIND-COLLAPSE** (`fix-epoch`, found by an epoch-reset / crash weighted soak, suite 1 seed 1394654959): an
+  own create merged before it folded has `nsTouchSeq` 0, and the merged-row rebind kept that on the winner's synced
+  record. After an epoch reset, B renamed the winner and an identical re-create folded live at the old path. A read its
+  record (the winner, `nsTouchSeq` 0, still at the old path) as an own create the fold had suffixed, and the
+  identical-loser collapse rebound it onto the new doc and deleted the winner, so the attachment was trashed on every
+  device. The rebind (planner and job) now records the winner's `lastTouchSeq`. Plan
+  `src/sim/regressions/merged-rebind-renamed-winner-collapsed.json`.
 - **CLONED-ID, FRAMENO-IDB** (identity-per-store phases 1–4, `client-remake-next`): a deviceId is used by exactly one
   store, ever. The identity lives in the store (`meta.identity`), data.json holds a pairing grant, a clone or a new
   IndexedDB registers a new device, an IndexedDB loss fences its predecessor and re-issues its mirrored frames, a
