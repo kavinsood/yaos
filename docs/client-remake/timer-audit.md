@@ -187,6 +187,7 @@ simple invariant (every deferred job is re-checked within 30 s) for event-driven
 | `passScheduler` debounce / retry | 30 ms / 1 s → 60 s | `passScheduler.ts:82,149` | latency | |
 | Blob write backoff (download whose disk write failed) | 0, then 1 min doubling to 10–60 min (scaled by size, ~16 MiB/h) | `blobQueue.ts` `writeBackoffMs` | cost | per (doc, hash), in memory; armed only through `nextDueInMs` while one waits; due at once on a user delete / rename |
 | `KEY_STORE_WAIT_MS` | 5 s | `secretStore.ts:188` | latency | one-shot at startup |
+| Abandoned-creator recheck / grace (`creatorStatusRecheckMs`, `abandonedCreateGraceMs`) | 5 min doubling per live answer to 60 min / 30 s | `creatorStatus.ts` (identity-per-store phase 3, bounded in phase 4) | consistency | One timer for every recheck and grace, armed only while a body-less doc waits on a foreign creator; none on an idle vault without one. One `POST /auth/device/status` in flight, ≤ 32 creators each (one per creator, not per doc). "unknown" is not asked again in the runtime. Before phase 4: a 5 min timer whose recheck only re-read a cached view (nothing asked until the next pass) and kept re-arming for unknown creators |
 | keyring `k` daily-limit retry / meta write | `retryAfterMs` or 60 s / 30 s | `keyringRuntime.ts:288,49` | latency | |
 | Engine start retry | 5 s flat, forever | `protocolEngine.ts:330` | housekeeping | F11 |
 

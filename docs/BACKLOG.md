@@ -1,6 +1,6 @@
 # Backlog
 
-Status: the open work as of 2026-10-21, on `sim-port`. The list is the project owner's (2026-10-21); the context
+Status: the open work as of 2026-10-21, on `sim-port` (identity-per-store through phase 4 on `client-remake-next`). The list is the project owner's (2026-10-21); the context
 under each item is checked against the code and the notes it names. Done work is not kept here once merged (the last
 section lists what landed on `sim-port` since 33bdf49b): it is in git history and in the notes
 ([integration-notes.md](client-remake/integration-notes.md) §3, the sim regression plans). Smaller known gaps that
@@ -11,63 +11,6 @@ Section letters (§x.y) refer to [DESIGN](client-remake/DESIGN.md).
 ---
 
 ## 1. Being fixed now
-
-### CLONED-ID: a cloned vault folder shares one device identity
-
-The device identity (`vaultId`, `deviceId`, device token) is plugin data, so it lives in the vault's
-`<configDir>/plugins/yaos/data.json` (`src/host/pluginController.ts`). A vault folder copied to a second machine, or
-synced there by iCloud, Syncthing or Dropbox, carries that file: both machines then run as the same device. Nothing
-detects it. Each takes the other's ns frames for its own (`deviceId === self`, `src/engine/sync/ingestRow.ts`,
-`src/engine/sync/foldRuntime.ts`), as confirmations of local work rather than remote changes: renames revert, files
-are trashed, and creates and settings changes are dropped. The fix is being designed:
-
-- an install marker that tells a cloned `data.json` from the install that wrote it, then a re-pair or a rotated
-  device identity on the clone;
-- a per-store writer tag, so two stores under one deviceId never take each other's frames for their own.
-
-Proposed design: [identity-per-store](client-remake/identity-per-store.md) (an identity per IndexedDB store, a pairing
-grant in data.json). Owner decisions recorded there (§12.1, 2026-10-21).
-
-- **Phase 1 landed (server only)** on `identity/phase1-server`: pairing grants, register / retire / self-retire /
-  leave, tombstones, per-grant limits, `last_seen_day`, grant pairing codes, "Revoke pairing" and the grouped console
-  (DECISIONS §10, G54–G64). Additive: the current client still enrolls the old way and is unaffected.
-- **Phase 2 landed (client)** on `identity/phase2-client`: grant pairing (the client mints the grant secret,
-  data.json holds only the grant), the install record in `App.saveLocalStorage`, `yaos3:<vaultId>:<epoch>:<installKey>`
-  stores with their identity in `meta.identity` (minted and registered on store create), mirrors under
-  `state/<deviceId>/`, registration refusal statuses, legacy `yaos2:` DB and flat mirror cleanup. A clone is a new
-  device (sim `clone` and `syncedConfig` faults, matrix "3 devices, clone + synced config faults"). IDB loss takes the
-  "without mirrors" path until phase 3 (conflict copies where mirrors used to merge; two composed tests are `todo`).
-- **Phase 3 landed (client + one server route)** on `identity/phase3-recovery`: the successor fence (retire by key
-  before the first connect), predecessor recovery from the lineage's mirror dirs (re-issue under the new identity,
-  commit check by origin, synced mirror import, snapshot move and lineage-aware retention, then cleanup), outbox
-  mirror format 2 (origins), and a revoked store's successor. The sim oracle is mirror-aware again; the composed
-  mirror-recovery tests run.
-- **Abandoned creator: fixed in phase 3** (found by the clone fault, sim seed 6 of the clone matrix). A doc whose
-  create committed and whose initial body did not, created by a store that is then abandoned, waited (`body-empty`)
-  for a body nobody would send. Rule (DESIGN §i.5 "Abandoned creates"): a creator the server reports retired
-  (`POST /auth/device/status`) never sends again, so after a 30 s grace its body-less docs are `lostCreateBody` on
-  every device; the empty doc is deleted and whoever holds the file creates it again as a new doc. The clone fault no
-  longer skips these windows (`strandedCreate` is gone); it removes the abandoned store in the console 60 s later.
-  Residual: until the abandoned store is retired (console "Remove device" now; phase 5 inactivity retirement
-  automatically) such a doc still waits.
-- Next: 4 (removal of the wall floor and `renumberBlind`, epoch-change minting), 5 (inactivity retirement, grant
-  rotation).
-
-### FRAMENO-IDB: frameNo collision after IndexedDB loss
-
-ns/cfg replay protection (e2ee-design §8.2) needs every frame number of a device to be new. A store lost with an
-uncommitted frame in flight, and no outbox mirror, restarts numbering from the committed edge, so the lost runtime's
-frame and the new one can share a number: whichever commits second folds as `replay-duplicate` (sim seed 222). The
-planner no longer trashes the file when that happens (d1f8a750: an own create that folded as ignored is re-created),
-but the collision itself stands. The current guard is a stopgap: a runtime's first number is at least the wall clock
-in ms (44748cb2), ignored when the clock reads past 2^45 ms (f47950cb) (`FoldRuntime.skip`,
-`src/engine/sync/foldRuntime.ts`). It depends on the wall clock moving forward across the loss. It stays until the
-CLONED-ID design lands: a fresh store under a new writer identity (rotated device id or writer tag) never shares a
-replay window with the lost one.
-
-Proposed design: [identity-per-store](client-remake/identity-per-store.md). Since phase 2 an IndexedDB loss starts a
-store with a new deviceId (a fresh replay window), so the collision no longer arises: seed 222's plan stays green with
-the wall-clock floor and the phase-3 fence both disabled. The floor is removed in phase 4.
 
 ### PERF-BOOT: fresh-device bootstrap takes ~50 s on a phone
 
@@ -101,6 +44,21 @@ the same vault in ~2.7 s ([integration-notes](client-remake/integration-notes.md
 that takes longer than 5 s to start the worker stops syncing until "Restart sync engine".
 
 ## 2. Smaller open items
+
+### IDENTITY-HYGIENE: identity-per-store phase 5 (optional)
+
+CLONED-ID and FRAMENO-IDB are closed (below, "Landed"). What [identity-per-store](client-remake/identity-per-store.md)
+§12.2 leaves for phase 5, none of it needed for correctness:
+- **Inactivity retirement** (decision 4: 90 days, lazily at the next registration or listing; `last_seen_day` is
+  recorded since phase 1). Until then an abandoned store (a clone deleted, a profile wiped without its successor
+  fencing it) stays live on the server: its body-less creates wait (DESIGN §i.5 "Abandoned creates") until the console's
+  "Remove device".
+- **Grant rotation** and re-fetch with the device token (§3.4), and rewriting a lost data.json from the store (§4
+  "data.json lost").
+- **Orphan DB sweep** (§6.4): `yaos3:<vaultId>:*` DBs whose install key is lost, deleted once the server reports their
+  identity retired or unknown.
+- **`rebuildLocalCache` as a store reset** (§4): the command restarts the runtime on the same store today; it should
+  flush the mirror, delete the DB, mint and recover with the old store as the predecessor, like a `Repo.open` mismatch.
 
 ### QUARANTINE-UI: quarantine release control in the UI
 
@@ -172,6 +130,15 @@ From [DECISIONS](server-rewrite/DECISIONS.md) §8, still open:
 ## Landed on `sim-port` since 33bdf49b
 
 Kept here until `sim-port` merges; then git history holds them.
+
+- **CLONED-ID, FRAMENO-IDB** (identity-per-store phases 1–4, `client-remake-next`): a deviceId is used by exactly one
+  store, ever. The identity lives in the store (`meta.identity`), data.json holds a pairing grant, a clone or a new
+  IndexedDB registers a new device, an IndexedDB loss fences its predecessor and re-issues its mirrored frames, a
+  vaultEpoch change mints too (the old epoch's store retires itself once the new one is live), and the per-install
+  data.json fields moved to `App.saveLocalStorage` (§8; a one-time notice when another tool syncs the folder). With
+  that, frameNo allocation is exact (e2ee-design §8.2): the wall-clock floor (44748cb2, f47950cb), the 64 skip,
+  `renumberBlind` and the epoch `frameNoFloor` are gone. Residual: a duplicated app profile (Migration Assistant, a
+  Time Machine restore onto a second Mac) still runs two installs as one store (decision 7, accepted); phase 5 above.
 
 - **BLOB-RETRY** (473cd500, after 31987119): a downloaded attachment whose disk write keeps failing backs its
   re-downloads off per (doc, hash), 1 min doubling to a cap scaled by size (10–60 min), and is listed

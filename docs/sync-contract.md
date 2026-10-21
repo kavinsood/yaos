@@ -220,16 +220,22 @@ From [wp-d-notes.md](client-remake/wp-d-notes.md) "Gaps and known issues",
   quarantined for a reader-dependent reason (missing key, newer writer) are retried at every session start. Nothing
   else lifts a quarantine: the `releaseQuarantine` command DESIGN §d.6 describes exists in the protocol, but no
   command or button sends it (BACKLOG QUARANTINE-UI). **Rebuild local cache** starts the store over from the relay.
-- **A copied or synced vault folder is a new device.** data.json holds only the pairing grant; each IndexedDB store
-  mints and registers its own device identity (identity-per-store §2-4). A copy of the vault folder on another
-  machine, or opened as another vault on the same one, has its own store and identity, joins without a prompt, and
-  syncs as a separate device; it never reads or writes the other store's mirror dir. It counts against the pairing's
-  limits (20 new stores a day, 50 live devices). Copying a vault over another one while that device still had a
-  create in flight can leave the note waiting for an initial body nobody can send (BACKLOG CLONED-ID, "abandoned
-  creator"). A grant copied with the folder is a credential: revoking the pairing revokes every copy.
-- **frameNo collision after IndexedDB loss.** A store lost with an unsent namespace frame in flight and no mirror can
-  reuse a frame number; the current guard is a wall-clock floor on the first number of a runtime (e2ee-design §8.2;
-  commits 44748cb2, f47950cb). See BACKLOG.
+- **A copied or synced vault folder is a new device.** data.json holds only the pairing grant and the settings a copy
+  may share; each IndexedDB store mints and registers its own device identity (identity-per-store §2-4), and the
+  per-install fields (device label, status bar, a pending enrollment, the creation marker) live in Obsidian's
+  per-vault-registration storage (§8). A copy of the vault folder on another machine, or opened as another vault on
+  the same one, has its own store and identity, joins without a prompt, and syncs as a separate device; it never reads
+  or writes the other store's mirror dir. YAOS says once when a fresh install finds another store's mirrors written in
+  the last day (another tool syncs the folder; exclude `<configDir>/plugins/yaos/` from it, or two tools make
+  conflicting copies). A copy counts against the pairing's limits (20 new stores a day, 50 live devices). Copying a
+  vault over another one while that device still had a create in flight leaves the note waiting for its initial body
+  until the abandoned store is retired (console "Remove device"; DESIGN §i.5 "Abandoned creates"). A grant copied with
+  the folder is a credential: revoking the pairing revokes every copy.
+- **A duplicated app profile is one device twice.** Copying Obsidian's app profile itself (macOS Migration Assistant,
+  a Time Machine restore onto a second Mac) copies the IndexedDB store and its identity: two installs then run as one
+  store, and each takes the other's changes for its own. Nothing detects it (identity-per-store decision 7, accepted;
+  Obsidian Sync has the same exposure). Removing that device in the console makes each install register a store of its
+  own (identity-per-store §4, "Store revoked by the server").
 - **Pruned and deleted docs keep their rows.** No device writes the `retired` checkpoints DESIGN §b.5 / §d.9
   describe, and the client does not adopt them (`src/engine/sync/catchUp.ts` "gap: retirement handling"), so relay
   rows and local stream records of deleted notes are never reclaimed.

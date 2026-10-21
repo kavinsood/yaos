@@ -1,7 +1,7 @@
 # One device identity per store (design)
 
-Status: approved 2026-10-21 (owner decisions in §12.1). Phase 1 (server) is built on `identity/phase1-server`
-(DECISIONS §10); phases 2–5 are not. Written on branch `design/identity-per-store` off `sim-port` (eaf05881).
+Status: approved 2026-10-21 (owner decisions in §12.1). Phases 1–4 are built (§12.2 "Landed" notes; phase 4 on
+`identity/phase4-removal`); phase 5 (optional hygiene) is not. Written on branch `design/identity-per-store` off `sim-port` (eaf05881).
 Fixes BACKLOG [CLONED-ID](../BACKLOG.md) and [FRAMENO-IDB](../BACKLOG.md). Section letters (§x.y) are
 [DESIGN](DESIGN.md); "e2ee §n" is [e2ee-design](e2ee-design.md). **[U]** = not verified; **[inferred]** = follows
 from verified facts but was not tested directly.
@@ -634,8 +634,46 @@ the same exposure. The relay cannot tell that from a reconnect overlap. This is 
 4. **Removal.** Delete the wall floor, the skip, `renumberBlind`, `frameNoFloor` and the earlier-store branches.
    Epoch migration mints and self-retires. Soak. Update DESIGN and e2ee docs. Close CLONED-ID and FRAMENO-IDB. Add the
    optional clone notice and the §8 per-install split of data.json fields.
+   - **Landed** on `identity/phase4-removal`. As built:
+     - **Removed:** the wall-clock floor (`FoldRuntime.skip`, `WALL_FLOOR_MAX`, `wallMs`; ClockPort's rule is back to
+       "never for ordering or fold decisions"), the NS_DEDUPE_RING skip of a runtime's first allocation and its
+       re-skip, `renumberBlind` / `renumberBlindFrames` and the `frame-renumbered` diag, the epoch `frameNoFloor`
+       (`MetaFrameNoFloor`, the carry through `EngineOptions` / `VaultRuntimeStart` / `ComposedEngine.migration`,
+       `ownFrameNoFloor`), and the "earlier store" clauses (`seq > lastOwnSeq` in `tLive`, `tReadPage`,
+       `tReleaseQuarantine`; the context comment): an own row without its outbox record is one this store settled.
+       `allocFrameNo` is `1 + max(R, own rows above the fold, receipts, the outbox)`: a fresh store starts at 1.
+       e2ee-design §8.2 states why that is exact.
+     - **The skip was checked, not assumed:** every number is sent only from the outbox written in the allocating
+       chain step, and leaves it only through a receipt that writes the own tail row. One hole was found and closed
+       instead of keeping the skip: a re-read of an own row that does not open (a reader-dependent gate failure)
+       replaced the receipt's row with an unopened one (frameNo 0), hiding the number. `putTail` now never replaces an
+       opened row with an unopened copy of the same frame.
+     - **Kept:** the gate that opens ns/cfg sends only after the start reads (late receipts §d.7, stale-epoch reseal,
+       the inherited commit check); the d1f8a750 planner re-create (decision 8; DESIGN §f.2 now names it a safety net);
+       `recoverFromMirror` (own mirror under the same deviceId) for engine tests that start without a store identity:
+       production never reaches it (a new store's own dir is empty).
+     - **Epoch migration mints** (decision 2). The old store's identity opens only its own DB: a start whose connect
+       names an epoch the found store has no DB for ends with `StoreEpochError`, and the composed engine registers a
+       pending identity with the grant (no extra connect: the error carries the epoch) and starts again. No fence and
+       no frame inheritance (the old outbox goes with §c.12 step 5; its mirrors are of the old epoch and never match),
+       but the old dir is the new store's lineage, so its local snapshots (the migration's "epoch" one) move over and
+       its files are removed after. At live, `retireOldEpochs` retires each other-epoch DB's identity by its retire key
+       (the self-retire) and deletes the DB; a retire without an answer keeps the DB until the next live. Sim test:
+       both devices of an epoch reset run as new devices, the old ids read retired, one `yaos3:` DB each.
+     - **§8 split:** `deviceLabel`, `showStatusBar`, `pendingEnrollment` and `creating` live in a per-install record
+       (`App.saveLocalStorage("yaos-local")`, `src/host/localSettings.ts`); data.json holds `version`, the grant, the
+       engine settings and the suite pin. The label and status bar flag move once from an older data.json; an older
+       `creating` / `pendingEnrollment` is dropped (it could be a twin's), and that data.json is rewritten once
+       without them. A label or status bar change never writes data.json.
+     - **Clone notice:** the first store of an install with no lineage looks at `state/*/` and says once (flag in the
+       per-install record) when another store's mirror was written within a day (`src/host/cloneNotice.ts`).
+     - **Abandoned-creator timer:** one timer for every recheck and grace, none while no doc waits on a foreign
+       creator; a live creator's recheck doubles from 5 min to 60 min and is asked by the timer itself (the phase-3
+       recheck only re-read a cached view); "unknown" is not asked again. timer-audit.md has the row.
+     - Not done: `rebuildLocalCache` still restarts on the same store (§4 wants a store reset; BACKLOG
+       IDENTITY-HYGIENE).
 5. **Hygiene (optional).** Inactivity retirement; grant rotation and re-fetch with the device token; orphan DB sweep;
-   ring compaction.
+   ring compaction; `rebuildLocalCache` as a store reset.
 
 ## 13. Migration note for dev vaults
 
