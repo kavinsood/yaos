@@ -18,7 +18,7 @@
 
 import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
-import { generateUserAction, runUserAction, tokensIn, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, STORM_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
+import { generateUserAction, runUserAction, tokensIn, CLEANUP_OPS, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, STORM_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
 import { activity, checkBlobLiveness, checkCanvas, checkIdentity, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, checkBounds, checkFoldDeterminism, checkOutboxAndCursor, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
 import { BrakeUser, type BrakeUserStats } from "./brakeUser";
@@ -52,6 +52,11 @@ export interface SimConfig {
 	readonly ops?: OpWeights;
 	/** Chance per main step of an extra attachment/settings action (own RNG stream). 0 disables. Default 0.15. */
 	readonly extras?: number;
+	/**
+	 * Chance per main step of the user's "Clean up unused server attachments" on a random device (own RNG stream).
+	 * Default 0. Pair with a tuning.blobGcGraceMs the run outlives (production's 7 days never pass in a run).
+	 */
+	readonly cleanups?: number;
 	/** Default: chosen by the seed. */
 	readonly profile?: CaseProfile;
 	readonly initialFiles?: number;
@@ -394,6 +399,7 @@ export function generatePlan(cfg: SimConfig): Step[] {
 	const c = full(cfg);
 	const rng = new SeededRandom(cfg.seed).fork("plan");
 	const xr = new SeededRandom(cfg.seed).fork("extra");
+	const gc = new SeededRandom(cfg.seed).fork("cleanup");
 	const sr = new SeededRandom(cfg.seed).fork("snapshot-ops");
 	const cr = new SeededRandom(cfg.seed).fork("canvas-ops");
 	const snaps = checkpointWorld(cfg).snapshots.some((x) => x);
@@ -408,6 +414,7 @@ export function generatePlan(cfg: SimConfig): Step[] {
 		if (c.extras > 0 && xr.chance(c.extras)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(xr, c.devices, EXTRA_OPS) });
 		// Manual snapshots, from their own stream (the main and extra plans of a seed do not depend on them).
 		if (snaps && sr.chance(0.04)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(sr, c.devices, SNAPSHOT_OPS) });
+		if ((cfg.cleanups ?? 0) > 0 && gc.chance(cfg.cleanups!)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(gc, c.devices, CLEANUP_OPS) });
 		if (storms > 0 && stormRng.chance(storms)) plan.push({ i: extra++, gapMs: 0, user: generateUserAction(stormRng, c.devices, STORM_OPS) });
 		// Canvas actions, from their own stream too: floor(rate) per main step, one more with the fraction's chance.
 		if (c.canvas) {

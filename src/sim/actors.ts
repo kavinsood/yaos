@@ -12,6 +12,7 @@
  * survive in the converged vault (conflict copies included).
  */
 
+import { cleanUpAttachments } from "../host/ui/attachmentsCleanup";
 import type { SeededRandom } from "./random";
 import type { SimDevice } from "./device";
 import type { SimEditorView } from "./workspace";
@@ -105,6 +106,8 @@ export type UserAction =
 	| { readonly t: "setting"; readonly dev: number; readonly file: number; readonly key: number; readonly del: boolean }
 	// The user's "Create snapshot" command (DESIGN §j.4): uploaded at once when the device uploads snapshots (snap rows).
 	| { readonly t: "snapshot"; readonly dev: number }
+	// The user's "Clean up unused server attachments" (e2ee-design §10.4), through the host flow (attachmentsCleanup.ts).
+	| { readonly t: "cleanUp"; readonly dev: number }
 	// Storms (STORM_OPS, drawn from their own stream): bulk changes past the safety brake's thresholds (DESIGN §f.5).
 	/** An external tool (file sync, unzip, Importer plugin) writes `count` notes into import/b<batch>/; `big` of them >= 6 KiB. */
 	| { readonly t: "importStorm"; readonly dev: number; readonly batch: number; readonly count: number; readonly big: number }
@@ -131,7 +134,7 @@ export type UserAction =
 
 export type OpWeights = Readonly<Record<UserAction["t"], number>>;
 
-const NO_EXTRAS = { attach: 0, attachRename: 0, attachDelete: 0, setting: 0, snapshot: 0 } as const;
+const NO_EXTRAS = { attach: 0, attachRename: 0, attachDelete: 0, setting: 0, snapshot: 0, cleanUp: 0 } as const;
 const NO_STORMS = { importStorm: 0, massDelete: 0, folderMove: 0, massRename: 0, massOverwrite: 0 } as const;
 const NO_RACES = { restoreTrash: 0, recreate: 0, bigNote: 0, bigReformat: 0, bigEdit: 0 } as const;
 /** Edits only (no deletes/renames). */
@@ -160,7 +163,7 @@ export const BIG_LINES = 20_100;
  */
 export const EXTRA_OPS: OpWeights = {
 	type: 0, paste: 0, deleteToken: 0, open: 0, close: 0, switch: 0, mode: 0, create: 0, diskInsert: 0, diskDeleteToken: 0, rename: 0, delete: 0,
-	attach: 6, attachRename: 1, attachDelete: 1, setting: 4, snapshot: 0, ...NO_STORMS, ...NO_RACES,
+	attach: 6, attachRename: 1, attachDelete: 1, setting: 4, snapshot: 0, cleanUp: 0, ...NO_STORMS, ...NO_RACES,
 };
 
 /**
@@ -169,6 +172,9 @@ export const EXTRA_OPS: OpWeights = {
  * brake's MIN 50 and 20 % (core/limits BRAKE_*).
  */
 export const STORM_OPS: OpWeights = { ...EXTRA_OPS, attach: 0, attachRename: 0, attachDelete: 0, setting: 0, importStorm: 4, massDelete: 3, folderMove: 2, massRename: 1, massOverwrite: 2 };
+
+/** Attachment clean-ups only (run.ts draws them from their own stream when SimConfig.cleanups > 0). */
+export const CLEANUP_OPS: OpWeights = { ...EXTRA_OPS, attach: 0, attachRename: 0, attachDelete: 0, setting: 0, cleanUp: 1 };
 
 /** Manual snapshots only (run.ts draws them from their own stream, in the seeds that upload snapshots). */
 export const SNAPSHOT_OPS: OpWeights = { ...EXTRA_OPS, attach: 0, attachRename: 0, attachDelete: 0, setting: 0, snapshot: 1 };
@@ -212,6 +218,7 @@ export function generateUserAction(rng: SeededRandom, devices: number, weights: 
 		case "attachDelete": return { t: "attachDelete", dev, file: f() };
 		case "setting": return { t: "setting", dev, file: rng.int(SETTING_FILES.length), key: rng.int(4), del: rng.chance(0.2) };
 		case "snapshot": return { t: "snapshot", dev };
+		case "cleanUp": return { t: "cleanUp", dev };
 		// A batch pool of 3: two devices may import the same folder (offline, different versions: conflicts).
 		case "importStorm": { const count = rng.range(40, 120); return { t: "importStorm", dev, batch: rng.int(3), count, big: Math.floor(count * rng.float()) }; }
 		// 0.25 .. 0.95: below half mostly mass-delete-local, above half listing-shrank first (brake.ts priority).
@@ -553,6 +560,10 @@ export async function runUserAction(w: ActorWorld, a: UserAction, step: number):
 		case "snapshot":
 			// A user command: its export and upload run on the engine's own time (the step does not wait).
 			void d.runtime.command({ t: "createSnapshot" }).catch(() => undefined);
+			return tag;
+		case "cleanUp":
+			// The host flow (one command, one notice); the sweep runs on the engine's time, the step does not wait.
+			void cleanUpAttachments({ command: (c) => d.runtime.command(c) }, (message, level) => d.ui.notices.push({ level, code: "attachments-cleaned", message }));
 			return tag;
 		case "setting": {
 			// Settings are last-writer-wins per key: no token ledger, convergence only (invariants checkSettings).
