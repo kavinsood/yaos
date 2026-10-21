@@ -31,8 +31,21 @@ grant in data.json). Owner decisions recorded there (§12.1, 2026-10-21).
 - **Phase 1 landed (server only)** on `identity/phase1-server`: pairing grants, register / retire / self-retire /
   leave, tombstones, per-grant limits, `last_seen_day`, grant pairing codes, "Revoke pairing" and the grouped console
   (DECISIONS §10, G54–G64). Additive: the current client still enrolls the old way and is unaffected.
-- Next: phase 2 (client grant pairing and a per-store identity), then 3 (predecessor recovery), 4 (removal of the
-  wall floor and `renumberBlind`), 5 (inactivity retirement, grant rotation).
+- **Phase 2 landed (client)** on `identity/phase2-client`: grant pairing (the client mints the grant secret,
+  data.json holds only the grant), the install record in `App.saveLocalStorage`, `yaos3:<vaultId>:<epoch>:<installKey>`
+  stores with their identity in `meta.identity` (minted and registered on store create), mirrors under
+  `state/<deviceId>/`, registration refusal statuses, legacy `yaos2:` DB and flat mirror cleanup. A clone is a new
+  device (sim `clone` and `syncedConfig` faults, matrix "3 devices, clone + synced config faults"). IDB loss takes the
+  "without mirrors" path until phase 3 (conflict copies where mirrors used to merge; two composed tests are `todo`).
+- **Abandoned creator** (found by the clone fault, sim seed 6 of the clone matrix before the fault learnt to avoid it):
+  a doc whose create committed and whose initial body did not, created by a store whose install is then abandoned
+  (a clone opened as a new vault over it, both web storages evicted), stays live on the relay with no body. Only the
+  creator's lineage uploads a lost initial body (`lostCreateBody`), so the other devices wait (`body-empty`) and their
+  own edits of that file do not sync. Before stores had identities, a device thrown away mid-create left the same
+  gap; phase 2 makes it reachable by a clone. The clone fault skips such windows (`FaultState.strandedCreate`). Fix
+  candidates: any holder of the file supplies the body once the creator is retired (phase 3 fence) or unseen.
+- Next: 3 (predecessor recovery), 4 (removal of the wall floor and `renumberBlind`, epoch-change minting), 5
+  (inactivity retirement, grant rotation).
 
 ### FRAMENO-IDB: frameNo collision after IndexedDB loss
 

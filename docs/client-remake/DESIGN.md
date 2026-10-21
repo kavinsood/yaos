@@ -596,7 +596,8 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
 2. Writes `intent{epoch-migration}`.
 3. Reads the old DB's `synced` and `baseText` as **path-keyed bases**: the base text of every markdown doc and canvas
    with one (a canvas's is its merge text, §j.2). Blobs have none. Old docIds are meaningless in the new epoch.
-4. Creates the new DB `yaos2:<vaultId>:<newEpoch>:<deviceId>` and onboards against the new epoch as in §j.5. Path-keyed
+4. Creates the new DB `yaos3:<vaultId>:<newEpoch>:<installKey>` (same store identity until phase 4 of
+   identity-per-store mints one per epoch) and onboards against the new epoch as in §j.5. Path-keyed
    bases turn the "no-base" merges into 3-way merges where the paths match, for markdown and canvases alike:
    - **No synced record.** A doc with no synced record merges against the base at its path.
    - **Migrated loser.** Every device re-creates its files, so a device's own create can lose the path race (§c.13
@@ -1420,7 +1421,22 @@ The planner does no destructive work until ns is caught up (§f.2).
 
 ## e. IndexedDB schema and transactions
 
-One database per `(vaultId, vaultEpoch, deviceId)`: `dbName()` gives `yaos2:<vaultId>:<vaultEpoch>:<deviceId>`.
+One database per `(vaultId, vaultEpoch, installKey)`: `dbName()` gives `yaos3:<vaultId>:<vaultEpoch>:<installKey>`
+(identity-per-store §2). The install key is per vault registration (the install record in `App.saveLocalStorage`,
+`src/host/installRecord.ts`), so two vaults of one machine, which share one IndexedDB origin, never share a store.
+
+**Store identity** (identity-per-store §2, §4: one deviceId per store, ever). `meta.identity` holds the store's
+`deviceId`, its device token and its retire key (SECRET). The engine's `self` is the store's id, never data.json's:
+data.json holds only the pairing grant (`relay.grantSecret`). With no store, the composed engine mints the next
+store's identity (16-byte id, 32-byte token and retire key), registers it under the grant (`POST /vault/:id/auth/device`,
+`Authorization: Grant`; relay-wire §2.4.1) and keeps it in a pending DB `yaos3-pending:<vaultId>:<installKey>` until
+the store exists: LogEngine deletes the pending DB right before it creates the store, so a pending identity serves at
+most one store (`src/engine/compose/storeIdentity.ts`). Refusals: `device_exists` / `device_retired` mint again (3 a
+start); `grant_revoked`, unknown grant, `grant_required` and no grant stop the start (phase `revoked`, re-pair); the
+20-a-day limit waits out its Retry-After (00:00 UTC); the 50-device limit is phase `error` with a notice and retries.
+The install record keeps the lineage (the current store and up to 8 before it), which the engine uses for
+`lostCreateBody` (§i.5). On start the client deletes the identity-less `yaos2:<vaultId>:*` DBs (§13 of
+identity-per-store).
 
 IDB is a **rebuildable cache**: everything can be rebuilt from relay + disk + side files (§i.5). The engine opens it
 through `StoragePort`. The same semantics hold for the in-memory simulation implementation, including "a crash keeps
@@ -1505,8 +1521,11 @@ Rules:
 
 ### e.4 Side files
 
-Side files live in `<configDir>/plugins/yaos/state/` (`SideFilePort`). The host reads them at startup and passes them
-in `EngineInitConfig.sideState`. The engine asks for writes with `sideFileWrite`.
+Side files live in `<configDir>/plugins/yaos/state/<deviceId>/` (`SideFilePort`), one dir per store identity: a
+copied or synced vault folder carries other installs' dirs, and a store only ever reads, writes or removes its own
+(the adapter refuses other shapes and never lists or deletes a dir as a whole). The flat files of the old layout
+(`state/outbox-*.bin`, `state/synced-*.bin`) are deleted on start. The host reads the store's dir at startup and passes
+it in `EngineInitConfig.sideState`. The engine asks for writes with `sideFileWrite`.
 
 **Outbox mirror** (`outbox-a.bin` / `outbox-b.bin`, A/B by generation):
 
@@ -1537,6 +1556,8 @@ frameCount × {
   - a resent ns frame is deduped by the relay window or the fold ring instead of creating duplicate docs;
   - body frames would converge anyway.
 - **Reader.** Takes the valid file (magic, checksum, identity match) with the highest generation.
+- **Until phase 3 of identity-per-store** a new store (after an IDB loss) has a new identity and reads only its own
+  (empty) dir: the lost store's mirrors are left in place, not imported (§i.5 "Without mirrors").
 
 **Synced mirror** (`synced-a.bin` / `synced-b.bin`, written `SYNCED_MIRROR_DEBOUNCE_MS` (2 s,
 src/engine/compose/syncedMirror.ts:29) after the first change; a fixed delay, not reset by later changes):
@@ -2252,6 +2273,16 @@ Further caps:
 **Without mirrors**, recovery is the fresh-device onboarding path (§j.5): identical files are adopted and differing
 ones get conflict copies.
 
+**Identity per store (phase 2 of identity-per-store).** A lost store is gone with its identity: the next store mints a
+new one, and until predecessor recovery lands (phase 3: the successor fence, then importing the predecessor's mirrors
+from `state/<predecessor>/`) every IDB loss takes the "without mirrors" path. Nothing is lost: an unsent edit is on
+disk and differs from the relay, so it gets a conflict copy (or merges, where the relay never had the file). Unsent
+deletes, renames and canvas reorders of the lost store are gone with it. One recovery is already lineage-aware: a live
+doc whose initial body was lost with an earlier store of this install (`createdBy` in the install record's lineage) is
+`lostCreateBody`, so the next store uploads it from disk. A doc whose creator's whole install is gone (a clone opened
+as a new vault, both web storages evicted) before its initial body committed has no one to supply it: a known gap
+(BACKLOG "abandoned creator").
+
 **`rebuildLocalCache`:** flush the outbox to the mirror, close and delete the DB, then run the same procedure.
 
 **`StorageFailure: quota`:** §e.3.
@@ -2667,8 +2698,10 @@ hashing and verification run in the worker (`src/core/snap/*`, `src/engine/snaps
 
 ### j.5 Onboarding and import
 
-- **Pairing** (UI out of scope; port the legacy provisioning client) yields `vaultId`, `deviceId` and a credential
-  (secret, kept in plugin data).
+- **Pairing** yields `vaultId`, the host and a pairing grant (identity-per-store §3): the client mints the grant secret,
+  sends it with the pairing code (`POST /enroll {pairingCode, enrollmentRequestId, grantSecret, grantName}`) and keeps
+  it in data.json. No device identity comes from pairing: each store mints and registers its own (§e). Pairing codes
+  for another device are minted with `Authorization: Grant <secret>`.
 - **First engine start against a vault:**
   1. ns catch-up (§j.6);
   2. full scan;

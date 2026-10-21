@@ -587,6 +587,18 @@ the same exposure. The relay cannot tell that from a reconnect overlap. This is 
    - IDB loss falls back to "without mirrors" onboarding.
    - Lands with the clone engine tests and the sim `clone` fault green. The floor and `renumberBlind` are still present
      but inert.
+   - **Landed** on `identity/phase2-client`. Deviations:
+     - The minted identity waits in a pending DB `yaos3-pending:<vaultId>:<installKey>` until its store is created
+       (the store's name needs the epoch, which only a connect as that identity learns); LogEngine drops it right
+       before creating the store, so it serves at most one store. A restart before then reuses it.
+     - Lineage-aware `lostCreateBody` (a phase-3 item) landed here: without it a doc created by an earlier store of the
+       install, whose body was lost with that store, stayed stuck (fault-heavy sim seed 17, `idbWipe` without mirrors).
+     - The other phase-3 recovery (fence, mirror import) is not built: every IDB loss is "without mirrors". The sim
+       oracle counts every `idbWipe` / `idbLost` as one (the composed mirror-recovery tests are `todo` with phase-2
+       variants asserting the conflict copy).
+     - Not built: epoch-change minting (phase 4: an epoch migration keeps the store identity), the revoked store's
+       successor (phase 3), the §8 per-install data.json split (phase 4). A re-pair to the same vault keeps the store.
+     - Found: the "abandoned creator" gap (BACKLOG CLONED-ID).
 3. **Predecessor recovery.** Fence, inherited records, commit check, re-issue, synced mirror import, snapshot move,
    lineage-aware `lostCreateBody`. Seed 222's plan and the `idbWipe` sim with mirrors green.
 4. **Removal.** Delete the wall floor, the skip, `renumberBlind`, `frameNoFloor` and the earlier-store branches.
