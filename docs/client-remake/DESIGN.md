@@ -896,11 +896,15 @@ cold ──load──▶ resident ──bind──▶ bound
   - For `renamed`, `merged` and `frozen`, the host re-opens the doc. `frozen` binds read-only.
   - For `resync`, every view of the doc re-binds: upload, then `bodyAttach` with the mirror's durable text as the
     base.
-  - Every pass end, a bound doc whose views show another file than its synced path gets `renamed`
-    (`retargetStrayViews`, `vaultRuntime.ts`). A bound doc's merge never writes its file, and a save only reaches the
-    views' file, so the doc's own file would wait for good. Views on a file another doc is synced at re-open at once.
-    Otherwise it waits for the next pass end, because a user rename of an open note moves the views one pass before
-    the doc.
+  - A bound doc whose views show another file than its synced path gets `renamed{stray}` (`retargetStrayViews`,
+    `vaultRuntime.ts`). A bound doc's merge never writes its file, and a save only reaches the views' file, so the
+    doc's own file would wait for good. Views on a file another doc is synced at re-open at once, at a pass end or
+    right after the vault rename that moved them. Otherwise they re-open at the second pass end that sees the same
+    pair, because a user rename of an open note moves the views one pass before the doc.
+  - On `stray` the host holds the views' saves until they bind again or stay unbound. A save meanwhile would write
+    the old doc's text over the file. The bind merges against the old doc's text (its mirror), so the file's doc
+    keeps its content, and edits not yet pushed apply on top or go to a conflict copy. With the file's doc's own
+    base, the editor read as an edit replacing that doc's text.
 - **Engine death** (§g.4): the runtime stops, and `stop` flushes and unbinds every view; the edits stay in the
   editors. The user's restart is a new runtime, which binds every view as at a first open. Text the dead engine took
   but never committed is still in the editor: the bind merge brings it back, or keeps the editor side as a conflict

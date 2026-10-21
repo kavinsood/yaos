@@ -372,3 +372,28 @@ test("binding: a view waiting on a path re-opens at the new path when the file i
 	assert.equal(v.path, "new.md");
 	assert.equal(bm.slotState(v.viewId), "bound");
 });
+
+test("binding: a stray retarget holds the view's saves until it binds the file's doc, merging against the old doc's text", async () => {
+	// The engine found the views of x.md's doc showing z.md, another doc's file (vaultRuntime retargetStrayViews).
+	const s = setup();
+	const { clock, ws, engine, bm, vault } = s;
+	const x = file(s, "x.md", "one\ntwo\nx\n");
+	file(s, "z.md", "one\ntwo\nz\n");
+	bm.start();
+	const v = ws.openFile("x.md");
+	assert.ok(v);
+	await clock.advance(5);
+	assert.equal(bm.slotState(v.viewId), "bound");
+	v.path = "z.md";
+	engine.delay = () => 400; // the re-open is slow: a save meanwhile must not write x's text over z.md
+	bm.onDocRetarget(x, { t: "renamed", path: "z.md" as never, stray: true });
+	v.edit(0, 3, "ONE"); // typed since the retarget, on a line both docs share
+	await v.save();
+	assert.equal(vault.textOf("z.md"), "one\ntwo\nz\n", "held");
+	await clock.advance(5_000);
+	assert.equal(bm.slotState(v.viewId), "bound");
+	assert.equal(engine.text("z.md"), "ONE\ntwo\nz\n", "z's text, plus the edit typed since");
+	assert.equal(v.getText(), "ONE\ntwo\nz\n");
+	assert.equal(vault.textOf("z.md"), "ONE\ntwo\nz\n", "the held save ran once bound");
+	assert.equal(engine.text("x.md"), "one\ntwo\nx\n");
+});

@@ -69,6 +69,10 @@ interface ViewSlot {
 	reload: number;
 	reloadText: string | null;
 	reloadChain: Promise<void>;
+	/** Saves held since a stray retarget, until the view binds again or stays unbound (releaseStray). */
+	heldStray: boolean;
+	/** Merge base of the next bind after a stray retarget: the old doc's text (onDocRetarget). */
+	carryBase: Text | null;
 }
 
 export interface BindingStats {
@@ -247,15 +251,34 @@ export class BindingManager {
 		s.client.bound(c);
 		if ([...doc.slots].every((o) => o.state === "bound")) this.bases.delete(doc.docId);
 		this.flushSlot(s);
+		this.releaseStray(s);
 	}
 
-	onDocRetarget(docId: DocId, change: { readonly t: "renamed"; readonly path: VaultPath } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" }): void {
+	/** End a stray retarget's save hold (the view bound again, or stays unbound); a skipped save runs now. */
+	private releaseStray(slot: ViewSlot): void {
+		slot.carryBase = null;
+		if (!slot.heldStray) return;
+		slot.heldStray = false;
+		if (slot.view.holdSaves(false)) void slot.view.save().catch(() => undefined);
+	}
+
+	onDocRetarget(docId: DocId, change: { readonly t: "renamed"; readonly path: VaultPath; readonly stray?: true } | { readonly t: "merged"; readonly into: DocId } | { readonly t: "frozen"; readonly reason: string } | { readonly t: "resync" }): void {
 		const doc = this.docs.get(docId);
 		if (!doc) return;
 		// resync: the worker dropped events (main fell behind its window); the mirror is behind but consistent.
 		if (change.t === "resync") return this.resync(doc, doc.mirror?.text ?? null);
+		// Stray (the views show another doc's file): the editor holds this doc's text, all of it in the replica
+		// but edits not pushed yet. Its saves are held until it binds again (a save meanwhile wrote this doc's text
+		// over the file), and that bind merges against this doc's text: the file's doc keeps its content, the
+		// unpushed edits apply on top. Bound with no base, the editor read as an edit replacing the file's text.
+		const carry = change.t === "renamed" && change.stray ? doc.mirror?.text ?? null : null;
 		for (const slot of [...doc.slots]) {
 			this.unbindSlot(slot);
+			if (change.t === "renamed" && change.stray) {
+				if (!slot.heldStray) slot.view.holdSaves(true);
+				slot.heldStray = true;
+				slot.carryBase = carry;
+			}
 			void this.open(slot);
 		}
 	}
@@ -321,6 +344,7 @@ export class BindingManager {
 		return {
 			viewId: view.viewId, view, seq: 0, state: "idle", doc: null, binding: null, client: null, unintercept: null,
 			attachDoc: null, attachId: 0, attachPosted: false, timer: null, lastLocalMono: -1, reload: 0, reloadText: null, reloadChain: Promise.resolve(),
+			heldStray: false, carryBase: null,
 		};
 	}
 
@@ -355,6 +379,7 @@ export class BindingManager {
 					this.slots.set(slot.viewId, slot);
 				} else this.unbindSlot(slot);
 				slot.reloadText = null; // another file now: its pending reload is moot
+				this.releaseStray(slot);
 				void this.open(slot);
 				return;
 			}
@@ -374,6 +399,7 @@ export class BindingManager {
 		const seq = ++slot.seq;
 		if (!this.running || path === null || kindOfPath(path) !== "markdown" || !view.hasEditor()) {
 			slot.state = "idle";
+			this.releaseStray(slot);
 			return;
 		}
 		slot.state = "opening";
@@ -437,7 +463,7 @@ export class BindingManager {
 		this.intercept(slot);
 		const editor = binding.doc();
 		slot.attachDoc = editor;
-		const base = this.bases.get(info.docId) ?? null;
+		const base = this.bases.get(info.docId) ?? slot.carryBase;
 		// Every bind of a dirty view says what is on disk: after an engine restart the engine has no disk text for
 		// the doc, and taking this editor's unsaved text for it would turn a sibling view's (older) disk text into
 		// an edit that reverts this one (sim seed 62).
@@ -527,6 +553,7 @@ export class BindingManager {
 		slot.unintercept?.();
 		slot.unintercept = null;
 		slot.state = state;
+		this.releaseStray(slot);
 	}
 
 	/**
