@@ -1355,8 +1355,10 @@ harness on the same afternoon, 3 runs each, then 4 more of each alternating (bas
   - So a fresh pairing over a `suite=0` link pays ~1-2 s for the retry and the restart. Holding `pinSuite0` in the
     engine until `k` is read, and applying the pin without a restart, would remove most of it.
 
-Open: why the engine is replaced once more right after the bootstrap ends (a second `yaos-engine` worker appears at
-the last file, every run).
+Not a second engine: earlier profile runs showed a second `yaos-engine` worker "at the last file". It was the same
+pin restart at +1.3 s, recorded late: the bench's blocking poll loop kept the DevTools socket from being read until
+the run ended (§7.3). With the loop yielding, the timeline above places it at the pin. One engine per vault runs
+after it.
 
 Raw logs (`experiments/logs/`): `client-e2e-phone-phone-base-20261021T094655Z.json` (perf-boot, 3 runs),
 `...T095007Z.json` (baseline, 3 runs), `...T095344Z` to `...T100231Z` (the alternating runs, one each), and the profile

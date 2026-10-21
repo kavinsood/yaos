@@ -37,12 +37,13 @@ Node harness does the same vault in ~2.7 s ([integration-notes](client-remake/in
 **Next:**
 1. **`pinSuite0` without the retry and the restart:** the engine holds the command until `k` is read; the pin applies
    without a restart. ~1-2 s of every `suite=0` pairing.
-2. **Why the engine is replaced again right after the bootstrap** (a second `yaos-engine` worker appears at the last
-   file, every run).
-3. **Fewer bridge calls per file needs Obsidian's side:** writing through the adapter would skip `create`'s `exists`
+2. **Fewer bridge calls per file needs Obsidian's side:** writing through the adapter would skip `create`'s `exists`
    (a quarter of the calls) but bypasses the vault's own bookkeeping; not without a design. File recovery's `read` is
    the user's plugin.
-4. **One transaction per catch-up batch** instead of three per file: hygiene; IndexedDB is not on the critical path.
+3. **One transaction per catch-up batch** instead of three per file: hygiene; IndexedDB is not on the critical path.
+
+(The "second engine at the last file" of earlier profile runs was this pin restart, recorded late by a blocked bench
+loop: integration-notes §7.4.)
 
 ## 2. Smaller open items
 
