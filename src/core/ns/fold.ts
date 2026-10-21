@@ -248,7 +248,7 @@ function prune(state: NsFoldState, index: NsFoldIndex, rules: NsFoldRules, seq: 
 		removed.push(e);
 		state.entries.delete(id);
 		index.tombstones--;
-		state.pruned.set(id, { state: e.state === "merged" ? "merged" : "deleted", deleteBaseBodySeq: e.deleteBaseBodySeq, prunedSeq: seq });
+		if (e.state === "deleted") state.pruned.set(id, { deleteBaseBodySeq: e.deleteBaseBodySeq, prunedSeq: seq });
 	};
 	for (const e of dead) {
 		if (index.tombstones <= goal) break;

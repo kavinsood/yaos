@@ -234,17 +234,17 @@ export interface NsFoldState {
 	readonly recentFrames: Map<DeviceId, ClientFrameId[]>;
 	/** frameNo anti-replay window per device (e2ee-design §8.2). Values are immutable. */
 	readonly replay: Map<DeviceId, ReplayWindow>;
-	/** What the prune left of each removed entry, newest PRUNED_STUB_CAP (DESIGN §c.9 "Pruned docs"). */
+	/** What the prune left of each removed deleted entry, newest PRUNED_STUB_CAP (DESIGN §c.9 "Pruned docs"). */
 	readonly pruned: Map<DocId, NsPrunedStub>;
 }
 
 /**
- * A pruned entry's stub (DESIGN §c.9 "Pruned docs"): enough for a reader that never folded the delete (it adopted a
- * checkpoint past the prune) to judge edit-beats-delete against the delete's base. Immutable.
+ * A pruned deleted entry's stub (DESIGN §c.9 "Pruned docs"): enough for a reader that never folded the delete (it
+ * adopted a checkpoint past the prune) to judge edit-beats-delete against the delete's base. Merged aliases leave
+ * none. Immutable.
  */
 export interface NsPrunedStub {
-	readonly state: "deleted" | "merged";
-	/** The delete's base (0 for merged). */
+	/** The delete's base. */
 	readonly deleteBaseBodySeq: Seq;
 	/** Seq of the frame whose fold pruned the entry (the stub cap drops the oldest first). */
 	readonly prunedSeq: Seq;

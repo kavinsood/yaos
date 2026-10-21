@@ -300,7 +300,7 @@ test("pruned docs (§c.9, core/ns/pruned): removedDeletes takes prune events and
 	// The duty: rows past the base (own, or anyone's: §c.7's fallback); a committed entry the optimistic view pruned
 	// decides itself; then the kept base; then the committed state's stub; nothing known: any row (re-create).
 	const rec = (lastOwnSeq: number, remoteHeadSeq: number) => ({ lastOwnSeq, remoteHeadSeq });
-	const stub = (state: "deleted" | "merged", base = 0) => ({ state, deleteBaseBodySeq: base, prunedSeq: 9 });
+	const stub = (base: number) => ({ deleteBaseBodySeq: base, prunedSeq: 9 });
 	assert.equal(prunedRestoreDuty(rec(5, 5), 5, undefined, undefined), false);
 	assert.equal(prunedRestoreDuty(rec(6, 6), 5, undefined, undefined), true);
 	assert.equal(prunedRestoreDuty(rec(0, 6), 5, undefined, undefined), true, "another device's (or an earlier store's) row past the base");
@@ -310,11 +310,9 @@ test("pruned docs (§c.9, core/ns/pruned): removedDeletes takes prune events and
 	assert.equal(prunedRestoreDuty(rec(7, 7), 3, entry("m", "merged"), undefined), true);
 	assert.equal(prunedRestoreDuty(rec(0, 7), 3, entry("m", "merged"), undefined), false);
 	// a reader that adopted a checkpoint past the delete and its prune: the stub's base
-	assert.equal(prunedRestoreDuty(rec(0, 7), undefined, undefined, stub("deleted", 6)), true, "a row past the stub's base");
-	assert.equal(prunedRestoreDuty(rec(0, 6), undefined, undefined, stub("deleted", 6)), false, "the delete covered every row");
-	assert.equal(prunedRestoreDuty(rec(0, 9), undefined, undefined, stub("merged")), false, "merged: own rows only");
-	assert.equal(prunedRestoreDuty(rec(1, 9), undefined, undefined, stub("merged")), true);
-	// the stub aged out: nothing known, any row re-creates (never a loss)
+	assert.equal(prunedRestoreDuty(rec(0, 7), undefined, undefined, stub(6)), true, "a row past the stub's base");
+	assert.equal(prunedRestoreDuty(rec(0, 6), undefined, undefined, stub(6)), false, "the delete covered every row");
+	// the stub aged out, or a merged alias was pruned: nothing known, any row re-creates (never a loss)
 	assert.equal(prunedRestoreDuty(rec(0, 9), undefined, undefined, undefined), true);
 	assert.equal(prunedRestoreDuty(rec(0, 0), undefined, undefined, undefined), false);
 });

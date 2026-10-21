@@ -13,8 +13,10 @@
  * device (ascending deviceId) varstring deviceId, varuint r, 8 bytes bitmap
  * (big-endian; bit i = frameNo r − i).
  *
- * Last come the pruned-entry stubs (DESIGN §c.9 "Pruned docs"; added in place): varuint count, then per stub
- * (ascending docId) varstring docId, u8 state (2 deleted, 3 merged), varuint deleteBaseBodySeq, varuint prunedSeq.
+ * Last come the pruned-delete stubs (DESIGN §c.9 "Pruned docs"; added in place): varuint count, then per stub, in
+ * ascending (prunedSeq, docId) order, varstring docId, varuint prunedSeq − the previous stub's (the first: itself),
+ * varuint zigzag(prunedSeq − deleteBaseBodySeq) (2d for d >= 0, -2d - 1 below: a frame's base is not checked against
+ * its seq). Both are small: ~21 bytes a stub after deflate, nearly all docId.
  */
 
 import type { ClientFrameId, DeviceId, DocId, NsEntry, NsEntryState, NsFoldState, NsPrunedStub, ReplayWindow } from "../types";
@@ -96,11 +98,13 @@ export function encodeNsFoldV1(state: NsFoldState): Uint8Array {
 	}
 	writeRings(w, state.recentFrames);
 	writeReplay(w, state.replay);
-	const stubs = sortedKeys(state.pruned);
+	const stubs = [...state.pruned].sort(([a, x], [b, y]) => x.prunedSeq - y.prunedSeq || compareCodeUnits(a, b));
 	w.varuint(stubs.length);
-	for (const id of stubs) {
-		const p = state.pruned.get(id)!;
-		w.varstring(id).u8(STATE_CODE[p.state]).varuint(p.deleteBaseBodySeq).varuint(p.prunedSeq);
+	let prev = 0;
+	for (const [id, p] of stubs) {
+		const d = p.prunedSeq - p.deleteBaseBodySeq;
+		w.varstring(id).varuint(p.prunedSeq - prev).varuint(d >= 0 ? 2 * d : -2 * d - 1);
+		prev = p.prunedSeq;
 	}
 	return w.finish();
 }
@@ -149,11 +153,15 @@ export function decodeNsFoldV1Strict(bytes: Uint8Array): NsFoldState {
 	const replay = readReplay(r);
 	const pruned = new Map<DocId, NsPrunedStub>();
 	const stubs = r.varuint();
+	let prev = 0;
 	for (let i = 0; i < stubs; i++) {
 		const docId = r.varstring() as DocId;
-		const state = STATE_BY_CODE.get(r.u8());
-		if (state !== "deleted" && state !== "merged") throw new CodecError("bad pruned stub state");
-		pruned.set(docId, { state, deleteBaseBodySeq: r.varuint(), prunedSeq: r.varuint() });
+		const prunedSeq = prev + r.varuint();
+		const z = r.varuint();
+		const base = prunedSeq - (z % 2 === 0 ? z / 2 : -(z + 1) / 2);
+		if (base < 0 || !Number.isSafeInteger(base)) throw new CodecError("pruned stub base out of range");
+		pruned.set(docId, { deleteBaseBodySeq: base, prunedSeq });
+		prev = prunedSeq;
 	}
 	r.end();
 	return { formatVersion: 1, foldRulesVersion, coversSeq, entries, recentFrames, replay, pruned };

@@ -195,12 +195,11 @@ deviceCount × (ascending deviceId)
   varuint n (1..64)
   n × varstring clientFrameId   oldest first
 (frameNo replay windows, e2ee-design §8.2)
-varuint stubCount             pruned-entry stubs (§c.9 "Pruned docs"), at most PRUNED_STUB_CAP
-stubCount × (ascending docId)
+varuint stubCount             pruned-delete stubs (§c.9 "Pruned docs"), at most PRUNED_STUB_CAP
+stubCount × (ascending (prunedSeq, docId))
   varstring docId
-  u8  state               2 deleted, 3 merged
-  varuint deleteBaseBodySeq  0 for merged
-  varuint prunedSeq       seq of the frame whose fold pruned the entry
+  varuint prunedSeq − previous stub's prunedSeq (first: prunedSeq)   prunedSeq: the frame whose fold pruned it
+  varuint zigzag(prunedSeq − deleteBaseBodySeq)                      2d if d >= 0, else −2d − 1
 ```
 
 `pathKey`, `byPathKey`, `folderRefs` and `tombstones` are derived (`NsFoldIndex`) and never encoded.
@@ -526,9 +525,14 @@ path (example E8).
   never dangle.
 - One frame-level event `pruned{docIds, entries}` is emitted; `entries` are the removed entries as they were (a
   deleted one keeps its `deleteBaseBodySeq` there, "Pruned docs" below).
-- Each removed entry leaves a **stub** in the state, `pruned[docId] = {state, deleteBaseBodySeq, prunedSeq}` (~30
-  bytes, encoded in `nsFoldV1`). When there are more than `PRUNED_STUB_CAP` (100000) stubs, the oldest by
-  `(prunedSeq, docId)` go. A stub is not an entry: ops on its docId stay `unknown-docid`.
+- Each removed deleted entry leaves a **stub** in the state, `pruned[docId] = {deleteBaseBodySeq, prunedSeq}`
+  (encoded in `nsFoldV1` with both seqs as small deltas: ~21 bytes deflated, nearly all the docId's entropy). Merged
+  aliases leave none. When there are more than `PRUNED_STUB_CAP` (20000) stubs, the oldest by `(prunedSeq, docId)`
+  go. A stub is not an entry: ops on its docId stay `unknown-docid`.
+  - Size: the cap keeps the stubs at <= 448 KiB of the 4 MiB checkpoint cap (§b.6). A 20000-note vault with
+    `TOMBSTONE_CAP` tombstones is 3.04 MiB deflated, 3.44 MiB with a full stub pool (`src/core/codec/folds.test.ts`
+    asserts <= 3.75 MiB). A 40000-note vault is over the cap without any stubs (OR-3).
+  - With `TOMBSTONE_CAP`, a device behind by up to ~40000 prunes still finds every base: in an entry or a stub.
 - Later ops on pruned docIds are `unknown-docid`.
 - The pruned docs' `b:`/`c:` streams are retired (§b.5, §d.9): the device whose frame pruned them puts the `retired`
   checkpoint, every device then drops their local records.
@@ -559,9 +563,10 @@ path (example E8).
     the fallback duty; it covers rows whose author is gone, e.g. own rows of an earlier store of this install after
     an IndexedDB loss, which are not `lastOwnSeq`), or own body frames still to send (`src/core/ns/pruned.ts`
     `prunedRestoreDuty`). The base comes from, first match: the committed entry (a doc only the optimistic view
-    pruned, an own pending frame's prune), the kept base, the stub. A merged one (entry or stub) has no base: own
-    rows only, all of them (the winner holds the rest). Nothing known (the stub aged out and this device never
-    folded the prune): any row is a duty, and the file is re-created;
+    pruned, an own pending frame's prune), the kept base, the stub. A committed merged entry has no base: own rows
+    only, all of them (the winner holds the rest). Nothing known (a pruned merged alias, whose only synced record is
+    its creator's, with its create's own rows; or a stub aged out and this device never folded the prune): any row is
+    a duty, and the file is re-created;
   - the planner's pruned row never trashes a file with a restore duty: it re-creates it under a fresh docId with
     the file's content (§f.2). The doc comes back as edit-beats-delete would have brought it back, under a new id.
     The file holds this device's rows only once it is synced at the replica's body version: the view hands the
@@ -573,13 +578,15 @@ path (example E8).
     rows re-creates from its file too. Every device with the duty re-creates: copies of the same text fold
     `merged` into the first (§c.5); a device whose file lacks rows it had not read yet makes a suffixed copy. The
     worst cases are such a copy and a resurrection (a merged alias's author whose file the winner does not own; a
-    doc a device knows nothing of: more than `PRUNED_STUB_CAP` entries pruned while it was away), never a loss.
+    doc a device knows nothing of: more than ~40000 deletes pruned while it was away), never a loss.
     The rule needs no author to come back: whoever holds the doc's synced record and its rows judges them against
     a base it always has (entry, kept base or stub) or, lacking all three, keeps the file.
   - Alternative: hold a deleted entry from pruning for some ns-seq horizon. Rejected: no horizon bounds an offline
     device, and the sim's goal-0 caps (every delete pruned in its own frame) need the device rule anyway.
-  - Alternative: keep stubs forever. Rejected: the state would grow with every delete for the vault's life; past
-    the stub cap the "nothing known" rule is never a loss, only a rare resurrection.
+  - Alternative: keep stubs forever, or 100000 of them. Rejected: the state would grow with every delete (100000
+    stubs are ~2 MiB, enough to push a 20000-note vault over the checkpoint cap); past the stub cap the "nothing
+    known" rule is never a loss, only a rare resurrection. Short docId fingerprints instead of docIds: rejected, a
+    collision would hand an unrelated doc a base.
 - Alternative: age-based pruning. Rejected: it needs wall clocks, which the fold never reads.
 
 ### c.10 Rules versioning (`upgradeRules`)

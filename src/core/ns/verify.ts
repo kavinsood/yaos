@@ -145,9 +145,7 @@ export function checkNsInvariants(state: NsFoldState, index?: NsFoldIndex, opts:
 	if (state.pruned.size > (opts.prunedCap ?? PRUNED_STUB_CAP)) return `pruned stubs ${state.pruned.size} > cap`;
 	for (const [id, p] of state.pruned) {
 		if (!isDocId(id)) return "pruned stub: invalid docId";
-		if (p.state !== "deleted" && p.state !== "merged") return `pruned stub ${id}: bad state`;
 		if (!isCount(p.deleteBaseBodySeq) || !isCount(p.prunedSeq)) return `pruned stub ${id}: bad integer`;
-		if (p.state === "merged" && p.deleteBaseBodySeq !== 0) return `pruned stub ${id}: merged with a delete base`;
 		if (p.prunedSeq < 1 || p.prunedSeq > state.coversSeq) return `pruned stub ${id}: prunedSeq out of range`;
 	}
 	if (index) {

@@ -39,18 +39,19 @@ export interface PrunedStreamInfo {
  *    is no duty (the prune is this device's own pending delete's), a deleted one gives its base, a merged one none;
  *  - `kept`, the delete base kept when this device's fold removed the entry (NsRuntime.removedDeletes,
  *    StreamRecord.prunedDeleteBase);
- *  - `stub`, the committed state's stub of the pruned entry (NsFoldState.pruned): a deleted one gives its base, a
- *    merged one none. It reaches a reader that adopted an ns checkpoint past the delete and its prune;
- *  - nothing (the stub aged out of PRUNED_STUB_CAP): any row is a duty. The file is re-created: a resurrection at
- *    worst, never a loss.
- * Merged (no base): own rows only, all of them; the merge's winner holds the rest.
+ *  - `stub`, the committed state's stub of the pruned deleted entry (NsFoldState.pruned): its base. It reaches a
+ *    reader that adopted an ns checkpoint past the delete and its prune;
+ *  - nothing (a merged alias pruned, a stub aged out of PRUNED_STUB_CAP): any row is a duty. The file is
+ *    re-created: a resurrection at worst, never a loss. (Only a merged alias's creator holds a synced record of it,
+ *    and its create's rows are its own: it re-created under the old rule too.)
+ * A committed merged entry (no base): own rows only, all of them; the merge's winner holds the rest.
  */
 export function prunedRestoreDuty(rec: PrunedStreamInfo, kept: Seq | undefined, entry: NsEntry | undefined, stub: NsPrunedStub | undefined): boolean {
 	if (entry !== undefined && entry.state === "live") return false;
 	const known: { readonly merged: boolean; readonly base: Seq } | null = entry !== undefined
 		? { merged: entry.state === "merged", base: entry.deleteBaseBodySeq }
 		: kept !== undefined ? { merged: false, base: kept }
-		: stub !== undefined ? { merged: stub.state === "merged", base: stub.deleteBaseBodySeq }
+		: stub !== undefined ? { merged: false, base: stub.deleteBaseBodySeq }
 		: null;
 	if (known === null) return rec.lastOwnSeq > 0 || rec.remoteHeadSeq > 0;
 	if (known.merged) return rec.lastOwnSeq > 0;
