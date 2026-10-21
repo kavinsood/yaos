@@ -19,7 +19,7 @@
 import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
 import { generateUserAction, runUserAction, tokensIn, CLEANUP_OPS, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, STORM_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
-import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
+import { FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
 import { activity, checkBlobLiveness, checkCanvas, checkIdentity, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, checkBounds, checkFoldDeterminism, checkOutboxAndCursor, checkRetired, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
 import { BrakeUser, type BrakeUserStats } from "./brakeUser";
 import type { Budgets } from "../core/limits";

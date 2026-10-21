@@ -407,7 +407,7 @@ export class SimRelay implements RelayPort {
 	/** Arms a one-shot targeted drop of `deviceId`'s socket at `point` of the frame flow (DropPoint); `then` runs after it. */
 	armDrop(deviceId: DeviceId, point: DropPoint, then: (() => void) | null = null): void {
 		let set = this.engine.dropTaps.get(deviceId);
-		if (!set) this.engine.dropTaps.set(deviceId, (set = new Map()));
+		if (!set) this.engine.dropTaps.set(deviceId, (set = new Map<DropPoint, (() => void) | null>()));
 		set.set(point, then);
 	}
 

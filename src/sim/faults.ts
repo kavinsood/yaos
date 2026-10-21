@@ -830,8 +830,10 @@ export class FaultState {
 		this.held.clear();
 		for (const i of [...this.down]) this.restart(i);
 		for (const i of [...this.armed]) {
-			this.devs[i]?.storage.setCommitHook(null);
-			if (this.devs[i]) this.devs[i]!.vault.afterWrite = null;
+			const d = this.devs[i];
+			if (!d) continue;
+			d.storage.setCommitHook(null);
+			d.vault.afterWrite = null;
 		}
 		this.armed.clear();
 		this.healHttp();
