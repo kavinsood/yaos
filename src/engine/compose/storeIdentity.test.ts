@@ -175,6 +175,21 @@ test("a store without a usable identity (no token: not a grant install's) is del
 	assert.equal(found.epoch, undefined, "two epochs: connect first");
 });
 
+test("an epoch change's two stores: the new one names the old (supersedes) and wins whatever the wall clock said", async () => {
+	// Sim seed 602 (3 devices, faults): the new epoch's store was created under a -42 h clock skew; the newest by
+	// createdAtMs was the old, already retired store, and every start after failed unauthorized.
+	const storage = new MemStoragePort();
+	const old = { deviceId: "dev-old-000000000000" as DeviceId, deviceToken: "t".repeat(43), retireKey: "r".repeat(43) };
+	const nu = { deviceId: "dev-new-000000000000" as DeviceId, deviceToken: "u".repeat(43), retireKey: "s".repeat(43) };
+	await createStore(storage, "install-key-00000001", old, 5_000);
+	const db = await storage.open<YS>(dbName(VAULT, "epoch-2" as VaultEpoch, "install-key-00000001"), DB_SCHEMA_VERSION, STORE_SPECS);
+	await db.tx([STORE.meta], "readwrite", async (tx) => tx.put(STORE.meta, { key: "identity", vaultId: VAULT, vaultEpoch: "epoch-2" as VaultEpoch, ...nu, schemaVersion: DB_SCHEMA_VERSION, clientVersion: "t", createdAtMs: 1, recoveredFromMirror: false, supersedes: [old.deviceId] }));
+	db.close();
+	const found = await resolveStoreIdentity(deps(storage, server()));
+	assert.deepEqual(found.creds, nu);
+	assert.equal(found.epoch, undefined, "two epochs: connect first");
+});
+
 test("legacy cleanup: the identity-less yaos2:<vaultId>:* stores of this vault are deleted, nothing else", async () => {
 	const storage = new MemStoragePort();
 	const names = [`${LEGACY_DB_NAME_PREFIX}:${VAULT}:e1`, `${LEGACY_DB_NAME_PREFIX}:${VAULT}:e2`, `${LEGACY_DB_NAME_PREFIX}:other-vault:e1`, dbName(VAULT, EPOCH, "k")];

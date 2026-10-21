@@ -202,6 +202,7 @@ export class VaultRuntime {
 			},
 			...(o.identity.lineage ? { lineage: o.identity.lineage } : {}),
 			inherit: o.identity.inherit ?? null,
+			supersedes: o.identity.supersedes ?? null,
 			lineageSideFiles: (deviceId) => engine.link.sideFilesOf(deviceId),
 			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,

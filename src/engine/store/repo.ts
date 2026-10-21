@@ -205,6 +205,8 @@ export class Repo {
 			pathBases?: readonly MetaPathBase[] | null; docDeletes?: readonly MetaDocDeletes[] | null;
 			/** A new store's predecessor recovery (MetaIdentity.inherit): recorded only when the DB is created. */
 			inherit?: MetaInherit | null;
+			/** The stores a new store replaces (MetaIdentity.supersedes): recorded only when the DB is created. */
+			supersedes?: readonly DeviceId[] | null;
 		} = {},
 	): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
 		const db = await storage.open<YS>(dbName(id.vaultId, id.vaultEpoch, id.storeKey ?? id.deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
@@ -227,6 +229,7 @@ export class Repo {
 				schemaVersion: DB_SCHEMA_VERSION,
 				clientVersion: id.clientVersion, createdAtMs: nowMs, recoveredFromMirror: opts.recoveredFromMirror ?? false,
 				...(opts.inherit && opts.inherit.dirs.length > 0 ? { inherit: opts.inherit } : {}),
+				...(opts.supersedes && opts.supersedes.length > 0 ? { supersedes: [...opts.supersedes] } : {}),
 			};
 			const cursor: MetaCursor = { key: "cursor", vaultSeq: 0, headSeqSeen: 0 };
 			tx.put(STORE.meta, fresh);

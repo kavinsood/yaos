@@ -55,6 +55,8 @@ export interface ResolvedIdentity {
 	 * newest first, and whether the newest store was fenced. null: a store already exists, or the install has none.
 	 */
 	readonly inherit?: MetaInherit | null;
+	/** An epoch mint's: the other epochs' stores the new one replaces (MetaIdentity.supersedes). */
+	readonly supersedes?: readonly DeviceId[];
 }
 
 /** `yaos3-pending:<vaultId>:<installKey>`. */
@@ -147,11 +149,17 @@ const MAX_MINTS = 3;
  */
 export async function resolveStoreIdentity(d: ResolveDeps): Promise<ResolvedIdentity> {
 	const dbs = await storeDbs(d.storage, d.vaultId, d.installKey);
-	let found: MetaIdentity | null = null;
+	const ids: MetaIdentity[] = [];
 	for (const db of dbs) {
 		const id = await readStoreIdentity(d.storage, db.name);
-		if (id && (!found || id.createdAtMs > found.createdAtMs)) found = id;
+		if (id) ids.push(id);
 	}
+	// Two stores only during an epoch change (the old epoch's until the new one is live and retires it): the new one
+	// names the old (MetaIdentity.supersedes), which may be retired already. Without that link (not written by this
+	// client) the newest by createdAtMs, a last resort only.
+	const replaced = new Set(ids.flatMap((i) => i.supersedes ?? []));
+	let found: MetaIdentity | null = null;
+	for (const id of ids.filter((i) => !replaced.has(i.deviceId))) if (!found || id.createdAtMs > found.createdAtMs) found = id;
 	if (found && found.deviceToken !== undefined && found.retireKey !== undefined) {
 		// A pending identity left by a crash between its consumption and the store's first commit cannot exist (it
 		// is deleted first); one minted while a store existed cannot either. Dropped all the same: never two stores.

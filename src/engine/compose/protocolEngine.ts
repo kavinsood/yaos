@@ -27,7 +27,7 @@ import { pathKey } from "../../core/paths/pathKey";
 import type { EnginePorts } from "../../ports";
 import type { BlobPort } from "../../ports/blob";
 import { findKnownEpoch, storeDbs, storedKeyringRecords } from "./knownEpoch";
-import { deleteLegacyDbs, deleteStoreDbs, IdentityRefused, needsRepair, registerPending, resolveStoreIdentity, type ResolvedIdentity } from "./storeIdentity";
+import { deleteLegacyDbs, deleteStoreDbs, IdentityRefused, needsRepair, readStoreIdentity, registerPending, resolveStoreIdentity, type ResolvedIdentity } from "./storeIdentity";
 import type { IdentityPort, RegisterRefusal, StoreCredentials } from "../../ports/identity";
 import { isStorageError } from "../../ports/storage";
 import type { VaultEvent } from "../../ports/vault";
@@ -363,10 +363,18 @@ export class ComposedEngine {
 		// store stays until the new one is live, which then retires it (runtimeOps.retireOldEpochs). Once that store
 		// exists (a start that created it failed later), it is found like any store.
 		const epoch = this.knownEpoch;
-		const epochMint = this.mintForEpoch && !(await storeDbs(ports.storage, config.vaultId, config.installKey)).some((d) => d.vaultEpoch === epoch);
-		const id: ResolvedIdentity = epochMint
-			? { creds: await registerPending(deps), source: "pending", epoch: undefined }
-			: await resolveStoreIdentity(deps);
+		const dbs = this.mintForEpoch ? await storeDbs(ports.storage, config.vaultId, config.installKey) : [];
+		const epochMint = this.mintForEpoch && !dbs.some((d) => d.vaultEpoch === epoch);
+		let id: ResolvedIdentity;
+		if (epochMint) {
+			// The new store names the ones it replaces: a start that finds both opens it, not the old (retired) one.
+			const supersedes: DeviceId[] = [];
+			for (const d of dbs) {
+				const old = await readStoreIdentity(ports.storage, d.name).catch(() => null);
+				if (old) supersedes.push(old.deviceId);
+			}
+			id = { creds: await registerPending(deps), source: "pending", epoch: undefined, supersedes };
+		} else id = await resolveStoreIdentity(deps);
 		port.use(id.creds.deviceToken);
 		this.link.sideDir = id.creds.deviceId;
 		// The install's earlier stores: every store this worker ran on before (a store reset or loss mints without a

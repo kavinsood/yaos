@@ -180,6 +180,8 @@ export interface EngineOptions {
 	 * import committed); ignored for a store that already exists.
 	 */
 	readonly inherit?: MetaInherit | null;
+	/** The stores a store this start creates replaces (MetaIdentity.supersedes); ignored for one that exists. */
+	readonly supersedes?: readonly DeviceId[] | null;
 	/** A lineage store's side files, `state/<deviceId>/` (recovery reads them; VaultRuntime removes them once replaced). */
 	readonly lineageSideFiles?: (deviceId: DeviceId) => SideFilePort;
 	/**

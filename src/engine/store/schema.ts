@@ -72,6 +72,13 @@ export interface MetaIdentity {
 	 * imports anything (a late import would replay old intents over newer changes).
 	 */
 	readonly inherit?: MetaInherit | null;
+	/**
+	 * The stores this one replaces (identity-per-store §4 "vaultEpoch change"): an epoch change creates the new
+	 * epoch's store under a new identity while the old epoch's store stays until the new one is live and retires it.
+	 * A start that finds both opens the one no other names here (storeIdentity.resolveStoreIdentity), never by the
+	 * wall clock (createdAtMs is diagnostics only, ports/clock.ts).
+	 */
+	readonly supersedes?: readonly DeviceId[];
 }
 
 /** The lineage stores to recover from, newest first (identity-per-store §5.2), and whether the newest was fenced. */

@@ -601,7 +601,8 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
    connect that names the new epoch ends that start (`StoreEpochError`), and the composed engine mints and registers
    the new identity with the grant and starts again on the new epoch. Nothing is fenced or inherited from the old store
    (its outbox goes with step 5, its mirrors are of the old epoch); its local snapshots, the step 1 one among them, move
-   into the new store's dir. It then onboards against the new epoch as in §j.5. Path-keyed
+   into the new store's dir. The new identity names the old store (`MetaIdentity.supersedes`): a start that finds both
+   DBs opens the new one, never by creation time (a wall-clock value). It then onboards against the new epoch as in §j.5. Path-keyed
    bases turn the "no-base" merges into 3-way merges where the paths match, for markdown and canvases alike:
    - **No synced record.** A doc with no synced record merges against the base at its path.
    - **Migrated loser.** Every device re-creates its files, so a device's own create can lose the path race (§c.13

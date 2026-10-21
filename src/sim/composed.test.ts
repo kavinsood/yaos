@@ -472,6 +472,7 @@ test("relay epoch reset (§c.12): both devices migrate, re-upload, and keep sync
 		assert.notEqual(now, before[i], `${d.name}: a new identity for the new epoch`);
 		assert.equal(net.identities.state(now), "live");
 		assert.equal(net.identities.state(before[i]!), "retired", `${d.name}: the old epoch's store retired`);
+		assert.deepEqual(d.vrt!.log.c.repo.identity.supersedes, [before[i]], `${d.name}: the new store names the one it replaces`);
 	});
 	for (const d of devs) assert.deepEqual((await d.storage.listDatabases()).filter((n) => n.startsWith("yaos3:")).map((n) => n.split(":")[2]), ["sim-epoch-2"], `${d.name}: only the new epoch's store`);
 });

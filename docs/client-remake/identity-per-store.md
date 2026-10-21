@@ -660,6 +660,13 @@ the same exposure. The relay cannot tell that from a reconnect overlap. This is 
        its files are removed after. At live, `retireOldEpochs` retires each other-epoch DB's identity by its retire key
        (the self-retire) and deletes the DB; a retire without an answer keeps the DB until the next live. Sim test:
        both devices of an epoch reset run as new devices, the old ids read retired, one `yaos3:` DB each.
+     - **Two stores at once** (the old epoch's until the new one is live and retires it, or a crash between the
+       retire and the delete): the new store's identity names the ones it replaces (`MetaIdentity.supersedes`, written
+       when the DB is created), and `resolveStoreIdentity` never picks a superseded store. It used to take the newest
+       `createdAtMs`, a wall-clock value: the 1000-seed sweep found a device whose new store was created under a -42 h
+       clock skew pick the old, already retired store and fail every start `unauthorized` (seed 602; plan in
+       `src/sim/regressions/epoch-mint-skewed-store-pick.json`). `createdAtMs` is now only a last resort among stores
+       with no link.
      - **§8 split:** `deviceLabel`, `showStatusBar`, `pendingEnrollment` and `creating` live in a per-install record
        (`App.saveLocalStorage("yaos-local")`, `src/host/localSettings.ts`); data.json holds `version`, the grant, the
        engine settings and the suite pin. The label and status bar flag move once from an older data.json; an older
