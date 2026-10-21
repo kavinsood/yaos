@@ -1,9 +1,11 @@
 /**
  * Device profile for phoneBench.ts --profile. Attaches to Obsidian's WebView over the DevTools protocol (adb forward
- * to webview_devtools_remote_<pid>) and auto-attaches every worker. A new worker is held at start until its hooks are
- * in, so the engine's first message, transaction and socket are seen (the host's startup ping pings again for 75 s,
- * engineHost.ts STARTUP_PING_ATTEMPTS, so the hold cannot stop the plugin). Each thread's events are drained every
- * second and its CPU profile is cut every 5 s, so a worker that is terminated mid-run (an engine restart) keeps what
+ * to webview_devtools_remote_<pid>) and auto-attaches every worker, hooking each as soon as it is seen running. Not
+ * held at start: on Obsidian Android (WebView, 2026-10-21) the engine worker created at pairing, held with
+ * waitForDebuggerOnStart, never reached this client's attachedToTarget and stayed held (resuming it from a second
+ * client unstuck the run). Unheld, its first session dies at once and the worker runs on, so a detached worker is
+ * attached again by target id, and setAutoAttach is re-sent every second for any worker never announced. Each
+ * thread's events are drained every second and its CPU profile is cut every 5 s, so a worker that is terminated mid-run (an engine restart) keeps what
  * it recorded. Recorded per call, on the phone's clock (performance.timeOrigin + now(), shared by every thread):
  *  - every worker: IndexedDB transactions, creation -> complete / abort (`idb`); fetch and XMLHttpRequest, call ->
  *    body read, or -> headers when the body is streamed (`net`); WebSocket open, close, and each frame sent or
@@ -74,6 +76,16 @@ class Cdp {
 
 	close(): void {
 		this.ws.close();
+	}
+}
+
+/** Evaluates `expression` on the page once (own connection), returning its value. */
+export async function pageEvaluate(wsUrl: string, expression: string): Promise<unknown> {
+	const cdp = await Cdp.open(wsUrl);
+	try {
+		return await cdp.evaluate(expression);
+	} finally {
+		cdp.close();
 	}
 }
 
@@ -190,13 +202,14 @@ const WORKER_HOOK = `(() => {
 		globalThis.addEventListener("message", (e) => { const t = now(); T.ev.push(["in", tag(e.data), t, t, 0]); }, true);
 		n++;
 	}
-	return "worker: " + n + " hooks";
+	return "worker: " + n + " hooks" + (self.name ? " (" + self.name + ")" : "");
 })()`;
 
 const DRAIN = "(() => { const T = globalThis.__yb; return T ? JSON.stringify(T.ev.splice(0)) : \"[]\"; })()";
 const NOW = "performance.timeOrigin + performance.now()";
 const DRAIN_MS = 1000;
 const CHUNK_MS = 5000;
+const STEP_TIMEOUT_MS = 3000;
 
 /** [kind, name, startMs, endMs, failed, requestId?] on the phone's clock. */
 type Ev = [string, string, number, number, number, number?];
@@ -226,23 +239,28 @@ interface Thread {
 	readonly chunks: CpuChunk[];
 	startWallMs: number;
 	gone: number | null;
+	readonly targetId: string | null;
+	/** A drain or cut of this thread is running. */
+	busy: boolean;
+	/** Drains in a row that timed out. */
+	stalls: number;
 }
 
 /** A live DevTools attachment to the phone's Obsidian page and its workers. */
 export class PhoneProfile {
 	private readonly threads = new Map<string, Thread>();
+	private readonly targets = new Set<string>();
 	private nextWorker = 0;
 	private timer: ReturnType<typeof setInterval> | null = null;
 	private ticks = 0;
-	private busy = false;
 
 	private constructor(private readonly cdp: Cdp, private readonly log: (s: string) => void) {}
 
-	/** Hooks main and starts its CPU profile; auto-attaches every worker, holding new ones until hooked. */
+	/** Hooks main and starts its CPU profile; auto-attaches every worker, existing or new, and hooks it. */
 	static async attach(wsUrl: string, log: (s: string) => void): Promise<PhoneProfile> {
 		const cdp = await Cdp.open(wsUrl);
 		const p = new PhoneProfile(cdp, log);
-		const main: Thread = { name: "main", url: "page", sid: undefined, hook: String(await cdp.evaluate(MAIN_HOOK)), events: [], chunks: [], startWallMs: 0, gone: null };
+		const main: Thread = { name: "main", url: "page", sid: undefined, hook: String(await cdp.evaluate(MAIN_HOOK)), events: [], chunks: [], startWallMs: 0, gone: null, targetId: null, busy: false, stalls: 0 };
 		log(main.hook);
 		p.threads.set("main", main);
 		cdp.listeners.push((m) => {
@@ -250,32 +268,42 @@ export class PhoneProfile {
 				const t = p.threads.get(m.params.sessionId as string);
 				if (t && t.gone === null) {
 					t.gone = Date.now();
-					log(`${t.name} gone (${t.url.slice(0, 60)})`);
+					log(`${t.name} detached (${t.url.slice(0, 60)})`);
+				}
+				// A detach is not always the worker ending: the engine worker created at pairing loses its first session
+				// at once ("Session with given id not found") and keeps running. Attach again; a gone worker refuses.
+				const targetId = m.params.targetId as string | undefined;
+				if (targetId && p.targets.delete(targetId)) {
+					setTimeout(() => void cdp.send("Target.attachToTarget", { targetId, flatten: true }).catch(() => undefined), 200);
 				}
 				return;
 			}
 			if (m.method !== "Target.attachedToTarget" || !m.params) return;
 			const sid = m.params.sessionId as string;
-			const info = m.params.targetInfo as { type: string; url: string };
+			const info = m.params.targetInfo as { type: string; url: string; targetId: string };
 			const paused = m.params.waitingForDebugger === true;
 			if (info.type !== "worker") {
 				if (paused) void cdp.send("Runtime.runIfWaitingForDebugger", {}, sid).catch(() => undefined);
 				return;
 			}
-			const t: Thread = { name: `worker${p.nextWorker++}`, url: info.url, sid, hook: "", events: [], chunks: [], startWallMs: 0, gone: null };
+			if (p.targets.has(info.targetId)) return; // re-announced by the periodic setAutoAttach
+			p.targets.add(info.targetId);
+			// A re-attached worker keeps its name: its events are one thread's.
+			const before = [...p.threads.values()].find((x) => x.targetId === info.targetId);
+			const t: Thread = { name: before?.name ?? `worker${p.nextWorker++}`, url: info.url, sid, hook: "", events: [], chunks: [], startWallMs: 0, gone: null, targetId: info.targetId, busy: false, stalls: 0 };
 			p.threads.set(sid, t);
-			// Every round trip crosses adb: send the hook, the profiler, the clock read and the resume back to back
-			// (the target runs them in order), then await.
 			const held = Date.now();
+			// Every round trip crosses adb: send the profiler, the hook and the clock read back to back (the target runs
+			// them in order), then await. (A worker held at start, if one ever is, is resumed before the hook.)
 			const steps = [
-				cdp.evaluate(WORKER_HOOK, sid),
 				cdp.send("Profiler.enable", {}, sid),
 				cdp.send("Profiler.setSamplingInterval", { interval: 1000 }, sid),
 				cdp.send("Profiler.start", {}, sid),
+				...(paused ? [cdp.send("Runtime.runIfWaitingForDebugger", {}, sid)] : [Promise.resolve({})]),
+				cdp.evaluate(WORKER_HOOK, sid),
 				cdp.evaluate(NOW, sid),
-				...(paused ? [cdp.send("Runtime.runIfWaitingForDebugger", {}, sid)] : []),
 			];
-			void Promise.all(steps).then(([hook, , , , wall]) => {
+			void Promise.all(steps).then(([, , , , hook, wall]) => {
 				t.hook = String(hook);
 				t.startWallMs = Number(wall);
 				log(`${t.name}: ${t.hook} (${paused ? `new, held ${Date.now() - held} ms` : "running"}) ${info.url.slice(0, 60)}`);
@@ -285,18 +313,36 @@ export class PhoneProfile {
 		await cdp.send("Profiler.setSamplingInterval", { interval: 1000 });
 		await cdp.send("Profiler.start");
 		main.startWallMs = Number(await cdp.evaluate(NOW));
-		await cdp.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
-		p.timer = setInterval(() => void p.tick(), DRAIN_MS);
+		await cdp.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
+		p.timer = setInterval(() => p.tick(), DRAIN_MS);
 		return p;
+	}
+
+	/** `step` or a timeout: a worker session can stop answering without a detach (the engine worker at pairing). */
+	private timed<T>(step: Promise<T>): Promise<T> {
+		return Promise.race([step, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("no answer in 3 s")), STEP_TIMEOUT_MS))]);
 	}
 
 	private async drain(t: Thread): Promise<void> {
 		if (t.gone !== null) return;
 		try {
-			t.events.push(...(JSON.parse(String(await this.cdp.evaluate(DRAIN, t.sid))) as Ev[]));
+			t.events.push(...(JSON.parse(String(await this.timed(this.cdp.evaluate(DRAIN, t.sid)))) as Ev[]));
+			t.stalls = 0;
 		} catch (e) {
-			if (t.gone === null) this.log(`${t.name} drain failed: ${String(e)}`);
+			if (t.gone !== null) return;
+			this.log(`${t.name} drain failed: ${String(e)}`);
+			if (++t.stalls >= 2 && t.targetId) this.reattach(t);
 		}
+	}
+
+	/** Drops a thread's dead session and attaches its worker again (its hook buffer survives in the worker). */
+	private reattach(t: Thread): void {
+		const targetId = t.targetId;
+		if (!targetId) return;
+		t.gone = Date.now();
+		this.targets.delete(targetId);
+		this.log(`${t.name} not answering: attaching again`);
+		void this.cdp.send("Target.attachToTarget", { targetId, flatten: true }).catch((e: unknown) => this.log(`${t.name} re-attach failed: ${String(e)}`));
 	}
 
 	/** Ends the thread's current CPU chunk and, unless `last`, starts the next. */
@@ -305,7 +351,7 @@ export class PhoneProfile {
 		try {
 			const steps: Promise<unknown>[] = [this.cdp.send("Profiler.stop", {}, t.sid)];
 			if (!last) steps.push(this.cdp.send("Profiler.start", {}, t.sid), this.cdp.evaluate(NOW, t.sid));
-			const [stopped, , wall] = await Promise.all(steps);
+			const [stopped, , wall] = await this.timed(Promise.all(steps));
 			t.chunks.push({ profile: (stopped as { profile: CpuProfile }).profile, startWallMs: t.startWallMs });
 			if (!last) t.startWallMs = Number(wall);
 		} catch (e) {
@@ -313,17 +359,22 @@ export class PhoneProfile {
 		}
 	}
 
-	private async tick(): Promise<void> {
-		if (this.busy) return;
-		this.busy = true;
-		try {
-			const cut = ++this.ticks % (CHUNK_MS / DRAIN_MS) === 0;
-			await Promise.all([...this.threads.values()].map(async (t) => {
-				await this.drain(t);
-				if (cut) await this.cut(t, false);
-			}));
-		} finally {
-			this.busy = false;
+	/** Each thread on its own: one that stops answering holds up only itself. */
+	private tick(): void {
+		// A worker never announced (or whose session died) is attached by a fresh setAutoAttach.
+		void this.cdp.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }).catch(() => undefined);
+		const cut = ++this.ticks % (CHUNK_MS / DRAIN_MS) === 0;
+		for (const t of this.threads.values()) {
+			if (t.busy || t.gone !== null) continue;
+			t.busy = true;
+			void (async () => {
+				try {
+					await this.drain(t);
+					if (cut) await this.cut(t, false);
+				} finally {
+					t.busy = false;
+				}
+			})();
 		}
 	}
 
@@ -342,15 +393,22 @@ export class PhoneProfile {
 	/** Stops the drains, takes every thread's last events and CPU chunk. `offset`: phone minus laptop clock. */
 	async finish(offset: number): Promise<ThreadCapture[]> {
 		if (this.timer) clearInterval(this.timer);
-		while (this.busy) await new Promise((r) => setTimeout(r, 50));
-		const out: ThreadCapture[] = [];
+		const t0 = Date.now();
+		while ([...this.threads.values()].some((t) => t.busy) && Date.now() - t0 < 2 * STEP_TIMEOUT_MS) await new Promise((r) => setTimeout(r, 50));
+		const out = new Map<string, ThreadCapture & { events: Ev[]; chunks: CpuChunk[] }>();
 		for (const t of this.threads.values()) {
 			await this.drain(t);
 			await this.cut(t, true);
-			out.push({ thread: t.name, url: t.url, hook: t.hook, events: t.events, chunks: t.chunks, goneAtMs: t.gone === null ? null : t.gone + offset });
+			const goneAtMs = t.gone === null ? null : t.gone + offset;
+			const prev = out.get(t.name); // sessions of one re-attached worker
+			if (prev) {
+				prev.events.push(...t.events);
+				prev.chunks.push(...t.chunks);
+				out.set(t.name, { ...prev, hook: prev.hook || t.hook, goneAtMs });
+			} else out.set(t.name, { thread: t.name, url: t.url, hook: t.hook, events: [...t.events], chunks: [...t.chunks], goneAtMs });
 		}
 		this.cdp.close();
-		return out;
+		return [...out.values()];
 	}
 }
 
@@ -479,10 +537,10 @@ export function cpuInWindow(chunks: CpuChunk[], win: Iv | null = null, topN = 15
 }
 
 /**
- * The window's events in order, as "+ms thread kind name (duration)", relative to `win[0]`. Runs of one kind and name
+ * The window's events in order, as "+ms thread kind name (duration)", relative to `origin` (default `win[0]`). Runs of one kind and name
  * in a row on one thread fold into one line with a count (a burst of transactions, a stream of frames).
  */
-export function timeline(threads: ThreadCapture[], win: Iv, kinds: readonly string[] = ["in", "out", "wsopen", "wsclose", "wsout", "wsin", "net", "idb", "bridge"]): string[] {
+export function timeline(threads: ThreadCapture[], win: Iv, origin = win[0], kinds: readonly string[] = ["in", "out", "wsopen", "wsclose", "wsout", "wsin", "net", "idb", "bridge"]): string[] {
 	const evs = threads.flatMap((t) => t.events.filter((e) => kinds.includes(e[0]) && e[2] >= win[0] && e[2] < win[1]).map((e) => ({ t: t.thread, e })))
 		.sort((a, b) => a.e[2] - b.e[2]);
 	const out: string[] = [];
@@ -491,7 +549,8 @@ export function timeline(threads: ThreadCapture[], win: Iv, kinds: readonly stri
 		if (!run) return;
 		const { first, last, n, bytes } = run;
 		const span = n > 1 ? ` x${n} over ${r1(last[3] - first[2])} ms` : first[3] > first[2] ? ` ${r1(first[3] - first[2])} ms` : "";
-		out.push(`+${r1(first[2] - win[0])} ${run.key}${span}${bytes ? ` ${bytes} B` : ""}${first[4] ? " FAILED" : ""}`);
+		const at = r1(first[2] - origin);
+		out.push(`${at < 0 ? "" : "+"}${at} ${run.key}${span}${bytes ? ` ${bytes} B` : ""}${first[4] ? " FAILED" : ""}`);
 		run = null;
 	};
 	for (const { t, e } of evs) {

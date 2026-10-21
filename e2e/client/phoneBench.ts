@@ -3,8 +3,8 @@
  * shape), so the phone's numbers sit next to bootBench's fresh Node devices. Per run, on the phone's bench vault
  * folder: stop Obsidian, revoke the previous run's device, wipe the folder (everything but .obsidian, plus the
  * plugin's data.json), push the current build, reopen Obsidian on the vault, mint a pairing code and open the setup
- * link. The only manual steps are the Pair tap and, if the phone is locked, unlocking it: the bench wakes the screen
- * and keeps it on while on USB until it exits. Timed on the laptop, by polling the folder over adb: Pair (data.json
+ * link, then press its Pair button over DevTools (a tap on the phone if that fails). The only manual step is
+ * unlocking the phone if it is locked: the bench wakes the screen and keeps it on while on USB until it exits. Timed on the laptop, by polling the folder over adb: Pair (data.json
  * holds an identity) -> first file -> every seeded file. A new pairing is a new device id and the store is per device
  * (store/schema.ts: yaos2:<vault>:<epoch>:<device>), so every run bootstraps from an empty IndexedDB.
  *
@@ -22,7 +22,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Report, sleep } from "./engineKit";
 import { contextPath, DEFAULT_LOG_DIR, devicePairingCode, revokeDevice, type OnboardDevice, type OnboardedVault } from "./onboard";
-import { attribute, cpuInWindow, PhoneProfile, timeline } from "./phoneProfile";
+import { attribute, cpuInWindow, pageEvaluate, PhoneProfile, timeline } from "./phoneProfile";
 
 function arg(name: string, fallback: string): string {
 	const i = process.argv.indexOf(`--${name}`);
@@ -196,6 +196,21 @@ async function unlocked(): Promise<void> {
 	console.log("unlocked");
 }
 
+/** Presses the pair modal's "Pair" button over DevTools (pairModal.ts); false when it did not appear within 20 s. */
+async function pressPair(): Promise<boolean> {
+	const click = `(() => { const b = [...document.querySelectorAll(".modal button")].find((e) => e.textContent.trim() === "Pair"); if (!b) return false; b.click(); return true; })()`;
+	const t = performance.now();
+	while (performance.now() - t < 20_000) {
+		try {
+			if (await pageEvaluate(await devtoolsPage(), click)) return true;
+		} catch {
+			// DevTools socket not up yet
+		}
+		await sleep(500);
+	}
+	return false;
+}
+
 async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<Run> {
 	await unlocked();
 	await reset(vault);
@@ -206,7 +221,8 @@ async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<
 	const code = await devicePairingCode(HOST, vault.vaultId, vault.devices[0]!.deviceToken);
 	const link = `obsidian://yaos?action=setup&host=${encodeURIComponent(HOST)}&pairingCode=${encodeURIComponent(code)}&suite=0`;
 	sh(`am start -a android.intent.action.VIEW -d ${q(link)}`);
-	console.log(`run ${k + 1}/${RUNS}: tap Pair on the phone`);
+	if (await pressPair()) console.log(`run ${k + 1}/${RUNS}: pressed Pair over DevTools`);
+	else console.log(`run ${k + 1}/${RUNS}: tap Pair on the phone`);
 
 	const tLink = performance.now();
 	while (!phoneIdentity()) {
@@ -225,6 +241,8 @@ async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<
 	let polls = 0;
 	let lastLog = t0;
 	while (filesMs === null) {
+		// Yield between the (synchronous) adb polls: with --profile, DevTools traffic (attaches, drains) is handled here.
+		await sleep(0);
 		n = countFiles();
 		polls++;
 		const at = performance.now() - t0;
@@ -264,7 +282,7 @@ async function profileOf(prof: PhoneProfile, wall0: number, run: Run, k: number)
 		cpu[t.thread] = Object.fromEntries(Object.entries(wins).map(([w, win]) => [w, cpuInWindow(t.chunks, [win[0], win[1]])]));
 	}
 	// The startup stall: everything from 1 s before the pair was seen (the poll lags it) to the first file.
-	const startup = timeline(threads, [at(-1000), at(first)]);
+	const startup = timeline(threads, [at(-1000), at(first)], at(0));
 	writeFileSync(`${base}-events.json`, JSON.stringify({ wall0, offset, run, threads: threads.map((t) => ({ thread: t.thread, url: t.url, hook: t.hook, goneAtMs: t.goneAtMs, events: t.events })) }));
 	writeFileSync(`${base}-startup.txt`, startup.join("\n") + "\n");
 	const threadInfo = threads.map((t) => ({ thread: t.thread, url: t.url.slice(0, 80), hook: t.hook, events: t.events.length, chunks: t.chunks.length, gone: t.goneAtMs === null ? null : r1(t.goneAtMs - at(0)) }));

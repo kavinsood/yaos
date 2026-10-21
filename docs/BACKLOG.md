@@ -48,35 +48,37 @@ replay window with the lost one.
 
 Proposed design: [identity-per-store](client-remake/identity-per-store.md).
 
-### PERF-BOOT: fresh-device bootstrap takes ~50 s on a phone
+### PERF-BOOT: fresh-device bootstrap takes ~32 s on a phone
 
-**A fresh Android phone needs ~50 s (median 49.6 s, n = 3) to bootstrap a 1022-file vault.** The Node harness does
-the same vault in ~2.7 s ([integration-notes](client-remake/integration-notes.md) §7.3, `e2e/client/phoneBench.ts`).
+**A fresh Android phone needs ~32 s (median, n = 7) to bootstrap a 1022-file vault; ~41 s before `perf-boot`.** The
+Node harness does the same vault in ~2.7 s ([integration-notes](client-remake/integration-notes.md) §7.3, §7.4;
+`e2e/client/phoneBench.ts`, which now pairs on its own).
 
-**Where the time goes, profiled on the device:**
-- **The ~43 s steady phase is Obsidian's native file bridge.** A DataAdapter call is in flight 94% of the time,
-  back to back and mostly one at a time.
-  - About 5.4 bridge calls per file: Obsidian's `create` (`exists` + `write`), Obsidian's metadata cache
-    (`readBinary`), Obsidian's File recovery plugin (`read`), and one of YAOS's own: the `absent` precondition's
-    `exists` (`src/host/obsidianVault.ts` `check`).
-  - IndexedDB can account for at most ~6% of this phase.
-- **~7.2 s before the first file are spent in the worker and on the network, not yet attributed.**
+**Landed (`perf-boot`, 1cc63f58), -9 s (-22%), measured A/B on the phone:**
+- independent files written concurrently (`Budgets.diskOpConcurrency`, 4; constrained 2), in the host's DiskExecutor
+  and the plan runner's materialize window;
+- YAOS's `exists` before each create removed: `vault.create` checks the disk itself;
+- the startup ping retries 5 + 10 + 20 + 40 s before the fatal (was fatal after 5 s); worker errors still end it at
+  once.
 
-**In `perf-boot` (1cc63f58), phone numbers pending:**
-1. **Independent files are written concurrently:** `Budgets.diskOpConcurrency` (4, constrained 2) in the host's
-   DiskExecutor and the plan runner's materialize window. The bridge serves 4 calls in flight 2-3x faster than one.
-2. **YAOS's `exists` before each create is gone** (~4.5 s summed): `vault.create` checks the disk itself. The other
-   ~4 calls per file are Obsidian's and stay; only concurrency shortens them.
+**Where the ~32 s goes now (§7.4):**
+- **~29 s: Obsidian's native file bridge, saturated.** A call is in flight all of it, ~6 deep; 4 calls per file, all
+  Obsidian's: `create` (`exists` + `write`), its metadata cache's `readBinary`, its File recovery plugin's `read`.
+  More concurrency only raises per-call latency (~139 calls/s against ~125 serial). Not CPU: main 7 s busy, the
+  engine 6 s.
+- **~3 s pair -> first file**, of which ~1-2 s is the `suite=0` pin: `pinSuite0 "link"` is sent before the session has
+  read `k`, fails transient, is retried after a fixed 1 s (`src/host/ui/keyActions.ts` `sendRetrying`), and the pin
+  then restarts the engine (`pluginController.pinAfter`).
 
 **Next:**
-1. **Measure 1-2 on the phone** (`phoneBench.ts`, 3 runs against the baseline).
-2. **Attribute the 7.2 s.** The old profile shows main and Obsidian's worker idle in it, so it is the engine worker
-   or the network; its capture was empty. `phoneProfile.ts` now holds new workers until hooked, records the
-   host <-> engine messages, the relay socket and IndexedDB, and drains every second.
-3. **One transaction per catch-up batch** instead of three per file: hygiene, worth ≤ ~2.6 s here.
-
-**Found on the way, fixed in `perf-boot`:** the startup ping (`src/host/engineHost.ts`) was fatal after 5 s. A miss
-now pings again with twice the deadline, 4 pings (75 s) before the fatal; worker errors still end it at once.
+1. **`pinSuite0` without the retry and the restart:** the engine holds the command until `k` is read; the pin applies
+   without a restart. ~1-2 s of every `suite=0` pairing.
+2. **Why the engine is replaced again right after the bootstrap** (a second `yaos-engine` worker appears at the last
+   file, every run).
+3. **Fewer bridge calls per file needs Obsidian's side:** writing through the adapter would skip `create`'s `exists`
+   (a quarter of the calls) but bypasses the vault's own bookkeeping; not without a design. File recovery's `read` is
+   the user's plugin.
+4. **One transaction per catch-up batch** instead of three per file: hygiene; IndexedDB is not on the critical path.
 
 ## 2. Smaller open items
 
