@@ -1,5 +1,5 @@
 /**
- * IndexedDB schema: one database per (vault, vaultEpoch, device).
+ * IndexedDB schema: one database per (vault, vaultEpoch, install): the store (identity-per-store §2.4).
  * DESIGN §e. IndexedDB is a rebuildable cache: every record here can be
  * reconstructed from the relay + disk, except the outbox, which is mirrored
  * to side files (OUTBOX_MIRROR_*).
@@ -26,22 +26,40 @@ import type { EnvelopeKind, CheckpointEncoding } from "../../core/envelope";
  * delete and rebuild every DB.
  */
 export const DB_SCHEMA_VERSION = 2;
-export const DB_NAME_PREFIX = "yaos2";
+/**
+ * `yaos3`: the store is named by the install key, and its device identity lives in it (identity-per-store §2.4).
+ * The `yaos2:<vaultId>:<epoch>:<deviceId>` layout (identity in data.json) is deleted on start (§13).
+ */
+export const DB_NAME_PREFIX = "yaos3";
+export const LEGACY_DB_NAME_PREFIX = "yaos2";
+/** `yaos3-pending:<vaultId>:<installKey>`: an identity minted for this install's next store (storeIdentity.ts). */
+export const PENDING_DB_NAME_PREFIX = "yaos3-pending";
 
-/** `yaos2:<vaultId>:<vaultEpoch>:<deviceId>`, each part URI-component encoded (the epoch is an opaque string). */
-export function dbName(vaultId: VaultId, vaultEpoch: VaultEpoch, deviceId: DeviceId): string {
-	return `${DB_NAME_PREFIX}:${encodeURIComponent(vaultId)}:${encodeURIComponent(vaultEpoch)}:${encodeURIComponent(deviceId)}`;
+/**
+ * `yaos3:<vaultId>:<vaultEpoch>:<storeKey>`, each part URI-component encoded (the epoch is an opaque string).
+ * `storeKey` is the install key (identity-per-store §2.4); engine tests without one use the deviceId.
+ */
+export function dbName(vaultId: VaultId, vaultEpoch: VaultEpoch, storeKey: string): string {
+	return `${DB_NAME_PREFIX}:${encodeURIComponent(vaultId)}:${encodeURIComponent(vaultEpoch)}:${encodeURIComponent(storeKey)}`;
 }
 
 // ---------------------------------------------------------------------------
 // meta — singleton records keyed by `key`
 // ---------------------------------------------------------------------------
 
+/**
+ * The store's identity (identity-per-store §2.4): written in the transaction that creates the DB, so the device
+ * identity and the store are created and lost together. A deviceId is used by exactly one store (§1.3).
+ */
 export interface MetaIdentity {
 	readonly key: "identity";
 	readonly vaultId: VaultId;
 	readonly vaultEpoch: VaultEpoch;
 	readonly deviceId: DeviceId;
+	/** SECRET: the device token (relay tickets, reads, blobs). Absent only in engine tests that run without a grant. */
+	readonly deviceToken?: string;
+	/** SECRET: the key whose SHA-256 the server keeps as the device's retire hash (the successor fence, §5.2). */
+	readonly retireKey?: string;
 	readonly schemaVersion: number;
 	readonly clientVersion: string;
 	readonly createdAtMs: number;
@@ -147,7 +165,23 @@ export interface MetaKeyringRecords {
 	readonly winners: readonly Uint8Array[];
 	readonly open: readonly Uint8Array[];
 }
-export type MetaRecord = MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes;
+/**
+ * An identity minted and registered for this install's next store, before that store exists (the epoch it is
+ * named by is learnt by connecting, which needs the identity). Only in the `yaos3-pending:` DB; consumed (the DB
+ * deleted) before the store is created, so it serves at most one store (storeIdentity.ts).
+ */
+export interface MetaPendingIdentity {
+	readonly key: "pendingIdentity";
+	readonly deviceId: DeviceId;
+	/** SECRET. */
+	readonly deviceToken: string;
+	/** SECRET. */
+	readonly retireKey: string;
+	/** The server answered the registration 200. */
+	readonly registered: boolean;
+}
+
+export type MetaRecord = MetaPendingIdentity | MetaIdentity | MetaCursor | MetaOutboxOrder | MetaDaily | MetaRelayCheckpointDuty | MetaFrameNoFloor | MetaKeyring | MetaBlobPut | MetaPathBase | MetaKeyringRecords | MetaDocDeletes;
 export type MetaKey = MetaRecord["key"];
 
 // ---------------------------------------------------------------------------

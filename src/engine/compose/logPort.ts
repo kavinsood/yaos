@@ -72,9 +72,10 @@ export class ComposedLog implements LogPort {
 			// Fallback duty, here without the 30 s grace (integration-notes deviation): rows exist
 			// past the delete base, so some edit was not seen by the deleter whoever authored it.
 			if (e.state === "deleted" && rec && (rec.lastOwnSeq > e.deleteBaseBodySeq || rec.remoteHeadSeq > e.deleteBaseBodySeq)) restoreDuty.add(e.docId);
-			// Own create, ns and stream heads read in this session, no row anywhere and no own frame left: the
-			// initial body was lost with this device's store (wipe, mirror lag). Nobody else can supply it.
-			if (this.nsCaughtUp && e.state === "live" && e.createdBy === c.self && body.caughtUp && !body.hasContent
+			// Own create (this store's, or an earlier store's of this install: identity-per-store §5.2), ns and stream
+			// heads read in this session, no row anywhere and no own frame left: the initial body was lost with the
+			// store (wipe, mirror lag). Nobody else can supply it.
+			if (this.nsCaughtUp && e.state === "live" && (e.createdBy === c.self || c.lineage.has(e.createdBy)) && body.caughtUp && !body.hasContent
 				&& e.createHash !== EMPTY_CONTENT_HASH && !pending.has(e.docId)) lostCreateBody.add(e.docId);
 			if (body.caughtUp && e.state === "live") {
 				const h = this.knownHash(e.docId, e.kind as "markdown" | "canvas", body.stream, body.version);

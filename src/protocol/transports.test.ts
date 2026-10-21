@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Worker } from "node:worker_threads";
-import type { DocId, DeviceId, VaultId } from "../core/types";
+import type { DocId, VaultId } from "../core/types";
 import type { EngineToMain, MainToEngine } from "./messages";
 import type { EngineTransport, HostTransport } from "./transport";
 import { createInlinePair } from "./inlineTransport";
@@ -89,13 +89,13 @@ function mainTrace(): MainToEngine[] {
 			config: {
 				protocolVersion: 1,
 				vaultId: "v" as VaultId,
-				deviceId: "d" as DeviceId,
 				deviceLabel: "Mac",
 				deviceClass: "desktop",
 				platform: { os: "macos", isMobile: false, isTablet: false, hardwareConcurrency: 8, deviceMemoryGiB: null, workerSupported: true },
 				configDir: ".obsidian",
 				caseInsensitiveFs: true,
-				relay: { url: "https://relay.invalid", credential: "secret" },
+				relay: { url: "https://relay.invalid", grantSecret: "secret" },
+				installKey: "install-key-0000000000",
 				settings: {
 					excludePatterns: ["tmp/**"],
 					syncAttachments: true,
@@ -105,7 +105,6 @@ function mainTrace(): MainToEngine[] {
 					provisionalBroadcast: true,
 					snapshots: { enabled: false, keepDaily: 3, uploadToBlobStore: false },
 				},
-				sideState: { outboxMirror: [bytes(1, 2, 3), null], syncedMirror: [null, bytes(9)] },
 				crypto: { suite: 1, keys: [{ e: 1, k: bytes(11, 12) }, { e: 2, k: bytes(13) }], records: [bytes(14, 15)] },
 			},
 		},
@@ -158,7 +157,7 @@ function engineTrace(): EngineToMain[] {
 				{ t: "rename", opId: 3, from: "a.md", to: "b.md", precondition: { t: "any" }, docId: D1, purpose: "remote-move" },
 			],
 		},
-		{ t: "sideFileWrite", rid: 3, name: "outbox-a.bin", bytes: bytes(8, 8, 8, 8) },
+		{ t: "sideFileWrite", rid: 3, name: "dev-0000000000000000/outbox-a.bin", bytes: bytes(8, 8, 8, 8) },
 		{ t: "docRetarget", docId: D1, change: { t: "renamed", path: "z.md" } },
 		{ t: "notice", level: "warn", code: "c", message: "m" },
 		{ t: "keyringChanged", rid: 5, keys: [{ e: 3, k: bytes(31, 32) }], records: [bytes(33)], pending: null },

@@ -78,7 +78,8 @@ export type WebSocketCtor = new (url: string) => WebSocketLike;
 export interface WsRelayOptions {
 	readonly baseUrl: string;
 	/** Device token. Secret: never logged, never in errors. */
-	readonly credential: string;
+	/** SECRET: the device token, or a getter read per call (the composed engine's store identity). */
+	readonly credential: string | (() => string);
 	readonly fetch?: typeof fetch;
 	readonly WebSocketImpl?: WebSocketCtor;
 	readonly clock: ClockPort;

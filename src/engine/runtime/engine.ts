@@ -49,6 +49,16 @@ export class EngineStartError extends Error {
 	}
 }
 
+/**
+ * The store's DB did not match its identity (another schema, vault or device) and was deleted: a new DB is a new
+ * store, so the next start mints a new identity (identity-per-store §1.3, §4 "Repo.open mismatch").
+ */
+export class StoreResetError extends EngineStartError {
+	constructor() {
+		super("store-reset");
+	}
+}
+
 export class LogEngine {
 	readonly maint: Maintenance;
 	private readonly gc: BlobGc;
@@ -79,13 +89,21 @@ export class LogEngine {
 	private static async boot(opts: EngineOptions, epoch: VaultEpoch, first: RelaySession | null): Promise<LogEngine> {
 		const c = new EngineCtx(opts);
 		const { storage } = opts.ports;
-		const ident = { vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion };
+		const store = opts.store;
+		const ident = {
+			vaultId: opts.vaultId, vaultEpoch: epoch, deviceId: opts.deviceId, clientVersion: opts.clientVersion,
+			...(store ? { storeKey: store.installKey, deviceToken: store.deviceToken, retireKey: store.retireKey } : {}),
+		};
 		const openOpts = { frameNoFloor: opts.frameNoFloor ?? null, pathBases: opts.pathBases ?? null, docDeletes: opts.docDeletes ?? null };
 		const openedAt = c.mono();
+		// A pending identity is consumed before its store exists, so it can serve no second store (storeIdentity.ts).
+		if (store?.beforeCreate) await store.beforeCreate();
 		let o = await Repo.open(storage, ident, c.now(), openOpts);
 		if (!o.repo) {
 			o.db.close();
 			await storage.deleteDatabase(o.db.name);
+			// Identity-per-store: the deleted DB was a store; the next one gets a new identity (the caller re-mints).
+			if (store) throw new StoreResetError();
 			o = await Repo.open(storage, ident, c.now(), openOpts);
 			if (!o.repo) throw new EngineStartError("db-identity");
 		}

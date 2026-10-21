@@ -18,6 +18,11 @@
  *              1 MiB/s), blobStore.ts;
  *              drawn only by BLOB_FAULTS
  *   world      wall-clock jumps (monotonic intact)
+ *   identity   clone: with one app down, its user copies another device's vault folder over its own (notes, config
+ *              dir with data.json, plugins/yaos/state/ with the other's mirrors) and opens it as a new vault
+ *              registration; both run (identity-per-store §4 "Clone"). syncedConfig: a sync tool carries
+ *              plugins/yaos/ (data.json, state/) between two running devices for a while. Drawn only by
+ *              CLONE_FAULTS; skipped in a suite-1 run (the copy carries no keychain)
  *   suspend    suspend-kill with a budget: hidden / pagehide / freeze, then the OS
  *              kills the app after B storage commits (0: at the event, before
  *              any posted work runs; null: never), with the host's saveViews
@@ -35,6 +40,7 @@
  * as the clock runs; settle() waits for every inspection before the checks).
  */
 
+import { EMPTY_CONTENT_HASH } from "../core/plan/planner";
 import type { DeviceId } from "../core/types";
 import type { LifecycleEvent } from "../ports/platform";
 import type { TimerHandle } from "../ports/clock";
@@ -69,7 +75,11 @@ export type FaultAction =
 	| E2eeFaultAction
 	| { readonly t: "blobStall"; readonly durationMs: number; readonly scope: SimStallScope }
 	| { readonly t: "blobSlow"; readonly durationMs: number; readonly bytesPerSec: number }
-	| SuspendKillAction;
+	| SuspendKillAction
+	/** Device `dev` (app down for downMs) becomes a clone of device `src`'s vault folder (SimDevice.cloneFrom). */
+	| { readonly t: "clone"; readonly dev: number; readonly src: number; readonly downMs: number }
+	/** A sync tool carries plugins/yaos/ between `dev` and `peer` for durationMs (dev's data.json wins). */
+	| { readonly t: "syncedConfig"; readonly dev: number; readonly peer: number; readonly durationMs: number };
 
 /**
  * Backgrounding the OS ends with a kill: `event` fires (the host's synchronous flush runs), then the app dies after
@@ -129,7 +139,15 @@ export const DEFAULT_FAULTS: FaultWeights = {
 	relaySubsLost: 0,
 	// Suspend-kill (SUSPEND_FAULTS): last and weight 0 here, so the default plans draw as before.
 	suspendKill: 0,
+	// Identity per store (CLONE_FAULTS): last and weight 0 here, so the default plans draw as before.
+	clone: 0, syncedConfig: 0,
 };
+
+/**
+ * The default matrix plus a copied vault folder run as a second device (clone) and a sync tool carrying the plugin's
+ * folder between two devices (syncedConfig): identity-per-store §4, §5.2.
+ */
+export const CLONE_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, clone: 1.5, syncedConfig: 1 };
 
 /** The default matrix plus suspend-kill with a budget (opt-in, like BLOB_FAULTS). */
 export const SUSPEND_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, suspendKill: 4 };
@@ -196,6 +214,8 @@ export function generateFault(rng: SeededRandom, devices: number, weights: Fault
 		case "hostileDowngrade": return { t: "hostileDowngrade", pick: rng.int(0x7fffffff), rows: rng.range(1, 3), join: rng.chance(0.3) };
 		case "blobStall": return { t: "blobStall", durationMs: rng.range(2_000, 90_000), scope: rng.chance(0.5) ? "path" : "put" };
 		case "blobSlow": return { t: "blobSlow", durationMs: rng.range(5_000, 150_000), bytesPerSec: Math.round(SLOW_MIN_BPS * (SLOW_MAX_BPS / SLOW_MIN_BPS) ** rng.float()) };
+		case "clone": return { t: "clone", dev, src: (dev + 1 + rng.int(Math.max(1, devices - 1))) % devices, downMs: rng.range(200, 10_000) };
+		case "syncedConfig": return { t: "syncedConfig", dev, peer: (dev + 1 + rng.int(Math.max(1, devices - 1))) % devices, durationMs: rng.range(5_000, 120_000) };
 		case "suspendKill": return { t: "suspendKill", dev, event: rng.pick(["hidden", "pagehide", "freeze"] as const), budget: rng.pick(SUSPEND_BUDGETS), save: rng.chance(0.5) ? "landed" : "lost", downMs: rng.range(200, 10_000), durationMs: rng.range(100, 30_000) };
 	}
 }
@@ -232,12 +252,19 @@ export class FaultState {
 	private limited = false;
 	/** Tokens an app crash legitimately lost (not durable anywhere). */
 	unacked = 0;
+	/** The canvas world's view of a clone fault (run.ts): why the copy cannot be taken now, and the copy itself. */
+	canvasClone: {
+		readonly blocked: (src: number) => string | null;
+		readonly copiedOver: (dst: SimDevice, others: readonly SimDevice[]) => void;
+	} | null = null;
 	readonly counts: Record<FaultAction["t"], number> = {
 		engineCrash: 0, appCrash: 0, commitCrash: 0, idbWipe: 0, idbLost: 0, offline: 0, ioFail: 0, background: 0,
 		socketDrop: 0, relayRestart: 0, relayDrain: 0, httpFail: 0, dailyLimit: 0, epochReset: 0, clockSkew: 0,
 		keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
-		blobStall: 0, blobSlow: 0, relaySubsLost: 0, suspendKill: 0,
+		blobStall: 0, blobSlow: 0, relaySubsLost: 0, suspendKill: 0, clone: 0, syncedConfig: 0,
 	};
+	/** The device pair a sync tool links now (syncedConfig), and how to end it. */
+	private synced: { readonly a: number; readonly b: number; readonly end: () => void } | null = null;
 	/** Every suspend-kill that ran, in order. */
 	readonly suspends: SuspendRecord[] = [];
 	/** Suspend-kills not killed yet (heal kills them). */
@@ -410,6 +437,10 @@ export class FaultState {
 				return `${tag} down ${f.downMs}ms rekey +${f.rekeyMs}ms`;
 			case "suspendKill":
 				return this.suspendKill(f, d, tag);
+			case "clone":
+				return this.clone(f, d, tag);
+			case "syncedConfig":
+				return this.syncConfig(f, d, tag);
 		}
 		this.counts[f.t]++;
 		return tag;
@@ -428,7 +459,7 @@ export class FaultState {
 		this.suspends.push(rec);
 		if (atRisk.length > 0) {
 			this.inspecting++;
-			this.inspections.push(inspectStore(this.clock, d.storage.copy(), d.deviceId).then((texts) => {
+			this.inspections.push(inspectStore(this.clock, d.storage.copy()).then((texts) => {
 				const kept = new Set<string>();
 				for (const t of texts) for (const tok of tokensIn(t)) kept.add(tok);
 				rec.committedAtEvent = new Set(atRisk.filter((t) => kept.has(t)));
@@ -497,6 +528,91 @@ export class FaultState {
 		return label;
 	}
 
+	/**
+	 * The clone fault: `d`'s app dies (as appCrash: tokens on no disk and in no committed storage are allowed lost),
+	 * then its user copies src's folder over d's and opens it as a new vault registration. What lived only in d's
+	 * folder or d's old store (now never opened: another install key) went with the user's copy: exempt (deleted).
+	 */
+	private clone(f: Extract<FaultAction, { t: "clone" }>, d: SimDevice, tag: string): string {
+		const src = this.devs[f.src];
+		if (this.e2ee) return `skip ${tag}: suite 1 (the copy carries no keychain)`;
+		if (!src || src === d) return `skip ${tag}: no source`;
+		if (this.down.has(f.src)) return `skip ${tag}: source app down`;
+		if (this.synced && [f.dev, f.src].some((i) => i === this.synced?.a || i === this.synced?.b)) return `skip ${tag}: config synced`;
+		const midSave = this.canvasClone?.blocked(f.src) ?? null;
+		if (midSave) return `skip ${tag}: ${midSave}`;
+		const stranded = this.strandedCreate(d);
+		if (stranded) return `skip ${tag}: ${stranded} created on ${d.name} has no body on the relay (abandoned-creator gap)`;
+		this.crash(f.dev, f.downMs, {});
+		const others = diskTokens(this.devs.filter((x) => x !== d));
+		const mine = new Set<string>();
+		for (const text of d.vault.snapshot().values()) for (const t of tokensIn(text)) mine.add(t);
+		// Typed on dst (live, or unacked by a crash: a half-written save or an unsent edit the copy replaced).
+		for (const e of this.ledger.entries.values()) if (e.dev === d.name) mine.add(e.token);
+		for (const t of mine) if (!others.has(t)) this.ledger.deleted(t);
+		this.canvasClone?.copiedOver(d, this.devs.filter((x) => x !== d));
+		d.cloneFrom(src);
+		this.counts.clone++;
+		return `${tag} of ${src.name}, down ${f.downMs}ms`;
+	}
+
+	/**
+	 * A doc `d`'s stores created whose initial body is not on the relay yet (a pending create included), or null.
+	 * Abandoning the install then strands the doc for everyone: only the creator (its store, or a later store of its
+	 * lineage, identity-per-store §5.2 `lostCreateBody`) uploads an initial body, and a clone is no store of that
+	 * lineage. The others wait for that body (planner `body-empty`) and their edits of the file never sync. A known
+	 * gap (BACKLOG "abandoned creator"; before stores had identities, a device thrown away mid-create left it too),
+	 * so the clone fault waits for such a window to close instead of tripping convergence on it.
+	 */
+	private strandedCreate(d: SimDevice): string | null {
+		const mine = new Set<string>(d.identities);
+		const bodies = this.net.logAudit().docStreams;
+		for (const x of this.devs) {
+			const lg = x.vrt?.log;
+			if (!lg) continue;
+			if (x === d) for (const doc of lg.listDocs()) if (doc.state === "pending" && doc.kind !== "blob" && !bodies.has(doc.docId)) return doc.path;
+			for (const e of lg.c.ns.state.entries.values()) {
+				if (e.state !== "live" || e.kind === "blob" || !mine.has(e.createdBy) || e.createHash === EMPTY_CONTENT_HASH || bodies.has(e.docId)) continue;
+				return e.path;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * syncedConfig: a sync tool (Syncthing, iCloud Drive) carries <configDir>/plugins/yaos/ between two running devices:
+	 * the side files both ways, 2 s after each change, and data.json (dev's grant and pin win; the peer's next runtime
+	 * start uses them). Each store writes only its own state dir, so the carried dirs are foreign to the receiver.
+	 */
+	private syncConfig(f: Extract<FaultAction, { t: "syncedConfig" }>, d: SimDevice, tag: string): string {
+		const peer = this.devs[f.peer];
+		if (this.e2ee) return `skip ${tag}: suite 1`;
+		if (!peer || peer === d) return `skip ${tag}: no peer`;
+		if (this.down.has(f.peer)) return `skip ${tag}: peer app down`;
+		if (this.synced) return `skip ${tag}: already synced`;
+		const carry = (to: SimDevice) => (path: string, bytes: Uint8Array | null) => {
+			this.later(2_000, () => {
+				if (bytes) to.sideFiles.files.set(path, bytes);
+				else to.sideFiles.files.delete(path);
+			});
+		};
+		for (const [from, to] of [[d, peer], [peer, d]] as const) {
+			for (const [k, v] of from.sideFiles.files) if (!to.sideFiles.files.has(k)) to.sideFiles.files.set(k, v.slice());
+			from.sideFiles.onChange = carry(to);
+		}
+		peer.grantSecret = d.grantSecret;
+		peer.pinData = structuredClone(d.pinData);
+		const end = () => {
+			d.sideFiles.onChange = null;
+			peer.sideFiles.onChange = null;
+			this.synced = null;
+		};
+		this.synced = { a: f.dev, b: f.peer, end };
+		this.later(f.durationMs, end);
+		this.counts.syncedConfig++;
+		return `${tag} with ${peer.name} ${f.durationMs}ms`;
+	}
+
 	/** App crash of device i (optionally with an IDB wipe); restart after downMs. */
 	private crash(i: number, downMs: number, o: { readonly wipe?: boolean; readonly dropMirrors?: boolean; readonly wipeSecrets?: boolean }): void {
 		const d = this.devs[i]!;
@@ -508,12 +624,12 @@ export class FaultState {
 		this.down.add(i);
 		this.backgrounded.delete(i);
 		this.later(downMs, () => this.restart(i));
-		if (candidates.length > 0) this.inspect(copy, d.deviceId, candidates);
+		if (candidates.length > 0) this.inspect(copy, candidates);
 	}
 
-	private inspect(copy: MemStoragePort, deviceId: DeviceId, candidates: readonly string[]): void {
+	private inspect(copy: MemStoragePort, candidates: readonly string[]): void {
 		this.inspecting++;
-		this.inspections.push(inspectStore(this.clock, copy, deviceId).then((texts) => {
+		this.inspections.push(inspectStore(this.clock, copy).then((texts) => {
 			const kept = new Set<string>();
 			for (const t of texts) for (const tok of tokensIn(t)) kept.add(tok);
 			for (const tok of candidates) {
@@ -594,6 +710,7 @@ export class FaultState {
 		this.net.blobs.setStall(null);
 		this.net.blobs.setSlow(null);
 		for (const d of this.devs) d.vault.failNextOps = 0;
+		this.synced?.end();
 		this.e2ee?.heal();
 	}
 }

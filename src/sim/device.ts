@@ -30,6 +30,8 @@ import { VaultKeyStore } from "../host/keys/secretStore";
 import { FakeSecretStorage } from "../host/keys/testkit/fakeSecretStorage";
 import { suite0PinForTest } from "../host/keys/testkit/pinFixture";
 import type { HostIdentity } from "../host/runtimeSupport";
+import { lineageOf, loadInstallRecord, saveStoreIdentity, type InstallStorage } from "../host/installRecord";
+import type { StoreCredentials } from "../ports/identity";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { createEngine, type ComposedEngine, type EngineHandle } from "../engine/compose/protocolEngine";
 import type { VaultRuntime } from "../engine/compose/vaultRuntime";
@@ -167,7 +169,21 @@ export class SimDevice {
 	/** Stats objects of every runtime / engine this device ran (hostStats sums them). */
 	private readonly statSources = new Set<{ readonly adopted: number; readonly adoptToPending: number }>();
 	private readonly boundDisks = new Set<{ readonly conflictCopies: number }>();
-	readonly deviceId: DeviceId;
+	/**
+	 * The machine (its network, its relay link): stable for the device's life, unlike its store identity. Also the id
+	 * of its first store (mint starts at 0), so a device that never loses its store keeps the deviceId it had before
+	 * identity-per-store.
+	 */
+	readonly machineKey: string;
+	/** The identity of the store the engine runs on (identity-per-store §2), from the engine's onIdentity. */
+	private currentId: DeviceId | null = null;
+	/** Store identities minted on this device (the readable id counter, `dev-<name>-<13 digits>`). */
+	mints = 0;
+	/** data.json's pairing grant (identity-per-store §3), copied with the vault folder by a clone. null: unpaired. SECRET. */
+	grantSecret: string | null;
+	/** Obsidian's per-vault-registration localStorage (App.saveLocalStorage): the install record. A clone has its own. */
+	readonly localStorage = new Map<string, unknown>();
+	private installs = 0;
 	/** The device's persistent SecretStorage contents (survives app restarts and IndexedDB wipes, like the OS keychain). */
 	readonly secretBacking = new Map<string, string>();
 	/** This app incarnation's SecretStorage over `secretBacking`. */
@@ -188,7 +204,8 @@ export class SimDevice {
 	constructor(readonly opts: SimDeviceOptions) {
 		// A real device id is 16..128 of [A-Za-z0-9_-] (relay-wire §2 enroll; the snap index ignores records of any
 		// other, core/snap/record.ts), so "dev-A" alone would make every snapshot upload a silent no-op.
-		this.deviceId = `dev-${opts.name}-0000000000000` as DeviceId;
+		this.machineKey = `dev-${opts.name}-0000000000000`;
+		this.grantSecret = opts.net.identities.issueGrant(opts.name);
 		this.secrets = new FakeSecretStorage(this.secretBacking);
 		this.pinData = opts.pin === null ? {} : { e2ee: opts.pin ?? suite0PinForTest() };
 		this.storage = new MemStoragePort({ beforeNextTimer: opts.clock.beforeNextTimer, macrotask: opts.clock.macrotask });
@@ -217,6 +234,26 @@ export class SimDevice {
 	get name(): string {
 		return this.opts.name;
 	}
+
+	/** The store's device identity (the relay's deviceId of its frames); the machine key before the first start. */
+	get deviceId(): DeviceId {
+		return this.currentId ?? (this.machineKey as DeviceId);
+	}
+
+	/** Every store identity this device ran as (current last). */
+	readonly identities: DeviceId[] = [];
+
+	/** IdentityPort.mint: readable, deterministic credentials (`dev-A-0000000000001` for A's second store). */
+	private mint(): StoreCredentials {
+		const n = this.mints++;
+		const tag = `${this.opts.name}-${String(n).padStart(13, "0")}`;
+		return { deviceId: `dev-${tag}` as DeviceId, deviceToken: `tok-${tag}`.padEnd(43, "0"), retireKey: `rk-${tag}`.padEnd(43, "0") };
+	}
+
+	private readonly installStorage: InstallStorage = {
+		load: (key) => this.localStorage.get(key),
+		save: (key, value) => void this.localStorage.set(key, value),
+	};
 
 	private carrier(): EngineCarrier {
 		if (this.opts.workerMode === "unavailable") throw new Error("Worker is not available (sim)");
@@ -250,6 +287,11 @@ export class SimDevice {
 				nsFold: (frames) => this.coverage.nsFold(frames),
 				pass: (ops, report) => this.coverage.pass(ops, report),
 			},
+			onIdentity: (id) => {
+				if (this.handle !== handle && this.handle !== null) return;
+				this.currentId = id as DeviceId;
+				if (this.identities[this.identities.length - 1] !== id) this.identities.push(id as DeviceId);
+			},
 			onRuntime: (rt) => {
 				if (rt) this.statSources.add(rt.log.c.docs.stats);
 				if (this.handle === handle) this.vrt = rt;
@@ -264,7 +306,14 @@ export class SimDevice {
 				const hash = work ? delayedHash(work, simHashPort()) : simHashPort();
 				const crypto = work ? await createDelayedSuite1(work, { vaultId: config.vaultId, random, keys: c.suite === 1 ? c.keys : [] }) : createNoopCrypto(hash);
 				const blob = (): BlobPort | null => (this.opts.blob ? this.opts.blob() : this.opts.net.blobPort());
-				return { relay: this.opts.net.port(this.deviceId), storage: this.storage, clock: this.deviceClock, random, crypto, hash, blob: blob(), probeBlob: async () => blob() };
+				let token: string | null = null;
+				const net = this.opts.net;
+				// The grant the host passed (data.json's): a clone's is the copied one.
+				const grant = config.relay.grantSecret || null;
+				return {
+					relay: net.port(this.machineKey, () => token), storage: this.storage, clock: this.deviceClock, random, crypto, hash, blob: blob(), probeBlob: async () => blob(),
+					identity: { register: (c) => net.register(this.machineKey, grant, c), use: (t) => (token = t), mint: () => this.mint() },
+				};
 			},
 		});
 		this.pair = pair;
@@ -282,15 +331,28 @@ export class SimDevice {
 		};
 	}
 
+	/** What the plugin controller builds from data.json and the install record (pluginController.ts startNow). */
+	hostIdentity(vaultId = SIM_VAULT_ID): HostIdentity {
+		const rec = loadInstallRecord(this.installStorage, vaultId, (n) => new SeededRandom(hashLabel(`install:${this.machineKey}#${++this.installs}`)).bytes(n));
+		return { vaultId, deviceLabel: this.opts.name, relay: { url: "sim://relay", grantSecret: this.grantSecret ?? "" }, installKey: rec.installKey, lineage: lineageOf(rec) };
+	}
+
+	/** This device's install record (lineage), as main keeps it. */
+	installRecord(): unknown {
+		return [...this.localStorage.values()][0] ?? null;
+	}
+
 	private makeRuntime(): HostRuntime {
+		const identity = this.hostIdentity();
 		const rt: HostRuntime = this.runtimeFor(
-			{ vaultId: SIM_VAULT_ID, deviceId: this.deviceId, deviceLabel: this.opts.name, relay: { url: "sim://relay", credential: "sim" } },
+			this.hostIdentity(),
 			this.opts.settings ?? (() => SIM_SETTINGS),
 			{
 				onStatus: (s) => this.ui.statuses.push(s),
 				onBrake: (b) => this.ui.brakes.push(b),
 				onNotice: (level, code, message) => this.ui.notices.push({ level, code, message }),
 				onCarrier: (c) => this.ui.carriers.push({ carrier: c.carrier, ready: c.ready }),
+				onStoreIdentity: (deviceId, retireKey) => saveStoreIdentity(this.installStorage, SIM_VAULT_ID, identity.installKey, deviceId, retireKey),
 				onFatal: (e) => {
 					if (this.crashed !== rt) {
 						this.ui.fatals.push(e);
@@ -330,6 +392,9 @@ export class SimDevice {
 
 	/** A HostRuntime over this device's vault/workspace/platform/carrier (plugin controller tests). */
 	runtimeFor(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink, keys: HostKeys = this.keysFor(identity.vaultId)): HostRuntime {
+		// The grant came from an enroll the sim server accepted (a controller test's fake pairing server, or issueGrant):
+		// its registry knows it. revokeGrant still revokes it (addGrant never un-revokes).
+		if (identity.relay.grantSecret) this.opts.net.identities.addGrant(identity.relay.grantSecret);
 		return new HostRuntime({
 			clock: this.opts.clock, vault: this.vault, configDir: this.configDir, sideFiles: this.sideFiles,
 			workspace: this.workspace, platform: this.platform,
@@ -352,7 +417,7 @@ export class SimDevice {
 		for (const c of this.vrt?.engine.boundDisk.pendingConflictCopies() ?? []) this.crashLost.push(c.text);
 		const dying = this.storage;
 		this.storage = dying.crash();
-		this.opts.net.relay.dropSession(this.deviceId);
+		this.opts.net.dropMachine(this.machineKey);
 		this.handle?.engine.dispose(true);
 		this.pair?.kill(reason);
 		this.vrt = null;
@@ -393,6 +458,29 @@ export class SimDevice {
 		for (const name of await this.storage.listDatabases()) await this.storage.deleteDatabase(name);
 	}
 
+	/**
+	 * The clone fault (identity-per-store §4 "Clone"): with this app down, the user copies `src`'s vault folder over
+	 * this one (notes, the config dir with data.json's grant and pin, and plugins/yaos/state/ with src's mirrors) and
+	 * opens it as a new vault registration: Obsidian's localStorage for it is empty, so the next start has a new install
+	 * key, a new store and a new identity. This machine's IndexedDB keeps its old store under the old install key
+	 * (never opened again). src keeps running.
+	 */
+	cloneFrom(src: SimDevice): void {
+		if (!this.appDown) throw new Error(`cloneFrom: ${this.name} is running`);
+		this.vault.copyFrom(src.vault);
+		this.configDir.files.clear();
+		for (const [k, v] of src.configDir.files) this.configDir.files.set(k, v.slice());
+		this.sideFiles.files.clear();
+		for (const [k, v] of src.sideFiles.files) this.sideFiles.files.set(k, v.slice());
+		this.grantSecret = src.grantSecret;
+		this.pinData = structuredClone(src.pinData);
+		this.localStorage.clear();
+		this.clonedFrom.push(src.name);
+	}
+
+	/** Devices whose vault folder this one copied (clone fault), in order. */
+	readonly clonedFrom: string[] = [];
+
 	/** Fresh app process over the same disk, side files and engine store. */
 	async restartApp(): Promise<void> {
 		this.appDown = false;
@@ -413,7 +501,7 @@ export class SimDevice {
 	}
 
 	setOnline(online: boolean): void {
-		this.opts.net.setOnline(this.deviceId, online);
+		this.opts.net.setOnline(this.machineKey, online);
 		this.platform.emit(online ? "online" : "offline");
 	}
 }

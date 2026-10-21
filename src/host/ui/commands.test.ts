@@ -13,7 +13,7 @@ function statusWith(phase: StatusSnapshot["phase"], e2ee: StatusSnapshot["e2ee"]
 	return e2ee === undefined ? base : { ...base, e2ee };
 }
 
-const IDENTITY: PairedIdentity = { host: "https://h.example", vaultId: testVaultId("v"), deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "t".repeat(43), deviceName: "Mac", vaultGeneration: null };
+const IDENTITY: PairedIdentity = { host: "https://h.example", vaultId: testVaultId("v"), grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: "t".repeat(43), grantName: "Mac", vaultGeneration: null };
 
 function host(opts: { run?: EngineRunState["phase"]; phase?: StatusSnapshot["phase"]; brake?: BrakeReport | null; paired?: boolean }) {
 	const data: YaosPluginData = { ...defaultPluginData("Mac"), identity: opts.paired ? IDENTITY : null };

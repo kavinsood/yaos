@@ -11,9 +11,9 @@ import { snapshot } from "./testkit/fakeUiHost";
 const IDENTITY: PairedIdentity = {
 	host: "https://sync.example.com",
 	vaultId: testVaultId("vaultOne"),
-	deviceId: "dev_AAAAAAAAAAAAAAAA",
-	deviceToken: "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-	deviceName: "Mac",
+	grantId: "grant_AAAAAAAAAAAAAAAA",
+	grantSecret: "gs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+	grantName: "Mac",
 	vaultGeneration: "gen-7",
 };
 
@@ -82,9 +82,10 @@ test("sanitizePluginData: partial and invalid fields fall back per field", () =>
 
 test("sanitizePluginData: an identity with any invalid credential field is dropped", () => {
 	const broken: Record<string, unknown>[] = [
-		{ ...IDENTITY, deviceToken: "short" },
-		{ ...IDENTITY, deviceToken: "has spaces in it which are not allowed at all!!" },
-		{ ...IDENTITY, deviceId: "x" },
+		{ ...IDENTITY, grantSecret: "short" },
+		{ ...IDENTITY, grantSecret: "has spaces in it which are not allowed at all!!" },
+		{ ...IDENTITY, grantId: "x" },
+		{ host: IDENTITY.host, vaultId: IDENTITY.vaultId, deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", deviceName: "Mac" },
 		{ ...IDENTITY, vaultId: "" },
 		{ ...IDENTITY, host: "http://sync.example.com" },
 		{ ...IDENTITY, host: 5 },
@@ -101,8 +102,9 @@ test("sanitizePluginData: the vaultId is exactly 22-char canonical base64url (se
 test("sameIdentity / sameEngineSettings", () => {
 	assert.equal(sameIdentity(null, null), true);
 	assert.equal(sameIdentity(IDENTITY, null), false);
-	assert.equal(sameIdentity(IDENTITY, { ...IDENTITY, deviceName: "Renamed" }), true);
-	assert.equal(sameIdentity(IDENTITY, { ...IDENTITY, deviceToken: `${IDENTITY.deviceToken}x` }), false);
+	assert.equal(sameIdentity(IDENTITY, { ...IDENTITY, grantName: "Renamed" }), true);
+	assert.equal(sameIdentity(IDENTITY, { ...IDENTITY, grantSecret: `${IDENTITY.grantSecret}x` }), false);
+	assert.equal(sameIdentity(IDENTITY, { ...IDENTITY, grantId: "grant_CCCCCCCCCCCCCCCC" }), false);
 	assert.equal(sameEngineSettings(DEFAULT_ENGINE_SETTINGS, { ...DEFAULT_ENGINE_SETTINGS, excludePatterns: [] }), true);
 	assert.equal(sameEngineSettings(DEFAULT_ENGINE_SETTINGS, { ...DEFAULT_ENGINE_SETTINGS, excludePatterns: ["a"] }), false);
 	assert.equal(sameEngineSettings(DEFAULT_ENGINE_SETTINGS, { ...DEFAULT_ENGINE_SETTINGS, snapshots: { ...DEFAULT_ENGINE_SETTINGS.snapshots, keepDaily: 8 } }), false);

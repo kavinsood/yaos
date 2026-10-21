@@ -5,9 +5,8 @@ import { createWorkerHostTransport, type WorkerLike, type WorkerScopeLike } from
 import type { EngineToMain, MainToEngine } from "../protocol/messages";
 import { PROTOCOL_VERSION } from "../protocol/messages";
 import { buildInitConfig } from "../host/runtimeSupport";
-import { SimSideFiles } from "../sim/vault";
 import { SIM_SETTINGS } from "../sim/device";
-import type { DeviceId, VaultId } from "../core/types";
+import type { VaultId } from "../core/types";
 import { startWorkerEngine } from "./workerMain";
 
 function channel(): { worker: WorkerLike; scope: WorkerScopeLike; close(): void } {
@@ -69,10 +68,10 @@ test("worker entry answers ping before init, inits on IndexedDB and accepts obse
 	post({ t: "ping", rid: 1 });
 	const pong = await waitFor((m) => m.t === "result" && m.re === 1);
 	assert.deepEqual(pong.t === "result" && pong.value, { t: "pong" });
-	const config = await buildInitConfig({
-		identity: { vaultId: "v" as VaultId, deviceId: "d" as DeviceId, deviceLabel: "test", relay: { url: "wss://x", credential: "c" } },
+	const config = buildInitConfig({
+		identity: { vaultId: "v" as VaultId, deviceLabel: "test", relay: { url: "wss://x", grantSecret: "" }, installKey: "install-key-0000000000" },
 		platform: { os: "linux", isMobile: false, isTablet: false, hardwareConcurrency: 4, deviceMemoryGiB: null, workerSupported: true },
-		configDir: ".obsidian", caseInsensitiveFs: false, settings: SIM_SETTINGS, side: new SimSideFiles(),
+		configDir: ".obsidian", caseInsensitiveFs: false, settings: SIM_SETTINGS,
 		crypto: { suite: 0 },
 	});
 	post({ t: "init", rid: 2, config });

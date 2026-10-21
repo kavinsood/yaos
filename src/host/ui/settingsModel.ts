@@ -194,14 +194,18 @@ export interface InfoRow {
 	readonly value: string;
 }
 
-/** Connection rows. The device token is always masked; the pairing code is never stored. */
-export function connectionRows(identity: PairedIdentity | null): InfoRow[] {
+/**
+ * Connection rows. The pairing secret is always masked; the pairing code is never stored. `deviceId`: this
+ * install's current store (identity-per-store §2.4; null before the engine registered one).
+ */
+export function connectionRows(identity: PairedIdentity | null, deviceId: string | null = null): InfoRow[] {
 	if (!identity) return [{ name: "Status", value: "Not paired. Pair this device to start syncing." }];
 	return [
 		{ name: "Server", value: identity.host },
 		{ name: "Vault ID", value: identity.vaultId },
-		{ name: "Device name", value: identity.deviceName || "(unnamed)" },
-		{ name: "Device token", value: maskSecret(identity.deviceToken) },
+		{ name: "Device name", value: identity.grantName || "(unnamed)" },
+		{ name: "Device ID", value: deviceId ?? "(registered at the next sync start)" },
+		{ name: "Pairing secret", value: maskSecret(identity.grantSecret) },
 	];
 }
 

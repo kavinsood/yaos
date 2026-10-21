@@ -290,14 +290,14 @@ export function ownFrameNoFloor(rt: VaultRuntime): FrameNoFloor {
 }
 
 /**
- * §c.12 step 6: the new epoch reached live; delete every other epoch's DB of this vault and device. Not only the one
+ * §c.12 step 6: the new epoch reached live; delete every other epoch's DB of this vault and install. Not only the one
  * the migration left: a crash between the migration and this step leaves two DBs, the restart connects first
  * (knownEpoch.ts) and opens the current one without migrating, and the old one would stay for good, every later
  * start waiting for the relay to name the epoch. Once the new DB exists the old one holds nothing it needs: the
  * bases were stored with the new DB's identity.
  */
 export async function retireOldEpochs(rt: VaultRuntime): Promise<void> {
-	const { vaultId, deviceId } = rt.o.config;
+	const { vaultId, installKey } = rt.o.config;
 	let names: readonly string[];
 	try {
 		names = await rt.o.ports.storage.listDatabases();
@@ -307,7 +307,7 @@ export async function retireOldEpochs(rt: VaultRuntime): Promise<void> {
 	}
 	for (const name of names) {
 		const p = parseDbName(name);
-		if (!p || p.vaultId !== vaultId || p.deviceId !== deviceId || p.vaultEpoch === rt.vaultEpoch) continue;
+		if (!p || p.vaultId !== vaultId || p.storeKey !== installKey || p.vaultEpoch === rt.vaultEpoch) continue;
 		try {
 			await rt.o.ports.storage.deleteDatabase(name);
 			rt.diag(`old epoch DB deleted`);

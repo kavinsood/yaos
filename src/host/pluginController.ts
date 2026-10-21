@@ -12,7 +12,7 @@
 
 import { isVaultId } from "../core/codec/ids";
 import { hexToBytes } from "../core/codec/lib0";
-import type { BrakeReport, DeviceId, VaultId } from "../core/types";
+import type { BrakeReport, VaultId } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { EngineResultValue, EngineSettings, UserCommand } from "../protocol/messages";
 import type { DeviceCheckMode, DeviceCheckReport, StatusSnapshot } from "../protocol/status";
@@ -29,6 +29,7 @@ import { VaultKeyStore, type EpochKey, type SecretStorageLike } from "./keys/sec
 import type { HostIdentity } from "./runtimeSupport";
 import { sameEngineSettings, sameIdentity, type EngineRunState, type PairedIdentity, type YaosPluginData } from "./ui/api";
 import { deviceCheckDeadlineMs } from "./ui/deviceCheck";
+import { installRecordKey, lineageOf, loadInstallRecord, sanitizeInstallRecord, saveStoreIdentity, type InstallStorage } from "./installRecord";
 
 export interface ControllerEnv {
 	makeRuntime(identity: HostIdentity, settings: () => EngineSettings, ui: HostUiSink, keys: HostKeys): HostRuntime;
@@ -39,8 +40,13 @@ export interface ControllerEnv {
 	readonly clock: ClockPort;
 	/** Obsidian's SecretStorage (App.secretStorage, obsidian.d.ts :458). Absent: this device can hold no key. */
 	readonly secrets?: SecretStorageLike | null;
-	/** Vault-local storage (App.loadLocalStorage / saveLocalStorage, d.ts :472 / :480) for the one-time notice flag. */
-	readonly localStorage?: Pick<PlaintextNoticeEnv, "load" | "save">;
+	/**
+	 * Vault-local storage (App.loadLocalStorage / saveLocalStorage, d.ts :472 / :480): the one-time notice flag and the
+	 * install record (installRecord.ts, identity-per-store §2.4). Absent (tests): an in-memory one.
+	 */
+	readonly localStorage?: { load(key: string): unknown; save(key: string, value: unknown): void };
+	/** Randomness for a new install key; default crypto.getRandomValues. */
+	readonly randomBytes?: (n: number) => Uint8Array;
 }
 
 export interface HostNotice {
@@ -60,9 +66,15 @@ export function hostNotice(level: "info" | "warn" | "error", code: string, messa
 	return { text: message };
 }
 
-export function hostIdentityOf(id: PairedIdentity, deviceLabel: string): HostIdentity {
-	// SECRET: relay.credential is the device token. Never log the result.
-	return { vaultId: id.vaultId as VaultId, deviceId: id.deviceId as DeviceId, deviceLabel, relay: { url: id.host, credential: id.deviceToken } };
+export function hostIdentityOf(id: PairedIdentity, deviceLabel: string, installKey: string, lineage: readonly string[] = []): HostIdentity {
+	// SECRET: relay.grantSecret is the pairing grant. Never log the result.
+	return { vaultId: id.vaultId as VaultId, deviceLabel, relay: { url: id.host, grantSecret: id.grantSecret }, installKey, lineage };
+}
+
+function defaultRandomBytes(n: number): Uint8Array {
+	const b = new Uint8Array(n);
+	crypto.getRandomValues(b);
+	return b;
 }
 
 function safeMessage(e: unknown): string {
@@ -95,12 +107,18 @@ export class YaosController {
 	private inflight = 0;
 	private restartWanted = false;
 	private restartTimer: TimerHandle | null = null;
+	/** Install records (identity-per-store §2.4) in vault-local storage. */
+	private readonly installStorage: InstallStorage;
 
 	constructor(
 		private current: YaosPluginData,
 		private readonly env: ControllerEnv,
 	) {
 		this.run = { phase: current.identity ? "stopped" : "unpaired", lastError: null };
+		const memory = new Map<string, unknown>();
+		this.installStorage = env.localStorage
+			? { load: (k) => env.localStorage?.load(k) ?? null, save: (k, v) => env.localStorage?.save(k, v) }
+			: { load: (k) => memory.get(k) ?? null, save: (k, v) => void memory.set(k, v) };
 		this.plaintextNotice = plaintextNoticeOnce({
 			load: (k) => env.localStorage?.load(k) ?? null,
 			save: (k, v) => env.localStorage?.save(k, v),
@@ -118,6 +136,13 @@ export class YaosController {
 
 	data(): YaosPluginData {
 		return this.current;
+	}
+
+	/** This install's current store (the install record's lineage `current`), or null before one started. */
+	deviceId(): string | null {
+		const id = this.current.identity;
+		if (!id) return null;
+		return sanitizeInstallRecord(this.installStorage.load(installRecordKey(id.vaultId)))?.current?.deviceId ?? null;
 	}
 	status(): StatusSnapshot | null {
 		return this.snapshot;
@@ -211,7 +236,13 @@ export class YaosController {
 				this.setRun({ phase: "failed", lastError: `${e.code}: ${e.message}` });
 				this.env.notice("error", `YAOS stopped: ${e.message}`);
 			},
+			// §2.4 point 4: the lineage follows the store each runtime started on (the install key it was told).
+			onStoreIdentity: (deviceId, retireKey) => {
+				saveStoreIdentity(this.installStorage, identity.vaultId, install.installKey, deviceId, retireKey);
+				this.changed();
+			},
 		};
+		const install = loadInstallRecord(this.installStorage, identity.vaultId, this.env.randomBytes ?? defaultRandomBytes);
 		const keys = createHostKeys({
 			store: this.keyStoreFor(identity.vaultId),
 			// The pin of this runtime's vault only: after the user left it, nothing applies (the restart follows).
@@ -220,7 +251,7 @@ export class YaosController {
 			stored: (info) => this.keyringStored(rt, identity, info),
 			plaintext: this.plaintextNotice,
 		});
-		const rt = this.env.makeRuntime(hostIdentityOf(identity, this.current.deviceLabel), () => this.current.engine, ui, keys);
+		const rt = this.env.makeRuntime(hostIdentityOf(identity, this.current.deviceLabel, install.installKey, lineageOf(install)), () => this.current.engine, ui, keys);
 		this.runtime = rt;
 		this.pendingBrake = null;
 		this.setRun({ phase: "starting", lastError: null });

@@ -39,5 +39,9 @@ test("IndexedDB lost with an unsaved editor buffer: own edits the relay has reac
 	void a.restartApp();
 	await clock.advance(20_000);
 	for (const d of [a, b]) assert.equal(d.vault.textOf("x.md"), "one typed\n", d.name);
-	assert.deepEqual([...a.vault.snapshot().keys()], ["x.md"]);
+	// identity-per-store phase 2: the new store (a new deviceId) does not read the lost store's mirror, so the stale disk
+	// text is kept as a conflict copy; phase 3's predecessor recovery (§5.2 step 5) imports the mirror and leaves x.md
+	// alone, as this test asserted before.
+	assert.deepEqual([...a.vault.snapshot().keys()].sort(), ["x (conflict A 2026-01-01 0000).md", "x.md"]);
+	assert.equal(a.vault.textOf("x (conflict A 2026-01-01 0000).md"), "one\n");
 });

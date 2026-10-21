@@ -134,6 +134,26 @@ export interface EngineOptions {
 	readonly deviceClass?: DeviceClass;
 	readonly clientVersion: string;
 	/**
+	 * The store (identity-per-store §2.4): the install key the DB is named by and the identity secrets a fresh DB
+	 * records in meta.identity. `beforeCreate` runs right before a fresh DB is created (the composed engine consumes
+	 * the pending identity there, storeIdentity.ts). Absent (engine tests): the DB is named by the deviceId.
+	 */
+	readonly store?: {
+		readonly installKey: string;
+		/** SECRET. */
+		readonly deviceToken: string;
+		/** SECRET. */
+		readonly retireKey: string;
+		readonly beforeCreate?: () => Promise<void>;
+	};
+	/**
+	 * This install's earlier stores (identity-per-store §2.4 lineage, §5.2 `lostCreateBody`): a live doc one of them
+	 * created whose initial body never reached the relay is this store's to upload, as its own create's would be. The
+	 * earlier store is gone from this install (its DB was lost or reset), and nobody else has the file. Never a
+	 * clone's twin: a clone has its own install record. Absent: none.
+	 */
+	readonly lineage?: ReadonlySet<DeviceId>;
+	/**
 	 * The suite pin and keyring inputs (e2ee-design §12.4, §18.4). Required, with no default. Only a pinned device
 	 * whose gate opened runs a LogEngine (compose/pinGate.ts); an unpinned one runs the KeyReader and has none.
 	 */

@@ -50,6 +50,7 @@ import { ComposedLog } from "./logPort";
 import { PassScheduler } from "./passScheduler";
 import { mergeStatus, type DiskSideStatus } from "./statusMerge";
 import { importSyncedMirror, SyncedMirrorWriter } from "./syncedMirror";
+import { dropPending, type ResolvedIdentity } from "./storeIdentity";
 import * as ops from "./runtimeOps";
 
 export type RestartReason = "retry" | "epoch" | "storage-lost" | "rebuild" | "settings" | "blob-store";
@@ -70,6 +71,8 @@ export interface RuntimeOwner {
 export interface VaultRuntimeStart {
 	readonly engine: RuntimeOwner;
 	readonly config: EngineInitConfig;
+	/** The store this runtime runs on (identity-per-store §4): `self`, and the secrets a fresh DB records. */
+	readonly identity: ResolvedIdentity;
 	readonly settings: EngineSettings;
 	readonly ports: EnginePorts;
 	readonly carrier: "worker" | "inline";
@@ -176,7 +179,13 @@ export class VaultRuntime {
 		const holder: { rt: VaultRuntime | null } = { rt: null };
 		const { engine, config } = o;
 		const log = await LogEngine.start({
-			ports: o.ports, vaultId: config.vaultId, deviceId: config.deviceId, deviceClass: config.deviceClass,
+			ports: o.ports, vaultId: config.vaultId, deviceId: o.identity.creds.deviceId, deviceClass: config.deviceClass,
+			store: {
+				installKey: config.installKey, deviceToken: o.identity.creds.deviceToken, retireKey: o.identity.creds.retireKey,
+				// A pending identity is consumed right before its store is created (storeIdentity.ts).
+				...(o.identity.source === "pending" ? { beforeCreate: () => dropPending(o.ports.storage, config.vaultId, config.installKey) } : {}),
+			},
+			...(o.identity.lineage ? { lineage: o.identity.lineage } : {}),
 			clientVersion: o.clientVersion, vaultEpoch: o.vaultEpoch, sideFiles: engine.link.sideFiles, frameNoFloor: o.frameNoFloor ?? null, pathBases: o.pathBases ?? null, docDeletes: o.docDeletes ?? null,
 			provisionalBroadcast: o.settings.provisionalBroadcast, tuning: o.tuning, budgets: o.budgets,
 			onBoundText: (docId, changes, length, origin) => engine.bound.onText(docId, changes, length, origin),
@@ -244,7 +253,7 @@ export class VaultRuntime {
 		const link = this.engine.link;
 		const c = log.c;
 		const db = this.db;
-		const identity = { vaultId: config.vaultId, vaultEpoch: this.vaultEpoch, deviceId: config.deviceId };
+		const identity = { vaultId: config.vaultId, vaultEpoch: this.vaultEpoch, deviceId: o.identity.creds.deviceId };
 		const imported = await importSyncedMirror({ db, side: link.sideFiles, hash: ports.hash, identity, pathKey, nowMs: ports.clock.now() });
 		this.recovered = imported > 0 || c.noticeList().some((n) => n.code === "recovered-from-mirror");
 		this.idbSnapshotDue = this.recovered || o.reason === "storage-lost";
@@ -346,7 +355,7 @@ export class VaultRuntime {
 		this.port.invalidate();
 		const c = this.log.c;
 		const bound = this.engine.bound;
-		const fx = foldEffects({ frames, self: this.o.config.deviceId, committed: (d) => c.ns.state.entries.get(d), isBound: (d) => bound.isBound(d), pathKey });
+		const fx = foldEffects({ frames, self: this.o.identity.creds.deviceId, committed: (d) => c.ns.state.entries.get(d), isBound: (d) => bound.isBound(d), pathKey });
 		if (fx.own.length > 0) {
 			this.ownQueue.push(...fx.own);
 			this.stats.ownFoldEvents += fx.own.length;

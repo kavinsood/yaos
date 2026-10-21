@@ -8,9 +8,9 @@ import { defaultPluginData, MAX_ATTACHMENT_BYTES_LIMIT, MIB, sanitizePluginData,
 import type { EnginePhase, StatusSnapshot } from "../../protocol/status";
 import { testVaultId } from "../keys/testkit/vaultIds";
 
-const TOKEN = "tok_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const TOKEN = "gs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const IDENTITY: PairedIdentity = {
-	host: "https://sync.example.com", vaultId: testVaultId("vaultOne"), deviceId: "dev_AAAAAAAAAAAAAAAA", deviceToken: TOKEN, deviceName: "Mac", vaultGeneration: null,
+	host: "https://sync.example.com", vaultId: testVaultId("vaultOne"), grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: TOKEN, grantName: "Mac", vaultGeneration: null,
 };
 
 test("every control key reads back what it writes, through the sanitizer", () => {
@@ -120,13 +120,15 @@ test("isControlKey and parseExcludePatterns", () => {
 	assert.deepEqual(parseExcludePatterns("a\r\nb\n a \n\n"), ["a", "b"]);
 });
 
-test("connectionRows mask the device token and never show it", () => {
-	const rows = connectionRows(IDENTITY);
+test("connectionRows mask the pairing secret, never show it, and name the store's device id", () => {
+	const rows = connectionRows(IDENTITY, "dev-store-AAAAAAAAAAAA");
 	const text = JSON.stringify(rows);
 	assert.ok(!text.includes(TOKEN));
 	assert.ok(!text.includes(TOKEN.slice(-4)));
-	assert.deepEqual(rows.map((r) => r.name), ["Server", "Vault ID", "Device name", "Device token"]);
-	assert.equal(rows[3]?.value, "••••••••••••");
+	assert.deepEqual(rows.map((r) => r.name), ["Server", "Vault ID", "Device name", "Device ID", "Pairing secret"]);
+	assert.equal(rows[3]?.value, "dev-store-AAAAAAAAAAAA");
+	assert.equal(rows[4]?.value, "••••••••••••");
+	assert.equal(connectionRows(IDENTITY)[3]?.value, "(registered at the next sync start)");
 	assert.equal(connectionRows(null).length, 1);
 });
 

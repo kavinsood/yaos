@@ -12,20 +12,26 @@ import type { TrashMode } from "../../ports/vault";
 import { isVaultId } from "../../core/codec/ids";
 import { sanitizeCreating, sanitizePin, type CreatingMarker, type E2eePin } from "../keys/pin";
 import {
-	DEVICE_ID_RE, DEVICE_TOKEN_RE, ENROLLMENT_REQUEST_ID_RE, normalizeDeviceName, normalizeHost, normalizePairingCode,
+	ENROLLMENT_REQUEST_ID_RE, GRANT_ID_RE, GRANT_SECRET_RE, normalizeDeviceName, normalizeHost, normalizePairingCode,
 	type EnrollmentAttempt,
 } from "./pairing";
 
 export { defaultDeviceName } from "./deviceName";
 export type { DevicePlatformFlags } from "./deviceName";
 
-/** Result of enrollment. deviceToken is SECRET (plugin data only, never logged/displayed unmasked). */
+/**
+ * The install's pairing grant (identity-per-store §3.1): the result of enrollment, stored in data.json in place of
+ * the old device identity. The device identity lives in the store (meta.identity), never here, so a copied vault
+ * folder carries a grant (and registers its own device, decision 1), not this install's identity. grantSecret is
+ * SECRET (plugin data only, never logged or displayed unmasked).
+ */
 export interface PairedIdentity {
 	readonly host: string; // https://... normalized, no trailing slash
 	readonly vaultId: string;
-	readonly deviceId: string;
-	readonly deviceToken: string;
-	readonly deviceName: string;
+	readonly grantId: string;
+	readonly grantSecret: string;
+	/** The grant's name on the server ("Mac 2"); every store of this install is listed under it. */
+	readonly grantName: string;
 	readonly vaultGeneration: string | null;
 }
 
@@ -36,7 +42,7 @@ export interface YaosPluginData {
 	readonly engine: EngineSettings;
 	readonly showStatusBar: boolean;
 	/**
-	 * SECRET (pairing code + the new device token): an /enroll sent but not yet answered, kept until
+	 * SECRET (pairing code + the new grant secret): an /enroll sent but not yet answered, kept until
 	 * success or a definitive refusal so the next load can retry it once (the relay replays an
 	 * identical request). Never logged or exported.
 	 */
@@ -142,7 +148,11 @@ export function sanitizeEngineSettings(raw: unknown): EngineSettings {
 	};
 }
 
-/** Returns a valid identity or null (any missing/invalid required field drops the whole identity). */
+/**
+ * Returns a valid grant or null (any missing/invalid required field drops it). The old device identity
+ * (deviceId/deviceToken, no grant) is dropped here: such an install starts unpaired and pairs again
+ * (identity-per-store §13).
+ */
 export function sanitizeIdentity(raw: unknown): PairedIdentity | null {
 	const r = asRecord(raw);
 	if (!r) return null;
@@ -154,14 +164,14 @@ export function sanitizeIdentity(raw: unknown): PairedIdentity | null {
 	}
 	// Exactly a vaultId (22-char canonical base64url, server DECISIONS §2.1): nothing trimmed, nothing else trusted.
 	if (typeof r.vaultId !== "string" || !isVaultId(r.vaultId)) return null;
-	if (typeof r.deviceId !== "string" || !DEVICE_ID_RE.test(r.deviceId)) return null;
-	if (typeof r.deviceToken !== "string" || !DEVICE_TOKEN_RE.test(r.deviceToken)) return null;
+	if (typeof r.grantId !== "string" || !GRANT_ID_RE.test(r.grantId)) return null;
+	if (typeof r.grantSecret !== "string" || !GRANT_SECRET_RE.test(r.grantSecret)) return null;
 	return {
 		host,
 		vaultId: r.vaultId,
-		deviceId: r.deviceId,
-		deviceToken: r.deviceToken,
-		deviceName: typeof r.deviceName === "string" ? normalizeDeviceName(r.deviceName) : "",
+		grantId: r.grantId,
+		grantSecret: r.grantSecret,
+		grantName: typeof r.grantName === "string" ? normalizeDeviceName(r.grantName) : "",
 		vaultGeneration: typeof r.vaultGeneration === "string" && r.vaultGeneration.trim() ? r.vaultGeneration : null,
 	};
 }
@@ -177,10 +187,9 @@ export function sanitizePendingEnrollment(raw: unknown): EnrollmentAttempt | nul
 			pairingCode: normalizePairingCode(str(r.pairingCode)),
 			deviceName: normalizeDeviceName(str(r.deviceName)),
 			enrollmentRequestId: str(r.enrollmentRequestId),
-			deviceId: str(r.deviceId),
-			deviceToken: str(r.deviceToken),
+			grantSecret: str(r.grantSecret),
 		};
-		const ok = ENROLLMENT_REQUEST_ID_RE.test(attempt.enrollmentRequestId) && DEVICE_ID_RE.test(attempt.deviceId) && DEVICE_TOKEN_RE.test(attempt.deviceToken);
+		const ok = ENROLLMENT_REQUEST_ID_RE.test(attempt.enrollmentRequestId) && GRANT_SECRET_RE.test(attempt.grantSecret);
 		return ok ? attempt : null;
 	} catch {
 		return null;
@@ -212,10 +221,10 @@ export function sanitizePluginData(raw: unknown, fallbackLabel: string): YaosPlu
 	}
 }
 
-/** True when both identities address the same relay credential (a change requires an engine restart). */
+/** True when both name the same pairing on the same relay (a change requires an engine restart). */
 export function sameIdentity(a: PairedIdentity | null, b: PairedIdentity | null): boolean {
 	if (a === null || b === null) return a === b;
-	return a.host === b.host && a.vaultId === b.vaultId && a.deviceId === b.deviceId && a.deviceToken === b.deviceToken;
+	return a.host === b.host && a.vaultId === b.vaultId && a.grantId === b.grantId && a.grantSecret === b.grantSecret;
 }
 
 /** Deep equality of two EngineSettings (to skip no-op updateSettings commands). */
@@ -242,6 +251,8 @@ export interface YaosUiHost {
 	readonly app: App;
 	readonly pluginVersion: string;
 	data(): YaosPluginData;
+	/** This install's current store device id (identity-per-store §2.4, the install record), or null before one. */
+	deviceId(): string | null;
 	/** Persist; the host applies it (engine updateSettings, or restart when identity changes). */
 	updateData(mutate: (d: YaosPluginData) => YaosPluginData): Promise<void>;
 	status(): StatusSnapshot | null;

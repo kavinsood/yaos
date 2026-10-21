@@ -51,7 +51,7 @@ function relay(log: string[], routes: Record<string, HttpResponse | ((req: HttpR
 function enrollOk(vaultId: string) {
 	return (req: HttpRequest): HttpResponse => {
 		const b = JSON.parse(req.body ?? "{}") as Record<string, string>;
-		return { status: 200, json: { host: ORIGIN, vaultId, deviceId: b.deviceId, deviceToken: b.deviceToken, deviceName: b.deviceName ?? "", vaultGeneration: "g1" } };
+		return { status: 200, json: { host: ORIGIN, vaultId, grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: b.grantSecret, grantName: b.grantName ?? "", vaultGeneration: "g1" } };
 	};
 }
 
@@ -119,7 +119,7 @@ test("unclaimed: claim with Origin, mark creating right after it, enroll in memo
 
 	const enroll = r.requests.find((q) => q.url.endsWith("/enroll"))!;
 	const body = JSON.parse(enroll.body!) as Record<string, unknown>;
-	assert.deepEqual(Object.keys(body).sort(), ["deviceId", "deviceName", "deviceToken", "enrollmentRequestId", "pairingCode"]);
+	assert.deepEqual(Object.keys(body).sort(), ["enrollmentRequestId", "grantName", "grantSecret", "pairingCode"]);
 	assert.equal(body.pairingCode, OWNER_CODE);
 	assert.ok(!/key|suite/i.test(enroll.url));
 

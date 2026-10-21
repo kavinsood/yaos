@@ -83,10 +83,10 @@ test("diagnosticsFileName", () => {
 	assert.equal(diagnosticsFileName(0, true), "yaos-diagnostics-1970-01-01T00-00-00-000Z-with-file-names.json");
 });
 
-const TOKEN = "dtok_9f8e7d6c5b4a39281706f5e4d3c2b1a0ZZ";
+const TOKEN = "gsec_9f8e7d6c5b4a39281706f5e4d3c2b1a0ZZ0123456789";
 const DATA: YaosPluginData = {
 	version: 1,
-	identity: { host: "https://sync.example.com", vaultId: testVaultId("v-123"), deviceId: "d-456", deviceToken: TOKEN, deviceName: "Laptop", vaultGeneration: "g1" },
+	identity: { host: "https://sync.example.com", vaultId: testVaultId("v-123"), grantId: "grant_d456AAAAAAAAAA", grantSecret: TOKEN, grantName: "Laptop", vaultGeneration: "g1" },
 	deviceLabel: "Laptop",
 	engine: { ...DEFAULT_ENGINE_SETTINGS, excludePatterns: ["Clients/Acme/", "**.tmp"] },
 	showStatusBar: true,
@@ -101,6 +101,7 @@ function fakeHost(result: EngineResultValue | Error, writeFails = false, data: Y
 		host: {
 			pluginVersion: "2.1.0",
 			data: () => data,
+			deviceId: () => "d-456",
 			runState: () => ({ phase: "running" as const, lastError: null }),
 			async command(c: UserCommand): Promise<EngineResultValue> {
 				commands.push(c);
@@ -155,8 +156,8 @@ test("exportDiagnostics: settings section names the device and engine settings, 
 		assert.deepEqual(h.commands, [{ t: "exportDiagnostics", includePaths }]);
 		const text = h.writes[0]?.text ?? "";
 		for (const out of [text, copied[0] ?? ""]) {
-			assert.ok(!out.includes(TOKEN), "device token leaked");
-			assert.ok(!out.includes(TOKEN.slice(5, 20)), "part of the device token leaked");
+			assert.ok(!out.includes(TOKEN), "pairing secret leaked");
+			assert.ok(!out.includes(TOKEN.slice(5, 20)), "part of the pairing secret leaked");
 		}
 		const s = (JSON.parse(text) as { settings: Record<string, unknown> }).settings;
 		assert.deepEqual(Object.keys(s).sort(), ["deviceId", "deviceLabel", "engine", "host", "pluginVersion", "vaultId"]);

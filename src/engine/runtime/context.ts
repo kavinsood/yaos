@@ -50,6 +50,7 @@ export interface PendingCreate {
 const DIAG_RING = 2_000;
 const ERROR_NOTICES = new Set(["device-revoked", "upgrade-required", "epoch-changed", "vault-unclaimed", "vault-not-found"]);
 const INFO_NOTICES = new Set(["recovered-from-mirror"]);
+const NO_LINEAGE: ReadonlySet<DeviceId> = new Set();
 
 /** A fold runtime and its after-change hook (EngineCtx.folds). */
 export interface Fold {
@@ -210,6 +211,10 @@ export class EngineCtx {
 
 	get self(): DeviceId {
 		return this.opts.deviceId;
+	}
+	/** EngineOptions.lineage: this install's earlier stores (never `self`). */
+	get lineage(): ReadonlySet<DeviceId> {
+		return this.opts.lineage ?? NO_LINEAGE;
 	}
 	now(): number {
 		return this.ports.clock.now();

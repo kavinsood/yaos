@@ -11,7 +11,8 @@ import { BUDGETS, FULL_RECONCILE_IDLE_MAX_MS, type DeviceClass } from "../core/l
 import type { BrakeReport } from "../core/types";
 import type { ClockPort, TimerHandle } from "../ports/clock";
 import type { LifecycleEvent, PlatformPort } from "../ports/platform";
-import type { ConfigDirPort, SideFilePort, VaultPort } from "../ports/vault";
+import type { ConfigDirPort, HostSideFilePort, SideFilePath, VaultPort } from "../ports/vault";
+import { sideFileDir } from "../ports/vault";
 import type { WorkspacePort } from "../ports/workspace";
 import type { ProtocolError } from "../protocol/errors";
 import type { EngineResultValue, EngineSettings, HostIoOp, HostIoResult, MainResultValue, UserCommand } from "../protocol/messages";
@@ -30,13 +31,19 @@ export interface HostUiSink {
 	onNotice(level: "info" | "warn" | "error", code: string, message: string): void;
 	onCarrier(info: { readonly carrier: CarrierKind | null; readonly ready: boolean }): void;
 	onFatal(error: ProtocolError): void;
+	/**
+	 * identity-per-store §2.4 point 4: a runtime started on this store (every start; the same one again after a
+	 * restart). Main records it as the install's lineage `current` (installRecord.ts). SECRET: retireKey.
+	 */
+	onStoreIdentity?(deviceId: string, retireKey: string): void;
 }
 
 export interface HostRuntimeDeps {
 	readonly clock: ClockPort;
 	readonly vault: VaultPort;
 	readonly configDir: ConfigDirPort;
-	readonly sideFiles: SideFilePort;
+	/** `<configDir>/plugins/yaos/state/`, addressed `<deviceId>/<name>` (identity-per-store §5.2). */
+	readonly sideFiles: HostSideFilePort;
 	readonly workspace: WorkspacePort;
 	readonly platform: PlatformPort;
 	readonly identity: HostIdentity;
@@ -105,7 +112,7 @@ export class HostRuntime {
 				return buildInitConfig({
 					identity: deps.identity, platform: deps.platform.info,
 					configDir: deps.vault.configDir, caseInsensitiveFs: deps.vault.caseInsensitive,
-					settings: deps.settings(), side: deps.sideFiles, crypto: await deps.keys.crypto(),
+					settings: deps.settings(), crypto: await deps.keys.crypto(),
 				});
 			},
 			handlers: {
@@ -256,6 +263,9 @@ export class HostRuntime {
 			case "status":
 				this.deps.ui.onStatus(m.status);
 				return;
+			case "storeIdentity":
+				this.deps.ui.onStoreIdentity?.(m.deviceId, m.retireKey);
+				return;
 			case "brake":
 				this.deps.ui.onBrake(m.report);
 				return;
@@ -274,10 +284,10 @@ export class HostRuntime {
 			case "saveViews":
 				return { t: "viewSaved", saved: await this.bindings.saveViews(m.docIds) };
 			case "sideFileWrite":
-				await this.deps.sideFiles.write(m.name, m.bytes);
+				await this.deps.sideFiles.write(sidePath(m.name), m.bytes);
 				return { t: "sideFileWritten" };
 			case "sideFileRead":
-				return { t: "sideFile", bytes: await this.deps.sideFiles.read(m.name) };
+				return { t: "sideFile", bytes: await this.deps.sideFiles.read(sidePath(m.name)) };
 			case "hostIo":
 				return { t: "hostIo", result: await this.hostIo(m.op) };
 			case "keyringChanged":
@@ -308,10 +318,19 @@ export class HostRuntime {
 				await this.deps.configDir.remove(op.path);
 				return { t: "done" };
 			case "sideFileList":
+				sidePath(op.prefix);
 				return { t: "sideFiles", names: await this.deps.sideFiles.list(op.prefix) };
 			case "sideFileRemove":
-				await this.deps.sideFiles.remove(op.name);
+				await this.deps.sideFiles.remove(sidePath(op.name));
 				return { t: "done" };
 		}
 	}
+}
+
+/** The engine names side files in a store dir, `<deviceId>/...`; anything else (a path escape) is refused. */
+function sidePath<P extends string>(name: P): P & SideFilePath {
+	if (sideFileDir(name) === null || name.includes("..") || name.includes("\\")) {
+		throw new HostRequestError({ code: "bad-request", message: "side file outside a store dir", retryable: false });
+	}
+	return name as P & SideFilePath;
 }

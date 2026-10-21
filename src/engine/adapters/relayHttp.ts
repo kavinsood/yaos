@@ -21,6 +21,7 @@
 import type { ClockPort } from "../../ports/clock";
 import type { FeedPage, PutCheckpointResult, ReadPage, ReadRequest, RelayConnectResult, RelayRow } from "../../ports/relay";
 import type { ClientFrameId, DeviceId, StreamName } from "../../core/types";
+import type { RegisterOutcome } from "../../ports/identity";
 import { bounded as boundedCall, relayHttpDeadlineMs, RELAY_HTTP_BASE_MS, RELAY_HTTP_IDLE_MS, RELAY_REPLY_BYTES, untilAborted, watched } from "../../core/deadline";
 import { decodeReadReply, type WireReadPage } from "./relayFrames";
 import { createWebClock } from "./webClock";
@@ -48,7 +49,8 @@ export type TicketResult =
 
 export interface RelayHttpOptions {
 	readonly baseUrl: string;
-	readonly credential: string;
+	/** SECRET: the device token, or a getter read per call (the composed engine's store identity). */
+	readonly credential: string | (() => string);
 	readonly fetch?: typeof fetch;
 	/** Wall clock for Retry-After dates and resetAt, and the deadlines' timers; a web clock when absent. */
 	readonly clock?: Pick<ClockPort, "now" | "setTimer" | "clearTimer">;
@@ -60,6 +62,11 @@ export interface RelayHttpOptions {
  * putCheckpoint with "timeout" at its deadline. Each rejects "aborted" as soon as `signal` aborts (the session closed).
  */
 export interface RelayHttp {
+	/**
+	 * `POST /vault/:id/auth/device` with `Authorization: Grant <secret>` (identity-per-store §3.2, relay-wire §2.4.1):
+	 * register a new store's identity under the install's grant. Never throws; bounded at the small-reply deadline.
+	 */
+	registerDevice(vaultId: string, grantSecret: string, body: { readonly deviceId: string; readonly deviceToken: string; readonly retireKeyHash: string }): Promise<RegisterOutcome>;
 	/** POST /vault/:id/auth/ticket {purpose:"streams"}. Never throws; "unavailable" once `signal` aborts (connect's deadline). */
 	ticket(vaultId: string, signal?: AbortSignal): Promise<TicketResult>;
 	feed(vaultId: string, afterSeq: number, limit: number | null, signal?: AbortSignal): Promise<FeedPage>;
@@ -171,7 +178,8 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	const doFetch: typeof fetch = opts.fetch ?? ((input, init) => fetch(input, init));
 	const clock = opts.clock ?? createWebClock();
 	const now = (): number => clock.now();
-	const auth = `Bearer ${opts.credential}`;
+	const cred = opts.credential;
+	const bearer = (): string => `Bearer ${typeof cred === "function" ? cred() : cred}`;
 
 	const vaultPath = (vaultId: string, rest: string): string => `${base}/vault/${encodeURIComponent(vaultId)}${rest}`;
 
@@ -213,9 +221,9 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	 * on every body chunk.
 	 */
 	async function call(
-		url: string, init: { method: string; body?: BodyInit; contentType?: string; binary?: true }, signal?: AbortSignal, progress: () => void = () => undefined,
+		url: string, init: { method: string; body?: BodyInit; contentType?: string; binary?: true; authorization?: string }, signal?: AbortSignal, progress: () => void = () => undefined,
 	): Promise<HttpReply | null> {
-		const headers: Record<string, string> = { Authorization: auth };
+		const headers: Record<string, string> = { Authorization: init.authorization ?? bearer() };
 		if (init.contentType) headers["Content-Type"] = init.contentType;
 		let res: Response;
 		try {
@@ -275,6 +283,16 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 	}
 
 	return {
+		async registerDevice(vaultId, grantSecret, body) {
+			const reply = await bounded("auth/device", RELAY_REPLY_BYTES, undefined, (s) => call(vaultPath(vaultId, "/auth/device"), {
+				method: "POST",
+				body: JSON.stringify({ deviceId: body.deviceId, deviceToken: body.deviceToken, retireKeyHash: body.retireKeyHash }),
+				contentType: "application/json",
+				authorization: `Grant ${grantSecret}`,
+			}, s)).catch(() => null);
+			return registerOutcome(reply);
+		},
+
 		async ticket(vaultId, signal) {
 			const reply = await call(vaultPath(vaultId, "/auth/ticket"), {
 				method: "POST",
@@ -382,4 +400,19 @@ export function createRelayHttp(opts: RelayHttpOptions): RelayHttp {
 			throw fail("checkpoint", reply);
 		},
 	};
+}
+
+/** A register reply as the engine reads it (relay-wire §2.4.1 errors); null = no reply (network, deadline). */
+export function registerOutcome(reply: { readonly status: number; readonly code: string | null; readonly retryAfterMs: number | null } | null): RegisterOutcome {
+	if (reply === null) return { ok: false, reason: "network", retryAfterMs: null };
+	const { status, code, retryAfterMs } = reply;
+	if (status === 200) return { ok: true };
+	if (status === 401) return { ok: false, reason: code === "grant_revoked" ? "grant-revoked" : "unauthorized", retryAfterMs: null };
+	if (status === 403 && code === "grant_required") return { ok: false, reason: "grant-required", retryAfterMs: null };
+	if (status === 409 && code === "device_exists") return { ok: false, reason: "device-exists", retryAfterMs: null };
+	if (status === 409 && code === "device_retired") return { ok: false, reason: "device-retired", retryAfterMs: null };
+	if (status === 409 && code === "device_limit") return { ok: false, reason: "device-limit", retryAfterMs: null };
+	if (status === 429 && code === "registration_limit") return { ok: false, reason: "registration-limit", retryAfterMs };
+	if (status === 429 || (status === 503 && code !== null && code !== "server_error")) return { ok: false, reason: "rate-limited", retryAfterMs };
+	return { ok: false, reason: "network", retryAfterMs };
 }

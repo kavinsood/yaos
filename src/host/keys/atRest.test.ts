@@ -26,7 +26,7 @@ import { VaultKeyStore, secretIdFor } from "./secretStore";
 import { fakeEpochKey, fakeGenesisRecord } from "./testkit/kRecords";
 import { testVaultId } from "./testkit/vaultIds";
 
-const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), deviceId: "dev-A", deviceToken: "device-credential", deviceName: "A", vaultGeneration: null };
+const ID: PairedIdentity = { host: "https://relay.example", vaultId: testVaultId("v1"), grantId: "grant_AAAAAAAAAAAAAAAA", grantSecret: "gs_SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS", grantName: "A", vaultGeneration: null };
 
 function base64(bytes: Uint8Array): string {
 	let s = "";

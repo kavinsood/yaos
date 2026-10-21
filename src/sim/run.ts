@@ -20,7 +20,7 @@ import { entropyIsSeeded, seedEntropy } from "./seededEntropy";
 import * as Y from "yjs";
 import { generateUserAction, runUserAction, tokensIn, EXTRA_OPS, FULL_OPS, SNAPSHOT_OPS, STORM_OPS, TokenLedger, type OpWeights, type UserAction } from "./actors";
 import { DEFAULT_FAULTS, FaultState, generateFault, type FaultAction, type FaultWeights, type SuspendKillAction, type SuspendRecord } from "./faults";
-import { activity, checkBlobLiveness, checkCanvas, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, checkBounds, checkFoldDeterminism, checkOutboxAndCursor, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
+import { activity, checkBlobLiveness, checkCanvas, checkIdentity, checkClean, checkConvergence, checkLogCarriesNoBlobs, checkNothingDestroyed, checkQuiet, checkSettings, checkTokens, checkCheckpoints, checkBounds, checkFoldDeterminism, checkOutboxAndCursor, clobberedTokens, settingsPrint, vaultTokens, type Violation } from "./invariants";
 import { BrakeUser, type BrakeUserStats } from "./brakeUser";
 import type { Budgets } from "../core/limits";
 import { collectCoverage } from "./coverage";
@@ -292,6 +292,11 @@ export interface SimReport {
 		 * engines reported, summed over the devices. Every COVERAGE_KEYS key is present, 0 if it never fired.
 		 */
 		readonly coverage: Readonly<Record<string, number>>;
+		/**
+		 * Identity per store: stores the devices ran on (one deviceId each; more than the devices after an IDB wipe or a
+		 * clone), and the relay registry's answers to registrations (ok, or the refusal).
+		 */
+		readonly identity: { readonly stores: number; readonly registrations: Readonly<Record<string, number>> };
 	};
 }
 
@@ -528,6 +533,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			if (bounds.size >= 5) return;
 			for (const v of checkBounds(devs)) if (bounds.size < 5 && !bounds.has(v.detail)) bounds.set(v.detail, v);
 		};
+		if (c.canvas) faults.canvasClone = { blocked: (src) => canvasWorld.midSave(src), copiedOver: (dst, others) => canvasWorld.copiedOver(dst, others) };
 		const actorWorld = {
 			devs, ledger, isDown: (i: number) => faults.isDown(i), isBackground: (i: number) => faults.isBackground(i),
 			onUserRename: (i: number, from: string, to: string, step: number) => {
@@ -543,7 +549,9 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			if (cw.lateJoin && step.i >= cw.lateJoin.atStep && step.i < c.steps && faults.join(cw.lateJoin.dev)) trace.push(`${step.i} join ${devs[cw.lateJoin.dev]?.name}`);
 			const line = "user" in step ? await runUserAction(actorWorld, step.user, step.i) : "canvas" in step ? await canvasWorld.run(step.canvas, step.i) : faults.run(step.fault);
 			if (line.startsWith("skip")) skipped++;
-			else if ("fault" in step && step.fault.t === "idbWipe" && !step.fault.mirrors) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
+			// A lost store's unsent ops go with it. Its mirrors would carry them, but a new store has a new identity and
+			// adopts no mirror before phase 3 (identity-per-store §5.2 predecessor recovery): every loss is "without mirrors".
+			else if ("fault" in step && (step.fault.t === "idbWipe" || step.fault.t === "idbLost")) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
 			trace.push(`${step.i} ${line}`);
 			faults.afterStep();
 			brakeUser.poll();
@@ -604,7 +612,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		const oracle = await net.oracle(120_000, c.suite1 ? oracleKeys(devs) : null);
 		if (c.suite1) violations.push(...checkE2eeLeaks(devs, net, ledger).violations, ...(faults.e2ee?.check() ?? []));
 		canvasWorld.finalize();
-		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net), ...checkCanvas(devs, canvasWorld.oracle), ...checkOutboxAndCursor(devs, net), ...bounds.values());
+		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkIdentity(devs), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net), ...checkCanvas(devs, canvasWorld.oracle), ...checkOutboxAndCursor(devs, net), ...bounds.values());
 		violations.push(...(await checkQuiet(clock, devs, net)));
 		// Invariant 4: refold the relay's rows (gates may await crypto on the clock, so it runs).
 		let fold: Violation[] | null = null;
@@ -633,7 +641,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, brakes: brakeUser.stats, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
+			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, brakes: brakeUser.stats, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), identity: { stores: devs.reduce((n, d) => n + d.identities.length, 0), registrations: { ...net.identities.counts } }, ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
 		};
 	} finally {
 		seedEntropy(null);

@@ -36,11 +36,21 @@ function strings(v: unknown, out: string[], depth = 0): void {
 	}
 }
 
+/** The deviceId in the meta.identity of store `name` (null: none). */
+function storeDeviceId(storage: MemStoragePort, name: string): DeviceId | null {
+	const rows = storage.dump(name)?.[STORE.meta] ?? [];
+	for (const r of rows) {
+		const m = r as { key?: unknown; deviceId?: unknown };
+		if (m.key === "identity" && typeof m.deviceId === "string") return m.deviceId as DeviceId;
+	}
+	return null;
+}
+
 /**
  * Texts recoverable from `storage` (a crash copy nobody else uses). Resolves as
  * the run's clock advances; never throws (an unopenable store holds nothing).
  */
-export async function inspectStore(clock: VirtualClock, storage: MemStoragePort, deviceId: DeviceId): Promise<string[]> {
+export async function inspectStore(clock: VirtualClock, storage: MemStoragePort): Promise<string[]> {
 	const out: string[] = [];
 	const hash = simHashPort();
 	let names: readonly string[] = [];
@@ -61,16 +71,19 @@ export async function inspectStore(clock: VirtualClock, storage: MemStoragePort,
 			} else if (store === STORE.intents || store === STORE.synced || store === STORE.localTree) strings(rows, out);
 		}
 	}
-	// One offline engine per database of this device, opened at the epoch in its name (knownEpoch.ts): without
-	// vaultEpoch LogEngine.start connects first, which OFFLINE refuses, and nothing in the doc logs was read.
+	// One offline engine per store of this device, opened at the epoch in its name (knownEpoch.ts) as the identity in
+	// its meta (identity-per-store §2): without vaultEpoch LogEngine.start connects first, which OFFLINE refuses, and
+	// nothing in the doc logs was read; with another deviceId it would refuse the store.
 	for (const name of names) {
 		const id = parseDbName(name);
-		if (!id || id.vaultId !== SIM_VAULT_ID || id.deviceId !== deviceId || id.vaultEpoch.length === 0) continue;
+		if (!id || id.vaultId !== SIM_VAULT_ID || id.vaultEpoch.length === 0) continue;
+		const deviceId = storeDeviceId(storage, name);
+		if (deviceId === null) continue;
 		let eng: LogEngine;
 		try {
 			eng = await LogEngine.start({
 				ports: { relay: OFFLINE, storage, clock, random: new SeededRandom(hashLabel(`inspect:${deviceId}`)), crypto: createNoopCrypto(hash), hash, blob: null },
-				vaultId: SIM_VAULT_ID, vaultEpoch: id.vaultEpoch, deviceId, clientVersion: "sim-inspect", sideFiles: null, autoReconnect: false, e2ee: { suite: 0 },
+				vaultId: SIM_VAULT_ID, vaultEpoch: id.vaultEpoch, deviceId, store: { installKey: id.storeKey, deviceToken: "", retireKey: "" }, clientVersion: "sim-inspect", sideFiles: null, autoReconnect: false, e2ee: { suite: 0 },
 			});
 		} catch {
 			continue;

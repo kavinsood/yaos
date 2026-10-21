@@ -45,6 +45,11 @@ export interface RepoIdentity {
 	readonly vaultEpoch: VaultEpoch;
 	readonly deviceId: DeviceId;
 	readonly clientVersion: string;
+	/** The install key the DB is named by (identity-per-store §2.4); absent = the deviceId (engine tests). */
+	readonly storeKey?: string;
+	/** SECRET: the device token and retire key a fresh DB records in meta.identity (§2.4). */
+	readonly deviceToken?: string;
+	readonly retireKey?: string;
 }
 
 export type OpenOutcome =
@@ -208,7 +213,7 @@ export class Repo {
 			pathBases?: readonly MetaPathBase[] | null; docDeletes?: readonly MetaDocDeletes[] | null;
 		} = {},
 	): Promise<{ repo: Repo | null; outcome: OpenOutcome; db: StorageDb<YS> }> {
-		const db = await storage.open<YS>(dbName(id.vaultId, id.vaultEpoch, id.deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
+		const db = await storage.open<YS>(dbName(id.vaultId, id.vaultEpoch, id.storeKey ?? id.deviceId), DB_SCHEMA_VERSION, STORE_SPECS);
 		const res = await db.tx([STORE.meta], "readwrite", async (tx) => {
 			const ident = await tx.get(STORE.meta, "identity") as MetaIdentity | undefined;
 			if (ident) {
@@ -223,7 +228,10 @@ export class Repo {
 				return { outcome: { t: "existing", identity: ident } as OpenOutcome, ident, cursor, next: order.next };
 			}
 			const fresh: MetaIdentity = {
-				key: "identity", vaultId: id.vaultId, vaultEpoch: id.vaultEpoch, deviceId: id.deviceId, schemaVersion: DB_SCHEMA_VERSION,
+				key: "identity", vaultId: id.vaultId, vaultEpoch: id.vaultEpoch, deviceId: id.deviceId,
+				...(id.deviceToken !== undefined ? { deviceToken: id.deviceToken } : {}),
+				...(id.retireKey !== undefined ? { retireKey: id.retireKey } : {}),
+				schemaVersion: DB_SCHEMA_VERSION,
 				clientVersion: id.clientVersion, createdAtMs: nowMs, recoveredFromMirror: opts.recoveredFromMirror ?? false,
 			};
 			const cursor: MetaCursor = { key: "cursor", vaultSeq: 0, headSeqSeen: 0 };
