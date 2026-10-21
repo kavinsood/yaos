@@ -5,7 +5,7 @@ name: Sim soak
 #            a manual run always runs. GitHub runs schedules from the default branch only, on its code.
 #   soak     scripts/sim-soak.mjs, one process per core, each with its own master seed (swarm profiles: fault subsets,
 #            storms, randomized tuning, canvas, suspend, targeted relay faults, a hostile device, conflict shapes,
-#            delete / restore races, attachment clean-ups). A failure is minimized and uploaded as sim-failures/*.json;
+#            delete / restore races, attachment clean-ups, a small tombstone cap). A failure is minimized and uploaded as sim-failures/*.json;
 #            replay it with `npm run sim:replay -- <file>`. Summed over the processes, every coverage key outside
 #            COVERAGE_OPTIONAL must fire (60-minute runs and longer).
 #   sweep    the CI sim matrices (`npm run test:sim`) at 1000 seeds from a random first seed (YAOS_SIM_FIRST), over

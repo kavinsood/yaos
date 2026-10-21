@@ -20,12 +20,13 @@ import { fileURLToPath } from "node:url";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 /**
- * Coverage keys a soak may leave at 0 (--require-coverage, --check-coverage): ns pruning and retired-stream reclamation
- * (long offline past the tombstone cap: their own work), a conflict-copy name taken between pick and write (only a
- * third-party writer racing the device's label and minute), own frames the relay refuses for good, and the upgrade
- * halt (a newer build's upgradeRules: upgradeHalt.test.ts, it stops the run's quiescence by design).
+ * Coverage keys a soak may leave at 0 (--require-coverage, --check-coverage): a conflict-copy name taken between pick
+ * and write (only a third-party writer racing the device's label and minute), own frames the relay refuses for good,
+ * and the upgrade halt (a newer build's upgradeRules: upgradeHalt.test.ts, it stops the run's quiescence by design).
+ * ns pruning and retired streams (ns.pruned, diag.checkpoint-retired, diag.retire-*) are required: the small-cap draw
+ * below makes them fire in every process.
  */
-const COVERAGE_OPTIONAL = new Set(["ns.pruned", "diag.checkpoint-retired", "conflict.path-taken", "diag.frame-poisoned", "diag.upgrade-required"]);
+const COVERAGE_OPTIONAL = new Set(["conflict.path-taken", "diag.frame-poisoned", "diag.upgrade-required"]);
 
 function args(argv) {
 	const o = { minutes: Number(process.env.YAOS_SOAK_MINUTES ?? 2), masterSeed: process.env.YAOS_SOAK_MASTER_SEED, out: "sim-failures", requireCoverage: false, maxRuns: Infinity, coverageOut: null, checkCoverage: null };
