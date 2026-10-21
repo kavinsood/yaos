@@ -6,6 +6,7 @@ import {
 	decodeServerFrame,
 	encodeAppend,
 	encodePing,
+	encodeRekeyed,
 	encodeServerFrame,
 	encodeSubscribe,
 	FRAME_APPEND,
@@ -116,20 +117,38 @@ describe("relayFrames control", () => {
 			liveness: { version: 1, idleMs: 60000, timeoutMs: 15000 },
 			capabilities: { streams: 1 },
 			limits: { maxPayloadBytes: 10, maxCheckpointBytes: 20, rateBytesPerSec: 30, burstBytes: 40, feedDefaultLimit: 50, readDefaultBytes: 60, readBatchMaxStreams: 70, maxSubscriptions: 128 },
+			rekey: { removals: 2, rekeyed: 1 },
 		}));
 		assert.deepEqual(full, {
 			type: "VAULT_READY", vaultEpoch: "E1", head: 42, canWrite: true, deviceId: "dev", runtimeEpoch: "R",
 			liveness: { idleMs: 60000, timeoutMs: 15000, keepalive: false },
 			limits: { maxPayloadBytes: 10, maxCheckpointBytes: 20, rateBytesPerSec: 30, burstBytes: 40, feedDefaultLimit: 50, readDefaultBytes: 60, readBatchMaxStreams: 70, maxSubscriptions: 128 },
+			rekey: { removals: 2, rekeyed: 1 },
 		});
 		const bare = parseControl(CONTROL_PREFIX + JSON.stringify({ type: "VAULT_READY", vaultEpoch: "E", head: 0, limits: { maxPayloadBytes: -1 } }));
 		assert.ok(bare && bare.type === "VAULT_READY");
 		assert.equal(bare.canWrite, false);
 		assert.equal(bare.liveness, null);
 		assert.equal(bare.limits, null, "a non-positive or missing limit voids the set");
+		assert.equal(bare.rekey, null, "no key-roll signal: the connect fails closed");
 		const noLimits = parseControl(CONTROL_PREFIX + JSON.stringify({ type: "VAULT_READY", vaultEpoch: "E", head: 0 }));
 		assert.ok(noLimits && noLimits.type === "VAULT_READY" && noLimits.limits === null);
 		assert.equal(parseControl(CONTROL_PREFIX + JSON.stringify({ type: "VAULT_READY", head: 1 })), null, "vaultEpoch required");
+	});
+
+	it("parses the key-roll signal: VAULT_REKEY and VAULT_READY.rekey are two counts, rekeyed never above removals", () => {
+		const ready = (rekey: unknown) => {
+			const c = parseControl(CONTROL_PREFIX + JSON.stringify({ type: "VAULT_READY", vaultEpoch: "E", head: 0, rekey }));
+			return c && c.type === "VAULT_READY" ? c.rekey : "not ready";
+		};
+		assert.deepEqual(ready({ removals: 0, rekeyed: 0 }), { removals: 0, rekeyed: 0 });
+		for (const bad of [null, {}, { removals: 1 }, { removals: 1, rekeyed: 2 }, { removals: -1, rekeyed: 0 }, { removals: 1.5, rekeyed: 0 }, { removals: "1", rekeyed: 0 }]) {
+			assert.equal(ready(bad), null, JSON.stringify(bad));
+		}
+		assert.deepEqual(parseControl(`${CONTROL_PREFIX}{"type":"VAULT_REKEY","removals":3,"rekeyed":1}`), { type: "VAULT_REKEY", removals: 3, rekeyed: 1 });
+		assert.equal(parseControl(`${CONTROL_PREFIX}{"type":"VAULT_REKEY","removals":1,"rekeyed":3}`), null);
+		assert.equal(parseControl(`${CONTROL_PREFIX}{"type":"VAULT_REKEY","removals":1}`), null);
+		assert.equal(encodeRekeyed(2), `${CONTROL_PREFIX}{"type":"VAULT_REKEYED","removals":2}`);
 	});
 
 	it("parses receipts, rejects malformed receipt lists", () => {

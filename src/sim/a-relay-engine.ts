@@ -189,6 +189,9 @@ export class RelayEngine {
 
 	// ---- messages ---------------------------------------------------------------
 
+	/** VAULT_REKEYED from an admitted socket (the host's noteRekeyed: SimRelay sets it). */
+	onRekeyed: (removals: number) => void = () => undefined;
+
 	arrive(session: SimRelaySession, msg: UpMsg): void {
 		if (msg.k === "close") {
 			session.markServerClosed();
@@ -202,6 +205,7 @@ export class RelayEngine {
 		// Every message is charged before parsing, text (subscribe, ping) in UTF-16 units (server message()).
 		if (!this.charge(session, msg.bytes, msg.k !== "append")) return;
 		if (msg.k === "ping") session.send({ k: "pong", head: this.store.head(), probeId: msg.probeId });
+		else if (msg.k === "rekeyed") this.onRekeyed(msg.removals);
 		else if (msg.k === "subscribe") this.subscribe(session, msg.streams);
 		else this.append(session, msg.wire);
 	}

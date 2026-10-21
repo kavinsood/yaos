@@ -70,6 +70,16 @@ export interface RelayLimits {
 	readonly maxSubscriptions: number;
 }
 
+/**
+ * The key-roll signal (e2ee-design §14.5, relay-wire §3.2 `rekey`, §4.3 VAULT_REKEY): the operator's blocking device
+ * removals, and the highest such count a device has since covered with a new vault key. A roll is due while
+ * `removals > rekeyed`. Server metadata, not a key: it only decides whether this device prompts the user.
+ */
+export interface RekeySignal {
+	readonly removals: number;
+	readonly rekeyed: number;
+}
+
 export interface AppendFrame {
 	readonly stream: StreamName;
 	readonly clientFrameId: ClientFrameId;
@@ -172,6 +182,8 @@ export type RelayEvent =
 	| { readonly t: "backpressure" }
 	/** Head hint (STREAM_RECEIPTS.head, VAULT_PONG.head): a gap probe. */
 	| { readonly t: "head"; readonly headSeq: Seq }
+	/** VAULT_REKEY: the key-roll signal changed (a blocking removal, or some device covered removals with a new key). */
+	| { readonly t: "rekey"; readonly rekey: RekeySignal }
 	/** errorCode: the control error preceding the close (e.g. "unauthorized", "update_required", "authority_superseded"). */
 	| { readonly t: "closed"; readonly code: number; readonly errorCode: string | null; readonly wasClean: boolean };
 
@@ -182,6 +194,8 @@ export interface RelaySession {
 	readonly headSeq: Seq;
 	/** false for read-only members: the engine never appends or puts checkpoints. */
 	readonly canWrite: boolean;
+	/** VAULT_READY.rekey: the key-roll signal when the session opened; later changes arrive as "rekey" events. */
+	readonly rekey: RekeySignal;
 	readonly limits: RelayLimits;
 	/** Queued and sent in call order. Outcome arrives as receipt / refused / closed / resendUnreceipted. */
 	append(frame: AppendFrame): void;
@@ -211,6 +225,11 @@ export interface RelaySession {
 	 * Only the device check calls it (engine/compose/deviceCheck.ts).
 	 */
 	ping(): Promise<{ readonly headSeq: Seq }>;
+	/**
+	 * VAULT_REKEYED (relay-wire §4.2): this device has rolled the vault key (a won revoke record) after it had seen
+	 * `removals` blocking removals. Fire and forget: the relay answers every socket with VAULT_REKEY when it takes it.
+	 */
+	ackRekey(removals: number): void;
 	close(code: number, reason: string): void;
 }
 

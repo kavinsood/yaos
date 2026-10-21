@@ -11,6 +11,7 @@
 
 import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
+import type { RekeySignal } from "../../ports/relay";
 
 export const FRAME_APPEND = 0x01;
 export const FRAME_PROVISIONAL = 0x10;
@@ -202,6 +203,8 @@ export interface WireReceipt {
 export type WireControl =
 	| {
 		readonly type: "VAULT_READY";
+		/** null when absent or malformed: the connect fails closed (update-required), as for `limits`. */
+		readonly rekey: RekeySignal | null;
 		readonly vaultEpoch: string;
 		readonly head: number;
 		readonly canWrite: boolean;
@@ -218,6 +221,7 @@ export type WireControl =
 	| { readonly type: "STREAM_RESEND"; readonly head: number; readonly runtimeEpoch: string | null }
 	| { readonly type: "VAULT_PONG"; readonly probeId: string | null; readonly head: number }
 	| { readonly type: "VAULT_BACKPRESSURE"; readonly reason: string | null }
+	| ({ readonly type: "VAULT_REKEY" } & RekeySignal)
 	| {
 		readonly type: "VAULT_ERROR";
 		readonly code: string;
@@ -235,6 +239,11 @@ export function encodeControl(message: Readonly<Record<string, unknown>>): strin
 /** STREAM_SUBSCRIBE (relay-wire §5.6): the full replacement set. */
 export function encodeSubscribe(streams: readonly string[]): string {
 	return encodeControl({ type: "STREAM_SUBSCRIBE", streams });
+}
+
+/** VAULT_REKEYED (relay-wire §4.2): this device rolled the vault key after seeing `removals` blocking removals. */
+export function encodeRekeyed(removals: number): string {
+	return encodeControl({ type: "VAULT_REKEYED", removals });
 }
 
 export function encodePing(probeId: string): string {
@@ -283,6 +292,15 @@ function parseLimits(value: unknown): WireLimits | null {
 		out[key] = v;
 	}
 	return out as WireLimits;
+}
+
+/** `{removals, rekeyed}`, two safe integers ≥ 0 with rekeyed ≤ removals; null otherwise. */
+function parseRekey(value: unknown): RekeySignal | null {
+	if (!isRecord(value)) return null;
+	const removals = seqOf(value, "removals");
+	const rekeyed = seqOf(value, "rekeyed");
+	if (removals === null || rekeyed === null || rekeyed > removals) return null;
+	return { removals, rekeyed };
 }
 
 function parseReceipts(value: unknown): WireReceipt[] | null {
@@ -334,7 +352,12 @@ export function parseControl(text: string): WireControl | null {
 				runtimeEpoch: str(o, "runtimeEpoch"),
 				liveness,
 				limits: parseLimits(o["limits"]),
+				rekey: parseRekey(o["rekey"]),
 			};
+		}
+		case "VAULT_REKEY": {
+			const rekey = parseRekey(o);
+			return rekey === null ? null : { type: "VAULT_REKEY", ...rekey };
 		}
 		case "STREAM_RECEIPTS": {
 			const head = seqOf(o, "head");

@@ -45,6 +45,7 @@ class FakeClock implements ClockPort {
 class FakeSession implements RelaySession {
 	readonly vaultEpoch = "e1";
 	readonly headSeq = 0;
+	readonly rekey = { removals: 0, rekeyed: 0 };
 	readonly appends: AppendFrame[] = [];
 	buffered = 0;
 	readonly limits;
@@ -58,6 +59,7 @@ class FakeSession implements RelaySession {
 	read(): never { throw new Error("unused"); }
 	readBatch(): never { throw new Error("unused"); }
 	ping(): never { throw new Error("unused"); }
+	ackRekey(): never { throw new Error("unused"); }
 	putCheckpoint(): never { throw new Error("unused"); }
 	onEvent(): () => void { return () => {}; }
 	close(): void {}

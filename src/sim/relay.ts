@@ -133,6 +133,7 @@ export class SimRelay implements RelayPort {
 			autoCommit: options.autoCommit ?? true,
 		});
 		this.engine.hiddenFor = (deviceId, stream) => this.isHidden(deviceId, stream);
+		this.engine.onRekeyed = (removals) => this.noteRekeyed(removals);
 		this.host = {
 			clock: this.clock,
 			arrive: (session, msg) => this.engine.arrive(session, msg),
@@ -163,7 +164,7 @@ export class SimRelay implements RelayPort {
 				if (this.engine.streamSockets().length >= this.maxSockets) return resolve({ ok: false, reason: "unavailable", retryAfterMs: 1000 });
 				const session = new SimRelaySession(
 					this.host, this.nextSessionId++, this.engine.nextOrdinal(), params.deviceId, this.epoch,
-					this.store.head(), !this.readOnly.has(params.deviceId), this.limits, link,
+					this.store.head(), !this.readOnly.has(params.deviceId), this.limits, link, { ...this.rekey },
 				);
 				this.engine.accept(session);
 				this.tracked.push(session);
@@ -462,6 +463,29 @@ export class SimRelay implements RelayPort {
 			this.engine.serverClose(session, 4403, "authority_superseded", true);
 		}
 		this.engine.dropDevice(deviceId);
+	}
+
+	/**
+	 * The key-roll signal (server host.ts countRemoval / noteRekeyed, e2ee-design §14.5): the operator's blocking
+	 * removals and the highest count a device covered with a new vault key. Authority: a reset or restore keeps it.
+	 */
+	readonly rekey = { removals: 0, rekeyed: 0 };
+
+	/** A blocking removal ("Revoke pairing"): call with `revoke` of its devices. Every open socket hears VAULT_REKEY. */
+	countRemoval(): void {
+		this.rekey.removals++;
+		this.broadcastRekey();
+	}
+
+	/** VAULT_REKEYED: only a count above `rekeyed` and at most `removals` is taken, then broadcast. */
+	private noteRekeyed(removals: number): void {
+		if (removals <= this.rekey.rekeyed || removals > this.rekey.removals) return;
+		this.rekey.rekeyed = removals;
+		this.broadcastRekey();
+	}
+
+	private broadcastRekey(): void {
+		for (const session of this.engine.streamSockets()) session.send({ k: "rekey", ...this.rekey });
 	}
 
 	unrevoke(deviceId: DeviceId): void {

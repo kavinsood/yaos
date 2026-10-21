@@ -84,6 +84,12 @@ export interface StatusSnapshot {
 	 */
 	readonly maxBlobBytes: number | null;
 	readonly notices: readonly { readonly code: string; readonly level: "info" | "warn" | "error"; readonly atMs: number }[];
+	/**
+	 * The relay's key-roll signal (e2ee-design §14.5): the operator's blocking device removals and the highest count a
+	 * device has covered with a new vault key. Main prompts for a key roll while `removals > rekeyed` (suite 1 only).
+	 * Absent from a status without a vault runtime (the key reader, idle), null before the runtime's first session.
+	 */
+	readonly rekey?: { readonly removals: number; readonly rekeyed: number } | null;
 	/** End-to-end encryption state (e2ee-design §18.4). No secrets. Set by the vault runtime and the key reader; absent from the idle status before either exists (compose/statusMerge.ts idleStatus). */
 	readonly e2ee?: E2eeStatus;
 }

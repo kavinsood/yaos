@@ -536,9 +536,15 @@ export class LogEngine {
 	installKeyRk(rk: Uint8Array): Promise<"verified" | "pending"> {
 		return this.c.keyring.installRk(rk);
 	}
-	/** §14.2 step 2: zero-fills `rk`. */
-	revokeRekey(rk: Uint8Array): Promise<OwnOutcome> {
-		return this.c.keyring.revokeRekey(rk);
+	/**
+	 * §14.2 step 2: zero-fills `rk`. A won record covers the blocking removals this engine had seen when it started
+	 * (e2ee-design §14.5): the relay is told so (VAULT_REKEYED), and the other devices stop prompting.
+	 */
+	async revokeRekey(rk: Uint8Array): Promise<OwnOutcome> {
+		const seen = this.c.rekey.signal?.removals ?? 0;
+		const o = await this.c.keyring.revokeRekey(rk);
+		if (o === "won") this.c.rekey.covered(seen);
+		return o;
 	}
 	diagnostics(): readonly DiagnosticsEvent[] {
 		return this.c.diagnostics();
