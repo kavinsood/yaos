@@ -760,10 +760,22 @@ export class CanvasWorld {
 			// which that value replaced there, unless another canvas still holds them (hot canvas seed 570: a no-base
 			// merge put A's two successive colours into a conflict copy, the user deleted it, the first colour was
 			// counted as lost).
+			// A removal in that chain goes too, and the chain goes on through what it removed (hot canvas seed 211:
+			// offline B set a colour, cleared it, set another; the copy held the last, the user deleted it, and the
+			// clear and the first colour were counted as lost).
 			const discard = (rec: string, f: string, v: string): void => {
 				this.oracle.discarded.add(`${rec}|${f}|${v}`);
 				const w = this.oracle.writes.get(`${rec}|${f}|${v}`);
-				for (let cur = w; cur && cur.saw !== null && cur.saw !== ABSENT; ) {
+				for (let cur = w; cur && cur.saw !== null; ) {
+					if (cur.saw === ABSENT) {
+						const at = cur.atMs;
+						const rms = (this.oracle.removals.get(`${rec}|${f}`) ?? []).filter((r) => r.dev === w!.dev && r.path === w!.path && r.atMs <= at && r !== cur);
+						const rm = rms[rms.length - 1];
+						if (!rm || this.oracle.discardedRemovals.has(rm)) break;
+						this.oracle.discardedRemovals.add(rm);
+						cur = rm;
+						continue;
+					}
 					const prev = this.oracle.writes.get(`${rec}|${f}|${cur.saw}`);
 					const k = `${rec}|${f}|${cur.saw}`;
 					if (!prev || prev.dev !== w!.dev || prev.path !== w!.path || held.has(k) || this.oracle.discarded.has(k)) break;
