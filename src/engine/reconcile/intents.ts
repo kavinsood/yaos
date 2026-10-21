@@ -168,6 +168,7 @@ async function resumeKeepBoth(env: Env, i: IntentRecord, docId: DocId, from: Vau
 		return true;
 	}
 	const res = await fetchAndWrite(env, docId, from, r.blob.hash, r.blob.size, { t: "hash", hash: subject });
+	if (res === "ok") env.ctx.deps.observeConflict?.("recovered", "intent");
 	return res === "ok";
 }
 

@@ -90,6 +90,8 @@ export const SIM_SETTINGS: EngineSettings = {
 
 export interface SimDeviceOptions {
 	readonly name: string;
+	/** The device label the user gave it (conflict copy names); default `name`. */
+	readonly label?: string;
 	readonly clock: VirtualClock;
 	readonly net: SimNet;
 	readonly profile?: CaseProfile;
@@ -338,7 +340,7 @@ export class SimDevice {
 	/** What the plugin controller builds from data.json and the install record (pluginController.ts startNow). */
 	hostIdentity(vaultId = SIM_VAULT_ID): HostIdentity {
 		const rec = loadInstallRecord(this.installStorage, vaultId, (n) => new SeededRandom(hashLabel(`install:${this.machineKey}#${++this.installs}`)).bytes(n));
-		return { vaultId, deviceLabel: this.opts.name, relay: { url: "sim://relay", grantSecret: this.grantSecret ?? "" }, installKey: rec.installKey, lineage: lineageOf(rec), predecessor: rec.current };
+		return { vaultId, deviceLabel: this.opts.label ?? this.opts.name, relay: { url: "sim://relay", grantSecret: this.grantSecret ?? "" }, installKey: rec.installKey, lineage: lineageOf(rec), predecessor: rec.current };
 	}
 
 	/** This device's install record (lineage), as main keeps it. */

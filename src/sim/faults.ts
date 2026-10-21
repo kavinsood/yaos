@@ -46,6 +46,7 @@
  * as the clock runs; settle() waits for every inspection before the checks).
  */
 
+import { BRAKE_MAX_CONFLICT_COPIES } from "../core/limits";
 import type { DeviceId } from "../core/types";
 import type { LifecycleEvent } from "../ports/platform";
 import type { TimerHandle } from "../ports/clock";
@@ -80,6 +81,17 @@ export type FaultAction =
 	| { readonly t: "lostSend"; readonly dev: number; readonly count: number }
 	/** The next group commit (holding a PROVISIONAL some socket was sent, with `provisional`) fails. */
 	| { readonly t: "commitFail"; readonly fault: "durability" | "restart-after"; readonly provisional: boolean }
+	/**
+	 * The app dies right after device `dev` next writes a conflict copy (before the merge's own write of the original
+	 * and the intent's end): the restart resumes the conflict-copy intent (reconcile/intents.ts).
+	 */
+	| { readonly t: "conflictCrash"; readonly dev: number; readonly downMs: number }
+	/**
+	 * Device `dev`'s store is lost with its mirrors (app down downMs) while an external tool rewrites every note in its
+	 * vault folder (a formatter run over a restored backup): the new store has no base for any of them, so each note
+	 * whose text differs from the vault's is a no-base conflict copy, hundreds at once in a big vault (conflict-flood).
+	 */
+	| { readonly t: "floodRewrite"; readonly dev: number; readonly downMs: number }
 	/** A hostile / buggy member device appends a frame no honest client builds (hostile.ts). */
 	| HostileAction
 	| { readonly t: "relayRestart" }
@@ -163,8 +175,9 @@ export const DEFAULT_FAULTS: FaultWeights = {
 	clone: 0, syncedConfig: 0,
 	// Targeted relay faults (RELAY_FAULTS): last and weight 0 here, so the default plans draw as before.
 	targetedDrop: 0, lostSend: 0, commitFail: 0,
-	// A hostile member device (HOSTILE_FAULTS): last and weight 0 here, so the default plans draw as before.
-	hostile: 0,
+	// A hostile member device (HOSTILE_FAULTS), a crash mid conflict copy (CONFLICT_FAULTS): last and weight 0 here,
+	// so the default plans draw as before.
+	hostile: 0, conflictCrash: 0, floodRewrite: 0,
 };
 
 /**
@@ -182,6 +195,18 @@ export const RELAY_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, socketDrop: 2, ta
  * epoch to seal under; both skipped in suite 0).
  */
 export const HOSTILE_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, hostile: 6, keyRoll: 0.7, revoke: 0.7 };
+
+/**
+ * Conflict copies (with BIG_OPS): long offline periods so both sides edit the same notes, and a crash right after a
+ * conflict copy's write, before the merge finishes (the restart resumes the intent).
+ */
+export const CONFLICT_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, offline: 10, conflictCrash: 4 };
+
+/**
+ * The conflict-flood brake (nightly, with storms for a vault of hundreds of notes): a store lost while an external
+ * tool rewrites the whole vault folder, so the new store meets every note as a no-base conflict.
+ */
+export const FLOOD_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, floodRewrite: 4 };
 
 /**
  * The default matrix plus a copied vault folder run as a second device (clone) and a sync tool carrying the plugin's
@@ -260,6 +285,8 @@ export function generateFault(rng: SeededRandom, devices: number, weights: Fault
 		case "lostSend": return { t: "lostSend", dev, count: rng.range(1, 4) };
 		case "commitFail": return { t: "commitFail", fault: rng.chance(0.6) ? "durability" : "restart-after", provisional: rng.chance(0.7) };
 		case "hostile": return { t: "hostile", kind: rng.pick(HOSTILE_KINDS), pick: rng.float() };
+		case "conflictCrash": return { t: "conflictCrash", dev, downMs: rng.range(200, 10_000) };
+		case "floodRewrite": return { t: "floodRewrite", dev, downMs: rng.range(200, 10_000) };
 		case "suspendKill": return { t: "suspendKill", dev, event: rng.pick(["hidden", "pagehide", "freeze"] as const), budget: rng.pick(SUSPEND_BUDGETS), save: rng.chance(0.5) ? "landed" : "lost", downMs: rng.range(200, 10_000), durationMs: rng.range(100, 30_000) };
 	}
 }
@@ -306,7 +333,7 @@ export class FaultState {
 		socketDrop: 0, relayRestart: 0, relayDrain: 0, httpFail: 0, dailyLimit: 0, epochReset: 0, clockSkew: 0,
 		keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
 		blobStall: 0, blobSlow: 0, relaySubsLost: 0, suspendKill: 0, clone: 0, syncedConfig: 0,
-		targetedDrop: 0, lostSend: 0, commitFail: 0, hostile: 0,
+		targetedDrop: 0, lostSend: 0, commitFail: 0, hostile: 0, conflictCrash: 0, floodRewrite: 0,
 	};
 	/** The device pair a sync tool links now (syncedConfig), and how to end it. */
 	private synced: { readonly a: number; readonly b: number; readonly end: () => void } | null = null;
@@ -498,6 +525,40 @@ export class FaultState {
 				this.net.relay.armDrop(d.deviceId, f.at, then);
 				this.counts.targetedDrop++;
 				return `${tag} at ${f.at}${f.offlineMs > 0 ? `, offline ${f.offlineMs}ms` : ""}`;
+			}
+			case "conflictCrash": {
+				if (this.armed.has(f.dev)) return `skip ${tag}: already armed`;
+				this.armed.add(f.dev);
+				const vault = d.vault;
+				vault.afterWrite = (path) => {
+					const m = /^(.*) \(conflict [^)]*\)(\.[^./]*)?$/.exec(path);
+					if (!m) return;
+					// A copy of an open note is the editor's (boundDisk, no intent): wait for the reconciler's.
+					const orig = `${m[1]}${m[2] ?? ""}`;
+					if (d.workspace.views_().some((v) => v.path === orig)) return;
+					vault.afterWrite = null;
+					// Before the engine sees the write's result (exec answers on a later turn).
+					queueMicrotask(() => {
+						if (!this.armed.delete(f.dev) || this.down.has(f.dev) || d.vault !== vault) return;
+						this.counts.conflictCrash++;
+						this.crash(f.dev, f.downMs, {});
+					});
+				};
+				return `${tag} down ${f.downMs}ms`;
+			}
+			case "floodRewrite": {
+				const notes = [...d.vault.snapshot().keys()].filter((p) => p.endsWith(".md")).length;
+				if (notes <= BRAKE_MAX_CONFLICT_COPIES) return `skip ${tag}: ${notes} notes (no flood)`;
+				this.crash(f.dev, f.downMs, { wipe: true, dropMirrors: true });
+				// The tool appends a line to every note (tokens kept: nothing for the ledger).
+				let n = 0;
+				for (const [path, text] of d.vault.snapshot()) {
+					if (!path.endsWith(".md")) continue;
+					d.vault.externalWrite(path, `${text}${text.endsWith("\n") ? "" : "\n"}formatted\n`);
+					n++;
+				}
+				this.counts.floodRewrite++;
+				return `${tag} ${n} notes, down ${f.downMs}ms`;
 			}
 			case "lostSend":
 				this.net.relay.loseSends(d.deviceId, f.count);
@@ -768,7 +829,10 @@ export class FaultState {
 		for (const i of [...this.backgrounded.keys()]) this.foreground(i);
 		this.held.clear();
 		for (const i of [...this.down]) this.restart(i);
-		for (const i of [...this.armed]) this.devs[i]?.storage.setCommitHook(null);
+		for (const i of [...this.armed]) {
+			this.devs[i]?.storage.setCommitHook(null);
+			if (this.devs[i]) this.devs[i]!.vault.afterWrite = null;
+		}
 		this.armed.clear();
 		this.healHttp();
 		this.healLimit();

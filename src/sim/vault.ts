@@ -164,6 +164,8 @@ export class SimVault implements VaultPort {
 	readonly calls = { write: 0, rename: 0, trash: 0, removeEmptyFolder: 0, list: 0, readBytes: 0 };
 	/** Fault hook: make the next N port operations throw (I/O error). */
 	failNextOps = 0;
+	/** Fault hook: called after each successful port write (faults.ts conflictCrash). */
+	afterWrite: ((path: VaultPath) => void) | null = null;
 
 	constructor(private readonly opts: SimVaultOptions) {
 		this.configDir = opts.configDir ?? ".obsidian";
@@ -225,6 +227,7 @@ export class SimVault implements VaultPort {
 			if ((now ? now.version : -1) !== version) continue;
 			if (!pass) return { ok: false, reason: "precondition", current: cur ? this.stamp(cur) : null, message: `precondition ${precondition.t} failed` };
 			const f = this.commit(path, bytes, "sync");
+			this.afterWrite?.(path);
 			return { ok: true, stat: this.stamp(f) };
 		}
 		return { ok: false, reason: "io", current: null, message: "file kept changing during CAS" };

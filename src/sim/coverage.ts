@@ -10,7 +10,8 @@
  *                          plan.reconcileContent.{base,noBase,pathBase}, plan.rebind.adopt, plan.wait.<reason>
  *   conflict.<reason>      conflict copy events (RuntimeObserver.conflict): a merge's copy in a reconcile job or a
  *                          bound reload (both-edited / too-large / no-base), a name taken between pick and write
- *                          (path-taken), a copy an intent resume finished after a crash (recovered)
+ *                          (path-taken), a copy an intent resume finished (recovered: a crash left it open, or a
+ *                          blob keep-both's download had not finished)
  *   brake.<reason>         distinct brake reports (by id) per device
  *   diag.<code>            LogEngine diagnostics of every device engine (SimDevice.diagCounts, class suffix folded)
  *   host.<counter>         engine stats over every runtime of a device (bound conflict copies, provisionals

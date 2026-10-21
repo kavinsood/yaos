@@ -112,8 +112,9 @@ export interface RuntimeObserver {
 	/**
 	 * A conflict copy event: written by a merge (`reason` the merge's: both-edited / too-large / no-base) in a
 	 * reconcile job ("merge", "canvas") or a bound reload ("bound"); "path-taken": the copy's name was taken by another
-	 * writer between the pick and the write (the absent precondition failed); "recovered": an intent resume after a
-	 * crash found the copy safe and finished the job ("intent").
+	 * writer between the pick and the write (the absent precondition failed); "recovered": an intent resume found the
+	 * copy safe and finished the job ("intent"): a markdown / canvas copy a crash left open, or a blob keep-both whose
+	 * download had not finished.
 	 */
 	conflict?(reason: ConflictReason, where: ConflictWhere): void;
 }

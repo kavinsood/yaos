@@ -99,6 +99,11 @@ export interface SimConfig {
 	 */
 	readonly storms?: number;
 	/**
+	 * Every device carries the same label (two phones both called "iPhone"): conflict copies made on two devices in
+	 * the same minute want the same name. Default false (each device's label is its name).
+	 */
+	readonly sameLabels?: boolean;
+	/**
 	 * Draw every device's engine tuning and budgets per seed (tuningWorld) over the checkpoint world's; `tuning`
 	 * still overrides. Default false (the fixed FAST_TUNING matrices).
 	 */
@@ -478,6 +483,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			const watch = dr.fork("watch");
 			return new SimDevice({
 				name, clock, net, profile,
+				...(cfg.sameLabels ? { label: "iPhone" } : {}),
 				settings: cw.snapshots[di] ? () => SNAPSHOT_SETTINGS : () => RUN_SETTINGS,
 				tuning: { ...cw.tuning, ...(tw?.[di]?.tuning ?? {}), ...cfg.tuning },
 				...(tw?.[di] ? { budgets: tw[di].budgets } : {}),
@@ -565,7 +571,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			if (line.startsWith("skip")) skipped++;
 			// A lost store's unsent ops go with it unless its mirrors survive: the successor store re-issues them
 			// (identity-per-store §5.2 predecessor recovery). idbLost keeps the mirrors (OS eviction of IndexedDB only).
-			else if ("fault" in step && step.fault.t === "idbWipe" && !step.fault.mirrors) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
+			else if ("fault" in step && ((step.fault.t === "idbWipe" && !step.fault.mirrors) || step.fault.t === "floodRewrite")) canvasWorld.oracle.wiped(devs[step.fault.dev]?.name ?? "", clock.now());
 			trace.push(`${step.i} ${line}`);
 			faults.afterStep();
 			brakeUser.poll();
