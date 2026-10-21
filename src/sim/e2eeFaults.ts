@@ -29,7 +29,7 @@
 import * as Y from "yjs";
 import { newClientFrameId } from "../core/codec/ids";
 import { bytesToHex } from "../core/codec/lib0";
-import { KEYRING_STREAM, type DeviceId, type StreamName } from "../core/types";
+import { KEYRING_STREAM, type DeviceId } from "../core/types";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
 import { sealFrame } from "../engine/ingest/envelope";
 import type { KeyringRuntime } from "../engine/keyring/keyringRuntime";

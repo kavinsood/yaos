@@ -24,7 +24,7 @@ import type { BlobAddress, WrapRole } from "../../ports/crypto";
 import { SeededRandom } from "../../sim/random";
 import { openEnvelope, sealCheckpoint, sealFrame } from "../ingest/envelope";
 import { gate, type GateCtx } from "../ingest/gate";
-import { KeyRecordKind, decodeKeyRecord, wrapAad, wrapsOf, type KeyRecord } from "../keyring/record";
+import { decodeKeyRecord, wrapAad, wrapsOf, type KeyRecord } from "../keyring/record";
 import { K, RK_A, VAULT, genesis, revoke, roll } from "../keyring/testkit/world";
 import { deriveSubkey, gcmOpen, importBase } from "./suite1Primitives";
 import { createWebCryptoSuite1, type Suite1Crypto } from "./webCryptoSuite1";

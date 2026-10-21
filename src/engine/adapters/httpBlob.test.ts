@@ -11,7 +11,7 @@ import {
 	startupBlob, type XhrConstructor,
 } from "./httpBlob";
 import { RelayHttpError } from "./relayHttp";
-import { fakeFetch, fakeXhrs, jsonResponse, ManualClock, routedXhr, type FakeRequest, type FakeXhr } from "./relayTestFakes";
+import { fakeFetch, fakeXhrs, jsonResponse, ManualClock, routedXhr, type FakeRequest } from "./relayTestFakes";
 
 const TOKEN = "device-token-SECRET";
 const addr = (i: number) => i.toString(16).padStart(64, "0") as BlobAddress;
@@ -449,7 +449,6 @@ describe("httpBlob", () => {
 
 	it("an error reply's body is read within the transfer: a 404 whose body stalls is stalled, never \"absent\"", async () => {
 		const clock = new ManualClock();
-		const never = <T>(): Promise<T> => new Promise<T>(() => undefined);
 		const deafError = (status: number) => async () => deafResponse(status, {}, null);
 		const cases: [string, typeof fetch, (port: ReturnType<typeof getPort>) => Promise<unknown>][] = [
 			["get 404", deafError(404), (port) => port.get(addr(1))],

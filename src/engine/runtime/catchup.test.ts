@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { StreamName } from "../../core/types";
 import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import { converged, sleep, startTestEngine, until, createDoc, docText, editDoc, renameDoc } from "./testHarness";

@@ -628,7 +628,12 @@ function manualTimers(): { readonly clock: NonNullable<PairingDeps["clock"]>; ad
 		},
 		advance(ms) {
 			now += ms;
-			for (const [h, t] of [...due]) if (t.at <= now) (due.delete(h), t.fn());
+			for (const [h, t] of [...due]) {
+				if (t.at <= now) {
+					due.delete(h);
+					t.fn();
+				}
+			}
 		},
 		pending: () => due.size,
 	};

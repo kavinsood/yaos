@@ -277,7 +277,6 @@ test("a. suite-0 rows forged into a suite-1 vault: every open is suite-downgrade
 	const rows = net.relay.forge(forged.map((f) => ({ stream: f.stream, deviceId: f.deviceId, clientFrameId: f.clientFrameId, payload: f.payload })));
 	assert.equal(rows.length, forged.length);
 	const keyOf = (f: Forged) => bytesToHex(decodeOuter(f.payload).ok ? (decodeOuter(f.payload) as { sealed: Uint8Array }).sealed : new Uint8Array());
-	const opened = (d: number) => forged.filter((f) => taps[d]!.has(keyOf(f)));
 	const mustOpen = forged.filter((f) => f.mustOpen);
 	assert.ok(await clock.runUntil(() => devs.every((d, i) => d.vrt?.log.isIdle() === true && mustOpen.every((f) => taps[i]!.has(keyOf(f)))), 120_000), "both devices read every forged row of a stream they hold");
 	await clock.advance(10_000);
@@ -1366,7 +1365,7 @@ async function linkMatrix(out: Map<string, number>): Promise<void> {
 		["key", { ...base, key: keyParam }],
 		["rekey", protocolParams(buildRekeyLink({ e: 1, k: key.slice() }))],
 	];
-	for (const [state, data, snap, sameVault] of linkDeviceStates()) {
+	for (const [, data, snap, sameVault] of linkDeviceStates()) {
 		for (const [cls, params] of links) {
 			const before = fp(data);
 			const route = routeSetupLink(parseSetupLink(params), data, snap);
@@ -1560,9 +1559,9 @@ test("g. a suite-0 device that sees a k genesis stops with encrypted-vault and i
 		switch (gc) {
 			case "live, typing through the genesis": {
 				await drive(2_000);
-				for (let i = 0; i < 6; i++) (type(), await drive(300));
+				for (let i = 0; i < 6; i++) { type(); await drive(300); }
 				appendGenesis();
-				for (let i = 0; i < 20; i++) (type(), await drive(i < 10 ? 7 : 250)); // edits inside the link delay too
+				for (let i = 0; i < 20; i++) { type(); await drive(i < 10 ? 7 : 250); } // edits inside the link delay too
 				break;
 			}
 			case "offline, genesis, reconnect":
@@ -1570,11 +1569,11 @@ test("g. a suite-0 device that sees a k genesis stops with encrypted-vault and i
 				await drive(2_000);
 				d.setOnline(false);
 				await drive(1_000);
-				if (gc === "offline edits, genesis, reconnect") for (let i = 0; i < 5; i++) (type(), await drive(500));
+				if (gc === "offline edits, genesis, reconnect") for (let i = 0; i < 5; i++) { type(); await drive(500); }
 				appendGenesis();
 				await drive(1_000);
 				d.setOnline(true);
-				for (let i = 0; i < 10; i++) (type(), await drive(400));
+				for (let i = 0; i < 10; i++) { type(); await drive(400); }
 				break;
 			case "restart after the genesis":
 			case "wipe and restart after the genesis":
@@ -1586,20 +1585,20 @@ test("g. a suite-0 device that sees a k genesis stops with encrypted-vault and i
 				await drive(1_000);
 				type();
 				void d.restartApp();
-				for (let i = 0; i < 10; i++) (type(), await drive(400));
+				for (let i = 0; i < 10; i++) { type(); await drive(400); }
 				break;
 			case "fresh suite-0 device, genesis already there":
 				appendGenesis();
 				await drive(1_000);
 				d.vault.userWrite("mine.md", "local\n");
 				void d.start();
-				for (let i = 0; i < 10; i++) (type(), await drive(400));
+				for (let i = 0; i < 10; i++) { type(); await drive(400); }
 				break;
 		}
 		assert.ok(await drive(60_000, () => tally.seen && keyMissing(d) === "encrypted-vault"), `${gc}: encrypted-vault`);
 		const seenSeq = net.relay.head();
 		const genesisSeq = net.relay.rows(KEYRING_STREAM)[0]!.seq;
-		for (let i = 0; i < 10; i++) (type(), await drive(500));
+		for (let i = 0; i < 10; i++) { type(); await drive(500); }
 		d.platform.emit("visible");
 		await drive(10_000);
 		count(t.finals, `${lastStatus(d)?.phase}/${keyMissing(d)}/suite=${e2eeOf(d)?.suite}`);

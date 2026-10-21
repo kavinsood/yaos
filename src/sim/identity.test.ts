@@ -126,7 +126,7 @@ test("IndexedDB loss: the next store has a new identity; it fences the old one, 
 });
 
 test("clone: a vault folder copied onto another device runs as its own identity, never touches the source's dir, and all converge", async () => {
-	const { clock, net, devs } = world();
+	const { clock, devs } = world();
 	const [a, b, c] = three(devs);
 	a.vault.userWrite("note.md", "hello\n");
 	a.vault.userWrite("keep.md", "keep\n");
@@ -258,7 +258,7 @@ test("IndexedDB loss without the fence (the retire key is wrong): the commit che
 test("store removed in the console: the install registers a successor, which recovers the unsent edits from the old store's mirror", async () => {
 	// identity-per-store §4 "Store revoked by the server" with a valid grant: an orderly replacement, nothing lost.
 	const { clock, net, devs } = world(["A", "B"]);
-	const [a, b] = devs as [SimDevice, SimDevice];
+	const [a] = devs as [SimDevice, SimDevice];
 	a.vault.userWrite("note.md", "hello\n");
 	for (const d of devs) void d.start();
 	await clock.advance(15_000);

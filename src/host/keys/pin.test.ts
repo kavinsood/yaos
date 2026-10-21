@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-	isCreating, keyringSeenOf, markedCreating, pinAcross, pinnedSuite, pinnedSuite0, pinnedSuite1, pinsFromKeyring, refuseEnableE2ee,
-	refuseKeyCommand, refusePinSuite0, sanitizeCreating, sanitizePin, sawKeyring, withoutCreating, PIN_REFUSAL_TEXT,
+	isCreating, keyringSeenOf, markedCreating, pinAcross, pinnedSuite, pinnedSuite0, pinnedSuite1, refuseEnableE2ee,
+	refusePinSuite0, sanitizeCreating, sanitizePin, sawKeyring, withoutCreating,
 	type PinFields,
 } from "./pin";
 import { sanitizeStoredData } from "../ui/api";

@@ -14,7 +14,7 @@ import { test } from "node:test";
 import { MAX_INLINE_UPDATE_BYTES } from "../../core/limits";
 import { decodeBodyUpdateRef } from "../../core/codec/contents";
 import { concatBytes } from "../../core/codec/lib0";
-import { KEYRING_STREAM, streamClass, type DocId, type StreamName } from "../../core/types";
+import { KEYRING_STREAM, streamClass, type DocId } from "../../core/types";
 import type { BlobPort } from "../../ports/blob";
 import type { BlobAddress, CryptoPort, SealedBlobParts } from "../../ports/crypto";
 import { SeededRandom } from "../../sim/random";
