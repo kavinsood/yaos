@@ -79,6 +79,8 @@ export interface PlannerContext {
 	readonly remoteTextHash: ReadonlyMap<DocId, ContentHash>;
 	readonly bodyAppliedSeq: ReadonlyMap<DocId, Seq>;
 	readonly restoreDuty: ReadonlySet<DocId>;
+	/** Replica body version of each pruned doc with a restore duty (§c.9 "Pruned docs"). */
+	readonly prunedBody: ReadonlyMap<DocId, BodyVersion>;
 	readonly lostCreateBody: ReadonlySet<DocId>;
 	/** Paths with a path-keyed base carried over an epoch migration (§c.12). */
 	readonly pathBaseKeys: ReadonlySet<PathKey>;
@@ -92,6 +94,7 @@ export const DEFAULT_PLANNER_CONTEXT: PlannerContext = {
 	remoteTextHash: new Map(),
 	bodyAppliedSeq: new Map(),
 	restoreDuty: new Set(),
+	prunedBody: new Map(),
 	lostCreateBody: new Set(),
 	pathBaseKeys: new Set(),
 };
@@ -537,6 +540,14 @@ export function planWith(input0: PlannerInput, options: Partial<PlannerContext> 
 		if (takesNoFreshId(s, l.hash, false) && !hasRestoreDuty(s.docId)) {
 			return push([...prefix, { op: "diskTrash", docId: s.docId, path: l.path, expect: { t: "hash", hash: s.contentHash } }, drop(s.docId)],
 				"diskTrash", brakeKey("diskTrash", s.docId, l.path, s.contentHash), l.path);
+		}
+		// The re-create takes the file's bytes: a replica ahead of what the file was synced at (own edits a bound
+		// editor never saved before a crash, rows from elsewhere) is merged into the file first, under the old id,
+		// and the next pass creates anew from the merged file (sim smallPrune storm seed 200: an unsaved bound edit
+		// lost to a re-create from the file).
+		const replica = s.kind === "blob" ? undefined : ctx.prunedBody.get(s.docId);
+		if (replica && !versionEq(replica, s.bodyVersion) && (l.kind === "markdown" || l.kind === "canvas") && l.kind === s.kind) {
+			return push([...prefix, { op: "reconcileContent", docId: s.docId, path: l.path, kind: l.kind, hasBase: s.hasBase }]);
 		}
 		const id = takeFresh();
 		if (id === null) return push(prefix);

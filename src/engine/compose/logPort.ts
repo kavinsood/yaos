@@ -18,8 +18,9 @@ import type * as Y from "yjs";
 import type { Handle } from "../body/handles";
 import { prunedRestoreDuty } from "../../core/ns/pruned";
 import { canvasDocHashInput } from "../reconcile/canvasDoc";
-import type {
-	BodyVersion, CfgFoldState, CfgOp, ContentHash, DeviceId, DocId, NsOp, PathKey, RemoteEntry, Seq, StreamName,
+import {
+	docStream, type BodyVersion, type CfgFoldState, type CfgOp, type ContentHash, type DeviceId, type DocId, type NsOp,
+	type PathKey, type RemoteEntry, type Seq, type StreamName,
 } from "../../core/types";
 import type { BodyHandle, LogPort, RemoteView, SubmitNsOptions } from "../reconcile/deps";
 import type { LogEngine } from "../runtime/engine";
@@ -57,6 +58,7 @@ export class ComposedLog implements LogPort {
 		const textHash = new Map<DocId, ContentHash>();
 		const appliedSeq = new Map<DocId, Seq>();
 		const restoreDuty = new Set<DocId>();
+		const prunedBody = new Map<DocId, BodyVersion>();
 		const lostCreateBody = new Set<DocId>();
 		const ask = new Set<DeviceId>();
 		const pending = log.docsWithPendingBody();
@@ -89,11 +91,14 @@ export class ComposedLog implements LogPort {
 			}
 		}
 		// Pruned docs (§c.9): a doc the view no longer holds keeps its restore duty while this device's stream record of
-		// it does (tDropStream keeps it while a synced record names the doc): rows past the removed delete's base.
+		// it does (tDropStream keeps it while a synced record names the doc): rows past the removed delete's base. Its
+		// replica's version tells the planner whether the file holds what the replica has.
 		for (const rec of c.repo.streams()) {
 			if ((rec.cls !== "body" && rec.cls !== "canvas") || !rec.docId || ns.state.entries.has(rec.docId)) continue;
 			const base = c.ns.removedDeletes.get(rec.docId)?.deleteBaseBodySeq ?? rec.prunedDeleteBase;
-			if (prunedRestoreDuty(rec, base, c.ns.state.entries.get(rec.docId))) restoreDuty.add(rec.docId);
+			const duty = prunedRestoreDuty(rec, base, c.ns.state.entries.get(rec.docId));
+			if (duty) restoreDuty.add(rec.docId);
+			if (duty || pending.has(rec.docId)) prunedBody.set(rec.docId, rec.bodyVersion);
 		}
 		this.creators?.seen(ask);
 		for (const [key, id] of ns.index.byPathKey) remoteByPathKey.set(key, id);
@@ -109,7 +114,7 @@ export class ComposedLog implements LogPort {
 		this.memo = {
 			remote, remoteByPathKey, nsCoversSeq: ns.coversSeq,
 			nsReady: this.nsCaughtUp && ns.halted === null && !ns.overlayHalted,
-			docsWithPendingBody: pending, restoreDuty, lostCreateBody, textHash, appliedSeq, pendingMoves,
+			docsWithPendingBody: pending, restoreDuty, prunedBody, lostCreateBody, textHash, appliedSeq, pendingMoves,
 		};
 		return this.memo;
 	}
@@ -186,8 +191,11 @@ export class ComposedLog implements LogPort {
 	}
 
 	async acquireBody(docId: DocId, kind: "markdown" | "canvas"): Promise<BodyHandle | null> {
-		const known = this.view().remote.get(docId);
-		if (!known || known.kind !== kind) return null;
+		const view = this.view();
+		const known = view.remote.get(docId);
+		// A pruned doc with a restore duty: its replica is merged into the file before the re-create (§c.9).
+		const pruned = !known && view.prunedBody.has(docId) && this.log.c.repo.stream(docStream(kind, docId)!) !== undefined;
+		if (!pruned && (!known || known.kind !== kind)) return null;
 		this.stats.acquires++;
 		const h = await this.log.openBody(docId, kind);
 		if (!h) return null;

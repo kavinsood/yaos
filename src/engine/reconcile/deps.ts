@@ -44,6 +44,11 @@ export interface RemoteView {
 	readonly docsWithPendingBody: ReadonlySet<DocId>;
 	/** Restore duty (§c.7) beyond docsWithPendingBody. */
 	readonly restoreDuty: ReadonlySet<DocId>;
+	/**
+	 * Body version of the replica of each doc the view no longer holds (pruned, §c.9 "Pruned docs") that has a restore
+	 * duty or own body frames to send: the pruned row merges the replica into the file before it re-creates the doc.
+	 */
+	readonly prunedBody: ReadonlyMap<DocId, BodyVersion>;
 	/** Live docs this device created whose initial body reached no one and is no longer pending here (store lost). */
 	readonly lostCreateBody: ReadonlySet<DocId>;
 	/** streams.textHash of caught-up md/canvas docs. */

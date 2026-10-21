@@ -548,8 +548,11 @@ path (example E8).
     of them (base 0): anyone's rows exceed 0, and every device would re-create. A doc only the optimistic view
     pruned (an own pending frame's prune) is judged by its committed entry;
   - the planner's pruned row never trashes a file with a restore duty: it re-creates it under a fresh docId with
-    the file's content, which holds this device's rows (§f.2). The doc comes back as edit-beats-delete would have
-    brought it back, under a new id.
+    the file's content (§f.2). The doc comes back as edit-beats-delete would have brought it back, under a new id.
+    The file holds this device's rows only once it is synced at the replica's body version: the view hands the
+    replica's version of each such doc (`RemoteView.prunedBody`), and while it differs from `S.bodyVersion` (an edit
+    a bound editor never saved before a crash, rows from elsewhere) the row runs `reconcileContent` under the old id
+    first (`acquireBody` opens a pruned doc's replica for it), and the re-create follows from the merged file.
   - **Invariant.** Body rows of a doc that the doc's delete did not cover (seq > `deleteBaseBodySeq`, or not yet
     committed) are never trashed on their author's device because the delete was pruned, and a device that saw such
     rows re-creates from its file too. Every device with the duty re-creates: copies of the same text fold
@@ -1728,7 +1731,7 @@ All are in `src/core/types.ts`.
 | merged → W | present | any | `rebind(S.docId → W)`, then plan as W. |
 | absent (pruned) | present | present, owned by a live doc | The live doc at S.path has its own S there, or its create / blob bytes equal L: `syncedDrop` only. No trash (the owner's row would read the file as a user delete: `nsDelete`), no create (a duplicate). An unsynced owner adopts the file next pass. |
 | absent (pruned) | present | ¬`Lc`, `S.nsTouchSeq > 0`, no restore duty / absent | `diskTrash` (braked) + `syncedDrop` / `syncedDrop`. |
-| absent (pruned) | present | `Lc`, or `S.nsTouchSeq = 0`, or restore duty | `nsCreate` (fresh docId) + `reconcileContent` / `pushBlob`; `syncedDrop(old)`. `nsTouchSeq = 0`: this device never saw the doc committed (S1 stamps an own create's fold seq), so the absence is an own create the fold ignored (`replay-duplicate`, ...), not a prune (below). Restore duty (§c.9 "Pruned docs"): own rows the pruned delete did not cover, or own body frames still to send; the file holds them, and the restore can no longer name the pruned id. |
+| absent (pruned) | present | `Lc`, or `S.nsTouchSeq = 0`, or restore duty | `nsCreate` (fresh docId) + `reconcileContent` / `pushBlob`; `syncedDrop(old)`. `nsTouchSeq = 0`: this device never saw the doc committed (S1 stamps an own create's fold seq), so the absence is an own create the fold ignored (`replay-duplicate`, ...), not a prune (below). Restore duty (§c.9 "Pruned docs"): own rows the pruned delete did not cover, or own body frames still to send; the file holds them, and the restore can no longer name the pruned id. With a duty and the replica's version (`prunedBody`) ≠ `S.bodyVersion`: `reconcileContent(old)` first, the re-create next pass. |
 | live | absent | absent | `diskMaterialize(R.path, expect absent)` once `body.caughtUp && (hasContent ∨ createSize = 0)`, else `wait(body-empty / body-not-caught-up)`. Blob: `fetchBlob`. |
 | live | absent | present | L hash = remote hash (`streams.textHash` / `blob.hash` / `createHash` at initial version) → `syncedPut` (adopt, no I/O). Else `reconcileContent(hasBase: false)`, which gives a no-base conflict copy unless identical. Path-keyed bases from recovery or epoch migration supply a base when present. |
 | absent | absent | present | Portable and not excluded → `nsCreate(freshDocId, path, hash, size)` + initial `reconcileContent` / `pushBlob`. Not portable (§c.2 validity) → notice, skip. |

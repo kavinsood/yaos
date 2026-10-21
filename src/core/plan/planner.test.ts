@@ -642,6 +642,22 @@ test("row pruned: a restore duty (own sent rows the pruned delete did not cover)
 	assert.deepEqual(opsOf(owned).filter((o) => o !== "reconcileContent" && o !== "syncedPut"), ["syncedDrop"]);
 });
 
+test("row pruned: a restore duty with the replica ahead of S -> the replica is merged into the file first, under the old id", () => {
+	// Sim smallPrune storm seed 200: an edit typed into a bound note was never saved (app crash), so it lived in the
+	// replica only; the doc was deleted elsewhere and pruned. A re-create from the file lost the edit.
+	const sc = { synced: [S("d1", "a.md", { bodyVersion: V(10) })], local: [L("a.md", h("c0"), { size: 9 })] };
+	const ahead = { restoreDuty: new Set([id("d1")]), prunedBody: new Map([[id("d1"), V(10, 3)]]) };
+	assert.deepEqual(run(sc, ahead).ops, [{ op: "reconcileContent", docId: "d1", path: "a.md", kind: "markdown", hasBase: true }]);
+	// a changed file merges too: the re-create takes the merged bytes
+	const changed = { ...sc, local: [L("a.md", h("c1"), { size: 9 })] };
+	assert.deepEqual(opsOf(run(changed, ahead)), ["reconcileContent"]);
+	// the replica at S: nothing to merge, the re-create runs
+	const level = { restoreDuty: ahead.restoreDuty, prunedBody: new Map([[id("d1"), V(10)]]) };
+	assert.deepEqual(opsOf(run(sc, level)), ["nsCreate", "reconcileContent", "syncedDrop"]);
+	// no duty: the trash stands whatever the replica holds (the delete covered every row)
+	assert.deepEqual(opsOf(run(sc, { prunedBody: ahead.prunedBody })), ["diskTrash", "syncedDrop"]);
+});
+
 test("row pruned: the file is a live doc's (its S at the path, or its bytes) -> syncedDrop only, no trash, no create", () => {
 	// Sim seed 222: the create from before the IDB wipe did fold (d2, synced here through S1) at the same path, with
 	// the same bytes. Trashing the file for d1 made d2's row read it as deleted by the user: nsDelete everywhere.
