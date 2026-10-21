@@ -192,7 +192,9 @@ Kept here until `sim-port` merges; then git history holds them.
   trashed the editor's sent edits (the restore names a docId the fold no longer has). Pruned docs keep their restore
   duty on the device (§c.9 "Pruned docs"): the `pruned` event carries the removed entries, the delete's base goes onto
   the doc's stream record (also for an ns checkpoint adopted past the prune), and the pruned row re-creates a file
-  with own rows past that base instead of trashing it. The soak's storm failures were the same: a mass delete, or an
+  with own rows past that base instead of trashing it. Each pruned entry also leaves a ~30-byte stub (docId, state,
+  delete base) in the fold state, so a reader that adopts an ns checkpoint past the delete and its prune still knows
+  the base (newest `PRUNED_STUB_CAP` = 100k; past it a device that knows nothing of the doc re-creates its file). The soak's storm failures were the same: a mass delete, or an
   epoch reset's migrated-loser collapse, pruned in the frame that made it. The sim's small cap now draws 0..8, pruned
   to 0..cap (goal 0: every delete pruned at once); plans in `src/sim/regressions/prune-*.json`. Found by the
   small-cap sweeps and fixed on the same branch: the re-create merges a replica ahead of the file (an unsaved bound

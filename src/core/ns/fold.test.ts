@@ -342,6 +342,24 @@ test("E11c the pruned event carries each removed entry as it was (the delete's b
 	assert.equal(w.state.entries.size, 0);
 });
 
+test("E11d a pruned entry leaves a stub (state, delete base, prune seq) in the state; the stub cap drops the oldest", () => {
+	// A reader that adopts a checkpoint past the delete and its prune folds neither: the stub is its delete base.
+	const w = world({ ...DEFAULT_NS_FOLD_RULES, tombstoneCap: 0, pruneHysteresis: 0, prunedCap: 2 });
+	w.fold(1, A, 0, [create(d1, "a.md", H(1)), create(d2, "b.md", H(2))]);
+	w.fold(2, B, 0, [create(d3, "a.md", H(1))]); // alias of d1, pruned at once
+	assert.deepEqual(w.state.pruned.get(d3), { state: "merged", deleteBaseBodySeq: 0, prunedSeq: 2 });
+	w.fold(3, C, 2, [del(d1, 17)]);
+	assert.deepEqual([...w.state.pruned].sort(), [[d1, { state: "deleted", deleteBaseBodySeq: 17, prunedSeq: 3 }], [d3, { state: "merged", deleteBaseBodySeq: 0, prunedSeq: 2 }]].sort());
+	// a third stub: the oldest (d3, pruned at 2) goes
+	w.fold(4, C, 3, [del(d2, 4)]);
+	assert.deepEqual([...w.state.pruned.keys()].sort(), [d1, d2].sort());
+	assert.deepEqual(w.state.pruned.get(d2), { state: "deleted", deleteBaseBodySeq: 4, prunedSeq: 4 });
+	// encoded and verified with the state
+	const back = decodeNsFoldV1(encodeNsFoldV1(w.state))!;
+	assert.deepEqual(back.pruned, w.state.pruned);
+	assert.ok(verifyNsFoldBytes(encodeNsFoldV1(w.state), 4).ok);
+});
+
 test("E12 upgradeRules halt: frame folds whole or not at all", () => {
 	const w = world();
 	w.fold(9099, A, 0, [create(d1, "a.md")]);
@@ -479,6 +497,7 @@ test("verify V1: canonical bytes pass; unsorted, duplicate, trailing and non-min
 		const replayDevices = [...s.replay.keys()].sort();
 		wr.varuint(replayDevices.length);
 		for (const d of replayDevices) wr.varstring(d).varuint(s.replay.get(d)!.r).raw(replayBitsToBytes(s.replay.get(d)!.bits));
+		wr.varuint(0); // no pruned stubs
 		return wr.finish();
 	};
 	assert.ok(bytesEqual(raw(w.state, [d1, d2, d3], [A, B]), bytes), "raw helper matches the encoder");

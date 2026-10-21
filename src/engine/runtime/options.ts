@@ -107,6 +107,8 @@ export interface EngineTuning {
 export interface NsPruneRules {
 	readonly tombstoneCap: number;
 	readonly pruneHysteresis: number;
+	/** Pruned-entry stubs kept (PRUNED_STUB_CAP when absent). */
+	readonly prunedCap?: number;
 }
 
 export const DEFAULT_NS_PRUNE: NsPruneRules = { tombstoneCap: TOMBSTONE_CAP, pruneHysteresis: TOMBSTONE_PRUNE_HYSTERESIS };

@@ -96,7 +96,7 @@ export class ComposedLog implements LogPort {
 		for (const rec of c.repo.streams()) {
 			if ((rec.cls !== "body" && rec.cls !== "canvas") || !rec.docId || ns.state.entries.has(rec.docId)) continue;
 			const base = c.ns.removedDeletes.get(rec.docId)?.deleteBaseBodySeq ?? rec.prunedDeleteBase;
-			const duty = prunedRestoreDuty(rec, base, c.ns.state.entries.get(rec.docId));
+			const duty = prunedRestoreDuty(rec, base, c.ns.state.entries.get(rec.docId), c.ns.state.pruned.get(rec.docId));
 			if (duty) restoreDuty.add(rec.docId);
 			if (duty || pending.has(rec.docId)) prunedBody.set(rec.docId, rec.bodyVersion);
 		}

@@ -19,6 +19,12 @@ export const SUFFIX_DOCID_CHARS = 8;
 /** FOLD. Tombstone pool (deleted + merged) cap; prune to cap - hysteresis when exceeded. */
 export const TOMBSTONE_CAP = 20_000;
 export const TOMBSTONE_PRUNE_HYSTERESIS = 1_000;
+/**
+ * FOLD. Pruned-entry stubs kept (DESIGN §c.9 "Pruned docs"): a pruned entry leaves its docId, state and delete base
+ * (~30 bytes) so a reader that adopts an ns checkpoint past the prune still knows the base. Beyond the cap the oldest
+ * stubs go; a reader then knows nothing of the doc and re-creates its file (a resurrection, never a loss).
+ */
+export const PRUNED_STUB_CAP = 100_000;
 /** FOLD. clientFrameIds remembered per device for duplicate-frame suppression (ns and cfg). */
 export const NS_DEDUPE_RING = 64;
 /**

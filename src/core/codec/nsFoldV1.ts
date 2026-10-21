@@ -12,9 +12,12 @@
  * that document; redefined in place, §18): varuint deviceCount, then per
  * device (ascending deviceId) varstring deviceId, varuint r, 8 bytes bitmap
  * (big-endian; bit i = frameNo r − i).
+ *
+ * Last come the pruned-entry stubs (DESIGN §c.9 "Pruned docs"; added in place): varuint count, then per stub
+ * (ascending docId) varstring docId, u8 state (2 deleted, 3 merged), varuint deleteBaseBodySeq, varuint prunedSeq.
  */
 
-import type { ClientFrameId, DeviceId, DocId, NsEntry, NsEntryState, NsFoldState, ReplayWindow } from "../types";
+import type { ClientFrameId, DeviceId, DocId, NsEntry, NsEntryState, NsFoldState, NsPrunedStub, ReplayWindow } from "../types";
 import { NS_DEDUPE_RING } from "../limits";
 import { REPLAY_BITS_BYTES, replayBitsFromBytes, replayBitsToBytes, replayWindowValid } from "../replayWindow";
 import { pathKey } from "../paths/pathKey";
@@ -93,6 +96,12 @@ export function encodeNsFoldV1(state: NsFoldState): Uint8Array {
 	}
 	writeRings(w, state.recentFrames);
 	writeReplay(w, state.replay);
+	const stubs = sortedKeys(state.pruned);
+	w.varuint(stubs.length);
+	for (const id of stubs) {
+		const p = state.pruned.get(id)!;
+		w.varstring(id).u8(STATE_CODE[p.state]).varuint(p.deleteBaseBodySeq).varuint(p.prunedSeq);
+	}
 	return w.finish();
 }
 
@@ -138,8 +147,16 @@ export function decodeNsFoldV1Strict(bytes: Uint8Array): NsFoldState {
 	}
 	const recentFrames = readRings(r);
 	const replay = readReplay(r);
+	const pruned = new Map<DocId, NsPrunedStub>();
+	const stubs = r.varuint();
+	for (let i = 0; i < stubs; i++) {
+		const docId = r.varstring() as DocId;
+		const state = STATE_BY_CODE.get(r.u8());
+		if (state !== "deleted" && state !== "merged") throw new CodecError("bad pruned stub state");
+		pruned.set(docId, { state, deleteBaseBodySeq: r.varuint(), prunedSeq: r.varuint() });
+	}
 	r.end();
-	return { formatVersion: 1, foldRulesVersion, coversSeq, entries, recentFrames, replay };
+	return { formatVersion: 1, foldRulesVersion, coversSeq, entries, recentFrames, replay, pruned };
 }
 
 /** null = malformed (bytes). Canonical form and invariants: src/core/ns/verify.ts. */

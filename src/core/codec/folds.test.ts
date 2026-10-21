@@ -41,7 +41,7 @@ export function sampleNsState(): NsFoldState {
 	const recentFrames = new Map<DeviceId, ClientFrameId[]>([[B, [fid("x")]], [A, [fid("y"), fid("w")]]]);
 	// B: frameNos 70, 69 and 7 (bit 63 = 70 - 63); A: frameNo 3 only.
 	const replay = new Map([[B, { r: 70, bits: BigInt(3) | (BigInt(1) << BigInt(63)) }], [A, { r: 3, bits: BigInt(1) }]]);
-	return { formatVersion: 1, foldRulesVersion: 1, coversSeq: 6, entries, recentFrames, replay };
+	return { formatVersion: 1, foldRulesVersion: 1, coversSeq: 6, entries, recentFrames, replay, pruned: new Map() };
 }
 
 test("nsFoldV1: canonical (insertion-order independent) and round trips", () => {
@@ -69,7 +69,7 @@ test("nsFoldV1: malformed bytes are rejected", () => {
 	assert.equal(decodeNsFoldV1(new Uint8Array([0x81, 0x00, ...bytes.subarray(1)])), null, "non-minimal formatVersion");
 	const empty = new Writer().varuint(1).varuint(1).varuint(0).varuint(0).varuint(1).varstring("d").varuint(0).finish();
 	assert.equal(decodeNsFoldV1(empty), null, "ring n = 0");
-	const ok = new Writer().varuint(1).varuint(1).varuint(0).varuint(0).varuint(0).varuint(0).finish();
+	const ok = new Writer().varuint(1).varuint(1).varuint(0).varuint(0).varuint(0).varuint(0).varuint(0).finish();
 	assert.ok(decodeNsFoldV1(ok));
 });
 
@@ -78,7 +78,7 @@ test("fold-state replay windows: byte layout and strict decode (e2ee-design §8.
 	const win = (r: number | number[], bits: number[]) => {
 		const w = head().varuint(1).varstring("d");
 		if (Array.isArray(r)) w.raw(new Uint8Array(r)); else w.varuint(r);
-		return decodeNsFoldV1(w.raw(new Uint8Array(bits)).finish());
+		return decodeNsFoldV1(w.raw(new Uint8Array(bits)).varuint(0).finish());
 	};
 	assert.deepEqual(win(2, [0, 0, 0, 0, 0, 0, 0, 3])?.replay.get("d" as DeviceId), { r: 2, bits: BigInt(3) });
 	assert.equal(win(0, [0, 0, 0, 0, 0, 0, 0, 1]), null, "r = 0");
@@ -89,11 +89,27 @@ test("fold-state replay windows: byte layout and strict decode (e2ee-design §8.
 	assert.equal(win(100, [0x80, 0, 0, 0, 0, 0, 0, 1])?.replay.get("d" as DeviceId)?.bits, (BigInt(1) << BigInt(63)) | BigInt(1));
 	const sB = sampleNsState();
 	const bytes = encodeNsFoldV1(sB);
-	// Tail: varuint 2, "devA" r=3 bits 1, "devB" r=70 bits 0x8000000000000003.
-	assert.deepEqual([...bytes.subarray(bytes.length - 29)], [
+	// Tail: varuint 2, "devA" r=3 bits 1, "devB" r=70 bits 0x8000000000000003; then no pruned stubs.
+	assert.deepEqual([...bytes.subarray(bytes.length - 30)], [
 		2, 4, ...Buffer.from("devA"), 3, 0, 0, 0, 0, 0, 0, 0, 1,
 		4, ...Buffer.from("devB"), 70, 0x80, 0, 0, 0, 0, 0, 0, 3,
+		0,
 	]);
+});
+
+test("nsFoldV1: pruned-entry stubs (DESIGN §c.9 \"Pruned docs\"): layout, canonical order, strict decode", () => {
+	const s: NsFoldState = { ...sampleNsState(), pruned: new Map([
+		[id("y"), { state: "merged", deleteBaseBodySeq: 0, prunedSeq: 6 }],
+		[id("x"), { state: "deleted", deleteBaseBodySeq: 3, prunedSeq: 5 }],
+	]) };
+	const bytes = encodeNsFoldV1(s);
+	assert.deepEqual(decodeNsFoldV1(bytes)?.pruned, s.pruned);
+	assert.ok(bytesEqual(encodeNsFoldV1({ ...s, pruned: new Map([...s.pruned].reverse()) }), bytes));
+	// count 2, then "xxx..." deleted base 3 at 5, "yyy..." merged base 0 at 6
+	assert.deepEqual([...bytes.subarray(bytes.length - 53)], [2, 22, ...Buffer.from("x".repeat(22)), 2, 3, 5, 22, ...Buffer.from("y".repeat(22)), 3, 0, 6]);
+	const bad = new Uint8Array(bytes);
+	bad[bytes.length - 29] = 1;
+	assert.equal(decodeNsFoldV1(bad), null, "a live stub");
 });
 
 function sampleCfg(): CfgFoldState {

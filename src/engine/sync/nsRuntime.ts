@@ -70,12 +70,13 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 
 	constructor(
 		repo: FoldRepo, self: DeviceId, candidateModulus = NS_CANDIDATE_MODULUS, knownRulesVersion = FOLD_RULES_VERSION,
-		prune: Pick<NsFoldRules, "tombstoneCap" | "pruneHysteresis"> = DEFAULT_NS_FOLD_RULES,
+		prune: Pick<NsFoldRules, "tombstoneCap" | "pruneHysteresis"> & { readonly prunedCap?: number } = DEFAULT_NS_FOLD_RULES,
 	) {
 		super(repo, self, NS_STREAM, candidateModulus);
 		const d = DEFAULT_NS_FOLD_RULES;
-		const same = knownRulesVersion === d.knownRulesVersion && prune.tombstoneCap === d.tombstoneCap && prune.pruneHysteresis === d.pruneHysteresis;
-		this.rules = same ? d : { ...d, knownRulesVersion, tombstoneCap: prune.tombstoneCap, pruneHysteresis: prune.pruneHysteresis };
+		const prunedCap = prune.prunedCap ?? d.prunedCap;
+		const same = knownRulesVersion === d.knownRulesVersion && prune.tombstoneCap === d.tombstoneCap && prune.pruneHysteresis === d.pruneHysteresis && prunedCap === d.prunedCap;
+		this.rules = same ? d : { ...d, knownRulesVersion, tombstoneCap: prune.tombstoneCap, pruneHysteresis: prune.pruneHysteresis, prunedCap };
 	}
 
 	get coversSeq(): Seq {
