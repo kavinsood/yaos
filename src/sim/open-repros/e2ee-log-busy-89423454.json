@@ -1,0 +1,1269 @@
+{
+	"seed": 89423454,
+	"config": {
+		"seed": 89423454,
+		"devices": 5,
+		"crypto": "suite1",
+		"steps": 114,
+		"faults": {
+			"engineCrash": 0,
+			"appCrash": 0,
+			"commitCrash": 3.258,
+			"idbWipe": 0,
+			"idbLost": 0,
+			"offline": 0,
+			"ioFail": 0,
+			"background": 2.387,
+			"socketDrop": 0,
+			"relayRestart": 0,
+			"relayDrain": 0,
+			"httpFail": 3.305,
+			"dailyLimit": 0.301,
+			"epochReset": 0,
+			"clockSkew": 1.441,
+			"keyStoreLoss": 0.832,
+			"keyRoll": 1.468,
+			"revoke": 0.631,
+			"epochRestore": 0,
+			"hostileReplay": 0.726,
+			"hostileDowngrade": 2.342,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"faultRate": 0.247,
+		"randomTuning": true,
+		"cleanups": 0.036,
+		"tuning": {
+			"blobGcGraceMs": 117958
+		}
+	},
+	"violations": [
+		{
+			"inv": "clean",
+			"detail": "no quiescence within 600000ms: A log busy"
+		},
+		{
+			"inv": "retired",
+			"detail": "A holds 2 dead streams: b:2ea-njsrx3gdY8uU1GQPwQ (stream+quarantine), b:buI6qMqSscPoQ0hHEt-Djw (stream+quarantine)"
+		},
+		{
+			"inv": "retired",
+			"detail": "B holds 2 dead streams: b:2ea-njsrx3gdY8uU1GQPwQ (stream+tail), b:buI6qMqSscPoQ0hHEt-Djw (stream+tail)"
+		},
+		{
+			"inv": "retired",
+			"detail": "D holds 2 dead streams: b:2ea-njsrx3gdY8uU1GQPwQ (stream+tail), b:buI6qMqSscPoQ0hHEt-Djw (stream+tail)"
+		},
+		{
+			"inv": "retired",
+			"detail": "E holds 2 dead streams: b:2ea-njsrx3gdY8uU1GQPwQ (stream+tail), b:buI6qMqSscPoQ0hHEt-Djw (stream+tail)"
+		},
+		{
+			"inv": "e2ee",
+			"detail": "E: releasing a doc frozen by forged rows dismissed 1 genuine rows"
+		},
+		{
+			"inv": "e2ee",
+			"detail": "devices seal under different epochs: 2,3"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed0.md differs: A=\"seed[B.17] [A.36]  0 [Z.0]\\n[B.0][A.92]  \" B=\"[E.79]\\n[E.78] seed[B.17] [A.36]  0 [Z.0]\\n[B.0] \""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed2.md differs: A=\"[A.26] seed[E.7]  [A.86] 2[A.108]  [A.18] [E.14][A.15]  [A.25]\\n[Z.2]\\n\" B=\"[A.26] seed[E.7]  2 [A.18] [E.14][A.15]  [A.25]\\n\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "canvas/c0.canvas differs (canonical): A=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\" B=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a0.png differs: A=\"PNG [D.124]\\n\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u061f\u0140\ufffd\ufffd\ufffd\ud926\udc98\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u051d\ufffd\u05cc\ufffd\ufffd\ufffd\ufffd\u0636\ufffd\u06e9\ufffd\ue96f\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u02bb\ufffd\ufffd\ufffd\ufffd\ufffd\u0469\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u67ed\ufffd\ufffd\ufffd...\" B=\"PNG [D.167]\\n\ufffd\ufffd\ufffd\ufffd\u067d\ufffd\u042c\ufffd\ufffd\u01af\ufffd\u05a7\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u05d7\ufffd\ud83a\udf86\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0540\ufffd\ufffd\u075c\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u06ed\ufffd\u010c\ufffd\ufffd\ufffd\uedec\u0203\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0728\ufffd...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a2.png on A, missing on B"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n2 (conflict E 2026-01-01 0000).md on A, missing on B"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed1 (conflict E 2026-01-01 0000).md differs: A=\"seed[E.5]  1 [Z.1]\\n\" B=\"seed  1 [Z.1]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/r0.md differs: A=\"seed  1 \\n\" B=\"seed[D.2]  1 \\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n7.md differs: A=\"[A.95]\\n\" B=\"[D.101]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n0.md on A, missing on B"
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a1.png on B, missing on A"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n6.md on B, missing on A"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed0.md differs: A=\"seed[B.17] [A.36]  0 [Z.0]\\n[B.0][A.92]  \" C=\"seed[B.17] [A.36]  0 [Z.0]\\n[B.0] \""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed2.md differs: A=\"[A.26] seed[E.7]  [A.86] 2[A.108]  [A.18] [E.14][A.15]  [A.25]\\n[Z.2]\\n\" C=\"[A.26] seed[E.7]  2 [A.18] [E.14][A.15]  [A.25]\\n[Z.2]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "canvas/c0.canvas differs (canonical): A=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\" C=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a0.png differs: A=\"PNG [D.124]\\n\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u061f\u0140\ufffd\ufffd\ufffd\ud926\udc98\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u051d\ufffd\u05cc\ufffd\ufffd\ufffd\ufffd\u0636\ufffd\u06e9\ufffd\ue96f\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u02bb\ufffd\ufffd\ufffd\ufffd\ufffd\u0469\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u67ed\ufffd\ufffd\ufffd...\" C=\"PNG [C.160]\\n\ufffd\ufffd\ufffd\u03b1\u00cf\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0407\ufffd\u04da\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0183\ufffd\ufffd\u0565\ufffd\ufffd\ufffd\ufffd\ufcee\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u03e9\u036e\ufffd\u02c1\ufffd\u039f\ufffd\u01a6\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0222\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n2.md differs: A=\"[C.13]\\n[A.39] \" C=\"[C.13]\\n \""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n2 (conflict E 2026-01-01 0000).md on A, missing on C"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n7.md on A, missing on C"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n0.md on A, missing on C"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/r1.md on C, missing on A"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed0.md differs: A=\"seed[B.17] [A.36]  0 [Z.0]\\n[B.0][A.92]  \" D=\"[E.79]\\n[E.78] seed[B.17] [A.36]  0 [Z.0]\\n[B.0] \""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed2.md differs: A=\"[A.26] seed[E.7]  [A.86] 2[A.108]  [A.18] [E.14][A.15]  [A.25]\\n[Z.2]\\n\" D=\"[A.26] seed[E.7]  2 [A.18] [E.14][A.15]  [A.25]\\n\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "canvas/c0.canvas differs (canonical): A=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\" D=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a0.png differs: A=\"PNG [D.124]\\n\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u061f\u0140\ufffd\ufffd\ufffd\ud926\udc98\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u051d\ufffd\u05cc\ufffd\ufffd\ufffd\ufffd\u0636\ufffd\u06e9\ufffd\ue96f\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u02bb\ufffd\ufffd\ufffd\ufffd\ufffd\u0469\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u67ed\ufffd\ufffd\ufffd...\" D=\"PNG [D.167]\\n\ufffd\ufffd\ufffd\ufffd\u067d\ufffd\u042c\ufffd\ufffd\u01af\ufffd\u05a7\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u05d7\ufffd\ud83a\udf86\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0540\ufffd\ufffd\u075c\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u06ed\ufffd\u010c\ufffd\ufffd\ufffd\uedec\u0203\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0728\ufffd...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a2.png on A, missing on D"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n2 (conflict E 2026-01-01 0000).md on A, missing on D"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed1 (conflict E 2026-01-01 0000).md differs: A=\"seed[E.5]  1 [Z.1]\\n\" D=\"seed  1 [Z.1]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/r0.md differs: A=\"seed  1 \\n\" D=\"seed[D.2]  1 \\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n7.md differs: A=\"[A.95]\\n\" D=\"[D.101]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n0.md on A, missing on D"
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a1.png on D, missing on A"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n6.md on D, missing on A"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed0.md differs: A=\"seed[B.17] [A.36]  0 [Z.0]\\n[B.0][A.92]  \" E=\"[E.79]\\n[E.78] seed[B.17] [A.36]  0 [Z.0]\\n[B.0] \""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed2.md differs: A=\"[A.26] seed[E.7]  [A.86] 2[A.108]  [A.18] [E.14][A.15]  [A.25]\\n[Z.2]\\n\" E=\"[A.26] seed[E.7]  2 [A.18] [E.14][A.15]  [A.25]\\n\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "canvas/c0.canvas differs (canonical): A=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\" E=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a0.png differs: A=\"PNG [D.124]\\n\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u061f\u0140\ufffd\ufffd\ufffd\ud926\udc98\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u051d\ufffd\u05cc\ufffd\ufffd\ufffd\ufffd\u0636\ufffd\u06e9\ufffd\ue96f\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u02bb\ufffd\ufffd\ufffd\ufffd\ufffd\u0469\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u67ed\ufffd\ufffd\ufffd...\" E=\"PNG [D.167]\\n\ufffd\ufffd\ufffd\ufffd\u067d\ufffd\u042c\ufffd\ufffd\u01af\ufffd\u05a7\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u05d7\ufffd\ud83a\udf86\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0540\ufffd\ufffd\u075c\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u06ed\ufffd\u010c\ufffd\ufffd\ufffd\uedec\u0203\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\u0728\ufffd...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a2.png on A, missing on E"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n2 (conflict E 2026-01-01 0000).md on A, missing on E"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/seed1 (conflict E 2026-01-01 0000).md differs: A=\"seed[E.5]  1 [Z.1]\\n\" E=\"seed  1 [Z.1]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/r0.md differs: A=\"seed  1 \\n\" E=\"seed[D.2]  1 \\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n7.md differs: A=\"[A.95]\\n\" E=\"[D.101]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n0.md on A, missing on E"
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a1.png on E, missing on A"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n6.md on E, missing on A"
+		},
+		{
+			"inv": "convergence",
+			"detail": "relay canvas canvas/c0.canvas=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\" disk=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "relay notes/r0.md=\"seed[D.2]  1 \\n\" disk=\"seed  1 \\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "relay notes/seed0.md=\"[E.79]\\n[E.78] seed[B.17] [A.36]  0 [Z.0]\\n[B.0] \" disk=\"seed[B.17] [A.36]  0 [Z.0]\\n[B.0][A.92]  \""
+		},
+		{
+			"inv": "convergence",
+			"detail": "relay notes/seed1 (conflict E 2026-01-01 0000).md=\"seed  1 [Z.1]\\n\" disk=\"seed[E.5]  1 [Z.1]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "relay doc att/a1.png has no file"
+		},
+		{
+			"inv": "convergence",
+			"detail": "relay notes/n2.md=\"\" disk=\"[C.13]\\n[A.39] \""
+		},
+		{
+			"inv": "convergence",
+			"detail": "relay notes/seed2.md=\"[A.26] seed[E.7]  2 [A.18] [E.14][A.15]  [A.25]\\n\\n\" disk=\"[A.26] seed[E.7]  [A.86] 2[A.108]  [A.18] [E.14][A.15]  [A.25]\\n[Z.2]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "relay notes/n7.md=\"\" disk=\"[A.95]\\n\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "relay doc notes/n6.md has no file"
+		},
+		{
+			"inv": "convergence",
+			"detail": "att/a2.png never reached the relay"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n2 (conflict E 2026-01-01 0000).md never reached the relay"
+		},
+		{
+			"inv": "convergence",
+			"detail": "notes/n0.md never reached the relay"
+		},
+		{
+			"inv": "convergence",
+			"detail": "A: body replica of notes/seed0.md=\"seed[B.17] [A.36]  0 [Z.0]\\n[B.0] \" disk=\"seed[B.17] [A.36]  0 [Z.0]\\n[B.0][A.92]  \""
+		},
+		{
+			"inv": "convergence",
+			"detail": "A: canvas replica of canvas/c0.canvas=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\" disk=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "A: body replica of notes/n2.md=\"[C.13]\\n \" disk=\"[C.13]\\n[A.39] \""
+		},
+		{
+			"inv": "convergence",
+			"detail": "C: canvas replica of canvas/c0.canvas=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\" disk=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "D: canvas replica of canvas/c0.canvas=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\" disk=\"{\\\"edges\\\":[{\\\"fromNode\\\":\\\"a-1n2\\\",\\\"fromSide\\\":\\\"bottom\\\",\\\"id\\\":\\\"a-1e0\\\",\\\"toNode\\\":\\\"a-1n...\""
+		},
+		{
+			"inv": "convergence",
+			"detail": "ns fold bytes differ: oracle,B,D,E=2451:22ea5ea5 A=1897:7f69196a C=2099:98591dae"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [E.78] (typed on E at step 78)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [E.79] (typed on E at step 79)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [E.156] (attach on E at step 156)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [D.157] (canvas-text on D at step 157)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [C.160] (attach on C at step 160)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [D.167] (attach on D at step 167)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [C.168] (canvas-text on C at step 168)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [D.101] (create on D at step 101)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [E.171] (canvas-text on E at step 171)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [D.106] (create on D at step 106)"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[E.78] was on B:notes/seed0.md (sync) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[E.79] was on B:notes/seed0.md (sync) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[E.156] was on B:att/a1.png (sync) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[D.157] was on B:canvas/c0.canvas (sync) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[D.167] was on B:att/a0.png (sync) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[D.101] was on B:notes/n7.md (sync) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[D.106] was on B:notes/n6.md (sync) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[C.160] was on C:att/a0.png (external) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[C.168] was on C:canvas/c0.canvas (user) and is gone"
+		},
+		{
+			"inv": "destroyed",
+			"detail": "[E.171] was on E:canvas/c0.canvas (user) and is gone"
+		},
+		{
+			"inv": "clean",
+			"detail": "A: ns covers 53 of head 84"
+		},
+		{
+			"inv": "clean",
+			"detail": "A: 2 pending ns frames"
+		},
+		{
+			"inv": "clean",
+			"detail": "A: log engine not idle"
+		},
+		{
+			"inv": "clean",
+			"detail": "A: status pendingDiskOps=0 outbox=4 unreceipted=4 frozen=8"
+		},
+		{
+			"inv": "clean",
+			"detail": "A: view 1 (notes/seed2.md) never bound"
+		},
+		{
+			"inv": "clean",
+			"detail": "A: view 2 (notes/seed0.md) never bound"
+		},
+		{
+			"inv": "clean",
+			"detail": "B: status pendingDiskOps=0 outbox=0 unreceipted=0 frozen=3"
+		},
+		{
+			"inv": "clean",
+			"detail": "C: status pendingDiskOps=0 outbox=0 unreceipted=0 frozen=3"
+		},
+		{
+			"inv": "clean",
+			"detail": "D: status pendingDiskOps=0 outbox=0 unreceipted=0 frozen=3"
+		},
+		{
+			"inv": "clean",
+			"detail": "E: status pendingDiskOps=0 outbox=0 unreceipted=0 frozen=2"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "A: ns frozen (checkpoint-disputed)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "A: c:DJSZw5V70LXjOBb3iwVdKA frozen (checkpoint-disputed)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "A: b:VcP1z3ue3CYQa6PAOIn5LQ frozen (checkpoint-disputed)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "A: b:yIEUQp-d2zcQZkXoWhSsow frozen (crypto-unknown-key)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "A: b:xkDPF6d38Lby66iJcRtDNQ frozen (crypto-downgrade)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "A: b:YNFgnsQYJbQfa3l4wy2mVg frozen (crypto-downgrade)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "A: b:2ea-njsrx3gdY8uU1GQPwQ frozen (crypto-auth)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "A: b:buI6qMqSscPoQ0hHEt-Djw frozen (crypto-auth)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "A: 4 streams behind the relay: ns at 53 of 84 stale (gc 68), c:DJSZw5V70LXjOBb3iwVdKA at 55 of 70 stale (gc 67), b:VcP1z3ue3CYQa6PAOIn5LQ at 32 of 66 stale (gc 66), b:YNFgnsQYJbQfa3l4wy2mVg at 48 of 86 stale (gc 86)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "B: b:PevsPvQGT77jp6bHjq_tPg frozen (crypto-auth)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "B: b:xkDPF6d38Lby66iJcRtDNQ frozen (crypto-auth)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "B: c:DJSZw5V70LXjOBb3iwVdKA frozen (crypto-auth)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "C: c:DJSZw5V70LXjOBb3iwVdKA frozen (crypto-unknown-key)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "C: b:VcP1z3ue3CYQa6PAOIn5LQ frozen (crypto-unknown-key)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "C: b:yIEUQp-d2zcQZkXoWhSsow frozen (crypto-unknown-key)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "C: 1 streams behind the relay: b:YNFgnsQYJbQfa3l4wy2mVg at 48 of 86 stale (gc 86)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "D: c:DJSZw5V70LXjOBb3iwVdKA frozen (crypto-auth)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "D: b:PevsPvQGT77jp6bHjq_tPg frozen (crypto-auth)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "D: b:xkDPF6d38Lby66iJcRtDNQ frozen (crypto-auth)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "E: b:PevsPvQGT77jp6bHjq_tPg frozen (crypto-auth)"
+		},
+		{
+			"inv": "checkpoint",
+			"detail": "E: c:DJSZw5V70LXjOBb3iwVdKA frozen (crypto-auth)"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost e:e96e0 (created on E at step 150 in canvas/c0.canvas)"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost n:ca8n0 (created on C at step 168 in canvas/c0.canvas)"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost write n:a-1n5.x=70 on B at step 164 (canvas/c0.canvas); final 26 | 26"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost write n:a-1n5.y=-71 on B at step 164 (canvas/c0.canvas); final -27 | -27"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost write n:a-1n3.width=183 on B at step 172 (canvas/c0.canvas); final 143 | 143"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost write n:a-1n3.height=124 on B at step 172 (canvas/c0.canvas); final 84 | 84"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost write n:c80n0.simMeta={\"nested\":{\"list\":[85,true,null],\"s\":\"x\"},\"v\":\"u85\"} on D at step 173 (canvas/c0.canvas); final (absent)"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost write n:a-1n4.x=86 on D at step 176 (canvas/c0.canvas); final 21 | 21"
+		},
+		{
+			"inv": "canvas",
+			"detail": "lost write n:a-1n4.y=-87 on D at step 176 (canvas/c0.canvas); final -22 | -22"
+		},
+		{
+			"inv": "clean",
+			"detail": "A: outbox holds 4 records {\"pending\":4}"
+		},
+		{
+			"inv": "fold",
+			"detail": "ns full refold: 2099:98591dae != A's 1897:7f69196a (25 rows to 84)"
+		},
+		{
+			"inv": "fold",
+			"detail": "ns paged refold: 2099:98591dae != A's 1897:7f69196a (25 rows to 84)"
+		},
+		{
+			"inv": "fold",
+			"detail": "ns snapshot@25 + tail: 2099:98591dae != A's 1897:7f69196a (25 rows to 84)"
+		}
+	],
+	"minimizedPlan": [
+		{
+			"i": 138,
+			"gapMs": 336,
+			"canvas": {
+				"t": "cMove",
+				"dev": 1,
+				"file": 0.3413840823341161,
+				"node": 0.8692118932958692
+			}
+		},
+		{
+			"i": 39,
+			"gapMs": 1049,
+			"user": {
+				"t": "diskInsert",
+				"dev": 0,
+				"file": 0.22728950809687376,
+				"pos": 0.8212488093413413,
+				"by": "user"
+			}
+		},
+		{
+			"i": 40,
+			"gapMs": 700,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 2,
+				"file": 0.760574423475191,
+				"pick": 0.7673169109039009,
+				"by": "user"
+			}
+		},
+		{
+			"i": 139,
+			"gapMs": 322,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 3,
+				"file": 0.9625425187405199,
+				"kind": "group",
+				"seed": 1909212673
+			}
+		},
+		{
+			"i": 41,
+			"gapMs": 659,
+			"fault": {
+				"t": "hostileDowngrade",
+				"pick": 1614956153,
+				"rows": 2,
+				"join": true
+			}
+		},
+		{
+			"i": 140,
+			"gapMs": 0,
+			"user": {
+				"t": "attachRename",
+				"dev": 0,
+				"file": 0.7408748914021999,
+				"name": 3
+			}
+		},
+		{
+			"i": 45,
+			"gapMs": 1284,
+			"user": {
+				"t": "type",
+				"dev": 2,
+				"view": 0.6224257631693035,
+				"pos": 0.005370520055294037,
+				"nl": false
+			}
+		},
+		{
+			"i": 144,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 1,
+				"name": 2,
+				"size": 3620
+			}
+		},
+		{
+			"i": 46,
+			"gapMs": 1492,
+			"fault": {
+				"t": "httpFail",
+				"durationMs": 14133
+			}
+		},
+		{
+			"i": 47,
+			"gapMs": 1254,
+			"user": {
+				"t": "rename",
+				"dev": 0,
+				"file": 0.7174665895290673,
+				"name": 0
+			}
+		},
+		{
+			"i": 48,
+			"gapMs": 1149,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.9438642386812717,
+				"pos": 0.7151311170309782,
+				"nl": false
+			}
+		},
+		{
+			"i": 49,
+			"gapMs": 899,
+			"user": {
+				"t": "mode",
+				"dev": 3,
+				"view": 0.6459809583611786
+			}
+		},
+		{
+			"i": 50,
+			"gapMs": 429,
+			"user": {
+				"t": "type",
+				"dev": 2,
+				"view": 0.8363929025363177,
+				"pos": 0.4548827512189746,
+				"nl": false
+			}
+		},
+		{
+			"i": 145,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 2,
+				"name": 2,
+				"size": 3025
+			}
+		},
+		{
+			"i": 51,
+			"gapMs": 435,
+			"user": {
+				"t": "create",
+				"dev": 4,
+				"name": 4
+			}
+		},
+		{
+			"i": 146,
+			"gapMs": 0,
+			"user": {
+				"t": "setting",
+				"dev": 2,
+				"file": 1,
+				"key": 3,
+				"del": false
+			}
+		},
+		{
+			"i": 147,
+			"gapMs": 395,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 4,
+				"file": 0.4240487483330071,
+				"kind": "text",
+				"seed": 567929632
+			}
+		},
+		{
+			"i": 52,
+			"gapMs": 1234,
+			"user": {
+				"t": "type",
+				"dev": 3,
+				"view": 0.5081764908973128,
+				"pos": 0.3105303714983165,
+				"nl": true
+			}
+		},
+		{
+			"i": 148,
+			"gapMs": 0,
+			"user": {
+				"t": "setting",
+				"dev": 2,
+				"file": 2,
+				"key": 0,
+				"del": false
+			}
+		},
+		{
+			"i": 53,
+			"gapMs": 464,
+			"fault": {
+				"t": "commitCrash",
+				"dev": 1,
+				"commits": 2,
+				"when": "before",
+				"downMs": 1154
+			}
+		},
+		{
+			"i": 54,
+			"gapMs": 466,
+			"fault": {
+				"t": "clockSkew",
+				"dev": 1,
+				"deltaMs": 137778498
+			}
+		},
+		{
+			"i": 55,
+			"gapMs": 1173,
+			"fault": {
+				"t": "background",
+				"dev": 0,
+				"event": "freeze",
+				"durationMs": 26260
+			}
+		},
+		{
+			"i": 56,
+			"gapMs": 1255,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.7229440382216126,
+				"pos": 0.9415514904540032,
+				"nl": false
+			}
+		},
+		{
+			"i": 57,
+			"gapMs": 1405,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.12229059217497706,
+				"pos": 0.9169489149935544,
+				"nl": true
+			}
+		},
+		{
+			"i": 58,
+			"gapMs": 680,
+			"fault": {
+				"t": "revoke",
+				"dev": 2,
+				"by": 0,
+				"rekeyMs": 17863,
+				"rkSeed": 350073770
+			}
+		},
+		{
+			"i": 149,
+			"gapMs": 49,
+			"canvas": {
+				"t": "cReorder",
+				"dev": 2,
+				"file": 0.055595012148842216,
+				"node": 0.43517431477084756,
+				"front": true
+			}
+		},
+		{
+			"i": 59,
+			"gapMs": 1295,
+			"user": {
+				"t": "open",
+				"dev": 4,
+				"file": 0.6185253097210079
+			}
+		},
+		{
+			"i": 150,
+			"gapMs": 255,
+			"canvas": {
+				"t": "cAddEdge",
+				"dev": 4,
+				"file": 0.969112190650776,
+				"from": 0.35303167905658484,
+				"to": 0.20332592725753784,
+				"seed": 234466276
+			}
+		},
+		{
+			"i": 60,
+			"gapMs": 925,
+			"fault": {
+				"t": "background",
+				"dev": 1,
+				"event": "hidden",
+				"durationMs": 23752
+			}
+		},
+		{
+			"i": 151,
+			"gapMs": 296,
+			"canvas": {
+				"t": "cBroken",
+				"dev": 0,
+				"file": 0.9210587597917765,
+				"seed": 1093267854,
+				"by": "external",
+				"kind": "badNumber",
+				"fixMs": 12680
+			}
+		},
+		{
+			"i": 61,
+			"gapMs": 146,
+			"fault": {
+				"t": "hostileDowngrade",
+				"pick": 305914066,
+				"rows": 2,
+				"join": false
+			}
+		},
+		{
+			"i": 62,
+			"gapMs": 1282,
+			"user": {
+				"t": "open",
+				"dev": 2,
+				"file": 0.5177507330663502
+			}
+		},
+		{
+			"i": 63,
+			"gapMs": 1260,
+			"fault": {
+				"t": "hostileDowngrade",
+				"pick": 1929944495,
+				"rows": 1,
+				"join": false
+			}
+		},
+		{
+			"i": 64,
+			"gapMs": 1297,
+			"fault": {
+				"t": "hostileDowngrade",
+				"pick": 1263115864,
+				"rows": 2,
+				"join": true
+			}
+		},
+		{
+			"i": 65,
+			"gapMs": 894,
+			"user": {
+				"t": "mode",
+				"dev": 1,
+				"view": 0.0568039552308619
+			}
+		},
+		{
+			"i": 66,
+			"gapMs": 590,
+			"user": {
+				"t": "type",
+				"dev": 3,
+				"view": 0.978568154387176,
+				"pos": 0.5123329448979348,
+				"nl": false
+			}
+		},
+		{
+			"i": 75,
+			"gapMs": 1264,
+			"fault": {
+				"t": "revoke",
+				"dev": 0,
+				"by": 4,
+				"rekeyMs": 36530,
+				"rkSeed": 928660027
+			}
+		},
+		{
+			"i": 76,
+			"gapMs": 319,
+			"user": {
+				"t": "diskInsert",
+				"dev": 0,
+				"file": 0.9107317011803389,
+				"pos": 0.4301404084544629,
+				"by": "user"
+			}
+		},
+		{
+			"i": 77,
+			"gapMs": 1256,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.760387099115178,
+				"pos": 0.3958669872954488,
+				"nl": false
+			}
+		},
+		{
+			"i": 78,
+			"gapMs": 492,
+			"user": {
+				"t": "type",
+				"dev": 4,
+				"view": 0.221782888751477,
+				"pos": 0.023858500411733985,
+				"nl": false
+			}
+		},
+		{
+			"i": 79,
+			"gapMs": 1150,
+			"user": {
+				"t": "type",
+				"dev": 4,
+				"view": 0.6055203236173838,
+				"pos": 0.0431303889490664,
+				"nl": true
+			}
+		},
+		{
+			"i": 80,
+			"gapMs": 338,
+			"user": {
+				"t": "switch",
+				"dev": 0,
+				"view": 0.31177716329693794,
+				"file": 0.28093759901821613
+			}
+		},
+		{
+			"i": 83,
+			"gapMs": 1065,
+			"user": {
+				"t": "deleteToken",
+				"dev": 0,
+				"view": 0.9843687075190246,
+				"pick": 0.4648309631738812
+			}
+		},
+		{
+			"i": 84,
+			"gapMs": 1491,
+			"user": {
+				"t": "close",
+				"dev": 1,
+				"view": 0.7406118866056204
+			}
+		},
+		{
+			"i": 160,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 2,
+				"name": 0,
+				"size": 1256842
+			}
+		},
+		{
+			"i": 161,
+			"gapMs": 262,
+			"canvas": {
+				"t": "cMove",
+				"dev": 4,
+				"file": 0.9304175158031285,
+				"node": 0.11998519580811262
+			}
+		},
+		{
+			"i": 85,
+			"gapMs": 1372,
+			"user": {
+				"t": "open",
+				"dev": 4,
+				"file": 0.3865040121600032
+			}
+		},
+		{
+			"i": 162,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 1,
+				"name": 2,
+				"size": 1460632
+			}
+		},
+		{
+			"i": 86,
+			"gapMs": 996,
+			"user": {
+				"t": "diskInsert",
+				"dev": 0,
+				"file": 0.9432078977115452,
+				"pos": 0.4479927234351635,
+				"by": "user"
+			}
+		},
+		{
+			"i": 87,
+			"gapMs": 415,
+			"user": {
+				"t": "open",
+				"dev": 2,
+				"file": 0.16313630319200456
+			}
+		},
+		{
+			"i": 88,
+			"gapMs": 252,
+			"fault": {
+				"t": "keyStoreLoss",
+				"dev": 4,
+				"downMs": 952,
+				"rekeyMs": 32461
+			}
+		},
+		{
+			"i": 89,
+			"gapMs": 315,
+			"user": {
+				"t": "switch",
+				"dev": 4,
+				"view": 0.8172560674138367,
+				"file": 0.2076452432665974
+			}
+		},
+		{
+			"i": 163,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 3,
+				"name": 2,
+				"size": 1540197
+			}
+		},
+		{
+			"i": 90,
+			"gapMs": 417,
+			"user": {
+				"t": "close",
+				"dev": 4,
+				"view": 0.958168659824878
+			}
+		},
+		{
+			"i": 91,
+			"gapMs": 788,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 2,
+				"file": 0.2835061214864254,
+				"pick": 0.7244331517722458,
+				"by": "user"
+			}
+		},
+		{
+			"i": 92,
+			"gapMs": 1037,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.3381056571379304,
+				"pos": 0.929334937594831,
+				"nl": false
+			}
+		},
+		{
+			"i": 93,
+			"gapMs": 460,
+			"user": {
+				"t": "delete",
+				"dev": 4,
+				"file": 0.09082231530919671
+			}
+		},
+		{
+			"i": 164,
+			"gapMs": 355,
+			"canvas": {
+				"t": "cMove",
+				"dev": 1,
+				"file": 0.4298453819938004,
+				"node": 0.9021204579621553
+			}
+		},
+		{
+			"i": 94,
+			"gapMs": 700,
+			"user": {
+				"t": "deleteToken",
+				"dev": 4,
+				"view": 0.9460987763013691,
+				"pick": 0.2999147728551179
+			}
+		},
+		{
+			"i": 165,
+			"gapMs": 437,
+			"canvas": {
+				"t": "cMove",
+				"dev": 0,
+				"file": 0.4975954098626971,
+				"node": 0.20892380131408572
+			}
+		},
+		{
+			"i": 95,
+			"gapMs": 1028,
+			"user": {
+				"t": "create",
+				"dev": 0,
+				"name": 7
+			}
+		},
+		{
+			"i": 96,
+			"gapMs": 477,
+			"user": {
+				"t": "type",
+				"dev": 3,
+				"view": 0.5051699909381568,
+				"pos": 0.2265409897081554,
+				"nl": false
+			}
+		},
+		{
+			"i": 97,
+			"gapMs": 314,
+			"user": {
+				"t": "create",
+				"dev": 0,
+				"name": 0
+			}
+		},
+		{
+			"i": 166,
+			"gapMs": 171,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 0,
+				"file": 0.2535648802295327,
+				"kind": "text",
+				"seed": 1161558789
+			}
+		},
+		{
+			"i": 98,
+			"gapMs": 977,
+			"user": {
+				"t": "deleteToken",
+				"dev": 3,
+				"view": 0.5735820289701223,
+				"pick": 0.6196029845159501
+			}
+		},
+		{
+			"i": 167,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 3,
+				"name": 0,
+				"size": 1292
+			}
+		}
+	],
+	"gitSha": "73859c321ecc72d0332799b81487793a4e772101",
+	"masterSeed": 9103,
+	"label": "E2EE_FAULTS[10] short d5 s114 suite1 tuned cleanups0.036"
+}

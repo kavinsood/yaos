@@ -77,14 +77,17 @@ that prunes down to 0 reproduces it (seeds 10, 20 with cap 1..5, hysteresis 0..c
 doc, what the planner needs to tell an uncovered own edit (the delete's base seq) past the prune, or hold a prune of
 a delete younger than some ns-seq horizon.
 
+The soak's small-cap draws reach it under storms too (PRUNE-STORM, §5), where a mass delete outnumbers the newest
+tombstones `pruneWorld` keeps, and a related shape with no delete at all: merged aliases pruned after an epoch reset.
+
 ### SIM-COVERAGE: generators for coverage keys that never fire
 
-`src/sim/coverage.ts` counts what the engines did; the keys still at 0 over 6 seeds of every matrix (2026-10-20) are
-listed in wp-d-notes "Sim coverage". The largest gaps: socket closes at targeted points (before append, after commit
-before receipt, between provisional and notice), dedupe-window expiry before a resend, malicious peer frames under
-suite 0 (malformed, disallowed Yjs types, oversize, bad checkpoint), long offline past ns pruning (production cap; the
-small-cap matrix covers pruning itself), `brake.conflict-flood`, residency pressure, and the rarer fold outcomes and conflict-copy kinds. Each needs
-an actor or fault that reaches it, then an assertion in `coverage.sim.test.ts`.
+The generators (`generators`: targeted relay faults, delete / restore races, a hostile member device, conflict shapes,
+attachment clean-ups, the upgrade halt) and the soak's small tombstone cap reach every key but three, which the nightly
+soak still exempts (`scripts/sim-soak.mjs` COVERAGE_OPTIONAL): `conflict.path-taken` (needs a third-party writer racing
+a name with the device's label and minute), `diag.frame-poisoned` (own frames the relay refuses for good) and
+`diag.upgrade-required` (stops quiescence by design; `upgradeHalt.test.ts`). Pruning at the production cap (> 20k
+tombstones) and residency pressure stay out of reach at sim scale. wp-d-notes "Sim coverage" has the list.
 
 ### IOS-SPIKE: real-device runs
 
@@ -116,6 +119,67 @@ From [DECISIONS](server-rewrite/DECISIONS.md) §8, still open:
   a Workers Enterprise account, where that limit is not enforced.
 - **PITR after delete** (e2ee-design §15.2, §23.3). Whether Cloudflare can restore a vault's rows after `deleteAll()`
   is unknown, so deleted plaintext may linger up to 30 days.
+
+## 5. Open sim failures
+
+Each has a minimized plan in `src/sim/open-repros/` (README there: replay with `npm run sim:replay -- <file>`; not
+replayed by the regressions test). All checked still failing on `integrate-3` (2026-10-21); "base" = also failing on
+`client-remake-next` 6a1fb3e5 before the reclaim / generators / governance merges.
+
+### SIM-S1-REKEY-WIPE: an outside edit lost across revokes and a wipe before the rekey (suite 1)
+
+Key roll, a revoke, an outside (disk) edit on B, a second revoke, then B's IndexedDB and mirrors wiped before B
+rekeys: the disk edit is lost (`tokens` + `destroyed`). `s1-197-clean.json` (5 steps, base), `s1-197.json`,
+`s1-197-nohostile.json`. `1482901505-47-min.json` (hostile device, suite 1, clean-ups, revokes, 5 devices: a token
+typed on D lost) is likely the same.
+
+### SIM-EPOCH-COMMIT-CRASH: an epoch reset, a commit crash and offline lose a typed token
+
+`relay-134.json` (targeted relay faults seed 134, base): epoch reset, a commit crash ("after"), offline: a token typed
+on A is lost. Possibly the same as test:sim-suite1 "4 devices, E2EE faults" seed 1 (`tokens: lost [C.52] (typed on C
+at step 52)`, identical on base; its plan has an epoch reset and commit crashes too, `s1-e2ee4-seed1.json`). The
+known suite-1 failure: `npm run test:sim-suite1` exits 1 on it.
+
+### SIM-CANVAS-FOLDER-REVIVE: a folder rename revives deleted canvas edges
+
+`20701862-41-min.json` (7 steps, base): A fixes a dangling edge (`cBroken`), then renames the canvas's folder; the
+edges A deleted come back with no concurrent edit and no conflict copy.
+
+### SIM-BLOB-STALE-DISK: blob faults leave A's disk stale
+
+`1370759151-13-min.json` (blob faults, 2 devices, delete / restore races): no convergence; A's body replica and the
+relay hold the newer text of `notes/r5.md`, A's disk the old one.
+
+### SIM-CLONE-BODYLESS-WAIT: a clone waits on a creator that never sends the body
+
+`532933571-114.json` (clone faults, 4 devices; found on 70c67349, base): no quiescence, D waits on the creator of a
+body-less doc whose body never comes.
+
+### PRUNE-STORM: pruning under storms loses edits (soak small-cap draws)
+
+The soak's small tombstone cap met storms (FLOOD_FAULTS) twice in 602 runs, both a token loss that passes without
+`smallPrune` and on `generators` alone. `prune-epoch-merged-overwrite.json` (10 steps: an import storm, C's IndexedDB
+lost, an epoch reset, two mass overwrites; no file is deleted, so every pruned entry is a merged alias of the
+re-creates after the reset): A's overwrite of 10 notes is lost. In production an epoch reset of a large vault makes
+(devices − 1) × notes merged aliases at once, enough to pass the 19000 cap. `prune-storm-mass-delete.json` (58 steps,
+mass deletes and import storms): imported notes lost, likely PRUNE-RESTORE with more deletes than the 2+ newest
+tombstones `pruneWorld` keeps. Until fixed, the nightly soak can fail on these.
+
+### SIM-E2EE-LOG-BUSY: a suite-1 device's log never goes idle; devices end on different epochs
+
+`e2ee-log-busy-89423454.json` (E2EE faults, 5 devices, suite 1): no quiescence ("A log busy"), devices seal under
+different epochs, wide divergence; the `retired` violations follow from A never catching up. Fails the same on
+`generators`; a second soak seed (1042558905, 3 devices, no generator ops) fails the same on base.
+
+### SIM-CANVAS-REORDER: a canvas reorder to the front lost
+
+`canvas-reorder-lost-1025898366.json` (E2EE faults, 2 devices, suite 1, delete / restore races; 251 steps): B's
+reorder of a node to the front loses against three nodes. Fails the same on `generators`.
+
+### SIM-SOAK-OOM: a soak process ran out of memory
+
+Soak master seed 4 reached ~4 GB and was killed at ~580 s (Node's default heap). Not minimized: find the run (its
+config is drawn from the master seed) and whether a run or the soak's coverage / failure bookkeeping grows.
 
 ## Landed on `sim-port` since 33bdf49b
 

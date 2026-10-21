@@ -1,0 +1,189 @@
+{
+	"seed": 922762991,
+	"config": {
+		"seed": 922762991,
+		"devices": 3,
+		"steps": 160,
+		"faults": {
+			"engineCrash": 0.786,
+			"appCrash": 0.51,
+			"commitCrash": 0.702,
+			"idbWipe": 0,
+			"idbLost": 0.429,
+			"offline": 3.389,
+			"ioFail": 1.701,
+			"background": 1.763,
+			"socketDrop": 0,
+			"relayRestart": 0,
+			"relayDrain": 0.572,
+			"httpFail": 0,
+			"dailyLimit": 0.211,
+			"epochReset": 0.688,
+			"clockSkew": 0.356,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"faultRate": 0.154,
+		"randomTuning": true,
+		"storms": 0.17,
+		"smallPrune": true
+	},
+	"violations": [
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.0] (overwrite on A at step 205) (+9 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.3] (overwrite on A at step 205) (+9 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.5] (overwrite on A at step 205) (+9 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.7] (overwrite on A at step 205) (+9 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.9] (overwrite on A at step 205) (+9 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.11] (overwrite on A at step 205) (+9 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.13] (overwrite on A at step 205) (+9 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.14] (overwrite on A at step 205) (+9 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.15] (overwrite on A at step 205) (+9 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.205.17] (overwrite on A at step 205) (+9 more)"
+		}
+	],
+	"minimizedPlan": [
+		{
+			"i": 185,
+			"gapMs": 0,
+			"user": {
+				"t": "importStorm",
+				"dev": 1,
+				"batch": 1,
+				"count": 47,
+				"big": 28
+			}
+		},
+		{
+			"i": 66,
+			"gapMs": 638,
+			"fault": {
+				"t": "idbLost",
+				"dev": 2
+			}
+		},
+		{
+			"i": 69,
+			"gapMs": 1371,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 0,
+				"file": 0.5738115238491446,
+				"pick": 0.40195190138183534,
+				"by": "external"
+			}
+		},
+		{
+			"i": 70,
+			"gapMs": 782,
+			"user": {
+				"t": "open",
+				"dev": 0,
+				"file": 0.05614545079879463
+			}
+		},
+		{
+			"i": 71,
+			"gapMs": 166,
+			"fault": {
+				"t": "epochReset"
+			}
+		},
+		{
+			"i": 201,
+			"gapMs": 0,
+			"user": {
+				"t": "massOverwrite",
+				"dev": 2,
+				"frac": 0.733342980616726,
+				"salt": 1259380855
+			}
+		},
+		{
+			"i": 79,
+			"gapMs": 1475,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.48796373209916055,
+				"pos": 0.1085831958334893,
+				"nl": false
+			}
+		},
+		{
+			"i": 81,
+			"gapMs": 1393,
+			"user": {
+				"t": "switch",
+				"dev": 2,
+				"view": 0.589943497441709,
+				"file": 0.9021283679176122
+			}
+		},
+		{
+			"i": 205,
+			"gapMs": 0,
+			"user": {
+				"t": "massOverwrite",
+				"dev": 0,
+				"frac": 0.4361728393938392,
+				"salt": 706446153
+			}
+		},
+		{
+			"i": 88,
+			"gapMs": 1432,
+			"fault": {
+				"t": "idbLost",
+				"dev": 1
+			}
+		}
+	],
+	"gitSha": "73859c321ecc72d0332799b81487793a4e772101",
+	"masterSeed": 9101,
+	"label": "FLOOD_FAULTS[11] short d3 s160 tuned storms0.17 small-cap"
+}

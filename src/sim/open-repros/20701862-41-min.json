@@ -1,0 +1,167 @@
+{
+ "seed": 20701862,
+ "config": {
+  "seed": 20701862,
+  "devices": 2,
+  "steps": 119,
+  "faults": {
+   "engineCrash": 10.146,
+   "appCrash": 0,
+   "commitCrash": 0,
+   "idbWipe": 0.568,
+   "idbLost": 3.162,
+   "offline": 0,
+   "ioFail": 1.416,
+   "background": 0,
+   "socketDrop": 10.73,
+   "relayRestart": 1.613,
+   "relayDrain": 0,
+   "httpFail": 0.529,
+   "dailyLimit": 0.155,
+   "epochReset": 0.098,
+   "clockSkew": 0,
+   "keyStoreLoss": 0,
+   "keyRoll": 0,
+   "revoke": 0,
+   "epochRestore": 0,
+   "hostileReplay": 0,
+   "hostileDowngrade": 0,
+   "blobStall": 0,
+   "blobSlow": 0,
+   "relaySubsLost": 0,
+   "suspendKill": 0,
+   "clone": 0,
+   "syncedConfig": 0,
+   "targetedDrop": 0,
+   "lostSend": 0,
+   "commitFail": 0,
+   "hostile": 0,
+   "conflictCrash": 0,
+   "floodRewrite": 0
+  },
+  "faultRate": 0.195,
+  "storms": 0.071,
+  "canvas": {
+   "rate": 1.92,
+   "ops": {
+    "cCreate": 0.6,
+    "cAddNode": 7,
+    "cMove": 12,
+    "cResize": 6,
+    "cColor": 6,
+    "cText": 12,
+    "cProps": 4,
+    "cDeleteNode": 3,
+    "cAddEdge": 4,
+    "cDeleteEdge": 2,
+    "cEdge": 6,
+    "cReorder": 5,
+    "cExtra": 5,
+    "cFileRef": 2,
+    "cRename": 0.4,
+    "cDelete": 0.3,
+    "cRewrite": 3,
+    "cBroken": 1.5,
+    "cBig": 0
+   },
+   "pool": 2,
+   "hot": true
+  }
+ },
+ "violations": [
+  {
+   "inv": "canvas",
+   "detail": "e:a-1e2 deleted on A at step 371 is back in canvas/c0.canvas with no concurrent edit and no conflict copy"
+  },
+  {
+   "inv": "canvas",
+   "detail": "e:a138e0 deleted on A at step 371 is back in canvas/c0.canvas with no concurrent edit and no conflict copy"
+  }
+ ],
+ "minimizedPlan": [
+  {
+   "i": 310,
+   "gapMs": 366,
+   "canvas": {
+    "t": "cAddNode",
+    "dev": 0,
+    "file": 0.7421559365466237,
+    "kind": "text",
+    "seed": 1429877251
+   }
+  },
+  {
+   "i": 89,
+   "gapMs": 1292,
+   "user": {
+    "t": "type",
+    "dev": 0,
+    "view": 0.8085923756007105,
+    "pos": 0.769787153461948,
+    "nl": false
+   }
+  },
+  {
+   "i": 312,
+   "gapMs": 250,
+   "canvas": {
+    "t": "cAddEdge",
+    "dev": 0,
+    "file": 0.030836156103760004,
+    "from": 0.5691621196456254,
+    "to": 0.6166889634914696,
+    "seed": 1305640800
+   }
+  },
+  {
+   "i": 324,
+   "gapMs": 54,
+   "canvas": {
+    "t": "cReorder",
+    "dev": 0,
+    "file": 0.08987859496846795,
+    "node": 0.4300024372059852,
+    "front": true
+   }
+  },
+  {
+   "i": 370,
+   "gapMs": 285,
+   "canvas": {
+    "t": "cText",
+    "dev": 1,
+    "file": 0.780079451855272,
+    "node": 0.02114615705795586,
+    "pos": 0.05317282001487911,
+    "del": false
+   }
+  },
+  {
+   "i": 371,
+   "gapMs": 355,
+   "canvas": {
+    "t": "cBroken",
+    "dev": 0,
+    "file": 0.857221060898155,
+    "seed": 1366673202,
+    "by": "user",
+    "kind": "dangling",
+    "fixMs": 0
+   }
+  },
+  {
+   "i": 372,
+   "gapMs": 74,
+   "canvas": {
+    "t": "cRename",
+    "dev": 0,
+    "file": 0.9104129849001765,
+    "name": 3,
+    "folder": true
+   }
+  }
+ ],
+ "gitSha": "3a83659fc28b9619c7cd52aebe2f5380bc010740",
+ "masterSeed": 12,
+ "label": "CANVAS_FAULTS[9] short d2 s119 storms0.071 hot-canvas"
+}

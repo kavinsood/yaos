@@ -1,0 +1,325 @@
+{
+	"seed": 1,
+	"config": {
+		"devices": 4,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 1,
+			"idbLost": 1,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 1,
+			"keyRoll": 1.5,
+			"revoke": 0.7,
+			"epochRestore": 0.5,
+			"hostileReplay": 2,
+			"hostileDowngrade": 1,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"faultRate": 0.3,
+		"crypto": "suite1",
+		"checkpoints": "scaled",
+		"seed": 1
+	},
+	"minimizedPlan": [
+		{
+			"i": 21,
+			"gapMs": 169,
+			"user": {
+				"t": "diskInsert",
+				"dev": 1,
+				"file": 0.7053642058745027,
+				"pos": 0.01908626640215516,
+				"by": "external"
+			}
+		},
+		{
+			"i": 27,
+			"gapMs": 242,
+			"fault": {
+				"t": "idbWipe",
+				"dev": 1,
+				"mirrors": false,
+				"downMs": 8066
+			}
+		},
+		{
+			"i": 28,
+			"gapMs": 244,
+			"user": {
+				"t": "open",
+				"dev": 0,
+				"file": 0.7062074255663902
+			}
+		},
+		{
+			"i": 33,
+			"gapMs": 673,
+			"user": {
+				"t": "deleteToken",
+				"dev": 2,
+				"view": 0.6952489304821938,
+				"pick": 0.9366958471946418
+			}
+		},
+		{
+			"i": 38,
+			"gapMs": 682,
+			"user": {
+				"t": "rename",
+				"dev": 2,
+				"file": 0.9183841238263994,
+				"name": 3
+			}
+		},
+		{
+			"i": 134,
+			"gapMs": 23,
+			"canvas": {
+				"t": "cColor",
+				"dev": 0,
+				"file": 0.16838726354762912,
+				"node": 0.1836631689220667,
+				"clear": false
+			}
+		},
+		{
+			"i": 39,
+			"gapMs": 302,
+			"fault": {
+				"t": "ioFail",
+				"dev": 3,
+				"ops": 1
+			}
+		},
+		{
+			"i": 40,
+			"gapMs": 209,
+			"user": {
+				"t": "open",
+				"dev": 2,
+				"file": 0.12778374133631587
+			}
+		},
+		{
+			"i": 41,
+			"gapMs": 1043,
+			"user": {
+				"t": "diskInsert",
+				"dev": 2,
+				"file": 0.034738674527034163,
+				"pos": 0.6265368813183159,
+				"by": "external"
+			}
+		},
+		{
+			"i": 42,
+			"gapMs": 1396,
+			"user": {
+				"t": "create",
+				"dev": 1,
+				"name": 6
+			}
+		},
+		{
+			"i": 135,
+			"gapMs": 322,
+			"canvas": {
+				"t": "cMove",
+				"dev": 1,
+				"file": 0.6403793483041227,
+				"node": 0.23835626197978854
+			}
+		},
+		{
+			"i": 44,
+			"gapMs": 465,
+			"user": {
+				"t": "deleteToken",
+				"dev": 3,
+				"view": 0.39066708693280816,
+				"pick": 0.9798023111652583
+			}
+		},
+		{
+			"i": 136,
+			"gapMs": 239,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 1,
+				"file": 0.21476496336981654,
+				"kind": "link",
+				"seed": 1721755029
+			}
+		},
+		{
+			"i": 45,
+			"gapMs": 1126,
+			"fault": {
+				"t": "hostileReplay",
+				"pick": 1358608942,
+				"copies": 3
+			}
+		},
+		{
+			"i": 46,
+			"gapMs": 513,
+			"fault": {
+				"t": "appCrash",
+				"dev": 1,
+				"downMs": 9352
+			}
+		},
+		{
+			"i": 47,
+			"gapMs": 441,
+			"fault": {
+				"t": "keyRoll",
+				"dev": 1,
+				"also": 3
+			}
+		},
+		{
+			"i": 137,
+			"gapMs": 158,
+			"canvas": {
+				"t": "cBroken",
+				"dev": 1,
+				"file": 0.321297072339803,
+				"seed": 978795634,
+				"by": "external",
+				"kind": "dangling",
+				"fixMs": 0
+			}
+		},
+		{
+			"i": 48,
+			"gapMs": 1106,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.22024432779289782,
+				"pos": 0.2601296817883849,
+				"nl": false
+			}
+		},
+		{
+			"i": 49,
+			"gapMs": 1053,
+			"fault": {
+				"t": "socketDrop",
+				"dev": 2,
+				"code": 1001
+			}
+		},
+		{
+			"i": 50,
+			"gapMs": 589,
+			"user": {
+				"t": "rename",
+				"dev": 1,
+				"file": 0.5787412037607282,
+				"name": 1
+			}
+		},
+		{
+			"i": 138,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 0,
+				"name": 0,
+				"size": 1802
+			}
+		},
+		{
+			"i": 51,
+			"gapMs": 201,
+			"fault": {
+				"t": "epochReset"
+			}
+		},
+		{
+			"i": 139,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 0,
+				"name": 3,
+				"size": 2866
+			}
+		},
+		{
+			"i": 52,
+			"gapMs": 770,
+			"user": {
+				"t": "type",
+				"dev": 2,
+				"view": 0.9514391024131328,
+				"pos": 0.44336275407113135,
+				"nl": false
+			}
+		},
+		{
+			"i": 53,
+			"gapMs": 675,
+			"fault": {
+				"t": "commitCrash",
+				"dev": 2,
+				"commits": 8,
+				"when": "after",
+				"downMs": 9306
+			}
+		},
+		{
+			"i": 54,
+			"gapMs": 927,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.9616678920574486,
+				"pos": 0.6043805642984807,
+				"nl": false
+			}
+		},
+		{
+			"i": 55,
+			"gapMs": 998,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.3705082223750651,
+				"pos": 0.10355360247194767,
+				"nl": false
+			}
+		}
+	],
+	"violations": [
+		{
+			"inv": "tokens",
+			"detail": "lost [C.52] (typed on C at step 52)"
+		}
+	],
+	"label": "test:sim-suite1 \"4 devices, E2EE faults\" seed 1"
+}

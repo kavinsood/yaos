@@ -1,0 +1,118 @@
+{
+ "seed": 197,
+ "config": {
+  "seed": 197,
+  "devices": 3,
+  "faults": {
+   "engineCrash": 3,
+   "appCrash": 2,
+   "commitCrash": 2,
+   "idbWipe": 1,
+   "idbLost": 1,
+   "offline": 4,
+   "ioFail": 2,
+   "background": 3,
+   "socketDrop": 4,
+   "relayRestart": 1,
+   "relayDrain": 1,
+   "httpFail": 1,
+   "dailyLimit": 0.5,
+   "epochReset": 0.3,
+   "clockSkew": 1,
+   "keyStoreLoss": 0,
+   "keyRoll": 0.7,
+   "revoke": 0.7,
+   "epochRestore": 0,
+   "hostileReplay": 0,
+   "hostileDowngrade": 0,
+   "blobStall": 0,
+   "blobSlow": 0,
+   "relaySubsLost": 0,
+   "suspendKill": 0,
+   "clone": 0,
+   "syncedConfig": 0,
+   "targetedDrop": 0,
+   "lostSend": 0,
+   "commitFail": 0,
+   "hostile": 6,
+   "conflictCrash": 0,
+   "floodRewrite": 0
+  },
+  "crypto": "suite1"
+ },
+ "violations": [
+  {
+   "inv": "tokens",
+   "detail": "lost [B.16] (disk-external on B at step 16)"
+  },
+  {
+   "inv": "destroyed",
+   "detail": "[B.16] was on B:notes/seed2.md (external) and is gone"
+  }
+ ],
+ "minimizedPlan": [
+  {
+   "i": 14,
+   "gapMs": 20,
+   "fault": {
+    "t": "hostile",
+    "kind": "wrongKind",
+    "pick": 0.13054452138021588
+   }
+  },
+  {
+   "i": 15,
+   "gapMs": 1297,
+   "fault": {
+    "t": "revoke",
+    "dev": 1,
+    "by": 0,
+    "rekeyMs": 5591,
+    "rkSeed": 2132644544
+   }
+  },
+  {
+   "i": 16,
+   "gapMs": 28,
+   "user": {
+    "t": "diskInsert",
+    "dev": 1,
+    "file": 0.7673955045174807,
+    "pos": 0.44935667607933283,
+    "by": "external"
+   }
+  },
+  {
+   "i": 17,
+   "gapMs": 1435,
+   "fault": {
+    "t": "hostile",
+    "kind": "deflateBomb",
+    "pick": 0.560760905733332
+   }
+  },
+  {
+   "i": 20,
+   "gapMs": 1042,
+   "fault": {
+    "t": "revoke",
+    "dev": 1,
+    "by": 2,
+    "rekeyMs": 50022,
+    "rkSeed": 1406218986
+   }
+  },
+  {
+   "i": 21,
+   "gapMs": 240,
+   "fault": {
+    "t": "idbWipe",
+    "dev": 1,
+    "mirrors": true,
+    "downMs": 5872
+   }
+  }
+ ],
+ "planLength": 171,
+ "runs": 75
+}

@@ -1,0 +1,712 @@
+{
+	"seed": 1180071477,
+	"config": {
+		"seed": 1180071477,
+		"devices": 3,
+		"steps": 177,
+		"faults": {
+			"engineCrash": 0,
+			"appCrash": 0,
+			"commitCrash": 1.466,
+			"idbWipe": 0,
+			"idbLost": 0.421,
+			"offline": 5.703,
+			"ioFail": 0,
+			"background": 11.631,
+			"socketDrop": 6.603,
+			"relayRestart": 3.685,
+			"relayDrain": 0,
+			"httpFail": 1.401,
+			"dailyLimit": 0.568,
+			"epochReset": 0.429,
+			"clockSkew": 2.063,
+			"keyStoreLoss": 0,
+			"keyRoll": 0,
+			"revoke": 0,
+			"epochRestore": 0,
+			"hostileReplay": 0,
+			"hostileDowngrade": 0,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"faultRate": 0.413,
+		"randomTuning": true,
+		"storms": 0.181,
+		"ops": {
+			"type": 30,
+			"paste": 2,
+			"deleteToken": 6,
+			"open": 8,
+			"close": 4,
+			"switch": 3,
+			"mode": 2,
+			"create": 6,
+			"diskInsert": 10,
+			"diskDeleteToken": 3,
+			"rename": 5,
+			"delete": 6,
+			"attach": 0,
+			"attachRename": 0,
+			"attachDelete": 0,
+			"setting": 0,
+			"snapshot": 0,
+			"cleanUp": 0,
+			"importStorm": 0,
+			"massDelete": 0,
+			"folderMove": 0,
+			"massRename": 0,
+			"massOverwrite": 0,
+			"restoreTrash": 6,
+			"recreate": 4,
+			"bigNote": 0,
+			"bigReformat": 0,
+			"bigEdit": 0
+		},
+		"smallPrune": true
+	},
+	"violations": [
+		{
+			"inv": "tokens",
+			"detail": "lost [B.196.13] (import on B at step 196) (+5 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [B.196.35] (import on B at step 196) (+5 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [B.196.43] (import on B at step 196) (+5 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.239.1] (overwrite on A at step 239) (+5 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.239.2] (overwrite on A at step 239) (+5 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.239.3] (overwrite on A at step 239) (+5 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.239.4] (overwrite on A at step 239) (+5 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.239.5] (overwrite on A at step 239) (+5 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.239.6] (overwrite on A at step 239) (+5 more)"
+		},
+		{
+			"inv": "tokens",
+			"detail": "lost [A.239.8] (overwrite on A at step 239) (+5 more)"
+		}
+	],
+	"minimizedPlan": [
+		{
+			"i": 0,
+			"gapMs": 367,
+			"fault": {
+				"t": "clockSkew",
+				"dev": 0,
+				"deltaMs": -182372672
+			}
+		},
+		{
+			"i": 177,
+			"gapMs": 438,
+			"canvas": {
+				"t": "cProps",
+				"dev": 0,
+				"file": 0.23012077203020453,
+				"node": 0.8799061747267842
+			}
+		},
+		{
+			"i": 1,
+			"gapMs": 423,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 0,
+				"file": 0.04714664653874934,
+				"pick": 0.19694253313355148,
+				"by": "external"
+			}
+		},
+		{
+			"i": 178,
+			"gapMs": 0,
+			"user": {
+				"t": "importStorm",
+				"dev": 1,
+				"batch": 1,
+				"count": 66,
+				"big": 29
+			}
+		},
+		{
+			"i": 10,
+			"gapMs": 1183,
+			"user": {
+				"t": "type",
+				"dev": 2,
+				"view": 0.8216902993153781,
+				"pos": 0.41689471271820366,
+				"nl": false
+			}
+		},
+		{
+			"i": 11,
+			"gapMs": 313,
+			"user": {
+				"t": "delete",
+				"dev": 1,
+				"file": 0.6472854907624424
+			}
+		},
+		{
+			"i": 12,
+			"gapMs": 297,
+			"fault": {
+				"t": "background",
+				"dev": 2,
+				"event": "pagehide",
+				"durationMs": 11760
+			}
+		},
+		{
+			"i": 13,
+			"gapMs": 1398,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.06633622548542917,
+				"pos": 0.15808655670844018,
+				"nl": false
+			}
+		},
+		{
+			"i": 18,
+			"gapMs": 916,
+			"fault": {
+				"t": "background",
+				"dev": 2,
+				"event": "freeze",
+				"durationMs": 12436
+			}
+		},
+		{
+			"i": 19,
+			"gapMs": 24,
+			"fault": {
+				"t": "socketDrop",
+				"dev": 1,
+				"code": 1006
+			}
+		},
+		{
+			"i": 20,
+			"gapMs": 534,
+			"user": {
+				"t": "deleteToken",
+				"dev": 0,
+				"view": 0.8388762539252639,
+				"pick": 0.054090921534225345
+			}
+		},
+		{
+			"i": 189,
+			"gapMs": 0,
+			"user": {
+				"t": "massDelete",
+				"dev": 0,
+				"frac": 0.7142277979524806,
+				"salt": 208494962
+			}
+		},
+		{
+			"i": 21,
+			"gapMs": 885,
+			"user": {
+				"t": "switch",
+				"dev": 1,
+				"view": 0.6128135400358588,
+				"file": 0.6736519811674953
+			}
+		},
+		{
+			"i": 22,
+			"gapMs": 592,
+			"fault": {
+				"t": "background",
+				"dev": 1,
+				"event": "freeze",
+				"durationMs": 16663
+			}
+		},
+		{
+			"i": 190,
+			"gapMs": 0,
+			"user": {
+				"t": "folderMove",
+				"dev": 1,
+				"folder": 0.5077280718833208,
+				"name": 0
+			}
+		},
+		{
+			"i": 191,
+			"gapMs": 434,
+			"canvas": {
+				"t": "cText",
+				"dev": 2,
+				"file": 0.3353415858000517,
+				"node": 0.5510508597362787,
+				"pos": 0.5761463292874396,
+				"del": true
+			}
+		},
+		{
+			"i": 23,
+			"gapMs": 176,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.8486206065863371,
+				"pos": 0.8986876998096704,
+				"nl": false
+			}
+		},
+		{
+			"i": 24,
+			"gapMs": 134,
+			"fault": {
+				"t": "background",
+				"dev": 1,
+				"event": "freeze",
+				"durationMs": 12140
+			}
+		},
+		{
+			"i": 192,
+			"gapMs": 319,
+			"canvas": {
+				"t": "cRewrite",
+				"dev": 1,
+				"file": 0.9789844402112067,
+				"seed": 1579786473,
+				"move": true,
+				"sort": false,
+				"by": "external"
+			}
+		},
+		{
+			"i": 25,
+			"gapMs": 414,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.5989602352492511,
+				"pos": 0.905455608619377,
+				"nl": false
+			}
+		},
+		{
+			"i": 193,
+			"gapMs": 357,
+			"canvas": {
+				"t": "cMove",
+				"dev": 0,
+				"file": 0.2532300539314747,
+				"node": 0.187140405876562
+			}
+		},
+		{
+			"i": 26,
+			"gapMs": 779,
+			"fault": {
+				"t": "clockSkew",
+				"dev": 2,
+				"deltaMs": -123430736
+			}
+		},
+		{
+			"i": 27,
+			"gapMs": 395,
+			"fault": {
+				"t": "socketDrop",
+				"dev": 0,
+				"code": 1006
+			}
+		},
+		{
+			"i": 28,
+			"gapMs": 1024,
+			"fault": {
+				"t": "clockSkew",
+				"dev": 1,
+				"deltaMs": 150580875
+			}
+		},
+		{
+			"i": 29,
+			"gapMs": 418,
+			"fault": {
+				"t": "clockSkew",
+				"dev": 2,
+				"deltaMs": -13961107
+			}
+		},
+		{
+			"i": 196,
+			"gapMs": 0,
+			"user": {
+				"t": "importStorm",
+				"dev": 1,
+				"batch": 1,
+				"count": 76,
+				"big": 28
+			}
+		},
+		{
+			"i": 30,
+			"gapMs": 461,
+			"fault": {
+				"t": "relayRestart"
+			}
+		},
+		{
+			"i": 197,
+			"gapMs": 0,
+			"user": {
+				"t": "massDelete",
+				"dev": 1,
+				"frac": 0.9473454135470092,
+				"salt": 1900487608
+			}
+		},
+		{
+			"i": 31,
+			"gapMs": 1486,
+			"user": {
+				"t": "rename",
+				"dev": 1,
+				"file": 0.6975861107930541,
+				"name": 4
+			}
+		},
+		{
+			"i": 32,
+			"gapMs": 202,
+			"fault": {
+				"t": "background",
+				"dev": 0,
+				"event": "pagehide",
+				"durationMs": 28627
+			}
+		},
+		{
+			"i": 198,
+			"gapMs": 0,
+			"user": {
+				"t": "setting",
+				"dev": 2,
+				"file": 3,
+				"key": 0,
+				"del": true
+			}
+		},
+		{
+			"i": 33,
+			"gapMs": 852,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.39235582714900374,
+				"pos": 0.03871975443325937,
+				"nl": false
+			}
+		},
+		{
+			"i": 199,
+			"gapMs": 0,
+			"user": {
+				"t": "massDelete",
+				"dev": 2,
+				"frac": 0.7955279157729819,
+				"salt": 1608724591
+			}
+		},
+		{
+			"i": 200,
+			"gapMs": 365,
+			"canvas": {
+				"t": "cText",
+				"dev": 2,
+				"file": 0.892632297705859,
+				"node": 0.5142114616464823,
+				"pos": 0.2735297966282815,
+				"del": true
+			}
+		},
+		{
+			"i": 34,
+			"gapMs": 445,
+			"user": {
+				"t": "diskInsert",
+				"dev": 1,
+				"file": 0.40364391379989684,
+				"pos": 0.6834942314308137,
+				"by": "external"
+			}
+		},
+		{
+			"i": 201,
+			"gapMs": 0,
+			"user": {
+				"t": "attachDelete",
+				"dev": 1,
+				"file": 0.20922743645496666
+			}
+		},
+		{
+			"i": 80,
+			"gapMs": 1434,
+			"fault": {
+				"t": "background",
+				"dev": 1,
+				"event": "pagehide",
+				"durationMs": 19833
+			}
+		},
+		{
+			"i": 236,
+			"gapMs": 45,
+			"canvas": {
+				"t": "cText",
+				"dev": 0,
+				"file": 0.29083220404572785,
+				"node": 0.9137661685235798,
+				"pos": 0.5732908407226205,
+				"del": false
+			}
+		},
+		{
+			"i": 83,
+			"gapMs": 621,
+			"fault": {
+				"t": "background",
+				"dev": 1,
+				"event": "pagehide",
+				"durationMs": 11529
+			}
+		},
+		{
+			"i": 237,
+			"gapMs": 0,
+			"user": {
+				"t": "importStorm",
+				"dev": 0,
+				"batch": 2,
+				"count": 72,
+				"big": 34
+			}
+		},
+		{
+			"i": 238,
+			"gapMs": 305,
+			"canvas": {
+				"t": "cText",
+				"dev": 1,
+				"file": 0.744966508820653,
+				"node": 0.9586159482132643,
+				"pos": 0.2527216055896133,
+				"del": false
+			}
+		},
+		{
+			"i": 84,
+			"gapMs": 920,
+			"fault": {
+				"t": "background",
+				"dev": 0,
+				"event": "pagehide",
+				"durationMs": 959
+			}
+		},
+		{
+			"i": 239,
+			"gapMs": 0,
+			"user": {
+				"t": "massOverwrite",
+				"dev": 0,
+				"frac": 0.9122587194899097,
+				"salt": 1403726879
+			}
+		},
+		{
+			"i": 85,
+			"gapMs": 1075,
+			"fault": {
+				"t": "offline",
+				"dev": 2,
+				"durationMs": 45116
+			}
+		},
+		{
+			"i": 86,
+			"gapMs": 984,
+			"fault": {
+				"t": "relayRestart"
+			}
+		},
+		{
+			"i": 240,
+			"gapMs": 0,
+			"user": {
+				"t": "setting",
+				"dev": 1,
+				"file": 2,
+				"key": 3,
+				"del": false
+			}
+		},
+		{
+			"i": 87,
+			"gapMs": 220,
+			"user": {
+				"t": "close",
+				"dev": 1,
+				"view": 0.20206677354872227
+			}
+		},
+		{
+			"i": 88,
+			"gapMs": 888,
+			"user": {
+				"t": "delete",
+				"dev": 0,
+				"file": 0.07000192790292203
+			}
+		},
+		{
+			"i": 89,
+			"gapMs": 293,
+			"user": {
+				"t": "paste",
+				"dev": 0,
+				"view": 0.9806364506948739,
+				"pos": 0.12389096384868026,
+				"lines": 68
+			}
+		},
+		{
+			"i": 241,
+			"gapMs": 321,
+			"canvas": {
+				"t": "cFileRef",
+				"dev": 0,
+				"file": 0.7893653297796845,
+				"node": 0.7641234914772213,
+				"pick": 0.40039603621698916
+			}
+		},
+		{
+			"i": 90,
+			"gapMs": 941,
+			"fault": {
+				"t": "background",
+				"dev": 0,
+				"event": "pagehide",
+				"durationMs": 29405
+			}
+		},
+		{
+			"i": 91,
+			"gapMs": 1336,
+			"user": {
+				"t": "rename",
+				"dev": 0,
+				"file": 0.7377014986705035,
+				"name": 3
+			}
+		},
+		{
+			"i": 245,
+			"gapMs": 306,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 2,
+				"file": 0.44522750983014703,
+				"kind": "text",
+				"seed": 990088644
+			}
+		},
+		{
+			"i": 93,
+			"gapMs": 124,
+			"user": {
+				"t": "create",
+				"dev": 2,
+				"name": 2
+			}
+		},
+		{
+			"i": 246,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 0,
+				"name": 2,
+				"size": 3508
+			}
+		},
+		{
+			"i": 247,
+			"gapMs": 73,
+			"canvas": {
+				"t": "cDeleteNode",
+				"dev": 2,
+				"file": 0.4970184904523194,
+				"node": 0.5935847226064652
+			}
+		},
+		{
+			"i": 94,
+			"gapMs": 787,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.8367725170683116,
+				"pos": 0.44394070957787335,
+				"nl": true
+			}
+		},
+		{
+			"i": 95,
+			"gapMs": 704,
+			"user": {
+				"t": "restoreTrash",
+				"dev": 0,
+				"pick": 0.8524579226505011
+			}
+		}
+	],
+	"gitSha": "73859c321ecc72d0332799b81487793a4e772101",
+	"masterSeed": 9106,
+	"label": "FLOOD_FAULTS[10] short d3 s177 tuned storms0.181 races small-cap"
+}
