@@ -178,13 +178,17 @@ Kept here until `sim-port` merges; then git history holds them.
   longer than the 600 s heal horizon, so the run never had 5 quiet seconds. Fallback refreshes now share one
   `readBatch` per tick from `fallbackMs` on (DESIGN §d.9). The flood plan settles at heal + ~90 s. Focused test in
   `settleCheckpoint.test.ts`; the 256-step plan (5 min a replay) is not promoted.
-- **SIM-SOAK-OOM** (`fix-integrity`): no leak; a run of the conflict-flood profile (5 devices, ~5000 files each,
-  ~55k vault versions) and three costs per size. Engine: every synced write read its doc's ns touch seq through
-  `view()`, which `commitEdits` invalidates, so each write refolded every own pending ns frame and built bodyInfo
-  for every entry: O(N x entries) per pass, >50% of CPU and most garbage. The ns overlay is memoized and jobs read
-  one entry (`peekRemote`). Sim: the heal loop printed every file's text on every device each virtual second
-  (two ~150 MB strings live), and path listings decoded every file; it now uses a vault content generation and
-  `visiblePaths()`. Between runs the soak's heap returns to ~27 MB (no cross-run growth).
+- **SIM-SOAK-OOM** (`fix-integrity`): no leak. Run #20 of master seed 4 is the conflict-flood profile (seed
+  1623917393, 5 devices): ~28k files per device by the end, ~200k vault versions kept. Three costs per size made it
+  blow up. Engine: every synced write read its doc's ns touch seq through `view()`, which `commitEdits`
+  invalidates, so each write refolded every own pending ns frame and built bodyInfo for every entry: O(N x entries)
+  per pass, >50% of CPU and most of the garbage. The ns overlay is memoized and jobs read one entry
+  (`peekRemote`). Sim: the heal loop printed every file's text on every device each virtual second (two ~150 MB
+  strings live), and path listings decoded every file; it now uses a vault content generation and
+  `visiblePaths()`. The run now completes in ~12 min wall with no violation, heap peak 2.8 GB (RSS 5.7 GB), under
+  Node's default heap; between runs the soak's heap returns to ~30-90 MB. Residual, by world size: the sim's
+  MemStorage copies every touched store's record array per write transaction (the main remaining churn), and the
+  vault keeps every version's bytes for the invariants.
 - **SIM-CANVAS-REORDER** (`fix-integrity`): a reorder re-ranks whichever records the order reconciliation moves
   (the longest ordered run keeps its ranks), often not the one the user moved; a concurrent edit of such a record made
   its line differ on both sides, and the record conflict kept the CRDT's line with its old rank. `mergeRecordLines`
