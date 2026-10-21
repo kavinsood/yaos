@@ -485,6 +485,19 @@ export class RelayEngine {
 		for (const [session, list] of receipts) session.send({ k: "receipts", head, receipts: list });
 	}
 
+	/** Sim only: buffered frames matching `which` are lost uncommitted (no receipt; PROVISIONAL holders drop). */
+	discardPending(which: (frame: PendingFrame) => boolean): number {
+		const lost = this.pending.filter(which);
+		if (lost.length === 0) return 0;
+		this.pending = this.pending.filter((f) => !which(f));
+		for (const f of lost) {
+			this.pendingByKey.delete(f.key);
+			this.pendingBytes -= f.payload.byteLength;
+			if (f.provisional) this.dropProvisional(f, "durability_failed");
+		}
+		return lost.length;
+	}
+
 	private dropProvisional(frame: PendingFrame, reason: string): void {
 		for (const peer of frame.provisionalTo) {
 			peer.send({ k: "dropped", stream: frame.stream, deviceId: frame.deviceId, clientFrameId: frame.clientFrameId, reason });

@@ -10,7 +10,7 @@
 
 import { CFG_STREAM, NS_STREAM, SNAP_STREAM, streamClass, streamDocId, type DeviceId, type DocId, type StreamName, type VaultId, type VaultPath } from "../core/types";
 import type { BlobPort } from "../ports/blob";
-import type { DeviceState, RegisterOutcome, RetireOutcome } from "../ports/identity";
+import type { DeviceState, GrantFetchOutcome, RegisterOutcome, RetireOutcome } from "../ports/identity";
 import { retireKeyHash } from "../engine/compose/storeIdentity";
 import type { RelayConnectResult, RelayPort } from "../ports/relay";
 import { createNoopCrypto } from "../engine/adapters/noopCrypto";
@@ -79,9 +79,17 @@ const LOG_CLASSES = new Set(["ns", "cfg", "snap", "keyring", "body", "canvas"]);
 /** The server's grant limits (server vault/host.ts registerDevice, identity-per-store §3.3). */
 export const SIM_GRANT_DAILY_REGISTRATIONS = 20;
 export const SIM_GRANT_LIVE_DEVICES = 50;
+/** The server's inactivity retirement (vault/pairing.ts INACTIVITY_RETIRE_DAYS, identity-per-store §6.2). */
+export const SIM_INACTIVITY_RETIRE_DAYS = 90;
 const DAY_MS = 86_400_000;
 
 interface SimGrant {
+	/** Stable across rotations (the server's grantId). */
+	readonly id: number;
+	/** The current secret (a rotation replaces it; the old one is unknown from then on). */
+	secret: string;
+	/** Rotated at least once: the server keeps the secret (wrapped) and a live device may fetch it. */
+	rotated: boolean;
 	revoked: boolean;
 	/** Registration times (wall ms) of the current UTC day. */
 	day: number;
@@ -89,10 +97,13 @@ interface SimGrant {
 }
 
 interface SimRegistered {
-	readonly grant: string;
+	/** The grant's id (SimGrant.id). */
+	readonly grant: number;
 	readonly deviceToken: string;
 	readonly retireKeyHash: string;
 	retired: boolean;
+	/** UTC day of the last connect (the server's `last_seen_day`, written at ticket). */
+	seenDay: number;
 }
 
 /**
@@ -102,30 +113,95 @@ interface SimRegistered {
  * registration_limit, Retry-After to midnight) → 50 live (409 device_limit).
  */
 export class SimIdentityRegistry {
+	/** By current secret. */
 	private readonly grants = new Map<string, SimGrant>();
+	private readonly grantsById = new Map<number, SimGrant>();
 	private readonly devices = new Map<DeviceId, SimRegistered>();
-	private readonly tokens = new Set<string>();
+	private readonly tokens = new Map<string, DeviceId>();
 	private nextGrant = 0;
+	private rotations = 0;
+	private readonly rotatedAway = new Set<string>();
+	/** The UTC day the inactivity sweep last finished (once a day, as the server's per runtime). */
+	private sweptDay = -1;
 	/** Registrations the server accepted, and refused (by reason): sim stats. */
 	readonly counts: Record<string, number> = {};
+	/** The server's inactivity threshold in UTC days (YAOS_INACTIVITY_RETIRE_DAYS); tests shorten it. */
+	inactivityDays = SIM_INACTIVITY_RETIRE_DAYS;
 
 	constructor(private readonly now: () => number) {}
 
+	private newGrant(secret: string): void {
+		const g: SimGrant = { id: ++this.nextGrant, secret, rotated: false, revoked: false, day: -1, today: 0 };
+		this.grants.set(secret, g);
+		this.grantsById.set(g.id, g);
+	}
+
 	/** A new pairing grant (an enroll with a pairing code); returns its secret. */
 	issueGrant(label: string): string {
-		const secret = `grant-${label}-${String(++this.nextGrant).padStart(8, "0")}`.padEnd(43, "0");
-		this.grants.set(secret, { revoked: false, day: -1, today: 0 });
+		const secret = `grant-${label}-${String(this.nextGrant + 1).padStart(8, "0")}`.padEnd(43, "0");
+		this.newGrant(secret);
 		return secret;
 	}
 
 	/** A grant whose secret the client chose (the enroll of a fake pairing server in a test): known from now on. */
 	addGrant(secret: string): void {
-		if (!this.grants.has(secret)) this.grants.set(secret, { revoked: false, day: -1, today: 0 });
+		// A rotated-away secret stays unknown (a copy of an old data.json does not bring it back).
+		if (this.grants.has(secret) || this.rotatedAway.has(secret)) return;
+		this.newGrant(secret);
 	}
 
 	revokeGrant(secret: string): void {
 		const g = this.grants.get(secret);
 		if (g) g.revoked = true;
+	}
+
+	/**
+	 * The operator's "Rotate secret" (identity-per-store §3.4): a new secret; the old one is unknown from now on. The
+	 * grant's devices stay live. Returns the new secret (tests only: the server never shows it), null for an unknown or
+	 * revoked grant.
+	 */
+	rotateGrant(secret: string): string | null {
+		const g = this.grants.get(secret);
+		if (!g || g.revoked) return null;
+		const next = `rotated-${++this.rotations}-${secret.slice(0, 12)}`.padEnd(43, "0");
+		this.grants.delete(secret);
+		this.rotatedAway.add(secret);
+		g.secret = next;
+		g.rotated = true;
+		this.grants.set(next, g);
+		return next;
+	}
+
+	/** `GET /auth/grant` as the device of `deviceToken` (the server's fetchGrant). */
+	fetchGrant(deviceToken: string): GrantFetchOutcome {
+		const id = this.tokens.get(deviceToken);
+		const d = id === undefined ? undefined : this.devices.get(id);
+		const g = d === undefined ? undefined : this.grantsById.get(d.grant);
+		if (!d || d.retired || !g || g.revoked) return { ok: false, reason: "refused" };
+		return g.rotated ? { ok: true, grantSecret: g.secret } : { ok: false, reason: "unavailable" };
+	}
+
+	/**
+	 * The server's lazy inactivity sweep (host.ts retireInactive): run at registration and device status, once a UTC
+	 * day; a device not seen for more than `inactivityDays` is retired, one with an open socket (`connected`) is seen
+	 * now instead. Returns the ids retired (the caller revokes their relay sessions).
+	 */
+	sweepInactive(connected: (deviceId: DeviceId) => boolean): DeviceId[] {
+		const today = Math.floor(this.now() / DAY_MS);
+		if (this.sweptDay === today) return [];
+		this.sweptDay = today;
+		const out: DeviceId[] = [];
+		for (const [id, d] of this.devices) {
+			if (d.retired || d.seenDay >= today - this.inactivityDays) continue;
+			if (connected(id)) {
+				d.seenDay = today;
+				continue;
+			}
+			d.retired = true;
+			out.push(id);
+		}
+		if (out.length > 0) this.counts["inactive"] = (this.counts["inactive"] ?? 0) + out.length;
+		return out;
 	}
 
 	register(grantSecret: string, c: { readonly deviceId: DeviceId; readonly deviceToken: string; readonly retireKeyHash: string }): RegisterOutcome {
@@ -150,11 +226,11 @@ export class SimIdentityRegistry {
 		}
 		if (g.today >= SIM_GRANT_DAILY_REGISTRATIONS) return { ok: false, reason: "registration-limit", retryAfterMs: (day + 1) * DAY_MS - now };
 		let live = 0;
-		for (const d of this.devices.values()) if (d.grant === grantSecret && !d.retired) live++;
+		for (const d of this.devices.values()) if (d.grant === g.id && !d.retired) live++;
 		if (live >= SIM_GRANT_LIVE_DEVICES) return { ok: false, reason: "device-limit", retryAfterMs: null };
 		g.today++;
-		this.devices.set(c.deviceId, { grant: grantSecret, deviceToken: c.deviceToken, retireKeyHash: c.retireKeyHash, retired: false });
-		this.tokens.add(c.deviceToken);
+		this.devices.set(c.deviceId, { grant: g.id, deviceToken: c.deviceToken, retireKeyHash: c.retireKeyHash, retired: false, seenDay: day });
+		this.tokens.set(c.deviceToken, c.deviceId);
 		return { ok: true };
 	}
 
@@ -183,10 +259,20 @@ export class SimIdentityRegistry {
 		return !d ? "unknown" : d.retired ? "retired" : "live";
 	}
 
-	/** A connect as `deviceId` with `token` authenticates: registered, live, the token it registered, grant not revoked. */
+	/**
+	 * A connect as `deviceId` with `token` authenticates: registered, live, the token it registered, grant not revoked.
+	 * It is the ticket, so it marks the device seen today (the server's `last_seen_day`).
+	 */
 	authenticates(deviceId: DeviceId, token: string): boolean {
 		const d = this.devices.get(deviceId);
-		return d !== undefined && !d.retired && d.deviceToken === token && this.grants.get(d.grant)?.revoked === false;
+		const ok = d !== undefined && !d.retired && d.deviceToken === token && this.grantsById.get(d.grant)?.revoked === false;
+		if (ok) d.seenDay = Math.floor(this.now() / DAY_MS);
+		return ok;
+	}
+
+	/** The server answers this secret's grant routes (it names a grant, revoked or not): else 401 before any sweep. */
+	grantKnown(secret: string): boolean {
+		return this.grants.has(secret);
 	}
 
 	/** Every registered device id (live or retired). */
@@ -272,7 +358,23 @@ export class SimNet {
 		if (this.offline.has(machine)) return { ok: false, reason: "network", retryAfterMs: null };
 		await new Promise<void>((resolve) => this.clock.setTimer(this.httpMs, resolve));
 		if (this.offline.has(machine)) return { ok: false, reason: "network", retryAfterMs: null };
+		if (this.identities.grantKnown(grantSecret)) this.sweepInactive();
 		return this.identities.register(grantSecret, c);
+	}
+
+	/** The server's lazy inactivity sweep (registration, device status): retired devices lose their sessions (D7). */
+	private sweepInactive(): void {
+		for (const id of this.identities.sweepInactive((d) => this.relay.subscriptionsOf(d).length > 0)) this.relay.revoke(id);
+	}
+
+	/** `GET /auth/grant` from `machine` as the store of `token` (one round trip); "network" while offline. */
+	async fetchGrant(machine: string, token: string | null): Promise<GrantFetchOutcome> {
+		if (token === null) return { ok: false, reason: "no-store" };
+		if (this.offline.has(machine)) return { ok: false, reason: "network" };
+		await new Promise<void>((resolve) => this.clock.setTimer(this.httpMs, resolve));
+		if (this.offline.has(machine)) return { ok: false, reason: "network" };
+		this.identities.counts["grant-fetch"] = (this.identities.counts["grant-fetch"] ?? 0) + 1;
+		return this.identities.fetchGrant(token);
 	}
 
 	/**
@@ -301,6 +403,7 @@ export class SimNet {
 		await new Promise<void>((resolve) => this.clock.setTimer(this.httpMs, resolve));
 		if (this.offline.has(machine)) return null;
 		this.identities.counts["status"] = (this.identities.counts["status"] ?? 0) + 1;
+		this.sweepInactive();
 		return new Map(ids.map((id) => [id, this.identities.state(id)]));
 	}
 

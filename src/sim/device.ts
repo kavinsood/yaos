@@ -308,11 +308,12 @@ export class SimDevice {
 				const blob = (): BlobPort | null => (this.opts.blob ? this.opts.blob() : this.opts.net.blobPort());
 				let token: string | null = null;
 				const net = this.opts.net;
-				// The grant the host passed (data.json's): a clone's is the copied one.
-				const grant = config.relay.grantSecret || null;
+				// The grant the host passed (data.json's): a clone's is the copied one. A rotation's fetch replaces it.
+				let grant = config.relay.grantSecret || null;
 				return {
 					relay: net.port(this.machineKey, () => token), storage: this.storage, clock: this.deviceClock, random, crypto, hash, blob: blob(), probeBlob: async () => blob(),
-					identity: { register: (c) => net.register(this.machineKey, grant, c), use: (t) => (token = t), mint: () => this.mint(), retire: (c) => net.retire(this.machineKey, c), status: (ids) => net.status(this.machineKey, ids) },
+					identity: { register: (c) => net.register(this.machineKey, grant, c), use: (t) => (token = t), mint: () => this.mint(), retire: (c) => net.retire(this.machineKey, c), status: (ids) => net.status(this.machineKey, ids),
+						fetchGrant: () => net.fetchGrant(this.machineKey, token), useGrant: (s) => (grant = s) },
 				};
 			},
 		});
@@ -353,6 +354,10 @@ export class SimDevice {
 				onNotice: (level, code, message) => this.ui.notices.push({ level, code, message }),
 				onCarrier: (c) => this.ui.carriers.push({ carrier: c.carrier, ready: c.ready }),
 				onStoreIdentity: (deviceId, retireKey) => saveStoreIdentity(this.installStorage, SIM_VAULT_ID, identity.installKey, deviceId, retireKey),
+				// The plugin controller's onGrantSecret: data.json takes the fetched secret (no restart).
+				onGrantSecret: (secret) => {
+					this.grantSecret = secret;
+				},
 				onFatal: (e) => {
 					if (this.crashed !== rt) {
 						this.ui.fatals.push(e);
