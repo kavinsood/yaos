@@ -9,13 +9,29 @@ import { SimRelay } from "../../sim/relay";
 import type { LogEngine } from "./engine";
 import type { SideFilePort } from "../../ports/vault";
 import { MemStoragePort } from "../../sim/storage";
-import { MemSideFiles, converged, sleep, startTestEngine, until, createDoc, docText, editDoc, renameDoc } from "./testHarness";
+import { MemSideFiles, converged, startTestEngine, until, createDoc, docText, editDoc, renameDoc } from "./testHarness";
 import { decodeOutboxMirror, encodeOutboxMirror } from "./mirrors";
 import { DB_SCHEMA_VERSION, STORE, STORE_SPECS, dbName, type MetaIdentity } from "../store/schema";
 import type { YS } from "../store/repo";
 
 async function live(...es: LogEngine[]): Promise<void> {
 	await until(() => es.every((e) => e.status().phase === "live"), 3_000, "live");
+}
+
+/**
+ * Until the outbox mirror on `side` holds every frame now in `e`'s outbox: the debounced mirror write landed. A fixed
+ * sleep past the debounce failed on a loaded machine (the timer and the write run late, not wrong).
+ */
+async function mirrored(e: LogEngine, side: MemSideFiles): Promise<void> {
+	const want = [...e.c.outbox.values()].map((r) => r.clientFrameId);
+	const hash = e.c.ports.hash;
+	await until(async () => {
+		for (const bytes of side.files.values()) {
+			const m = await decodeOutboxMirror(bytes, hash);
+			if (m && want.every((id) => m.frames.some((f) => f.clientFrameId === id))) return true;
+		}
+		return false;
+	}, 10_000, "outbox mirror written");
 }
 
 function countsByFrame(relay: SimRelay): Map<string, number> {
@@ -43,9 +59,7 @@ for (const committed of [false, true]) {
 			await until(() => a.c.sender.inflightCount >= 3, 2_000, "sent");
 			const frames = [...a.c.outbox.values()].map((r) => r.clientFrameId);
 			assert.ok(frames.length >= 4);
-			await sleep(60); // mirror debounce
-			const w = side.writes;
-			assert.ok(w > 0, "outbox mirror written");
+			await mirrored(a, side);
 			a.disconnect();
 			await a.stop();
 			if (committed) relay.resumeCommits();
@@ -95,7 +109,7 @@ test("schema upgrade: an older DB is rebuilt fresh and imports the mirror, legac
 		await editDoc(a, id, (t) => t.insert(t.length, "inflight;"));
 		await until(() => a.c.sender.inflightCount >= 1, 2_000, "sent");
 		const frames = [...a.c.outbox.values()].map((r) => r.clientFrameId);
-		await sleep(60); // mirror debounce
+		await mirrored(a, side);
 		const hash = a.c.ports.hash;
 		const name = dbName(a.c.opts.vaultId, a.c.repo.identity.vaultEpoch, a.c.self);
 		a.disconnect();
@@ -170,7 +184,7 @@ test("mirror recovery: a restart over stored frames the mirror lacks rewrites it
 		const p2 = mortal(side);
 		a2 = (await startTestEngine({ relay, deviceId: "dev-a", sideFiles: p2.port, storage: copy, extra: { vaultEpoch: relay.vaultEpoch() } })).engine;
 		assert.ok(a2.c.outbox.size > 0);
-		await sleep(80); // mirror debounce
+		await mirrored(a2, side); // the restart rewrote the mirror with the frame p1 never mirrored
 		p2.kill(); // IDB wiped with the app down
 		a2.disconnect();
 		await a2.stop().catch(() => undefined);

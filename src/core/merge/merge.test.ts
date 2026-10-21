@@ -372,8 +372,10 @@ test("merge + minimalDiff are bounded on 2M-char inputs", (t) => {
 		{ name: "3000 random edits per side (anchored fallback)", disk: scatter(rnd, base, 3000, "DISK"), crdt: scatter(rnd, base, 3000, "CRDT") },
 		{ name: "both sides rewritten", disk: bigDoc(prng(1), size), crdt: bigDoc(prng(2), size) },
 	];
+	let fastestMerge = Infinity;
 	for (const s of scenarios) {
 		const m = measure(() => merge({ base, disk: s.disk, crdt: s.crdt, limits: DEFAULT_MERGE_LIMITS }));
+		fastestMerge = Math.min(fastestMerge, m.ms);
 		const result = m.value;
 		if (s.name.endsWith("(clean)")) assert.equal(result.kind, "clean");
 		const target = result.kind === "identical" ? s.crdt : result.text;
@@ -387,9 +389,13 @@ test("merge + minimalDiff are bounded on 2M-char inputs", (t) => {
 		assert.ok(m.ms < 10_000, `merge took ${m.ms} ms`);
 		assert.ok(d.ms < 10_000 && w.ms < 10_000, `minimalDiff took ${d.ms}/${w.ms} ms`);
 	}
+	// Over the limit: refused up front (too-large), before any diff runs. The timing shows it did no work, relative to
+	// the merges above on the same machine and load (a clean 2M-char merge takes ~40 ms, the refusal well under 1 ms):
+	// the fastest of 5 runs, so one scheduler stall does not count (a fixed 50 ms bound failed at load 70).
 	const over = base + "x".repeat(2000);
-	const tooBig = measure(() => merge({ base: over, disk: over + "d\n", crdt: "c\n" + over, limits: DEFAULT_MERGE_LIMITS }));
-	assert.equal(tooBig.value.kind, "conflict");
-	t.diagnostic(`over limit: ${tooBig.ms.toFixed(1)} ms`);
-	assert.ok(tooBig.ms < 50);
+	const runs = Array.from({ length: 5 }, () => measure(() => merge({ base: over, disk: over + "d\n", crdt: "c\n" + over, limits: DEFAULT_MERGE_LIMITS })));
+	for (const r of runs) assert.deepEqual(r.value.kind === "conflict" ? r.value.reason : r.value.kind, "too-large");
+	const fastest = Math.min(...runs.map((r) => r.ms));
+	t.diagnostic(`over limit: fastest of 5 ${fastest.toFixed(1)} ms, fastest merge ${fastestMerge.toFixed(0)} ms`);
+	assert.ok(fastest < fastestMerge / 10, `the over-limit refusal took ${fastest} ms at best, a merge ${fastestMerge} ms`);
 });
