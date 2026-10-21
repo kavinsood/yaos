@@ -297,6 +297,30 @@ test("binding: docRetarget resync re-attaches with the mirror as base; frozen wa
 	assert.equal(engine.count("bodyAttach"), 4);
 });
 
+test("binding: a doc frozen under unsaved keystrokes saves the view at once (an outside write cannot reload over them)", async () => {
+	const s = setup();
+	const { clock, ws, engine, bm, vault } = s;
+	const docId = file(s, "a.md", "abc\n");
+	bm.start();
+	const v = ws.openFile("a.md");
+	assert.ok(v);
+	await clock.advance(5);
+	v.edit(3, 0, " typed");
+	assert.equal(v.isDirty(), true);
+	// The engine froze the doc and dropped its binding before the coalesced push arrived (sim suite 1 seed 1482901505:
+	// a revoked device's doc froze 5 ms after a keystroke, crypto-unknown-key): the push is refused.
+	engine.frozen.add("a.md");
+	bm.onDocRetarget(docId, { t: "frozen", reason: "test" });
+	await clock.advance(5);
+	assert.equal(bm.slotState(v.viewId), "waiting");
+	assert.equal(vault.textOf("a.md"), "abc typed\n", "on disk now, not after Obsidian's 2 s save");
+	assert.equal(v.isDirty(), false);
+	// Another app writes the file inside what was the save window: the unbound view reloads the disk, keystrokes kept.
+	vault.externalWrite("a.md", "abc typed\nmore\n");
+	await clock.advance(1_000);
+	assert.equal(v.getText(), "abc typed\nmore\n");
+});
+
 test("binding: a frozen doc stays unbound with a notice; notBindable waits until bindable", async () => {
 	const s = setup();
 	const { clock, ws, engine, bm, notices } = s;
