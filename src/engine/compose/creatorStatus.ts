@@ -55,6 +55,8 @@ export class CreatorStatus {
 	/** Retired creators whose grace end was reported (onAbandoned). */
 	private readonly reported = new Set<DeviceId>();
 	private inFlight = false;
+	/** The ids of the request in flight: not queued again meanwhile (a second answer would double the backoff). */
+	private asking: ReadonlySet<DeviceId> = new Set();
 	private stopped = false;
 
 	constructor(private readonly d: CreatorStatusDeps) {}
@@ -99,7 +101,7 @@ export class CreatorStatus {
 	private queueDue(): void {
 		const now = this.d.mono();
 		for (const id of this.named) {
-			if (this.retiredAt.has(id) || this.unknown.has(id)) continue;
+			if (this.retiredAt.has(id) || this.unknown.has(id) || this.asking.has(id)) continue;
 			const l = this.live.get(id);
 			if (l && l.dueAt > now) continue;
 			this.wanted.add(id);
@@ -117,7 +119,7 @@ export class CreatorStatus {
 		let at = Infinity;
 		for (const id of this.named) {
 			const l = this.live.get(id);
-			if (l && !this.wanted.has(id)) at = Math.min(at, l.dueAt);
+			if (l && !this.wanted.has(id) && !this.asking.has(id)) at = Math.min(at, l.dueAt);
 		}
 		for (const [id, t] of this.retiredAt) if (!this.reported.has(id)) at = Math.min(at, t + this.d.graceMs);
 		if (at === Infinity) {
@@ -151,6 +153,7 @@ export class CreatorStatus {
 		this.inFlight = true;
 		const ids = [...this.wanted].sort().slice(0, BATCH);
 		for (const id of ids) this.wanted.delete(id);
+		this.asking = new Set(ids);
 		let states: ReadonlyMap<DeviceId, DeviceState> | null = null;
 		try {
 			states = await status(ids);
@@ -158,6 +161,7 @@ export class CreatorStatus {
 			states = null;
 		}
 		this.inFlight = false;
+		this.asking = new Set();
 		if (this.stopped) return;
 		const now = this.d.mono();
 		// Not answered (offline, not authenticated yet): the next view() asks again.

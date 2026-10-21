@@ -140,11 +140,6 @@ on A is lost. Possibly the same as test:sim-suite1 "4 devices, E2EE faults" seed
 at step 52)`, identical on base; its plan has an epoch reset and commit crashes too, `s1-e2ee4-seed1.json`). The
 known suite-1 failure: `npm run test:sim-suite1` exits 1 on it.
 
-### SIM-CLONE-BODYLESS-WAIT: a clone waits on a creator that never sends the body
-
-`532933571-114.json` (clone faults, 4 devices; found on 70c67349, base): no quiescence, D waits on the creator of a
-body-less doc whose body never comes.
-
 ### PRUNE-STORM: pruning under storms loses edits (soak small-cap draws)
 
 The soak's small tombstone cap met storms (FLOOD_FAULTS) twice in 602 runs, both a token loss that passes without
@@ -180,6 +175,11 @@ config is drawn from the master seed) and whether a run or the soak's coverage /
 
 Kept here until `sim-port` merges; then git history holds them.
 
+- **SIM-CLONE-BODYLESS-WAIT** (`fix-integrity`): a view() while a creator-status request was in flight queued the
+  same creator again; its second "live" answer counted as a recheck and doubled the backoff (10 min instead of 5), so
+  docs of a creator removed meanwhile waited past the heal horizon. A creator being asked is neither queued again nor
+  timed (`creatorStatus.ts`). Nothing was at risk while waiting: the files stay on disk and abandonment re-creates
+  them. Regression `creator-asked-twice-doubles-recheck.json`.
 - **SIM-BLOB-STALE-DISK** (`fix-integrity`): observed renames were ordered by wall-clock stamps; a clock set back
   between seed1 -> r1 -> r5 and n5 -> r1 chained n5 into r5 (both docs claimed r5.md, the editor bound to n5's doc
   sat at r1.md, its content job deferred for good, A's disk stale). Rename stamps are now strictly increasing in event

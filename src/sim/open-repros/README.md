@@ -20,7 +20,6 @@ Status as of integrate-3 (2026-10-21): every file below still fails. "base": als
 | `s1-197-nohostile.json` | the same seed, another minimization (same loss) | SIM-S1-REKEY-WIPE |
 | `1482901505-47-min.json` | hostile device, suite 1, attachment clean-ups and revokes, 5 devices: token `[D.54]` typed on D is lost. Likely the same as SIM-S1-REKEY-WIPE | SIM-S1-REKEY-WIPE |
 | `relay-134.json` | targeted relay faults, seed 134: epoch reset, then a commit crash (after) and offline: token `[A.36]` typed on A is lost. Possibly the same as suite 1 "4 devices, E2EE faults" seed 1 (epoch reset + commit crash); base | SIM-EPOCH-COMMIT-CRASH |
-| `532933571-114.json` | identity-per-store clone faults, 4 devices: no quiescence, D waits on the creator of a body-less doc that never sends its body; base | SIM-CLONE-BODYLESS-WAIT |
 | `s1-e2ee4-seed1.json` | `npm run test:sim-suite1` "4 devices, E2EE faults" seed 1: token `[C.52]` typed on C is lost; base | SIM-EPOCH-COMMIT-CRASH |
 | `prune-epoch-merged-overwrite.json` | small tombstone cap (soak): an import storm, an epoch reset, mass overwrites, no file deleted (every pruned entry is a merged alias): A's overwrite of 10 notes is lost. Passes without `smallPrune` | PRUNE-STORM |
 | `prune-storm-mass-delete.json` | small tombstone cap (soak): mass deletes and import storms: imported notes on B lost. Passes without `smallPrune` | PRUNE-STORM |

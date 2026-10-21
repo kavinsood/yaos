@@ -107,3 +107,46 @@ test("creatorStatus: unknown is never asked again; retired ends its grace on the
 	await r.settle();
 	assert.equal(r.asked.length, 1, "neither asked again");
 });
+
+/**
+ * Sim clone seed 532933571: a view() while the first request was in flight queued the same creator again, and its
+ * second "live" answer, 36 ms later, counted as a recheck: the next ask came after 10 min, not 5. The creator was
+ * removed in the console meanwhile, and its body-less docs stayed waiting past the sim's heal horizon.
+ */
+test("creatorStatus: a creator already being asked is not queued again; one live answer, one 5 min recheck", async () => {
+	let release: (() => void) | null = null;
+	let now = 0;
+	let seq = 0;
+	const timers = new Map<number, { at: number; fn: () => void }>();
+	const asked: DeviceId[][] = [];
+	const cs = new CreatorStatus({
+		status: (ids) => {
+			asked.push([...ids]);
+			return new Promise((resolve) => (release = () => resolve(new Map(ids.map((id) => [id, "live" as DeviceState])))));
+		},
+		mono: () => now,
+		setTimer: (ms, fn) => {
+			timers.set(++seq, { at: now + ms, fn });
+			return seq;
+		},
+		clearTimer: (h) => void timers.delete(h),
+		graceMs: 30_000, recheckMs: 300_000, recheckMaxMs: 3_600_000,
+		onAbandoned: () => undefined,
+	});
+	const settle = async () => {
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+	};
+	const c = ids(1);
+	cs.seen(c);
+	await settle();
+	cs.seen(c);
+	cs.seen(c);
+	await settle();
+	assert.equal(asked.length, 1, "one request");
+	assert.equal(timers.size, 0, "no timer for a creator being asked (a past due date would spin)");
+	now = 36;
+	release!();
+	await settle();
+	assert.equal(asked.length, 1, "not asked again when the answer comes");
+	assert.deepEqual([...timers.values()].map((t) => t.at), [36 + 300_000], "the recheck after one live answer");
+});
