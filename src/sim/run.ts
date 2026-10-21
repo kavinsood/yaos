@@ -34,6 +34,7 @@ import type { SimCheckpointStats } from "./relay";
 import type { CaseProfile } from "./vault";
 import { checkE2eeLeaks, oracleKeys, onboardSuite1, seededRk } from "./e2ee";
 import type { E2eeFaultStats } from "./e2eeFaults";
+import type { HostileStats } from "./hostile";
 import { realWorkFor, type RealWork } from "./delayedCrypto";
 import type { SimBlobLiveness } from "./blobStore";
 import { CANVAS_NAME_POOL, CANVAS_OPS, CanvasWorld, generateCanvasAction, type CanvasAction, type CanvasStats, type CanvasWeights } from "./canvas";
@@ -288,6 +289,8 @@ export interface SimReport {
 		readonly brakes: BrakeUserStats;
 		/** Suite-1 fault outcomes (e2eeFaults.ts), in a suite-1 run with faults. */
 		readonly e2ee?: E2eeFaultStats;
+		/** Hostile member device outcomes (hostile.ts), in a run that drew the hostile fault. */
+		readonly hostile?: HostileStats;
 		/** Every suspend-kill of the run (faults.ts SuspendKillAction) and what it lost. */
 		readonly suspend: readonly SuspendOutcome[];
 		/** Checkpoint coverage: relay puts / GC / served pages, and adoptions / gate disputes on the devices and the oracle. */
@@ -486,7 +489,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		});
 		const ledger = new TokenLedger();
 		const merges0 = { ...canvasMergeStats };
-		const faults = new FaultState(clock, devs, net, ledger, { suite1: c.suite1, weights: c.faults, initialRk: () => seededRk(world.fork("e2ee").fork("rk")) });
+		const faults = new FaultState(clock, devs, net, ledger, { suite1: c.suite1, weights: c.faults, initialRk: () => seededRk(world.fork("e2ee").fork("rk")), seed: cfg.seed });
 		const trace: string[] = [`world ${profile} ${devs.map((d) => `${d.name}:${d.platform.info.os}`).join(" ")}`];
 		if (cfg.checkpoints !== "production") {
 			const t = cw.tuning;
@@ -585,7 +588,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			brakeUser.poll();
 			sampleBounds();
 			// Blob store calls outside the blob queue (a snapshot upload's) count too: a stalled one ends by its idle window.
-			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && !(d.vrt?.creators.busy() ?? false) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending();
+			const idle = net.quiet() && net.blobs.transfers().length === 0 && devs.every((d, i) => !faults.isDown(i) && d.runtime.engine.isReady && (d.vrt?.log.isIdle() ?? false) && adoptables(d) === 0 && (d.vrt?.blobs.queued().length ?? 0) === 0 && (d.vrt?.snaps.idle ?? true) && !(d.vrt?.creators.busy() ?? false) && d.vault.pendingEvents() === 0 && !d.workspace.views_().some((v) => v.isDirty())) && !brakeUser.pending() && !(faults.hostile?.busy() ?? false);
 			const fp = print();
 			stable = idle && fp === last ? stable + 1 : 0;
 			last = fp;
@@ -605,6 +608,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 			if (!net.relay.quiescent()) why.push("relay busy");
 			if (net.relay.pendingCount() > 0) why.push(`relay pending ${net.relay.pendingCount()}`);
 			if (net.blobs.transfers().length > 0) why.push(`blob calls in flight ${net.blobs.transfers().length}`);
+			if (faults.hostile?.busy()) why.push("hostile device busy");
 			devs.forEach((d, i) => {
 				if (faults.isDown(i)) why.push(`${d.name} down`);
 				else if (!d.runtime.engine.isReady) why.push(`${d.name} not ready`);
@@ -623,6 +627,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		if (!(await faults.settle())) violations.push({ inv: "clean", detail: "crash inspections did not finish" });
 		const oracle = await net.oracle(120_000, c.suite1 ? oracleKeys(devs) : null);
 		if (c.suite1) violations.push(...checkE2eeLeaks(devs, net, ledger).violations, ...(faults.e2ee?.check() ?? []));
+		violations.push(...(faults.hostile?.check() ?? []));
 		canvasWorld.finalize();
 		violations.push(...checkConvergence(devs, oracle), ...checkLogCarriesNoBlobs(net, oracle), ...checkSettings(devs), ...checkTokens(devs, ledger), ...checkNothingDestroyed(devs, ledger), ...checkIdentity(devs), ...checkClean(devs, net, (i) => faults.isDown(i)), ...checkBlobLiveness(net), ...checkCheckpoints(devs, net), ...checkCanvas(devs, canvasWorld.oracle), ...checkOutboxAndCursor(devs, net), ...bounds.values());
 		violations.push(...(await checkQuiet(clock, devs, net)));
@@ -653,7 +658,7 @@ export async function runSim(cfg: SimConfig, explicitPlan?: readonly Step[]): Pr
 		return {
 			seed: cfg.seed, plan, trace, violations, seededEntropy: seeded, profile,
 			digest: digestOf([...trace, ...snap.map(([p, t]) => `${p}=${t}`)]),
-			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, brakes: brakeUser.stats, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), identity: { stores: devs.reduce((n, d) => n + d.identities.length, 0), registrations: { ...net.identities.counts } }, relayTaps: net.relay.taps(), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
+			stats: { steps: plan.length, skipped, tokens, subs: subsStats(net, devs), files: snap.length, faults: { ...faults.counts }, blobs: structuredClone(net.blobs.liveness), quiesceMs, relayHead: net.relay.head(), crashUnacked: faults.unacked, clobbers: devs.reduce((n, d) => n + d.vault.clobbered.length, 0), suspend, brakes: brakeUser.stats, checkpoints: checkpointStats(devs, net), coverage: collectCoverage(devs), identity: { stores: devs.reduce((n, d) => n + d.identities.length, 0), registrations: { ...net.identities.counts } }, relayTaps: net.relay.taps(), ...(faults.e2ee ? { e2ee: faults.e2ee.stats } : {}), ...(faults.hostile ? { hostile: faults.hostile.stats } : {}), ...(c.suite1 ? { realWork: { ...realWorkFor(clock).stats } } : {}), canvas: canvasStats },
 		};
 	} finally {
 		seedEntropy(null);

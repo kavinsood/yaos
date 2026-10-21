@@ -24,7 +24,9 @@
  * never emits wait/blob-unavailable nor conflictCopy ops for both-edited / too-large (those are merge outcomes,
  * conflict.*), and no code emits the ConflictReason members path-taken / recovered on a planner op (the events are
  * conflict.path-taken / conflict.recovered); diagnostics `recovered-from-mirror` is the no-identity engine-test path
- * (production's mirror recovery is the identity-per-store inherit, diag `inherited`).
+ * (production's mirror recovery is the identity-per-store inherit, diag `inherited`). An ns frame with upgradeRules
+ * above the known version halts the fold before it folds (ns/fold.ts pre-scan), so its ignored/rules-version event
+ * never reaches RuntimeObserver.nsFold: the halt is diag `upgrade-required` (upgradeHalt.test.ts).
  */
 
 import type { FoldedNsFrame } from "../engine/sync/nsRuntime";
@@ -42,7 +44,7 @@ const NS_OUTCOMES: readonly string[] = [
 const NS_IGNORED: readonly string[] = [
 	"duplicate-frame", "replay-stale", "replay-duplicate", "stale-epoch", "duplicate-docid", "unknown-docid", "invalid-path",
 	"kind-mismatch", "stale-delete", "already-deleted", "not-deleted", "restore-not-current", "stale-revive", "rev-mismatch",
-	"not-blob", "noop", "rules-version",
+	"not-blob", "noop",
 ];
 const PLAN_OPS: readonly string[] = [
 	"nsCreate", "nsRename", "nsDelete", "nsRestore", "nsSetBlob", "diskMaterialize", "diskRename", "diskTrash", "conflictCopy",
@@ -59,7 +61,7 @@ const DIAGS: readonly string[] = [
 	"checkpoint-written", "checkpoint-conflict", "checkpoint-adopted", "checkpoint-adopted-behind", "checkpoint-retired", "checkpoint-held",
 	"checkpoint-refused", "checkpoint-failed", "doc-frozen", "frame-poisoned", "adopt-pending", "stream-resend", "causal-hole", "doc-thawed",
 	"live-overflow", "inherited", "epoch-mismatch", "gap-feed", "quarantine-retried", "blob-gc-swept", "frame-resealed",
-	"snap-fold",
+	"snap-fold", "upgrade-required",
 ];
 
 export const COVERAGE_KEYS: readonly string[] = [
@@ -74,6 +76,7 @@ export const COVERAGE_KEYS: readonly string[] = [
 export const DEAD_COVERAGE: readonly string[] = [
 	"ns.create.revived", "ns.restore.applied", "ns.restore.suffixed", "plan.wait.blob-unavailable", "plan.conflictCopy.both-edited",
 	"plan.conflictCopy.too-large", "plan.conflictCopy.path-taken", "plan.conflictCopy.recovered", "diag.recovered-from-mirror",
+	"ns.ignored.rules-version",
 ];
 
 export function emptyCoverage(): Record<string, number> {

@@ -160,6 +160,8 @@ export class SimDevice {
 	engineStarts = 0;
 	/** LogEngine diagnostics of every engine this device ran, counted by `code` or `code:cls` (sim stats). */
 	readonly diagCounts: Record<string, number> = {};
+	/** Tuning of a newer build the app was updated to (applies from the next engine start; upgradeHalt.test.ts). */
+	updatedTuning: Partial<EngineTuning> | null = null;
 	/** Checkpoints the gate refused on this device (checkpoint-disputed), with their detail. */
 	readonly disputed: string[] = [];
 	/** Texts that existed only in host memory when the app crashed (pending conflict copies; known gap). */
@@ -259,7 +261,7 @@ export class SimDevice {
 		if (this.opts.workerMode === "unavailable") throw new Error("Worker is not available (sim)");
 		const pair = createInlinePair({ schedule: this.opts.clock.schedule });
 		const storageFails = this.opts.workerMode === "storage-fails";
-		const tuning: Partial<EngineTuning> = { ...SIM_TUNING, ...(this.opts.tuning ?? {}) };
+		const tuning: Partial<EngineTuning> = { ...SIM_TUNING, ...(this.opts.tuning ?? {}), ...(this.updatedTuning ?? {}) };
 		// A sim world whose tuning breaks a DESIGN constraint finds harness bugs, not engine bugs: refuse it.
 		const bad = causalWindowProblem({ ...DEFAULT_TUNING, ...tuning });
 		if (bad !== null) throw new Error(`SimDevice ${this.opts.name}: ${bad}`);

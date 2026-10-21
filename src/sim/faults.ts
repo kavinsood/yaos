@@ -54,6 +54,7 @@ import type { DropPoint } from "./relay";
 import { tokensIn, type TokenLedger } from "./actors";
 import type { VirtualClock } from "./clock";
 import { E2eeFaults, type E2eeFaultAction } from "./e2eeFaults";
+import { HOSTILE_KINDS, HostileDevice, type HostileAction } from "./hostile";
 import type { SeededRandom } from "./random";
 import type { SimDevice } from "./device";
 import { inspectStore } from "./inspect";
@@ -79,6 +80,8 @@ export type FaultAction =
 	| { readonly t: "lostSend"; readonly dev: number; readonly count: number }
 	/** The next group commit (holding a PROVISIONAL some socket was sent, with `provisional`) fails. */
 	| { readonly t: "commitFail"; readonly fault: "durability" | "restart-after"; readonly provisional: boolean }
+	/** A hostile / buggy member device appends a frame no honest client builds (hostile.ts). */
+	| HostileAction
 	| { readonly t: "relayRestart" }
 	/** Relay restart whose socket attachments kept no subscription (overflow): every set empty until resent. */
 	| { readonly t: "relaySubsLost" }
@@ -160,6 +163,8 @@ export const DEFAULT_FAULTS: FaultWeights = {
 	clone: 0, syncedConfig: 0,
 	// Targeted relay faults (RELAY_FAULTS): last and weight 0 here, so the default plans draw as before.
 	targetedDrop: 0, lostSend: 0, commitFail: 0,
+	// A hostile member device (HOSTILE_FAULTS): last and weight 0 here, so the default plans draw as before.
+	hostile: 0,
 };
 
 /**
@@ -169,6 +174,14 @@ export const DEFAULT_FAULTS: FaultWeights = {
  * world's small dedupe windows (run.ts), a resend after a lost receipt can outlive its original's window.
  */
 export const RELAY_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, socketDrop: 2, targetedDrop: 6, lostSend: 2, commitFail: 2, offline: 5 };
+
+/**
+ * The default matrix plus a hostile / buggy member device (hostile.ts) appending malformed, truncated, oversize and
+ * wrong-kind rows, ns ops every reader must ignore and replays of its own frames, through the relay; the user releases
+ * the docs its rows froze. Suite 0 and suite 1 (where it holds the vault key; key rolls and revokes give it a revoked
+ * epoch to seal under; both skipped in suite 0).
+ */
+export const HOSTILE_FAULTS: FaultWeights = { ...DEFAULT_FAULTS, hostile: 6, keyRoll: 0.7, revoke: 0.7 };
 
 /**
  * The default matrix plus a copied vault folder run as a second device (clone) and a sync tool carrying the plugin's
@@ -246,6 +259,7 @@ export function generateFault(rng: SeededRandom, devices: number, weights: Fault
 		case "targetedDrop": return { t: "targetedDrop", dev, at: rng.pick(["append", "notice", "notice", "receipt", "receipt"] as const), offlineMs: rng.chance(0.5) ? 0 : rng.range(1_000, 60_000) };
 		case "lostSend": return { t: "lostSend", dev, count: rng.range(1, 4) };
 		case "commitFail": return { t: "commitFail", fault: rng.chance(0.6) ? "durability" : "restart-after", provisional: rng.chance(0.7) };
+		case "hostile": return { t: "hostile", kind: rng.pick(HOSTILE_KINDS), pick: rng.float() };
 		case "suspendKill": return { t: "suspendKill", dev, event: rng.pick(["hidden", "pagehide", "freeze"] as const), budget: rng.pick(SUSPEND_BUDGETS), save: rng.chance(0.5) ? "landed" : "lost", downMs: rng.range(200, 10_000), durationMs: rng.range(100, 30_000) };
 	}
 }
@@ -292,7 +306,7 @@ export class FaultState {
 		socketDrop: 0, relayRestart: 0, relayDrain: 0, httpFail: 0, dailyLimit: 0, epochReset: 0, clockSkew: 0,
 		keyStoreLoss: 0, keyRoll: 0, revoke: 0, epochRestore: 0, hostileReplay: 0, hostileDowngrade: 0,
 		blobStall: 0, blobSlow: 0, relaySubsLost: 0, suspendKill: 0, clone: 0, syncedConfig: 0,
-		targetedDrop: 0, lostSend: 0, commitFail: 0,
+		targetedDrop: 0, lostSend: 0, commitFail: 0, hostile: 0,
 	};
 	/** The device pair a sync tool links now (syncedConfig), and how to end it. */
 	private synced: { readonly a: number; readonly b: number; readonly end: () => void } | null = null;
@@ -304,13 +318,15 @@ export class FaultState {
 	private readonly abandoned = new Set<DeviceId>();
 	/** Suite-1 faults (null in a suite-0 run: they are skipped). */
 	readonly e2ee: E2eeFaults | null;
+	/** The hostile member device, made at its first fault (null until then). */
+	hostile: HostileDevice | null = null;
 
 	constructor(
 		private readonly clock: VirtualClock,
 		private readonly devs: readonly SimDevice[],
 		private readonly net: SimNet,
 		private readonly ledger: TokenLedger,
-		o: { readonly suite1?: boolean; readonly weights?: FaultWeights | null; readonly initialRk?: () => Uint8Array } = {},
+		private readonly o: { readonly suite1?: boolean; readonly weights?: FaultWeights | null; readonly initialRk?: () => Uint8Array; readonly seed?: number } = {},
 	) {
 		this.e2ee = o.suite1 ? new E2eeFaults(clock, devs, net, (i) => this.down.has(i), (o.weights?.epochRestore ?? 0) > 0, o.initialRk ?? null) : null;
 	}
@@ -380,6 +396,15 @@ export class FaultState {
 				this.net.relay.armCommitFault(f.fault, f.provisional ? "provisional" : "any");
 				this.counts.commitFail++;
 				return `fault commitFail ${f.fault}${f.provisional ? " (provisional)" : ""}`;
+			case "hostile": {
+				this.hostile ??= new HostileDevice(this.clock, this.devs, this.net, this.o.suite1 === true, (i) => this.down.has(i), this.o.seed ?? 0);
+				const line = this.hostile.run(f);
+				if (!line.startsWith("skip")) {
+					this.counts.hostile++;
+					this.hostile.startUser();
+				}
+				return line;
+			}
 			case "epochReset": {
 				const epoch = `sim-epoch-reset-${++this.epochs}`;
 				this.net.relay.resetEpoch(epoch);
@@ -685,7 +710,8 @@ export class FaultState {
 		if (this.inspecting > 0) await this.clock.runUntil(() => this.inspecting === 0, horizonMs);
 		await Promise.all(this.inspections);
 		const e2ee = this.e2ee ? await this.e2ee.stop(horizonMs) : true;
-		return this.inspecting === 0 && e2ee;
+		const hostile = this.hostile ? await this.hostile.stop(horizonMs) : true;
+		return this.inspecting === 0 && e2ee && hostile;
 	}
 
 	/** A device whose app has not started yet (run.ts late join): down for actors and faults until join(i) or heal. */
@@ -753,6 +779,7 @@ export class FaultState {
 		for (const d of this.devs) d.vault.failNextOps = 0;
 		this.synced?.end();
 		this.e2ee?.heal();
+		this.hostile?.heal();
 		this.removeAbandoned();
 	}
 }
