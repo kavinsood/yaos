@@ -7,7 +7,7 @@ import vm from "node:vm";
 
 import QRCODE_SCRIPT from "qrcode-generator/dist/qrcode.js";
 
-import { CONSOLE_MESSAGES, consolePage } from "../../server/src/console/console";
+import { CONSOLE_MESSAGES, REKEY_NOTE, consolePage } from "../../server/src/console/console";
 import { mobileSetupPage } from "../../server/src/console/mobileSetup";
 import { buildMobileSetupUrl } from "../../server/src/setupQr";
 import { suite } from "../harness.ts";
@@ -359,6 +359,7 @@ s.test("identity-per-store §6.3: devices grouped by pairing; Revoke pairing and
 	const revoke = page.calls.filter((c) => c.method === "DELETE").at(-1)!;
 	assert.deepEqual([revoke.path, revoke.body], [`${base}/grants/${GRANT}`, {}]);
 	assert.match(page.confirms.at(-1)!, /Every store of it stops syncing at once, and that install has to be paired again/);
+	assert.ok(page.confirms.at(-1)!.endsWith(REKEY_NOTE), "a blocking removal says the other devices ask for a new vault key");
 	assert.deepEqual([page.msg, page.last().path], ["Mac is unpaired.", `${base}/devices`]);
 
 	page.reply(`DELETE ${base}/devices/${STORE}`, 200, { ok: true, deviceId: STORE, revoked: true });
@@ -366,6 +367,7 @@ s.test("identity-per-store §6.3: devices grouped by pairing; Revoke pairing and
 	const remove = page.calls.filter((c) => c.method === "DELETE").at(-1)!;
 	assert.deepEqual([remove.path, remove.body], [`${base}/devices/${STORE}`, {}]);
 	assert.match(page.confirms.at(-1)!, /comes back as a new device on its next start; to block it, use Revoke pairing/);
+	assert.ok(!page.confirms.at(-1)!.includes(REKEY_NOTE), "a tidy is not a removal that needs a new vault key");
 	assert.equal(page.msg, "The store of Mac is removed.");
 
 	page.reply(`GET ${base}/devices`, 200, { devices: [], grants: [] });

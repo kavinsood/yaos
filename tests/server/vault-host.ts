@@ -10,7 +10,7 @@ import { ConfigHost, CONFIG_SCHEMA } from "../../server/src/config/host";
 import { AUTHORITY_SUPERSEDED_SOCKET_CLOSE_CODE } from "../../server/src/shared/socketCloseCodes";
 import { encodeAppendFrame } from "../../server/src/streams/protocol";
 import { OWNER_CAPABILITY_DIGEST } from "../../server/src/vault/host";
-import { IDENTITY_V2_MIGRATION, IDENTITY_V3_MIGRATION, VAULT_IDENTITY_SCHEMA } from "../../server/src/vault/schema";
+import { IDENTITY_V2_MIGRATION, IDENTITY_V3_MIGRATION, IDENTITY_V4_MIGRATION, VAULT_IDENTITY_SCHEMA } from "../../server/src/vault/schema";
 import { STREAM_SCHEMA } from "../../server/src/streams/store";
 import { sha256Hex } from "../../server/src/hex";
 import { suite } from "../harness.ts";
@@ -74,7 +74,9 @@ const VAULT_TABLES = {
 	...STREAM_TABLES,
 	vault_meta: { withoutRowid: true, columns: ["id INTEGER NOT NULL PK1", "vault_id TEXT NOT NULL",
 		"vault_generation TEXT NOT NULL", "ticket_key BLOB NOT NULL", "created_at INTEGER NOT NULL", "pending_restore_id TEXT",
-		"last_restore_id TEXT", "last_restore_at INTEGER"] },
+		"last_restore_id TEXT", "last_restore_at INTEGER",
+		// Identity v4 (the key-roll signal, e2ee-design §14.5).
+		"removals INTEGER NOT NULL", "rekeyed INTEGER NOT NULL"] },
 	device: { withoutRowid: true, columns: ["token_hash BLOB NOT NULL PK1", "device_id TEXT NOT NULL", "device_name TEXT NOT NULL",
 		"enrollment_request_id TEXT NOT NULL", "enrolled_at INTEGER NOT NULL",
 		// Identity v2 (identity-per-store §3.1).
@@ -177,7 +179,7 @@ s.test("§6.1: an unknown vault is cached after one probe; it answers 401 / 404 
 			[[{ type: "error", code: "unauthorized" }, 1008]]);
 		assert.deepEqual(object.statements,
 			["SELECT vault_id, vault_generation, ticket_key, created_at, pending_restore_id, last_restore_id,"
-				+ " last_restore_at FROM vault_meta WHERE id = 1"]);
+				+ " last_restore_at, removals, rekeyed FROM vault_meta WHERE id = 1"]);
 		assert.deepEqual(schemaOf(object.storage), {}, "T-PAIR-NOWRITE: no DDL on a request path");
 		assert.equal(object.model.totals.cf, 0);
 		assert.equal((await object.host.fetch(new Request(`${INTERNAL}/streams/other`))).status, 404);
@@ -208,9 +210,9 @@ s.test("G54: a vault initialized before identity v2 migrates once, at its first 
 		object.model.reset();
 		object.statements.length = 0;
 		assert.equal((await feed(object, bearer(owner))).status, 200, "the v1 device authenticates after the migration");
-		assert.deepEqual(schemaOf(object.storage), VAULT_TABLES, "migrated == a fresh v3 init");
+		assert.deepEqual(schemaOf(object.storage), VAULT_TABLES, "migrated == a fresh v4 init");
 		assert.equal(object.statements.filter((sql) => /^\s*(ALTER|CREATE)\b/i.test(sql)).length,
-			IDENTITY_V2_MIGRATION.length + IDENTITY_V3_MIGRATION.length, "v2 and v3 together");
+			IDENTITY_V2_MIGRATION.length + IDENTITY_V3_MIGRATION.length + IDENTITY_V4_MIGRATION.length, "v2, v3 and v4 together");
 		assert.equal(object.model.totals.cf, 0, "DDL only: no row written");
 		const device = object.host.load()!.devices.byId(owner.deviceId)!;
 		assert.deepEqual([device.grantId, device.retireHash, device.lastSeenDay], [null, null, null], "an old enroll");
@@ -240,7 +242,7 @@ s.test("§6.1: bearer auth reads meta 1 + devices N once per runtime, then 0 row
 		const reads = object.statements.filter((sql) => /FROM (vault_meta|device|pairing_grant)\b/.test(sql));
 		assert.deepEqual(reads, [
 			"SELECT vault_id, vault_generation, ticket_key, created_at, pending_restore_id, last_restore_id,"
-				+ " last_restore_at FROM vault_meta WHERE id = 1",
+				+ " last_restore_at, removals, rekeyed FROM vault_meta WHERE id = 1",
 			"SELECT grant_id, secret_hash, grant_name, enrollment_request_id, created_at, revoked_at, registered_day,"
 				+ " registered_count, secret_wrap FROM pairing_grant",
 			"SELECT token_hash, device_id, device_name, enrollment_request_id, enrolled_at, grant_id, retire_hash,"

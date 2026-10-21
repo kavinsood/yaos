@@ -124,7 +124,8 @@ export function isObjectResetError(error: unknown): boolean {
 /**
  * DECISIONS-GAP (G62). The journal's `devices` BLOB: JSON of the identity snapshot, `{v: 2, devices, grants,
  * retired}` (token, secret and retire-key hashes only). A row written before identity v2 holds a bare device array:
- * it decodes with `grants` and `retired` null, so finish leaves those tables alone.
+ * it decodes with `grants` and `retired` null, so finish leaves those tables alone. `rekey` (identity v4, the key-roll
+ * signal `{removals, rekeyed}`) is null when absent: finish then leaves the rewound counts.
  */
 function encodeSnapshot(snapshot: IdentitySnapshot): ArrayBuffer {
 	const bytes = new TextEncoder().encode(JSON.stringify({
@@ -142,6 +143,7 @@ function encodeSnapshot(snapshot: IdentitySnapshot): ArrayBuffer {
 		retired: snapshot.retired?.map((tombstone) => ({
 			deviceId: tombstone.deviceId, grantId: tombstone.grantId, retiredAt: tombstone.retiredAt,
 		})) ?? null,
+		rekey: snapshot.rekey ? { removals: snapshot.rekey.removals, rekeyed: snapshot.rekey.rekeyed } : null,
 	}));
 	const buffer = new ArrayBuffer(bytes.byteLength);
 	new Uint8Array(buffer).set(bytes);
@@ -188,9 +190,17 @@ function decodeRetired(entry: Record<string, unknown>): RetiredRecord {
 	return { deviceId: entry.deviceId, grantId: entry.grantId, retiredAt: entry.retiredAt };
 }
 
+function decodeRekey(value: unknown): IdentitySnapshot["rekey"] {
+	if (value === undefined || value === null) return null;
+	const entry = typeof value === "object" ? value as Record<string, unknown> : null;
+	const count = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+	if (!entry || !count(entry.removals) || !count(entry.rekeyed)) throw new Error("restore journal: malformed rekey");
+	return { removals: entry.removals, rekeyed: entry.rekeyed };
+}
+
 function decodeSnapshot(blob: ArrayBuffer): IdentitySnapshot {
 	const value: unknown = JSON.parse(new TextDecoder().decode(new Uint8Array(blob)));
-	if (Array.isArray(value)) return { devices: value.map(decodeDevice), grants: null, retired: null };
+	if (Array.isArray(value)) return { devices: value.map(decodeDevice), grants: null, retired: null, rekey: null };
 	const record = value && typeof value === "object" ? value as Record<string, unknown> : null;
 	if (!record || record.v !== 2 || !Array.isArray(record.devices)
 		|| !(record.grants === null || Array.isArray(record.grants))
@@ -201,6 +211,7 @@ function decodeSnapshot(blob: ArrayBuffer): IdentitySnapshot {
 		devices: record.devices.map(decodeDevice),
 		grants: Array.isArray(record.grants) ? record.grants.map(decodeGrant) : null,
 		retired: Array.isArray(record.retired) ? record.retired.map(decodeRetired) : null,
+		rekey: decodeRekey(record.rekey),
 	};
 }
 
@@ -360,7 +371,8 @@ export class RestoreRunner {
 				case "prepared":
 					if (!this.current(row)) return fail(404, "unknown_vault");
 					bookmark = prepared.bookmark;
-					snapshot = { devices: prepared.devices, grants: prepared.grants, retired: prepared.retired };
+					snapshot = { devices: prepared.devices, grants: prepared.grants, retired: prepared.retired,
+						rekey: prepared.rekey };
 					this.storage.sql.exec(
 						"UPDATE restore_journal SET bookmark = ?, devices = ? WHERE vault_id = ? AND restore_id = ?",
 						bookmark, encodeSnapshot(snapshot), row.vault_id, row.restore_id,

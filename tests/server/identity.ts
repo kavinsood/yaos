@@ -454,9 +454,9 @@ s.test("T-REVOKE-GATE/-BUFFER/-SILENCE/-4403/-401: revoke is one synchronous tur
 		assert.deepEqual(result, { revoked: true, droppedFrames: 2, closedSockets: 2 });
 
 		// Everything below was already true when revokeDevice returned (no timer or microtask has run).
-		assert.equal(object.model.totals.cf, 2, "§6.2 revoke = 2 rows (the row and its tombstone)");
-		assert.deepEqual(writes(object), ["DELETE FROM device WHERE device_id = ?",
-			"INSERT OR IGNORE INTO retired_device (device_id, grant_id, retired_at) VALUES (?, ?, ?)"],
+		assert.equal(object.model.totals.cf, 3, "§6.2 revoke = 3 rows (the row, its tombstone, the key-roll count)");
+		assert.deepEqual(writes(object), ["UPDATE vault_meta SET removals = removals + 1 WHERE id = 1",
+			"DELETE FROM device WHERE device_id = ?", "INSERT OR IGNORE INTO retired_device (device_id, grant_id, retired_at) VALUES (?, ?, ?)"],
 			"no flush: no stream row was written");
 		assert.equal(object.host.admits(victim.deviceId), false, "GATE: the device map entry is gone");
 		for (const socket of victimSockets) {
@@ -548,7 +548,8 @@ s.test("D7 races: a revoke while a handler awaits crypto or a body wins; nothing
 		object.model.reset();
 		const code = await duringCrypto("digest", 2, revoke, () => post(object, "auth/pairing-code", victim));
 		assert.equal(code.status, 401, "revoke during the code hash: no code is minted");
-		assert.deepEqual([...object.model.totals.byTable], [["device", 1], ["retired_device", 1]], "only the revoke wrote");
+		assert.deepEqual([...object.model.totals.byTable], [["vault_meta", 1], ["device", 1], ["retired_device", 1]],
+			"only the revoke wrote (with its key-roll count)");
 
 		await reEnroll();
 		object.model.reset();
@@ -563,7 +564,8 @@ s.test("D7 races: a revoke while a handler awaits crypto or a body wins; nothing
 			`${INTERNAL}/streams/checkpoint?stream=ns&coversSeq=1&expectedCoversSeq=0`,
 			{ method: "PUT", headers: bearer(victim), body, duplex: "half" } as RequestInit));
 		assert.equal(checkpoint.status, 401, "revoke during the checkpoint body read");
-		assert.deepEqual([...object.model.totals.byTable], [["device", 1], ["retired_device", 1]], "no checkpoint row");
+		assert.deepEqual([...object.model.totals.byTable], [["vault_meta", 1], ["device", 1], ["retired_device", 1]],
+			"no checkpoint row");
 
 		// Vault delete while an enroll hashes: the enroll answers like an unknown vault and writes nothing.
 		const late = newDevice("late-device-00001");

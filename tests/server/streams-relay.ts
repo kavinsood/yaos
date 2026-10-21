@@ -105,6 +105,8 @@ async function withStreams(check: (harness: Harness) => void | Promise<void>, co
 		noteCommitError: (error) => { latch.note(error); },
 		vaultId: () => VAULT_ID,
 		vaultGeneration: () => GENERATION,
+		rekey: () => ({ removals: 0, rekeyed: 0 }),
+		onRekeyed: () => {},
 		runtimeEpoch,
 		clock: { now: () => timers.now },
 		timers,
