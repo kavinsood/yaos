@@ -21,7 +21,8 @@ export class RekeySignalState {
 	private owed = 0;
 
 	constructor(
-		private readonly session: () => RelaySession | null,
+		/** The live session (only its VAULT_REKEYED send is used). */
+		private readonly session: () => Pick<RelaySession, "ackRekey"> | null,
 		private readonly changed: () => void,
 	) {}
 

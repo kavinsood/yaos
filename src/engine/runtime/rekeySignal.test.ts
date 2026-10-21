@@ -3,22 +3,23 @@ import assert from "node:assert/strict";
 import type { RelaySession } from "../../ports/relay";
 import { RekeySignalState } from "./rekeySignal";
 
-/** A session that only records its acks (every other member is unused here). */
-function fakeSession(acks: number[], throws = false): RelaySession {
+/** A session that only records its acks (the one member RekeySignalState uses). */
+type AckSession = Pick<RelaySession, "ackRekey">;
+function fakeSession(acks: number[], throws = false): AckSession {
 	return {
 		ackRekey: (n: number) => {
 			if (throws) throw new Error("read-only");
 			acks.push(n);
 		},
-	} as unknown as RelaySession;
+	};
 }
 
 function harness() {
 	const acks: number[] = [];
-	let session: RelaySession | null = fakeSession(acks);
+	let session: AckSession | null = fakeSession(acks);
 	let changes = 0;
 	const state = new RekeySignalState(() => session, () => { changes++; });
-	return { state, acks, changes: () => changes, setSession: (s: RelaySession | null) => { session = s; } };
+	return { state, acks, changes: () => changes, setSession: (s: AckSession | null) => { session = s; } };
 }
 
 test("RekeySignalState: keeps the latest signal; a status change only when it changed", () => {
