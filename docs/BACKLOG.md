@@ -30,13 +30,14 @@ Node harness does the same vault in ~2.7 s ([integration-notes](client-remake/in
   Obsidian's: `create` (`exists` + `write`), its metadata cache's `readBinary`, its File recovery plugin's `read`.
   More concurrency only raises per-call latency (~139 calls/s against ~125 serial). Not CPU: main 7 s busy, the
   engine 6 s.
-- **~3 s pair -> first file**, of which ~1-2 s is the `suite=0` pin: `pinSuite0 "link"` is sent before the session has
-  read `k`, fails transient, is retried after a fixed 1 s (`src/host/ui/keyActions.ts` `sendRetrying`), and the pin
-  then restarts the engine (`pluginController.pinAfter`).
+- **~3 s pair -> first file** (was ~3.8 s, of which ~1-2 s was the `suite=0` pin's fixed 1 s retry and the engine
+  restart after it; landed below).
+
+**Landed after (fe457402): the `suite=0` pin without the retry and the restart.** One engine per pairing; pair ->
+first file median 3.8 -> 2.9 s (integration-notes §7.4).
 
 **Next:**
-1. **`pinSuite0` without the retry and the restart:** the engine holds the command until `k` is read; the pin applies
-   without a restart. ~1-2 s of every `suite=0` pairing.
+1. **The feed apply before the first file:** two `streams,meta` write transactions, ~0.8-1.1 s on the phone.
 2. **Fewer bridge calls per file needs Obsidian's side:** writing through the adapter would skip `create`'s `exists`
    (a quarter of the calls) but bypasses the vault's own bookkeeping; not without a design. File recovery's `read` is
    the user's plugin.

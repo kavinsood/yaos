@@ -1352,8 +1352,25 @@ harness on the same afternoon, 3 runs each, then 4 more of each alternating (bas
   - +1.1 s the pin lands and **the engine restarts** with the pinned config (pluginController `pinAfter`);
   - engine 2 from +1.3 s: capabilities 67 ms, socket open 98 ms, IndexedDB open and reads, ready at +1.8 s; feed
     apply (two `streams,meta` write transactions, 0.76 s); first `diskOps` at +3.0 s.
-  - So a fresh pairing over a `suite=0` link pays ~1-2 s for the retry and the restart. Holding `pinSuite0` in the
-    engine until `k` is read, and applying the pin without a restart, would remove most of it.
+  - So a fresh pairing over a `suite=0` link paid ~1-2 s for the retry and the restart.
+
+**The pin without the retry and the restart** (fe457402; 3 runs + a profile run, 2026-10-21, a freshly seeded vault):
+the KeyReader holds `pinSuite0 "link"` until `k` is read, a refused send is retried on the next host change instead of
+after 1 s, and after the pin main sends `applyPin`: the same engine swaps in the identity crypto adapter and starts its
+VaultRuntime. One `yaos-engine` worker per run (the profile: never detached). Timeline (`...T190738Z-run1-startup.txt`):
+the pin's first send is refused at -0.3 s (the KeyReader not up yet), resent at +0.19 s on the next status, `ok` at
++0.51 s once `k` is read; `applyPin` at +0.52 s; runtime ready at +1.17 s (was +2.81 s); first `diskOps` at +2.94 s (was
++4.03 s). Pair -> first file, median 3.8 -> 2.9 s. What is left before the first file is mostly the feed apply's
+`streams,meta` write transactions (1.09 s). Whole runs: 35.5 / 31.6 / 43.6 s (profile run 37.3 s); run 3 slowed from
+20 s on along with the bench's adb polls (149 ms against 107 ms), the phone after ~20 min of back-to-back runs, not
+the startup this changes.
+
+**Bench hygiene found on the way:** the folder wipe left the plugin's stores (IndexedDB), its install record
+(localStorage) and the stores' mirror dirs (`.obsidian/plugins/yaos/state`), so the next pairing reopened the previous
+run's store, whose grant the bench had just revoked (an unpinned engine stays `revoked`: `onStoreRevoked` needs a
+VaultRuntime), or inherited from its mirror. phoneBench now deletes all three for the bench vault before each pairing.
+The vault those runs used lost 8 attachments on the relay (a fresh Node device gets 1014 of 1022 files), cause not yet
+known; the runs above are on a newly seeded vault.
 
 Not a second engine: earlier profile runs showed a second `yaos-engine` worker "at the last file". It was the same
 pin restart at +1.3 s, recorded late: the bench's blocking poll loop kept the DevTools socket from being read until

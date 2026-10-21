@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { Report, sleep } from "./engineKit";
 import { contextPath, DEFAULT_LOG_DIR, devicePairingCode, revokeDevice, type OnboardDevice, type OnboardedVault } from "./onboard";
 import { attribute, cpuInWindow, pageEvaluate, PhoneProfile, timeline } from "./phoneProfile";
+import { LOCAL_SETTINGS_KEY } from "../../src/host/localSettings";
 
 function arg(name: string, fallback: string): string {
 	const i = process.argv.indexOf(`--${name}`);
@@ -153,12 +154,15 @@ async function laptopRtt(): Promise<{ capabilitiesMs: number; cfRay: string | nu
 
 // ---- one run ---------------------------------------------------------------------------------------------------
 
-/** Stops Obsidian, revokes the device the folder is paired as, and empties the folder for a fresh pairing. */
+/**
+ * Stops Obsidian, revokes the device the folder is paired as, and empties the folder for a fresh pairing: the notes,
+ * data.json and the plugin's `state/` (the stores' mirror dirs, which a new store would otherwise inherit from).
+ */
 async function reset(vault: OnboardedVault): Promise<void> {
 	sh(`am force-stop ${PKG}`);
 	const prev = phoneIdentity();
 	if (prev) await revokeIdentity(vault, prev).catch((e: unknown) => console.log(`revoke of the previous pairing failed: ${String(e)}`));
-	sh(`cd ${q(DIR)} && find . -mindepth 1 -maxdepth 1 ! -name .obsidian -exec rm -rf {} + ; rm -f ${q(`${PLUGIN_DIR}/data.json`)}`);
+	sh(`cd ${q(DIR)} && find . -mindepth 1 -maxdepth 1 ! -name .obsidian -exec rm -rf {} + ; rm -rf ${q(`${PLUGIN_DIR}/data.json`)} ${q(`${PLUGIN_DIR}/state`)}`);
 	if (countFiles() !== 0) throw new Error(`${DIR} still holds files after the wipe`);
 }
 
@@ -227,12 +231,46 @@ async function pressPair(): Promise<boolean> {
 	return false;
 }
 
+/**
+ * Makes the phone a fresh install of the bench vault, as a new phone would be: deletes this vault's YAOS stores
+ * (IndexedDB `yaos3:<vaultId>:…`, `yaos3-pending:<vaultId>:…`) and the per-install record in Obsidian's localStorage
+ * (localSettings.ts, its install key), with the plugin unloaded so nothing holds them open. The folder wipe leaves
+ * both: the next pairing then reopened the previous run's store, whose device the bench had just revoked (an unpinned
+ * engine does not replace a revoked store). Scoped to the bench vault's id: other vaults' stores on the phone (one
+ * WebView origin) are not touched.
+ */
+async function freshInstall(vaultId: string): Promise<void> {
+	const expr = `(async () => {
+		if (app.vault.getName() !== ${JSON.stringify(VAULT_NAME)}) return "Obsidian has another vault open: " + app.vault.getName();
+		await app.plugins.disablePlugin("yaos");
+		const ours = (n) => typeof n === "string" && (n.startsWith("yaos3:") || n.startsWith("yaos3-pending:")) && n.split(":")[1] === ${JSON.stringify(vaultId)};
+		const names = (await indexedDB.databases()).map((d) => d.name).filter(ours);
+		for (const n of names) await new Promise((res, rej) => { const r = indexedDB.deleteDatabase(n); r.onsuccess = res; r.onerror = () => rej(r.error); r.onblocked = () => rej(new Error("blocked: " + n)); });
+		app.saveLocalStorage(${JSON.stringify(LOCAL_SETTINGS_KEY)}, null);
+		await app.plugins.enablePlugin("yaos");
+		return names.length;
+	})()`;
+	let last: unknown = null;
+	for (let i = 0; i < 20; i++) {
+		try {
+			last = await pageEvaluate(await devtoolsPage(), expr);
+			break;
+		} catch (e) {
+			last = e; // DevTools or the app not up yet
+			await sleep(500);
+		}
+	}
+	if (typeof last !== "number") throw new Error(`fresh install failed: ${String(last)}`);
+	console.log(`  fresh install: ${last} store DB(s) of the bench vault deleted, install record cleared`);
+}
+
 async function oneRun(vault: OnboardedVault, files: number, k: number): Promise<Run> {
 	await unlocked();
 	await reset(vault);
 	installPlugin();
 	sh(`am start -a android.intent.action.VIEW -d ${q(`obsidian://open?vault=${encodeURIComponent(VAULT_NAME)}`)}`);
 	await sleep(OPEN_WAIT_MS);
+	await freshInstall(vault.vaultId);
 	const prof = PROFILE ? await PhoneProfile.attach(await devtoolsPage(), (l) => console.log(`  profile: ${l}`)) : null;
 	const code = await devicePairingCode(HOST, vault.vaultId, vault.devices[0]!.deviceToken);
 	const link = `obsidian://yaos?action=setup&host=${encodeURIComponent(HOST)}&pairingCode=${encodeURIComponent(code)}&suite=0`;
