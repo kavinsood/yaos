@@ -31,7 +31,7 @@ import {
 	type ClientFrameId, type DeviceId, type DocId, type DocKind, type NsEntry, type NsFoldEvent, type NsFoldIndex, type NsFoldState, type NsOp, type ReplayWindow, type Seq, type VaultPath,
 } from "../../core/types";
 import type { OutboxChange } from "../store/repo";
-import type { SnapshotRecord, TailRecord } from "../store/schema";
+import type { OutboxRecord, SnapshotRecord, TailRecord } from "../store/schema";
 import type { OutboxCache } from "../runtime/outboxCache";
 import { FoldRuntime, type FoldCandidate, type FoldedFrame, type FoldRepo } from "./foldRuntime";
 
@@ -137,11 +137,25 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 		return this.index.byPathKey.get(pathKey(path)) ?? null;
 	}
 
-	/** Committed fold + own pending frames (§f.1). */
+	/**
+	 * Committed fold + own pending frames (§f.1). Memoized: the fold folds in place, so the key is the state, its
+	 * coversSeq (every folded row moves it), the committed own frames and the stream's outbox records (put replaces
+	 * a record object). Callers read the result only; a refold per call was O(entries) for each synced write.
+	 */
 	overlay(outbox: OutboxCache): NsOverlay & { readonly pending: readonly PendingNsFrame[] } {
+		const recs = outbox.ofStream(this.stream);
+		const m = this.ovMemo;
+		if (m && m.state === this.state && m.index === this.index && m.coversSeq === this.state.coversSeq && m.ownGen === this.committedOwnGen && sameRecords(m.recs, recs)) return m.result;
 		const pending = this.pendingFrames(outbox);
-		return { ...overlayPending(this.state, this.index, this.self, pending, this.rules), pending };
+		const result = { ...overlayPending(this.state, this.index, this.self, pending, this.rules), pending };
+		this.ovMemo = { state: this.state, index: this.index, coversSeq: this.state.coversSeq, ownGen: this.committedOwnGen, recs, result };
+		return result;
 	}
+
+	private ovMemo: {
+		readonly state: NsFoldState; readonly index: NsFoldIndex; readonly coversSeq: Seq; readonly ownGen: number;
+		readonly recs: readonly OutboxRecord[]; readonly result: NsOverlay & { readonly pending: readonly PendingNsFrame[] };
+	} | null = null;
 
 	/** Docs of the optimistic view; "pending" = not in the committed fold yet. */
 	listDocs(outbox: OutboxCache): DocInfo[] {
@@ -187,4 +201,10 @@ export class NsRuntime extends FoldRuntime<NsOp, NsFoldEvent> {
 		}
 		return changes;
 	}
+}
+
+function sameRecords(a: readonly OutboxRecord[], b: readonly OutboxRecord[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
 }

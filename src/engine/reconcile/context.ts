@@ -253,7 +253,7 @@ export class Ctx {
 
 	/** nsTouchSeq for a synced write: the view's lastTouchSeq unless own ns ops are pending (S1 sets it on fold). */
 	touchSeq(docId: DocId): Seq {
-		const r = this.log.view().remote.get(docId);
+		const r = this.log.nsTouch ? this.log.nsTouch(docId) : this.log.view().remote.get(docId);
 		if (!r || r.pendingLocal) return this.synced(docId)?.nsTouchSeq ?? 0;
 		return r.lastTouchSeq;
 	}

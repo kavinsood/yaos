@@ -129,6 +129,40 @@ test("ns: submitNs splits into frames, nsView shows them pending, onNsFold repor
 	}
 });
 
+test("ns: the overlay is memoized until the fold, own frames or the ns outbox change", async () => {
+	// The reconciler reads one doc's lastTouchSeq per synced write; a refold of every pending frame over a cloned
+	// fold per read was O(entries) each (conflict-flood soak: quadratic passes, ~4 GB).
+	const relay = new SimRelay();
+	const { engine: a } = await startTestEngine({ relay, deviceId: "dev-a" });
+	const { engine: b } = await startTestEngine({ relay, deviceId: "dev-b" });
+	try {
+		const v0 = a.nsView();
+		assert.equal(a.nsView().state, v0.state, "nothing changed: same overlay");
+		relay.pauseCommits();
+		const d = await createDoc(a, "m/a.md" as VaultPath, "x");
+		const v1 = a.nsView();
+		assert.notEqual(v1.state, v0.state, "own frame: refolded");
+		assert.ok(v1.pendingDocs.has(d) && v1.state.entries.get(d)?.path === "m/a.md");
+		assert.equal(a.nsView().state, v1.state);
+		await a.submitNs([{ t: "rename", docId: d, path: "m/b.md" as VaultPath }]);
+		assert.equal(a.nsView().state.entries.get(d)?.path, "m/b.md", "a second own frame: refolded");
+		relay.resumeCommits();
+		await converged([a, b]);
+		await until(() => a.nsView().pending.length === 0, 2_000, "a pending drained");
+		const committed = a.c.ns.state.entries.get(d);
+		assert.ok(committed && committed.lastTouchSeq > 0);
+		assert.deepEqual(a.nsView().state.entries.get(d), committed, "folded: overlay = committed fold");
+		assert.equal(a.nsView().pendingDocs.has(d), false);
+		// A remote frame moves only the committed fold (no own outbox change).
+		await b.submitNs([{ t: "rename", docId: d, path: "m/c.md" as VaultPath }]);
+		await converged([a, b]);
+		assert.equal(a.nsView().state.entries.get(d)?.path, "m/c.md", "remote fold: refolded");
+		assert.equal(a.nsView().state.entries.get(d)?.lastTouchSeq, a.c.ns.state.entries.get(d)?.lastTouchSeq);
+	} finally {
+		await stopAll(a, b);
+	}
+});
+
 test("ns: a late receipt at a seq the fold already covers leaves no pending frame (sim heavy seed 27)", async () => {
 	// Sim: A's ns frame committed while A crashed before the receipt; B's checkpoint at lastSeq retired the stream
 	// (H7); A restarted, adopted the checkpoint (covering the frame) and resent the frame, which the relay deduped at

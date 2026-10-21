@@ -42,6 +42,13 @@ export class ComposedLog implements LogPort {
 
 	// ---- RemoteView --------------------------------------------------------------
 
+	nsTouch(docId: DocId): { readonly lastTouchSeq: Seq; readonly pendingLocal: boolean } | undefined {
+		if (this.memo) return this.memo.remote.get(docId);
+		const ns = this.log.nsView();
+		const e = ns.state.entries.get(docId);
+		return e ? { lastTouchSeq: e.lastTouchSeq, pendingLocal: ns.pendingDocs.has(docId) } : undefined;
+	}
+
 	view(): RemoteView {
 		if (this.memo) {
 			this.stats.viewMemoHits++;

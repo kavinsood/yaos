@@ -88,6 +88,11 @@ export interface SubmitNsOptions {
 export interface LogPort {
 	view(): RemoteView;
 	/**
+	 * view().remote's lastTouchSeq / pendingLocal of one doc (undefined: not in the view), without building the
+	 * whole view. Optional: a log without it answers from view().
+	 */
+	nsTouch?(docId: DocId): { readonly lastTouchSeq: Seq; readonly pendingLocal: boolean } | undefined;
+	/**
 	 * Take the textHash of resident replicas through HashPort before a plan reads view() (which never awaits a
 	 * digest: a replica changed since has a textHash there only when it is small).
 	 */
