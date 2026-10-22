@@ -293,6 +293,24 @@ test("write gate shut (key-missing): a bound replica's unframed typing is never 
 	assert.equal(w.log.text(id), "one\n");
 });
 
+test("write gate shut (key-missing): a pass the gate stops at another doc's ns op still marks a file gone from its record", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 40: a frozen canvas renamed while a note's rename waited on the gate. The plan
+	// marked the canvas's record (fileGone, renamedTo), but the mark came after the refused ns ops: no pass reached it,
+	// and the rename was lost with the store.
+	const w = new World();
+	await w.boot();
+	const a = w.log.remoteCreate(P("a.md"), "one\n");
+	const b = w.log.remoteCreate(P("b.md"), "two\n");
+	await w.sync();
+	w.log.writeGate = "revoked-epoch";
+	w.log.setCaughtUp(b, false);
+	w.vault.userWrite("c.md", "new\n"); // an nsCreate: refused at the gate
+	w.vault.userDelete("b.md"); // its delete waits for the body: a mark only
+	await assert.rejects(w.sync(3), KeyMissingError);
+	assert.equal(w.synced(b)?.fileGone, true, "the delete is decided");
+	assert.equal(w.synced(a)?.fileGone, undefined);
+});
+
 test("write gate shut (key-missing): an observed rename the gate refused survives an engine restart, kept on the synced record", async () => {
 	// Sim suite-1 wipe/revoke/roll seed 112: key-missing after a revoke, the user deleted a canvas record and renamed the
 	// file; the engine crashed. The restart had no rename to pair the edited file with: a new doc, and the doc came

@@ -96,18 +96,29 @@ async function runOne(env: Env, op: PlannerOp): Promise<JobOutcome> {
  * sync no hash pairs it again, so the renamed file became a new doc and the doc came back at its old path with what
  * the user had deleted in the file (sim suite-1 wipe/revoke/roll seed 112, minimized: key-missing after a revoke).
  */
-async function keepObservedRenames(env: Env, ns: readonly NsOp[]): Promise<void> {
+async function keepObservedRenames(env: Env, ns: readonly NsOp[], ops: readonly PlannerOp[]): Promise<void> {
 	const { ctx } = env;
-	const keep: SyncedRecord[] = [];
+	const keep = new Map<DocId, SyncedRecord>();
 	for (const op of ns) {
 		if (op.t !== "rename") continue;
 		const s = ctx.store.synced.get(op.docId);
 		if (!s || s.fileGone) continue;
 		const away = renamedAway(ctx.renames, s.pathKey, ctx.pk);
 		if (!away || ctx.pk(away.to) !== ctx.pk(op.path)) continue;
-		keep.push({ ...s, fileGone: true, renamedTo: away });
+		keep.set(s.docId, { ...s, fileGone: true, renamedTo: away });
 	}
-	if (keep.length > 0) await ctx.commit({ syncedPut: keep });
+	// The plan's own marks of a file gone from its record (planner liveMissing `hold`, the frozen branch): a store
+	// write that waits for nothing, but it comes after the ns ops the gate refused, so no pass reached it while any
+	// other doc had an ns op to send (sim suite-1 wipe/revoke/roll seed 40: a frozen canvas renamed while a note's
+	// rename waited on the gate; the rename was lost with the store).
+	for (const op of ops) {
+		if (op.op !== "syncedPut" || !op.entry.fileGone || keep.has(op.entry.docId)) continue;
+		const s = ctx.store.synced.get(op.entry.docId);
+		if (!s || s.pathKey !== op.entry.pathKey || s.contentHash !== op.entry.contentHash) continue;
+		if (s.fileGone && (op.entry.renamedTo === undefined || s.renamedTo?.to === op.entry.renamedTo.to)) continue;
+		keep.set(s.docId, { ...s, fileGone: true, ...(op.entry.renamedTo ? { renamedTo: op.entry.renamedTo } : {}) });
+	}
+	if (keep.size > 0) await ctx.commit({ syncedPut: [...keep.values()] });
 }
 
 export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunReport> {
@@ -185,7 +196,7 @@ export async function runPlan(env: Env, ops: readonly PlannerOp[]): Promise<RunR
 		try {
 			ctx.log.assertWritable?.();
 		} catch (e) {
-			if (e instanceof KeyMissingError) await keepObservedRenames(env, ns);
+			if (e instanceof KeyMissingError) await keepObservedRenames(env, ns, ops.slice(i));
 			throw e;
 		}
 	}
