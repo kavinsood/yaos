@@ -100,6 +100,10 @@ test("trustedEpochBase: only a subsequence of the crdt text is trusted", () => {
 	assert.equal(trustedEpochBase("a\nc\n", "a\nb\nc\n"), "a\nc\n");
 	assert.equal(trustedEpochBase("a\nlocal\n", "a\n"), null);
 	assert.equal(trustedEpochBase("ab", "ba"), null);
+	// Soak 979386157 #156: a short base is a character subsequence of an unrelated long text, scattered over it.
+	assert.equal(trustedEpochBase("[B.333]\n", "line 0 [B.3]\nline 1 [B.33]\nline 2 [B.3]\n"), null, "words, not scattered characters");
+	assert.equal(trustedEpochBase("one three\n", "one two three\n"), "one three\n", "words inserted inside a line");
+	assert.equal(trustedEpochBase("onethree\n", "one three\n"), null, "a word split is a change");
 	// Canvas merge text: whole record lines. A record the new epoch changed (or lacks) is not trusted.
 	assert.equal(trustedEpochBase("{a}\n{doc}\n", "{a}\n{b}\n{doc}\n", "line"), "{a}\n{doc}\n");
 	assert.equal(trustedEpochBase("{a:1}\n{doc}\n", "{a:2}\n{doc}\n", "line"), null);
@@ -309,4 +313,14 @@ test("an observed rename with no synced record to stay on is handed to the store
 	w.vault.userRename("s.md", "t.md");
 	await w.sync(3).catch(() => undefined);
 	assert.deepEqual(kept.map((r) => [r.from, r.to]), [["n.md", "m.md"]], JSON.stringify(kept));
+});
+
+test("an unrelated doc re-created at the path after a reset does not take the note there as kept (words, not scattered characters)", async () => {
+	// Soak 979386157 #156: B's new one-line note was synced just before an epoch reset; a peer re-created its own
+	// 60-line note at the path. The base was a character subsequence of that text, scattered over it, so the merge
+	// read B's line as kept by the peer and wrote the peer's text over the note.
+	const remote = Array.from({ length: 20 }, (_, i) => `line ${i} [B.3${i}.3]`).join("\n") + "\n";
+	const { w } = await migrated("[B.333]\n", "[B.333]\n", remote);
+	const texts = [w.vault.text("n.md"), ...w.conflictCopies().map((p) => w.vault.text(p))];
+	assert.ok(texts.some((t) => t?.includes("[B.333]")), JSON.stringify(texts));
 });

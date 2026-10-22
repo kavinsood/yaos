@@ -693,8 +693,11 @@ The engine detects a change when `session.vaultEpoch ≠ identity.vaultEpoch`, o
      `rebind{adopt}`, then `nsDelete` of the loser, then `reconcileContent{pathBase}`. The collapse conditions are in
      §c.13.
    - **Trust.** A base is trusted only while the new epoch's text still contains it: as a character subsequence for
-     markdown, and as a subsequence of whole record lines of the merge text for a canvas. A base ahead of the new
-     epoch would read as deletions. Without trust, the no-base merge keeps the disk side as a conflict copy.
+     markdown whose words are also a subsequence of the text's words, and as a subsequence of whole record lines of
+     the merge text for a canvas. A base ahead of the new epoch would read as deletions. Characters alone are not
+     enough: a short base is a character subsequence of almost any long text, so an unrelated doc re-created at the
+     path read as having kept it, and its text replaced the note there (soak 979386157 #156). Without trust, the
+     no-base merge keeps the disk side as a conflict copy.
    - **Stored.** The bases are written to the new DB's `meta` (`pathBase:<pathKey>`, the old `baseText` row's bytes,
      with the old doc's deletes) in the transaction that creates its identity, so a crash or restart before the
      merges keeps them (`src/engine/compose/epochBases.ts`). A base is dropped once its path is settled: the

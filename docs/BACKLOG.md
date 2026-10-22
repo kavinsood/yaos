@@ -268,6 +268,11 @@ Kept here until `sim-port` merges; then git history holds them.
   them as observed renames until their source path is settled. Tests in `reconciler.epoch.test.ts`,
   `epochBases.test.ts`, `syncedMirrorOrder.test.ts`, `mirrors.test.ts`; plans
   `epoch-migration-drops-unpublished-rename.json`, `unrecorded-rename-lost-with-store-after-migration.json`.
+- **SOAK-EPOCH-BASE-SCATTERED-TRUST** (integrate-3; soak 979386157 #156, data loss, also at ac7aff61): B's new
+  one-line note was synced just before an epoch reset, and A re-created its own 60-line note at the path. B's old
+  base was a character subsequence of A's text, scattered over it, so it was trusted. The merge read B's line as
+  kept by A and wrote A's text over the note. A markdown epoch base now needs its words in order in the new text
+  too. Tests in `reconciler.epoch.test.ts`; plan `epoch-base-trusted-by-scattered-characters.json`.
 - **Canvas concurrent record create** (`fix-integrity`, fix-epoch soak `971197958-35`): after an epoch reset C
   re-created a canvas empty, and A and D each merged their file into it before seeing the other's rows. A record
   new to a replica is a new Y.Map, so the two maps competed and A's survived whole; D's synced base kept D's colour

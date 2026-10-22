@@ -33,7 +33,11 @@ export function epochBaseKey(env: Env, op: ReconcileOp): PathKey {
 
 /**
  * §c.12 path base, trusted only when the new epoch's text still holds all of it: the base is a subsequence of the
- * crdt text, by character for markdown, by whole record line of the canvas merge text (`unit` "line"). The old base
+ * crdt text, by character for markdown, by whole record line of the canvas merge text (`unit` "line"). For markdown
+ * its words must be a subsequence of the crdt text's words too: a short base is a character subsequence of almost
+ * any long text, scattered over it, and an unrelated doc re-created at the path read as having kept it. The merge
+ * then took that doc's text over the disk's, and the note the user had there was gone (soak 979386157 #156: a new
+ * note's one line against a peer's 60-line note after an epoch reset). The old base
  * can be ahead of the new epoch: it includes own edits the old relay never received (offline imports, pending
  * creates) and acked edits the migrating peer never saw before the reset. A 3-way merge against such a base reads
  * the peer's staleness as deletions and drops local text or records. With base ⊑ crdt the crdt side only
@@ -45,9 +49,20 @@ export function trustedEpochBase(base: string | null, crdt: string, unit: "char"
 	const b: ArrayLike<string> = unit === "line" ? base.split("\n") : base;
 	const c: ArrayLike<string> = unit === "line" ? crdt.split("\n") : crdt;
 	if (b.length > c.length) return null;
+	if (!subsequence(b, c)) return null;
+	if (unit === "char" && !subsequence(words(base), words(crdt))) return null;
+	return base;
+}
+
+function subsequence(b: ArrayLike<string>, c: ArrayLike<string>): boolean {
+	if (b.length > c.length) return false;
 	let i = 0;
 	for (let j = 0; i < b.length && j < c.length; j++) if (b[i] === c[j]) i++;
-	return i === b.length ? base : null;
+	return i === b.length;
+}
+
+function words(t: string): string[] {
+	return t.split(/\s+/).filter((w) => w.length > 0);
 }
 
 /**
