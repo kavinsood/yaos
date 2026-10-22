@@ -306,6 +306,7 @@ export class LogEngine {
 				return version();
 			},
 			version,
+			unframed: () => !h.builder.empty,
 			release: () => {
 				if (released) return;
 				released = true;

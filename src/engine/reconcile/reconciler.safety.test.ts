@@ -268,3 +268,27 @@ test("write gate shut (key-missing): a create commits no born-empty synced recor
 	assert.ok(id, "created once writes are back");
 	assert.equal(w.log.text(id), "new\n");
 });
+
+test("write gate shut (key-missing): a bound replica's unframed typing is never materialized under a version without it", async () => {
+	// Sim suite-1 wipe/revoke/roll seed 6: a revoked device's typing (refused frames) was in the replica when the doc
+	// materialized at the path its rename had just left. S recorded that text at the version without the typing; the
+	// restart dropped the typing from the replica, and the file kept it as synced: it never reached another device
+	// and the file never converged.
+	const w = new World();
+	await w.boot();
+	const id = w.log.remoteCreate(P("a.md"), "one\n");
+	await w.sync();
+	w.log.setBound(id, true);
+	w.log.writeGate = "revoked-epoch";
+	w.log.editorType(id, (t) => t.insert(0, "typed "));
+	await w.r.ctx.store.commit({ syncedDrop: [id] }); // as when the store came back without the record
+	w.vault.userDelete("a.md");
+	await w.sync(3).catch(() => undefined);
+	assert.equal(w.vault.text("a.md"), null, "nothing written while the typing cannot be framed");
+	assert.equal(w.synced(id), undefined);
+	await w.crashAndReboot(); // the unframed typing is gone with the replica
+	w.log.writeGate = null;
+	await w.sync();
+	assert.equal(w.vault.text("a.md"), "one\n", "the doc's text, which every device has");
+	assert.equal(w.log.text(id), "one\n");
+});

@@ -235,6 +235,7 @@ export class ComposedLog implements LogPort {
 				}
 			},
 			version: () => h.version(),
+			unframed: () => h.unframed?.() ?? false,
 			release: () => h.release(),
 		};
 	}

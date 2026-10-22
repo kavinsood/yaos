@@ -31,7 +31,7 @@ import { applyCanvas, baseSeenBy, emptyCanvas, projectCanvasBytes, projectionHas
 import { isEmptyCanvas, mergeCanvasSides, parseDiskCanvas, parseMergeText, rankDisk, withEpochDeletes, type CanvasMergeOutput } from "./canvasMerge";
 import { epochBaseOf, MAX_CAS_ATTEMPTS, overwriteAllowed, trustedEpochBase, writeConflictCopy, type ReconcileOp } from "./contentSteps";
 import type { BodyHandle } from "./deps";
-import { writeOk, type Env, type JobOutcome } from "./diskJobs";
+import { framedVersion, writeOk, type Env, type JobOutcome } from "./diskJobs";
 import { MAX_TEXT_FILE_BYTES } from "./localState";
 import { applyOldDeletes } from "./oldDeletes";
 import { hashBase } from "./store";
@@ -181,7 +181,8 @@ export async function diskMaterializeCanvas(env: Env, op: MaterializeOp): Promis
 
 async function materializeCanvas(env: Env, op: MaterializeOp, h: BodyHandle): Promise<JobOutcome> {
 	const { ctx } = env;
-	const version = h.version();
+	const version = await framedVersion(h);
+	if (!version) return "fail";
 	const p = projectCanvasBytes(h.doc);
 	if (!p.ok) return invalid(env, op.docId, op.path, `crdt: ${p.reason}`, `crdt:${version.remoteSeq}`);
 	// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.

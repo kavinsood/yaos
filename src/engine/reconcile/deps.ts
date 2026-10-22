@@ -87,6 +87,11 @@ export interface BodyHandle {
 	commitEdits(): Promise<BodyVersion>;
 	/** Current body version (streams.bodyVersion incl. own frames). */
 	version(): BodyVersion;
+	/**
+	 * The replica holds edits no frame carries yet (an open frame: a bound editor's typing, or `mergeOrigin` edits
+	 * before commitEdits): its text is ahead of version(). Optional: a handle without it never is.
+	 */
+	unframed?(): boolean;
 	release(): void;
 }
 

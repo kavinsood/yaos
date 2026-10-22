@@ -1,0 +1,404 @@
+{
+	"seed": 6,
+	"config": {
+		"devices": 3,
+		"faults": {
+			"engineCrash": 3,
+			"appCrash": 2,
+			"commitCrash": 2,
+			"idbWipe": 3,
+			"idbLost": 2,
+			"offline": 4,
+			"ioFail": 2,
+			"background": 3,
+			"socketDrop": 4,
+			"relayRestart": 1,
+			"relayDrain": 1,
+			"httpFail": 1,
+			"dailyLimit": 0.5,
+			"epochReset": 0.3,
+			"clockSkew": 1,
+			"keyStoreLoss": 1,
+			"keyRoll": 2,
+			"revoke": 2,
+			"epochRestore": 0.5,
+			"hostileReplay": 2,
+			"hostileDowngrade": 1,
+			"blobStall": 0,
+			"blobSlow": 0,
+			"relaySubsLost": 0,
+			"suspendKill": 0,
+			"clone": 0,
+			"syncedConfig": 0,
+			"targetedDrop": 0,
+			"lostSend": 0,
+			"commitFail": 0,
+			"hostile": 0,
+			"conflictCrash": 0,
+			"floodRewrite": 0
+		},
+		"crypto": "suite1",
+		"faultRate": 0.3,
+		"seed": 6
+	},
+	"minimizedPlan": [
+		{
+			"i": 43,
+			"gapMs": 888,
+			"user": {
+				"t": "deleteToken",
+				"dev": 1,
+				"view": 0.4296932148281485,
+				"pick": 0.1899484870955348
+			}
+		},
+		{
+			"i": 44,
+			"gapMs": 170,
+			"user": {
+				"t": "create",
+				"dev": 1,
+				"name": 7
+			}
+		},
+		{
+			"i": 45,
+			"gapMs": 1229,
+			"fault": {
+				"t": "revoke",
+				"dev": 2,
+				"by": 0,
+				"rekeyMs": 42021,
+				"rkSeed": 1969950779
+			}
+		},
+		{
+			"i": 46,
+			"gapMs": 1469,
+			"fault": {
+				"t": "hostileDowngrade",
+				"pick": 1959805453,
+				"rows": 1,
+				"join": false
+			}
+		},
+		{
+			"i": 47,
+			"gapMs": 1415,
+			"user": {
+				"t": "type",
+				"dev": 2,
+				"view": 0.02161932084709406,
+				"pos": 0.32301279390230775,
+				"nl": true
+			}
+		},
+		{
+			"i": 143,
+			"gapMs": 155,
+			"canvas": {
+				"t": "cMove",
+				"dev": 1,
+				"file": 0.9398755882866681,
+				"node": 0.053424998885020614
+			}
+		},
+		{
+			"i": 48,
+			"gapMs": 1433,
+			"user": {
+				"t": "delete",
+				"dev": 0,
+				"file": 0.027863236609846354
+			}
+		},
+		{
+			"i": 144,
+			"gapMs": 0,
+			"user": {
+				"t": "setting",
+				"dev": 0,
+				"file": 1,
+				"key": 1,
+				"del": false
+			}
+		},
+		{
+			"i": 49,
+			"gapMs": 1343,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 0,
+				"file": 0.7339361819904298,
+				"pick": 0.22725734557025135,
+				"by": "user"
+			}
+		},
+		{
+			"i": 50,
+			"gapMs": 663,
+			"user": {
+				"t": "switch",
+				"dev": 2,
+				"view": 0.9652892425656319,
+				"file": 0.16026103543117642
+			}
+		},
+		{
+			"i": 51,
+			"gapMs": 1239,
+			"user": {
+				"t": "open",
+				"dev": 2,
+				"file": 0.9418170363642275
+			}
+		},
+		{
+			"i": 145,
+			"gapMs": 0,
+			"user": {
+				"t": "attach",
+				"dev": 0,
+				"name": 1,
+				"size": 1876
+			}
+		},
+		{
+			"i": 52,
+			"gapMs": 80,
+			"fault": {
+				"t": "idbLost",
+				"dev": 2
+			}
+		},
+		{
+			"i": 53,
+			"gapMs": 573,
+			"fault": {
+				"t": "epochRestore",
+				"back": 8
+			}
+		},
+		{
+			"i": 146,
+			"gapMs": 127,
+			"canvas": {
+				"t": "cColor",
+				"dev": 1,
+				"file": 0.5777590966317803,
+				"node": 0.30551412189379334,
+				"clear": false
+			}
+		},
+		{
+			"i": 54,
+			"gapMs": 1353,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.28051047562621534,
+				"pos": 0.00016023311764001846,
+				"nl": false
+			}
+		},
+		{
+			"i": 55,
+			"gapMs": 1288,
+			"fault": {
+				"t": "socketDrop",
+				"dev": 0,
+				"code": 1006
+			}
+		},
+		{
+			"i": 56,
+			"gapMs": 350,
+			"user": {
+				"t": "type",
+				"dev": 1,
+				"view": 0.14789214567281306,
+				"pos": 0.772133860271424,
+				"nl": true
+			}
+		},
+		{
+			"i": 91,
+			"gapMs": 381,
+			"fault": {
+				"t": "hostileReplay",
+				"pick": 72612710,
+				"copies": 3
+			}
+		},
+		{
+			"i": 92,
+			"gapMs": 493,
+			"fault": {
+				"t": "offline",
+				"dev": 2,
+				"durationMs": 11262
+			}
+		},
+		{
+			"i": 162,
+			"gapMs": 0,
+			"user": {
+				"t": "snapshot",
+				"dev": 0
+			}
+		},
+		{
+			"i": 93,
+			"gapMs": 999,
+			"user": {
+				"t": "type",
+				"dev": 2,
+				"view": 0.10977671225555241,
+				"pos": 0.11145906383171678,
+				"nl": false
+			}
+		},
+		{
+			"i": 163,
+			"gapMs": 357,
+			"canvas": {
+				"t": "cEdge",
+				"dev": 0,
+				"file": 0.22934903902933002,
+				"edge": 0.449064138578251,
+				"what": "sides",
+				"pick": 0.2165660043247044
+			}
+		},
+		{
+			"i": 94,
+			"gapMs": 1178,
+			"user": {
+				"t": "type",
+				"dev": 0,
+				"view": 0.915111469104886,
+				"pos": 0.05602299189195037,
+				"nl": false
+			}
+		},
+		{
+			"i": 95,
+			"gapMs": 1301,
+			"fault": {
+				"t": "socketDrop",
+				"dev": 0,
+				"code": 1006
+			}
+		},
+		{
+			"i": 164,
+			"gapMs": 0,
+			"user": {
+				"t": "setting",
+				"dev": 0,
+				"file": 2,
+				"key": 3,
+				"del": false
+			}
+		},
+		{
+			"i": 96,
+			"gapMs": 610,
+			"user": {
+				"t": "diskDeleteToken",
+				"dev": 1,
+				"file": 0.7281363129150122,
+				"pick": 0.13740425277501345,
+				"by": "external"
+			}
+		},
+		{
+			"i": 97,
+			"gapMs": 1251,
+			"user": {
+				"t": "create",
+				"dev": 1,
+				"name": 1
+			}
+		},
+		{
+			"i": 98,
+			"gapMs": 975,
+			"user": {
+				"t": "rename",
+				"dev": 2,
+				"file": 0.9295877404510975,
+				"name": 0
+			}
+		},
+		{
+			"i": 99,
+			"gapMs": 119,
+			"user": {
+				"t": "open",
+				"dev": 0,
+				"file": 0.9888222771696746
+			}
+		},
+		{
+			"i": 106,
+			"gapMs": 1377,
+			"fault": {
+				"t": "socketDrop",
+				"dev": 1,
+				"code": 1006
+			}
+		},
+		{
+			"i": 165,
+			"gapMs": 491,
+			"canvas": {
+				"t": "cAddNode",
+				"dev": 0,
+				"file": 0.03129398077726364,
+				"kind": "file",
+				"seed": 1367985663
+			}
+		},
+		{
+			"i": 107,
+			"gapMs": 556,
+			"fault": {
+				"t": "hostileReplay",
+				"pick": 1896513102,
+				"copies": 1
+			}
+		},
+		{
+			"i": 108,
+			"gapMs": 1311,
+			"fault": {
+				"t": "appCrash",
+				"dev": 2,
+				"downMs": 5241
+			}
+		},
+		{
+			"i": 109,
+			"gapMs": 890,
+			"user": {
+				"t": "deleteToken",
+				"dev": 2,
+				"view": 0.29446699330583215,
+				"pick": 0.3960408258717507
+			}
+		},
+		{
+			"i": 166,
+			"gapMs": 20,
+			"canvas": {
+				"t": "cText",
+				"dev": 2,
+				"file": 0.495229440741241,
+				"node": 0.21775912982411683,
+				"pos": 0.3210946233011782,
+				"del": false
+			}
+		}
+	]
+}

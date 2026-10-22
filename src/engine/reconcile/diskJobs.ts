@@ -8,12 +8,13 @@
  * the doc's later ops. Unknown exceptions propagate.
  */
 
-import type { ContentHash, DocId, NsBlobRef, NsOp, PlannerOp, VaultPath } from "../../core/types";
+import type { BodyVersion, ContentHash, DocId, NsBlobRef, NsOp, PlannerOp, VaultPath } from "../../core/types";
 import { markdownContentHash } from "../../core/hash/markdownLf";
 import { restartAtCreate } from "../../core/plan/planner";
 import type { VaultStat } from "../../ports/vault";
 import type { BlobReq, BlobTransfer, Ctx } from "./context";
-import type { ExecResult, WrittenOk } from "./deps";
+import type { BodyHandle, ExecResult, WrittenOk } from "./deps";
+import { KeyMissingError } from "../keyring/writeGate";
 import type { Scanner } from "./scan";
 import { applyOldDeletes } from "./oldDeletes";
 import { makeBase } from "./store";
@@ -148,6 +149,24 @@ export async function diskTrash(env: Env, op: Op<"diskTrash">): Promise<JobOutco
 	return "ok";
 }
 
+/**
+ * The version that carries the replica's text, for a synced record of that text. Edits no frame carries yet (a bound
+ * editor's typing, the old epoch's deletes just applied) are framed first. While they cannot be (the write gate is
+ * shut), null: the job writes nothing. A record of that text at the version without them reads as synced once the
+ * replica drops them (a restart): the file keeps edits no device ever gets, and never converges (sim suite-1
+ * wipe/revoke/roll seed 6: a revoked device's typing materialized at the path its rename had just left).
+ */
+export async function framedVersion(h: BodyHandle): Promise<BodyVersion | null> {
+	if (!h.unframed?.()) return h.version();
+	try {
+		h.assertWritable();
+	} catch (e) {
+		if (e instanceof KeyMissingError) return null;
+		throw e;
+	}
+	return h.commitEdits();
+}
+
 /** Create a file for a remote doc that is absent locally (precondition absent). */
 export async function diskMaterialize(env: Env, op: Op<"diskMaterialize">): Promise<JobOutcome> {
 	const { ctx } = env;
@@ -159,8 +178,9 @@ export async function diskMaterialize(env: Env, op: Op<"diskMaterialize">): Prom
 	if (!h) return "fail";
 	try {
 		await applyOldDeletes(env, op.docId, h);
+		const version = await framedVersion(h);
+		if (!version) return "fail";
 		const text = h.doc.getText("text").toString();
-		const version = h.version();
 		// Hashed before the write: nothing awaits between the write and the T_synced commit that records it.
 		const hash = await markdownContentHash(ctx.deps.hash, text);
 		const res = await ctx.exec({ t: "write", area: "vault", path: op.path, data: { t: "text", text }, precondition: { t: "absent" }, docId: op.docId, purpose: "materialize" });

@@ -360,6 +360,7 @@ export class StubLog implements LogPort {
 			doc: replica,
 			mergeOrigin: MERGE,
 			bound: b.bound,
+			unframed: () => b.unframed.length > 0,
 			assertWritable: () => {
 				if (this.writeGate !== null) throw new KeyMissingError(this.writeGate);
 			},
