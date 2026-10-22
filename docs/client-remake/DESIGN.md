@@ -1014,6 +1014,10 @@ cold ──load──▶ resident ──bind──▶ bound
     doc's own file would wait for good. Views on a file another doc is synced at re-open at once, at a pass end or
     right after the vault rename that moved them. Otherwise they re-open at the second pass end that sees the same
     pair, because a user rename of an open note moves the views one pass before the doc.
+  - A doc's views share one file (`BoundDoc.path`). `openDoc` at the doc's file while its views are bound at
+    another path gives those views `renamed{stray}` first (`retargetStray`): bound with them, the doc's path became
+    the new view's, no check saw the old views again, and their saves wrote the doc's text over another doc's file
+    (soak seed 63846271).
   - On `stray` the host holds the views' saves until they bind again or stay unbound. A save meanwhile would write
     the old doc's text over the file. The bind merges against the old doc's text (its mirror), so the file's doc
     keeps its content, and edits not yet pushed apply on top or go to a conflict copy. With the file's doc's own

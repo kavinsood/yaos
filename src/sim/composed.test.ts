@@ -855,6 +855,44 @@ test("a stray bound editor with unsaved edits over another doc's file: neither t
 	assert.deepEqual([...b.vault.snapshot().entries()].sort(), [...a.vault.snapshot().entries()].sort());
 });
 
+test("a view opened on a bound doc's own file while its other views show another doc's file: those views re-open on that file", async () => {
+	// Soak seed 63846271: B's view showed a file whose doc an own rename moved to another path (the file stayed and
+	// became a new doc) while a second view opened at the doc's new path, before the pass end that would have found the
+	// first view stray. The bind set the doc's one view path to the second view's, so no check ever saw the first view
+	// again: the doc's merges went into the other doc's file through its saves, and the doc's own file on B stayed stale.
+	const { clock, devs } = world();
+	const [a, b] = pair(devs);
+	a.vault.userWrite("x.md", "x body\n");
+	a.vault.userWrite("z.md", "z body\n");
+	await boot(clock, devs);
+	await clock.advance(10_000);
+	assert.equal(b.vault.textOf("z.md"), "z body\n");
+	const stray = a.workspace.openFile("x.md");
+	await clock.advance(1_000);
+	const rt = a.vrt;
+	assert.ok(stray && rt && stray.isBound(), "bound");
+	const x = [...rt.engine.bound.byId.keys()];
+	// Built directly: the views of X follow z.md, Z's file (as test "a bound doc whose views show another doc's file"),
+	// and a view opens on x.md, X's own file, before any check.
+	stray.path = "z.md";
+	rt.engine.bound.followRename(pathKey("x.md"), "z.md", pathKey);
+	const own = a.workspace.openFile("x.md");
+	await clock.advance(1_000);
+	assert.ok(own?.isBound(), "the view on X's file binds");
+	b.vault.userWrite("x.md", "x body\nB edit\n");
+	await clock.advance(30_000);
+	assert.equal(a.vault.textOf("z.md"), "z body\n", "Z's file is untouched");
+	assert.equal(a.vault.textOf("x.md"), "x body\nB edit\n", "X's file gets B's edit");
+	assert.ok(stray.isBound(), "the stray view is bound again");
+	assert.equal(stray.getText(), "z body\n");
+	assert.equal(x.length, 1);
+	assert.deepEqual([...rt.engine.bound.byId.values()].map((d) => [d.docId === x[0], d.path]).sort(), [[false, "z.md"], [true, "x.md"]], "each view on its file's doc");
+	for (const d of [a, b]) {
+		assert.deepEqual([...d.vault.snapshot().entries()].sort(), [["x.md", "x body\nB edit\n"], ["z.md", "z body\n"]], d.name);
+		for (const [p, t] of d.vault.snapshot()) assert.equal(d.engineText(p), t, `${d.name}: replica of ${p}`);
+	}
+});
+
 test("bound views on a file no doc is synced at re-open only when two pass ends saw it; a rename of the open note never does", async () => {
 	const { clock, devs } = world();
 	const [a, b] = pair(devs);

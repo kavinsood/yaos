@@ -34,6 +34,11 @@ export async function openDoc(rt: VaultRuntime, path: VaultPath, viewId: number)
 	}
 	const docId = e.docId;
 	const frozen = e.body?.frozen ?? false;
+	// The doc's views share one file (BoundDoc.path). Views already bound at another path show a file that is no longer
+	// the doc's (it moved since they bound, and the file stayed): they are stray and re-open by path first. Adding this
+	// view would set the path to the doc's own file, and no stray check could see those views again.
+	const was = rt.engine.bound.get(docId);
+	if (was && rt.rec.ctx.pk(was.path) !== cls.pathKey) rt.retargetStray(docId);
 	const first = rt.engine.bound.add(docId, path, viewId);
 	try {
 		// One replica pin per bound doc (released when its last view closes); the views attach next (bodyAttach).

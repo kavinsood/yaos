@@ -670,6 +670,16 @@ export class VaultRuntime {
 		if (passEnd) this.strayViews = seen;
 	}
 
+	/** openDoc found the doc's views on another file than the one a view now opens at, the doc's own: they re-open. */
+	retargetStray(docId: DocId): void {
+		const b = this.engine.bound.get(docId);
+		if (!b || this.stopped) return;
+		this.diag(`bound doc ${docId}: views on ${b.path}, a view opens at the doc's file: re-opening the views`);
+		const viewKey = pathKey(b.path);
+		this.retarget(docId, null, true);
+		this.sched.request({ t: "docs", docIds: [docId], pathKeys: [viewKey] });
+	}
+
 	/** A vault rename moved bound views (BoundDocs.followRename): views now on another doc's file re-open at once. */
 	viewsMoved(): void {
 		if (!this.stopped) this.retargetStrayViews(false);
